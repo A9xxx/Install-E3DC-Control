@@ -1,5 +1,43 @@
+# Python Cache
 __pycache__/
-*.pyc
-*.pyo
-.backup
+*.py[cod]
+*$py.class
+*.so
+
+# Backup-Dateien
+*.backup
+.backup/
+Install.backup/
+
+# Spezifische ZIP-Datei vom Update-Prozess
 Install-E3DC-Control.zip
+E3DC-Install-*.zip
+
+# Temporäre Dateien
+*.tmp
+*.temp
+.DS_Store
+Thumbs.db
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+
+# Distribution / Packaging
+dist/
+build/
+*.egg-info/
+
+# Virtual Environments
+venv/
+ENV/
+env/
+
+# Git
+*.orig

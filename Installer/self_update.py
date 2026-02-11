@@ -131,85 +131,113 @@ def download_release(download_url):
     return None
 
 
-def extract_release(zip_path):
+def extract_release(zip_path, new_version):
     """
     Entpackt die Release-ZIP und führt Update durch.
+    
+    Args:
+        zip_path: Pfad zur heruntergeladenen ZIP-Datei
+        new_version: Die neue Version, die in VERSION-Datei geschrieben wird
     
     Returns:
         True bei Erfolg, False bei Fehler
     """
     try:
         import zipfile
-        
         print("→ Entpacke Update…")
-        
         temp_extract = os.path.join(tempfile.gettempdir(), f"e3dc_update_{os.getpid()}")
-        
-        # Entpacke ZIP
+        print(f"[DEBUG] Entpacke nach: {temp_extract}")
+        # Entpacke ZIP immer aus dem übergebenen Pfad (sollte im Temp liegen)
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
             zip_ref.extractall(temp_extract)
-        
+
         # Finde das Installer-Verzeichnis in der ZIP
-        # Normalerweise ist die Struktur: Install-E3DC-Control/Install/...
         extracted_items = os.listdir(temp_extract)
-        
-        if not extracted_items:
-            print("✗ ZIP-Datei ist leer")
-            shutil.rmtree(temp_extract, ignore_errors=True)
-            return False
-        
-        # Suche nach dem Install-Ordner
-        if len(extracted_items) == 1 and os.path.isdir(os.path.join(temp_extract, extracted_items[0])):
-            # ZIP hat einen Root-Ordner
-            root_dir = os.path.join(temp_extract, extracted_items[0])
-            src_installer = os.path.join(root_dir, "Install")
-        else:
-            # ZIP hat keine Root-Ordner
+        print(f"[DEBUG] ZIP-Inhalt: {extracted_items}")
+        src_installer = None
+        # Suche nach dem Install-Ordner in typischer ZIP-Struktur
+        for item in extracted_items:
+            item_path = os.path.join(temp_extract, item)
+            if os.path.isdir(item_path):
+                # Prüfe, ob darin ein Install-Ordner liegt
+                possible = os.path.join(item_path, "Install")
+                if os.path.exists(possible):
+                    src_installer = possible
+                    break
+        # Fallback: Direkt im temp_extract
+        if not src_installer and os.path.exists(os.path.join(temp_extract, "Install")):
             src_installer = os.path.join(temp_extract, "Install")
-        
-        if not os.path.exists(src_installer):
+
+        if not src_installer or not os.path.exists(src_installer):
             print(f"✗ Installer-Verzeichnis nicht in ZIP gefunden: {src_installer}")
             shutil.rmtree(temp_extract, ignore_errors=True)
             return False
-        
-        print("→ Aktualisiere Installer-Verzeichnis…")
-        
-        # Sicherung der aktuellen Version (optional)
-        backup_dir = None
+
+        print(f"→ Aktualisiere Installer-Verzeichnis aus: {src_installer}")
+
+        # Sicherung der aktuellen Version (immer!)
+        backup_dir = INSTALLER_DIR + ".backup"
+        if os.path.exists(backup_dir):
+            shutil.rmtree(backup_dir, ignore_errors=True)
         if os.path.exists(INSTALLER_DIR):
-            backup_dir = INSTALLER_DIR + ".backup"
-            if os.path.exists(backup_dir):
-                shutil.rmtree(backup_dir, ignore_errors=True)
             try:
                 shutil.copytree(INSTALLER_DIR, backup_dir)
                 print(f"  → Sicherung erstellt: {backup_dir}")
             except Exception as e:
                 print(f"  ⚠ Sicherung fehlgeschlagen: {e}")
-        
-        # Ersetze Installer-Verzeichnis
+        else:
+            print(f"  ⚠ Kein bestehendes Installationsverzeichnis für Backup gefunden: {INSTALLER_DIR}")
+
+        # Ersetze Installer-Verzeichnis (Inhalt, nicht das Verzeichnis selbst)
         try:
+            # Lösche nur den Inhalt, nicht das Verzeichnis selbst (Shell-Kompatibilität)
             if os.path.exists(INSTALLER_DIR):
-                shutil.rmtree(INSTALLER_DIR)
+                for item in os.listdir(INSTALLER_DIR):
+                    item_path = os.path.join(INSTALLER_DIR, item)
+                    if os.path.isdir(item_path):
+                        shutil.rmtree(item_path)
+                    else:
+                        os.remove(item_path)
+            else:
+                os.makedirs(INSTALLER_DIR)
             
-            shutil.copytree(src_installer, INSTALLER_DIR)
-            
-            # Cleanup
-            shutil.rmtree(temp_extract, ignore_errors=True)
-            os.remove(zip_path) if os.path.exists(zip_path) else None
+            # Kopiere neuen Inhalt ins bestehende Verzeichnis
+            for item in os.listdir(src_installer):
+                src_path = os.path.join(src_installer, item)
+                dst_path = os.path.join(INSTALLER_DIR, item)
+                if os.path.isdir(src_path):
+                    shutil.copytree(src_path, dst_path)
+                else:
+                    shutil.copy2(src_path, dst_path)
             
             print("✓ Update erfolgreich installiert")
             
-            # Entferne alte Sicherung
-            if backup_dir and os.path.exists(backup_dir):
-                shutil.rmtree(backup_dir, ignore_errors=True)
+            # Aktualisiere VERSION-Datei mit neuer Version
+            try:
+                with open(VERSION_FILE, 'w') as f:
+                    f.write(new_version)
+                print(f"✓ VERSION-Datei aktualisiert: {new_version}")
+            except Exception as e:
+                print(f"⚠ Konnte VERSION-Datei nicht aktualisieren: {e}")
             
+            # Setze Besitzrechte auf pi:pi für den Installationsordner
+            try:
+                subprocess.run(["chown", "-R", "pi:pi", INSTALLER_DIR], check=True)
+                print(f"✓ Rechte für {INSTALLER_DIR} auf pi:pi gesetzt")
+            except Exception as e:
+                print(f"⚠ Konnte Rechte nicht setzen: {e}")
+            # Entferne alte Sicherung
+            if os.path.exists(backup_dir):
+                shutil.rmtree(backup_dir, ignore_errors=True)
+            # Cleanup
+            shutil.rmtree(temp_extract, ignore_errors=True)
+            if os.path.exists(zip_path):
+                os.remove(zip_path)
             return True
-        
         except Exception as e:
             print(f"✗ Fehler beim Verschieben der Dateien: {e}")
-            
             # Restore Backup
-            if backup_dir and os.path.exists(backup_dir):
+            if os.path.exists(backup_dir):
                 print("→ Stelle Sicherung wieder her…")
                 try:
                     if os.path.exists(INSTALLER_DIR):
@@ -218,7 +246,6 @@ def extract_release(zip_path):
                     print("✓ Sicherung wiederhergestellt")
                 except Exception as restore_e:
                     print(f"✗ Fehler beim Wiederherstellen: {restore_e}")
-            
             return False
     
     except ImportError:
@@ -293,12 +320,14 @@ def check_and_update(silent=False):
     
     # Entpacke und installiere
     print()
-    if not extract_release(zip_path):
+    if not extract_release(zip_path, release_info['version']):
         print("✗ Installation fehlgeschlagen.\n")
         return False
     
     print("\n→ Installer wird neu gestartet…\n")
-    return True
+    # Ersetze aktuellen Prozess durch neu gestarteten Installer (behält sudo-Rechte und Terminal)
+    installer_main = os.path.join(INSTALLER_DIR, 'installer_main.py')
+    os.execv(sys.executable, [sys.executable, installer_main])
 
 
 def run_self_update_check():

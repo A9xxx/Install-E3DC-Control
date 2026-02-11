@@ -176,5 +176,5 @@ def start_menu():
     start_e3dc_control()
 
 
-register_command("6", "Screen + Cronjob einrichten", screen_cron_menu, sort_order=60)
-register_command("7", "E3DC-Control starten", start_menu, sort_order=70)
+register_command("7", "Screen + Cronjob einrichten", screen_cron_menu, sort_order=70)
+register_command("10", "E3DC-Control starten", start_menu, sort_order=100)

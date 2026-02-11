@@ -71,4 +71,4 @@ def config_wizard():
         print("\n→ Keine Änderungen gemacht.\n")
 
 
-register_command("5", "Configuration bearbeiten", config_wizard, sort_order=50)
+register_command("6", "Configuration bearbeiten", config_wizard, sort_order=60)

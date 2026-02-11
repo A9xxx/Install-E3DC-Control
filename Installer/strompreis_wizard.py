@@ -197,4 +197,4 @@ def strompreis_wizard():
         print("\n✗ Speichern fehlgeschlagen.\n")
 
 
-register_command("11", "Strompreis-Wizard", strompreis_wizard, sort_order=110)
+register_command("14", "Strompreis-Wizard", strompreis_wizard, sort_order=140)

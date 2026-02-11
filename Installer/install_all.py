@@ -184,4 +184,4 @@ def install_all_main():
     print("     → Ctrl+A Ctrl+D\n")
 
 
-register_command("8", "Alles installieren", install_all_main, sort_order=80)
+register_command("11", "Alles installieren", install_all_main, sort_order=110)

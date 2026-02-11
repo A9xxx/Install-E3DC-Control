@@ -87,5 +87,5 @@ def reinstall_menu():
     install_e3dc_control()
 
 
-register_command("6", "Systempakete installieren", system_packages_menu, sort_order=60)
-register_command("7", "E3DC-Control neu installieren", reinstall_menu, sort_order=70)
+register_command("8", "Systempakete installieren", system_packages_menu, sort_order=80)
+register_command("9", "E3DC-Control neu installieren", reinstall_menu, sort_order=90)

@@ -207,5 +207,5 @@ def rollback_commit_menu():
             rollback_to_commit(commit)
 
 
-register_command("8", "Rollback (Backup)", rollback_menu, sort_order=80)
-register_command("9", "Rollback (Commit-Auswahl)", rollback_commit_menu, sort_order=90)
+register_command("12", "Rollback (Backup)", rollback_menu, sort_order=120)
+register_command("13", "Rollback (Commit-Auswahl)", rollback_commit_menu, sort_order=130)

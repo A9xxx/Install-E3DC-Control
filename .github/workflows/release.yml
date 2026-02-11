@@ -1,0 +1,78 @@
+name: Release E3DC-Control Installer
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+      
+      - name: Create ZIP artifact
+        run: |
+          # Erstelle ZIP-Datei mit korrekter Struktur
+          mkdir -p Install-E3DC-Control
+          cp -r Install Install-E3DC-Control/
+          
+          # ZIP mit Struktur erstellen
+          zip -r Install-E3DC-Control.zip Install-E3DC-Control/
+          
+          # Zeige Größe
+          ls -lh Install-E3DC-Control.zip
+      
+      - name: Extract version from tag
+        id: version
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION"
+      
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: Version ${{ steps.version.outputs.version }}
+          draft: false
+          prerelease: false
+          files: |
+            Install-E3DC-Control.zip
+          body: |
+            ## E3DC-Control Installer - Version ${{ steps.version.outputs.version }}
+            
+            ### What's New
+            Siehe [CHANGELOG.md](CHANGELOG.md) für Details.
+            
+            ### Installation
+            1. Lade `Install-E3DC-Control.zip` herunter
+            2. Entpacke die Datei
+            3. Schreibe die neue Versionsnummer in `Install/VERSION`
+            4. Starten Sie den Installer neu
+            
+            Die Auto-Update Funktion wird automatisch erkannt.
+            
+            ### System Requirements
+            - Python 3.7+
+            - sudo-Zugriff
+            - Internetverbindung für Updates
+            
+            ### Changelog
+            ```
+            ${{ github.event.head_commit.message }}
+            ```
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Update VERSION file
+        if: always()
+        run: |
+          echo "${{ steps.version.outputs.version }}" > Install/VERSION
+          echo "✓ VERSION aktualisiert auf ${{ steps.version.outputs.version }}"

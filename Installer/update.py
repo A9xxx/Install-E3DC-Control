@@ -1,0 +1,173 @@
+import os
+import subprocess
+import time
+
+from .core import register_command
+from .backup import backup_current_version
+from .utils import replace_in_file, run_command
+
+INSTALL_PATH = "/home/pi/E3DC-Control"
+
+
+def get_current_version():
+    """Holt die aktuelle Git-Commit-ID."""
+    result = run_command(f"cd {INSTALL_PATH} && git rev-parse HEAD", timeout=5)
+    return result['stdout'].strip() if result['success'] else None
+
+
+def get_latest_version():
+    """Holt die neueste Commit-ID vom Remote."""
+    git_dir = os.path.join(INSTALL_PATH, ".git")
+    if not os.path.exists(git_dir):
+        print("✗ Keine Git-Installation gefunden.")
+        return None
+
+    # Prüfe ob Remote existiert
+    result = run_command(f"cd {INSTALL_PATH} && git remote get-url origin", timeout=5)
+    if not result['success']:
+        print("✗ Kein Git-Remote 'origin' gefunden.")
+        return None
+
+    # Hole neueste Version vom Remote
+    result = run_command(
+        f"cd {INSTALL_PATH} && git ls-remote --heads origin master",
+        timeout=10
+    )
+    if not result['success'] or not result['stdout'].strip():
+        print("✗ Branch 'master' nicht gefunden.")
+        return None
+
+    return result['stdout'].split()[0]
+
+
+def count_missing_commits():
+    """Zählt fehlende Commits."""
+    # Fetch origin
+    result = run_command(f"cd {INSTALL_PATH} && git fetch origin master", timeout=15)
+    if not result['success']:
+        return None
+
+    # Zähle Commits
+    result = run_command(
+        f"cd {INSTALL_PATH} && git rev-list --count HEAD..origin/master",
+        timeout=5
+    )
+    if result['success']:
+        try:
+            return int(result['stdout'].strip())
+        except ValueError:
+            return None
+    return None
+
+
+def list_missing_commits():
+    """Listet fehlende Commits auf."""
+    result = run_command(
+        f"cd {INSTALL_PATH} && git log HEAD..origin/master --oneline",
+        timeout=5
+    )
+    return result['stdout'].strip() if result['success'] else None
+
+
+def update_e3dc():
+    """Führt Update durch."""
+    print("\n=== E3DC-Control aktualisieren ===\n")
+
+    if not os.path.exists(INSTALL_PATH):
+        print("✗ Installation nicht gefunden.")
+        return
+
+    old_version = get_current_version()
+    if old_version is None:
+        print("✗ Aktuelle Version konnte nicht ermittelt werden.")
+        return
+
+    latest_version = get_latest_version()
+    if latest_version is None:
+        print("✗ Update nicht möglich – prüfe Internet und Repository.")
+        return
+
+    print(f"Aktuelle Version: {old_version[:7]}")
+    print(f"Neueste Version:  {latest_version[:7]}")
+
+    # Prüfe auf Updates
+    missing = count_missing_commits()
+    if missing is None:
+        print("⚠ Commit-Zählung nicht möglich.")
+    elif missing == 0:
+        print("✓ Du bist auf dem neuesten Stand.")
+        return
+    else:
+        print(f"→ Es fehlen {missing} Commit(s).\n")
+        commits = list_missing_commits()
+        if commits:
+            print("Fehlende Commits:")
+            print(commits)
+
+    # Bestätigung
+    confirm = input("\n→ Möchtest du jetzt aktualisieren? (j/n): ").strip().lower()
+    if confirm != "j":
+        print("✗ Update abgebrochen.\n")
+        return
+
+    # Backup erstellen
+    print("\n→ Erstelle Backup…")
+    backup_dir = backup_current_version()
+    if backup_dir is None:
+        print("✗ Backup fehlgeschlagen. Update abgebrochen.\n")
+        return
+
+    # Prüfe auf lokale Änderungen
+    print("→ Prüfe auf lokale Änderungen…")
+    result1 = subprocess.run(f"cd {INSTALL_PATH} && git diff --quiet", shell=True)
+    result2 = subprocess.run(f"cd {INSTALL_PATH} && git diff --cached --quiet", shell=True)
+    has_changes = (result1.returncode != 0 or result2.returncode != 0)
+
+    if has_changes:
+        print("⚠ Lokale Änderungen gefunden – sichere automatisch per git stash…")
+        result = run_command(f"cd {INSTALL_PATH} && git stash push -m 'Auto-Stash vor Update'")
+        if not result['success']:
+            print("✗ Stash fehlgeschlagen. Update abgebrochen.\n")
+            return
+        print("✓ Änderungen gestasht.")
+    else:
+        print("✓ Keine lokalen Änderungen.")
+
+    # Update durchführen
+    print("→ Hole neue Version…")
+    result = run_command(f"cd {INSTALL_PATH} && git pull", timeout=60)
+    if not result['success']:
+        print("✗ Git Pull fehlgeschlagen. Update abgebrochen.\n")
+        return
+
+    print("→ Kompiliere neue Version…")
+    result = run_command(f"cd {INSTALL_PATH} && make", timeout=300)
+    if not result['success']:
+        print("✗ Kompilierung fehlgeschlagen. Update abgebrochen.\n")
+        return
+
+    # Neustart mit gestopptem Service
+    config_file = os.path.join(INSTALL_PATH, "e3dc.config.txt")
+    if os.path.exists(config_file):
+        print("→ Neustart mit Konfiguration…")
+        replace_in_file(config_file, "stop", "stop = 1")
+        time.sleep(3)
+        replace_in_file(config_file, "stop", "stop = 0")
+
+    print("✓ Update erfolgreich abgeschlossen.\n")
+
+    # Stash-Management
+    result = run_command(f"cd {INSTALL_PATH} && git stash list")
+    if result['success'] and "Auto-Stash vor Update" in result['stdout']:
+        choice = input("→ Lokale Änderungen wiederherstellen? (j/n): ").strip().lower()
+        if choice == "j":
+            print("→ Stelle Änderungen wieder her…")
+            run_command(f"cd {INSTALL_PATH} && git stash pop")
+            print("✓ Änderungen wiederhergestellt.\n")
+
+
+def update_menu():
+    update_e3dc()
+
+
+register_command("3", "Update E3DC-Control", update_menu, sort_order=30)

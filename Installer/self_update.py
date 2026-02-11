@@ -10,8 +10,9 @@ import json
 import subprocess
 import tempfile
 import shutil
-from urllib.request import urlopen
+from urllib.request import urlopen, Request
 from urllib.error import URLError
+import re
 
 from .core import register_command
 from .utils import run_command
@@ -23,6 +24,8 @@ SCRIPT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 INSTALL_ROOT = os.path.dirname(SCRIPT_DIR)  # /home/pi
 INSTALLER_DIR = os.path.join(INSTALL_ROOT, "Install")
 VERSION_FILE = os.path.join(SCRIPT_DIR, "VERSION")
+DEBUG = False
+USER_AGENT = "E3DC-Control-Installer/1.0"
 
 
 def get_installed_version():
@@ -61,7 +64,8 @@ def get_latest_release_info():
         dict mit 'version', 'download_url', 'body' oder None bei Fehler
     """
     try:
-        with urlopen(RELEASES_API, timeout=10) as response:
+        request = Request(RELEASES_API, headers={"User-Agent": USER_AGENT})
+        with urlopen(request, timeout=10) as response:
             data = json.loads(response.read().decode())
             
             # Prüfe ob es ein Release ist (nicht nur Draft/Prerelease)
@@ -112,7 +116,8 @@ def download_release(download_url):
         temp_dir = tempfile.gettempdir()
         zip_path = os.path.join(temp_dir, f"E3DC-Install-{os.getpid()}.zip")
         
-        with urlopen(download_url, timeout=60) as response:
+        request = Request(download_url, headers={"User-Agent": USER_AGENT})
+        with urlopen(request, timeout=60) as response:
             with open(zip_path, 'wb') as out_file:
                 out_file.write(response.read())
         
@@ -146,14 +151,16 @@ def extract_release(zip_path, new_version):
         import zipfile
         print("→ Entpacke Update…")
         temp_extract = os.path.join(tempfile.gettempdir(), f"e3dc_update_{os.getpid()}")
-        print(f"[DEBUG] Entpacke nach: {temp_extract}")
+        if DEBUG:
+            print(f"[DEBUG] Entpacke nach: {temp_extract}")
         # Entpacke ZIP immer aus dem übergebenen Pfad (sollte im Temp liegen)
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
             zip_ref.extractall(temp_extract)
 
         # Finde das Installer-Verzeichnis in der ZIP
         extracted_items = os.listdir(temp_extract)
-        print(f"[DEBUG] ZIP-Inhalt: {extracted_items}")
+        if DEBUG:
+            print(f"[DEBUG] ZIP-Inhalt: {extracted_items}")
         src_installer = None
         # Suche nach dem Install-Ordner in typischer ZIP-Struktur
         for item in extracted_items:
@@ -256,6 +263,24 @@ def extract_release(zip_path, new_version):
     return False
 
 
+def is_newer_version(latest, installed):
+    def parse(v):
+        parts = [p for p in re.split(r'[^0-9]+', v) if p]
+        return [int(p) for p in parts] if parts else []
+    lv = parse(latest)
+    iv = parse(installed)
+    if not lv or not iv:
+        return latest != installed
+    for i in range(max(len(lv), len(iv))):
+        l = lv[i] if i < len(lv) else 0
+        r = iv[i] if i < len(iv) else 0
+        if l > r:
+            return True
+        if l < r:
+            return False
+    return False
+
+
 def check_and_update(silent=False):
     """
     Hauptfunktion: Prüft auf Updates und führt diese durch.
@@ -285,31 +310,31 @@ def check_and_update(silent=False):
     if not silent:
         print(f"Neueste Version:      {latest_version}")
     
-    # Vergleiche Versionen (einfacher String-Vergleich für Tags)
-    if installed_version == latest_version:
+    if not is_newer_version(latest_version, installed_version):
         if not silent:
             print("\n✓ Installer ist aktuell.\n")
         return False
     
     # Zeige Release-Notes
-    print(f"\n→ Neue Version verfügbar!\n")
-    
-    if release_info['body']:
-        print("Änderungen:")
-        print("-" * 40)
-        # Begrenzte Länge für Anzeige
-        body = release_info['body'][:500]
-        print(body)
-        if len(release_info['body']) > 500:
-            print("\n... (weitere Informationen auf GitHub)")
-        print("-" * 40 + "\n")
-    
-    # Frage Benutzer
-    choice = input("Soll die neue Version jetzt installiert werden? (j/n): ").strip().lower()
-    
-    if choice != "j":
-        print("→ Update übersprungen.\n")
-        return False
+    if not silent:
+        print(f"\n→ Neue Version verfügbar!\n")
+
+        if release_info['body']:
+            print("Änderungen:")
+            print("-" * 40)
+            # Begrenzte Länge für Anzeige
+            body = release_info['body'][:500]
+            print(body)
+            if len(release_info['body']) > 500:
+                print("\n... (weitere Informationen auf GitHub)")
+            print("-" * 40 + "\n")
+
+        # Frage Benutzer
+        choice = input("Soll die neue Version jetzt installiert werden? (j/n): ").strip().lower()
+
+        if choice != "j":
+            print("→ Update übersprungen.\n")
+            return False
     
     # Lade Release herunter
     print()

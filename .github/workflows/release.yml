@@ -20,14 +20,18 @@ jobs:
       
       - name: Create ZIP artifact
         run: |
-          # Erstelle ZIP-Datei mit korrekter Struktur
-          mkdir -p Install-E3DC-Control
-          cp -r Install Install-E3DC-Control/
-          
-          # ZIP mit Struktur erstellen
+          # Versionsnummer aus Tag
+          VERSION=${GITHUB_REF#refs/tags/v}
+          echo "$VERSION" > VERSION
+
+          # Release-Struktur
+          mkdir -p Install-E3DC-Control/Install
+
+          # Repo-Inhalt in Install/ kopieren (ohne .git und .github)
+          rsync -a --exclude '.git' --exclude '.github' ./ Install-E3DC-Control/Install/
+
+          # ZIP erstellen
           zip -r Install-E3DC-Control.zip Install-E3DC-Control/
-          
-          # Zeige Größe
           ls -lh Install-E3DC-Control.zip
       
       - name: Extract version from tag
@@ -70,9 +74,3 @@ jobs:
             ```
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      
-      - name: Update VERSION file
-        if: always()
-        run: |
-          echo "${{ steps.version.outputs.version }}" > Install/VERSION
-          echo "✓ VERSION aktualisiert auf ${{ steps.version.outputs.version }}"

@@ -54,6 +54,64 @@ def check_for_updates():
         print(f"⚠ Warnung: Update-Prüfung fehlgeschlagen: {e}\n")
 
 
+def check_permissions_on_startup():
+    """Prüft Berechtigungen beim Start und fragt nach Korrektur."""
+    try:
+        from Installer.permissions import (
+            check_permissions,
+            check_webportal_permissions,
+            check_file_permissions,
+            fix_permissions,
+            fix_webportal_permissions,
+            fix_file_permissions
+        )
+        
+        # Prüfe Berechtigungen
+        issues = check_permissions()
+        wp_issues = check_webportal_permissions()
+        file_issues = check_file_permissions()
+        
+        has_issues = bool(issues) or bool(wp_issues) or bool(file_issues)
+        
+        if not has_issues:
+            return  # Alle Berechtigungen OK, weitermachen
+        
+        # Berechtigungsprobleme gefunden - nachfragen
+        print("\n⚠ Berechtigungsprobleme gefunden.")
+        choice = input("Automatisch korrigieren? (j/n): ").strip().lower()
+        
+        if choice != "j":
+            print("✗ Korrektur übersprungen.\n")
+            return
+        
+        # Korrigiere Berechtigungen
+        all_success = True
+        
+        if issues:
+            success = fix_permissions(issues)
+            all_success = all_success and success
+
+        if wp_issues:
+            success = fix_webportal_permissions(wp_issues)
+            all_success = all_success and success
+        
+        if file_issues:
+            success = fix_file_permissions(file_issues)
+            all_success = all_success and success
+
+        if all_success:
+            print("\n✓ Alle Berechtigungen korrigiert.\n")
+        else:
+            print("\n⚠ Einige Berechtigungen konnten nicht korrigiert werden.\n")
+    
+    except ImportError:
+        # permissions-Modul nicht vorhanden, ignorieren
+        pass
+    except Exception as e:
+        # Fehler bei Berechtigungsprüfung, aber nicht fatale (nur warnen)
+        print(f"⚠ Warnung: Berechtigungsprüfung fehlgeschlagen: {e}\n")
+
+
 def main():
     """Haupteinstiegspunkt."""
     try:
@@ -71,6 +129,9 @@ def main():
 
         # Prüfe auf Updates (vor dem Hauptmenü)
         check_for_updates()
+
+        # Prüfe Berechtigungen beim Start
+        check_permissions_on_startup()
 
         # Starte Hauptmenü
         run_main_menu(restart_callback=restart_installer)

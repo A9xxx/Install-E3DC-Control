@@ -108,19 +108,52 @@ def check_webportal_permissions():
 
 
 def check_file_permissions():
-    """Prüft Python-Dateien, die PHP schreiben muss."""
+    """Prüft Dateien, die PHP schreiben muss (config/wallbox) und Python-Dateien."""
     print("\n=== Datei-Rechteprüfung ===\n")
 
-    files_to_check = [
-        f"{INSTALL_PATH}/plot_soc_changes.py",
+    # Dateien, die von PHP geschrieben werden (gehören zu www-data)
+    php_writable_files = [
         f"{INSTALL_PATH}/e3dc.config.txt",
-        f"{INSTALL_PATH}/e3dc.wallbox.txt",
+        f"{INSTALL_PATH}/e3dc.wallbox.txt"
+    ]
+    
+    # Andere Python-Dateien (gehören zu pi:pi)
+    python_files = [
+        f"{INSTALL_PATH}/plot_soc_changes.py",
         f"{INSTALL_PATH}/e3dc.strompreis.txt"
     ]
     
     issues = {}
     
-    for path in files_to_check:
+    # Prüfe PHP-Dateien (sollten pi:www-data gehören)
+    for path in php_writable_files:
+        if not os.path.exists(path):
+            continue
+        
+        try:
+            st = os.stat(path)
+            mode = oct(st.st_mode)[-3:]
+            owner = pwd.getpwuid(st.st_uid).pw_name
+            group = grp.getgrgid(st.st_gid).gr_name
+            
+            is_group_writable = bool(st.st_mode & 0o020)
+            status_ok = owner == "pi" and group == "www-data" and mode == "664" and is_group_writable
+            
+            if status_ok:
+                print(f"✓ {path} OK (pi:www-data)")
+            else:
+                print(f"✗ {path} Problem (sollte pi:www-data sein)")
+                issues[path] = {
+                    "owner": owner != "pi",
+                    "group": group != "www-data",
+                    "mode": mode != "664",
+                    "php_writable": True
+                }
+        except Exception as e:
+            print(f"✗ Fehler bei {path}: {e}")
+    
+    # Prüfe Python-Dateien (gehören zu pi:pi)
+    for path in python_files:
         if not os.path.exists(path):
             continue
         
@@ -134,13 +167,14 @@ def check_file_permissions():
             status_ok = owner == "pi" and group == "pi" and mode == "664" and is_group_writable
             
             if status_ok:
-                print(f"✓ {path} OK")
+                print(f"✓ {path} OK (pi:pi)")
             else:
                 print(f"✗ {path} Problem")
                 issues[path] = {
                     "owner": owner != "pi",
                     "group": group != "pi",
-                    "mode": mode != "664"
+                    "mode": mode != "664",
+                    "php_writable": False
                 }
         except Exception as e:
             print(f"✗ Fehler bei {path}: {e}")
@@ -236,8 +270,16 @@ def fix_file_permissions(issues):
     success = True
     
     for path, file_issues in issues.items():
+        is_php_file = file_issues.get("php_writable", False)
+        
         if file_issues["owner"] or file_issues["group"]:
-            result = run_command(f"sudo chown pi:pi {path}")
+            if is_php_file:
+                # PHP-Dateien gehören zu pi:www-data
+                result = run_command(f"sudo chown pi:www-data {path}")
+            else:
+                # Python-Dateien gehören zu pi:pi
+                result = run_command(f"sudo chown pi:pi {path}")
+            
             if not result['success']:
                 success = False
         

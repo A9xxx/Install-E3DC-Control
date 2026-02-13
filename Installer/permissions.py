@@ -117,7 +117,7 @@ def check_file_permissions():
         f"{INSTALL_PATH}/e3dc.wallbox.txt"
     ]
     
-    # Andere Python-Dateien (gehören zu pi:pi)
+    # Andere Python-Dateien (gehören zu pi:www-data)
     python_files = [
         f"{INSTALL_PATH}/plot_soc_changes.py",
         f"{INSTALL_PATH}/e3dc.strompreis.txt"
@@ -152,7 +152,7 @@ def check_file_permissions():
         except Exception as e:
             print(f"✗ Fehler bei {path}: {e}")
     
-    # Prüfe Python-Dateien (gehören zu pi:pi)
+    # Prüfe Python-Dateien (gehören zu pi:www-data)
     for path in python_files:
         if not os.path.exists(path):
             continue
@@ -164,16 +164,16 @@ def check_file_permissions():
             group = grp.getgrgid(st.st_gid).gr_name
             
             is_group_writable = bool(st.st_mode & 0o020)
-            status_ok = owner == "pi" and group == "pi" and mode == "664" and is_group_writable
+            status_ok = owner == "pi" and group == "www-data" and mode == "775" and is_group_writable
             
             if status_ok:
-                print(f"✓ {path} OK (pi:pi)")
+                print(f"✓ {path} OK (pi:www-data)")
             else:
-                print(f"✗ {path} Problem")
+                print(f"✗ {path} Problem (sollte pi:www-data sein)")
                 issues[path] = {
                     "owner": owner != "pi",
-                    "group": group != "pi",
-                    "mode": mode != "664",
+                    "group": group != "www-data",
+                    "mode": mode != "775",
                     "php_writable": False
                 }
         except Exception as e:
@@ -277,14 +277,17 @@ def fix_file_permissions(issues):
                 # PHP-Dateien gehören zu pi:www-data
                 result = run_command(f"sudo chown pi:www-data {path}")
             else:
-                # Python-Dateien gehören zu pi:pi
-                result = run_command(f"sudo chown pi:pi {path}")
+                # Python-Dateien gehören zu pi:www-data
+                result = run_command(f"sudo chown pi:www-data {path}")
             
             if not result['success']:
                 success = False
         
         if file_issues["mode"]:
-            result = run_command(f"sudo chmod 664 {path}")
+            if is_php_file:
+                result = run_command(f"sudo chmod 664 {path}")
+            else:
+                result = run_command(f"sudo chmod 775 {path}")
             if not result['success']:
                 success = False
     

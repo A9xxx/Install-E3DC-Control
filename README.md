@@ -225,4 +225,4 @@ sudo chown -R pi:pi /home/pi/Install
 A9xxx
 
 
-**Letzte Aktualisierung:** 11. Februar 2026
+**Letzte Aktualisierung:** 13. Februar 2026

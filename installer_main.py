@@ -5,6 +5,13 @@ import os
 import sys
 import subprocess
 
+from Installer.installer_config import (
+    load_config,
+    save_config,
+    ensure_web_config,
+    get_home_dir
+)
+
 # Basis-Pfade
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 INSTALLER_DIR = os.path.join(SCRIPT_DIR, "Installer")
@@ -28,6 +35,33 @@ def check_root_privileges():
         print("✗ Fehler: Dieses Skript muss mit sudo ausgeführt werden!")
         print("Beispiel: sudo python3 installer_main.py")
         sys.exit(1)
+
+
+def ensure_install_user():
+    """Ask for install user once and persist selection."""
+    config = load_config()
+    current_user = config.get("install_user", "pi")
+    current_home = config.get("home_dir")
+
+    if current_user and current_home and os.path.isdir(current_home):
+        ensure_web_config(current_user)
+        return True
+
+    print("\n=== Installer Benutzer ===\n")
+    user_input = input(f"Installationsbenutzer [{current_user}]: ").strip()
+    install_user = user_input or current_user
+
+    try:
+        home_dir = get_home_dir(install_user)
+    except KeyError:
+        print(f"✗ Benutzer '{install_user}' existiert nicht.")
+        return False
+
+    config["install_user"] = install_user
+    config["home_dir"] = home_dir
+    save_config(config)
+    ensure_web_config(install_user)
+    return True
 
 
 def restart_installer():
@@ -118,6 +152,8 @@ def main():
         # Prüfungen
         check_python_version()
         check_root_privileges()
+        if not ensure_install_user():
+            sys.exit(1)
 
         # Importiere Core-Modul
         try:

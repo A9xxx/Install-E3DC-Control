@@ -5,8 +5,11 @@ import subprocess
 
 from .core import register_command
 from .utils import run_command
+from .installer_config import get_install_path, get_install_user, get_home_dir
 
-INSTALL_PATH = "/home/pi/E3DC-Control"
+INSTALL_USER = get_install_user()
+INSTALL_HOME = get_home_dir(INSTALL_USER)
+INSTALL_PATH = get_install_path()
 
 
 def check_permissions():
@@ -15,12 +18,12 @@ def check_permissions():
 
     issues = []
 
-    # /home/pi muss für Webserver lesbar sein
-    if not os.access("/home/pi", os.X_OK):
-        print("✗ /home/pi ist NICHT für Webserver lesbar")
+    # Home-Verzeichnis muss für Webserver lesbar sein
+    if not os.access(INSTALL_HOME, os.X_OK):
+        print(f"✗ {INSTALL_HOME} ist NICHT für Webserver lesbar")
         issues.append("home")
     else:
-        print("✓ /home/pi ist für Webserver lesbar")
+        print(f"✓ {INSTALL_HOME} ist für Webserver lesbar")
 
     # INSTALL_PATH prüfen
     if not os.path.exists(INSTALL_PATH):
@@ -37,11 +40,11 @@ def check_permissions():
         owner = pwd.getpwuid(st.st_uid).pw_name
         group = grp.getgrgid(st.st_gid).gr_name
 
-        if owner != "pi" or group != "pi":
-            print(f"✗ {INSTALL_PATH} gehört {owner}:{group} statt pi:pi")
+        if owner != INSTALL_USER or group != INSTALL_USER:
+            print(f"✗ {INSTALL_PATH} gehört {owner}:{group} statt {INSTALL_USER}:{INSTALL_USER}")
             issues.append("owner")
         else:
-            print(f"✓ {INSTALL_PATH} gehört pi:pi")
+            print(f"✓ {INSTALL_PATH} gehört {INSTALL_USER}:{INSTALL_USER}")
 
         mode = oct(st.st_mode)[-3:]
         if mode != "755":
@@ -73,11 +76,11 @@ def check_webportal_permissions():
         owner = pwd.getpwuid(st.st_uid).pw_name
         group = grp.getgrgid(st.st_gid).gr_name
 
-        if owner != "pi" or group != "www-data":
-            print(f"✗ {wp_path} gehört {owner}:{group} statt pi:www-data")
+        if owner != INSTALL_USER or group != "www-data":
+            print(f"✗ {wp_path} gehört {owner}:{group} statt {INSTALL_USER}:www-data")
             issues.append("wp_owner")
         else:
-            print(f"✓ {wp_path} gehört pi:www-data")
+            print(f"✓ {wp_path} gehört {INSTALL_USER}:www-data")
 
         mode = oct(st.st_mode)[-3:]
         if mode != "775":
@@ -111,22 +114,22 @@ def check_file_permissions():
     """Prüft Dateien, die PHP schreiben muss (config/wallbox) und Python-Dateien."""
     print("\n=== Datei-Rechteprüfung ===\n")
 
-    # Dateien, die von PHP geschrieben werden (gehören zu www-data)
-    php_writable_files = [
-        f"{INSTALL_PATH}/e3dc.config.txt",
-        f"{INSTALL_PATH}/e3dc.wallbox.txt"
+    # Konfigurationsdateien (pi:www-data mit 664)
+    config_files = [
+        (f"{INSTALL_PATH}/e3dc.config.txt", "664"),
+        (f"{INSTALL_PATH}/e3dc.wallbox.txt", "664"),
+        (f"{INSTALL_PATH}/e3dc.strompreis.txt", "664")  # Strompreise
     ]
     
-    # Andere Python-Dateien (gehören zu pi:www-data)
-    python_files = [
-        f"{INSTALL_PATH}/plot_soc_changes.py",
-        f"{INSTALL_PATH}/e3dc.strompreis.txt"
+    # Ausführbare Python-Dateien (pi:www-data mit 755)
+    executable_files = [
+        (f"{INSTALL_PATH}/plot_soc_changes.py", "755")
     ]
     
     issues = {}
     
-    # Prüfe PHP-Dateien (sollten pi:www-data gehören)
-    for path in php_writable_files:
+    # Prüfe Konfigurationsdateien (pi:www-data mit 664)
+    for path, expected_mode in config_files:
         if not os.path.exists(path):
             continue
         
@@ -136,24 +139,23 @@ def check_file_permissions():
             owner = pwd.getpwuid(st.st_uid).pw_name
             group = grp.getgrgid(st.st_gid).gr_name
             
-            is_group_writable = bool(st.st_mode & 0o020)
-            status_ok = owner == "pi" and group == "www-data" and mode == "664" and is_group_writable
+            status_ok = owner == INSTALL_USER and group == "www-data" and mode == expected_mode
             
             if status_ok:
-                print(f"✓ {path} OK (pi:www-data)")
+                print(f"✓ {os.path.basename(path)} OK ({INSTALL_USER}:www-data, {expected_mode})")
             else:
-                print(f"✗ {path} Problem (sollte pi:www-data sein)")
+                print(f"✗ {os.path.basename(path)} Problem")
                 issues[path] = {
-                    "owner": owner != "pi",
+                    "owner": owner != INSTALL_USER,
                     "group": group != "www-data",
-                    "mode": mode != "664",
-                    "php_writable": True
+                    "mode": mode != expected_mode,
+                    "expected_mode": expected_mode
                 }
         except Exception as e:
             print(f"✗ Fehler bei {path}: {e}")
     
-    # Prüfe Python-Dateien (gehören zu pi:www-data)
-    for path in python_files:
+    # Prüfe ausführbare Python-Dateien (pi:www-data mit 755)
+    for path, expected_mode in executable_files:
         if not os.path.exists(path):
             continue
         
@@ -163,18 +165,18 @@ def check_file_permissions():
             owner = pwd.getpwuid(st.st_uid).pw_name
             group = grp.getgrgid(st.st_gid).gr_name
             
-            is_group_writable = bool(st.st_mode & 0o020)
-            status_ok = owner == "pi" and group == "www-data" and mode == "775" and is_group_writable
+            is_executable = bool(st.st_mode & 0o111)
+            status_ok = owner == INSTALL_USER and group == "www-data" and mode == expected_mode and is_executable
             
             if status_ok:
-                print(f"✓ {path} OK (pi:www-data)")
+                print(f"✓ {os.path.basename(path)} OK ({INSTALL_USER}:www-data, {expected_mode}, ausführbar)")
             else:
-                print(f"✗ {path} Problem (sollte pi:www-data sein)")
+                print(f"✗ {os.path.basename(path)} Problem")
                 issues[path] = {
-                    "owner": owner != "pi",
+                    "owner": owner != INSTALL_USER,
                     "group": group != "www-data",
-                    "mode": mode != "775",
-                    "php_writable": False
+                    "mode": mode != expected_mode,
+                    "expected_mode": expected_mode
                 }
         except Exception as e:
             print(f"✗ Fehler bei {path}: {e}")
@@ -189,14 +191,14 @@ def fix_permissions(issues):
     success = True
 
     if "home" in issues:
-        result = run_command("sudo chmod o+rx /home/pi")
+        result = run_command(f"sudo chmod o+rx {INSTALL_HOME}")
         if result['success']:
-            print("✓ /home/pi Rechte korrigiert")
+            print(f"✓ {INSTALL_HOME} Rechte korrigiert")
         else:
             success = False
 
     if "owner" in issues:
-        result = run_command(f"sudo chown -R pi:pi {INSTALL_PATH}")
+        result = run_command(f"sudo chown -R {INSTALL_USER}:{INSTALL_USER} {INSTALL_PATH}")
         if result['success']:
             print("✓ Besitzer korrigiert")
         else:
@@ -231,7 +233,7 @@ def fix_webportal_permissions(issues):
             success = False
 
     if "wp_owner" in issues:
-        result = run_command(f"sudo chown -R pi:www-data {wp_path}")
+        result = run_command(f"sudo chown -R {INSTALL_USER}:www-data {wp_path}")
         if result['success']:
             print("✓ Besitzer korrigiert")
         else:
@@ -261,8 +263,59 @@ def fix_webportal_permissions(issues):
     return success
 
 
+def cleanup_root_owned_files():
+    """Sucht und bereinigt root-eigene Dateien in INSTALL_PATH."""
+    if not os.path.exists(INSTALL_PATH):
+        return True
+    
+    print("\n■ Prüfe auf root-eigene Dateien…\n")
+    cleaned = 0
+    
+    try:
+        for root, dirs, files in os.walk(INSTALL_PATH):
+            # Prüfe Ordner
+            for d in dirs:
+                dir_path = os.path.join(root, d)
+                try:
+                    st = os.stat(dir_path)
+                    owner = pwd.getpwuid(st.st_uid).pw_name
+                    
+                    if owner == "root":
+                        result = run_command(f"sudo chown {INSTALL_USER}:{INSTALL_USER} {dir_path}")
+                        if result['success']:
+                            print(f"  ✓ {os.path.relpath(dir_path, INSTALL_PATH)} von root bereinigt")
+                            cleaned += 1
+                except Exception:
+                    pass
+            
+            # Prüfe Dateien
+            for f in files:
+                file_path = os.path.join(root, f)
+                try:
+                    st = os.stat(file_path)
+                    owner = pwd.getpwuid(st.st_uid).pw_name
+                    
+                    if owner == "root":
+                        result = run_command(f"sudo chown {INSTALL_USER}:{INSTALL_USER} {file_path}")
+                        if result['success']:
+                            print(f"  ✓ {os.path.relpath(file_path, INSTALL_PATH)} von root bereinigt")
+                            cleaned += 1
+                except Exception:
+                    pass
+    except Exception as e:
+        print(f"✗ Fehler beim Scannen: {e}")
+        return False
+    
+    if cleaned > 0:
+        print(f"✓ {cleaned} Datei(en)/Ordner bereinigt\n")
+    else:
+        print("✓ Keine root-eigenen Dateien gefunden\n")
+    
+    return True
+
+
 def fix_file_permissions(issues):
-    """Korrigiert Datei-Rechte für PHP-Zugriff."""
+    """Korrigiert Datei-Rechte für Konfiguration und ausführbare Dateien."""
     if not issues:
         return True
     
@@ -270,25 +323,22 @@ def fix_file_permissions(issues):
     success = True
     
     for path, file_issues in issues.items():
-        is_php_file = file_issues.get("php_writable", False)
+        expected_mode = file_issues.get("expected_mode", "664")
         
+        # Setze Owner auf <user>:www-data
         if file_issues["owner"] or file_issues["group"]:
-            if is_php_file:
-                # PHP-Dateien gehören zu pi:www-data
-                result = run_command(f"sudo chown pi:www-data {path}")
+            result = run_command(f"sudo chown {INSTALL_USER}:www-data {path}")
+            if result['success']:
+                print(f"✓ {os.path.basename(path)}: Owner korrigiert")
             else:
-                # Python-Dateien gehören zu pi:www-data
-                result = run_command(f"sudo chown pi:www-data {path}")
-            
-            if not result['success']:
                 success = False
         
+        # Setze Modus
         if file_issues["mode"]:
-            if is_php_file:
-                result = run_command(f"sudo chmod 664 {path}")
+            result = run_command(f"sudo chmod {expected_mode} {path}")
+            if result['success']:
+                print(f"✓ {os.path.basename(path)}: Rechte auf {expected_mode} gesetzt")
             else:
-                result = run_command(f"sudo chmod 775 {path}")
-            if not result['success']:
                 success = False
     
     return success
@@ -296,6 +346,11 @@ def fix_file_permissions(issues):
 
 def run_permissions_wizard():
     """Hauptlogik für Rechteprüfung und -korrektur."""
+    # Als erstes: Bereinige root-eigene Dateien falls vorhanden
+    cleanup_success = cleanup_root_owned_files()
+    if not cleanup_success:
+        print("⚠ Warnung: Cleanup von root-Dateien hatte Fehler")
+    
     issues = check_permissions()
     wp_issues = check_webportal_permissions()
     file_issues = check_file_permissions()

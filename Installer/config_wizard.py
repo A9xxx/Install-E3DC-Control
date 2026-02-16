@@ -2,8 +2,9 @@ import os
 
 from .core import register_command
 from .utils import replace_in_file
+from .installer_config import get_install_path
 
-INSTALL_PATH = "/home/pi/E3DC-Control"
+INSTALL_PATH = get_install_path()
 CONFIG_FILE = os.path.join(INSTALL_PATH, "e3dc.config.txt")
 
 

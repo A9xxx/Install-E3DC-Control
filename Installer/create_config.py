@@ -1,8 +1,9 @@
 import os
 
 from .core import register_command
+from .installer_config import get_install_path, get_user_ids, get_www_data_gid
 
-INSTALL_PATH = "/home/pi/E3DC-Control"
+INSTALL_PATH = get_install_path()
 CONFIG_FILE = os.path.join(INSTALL_PATH, "e3dc.config.txt")
 
 
@@ -183,76 +184,89 @@ def write_e3dc_config(cfg):
     try:
         os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
         
-        with open(CONFIG_FILE, "w") as f:
-            # Grunddaten
-            write_param(f, "server_ip", cfg["server_ip"])
-            write_param(f, "server_port", cfg["server_port"])
-            write_param(f, "e3dc_user", cfg["user"])
-            write_param(f, "e3dc_password", cfg["password"])
-            write_param(f, "aes_password", cfg["aes"])
-            write_param(f, "stop", cfg["stop"])
+        # Umask setzen für korrekte File-Berechtigungen
+        old_umask = os.umask(0o002)
+        try:
+            with open(CONFIG_FILE, "w") as f:
+                # Grunddaten
+                write_param(f, "server_ip", cfg["server_ip"])
+                write_param(f, "server_port", cfg["server_port"])
+                write_param(f, "e3dc_user", cfg["user"])
+                write_param(f, "e3dc_password", cfg["password"])
+                write_param(f, "aes_password", cfg["aes"])
+                write_param(f, "stop", cfg["stop"])
 
-            f.write("\n# Leistungs- und Speicherparameter\n")
-            write_param(f, "wrleistung", cfg["wrleistung"])
-            write_param(f, "speichergroesse", cfg["speichergroesse"])
-            write_param(f, "speicherEV", cfg["speicherEV"])
-            write_param(f, "speicherETA", cfg["speicherETA"])
-            write_param(f, "einspeiselimit", cfg["einspeiselimit"])
-            write_param(f, "unload", cfg["unload"])
-            write_param(f, "ladeschwelle", cfg["ladeschwelle"])
-            write_param(f, "ladeende", cfg["ladeende"])
-            write_param(f, "ladeende2", cfg["ladeende2"])
-            write_param(f, "Ladeende2rampe", cfg["Ladeende2rampe"])
-            write_param(f, "maximumLadeleistung", cfg["maximumLadeleistung"])
-            write_param(f, "powerfaktor", cfg["powerfaktor"])
-            write_param(f, "rb", cfg["rb"])
-            write_param(f, "re", cfg["re"])
-            write_param(f, "le", cfg["le"])
+                f.write("\n# Leistungs- und Speicherparameter\n")
+                write_param(f, "wrleistung", cfg["wrleistung"])
+                write_param(f, "speichergroesse", cfg["speichergroesse"])
+                write_param(f, "speicherEV", cfg["speicherEV"])
+                write_param(f, "speicherETA", cfg["speicherETA"])
+                write_param(f, "einspeiselimit", cfg["einspeiselimit"])
+                write_param(f, "unload", cfg["unload"])
+                write_param(f, "ladeschwelle", cfg["ladeschwelle"])
+                write_param(f, "ladeende", cfg["ladeende"])
+                write_param(f, "ladeende2", cfg["ladeende2"])
+                write_param(f, "Ladeende2rampe", cfg["Ladeende2rampe"])
+                write_param(f, "maximumLadeleistung", cfg["maximumLadeleistung"])
+                write_param(f, "powerfaktor", cfg["powerfaktor"])
+                write_param(f, "rb", cfg["rb"])
+                write_param(f, "re", cfg["re"])
+                write_param(f, "le", cfg["le"])
 
-            # Wallbox
-            f.write("\n# Wallbox Parameter\n")
-            write_param(f, "wallbox", str(cfg["wallbox"]).lower())
-            write_param(f, "wbmode", cfg.get("wbmode", ""), cfg["wallbox"])
-            write_param(f, "wbminlade", cfg.get("wbminlade", ""), cfg["wallbox"])
-            write_param(f, "wbminSoC", cfg.get("wbminSoC", ""), cfg["wallbox"])
-            write_param(f, "wbmaxladestrom", cfg.get("wbmaxladestrom", ""), cfg["wallbox"])
-            write_param(f, "wbminladestrom", cfg.get("wbminladestrom", ""), cfg["wallbox"])
-            write_param(f, "wbhour", cfg.get("wbhour", ""), cfg["wallbox"])
-            write_param(f, "Wbvon", cfg.get("Wbvon", ""), cfg["wallbox"])
-            write_param(f, "Wbbis", cfg.get("Wbbis", ""), cfg["wallbox"])
+                # Wallbox
+                f.write("\n# Wallbox Parameter\n")
+                write_param(f, "wallbox", str(cfg["wallbox"]).lower())
+                write_param(f, "wbmode", cfg.get("wbmode", ""), cfg["wallbox"])
+                write_param(f, "wbminlade", cfg.get("wbminlade", ""), cfg["wallbox"])
+                write_param(f, "wbminSoC", cfg.get("wbminSoC", ""), cfg["wallbox"])
+                write_param(f, "wbmaxladestrom", cfg.get("wbmaxladestrom", ""), cfg["wallbox"])
+                write_param(f, "wbminladestrom", cfg.get("wbminladestrom", ""), cfg["wallbox"])
+                write_param(f, "wbhour", cfg.get("wbhour", ""), cfg["wallbox"])
+                write_param(f, "Wbvon", cfg.get("Wbvon", ""), cfg["wallbox"])
+                write_param(f, "Wbbis", cfg.get("Wbbis", ""), cfg["wallbox"])
 
-            # Wärmepumpe
-            f.write("\n# Wärmepumpe Parameter\n")
-            write_param(f, "WP", str(cfg["WP"]).lower())
-            write_param(f, "shellyem_ip", cfg.get("shellyem_ip", ""), cfg["WP"])
-            write_param(f, "WPHeizlast", cfg.get("WPHeizlast", ""), cfg["WP"])
-            write_param(f, "WPHeizgrenze", cfg.get("WPHeizgrenze", ""), cfg["WP"])
-            write_param(f, "WPLeistung", cfg.get("WPLeistung", ""), cfg["WP"])
-            write_param(f, "WPMin", cfg.get("WPMin", ""), cfg["WP"])
-            write_param(f, "WPMax", cfg.get("WPMax", ""), cfg["WP"])
+                # Wärmepumpe
+                f.write("\n# Wärmepumpe Parameter\n")
+                write_param(f, "WP", str(cfg["WP"]).lower())
+                write_param(f, "shellyem_ip", cfg.get("shellyem_ip", ""), cfg["WP"])
+                write_param(f, "WPHeizlast", cfg.get("WPHeizlast", ""), cfg["WP"])
+                write_param(f, "WPHeizgrenze", cfg.get("WPHeizgrenze", ""), cfg["WP"])
+                write_param(f, "WPLeistung", cfg.get("WPLeistung", ""), cfg["WP"])
+                write_param(f, "WPMin", cfg.get("WPMin", ""), cfg["WP"])
+                write_param(f, "WPMax", cfg.get("WPMax", ""), cfg["WP"])
 
-            # Awattar
-            f.write("\n# Awattar Parameter\n")
-            write_param(f, "awattar", str(cfg["awattar"]).lower())
-            write_param(f, "awmwst", cfg.get("awmwst", ""), cfg["awattar"])
-            write_param(f, "awnebenkosten", cfg.get("awnebenkosten", ""), cfg["awattar"])
-            write_param(f, "awaufschlag", cfg.get("awaufschlag", ""), cfg["awattar"])
-            write_param(f, "awland", cfg.get("awland", ""), cfg["awattar"])
-            write_param(f, "awreserve", cfg.get("awreserve", ""), cfg["awattar"])
+                # Awattar
+                f.write("\n# Awattar Parameter\n")
+                write_param(f, "awattar", str(cfg["awattar"]).lower())
+                write_param(f, "awmwst", cfg.get("awmwst", ""), cfg["awattar"])
+                write_param(f, "awnebenkosten", cfg.get("awnebenkosten", ""), cfg["awattar"])
+                write_param(f, "awaufschlag", cfg.get("awaufschlag", ""), cfg["awattar"])
+                write_param(f, "awland", cfg.get("awland", ""), cfg["awattar"])
+                write_param(f, "awreserve", cfg.get("awreserve", ""), cfg["awattar"])
 
-            # OpenMeteo + Forecast
-            f.write("\n# OpenMeteo & Forecast Parameter\n")
-            write_param(f, "openmeteo", str(cfg["openmeteo"]).lower())
-            write_param(f, "hoehe", cfg.get("hoehe", ""), cfg["openmeteo"])
-            write_param(f, "laenge", cfg.get("laenge", ""), cfg["openmeteo"])
-            write_param(f, "forecast1", cfg.get("forecast1", ""), cfg["openmeteo"])
-            write_param(f, "forecast2", cfg.get("forecast2", ""), cfg.get("forecast2_enabled", False))
-            write_param(f, "forecast3", cfg.get("forecast3", ""), cfg.get("forecast3_enabled", False))
-            write_param(f, "ForecastSoc", cfg.get("ForecastSoc", ""), cfg["openmeteo"])
-            write_param(f, "ForecastConsumption", cfg.get("ForecastConsumption", ""), cfg["openmeteo"])
-            write_param(f, "ForecastReserve", cfg.get("ForecastReserve", ""), cfg["openmeteo"])
+                # OpenMeteo + Forecast
+                f.write("\n# OpenMeteo & Forecast Parameter\n")
+                write_param(f, "openmeteo", str(cfg["openmeteo"]).lower())
+                write_param(f, "hoehe", cfg.get("hoehe", ""), cfg["openmeteo"])
+                write_param(f, "laenge", cfg.get("laenge", ""), cfg["openmeteo"])
+                write_param(f, "forecast1", cfg.get("forecast1", ""), cfg["openmeteo"])
+                write_param(f, "forecast2", cfg.get("forecast2", ""), cfg.get("forecast2_enabled", False))
+                write_param(f, "forecast3", cfg.get("forecast3", ""), cfg.get("forecast3_enabled", False))
+                write_param(f, "ForecastSoc", cfg.get("ForecastSoc", ""), cfg["openmeteo"])
+                write_param(f, "ForecastConsumption", cfg.get("ForecastConsumption", ""), cfg["openmeteo"])
+                write_param(f, "ForecastReserve", cfg.get("ForecastReserve", ""), cfg["openmeteo"])
+        finally:
+            os.umask(old_umask)
+        
+        # Setze korrekten Owner und Berechtigungen
+        try:
+            uid, _ = get_user_ids()
+            os.chown(CONFIG_FILE, uid, get_www_data_gid())
+            os.chmod(CONFIG_FILE, 0o664)      # rw-rw-r-- damit PHP schreiben kann
+        except Exception as e:
+            print(f"⚠ Warnung: Berechtigungen konnten nicht vollständig gesetzt werden: {e}")
+            pass
 
-        os.chmod(CONFIG_FILE, 0o664)
         return True
     except Exception as e:
         print(f"✗ Fehler beim Schreiben der Konfiguration: {e}")

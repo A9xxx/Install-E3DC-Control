@@ -16,6 +16,7 @@ import re
 
 from .core import register_command
 from .utils import run_command
+from .installer_config import get_install_user
 
 # Repository-Informationen
 GITHUB_REPO = "A9xxx/Install-E3DC-Control"
@@ -227,10 +228,11 @@ def extract_release(zip_path, new_version):
             except Exception as e:
                 print(f"⚠ Konnte VERSION-Datei nicht aktualisieren: {e}")
             
-            # Setze Besitzrechte auf pi:pi für den Installationsordner
+            # Setze Besitzrechte für den Installationsordner
             try:
-                subprocess.run(["chown", "-R", "pi:pi", INSTALLER_DIR], check=True)
-                print(f"✓ Rechte für {INSTALLER_DIR} auf pi:pi gesetzt")
+                install_user = get_install_user()
+                subprocess.run(["chown", "-R", f"{install_user}:{install_user}", INSTALLER_DIR], check=True)
+                print(f"✓ Rechte für {INSTALLER_DIR} auf {install_user}:{install_user} gesetzt")
             except Exception as e:
                 print(f"⚠ Konnte Rechte nicht setzen: {e}")
             # Entferne alte Sicherung

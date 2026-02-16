@@ -4,8 +4,9 @@ import shutil
 
 from .core import register_command
 from .utils import run_command
+from .installer_config import get_install_path, get_install_user
 
-INSTALL_PATH = "/home/pi/E3DC-Control"
+INSTALL_PATH = get_install_path()
 
 
 def uninstall_e3dc():
@@ -20,7 +21,8 @@ def uninstall_e3dc():
     # Cronjob entfernen
     print("→ Entferne Cronjob…")
     try:
-        result = run_command("sudo crontab -l", timeout=5)
+        install_user = get_install_user()
+        result = run_command(f"sudo -u {install_user} crontab -l", timeout=5)
         
         if result['success']:
             lines = [
@@ -31,22 +33,23 @@ def uninstall_e3dc():
             if lines:
                 new_cron = "\n".join(lines) + "\n"
                 process = subprocess.Popen(
-                    ["sudo", "crontab", "-"],
+                    ["sudo", "-u", install_user, "crontab", "-"],
                     stdin=subprocess.PIPE,
                     text=True
                 )
                 process.communicate(input=new_cron, timeout=10)
                 print("✓ Cronjob entfernt")
             else:
-                run_command("sudo crontab -r", timeout=5)
+                run_command(f"sudo -u {install_user} crontab -r", timeout=5)
                 print("✓ Cronjob gelöscht")
     except Exception as e:
         print(f"⚠ Fehler beim Entfernen des Cronjobs: {e}")
 
     # Screen-Session beenden
     print("→ Beende Screen-Session…")
-    run_command("screen -S E3DC -X quit", timeout=5)
-    run_command("pkill -f E3DC-Control", timeout=5)
+    install_user = get_install_user()
+    run_command(f"sudo -u {install_user} screen -S E3DC -X quit", timeout=5)
+    run_command(f"sudo -u {install_user} pkill -f E3DC-Control", timeout=5)
     print("✓ Screen-Session beendet")
 
     # Webportal optional löschen

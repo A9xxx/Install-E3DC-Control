@@ -4,8 +4,9 @@ import shutil
 
 from .core import register_command
 from .utils import run_command
+from .installer_config import get_install_path
 
-INSTALL_PATH = "/home/pi/E3DC-Control"
+INSTALL_PATH = get_install_path()
 WEBPORTAL_FILES = [
     "wallbox.php",
     "start_content.php",

@@ -5,8 +5,9 @@ import time
 from .core import register_command
 from .backup import backup_current_version
 from .utils import replace_in_file, run_command
+from .installer_config import get_install_path, get_install_user
 
-INSTALL_PATH = "/home/pi/E3DC-Control"
+INSTALL_PATH = get_install_path()
 
 
 def get_current_version():
@@ -119,13 +120,14 @@ def update_e3dc():
 
     # Prüfe auf lokale Änderungen
     print("→ Prüfe auf lokale Änderungen…")
-    result1 = subprocess.run(f"cd {INSTALL_PATH} && git diff --quiet", shell=True)
-    result2 = subprocess.run(f"cd {INSTALL_PATH} && git diff --cached --quiet", shell=True)
+    install_user = get_install_user()
+    result1 = subprocess.run(f"sudo -u {install_user} bash -c 'cd {INSTALL_PATH} && git diff --quiet'", shell=True)
+    result2 = subprocess.run(f"sudo -u {install_user} bash -c 'cd {INSTALL_PATH} && git diff --cached --quiet'", shell=True)
     has_changes = (result1.returncode != 0 or result2.returncode != 0)
 
     if has_changes:
         print("⚠ Lokale Änderungen gefunden – sichere automatisch per git stash…")
-        result = run_command(f"cd {INSTALL_PATH} && git stash push -m 'Auto-Stash vor Update'")
+        result = run_command(f"sudo -u {install_user} bash -c 'cd {INSTALL_PATH} && git stash push -m \"Auto-Stash vor Update\"'")
         if not result['success']:
             print("✗ Stash fehlgeschlagen. Update abgebrochen.\n")
             return
@@ -135,13 +137,13 @@ def update_e3dc():
 
     # Update durchführen
     print("→ Hole neue Version…")
-    result = run_command(f"cd {INSTALL_PATH} && git pull", timeout=60)
+    result = run_command(f"sudo -u {install_user} bash -c 'cd {INSTALL_PATH} && git pull'", timeout=60)
     if not result['success']:
         print("✗ Git Pull fehlgeschlagen. Update abgebrochen.\n")
         return
 
     print("→ Kompiliere neue Version…")
-    result = run_command(f"cd {INSTALL_PATH} && make", timeout=300)
+    result = run_command(f"sudo -u {install_user} bash -c 'cd {INSTALL_PATH} && make'", timeout=300)
     if not result['success']:
         print("✗ Kompilierung fehlgeschlagen. Update abgebrochen.\n")
         return

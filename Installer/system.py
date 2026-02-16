@@ -4,8 +4,9 @@ import subprocess
 
 from .core import register_command
 from .utils import apt_install, pip_install, run_command
+from .installer_config import get_install_path, get_install_user
 
-INSTALL_PATH = "/home/pi/E3DC-Control"
+INSTALL_PATH = get_install_path()
 
 
 def install_system_packages():
@@ -25,7 +26,7 @@ def install_system_packages():
     for pkg in packages:
         apt_install(pkg)
 
-    python_packages = ["plotly", "pandas-stubs", "pytz", "matplotlib"]
+    python_packages = ["plotly>=5.0", "pandas-stubs", "pytz", "matplotlib"]
     print("\n→ Installiere Python-Pakete…\n")
     for pkg in python_packages:
         pip_install(pkg)
@@ -41,8 +42,8 @@ def install_e3dc_control():
         print("⚠ E3DC-Control existiert bereits.")
         choice = input("Überschreiben? (j/n): ").strip().lower()
         if choice != "j":
-            print("→ Installation abgebrochen.\n")
-            return False
+            print("→ Schritt übersprungen, verwende vorhandene Installation.\n")
+            return True
         print("→ Entferne altes Verzeichnis…")
         try:
             shutil.rmtree(INSTALL_PATH, ignore_errors=True)
@@ -51,8 +52,9 @@ def install_e3dc_control():
             return False
 
     print("→ Klone Repository…")
+    install_user = get_install_user()
     result = run_command(
-        "git clone https://github.com/Eba-M/E3DC-Control.git {}".format(INSTALL_PATH),
+        f"sudo -u {install_user} git clone https://github.com/Eba-M/E3DC-Control.git {INSTALL_PATH}",
         timeout=120
     )
 
@@ -61,7 +63,7 @@ def install_e3dc_control():
         return False
 
     print("→ Kompiliere…")
-    result = run_command(f"cd {INSTALL_PATH} && make", timeout=300)
+    result = run_command(f"sudo -u {install_user} bash -c 'cd {INSTALL_PATH} && make'", timeout=300)
 
     if not result['success']:
         print(f"✗ Kompilierung fehlgeschlagen: {result['stderr']}\n")

@@ -10,12 +10,13 @@ from .strompreis_wizard import strompreis_wizard
 from .screen_cron import install_screen_cron
 from .backup import backup_current_version
 from .utils import run_command
+from .installer_config import get_install_path, get_user_ids, get_www_data_gid
 
-INSTALL_PATH = "/home/pi/E3DC-Control"
+INSTALL_PATH = get_install_path()
 
 
 def restart_apache():
-    """Startet Apache2 neu."""
+    """Startet Apache2 neu. Gibt True zurück bei Erfolg."""
     print("→ Starte Apache2 neu…")
     try:
         result = run_command("sudo systemctl restart apache2", timeout=10)
@@ -28,6 +29,11 @@ def restart_apache():
     except Exception as e:
         print(f"⚠ Fehler: {e}\n")
         return False
+
+
+def collect_installation_errors():
+    """Sammelt und gibt Fehler am Ende aus."""
+    return {}
 
 
 def finalize_permissions():
@@ -44,19 +50,10 @@ def finalize_permissions():
     if wp_issues:
         fix_webportal_permissions(wp_issues)
     
-    # Datei-Rechte
-    files_to_check = [
-        (f"{INSTALL_PATH}/e3dc.config.txt", "664"),
-        (f"{INSTALL_PATH}/e3dc.wallbox.txt", "664"),
-        (f"{INSTALL_PATH}/e3dc.strompreis.txt", "664"),
-        (f"{INSTALL_PATH}/plot_soc_changes.py", "755")
-    ]
-    
-    for file_path, mode in files_to_check:
-        if os.path.exists(file_path):
-            file_issues = check_file_permissions()
-            if file_issues:
-                fix_file_permissions(file_issues)
+    # Datei-Rechte (alle auf einmal prüfen und fixen)
+    file_issues = check_file_permissions()
+    if file_issues:
+        fix_file_permissions(file_issues)
     
     print("✓ Finale Berechtigungen gesetzt.\n")
 
@@ -68,14 +65,14 @@ def install_all_main():
     print("=" * 60 + "\n")
 
     print("Diese Installation führt folgende Schritte in dieser Reihenfolge durch:\n")
-    print("  1. Berechtigungen prüfen & setzen (Initial)")
+    print("  1. Berechtigungen prüfen & korrigieren (Initial)")
     print("  2. Systempakete installieren (build-essential, Apache, PHP, etc.)")
     print("  3. E3DC-Control klonen & kompilieren")
     print("  4. Webportal & Diagramm-System einrichten")
-    print("  5. E3DC-Konfiguration erstellen")
+    print("  5. E3DC-Konfiguration & Wallbox-Datei erstellen")
     print("  6. Strompreise konfigurieren (optional)")
     print("  7. Screen-Session & Cronjob einrichten")
-    print("  8. FINALE BERECHTIGUNGSSETZUNG")
+    print("  8. Berechtigungen verifizieren & final setzen")
     print("  9. Backup der Initialversion erstellen\n")
 
     confirm = input("Alle Schritte ausführen? (j/n): ").strip().lower()
@@ -83,13 +80,40 @@ def install_all_main():
         print("→ Abgebrochen.\n")
         return
 
+    # Fehler-Sammler für abschließende Ausgabe
+    errors = {}
+
     # =========================================================
-    # SCHRITT 1: Berechtigungen (Initial)
+    # SCHRITT 1: Berechtigungen (Initial) - PRÜFE & KORRIGIERE SOFORT
     # =========================================================
     print("\n" + "=" * 60)
     print("SCHRITT 1 / 9: Berechtigungen prüfen & korrigieren (Initial)")
     print("=" * 60)
-    run_permissions_wizard()
+    print("\n→ Prüfe und korrigiere Berechtigungen…\n")
+    
+    # Verzeichnis-Rechte
+    dir_issues = check_permissions()
+    if dir_issues:
+        print("⚠ Verzeichnis-Berechtigungen werden korrigiert…")
+        fix_permissions(dir_issues)
+    else:
+        print("✓ Verzeichnis-Berechtigungen OK")
+    
+    # Webportal-Rechte
+    wp_issues = check_webportal_permissions()
+    if wp_issues:
+        print("⚠ Webportal-Berechtigungen werden korrigiert…")
+        fix_webportal_permissions(wp_issues)
+    else:
+        print("✓ Webportal-Berechtigungen OK")
+    
+    # Datei-Rechte (nur vorhandene Dateien prüfen)
+    file_issues = check_file_permissions()
+    if file_issues:
+        print("⚠ Datei-Berechtigungen werden korrigiert…")
+        fix_file_permissions(file_issues)
+    else:
+        print("✓ Datei-Berechtigungen OK\n")
 
     # =========================================================
     # SCHRITT 2: Systempakete
@@ -116,10 +140,15 @@ def install_all_main():
     print("\n" + "=" * 60)
     print("SCHRITT 4 / 9: Webportal & Diagramm-System")
     print("=" * 60)
-    install_diagramm()
-    
-    # Starte Apache neu nach Installation
-    restart_apache()
+    try:
+        install_diagramm()
+        
+        # Starte Apache neu nach Installation
+        if not restart_apache():
+            print("⚠ Apache-Neustart fehlgeschlagen – fahre fort.\n")
+    except Exception as e:
+        print(f"⚠ Warnung bei Diagramm-Installation: {e}")
+        print("→ Installation wird fortgesetzt.\n")
 
     # =========================================================
     # SCHRITT 5: Konfiguration
@@ -127,7 +156,27 @@ def install_all_main():
     print("\n" + "=" * 60)
     print("SCHRITT 5 / 9: E3DC-Konfiguration erstellen")
     print("=" * 60)
-    create_e3dc_config()
+    try:
+        create_e3dc_config()
+        
+        # Erstelle auch leere wallbox.txt wenn noch nicht vorhanden
+        wallbox_file = os.path.join(INSTALL_PATH, "e3dc.wallbox.txt")
+        if not os.path.exists(wallbox_file):
+            try:
+                with open(wallbox_file, "w") as f:
+                    f.write("# Wallbox Konfiguration\n")
+                    f.write("# Wird automatisch von der Weboberfläche generiert\n")
+                uid, _ = get_user_ids()
+                os.chown(wallbox_file, uid, get_www_data_gid())  # <user>:www-data
+                os.chmod(wallbox_file, 0o664)
+                print(f"✓ Wallbox-Datei erstellt: {wallbox_file}\n")
+            except Exception as e:
+                print(f"⚠ Wallbox-Datei konnte nicht erstellt werden: {e}\n")
+                errors["wallbox"] = str(e)
+    except Exception as e:
+        print(f"⚠ Warnung bei Konfiguration: {e}")
+        print("→ Installation wird fortgesetzt (Config kann später angepasst werden).\n")
+        errors["config"] = str(e)
 
     # =========================================================
     # SCHRITT 6: Strompreise (optional)
@@ -137,7 +186,11 @@ def install_all_main():
     print("=" * 60)
     choice = input("Strompreise jetzt konfigurieren? (j/n): ").strip().lower()
     if choice == "j":
-        strompreis_wizard()
+        try:
+            strompreis_wizard()
+        except Exception as e:
+            print(f"⚠ Warnung bei Strompreis-Konfiguration: {e}\n")
+            errors["strompreis"] = str(e)
     else:
         print("→ Übersprungen (kann später hinzugefügt werden).\n")
 
@@ -147,14 +200,19 @@ def install_all_main():
     print("\n" + "=" * 60)
     print("SCHRITT 7 / 9: Screen-Session & Cronjob einrichten")
     print("=" * 60)
-    install_screen_cron()
+    try:
+        install_screen_cron()
+    except Exception as e:
+        print(f"⚠ Warnung bei Screen/Cronjob-Setup: {e}\n")
+        errors["screen_cron"] = str(e)
 
     # =========================================================
-    # SCHRITT 8: FINALE BERECHTIGUNGEN
+    # SCHRITT 8: FINALE BERECHTIGUNGEN (Sicherheitscheck)
     # =========================================================
     print("\n" + "=" * 60)
-    print("SCHRITT 8 / 9: Finale Berechtigungssetzung")
+    print("SCHRITT 8 / 9: Berechtigungen verifizieren & final setzen")
     print("=" * 60)
+    print("\n→ Verifiziere alle Berechtigungen nach der Installation…\n")
     finalize_permissions()
 
     # =========================================================
@@ -164,24 +222,37 @@ def install_all_main():
     print("SCHRITT 9 / 9: Backup erstellen")
     print("=" * 60)
     print("→ Erstelle Backup der Initialversion…")
-    backup_current_version()
+    try:
+        backup_current_version()
+    except Exception as e:
+        print(f"⚠ Warnung bei Backup: {e}\n")
+        errors["backup"] = str(e)
 
     # =========================================================
-    # Abschluss
+    # Abschluss + Fehlersammlung
     # =========================================================
     print("\n" + "=" * 60)
-    print("✓ KOMPLÈTE INSTALLATION ERFOLGREICH ABGESCHLOSSEN")
+    if errors:
+        print("✓ INSTALLATION ABGESCHLOSSEN (mit Warnungen)")
+    else:
+        print("✓ KOMPLÈTE INSTALLATION ERFOLGREICH ABGESCHLOSSEN")
     print("=" * 60 + "\n")
+
+    # Fehler-Zusammenfassung am Ende
+    if errors:
+        print("⚠ FOLGENDE WARNUNGEN TRATEN AUF:\n")
+        for step, error in errors.items():
+            print(f"  [{step}] {error}")
+        print()
 
     print("Nächste Schritte:")
     print("  1. Webportal öffnen:")
     print("     → http://localhost oder http://<PI-IP>\n")
     print("  2. E3DC-Control starten:")
-    print("     → Menüpunkt '7' oder 'screen -r E3DC'\n")
-    print("  3. Ausgabe ansehen:")
-    print("     → 'screen -r E3DC'\n")
-    print("  4. Session verlassen:")
-    print("     → Ctrl+A Ctrl+D\n")
+    print("     → Mit 'screen -r E3DC' überprüfen (läuft bei Reboot automatisch)\n")
+    print("  3. Bei Fehlern: Config überprüfen")
+    if "config" in errors:
+        print(f"     → {INSTALL_PATH}/e3dc.config.txt\n")
 
 
 register_command("11", "Alles installieren", install_all_main, sort_order=110)

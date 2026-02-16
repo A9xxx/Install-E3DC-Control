@@ -3,8 +3,9 @@ import re
 
 from .core import register_command
 from .utils import ensure_dir
+from .installer_config import get_install_path, get_user_ids, get_www_data_gid
 
-INSTALL_PATH = "/home/pi/E3DC-Control"
+INSTALL_PATH = get_install_path()
 PRICE_FILE = os.path.join(INSTALL_PATH, "e3dc.strompreis.txt")
 
 # Standardwerte
@@ -81,6 +82,11 @@ def create_default_price_file():
             for line in DEFAULT_ENTRIES:
                 f.write(line + "\n")
         
+        try:
+            uid, _ = get_user_ids()
+            os.chown(PRICE_FILE, uid, get_www_data_gid())
+        except Exception:
+            pass
         os.chmod(PRICE_FILE, 0o664)
         print(f"✓ Datei erstellt: {PRICE_FILE}\n")
         return True
@@ -117,15 +123,27 @@ def load_entries():
 def save_entries(parsed_prices):
     """Speichert die Strompreise (sortiert nach Stunde)."""
     try:
-        with open(PRICE_FILE, "w") as f:
-            f.write("# Strompreise (Stunde Preis)\n")
-            f.write("# Format: 0-23 (Stunde) und Preis in €/kWh\n\n")
-            
-            for hour in sorted(parsed_prices.keys()):
-                price = parsed_prices[hour]
-                f.write(f"{hour} {price}\n")
+        # Umask setzen für korrekte File-Berechtigungen
+        old_umask = os.umask(0o002)
+        try:
+            with open(PRICE_FILE, "w") as f:
+                f.write("# Strompreise (Stunde Preis)\n")
+                f.write("# Format: 0-23 (Stunde) und Preis in €/kWh\n\n")
+                
+                for hour in sorted(parsed_prices.keys()):
+                    price = parsed_prices[hour]
+                    f.write(f"{hour} {price}\n")
+        finally:
+            os.umask(old_umask)
         
-        os.chmod(PRICE_FILE, 0o664)
+        # Setze korrekten Owner und Berechtigungen
+        try:
+            uid, _ = get_user_ids()
+            os.chown(PRICE_FILE, uid, get_www_data_gid())
+            os.chmod(PRICE_FILE, 0o664)      # rw-rw-r-- damit PHP schreiben kann
+        except Exception as e:
+            print(f"⚠ Warnung: Berechtigungen konnten nicht vollständig gesetzt werden: {e}")
+        
         return True
     except Exception as e:
         print(f"✗ Fehler beim Speichern: {e}")

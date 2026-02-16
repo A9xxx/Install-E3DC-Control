@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-diagrammphp.py - E3DC-Control Komplett-Installation
+diagrammphp.py - Diagramm-System & Web-Portal Installation
 
 FEATURES:
-- Extrahiert E3DC-Control.zip automatisch
+- Extrahiert E3DC-Control.zip automatisch (Diagramm-Dateien)
 - Installiert plot_soc_changes.py nach /home/pi/E3DC-Control/
-- Kopiert PHP/HTML-Dateien nach /var/www/html/
+- Kopiert Web-Portal-Dateien (PHP/HTML/CSS) nach /var/www/html/
 - Erstellt /var/www/html/tmp/ Verzeichnis
 - Setzt korrekte Berechtigungen (www-data)
 - Python-Umgebung prüfen (Python 3 + plotly)
@@ -25,6 +25,12 @@ import zipfile
 import tempfile
 from pathlib import Path
 from . import core
+from .installer_config import (
+    get_install_path,
+    get_install_user,
+    get_user_ids,
+    get_www_data_gid
+)
 
 # Logging einrichten
 logging.basicConfig(
@@ -33,7 +39,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-INSTALL_PATH = "/home/pi/E3DC-Control"
+INSTALL_PATH = get_install_path()
 WWW_PATH = "/var/www/html"
 TMP_PATH = "/var/www/html/tmp"
 CONFIG_FILE = os.path.join(INSTALL_PATH, "diagram_config.json")
@@ -56,6 +62,9 @@ class DiagramInstaller:
         self.enable_wallbox = True
         self.enable_heatpump = True
         self.plot_script_path = os.path.join(self.install_path, PLOT_SCRIPT_NAME)
+        self.install_user = get_install_user()
+        self.install_uid, _ = get_user_ids()
+        self.www_data_gid = get_www_data_gid()
     
     # ============================================================
     # SYSTEM-PRÜFUNGEN
@@ -84,7 +93,7 @@ class DiagramInstaller:
             print("   Installation: sudo apt-get install python3")
             return False
         
-        # plotly prüfen
+        # plotly prüfen (mindestens 5.0 erforderlich)
         try:
             result = subprocess.run(
                 ["python3", "-c", "import plotly; print(plotly.__version__)"],
@@ -95,7 +104,45 @@ class DiagramInstaller:
             if result.returncode == 0:
                 plotly_version = result.stdout.strip()
                 print(f"✓ plotly {plotly_version}")
-                return True
+
+                def _parse_version(version_str):
+                    parts = []
+                    for token in version_str.split("."):
+                        num = ""
+                        for ch in token:
+                            if ch.isdigit():
+                                num += ch
+                            else:
+                                break
+                        if num:
+                            parts.append(int(num))
+                        else:
+                            break
+                    while len(parts) < 3:
+                        parts.append(0)
+                    return tuple(parts[:3])
+
+                if _parse_version(plotly_version) >= (5, 0, 0):
+                    return True
+
+                print("⚠ plotly ist zu alt (mindestens 5.0 erforderlich)")
+                choice = input("\nPlotly auf >=5.0 aktualisieren? (j/n): ").strip().lower()
+                if choice == 'j':
+                    print("\nAktualisiere plotly...")
+                    try:
+                        subprocess.run(
+                            ["pip3", "install", "--upgrade", "plotly>=5.0"],
+                            check=True
+                        )
+                        print("✓ plotly erfolgreich aktualisiert")
+                        return True
+                    except subprocess.CalledProcessError:
+                        print("❌ Update fehlgeschlagen")
+                        print("   Manuell: pip3 install --upgrade 'plotly>=5.0'")
+                        return False
+                else:
+                    print("⚠️  plotly >= 5.0 wird benötigt für Diagramme")
+                    return False
             else:
                 raise ImportError()
         
@@ -107,14 +154,14 @@ class DiagramInstaller:
                 print("\nInstalliere plotly...")
                 try:
                     subprocess.run(
-                        ["pip3", "install", "plotly"],
+                        ["pip3", "install", "plotly>=5.0"],
                         check=True
                     )
                     print("✓ plotly erfolgreich installiert")
                     return True
                 except subprocess.CalledProcessError:
                     print("❌ Installation fehlgeschlagen")
-                    print("   Manuell: pip3 install plotly")
+                    print("   Manuell: pip3 install 'plotly>=5.0'")
                     return False
             else:
                 print("⚠️  plotly wird benötigt für Diagramme")
@@ -128,19 +175,25 @@ class DiagramInstaller:
     
     def extract_and_install_from_zip(self):
         """
-        Extrahiert E3DC-Control.zip und installiert alle Dateien:
+        Extrahiert E3DC-Control.zip und installiert Diagramm-System-Dateien:
         - plot_soc_changes.py → /home/pi/E3DC-Control/
-        - PHP/HTML Dateien → /var/www/html/
+        - PHP/HTML Web-Portal-Dateien → /var/www/html/
         - Erstellt /var/www/html/tmp/
         - Setzt Rechte für www-data
         """
         print("\n" + "-" * 60)
-        print("Installiere E3DC-Control aus ZIP-Datei...")
+        print("Installiere Diagramm-System aus ZIP-Datei...")
         print("-" * 60)
         
         # ZIP-Datei finden
         script_dir = os.path.dirname(os.path.abspath(__file__))
         zip_path = os.path.join(script_dir, ZIP_NAME)
+        
+        # Debug: Zeige gesuchte Pfade
+        print(f"→ Suche ZIP-Datei...")
+        print(f"  __file__: {__file__}")
+        print(f"  script_dir: {script_dir}")
+        print(f"  zip_path: {zip_path}")
         
         if not os.path.isfile(zip_path):
             print(f"❌ {ZIP_NAME} nicht gefunden!")
@@ -148,6 +201,17 @@ class DiagramInstaller:
             return False
         
         print(f"✓ ZIP gefunden: {zip_path}")
+        
+        # Debug: Zeige ZIP-Inhalte
+        print("\n→ ZIP-Inhalte:")
+        try:
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                for name in zip_ref.namelist()[:20]:  # Erste 20 Dateien
+                    print(f"  {name}")
+                if len(zip_ref.namelist()) > 20:
+                    print(f"  ... und {len(zip_ref.namelist()) - 20} weitere")
+        except Exception as e:
+            print(f"  ⚠️  Fehler beim Lesen: {e}")
         
         # Temporäres Verzeichnis für Extraktion
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -160,7 +224,7 @@ class DiagramInstaller:
                 print(f"✓ ZIP extrahiert nach: {temp_dir}")
                 
                 # 1) plot_soc_changes.py nach /home/pi/E3DC-Control/ kopieren
-                print("\n→ Installiere Python-Skript...")
+                print("\n→ Installiere Diagramm-Skript (plot_soc_changes.py)...")
                 source_script = os.path.join(temp_dir, PLOT_SCRIPT_NAME)
                 
                 if not os.path.isfile(source_script):
@@ -169,10 +233,10 @@ class DiagramInstaller:
                 
                 os.makedirs(self.install_path, exist_ok=True)
                 shutil.copy2(source_script, self.plot_script_path)
-                os.chmod(self.plot_script_path, 0o775)
+                os.chmod(self.plot_script_path, 0o755)
                 try:
                     subprocess.run(
-                        ["sudo", "chown", "pi:www-data", self.plot_script_path],
+                        ["sudo", "chown", f"{self.install_user}:www-data", self.plot_script_path],
                         check=True,
                         capture_output=True
                     )
@@ -180,8 +244,8 @@ class DiagramInstaller:
                     print(f"⚠️  Konnte Besitzer nicht setzen: {e}")
                 print(f"✓ {PLOT_SCRIPT_NAME} → {self.plot_script_path}")
                 
-                # 2) PHP/HTML Dateien nach /var/www/html/ kopieren
-                print("\n→ Installiere Web-Dateien...")
+                # 2) PHP/HTML Dateien nach /var/www/html/ kopieren (Web-Portal)
+                print("\n→ Installiere Web-Portal-Dateien (HTML, CSS, PHP)...")
                 html_source = os.path.join(temp_dir, "html")
                 
                 if not os.path.isdir(html_source):
@@ -209,11 +273,11 @@ class DiagramInstaller:
                 try:
                     # Besitzer auf www-data setzen
                     subprocess.run(
-                        ["sudo", "chown", "-R", "pi:www-data", WWW_PATH],
+                        ["sudo", "chown", "-R", f"{self.install_user}:www-data", WWW_PATH],
                         check=True,
                         capture_output=True
                     )
-                    print(f"✓ Besitzer: pi:www-data")
+                    print(f"✓ Besitzer: {self.install_user}:www-data")
                     
                     # Rechte setzen
                     subprocess.run(
@@ -226,7 +290,7 @@ class DiagramInstaller:
                 except subprocess.CalledProcessError as e:
                     print(f"⚠️  Berechtigungen konnten nicht gesetzt werden: {e}")
                     print("   Manuell ausführen:")
-                    print(f"   sudo chown -R pi:www-data {WWW_PATH}")
+                    print(f"   sudo chown -R {self.install_user}:www-data {WWW_PATH}")
                     print(f"   sudo chmod -R 775 {WWW_PATH}")
                 
                 print("\n✓ Installation abgeschlossen")
@@ -324,11 +388,27 @@ class DiagramInstaller:
         print("1 = Jede Minute (höchste Aktualität, höchste Last)")
         print("2 = Alle 5 Minuten")
         print("3 = Alle 10 Minuten")
-        print("4 = Alle 30 Minuten")
-        print("5 = Jede Stunde")
-        choice = input("Auswahl (1-5): ").strip()
+        print("4 = Alle 15 Minuten")
+        print("5 = Alle 30 Minuten")
+        print("6 = Jede Stunde")
+        print("7 = Eigene Eingabe")
+        choice = input("Auswahl (1-7): ").strip()
         
-        intervals = {"1": 1, "2": 5, "3": 10, "4": 30, "5": 60}
+        intervals = {"1": 1, "2": 5, "3": 10, "4": 15, "5": 30, "6": 60}
+        
+        if choice == "7":
+            # Eigene Eingabe
+            while True:
+                try:
+                    custom = input("Intervall in Minuten (1-1440): ").strip()
+                    minutes = int(custom)
+                    if 1 <= minutes <= 1440:  # Max 24 Stunden
+                        return minutes
+                    else:
+                        print("⚠ Bitte Wert zwischen 1 und 1440 eingeben")
+                except ValueError:
+                    print("⚠ Ungültige Eingabe, bitte Zahl eingeben")
+        
         return intervals.get(choice, 5)
     
     # ============================================================
@@ -367,7 +447,9 @@ class DiagramInstaller:
         Richtet crontab für automatische Diagramm-Aktualisierung ein.
         """
         if self.diagram_mode == "manual":
-            print("\n✓ Crontab nicht nötig (manueller Modus)")
+            # Im manuellen Modus: Entferne alten Crontab falls vorhanden
+            print("\n✓ Modus: MANUAL - Crontab wird entfernt falls vorhanden")
+            self.remove_crontab()
             return True
         
         try:
@@ -383,9 +465,9 @@ class DiagramInstaller:
             cron_schedule = self._get_cron_schedule(self.auto_interval)
             cron_line = f"{cron_schedule} /usr/bin/python3 {plot_script} {awattar_data} normal # {CRON_COMMENT}"
             
-            # Existierende crons auslesen
+            # Existierende crons auslesen - WICHTIG: Als install_user!
             result = subprocess.run(
-                ["crontab", "-l"],
+                ["sudo", "-u", self.install_user, "crontab", "-l"],
                 capture_output=True,
                 text=True
             )
@@ -400,9 +482,13 @@ class DiagramInstaller:
             new_crons.append(cron_line)
             new_crons_text = '\n'.join(new_crons)
             
-            # In crontab eintragen
+            # Stelle sicher, dass der Text mit Newline endet
+            if new_crons_text and not new_crons_text.endswith('\n'):
+                new_crons_text += '\n'
+            
+            # In crontab eintragen - WICHTIG: Als install_user!
             process = subprocess.Popen(
-                ["crontab", "-"],
+                ["sudo", "-u", self.install_user, "crontab", "-"],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -426,8 +512,9 @@ class DiagramInstaller:
     def remove_crontab(self):
         """Entfernt E3DC-Crontab"""
         try:
+            # Lese crontab als install_user
             result = subprocess.run(
-                ["crontab", "-l"],
+                ["sudo", "-u", self.install_user, "crontab", "-l"],
                 capture_output=True,
                 text=True
             )
@@ -444,8 +531,13 @@ class DiagramInstaller:
             
             new_crons_text = '\n'.join(new_crons)
             
+            # Stelle sicher, dass der Text mit Newline endet
+            if new_crons_text and not new_crons_text.endswith('\n'):
+                new_crons_text += '\n'
+            
+            # Schreibe crontab als install_user
             process = subprocess.Popen(
-                ["crontab", "-"],
+                ["sudo", "-u", self.install_user, "crontab", "-"],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -469,6 +561,8 @@ class DiagramInstaller:
             return "*/5 * * * *"  # jede 5. Minute
         elif minutes == 10:
             return "*/10 * * * *"
+        elif minutes == 15:
+            return "*/15 * * * *"
         elif minutes == 30:
             return "*/30 * * * *"
         elif minutes == 60:
@@ -493,6 +587,11 @@ class DiagramInstaller:
             os.makedirs(self.install_path, exist_ok=True)
             with open(self.config_file, 'w') as f:
                 json.dump(config, f, indent=2)
+            try:
+                os.chown(self.config_file, self.install_uid, self.www_data_gid)
+                os.chmod(self.config_file, 0o664)
+            except Exception as e:
+                logger.warning(f"Konnte Berechtigungen nicht setzen: {e}")
             print(f"\n✓ Konfiguration gespeichert: {self.config_file}")
             return True
         except Exception as e:
@@ -561,13 +660,12 @@ class DiagramInstaller:
             # Bei choice == "1" wird nur Konfiguration gemacht (unten)
         
         else:
-            # Skript fehlt - Installation anbieten
-            print(f"\n⚠️  {PLOT_SCRIPT_NAME} nicht gefunden")
-            
-            choice = input("\nMöchtest du E3DC-Control installieren? (j/n): ").strip().lower()
+            # Skript fehlt - erste Installation
+            # Direkt fragen, ob aus ZIP installiert werden soll
+            choice = input("\nDiagramm-System aus ZIP-Datei installieren? (j/n): ").strip().lower()
             
             if choice != 'j':
-                print("Installation abgebrochen")
+                print("Installation übersprungen")
                 return False
             
             # Aus ZIP installieren

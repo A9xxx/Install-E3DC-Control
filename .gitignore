@@ -12,6 +12,9 @@ Install.backup/
 # Spezifische ZIP-Datei vom Update-Prozess
 Install-E3DC-Control.zip
 E3DC-Install-*.zip
+Installer/E3DC-Control.zip
+# Installer-Konfiguration (lokal)
+Installer/installer_config.json
 
 # Temporäre Dateien
 *.tmp

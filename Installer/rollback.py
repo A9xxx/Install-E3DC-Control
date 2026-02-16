@@ -6,8 +6,9 @@ import shutil
 from .core import register_command
 from .backup import choose_backup_version, restore_backup
 from .utils import replace_in_file, run_command
+from .installer_config import get_install_path, get_install_user
 
-INSTALL_PATH = "/home/pi/E3DC-Control"
+INSTALL_PATH = get_install_path()
 
 
 def hard_stop_e3dc():
@@ -15,6 +16,8 @@ def hard_stop_e3dc():
     print("→ Stoppe E3DC-Control vollständig…")
 
     try:
+        install_user = get_install_user()
+        
         # Setze Stop-Flag
         config_file = os.path.join(INSTALL_PATH, "e3dc.config.txt")
         if os.path.exists(config_file):
@@ -22,10 +25,10 @@ def hard_stop_e3dc():
         
         # Beende Prozesse
         commands = [
-            "screen -S E3DC -X quit",
-            "pkill -f E3DC-Control",
-            "pkill -f E3DC.sh",
-            f"pkill -f {INSTALL_PATH}/E3DC.sh"
+            f"sudo -u {install_user} screen -S E3DC -X quit",
+            f"sudo -u {install_user} pkill -f E3DC-Control",
+            f"sudo -u {install_user} pkill -f E3DC.sh",
+            f"sudo -u {install_user} pkill -f {INSTALL_PATH}/E3DC.sh"
         ]
         
         for cmd in commands:
@@ -43,7 +46,8 @@ def start_e3dc():
     """Startet E3DC-Control."""
     print("→ Starte E3DC-Control…")
     
-    result = run_command(f"screen -dmS E3DC {INSTALL_PATH}/E3DC.sh", timeout=5)
+    install_user = get_install_user()
+    result = run_command(f"sudo -u {install_user} screen -dmS E3DC {INSTALL_PATH}/E3DC.sh", timeout=5)
     
     if result['success']:
         print("✓ E3DC-Control gestartet")
@@ -150,7 +154,8 @@ def rollback_to_commit(commit_hash):
 
     # Kompilierung
     print("→ Kompiliere…")
-    result = run_command(f"cd {INSTALL_PATH} && make", timeout=300)
+    install_user = get_install_user()
+    result = run_command(f"sudo -u {install_user} bash -c 'cd {INSTALL_PATH} && make'", timeout=300)
     if not result['success']:
         print(f"✗ Kompilierung fehlgeschlagen")
         return False

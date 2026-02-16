@@ -9,9 +9,10 @@ import re
 import subprocess
 from .core import register_command
 from .utils import run_command
+from .installer_config import get_install_path
 
 
-CONFIG_FILE = os.path.expanduser("~/E3DC-Control/e3dc.config.txt")
+CONFIG_FILE = os.path.join(get_install_path(), "e3dc.config.txt")
 MQTT_PACKAGES = ["mosquitto-clients", "python3-paho-mqtt"]
 
 

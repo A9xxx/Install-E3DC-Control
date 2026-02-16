@@ -5,7 +5,7 @@ import subprocess
 
 from .core import register_command
 from .utils import run_command
-from .installer_config import get_install_path, get_install_user, get_home_dir
+from .installer_config import get_install_path, get_install_user, get_home_dir, get_www_data_gid
 
 INSTALL_USER = get_install_user()
 INSTALL_HOME = get_home_dir(INSTALL_USER)
@@ -18,12 +18,21 @@ def check_permissions():
 
     issues = []
 
-    # Home-Verzeichnis muss für Webserver lesbar sein
-    if not os.access(INSTALL_HOME, os.X_OK):
-        print(f"✗ {INSTALL_HOME} ist NICHT für Webserver lesbar")
+    # Home-Verzeichnis muss für www-data betretbar sein (execute-bit)
+    try:
+        st_home = os.stat(INSTALL_HOME)
+        www_data_gid = get_www_data_gid()
+        other_x = bool(st_home.st_mode & 0o001)
+        group_x = st_home.st_gid == www_data_gid and bool(st_home.st_mode & 0o010)
+
+        if not other_x and not group_x:
+            print(f"✗ {INSTALL_HOME} ist NICHT für www-data erreichbar")
+            issues.append("home")
+        else:
+            print(f"✓ {INSTALL_HOME} ist für www-data erreichbar")
+    except Exception as e:
+        print(f"✗ Fehler beim Prüfen von {INSTALL_HOME}: {e}")
         issues.append("home")
-    else:
-        print(f"✓ {INSTALL_HOME} ist für Webserver lesbar")
 
     # INSTALL_PATH prüfen
     if not os.path.exists(INSTALL_PATH):
@@ -103,6 +112,15 @@ def check_webportal_permissions():
             else:
                 print(f"✓ {tmp_path} hat korrekte Rechte (777)")
 
+            www_data_gid = get_www_data_gid()
+            other_wx = bool(st_tmp.st_mode & 0o003)
+            group_wx = st_tmp.st_gid == www_data_gid and bool(st_tmp.st_mode & 0o030)
+            if not other_wx and not group_wx:
+                print(f"✗ {tmp_path} ist für www-data nicht schreibbar")
+                issues.append("tmp_not_writable")
+            else:
+                print(f"✓ {tmp_path} ist für www-data schreibbar")
+
     except Exception as e:
         print(f"✗ Fehler beim Prüfen: {e}")
         issues.append("error")
@@ -124,6 +142,17 @@ def check_file_permissions():
     # Ausführbare Python-Dateien (pi:www-data mit 755)
     executable_files = [
         (f"{INSTALL_PATH}/plot_soc_changes.py", "755")
+    ]
+
+    # Web-Ausgabedateien (pi:www-data mit 664)
+    web_files = [
+        ("/var/www/html/diagramm.html", "664"),
+        ("/var/www/html/archiv_diagramm.html", "664"),
+        ("/var/www/html/tmp/plot_soc_done", "666"),
+        ("/var/www/html/tmp/plot_soc_done_archiv", "666"),
+        ("/var/www/html/tmp/plot_soc_error", "664", True),
+        ("/var/www/html/tmp/plot_soc_error_archiv", "664", True),
+        ("/var/www/html/tmp/plot_soc_last_run", "666")
     ]
     
     issues = {}
@@ -180,6 +209,43 @@ def check_file_permissions():
                 }
         except Exception as e:
             print(f"✗ Fehler bei {path}: {e}")
+
+    # Prüfe Web-Ausgabedateien (pi:www-data mit 664)
+    for entry in web_files:
+        if len(entry) == 3:
+            path, expected_mode, allow_missing = entry
+        else:
+            path, expected_mode = entry
+            allow_missing = False
+        if not os.path.exists(path):
+            if not allow_missing:
+                print(f"✗ {os.path.basename(path)} fehlt")
+                issues[path] = {
+                    "missing": True,
+                    "expected_mode": expected_mode
+                }
+            continue
+
+        try:
+            st = os.stat(path)
+            mode = oct(st.st_mode)[-3:]
+            owner = pwd.getpwuid(st.st_uid).pw_name
+            group = grp.getgrgid(st.st_gid).gr_name
+
+            status_ok = owner == INSTALL_USER and group == "www-data" and mode == expected_mode
+
+            if status_ok:
+                print(f"✓ {os.path.basename(path)} OK ({INSTALL_USER}:www-data, {expected_mode})")
+            else:
+                print(f"✗ {os.path.basename(path)} Problem")
+                issues[path] = {
+                    "owner": owner != INSTALL_USER,
+                    "group": group != "www-data",
+                    "mode": mode != expected_mode,
+                    "expected_mode": expected_mode
+                }
+        except Exception as e:
+            print(f"✗ Fehler bei {path}: {e}")
     
     return issues
 
@@ -191,7 +257,7 @@ def fix_permissions(issues):
     success = True
 
     if "home" in issues:
-        result = run_command(f"sudo chmod o+rx {INSTALL_HOME}")
+        result = run_command(f"sudo chmod o+x {INSTALL_HOME}")
         if result['success']:
             print(f"✓ {INSTALL_HOME} Rechte korrigiert")
         else:
@@ -253,7 +319,7 @@ def fix_webportal_permissions(issues):
         else:
             success = False
 
-    if "tmp_missing" in issues or "tmp_mode" in issues:
+    if "tmp_missing" in issues or "tmp_mode" in issues or "tmp_not_writable" in issues:
         result = run_command(f"sudo chmod -R 777 {wp_path}/tmp")
         if result['success']:
             print("✓ tmp-Rechte korrigiert")
@@ -324,9 +390,18 @@ def fix_file_permissions(issues):
     
     for path, file_issues in issues.items():
         expected_mode = file_issues.get("expected_mode", "664")
+
+        # Fehlende Dateien anlegen
+        if file_issues.get("missing"):
+            result = run_command(f"sudo touch {path}")
+            if result['success']:
+                print(f"✓ {os.path.basename(path)} erstellt")
+            else:
+                success = False
+                continue
         
         # Setze Owner auf <user>:www-data
-        if file_issues["owner"] or file_issues["group"]:
+        if file_issues.get("owner") or file_issues.get("group") or file_issues.get("missing"):
             result = run_command(f"sudo chown {INSTALL_USER}:www-data {path}")
             if result['success']:
                 print(f"✓ {os.path.basename(path)}: Owner korrigiert")
@@ -334,7 +409,7 @@ def fix_file_permissions(issues):
                 success = False
         
         # Setze Modus
-        if file_issues["mode"]:
+        if file_issues.get("mode") or file_issues.get("missing"):
             result = run_command(f"sudo chmod {expected_mode} {path}")
             if result['success']:
                 print(f"✓ {os.path.basename(path)}: Rechte auf {expected_mode} gesetzt")

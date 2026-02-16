@@ -19,6 +19,7 @@ import sys
 import json
 import subprocess
 import platform
+import socket
 import logging
 import shutil
 import zipfile
@@ -695,6 +696,7 @@ class DiagramInstaller:
     
     def print_summary(self):
         """Zeigt Zusammenfassung"""
+        host = self._get_local_host()
         print("\n" + "=" * 60)
         print("INSTALLATION ABGESCHLOSSEN")
         print("=" * 60)
@@ -709,13 +711,29 @@ class DiagramInstaller:
             print(f"➤ Auto-Update: Alle {self.auto_interval} Minuten")
         print(f"➤ Config: {self.config_file}")
         print("\n💡 Tipps:")
-        print(f"  • Web-Interface: http://raspberrypi.local/")
-        print(f"  • Diagramm direkt: http://raspberrypi.local/diagramm.html")
+        print(f"  • Web-Interface: http://{host}/index.php")
+        print(f"  • Diagramm direkt: http://{host}/diagramm.html")
         print("  • Manuell ausführen:")
         print(f"    python3 {self.plot_script_path}")
         if self.diagram_mode in ("auto", "hybrid"):
             print(f"  • Crontab prüfen: crontab -l")
         print("=" * 60 + "\n")
+
+    @staticmethod
+    def _get_local_host():
+        """Ermittelt die lokale IP für die Anzeige im Tipp."""
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.connect(("8.8.8.8", 80))
+            ip_addr = sock.getsockname()[0]
+            return ip_addr if ip_addr else "raspberrypi.local"
+        except Exception:
+            return "raspberrypi.local"
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
 
 
 # ============================================================

@@ -215,4 +215,4 @@ def strompreis_wizard():
         print("\n✗ Speichern fehlgeschlagen.\n")
 
 
-register_command("14", "Strompreis-Wizard", strompreis_wizard, sort_order=140)
+register_command("9", "E3DC-Control Strompreis-Wizard", strompreis_wizard, sort_order=90)

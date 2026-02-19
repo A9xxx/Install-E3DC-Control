@@ -4,7 +4,7 @@ import shutil
 
 from .core import register_command
 from .utils import run_command
-from .installer_config import get_install_path
+from .installer_config import get_install_path, get_user_ids, get_www_data_gid
 
 INSTALL_PATH = get_install_path()
 WEBPORTAL_FILES = [
@@ -12,6 +12,10 @@ WEBPORTAL_FILES = [
     "start_content.php",
     "auto.php",
     "index.php",
+    "mobile.php",
+    "status.php",
+    "sw.js",
+    "manifest.json",
     "archiv_diagramm.php",
     "run_now.php",
     "archiv.php",
@@ -58,6 +62,14 @@ def backup_current_version():
                 except Exception as e:
                     print(f"  ⚠ Fehler bei {filename}: {e}")
         
+        # Icons sichern
+        icons_src = "/var/www/html/icons"
+        if os.path.exists(icons_src):
+            try:
+                shutil.copytree(icons_src, os.path.join(wp_backup_dir, "icons"), dirs_exist_ok=True)
+            except Exception as e:
+                print(f"  ⚠ Fehler beim Sichern der Icons: {e}")
+        
         print("  ✓ Webportal-Dateien gesichert")
 
         # Installer-Datei sichern
@@ -67,6 +79,22 @@ def backup_current_version():
                 shutil.copy2(plot_installer, backup_dir)
             except Exception:
                 pass
+
+        # Rechte des Backups auf den Installationsbenutzer setzen
+        try:
+            uid, _ = get_user_ids()
+            gid = get_www_data_gid()
+            
+            # Rekursiv alles im Backup-Ordner auf pi:www-data setzen
+            for root, dirs, files in os.walk(backup_dir):
+                for d in dirs:
+                    os.chown(os.path.join(root, d), uid, gid)
+                for f in files:
+                    os.chown(os.path.join(root, f), uid, gid)
+            os.chown(backup_dir, uid, gid)
+            print("  ✓ Besitzrechte auf pi:www-data gesetzt")
+        except Exception as e:
+            print(f"  ⚠ Konnte Besitzrechte für Backup nicht setzen: {e}")
 
         print("✓ Backup abgeschlossen.\n")
         return backup_dir
@@ -152,9 +180,18 @@ def restore_backup(backup_path):
                     src = os.path.join(wp_backup_dir, filename)
                     dst = os.path.join("/var/www/html", filename)
                     try:
-                        shutil.copy2(src, dst)
+                        if os.path.isdir(src):
+                            shutil.copytree(src, dst, dirs_exist_ok=True)
+                        else:
+                            shutil.copy2(src, dst)
                     except Exception as e:
                         print(f"  ⚠ {filename}: {e}")
+                
+                # Berechtigungen nach Restore korrigieren
+                print("\n→ Korrigiere Berechtigungen nach Wiederherstellung…")
+                from .permissions import run_permissions_wizard
+                run_permissions_wizard()
+                
                 print("  ✓ Webportal-Dateien wiederhergestellt")
 
         print("✓ Wiederherstellung abgeschlossen.\n")
@@ -181,4 +218,4 @@ def backup_menu():
         print("✗ Ungültige Auswahl.\n")
 
 
-register_command("2", "Backup verwalten", backup_menu, sort_order=20)
+register_command("14", "Backup verwalten", backup_menu, sort_order=140)

@@ -21,6 +21,7 @@ __all__ = [
     "config_wizard",
     "create_config",
     "strompreis_wizard",
+    "ramdisk",
     "uninstall",
     "install_all",
     "self_update"

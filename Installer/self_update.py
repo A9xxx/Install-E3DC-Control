@@ -367,4 +367,4 @@ def run_self_update_check():
 
 
 # Registriere als Menü-Befehl
-register_command("0", "Installer aktualisieren", run_self_update_check, sort_order=5)
+register_command("1", "Installer aktualisieren", run_self_update_check, sort_order=10)

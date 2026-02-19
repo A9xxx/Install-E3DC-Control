@@ -1,0 +1,173 @@
+"""
+IMPLEMENTIERUNGS-CHECKLISTE: Neue Logging-Features
+===================================================
+
+Die folgenden 3 neue Module wurden erstellt und müssen in das Projekt integriert werden:
+
+┌─────────────────────────────────────────────────────────────┐
+│  MODUL 1: logging_manager.py                                │
+├─────────────────────────────────────────────────────────────┤
+│ Zweck: Zentrales Logging-Management für alle Module         │
+│                                                              │
+│ Funktionen:                                                 │
+│   ✓ setup_installation_loggers()  → Initialisiert Logger    │
+│   ✓ log_menu_action()             → Logs Menü-Auswahl      │
+│   ✓ log_task_completed()          → Logs erfolgreiche Tasks│
+│   ✓ log_task_skipped()            → Logs übersprungene         │
+│   ✓ log_error()                   → Logs Fehler            │
+│   ✓ log_warning()                 → Logs Warnungen         │
+│   ✓ print_installation_summary()  → Finale Zusammenfassung │
+│                                                              │
+│ Logdateien (alle in /Install/logs/):                        │
+│   • install.log       → Allgemeine Installation-Events      │
+│   • permissions.log   → Permission-Checks & Fixes          │
+│   • backup.log        → Backup-Operationen                 │
+│   • error.log         → Detaillierte Fehler mit Stack-Trace│
+│                                                              │
+│ Integration in Module:                                      │
+│   from .logging_manager import setup_installation_loggers  │
+│   from .logging_manager import log_error, log_task_completed │
+└─────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│  MODUL 2: task_executor.py                                  │
+├─────────────────────────────────────────────────────────────┤
+│ Zweck: Sichere Task-Ausführung mit automatischer            │
+│        Fehlerbehandlung und Logging                         │
+│                                                              │
+│ Funktionen:                                                 │
+│   ✓ safe_execute_task()   → Führt Task mit Error-Handling  │
+│   ✓ safe_menu_action()    → Wrapper für Menü-Befehle       │
+│   ✓ wrap_menu_handlers()  → Wickelt alle Commands ein      │
+│                                                              │
+│ Usage in install_all.py:                                    │
+│   from .task_executor import safe_menu_action              │
+│   success = safe_menu_action("2", "Rechte prüfen", func)   │
+│                                                              │
+│ Funktionsweise:                                             │
+│   1. Menü-Auswahl wird geloggt                             │
+│   2. Task wird ausgeführt                                  │
+│   3. Bei Erfolg: log_task_completed()                      │
+│   4. Bei Fehler: log_error() + error.log mit Stack-Trace  │
+│   5. KeyboardInterrupt wird abgefangen                     │
+└─────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│  MODUL 3: INTEGRATIONS_GUIDE.py                             │
+├─────────────────────────────────────────────────────────────┤
+│ Zweck: Beispiel-Implementierung für install_all.py          │
+│                                                              │
+│ Zeigt:                                                      │
+│   • Hauptschleife mit Error-Handling                       │
+│   • Menu-Anzeige                                           │
+│   • Task-Ausführung mit safe_menu_action()                │
+│   • Finale Summary mit print_installation_summary()        │
+│   • Logging bei KeyboardInterrupt                          │
+│                                                              │
+│ Zum Anwenden auf reale install_all.py kopieren!             │
+└─────────────────────────────────────────────────────────────┘
+
+═════════════════════════════════════════════════════════════
+
+INTEGRATION IN BESTEHENDE DATEIEN:
+
+1️⃣  permissions.py
+    ✓ SCHON ANGEPASST
+    • Nutzt logging_manager statt eigenem Logger
+    • Ruft log_task_completed() und log_error() auf
+    • Imports: from .logging_manager import ...
+
+2️⃣  install_all.py  ← MANUELL ANPASSEN ERFORDERLICH
+    Schritte:
+    □ Imports hinzufügen:
+        from .logging_manager import setup_installation_loggers, print_installation_summary, log_error
+        from .task_executor import safe_menu_action
+    
+    □ main() anpassen:
+        - setup_installation_loggers() am Anfang aufrufen
+        - Menü-Loop mit Error-Handling umwickeln
+        - safe_menu_action() statt direkte Funktionsaufrufe
+        - print_installation_summary() am Ende aufrufen
+        - Siehe INTEGRATIONS_GUIDE.py für Beispiel!
+
+3️⃣  backup.py, rollback.py, uninstall.py, ramdisk.py  ← Optional verbessern
+    Empfehlung:
+    □ log_warning() bei kritischen Schritten
+    □ log_error() bei Exceptions
+    □ log_task_completed() bei erfolgreichen Operationen
+    
+    Beispiel:
+        from .logging_manager import log_error, log_task_completed
+        
+        try:
+            do_backup_operation()
+            log_task_completed("Backup erstellt", details="...")
+        except Exception as e:
+            log_error("backup", str(e), e)
+
+═════════════════════════════════════════════════════════════
+
+RESULTIERENDE LOGDATEIEN:
+
+Nach vollständiger Integration zeigen Sie:
+
+install.log:
+  2026-02-18 22:32:00 - INFO - E3DC Installer gestartet
+  2026-02-18 22:32:05 - INFO - → Benutzer wählte: Rechte prüfen & korrigieren (2)
+  2026-02-18 22:32:15 - INFO - ✓ Task abgeschlossen: Rechte prüfen & korrigieren
+  2026-02-18 22:32:20 - INFO - → Benutzer wählte: Backup erstellen (4)
+  2026-02-18 22:33:00 - INFO - ✓ Task abgeschlossen: Backup erstellen
+  ...
+  2026-02-18 22:35:00 - INFO - Installer vom Benutzer beendet
+
+permissions.log:
+  2026-02-18 22:32:07 - [INFO] - --- Starte Verzeichnis-Rechteprüfung ---
+  2026-02-18 22:32:07 - [INFO] - Home-Verzeichnis OK: /home/pi
+  2026-02-18 22:32:52 - [INFO] - Kommando: sudo chown pi:www-data /var/www/html
+  ...
+
+error.log:
+  2026-02-18 22:35:45 - [ERROR] - [backup] Backup-Verzeichnis nicht erreichbar
+  Traceback (most recent call last):
+    File "backup.py", line 45, in do_backup()
+    ...
+
+backup.log:  (wenn backup.py angepasst wird)
+  2026-02-18 22:32:20 - [INFO] - Backup-Version 20260218-223200 erstellt
+  2026-02-18 22:32:40 - [INFO] - Berechtigungen nach Backup korrekt
+  ...
+
+═════════════════════════════════════════════════════════════
+
+TESTING:
+
+Als Test können Sie folgende Szenarien prüfen:
+
+1. Normales Durchlaufen:
+   □ install.log zeigt alle Menü-Auswahl
+   □ permission.log zeigt Permission-Checks
+   □ Keine Doppel-Logs in install.log
+   □ Summary wird am Ende gezeigt und geloggt
+
+2. Task mit Fehler:
+   □ error.log zeigt Fehler mit Stack-Trace
+   □ install.log zeigt ✗ FEHLER in [Modul]
+   □ Installer läuft weiter, nicht abgebrochen
+
+3. KeyboardInterrupt (Ctrl+C):
+   □ Graceful shutdown mit "unterbrochen" Meldung
+   □ Summary wird trotzdem gezeigt
+   □ logs zeigen den Abbruch korrekt
+
+═════════════════════════════════════════════════════════════
+
+STATUS:
+
+✓ logging_manager.py        → Erstellt und einsatzbereit
+✓ task_executor.py          → Erstellt und einsatzbereit
+✓ permissions.py            → Angepasst um neue Logging zu nutzen
+⊘ install_all.py            → MANUELL ANPASSEN ERFORDERLICH (siehe oben)
+⊘ backup.py, rollback.py... → Optional für volle Abdeckung
+
+═════════════════════════════════════════════════════════════
+"""

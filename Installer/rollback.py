@@ -67,6 +67,12 @@ def rollback(backup_dir):
 
     success = restore_backup(backup_dir)
 
+    if success:
+        # Berechtigungen nach Backup-Restore korrigieren
+        print("\n→ Korrigiere Berechtigungen nach Wiederherstellung…")
+        from .permissions import run_permissions_wizard
+        run_permissions_wizard()
+
     # Service neustarten
     config_file = os.path.join(INSTALL_PATH, "e3dc.config.txt")
     if os.path.exists(config_file):
@@ -160,6 +166,11 @@ def rollback_to_commit(commit_hash):
         print(f"✗ Kompilierung fehlgeschlagen")
         return False
 
+    # Berechtigungen korrigieren
+    print("\n→ Korrigiere Berechtigungen nach Rollback…")
+    from .permissions import run_permissions_wizard
+    run_permissions_wizard()
+
     # Service neustarten
     config_file = os.path.join(INSTALL_PATH, "e3dc.config.txt")
     if os.path.exists(config_file):
@@ -212,5 +223,5 @@ def rollback_commit_menu():
             rollback_to_commit(commit)
 
 
-register_command("12", "Rollback (Backup)", rollback_menu, sort_order=120)
-register_command("13", "Rollback (Commit-Auswahl)", rollback_commit_menu, sort_order=130)
+register_command("15", "Rollback (Backup)", rollback_menu, sort_order=150)
+register_command("6", "E3DC-Control Rollback (Commit-Version)", rollback_commit_menu, sort_order=60)

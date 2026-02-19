@@ -148,6 +148,11 @@ def update_e3dc():
         print("✗ Kompilierung fehlgeschlagen. Update abgebrochen.\n")
         return
 
+    # Berechtigungen korrigieren
+    print("\n→ Korrigiere Berechtigungen nach Update…")
+    from .permissions import run_permissions_wizard
+    run_permissions_wizard()
+
     # Neustart mit gestopptem Service
     config_file = os.path.join(INSTALL_PATH, "e3dc.config.txt")
     if os.path.exists(config_file):
@@ -172,4 +177,4 @@ def update_menu():
     update_e3dc()
 
 
-register_command("3", "Update E3DC-Control", update_menu, sort_order=30)
+register_command("5", "E3DC-Control aktualisieren (neueste Version)", update_menu, sort_order=50)

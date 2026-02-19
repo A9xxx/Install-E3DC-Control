@@ -72,4 +72,4 @@ def config_wizard():
         print("\n→ Keine Änderungen gemacht.\n")
 
 
-register_command("6", "Configuration bearbeiten", config_wizard, sort_order=60)
+register_command("8", "E3DC-Control Konfiguration bearbeiten", config_wizard, sort_order=80)

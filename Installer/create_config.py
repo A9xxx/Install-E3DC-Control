@@ -1,4 +1,5 @@
 import os
+import shutil
 
 from .core import register_command
 from .installer_config import get_install_path, get_user_ids, get_www_data_gid
@@ -19,10 +20,59 @@ def write_param(f, key, value, enabled=True):
     f.write(f"{prefix}{key} = {value}\n")
 
 
+def copy_existing_config():
+    """Kopiert eine vorhandene e3dc.config.txt in den Zielordner."""
+    print("\n--- Vorhandene Konfiguration kopieren ---\n")
+    
+    default_source = "/home/pi/Install/e3dc.config.txt"
+    source_path = ask("Pfad zur vorhandenen e3dc.config.txt", default_source)
+    
+    if not os.path.exists(source_path):
+        print(f"✗ Datei nicht gefunden: {source_path}")
+        return False
+    
+    if not os.path.isfile(source_path):
+        print(f"✗ Kein gültiger Dateipfad: {source_path}")
+        return False
+    
+    try:
+        # Zielverzeichnis erstellen falls nicht vorhanden
+        os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+        
+        # Datei kopieren
+        shutil.copy2(source_path, CONFIG_FILE)
+        print(f"✓ Datei kopiert: {source_path} → {CONFIG_FILE}")
+        
+        # Berechtigungen setzen
+        try:
+            uid, _ = get_user_ids()
+            os.chown(CONFIG_FILE, uid, get_www_data_gid())
+            os.chmod(CONFIG_FILE, 0o664)  # rw-rw-r--
+            print(f"✓ Berechtigungen gesetzt (664, Besitzer: UID {uid})")
+        except Exception as e:
+            print(f"⚠ Warnung: Berechtigungen konnten nicht vollständig gesetzt werden: {e}")
+        
+        print(f"\n✓ Konfiguration erfolgreich kopiert und installiert!\n")
+        return True
+        
+    except Exception as e:
+        print(f"✗ Fehler beim Kopieren der Datei: {e}")
+        return False
+
+
 def create_e3dc_config():
     """Kompletter Config-Wizard mit allen Parametern und Defaults."""
     print("\n=== E3DC-Konfiguration erstellen ===\n")
-
+    
+    # Prüfen ob vorhandene Config kopiert werden soll
+    copy_existing = ask("Möchten Sie eine vorhandene e3dc.config.txt kopieren? (j/n)", "n")
+    
+    if copy_existing and copy_existing.lower() == "j":
+        if copy_existing_config():
+            return  # Erfolgreich kopiert, Wizard beenden
+        else:
+            print("\nFortfahren mit manuellem Wizard...\n")
+    
     cfg = {}
 
     # =========================================================
@@ -273,4 +323,4 @@ def write_e3dc_config(cfg):
         return False
 
 
-register_command("5", "E3DC-Konfiguration erstellen", create_e3dc_config, sort_order=50)
+register_command("7", "E3DC-Konfiguration erstellen", create_e3dc_config, sort_order=70)

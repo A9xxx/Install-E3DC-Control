@@ -212,4 +212,4 @@ def setup_openwb_mqtt():
 
 
 # Registriere als Menü-Befehl
-register_command("16", "openWB MQTT Integration einrichten", setup_openwb_mqtt, sort_order=160)
+register_command("10", "E3DC-Control openWB MQTT Integration einrichten", setup_openwb_mqtt, sort_order=100)

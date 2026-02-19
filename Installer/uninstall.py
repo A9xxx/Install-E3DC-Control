@@ -19,7 +19,7 @@ def uninstall_e3dc():
         return
 
     # Cronjob entfernen
-    print("→ Entferne Cronjob…")
+    print("→ Entferne Cronjobs…")
     try:
         install_user = get_install_user()
         result = run_command(f"sudo -u {install_user} crontab -l", timeout=5)
@@ -27,7 +27,7 @@ def uninstall_e3dc():
         if result['success']:
             lines = [
                 l.strip() for l in result['stdout'].splitlines()
-                if "E3DC" not in l and l.strip() and not l.strip().startswith("#")
+                if "E3DC" not in l and "get_live.sh" not in l and l.strip() and not l.strip().startswith("#")
             ]
             
             if lines:
@@ -46,11 +46,28 @@ def uninstall_e3dc():
         print(f"⚠ Fehler beim Entfernen des Cronjobs: {e}")
 
     # Screen-Session beenden
-    print("→ Beende Screen-Session…")
+    print("→ Beende Screen-Sessions…")
     install_user = get_install_user()
     run_command(f"sudo -u {install_user} screen -S E3DC -X quit", timeout=5)
+    run_command(f"sudo -u {install_user} screen -S live-grabber -X quit", timeout=5)
     run_command(f"sudo -u {install_user} pkill -f E3DC-Control", timeout=5)
-    print("✓ Screen-Session beendet")
+    run_command(f"sudo -u {install_user} pkill -f get_live.sh", timeout=5)
+    print("✓ Screen-Sessions beendet")
+
+    # RAM-Disk entfernen
+    print("→ Entferne RAM-Disk…")
+    run_command("sudo umount /var/www/html/ramdisk", timeout=5)
+    try:
+        if os.path.exists("/etc/fstab"):
+            with open("/etc/fstab", "r") as f:
+                f_lines = f.readlines()
+            with open("/etc/fstab", "w") as f:
+                for line in f_lines:
+                    if "/var/www/html/ramdisk" not in line:
+                        f.write(line)
+        print("✓ fstab bereinigt")
+    except Exception as e:
+        print(f"⚠ Fehler beim fstab Bereinigen: {e}")
 
     # Webportal optional löschen
     print("\n→ Webportal-Dateien:")
@@ -66,6 +83,15 @@ def uninstall_e3dc():
     # Konfiguration optional behalten
     print("\n→ Konfigurationsdateien:")
     keep_cfg = input("  Behalten? (j/n): ").strip().lower()
+
+    # Grabber Skript entfernen
+    grabber_script = os.path.join(os.path.expanduser(f"~{get_install_user()}"), "get_live.sh")
+    if os.path.exists(grabber_script):
+        try:
+            os.remove(grabber_script)
+            print("✓ Grabber-Skript entfernt")
+        except Exception as e:
+            print(f"⚠ Fehler beim Löschen von {grabber_script}: {e}")
 
     try:
         if keep_cfg == "j":
@@ -102,4 +128,4 @@ def uninstall_e3dc():
     print("\n✓ Deinstallation abgeschlossen.\n")
 
 
-register_command("15", "Deinstallation", uninstall_e3dc, sort_order=150)
+register_command("18", "Deinstallation", uninstall_e3dc, sort_order=180)

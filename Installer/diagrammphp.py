@@ -32,6 +32,12 @@ from .installer_config import (
     get_user_ids,
     get_www_data_gid
 )
+from .permissions_helper import (
+    set_file_ownership,
+    set_directory_ownership_recursive,
+    set_web_directory,
+    set_executable_script
+)
 
 # Logging einrichten
 logging.basicConfig(
@@ -234,65 +240,75 @@ class DiagramInstaller:
                 
                 os.makedirs(self.install_path, exist_ok=True)
                 shutil.copy2(source_script, self.plot_script_path)
-                os.chmod(self.plot_script_path, 0o755)
+                
+                # Setze Berechtigungen für das Skript (pi:www-data, 775)
                 try:
                     subprocess.run(
                         ["sudo", "chown", f"{self.install_user}:www-data", self.plot_script_path],
                         check=True,
                         capture_output=True
                     )
+                    subprocess.run(
+                        ["sudo", "chmod", "775", self.plot_script_path],
+                        check=True,
+                        capture_output=True
+                    )
                 except subprocess.CalledProcessError as e:
-                    print(f"⚠️  Konnte Besitzer nicht setzen: {e}")
+                    print(f"⚠️  Konnte Besitzer/Rechte für Skript nicht setzen: {e}")
                 print(f"✓ {PLOT_SCRIPT_NAME} → {self.plot_script_path}")
                 
-                # 2) PHP/HTML Dateien nach /var/www/html/ kopieren (Web-Portal)
-                print("\n→ Installiere Web-Portal-Dateien (HTML, CSS, PHP)...")
+                # 2) Web-Portal Dateien rekursiv nach /var/www/html/ kopieren
+                print("\n→ Installiere Web-Portal-Dateien (PHP, CSS, JS, Icons)...")
                 html_source = os.path.join(temp_dir, "html")
                 
                 if not os.path.isdir(html_source):
                     print(f"⚠️  Kein 'html'-Ordner in ZIP gefunden")
                 else:
-                    # Dateien kopieren
-                    file_count = 0
-                    for filename in os.listdir(html_source):
-                        source_file = os.path.join(html_source, filename)
-                        if os.path.isfile(source_file):
-                            dest_file = os.path.join(WWW_PATH, filename)
-                            shutil.copy2(source_file, dest_file)
-                            file_count += 1
-                    
-                    print(f"✓ {file_count} Dateien → {WWW_PATH}")
+                    # Dateien und Ordner (wie icons/) rekursiv kopieren
+                    import distutils.dir_util
+                    try:
+                        # distutils.dir_util.copy_tree eignet sich gut zum Zusammenführen
+                        distutils.dir_util.copy_tree(html_source, WWW_PATH)
+                        print(f"✓ Dateien und Unterordner (icons) → {WWW_PATH}")
+                    except Exception as e:
+                        print(f"⚠️  Fehler beim Kopieren des Webportal-Ordners: {e}")
                 
-                # 3) /var/www/html/tmp/ erstellen
-                print("\n→ Erstelle tmp-Verzeichnis...")
+                # 3) /var/www/html/tmp/ und icons/ Berechtigungen sicherstellen
+                print("\n→ Überprüfe Verzeichnisstrukturen...")
                 os.makedirs(TMP_PATH, exist_ok=True)
-                os.chmod(TMP_PATH, 0o777)
-                print(f"✓ tmp-Ordner erstellt: {TMP_PATH}")
+                print(f"✓ tmp-Ordner sichergestellt: {TMP_PATH}")
                 
-                # 4) Rechte setzen für www-data
+                # 4) Rechte für das gesamte Webportal setzen (pi:www-data, 775)
                 print("\n→ Setze Berechtigungen...")
                 try:
-                    # Besitzer auf www-data setzen
+                    # Besitzer auf pi:www-data setzen (-R für alles inkl. icons/)
                     subprocess.run(
                         ["sudo", "chown", "-R", f"{self.install_user}:www-data", WWW_PATH],
                         check=True,
                         capture_output=True
                     )
-                    print(f"✓ Besitzer: {self.install_user}:www-data")
-                    
-                    # Rechte setzen
+                    # Rechte setzen (-R für alles inkl. icons/)
+                    # 775 = rwxrwxr-x (Owner & Gruppe haben alle Rechte)
                     subprocess.run(
                         ["sudo", "chmod", "-R", "775", WWW_PATH],
                         check=True,
                         capture_output=True
                     )
-                    print(f"✓ Rechte: 775")
+                    # Ordner auf 775, Dateien auf 664
+                    for root, dirs, files in os.walk(WWW_PATH):
+                        for d in dirs:
+                            os.chmod(os.path.join(root, d), 0o775)
+                        for f in files:
+                            os.chmod(os.path.join(root, f), 0o664)
                     
-                except subprocess.CalledProcessError as e:
+                    # Spezielle Rechte für tmp (775, nicht 777 - nicht world-writable!)
+                    set_web_directory(TMP_PATH, recursive=False)
+                    
+                    print(f"✓ Besitzer für alle Dateien: {self.install_user}:www-data")
+                    print(f"✓ Rechte gesetzt (Ordner 775, Dateien 664)")
+                    
+                except Exception as e:
                     print(f"⚠️  Berechtigungen konnten nicht gesetzt werden: {e}")
-                    print("   Manuell ausführen:")
-                    print(f"   sudo chown -R {self.install_user}:www-data {WWW_PATH}")
-                    print(f"   sudo chmod -R 775 {WWW_PATH}")
                 
                 print("\n✓ Installation abgeschlossen")
                 return True
@@ -754,10 +770,10 @@ def install_diagramm():
 # ============================================================
 
 core.register_command(
-    key="4",
+    key="13",
     label="Diagramm-Installation & Automatisierung",
     func=install_diagramm,
-    sort_order=40
+    sort_order=130
 )
 
 

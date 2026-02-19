@@ -1,13 +1,43 @@
 import os
 import subprocess
+import logging
+
+_logging_initialized = False
+
+def setup_logging():
+    """Initialisiert das Logging in eine Datei."""
+    global _logging_initialized
+    if _logging_initialized:
+        return
+    
+    # Logfile im Ordner Logs oberhalb von Installer
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    log_dir = os.path.join(os.path.dirname(script_dir), "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, "install.log")
+    
+    logging.basicConfig(
+        filename=log_file,
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        encoding='utf-8'
+    )
+    _logging_initialized = True
 
 def run_command(cmd, timeout=10, use_shell=True):
-    """Führt Shell-Kommando aus mit vollständiger Fehlerbehandlung."""
+    """Führt Shell-Kommando aus mit vollständiger Fehlerbehandlung und Logging."""
+    setup_logging()
+    logging.info(f"Kommando: {cmd}")
     try:
         result = subprocess.run(
             cmd, shell=use_shell, timeout=timeout,
             capture_output=True, text=True
         )
+        if result.stdout.strip():
+            logging.info(f"STDOUT: {result.stdout.strip()[:1000]}...") # Gekürzt für das Log
+        if result.stderr.strip():
+            logging.error(f"STDERR: {result.stderr.strip()[:1000]}...")
+            
         return {
             'success': result.returncode == 0,
             'stdout': result.stdout,
@@ -15,8 +45,10 @@ def run_command(cmd, timeout=10, use_shell=True):
             'returncode': result.returncode
         }
     except subprocess.TimeoutExpired:
+        logging.error("Fehler: Timeout ausgegeben")
         return {'success': False, 'stdout': '', 'stderr': 'Timeout', 'returncode': -1}
     except Exception as e:
+        logging.error(f"Fehler bei Ausführung: {str(e)}")
         return {'success': False, 'stdout': '', 'stderr': str(e), 'returncode': -1}
 
 

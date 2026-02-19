@@ -11,6 +11,7 @@ from Installer.installer_config import (
     ensure_web_config,
     get_home_dir
 )
+from Installer.utils import setup_logging
 
 # Basis-Pfade
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -149,6 +150,9 @@ def check_permissions_on_startup():
 def main():
     """Haupteinstiegspunkt."""
     try:
+        # Logging initialisieren
+        setup_logging()
+        
         # Prüfungen
         check_python_version()
         check_root_privileges()

@@ -3,24 +3,66 @@ import datetime
 import shutil
 
 from .core import register_command
-from .utils import run_command
 from .installer_config import get_install_path, get_user_ids, get_www_data_gid
 
 INSTALL_PATH = get_install_path()
-WEBPORTAL_FILES = [
-    "wallbox.php",
-    "start_content.php",
-    "auto.php",
-    "index.php",
-    "mobile.php",
-    "status.php",
-    "sw.js",
-    "manifest.json",
-    "archiv_diagramm.php",
-    "run_now.php",
-    "archiv.php",
-    "config_editor.php"
-]
+WEBPORTAL_EXTENSIONS = {".php", ".css", ".js", ".json"}
+E3DC_CONTROL_EXTRA_EXTENSIONS = {".dat", ".json", ".py"}
+
+
+def _copy_matching_files(source_root, destination_root, extensions, exclude_dirs=None):
+    """Kopiert rekursiv alle Dateien mit passenden Endungen und behält Pfadstruktur bei."""
+    copied = 0
+    excluded = {os.path.abspath(path) for path in (exclude_dirs or [])}
+
+    for root, dirs, files in os.walk(source_root):
+        root_abs = os.path.abspath(root)
+
+        dirs[:] = [
+            d for d in dirs
+            if os.path.abspath(os.path.join(root, d)) not in excluded
+        ]
+
+        if root_abs in excluded:
+            continue
+
+        for filename in files:
+            if os.path.splitext(filename)[1].lower() not in extensions:
+                continue
+
+            source_file = os.path.join(root, filename)
+            relative_path = os.path.relpath(source_file, source_root)
+            destination_file = os.path.join(destination_root, relative_path)
+            os.makedirs(os.path.dirname(destination_file), exist_ok=True)
+            shutil.copy2(source_file, destination_file)
+            copied += 1
+    return copied
+
+
+def _count_files_recursive(path):
+    """Zählt rekursiv alle Dateien in einem Verzeichnis."""
+    count = 0
+    for _, _, files in os.walk(path):
+        count += len(files)
+    return count
+
+
+def _print_missing_source(path):
+    print(f"  ⚠ Quellordner fehlt: {path}")
+
+
+def _print_filtered_count(count, label):
+    if count == 0:
+        print(f"  ⚠ Keine passenden {label} gefunden")
+    else:
+        print(f"  ✓ {count} {label} gesichert")
+
+
+def _print_total_count(count, action_word):
+    if count == 0:
+        print(f"  ⚠ Es wurden keine Dateien {action_word}")
+    else:
+        print(f"  ✓ Insgesamt {count} Dateien {action_word}")
 
 
 def backup_current_version():
@@ -29,6 +71,7 @@ def backup_current_version():
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M")
         backup_dir = os.path.join(INSTALL_PATH, "backups", timestamp)
         os.makedirs(backup_dir, exist_ok=True)
+        total_copied_files = 0
 
         print(f"→ Erstelle Backup unter {backup_dir}…")
 
@@ -37,6 +80,7 @@ def backup_current_version():
         if os.path.exists(bin_path):
             try:
                 shutil.copy2(bin_path, backup_dir)
+                total_copied_files += 1
                 print("  ✓ Hauptprogramm gesichert")
             except Exception as e:
                 print(f"  ⚠ Fehler beim Sichern des Programms: {e}")
@@ -46,6 +90,7 @@ def backup_current_version():
         if os.path.exists(cfg_path):
             try:
                 shutil.copy2(cfg_path, backup_dir)
+                total_copied_files += 1
                 print("  ✓ Konfiguration gesichert")
             except Exception as e:
                 print(f"  ⚠ Fehler beim Sichern der Konfiguration: {e}")
@@ -53,30 +98,59 @@ def backup_current_version():
         # Webportal-Dateien sichern
         wp_backup_dir = os.path.join(backup_dir, "webportal")
         os.makedirs(wp_backup_dir, exist_ok=True)
+        webroot_dir = "/var/www/html"
 
-        for filename in WEBPORTAL_FILES:
-            src = os.path.join("/var/www/html", filename)
-            if os.path.exists(src):
-                try:
-                    shutil.copy2(src, wp_backup_dir)
-                except Exception as e:
-                    print(f"  ⚠ Fehler bei {filename}: {e}")
+        if not os.path.isdir(webroot_dir):
+            _print_missing_source(webroot_dir)
+        else:
+            try:
+                copied_webportal = _copy_matching_files(
+                    webroot_dir,
+                    wp_backup_dir,
+                    WEBPORTAL_EXTENSIONS
+                )
+                total_copied_files += copied_webportal
+                _print_filtered_count(copied_webportal, "Webportal-Dateien")
+            except Exception as e:
+                print(f"  ⚠ Fehler beim Sichern der Webportal-Dateien: {e}")
         
         # Icons sichern
         icons_src = "/var/www/html/icons"
         if os.path.exists(icons_src):
             try:
+                icons_count = _count_files_recursive(icons_src)
                 shutil.copytree(icons_src, os.path.join(wp_backup_dir, "icons"), dirs_exist_ok=True)
+                total_copied_files += icons_count
             except Exception as e:
                 print(f"  ⚠ Fehler beim Sichern der Icons: {e}")
-        
-        print("  ✓ Webportal-Dateien gesichert")
+
+        # E3DC-Control-Zusatzdateien sichern
+        e3dc_source_dir = INSTALL_PATH
+        e3dc_extra_backup_dir = os.path.join(backup_dir, "e3dc-control-extra")
+        backup_root_dir = os.path.join(INSTALL_PATH, "backups")
+
+        if os.path.isdir(e3dc_source_dir):
+            os.makedirs(e3dc_extra_backup_dir, exist_ok=True)
+            try:
+                copied_e3dc = _copy_matching_files(
+                    e3dc_source_dir,
+                    e3dc_extra_backup_dir,
+                    E3DC_CONTROL_EXTRA_EXTENSIONS,
+                    exclude_dirs={backup_root_dir}
+                )
+                total_copied_files += copied_e3dc
+                _print_filtered_count(copied_e3dc, "E3DC-Control-Zusatzdateien")
+            except Exception as e:
+                print(f"  ⚠ Fehler beim Sichern der E3DC-Control-Zusatzdateien: {e}")
+        else:
+            _print_missing_source(e3dc_source_dir)
 
         # Installer-Datei sichern
         plot_installer = os.path.join(os.path.dirname(__file__), "install.py")
         if os.path.exists(plot_installer):
             try:
                 shutil.copy2(plot_installer, backup_dir)
+                total_copied_files += 1
             except Exception:
                 pass
 
@@ -96,6 +170,8 @@ def backup_current_version():
         except Exception as e:
             print(f"  ⚠ Konnte Besitzrechte für Backup nicht setzen: {e}")
 
+        _print_total_count(total_copied_files, "gesichert")
+
         print("✓ Backup abgeschlossen.\n")
         return backup_dir
     except Exception as e:
@@ -103,8 +179,8 @@ def backup_current_version():
         return None
 
 
-def choose_backup_version():
-    """Wählt eine Backup-Version aus."""
+def choose_backup_version(action_text="wiederherstellen"):
+    """Wählt eine Backup-Version für die angegebene Aktion aus."""
     backup_root = os.path.join(INSTALL_PATH, "backups")
     if not os.path.exists(backup_root):
         print("✗ Keine Backups vorhanden.\n")
@@ -124,7 +200,7 @@ def choose_backup_version():
     for i, v in enumerate(versions):
         print(f"  {i+1}: {v}")
 
-    choice = input("\nWelche Version wiederherstellen? (Nummer): ").strip()
+    choice = input(f"\nWelche Version {action_text}? (Nummer): ").strip()
     if not choice.isdigit():
         print("✗ Ungültige Eingabe.\n")
         return None
@@ -150,6 +226,7 @@ def restore_backup(backup_path):
 
     try:
         print("→ Stelle Backup wieder her…")
+        total_restored_files = 0
 
         # Hauptprogramm wiederherstellen
         bin_backup = os.path.join(backup_path, "E3DC-Control")
@@ -157,6 +234,7 @@ def restore_backup(backup_path):
             try:
                 bin_dest = os.path.join(INSTALL_PATH, "E3DC-Control")
                 shutil.copy2(bin_backup, bin_dest)
+                total_restored_files += 1
                 print("  ✓ Hauptprogramm wiederhergestellt")
             except Exception as e:
                 print(f"  ✗ Fehler: {e}")
@@ -167,6 +245,7 @@ def restore_backup(backup_path):
             try:
                 cfg_dest = os.path.join(INSTALL_PATH, "e3dc.config.txt")
                 shutil.copy2(cfg_backup, cfg_dest)
+                total_restored_files += 1
                 print("  ✓ Konfiguration wiederhergestellt")
             except Exception as e:
                 print(f"  ✗ Fehler: {e}")
@@ -176,16 +255,20 @@ def restore_backup(backup_path):
         if os.path.exists(wp_backup_dir):
             choice = input("\n→ Webportal-Dateien wiederherstellen? (j/n): ").strip().lower()
             if choice == "j":
+                restored_webportal_count = 0
                 for filename in os.listdir(wp_backup_dir):
                     src = os.path.join(wp_backup_dir, filename)
                     dst = os.path.join("/var/www/html", filename)
                     try:
                         if os.path.isdir(src):
                             shutil.copytree(src, dst, dirs_exist_ok=True)
+                            restored_webportal_count += _count_files_recursive(src)
                         else:
                             shutil.copy2(src, dst)
+                            restored_webportal_count += 1
                     except Exception as e:
                         print(f"  ⚠ {filename}: {e}")
+                total_restored_files += restored_webportal_count
                 
                 # Berechtigungen nach Restore korrigieren
                 print("\n→ Korrigiere Berechtigungen nach Wiederherstellung…")
@@ -194,10 +277,56 @@ def restore_backup(backup_path):
                 
                 print("  ✓ Webportal-Dateien wiederhergestellt")
 
+        # E3DC-Control-Zusatzdateien wiederherstellen
+        e3dc_extra_backup_dir = os.path.join(backup_path, "e3dc-control-extra")
+        e3dc_target_dir = INSTALL_PATH
+        if os.path.isdir(e3dc_extra_backup_dir) and os.path.isdir(e3dc_target_dir):
+            restored_count = 0
+            for root, _, files in os.walk(e3dc_extra_backup_dir):
+                for filename in files:
+                    src = os.path.join(root, filename)
+                    rel_path = os.path.relpath(src, e3dc_extra_backup_dir)
+                    dst = os.path.join(e3dc_target_dir, rel_path)
+                    try:
+                        os.makedirs(os.path.dirname(dst), exist_ok=True)
+                        shutil.copy2(src, dst)
+                        restored_count += 1
+                    except Exception as e:
+                        print(f"  ⚠ Fehler bei E3DC-Control-Zusatzdatei {rel_path}: {e}")
+            total_restored_files += restored_count
+            print(f"  ✓ {restored_count} E3DC-Control-Zusatzdateien wiederhergestellt")
+
+        _print_total_count(total_restored_files, "wiederhergestellt")
+
         print("✓ Wiederherstellung abgeschlossen.\n")
         return True
     except Exception as e:
         print(f"✗ Fehler bei Wiederherstellung: {e}\n")
+        return False
+
+
+def delete_backup():
+    """Löscht eine ausgewählte Backup-Version."""
+    backup_path = choose_backup_version("löschen")
+    if not backup_path:
+        return False
+
+    if not os.path.isdir(backup_path):
+        print("✗ Ungültiges Backup-Verzeichnis.\n")
+        return False
+
+    print(f"\n⚠ Willst du wirklich das Backup {os.path.basename(backup_path)} löschen?")
+    confirm = input("Ja/Nein [n]: ").strip().lower()
+    if confirm != "ja":
+        print("✗ Abgebrochen.\n")
+        return False
+
+    try:
+        shutil.rmtree(backup_path)
+        print("✓ Backup gelöscht.\n")
+        return True
+    except Exception as e:
+        print(f"✗ Fehler beim Löschen des Backups: {e}\n")
         return False
 
 
@@ -206,6 +335,7 @@ def backup_menu():
     print("\n=== Backup-Verwaltung ===\n")
     print("1 = Backup erstellen")
     print("2 = Backup wiederherstellen")
+    print("3 = Backup löschen")
     choice = input("Auswahl: ").strip()
 
     if choice == "1":
@@ -214,6 +344,8 @@ def backup_menu():
         backup_path = choose_backup_version()
         if backup_path:
             restore_backup(backup_path)
+    elif choice == "3":
+        delete_backup()
     else:
         print("✗ Ungültige Auswahl.\n")
 

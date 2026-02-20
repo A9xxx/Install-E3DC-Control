@@ -1,11 +1,11 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 diagrammphp.py - Diagramm-System & Web-Portal Installation
 
 FEATURES:
 - Extrahiert E3DC-Control.zip automatisch (Diagramm-Dateien)
-- Installiert plot_soc_changes.py nach /home/pi/E3DC-Control/
+- Installiert plot_soc_changes.py nach /home/<install_user>/E3DC-Control/
 - Kopiert Web-Portal-Dateien (PHP/HTML/CSS) nach /var/www/html/
 - Erstellt /var/www/html/tmp/ Verzeichnis
 - Setzt korrekte Berechtigungen (www-data)
@@ -183,7 +183,7 @@ class DiagramInstaller:
     def extract_and_install_from_zip(self):
         """
         Extrahiert E3DC-Control.zip und installiert Diagramm-System-Dateien:
-        - plot_soc_changes.py → /home/pi/E3DC-Control/
+        - plot_soc_changes.py → /home/<install_user>/E3DC-Control/
         - PHP/HTML Web-Portal-Dateien → /var/www/html/
         - Erstellt /var/www/html/tmp/
         - Setzt Rechte für www-data
@@ -230,7 +230,7 @@ class DiagramInstaller:
                 
                 print(f"✓ ZIP extrahiert nach: {temp_dir}")
                 
-                # 1) plot_soc_changes.py nach /home/pi/E3DC-Control/ kopieren
+                # 1) plot_soc_changes.py nach /home/<install_user>/E3DC-Control/ kopieren
                 print("\n→ Installiere Diagramm-Skript (plot_soc_changes.py)...")
                 source_script = os.path.join(temp_dir, PLOT_SCRIPT_NAME)
                 
@@ -241,7 +241,7 @@ class DiagramInstaller:
                 os.makedirs(self.install_path, exist_ok=True)
                 shutil.copy2(source_script, self.plot_script_path)
                 
-                # Setze Berechtigungen für das Skript (pi:www-data, 775)
+                # Setze Berechtigungen für das Skript (install_user:www-data, 775)
                 try:
                     subprocess.run(
                         ["sudo", "chown", f"{self.install_user}:www-data", self.plot_script_path],
@@ -278,10 +278,10 @@ class DiagramInstaller:
                 os.makedirs(TMP_PATH, exist_ok=True)
                 print(f"✓ tmp-Ordner sichergestellt: {TMP_PATH}")
                 
-                # 4) Rechte für das gesamte Webportal setzen (pi:www-data, 775)
+                # 4) Rechte für das gesamte Webportal setzen (install_user:www-data, 775)
                 print("\n→ Setze Berechtigungen...")
                 try:
-                    # Besitzer auf pi:www-data setzen (-R für alles inkl. icons/)
+                    # Besitzer auf install_user:www-data setzen (-R für alles inkl. icons/)
                     subprocess.run(
                         ["sudo", "chown", "-R", f"{self.install_user}:www-data", WWW_PATH],
                         check=True,
@@ -324,7 +324,7 @@ class DiagramInstaller:
         Loescht alte Modul-Ordner im E3DC-Control Verzeichnis.
         """
         print("\n" + "-" * 60)
-        print("Pruefe alte Modul-Ordner...")
+        print("Prüfe alte Modul-Ordner...")
         print("-" * 60)
 
         removed = 0

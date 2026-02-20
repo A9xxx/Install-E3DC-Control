@@ -1,4 +1,4 @@
-"""
+﻿"""
 Zentrales Logging-Management für Installation und Fehlerbehandlung.
 Verwaltet mehrere Log-Streams: install.log, permissions.log, error.log
 """

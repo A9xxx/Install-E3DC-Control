@@ -1,4 +1,4 @@
-"""
+﻿"""
 E3DC-Control openWB MQTT Integration
 
 Installiert MQTT und konfiguriert die openWB Wallbox Integration.

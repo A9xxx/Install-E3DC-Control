@@ -159,14 +159,14 @@ def backup_current_version():
             uid, _ = get_user_ids()
             gid = get_www_data_gid()
             
-            # Rekursiv alles im Backup-Ordner auf pi:www-data setzen
+            # Rekursiv alles im Backup-Ordner auf install_user:www-data setzen
             for root, dirs, files in os.walk(backup_dir):
                 for d in dirs:
                     os.chown(os.path.join(root, d), uid, gid)
                 for f in files:
                     os.chown(os.path.join(root, f), uid, gid)
             os.chown(backup_dir, uid, gid)
-            print("  ✓ Besitzrechte auf pi:www-data gesetzt")
+            print("  ✓ Besitzrechte auf install_user:www-data gesetzt")
         except Exception as e:
             print(f"  ⚠ Konnte Besitzrechte für Backup nicht setzen: {e}")
 

@@ -1,8 +1,8 @@
-import os
+﻿import os
 import shutil
 
 from .core import register_command
-from .installer_config import get_install_path, get_user_ids, get_www_data_gid
+from .installer_config import get_install_path, get_home_dir, get_user_ids, get_www_data_gid
 
 INSTALL_PATH = get_install_path()
 CONFIG_FILE = os.path.join(INSTALL_PATH, "e3dc.config.txt")
@@ -24,7 +24,7 @@ def copy_existing_config():
     """Kopiert eine vorhandene e3dc.config.txt in den Zielordner."""
     print("\n--- Vorhandene Konfiguration kopieren ---\n")
     
-    default_source = "/home/pi/Install/e3dc.config.txt"
+    default_source = os.path.join(get_home_dir(), "Install", "e3dc.config.txt")
     source_path = ask("Pfad zur vorhandenen e3dc.config.txt", default_source)
     
     if not os.path.exists(source_path):
@@ -65,7 +65,7 @@ def create_e3dc_config():
     print("\n=== E3DC-Konfiguration erstellen ===\n")
     
     # Prüfen ob vorhandene Config kopiert werden soll
-    copy_existing = ask("Möchten Sie eine vorhandene e3dc.config.txt kopieren? (j/n)", "n")
+    copy_existing = ask("Möchtest du eine vorhandene e3dc.config.txt kopieren? (j/n)", "n")
     
     if copy_existing and copy_existing.lower() == "j":
         if copy_existing_config():

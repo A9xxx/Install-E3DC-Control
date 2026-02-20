@@ -1,4 +1,4 @@
-import os
+﻿import os
 import subprocess
 import shutil
 import logging
@@ -70,7 +70,7 @@ done
         print(f"  ✗ Fehler beim Erstellen des Skripts: {e}")
         logging.error(f"Skript Fehler: {e}")
 
-    # 5. Autostart via Crontab (für User pi)
+    # 5. Autostart via Crontab (für install_user)
     print(f"→ Erstelle Crontab-Eintrag für @reboot…")
     cron_line = f"@reboot /usr/bin/screen -dmS live-grabber {GRABBER_SCRIPT}"
     

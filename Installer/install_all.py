@@ -1,4 +1,4 @@
-import os
+﻿import os
 import subprocess
 
 from .core import register_command
@@ -70,7 +70,7 @@ def finalize_permissions():
 def install_all_main():
     """Komplette Installation mit korrekter Reihenfolge."""
     print("\n" + "=" * 60)
-    print("  KOMPLÈTE E3DC-CONTROL INSTALLATION")
+    print("  KOMPLETTE E3DC-CONTROL INSTALLATION")
     print("=" * 60 + "\n")
 
     print("Diese Installation führt folgende Schritte in dieser Reihenfolge durch:\n")
@@ -258,7 +258,7 @@ def install_all_main():
     if errors:
         print("✓ INSTALLATION ABGESCHLOSSEN (mit Warnungen)")
     else:
-        print("✓ KOMPLÈTE INSTALLATION ERFOLGREICH ABGESCHLOSSEN")
+        print("✓ KOMPLETTE INSTALLATION ERFOLGREICH ABGESCHLOSSEN")
     print("=" * 60 + "\n")
 
     # Fehler-Zusammenfassung am Ende

@@ -1,4 +1,4 @@
-import os
+﻿import os
 
 from .core import register_command
 from .utils import replace_in_file

@@ -1,4 +1,4 @@
-"""
+﻿"""
 E3DC-Control Installer - Selbstaktualisierung
 
 Prüft beim Start, ob eine neue Version des Installers auf GitHub verfügbar ist.
@@ -22,7 +22,7 @@ from .installer_config import get_install_user
 GITHUB_REPO = "A9xxx/Install-E3DC-Control"
 RELEASES_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 SCRIPT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-INSTALL_ROOT = os.path.dirname(SCRIPT_DIR)  # /home/pi
+INSTALL_ROOT = os.path.dirname(SCRIPT_DIR)  # /home/<install_user>
 INSTALLER_DIR = os.path.join(INSTALL_ROOT, "Install")
 VERSION_FILE = os.path.join(SCRIPT_DIR, "VERSION")
 DEBUG = False

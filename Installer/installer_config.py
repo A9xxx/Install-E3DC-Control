@@ -1,11 +1,31 @@
-import json
+﻿import json
 import os
 import pwd
 import grp
+import logging
 
-DEFAULT_INSTALL_USER = "pi"
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "installer_config.json")
 WEB_CONFIG_FILE = "/var/www/html/e3dc_paths.json"
+
+
+def get_default_install_user():
+    """Ermittelt einen sinnvollen Default-User ohne statisches Hardcoding."""
+    env_user = os.environ.get("SUDO_USER") or os.environ.get("USER")
+    if env_user and env_user != "root":
+        return env_user
+
+    try:
+        for entry in pwd.getpwall():
+            if entry.pw_uid == 1000 and entry.pw_name != "root":
+                return entry.pw_name
+
+        for entry in pwd.getpwall():
+            if entry.pw_uid >= 1000 and entry.pw_name != "root" and entry.pw_dir.startswith("/home/"):
+                return entry.pw_name
+    except Exception:
+        pass
+
+    return "root"
 
 
 def load_config():
@@ -18,19 +38,21 @@ def load_config():
                     return data
         except Exception:
             pass
-    return {"install_user": DEFAULT_INSTALL_USER}
+    return {"install_user": get_default_install_user()}
 
 
 def save_config(config):
     """Persist installer config to disk."""
+    install_user = config.get("install_user", get_default_install_user())
     os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
+    set_config_file_permissions(install_user)
 
 
 def get_install_user():
     config = load_config()
-    return config.get("install_user", DEFAULT_INSTALL_USER)
+    return config.get("install_user", get_default_install_user())
 
 
 def get_home_dir(install_user=None):
@@ -58,8 +80,26 @@ def get_www_data_gid():
     return grp.getgrnam("www-data").gr_gid
 
 
+def set_config_file_permissions(install_user=None):
+    """Setzt Rechte der installer_config.json so, dass der Install-User zugreifen kann."""
+    logger = logging.getLogger("install")
+    user = install_user or get_install_user()
+
+    try:
+        uid, _ = get_user_ids(user)
+        gid = get_www_data_gid()
+        os.chown(CONFIG_FILE, uid, gid)
+        os.chmod(CONFIG_FILE, 0o664)
+        logger.info("installer_config.json Rechte gesetzt auf %s:www-data (664)", user)
+        return True
+    except Exception as e:
+        logger.warning("Konnte Rechte der installer_config.json nicht setzen: %s", e)
+        return False
+
+
 def ensure_web_config(install_user=None):
     """Write web config so PHP can resolve paths."""
+    logger = logging.getLogger("install")
     user = install_user or get_install_user()
     data = {
         "install_user": user,
@@ -77,6 +117,13 @@ def ensure_web_config(install_user=None):
             os.chmod(WEB_CONFIG_FILE, 0o664)
         except Exception:
             pass
+        logger.info(
+            "e3dc_paths.json geschrieben: user=%s, home_dir=%s, install_path=%s",
+            data["install_user"],
+            data["home_dir"],
+            data["install_path"]
+        )
         return True
-    except Exception:
+    except Exception as e:
+        logger.error("Fehler beim Schreiben von e3dc_paths.json: %s", e)
         return False

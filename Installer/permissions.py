@@ -6,7 +6,7 @@ import logging
 
 from .core import register_command
 from .utils import run_command, setup_logging
-from .installer_config import get_install_path, get_install_user, get_home_dir, get_www_data_gid
+from .installer_config import CONFIG_FILE, get_install_path, get_install_user, get_home_dir, get_www_data_gid
 from .logging_manager import get_or_create_logger, log_task_completed, log_error, log_warning
 
 INSTALL_USER = get_install_user()
@@ -218,20 +218,20 @@ def check_file_permissions():
             details.append(f"Modus={mode} (soll: {expected_mode})")
         return ", ".join(details) if details else "unbekannte Abweichung"
 
-    # Konfigurationsdateien (pi:www-data mit 664)
+    # Konfigurationsdateien (install_user:www-data mit 664)
     config_files = [
         (f"{INSTALL_PATH}/e3dc.config.txt", "664"),
         (f"{INSTALL_PATH}/e3dc.wallbox.txt", "664"),
         (f"{INSTALL_PATH}/e3dc.strompreis.txt", "664")  # Strompreise
     ]
     
-    # Ausführbare Python-Dateien (pi:www-data mit 755)
+    # Ausführbare Python-Dateien (install_user:www-data mit 755)
     executable_files = [
         (f"{INSTALL_PATH}/plot_soc_changes.py", "755"),
         (f"{INSTALL_HOME}/get_live.sh", "755")
     ]
 
-    # Web-Ausgabedateien (pi:www-data mit 664)
+    # Web-Ausgabedateien (install_user:www-data mit 664)
     web_files = [
         ("/var/www/html/diagramm.html", "664"),
         ("/var/www/html/archiv_diagramm.html", "664"),
@@ -250,8 +250,41 @@ def check_file_permissions():
     ]
     
     issues = {}
+
+    # Installer-Config prüfen (muss vom Install-User schreibbar sein)
+    if os.path.exists(CONFIG_FILE):
+        try:
+            st_cfg = os.stat(CONFIG_FILE)
+            cfg_mode = oct(st_cfg.st_mode)[-3:]
+            cfg_owner = pwd.getpwuid(st_cfg.st_uid).pw_name
+            cfg_group = grp.getgrgid(st_cfg.st_gid).gr_name
+
+            cfg_owner_ok = cfg_owner == INSTALL_USER
+            cfg_group_ok = cfg_group == "www-data"
+            cfg_mode_ok = cfg_mode == "664"
+
+            if cfg_owner_ok and cfg_group_ok and cfg_mode_ok:
+                print(f"✓ {os.path.basename(CONFIG_FILE)} OK ({INSTALL_USER}:www-data, 664)")
+            else:
+                details = []
+                if not cfg_owner_ok:
+                    details.append(f"Owner={cfg_owner} (soll: {INSTALL_USER})")
+                if not cfg_group_ok:
+                    details.append(f"Gruppe={cfg_group} (soll: www-data)")
+                if not cfg_mode_ok:
+                    details.append(f"Modus={cfg_mode} (soll: 664)")
+                print(f"✗ {os.path.basename(CONFIG_FILE)} Problem: {', '.join(details)}")
+                issues[CONFIG_FILE] = {
+                    "owner": not cfg_owner_ok,
+                    "group": not cfg_group_ok,
+                    "mode": not cfg_mode_ok,
+                    "expected_mode": "664",
+                    "expected_group": "www-data"
+                }
+        except Exception as e:
+            print(f"✗ Fehler bei {CONFIG_FILE}: {e}")
     
-    # Prüfe Konfigurationsdateien (pi:www-data mit 664)
+    # Prüfe Konfigurationsdateien (install_user:www-data mit 664)
     for path, expected_mode in config_files:
         if not os.path.exists(path):
             continue
@@ -278,7 +311,7 @@ def check_file_permissions():
         except Exception as e:
             print(f"✗ Fehler bei {path}: {e}")
     
-    # Prüfe ausführbare Python-Dateien (pi:www-data mit 755)
+    # Prüfe ausführbare Python-Dateien (install_user:www-data mit 755)
     for path, expected_mode in executable_files:
         if not os.path.exists(path):
             continue
@@ -308,7 +341,7 @@ def check_file_permissions():
         except Exception as e:
             print(f"✗ Fehler bei {path}: {e}")
 
-    # Prüfe Web-Ausgabedateien (pi:www-data mit 664)
+    # Prüfe Web-Ausgabedateien (install_user:www-data mit 664)
     for entry in web_files:
         if len(entry) == 3:
             path, expected_mode, allow_missing = entry
@@ -547,6 +580,7 @@ def fix_file_permissions(issues):
     for path, file_issues in issues.items():
         expected_mode = file_issues.get("expected_mode", "664")
         file_name = os.path.basename(path)
+        expected_group = file_issues.get("expected_group", "www-data")
 
         # Fehlende Dateien anlegen
         if file_issues.get("missing"):
@@ -558,12 +592,12 @@ def fix_file_permissions(issues):
                 success = False
                 continue
         
-        # Setze Owner auf <user>:www-data
+        # Setze Owner auf <user>:<expected_group>
         if file_issues.get("owner") or file_issues.get("group") or file_issues.get("missing"):
-            print(f"  → Setze Besitzer: {path} -> {INSTALL_USER}:www-data")
-            result = run_command(f"sudo chown {INSTALL_USER}:www-data {path}")
+            print(f"  → Setze Besitzer: {path} -> {INSTALL_USER}:{expected_group}")
+            result = run_command(f"sudo chown {INSTALL_USER}:{expected_group} {path}")
             if result['success']:
-                print(f"✓ {file_name}: Besitzer auf {INSTALL_USER}:www-data gesetzt")
+                print(f"✓ {file_name}: Besitzer auf {INSTALL_USER}:{expected_group} gesetzt")
             else:
                 success = False
         
@@ -625,7 +659,7 @@ def run_permissions_wizard():
 
     if all_success:
         print("\n✓ Alle Berechtigungen korrigiert.\n")
-        perm_logger.info("✓ Alle Berechtigungskorektionen erfolgreich durchgeführt.")
+        perm_logger.info("✓ Alle Berechtigungskorrekturen erfolgreich durchgeführt.")
         log_task_completed("Rechte prüfen & korrigieren", details="Alle Probleme behoben")
     else:
         print("\n⚠ Einige Berechtigungen konnten nicht korrigiert werden.\n")

@@ -1,15 +1,15 @@
-"""
+﻿"""
 Standardisierter Permission-Helper für konsistente Rechtevergabe
 Wird von allen Modulen genutzt um sicherzustellen, dass Berechtigungen
 mit permissions.py Standard übereinstimmen.
 
 STANDARDS:
-- Install-Verzeichnisse:      pi:pi       755
-- Webportal-Verzeichnisse:    pi:www-data 775
-- Web-Konfigdateien:          pi:www-data 664
-- Ausführbare Web-Dateien:    pi:www-data 755
-- Log-Dateien:                pi:www-data 664
-- Temp-Verzeichnisse:         pi:www-data 775
+- Install-Verzeichnisse:      install_user:install_user 755
+- Webportal-Verzeichnisse:    install_user:www-data      775
+- Web-Konfigdateien:          install_user:www-data      664
+- Ausführbare Web-Dateien:    install_user:www-data      755
+- Log-Dateien:                install_user:www-data      664
+- Temp-Verzeichnisse:         install_user:www-data      775
 """
 
 import os
@@ -18,13 +18,17 @@ from .utils import run_command
 from .installer_config import get_install_user, get_user_ids, get_www_data_gid
 
 
-def set_file_ownership(path, owner_user="pi", owner_group="www-data"):
+def _resolve_owner_user(owner_user=None):
+    return owner_user or get_install_user()
+
+
+def set_file_ownership(path, owner_user=None, owner_group="www-data"):
     """
     Setzt Ownership einer Datei/Verzeichnis auf gewünschtem Benutzer.
     
     Args:
         path: Datei- oder Verzeichnispath
-        owner_user: Besitzender Benutzer (Standard: "pi")
+        owner_user: Besitzender Benutzer (Standard: install_user)
         owner_group: Besitzende Gruppe (Standard: "www-data")
     
     Returns:
@@ -32,6 +36,8 @@ def set_file_ownership(path, owner_user="pi", owner_group="www-data"):
     """
     if not os.path.exists(path):
         return False
+
+    owner_user = _resolve_owner_user(owner_user)
     
     try:
         result = run_command(f"sudo chown {owner_user}:{owner_group} {path}")
@@ -41,13 +47,13 @@ def set_file_ownership(path, owner_user="pi", owner_group="www-data"):
         return False
 
 
-def set_directory_ownership_recursive(path, owner_user="pi", owner_group="www-data"):
+def set_directory_ownership_recursive(path, owner_user=None, owner_group="www-data"):
     """
     Setzt Ownership eines Verzeichnisses rekursiv.
     
     Args:
         path: Verzeichnispath
-        owner_user: Besitzender Benutzer (Standard: "pi")
+        owner_user: Besitzender Benutzer (Standard: install_user)
         owner_group: Besitzende Gruppe (Standard: "www-data")
     
     Returns:
@@ -55,6 +61,8 @@ def set_directory_ownership_recursive(path, owner_user="pi", owner_group="www-da
     """
     if not os.path.exists(path):
         return False
+
+    owner_user = _resolve_owner_user(owner_user)
     
     try:
         result = run_command(f"sudo chown -R {owner_user}:{owner_group} {path}")
@@ -110,7 +118,7 @@ def set_directory_permissions_recursive(path, mode):
 
 def set_web_file(path, executable=False):
     """
-    Setzt Standard Web-Datei Berechtigungen (pi:www-data).
+    Setzt Standard Web-Datei Berechtigungen (install_user:www-data).
     
     Args:
         path: Dateipath
@@ -120,8 +128,8 @@ def set_web_file(path, executable=False):
         True bei erfolg
     """
     mode = "755" if executable else "664"
-    
-    set_file_ownership(path, "pi", "www-data")
+
+    set_file_ownership(path, None, "www-data")
     set_file_permissions(path, mode)
     
     return True
@@ -129,7 +137,7 @@ def set_web_file(path, executable=False):
 
 def set_web_directory(path, recursive=False):
     """
-    Setzt Standard Web-Verzeichnis Berechtigungen (pi:www-data 775).
+    Setzt Standard Web-Verzeichnis Berechtigungen (install_user:www-data 775).
     
     Args:
         path: Verzeichnispath
@@ -139,10 +147,10 @@ def set_web_directory(path, recursive=False):
         True bei erfolg
     """
     if recursive:
-        set_directory_ownership_recursive(path, "pi", "www-data")
+        set_directory_ownership_recursive(path, None, "www-data")
         set_directory_permissions_recursive(path, "775")
     else:
-        set_file_ownership(path, "pi", "www-data")
+        set_file_ownership(path, None, "www-data")
         set_file_permissions(path, "775")
     
     return True
@@ -150,7 +158,7 @@ def set_web_directory(path, recursive=False):
 
 def set_log_file(path):
     """
-    Setzt Standard Log-Datei Berechtigungen (pi:www-data 664).
+    Setzt Standard Log-Datei Berechtigungen (install_user:www-data 664).
     
     Args:
         path: Log-Dateipath
@@ -158,7 +166,7 @@ def set_log_file(path):
     Returns:
         True bei erfolg
     """
-    set_file_ownership(path, "pi", "www-data")
+    set_file_ownership(path, None, "www-data")
     set_file_permissions(path, "664")
     
     return True
@@ -166,7 +174,7 @@ def set_log_file(path):
 
 def set_log_directory(path, recursive=False):
     """
-    Setzt Standard Log-Verzeichnis Berechtigungen (pi:www-data 775).
+    Setzt Standard Log-Verzeichnis Berechtigungen (install_user:www-data 775).
     
     Args:
         path: Verzeichnispath
@@ -176,10 +184,10 @@ def set_log_directory(path, recursive=False):
         True bei erfolg
     """
     if recursive:
-        set_directory_ownership_recursive(path, "pi", "www-data")
+        set_directory_ownership_recursive(path, None, "www-data")
         set_directory_permissions_recursive(path, "775")
     else:
-        set_file_ownership(path, "pi", "www-data")
+        set_file_ownership(path, None, "www-data")
         set_file_permissions(path, "775")
     
     return True
@@ -187,7 +195,7 @@ def set_log_directory(path, recursive=False):
 
 def set_executable_script(path):
     """
-    Setzt Standard Python/Shell-Skript Berechtigungen (pi:www-data 755).
+    Setzt Standard Python/Shell-Skript Berechtigungen (install_user:www-data 755).
     
     Args:
         path: Skriptpath
@@ -195,7 +203,7 @@ def set_executable_script(path):
     Returns:
         True bei erfolg
     """
-    set_file_ownership(path, "pi", "www-data")
+    set_file_ownership(path, None, "www-data")
     set_file_permissions(path, "755")
     
     return True

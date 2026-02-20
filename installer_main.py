@@ -167,29 +167,29 @@ def restart_installer():
 
 
 def check_for_updates():
-    """Prüft auf verfügbare Updates und fragt vor Installation nach."""
+    """Prüft auf verfügbare Updates und fragt nur bei Verfügbarkeit nach."""
     try:
         import inspect
         from Installer.self_update import check_and_update
-
-        choice = input("\nAuf Updates prüfen? (j/n): ").strip().lower()
-        if choice != "j":
-            return
 
         signature = inspect.signature(check_and_update)
         params = signature.parameters
 
         if "check_only" in params:
+            # Prüfe zuerst stillschweigend auf Updates (keine Frage vorher)
             check_kwargs = {"check_only": True}
             if "silent" in params:
-                check_kwargs["silent"] = False
+                check_kwargs["silent"] = True  # Still = keine Meldungen
 
+            print("\n→ Prüfe auf Updates...")
             update_available = bool(check_and_update(**check_kwargs))
+            
             if not update_available:
-                print("✓ Keine Updates verfügbar.\n")
+                print("✓ Du bist auf dem neuesten Stand.\n")
                 return
 
-            install_choice = input("Update verfügbar. Jetzt installieren? (j/n): ").strip().lower()
+            # Nur wenn Update verfügbar ist, fragen
+            install_choice = input("✓ Update verfügbar. Jetzt installieren? (j/n): ").strip().lower()
             if install_choice != "j":
                 print("→ Update übersprungen.\n")
                 return
@@ -208,17 +208,16 @@ def check_for_updates():
                 restart_installer()
             return
 
-        install_choice = input("Update-Prüfung kann direkt installieren. Fortfahren? (j/n): ").strip().lower()
-        if install_choice != "j":
-            print("→ Update übersprungen.\n")
-            return
-
+        # Fallback: Versuche direkt mit Installation zu prüfen
         update_kwargs = {}
         if "silent" in params:
-            update_kwargs["silent"] = False
+            update_kwargs["silent"] = True
 
+        print("\n→ Prüfe auf Updates...")
         if check_and_update(**update_kwargs):
             restart_installer()
+        else:
+            print("✓ Du bist auf dem neuesten Stand.\n")
     
     except ImportError:
         # self_update-Modul nicht vorhanden, ignorieren

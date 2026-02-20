@@ -8,6 +8,24 @@ INSTALL_PATH = get_install_path()
 CONFIG_FILE = os.path.join(INSTALL_PATH, "e3dc.config.txt")
 
 
+def _normalize_numeric_input(value):
+    """Normalisiert numerische Eingaben: Komma in Punkt (z.B. 13,5 -> 13.5)."""
+    if not value or not isinstance(value, str):
+        return value, False
+
+    raw = value.strip()
+    if "," not in raw:
+        return value, False
+
+    # Nur dann umwandeln, wenn es wie eine Zahl aussieht
+    candidate = raw.replace(",", ".")
+    try:
+        float(candidate)
+        return candidate, True
+    except ValueError:
+        return value, False
+
+
 def load_config():
     """Lädt die Konfigurationsdatei."""
     if not os.path.exists(CONFIG_FILE):
@@ -36,8 +54,12 @@ def save_param(key, value):
     if not os.path.exists(CONFIG_FILE):
         print(f"✗ Konfigurationsdatei nicht vorhanden: {CONFIG_FILE}")
         return False
-    
-    success = replace_in_file(CONFIG_FILE, key, f"{key} = {value}")
+
+    normalized, changed = _normalize_numeric_input(value)
+    if changed:
+        print(f"  Hinweis: ',' wurde zu '.' normalisiert ({value} -> {normalized})")
+
+    success = replace_in_file(CONFIG_FILE, key, f"{key} = {normalized}")
     return success
 
 

@@ -107,6 +107,24 @@ def ensure_web_config(install_user=None):
         "install_path": get_install_path(user)
     }
     try:
+        existing_user = None
+        if os.path.exists(WEB_CONFIG_FILE):
+            try:
+                with open(WEB_CONFIG_FILE, "r", encoding="utf-8") as f:
+                    existing_data = json.load(f)
+                if isinstance(existing_data, dict):
+                    existing_user = existing_data.get("install_user")
+            except Exception:
+                existing_user = None
+
+        # Nur bei Erstinstallation (Datei fehlt) oder manuellem Benutzerwechsel schreiben
+        if os.path.exists(WEB_CONFIG_FILE) and existing_user == user:
+            logger.info(
+                "e3dc_paths.json unverändert (install_user=%s) – kein Rewrite notwendig.",
+                user
+            )
+            return True
+
         os.makedirs(os.path.dirname(WEB_CONFIG_FILE), exist_ok=True)
         with open(WEB_CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)

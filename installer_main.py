@@ -59,9 +59,11 @@ def ensure_install_user():
         print(f"→ Aktueller Installationsbenutzer: {saved_user} ({saved_home})")
         logger.info(f"Aktueller Installationsbenutzer: {saved_user} ({saved_home})")
         verify_config_file_access(saved_user)
-        print(f"→ Schreibe e3dc_paths.json mit Benutzer '{saved_user}'")
-        logger.info(f"Schreibe e3dc_paths.json mit Benutzer '{saved_user}'")
-        ensure_web_config(saved_user)
+        print("→ Prüfe e3dc_paths.json (Aktualisierung nur bei Bedarf)")
+        logger.info("Prüfe e3dc_paths.json (Aktualisierung nur bei Bedarf)")
+        if not ensure_web_config(saved_user):
+            print("⚠ Konnte e3dc_paths.json nicht prüfen/aktualisieren.")
+            logger.warning("Konnte e3dc_paths.json nicht prüfen/aktualisieren (user=%s)", saved_user)
         return True
 
     print("\n=== Installer Benutzer ===\n")
@@ -81,9 +83,11 @@ def ensure_install_user():
     config["install_user_confirmed"] = True
     save_config(config)
     verify_config_file_access(install_user)
-    print(f"→ Schreibe e3dc_paths.json mit Benutzer '{install_user}'")
-    logger.info(f"Schreibe e3dc_paths.json mit Benutzer '{install_user}'")
-    ensure_web_config(install_user)
+    print("→ Prüfe e3dc_paths.json (Aktualisierung nur bei Bedarf)")
+    logger.info("Prüfe e3dc_paths.json (Aktualisierung nur bei Bedarf)")
+    if not ensure_web_config(install_user):
+        print("⚠ Konnte e3dc_paths.json nicht prüfen/aktualisieren.")
+        logger.warning("Konnte e3dc_paths.json nicht prüfen/aktualisieren (user=%s)", install_user)
     return True
 
 
@@ -155,9 +159,11 @@ def change_install_user_from_menu():
     print(f"✓ Installationsbenutzer gesetzt auf '{install_user}' ({home_dir})")
     logger.info(f"Installationsbenutzer per Menü geändert auf '{install_user}' ({home_dir})")
 
-    print(f"→ Schreibe e3dc_paths.json mit Benutzer '{install_user}'")
-    logger.info(f"Schreibe e3dc_paths.json mit Benutzer '{install_user}'")
-    ensure_web_config(install_user)
+    print("→ Prüfe e3dc_paths.json (Aktualisierung nur bei Bedarf)")
+    logger.info("Prüfe e3dc_paths.json (Aktualisierung nur bei Bedarf)")
+    if not ensure_web_config(install_user):
+        print("⚠ Konnte e3dc_paths.json nicht prüfen/aktualisieren.")
+        logger.warning("Konnte e3dc_paths.json nicht prüfen/aktualisieren (user=%s)", install_user)
 
 
 def restart_installer():

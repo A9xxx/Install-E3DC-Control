@@ -1,5 +1,5 @@
 E3DC-Control Webportal Export
-Erstellt: 2026-02-20 13:17:36
+Erstellt: 2026-02-20 14:46:57
 
 Quellen:
   E3DC-Control: /home/pi/E3DC-Control

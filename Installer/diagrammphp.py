@@ -240,6 +240,18 @@ class DiagramInstaller:
                 
                 os.makedirs(self.install_path, exist_ok=True)
                 shutil.copy2(source_script, self.plot_script_path)
+
+                # Sicherstellen: kein UTF-8 BOM (sonst bricht die Shebang unter Linux)
+                try:
+                    with open(self.plot_script_path, "rb") as f:
+                        content = f.read()
+                    bom = b"\xef\xbb\xbf"
+                    if content.startswith(bom):
+                        with open(self.plot_script_path, "wb") as f:
+                            f.write(content[len(bom):])
+                        print("✓ BOM aus plot_soc_changes.py entfernt")
+                except Exception as e:
+                    print(f"⚠️  Konnte BOM nicht prüfen/entfernen: {e}")
                 
                 # Setze Berechtigungen für das Skript (install_user:www-data, 775)
                 try:

@@ -14,6 +14,19 @@ INSTALL_HOME = get_home_dir(INSTALL_USER)
 INSTALL_PATH = get_install_path()
 
 
+def _strip_utf8_bom_silent(path):
+    """Entfernt UTF-8 BOM still, falls vorhanden (keine Ausgabe)."""
+    try:
+        with open(path, "rb") as f:
+            content = f.read()
+        bom = b"\xef\xbb\xbf"
+        if content.startswith(bom):
+            with open(path, "wb") as f:
+                f.write(content[len(bom):])
+    except Exception:
+        pass
+
+
 def setup_permissions_logging():
     """Initialisiert Logging für Berechtigungen über logging_manager."""
     import os
@@ -609,6 +622,10 @@ def fix_file_permissions(issues):
                 print(f"✓ {file_name}: Rechte auf {expected_mode} gesetzt")
             else:
                 success = False
+
+        # BOM still entfernen bei Skripten (Shebang-Kompatibilitaet)
+        if file_name.endswith((".py", ".sh")) or file_name in ("plot_soc_changes.py", "get_live.sh"):
+            _strip_utf8_bom_silent(path)
     
     return success
 

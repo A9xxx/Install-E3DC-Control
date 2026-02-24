@@ -135,6 +135,10 @@ def update_e3dc():
     else:
         print("✓ Keine lokalen Änderungen.")
 
+    # Rechte im .git-Ordner vor Pull korrigieren
+    print("→ Korrigiere .git-Berechtigungen vor Update…")
+    run_command(f"sudo chown -R {install_user}:{install_user} {INSTALL_PATH}/.git")
+
     # Update durchführen
     print("→ Hole neue Version…")
     result = run_command(f"sudo -u {install_user} bash -c 'cd {INSTALL_PATH} && git pull'", timeout=60)

@@ -244,7 +244,7 @@ def install_screen_cron():
             return False
 
     # Crontab-Eintrag
-    cron_line = f"@reboot sleep 10 && echo 0 > {INSTALL_PATH}/stop && /usr/bin/screen -dmS E3DC {sh_path}"
+    cron_line = f"@reboot sleep 20 && echo 0 > {INSTALL_PATH}/stop && /usr/bin/screen -dmS E3DC {sh_path}"
     entry_identifier = "E3DC"
 
     # Benutzer-Crontab (OHNE sudo!)

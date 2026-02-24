@@ -128,4 +128,4 @@ def uninstall_e3dc():
     print("\n✓ Deinstallation abgeschlossen.\n")
 
 
-register_command("18", "Deinstallation", uninstall_e3dc, sort_order=180)
+register_command("20", "Deinstallation", uninstall_e3dc, sort_order=200)

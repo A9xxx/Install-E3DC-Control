@@ -1,200 +1,66 @@
-# Quick-Start: Auto-Update-Aktivierung
+# Quickstart: E3DC-Control Installation
 
-## 5-Minuten Anleitung
+Diese Anleitung fasst die schnellsten Schritte zusammen, um E3DC-Control auf einem frischen Raspberry Pi OS (oder ähnlichem Debian-System) zu installieren.
 
-### 1. Dateien lokal installieren
+## Schritt 1: System vorbereiten
 
-Das Installer-Verzeichnis sollte folgende neue Dateien enthalten:
-
-```
-Install/
-├── installer_main.py          (AKTUALISIERT)
-├── VERSION                     (NEU)
-├── AUTO_UPDATE_DOKU.md        (NEU - Dokumentation)
-├── GITHUB_RELEASE_ANLEITUNG.md (NEU - GitHub Setup)
-├── test_auto_update.py        (NEU - Tests)
-└── Installer/
-    ├── __init__.py            (AKTUALISIERT)
-    └── self_update.py         (NEU)
-```
-
-### 2. Installer-Änderungen überprüfen
+Stellen Sie sicher, dass Ihr System auf dem neuesten Stand ist und `git` installiert ist.
 
 ```bash
-# Überprüfe dass installer_main.py die neue check_for_updates() Funktion hat
-grep -n "check_for_updates" ~/Install/installer_main.py
-
-# Sollte etwa so aussehen:
-# 37: def check_for_updates():
-# 71: check_for_updates()
+sudo apt update && sudo apt upgrade -y
+sudo apt install -y git
 ```
 
-### 3. Lokal testen (Optional)
+## Schritt 2: Installer herunterladen
+
+Klonen Sie das Repository, das den Installer enthält. Wenn Sie dieses Dokument lesen, haben Sie diesen Schritt wahrscheinlich schon erledigt. Falls nicht, hier ein Beispielbefehl (URL anpassen):
 
 ```bash
-# Test-Script ausführen
-python3 ~/Install/test_auto_update.py
-
-# Sollte mit "✓ Alle Tests erfolgreich" enden
+# Beispiel für das Klonen in das Home-Verzeichnis
+cd ~
+git clone [https://github.com/A9xxx/Install-E3DC-Control.git](https://github.com/A9xxx/Install-E3DC-Control.git) Install
+cd Install
 ```
+*Hinweis: Passen Sie die URL und die Verzeichnisnamen entsprechend an.*
 
-### 4. GitHub vorbereiten
+## Schritt 3: Installation starten
+
+Führen Sie das Haupt-Installationsskript im `Install`-Verzeichnis mit `sudo` aus. Dies startet den interaktiven Installer.
 
 ```bash
-cd ~/Install
-
-# 4a. VERSION-Datei aktualisieren
-echo "1.0.0" > VERSION
-
-# 4b. Lokale Änderungen committen
-git add .
-git commit -m "Add Auto-Update functionality"
-
-# 4c. Tag erstellen (wichtig!)
-git tag v1.0.0
-
-# 4d. Zu GitHub pushen
-git push origin main
-git push origin v1.0.0
-```
-
-### 5. GitHub-Release erstellen
-
-Gehe zu: `https://github.com/A9xxx/Install-E3DC-Control/releases`
-
-1. Klicke **"Create a new release"**
-2. Wähle Tag: **v1.0.0**
-3. Release Title: **Version 1.0.0**
-4. Description:
-   ```
-   ## What's New
-   - Auto-Update-Funktion hinzugefügt
-   - Installer prüft automatisch auf neue Versionen
-   
-   ## Installation
-   Das Update wird beim nächsten Start automatisch erkannt.
-   ```
-5. Lade ZIP hoch: **Install-E3DC-Control.zip**
-   - Struktur: `Install-E3DC-Control/Install/...`
-6. Klicke **"Publish release"**
-
-### 6. Fertig! 🎉
-
-Die Auto-Update-Funktion ist jetzt aktiv:
-
-```bash
-# Installer starten
-sudo python3 ~/Install/installer_main.py
-
-# Beim nächsten Update:
-# → Installer prüft GitHub ab
-# → Fragt ob aktualisieren
-# → Lädt neue Version herunter
-# → Startet automatisch neu
-```
-
-## Was passiert beim Update?
-
-### Automatische Prüfung (beim Start)
-
-```
 sudo python3 installer_main.py
-
-→ (Still) Prüfung ob Updates verfügbar...
-
-[Falls Update verfügbar]
-Neue Version verfügbar!
-
-Soll die neue Version jetzt installiert werden? (j/n): j
-
-→ Lade Release herunter…
-✓ Download abgeschlossen
-→ Entpacke Update…
-✓ Update erfolgreich installiert
-
-→ Installer wird neu gestartet…
 ```
 
-### Manuelles Update (aus Menü)
+Ein Menü mit verschiedenen Optionen wird angezeigt.
 
-```
-E3DC-Control Installer
+## Schritt 4: "Alles installieren" auswählen
 
-  0) Installer aktualisieren
-  1) Rechte prüfen & korrigieren
-  ...
-
-Auswahl: 0
-
-=== Installer-Update Prüfung ===
-
-Installierte Version: 1.0.0
-Neueste Version:      1.0.1
-
-→ Neue Version verfügbar!
-[...]
-```
-
-## Häufig gestellte Fragen
-
-### F: Wird der Installer automatisch updated?
-A: Ja, beim Start werden neue Versionen erkannt. Der Benutzer wird gefragt, ob das Update installiert werden soll. Bei "Ja" wird automatisch heruntergeladen und installiert.
-
-### F: Was passiert bei Netzwerkfehlern?
-A: Fehler werden still ignoriert und der Installer startet normal. Die Auto-Update-Prüfung ist nicht-kritisch.
-
-### F: Wie kann ich Auto-Update deaktivieren?
-A: Kommentiere diese Zeile in `installer_main.py` aus:
-```python
-# check_for_updates()  # <-- auskommentieren
-```
-
-### F: Welche Python-Version wird benötigt?
-A: Python 3.7+ (wird am Start geprüft)
-
-### F: Funktioniert das auch ohne sudo?
-A: Nein, der Installer benötigt sudo. Bio-Einrichtung ist daher auch mit sudo erforderlich.
-
-## Weitere Informationen
-
-- 📖 [Ausführliche Dokumentation](AUTO_UPDATE_DOKU.md)
-- 🚀 [GitHub Release Setup](GITHUB_RELEASE_ANLEITUNG.md)
-- 🧪 [Test-Script](test_auto_update.py)
-
-## Troubleshooting
-
-### "Installer-Verzeichnis nicht in ZIP gefunden"
-
-ZIP-Struktur prüfen:
-```bash
-unzip -l Install-E3DC-Control.zip | head -20
-
-# Sollte beginnen mit:
-# Archive: Install-E3DC-Control.zip
-#   Length     Date   Time    Name
-# -------- ---------- ----- ----
-#        0  2024-02-11 10:00   Install-E3DC-Control/
-#        0  2024-02-11 10:00   Install-E3DC-Control/Install/
-#        ...
-```
-
-### "Release nicht auf GitHub sichtbar"
-
-Prüfung Checkliste:
-- [ ] Git tag erstellt? `git tag -l | grep v1`
-- [ ] Zu GitHub gepusht? `git push origin v1.0.0`
-- [ ] Release auf GitHub erstellt?
-- [ ] ZIP herunterladbar? (Test-Download)
-
-### Installer lädt nicht herunter
-
-```bash
-# Verwende curl zum Testen
-curl -I "https://github.com/A9xxx/Install-E3DC-Control/releases/download/v1.0.0/Install-E3DC-Control.zip"
-
-# Sollte HTTP 200 zurückgeben
-```
+Für eine Erstinstallation ist die empfohlene Option **"Alles installieren"** (normalerweise die Nr. 16).
+1.  Wählen Sie die entsprechende Nummer aus dem Menü.
+2.  Bestätigen Sie die Nachfrage mit `j` und drücken Sie Enter.
+3.  Der Installer führt nun alle notwendigen Schritte automatisch aus. Folgen Sie den Anweisungen auf dem Bildschirm.
 
 ---
 
-**Brauchen Sie weitere Hilfe?** Siehe [Ausführliche Dokumentation](AUTO_UPDATE_DOKU.md)
+## Wichtige Befehle für die Wartung
+
+Nach der Installation können Sie den Installer für Wartungsaufgaben verwenden. Führen Sie immer wieder `sudo python3 installer_main.py` im `Install`-Verzeichnis aus und wählen Sie die gewünschte Option:
+
+- **E3DC-Control aktualisieren:**
+  - Option `5` (E3DC-Control aktualisieren)
+  - Hält die Anwendung auf dem neuesten Stand.
+
+- **Berechtigungen überprüfen & korrigieren:**
+  - Option `2` (Rechte prüfen & korrigieren)
+  - Sehr nützlich, wenn es nach manuellen Änderungen zu Zugriffsproblemen kommt.
+
+- **Backups verwalten:**
+  - Option `14` (Backup verwalten)
+  - Erstellen, Wiederherstellen oder Löschen von Backups.
+
+- **Laufenden Prozess überprüfen:**
+  - Um die `E3DC-Control` Anwendung zu beobachten, können Sie sich auf die `screen`-Sitzung verbinden:
+  ```bash
+  screen -r E3DC
+  ```
+  - Sie verlassen die Sitzung mit der Tastenkombination `Strg + A`, gefolgt von `D`.

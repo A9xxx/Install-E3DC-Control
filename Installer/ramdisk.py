@@ -1,4 +1,4 @@
-﻿import os
+import os
 import subprocess
 import shutil
 import logging
@@ -27,17 +27,35 @@ def setup_ramdisk():
     
     # 2. fstab Eintrag
     print("→ Konfiguriere /etc/fstab für tmpfs…")
-    fstab_entry = f"tmpfs {RAMDISK_PATH} tmpfs nodev,nosuid,size=1M 0 0"
+    # UID des install_user dynamisch ermitteln
+    import pwd
+    try:
+        user_uid = pwd.getpwnam(install_user).pw_uid
+    except Exception as e:
+        print(f"  ✗ Fehler beim Ermitteln der UID für {install_user}: {e}")
+        logging.error(f"UID Fehler: {e}")
+        user_uid = 1000  # Fallback
+    fstab_entry = f"tmpfs {RAMDISK_PATH} tmpfs nodev,nosuid,size=32M,uid={user_uid},gid=33,mode=2775 0 0"
     
     try:
         with open(FSTAB_PATH, "r") as f:
-            content = f.read()
-        
-        if RAMDISK_PATH not in content:
-            run_command(f'echo "{fstab_entry}" | sudo tee -a {FSTAB_PATH}')
+            lines = f.readlines()
+        new_lines = []
+        replaced = False
+        for line in lines:
+            if line.strip().startswith("tmpfs") and RAMDISK_PATH in line:
+                new_lines.append(fstab_entry + "\n")
+                replaced = True
+            else:
+                new_lines.append(line)
+        if not replaced:
+            new_lines.append(fstab_entry + "\n")
             print("  ✓ Eintrag hinzugefügt")
         else:
-            print("  ✓ Eintrag bereits vorhanden")
+            print("  ✓ Eintrag überschrieben")
+        # Schreibe die neuen Zeilen zurück
+        with open(FSTAB_PATH, "w") as f:
+            f.writelines(new_lines)
     except Exception as e:
         print(f"  ✗ Fehler beim Bearbeiten von fstab: {e}")
         logging.error(f"FSTAB Fehler: {e}")

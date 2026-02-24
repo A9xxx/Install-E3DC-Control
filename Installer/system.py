@@ -26,7 +26,7 @@ def install_system_packages():
     for pkg in packages:
         apt_install(pkg)
 
-    python_packages = ["plotly>=5.0", "pandas-stubs", "pytz", "matplotlib"]
+    python_packages = ["plotly>=5.0", "pandas-stubs", "pandas", "pytz", "matplotlib"]
     print("\n→ Installiere Python-Pakete…\n")
     for pkg in python_packages:
         pip_install(pkg)

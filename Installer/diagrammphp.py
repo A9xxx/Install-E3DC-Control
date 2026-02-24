@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 diagrammphp.py - Diagramm-System & Web-Portal Installation
@@ -52,8 +52,12 @@ TMP_PATH = "/var/www/html/tmp"
 CONFIG_FILE = os.path.join(INSTALL_PATH, "diagram_config.json")
 CRON_COMMENT = "E3DC-Control Diagram Auto-Update"
 PLOT_SCRIPT_NAME = "plot_soc_changes.py"
+BACKUP_CRON_COMMENT = "E3DC-Control History Backup" # Neuer Kommentar für den Backup-Cron
+BACKUP_SCRIPT_PATH = "/var/www/html/backup_history.php" # Pfad zum Backup-Skript
+PLOT_LIVE_HISTORY_NAME = "plot_live_history.py"
 ZIP_NAME = "E3DC-Control.zip"
 OLD_MODULE_DIRS = ["config", "parsing", "plotting"]
+OBSOLETE_WEB_FILES = ["auto.php", "check.php", "config.php", "test.php", "mobile_history.php", "mobile_archiv.php"]
 
 
 class DiagramInstaller:
@@ -268,6 +272,29 @@ class DiagramInstaller:
                 except subprocess.CalledProcessError as e:
                     print(f"⚠️  Konnte Besitzer/Rechte für Skript nicht setzen: {e}")
                 print(f"✓ {PLOT_SCRIPT_NAME} → {self.plot_script_path}")
+
+                # 1b) plot_live_history.py (Live-48h-Diagramm) – aus ZIP oder aus Diagramm-Ordner
+                live_history_dest = os.path.join(self.install_path, PLOT_LIVE_HISTORY_NAME)
+                source_live = os.path.join(temp_dir, PLOT_LIVE_HISTORY_NAME)
+                if not os.path.isfile(source_live):
+                    diagramm_dir = os.path.join(os.path.dirname(zip_path), '..', '..', 'Diagramm')
+                    source_live = os.path.join(diagramm_dir, PLOT_LIVE_HISTORY_NAME)
+                if os.path.isfile(source_live):
+                    shutil.copy2(source_live, live_history_dest)
+                    try:
+                        with open(live_history_dest, "rb") as f:
+                            c = f.read()
+                        if c.startswith(b"\xef\xbb\xbf"):
+                            with open(live_history_dest, "wb") as f:
+                                f.write(c[3:])
+                    except Exception:
+                        pass
+                    try:
+                        subprocess.run(["sudo", "chown", f"{self.install_user}:www-data", live_history_dest], check=True, capture_output=True)
+                        subprocess.run(["sudo", "chmod", "775", live_history_dest], check=True, capture_output=True)
+                    except subprocess.CalledProcessError:
+                        pass
+                    print(f"✓ {PLOT_LIVE_HISTORY_NAME} → {live_history_dest}")
                 
                 # 2) Web-Portal Dateien rekursiv nach /var/www/html/ kopieren
                 print("\n→ Installiere Web-Portal-Dateien (PHP, CSS, JS, Icons)...")
@@ -276,15 +303,23 @@ class DiagramInstaller:
                 if not os.path.isdir(html_source):
                     print(f"⚠️  Kein 'html'-Ordner in ZIP gefunden")
                 else:
-                    # Dateien und Ordner (wie icons/) rekursiv kopieren
-                    import distutils.dir_util
                     try:
-                        # distutils.dir_util.copy_tree eignet sich gut zum Zusammenführen
-                        distutils.dir_util.copy_tree(html_source, WWW_PATH)
+                        # Modernes shutil.copytree zum Zusammenführen der Verzeichnisse
+                        shutil.copytree(html_source, WWW_PATH, dirs_exist_ok=True)
                         print(f"✓ Dateien und Unterordner (icons) → {WWW_PATH}")
                     except Exception as e:
                         print(f"⚠️  Fehler beim Kopieren des Webportal-Ordners: {e}")
                 
+                # 2b) Veraltete Dateien im Web-Verzeichnis bereinigen
+                for obs_file in OBSOLETE_WEB_FILES:
+                    obs_path = os.path.join(WWW_PATH, obs_file)
+                    if os.path.isfile(obs_path):
+                        try:
+                            os.remove(obs_path)
+                            print(f"✓ Veraltete Datei entfernt: {obs_path}")
+                        except Exception as e:
+                            print(f"⚠️  Konnte veraltete Datei {obs_file} nicht entfernen: {e}")
+
                 # 3) /var/www/html/tmp/ und icons/ Berechtigungen sicherstellen
                 print("\n→ Überprüfe Verzeichnisstrukturen...")
                 os.makedirs(TMP_PATH, exist_ok=True)
@@ -475,12 +510,6 @@ class DiagramInstaller:
         """
         Richtet crontab für automatische Diagramm-Aktualisierung ein.
         """
-        if self.diagram_mode == "manual":
-            # Im manuellen Modus: Entferne alten Crontab falls vorhanden
-            print("\n✓ Modus: MANUAL - Crontab wird entfernt falls vorhanden")
-            self.remove_crontab()
-            return True
-        
         try:
             print("\n" + "-" * 60)
             print("Richte crontab für Auto-Update ein...")
@@ -489,10 +518,14 @@ class DiagramInstaller:
             # Script-Pfad (monolithisches plot_soc_changes.py)
             plot_script = self.plot_script_path
             awattar_data = os.path.join(self.install_path, "awattardebug.txt")
+            cron_line_plot = ""
+            if self.diagram_mode in ("auto", "hybrid"):
+                cron_schedule_plot = self._get_cron_schedule(self.auto_interval)
+                cron_line_plot = f"{cron_schedule_plot} /usr/bin/python3 {plot_script} {awattar_data} normal # {CRON_COMMENT}"
             
-            # Cron-Linie je nach Intervall
-            cron_schedule = self._get_cron_schedule(self.auto_interval)
-            cron_line = f"{cron_schedule} /usr/bin/python3 {plot_script} {awattar_data} normal # {CRON_COMMENT}"
+            # Cron-Linie für backup_history.php (täglich um Mitternacht)
+            cron_schedule_backup = "0 0 * * *"
+            cron_line_backup = f"{cron_schedule_backup} /usr/bin/php {BACKUP_SCRIPT_PATH} > /dev/null 2>&1 # {BACKUP_CRON_COMMENT}"
             
             # Existierende crons auslesen - WICHTIG: Als install_user!
             result = subprocess.run(
@@ -505,10 +538,14 @@ class DiagramInstaller:
             # Neueste cron-Linie (alte entfernen, neue hinzufügen)
             new_crons = []
             for line in existing_crons.split('\n'):
-                if CRON_COMMENT not in line:
+                if line.strip() and CRON_COMMENT not in line and BACKUP_CRON_COMMENT not in line:
                     new_crons.append(line)
             
-            new_crons.append(cron_line)
+            # Füge die neuen Cron-Einträge hinzu
+            if cron_line_plot:
+                new_crons.append(cron_line_plot)
+            new_crons.append(cron_line_backup) # Backup-Cron immer hinzufügen
+
             new_crons_text = '\n'.join(new_crons)
             
             # Stelle sicher, dass der Text mit Newline endet
@@ -530,8 +567,9 @@ class DiagramInstaller:
                 return False
             
             print(f"✓ Crontab eingerichtet:")
-            print(f"  Schedule: {cron_schedule}")
-            print(f"  Skript: {plot_script}")
+            if cron_line_plot:
+                print(f"  Plot-Skript: {cron_schedule_plot} {plot_script}")
+            print(f"  Backup-Skript: {cron_schedule_backup} {BACKUP_SCRIPT_PATH}")
             return True
         
         except Exception as e:
@@ -555,7 +593,7 @@ class DiagramInstaller:
             # Entferne E3DC-Einträge
             new_crons = []
             for line in result.stdout.split('\n'):
-                if CRON_COMMENT not in line:
+                if line.strip() and CRON_COMMENT not in line and BACKUP_CRON_COMMENT not in line:
                     new_crons.append(line)
             
             new_crons_text = '\n'.join(new_crons)
@@ -710,10 +748,9 @@ class DiagramInstaller:
         
         # 4) Diagramm-Modus
         self.select_diagram_mode()
-        
+
         # 5) Crontab
-        if self.diagram_mode in ("auto", "hybrid"):
-            self.setup_crontab()
+        self.setup_crontab()
         
         # 6) Konfiguration speichern
         self.save_config()
@@ -737,6 +774,7 @@ class DiagramInstaller:
         print(f"➤ Wärmepumpe: {self.enable_heatpump}")
         if self.diagram_mode in ("auto", "hybrid"):
             print(f"➤ Auto-Update: Alle {self.auto_interval} Minuten")
+        print(f"➤ History-Backup: Täglich um Mitternacht")
         print(f"➤ Config: {self.config_file}")
         print("\n💡 Tipps:")
         print(f"  • Web-Interface: http://{host}/index.php")
@@ -745,6 +783,7 @@ class DiagramInstaller:
         print(f"    python3 {self.plot_script_path}")
         if self.diagram_mode in ("auto", "hybrid"):
             print(f"  • Crontab prüfen: crontab -l")
+            print(f"  • Crontab prüfen (für {self.install_user}): crontab -l")
         print("=" * 60 + "\n")
 
     @staticmethod

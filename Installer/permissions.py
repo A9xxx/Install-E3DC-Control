@@ -152,7 +152,8 @@ def check_webportal_permissions():
         subfolders = [
             (f"{wp_path}/tmp", "777"),
             (f"{wp_path}/icons", "775"),
-            (f"{wp_path}/ramdisk", "775")
+            (f"{wp_path}/ramdisk", "775"),
+            (f"{wp_path}/tmp/history_backups", "775")
         ]
         for folder_path, expected_mode in subfolders:
             if not os.path.exists(folder_path):
@@ -229,6 +230,7 @@ FILE_DEFINITIONS = [
     {"path": "/var/www/html/tmp/plot_soc_done_archiv", "mode": "666", "owner": INSTALL_USER, "group": "www-data", "optional": False, "executable": False},
     {"path": "/var/www/html/tmp/plot_soc_error", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": "/var/www/html/tmp/plot_soc_error_archiv", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
+    {"path": "/var/www/html/tmp/plot_live_history_last_run", "mode": "666", "owner": INSTALL_USER, "group": "www-data", "optional": False, "executable": False},
     {"path": "/var/www/html/tmp/plot_soc_last_run", "mode": "666", "owner": INSTALL_USER, "group": "www-data", "optional": False, "executable": False},
 ]
 
@@ -393,6 +395,28 @@ def fix_webportal_permissions(issues):
             print("✓ ramdisk-Rechte korrigiert")
         else:
             success = False
+    # Hinzugefügt für History-Backups
+    if "history_backups_missing" in issues:
+        print(f"  → Erstelle Backup-Verzeichnis: {wp_path}/tmp/history_backups")
+        result = run_command(f"sudo mkdir -p {wp_path}/tmp/history_backups")
+        if result['success']:
+            print("✓ history_backups-Ordner erstellt")
+        else:
+            success = False
+    if "history_backups_owner" in issues:
+        print(f"  → Setze Backup-Verzeichnis Besitzer: {wp_path}/tmp/history_backups -> {INSTALL_USER}:www-data")
+        result = run_command(f"sudo chown -R {INSTALL_USER}:www-data {wp_path}/tmp/history_backups")
+        if result['success']:
+            print("✓ history_backups-Besitzer korrigiert")
+        else:
+            success = False
+    if "history_backups_missing" in issues or "history_backups_mode" in issues:
+        print(f"  → Setze Backup-Verzeichnis Rechte: {wp_path}/tmp/history_backups -> 775")
+        result = run_command(f"sudo chmod -R 775 {wp_path}/tmp/history_backups")
+        if result['success']:
+            print("✓ history_backups-Rechte korrigiert")
+        else:
+            success = False
     return success
 
 
@@ -491,6 +515,102 @@ def fix_file_permissions(issues):
             _strip_utf8_bom_silent(path)
     return success
 
+def check_cronjobs():
+    """Prüft, ob die notwendigen Cronjobs für den INSTALL_USER existieren."""
+    print("\n=== Cronjob-Prüfung ===\n")
+    perm_logger.info("--- Starte Cronjob-Prüfung ---")
+    issues = {}
+
+    expected_cronjobs = [
+        {
+            "name": "Live-Daten-Abruf (periodisch)",
+            "line": f"* * * * * {INSTALL_HOME}/get_live.sh > /dev/null 2>&1",
+            "check_part": f"{INSTALL_HOME}/get_live.sh",
+            "optional_if_exists": f"{INSTALL_HOME}/get_live.sh"
+        },
+        {
+            "name": "History-Backup",
+            "line": "0 0 * * * /usr/bin/php /var/www/html/backup_history.php > /dev/null 2>&1",
+            "check_part": "/var/www/html/backup_history.php",
+            "optional_if_exists": "/var/www/html/backup_history.php"
+        },
+        {
+            "name": "E3DC-Control Autostart",
+            "line": f"@reboot sleep 30 && echo 0 > {INSTALL_PATH}/stop && /usr/bin/screen -dmS E3DC {INSTALL_PATH}/e3dc.py",
+            "check_part": "screen -dmS E3DC",
+            "optional_if_exists": f"{INSTALL_PATH}/e3dc.py"
+        },
+        {
+            "name": "Live-Grabber Autostart",
+            "line": f"@reboot /usr/bin/screen -dmS live-grabber {INSTALL_HOME}/get_live.sh",
+            "check_part": "screen -dmS live-grabber",
+            "optional_if_exists": f"{INSTALL_HOME}/get_live.sh"
+        },
+        {
+            "name": "Boot-Benachrichtigung",
+            "line": "@reboot sleep 45 && /usr/local/bin/boot_notify.sh",
+            "check_part": "boot_notify.sh",
+            "optional_if_exists": "/usr/local/bin/boot_notify.sh"
+        },
+        {
+            "name": "Täglicher Statusbericht",
+            "line": '0 12 * * * /usr/local/bin/boot_notify.sh "✅ Status:ControlReserve Online. Laufzeit: \\$(uptime -p)"',
+            "check_part": 'boot_notify.sh "✅ Status:ControlReserve Online',
+            "optional_if_exists": "/usr/local/bin/boot_notify.sh"
+        }
+    ]
+
+    try:
+        result = run_command(f"sudo crontab -l -u {INSTALL_USER}")
+        current_crontab = result['stdout'] if result['success'] else ""
+
+        for cron in expected_cronjobs:
+            # NEU: Prüfen, ob die zugehörige Datei existiert, bevor der Cronjob geprüft wird
+            if 'optional_if_exists' in cron and not os.path.exists(cron['optional_if_exists']):
+                perm_logger.info(f"Cronjob '{cron['name']}' übersprungen (optionales Modul {cron['optional_if_exists']} nicht gefunden).")
+                continue
+
+            if cron['check_part'] in current_crontab:
+                print(f"✓ Cronjob '{cron['name']}' gefunden.")
+                perm_logger.info(f"Cronjob '{cron['name']}' gefunden.")
+            else:
+                print(f"✗ Cronjob '{cron['name']}' fehlt.")
+                perm_logger.warning(f"Cronjob '{cron['name']}' fehlt.")
+                issues[cron['name']] = {"missing": True, "line": cron['line']}
+
+    except Exception as e:
+        print(f"✗ Fehler beim Prüfen der Cronjobs: {e}")
+        perm_logger.error(f"Fehler beim Prüfen der Cronjobs: {e}")
+        issues["error"] = str(e)
+
+    return issues
+
+def fix_cronjobs(issues):
+    """Fügt fehlende Cronjob-Einträge hinzu."""
+    print("\n→ Korrigiere Cronjob-Einträge…\n")
+    success = True
+
+    for name, issue_details in issues.items():
+        if issue_details.get("missing"):
+            cron_line = issue_details["line"]
+            print(f"  → Füge Cronjob '{name}' hinzu...")
+
+            # Dieser Befehl fügt die Zeile zur Crontab hinzu, falls sie noch nicht existiert.
+            # Er ist sicher gegen Duplikate.
+            cmd = f"sudo bash -c \"(crontab -u {INSTALL_USER} -l 2>/dev/null | grep -Fq -- \\\"{cron_line}\\\") || (crontab -u {INSTALL_USER} -l 2>/dev/null; echo \\\"{cron_line}\\\") | crontab -u {INSTALL_USER} -\""
+            
+            result = run_command(cmd)
+            
+            if result['success']:
+                print(f"✓ Cronjob '{name}' hinzugefügt/verifiziert.")
+                perm_logger.info(f"Cronjob '{name}' hinzugefügt/verifiziert: {cron_line}")
+            else:
+                print(f"✗ Fehler beim Hinzufügen des Cronjobs '{name}'. Details im Log.")
+                perm_logger.error(f"Fehler beim Hinzufügen des Cronjobs '{name}': {result['stderr']}")
+                success = False
+                
+    return success
+
 
 def run_permissions_wizard():
     """Hauptlogik für Rechteprüfung und -korrektur."""
@@ -502,20 +622,24 @@ def run_permissions_wizard():
     issues = check_permissions()
     wp_issues = check_webportal_permissions()
     file_issues = check_file_permissions()
-    has_issues = bool(issues) or bool(wp_issues) or bool(file_issues)
+    cron_issues = check_cronjobs()
+
+    has_issues = bool(issues) or bool(wp_issues) or bool(file_issues) or bool(cron_issues)
     if not has_issues:
-        print("\n✓ Alle Berechtigungen sind korrekt.\n")
-        perm_logger.info("✓ Permissionsprüfung bestanden: Keine Probleme gefunden.")
-        log_task_completed("Rechte prüfen & korrigieren", details="Alle Berechtigungen korrekt")
+        print("\n✓ Alle Berechtigungen und Cronjobs sind korrekt.\n")
+        perm_logger.info("✓ Prüfung bestanden: Keine Probleme bei Berechtigungen oder Cronjobs gefunden.")
+        log_task_completed("Rechte prüfen & korrigieren", details="Alle Berechtigungen und Cronjobs korrekt")
         return
-    print("\n⚠ Berechtigungsprobleme gefunden.")
-    perm_logger.warning(f"⚠ Berechtigungsprobleme erkannt: {len(issues)} Verz., {len(wp_issues)} Web, {len(file_issues)} Dateien")
+
+    print("\n⚠ Probleme mit Berechtigungen und/oder Cronjobs gefunden.")
+    perm_logger.warning(f"⚠ Probleme erkannt: {len(issues)} Verz., {len(wp_issues)} Web, {len(file_issues)} Dateien, {len(cron_issues)} Cronjobs")
     choice = input("Automatisch korrigieren? (j/n): ").strip().lower()
     if choice != "j":
         print("✗ Korrektur übersprungen.\n")
-        perm_logger.warning("✗ Berechtigungskorrektur vom Benutzer übersprungen.")
-        log_warning("permissions", "Berechtigungskorrektur vom Benutzer übersprungen")
+        perm_logger.warning("✗ Korrektur vom Benutzer übersprungen.")
+        log_warning("permissions", "Korrektur vom Benutzer übersprungen")
         return
+
     all_success = True
     if issues:
         success = fix_permissions(issues)
@@ -526,14 +650,18 @@ def run_permissions_wizard():
     if file_issues:
         success = fix_file_permissions(file_issues)
         all_success = all_success and success
+    if cron_issues:
+        success = fix_cronjobs(cron_issues)
+        all_success = all_success and success
+
     if all_success:
-        print("\n✓ Alle Berechtigungen korrigiert.\n")
-        perm_logger.info("✓ Alle Berechtigungskorrekturen erfolgreich durchgeführt.")
+        print("\n✓ Alle Probleme korrigiert.\n")
+        perm_logger.info("✓ Alle Korrekturen erfolgreich durchgeführt.")
         log_task_completed("Rechte prüfen & korrigieren", details="Alle Probleme behoben")
     else:
-        print("\n⚠ Einige Berechtigungen konnten nicht korrigiert werden.\n")
-        perm_logger.error("⚠ Einige Berechtigungen konnten nicht automatisch korrigiert werden - manuelle Intervention notwendig.")
-        log_error("permissions", "Einige Berechtigungen konnten nicht automatisch korrigiert werden")
+        print("\n⚠ Einige Probleme konnten nicht korrigiert werden.\n")
+        perm_logger.error("⚠ Einige Probleme konnten nicht automatisch korrigiert werden - manuelle Intervention notwendig.")
+        log_error("permissions", "Einige Probleme konnten nicht automatisch korrigiert werden")
 
 
 register_command("2", "Rechte prüfen & korrigieren", run_permissions_wizard, sort_order=20)

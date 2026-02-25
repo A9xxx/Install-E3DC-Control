@@ -529,10 +529,10 @@ def check_cronjobs():
 
     expected_cronjobs = [
         {
-            "name": "Live-Daten-Abruf (periodisch)",
-            "line": f"* * * * * {INSTALL_HOME}/get_live.sh > /dev/null 2>&1",
-            "check_part": f"{INSTALL_HOME}/get_live.sh",
-            "optional_if_exists": f"{INSTALL_HOME}/get_live.sh"
+            "name": "Live-History schreiben",
+            "line": "* * * * * cd /var/www/html && /usr/bin/php get_live_json.php > /dev/null 2>&1",
+            "check_part": "get_live_json.php",
+            "optional_if_exists": "/var/www/html/get_live_json.php"
         },
         {
             "name": "History-Backup",
@@ -561,7 +561,7 @@ def check_cronjobs():
         {
             "name": "Täglicher Statusbericht",
             "line": '0 12 * * * /usr/local/bin/boot_notify.sh "✅ Status:ControlReserve Online. Laufzeit: \\$(uptime -p)"',
-            "check_part": 'boot_notify.sh "✅ Status:ControlReserve Online',
+            "check_part": 'boot_notify.sh "✅ Status:',
             "optional_if_exists": "/usr/local/bin/boot_notify.sh"
         }
     ]
@@ -601,9 +601,12 @@ def fix_cronjobs(issues):
             cron_line = issue_details["line"]
             print(f"  → Füge Cronjob '{name}' hinzu...")
 
+            # Anführungszeichen für den Shell-Befehl escapen, damit echo "..." funktioniert
+            cron_line_safe = cron_line.replace('"', '\\"')
+
             # Dieser Befehl fügt die Zeile zur Crontab hinzu, falls sie noch nicht existiert.
             # Er ist sicher gegen Duplikate.
-            cmd = f"sudo bash -c \"(crontab -u {INSTALL_USER} -l 2>/dev/null | grep -Fq -- \\\"{cron_line}\\\") || (crontab -u {INSTALL_USER} -l 2>/dev/null; echo \\\"{cron_line}\\\") | crontab -u {INSTALL_USER} -\""
+            cmd = f"sudo bash -c \"(crontab -u {INSTALL_USER} -l 2>/dev/null | grep -Fq -- \\\"{cron_line_safe}\\\") || (crontab -u {INSTALL_USER} -l 2>/dev/null; echo \\\"{cron_line_safe}\\\") | crontab -u {INSTALL_USER} -\""
             
             result = run_command(cmd)
             

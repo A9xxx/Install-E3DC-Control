@@ -89,21 +89,37 @@ done
         logging.error(f"Skript Fehler: {e}")
 
     # 5. Autostart via Crontab (für install_user)
-    print(f"→ Erstelle Crontab-Eintrag für @reboot…")
-    cron_line = f"@reboot /usr/bin/screen -dmS live-grabber {GRABBER_SCRIPT}"
+    print(f"→ Erstelle Crontab-Einträge…")
+    
+    grabber_cron = f"@reboot /usr/bin/screen -dmS live-grabber {GRABBER_SCRIPT}"
+    history_cron = "* * * * * cd /var/www/html && /usr/bin/php get_live_json.php > /dev/null 2>&1"
     
     try:
         # Bestehende Crontab laden
         result = run_command(f"sudo -u {install_user} crontab -l")
         existing_cron = result['stdout'] if result['success'] else ""
         
+        new_cron = existing_cron
+        modified = False
+        
         if GRABBER_SCRIPT not in existing_cron:
-            new_cron = existing_cron.strip() + f"\n{cron_line}\n"
+            new_cron = new_cron.strip() + f"\n{grabber_cron}\n"
+            modified = True
+            print("  ✓ Live-Grabber Autostart hinzugefügt")
+        else:
+            print("  ✓ Live-Grabber Autostart bereits vorhanden")
+
+        if "get_live_json.php" not in existing_cron:
+            new_cron = new_cron.strip() + f"\n{history_cron}\n"
+            modified = True
+            print("  ✓ Live-History Writer hinzugefügt")
+        else:
+            print("  ✓ Live-History Writer bereits vorhanden")
+
+        if modified:
             process = subprocess.Popen(["sudo", "-u", install_user, "crontab", "-"], stdin=subprocess.PIPE, text=True)
             process.communicate(input=new_cron)
             print("  ✓ Crontab aktualisiert")
-        else:
-            print("  ✓ Crontab-Eintrag bereits vorhanden")
     except Exception as e:
         print(f"  ✗ Fehler beim Crontab-Setup: {e}")
         logging.error(f"Crontab Fehler: {e}")

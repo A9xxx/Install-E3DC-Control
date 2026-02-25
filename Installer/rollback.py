@@ -175,7 +175,7 @@ def rollback_to_commit(commit_hash):
     config_file = os.path.join(INSTALL_PATH, "e3dc.config.txt")
     if os.path.exists(config_file):
         replace_in_file(config_file, "stop", "stop = 1")
-        time.sleep(3)
+        time.sleep(5)
         replace_in_file(config_file, "stop", "stop = 0")
 
     print("✓ Rollback abgeschlossen.\n")

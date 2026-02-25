@@ -202,6 +202,7 @@ def main():
     # NEU: Argumenten-Parser für Headless / Web-Trigger
     parser = argparse.ArgumentParser(description="E3DC-Control Installer")
     parser.add_argument("--unattended", action="store_true", help="Ohne Benutzereingaben ausführen (für PHP/Cron)")
+    parser.add_argument("--update-e3dc", action="store_true", help="E3DC-Control aktualisieren (headless)")
     args = parser.parse_args()
     UNATTENDED_MODE = args.unattended
 
@@ -209,6 +210,12 @@ def main():
         setup_logging()
         check_python_version()
         check_root_privileges()
+
+        # Direktes Update wenn angefordert
+        if args.update_e3dc:
+            from Installer.update import update_e3dc
+            update_e3dc(headless=True)
+            sys.exit(0)
 
         check_for_updates()
 

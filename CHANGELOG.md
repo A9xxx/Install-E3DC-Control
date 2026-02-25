@@ -27,6 +27,14 @@
 *   **Warnsystem:** Blinkende Indikatoren warnen vor starken Preissprüngen in den nächsten Stunden.
 *   **Konsistenz:** Übernahme der Farb-Logik (Grün/Rot) für Preisniveaus vom Desktop.
 
+### 🔄 Update-System & Wartung
+*   **Web-Update:** E3DC-Control kann nun direkt über das Web-Portal aktualisiert werden (Desktop & Mobile).
+    *   Echtzeit-Fortschrittsanzeige im Modal-Fenster.
+    *   Polling-Mechanismus verhindert Timeouts bei langsamen Verbindungen (Cloudflare-Fix).
+    *   Visuelles Feedback (Grüner Haken / Rotes Kreuz) bei Erfolg/Fehler.
+*   **Headless-Installer:** Der Installer unterstützt nun einen `--unattended` Modus für automatisierte Abläufe.
+*   **BOM-Bereinigung:** Automatisches Entfernen von Windows-Steuerzeichen (Byte Order Mark) aus Skripten zur Vermeidung von Syntaxfehlern.
+
 ### 🛠️ Technik & Backend
 *   **Self-Healing:** `run_now.php` erkennt und bereinigt nun automatisch verwaiste Lockfiles (> 5 Min), um Systemhänger zu vermeiden.
 *   **Rechte-Management:** Der Installer (`check_permissions.sh`) prüft nun auch Schreibrechte für temporäre Web-Verzeichnisse (`tmp/`, `ramdisk/`).

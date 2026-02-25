@@ -14,8 +14,8 @@ INSTALL_HOME = get_home_dir(INSTALL_USER)
 INSTALL_PATH = get_install_path()
 
 
-def _strip_utf8_bom_silent(path):
-    """Entfernt UTF-8 BOM still, falls vorhanden (keine Ausgabe)."""
+def _strip_utf8_bom(path):
+    """Entfernt UTF-8 BOM, falls vorhanden."""
     try:
         with open(path, "rb") as f:
             content = f.read()
@@ -23,6 +23,7 @@ def _strip_utf8_bom_silent(path):
         if content.startswith(bom):
             with open(path, "wb") as f:
                 f.write(content[len(bom):])
+            print(f"  ✓ BOM entfernt: {os.path.basename(path)}")
     except Exception:
         pass
 
@@ -216,6 +217,7 @@ FILE_DEFINITIONS = [
     {"path": "/var/www/html/get_live_json.php", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": False, "executable": False},
     {"path": "/var/www/html/run_live_history.php", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": "/var/www/html/run_now.php", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": False, "executable": False},
+    {"path": "/var/www/html/run_update.php", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": False, "executable": False},
     {"path": "/var/www/html/config_editor.php", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": False, "executable": False},
     {"path": "/var/www/html/archiv_diagramm.php", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": False, "executable": False},
     {"path": "/var/www/html/run_history.php", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
@@ -542,9 +544,9 @@ def check_cronjobs():
         },
         {
             "name": "E3DC-Control Autostart",
-            "line": f"@reboot sleep 30 && echo 0 > {INSTALL_PATH}/stop && /usr/bin/screen -dmS E3DC {INSTALL_PATH}/e3dc.py",
+            "line": f"@reboot sleep 20 && echo 0 > {INSTALL_PATH}/stop && /usr/bin/screen -dmS E3DC {INSTALL_PATH}/E3DC.sh",
             "check_part": "screen -dmS E3DC",
-            "optional_if_exists": f"{INSTALL_PATH}/e3dc.py"
+            "optional_if_exists": f"{INSTALL_PATH}/E3DC.sh"
         },
         {
             "name": "Live-Grabber Autostart",
@@ -621,6 +623,57 @@ def fix_cronjobs(issues):
     return success
 
 
+def check_sudoers_permissions():
+    """Prüft, ob www-data das Update-Skript ausführen darf."""
+    print("\n=== Sudoers-Prüfung (Web-Update) ===\n")
+    perm_logger.info("--- Starte Sudoers-Prüfung ---")
+    
+    sudoers_file = "/etc/sudoers.d/010_e3dc_web_update"
+    script_path = os.path.join(INSTALL_HOME, "Install", "installer_main.py")
+    expected_content = f"www-data ALL=(root) NOPASSWD: /usr/bin/python3 {script_path} --update-e3dc"
+    
+    issues = []
+    
+    if not os.path.exists(sudoers_file):
+        print(f"✗ Sudoers-Datei fehlt: {sudoers_file}")
+        issues.append({"missing": True, "file": sudoers_file, "content": expected_content})
+    else:
+        try:
+            with open(sudoers_file, "r") as f:
+                content = f.read().strip()
+            if content != expected_content:
+                print(f"✗ Sudoers-Inhalt veraltet/falsch.")
+                issues.append({"missing": False, "file": sudoers_file, "content": expected_content})
+            else:
+                print(f"✓ Sudoers-Konfiguration korrekt.")
+                perm_logger.info("Sudoers-Konfiguration korrekt.")
+        except Exception as e:
+            print(f"✗ Fehler beim Lesen von {sudoers_file}: {e}")
+            perm_logger.error(f"Fehler beim Lesen von {sudoers_file}: {e}")
+            issues.append({"error": True})
+            
+    return issues
+
+def fix_sudoers_permissions(issues):
+    """Erstellt die Sudoers-Datei für Web-Updates."""
+    print("\n→ Richte Sudoers für Web-Update ein…\n")
+    success = True
+    for issue in issues:
+        if "content" in issue:
+            path = issue["file"]
+            content = issue["content"]
+            print(f"  → Schreibe {path}…")
+            try:
+                run_command(f"sudo bash -c 'echo \"{content}\" > {path}'")
+                run_command(f"sudo chmod 440 {path}")
+                print(f"✓ Sudoers-Datei erstellt/aktualisiert.")
+                perm_logger.info(f"Sudoers-Datei erstellt/aktualisiert: {path}")
+            except Exception as e:
+                print(f"✗ Fehler: {e}")
+                perm_logger.error(f"Fehler beim Erstellen der Sudoers-Datei {path}: {e}")
+                success = False
+    return success
+
 def run_permissions_wizard():
     """Hauptlogik für Rechteprüfung und -korrektur."""
     # Als erstes: Bereinige root-eigene Dateien falls vorhanden
@@ -632,8 +685,9 @@ def run_permissions_wizard():
     wp_issues = check_webportal_permissions()
     file_issues = check_file_permissions()
     cron_issues = check_cronjobs()
+    sudo_issues = check_sudoers_permissions()
 
-    has_issues = bool(issues) or bool(wp_issues) or bool(file_issues) or bool(cron_issues)
+    has_issues = bool(issues) or bool(wp_issues) or bool(file_issues) or bool(cron_issues) or bool(sudo_issues)
     if not has_issues:
         print("\n✓ Alle Berechtigungen und Cronjobs sind korrekt.\n")
         perm_logger.info("✓ Prüfung bestanden: Keine Probleme bei Berechtigungen oder Cronjobs gefunden.")
@@ -641,7 +695,7 @@ def run_permissions_wizard():
         return
 
     print("\n⚠ Probleme mit Berechtigungen und/oder Cronjobs gefunden.")
-    perm_logger.warning(f"⚠ Probleme erkannt: {len(issues)} Verz., {len(wp_issues)} Web, {len(file_issues)} Dateien, {len(cron_issues)} Cronjobs")
+    perm_logger.warning(f"⚠ Probleme erkannt: {len(issues)} Verz., {len(wp_issues)} Web, {len(file_issues)} Dateien, {len(cron_issues)} Cronjobs, {len(sudo_issues)} Sudoers")
     choice = input("Automatisch korrigieren? (j/n): ").strip().lower()
     if choice != "j":
         print("✗ Korrektur übersprungen.\n")
@@ -661,6 +715,9 @@ def run_permissions_wizard():
         all_success = all_success and success
     if cron_issues:
         success = fix_cronjobs(cron_issues)
+        all_success = all_success and success
+    if sudo_issues:
+        success = fix_sudoers_permissions(sudo_issues)
         all_success = all_success and success
 
     if all_success:

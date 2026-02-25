@@ -283,12 +283,13 @@ def is_newer_version(latest, installed):
     return False
 
 
-def check_and_update(silent=False):
+def check_and_update(silent=False, check_only=False):
     """
     Hauptfunktion: Prüft auf Updates und führt diese durch.
     
     Args:
         silent (bool): Wenn True, nur aktualisieren ohne Nachfragen bei Match
+        check_only (bool): Wenn True, nur prüfen und True/False zurückgeben (keine Installation)
     
     Returns:
         True wenn Update durchgeführt wurde, False sonst
@@ -316,6 +317,9 @@ def check_and_update(silent=False):
         if not silent:
             print("\n✓ Installer ist aktuell.\n")
         return False
+
+    if check_only:
+        return True
     
     # Zeige Release-Notes
     if not silent:

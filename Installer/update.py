@@ -12,7 +12,8 @@ INSTALL_PATH = get_install_path()
 
 def get_current_version():
     """Holt die aktuelle Git-Commit-ID."""
-    result = run_command(f"cd {INSTALL_PATH} && git rev-parse HEAD", timeout=5)
+    install_user = get_install_user()
+    result = run_command(f"sudo -u {install_user} git -C {INSTALL_PATH} rev-parse HEAD", timeout=5)
     return result['stdout'].strip() if result['success'] else None
 
 
@@ -23,15 +24,16 @@ def get_latest_version():
         print("✗ Keine Git-Installation gefunden.")
         return None
 
+    install_user = get_install_user()
     # Prüfe ob Remote existiert
-    result = run_command(f"cd {INSTALL_PATH} && git remote get-url origin", timeout=5)
+    result = run_command(f"sudo -u {install_user} git -C {INSTALL_PATH} remote get-url origin", timeout=5)
     if not result['success']:
         print("✗ Kein Git-Remote 'origin' gefunden.")
         return None
 
     # Hole neueste Version vom Remote
     result = run_command(
-        f"cd {INSTALL_PATH} && git ls-remote --heads origin master",
+        f"sudo -u {install_user} git -C {INSTALL_PATH} ls-remote --heads origin master",
         timeout=10
     )
     if not result['success'] or not result['stdout'].strip():
@@ -43,14 +45,15 @@ def get_latest_version():
 
 def count_missing_commits():
     """Zählt fehlende Commits."""
+    install_user = get_install_user()
     # Fetch origin
-    result = run_command(f"cd {INSTALL_PATH} && git fetch origin master", timeout=15)
+    result = run_command(f"sudo -u {install_user} git -C {INSTALL_PATH} fetch origin master", timeout=15)
     if not result['success']:
         return None
 
     # Zähle Commits
     result = run_command(
-        f"cd {INSTALL_PATH} && git rev-list --count HEAD..origin/master",
+        f"sudo -u {install_user} git -C {INSTALL_PATH} rev-list --count HEAD..origin/master",
         timeout=5
     )
     if result['success']:
@@ -63,14 +66,15 @@ def count_missing_commits():
 
 def list_missing_commits():
     """Listet fehlende Commits auf."""
+    install_user = get_install_user()
     result = run_command(
-        f"cd {INSTALL_PATH} && git log HEAD..origin/master --oneline",
+        f"sudo -u {install_user} git -C {INSTALL_PATH} log HEAD..origin/master --oneline",
         timeout=5
     )
     return result['stdout'].strip() if result['success'] else None
 
 
-def update_e3dc():
+def update_e3dc(headless=False):
     """Führt Update durch."""
     print("\n=== E3DC-Control aktualisieren ===\n")
 
@@ -91,6 +95,11 @@ def update_e3dc():
     print(f"Aktuelle Version: {old_version[:7]}")
     print(f"Neueste Version:  {latest_version[:7]}")
 
+    # Speichere aktuellen Stand von origin/master für Reset bei Abbruch
+    install_user = get_install_user()
+    res = run_command(f"sudo -u {install_user} git -C {INSTALL_PATH} rev-parse origin/master", timeout=5)
+    old_origin_sha = res['stdout'].strip() if res['success'] else None
+
     # Prüfe auf Updates
     missing = count_missing_commits()
     if missing is None:
@@ -106,10 +115,17 @@ def update_e3dc():
             print(commits)
 
     # Bestätigung
-    confirm = input("\n→ Möchtest du jetzt aktualisieren? (j/n): ").strip().lower()
-    if confirm != "j":
-        print("✗ Update abgebrochen.\n")
-        return
+    if not headless:
+        confirm = input("\n→ Möchtest du jetzt aktualisieren? (j/n): ").strip().lower()
+        if confirm != "j":
+            print("✗ Update abgebrochen. Es wurden keine Änderungen vorgenommen.\n")
+            
+            # Reset origin/master auf alten Stand, damit "git status" sauber bleibt
+            if old_origin_sha:
+                run_command(f"sudo -u {install_user} git -C {INSTALL_PATH} update-ref refs/remotes/origin/master {old_origin_sha}")
+            return
+    else:
+        print("→ Starte Update (Headless-Modus)...\n")
 
     # Backup erstellen
     print("\n→ Erstelle Backup…")
@@ -162,18 +178,23 @@ def update_e3dc():
     if os.path.exists(config_file):
         print("→ Neustart mit Konfiguration…")
         replace_in_file(config_file, "stop", "stop = 1")
-        time.sleep(3)
+        time.sleep(5)
         replace_in_file(config_file, "stop", "stop = 0")
 
     print("✓ Update erfolgreich abgeschlossen.\n")
 
     # Stash-Management
-    result = run_command(f"cd {INSTALL_PATH} && git stash list")
+    result = run_command(f"sudo -u {install_user} git -C {INSTALL_PATH} stash list")
     if result['success'] and "Auto-Stash vor Update" in result['stdout']:
-        choice = input("→ Lokale Änderungen wiederherstellen? (j/n): ").strip().lower()
-        if choice == "j":
-            print("→ Stelle Änderungen wieder her…")
-            run_command(f"cd {INSTALL_PATH} && git stash pop")
+        restore = False
+        if headless:
+            restore = True # Im Headless-Modus automatisch wiederherstellen
+        else:
+            restore = input("→ Lokale Änderungen wiederherstellen? (j/n): ").strip().lower() == "j"
+        
+        if restore:
+            print("→ Stelle Änderungen wieder her (git stash pop)…")
+            run_command(f"sudo -u {install_user} git -C {INSTALL_PATH} stash pop", timeout=30)
             print("✓ Änderungen wiederhergestellt.\n")
 
 

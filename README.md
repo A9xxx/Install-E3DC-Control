@@ -1,40 +1,80 @@
-﻿# E3DC-Control Installer & Web-Interface
+﻿# ⚡ E3DC-Control Installer & Web-Interface
 
-Modularer Installer und Backend-Controller für E3DC-Control auf einem (Headless) Raspberry Pi.
-Optimiert für die Nutzung als Progressive Web App (PWA) über Cloudflare Tunnel.
+**Intelligente Steuerung und Visualisierung für E3DC Hauskraftwerke auf dem Raspberry Pi.**
 
-## Voraussetzungen
+Dieses Projekt ist ein Erweiterungsmodul für [E3DC-Control von Eba-M](https://github.com/Eba-M/E3DC-Control).
+Es bietet eine Komplettlösung zur Installation, Verwaltung und Visualisierung der E3DC-Control Software, um die Installation und Rechtevergabe so benutzerfreundlich wie möglich zu machen und eine moderne Bedienoberfläche zu schaffen.
 
-- Raspberry Pi OS (Bullseye oder neuer) - Headless (ohne Desktop) unterstützt!
-- Python 3.7+
-- sudo-Rechte
-- Webserver (Apache/Nginx) mit PHP-Unterstützung für das `/var/www/html/` Frontend
+---
 
-## Installation
+## 🎯 Was macht dieses Projekt?
 
-### Option 1 (empfohlen): Installation über GitHub
+Es verbindet die leistungsstarke C++ Steuerung des Basis-Projekts mit einem modernen, responsiven Web-Dashboard.
+
+Die Kernfunktionen der Steuerung (von [Eba-M](https://github.com/Eba-M/E3DC-Control)):
+*   **🔋 Intelligentes Laden:** Der Speicher wird basierend auf Wetterprognosen und dynamischen Strompreisen (aWATTar/Tibber) geladen.
+*   **📉 Kostenoptimierung:** Nutzung günstiger Strompreisfenster zum Nachladen (insb. im Winter).
+*   **☀️ Prognosebasiert:** Vermeidung von Abregelungsverlusten durch vorausschauendes Lademanagement.
+
+Zusätzliche Funktionen dieses Moduls:
+*   **📊 Visualisierung:** Ein umfassendes Web-Dashboard zeigt Live-Werte, Historie und Prognosen für PV, Batterie, Hausverbrauch, Netz, Wallbox und Wärmepumpe.
+*   **🚗 Wallbox-Steuerung:** Manuelle und automatische Steuerung der E3DC Wallbox inkl. Ladeplanung.
+
+---
+
+## 📋 Voraussetzungen
+
+Bevor du startest, stelle sicher, dass folgende Punkte erfüllt sind:
+
+*   **Hardware:** Raspberry Pi (Empfohlen: Pi 4 oder Pi 5, läuft auch auf Pi Zero 2 W) mit SD-Karte oder SSD.
+*   **Betriebssystem:** Raspberry Pi OS Lite (Bullseye oder neuer, 64-bit empfohlen).
+*   **Netzwerk:** Der Pi muss im gleichen Netzwerk wie das E3DC Hauskraftwerk sein und Internetzugriff haben.
+*   **Zugriff:** SSH-Zugriff auf den Pi.
+
+*Hinweis: Ein Webserver (Apache/PHP) ist nicht zwingend vorinstalliert nötig, da der Installer diesen auf Wunsch automatisch einrichtet.*
+
+---
+
+## 🚀 Installation
+
+Die Installation erfolgt bequem über die Kommandozeile.
+
+### Schritt 1: System aktualisieren & Git installieren
+
+Melde dich per SSH auf deinem Raspberry Pi an und führe folgende Befehle aus:
 
 ```bash
 sudo apt update
 sudo apt install -y git
+```
+
+### Schritt 2: Repository klonen
+
+Lade den Installer herunter:
+
+```bash
 cd ~
-git clone [https://github.com/A9xxx/Install-E3DC-Control.git](https://github.com/A9xxx/Install-E3DC-Control.git) Install
+git clone https://github.com/A9xxx/Install-E3DC-Control.git Install
+```
+
+### Schritt 3: Installer starten
+
+Wechsle in das Verzeichnis und starte das Setup:
+
+```bash
 cd Install
 sudo python3 installer_main.py
-Option 2: Headless / Unattended Modus (Neu)
-Für automatisierte Installationen (oder Ausführung via PHP/Webinterface ohne Konsoleneingaben) kann der Installer im unbeaufsichtigten Modus gestartet werden. Alle Abfragen werden automatisch mit den Standardwerten beantwortet:
+```
 
-Bash
-sudo python3 installer_main.py --unattended
-Rechteprüfung für das Web-Interface (PWA)
-Da das System über PHP (www-data) auf die Skripte zugreift, sind korrekte Dateiberechtigungen essenziell. Prüfe diese regelmäßig mit:
+Im Menü wählst du für eine Neuinstallation am besten die Option **"Alles installieren"**. Der Assistent führt dich durch die Einrichtung von Abhängigkeiten, der E3DC-Software, dem Webserver und der Konfiguration.
 
-Bash
-cd ~/Install
-chmod +x check_permissions.sh
-./check_permissions.sh
-Wichtige Hinweise zum Ablauf
-Beim Start erfolgt zuerst eine Update-Abfrage (im --unattended Modus wird dieses automatisch installiert).
+---
 
-Die IPC-Kommunikation (Inter-Process-Communication) zwischen PHP und Python läuft primär über die Datei e3dc_paths.json und das tmp/ Verzeichnis im Web-Root.
+## 🛠️ Wartung & Updates
 
+Der Installer dient auch als Wartungstool. Starte ihn jederzeit erneut (`sudo python3 installer_main.py`), um Updates einzuspielen, Berechtigungen zu reparieren oder Backups zu verwalten.
+
+Für automatisierte Abläufe (z.B. via Cronjob) gibt es den Headless-Modus: `sudo python3 installer_main.py --unattended`
+
+
+---

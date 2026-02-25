@@ -323,6 +323,9 @@ class DiagramInstaller:
                 # 3) /var/www/html/tmp/ und icons/ Berechtigungen sicherstellen
                 print("\n→ Überprüfe Verzeichnisstrukturen...")
                 os.makedirs(TMP_PATH, exist_ok=True)
+                # Backup-Verzeichnis für Historie erstellen
+                history_backups_path = os.path.join(TMP_PATH, "history_backups")
+                os.makedirs(history_backups_path, exist_ok=True)
                 print(f"✓ tmp-Ordner sichergestellt: {TMP_PATH}")
                 
                 # 4) Rechte für das gesamte Webportal setzen (install_user:www-data, 775)
@@ -348,8 +351,12 @@ class DiagramInstaller:
                         for f in files:
                             os.chmod(os.path.join(root, f), 0o664)
                     
-                    # Spezielle Rechte für tmp (775, nicht 777 - nicht world-writable!)
-                    set_web_directory(TMP_PATH, recursive=False)
+                    # Spezielle Rechte für tmp (777, damit PHP/Python problemlos schreiben können)
+                    subprocess.run(["sudo", "chmod", "777", TMP_PATH], check=True, capture_output=True)
+                    
+                    # Rechte für history_backups (775)
+                    subprocess.run(["sudo", "chown", f"{self.install_user}:www-data", history_backups_path], check=True, capture_output=True)
+                    subprocess.run(["sudo", "chmod", "775", history_backups_path], check=True, capture_output=True)
                     
                     print(f"✓ Besitzer für alle Dateien: {self.install_user}:www-data")
                     print(f"✓ Rechte gesetzt (Ordner 775, Dateien 664)")

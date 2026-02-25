@@ -1,18 +1,44 @@
-1. Intelligentes History-Backup
-Das Skript backup_history.php, das deine täglichen Sicherungen erstellt, wurde grundlegend überarbeitet. Es kopiert nicht mehr die gesamte 48-Stunden-Datei, sondern liest sie intelligent aus und speichert nur die Daten des jeweils gestrigen Tages. Außerdem setzt es automatisch die korrekten Dateiberechtigungen (pi:www-data), damit der Webserver die Backups auch lesen kann.
+# Changelog
 
-2. Korrekte Anzeige von Archiv-Diagrammen
-Das Hauptproblem, dass beim Auswählen eines alten Datums im Dropdown-Menü trotzdem die Live-Daten angezeigt wurden, ist behoben. Die gesamte Kette von der Weboberfläche (history.php) über das Steuer-Skript (run_live_history.php) bis zum Python-Skript (plot_live_history.py) wurde korrigiert. Das Python-Skript akzeptiert jetzt einen Dateipfad und zeichnet genau die Daten, die ihm übergeben werden.
+## [Aktuelles Update] - Dashboard 2.0 & Wallbox-Intelligenz
 
-3. Optimierungen am Diagramm
-Die Darstellung des Diagramms selbst wurde mehrfach verbessert:
+### 🖥️ Desktop Dashboard (`index.php`)
+*   **Komplettes Redesign:** Neues Grid-Layout, das die volle Bildschirmbreite nutzt.
+*   **Live-Daten Kacheln:** Echtzeit-Visualisierung von PV, Batterie, Hausverbrauch, Netz, Wallbox und Wärmepumpe.
+*   **Intelligente Strompreis-Anzeige:**
+    *   Dynamischer Balken mit Farbcodierung (Grün/Gelb/Rot) je nach Preisniveau (Günstig/Teuer).
+    *   Trend-Indikatoren (Pfeile) zeigen steigende oder fallende Preise an.
+    *   Anzeige der Tages-Minima und -Maxima.
+*   **Multi-View Diagramm:** Nahtloser Wechsel zwischen SoC-Prognose, Live-Leistungsverlauf und Archiv-Ansicht direkt im Dashboard.
+*   **Smart Polling:** Asynchrone Datenaktualisierung mit Lade-Animationen für ein flüssiges Nutzererlebnis.
+*   **Routing:** Integrierte Navigation zu Unterseiten (Wallbox, Config, Archiv) ohne die Hauptseite zu verlassen.
 
-Korrekter Hausverbrauch: Der Verbrauch der Wärmepumpe wird nun korrekt aus dem Gesamthausverbrauch herausgerechnet.
-Batterie-Logik: Die vertauschten Bezeichnungen für "Laden" und "Entladen" der Batterie wurden korrigiert.
-Lesbarkeit: Die Linien für Netzbezug und Einspeisung sind jetzt dicker. Zudem beginnen alle Linien sauber auf der Nulllinie und "schweben" nicht mehr in der Luft.
-Mobile Ansicht: Die Legende wurde durch kürzere Bezeichnungen und kleinere Schrift kompakter gestaltet, was die Darstellung auf Smartphones deutlich verbessert.
-4. Verbesserte Systemprüfung (Installer)
-Die permissions.py wurde erweitert, um die Stabilität des Systems langfristig zu sichern:
+### 🔌 Wallbox & Ladeplanung (`Wallbox.php`)
+*   **Visuelle 24h-Timeline:** Neue rollierende Ansicht (zentriert auf "Jetzt"), die vergangene und geplante Ladefenster grafisch darstellt.
+*   **Kostenvorschau:** Automatische Berechnung der voraussichtlichen Ladekosten für den geplanten Zeitraum (basierend auf aWATTar-Preisen).
+    *   Szenarien für 7.2 kW, 11 kW und 22 kW Ladeleistung.
+*   **Echtzeit-Status:** Neue Status-Card am Kopf der Seite zeigt sofort an, wenn aktiv geladen wird (inkl. Leistung).
+*   **Robustheit:** Umstellung auf Parsing der maschinenlesbaren `e3dc.wallbox.out` für präzisere Datenverarbeitung.
+*   **Auto-Refresh:** Die Seite aktualisiert sich automatisch, sobald ein neuer Ladeplan berechnet wurde.
+*   **Quick-Actions:** Schnellzugriff für "Stop" (0h) und "Sofort Laden" (99h).
 
-Neue Dateien: Alle heute geänderten und neu hinzugekommenen Dateien und Ordner (wie das Backup-Verzeichnis) werden nun von der Rechteprüfung erfasst.
-Cronjob-Prüfung: Der Installer kann jetzt alle wichtigen Cronjobs (sowohl die periodischen als auch die @reboot-Jobs) überprüfen. Die Prüfung ist dabei so intelligent, dass sie nur die Cronjobs als "fehlend" meldet, deren zugehörige Skripte auch wirklich installiert sind. Das verhindert Fehlalarme bei optionalen Modulen.
+### 📱 Mobile Ansicht (`mobile.php`)
+*   **Preis-Chart:** Ein Area-Chart im Hintergrund der Preiskachel visualisiert den Tagesverlauf.
+*   **Warnsystem:** Blinkende Indikatoren warnen vor starken Preissprüngen in den nächsten Stunden.
+*   **Konsistenz:** Übernahme der Farb-Logik (Grün/Rot) für Preisniveaus vom Desktop.
+
+### 🛠️ Technik & Backend
+*   **Self-Healing:** `run_now.php` erkennt und bereinigt nun automatisch verwaiste Lockfiles (> 5 Min), um Systemhänger zu vermeiden.
+*   **Rechte-Management:** Der Installer (`check_permissions.sh`) prüft nun auch Schreibrechte für temporäre Web-Verzeichnisse (`tmp/`, `ramdisk/`).
+*   **Performance:** Optimiertes Caching und Polling-Intervalle zur Entlastung des Raspberry Pi.
+
+---
+
+### ✨ Mehrwert der Änderungen
+*   **Sofortige Klarheit (UX):** Keine Interpretation von Textlisten mehr nötig – ein Blick auf die Timeline oder das Dashboard genügt.
+*   **Kosten-Transparenz:** Du siehst vorab, was dich das Laden kosten wird.
+*   **Live-Feedback:** Direkte Rückmeldung über Aktionen ohne manuelles Neuladen der Seite.
+*   **Professionelle Optik:** Einheiltiche Designsprache (Dark Mode, Bootstrap 5) über alle Ansichten hinweg.
+
+---
+*Generiert für E3DC-Control Release Candidate*

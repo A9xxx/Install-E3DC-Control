@@ -27,6 +27,7 @@ Thumbs.db
 *.swp
 *.swo
 *~
+=5
 
 # Logs
 *.log

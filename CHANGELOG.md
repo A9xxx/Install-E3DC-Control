@@ -1,6 +1,31 @@
 # Changelog
 
-## [Aktuelles Update] - Dashboard 2.0 & Wallbox-Intelligenz
+## [2026.02.26] - Bugfixes & UI-Verbesserungen
+
+### 🐞 Bugfixes
+*   **PV-Prognose (`mobile.php`):** Die Berechnung des theoretischen PV-Sollwerts wurde korrigiert. Sie berücksichtigt nun die atmosphärische Dämpfung (Air Mass), was zu deutlich realistischeren Werten bei tiefem Sonnenstand (morgens/abends) führt.
+*   **Diagramm-Kompatibilität (`plot_live_history.py`):** Ein Fehler (`Invalid property: 'titlefont'`) wurde behoben, der auf Systemen mit neueren Plotly-Versionen (v4/v5+) zum Absturz der Diagrammerstellung führte.
+*   **Desktop-Dashboard (`index.php`):** Ein Fehler wurde behoben, bei dem das Aktualisieren des Leistungsverlaufs-Diagramms fehlschlug.
+*   **Wallbox-Anzeige (`Wallbox.php`):** Ein Anzeigefehler wurde korrigiert, durch den immer alle drei Ladekosten-Szenarien gleichzeitig sichtbar waren.
+*   **Variablen-Groß-/Kleinschreibung:** Diverse PHP-Skripte und Python-Dateien wurden robuster gemacht, um Fehler durch inkonsistente Groß-/Kleinschreibung in Konfigurationsvariablen (z.B. `awmwst` vs. `AWMwSt`) zu verhindern.
+*   **Self-Update (`self_update.py`):** Ein Fehler wurde behoben, der dazu führte, dass bei einem Self-Update bestehende `.json`-Konfigurationsdateien überschrieben wurden. Die unnötige Abfrage von bereits konfigurierten Werten wurde ebenfalls korrigiert.
+*   **Ramdisk (`ramdisk.py`):** Der `systemctl daemon-reload` Befehl wird nun nach Änderungen an der `fstab` ausgeführt, um Systemwarnungen zu vermeiden und sicherzustellen, dass die Ramdisk korrekt eingebunden wird.
+
+### ✨ UI & UX-Verbesserungen
+*   **Wallbox-Ladekosten (`Wallbox.php`):**
+    *   Die Auswahl der Ladeleistung (z.B. 7.2, 11 kW) für die Kostenschätzung ist nun in der `e3dc.config.txt` (`wbcostpowers`) frei konfigurierbar.
+    *   Die zuletzt gewählte Ladeleistung wird im Browser gespeichert und beim nächsten Besuch automatisch wiederhergestellt (Standard ist 11 kW).
+    *   Die Tooltips auf der Lade-Timeline funktionieren nun auch auf Touch-Geräten (durch Antippen).
+*   **Konfigurations-Editor (`config_editor.php`):**
+    *   Es können nun direkt über die Weboberfläche neue Variablen zur `e3dc.config.txt` hinzugefügt werden.
+    *   Die Lesbarkeit von Hinweistexten im Dark-Mode wurde verbessert.
+*   **Mobile Historie (`history.php`):** Das Diagramm wird beim Wechsel auf den Reiter "Historie" nicht mehr automatisch aktualisiert, sondern erst nach einem Klick auf den "Update"-Button, um unnötige Ladevorgänge zu vermeiden.
+*   **Design-Anpassungen:**
+    *   Der "Steuern"-Button auf der Wallbox-Kachel im Desktop-Dashboard wurde durch ein dezentes Zahnrad-Icon ersetzt.
+
+---
+
+## [2026.02.25] - Dashboard 2.0 & Wallbox-Intelligenz
 
 ### 🖥️ Desktop Dashboard (`index.php`)
 *   **Komplettes Redesign:** Neues Grid-Layout, das die volle Bildschirmbreite nutzt.

@@ -56,6 +56,8 @@ def setup_ramdisk():
         # Schreibe die neuen Zeilen zurück
         with open(FSTAB_PATH, "w") as f:
             f.writelines(new_lines)
+        print("  → Reloading systemd manager configuration…")
+        run_command("sudo systemctl daemon-reload")
     except Exception as e:
         print(f"  ✗ Fehler beim Bearbeiten von fstab: {e}")
         logging.error(f"FSTAB Fehler: {e}")

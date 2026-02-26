@@ -303,10 +303,30 @@ class DiagramInstaller:
                 if not os.path.isdir(html_source):
                     print(f"⚠️  Kein 'html'-Ordner in ZIP gefunden")
                 else:
+                    # Sicherung der e3dc_paths.json
+                    paths_config_to_preserve = None
+                    paths_config_path = os.path.join(WWW_PATH, "e3dc_paths.json")
+                    if os.path.exists(paths_config_path):
+                        try:
+                            with open(paths_config_path, 'r', encoding='utf-8') as f:
+                                paths_config_to_preserve = f.read()
+                            print("  → Sichern der e3dc_paths.json")
+                        except Exception as e:
+                            print(f"  ⚠️  Sicherung der e3dc_paths.json fehlgeschlagen: {e}")
+
                     try:
                         # Modernes shutil.copytree zum Zusammenführen der Verzeichnisse
                         shutil.copytree(html_source, WWW_PATH, dirs_exist_ok=True)
                         print(f"✓ Dateien und Unterordner (icons) → {WWW_PATH}")
+
+                        # Wiederherstellen der e3dc_paths.json
+                        if paths_config_to_preserve:
+                            try:
+                                with open(paths_config_path, 'w', encoding='utf-8') as f:
+                                    f.write(paths_config_to_preserve)
+                                print("  ✓ Wiederherstellen der e3dc_paths.json")
+                            except Exception as e:
+                                print(f"  ⚠️  Wiederherstellen der e3dc_paths.json fehlgeschlagen: {e}")
                     except Exception as e:
                         print(f"⚠️  Fehler beim Kopieren des Webportal-Ordners: {e}")
                 

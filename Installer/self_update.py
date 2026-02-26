@@ -183,6 +183,17 @@ def extract_release(zip_path, new_version):
 
         print(f"→ Aktualisiere Installer-Verzeichnis aus: {src_installer}")
 
+        # Sicherung der Konfiguration
+        config_to_preserve = None
+        config_path = os.path.join(INSTALLER_DIR, "Installer", "installer_config.json")
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    config_to_preserve = f.read()
+                print("  → Sichern der installer_config.json")
+            except Exception as e:
+                print(f"  ⚠ Sicherung der installer_config.json fehlgeschlagen: {e}")
+
         # Sicherung der aktuellen Version (immer!)
         backup_dir = INSTALLER_DIR + ".backup"
         if os.path.exists(backup_dir):
@@ -219,6 +230,17 @@ def extract_release(zip_path, new_version):
                     shutil.copy2(src_path, dst_path)
             
             print("✓ Update erfolgreich installiert")
+
+            # Wiederherstellen der Konfiguration
+            if config_to_preserve:
+                try:
+                    # Ensure the "Installer" directory exists
+                    os.makedirs(os.path.dirname(config_path), exist_ok=True)
+                    with open(config_path, 'w', encoding='utf-8') as f:
+                        f.write(config_to_preserve)
+                    print("✓ Wiederherstellen der installer_config.json")
+                except Exception as e:
+                    print(f"⚠ Wiederherstellen der installer_config.json fehlgeschlagen: {e}")
             
             # Aktualisiere VERSION-Datei mit neuer Version
             try:

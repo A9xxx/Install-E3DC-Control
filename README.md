@@ -62,6 +62,7 @@ git clone https://github.com/A9xxx/Install-E3DC-Control.git Install
 Wechsle in das Verzeichnis und starte das Setup:
 
 ```bash
+sudo python3 fix_bom.py
 cd Install
 sudo python3 installer_main.py
 ```

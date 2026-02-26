@@ -1,4 +1,4 @@
-﻿"""
+"""
 Zentrales Logging-Management für Installation und Fehlerbehandlung.
 Verwaltet mehrere Log-Streams: install.log, permissions.log, error.log
 """
@@ -81,6 +81,18 @@ def setup_installation_loggers():
         "permissions": get_or_create_logger("permissions", os.path.join(log_dir, "permissions.log")),
         "backup": get_or_create_logger("backup", os.path.join(log_dir, "backup.log")),
         "error": get_or_create_logger("error", os.path.join(log_dir, "error.log")),
+        # Weitere Module auf install.log oder update.log mappen
+        "update": get_or_create_logger("update", os.path.join(log_dir, "update.log")),
+        "self_update": get_or_create_logger("self_update", os.path.join(log_dir, "update.log")),
+        "system": get_or_create_logger("system", os.path.join(log_dir, "install.log")),
+        "config": get_or_create_logger("config", os.path.join(log_dir, "install.log")),
+        "ramdisk": get_or_create_logger("ramdisk", os.path.join(log_dir, "install.log")),
+        "screen_cron": get_or_create_logger("screen_cron", os.path.join(log_dir, "install.log")),
+        "diagramm": get_or_create_logger("diagramm", os.path.join(log_dir, "install.log")),
+        "strompreis": get_or_create_logger("strompreis", os.path.join(log_dir, "install.log")),
+        "openwb": get_or_create_logger("openwb", os.path.join(log_dir, "install.log")),
+        "uninstall": get_or_create_logger("uninstall", os.path.join(log_dir, "uninstall.log")),
+        "rollback": get_or_create_logger("rollback", os.path.join(log_dir, "install.log")),
     }
     
     return loggers

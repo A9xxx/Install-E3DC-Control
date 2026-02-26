@@ -20,7 +20,6 @@ import json
 import subprocess
 import platform
 import socket
-import logging
 import shutil
 import zipfile
 import tempfile
@@ -32,6 +31,7 @@ from .installer_config import (
     get_user_ids,
     get_www_data_gid
 )
+from .logging_manager import get_or_create_logger, log_task_completed, log_error, log_warning
 from .permissions_helper import (
     set_file_ownership,
     set_directory_ownership_recursive,
@@ -39,12 +39,8 @@ from .permissions_helper import (
     set_executable_script
 )
 
-# Logging einrichten
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+# Logger
+diagramm_logger = get_or_create_logger("diagramm")
 
 INSTALL_PATH = get_install_path()
 WWW_PATH = "/var/www/html"
@@ -102,6 +98,7 @@ class DiagramInstaller:
         except FileNotFoundError:
             print("❌ Python 3 nicht gefunden!")
             print("   Installation: sudo apt-get install python3")
+            log_error("diagramm", "Python 3 nicht gefunden.")
             return False
         
         # plotly prüfen (mindestens 5.0 erforderlich)
@@ -150,6 +147,7 @@ class DiagramInstaller:
                     except subprocess.CalledProcessError:
                         print("❌ Update fehlgeschlagen")
                         print("   Manuell: pip3 install --upgrade 'plotly>=5.0'")
+                        log_error("diagramm", "pip3 upgrade für plotly fehlgeschlagen.")
                         return False
                 else:
                     print("⚠️  plotly >= 5.0 wird benötigt für Diagramme")
@@ -173,10 +171,12 @@ class DiagramInstaller:
                 except subprocess.CalledProcessError:
                     print("❌ Installation fehlgeschlagen")
                     print("   Manuell: pip3 install 'plotly>=5.0'")
+                    log_error("diagramm", "pip3 install für plotly fehlgeschlagen.")
                     return False
             else:
                 print("⚠️  plotly wird benötigt für Diagramme")
                 return False
+
     
     def check_script_installed(self):
         """
@@ -209,6 +209,7 @@ class DiagramInstaller:
         if not os.path.isfile(zip_path):
             print(f"❌ {ZIP_NAME} nicht gefunden!")
             print(f"   Gesucht in: {script_dir}")
+            log_error("diagramm", f"{ZIP_NAME} nicht gefunden in {script_dir}")
             return False
         
         print(f"✓ ZIP gefunden: {zip_path}")
@@ -222,6 +223,7 @@ class DiagramInstaller:
                 if len(zip_ref.namelist()) > 20:
                     print(f"  ... und {len(zip_ref.namelist()) - 20} weitere")
         except Exception as e:
+            log_warning("diagramm", f"Fehler beim Lesen des ZIP-Inhalts: {e}")
             print(f"  ⚠️  Fehler beim Lesen: {e}")
         
         # Temporäres Verzeichnis für Extraktion
@@ -232,6 +234,7 @@ class DiagramInstaller:
                 with zipfile.ZipFile(zip_path, 'r') as zip_ref:
                     zip_ref.extractall(temp_dir)
                 
+                diagramm_logger.info(f"ZIP extrahiert nach: {temp_dir}")
                 print(f"✓ ZIP extrahiert nach: {temp_dir}")
                 
                 # 1) plot_soc_changes.py nach /home/<install_user>/E3DC-Control/ kopieren
@@ -240,6 +243,7 @@ class DiagramInstaller:
                 
                 if not os.path.isfile(source_script):
                     print(f"❌ {PLOT_SCRIPT_NAME} nicht in ZIP gefunden!")
+                    log_error("diagramm", f"{PLOT_SCRIPT_NAME} nicht in ZIP gefunden.")
                     return False
                 
                 os.makedirs(self.install_path, exist_ok=True)
@@ -254,7 +258,9 @@ class DiagramInstaller:
                         with open(self.plot_script_path, "wb") as f:
                             f.write(content[len(bom):])
                         print("✓ BOM aus plot_soc_changes.py entfernt")
+                        diagramm_logger.info("BOM aus plot_soc_changes.py entfernt.")
                 except Exception as e:
+                    log_warning("diagramm", f"Konnte BOM nicht prüfen/entfernen: {e}")
                     print(f"⚠️  Konnte BOM nicht prüfen/entfernen: {e}")
                 
                 # Setze Berechtigungen für das Skript (install_user:www-data, 775)
@@ -270,6 +276,7 @@ class DiagramInstaller:
                         capture_output=True
                     )
                 except subprocess.CalledProcessError as e:
+                    log_warning("diagramm", f"Konnte Besitzer/Rechte für Skript nicht setzen: {e}")
                     print(f"⚠️  Konnte Besitzer/Rechte für Skript nicht setzen: {e}")
                 print(f"✓ {PLOT_SCRIPT_NAME} → {self.plot_script_path}")
 
@@ -301,6 +308,7 @@ class DiagramInstaller:
                 html_source = os.path.join(temp_dir, "html")
                 
                 if not os.path.isdir(html_source):
+                    log_warning("diagramm", "Kein 'html'-Ordner in ZIP gefunden.")
                     print(f"⚠️  Kein 'html'-Ordner in ZIP gefunden")
                 else:
                     # Sicherung der e3dc_paths.json
@@ -310,6 +318,7 @@ class DiagramInstaller:
                         try:
                             with open(paths_config_path, 'r', encoding='utf-8') as f:
                                 paths_config_to_preserve = f.read()
+                            diagramm_logger.info("e3dc_paths.json gesichert.")
                             print("  → Sichern der e3dc_paths.json")
                         except Exception as e:
                             print(f"  ⚠️  Sicherung der e3dc_paths.json fehlgeschlagen: {e}")
@@ -317,6 +326,7 @@ class DiagramInstaller:
                     try:
                         # Modernes shutil.copytree zum Zusammenführen der Verzeichnisse
                         shutil.copytree(html_source, WWW_PATH, dirs_exist_ok=True)
+                        diagramm_logger.info(f"Webportal-Dateien nach {WWW_PATH} kopiert.")
                         print(f"✓ Dateien und Unterordner (icons) → {WWW_PATH}")
 
                         # Wiederherstellen der e3dc_paths.json
@@ -324,10 +334,12 @@ class DiagramInstaller:
                             try:
                                 with open(paths_config_path, 'w', encoding='utf-8') as f:
                                     f.write(paths_config_to_preserve)
+                                diagramm_logger.info("e3dc_paths.json wiederhergestellt.")
                                 print("  ✓ Wiederherstellen der e3dc_paths.json")
                             except Exception as e:
                                 print(f"  ⚠️  Wiederherstellen der e3dc_paths.json fehlgeschlagen: {e}")
                     except Exception as e:
+                        log_error("diagramm", f"Fehler beim Kopieren des Webportal-Ordners: {e}", e)
                         print(f"⚠️  Fehler beim Kopieren des Webportal-Ordners: {e}")
                 
                 # 2b) Veraltete Dateien im Web-Verzeichnis bereinigen
@@ -336,8 +348,10 @@ class DiagramInstaller:
                     if os.path.isfile(obs_path):
                         try:
                             os.remove(obs_path)
+                            diagramm_logger.info(f"Veraltete Datei entfernt: {obs_path}")
                             print(f"✓ Veraltete Datei entfernt: {obs_path}")
                         except Exception as e:
+                            log_warning("diagramm", f"Konnte veraltete Datei {obs_file} nicht entfernen: {e}")
                             print(f"⚠️  Konnte veraltete Datei {obs_file} nicht entfernen: {e}")
 
                 # 3) /var/www/html/tmp/ und icons/ Berechtigungen sicherstellen
@@ -346,6 +360,7 @@ class DiagramInstaller:
                 # Backup-Verzeichnis für Historie erstellen
                 history_backups_path = os.path.join(TMP_PATH, "history_backups")
                 os.makedirs(history_backups_path, exist_ok=True)
+                diagramm_logger.info(f"tmp-Ordner und Unterordner sichergestellt: {TMP_PATH}")
                 print(f"✓ tmp-Ordner sichergestellt: {TMP_PATH}")
                 
                 # 4) Rechte für das gesamte Webportal setzen (install_user:www-data, 775)
@@ -381,16 +396,18 @@ class DiagramInstaller:
                     print(f"✓ Besitzer für alle Dateien: {self.install_user}:www-data")
                     print(f"✓ Rechte gesetzt (Ordner 775, Dateien 664)")
                     
+                    diagramm_logger.info("Berechtigungen für Webportal gesetzt.")
                 except Exception as e:
+                    log_warning("diagramm", f"Berechtigungen konnten nicht gesetzt werden: {e}")
                     print(f"⚠️  Berechtigungen konnten nicht gesetzt werden: {e}")
                 
                 print("\n✓ Installation abgeschlossen")
+                log_task_completed("Diagramm-System installieren")
                 return True
             
             except Exception as e:
-                logger.error(f"❌ Fehler bei der Installation: {str(e)}")
-                import traceback
-                traceback.print_exc()
+                log_error("diagramm", f"Fehler bei der Installation: {str(e)}", e)
+                print(f"❌ Fehler bei der Installation: {str(e)}")
                 return False
 
     def cleanup_old_modules(self):
@@ -407,9 +424,11 @@ class DiagramInstaller:
             if os.path.isdir(candidate):
                 try:
                     shutil.rmtree(candidate)
+                    diagramm_logger.info(f"Alter Modul-Ordner entfernt: {candidate}")
                     print(f"✓ Entfernt: {candidate}")
                     removed += 1
                 except Exception as e:
+                    log_warning("diagramm", f"Konnte alten Modul-Ordner nicht entfernen: {candidate} ({e})")
                     print(f"⚠️  Konnte nicht entfernen: {candidate} ({e})")
 
         if removed == 0:
@@ -471,6 +490,7 @@ class DiagramInstaller:
         
         print(f"\n✓ Modus: {self.diagram_mode.upper()}")
         if self.diagram_mode in ("auto", "hybrid"):
+            diagramm_logger.info(f"Diagramm-Modus gewählt: {self.diagram_mode}, Intervall: {self.auto_interval} Min.")
             print(f"  Auto-Update: Alle {self.auto_interval} Minuten")
     
     def _select_interval(self):
@@ -527,6 +547,7 @@ class DiagramInstaller:
             self.enable_wallbox = False
             self.enable_heatpump = False
         
+        diagramm_logger.info(f"Diagramm-Features: Wallbox={self.enable_wallbox}, Wärmepumpe={self.enable_heatpump}")
         print(f"\n✓ Wallbox: {self.enable_wallbox} | Wärmepumpe: {self.enable_heatpump}")
     
     # ============================================================
@@ -590,17 +611,20 @@ class DiagramInstaller:
             stdout, stderr = process.communicate(new_crons_text)
             
             if process.returncode != 0:
-                logger.error(f"❌ Fehler beim Einrichten des crontab: {stderr}")
+                log_error("diagramm", f"Fehler beim Einrichten des crontab: {stderr}")
+                print(f"❌ Fehler beim Einrichten des crontab: {stderr}")
                 return False
             
             print(f"✓ Crontab eingerichtet:")
             if cron_line_plot:
+                diagramm_logger.info(f"Cronjob für Plot-Skript eingerichtet: {cron_schedule_plot}")
                 print(f"  Plot-Skript: {cron_schedule_plot} {plot_script}")
+            diagramm_logger.info(f"Cronjob für Backup-Skript eingerichtet: {cron_schedule_backup}")
             print(f"  Backup-Skript: {cron_schedule_backup} {BACKUP_SCRIPT_PATH}")
             return True
         
         except Exception as e:
-            logger.error(f"❌ Fehler beim crontab-Setup: {str(e)}")
+            log_error("diagramm", f"Fehler beim crontab-Setup: {str(e)}", e)
             return False
     
     def remove_crontab(self):
@@ -639,11 +663,12 @@ class DiagramInstaller:
             )
             process.communicate(new_crons_text)
             
+            diagramm_logger.info("Crontab-Einträge entfernt.")
             print("✓ Crontab-Eintrag entfernt")
             return True
         
         except Exception as e:
-            logger.error(f"❌ Fehler beim Entfernen des crontab: {str(e)}")
+            log_error("diagramm", f"Fehler beim Entfernen des crontab: {str(e)}", e)
             return False
     
     @staticmethod
@@ -685,11 +710,13 @@ class DiagramInstaller:
                 os.chown(self.config_file, self.install_uid, self.www_data_gid)
                 os.chmod(self.config_file, 0o664)
             except Exception as e:
-                logger.warning(f"Konnte Berechtigungen nicht setzen: {e}")
+                log_warning("diagramm", f"Konnte Berechtigungen für {self.config_file} nicht setzen: {e}")
             print(f"\n✓ Konfiguration gespeichert: {self.config_file}")
+            diagramm_logger.info(f"Konfiguration gespeichert: {self.config_file}")
             return True
         except Exception as e:
-            logger.error(f"❌ Fehler beim Speichern der Konfiguration: {str(e)}")
+            log_error("diagramm", f"Fehler beim Speichern der Konfiguration: {str(e)}", e)
+            print(f"❌ Fehler beim Speichern der Konfiguration: {str(e)}")
             return False
     
     def load_config(self):
@@ -707,7 +734,8 @@ class DiagramInstaller:
             self.enable_heatpump = config.get("enable_heatpump", True)
             return True
         except Exception as e:
-            logger.error(f"⚠️  Fehler beim Laden der Konfiguration: {str(e)}")
+            log_warning("diagramm", f"Fehler beim Laden der Konfiguration: {str(e)}")
+            print(f"⚠️  Fehler beim Laden der Konfiguration: {str(e)}")
             return False
     
     # ============================================================
@@ -721,6 +749,7 @@ class DiagramInstaller:
         # 0) Python-Umgebung prüfen (IMMER ZUERST)
         if not self.check_python_requirements():
             print("\n❌ Installation abgebrochen: Python-Requirements fehlen")
+            log_error("diagramm", "Installation abgebrochen: Python-Requirements fehlen.")
             return False
         
         # 1) Skript-Status prüfen
@@ -740,10 +769,12 @@ class DiagramInstaller:
             
             if choice == "4":
                 print("Installation abgebrochen")
+                diagramm_logger.info("Installation vom Benutzer abgebrochen.")
                 return False
             elif choice == "2":
                 if not self.extract_and_install_from_zip():
                     print("❌ Installation fehlgeschlagen")
+                    log_error("diagramm", "Neuinstallation aus ZIP fehlgeschlagen.")
                     return False
             elif choice == "3":
                 self.select_diagram_mode()
@@ -760,11 +791,13 @@ class DiagramInstaller:
             
             if choice != 'j':
                 print("Installation übersprungen")
+                diagramm_logger.info("Installation aus ZIP übersprungen.")
                 return False
             
             # Aus ZIP installieren
             if not self.extract_and_install_from_zip():
                 print("❌ Installation fehlgeschlagen")
+                log_error("diagramm", "Erstinstallation aus ZIP fehlgeschlagen.")
                 return False
         
         # 2) Alte Modul-Ordner entfernen (falls vorhanden)
@@ -784,6 +817,7 @@ class DiagramInstaller:
         
         # 7) Zusammenfassung
         self.print_summary()
+        log_task_completed("Diagramm-Konfiguration")
         return True
     
     def print_summary(self):

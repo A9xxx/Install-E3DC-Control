@@ -129,4 +129,4 @@ WantedBy=multi-user.target
 if __name__ == "__main__":
     setup_watchdog()
 
-register_command("19", "Watchdog mit Telegram Benachrichtigung einrichten", setup_watchdog, sort_order=190)
+register_command("15", "Watchdog mit Telegram Benachrichtigung einrichten", setup_watchdog, sort_order=150)

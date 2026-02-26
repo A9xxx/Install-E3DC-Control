@@ -4,10 +4,13 @@ import shutil
 
 from .core import register_command
 from .installer_config import get_install_path, get_user_ids, get_www_data_gid
+from .logging_manager import get_or_create_logger, log_task_completed, log_error, log_warning
 
 INSTALL_PATH = get_install_path()
 WEBPORTAL_EXTENSIONS = {".php", ".css", ".js", ".json"}
 E3DC_CONTROL_EXTRA_EXTENSIONS = {".dat", ".json", ".py"}
+
+backup_logger = get_or_create_logger("backup")
 
 
 def _copy_matching_files(source_root, destination_root, extensions, exclude_dirs=None):
@@ -47,29 +50,12 @@ def _count_files_recursive(path):
     return count
 
 
-def _print_missing_source(path):
-    print(f"  ⚠ Quellordner fehlt: {path}")
-
-
-def _print_filtered_count(count, label):
-    if count == 0:
-        print(f"  ⚠ Keine passenden {label} gefunden")
-    else:
-        print(f"  ✓ {count} {label} gesichert")
-
-
-def _print_total_count(count, action_word):
-    if count == 0:
-        print(f"  ⚠ Es wurden keine Dateien {action_word}")
-    else:
-        print(f"  ✓ Insgesamt {count} Dateien {action_word}")
-
-
 def backup_current_version():
     """Erstellt ein Backup der aktuellen Version."""
     try:
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M")
         backup_dir = os.path.join(INSTALL_PATH, "backups", timestamp)
+        backup_logger.info(f"Starte Backup-Erstellung nach: {backup_dir}")
         os.makedirs(backup_dir, exist_ok=True)
         total_copied_files = 0
 
@@ -82,8 +68,10 @@ def backup_current_version():
                 shutil.copy2(bin_path, backup_dir)
                 total_copied_files += 1
                 print("  ✓ Hauptprogramm gesichert")
+                backup_logger.info("Hauptprogramm 'E3DC-Control' gesichert.")
             except Exception as e:
                 print(f"  ⚠ Fehler beim Sichern des Programms: {e}")
+                log_error("backup", f"Fehler beim Sichern des Programms: {e}", e)
 
         # Konfiguration sichern
         cfg_path = os.path.join(INSTALL_PATH, "e3dc.config.txt")
@@ -92,8 +80,10 @@ def backup_current_version():
                 shutil.copy2(cfg_path, backup_dir)
                 total_copied_files += 1
                 print("  ✓ Konfiguration gesichert")
+                backup_logger.info("Konfiguration 'e3dc.config.txt' gesichert.")
             except Exception as e:
                 print(f"  ⚠ Fehler beim Sichern der Konfiguration: {e}")
+                log_error("backup", f"Fehler beim Sichern der Konfiguration: {e}", e)
 
         # Webportal-Dateien sichern
         wp_backup_dir = os.path.join(backup_dir, "webportal")
@@ -101,7 +91,8 @@ def backup_current_version():
         webroot_dir = "/var/www/html"
 
         if not os.path.isdir(webroot_dir):
-            _print_missing_source(webroot_dir)
+            print(f"  ⚠ Quellordner fehlt: {webroot_dir}")
+            log_warning("backup", f"Quellordner für Backup fehlt: {webroot_dir}")
         else:
             try:
                 copied_webportal = _copy_matching_files(
@@ -110,9 +101,15 @@ def backup_current_version():
                     WEBPORTAL_EXTENSIONS
                 )
                 total_copied_files += copied_webportal
-                _print_filtered_count(copied_webportal, "Webportal-Dateien")
+                if copied_webportal > 0:
+                    print(f"  ✓ {copied_webportal} Webportal-Dateien gesichert")
+                    backup_logger.info(f"{copied_webportal} Webportal-Dateien gesichert.")
+                else:
+                    print("  ⚠ Keine passenden Webportal-Dateien gefunden")
+                    backup_logger.warning("Keine passenden Webportal-Dateien für Backup gefunden.")
             except Exception as e:
                 print(f"  ⚠ Fehler beim Sichern der Webportal-Dateien: {e}")
+                log_error("backup", f"Fehler beim Sichern der Webportal-Dateien: {e}", e)
         
         # Icons sichern
         icons_src = "/var/www/html/icons"
@@ -121,8 +118,10 @@ def backup_current_version():
                 icons_count = _count_files_recursive(icons_src)
                 shutil.copytree(icons_src, os.path.join(wp_backup_dir, "icons"), dirs_exist_ok=True)
                 total_copied_files += icons_count
+                backup_logger.info(f"{icons_count} Icons gesichert.")
             except Exception as e:
                 print(f"  ⚠ Fehler beim Sichern der Icons: {e}")
+                log_error("backup", f"Fehler beim Sichern der Icons: {e}", e)
 
         # E3DC-Control-Zusatzdateien sichern
         e3dc_source_dir = INSTALL_PATH
@@ -139,17 +138,25 @@ def backup_current_version():
                     exclude_dirs={backup_root_dir}
                 )
                 total_copied_files += copied_e3dc
-                _print_filtered_count(copied_e3dc, "E3DC-Control-Zusatzdateien")
+                if copied_e3dc > 0:
+                    print(f"  ✓ {copied_e3dc} E3DC-Control-Zusatzdateien gesichert")
+                    backup_logger.info(f"{copied_e3dc} E3DC-Control-Zusatzdateien gesichert.")
+                else:
+                    print("  ⚠ Keine passenden E3DC-Control-Zusatzdateien gefunden")
+                    backup_logger.warning("Keine passenden E3DC-Control-Zusatzdateien für Backup gefunden.")
             except Exception as e:
                 print(f"  ⚠ Fehler beim Sichern der E3DC-Control-Zusatzdateien: {e}")
+                log_error("backup", f"Fehler beim Sichern der E3DC-Control-Zusatzdateien: {e}", e)
         else:
-            _print_missing_source(e3dc_source_dir)
+            print(f"  ⚠ Quellordner fehlt: {e3dc_source_dir}")
+            log_warning("backup", f"Quellordner für Backup fehlt: {e3dc_source_dir}")
 
         # Installer-Datei sichern
         plot_installer = os.path.join(os.path.dirname(__file__), "install.py")
         if os.path.exists(plot_installer):
             try:
                 shutil.copy2(plot_installer, backup_dir)
+                backup_logger.info("Installer-Skript gesichert.")
                 total_copied_files += 1
             except Exception:
                 pass
@@ -167,15 +174,24 @@ def backup_current_version():
                     os.chown(os.path.join(root, f), uid, gid)
             os.chown(backup_dir, uid, gid)
             print("  ✓ Besitzrechte auf install_user:www-data gesetzt")
+            backup_logger.info("Besitzrechte für Backup-Ordner gesetzt.")
         except Exception as e:
             print(f"  ⚠ Konnte Besitzrechte für Backup nicht setzen: {e}")
+            log_warning("backup", f"Konnte Besitzrechte für Backup nicht setzen: {e}")
 
-        _print_total_count(total_copied_files, "gesichert")
+        if total_copied_files == 0:
+            print("  ⚠ Es wurden keine Dateien gesichert")
+            backup_logger.warning("Es wurden keine Dateien gesichert.")
+        else:
+            print(f"  ✓ Insgesamt {total_copied_files} Dateien gesichert")
+            backup_logger.info(f"Insgesamt {total_copied_files} Dateien gesichert.")
 
         print("✓ Backup abgeschlossen.\n")
+        log_task_completed("Backup erstellen", details=f"{total_copied_files} Dateien in {os.path.basename(backup_dir)}")
         return backup_dir
     except Exception as e:
         print(f"✗ Fehler beim Backup: {e}\n")
+        log_error("backup", f"Genereller Fehler beim Backup: {e}", e)
         return None
 
 
@@ -184,12 +200,14 @@ def choose_backup_version(action_text="wiederherstellen"):
     backup_root = os.path.join(INSTALL_PATH, "backups")
     if not os.path.exists(backup_root):
         print("✗ Keine Backups vorhanden.\n")
+        backup_logger.warning("Kein Backup-Verzeichnis gefunden.")
         return None
 
     try:
         versions = sorted(os.listdir(backup_root))
     except Exception as e:
         print(f"✗ Fehler beim Lesen der Backups: {e}\n")
+        log_error("backup", f"Fehler beim Lesen des Backup-Verzeichnisses: {e}", e)
         return None
 
     if not versions:
@@ -225,6 +243,7 @@ def restore_backup(backup_path):
         return False
 
     try:
+        backup_logger.info(f"Starte Wiederherstellung von: {os.path.basename(backup_path)}")
         print("→ Stelle Backup wieder her…")
         total_restored_files = 0
 
@@ -236,8 +255,10 @@ def restore_backup(backup_path):
                 shutil.copy2(bin_backup, bin_dest)
                 total_restored_files += 1
                 print("  ✓ Hauptprogramm wiederhergestellt")
+                backup_logger.info("Hauptprogramm wiederhergestellt.")
             except Exception as e:
                 print(f"  ✗ Fehler: {e}")
+                log_error("backup", f"Fehler beim Wiederherstellen des Hauptprogramms: {e}", e)
 
         # Konfiguration wiederherstellen
         cfg_backup = os.path.join(backup_path, "e3dc.config.txt")
@@ -247,8 +268,10 @@ def restore_backup(backup_path):
                 shutil.copy2(cfg_backup, cfg_dest)
                 total_restored_files += 1
                 print("  ✓ Konfiguration wiederhergestellt")
+                backup_logger.info("Konfiguration wiederhergestellt.")
             except Exception as e:
                 print(f"  ✗ Fehler: {e}")
+                log_error("backup", f"Fehler beim Wiederherstellen der Konfiguration: {e}", e)
 
         # Webportal-Dateien wiederherstellen
         wp_backup_dir = os.path.join(backup_path, "webportal")
@@ -268,6 +291,7 @@ def restore_backup(backup_path):
                             restored_webportal_count += 1
                     except Exception as e:
                         print(f"  ⚠ {filename}: {e}")
+                        log_warning("backup", f"Fehler bei Wiederherstellung von {filename}: {e}")
                 total_restored_files += restored_webportal_count
                 
                 # Berechtigungen nach Restore korrigieren
@@ -276,6 +300,7 @@ def restore_backup(backup_path):
                 run_permissions_wizard()
                 
                 print("  ✓ Webportal-Dateien wiederhergestellt")
+                backup_logger.info(f"{restored_webportal_count} Webportal-Dateien wiederhergestellt.")
 
         # E3DC-Control-Zusatzdateien wiederherstellen
         e3dc_extra_backup_dir = os.path.join(backup_path, "e3dc-control-extra")
@@ -293,15 +318,24 @@ def restore_backup(backup_path):
                         restored_count += 1
                     except Exception as e:
                         print(f"  ⚠ Fehler bei E3DC-Control-Zusatzdatei {rel_path}: {e}")
+                        log_warning("backup", f"Fehler bei Wiederherstellung von Zusatzdatei {rel_path}: {e}")
             total_restored_files += restored_count
             print(f"  ✓ {restored_count} E3DC-Control-Zusatzdateien wiederhergestellt")
+            backup_logger.info(f"{restored_count} E3DC-Control-Zusatzdateien wiederhergestellt.")
 
-        _print_total_count(total_restored_files, "wiederhergestellt")
+        if total_restored_files == 0:
+            print("  ⚠ Es wurden keine Dateien wiederhergestellt")
+            backup_logger.warning("Es wurden keine Dateien wiederhergestellt.")
+        else:
+            print(f"  ✓ Insgesamt {total_restored_files} Dateien wiederhergestellt")
+            backup_logger.info(f"Insgesamt {total_restored_files} Dateien wiederhergestellt.")
 
         print("✓ Wiederherstellung abgeschlossen.\n")
+        log_task_completed("Backup wiederherstellen", details=f"{total_restored_files} Dateien aus {os.path.basename(backup_path)}")
         return True
     except Exception as e:
         print(f"✗ Fehler bei Wiederherstellung: {e}\n")
+        log_error("backup", f"Genereller Fehler bei Wiederherstellung: {e}", e)
         return False
 
 
@@ -324,9 +358,12 @@ def delete_backup():
     try:
         shutil.rmtree(backup_path)
         print("✓ Backup gelöscht.\n")
+        backup_logger.info(f"Backup gelöscht: {os.path.basename(backup_path)}")
+        log_task_completed("Backup löschen", details=os.path.basename(backup_path))
         return True
     except Exception as e:
         print(f"✗ Fehler beim Löschen des Backups: {e}\n")
+        log_error("backup", f"Fehler beim Löschen des Backups: {e}", e)
         return False
 
 
@@ -350,4 +387,4 @@ def backup_menu():
         print("✗ Ungültige Auswahl.\n")
 
 
-register_command("14", "Backup verwalten", backup_menu, sort_order=140)
+register_command("16", "Backup verwalten", backup_menu, sort_order=160)

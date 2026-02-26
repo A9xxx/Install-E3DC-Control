@@ -1,12 +1,14 @@
-﻿import os
+import os
 import re
 
 from .core import register_command
 from .utils import ensure_dir
 from .installer_config import get_install_path, get_user_ids, get_www_data_gid
+from .logging_manager import get_or_create_logger, log_task_completed, log_error, log_warning
 
 INSTALL_PATH = get_install_path()
 PRICE_FILE = os.path.join(INSTALL_PATH, "e3dc.strompreis.txt")
+strom_logger = get_or_create_logger("strompreis")
 
 # Standardwerte
 DEFAULT_ENTRIES = [
@@ -72,9 +74,11 @@ def create_default_price_file():
     try:
         if not ensure_dir(INSTALL_PATH):
             print("✗ Verzeichnis konnte nicht erstellt werden\n")
+            log_error("strompreis", f"Verzeichnis konnte nicht erstellt werden: {INSTALL_PATH}")
             return False
         
         print("→ Erstelle Strompreis-Datei mit Standardwerten…")
+        strom_logger.info("Erstelle Strompreis-Datei mit Standardwerten.")
         
         with open(PRICE_FILE, "w") as f:
             f.write("# Strompreise (Stunde Preis)\n")
@@ -85,13 +89,16 @@ def create_default_price_file():
         try:
             uid, _ = get_user_ids()
             os.chown(PRICE_FILE, uid, get_www_data_gid())
-        except Exception:
+        except Exception as e:
+            log_warning("strompreis", f"Konnte Besitzrechte nicht setzen: {e}")
             pass
         os.chmod(PRICE_FILE, 0o664)
         print(f"✓ Datei erstellt: {PRICE_FILE}\n")
+        strom_logger.info(f"Datei erstellt: {PRICE_FILE}")
         return True
     except Exception as e:
         print(f"✗ Fehler beim Erstellen der Datei: {e}\n")
+        log_error("strompreis", f"Fehler beim Erstellen der Datei: {e}", e)
         return False
 
 
@@ -99,12 +106,14 @@ def load_entries():
     """Liest die Datei ein oder bietet Standardwerte an."""
     if not os.path.exists(PRICE_FILE):
         print("⚠ Strompreis-Datei existiert nicht.")
+        strom_logger.warning(f"Strompreis-Datei existiert nicht: {PRICE_FILE}")
         choice = input("Jetzt mit Standardwerten erstellen? (j/n): ").strip().lower()
         if choice == "j":
             if create_default_price_file():
                 return DEFAULT_ENTRIES.copy()
         else:
             print("→ Abgebrochen.\n")
+            strom_logger.info("Erstellung der Strompreis-Datei abgebrochen.")
         return None
 
     try:
@@ -117,6 +126,7 @@ def load_entries():
         return entries if entries else None
     except Exception as e:
         print(f"✗ Fehler beim Lesen der Datei: {e}\n")
+        log_error("strompreis", f"Fehler beim Lesen der Datei: {e}", e)
         return None
 
 
@@ -135,24 +145,30 @@ def save_entries(parsed_prices):
                     f.write(f"{hour} {price}\n")
         finally:
             os.umask(old_umask)
+            
+        strom_logger.info(f"Strompreise gespeichert in {PRICE_FILE}")
         
         # Setze korrekten Owner und Berechtigungen
         try:
             uid, _ = get_user_ids()
             os.chown(PRICE_FILE, uid, get_www_data_gid())
             os.chmod(PRICE_FILE, 0o664)      # rw-rw-r-- damit PHP schreiben kann
+            strom_logger.info("Berechtigungen für Strompreis-Datei gesetzt.")
         except Exception as e:
             print(f"⚠ Warnung: Berechtigungen konnten nicht vollständig gesetzt werden: {e}")
+            log_warning("strompreis", f"Berechtigungen konnten nicht gesetzt werden: {e}")
         
         return True
     except Exception as e:
         print(f"✗ Fehler beim Speichern: {e}")
+        log_error("strompreis", f"Fehler beim Speichern der Strompreise: {e}", e)
         return False
 
 
 def strompreis_wizard():
     """Hauptlogik für Strompreis-Konfiguration."""
     print("\n=== Strompreis-Wizard ===\n")
+    strom_logger.info("Starte Strompreis-Wizard")
 
     entries = load_entries()
     if entries is None:
@@ -184,6 +200,7 @@ def strompreis_wizard():
             new_entries = DEFAULT_ENTRIES.copy()
         else:
             print("→ Abgebrochen.\n")
+            strom_logger.info("Strompreis-Wizard abgebrochen (keine Eingaben).")
             return
 
     # Validiere alle Einträge
@@ -193,6 +210,7 @@ def strompreis_wizard():
         print("\n⚠ Fehler bei der Validierung:\n")
         for error in errors:
             print(f"  - {error}")
+        strom_logger.warning(f"Validierungsfehler: {errors}")
 
     if not parsed:
         print("\n✗ Keine gültigen Einträge – Abbruch.\n")
@@ -206,11 +224,13 @@ def strompreis_wizard():
     choice = input("\nSpeichern? (j/n): ").strip().lower()
     if choice != "j":
         print("→ Abgebrochen.\n")
+        strom_logger.info("Strompreis-Wizard abgebrochen (nicht gespeichert).")
         return
 
     # Speichern
     if save_entries(parsed):
         print("\n✓ Strompreise aktualisiert.\n")
+        log_task_completed("Strompreise aktualisiert")
     else:
         print("\n✗ Speichern fehlgeschlagen.\n")
 

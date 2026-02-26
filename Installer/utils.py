@@ -1,6 +1,7 @@
 import os
 import subprocess
 import logging
+import shutil
 
 _logging_initialized = False
 
@@ -131,3 +132,8 @@ def ensure_dir(path):
         return True
     except Exception:
         return False
+
+
+def command_exists(cmd):
+    """Prüft, ob ein Befehl im System verfügbar ist."""
+    return shutil.which(cmd) is not None

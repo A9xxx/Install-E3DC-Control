@@ -520,7 +520,7 @@ def fix_file_permissions(issues):
                 perm_logger.error(f"Rechte für {file_name} konnten nicht auf {expected_mode} gesetzt werden.")
         # BOM still entfernen bei Skripten (Shebang-Kompatibilitaet)
         if file_name.endswith((".py", ".sh")):
-            _strip_utf8_bom_silent(path)
+            _strip_utf8_bom(path)
     return success
 
 def check_cronjobs():

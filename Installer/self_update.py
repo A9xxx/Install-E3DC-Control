@@ -1,4 +1,4 @@
-﻿"""
+"""
 E3DC-Control Installer - Selbstaktualisierung
 
 Prüft beim Start, ob eine neue Version des Installers auf GitHub verfügbar ist.
@@ -17,6 +17,7 @@ import re
 from .core import register_command
 from .utils import run_command
 from .installer_config import get_install_user
+from .logging_manager import get_or_create_logger, log_task_completed, log_error, log_warning
 
 # Repository-Informationen
 GITHUB_REPO = "A9xxx/Install-E3DC-Control"
@@ -27,6 +28,7 @@ INSTALLER_DIR = os.path.join(INSTALL_ROOT, "Install")
 VERSION_FILE = os.path.join(SCRIPT_DIR, "VERSION")
 DEBUG = False
 USER_AGENT = "E3DC-Control-Installer/1.0"
+update_logger = get_or_create_logger("self_update")
 
 
 def get_installed_version():
@@ -96,10 +98,13 @@ def get_latest_release_info():
     
     except URLError as e:
         print(f"⚠ Netzwerkfehler beim Abrufen der Release-Informationen: {e}")
+        log_warning("self_update", f"Netzwerkfehler beim Abrufen der Release-Informationen: {e}")
     except json.JSONDecodeError:
         print("⚠ Fehler beim Parsen der Release-Informationen")
+        log_warning("self_update", "Fehler beim Parsen der Release-Informationen")
     except Exception as e:
         print(f"⚠ Fehler beim Abrufen der Release-Informationen: {e}")
+        log_warning("self_update", f"Fehler beim Abrufen der Release-Informationen: {e}")
     
     return None
 
@@ -113,6 +118,7 @@ def download_release(download_url):
     """
     try:
         print("→ Lade Release herunter…")
+        update_logger.info(f"Starte Download von: {download_url}")
         
         temp_dir = tempfile.gettempdir()
         zip_path = os.path.join(temp_dir, f"E3DC-Install-{os.getpid()}.zip")
@@ -125,14 +131,17 @@ def download_release(download_url):
         if os.path.exists(zip_path):
             size_mb = os.path.getsize(zip_path) / (1024 * 1024)
             print(f"✓ Download abgeschlossen ({size_mb:.1f} MB)")
+            update_logger.info(f"Download abgeschlossen: {size_mb:.1f} MB")
             return zip_path
         
         return None
     
     except URLError as e:
         print(f"✗ Netzwerkfehler beim Download: {e}")
+        log_error("self_update", f"Netzwerkfehler beim Download: {e}", e)
     except Exception as e:
         print(f"✗ Fehler beim Download: {e}")
+        log_error("self_update", f"Fehler beim Download: {e}", e)
     
     return None
 
@@ -151,6 +160,7 @@ def extract_release(zip_path, new_version):
     try:
         import zipfile
         print("→ Entpacke Update…")
+        update_logger.info("Entpacke Update-ZIP...")
         temp_extract = os.path.join(tempfile.gettempdir(), f"e3dc_update_{os.getpid()}")
         if DEBUG:
             print(f"[DEBUG] Entpacke nach: {temp_extract}")
@@ -178,10 +188,12 @@ def extract_release(zip_path, new_version):
 
         if not src_installer or not os.path.exists(src_installer):
             print(f"✗ Installer-Verzeichnis nicht in ZIP gefunden: {src_installer}")
+            log_error("self_update", "Installer-Verzeichnis nicht in ZIP gefunden.")
             shutil.rmtree(temp_extract, ignore_errors=True)
             return False
 
         print(f"→ Aktualisiere Installer-Verzeichnis aus: {src_installer}")
+        update_logger.info(f"Aktualisiere Installer-Verzeichnis aus: {src_installer}")
 
         # Sicherung der Konfiguration
         config_to_preserve = None
@@ -202,8 +214,10 @@ def extract_release(zip_path, new_version):
             try:
                 shutil.copytree(INSTALLER_DIR, backup_dir)
                 print(f"  → Sicherung erstellt: {backup_dir}")
+                update_logger.info(f"Backup erstellt: {backup_dir}")
             except Exception as e:
                 print(f"  ⚠ Sicherung fehlgeschlagen: {e}")
+                log_warning("self_update", f"Backup vor Update fehlgeschlagen: {e}")
         else:
             print(f"  ⚠ Kein bestehendes Installationsverzeichnis für Backup gefunden: {INSTALLER_DIR}")
 
@@ -230,6 +244,7 @@ def extract_release(zip_path, new_version):
                     shutil.copy2(src_path, dst_path)
             
             print("✓ Update erfolgreich installiert")
+            update_logger.info("Dateien erfolgreich aktualisiert.")
 
             # Wiederherstellen der Konfiguration
             if config_to_preserve:
@@ -267,6 +282,7 @@ def extract_release(zip_path, new_version):
             return True
         except Exception as e:
             print(f"✗ Fehler beim Verschieben der Dateien: {e}")
+            log_error("self_update", f"Fehler beim Verschieben der Dateien: {e}", e)
             # Restore Backup
             if os.path.exists(backup_dir):
                 print("→ Stelle Sicherung wieder her…")
@@ -274,15 +290,19 @@ def extract_release(zip_path, new_version):
                     if os.path.exists(INSTALLER_DIR):
                         shutil.rmtree(INSTALLER_DIR)
                     shutil.copytree(backup_dir, INSTALLER_DIR)
+                    update_logger.info("Sicherung nach Fehler wiederhergestellt.")
                     print("✓ Sicherung wiederhergestellt")
                 except Exception as restore_e:
                     print(f"✗ Fehler beim Wiederherstellen: {restore_e}")
+                    log_error("self_update", f"Fehler beim Wiederherstellen der Sicherung: {restore_e}", restore_e)
             return False
     
     except ImportError:
         print("✗ zipfile-Modul nicht verfügbar")
+        log_error("self_update", "zipfile-Modul nicht verfügbar.")
     except Exception as e:
         print(f"✗ Fehler beim Entpacken: {e}")
+        log_error("self_update", f"Fehler beim Entpacken: {e}", e)
     
     return False
 
@@ -321,6 +341,7 @@ def check_and_update(silent=False, check_only=False):
     if not silent:
         print("\n=== Installer-Update Prüfung ===\n")
         print(f"Installierte Version: {installed_version}")
+        update_logger.info(f"Prüfe auf Updates. Installiert: {installed_version}")
     
     # Hole neueste Release-Infos
     release_info = get_latest_release_info()
@@ -338,6 +359,7 @@ def check_and_update(silent=False, check_only=False):
     if not is_newer_version(latest_version, installed_version):
         if not silent:
             print("\n✓ Installer ist aktuell.\n")
+            update_logger.info("Installer ist aktuell.")
         return False
 
     if check_only:
@@ -362,6 +384,7 @@ def check_and_update(silent=False, check_only=False):
 
         if choice != "j":
             print("→ Update übersprungen.\n")
+            update_logger.info("Update vom Benutzer abgebrochen.")
             return False
     
     # Lade Release herunter
@@ -378,6 +401,7 @@ def check_and_update(silent=False, check_only=False):
         return False
     
     print("\n→ Installer wird neu gestartet…\n")
+    log_task_completed("Installer aktualisiert", details=f"Auf Version {latest_version}")
     # Ersetze aktuellen Prozess durch neu gestarteten Installer (behält sudo-Rechte und Terminal)
     installer_main = os.path.join(INSTALLER_DIR, 'installer_main.py')
     os.execv(sys.executable, [sys.executable, installer_main])

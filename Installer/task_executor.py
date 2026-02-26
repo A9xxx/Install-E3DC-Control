@@ -1,4 +1,4 @@
-﻿"""
+"""
 Sichere Task-Ausführungs-Wrapper mit automatischer Fehler-Logging.
 Wird um Menu-Befehle gewickelt um Crashes zu tracken.
 """

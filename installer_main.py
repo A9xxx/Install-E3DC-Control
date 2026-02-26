@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # E3DC-Control Installer – modular & dynamisch
 
 import os
@@ -29,6 +29,12 @@ INSTALLER_DIR = os.path.join(SCRIPT_DIR, "Installer")
 if INSTALLER_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
+# Importiere das BOM-Fix-Skript
+try:
+    from fix_bom import main as fix_bom_main
+except ImportError:
+    fix_bom_main = None
+
 # Globale Variable für den Headless-Modus
 UNATTENDED_MODE = False
 
@@ -47,25 +53,43 @@ def check_root_privileges():
         sys.exit(1)
 
 def ensure_install_user():
-    """Ask for install user only on first start and persist selection."""
+    """Stellt sicher, dass ein valider Installationsbenutzer konfiguriert ist, ohne unnötig nachzufragen."""
     logger = logging.getLogger("install")
     config = load_config()
     saved_user = config.get("install_user")
-    saved_home = config.get("home_dir")
-    user_confirmed = bool(config.get("install_user_confirmed", False))
 
-    default_user = saved_user or get_default_install_user()
+    # 1. Prüfen, ob ein valider Benutzer bereits gespeichert ist
+    if saved_user:
+        try:
+            user_info = pwd.getpwnam(saved_user)
+            home_dir = user_info.pw_dir
+            
+            # Benutzer ist valide, also verwenden
+            print(f"→ Aktueller Installationsbenutzer: {saved_user} ({home_dir})")
+            logger.info(f"Aktueller Installationsbenutzer: {saved_user} ({home_dir})")
+            
+            # Sicherstellen, dass die Konfiguration vollständig ist und speichern
+            if not config.get("install_user_confirmed") or config.get("home_dir") != home_dir:
+                config["install_user"] = saved_user
+                config["home_dir"] = home_dir
+                config["install_user_confirmed"] = True
+                save_config(config)
+                logger.info("Benutzerkonfiguration verifiziert und gespeichert.")
 
-    if user_confirmed and saved_user and saved_home and os.path.isdir(saved_home):
-        print(f"→ Aktueller Installationsbenutzer: {saved_user} ({saved_home})")
-        logger.info(f"Aktueller Installationsbenutzer: {saved_user} ({saved_home})")
-        verify_config_file_access(saved_user)
-        ensure_web_config_safe(saved_user, logger)
-        return True
+            verify_config_file_access(saved_user)
+            ensure_web_config_safe(saved_user, logger)
+            return True
+        except KeyError:
+            # Gespeicherter Benutzer ist ungültig, also neu fragen
+            print(f"⚠ Gespeicherter Benutzer '{saved_user}' ist ungültig. Bitte neu konfigurieren.")
+            logger.warning(f"Gespeicherter Benutzer '{saved_user}' ist ungültig.")
+            # Fall through to ask for a new user
 
-    print("\n=== Installer Benutzer ===")
+    # 2. Wenn kein valider Benutzer gespeichert ist, neu fragen
+    print("\n=== Installer Benutzer festlegen ===")
     
-    # NEU: Unattended Mode überspringt den Input
+    default_user = get_default_install_user()
+
     if UNATTENDED_MODE:
         install_user = default_user
         print(f"Automatischer Modus aktiv. Setze Benutzer auf: {install_user}")
@@ -207,6 +231,13 @@ def main():
     UNATTENDED_MODE = args.unattended
 
     try:
+        # Führe den BOM-Fixer aus, um Dateikodierungsprobleme zu beheben
+        if fix_bom_main:
+            print("→ Prüfe Dateikodierungen (BOM)...")
+            fix_bom_main()
+        else:
+            print("⚠ Warnung: BOM-Fixer-Skript (fix_bom.py) nicht gefunden.")
+
         setup_logging()
         check_python_version()
         check_root_privileges()

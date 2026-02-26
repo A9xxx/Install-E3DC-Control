@@ -11,6 +11,12 @@
 *   **Self-Update (`self_update.py`):** Ein Fehler wurde behoben, der dazu führte, dass bei einem Self-Update bestehende `.json`-Konfigurationsdateien überschrieben wurden. Die unnötige Abfrage von bereits konfigurierten Werten wurde ebenfalls korrigiert.
 *   **Ramdisk (`ramdisk.py`):** Der `systemctl daemon-reload` Befehl wird nun nach Änderungen an der `fstab` ausgeführt, um Systemwarnungen zu vermeiden und sicherzustellen, dass die Ramdisk korrekt eingebunden wird.
 
+### 🔧 Installer & Wartung
+*   **Robustheit:** Der Installer prüft nun vor dem Klonen, ob `git` installiert ist, und verhindert so Fehler bei einer unvollständigen System-Einrichtung.
+*   **Benutzerfreundlichkeit:**
+    *   Ein Fehler wurde behoben, durch den der Installer nach einem Selbst-Update erneut nach dem Benutzernamen fragte, obwohl dieser bereits konfiguriert war.
+    *   Die Menü-Abfrage wurde personalisiert und zeigt nun den aktuellen Installationsbenutzer an (z.B. `Auswahl (pi):`).
+
 ### ✨ UI & UX-Verbesserungen
 *   **Wallbox-Ladekosten (`Wallbox.php`):**
     *   Die Auswahl der Ladeleistung (z.B. 7.2, 11 kW) für die Kostenschätzung ist nun in der `e3dc.config.txt` (`wbcostpowers`) frei konfigurierbar.

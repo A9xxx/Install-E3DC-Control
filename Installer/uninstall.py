@@ -1,12 +1,14 @@
-﻿import os
+import os
 import subprocess
 import shutil
 
 from .core import register_command
 from .utils import run_command
 from .installer_config import get_install_path, get_install_user
+from .logging_manager import get_or_create_logger, log_task_completed, log_error, log_warning
 
 INSTALL_PATH = get_install_path()
+uninstall_logger = get_or_create_logger("uninstall")
 
 
 def uninstall_e3dc():
@@ -16,7 +18,10 @@ def uninstall_e3dc():
     confirm = input("Bist du sicher, dass du E3DC-Control entfernen möchtest? (j/n): ").strip().lower()
     if confirm != "j":
         print("→ Abgebrochen.\n")
+        uninstall_logger.info("Deinstallation vom Benutzer abgebrochen.")
         return
+
+    uninstall_logger.info("Starte Deinstallation von E3DC-Control.")
 
     # Cronjob entfernen
     print("→ Entferne Cronjobs…")
@@ -42,8 +47,10 @@ def uninstall_e3dc():
             else:
                 run_command(f"sudo -u {install_user} crontab -r", timeout=5)
                 print("✓ Cronjob gelöscht")
+            uninstall_logger.info("Cronjobs entfernt.")
     except Exception as e:
         print(f"⚠ Fehler beim Entfernen des Cronjobs: {e}")
+        log_warning("uninstall", f"Fehler beim Entfernen des Cronjobs: {e}")
 
     # Screen-Session beenden
     print("→ Beende Screen-Sessions…")
@@ -53,6 +60,7 @@ def uninstall_e3dc():
     run_command(f"sudo -u {install_user} pkill -f E3DC-Control", timeout=5)
     run_command(f"sudo -u {install_user} pkill -f get_live.sh", timeout=5)
     print("✓ Screen-Sessions beendet")
+    uninstall_logger.info("Screen-Sessions beendet.")
 
     # RAM-Disk entfernen
     print("→ Entferne RAM-Disk…")
@@ -66,8 +74,10 @@ def uninstall_e3dc():
                     if "/var/www/html/ramdisk" not in line:
                         f.write(line)
         print("✓ fstab bereinigt")
+        uninstall_logger.info("RAM-Disk aus fstab entfernt.")
     except Exception as e:
         print(f"⚠ Fehler beim fstab Bereinigen: {e}")
+        log_warning("uninstall", f"Fehler beim Bereinigen der fstab: {e}")
 
     # Webportal optional löschen
     print("\n→ Webportal-Dateien:")
@@ -77,8 +87,10 @@ def uninstall_e3dc():
         try:
             run_command("sudo rm -rf /var/www/html/*", timeout=10)
             print("  ✓ Webportal gelöscht")
+            uninstall_logger.info("Webportal-Dateien gelöscht.")
         except Exception as e:
             print(f"  ✗ Fehler: {e}")
+            log_error("uninstall", f"Fehler beim Löschen des Webportals: {e}", e)
 
     # Konfiguration optional behalten
     print("\n→ Konfigurationsdateien:")
@@ -90,8 +102,10 @@ def uninstall_e3dc():
         try:
             os.remove(grabber_script)
             print("✓ Grabber-Skript entfernt")
+            uninstall_logger.info(f"Grabber-Skript entfernt: {grabber_script}")
         except Exception as e:
             print(f"⚠ Fehler beim Löschen von {grabber_script}: {e}")
+            log_warning("uninstall", f"Fehler beim Löschen von {grabber_script}: {e}")
 
     try:
         if keep_cfg == "j":
@@ -115,17 +129,22 @@ def uninstall_e3dc():
                                 os.remove(path)
                         except Exception as e:
                             print(f"  ⚠ Konnte {item} nicht löschen: {e}")
+                            log_warning("uninstall", f"Konnte {item} nicht löschen: {e}")
             
             print("✓ Programm deinstalliert, Konfiguration behalten")
+            uninstall_logger.info("Programm deinstalliert, Konfiguration behalten.")
         else:
             print("→ Entferne gesamten Installationsordner…")
             if os.path.exists(INSTALL_PATH):
                 shutil.rmtree(INSTALL_PATH, ignore_errors=True)
             print("✓ Installationsordner gelöscht")
+            uninstall_logger.info("Gesamter Installationsordner gelöscht.")
     except Exception as e:
         print(f"✗ Fehler beim Löschen: {e}")
+        log_error("uninstall", f"Fehler beim Löschen der Programmdateien: {e}", e)
 
     print("\n✓ Deinstallation abgeschlossen.\n")
+    log_task_completed("Deinstallation")
 
 
 register_command("20", "Deinstallation", uninstall_e3dc, sort_order=200)

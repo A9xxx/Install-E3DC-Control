@@ -6,8 +6,10 @@ from .core import register_command
 from .backup import backup_current_version
 from .utils import replace_in_file, run_command
 from .installer_config import get_install_path, get_install_user
+from .logging_manager import get_or_create_logger, log_task_completed, log_error, log_warning
 
 INSTALL_PATH = get_install_path()
+update_logger = get_or_create_logger("update")
 
 
 def get_current_version():
@@ -22,6 +24,7 @@ def get_latest_version():
     git_dir = os.path.join(INSTALL_PATH, ".git")
     if not os.path.exists(git_dir):
         print("✗ Keine Git-Installation gefunden.")
+        log_warning("update", "Keine Git-Installation für Update-Prüfung gefunden.")
         return None
 
     install_user = get_install_user()
@@ -29,6 +32,7 @@ def get_latest_version():
     result = run_command(f"sudo -u {install_user} git -C {INSTALL_PATH} remote get-url origin", timeout=5)
     if not result['success']:
         print("✗ Kein Git-Remote 'origin' gefunden.")
+        log_warning("update", "Kein Git-Remote 'origin' für Update-Prüfung gefunden.")
         return None
 
     # Hole neueste Version vom Remote
@@ -38,6 +42,7 @@ def get_latest_version():
     )
     if not result['success'] or not result['stdout'].strip():
         print("✗ Branch 'master' nicht gefunden.")
+        log_warning("update", "Branch 'master' auf Remote 'origin' nicht gefunden.")
         return None
 
     return result['stdout'].split()[0]
@@ -49,6 +54,7 @@ def count_missing_commits():
     # Fetch origin
     result = run_command(f"sudo -u {install_user} git -C {INSTALL_PATH} fetch origin master", timeout=15)
     if not result['success']:
+        log_warning("update", f"git fetch fehlgeschlagen: {result['stderr']}")
         return None
 
     # Zähle Commits
@@ -77,19 +83,23 @@ def list_missing_commits():
 def update_e3dc(headless=False):
     """Führt Update durch."""
     print("\n=== E3DC-Control aktualisieren ===\n")
+    update_logger.info("Starte Update-Prozess.")
 
     if not os.path.exists(INSTALL_PATH):
         print("✗ Installation nicht gefunden.")
+        log_error("update", "Installationsverzeichnis nicht gefunden, Update abgebrochen.")
         return
 
     old_version = get_current_version()
     if old_version is None:
         print("✗ Aktuelle Version konnte nicht ermittelt werden.")
+        log_error("update", "Aktuelle Version konnte nicht ermittelt werden, Update abgebrochen.")
         return
 
     latest_version = get_latest_version()
     if latest_version is None:
         print("✗ Update nicht möglich – prüfe Internet und Repository.")
+        log_error("update", "Neueste Version konnte nicht ermittelt werden, Update abgebrochen.")
         return
 
     print(f"Aktuelle Version: {old_version[:7]}")
@@ -106,6 +116,7 @@ def update_e3dc(headless=False):
         print("⚠ Commit-Zählung nicht möglich.")
     elif missing == 0:
         print("✓ Du bist auf dem neuesten Stand.")
+        update_logger.info("Kein Update verfügbar, Version ist aktuell.")
         return
     else:
         print(f"→ Es fehlen {missing} Commit(s).\n")
@@ -123,6 +134,7 @@ def update_e3dc(headless=False):
             # Reset origin/master auf alten Stand, damit "git status" sauber bleibt
             if old_origin_sha:
                 run_command(f"sudo -u {install_user} git -C {INSTALL_PATH} update-ref refs/remotes/origin/master {old_origin_sha}")
+            log_warning("update", "Update vom Benutzer abgebrochen.")
             return
     else:
         print("→ Starte Update (Headless-Modus)...\n")
@@ -132,6 +144,7 @@ def update_e3dc(headless=False):
     backup_dir = backup_current_version()
     if backup_dir is None:
         print("✗ Backup fehlgeschlagen. Update abgebrochen.\n")
+        log_error("update", "Backup vor Update fehlgeschlagen, Update abgebrochen.")
         return
 
     # Prüfe auf lokale Änderungen
@@ -146,6 +159,7 @@ def update_e3dc(headless=False):
         result = run_command(f"sudo -u {install_user} bash -c 'cd {INSTALL_PATH} && git stash push -m \"Auto-Stash vor Update\"'")
         if not result['success']:
             print("✗ Stash fehlgeschlagen. Update abgebrochen.\n")
+            log_error("update", f"git stash fehlgeschlagen, Update abgebrochen: {result['stderr']}")
             return
         print("✓ Änderungen gestasht.")
     else:
@@ -160,12 +174,14 @@ def update_e3dc(headless=False):
     result = run_command(f"sudo -u {install_user} bash -c 'cd {INSTALL_PATH} && git pull'", timeout=60)
     if not result['success']:
         print("✗ Git Pull fehlgeschlagen. Update abgebrochen.\n")
+        log_error("update", f"git pull fehlgeschlagen, Update abgebrochen: {result['stderr']}")
         return
 
     print("→ Kompiliere neue Version…")
     result = run_command(f"sudo -u {install_user} bash -c 'cd {INSTALL_PATH} && make'", timeout=300)
     if not result['success']:
         print("✗ Kompilierung fehlgeschlagen. Update abgebrochen.\n")
+        log_error("update", f"Kompilierung fehlgeschlagen, Update abgebrochen: {result['stderr']}")
         return
 
     # Berechtigungen korrigieren
@@ -182,6 +198,7 @@ def update_e3dc(headless=False):
         replace_in_file(config_file, "stop", "stop = 0")
 
     print("✓ Update erfolgreich abgeschlossen.\n")
+    log_task_completed("E3DC-Control aktualisieren", details=f"Von {old_version[:7]} zu {latest_version[:7]}")
 
     # Stash-Management
     result = run_command(f"sudo -u {install_user} git -C {INSTALL_PATH} stash list")
@@ -196,6 +213,7 @@ def update_e3dc(headless=False):
             print("→ Stelle Änderungen wieder her (git stash pop)…")
             run_command(f"sudo -u {install_user} git -C {INSTALL_PATH} stash pop", timeout=30)
             print("✓ Änderungen wiederhergestellt.\n")
+            update_logger.info("Lokale Änderungen (stash) nach Update wiederhergestellt.")
 
 
 def update_menu():

@@ -6,8 +6,10 @@ import time
 from .core import register_command
 from .utils import run_command
 from .installer_config import get_install_path, get_user_ids, get_install_user
+from .logging_manager import get_or_create_logger, log_task_completed, log_error, log_warning
 
 INSTALL_PATH = get_install_path()
+screen_logger = get_or_create_logger("screen_cron")
 
 
 def is_e3dc_running():
@@ -34,6 +36,7 @@ def is_e3dc_running():
 def start_e3dc_control():
     """Startet E3DC-Control in einer Screen-Session."""
     print("\n=== E3DC-Control starten ===\n")
+    screen_logger.info("Versuche E3DC-Control zu starten.")
 
     sh_path = os.path.join(INSTALL_PATH, "E3DC.sh")
     install_user = get_install_user()
@@ -41,6 +44,7 @@ def start_e3dc_control():
     # Prüfe ob E3DC.sh existiert
     if not os.path.exists(sh_path):
         print(f"✗ Startskript nicht gefunden: {sh_path}")
+        screen_logger.warning(f"Startskript nicht gefunden: {sh_path}")
         choice = input("Soll 'Screen + Cronjob einrichten' jetzt ausgeführt werden? (j/n): ").strip().lower()
         if choice == "j":
             install_screen_cron()
@@ -59,8 +63,10 @@ def start_e3dc_control():
             try:
                 os.chmod(sh_path, 0o755)
                 print("✓ Startskript ist jetzt ausführbar.\n")
+                screen_logger.info("Startskript ausführbar gemacht.")
             except Exception as e:
                 print(f"✗ Fehler beim Setzen der Ausführungsrechte: {e}\n")
+                log_error("screen_cron", f"Fehler beim chmod auf Startskript: {e}", e)
                 return
         else:
             print("→ Kann nicht gestartet werden ohne Ausführungsrechte.\n")
@@ -77,6 +83,7 @@ def start_e3dc_control():
             return
         print("→ Stoppe alte Session…")
         run_command(f"sudo -u {install_user} screen -S E3DC -X quit", timeout=5)
+        screen_logger.info("Alte E3DC-Session gestoppt.")
 
     print("→ Starte E3DC-Control…")
     # Wichtig: Screen muss als der richtige Benutzer laufen, nicht als root!
@@ -84,11 +91,13 @@ def start_e3dc_control():
     
     if result['success']:
         print("✓ E3DC-Control gestartet.\n")
+        screen_logger.info("E3DC-Control Screen-Session gestartet.")
         
         # Verifiziere dass es wirklich läuft
         time.sleep(1)
         if is_e3dc_running():
             print("✓ E3DC-Control läuft im Hintergrund.")
+            log_task_completed("E3DC-Control gestartet")
             choice = input("Möchtest du die Screen-Session öffnen? (j/n): ").strip().lower()
             if choice == "j":
                 print(f"→ Öffne Screen-Session…\n")
@@ -97,9 +106,11 @@ def start_e3dc_control():
                 print("  Mit 'screen -r E3DC' kannst du die Ausgabe später ansehen.\n")
         else:
             print("⚠ Warnung: Konnte nicht verifizieren, dass E3DC läuft.")
+            log_warning("screen_cron", "Konnte nicht verifizieren, dass E3DC läuft (is_e3dc_running returned False).")
             print("  Prüfe manuell mit: screen -ls\n")
     else:
         print(f"✗ Start fehlgeschlagen: {result['stderr']}\n")
+        log_error("screen_cron", f"Start fehlgeschlagen: {result['stderr']}")
 
 
 def get_user_crontab():
@@ -201,6 +212,7 @@ def crontab_has_entry(crontab_content, entry_identifier):
 def install_screen_cron():
     """Richtet Screen und Cronjob ein. Gibt True bei Erfolg zurück."""
     print("\n=== Screen + Cronjob einrichten ===\n")
+    screen_logger.info("Starte Screen + Cronjob Einrichtung.")
 
     sh_path = os.path.join(INSTALL_PATH, "E3DC.sh")
 
@@ -224,8 +236,10 @@ def install_screen_cron():
                 uid, gid = get_user_ids()
                 os.chown(sh_path, uid, gid)
                 print("✓ Startskript überschrieben (Install-User, 755).\n")
+                screen_logger.info("Startskript E3DC.sh erstellt/überschrieben.")
             except Exception as e:
                 print(f"✗ Fehler beim Erstellen des Startskripts: {e}\n")
+                log_error("screen_cron", f"Fehler beim Erstellen des Startskripts: {e}", e)
                 return False
     else:
         try:
@@ -239,8 +253,10 @@ def install_screen_cron():
             uid, gid = get_user_ids()
             os.chown(sh_path, uid, gid)
             print("✓ Startskript erstellt (Install-User, 755).\n")
+            screen_logger.info("Startskript E3DC.sh erstellt.")
         except Exception as e:
             print(f"✗ Fehler beim Erstellen des Startskripts: {e}\n")
+            log_error("screen_cron", f"Fehler beim Erstellen des Startskripts: {e}", e)
             return False
 
     # Crontab-Eintrag
@@ -253,6 +269,7 @@ def install_screen_cron():
 
     if crontab_has_entry(user_cron, entry_identifier):
         print("✓ Cronjob ist bereits vorhanden.")
+        screen_logger.info("Benutzer-Cronjob bereits vorhanden.")
     else:
         print("  → Cronjob fehlt – füge ihn hinzu…")
         new_cron = user_cron.rstrip() + "\n" + cron_line + "\n"
@@ -265,12 +282,15 @@ def install_screen_cron():
             
             if crontab_has_entry(verify_cron, entry_identifier):
                 print("✓ Cronjob zum Benutzer-crontab hinzugefügt.")
+                screen_logger.info("Cronjob zum Benutzer-crontab hinzugefügt.")
             else:
                 print(f"✗ Cronjob konnte nicht verifiziert werden!")
+                log_error("screen_cron", "Cronjob konnte nach Hinzufügen nicht verifiziert werden.")
                 print("  Prüfe manuell mit: crontab -l\n")
                 return False
         else:
             print(f"✗ Fehler beim Schreiben des Crontabs: {error}\n")
+            log_error("screen_cron", f"Fehler beim Schreiben des Benutzer-Crontabs: {error}")
             return False
 
     # Root-Crontab: Entferne Eintrag falls vorhanden
@@ -288,12 +308,15 @@ def install_screen_cron():
         success, error = set_crontab(new_root_cron, use_sudo=True)
         if success:
             print("✓ Eintrag aus root-crontab entfernt.")
+            screen_logger.info("Alter Eintrag aus root-crontab entfernt.")
         else:
             print(f"⚠ Fehler beim Ändern des root-crontab: {error}")
+            log_warning("screen_cron", f"Fehler beim Bereinigen des root-crontab: {error}")
     else:
         print("✓ root-crontab ist sauber.")
 
     print("\n✓ Screen + Cronjob vollständig eingerichtet.\n")
+    log_task_completed("Screen + Cronjob Einrichtung")
     
     # Finale Verifizierung: Zeige den crontab-Eintrag
     print("→ Verifizierung - aktueller Benutzer-Crontab:")

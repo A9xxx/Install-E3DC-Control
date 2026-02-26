@@ -1,4 +1,4 @@
-﻿"""
+"""
 Standardisierter Permission-Helper für konsistente Rechtevergabe
 Wird von allen Modulen genutzt um sicherzustellen, dass Berechtigungen
 mit permissions.py Standard übereinstimmen.

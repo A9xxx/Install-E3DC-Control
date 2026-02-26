@@ -16,10 +16,13 @@ def remove_bom(path):
     return False
 
 def main():
-    print("Suche nach Dateien mit UTF-8 BOM...")
+    # Nutze das Verzeichnis, in dem das Skript liegt, als Basis
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    print(f"Suche nach Dateien mit UTF-8 BOM in {base_dir}...")
     count = 0
-    for root, dirs, files in os.walk("."):
+    for root, dirs, files in os.walk(base_dir):
         if ".git" in dirs: dirs.remove(".git")
+        if "__pycache__" in dirs: dirs.remove("__pycache__")
         for file in files:
             if file.endswith((".py", ".sh", ".php", ".txt", ".md", ".json", ".html", ".css", ".js")):
                 if remove_bom(os.path.join(root, file)):

@@ -2,6 +2,10 @@ import importlib
 import pkgutil
 import os
 
+from .task_executor import safe_menu_action
+from .installer_config import get_install_user
+from .logging_manager import setup_installation_loggers
+
 # Basis: alle Module im Installer-Paket durchsuchen
 PACKAGE_NAME = __name__.rsplit(".", 1)[0]  # "Installer"
 
@@ -75,10 +79,12 @@ def print_menu():
 def run_main_menu(restart_callback=None):
     """Hauptmenü-Loop."""
     auto_discover_modules()
+    setup_installation_loggers()
+    install_user = get_install_user()
     
     while True:
         print_menu()
-        choice = input("Auswahl: ").strip().lower()
+        choice = input(f"Auswahl ({install_user}): ").strip().lower()
 
         if choice == "q":
             print("→ Beende Installer.\n")
@@ -92,14 +98,7 @@ def run_main_menu(restart_callback=None):
             continue
 
         cmd = matched[0]
-        try:
-            cmd.func()
-        except KeyboardInterrupt:
-            print("\n⚠ Aktion unterbrochen.\n")
-        except Exception as e:
-            print(f"\n✗ Fehler bei '{cmd.label}': {e}\n")
-            import traceback
-            traceback.print_exc()
+        safe_menu_action(cmd.key, cmd.label, cmd.func)
 
         # Optional: nach Updates/Rollback neu starten
         if restart_callback and choice in ("2",):  # z.B. nur nach Update

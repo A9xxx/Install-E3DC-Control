@@ -17,4 +17,4 @@ def change_install_user():
     save_config({"install_user": new_user})
     print(f"✓ Installationsbenutzer geändert auf: {new_user}\n")
 
-register_command("18", "Installationsbenutzer ändern", change_install_user, sort_order=180)
+register_command("19", "Installationsbenutzer ändern", change_install_user, sort_order=190)

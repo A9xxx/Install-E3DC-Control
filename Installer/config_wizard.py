@@ -1,11 +1,13 @@
-﻿import os
+import os
 
 from .core import register_command
 from .utils import replace_in_file
 from .installer_config import get_install_path
+from .logging_manager import get_or_create_logger, log_task_completed, log_error
 
 INSTALL_PATH = get_install_path()
 CONFIG_FILE = os.path.join(INSTALL_PATH, "e3dc.config.txt")
+config_logger = get_or_create_logger("config")
 
 
 def _normalize_numeric_input(value):
@@ -30,6 +32,7 @@ def load_config():
     """Lädt die Konfigurationsdatei."""
     if not os.path.exists(CONFIG_FILE):
         print(f"✗ Konfigurationsdatei nicht gefunden: {CONFIG_FILE}")
+        config_logger.warning(f"Konfigurationsdatei nicht gefunden: {CONFIG_FILE}")
         return {}
 
     config = {}
@@ -46,6 +49,7 @@ def load_config():
         return config
     except Exception as e:
         print(f"✗ Fehler beim Lesen der Datei: {e}")
+        log_error("config", f"Fehler beim Lesen der Konfigurationsdatei: {e}", e)
         return {}
 
 
@@ -58,14 +62,20 @@ def save_param(key, value):
     normalized, changed = _normalize_numeric_input(value)
     if changed:
         print(f"  Hinweis: ',' wurde zu '.' normalisiert ({value} -> {normalized})")
+        config_logger.info(f"Eingabe normalisiert: {value} -> {normalized}")
 
     success = replace_in_file(CONFIG_FILE, key, f"{key} = {normalized}")
+    if success:
+        config_logger.info(f"Parameter '{key}' geändert auf '{normalized}'")
+    else:
+        log_error("config", f"Fehler beim Speichern von Parameter '{key}'")
     return success
 
 
 def config_wizard():
     """Wizard zur Bearbeitung der Konfiguration."""
     print("\n=== Config-Wizard ===\n")
+    config_logger.info("Starte Config-Wizard")
 
     config = load_config()
     if not config:
@@ -90,8 +100,10 @@ def config_wizard():
 
     if updated:
         print("\n✓ Konfiguration aktualisiert.\n")
+        log_task_completed("Konfiguration aktualisiert")
     else:
         print("\n→ Keine Änderungen gemacht.\n")
+        config_logger.info("Keine Änderungen an der Konfiguration vorgenommen.")
 
 
 register_command("8", "E3DC-Control Konfiguration bearbeiten", config_wizard, sort_order=80)

@@ -1,5 +1,38 @@
 # Changelog
 
+## [2026.02.27] - UI-Feinschliff, Logik-Optimierung & Cleanup
+
+### 📱 Mobile Ansicht (`mobile.php`)
+*   **Bugfix:** Die Richtung des Preistendenz-Pfeils wurde korrigiert (war invertiert).
+*   **Lesbarkeit:** Die Schriftfarbe der Batterie-Anzeige passt sich nun besser an den Light-Mode an.
+*   **Animation:** Das Pulsieren bei Leistung wurde verlangsamt (Faktor 4) für eine ruhigere Optik. Die Wallbox pulsiert nun ebenfalls aktiv beim Laden.
+*   **UX:** Der Diagramm-Button zeigt nun den Status ("einblenden"/"ausblenden") und passt sich dem Farbschema an.
+
+### 🖥️ Desktop Dashboard (`index.php`)
+*   **Daten-Aktualität:** Warnung ("Veraltet"), wenn die Live-Daten älter als 5 Minuten sind (z.B. bei Verbindungsabbruch).
+*   **Performance:** Der automatische Diagramm-Refresh prüft nun intelligent, ob ein Update überhaupt nötig ist (15-Minuten-Raster), um den Pi zu entlasten.
+*   **Optik:** Preis-Trendpfeil und Balken sind nun vollständig Dark/Light-Mode kompatibel.
+
+### 🔌 Wallbox & UI (`Wallbox.php`, `config_editor.php`)
+*   **Design:** Eingabefelder und Aktions-Buttons wurden modernisiert (abgerundet `rounded-pill`, fetter Rahmen) für bessere Bedienbarkeit auf Touch-Screens.
+*   **Editor:** Verbesserte Lesbarkeit von Tooltips im Dark Mode und kontrastreichere Buttons.
+
+### ⚙️ System & Logik
+*   **Neuer Parameter:** `pvatmosphere` (Standard 0.7) erlaubt die Feinjustierung der PV-Sollkurve an die atmosphärische Dämpfung.
+*   **Robustheit:** Der Konfigurations-Parser (`logic.php`) akzeptiert nun auch Kommas in Zahlenwerten (z.B. `15,4` kWp).
+*   **Caching:** Aggressiveres Cache-Busting für Live-Daten und JavaScript-Dateien verhindert Anzeigefehler nach Updates.
+
+### 📊 Diagramm-Generator (`plot_soc_changes.py`)
+*   **Redundanz-Bereinigung:** Die Darstellung der Wallbox-Punkte wurde entfernt, da die neue `Wallbox.php` eine detailliertere Timeline bietet.
+*   **Optik:** Die Kurven für PV, Wärmepumpe und Außentemperatur werden nun geglättet (`spline`) dargestellt, was das Diagramm ruhiger und moderner wirken lässt.
+*   **Bugfix Sommerzeit:** Die Berechnung der Sommerzeitumstellung (DST) wurde korrigiert, um Fehler in Jahren zu vermeiden, in denen der 31. März ein Sonntag ist.
+*   **Stabilität:** Das Parsing der Zeitstempel aus der `awattardebug.txt` wurde robuster gestaltet (mathematische Berechnung statt String-Splitting).
+*   **Code-Qualität:** Zentrale Pfad-Konstanten eingeführt und ungenutzten Code entfernt.
+
+### 🔧 Installer & Konfiguration
+*   **Installer (`diagrammphp.py`):** Die Abfrage, ob die Wallbox im Diagramm angezeigt werden soll, wurde entfernt.
+*   **Config (`diagram_config.json`):** Der veraltete Parameter `enable_wallbox` wurde aus der Konfiguration entfernt.
+
 ## [2026.02.26] - Bugfixes & UI-Verbesserungen
 
 ### 🐞 Bugfixes

@@ -66,7 +66,6 @@ class DiagramInstaller:
         self.config_file = CONFIG_FILE
         self.diagram_mode = "manual"  # auto oder manual
         self.auto_interval = 5  # Minuten
-        self.enable_wallbox = True
         self.enable_heatpump = True
         self.plot_script_path = os.path.join(self.install_path, PLOT_SCRIPT_NAME)
         self.install_user = get_install_user()
@@ -532,23 +531,15 @@ class DiagramInstaller:
         print("Welche Diagramm-Features aktivieren?")
         print("-" * 60)
         
-        choice = input("\n1 = Wallbox\n2 = Wärmepumpe\n3 = Beides\n4 = Keine\nAuswahl (1-4): ").strip()
+        choice = input("\nWärmepumpe im Diagramm anzeigen? (j/n): ").strip().lower()
         
-        if choice == "1":
-            self.enable_wallbox = True
-            self.enable_heatpump = False
-        elif choice == "2":
-            self.enable_wallbox = False
-            self.enable_heatpump = True
-        elif choice == "3":
-            self.enable_wallbox = True
+        if choice == 'j':
             self.enable_heatpump = True
         else:
-            self.enable_wallbox = False
             self.enable_heatpump = False
         
-        diagramm_logger.info(f"Diagramm-Features: Wallbox={self.enable_wallbox}, Wärmepumpe={self.enable_heatpump}")
-        print(f"\n✓ Wallbox: {self.enable_wallbox} | Wärmepumpe: {self.enable_heatpump}")
+        diagramm_logger.info(f"Diagramm-Features: Wärmepumpe={self.enable_heatpump}")
+        print(f"\n✓ Wärmepumpe: {self.enable_heatpump}")
     
     # ============================================================
     # CRONTAB MANAGEMENT
@@ -698,7 +689,6 @@ class DiagramInstaller:
         config = {
             "diagram_mode": self.diagram_mode,
             "auto_interval_minutes": self.auto_interval,
-            "enable_wallbox": self.enable_wallbox,
             "enable_heatpump": self.enable_heatpump,
         }
         
@@ -730,7 +720,6 @@ class DiagramInstaller:
             
             self.diagram_mode = config.get("diagram_mode", "manual")
             self.auto_interval = config.get("auto_interval_minutes", 5)
-            self.enable_wallbox = config.get("enable_wallbox", True)
             self.enable_heatpump = config.get("enable_heatpump", True)
             return True
         except Exception as e:
@@ -831,7 +820,6 @@ class DiagramInstaller:
         print(f"➤ Web-Dateien: {WWW_PATH}")
         print(f"➤ tmp-Ordner: {TMP_PATH}")
         print(f"➤ Modus: {self.diagram_mode.upper()}")
-        print(f"➤ Wallbox: {self.enable_wallbox}")
         print(f"➤ Wärmepumpe: {self.enable_heatpump}")
         if self.diagram_mode in ("auto", "hybrid"):
             print(f"➤ Auto-Update: Alle {self.auto_interval} Minuten")

@@ -1,4 +1,4 @@
-﻿# ⚡ E3DC-Control Installer & Web-Interface
+# ⚡ E3DC-Control Installer & Web-Interface
 
 **Intelligente Steuerung und Visualisierung für E3DC Hauskraftwerke auf dem Raspberry Pi.**
 

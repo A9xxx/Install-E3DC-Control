@@ -560,7 +560,7 @@ def check_cronjobs():
         {
             "name": "Boot-Benachrichtigung",
             "line": "@reboot sleep 45 && /usr/local/bin/boot_notify.sh",
-            "check_part": "boot_notify.sh",
+            "check_part": "sleep 45 && /usr/local/bin/boot_notify.sh",
             "optional_if_exists": "/usr/local/bin/boot_notify.sh"
         },
         {
@@ -611,7 +611,7 @@ def fix_cronjobs(issues):
 
             # Dieser Befehl fügt die Zeile zur Crontab hinzu, falls sie noch nicht existiert.
             # Er ist sicher gegen Duplikate.
-            cmd = f"sudo bash -c \"(crontab -u {INSTALL_USER} -l 2>/dev/null | grep -Fq -- \\\"{cron_line_safe}\\\") || (crontab -u {INSTALL_USER} -l 2>/dev/null; echo \\\"{cron_line_safe}\\\") | crontab -u {INSTALL_USER} -\""
+            cmd = f"sudo bash -c \"(crontab -u {INSTALL_USER} -l 2>/dev/null | grep -Fq -- \\\"{cron_line_safe}\\\") || (crontab -u {INSTALL_USER} -l 2>/dev/null; echo \\\"\\\"; echo \\\"{cron_line_safe}\\\") | crontab -u {INSTALL_USER} -\""
             
             result = run_command(cmd)
             
@@ -677,6 +677,57 @@ def fix_sudoers_permissions(issues):
                 success = False
     return success
 
+def check_services():
+    """Prüft, ob der Watchdog-Service läuft (falls installiert)."""
+    print("\n=== Service-Prüfung ===\n")
+    perm_logger.info("--- Starte Service-Prüfung ---")
+    issues = {}
+
+    # Piguard (Watchdog) - Nur prüfen, wenn das Skript existiert (also installiert wurde)
+    if os.path.exists("/usr/local/bin/pi_guard.sh"):
+        srv = "piguard"
+        # Check status
+        res_active = run_command(f"systemctl is-active {srv}")
+        is_active = res_active['stdout'].strip() == "active"
+        
+        res_enabled = run_command(f"systemctl is-enabled {srv}")
+        is_enabled = res_enabled['stdout'].strip() == "enabled"
+        
+        if is_active and is_enabled:
+            print(f"✓ Service '{srv}' ist aktiv und enabled.")
+            perm_logger.info(f"Service '{srv}' OK.")
+        else:
+            details = []
+            if not is_active: details.append("nicht aktiv")
+            if not is_enabled: details.append("nicht enabled")
+            print(f"✗ Service '{srv}' Problem: {', '.join(details)}")
+            perm_logger.warning(f"Service '{srv}' Problem: {', '.join(details)}")
+            issues[srv] = {"active": is_active, "enabled": is_enabled}
+    
+    return issues
+
+def fix_services(issues):
+    """Korrigiert Service-Status."""
+    print("\n→ Korrigiere Services…\n")
+    success = True
+    for srv, data in issues.items():
+        if not data.get("enabled"):
+            print(f"  → Enable {srv}...")
+            run_command(f"sudo systemctl enable {srv}")
+        
+        if not data.get("active"):
+            print(f"  → Start {srv}...")
+            run_command(f"sudo systemctl start {srv}")
+            
+        # Verify
+        res = run_command(f"systemctl is-active {srv}")
+        if res['stdout'].strip() == "active":
+            print(f"✓ {srv} läuft nun.")
+        else:
+            print(f"✗ {srv} konnte nicht gestartet werden.")
+            success = False
+    return success
+
 def run_permissions_wizard():
     """Hauptlogik für Rechteprüfung und -korrektur."""
     # Als erstes: Bereinige root-eigene Dateien falls vorhanden
@@ -689,16 +740,17 @@ def run_permissions_wizard():
     file_issues = check_file_permissions()
     cron_issues = check_cronjobs()
     sudo_issues = check_sudoers_permissions()
+    service_issues = check_services()
 
-    has_issues = bool(issues) or bool(wp_issues) or bool(file_issues) or bool(cron_issues) or bool(sudo_issues)
+    has_issues = bool(issues) or bool(wp_issues) or bool(file_issues) or bool(cron_issues) or bool(sudo_issues) or bool(service_issues)
     if not has_issues:
-        print("\n✓ Alle Berechtigungen und Cronjobs sind korrekt.\n")
-        perm_logger.info("✓ Prüfung bestanden: Keine Probleme bei Berechtigungen oder Cronjobs gefunden.")
-        log_task_completed("Rechte prüfen & korrigieren", details="Alle Berechtigungen und Cronjobs korrekt")
+        print("\n✓ Alle Berechtigungen, Cronjobs und Services sind korrekt.\n")
+        perm_logger.info("✓ Prüfung bestanden: Keine Probleme gefunden.")
+        log_task_completed("Rechte prüfen & korrigieren", details="Alle Checks OK")
         return
 
-    print("\n⚠ Probleme mit Berechtigungen und/oder Cronjobs gefunden.")
-    perm_logger.warning(f"⚠ Probleme erkannt: {len(issues)} Verz., {len(wp_issues)} Web, {len(file_issues)} Dateien, {len(cron_issues)} Cronjobs, {len(sudo_issues)} Sudoers")
+    print("\n⚠ Probleme gefunden.")
+    perm_logger.warning(f"⚠ Probleme erkannt: {len(issues)} Verz., {len(wp_issues)} Web, {len(file_issues)} Dateien, {len(cron_issues)} Cronjobs, {len(sudo_issues)} Sudoers, {len(service_issues)} Services")
     choice = input("Automatisch korrigieren? (j/n): ").strip().lower()
     if choice != "j":
         print("✗ Korrektur übersprungen.\n")
@@ -721,6 +773,9 @@ def run_permissions_wizard():
         all_success = all_success and success
     if sudo_issues:
         success = fix_sudoers_permissions(sudo_issues)
+        all_success = all_success and success
+    if service_issues:
+        success = fix_services(service_issues)
         all_success = all_success and success
 
     if all_success:

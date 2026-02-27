@@ -28,10 +28,13 @@
 *   **Bugfix Sommerzeit:** Die Berechnung der Sommerzeitumstellung (DST) wurde korrigiert, um Fehler in Jahren zu vermeiden, in denen der 31. März ein Sonntag ist.
 *   **Stabilität:** Das Parsing der Zeitstempel aus der `awattardebug.txt` wurde robuster gestaltet (mathematische Berechnung statt String-Splitting).
 *   **Code-Qualität:** Zentrale Pfad-Konstanten eingeführt und ungenutzten Code entfernt.
+*   **Mobile Darkmode:** Der Hintergrund des Diagramms wird im Mobile-Modus nun explizit dunkel gesetzt (`#1a1f29`), um Transparenz-Probleme in Iframes zu beheben.
 
 ### 🔧 Installer & Konfiguration
 *   **Installer (`diagrammphp.py`):** Die Abfrage, ob die Wallbox im Diagramm angezeigt werden soll, wurde entfernt.
 *   **Config (`diagram_config.json`):** Der veraltete Parameter `enable_wallbox` wurde aus der Konfiguration entfernt.
+*   **Health-Check (`permissions.py`):** Erweiterte Prüfung, ob der Watchdog-Service (`piguard`) aktiv ist und automatischer Start bei Ausfall.
+*   **Crontab-Sicherheit:** Verbesserte Routine zum Schreiben von Cronjobs verhindert das versehentliche Zusammenfügen von Zeilen.
 
 ## [2026.02.26] - Bugfixes & UI-Verbesserungen
 

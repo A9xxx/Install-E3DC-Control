@@ -3,6 +3,7 @@ import pwd
 import grp
 import subprocess
 import logging
+import tempfile
 
 from .core import register_command
 from .utils import run_command, setup_logging
@@ -547,7 +548,7 @@ def check_cronjobs():
         },
         {
             "name": "E3DC-Control Autostart",
-            "line": f"@reboot sleep 20 && echo 0 > {INSTALL_PATH}/stop && /usr/bin/screen -dmS E3DC {INSTALL_PATH}/E3DC.sh",
+            "line": f"@reboot sleep 30 && echo 0 > {INSTALL_PATH}/stop && /usr/bin/screen -dmS E3DC {INSTALL_PATH}/E3DC.sh",
             "check_part": "screen -dmS E3DC",
             "optional_if_exists": f"{INSTALL_PATH}/E3DC.sh"
         },
@@ -565,8 +566,8 @@ def check_cronjobs():
         },
         {
             "name": "Täglicher Statusbericht",
-            "line": '0 12 * * * /usr/local/bin/boot_notify.sh "✅ Status:ControlReserve Online. Laufzeit: \\$(uptime -p)"',
-            "check_part": 'boot_notify.sh "✅ Status:',
+            "line": "0 12 * * * /usr/local/bin/boot_notify.sh DAILY",
+            "check_part": "/usr/local/bin/boot_notify.sh DAILY",
             "optional_if_exists": "/usr/local/bin/boot_notify.sh"
         }
     ]
@@ -600,28 +601,58 @@ def fix_cronjobs(issues):
     """Fügt fehlende Cronjob-Einträge hinzu."""
     print("\n→ Korrigiere Cronjob-Einträge…\n")
     success = True
+    
+    # 1. Aktuelle Crontab lesen
+    result = run_command(f"sudo crontab -u {INSTALL_USER} -l")
+    current_crontab = result['stdout'] if result['success'] else ""
+    
+    # Zeilenweise verarbeiten und leere Zeilen entfernen
+    new_crontab_lines = [line for line in current_crontab.splitlines() if line.strip()]
+    modified = False
 
     for name, issue_details in issues.items():
         if issue_details.get("missing"):
             cron_line = issue_details["line"]
             print(f"  → Füge Cronjob '{name}' hinzu...")
-
-            # Anführungszeichen für den Shell-Befehl escapen, damit echo "..." funktioniert
-            cron_line_safe = cron_line.replace('"', '\\"')
-
-            # Dieser Befehl fügt die Zeile zur Crontab hinzu, falls sie noch nicht existiert.
-            # Er ist sicher gegen Duplikate.
-            cmd = f"sudo bash -c \"(crontab -u {INSTALL_USER} -l 2>/dev/null | grep -Fq -- \\\"{cron_line_safe}\\\") || (crontab -u {INSTALL_USER} -l 2>/dev/null; echo \\\"\\\"; echo \\\"{cron_line_safe}\\\") | crontab -u {INSTALL_USER} -\""
             
+            # Prüfen ob exakte Zeile schon existiert (vermeidet Duplikate)
+            if cron_line in new_crontab_lines:
+                print("    (Bereits vorhanden, überspringe)")
+                continue
+            
+            new_crontab_lines.append(cron_line)
+            modified = True
+            perm_logger.info(f"Cronjob '{name}' zur Liste hinzugefügt.")
+
+    if modified:
+        try:
+            # Temporäre Datei erstellen (vermeidet Shell-Escaping-Probleme mit Sonderzeichen)
+            # WICHTIG: encoding='utf-8' für Emojis
+            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', delete=False) as tmp:
+                # Inhalt schreiben (mit abschließendem Newline)
+                tmp.write("\n".join(new_crontab_lines) + "\n")
+                tmp_path = tmp.name
+            
+            # Crontab aus Datei laden
+            cmd = f"sudo crontab -u {INSTALL_USER} {tmp_path}"
             result = run_command(cmd)
             
+            # Temp-Datei aufräumen
+            os.unlink(tmp_path)
+            
             if result['success']:
-                print(f"✓ Cronjob '{name}' hinzugefügt/verifiziert.")
-                perm_logger.info(f"Cronjob '{name}' hinzugefügt/verifiziert: {cron_line}")
+                print(f"✓ Crontab erfolgreich aktualisiert.")
+                perm_logger.info("Crontab erfolgreich geschrieben.")
             else:
-                print(f"✗ Fehler beim Hinzufügen des Cronjobs '{name}'. Details im Log.")
-                perm_logger.error(f"Fehler beim Hinzufügen des Cronjobs '{name}': {result['stderr']}")
+                print(f"✗ Fehler beim Schreiben der Crontab: {result['stderr']}")
+                perm_logger.error(f"Fehler beim Schreiben der Crontab: {result['stderr']}")
                 success = False
+        except Exception as e:
+            print(f"✗ Fehler: {e}")
+            perm_logger.error(f"Exception beim Schreiben der Crontab: {e}")
+            success = False
+    else:
+        print("✓ Keine Änderungen notwendig.")
                 
     return success
 

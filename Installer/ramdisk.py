@@ -1,6 +1,7 @@
 import os
 import subprocess
 import shutil
+import tempfile
 from .core import register_command
 from .utils import run_command
 from .installer_config import get_install_path, get_install_user, get_home_dir
@@ -126,10 +127,19 @@ done
             print("  ✓ Live-History Writer bereits vorhanden")
 
         if modified:
-            process = subprocess.Popen(["sudo", "-u", install_user, "crontab", "-"], stdin=subprocess.PIPE, text=True)
-            process.communicate(input=new_cron)
-            print("  ✓ Crontab aktualisiert")
-            ramdisk_logger.info("Crontab aktualisiert.")
+            # Sicher über Temp-File schreiben
+            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', delete=False) as tmp:
+                tmp.write(new_cron + "\n")
+                tmp_path = tmp.name
+            
+            res = run_command(f"sudo crontab -u {install_user} {tmp_path}")
+            os.unlink(tmp_path)
+            
+            if res['success']:
+                print("  ✓ Crontab aktualisiert")
+                ramdisk_logger.info("Crontab aktualisiert.")
+            else:
+                print(f"  ✗ Fehler beim Schreiben der Crontab: {res['stderr']}")
     except Exception as e:
         print(f"  ✗ Fehler beim Crontab-Setup: {e}")
         log_error("ramdisk", f"Fehler beim Crontab-Setup: {e}", e)

@@ -2,6 +2,7 @@ import os
 import subprocess
 import shlex
 import time
+import tempfile
 
 from .core import register_command
 from .utils import run_command
@@ -173,22 +174,24 @@ def set_crontab(crontab_content, use_sudo=False):
         if cleaned_content and not cleaned_content.endswith('\n'):
             cleaned_content += '\n'
         
-        if use_sudo:
-            # Root-Crontab
-            cmd = ["sudo", "crontab", "-"]
-        else:
-            # Benutzer-Crontab mit korrektem User-Kontext
-            # Verwende sudo -u um sicherzustellen, dass es in der richtigen crontab gespeichert wird
-            cmd = ["sudo", "-u", install_user, "crontab", "-"]
-        
-        process = subprocess.Popen(
-            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, text=True
-        )
-        stdout, stderr = process.communicate(input=cleaned_content, timeout=10)
-        
-        if process.returncode != 0:
-            return False, stderr
+        # Temp-File Methode (sicherer gegen Quoting-Probleme)
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', delete=False) as tmp:
+                tmp.write(cleaned_content)
+                tmp_path = tmp.name
+            
+            if use_sudo:
+                cmd = f"sudo crontab {tmp_path}"
+            else:
+                cmd = f"sudo crontab -u {install_user} {tmp_path}"
+                
+            result = run_command(cmd)
+            os.unlink(tmp_path)
+            
+            if not result['success']:
+                return False, result['stderr']
+        except Exception as e:
+            return False, str(e)
         
         return True, None
     except subprocess.TimeoutExpired:
@@ -260,7 +263,7 @@ def install_screen_cron():
             return False
 
     # Crontab-Eintrag
-    cron_line = f"@reboot sleep 20 && echo 0 > {INSTALL_PATH}/stop && /usr/bin/screen -dmS E3DC {sh_path}"
+    cron_line = f"@reboot sleep 30 && echo 0 > {INSTALL_PATH}/stop && /usr/bin/screen -dmS E3DC {sh_path}"
     entry_identifier = "E3DC"
 
     # Benutzer-Crontab (OHNE sudo!)

@@ -30,11 +30,21 @@
 *   **Code-Qualität:** Zentrale Pfad-Konstanten eingeführt und ungenutzten Code entfernt.
 *   **Mobile Darkmode:** Der Hintergrund des Diagramms wird im Mobile-Modus nun explizit dunkel gesetzt (`#1a1f29`), um Transparenz-Probleme in Iframes zu beheben.
 
-### 🔧 Installer & Konfiguration
+### ️ Watchdog & Sicherheit
+*   **Watchdog-Overhaul (`install_watchdog.py`):** Komplett überarbeiteter Installer mit interaktivem Menü. Ermöglicht nun die Änderung des Gerätenamens und der Telegram-Einstellungen ohne Neuinstallation.
+*   **Täglicher Statusbericht:** Neuer, konfigurierbarer `DAILY`-Modus für `boot_notify.sh`, der Uptime und CPU-Temperatur meldet. Der Zeitpunkt ist im Installer frei wählbar.
+*   **Telegram-Robustheit:** Umstellung auf `--data-urlencode` in `boot_notify.sh`, um Probleme mit Sonderzeichen und Leerzeichen in Nachrichten zu beheben.
+*   **Multi-IP Überwachung:** Der Watchdog kann nun mehrere IP-Adressen (z.B. Router und Google DNS) überwachen. Ein Reboot erfolgt erst, wenn *alle* Ziele nicht erreichbar sind.
+*   **Router-IP Konfiguration:** Die zu überwachende(n) IP-Adresse(n) können nun im Installer-Menü konfiguriert werden.
+*   **Benutzer-Flexibilität:** Der Watchdog prüft nun dynamisch den Screen-Prozess des Installationsbenutzers (statt hardcoded `pi`), was die Kompatibilität mit anderen Benutzernamen erhöht.
+
+### 🔧 Installer & Stabilität
+*   **Crontab-Fix ("Quoting Hell"):** `permissions.py`, `ramdisk.py` und `screen_cron.py` nutzen nun temporäre Dateien statt Shell-Pipes, um Cronjobs zu schreiben. Dies behebt Abstürze bei Anführungszeichen oder Emojis in Befehlszeilen.
+*   **Encoding:** Explizite `utf-8` Kodierung beim Schreiben von Systemdateien verhindert Fehler bei der Verwendung von Emojis.
+*   **Flexibilität:** Die Rechteprüfung (`permissions.py`) toleriert nun angepasste Ausführungszeiten für den täglichen Statusbericht.
 *   **Installer (`diagrammphp.py`):** Die Abfrage, ob die Wallbox im Diagramm angezeigt werden soll, wurde entfernt.
 *   **Config (`diagram_config.json`):** Der veraltete Parameter `enable_wallbox` wurde aus der Konfiguration entfernt.
 *   **Health-Check (`permissions.py`):** Erweiterte Prüfung, ob der Watchdog-Service (`piguard`) aktiv ist und automatischer Start bei Ausfall.
-*   **Crontab-Sicherheit:** Verbesserte Routine zum Schreiben von Cronjobs verhindert das versehentliche Zusammenfügen von Zeilen.
 
 ## [2026.02.26] - Bugfixes & UI-Verbesserungen
 

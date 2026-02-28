@@ -202,7 +202,7 @@ while true; do
   if [ "$disk_usage" -gt 90 ]; then
     ((disk_fail++))
     if [ $disk_fail -eq 5 ] && [ "$warned_disk" = false ]; then
-        /usr/local/bin/boot_notify.sh "⚠️ Speicherplatz kritisch! SD-Karte zu ${{disk_usage}}% voll."
+        /usr/local/bin/boot_notify.sh "⚠️ Speicherplatz kritisch! SD-Karte zu $disk_usage% voll."
         warned_disk=true
     fi
   else

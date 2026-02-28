@@ -3,7 +3,7 @@ import sys
 import subprocess
 import tempfile
 import re
-from .installer_config import get_install_user
+from .installer_config import get_install_user, get_install_path
 from .utils import run_command
 from .core import register_command
 
@@ -17,7 +17,8 @@ def get_current_config():
         "TOKEN": "",
         "CHAT_ID": "",
         "DEVICE_NAME": "E3DC-Control",
-        "ROUTER_IP": "192.168.178.1"
+        "ROUTER_IP": "192.168.178.1",
+        "MONITOR_FILE": ""
     }
     if os.path.exists(NOTIFY_PATH):
         try:
@@ -44,6 +45,8 @@ def get_current_config():
                     # Fallback auf altes Format (direkter Ping)
                     ip = re.search(r'ping -c 1 -W 2 ([0-9.]+)', content)
                     if ip: config["ROUTER_IP"] = ip.group(1)
+                mf = re.search(r'MONITOR_FILE="([^"]*)"', content)
+                if mf: config["MONITOR_FILE"] = mf.group(1)
         except Exception:
             pass
     return config
@@ -95,7 +98,7 @@ fi
     subprocess.run(["sudo", "mv", "boot_notify.sh", NOTIFY_PATH])
     subprocess.run(["sudo", "chmod", "+x", NOTIFY_PATH])
 
-def create_pi_guard(router_ips):
+def create_pi_guard(router_ips, monitor_file=""):
     """Erstellt das Watchdog-Skript."""
     print(f"Erstelle {GUARD_PATH}...")
     
@@ -104,14 +107,25 @@ def create_pi_guard(router_ips):
     install_user = get_install_user()
     
     guard_content = f"""#!/bin/bash
-sleep 300
+echo "Watchdog gestartet. Warte 60s auf System..." | logger -t PIGUARD
+sleep 60
 fb_fail=0
 e3dc_fail=0
+file_fail=0
+disk_fail=0
 warned_fb=false
 warned_e3dc=false
+warned_file=false
+warned_disk=false
+LAST_CHECKED_FILE=""
 
 # Zu überwachende IPs (leerzeichengetrennt)
 ROUTER_IPS="{ips_normalized}"
+MONITOR_FILE="{monitor_file}"
+
+if [ -z "$MONITOR_FILE" ]; then
+    echo "Info: Keine Datei-Überwachung konfiguriert." | logger -t PIGUARD
+fi
 
 while true; do
   # --- CHECK 1: NETZWERK (Ping) ---
@@ -138,7 +152,7 @@ while true; do
   if ! screen -ls {install_user}/ | grep -v "Dead" | grep -q "E3DC"; then
     ((e3dc_fail++))
     if [ $e3dc_fail -eq 5 ] && [ "$warned_e3dc" = false ]; then
-        /usr/local/bin/boot_notify.sh "⚠️ E3DC Screen fehlt! Reboot in 2 Min."
+        /usr/local/bin/boot_notify.sh "⚠️ E3DC Screen fehlt! Restart Service in 2 Min."
         warned_e3dc=true
     fi
   else
@@ -146,13 +160,75 @@ while true; do
     warned_e3dc=false
   fi
 
+  # --- CHECK 3: DATEI-AKTIVITÄT (Hänger-Schutz) ---
+  # Dynamische Dateinamen (z.B. protokoll.{{day}}.txt)
+  ACTUAL_FILE="$MONITOR_FILE"
+  if [[ "$MONITOR_FILE" == *"{{day}}"* ]]; then
+      dow=$(date +%u)
+      case $dow in
+          1) d="Mo" ;; 2) d="Di" ;; 3) d="Mi" ;; 4) d="Do" ;; 5) d="Fr" ;; 6) d="Sa" ;; 7) d="So" ;;
+      esac
+      ACTUAL_FILE=$(echo "$MONITOR_FILE" | sed "s/{{day}}/$d/")
+  fi
+
+  # Logge Datei-Wechsel (z.B. neuer Tag oder Start)
+  if [ "$ACTUAL_FILE" != "$LAST_CHECKED_FILE" ] && [ -n "$ACTUAL_FILE" ]; then
+      echo "Überwache Datei: $ACTUAL_FILE" | logger -t PIGUARD
+      LAST_CHECKED_FILE="$ACTUAL_FILE"
+  fi
+
+  if [ -n "$ACTUAL_FILE" ] && [ -f "$ACTUAL_FILE" ]; then
+    current_time=$(date +%s)
+    file_time=$(stat -c %Y "$ACTUAL_FILE")
+    diff=$((current_time - file_time))
+    
+    # Alarm wenn Datei älter als 15 Minuten (900 Sekunden)
+    if [ $diff -gt 900 ]; then
+      ((file_fail++))
+      if [ $file_fail -eq 5 ] && [ "$warned_file" = false ]; then
+          /usr/local/bin/boot_notify.sh "⚠️ Datei veraltet! ($ACTUAL_FILE > 15min). Restart Service in 2 Min."
+          warned_file=true
+      fi
+    else
+      file_fail=0
+      warned_file=false
+    fi
+  fi
+
+  # --- CHECK 4: SPEICHERPLATZ (SD-Karte) ---
+  # Prüft Root-Partition (/) auf Füllstand > 90%
+  disk_usage=$(df / | awk 'NR==2 {{print $5}}' | tr -d '%')
+  
+  if [ "$disk_usage" -gt 90 ]; then
+    ((disk_fail++))
+    if [ $disk_fail -eq 5 ] && [ "$warned_disk" = false ]; then
+        /usr/local/bin/boot_notify.sh "⚠️ Speicherplatz kritisch! SD-Karte zu ${{disk_usage}}% voll."
+        warned_disk=true
+    fi
+  else
+    disk_fail=0
+    warned_disk=false
+  fi
+
   if [ $fb_fail -ge 30 ]; then
     echo "Netzwerk ($ROUTER_IPS) seit 5 Min weg. Reboot!" | logger -t PIGUARD
     systemctl reboot
   fi
   if [ $e3dc_fail -ge 18 ]; then
-    echo "E3DC Screen fehlt seit 3 Min. Reboot!" | logger -t PIGUARD
-    systemctl reboot
+    echo "E3DC Screen fehlt seit 3 Min. Restart E3DC Service!" | logger -t PIGUARD
+    systemctl restart e3dc
+    /usr/local/bin/boot_notify.sh "⚠️ E3DC Service neu gestartet (Screen fehlte)."
+    e3dc_fail=0
+    warned_e3dc=false
+    sleep 60
+  fi
+  if [ $file_fail -ge 18 ]; then
+    echo "Watchdog-Datei $ACTUAL_FILE seit >18 Min nicht aktualisiert. Restart E3DC Service!" | logger -t PIGUARD
+    systemctl restart e3dc
+    /usr/local/bin/boot_notify.sh "⚠️ E3DC Service neu gestartet (Datei $ACTUAL_FILE veraltet)."
+    file_fail=0
+    warned_file=false
+    sleep 60
   fi
   sleep 10
 done
@@ -286,6 +362,36 @@ def setup_watchdog_menu():
         # Router IP
         router_ip = input(f"Router-IP(s) für Watchdog (getrennt durch Leerzeichen) [{current['ROUTER_IP']}]: ").strip() or current['ROUTER_IP']
         
+        # Monitor File (Hänger-Schutz)
+        monitor_file = current['MONITOR_FILE']
+        install_path = get_install_path()
+        if not monitor_file:
+            # Versuche Logfile aus Config zu erraten
+            try:
+                config_path = os.path.join(install_path, "e3dc.config.txt")
+                if os.path.exists(config_path):
+                    with open(config_path, "r") as f:
+                        for line in f:
+                            if line.strip().lower().startswith("logfile"):
+                                parts = line.split("=")
+                                if len(parts) > 1:
+                                    val = parts[1].strip().strip('"').strip("'")
+                                    if val:
+                                        monitor_file = val if val.startswith("/") else os.path.join(install_path, val)
+                                    break
+            except: pass
+        
+        # Fallback auf Standard-Protokoll, wenn nichts gefunden
+        if not monitor_file:
+            monitor_file = os.path.join(install_path, "protokoll.{day}.txt")
+        
+        use_file = input(f"Datei auf Aktualisierung überwachen (Hänger-Schutz)? (j/n) [j]: ").strip().lower()
+        if use_file == 'j' or use_file == '':
+            print("   ℹ️  Tipp: Für täglich wechselnde Dateien (z.B. protokoll.Sa.txt) nutze '{day}' als Platzhalter.")
+            monitor_file = input(f"Pfad zur Datei [{monitor_file}]: ").strip() or monitor_file
+        else:
+            monitor_file = ""
+
         # Daily
         use_daily = input("Täglichen Statusbericht senden? (j/n) [j]: ").strip().lower() or "j"
         daily_hour = 12
@@ -298,7 +404,7 @@ def setup_watchdog_menu():
         
         # Ausführen
         create_boot_notify(token, chat_id, device_name)
-        create_pi_guard(router_ip)
+        create_pi_guard(router_ip, monitor_file)
         create_service()
         configure_hardware_watchdog()
         update_cronjobs(daily_enabled=(use_daily=="j"), daily_hour=daily_hour)
@@ -337,7 +443,7 @@ def setup_watchdog_menu():
     elif choice == "5": # Router IP
         new_ip = input(f"Neue Router-IP(s) [{current['ROUTER_IP']}]: ").strip()
         if new_ip:
-            create_pi_guard(new_ip)
+            create_pi_guard(new_ip, current['MONITOR_FILE'])
             subprocess.run(["sudo", "systemctl", "restart", "piguard.service"])
             print("✓ Router-IP aktualisiert und Service neugestartet.")
 

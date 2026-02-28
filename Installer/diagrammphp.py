@@ -409,6 +409,191 @@ class DiagramInstaller:
                 print(f"❌ Fehler bei der Installation: {str(e)}")
                 return False
 
+    def ensure_update_check_config(self):
+        """Stellt sicher, dass check_updates in e3dc.config.txt gesetzt ist."""
+        config_path = os.path.join(self.install_path, "e3dc.config.txt")
+        if not os.path.exists(config_path):
+            return
+
+        try:
+            with open(config_path, "r") as f:
+                lines = f.readlines()
+            
+            key_found = False
+            for line in lines:
+                if line.strip().lower().startswith("check_updates"):
+                    key_found = True
+                    break
+            
+            if not key_found:
+                print("→ Setze Standardwert: check_updates = 1")
+                with open(config_path, "a") as f:
+                    f.write("\ncheck_updates = 1\n")
+                
+                # Rechte sicherstellen
+                try:
+                    subprocess.run(["sudo", "chown", f"{self.install_user}:www-data", config_path], check=False)
+                    subprocess.run(["sudo", "chmod", "664", config_path], check=False)
+                except:
+                    pass
+        except Exception as e:
+            print(f"⚠️  Konnte check_updates nicht setzen: {e}")
+
+    def configure_sudoers_for_git(self):
+        """
+        Erstellt eine sudoers-Datei, damit www-data git Befehle als install_user ausführen darf.
+        Erlaubt zusätzlich den Neustart des e3dc-Services.
+        """
+        print("\n" + "-" * 60)
+        print("Konfiguriere sudo-Rechte für Web-Interface (git & systemctl)...")
+        print("-" * 60)
+        
+        sudoers_file = "/etc/sudoers.d/010_e3dc_web_git"
+        
+        lines = [
+            f"www-data ALL=({self.install_user}) NOPASSWD: /usr/bin/git",
+            "www-data ALL=NOPASSWD: /bin/systemctl restart e3dc"
+        ]
+        content = "\n".join(lines) + "\n"
+        
+        try:
+            # Prüfen ob Datei existiert (via sudo cat, da oft nicht lesbar für normal user)
+            check_cmd = ["sudo", "cat", sudoers_file]
+            result = subprocess.run(check_cmd, capture_output=True, text=True)
+            
+            if result.returncode == 0:
+                if all(line in result.stdout for line in lines):
+                    print(f"✓ Sudo-Rechte bereits vorhanden.")
+                    return True
+
+            print(f"→ Aktualisiere {sudoers_file}...")
+            
+            # Via subprocess und tee schreiben
+            cmd = f"printf '{content}' | sudo tee {sudoers_file} > /dev/null"
+            subprocess.run(cmd, shell=True, check=True)
+            
+            # Rechte setzen (0440)
+            subprocess.run(["sudo", "chmod", "0440", sudoers_file], check=True)
+            
+            print(f"✓ Sudo-Rechte eingerichtet: git ({self.install_user}) & systemctl restart e3dc")
+            diagramm_logger.info(f"Sudoers-Datei aktualisiert: {sudoers_file}")
+            return True
+            
+        except Exception as e:
+            log_error("diagramm", f"Fehler beim Einrichten der sudo-Rechte: {e}", e)
+            print(f"❌ Fehler beim Einrichten der sudo-Rechte: {e}")
+            return False
+
+    def setup_e3dc_service(self):
+        """
+        Erstellt e3dc.service falls nicht vorhanden und migriert von crontab.
+        """
+        print("\n" + "-" * 60)
+        print("Prüfe E3DC-Control Systemdienst...")
+        print("-" * 60)
+        
+        service_path = "/etc/systemd/system/e3dc.service"
+        sh_path = os.path.join(self.install_path, "E3DC.sh")
+        
+        if not os.path.exists(sh_path):
+            print(f"ℹ️  {sh_path} nicht gefunden. Überspringe Service-Einrichtung.")
+            return
+
+        # Check if service exists
+        if os.path.exists(service_path):
+            print("✓ e3dc.service existiert bereits.")
+            self._disable_crontab_start() # Sicherstellen, dass Crontab sauber ist (und alter Screen beendet wird)
+            
+            # Sicherstellen, dass der Service auch läuft und enabled ist
+            try:
+                subprocess.run(["sudo", "systemctl", "enable", "e3dc"], check=False, capture_output=True)
+                res = subprocess.run(["systemctl", "is-active", "e3dc"], capture_output=True, text=True)
+                if res.stdout.strip() != "active":
+                    print("→ Service ist nicht aktiv. Starte Service...")
+                    subprocess.run(["sudo", "systemctl", "start", "e3dc"], check=True)
+                    print("✓ Service gestartet.")
+            except Exception as e:
+                print(f"⚠ Fehler beim Prüfen des Services: {e}")
+            return
+
+        print("→ Erstelle e3dc.service (ersetzt crontab/screen)...")
+        
+        # Service Definition für Screen-Nutzung
+        service_content = f"""[Unit]
+Description=E3DC-Control Service
+After=network.target
+
+[Service]
+Type=forking
+User={self.install_user}
+Group={self.install_user}
+WorkingDirectory={self.install_path}
+# Bereinigt nur tote Sessions (Dead), laesst aktive unberuehrt
+ExecStartPre=-/usr/bin/screen -wipe
+ExecStartPre=/bin/sh -c 'echo 0 > stop'
+ExecStart=/usr/bin/screen -dmS E3DC ./E3DC.sh
+ExecStop=/usr/bin/screen -S E3DC -X quit
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+"""
+        try:
+            with open("/tmp/e3dc.service", "w") as f:
+                f.write(service_content)
+            
+            subprocess.run(["sudo", "mv", "/tmp/e3dc.service", service_path], check=True)
+            subprocess.run(["sudo", "chmod", "644", service_path], check=True)
+            subprocess.run(["sudo", "systemctl", "daemon-reload"], check=True)
+            subprocess.run(["sudo", "systemctl", "enable", "e3dc"], check=True)
+            print("✓ Service erstellt und aktiviert.")
+            diagramm_logger.info("e3dc.service erstellt.")
+            
+            # Crontab bereinigen
+            self._disable_crontab_start()
+            
+            # Sicherheitsnetz: Alte Screen-Session beenden (falls vorhanden), 
+            # damit der neue Service sauber starten kann.
+            subprocess.run(["sudo", "-u", self.install_user, "screen", "-S", "E3DC", "-X", "quit"], capture_output=True)
+            
+            print("→ Starte Service neu (via systemd)...")
+            subprocess.run(["sudo", "systemctl", "restart", "e3dc"], check=True)
+            print("✓ Service läuft.")
+            
+        except Exception as e:
+            print(f"❌ Fehler beim Einrichten des Services: {e}")
+            log_error("diagramm", f"Service-Setup fehlgeschlagen: {e}")
+
+    def _disable_crontab_start(self):
+        """Deaktiviert den alten Startbefehl in der Crontab."""
+        try:
+            cmd = ["sudo", "-u", self.install_user, "crontab", "-l"]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0: return
+
+            lines = result.stdout.splitlines()
+            new_lines = []
+            changed = False
+            for line in lines:
+                # Suche nach typischen Start-Mustern
+                if "E3DC.sh" in line and "screen" in line and not line.strip().startswith("#"):
+                    new_lines.append(f"# {line} # Deaktiviert durch Installer (migriert zu systemd)")
+                    changed = True
+                    print("  → Alten Crontab-Eintrag deaktiviert.")
+                else:
+                    new_lines.append(line)
+            
+            if changed:
+                input_str = "\n".join(new_lines) + "\n"
+                subprocess.run(["sudo", "-u", self.install_user, "crontab", "-"], input=input_str, text=True, check=True)
+                
+                # Alte Screen-Session beenden, um Doppelstart zu vermeiden
+                print("  → Beende alte Screen-Session...")
+                subprocess.run(["sudo", "-u", self.install_user, "screen", "-S", "E3DC", "-X", "quit"], capture_output=True)
+        except Exception as e:
+            print(f"⚠ Fehler beim Bereinigen der Crontab: {e}")
+
     def cleanup_old_modules(self):
         """
         Loescht alte Modul-Ordner im E3DC-Control Verzeichnis.
@@ -752,7 +937,7 @@ class DiagramInstaller:
             print("\nWas möchtest du tun?")
             print("1 = Nur Konfiguration ändern (Dateien bleiben)")
             print("2 = Komplett neu installieren (aus ZIP)")
-            print("3 = Nur crontab ändern")
+            print("3 = Crontab & Service aktualisieren")
             print("4 = Abbrechen")
             choice = input("Auswahl (1-4): ").strip()
             
@@ -768,6 +953,9 @@ class DiagramInstaller:
             elif choice == "3":
                 self.select_diagram_mode()
                 self.setup_crontab()
+                self.ensure_update_check_config()
+                self.setup_e3dc_service()
+                self.configure_sudoers_for_git()
                 self.save_config()
                 self.print_summary()
                 return True
@@ -789,6 +977,11 @@ class DiagramInstaller:
                 log_error("diagramm", "Erstinstallation aus ZIP fehlgeschlagen.")
                 return False
         
+        # Gemeinsame Einrichtung für Option 1, 2 und Erstinstallation
+        self.ensure_update_check_config()
+        self.setup_e3dc_service()
+        self.configure_sudoers_for_git()
+
         # 2) Alte Modul-Ordner entfernen (falls vorhanden)
         self.cleanup_old_modules()
 
@@ -825,6 +1018,27 @@ class DiagramInstaller:
             print(f"➤ Auto-Update: Alle {self.auto_interval} Minuten")
         print(f"➤ History-Backup: Täglich um Mitternacht")
         print(f"➤ Config: {self.config_file}")
+        
+        # Service Status anzeigen
+        try:
+            res = subprocess.run(["systemctl", "is-active", "e3dc"], capture_output=True, text=True)
+            status = res.stdout.strip()
+            res_enabled = subprocess.run(["systemctl", "is-enabled", "e3dc"], capture_output=True, text=True)
+            enabled = res_enabled.stdout.strip()
+            
+            if enabled == "disabled":
+                print(f"➤ Service Status: {status} (Autostart: disabled)")
+                if input("   ⚠️  Soll der Autostart aktiviert werden? (j/n): ").strip().lower() == 'j':
+                    try:
+                        subprocess.run(["sudo", "systemctl", "enable", "e3dc"], check=True, capture_output=True)
+                        print("   ✓ Autostart aktiviert.")
+                    except Exception as e:
+                        print(f"   ❌ Fehler: {e}")
+            else:
+                print(f"➤ Service Status: {status} (Autostart: {enabled})")
+        except Exception:
+            pass
+
         print("\n💡 Tipps:")
         print(f"  • Web-Interface: http://{host}/index.php")
         print(f"  • Diagramm direkt: http://{host}/diagramm.html")

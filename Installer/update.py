@@ -1,4 +1,5 @@
 import os
+import json
 import subprocess
 import time
 
@@ -110,14 +111,40 @@ def update_e3dc(headless=False):
     res = run_command(f"sudo -u {install_user} git -C {INSTALL_PATH} rev-parse origin/master", timeout=5)
     old_origin_sha = res['stdout'].strip() if res['success'] else None
 
+    # Lese Flags vom Web-Interface (falls vorhanden)
+    force_update_web = False
+    discard_changes_web = False
+    flag_file = "/tmp/e3dc_update_flags.json"
+    if os.path.exists(flag_file):
+        try:
+            with open(flag_file, 'r') as f:
+                flags = json.load(f)
+                force_update_web = flags.get('force', False)
+                discard_changes_web = flags.get('discard', False)
+            os.remove(flag_file) # Datei löschen
+            if force_update_web or discard_changes_web:
+                print(f"→ Web-Optionen: Force={force_update_web}, Discard={discard_changes_web}")
+        except Exception:
+            pass
+
     # Prüfe auf Updates
     missing = count_missing_commits()
+    ask_confirmation = True
     if missing is None:
         print("⚠ Commit-Zählung nicht möglich.")
     elif missing == 0:
         print("✓ Du bist auf dem neuesten Stand.")
         update_logger.info("Kein Update verfügbar, Version ist aktuell.")
-        return
+        if force_update_web:
+            print("→ Update wird erzwungen (Web-Option).")
+            ask_confirmation = False
+        elif not headless:
+            confirm = input("\n→ Möchtest du trotzdem aktualisieren (neu installieren)? (j/n): ").strip().lower()
+            if confirm != "j":
+                return
+            ask_confirmation = False
+        else:
+            return
     else:
         print(f"→ Es fehlen {missing} Commit(s).\n")
         commits = list_missing_commits()
@@ -126,7 +153,7 @@ def update_e3dc(headless=False):
             print(commits)
 
     # Bestätigung
-    if not headless:
+    if not headless and ask_confirmation:
         confirm = input("\n→ Möchtest du jetzt aktualisieren? (j/n): ").strip().lower()
         if confirm != "j":
             print("✗ Update abgebrochen. Es wurden keine Änderungen vorgenommen.\n")
@@ -136,7 +163,7 @@ def update_e3dc(headless=False):
                 run_command(f"sudo -u {install_user} git -C {INSTALL_PATH} update-ref refs/remotes/origin/master {old_origin_sha}")
             log_warning("update", "Update vom Benutzer abgebrochen.")
             return
-    else:
+    elif headless:
         print("→ Starte Update (Headless-Modus)...\n")
 
     # Backup erstellen
@@ -155,13 +182,30 @@ def update_e3dc(headless=False):
     has_changes = (result1.returncode != 0 or result2.returncode != 0)
 
     if has_changes:
-        print("⚠ Lokale Änderungen gefunden – sichere automatisch per git stash…")
-        result = run_command(f"sudo -u {install_user} bash -c 'cd {INSTALL_PATH} && git stash push -m \"Auto-Stash vor Update\"'")
-        if not result['success']:
-            print("✗ Stash fehlgeschlagen. Update abgebrochen.\n")
-            log_error("update", f"git stash fehlgeschlagen, Update abgebrochen: {result['stderr']}")
-            return
-        print("✓ Änderungen gestasht.")
+        discard_changes = discard_changes_web
+        
+        if not discard_changes and not headless:
+            print("⚠ Es wurden lokale Änderungen an Dateien gefunden.")
+            decision = input("→ Möchtest du diese verwerfen (v) oder behalten (b)? [b]: ").strip().lower()
+            if decision == 'v':
+                discard_changes = True
+
+        if discard_changes:
+            print("→ Verwerfe lokale Änderungen (git reset --hard)…")
+            result = run_command(f"sudo -u {install_user} git -C {INSTALL_PATH} reset --hard HEAD")
+            if not result['success']:
+                print("✗ Zurücksetzen fehlgeschlagen. Update abgebrochen.\n")
+                log_error("update", f"git reset --hard fehlgeschlagen: {result['stderr']}")
+                return
+            print("✓ Änderungen verworfen.")
+        else:
+            print("⚠ Sichere Änderungen automatisch per git stash…")
+            result = run_command(f"sudo -u {install_user} bash -c 'cd {INSTALL_PATH} && git stash push -m \"Auto-Stash vor Update\"'")
+            if not result['success']:
+                print("✗ Stash fehlgeschlagen. Update abgebrochen.\n")
+                log_error("update", f"git stash fehlgeschlagen, Update abgebrochen: {result['stderr']}")
+                return
+            print("✓ Änderungen gestasht.")
     else:
         print("✓ Keine lokalen Änderungen.")
 

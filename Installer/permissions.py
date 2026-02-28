@@ -250,6 +250,29 @@ FILE_DEFINITIONS = [
 def check_file_permissions():
     """Prüft Dateien, die PHP schreiben muss (config/wallbox) und Python-Dateien."""
     print("\n=== Datei-Rechteprüfung ===\n")
+    
+    # Logfile aus Config lesen und zur globalen Liste hinzufügen
+    try:
+        config_path = os.path.join(INSTALL_PATH, "e3dc.config.txt")
+        if os.path.exists(config_path):
+            with open(config_path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    if line.strip().lower().startswith("logfile"):
+                        parts = line.split("=")
+                        if len(parts) > 1:
+                            log_val = parts[1].strip().strip('"').strip("'")
+                            if log_val:
+                                full_log_path = log_val if log_val.startswith("/") else os.path.join(INSTALL_PATH, log_val)
+                                # Prüfen ob schon vorhanden
+                                if not any(d['path'] == full_log_path for d in FILE_DEFINITIONS):
+                                    FILE_DEFINITIONS.append({
+                                        "path": full_log_path, "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False
+                                    })
+                                    print(f"ℹ️  Logdatei erkannt: {os.path.basename(full_log_path)}")
+                                break
+    except Exception:
+        pass
+
     issues = {}
     for fdef in FILE_DEFINITIONS:
         path = fdef["path"]
@@ -547,12 +570,6 @@ def check_cronjobs():
             "optional_if_exists": "/var/www/html/backup_history.php"
         },
         {
-            "name": "E3DC-Control Autostart",
-            "line": f"@reboot sleep 30 && echo 0 > {INSTALL_PATH}/stop && /usr/bin/screen -dmS E3DC {INSTALL_PATH}/E3DC.sh",
-            "check_part": "screen -dmS E3DC",
-            "optional_if_exists": f"{INSTALL_PATH}/E3DC.sh"
-        },
-        {
             "name": "Live-Grabber Autostart",
             "line": f"@reboot /usr/bin/screen -dmS live-grabber {INSTALL_HOME}/get_live.sh",
             "check_part": "screen -dmS live-grabber",
@@ -709,14 +726,22 @@ def fix_sudoers_permissions(issues):
     return success
 
 def check_services():
-    """Prüft, ob der Watchdog-Service läuft (falls installiert)."""
+    """Prüft, ob Services laufen (E3DC-Control, Watchdog)."""
     print("\n=== Service-Prüfung ===\n")
     perm_logger.info("--- Starte Service-Prüfung ---")
     issues = {}
 
+    services_to_check = []
+
+    # E3DC-Control Service
+    if os.path.exists("/etc/systemd/system/e3dc.service"):
+        services_to_check.append("e3dc")
+
     # Piguard (Watchdog) - Nur prüfen, wenn das Skript existiert (also installiert wurde)
     if os.path.exists("/usr/local/bin/pi_guard.sh"):
-        srv = "piguard"
+        services_to_check.append("piguard")
+
+    for srv in services_to_check:
         # Check status
         res_active = run_command(f"systemctl is-active {srv}")
         is_active = res_active['stdout'].strip() == "active"

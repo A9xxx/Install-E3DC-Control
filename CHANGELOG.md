@@ -1,5 +1,34 @@
 # Changelog
 
+## [2026.02.28] - Service-Migration, Watchdog-Intelligenz & Update-Kontrolle
+
+### ⚙️ System-Dienst & Autostart
+*   **Migration zu Systemd:** E3DC-Control wird nun als echter Systemdienst (`e3dc.service`) verwaltet.
+    *   Ersetzt den alten Crontab-Autostart für mehr Stabilität.
+    *   Automatischer Neustart bei Abstürzen (`Restart=always`).
+    *   Bereinigung von "toten" Screen-Sessions vor dem Start.
+*   **Web-Steuerung:** Neuer Button "Service Neustart" im Web-Interface (Desktop & Mobile), um E3DC-Control bequem neu zu starten.
+
+### 🛡️ Watchdog (`install_watchdog.py`)
+*   **Hänger-Erkennung:** Der Watchdog kann nun überwachen, ob eine Datei (z.B. Logfile) regelmäßig aktualisiert wird. Stoppt die Aktualisierung (>15 Min), wird der Dienst neu gestartet.
+*   **Dynamische Dateinamen:** Unterstützung für den Platzhalter `{day}` (z.B. `protokoll.{day}.txt`), der automatisch durch den aktuellen Wochentag (Mo, Di, ...) ersetzt wird.
+*   **Gezielter Neustart:** Bei Problemen mit E3DC-Control (Screen fehlt oder Hänger) wird nur der Dienst neu gestartet, nicht mehr der ganze Raspberry Pi.
+*   **Feedback:** Push-Benachrichtigung bei erfolgreichem Service-Neustart durch den Watchdog.
+*   **Schnellstart:** Wartezeit beim Start von 5 Min auf 60 Sek verkürzt inkl. sofortiger Log-Meldung.
+*   **Speicher-Warnung:** Überwachung des SD-Karten-Speicherplatzes (Warnung bei >90% Belegung).
+*   **Bugfix:** Korrektur der `{day}`-Platzhalter-Ersetzung mittels `sed` für maximale Kompatibilität.
+
+### 🔄 Update-System
+*   **Erzwingen & Reset:** Neue Optionen beim Update:
+    *   Installation erzwingen (Re-Install), auch wenn die Version aktuell ist.
+    *   Lokale Änderungen verwerfen (`git reset --hard`) oder behalten (Stash).
+*   **Sichtbarkeit:** Rote Badges im Dashboard (Zahnrad & Button) weisen auf verfügbare Updates hin.
+*   **Konfiguration:** Automatische Update-Prüfung kann in der Config (`check_updates`) deaktiviert werden.
+
+### 📱 UI & Komfort
+*   **Mobile:** Optimierte Button-Stile (Outline), die erst bei Bedarf (z.B. Update verfügbar) farbig hervorgehoben werden.
+*   **Installer:** Automatische Einrichtung der nötigen `sudo`-Rechte für den Webserver (`git`, `systemctl`).
+
 ## [2026.02.27] - UI-Feinschliff, Logik-Optimierung & Cleanup
 
 ### 📱 Mobile Ansicht (`mobile.php`)

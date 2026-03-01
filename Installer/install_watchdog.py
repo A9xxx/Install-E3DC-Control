@@ -164,11 +164,19 @@ while true; do
   # Dynamische Dateinamen (z.B. protokoll.{{day}}.txt)
   ACTUAL_FILE="$MONITOR_FILE"
   if [[ "$MONITOR_FILE" == *"{{day}}"* ]]; then
-      dow=$(date +%u)
-      case $dow in
-          1) d="Mo" ;; 2) d="Di" ;; 3) d="Mi" ;; 4) d="Do" ;; 5) d="Fr" ;; 6) d="Sa" ;; 7) d="So" ;;
-      esac
-      ACTUAL_FILE=$(echo "$MONITOR_FILE" | sed "s/{{day}}/$d/")
+      # Strategie: Wir suchen die neueste Datei, die auf das Muster passt.
+      # Das löst Probleme beim Tageswechsel (z.B. wenn E3DC noch in die gestrige Datei schreibt).
+      PATTERN=$(echo "$MONITOR_FILE" | sed 's/{{day}}/*/g')
+      LATEST=$(ls -1t $PATTERN 2>/dev/null | head -n 1)
+      if [ -n "$LATEST" ]; then
+          ACTUAL_FILE="$LATEST"
+      else
+          dow=$(date +%u)
+          case $dow in
+              1) d="Mo" ;; 2) d="Di" ;; 3) d="Mi" ;; 4) d="Do" ;; 5) d="Fr" ;; 6) d="Sa" ;; 7) d="So" ;;
+          esac
+          ACTUAL_FILE=$(echo "$MONITOR_FILE" | sed "s/{{day}}/$d/")
+      fi
   fi
 
   # Logge Datei-Wechsel (z.B. neuer Tag oder Start)
@@ -408,6 +416,9 @@ def setup_watchdog_menu():
         create_service()
         configure_hardware_watchdog()
         update_cronjobs(daily_enabled=(use_daily=="j"), daily_hour=daily_hour)
+        
+        print("Starte PIGUARD Service neu...")
+        subprocess.run(["sudo", "systemctl", "restart", "piguard.service"])
         
         print("\n--- INSTALLATION ABGESCHLOSSEN ---")
         print("Bitte starte den Pi einmal neu, um alle Änderungen zu aktivieren.")

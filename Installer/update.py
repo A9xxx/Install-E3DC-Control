@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import subprocess
 import time
@@ -83,6 +84,15 @@ def list_missing_commits():
 
 def update_e3dc(headless=False):
     """Führt Update durch."""
+    # Automatische Erkennung: Wenn kein TTY (z.B. Web-Interface), dann Headless & Line-Buffering erzwingen
+    if not sys.stdout.isatty():
+        headless = True
+        # Pufferung deaktivieren, damit Ausgaben sofort im Web-Log erscheinen
+        try:
+            sys.stdout.reconfigure(line_buffering=True)
+        except AttributeError:
+            sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', buffering=1)
+
     print("\n=== E3DC-Control aktualisieren ===\n")
     update_logger.info("Starte Update-Prozess.")
 

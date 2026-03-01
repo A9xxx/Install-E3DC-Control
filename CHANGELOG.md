@@ -1,5 +1,12 @@
 # Changelog
 
+## [2026.03.01] - Watchdog-Optimierung & Bugfixes
+
+### 🛡️ Watchdog (`install_watchdog.py`)
+*   **Tageswechsel-Logik:** Die Datei-Überwachung (`{day}`-Platzhalter) sucht nun intelligent nach der *neuesten* passenden Datei, statt stur den aktuellen Wochentag zu prüfen. Dies verhindert Fehlalarme beim Tageswechsel (Mitternacht), wenn E3DC-Control aufgrund von Zeitzonen-Differenzen (GMT) noch in die alte Datei schreibt.
+*   **Service-Reload:** Der `piguard`-Service wird nach Änderungen im Installer-Menü automatisch neu gestartet, um die neue Konfiguration sofort zu aktivieren.
+*   **Watchdog aktualisieren:** Um die neuen Funktionen zu aktivieren, muss der Watchdog einmalig neu installiert werden. Starte dazu den Installer, wähle "Watchdog & Telegram konfigurieren" und dann **Punkt 1 (Komplett neu installieren / reparieren)**. Deine bisherigen Einstellungen werden automatisch vorgeschlagen und können einfach mit Enter bestätigt werden.
+
 ## [2026.02.28] - Service-Migration, Watchdog-Intelligenz & Update-Kontrolle
 
 ### ⚙️ System-Dienst & Autostart

@@ -2,6 +2,12 @@
 
 ## [2026.03.01] - Watchdog-Optimierung & Bugfixes
 
+### 🖥️ Installer & Menü-System
+*   **Kategorien:** Das Hauptmenü ist nun übersichtlich in Bereiche unterteilt (Installation, Konfiguration, System, Erweiterungen, Backup).
+*   **Suchfunktion:** Mit `s` kann im Menü nach Befehlen gesucht werden.
+*   **Notfall-Modus (Menu 99):** Ein neuer Assistent führt bei Problemen automatisch Rechte-Reparatur, Service-Einrichtung und Watchdog-Check nacheinander aus.
+*   **Erweiterter Status-Check:** Prüft nun auch Internetverbindung, zeigt Service-Logs bei Fehlern an und gibt konkrete Lösungsvorschläge.
+
 ### 🛡️ Watchdog (`install_watchdog.py`)
 *   **Tageswechsel-Logik:** Die Datei-Überwachung (`{day}`-Platzhalter) sucht nun intelligent nach der *neuesten* passenden Datei, statt stur den aktuellen Wochentag zu prüfen. Dies verhindert Fehlalarme beim Tageswechsel (Mitternacht), wenn E3DC-Control aufgrund von Zeitzonen-Differenzen (GMT) noch in die alte Datei schreibt.
 *   **Service-Reload:** Der `piguard`-Service wird nach Änderungen im Installer-Menü automatisch neu gestartet, um die neue Konfiguration sofort zu aktivieren.

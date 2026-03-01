@@ -38,6 +38,7 @@ from .permissions_helper import (
     set_web_directory,
     set_executable_script
 )
+from .screen_cron import install_e3dc_service
 
 # Logger
 diagramm_logger = get_or_create_logger("diagramm")
@@ -488,116 +489,6 @@ class DiagramInstaller:
             print(f"❌ Fehler beim Einrichten der sudo-Rechte: {e}")
             return False
 
-    def setup_e3dc_service(self):
-        """
-        Erstellt e3dc.service falls nicht vorhanden und migriert von crontab.
-        """
-        print("\n" + "-" * 60)
-        print("Prüfe E3DC-Control Systemdienst...")
-        print("-" * 60)
-        
-        service_path = "/etc/systemd/system/e3dc.service"
-        sh_path = os.path.join(self.install_path, "E3DC.sh")
-        
-        if not os.path.exists(sh_path):
-            print(f"ℹ️  {sh_path} nicht gefunden. Überspringe Service-Einrichtung.")
-            return
-
-        # Check if service exists
-        if os.path.exists(service_path):
-            print("✓ e3dc.service existiert bereits.")
-            self._disable_crontab_start() # Sicherstellen, dass Crontab sauber ist (und alter Screen beendet wird)
-            
-            # Sicherstellen, dass der Service auch läuft und enabled ist
-            try:
-                subprocess.run(["sudo", "systemctl", "enable", "e3dc"], check=False, capture_output=True)
-                res = subprocess.run(["systemctl", "is-active", "e3dc"], capture_output=True, text=True)
-                if res.stdout.strip() != "active":
-                    print("→ Service ist nicht aktiv. Starte Service...")
-                    subprocess.run(["sudo", "systemctl", "start", "e3dc"], check=True)
-                    print("✓ Service gestartet.")
-            except Exception as e:
-                print(f"⚠ Fehler beim Prüfen des Services: {e}")
-            return
-
-        print("→ Erstelle e3dc.service (ersetzt crontab/screen)...")
-        
-        # Service Definition für Screen-Nutzung
-        service_content = f"""[Unit]
-Description=E3DC-Control Service
-After=network.target
-
-[Service]
-Type=forking
-User={self.install_user}
-Group={self.install_user}
-WorkingDirectory={self.install_path}
-# Bereinigt nur tote Sessions (Dead), laesst aktive unberuehrt
-ExecStartPre=-/usr/bin/screen -wipe
-ExecStartPre=/bin/sh -c 'echo 0 > stop'
-ExecStart=/usr/bin/screen -dmS E3DC ./E3DC.sh
-ExecStop=/usr/bin/screen -S E3DC -X quit
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-"""
-        try:
-            with open("/tmp/e3dc.service", "w") as f:
-                f.write(service_content)
-            
-            subprocess.run(["sudo", "mv", "/tmp/e3dc.service", service_path], check=True)
-            subprocess.run(["sudo", "chmod", "644", service_path], check=True)
-            subprocess.run(["sudo", "systemctl", "daemon-reload"], check=True)
-            subprocess.run(["sudo", "systemctl", "enable", "e3dc"], check=True)
-            print("✓ Service erstellt und aktiviert.")
-            diagramm_logger.info("e3dc.service erstellt.")
-            
-            # Crontab bereinigen
-            self._disable_crontab_start()
-            
-            # Sicherheitsnetz: Alte Screen-Session beenden (falls vorhanden), 
-            # damit der neue Service sauber starten kann.
-            subprocess.run(["sudo", "-u", self.install_user, "screen", "-S", "E3DC", "-X", "quit"], capture_output=True)
-            
-            print("→ Starte Service neu (via systemd)...")
-            subprocess.run(["sudo", "systemctl", "restart", "e3dc"], check=True)
-            print("✓ Service läuft.")
-            
-        except Exception as e:
-            print(f"❌ Fehler beim Einrichten des Services: {e}")
-            log_error("diagramm", f"Service-Setup fehlgeschlagen: {e}")
-
-    def _disable_crontab_start(self):
-        """Deaktiviert den alten Startbefehl in der Crontab."""
-        try:
-            cmd = ["sudo", "-u", self.install_user, "crontab", "-l"]
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            if result.returncode != 0: return
-
-            lines = result.stdout.splitlines()
-            new_lines = []
-            changed = False
-            for line in lines:
-                # Suche nach typischen Start-Mustern
-                if "E3DC.sh" in line and "screen" in line and not line.strip().startswith("#"):
-                    new_lines.append(f"# {line} # Deaktiviert durch Installer (migriert zu systemd)")
-                    changed = True
-                    print("  → Alten Crontab-Eintrag deaktiviert.")
-                else:
-                    new_lines.append(line)
-            
-            if changed:
-                input_str = "\n".join(new_lines) + "\n"
-                subprocess.run(["sudo", "-u", self.install_user, "crontab", "-"], input=input_str, text=True, check=True)
-                
-                # Alte Screen-Session beenden, um Doppelstart zu vermeiden
-                print("  → Beende alte Screen-Session...")
-                subprocess.run(["sudo", "-u", self.install_user, "screen", "-S", "E3DC", "-X", "quit"], capture_output=True)
-        except Exception as e:
-            print(f"⚠ Fehler beim Bereinigen der Crontab: {e}")
-
     def cleanup_old_modules(self):
         """
         Loescht alte Modul-Ordner im E3DC-Control Verzeichnis.
@@ -958,7 +849,7 @@ WantedBy=multi-user.target
                 self.select_diagram_mode()
                 self.setup_crontab()
                 self.ensure_update_check_config()
-                self.setup_e3dc_service()
+                install_e3dc_service()
                 self.configure_sudoers_for_git()
                 self.save_config()
                 self.print_summary()
@@ -983,7 +874,7 @@ WantedBy=multi-user.target
         
         # Gemeinsame Einrichtung für Option 1, 2 und Erstinstallation
         self.ensure_update_check_config()
-        self.setup_e3dc_service()
+        install_e3dc_service()
         self.configure_sudoers_for_git()
 
         # 2) Alte Modul-Ordner entfernen (falls vorhanden)

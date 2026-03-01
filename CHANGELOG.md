@@ -5,7 +5,24 @@
 ### 🛡️ Watchdog (`install_watchdog.py`)
 *   **Tageswechsel-Logik:** Die Datei-Überwachung (`{day}`-Platzhalter) sucht nun intelligent nach der *neuesten* passenden Datei, statt stur den aktuellen Wochentag zu prüfen. Dies verhindert Fehlalarme beim Tageswechsel (Mitternacht), wenn E3DC-Control aufgrund von Zeitzonen-Differenzen (GMT) noch in die alte Datei schreibt.
 *   **Service-Reload:** Der `piguard`-Service wird nach Änderungen im Installer-Menü automatisch neu gestartet, um die neue Konfiguration sofort zu aktivieren.
+*   **Log-Viewer:** Automatische Einrichtung der Leserechte für das Web-Interface, damit das Watchdog-Protokoll direkt im Browser angezeigt werden kann.
 *   **Watchdog aktualisieren:** Um die neuen Funktionen zu aktivieren, muss der Watchdog einmalig neu installiert werden. Starte dazu den Installer, wähle "Watchdog & Telegram konfigurieren" und dann **Punkt 1 (Komplett neu installieren / reparieren)**. Deine bisherigen Einstellungen werden automatisch vorgeschlagen und können einfach mit Enter bestätigt werden.
+
+### 📱 Web-Interface (Desktop & Mobile)
+*   **Watchdog-Status:** Ein neues Schild-Icon in der Kopfzeile visualisiert den Status des Wächters:
+    *   **Grün:** Alles OK, Dienst läuft.
+    *   **Gelb:** Warnung (z.B. Protokoll-Datei veraltet).
+    *   **Rot:** Dienst gestoppt oder nicht verfügbar.
+*   **Interaktivität:** Ein Klick auf das Icon öffnet die letzten 50 Zeilen des Watchdog-Logs zur schnellen Diagnose.
+*   **Online-Status:** Die "Online"-Anzeige ist nun auch in der mobilen Ansicht verfügbar.
+    *   **Smart-Action:** Ein Klick auf das Badge aktualisiert die Daten sofort.
+    *   **Selbstheilung:** Ist der Status "Offline" oder "Veraltet", bietet ein Klick darauf direkt den Neustart des E3DC-Services an.
+*   **Cleanup:** Redundante Funktionen (Changelog-Modal, Diagramm-Update-Logik) wurden in die zentrale `helpers.php` ausgelagert, um den Code sauberer und wartbarer zu halten.
+*   **Mobile Preis-Graph:** Intelligente Dateiauswahl: Ab 18 Uhr wird bevorzugt die Mittags-Datei (`awattardebug.11.txt`) geladen, um bereits die Preise des nächsten Tages anzuzeigen. Ab 6 Uhr morgens wechselt die Ansicht wieder auf die Nacht-Datei (`23.txt`) für den aktuellen Tag.
+*   **Code-Refactoring:** Massive Aufräumaktion im Backend.
+    *   **Zentralisierung:** Alle Hilfsskripte (`run_now.php`, `save_setting.php`, `status.php`, `run_update.php`, `archiv_diagramm.php`) wurden in die zentrale `helpers.php` integriert.
+    *   **Vereinfachung:** `Wallbox.php`, `archiv.php` und `history.php` nutzen nun gemeinsame Funktionen aus `helpers.php` statt eigenen Code.
+    *   **Installer:** Die Rechteprüfung (`permissions.py`) wurde an die neue Dateistruktur angepasst und prüft keine gelöschten Dateien mehr.
 
 ## [2026.02.28] - Service-Migration, Watchdog-Intelligenz & Update-Kontrolle
 

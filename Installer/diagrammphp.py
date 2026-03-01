@@ -53,7 +53,11 @@ BACKUP_SCRIPT_PATH = "/var/www/html/backup_history.php" # Pfad zum Backup-Skript
 PLOT_LIVE_HISTORY_NAME = "plot_live_history.py"
 ZIP_NAME = "E3DC-Control.zip"
 OLD_MODULE_DIRS = ["config", "parsing", "plotting"]
-OBSOLETE_WEB_FILES = ["auto.php", "check.php", "config.php", "test.php", "mobile_history.php", "mobile_archiv.php"]
+OBSOLETE_WEB_FILES = [
+    "auto.php", "check.php", "config.php", "test.php", "mobile_history.php", "mobile_archiv.php",
+    "start_content.php", "live_content.php", "run_history.php", "save_setting.php", "status.php",
+    "run_now.php", "run_live_history.php", "run_update.php", "archiv_diagramm.php"
+]
 
 
 class DiagramInstaller:

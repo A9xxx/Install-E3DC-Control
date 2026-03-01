@@ -107,7 +107,8 @@ def create_pi_guard(router_ips, monitor_file=""):
     install_user = get_install_user()
     
     guard_content = f"""#!/bin/bash
-echo "Watchdog gestartet. Warte 60s auf System..." | logger -t PIGUARD
+VERSION="2026.03.01"
+echo "Watchdog v$VERSION gestartet. Warte 60s auf System..." | logger -t PIGUARD
 sleep 60
 fb_fail=0
 e3dc_fail=0
@@ -416,6 +417,12 @@ def setup_watchdog_menu():
         create_service()
         configure_hardware_watchdog()
         update_cronjobs(daily_enabled=(use_daily=="j"), daily_hour=daily_hour)
+        
+        print("Setze Berechtigungen für Log-Zugriff...")
+        subprocess.run(["sudo", "usermod", "-aG", "systemd-journal", "www-data"])
+        # Webserver neu starten, damit Gruppenrechte sofort wirksam werden
+        print("Starte Webserver neu (Rechte-Update)...")
+        subprocess.run("sudo systemctl restart apache2 2>/dev/null || sudo systemctl restart lighttpd 2>/dev/null", shell=True)
         
         print("Starte PIGUARD Service neu...")
         subprocess.run(["sudo", "systemctl", "restart", "piguard.service"])

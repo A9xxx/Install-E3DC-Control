@@ -225,5 +225,8 @@ def _remove_legacy_cronjobs(user):
             print("✓ Alte Einträge aus Root-Crontab entfernt.")
 
 
+# Alias für Rückwärtskompatibilität (für install_all.py)
+install_screen_cron = install_e3dc_service
+
 register_command("11", "E3DC-Control Service einrichten (Systemd)", install_e3dc_service, sort_order=110)
 register_command("12", "E3DC-Control starten", start_e3dc_control, sort_order=120)

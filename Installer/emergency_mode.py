@@ -67,6 +67,5 @@ def run_emergency_mode():
     print("Bitte prüfe nun, ob das System wieder läuft (Menü 'Status anzeigen').")
     print("=" * 60)
     log_task_completed("Notfall-Modus ausgeführt")
-    input("Drücke ENTER um zum Menü zurückzukehren...")
 
 register_command("99", "NOTFALL-MODUS (System reparieren)", run_emergency_mode, sort_order=990)

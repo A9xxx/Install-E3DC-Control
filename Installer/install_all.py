@@ -7,7 +7,7 @@ from .system import install_system_packages, install_e3dc_control
 from .diagrammphp import install_diagramm
 from .create_config import create_e3dc_config
 from .strompreis_wizard import strompreis_wizard
-from .screen_cron import install_screen_cron
+from .screen_cron import install_e3dc_service
 from .ramdisk import setup_ramdisk
 from .backup import backup_current_version
 from .utils import run_command
@@ -76,7 +76,7 @@ def install_all_main():
     print("  4. Webportal & Diagramm-System einrichten")
     print("  5. E3DC-Konfiguration & Wallbox-Datei erstellen")
     print("  6. Strompreise konfigurieren (optional)")
-    print("  7. Screen-Session & Cronjob einrichten")
+    print("  7. E3DC-Control Service einrichten (Systemd)")
     print("  8. RAM-Disk & Live-Status-Grabber einrichten")
     print("  9. Berechtigungen verifizieren & final setzen")
     print("  10. Backup der Initialversion erstellen\n")
@@ -194,10 +194,10 @@ def install_all_main():
         print("→ Übersprungen (kann später hinzugefügt werden).\n")
 
     # =========================================================
-    # SCHRITT 7: Screen & Cronjob
+    # SCHRITT 7: Service (Systemd)
     # =========================================================
-    if not safe_execute_task("SCHRITT 7/10: Screen-Session & Cronjob einrichten", install_screen_cron):
-        failed_steps.append("Screen/Cronjob")
+    if not safe_execute_task("SCHRITT 7/10: E3DC-Control Service einrichten (Systemd)", install_e3dc_service):
+        failed_steps.append("Service")
 
     # =========================================================
     # SCHRITT 8: RAM-Disk & Live-Status

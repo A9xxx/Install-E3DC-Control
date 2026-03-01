@@ -166,6 +166,5 @@ def show_system_status():
 
     print("\n==============================\n")
     log_task_completed("System-Statusprüfung")
-    input("Drücke ENTER, um zum Menü zurückzukehren...")
 
 register_command("21", "System-Status anzeigen", show_system_status, sort_order=210)

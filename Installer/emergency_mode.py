@@ -2,7 +2,7 @@ import os
 import time
 from .core import register_command
 from .permissions import run_permissions_wizard
-from .screen_cron import install_e3dc_service, start_e3dc_control
+from .service_setup import install_e3dc_service, start_e3dc_control
 from .install_watchdog import setup_watchdog_menu, create_service
 from .system import install_system_packages
 from .logging_manager import get_or_create_logger, log_task_completed

@@ -8,7 +8,7 @@ from .system import install_system_packages, install_e3dc_control
 from .diagrammphp import install_diagramm
 from .create_config import create_e3dc_config
 from .strompreis_wizard import strompreis_wizard
-from .screen_cron import install_e3dc_service
+from .service_setup import install_e3dc_service
 from .ramdisk import setup_ramdisk
 from .backup import backup_current_version
 from .utils import run_command

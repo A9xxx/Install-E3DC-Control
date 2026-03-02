@@ -4,7 +4,7 @@ import subprocess
 
 from .core import register_command
 from .utils import apt_install, pip_install, run_command, command_exists
-from .installer_config import get_install_path, get_install_user, load_config
+from .installer_config import get_install_path, get_install_user, get_home_dir, load_config
 from .logging_manager import get_or_create_logger, log_task_completed, log_error
 
 INSTALL_PATH = get_install_path()
@@ -22,7 +22,18 @@ def setup_venv(show_header=False):
     
     install_user = get_install_user()
     venv_name = get_venv_name() or ".venv_e3dc"
-    venv_path = os.path.join(INSTALL_PATH, venv_name)
+    venv_path = os.path.join(get_home_dir(), venv_name)
+
+    # Altes venv im E3DC-Control Ordner bereinigen (Migration)
+    old_venv_path = os.path.join(INSTALL_PATH, venv_name)
+    if os.path.exists(old_venv_path) and os.path.isdir(old_venv_path):
+        if os.path.abspath(old_venv_path) != os.path.abspath(venv_path):
+            print(f"→ Entferne veraltetes venv: {old_venv_path}")
+            try:
+                shutil.rmtree(old_venv_path)
+                print("✓ Altes venv bereinigt.")
+            except Exception as e:
+                print(f"⚠ Konnte altes venv nicht löschen: {e}")
     
     print(f"→ Ziel: {venv_path}")
     
@@ -45,10 +56,23 @@ def setup_venv(show_header=False):
     system_logger.info(f"Installiere {len(PYTHON_PACKAGES)} Python-Pakete in {venv_path}.")
     
     for pkg in PYTHON_PACKAGES:
-        # Installiere via venv-pip als install_user
-        cmd = f"sudo -u {install_user} {venv_pip} install {pkg}"
-        print(f"  • {pkg}...")
-        run_command(cmd)
+        # Paketname extrahieren (alles vor >, <, =)
+        pkg_name = pkg.split('>')[0].split('=')[0].split('<')[0]
+        
+        # Prüfen ob Paket installiert ist
+        check_cmd = f"sudo -u {install_user} {venv_pip} show {pkg_name}"
+        check_res = run_command(check_cmd)
+        
+        if check_res['success']:
+            # Bei Version-Constraint sicherheitshalber install ausführen (Update/Check)
+            if any(c in pkg for c in ['>', '=', '<']):
+                run_command(f"sudo -u {install_user} {venv_pip} install {pkg}")
+                print(f"  ✓ {pkg} (geprüft)")
+            else:
+                print(f"  ✓ {pkg} bereits installiert")
+        else:
+            print(f"  → Installiere {pkg}...")
+            run_command(f"sudo -u {install_user} {venv_pip} install {pkg}")
     
     if show_header:
         print("\n✓ Python-Umgebung eingerichtet.\n")
@@ -61,7 +85,7 @@ def list_venv_packages():
     
     install_user = get_install_user()
     venv_name = get_venv_name() or ".venv_e3dc"
-    venv_pip = os.path.join(INSTALL_PATH, venv_name, "bin", "pip")
+    venv_pip = os.path.join(get_home_dir(), venv_name, "bin", "pip")
     
     if not os.path.exists(venv_pip):
         print("✗ Kein venv gefunden.")
@@ -89,7 +113,7 @@ def install_system_packages(use_venv=True):
 
     packages = [
         "curl", "jq", "python3-bs4", "git", "screen",
-        "apache2", "php", "python3", "python3-pip",
+        "apache2", "php", "python3", "python3-pip", "python3-venv",
         "python3-plotly", "libjpeg-dev", "zlib1g-dev",
         "libcurl4-openssl-dev", "libssl-dev",
         "libmosquitto-dev", "libjsoncpp-dev",

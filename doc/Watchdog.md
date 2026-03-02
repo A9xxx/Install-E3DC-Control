@@ -24,14 +24,14 @@ if [ -z "$1" ]; then
     # Ursachenforschung im Log des letzten Boots (-b -1)
     REASON=$(journalctl -b -1 -t PIGUARD --no-pager | tail -n 1)
     if [ -z "$REASON" ]; then
-        MSG="🚀 Pi5ControlSSD gestartet.%0A📍 IP: $IP_ADDR%0Aℹ️ Ursache: Manueller Start oder Stromausfall."
+        MSG=$(printf "🚀 Pi5ControlSSD gestartet.\n📍 IP: $IP_ADDR\nℹ️ Ursache: Manueller Start oder Stromausfall.")
     else
         CLEAN_REASON=$(echo "$REASON" | sed 's/.*PIGUARD: //')
-        MSG="⚠️ Pi5ControlSSD REBOOT erfolgt!%0A📍 IP: $IP_ADDR%0A❌ Grund: $CLEAN_REASON"
+        MSG=$(printf "⚠️ Pi5ControlSSD REBOOT erfolgt!\n📍 IP: $IP_ADDR\n❌ Grund: $CLEAN_REASON")
     fi
 else
     # Nachrichtentext aus dem ersten Argument ($1) übernehmen
-    MSG="$1%0A📍 IP: $IP_ADDR"
+    MSG=$(printf "%s\n📍 IP: $IP_ADDR" "$1")
 fi
 
 # Senden an Telegram (URL-encoded)

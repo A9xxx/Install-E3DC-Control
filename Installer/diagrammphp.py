@@ -28,6 +28,7 @@ from . import core
 from .installer_config import (
     get_install_path,
     get_install_user,
+    get_home_dir,
     get_user_ids,
     get_www_data_gid,
     load_config
@@ -39,7 +40,7 @@ from .permissions_helper import (
     set_web_directory,
     set_executable_script
 )
-from .screen_cron import install_e3dc_service
+from .service_setup import install_e3dc_service
 
 # Logger
 diagramm_logger = get_or_create_logger("diagramm")
@@ -82,7 +83,7 @@ class DiagramInstaller:
         """Ermittelt den Pfad zum Python-Interpreter (venv bevorzugt)."""
         cfg = load_config()
         venv_name = cfg.get("venv_name", ".venv_e3dc")
-        venv_python = os.path.join(self.install_path, venv_name, "bin", "python3") if venv_name else ""
+        venv_python = os.path.join(get_home_dir(), venv_name, "bin", "python3") if venv_name else ""
         if venv_name and os.path.exists(venv_python):
             return venv_python
         return "/usr/bin/python3"

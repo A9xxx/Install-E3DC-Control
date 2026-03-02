@@ -82,6 +82,15 @@ def list_missing_commits():
     return result['stdout'].strip() if result['success'] else None
 
 
+def send_telegram_notification(message):
+    """Sendet eine Nachricht über das Watchdog-Skript."""
+    notify_script = "/usr/local/bin/boot_notify.sh"
+    if os.path.exists(notify_script) and os.access(notify_script, os.X_OK):
+        try:
+            subprocess.run([notify_script, message], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
 def update_e3dc(headless=False):
     """Führt Update durch."""
     # Automatische Erkennung: Wenn kein TTY (z.B. Web-Interface), dann Headless & Line-Buffering erzwingen
@@ -105,12 +114,14 @@ def update_e3dc(headless=False):
     if old_version is None:
         print("✗ Aktuelle Version konnte nicht ermittelt werden.")
         log_error("update", "Aktuelle Version konnte nicht ermittelt werden, Update abgebrochen.")
+        send_telegram_notification("❌ E3DC-Control Update fehlgeschlagen!\nUrsache: Aktuelle Version nicht ermittelbar.")
         return
 
     latest_version = get_latest_version()
     if latest_version is None:
         print("✗ Update nicht möglich – prüfe Internet und Repository.")
         log_error("update", "Neueste Version konnte nicht ermittelt werden, Update abgebrochen.")
+        send_telegram_notification("❌ E3DC-Control Update fehlgeschlagen!\nUrsache: Neueste Version nicht ermittelbar.")
         return
 
     print(f"Aktuelle Version: {old_version[:7]}")
@@ -182,6 +193,7 @@ def update_e3dc(headless=False):
     if backup_dir is None:
         print("✗ Backup fehlgeschlagen. Update abgebrochen.\n")
         log_error("update", "Backup vor Update fehlgeschlagen, Update abgebrochen.")
+        send_telegram_notification("❌ E3DC-Control Update fehlgeschlagen!\nUrsache: Backup fehlgeschlagen.")
         return
 
     # Prüfe auf lokale Änderungen
@@ -206,6 +218,7 @@ def update_e3dc(headless=False):
             if not result['success']:
                 print("✗ Zurücksetzen fehlgeschlagen. Update abgebrochen.\n")
                 log_error("update", f"git reset --hard fehlgeschlagen: {result['stderr']}")
+                send_telegram_notification("❌ E3DC-Control Update fehlgeschlagen!\nUrsache: Git Reset fehlgeschlagen.")
                 return
             print("✓ Änderungen verworfen.")
         else:
@@ -214,6 +227,7 @@ def update_e3dc(headless=False):
             if not result['success']:
                 print("✗ Stash fehlgeschlagen. Update abgebrochen.\n")
                 log_error("update", f"git stash fehlgeschlagen, Update abgebrochen: {result['stderr']}")
+                send_telegram_notification("❌ E3DC-Control Update fehlgeschlagen!\nUrsache: Git Stash fehlgeschlagen.")
                 return
             print("✓ Änderungen gestasht.")
     else:
@@ -229,6 +243,7 @@ def update_e3dc(headless=False):
     if not result['success']:
         print("✗ Git Pull fehlgeschlagen. Update abgebrochen.\n")
         log_error("update", f"git pull fehlgeschlagen, Update abgebrochen: {result['stderr']}")
+        send_telegram_notification("❌ E3DC-Control Update fehlgeschlagen!\nUrsache: Git Pull fehlgeschlagen.")
         return
 
     print("→ Kompiliere neue Version…")
@@ -243,6 +258,7 @@ def update_e3dc(headless=False):
     if not result['success']:
         print("✗ Kompilierung fehlgeschlagen. Update abgebrochen.\n")
         log_error("update", f"Kompilierung fehlgeschlagen, Update abgebrochen: {result['stderr']}")
+        send_telegram_notification("❌ E3DC-Control Update fehlgeschlagen!\nUrsache: Kompilierung fehlgeschlagen.")
         return
 
     # Berechtigungen korrigieren
@@ -260,6 +276,9 @@ def update_e3dc(headless=False):
 
     print("✓ Update erfolgreich abgeschlossen.\n")
     log_task_completed("E3DC-Control aktualisieren", details=f"Von {old_version[:7]} zu {latest_version[:7]}")
+
+    # Telegram Benachrichtigung senden (falls vorhanden)
+    send_telegram_notification(f"✅ E3DC-Control Update erfolgreich!\nVon: {old_version[:7]}\nZu: {latest_version[:7]}")
 
     # Stash-Management
     result = run_command(f"sudo -u {install_user} git -C {INSTALL_PATH} stash list")

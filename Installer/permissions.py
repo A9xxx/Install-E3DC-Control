@@ -109,7 +109,7 @@ def check_permissions():
             
         # VENV prüfen (falls vorhanden)
         venv_name = load_config().get("venv_name", ".venv_e3dc")
-        venv_path = os.path.join(INSTALL_PATH, venv_name) if venv_name else ""
+        venv_path = os.path.join(INSTALL_HOME, venv_name) if venv_name else ""
         if venv_name and os.path.exists(venv_path):
             st_venv = os.stat(venv_path)
             owner_venv = pwd.getpwuid(st_venv.st_uid).pw_name
@@ -360,7 +360,7 @@ def fix_permissions(issues):
     if "venv_owner" in issues:
         venv_name = load_config().get("venv_name", ".venv_e3dc")
         print(f"  → Setze Besitzer für {venv_name}: {INSTALL_USER}:{INSTALL_USER}")
-        venv_path = os.path.join(INSTALL_PATH, venv_name)
+        venv_path = os.path.join(INSTALL_HOME, venv_name)
         result = run_command(f"sudo chown -R {INSTALL_USER}:{INSTALL_USER} {venv_path}")
         if result['success']:
             print(f"✓ {venv_name} Besitzer korrigiert")
@@ -369,7 +369,7 @@ def fix_permissions(issues):
     if "venv_mode" in issues:
         venv_name = load_config().get("venv_name", ".venv_e3dc")
         print(f"  → Setze Rechte für {venv_name}/bin: +x")
-        venv_bin = os.path.join(INSTALL_PATH, venv_name, "bin")
+        venv_bin = os.path.join(INSTALL_HOME, venv_name, "bin")
         result = run_command(f"sudo chmod -R +x {venv_bin}")
         if result['success']:
             print(f"✓ {venv_name} Executables korrigiert")
@@ -815,6 +815,66 @@ def fix_services(issues):
             success = False
     return success
 
+def check_legacy_autostart():
+    """Prüft auf alte Autostart-Einträge in /etc/rc.local."""
+    print("\n=== Legacy Autostart Prüfung ===\n")
+    perm_logger.info("--- Starte Legacy Autostart Prüfung ---")
+    issues = []
+    rc_local = "/etc/rc.local"
+    
+    if os.path.exists(rc_local):
+        try:
+            with open(rc_local, "r") as f:
+                for line in f:
+                    if "E3DC.sh" in line and "screen" in line and not line.strip().startswith("#"):
+                        print(f"✗ Alter Autostart in {rc_local} gefunden: {line.strip()}")
+                        issues.append("rc_local_legacy")
+                        break
+        except Exception as e:
+            print(f"⚠ Fehler beim Lesen von {rc_local}: {e}")
+    
+    if not issues:
+        print("✓ Keine Legacy-Einträge in rc.local gefunden.")
+    
+    return issues
+
+def fix_legacy_autostart(issues):
+    """Entfernt Legacy-Einträge und bereinigt Prozesse."""
+    print("\n→ Bereinige Legacy Autostart…\n")
+    success = True
+    
+    if "rc_local_legacy" in issues:
+        rc_local = "/etc/rc.local"
+        try:
+            with open(rc_local, "r") as f:
+                lines = f.readlines()
+            new_lines = []
+            for line in lines:
+                if "E3DC.sh" in line and "screen" in line and not line.strip().startswith("#"):
+                    continue
+                new_lines.append(line)
+            with open(rc_local, "w") as f:
+                f.writelines(new_lines)
+            print(f"✓ {rc_local} bereinigt.")
+            
+            # Laufende Screen-Sessions killen (sowohl User als auch Root/Andere)
+            print("  → Beende laufende E3DC Screen-Sessions (Cleanup)...")
+            run_command(f"sudo -u {INSTALL_USER} screen -S E3DC -X quit")
+            run_command("sudo screen -S E3DC -X quit")
+            
+            # Service neu starten, um sauberen Zustand zu haben
+            print("  → Starte E3DC-Service neu...")
+            run_command("sudo systemctl restart e3dc")
+            print("✓ Service neu gestartet.")
+            perm_logger.info("Legacy Autostart entfernt und Service neu gestartet.")
+            
+        except Exception as e:
+            print(f"✗ Fehler: {e}")
+            perm_logger.error(f"Fehler beim Fixen von Legacy Autostart: {e}")
+            success = False
+            
+    return success
+
 def run_permissions_wizard(headless=False):
     """Hauptlogik für Rechteprüfung und -korrektur."""
     # Als erstes: Bereinige root-eigene Dateien falls vorhanden
@@ -828,8 +888,9 @@ def run_permissions_wizard(headless=False):
     cron_issues = check_cronjobs()
     sudo_issues = check_sudoers_permissions()
     service_issues = check_services()
+    legacy_issues = check_legacy_autostart()
 
-    has_issues = bool(issues) or bool(wp_issues) or bool(file_issues) or bool(cron_issues) or bool(sudo_issues) or bool(service_issues)
+    has_issues = bool(issues) or bool(wp_issues) or bool(file_issues) or bool(cron_issues) or bool(sudo_issues) or bool(service_issues) or bool(legacy_issues)
     if not has_issues:
         print("\n✓ Alle Berechtigungen, Cronjobs und Services sind korrekt.\n")
         perm_logger.info("✓ Prüfung bestanden: Keine Probleme gefunden.")
@@ -837,7 +898,7 @@ def run_permissions_wizard(headless=False):
         return
 
     print("\n⚠ Probleme gefunden.")
-    perm_logger.warning(f"⚠ Probleme erkannt: {len(issues)} Verz., {len(wp_issues)} Web, {len(file_issues)} Dateien, {len(cron_issues)} Cronjobs, {len(sudo_issues)} Sudoers, {len(service_issues)} Services")
+    perm_logger.warning(f"⚠ Probleme erkannt: {len(issues)} Verz., {len(wp_issues)} Web, {len(file_issues)} Dateien, {len(cron_issues)} Cronjobs, {len(sudo_issues)} Sudoers, {len(service_issues)} Services, {len(legacy_issues)} Legacy")
     
     if not headless:
         choice = input("Automatisch korrigieren? (j/n): ").strip().lower()
@@ -867,6 +928,9 @@ def run_permissions_wizard(headless=False):
         all_success = all_success and success
     if service_issues:
         success = fix_services(service_issues)
+        all_success = all_success and success
+    if legacy_issues:
+        success = fix_legacy_autostart(legacy_issues)
         all_success = all_success and success
 
     if all_success:

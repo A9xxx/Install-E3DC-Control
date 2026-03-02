@@ -79,17 +79,17 @@ IP_ADDR=$(hostname -I | cut -d' ' -f1)
 if [ -z "$1" ]; then
     REASON=$(journalctl -b -1 -t PIGUARD --no-pager | tail -n 1)
     if [ -z "$REASON" ]; then
-        MSG="🚀 $DEVICE_NAME gestartet.%0A📍 IP: $IP_ADDR%0Aℹ️ Ursache: Manueller Start oder Stromausfall."
+        MSG=$(printf "🚀 $DEVICE_NAME gestartet.\\n📍 IP: $IP_ADDR\\nℹ️ Ursache: Manueller Start oder Stromausfall.")
     else
         CLEAN_REASON=$(echo "$REASON" | sed 's/.*PIGUARD: //')
-        MSG="⚠️ $DEVICE_NAME REBOOT erfolgt!%0A📍 IP: $IP_ADDR%0A❌ Grund: $CLEAN_REASON"
+        MSG=$(printf "⚠️ $DEVICE_NAME REBOOT erfolgt!\\n📍 IP: $IP_ADDR\\n❌ Grund: $CLEAN_REASON")
     fi
 elif [ "$1" == "DAILY" ]; then
     UPTIME=$(uptime -p)
     TEMP=$(vcgencmd measure_temp | cut -d'=' -f2)
-    MSG="✅ Status: $DEVICE_NAME Online.%0A📍 IP: $IP_ADDR%0A⏱ Laufzeit: $UPTIME%0A🌡 Temp: $TEMP"
+    MSG=$(printf "✅ Status: $DEVICE_NAME Online.\\n📍 IP: $IP_ADDR\\n⏱ Laufzeit: $UPTIME\\n🌡 Temp: $TEMP")
 else
-    MSG="$1%0A📍 IP: $IP_ADDR"
+    MSG=$(printf "%s\\n📍 IP: $IP_ADDR" "$1")
 fi
 {telegram_logic}
 """

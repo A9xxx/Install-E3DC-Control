@@ -53,12 +53,12 @@ Dieses Skript ist für die Darstellung und Logik des interaktiven Hauptmenüs zu
 ### `install_all.py`
 Führt die komplette Neuinstallation in einer festen, logischen Reihenfolge durch:
 1.  Initiale Korrektur von Berechtigungen.
-2.  Installation von System-Abhängigkeiten und Einrichtung des **Python Virtual Environments** (`.venv_e3dc`).
+2.  Installation von System-Abhängigkeiten und Einrichtung des **Python Virtual Environments** (Standard: `~/.venv_e3dc`).
 3.  Klonen des `E3DC-Control` Git-Repositorys und Kompilieren des C-Programms via `make`.
 4.  Einrichten des PHP-Webportals.
 5.  Erstellen der initialen Konfigurationsdateien (`e3dc.config.txt`, `e3dc.wallbox.txt`).
 6.  Optionale Konfiguration von Strompreisen.
-7.  Einrichten von `cron` und `screen` für den automatischen Betrieb.
+7.  Einrichten des System-Dienstes für den automatischen Betrieb (inkl. Bereinigung von `rc.local`).
 8.  Einrichten einer RAM-Disk zur Schonung der SD-Karte.
 9.  **Finale Verifizierung aller Berechtigungen.**
 10. Erstellen eines ersten Backups.

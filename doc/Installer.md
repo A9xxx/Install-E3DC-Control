@@ -32,7 +32,7 @@ Da das Programm in Hintergrund-Sessions (`screen`) läuft, sind diese Befehle f�
 *   **System & Kompilierung (system.py)**: Installiert Linux-Pakete, richtet das Python venv ein (inkl. Plotly/Pandas) und übersetzt den C-Code.
 *   **Update-System (update.py)**: Vergleicht deine Version mit dem GitHub-Stand und aktualisiert nur das Programm, ohne deine Konfiguration zu überschreiben.
 *   **Backup & Rollback (backup.py / rollback.py)**: Erstellt Schnappschüsse deiner gesamten Installation (Binary, Config, Web). Erlaubt das Zurückkehren zu jedem Git-Commit oder lokalen Backup.
-*   **Automatisierung (screen_cron.py)**: Erstellt die Autostart-Einträge in der `crontab`, damit E3DC-Control nach einem Stromausfall von selbst startet.
+*   **Automatisierung (service_setup.py)**: Richtet den Systemd-Service (`e3dc.service`) ein, damit E3DC-Control automatisch startet und überwacht wird.
 *   **Webportal (diagrammphp.py)**: Richtet das PHP-Frontend und die täglichen Diagramm-Updates ein.
 *   **RAM-Disk & Live-Status (ramdisk.py)**: Konfiguriert den SD-Karten-Schutz durch eine 1MB RAM-Disk und startet das Grabber-Skript für das Mobile-Dashboard.
 *   **Konfigurations-Wizards (create_config.py / config_wizard.py)**: Interaktive Abfragen für alle Parameter der `e3dc.config.txt`.
@@ -44,8 +44,8 @@ Da das Programm in Hintergrund-Sessions (`screen`) läuft, sind diese Befehle f�
 *   **/home/pi/E3DC-Control/**: Das Hauptverzeichnis des Programms.
     *   `E3DC-Control`: Das kompilierte C-Programm.
     *   `e3dc.config.txt`: Deine Zugangsdaten und Einstellungen.
-    *   `.venv_e3dc/`: Die isolierte Python-Umgebung (Virtual Environment).
     *   `backups/`: Alle während Updates erstellten Sicherungen.
+*   **/home/pi/.venv_e3dc/**: Die isolierte Python-Umgebung (Virtual Environment).
 *   **/var/www/html/**: Das Webverzeichnis.
     *   `ramdisk/live.txt`: Der aktuelle Status (wird alle 4 Sek. überschrieben).
     *   `diagramm.html`: Das große Desktop-Diagramm.

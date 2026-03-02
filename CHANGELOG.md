@@ -2,7 +2,27 @@
 
 ## [2026.03.02] - Mobile UI & Chart-Optimierung
 
-### 📱 Mobile Ansicht (`mobile.php`)
+### � Interaktive Diagramme & Details
+*   **Klickbare Kacheln:** Ein Klick auf PV, Batterie, Netz oder Wallbox öffnet nun eine detaillierte Diagramm-Ansicht für den jeweiligen Bereich (Desktop & Mobile).
+*   **Detail-Daten:**
+    *   **PV:** Anzeige der einzelnen Strings (Leistung & Spannung).
+    *   **Netz:** Anzeige der einzelnen Phasen für Netzbezug und Wechselrichter.
+    *   **Batterie:** Anzeige von Spannung und Stromstärke zusätzlich zur Leistung.
+    *   **Wallbox:** Anzeige der einzelnen Phasenleistungen.
+*   **Mobile Optimierung:**
+    *   Diagramme passen sich nun dynamisch der Bildschirmgröße an (Responsive).
+    *   Neue Zeitauswahl (6h, 12h, 24h, 48h) direkt über dem Diagramm.
+    *   Detailwerte werden übersichtlich über dem Diagramm eingeblendet.
+    *   Trennung von "Live-Status" und "Prognose" in eigene Reiter für mehr Übersichtlichkeit.
+
+### ⚙️ System & Installer
+*   **Venv-Migration:** Das Python Virtual Environment wird nun standardmäßig im Home-Verzeichnis (`~/.venv_e3dc`) erstellt, um Konflikte mit dem Git-Repository zu vermeiden. Alte Venvs im Programmordner werden automatisch bereinigt.
+*   **Legacy-Cleanup:** Der Installer erkennt und entfernt nun veraltete Autostart-Einträge in `/etc/rc.local`, die zu doppelten E3DC-Instanzen führen konnten.
+*   **Bugfixes:**
+    *   Korrektur beim Auslesen negativer Werte bei Wechselrichter-Phasen.
+    *   Verbesserte Skalierung der Diagramm-Achsen für negative Werte (Einspeisung/Entladen).
+
+### �📱 Mobile Ansicht (`mobile.php`)
 *   **Preis-Chart Logik:** Die Berechnung der Zeitlinien (Start von Heute/Morgen) wurde korrigiert. Sie basiert nun auf der relativen Position zur aktuellen Uhrzeit, wodurch die Beschriftungen auch bei Charts, die gestern beginnen, korrekt positioniert sind.
 *   **Hintergrund-Visualisierung:** Tiefst- und Höchstpreise werden nun durch dezente, farbige Balken (Grün für Min, Rot für Max) direkt im Hintergrund-Chart markiert.
 *   **Layout-Optimierung:**
@@ -26,6 +46,9 @@
 *   **Venv-Flexibilität:** Der Name der Umgebung ist nun konfigurierbar (Standard: `.venv_e3dc`). Der Installer scannt nach vorhandenen Umgebungen und lässt den Benutzer wählen.
 *   **System-Integration:** Status-Check, Notfall-Modus und Web-Interface (`helpers.php`) lesen den venv-Namen dynamisch aus der Konfiguration.
 *   **Web-Update Fix:** Das System-Update über das Webportal läuft nun stabil durch (Headless-Modus für Rechtekorrektur), ohne bei Rückfragen hängen zu bleiben.
+*   **Prognose-Korrektur:** Die PV-Prognose wird nun korrekt gegen GMT-Zeit abgeglichen. Das Diagramm zeigt die Zeiten wieder in lokaler Zeitzone (Berlin) an.
+*   **Update-Benachrichtigung:** Nach einem Update (Erfolg oder Fehler) wird nun automatisch eine Telegram-Nachricht gesendet (sofern konfiguriert).
+*   **Bugfix Telegram:** Doppelte Kodierung von Zeilenumbrüchen (`%0A`) in Benachrichtigungen behoben.
 
 ## [2026.03.01] - Watchdog-Optimierung & Bugfixes
 

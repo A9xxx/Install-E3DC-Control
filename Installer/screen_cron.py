@@ -6,7 +6,7 @@ import tempfile
 
 from .core import register_command
 from .utils import run_command
-from .installer_config import get_install_path, get_user_ids, get_install_user
+from .installer_config import get_install_path, get_user_ids, get_install_user, load_config
 from .logging_manager import get_or_create_logger, log_task_completed, log_error, log_warning
 
 INSTALL_PATH = get_install_path()
@@ -113,6 +113,9 @@ def install_e3dc_service():
         with open(sh_path, "w") as f:
             f.write("#!/bin/bash\n")
             f.write(f"cd {INSTALL_PATH}\n")
+            # NEU: venv aktivieren falls vorhanden (für Python-Aufrufe aus C++)
+            venv_name = load_config().get("venv_name", ".venv_e3dc")
+            if venv_name: f.write(f"if [ -f {venv_name}/bin/activate ]; then source {venv_name}/bin/activate; fi\n")
             f.write("while true; do ./E3DC-Control; sleep 30; done\n")
         
         os.chmod(sh_path, 0o755)
@@ -128,7 +131,8 @@ def install_e3dc_service():
     print("→ Erstelle Systemd Service…")
     service_content = f"""[Unit]
 Description=E3DC-Control Service
-After=network.target
+Wants=network-online.target
+After=network-online.target
 
 [Service]
 Type=forking

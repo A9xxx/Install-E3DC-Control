@@ -4,9 +4,9 @@ import time
 import shutil
 
 from .core import register_command
-from .backup import choose_backup_version, restore_backup
+from .backup import choose_backup_version, restore_backup, backup_current_version
 from .utils import replace_in_file, run_command
-from .installer_config import get_install_path, get_install_user
+from .installer_config import get_install_path, get_install_user, load_config
 from .logging_manager import get_or_create_logger, log_task_completed, log_error, log_warning
 
 INSTALL_PATH = get_install_path()
@@ -21,6 +21,10 @@ def hard_stop_e3dc():
     try:
         install_user = get_install_user()
         
+        # NEU: Systemd Service stoppen (verhindert automatischen Neustart während Rollback)
+        if os.path.exists("/etc/systemd/system/e3dc.service"):
+            run_command("sudo systemctl stop e3dc", timeout=10)
+
         # Setze Stop-Flag
         config_file = os.path.join(INSTALL_PATH, "e3dc.config.txt")
         if os.path.exists(config_file):
@@ -52,11 +56,20 @@ def start_e3dc():
     print("→ Starte E3DC-Control…")
     rollback_logger.info("Starte E3DC-Control")
     
+    # NEU: Systemd Service nutzen falls vorhanden
+    if os.path.exists("/etc/systemd/system/e3dc.service"):
+        res = run_command("sudo systemctl start e3dc", timeout=10)
+        if res['success']:
+            print("✓ E3DC-Control Service gestartet")
+            return True
+        else:
+            print(f"⚠ Fehler beim Starten des Services: {res['stderr']}")
+    
     install_user = get_install_user()
     result = run_command(f"sudo -u {install_user} screen -dmS E3DC {INSTALL_PATH}/E3DC.sh", timeout=5)
     
     if result['success']:
-        print("✓ E3DC-Control gestartet")
+        print("✓ E3DC-Control gestartet (Legacy)")
         return True
     else:
         print("⚠ Warnung: E3DC-Control konnte nicht gestartet werden")
@@ -68,6 +81,14 @@ def rollback(backup_dir):
     """Kompletter Rollback-Prozess vom Backup."""
     print(f"\n→ Rollback von {os.path.basename(backup_dir)}…\n")
     rollback_logger.info(f"Starte Rollback von Backup: {os.path.basename(backup_dir)}")
+
+    # Sicherheits-Backup erstellen
+    print("→ Erstelle Sicherheits-Backup vor dem Überschreiben…")
+    try:
+        backup_current_version()
+    except Exception as e:
+        print(f"⚠ Warnung: Sicherheits-Backup konnte nicht erstellt werden: {e}")
+        rollback_logger.warning(f"Sicherheits-Backup vor Rollback fehlgeschlagen: {e}")
 
     if not hard_stop_e3dc():
         print("✗ Konnte E3DC nicht stoppen – Rollback abgebrochen")
@@ -168,6 +189,14 @@ def rollback_to_commit(commit_hash):
     print(f"\n→ Rollback auf {commit_hash}…\n")
     rollback_logger.info(f"Starte Rollback zu Commit: {commit_hash}")
 
+    # Sicherheits-Backup erstellen
+    print("→ Erstelle Sicherheits-Backup vor dem Git-Reset…")
+    try:
+        backup_current_version()
+    except Exception as e:
+        print(f"⚠ Warnung: Sicherheits-Backup konnte nicht erstellt werden: {e}")
+        rollback_logger.warning(f"Sicherheits-Backup vor Commit-Rollback fehlgeschlagen: {e}")
+
     # Git Reset
     result = run_command(f"cd {INSTALL_PATH} && git reset --hard {commit_hash}")
     if not result['success']:
@@ -178,7 +207,15 @@ def rollback_to_commit(commit_hash):
     # Kompilierung
     print("→ Kompiliere…")
     install_user = get_install_user()
-    result = run_command(f"sudo -u {install_user} bash -c 'cd {INSTALL_PATH} && make'", timeout=300)
+    
+    venv_name = load_config().get("venv_name", ".venv_e3dc")
+    venv_act = os.path.join(INSTALL_PATH, venv_name, "bin", "activate") if venv_name else ""
+    make_cmd = "make"
+    if venv_name and os.path.exists(venv_act):
+        make_cmd = f"source {venv_act} && make"
+        print("  (in venv Umgebung)")
+        
+    result = run_command(f"sudo -u {install_user} bash -c 'cd {INSTALL_PATH} && {make_cmd}'", timeout=300)
     if not result['success']:
         print(f"✗ Kompilierung fehlgeschlagen")
         log_error("rollback", f"Kompilierung nach Rollback auf {commit_hash} fehlgeschlagen.", result['stderr'])

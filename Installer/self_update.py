@@ -360,14 +360,24 @@ def check_and_update(silent=False, check_only=False):
         if not silent:
             print("\n✓ Installer ist aktuell.\n")
             update_logger.info("Installer ist aktuell.")
-        return False
+            
+            if latest_version == installed_version:
+                if input("Möchtest du das Update trotzdem erzwingen (Re-Install)? (j/n): ").strip().lower() != 'j':
+                    return False
+            else:
+                return False
+        else:
+            return False
 
     if check_only:
         return True
     
     # Zeige Release-Notes
     if not silent:
-        print(f"\n→ Neue Version verfügbar!\n")
+        if latest_version == installed_version:
+            print(f"\n→ Re-Installation von Version {latest_version}...\n")
+        else:
+            print(f"\n→ Neue Version verfügbar!\n")
 
         if release_info['body']:
             print("Änderungen:")

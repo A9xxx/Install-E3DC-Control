@@ -44,16 +44,33 @@ sleep 300
 
 fb_fail=0
 e3dc_fail=0
+file_fail=0
+disk_fail=0
 warned_fb=false
 warned_e3dc=false
+warned_file=false
+warned_disk=false
+LAST_CHECKED_FILE=""
+
+# Zu überwachende IPs (leerzeichengetrennt)
+ROUTER_IPS="192.168.178.1 8.8.8.8"
+MONITOR_FILE="/home/pi/E3DC-Control/protokoll.{{day}}.txt"
 
 while true; do
-  # --- CHECK 1: FRITZBOX (Ping) ---
-  if ! ping -c 1 -W 2 192.168.178.1 > /dev/null; then
+  # --- CHECK 1: NETZWERK (Ping) ---
+  network_ok=false
+  for ip in $ROUTER_IPS; do
+    if ping -c 1 -W 2 $ip > /dev/null; then
+      network_ok=true
+      break
+    fi
+  done
+
+  if [ "$network_ok" = false ]; then
     ((fb_fail++))
     # Vorwarnung nach 50 Sek. (5 Fehlversuche à 10s)
     if [ $fb_fail -eq 5 ] && [ "$warned_fb" = false ]; then
-        /usr/local/bin/boot_notify.sh "⚠️ FritzBox weg! Reboot in ca. 4 Min."
+        /usr/local/bin/boot_notify.sh "⚠️ Netzwerk weg ($ROUTER_IPS)! Reboot in 4 Min."
         warned_fb=true
     fi
   else
@@ -61,12 +78,13 @@ while true; do
     warned_fb=false
   fi
 
-  # --- CHECK 2: E3DC SCREEN (Sessions vom User 'pi') ---
+  # --- CHECK 2: E3DC SCREEN ---
+  # Prüft Screens des Installationsbenutzers (hier beispielhaft 'pi')
   if ! screen -ls pi/ | grep -v "Dead" | grep -q "E3DC"; then
     ((e3dc_fail++))
     # Vorwarnung nach 50 Sek.
     if [ $e3dc_fail -eq 5 ] && [ "$warned_e3dc" = false ]; then
-        /usr/local/bin/boot_notify.sh "⚠️ E3DC Screen fehlt! Reboot in ca. 2 Min."
+        /usr/local/bin/boot_notify.sh "⚠️ E3DC Screen fehlt! Restart Service in 2 Min."
         warned_e3dc=true
     fi
   else
@@ -74,22 +92,30 @@ while true; do
     warned_e3dc=false
   fi
 
-  # --- REBOOT ENTSCHEIDUNG ---
-  # FritzBox: 30 Fehlversuche = 5 Min
+  # --- CHECK 3: DATEI-AKTIVITÄT (Hänger-Schutz) ---
+  # ... (Logik zur Prüfung des Datei-Zeitstempels) ...
+
+  # --- CHECK 4: SPEICHERPLATZ (SD-Karte) ---
+  # ... (Prüfung auf >90% Belegung) ...
+
+  # --- REBOOT / RESTART ENTSCHEIDUNG ---
+  # Netzwerk: 30 Fehlversuche = 5 Min -> Reboot
   if [ $fb_fail -ge 30 ]; then
-    echo "FritzBox seit 5 Min weg. Reboot!" | logger -t PIGUARD
+    echo "Netzwerk ($ROUTER_IPS) seit 5 Min weg. Reboot!" | logger -t PIGUARD
     systemctl reboot
   fi
-  # E3DC-Screen: 18 Fehlversuche = 3 Min
+  # E3DC-Screen: 18 Fehlversuche = 3 Min -> Service Restart
   if [ $e3dc_fail -ge 18 ]; then
-    echo "E3DC Screen fehlt seit 3 Min. Reboot!" | logger -t PIGUARD
-    systemctl reboot
+    echo "E3DC Screen fehlt seit 3 Min. Restart E3DC Service!" | logger -t PIGUARD
+    systemctl restart e3dc
+    # ... Benachrichtigung senden ...
   fi
 
   sleep 10
 done
 4. Automatisierung (Service & Crontab)Hintergrund-Dienst für pi_guard.shErstellen der Datei /etc/systemd/system/piguard.service:Ini, TOML[Unit]
 Description=E3DC and FritzBox Guard Service
+Wants=network-online.target
 After=network-online.target
 
 [Service]

@@ -7,7 +7,7 @@ import time
 from .core import register_command
 from .backup import backup_current_version
 from .utils import replace_in_file, run_command
-from .installer_config import get_install_path, get_install_user
+from .installer_config import get_install_path, get_install_user, load_config
 from .logging_manager import get_or_create_logger, log_task_completed, log_error, log_warning
 
 INSTALL_PATH = get_install_path()
@@ -232,7 +232,14 @@ def update_e3dc(headless=False):
         return
 
     print("→ Kompiliere neue Version…")
-    result = run_command(f"sudo -u {install_user} bash -c 'cd {INSTALL_PATH} && make'", timeout=300)
+    venv_name = load_config().get("venv_name", ".venv_e3dc")
+    venv_act = os.path.join(INSTALL_PATH, venv_name, "bin", "activate") if venv_name else ""
+    make_cmd = "make"
+    if venv_name and os.path.exists(venv_act):
+        make_cmd = f"source {venv_act} && make"
+        print("  (in venv Umgebung)")
+        
+    result = run_command(f"sudo -u {install_user} bash -c 'cd {INSTALL_PATH} && {make_cmd}'", timeout=300)
     if not result['success']:
         print("✗ Kompilierung fehlgeschlagen. Update abgebrochen.\n")
         log_error("update", f"Kompilierung fehlgeschlagen, Update abgebrochen: {result['stderr']}")
@@ -241,7 +248,7 @@ def update_e3dc(headless=False):
     # Berechtigungen korrigieren
     print("\n→ Korrigiere Berechtigungen nach Update…")
     from .permissions import run_permissions_wizard
-    run_permissions_wizard()
+    run_permissions_wizard(headless=headless)
 
     # Neustart mit gestopptem Service
     config_file = os.path.join(INSTALL_PATH, "e3dc.config.txt")

@@ -1,5 +1,6 @@
 import os
 import subprocess
+import shutil
 
 from .core import register_command
 from .permissions import run_permissions_wizard, check_permissions, check_webportal_permissions, check_file_permissions, fix_permissions, fix_webportal_permissions, fix_file_permissions
@@ -11,7 +12,7 @@ from .screen_cron import install_e3dc_service
 from .ramdisk import setup_ramdisk
 from .backup import backup_current_version
 from .utils import run_command
-from .installer_config import get_install_path, get_user_ids, get_www_data_gid
+from .installer_config import get_install_path, get_user_ids, get_www_data_gid, get_home_dir, load_config, save_config
 from .logging_manager import setup_installation_loggers, print_installation_summary, log_task_completed, log_error, log_warning
 from .task_executor import safe_execute_task
 
@@ -79,9 +80,89 @@ def install_all_main():
     print("  7. E3DC-Control Service einrichten (Systemd)")
     print("  8. RAM-Disk & Live-Status-Grabber einrichten")
     print("  9. Berechtigungen verifizieren & final setzen")
-    print("  10. Backup der Initialversion erstellen\n")
+    print("  10. Backup der Initialversion erstellen")
+    print("  11. Watchdog-Dienst installieren (Silent)\n")
 
-    confirm = input("Alle Schritte ausführen? (j/n): ").strip().lower()
+    # Check auf vorhandene Config im Install-Ordner
+    possible_config = os.path.join(get_home_dir(), "Install", "e3dc.config.txt")
+    use_custom_config = False
+    if os.path.exists(possible_config):
+        print(f"ℹ️  Gefunden: {possible_config}")
+        if input("  Soll diese Konfigurationsdatei verwendet werden? (j/n): ").strip().lower() == 'j':
+            use_custom_config = True
+            print("  ✓ Wird in Schritt 5 integriert.")
+
+    # VENV Abfrage
+    use_venv = True
+    print("\n" + "-" * 60)
+    print("PYTHON UMGEBUNG")
+    print("-" * 60)
+
+    config = load_config()
+    current_venv = config.get("venv_name", ".venv_e3dc")
+    
+    # Scan nach vorhandenen venvs
+    possible_venvs = []
+    if os.path.exists(INSTALL_PATH):
+        try:
+            for item in os.listdir(INSTALL_PATH):
+                if item.startswith(".venv") and os.path.isdir(os.path.join(INSTALL_PATH, item)):
+                    possible_venvs.append(item)
+        except: pass
+    
+    use_venv = True
+    venv_name = current_venv
+
+    if possible_venvs:
+        print(f"Gefundene Umgebungen:")
+        for i, v in enumerate(possible_venvs, 1):
+            mark = " (aktuell)" if v == current_venv else ""
+            print(f"  {i}) {v}{mark}")
+        print(f"  n) Neue erstellen / Anderen Namen wählen")
+        print(f"  x) Kein venv (System-Python)")
+        
+        sel = input(f"Auswahl [1]: ").strip().lower()
+        if not sel: sel = "1"
+        
+        if sel == 'x':
+            use_venv = False
+            venv_name = None
+        elif sel == 'n':
+            custom = input("Name für neues venv [.venv_e3dc]: ").strip()
+            if custom: venv_name = custom
+        elif sel.isdigit():
+            idx = int(sel) - 1
+            if 0 <= idx < len(possible_venvs):
+                venv_name = possible_venvs[idx]
+    else:
+        print("Es wird empfohlen, eine isolierte Python-Umgebung (venv) zu nutzen.")
+        sel = input("Soll ein Python venv genutzt werden? (j/n) [j]: ").strip().lower()
+        if sel == 'n':
+            use_venv = False
+            venv_name = None
+            print("→ Installation erfolgt systemweit (global).")
+        else:
+            custom = input("Name für venv [.venv_e3dc]: ").strip()
+            if custom: venv_name = custom
+            print(f"→ Installation erfolgt im venv ({venv_name}).")
+
+    # Speichern in Config
+    config['venv_name'] = venv_name
+    save_config(config)
+    
+    # e3dc_paths.json aktualisieren (für PHP)
+    try:
+        paths_file = "/var/www/html/e3dc_paths.json"
+        if os.path.exists(paths_file):
+            import json
+            with open(paths_file, 'r') as f:
+                d = json.load(f)
+            d['venv_name'] = venv_name
+            with open(paths_file, 'w') as f:
+                json.dump(d, f, indent=2)
+    except: pass
+
+    confirm = input("\nAlle Schritte ausführen? (j/n): ").strip().lower()
     if confirm != "j":
         print("→ Abgebrochen.\n")
         return
@@ -94,7 +175,7 @@ def install_all_main():
     # SCHRITT 1: Berechtigungen (Initial) - PRÜFE & KORRIGIERE SOFORT
     # =========================================================
     print("\n" + "=" * 60)
-    print("SCHRITT 1 / 10: Berechtigungen prüfen & korrigieren (Initial)")
+    print("SCHRITT 1 / 11: Berechtigungen prüfen & korrigieren (Initial)")
     print("=" * 60)
     print("\n→ Prüfe und korrigiere Berechtigungen…\n")
     
@@ -126,14 +207,14 @@ def install_all_main():
     # SCHRITT 2: Systempakete
     # =========================================================
     print("\n" + "=" * 60)
-    if not safe_execute_task("SCHRITT 2/10: Systempakete installieren", install_system_packages):
+    if not safe_execute_task("SCHRITT 2/11: Systempakete installieren", install_system_packages, use_venv=use_venv):
         failed_steps.append("Systempakete")
 
     # =========================================================
     # SCHRITT 3: E3DC-Control Binary
     # =========================================================
     print("\n" + "=" * 60)
-    if not safe_execute_task("SCHRITT 3/10: E3DC-Control klonen & kompilieren", install_e3dc_control):
+    if not safe_execute_task("SCHRITT 3/11: E3DC-Control klonen & kompilieren", install_e3dc_control):
         failed_steps.append("E3DC-Control")
         print("\n✗ Kritischer Fehler: E3DC-Control konnte nicht installiert werden. Installation wird abgebrochen.\n")
         print_installation_summary()
@@ -144,11 +225,12 @@ def install_all_main():
     # =========================================================
     print("\n" + "=" * 60)
     def install_diagramm_and_restart_apache():
-        install_diagramm()
+        # Automatische Konfiguration: WP=Ja, Modus=Manuell (für Ramdisk-Support)
+        install_diagramm(auto_config={'enable_heatpump': True, 'diagram_mode': 'manual'})
         if not restart_apache():
             log_warning("install_all", "Apache-Neustart nach Diagramm-Installation fehlgeschlagen.")
 
-    if not safe_execute_task("SCHRITT 4/10: Webportal & Diagramm-System einrichten", install_diagramm_and_restart_apache):
+    if not safe_execute_task("SCHRITT 4/11: Webportal & Diagramm-System einrichten", install_diagramm_and_restart_apache):
         failed_steps.append("Diagramm")
 
     # =========================================================
@@ -156,7 +238,22 @@ def install_all_main():
     # =========================================================
     print("\n" + "=" * 60)
     def create_configs_task():
-        create_e3dc_config()
+        if use_custom_config:
+            print(f"→ Kopiere vorhandene Konfiguration von {possible_config}...")
+            try:
+                shutil.copy2(possible_config, os.path.join(INSTALL_PATH, "e3dc.config.txt"))
+                uid, _ = get_user_ids()
+                os.chown(os.path.join(INSTALL_PATH, "e3dc.config.txt"), uid, get_www_data_gid())
+                os.chmod(os.path.join(INSTALL_PATH, "e3dc.config.txt"), 0o664)
+                log_task_completed("Konfiguration kopiert", details=possible_config)
+                print("✓ Konfiguration kopiert.")
+            except Exception as e:
+                log_error("install_all", f"Fehler beim Kopieren der Config: {e}", e)
+                print(f"✗ Fehler beim Kopieren: {e}")
+                create_e3dc_config() # Fallback
+        else:
+            create_e3dc_config()
+            
         # Erstelle auch leere wallbox.txt wenn noch nicht vorhanden
         wallbox_file = os.path.join(INSTALL_PATH, "e3dc.wallbox.txt")
         if not os.path.exists(wallbox_file):
@@ -173,14 +270,14 @@ def install_all_main():
                 log_warning("install_all", f"Leere Wallbox-Datei konnte nicht erstellt werden: {e}")
                 print(f"⚠ Wallbox-Datei konnte nicht erstellt werden: {e}\n")
 
-    if not safe_execute_task("SCHRITT 5/10: E3DC-Konfiguration erstellen", create_configs_task):
+    if not safe_execute_task("SCHRITT 5/11: E3DC-Konfiguration erstellen", create_configs_task):
         failed_steps.append("Konfiguration")
 
     # =========================================================
     # SCHRITT 6: Strompreise (optional)
     # =========================================================
     print("\n" + "=" * 60)
-    print("SCHRITT 6/10: Strompreise (optional)")
+    print("SCHRITT 6/11: Strompreise (optional)")
     print("=" * 60)
     choice = input("Strompreise jetzt konfigurieren? (j/n): ").strip().lower()
     if choice == "j":
@@ -196,20 +293,20 @@ def install_all_main():
     # =========================================================
     # SCHRITT 7: Service (Systemd)
     # =========================================================
-    if not safe_execute_task("SCHRITT 7/10: E3DC-Control Service einrichten (Systemd)", install_e3dc_service):
+    if not safe_execute_task("SCHRITT 7/11: E3DC-Control Service einrichten (Systemd)", install_e3dc_service):
         failed_steps.append("Service")
 
     # =========================================================
     # SCHRITT 8: RAM-Disk & Live-Status
     # =========================================================
-    if not safe_execute_task("SCHRITT 8/10: RAM-Disk & Live-Status einrichten", setup_ramdisk):
+    if not safe_execute_task("SCHRITT 8/11: RAM-Disk & Live-Status einrichten", setup_ramdisk):
         failed_steps.append("RAM-Disk")
 
     # =========================================================
     # SCHRITT 9: FINALE BERECHTIGUNGEN (Sicherheitscheck)
     # =========================================================
     print("\n" + "=" * 60)
-    print("SCHRITT 9 / 10: Berechtigungen verifizieren & final setzen")
+    print("SCHRITT 9 / 11: Berechtigungen verifizieren & final setzen")
     print("=" * 60)
     print("\n→ Verifiziere alle Berechtigungen nach der Installation…\n")
     finalize_permissions()
@@ -217,8 +314,15 @@ def install_all_main():
     # =========================================================
     # SCHRITT 10: Backup
     # =========================================================
-    if not safe_execute_task("SCHRITT 10/10: Backup der Initialversion erstellen", backup_current_version):
+    if not safe_execute_task("SCHRITT 10/11: Backup der Initialversion erstellen", backup_current_version):
         failed_steps.append("Backup")
+
+    # =========================================================
+    # SCHRITT 11: Watchdog (Silent)
+    # =========================================================
+    from .install_watchdog import install_watchdog_silent
+    if not safe_execute_task("SCHRITT 11/11: Watchdog-Dienst installieren", install_watchdog_silent):
+        failed_steps.append("Watchdog")
 
     # =========================================================
     # Abschluss + Fehlersammlung
@@ -230,6 +334,8 @@ def install_all_main():
     print("     → http://localhost oder http://<PI-IP>\n")
     print("  2. E3DC-Control starten:")
     print("     → Mit 'screen -r E3DC' überprüfen (läuft bei Reboot automatisch)\n")
+    print("  3. Dokumentation:")
+    print("     → Weitere Infos findest du im Ordner 'Install/doc' (z.B. zu Watchdog, Venv).\n")
 
 
 register_command("18", "Alles installieren", install_all_main, sort_order=180)

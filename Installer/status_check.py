@@ -3,7 +3,7 @@ import sys
 from .core import register_command
 from .utils import run_command
 from .logging_manager import get_or_create_logger, log_task_completed
-from .installer_config import get_install_user
+from .installer_config import get_install_user, get_install_path, load_config
 
 status_logger = get_or_create_logger("status_check")
 
@@ -122,6 +122,20 @@ def show_system_status():
 
     # 3. System-Ressourcen
     print("\n--- System-Ressourcen ---")
+    # CPU Temp
+    res_temp = run_command("vcgencmd measure_temp")
+    if res_temp['success']:
+        temp = res_temp['stdout'].strip().replace("temp=", "")
+        print(f"CPU Temperatur:    {temp}")
+
+    # RAM-Disk
+    res_ram = run_command("mount | grep '/var/www/html/ramdisk'")
+    if res_ram['success'] and "tmpfs" in res_ram['stdout']:
+        print(f"RAM-Disk:          Aktiv")
+    else:
+        print(f"RAM-Disk:          NICHT AKTIV")
+        issues_found.append("ramdisk_missing")
+
     # Disk Usage
     res_disk = run_command("df -h /")
     if res_disk['success']:
@@ -139,7 +153,26 @@ def show_system_status():
     if res_up['success']:
         print(f"Laufzeit:          {res_up['stdout'].strip()}")
 
-    # 4. Lösungsvorschläge
+    # 4. Python Umgebung
+    print("\n--- Python Umgebung ---")
+    install_path = get_install_path()
+    config = load_config()
+    venv_name = config.get("venv_name", ".venv_e3dc")
+    
+    if "venv_name" in config and config["venv_name"] is None:
+        print("Modus:             System-Python (global)")
+    else:
+        venv_full_path = os.path.join(install_path, venv_name)
+        if os.path.exists(venv_full_path):
+            print(f"Modus:             Virtual Environment")
+            print(f"Pfad:              {venv_name}")
+            print(f"Status:            Aktiv")
+        else:
+            print(f"Modus:             Virtual Environment (konfiguriert)")
+            print(f"Status:            FEHLT ({venv_name} nicht gefunden)")
+            issues_found.append("venv_missing")
+
+    # 5. Lösungsvorschläge
     if issues_found:
         print("\n=== 💡 Lösungsvorschläge ===")
         if "internet" in issues_found:
@@ -161,6 +194,12 @@ def show_system_status():
 
         if "disk_full" in issues_found:
             print("• Speicher voll: Lösche alte Logs oder Backups (z.B. in /var/www/html/tmp/).")
+
+        if "ramdisk_missing" in issues_found:
+            print("• RAM-Disk fehlt: Nutze Menüpunkt '14' (Live-Status & RAM-Disk Setup).")
+            
+        if "venv_missing" in issues_found:
+            print("• Venv fehlt: Nutze Menüpunkt '22' (Python venv einrichten) zur Reparatur.")
     else:
         print("\n✓ Keine offensichtlichen Probleme gefunden.")
 

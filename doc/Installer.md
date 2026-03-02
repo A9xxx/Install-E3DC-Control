@@ -29,7 +29,7 @@ Da das Programm in Hintergrund-Sessions (`screen`) l채uft, sind diese Befehle f�
 
 ### Funktions-Module (Men체punkte)
 *   **Rechteverwaltung (permissions.py)**: Erzwingt konsistente Berechtigungen. Setzt `pi:www-data` als Besitzer und stellt sicher, dass PHP und der Webserver schreiben d체rfen.
-*   **System & Kompilierung (system.py)**: Installiert alle Linux-Pakete (Apache, PHP, Plotly) und 체bersetzt den C-Code von E3DC-Control in ein ausf체hrbares Programm.
+*   **System & Kompilierung (system.py)**: Installiert Linux-Pakete, richtet das Python venv ein (inkl. Plotly/Pandas) und 체bersetzt den C-Code.
 *   **Update-System (update.py)**: Vergleicht deine Version mit dem GitHub-Stand und aktualisiert nur das Programm, ohne deine Konfiguration zu 체berschreiben.
 *   **Backup & Rollback (backup.py / rollback.py)**: Erstellt Schnappsch체sse deiner gesamten Installation (Binary, Config, Web). Erlaubt das Zur체ckkehren zu jedem Git-Commit oder lokalen Backup.
 *   **Automatisierung (screen_cron.py)**: Erstellt die Autostart-Eintr채ge in der `crontab`, damit E3DC-Control nach einem Stromausfall von selbst startet.
@@ -44,6 +44,7 @@ Da das Programm in Hintergrund-Sessions (`screen`) l채uft, sind diese Befehle f�
 *   **/home/pi/E3DC-Control/**: Das Hauptverzeichnis des Programms.
     *   `E3DC-Control`: Das kompilierte C-Programm.
     *   `e3dc.config.txt`: Deine Zugangsdaten und Einstellungen.
+    *   `.venv_e3dc/`: Die isolierte Python-Umgebung (Virtual Environment).
     *   `backups/`: Alle w채hrend Updates erstellten Sicherungen.
 *   **/var/www/html/**: Das Webverzeichnis.
     *   `ramdisk/live.txt`: Der aktuelle Status (wird alle 4 Sek. 체berschrieben).
@@ -82,4 +83,3 @@ Du kannst das Dashboard als **Progressive Web App (PWA)** auf deinem Handy insta
 
 ---
 *Dokumentation Stand: Februar 2026*
-

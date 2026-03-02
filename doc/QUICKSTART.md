@@ -38,7 +38,8 @@ Ein Menü mit verschiedenen Optionen wird angezeigt.
 Für eine Erstinstallation ist die empfohlene Option **"Alles installieren"** (normalerweise die Nr. 16).
 1.  Wählen Sie die entsprechende Nummer aus dem Menü.
 2.  Bestätigen Sie die Nachfrage mit `j` und drücken Sie Enter.
-3.  Der Installer führt nun alle notwendigen Schritte automatisch aus. Folgen Sie den Anweisungen auf dem Bildschirm.
+3.  **Python Umgebung:** Der Installer fragt, ob ein "venv" genutzt werden soll. Bestätigen Sie dies mit `j` (empfohlen).
+4.  Der Installer führt nun alle notwendigen Schritte automatisch aus. Folgen Sie den Anweisungen auf dem Bildschirm.
 
 ---
 

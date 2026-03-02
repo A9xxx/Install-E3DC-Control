@@ -28,6 +28,7 @@ Bevor du startest, stelle sicher, dass folgende Punkte erfüllt sind:
 
 *   **Hardware:** Raspberry Pi (Empfohlen: Pi 4 oder Pi 5, läuft auch auf Pi Zero 2 W) mit SD-Karte oder SSD.
 *   **Betriebssystem:** Raspberry Pi OS Lite (Bullseye oder neuer, 64-bit empfohlen).
+*   **Python:** Python 3.7+ (Der Installer richtet automatisch ein isoliertes Virtual Environment ein).
 *   **Netzwerk:** Der Pi muss im gleichen Netzwerk wie das E3DC Hauskraftwerk sein und Internetzugriff haben.
 *   **Zugriff:** SSH-Zugriff auf den Pi.
 
@@ -71,20 +72,7 @@ Im Menü wählst du für eine Neuinstallation am besten die Option **"Alles inst
 
 ---
 
-## 🔄 Upgrade auf die neueste Version
-
-Um von einer älteren Version auf die aktuelle Version (mit Systemd & neuem Menü) zu wechseln:
-
-1.  **Installer aktualisieren:**
-    Wähle im Menü **"Installation & Update"** -> **"Installer aktualisieren"** (oder `git pull` im Verzeichnis).
-2.  **Service umstellen:**
-    Gehe zu **"System & Dienste"** -> **"E3DC-Control Service einrichten (Systemd)"** (Punkt 11). Dies ersetzt den alten Crontab-Autostart durch einen stabilen Systemdienst.
-3.  **Status prüfen:**
-    Nutze **"System-Status anzeigen"** (Punkt 21), um sicherzustellen, dass alles läuft.
-
----
-
-## �️ Wartung & Updates
+## ️ Wartung & Updates
 
 Der Installer dient auch als Wartungstool. Starte ihn jederzeit erneut (`sudo python3 installer_main.py`), um Updates einzuspielen, Berechtigungen zu reparieren oder Backups zu verwalten.
 

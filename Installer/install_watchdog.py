@@ -252,6 +252,7 @@ def create_service():
     print(f"Erstelle Systemd Service {SERVICE_PATH}...")
     service_content = f"""[Unit]
 Description=E3DC and FritzBox Guard Service
+Wants=network-online.target
 After=network-online.target
 
 [Service]
@@ -464,6 +465,59 @@ def setup_watchdog_menu():
             create_pi_guard(new_ip, current['MONITOR_FILE'])
             subprocess.run(["sudo", "systemctl", "restart", "piguard.service"])
             print("✓ Router-IP aktualisiert und Service neugestartet.")
+
+def install_watchdog_silent():
+    """Installiert den Watchdog automatisch mit sicheren Defaults (ohne Telegram)."""
+    print("\n=== Watchdog-Installation (Automatisch) ===")
+    
+    # 1. Router IP ermitteln (Gateway)
+    router_ip = "192.168.178.1" # Fallback
+    try:
+        # Versuche Gateway zu ermitteln
+        res = subprocess.run("ip route | grep default | awk '{print $3}'", shell=True, capture_output=True, text=True)
+        detected = res.stdout.strip()
+        if detected:
+            router_ip = detected
+    except:
+        pass
+        
+    # 2. Monitor File ermitteln
+    install_path = get_install_path()
+    monitor_file = os.path.join(install_path, "protokoll.{day}.txt")
+    
+    # Versuche aus Config zu lesen
+    try:
+        config_path = os.path.join(install_path, "e3dc.config.txt")
+        if os.path.exists(config_path):
+            with open(config_path, "r") as f:
+                for line in f:
+                    if line.strip().lower().startswith("logfile"):
+                        parts = line.split("=")
+                        if len(parts) > 1:
+                            val = parts[1].strip().strip('"').strip("'")
+                            if val:
+                                monitor_file = val if val.startswith("/") else os.path.join(install_path, val)
+                            break
+    except: pass
+
+    print(f"Konfiguration (Silent):")
+    print(f"  Telegram:      Deaktiviert")
+    print(f"  Router-IP:     {router_ip}")
+    print(f"  Monitor-Datei: {monitor_file}")
+
+    # Installation durchführen
+    create_boot_notify("", "", "E3DC-Control") # Token/ChatID leer -> Telegram aus
+    create_pi_guard(router_ip, monitor_file)
+    create_service()
+    configure_hardware_watchdog()
+    update_cronjobs(daily_enabled=True, daily_hour=12)
+    
+    # Rechte setzen
+    subprocess.run(["sudo", "usermod", "-aG", "systemd-journal", "www-data"])
+    subprocess.run("sudo systemctl restart apache2 2>/dev/null || sudo systemctl restart lighttpd 2>/dev/null", shell=True)
+    subprocess.run(["sudo", "systemctl", "restart", "piguard.service"])
+    
+    print("✓ Watchdog erfolgreich installiert.")
 
 if __name__ == "__main__":
     setup_watchdog_menu()

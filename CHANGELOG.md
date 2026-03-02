@@ -1,5 +1,32 @@
 # Changelog
 
+## [2026.03.02] - Mobile UI & Chart-Optimierung
+
+### 📱 Mobile Ansicht (`mobile.php`)
+*   **Preis-Chart Logik:** Die Berechnung der Zeitlinien (Start von Heute/Morgen) wurde korrigiert. Sie basiert nun auf der relativen Position zur aktuellen Uhrzeit, wodurch die Beschriftungen auch bei Charts, die gestern beginnen, korrekt positioniert sind.
+*   **Hintergrund-Visualisierung:** Tiefst- und Höchstpreise werden nun durch dezente, farbige Balken (Grün für Min, Rot für Max) direkt im Hintergrund-Chart markiert.
+*   **Layout-Optimierung:**
+    *   Die Min/Max-Preiswerte wurden in die oberen Ecken der Kachel verschoben, um die Lesbarkeit zu verbessern.
+    *   Die Abstände in der Photovoltaik-Kachel (Prognose-Zeile) wurden für ein ausgewogeneres Design angepasst.
+    *   Ein fehlendes Label für "Gestern" wurde im Preis-Chart ergänzt.
+
+### ⚙️ Installer & Backend
+*   **Intelligente Installation:** "Alles installieren" erkennt nun vorhandene Konfigurationsdateien, installiert das Diagramm-System automatisch mit und richtet den Watchdog (Silent) ein.
+*   **Modulare Deinstallation:** Neues Menü zum gezielten Entfernen einzelner Komponenten (Watchdog, RAM-Disk, Webportal) oder des gesamten Systems.
+*   **Service-Härtung:** Systemd-Services warten nun explizit auf eine aktive Netzwerkverbindung (`network-online.target`), um Startfehler zu vermeiden.
+*   **Menü-Optimierung:** Untermenüs sind nun einfacher bedienbar (Nummerierung 1-N) und sicherer (keine globalen Hotkeys mehr).
+*   **Diagnose:** Der Status-Check zeigt nun auch CPU-Temperatur und RAM-Disk-Status an. Der Notfall-Modus prüft zusätzlich auf fehlende Systempakete.
+
+### 💾 Backup & Sicherheit
+*   **Erweiterter Umfang:** Backups beinhalten nun auch Watchdog-Skripte, Systemd-Service-Dateien, `e3dc_paths.json` und alle Spezial-Konfigurationen.
+*   **Sicherheits-Backup:** Vor jedem Rollback oder Update wird automatisch ein Backup des aktuellen Zustands erstellt ("Safety First").
+*   **Prozess-Sicherheit:** Alle Datei-Operationen (Install, Uninstall, Restore) stoppen nun zuverlässig den laufenden Systemdienst, um Datenkorruption zu verhindern.
+*   **Virtual Environment:** Volle Unterstützung für Python venv (`.venv`) bei Installation, Updates und Kompilierung, um Konflikte mit System-Paketen zu vermeiden (PEP 668).
+*   **Smart-Install:** `install_all.py` erkennt nun automatisch eine bestehende venv-Umgebung und nutzt diese weiter, ohne erneut zu fragen.
+*   **Venv-Flexibilität:** Der Name der Umgebung ist nun konfigurierbar (Standard: `.venv_e3dc`). Der Installer scannt nach vorhandenen Umgebungen und lässt den Benutzer wählen.
+*   **System-Integration:** Status-Check, Notfall-Modus und Web-Interface (`helpers.php`) lesen den venv-Namen dynamisch aus der Konfiguration.
+*   **Web-Update Fix:** Das System-Update über das Webportal läuft nun stabil durch (Headless-Modus für Rechtekorrektur), ohne bei Rückfragen hängen zu bleiben.
+
 ## [2026.03.01] - Watchdog-Optimierung & Bugfixes
 
 ### 🖥️ Installer & Menü-System

@@ -21,7 +21,7 @@ CAT_OTHER = "Sonstiges"
 CATEGORY_MAP = {
     "1": CAT_INSTALL, "3": CAT_INSTALL, "4": CAT_INSTALL, "5": CAT_INSTALL, "18": CAT_INSTALL, "20": CAT_INSTALL,
     "7": CAT_CONFIG, "8": CAT_CONFIG, "9": CAT_CONFIG, "19": CAT_CONFIG,
-    "2": CAT_SYSTEM, "11": CAT_SYSTEM, "12": CAT_SYSTEM, "14": CAT_SYSTEM, "21": CAT_SYSTEM, "99": CAT_SYSTEM,
+    "2": CAT_SYSTEM, "11": CAT_SYSTEM, "12": CAT_SYSTEM, "14": CAT_SYSTEM, "21": CAT_SYSTEM, "22": CAT_SYSTEM, "23": CAT_SYSTEM, "99": CAT_SYSTEM,
     "10": CAT_EXTENSIONS, "13": CAT_EXTENSIONS, "15": CAT_EXTENSIONS,
     "6": CAT_BACKUP, "16": CAT_BACKUP, "17": CAT_BACKUP
 }
@@ -111,10 +111,10 @@ def print_category_menu(category, commands):
     print(f"    {category}")
     print("-" * 40 + "\n")
 
-    for cmd in commands:
-        print(f"  {cmd.key}) {cmd.label}")
+    for idx, cmd in enumerate(commands, 1):
+        print(f"  {idx}) {cmd.label}")
     
-    print(f"\n  b) Zurück zum Hauptmenü")
+    print(f"\n  q) Zurück zum Hauptmenü")
     print()
 
 
@@ -127,8 +127,7 @@ def print_all_commands_menu(commands):
     for cmd in commands:
         print(f"  {cmd.key}) {cmd.label}")
     
-    print(f"  b) Zurück")
-    print(f"  q) Beenden")
+    print(f"  q) Zurück zum Hauptmenü")
     print()
 
 
@@ -191,8 +190,8 @@ def run_main_menu(restart_callback=None):
                 print(f"  {cmd.key}) {cmd.label} ({cmd.category})")
             print()
             
-            sel = input(f"Befehl ausführen (Nummer) oder 'b' für Zurück: ").strip().lower()
-            if sel == "b":
+            sel = input(f"Befehl ausführen (Nummer) oder 'q' für Zurück: ").strip().lower()
+            if sel == "q":
                 continue
             
             target = next((c for c in matches if c.key == sel), None)
@@ -217,17 +216,26 @@ def run_main_menu(restart_callback=None):
 
             choice = input(f"Befehl ({install_user}): ").strip().lower()
 
-            if choice == "b":
+            if choice == "q":
+                # In Untermenüs bedeutet q immer "Zurück zum Hauptmenü"
                 current_view = "main"
                 continue
-            elif choice == "q" and current_view == "all":
-                print("→ Beende Installer.\n")
-                break
             
-            matched = [c for c in view_commands if c.key == choice]
+            matched = []
+            
+            # 1. Versuch: Index-basiert (nur in Kategorie-Ansicht)
+            if current_view != "all" and choice.isdigit():
+                try:
+                    idx = int(choice)
+                    if 1 <= idx <= len(view_commands):
+                        matched = [view_commands[idx-1]]
+                except ValueError:
+                    pass
+            
+            # 2. Versuch: Key-basiert (in "all" Ansicht oder als Fallback für globale IDs)
             if not matched:
-                # Versuche globalen Match (falls User ID aus anderer Kategorie kennt)
-                matched = [c for c in commands if c.key == choice]
+                # Zuerst im aktuellen View schauen (für "all" wichtig)
+                matched = [c for c in view_commands if c.key == choice]
             
             if matched:
                 cmd = matched[0]

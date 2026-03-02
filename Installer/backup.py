@@ -5,6 +5,7 @@ import shutil
 from .core import register_command
 from .installer_config import get_install_path, get_user_ids, get_www_data_gid
 from .logging_manager import get_or_create_logger, log_task_completed, log_error, log_warning
+from .utils import run_command
 
 INSTALL_PATH = get_install_path()
 WEBPORTAL_EXTENSIONS = {".php", ".css", ".js", ".json"}
@@ -73,17 +74,30 @@ def backup_current_version():
                 print(f"  ⚠ Fehler beim Sichern des Programms: {e}")
                 log_error("backup", f"Fehler beim Sichern des Programms: {e}", e)
 
-        # Konfiguration sichern
-        cfg_path = os.path.join(INSTALL_PATH, "e3dc.config.txt")
-        if os.path.exists(cfg_path):
+        # Alle Konfigurationsdateien sichern
+        config_files = ["e3dc.config.txt", "e3dc.strompreis.txt", "diagram_config.json"]
+        for cfg in config_files:
+            cfg_path = os.path.join(INSTALL_PATH, cfg)
+            if os.path.exists(cfg_path):
+                try:
+                    shutil.copy2(cfg_path, backup_dir)
+                    total_copied_files += 1
+                    print(f"  ✓ {cfg} gesichert")
+                    backup_logger.info(f"Konfiguration '{cfg}' gesichert.")
+                except Exception as e:
+                    print(f"  ⚠ Fehler beim Sichern von {cfg}: {e}")
+                    log_error("backup", f"Fehler beim Sichern von {cfg}: {e}", e)
+
+        # e3dc_paths.json aus Webverzeichnis sichern (WICHTIG)
+        paths_json = "/var/www/html/e3dc_paths.json"
+        if os.path.exists(paths_json):
             try:
-                shutil.copy2(cfg_path, backup_dir)
+                shutil.copy2(paths_json, backup_dir)
                 total_copied_files += 1
-                print("  ✓ Konfiguration gesichert")
-                backup_logger.info("Konfiguration 'e3dc.config.txt' gesichert.")
+                print(f"  ✓ e3dc_paths.json gesichert")
+                backup_logger.info("e3dc_paths.json gesichert.")
             except Exception as e:
-                print(f"  ⚠ Fehler beim Sichern der Konfiguration: {e}")
-                log_error("backup", f"Fehler beim Sichern der Konfiguration: {e}", e)
+                log_warning("backup", f"Konnte e3dc_paths.json nicht sichern: {e}")
 
         # Webportal-Dateien sichern
         wp_backup_dir = os.path.join(backup_dir, "webportal")
@@ -160,6 +174,55 @@ def backup_current_version():
                 total_copied_files += 1
             except Exception:
                 pass
+
+        # Installer-Konfiguration sichern
+        installer_config = os.path.join(os.path.dirname(__file__), "installer_config.json")
+        if os.path.exists(installer_config):
+            try:
+                shutil.copy2(installer_config, backup_dir)
+                backup_logger.info("installer_config.json gesichert.")
+                print("  ✓ Installer-Konfiguration gesichert")
+                total_copied_files += 1
+            except Exception as e:
+                log_warning("backup", f"Konnte installer_config.json nicht sichern: {e}")
+
+        # Watchdog-Skripte sichern (enthalten Token/Einstellungen)
+        wd_backup_dir = os.path.join(backup_dir, "watchdog")
+        watchdog_files = ["/usr/local/bin/boot_notify.sh", "/usr/local/bin/pi_guard.sh"]
+        wd_found = False
+        
+        for wd_file in watchdog_files:
+            if os.path.exists(wd_file):
+                if not wd_found:
+                    os.makedirs(wd_backup_dir, exist_ok=True)
+                    wd_found = True
+                try:
+                    shutil.copy2(wd_file, wd_backup_dir)
+                    total_copied_files += 1
+                    print(f"  ✓ {os.path.basename(wd_file)} gesichert")
+                    backup_logger.info(f"Watchdog-Datei gesichert: {wd_file}")
+                except Exception as e:
+                    print(f"  ⚠ Fehler beim Sichern von {wd_file}: {e}")
+                    log_warning("backup", f"Fehler beim Sichern von {wd_file}: {e}")
+
+        # Systemd Services sichern
+        service_backup_dir = os.path.join(backup_dir, "services")
+        service_files = ["/etc/systemd/system/e3dc.service", "/etc/systemd/system/piguard.service"]
+        srv_found = False
+        
+        for srv_file in service_files:
+            if os.path.exists(srv_file):
+                if not srv_found:
+                    os.makedirs(service_backup_dir, exist_ok=True)
+                    srv_found = True
+                try:
+                    shutil.copy2(srv_file, service_backup_dir)
+                    total_copied_files += 1
+                    print(f"  ✓ {os.path.basename(srv_file)} gesichert")
+                    backup_logger.info(f"Service-Datei gesichert: {srv_file}")
+                except Exception as e:
+                    print(f"  ⚠ Fehler beim Sichern von {srv_file}: {e}")
+                    log_warning("backup", f"Fehler beim Sichern von {srv_file}: {e}")
 
         # Rechte des Backups auf den Installationsbenutzer setzen
         try:
@@ -260,18 +323,99 @@ def restore_backup(backup_path):
                 print(f"  ✗ Fehler: {e}")
                 log_error("backup", f"Fehler beim Wiederherstellen des Hauptprogramms: {e}", e)
 
-        # Konfiguration wiederherstellen
-        cfg_backup = os.path.join(backup_path, "e3dc.config.txt")
-        if os.path.exists(cfg_backup):
+        # Konfigurationen wiederherstellen (Config, Strompreis, Diagramm)
+        config_files = ["e3dc.config.txt", "e3dc.strompreis.txt", "diagram_config.json"]
+        for cfg in config_files:
+            cfg_backup = os.path.join(backup_path, cfg)
+            if os.path.exists(cfg_backup):
+                try:
+                    cfg_dest = os.path.join(INSTALL_PATH, cfg)
+                    shutil.copy2(cfg_backup, cfg_dest)
+                    total_restored_files += 1
+                    print(f"  ✓ {cfg} wiederhergestellt")
+                    backup_logger.info(f"{cfg} wiederhergestellt.")
+                except Exception as e:
+                    print(f"  ✗ Fehler bei {cfg}: {e}")
+                    log_error("backup", f"Fehler beim Wiederherstellen von {cfg}: {e}", e)
+
+        # e3dc_paths.json wiederherstellen
+        paths_backup = os.path.join(backup_path, "e3dc_paths.json")
+        if os.path.exists(paths_backup):
             try:
-                cfg_dest = os.path.join(INSTALL_PATH, "e3dc.config.txt")
-                shutil.copy2(cfg_backup, cfg_dest)
+                shutil.copy2(paths_backup, "/var/www/html/e3dc_paths.json")
                 total_restored_files += 1
-                print("  ✓ Konfiguration wiederhergestellt")
-                backup_logger.info("Konfiguration wiederhergestellt.")
+                print("  ✓ e3dc_paths.json wiederhergestellt")
+                backup_logger.info("e3dc_paths.json wiederhergestellt.")
             except Exception as e:
-                print(f"  ✗ Fehler: {e}")
-                log_error("backup", f"Fehler beim Wiederherstellen der Konfiguration: {e}", e)
+                print(f"  ✗ Fehler bei e3dc_paths.json: {e}")
+                log_error("backup", f"Fehler bei e3dc_paths.json: {e}", e)
+
+        # Installer-Konfiguration wiederherstellen
+        inst_cfg_backup = os.path.join(backup_path, "installer_config.json")
+        if os.path.exists(inst_cfg_backup):
+            try:
+                # Ziel ist das Verzeichnis, in dem dieses Skript liegt
+                target_dir = os.path.dirname(os.path.abspath(__file__))
+                shutil.copy2(inst_cfg_backup, os.path.join(target_dir, "installer_config.json"))
+                total_restored_files += 1
+                print("  ✓ Installer-Konfiguration wiederhergestellt")
+                backup_logger.info("installer_config.json wiederhergestellt.")
+            except Exception as e:
+                print(f"  ✗ Fehler bei installer_config.json: {e}")
+                log_error("backup", f"Fehler bei installer_config.json: {e}", e)
+
+        # Systemd Services wiederherstellen
+        service_backup_dir = os.path.join(backup_path, "services")
+        if os.path.exists(service_backup_dir):
+            print("\n→ Systemd Services wiederherstellen…")
+            restored_srv = 0
+            for filename in os.listdir(service_backup_dir):
+                src = os.path.join(service_backup_dir, filename)
+                dest = os.path.join("/etc/systemd/system", filename)
+                try:
+                    shutil.copy2(src, dest)
+                    # Rechte korrigieren (root:root, 644)
+                    os.chown(dest, 0, 0)
+                    os.chmod(dest, 0o644)
+                    restored_srv += 1
+                    print(f"  ✓ {filename} wiederhergestellt")
+                except Exception as e:
+                    print(f"  ✗ Fehler bei {filename}: {e}")
+                    log_error("backup", f"Fehler bei Service-Restore {filename}: {e}", e)
+            
+            if restored_srv > 0:
+                backup_logger.info(f"{restored_srv} Service-Dateien wiederhergestellt.")
+                run_command("systemctl daemon-reload")
+                if os.path.exists(os.path.join(service_backup_dir, "e3dc.service")):
+                     run_command("systemctl enable e3dc")
+                if os.path.exists(os.path.join(service_backup_dir, "piguard.service")):
+                     run_command("systemctl enable piguard")
+
+        # Watchdog wiederherstellen
+        wd_backup_dir = os.path.join(backup_path, "watchdog")
+        if os.path.exists(wd_backup_dir):
+            print("\n→ Watchdog-Konfiguration wiederherstellen…")
+            restored_wd = 0
+            for filename in os.listdir(wd_backup_dir):
+                src = os.path.join(wd_backup_dir, filename)
+                dest = os.path.join("/usr/local/bin", filename)
+                try:
+                    shutil.copy2(src, dest)
+                    # Rechte korrigieren (root:root, 755)
+                    os.chown(dest, 0, 0)
+                    os.chmod(dest, 0o755)
+                    restored_wd += 1
+                    print(f"  ✓ {filename} wiederhergestellt")
+                except Exception as e:
+                    print(f"  ✗ Fehler bei {filename}: {e}")
+                    log_error("backup", f"Fehler bei Watchdog-Restore {filename}: {e}", e)
+            
+            if restored_wd > 0:
+                backup_logger.info(f"{restored_wd} Watchdog-Dateien wiederhergestellt.")
+                # Service neu starten
+                if os.path.exists("/etc/systemd/system/piguard.service"):
+                    run_command("systemctl restart piguard")
+                    print("  ✓ Watchdog-Service neu gestartet")
 
         # Webportal-Dateien wiederherstellen
         wp_backup_dir = os.path.join(backup_path, "webportal")
@@ -367,16 +511,21 @@ def delete_backup():
         return False
 
 
+def backup_full():
+    """Erstellt ein vollständiges Backup aller Komponenten."""
+    return backup_current_version()
+
+
 def backup_menu():
     """Menü für Backup-Verwaltung."""
     print("\n=== Backup-Verwaltung ===\n")
-    print("1 = Backup erstellen")
+    print("1 = Vollständiges Backup erstellen")
     print("2 = Backup wiederherstellen")
     print("3 = Backup löschen")
     choice = input("Auswahl: ").strip()
 
     if choice == "1":
-        backup_current_version()
+        backup_full()
     elif choice == "2":
         backup_path = choose_backup_version()
         if backup_path:

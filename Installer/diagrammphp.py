@@ -29,7 +29,8 @@ from .installer_config import (
     get_install_path,
     get_install_user,
     get_user_ids,
-    get_www_data_gid
+    get_www_data_gid,
+    load_config
 )
 from .logging_manager import get_or_create_logger, log_task_completed, log_error, log_warning
 from .permissions_helper import (
@@ -77,6 +78,15 @@ class DiagramInstaller:
         self.install_uid, _ = get_user_ids()
         self.www_data_gid = get_www_data_gid()
     
+    def get_python_executable(self):
+        """Ermittelt den Pfad zum Python-Interpreter (venv bevorzugt)."""
+        cfg = load_config()
+        venv_name = cfg.get("venv_name", ".venv_e3dc")
+        venv_python = os.path.join(self.install_path, venv_name, "bin", "python3") if venv_name else ""
+        if venv_name and os.path.exists(venv_python):
+            return venv_python
+        return "/usr/bin/python3"
+
     # ============================================================
     # SYSTEM-PRÜFUNGEN
     # ============================================================
@@ -90,10 +100,12 @@ class DiagramInstaller:
         print("Prüfe Python-Umgebung...")
         print("-" * 60)
         
+        python_exec = self.get_python_executable()
+        
         # Python Version prüfen
         try:
             result = subprocess.run(
-                ["python3", "--version"],
+                [python_exec, "--version"],
                 capture_output=True,
                 text=True
             )
@@ -108,7 +120,7 @@ class DiagramInstaller:
         # plotly prüfen (mindestens 5.0 erforderlich)
         try:
             result = subprocess.run(
-                ["python3", "-c", "import plotly; print(plotly.__version__)"],
+                [python_exec, "-c", "import plotly; print(plotly.__version__)"],
                 capture_output=True,
                 text=True
             )
@@ -138,19 +150,20 @@ class DiagramInstaller:
                     return True
 
                 print("⚠ plotly ist zu alt (mindestens 5.0 erforderlich)")
+                # Hinweis: Installation erfolgt jetzt über system.py im venv, hier nur Warnung
                 choice = input("\nPlotly auf >=5.0 aktualisieren? (j/n): ").strip().lower()
                 if choice == 'j':
                     print("\nAktualisiere plotly...")
                     try:
+                        pip_exec = os.path.join(os.path.dirname(python_exec), "pip")
                         subprocess.run(
-                            ["pip3", "install", "--upgrade", "plotly>=5.0"],
+                            ["sudo", "-u", self.install_user, pip_exec, "install", "--upgrade", "plotly>=5.0"],
                             check=True
                         )
                         print("✓ plotly erfolgreich aktualisiert")
                         return True
                     except subprocess.CalledProcessError:
                         print("❌ Update fehlgeschlagen")
-                        print("   Manuell: pip3 install --upgrade 'plotly>=5.0'")
                         log_error("diagramm", "pip3 upgrade für plotly fehlgeschlagen.")
                         return False
                 else:
@@ -166,15 +179,15 @@ class DiagramInstaller:
             if choice == 'j':
                 print("\nInstalliere plotly...")
                 try:
+                    pip_exec = os.path.join(os.path.dirname(python_exec), "pip")
                     subprocess.run(
-                        ["pip3", "install", "plotly>=5.0"],
+                        ["sudo", "-u", self.install_user, pip_exec, "install", "plotly>=5.0"],
                         check=True
                     )
                     print("✓ plotly erfolgreich installiert")
                     return True
                 except subprocess.CalledProcessError:
                     print("❌ Installation fehlgeschlagen")
-                    print("   Manuell: pip3 install 'plotly>=5.0'")
                     log_error("diagramm", "pip3 install für plotly fehlgeschlagen.")
                     return False
             else:
@@ -636,11 +649,12 @@ class DiagramInstaller:
             
             # Script-Pfad (monolithisches plot_soc_changes.py)
             plot_script = self.plot_script_path
+            python_exec = self.get_python_executable()
             awattar_data = os.path.join(self.install_path, "awattardebug.txt")
             cron_line_plot = ""
             if self.diagram_mode in ("auto", "hybrid"):
                 cron_schedule_plot = self._get_cron_schedule(self.auto_interval)
-                cron_line_plot = f"{cron_schedule_plot} /usr/bin/python3 {plot_script} {awattar_data} normal # {CRON_COMMENT}"
+                cron_line_plot = f"{cron_schedule_plot} {python_exec} {plot_script} {awattar_data} normal # {CRON_COMMENT}"
             
             # Cron-Linie für backup_history.php (täglich um Mitternacht)
             cron_schedule_backup = "0 0 * * *"
@@ -811,7 +825,7 @@ class DiagramInstaller:
     # Main Installation
     # ============================================================
     
-    def run_installation(self):
+    def run_installation(self, auto_config=None):
         """Führt komplette Installation durch"""
         self.print_header()
         
@@ -881,10 +895,20 @@ class DiagramInstaller:
         self.cleanup_old_modules()
 
         # 3) Features konfigurieren
-        self.select_diagram_features()
+        if auto_config and 'enable_heatpump' in auto_config:
+            self.enable_heatpump = auto_config['enable_heatpump']
+            print(f"\n✓ Wärmepumpe: {self.enable_heatpump} (Auto-Config)")
+            diagramm_logger.info(f"Diagramm-Features: Wärmepumpe={self.enable_heatpump} (Auto)")
+        else:
+            self.select_diagram_features()
         
         # 4) Diagramm-Modus
-        self.select_diagram_mode()
+        if auto_config and 'diagram_mode' in auto_config:
+            self.diagram_mode = auto_config['diagram_mode']
+            print(f"\n✓ Modus: {self.diagram_mode.upper()} (Auto-Config)")
+            diagramm_logger.info(f"Diagramm-Modus: {self.diagram_mode} (Auto)")
+        else:
+            self.select_diagram_mode()
 
         # 5) Crontab
         self.setup_crontab()
@@ -965,13 +989,13 @@ class DiagramInstaller:
 # INTEGRATIONS-FUNKTIONEN
 # ============================================================
 
-def install_diagramm():
+def install_diagramm(auto_config=None):
     """
     Wrapper-Funktion für die Integration in install_all.py
     Installiert und konfiguriert das Diagramm-System
     """
     installer = DiagramInstaller()
-    installer.run_installation()
+    installer.run_installation(auto_config=auto_config)
 
 
 # ============================================================

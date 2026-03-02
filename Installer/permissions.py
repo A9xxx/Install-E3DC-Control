@@ -7,7 +7,7 @@ import tempfile
 
 from .core import register_command
 from .utils import run_command, setup_logging
-from .installer_config import CONFIG_FILE, get_install_path, get_install_user, get_home_dir, get_www_data_gid
+from .installer_config import CONFIG_FILE, get_install_path, get_install_user, get_home_dir, get_www_data_gid, load_config
 from .logging_manager import get_or_create_logger, log_task_completed, log_error, log_warning
 
 INSTALL_USER = get_install_user()
@@ -106,6 +106,25 @@ def check_permissions():
         else:
             print(f"✓ {INSTALL_PATH} hat korrekte Rechte (755)")
             perm_logger.info(f"INSTALL_PATH Modus OK: 755")
+            
+        # VENV prüfen (falls vorhanden)
+        venv_name = load_config().get("venv_name", ".venv_e3dc")
+        venv_path = os.path.join(INSTALL_PATH, venv_name) if venv_name else ""
+        if venv_name and os.path.exists(venv_path):
+            st_venv = os.stat(venv_path)
+            owner_venv = pwd.getpwuid(st_venv.st_uid).pw_name
+            if owner_venv != INSTALL_USER:
+                print(f"✗ {venv_name} gehört {owner_venv} (soll: {INSTALL_USER})")
+                issues.append("venv_owner")
+            else:
+                print(f"✓ {venv_name} gehört {INSTALL_USER}")
+            
+            # Prüfen ob executables ausführbar sind
+            pip_bin = os.path.join(venv_path, "bin", "pip")
+            if os.path.exists(pip_bin) and not os.access(pip_bin, os.X_OK):
+                print(f"✗ {venv_name}/bin/pip ist nicht ausführbar")
+                issues.append("venv_mode")
+
     except Exception as e:
         print(f"✗ Fehler beim Prüfen: {e}")
         perm_logger.error(f"Fehler beim Prüfen von INSTALL_PATH: {e}")
@@ -204,6 +223,7 @@ FILE_DEFINITIONS = [
     {"path": f"{INSTALL_PATH}/e3dc.config.txt", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": f"{INSTALL_PATH}/e3dc.wallbox.txt", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": f"{INSTALL_PATH}/e3dc.strompreis.txt", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
+    {"path": f"{INSTALL_PATH}/diagram_config.json", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     # Ausführbare Python-Dateien
     {"path": f"{INSTALL_PATH}/plot_soc_changes.py", "mode": "755", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": True},
     {"path": f"{INSTALL_PATH}/plot_live_history.py", "mode": "755", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": True},
@@ -335,6 +355,24 @@ def fix_permissions(issues):
         result = run_command(f"sudo chmod -R 755 {INSTALL_PATH}")
         if result['success']:
             print(f"✓ {INSTALL_PATH}: Rechte auf 755 gesetzt")
+        else:
+            success = False
+    if "venv_owner" in issues:
+        venv_name = load_config().get("venv_name", ".venv_e3dc")
+        print(f"  → Setze Besitzer für {venv_name}: {INSTALL_USER}:{INSTALL_USER}")
+        venv_path = os.path.join(INSTALL_PATH, venv_name)
+        result = run_command(f"sudo chown -R {INSTALL_USER}:{INSTALL_USER} {venv_path}")
+        if result['success']:
+            print(f"✓ {venv_name} Besitzer korrigiert")
+        else:
+            success = False
+    if "venv_mode" in issues:
+        venv_name = load_config().get("venv_name", ".venv_e3dc")
+        print(f"  → Setze Rechte für {venv_name}/bin: +x")
+        venv_bin = os.path.join(INSTALL_PATH, venv_name, "bin")
+        result = run_command(f"sudo chmod -R +x {venv_bin}")
+        if result['success']:
+            print(f"✓ {venv_name} Executables korrigiert")
         else:
             success = False
     if "notdir" in issues:
@@ -558,7 +596,7 @@ def check_cronjobs():
         },
         {
             "name": "History-Backup",
-            "line": "0 0 * * * /usr/bin/php /var/www/html/backup_history.php > /dev/null 2>&1",
+            "line": "0 0 * * * /usr/bin/php /var/www/html/backup_history.php > /dev/null 2>&1 # E3DC-Control History Backup",
             "check_part": "/var/www/html/backup_history.php",
             "optional_if_exists": "/var/www/html/backup_history.php"
         },
@@ -777,7 +815,7 @@ def fix_services(issues):
             success = False
     return success
 
-def run_permissions_wizard():
+def run_permissions_wizard(headless=False):
     """Hauptlogik für Rechteprüfung und -korrektur."""
     # Als erstes: Bereinige root-eigene Dateien falls vorhanden
     cleanup_success = cleanup_root_owned_files()
@@ -800,12 +838,16 @@ def run_permissions_wizard():
 
     print("\n⚠ Probleme gefunden.")
     perm_logger.warning(f"⚠ Probleme erkannt: {len(issues)} Verz., {len(wp_issues)} Web, {len(file_issues)} Dateien, {len(cron_issues)} Cronjobs, {len(sudo_issues)} Sudoers, {len(service_issues)} Services")
-    choice = input("Automatisch korrigieren? (j/n): ").strip().lower()
-    if choice != "j":
-        print("✗ Korrektur übersprungen.\n")
-        perm_logger.warning("✗ Korrektur vom Benutzer übersprungen.")
-        log_warning("permissions", "Korrektur vom Benutzer übersprungen")
-        return
+    
+    if not headless:
+        choice = input("Automatisch korrigieren? (j/n): ").strip().lower()
+        if choice != "j":
+            print("✗ Korrektur übersprungen.\n")
+            perm_logger.warning("✗ Korrektur vom Benutzer übersprungen.")
+            log_warning("permissions", "Korrektur vom Benutzer übersprungen")
+            return
+    else:
+        print("→ Automatische Korrektur (Headless-Modus)...")
 
     all_success = True
     if issues:

@@ -17,7 +17,8 @@ from Installer.installer_config import (
     get_home_dir,
     get_user_ids,
     get_www_data_gid,
-    set_config_file_permissions
+    set_config_file_permissions,
+    get_install_path
 )
 from Installer.utils import setup_logging
 
@@ -252,6 +253,29 @@ def main():
 
         if not ensure_install_user():
             sys.exit(1)
+
+        # VENV Status Check
+        install_path = get_install_path()
+        config = load_config()
+        venv_name = config.get("venv_name", ".venv_e3dc")
+        venv_path = os.path.join(install_path, venv_name) if venv_name else ""
+        
+        GREEN = '\033[92m'
+        YELLOW = '\033[93m'
+        RESET = '\033[0m'
+        if venv_name and os.path.exists(venv_path):
+            print(f"{GREEN}✓ Python venv aktiv: {venv_path}{RESET}")
+            # Update e3dc_paths.json für PHP
+            try:
+                paths_file = "/var/www/html/e3dc_paths.json"
+                if os.path.exists(paths_file):
+                    import json
+                    with open(paths_file, 'r') as f: d = json.load(f)
+                    d['venv_name'] = venv_name
+                    with open(paths_file, 'w') as f: json.dump(d, f, indent=2)
+            except: pass
+        else:
+            print(f"{YELLOW}ℹ️  Kein Python venv gefunden (System-Python wird genutzt){RESET}")
 
         # Wenn im Unattended Mode, beenden wir das Script nach den Grund-Checks und Updates
         # Da das interaktive Menü in der Konsole hier keinen Sinn macht

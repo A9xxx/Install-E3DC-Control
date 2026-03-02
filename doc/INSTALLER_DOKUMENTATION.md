@@ -53,7 +53,7 @@ Dieses Skript ist für die Darstellung und Logik des interaktiven Hauptmenüs zu
 ### `install_all.py`
 Führt die komplette Neuinstallation in einer festen, logischen Reihenfolge durch:
 1.  Initiale Korrektur von Berechtigungen.
-2.  Installation von System-Abhängigkeiten (z.B. `apache2`, `php`, `build-essential`).
+2.  Installation von System-Abhängigkeiten und Einrichtung des **Python Virtual Environments** (`.venv_e3dc`).
 3.  Klonen des `E3DC-Control` Git-Repositorys und Kompilieren des C-Programms via `make`.
 4.  Einrichten des PHP-Webportals.
 5.  Erstellen der initialen Konfigurationsdateien (`e3dc.config.txt`, `e3dc.wallbox.txt`).
@@ -86,7 +86,7 @@ Verwaltet den Backup-Lebenszyklus:
 - **`config_wizard.py`:** Ein einfacher Assistent zur Bearbeitung der `e3dc.config.txt`, um Fehleingaben zu vermeiden.
 - **`installer_config.py`:** Verwaltet die Konfiguration des Installers selbst (z.B. den Namen des Installationsbenutzers), gespeichert in `installer_config.json`.
 - **`utils.py`:** Stellt Hilfsfunktionen wie `run_command` oder `replace_in_file` bereit, die von vielen Modulen genutzt werden.
-- **`system.py`:** Kümmert sich um die Installation von APT-Paketen.
+- **`system.py`:** Kümmert sich um die Installation von APT-Paketen und die Einrichtung der Python-Umgebung (venv).
 
 ## 5. Konfigurationsdateien
 

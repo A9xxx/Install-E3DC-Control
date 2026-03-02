@@ -3,7 +3,7 @@ import sys
 from .core import register_command
 from .utils import run_command
 from .logging_manager import get_or_create_logger, log_task_completed
-from .installer_config import get_install_user, get_install_path, load_config
+from .installer_config import get_install_user, get_install_path, load_config, get_home_dir
 
 status_logger = get_or_create_logger("status_check")
 
@@ -156,6 +156,7 @@ def show_system_status():
     # 4. Python Umgebung
     print("\n--- Python Umgebung ---")
     install_path = get_install_path()
+    home_dir = get_home_dir()
     config = load_config()
     venv_name = config.get("venv_name", ".venv_e3dc")
     
@@ -163,9 +164,15 @@ def show_system_status():
         print("Modus:             System-Python (global)")
     else:
         venv_full_path = os.path.join(install_path, venv_name)
+        venv_home_path = os.path.join(home_dir, venv_name)
+        
         if os.path.exists(venv_full_path):
             print(f"Modus:             Virtual Environment")
-            print(f"Pfad:              {venv_name}")
+            print(f"Pfad:              {venv_full_path}")
+            print(f"Status:            Aktiv")
+        elif os.path.exists(venv_home_path):
+            print(f"Modus:             Virtual Environment")
+            print(f"Pfad:              {venv_home_path}")
             print(f"Status:            Aktiv")
         else:
             print(f"Modus:             Virtual Environment (konfiguriert)")

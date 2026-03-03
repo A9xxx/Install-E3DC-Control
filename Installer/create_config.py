@@ -2,7 +2,7 @@ import os
 import shutil
 
 from .core import register_command
-from .installer_config import get_install_path, get_home_dir, get_user_ids, get_www_data_gid
+from .installer_config import get_install_path, get_home_dir, get_user_ids, get_www_data_gid, get_install_user
 from .logging_manager import get_or_create_logger, log_task_completed, log_error, log_warning
 
 INSTALL_PATH = get_install_path()

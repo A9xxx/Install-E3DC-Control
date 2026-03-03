@@ -158,6 +158,8 @@ def install_all_main():
             with open(paths_file, 'r') as f:
                 d = json.load(f)
             d['venv_name'] = venv_name
+            if use_venv and venv_name:
+                d['venv_path'] = os.path.join(get_home_dir(), venv_name)
             with open(paths_file, 'w') as f:
                 json.dump(d, f, indent=2)
     except: pass

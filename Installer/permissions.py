@@ -6,7 +6,7 @@ import logging
 import tempfile
 
 from .core import register_command
-from .utils import run_command, setup_logging
+from .utils import run_command
 from .installer_config import CONFIG_FILE, get_install_path, get_install_user, get_home_dir, get_www_data_gid, load_config
 from .logging_manager import get_or_create_logger, log_task_completed, log_error, log_warning
 
@@ -109,8 +109,14 @@ def check_permissions():
             
         # VENV prüfen (falls vorhanden)
         venv_name = load_config().get("venv_name", ".venv_e3dc")
-        venv_path = os.path.join(INSTALL_HOME, venv_name) if venv_name else ""
-        if venv_name and os.path.exists(venv_path):
+        venv_path = ""
+        if venv_name:
+            if os.path.exists(os.path.join(INSTALL_HOME, venv_name)):
+                venv_path = os.path.join(INSTALL_HOME, venv_name)
+            elif os.path.exists(os.path.join(INSTALL_PATH, venv_name)):
+                venv_path = os.path.join(INSTALL_PATH, venv_name)
+
+        if venv_name and venv_path:
             st_venv = os.stat(venv_path)
             owner_venv = pwd.getpwuid(st_venv.st_uid).pw_name
             if owner_venv != INSTALL_USER:
@@ -172,7 +178,6 @@ def check_webportal_permissions():
         # Sub-Ordner prüfen
         subfolders = [
             (f"{wp_path}/tmp", "777"),
-            (f"{wp_path}/icons", "775"),
             (f"{wp_path}/ramdisk", "775"),
             (f"{wp_path}/tmp/history_backups", "775")
         ]
@@ -360,7 +365,11 @@ def fix_permissions(issues):
     if "venv_owner" in issues:
         venv_name = load_config().get("venv_name", ".venv_e3dc")
         print(f"  → Setze Besitzer für {venv_name}: {INSTALL_USER}:{INSTALL_USER}")
+        # Pfad erneut ermitteln
         venv_path = os.path.join(INSTALL_HOME, venv_name)
+        if not os.path.exists(venv_path) and os.path.exists(os.path.join(INSTALL_PATH, venv_name)):
+            venv_path = os.path.join(INSTALL_PATH, venv_name)
+            
         result = run_command(f"sudo chown -R {INSTALL_USER}:{INSTALL_USER} {venv_path}")
         if result['success']:
             print(f"✓ {venv_name} Besitzer korrigiert")
@@ -369,7 +378,11 @@ def fix_permissions(issues):
     if "venv_mode" in issues:
         venv_name = load_config().get("venv_name", ".venv_e3dc")
         print(f"  → Setze Rechte für {venv_name}/bin: +x")
+        # Pfad erneut ermitteln
         venv_bin = os.path.join(INSTALL_HOME, venv_name, "bin")
+        if not os.path.exists(venv_bin) and os.path.exists(os.path.join(INSTALL_PATH, venv_name, "bin")):
+            venv_bin = os.path.join(INSTALL_PATH, venv_name, "bin")
+            
         result = run_command(f"sudo chmod -R +x {venv_bin}")
         if result['success']:
             print(f"✓ {venv_name} Executables korrigiert")
@@ -421,18 +434,11 @@ def fix_webportal_permissions(issues):
             print("✓ tmp-Rechte korrigiert")
         else:
             success = False
-    if "icons_missing" in issues:
-        print(f"  → Erstelle Icons-Verzeichnis: {wp_path}/icons")
-        result = run_command(f"sudo mkdir -p {wp_path}/icons")
+    if "tmp_owner" in issues:
+        print(f"  → Setze tmp-Besitzer rekursiv: {wp_path}/tmp -> {INSTALL_USER}:www-data")
+        result = run_command(f"sudo chown -R {INSTALL_USER}:www-data {wp_path}/tmp")
         if result['success']:
-            print("✓ icons-Ordner erstellt")
-        else:
-            success = False
-    if "icons_missing" in issues or "icons_mode" in issues:
-        print(f"  → Setze Icons-Rechte rekursiv: {wp_path}/icons -> 775")
-        result = run_command(f"sudo chmod -R 775 {wp_path}/icons")
-        if result['success']:
-            print("✓ icons-Rechte korrigiert")
+            print("✓ tmp-Besitzer korrigiert")
         else:
             success = False
     if "ramdisk_missing" in issues:
@@ -875,6 +881,123 @@ def fix_legacy_autostart(issues):
             
     return success
 
+    return success
+
+
+def check_and_set_config_defaults():
+    """Prüft, ob wichtige UI-bezogene Variablen in e3dc.config.txt vorhanden sind und fügt sie bei Bedarf hinzu."""
+    print("\n=== Konfigurations-Standardwerte-Prüfung ===\n")
+    perm_logger.info("--- Starte Prüfung der Konfigurations-Standardwerte ---")
+
+    install_path = get_install_path()
+    config_file = os.path.join(install_path, "e3dc.config.txt")
+
+    if not os.path.exists(config_file):
+        print(f"✗ Konfigurationsdatei {config_file} nicht gefunden. Prüfung übersprungen.")
+        perm_logger.warning(f"e3dc.config.txt nicht gefunden, Prüfung der Standardwerte übersprungen.")
+        return True # Kein Fehler, da die Datei vielleicht erst später erstellt wird.
+
+    defaults_to_check = {
+        "show_forecast": "0",
+        "wbcostpowers": "7.2, 11.0",
+        "darkmode": "1",
+        "pvatmosphere": "0.815",
+        "check_updates": "0"
+    }
+
+    try:
+        with open(config_file, "r", encoding="utf-8") as f:
+            content = f.read()
+        
+        existing_keys = {line.split('=', 1)[0].strip().lower() for line in content.splitlines() if '=' in line and not line.strip().startswith('#')}
+
+        missing_keys_to_add = []
+        for key, value in defaults_to_check.items():
+            if key.lower() not in existing_keys:
+                missing_keys_to_add.append(f"{key} = {value}")
+                print(f"✗ Variable '{key}' fehlt in e3dc.config.txt.")
+                perm_logger.warning(f"Variable '{key}' fehlt in e3dc.config.txt.")
+
+        if not missing_keys_to_add:
+            print("✓ Alle notwendigen UI-Konfigurationsvariablen sind vorhanden.\n")
+            perm_logger.info("Alle UI-Konfigurationsvariablen vorhanden.")
+            return True
+        else:
+            print("\n→ Füge fehlende Variablen am Ende der Datei hinzu...")
+            if not content.endswith('\n'):
+                content += '\n'
+            content += "\n# --- Automatisch hinzugefügte UI-Parameter ---\n"
+            content += "\n".join(missing_keys_to_add) + "\n"
+            with open(config_file, "w", encoding="utf-8") as f:
+                f.write(content)
+            print("\n✓ Konfigurationsdatei aktualisiert.\n")
+            return True
+    except Exception as e:
+        print(f"✗ Fehler beim Lesen oder Schreiben von {config_file}: {e}")
+        perm_logger.error(f"Fehler beim Prüfen/Setzen der Config-Defaults: {e}")
+        return False
+
+def check_config_duplicates():
+    """Prüft e3dc.config.txt auf doppelte Einträge (case-insensitive) und entfernt Duplikate (behält das erste)."""
+    print("\n=== Konfigurations-Duplikat-Prüfung ===\n")
+    perm_logger.info("--- Starte Prüfung auf Konfigurations-Duplikate ---")
+
+    install_path = get_install_path()
+    config_file = os.path.join(install_path, "e3dc.config.txt")
+
+    if not os.path.exists(config_file):
+        print(f"✓ Konfigurationsdatei {config_file} nicht gefunden. Übersprungen.")
+        return True
+
+    try:
+        with open(config_file, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+
+        seen_keys = set()
+        new_lines = []
+        duplicates_found = False
+        removed_count = 0
+
+        for line in lines:
+            stripped = line.strip()
+            # Kommentare und Leerzeilen behalten
+            if not stripped or stripped.startswith("#"):
+                new_lines.append(line)
+                continue
+            
+            if "=" in stripped:
+                parts = stripped.split("=", 1)
+                key = parts[0].strip().lower()
+                
+                if key in seen_keys:
+                    print(f"  ✗ Duplikat gefunden und entfernt: {parts[0].strip()} (Zeile: {stripped})")
+                    perm_logger.warning(f"Duplikat entfernt: {parts[0].strip()}")
+                    duplicates_found = True
+                    removed_count += 1
+                    continue # Zeile überspringen (löschen)
+                else:
+                    seen_keys.add(key)
+                    new_lines.append(line)
+            else:
+                new_lines.append(line)
+
+        if duplicates_found:
+            print(f"\n→ Entferne {removed_count} Duplikate (behalte jeweils das erste)...")
+            with open(config_file, "w", encoding="utf-8") as f:
+                f.writelines(new_lines)
+            print("✓ Konfigurationsdatei bereinigt.\n")
+            perm_logger.info(f"Konfigurationsdatei bereinigt, {removed_count} Duplikate entfernt.")
+            return True
+        else:
+            print("✓ Keine Duplikate gefunden.\n")
+            perm_logger.info("Keine Duplikate in Konfiguration gefunden.")
+            return True
+
+    except Exception as e:
+        print(f"✗ Fehler bei der Duplikat-Prüfung: {e}")
+        perm_logger.error(f"Fehler bei Duplikat-Prüfung: {e}")
+        return False
+
 def run_permissions_wizard(headless=False):
     """Hauptlogik für Rechteprüfung und -korrektur."""
     # Als erstes: Bereinige root-eigene Dateien falls vorhanden
@@ -882,6 +1005,16 @@ def run_permissions_wizard(headless=False):
     if not cleanup_success:
         print("⚠ Warnung: Cleanup von root-Dateien hatte Fehler")
         log_warning("permissions", "Cleanup von root-Dateien hatte Fehler")
+
+    # NEU: Auf Duplikate prüfen und bereinigen (bevor Defaults geprüft werden)
+    check_config_duplicates()
+
+    # NEU: Standardwerte in der Konfiguration prüfen und setzen
+    config_defaults_success = check_and_set_config_defaults()
+    if not config_defaults_success:
+        print("⚠ Warnung: Prüfung der Konfigurations-Standardwerte hatte Fehler")
+        log_warning("permissions", "Prüfung der Konfigurations-Standardwerte hatte Fehler")
+
     issues = check_permissions()
     wp_issues = check_webportal_permissions()
     file_issues = check_file_permissions()

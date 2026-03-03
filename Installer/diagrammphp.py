@@ -83,7 +83,7 @@ class DiagramInstaller:
         """Ermittelt den Pfad zum Python-Interpreter (venv bevorzugt)."""
         cfg = load_config()
         venv_name = cfg.get("venv_name", ".venv_e3dc")
-        venv_python = os.path.join(get_home_dir(), venv_name, "bin", "python3") if venv_name else ""
+        venv_python = os.path.join(get_home_dir(self.install_user), venv_name, "bin", "python3") if venv_name else ""
         if venv_name and os.path.exists(venv_python):
             return venv_python
         return "/usr/bin/python3"

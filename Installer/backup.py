@@ -8,7 +8,7 @@ from .logging_manager import get_or_create_logger, log_task_completed, log_error
 from .utils import run_command
 
 INSTALL_PATH = get_install_path()
-WEBPORTAL_EXTENSIONS = {".php", ".css", ".js", ".json"}
+WEBPORTAL_EXTENSIONS = {".php", ".css", ".js", ".json", ".png", ".ico", ".svg"}
 E3DC_CONTROL_EXTRA_EXTENSIONS = {".dat", ".json", ".py"}
 
 backup_logger = get_or_create_logger("backup")
@@ -125,18 +125,6 @@ def backup_current_version():
                 print(f"  ⚠ Fehler beim Sichern der Webportal-Dateien: {e}")
                 log_error("backup", f"Fehler beim Sichern der Webportal-Dateien: {e}", e)
         
-        # Icons sichern
-        icons_src = "/var/www/html/icons"
-        if os.path.exists(icons_src):
-            try:
-                icons_count = _count_files_recursive(icons_src)
-                shutil.copytree(icons_src, os.path.join(wp_backup_dir, "icons"), dirs_exist_ok=True)
-                total_copied_files += icons_count
-                backup_logger.info(f"{icons_count} Icons gesichert.")
-            except Exception as e:
-                print(f"  ⚠ Fehler beim Sichern der Icons: {e}")
-                log_error("backup", f"Fehler beim Sichern der Icons: {e}", e)
-
         # E3DC-Control-Zusatzdateien sichern
         e3dc_source_dir = INSTALL_PATH
         e3dc_extra_backup_dir = os.path.join(backup_dir, "e3dc-control-extra")

@@ -9,7 +9,7 @@ from .logging_manager import get_or_create_logger, log_task_completed, log_error
 
 INSTALL_PATH = get_install_path()
 RAMDISK_PATH = "/var/www/html/ramdisk"
-GRABBER_SCRIPT = os.path.join(get_home_dir(), "get_live.sh")
+GRABBER_SCRIPT = os.path.join(get_home_dir(get_install_user()), "get_live.sh")
 FSTAB_PATH = "/etc/fstab"
 CRON_COMMENT = "E3DC Live Grabber"
 ramdisk_logger = get_or_create_logger("ramdisk")

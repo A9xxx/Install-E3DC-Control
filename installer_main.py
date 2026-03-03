@@ -257,23 +257,44 @@ def main():
         # VENV Status Check
         install_path = get_install_path()
         config = load_config()
+        home_dir = get_home_dir(config.get("install_user"))
         venv_name = config.get("venv_name", ".venv_e3dc")
-        venv_path = os.path.join(install_path, venv_name) if venv_name else ""
+        
+        venv_path = ""
+        if venv_name:
+            # Prüfe Home-Verzeichnis (Standard) und Install-Verzeichnis (Legacy)
+            if os.path.exists(os.path.join(home_dir, venv_name)):
+                venv_path = os.path.join(home_dir, venv_name)
+            elif os.path.exists(os.path.join(install_path, venv_name)):
+                venv_path = os.path.join(install_path, venv_name)
         
         GREEN = '\033[92m'
         YELLOW = '\033[93m'
         RESET = '\033[0m'
-        if venv_name and os.path.exists(venv_path):
+        if venv_name and venv_path:
             print(f"{GREEN}✓ Python venv aktiv: {venv_path}{RESET}")
             # Update e3dc_paths.json für PHP
             try:
                 paths_file = "/var/www/html/e3dc_paths.json"
+                if not os.path.exists(paths_file):
+                    ensure_web_config(config.get("install_user"))
+
                 if os.path.exists(paths_file):
                     import json
                     with open(paths_file, 'r') as f: d = json.load(f)
                     d['venv_name'] = venv_name
+                    d['venv_path'] = venv_path
                     with open(paths_file, 'w') as f: json.dump(d, f, indent=2)
-            except: pass
+                    
+                    # Rechte korrigieren
+                    try:
+                        uid, _ = get_user_ids(config.get("install_user"))
+                        gid = get_www_data_gid()
+                        os.chown(paths_file, uid, gid)
+                        os.chmod(paths_file, 0o664)
+                    except: pass
+            except Exception as e:
+                print(f"⚠ Fehler beim Aktualisieren von e3dc_paths.json: {e}")
         else:
             print(f"{YELLOW}ℹ️  Kein Python venv gefunden (System-Python wird genutzt){RESET}")
 

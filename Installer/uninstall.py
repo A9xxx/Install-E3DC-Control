@@ -92,7 +92,7 @@ def uninstall_ramdisk():
         print(f"  ⚠ Fehler bei fstab: {e}")
 
     # Skript löschen
-    grabber_script = os.path.join(get_home_dir(), "get_live.sh")
+    grabber_script = os.path.join(get_home_dir(install_user), "get_live.sh")
     if os.path.exists(grabber_script):
         os.remove(grabber_script)
         print("  ✓ get_live.sh gelöscht")

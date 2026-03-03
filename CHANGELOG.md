@@ -1,5 +1,20 @@
 # Changelog
 
+## [2026.03.03] - PWA & Caching Optimierung
+
+### 📱 PWA (Progressive Web App)
+*   **Separate Manifeste:** Desktop (`manifest.json`) und Mobile (`manifest_mobile.json`) nutzen nun eigene Konfigurationen, um die korrekte Startseite (`index.php` bzw. `mobile.php`) beim "Add to Homescreen" zu garantieren.
+*   **Icon-Caching Fix:** App-Icons wurden in das Hauptverzeichnis verschoben und umbenannt (`app-icon-*.png`), um hartnäckige Cloudflare-Caching-Probleme zu umgehen und die Installation zuverlässig zu ermöglichen.
+*   **Service Worker:** Grundlegende Integration (`sw.js`) hinzugefügt, um die PWA-Installationskriterien moderner Browser zu erfüllen.
+
+### 🔧 System & Konfiguration
+*   **Wurzelzähler-Support:** Berücksichtigung der Variable `wurzelzaehler` (0, 3, 6) für das korrekte Auslesen der Netz-Phasenwerte in der Live-Ansicht.
+*   **Config-Bereinigung:** Automatische Erkennung und Entfernung von doppelten Variablen (Case-Insensitive) in der `e3dc.config.txt` durch die Rechteprüfung. Der Editor verhindert nun auch das Anlegen von Duplikaten.
+*   **Venv-Sicherheit:** Das Python Virtual Environment wird bei Neuinstallationen (git clone) nun temporär gesichert und wiederhergestellt, um Datenverlust zu vermeiden. Der Pfad wird explizit in `e3dc_paths.json` gespeichert.
+*   **Diagramm-Stabilität:** Verbesserte Prozess-Steuerung (Lockfile-Handling) für das Live-Diagramm, um Hänger beim Theme-Wechsel zu vermeiden.
+*   **Sudo-Kompatibilität:** Korrektur der Pfad-Ermittlung in allen Installer-Skripten. Das Virtual Environment und Konfigurationsdateien werden nun auch bei Ausführung mit `sudo` korrekt im Benutzerverzeichnis (`/home/pi`) statt in `/root` gesucht.
+*   **Web-Config Fix:** `installer_main.py` erzwingt nun das Anlegen der `e3dc_paths.json` mit korrekten Berechtigungen (`www-data`), falls diese fehlt. Dies behebt Probleme, bei denen PHP das venv nicht finden konnte.
+
 ## [2026.03.02] - Mobile UI & Chart-Optimierung
 
 ### � Interaktive Diagramme & Details

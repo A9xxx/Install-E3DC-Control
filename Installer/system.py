@@ -1,6 +1,7 @@
 import os
 import shutil
 import subprocess
+import tempfile
 
 from .core import register_command
 from .utils import apt_install, pip_install, run_command, command_exists
@@ -22,7 +23,7 @@ def setup_venv(show_header=False):
     
     install_user = get_install_user()
     venv_name = get_venv_name() or ".venv_e3dc"
-    venv_path = os.path.join(get_home_dir(), venv_name)
+    venv_path = os.path.join(get_home_dir(install_user), venv_name)
 
     # Altes venv im E3DC-Control Ordner bereinigen (Migration)
     old_venv_path = os.path.join(INSTALL_PATH, venv_name)
@@ -85,7 +86,7 @@ def list_venv_packages():
     
     install_user = get_install_user()
     venv_name = get_venv_name() or ".venv_e3dc"
-    venv_pip = os.path.join(get_home_dir(), venv_name, "bin", "pip")
+    venv_pip = os.path.join(get_home_dir(install_user), venv_name, "bin", "pip")
     
     if not os.path.exists(venv_pip):
         print("✗ Kein venv gefunden.")
@@ -162,6 +163,21 @@ def install_e3dc_control():
             print("→ Stoppe E3DC-Control Service…")
             run_command("sudo systemctl stop e3dc")
             service_was_stopped = True
+        
+        # VENV RETTUNG: Prüfen ob venv im Ordner liegt und sichern
+        venv_name = get_venv_name()
+        temp_venv_backup = None
+        if venv_name:
+            possible_venv = os.path.join(INSTALL_PATH, venv_name)
+            if os.path.exists(possible_venv) and os.path.isdir(possible_venv):
+                print(f"  ℹ️  Sichere venv vor dem Löschen: {possible_venv}")
+                try:
+                    temp_venv_backup = os.path.join(tempfile.gettempdir(), f"{venv_name}_backup_{os.getpid()}")
+                    if os.path.exists(temp_venv_backup):
+                        shutil.rmtree(temp_venv_backup)
+                    shutil.move(possible_venv, temp_venv_backup)
+                except Exception as e:
+                    print(f"  ⚠ Konnte venv nicht sichern: {e}")
             
         print("→ Entferne altes Verzeichnis…")
         try:
@@ -184,6 +200,21 @@ def install_e3dc_control():
         log_error("system", f"Git Clone fehlgeschlagen: {result['stderr']}")
         return False
     system_logger.info("Repository erfolgreich geklont.")
+
+    # VENV WIEDERHERSTELLUNG
+    if temp_venv_backup and os.path.exists(temp_venv_backup):
+        target_venv = os.path.join(INSTALL_PATH, venv_name)
+        print(f"→ Stelle venv wieder her: {target_venv}")
+        try:
+            if os.path.exists(target_venv):
+                shutil.rmtree(target_venv)
+            shutil.move(temp_venv_backup, target_venv)
+            
+            # Rechte sicherstellen (install_user)
+            run_command(f"chown -R {install_user}:{install_user} {target_venv}")
+        except Exception as e:
+            print(f"  ⚠ Konnte venv nicht wiederherstellen: {e}")
+            log_error("system", f"Konnte venv nicht wiederherstellen: {e}", e)
 
     print("→ Kompiliere…")
     # Venv nutzen falls vorhanden

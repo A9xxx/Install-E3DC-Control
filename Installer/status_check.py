@@ -156,7 +156,7 @@ def show_system_status():
     # 4. Python Umgebung
     print("\n--- Python Umgebung ---")
     install_path = get_install_path()
-    home_dir = get_home_dir()
+    home_dir = get_home_dir(get_install_user())
     config = load_config()
     venv_name = config.get("venv_name", ".venv_e3dc")
     
@@ -166,13 +166,13 @@ def show_system_status():
         venv_full_path = os.path.join(install_path, venv_name)
         venv_home_path = os.path.join(home_dir, venv_name)
         
-        if os.path.exists(venv_full_path):
-            print(f"Modus:             Virtual Environment")
-            print(f"Pfad:              {venv_full_path}")
-            print(f"Status:            Aktiv")
-        elif os.path.exists(venv_home_path):
+        if os.path.exists(venv_home_path):
             print(f"Modus:             Virtual Environment")
             print(f"Pfad:              {venv_home_path}")
+            print(f"Status:            Aktiv")
+        elif os.path.exists(venv_full_path):
+            print(f"Modus:             Virtual Environment (Legacy)")
+            print(f"Pfad:              {venv_full_path}")
             print(f"Status:            Aktiv")
         else:
             print(f"Modus:             Virtual Environment (konfiguriert)")

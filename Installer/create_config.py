@@ -27,7 +27,7 @@ def copy_existing_config():
     print("\n--- Vorhandene Konfiguration kopieren ---\n")
     config_logger.info("Versuche, eine vorhandene Konfiguration zu kopieren.")
     
-    default_source = os.path.join(get_home_dir(), "Install", "e3dc.config.txt")
+    default_source = os.path.join(get_home_dir(get_install_user()), "Install", "e3dc.config.txt")
     source_path = ask("Pfad zur vorhandenen e3dc.config.txt", default_source)
     
     if not os.path.exists(source_path):

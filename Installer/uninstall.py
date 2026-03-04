@@ -70,6 +70,14 @@ def uninstall_ramdisk():
     print("\n→ Entferne RAM-Disk & Live-Status…")
     install_user = get_install_user()
 
+    # Service stoppen und entfernen
+    run_command("sudo systemctl stop e3dc-grabber", timeout=10)
+    run_command("sudo systemctl disable e3dc-grabber", timeout=10)
+    if os.path.exists("/etc/systemd/system/e3dc-grabber.service"):
+        os.remove("/etc/systemd/system/e3dc-grabber.service")
+        run_command("sudo systemctl daemon-reload")
+        print("  ✓ Service 'e3dc-grabber' entfernt")
+
     # Screen/Prozesse killen
     run_command(f"sudo -u {install_user} screen -S live-grabber -X quit", timeout=5)
     run_command(f"sudo -u {install_user} pkill -f get_live.sh", timeout=5)

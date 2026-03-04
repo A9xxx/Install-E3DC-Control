@@ -84,7 +84,7 @@ if [ -z "$1" ]; then
         CLEAN_REASON=$(echo "$REASON" | sed 's/.*PIGUARD: //')
         MSG=$(printf "⚠️ $DEVICE_NAME REBOOT erfolgt!\\n📍 IP: $IP_ADDR\\n❌ Grund: $CLEAN_REASON")
     fi
-elif [ "$1" == "DAILY" ]; then
+elif [ "$1" == "status" ]; then
     UPTIME=$(uptime -p)
     TEMP=$(vcgencmd measure_temp | cut -d'=' -f2)
     MSG=$(printf "✅ Status: $DEVICE_NAME Online.\\n📍 IP: $IP_ADDR\\n⏱ Laufzeit: $UPTIME\\n🌡 Temp: $TEMP")
@@ -286,7 +286,7 @@ def update_cronjobs(daily_enabled=True, daily_hour=12):
         reboot_job = "@reboot sleep 45 && /usr/local/bin/boot_notify.sh"
         
         # Daily Job (optional)
-        daily_job = f"0 {daily_hour} * * * /usr/local/bin/boot_notify.sh DAILY"
+        daily_job = f"0 {daily_hour} * * * /usr/local/bin/boot_notify.sh status"
         
         # Aktuelle Crontab lesen
         res = run_command(f"sudo crontab -u {install_user} -l")
@@ -428,6 +428,16 @@ def setup_watchdog_menu():
         print("Starte PIGUARD Service neu...")
         subprocess.run(["sudo", "systemctl", "restart", "piguard.service"])
         
+        # Cleanup: Entferne fehlerhafte Dateien aus alten Versionen (=5.0)
+        user_home = f"/home/{get_install_user()}"
+        bad_files = [os.path.join(user_home, "=5.0"), os.path.join(user_home, "5.0")]
+        for bf in bad_files:
+            if os.path.exists(bf):
+                try:
+                    os.remove(bf)
+                    print(f"✓ Alte Fehler-Datei entfernt: {bf}")
+                except: pass
+
         print("\n--- INSTALLATION ABGESCHLOSSEN ---")
         print("Bitte starte den Pi einmal neu, um alle Änderungen zu aktivieren.")
 

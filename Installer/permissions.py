@@ -607,12 +607,6 @@ def check_cronjobs():
             "optional_if_exists": "/var/www/html/backup_history.php"
         },
         {
-            "name": "Live-Grabber Autostart",
-            "line": f"@reboot /usr/bin/screen -dmS live-grabber {INSTALL_HOME}/get_live.sh",
-            "check_part": "screen -dmS live-grabber",
-            "optional_if_exists": f"{INSTALL_HOME}/get_live.sh"
-        },
-        {
             "name": "Boot-Benachrichtigung",
             "line": "@reboot sleep 45 && /usr/local/bin/boot_notify.sh",
             "check_part": "sleep 45 && /usr/local/bin/boot_notify.sh",
@@ -620,8 +614,8 @@ def check_cronjobs():
         },
         {
             "name": "Täglicher Statusbericht",
-            "line": "0 12 * * * /usr/local/bin/boot_notify.sh DAILY",
-            "check_part": "/usr/local/bin/boot_notify.sh DAILY",
+            "line": "0 12 * * * /usr/local/bin/boot_notify.sh status",
+            "check_part": "/usr/local/bin/boot_notify.sh status",
             "optional_if_exists": "/usr/local/bin/boot_notify.sh"
         }
     ]
@@ -794,6 +788,10 @@ def check_services():
     # Piguard (Watchdog) - Nur prüfen, wenn das Skript existiert (also installiert wurde)
     if os.path.exists("/usr/local/bin/pi_guard.sh"):
         services_to_check.append("piguard")
+
+    # Live-Grabber Service
+    if os.path.exists("/etc/systemd/system/e3dc-grabber.service"):
+        services_to_check.append("e3dc-grabber")
 
     for srv in services_to_check:
         # Check status

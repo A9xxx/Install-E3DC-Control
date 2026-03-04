@@ -1,6 +1,16 @@
 # Changelog
 
-## [2026.03.04] - Installer-Robustheit & Portabilität
+## [2026.03.04] - Wallbox-Status, Diagramm-Details & Installer-Fixes
+
+### 🔌 Wallbox & UI
+*   **Status-Visualisierung:** Die Wallbox-Kachel zeigt nun an, ob das Auto verriegelt ist (Schloss-Icon) und in welchem Modus (WBMode) geladen wird.
+*   **Phasen-Erkennung:** Automatische Ermittlung und Anzeige der aktiven Phasenanzahl (1-ph / 3-ph) beim Laden.
+*   **Sperr-Status:** Ein gelbes Auto-Icon signalisiert nun "Angesteckt & Verriegelt", auch wenn gerade nicht geladen wird.
+   **Bugfix:** Korrektur der Farbumschaltung (Gelb -> Blau) beim Start des Ladevorgangs in der Wallbox-Kachel.
+
+### 📊 Diagramm & Details
+*   **Erweiterte Details:** Beim Klick auf die Netz-Kachel (Desktop & Mobile) wird nun zusätzlich zu den Einzelphasen auch die Gesamtleistung von Netz und Wechselrichter (WR) angezeigt.
+*   **Live-Diagramm:** Im Netz-Detail-Diagramm (`plot_live_history.py`) werden nun zwei neue Linien gezeichnet: "Netz Gesamt" und "WR Gesamt" (gestrichelt), um die Summenleistung besser zu visualisieren.
 
 ### 🔧 Installer & Updates
 *   **Portabilität:** Der Installer und das Update-System (`self_update.py`) unterstützen nun beliebige Installationsverzeichnisse (z.B. Git-Clones). Updates werden immer im aktuellen Verzeichnis ausgeführt, statt stur `~/Install` zu erzwingen.
@@ -8,6 +18,14 @@
 *   **Sudo-Rechte:** Die Einrichtung der Web-Rechte (`permissions.py`, `diagrammphp.py`) wurde erweitert. Es werden nun zuverlässig beide Sudoers-Dateien (`010_e3dc_web_update` und `010_e3dc_web_git`) erstellt und mit dem korrekten, dynamischen Pfad zum Installer verknüpft.
 *   **Bugfix:** Ein `UnboundLocalError` in `system.py` bei Neuinstallationen (wenn kein Backup vorhanden war) wurde behoben.
 *   **Transparenz:** Der Installer zeigt beim Start nun explizit das Arbeitsverzeichnis und die geladene Konfigurationsdatei an.
+
+### ⚙️ System & Stabilität
+*   **Live-Grabber Service:** Umstellung des `get_live.sh` Skripts auf einen echten Systemd-Service (`e3dc-grabber`). Dies erhöht die Stabilität gegenüber der alten Screen-Lösung.
+*   **Anti-Spike Logik:** Doppelte Absicherung gegen fehlerhafte "0"-Werte in Diagrammen:
+    1.  **Atomares Schreiben:** Der Grabber nutzt nun `mv` für atomare Datei-Updates in der RAM-Disk.
+    2.  **PHP-Validierung:** `get_live_json.php` filtert ungültige Lesevorgänge aktiv aus, bevor sie in die Historie gelangen.
+*   **Watchdog-Cleanup:** Optimierung des Crontab-Eintrags für den täglichen Bericht (Parameter `status`), um Dateisystem-Fehler (`=5.0` Datei) zu beheben.
+*   **Deinstallation:** Die Routine entfernt nun auch den neuen Grabber-Service sauber.
 
 ## [2026.03.03] - PWA & Caching Optimierung
 

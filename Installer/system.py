@@ -11,7 +11,7 @@ from .logging_manager import get_or_create_logger, log_task_completed, log_error
 INSTALL_PATH = get_install_path()
 system_logger = get_or_create_logger("system")
 
-PYTHON_PACKAGES = ["plotly>=5.0", "pandas-stubs", "pandas", "pytz", "matplotlib", "paho-mqtt", "requests"]
+PYTHON_PACKAGES = ["plotly>=5.0", "pandas-stubs", "pandas", "pytz", "matplotlib", "paho-mqtt", "requests", "pymodbus"]
 
 def get_venv_name():
     return load_config().get("venv_name", ".venv_e3dc")

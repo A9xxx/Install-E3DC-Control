@@ -12,12 +12,17 @@ RAMDISK_PATH = "/var/www/html/ramdisk"
 GRABBER_SCRIPT = os.path.join(get_home_dir(get_install_user()), "get_live.sh")
 FSTAB_PATH = "/etc/fstab"
 CRON_COMMENT = "E3DC Live Grabber"
+SERVICE_NAME = "e3dc-grabber"
+SERVICE_PATH = f"/etc/systemd/system/{SERVICE_NAME}.service"
 ramdisk_logger = get_or_create_logger("ramdisk")
 
 def setup_ramdisk():
     """Richtet die RAM-Disk und den Live-Grabber ein."""
     print("\n=== Live-Status & RAM-Disk Setup ===\n")
     ramdisk_logger.info("Starte RAM-Disk und Live-Grabber Setup.")
+
+    # Service vor der Einrichtung stoppen, um Konflikte zu vermeiden
+    run_command(f"sudo systemctl stop {SERVICE_NAME}")
 
     install_user = get_install_user()
     
@@ -80,26 +85,57 @@ def setup_ramdisk():
     script_content = f"""#!/bin/bash
 # {CRON_COMMENT}
 while true; do
-  /usr/bin/screen -S E3DC -X hardcopy {RAMDISK_PATH}/live.txt
+  /usr/bin/screen -S E3DC -X hardcopy {RAMDISK_PATH}/live.tmp
+  if [ -f {RAMDISK_PATH}/live.tmp ]; then
+      mv {RAMDISK_PATH}/live.tmp {RAMDISK_PATH}/live.txt
+  fi
   sleep 4
 done
 """
     try:
         with open(GRABBER_SCRIPT, "w") as f:
             f.write(script_content)
-        
-        run_command(f"sudo chown {install_user}:{install_user} {GRABBER_SCRIPT}")
-        run_command(f"sudo chmod +x {GRABBER_SCRIPT}")
+
+        run_command(f"sudo chown {install_user}:www-data {GRABBER_SCRIPT}")
+        run_command(f"sudo chmod 755 {GRABBER_SCRIPT}")
         print("  ✓ Skript erstellt und ausführbar gemacht")
         ramdisk_logger.info(f"Grabber-Skript erstellt: {GRABBER_SCRIPT}")
     except Exception as e:
         print(f"  ✗ Fehler beim Erstellen des Skripts: {e}")
         log_error("ramdisk", f"Fehler beim Erstellen des Grabber-Skripts: {e}", e)
 
-    # 5. Autostart via Crontab (für install_user)
-    print(f"→ Erstelle Crontab-Einträge…")
+    # 5. Systemd Service erstellen (ersetzt alten Cronjob)
+    print(f"→ Erstelle Systemd Service ({SERVICE_NAME})…")
+    service_content = f"""[Unit]
+Description=E3DC Live Data Grabber
+After=network.target
+
+[Service]
+Type=simple
+User={install_user}
+Group=www-data
+ExecStart={GRABBER_SCRIPT}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+"""
+    try:
+        with open("e3dc-grabber.service", "w") as f:
+            f.write(service_content)
+        run_command(f"sudo mv e3dc-grabber.service {SERVICE_PATH}")
+        run_command(f"sudo chmod 644 {SERVICE_PATH}")
+        run_command("sudo systemctl daemon-reload")
+        run_command(f"sudo systemctl enable {SERVICE_NAME}")
+        print("  ✓ Service erstellt und aktiviert")
+        ramdisk_logger.info(f"Service {SERVICE_NAME} erstellt.")
+    except Exception as e:
+        print(f"  ✗ Fehler beim Erstellen des Services: {e}")
+        log_error("ramdisk", f"Fehler Service: {e}", e)
     
-    grabber_cron = f"@reboot /usr/bin/screen -dmS live-grabber {GRABBER_SCRIPT}"
+    # 6. Crontab bereinigen (Alten Grabber entfernen, History Writer behalten)
+    print(f"→ Aktualisiere Crontab (entferne alten Screen-Job)…")
     history_cron = "* * * * * cd /var/www/html && /usr/bin/php get_live_json.php > /dev/null 2>&1"
     
     try:
@@ -110,13 +146,14 @@ done
         new_cron = existing_cron
         modified = False
         
-        if GRABBER_SCRIPT not in existing_cron:
-            new_cron = new_cron.strip() + f"\n{grabber_cron}\n"
+        # Entferne alten Grabber-Eintrag falls vorhanden
+        if "get_live.sh" in new_cron and "screen" in new_cron:
+            # Wir bauen die Crontab neu auf, ohne die Grabber-Zeile
+            lines = new_cron.splitlines()
+            new_lines = [line for line in lines if not ("get_live.sh" in line and "screen" in line)]
+            new_cron = "\n".join(new_lines)
             modified = True
-            print("  ✓ Live-Grabber Autostart hinzugefügt")
-            ramdisk_logger.info("Live-Grabber Autostart zum Cronjob hinzugefügt.")
-        else:
-            print("  ✓ Live-Grabber Autostart bereits vorhanden")
+            print("  ✓ Alter Live-Grabber Cronjob entfernt")
 
         if "get_live_json.php" not in existing_cron:
             new_cron = new_cron.strip() + f"\n{history_cron}\n"
@@ -144,13 +181,13 @@ done
         print(f"  ✗ Fehler beim Crontab-Setup: {e}")
         log_error("ramdisk", f"Fehler beim Crontab-Setup: {e}", e)
 
-    # 6. Grabber jetzt starten (falls E3DC screen läuft)
-    print("→ Starte Live-Grabber jetzt…")
-    # Zuerst alten Grabber killen falls er läuft
+    # 7. Service starten & alte Screen Session killen
+    print("→ Starte Live-Grabber Service…")
+    # Alte Screen-Session beenden falls vorhanden
     run_command(f"sudo -u {install_user} screen -S live-grabber -X quit")
-    # Neu starten
-    run_command(f"sudo -u {install_user} screen -dmS live-grabber {GRABBER_SCRIPT}")
-    ramdisk_logger.info("Live-Grabber gestartet.")
+    # Service starten
+    run_command(f"sudo systemctl restart {SERVICE_NAME}")
+    ramdisk_logger.info("Live-Grabber Service gestartet.")
 
     print("\n✓ RAM-Disk und Live-Status-Grabber erfolgreich eingerichtet.\n")
     log_task_completed("RAM-Disk & Live-Status Setup")

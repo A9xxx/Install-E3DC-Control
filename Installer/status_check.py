@@ -120,6 +120,20 @@ def show_system_status():
              print("  " + "-" * 40)
              issues_found.append("watchdog_failed")
 
+    # 2b. Live-Grabber
+    print("\n--- Live-Grabber ---")
+    grabber_srv = check_service_details("e3dc-grabber")
+    
+    if grabber_srv["status"] == "not_installed":
+        # Fallback: Prüfe auf alte Screen-Session
+        if check_screen_session("live-grabber"):
+            print("✓ Screen-Session 'live-grabber': Gefunden (Legacy Mode)")
+        else:
+            print("⚪ Service 'e3dc-grabber': Nicht installiert")
+    else:
+        status_icon = "✓" if grabber_srv["active"] else "✗"
+        print(f"{status_icon} Service Status: {'Aktiv (running)' if grabber_srv['active'] else 'Inaktiv'}")
+
     # 3. System-Ressourcen
     print("\n--- System-Ressourcen ---")
     # CPU Temp

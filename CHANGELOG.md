@@ -1,5 +1,14 @@
 # Changelog
 
+## [2026.03.04] - Installer-Robustheit & Portabilität
+
+### 🔧 Installer & Updates
+*   **Portabilität:** Der Installer und das Update-System (`self_update.py`) unterstützen nun beliebige Installationsverzeichnisse (z.B. Git-Clones). Updates werden immer im aktuellen Verzeichnis ausgeführt, statt stur `~/Install` zu erzwingen.
+*   **Konflikt-Erkennung:** `installer_main.py` warnt nun beim Start, wenn eine parallele Installation im Standardpfad (`~/Install`) gefunden wird, um Verwirrung bei Konfigurationen zu vermeiden.
+*   **Sudo-Rechte:** Die Einrichtung der Web-Rechte (`permissions.py`, `diagrammphp.py`) wurde erweitert. Es werden nun zuverlässig beide Sudoers-Dateien (`010_e3dc_web_update` und `010_e3dc_web_git`) erstellt und mit dem korrekten, dynamischen Pfad zum Installer verknüpft.
+*   **Bugfix:** Ein `UnboundLocalError` in `system.py` bei Neuinstallationen (wenn kein Backup vorhanden war) wurde behoben.
+*   **Transparenz:** Der Installer zeigt beim Start nun explizit das Arbeitsverzeichnis und die geladene Konfigurationsdatei an.
+
 ## [2026.03.03] - PWA & Caching Optimierung
 
 ### 📱 PWA (Progressive Web App)

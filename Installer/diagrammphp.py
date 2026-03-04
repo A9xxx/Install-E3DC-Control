@@ -458,50 +458,72 @@ class DiagramInstaller:
         except Exception as e:
             print(f"⚠️  Konnte check_updates nicht setzen: {e}")
 
-    def configure_sudoers_for_git(self):
+    def configure_web_sudoers(self):
         """
-        Erstellt eine sudoers-Datei, damit www-data git Befehle als install_user ausführen darf.
-        Erlaubt zusätzlich den Neustart des e3dc-Services.
+        Erstellt sudoers-Dateien für Web-Interface (git, systemctl, update).
         """
         print("\n" + "-" * 60)
-        print("Konfiguriere sudo-Rechte für Web-Interface (git & systemctl)...")
+        print("Konfiguriere sudo-Rechte für Web-Interface...")
         print("-" * 60)
         
-        sudoers_file = "/etc/sudoers.d/010_e3dc_web_git"
+        # Dynamischer Pfad zum Installer-Skript (basierend auf aktuellem Speicherort)
+        current_installer_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        installer_script = os.path.join(current_installer_dir, "installer_main.py")
         
-        lines = [
-            f"www-data ALL=({self.install_user}) NOPASSWD: /usr/bin/git",
-            "www-data ALL=NOPASSWD: /bin/systemctl restart e3dc"
+        sudo_files = [
+            {
+                "path": "/etc/sudoers.d/010_e3dc_web_git",
+                "lines": [
+                    f"www-data ALL=({self.install_user}) NOPASSWD: /usr/bin/git",
+                    "www-data ALL=NOPASSWD: /bin/systemctl restart e3dc"
+                ],
+                "desc": "Git & Service-Steuerung"
+            },
+            {
+                "path": "/etc/sudoers.d/010_e3dc_web_update",
+                "lines": [
+                    f"www-data ALL=(root) NOPASSWD: /usr/bin/python3 {installer_script} --update-e3dc"
+                ],
+                "desc": "Installer Self-Update"
+            }
         ]
-        content = "\n".join(lines) + "\n"
         
-        try:
-            # Prüfen ob Datei existiert (via sudo cat, da oft nicht lesbar für normal user)
-            check_cmd = ["sudo", "cat", sudoers_file]
-            result = subprocess.run(check_cmd, capture_output=True, text=True)
+        all_success = True
+        
+        for item in sudo_files:
+            path = item["path"]
+            lines = item["lines"]
+            desc = item["desc"]
+            content = "\n".join(lines) + "\n"
             
-            if result.returncode == 0:
-                if all(line in result.stdout for line in lines):
-                    print(f"✓ Sudo-Rechte bereits vorhanden.")
-                    return True
+            try:
+                # Prüfen ob Datei existiert und Inhalt stimmt
+                check_cmd = ["sudo", "cat", path]
+                result = subprocess.run(check_cmd, capture_output=True, text=True)
+                
+                if result.returncode == 0:
+                    if all(line in result.stdout for line in lines):
+                        print(f"✓ Sudo-Rechte ({desc}) bereits vorhanden.")
+                        continue
 
-            print(f"→ Aktualisiere {sudoers_file}...")
-            
-            # Via subprocess und tee schreiben
-            cmd = f"printf '{content}' | sudo tee {sudoers_file} > /dev/null"
-            subprocess.run(cmd, shell=True, check=True)
-            
-            # Rechte setzen (0440)
-            subprocess.run(["sudo", "chmod", "0440", sudoers_file], check=True)
-            
-            print(f"✓ Sudo-Rechte eingerichtet: git ({self.install_user}) & systemctl restart e3dc")
-            diagramm_logger.info(f"Sudoers-Datei aktualisiert: {sudoers_file}")
-            return True
-            
-        except Exception as e:
-            log_error("diagramm", f"Fehler beim Einrichten der sudo-Rechte: {e}", e)
-            print(f"❌ Fehler beim Einrichten der sudo-Rechte: {e}")
-            return False
+                print(f"→ Aktualisiere {path} ({desc})...")
+                
+                # Via subprocess und tee schreiben
+                cmd = f"printf '{content}' | sudo tee {path} > /dev/null"
+                subprocess.run(cmd, shell=True, check=True)
+                
+                # Rechte setzen (0440)
+                subprocess.run(["sudo", "chmod", "0440", path], check=True)
+                
+                print(f"✓ Sudo-Rechte eingerichtet: {desc}")
+                diagramm_logger.info(f"Sudoers-Datei aktualisiert: {path}")
+                
+            except Exception as e:
+                log_error("diagramm", f"Fehler beim Einrichten der sudo-Rechte ({desc}): {e}", e)
+                print(f"❌ Fehler beim Einrichten der sudo-Rechte ({desc}): {e}")
+                all_success = False
+                
+        return all_success
 
     def cleanup_old_modules(self):
         """
@@ -865,7 +887,7 @@ class DiagramInstaller:
                 self.setup_crontab()
                 self.ensure_update_check_config()
                 install_e3dc_service()
-                self.configure_sudoers_for_git()
+                self.configure_web_sudoers()
                 self.save_config()
                 self.print_summary()
                 return True
@@ -890,7 +912,7 @@ class DiagramInstaller:
         # Gemeinsame Einrichtung für Option 1, 2 und Erstinstallation
         self.ensure_update_check_config()
         install_e3dc_service()
-        self.configure_sudoers_for_git()
+        self.configure_web_sudoers()
 
         # 2) Alte Modul-Ordner entfernen (falls vorhanden)
         self.cleanup_old_modules()

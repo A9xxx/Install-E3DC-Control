@@ -23,8 +23,7 @@ from .logging_manager import get_or_create_logger, log_task_completed, log_error
 GITHUB_REPO = "A9xxx/Install-E3DC-Control"
 RELEASES_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 SCRIPT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-INSTALL_ROOT = os.path.dirname(SCRIPT_DIR)  # /home/<install_user>
-INSTALLER_DIR = os.path.join(INSTALL_ROOT, "Install")
+INSTALLER_DIR = SCRIPT_DIR
 VERSION_FILE = os.path.join(SCRIPT_DIR, "VERSION")
 DEBUG = False
 USER_AGENT = "E3DC-Control-Installer/1.0"
@@ -194,6 +193,7 @@ def extract_release(zip_path, new_version):
 
         print(f"→ Aktualisiere Installer-Verzeichnis aus: {src_installer}")
         update_logger.info(f"Aktualisiere Installer-Verzeichnis aus: {src_installer}")
+        print(f"  Ziel-Verzeichnis (wird aktualisiert): {INSTALLER_DIR}")
 
         # Sicherung der Konfiguration
         config_to_preserve = None

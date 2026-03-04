@@ -220,6 +220,34 @@ def restart_installer():
     # Argumente durchreichen, falls Unattended Mode aktiv ist
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
+def check_duplicate_installations():
+    """Prüft auf konkurrierende Installationen in ~/Install."""
+    try:
+        config = load_config()
+        user = config.get("install_user")
+        if not user: return
+
+        home = get_home_dir(user)
+        standard_path = os.path.join(home, "Install")
+        
+        current_path = os.path.abspath(SCRIPT_DIR)
+        standard_path = os.path.abspath(standard_path)
+
+        # Nur warnen, wenn wir NICHT im Standardpfad sind, aber einer existiert
+        if os.path.exists(standard_path) and current_path != standard_path:
+            print("\n" + "!" * 60)
+            print("⚠ HINWEIS: Parallele Installation gefunden!")
+            print(f"  Laufend:   {current_path}")
+            print(f"  Gefunden:  {standard_path}")
+            print("!" * 60)
+            print("Dies kann zu Verwirrung führen (unterschiedliche Configs/Versionen).")
+            print(f"Empfehlung: Lösche die alte Version, wenn sie nicht mehr benötigt wird.")
+            print(f"Befehl: sudo rm -rf {standard_path}")
+            print("-" * 60 + "\n")
+            
+    except Exception:
+        pass
+
 def main():
     """Haupteinstiegspunkt."""
     global UNATTENDED_MODE
@@ -242,6 +270,9 @@ def main():
         setup_logging()
         check_python_version()
         check_root_privileges()
+        
+        print(f"→ Installer-Pfad: {SCRIPT_DIR}")
+        print(f"→ Konfiguration:  {CONFIG_FILE}")
 
         # Direktes Update wenn angefordert
         if args.update_e3dc:
@@ -253,6 +284,8 @@ def main():
 
         if not ensure_install_user():
             sys.exit(1)
+
+        check_duplicate_installations()
 
         # VENV Status Check
         install_path = get_install_path()

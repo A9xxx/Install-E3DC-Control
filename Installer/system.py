@@ -150,6 +150,7 @@ def install_e3dc_control():
         return False
 
     service_was_stopped = False
+    temp_venv_backup = None
 
     if os.path.exists(INSTALL_PATH):
         print("⚠ E3DC-Control existiert bereits.")
@@ -166,7 +167,6 @@ def install_e3dc_control():
         
         # VENV RETTUNG: Prüfen ob venv im Ordner liegt und sichern
         venv_name = get_venv_name()
-        temp_venv_backup = None
         if venv_name:
             possible_venv = os.path.join(INSTALL_PATH, venv_name)
             if os.path.exists(possible_venv) and os.path.isdir(possible_venv):

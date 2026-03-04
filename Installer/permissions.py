@@ -712,39 +712,56 @@ def fix_cronjobs(issues):
 
 
 def check_sudoers_permissions():
-    """Prüft, ob www-data das Update-Skript ausführen darf."""
-    print("\n=== Sudoers-Prüfung (Web-Update) ===\n")
+    """Prüft, ob www-data die notwendigen Sudo-Rechte für Web-Funktionen hat."""
+    print("\n=== Sudoers-Prüfung (Web-Funktionen) ===\n")
     perm_logger.info("--- Starte Sudoers-Prüfung ---")
-    
-    sudoers_file = "/etc/sudoers.d/010_e3dc_web_update"
-    script_path = os.path.join(INSTALL_HOME, "Install", "installer_main.py")
-    expected_content = f"www-data ALL=(root) NOPASSWD: /usr/bin/python3 {script_path} --update-e3dc"
-    
+
+    # Dynamischer Pfad zum Installer-Skript (basierend auf aktuellem Speicherort)
+    current_installer_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    script_path = os.path.join(current_installer_dir, "installer_main.py")
+
+    expected_sudoers_files = [
+        {
+            "file": "/etc/sudoers.d/010_e3dc_web_update",
+            "content": f"www-data ALL=(root) NOPASSWD: /usr/bin/python3 {script_path} --update-e3dc",
+            "description": "Web-Update"
+        },
+        {
+            "file": "/etc/sudoers.d/010_e3dc_web_git",
+            "content": "www-data ALL=(root) NOPASSWD: /usr/bin/git, /bin/systemctl",
+            "description": "Web-Steuerung (git/systemctl)"
+        }
+    ]
+
     issues = []
-    
-    if not os.path.exists(sudoers_file):
-        print(f"✗ Sudoers-Datei fehlt: {sudoers_file}")
-        issues.append({"missing": True, "file": sudoers_file, "content": expected_content})
-    else:
-        try:
-            with open(sudoers_file, "r") as f:
-                content = f.read().strip()
-            if content != expected_content:
-                print(f"✗ Sudoers-Inhalt veraltet/falsch.")
-                issues.append({"missing": False, "file": sudoers_file, "content": expected_content})
-            else:
-                print(f"✓ Sudoers-Konfiguration korrekt.")
-                perm_logger.info("Sudoers-Konfiguration korrekt.")
-        except Exception as e:
-            print(f"✗ Fehler beim Lesen von {sudoers_file}: {e}")
-            perm_logger.error(f"Fehler beim Lesen von {sudoers_file}: {e}")
-            issues.append({"error": True})
-            
+
+    for sudo_def in expected_sudoers_files:
+        sudoers_file = sudo_def["file"]
+        expected_content = sudo_def["content"]
+        description = sudo_def["description"]
+
+        if not os.path.exists(sudoers_file):
+            print(f"✗ Sudoers-Datei für '{description}' fehlt: {os.path.basename(sudoers_file)}")
+            issues.append({"missing": True, "file": sudoers_file, "content": expected_content})
+        else:
+            try:
+                with open(sudoers_file, "r") as f:
+                    content = f.read().strip()
+                if content != expected_content:
+                    print(f"✗ Sudoers-Inhalt für '{description}' veraltet/falsch.")
+                    issues.append({"missing": False, "file": sudoers_file, "content": expected_content})
+                else:
+                    print(f"✓ Sudoers-Konfiguration für '{description}' korrekt.")
+                    perm_logger.info(f"Sudoers-Konfiguration '{description}' korrekt.")
+            except Exception as e:
+                print(f"✗ Fehler beim Lesen von {sudoers_file}: {e}")
+                perm_logger.error(f"Fehler beim Lesen von {sudoers_file}: {e}")
+                issues.append({"error": True, "file": sudoers_file})
     return issues
 
 def fix_sudoers_permissions(issues):
-    """Erstellt die Sudoers-Datei für Web-Updates."""
-    print("\n→ Richte Sudoers für Web-Update ein…\n")
+    """Erstellt oder korrigiert die Sudoers-Dateien für Web-Funktionen."""
+    print("\n→ Richte Sudoers für Web-Funktionen ein…\n")
     success = True
     for issue in issues:
         if "content" in issue:

@@ -24,6 +24,7 @@
 *   **Anti-Spike Logik:** Doppelte Absicherung gegen fehlerhafte "0"-Werte in Diagrammen:
     1.  **Atomares Schreiben:** Der Grabber nutzt nun `mv` für atomare Datei-Updates in der RAM-Disk.
     2.  **PHP-Validierung:** `get_live_json.php` filtert ungültige Lesevorgänge aktiv aus, bevor sie in die Historie gelangen.
+*   **Ramdisk-Rechte:** Korrektur der Berechtigungen für `/var/www/html/ramdisk` auf `2775` (Setgid). Dies stellt sicher, dass neu erstellte Dateien automatisch der Gruppe `www-data` gehören.
 *   **Watchdog-Cleanup:** Optimierung des Crontab-Eintrags für den täglichen Bericht (Parameter `status`), um Dateisystem-Fehler (`=5.0` Datei) zu beheben.
 *   **Deinstallation:** Die Routine entfernt nun auch den neuen Grabber-Service sauber.
 

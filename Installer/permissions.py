@@ -178,7 +178,7 @@ def check_webportal_permissions():
         # Sub-Ordner prüfen
         subfolders = [
             (f"{wp_path}/tmp", "777"),
-            (f"{wp_path}/ramdisk", "775"),
+            (f"{wp_path}/ramdisk", "2775"),
             (f"{wp_path}/tmp/history_backups", "775")
         ]
         for folder_path, expected_mode in subfolders:
@@ -187,7 +187,11 @@ def check_webportal_permissions():
                 issues.append(f"{os.path.basename(folder_path)}_missing")
             else:
                 st_sub = os.stat(folder_path)
-                mode_sub = oct(st_sub.st_mode)[-3:]
+                # Mode-Erkennung: 4 Stellen für S-Bit (z.B. 2775), sonst 3
+                if len(expected_mode) == 4:
+                    mode_sub = oct(st_sub.st_mode)[-4:]
+                else:
+                    mode_sub = oct(st_sub.st_mode)[-3:]
                 owner_sub = pwd.getpwuid(st_sub.st_uid).pw_name
                 group_sub = grp.getgrgid(st_sub.st_gid).gr_name
                 # Prüfe Owner/Group separat
@@ -456,11 +460,11 @@ def fix_webportal_permissions(issues):
         else:
             success = False
     if "ramdisk_missing" in issues or "ramdisk_mode" in issues:
-        print(f"  → Setze RAM-Disk-Rechte rekursiv: {wp_path}/ramdisk -> 775 (Dirs), 664 (Dateien)")
-        result = run_command(f"sudo chmod -R 775 {wp_path}/ramdisk")
+        print(f"  → Setze RAM-Disk-Rechte: {wp_path}/ramdisk -> 2775")
+        result = run_command(f"sudo chmod 2775 {wp_path}/ramdisk")
         if result['success']:
             # Fix live.txt und live_history.txt spezifisch auf 664
-            for fname in ("live.txt", "live_history.txt"):
+            for fname in ("live.txt", "live_history.txt", "luxtronik.json", "luxtronik_history.json", "luxtronik_stats.json"):
                 live_f = f"{wp_path}/ramdisk/{fname}"
                 if os.path.exists(live_f):
                     run_command(f"sudo chmod 664 {live_f}")

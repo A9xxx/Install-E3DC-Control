@@ -870,10 +870,10 @@ class DiagramInstaller:
             print("1 = Nur Konfiguration ändern (Dateien bleiben)")
             print("2 = Komplett neu installieren (aus ZIP)")
             print("3 = Crontab & Service aktualisieren")
-            print("4 = Abbrechen")
+            print("q = Abbrechen")
             choice = input("Auswahl (1-4): ").strip()
             
-            if choice == "4":
+            if choice == "q":
                 print("Installation abgebrochen")
                 diagramm_logger.info("Installation vom Benutzer abgebrochen.")
                 return False

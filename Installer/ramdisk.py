@@ -77,7 +77,7 @@ def setup_ramdisk():
     
     # Besitzrechte für RAM-Disk setzen
     run_command(f"sudo chown {install_user}:www-data {RAMDISK_PATH}")
-    run_command(f"sudo chmod 775 {RAMDISK_PATH}")
+    run_command(f"sudo chmod 2775 {RAMDISK_PATH}")
     ramdisk_logger.info("RAM-Disk gemountet und Berechtigungen gesetzt.")
 
     # 4. Grabber Skript erstellen

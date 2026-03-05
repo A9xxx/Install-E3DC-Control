@@ -8,20 +8,6 @@ import logging
 import pwd
 import argparse  # NEU: Für Argumenten-Parsing (Headless/PWA Support)
 
-from Installer.installer_config import (
-    CONFIG_FILE,
-    get_default_install_user,
-    load_config,
-    save_config,
-    ensure_web_config,
-    get_home_dir,
-    get_user_ids,
-    get_www_data_gid,
-    set_config_file_permissions,
-    get_install_path
-)
-from Installer.utils import setup_logging
-
 # Basis-Pfade
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 INSTALLER_DIR = os.path.join(SCRIPT_DIR, "Installer")
@@ -38,6 +24,45 @@ except ImportError:
 
 # Globale Variable für den Headless-Modus
 UNATTENDED_MODE = False
+
+# Pufferung deaktivieren (wichtig für Web-Interface Ausgabe)
+# Muss so früh wie möglich geschehen
+if not sys.stdout.isatty():
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except AttributeError:
+        sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', buffering=1)
+
+# Debug-Ausgabe ganz am Anfang (für Web-Update Diagnose)
+print(f"→ Installer-Skript gestartet (PID: {os.getpid()})")
+print(f"→ Arbeitsverzeichnis: {os.getcwd()}")
+sys.stdout.flush()
+
+# ZUSATZ-DIAGNOSE: Schreibe in eine separate Datei, um Redirect-Probleme auszuschließen
+try:
+    with open("/tmp/e3dc_installer_debug.txt", "w") as f:
+        f.write(f"Gestartet um {os.popen('date').read().strip()}\nPID: {os.getpid()}\nUser: {os.geteuid()}\n")
+except:
+    pass
+
+# Importe mit Fehlerbehandlung, damit Abstürze im Log landen
+try:
+    from Installer.installer_config import (
+        CONFIG_FILE,
+        get_default_install_user,
+        load_config,
+        save_config,
+        ensure_web_config,
+        get_home_dir,
+        get_user_ids,
+        get_www_data_gid,
+        set_config_file_permissions,
+        get_install_path
+    )
+    from Installer.utils import setup_logging
+except ImportError as e:
+    print(f"CRITICAL ERROR: Import fehlgeschlagen: {e}")
+    sys.exit(1)
 
 def check_python_version():
     """Prüft ob Python 3.7+ vorhanden ist."""
@@ -263,9 +288,13 @@ def main():
         # Führe den BOM-Fixer aus, um Dateikodierungsprobleme zu beheben
         if fix_bom_main:
             print("→ Prüfe Dateikodierungen (BOM)...")
+            sys.stdout.flush()
             fix_bom_main()
+            print("✓ BOM-Prüfung abgeschlossen.")
+            sys.stdout.flush()
         else:
             print("⚠ Warnung: BOM-Fixer-Skript (fix_bom.py) nicht gefunden.")
+            sys.stdout.flush()
 
         setup_logging()
         check_python_version()
@@ -273,9 +302,12 @@ def main():
         
         print(f"→ Installer-Pfad: {SCRIPT_DIR}")
         print(f"→ Konfiguration:  {CONFIG_FILE}")
+        sys.stdout.flush()
 
         # Direktes Update wenn angefordert
         if args.update_e3dc:
+            print("→ Starte Update-Modul...")
+            sys.stdout.flush()
             from Installer.update import update_e3dc
             update_e3dc(headless=True)
             sys.exit(0)

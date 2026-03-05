@@ -103,6 +103,7 @@ def update_e3dc(headless=False):
             sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', buffering=1)
 
     print("\n=== E3DC-Control aktualisieren ===\n")
+    sys.stdout.flush()
     update_logger.info("Starte Update-Prozess.")
 
     if not os.path.exists(INSTALL_PATH):
@@ -126,6 +127,7 @@ def update_e3dc(headless=False):
 
     print(f"Aktuelle Version: {old_version[:7]}")
     print(f"Neueste Version:  {latest_version[:7]}")
+    sys.stdout.flush()
 
     # Speichere aktuellen Stand von origin/master für Reset bei Abbruch
     install_user = get_install_user()
@@ -156,6 +158,7 @@ def update_e3dc(headless=False):
     elif missing == 0:
         print("✓ Du bist auf dem neuesten Stand.")
         update_logger.info("Kein Update verfügbar, Version ist aktuell.")
+        sys.stdout.flush()
         if force_update_web:
             print("→ Update wird erzwungen (Web-Option).")
             ask_confirmation = False
@@ -186,6 +189,7 @@ def update_e3dc(headless=False):
             return
     elif headless:
         print("→ Starte Update (Headless-Modus)...\n")
+        sys.stdout.flush()
 
     # Backup erstellen
     print("\n→ Erstelle Backup…")
@@ -278,7 +282,8 @@ def update_e3dc(headless=False):
     log_task_completed("E3DC-Control aktualisieren", details=f"Von {old_version[:7]} zu {latest_version[:7]}")
 
     # Telegram Benachrichtigung senden (falls vorhanden)
-    send_telegram_notification(f"✅ E3DC-Control Update erfolgreich!\nVon: {old_version[:7]}\nZu: {latest_version[:7]}")
+    if old_version != latest_version:
+        send_telegram_notification(f"✅ E3DC-Control Update erfolgreich!\nVon: {old_version[:7]}\nZu: {latest_version[:7]}")
 
     # Stash-Management
     result = run_command(f"sudo -u {install_user} git -C {INSTALL_PATH} stash list")

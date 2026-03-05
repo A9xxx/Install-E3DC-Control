@@ -715,7 +715,7 @@ def check_sudoers_permissions():
     perm_logger.info("--- Starte Sudoers-Prüfung ---")
 
     # Dynamischer Pfad zum Installer-Skript (basierend auf aktuellem Speicherort)
-    current_installer_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    current_installer_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
     script_path = os.path.join(current_installer_dir, "installer_main.py")
 
     expected_sudoers_files = [

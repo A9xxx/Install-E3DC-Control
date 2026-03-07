@@ -13,7 +13,12 @@ from .logging_manager import get_or_create_logger, log_task_completed, log_error
 INSTALL_USER = get_install_user()
 INSTALL_HOME = get_home_dir(INSTALL_USER)
 INSTALL_PATH = get_install_path()
+INSTALLER_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# ANSI Colors
+GREEN = '\033[92m'
+RED = '\033[91m'
+RESET = '\033[0m'
 
 def _strip_utf8_bom(path):
     """Entfernt UTF-8 BOM, falls vorhanden."""
@@ -24,7 +29,7 @@ def _strip_utf8_bom(path):
         if content.startswith(bom):
             with open(path, "wb") as f:
                 f.write(content[len(bom):])
-            print(f"  ✓ BOM entfernt: {os.path.basename(path)}")
+            print(f"  {GREEN}✓{RESET} BOM entfernt: {os.path.basename(path)}")
     except Exception:
         pass
 
@@ -66,23 +71,23 @@ def check_permissions():
         other_x = bool(st_home.st_mode & 0o001)
         group_x = st_home.st_gid == www_data_gid and bool(st_home.st_mode & 0o010)
         if not other_x and not group_x:
-            print(f"✗ {INSTALL_HOME} ist NICHT für www-data erreichbar")
+            print(f"{RED}✗{RESET} {INSTALL_HOME} ist NICHT für www-data erreichbar")
             perm_logger.error(f"Home-Verzeichnis nicht für www-data erreichbar: {INSTALL_HOME}")
             issues.append("home")
         else:
-            print(f"✓ {INSTALL_HOME} ist für www-data erreichbar")
+            print(f"{GREEN}✓{RESET} {INSTALL_HOME} ist für www-data erreichbar")
             perm_logger.info(f"Home-Verzeichnis OK: {INSTALL_HOME}")
     except Exception as e:
-        print(f"✗ Fehler beim Prüfen von {INSTALL_HOME}: {e}")
+        print(f"{RED}✗{RESET} Fehler beim Prüfen von {INSTALL_HOME}: {e}")
         perm_logger.error(f"Fehler beim Prüfen von {INSTALL_HOME}: {e}")
         issues.append("home")
     # INSTALL_PATH prüfen
     if not os.path.exists(INSTALL_PATH):
-        print(f"✓ {INSTALL_PATH} existiert noch nicht – überspringe Rechteprüfung.\n")
+        print(f"{GREEN}✓{RESET} {INSTALL_PATH} existiert noch nicht – überspringe Rechteprüfung.\n")
         perm_logger.info(f"Install-Pfad existiert noch nicht: {INSTALL_PATH}")
         return issues
     if not os.path.isdir(INSTALL_PATH):
-        print(f"✗ {INSTALL_PATH} ist kein Verzeichnis!")
+        print(f"{RED}✗{RESET} {INSTALL_PATH} ist kein Verzeichnis!")
         perm_logger.error(f"Install-Pfad ist kein Verzeichnis: {INSTALL_PATH}")
         issues.append("notdir")
         return issues
@@ -93,18 +98,18 @@ def check_permissions():
         mode = oct(st.st_mode)[-3:]
         if owner != INSTALL_USER or group != INSTALL_USER:
             details = format_dir_issue(owner, group, mode, INSTALL_USER, INSTALL_USER, "755")
-            print(f"✗ {INSTALL_PATH} Problem: {details}")
+            print(f"{RED}✗{RESET} {INSTALL_PATH} Problem: {details}")
             perm_logger.error(f"INSTALL_PATH Besitzer/Gruppe falsch: {details}")
             issues.append("owner")
         else:
-            print(f"✓ {INSTALL_PATH} gehört {INSTALL_USER}:{INSTALL_USER}")
+            print(f"{GREEN}✓{RESET} {INSTALL_PATH} gehört {INSTALL_USER}:{INSTALL_USER}")
             perm_logger.info(f"INSTALL_PATH Besitzer OK: {INSTALL_USER}:{INSTALL_USER}")
         if mode != "755":
-            print(f"✗ {INSTALL_PATH} hat Rechte {mode} statt 755")
+            print(f"{RED}✗{RESET} {INSTALL_PATH} hat Rechte {mode} statt 755")
             perm_logger.error(f"INSTALL_PATH Modus falsch: {mode} (soll: 755)")
             issues.append("mode")
         else:
-            print(f"✓ {INSTALL_PATH} hat korrekte Rechte (755)")
+            print(f"{GREEN}✓{RESET} {INSTALL_PATH} hat korrekte Rechte (755)")
             perm_logger.info(f"INSTALL_PATH Modus OK: 755")
             
         # VENV prüfen (falls vorhanden)
@@ -120,19 +125,19 @@ def check_permissions():
             st_venv = os.stat(venv_path)
             owner_venv = pwd.getpwuid(st_venv.st_uid).pw_name
             if owner_venv != INSTALL_USER:
-                print(f"✗ {venv_name} gehört {owner_venv} (soll: {INSTALL_USER})")
+                print(f"{RED}✗{RESET} {venv_name} gehört {owner_venv} (soll: {INSTALL_USER})")
                 issues.append("venv_owner")
             else:
-                print(f"✓ {venv_name} gehört {INSTALL_USER}")
+                print(f"{GREEN}✓{RESET} {venv_name} gehört {INSTALL_USER}")
             
             # Prüfen ob executables ausführbar sind
             pip_bin = os.path.join(venv_path, "bin", "pip")
             if os.path.exists(pip_bin) and not os.access(pip_bin, os.X_OK):
-                print(f"✗ {venv_name}/bin/pip ist nicht ausführbar")
+                print(f"{RED}✗{RESET} {venv_name}/bin/pip ist nicht ausführbar")
                 issues.append("venv_mode")
 
     except Exception as e:
-        print(f"✗ Fehler beim Prüfen: {e}")
+        print(f"{RED}✗{RESET} Fehler beim Prüfen: {e}")
         perm_logger.error(f"Fehler beim Prüfen von INSTALL_PATH: {e}")
         issues.append("error")
     return issues
@@ -156,7 +161,7 @@ def check_webportal_permissions():
     issues = []
     wp_path = "/var/www/html"
     if not os.path.exists(wp_path):
-        print(f"✗ {wp_path} existiert nicht – Webportal nicht installiert")
+        print(f"{RED}✗{RESET} {wp_path} existiert nicht – Webportal nicht installiert")
         issues.append("wp_missing")
         return issues
     try:
@@ -166,15 +171,15 @@ def check_webportal_permissions():
         mode = oct(st.st_mode)[-3:]
         if owner != INSTALL_USER or group != "www-data":
             details = format_wp_issue(owner, group, mode, INSTALL_USER, "www-data", "775")
-            print(f"✗ {wp_path} Problem: {details}")
+            print(f"{RED}✗{RESET} {wp_path} Problem: {details}")
             issues.append("wp_owner")
         else:
-            print(f"✓ {wp_path} gehört {INSTALL_USER}:www-data")
+            print(f"{GREEN}✓{RESET} {wp_path} gehört {INSTALL_USER}:www-data")
         if mode != "775":
-            print(f"✗ {wp_path} hat Rechte {mode} statt 775")
+            print(f"{RED}✗{RESET} {wp_path} hat Rechte {mode} statt 775")
             issues.append("wp_mode")
         else:
-            print(f"✓ {wp_path} hat korrekte Rechte (775)")
+            print(f"{GREEN}✓{RESET} {wp_path} hat korrekte Rechte (775)")
         # Sub-Ordner prüfen
         subfolders = [
             (f"{wp_path}/tmp", "777"),
@@ -183,7 +188,7 @@ def check_webportal_permissions():
         ]
         for folder_path, expected_mode in subfolders:
             if not os.path.exists(folder_path):
-                print(f"✗ {folder_path} existiert nicht")
+                print(f"{RED}✗{RESET} {folder_path} existiert nicht")
                 issues.append(f"{os.path.basename(folder_path)}_missing")
             else:
                 st_sub = os.stat(folder_path)
@@ -199,7 +204,7 @@ def check_webportal_permissions():
                 mode_issue = mode_sub != expected_mode
                 if owner_group_issue or mode_issue:
                     details = format_wp_issue(owner_sub, group_sub, mode_sub, INSTALL_USER, "www-data", expected_mode)
-                    print(f"✗ {folder_path} Problem: {details}")
+                    print(f"{RED}✗{RESET} {folder_path} Problem: {details}")
                     # Separate Issue-Keys für Owner und Mode
                     folder_name = os.path.basename(folder_path)
                     if owner_group_issue:
@@ -207,19 +212,19 @@ def check_webportal_permissions():
                     if mode_issue:
                         issues.append(f"{folder_name}_mode")
                 else:
-                    print(f"✓ {folder_path} OK ({INSTALL_USER}:www-data, {expected_mode})")
+                    print(f"{GREEN}✓{RESET} {folder_path} OK ({INSTALL_USER}:www-data, {expected_mode})")
                 # tmp-Ordner Schreibprüfung für www-data
                 if os.path.basename(folder_path) == "tmp":
                     www_data_gid = get_www_data_gid()
                     other_wx = bool(st_sub.st_mode & 0o003)
                     group_wx = st_sub.st_gid == www_data_gid and bool(st_sub.st_mode & 0o030)
                     if not other_wx and not group_wx:
-                        print(f"✗ {folder_path} ist für www-data nicht schreibbar")
+                        print(f"{RED}✗{RESET} {folder_path} ist für www-data nicht schreibbar")
                         issues.append("tmp_not_writable")
                     else:
-                        print(f"✓ {folder_path} ist für www-data schreibbar")
+                        print(f"{GREEN}✓{RESET} {folder_path} ist für www-data schreibbar")
     except Exception as e:
-        print(f"✗ Fehler beim Prüfen: {e}")
+        print(f"{RED}✗{RESET} Fehler beim Prüfen: {e}")
         issues.append("error")
     return issues
 
@@ -266,6 +271,10 @@ FILE_DEFINITIONS = [
     {"path": "/var/www/html/tmp/plot_soc_error_mobile", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": "/var/www/html/tmp/plot_live_history_last_run", "mode": "666", "owner": INSTALL_USER, "group": "www-data", "optional": False, "executable": False},
     {"path": "/var/www/html/tmp/plot_soc_last_run", "mode": "666", "owner": INSTALL_USER, "group": "www-data", "optional": False, "executable": False},
+    # Luxtronik Dateien
+    {"path": f"{INSTALLER_DIR}/luxtronik/energy_manager.py", "mode": "755", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": True},
+    {"path": f"{INSTALLER_DIR}/luxtronik/config.lux.json", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
+    {"path": "/var/www/html/ramdisk/luxtronik.json", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
 ]
 
 
@@ -307,7 +316,7 @@ def check_file_permissions():
 
         if not os.path.exists(path):
             if not is_optional:
-                print(f"✗ {file_name} fehlt")
+                print(f"{RED}✗{RESET} {file_name} fehlt")
                 issues[path] = {"missing": True}
             continue
         try:
@@ -321,14 +330,14 @@ def check_file_permissions():
             exec_ok = not is_executable or (is_executable and bool(st.st_mode & 0o111))
             if owner_ok and group_ok and mode_ok and exec_ok:
                 exec_str = ", ausführbar" if is_executable else ""
-                print(f"✓ {file_name} OK ({expected_owner}:{expected_group}, {expected_mode}{exec_str})")
+                print(f"{GREEN}✓{RESET} {file_name} OK ({expected_owner}:{expected_group}, {expected_mode}{exec_str})")
             else:
                 details = []
                 if not owner_ok: details.append(f"Owner={owner} (soll: {expected_owner})")
                 if not group_ok: details.append(f"Gruppe={group} (soll: {expected_group})")
                 if not mode_ok: details.append(f"Modus={mode} (soll: {expected_mode})")
                 if not exec_ok: details.append("nicht ausführbar")
-                print(f"✗ {file_name} Problem: {', '.join(details)}")
+                print(f"{RED}✗{RESET} {file_name} Problem: {', '.join(details)}")
                 issues[path] = {
                     "owner": not owner_ok,
                     "group": not group_ok,
@@ -336,7 +345,7 @@ def check_file_permissions():
                     "exec": not exec_ok
                 }
         except Exception as e:
-            print(f"✗ Fehler bei {path}: {e}")
+            print(f"{RED}✗{RESET} Fehler bei {path}: {e}")
             issues[path] = {"error": str(e)}
     return issues
 
@@ -349,21 +358,21 @@ def fix_permissions(issues):
         print(f"  → Setze Execute-Bit auf Home-Verzeichnis: {INSTALL_HOME} (soll: für www-data betretbar)")
         result = run_command(f"sudo chmod o+x {INSTALL_HOME}")
         if result['success']:
-            print(f"✓ {INSTALL_HOME}: Execute-Bit für Others gesetzt")
+            print(f"{GREEN}✓{RESET} {INSTALL_HOME}: Execute-Bit für Others gesetzt")
         else:
             success = False
     if "owner" in issues:
         print(f"  → Setze Besitzer rekursiv: {INSTALL_PATH} -> {INSTALL_USER}:{INSTALL_USER}")
         result = run_command(f"sudo chown -R {INSTALL_USER}:{INSTALL_USER} {INSTALL_PATH}")
         if result['success']:
-            print(f"✓ {INSTALL_PATH}: Besitzer auf {INSTALL_USER}:{INSTALL_USER} gesetzt")
+            print(f"{GREEN}✓{RESET} {INSTALL_PATH}: Besitzer auf {INSTALL_USER}:{INSTALL_USER} gesetzt")
         else:
             success = False
     if "mode" in issues:
         print(f"  → Setze Verzeichnis-/Dateirechte rekursiv: {INSTALL_PATH} -> 755")
         result = run_command(f"sudo chmod -R 755 {INSTALL_PATH}")
         if result['success']:
-            print(f"✓ {INSTALL_PATH}: Rechte auf 755 gesetzt")
+            print(f"{GREEN}✓{RESET} {INSTALL_PATH}: Rechte auf 755 gesetzt")
         else:
             success = False
     if "venv_owner" in issues:
@@ -376,7 +385,7 @@ def fix_permissions(issues):
             
         result = run_command(f"sudo chown -R {INSTALL_USER}:{INSTALL_USER} {venv_path}")
         if result['success']:
-            print(f"✓ {venv_name} Besitzer korrigiert")
+            print(f"{GREEN}✓{RESET} {venv_name} Besitzer korrigiert")
         else:
             success = False
     if "venv_mode" in issues:
@@ -389,11 +398,11 @@ def fix_permissions(issues):
             
         result = run_command(f"sudo chmod -R +x {venv_bin}")
         if result['success']:
-            print(f"✓ {venv_name} Executables korrigiert")
+            print(f"{GREEN}✓{RESET} {venv_name} Executables korrigiert")
         else:
             success = False
     if "notdir" in issues:
-        print(f"✗ {INSTALL_PATH} ist keine Ordnerstruktur")
+        print(f"{RED}✗{RESET} {INSTALL_PATH} ist keine Ordnerstruktur")
         success = False
     return success
 
@@ -407,21 +416,21 @@ def fix_webportal_permissions(issues):
         print(f"  → Erstelle Webportal-Verzeichnis: {wp_path}")
         result = run_command(f"sudo mkdir -p {wp_path}")
         if result['success']:
-            print(f"✓ {wp_path} erstellt")
+            print(f"{GREEN}✓{RESET} {wp_path} erstellt")
         else:
             success = False
     if "wp_owner" in issues:
         print(f"  → Setze Besitzer rekursiv: {wp_path} -> {INSTALL_USER}:www-data")
         result = run_command(f"sudo chown -R {INSTALL_USER}:www-data {wp_path}")
         if result['success']:
-            print(f"✓ {wp_path}: Besitzer auf {INSTALL_USER}:www-data gesetzt")
+            print(f"{GREEN}✓{RESET} {wp_path}: Besitzer auf {INSTALL_USER}:www-data gesetzt")
         else:
             success = False
     if "wp_mode" in issues:
         print(f"  → Setze Verzeichnis-/Dateirechte rekursiv: {wp_path} -> 775")
         result = run_command(f"sudo chmod -R 775 {wp_path}")
         if result['success']:
-            print(f"✓ {wp_path}: Rechte auf 775 gesetzt")
+            print(f"{GREEN}✓{RESET} {wp_path}: Rechte auf 775 gesetzt")
         else:
             success = False
     if "tmp_missing" in issues:
@@ -435,28 +444,28 @@ def fix_webportal_permissions(issues):
         print(f"  → Setze tmp-Rechte rekursiv: {wp_path}/tmp -> 777")
         result = run_command(f"sudo chmod -R 777 {wp_path}/tmp")
         if result['success']:
-            print("✓ tmp-Rechte korrigiert")
+            print(f"{GREEN}✓{RESET} tmp-Rechte korrigiert")
         else:
             success = False
     if "tmp_owner" in issues:
         print(f"  → Setze tmp-Besitzer rekursiv: {wp_path}/tmp -> {INSTALL_USER}:www-data")
         result = run_command(f"sudo chown -R {INSTALL_USER}:www-data {wp_path}/tmp")
         if result['success']:
-            print("✓ tmp-Besitzer korrigiert")
+            print(f"{GREEN}✓{RESET} tmp-Besitzer korrigiert")
         else:
             success = False
     if "ramdisk_missing" in issues:
         print(f"  → Erstelle RAM-Disk-Verzeichnis: {wp_path}/ramdisk")
         result = run_command(f"sudo mkdir -p {wp_path}/ramdisk")
         if result['success']:
-            print("✓ ramdisk-Ordner erstellt")
+            print(f"{GREEN}✓{RESET} ramdisk-Ordner erstellt")
         else:
             success = False
     if "ramdisk_owner" in issues:
         print(f"  → Setze RAM-Disk Besitzer rekursiv: {wp_path}/ramdisk -> {INSTALL_USER}:www-data")
         result = run_command(f"sudo chown -R {INSTALL_USER}:www-data {wp_path}/ramdisk")
         if result['success']:
-            print("✓ ramdisk-Besitzer korrigiert")
+            print(f"{GREEN}✓{RESET} ramdisk-Besitzer korrigiert")
         else:
             success = False
     if "ramdisk_missing" in issues or "ramdisk_mode" in issues:
@@ -468,7 +477,7 @@ def fix_webportal_permissions(issues):
                 live_f = f"{wp_path}/ramdisk/{fname}"
                 if os.path.exists(live_f):
                     run_command(f"sudo chmod 664 {live_f}")
-            print("✓ ramdisk-Rechte korrigiert")
+            print(f"{GREEN}✓{RESET} ramdisk-Rechte korrigiert")
         else:
             success = False
     # Hinzugefügt für History-Backups
@@ -476,21 +485,21 @@ def fix_webportal_permissions(issues):
         print(f"  → Erstelle Backup-Verzeichnis: {wp_path}/tmp/history_backups")
         result = run_command(f"sudo mkdir -p {wp_path}/tmp/history_backups")
         if result['success']:
-            print("✓ history_backups-Ordner erstellt")
+            print(f"{GREEN}✓{RESET} history_backups-Ordner erstellt")
         else:
             success = False
     if "history_backups_owner" in issues:
         print(f"  → Setze Backup-Verzeichnis Besitzer: {wp_path}/tmp/history_backups -> {INSTALL_USER}:www-data")
         result = run_command(f"sudo chown -R {INSTALL_USER}:www-data {wp_path}/tmp/history_backups")
         if result['success']:
-            print("✓ history_backups-Besitzer korrigiert")
+            print(f"{GREEN}✓{RESET} history_backups-Besitzer korrigiert")
         else:
             success = False
     if "history_backups_missing" in issues or "history_backups_mode" in issues:
         print(f"  → Setze Backup-Verzeichnis Rechte: {wp_path}/tmp/history_backups -> 775")
         result = run_command(f"sudo chmod -R 775 {wp_path}/tmp/history_backups")
         if result['success']:
-            print("✓ history_backups-Rechte korrigiert")
+            print(f"{GREEN}✓{RESET} history_backups-Rechte korrigiert")
         else:
             success = False
     return success
@@ -513,7 +522,7 @@ def cleanup_root_owned_files():
                     if owner == "root":
                         result = run_command(f"sudo chown {INSTALL_USER}:{INSTALL_USER} {dir_path}")
                         if result['success']:
-                            print(f"  ✓ {os.path.relpath(dir_path, INSTALL_PATH)} von root bereinigt")
+                            print(f"  {GREEN}✓{RESET} {os.path.relpath(dir_path, INSTALL_PATH)} von root bereinigt")
                             cleaned += 1
                 except Exception:
                     pass
@@ -526,17 +535,17 @@ def cleanup_root_owned_files():
                     if owner == "root":
                         result = run_command(f"sudo chown {INSTALL_USER}:{INSTALL_USER} {file_path}")
                         if result['success']:
-                            print(f"  ✓ {os.path.relpath(file_path, INSTALL_PATH)} von root bereinigt")
+                            print(f"  {GREEN}✓{RESET} {os.path.relpath(file_path, INSTALL_PATH)} von root bereinigt")
                             cleaned += 1
                 except Exception:
                     pass
     except Exception as e:
-        print(f"✗ Fehler beim Scannen: {e}")
+        print(f"{RED}✗{RESET} Fehler beim Scannen: {e}")
         return False
     if cleaned > 0:
-        print(f"✓ {cleaned} Datei(en)/Ordner bereinigt\n")
+        print(f"{GREEN}✓{RESET} {cleaned} Datei(en)/Ordner bereinigt\n")
     else:
-        print("✓ Keine root-eigenen Dateien gefunden\n")
+        print(f"{GREEN}✓{RESET} Keine root-eigenen Dateien gefunden\n")
     return True
 
 
@@ -563,7 +572,7 @@ def fix_file_permissions(issues):
             # `touch` erstellt eine leere Datei, die danach weiter bearbeitet wird
             result = run_command(f"sudo touch {path}")
             if result['success']:
-                print(f"✓ {file_name}: Datei erstellt")
+                print(f"{GREEN}✓{RESET} {file_name}: Datei erstellt")
             else:
                 success = False
                 perm_logger.error(f"Konnte fehlende Datei nicht erstellen: {path}")
@@ -573,7 +582,7 @@ def fix_file_permissions(issues):
             print(f"  → Setze Besitzer: {path} -> {expected_owner}:{expected_group}")
             result = run_command(f"sudo chown {expected_owner}:{expected_group} {path}")
             if result['success']:
-                print(f"✓ {file_name}: Besitzer auf {expected_owner}:{expected_group} gesetzt")
+                print(f"{GREEN}✓{RESET} {file_name}: Besitzer auf {expected_owner}:{expected_group} gesetzt")
             else:
                 success = False
                 perm_logger.error(f"Besitzer für {file_name} konnte nicht gesetzt werden.")
@@ -582,7 +591,7 @@ def fix_file_permissions(issues):
             print(f"  → Setze Rechte: {path} -> {expected_mode}")
             result = run_command(f"sudo chmod {expected_mode} {path}")
             if result['success']:
-                print(f"✓ {file_name}: Rechte auf {expected_mode} gesetzt")
+                print(f"{GREEN}✓{RESET} {file_name}: Rechte auf {expected_mode} gesetzt")
             else:
                 success = False
                 perm_logger.error(f"Rechte für {file_name} konnten nicht auf {expected_mode} gesetzt werden.")
@@ -635,15 +644,15 @@ def check_cronjobs():
                 continue
 
             if cron['check_part'] in current_crontab:
-                print(f"✓ Cronjob '{cron['name']}' gefunden.")
+                print(f"{GREEN}✓{RESET} Cronjob '{cron['name']}' gefunden.")
                 perm_logger.info(f"Cronjob '{cron['name']}' gefunden.")
             else:
-                print(f"✗ Cronjob '{cron['name']}' fehlt.")
+                print(f"{RED}✗{RESET} Cronjob '{cron['name']}' fehlt.")
                 perm_logger.warning(f"Cronjob '{cron['name']}' fehlt.")
                 issues[cron['name']] = {"missing": True, "line": cron['line']}
 
     except Exception as e:
-        print(f"✗ Fehler beim Prüfen der Cronjobs: {e}")
+        print(f"{RED}✗{RESET} Fehler beim Prüfen der Cronjobs: {e}")
         perm_logger.error(f"Fehler beim Prüfen der Cronjobs: {e}")
         issues["error"] = str(e)
 
@@ -693,18 +702,18 @@ def fix_cronjobs(issues):
             os.unlink(tmp_path)
             
             if result['success']:
-                print(f"✓ Crontab erfolgreich aktualisiert.")
+                print(f"{GREEN}✓{RESET} Crontab erfolgreich aktualisiert.")
                 perm_logger.info("Crontab erfolgreich geschrieben.")
             else:
-                print(f"✗ Fehler beim Schreiben der Crontab: {result['stderr']}")
+                print(f"{RED}✗{RESET} Fehler beim Schreiben der Crontab: {result['stderr']}")
                 perm_logger.error(f"Fehler beim Schreiben der Crontab: {result['stderr']}")
                 success = False
         except Exception as e:
-            print(f"✗ Fehler: {e}")
+            print(f"{RED}✗{RESET} Fehler: {e}")
             perm_logger.error(f"Exception beim Schreiben der Crontab: {e}")
             success = False
     else:
-        print("✓ Keine Änderungen notwendig.")
+        print(f"{GREEN}✓{RESET} Keine Änderungen notwendig.")
                 
     return success
 
@@ -739,20 +748,20 @@ def check_sudoers_permissions():
         description = sudo_def["description"]
 
         if not os.path.exists(sudoers_file):
-            print(f"✗ Sudoers-Datei für '{description}' fehlt: {os.path.basename(sudoers_file)}")
+            print(f"{RED}✗{RESET} Sudoers-Datei für '{description}' fehlt: {os.path.basename(sudoers_file)}")
             issues.append({"missing": True, "file": sudoers_file, "content": expected_content})
         else:
             try:
                 with open(sudoers_file, "r") as f:
                     content = f.read().strip()
                 if content != expected_content:
-                    print(f"✗ Sudoers-Inhalt für '{description}' veraltet/falsch.")
+                    print(f"{RED}✗{RESET} Sudoers-Inhalt für '{description}' veraltet/falsch.")
                     issues.append({"missing": False, "file": sudoers_file, "content": expected_content})
                 else:
-                    print(f"✓ Sudoers-Konfiguration für '{description}' korrekt.")
+                    print(f"{GREEN}✓{RESET} Sudoers-Konfiguration für '{description}' korrekt.")
                     perm_logger.info(f"Sudoers-Konfiguration '{description}' korrekt.")
             except Exception as e:
-                print(f"✗ Fehler beim Lesen von {sudoers_file}: {e}")
+                print(f"{RED}✗{RESET} Fehler beim Lesen von {sudoers_file}: {e}")
                 perm_logger.error(f"Fehler beim Lesen von {sudoers_file}: {e}")
                 issues.append({"error": True, "file": sudoers_file})
     return issues
@@ -769,10 +778,10 @@ def fix_sudoers_permissions(issues):
             try:
                 run_command(f"sudo bash -c 'echo \"{content}\" > {path}'")
                 run_command(f"sudo chmod 440 {path}")
-                print(f"✓ Sudoers-Datei erstellt/aktualisiert.")
+                print(f"{GREEN}✓{RESET} Sudoers-Datei erstellt/aktualisiert.")
                 perm_logger.info(f"Sudoers-Datei erstellt/aktualisiert: {path}")
             except Exception as e:
-                print(f"✗ Fehler: {e}")
+                print(f"{RED}✗{RESET} Fehler: {e}")
                 perm_logger.error(f"Fehler beim Erstellen der Sudoers-Datei {path}: {e}")
                 success = False
     return success
@@ -806,13 +815,13 @@ def check_services():
         is_enabled = res_enabled['stdout'].strip() == "enabled"
         
         if is_active and is_enabled:
-            print(f"✓ Service '{srv}' ist aktiv und enabled.")
+            print(f"{GREEN}✓{RESET} Service '{srv}' ist aktiv und enabled.")
             perm_logger.info(f"Service '{srv}' OK.")
         else:
             details = []
             if not is_active: details.append("nicht aktiv")
             if not is_enabled: details.append("nicht enabled")
-            print(f"✗ Service '{srv}' Problem: {', '.join(details)}")
+            print(f"{RED}✗{RESET} Service '{srv}' Problem: {', '.join(details)}")
             perm_logger.warning(f"Service '{srv}' Problem: {', '.join(details)}")
             issues[srv] = {"active": is_active, "enabled": is_enabled}
     
@@ -834,9 +843,9 @@ def fix_services(issues):
         # Verify
         res = run_command(f"systemctl is-active {srv}")
         if res['stdout'].strip() == "active":
-            print(f"✓ {srv} läuft nun.")
+            print(f"{GREEN}✓{RESET} {srv} läuft nun.")
         else:
-            print(f"✗ {srv} konnte nicht gestartet werden.")
+            print(f"{RED}✗{RESET} {srv} konnte nicht gestartet werden.")
             success = False
     return success
 
@@ -852,14 +861,14 @@ def check_legacy_autostart():
             with open(rc_local, "r") as f:
                 for line in f:
                     if "E3DC.sh" in line and "screen" in line and not line.strip().startswith("#"):
-                        print(f"✗ Alter Autostart in {rc_local} gefunden: {line.strip()}")
+                        print(f"{RED}✗{RESET} Alter Autostart in {rc_local} gefunden: {line.strip()}")
                         issues.append("rc_local_legacy")
                         break
         except Exception as e:
             print(f"⚠ Fehler beim Lesen von {rc_local}: {e}")
     
     if not issues:
-        print("✓ Keine Legacy-Einträge in rc.local gefunden.")
+        print(f"{GREEN}✓{RESET} Keine Legacy-Einträge in rc.local gefunden.")
     
     return issues
 
@@ -880,7 +889,7 @@ def fix_legacy_autostart(issues):
                 new_lines.append(line)
             with open(rc_local, "w") as f:
                 f.writelines(new_lines)
-            print(f"✓ {rc_local} bereinigt.")
+            print(f"{GREEN}✓{RESET} {rc_local} bereinigt.")
             
             # Laufende Screen-Sessions killen (sowohl User als auch Root/Andere)
             print("  → Beende laufende E3DC Screen-Sessions (Cleanup)...")
@@ -890,11 +899,11 @@ def fix_legacy_autostart(issues):
             # Service neu starten, um sauberen Zustand zu haben
             print("  → Starte E3DC-Service neu...")
             run_command("sudo systemctl restart e3dc")
-            print("✓ Service neu gestartet.")
+            print(f"{GREEN}✓{RESET} Service neu gestartet.")
             perm_logger.info("Legacy Autostart entfernt und Service neu gestartet.")
             
         except Exception as e:
-            print(f"✗ Fehler: {e}")
+            print(f"{RED}✗{RESET} Fehler: {e}")
             perm_logger.error(f"Fehler beim Fixen von Legacy Autostart: {e}")
             success = False
             
@@ -912,7 +921,7 @@ def check_and_set_config_defaults():
     config_file = os.path.join(install_path, "e3dc.config.txt")
 
     if not os.path.exists(config_file):
-        print(f"✗ Konfigurationsdatei {config_file} nicht gefunden. Prüfung übersprungen.")
+        print(f"{RED}✗{RESET} Konfigurationsdatei {config_file} nicht gefunden. Prüfung übersprungen.")
         perm_logger.warning(f"e3dc.config.txt nicht gefunden, Prüfung der Standardwerte übersprungen.")
         return True # Kein Fehler, da die Datei vielleicht erst später erstellt wird.
 
@@ -934,11 +943,11 @@ def check_and_set_config_defaults():
         for key, value in defaults_to_check.items():
             if key.lower() not in existing_keys:
                 missing_keys_to_add.append(f"{key} = {value}")
-                print(f"✗ Variable '{key}' fehlt in e3dc.config.txt.")
+                print(f"{RED}✗{RESET} Variable '{key}' fehlt in e3dc.config.txt.")
                 perm_logger.warning(f"Variable '{key}' fehlt in e3dc.config.txt.")
 
         if not missing_keys_to_add:
-            print("✓ Alle notwendigen UI-Konfigurationsvariablen sind vorhanden.\n")
+            print(f"{GREEN}✓{RESET} Alle notwendigen UI-Konfigurationsvariablen sind vorhanden.\n")
             perm_logger.info("Alle UI-Konfigurationsvariablen vorhanden.")
             return True
         else:
@@ -949,10 +958,10 @@ def check_and_set_config_defaults():
             content += "\n".join(missing_keys_to_add) + "\n"
             with open(config_file, "w", encoding="utf-8") as f:
                 f.write(content)
-            print("\n✓ Konfigurationsdatei aktualisiert.\n")
+            print(f"\n{GREEN}✓{RESET} Konfigurationsdatei aktualisiert.\n")
             return True
     except Exception as e:
-        print(f"✗ Fehler beim Lesen oder Schreiben von {config_file}: {e}")
+        print(f"{RED}✗{RESET} Fehler beim Lesen oder Schreiben von {config_file}: {e}")
         perm_logger.error(f"Fehler beim Prüfen/Setzen der Config-Defaults: {e}")
         return False
 
@@ -965,7 +974,7 @@ def check_config_duplicates():
     config_file = os.path.join(install_path, "e3dc.config.txt")
 
     if not os.path.exists(config_file):
-        print(f"✓ Konfigurationsdatei {config_file} nicht gefunden. Übersprungen.")
+        print(f"{GREEN}✓{RESET} Konfigurationsdatei {config_file} nicht gefunden. Übersprungen.")
         return True
 
     try:
@@ -989,7 +998,7 @@ def check_config_duplicates():
                 key = parts[0].strip().lower()
                 
                 if key in seen_keys:
-                    print(f"  ✗ Duplikat gefunden und entfernt: {parts[0].strip()} (Zeile: {stripped})")
+                    print(f"  {RED}✗{RESET} Duplikat gefunden und entfernt: {parts[0].strip()} (Zeile: {stripped})")
                     perm_logger.warning(f"Duplikat entfernt: {parts[0].strip()}")
                     duplicates_found = True
                     removed_count += 1
@@ -1004,16 +1013,16 @@ def check_config_duplicates():
             print(f"\n→ Entferne {removed_count} Duplikate (behalte jeweils das erste)...")
             with open(config_file, "w", encoding="utf-8") as f:
                 f.writelines(new_lines)
-            print("✓ Konfigurationsdatei bereinigt.\n")
+            print(f"{GREEN}✓{RESET} Konfigurationsdatei bereinigt.\n")
             perm_logger.info(f"Konfigurationsdatei bereinigt, {removed_count} Duplikate entfernt.")
             return True
         else:
-            print("✓ Keine Duplikate gefunden.\n")
+            print(f"{GREEN}✓{RESET} Keine Duplikate gefunden.\n")
             perm_logger.info("Keine Duplikate in Konfiguration gefunden.")
             return True
 
     except Exception as e:
-        print(f"✗ Fehler bei der Duplikat-Prüfung: {e}")
+        print(f"{RED}✗{RESET} Fehler bei der Duplikat-Prüfung: {e}")
         perm_logger.error(f"Fehler bei Duplikat-Prüfung: {e}")
         return False
 
@@ -1044,7 +1053,7 @@ def run_permissions_wizard(headless=False):
 
     has_issues = bool(issues) or bool(wp_issues) or bool(file_issues) or bool(cron_issues) or bool(sudo_issues) or bool(service_issues) or bool(legacy_issues)
     if not has_issues:
-        print("\n✓ Alle Berechtigungen, Cronjobs und Services sind korrekt.\n")
+        print(f"\n{GREEN}✓{RESET} Alle Berechtigungen, Cronjobs und Services sind korrekt.\n")
         perm_logger.info("✓ Prüfung bestanden: Keine Probleme gefunden.")
         log_task_completed("Rechte prüfen & korrigieren", details="Alle Checks OK")
         return
@@ -1055,7 +1064,7 @@ def run_permissions_wizard(headless=False):
     if not headless:
         choice = input("Automatisch korrigieren? (j/n): ").strip().lower()
         if choice != "j":
-            print("✗ Korrektur übersprungen.\n")
+            print(f"{RED}✗{RESET} Korrektur übersprungen.\n")
             perm_logger.warning("✗ Korrektur vom Benutzer übersprungen.")
             log_warning("permissions", "Korrektur vom Benutzer übersprungen")
             return
@@ -1086,7 +1095,7 @@ def run_permissions_wizard(headless=False):
         all_success = all_success and success
 
     if all_success:
-        print("\n✓ Alle Probleme korrigiert.\n")
+        print(f"\n{GREEN}✓{RESET} Alle Probleme korrigiert.\n")
         perm_logger.info("✓ Alle Korrekturen erfolgreich durchgeführt.")
         log_task_completed("Rechte prüfen & korrigieren", details="Alle Probleme behoben")
     else:

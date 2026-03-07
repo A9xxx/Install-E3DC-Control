@@ -7,6 +7,11 @@ from .installer_config import get_install_user, get_install_path, load_config, g
 
 status_logger = get_or_create_logger("status_check")
 
+# ANSI Colors
+GREEN = '\033[92m'
+RED = '\033[91m'
+RESET = '\033[0m'
+
 def check_internet_connection():
     """Prüft die Internetverbindung (Ping zu Google DNS)."""
     res = run_command("ping -c 1 -W 2 8.8.8.8")
@@ -63,9 +68,9 @@ def show_system_status():
     # 0. Internet Check
     print("--- Netzwerk ---")
     if check_internet_connection():
-        print("✓ Internetverbindung: OK (Ping 8.8.8.8)")
+        print(f"{GREEN}✓{RESET} Internetverbindung: OK (Ping 8.8.8.8)")
     else:
-        print("✗ Internetverbindung: FEHLGESCHLAGEN")
+        print(f"{RED}✗{RESET} Internetverbindung: FEHLGESCHLAGEN")
         issues_found.append("internet")
 
     # 1. E3DC-Control Service
@@ -76,14 +81,14 @@ def show_system_status():
         print("⚪ Service 'e3dc': Nicht installiert (Systemd)")
         # Fallback Check Screen
         if check_screen_session("E3DC"):
-            print("✓ Screen-Session 'E3DC': Gefunden (Legacy Mode)")
+            print(f"{GREEN}✓{RESET} Screen-Session 'E3DC': Gefunden (Legacy Mode)")
         else:
-            print("✗ Screen-Session 'E3DC': Nicht gefunden")
+            print(f"{RED}✗{RESET} Screen-Session 'E3DC': Nicht gefunden")
             print("  -> E3DC-Control läuft nicht.")
             issues_found.append("e3dc_not_running")
     else:
-        status_icon = "✓" if e3dc_srv["active"] else "✗"
-        enabled_icon = "✓" if e3dc_srv["enabled"] else "✗"
+        status_icon = f"{GREEN}✓{RESET}" if e3dc_srv["active"] else f"{RED}✗{RESET}"
+        enabled_icon = f"{GREEN}✓{RESET}" if e3dc_srv["enabled"] else f"{RED}✗{RESET}"
         
         print(f"{status_icon} Service Status: {'Aktiv (running)' if e3dc_srv['active'] else 'Inaktiv (stopped/failed)'}")
         print(f"{enabled_icon} Autostart:     {'Aktiviert (enabled)' if e3dc_srv['enabled'] else 'Deaktiviert (disabled)'}")
@@ -105,8 +110,8 @@ def show_system_status():
     if guard_srv["status"] == "not_installed":
         print("⚪ Service 'piguard': Nicht installiert")
     else:
-        status_icon = "✓" if guard_srv["active"] else "✗"
-        enabled_icon = "✓" if guard_srv["enabled"] else "✗"
+        status_icon = f"{GREEN}✓{RESET}" if guard_srv["active"] else f"{RED}✗{RESET}"
+        enabled_icon = f"{GREEN}✓{RESET}" if guard_srv["enabled"] else f"{RED}✗{RESET}"
         
         print(f"{status_icon} Service Status: {'Aktiv (running)' if guard_srv['active'] else 'Inaktiv (stopped/failed)'}")
         print(f"{enabled_icon} Autostart:     {'Aktiviert (enabled)' if guard_srv['enabled'] else 'Deaktiviert (disabled)'}")
@@ -127,12 +132,28 @@ def show_system_status():
     if grabber_srv["status"] == "not_installed":
         # Fallback: Prüfe auf alte Screen-Session
         if check_screen_session("live-grabber"):
-            print("✓ Screen-Session 'live-grabber': Gefunden (Legacy Mode)")
+            print(f"{GREEN}✓{RESET} Screen-Session 'live-grabber': Gefunden (Legacy Mode)")
         else:
             print("⚪ Service 'e3dc-grabber': Nicht installiert")
     else:
-        status_icon = "✓" if grabber_srv["active"] else "✗"
+        status_icon = f"{GREEN}✓{RESET}" if grabber_srv["active"] else f"{RED}✗{RESET}"
+        enabled_icon = f"{GREEN}✓{RESET}" if grabber_srv["enabled"] else f"{RED}✗{RESET}"
         print(f"{status_icon} Service Status: {'Aktiv (running)' if grabber_srv['active'] else 'Inaktiv'}")
+        print(f"{enabled_icon} Autostart:     {'Aktiviert (enabled)' if grabber_srv['enabled'] else 'Deaktiviert (disabled)'}")
+
+    # 2c. Luxtronik Manager
+    print("\n--- Luxtronik Manager ---")
+    lux_srv = check_service_details("energy_manager")
+    
+    if lux_srv["status"] == "not_installed":
+        print("⚪ Service 'energy_manager': Nicht installiert")
+    else:
+        status_icon = f"{GREEN}✓{RESET}" if lux_srv["active"] else f"{RED}✗{RESET}"
+        enabled_icon = f"{GREEN}✓{RESET}" if lux_srv["enabled"] else f"{RED}✗{RESET}"
+        print(f"{status_icon} Service Status: {'Aktiv (running)' if lux_srv['active'] else 'Inaktiv'}")
+        print(f"{enabled_icon} Autostart:     {'Aktiviert (enabled)' if lux_srv['enabled'] else 'Deaktiviert (disabled)'}")
+        if not lux_srv["active"] and lux_srv["enabled"]:
+             issues_found.append("luxtronik_failed")
 
     # 3. System-Ressourcen
     print("\n--- System-Ressourcen ---")
@@ -219,10 +240,13 @@ def show_system_status():
         if "ramdisk_missing" in issues_found:
             print("• RAM-Disk fehlt: Nutze Menüpunkt '14' (Live-Status & RAM-Disk Setup).")
             
+        if "luxtronik_failed" in issues_found:
+            print("• Luxtronik Fehler: Prüfe 'journalctl -u energy_manager -e' oder die config.lux.json.")
+            
         if "venv_missing" in issues_found:
             print("• Venv fehlt: Nutze Menüpunkt '22' (Python venv einrichten) zur Reparatur.")
     else:
-        print("\n✓ Keine offensichtlichen Probleme gefunden.")
+        print(f"\n{GREEN}✓{RESET} Keine offensichtlichen Probleme gefunden.")
 
     print("\n==============================\n")
     log_task_completed("System-Statusprüfung")

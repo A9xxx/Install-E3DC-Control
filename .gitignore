@@ -48,7 +48,7 @@ env/
 
 # Git
 *.orig
+.git/
 
 # Luxtronik (Privat)
-Installer/luxtronik/
-luxtronik.php
+Installer/luxtronik/test

@@ -24,5 +24,6 @@ __all__ = [
     "ramdisk",
     "uninstall",
     "install_all",
-    "self_update"
+    "self_update",
+    "install_luxtronik"
 ]

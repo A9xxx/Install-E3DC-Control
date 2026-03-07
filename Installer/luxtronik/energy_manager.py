@@ -37,6 +37,7 @@ def main():
     GRID_START_LIMIT = cfg.get('GRID_START_LIMIT', -3500) 
     MIN_SOC = cfg.get('MIN_SOC', 80)
     AT_LIMIT = cfg.get('AT_LIMIT', 10.0)
+    AUTO_MODE = int(cfg.get('auto_mode', 1))
     
     # Stop-Verzögerung: Wie lange darf Strom aus Netz/Akku gezogen werden?
     STOP_DELAY_MINUTES = 10 
@@ -65,8 +66,11 @@ def main():
     except: pass
 
     print(f"Energy-Manager gestartet...")
-    print(f"Start bei > {abs(GRID_START_LIMIT)}W Einspeisung.")
-    print(f"Stop nach {STOP_DELAY_MINUTES} min Bezug (Netz oder Batterie).")
+    if AUTO_MODE == 0:
+        print("Automatik-Regelung ist DEAKTIVIERT (Nur Monitoring).")
+    else:
+        print(f"Start bei > {abs(GRID_START_LIMIT)}W Einspeisung.")
+        print(f"Stop nach {STOP_DELAY_MINUTES} min Bezug (Netz oder Batterie).")
 
     while True:
         now = datetime.now()
@@ -87,7 +91,7 @@ def main():
                     if os.path.exists(FLAG_FILE):
                         print(f"[{now.strftime('%H:%M:%S')}] Manueller Boost erkannt (Flag). Warte im Standby.")
                         boost_active = False
-                    elif wp_status.get('WW_Mode') == 1 or wp_status.get('HZ_Mode') == 1:
+                    elif AUTO_MODE == 1 and (wp_status.get('WW_Mode') == 1 or wp_status.get('HZ_Mode') == 1):
                         print(f"[{now.strftime('%H:%M:%S')}] WP ist bereits im Boost-Modus. Übernehme Status.")
                         boost_active = True
                     first_run = False
@@ -105,7 +109,7 @@ def main():
                 print(f"[{now.strftime('%H:%M:%S')}] Verbindung zur WP fehlgeschlagen")
 
             # 2. Logik (Überschuss-Prüfung)
-            if not os.path.exists(FLAG_FILE):
+            if not os.path.exists(FLAG_FILE) and AUTO_MODE == 1:
                 try:
                     r = requests.get("http://localhost/get_live_json.php", timeout=5)
                     if r.status_code == 200:
@@ -192,6 +196,7 @@ def main():
                 "data": wp_data,
                 "status": wp_status,
                 "boost_active": boost_active,
+                "auto_mode": AUTO_MODE,
                 "success": success
             }
 

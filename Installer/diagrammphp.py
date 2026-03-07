@@ -475,7 +475,9 @@ class DiagramInstaller:
                 "path": "/etc/sudoers.d/010_e3dc_web_git",
                 "lines": [
                     f"www-data ALL=({self.install_user}) NOPASSWD: /usr/bin/git",
-                    "www-data ALL=NOPASSWD: /bin/systemctl restart e3dc"
+                    "www-data ALL=NOPASSWD: /bin/systemctl restart e3dc",
+                    "www-data ALL=NOPASSWD: /bin/systemctl restart energy_manager",
+                    "www-data ALL=NOPASSWD: /bin/systemctl is-active energy_manager"
                 ],
                 "desc": "Git & Service-Steuerung"
             },

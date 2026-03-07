@@ -735,7 +735,7 @@ def check_sudoers_permissions():
         },
         {
             "file": "/etc/sudoers.d/010_e3dc_web_git",
-            "content": "www-data ALL=(root) NOPASSWD: /usr/bin/git, /bin/systemctl",
+            "content": f"www-data ALL=({INSTALL_USER}) NOPASSWD: /usr/bin/git\nwww-data ALL=NOPASSWD: /bin/systemctl restart e3dc\nwww-data ALL=NOPASSWD: /bin/systemctl restart energy_manager\nwww-data ALL=NOPASSWD: /bin/systemctl is-active energy_manager",
             "description": "Web-Steuerung (git/systemctl)"
         }
     ]
@@ -805,6 +805,10 @@ def check_services():
     # Live-Grabber Service
     if os.path.exists("/etc/systemd/system/e3dc-grabber.service"):
         services_to_check.append("e3dc-grabber")
+
+    # Luxtronik Manager
+    if os.path.exists("/etc/systemd/system/energy_manager.service"):
+        services_to_check.append("energy_manager")
 
     for srv in services_to_check:
         # Check status

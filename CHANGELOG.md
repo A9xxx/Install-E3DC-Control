@@ -1,5 +1,48 @@
 # Changelog
 
+## [3.0.1] - 2026-03-07 - Luxtronik Komfort-Funktionen & Fixes
+
+### 🔥 Luxtronik
+*   **Urlaubsmodus:** Neuer Schalter "Automatik-Regelung" in den Einstellungen. Deaktiviert den PV-Boost, behält aber die Anzeige bei.
+*   **Globaler Schalter:** Integration kann nun direkt in der Konfiguration (Desktop & Mobile) komplett ein-/ausgeschaltet werden.
+*   **Service-Steuerung:** Der `energy_manager` Dienst kann nun direkt über das Web-Interface neu gestartet werden.
+
+### ⚙️ System
+*   **Rechte-Management:** Erweiterte Sudo-Rechte für `www-data` zur Steuerung des `energy_manager` Services.
+*   **Status-Check:** Der `energy_manager` wird nun vom Status-Check und der Rechte-Reparatur (`permissions.py`) überwacht.
+
+## [3.0.0] - 2026-03-07 - Luxtronik Integration & Dashboard 3.0
+
+### 🔥 Luxtronik Energy Manager (NEU)
+*   **Vollständige Integration:** Steuerung von Luxtronik 2.0/2.1 Wärmepumpen (Alpha Innotec, Novelan) via Modbus TCP.
+*   **PV-Überschuss:** Automatischer Boost für Warmwasser und Heizung bei Solarüberschuss und vollem Speicher.
+*   **Web-Interface:** Eigene Kachel im Dashboard und detaillierte Steuerungsseite (`luxtronik.php`) mit Live-Werten (COP, Temperaturen, Frequenz).
+*   **Smart-Features:**
+    *   **Auto-Boost:** Intelligente Anhebung der Sollwerte basierend auf PV-Leistung und SoC.
+    *   **Manuell-Boost:** "Batterie leeren" Funktion für den Morgen (Warmwasser aufheizen).
+    *   **Sommer-Logik:** Automatische Abschaltung der Heizkreis-Anhebung bei hohen Außentemperaturen.
+    *   **Frequenz-Anzeige:** Visualisierung der Verdichter-Frequenz (Soll/Ist) für Inverter-Modelle.
+
+### 📱 Dashboard & Mobile UI
+*   **Auto-Boost Badge:** Pulsierendes "Auto"-Badge in der Wärmepumpen-Kachel, wenn der Energy Manager aktiv regelt.
+*   **Mobile Navigation:** Neuer Tab "WP" in der mobilen Ansicht für schnellen Zugriff auf die Wärmepumpe.
+*   **Usability:** Verbesserte Darstellung von Status-Meldungen und Tooltips für Soll-Werte.
+
+### ⚙️ Installer & System
+*   **Modulares Setup:** Neues Installationsmodul für Luxtronik (`install_luxtronik.py`) im Menü "Erweiterungen".
+*   **Service-Integration:** Der `energy_manager` läuft als eigenständiger Systemd-Service mit Watchdog-Überwachung.
+*   **Rechte-Management:** Automatische Konfiguration der Berechtigungen für Config-Dateien und Logs.
+*   **Release-Workflow:** Optimierte Build-Pipeline bereinigt nun rekursiv alle Entwickler-Dateien (`.git`, `__pycache__`) aus dem Release-Paket.
+
+## [2026.03.05] - Web-Update Stabilität & Cloudflare Fixes
+
+### 🔄 Update-System
+*   **Cloudflare-Kompatibilität:** Das Web-Update funktioniert nun auch zuverlässig über Cloudflare Tunnel. Caching-Probleme bei Status-Abfragen wurden durch Zeitstempel-Bypassing behoben.
+*   **Echtzeit-Logs:** Die Ausgabe des Update-Prozesses wird nun ungepuffert an das Web-Interface gesendet. Das "Warte auf Ausgabe..." Problem wurde durch Deaktivierung des Output-Bufferings in Python und PHP gelöst.
+*   **Prozess-Steuerung:** Optimierte `sudo`-Aufrufe im Backend verhindern Passwort-Abfragen, die das Update blockieren könnten.
+*   **UI-Feedback:** Das Update-Fenster erkennt nun zuverlässig den Abschluss des Vorgangs anhand von Log-Meldungen ("Erfolgreich abgeschlossen"), selbst wenn der Hintergrundprozess verzögert beendet wird.
+*   **Robustheit:** Verbesserte Fehlerbehandlung bei Sonderzeichen in Log-Dateien verhindert Abstürze der Status-Anzeige.
+
 ## [2026.03.04] - Wallbox-Status, Diagramm-Details & Installer-Fixes
 
 ### 🔌 Wallbox & UI

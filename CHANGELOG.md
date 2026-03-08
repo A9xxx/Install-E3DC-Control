@@ -1,5 +1,27 @@
 # Changelog
 
+# Changelog
+
+## [3.1.1] - 2026-03-08 - Installer Hotfix
+
+### 🔧 Installer
+*   **Bugfix:** `service_setup.py` akzeptiert nun den Parameter `headless`, was Abstürze bei der automatischen Installation behebt.
+*   **Stabilität:** Timeout für die Erstellung des Python venv in `system.py` erhöht (Fix für Timeout-Fehler in Schritt 2).
+
+## [3.1.0] - 2026-03-08 - Live Energiefluss & Visualisierung
+
+### 📊 Visualisierung
+*   **Live Energiefluss:** Komplett neue, animierte Darstellung der Energieflüsse für Desktop und Mobile.
+*   **Smart-Animation:** Dynamische Geschwindigkeit und Dichte der Partikel basierend auf der aktuellen Leistung.
+*   **Status-Feedback:** Visuelle Indikatoren für Netzeinspeisung (Grün), Batterie-Füllstand und WP-Boost.
+
+### 🔥 Luxtronik
+*   **Optimierung:** Berechnung der Verdichterfrequenz aus Leistungsdaten und verbesserte Reaktionszeit bei Konfigurationsänderungen.
+*   **Bugfix:** Korrekte Übernahme neuer Sollwerte auch während aktiver Boost-Phasen.
+
+### ⚙️ System
+*   **Stabilität:** Verbesserte Filterung von ungültigen Messwerten (0-Spikes) im Live-Daten-Stream.
+
 ## [3.0.1] - 2026-03-07 - Luxtronik Komfort-Funktionen & Fixes
 
 ### 🔥 Luxtronik

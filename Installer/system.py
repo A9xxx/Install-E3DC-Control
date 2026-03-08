@@ -41,7 +41,7 @@ def setup_venv(show_header=False):
     if not os.path.exists(venv_path):
         print("→ Erstelle venv…")
         # Erstelle venv mit Zugriff auf System-Pakete (für apt-installierte Module wie RPi.GPIO falls nötig)
-        res = run_command(f"sudo -u {install_user} python3 -m venv {venv_path} --system-site-packages")
+        res = run_command(f"sudo -u {install_user} python3 -m venv {venv_path} --system-site-packages", timeout=60)
         if res['success']:
             print("✓ venv erstellt.")
             system_logger.info(f"Virtual Environment erstellt: {venv_path}")

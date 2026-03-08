@@ -98,7 +98,7 @@ def start_e3dc_control(headless=False):
         log_error("service_setup", f"Start fehlgeschlagen: {result['stderr']}")
 
 
-def install_e3dc_service():
+def install_e3dc_service(headless=False):
     """Richtet E3DC als Systemd Service ein und entfernt alte Cronjobs."""
     print("\n=== E3DC-Control Service einrichten (Systemd) ===\n")
     service_logger.info("Starte Service-Einrichtung.")

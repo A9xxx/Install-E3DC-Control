@@ -2,6 +2,23 @@
 
 # Changelog
 
+## [3.1.2] - 2026-03-08 - Luxtronik Energy Manager Upgrade
+
+### 🔥 Luxtronik Energy Manager
+*   **Strompreis-Boost:** Intelligente Anhebung bei günstigen Preisen (aWATTar/Tibber) mit Vorlauf-Pause (1h) zur Erholung der Quelle.
+*   **Smart-Logic:**
+    *   **Zwangs-Boost:** Neuer Parameter `price_hard_limit` (z.B. -5 ct) ignoriert Tageslimits und Sperrzeiten bei Negativpreisen.
+    *   **Saison-Steuerung:** Preis-Boost beachtet nun auch die Außentemperatur-Grenze (`AT_LIMIT`) und schaltet im Sommer nur Warmwasser, im Winter auch Heizung.
+    *   **18h-Sperre:** Kein Preis-Boost, wenn das Haus durch PV-Strom bereits aufgeheizt wurde (verhindert unnötigen Netzbezug).
+    *   **WQ-Schutz:** Überwachung der Sole-Austrittstemperatur mit Not-Abschaltung des Boosts bei Unterschreitung (konfigurierbar).
+*   **Sicherheit:**
+    *   **Manuell-Boost:** Automatische Abschaltung nach 3 Stunden oder bei Unterschreitung eines Mindest-SoC (Standard 25%).
+    *   **Persistenz:** Status-Wiederherstellung nach Neustarts verhindert "Endlos-Boosts" bei Systemausfällen.
+
+### ⚙️ Web-Interface
+*   **Konfiguration:** Neue Felder für Preis-Limits, WQ-Temperatur und SoC-Schutz in den Luxtronik-Einstellungen (`luxtronik.php`).
+*   **Visualisierung:** Anzeige der neuen Schutzparameter in der Konfigurationsübersicht.
+
 ## [3.1.1] - 2026-03-08 - Installer Hotfix
 
 ### 🔧 Installer

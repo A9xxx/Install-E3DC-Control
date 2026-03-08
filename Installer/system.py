@@ -11,7 +11,7 @@ from .logging_manager import get_or_create_logger, log_task_completed, log_error
 INSTALL_PATH = get_install_path()
 system_logger = get_or_create_logger("system")
 
-PYTHON_PACKAGES = ["plotly>=5.0", "pandas-stubs", "pandas", "pytz", "matplotlib", "paho-mqtt", "requests", "pymodbus"]
+PYTHON_PACKAGES = ["plotly>=5.0", "pandas-stubs", "pandas", "pytz", "matplotlib", "paho-mqtt", "requests"]
 
 def get_venv_name():
     return load_config().get("venv_name", ".venv_e3dc")
@@ -137,7 +137,7 @@ def install_system_packages(use_venv=True):
     log_task_completed("Systempakete installieren")
 
 
-def install_e3dc_control():
+def install_e3dc_control(headless=False):
     """Klont und kompiliert E3DC-Control."""
     print("\n=== E3DC-Control installieren ===\n")
     system_logger.info("Starte Installation von E3DC-Control (Klonen & Kompilieren).")
@@ -154,7 +154,7 @@ def install_e3dc_control():
 
     if os.path.exists(INSTALL_PATH):
         print("⚠ E3DC-Control existiert bereits.")
-        choice = input("Überschreiben? (j/n): ").strip().lower()
+        choice = "j" if headless else input("Überschreiben? (j/n): ").strip().lower()
         if choice != "j":
             print("→ Schritt übersprungen, verwende vorhandene Installation.\n")
             system_logger.warning("Installation von E3DC-Control übersprungen, da Verzeichnis bereits existiert.")

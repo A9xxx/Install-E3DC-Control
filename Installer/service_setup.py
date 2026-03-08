@@ -35,7 +35,7 @@ def is_e3dc_running():
     return False
 
 
-def start_e3dc_control():
+def start_e3dc_control(headless=False):
     """Startet E3DC-Control (via Systemd bevorzugt)."""
     print("\n=== E3DC-Control starten ===\n")
     service_logger.info("Versuche E3DC-Control zu starten.")
@@ -63,7 +63,7 @@ def start_e3dc_control():
 
     if not os.path.exists(sh_path) or not os.path.exists("/etc/systemd/system/e3dc.service"):
         print("⚠ E3DC-Service ist noch nicht eingerichtet.")
-        choice = input("Soll der E3DC-Service jetzt installiert werden (empfohlen)? (j/n): ").strip().lower()
+        choice = "j" if headless else input("Soll der E3DC-Service jetzt installiert werden (empfohlen)? (j/n): ").strip().lower()
         if choice == "j":
             install_e3dc_service()
             start_e3dc_control()

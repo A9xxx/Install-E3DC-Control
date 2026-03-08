@@ -109,19 +109,13 @@ class LuxtronikModbus:
             data['Warmwasser_Soll'] = to_s(ww_regs[1])
 
         # 7. Aktuelle Leistung (Elektrisch & Thermisch)
-        # 10300: Elektrische Leistungsaufnahme in Watt (Verdichter + System)
-        # 10301: Thermische Heizleistung in Watt
+        # 10300: Thermische Heizleistung in kW (x10) -> z.B. 65 = 6.5 kW
+        # 10301: Elektrische Leistungsaufnahme in W (x100) -> z.B. 15 = 1500 W
         p_regs = self._send_request(4, 10300, 2)
         if p_regs:
-            # Stromverbrauch in Watt (für das Dashboard "Akt. Verbrauch")
-            data['Leistung_Heiz_kW'] = p_regs[0] /10
-            
-            # Heizleistung (Thermisch) umrechnen in kW
-            # HINWEIS: Meistens wird der Wert direkt in Watt gesendet (/ 1000.0).
-            # Falls im Dashboard später utopische Werte stehen (z.B. "6500 kW"), 
-            # sendet deine Firmware den Wert in 100W-Schritten. 
-            # Ändere es dann einfach auf: p_regs[1] / 10 
-            data['Leistung_Verdichter_W'] = p_regs[1] *100
+            data['Leistung_Heiz_kW'] = p_regs[0] / 10.0
+            # Skalierung x100 für grobe 100W-Schritte (15 -> 1500W)
+            data['Leistung_Verdichter_W'] = p_regs[1] * 100.0
 
         # Energie Zähler
         e_elek_hw = self._send_request(4, 10310, 1)
@@ -134,13 +128,6 @@ class LuxtronikModbus:
         if e_waerme_hw and e_waerme_lw:
             data['Energie_Waerme_kWh'] = ((e_waerme_hw[0] << 16) + e_waerme_lw[0])
         
-        # 8. Inverter Frequenz (Register 10140=Soll, 10141=Ist)
-        freq = self._send_request(4, 10140, 2)
-        if freq:
-            data['Verdichter_Frequenz_Soll'] = freq[0] / 10
-            data['Verdichter_Frequenz_Ist'] = freq[1] / 10
-            data['Verdichter_Frequenz'] = freq[1] / 10 # Hauptwert auf Ist setzen
-
         return data
 
     def read_shi_status(self):

@@ -165,10 +165,14 @@ def save_entries(parsed_prices):
         return False
 
 
-def strompreis_wizard():
+def strompreis_wizard(headless=False):
     """Hauptlogik für Strompreis-Konfiguration."""
     print("\n=== Strompreis-Wizard ===\n")
     strom_logger.info("Starte Strompreis-Wizard")
+
+    if headless:
+        print("Headless-Modus: Überspringe interaktive Eingabe.")
+        return
 
     entries = load_entries()
     if entries is None:

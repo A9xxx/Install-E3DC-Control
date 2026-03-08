@@ -10,8 +10,10 @@ CONFIG_FILE = os.path.join(INSTALL_PATH, "e3dc.config.txt")
 config_logger = get_or_create_logger("config")
 
 
-def ask(prompt, default=None):
+def ask(prompt, default=None, headless=False):
     """Fragt Benutzer mit Standardwert ab."""
+    if headless:
+        return default
     value = input(f"{prompt} [{default}]: ").strip()
     return value if value else default
 
@@ -70,13 +72,13 @@ def copy_existing_config():
         return False
 
 
-def create_e3dc_config():
+def create_e3dc_config(headless=False):
     """Kompletter Config-Wizard mit allen Parametern und Defaults."""
     print("\n=== E3DC-Konfiguration erstellen ===\n")
     config_logger.info("Starte Konfigurations-Wizard.")
     
     # Prüfen ob vorhandene Config kopiert werden soll
-    copy_existing = ask("Möchtest du eine vorhandene e3dc.config.txt kopieren? (j/n)", "n")
+    copy_existing = ask("Möchtest du eine vorhandene e3dc.config.txt kopieren? (j/n)", "n", headless)
     
     if copy_existing and copy_existing.lower() == "j":
         if copy_existing_config():
@@ -91,49 +93,49 @@ def create_e3dc_config():
     # GRUNDDATEN
     # =========================================================
     print("--- GRUNDDATEN ---\n")
-    cfg["server_ip"] = ask("E3DC IP-Adresse", "192.168.178.2")
-    cfg["server_port"] = ask("Port", "5033")
-    cfg["user"] = ask("Benutzername", "local.user")
-    cfg["password"] = ask("Passwort", "1234")
-    cfg["aes"] = ask("AES-Passwort", "1234")
-    cfg["stop"] = ask("Stop-Flag", "0")
+    cfg["server_ip"] = ask("E3DC IP-Adresse", "192.168.178.2", headless)
+    cfg["server_port"] = ask("Port", "5033", headless)
+    cfg["user"] = ask("Benutzername", "local.user", headless)
+    cfg["password"] = ask("Passwort", "1234", headless)
+    cfg["aes"] = ask("AES-Passwort", "1234", headless)
+    cfg["stop"] = ask("Stop-Flag", "0", headless)
 
     # =========================================================
     # LEISTUNGS- UND SPEICHERPARAMETER
     # =========================================================
     print("\n--- LEISTUNGS- UND SPEICHERPARAMETER ---\n")
-    cfg["wrleistung"] = ask("Wechselrichterleistung (W)", "11700")
-    cfg["speichergroesse"] = ask("Speichergröße (kWh)", "35")
-    cfg["speicherEV"] = ask("Speicher Eigenverbrauch (W)", "80")
-    cfg["speicherETA"] = ask("Speicher Wirkungsgrad", "0.97")
-    cfg["einspeiselimit"] = ask("Einspeiselimit (kW)", "10.3")
-    cfg["unload"] = ask("Unload (%)", "65")
-    cfg["ladeschwelle"] = ask("Ladeschwelle (%)", "70")
-    cfg["ladeende"] = ask("Ladeende (%)", "85")
-    cfg["ladeende2"] = ask("Ladeende2 (%)", "91")
-    cfg["Ladeende2rampe"] = ask("Ladeende2-Rampe", "2")
-    cfg["maximumLadeleistung"] = ask("Maximale Ladeleistung (W)", "12500")
-    cfg["powerfaktor"] = ask("Powerfaktor", "1.75")
-    cfg["rb"] = ask("Regelbeginn", "7")
-    cfg["re"] = ask("Regelende", "12.5")
-    cfg["le"] = ask("Ladeende", "14.2")
+    cfg["wrleistung"] = ask("Wechselrichterleistung (W)", "11700", headless)
+    cfg["speichergroesse"] = ask("Speichergröße (kWh)", "35", headless)
+    cfg["speicherEV"] = ask("Speicher Eigenverbrauch (W)", "80", headless)
+    cfg["speicherETA"] = ask("Speicher Wirkungsgrad", "0.97", headless)
+    cfg["einspeiselimit"] = ask("Einspeiselimit (kW)", "10.3", headless)
+    cfg["unload"] = ask("Unload (%)", "65", headless)
+    cfg["ladeschwelle"] = ask("Ladeschwelle (%)", "70", headless)
+    cfg["ladeende"] = ask("Ladeende (%)", "85", headless)
+    cfg["ladeende2"] = ask("Ladeende2 (%)", "91", headless)
+    cfg["Ladeende2rampe"] = ask("Ladeende2-Rampe", "2", headless)
+    cfg["maximumLadeleistung"] = ask("Maximale Ladeleistung (W)", "12500", headless)
+    cfg["powerfaktor"] = ask("Powerfaktor", "1.75", headless)
+    cfg["rb"] = ask("Regelbeginn", "7", headless)
+    cfg["re"] = ask("Regelende", "12.5", headless)
+    cfg["le"] = ask("Ladeende", "14.2", headless)
 
     # =========================================================
     # WALLBOX
     # =========================================================
     print("\n--- WALLBOX ---\n")
-    wb = ask("Wallbox vorhanden? (j/n)", "j")
+    wb = ask("Wallbox vorhanden? (j/n)", "j", headless)
     cfg["wallbox"] = (wb.lower() == "j")
 
     if cfg["wallbox"]:
-        cfg["wbmode"] = ask("WB Modus", "4")
-        cfg["wbminlade"] = ask("WB Mindestladeleistung (W)", "1200")
-        cfg["wbminSoC"] = ask("WB Mindest-SoC (%)", "85")
-        cfg["wbmaxladestrom"] = ask("WB Maximalstrom (A)", "32")
-        cfg["wbminladestrom"] = ask("WB Mindeststrom (A)", "6")
-        cfg["wbhour"] = ask("WB hour-Modus", "0")
-        cfg["Wbvon"] = ask("WB hour Startzeit", "22")
-        cfg["Wbbis"] = ask("WB hour Endzeit", "6")
+        cfg["wbmode"] = ask("WB Modus", "4", headless)
+        cfg["wbminlade"] = ask("WB Mindestladeleistung (W)", "1200", headless)
+        cfg["wbminSoC"] = ask("WB Mindest-SoC (%)", "85", headless)
+        cfg["wbmaxladestrom"] = ask("WB Maximalstrom (A)", "32", headless)
+        cfg["wbminladestrom"] = ask("WB Mindeststrom (A)", "6", headless)
+        cfg["wbhour"] = ask("WB hour-Modus", "0", headless)
+        cfg["Wbvon"] = ask("WB hour Startzeit", "22", headless)
+        cfg["Wbbis"] = ask("WB hour Endzeit", "6", headless)
     else:
         # Defaults setzen, falls keine Wallbox
         cfg["wbmode"] = ""
@@ -149,16 +151,16 @@ def create_e3dc_config():
     # WÄRMEPUMPE
     # =========================================================
     print("\n--- WÄRMEPUMPE ---\n")
-    wp = ask("Wärmepumpe vorhanden? (j/n)", "n")
+    wp = ask("Wärmepumpe vorhanden? (j/n)", "n", headless)
     cfg["WP"] = (wp.lower() == "j")
 
     if cfg["WP"]:
-        cfg["shellyem_ip"] = ask("Shelly EM IP", "192.168.178.163")
-        cfg["WPHeizlast"] = ask("Heizlast (kW)", "18")
-        cfg["WPHeizgrenze"] = ask("Heizgrenze (°C)", "13")
-        cfg["WPLeistung"] = ask("Heizleistung (kW)", "20")
-        cfg["WPMin"] = ask("Min-Verbrauch (kW)", "0.5")
-        cfg["WPMax"] = ask("Max-Verbrauch (kW)", "4.7")
+        cfg["shellyem_ip"] = ask("Shelly EM IP", "192.168.178.163", headless)
+        cfg["WPHeizlast"] = ask("Heizlast (kW)", "18", headless)
+        cfg["WPHeizgrenze"] = ask("Heizgrenze (°C)", "13", headless)
+        cfg["WPLeistung"] = ask("Heizleistung (kW)", "20", headless)
+        cfg["WPMin"] = ask("Min-Verbrauch (kW)", "0.5", headless)
+        cfg["WPMax"] = ask("Max-Verbrauch (kW)", "4.7", headless)
     else:
         # Defaults setzen
         cfg["shellyem_ip"] = ""
@@ -172,15 +174,15 @@ def create_e3dc_config():
     # AWATTAR
     # =========================================================
     print("\n--- AWATTAR ---\n")
-    aw = ask("Awattar aktiv? (j/n)", "j")
+    aw = ask("Awattar aktiv? (j/n)", "j", headless)
     cfg["awattar"] = (aw.lower() == "j")
 
     if cfg["awattar"]:
-        cfg["awmwst"] = ask("MwSt (%)", "19")
-        cfg["awnebenkosten"] = ask("Nebenkosten (ct)", "15.915")
-        cfg["awaufschlag"] = ask("Aufschlag (%)", "10")
-        cfg["awland"] = ask("Land (de/at/ch)", "de")
-        cfg["awreserve"] = ask("Reserve (%)", "20")
+        cfg["awmwst"] = ask("MwSt (%)", "19", headless)
+        cfg["awnebenkosten"] = ask("Nebenkosten (ct)", "15.915", headless)
+        cfg["awaufschlag"] = ask("Aufschlag (%)", "10", headless)
+        cfg["awland"] = ask("Land (de/at/ch)", "de", headless)
+        cfg["awreserve"] = ask("Reserve (%)", "20", headless)
     else:
         cfg["awmwst"] = ""
         cfg["awnebenkosten"] = ""
@@ -192,35 +194,35 @@ def create_e3dc_config():
     # OPENMETEO + FORECAST
     # =========================================================
     print("\n--- OPENMETEO & FORECAST ---\n")
-    om = ask("OpenMeteo aktiv? (j/n)", "j")
+    om = ask("OpenMeteo aktiv? (j/n)", "j", headless)
     cfg["openmeteo"] = (om.lower() == "j")
 
     if cfg["openmeteo"]:
-        cfg["hoehe"] = ask("Breitengrad (°N)", "48.00000")
-        cfg["laenge"] = ask("Längengrad (°E)", "13.00000")
+        cfg["hoehe"] = ask("Breitengrad (°N)", "48.00000", headless)
+        cfg["laenge"] = ask("Längengrad (°E)", "13.00000", headless)
 
         print("\n--- Forecast Parameter ---")
-        cfg["forecast1"] = ask("Forecast1 (Neigung/Azimut/kWp)", "30/0/15.4")
+        cfg["forecast1"] = ask("Forecast1 (Neigung/Azimut/kWp)", "30/0/15.4", headless)
 
         # Forecast 2?
-        f2 = ask("Forecast2 hinzufügen? (j/n)", "n")
+        f2 = ask("Forecast2 hinzufügen? (j/n)", "n", headless)
         cfg["forecast2_enabled"] = (f2.lower() == "j")
         if cfg["forecast2_enabled"]:
-            cfg["forecast2"] = ask("Forecast2 (Neigung/Azimut/kWp)", "0/90/5.0")
+            cfg["forecast2"] = ask("Forecast2 (Neigung/Azimut/kWp)", "0/90/5.0", headless)
         else:
             cfg["forecast2"] = ""
 
         # Forecast 3?
-        f3 = ask("Forecast3 hinzufügen? (j/n)", "n")
+        f3 = ask("Forecast3 hinzufügen? (j/n)", "n", headless)
         cfg["forecast3_enabled"] = (f3.lower() == "j")
         if cfg["forecast3_enabled"]:
-            cfg["forecast3"] = ask("Forecast3 (Neigung/Azimut/kWp)", "0/-90/5.0")
+            cfg["forecast3"] = ask("Forecast3 (Neigung/Azimut/kWp)", "0/-90/5.0", headless)
         else:
             cfg["forecast3"] = ""
 
-        cfg["ForecastSoc"] = ask("Forecast SOC-Faktor", "1.2")
-        cfg["ForecastConsumption"] = ask("Forecast Verbrauchsfaktor", "1")
-        cfg["ForecastReserve"] = ask("Forecast Reserve (%)", "5")
+        cfg["ForecastSoc"] = ask("Forecast SOC-Faktor", "1.2", headless)
+        cfg["ForecastConsumption"] = ask("Forecast Verbrauchsfaktor", "1", headless)
+        cfg["ForecastReserve"] = ask("Forecast Reserve (%)", "5", headless)
     else:
         # Defaults setzen
         cfg["hoehe"] = ""

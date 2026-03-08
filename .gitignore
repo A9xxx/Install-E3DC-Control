@@ -20,6 +20,7 @@ Installer/installer_config.json
 *.json
 
 # Temporäre Dateien
+temp_install_dir/
 *.tmp
 *.temp
 .DS_Store

@@ -31,8 +31,11 @@ jobs:
           mkdir -p Install-E3DC-Control/Install
 
           # Repo-Inhalt in Install/ kopieren (ohne .git und .github)
-          rsync -a --exclude '.git' --exclude '.github' ./ Install-E3DC-Control/Install/
+          rsync -a --exclude '.git' --exclude '.github' --exclude '__pycache__' --exclude '.vscode' --exclude '.idea' --exclude '.gitignore' --exclude '.gitattributes' --exclude '.DS_Store' ./ Install-E3DC-Control/Install/
 
+          # JSON-Bereinigung (außer manifest.json), um keine lokalen Configs zu shippen
+          find Install-E3DC-Control/Install/ -name "*.json" ! -name "manifest.json" -type f -delete
+          
           # ZIP erstellen
           zip -r Install-E3DC-Control.zip Install-E3DC-Control/
           ls -lh Install-E3DC-Control.zip

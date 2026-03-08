@@ -64,7 +64,7 @@ def finalize_permissions():
         raise
 
 
-def install_all_main():
+def install_all_main(headless=False):
     """Komplette Installation mit korrekter Reihenfolge."""
     print("\n" + "=" * 60)
     print("  KOMPLETTE E3DC-CONTROL INSTALLATION")
@@ -86,7 +86,7 @@ def install_all_main():
     # Check auf vorhandene Config im Install-Ordner
     possible_config = os.path.join(get_home_dir(), "Install", "e3dc.config.txt")
     use_custom_config = False
-    if os.path.exists(possible_config):
+    if os.path.exists(possible_config) and not headless:
         print(f"ℹ️  Gefunden: {possible_config}")
         if input("  Soll diese Konfigurationsdatei verwendet werden? (j/n): ").strip().lower() == 'j':
             use_custom_config = True
@@ -113,38 +113,44 @@ def install_all_main():
     use_venv = True
     venv_name = current_venv
 
-    if possible_venvs:
-        print(f"Gefundene Umgebungen:")
-        for i, v in enumerate(possible_venvs, 1):
-            mark = " (aktuell)" if v == current_venv else ""
-            print(f"  {i}) {v}{mark}")
-        print(f"  n) Neue erstellen / Anderen Namen wählen")
-        print(f"  x) Kein venv (System-Python)")
-        
-        sel = input(f"Auswahl [1]: ").strip().lower()
-        if not sel: sel = "1"
-        
-        if sel == 'x':
-            use_venv = False
-            venv_name = None
-        elif sel == 'n':
-            custom = input("Name für neues venv [.venv_e3dc]: ").strip()
-            if custom: venv_name = custom
-        elif sel.isdigit():
-            idx = int(sel) - 1
-            if 0 <= idx < len(possible_venvs):
-                venv_name = possible_venvs[idx]
+    if headless:
+        # Im Headless-Modus nutzen wir Standardwerte
+        use_venv = True
+        venv_name = ".venv_e3dc"
+        print(f"→ Headless: Nutze Standard-Venv '{venv_name}'")
     else:
-        print("Es wird empfohlen, eine isolierte Python-Umgebung (venv) zu nutzen.")
-        sel = input("Soll ein Python venv genutzt werden? (j/n) [j]: ").strip().lower()
-        if sel == 'n':
-            use_venv = False
-            venv_name = None
-            print("→ Installation erfolgt systemweit (global).")
+        if possible_venvs:
+            print(f"Gefundene Umgebungen:")
+            for i, v in enumerate(possible_venvs, 1):
+                mark = " (aktuell)" if v == current_venv else ""
+                print(f"  {i}) {v}{mark}")
+            print(f"  n) Neue erstellen / Anderen Namen wählen")
+            print(f"  x) Kein venv (System-Python)")
+            
+            sel = input(f"Auswahl [1]: ").strip().lower()
+            if not sel: sel = "1"
+            
+            if sel == 'x':
+                use_venv = False
+                venv_name = None
+            elif sel == 'n':
+                custom = input("Name für neues venv [.venv_e3dc]: ").strip()
+                if custom: venv_name = custom
+            elif sel.isdigit():
+                idx = int(sel) - 1
+                if 0 <= idx < len(possible_venvs):
+                    venv_name = possible_venvs[idx]
         else:
-            custom = input("Name für venv [.venv_e3dc]: ").strip()
-            if custom: venv_name = custom
-            print(f"→ Installation erfolgt im venv ({venv_name}).")
+            print("Es wird empfohlen, eine isolierte Python-Umgebung (venv) zu nutzen.")
+            sel = input("Soll ein Python venv genutzt werden? (j/n) [j]: ").strip().lower()
+            if sel == 'n':
+                use_venv = False
+                venv_name = None
+                print("→ Installation erfolgt systemweit (global).")
+            else:
+                custom = input("Name für venv [.venv_e3dc]: ").strip()
+                if custom: venv_name = custom
+                print(f"→ Installation erfolgt im venv ({venv_name}).")
 
     # Speichern in Config
     config['venv_name'] = venv_name
@@ -164,10 +170,11 @@ def install_all_main():
                 json.dump(d, f, indent=2)
     except: pass
 
-    confirm = input("\nAlle Schritte ausführen? (j/n): ").strip().lower()
-    if confirm != "j":
-        print("→ Abgebrochen.\n")
-        return
+    if not headless:
+        confirm = input("\nAlle Schritte ausführen? (j/n): ").strip().lower()
+        if confirm != "j":
+            print("→ Abgebrochen.\n")
+            return
 
     # Logging für diese "Alles installieren"-Sitzung initialisieren
     setup_installation_loggers()
@@ -216,7 +223,7 @@ def install_all_main():
     # SCHRITT 3: E3DC-Control Binary
     # =========================================================
     print("\n" + "=" * 60)
-    if not safe_execute_task("SCHRITT 3/11: E3DC-Control klonen & kompilieren", install_e3dc_control):
+    if not safe_execute_task("SCHRITT 3/11: E3DC-Control klonen & kompilieren", install_e3dc_control, headless=headless):
         failed_steps.append("E3DC-Control")
         print("\n✗ Kritischer Fehler: E3DC-Control konnte nicht installiert werden. Installation wird abgebrochen.\n")
         print_installation_summary()
@@ -252,9 +259,9 @@ def install_all_main():
             except Exception as e:
                 log_error("install_all", f"Fehler beim Kopieren der Config: {e}", e)
                 print(f"✗ Fehler beim Kopieren: {e}")
-                create_e3dc_config() # Fallback
+                create_e3dc_config(headless=headless) # Fallback
         else:
-            create_e3dc_config()
+            create_e3dc_config(headless=headless)
             
         # Erstelle auch leere wallbox.txt wenn noch nicht vorhanden
         wallbox_file = os.path.join(INSTALL_PATH, "e3dc.wallbox.txt")
@@ -281,10 +288,10 @@ def install_all_main():
     print("\n" + "=" * 60)
     print("SCHRITT 6/11: Strompreise (optional)")
     print("=" * 60)
-    choice = input("Strompreise jetzt konfigurieren? (j/n): ").strip().lower()
-    if choice == "j":
+    choice = "n" if headless else input("Strompreise jetzt konfigurieren? (j/n): ").strip().lower()
+    if choice == "j" or (headless and False): # Im Headless Modus Strompreise überspringen oder Default? Eher überspringen.
         try:
-            strompreis_wizard()
+            strompreis_wizard(headless=headless)
             log_task_completed("Strompreise konfiguriert")
         except Exception as e:
             log_error("Strompreis-Wizard", f"Fehler bei der Strompreis-Konfiguration: {e}", e)
@@ -295,7 +302,7 @@ def install_all_main():
     # =========================================================
     # SCHRITT 7: Service (Systemd)
     # =========================================================
-    if not safe_execute_task("SCHRITT 7/11: E3DC-Control Service einrichten (Systemd)", install_e3dc_service):
+    if not safe_execute_task("SCHRITT 7/11: E3DC-Control Service einrichten (Systemd)", install_e3dc_service, headless=headless):
         failed_steps.append("Service")
 
     # =========================================================

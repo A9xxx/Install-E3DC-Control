@@ -87,11 +87,18 @@ def main():
     PRICE_MAX_DAILY = int(cfg.get('price_max_daily', 180)) # Minuten pro Tag
     PRICE_HARD_LIMIT = float(cfg.get('price_hard_limit', -99.0)) # Zwangs-Boost unter diesem Preis
     WQ_MIN_TEMP = float(cfg.get('wq_min_temp', 1.0)) # WQ Aus Schutz
-    MANUAL_BOOST_MAX_DURATION = 180 # Minuten (3 Stunden)
+    RL_SOURCE = cfg.get('rl_source', 'internal') # 'internal' or 'external'
     MANUAL_BOOST_MIN_SOC = int(cfg.get('manual_boost_min_soc', 25)) # SoC Schutz für manuellen Boost
+
+    # PV-Pause (Prognose-basiert)
+    PV_PAUSE_ENABLE = int(cfg.get('pv_pause_enable', 0))
+    PV_PAUSE_SOC = int(cfg.get('pv_pause_soc', 80)) # Mindest-SoC für Pause
+    PV_PAUSE_WATT = float(cfg.get('pv_pause_watt', 3000.0)) # Erwartete Leistung
+    PV_PAUSE_TIMEOUT_MINUTES = int(cfg.get('pv_pause_timeout_minutes', 120)) # Max. Dauer der Pause
     
     # Stop-Verzögerung: Wie lange darf Strom aus Netz/Akku gezogen werden?
-    STOP_DELAY_MINUTES = 10 
+    STOP_DELAY_MINUTES = int(cfg.get('stop_delay_minutes', 10))
+    MANUAL_BOOST_MAX_DURATION = int(cfg.get('manual_boost_max_duration', 180))
     
     # IP Adresse
     wp_ip = cfg.get('luxtronik_ip', "192.168.178.88")
@@ -99,6 +106,8 @@ def main():
     
     boost_active = False
     price_boost_active = False
+    pv_pause_active = False
+    pv_pause_start_time = None
     pre_pause_active = False
     deficit_start_time = None # Timer für Abschaltung
     last_day = datetime.now().day
@@ -122,6 +131,15 @@ def main():
                     price_boost_active = True
                     boost_active = True
                     print(f"Status wiederhergestellt: Preis-Boost aktiv.")
+                if saved.get('pre_pause_active', False):
+                    pre_pause_active = True
+                    boost_active = True
+                    print(f"Status wiederhergestellt: Pause aktiv.")
+                if saved.get('pv_pause_active', False):
+                    pv_pause_active = True
+                    boost_active = True
+                    pv_pause_start_time = saved.get('pv_pause_start_time', time.time()) # Fallback auf jetzt
+                    print(f"Status wiederhergestellt: PV-Pause (Prognose) aktiv.")
                 print(f"Status wiederhergestellt: PV-Boost vor {(time.time() - last_pv_boost_time)/3600:.1f}h")
         except: pass
 
@@ -196,6 +214,7 @@ def main():
             soc = 0
             current_price = 99.9
             prices = []
+            forecast = []
             price_start_hour = 0
             price_interval = 1.0
             
@@ -208,6 +227,7 @@ def main():
                     soc = e3dc.get('soc', 0)
                     current_price = e3dc.get('current_price', 99.9)
                     prices = e3dc.get('prices', [])
+                    forecast = e3dc.get('forecast', [])
                     price_start_hour = e3dc.get('price_start_hour', 0)
                     price_interval = e3dc.get('price_interval', 1.0)
             except Exception as e:
@@ -264,27 +284,84 @@ def main():
                         # ODER wenn wir die Batterie entladen (bat < -50W)
                         is_deficit = (grid > 50) or (bat < -50)
 
+                        # --- PV PAUSE LOGIK (Prognose) ---
+                        # Diese Logik hat Vorrang vor Preis-Boost, um kostenlose Energie zu priorisieren.
+                        # Wird bei negativen Preisen übersprungen, da Netzbezug dann gewünscht ist.
+                        if PV_PAUSE_ENABLE == 1 and current_price > 0:
+
+                            # Fall A: Wir sind bereits in der PV-Pause
+                            if pv_pause_active:
+                                # Abbruchbedingung 1: Überschuss ist JETZT da -> Sofort Boost starten
+                                if grid <= GRID_START_LIMIT:
+                                    print(f"[{now.strftime('%H:%M:%S')}] PV-Pause beendet -> Überschuss da ({grid}W). Übergebe an Boost-Logik.")
+                                    pv_pause_active = False
+                                    boost_active = False # Damit die PV-Boost Logik unten greift
+                                
+                                # Abbruchbedingung 2: SoC fällt zu tief (Sicherheitsnetz)
+                                elif soc < (PV_PAUSE_SOC - 5):
+                                    print(f"[{now.strftime('%H:%M:%S')}] PV-Pause abgebrochen (SoC {soc}% < {PV_PAUSE_SOC-5}%).")
+                                    if wp.connect(): wp.write_hz_boost(0); wp.write_ww_boost(0); wp.close()
+                                    pv_pause_active = False; boost_active = False; pv_pause_start_time = None
+
+                                # Abbruchbedingung 3: Timeout (Sonne kam nicht)
+                                elif pv_pause_start_time and (time.time() - pv_pause_start_time) > (PV_PAUSE_TIMEOUT_MINUTES * 60):
+                                    print(f"[{now.strftime('%H:%M:%S')}] PV-Pause abgebrochen (Timeout > {PV_PAUSE_TIMEOUT_MINUTES} Min).")
+                                    if wp.connect(): wp.write_hz_boost(0); wp.write_ww_boost(0); wp.close()
+                                    pv_pause_active = False; boost_active = False; pv_pause_start_time = None
+
+                            # Fall B: Wir prüfen, ob wir pausieren sollten (noch kein Boost aktiv)
+                            elif not boost_active and soc >= PV_PAUSE_SOC:
+                                # Prognose prüfen: Kommt in den nächsten 90 Min viel Sonne?
+                                peak_found = False
+                                if forecast:
+                                    gmt = time.gmtime()
+                                    now_gmt = gmt.tm_hour + gmt.tm_min / 60.0
+                                    
+                                    for entry in forecast:
+                                        h = entry['h']
+                                        if h < (now_gmt - 12): h += 24 
+                                        
+                                        if now_gmt < h <= (now_gmt + 1.5):
+                                            if entry['w'] >= PV_PAUSE_WATT:
+                                                peak_found = True
+                                                break
+                                
+                                if peak_found:
+                                    print(f"[{now.strftime('%H:%M:%S')}] Starte PV-Pause (Prognose > {PV_PAUSE_WATT}W erwartet).")
+                                    if wp.connect():
+                                        wp.write_hz_boost(1, 20.0) # Heizung unterdrücken
+                                        wp.write_ww_boost(0)
+                                        wp.close()
+                                    pv_pause_active = True
+                                    boost_active = True
+                                    pv_pause_start_time = time.time()
+
                         # --- PREIS BOOST LOGIK ---
                         # Diese Logik hat Vorrang vor PV-Boost, wenn aktiviert
                         price_action = "NONE"
-                        
+
                         if PRICE_BOOST_ENABLE == 1:
-                            # Aktuelle Zeit im Preis-Raster ermitteln
-                            if prices:
-                                gmt = time.gmtime()
-                                now_gmt_dec = gmt.tm_hour + gmt.tm_min / 60.0
-                                hour_diff = now_gmt_dec - price_start_hour
-                                if hour_diff < -12: hour_diff += 24
-                                if hour_diff > 36: hour_diff -= 24
-                                
-                                current_idx_float = hour_diff / price_interval
-                                
-                                # Aktion ermitteln (BOOST, PAUSE oder NONE)
-                                price_action = get_price_action(prices, price_start_hour, price_interval, PRICE_LIMIT, PRICE_MIN_DURATION, current_idx_float)
-                            elif (time.time() - last_price_warning_time) > 3600:
-                                # Warnung nur 1x pro Stunde
-                                print(f"[{now.strftime('%H:%M:%S')}] WARNUNG: Preis-Boost aktiv, aber keine Preisdaten (prices=[]) empfangen.")
-                                last_price_warning_time = time.time()
+                            # Sonderfall: Bei negativen Preisen immer "BOOST" erzwingen
+                            if current_price <= 0:
+                                price_action = "BOOST"
+                                print(f"[{now.strftime('%H:%M:%S')}] Negativer Strompreis erkannt ({current_price} ct). Erzwinge Boost.")
+                            else:
+                                # Aktuelle Zeit im Preis-Raster ermitteln
+                                if prices:
+                                    gmt = time.gmtime()
+                                    now_gmt_dec = gmt.tm_hour + gmt.tm_min / 60.0
+                                    hour_diff = now_gmt_dec - price_start_hour
+                                    if hour_diff < -12: hour_diff += 24
+                                    if hour_diff > 36: hour_diff -= 24
+
+                                    current_idx_float = hour_diff / price_interval
+
+                                    # Aktion ermitteln (BOOST, PAUSE oder NONE)
+                                    price_action = get_price_action(prices, price_start_hour, price_interval, PRICE_LIMIT, PRICE_MIN_DURATION, current_idx_float)
+                                elif (time.time() - last_price_warning_time) > 3600:
+                                    # Warnung nur 1x pro Stunde
+                                    print(f"[{now.strftime('%H:%M:%S')}] WARNUNG: Preis-Boost aktiv, aber keine Preisdaten (prices=[]) empfangen.")
+                                    last_price_warning_time = time.time()
 
                             # Constraints prüfen (WQ, Tageslimit, 18h Sperre, Hard-Limit)
                             # Hard-Limit: Bei extrem tiefen Preisen (z.B. negativ) Limits ignorieren
@@ -362,6 +439,7 @@ def main():
                                 # Wenn PV-Boost aktiv (kein Preis-Boost), Timestamp aktualisieren
                                 if not price_boost_active:
                                     last_pv_boost_time = time.time()
+                                    deficit_start_time = None # Timer zurücksetzen
 
                             # SYNC-CHECK: Prüfen ob Werte mit Config übereinstimmen
                             # (Wichtig nach Neustart oder Config-Änderung)
@@ -424,6 +502,9 @@ def main():
                 "daily_boost_counter": daily_boost_counter,
                 "last_pv_boost_time": last_pv_boost_time,
                 "price_boost_active": price_boost_active,
+                "pre_pause_active": pre_pause_active,
+                "pv_pause_start_time": pv_pause_start_time,
+                "pv_pause_active": pv_pause_active,
                 "success": success
             }
 
@@ -458,7 +539,7 @@ def main():
                 os.chmod(RAMDISK_FILE, 0o664)
             except: pass
         
-        time.sleep(30)
+        time.sleep(15)
 
 if __name__ == "__main__":
     main()

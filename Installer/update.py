@@ -30,21 +30,14 @@ def get_latest_version():
         return None
 
     install_user = get_install_user()
-    # Prüfe ob Remote existiert
-    result = run_command(f"sudo -u {install_user} git -C {INSTALL_PATH} remote get-url origin", timeout=5)
-    if not result['success']:
-        print("✗ Kein Git-Remote 'origin' gefunden.")
-        log_warning("update", "Kein Git-Remote 'origin' für Update-Prüfung gefunden.")
-        return None
-
     # Hole neueste Version vom Remote
     result = run_command(
-        f"sudo -u {install_user} git -C {INSTALL_PATH} ls-remote --heads origin master",
+        f"sudo -u {install_user} git -C {INSTALL_PATH} ls-remote --heads https://github.com/Eba-M/E3DC-Control.git master",
         timeout=10
     )
     if not result['success'] or not result['stdout'].strip():
-        print("✗ Branch 'master' nicht gefunden.")
-        log_warning("update", "Branch 'master' auf Remote 'origin' nicht gefunden.")
+        print("✗ Remote-Branch 'master' nicht gefunden.")
+        log_warning("update", "Branch 'master' auf Eba-M Remote nicht gefunden.")
         return None
 
     return result['stdout'].split()[0]
@@ -54,14 +47,14 @@ def count_missing_commits():
     """Zählt fehlende Commits."""
     install_user = get_install_user()
     # Fetch origin
-    result = run_command(f"sudo -u {install_user} git -C {INSTALL_PATH} fetch origin master", timeout=15)
+    result = run_command(f"sudo -u {install_user} git -C {INSTALL_PATH} fetch https://github.com/Eba-M/E3DC-Control.git master", timeout=15)
     if not result['success']:
         log_warning("update", f"git fetch fehlgeschlagen: {result['stderr']}")
         return None
 
     # Zähle Commits
     result = run_command(
-        f"sudo -u {install_user} git -C {INSTALL_PATH} rev-list --count HEAD..origin/master",
+        f"sudo -u {install_user} git -C {INSTALL_PATH} rev-list --count HEAD..FETCH_HEAD",
         timeout=5
     )
     if result['success']:
@@ -76,7 +69,7 @@ def list_missing_commits():
     """Listet fehlende Commits auf."""
     install_user = get_install_user()
     result = run_command(
-        f"sudo -u {install_user} git -C {INSTALL_PATH} log HEAD..origin/master --oneline",
+        f"sudo -u {install_user} git -C {INSTALL_PATH} log HEAD..FETCH_HEAD --oneline",
         timeout=5
     )
     return result['stdout'].strip() if result['success'] else None
@@ -129,10 +122,7 @@ def update_e3dc(headless=False):
     print(f"Neueste Version:  {latest_version[:7]}")
     sys.stdout.flush()
 
-    # Speichere aktuellen Stand von origin/master für Reset bei Abbruch
     install_user = get_install_user()
-    res = run_command(f"sudo -u {install_user} git -C {INSTALL_PATH} rev-parse origin/master", timeout=5)
-    old_origin_sha = res['stdout'].strip() if res['success'] else None
 
     # Lese Flags vom Web-Interface (falls vorhanden)
     force_update_web = False
@@ -166,7 +156,7 @@ def update_e3dc(headless=False):
             confirm = input("\n→ Möchtest du trotzdem aktualisieren (neu installieren)? (j/n): ").strip().lower()
             if confirm != "j":
                 return
-            ask_confirmation = False
+            print("\nHinweis: E3DC-Control wird jetzt aktualisiert.")
         else:
             return
     else:
@@ -181,10 +171,6 @@ def update_e3dc(headless=False):
         confirm = input("\n→ Möchtest du jetzt aktualisieren? (j/n): ").strip().lower()
         if confirm != "j":
             print("✗ Update abgebrochen. Es wurden keine Änderungen vorgenommen.\n")
-            
-            # Reset origin/master auf alten Stand, damit "git status" sauber bleibt
-            if old_origin_sha:
-                run_command(f"sudo -u {install_user} git -C {INSTALL_PATH} update-ref refs/remotes/origin/master {old_origin_sha}")
             log_warning("update", "Update vom Benutzer abgebrochen.")
             return
     elif headless:
@@ -243,7 +229,7 @@ def update_e3dc(headless=False):
 
     # Update durchführen
     print("→ Hole neue Version…")
-    result = run_command(f"sudo -u {install_user} bash -c 'cd {INSTALL_PATH} && git pull'", timeout=60)
+    result = run_command(f"sudo -u {install_user} bash -c 'cd {INSTALL_PATH} && git pull https://github.com/Eba-M/E3DC-Control.git master'", timeout=60)
     if not result['success']:
         print("✗ Git Pull fehlgeschlagen. Update abgebrochen.\n")
         log_error("update", f"git pull fehlgeschlagen, Update abgebrochen: {result['stderr']}")
@@ -284,6 +270,14 @@ def update_e3dc(headless=False):
     # Telegram Benachrichtigung senden (falls vorhanden)
     if old_version != latest_version:
         send_telegram_notification(f"✅ E3DC-Control Update erfolgreich!\nVon: {old_version[:7]}\nZu: {latest_version[:7]}")
+
+    # Cache für Web-Interface Update-Prüfung löschen, damit der rote Punkt verschwindet
+    cache_file = "/tmp/e3dc_update_status.json"
+    if os.path.exists(cache_file):
+        try:
+            os.remove(cache_file)
+        except Exception:
+            pass
 
     # Stash-Management
     result = run_command(f"sudo -u {install_user} git -C {INSTALL_PATH} stash list")

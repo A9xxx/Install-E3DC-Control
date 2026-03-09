@@ -2,6 +2,32 @@
 
 # Changelog
 
+## [3.2.0] - 2026-03-09 - Smart-Grid & Dashboard Upgrade
+
+### 🔥 Luxtronik Energy Manager
+*   **PV-Prognose-Pause:** Neue Funktion "Aushungern", die die Wärmepumpe vor erwarteten PV-Spitzen pausiert, um Speicherkapazität im Estrich zu schaffen.
+*   **Negativ-Preis-Boost:** Bei Strompreisen unter 0 ct/kWh wird nun maximaler Boost erzwungen (ignoriert Tageslimits und Sperrzeiten).
+*   **Logik-Optimierung:** PV-Nutzung hat nun Vorrang vor Preis-Steuerung. Loop-Intervall auf 15s verkürzt für schnellere Reaktion.
+*   **Konfiguration:**
+    *   Komplett neu strukturierte Einstellungsseite (`luxtronik.php`).
+    *   Auswahl des Rücklauf-Sensors (Intern/Extern) für Anzeige und Regelung.
+    *   Einstellbare Verzögerungen für Stop und manuellen Boost.
+
+### 🖥️ Dashboard & Visualisierung
+*   **PV-Tagesertrag:** Berechnung und Anzeige des heutigen Ertrags in der PV-Kachel (Desktop) und im Energiefluss (Mobile).
+*   **Status-Header:** Neue Kopfzeile auf Unterseiten (Config, Wallbox) zeigt Live-Werte (PV, SoC, Haus, Netz, Preis) an.
+*   **Wärmepumpe:**
+    *   Anzeige von Warmwasser- und Rücklauftemperaturen direkt in der Kachel.
+    *   Detaillierte Status-Badges (Auto PV, Auto €, Auto Pause).
+    *   **Betriebsstatus:** Anzeige des aktuellen WP-Modus (Heizen, WW, Abtauen, Aus) direkt in der Kachel.
+    *   **Quick-Link:** Klickbare Status-Badges führen direkt zur Luxtronik-Detailseite.
+*   **Versionierung:** Anzeige der exakten A9xxx-Version und des Eba-M Commit-Hashs (inkl. Datum) im Footer.
+
+### 🔄 System & Updates
+*   **Update-Check:** Prüfung erfolgt nun direkt gegen das Original-Repository (`Eba-M/E3DC-Control`), um Updates auch bei Forks zuverlässig zu erkennen.
+*   **Force-Update:** Möglichkeit zur erzwungenen Neuinstallation, auch wenn das System aktuell ist.
+*   **Feedback:** Sofortige Aktualisierung der Update-Badges nach erfolgreichem Durchlauf.
+
 ## [3.1.2] - 2026-03-08 - Luxtronik Energy Manager Upgrade
 
 ### 🔥 Luxtronik Energy Manager

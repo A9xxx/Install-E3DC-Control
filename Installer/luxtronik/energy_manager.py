@@ -435,10 +435,11 @@ def main():
                                     boost_active = True
                                     deficit_start_time = None # Timer sicherheitshalber nullen
 
-                            elif boost_active:
-                                # Wenn PV-Boost aktiv (kein Preis-Boost), Timestamp aktualisieren
-                                if not price_boost_active:
-                                    last_pv_boost_time = time.time()
+                        # LAUFENDE ÜBERWACHUNG (Wenn Boost aktiv ist)
+                        if boost_active:
+                            # Wenn PV-Boost aktiv (kein Preis-Boost), Timestamp aktualisieren
+                            if not price_boost_active:
+                                last_pv_boost_time = time.time()
 
                             # SYNC-CHECK: Prüfen ob Werte mit Config übereinstimmen
                             # (Wichtig nach Neustart oder Config-Änderung)
@@ -468,7 +469,7 @@ def main():
                             # AUSSCHALTEN PRÜFEN (Nur bei reinem PV-Boost relevant)
                             # Preis-Boost, Pausen etc. dürfen Netzbezug haben.
                             # Wir prüfen auch boost_active, um unnötige Logik im Standby zu vermeiden.
-                            if is_deficit and boost_active and not price_boost_active and not pre_pause_active and not pv_pause_active:
+                            if is_deficit and not price_boost_active and not pre_pause_active and not pv_pause_active:
                                 # Wenn wir gerade erst ins Defizit rutschen -> Timer starten
                                 if deficit_start_time is None:
                                     deficit_start_time = now

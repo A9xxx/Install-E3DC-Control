@@ -87,9 +87,10 @@ def setup_ramdisk():
 while true; do
   /usr/bin/screen -S E3DC -X hardcopy {RAMDISK_PATH}/live.tmp
   if [ -f {RAMDISK_PATH}/live.tmp ]; then
+      chmod 664 {RAMDISK_PATH}/live.tmp
       mv {RAMDISK_PATH}/live.tmp {RAMDISK_PATH}/live.txt
   fi
-  sleep 4
+  sleep 2
 done
 """
     try:

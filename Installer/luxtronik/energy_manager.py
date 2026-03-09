@@ -439,7 +439,6 @@ def main():
                                 # Wenn PV-Boost aktiv (kein Preis-Boost), Timestamp aktualisieren
                                 if not price_boost_active:
                                     last_pv_boost_time = time.time()
-                                    deficit_start_time = None # Timer zurücksetzen
 
                             # SYNC-CHECK: Prüfen ob Werte mit Config übereinstimmen
                             # (Wichtig nach Neustart oder Config-Änderung)
@@ -466,8 +465,10 @@ def main():
                                         wp.write_hz_boost(1, cfg.get('HZ', 50.0))
                                     wp.close()
 
-                            # AUSSCHALTEN PRÜFEN
-                            if is_deficit:
+                            # AUSSCHALTEN PRÜFEN (Nur bei reinem PV-Boost relevant)
+                            # Preis-Boost, Pausen etc. dürfen Netzbezug haben.
+                            # Wir prüfen auch boost_active, um unnötige Logik im Standby zu vermeiden.
+                            if is_deficit and boost_active and not price_boost_active and not pre_pause_active and not pv_pause_active:
                                 # Wenn wir gerade erst ins Defizit rutschen -> Timer starten
                                 if deficit_start_time is None:
                                     deficit_start_time = now
@@ -476,7 +477,7 @@ def main():
                                 # Wenn Timer läuft -> Prüfen ob Zeit abgelaufen
                                 elif (now - deficit_start_time).total_seconds() > (STOP_DELAY_MINUTES * 60):
                                     if wp.connect():
-                                        print(f"[{now.strftime('%H:%M:%S')}] Stop Boost (10 min Defizit)")
+                                        print(f"[{now.strftime('%H:%M:%S')}] Stop Boost ({STOP_DELAY_MINUTES} min Defizit)")
                                         wp.write_ww_boost(0, 45.0) # Reset auf Standard
                                         wp.write_hz_boost(0)
                                         wp.close()

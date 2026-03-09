@@ -12,6 +12,7 @@
     *   Komplett neu strukturierte Einstellungsseite (`luxtronik.php`).
     *   Auswahl des Rücklauf-Sensors (Intern/Extern) für Anzeige und Regelung.
     *   Einstellbare Verzögerungen für Stop und manuellen Boost.
+*   **Bugfix:** Korrektur der Abschalt-Verzögerung. Der Timer wurde gefixt und die Logik verfeinert, sodass die Defizit-Abschaltung nur noch beim PV-Boost greift (nicht bei Preis-Boost).
 
 ### 🖥️ Dashboard & Visualisierung
 *   **PV-Tagesertrag:** Berechnung und Anzeige des heutigen Ertrags in der PV-Kachel (Desktop) und im Energiefluss (Mobile).

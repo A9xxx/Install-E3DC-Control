@@ -11,10 +11,20 @@
 *   **Superintelligenz:** Experimentelle Funktion zur aggressiven Speicherentladung bei extrem guten Prognosen.
 
 ### ⚙️ System & Stabilität
-*   **Sicherheits-Reset:** Verbesserte Logik beim Zurücksetzen der Wärmepumpe verhindert "Geister-Setpoints" (z.B. hängende 20°C Sollwerte).
+*   **Sicherheits-Reset:** Verbesserte Logik beim Zurücksetzen der Wärmepumpe verhindert "Geister-Setpoints" (z.B. hängende 20°C Sollwerte) und Endlosschleifen.
 *   **Reboot-Sicherheit:** Der Energy Manager startet nach einem Stromausfall nun sauber und übernimmt keine alten, ungültigen Zustände mehr.
-*   **Konfiguration:** Bugfix beim Speichern von Checkboxen (z.B. Deaktivieren von Funktionen) in der `luxtronik.php`.
+*   **Release-Optimierung:** Das Release-Paket wurde bereinigt (keine Entwickler-Dateien mehr) und die Installation von `luxtronik.php` korrigiert.
+*   **Berechtigungen:** Erweiterte Rechteprüfung für neue Skripte und State-Dateien (`permissions.py`).
 *   **Dokumentation:** Neue ausführliche Anleitung für das Lademanagement (`LADEMANAGEMENT_DOKUMENTATION.md`).
+
+### 🖥️ Web-Interface & Konfiguration
+*   **Luxtronik-Config:**
+    *   **Tooltips:** Ausführliche Erklärungen für alle Parameter und Schalter hinzugefügt.
+    *   **Sicherheit:** Standardwert für Heizungs-Boost auf materialschonende 32°C gesenkt.
+    *   **Robustheit:** Der Konfigurations-Editor lädt nun auch bei fehlender oder defekter Config-Datei zuverlässig.
+*   **Strompreise:**
+    *   **Wizard:** Korrektur der Einheiten (ct/kWh) und verbesserter Workflow für manuelle Eingabe.
+    *   **Editor:** Manuelle Strompreise (`e3dc.strompreis.txt`) können nun direkt im `config_editor.php` bearbeitet werden.
 
 ## [3.2.0] - 2026-03-09 - Smart-Grid & Dashboard Upgrade
 

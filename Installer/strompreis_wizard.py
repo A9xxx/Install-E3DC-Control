@@ -82,7 +82,7 @@ def create_default_price_file():
         
         with open(PRICE_FILE, "w") as f:
             f.write("# Strompreise (Stunde Preis)\n")
-            f.write("# Format: 0-23 (Stunde) und Preis in €/kWh\n\n")
+            f.write("# Format: 0-23 (Stunde) und Preis in ct/kWh\n\n")
             for line in DEFAULT_ENTRIES:
                 f.write(line + "\n")
         
@@ -103,17 +103,8 @@ def create_default_price_file():
 
 
 def load_entries():
-    """Liest die Datei ein oder bietet Standardwerte an."""
+    """Liest die Einträge aus der Preis-Datei."""
     if not os.path.exists(PRICE_FILE):
-        print("⚠ Strompreis-Datei existiert nicht.")
-        strom_logger.warning(f"Strompreis-Datei existiert nicht: {PRICE_FILE}")
-        choice = input("Jetzt mit Standardwerten erstellen? (j/n): ").strip().lower()
-        if choice == "j":
-            if create_default_price_file():
-                return DEFAULT_ENTRIES.copy()
-        else:
-            print("→ Abgebrochen.\n")
-            strom_logger.info("Erstellung der Strompreis-Datei abgebrochen.")
         return None
 
     try:
@@ -123,7 +114,7 @@ def load_entries():
                 line = line.strip()
                 if line and not line.startswith("#"):
                     entries.append(line)
-        return entries if entries else None
+        return entries if entries else []
     except Exception as e:
         print(f"✗ Fehler beim Lesen der Datei: {e}\n")
         log_error("strompreis", f"Fehler beim Lesen der Datei: {e}", e)
@@ -138,7 +129,7 @@ def save_entries(parsed_prices):
         try:
             with open(PRICE_FILE, "w") as f:
                 f.write("# Strompreise (Stunde Preis)\n")
-                f.write("# Format: 0-23 (Stunde) und Preis in €/kWh\n\n")
+                f.write("# Format: 0-23 (Stunde) und Preis in ct/kWh\n\n")
                 
                 for hour in sorted(parsed_prices.keys()):
                     price = parsed_prices[hour]
@@ -175,40 +166,57 @@ def strompreis_wizard(headless=False):
         return
 
     entries = load_entries()
-    if entries is None:
-        return
+    if entries is None: # Datei existiert nicht
+        print("⚠ Strompreis-Datei existiert nicht.")
+        strom_logger.warning(f"Strompreis-Datei existiert nicht: {PRICE_FILE}")
+        choice = input("Jetzt mit Standardwerten erstellen? (j/n): ").strip().lower()
+        if choice == 'j':
+            if create_default_price_file():
+                entries = DEFAULT_ENTRIES.copy()
+            else:
+                return # Fehler beim Erstellen
+        else:
+            # Benutzer möchte manuell eingeben
+            entries = []
 
-    print("Aktuelle Einträge:\n")
-    for line in entries:
-        print(f"  {line}")
+    if entries:
+        print("Aktuelle Einträge:\n")
+        for line in entries:
+            print(f"  {line}")
 
     print("\n--- Neue Werte eingeben ---")
     print("Format: Stunde (0-23) und Preis")
-    print("Beispiel: '14 0.25'")
+    print("Beispiel: '14 25.5'")
     print("Mehrere Zeilen eingeben, mit leerer Zeile beenden.\n")
 
-    new_entries = []
+    new_entries_lines = []
     while True:
         line = input("> ").strip()
         if not line:
             break
         if line.startswith("#"):
             continue
-        new_entries.append(line)
+        new_entries_lines.append(line)
 
-    # Wenn keine Eingaben → Standardwerte anbieten
-    if not new_entries:
+    # Entscheiden, welche Einträge verarbeitet werden sollen
+    if new_entries_lines:
+        entries_to_process = new_entries_lines
+        print("\n→ Verarbeite neue Eingaben...")
+    elif not entries: # Keine neuen Eingaben UND keine vorherigen Einträge
         print("\nKeine Eingaben gemacht.")
         choice = input("Standardwerte übernehmen? (j/n): ").strip().lower()
         if choice == "j":
-            new_entries = DEFAULT_ENTRIES.copy()
+            entries_to_process = DEFAULT_ENTRIES.copy()
         else:
             print("→ Abgebrochen.\n")
             strom_logger.info("Strompreis-Wizard abgebrochen (keine Eingaben).")
             return
+    else: # Keine neuen Eingaben, aber es gab alte
+        entries_to_process = entries
+        print("\n→ Keine neuen Eingaben, behalte alte Werte bei.")
 
-    # Validiere alle Einträge
-    parsed, errors = parse_entries(new_entries)
+    # Validiere die ausgewählten Einträge
+    parsed, errors = parse_entries(entries_to_process)
 
     if errors:
         print("\n⚠ Fehler bei der Validierung:\n")
@@ -223,7 +231,7 @@ def strompreis_wizard(headless=False):
     # Bestätigung
     print("\nValidierte Einträge:\n")
     for hour in sorted(parsed.keys()):
-        print(f"  {hour:2d}:00 → {parsed[hour]:.2f} €/kWh")
+        print(f"  {hour:2d}:00 → {parsed[hour]:.2f} ct/kWh")
 
     choice = input("\nSpeichern? (j/n): ").strip().lower()
     if choice != "j":

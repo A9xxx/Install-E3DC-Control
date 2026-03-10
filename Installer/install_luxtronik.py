@@ -166,6 +166,9 @@ WantedBy=multi-user.target
     print(f"✓ Service {SERVICE_NAME} installiert und gestartet.")
 
 def install_luxtronik_menu():
+    print(f"→ Stoppe Service '{SERVICE_NAME}'…")
+    run_command(f"sudo systemctl stop {SERVICE_NAME}")
+
     if install_dependencies():
         setup_script()
         configure_luxtronik()

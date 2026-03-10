@@ -18,8 +18,10 @@ Die Kernfunktionen der Steuerung (von [Eba-M](https://github.com/Eba-M/E3DC-Cont
 
 Zusätzliche Funktionen dieses Moduls:
 *   **📊 Visualisierung:** Ein umfassendes Web-Dashboard zeigt Live-Werte, Historie und Prognosen für PV, Batterie, Hausverbrauch, Netz, Wallbox und Wärmepumpe.
-*   **📈 Interaktive Diagramme:** Klickbare Kacheln für Detailanalysen (PV-Strings, Phasen-Spannungen, Batteriestrom etc.).
+*   **📈 Interaktive Diagramme:** Live-Energiefluss-Animation und klickbare Kacheln für Detailanalysen.
 *   **� Wallbox-Steuerung:** Manuelle und automatische Steuerung der E3DC Wallbox inkl. Ladeplanung.
+*   **🧠 Intelligentes Entladen:** Prognosebasierte Entladung des Speichers am Morgen über Wallbox oder Wärmepumpe, um Platz für den Solarertrag zu schaffen (inkl. "Superintelligenz" mit dynamischer Ladeleistungserkennung).
+*   **🔥 Luxtronik-Integration:** Intelligente Steuerung für Wärmepumpen (Alpha Innotec, Novelan) zur Nutzung von PV-Überschüssen (SG-Ready/Modbus).
 
 ---
 

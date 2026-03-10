@@ -2,6 +2,20 @@
 
 # Changelog
 
+## [3.2.2] - 2026-03-10 - Smart Charging & Stability
+
+### 🔌 Intelligentes Lademanagement
+*   **Standalone-Modus:** Die intelligenten Ladefunktionen (Morning Boost, Superintelligenz) sind nun auch **ohne** Wärmepumpe nutzbar.
+*   **Neuer Installer:** Separates Installationsskript (`install_lademanagement.py`) für reine Wallbox-Nutzer (Menüpunkt 102).
+*   **Priorisierung:** Neue Option "Nur Wallbox (kein Fallback)" für den Morning Boost.
+*   **Superintelligenz:** Experimentelle Funktion zur aggressiven Speicherentladung bei extrem guten Prognosen.
+
+### ⚙️ System & Stabilität
+*   **Sicherheits-Reset:** Verbesserte Logik beim Zurücksetzen der Wärmepumpe verhindert "Geister-Setpoints" (z.B. hängende 20°C Sollwerte).
+*   **Reboot-Sicherheit:** Der Energy Manager startet nach einem Stromausfall nun sauber und übernimmt keine alten, ungültigen Zustände mehr.
+*   **Konfiguration:** Bugfix beim Speichern von Checkboxen (z.B. Deaktivieren von Funktionen) in der `luxtronik.php`.
+*   **Dokumentation:** Neue ausführliche Anleitung für das Lademanagement (`LADEMANAGEMENT_DOKUMENTATION.md`).
+
 ## [3.2.0] - 2026-03-09 - Smart-Grid & Dashboard Upgrade
 
 ### 🔥 Luxtronik Energy Manager
@@ -13,6 +27,7 @@
     *   Auswahl des Rücklauf-Sensors (Intern/Extern) für Anzeige und Regelung.
     *   Einstellbare Verzögerungen für Stop und manuellen Boost.
 *   **Bugfix:** Korrektur der Abschalt-Verzögerung. Der Timer wurde gefixt und die Logik verfeinert, sodass die Defizit-Abschaltung nur noch beim PV-Boost greift (nicht bei Preis-Boost).
+*   **Bugfix (Permissions):** Korrigiert die Dateiberechtigungen für temporäre Diagramm-Dateien (`plot_soc_done_archiv`), um Warnungen bei der Rechteprüfung zu vermeiden.
 
 ### 🖥️ Dashboard & Visualisierung
 *   **PV-Tagesertrag:** Berechnung und Anzeige des heutigen Ertrags in der PV-Kachel (Desktop) und im Energiefluss (Mobile).

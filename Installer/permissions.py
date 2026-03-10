@@ -271,9 +271,13 @@ FILE_DEFINITIONS = [
     {"path": "/var/www/html/tmp/plot_soc_error_mobile", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": "/var/www/html/tmp/plot_live_history_last_run", "mode": "666", "owner": INSTALL_USER, "group": "www-data", "optional": False, "executable": False},
     {"path": "/var/www/html/tmp/plot_soc_last_run", "mode": "666", "owner": INSTALL_USER, "group": "www-data", "optional": False, "executable": False},
+    # Neue Zustandsdatei für Morning Boost
+    {"path": "/var/www/html/tmp/morning_boost_state.json", "mode": "666", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     # Luxtronik Dateien
     {"path": f"{INSTALLER_DIR}/luxtronik/energy_manager.py", "mode": "755", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": True},
     {"path": f"{INSTALLER_DIR}/luxtronik/config.lux.json", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
+    {"path": f"{INSTALLER_DIR}/luxtronik/get_luxtronik.py", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
+    {"path": f"{INSTALLER_DIR}/luxtronik/set_manual_boost.py", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": "/var/www/html/ramdisk/luxtronik.json", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
 ]
 

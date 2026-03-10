@@ -25,5 +25,6 @@ __all__ = [
     "uninstall",
     "install_all",
     "self_update",
-    "install_luxtronik"
+    "install_luxtronik",
+    "install_lademanagement"
 ]

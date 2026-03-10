@@ -88,6 +88,10 @@ Verwaltet den Backup-Lebenszyklus:
 - **`utils.py`:** Stellt Hilfsfunktionen wie `run_command` oder `replace_in_file` bereit, die von vielen Modulen genutzt werden.
 - **`system.py`:** Kümmert sich um die Installation von APT-Paketen und die Einrichtung der Python-Umgebung (venv).
 
+### Erweiterungsmodule
+- **`install_luxtronik.py`:** Installiert und konfiguriert den `energy_manager` für die Wärmepumpen-Steuerung.
+- **`install_lademanagement.py`:** Eine schlankere Installationsroutine, die den `energy_manager` nur für die intelligente Wallbox-Steuerung einrichtet (für Systeme ohne steuerbare Wärmepumpe).
+
 ## 5. Konfigurationsdateien
 
 - **`pi/Install/Installer/installer_config.json`**: Speichert die Konfiguration des Installers selbst. Hauptsächlich der gewählte Installationsbenutzer, um die Abfrage nicht bei jedem Start zu wiederholen.

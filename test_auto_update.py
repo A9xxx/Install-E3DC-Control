@@ -36,6 +36,7 @@ def create_test_release_zip(version, temp_dir):
         zf.writestr('Install-E3DC-Control/Install/installer_main.py', '# Test version')
         zf.writestr('Install-E3DC-Control/Install/Installer/__init__.py', '')
         zf.writestr('Install-E3DC-Control/Install/Installer/self_update.py', '# self_update')
+        zf.writestr('Install-E3DC-Control/UPDATE_POLICY.json', '{"description": "Test", "restart_services": []}')
     
     print(f"✓ Test-ZIP erstellt: {zip_path}")
     return zip_path
@@ -136,9 +137,15 @@ def test_download_simulation():
         
         # Prüfe Struktur
         install_path = os.path.join(extract_dir, "Install-E3DC-Control", "Install")
+        policy_path = os.path.join(extract_dir, "Install-E3DC-Control", "UPDATE_POLICY.json")
+        
         if os.path.exists(install_path):
             print(f"✓ ZIP entpackt mit korrekter Struktur")
             print(f"  Pfad: {install_path}")
+            if os.path.exists(policy_path):
+                print(f"✓ UPDATE_POLICY.json an korrekter Stelle gefunden")
+            else:
+                print(f"⚠ UPDATE_POLICY.json fehlt!")
             
             # Cleanup
             import shutil

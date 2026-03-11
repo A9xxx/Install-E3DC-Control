@@ -941,7 +941,9 @@ def check_and_set_config_defaults():
         "wbcostpowers": "7.2, 11.0",
         "darkmode": "1",
         "pvatmosphere": "0.815",
-        "check_updates": "0"
+        "check_updates": "0",
+        "auto_update_enable": "0",
+        "auto_update_time": "23:00"
     }
 
     try:

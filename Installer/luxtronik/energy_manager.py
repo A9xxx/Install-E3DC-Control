@@ -252,6 +252,15 @@ def main():
     STOP_DELAY_MINUTES = int(cfg.get('stop_delay_minutes', 10))
     MANUAL_BOOST_MAX_DURATION = int(cfg.get('manual_boost_max_duration', 180))
     
+    # Auto-Update Konfiguration
+    AUTO_UPDATE_ENABLE = int(read_e3dc_config_value('auto_update_enable') or 0)
+    update_time_str = read_e3dc_config_value('auto_update_time') or "23:00"
+    try:
+        update_hour, update_minute = map(int, update_time_str.split(':'))
+    except:
+        update_hour, update_minute = 23, 0
+    update_checked_today = False
+
     # IP Adresse
     boost_active = False
     price_boost_active = False
@@ -367,6 +376,27 @@ def main():
 
     while True:
         now = datetime.now()
+        
+        # --- AUTO-UPDATE CHECK (23:00 Uhr) ---
+        if AUTO_UPDATE_ENABLE == 1:
+            if now.hour == update_hour and now.minute == update_minute:
+                if not update_checked_today:
+                    logger.info(f"Starte tägliche Update-Prüfung ({update_hour:02d}:{update_minute:02d} Uhr)...")
+                    # Installer im Unattended-Modus aufrufen (detached, damit Service-Neustart uns nicht killt)
+                    installer_script = os.path.abspath(os.path.join(script_dir, "../../installer_main.py"))
+                    if os.path.exists(installer_script):
+                        try:
+                            # nohup verwenden, damit der Prozess weiterläuft, auch wenn energy_manager neu startet
+                            subprocess.Popen(
+                                f"nohup python3 {installer_script} --unattended > /dev/null 2>&1 &", 
+                                shell=True
+                            )
+                        except Exception as e:
+                            logger.error(f"Fehler beim Starten des Updates: {e}")
+                    update_checked_today = True
+            else:
+                update_checked_today = False
+
         wp_data = {}   
         wp_status = {} 
         at = 20.0 # Default
@@ -462,6 +492,7 @@ def main():
             forecast = []
             price_start_hour = 0
             price_interval = 1.0
+            e3dc_valid = False
             
             try:
                 r = requests.get("http://localhost/get_live_json.php", timeout=5)
@@ -476,6 +507,7 @@ def main():
                     forecast = e3dc.get('forecast', [])
                     price_start_hour = e3dc.get('price_start_hour', 0)
                     price_interval = e3dc.get('price_interval', 1.0)
+                    e3dc_valid = True
             except Exception as e:
                 if AUTO_MODE == 1 or os.path.exists(FLAG_FILE):
                     logger.error(f"Fehler bei E3DC Abfrage: {e}")
@@ -780,8 +812,8 @@ def main():
                                     pv_pause_active = False
                                     boost_active = False # Damit die PV-Boost Logik unten greift
                                 
-                                # Abbruchbedingung 2: SoC fällt zu tief (Sicherheitsnetz)
-                                elif soc < (PV_PAUSE_SOC - 5):                                    
+                                # Abbruchbedingung 2: SoC fällt zu tief (Sicherheitsnetz). Glitch-Schutz: SoC > 0 prüfen.
+                                elif e3dc_valid and soc > 0 and soc < (PV_PAUSE_SOC - 5):                                    
                                     logger.warning(f"PV-Pause abgebrochen (SoC {soc}% < {PV_PAUSE_SOC-5}%).")
                                     if wp and wp.connect(): wp.write_hz_boost(0); wp.write_ww_boost(0, cfg.get('WWW', 45.0)); wp.close()
                                     pv_pause_active = False; boost_active = False; pv_pause_start_time = None

@@ -13,6 +13,7 @@ import shutil
 from urllib.request import urlopen, Request
 from urllib.error import URLError
 import re
+import time
 
 from .core import register_command
 from .utils import run_command
@@ -243,6 +244,67 @@ def extract_release(zip_path, new_version):
                 else:
                     shutil.copy2(src_path, dst_path)
             
+            # --- UPDATE POLICY & ACTIONS ---
+            # Prüfen auf UPDATE_POLICY.json im Quellpaket
+            policy_file = os.path.join(src_installer, "..", "UPDATE_POLICY.json")
+            policy_executed = False
+            
+            # Standard-Aktion: Energy Manager neu starten, falls keine Policy das Gegenteil sagt
+            services_to_restart = ["energy_manager"]
+            run_full_permissions = False
+            apt_packages = []
+            pip_packages = []
+
+            if os.path.exists(policy_file):
+                try:
+                    print("→ Verarbeite Update-Richtlinien (Policy)...")
+                    with open(policy_file, 'r') as f:
+                        policy = json.load(f)
+                        if "restart_services" in policy:
+                            services_to_restart = policy["restart_services"]
+                        if "run_permissions" in policy:
+                            run_full_permissions = bool(policy["run_permissions"])
+                        if "apt_packages" in policy:
+                            apt_packages = policy.get("apt_packages", [])
+                        if "pip_packages" in policy:
+                            pip_packages = policy.get("pip_packages", [])
+                            
+                        # Hier könnten in Zukunft auch Migrations-Skripte ausgeführt werden
+                        policy_executed = True
+                except Exception as pe:
+                    print(f"⚠ Fehler beim Lesen der Update-Policy: {pe}")
+
+            # 1. Pakete nachinstallieren (falls angefordert)
+            if apt_packages:
+                print(f"→ Installiere System-Pakete: {', '.join(apt_packages)}")
+                try:
+                    subprocess.run(["apt-get", "update"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                    subprocess.run(["apt-get", "install", "-y"] + apt_packages, check=True)
+                except Exception as e:
+                    print(f"⚠ Fehler bei der Paket-Installation (apt): {e}")
+            
+            if pip_packages:
+                print(f"→ Installiere Python-Pakete: {', '.join(pip_packages)}")
+                try:
+                    subprocess.run([sys.executable, "-m", "pip", "install"] + pip_packages, check=True)
+                except Exception as e:
+                    print(f"⚠ Fehler bei der Paket-Installation (pip): {e}")
+
+            # 2. Rechte korrigieren (Vollständiger Wizard, falls angefordert)
+            if run_full_permissions:
+                print("→ Führe vollständige Rechte-Reparatur aus (Policy)...")
+                try:
+                    from .permissions import run_permissions_wizard
+                    run_permissions_wizard(headless=True)
+                except Exception as e:
+                    print(f"⚠ Fehler bei der Rechte-Reparatur: {e}")
+
+            # Dienste neustarten (Standard oder Policy)
+            for srv in services_to_restart:
+                if os.path.exists(f"/etc/systemd/system/{srv}.service"):
+                    print(f"  → Starte Service neu: {srv}")
+                    subprocess.run(["systemctl", "restart", srv], check=False)
+
             print("✓ Update erfolgreich installiert")
             update_logger.info("Dateien erfolgreich aktualisiert.")
 
@@ -265,6 +327,14 @@ def extract_release(zip_path, new_version):
             except Exception as e:
                 print(f"⚠ Konnte VERSION-Datei nicht aktualisieren: {e}")
             
+            # Benachrichtigung für Web-Interface erstellen
+            try:
+                note_file = "/var/www/html/ramdisk/update_completed.json"
+                with open(note_file, 'w') as f:
+                    json.dump({"ts": time.time(), "version": new_version, "status": "success"}, f)
+                os.chmod(note_file, 0o666)
+            except: pass
+
             # Setze Besitzrechte für den Installationsordner
             try:
                 install_user = get_install_user()

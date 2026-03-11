@@ -4,6 +4,7 @@ import grp
 import subprocess
 import logging
 import tempfile
+import json
 
 from .core import register_command
 from .utils import run_command
@@ -237,7 +238,7 @@ FILE_DEFINITIONS = [
     # Konfigurationsdateien
     {"path": f"{INSTALL_PATH}/e3dc.config.txt", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": f"{INSTALL_PATH}/e3dc.wallbox.txt", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
-    {"path": f"{INSTALL_PATH}/e3dc.strompreis.txt", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
+    {"path": f"{INSTALL_PATH}/e3dc.strompreise.txt", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": f"{INSTALL_PATH}/diagram_config.json", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     # Ausführbare Python-Dateien
     {"path": f"{INSTALL_PATH}/plot_soc_changes.py", "mode": "755", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": True},
@@ -273,12 +274,9 @@ FILE_DEFINITIONS = [
     {"path": "/var/www/html/tmp/plot_soc_error_mobile", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": "/var/www/html/tmp/plot_live_history_last_run", "mode": "666", "owner": INSTALL_USER, "group": "www-data", "optional": False, "executable": False},
     {"path": "/var/www/html/tmp/plot_soc_last_run", "mode": "666", "owner": INSTALL_USER, "group": "www-data", "optional": False, "executable": False},
-    # Neue Zustandsdatei für Morning Boost
     {"path": "/var/www/html/tmp/morning_boost_state.json", "mode": "666", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     # Luxtronik Dateien
     {"path": f"{INSTALLER_DIR}/luxtronik/energy_manager.py", "mode": "755", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": True},
-    {"path": f"{INSTALLER_DIR}/luxtronik/config.lux.json", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
-    {"path": f"{INSTALLER_DIR}/luxtronik/get_luxtronik.py", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": f"{INSTALLER_DIR}/luxtronik/set_manual_boost.py", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": "/var/www/html/ramdisk/luxtronik.json", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": "/var/www/html/logs/energy_manager.log", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
@@ -943,7 +941,42 @@ def check_and_set_config_defaults():
         "pvatmosphere": "0.815",
         "check_updates": "0",
         "auto_update_enable": "0",
-        "auto_update_time": "23:00"
+        "auto_update_time": "23:00",
+        # Luxtronik Defaults
+        "luxtronik": "0",
+        "luxtronik_ip": "192.168.178.88",
+        "auto_mode": "1",
+        "GRID_START_LIMIT": "-3500",
+        "MIN_SOC": "80",
+        "AT_LIMIT": "10.0",
+        "WWS": "50.0",
+        "WWW": "48.0",
+        "HZ": "32.0",
+        "price_boost_enable": "0",
+        "price_limit": "20.0",
+        "price_hard_limit": "-99.0",
+        "price_min_duration": "60",
+        "price_max_daily": "180",
+        "stop_delay_minutes": "10",
+        "manual_boost_max_duration": "180",
+        "rl_source": "internal",
+        "wq_min_temp": "1.0",
+        "manual_boost_min_soc": "25",
+        "pv_pause_enable": "0",
+        "pv_pause_soc": "80",
+        "pv_pause_watt": "3000.0",
+        "pv_pause_timeout_minutes": "120",
+        "morning_boost_enable": "0",
+        "morning_boost_prio": "wallbox",
+        "morning_boost_wb_power": "7.0",
+        "morning_boost_min_hours": "3",
+        "morning_boost_min_pv_pct": "50.0",
+        "morning_boost_target_soc": "20",
+        "morning_boost_deadline": "8",
+        "super_intelligence_enable": "0",
+        "super_intelligence_deadline": "8",
+        "telegram_token": "",
+        "telegram_chat_id": ""
     }
 
     try:
@@ -1039,8 +1072,87 @@ def check_config_duplicates():
         perm_logger.error(f"Fehler bei Duplikat-Prüfung: {e}")
         return False
 
+def _migrate_luxtronik_config():
+    """Prüft auf alte config.lux.json und migriert die Werte."""
+    lux_config_path = os.path.join(INSTALLER_DIR, "luxtronik", "config.lux.json")
+    if not os.path.exists(lux_config_path):
+        return # Nichts zu tun
+
+    print("\n=== Veraltete Luxtronik-Konfiguration gefunden ===")
+    print("→ Migriere Einstellungen nach e3dc.config.txt...")
+    perm_logger.info("Veraltete config.lux.json gefunden, starte Migration.")
+
+    e3dc_config_path = os.path.join(INSTALL_PATH, "e3dc.config.txt")
+    
+    try:
+        with open(lux_config_path, 'r', encoding='utf-8') as f:
+            lux_conf = json.load(f)
+
+        if not os.path.exists(e3dc_config_path):
+            print(f"✗ Fehler: {e3dc_config_path} nicht gefunden. Migration abgebrochen.")
+            perm_logger.error(f"e3dc.config.txt nicht gefunden, Migration abgebrochen.")
+            return
+
+        with open(e3dc_config_path, 'r', encoding='utf-8') as f:
+            e3dc_lines = f.readlines()
+
+        new_lines = []
+        keys_to_update = {k.lower(): str(v) for k, v in lux_conf.items()}
+        
+        for line in e3dc_lines:
+            stripped_line = line.strip()
+            if not stripped_line or stripped_line.startswith('#'):
+                new_lines.append(line)
+                continue
+            
+            if '=' in stripped_line:
+                key, _ = stripped_line.split('=', 1)
+                key_lower = key.strip().lower()
+                if key_lower in keys_to_update:
+                    new_lines.append(f"{key.strip()} = {keys_to_update[key_lower]}\n")
+                    del keys_to_update[key_lower]
+                    continue
+            new_lines.append(line)
+
+        if keys_to_update:
+            new_lines.append("\n# --- Automatisch migrierte Luxtronik-Parameter ---\n")
+            for key, value in keys_to_update.items():
+                new_lines.append(f"{key} = {value}\n")
+
+        with open(e3dc_config_path, 'w', encoding='utf-8') as f:
+            f.writelines(new_lines)
+        
+        os.rename(lux_config_path, lux_config_path + ".migrated")
+        print(f"✓ Konfiguration erfolgreich migriert. Alte Datei umbenannt zu: {os.path.basename(lux_config_path)}.migrated\n")
+        perm_logger.info("Luxtronik-Konfiguration erfolgreich migriert.")
+
+    except Exception as e:
+        print(f"✗ Fehler bei der Konfigurations-Migration: {e}")
+        perm_logger.error(f"Fehler bei der Konfigurations-Migration: {e}")
+
+def _migrate_strompreis_file():
+    """Benennt e3dc.strompreis.txt in e3dc.strompreise.txt um."""
+    old_file = os.path.join(INSTALL_PATH, "e3dc.strompreis.txt")
+    new_file = os.path.join(INSTALL_PATH, "e3dc.strompreise.txt")
+    
+    if os.path.exists(old_file) and not os.path.exists(new_file):
+        print(f"\n→ Migriere Strompreis-Datei: {os.path.basename(old_file)} -> {os.path.basename(new_file)}")
+        try:
+            os.rename(old_file, new_file)
+            print(f"{GREEN}✓{RESET} Datei umbenannt.")
+            perm_logger.info(f"Strompreis-Datei umbenannt: {old_file} -> {new_file}")
+        except Exception as e:
+            print(f"{RED}✗{RESET} Fehler beim Umbenennen: {e}")
+            perm_logger.error(f"Fehler beim Umbenennen der Strompreis-Datei: {e}")
+
 def run_permissions_wizard(headless=False):
     """Hauptlogik für Rechteprüfung und -korrektur."""
+    # Zuerst auf alte Konfig prüfen und migrieren
+    _migrate_luxtronik_config()
+    
+    # Migration Strompreis-Datei
+    _migrate_strompreis_file()
+
     # Als erstes: Bereinige root-eigene Dateien falls vorhanden
     cleanup_success = cleanup_root_owned_files()
     if not cleanup_success:

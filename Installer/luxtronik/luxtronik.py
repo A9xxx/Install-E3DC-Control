@@ -4,20 +4,33 @@ import time
 import json
 import os
 
+def _read_e3dc_config_value(key, default=None):
+    """Liest einen Wert aus der zentralen e3dc.config.txt."""
+    # Finde den Installationspfad über die Web-Konfig
+    try:
+        with open('/var/www/html/e3dc_paths.json', 'r') as f:
+            paths = json.load(f)
+            install_path = paths.get('install_path', '/home/pi/E3DC-Control/')
+    except:
+        install_path = '/home/pi/E3DC-Control/'
+    
+    config_path = os.path.join(install_path, 'e3dc.config.txt')
+    if not os.path.exists(config_path): return default
+
+    try:
+        with open(config_path, 'r') as f:
+            for line in f:
+                if line.strip().startswith('#') or '=' not in line: continue
+                k, v = line.split('=', 1)
+                if k.strip().lower() == key.lower():
+                    return v.strip()
+    except Exception: pass
+    return default
+
 class LuxtronikModbus:
     def __init__(self, host=None, port=502):
         if host is None:
-            # Standard-IP als Fallback, falls Config nicht lesbar
-            host = '192.168.178.88'
-            try:
-                script_dir = os.path.dirname(os.path.abspath(__file__))
-                config_file = os.path.join(script_dir, "config.lux.json")
-                if os.path.exists(config_file):
-                    with open(config_file, 'r') as f:
-                        data = json.load(f)
-                        host = data.get('luxtronik_ip', host)
-            except:
-                pass
+            host = _read_e3dc_config_value('luxtronik_ip', '192.168.178.88')
 
         self.host = host
         self.port = port
@@ -155,10 +168,10 @@ class LuxtronikModbus:
     
     def write_ww_boost(self, mode, temp):
         """Schreibt Werte in das SHI für Warmwasser"""
-        # Mode: 0=Aus, 1=Setpoint
-        self._send_request(6, 10005, mode) # Register 10005
         # Temperatur mal 10
         self._send_request(6, 10006, int(temp * 10)) # Register 10006
+        # Mode: 0=Aus, 1=Setpoint
+        self._send_request(6, 10005, mode) # Register 10005
     
     # Guten Morgen Boost zum Akku-leeren:
     def write_hz_boost(self, mode, setpoint=None):
@@ -167,6 +180,6 @@ class LuxtronikModbus:
         mode: 0=Auto/Aus, 1=Setpoint
         setpoint: Temperatur in °C (z.B. 35.0)
         """
-        self._send_request(6, 10000, mode) # Register 10000: Heizung Modus
         if setpoint is not None:
             self._send_request(6, 10001, int(setpoint * 10)) # 10001: Sollwert
+        self._send_request(6, 10000, mode) # Register 10000: Heizung Modus

@@ -4,25 +4,32 @@ import sys
 import os
 from luxtronik import LuxtronikModbus
 
+def _read_e3dc_config_value(key, default=None):
+    """Liest einen Wert aus der zentralen e3dc.config.txt."""
+    try:
+        with open('/var/www/html/e3dc_paths.json', 'r') as f:
+            paths = json.load(f)
+            install_path = paths.get('install_path', '/home/pi/E3DC-Control/')
+    except:
+        install_path = '/home/pi/E3DC-Control/'
+    
+    config_path = os.path.join(install_path, 'e3dc.config.txt')
+    if not os.path.exists(config_path): return default
+
+    try:
+        with open(config_path, 'r') as f:
+            for line in f:
+                if line.strip().startswith('#') or '=' not in line: continue
+                k, v = line.split('=', 1)
+                if k.strip().lower() == key.lower():
+                    return v.strip()
+    except Exception: pass
+    return default
+
 def main():
-    # Standardwerte
-    ip = '192.168.178.88' 
-    luxtronik_enabled = 0
-
-    # Pfad zur Konfigurationsdatei ermitteln
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    config_file = os.path.join(script_dir, "config.lux.json")
-
-    # Config laden
-    if os.path.exists(config_file):
-        try:
-            with open(config_file, 'r') as f:
-                data = json.load(f)
-                ip = data.get('luxtronik_ip', ip)
-                luxtronik_enabled = int(data.get('luxtronik', 0))
-        except Exception as e:
-            # Fehler auf stderr ausgeben, damit der JSON-Output (stdout) nicht zerstört wird
-            sys.stderr.write(f"Config-Fehler: {e}\n")
+    ip = _read_e3dc_config_value('luxtronik_ip', '192.168.178.88')
+    luxtronik_enabled_str = _read_e3dc_config_value('luxtronik', '0')
+    luxtronik_enabled = luxtronik_enabled_str.lower() in ['1', 'true']
 
     # Vorbereiten des Ergebnis-Objekts
     result = {
@@ -34,7 +41,7 @@ def main():
 
     # Abbruch, wenn deaktiviert
     if luxtronik_enabled != 1:
-        result['error'] = "Luxtronik ist deaktiviert (config.lux.json)."
+        result['error'] = "Luxtronik ist in der Konfiguration deaktiviert."
         print(json.dumps(result))
         return
 

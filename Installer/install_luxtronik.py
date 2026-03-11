@@ -6,7 +6,6 @@ import subprocess
 from .core import register_command
 from .utils import run_command, pip_install
 from .installer_config import get_install_path, get_install_user, get_user_ids, get_www_data_gid, load_config
-from .logging_manager import get_or_create_logger, log_task_completed, log_error
 
 INSTALL_PATH = get_install_path()
 LUX_SCRIPT_NAME = "energy_manager.py"
@@ -14,8 +13,6 @@ LUX_CONFIG_NAME = "config.lux.json"
 SERVICE_NAME = "energy_manager"
 # Wir nutzen direkt das Verzeichnis im Installer (kein Kopieren mehr)
 LUX_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "luxtronik")
-
-lux_logger = get_or_create_logger("luxtronik")
 
 def install_dependencies():
     """Installiert Python-Abhängigkeiten für Luxtronik."""
@@ -52,57 +49,16 @@ def setup_script():
         return True
     except Exception as e:
         print(f"✗ Fehler beim Setzen der Berechtigungen: {e}")
-        log_error("luxtronik", f"Fehler bei Berechtigungen: {e}")
         return False
 
-def configure_luxtronik():
-    """Erstellt oder bearbeitet die config.lux.json."""
-    print("\n=== Luxtronik Konfiguration ===\n")
-    
-    config_path = os.path.join(LUX_DIR, LUX_CONFIG_NAME)
-    current_conf = {}
-    
-    if os.path.exists(config_path):
-        try:
-            with open(config_path, 'r') as f:
-                current_conf = json.load(f)
-        except: pass
-
-    # Wizard
-    def ask(key, text, default):
-        val = input(f"{text} [{current_conf.get(key, default)}]: ").strip()
-        return val if val else current_conf.get(key, default)
-
-    new_conf = current_conf.copy()
-    
-    # Aktivierung
-    act = ask("luxtronik", "Luxtronik aktivieren? (1=Ja, 0=Nein)", "1")
-    new_conf["luxtronik"] = int(act)
-    
-    if new_conf["luxtronik"] == 1:
-        new_conf["luxtronik_ip"] = ask("luxtronik_ip", "IP-Adresse der Wärmepumpe", "192.168.178.88")
-        new_conf["GRID_START_LIMIT"] = int(ask("GRID_START_LIMIT", "Einspeisegrenze Start (Watt, negativ)", "-3500"))
-        new_conf["MIN_SOC"] = int(ask("MIN_SOC", "Mindest-SoC (%)", "65"))
-        new_conf["AT_LIMIT"] = float(ask("AT_LIMIT", "Außentemperatur-Grenze (°C)", "14.0"))
-        
-        print("\n--- Boost Temperaturen ---")
-        new_conf["WWS"] = float(ask("WWS", "Warmwasser Soll (Sommer/Boost) (°C)", "55.0"))
-        new_conf["WWW"] = float(ask("WWW", "Warmwasser Soll (Winter) (°C)", "45.0"))
-        new_conf["HZ"] = float(ask("HZ", "Rücklauf Soll (°C)", "50.0"))
-
-    # Speichern
-    try:
-        with open(config_path, 'w') as f:
-            json.dump(new_conf, f, indent=4)
-        
-        # Rechte
-        uid, _ = get_user_ids()
-        gid = get_www_data_gid()
-        os.chown(config_path, uid, gid)
-        os.chmod(config_path, 0o664)
-        print(f"✓ Konfiguration gespeichert: {config_path}")
-    except Exception as e:
-        print(f"✗ Fehler beim Speichern: {e}")
+def configure_luxtronik_obsolete():
+    """Informiert den User, dass die Konfiguration umgezogen ist."""
+    print("\n" + "="*50)
+    print("  HINWEIS: Die Konfiguration für den Luxtronik Energy Manager")
+    print("  erfolgt nun zentral im Web-Interface unter 'Config Editor'.")
+    print("  Dieses Menü dient nur noch der Installation des Dienstes.")
+    print("="*50 + "\n")
+    input("Drücke Enter um fortzufahren...")
 
 def cleanup_old_service():
     """Entfernt den alten wp-manager Service falls vorhanden."""
@@ -171,9 +127,8 @@ def install_luxtronik_menu():
 
     if install_dependencies():
         setup_script()
-        configure_luxtronik()
+        configure_luxtronik_obsolete()
         cleanup_old_service()
         setup_service()
-        log_task_completed("Luxtronik Installation")
 
 register_command("101", "Luxtronik Manager installieren/konfigurieren", install_luxtronik_menu, category="Erweiterungen", sort_order=145)

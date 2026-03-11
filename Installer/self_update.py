@@ -16,7 +16,7 @@ import re
 import time
 
 from .core import register_command
-from .utils import run_command
+from .utils import run_command, replace_in_file
 from .installer_config import get_install_user
 from .logging_manager import get_or_create_logger, log_task_completed, log_error, log_warning
 
@@ -146,6 +146,61 @@ def download_release(download_url):
     return None
 
 
+def _run_migration_luxtronik_config(installer_dir):
+    """
+    Führt eine einmalige Migration von der alten config.lux.json
+    zur zentralen e3dc.config.txt durch.
+    """
+    from .installer_config import get_install_path
+    lux_config_path = os.path.join(installer_dir, "Installer", "luxtronik", "config.lux.json")
+    e3dc_config_path = os.path.join(get_install_path(), "e3dc.config.txt")
+
+    if not os.path.exists(lux_config_path):
+        return # Nichts zu migrieren
+
+    print("→ Führe Konfigurations-Migration für Luxtronik durch...")
+    update_logger.info("Starte Migration von config.lux.json...")
+    try:
+        with open(lux_config_path, 'r', encoding='utf-8') as f:
+            lux_conf = json.load(f)
+
+        with open(e3dc_config_path, 'r', encoding='utf-8') as f:
+            e3dc_lines = f.readlines()
+
+        new_lines = []
+        keys_to_update = {k.lower(): str(v) for k, v in lux_conf.items()}
+        
+        for line in e3dc_lines:
+            stripped_line = line.strip()
+            if not stripped_line or stripped_line.startswith('#'):
+                new_lines.append(line)
+                continue
+            
+            if '=' in stripped_line:
+                key, _ = stripped_line.split('=', 1)
+                key_lower = key.strip().lower()
+                if key_lower in keys_to_update:
+                    new_lines.append(f"{key.strip()} = {keys_to_update[key_lower]}\n")
+                    del keys_to_update[key_lower]
+                    continue
+            new_lines.append(line)
+
+        if keys_to_update:
+            new_lines.append("\n# --- Automatisch migrierte Luxtronik-Parameter ---\n")
+            for key, value in keys_to_update.items():
+                new_lines.append(f"{key} = {value}\n")
+
+        with open(e3dc_config_path, 'w', encoding='utf-8') as f:
+            f.writelines(new_lines)
+        
+        os.rename(lux_config_path, lux_config_path + ".migrated")
+        print("✓ Konfiguration erfolgreich nach e3dc.config.txt migriert.")
+        update_logger.info("Luxtronik-Konfiguration erfolgreich migriert.")
+
+    except Exception as e:
+        print(f"⚠ Fehler bei der Konfigurations-Migration: {e}")
+        update_logger.error(f"Fehler bei der Konfigurations-Migration: {e}", e)
+
 def extract_release(zip_path, new_version):
     """
     Entpackt die Release-ZIP und führt Update durch.
@@ -273,6 +328,9 @@ def extract_release(zip_path, new_version):
                         policy_executed = True
                 except Exception as pe:
                     print(f"⚠ Fehler beim Lesen der Update-Policy: {pe}")
+
+            # Migration der Luxtronik-Konfiguration nach dem Kopieren der neuen Dateien
+            _run_migration_luxtronik_config(INSTALLER_DIR)
 
             # 1. Pakete nachinstallieren (falls angefordert)
             if apt_packages:

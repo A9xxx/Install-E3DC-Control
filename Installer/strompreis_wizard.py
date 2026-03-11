@@ -7,7 +7,7 @@ from .installer_config import get_install_path, get_user_ids, get_www_data_gid
 from .logging_manager import get_or_create_logger, log_task_completed, log_error, log_warning
 
 INSTALL_PATH = get_install_path()
-PRICE_FILE = os.path.join(INSTALL_PATH, "e3dc.strompreis.txt")
+PRICE_FILE = os.path.join(INSTALL_PATH, "e3dc.strompreise.txt")
 strom_logger = get_or_create_logger("strompreis")
 
 # Standardwerte

@@ -2,6 +2,23 @@
 
 # Changelog
 
+## [3.2.5] - 2026-03-11 - Config Centralization & Logic Fixes
+
+### ⚙️ System & Konfiguration
+*   **Zentrale Konfiguration:** Die Einstellungen für den Luxtronik Energy Manager wurden von `config.lux.json` in die zentrale `e3dc.config.txt` integriert. Dies vereinfacht Backups und Verwaltung massiv.
+*   **Auto-Migration:** Beim Update werden vorhandene Einstellungen automatisch in die neue Struktur überführt und alte Dateien bereinigt.
+
+### 🔥 Luxtronik Energy Manager
+*   **Smart-Logik (PV-Pause):** Die "Aushungern"-Funktion prüft nun zusätzlich den Trend. Eine Pause wird nur noch eingelegt, wenn die Prognosekurve ansteigt (>10%), um unnötiges Pausieren bei fallender Leistung (Nachmittag) zu verhindern.
+*   **Bugfix:** Behebung eines Absturzes, der durch falsche Datentypen (Float statt Int) bei Zeit-Parametern verursacht wurde.
+*   **Stabilität:** Korrektur von Zugriffen auf veraltete Konfigurationsvariablen nach der Migration.
+
+### 🖥️ Web-Interface
+*   **Config Editor:** Neues, zweispaltiges Layout für Desktop-Geräte und eine spezialisierte, gruppierte Ansicht für alle Luxtronik-Einstellungen inklusive Tooltips.
+*   **Cleanup:** Die Luxtronik-Seite dient nun rein der Visualisierung; Einstellungen erfolgen zentral im Config Editor.
+
+---
+
 ## [3.2.4] - 2026-03-11 - Auto-Update & Release Workflow
 
 ### 🚀 System & Updates

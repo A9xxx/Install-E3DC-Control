@@ -68,27 +68,29 @@ def setup_logging():
 if not os.path.exists(BACKUP_DIR):
     os.makedirs(BACKUP_DIR)
 
-def load_config():
-    if os.path.exists(CONFIG_PATH):
-        with open(CONFIG_PATH, 'r') as f:
-            return json.load(f)
-    return {}
-
-
-def read_e3dc_config_value(key):
-    """Liest einen Wert aus der e3dc.config.txt"""
+def read_e3dc_config_value_raw(key):
+    """Liest einen Rohwert aus der e3dc.config.txt"""
     try:
         with open(E3DC_CONFIG_PATH, 'r') as f:
             for line in f:
-                if line.strip().startswith('#'): continue
-                if '=' in line:
-                    k, v = line.split('=', 1)
-                    if k.strip().lower() == key.lower():
-                        return v.strip()
-    except Exception as e:
-        # Hier kann nicht geloggt werden, da der Logger noch nicht initialisiert ist
-        pass
+                line = line.strip()
+                if line.startswith('#') or '=' not in line: continue
+                k, v = line.split('=', 1)
+                if k.strip().lower() == key.lower():
+                    return v.strip()
+    except Exception: pass
     return None
+
+def read_e3dc_config_value(key, default=None):
+    """Liest einen Wert aus der e3dc.config.txt und gibt einen Default zurück, falls nicht gefunden."""
+    value = read_e3dc_config_value_raw(key)
+    if value is None:
+        return default
+    # Konvertiere 'true'/'false' Strings zu Booleans, Zahlen zu Zahlen etc.
+    if value.lower() in ['true', '1']: return 1
+    if value.lower() in ['false', '0']: return 0
+    try: return float(value)
+    except ValueError: return value
 
 
 def write_e3dc_config_value(key, value):
@@ -191,11 +193,10 @@ def get_price_action(prices, start_hour, interval, limit, min_duration_min, curr
 
 def main():
     logger = setup_logging()
-    cfg = load_config()
 
     # Prüfen ob Luxtronik aktiviert ist
-    luxtronik_enabled = int(cfg.get('luxtronik', 0)) == 1
-    wp_ip = cfg.get('luxtronik_ip')
+    luxtronik_enabled = read_e3dc_config_value('luxtronik', 0) == 1
+    wp_ip = read_e3dc_config_value('luxtronik_ip')
     
     logger.info("Dienst wird gestartet...")
     # Nur initialisieren, wenn auch aktiv und IP vorhanden
@@ -210,55 +211,49 @@ def main():
 
     # Konfiguration
     # Start-Grenze: -3500 bedeutet 3500W Einspeisung nötig zum Starten
-    GRID_START_LIMIT = cfg.get('GRID_START_LIMIT', -3500) 
-    MIN_SOC = cfg.get('MIN_SOC', 80)
-    AT_LIMIT = cfg.get('AT_LIMIT', 10.0)
-    AUTO_MODE = int(cfg.get('auto_mode', 1))
+    GRID_START_LIMIT = read_e3dc_config_value('GRID_START_LIMIT', -3500)
+    MIN_SOC = read_e3dc_config_value('MIN_SOC', 80)
+    AT_LIMIT = read_e3dc_config_value('AT_LIMIT', 10.0)
+    AUTO_MODE = read_e3dc_config_value('auto_mode', 1)
     
     # Preis-Boost Konfiguration
-    PRICE_BOOST_ENABLE = int(cfg.get('price_boost_enable', 0))
-    PRICE_LIMIT = float(cfg.get('price_limit', 20.0)) # ct/kWh
-    PRICE_MIN_DURATION = int(cfg.get('price_min_duration', 60)) # Minuten
-    PRICE_MAX_DAILY = int(cfg.get('price_max_daily', 180)) # Minuten pro Tag
-    PRICE_HARD_LIMIT = float(cfg.get('price_hard_limit', -99.0)) # Zwangs-Boost unter diesem Preis
-    WQ_MIN_TEMP = float(cfg.get('wq_min_temp', 1.0)) # WQ Aus Schutz
-    RL_SOURCE = cfg.get('rl_source', 'internal') # 'internal' or 'external'
-    MANUAL_BOOST_MIN_SOC = int(cfg.get('manual_boost_min_soc', 25)) # SoC Schutz für manuellen Boost
+    PRICE_BOOST_ENABLE = read_e3dc_config_value('price_boost_enable', 0)
+    PRICE_LIMIT = read_e3dc_config_value('price_limit', 20.0)
+    PRICE_MIN_DURATION = read_e3dc_config_value('price_min_duration', 60)
+    PRICE_MAX_DAILY = read_e3dc_config_value('price_max_daily', 180)
+    PRICE_HARD_LIMIT = read_e3dc_config_value('price_hard_limit', -99.0)
+    WQ_MIN_TEMP = read_e3dc_config_value('wq_min_temp', 1.0)
+    RL_SOURCE = read_e3dc_config_value('rl_source', 'internal')
+    MANUAL_BOOST_MIN_SOC = read_e3dc_config_value('manual_boost_min_soc', 25)
 
     # Morning Boost Konfiguration
-    MB_ENABLE = int(cfg.get('morning_boost_enable', 0))
-    MB_PRIO = cfg.get('morning_boost_prio', 'wallbox')
-    MB_WB_POWER = float(cfg.get('morning_boost_wb_power', 7.0))
-    MB_MIN_HOURS = int(cfg.get('morning_boost_min_hours', 3))
-    MB_MIN_PV_PCT = float(cfg.get('morning_boost_min_pv_pct', 50.0))
-    MB_TARGET_SOC = int(cfg.get('morning_boost_target_soc', 20))
-    MB_DEADLINE = int(cfg.get('morning_boost_deadline', 8)) # Stunde
+    MB_ENABLE = read_e3dc_config_value('morning_boost_enable', 0)
+    MB_PRIO = read_e3dc_config_value('morning_boost_prio', 'wallbox')
+    MB_WB_POWER = read_e3dc_config_value('morning_boost_wb_power', 7.0)
+    MB_MIN_HOURS = read_e3dc_config_value('morning_boost_min_hours', 3)
+    MB_MIN_PV_PCT = read_e3dc_config_value('morning_boost_min_pv_pct', 50.0)
+    MB_TARGET_SOC = read_e3dc_config_value('morning_boost_target_soc', 20)
+    MB_DEADLINE = int(read_e3dc_config_value('morning_boost_deadline', 8))
 
     # Superintelligence Konfiguration
-    SI_ENABLE = int(cfg.get('super_intelligence_enable', 0))
-    SI_DEADLINE = int(cfg.get('super_intelligence_deadline', 8))
+    SI_ENABLE = read_e3dc_config_value('super_intelligence_enable', 0)
+    SI_DEADLINE = int(read_e3dc_config_value('super_intelligence_deadline', 8))
 
     # Telegram Konfiguration
-    TELEGRAM_TOKEN = cfg.get('telegram_token', '')
-    TELEGRAM_CHAT_ID = cfg.get('telegram_chat_id', '')
+    TELEGRAM_TOKEN = read_e3dc_config_value('telegram_token', '')
+    TELEGRAM_CHAT_ID = read_e3dc_config_value('telegram_chat_id', '')
 
     # PV-Pause (Prognose-basiert)
-    PV_PAUSE_ENABLE = int(cfg.get('pv_pause_enable', 0))
-    PV_PAUSE_SOC = int(cfg.get('pv_pause_soc', 80)) # Mindest-SoC für Pause
-    PV_PAUSE_WATT = float(cfg.get('pv_pause_watt', 3000.0)) # Erwartete Leistung
-    PV_PAUSE_TIMEOUT_MINUTES = int(cfg.get('pv_pause_timeout_minutes', 120)) # Max. Dauer der Pause
+    PV_PAUSE_ENABLE = read_e3dc_config_value('pv_pause_enable', 0)
+    PV_PAUSE_SOC = read_e3dc_config_value('pv_pause_soc', 80)
+    PV_PAUSE_WATT = read_e3dc_config_value('pv_pause_watt', 3000.0)
+    PV_PAUSE_TIMEOUT_MINUTES = read_e3dc_config_value('pv_pause_timeout_minutes', 120)
     
     # Stop-Verzögerung: Wie lange darf Strom aus Netz/Akku gezogen werden?
-    STOP_DELAY_MINUTES = int(cfg.get('stop_delay_minutes', 10))
-    MANUAL_BOOST_MAX_DURATION = int(cfg.get('manual_boost_max_duration', 180))
+    STOP_DELAY_MINUTES = read_e3dc_config_value('stop_delay_minutes', 10)
+    MANUAL_BOOST_MAX_DURATION = read_e3dc_config_value('manual_boost_max_duration', 180)
     
     # Auto-Update Konfiguration
-    AUTO_UPDATE_ENABLE = int(read_e3dc_config_value('auto_update_enable') or 0)
-    update_time_str = read_e3dc_config_value('auto_update_time') or "23:00"
-    try:
-        update_hour, update_minute = map(int, update_time_str.split(':'))
-    except:
-        update_hour, update_minute = 23, 0
     update_checked_today = False
 
     # IP Adresse
@@ -377,6 +372,14 @@ def main():
     while True:
         now = datetime.now()
         
+        # Dynamisches Nachladen der Update-Konfiguration (damit Änderungen sofort greifen)
+        AUTO_UPDATE_ENABLE = int(read_e3dc_config_value('auto_update_enable') or 0)
+        update_time_str = read_e3dc_config_value('auto_update_time') or "23:00"
+        try:
+            update_hour, update_minute = map(int, update_time_str.split(':'))
+        except:
+            update_hour, update_minute = 23, 0
+        
         # --- AUTO-UPDATE CHECK (23:00 Uhr) ---
         if AUTO_UPDATE_ENABLE == 1:
             if now.hour == update_hour and now.minute == update_minute:
@@ -453,7 +456,7 @@ def main():
                             
                             # Reset mit validen Temperaturen
                             wp.write_hz_boost(0, 32.0)
-                            wp.write_ww_boost(0, cfg.get('WWW', 45.0))
+                            wp.write_ww_boost(0, read_e3dc_config_value('WWW', 45.0))
                         
                         # WICHTIG: Verbindung sauber schließen, bevor wir den Zyklus abbrechen!
                         wp.close()
@@ -520,7 +523,7 @@ def main():
                         logger.warning(f"NOT-AUS (Manuell): WQ Aus zu kalt ({wq_aus}°C).")
                         if wp and wp.connect():
                             wp.write_hz_boost(0)
-                            wp.write_ww_boost(0, cfg.get('WWW', 45.0))
+                            wp.write_ww_boost(0, read_e3dc_config_value('WWW', 45.0))
                             wp.close()
                         os.remove(FLAG_FILE)
                     # 2. SoC Schutz (NEU)
@@ -528,7 +531,7 @@ def main():
                         logger.info(f"Manueller Boost gestoppt: SoC zu niedrig ({soc}% < {MANUAL_BOOST_MIN_SOC}%).")
                         if wp and wp.connect():
                             wp.write_hz_boost(0)
-                            wp.write_ww_boost(0, cfg.get('WWW', 45.0))
+                            wp.write_ww_boost(0, read_e3dc_config_value('WWW', 45.0))
                             wp.close()
                         os.remove(FLAG_FILE)
                     # 2. Zeit-Limit
@@ -536,7 +539,7 @@ def main():
                         logger.info(f"Manueller Boost abgelaufen (> {MANUAL_BOOST_MAX_DURATION/60:.1f}h).")
                         if wp and wp.connect():
                             wp.write_hz_boost(0)
-                            wp.write_ww_boost(0, cfg.get('WWW', 45.0))
+                            wp.write_ww_boost(0, read_e3dc_config_value('WWW', 45.0))
                             wp.close()
                         os.remove(FLAG_FILE)
                 except Exception as e:
@@ -815,13 +818,13 @@ def main():
                                 # Abbruchbedingung 2: SoC fällt zu tief (Sicherheitsnetz). Glitch-Schutz: SoC > 0 prüfen.
                                 elif e3dc_valid and soc > 0 and soc < (PV_PAUSE_SOC - 5):                                    
                                     logger.warning(f"PV-Pause abgebrochen (SoC {soc}% < {PV_PAUSE_SOC-5}%).")
-                                    if wp and wp.connect(): wp.write_hz_boost(0); wp.write_ww_boost(0, cfg.get('WWW', 45.0)); wp.close()
+                                    if wp and wp.connect(): wp.write_hz_boost(0); wp.write_ww_boost(0, read_e3dc_config_value('WWW', 45.0)); wp.close()
                                     pv_pause_active = False; boost_active = False; pv_pause_start_time = None
 
                                 # Abbruchbedingung 3: Timeout (Sonne kam nicht)
                                 elif pv_pause_start_time and (time.time() - pv_pause_start_time) > (PV_PAUSE_TIMEOUT_MINUTES * 60):                                    
                                     logger.warning(f"PV-Pause abgebrochen (Timeout > {PV_PAUSE_TIMEOUT_MINUTES} Min).")
-                                    if wp and wp.connect(): wp.write_hz_boost(0); wp.write_ww_boost(0, cfg.get('WWW', 45.0)); wp.close()
+                                    if wp and wp.connect(): wp.write_hz_boost(0); wp.write_ww_boost(0, read_e3dc_config_value('WWW', 45.0)); wp.close()
                                     pv_pause_active = False; boost_active = False; pv_pause_start_time = None
                                 
                                 # Abbruchbedingung 4: Prognose-Check (Ist der Grund für die Pause noch da?)
@@ -829,17 +832,24 @@ def main():
                                     gmt = time.gmtime()
                                     now_gmt = gmt.tm_hour + gmt.tm_min / 60.0
                                     peak_still_valid = False
+                                    current_w = 0.0
+                                    max_future_w = 0.0
+                                    
                                     for entry in forecast:
                                         h = entry['h']
                                         if h < (now_gmt - 12): h += 24
-                                        # Prüfe ob Peak in den nächsten 1.5h (oder aktuell) liegt
+                                        # Werte einsammeln
+                                        if abs(h - now_gmt) < 0.25: current_w = entry['w']
                                         if now_gmt < h <= (now_gmt + 1.5):
-                                            if entry['w'] >= PV_PAUSE_WATT:
-                                                peak_still_valid = True
-                                                break
+                                            if entry['w'] > max_future_w: max_future_w = entry['w']
+                                    
+                                    # Pause nur fortsetzen, wenn Peak hoch genug UND höher als aktuell (Trend positiv)
+                                    if max_future_w >= PV_PAUSE_WATT and max_future_w > (current_w * 1.1):
+                                        peak_still_valid = True
+                                        
                                     if not peak_still_valid:
                                         logger.info(f"PV-Pause beendet (Prognose-Grund entfallen).")
-                                        if wp and wp.connect(): wp.write_hz_boost(0); wp.write_ww_boost(0, cfg.get('WWW', 45.0)); wp.close()
+                                        if wp and wp.connect(): wp.write_hz_boost(0); wp.write_ww_boost(0, read_e3dc_config_value('WWW', 45.0)); wp.close()
                                         pv_pause_active = False; boost_active = False; pv_pause_start_time = None
 
                             # Fall B: Wir prüfen, ob wir pausieren sollten (noch kein Boost aktiv)
@@ -849,21 +859,24 @@ def main():
                                 if forecast:
                                     gmt = time.gmtime()
                                     now_gmt = gmt.tm_hour + gmt.tm_min / 60.0
+                                    current_w = 0.0
+                                    max_future_w = 0.0
                                     
                                     for entry in forecast:
                                         h = entry['h']
                                         if h < (now_gmt - 12): h += 24 
-                                        
+                                        if abs(h - now_gmt) < 0.25: current_w = entry['w']
                                         if now_gmt < h <= (now_gmt + 1.5):
-                                            if entry['w'] >= PV_PAUSE_WATT:
-                                                peak_found = True
-                                                break
+                                            if entry['w'] > max_future_w: max_future_w = entry['w']
+                                
+                                if max_future_w >= PV_PAUSE_WATT and max_future_w > (current_w * 1.1):
+                                    peak_found = True
                                 
                                 if peak_found:
                                     logger.info(f"Starte PV-Pause (Prognose > {PV_PAUSE_WATT}W erwartet).")
                                     if wp and wp.connect():
                                         wp.write_hz_boost(1, 20.0) # Heizung unterdrücken
-                                        wp.write_ww_boost(0, cfg.get('WWW', 45.0))
+                                        wp.write_ww_boost(0, read_e3dc_config_value('WWW', 45.0))
                                         wp.close()
                                     pv_pause_active = True
                                     boost_active = True
@@ -916,7 +929,7 @@ def main():
                                 logger.info(f"Start Preis-Pause (Erholung vor Boost). WQ: {wq_aus}°C")
                                 if wp and wp.connect():
                                     wp.write_hz_boost(1, 20.0) # Heizung auf 20°C zwingen (Pause)
-                                    wp.write_ww_boost(0, cfg.get('WWW', 45.0))       # WW Normal
+                                    wp.write_ww_boost(0, read_e3dc_config_value('WWW', 45.0))       # WW Normal
                                     wp.close()
                                 pre_pause_active = True
                                 price_boost_active = False
@@ -928,12 +941,12 @@ def main():
                                 if wp and wp.connect():
                                     if at > AT_LIMIT:
                                         # Sommer-Settings
-                                        wp.write_ww_boost(1, cfg.get('WWS', 50.0))
+                                        wp.write_ww_boost(1, read_e3dc_config_value('WWS', 50.0))
                                         wp.write_hz_boost(0) # Heizung aus
                                     else:
                                         # Winter-Settings
-                                        wp.write_ww_boost(1, cfg.get('WWW', 48.0))
-                                        wp.write_hz_boost(1, cfg.get('HZ', 50.0))
+                                        wp.write_ww_boost(1, read_e3dc_config_value('WWW', 48.0))
+                                        wp.write_hz_boost(1, read_e3dc_config_value('HZ', 50.0))
                                     wp.close()
                                 price_boost_active = True
                                 pre_pause_active = False
@@ -946,7 +959,7 @@ def main():
                             logger.info("Ende Preis-Steuerung.")
                             if wp and wp.connect():
                                 wp.write_hz_boost(0)
-                                wp.write_ww_boost(0, cfg.get('WWW', 45.0))
+                                wp.write_ww_boost(0, read_e3dc_config_value('WWW', 45.0))
                                 wp.close()
                             price_boost_active = False
                             pre_pause_active = False
@@ -959,11 +972,11 @@ def main():
                                     logger.info(f"Start PV-Boost (Grid: {grid}W, SoC: {soc}%)")
                                     if wp.connect():
                                         if at > AT_LIMIT:
-                                            wp.write_ww_boost(1, cfg.get('WWS', 50.0))
+                                            wp.write_ww_boost(1, read_e3dc_config_value('WWS', 50.0))
                                             wp.write_hz_boost(0) # Heizung im Sommer sicherheitshalber aus
                                         else:
-                                            wp.write_ww_boost(1, cfg.get('WWW', 48.0))
-                                            wp.write_hz_boost(1, cfg.get('HZ', 50.0))
+                                            wp.write_ww_boost(1, read_e3dc_config_value('WWW', 48.0))
+                                            wp.write_hz_boost(1, read_e3dc_config_value('HZ', 50.0))
                                         wp.close()
                                     boost_active = True
                                     deficit_start_time = None # Timer sicherheitshalber nullen
@@ -979,14 +992,14 @@ def main():
 
                                 # SYNC-CHECK: Prüfen ob Werte mit Config übereinstimmen
                                 # (Wichtig nach Neustart oder Config-Änderung)
-                                target_ww = cfg.get('WWS', 50.0) if at > AT_LIMIT else cfg.get('WWW', 48.0)
+                                target_ww = read_e3dc_config_value('WWS', 50.0) if at > AT_LIMIT else read_e3dc_config_value('WWW', 48.0)
                                 current_ww = wp_status.get('WW_Setpoint', 0)
                                 
                                 sync_needed = abs(current_ww - target_ww) > 0.5
 
                                 # Im Winter auch Heizung prüfen
                                 if at <= AT_LIMIT:
-                                    target_hz = cfg.get('HZ', 50.0)
+                                    target_hz = read_e3dc_config_value('HZ', 50.0)
                                     current_hz = wp_status.get('HZ_Setpoint', 0)
                                     if abs(current_hz - target_hz) > 0.5:
                                         sync_needed = True
@@ -995,11 +1008,11 @@ def main():
                                     logger.info("Korrigiere Boost-Werte (Sync Check)")
                                     if wp.connect():
                                         if at > AT_LIMIT:
-                                            wp.write_ww_boost(1, cfg.get('WWS', 50.0))
+                                            wp.write_ww_boost(1, read_e3dc_config_value('WWS', 50.0))
                                             wp.write_hz_boost(0)
                                         else:
-                                            wp.write_ww_boost(1, cfg.get('WWW', 48.0))
-                                            wp.write_hz_boost(1, cfg.get('HZ', 50.0))
+                                            wp.write_ww_boost(1, read_e3dc_config_value('WWW', 48.0))
+                                            wp.write_hz_boost(1, read_e3dc_config_value('HZ', 50.0))
                                         wp.close()
 
                             # AUSSCHALTEN PRÜFEN (Nur bei reinem PV-Boost relevant)

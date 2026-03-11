@@ -3,17 +3,39 @@ import os
 import json
 from luxtronik import LuxtronikModbus
 
-CONFIG_PATH = "/home/pi/Install/Installer/luxtronik/config.lux.json"
 FLAG_FILE = "/var/www/html/ramdisk/manual_boost.flag"
-WP_IP = "192.168.178.88"
 
-def load_config():
-    with open(CONFIG_PATH, 'r') as f:
-        return json.load(f)
+def _read_e3dc_config_value(key, default=None):
+    """Liest einen Wert aus der zentralen e3dc.config.txt."""
+    try:
+        with open('/var/www/html/e3dc_paths.json', 'r') as f:
+            paths = json.load(f)
+            install_path = paths.get('install_path', '/home/pi/E3DC-Control/')
+    except:
+        install_path = '/home/pi/E3DC-Control/'
+    
+    config_path = os.path.join(install_path, 'e3dc.config.txt')
+    if not os.path.exists(config_path): return default
+
+    try:
+        with open(config_path, 'r') as f:
+            for line in f:
+                if line.strip().startswith('#') or '=' not in line: continue
+                k, v = line.split('=', 1)
+                if k.strip().lower() == key.lower():
+                    return v.strip()
+    except Exception: pass
+    return default
 
 def main():
     action = sys.argv[1] if len(sys.argv) > 1 else "off"
-    cfg = load_config()
+
+    WP_IP = _read_e3dc_config_value('luxtronik_ip', '192.168.178.88')
+    AT_LIMIT = float(_read_e3dc_config_value('at_limit', 10.0))
+    WWS = float(_read_e3dc_config_value('wws', 50.0))
+    WWW = float(_read_e3dc_config_value('www', 48.0))
+    HZ = float(_read_e3dc_config_value('hz', 32.0))
+
     wp = LuxtronikModbus(WP_IP)
 
     if action == "on":
@@ -21,16 +43,16 @@ def main():
             data = wp.read_all_sensors()
             at_mittel = data.get('Aussentemp_Mittel', 20.0) #
             
-            if at_mittel > cfg['AT_LIMIT']:
+            if at_mittel > AT_LIMIT:
                 # SOMMER-BOOST: Nur Warmwasser auf WWS (55°C)
-                wp.write_ww_boost(1, cfg['WWS'])
+                wp.write_ww_boost(1, WWS)
                 wp.write_hz_boost(0) # Heizung bleibt Automatik
-                status_msg = f"Sommer-Boost: WW {cfg['WWS']}°C"
+                status_msg = f"Sommer-Boost: WW {WWS}°C"
             else:
                 # WINTER-BOOST: WW auf WWW (45°C) + Heizung auf HZ (50°C)
-                wp.write_ww_boost(1, cfg['WWW'])
-                wp.write_hz_boost(1, cfg['HZ'])
-                status_msg = f"Winter-Boost: WW {cfg['WWW']}°C, HZ {cfg['HZ']}°C"
+                wp.write_ww_boost(1, WWW)
+                wp.write_hz_boost(1, HZ)
+                status_msg = f"Winter-Boost: WW {WWW}°C, HZ {HZ}°C"
             
             wp.close()
             with open(FLAG_FILE, 'w') as f: f.write(status_msg)

@@ -5,12 +5,19 @@ import subprocess
 import shutil
 import math
 from datetime import datetime, timedelta
+import logging
+from logging.handlers import RotatingFileHandler
 import re
 import requests
 from luxtronik import LuxtronikModbus
 
 # Pfade
 script_dir = os.path.dirname(os.path.abspath(__file__))
+
+# NEU: Logging Konfiguration
+LOG_DIR = "/var/www/html/logs"
+
+# Bestehende Pfade
 CONFIG_PATH = os.path.join(script_dir, "config.lux.json")
 E3DC_CONFIG_PATH = "/home/pi/E3DC-Control/e3dc.config.txt"
 AWATTAR_DEBUG_PATH = "/home/pi/E3DC-Control/awattardebug.txt"
@@ -31,6 +38,31 @@ if os.path.exists(PATHS_FILE):
             E3DC_CONFIG_PATH = install_path + "e3dc.config.txt"
             AWATTAR_DEBUG_PATH = install_path + "awattardebug.txt"
     except: pass
+
+def setup_logging():
+    """Initialisiert ein rotierendes Logfile für den Energy Manager."""
+    os.makedirs(LOG_DIR, exist_ok=True)
+    log_file = os.path.join(LOG_DIR, "energy_manager.log")
+    
+    logger = logging.getLogger("EnergyManager")
+    logger.setLevel(logging.INFO)
+    
+    # Rotierendes Log: 1MB groß, 1 Backup-Datei
+    handler = RotatingFileHandler(log_file, maxBytes=1024*1024, backupCount=1, encoding='utf-8')
+    formatter = logging.Formatter('%(asctime)s - %(message)s', datefmt='%d.%m %H:%M:%S')
+    handler.setFormatter(formatter)
+    
+    if not logger.handlers:
+        logger.addHandler(handler)
+        
+    # Berechtigungen für das Logfile setzen, damit es vom Webserver gelesen werden kann
+    try: 
+        os.chmod(log_file, 0o664)
+        # Owner/Group vom Verzeichnis erben (damit Check zufrieden ist)
+        st = os.stat(LOG_DIR)
+        os.chown(log_file, st.st_uid, st.st_gid)
+    except Exception: pass
+    return logger
 
 # Verzeichnis für Archiv erstellen
 if not os.path.exists(BACKUP_DIR):
@@ -54,7 +86,8 @@ def read_e3dc_config_value(key):
                     if k.strip().lower() == key.lower():
                         return v.strip()
     except Exception as e:
-        print(f"Fehler beim Lesen von {key}: {e}")
+        # Hier kann nicht geloggt werden, da der Logger noch nicht initialisiert ist
+        pass
     return None
 
 
@@ -76,7 +109,7 @@ def write_e3dc_config_value(key, value):
             f.write(new_content)
         return True
     except Exception as e:
-        print(f"Fehler beim Schreiben von {key}: {e}")
+        # Siehe oben
         return False
 
 
@@ -157,20 +190,22 @@ def get_price_action(prices, start_hour, interval, limit, min_duration_min, curr
 
 
 def main():
+    logger = setup_logging()
     cfg = load_config()
 
     # Prüfen ob Luxtronik aktiviert ist
     luxtronik_enabled = int(cfg.get('luxtronik', 0)) == 1
     wp_ip = cfg.get('luxtronik_ip')
     
+    logger.info("Dienst wird gestartet...")
     # Nur initialisieren, wenn auch aktiv und IP vorhanden
     wp = None
     if luxtronik_enabled and wp_ip:
         try:
             wp = LuxtronikModbus(wp_ip)
-            print("Luxtronik-Modul aktiv.")
+            logger.info("Luxtronik-Modul aktiv und verbunden.")
         except Exception as e:
-            print(f"Fehler bei Luxtronik-Initialisierung: {e}")
+            logger.error(f"Fehler bei Luxtronik-Initialisierung: {e}")
             wp = None # Sicherstellen, dass es None ist bei Fehler
 
     # Konfiguration
@@ -266,9 +301,20 @@ def main():
                     saved_ts = datetime.fromisoformat(saved['ts'])
                     if saved_ts.date() == datetime.now().date():
                         daily_boost_counter = saved.get('daily_boost_counter', 0)
-                last_pv_boost_time = saved.get('last_pv_boost_time', 0)
-                # Nur Zähler und Timer wiederherstellen, keine aktiven Zustände!
-                print(f"Status wiederhergestellt: Tageszähler ({daily_boost_counter} Min) und letzter PV-Boost vor {(time.time() - last_pv_boost_time)/3600:.1f}h.")
+                last_pv_boost_time = saved.get('last_pv_boost_time', 0)                
+                if daily_boost_counter > 0 or last_pv_boost_time > 0:
+                    logger.info(f"Status wiederhergestellt: Tageszähler ({daily_boost_counter} Min), letzter PV-Boost vor {(time.time() - last_pv_boost_time)/3600:.1f}h.")
+                
+                # NEU: Aktive Zustände wiederherstellen (Crash/Reboot Recovery)
+                # Nur wenn Daten frisch sind (< 20 min)
+                if (datetime.now() - saved_ts).total_seconds() < 1200:
+                    if saved.get('boost_active'):
+                        boost_active = True
+                        pv_pause_active = saved.get('pv_pause_active', False)
+                        price_boost_active = saved.get('price_boost_active', False)
+                        pre_pause_active = saved.get('pre_pause_active', False)
+                        if pv_pause_active: pv_pause_start_time = saved.get('pv_pause_start_time', time.time())
+                        logger.info(f"Aktiven Status wiederhergestellt: Boost={boost_active}, Pause={pv_pause_active}")
         except: pass
 
     # Morning Boost State Recovery (Sicherheit bei Neustart)
@@ -282,15 +328,15 @@ def main():
                 if state_data.get('mode') == 'morning_boost' and state_data.get('status') == 'RUNNING':
                     mb_state = 'RUNNING'
                     mb_running_prio = state_data.get('prio', '')
-                    mb_restore_needed = True
-                    print(f"Morning-Boost Status wiederhergestellt: RUNNING ({mb_running_prio})")
+                    mb_restore_needed = True                    
+                    logger.warning(f"Morning-Boost Status wiederhergestellt: RUNNING ({mb_running_prio})")
                 elif state_data.get('mode') == 'super_intelligence':
                     si_state = state_data.get('status', 'IDLE')
                     if si_state != 'IDLE' and si_state != 'DONE':
-                        si_calibrated_power_kw = state_data.get('calibrated_power')
+                        si_calibrated_power_kw = state_data.get('calibrated_power')                        
                         si_pause_end_ts = state_data.get('pause_end_ts')
                         mb_restore_needed = True # nutzt den gleichen Restore-Mechanismus
-                        print(f"Superintelligence Status wiederhergestellt: {si_state}")
+                        logger.warning(f"Superintelligence Status wiederhergestellt: {si_state}")
 
         except: pass
 
@@ -309,16 +355,15 @@ def main():
                 # os.chown(RAMDISK_FILE, os.getuid(), os.getgid()) # Optional: Owner auf den ausführenden User setzen
     except: pass
 
-    print(f"Energy-Manager gestartet...")
     if AUTO_MODE == 0:
-        print("Automatik-Regelung ist DEAKTIVIERT (Nur Monitoring).")
+        logger.info("Automatik-Regelung ist DEAKTIVIERT (Nur Monitoring).")
     elif not wp:
-        print("Nur Lademanagement-Regeln sind aktiv.")
+        logger.info("Nur Lademanagement-Regeln sind aktiv.")
         # Deaktiviere die Haupt-Boost-Logik für die WP, wenn keine WP konfiguriert ist
         AUTO_MODE = 0
     else:
-        print(f"Start bei > {abs(GRID_START_LIMIT)}W Einspeisung.")
-        print(f"Stop nach {STOP_DELAY_MINUTES} min Bezug (Netz oder Batterie).")
+        logger.info(f"Start bei > {abs(GRID_START_LIMIT)}W Einspeisung.")
+        logger.info(f"Stop nach {STOP_DELAY_MINUTES} min Bezug (Netz oder Batterie).")
 
     while True:
         now = datetime.now()
@@ -345,8 +390,8 @@ def main():
                     
                     # Initial-Status beim Start prüfen
                     if first_run:
-                        if os.path.exists(FLAG_FILE):
-                            print(f"[{now.strftime('%H:%M:%S')}] Manueller Boost erkannt (Flag). Warte im Standby.")
+                        if os.path.exists(FLAG_FILE):                            
+                            logger.info("Manueller Boost erkannt (Flag). Warte im Standby.")
                         # Die Logik zum Übernehmen eines Boosts wird entfernt.
                         # Stattdessen wird der Sicherheits-Check unten den Zustand korrigieren.
                         first_run = False
@@ -355,15 +400,30 @@ def main():
                     # obwohl das Skript keinen Boost-Zustand verwaltet.
                     if not boost_active and not os.path.exists(FLAG_FILE) and (wp_status.get('WW_Mode') == 1 or wp_status.get('HZ_Mode') == 1):
                         # Nur alle 15 Minuten benachrichtigen, um Spam zu vermeiden
-                        if (time.time() - last_safety_check_time) > 900:
-                            msg = f"[{now.strftime('%H:%M:%S')}] ⚠️ SICHERHEIT: Unerwarteter Boost-Status erkannt. Setze WP zurück."
-                            print(msg)
-                            send_telegram(msg)
-                            last_safety_check_time = time.time()
                         
-                        # Reset mit validen Temperaturen (wichtig, damit der Befehl akzeptiert wird!)
-                        wp.write_hz_boost(0, 32.0)
-                        wp.write_ww_boost(0, cfg.get('WWW', 45.0))
+                        # NEU: Smart-Check - Ist es vielleicht eine noch aktive Pause (20°C)?
+                        hz_set = wp_status.get('HZ_Setpoint', 0)
+                        if wp_status.get('HZ_Mode') == 1 and abs(hz_set - 20.0) < 1.0:
+                             # Nur übernehmen, wenn Feature auch aktiviert ist
+                             if PV_PAUSE_ENABLE == 1:
+                                 logger.info("Erkenne aktiven Pause-Status an der WP (20°C). Übernehme Status.")
+                                 boost_active = True
+                                 pv_pause_active = True
+                                 if not pv_pause_start_time: pv_pause_start_time = time.time()
+                             else:
+                                 # Feature ist aus -> Reset erzwingen (fällt in den else-Block unten)
+                                 pass
+                        else:
+                            # Echter Fehler -> Reset
+                            if (time.time() - last_safety_check_time) > 900:
+                                msg = f"SICHERHEIT: Unerwarteter Boost-Status erkannt (WW-Mode={wp_status.get('WW_Mode')}, HZ-Mode={wp_status.get('HZ_Mode')}). Setze WP zurück."
+                                logger.warning(msg)
+                                send_telegram(f"⚠️ {msg}")
+                                last_safety_check_time = time.time()
+                            
+                            # Reset mit validen Temperaturen
+                            wp.write_hz_boost(0, 32.0)
+                            wp.write_ww_boost(0, cfg.get('WWW', 45.0))
                         
                         # WICHTIG: Verbindung sauber schließen, bevor wir den Zyklus abbrechen!
                         wp.close()
@@ -377,7 +437,7 @@ def main():
                     # Status-Korrektur: Falls WP extern (Display/App) auf "Auto" (0) gestellt wurde
                     if boost_active and wp_status:
                         if wp_status.get('WW_Mode') != 1 and wp_status.get('HZ_Mode') != 1:
-                            print(f"[{now.strftime('%H:%M:%S')}] Boost-Modus wurde extern deaktiviert (Register=0). Reset Status.")
+                            logger.info("Boost-Modus wurde extern deaktiviert (Register=0). Reset Status.")
                             boost_active = False
                             deficit_start_time = None
                             price_boost_active = False
@@ -387,7 +447,7 @@ def main():
                     wp.close()
                     success = True 
                 else:
-                    print(f"[{now.strftime('%H:%M:%S')}] Verbindung zur WP fehlgeschlagen")
+                    logger.warning("Verbindung zur WP fehlgeschlagen")
 
             # 2. Logik (Überschuss-Prüfung)
             
@@ -418,37 +478,37 @@ def main():
                     price_interval = e3dc.get('price_interval', 1.0)
             except Exception as e:
                 if AUTO_MODE == 1 or os.path.exists(FLAG_FILE):
-                    print(f"Fehler bei E3DC Abfrage: {e}")
+                    logger.error(f"Fehler bei E3DC Abfrage: {e}")
 
             # Zuerst prüfen wir den manuellen Boost auf Limits (Zeit & WQ & SoC)
             if os.path.exists(FLAG_FILE) and wp:
                 try:
                     # 1. WQ Schutz
                     if wq_aus < WQ_MIN_TEMP:
-                        print(f"[{now.strftime('%H:%M:%S')}] NOT-AUS (Manuell): WQ Aus zu kalt ({wq_aus}°C).")
+                        logger.warning(f"NOT-AUS (Manuell): WQ Aus zu kalt ({wq_aus}°C).")
                         if wp and wp.connect():
                             wp.write_hz_boost(0)
-                            wp.write_ww_boost(0)
+                            wp.write_ww_boost(0, cfg.get('WWW', 45.0))
                             wp.close()
                         os.remove(FLAG_FILE)
                     # 2. SoC Schutz (NEU)
-                    elif soc < MANUAL_BOOST_MIN_SOC:
-                        print(f"[{now.strftime('%H:%M:%S')}] Manueller Boost gestoppt: SoC zu niedrig ({soc}% < {MANUAL_BOOST_MIN_SOC}%).")
+                    elif soc < MANUAL_BOOST_MIN_SOC:                        
+                        logger.info(f"Manueller Boost gestoppt: SoC zu niedrig ({soc}% < {MANUAL_BOOST_MIN_SOC}%).")
                         if wp and wp.connect():
                             wp.write_hz_boost(0)
-                            wp.write_ww_boost(0)
+                            wp.write_ww_boost(0, cfg.get('WWW', 45.0))
                             wp.close()
                         os.remove(FLAG_FILE)
                     # 2. Zeit-Limit
                     elif (time.time() - os.path.getmtime(FLAG_FILE)) > (MANUAL_BOOST_MAX_DURATION * 60):
-                        print(f"[{now.strftime('%H:%M:%S')}] Manueller Boost abgelaufen (> {MANUAL_BOOST_MAX_DURATION/60:.1f}h).")
+                        logger.info(f"Manueller Boost abgelaufen (> {MANUAL_BOOST_MAX_DURATION/60:.1f}h).")
                         if wp and wp.connect():
                             wp.write_hz_boost(0)
-                            wp.write_ww_boost(0)
+                            wp.write_ww_boost(0, cfg.get('WWW', 45.0))
                             wp.close()
                         os.remove(FLAG_FILE)
                 except Exception as e:
-                    print(f"Fehler bei Manual-Boost Check: {e}")
+                    logger.error(f"Fehler bei Manual-Boost Check: {e}")
 
             # --- SUPERINTELLIGENCE LOGIK ---
             if SI_ENABLE == 1:
@@ -457,7 +517,7 @@ def main():
 
                 # 0. Pausen-Management
                 if si_state == "PAUSING" and si_pause_end_ts and now >= datetime.fromtimestamp(si_pause_end_ts):
-                    print(f"[{now.strftime('%H:%M:%S')}] Superintelligence: Pause beendet, setze Ladung fort.")
+                    logger.info("Superintelligence: Pause beendet, setze Ladung fort.")
                     write_e3dc_config_value('wbmode', 10)
                     si_state = "RUNNING"
 
@@ -466,8 +526,8 @@ def main():
                     high_hours, pv_sum = get_forecast_data()
                     condition_hours = high_hours >= 8.0
                     condition_yield = pv_sum >= 1.5 * (100 - si_target_soc)
-                    if condition_hours and condition_yield:
-                        print(f"[{now.strftime('%H:%M:%S')}] Superintelligence geplant! (Prognose: {high_hours}h voll, {pv_sum:.1f}% PV, Ziel-SoC {si_target_soc}%)")
+                    if condition_hours and condition_yield:                        
+                        logger.info(f"Superintelligence geplant! (Prognose: {high_hours}h voll, {pv_sum:.1f}% PV, Ziel-SoC {si_target_soc}%)")
                         si_state = "PLANNED"
                 
                 # 2. Start-Berechnung & Ausführung
@@ -482,7 +542,7 @@ def main():
                     start_ts = si_deadline_ts - timedelta(hours=duration_h)
                     
                     if now >= start_ts:
-                        print(f"[{now.strftime('%H:%M:%S')}] Starte Superintelligence. Ziel: {si_target_soc}% SoC bis {SI_DEADLINE}:00.")
+                        logger.info(f"Starte Superintelligence. Ziel: {si_target_soc}% SoC bis {SI_DEADLINE}:00.")
                         orig_mode = read_e3dc_config_value('wbmode')
                         orig_min = read_e3dc_config_value('wbminsoc')
                         with open(STATE_FILE, 'w') as f:
@@ -506,7 +566,7 @@ def main():
                     stop_boost = (soc <= (si_target_soc + 1)) or (now >= si_deadline_ts)
                     
                     if stop_boost:
-                        print(f"[{now.strftime('%H:%M:%S')}] Superintelligence beendet.")
+                        logger.info("Superintelligence beendet.")
                         if os.path.exists(STATE_FILE):
                             with open(STATE_FILE, 'r') as f: saved_state = json.load(f)
                             write_e3dc_config_value('wbmode', saved_state.get('orig_wbmode', 4))
@@ -520,7 +580,7 @@ def main():
                             si_power_check_counter += 1
                             if si_power_check_counter >= 3: # Stabil nach ca. 45s
                                 si_calibrated_power_kw = actual_wb_power_w / 1000.0
-                                print(f"[{now.strftime('%H:%M:%S')}] Superintelligence: Ladeleistung auf {si_calibrated_power_kw:.2f} kW kalibriert.")
+                                logger.info(f"Superintelligence: Ladeleistung auf {si_calibrated_power_kw:.2f} kW kalibriert.")
                                 with open(STATE_FILE, 'r+') as f:
                                     d = json.load(f)
                                     d['calibrated_power'] = si_calibrated_power_kw
@@ -539,8 +599,8 @@ def main():
 
                             if now < required_start_ts:
                                 pause_seconds = (required_start_ts - now).total_seconds()
-                                if pause_seconds > 120: # Nur bei >2min Pause
-                                    print(f"[{now.strftime('%H:%M:%S')}] Superintelligence: Ladeplan angepasst. Pausiere für {pause_seconds/60:.1f} Min.")
+                                if pause_seconds > 120: # Nur bei >2min Pause                                    
+                                    logger.info(f"Superintelligence: Ladeplan angepasst. Pausiere für {pause_seconds/60:.1f} Min.")
                                     si_pause_end_ts = time.time() + pause_seconds
                                     si_state = "PAUSING"
                                     
@@ -569,25 +629,25 @@ def main():
                     # Wir prüfen einfach: Ist es vor der Deadline?
                     if now.hour < MB_DEADLINE:
                         high_hours, pv_sum = get_forecast_data()
-                        if high_hours >= MB_MIN_HOURS and pv_sum >= MB_MIN_PV_PCT:
-                            print(f"[{now.strftime('%H:%M:%S')}] Morning-Boost geplant! (Prognose: {high_hours}h voll, {pv_sum:.1f}% PV)")
+                        if high_hours >= MB_MIN_HOURS and pv_sum >= MB_MIN_PV_PCT:                            
+                            logger.info(f"Morning-Boost geplant! (Prognose: {high_hours}h voll, {pv_sum:.1f}% PV)")
                             mb_state = "PLANNED"
                 
                 # 2. Start-Berechnung & Ausführung
                 if mb_state == "PLANNED":
                     # Priorität prüfen und ob gestartet werden kann
                     effective_prio = None
-                    if MB_PRIO == 'wallbox':
+                    if MB_PRIO == 'wallbox':                        
                         if wb_locked:
                             effective_prio = 'wallbox'
                         elif wp: # Fallback nur wenn WP existiert
-                            print(f"[{now.strftime('%H:%M:%S')}] Morning-Boost: Wallbox priorisiert, aber nicht verbunden. Wechsle zu Wärmepumpe.")
+                            logger.info("Morning-Boost: Wallbox priorisiert, aber nicht verbunden. Wechsle zu Wärmepumpe.")
                             effective_prio = 'heatpump'
                     elif MB_PRIO == 'wallbox_only':
                         if wb_locked:
                             effective_prio = 'wallbox'
                         else:
-                            print(f"[{now.strftime('%H:%M:%S')}] Morning-Boost (Nur Wallbox): Auto nicht verbunden. Warte...")
+                            logger.info("Morning-Boost (Nur Wallbox): Auto nicht verbunden. Warte...")
                     elif MB_PRIO == 'heatpump' and wp:
                         effective_prio = 'heatpump'
 
@@ -618,7 +678,7 @@ def main():
                         
                         # Starten?
                         if now >= start_ts:
-                            print(f"[{now.strftime('%H:%M:%S')}] Starte Morning-Boost ({effective_prio}). Ziel: {MB_TARGET_SOC}% SoC bis {MB_DEADLINE}:00.")
+                            logger.info(f"Starte Morning-Boost ({effective_prio}). Ziel: {MB_TARGET_SOC}% SoC bis {MB_DEADLINE}:00.")
                             
                             if effective_prio == 'wallbox':
                                 # Aktuelle Werte sichern
@@ -665,7 +725,7 @@ def main():
                     if now.hour >= MB_DEADLINE: stop_boost = True
                     
                     if stop_boost:
-                        print(f"[{now.strftime('%H:%M:%S')}] Morning-Boost beendet.")
+                        logger.info("Morning-Boost beendet.")
                         
                         # Wiederherstellen
                         if os.path.exists(STATE_FILE):
@@ -715,22 +775,40 @@ def main():
                             # Fall A: Wir sind bereits in der PV-Pause
                             if pv_pause_active:
                                 # Abbruchbedingung 1: Überschuss ist JETZT da -> Sofort Boost starten
-                                if grid <= GRID_START_LIMIT:
-                                    print(f"[{now.strftime('%H:%M:%S')}] PV-Pause beendet -> Überschuss da ({grid}W). Übergebe an Boost-Logik.")
+                                if grid <= GRID_START_LIMIT:                                    
+                                    logger.info(f"PV-Pause beendet -> Überschuss da ({grid}W). Übergebe an Boost-Logik.")
                                     pv_pause_active = False
                                     boost_active = False # Damit die PV-Boost Logik unten greift
                                 
                                 # Abbruchbedingung 2: SoC fällt zu tief (Sicherheitsnetz)
-                                elif soc < (PV_PAUSE_SOC - 5):
-                                    print(f"[{now.strftime('%H:%M:%S')}] PV-Pause abgebrochen (SoC {soc}% < {PV_PAUSE_SOC-5}%).")
-                                    if wp and wp.connect(): wp.write_hz_boost(0); wp.write_ww_boost(0); wp.close()
+                                elif soc < (PV_PAUSE_SOC - 5):                                    
+                                    logger.warning(f"PV-Pause abgebrochen (SoC {soc}% < {PV_PAUSE_SOC-5}%).")
+                                    if wp and wp.connect(): wp.write_hz_boost(0); wp.write_ww_boost(0, cfg.get('WWW', 45.0)); wp.close()
                                     pv_pause_active = False; boost_active = False; pv_pause_start_time = None
 
                                 # Abbruchbedingung 3: Timeout (Sonne kam nicht)
-                                elif pv_pause_start_time and (time.time() - pv_pause_start_time) > (PV_PAUSE_TIMEOUT_MINUTES * 60):
-                                    print(f"[{now.strftime('%H:%M:%S')}] PV-Pause abgebrochen (Timeout > {PV_PAUSE_TIMEOUT_MINUTES} Min).")
-                                    if wp and wp.connect(): wp.write_hz_boost(0); wp.write_ww_boost(0); wp.close()
+                                elif pv_pause_start_time and (time.time() - pv_pause_start_time) > (PV_PAUSE_TIMEOUT_MINUTES * 60):                                    
+                                    logger.warning(f"PV-Pause abgebrochen (Timeout > {PV_PAUSE_TIMEOUT_MINUTES} Min).")
+                                    if wp and wp.connect(): wp.write_hz_boost(0); wp.write_ww_boost(0, cfg.get('WWW', 45.0)); wp.close()
                                     pv_pause_active = False; boost_active = False; pv_pause_start_time = None
+                                
+                                # Abbruchbedingung 4: Prognose-Check (Ist der Grund für die Pause noch da?)
+                                elif forecast:
+                                    gmt = time.gmtime()
+                                    now_gmt = gmt.tm_hour + gmt.tm_min / 60.0
+                                    peak_still_valid = False
+                                    for entry in forecast:
+                                        h = entry['h']
+                                        if h < (now_gmt - 12): h += 24
+                                        # Prüfe ob Peak in den nächsten 1.5h (oder aktuell) liegt
+                                        if now_gmt < h <= (now_gmt + 1.5):
+                                            if entry['w'] >= PV_PAUSE_WATT:
+                                                peak_still_valid = True
+                                                break
+                                    if not peak_still_valid:
+                                        logger.info(f"PV-Pause beendet (Prognose-Grund entfallen).")
+                                        if wp and wp.connect(): wp.write_hz_boost(0); wp.write_ww_boost(0, cfg.get('WWW', 45.0)); wp.close()
+                                        pv_pause_active = False; boost_active = False; pv_pause_start_time = None
 
                             # Fall B: Wir prüfen, ob wir pausieren sollten (noch kein Boost aktiv)
                             elif not boost_active and soc >= PV_PAUSE_SOC:
@@ -750,10 +828,10 @@ def main():
                                                 break
                                 
                                 if peak_found:
-                                    print(f"[{now.strftime('%H:%M:%S')}] Starte PV-Pause (Prognose > {PV_PAUSE_WATT}W erwartet).")
+                                    logger.info(f"Starte PV-Pause (Prognose > {PV_PAUSE_WATT}W erwartet).")
                                     if wp and wp.connect():
                                         wp.write_hz_boost(1, 20.0) # Heizung unterdrücken
-                                        wp.write_ww_boost(0)
+                                        wp.write_ww_boost(0, cfg.get('WWW', 45.0))
                                         wp.close()
                                     pv_pause_active = True
                                     boost_active = True
@@ -767,7 +845,7 @@ def main():
                             # Sonderfall: Bei negativen Preisen immer "BOOST" erzwingen
                             if current_price <= 0:
                                 price_action = "BOOST"
-                                print(f"[{now.strftime('%H:%M:%S')}] Negativer Strompreis erkannt ({current_price} ct). Erzwinge Boost.")
+                                logger.info(f"Negativer Strompreis erkannt ({current_price} ct). Erzwinge Boost.")
                             else:
                                 # Aktuelle Zeit im Preis-Raster ermitteln
                                 if prices:
@@ -782,8 +860,8 @@ def main():
                                     # Aktion ermitteln (BOOST, PAUSE oder NONE)
                                     price_action = get_price_action(prices, price_start_hour, price_interval, PRICE_LIMIT, PRICE_MIN_DURATION, current_idx_float)
                                 elif (time.time() - last_price_warning_time) > 3600:
-                                    # Warnung nur 1x pro Stunde
-                                    print(f"[{now.strftime('%H:%M:%S')}] WARNUNG: Preis-Boost aktiv, aber keine Preisdaten (prices=[]) empfangen.")
+                                    # Warnung nur 1x pro Stunde                                    
+                                    logger.warning("Preis-Boost aktiv, aber keine Preisdaten (prices=[]) empfangen.")
                                     last_price_warning_time = time.time()
 
                             # Constraints prüfen (WQ, Tageslimit, 18h Sperre, Hard-Limit)
@@ -792,7 +870,7 @@ def main():
 
                             if wq_aus < WQ_MIN_TEMP:
                                 if price_boost_active or pre_pause_active:
-                                    print(f"[{now.strftime('%H:%M:%S')}] NOT-AUS: WQ Aus zu kalt ({wq_aus}°C).")
+                                    logger.warning(f"NOT-AUS: WQ Aus zu kalt ({wq_aus}°C).")
                                 price_action = "NONE"
                             elif daily_boost_counter >= PRICE_MAX_DAILY and price_action == "BOOST" and not is_hard_boost:
                                 price_action = "NONE"
@@ -803,10 +881,10 @@ def main():
                         # --- AUSFÜHRUNG PREIS LOGIK ---
                         if price_action == "PAUSE":
                             if not pre_pause_active:
-                                print(f"[{now.strftime('%H:%M:%S')}] Start Preis-Pause (Erholung vor Boost). WQ: {wq_aus}°C")
+                                logger.info(f"Start Preis-Pause (Erholung vor Boost). WQ: {wq_aus}°C")
                                 if wp and wp.connect():
                                     wp.write_hz_boost(1, 20.0) # Heizung auf 20°C zwingen (Pause)
-                                    wp.write_ww_boost(0)       # WW Normal
+                                    wp.write_ww_boost(0, cfg.get('WWW', 45.0))       # WW Normal
                                     wp.close()
                                 pre_pause_active = True
                                 price_boost_active = False
@@ -814,7 +892,7 @@ def main():
                                 
                         elif price_action == "BOOST":
                             if not price_boost_active:
-                                print(f"[{now.strftime('%H:%M:%S')}] Start Preis-Boost (Preis: {current_price} ct). WQ: {wq_aus}°C")
+                                logger.info(f"Start Preis-Boost (Preis: {current_price} ct). WQ: {wq_aus}°C")
                                 if wp and wp.connect():
                                     if at > AT_LIMIT:
                                         # Sommer-Settings
@@ -833,10 +911,10 @@ def main():
                             
                         elif (price_boost_active or pre_pause_active) and price_action == "NONE":
                             # Ende von Preis-Aktionen (oder Feature deaktiviert)
-                            print(f"[{now.strftime('%H:%M:%S')}] Ende Preis-Steuerung.")
+                            logger.info("Ende Preis-Steuerung.")
                             if wp and wp.connect():
                                 wp.write_hz_boost(0)
-                                wp.write_ww_boost(0)
+                                wp.write_ww_boost(0, cfg.get('WWW', 45.0))
                                 wp.close()
                             price_boost_active = False
                             pre_pause_active = False
@@ -846,7 +924,7 @@ def main():
                         if not boost_active and mb_state != "RUNNING" and si_state != "RUNNING" and si_state != "PAUSING":
                             # EINSCHALTEN: Genug Überschuss und Batterie voll genug
                             if grid <= GRID_START_LIMIT and soc >= MIN_SOC and wp:
-                                    print(f"[{now.strftime('%H:%M:%S')}] Start Boost (Grid: {grid}W, SoC: {soc}%)")
+                                    logger.info(f"Start PV-Boost (Grid: {grid}W, SoC: {soc}%)")
                                     if wp.connect():
                                         if at > AT_LIMIT:
                                             wp.write_ww_boost(1, cfg.get('WWS', 50.0))
@@ -860,34 +938,37 @@ def main():
 
                         # LAUFENDE ÜBERWACHUNG (Wenn Boost aktiv ist)
                         if boost_active:
-                            # Wenn PV-Boost aktiv (kein Preis-Boost), Timestamp aktualisieren
-                            if not price_boost_active:
+                            # Identifiziere reinen PV-Boost
+                            is_standard_pv_boost = (not price_boost_active) and (not pre_pause_active) and (not pv_pause_active)
+                            
+                            if is_standard_pv_boost:
+                                # Timestamp für 18h-Sperre aktualisieren
                                 last_pv_boost_time = time.time()
 
-                            # SYNC-CHECK: Prüfen ob Werte mit Config übereinstimmen
-                            # (Wichtig nach Neustart oder Config-Änderung)
-                            target_ww = cfg.get('WWS', 50.0) if at > AT_LIMIT else cfg.get('WWW', 48.0)
-                            current_ww = wp_status.get('WW_Setpoint', 0)
-                            
-                            sync_needed = abs(current_ww - target_ww) > 0.5
+                                # SYNC-CHECK: Prüfen ob Werte mit Config übereinstimmen
+                                # (Wichtig nach Neustart oder Config-Änderung)
+                                target_ww = cfg.get('WWS', 50.0) if at > AT_LIMIT else cfg.get('WWW', 48.0)
+                                current_ww = wp_status.get('WW_Setpoint', 0)
+                                
+                                sync_needed = abs(current_ww - target_ww) > 0.5
 
-                            # Im Winter auch Heizung prüfen
-                            if at <= AT_LIMIT:
-                                target_hz = cfg.get('HZ', 50.0)
-                                current_hz = wp_status.get('HZ_Setpoint', 0)
-                                if abs(current_hz - target_hz) > 0.5:
-                                    sync_needed = True
-                            
-                            if sync_needed:
-                                print(f"[{now.strftime('%H:%M:%S')}] Korrigiere Boost-Werte (Sync Check)")
-                                if wp.connect():
-                                    if at > AT_LIMIT:
-                                        wp.write_ww_boost(1, cfg.get('WWS', 50.0))
-                                        wp.write_hz_boost(0)
-                                    else:
-                                        wp.write_ww_boost(1, cfg.get('WWW', 48.0))
-                                        wp.write_hz_boost(1, cfg.get('HZ', 50.0))
-                                    wp.close()
+                                # Im Winter auch Heizung prüfen
+                                if at <= AT_LIMIT:
+                                    target_hz = cfg.get('HZ', 50.0)
+                                    current_hz = wp_status.get('HZ_Setpoint', 0)
+                                    if abs(current_hz - target_hz) > 0.5:
+                                        sync_needed = True
+                                
+                                if sync_needed:
+                                    logger.info("Korrigiere Boost-Werte (Sync Check)")
+                                    if wp.connect():
+                                        if at > AT_LIMIT:
+                                            wp.write_ww_boost(1, cfg.get('WWS', 50.0))
+                                            wp.write_hz_boost(0)
+                                        else:
+                                            wp.write_ww_boost(1, cfg.get('WWW', 48.0))
+                                            wp.write_hz_boost(1, cfg.get('HZ', 50.0))
+                                        wp.close()
 
                             # AUSSCHALTEN PRÜFEN (Nur bei reinem PV-Boost relevant)
                             # Preis-Boost, Pausen etc. dürfen Netzbezug haben.
@@ -895,13 +976,13 @@ def main():
                             if is_deficit and not price_boost_active and not pre_pause_active and not pv_pause_active:
                                 # Wenn wir gerade erst ins Defizit rutschen -> Timer starten
                                 if deficit_start_time is None:
-                                    deficit_start_time = now
-                                    print(f"[{now.strftime('%H:%M:%S')}] Defizit erkannt (Grid: {grid}W, Bat: {bat}W). Timer gestartet.")
+                                    deficit_start_time = now                                    
+                                    logger.info(f"Defizit erkannt (Grid: {grid}W, Bat: {bat}W). Timer gestartet.")
                                 
                                 # Wenn Timer läuft -> Prüfen ob Zeit abgelaufen
-                                elif (now - deficit_start_time).total_seconds() > (STOP_DELAY_MINUTES * 60):
-                                    if wp and wp.connect():
-                                        print(f"[{now.strftime('%H:%M:%S')}] Stop Boost ({STOP_DELAY_MINUTES} min Defizit)")
+                                elif (now - deficit_start_time).total_seconds() > (STOP_DELAY_MINUTES * 60):                                    
+                                    logger.info(f"Stop PV-Boost nach {STOP_DELAY_MINUTES} min Defizit.")
+                                    if wp and wp.connect():                                        
                                         wp.write_ww_boost(0, 45.0) # Reset auf Standard
                                         wp.write_hz_boost(0)
                                         wp.close()
@@ -910,11 +991,11 @@ def main():
                             else:
                                 # Kein Defizit (wir speisen ein oder laden Batterie) -> Timer reset
                                 if deficit_start_time is not None:
-                                    print(f"[{now.strftime('%H:%M:%S')}] Defizit beendet (Sonne ist zurück). Timer reset.")
+                                    logger.info("Defizit beendet (Sonne ist zurück). Timer reset.")
                                 deficit_start_time = None
 
                 except Exception as req_err:
-                    print(f"Fehler bei E3DC Abfrage: {req_err}")
+                    logger.error(f"Fehler bei E3DC Abfrage: {req_err}")
 
             # 3. Daten schreiben (Ramdisk & History)
             json_export = {
@@ -942,6 +1023,9 @@ def main():
                 json.dump(json_export, f)
             try:
                 os.chmod(tmp_file, 0o664)
+                # Owner/Group erben (für Permission-Check Konsistenz)
+                st = os.stat(os.path.dirname(RAMDISK_FILE))
+                os.chown(tmp_file, st.st_uid, st.st_gid)
             except: pass
             os.replace(tmp_file, RAMDISK_FILE)
 
@@ -965,7 +1049,7 @@ def main():
                 last_day = now.day
 
         except Exception as e:
-            print(f"Fehler im Loop: {e}")
+            logger.critical(f"Kritischer Fehler im Haupt-Loop: {e}", exc_info=True)
             error_json = {"success": False, "error": str(e), "ts": now.isoformat()}
             with open(RAMDISK_FILE, 'w') as f:
                 json.dump(error_json, f)

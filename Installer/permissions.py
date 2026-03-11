@@ -184,7 +184,8 @@ def check_webportal_permissions():
         subfolders = [
             (f"{wp_path}/tmp", "777"),
             (f"{wp_path}/ramdisk", "2775"),
-            (f"{wp_path}/tmp/history_backups", "775")
+            (f"{wp_path}/tmp/history_backups", "775"),
+            (f"{wp_path}/logs", "775")
         ]
         for folder_path, expected_mode in subfolders:
             if not os.path.exists(folder_path):
@@ -280,6 +281,7 @@ FILE_DEFINITIONS = [
     {"path": f"{INSTALLER_DIR}/luxtronik/get_luxtronik.py", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": f"{INSTALLER_DIR}/luxtronik/set_manual_boost.py", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": "/var/www/html/ramdisk/luxtronik.json", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
+    {"path": "/var/www/html/logs/energy_manager.log", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
 ]
 
 

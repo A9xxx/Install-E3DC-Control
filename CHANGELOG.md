@@ -2,6 +2,23 @@
 
 # Changelog
 
+## [3.2.3] - 2026-03-11 - Energy Manager Hardening
+
+### ⚙️ System & Stabilität (Energy Manager)
+*   **Reboot-Sicherheit:** Der Dienst kann seinen Zustand (z.B. "PV-Pause") nach einem Neustart oder Absturz wiederherstellen und bleibt nicht mehr in einem undefinierten Zustand hängen.
+*   **Intelligente Pausen-Steuerung:** Die "PV-Pause" wird nun automatisch beendet, wenn der Grund dafür (hohe PV-Prognose) nicht mehr gegeben ist (z.B. bei Wetteränderung).
+*   **Bugfix (Sync-Check):** Ein Fehler wurde behoben, durch den eine aktive Pause fälschlicherweise als "falscher" Zustand erkannt und durch einen Boost überschrieben wurde.
+*   **Bugfix (API-Call):** Ein Absturz wurde behoben, der durch einen fehlenden Temperatur-Parameter beim Deaktivieren des Warmwasser-Boosts verursacht wurde.
+
+### 🪵 Logging & Diagnose
+*   **Log-Datei-Verwaltung:** Die Berechtigungen der `energy_manager.log` werden nun korrekt gesetzt, um Fehler bei der Rechteprüfung zu vermeiden.
+*   **Transparenz:** Das neue Logging-System hat maßgeblich zur schnellen Identifizierung und Behebung der oben genannten Fehler beigetragen.
+
+### 💡 Sonstiges
+*   **Fix-Tarif-Anzeige:** Bei festen Stromtarifen (ohne Preisdynamik) werden die Preiskachel im Dashboard und die Preis-Kurven in den Diagrammen nun automatisch ausgeblendet.
+
+---
+
 ## [3.2.2] - 2026-03-10 - Smart Charging & Stability
 
 ### 🔌 Intelligentes Lademanagement

@@ -2,6 +2,19 @@
 
 # Changelog
 
+## [3.2.4] - 2026-03-11 - Auto-Update & Release Workflow
+
+### 🚀 System & Updates
+*   **Automatisches Update:** Neue, optional aktivierbare Funktion, die das System täglich zu einer festgelegten Zeit auf die neueste Version aktualisiert.
+*   **Update-Richtlinie (`UPDATE_POLICY.json`):** Jedes Release kann nun eine Richtlinie mitliefern, die dem Updater mitteilt, welche Aktionen (Dienste neustarten, Pakete installieren, Rechte prüfen) nach der Installation ausgeführt werden müssen.
+
+### ⚙️ System & Stabilität
+*   **Energy Manager:** Ein Fehler wurde behoben, bei dem kurzzeitige Datenlücken (SoC=0) fälschlicherweise zum Abbruch der PV-Pause führten. Das System ignoriert nun unrealistische Null-Werte.
+
+---
+
+# Changelog
+
 ## [3.2.3] - 2026-03-11 - Energy Manager Hardening
 
 ### ⚙️ System & Stabilität (Energy Manager)

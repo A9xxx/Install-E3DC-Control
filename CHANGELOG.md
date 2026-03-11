@@ -1,5 +1,19 @@
 # Changelog
 
+## [3.2.6] - 2026-03-11 - Auto-Update Fixes & Smart Charging UI
+
+### 🚀 Auto-Update & Installer
+*   **Web-Portal Update:** Das automatische Update aktualisiert nun auch zuverlässig die Web-Oberfläche und Diagramm-Skripte (extrahiert `E3DC-Control.zip`).
+*   **Prozess-Steuerung:** Korrektur des Update-Aufrufs im Energy Manager (Nutzung von `sudo` und `--unattended`).
+*   **Logging:** Update-Prüfungen und Ergebnisse werden nun für bessere Transparenz im `energy_manager.log` protokolliert.
+
+### 🖥️ Web-Interface
+*   **Smart Charging UI:**
+    *   Dynamisches "Zauberstab"-Icon im Header für reines Lademanagement (ohne WP).
+    *   Der Config-Editor blendet Wärmepumpen-Parameter aus, wenn Luxtronik deaktiviert ist, und benennt die Gruppe passend um.
+
+---
+
 # Changelog
 
 ## [3.2.5] - 2026-03-11 - Config Centralization & Logic Fixes

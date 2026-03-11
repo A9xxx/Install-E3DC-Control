@@ -179,6 +179,7 @@ def verify_config_file_access(install_user):
 
 def check_for_updates():
     """Prüft auf verfügbare Updates und fragt nur bei Verfügbarkeit nach."""
+    logger = logging.getLogger("install")
     try:
         import inspect
         from Installer.self_update import check_and_update
@@ -186,6 +187,7 @@ def check_for_updates():
         params = signature.parameters
 
         print("\n→ Prüfe auf Updates...")
+        logger.info("Starte Update-Prüfung (Self-Update)...")
         
         # Sicherstellen, dass wir nur Parameter übergeben, die die Funktion auch kennt
         check_kwargs = {}
@@ -207,12 +209,14 @@ def check_for_updates():
         
         if not update_available:
             print("✓ Du bist auf dem neuesten Stand.\n")
+            logger.info("Kein Update verfügbar (System ist aktuell).")
             return
 
         # NEU: Unattended Mode installiert Updates automatisch
         if UNATTENDED_MODE:
             install_choice = "j"
             print("Automatischer Modus: Update wird installiert.")
+            logger.info("Update gefunden. Starte automatische Installation (Unattended).")
         else:
             install_choice = input("✓ Update verfügbar. Jetzt installieren? (j/n): ").strip().lower()
             
@@ -281,6 +285,7 @@ def main():
     parser = argparse.ArgumentParser(description="E3DC-Control Installer")
     parser.add_argument("--unattended", action="store_true", help="Ohne Benutzereingaben ausführen (für PHP/Cron)")
     parser.add_argument("--update-e3dc", action="store_true", help="E3DC-Control aktualisieren (headless)")
+    parser.add_argument("--install-all", action="store_true", help="Vollständige Installation durchführen (headless)")
     args = parser.parse_args()
     UNATTENDED_MODE = args.unattended
 
@@ -310,6 +315,14 @@ def main():
             sys.stdout.flush()
             from Installer.update import update_e3dc
             update_e3dc(headless=True)
+            sys.exit(0)
+
+        # Direktes Install-All wenn angefordert (Zero-Touch)
+        if args.install_all:
+            print("→ Starte vollautomatische Installation (Zero-Touch)...")
+            UNATTENDED_MODE = True
+            from Installer.install_all import install_all_main
+            install_all_main(headless=True)
             sys.exit(0)
 
         check_for_updates()

@@ -31,6 +31,17 @@ USER_AGENT = "E3DC-Control-Installer/1.0"
 update_logger = get_or_create_logger("self_update")
 
 
+def log_to_energy_manager(msg):
+    """Schreibt eine Nachricht in das Energy-Manager Log."""
+    try:
+        log_file = "/var/www/html/logs/energy_manager.log"
+        if os.path.exists(log_file):
+            timestamp = time.strftime('%d.%m %H:%M:%S')
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(f"{timestamp} - {msg}\n")
+    except Exception:
+        pass
+
 def get_installed_version():
     """
     Holt die aktuelle Version des Installers.
@@ -332,6 +343,23 @@ def extract_release(zip_path, new_version):
             # Migration der Luxtronik-Konfiguration nach dem Kopieren der neuen Dateien
             _run_migration_luxtronik_config(INSTALLER_DIR)
 
+            # NEU: Webportal & Diagramm-Skripte aus E3DC-Control.zip entpacken
+            # Dies ist der entscheidende Schritt, um das Dashboard zu aktualisieren!
+            print("→ Aktualisiere Webportal und Skripte (aus ZIP)…")
+            try:
+                # Import lokal, um Zirkelbezüge zu vermeiden
+                from .diagrammphp import DiagramInstaller
+                diag_installer = DiagramInstaller()
+                if diag_installer.extract_and_install_from_zip():
+                    print("✓ Webportal-Dateien erfolgreich aktualisiert.")
+                    update_logger.info("Webportal und Skripte via DiagramInstaller aktualisiert.")
+                else:
+                    print("⚠ Fehler beim Entpacken der Webportal-Dateien.")
+                    update_logger.warning("Webportal-Update (ZIP-Extraktion) fehlgeschlagen.")
+            except Exception as e:
+                print(f"⚠ Fehler beim Webportal-Update: {e}")
+                update_logger.error(f"Ausnahme beim Webportal-Update: {e}", e)
+
             # 1. Pakete nachinstallieren (falls angefordert)
             if apt_packages:
                 print(f"→ Installiere System-Pakete: {', '.join(apt_packages)}")
@@ -365,6 +393,7 @@ def extract_release(zip_path, new_version):
 
             print("✓ Update erfolgreich installiert")
             update_logger.info("Dateien erfolgreich aktualisiert.")
+            log_to_energy_manager(f"Update auf Version {new_version} erfolgreich.")
 
             # Wiederherstellen der Konfiguration
             if config_to_preserve:
@@ -469,7 +498,8 @@ def check_and_update(silent=False, check_only=False):
     if not silent:
         print("\n=== Installer-Update Prüfung ===\n")
         print(f"Installierte Version: {installed_version}")
-        update_logger.info(f"Prüfe auf Updates. Installiert: {installed_version}")
+    
+    update_logger.info(f"Prüfe auf Updates. Installiert: {installed_version}")
     
     # Hole neueste Release-Infos
     release_info = get_latest_release_info()
@@ -488,6 +518,8 @@ def check_and_update(silent=False, check_only=False):
         if not silent:
             print("\n✓ Installer ist aktuell.\n")
             update_logger.info("Installer ist aktuell.")
+        elif silent:
+            log_to_energy_manager("System ist aktuell.")
             
             if latest_version == installed_version:
                 if input("Möchtest du das Update trotzdem erzwingen (Re-Install)? (j/n): ").strip().lower() != 'j':

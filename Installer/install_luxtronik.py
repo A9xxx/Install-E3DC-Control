@@ -4,8 +4,9 @@ import shutil
 import subprocess
 
 from .core import register_command
-from .utils import run_command, pip_install
+from .utils import run_command, pip_install, replace_in_file
 from .installer_config import get_install_path, get_install_user, get_user_ids, get_www_data_gid, load_config
+from .logging_manager import get_or_create_logger, log_task_completed, log_error
 
 INSTALL_PATH = get_install_path()
 LUX_SCRIPT_NAME = "energy_manager.py"
@@ -13,6 +14,8 @@ LUX_CONFIG_NAME = "config.lux.json"
 SERVICE_NAME = "energy_manager"
 # Wir nutzen direkt das Verzeichnis im Installer (kein Kopieren mehr)
 LUX_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "luxtronik")
+
+luxtronik_logger = get_or_create_logger("luxtronik")
 
 def install_dependencies():
     """Installiert Python-Abhängigkeiten für Luxtronik."""
@@ -51,13 +54,38 @@ def setup_script():
         print(f"✗ Fehler beim Setzen der Berechtigungen: {e}")
         return False
 
-def configure_luxtronik_obsolete():
-    """Informiert den User, dass die Konfiguration umgezogen ist."""
-    print("\n" + "="*50)
-    print("  HINWEIS: Die Konfiguration für den Luxtronik Energy Manager")
-    print("  erfolgt nun zentral im Web-Interface unter 'Config Editor'.")
-    print("  Dieses Menü dient nur noch der Installation des Dienstes.")
-    print("="*50 + "\n")
+def configure_luxtronik():
+    """Informiert über zentrale Konfiguration und setzt Basis-Werte in e3dc.config.txt."""
+    print("\n=== Luxtronik Manager Konfiguration ===\n")
+    
+    print("HINWEIS: Die Konfiguration erfolgt nun zentral im Web-Interface")
+    print("unter 'Config Editor' (Gruppe: Luxtronik Energy Manager).")
+    print("Dieses Setup richtet den notwendigen Hintergrunddienst ein.\n")
+
+    # Basis-Konfiguration setzen
+    try:
+        config_file = os.path.join(get_install_path(), "e3dc.config.txt")
+        if os.path.exists(config_file):
+            print("→ Passe e3dc.config.txt an (Luxtronik aktivieren)...")
+            
+            # 1. Luxtronik-Modul aktivieren
+            replace_in_file(config_file, "luxtronik", "luxtronik = 1")
+            
+            # 2. Automatik-Modus aktivieren
+            replace_in_file(config_file, "auto_mode", "auto_mode = 1")
+            
+            print("✓ 'luxtronik = 1' gesetzt (WP-Steuerung aktiv).")
+            print("✓ 'auto_mode = 1' gesetzt (Energy Manager aktiv).")
+            
+            # Rechte sicherstellen
+            uid, _ = get_user_ids()
+            gid = get_www_data_gid()
+            os.chown(config_file, uid, gid)
+            os.chmod(config_file, 0o664)
+    except Exception as e:
+        print(f"⚠ Fehler beim Anpassen der Konfiguration: {e}")
+        log_error("luxtronik", f"Fehler bei Config-Anpassung: {e}")
+
     input("Drücke Enter um fortzufahren...")
 
 def cleanup_old_service():
@@ -127,8 +155,9 @@ def install_luxtronik_menu():
 
     if install_dependencies():
         setup_script()
-        configure_luxtronik_obsolete()
+        configure_luxtronik()
         cleanup_old_service()
         setup_service()
+        log_task_completed("Luxtronik Manager Installation")
 
 register_command("101", "Luxtronik Manager installieren/konfigurieren", install_luxtronik_menu, category="Erweiterungen", sort_order=145)

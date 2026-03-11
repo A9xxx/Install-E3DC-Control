@@ -4,7 +4,7 @@ import shutil
 import subprocess
 
 from .core import register_command
-from .utils import run_command, pip_install
+from .utils import run_command, pip_install, replace_in_file
 from .installer_config import get_install_path, get_install_user, get_user_ids, get_www_data_gid, load_config
 from .logging_manager import get_or_create_logger, log_task_completed, log_error
 
@@ -12,7 +12,6 @@ from .logging_manager import get_or_create_logger, log_task_completed, log_error
 # It's inside the Installer package structure
 LADEMANAGEMENT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "luxtronik")
 SCRIPT_NAME = "energy_manager.py"
-CONFIG_NAME = "config.lux.json" # We reuse the same config file for simplicity
 SERVICE_NAME = "energy_manager" # We reuse the same service
 
 lademanagement_logger = get_or_create_logger("lademanagement")
@@ -52,80 +51,38 @@ def setup_script_permissions():
         return False
 
 def configure_lademanagement():
-    """Erstellt oder bearbeitet die config.lux.json für reines Lademanagement."""
+    """Informiert über zentrale Konfiguration und setzt Basis-Werte in e3dc.config.txt."""
     print("\n=== Intelligentes Lademanagement Konfiguration ===\n")
     
-    config_path = os.path.join(LADEMANAGEMENT_DIR, CONFIG_NAME)
-    current_conf = {}
-    
-    if os.path.exists(config_path):
-        try:
-            with open(config_path, 'r') as f:
-                current_conf = json.load(f)
-        except: pass
+    print("HINWEIS: Die Konfiguration erfolgt nun zentral im Web-Interface")
+    print("unter 'Config Editor' (Gruppe: Luxtronik Energy Manager).")
+    print("Dieses Setup richtet den notwendigen Hintergrunddienst ein.\n")
 
-    # SAFETY CHECK: Warnung, falls Luxtronik bereits aktiv ist
-    if current_conf.get("luxtronik") == 1:
-        print("\n⚠️  ACHTUNG: Es wurde eine aktive Luxtronik-Konfiguration gefunden!")
-        print("   Dieser Assistent aktiviert den 'Nur-Lade-Modus' und DEAKTIVIERT die Wärmepumpe.")
-        print("   (Um beides zu nutzen: Installiere den Luxtronik-Manager und aktiviere")
-        print("    das Lademanagement anschließend im Web-Interface.)\n")
-        
-        if input("   Trotzdem fortfahren und WP deaktivieren? (j/n) [n]: ").strip().lower() != 'j':
-            print("Abbruch.")
-            return False
-
-    def ask(key, text, default, type_func=str):
-        val = input(f"{text} [{current_conf.get(key, default)}]: ").strip()
-        raw_val = val if val else current_conf.get(key, default)
-        try:
-            return type_func(raw_val)
-        except (ValueError, TypeError):
-            return default
-
-    new_conf = current_conf.copy()
-    
-    # Deactivate Luxtronik module explicitly
-    new_conf["luxtronik"] = 0
-    new_conf["auto_mode"] = 1 # Automatik-Regelung muss an sein
-    
-    print("Die Luxtronik-Integration wird deaktiviert, um nur das Lademanagement zu nutzen.")
-    print("Die Automatik-Regelung wird aktiviert.\n")
-
-    # Morning Boost
-    new_conf['morning_boost_enable'] = ask("morning_boost_enable", "Intelligente Speicher-Entladung (Morgen) aktivieren? (1=Ja, 0=Nein)", 1, int)
-    if new_conf['morning_boost_enable'] == 1:
-        print("\n--- Konfiguration: Intelligente Speicher-Entladung ---")
-        # Priority: only wallbox options are relevant
-        mb_prio = ask("morning_boost_prio", "Priorität (wallbox, wallbox_only)", "wallbox_only")
-        if mb_prio not in ["wallbox", "wallbox_only"]:
-            mb_prio = "wallbox_only"
-        new_conf['morning_boost_prio'] = mb_prio
-        new_conf['morning_boost_wb_power'] = ask("morning_boost_wb_power", "Annahme Ladeleistung der Wallbox (kW)", 7.0, float)
-        new_conf['morning_boost_deadline'] = ask("morning_boost_deadline", "Ziel-Zeit (Stunde, z.B. 8 für 08:00)", 8, int)
-        new_conf['morning_boost_target_soc'] = ask("morning_boost_target_soc", "Ziel-SoC nach Entladung (%)", 20, int)
-        new_conf['morning_boost_min_hours'] = ask("morning_boost_min_hours", "Bedingung: Mind. Stunden mit 99% SoC Prognose", 3, int)
-        new_conf['morning_boost_min_pv_pct'] = ask("morning_boost_min_pv_pct", "Bedingung: Mind. PV-Ertrag in diesen Stunden (%)", 50.0, float)
-
-    # Superintelligence
-    new_conf['super_intelligence_enable'] = ask("super_intelligence_enable", "\nSuperintelligenz (Experimentell) aktivieren? (1=Ja, 0=Nein)", 0, int)
-    if new_conf['super_intelligence_enable'] == 1:
-        print("\n--- Konfiguration: Superintelligenz ---")
-        new_conf['super_intelligence_deadline'] = ask("super_intelligence_deadline", "Ziel-Zeit (Stunde, z.B. 8 für 08:00)", 8, int)
-        print("Info: Entlädt auf den 'Manuell Boost Min-SoC' (siehe Luxtronik-Einstellungen).")
-
-    # Speichern
+    # Basis-Konfiguration setzen
     try:
-        with open(config_path, 'w') as f:
-            json.dump(new_conf, f, indent=4)
-        
-        uid, _ = get_user_ids()
-        gid = get_www_data_gid()
-        os.chown(config_path, uid, gid)
-        os.chmod(config_path, 0o664)
-        print(f"\n✓ Konfiguration gespeichert: {config_path}")
+        config_file = os.path.join(get_install_path(), "e3dc.config.txt")
+        if os.path.exists(config_file):
+            print("→ Passe e3dc.config.txt an (Nur-Lade-Modus)...")
+            
+            # 1. Luxtronik-Modul deaktivieren (wir wollen nur Lademanagement)
+            replace_in_file(config_file, "luxtronik", "luxtronik = 0")
+            
+            # 2. Automatik-Modus aktivieren (damit der Energy Manager läuft)
+            replace_in_file(config_file, "auto_mode", "auto_mode = 1")
+            
+            print("✓ 'luxtronik = 0' gesetzt (keine WP-Steuerung).")
+            print("✓ 'auto_mode = 1' gesetzt (Energy Manager aktiv).")
+            
+            # Rechte sicherstellen
+            uid, _ = get_user_ids()
+            gid = get_www_data_gid()
+            os.chown(config_file, uid, gid)
+            os.chmod(config_file, 0o664)
     except Exception as e:
-        print(f"✗ Fehler beim Speichern: {e}")
+        print(f"⚠ Fehler beim Anpassen der Konfiguration: {e}")
+        log_error("lademanagement", f"Fehler bei Config-Anpassung: {e}")
+
+    input("\nDrücke Enter um fortzufahren...")
     return True
 
 def setup_lademanagement_service():

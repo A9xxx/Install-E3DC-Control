@@ -450,9 +450,10 @@ class DiagramInstaller:
                 "path": "/etc/sudoers.d/010_e3dc_web_update",
                 "lines": [
                     f"www-data ALL=(root) NOPASSWD: /usr/bin/python3 {installer_script} --update-e3dc",
-                    f"www-data ALL=(root) NOPASSWD: /usr/bin/python3 {os.path.join(INSTALL_DIR, 'Installer', 'self_update.py')} *"
+                    f"www-data ALL=(root) NOPASSWD: /usr/bin/python3 {os.path.join(INSTALL_DIR, 'Installer', 'self_update.py')} *",
+                    f"{self.install_user} ALL=(root) NOPASSWD: /usr/bin/python3 {os.path.join(INSTALL_DIR, 'Installer', 'self_update.py')} *"
                 ],
-                "desc": "Installer Self-Update"
+                "desc": "Installer Self-Update & Auto-Update"
             }
         ]
         

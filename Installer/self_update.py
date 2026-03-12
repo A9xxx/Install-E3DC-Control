@@ -467,8 +467,14 @@ def extract_release(zip_path, new_version, silent=False):
             # Setze Besitzrechte für den Installationsordner
             try:
                 install_user = get_install_user()
-                subprocess.run(["chown", "-R", f"{install_user}:{install_user}", INSTALLER_DIR], check=True)
-                print(f"✓ Rechte für {INSTALLER_DIR} auf {install_user}:{install_user} gesetzt")
+                subprocess.run(["chown", "-R", f"{install_user}:www-data", INSTALLER_DIR], check=True)
+                print(f"✓ Rechte für {INSTALLER_DIR} auf {install_user}:www-data gesetzt")
+                
+                # Sicherstellen, dass Verzeichnisse betretbar sind (775) und Dateien (664)
+                # Dies entspricht dem Standard für Web-zugängliche Ordner (pi:www-data)
+                subprocess.run(["find", INSTALLER_DIR, "-type", "d", "-exec", "chmod", "775", "{}", "+"], check=False)
+                subprocess.run(["find", INSTALLER_DIR, "-type", "f", "-exec", "chmod", "664", "{}", "+"], check=False)
+                subprocess.run(["chmod", "+x", os.path.join(INSTALLER_DIR, "self_update.py")], check=False)
             except Exception as e:
                 print(f"⚠ Konnte Rechte nicht setzen: {e}")
             # Entferne alte Sicherung

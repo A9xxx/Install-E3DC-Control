@@ -18,7 +18,6 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = "/var/www/html/logs"
 
 # Bestehende Pfade
-CONFIG_PATH = os.path.join(script_dir, "config.lux.json")
 E3DC_CONFIG_PATH = "/home/pi/E3DC-Control/e3dc.config.txt"
 AWATTAR_DEBUG_PATH = "/home/pi/E3DC-Control/awattardebug.txt"
 RAMDISK_FILE = "/var/www/html/ramdisk/luxtronik.json"
@@ -333,6 +332,10 @@ def main():
     try: os.chmod(RAMDISK_FILE, 0o664)
     except: pass
 
+    # Config Cache Init
+    config_cache = {}
+    config_mtime = 0
+
     if AUTO_MODE == 0: logger.info("Automatik-Regelung ist DEAKTIVIERT (Nur Monitoring).")
     elif not wp: logger.info("Nur Lademanagement-Regeln sind aktiv.")
     else: logger.info(f"Start bei > {abs(GRID_START_LIMIT)}W Einspeisung.")
@@ -340,8 +343,18 @@ def main():
     while True:
         now = datetime.now()
         
-        # 1. Konfiguration EINMALIG laden für diesen Zyklus (Caching)
-        current_config = load_e3dc_config_dict()
+        # 1. Konfiguration nur bei Dateiänderung neu laden (Smart Caching)
+        try:
+            if os.path.exists(E3DC_CONFIG_PATH):
+                current_mtime = os.path.getmtime(E3DC_CONFIG_PATH)
+                if current_mtime != config_mtime:
+                    config_cache = load_e3dc_config_dict()
+                    config_mtime = current_mtime
+                    logger.info("Konfiguration aktualisiert (Dateiänderung erkannt).")
+        except Exception as e:
+            logger.error(f"Fehler beim Konfigurations-Check: {e}")
+        
+        current_config = config_cache
         
         # Dynamisches Nachladen wichtiger Parameter
         AUTO_UPDATE_ENABLE = int(get_cfg_value(current_config, 'auto_update_enable', 0))
@@ -366,15 +379,29 @@ def main():
                     logger.info(f"Starte tägliche Update-Prüfung ({update_hour:02d}:{update_minute:02d} Uhr)...")
                     # Pfad zum Install-Verzeichnis (z.B. /home/pi/Install)
                     install_root = os.path.abspath(os.path.join(script_dir, "../../"))
+                    self_update_script = os.path.join(install_root, "Installer", "self_update.py")
                     
-                    if os.path.exists(install_root):
+                    if os.path.exists(self_update_script):
                         try:
-                            # Wir rufen check_and_update direkt auf, um Probleme im installer_main.py zu umgehen.
-                            # Wir setzen PYTHONPATH, damit Importe funktionieren.
-                            cmd = f"cd {install_root} && sudo PYTHONPATH={install_root} python3 -c \"from Installer.self_update import check_and_update; check_and_update(silent=True)\""
+                            # Vereinfachter und robusterer Aufruf.
+                            # Erfordert eine sudoers-Regel für den ausführenden Benutzer.
+                            log_file = os.path.join(LOG_DIR, "auto_self_update.log")
+                            cmd = f"sudo /usr/bin/python3 {self_update_script} --silent"
+                            
+                            # Log-Datei vorbereiten
+                            with open(log_file, "w") as f:
+                                f.write(f"=== Starting Auto-Update at {datetime.now()} ===\n")
+                                f.write(f"Command: {cmd}\n---\n")
+                            os.chmod(log_file, 0o664)
+
                             logger.info(f"Führe Update-Kommando aus: {cmd}")
-                            subprocess.Popen(f"nohup {cmd} > /dev/null 2>&1 &", shell=True)
-                        except Exception as e: logger.error(f"Fehler beim Starten des Updates: {e}")
+                            # Prozess starten und Ausgabe in Log-Datei umleiten
+                            subprocess.Popen(f"nohup {cmd} >> {log_file} 2>&1 &", shell=True)
+                            logger.info("Update-Prozess im Hintergrund gestartet.")
+                        except Exception as e:
+                            logger.error(f"Fehler beim Starten des Auto-Updates: {e}")
+                    else:
+                        logger.error("Auto-Update fehlgeschlagen: self_update.py nicht gefunden.")
                     update_checked_today = True
             else:
                 update_checked_today = False

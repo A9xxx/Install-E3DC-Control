@@ -15,6 +15,7 @@ INSTALL_USER = get_install_user()
 INSTALL_HOME = get_home_dir(INSTALL_USER)
 INSTALL_PATH = get_install_path()
 INSTALLER_DIR = os.path.dirname(os.path.abspath(__file__))
+INSTALL_ROOT = os.path.dirname(INSTALLER_DIR) # .../Install
 
 # ANSI Colors
 GREEN = '\033[92m'
@@ -141,6 +142,21 @@ def check_permissions():
         print(f"{RED}✗{RESET} Fehler beim Prüfen: {e}")
         perm_logger.error(f"Fehler beim Prüfen von INSTALL_PATH: {e}")
         issues.append("error")
+
+    # INSTALL_ROOT (~/Install) prüfen - darf NICHT root sein!
+    if os.path.isdir(INSTALL_ROOT):
+        try:
+            st = os.stat(INSTALL_ROOT)
+            owner = pwd.getpwuid(st.st_uid).pw_name
+            group = grp.getgrgid(st.st_gid).gr_name
+            if owner != INSTALL_USER or group != "www-data":
+                print(f"{RED}✗{RESET} {INSTALL_ROOT} gehört {owner}:{group} (soll: {INSTALL_USER}:www-data)")
+                issues.append("install_root_owner")
+            else:
+                print(f"{GREEN}✓{RESET} {INSTALL_ROOT} gehört {INSTALL_USER}:www-data")
+        except Exception:
+            pass
+            
     return issues
 
 
@@ -233,6 +249,9 @@ def check_webportal_permissions():
 
 # Definition der zu prüfenden Dateien und ihrer Berechtigungen
 FILE_DEFINITIONS = [
+    # Installer Skripte (Sicherstellen, dass sie ausführbar sind)
+    {"path": f"{INSTALL_ROOT}/installer_main.py", "mode": "755", "owner": INSTALL_USER, "group": "www-data", "optional": False, "executable": True},
+    {"path": f"{INSTALLER_DIR}/self_update.py", "mode": "755", "owner": INSTALL_USER, "group": "www-data", "optional": False, "executable": True},
     # Installer Config (Sonderfall, weil sie nicht im INSTALL_PATH liegen muss)
     {"path": CONFIG_FILE, "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     # Konfigurationsdateien
@@ -373,6 +392,13 @@ def fix_permissions(issues):
             print(f"{GREEN}✓{RESET} {INSTALL_PATH}: Besitzer auf {INSTALL_USER}:{INSTALL_USER} gesetzt")
         else:
             success = False
+    if "install_root_owner" in issues:
+        print(f"  → Setze Besitzer rekursiv: {INSTALL_ROOT} -> {INSTALL_USER}:www-data")
+        result = run_command(f"sudo chown -R {INSTALL_USER}:www-data {INSTALL_ROOT}")
+        if result['success']:
+            print(f"{GREEN}✓{RESET} {INSTALL_ROOT}: Besitzer auf {INSTALL_USER}:www-data korrigiert")
+        else:
+            success = False
     if "mode" in issues:
         print(f"  → Setze Verzeichnis-/Dateirechte rekursiv: {INSTALL_PATH} -> 755")
         result = run_command(f"sudo chmod -R 755 {INSTALL_PATH}")
@@ -511,39 +537,49 @@ def fix_webportal_permissions(issues):
 
 
 def cleanup_root_owned_files():
-    """Sucht und bereinigt root-eigene Dateien in INSTALL_PATH."""
-    if not os.path.exists(INSTALL_PATH):
-        return True
+    """Sucht und bereinigt root-eigene Dateien in INSTALL_PATH und INSTALL_ROOT."""
     print("\n■ Prüfe auf root-eigene Dateien…\n")
     cleaned = 0
+    
+    paths_to_check = []
+    if os.path.exists(INSTALL_PATH): paths_to_check.append(INSTALL_PATH)
+    if os.path.exists(INSTALL_ROOT): paths_to_check.append(INSTALL_ROOT)
+
     try:
-        for root, dirs, files in os.walk(INSTALL_PATH):
-            # Prüfe Ordner
-            for d in dirs:
-                dir_path = os.path.join(root, d)
-                try:
-                    st = os.stat(dir_path)
-                    owner = pwd.getpwuid(st.st_uid).pw_name
-                    if owner == "root":
-                        result = run_command(f"sudo chown {INSTALL_USER}:{INSTALL_USER} {dir_path}")
-                        if result['success']:
-                            print(f"  {GREEN}✓{RESET} {os.path.relpath(dir_path, INSTALL_PATH)} von root bereinigt")
-                            cleaned += 1
-                except Exception:
-                    pass
-            # Prüfe Dateien
-            for f in files:
-                file_path = os.path.join(root, f)
-                try:
-                    st = os.stat(file_path)
-                    owner = pwd.getpwuid(st.st_uid).pw_name
-                    if owner == "root":
-                        result = run_command(f"sudo chown {INSTALL_USER}:{INSTALL_USER} {file_path}")
-                        if result['success']:
-                            print(f"  {GREEN}✓{RESET} {os.path.relpath(file_path, INSTALL_PATH)} von root bereinigt")
-                            cleaned += 1
-                except Exception:
-                    pass
+        for base_dir in paths_to_check:
+            # Besitzer je nach Hauptverzeichnis festlegen
+            if base_dir == INSTALL_ROOT:
+                correct_owner = f"{INSTALL_USER}:www-data"
+            else: # Gilt für INSTALL_PATH
+                correct_owner = f"{INSTALL_USER}:{INSTALL_USER}"
+
+            for root, dirs, files in os.walk(base_dir):
+                # Prüfe Ordner
+                for d in dirs:
+                    dir_path = os.path.join(root, d)
+                    try:
+                        st = os.stat(dir_path)
+                        owner = pwd.getpwuid(st.st_uid).pw_name
+                        if owner == "root":
+                            result = run_command(f"sudo chown {correct_owner} '{dir_path}'")
+                            if result['success']:
+                                print(f"  {GREEN}✓{RESET} {dir_path} von root bereinigt")
+                                cleaned += 1
+                    except Exception:
+                        pass
+                # Prüfe Dateien
+                for f in files:
+                    file_path = os.path.join(root, f)
+                    try:
+                        st = os.stat(file_path)
+                        owner = pwd.getpwuid(st.st_uid).pw_name
+                        if owner == "root":
+                            result = run_command(f"sudo chown {correct_owner} '{file_path}'")
+                            if result['success']:
+                                print(f"  {GREEN}✓{RESET} {file_path} von root bereinigt")
+                                cleaned += 1
+                    except Exception:
+                        pass
     except Exception as e:
         print(f"{RED}✗{RESET} Fehler beim Scannen: {e}")
         return False
@@ -731,12 +767,18 @@ def check_sudoers_permissions():
     # Dynamischer Pfad zum Installer-Skript (basierend auf aktuellem Speicherort)
     current_installer_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
     script_path = os.path.join(current_installer_dir, "installer_main.py")
+    
+    # NEU: Pfad zum self_update.py und install_user holen
+    self_update_script_path = os.path.join(INSTALLER_DIR, 'self_update.py')
+    install_user = get_install_user()
 
     expected_sudoers_files = [
         {
             "file": "/etc/sudoers.d/010_e3dc_web_update",
-            "content": f"www-data ALL=(root) NOPASSWD: /usr/bin/python3 {script_path} --update-e3dc\nwww-data ALL=(root) NOPASSWD: /usr/bin/python3 {os.path.join(INSTALLER_DIR, 'self_update.py')} *",
-            "description": "Web-Update"
+            "content": (f"www-data ALL=(root) NOPASSWD: /usr/bin/python3 {script_path} --update-e3dc\n"
+                        f"www-data ALL=(root) NOPASSWD: /usr/bin/python3 {self_update_script_path} *\n"
+                        f"{install_user} ALL=(root) NOPASSWD: /usr/bin/python3 {self_update_script_path} *"),
+            "description": "Web-Update & Auto-Update"
         },
         {
             "file": "/etc/sudoers.d/010_e3dc_web_git",
@@ -753,18 +795,34 @@ def check_sudoers_permissions():
         description = sudo_def["description"]
 
         if not os.path.exists(sudoers_file):
-            print(f"{RED}✗{RESET} Sudoers-Datei für '{description}' fehlt: {os.path.basename(sudoers_file)}")
+            print(f"{RED}✗{RESET} Sudoers-Datei für '{description}' fehlt: {os.path.basename(sudoers_file)}.")
             issues.append({"missing": True, "file": sudoers_file, "content": expected_content})
         else:
             try:
+                st = os.stat(sudoers_file)
+                owner = pwd.getpwuid(st.st_uid).pw_name
+                group = grp.getgrgid(st.st_gid).gr_name
+                mode = oct(st.st_mode)[-4:] # 4-stellig für 0440
+
                 with open(sudoers_file, "r") as f:
                     content = f.read().strip()
-                if content != expected_content:
-                    print(f"{RED}✗{RESET} Sudoers-Inhalt für '{description}' veraltet/falsch.")
-                    issues.append({"missing": False, "file": sudoers_file, "content": expected_content})
-                else:
+                
+                content_ok = (content == expected_content)
+                owner_ok = (owner == "root")
+                group_ok = (group == "root")
+                mode_ok = (mode == "0440")
+
+                if content_ok and owner_ok and group_ok and mode_ok:
                     print(f"{GREEN}✓{RESET} Sudoers-Konfiguration für '{description}' korrekt.")
                     perm_logger.info(f"Sudoers-Konfiguration '{description}' korrekt.")
+                else:
+                    details = []
+                    if not content_ok: details.append("Inhalt veraltet")
+                    if not owner_ok: details.append(f"Owner={owner} (soll: root)")
+                    if not group_ok: details.append(f"Gruppe={group} (soll: root)")
+                    if not mode_ok: details.append(f"Rechte={mode} (soll: 0440)")
+                    print(f"{RED}✗{RESET} Sudoers-Problem für '{description}': {', '.join(details)}.")
+                    issues.append({"missing": False, "file": sudoers_file, "content": expected_content})
             except Exception as e:
                 print(f"{RED}✗{RESET} Fehler beim Lesen von {sudoers_file}: {e}")
                 perm_logger.error(f"Fehler beim Lesen von {sudoers_file}: {e}")
@@ -781,8 +839,17 @@ def fix_sudoers_permissions(issues):
             content = issue["content"]
             print(f"  → Schreibe {path}…")
             try:
-                run_command(f"sudo bash -c 'echo \"{content}\" > {path}'")
-                run_command(f"sudo chmod 440 {path}")
+                # Sicherer Weg über temporäre Datei, um Shell-Probleme zu vermeiden
+                with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix=".sudoers") as tmp:
+                    tmp.write(content + "\n")
+                    tmp_path = tmp.name
+                
+                # Kopieren und Rechte setzen
+                run_command(f"sudo cp {tmp_path} {path}")
+                run_command(f"sudo chown root:root {path}")
+                run_command(f"sudo chmod 0440 {path}")
+                os.unlink(tmp_path)
+
                 print(f"{GREEN}✓{RESET} Sudoers-Datei erstellt/aktualisiert.")
                 perm_logger.info(f"Sudoers-Datei erstellt/aktualisiert: {path}")
             except Exception as e:

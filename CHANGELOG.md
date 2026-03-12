@@ -1,5 +1,16 @@
 # Changelog
 
+## [3.2.8] - 2026-03-12 - UI & Performance Refactoring
+
+### 🚀 Performance & Code-Qualität
+*   **JavaScript Bündelung:** Redundanter JavaScript-Code aus `index.php` und `mobile.php` wurde in die zentrale, cache-bare `solar.js` ausgelagert. Dies verbessert die Wartbarkeit und Ladezeiten.
+*   **Energy Manager Caching:** Der `energy_manager.py` liest die Konfiguration nur noch bei Änderungen neu ein, was die Systemlast (CPU/SD-Karte) deutlich reduziert.
+
+### 🖥️ Web-Interface
+*   **Einheitlicher Config Editor:** Das moderne Kachel-Layout wird nun für alle Bereiche im Konfigurations-Editor verwendet, was die Übersichtlichkeit stark verbessert.
+*   **Priorisierte Ansicht:** Die "Luxtronik Energy Manager"-Gruppe wird nun zuoberst im Editor angezeigt.
+*   **Komfort-Link:** Ein Klick auf "Config Editor" in der Luxtronik-Ansicht springt nun direkt zum passenden, aufgeklappten Abschnitt.
+
 ## [3.2.7] - 2026-03-12 - Installer & Config Editor Polish
 
 ### 🔧 Installer & Automatisierung

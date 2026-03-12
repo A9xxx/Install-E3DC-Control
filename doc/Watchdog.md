@@ -29,6 +29,11 @@ if [ -z "$1" ]; then
         CLEAN_REASON=$(echo "$REASON" | sed 's/.*PIGUARD: //')
         MSG=$(printf "⚠️ Pi5ControlSSD REBOOT erfolgt!\n📍 IP: $IP_ADDR\n❌ Grund: $CLEAN_REASON")
     fi
+elif [ "$1" == "status" ]; then
+    # Täglicher Statusbericht (intern generiert)
+    TEMP=$(vcgencmd measure_temp | cut -d'=' -f2)
+    UPTIME=$(uptime -p)
+    MSG=$(printf "✅ Status: Pi5 online.\n⏱ Laufzeit: $UPTIME\n🌡 Temp: $TEMP\n📍 IP: $IP_ADDR")
 else
     # Nachrichtentext aus dem ersten Argument ($1) übernehmen
     MSG=$(printf "%s\n📍 IP: $IP_ADDR" "$1")
@@ -130,7 +135,7 @@ Befehle: sudo systemctl daemon-reloadsudo systemctl enable piguard.servicesudo s
 @reboot sleep 45 && /usr/local/bin/boot_notify.sh
 
 # Täglicher Statusbericht um 12:00 Uhr mittags
-00 12 * * * /usr/local/bin/boot_notify.sh "✅ Status: Pi5 online. Laufzeit: $(uptime -p). Temp: $(vcgencmd measure_temp | cut -d'=' -f2)"
+00 12 * * * /usr/local/bin/boot_notify.sh status
 Zusammenfassung der ReaktionszeitenEreignisWarnung nachReboot nachSystem "Freeze"-60 SekundenFritzBox Ausfall50 Sekunden5 MinutenE3DC Screen Ausfall50 Sekunden3 Minuten
 
 PiGuard überprüfen: 

@@ -73,6 +73,7 @@ Stellt sicher, dass die Dateiberechtigungen immer korrekt sind, damit sowohl der
 - **Struktur & Sicherheit:** Die Logik ist in `check_*`- und `fix_*`-Funktionen getrennt. Eine zentrale `FILE_DEFINITIONS` Liste definiert den Soll-Zustand.
 - **Zusatzfunktionen:** Erkennt und entfernt doppelte Variablen in der `e3dc.config.txt`. Prüft Schreibrechte für temporäre Web-Verzeichnisse.
 - **System-Integration:** Richtet Sudoers-Dateien (`010_e3dc_web_update`, `010_e3dc_web_git`) ein und wird am Ende des Update-Skripts immer automatisch ausgeführt.
+- **Installer-Rechte:** Stellt sicher, dass auch der `Install`-Ordner der Gruppe `www-data` gehört, damit Web-Updates (PHP) reibungslos funktionieren.
 
 ### `update.py`
 Realisiert den Update-Prozess für E3DC-Control:
@@ -108,7 +109,7 @@ Ein zentraler Installer für den Watchdog-Dienst (`piguard`):
 - **`e3dc.config.txt`**: Die Hauptkonfigurationsdatei. Sie dient nun auch als zentrale Konfiguration für den Luxtronik Energy Manager.
 - **`installer_config.json`**: Speichert die Konfiguration des Installers selbst (z.B. den Installationsbenutzer).
 - **`e3dc_paths.json`**: Speichert explizit den Pfad zum Python Virtual Environment.
-- **`UPDATE_POLICY.json`**: Wird bei Releases mitgeliefert und teilt dem Updater mit, welche Aktionen nach der Installation ausgeführt werden müssen.
+- **`UPDATE_POLICY.json`**: Liegt im `Install`-Ordner (Git-Repo) und steuert Nacharbeiten bei Updates (Pakete, Neustarts, Rechte).
 
 ## 6. Diagnose, Wartung & Logging
 

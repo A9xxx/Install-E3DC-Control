@@ -60,17 +60,6 @@ def git_exec(git_cmd, cwd=INSTALLER_DIR):
     # Fallback: Normal ausführen
     return run_command(f"cd {cwd} && {git_cmd}", timeout=60)
 
-def log_to_energy_manager(msg):
-    """Schreibt eine Nachricht in das Energy-Manager Log."""
-    try:
-        log_file = "/var/www/html/logs/energy_manager.log"
-        if os.path.exists(log_file):
-            timestamp = time.strftime('%d.%m %H:%M:%S')
-            with open(log_file, "a", encoding="utf-8") as f:
-                f.write(f"{timestamp} - {msg}\n")
-    except Exception:
-        pass
-
 def get_installed_version():
     """
     Holt die aktuelle Version des Installers.
@@ -352,6 +341,16 @@ def extract_release(zip_path, new_version, silent=False):
             except Exception as e:
                 print(f"  ⚠ Sicherung der installer_config.json fehlgeschlagen: {e}")
 
+        # Sicherung einer eventuell vorhandenen e3dc.config.txt (Template im Install-Ordner)
+        e3dc_config_to_preserve = None
+        e3dc_config_path = os.path.join(INSTALLER_DIR, "e3dc.config.txt")
+        if os.path.exists(e3dc_config_path):
+            try:
+                with open(e3dc_config_path, 'r', encoding='utf-8') as f:
+                    e3dc_config_to_preserve = f.read()
+                print("  → Sichern der e3dc.config.txt (Template)")
+            except Exception: pass
+
         # Sicherung der aktuellen Version (immer!)
         backup_dir = INSTALLER_DIR + ".backup"
         if os.path.exists(backup_dir):
@@ -435,7 +434,6 @@ def extract_release(zip_path, new_version, silent=False):
 
             print("✓ Update erfolgreich installiert")
             update_logger.info("Dateien erfolgreich aktualisiert.")
-            log_to_energy_manager(f"Update auf Version {new_version} erfolgreich.")
 
             # Wiederherstellen der Konfiguration
             if config_to_preserve:
@@ -448,6 +446,14 @@ def extract_release(zip_path, new_version, silent=False):
                 except Exception as e:
                     print(f"⚠ Wiederherstellen der installer_config.json fehlgeschlagen: {e}")
             
+            # Wiederherstellen der e3dc.config.txt Vorlage
+            if e3dc_config_to_preserve:
+                try:
+                    with open(e3dc_config_path, 'w', encoding='utf-8') as f:
+                        f.write(e3dc_config_to_preserve)
+                    print("✓ Wiederherstellen der e3dc.config.txt (Template)")
+                except Exception: pass
+
             # Aktualisiere VERSION-Datei mit neuer Version
             try:
                 with open(VERSION_FILE, 'w') as f:
@@ -625,9 +631,6 @@ def check_and_update(silent=False, check_only=False):
         if not silent:
             print("\n✓ Installer ist aktuell.\n")
             update_logger.info("Installer ist aktuell.")
-        elif silent:
-            log_to_energy_manager("System ist aktuell.")
-            
             if latest_version == installed_version:
                 return False
         else:

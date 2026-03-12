@@ -1,15 +1,27 @@
 # Changelog
 
+## [3.3.0] - 2026-03-12 - Major Refactoring: UI, Performance & Stability
+
+### 🚀 Performance & Code-Qualität
+*   **JavaScript-Zentralisierung:** Große Teile des JavaScript-Codes aus `index.php` und `mobile.php` (Update-Logik, Service-Steuerung, Dark Mode, Diagramm-Steuerung) wurden in die zentrale, cache-bare `solar.js` ausgelagert. Dies reduziert Redundanz, verbessert die Wartbarkeit und beschleunigt das Laden der Seiten.
+*   **Energy Manager Caching:** Der `energy_manager.py` liest die Konfigurationsdatei (`e3dc.config.txt`) nur noch dann neu ein, wenn sie sich tatsächlich geändert hat. Dies reduziert die Systemlast (CPU/SD-Karte) erheblich.
+
+### 🖥️ UI & UX-Verbesserungen
+*   **Einheitlicher Config Editor:** Alle Bereiche im Konfigurations-Editor nutzen nun ein modernes, mehrspaltiges Kachel-Layout, was die Übersichtlichkeit auf allen Geräten stark verbessert.
+*   **Priorisierte Ansicht:** Die "Luxtronik Energy Manager"-Gruppe wird für einen schnelleren Zugriff nun zuoberst im Editor angezeigt.
+*   **Komfort-Link:** Ein Klick auf "Config Editor" in der Luxtronik-Ansicht springt nun direkt zum passenden, aufgeklappten Abschnitt im Editor.
+
+### 🔧 Installer & Update-Prozess
+*   **Robuster Auto-Update:** Der automatische Update-Prozess aus dem Energy Manager wurde korrigiert und loggt seine Ausgaben nun in eine separate Datei (`auto_self_update.log`) für bessere Fehlersuche.
+*   **Zentrale Update-Richtlinie:** Die `UPDATE_POLICY.json` ist nun Teil des Git-Repositorys und wird sowohl von Git- als auch von ZIP-Updates korrekt verarbeitet, um Aktionen nach dem Update (z.B. Service-Neustarts) zuverlässig auszuführen.
+*   **Umfassende Rechte-Korrektur:** Das `permissions.py`-Skript wurde massiv erweitert, um die Rechte des gesamten `Install`-Verzeichnisses (`pi:www-data`) zu verwalten und Fehler durch falsche Dateibesitzer (`root`) oder Modi (`644` für Ordner) automatisch zu beheben.
+*   **Dokumentations-Update:** Die `INSTALLER_DOKUMENTATION.md` und `Luxtronik.md` wurden an die neuesten Änderungen (zentrale Konfiguration, Rechte-Management) angepasst.
+
 ## [3.2.8] - 2026-03-12 - UI & Performance Refactoring
 
 ### 🚀 Performance & Code-Qualität
 *   **JavaScript Bündelung:** Redundanter JavaScript-Code aus `index.php` und `mobile.php` wurde in die zentrale, cache-bare `solar.js` ausgelagert. Dies verbessert die Wartbarkeit und Ladezeiten.
 *   **Energy Manager Caching:** Der `energy_manager.py` liest die Konfiguration nur noch bei Änderungen neu ein, was die Systemlast (CPU/SD-Karte) deutlich reduziert.
-
-### 🖥️ Web-Interface
-*   **Einheitlicher Config Editor:** Das moderne Kachel-Layout wird nun für alle Bereiche im Konfigurations-Editor verwendet, was die Übersichtlichkeit stark verbessert.
-*   **Priorisierte Ansicht:** Die "Luxtronik Energy Manager"-Gruppe wird nun zuoberst im Editor angezeigt.
-*   **Komfort-Link:** Ein Klick auf "Config Editor" in der Luxtronik-Ansicht springt nun direkt zum passenden, aufgeklappten Abschnitt.
 
 ## [3.2.7] - 2026-03-12 - Installer & Config Editor Polish
 

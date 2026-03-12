@@ -32,13 +32,15 @@ sudo python3 installer_main.py
 
 Nach dem Start erscheint ein interaktives, in Kategorien unterteiltes Menü, das über eine Suchfunktion verfügt.
 
-### Automatischer Modus (`--unattended`)
+### Automatischer Modus & CLI-Parameter
 
-Für die Ausführung durch andere Skripte (z.B. PHP aus dem Webportal) gibt es einen unbeaufsichtigten Modus. Blockierende Eingabeaufforderungen wurden hier entfernt, sodass automatische Installationen vollständig ohne Interaktion durchlaufen.
+Für die Automatisierung (z.B. durch Cronjobs oder das Webportal) unterstützt der Installer spezielle Parameter:
 
-```bash
-sudo python3 installer_main.py --unattended
-```
+- `--unattended`: Führt den Installer ohne Benutzereingaben mit Standardwerten aus.
+- `--update-e3dc`: Führt gezielt das E3DC-Control Update durch (Headless).
+- `--install-all`: Startet die komplette "Alles installieren" Routine vollautomatisch (Zero-Touch).
+
+Beispiel: `sudo python3 installer_main.py --unattended`
 
 ## 4. Hauptkomponenten (Die Skripte im `Installer`-Ordner)
 
@@ -118,6 +120,10 @@ Der Installer bietet weitreichende Möglichkeiten zur Fehlersuche:
 - **Erweiterter Status-Check:** Prüft Internetverbindung, CPU-Temperatur, RAM-Disk-Status und zeigt Service-Logs bei Fehlern an.
 
 Log-Dateien befinden sich im `logs/`-Verzeichnis:
-- **`install.log`**: Das allgemeine Log für die meisten Aktionen.
+- **`install.log`**: Das allgemeine Log für die meisten Aktionen des Installers.
 - **`permissions.log`**: Log für Aktionen des Berechtigungs-Skripts.
-- **`energy_manager.log`**: Protokolliert Update-Prüfungen und Ergebnisse der Wärmepumpen-Steuerung.
+
+Zusätzliche Logs im Web-Verzeichnis (`/var/www/html/logs/`):
+- **`energy_manager.log`**: Protokoll des Energy Managers (Wärmepumpe, Ladeplanung).
+- **`auto_self_update.log`**: Protokoll des automatischen Updates (vom Energy Manager getriggert).
+- **`self_update_php.log`**: Protokoll manueller Updates, die über das Web-Interface gestartet wurden.

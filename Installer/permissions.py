@@ -328,6 +328,21 @@ def check_file_permissions():
     except Exception:
         pass
 
+    # Alle Python-Skripte im INSTALL_PATH dynamisch erfassen und prüfen
+    # Dies stellt sicher, dass auch neue Skripte (z.B. nach Updates) korrekt gesetzt sind (pi:www-data, 755)
+    if os.path.exists(INSTALL_PATH):
+        try:
+            for fname in os.listdir(INSTALL_PATH):
+                if fname.endswith(".py"):
+                    fpath = os.path.join(INSTALL_PATH, fname)
+                    # Wenn noch nicht in der Liste, hinzufügen
+                    if not any(d['path'] == fpath for d in FILE_DEFINITIONS):
+                        FILE_DEFINITIONS.append({
+                            "path": fpath, "mode": "755", "owner": INSTALL_USER, "group": "www-data", "optional": False, "executable": True
+                        })
+        except Exception:
+            pass
+
     issues = {}
     for fdef in FILE_DEFINITIONS:
         path = fdef["path"]
@@ -472,8 +487,8 @@ def fix_webportal_permissions(issues):
         else:
             success = False
     if "tmp_missing" in issues or "tmp_mode" in issues or "tmp_not_writable" in issues:
-        print(f"  → Setze tmp-Rechte rekursiv: {wp_path}/tmp -> 777")
-        result = run_command(f"sudo chmod -R 777 {wp_path}/tmp")
+        print(f"  → Setze tmp-Rechte: {wp_path}/tmp -> 777 (nicht-rekursiv)")
+        result = run_command(f"sudo chmod 777 {wp_path}/tmp")
         if result['success']:
             print(f"{GREEN}✓{RESET} tmp-Rechte korrigiert")
         else:

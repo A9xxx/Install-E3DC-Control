@@ -364,10 +364,16 @@ def main():
             if now.hour == update_hour and now.minute == update_minute:
                 if not update_checked_today:
                     logger.info(f"Starte tägliche Update-Prüfung ({update_hour:02d}:{update_minute:02d} Uhr)...")
-                    installer_script = os.path.abspath(os.path.join(script_dir, "../../installer_main.py"))
-                    if os.path.exists(installer_script):
+                    # Pfad zum Install-Verzeichnis (z.B. /home/pi/Install)
+                    install_root = os.path.abspath(os.path.join(script_dir, "../../"))
+                    
+                    if os.path.exists(install_root):
                         try:
-                            subprocess.Popen(f"nohup sudo python3 {installer_script} --unattended > /dev/null 2>&1 &", shell=True)
+                            # Wir rufen check_and_update direkt auf, um Probleme im installer_main.py zu umgehen.
+                            # Wir setzen PYTHONPATH, damit Importe funktionieren.
+                            cmd = f"cd {install_root} && sudo PYTHONPATH={install_root} python3 -c \"from Installer.self_update import check_and_update; check_and_update(silent=True)\""
+                            logger.info(f"Führe Update-Kommando aus: {cmd}")
+                            subprocess.Popen(f"nohup {cmd} > /dev/null 2>&1 &", shell=True)
                         except Exception as e: logger.error(f"Fehler beim Starten des Updates: {e}")
                     update_checked_today = True
             else:

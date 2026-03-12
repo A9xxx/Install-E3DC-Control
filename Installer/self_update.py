@@ -12,8 +12,17 @@ import tempfile
 import shutil
 from urllib.request import urlopen, Request
 from urllib.error import URLError
+# Pfad-Hack für Standalone-Ausführung (damit relative Imports funktionieren)
+if __name__ == "__main__" and __package__ is None:
+    import sys
+    # Parent-Dir (Install/) zum Pfad hinzufügen
+    parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    sys.path.insert(0, parent)
+    __package__ = "Installer"
+
 import re
 import time
+import argparse
 
 from .core import register_command
 from .utils import run_command, replace_in_file
@@ -30,6 +39,26 @@ DEBUG = False
 USER_AGENT = "E3DC-Control-Installer/1.0"
 update_logger = get_or_create_logger("self_update")
 
+def git_exec(git_cmd, cwd=INSTALLER_DIR):
+    """
+    Führt Git-Befehle sicher aus. 
+    Wenn wir root sind, aber das Repo einem User gehört, nutzen wir sudo -u user.
+    """
+    try:
+        stat = os.stat(cwd)
+        uid = stat.st_uid
+        # Wenn wir root sind (uid 0) und das Repo nicht root gehört
+        if os.geteuid() == 0 and uid != 0:
+            import pwd
+            user = pwd.getpwuid(uid).pw_name
+            # Befehl maskieren für Shell
+            cmd = f"sudo -u {user} {git_cmd}"
+            return run_command(f"cd {cwd} && {cmd}", timeout=60)
+    except Exception:
+        pass
+    
+    # Fallback: Normal ausführen
+    return run_command(f"cd {cwd} && {git_cmd}", timeout=60)
 
 def log_to_energy_manager(msg):
     """Schreibt eine Nachricht in das Energy-Manager Log."""
@@ -212,7 +241,57 @@ def _run_migration_luxtronik_config(installer_dir):
         print(f"⚠ Fehler bei der Konfigurations-Migration: {e}")
         update_logger.error(f"Fehler bei der Konfigurations-Migration: {e}", e)
 
-def extract_release(zip_path, new_version):
+def execute_update_policy(policy_path):
+    """
+    Führt Aktionen basierend auf der UPDATE_POLICY.json aus.
+    Wird von extract_release und git_update genutzt.
+    """
+    if not os.path.exists(policy_path):
+        return
+        
+    print("→ Verarbeite Update-Richtlinien (Policy)...")
+    try:
+        with open(policy_path, 'r') as f:
+            policy = json.load(f)
+
+        # 1. Pakete installieren
+        apt_packages = policy.get("apt_packages", [])
+        if apt_packages:
+            print(f"→ Installiere System-Pakete: {', '.join(apt_packages)}")
+            try:
+                subprocess.run(["apt-get", "update"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                subprocess.run(["apt-get", "install", "-y"] + apt_packages, check=True)
+            except Exception as e:
+                print(f"⚠ Fehler bei der Paket-Installation (apt): {e}")
+        
+        pip_packages = policy.get("pip_packages", [])
+        if pip_packages:
+            print(f"→ Installiere Python-Pakete: {', '.join(pip_packages)}")
+            try:
+                subprocess.run([sys.executable, "-m", "pip", "install"] + pip_packages, check=True)
+            except Exception as e:
+                print(f"⚠ Fehler bei der Paket-Installation (pip): {e}")
+
+        # 2. Rechte korrigieren
+        if policy.get("run_permissions", False):
+            print("→ Führe vollständige Rechte-Reparatur aus (Policy)...")
+            try:
+                from .permissions import run_permissions_wizard
+                run_permissions_wizard(headless=True)
+            except Exception as e:
+                print(f"⚠ Fehler bei der Rechte-Reparatur: {e}")
+
+        # 3. Dienste neustarten
+        services_to_restart = policy.get("restart_services", [])
+        for srv in services_to_restart:
+            if os.path.exists(f"/etc/systemd/system/{srv}.service") or os.path.exists(f"/lib/systemd/system/{srv}.service"):
+                print(f"  → Starte Service neu: {srv}")
+                subprocess.run(["systemctl", "restart", srv], check=False)
+                
+    except Exception as pe:
+        print(f"⚠ Fehler beim Verarbeiten der Update-Policy: {pe}")
+
+def extract_release(zip_path, new_version, silent=False):
     """
     Entpackt die Release-ZIP und führt Update durch.
     
@@ -315,32 +394,7 @@ def extract_release(zip_path, new_version):
             policy_file = os.path.join(src_installer, "..", "UPDATE_POLICY.json")
             policy_executed = False
             
-            # Standard-Aktion: Energy Manager neu starten, falls keine Policy das Gegenteil sagt
-            services_to_restart = ["energy_manager"]
-            run_full_permissions = False
-            apt_packages = []
-            pip_packages = []
-
-            if os.path.exists(policy_file):
-                try:
-                    print("→ Verarbeite Update-Richtlinien (Policy)...")
-                    with open(policy_file, 'r') as f:
-                        policy = json.load(f)
-                        if "restart_services" in policy:
-                            services_to_restart = policy["restart_services"]
-                        if "run_permissions" in policy:
-                            run_full_permissions = bool(policy["run_permissions"])
-                        if "apt_packages" in policy:
-                            apt_packages = policy.get("apt_packages", [])
-                        if "pip_packages" in policy:
-                            pip_packages = policy.get("pip_packages", [])
-                            
-                        # Hier könnten in Zukunft auch Migrations-Skripte ausgeführt werden
-                        policy_executed = True
-                except Exception as pe:
-                    print(f"⚠ Fehler beim Lesen der Update-Policy: {pe}")
-
-            # Migration der Luxtronik-Konfiguration nach dem Kopieren der neuen Dateien
+            # Migration VOR Webupdate (damit Config da ist)
             _run_migration_luxtronik_config(INSTALLER_DIR)
 
             # NEU: Webportal & Diagramm-Skripte aus E3DC-Control.zip entpacken
@@ -348,7 +402,7 @@ def extract_release(zip_path, new_version):
             print("→ Aktualisiere Webportal und Skripte (aus ZIP)…")
             try:
                 # Import lokal, um Zirkelbezüge zu vermeiden
-                from .diagrammphp import DiagramInstaller
+                from Installer.diagrammphp import DiagramInstaller
                 diag_installer = DiagramInstaller()
                 if diag_installer.extract_and_install_from_zip():
                     print("✓ Webportal-Dateien erfolgreich aktualisiert.")
@@ -360,36 +414,24 @@ def extract_release(zip_path, new_version):
                 print(f"⚠ Fehler beim Webportal-Update: {e}")
                 update_logger.error(f"Ausnahme beim Webportal-Update: {e}", e)
 
-            # 1. Pakete nachinstallieren (falls angefordert)
-            if apt_packages:
-                print(f"→ Installiere System-Pakete: {', '.join(apt_packages)}")
-                try:
-                    subprocess.run(["apt-get", "update"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-                    subprocess.run(["apt-get", "install", "-y"] + apt_packages, check=True)
-                except Exception as e:
-                    print(f"⚠ Fehler bei der Paket-Installation (apt): {e}")
+            # Policy ausführen (Pakete, Services)
+            if os.path.exists(policy_file):
+                execute_update_policy(policy_file)
             
-            if pip_packages:
-                print(f"→ Installiere Python-Pakete: {', '.join(pip_packages)}")
-                try:
-                    subprocess.run([sys.executable, "-m", "pip", "install"] + pip_packages, check=True)
-                except Exception as e:
-                    print(f"⚠ Fehler bei der Paket-Installation (pip): {e}")
+            # IMMER Rechte korrigieren am Ende (Sicherheit)
+            print("→ Führe vollständige Rechte-Reparatur aus...")
+            try:
+                from .permissions import run_permissions_wizard
+                run_permissions_wizard(headless=True)
+                print("✓ Rechte-Reparatur abgeschlossen.")
+            except Exception as e:
+                print(f"⚠ Fehler bei der Rechte-Reparatur: {e}")
+                log_error("self_update", f"Fehler bei der Rechte-Reparatur: {e}", e)
 
-            # 2. Rechte korrigieren (Vollständiger Wizard, falls angefordert)
-            if run_full_permissions:
-                print("→ Führe vollständige Rechte-Reparatur aus (Policy)...")
-                try:
-                    from .permissions import run_permissions_wizard
-                    run_permissions_wizard(headless=True)
-                except Exception as e:
-                    print(f"⚠ Fehler bei der Rechte-Reparatur: {e}")
-
-            # Dienste neustarten (Standard oder Policy)
-            for srv in services_to_restart:
-                if os.path.exists(f"/etc/systemd/system/{srv}.service"):
-                    print(f"  → Starte Service neu: {srv}")
-                    subprocess.run(["systemctl", "restart", srv], check=False)
+            # Fallback Neustart, wenn keine Policy da war
+            if not os.path.exists(policy_file):
+                if os.path.exists("/etc/systemd/system/energy_manager.service"):
+                    subprocess.run(["systemctl", "restart", "energy_manager"], check=False)
 
             print("✓ Update erfolgreich installiert")
             update_logger.info("Dateien erfolgreich aktualisiert.")
@@ -464,6 +506,45 @@ def extract_release(zip_path, new_version):
     return False
 
 
+def git_update(silent=False):
+    """
+    Führt ein Update via Git durch (bevorzugte Methode).
+    """
+    try:
+        if not silent:
+            print("→ Prüfe auf Updates via Git...")
+        update_logger.info("Starte Git-Update...")
+        
+        # 1. Fetch
+        res = git_exec("git fetch")
+        if not res['success']:
+            if not silent: print(f"✗ Fehler beim Git Fetch: {res['stderr']}")
+            return False
+            
+        # 2. Check status
+        # Nutze rev-list statt status, da status sprachabhängig ist ("Your branch is behind")
+        res = git_exec("git rev-list --count HEAD..@{u}")
+        if res['success'] and res['stdout'].strip().isdigit() and int(res['stdout'].strip()) > 0:
+            if not silent: print("→ Neue Version verfügbar. Aktualisiere...")
+            
+            # 3. Pull
+            res = git_exec("git pull")
+            if res['success']:
+                if not silent: print("✓ Update via Git erfolgreich.")
+                update_logger.info("Git Pull erfolgreich.")
+                
+                # Policy aus dem Repo ausführen (Install/UPDATE_POLICY.json)
+                repo_policy = os.path.join(INSTALLER_DIR, "UPDATE_POLICY.json")
+                execute_update_policy(repo_policy)
+                
+                return True
+            else:
+                if not silent: print(f"✗ Fehler beim Git Pull: {res['stderr']}")
+                return False
+    except Exception as e:
+        update_logger.error(f"Git Update Exception: {e}", e)
+    return False
+
 def is_newer_version(latest, installed):
     def parse(v):
         parts = [p for p in re.split(r'[^0-9]+', v) if p]
@@ -495,6 +576,26 @@ def check_and_update(silent=False, check_only=False):
     """
     installed_version = get_installed_version()
     
+    # 0. Versuch: Git Update (wenn .git existiert)
+    # Das ist die bevorzugte Methode, ähnlich wie bei Eba-M
+    is_git = os.path.exists(os.path.join(INSTALLER_DIR, ".git"))
+    
+    if is_git:
+        if not silent:
+            print(f"Installierte Version (Git): {installed_version}")
+            print("Nutze Git für Update-Prüfung...")
+        
+        # Prüfen ob Updates da sind (ohne Pull)
+        git_exec("git fetch")
+        # status = run_command(f"cd {INSTALLER_DIR} && git status -uno", timeout=10)
+        res = git_exec("git rev-list --count HEAD..@{u}")
+        
+        if res['success'] and res['stdout'].strip().isdigit() and int(res['stdout'].strip()) > 0:
+             if check_only: return True
+             # Führe Git Update durch
+             return git_update(silent=silent)
+
+    # Fallback: Release ZIP Methode (wenn kein Git)
     if not silent:
         print("\n=== Installer-Update Prüfung ===\n")
         print(f"Installierte Version: {installed_version}")
@@ -522,9 +623,6 @@ def check_and_update(silent=False, check_only=False):
             log_to_energy_manager("System ist aktuell.")
             
             if latest_version == installed_version:
-                if input("Möchtest du das Update trotzdem erzwingen (Re-Install)? (j/n): ").strip().lower() != 'j':
-                    return False
-            else:
                 return False
         else:
             return False
@@ -566,16 +664,18 @@ def check_and_update(silent=False, check_only=False):
     
     # Entpacke und installiere
     print()
-    if not extract_release(zip_path, release_info['version']):
+    if not extract_release(zip_path, release_info['version'], silent=silent):
         print("✗ Installation fehlgeschlagen.\n")
         return False
     
-    print("\n→ Installer wird neu gestartet…\n")
-    log_task_completed("Installer aktualisiert", details=f"Auf Version {latest_version}")
-    # Ersetze aktuellen Prozess durch neu gestarteten Installer (behält sudo-Rechte und Terminal)
-    installer_main = os.path.join(INSTALLER_DIR, 'installer_main.py')
-    os.execv(sys.executable, [sys.executable, installer_main])
+    if not silent:
+        print("\n→ Installer wird neu gestartet…\n")
+        log_task_completed("Installer aktualisiert", details=f"Auf Version {latest_version}")
+        # Ersetze aktuellen Prozess durch neu gestarteten Installer (behält sudo-Rechte und Terminal)
+        installer_main = os.path.join(INSTALLER_DIR, 'installer_main.py')
+        os.execv(sys.executable, [sys.executable, installer_main])
 
+    return True
 
 def run_self_update_check():
     """
@@ -588,3 +688,12 @@ def run_self_update_check():
 
 # Registriere als Menü-Befehl
 register_command("1", "Installer aktualisieren", run_self_update_check, sort_order=10)
+
+if __name__ == "__main__":
+    # CLI Support für Aufrufe durch PHP oder Energy Manager
+    parser = argparse.ArgumentParser(description="E3DC Installer Self-Update")
+    parser.add_argument("--check", action="store_true", help="Nur prüfen, ob Updates verfügbar sind")
+    parser.add_argument("--silent", action="store_true", help="Keine Ausgaben, automatischer Modus")
+    args = parser.parse_args()
+
+    check_and_update(silent=args.silent, check_only=args.check)

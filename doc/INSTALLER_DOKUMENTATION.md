@@ -12,26 +12,29 @@ Zu seinen Hauptaufgaben gehören:
 - Ein ausgeklügeltes System zur Überprüfung und Korrektur von Dateiberechtigungen.
 - Eine Backup- und Wiederherstellungsfunktion.
 - Assistenten zur Vereinfachung der Konfiguration.
+- Gezielte Deinstallation einzelner Komponenten oder des gesamten Systems.
+- Ein Notfall-Modus zur automatischen Fehlerbehebung.
 
 ## 2. Voraussetzungen
 
 - **Betriebssystem:** Ein Debian-basiertes Linux (z.B. Raspberry Pi OS).
+- **Abhängigkeiten:** Git muss auf dem System installiert sein.
 - **Python:** Python 3.7 oder neuer.
 - **Rechte:** Das Hauptskript muss mit `sudo` ausgeführt werden, da es Systempakete installiert und systemweite Änderungen vornimmt.
 
 ## 3. Ausführung
 
-Der Installer wird über das Hauptskript `installer_main.py` im `Install`-Verzeichnis gestartet.
+Der Installer wird über das Hauptskript `installer_main.py` gestartet. Er unterstützt mittlerweile beliebige Installationsverzeichnisse (z.B. Git-Clones) und ist nicht mehr stur auf den Pfad `~/Install` festgelegt.
 
 ```bash
 sudo python3 installer_main.py
 ```
 
-Nach dem Start erscheint ein interaktives Menü, aus dem die gewünschte Aktion ausgewählt werden kann.
+Nach dem Start erscheint ein interaktives, in Kategorien unterteiltes Menü, das über eine Suchfunktion verfügt.
 
 ### Automatischer Modus (`--unattended`)
 
-Für die Ausführung durch andere Skripte (z.B. PHP aus dem Webportal) gibt es einen unbeaufsichtigten Modus. In diesem Modus werden keine benutzereingaben erwartet. Er wird für den Auto-Update-Mechanismus des Installers selbst genutzt.
+Für die Ausführung durch andere Skripte (z.B. PHP aus dem Webportal) gibt es einen unbeaufsichtigten Modus. Blockierende Eingabeaufforderungen wurden hier entfernt, sodass automatische Installationen vollständig ohne Interaktion durchlaufen.
 
 ```bash
 sudo python3 installer_main.py --unattended
@@ -43,62 +46,77 @@ sudo python3 installer_main.py --unattended
 Dies ist der zentrale Einstiegspunkt. Seine Aufgaben sind:
 - Starten der Logging-Funktion.
 - Prüfen der Python-Version und der `sudo`-Rechte.
+- Warnung ausgeben, falls eine parallele Installation im Standardpfad gefunden wird.
 - **Selbst-Update:** Prüfen, ob eine neue Version des Installers auf GitHub verfügbar ist und diese bei Bedarf aktualisieren.
-- Sicherstellen, dass ein Installationsbenutzer ausgewählt wurde und diesen in der `installer_config.json` speichern.
+- Sicherstellen, dass ein Installationsbenutzer ausgewählt wurde.
+- Erzwingen der Anlage der `e3dc_paths.json` mit korrekten Berechtigungen.
 - Starten des interaktiven Hauptmenüs (aus `core.py`), außer im `--unattended`-Modus.
 
 ### `core.py`
-Dieses Skript ist für die Darstellung und Logik des interaktiven Hauptmenüs zuständig. Es sammelt alle verfügbaren Aktionen (die in anderen Skripten mit `register_command` registriert wurden) und zeigt sie dem Benutzer zur Auswahl an.
+Dieses Skript ist für die Darstellung und Logik des interaktiven Hauptmenüs zuständig. Es sammelt alle verfügbaren Aktionen und zeigt sie dem Benutzer in Kategorien (Installation, Konfiguration, System, Erweiterungen, Backup) zur Auswahl an.
 
 ### `install_all.py`
 Führt die komplette Neuinstallation in einer festen, logischen Reihenfolge durch:
 1.  Initiale Korrektur von Berechtigungen.
-2.  Installation von System-Abhängigkeiten und Einrichtung des **Python Virtual Environments** (Standard: `~/.venv_e3dc`).
+2.  Installation von System-Abhängigkeiten und Einrichtung des Python Virtual Environments (Standard: `~/.venv_e3dc`). Eine bestehende venv-Umgebung wird automatisch erkannt und genutzt.
 3.  Klonen des `E3DC-Control` Git-Repositorys und Kompilieren des C-Programms via `make`.
-4.  Einrichten des PHP-Webportals.
-5.  Erstellen der initialen Konfigurationsdateien (`e3dc.config.txt`, `e3dc.wallbox.txt`).
+4.  Einrichten des PHP-Webportals und automatische Installation des Diagramm-Systems.
+5.  Erstellen der initialen Konfigurationsdateien.
 6.  Optionale Konfiguration von Strompreisen.
-7.  Einrichten des System-Dienstes für den automatischen Betrieb (inkl. Bereinigung von `rc.local`).
+7.  Einrichten des System-Dienstes für den automatischen Betrieb.
 8.  Einrichten einer RAM-Disk zur Schonung der SD-Karte.
-9.  **Finale Verifizierung aller Berechtigungen.**
+9.  Finale Verifizierung aller Berechtigungen.
 10. Erstellen eines ersten Backups.
 
 ### `permissions.py`
-Dies ist eine der wichtigsten und komplexesten Komponenten. Sie stellt sicher, dass die Dateiberechtigungen immer korrekt sind, damit sowohl der ausführende Benutzer als auch der Webserver (`www-data`) korrekt auf die Dateien zugreifen können.
-- **Struktur:** Die Logik ist sauber in `check_*`- und `fix_*`-Funktionen getrennt. Zuerst werden alle Probleme gesammelt, dann wird dem Benutzer eine Korrektur angeboten.
-- **`FILE_DEFINITIONS`:** Eine zentrale Liste definiert den Soll-Zustand (Besitzer, Gruppe, Modus) für jede wichtige Datei. Dies macht die Logik wartbar und übersichtlich.
-- **Sicherheits-Features:** Das Skript kann proaktiv fälschlicherweise `root` gehörende Dateien korrigieren und prüft auch den `execute`-Status von Home-Verzeichnissen, eine häufige Fehlerquelle.
+Stellt sicher, dass die Dateiberechtigungen immer korrekt sind, damit sowohl der ausführende Benutzer als auch der Webserver (`www-data`) korrekt auf die Dateien zugreifen können.
+- **Struktur & Sicherheit:** Die Logik ist in `check_*`- und `fix_*`-Funktionen getrennt. Eine zentrale `FILE_DEFINITIONS` Liste definiert den Soll-Zustand.
+- **Zusatzfunktionen:** Erkennt und entfernt doppelte Variablen in der `e3dc.config.txt`. Prüft Schreibrechte für temporäre Web-Verzeichnisse.
+- **System-Integration:** Richtet Sudoers-Dateien (`010_e3dc_web_update`, `010_e3dc_web_git`) ein und wird am Ende des Update-Skripts immer automatisch ausgeführt.
 
 ### `update.py`
-Realisiert einen sehr sicheren Update-Prozess für eine bestehende `E3DC-Control` Installation:
-1.  **Backup:** Führt zu Beginn immer ein Backup der bestehenden Version durch.
-2.  **Lokale Änderungen:** Erkennt lokale, nicht gespeicherte Änderungen des Benutzers und sichert diese automatisch via `git stash`.
-3.  **Update:** Führt `git pull` und `make` aus.
-4.  **Abschluss:** Korrigiert die Berechtigungen und bietet an, die zuvor gesicherten lokalen Änderungen (`git stash pop`) wiederherzustellen.
+Realisiert den Update-Prozess für E3DC-Control:
+- **Sicherheit:** Führt zu Beginn ein Backup durch und sichert lokale Änderungen via `git stash`.
+- **Flexibilität:** Bietet Optionen, um eine Installation zu erzwingen (Re-Install) oder lokale Änderungen zu verwerfen (`git reset --hard`).
+- **Web-Portal:** Aktualisiert zuverlässig die Web-Oberfläche durch Extraktion der `E3DC-Control.zip`.
+- **Auto-Update:** Kann täglich zu einer festgelegten Zeit automatisch aktualisieren und nutzt dabei Richtlinien aus der `UPDATE_POLICY.json`.
 
 ### `backup.py`
 Verwaltet den Backup-Lebenszyklus:
-- **`backup_current_version`:** Erstellt ein intelligentes, selektives Backup der wichtigsten Dateien in einem Zeitstempel-Ordner.
-- **`restore_backup`:** Listet verfügbare Backups auf und stellt eine ausgewählte Version nach einer Sicherheitsabfrage wieder her.
-- **`delete_backup`:** Löscht alte, nicht mehr benötigte Backups.
+- Erstellt intelligente Backups in Zeitstempel-Ordnern. Diese beinhalten nun auch Watchdog-Skripte, Systemd-Dateien, `e3dc_paths.json` und Spezial-Konfigurationen.
+- Erstellt automatisch ein Sicherheits-Backup vor jedem Rollback oder Update.
+- Listet verfügbare Backups auf, stellt diese wieder her und löscht alte Versionen.
+
+### `install_watchdog.py`
+Ein zentraler Installer für den Watchdog-Dienst (`piguard`):
+- Überwacht, ob Dateien (z.B. Logfiles) regelmäßig aktualisiert werden. Stoppt die Aktualisierung, wird der E3DC-Dienst gezielt neu gestartet.
+- Ermöglicht die Konfiguration von IP-Überwachung, SD-Karten-Warnungen und Telegram-Benachrichtigungen.
 
 ### Weitere wichtige Helfer
-- **`config_wizard.py`:** Ein einfacher Assistent zur Bearbeitung der `e3dc.config.txt`, um Fehleingaben zu vermeiden.
-- **`installer_config.py`:** Verwaltet die Konfiguration des Installers selbst (z.B. den Namen des Installationsbenutzers), gespeichert in `installer_config.json`.
-- **`utils.py`:** Stellt Hilfsfunktionen wie `run_command` oder `replace_in_file` bereit, die von vielen Modulen genutzt werden.
-- **`system.py`:** Kümmert sich um die Installation von APT-Paketen und die Einrichtung der Python-Umgebung (venv).
+- **`config_wizard.py`:** Ein einfacher Assistent zur Bearbeitung der `e3dc.config.txt`.
+- **`installer_config.py`:** Verwaltet die Konfiguration des Installers selbst in `installer_config.json`.
+- **`service_setup.py`:** Richtet E3DC-Control als echten Systemd-Service (`e3dc.service`) ein, was den alten Crontab-Autostart ersetzt.
 
 ### Erweiterungsmodule
-- **`install_luxtronik.py`:** Installiert und konfiguriert den `energy_manager` für die Wärmepumpen-Steuerung.
-- **`install_lademanagement.py`:** Eine schlankere Installationsroutine, die den `energy_manager` nur für die intelligente Wallbox-Steuerung einrichtet (für Systeme ohne steuerbare Wärmepumpe).
+- **Webportal (`diagrammphp.py`):** Richtet das PHP-Frontend ein. Prüft beim Start die Version des Webportals und bietet primär Konfigurations-Optionen an, falls dieses aktuell ist, um versehentliche Neuinstallationen zu verhindern.
+- **RAM-Disk (`ramdisk.py`):** Konfiguriert den SD-Karten-Schutz und richtet den `e3dc-grabber` Systemd-Service für die Live-Daten ein.
+- **Luxtronik (`install_luxtronik.py`):** Installiert den `energy_manager` für die Wärmepumpen-Steuerung als eigenständigen Systemd-Service.
+- **Lademanagement (`install_lademanagement.py`):** Eine schlankere Installationsroutine für die intelligente Wallbox-Steuerung ohne steuerbare Wärmepumpe.
 
 ## 5. Konfigurationsdateien
 
-- **`pi/Install/Installer/installer_config.json`**: Speichert die Konfiguration des Installers selbst. Hauptsächlich der gewählte Installationsbenutzer, um die Abfrage nicht bei jedem Start zu wiederholen.
-- **`E3DC-Control/e3dc.config.txt`**: Die Hauptkonfigurationsdatei für die C-Anwendung `E3DC-Control`. Wird über den `config_wizard.py` bearbeitet.
+- **`e3dc.config.txt`**: Die Hauptkonfigurationsdatei. Sie dient nun auch als zentrale Konfiguration für den Luxtronik Energy Manager.
+- **`installer_config.json`**: Speichert die Konfiguration des Installers selbst (z.B. den Installationsbenutzer).
+- **`e3dc_paths.json`**: Speichert explizit den Pfad zum Python Virtual Environment.
+- **`UPDATE_POLICY.json`**: Wird bei Releases mitgeliefert und teilt dem Updater mit, welche Aktionen nach der Installation ausgeführt werden müssen.
 
-## 6. Logging
+## 6. Diagnose, Wartung & Logging
 
-Der Installer schreibt detaillierte Log-Dateien, die für die Fehlersuche unerlässlich sind. Sie befinden sich im `pi/Install/logs/`-Verzeichnis.
-- **`install.log`**: Das allgemeine Log für die meisten Aktionen des Installers.
-- **`permissions.log`**: Ein dediziertes Log für alle Aktionen des Berechtigungs-Skripts. Sehr nützlich, wenn es Probleme mit dem Zugriff auf Dateien gibt.
+Der Installer bietet weitreichende Möglichkeiten zur Fehlersuche:
+- **Notfall-Modus (Menü 99):** Ein Assistent, der bei Problemen automatisch eine Rechte-Reparatur, Service-Einrichtung und einen Watchdog-Check durchführt.
+- **Erweiterter Status-Check:** Prüft Internetverbindung, CPU-Temperatur, RAM-Disk-Status und zeigt Service-Logs bei Fehlern an.
+
+Log-Dateien befinden sich im `logs/`-Verzeichnis:
+- **`install.log`**: Das allgemeine Log für die meisten Aktionen.
+- **`permissions.log`**: Log für Aktionen des Berechtigungs-Skripts.
+- **`energy_manager.log`**: Protokolliert Update-Prüfungen und Ergebnisse der Wärmepumpen-Steuerung.

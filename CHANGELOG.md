@@ -1,5 +1,17 @@
 # Changelog
 
+## [3.2.7] - 2026-03-12 - Installer & Config Editor Polish
+
+### 🔧 Installer & Automatisierung
+*   **Unattended-Fix:** Entfernung blockierender Eingabeaufforderungen in `self_update.py` und `diagrammphp.py`. Automatische Installationen ("Alles installieren") laufen nun vollständig ohne Interaktion durch.
+*   **Menü-Logik:** Der Installer prüft nun die Version des Webportals. Ist es aktuell, werden primär Konfigurations-Optionen angeboten, was versehentliche Neuinstallationen verhindert.
+*   **Dokumentation:** `INSTALLER_DOKUMENTATION.md` wurde um das fehlende Modul `diagrammphp.py` ergänzt.
+
+### ⚙️ System & Stabilität
+*   **Config Editor:** Die Speicherlogik wurde komplett überarbeitet. Kommentare, Leerzeilen und die Reihenfolge der Parameter in der `e3dc.config.txt` bleiben nun beim Speichern im Web-Interface erhalten.
+*   **Rechte-Management:** Das Update-Skript führt nun am Ende immer die zentrale `permissions.py` aus, um sicherzustellen, dass der User `pi` weiterhin Schreibrechte auf Web-Dateien hat.
+*   **Sudoers:** Automatische Einrichtung der Sudo-Rechte für das `self_update.py` Skript.
+
 ## [3.2.6] - 2026-03-11 - Auto-Update Fixes & Smart Charging UI
 
 ### 🚀 Auto-Update & Installer

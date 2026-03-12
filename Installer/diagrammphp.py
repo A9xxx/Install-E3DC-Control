@@ -380,46 +380,11 @@ class DiagramInstaller:
                 os.makedirs(history_backups_path, exist_ok=True)
                 diagramm_logger.info(f"tmp-Ordner und Unterordner sichergestellt: {TMP_PATH}")
                 print(f"✓ tmp-Ordner sichergestellt: {TMP_PATH}")
-                
-                # 4) Rechte für das gesamte Webportal setzen (install_user:www-data, 775)
-                print("\n→ Setze Berechtigungen...")
-                try:
-                    # Besitzer auf install_user:www-data setzen (-R für alles inkl. icons/)
-                    subprocess.run(
-                        ["sudo", "chown", "-R", f"{self.install_user}:www-data", WWW_PATH],
-                        check=True,
-                        capture_output=True
-                    )
-                    # Rechte setzen (-R für alles inkl. icons/)
-                    # 775 = rwxrwxr-x (Owner & Gruppe haben alle Rechte)
-                    subprocess.run(
-                        ["sudo", "chmod", "-R", "775", WWW_PATH],
-                        check=True,
-                        capture_output=True
-                    )
-                    # Ordner auf 775, Dateien auf 664
-                    for root, dirs, files in os.walk(WWW_PATH):
-                        for d in dirs:
-                            os.chmod(os.path.join(root, d), 0o775)
-                        for f in files:
-                            os.chmod(os.path.join(root, f), 0o664)
-                    
-                    # Spezielle Rechte für tmp (777, damit PHP/Python problemlos schreiben können)
-                    subprocess.run(["sudo", "chmod", "777", TMP_PATH], check=True, capture_output=True)
-                    
-                    # Rechte für history_backups (775)
-                    subprocess.run(["sudo", "chown", f"{self.install_user}:www-data", history_backups_path], check=True, capture_output=True)
-                    subprocess.run(["sudo", "chmod", "775", history_backups_path], check=True, capture_output=True)
-                    
-                    print(f"✓ Besitzer für alle Dateien: {self.install_user}:www-data")
-                    print(f"✓ Rechte gesetzt (Ordner 775, Dateien 664)")
-                    
-                    diagramm_logger.info("Berechtigungen für Webportal gesetzt.")
-                except Exception as e:
-                    log_warning("diagramm", f"Berechtigungen konnten nicht gesetzt werden: {e}")
-                    print(f"⚠️  Berechtigungen konnten nicht gesetzt werden: {e}")
-                
-                print("\n✓ Installation abgeschlossen")
+
+                # Die Rechtevergabe wird nun zentral vom aufrufenden Skript (z.B. self_update.py)
+                # durch den Aufruf von permissions.py gehandhabt.
+
+                print("\n✓ Datei-Extraktion abgeschlossen.")
                 log_task_completed("Diagramm-System installieren")
                 return True
             
@@ -484,7 +449,8 @@ class DiagramInstaller:
             {
                 "path": "/etc/sudoers.d/010_e3dc_web_update",
                 "lines": [
-                    f"www-data ALL=(root) NOPASSWD: /usr/bin/python3 {installer_script} --update-e3dc"
+                    f"www-data ALL=(root) NOPASSWD: /usr/bin/python3 {installer_script} --update-e3dc",
+                    f"www-data ALL=(root) NOPASSWD: /usr/bin/python3 {os.path.join(INSTALL_DIR, 'Installer', 'self_update.py')} *"
                 ],
                 "desc": "Installer Self-Update"
             }
@@ -866,41 +832,63 @@ class DiagramInstaller:
         if script_exists:
             print(f"\n✓ {PLOT_SCRIPT_NAME} ist bereits installiert")
             print(f"  Pfad: {self.plot_script_path}")
-            
-            # Frage: Neu-Installation oder nur Konfiguration
-            print("\nWas möchtest du tun?")
-            print("1 = Nur Konfiguration ändern (Dateien bleiben)")
-            print("2 = Komplett neu installieren (aus ZIP)")
-            print("3 = Crontab & Service aktualisieren")
-            print("q = Abbrechen")
-            choice = input("Auswahl (1-4): ").strip()
-            
-            if choice == "q":
-                print("Installation abgebrochen")
-                diagramm_logger.info("Installation vom Benutzer abgebrochen.")
-                return False
-            elif choice == "2":
-                if not self.extract_and_install_from_zip():
-                    print("❌ Installation fehlgeschlagen")
-                    log_error("diagramm", "Neuinstallation aus ZIP fehlgeschlagen.")
+
+            # NEU: Versionsvergleich
+            web_version = get_web_version()
+            installer_version = get_installer_bundle_version()
+            is_up_to_date = (web_version == installer_version and web_version != "0.0.0")
+
+            if is_up_to_date:
+                print(f"✓ Webportal ist aktuell (Version {web_version})")
+            else:
+                print(f"⚠ Webportal-Update verfügbar (Installiert: {web_version}, Verfügbar: {installer_version})")
+
+            # Wenn auto_config gesetzt ist (z.B. via install_all), überspringen wir das Menü
+            if auto_config:
+                print("→ Auto-Config aktiv: Überspringe Menü, aktualisiere Konfiguration und Dienste.")
+                diagramm_logger.info("Auto-Config: Menü übersprungen, führe Konfigurations-Update durch.")
+                # Fall-through zu den gemeinsamen Schritten (Option 3)
+            else:
+                # Frage: Neu-Installation oder nur Konfiguration
+                print("\nWas möchtest du tun?")
+                print("1 = Nur Konfiguration ändern (Dateien bleiben)")
+                if not is_up_to_date:
+                    print("2 = Komplett neu installieren (aus ZIP)")
+                print("3 = Crontab & Service aktualisieren")
+                print("q = Abbrechen")
+                choice = input("Auswahl: ").strip()
+                
+                if choice == "q":
+                    print("Installation abgebrochen")
+                    diagramm_logger.info("Installation vom Benutzer abgebrochen.")
                     return False
-            elif choice == "3":
-                self.select_diagram_mode()
-                self.setup_crontab()
-                self.ensure_update_check_config()
-                install_e3dc_service()
-                self.configure_web_sudoers()
-                self.save_config()
-                self.print_summary()
-                return True
-            # Bei choice == "1" wird nur Konfiguration gemacht (unten)
+                elif choice == "2":
+                    if is_up_to_date:
+                        print("✗ Ungültige Auswahl.")
+                        return False
+                    if not self.extract_and_install_from_zip():
+                        print("❌ Installation fehlgeschlagen")
+                        log_error("diagramm", "Neuinstallation aus ZIP fehlgeschlagen.")
+                        return False
+                elif choice == "3":
+                    self.select_diagram_mode()
+                    self.setup_crontab()
+                    self.ensure_update_check_config()
+                    install_e3dc_service()
+                    self.configure_web_sudoers()
+                    self.save_config()
+                    self.print_summary()
+                    return True
+                # Bei choice == "1" wird nur Konfiguration gemacht (unten)
         
         else:
             # Skript fehlt - erste Installation
             # Direkt fragen, ob aus ZIP installiert werden soll
-            choice = input("\nDiagramm-System aus ZIP-Datei installieren? (j/n): ").strip().lower()
+            choice = 'j' # Standardmäßig 'ja'
+            if not auto_config:
+                choice = input("\nDiagramm-System aus ZIP-Datei installieren? (j/n): ").strip().lower()
             
-            if choice != 'j':
+            if choice != 'j' and not auto_config:
                 print("Installation übersprungen")
                 diagramm_logger.info("Installation aus ZIP übersprungen.")
                 return False

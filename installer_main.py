@@ -315,6 +315,14 @@ def main():
             sys.stdout.flush()
             from Installer.update import update_e3dc
             update_e3dc(headless=True)
+            
+            # Sicherstellen, dass e3dc_paths.json nach Update aktuell ist
+            config = load_config()
+            user = config.get("install_user")
+            if user:
+                logger = logging.getLogger("install")
+                ensure_web_config_safe(user, logger)
+                
             sys.exit(0)
 
         # Direktes Install-All wenn angefordert (Zero-Touch)

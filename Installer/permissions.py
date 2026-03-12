@@ -735,7 +735,7 @@ def check_sudoers_permissions():
     expected_sudoers_files = [
         {
             "file": "/etc/sudoers.d/010_e3dc_web_update",
-            "content": f"www-data ALL=(root) NOPASSWD: /usr/bin/python3 {script_path} --update-e3dc",
+            "content": f"www-data ALL=(root) NOPASSWD: /usr/bin/python3 {script_path} --update-e3dc\nwww-data ALL=(root) NOPASSWD: /usr/bin/python3 {os.path.join(INSTALLER_DIR, 'self_update.py')} *",
             "description": "Web-Update"
         },
         {

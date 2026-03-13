@@ -3,6 +3,7 @@
 ## [3.3.1] - 2026-03-13 - Stabilität von Releases & Diagramm-Updates
 
 ### 🔧 Installer & Release-Prozess
+*   **Fix (Self-Update):** Ein Fehler wurde behoben, bei dem die Dateiberechtigungen nach einem Selbst-Update fälschlicherweise pauschal überschrieben wurden. Dies verhinderte die Ausführung von Skripten und konnte zu Folgefehlern (z.B. bei Sudo-Rechten) führen.
 *   **Fix (Release-Workflow):** Das `release.py`-Skript schließt nun das notwendige Hilfsskript `diagram_helpers.py` korrekt in das `E3DC-Control.zip`-Archiv mit ein.
 *   **Fix (Diagramm-Installation):** Das `diagrammphp.py`-Skript wurde korrigiert und installiert nun alle für die Diagrammerstellung benötigten Python-Skripte (`.py`) aus dem Archiv, statt nur ein einzelnes. Dies behebt einen Fehler, bei dem nach einem Update die Diagramm-Generierung aufgrund fehlender Abhängigkeiten fehlschlug.
 

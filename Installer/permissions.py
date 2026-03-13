@@ -474,11 +474,20 @@ def fix_webportal_permissions(issues):
         else:
             success = False
     if "wp_mode" in issues:
-        print(f"  → Setze Verzeichnis-/Dateirechte rekursiv: {wp_path} -> 775")
-        result = run_command(f"sudo chmod -R 775 {wp_path}")
-        if result['success']:
-            print(f"{GREEN}✓{RESET} {wp_path}: Rechte auf 775 gesetzt")
+        print(f"  → Setze Verzeichnisrechte rekursiv: {wp_path} -> 775")
+        result_dirs = run_command(f"sudo find {wp_path} -type d -exec chmod 775 {{}} +")
+        if result_dirs['success']:
+            print(f"{GREEN}✓{RESET} {wp_path}: Verzeichnisrechte auf 775 gesetzt")
         else:
+            print(f"{RED}✗{RESET} {wp_path}: Fehler beim Setzen der Verzeichnisrechte.")
+            success = False
+
+        print(f"  → Setze Dateirechte rekursiv: {wp_path} -> 664")
+        result_files = run_command(f"sudo find {wp_path} -type f -exec chmod 664 {{}} +")
+        if result_files['success']:
+            print(f"{GREEN}✓{RESET} {wp_path}: Dateirechte auf 664 gesetzt")
+        else:
+            print(f"{RED}✗{RESET} {wp_path}: Fehler beim Setzen der Dateirechte.")
             success = False
     if "tmp_missing" in issues:
         print(f"  → Erstelle tmp-Verzeichnis: {wp_path}/tmp")

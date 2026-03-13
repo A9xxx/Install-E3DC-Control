@@ -47,36 +47,22 @@ jobs:
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Version: $VERSION"
       
+      - name: Generate Release Notes from Changelog
+        id: notes
+        run: |
+          notes=$(python3 pi/release.py --get-notes ${{ steps.version.outputs.version }})
+          echo "body<<EOF" >> $GITHUB_OUTPUT
+          echo "${notes}" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+      
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
           name: Version ${{ steps.version.outputs.version }}
+          body: ${{ steps.notes.outputs.body }}
           draft: false
           prerelease: false
           files: |
             Install-E3DC-Control.zip
-          body: |
-            ## E3DC-Control Installer - Version ${{ steps.version.outputs.version }}
-            
-            ### What's New
-            Siehe [CHANGELOG.md](CHANGELOG.md) für Details.
-            
-            ### Installation
-            1. Lade `Install-E3DC-Control.zip` herunter
-            2. Entpacke die Datei
-            3. Schreibe die neue Versionsnummer in `Install/VERSION`
-            4. Starten Sie den Installer neu
-            
-            Die Auto-Update Funktion wird automatisch erkannt.
-            
-            ### System Requirements
-            - Python 3.7+
-            - sudo-Zugriff
-            - Internetverbindung für Updates
-            
-            ### Changelog
-            ```
-            ${{ github.event.head_commit.message }}
-            ```
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -136,11 +136,6 @@ def uninstall_diagramm():
         if os.path.exists(p):
             os.remove(p)
             print(f"  ✓ {f} gelöscht")
-
-    # Webportal
-    if input("  Soll das gesamte Webverzeichnis (/var/www/html) geleert werden? (j/n): ").strip().lower() == "j":
-        run_command("sudo rm -rf /var/www/html/*", timeout=10)
-        print("  ✓ Webverzeichnis geleert")
     
     uninstall_logger.info("Diagramm-System deinstalliert.")
     log_task_completed("Deinstallation (Diagramm)")
@@ -176,12 +171,50 @@ def uninstall_service():
     uninstall_logger.info("E3DC Service deinstalliert.")
     log_task_completed("Deinstallation (Service)")
 
+
+def uninstall_system_packages():
+    """Entfernt die installierten System-Pakete."""
+    print("\n→ Entferne System-Pakete…")
+    
+    packages = [
+        "curl", "jq", "python3-bs4", "git", "screen",
+        "apache2", "php", "python3-pip", "python3-venv",
+        "python3-plotly", "libjpeg-dev", "zlib1g-dev",
+        "libcurl4-openssl-dev", "libssl-dev",
+        "libmosquitto-dev", "libjsoncpp-dev",
+        "libsqlite3-dev", "build-essential", "cmake"
+    ]
+    
+    print("  → Folgende Pakete werden entfernt:")
+    print("  " + ", ".join(packages))
+    
+    if input("\n  Fortfahren? (j/n): ").strip().lower() != 'j':
+        print("→ Übersprungen.")
+        return
+
+    # Autoremove, um Abhängigkeiten zu bereinigen
+    run_command("sudo apt-get -y autoremove --purge " + " ".join(packages), timeout=300)
+    
+    print("✓ System-Pakete entfernt.")
+    uninstall_logger.info("System-Pakete deinstalliert.")
+    log_task_completed("Deinstallation (System-Pakete)")
+
+
 def uninstall_venv():
     """Entfernt das Python Virtual Environment."""
-    venv_name = load_config().get("venv_name", ".venv_e3dc")
-    print(f"\n→ Entferne Python venv ({venv_name})…")
-    venv_path = os.path.join(INSTALL_PATH, venv_name)
+    config = load_config()
+    venv_name = config.get("venv_name", ".venv_e3dc")
+    install_user = config.get("install_user")
     
+    if not install_user:
+        print("  ✗ Installationsbenutzer nicht gefunden. Überspringe venv-Deinstallation.")
+        return
+
+    home_dir = get_home_dir(install_user)
+    venv_path = os.path.join(home_dir, venv_name)
+
+    print(f"\n→ Entferne Python venv ({venv_path})…")
+
     if os.path.exists(venv_path):
         try:
             shutil.rmtree(venv_path)
@@ -195,39 +228,41 @@ def uninstall_venv():
     
     log_task_completed("Deinstallation (venv)")
 
+
 def uninstall_full():
     """Komplette Deinstallation."""
     print("\n=== Vollständige Deinstallation ===\n")
+    print("ACHTUNG: Dieser Vorgang entfernt ALLE zugehörigen Komponenten,")
+    print("inklusive Webportal, Datenbanken und System-Pakete.")
+    
     if input("Wirklich ALLES entfernen? (j/n): ").strip().lower() != "j":
         return
 
     # Reihenfolge optimiert:
-    # 1. Watchdog weg (damit er nicht dazwischenfunkt)
     uninstall_watchdog()
-    # 2. Service weg (damit E3DC stoppt und RAM-Disk freigibt)
     uninstall_service()
-    # 3. RAM-Disk weg (jetzt sicher unmountbar)
     uninstall_ramdisk()
-    # 4. Webportal weg
+    
+    # Webportal ohne Nachfrage entfernen
+    print("\n→ Entferne Webportal…")
+    run_command("sudo rm -rf /var/www/html/*", timeout=20)
+    print("  ✓ Webverzeichnis geleert")
+    
     uninstall_diagramm()
-    # 5. Venv weg
     uninstall_venv()
     
-    # Config & Binary
-    print("\n→ Programmdateien:")
-    if input("  Konfiguration (e3dc.config.txt) behalten? (j/n): ").strip().lower() == "n":
-        if os.path.exists(INSTALL_PATH):
-            shutil.rmtree(INSTALL_PATH, ignore_errors=True)
-            print("  ✓ Installationsordner gelöscht")
-    else:
-        # Nur Binary löschen
-        bin_path = os.path.join(INSTALL_PATH, "E3DC-Control")
-        if os.path.exists(bin_path):
-            os.remove(bin_path)
-            print("  ✓ Binary gelöscht")
+    # System-Pakete deinstallieren
+    uninstall_system_packages()
+    
+    # Config & Binary ohne Nachfrage entfernen
+    print("\n→ Programmdateien & Konfiguration:")
+    if os.path.exists(INSTALL_PATH):
+        shutil.rmtree(INSTALL_PATH, ignore_errors=True)
+        print("  ✓ Installationsordner gelöscht")
             
     print("\n✓ Deinstallation abgeschlossen.\n")
     log_task_completed("Vollständige Deinstallation")
+
 
 def uninstall_menu():
     """Menü für Deinstallation."""

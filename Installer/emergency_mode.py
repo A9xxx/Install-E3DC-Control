@@ -1,5 +1,6 @@
 import os
 import time
+import shutil
 from .core import register_command
 from .permissions import run_permissions_wizard
 from .service_setup import install_e3dc_service, start_e3dc_control
@@ -10,8 +11,43 @@ from .installer_config import load_config
 
 logger = get_or_create_logger("emergency")
 
+
+def cleanup_pycache(start_path):
+    """
+    Bereinigt alle __pycache__-Ordner in einem gegebenen Pfad.
+    """
+    logger.info(f"Starte __pycache__-Bereinigung in {start_path}")
+    
+    for root, dirs, files in os.walk(start_path):
+        if "__pycache__" in dirs:
+            pycache_path = os.path.join(root, "__pycache__")
+            logger.info(f"Entferne {pycache_path}")
+            try:
+                shutil.rmtree(pycache_path)
+                print(f"✓ Cache in {os.path.basename(root)} entfernt.")
+            except Exception as e:
+                logger.error(f"Fehler beim Entfernen von {pycache_path}: {e}")
+                print(f"⚠ Fehler beim Entfernen des Caches in {os.path.basename(root)}.")
+    
+    logger.info("__pycache__-Bereinigung abgeschlossen.")
+
+
 def run_emergency_mode():
     """Führt alle Reparatur-Maßnahmen nacheinander aus."""
+    # Cache-Bereinigung vor allen Operationen
+    print("\n" + "=" * 60)
+    print("  CACHE-BEREINIGUNG")
+    print("=" * 60 + "\n")
+    
+    # Pfade für die Bereinigung definieren
+    installer_dir = os.path.dirname(os.path.abspath(__file__))
+    install_dir = os.path.dirname(installer_dir)
+    pi_dir = os.path.dirname(install_dir)
+    e3dc_control_dir = os.path.join(pi_dir, "E3DC-Control")
+
+    cleanup_pycache(install_dir)
+    cleanup_pycache(e3dc_control_dir)
+    
     print("\n" + "!" * 60)
     print("!!! NOTFALL-MODUS / SYSTEM-REPARATUR !!!")
     print("!" * 60)

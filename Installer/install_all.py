@@ -1,22 +1,36 @@
 import os
 import subprocess
 import shutil
+import socket
 
 from .core import register_command
-from .permissions import run_permissions_wizard, check_permissions, check_webportal_permissions, check_file_permissions, fix_permissions, fix_webportal_permissions, fix_file_permissions
+from .permissions import run_permissions_wizard
 from .system import install_system_packages, install_e3dc_control
-from .diagrammphp import install_diagramm
+from .diagrammphp import install_diagramm, DiagramInstaller
 from .create_config import create_e3dc_config
 from .strompreis_wizard import strompreis_wizard
 from .service_setup import install_e3dc_service
 from .ramdisk import setup_ramdisk
 from .backup import backup_current_version
-from .utils import run_command
+from .utils import run_command, cleanup_pycache
 from .installer_config import get_install_path, get_user_ids, get_www_data_gid, get_home_dir, load_config, save_config
 from .logging_manager import setup_installation_loggers, print_installation_summary, log_task_completed, log_error, log_warning
 from .task_executor import safe_execute_task
 
 INSTALL_PATH = get_install_path()
+
+
+def get_ip_address():
+    """Holt die lokale IP-Adresse."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # Es ist nicht notwendig, eine echte Verbindung herzustellen
+        s.connect(("8.8.8.8", 80))
+        ip_address = s.getsockname()[0]
+        s.close()
+        return ip_address
+    except Exception:
+        return "<IP nicht gefunden>"
 
 
 def restart_apache():
@@ -35,53 +49,38 @@ def restart_apache():
         return False
 
 
-def finalize_permissions():
-    """Setzt alle Berechtigungen endgültig nach der Installation."""
-    print("\n→ Setze finale Berechtigungen…\n")
-    
-    try:
-        # Verzeichnis-Rechte
-        dir_issues = check_permissions()
-        if dir_issues:
-            fix_permissions(dir_issues)
-        
-        # Webportal-Rechte
-        wp_issues = check_webportal_permissions()
-        if wp_issues:
-            fix_webportal_permissions(wp_issues)
-        
-        # Datei-Rechte (alle auf einmal prüfen und fixen)
-        file_issues = check_file_permissions()
-        if file_issues:
-            fix_file_permissions(file_issues)
-        
-        print("✓ Finale Berechtigungen gesetzt.\n")
-        log_task_completed("Finale Berechtigungsprüfung", details="Alle Berechtigungen validiert")
-        
-    except Exception as e:
-        log_error("install_all", f"Fehler bei finalen Berechtigungen: {e}", e)
-        print(f"✗ Fehler bei Berechtigungen: {e}\n")
-        raise
-
-
 def install_all_main(headless=False):
     """Komplette Installation mit korrekter Reihenfolge."""
+    # Cache-Bereinigung vor allen Operationen
+    print("\n" + "=" * 60)
+    print("  CACHE-BEREINIGUNG")
+    print("=" * 60 + "\n")
+    
+    # Pfade für die Bereinigung definieren
+    # Annahme: Dieses Skript liegt in pi/Install/Installer
+    installer_dir = os.path.dirname(os.path.abspath(__file__))
+    install_dir = os.path.dirname(installer_dir)
+    pi_dir = os.path.dirname(install_dir)
+    e3dc_control_dir = os.path.join(pi_dir, "E3DC-Control")
+
+    cleanup_pycache(install_dir)
+    cleanup_pycache(e3dc_control_dir)
+
     print("\n" + "=" * 60)
     print("  KOMPLETTE E3DC-CONTROL INSTALLATION")
     print("=" * 60 + "\n")
 
     print("Diese Installation führt folgende Schritte in dieser Reihenfolge durch:\n")
-    print("  1. Berechtigungen prüfen & korrigieren (Initial)")
-    print("  2. Systempakete installieren (build-essential, Apache, PHP, etc.)")
-    print("  3. E3DC-Control klonen & kompilieren")
-    print("  4. Webportal & Diagramm-System einrichten")
-    print("  5. E3DC-Konfiguration & Wallbox-Datei erstellen")
-    print("  6. Strompreise konfigurieren (optional)")
-    print("  7. E3DC-Control Service einrichten (Systemd)")
-    print("  8. RAM-Disk & Live-Status-Grabber einrichten")
-    print("  9. Berechtigungen verifizieren & final setzen")
-    print("  10. Backup der Initialversion erstellen")
-    print("  11. Watchdog-Dienst installieren (Silent)\n")
+    print("  1. Systempakete installieren (build-essential, Apache, PHP, etc.)")
+    print("  2. E3DC-Control klonen & kompilieren")
+    print("  3. Webportal & Diagramm-System einrichten")
+    print("  4. E3DC-Konfiguration & Wallbox-Datei erstellen")
+    print("  5. Strompreise konfigurieren (optional)")
+    print("  6. E3DC-Control Service einrichten (Systemd)")
+    print("  7. RAM-Disk & Live-Status-Grabber einrichten")
+    print("  8. Backup der Initialversion erstellen")
+    print("  9. Watchdog-Dienst installieren (Silent)")
+    print("  10. Finale Prüfung & Einrichtung (Berechtigungen, Cronjobs, Services etc.)\n")
 
     # Check auf vorhandene Config im Install-Ordner
     possible_config = os.path.join(get_home_dir(), "Install", "e3dc.config.txt")
@@ -90,7 +89,7 @@ def install_all_main(headless=False):
         print(f"ℹ️  Gefunden: {possible_config}")
         if input("  Soll diese Konfigurationsdatei verwendet werden? (j/n): ").strip().lower() == 'j':
             use_custom_config = True
-            print("  ✓ Wird in Schritt 5 integriert.")
+            print("  ✓ Wird in Schritt 4 integriert.")
 
     # VENV Abfrage
     use_venv = True
@@ -181,69 +180,49 @@ def install_all_main(headless=False):
     failed_steps = []
 
     # =========================================================
-    # SCHRITT 1: Berechtigungen (Initial) - PRÜFE & KORRIGIERE SOFORT
+    # SCHRITT 1: Systempakete
     # =========================================================
     print("\n" + "=" * 60)
-    print("SCHRITT 1 / 11: Berechtigungen prüfen & korrigieren (Initial)")
-    print("=" * 60)
-    print("\n→ Prüfe und korrigiere Berechtigungen…\n")
-    
-    # Verzeichnis-Rechte
-    dir_issues = check_permissions()
-    if dir_issues:
-        print("⚠ Verzeichnis-Berechtigungen werden korrigiert…")
-        fix_permissions(dir_issues)
-    else:
-        print("✓ Verzeichnis-Berechtigungen OK")
-    
-    # Webportal-Rechte
-    wp_issues = check_webportal_permissions()
-    if wp_issues:
-        print("⚠ Webportal-Berechtigungen werden korrigiert…")
-        fix_webportal_permissions(wp_issues)
-    else:
-        print("✓ Webportal-Berechtigungen OK")
-    
-    # Datei-Rechte (nur vorhandene Dateien prüfen)
-    file_issues = check_file_permissions()
-    if file_issues:
-        print("⚠ Datei-Berechtigungen werden korrigiert…")
-        fix_file_permissions(file_issues)
-    else:
-        print("✓ Datei-Berechtigungen OK\n")
-
-    # =========================================================
-    # SCHRITT 2: Systempakete
-    # =========================================================
-    print("\n" + "=" * 60)
-    if not safe_execute_task("SCHRITT 2/11: Systempakete installieren", install_system_packages, use_venv=use_venv):
+    if not safe_execute_task("SCHRITT 1/10: Systempakete installieren", install_system_packages, use_venv=use_venv):
         failed_steps.append("Systempakete")
 
     # =========================================================
-    # SCHRITT 3: E3DC-Control Binary
+    # SCHRITT 2: E3DC-Control Binary
     # =========================================================
     print("\n" + "=" * 60)
-    if not safe_execute_task("SCHRITT 3/11: E3DC-Control klonen & kompilieren", install_e3dc_control, headless=headless):
+    if not safe_execute_task("SCHRITT 2/10: E3DC-Control klonen & kompilieren", install_e3dc_control, headless=headless):
         failed_steps.append("E3DC-Control")
         print("\n✗ Kritischer Fehler: E3DC-Control konnte nicht installiert werden. Installation wird abgebrochen.\n")
         print_installation_summary()
         return
 
     # =========================================================
-    # SCHRITT 4: Diagramm & PHP
+    # SCHRITT 3: Diagramm & PHP
     # =========================================================
     print("\n" + "=" * 60)
     def install_diagramm_and_restart_apache():
-        # Automatische Konfiguration: WP=Ja, Modus=Manuell (für Ramdisk-Support)
+        # IMMER aus ZIP neu installieren, um sicherzustellen, dass die Web-Dateien frisch sind
+        print("→ Erzwinge Neuinstallation des Webportals aus ZIP-Datei...")
+        try:
+            diag_installer = DiagramInstaller()
+            if not diag_installer.extract_and_install_from_zip():
+                log_error("install_all", "Neuinstallation des Webportals aus ZIP ist fehlgeschlagen.")
+            else:
+                log_task_completed("Webportal aus ZIP neu installiert")
+        except Exception as e:
+            log_error("install_all", f"Fehler bei erzwungener ZIP-Extraktion: {e}", e)
+
+        # Automatische Konfiguration danach anwenden
         install_diagramm(auto_config={'enable_heatpump': True, 'diagram_mode': 'manual'})
+        
         if not restart_apache():
             log_warning("install_all", "Apache-Neustart nach Diagramm-Installation fehlgeschlagen.")
 
-    if not safe_execute_task("SCHRITT 4/11: Webportal & Diagramm-System einrichten", install_diagramm_and_restart_apache):
+    if not safe_execute_task("SCHRITT 3/10: Webportal & Diagramm-System einrichten", install_diagramm_and_restart_apache):
         failed_steps.append("Diagramm")
 
     # =========================================================
-    # SCHRITT 5: Konfiguration
+    # SCHRITT 4: Konfiguration
     # =========================================================
     print("\n" + "=" * 60)
     def create_configs_task():
@@ -279,14 +258,14 @@ def install_all_main(headless=False):
                 log_warning("install_all", f"Leere Wallbox-Datei konnte nicht erstellt werden: {e}")
                 print(f"⚠ Wallbox-Datei konnte nicht erstellt werden: {e}\n")
 
-    if not safe_execute_task("SCHRITT 5/11: E3DC-Konfiguration erstellen", create_configs_task):
+    if not safe_execute_task("SCHRITT 4/10: E3DC-Konfiguration erstellen", create_configs_task):
         failed_steps.append("Konfiguration")
 
     # =========================================================
-    # SCHRITT 6: Strompreise (optional)
+    # SCHRITT 5: Strompreise (optional)
     # =========================================================
     print("\n" + "=" * 60)
-    print("SCHRITT 6/11: Strompreise (optional)")
+    print("SCHRITT 5/10: Strompreise (optional)")
     print("=" * 60)
     choice = "n" if headless else input("Strompreise jetzt konfigurieren? (j/n): ").strip().lower()
     if choice == "j" or (headless and False): # Im Headless Modus Strompreise überspringen oder Default? Eher überspringen.
@@ -300,47 +279,55 @@ def install_all_main(headless=False):
         print("→ Übersprungen (kann später hinzugefügt werden).\n")
 
     # =========================================================
-    # SCHRITT 7: Service (Systemd)
+    # SCHRITT 6: Service (Systemd)
     # =========================================================
-    if not safe_execute_task("SCHRITT 7/11: E3DC-Control Service einrichten (Systemd)", install_e3dc_service, headless=headless):
+    if not safe_execute_task("SCHRITT 6/10: E3DC-Control Service einrichten (Systemd)", install_e3dc_service, headless=headless):
         failed_steps.append("Service")
 
     # =========================================================
-    # SCHRITT 8: RAM-Disk & Live-Status
+    # SCHRITT 7: RAM-Disk & Live-Status
     # =========================================================
-    if not safe_execute_task("SCHRITT 8/11: RAM-Disk & Live-Status einrichten", setup_ramdisk):
+    if not safe_execute_task("SCHRITT 7/10: RAM-Disk & Live-Status einrichten", setup_ramdisk):
         failed_steps.append("RAM-Disk")
 
     # =========================================================
-    # SCHRITT 9: FINALE BERECHTIGUNGEN (Sicherheitscheck)
+    # SCHRITT 8: Backup
     # =========================================================
-    print("\n" + "=" * 60)
-    print("SCHRITT 9 / 11: Berechtigungen verifizieren & final setzen")
-    print("=" * 60)
-    print("\n→ Verifiziere alle Berechtigungen nach der Installation…\n")
-    finalize_permissions()
-
-    # =========================================================
-    # SCHRITT 10: Backup
-    # =========================================================
-    if not safe_execute_task("SCHRITT 10/11: Backup der Initialversion erstellen", backup_current_version):
+    if not safe_execute_task("SCHRITT 8/10: Backup der Initialversion erstellen", backup_current_version):
         failed_steps.append("Backup")
 
     # =========================================================
-    # SCHRITT 11: Watchdog (Silent)
+    # SCHRITT 9: Watchdog (Silent)
     # =========================================================
     from .install_watchdog import install_watchdog_silent
-    if not safe_execute_task("SCHRITT 11/11: Watchdog-Dienst installieren", install_watchdog_silent):
+    if not safe_execute_task("SCHRITT 9/10: Watchdog-Dienst installieren", install_watchdog_silent):
         failed_steps.append("Watchdog")
+
+    # =========================================================
+    # SCHRITT 10: FINALE PRÜFUNG & EINRICHTUNG
+    # =========================================================
+    print("\n" + "=" * 60)
+    print("SCHRITT 10/10: Finale Prüfung & Einrichtung (Berechtigungen, Cronjobs, Services etc.)")
+    print("=" * 60)
+    try:
+        print("\n→ Führe umfassende Prüfung und Einrichtung des Systems aus…\n")
+        run_permissions_wizard(headless=True)
+        log_task_completed("Finale Prüfung & Einrichtung", details="run_permissions_wizard(headless=True) ausgeführt.")
+    except Exception as e:
+        log_error("install_all", f"Fehler bei der finalen Prüfung: {e}", e)
+        print(f"✗ Kritischer Fehler bei der finalen Prüfung und Einrichtung: {e}\n")
+        failed_steps.append("Finale Prüfung")
 
     # =========================================================
     # Abschluss + Fehlersammlung
     # =========================================================
     print_installation_summary()
 
+    ip_address = get_ip_address()
+
     print("Nächste Schritte:")
     print("  1. Webportal öffnen:")
-    print("     → http://localhost oder http://<PI-IP>\n")
+    print(f"     → http://localhost oder http://{ip_address}\n")
     print("  2. E3DC-Control starten:")
     print("     → Mit 'screen -r E3DC' überprüfen (läuft bei Reboot automatisch)\n")
     print("  3. Dokumentation:")

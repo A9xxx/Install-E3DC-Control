@@ -101,7 +101,7 @@ Ein zentraler Installer für den Watchdog-Dienst (`piguard`):
 - **`service_setup.py`:** Richtet E3DC-Control als echten Systemd-Service (`e3dc.service`) ein, was den alten Crontab-Autostart ersetzt.
 
 ### Erweiterungsmodule
-- **Webportal (`diagrammphp.py`):** Richtet das PHP-Frontend ein. Prüft beim Start die Version des Webportals und bietet primär Konfigurations-Optionen an, falls dieses aktuell ist, um versehentliche Neuinstallationen zu verhindern.
+- **Webportal (`diagrammphp.py`):** Richtet das PHP-Frontend ein. Dazu extrahiert es die `E3DC-Control.zip` und installiert sowohl die PHP-Dateien für die Weboberfläche als auch die Python-Skripte für die Diagrammerstellung (inkl. aller Abhängigkeiten wie `diagram_helpers.py`). Prüft beim Start die Version des Webportals und bietet primär Konfigurations-Optionen an, falls dieses aktuell ist, um versehentliche Neuinstallationen zu verhindern.
 - **RAM-Disk (`ramdisk.py`):** Konfiguriert den SD-Karten-Schutz und richtet den `e3dc-grabber` Systemd-Service für die Live-Daten ein.
 - **Luxtronik (`install_luxtronik.py`):** Installiert den `energy_manager` für die Wärmepumpen-Steuerung als eigenständigen Systemd-Service.
 - **Lademanagement (`install_lademanagement.py`):** Eine schlankere Installationsroutine für die intelligente Wallbox-Steuerung ohne steuerbare Wärmepumpe.

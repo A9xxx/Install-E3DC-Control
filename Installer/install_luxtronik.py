@@ -4,7 +4,7 @@ import shutil
 import subprocess
 
 from .core import register_command
-from .utils import run_command, pip_install, replace_in_file
+from .utils import run_command, pip_install, replace_in_file, cleanup_pycache
 from .installer_config import get_install_path, get_install_user, get_user_ids, get_www_data_gid, load_config
 from .logging_manager import get_or_create_logger, log_task_completed, log_error
 
@@ -150,6 +150,10 @@ WantedBy=multi-user.target
     print(f"✓ Service {SERVICE_NAME} installiert und gestartet.")
 
 def install_luxtronik_menu():
+    # Cache-Bereinigung
+    print("\n→ Bereinige Luxtronik Cache…")
+    cleanup_pycache(LUX_DIR)
+
     print(f"→ Stoppe Service '{SERVICE_NAME}'…")
     run_command(f"sudo systemctl stop {SERVICE_NAME}")
 

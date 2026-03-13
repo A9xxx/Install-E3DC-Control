@@ -213,6 +213,17 @@ def main():
             logger.error(f"Fehler bei Luxtronik-Initialisierung: {e}")
             wp = None
 
+    # Prüfen, ob der Neustart durch ein Update ausgelöst wurde, um eine Endlosschleife zu verhindern.
+    restarted_by_update = False
+    update_flag_path = "/tmp/em_restarted_by_update.flag"
+    if os.path.exists(update_flag_path):
+        try:
+            restarted_by_update = True
+            os.remove(update_flag_path)
+            logger.info("Neustart durch Update erkannt. Erster Auto-Update-Check wird übersprungen.")
+        except Exception as e:
+            logger.warning(f"Konnte Update-Flag nicht entfernen: {e}")
+
     # Initialwerte lesen
     GRID_START_LIMIT = read_e3dc_config_value('GRID_START_LIMIT', -3500)
     MIN_SOC = read_e3dc_config_value('MIN_SOC', 80)
@@ -252,7 +263,8 @@ def main():
     STOP_DELAY_MINUTES = read_e3dc_config_value('stop_delay_minutes', 10)
     MANUAL_BOOST_MAX_DURATION = read_e3dc_config_value('manual_boost_max_duration', 180)
     
-    update_checked_today = False
+    # Wenn durch Update neugestartet, den ersten Check überspringen.
+    update_checked_today = restarted_by_update
 
     boost_active = False
     price_boost_active = False

@@ -41,6 +41,7 @@ from .permissions_helper import (
     set_executable_script
 )
 from .service_setup import install_e3dc_service
+from .utils import get_web_version, get_installer_bundle_version
 
 # Logger
 diagramm_logger = get_or_create_logger("diagramm")
@@ -255,71 +256,68 @@ class DiagramInstaller:
                 diagramm_logger.info(f"ZIP extrahiert nach: {temp_dir}")
                 print(f"✓ ZIP extrahiert nach: {temp_dir}")
                 
-                # 1) plot_soc_changes.py nach /home/<install_user>/E3DC-Control/ kopieren
-                print("\n→ Installiere Diagramm-Skript (plot_soc_changes.py)...")
-                source_script = os.path.join(temp_dir, PLOT_SCRIPT_NAME)
-                
-                if not os.path.isfile(source_script):
-                    print(f"❌ {PLOT_SCRIPT_NAME} nicht in ZIP gefunden!")
-                    log_error("diagramm", f"{PLOT_SCRIPT_NAME} nicht in ZIP gefunden.")
-                    return False
-                
+                # 1) Python-Skripte für Diagramme nach /home/<install_user>/E3DC-Control/ kopieren
+                print("\n→ Installiere Diagramm-Skripte (plot_soc_changes.py, diagram_helpers.py, etc.)...")
                 os.makedirs(self.install_path, exist_ok=True)
-                shutil.copy2(source_script, self.plot_script_path)
-
-                # Sicherstellen: kein UTF-8 BOM (sonst bricht die Shebang unter Linux)
-                try:
-                    with open(self.plot_script_path, "rb") as f:
-                        content = f.read()
-                    bom = b"\xef\xbb\xbf"
-                    if content.startswith(bom):
-                        with open(self.plot_script_path, "wb") as f:
-                            f.write(content[len(bom):])
-                        print("✓ BOM aus plot_soc_changes.py entfernt")
-                        diagramm_logger.info("BOM aus plot_soc_changes.py entfernt.")
-                except Exception as e:
-                    log_warning("diagramm", f"Konnte BOM nicht prüfen/entfernen: {e}")
-                    print(f"⚠️  Konnte BOM nicht prüfen/entfernen: {e}")
                 
-                # Setze Berechtigungen für das Skript (install_user:www-data, 775)
-                try:
-                    subprocess.run(
-                        ["sudo", "chown", f"{self.install_user}:www-data", self.plot_script_path],
-                        check=True,
-                        capture_output=True
-                    )
-                    subprocess.run(
-                        ["sudo", "chmod", "775", self.plot_script_path],
-                        check=True,
-                        capture_output=True
-                    )
-                except subprocess.CalledProcessError as e:
-                    log_warning("diagramm", f"Konnte Besitzer/Rechte für Skript nicht setzen: {e}")
-                    print(f"⚠️  Konnte Besitzer/Rechte für Skript nicht setzen: {e}")
-                print(f"✓ {PLOT_SCRIPT_NAME} → {self.plot_script_path}")
+                # Alle .py Dateien aus dem ZIP-Root (temp_dir) kopieren
+                py_files_copied = 0
+                items_in_zip_root = os.listdir(temp_dir)
+                diagramm_logger.info(f"Dateien im ZIP-Root zur Prüfung: {items_in_zip_root}")
 
-                # 1b) plot_live_history.py (Live-48h-Diagramm) – aus ZIP oder aus Diagramm-Ordner
+                for item in items_in_zip_root:
+                    if item.endswith(".py"):
+                        source_file = os.path.join(temp_dir, item)
+                        dest_file = os.path.join(self.install_path, item)
+                        
+                        try:
+                            shutil.copy2(source_file, dest_file)
+                            
+                            # BOM entfernen (wichtig für Linux shebang)
+                            with open(dest_file, "rb") as f:
+                                content = f.read()
+                            bom = b"\xef\xbb\xbf"
+                            if content.startswith(bom):
+                                with open(dest_file, "wb") as f:
+                                    f.write(content[len(bom):])
+                            
+                            # Rechte setzen
+                            subprocess.run(
+                                ["sudo", "chown", f"{self.install_user}:www-data", dest_file],
+                                check=True, capture_output=True, text=True)
+                            subprocess.run(
+                                ["sudo", "chmod", "775", dest_file],
+                                check=True, capture_output=True, text=True)
+                            
+                            print(f"✓ {item} → {self.install_path}")
+                            diagramm_logger.info(f"Skript kopiert und Rechte gesetzt: {item}")
+                            py_files_copied += 1
+                        
+                        except Exception as e:
+                            log_warning("diagramm", f"Fehler beim Kopieren/Bearbeiten von {item}: {e}")
+                            print(f"⚠️  Fehler bei {item}: {e}")
+
+                if py_files_copied == 0:
+                    # Prüfe, ob die PY-Dateien evtl. in einem Unterverzeichnis sind
+                    # z.B. wenn das ZIP einen Hauptordner hat
+                    subdirs = [d for d in items_in_zip_root if os.path.isdir(os.path.join(temp_dir, d))]
+                    if subdirs:
+                         log_warning("diagramm", f"Keine .py-Dateien im ZIP-Root gefunden. Durchsuche Unterordner: {subdirs}")
+
+                    print(f"❌ Warnung: Keine Python-Skripte (.py) im Hauptverzeichnis des ZIP-Archivs gefunden!")
+                    # Kein `return False`, da das Web-Update trotzdem funktionieren könnte.
+                
+                # 1b) plot_live_history.py (Legacy-Pfad-Check)
                 live_history_dest = os.path.join(self.install_path, PLOT_LIVE_HISTORY_NAME)
                 source_live = os.path.join(temp_dir, PLOT_LIVE_HISTORY_NAME)
                 if not os.path.isfile(source_live):
+                     # Fallback falls es im alten Pfad liegt
                     diagramm_dir = os.path.join(os.path.dirname(zip_path), '..', '..', 'Diagramm')
-                    source_live = os.path.join(diagramm_dir, PLOT_LIVE_HISTORY_NAME)
-                if os.path.isfile(source_live):
-                    shutil.copy2(source_live, live_history_dest)
-                    try:
-                        with open(live_history_dest, "rb") as f:
-                            c = f.read()
-                        if c.startswith(b"\xef\xbb\xbf"):
-                            with open(live_history_dest, "wb") as f:
-                                f.write(c[3:])
-                    except Exception:
-                        pass
-                    try:
-                        subprocess.run(["sudo", "chown", f"{self.install_user}:www-data", live_history_dest], check=True, capture_output=True)
-                        subprocess.run(["sudo", "chmod", "775", live_history_dest], check=True, capture_output=True)
-                    except subprocess.CalledProcessError:
-                        pass
-                    print(f"✓ {PLOT_LIVE_HISTORY_NAME} → {live_history_dest}")
+                    source_live_fallback = os.path.join(diagramm_dir, PLOT_LIVE_HISTORY_NAME)
+                    if os.path.isfile(source_live_fallback):
+                         shutil.copy2(source_live_fallback, live_history_dest)
+                         print(f"✓ {PLOT_LIVE_HISTORY_NAME} (aus Fallback-Pfad) → {live_history_dest}")
+
                 
                 # 2) Web-Portal Dateien rekursiv nach /var/www/html/ kopieren
                 print("\n→ Installiere Web-Portal-Dateien (PHP, CSS, JS, Icons)...")
@@ -450,8 +448,8 @@ class DiagramInstaller:
                 "path": "/etc/sudoers.d/010_e3dc_web_update",
                 "lines": [
                     f"www-data ALL=(root) NOPASSWD: /usr/bin/python3 {installer_script} --update-e3dc",
-                    f"www-data ALL=(root) NOPASSWD: /usr/bin/python3 {os.path.join(INSTALL_DIR, 'Installer', 'self_update.py')} *",
-                    f"{self.install_user} ALL=(root) NOPASSWD: /usr/bin/python3 {os.path.join(INSTALL_DIR, 'Installer', 'self_update.py')} *"
+                    f"www-data ALL=(root) NOPASSWD: /usr/bin/python3 {os.path.join(current_installer_dir, 'Installer', 'self_update.py')} *",
+                    f"{self.install_user} ALL=(root) NOPASSWD: /usr/bin/python3 {os.path.join(current_installer_dir, 'Installer', 'self_update.py')} *"
                 ],
                 "desc": "Installer Self-Update & Auto-Update"
             }
@@ -853,8 +851,7 @@ class DiagramInstaller:
                 # Frage: Neu-Installation oder nur Konfiguration
                 print("\nWas möchtest du tun?")
                 print("1 = Nur Konfiguration ändern (Dateien bleiben)")
-                if not is_up_to_date:
-                    print("2 = Komplett neu installieren (aus ZIP)")
+                print("2 = Komplett neu installieren (aus ZIP)")
                 print("3 = Crontab & Service aktualisieren")
                 print("q = Abbrechen")
                 choice = input("Auswahl: ").strip()
@@ -864,9 +861,6 @@ class DiagramInstaller:
                     diagramm_logger.info("Installation vom Benutzer abgebrochen.")
                     return False
                 elif choice == "2":
-                    if is_up_to_date:
-                        print("✗ Ungültige Auswahl.")
-                        return False
                     if not self.extract_and_install_from_zip():
                         print("❌ Installation fehlgeschlagen")
                         log_error("diagramm", "Neuinstallation aus ZIP fehlgeschlagen.")

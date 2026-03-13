@@ -6,7 +6,7 @@ import time
 
 from .core import register_command
 from .backup import backup_current_version
-from .utils import replace_in_file, run_command
+from .utils import replace_in_file, run_command, cleanup_pycache
 from .installer_config import get_install_path, get_install_user, load_config
 from .logging_manager import get_or_create_logger, log_task_completed, log_error, log_warning
 
@@ -86,6 +86,13 @@ def send_telegram_notification(message):
 
 def update_e3dc(headless=False):
     """Führt Update durch."""
+    # Cache-Bereinigung vor allen Operationen
+    print("\n" + "=" * 60)
+    print("  CACHE-BEREINIGUNG")
+    print("=" * 60 + "\n")
+    
+    cleanup_pycache(INSTALL_PATH)
+    
     # Automatische Erkennung: Wenn kein TTY (z.B. Web-Interface), dann Headless & Line-Buffering erzwingen
     if not sys.stdout.isatty():
         headless = True

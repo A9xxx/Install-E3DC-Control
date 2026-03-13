@@ -25,7 +25,7 @@ import time
 import argparse
 
 from .core import register_command
-from .utils import run_command, replace_in_file
+from .utils import run_command, replace_in_file, cleanup_pycache
 from .installer_config import get_install_user
 from .logging_manager import get_or_create_logger, log_task_completed, log_error, log_warning
 
@@ -275,6 +275,14 @@ def execute_update_policy(policy_path):
         for srv in services_to_restart:
             if os.path.exists(f"/etc/systemd/system/{srv}.service") or os.path.exists(f"/lib/systemd/system/{srv}.service"):
                 print(f"  → Starte Service neu: {srv}")
+                # Flag erstellen, um Endlosschleife beim Auto-Update zu verhindern
+                if srv == "energy_manager":
+                    try:
+                        flag_path = "/tmp/em_restarted_by_update.flag"
+                        with open(flag_path, "w") as f: f.write(str(time.time()))
+                        os.chmod(flag_path, 0o666)
+                    except Exception as e:
+                        print(f"  ⚠ Konnte Restart-Flag nicht erstellen: {e}")
                 subprocess.run(["systemctl", "restart", srv], check=False)
                 
     except Exception as pe:
@@ -430,6 +438,12 @@ def extract_release(zip_path, new_version, silent=False):
             # Fallback Neustart, wenn keine Policy da war
             if not os.path.exists(policy_file):
                 if os.path.exists("/etc/systemd/system/energy_manager.service"):
+                    # Flag erstellen, um Endlosschleife zu verhindern
+                    try:
+                        flag_path = "/tmp/em_restarted_by_update.flag"
+                        with open(flag_path, "w") as f: f.write(str(time.time()))
+                        os.chmod(flag_path, 0o666)
+                    except: pass
                     subprocess.run(["systemctl", "restart", "energy_manager"], check=False)
 
             print("✓ Update erfolgreich installiert")
@@ -483,6 +497,11 @@ def extract_release(zip_path, new_version, silent=False):
                 subprocess.run(["chmod", "+x", os.path.join(INSTALLER_DIR, "self_update.py")], check=False)
             except Exception as e:
                 print(f"⚠ Konnte Rechte nicht setzen: {e}")
+            
+            # Pycache-Bereinigung nach dem Update
+            print("→ Bereinige Python-Cache…")
+            cleanup_pycache(INSTALLER_DIR)
+
             # Entferne alte Sicherung
             if os.path.exists(backup_dir):
                 shutil.rmtree(backup_dir, ignore_errors=True)
@@ -529,6 +548,8 @@ def git_update(silent=False):
         
         # 1. Fetch
         res = git_exec("git fetch")
+        if silent and res['success']:
+            print("Git fetch erfolgreich.")
         if not res['success']:
             if not silent: print(f"✗ Fehler beim Git Fetch: {res['stderr']}")
             return False
@@ -538,6 +559,7 @@ def git_update(silent=False):
         res = git_exec("git rev-list --count HEAD..@{u}")
         if res['success'] and res['stdout'].strip().isdigit() and int(res['stdout'].strip()) > 0:
             if not silent: print("→ Neue Version verfügbar. Aktualisiere...")
+            else: print(f"→ {res['stdout'].strip()} neue Commits via Git verfügbar. Aktualisiere...")
             
             # 3. Pull
             res = git_exec("git pull")
@@ -553,6 +575,8 @@ def git_update(silent=False):
             else:
                 if not silent: print(f"✗ Fehler beim Git Pull: {res['stderr']}")
                 return False
+        elif silent and res['success']:
+            print("Git: Keine neuen Commits.")
     except Exception as e:
         update_logger.error(f"Git Update Exception: {e}", e)
     return False
@@ -587,6 +611,8 @@ def check_and_update(silent=False, check_only=False):
         True wenn Update durchgeführt wurde, False sonst
     """
     installed_version = get_installed_version()
+    if silent:
+        print(f"Starte Update-Prüfung... (Installiert: {installed_version})")
     
     # 0. Versuch: Git Update (wenn .git existiert)
     # Das ist die bevorzugte Methode, ähnlich wie bei Eba-M
@@ -634,6 +660,7 @@ def check_and_update(silent=False, check_only=False):
             if latest_version == installed_version:
                 return False
         else:
+            print(f"✓ System ist aktuell (v{installed_version}).")
             return False
 
     if check_only:

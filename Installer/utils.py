@@ -2,6 +2,8 @@ import os
 import subprocess
 import logging
 import shutil
+import zipfile
+
 
 _logging_initialized = False
 
@@ -137,3 +139,59 @@ def ensure_dir(path):
 def command_exists(cmd):
     """Prüft, ob ein Befehl im System verfügbar ist."""
     return shutil.which(cmd) is not None
+
+def get_web_version():
+    """Liest die Version aus /var/www/html/VERSION."""
+    path = "/var/www/html/VERSION"
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                return f.read().strip()
+        except Exception:
+            return "0.0.0"
+    return "0.0.0"
+
+def get_installer_bundle_version():
+    """Liest die Version aus der E3DC-Control.zip (html/VERSION)."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    zip_path = os.path.join(script_dir, "E3DC-Control.zip")
+    
+    if not os.path.exists(zip_path):
+        return "0.0.0"
+        
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zf:
+            # Pfad im ZIP kann variieren (mit/ohne Root-Ordner), daher flexibel suchen
+            version_file_path = None
+            for name in zf.namelist():
+                if name.endswith('html/VERSION'):
+                    version_file_path = name
+                    break
+            
+            if version_file_path:
+                with zf.open(version_file_path) as f:
+                    return f.read().decode('utf-8').strip()
+    except Exception:
+        return "0.0.0"
+    return "0.0.0"
+
+
+def cleanup_pycache(start_path):
+    """
+    Bereinigt alle __pycache__-Ordner in einem gegebenen Pfad.
+    """
+    setup_logging()
+    logging.info(f"Starte __pycache__-Bereinigung in {start_path}")
+    
+    for root, dirs, files in os.walk(start_path):
+        if "__pycache__" in dirs:
+            pycache_path = os.path.join(root, "__pycache__")
+            logging.info(f"Entferne {pycache_path}")
+            try:
+                shutil.rmtree(pycache_path)
+                print(f"✓ Cache in {os.path.basename(root)} entfernt.")
+            except Exception as e:
+                logging.error(f"Fehler beim Entfernen von {pycache_path}: {e}")
+                print(f"⚠ Fehler beim Entfernen des Caches in {os.path.basename(root)}.")
+    
+    logging.info("__pycache__-Bereinigung abgeschlossen.")

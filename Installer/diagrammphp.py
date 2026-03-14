@@ -58,7 +58,7 @@ PLOT_LIVE_HISTORY_NAME = "plot_live_history.py"
 ZIP_NAME = "E3DC-Control.zip"
 OLD_MODULE_DIRS = ["config", "parsing", "plotting"]
 OBSOLETE_WEB_FILES = [
-    "auto.php", "check.php", "config.php", "test.php", "mobile_history.php", "mobile_archiv.php",
+    "index.html", "auto.php", "check.php", "config.php", "test.php", "mobile_history.php", "mobile_archiv.php",
     "start_content.php", "live_content.php", "run_history.php", "save_setting.php", "status.php",
     "run_now.php", "run_live_history.php", "run_update.php", "archiv_diagramm.php"
 ]
@@ -815,7 +815,7 @@ class DiagramInstaller:
     # Main Installation
     # ============================================================
     
-    def run_installation(self, auto_config=None):
+    def run_installation(self, auto_config=None, force_extract=False):
         """Führt komplette Installation durch"""
         self.print_header()
         
@@ -828,7 +828,17 @@ class DiagramInstaller:
         # 1) Skript-Status prüfen
         script_exists = self.check_script_installed()
         
-        if script_exists:
+        if force_extract:
+            print("\n→ Erzwinge Neuinstallation des Webportals aus ZIP-Datei...")
+            diagramm_logger.info("Erzwinge Neuinstallation aus ZIP.")
+            if not self.extract_and_install_from_zip():
+                print("❌ Installation fehlgeschlagen")
+                log_error("diagramm", "Neuinstallation aus ZIP fehlgeschlagen.")
+                return False
+            # Da wir gerade extrahiert haben, ist das Skript jetzt vorhanden
+            script_exists = True
+            
+        elif script_exists:
             print(f"\n✓ {PLOT_SCRIPT_NAME} ist bereits installiert")
             print(f"  Pfad: {self.plot_script_path}")
 
@@ -997,13 +1007,13 @@ class DiagramInstaller:
 # INTEGRATIONS-FUNKTIONEN
 # ============================================================
 
-def install_diagramm(auto_config=None):
+def install_diagramm(auto_config=None, force_extract=False):
     """
     Wrapper-Funktion für die Integration in install_all.py
     Installiert und konfiguriert das Diagramm-System
     """
     installer = DiagramInstaller()
-    installer.run_installation(auto_config=auto_config)
+    installer.run_installation(auto_config=auto_config, force_extract=force_extract)
 
 
 # ============================================================

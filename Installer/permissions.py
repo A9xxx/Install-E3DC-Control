@@ -579,6 +579,10 @@ def cleanup_root_owned_files():
                 correct_owner = f"{INSTALL_USER}:{INSTALL_USER}"
 
             for root, dirs, files in os.walk(base_dir):
+                # OPTIMIERUNG: Überspringe riesige versteckte Verzeichnisse (.git, .venv),
+                # um die SD-Karten-Last und Laufzeit (z.B. nach Updates) massiv zu reduzieren!
+                dirs[:] = [d for d in dirs if not d.startswith('.git') and not d.startswith('.venv')]
+                
                 # Prüfe Ordner
                 for d in dirs:
                     dir_path = os.path.join(root, d)

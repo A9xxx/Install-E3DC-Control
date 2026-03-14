@@ -1,5 +1,25 @@
 # Changelog
 
+## [3.3.2] - 2026-03-14 - Tagesstatistik & Autarkie-Optimierung
+
+### 📊 Statistik & Energieverteilung
+*   **Neue Tagesstatistik:** Detaillierte Aufschlüsselung der täglichen Energieverteilung (in kWh und %) für Sonnenenergie (PV) und Netzbezug, aufgeteilt auf Haus, Batterie, Wallbox und Wärmepumpe.
+*   **Gesamtwerte:** Übersichtliche Anzeige des kumulierten Tagesertrags (PV) und Gesamt-Netzbezugs direkt im Kopfbereich der Statistik.
+*   **Historien-Auswahl:** Über ein Dropdown-Menü in der Statistik-Ansicht können nun bequem die Daten der vergangenen Tage abgerufen werden.
+
+### 🖥️ Dashboard & UI
+*   **Autarkie & Eigenverbrauch:** Anzeige der momentanen und ganztägigen Autarkie sowie des Eigenverbrauchs direkt auf der Haus-Kachel (Desktop) bzw. in einer neuen Statistik-Bar (Mobile).
+*   **Optik:** Vergrößerte Darstellung der Autarkie- und Eigenverbrauchswerte für bessere Lesbarkeit. Ein Klick darauf öffnet das neue Statistik-Overlay über dem Diagrammbereich.
+*   **UX-Optimierung:** Das Statistik-Overlay schließt sich nun automatisch im Hintergrund, wenn über die Kacheln ein neues Detail-Diagramm aufgerufen wird.
+*   **Flüssigere Diagramme:** Liniendiagramme werden nun sanft eingeblendet und laden durch ein auf 400ms reduziertes Abfrage-Intervall sowie DNS-Prefetching nahezu in Echtzeit.
+
+### ⚙️ System & Logik
+*   **Autarkie-Glättung:** Die Live-Berechnung der Autarkie im Frontend unterdrückt nun kleine Regelabweichungen des Wechselrichters (<30W) und schnappt bei Werten ab 97% stabil auf 100% ein, um eine unruhige Anzeige zu vermeiden.
+*   **Backend-Performance:** Die aufwendige Berechnung der tagesgenauen Energiemengen (kWh-Verteilung) wurde in das Backend verlagert und wird ressourcenschonend zwischengespeichert (`daily_stats.json`).
+*   **Massives RAM-Disk Caching:** Zentrale Konfiguration (`e3dc.config.txt`), dynamische Strompreise (`awattardebug.txt`) und Prognosedaten werden nun intelligent im Arbeitsspeicher gecacht. Dies entlastet SD-Karte und CPU drastisch.
+*   **Installer-Boost:** Die rekursive Rechteprüfung (`permissions.py`) überspringt nun versteckte System-Verzeichnisse (`.venv`, `.git`), was die Laufzeit des Installers und von Auto-Updates extrem beschleunigt.
+*   **Cleanup:** Altlasten (wie z.B. 5 veraltete PHP-Skripte und die alte `config.lux.json`) wurden restlos aus dem System entfernt, um das Projekt sauber zu halten.
+
 ## [3.3.1] - 2026-03-13 - Stabilität von Releases & Diagramm-Updates
 
 ### 🔧 Installer & Release-Prozess

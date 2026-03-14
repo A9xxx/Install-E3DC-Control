@@ -201,19 +201,8 @@ def install_all_main(headless=False):
     # =========================================================
     print("\n" + "=" * 60)
     def install_diagramm_and_restart_apache():
-        # IMMER aus ZIP neu installieren, um sicherzustellen, dass die Web-Dateien frisch sind
-        print("→ Erzwinge Neuinstallation des Webportals aus ZIP-Datei...")
-        try:
-            diag_installer = DiagramInstaller()
-            if not diag_installer.extract_and_install_from_zip():
-                log_error("install_all", "Neuinstallation des Webportals aus ZIP ist fehlgeschlagen.")
-            else:
-                log_task_completed("Webportal aus ZIP neu installiert")
-        except Exception as e:
-            log_error("install_all", f"Fehler bei erzwungener ZIP-Extraktion: {e}", e)
-
-        # Automatische Konfiguration danach anwenden
-        install_diagramm(auto_config={'enable_heatpump': True, 'diagram_mode': 'manual'})
+        # Automatische Konfiguration anwenden (inklusive erzwungener ZIP-Extraktion im korrekten Ablauf)
+        install_diagramm(auto_config={'enable_heatpump': True, 'diagram_mode': 'manual'}, force_extract=True)
         
         if not restart_apache():
             log_warning("install_all", "Apache-Neustart nach Diagramm-Installation fehlgeschlagen.")

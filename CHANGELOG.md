@@ -1,5 +1,13 @@
 # Changelog
 
+## [3.3.3] - 2026-03-14 - Service Management & Hotfixes
+
+### ⚙️ System & Dienste
+*   **Dynamische Konfiguration:** Der Energy Manager lädt nun alle Lademanagement-Parameter (z.B. Preis-Limits, Boost-Einstellungen) dynamisch zur Laufzeit aus dem Cache nach, ohne dass ein Dienst-Neustart erforderlich ist.
+*   **Service-Neustart:** Der interaktive Config-Wizard bietet nun nach Änderungen komfortabel den direkten Neustart aller relevanten Hintergrunddienste an.
+*   **Ganzheitlicher Start:** Die Start-Funktion des Installers (`service_setup.py`) fährt nun neben dem Hauptprogramm automatisch auch alle aktivierten Zusatzdienste (`energy_manager`, `e3dc-grabber`) hoch.
+*   **Backup & Rollback:** Das Backup- und Rollback-System wurde erweitert und berücksichtigt nun auch die neuen Systemd-Dienste (`energy_manager`, `e3dc-grabber`). Diese werden bei Wiederherstellungen sicher gestoppt und mitgesichert, um Datenkorruption zu vermeiden.
+
 ## [3.3.2] - 2026-03-14 - Tagesstatistik & Autarkie-Optimierung
 
 ### 📊 Statistik & Energieverteilung

@@ -547,6 +547,10 @@ def git_update(silent=False):
             if not silent: print("→ Neue Version verfügbar. Aktualisiere...")
             else: print(f"→ {res['stdout'].strip()} neue Commits via Git verfügbar. Aktualisiere...")
             
+            # Lokale Änderungen an überwachten Dateien (z.B. durch fix_bom.py) 
+            # verwerfen, damit der Git Pull ohne Merge-Konflikt durchläuft.
+            git_exec("git reset --hard HEAD")
+            
             # 3. Pull
             res = git_exec("git pull")
             if res['success']:

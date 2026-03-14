@@ -224,44 +224,9 @@ def main():
         except Exception as e:
             logger.warning(f"Konnte Update-Flag nicht entfernen: {e}")
 
-    # Initialwerte lesen
-    GRID_START_LIMIT = read_e3dc_config_value('GRID_START_LIMIT', -3500)
-    MIN_SOC = read_e3dc_config_value('MIN_SOC', 80)
-    AT_LIMIT = read_e3dc_config_value('AT_LIMIT', 10.0)
-    AUTO_MODE = read_e3dc_config_value('auto_mode', 1)
-    
-    PRICE_BOOST_ENABLE = read_e3dc_config_value('price_boost_enable', 0)
-    PRICE_LIMIT = read_e3dc_config_value('price_limit', 20.0)
-    PRICE_MIN_DURATION = read_e3dc_config_value('price_min_duration', 60)
-    PRICE_MAX_DAILY = read_e3dc_config_value('price_max_daily', 180)
-    PRICE_HARD_LIMIT = read_e3dc_config_value('price_hard_limit', -99.0)
-    WQ_MIN_TEMP = read_e3dc_config_value('wq_min_temp', 1.0)
-    RL_SOURCE = read_e3dc_config_value('rl_source', 'internal')
-    MANUAL_BOOST_MIN_SOC = read_e3dc_config_value('manual_boost_min_soc', 25)
-
-    MB_ENABLE = read_e3dc_config_value('morning_boost_enable', 0)
-    MB_PRIO = read_e3dc_config_value('morning_boost_prio', 'wallbox')
-    MB_WB_POWER = read_e3dc_config_value('morning_boost_wb_power', 7.0)
-    MB_MIN_HOURS = read_e3dc_config_value('morning_boost_min_hours', 3)
-    MB_MIN_PV_PCT = read_e3dc_config_value('morning_boost_min_pv_pct', 50.0)
-    MB_TARGET_SOC = read_e3dc_config_value('morning_boost_target_soc', 20)
-    try: MB_DEADLINE = int(read_e3dc_config_value('morning_boost_deadline', 8))
-    except: MB_DEADLINE = 8
-
-    SI_ENABLE = read_e3dc_config_value('super_intelligence_enable', 0)
-    try: SI_DEADLINE = int(read_e3dc_config_value('super_intelligence_deadline', 8))
-    except: SI_DEADLINE = 8
-
-    TELEGRAM_TOKEN = read_e3dc_config_value('telegram_token', '')
-    TELEGRAM_CHAT_ID = read_e3dc_config_value('telegram_chat_id', '')
-
-    PV_PAUSE_ENABLE = read_e3dc_config_value('pv_pause_enable', 0)
-    PV_PAUSE_SOC = read_e3dc_config_value('pv_pause_soc', 80)
-    PV_PAUSE_WATT = read_e3dc_config_value('pv_pause_watt', 3000.0)
-    PV_PAUSE_TIMEOUT_MINUTES = read_e3dc_config_value('pv_pause_timeout_minutes', 120)
-    
-    STOP_DELAY_MINUTES = read_e3dc_config_value('stop_delay_minutes', 10)
-    MANUAL_BOOST_MAX_DURATION = read_e3dc_config_value('manual_boost_max_duration', 180)
+    # Vorab-Deklaration für send_telegram (Closure Scope)
+    TELEGRAM_TOKEN = ''
+    TELEGRAM_CHAT_ID = ''
     
     # Wenn durch Update neugestartet, den ersten Check überspringen.
     update_checked_today = restarted_by_update
@@ -383,6 +348,37 @@ def main():
         CONF_WWS = get_cfg_value(current_config, 'WWS', 50.0)
         CONF_WWW = get_cfg_value(current_config, 'WWW', 48.0)
         CONF_HZ  = get_cfg_value(current_config, 'HZ', 32.0)
+
+        PRICE_BOOST_ENABLE = get_cfg_value(current_config, 'price_boost_enable', 0)
+        PRICE_LIMIT = get_cfg_value(current_config, 'price_limit', 20.0)
+        PRICE_MIN_DURATION = get_cfg_value(current_config, 'price_min_duration', 60)
+        PRICE_MAX_DAILY = get_cfg_value(current_config, 'price_max_daily', 180)
+        PRICE_HARD_LIMIT = get_cfg_value(current_config, 'price_hard_limit', -99.0)
+        WQ_MIN_TEMP = get_cfg_value(current_config, 'wq_min_temp', 1.0)
+        RL_SOURCE = str(get_cfg_value(current_config, 'rl_source', 'internal'))
+        MANUAL_BOOST_MIN_SOC = get_cfg_value(current_config, 'manual_boost_min_soc', 25)
+        MANUAL_BOOST_MAX_DURATION = get_cfg_value(current_config, 'manual_boost_max_duration', 180)
+
+        MB_ENABLE = get_cfg_value(current_config, 'morning_boost_enable', 0)
+        MB_PRIO = str(get_cfg_value(current_config, 'morning_boost_prio', 'wallbox'))
+        MB_WB_POWER = get_cfg_value(current_config, 'morning_boost_wb_power', 7.0)
+        MB_MIN_HOURS = get_cfg_value(current_config, 'morning_boost_min_hours', 3)
+        MB_MIN_PV_PCT = get_cfg_value(current_config, 'morning_boost_min_pv_pct', 50.0)
+        MB_TARGET_SOC = get_cfg_value(current_config, 'morning_boost_target_soc', 20)
+        try: MB_DEADLINE = int(get_cfg_value(current_config, 'morning_boost_deadline', 8))
+        except: MB_DEADLINE = 8
+
+        SI_ENABLE = get_cfg_value(current_config, 'super_intelligence_enable', 0)
+        try: SI_DEADLINE = int(get_cfg_value(current_config, 'super_intelligence_deadline', 8))
+        except: SI_DEADLINE = 8
+
+        TELEGRAM_TOKEN = str(get_cfg_value(current_config, 'telegram_token', ''))
+        TELEGRAM_CHAT_ID = str(get_cfg_value(current_config, 'telegram_chat_id', ''))
+
+        PV_PAUSE_ENABLE = get_cfg_value(current_config, 'pv_pause_enable', 0)
+        PV_PAUSE_SOC = get_cfg_value(current_config, 'pv_pause_soc', 80)
+        PV_PAUSE_WATT = get_cfg_value(current_config, 'pv_pause_watt', 3000.0)
+        PV_PAUSE_TIMEOUT_MINUTES = get_cfg_value(current_config, 'pv_pause_timeout_minutes', 120)
         
         # Auto-Update Check
         if AUTO_UPDATE_ENABLE == 1:

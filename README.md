@@ -1,64 +1,46 @@
-# ⚡ E3DC-Control Installer & Web-Interface
+# E3DC-Control Web-Portal & Installer
 
-**Intelligente Steuerung und Visualisierung für E3DC Hauskraftwerke auf dem Raspberry Pi.**
+Ein hochperformantes, modulares Dashboard und Installations-System für [Eba-M/E3DC-Control](https://github.com/Eba-M/E3DC-Control). Es verwandelt das bewährte Konsolen-Programm in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
 
-Dieses Projekt ist ein Erweiterungsmodul für [E3DC-Control von Eba-M](https://github.com/Eba-M/E3DC-Control).
-Es bietet eine Komplettlösung zur Installation, Verwaltung und Visualisierung der E3DC-Control Software, um die Installation und Rechtevergabe so benutzerfreundlich wie möglich zu machen und eine moderne Bedienoberfläche zu schaffen.
+![E3DC-Control Dashboard](html/icons/app-icon-512.png)
 
----
+## ✨ Highlights & Features
 
-## 🎯 Was macht dieses Projekt?
+### 📊 Modernes Live-Dashboard & Statistik
+* **Echtzeit-Energiefluss:** Animierte Darstellung aller Energieflüsse (Haus, PV, Netz, Batterie, Wallbox, Wärmepumpe).
+* **Tagesstatistik:** Hochpräzise Echtzeit-Berechnung von **Autarkie** und **Eigenverbrauch** sowie detaillierte Aufschlüsselung der Energieverteilung in kWh und Prozent.
+* **Responsive & PWA:** Vollständig optimiert für Desktop und Mobile (Dark/Light Mode). Dank PWA-Support wie eine native App auf iOS und Android installierbar.
+* **Dynamische Liniendiagramme:** Schneller Wechsel zwischen Live-Verlauf, SoC-Prognose und Archiv-Daten der letzten 30 Tage.
 
-Es verbindet die leistungsstarke C++ Steuerung des Basis-Projekts mit einem modernen, responsiven Web-Dashboard.
+### ⚡ Smart Charging & Luxtronik Energy Manager
+* **Intelligentes Lademanagement:** Nutze dynamische Stromtarife (aWATTar / Tibber), um dein Auto oder Haus an den günstigsten Punkten des Tages aufzuladen.
+* **Luxtronik Wärmepumpen-Integration:** Native Modbus-Steuerung für Alpha Innotec / Novelan Wärmepumpen.
+* **Superintelligenz & Morning Boost:** Die Anlage plant vollautomatisch voraus, belädt bei extrem günstigen Preisen (z.B. < 0 ct/kWh) oder pausiert die Wärmepumpe strategisch ("Aushungern"), um Platz für PV-Überschuss am Mittag zu schaffen.
 
-Die Kernfunktionen der Steuerung (von [Eba-M](https://github.com/Eba-M/E3DC-Control)):
-*   **🔋 Intelligentes Laden:** Der Speicher wird basierend auf Wetterprognosen und dynamischen Strompreisen (aWATTar/Tibber) geladen.
-*   **📉 Kostenoptimierung:** Nutzung günstiger Strompreisfenster zum Nachladen (insb. im Winter).
-*   **☀️ Prognosebasiert:** Vermeidung von Abregelungsverlusten durch vorausschauendes Lademanagement.
+### 🚀 Maximale Performance & SD-Karten-Schutz
+* **RAM-Disk Caching:** Konfigurationen, Strompreise, Live-Werte und Log-Daten werden intelligent im Arbeitsspeicher gehalten. Dies schont die SD-Karte des Raspberry Pi massiv und reduziert die CPU-Last.
+* **Sanftes Rendering:** Diagramme laden dank asynchronem Polling, DNS-Prefetching und weichen CSS-Übergängen (`onload`-Events) spürbar flüssiger.
 
-Zusätzliche Funktionen dieses Moduls:
-*   **📊 Visualisierung:** Ein umfassendes Web-Dashboard zeigt Live-Werte, Historie und Prognosen für PV, Batterie, Hausverbrauch, Netz, Wallbox und Wärmepumpe.
-*   **📈 Interaktive Diagramme:** Live-Energiefluss-Animation und klickbare Kacheln für Detailanalysen.
-*   **� Wallbox-Steuerung:** Manuelle und automatische Steuerung der E3DC Wallbox inkl. Ladeplanung.
-*   **🧠 Intelligentes Entladen:** Prognosebasierte Entladung des Speichers am Morgen über Wallbox oder Wärmepumpe, um Platz für den Solarertrag zu schaffen (inkl. "Superintelligenz" mit dynamischer Ladeleistungserkennung).
-*   **🔥 Luxtronik-Integration:** Intelligente Steuerung für Wärmepumpen (Alpha Innotec, Novelan) zur Nutzung von PV-Überschüssen (SG-Ready/Modbus).
+### 🛡️ System-Stabilität & Watchdog
+* **Systemd-Dienste:** Alle Module (E3DC-Core, Energy Manager, Live-Grabber) laufen als robuste Hintergrunddienste mit Auto-Restart-Fähigkeit.
+* **Piguard Watchdog:** Überwacht das Netzwerk, den SD-Karten-Speicher und Dateihänger. Startet bei Bedarf einzelne Dienste (oder den Raspberry Pi) intelligent neu.
+* **Telegram-Benachrichtigungen:** Erhalte tägliche Statusberichte (Uptime, Temperatur) oder Warnungen direkt auf dein Smartphone.
 
----
-
-## 📋 Voraussetzungen
-
-Bevor du startest, stelle sicher, dass folgende Punkte erfüllt sind:
-
-*   **Hardware:** Raspberry Pi (Empfohlen: Pi 4 oder Pi 5, läuft auch auf Pi Zero 2 W) mit SD-Karte oder SSD.
-*   **Betriebssystem:** Raspberry Pi OS Lite (Bullseye oder neuer, 64-bit empfohlen).
-*   **Python:** Python 3.7+ (Der Installer richtet automatisch ein isoliertes Virtual Environment ein).
-*   **Netzwerk:** Der Pi muss im gleichen Netzwerk wie das E3DC Hauskraftwerk sein und Internetzugriff haben.
-*   **Zugriff:** SSH-Zugriff auf den Pi.
-
-*Hinweis: Ein Webserver (Apache/PHP) ist nicht zwingend vorinstalliert nötig, da der Installer diesen auf Wunsch automatisch einrichtet.*
+### 🔄 Auto-Update & Rollback
+* **Selbstheilend:** Das System prüft (optional vollautomatisch) nachts auf Updates und aktualisiert sowohl das E3DC-Core-Programm als auch das Web-Dashboard.
+* **Sicheres Rollback:** Vor jedem Update wird ein lokales Backup erstellt, zu dem jederzeit per Mausklick (oder über das Konsolenmenü) zurückgekehrt werden kann.
 
 ---
 
-## 🚀 Installation
+## ️ Installation
 
-Die Installation erfolgt bequem über die Kommandozeile.
+Die Installation erfordert einen Raspberry Pi (oder ein Debian-basiertes System) und Root-Rechte.
 
-### Schritt 1: System aktualisieren & Git installieren
-
-Melde dich per SSH auf deinem Raspberry Pi an und führe folgende Befehle aus:
-
-```bash
-sudo apt update
-sudo apt install -y git
-```
-
-### Schritt 2: Repository klonen
-
-Lade den Installer herunter:
-
+1. **Repository klonen:**
 ```bash
 cd ~
 git clone https://github.com/A9xxx/Install-E3DC-Control.git Install
+cd Install
 ```
 
 ### Schritt 3: Installer starten

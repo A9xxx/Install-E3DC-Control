@@ -112,8 +112,14 @@ def get_cfg_value(config_dict, key, default=None):
     """Holt Wert aus dem Cache-Dict."""
     if config_dict is None: return default
     val = config_dict.get(key.lower(), default)
+    if val == '': return default
     try: return float(val)
     except (ValueError, TypeError): return val
+
+def get_cfg_int(config_dict, key, default=0):
+    val = get_cfg_value(config_dict, key, default)
+    try: return int(float(val))
+    except: return default
 
 def write_e3dc_config_value(key, value):
     """Schreibt einen Wert in die e3dc.config.txt"""
@@ -195,6 +201,32 @@ def get_price_action(prices, start_hour, interval, limit, min_duration_min, curr
             return "PAUSE"
             
     return "NONE"
+
+def get_average_baseload():
+    """
+    Ermittelt die durchschnittliche Grundlast des Hauses (in W) aus der jüngeren Historie.
+    Filtert extreme Spitzen (Backofen etc.) heraus, um die "ruhige" Last zu finden.
+    """
+    history_path = "/var/www/html/ramdisk/live_history.txt"
+    if not os.path.exists(history_path):
+        return 300.0 # Fallback 300W
+        
+    try:
+        with open(history_path, 'r') as f:
+            lines = f.readlines()
+        
+        total_w = 0; count = 0
+        # Analysiere die letzten ~2 Stunden (bei 60s Takt = 120 Zeilen)
+        for line in lines[-120:]:
+            try:
+                d = json.loads(line)
+                home = float(d.get("home", 0))
+                if 50 < home < 1500: # Ignoriere 0-Werte und große Verbraucher
+                    total_w += home; count += 1
+            except: pass
+        if count > 10: return total_w / count
+    except: pass
+    return 300.0
 
 def main():
     logger = setup_logging()
@@ -310,12 +342,18 @@ def main():
     except: pass
 
     # Config Cache Init
-    config_cache = {}
-    config_mtime = 0
+    config_cache = load_e3dc_config_dict()
+    if os.path.exists(E3DC_CONFIG_PATH):
+        config_mtime = os.path.getmtime(E3DC_CONFIG_PATH)
+    else:
+        config_mtime = 0
 
-    if AUTO_MODE == 0: logger.info("Automatik-Regelung ist DEAKTIVIERT (Nur Monitoring).")
+    auto_mode_init = get_cfg_int(config_cache, 'auto_mode', 1)
+    grid_limit_init = get_cfg_value(config_cache, 'GRID_START_LIMIT', -3500)
+
+    if auto_mode_init == 0: logger.info("Automatik-Regelung ist DEAKTIVIERT (Nur Monitoring).")
     elif not wp: logger.info("Nur Lademanagement-Regeln sind aktiv.")
-    else: logger.info(f"Start bei > {abs(GRID_START_LIMIT)}W Einspeisung.")
+    else: logger.info(f"Start bei > {abs(grid_limit_init)}W Einspeisung.")
 
     while True:
         now = datetime.now()
@@ -333,95 +371,90 @@ def main():
         
         current_config = config_cache
         
-        # Dynamisches Nachladen wichtiger Parameter
-        AUTO_UPDATE_ENABLE = int(get_cfg_value(current_config, 'auto_update_enable', 0))
-        update_time_str = str(get_cfg_value(current_config, 'auto_update_time', "23:00"))
-        try: update_hour, update_minute = map(int, update_time_str.split(':'))
-        except: update_hour, update_minute = 23, 0
-            
-        GRID_START_LIMIT = get_cfg_value(current_config, 'GRID_START_LIMIT', -3500)
-        STOP_DELAY_MINUTES = get_cfg_value(current_config, 'stop_delay_minutes', 10)
-        MIN_SOC = get_cfg_value(current_config, 'MIN_SOC', 80)
-        AUTO_MODE = int(get_cfg_value(current_config, 'auto_mode', 1))
-        AT_LIMIT = get_cfg_value(current_config, 'AT_LIMIT', 10.0)
-        # Gecachte Sollwerte für die Schleife
-        CONF_WWS = get_cfg_value(current_config, 'WWS', 50.0)
-        CONF_WWW = get_cfg_value(current_config, 'WWW', 48.0)
-        CONF_HZ  = get_cfg_value(current_config, 'HZ', 32.0)
-
-        PRICE_BOOST_ENABLE = get_cfg_value(current_config, 'price_boost_enable', 0)
-        PRICE_LIMIT = get_cfg_value(current_config, 'price_limit', 20.0)
-        PRICE_MIN_DURATION = get_cfg_value(current_config, 'price_min_duration', 60)
-        PRICE_MAX_DAILY = get_cfg_value(current_config, 'price_max_daily', 180)
-        PRICE_HARD_LIMIT = get_cfg_value(current_config, 'price_hard_limit', -99.0)
-        WQ_MIN_TEMP = get_cfg_value(current_config, 'wq_min_temp', 1.0)
-        RL_SOURCE = str(get_cfg_value(current_config, 'rl_source', 'internal'))
-        MANUAL_BOOST_MIN_SOC = get_cfg_value(current_config, 'manual_boost_min_soc', 25)
-        MANUAL_BOOST_MAX_DURATION = get_cfg_value(current_config, 'manual_boost_max_duration', 180)
-
-        MB_ENABLE = get_cfg_value(current_config, 'morning_boost_enable', 0)
-        MB_PRIO = str(get_cfg_value(current_config, 'morning_boost_prio', 'wallbox'))
-        MB_WB_POWER = get_cfg_value(current_config, 'morning_boost_wb_power', 7.0)
-        MB_MIN_HOURS = get_cfg_value(current_config, 'morning_boost_min_hours', 3)
-        MB_MIN_PV_PCT = get_cfg_value(current_config, 'morning_boost_min_pv_pct', 50.0)
-        MB_TARGET_SOC = get_cfg_value(current_config, 'morning_boost_target_soc', 20)
-        try: MB_DEADLINE = int(get_cfg_value(current_config, 'morning_boost_deadline', 8))
-        except: MB_DEADLINE = 8
-
-        SI_ENABLE = get_cfg_value(current_config, 'super_intelligence_enable', 0)
-        try: SI_DEADLINE = int(get_cfg_value(current_config, 'super_intelligence_deadline', 8))
-        except: SI_DEADLINE = 8
-
-        TELEGRAM_TOKEN = str(get_cfg_value(current_config, 'telegram_token', ''))
-        TELEGRAM_CHAT_ID = str(get_cfg_value(current_config, 'telegram_chat_id', ''))
-
-        PV_PAUSE_ENABLE = get_cfg_value(current_config, 'pv_pause_enable', 0)
-        PV_PAUSE_SOC = get_cfg_value(current_config, 'pv_pause_soc', 80)
-        PV_PAUSE_WATT = get_cfg_value(current_config, 'pv_pause_watt', 3000.0)
-        PV_PAUSE_TIMEOUT_MINUTES = get_cfg_value(current_config, 'pv_pause_timeout_minutes', 120)
-        
-        # Auto-Update Check
-        if AUTO_UPDATE_ENABLE == 1:
-            if now.hour == update_hour and now.minute == update_minute:
-                if not update_checked_today:
-                    logger.info(f"Starte tägliche Update-Prüfung ({update_hour:02d}:{update_minute:02d} Uhr)...")
-                    # Pfad zum Install-Verzeichnis (z.B. /home/pi/Install)
-                    install_root = os.path.abspath(os.path.join(script_dir, "../../"))
-                    self_update_script = os.path.join(install_root, "Installer", "self_update.py")
-                    
-                    if os.path.exists(self_update_script):
-                        try:
-                            # Vereinfachter und robusterer Aufruf.
-                            # Erfordert eine sudoers-Regel für den ausführenden Benutzer.
-                            log_file = os.path.join(LOG_DIR, "auto_self_update.log")
-                            cmd = f"sudo /usr/bin/python3 {self_update_script} --silent"
-                            
-                            # Log-Datei vorbereiten
-                            with open(log_file, "w") as f:
-                                f.write(f"=== Starting Auto-Update at {datetime.now()} ===\n")
-                                f.write(f"Command: {cmd}\n---\n")
-                            os.chmod(log_file, 0o664)
-
-                            logger.info(f"Führe Update-Kommando aus: {cmd}")
-                            # Prozess starten und Ausgabe in Log-Datei umleiten
-                            subprocess.Popen(f"nohup {cmd} >> {log_file} 2>&1 &", shell=True)
-                            logger.info("Update-Prozess im Hintergrund gestartet.")
-                        except Exception as e:
-                            logger.error(f"Fehler beim Starten des Auto-Updates: {e}")
-                    else:
-                        logger.error("Auto-Update fehlgeschlagen: self_update.py nicht gefunden.")
-                    update_checked_today = True
-            else:
-                update_checked_today = False
-
-        wp_data = {}   
-        wp_status = {} 
-        at = 20.0 
-        success = False 
-        wq_aus = 10.0 
-        if not wp: success = True
-
         try:
+            # Dynamisches Nachladen wichtiger Parameter sicher im Try-Block
+            AUTO_UPDATE_ENABLE = get_cfg_int(current_config, 'auto_update_enable', 0)
+            update_time_str = str(get_cfg_value(current_config, 'auto_update_time', "23:00"))
+            try: update_hour, update_minute = map(int, update_time_str.split(':'))
+            except: update_hour, update_minute = 23, 0
+                
+            GRID_START_LIMIT = get_cfg_value(current_config, 'GRID_START_LIMIT', -3500)
+            STOP_DELAY_MINUTES = get_cfg_value(current_config, 'stop_delay_minutes', 10)
+            MIN_SOC = get_cfg_value(current_config, 'MIN_SOC', 80)
+            AUTO_MODE = get_cfg_int(current_config, 'auto_mode', 1)
+            AT_LIMIT = get_cfg_value(current_config, 'AT_LIMIT', 10.0)
+            # Gecachte Sollwerte für die Schleife
+            CONF_WWS = get_cfg_value(current_config, 'WWS', 50.0)
+            CONF_WWW = get_cfg_value(current_config, 'WWW', 48.0)
+            CONF_HZ  = get_cfg_value(current_config, 'HZ', 32.0)
+
+            PRICE_BOOST_ENABLE = get_cfg_value(current_config, 'price_boost_enable', 0)
+            PRICE_LIMIT = get_cfg_value(current_config, 'price_limit', 20.0)
+            PRICE_MIN_DURATION = get_cfg_value(current_config, 'price_min_duration', 60)
+            PRICE_MAX_DAILY = get_cfg_value(current_config, 'price_max_daily', 180)
+            PRICE_HARD_LIMIT = get_cfg_value(current_config, 'price_hard_limit', -99.0)
+            WQ_MIN_TEMP = get_cfg_value(current_config, 'wq_min_temp', 1.0)
+            RL_SOURCE = str(get_cfg_value(current_config, 'rl_source', 'internal'))
+            MANUAL_BOOST_MIN_SOC = get_cfg_value(current_config, 'manual_boost_min_soc', 25)
+            MANUAL_BOOST_MAX_DURATION = get_cfg_value(current_config, 'manual_boost_max_duration', 180)
+
+            MB_ENABLE = get_cfg_value(current_config, 'morning_boost_enable', 0)
+            MB_PRIO = str(get_cfg_value(current_config, 'morning_boost_prio', 'wallbox'))
+            MB_WB_POWER = get_cfg_value(current_config, 'morning_boost_wb_power', 7.0)
+            MB_MIN_HOURS = get_cfg_value(current_config, 'morning_boost_min_hours', 3)
+            MB_MIN_PV_PCT = get_cfg_value(current_config, 'morning_boost_min_pv_pct', 50.0)
+            MB_TARGET_SOC = get_cfg_value(current_config, 'morning_boost_target_soc', 20)
+            MB_DEADLINE = get_cfg_int(current_config, 'morning_boost_deadline', 8)
+
+            SI_ENABLE = get_cfg_value(current_config, 'super_intelligence_enable', 0)
+            SI_DEADLINE = get_cfg_int(current_config, 'super_intelligence_deadline', 8)
+
+            TELEGRAM_TOKEN = str(get_cfg_value(current_config, 'telegram_token', ''))
+            TELEGRAM_CHAT_ID = str(get_cfg_value(current_config, 'telegram_chat_id', ''))
+
+            PV_PAUSE_ENABLE = get_cfg_value(current_config, 'pv_pause_enable', 0)
+            PV_PAUSE_SOC = get_cfg_value(current_config, 'pv_pause_soc', 80)
+            PV_PAUSE_WATT = get_cfg_value(current_config, 'pv_pause_watt', 3000.0)
+            PV_PAUSE_TIMEOUT_MINUTES = get_cfg_value(current_config, 'pv_pause_timeout_minutes', 120)
+            PV_PAUSE_MIN_AT = get_cfg_value(current_config, 'pv_pause_min_at', 0.0)
+            
+            # Auto-Update Check
+            if AUTO_UPDATE_ENABLE == 1:
+                if now.hour == update_hour and now.minute == update_minute:
+                    if not update_checked_today:
+                        logger.info(f"Starte tägliche Update-Prüfung ({update_hour:02d}:{update_minute:02d} Uhr)...")
+                        install_root = os.path.abspath(os.path.join(script_dir, "../../"))
+                        self_update_script = os.path.join(install_root, "Installer", "self_update.py")
+                        
+                        if os.path.exists(self_update_script):
+                            try:
+                                log_file = os.path.join(LOG_DIR, "auto_self_update.log")
+                                cmd = f"sudo /usr/bin/python3 {self_update_script} --silent"
+                                
+                                with open(log_file, "w") as f:
+                                    f.write(f"=== Starting Auto-Update at {datetime.now()} ===\n")
+                                    f.write(f"Command: {cmd}\n---\n")
+                                os.chmod(log_file, 0o664)
+
+                                logger.info(f"Führe Update-Kommando aus: {cmd}")
+                                subprocess.Popen(f"nohup {cmd} >> {log_file} 2>&1 &", shell=True)
+                                logger.info("Update-Prozess im Hintergrund gestartet.")
+                            except Exception as e:
+                                logger.error(f"Fehler beim Starten des Auto-Updates: {e}")
+                        else:
+                            logger.error("Auto-Update fehlgeschlagen: self_update.py nicht gefunden.")
+                        update_checked_today = True
+                else:
+                    update_checked_today = False
+
+            wp_data = {}   
+            wp_status = {} 
+            at = 20.0 
+            success = False 
+            wq_aus = 10.0 
+            wp_error_msg = ""
+            if not wp: success = True
+
             # 1. Daten von WP holen
             if wp:
                 if wp.connect():
@@ -430,6 +463,7 @@ def main():
                     wp_status = wp.read_shi_status()
                     
                     wq_aus = wp_data.get('Sole_Aus', wp_data.get('WQ_Austritt', 10.0))
+                    at = wp_data.get('Aussentemp', wp_data.get('Aussentemp_Mittel', 20.0))
                     
                     if first_run: first_run = False
                     
@@ -454,8 +488,6 @@ def main():
                         
                         wp.close()
                         success = True
-                        time.sleep(15)
-                        continue
 
                     # Externer Reset Check
                     if boost_active and wp_status:
@@ -470,6 +502,7 @@ def main():
                     wp.close()
                     success = True 
                 else:
+                    wp_error_msg = "Verbindung zur Wärmepumpe im Modbus-Netzwerk fehlgeschlagen."
                     logger.warning("Verbindung zur WP fehlgeschlagen")
 
             # 2. E3DC Daten holen
@@ -561,7 +594,15 @@ def main():
                         si_calibrated_power_kw = None
 
                 if si_state == "RUNNING":
-                    if (soc <= (si_target_soc + 1)) or (now >= si_deadline_ts):
+                    # Dynamische Ziel-Berechnung (Grundlast-Kompensation)
+                    cap_kwh = float(get_cfg_value(current_config, 'speichergroesse', 10.0))
+                    hours_left = (si_deadline_ts - now).total_seconds() / 3600.0
+                    avg_baseload_kw = get_average_baseload() / 1000.0
+                    
+                    natural_drain_soc = ((avg_baseload_kw * hours_left) / cap_kwh) * 100 if cap_kwh > 0 else 0
+                    dynamic_target_soc = si_target_soc + natural_drain_soc
+
+                    if (soc <= (dynamic_target_soc + 1)) or (now >= si_deadline_ts):
                         logger.info("Superintelligence beendet.")
                         if os.path.exists(STATE_FILE):
                             with open(STATE_FILE, 'r') as f: saved = json.load(f)
@@ -569,6 +610,7 @@ def main():
                             write_e3dc_config_value('wbminsoc', saved.get('orig_wbminsoc', 50))
                             os.remove(STATE_FILE)
                         si_state = "DONE"
+                        logger.info(f"SI Ziel erreicht: SoC={soc}% (Dynamisches Ziel war {dynamic_target_soc:.1f}% inkl. {natural_drain_soc:.1f}% Puffer für Grundlast).")
                     else:
                         actual_wb_power_w = e3dc.get('wb', 0)
                         if si_calibrated_power_kw is None and actual_wb_power_w > 1000:
@@ -585,7 +627,7 @@ def main():
 
                         if si_calibrated_power_kw is not None:
                             cap_kwh = float(get_cfg_value(current_config, 'speichergroesse', 10.0))
-                            remaining_energy = ((soc - si_target_soc) / 100.0) * cap_kwh
+                            remaining_energy = ((soc - dynamic_target_soc) / 100.0) * cap_kwh
                             power_kw = si_calibrated_power_kw + 0.5
                             needed_h = remaining_energy / power_kw if power_kw > 0 else 99
                             req_start = si_deadline_ts - timedelta(hours=needed_h)
@@ -651,7 +693,16 @@ def main():
                             mb_state = "RUNNING"
 
                 if mb_state == "RUNNING":
-                    if soc <= (MB_TARGET_SOC + 1) or now.hour >= MB_DEADLINE:
+                    # Auch beim Morning Boost den Puffer für die Grundlast einbauen
+                    cap_kwh = float(get_cfg_value(current_config, 'speichergroesse', 10.0))
+                    deadline_ts = datetime(now.year, now.month, now.day, MB_DEADLINE, 0, 0)
+                    hours_left = max(0, (deadline_ts - now).total_seconds() / 3600.0)
+                    avg_baseload_kw = get_average_baseload() / 1000.0
+                    
+                    natural_drain_soc = ((avg_baseload_kw * hours_left) / cap_kwh) * 100 if cap_kwh > 0 else 0
+                    dynamic_mb_target = MB_TARGET_SOC + natural_drain_soc
+
+                    if soc <= (dynamic_mb_target + 1) or now.hour >= MB_DEADLINE:
                         logger.info("Morning-Boost beendet.")
                         if os.path.exists(STATE_FILE):
                             with open(STATE_FILE, 'r') as f: saved = json.load(f)
@@ -666,6 +717,7 @@ def main():
                             os.remove(STATE_FILE)
                         mb_state = "DONE"
                         mb_running_prio = ""
+                        logger.info(f"MB Ziel erreicht (Puffer für Grundlast: {natural_drain_soc:.1f}%).")
 
             # --- HAUPT REGELUNG (Wärmepumpe) ---
             if not os.path.exists(FLAG_FILE) and AUTO_MODE == 1 and wp:
@@ -674,7 +726,14 @@ def main():
 
                     # PV PAUSE
                     if PV_PAUSE_ENABLE == 1 and current_price > 0 and mb_state != "RUNNING" and si_state != "RUNNING" and si_state != "PAUSING":
-                        if pv_pause_active:
+                        # Auskühlschutz: Keine Pause bei tiefen Temperaturen
+                        if at < PV_PAUSE_MIN_AT:
+                            if pv_pause_active:
+                                logger.info(f"PV-Pause beendet (Auskühlschutz, AT {at}°C < Limit {PV_PAUSE_MIN_AT}°C).")
+                                if wp and wp.connect(): wp.write_hz_boost(0); wp.write_ww_boost(0, CONF_WWW); wp.close()
+                                pv_pause_active = False; boost_active = False; pv_pause_start_time = None
+                        
+                        elif pv_pause_active:
                             if grid <= GRID_START_LIMIT:                                    
                                 logger.info(f"PV-Pause beendet -> Überschuss ({grid}W).")
                                 pv_pause_active = False; boost_active = False
@@ -721,14 +780,22 @@ def main():
 
                     # PREIS BOOST
                     price_action = "NONE"
+                    effective_price_limit = PRICE_LIMIT
+                    estimated_cop = 3.5
+                    
                     if PRICE_BOOST_ENABLE == 1 and mb_state != "RUNNING" and si_state != "RUNNING" and si_state != "PAUSING":
+                        # COP-Schätzung & thermische Preisanpassung (Sole vs. Luft)
+                        wq_ein = wp_data.get('Sole_Ein', wp_data.get('WQ_Eintritt', at))
+                        estimated_cop = max(2.0, min(6.0, 3.5 + (wq_ein - 5.0) * 0.1))
+                        effective_price_limit = PRICE_LIMIT * (estimated_cop / 3.5)
+
                         if current_price <= 0: price_action = "BOOST"
                         elif prices:
                             gmt = time.gmtime(); now_gmt = gmt.tm_hour + gmt.tm_min / 60.0
                             h_diff = now_gmt - price_start_hour
                             if h_diff < -12: h_diff += 24
                             if h_diff > 36: h_diff -= 24
-                            price_action = get_price_action(prices, price_start_hour, price_interval, PRICE_LIMIT, PRICE_MIN_DURATION, h_diff / price_interval)
+                            price_action = get_price_action(prices, price_start_hour, price_interval, effective_price_limit, PRICE_MIN_DURATION, h_diff / price_interval)
                         
                         is_hard = (current_price <= PRICE_HARD_LIMIT)
                         if wq_aus < WQ_MIN_TEMP: price_action = "NONE"
@@ -742,7 +809,7 @@ def main():
                             pre_pause_active = True; price_boost_active = False; boost_active = True
                     elif price_action == "BOOST":
                         if not price_boost_active:
-                            logger.info(f"Start Preis-Boost ({current_price} ct).")
+                            logger.info(f"Start Preis-Boost ({current_price} ct). (Eff. Limit: {effective_price_limit:.1f} ct bei COP ~{estimated_cop:.1f})")
                             if wp and wp.connect():
                                 if at > AT_LIMIT: wp.write_ww_boost(1, CONF_WWS); wp.write_hz_boost(0)
                                 else: wp.write_ww_boost(1, CONF_WWW); wp.write_hz_boost(1, CONF_HZ)
@@ -799,7 +866,7 @@ def main():
                 "daily_boost_counter": daily_boost_counter, "last_pv_boost_time": last_pv_boost_time,
                 "price_boost_active": price_boost_active, "pre_pause_active": pre_pause_active,
                 "pv_pause_active": pv_pause_active, "mb_state": mb_state, "mb_prio": mb_running_prio,
-                "si_state": si_state, "success": success
+                "si_state": si_state, "success": success, "error": wp_error_msg
             }
             tmp_file = RAMDISK_FILE + ".tmp"
             with open(tmp_file, 'w') as f: json.dump(json_export, f)
@@ -823,7 +890,10 @@ def main():
             logger.critical(f"Kritischer Fehler: {e}", exc_info=True)
             with open(RAMDISK_FILE, 'w') as f: json.dump({"success": False, "error": str(e), "ts": now.isoformat()}, f)
         
-        time.sleep(15)
+        # WICHTIG: Die Luxtronik-Steuerung hat einen sehr schwachen Prozessor. 
+        # Ein zu schnelles Polling (< 30s) kann den internen Datenbus der Wärmepumpe 
+        # zum Absturz bringen (Fehler 816). Daher mindestens 30s Pause!
+        time.sleep(30)
 
 if __name__ == "__main__":
     main()

@@ -63,6 +63,7 @@ def check_and_set_config_defaults():
         "pv_pause_soc": "80",
         "pv_pause_watt": "3000.0",
         "pv_pause_timeout_minutes": "120",
+        "pv_pause_min_at": "0.0",
         "morning_boost_enable": "0",
         "morning_boost_prio": "wallbox",
         "morning_boost_wb_power": "7.0",

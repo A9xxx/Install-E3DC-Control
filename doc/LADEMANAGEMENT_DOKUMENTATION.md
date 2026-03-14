@@ -76,8 +76,25 @@ Hier liegt der entscheidende Unterschied und Vorteil:
 
 **Ergebnis:** Eine perfekt auf das Ladeverhalten des Autos abgestimmte, punktgenaue Entladung zur Zieldestzeit.
 
+*(Auch hier greift die dynamische Grundlast-Kompensation, um den Hausverbrauch bis zum Sonnenaufgang einzuplanen).*
+
 ---
 
-## 4. Sicherheit
+## 4. Feature: Wärme-Gestehungskosten (Thermischer Preis-Boost)
+
+Dieses Feature optimiert das Heizen mit dynamischen Stromtarifen (aWATTar/Tibber), wenn eine Wärmepumpe angeschlossen ist.
+*   **Das Problem:** Strom ist nachts oft am günstigsten. Aber nachts ist es auch am kältesten, was den Wirkungsgrad (COP) der Wärmepumpe drückt. 15 ct/kWh bei einem COP von 2,5 sind am Ende teurer als 20 ct/kWh am Mittag bei einem COP von 4,0!
+*   **Die Lösung:** Der Energy Manager schätzt den zu erwartenden COP anhand der Quelleneintrittstemperatur (Sole oder Luft). Bei schlechtem COP wird dein eingestelltes Preislimit (`price_limit`) automatisch **nach unten korrigiert**. Bei sehr effizienten Bedingungen (hohe Quellentemperatur) wird das Limit leicht angehoben. Es wird also nach dem echten *Wärmepreis* geregelt, nicht nur nach dem Strompreis.
+
+---
+
+## 5. Feature: Auskühlschutz (Wetter-Hysterese bei PV-Pause)
+
+*   **Die Funktion:** Die "PV-Pause" (Aushungern) schaltet die Wärmepumpe am Vormittag bewusst ab, wenn später am Tag ein großer PV-Überschuss erwartet wird. So wird Speicherkapazität im Estrich geschaffen.
+*   **Der Auskühlschutz:** Im tiefen Winter (z.B. bei -5 °C) würde das Haus durch die Pause zu stark auskühlen. Das Wiederaufheizen würde den späteren PV-Gewinn zunichtemachen. Über den Parameter `pv_pause_min_at` (z.B. `0.0` °C) kann eine Außentemperatur definiert werden, unterhalb derer die PV-Pause komplett ausgesetzt wird.
+
+---
+
+## 6. Sicherheit
 
 Beide Systeme sind gegen Stromausfälle und Neustarts abgesichert. Ein laufender Entlade-Vorgang wird in einer persistenten Datei (`/var/www/html/tmp/morning_boost_state.json`) gespeichert. Nach einem Neustart liest der `energy_manager` diese Datei, setzt den Vorgang fort und stellt am Ende sicher, dass die `e3dc.config.txt` (`wbminsoc`, `wbmode`) wieder auf die ursprünglichen Werte zurückgesetzt wird.

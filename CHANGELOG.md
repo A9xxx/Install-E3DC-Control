@@ -1,5 +1,15 @@
 # Changelog
 
+## [3.3.4] - 2026-03-14 - Smart Energy Manager Updates
+
+### 🧠 Lademanagement & Superintelligenz
+*   **Dynamische Grundlast-Kompensation:** Der Morgen-Boost und die Superintelligenz berechnen nun den "natürlichen" Hausverbrauch bis zur Ziel-Zeit mit ein. Dadurch wird verhindert, dass das Haus nach dem Entladen bis zum Sonnenaufgang teuren Netzbezug verursacht.
+*   **Thermische Preisanpassung (COP-Logik):** Der Preis-Boost (aWATTar/Tibber) berücksichtigt nun den zu erwartenden Wirkungsgrad der Wärmepumpe (via Quellentemperatur). Bei schlechtem COP wird das Preislimit automatisch gesenkt, bei gutem COP angehoben.
+*   **Auskühlschutz (PV-Pause):** Die "Aushungern"-Funktion (Pausieren vor erwartetem PV-Ertrag) wird nun bei extremen Minusgraden (konfigurierbar über `pv_pause_min_at`) automatisch ausgesetzt, um ein zu starkes Auskühlen des Estrichs zu verhindern.
+
+### 🖥️ Web-Interface & Config
+*   **Config-Editor:** Die neue Variable `pv_pause_min_at` (Auskühlschutz) wurde als Eingabefeld in den Config-Editor unter "Luxtronik Energy Manager" integriert.
+
 ## [3.3.3] - 2026-03-14 - Service Management & Hotfixes
 
 ### ⚙️ System & Dienste

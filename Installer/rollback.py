@@ -2,6 +2,16 @@ import os
 import subprocess
 import time
 import shutil
+import sys
+
+# Standard-Ausgabe auf UTF-8 erzwingen
+try:
+    if not sys.stdout.isatty():
+        sys.stdout.reconfigure(encoding='utf-8', line_buffering=True)
+    else:
+        sys.stdout.reconfigure(encoding='utf-8')
+except Exception:
+    pass
 
 from .core import register_command
 from .backup import choose_backup_version, restore_backup, backup_current_version
@@ -22,8 +32,10 @@ def hard_stop_e3dc():
         install_user = get_install_user()
         
         # NEU: Systemd Service stoppen (verhindert automatischen Neustart während Rollback)
-        if os.path.exists("/etc/systemd/system/e3dc.service"):
-            run_command("sudo systemctl stop e3dc", timeout=10)
+        services_to_stop = ["e3dc", "energy_manager", "e3dc-grabber", "piguard"]
+        for srv in services_to_stop:
+            if os.path.exists(f"/etc/systemd/system/{srv}.service"):
+                run_command(f"sudo systemctl stop {srv}", timeout=10)
 
         # Setze Stop-Flag
         config_file = os.path.join(INSTALL_PATH, "e3dc.config.txt")
@@ -57,13 +69,19 @@ def start_e3dc():
     rollback_logger.info("Starte E3DC-Control")
     
     # NEU: Systemd Service nutzen falls vorhanden
-    if os.path.exists("/etc/systemd/system/e3dc.service"):
-        res = run_command("sudo systemctl start e3dc", timeout=10)
-        if res['success']:
-            print("✓ E3DC-Control Service gestartet")
-            return True
-        else:
-            print(f"⚠ Fehler beim Starten des Services: {res['stderr']}")
+    services_started = False
+    services_to_start = ["e3dc", "energy_manager", "e3dc-grabber", "piguard"]
+    for srv in services_to_start:
+        if os.path.exists(f"/etc/systemd/system/{srv}.service"):
+            res = run_command(f"sudo systemctl start {srv}", timeout=10)
+            if res['success']:
+                print(f"✓ Service gestartet: {srv}")
+                services_started = True
+            else:
+                print(f"⚠ Fehler beim Starten von {srv}: {res['stderr']}")
+                
+    if services_started:
+        return True
     
     install_user = get_install_user()
     result = run_command(f"sudo -u {install_user} screen -dmS E3DC {INSTALL_PATH}/E3DC.sh", timeout=5)

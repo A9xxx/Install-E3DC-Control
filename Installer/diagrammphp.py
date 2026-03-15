@@ -43,6 +43,15 @@ from .permissions_helper import (
 from .service_setup import install_e3dc_service
 from .utils import get_web_version, get_installer_bundle_version
 
+# Standard-Ausgabe auf UTF-8 erzwingen
+try:
+    if not sys.stdout.isatty():
+        sys.stdout.reconfigure(encoding='utf-8', line_buffering=True)
+    else:
+        sys.stdout.reconfigure(encoding='utf-8')
+except Exception:
+    pass
+
 # Logger
 diagramm_logger = get_or_create_logger("diagramm")
 
@@ -54,6 +63,8 @@ CRON_COMMENT = "E3DC-Control Diagram Auto-Update"
 PLOT_SCRIPT_NAME = "plot_soc_changes.py"
 BACKUP_CRON_COMMENT = "E3DC-Control History Backup" # Neuer Kommentar für den Backup-Cron
 BACKUP_SCRIPT_PATH = "/var/www/html/backup_history.php" # Pfad zum Backup-Skript
+TELEGRAM_STATS_CRON_COMMENT = "E3DC-Control Daily Telegram Stats"
+TELEGRAM_STATS_SCRIPT_PATH = "/var/www/html/send_daily_telegram.php"
 PLOT_LIVE_HISTORY_NAME = "plot_live_history.py"
 ZIP_NAME = "E3DC-Control.zip"
 OLD_MODULE_DIRS = ["config", "parsing", "plotting"]
@@ -650,6 +661,10 @@ class DiagramInstaller:
             cron_schedule_backup = "0 0 * * *"
             cron_line_backup = f"{cron_schedule_backup} /usr/bin/php {BACKUP_SCRIPT_PATH} > /dev/null 2>&1 # {BACKUP_CRON_COMMENT}"
             
+            # Cron-Linie für Telegram-Stats (täglich um 07:00 Uhr)
+            cron_schedule_telegram = "0 7 * * *"
+            cron_line_telegram = f"{cron_schedule_telegram} /usr/bin/php {TELEGRAM_STATS_SCRIPT_PATH} > /dev/null 2>&1 # {TELEGRAM_STATS_CRON_COMMENT}"
+
             # Existierende crons auslesen - WICHTIG: Als install_user!
             result = subprocess.run(
                 ["sudo", "-u", self.install_user, "crontab", "-l"],
@@ -661,13 +676,14 @@ class DiagramInstaller:
             # Neueste cron-Linie (alte entfernen, neue hinzufügen)
             new_crons = []
             for line in existing_crons.split('\n'):
-                if line.strip() and CRON_COMMENT not in line and BACKUP_CRON_COMMENT not in line:
+                if line.strip() and CRON_COMMENT not in line and BACKUP_CRON_COMMENT not in line and TELEGRAM_STATS_CRON_COMMENT not in line:
                     new_crons.append(line)
             
             # Füge die neuen Cron-Einträge hinzu
             if cron_line_plot:
                 new_crons.append(cron_line_plot)
             new_crons.append(cron_line_backup) # Backup-Cron immer hinzufügen
+            new_crons.append(cron_line_telegram) # Telegram-Stats-Cron hinzufügen
 
             new_crons_text = '\n'.join(new_crons)
             
@@ -696,6 +712,8 @@ class DiagramInstaller:
                 print(f"  Plot-Skript: {cron_schedule_plot} {plot_script}")
             diagramm_logger.info(f"Cronjob für Backup-Skript eingerichtet: {cron_schedule_backup}")
             print(f"  Backup-Skript: {cron_schedule_backup} {BACKUP_SCRIPT_PATH}")
+            diagramm_logger.info(f"Cronjob für Telegram-Stats eingerichtet: {cron_schedule_telegram}")
+            print(f"  Telegram-Stats: {cron_schedule_telegram} {TELEGRAM_STATS_SCRIPT_PATH}")
             return True
         
         except Exception as e:
@@ -719,7 +737,7 @@ class DiagramInstaller:
             # Entferne E3DC-Einträge
             new_crons = []
             for line in result.stdout.split('\n'):
-                if line.strip() and CRON_COMMENT not in line and BACKUP_CRON_COMMENT not in line:
+                if line.strip() and CRON_COMMENT not in line and BACKUP_CRON_COMMENT not in line and TELEGRAM_STATS_CRON_COMMENT not in line:
                     new_crons.append(line)
             
             new_crons_text = '\n'.join(new_crons)

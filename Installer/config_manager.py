@@ -2,6 +2,16 @@ import os
 import json
 import logging
 import tempfile
+import sys
+
+# Standard-Ausgabe auf UTF-8 erzwingen
+try:
+    if not sys.stdout.isatty():
+        sys.stdout.reconfigure(encoding='utf-8', line_buffering=True)
+    else:
+        sys.stdout.reconfigure(encoding='utf-8')
+except Exception:
+    pass
 
 from .utils import run_command
 from .installer_config import CONFIG_FILE, get_install_path, get_install_user, get_home_dir, load_config
@@ -74,7 +84,8 @@ def check_and_set_config_defaults():
         "super_intelligence_enable": "0",
         "super_intelligence_deadline": "8",
         "telegram_token": "",
-        "telegram_chat_id": ""
+        "telegram_chat_id": "",
+        "telegram_stats_enable": "0"
     }
 
     try:

@@ -237,6 +237,14 @@ def create_e3dc_config(headless=False):
         cfg["ForecastReserve"] = ""
 
     # =========================================================
+    # TELEGRAM
+    # =========================================================
+    print("\n--- TELEGRAM BENACHRICHTIGUNGEN ---\n")
+    cfg["telegram_token"] = ask("Telegram Bot Token", "", headless)
+    cfg["telegram_chat_id"] = ask("Telegram Chat ID", "", headless)
+    cfg["telegram_stats_enable"] = "1" if ask("Tägliche Statistik (07:00 Uhr) senden? (j/n)", "n", headless).lower() == "j" else "0"
+
+    # =========================================================
     # DATEI SCHREIBEN
     # =========================================================
     write_e3dc_config(cfg)
@@ -308,6 +316,12 @@ def write_e3dc_config(cfg):
                 write_param(f, "awaufschlag", cfg.get("awaufschlag", ""), cfg["awattar"])
                 write_param(f, "awland", cfg.get("awland", ""), cfg["awattar"])
                 write_param(f, "awreserve", cfg.get("awreserve", ""), cfg["awattar"])
+
+                # Telegram
+                f.write("\n# Telegram Benachrichtigungen\n")
+                write_param(f, "telegram_token", cfg.get("telegram_token", ""))
+                write_param(f, "telegram_chat_id", cfg.get("telegram_chat_id", ""))
+                write_param(f, "telegram_stats_enable", cfg.get("telegram_stats_enable", "0"))
 
                 # OpenMeteo + Forecast
                 f.write("\n# OpenMeteo & Forecast Parameter\n")

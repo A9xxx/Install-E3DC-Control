@@ -25,13 +25,18 @@ except ImportError:
 # Globale Variable für den Headless-Modus
 UNATTENDED_MODE = False
 
-# Pufferung deaktivieren (wichtig für Web-Interface Ausgabe)
-# Muss so früh wie möglich geschehen
-if not sys.stdout.isatty():
-    try:
-        sys.stdout.reconfigure(line_buffering=True)
-    except AttributeError:
-        sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', buffering=1)
+# Standard-Ausgabe auf UTF-8 erzwingen (verhindert UnicodeEncodeError z.B. bei sudo ohne Locale)
+# und Pufferung für Non-TTY Umgebungen (Web-Interface) anpassen
+try:
+    if not sys.stdout.isatty():
+        sys.stdout.reconfigure(encoding='utf-8', line_buffering=True)
+    else:
+        sys.stdout.reconfigure(encoding='utf-8')
+except AttributeError:
+    if not sys.stdout.isatty():
+        sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', buffering=1, encoding='utf-8')
+except Exception:
+    pass
 
 # Debug-Ausgabe ganz am Anfang (für Web-Update Diagnose)
 print(f"→ Installer-Skript gestartet (PID: {os.getpid()})")

@@ -24,6 +24,15 @@ import re
 import time
 import argparse
 
+# Standard-Ausgabe auf UTF-8 erzwingen (verhindert UnicodeEncodeError im Auto-Update)
+try:
+    if not sys.stdout.isatty():
+        sys.stdout.reconfigure(encoding='utf-8', line_buffering=True)
+    else:
+        sys.stdout.reconfigure(encoding='utf-8')
+except Exception:
+    pass
+
 from .core import register_command
 from .utils import run_command, replace_in_file, cleanup_pycache
 from .installer_config import get_install_user

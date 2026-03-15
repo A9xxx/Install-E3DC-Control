@@ -5,6 +5,16 @@ import subprocess
 import logging
 import tempfile
 import json
+import sys
+
+# Standard-Ausgabe auf UTF-8 erzwingen
+try:
+    if not sys.stdout.isatty():
+        sys.stdout.reconfigure(encoding='utf-8', line_buffering=True)
+    else:
+        sys.stdout.reconfigure(encoding='utf-8')
+except Exception:
+    pass
 
 from .core import register_command
 from .utils import run_command
@@ -307,6 +317,7 @@ def check_file_permissions():
     """Prüft Dateien, die PHP schreiben muss (config/wallbox) und Python-Dateien."""
     print("\n=== Datei-Rechteprüfung ===\n")
     
+    dynamic_log_file = None
     # Logfile aus Config lesen und zur globalen Liste hinzufügen
     try:
         config_path = os.path.join(INSTALL_PATH, "e3dc.config.txt")
@@ -319,6 +330,7 @@ def check_file_permissions():
                             log_val = parts[1].strip().strip('"').strip("'")
                             if log_val:
                                 full_log_path = log_val if log_val.startswith("/") else os.path.join(INSTALL_PATH, log_val)
+                                dynamic_log_file = full_log_path
                                 # Prüfen ob schon vorhanden
                                 if not any(d['path'] == full_log_path for d in FILE_DEFINITIONS):
                                     FILE_DEFINITIONS.append({
@@ -365,8 +377,24 @@ def check_file_permissions():
             owner = pwd.getpwuid(st.st_uid).pw_name
             group = grp.getgrgid(st.st_gid).gr_name
             owner_ok = owner == expected_owner
+            
+            # Toleranz für RAM-Disk & TMP Dateien: Der Webserver (www-data) erstellt diese oft.
+            if not owner_ok and expected_owner == INSTALL_USER and owner == "www-data":
+                if "/ramdisk/" in path or "/tmp/" in path:
+                    owner_ok = True
+
             group_ok = group == expected_group
             mode_ok = mode == expected_mode
+            
+            # Toleranz für Datei-Modus (Webserver / C++ Binary erstellt oft mit 644 statt 664/666)
+            if not mode_ok and mode == "644" and expected_mode in ["664", "666"]:
+                if "/ramdisk/" in path or "/tmp/" in path or path == dynamic_log_file:
+                    mode_ok = True
+                    
+            # Toleranz für die Gruppe der E3DC-Control C++ Logdatei (wird meist als pi:pi angelegt)
+            if not group_ok and path == dynamic_log_file and group == expected_owner:
+                group_ok = True
+
             exec_ok = not is_executable or (is_executable and bool(st.st_mode & 0o111))
             if owner_ok and group_ok and mode_ok and exec_ok:
                 exec_str = ", ausführbar" if is_executable else ""
@@ -700,6 +728,12 @@ def check_cronjobs():
             "line": "0 12 * * * /usr/local/bin/boot_notify.sh status",
             "check_part": "/usr/local/bin/boot_notify.sh status",
             "optional_if_exists": "/usr/local/bin/boot_notify.sh"
+        },
+        {
+            "name": "Telegram Tagesstatistik",
+            "line": "0 7 * * * /usr/bin/php /var/www/html/send_daily_telegram.php > /dev/null 2>&1 # E3DC-Control Daily Telegram Stats",
+            "check_part": "send_daily_telegram.php",
+            "optional_if_exists": "/var/www/html/send_daily_telegram.php"
         }
     ]
 

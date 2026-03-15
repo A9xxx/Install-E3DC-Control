@@ -15,6 +15,15 @@ import io
 from unittest.mock import patch, MagicMock, mock_open
 from urllib.error import URLError
 
+# Standard-Ausgabe auf UTF-8 erzwingen (verhindert UnicodeEncodeError bei Emojis)
+try:
+    if not sys.stdout.isatty():
+        sys.stdout.reconfigure(encoding='utf-8', line_buffering=True)
+    else:
+        sys.stdout.reconfigure(encoding='utf-8')
+except Exception:
+    pass
+
 # Basis-Pfade
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 INSTALLER_DIR = os.path.join(SCRIPT_DIR, "Installer")

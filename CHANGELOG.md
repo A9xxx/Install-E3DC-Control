@@ -1,5 +1,17 @@
 # Changelog
 
+## [3.3.6] - 2026-03-15 - Systemstabilität & Installer-Wartung
+
+### ⚙️ System & Stabilität
+*   **Log-Rotation:** Zentrale Installer- und Hilfsskript-Logs (`install.log`, `error.log` etc.) werden nun automatisch rotiert (max. 2 MB pro Datei, 2 Backups). Dies verhindert das unendliche Anwachsen der Dateien und schützt die SD-Karte langfristig.
+*   **UTF-8 Konsolen-Ausgabe:** Der Installer und das Auto-Update-Skript erzwingen nun systemweit eine UTF-8 Ausgabe. Dies verhindert Abstürze (`UnicodeEncodeError`), wenn Skripte über `sudo` ohne durchgereichte Locale-Variablen ausgeführt werden und Emojis loggen wollen.
+*   **Intelligente Rechteprüfung:** Die `permissions.py` ist nun toleranter gegenüber temporären Dateien in der RAM-Disk und Log-Dateien. Sie akzeptiert nun dynamische Eigentümer (`www-data`) und Modi (`644`), die von externen Prozessen (wie dem E3DC C++ Programm oder dem Webserver) zur Laufzeit generiert werden. Dadurch werden unnötige "Phantom-Fehler" vermieden.
+
+## [3.3.5] - 2026-03-15 - Telegram Tagesstatistik
+
+### 📱 Benachrichtigungen & Smart Home
+*   **Telegram-Morgenbericht:** Das System sendet nun automatisch jeden Morgen um 07:00 Uhr eine strukturierte Tagesstatistik (Autarkie, Eigenverbrauch, Energieflüsse Haus/Batterie/WP) für den jeweils gestrigen Tag per Telegram.
+
 ## [3.3.4] - 2026-03-14 - Smart Energy Manager Updates
 
 ### 🧠 Lademanagement & Superintelligenz

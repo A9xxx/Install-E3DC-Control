@@ -1,8 +1,19 @@
 import os
 import subprocess
 import logging
+from logging.handlers import RotatingFileHandler
 import shutil
 import zipfile
+import sys
+
+# Standard-Ausgabe auf UTF-8 erzwingen
+try:
+    if not sys.stdout.isatty():
+        sys.stdout.reconfigure(encoding='utf-8', line_buffering=True)
+    else:
+        sys.stdout.reconfigure(encoding='utf-8')
+except Exception:
+    pass
 
 
 _logging_initialized = False
@@ -19,12 +30,14 @@ def setup_logging():
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, "install.log")
     
-    logging.basicConfig(
-        filename=log_file,
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        encoding='utf-8'
-    )
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    if not root_logger.handlers:
+        handler = RotatingFileHandler(log_file, maxBytes=2*1024*1024, backupCount=2, encoding='utf-8')
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        handler.setFormatter(formatter)
+        root_logger.addHandler(handler)
+        
     _logging_initialized = True
 
 def run_command(cmd, timeout=10, use_shell=True):

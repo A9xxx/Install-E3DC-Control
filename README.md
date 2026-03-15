@@ -25,6 +25,7 @@ Ein hochperformantes, modulares Dashboard und Installations-System für [Eba-M/E
 * **Systemd-Dienste:** Alle Module (E3DC-Core, Energy Manager, Live-Grabber) laufen als robuste Hintergrunddienste mit Auto-Restart-Fähigkeit.
 * **Piguard Watchdog:** Überwacht das Netzwerk, den SD-Karten-Speicher und Dateihänger. Startet bei Bedarf einzelne Dienste (oder den Raspberry Pi) intelligent neu.
 * **Telegram-Benachrichtigungen:** Erhalte tägliche Statusberichte (Uptime, Temperatur) oder Warnungen direkt auf dein Smartphone.
+* **Wartungsfrei:** Automatisches Log-Management (Log-Rotation) verhindert volllaufende Festplatten, und eine intelligente Selbstreparatur der Dateirechte sorgt für störungsfreien Dauerbetrieb.
 
 ### 🔄 Auto-Update & Rollback
 * **Selbstheilend:** Das System prüft (optional vollautomatisch) nachts auf Updates und aktualisiert sowohl das E3DC-Core-Programm als auch das Web-Dashboard.

@@ -98,9 +98,11 @@ def update_e3dc(headless=False):
         headless = True
         # Pufferung deaktivieren, damit Ausgaben sofort im Web-Log erscheinen
         try:
-            sys.stdout.reconfigure(line_buffering=True)
+            sys.stdout.reconfigure(encoding='utf-8', line_buffering=True)
         except AttributeError:
-            sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', buffering=1)
+            sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', buffering=1, encoding='utf-8')
+        except Exception:
+            pass
 
     print("\n=== E3DC-Control aktualisieren ===\n")
     sys.stdout.flush()

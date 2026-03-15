@@ -1,6 +1,16 @@
 import os
 import datetime
 import shutil
+import sys
+
+# Standard-Ausgabe auf UTF-8 erzwingen
+try:
+    if not sys.stdout.isatty():
+        sys.stdout.reconfigure(encoding='utf-8', line_buffering=True)
+    else:
+        sys.stdout.reconfigure(encoding='utf-8')
+except Exception:
+    pass
 
 from .core import register_command
 from .installer_config import get_install_path, get_user_ids, get_www_data_gid
@@ -154,7 +164,7 @@ def backup_current_version():
             log_warning("backup", f"Quellordner für Backup fehlt: {e3dc_source_dir}")
 
         # Installer-Datei sichern
-        plot_installer = os.path.join(os.path.dirname(__file__), "install.py")
+        plot_installer = os.path.join(os.path.dirname(__file__), "install_all.py")
         if os.path.exists(plot_installer):
             try:
                 shutil.copy2(plot_installer, backup_dir)
@@ -195,7 +205,12 @@ def backup_current_version():
 
         # Systemd Services sichern
         service_backup_dir = os.path.join(backup_dir, "services")
-        service_files = ["/etc/systemd/system/e3dc.service", "/etc/systemd/system/piguard.service"]
+        service_files = [
+            "/etc/systemd/system/e3dc.service", 
+            "/etc/systemd/system/piguard.service",
+            "/etc/systemd/system/energy_manager.service",
+            "/etc/systemd/system/e3dc-grabber.service"
+        ]
         srv_found = False
         
         for srv_file in service_files:
@@ -378,6 +393,10 @@ def restore_backup(backup_path):
                      run_command("systemctl enable e3dc")
                 if os.path.exists(os.path.join(service_backup_dir, "piguard.service")):
                      run_command("systemctl enable piguard")
+                if os.path.exists(os.path.join(service_backup_dir, "energy_manager.service")):
+                     run_command("systemctl enable energy_manager")
+                if os.path.exists(os.path.join(service_backup_dir, "e3dc-grabber.service")):
+                     run_command("systemctl enable e3dc-grabber")
 
         # Watchdog wiederherstellen
         wd_backup_dir = os.path.join(backup_path, "watchdog")

@@ -119,7 +119,9 @@ Der Installer bietet weitreichende Möglichkeiten zur Fehlersuche:
 - **Notfall-Modus (Menü 99):** Ein Assistent, der bei Problemen automatisch eine Rechte-Reparatur, Service-Einrichtung und einen Watchdog-Check durchführt.
 - **Erweiterter Status-Check:** Prüft Internetverbindung, CPU-Temperatur, RAM-Disk-Status und zeigt Service-Logs bei Fehlern an.
 
-Log-Dateien befinden sich im `logs/`-Verzeichnis:
+Alle Log-Dateien werden **automatisch rotiert** (maximal 2 MB groß, mit bis zu zwei Backups), um Speicherplatz zu schonen und die Lebensdauer der SD-Karte zu verlängern.
+
+Die Log-Dateien befinden sich im `logs/`-Verzeichnis:
 - **`install.log`**: Das allgemeine Log für die meisten Aktionen des Installers.
 - **`permissions.log`**: Log für Aktionen des Berechtigungs-Skripts.
 

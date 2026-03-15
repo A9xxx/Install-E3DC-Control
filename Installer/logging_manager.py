@@ -5,6 +5,7 @@ Verwaltet mehrere Log-Streams: install.log, permissions.log, error.log
 
 import logging
 import os
+from logging.handlers import RotatingFileHandler
 from datetime import datetime
 
 # Installation Session-Tracking
@@ -47,7 +48,8 @@ def get_or_create_logger(name, log_file=None):
     if not logger.handlers:
         if log_file:
             os.makedirs(os.path.dirname(log_file), exist_ok=True)
-            handler = logging.FileHandler(log_file, encoding='utf-8')
+            # Rotation: Max 2 MB pro Datei, max. 2 historische Backups aufheben
+            handler = RotatingFileHandler(log_file, maxBytes=2*1024*1024, backupCount=2, encoding='utf-8')
             formatter = logging.Formatter('%(asctime)s - [%(levelname)s] - %(message)s')
             handler.setFormatter(formatter)
             logger.addHandler(handler)

@@ -1,0 +1,215 @@
+name: Build and promote verified release images
+
+on:
+  workflow_dispatch:
+    inputs:
+      phase:
+        description: "B1a builds a candidate; B1b promotes an already verified digest"
+        required: true
+        type: choice
+        options: [b1a-candidate, b1b-promote]
+      release_tag:
+        description: "Exactly v5.3.2b or v5.4.0"
+        required: true
+        type: choice
+        options: [v5.3.2b, v5.4.0]
+      release_sha:
+        description: "Approved 40-hex release commit"
+        required: true
+        type: string
+      release_tree:
+        description: "Approved 40-hex tree"
+        required: true
+        type: string
+      root_sha:
+        description: "Exact parentless R0 commit"
+        required: true
+        type: string
+      root_tree:
+        description: "Exact parentless R0 tree"
+        required: true
+        type: string
+      created:
+        description: "Approved UTC OCI created timestamp"
+        required: true
+        type: string
+      source_manifest_sha256:
+        description: "SHA-256 of the approved public source manifest"
+        required: true
+        type: string
+      candidate_digest:
+        description: "Required only for B1b; verified B1a OCI index digest"
+        required: false
+        type: string
+
+concurrency:
+  group: e3dc-release-b1-transaction
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  DOCKER_BUILD_RECORD_UPLOAD: "false"
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      image: ${{ steps.release.outputs.image }}
+      version: ${{ steps.release.outputs.version }}
+      short_sha: ${{ steps.release.outputs.short_sha }}
+    steps:
+      - name: Checkout exact approved commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs.release_sha }}
+          fetch-depth: 2
+          fetch-tags: false
+          persist-credentials: false
+      - name: Validate exact release identity and topology
+        id: release
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          RELEASE_TREE: ${{ inputs.release_tree }}
+          ROOT_SHA: ${{ inputs.root_sha }}
+          ROOT_TREE: ${{ inputs.root_tree }}
+          CREATED: ${{ inputs.created }}
+          SOURCE_MANIFEST: ${{ inputs.source_manifest_sha256 }}
+          CANDIDATE_DIGEST: ${{ inputs.candidate_digest }}
+          PHASE: ${{ inputs.phase }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RELEASE_TREE" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$ROOT_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$ROOT_TREE" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$SOURCE_MANIFEST" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$CREATED" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?Z$ ]]
+          [ "$(git rev-parse HEAD)" = "$RELEASE_SHA" ]
+          [ "$(git rev-parse HEAD^{tree})" = "$RELEASE_TREE" ]
+          [ "$(tr -d '[:space:]' < VERSION)" = "${RELEASE_TAG#v}" ]
+          [ "$(git show -s --format='%an|%ae|%cn|%ce' HEAD)" = "A9x|169547159+A9xxx@users.noreply.github.com|A9x|169547159+A9xxx@users.noreply.github.com" ]
+          if [ "$RELEASE_TAG" = "v5.3.2b" ]; then
+            [ "$RELEASE_SHA" = "$ROOT_SHA" ]
+            [ "$RELEASE_TREE" = "$ROOT_TREE" ]
+            [ "$(git rev-list --parents -n 1 HEAD | awk '{print NF-1}')" -eq 0 ]
+          elif [ "$RELEASE_TAG" = "v5.4.0" ]; then
+            [ "$(git rev-list --parents -n 1 HEAD | awk '{print NF-1}')" -eq 1 ]
+            [ "$(git rev-parse HEAD^)" = "$ROOT_SHA" ]
+            [ "$(git rev-parse HEAD^^{tree})" = "$ROOT_TREE" ]
+            [ "$(git rev-list --parents -n 1 "$ROOT_SHA" | awk '{print NF-1}')" -eq 0 ]
+          else
+            exit 1
+          fi
+          if [ "$PHASE" = "b1b-promote" ]; then
+            [[ "$CANDIDATE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          fi
+          echo "image=${REGISTRY}/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${RELEASE_SHA:0:12}" >> "$GITHUB_OUTPUT"
+
+  b1a-candidate:
+    if: ${{ inputs.phase == 'b1a-candidate' }}
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout verifier from exact approved commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs.release_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build candidate digest only
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: https://github.com/${{ github.repository }}.git#${{ inputs.release_sha }}
+          file: Dockerfile
+          push: true
+          pull: true
+          no-cache: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ needs.validate.outputs.image }}:candidate-${{ needs.validate.outputs.short_sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/A9xxx/Install-E3DC-Control
+            org.opencontainers.image.licenses=AGPL-3.0-or-later
+            org.opencontainers.image.version=${{ needs.validate.outputs.version }}
+            org.opencontainers.image.revision=${{ inputs.release_sha }}
+            org.opencontainers.image.created=${{ inputs.created }}
+            io.e3dc.git.tree=${{ inputs.release_tree }}
+            io.e3dc.source.manifest=${{ inputs.source_manifest_sha256 }}
+          build-args: |
+            E3DC_VERSION=${{ needs.validate.outputs.version }}
+            E3DC_REVISION=${{ inputs.release_sha }}
+            E3DC_TREE=${{ inputs.release_tree }}
+            E3DC_CREATED=${{ inputs.created }}
+            E3DC_SOURCE_MANIFEST=${{ inputs.source_manifest_sha256 }}
+          sbom: true
+          provenance: mode=max
+      - name: Verify candidate before any stable tag exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash .github/scripts/verify-oci-release.sh \
+            "${{ needs.validate.outputs.image }}" "${{ steps.build.outputs.digest }}" \
+            "${{ inputs.release_sha }}" "${{ inputs.release_tree }}" \
+            "${{ needs.validate.outputs.version }}" "${{ inputs.created }}" \
+            "${{ inputs.source_manifest_sha256 }}"
+
+  b1b-promote:
+    if: ${{ inputs.phase == 'b1b-promote' }}
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout verifier from exact approved commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs.release_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Reverify immutable candidate digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash .github/scripts/verify-oci-release.sh \
+            "${{ needs.validate.outputs.image }}" "${{ inputs.candidate_digest }}" \
+            "${{ inputs.release_sha }}" "${{ inputs.release_tree }}" \
+            "${{ needs.validate.outputs.version }}" "${{ inputs.created }}" \
+            "${{ inputs.source_manifest_sha256 }}"
+      - name: Promote verified digest to stable version tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="${{ needs.validate.outputs.image }}"
+          digest="${{ inputs.candidate_digest }}"
+          docker buildx imagetools create --tag "${image}:${{ inputs.release_tag }}" "${image}@${digest}"
+          docker buildx imagetools create --tag "${image}:${{ needs.validate.outputs.version }}" "${image}@${digest}"
+          [ "$(docker buildx imagetools inspect "${image}:${{ inputs.release_tag }}" | awk '$1 == "Digest:" {print $2; exit}')" = "$digest" ]
+          if [ "${{ inputs.release_tag }}" = "v5.4.0" ]; then
+            docker buildx imagetools create --tag "${image}:latest" "${image}@${digest}"
+            [ "$(docker buildx imagetools inspect "${image}:latest" | awk '$1 == "Digest:" {print $2; exit}')" = "$digest" ]
+          fi

@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>E3DC-Control - Lade...</title>
+    <style>
+        body { background-color: #121212; color: #fff; font-family: -apple-system, sans-serif; text-align: center; padding-top: 20vh; margin: 0; }
+        .spinner { width: 40px; height: 40px; margin: 0 auto 20px auto; border: 4px solid rgba(255,255,255,0.1); border-left-color: #0dcaf0; border-radius: 50%; animation: spin 1s linear infinite; }
+        @keyframes spin { 100% { transform: rotate(360deg); } }
+    </style>
+    <script>
+        // Prüfen, ob ein mobiles Gerät (anhand User-Agent) oder schmaler Bildschirm verwendet wird
+        var isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent) || window.innerWidth < 768;
+        
+        var target = isMobile ? 'mobile.php' : 'index.php';
+        // Parameter (z.B. ?seite=config) nahtlos durchreichen
+        window.location.replace(target + window.location.search);
+    </script>
+</head>
+<body>
+    <div class="spinner"></div>
+</body>
+</html>

@@ -1,0 +1,2505 @@
+import json
+import os
+import logging
+import subprocess
+import sys
+import urllib.request
+import urllib.error
+import hashlib
+import io
+import math
+import re
+import zipfile
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+INSTALLER_DIR = os.path.dirname(SCRIPT_DIR)
+if INSTALLER_DIR not in sys.path:
+    sys.path.insert(0, INSTALLER_DIR)
+
+# Dynamischer Pfad analog zum Rest des Systems
+CONFIG_FILE = "/home/pi/E3DC-Control/e3dc.config.txt"
+if os.path.exists("/var/www/html/data/e3dc.config.txt"):
+    CONFIG_FILE = "/var/www/html/data/e3dc.config.txt"
+
+RAMDISK_DIR = "/var/www/html/ramdisk"
+if not os.path.exists(RAMDISK_DIR):
+    os.makedirs(RAMDISK_DIR, exist_ok=True)
+FORECAST_OUTPUT = os.path.join(RAMDISK_DIR, "pv_forecast.json")
+WEATHER_ALERTS_OUTPUT = os.path.join(RAMDISK_DIR, "weather_alerts.json")
+ML_PREDICTION_OUTPUT = os.path.join(RAMDISK_DIR, "ml_prediction.json")
+ML_MODEL_FILE = "/var/www/html/data/ml_model.pkl"
+MODEL_CACHE_FILE = "/var/www/html/logs/forecast_model_cache.json"
+FORECAST_EVAL_FILE = "/var/www/html/logs/pv_forecast_eval.json"
+DAILY_STATS_DB_PATH = "/var/www/html/data/e3dc_stats.db"
+DWD_CAP_WARNINGS_URL = (
+    "https://opendata.dwd.de/weather/alerts/cap/COMMUNEUNION_EVENT_STAT/"
+    "Z_CAP_C_EDZW_LATEST_PVW_STATUS_PREMIUMEVENT_COMMUNEUNION_DE.zip"
+)
+
+# --- Abruf-Intervalle pro Modell (in Sekunden) ---
+# Forecast.Solar: kostenlos, ~1000 Calls/Tag -> 60 Min reichen
+# Open-Meteo:    kostenlos, unlimitiert      -> 60 Min reichen
+# Solcast:       Home-PV default 10 Requests/Tag, exakt per Konto budgetiert
+MODEL_TTL = {
+    "m1": 60 * 60,     # Forecast.Solar: 1 Stunde
+    "m2": 60 * 60,     # Open-Meteo:     1 Stunde
+    "m3": 4 * 60 * 60  # Solcast:        Fallback ohne Sites
+}
+WEATHER_ALERT_TTL_S = 5 * 60
+ML_PREDICTION_MAX_AGE_S = 90 * 60
+SOLCAST_DEFAULT_CALLS_PER_DAY = 10
+SOLCAST_MIN_TTL_S = 60 * 60
+PV_PHYSICAL_PEAK_MARGIN = 1.03
+PV_CLOUD_EDGE_PEAK_MARGIN = 1.15
+PV_DAILY_SANITY_HISTORY_DAYS = 730
+PV_DAILY_SANITY_MIN_DAYS = 7
+PV_DAILY_SANITY_MARGIN = 1.08
+PV_DAILY_SANITY_DOY_WINDOW_DAYS = 45
+PV_BIAS_MIN_QUARTER_DAYS = 7
+PV_BIAS_CONFIRMATION_WINDOW_DAYS = 45
+PV_BIAS_CONFIRMATION_TOLERANCE = 0.06
+PV_BIAS_MIN_CONFIRMATIONS = 1
+PV_BIAS_SCHEMA3_GUARD_WINDOW_DAYS = 14
+PV_BIAS_SCHEMA3_VISIBLE_OVERSHOOT = 0.97
+PV_BIAS_SCHEMA3_GUARD_MARGIN = 1.06
+
+logger = logging.getLogger("EnsemblePVForecaster")
+
+def _roof_float(value):
+    return float(str(value).strip().replace(',', '.'))
+
+def _parse_roof_config(value):
+    text = str(value or "").strip()
+    if not text:
+        return []
+
+    roofs = []
+    if "/" in text:
+        pattern = r"(-?\d+(?:[.,]\d+)?)\s*/\s*(-?\d+(?:[.,]\d+)?)\s*/\s*(\d+(?:[.,]\d+)?)"
+        for match in re.finditer(pattern, text):
+            try:
+                roofs.append({
+                    "tilt": _roof_float(match.group(1)),
+                    "azimuth": _roof_float(match.group(2)),
+                    "kwp": _roof_float(match.group(3)),
+                })
+            except ValueError:
+                continue
+        if roofs:
+            return roofs
+
+    parts = [part.strip() for part in re.split(r"[,;/\s]+", text) if part.strip()]
+    if len(parts) >= 3:
+        try:
+            return [{
+                "tilt": _roof_float(parts[0]),
+                "azimuth": _roof_float(parts[1]),
+                "kwp": _roof_float(parts[2]),
+            }]
+        except ValueError:
+            return []
+    return []
+
+
+def _forecast_history_path():
+    return os.path.join(RAMDISK_DIR, "pv_forecast_history.json")
+
+
+def _forecast_site_descriptor(roofs, installed_kwp=None):
+    normalized_roofs = []
+    for roof in roofs or []:
+        try:
+            normalized_roofs.append({
+                "tilt": round(float(roof.get("tilt", 0.0)), 1),
+                "azimuth": round(float(roof.get("azimuth", 0.0)), 1),
+                "kwp": round(float(roof.get("kwp", 0.0)), 3),
+            })
+        except Exception:
+            continue
+    normalized_roofs.sort(key=lambda r: (r["azimuth"], r["tilt"], r["kwp"]))
+    try:
+        kwp = round(float(installed_kwp or 0.0), 3)
+    except Exception:
+        kwp = 0.0
+    return {
+        "roofs": normalized_roofs,
+        "configured_kwp": round(sum(r["kwp"] for r in normalized_roofs), 3),
+        "installed_kwp": kwp,
+    }
+
+
+def _forecast_site_signature(roofs, installed_kwp=None):
+    descriptor = _forecast_site_descriptor(roofs, installed_kwp)
+    payload = json.dumps(descriptor, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16], descriptor
+
+
+def _quarter_for_date(day):
+    if isinstance(day, datetime):
+        month = day.month
+    else:
+        month = day.month
+    return f"Q{(month - 1) // 3 + 1}"
+
+
+def _day_of_year_distance(a, b):
+    da = int(a.strftime("%j"))
+    db = int(b.strftime("%j"))
+    diff = abs(da - db)
+    return min(diff, 366 - diff)
+
+
+def _quarter_training_counts(daily_log, site_signature=None):
+    counts = {}
+    for entry in daily_log or []:
+        entry_signature = str(entry.get("site_signature") or "")
+        if site_signature and entry_signature and entry_signature != str(site_signature):
+            continue
+        day = _parse_iso_date(entry.get("date"))
+        quarter = str(entry.get("quarter") or (_quarter_for_date(day) if day else ""))
+        if not quarter:
+            continue
+        counts.setdefault(quarter, {"total": 0, "eligible": 0})
+        counts[quarter]["total"] += 1
+        if str(entry.get("clearsky_class") or "sunny") != "cloudy":
+            counts[quarter]["eligible"] += 1
+    return counts
+
+
+def _daily_log_entry_schema(entry):
+    if not isinstance(entry, dict):
+        return "unknown"
+    try:
+        schema_version = int(entry.get("schema_version") or 0)
+    except (TypeError, ValueError):
+        schema_version = 0
+    if (
+        schema_version >= 3
+        or (
+            "raw_forecast_kwh" in entry
+            and "bias_corrected_kwh" in entry
+            and "visible_forecast_kwh" in entry
+        )
+    ):
+        return "raw_bias_visible"
+    if "raw_forecast_kwh" in entry or "visible_forecast_kwh" in entry:
+        return "partial_raw_visible"
+    if "forecast_kwh" in entry and "actual_kwh" in entry:
+        return "legacy_forecast_only"
+    return "unknown"
+
+
+def _daily_log_schema_counts(daily_log, site_signature=None):
+    counts = {
+        "raw_bias_visible": 0,
+        "partial_raw_visible": 0,
+        "legacy_forecast_only": 0,
+        "unknown": 0,
+    }
+    for entry in daily_log or []:
+        entry_signature = str(entry.get("site_signature") or "")
+        if site_signature and entry_signature and entry_signature != str(site_signature):
+            continue
+        schema = _daily_log_entry_schema(entry)
+        counts[schema] = counts.get(schema, 0) + 1
+    return counts
+
+
+def _entry_bias_value(entry):
+    if not isinstance(entry, dict):
+        return None
+    for key in ("bias_raw", "bias_target", "bias_new"):
+        try:
+            value = float(entry.get(key))
+            if 0.2 <= value <= 3.0:
+                return value
+        except (TypeError, ValueError):
+            pass
+    try:
+        actual = float(entry.get("actual_kwh") or 0.0)
+        raw = float(entry.get("raw_forecast_kwh") or 0.0)
+        if actual > 0.5 and raw > 1.0:
+            value = actual / raw
+            if 0.2 <= value <= 3.0:
+                return value
+    except (TypeError, ValueError):
+        pass
+    try:
+        actual = float(entry.get("actual_kwh") or 0.0)
+        forecast = float(entry.get("forecast_kwh") or 0.0)
+        if actual > 0.5 and forecast > 1.0:
+            value = actual / forecast
+            if 0.2 <= value <= 3.0:
+                return value
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+def _bias_confirmation_status(
+    daily_log,
+    quarter,
+    bias,
+    now=None,
+    site_signature=None,
+    window_days=PV_BIAS_CONFIRMATION_WINDOW_DAYS,
+    tolerance=PV_BIAS_CONFIRMATION_TOLERANCE,
+):
+    now = now or datetime.now()
+    try:
+        now_day = now.date()
+    except AttributeError:
+        now_day = now
+    try:
+        bias_value = float(bias or 1.0)
+    except (TypeError, ValueError):
+        bias_value = 1.0
+    threshold = max(0.04, abs(bias_value) * float(tolerance))
+    confirmation_count = 0
+    recent_samples = 0
+    latest_confirmed_date = None
+    latest_confirmed_bias = None
+    latest_sample_date = None
+    latest_sample_bias = None
+
+    for entry in daily_log or []:
+        if not isinstance(entry, dict):
+            continue
+        entry_signature = str(entry.get("site_signature") or "")
+        if site_signature and entry_signature and entry_signature != str(site_signature):
+            continue
+        day = _parse_iso_date(entry.get("date"))
+        if not day:
+            continue
+        age_days = (now_day - day).days
+        if age_days < 0 or age_days > int(window_days):
+            continue
+        entry_quarter = str(entry.get("quarter") or _quarter_for_date(day))
+        if entry_quarter != str(quarter):
+            continue
+        if str(entry.get("clearsky_class") or "sunny") == "cloudy":
+            continue
+        value = _entry_bias_value(entry)
+        if value is None:
+            continue
+        recent_samples += 1
+        latest_sample_date = day.isoformat()
+        latest_sample_bias = value
+        if abs(value - bias_value) <= threshold:
+            confirmation_count += 1
+            latest_confirmed_date = day.isoformat()
+            latest_confirmed_bias = value
+
+    return {
+        "confirmed": confirmation_count >= PV_BIAS_MIN_CONFIRMATIONS,
+        "confirmation_count": confirmation_count,
+        "min_confirmations": PV_BIAS_MIN_CONFIRMATIONS,
+        "recent_samples": recent_samples,
+        "window_days": int(window_days),
+        "tolerance": round(float(tolerance), 4),
+        "threshold": round(threshold, 4),
+        "latest_confirmed_date": latest_confirmed_date,
+        "latest_confirmed_bias": round(latest_confirmed_bias, 4) if latest_confirmed_bias is not None else None,
+        "latest_sample_date": latest_sample_date,
+        "latest_sample_bias": round(latest_sample_bias, 4) if latest_sample_bias is not None else None,
+    }
+
+
+def _recent_schema3_visible_overshoot_guard(
+    daily_log,
+    quarter,
+    bias,
+    now=None,
+    site_signature=None,
+    window_days=PV_BIAS_SCHEMA3_GUARD_WINDOW_DAYS,
+    visible_ratio_threshold=PV_BIAS_SCHEMA3_VISIBLE_OVERSHOOT,
+    margin=PV_BIAS_SCHEMA3_GUARD_MARGIN,
+):
+    """Begrenzt alten Bias, wenn neue raw/visible-Tage sichtbare Überprognose zeigen."""
+    now = now or datetime.now()
+    try:
+        now_day = now.date()
+    except AttributeError:
+        now_day = now
+    try:
+        bias_value = float(bias or 1.0)
+    except (TypeError, ValueError):
+        bias_value = 1.0
+
+    recent_schema3 = []
+    for entry in daily_log or []:
+        if not isinstance(entry, dict):
+            continue
+        entry_signature = str(entry.get("site_signature") or "")
+        if site_signature and entry_signature and entry_signature != str(site_signature):
+            continue
+        if _daily_log_entry_schema(entry) != "raw_bias_visible":
+            continue
+        day = _parse_iso_date(entry.get("date"))
+        if not day:
+            continue
+        age_days = (now_day - day).days
+        if age_days < 0 or age_days > int(window_days):
+            continue
+        entry_quarter = str(entry.get("quarter") or _quarter_for_date(day))
+        if entry_quarter != str(quarter):
+            continue
+        if str(entry.get("clearsky_class") or "sunny") == "cloudy":
+            continue
+        try:
+            visible_ratio = float(entry.get("visible_ratio"))
+        except (TypeError, ValueError):
+            continue
+        target = None
+        for key in ("bias_target", "bias_raw", "bias_new"):
+            try:
+                candidate = float(entry.get(key))
+                if 0.2 <= candidate <= 3.0:
+                    target = candidate
+                    break
+            except (TypeError, ValueError):
+                continue
+        if target is None:
+            continue
+        recent_schema3.append({
+            "date": day.isoformat(),
+            "visible_ratio": round(visible_ratio, 4),
+            "bias_target": round(target, 4),
+            "bias_raw": entry.get("bias_raw"),
+            "bias_new": entry.get("bias_new"),
+        })
+
+    overshoots = [
+        item for item in recent_schema3
+        if item["visible_ratio"] < float(visible_ratio_threshold)
+        and item["bias_target"] < bias_value - 0.005
+    ]
+    latest = recent_schema3[-1] if recent_schema3 else None
+    latest_overshoot = overshoots[-1] if overshoots else None
+    result = {
+        "active": False,
+        "reason": "no_recent_schema3_overshoot",
+        "window_days": int(window_days),
+        "visible_ratio_threshold": round(float(visible_ratio_threshold), 4),
+        "guard_margin": round(float(margin), 4),
+        "schema3_recent_samples": len(recent_schema3),
+        "schema3_overshoot_samples": len(overshoots),
+        "latest_schema3": latest,
+        "latest_overshoot": latest_overshoot,
+    }
+    if not latest_overshoot:
+        return result
+
+    guarded_bias = max(0.75, min(bias_value, latest_overshoot["bias_target"] * float(margin)))
+    result["effective_bias_cap"] = round(guarded_bias, 4)
+    if guarded_bias < bias_value - 0.005:
+        result["active"] = True
+        result["reason"] = "recent_schema3_visible_overshoot"
+    return result
+
+
+def _load_forecast_eval(eval_path=FORECAST_EVAL_FILE):
+    if os.path.exists(eval_path):
+        with open(eval_path, 'r') as f:
+            data = json.load(f)
+    else:
+        data = {"version": 3, "daily_log": [], "seasonal_bias": {}, "last_update": ""}
+
+    if "daily_errors" in data and "daily_log" not in data:
+        data["daily_log"] = []
+        data["seasonal_bias"] = {}
+        data["version"] = 2
+        logger.info("pv_forecast_eval.json: Migration auf Version 2 (EWMA-Bias).")
+
+    data.setdefault("daily_log", [])
+    data.setdefault("seasonal_bias", {})
+    data.setdefault("last_update", "")
+    data["version"] = max(int(data.get("version", 1) or 1), 3)
+    return data
+
+
+def _ensure_eval_site_signature(eval_data, site_signature=None, site_descriptor=None, now=None):
+    if not site_signature:
+        return eval_data, False
+    now = now or datetime.now()
+    current = str(site_signature)
+    stored = str(eval_data.get("site_signature") or "")
+    changed = bool(stored and stored != current)
+    if changed:
+        eval_data["seasonal_bias"] = {}
+        eval_data["daily_log"] = []
+        eval_data["last_update"] = ""
+        eval_data["site_signature_changed_at"] = now.isoformat(timespec='seconds')
+        eval_data["site_signature_seen_at"] = now.isoformat(timespec='seconds')
+        eval_data["signature_reset_reason"] = "roof_config_changed"
+        logger.warning(
+            "PV-Prognose-Kalibrierung zurückgesetzt: Dach-/Anlagen-Signatur hat sich geändert "
+            f"({stored} -> {current})."
+        )
+    elif not stored:
+        eval_data["site_signature_seen_at"] = eval_data.get("site_signature_seen_at") or ""
+
+    eval_data["site_signature"] = current
+    if site_descriptor is not None:
+        eval_data["site_descriptor"] = site_descriptor
+    return eval_data, changed
+
+
+def _slot_kw(slot, *keys):
+    for key in keys:
+        if key in slot and slot.get(key) is not None:
+            try:
+                return float(slot.get(key) or 0.0)
+            except Exception:
+                continue
+    return 0.0
+
+
+def _slots_energy_kwh(slots, field="predicted_kwh"):
+    total = 0.0
+    for slot in slots or []:
+        total += _slot_kw(slot, field) * 0.25
+    return total
+
+
+def _daily_forecast_totals(slots):
+    """Summiert Tages-/Restprognosen getrennt nach Roh-, Bias- und Anzeige-Wert."""
+    by_day = {}
+    for slot in slots or []:
+        try:
+            day = datetime.fromtimestamp(slot["start_timestamp"] / 1000).strftime("%Y-%m-%d")
+        except Exception:
+            continue
+        entry = by_day.setdefault(day, {
+            "day": day,
+            "slots": 0,
+            "raw_kwh": 0.0,
+            "bias_corrected_kwh": 0.0,
+            "displayed_kwh": 0.0,
+            "predicted_kwh": 0.0,
+        })
+        entry["slots"] += 1
+        entry["raw_kwh"] += _slot_kw(slot, "raw_predicted_kwh", "predicted_kwh") * 0.25
+        entry["bias_corrected_kwh"] += _slot_kw(slot, "bias_corrected_kwh", "predicted_kwh") * 0.25
+        entry["displayed_kwh"] += _slot_kw(slot, "displayed_predicted_kwh", "predicted_kwh") * 0.25
+        entry["predicted_kwh"] += _slot_kw(slot, "predicted_kwh") * 0.25
+
+    result = []
+    for day in sorted(by_day):
+        entry = by_day[day]
+        for key in ("raw_kwh", "bias_corrected_kwh", "displayed_kwh", "predicted_kwh"):
+            entry[key] = round(entry[key], 2)
+        result.append(entry)
+    return result
+
+
+def _mark_raw_forecast_slots(slots):
+    marked = []
+    for slot in slots or []:
+        slot = dict(slot)
+        raw_kw = _slot_kw(slot, "raw_predicted_kwh", "predicted_kwh")
+        slot["raw_predicted_kwh"] = round(raw_kw, 4)
+        slot.setdefault("bias_corrected_kwh", round(_slot_kw(slot, "predicted_kwh"), 4))
+        marked.append(slot)
+    return marked
+
+
+def _mark_displayed_forecast_slots(slots):
+    marked = []
+    for slot in slots or []:
+        slot = dict(slot)
+        slot["displayed_predicted_kwh"] = round(_slot_kw(slot, "predicted_kwh"), 4)
+        marked.append(slot)
+    return marked
+
+class EnsemblePVForecaster:
+    def __init__(self):
+        self.config = self._load_config()
+        self.v4_config = self._load_v4_config()
+        self._model_cache = self._load_model_cache()
+        
+        # Favorisiere v4_config für Standortdaten
+        self.lat = float(self.v4_config.get('hoehe', self.config.get('hoehe', 51.16)))
+        self.lon = float(self.v4_config.get('laenge', self.config.get('laenge', 10.45)))
+        
+        # Parsen aller Dachflächen (z.B. "35/0/10.0" = Neigung/Azimuth/kWp)
+        self.roofs = []
+        for key in ['forecast1', 'forecast2', 'forecast3']:
+            # V4-Config hat Vorrang, Fallback auf alte e3dc.config.txt
+            val = self.v4_config.get(key) or self.config.get(key)
+            roofs = _parse_roof_config(val)
+            if roofs:
+                self.roofs.extend(roofs)
+            elif val:
+                logger.error(f"Ungueltiges Format fuer Dach: {val}")
+        # Fallback falls nichts konfiguriert
+        if not self.roofs:
+            self.roofs.append({"tilt": 35, "azimuth": 0, "kwp": 10.0})
+        
+        # Für Open-Meteo (welches keine Ausrichtung kennt) berechnen wir die Gesamt-kWp
+        self.configured_total_kwp = sum(r['kwp'] for r in self.roofs)
+        self.total_kwp = self.configured_total_kwp
+        self._update_kwp_from_live()
+
+    def _update_kwp_from_live(self):
+        live_path = os.path.join(RAMDISK_DIR, "live_data_py.json")
+        if os.path.exists(live_path):
+            try:
+                with open(live_path, 'r') as f:
+                    d = json.load(f)
+                    installed_kwp_values = []
+                    peak_valid = d.get("installed_peak_power_valid")
+                    peak_source = str(d.get("installed_peak_power_source") or "rscp").strip()
+                    if peak_valid is False:
+                        installed_kwp = None
+                        logger.warning(
+                            "E3DC-PV-Leistung nicht vertrauenswuerdig "
+                            f"({peak_source}); behalte konfigurierte "
+                            f"{float(getattr(self, 'configured_total_kwp', self.total_kwp) or 0.0):.2f} kWp."
+                        )
+                    elif "installed_peak_power_w" in d:
+                        installed_kwp_values.append(float(d.get("installed_peak_power_w") or 0.0) / 1000.0)
+                    if peak_valid is not False and "installed_peak_power_kwp" in d:
+                        installed_kwp_values.append(float(d.get("installed_peak_power_kwp") or 0.0))
+                    if peak_valid is not False:
+                        installed_kwp = max(installed_kwp_values) if installed_kwp_values else None
+
+                    if installed_kwp is not None:
+                        live_pv_kw = max(
+                            0.0,
+                            float(d.get("PV_Power") or 0.0) / 1000.0,
+                            float(d.get("Ext_PV_Power") or 0.0) / 1000.0,
+                        )
+                        configured_kwp = float(getattr(self, "configured_total_kwp", self.total_kwp) or 0.0)
+                        if installed_kwp <= 0.0:
+                            logger.warning(
+                                "E3DC meldet installierte PV-Leistung 0.00 kWp; "
+                                f"behalte konfigurierte {configured_kwp:.2f} kWp."
+                            )
+                        elif live_pv_kw > 0.5 and installed_kwp < live_pv_kw * 0.85:
+                            logger.warning(
+                                f"E3DC-PV-Leistung {installed_kwp:.2f} kWp ist kleiner als aktuelle "
+                                f"PV-Leistung {live_pv_kw:.2f} kW; behalte konfigurierte {configured_kwp:.2f} kWp."
+                            )
+                        else:
+                            self.total_kwp = installed_kwp
+                            logger.info(f"PV-Leistung auf reale {self.total_kwp:.2f} kWp angepasst (aus E3DC).")
+            except: pass
+
+        # Die Gewichte aus der Zukunft (können später dynamisch vom Evaluator überschrieben werden)
+        self.weight_m1 = float(self.config.get('pv_score_m1', 0.4))
+        self.weight_m2 = float(self.config.get('pv_score_m2', 0.2))
+        self.weight_m3 = float(self.config.get('pv_score_m3', 0.4)) # Solcast
+
+        # Solcast Rooftop Sites (bevorzugt aus v4.json).
+        # FC1 nutzt Konto 1. FC2/FC3 nutzen Konto 2 wenn gesetzt, sonst Konto 1.
+        self.solcast_api_key = str(self.v4_config.get('solcast_api_key', self.config.get('solcast_api_key', '')) or '').strip()
+        self.solcast_api_key_2 = str(self.v4_config.get('solcast_api_key_2', self.config.get('solcast_api_key_2', '')) or '').strip()
+        self.solcast_calls_per_day = self._solcast_calls_per_day("solcast_calls_per_day", SOLCAST_DEFAULT_CALLS_PER_DAY)
+        self.solcast_calls_per_day_2 = self._solcast_calls_per_day("solcast_calls_per_day_2", self.solcast_calls_per_day)
+        self.solcast_resource_id = str(self.v4_config.get('solcast_resource_id', self.config.get('solcast_resource_id', '')) or '').strip()
+        self.solcast_resource_id_2 = str(self.v4_config.get('solcast_resource_id_2', self.config.get('solcast_resource_id_2', '')) or '').strip()
+        self.solcast_resource_id_3 = str(self.v4_config.get('solcast_resource_id_3', self.config.get('solcast_resource_id_3', '')) or '').strip()
+        self.solcast_sites = []
+        if self.solcast_resource_id and self.solcast_api_key:
+            self.solcast_sites.append(("FC1", self.solcast_resource_id, self.solcast_api_key))
+        if self.solcast_resource_id_2:
+            api_key = self.solcast_api_key_2 or self.solcast_api_key
+            if api_key:
+                self.solcast_sites.append(("FC2", self.solcast_resource_id_2, api_key))
+        if self.solcast_resource_id_3:
+            api_key = self.solcast_api_key_2 or self.solcast_api_key
+            if api_key:
+                self.solcast_sites.append(("FC3", self.solcast_resource_id_3, api_key))
+        sig_src = "|".join(f"{label}:{resource}" for label, resource, _api in self.solcast_sites)
+        self.solcast_signature = hashlib.sha256(sig_src.encode("utf-8")).hexdigest() if sig_src else ""
+        self.solcast_ttl_s = self._solcast_dynamic_ttl_s()
+
+    def _solar_window_hours(self, day_date):
+        try:
+            doy = day_date.timetuple().tm_yday
+            decl = math.radians(23.45 * math.sin(2.0 * math.pi * (doy - 81) / 364.0))
+            lat_r = math.radians(max(-66.0, min(66.0, float(self.lat))))
+            cos_ha = -math.tan(lat_r) * math.tan(decl)
+            cos_ha = max(-0.999, min(0.999, cos_ha))
+            ha_h = math.degrees(math.acos(cos_ha)) / 15.0
+            timezone_center_lon = 15.0
+            solar_noon = 12.0 - ((float(self.lon) - timezone_center_lon) / 15.0)
+            return max(3.0, solar_noon - ha_h), solar_noon, min(22.5, solar_noon + ha_h)
+        except Exception:
+            return 6.0, 12.5, 19.0
+
+    def _pv_daylight_factor(self, slot_dt):
+        sunrise, _solar_noon, sunset = self._solar_window_hours(slot_dt.date())
+        hour = slot_dt.hour + slot_dt.minute / 60.0 + slot_dt.second / 3600.0
+        if sunrise >= sunset or hour <= sunrise or hour >= sunset:
+            return 0.0
+        progress = (hour - sunrise) / max(0.1, sunset - sunrise)
+        return max(0.0, math.sin(math.pi * progress))
+
+    def _solcast_calls_per_day(self, key, default):
+        raw = self.v4_config.get(key, self.config.get(key, default))
+        try:
+            calls = int(float(raw))
+        except (TypeError, ValueError):
+            calls = int(default)
+        return max(1, min(500, calls))
+
+    def _solcast_limit_for_api_key(self, api_key):
+        if self.solcast_api_key_2 and api_key == self.solcast_api_key_2:
+            return self.solcast_calls_per_day_2
+        return self.solcast_calls_per_day
+
+    def _solcast_dynamic_ttl_s(self):
+        """Keeps each Solcast API key below the configured daily request quota."""
+        if not self.solcast_sites:
+            return MODEL_TTL["m3"]
+        sites_per_key = {}
+        for _label, _resource_id, api_key in self.solcast_sites:
+            sites_per_key[api_key] = sites_per_key.get(api_key, 0) + 1
+        ttl_requirements = []
+        for api_key, site_count in sites_per_key.items():
+            calls_per_day = self._solcast_limit_for_api_key(api_key)
+            ttl_requirements.append(math.ceil((24 * 60 * 60 * site_count) / calls_per_day))
+        min_ttl_for_quota = max(ttl_requirements or [MODEL_TTL["m3"]])
+        # Auf 15-Minuten-Grenzen aufrunden, damit Restarts die Tagesquote nicht langsam ueberziehen.
+        quota_safe_ttl = int(math.ceil(min_ttl_for_quota / 900.0) * 900)
+        ttl = max(SOLCAST_MIN_TTL_S, quota_safe_ttl)
+        if ttl != MODEL_TTL["m3"] or len(sites_per_key) > 1:
+            logger.info(
+                "Model 3 (Solcast): %d Site(s) auf %d API-Key(s), Tagesbudget %s -> TTL %.2fh."
+                % (
+                    len(self.solcast_sites),
+                    len(sites_per_key),
+                    ",".join(str(self._solcast_limit_for_api_key(k)) for k in sites_per_key.keys()),
+                    ttl / 3600.0,
+                )
+            )
+        return ttl
+
+    def _load_model_cache(self):
+        """Laedt zwischengespeicherte Modell-Daten (Zeitstempel + Daten pro Modell)."""
+        if os.path.exists(MODEL_CACHE_FILE):
+            try:
+                with open(MODEL_CACHE_FILE, 'r') as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {}
+
+    def _save_model_cache(self):
+        """Persistiert den Model-Cache auf Disk (ueberlebt Neustarts)."""
+        try:
+            with open(MODEL_CACHE_FILE, 'w') as f:
+                json.dump(self._model_cache, f)
+        except Exception as e:
+            logger.warning(f"Konnte Model-Cache nicht speichern: {e}")
+
+    def _model_is_stale(self, model_id: str) -> bool:
+        """Gibt True zurueck wenn das Modell neu abgerufen werden muss."""
+        import time as _t
+        cached = self._model_cache.get(model_id, {})
+        if model_id == "m3" and cached.get("sig", "") != getattr(self, "solcast_signature", ""):
+            logger.info("Modell m3: Solcast-Konfiguration geaendert - Cache wird erneuert.")
+            return True
+        last_ts = cached.get('ts', 0)
+        ttl = getattr(self, "solcast_ttl_s", MODEL_TTL.get(model_id, 3600)) if model_id == "m3" else MODEL_TTL.get(model_id, 3600)
+        age = _t.time() - last_ts
+        if age >= ttl:
+            logger.info(f"Modell {model_id}: Abruf noetig (Alter {age/60:.0f}min, TTL {ttl/60:.0f}min).")
+            return True
+        logger.info(f"Modell {model_id}: Cache gueltig ({age/60:.0f}min alt, TTL {ttl/60:.0f}min) - ueberspringe API Call.")
+        return False
+
+    def _get_model_data(self, model_id: str):
+        """Gibt gecachte Modell-Daten zurueck (dict ts->kwh), oder leeres dict."""
+        return self._model_cache.get(model_id, {}).get('data', {})
+
+    def _set_model_data(self, model_id: str, data: dict):
+        """Speichert Modell-Daten in den Cache."""
+        import time as _t
+        if data:  # Nur bei echten Daten cachen, nicht bei leeren Ergebnissen
+            entry = {'ts': _t.time(), 'data': data}
+            if model_id == "m3":
+                entry["sig"] = getattr(self, "solcast_signature", "")
+            self._model_cache[model_id] = entry
+            self._save_model_cache()
+
+    def _load_v4_config(self):
+        v4_path = "/var/www/html/data/e3dc_v4.json"
+        if os.path.exists(v4_path):
+            try:
+                with open(v4_path, 'r') as f:
+                    return json.load(f)
+            except: pass
+        return {}
+
+    def _load_config(self):
+        conf = {}
+        if not os.path.exists(CONFIG_FILE): return conf
+        with open(CONFIG_FILE, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith('#') or '=' not in line: continue
+                k, v = line.split('=', 1)
+                conf[k.strip().lower()] = v.strip()
+        return conf
+
+    def _write_weather_alerts(self, payload):
+        try:
+            payload["fetched_at"] = datetime.now().isoformat(timespec='seconds')
+            payload["lat"] = round(float(self.lat), 6)
+            payload["lon"] = round(float(self.lon), 6)
+            with open(WEATHER_ALERTS_OUTPUT, 'w') as f:
+                json.dump(payload, f, indent=2)
+            logger.info(
+                "Wetterwarnungen gespeichert: active=%s alerts=%s risk=%s"
+                % (payload.get("active"), len(payload.get("alerts") or []), (payload.get("risk") or {}).get("level"))
+            )
+        except Exception as e:
+            logger.warning(f"Wetterwarnungen konnten nicht gespeichert werden: {e}")
+
+    def _parse_cap_datetime(self, value):
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    def _dt_epoch(self, dt_obj):
+        try:
+            return int(dt_obj.timestamp()) if dt_obj else None
+        except Exception:
+            return None
+
+    def _severity_level(self, severity):
+        return {
+            "minor": 1,
+            "moderate": 2,
+            "severe": 3,
+            "extreme": 4,
+        }.get(str(severity or "").strip().lower(), 0)
+
+    def _point_in_polygon(self, lat, lon, polygon_text):
+        points = []
+        for token in str(polygon_text or "").replace("\n", " ").split():
+            if "," not in token:
+                continue
+            try:
+                p_lat, p_lon = token.split(",", 1)
+                points.append((float(p_lon), float(p_lat)))
+            except Exception:
+                continue
+        if len(points) < 3:
+            return False
+
+        x, y = float(lon), float(lat)
+        inside = False
+        j = len(points) - 1
+        for i in range(len(points)):
+            xi, yi = points[i]
+            xj, yj = points[j]
+            crosses = ((yi > y) != (yj > y))
+            if crosses:
+                x_at_y = (xj - xi) * (y - yi) / ((yj - yi) or 1e-12) + xi
+                if x < x_at_y:
+                    inside = not inside
+            j = i
+        return inside
+
+    def _cap_child_text(self, node, tag, ns):
+        value = node.findtext(f"cap:{tag}", default="", namespaces=ns)
+        return value.strip() if isinstance(value, str) else value
+
+    def _cap_pairs(self, parent, pair_tag, ns):
+        pairs = {}
+        for item in parent.findall(f"cap:{pair_tag}", ns):
+            name = self._cap_child_text(item, "valueName", ns)
+            value = self._cap_child_text(item, "value", ns)
+            if name:
+                pairs[name] = value
+        return pairs
+
+    def _fetch_dwd_cap_alerts_for_location(self):
+        req = urllib.request.Request(DWD_CAP_WARNINGS_URL, headers={'User-Agent': 'E3DC-Control-V4'})
+        with urllib.request.urlopen(req, timeout=15) as response:
+            zip_bytes = response.read()
+
+        alerts = []
+        now_ts = datetime.now().timestamp()
+        ns = {"cap": "urn:oasis:names:tc:emergency:cap:1.2"}
+
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as archive:
+            for entry in archive.infolist():
+                if not entry.filename.lower().endswith(".xml"):
+                    continue
+                try:
+                    root = ET.fromstring(archive.read(entry))
+                except Exception:
+                    continue
+
+                infos = root.findall("cap:info", ns)
+                if not infos:
+                    continue
+                info = None
+                for candidate in infos:
+                    lang = self._cap_child_text(candidate, "language", ns).lower()
+                    if lang.startswith("de"):
+                        info = candidate
+                        break
+                if info is None:
+                    info = infos[0]
+
+                polygons = []
+                region = ""
+                for area in info.findall("cap:area", ns):
+                    region = region or self._cap_child_text(area, "areaDesc", ns)
+                    polygons.extend([
+                        p.text or "" for p in area.findall("cap:polygon", ns)
+                        if (p.text or "").strip()
+                    ])
+
+                if not polygons or not any(self._point_in_polygon(self.lat, self.lon, poly) for poly in polygons):
+                    continue
+
+                event = self._cap_child_text(info, "event", ns)
+                headline = self._cap_child_text(info, "headline", ns)
+                description = self._cap_child_text(info, "description", ns)
+                instruction = self._cap_child_text(info, "instruction", ns)
+                severity = self._cap_child_text(info, "severity", ns)
+                certainty = self._cap_child_text(info, "certainty", ns)
+                urgency = self._cap_child_text(info, "urgency", ns)
+                onset = self._parse_cap_datetime(self._cap_child_text(info, "onset", ns))
+                expires = self._parse_cap_datetime(self._cap_child_text(info, "expires", ns))
+                effective = self._parse_cap_datetime(self._cap_child_text(info, "effective", ns))
+                start = onset or effective
+                start_ts = self._dt_epoch(start)
+                end_ts = self._dt_epoch(expires)
+
+                if end_ts is not None and end_ts < now_ts:
+                    continue
+                if start_ts is not None and start_ts - now_ts > 36 * 3600:
+                    continue
+
+                event_codes = self._cap_pairs(info, "eventCode", ns)
+                parameters = self._cap_pairs(info, "parameter", ns)
+                search_text = " ".join([
+                    event or "", headline or "", description or "",
+                    event_codes.get("GROUP", ""), event_codes.get("II", "")
+                ]).upper()
+                thunderstorm = "GEWITTER" in search_text or event_codes.get("GROUP", "").upper() in ("THUNDERSTORM", "CONVECTIVE")
+                active_now = (start_ts is None or start_ts <= now_ts) and (end_ts is None or now_ts <= end_ts)
+
+                alerts.append({
+                    "source": "dwd_cap",
+                    "event": event,
+                    "headline": headline or event,
+                    "description": description,
+                    "instruction": instruction,
+                    "severity": severity,
+                    "level": self._severity_level(severity),
+                    "certainty": certainty,
+                    "urgency": urgency,
+                    "region": region,
+                    "start": start.isoformat(timespec='seconds') if start else None,
+                    "end": expires.isoformat(timespec='seconds') if expires else None,
+                    "start_ts": start_ts,
+                    "end_ts": end_ts,
+                    "active_now": active_now,
+                    "upcoming": bool(start_ts is not None and start_ts > now_ts),
+                    "thunderstorm": thunderstorm,
+                    "event_codes": event_codes,
+                    "parameters": parameters,
+                })
+
+        alerts.sort(key=lambda a: (
+            0 if a.get("active_now") else 1,
+            0 if a.get("thunderstorm") else 1,
+            -int(a.get("level") or 0),
+            int(a.get("start_ts") or 0),
+        ))
+        return alerts
+
+    def _fetch_open_meteo_storm_risk(self):
+        url = (
+            f"https://api.open-meteo.com/v1/dwd-icon"
+            f"?latitude={self.lat}&longitude={self.lon}"
+            f"&hourly=weather_code,lightning_potential,precipitation,showers,wind_gusts_10m"
+            f"&timezone=Europe%2FBerlin&forecast_days=2"
+        )
+        req = urllib.request.Request(url, headers={'User-Agent': 'E3DC-Control-V4'})
+        with urllib.request.urlopen(req, timeout=10) as response:
+            data = json.loads(response.read().decode())
+
+        hourly = data.get("hourly", {})
+        times = hourly.get("time", [])
+        codes = hourly.get("weather_code", [])
+        lpi_values = hourly.get("lightning_potential", [])
+        precip_values = hourly.get("precipitation", [])
+        shower_values = hourly.get("showers", [])
+        gust_values = hourly.get("wind_gusts_10m", [])
+
+        now_ts = datetime.now().timestamp()
+        horizon_ts = now_ts + 18 * 3600
+        peak = {
+            "level": 0,
+            "reason": "Keine erhoehte Gewittertendenz im ICON-Kurzfristmodell.",
+            "weather_code": None,
+            "lpi": 0.0,
+            "precip_mm": 0.0,
+            "showers_mm": 0.0,
+            "wind_gust_kmh": 0.0,
+            "time": None,
+            "ts": None,
+        }
+        current_weather = None
+
+        for i, time_str in enumerate(times):
+            try:
+                ts = datetime.strptime(time_str, "%Y-%m-%dT%H:%M").timestamp()
+            except Exception:
+                continue
+            if ts < now_ts - 3600 or ts > horizon_ts:
+                continue
+
+            code = int(codes[i]) if i < len(codes) and codes[i] is not None else None
+            lpi = float(lpi_values[i]) if i < len(lpi_values) and lpi_values[i] is not None else 0.0
+            precip = float(precip_values[i]) if i < len(precip_values) and precip_values[i] is not None else 0.0
+            showers = float(shower_values[i]) if i < len(shower_values) and shower_values[i] is not None else 0.0
+            gust = float(gust_values[i]) if i < len(gust_values) and gust_values[i] is not None else 0.0
+
+            level = 0
+            reason = "Keine erhoehte Gewittertendenz im ICON-Kurzfristmodell."
+            if code in (96, 99) or lpi >= 2000:
+                level = 3
+                reason = "ICON meldet starkes Gewitterrisiko."
+            elif code == 95 or lpi >= 500:
+                level = 2
+                reason = "ICON meldet Gewittertendenz."
+            elif lpi >= 50 or (showers >= 1.0 and gust >= 50):
+                level = 1
+                reason = "ICON zeigt konvektive Schauer/Boen, PV-Einbruch moeglich."
+
+            sample = {
+                "weather_code": code,
+                "lpi": round(lpi, 1),
+                "precip_mm": round(precip, 2),
+                "showers_mm": round(showers, 2),
+                "wind_gust_kmh": round(gust, 1),
+                "time": time_str,
+                "ts": int(ts),
+            }
+            if current_weather is None or abs(ts - now_ts) < abs(float(current_weather.get("ts", 0)) - now_ts):
+                current_weather = sample
+
+            better = level > peak["level"] or (level == peak["level"] and lpi > peak["lpi"])
+            if better:
+                peak = {
+                    "level": level,
+                    "active": level > 0,
+                    "reason": reason,
+                    **sample,
+                }
+
+        if int(peak.get("level") or 0) <= 0 and current_weather:
+            peak.update(current_weather)
+            peak["reason"] = "Keine erhoehte Gewittertendenz; aktueller ICON-Wetterzustand."
+            peak["active"] = False
+
+        peak["source"] = "open-meteo/dwd-icon"
+        peak["active"] = bool(peak.get("level", 0) > 0)
+        return peak
+
+    def update_weather_alerts(self):
+        payload = {
+            "source": "dwd_cap+open_meteo_dwd_icon",
+            "active": False,
+            "thunderstorm_active": False,
+            "title": "Keine Wetterwarnung",
+            "summary": "Keine aktive DWD-Warnung am Standort.",
+            "alerts": [],
+            "risk": {"source": "open-meteo/dwd-icon", "active": False, "level": 0},
+            "errors": [],
+        }
+
+        try:
+            payload["alerts"] = self._fetch_dwd_cap_alerts_for_location()
+        except Exception as e:
+            msg = f"DWD CAP Warnungen nicht abrufbar: {e}"
+            logger.warning(msg)
+            payload["errors"].append(msg)
+
+        try:
+            payload["risk"] = self._fetch_open_meteo_storm_risk()
+        except Exception as e:
+            msg = f"Open-Meteo Gewitterrisiko nicht abrufbar: {e}"
+            logger.warning(msg)
+            payload["errors"].append(msg)
+
+        alerts = payload.get("alerts") or []
+        top_alert = alerts[0] if alerts else None
+        risk = payload.get("risk") or {}
+        has_dwd = bool(top_alert)
+        has_risk = bool(risk.get("active"))
+        thunder = any(bool(a.get("thunderstorm")) for a in alerts) or (int(risk.get("level") or 0) >= 2)
+
+        payload["active"] = has_dwd or has_risk
+        payload["thunderstorm_active"] = thunder
+        payload["highest_level"] = max([int(a.get("level") or 0) for a in alerts] + [int(risk.get("level") or 0)])
+
+        if top_alert:
+            label = "Gewitterwarnung" if top_alert.get("thunderstorm") else "Wetterwarnung"
+            payload["title"] = f"{label}: {top_alert.get('event') or top_alert.get('headline')}"
+            payload["summary"] = top_alert.get("headline") or top_alert.get("description") or payload["title"]
+            payload["start"] = top_alert.get("start")
+            payload["end"] = top_alert.get("end")
+        elif has_risk:
+            payload["title"] = "Gewitterrisiko"
+            payload["summary"] = risk.get("reason") or "ICON meldet erhoehtes Gewitterrisiko."
+            payload["start"] = risk.get("time")
+            payload["end"] = None
+
+        self._write_weather_alerts(payload)
+
+    def fetch_model_1_forecast_solar(self):
+        """Holt Prognose von Forecast.Solar (Standard in der PV Community)"""
+        parsed_model_total = {}
+        successful_fetches = 0
+        
+        for idx, roof in enumerate(self.roofs):
+            # API Erwartet Azimuth: 0=Süd, -90=Ost
+            url = f"https://api.forecast.solar/estimate/{self.lat}/{self.lon}/{roof['tilt']}/{roof['azimuth']}/{roof['kwp']}"
+            logger.info(f"Hole Model 1 (Forecast.Solar) Tag {idx+1}: {url}")
+            
+            try:
+                req = urllib.request.Request(url, headers={'User-Agent': 'E3DC-Control-V4'})
+                with urllib.request.urlopen(req, timeout=10) as response:
+                    data = json.loads(response.read().decode())
+                    
+                    # Format: {"result": {"watts": {"2024-10-10 08:00:00": 1500, ...}}}
+                    hourly_watts = data.get('result', {}).get('watts', {})
+                    
+                    for time_str, watts in hourly_watts.items():
+                        # Parse "YYYY-MM-DD HH:MM:SS" -> datetime object
+                        dt = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
+                        unix_h = int(dt.replace(minute=0, second=0).timestamp())
+                        # Speichere als kWh fuer diese Stunde (Key IMMER int!)
+                        kwh = float(watts) / 1000.0
+                        if unix_h in parsed_model_total:
+                            parsed_model_total[unix_h] += kwh
+                        else:
+                            parsed_model_total[unix_h] = kwh
+                    successful_fetches += 1
+            except Exception as e:
+                logger.error(f"Fehler bei Model 1 Dach {idx+1}: {e}")
+                
+        if successful_fetches > 0:
+            return parsed_model_total
+        return {}
+
+    def fetch_model_2_open_meteo(self):
+        """Holt Strahlung UND Temperatur von Open-Meteo (Zweit-Modell + Wetter-Prognose)"""
+        # Wir berechnen den PV-Ertrag auf Basis der exakten Dach-Geometrie (global_tilted_irradiance)
+        # und nutzen dafuer direkt das Ensemble aus: best_match, icon_d2, ecmwf_ifs025 
+        
+        parsed_model_total = {}
+        weather_by_ts = {}
+        successful_fetches = 0
+
+        for idx, roof in enumerate(self.roofs):
+            # Open-Meteo nutzt dieselbe Solar-Konvention wie Forecast.Solar:
+            # Sued=0, West=90, Ost=-90
+            om_azimuth = roof['azimuth']
+            
+            url = (
+                f"https://api.open-meteo.com/v1/forecast"
+                f"?latitude={self.lat}&longitude={self.lon}"
+                f"&hourly=global_tilted_irradiance,temperature_2m"
+                f"&tilt={roof['tilt']}&azimuth={om_azimuth}"
+                f"&timezone=Europe%2FBerlin&models=best_match,icon_d2,ecmwf_ifs025&forecast_days=4"
+            )
+            logger.info(f"Hole Model 2 Dach {idx+1} (Open-Meteo Ensemble): {url}")
+
+            try:
+                req = urllib.request.Request(url, headers={'User-Agent': 'E3DC-Control-V4'})
+                with urllib.request.urlopen(req, timeout=10) as response:
+                    data = json.loads(response.read().decode())
+                    
+                    times = data['hourly']['time']
+                    
+                    # Modelle abrufen (Falls ein Modell fehlt, z.B. icon_d2 ausserhalb Europas, Fallback)
+                    rad_best  = data['hourly'].get('global_tilted_irradiance_best_match', [])
+                    rad_icon  = data['hourly'].get('global_tilted_irradiance_icon_d2', [])
+                    rad_ecmwf = data['hourly'].get('global_tilted_irradiance_ecmwf_ifs025', [])
+                    
+                    if not rad_best:
+                        rad_best = data['hourly'].get('global_tilted_irradiance', [])
+                    
+                    if not rad_icon: rad_icon = rad_best
+                    if not rad_ecmwf: rad_ecmwf = rad_best
+
+                    # Temp fuer ML (nur 1x pro Zeitslot noetig, egal welches Dach)
+                    temp_2m = data['hourly'].get('temperature_2m_best_match', data['hourly'].get('temperature_2m', []))
+
+                    for i, time_str in enumerate(times):
+                        dt = datetime.strptime(time_str, "%Y-%m-%dT%H:%M")
+                        unix_h = int(dt.timestamp())
+
+                        # Kombiniere die Modelle zu einem internen Ensemble (50% ICON, 30% ECMWF, 20% Best)
+                        # ICON-D2 reicht nur 48h weit
+                        v_icon = rad_icon[i] if i < len(rad_icon) and rad_icon[i] is not None else None
+                        v_ecmwf = rad_ecmwf[i] if i < len(rad_ecmwf) and rad_ecmwf[i] is not None else None
+                        v_best = rad_best[i] if i < len(rad_best) and rad_best[i] is not None else 0.0
+
+                        if v_icon is not None and v_ecmwf is not None:
+                            blended_rad = (v_icon * 0.5) + (v_ecmwf * 0.3) + (v_best * 0.2)
+                        elif v_ecmwf is not None:
+                            blended_rad = (v_ecmwf * 0.6) + (v_best * 0.4)
+                        else:
+                            blended_rad = v_best
+
+                        # kWp * (GlobalTiltedIrradiance / 1000) * Performance Ratio (0.85 für geneigte Flächen realistischer)
+                        est_kwh = (blended_rad / 1000.0) * roof['kwp'] * 0.85
+
+                        if unix_h in parsed_model_total:
+                            parsed_model_total[unix_h] += est_kwh
+                        else:
+                            parsed_model_total[unix_h] = est_kwh
+
+                        # Temperatur im ML Cache speichern
+                        if idx == 0 and i < len(temp_2m) and temp_2m[i] is not None:
+                            weather_by_ts[unix_h] = {
+                                "temp_c": round(float(temp_2m[i]), 1),
+                                "radiation_wm2": round(float(blended_rad), 1)
+                            }
+                    
+                    successful_fetches += 1
+
+            except Exception as e:
+                logger.error(f"Fehler bei Model 2 (Open-Meteo) Dach {idx+1}: {e}")
+
+        # weather_forecast.json in Ramdisk speichern (fuer ML)
+        if weather_by_ts and successful_fetches > 0:
+            try:
+                weather_forecast_path = os.path.join(RAMDISK_DIR, "weather_forecast.json")
+                weather_output = {
+                    "fetched_at": datetime.now().isoformat(timespec='seconds'),
+                    "source": "open-meteo/icon_ecmwf_ensemble",
+                    "slots": len(weather_by_ts),
+                    "hourly": weather_by_ts
+                }
+                with open(weather_forecast_path, 'w') as wf:
+                    json.dump(weather_output, wf)
+                logger.info(f"Wetter-Prognose (Temp) gespeichert: {len(weather_by_ts)} Stunden-Slots.")
+            except Exception: pass
+
+        if successful_fetches > 0:
+            return parsed_model_total
+        return {}
+
+
+    def fetch_model_3_solcast(self):
+        """Holt und summiert Solcast-Prognosen fuer bis zu drei Rooftop Sites."""
+        if not self.solcast_sites:
+            logger.info("Model 3 (Solcast): Uebersprungen (keine vollstaendige Site in e3dc_v4.json)")
+            return {}
+
+        parsed_model_total = {}
+        successful_fetches = 0
+
+        for label, resource_id, api_key in self.solcast_sites:
+            url = f"https://api.solcast.com.au/rooftop_sites/{resource_id}/forecasts?format=json&api_key={api_key}"
+            logger.info(f"Hole Model 3 (Solcast {label})")
+
+            try:
+                req = urllib.request.Request(url)
+                with urllib.request.urlopen(req, timeout=10) as response:
+                    data = json.loads(response.read().decode())
+
+                    forecasts = data.get('forecasts', [])
+                    for entry in forecasts:
+                        time_str = entry['period_end'].replace('Z', '+00:00')
+                        dt = datetime.fromisoformat(time_str)
+                        unix_h = int(dt.replace(minute=0, second=0).timestamp())
+
+                        est_kw = float(entry['pv_estimate'])
+                        parsed_model_total[unix_h] = parsed_model_total.get(unix_h, 0.0) + est_kw * 0.5
+                    successful_fetches += 1
+            except urllib.error.HTTPError as e:
+                if e.code == 429:
+                    logger.error(f"Fehler bei Model 3 ({label}): Solcast API Limit / Roar exhausted (429)")
+                else:
+                    logger.error(f"Fehler bei Model 3 ({label}): {e}")
+            except Exception as e:
+                logger.error(f"Fehler bei Model 3 ({label}): {e}")
+
+        if successful_fetches > 0:
+            logger.info(f"Model 3 (Solcast): {successful_fetches}/{len(self.solcast_sites)} Site(s) erfolgreich summiert.")
+            return parsed_model_total
+        return {}
+
+    def _check_connectivity(self):
+        """Schneller Netz-Ping vor API-Calls um sinnlose Fehler-Loops zu vermeiden."""
+        import socket
+        try:
+            socket.setdefaulttimeout(3)
+            socket.getaddrinfo("api.open-meteo.com", 80)
+            return True
+        except Exception:
+            return False
+
+    def generate_ensemble(self):
+        # Konnektivitaet pruefen bevor alle APIs einzeln scheitern
+        if not self._check_connectivity():
+            logger.warning("Kein Internetzugang (DNS-Fehler). Behalte bestehende Prognose.")
+            return  # Alte pv_forecast.json bleibt unangetastet!
+
+        self.update_weather_alerts()
+
+        # Config-Flags: Modelle koennen per v4.json (Web-UI) deaktiviert werden.
+        # WICHTIG: 'openmeteo' aus der ALTEN e3dc.config.txt wird hier IGNORIERT!
+        # Der Key dort ist fuer den C++ Kern (verhindert Eba-M Fallback) und hat
+        # mit unserem Python-Service NICHTS zu tun.
+        # Fuer unseren Service gilt: v4.json 'openmeteo' (default: true = immer aktiv)
+        use_openmeteo     = str(self.v4_config.get('openmeteo',     'true')).lower() not in ('false', '0', 'no')
+        use_forecastsolar = str(self.v4_config.get('forecastsolar', 'true')).lower() not in ('false', '0', 'no')
+        # forecast1/2/3 keys muessen vorhanden (und nicht kommentiert) sein; sonst haben wir keine roofs -> skip
+        use_forecastsolar = use_forecastsolar and len(self.roofs) > 0
+
+        # --- Per-Modell TTL Cache: nur abfragen wenn TTL abgelaufen ---
+        if use_forecastsolar and self._model_is_stale('m1'):
+            m1 = self.fetch_model_1_forecast_solar()
+            self._set_model_data('m1', m1)
+        else:
+            m1 = self._get_model_data('m1')
+            if not use_forecastsolar:
+                logger.info("Model 1 (Forecast.Solar): Deaktiviert via Config.")
+
+        if use_openmeteo and self._model_is_stale('m2'):
+            m2 = self.fetch_model_2_open_meteo()
+            self._set_model_data('m2', m2)
+        else:
+            m2 = self._get_model_data('m2')
+            if not use_openmeteo:
+                logger.info("Model 2 (Open-Meteo): Deaktiviert via Config.")
+
+        if self._model_is_stale('m3'):
+            m3 = self.fetch_model_3_solcast()
+            self._set_model_data('m3', m3)
+        else:
+            m3 = self._get_model_data('m3')
+        
+        ensemble_forecast = []
+
+        # Vereine alle vorkommenden Zeitstempel
+        # KRITISCH: JSON-Cache-Keys sind STRINGS! -> immer int() casten!
+        all_timestamps = set(
+            [int(k) for k in m1.keys()] +
+            [int(k) for k in m2.keys()] +
+            [int(k) for k in m3.keys()]
+        )
+
+        # Normalisierte int-key Dicts (verhindert str+int TypeError beim Interpolieren)
+        m1 = {int(k): v for k, v in m1.items()}
+        m2 = {int(k): v for k, v in m2.items()}
+        m3 = {int(k): v for k, v in m3.items()}
+
+        # Nur Zeitstempel der naechsten 72h behalten (Prognose-Horizont)
+        import time as _t2
+        now_h = int(_t2.time())
+        horizon_72h = now_h + 72 * 3600
+        all_timestamps = {ts for ts in all_timestamps if ts <= horizon_72h}
+
+        # Zwischenspeicher fuer stuendliche Werte
+        hourly_values = []
+
+        for ts in sorted(all_timestamps):
+            val1 = m1.get(ts)
+            val2 = m2.get(ts)
+            val3 = m3.get(ts)
+
+            # BUG-FIX: Basis-Gewichte aus Config, normiert auf verfuegbare Modelle.
+            w1 = self.weight_m1 if val1 is not None else 0.0
+            w2 = self.weight_m2 if val2 is not None else 0.0
+            w3 = self.weight_m3 if val3 is not None else 0.0
+            total_weight = w1 + w2 + w3
+
+            if total_weight == 0:
+                continue
+
+            # Basis-Normierung (Summe immer 1.0)
+            norm_w1 = w1 / total_weight
+            norm_w2 = w2 / total_weight
+            norm_w3 = w3 / total_weight
+
+            # --- PHASE A: Horizont-abhaengige Gewichtung ---
+            # Grundprinzip (IEA Task 16 / WMO):
+            #   0-24h:  M2 (NWP-Ensemble) dominiert - aktuelles Wetter wird korrekt erfasst
+            #   24-48h: M1+M2 gleichgewichtig - beide Modelle in ihrem Optimum
+            #   48-72h: M1 (Geometrie/Jahreszeit) leicht bevorzugt - NWP verliert Praezision,
+            #           M1's astronomische Genauigkeit zahlt sich aus
+            # M3 (Solcast): linearer Abfall ab 24h, ab 36h=0 (Free-Tier Horizont)
+            hours_ahead = (ts - now_h) / 3600.0
+            if hours_ahead <= 24:
+                # Kurzfrist: M2 (NWP) dominiert, M1 reduziert
+                h_factor_1 = 0.60   # M1 auf 60% seines Basis-Gewichts
+                h_factor_2 = 1.40   # M2 auf 140% seines Basis-Gewichts
+                h_factor_3 = 1.00   # M3 (Solcast): voll aktiv wenn verfuegbar
+            elif hours_ahead <= 48:
+                # Mittelfrist: gleichgewichtig, M3 faellt linear ab
+                t = (hours_ahead - 24) / 24.0  # 0..1
+                h_factor_1 = 0.60 + t * 0.50   # 0.60 -> 1.10
+                h_factor_2 = 1.40 - t * 0.40   # 1.40 -> 1.00
+                h_factor_3 = max(0.0, 1.0 - (hours_ahead - 24) / 12.0)  # linear 0 ab 36h
+            else:
+                # Langfrist (48-72h): M1 Geometrie-Vorteil, M2 normal, M3=0
+                t = min(1.0, (hours_ahead - 48) / 24.0)  # 0..1
+                h_factor_1 = 1.10 + t * 0.20   # 1.10 -> 1.30
+                h_factor_2 = 1.00 - t * 0.20   # 1.00 -> 0.80
+                h_factor_3 = 0.0
+
+            # Horizont-Faktoren anwenden und renormieren
+            hw1 = norm_w1 * h_factor_1
+            hw2 = norm_w2 * h_factor_2
+            hw3 = norm_w3 * h_factor_3
+            h_total = hw1 + hw2 + hw3
+            if h_total > 0:
+                norm_w1 = hw1 / h_total
+                norm_w2 = hw2 / h_total
+                norm_w3 = hw3 / h_total
+
+            # --- PHASE B: Wetterklassen-Gewichtung (basiert auf M2-Strahlungswert) ---
+            # M2 liefert Global Tilted Irradiance (GTI) als Rohwert in kWh/15min
+            # Daraus leiten wir den Wettertyp ab:
+            #   Klar  (val2 > 0.30 kWh/h = ~300W/m2): M1 Geometrie-Prazision bevorzugt
+            #   Misch (val2 0.08-0.30):                ausgeglichen
+            #   Bedeckt (val2 < 0.08 kWh/h):           M2 NWP-Diffusmodell bevorzugt
+            # Faktor: Multiplikator auf norm_w1 (Anteil M1), Rest geht an M2
+            if val2 is not None and val2 > 0:
+                if val2 >= 0.30:     # Klar: M1 bekommt Bonus (geometrische Dachgenauigkeit)
+                    wc_factor = 1.25
+                elif val2 >= 0.08:   # Mischbewoelkt: neutral
+                    wc_factor = 1.00
+                else:               # Bedeckt/Nebel: M2 NWP ist besser fuer Diffusstrahlung
+                    wc_factor = 0.70
+                ww1 = norm_w1 * wc_factor
+                ww2 = norm_w2 * (2.0 - wc_factor)  # Spiegelsymmetrisch
+                ww3 = norm_w3
+                ww_total = ww1 + ww2 + ww3
+                if ww_total > 0:
+                    norm_w1 = ww1 / ww_total
+                    norm_w2 = ww2 / ww_total
+                    norm_w3 = ww3 / ww_total
+
+            final_kwh = ((val1 or 0) * norm_w1 + (val2 or 0) * norm_w2 + (val3 or 0) * norm_w3)
+            hourly_values.append({
+                "ts": ts, "kwh": final_kwh, "m1": val1, "m2": val2, "m3": val3,
+                "w1_eff": round(norm_w1, 3), "w2_eff": round(norm_w2, 3),
+                "hours_ahead": round(hours_ahead, 1)
+            })
+            
+        # Weiche Interpolation auf 15-Minuten Blöcke
+        for i, hr in enumerate(hourly_values):
+            curr_kw = hr["kwh"]
+            prev_kw = hourly_values[i-1]["kwh"] if i > 0 else curr_kw
+            next_kw = hourly_values[i+1]["kwh"] if i < len(hourly_values)-1 else curr_kw
+            
+            for q in range(4):
+                if q == 0: slotted_kw = (prev_kw * 0.25) + (curr_kw * 0.75)
+                elif q == 1: slotted_kw = (prev_kw * 0.10) + (curr_kw * 0.90)
+                elif q == 2: slotted_kw = (next_kw * 0.10) + (curr_kw * 0.90)
+                else: slotted_kw = (next_kw * 0.25) + (curr_kw * 0.75)
+                
+                start_s = int(hr["ts"]) + q * 900
+                daylight_factor = self._pv_daylight_factor(datetime.fromtimestamp(start_s + 450))
+                if daylight_factor <= 0.0:
+                    slotted_kw = 0.0
+                else:
+                    slotted_kw = min(
+                        max(0.0, slotted_kw),
+                        self.total_kwp * PV_CLOUD_EDGE_PEAK_MARGIN * daylight_factor,
+                    )
+
+                start_ms = start_s * 1000
+                ensemble_forecast.append({
+                    "start_timestamp": start_ms,
+                    "end_timestamp": start_ms + (900 * 1000),
+                    "predicted_kwh": round(slotted_kw, 4),
+                    "m1_raw": hr.get("m1"),
+                    "m2_raw": hr.get("m2"),
+                    "m3_raw": hr.get("m3")
+                })
+            
+        site_signature, site_descriptor = _forecast_site_signature(self.roofs, self.total_kwp)
+
+        # Tages-Bias-Update: einmal pro Tag mit Ist-Ertrag aus DB vs. History-Summe.
+        # Wichtig: History enthaelt ab jetzt Rohwert UND sichtbaren Prognosewert.
+        _update_daily_bias_from_db(
+            site_signature=site_signature,
+            site_descriptor=site_descriptor,
+        )
+
+        # EWMA-Bias anwenden: Korrigiert systematische Modell-Unterschaetzung/-Ueberschaetzung.
+        # Rohwert, bias-korrigierter Wert und spaeter sichtbarer Wert bleiben getrennt.
+        ensemble_forecast = _apply_daily_bias_to_forecast(
+            ensemble_forecast,
+            site_signature=site_signature,
+        )
+        ensemble_forecast, capped_slots, cap_kw = _cap_physical_pv_peak(
+            ensemble_forecast,
+            self.total_kwp,
+        )
+        if capped_slots:
+            logger.warning(
+                "PV-Prognose physikalisch begrenzt: %d Slot(s) auf %.2f kW "
+                "(%.2f kWp + %.0f%% Puffer)."
+                % (
+                    capped_slots,
+                    cap_kw,
+                    float(self.total_kwp),
+                    (PV_PHYSICAL_PEAK_MARGIN - 1.0) * 100.0,
+                )
+            )
+
+        ensemble_forecast, daily_caps = _cap_daily_forecast_totals(
+            ensemble_forecast,
+            installed_kwp=self.total_kwp,
+            site_signature=site_signature,
+            config=self.v4_config,
+        )
+        ensemble_forecast = _mark_displayed_forecast_slots(ensemble_forecast)
+        full_day_forecast_totals = _daily_forecast_totals(ensemble_forecast)
+
+        # --- History-Buffer: Vergangene Slots fuer Chart-Overlay speichern ---
+        # Bevor wir filtern: vergangene Slots in pv_forecast_history.json persistieren.
+        # (Rolling 24h Buffer - PHP liest sie fuer die "Prognose vs Realitaet" Linie)
+        import time as _t
+        now_ms = int(_t.time() * 1000)
+        cutoff_24h_ms = now_ms - (24 * 3600 * 1000)
+        past_slots = [s for s in ensemble_forecast if s['end_timestamp'] <= now_ms]
+        _save_forecast_history(past_slots, cutoff_24h_ms)
+
+        # Vergangene Slots aus dem Live-Forecast entfernen
+        future_forecast = [s for s in ensemble_forecast if s['end_timestamp'] > now_ms]
+        removed = len(ensemble_forecast) - len(future_forecast)
+        if removed > 0:
+            logger.info(f"Gefiltert: {removed} vergangene Slots gesichert in History + entfernt aus Live-Forecast.")
+
+        ensemble_forecast = future_forecast
+        remaining_forecast_totals = _daily_forecast_totals(ensemble_forecast)
+
+        # KRITISCH: Niemals eine leere Prognose speichern (wuerde gueltige Daten loeschen!)
+        if len(ensemble_forecast) == 0:
+            logger.warning(
+                f"Alle APIs haben leere Antworten geliefert (M1={len(m1)} M2={len(m2)} M3={len(m3)} Slots). "
+                f"Bestehende pv_forecast.json wird NICHT ueberschrieben."
+            )
+            return
+
+        # Speichern in die Ramdisk (nur bei echten Daten)
+        try:
+            fetched_at = datetime.now().isoformat(timespec='seconds')  # datetime = Klasse
+            output = {
+                "fetched_at": fetched_at,
+                "slots": len(ensemble_forecast),
+                "models_ok": {"m1": len(m1) > 0, "m2": len(m2) > 0, "m3": len(m3) > 0},
+            }
+            # Rueckwaertskompatibel: Als flache Liste speichern (wie bisher gelesen)
+            with open(FORECAST_OUTPUT, 'w') as f:
+                json.dump(ensemble_forecast, f, indent=2)
+            # Zusaetzlich Metadaten in separate Datei (fuer Dashboard/Debug)
+            meta_path = FORECAST_OUTPUT.replace('.json', '_meta.json')
+            # Lade aktuellen Bias-Status fuer Meta-Ausgabe
+            bias_info = _get_current_bias_info(
+                site_signature=site_signature,
+                site_descriptor=site_descriptor,
+            )
+            with open(meta_path, 'w') as f:
+                json.dump({"fetched_at": output["fetched_at"], "slots": output["slots"],
+                           "models_ok": output["models_ok"],
+                           "calibration": bias_info,
+                           "daily_caps": daily_caps,
+                           "forecast_totals": {
+                               "schema": "slot_kw_times_0_25h",
+                               "full_days": full_day_forecast_totals,
+                               "remaining_days": remaining_forecast_totals,
+                           },
+                           "site_signature": site_signature}, f)
+
+            # Log: effektive Gewichte fuer ersten SONNIGEN Slot und letzten sonnigen Slot
+            sunny_hrs = [h for h in hourly_values if (h.get("kwh") or 0) > 0.3]
+            first_hr = sunny_hrs[0] if sunny_hrs else hourly_values[0] if hourly_values else {}
+            last_hr  = sunny_hrs[-1] if sunny_hrs else hourly_values[-1] if hourly_values else {}
+            logger.info(
+                f"Ensemble-Prognose: {len(ensemble_forecast)} Slots gespeichert. "
+                f"Modelle: M1={'OK' if len(m1)>0 else 'FEHLER'} "
+                f"M2={'OK' if len(m2)>0 else 'FEHLER'} "
+                f"M3={'OK' if len(m3)>0 else 'Uebersprungen'}"
+            )
+            logger.info(
+                f"Gewichtung (Phase A+B): "
+                f"Kurzfrist (0h): M1={first_hr.get('w1_eff','?'):.2f} M2={first_hr.get('w2_eff','?'):.2f} | "
+                f"Langfrist ({last_hr.get('hours_ahead','?')}h): M1={last_hr.get('w1_eff','?'):.2f} M2={last_hr.get('w2_eff','?'):.2f}"
+            )
+        except Exception as e:
+            logger.error(f"Konnte Prognose nicht speichern: {e}")
+
+
+
+
+def _save_forecast_history(past_slots: list, cutoff_ms: int):
+    """
+    Fuegt vergangene Forecast-Slots in pv_forecast_history.json ein (Rolling 24h Buffer).
+    PHP liest diese Datei fuer den 'Prognose vs Realitaet' Chart-Overlay.
+    """
+    history_path = _forecast_history_path()
+    try:
+        # Vorhandene History laden
+        if os.path.exists(history_path):
+            with open(history_path, 'r') as f:
+                history = json.load(f)
+        else:
+            history = []
+
+        # Neue Slots mergen. Bestehende Slots werden ergaenzt, damit neue Diagnosefelder
+        # wie raw_predicted_kwh/displayed_predicted_kwh nicht einen Tag lang fehlen.
+        by_ts = {s['start_timestamp']: s for s in history if 'start_timestamp' in s}
+        added = 0
+        updated = 0
+        for slot in past_slots:
+            ts = slot.get('start_timestamp')
+            if ts is None:
+                continue
+            if ts in by_ts:
+                merged = dict(by_ts[ts])
+                merged.update(slot)
+                by_ts[ts] = merged
+                updated += 1
+            else:
+                by_ts[ts] = slot
+                added += 1
+        history = list(by_ts.values())
+
+        # Alles aelter als 24h entfernen (Rolling Buffer)
+        history = [s for s in history if s['end_timestamp'] > cutoff_ms]
+        history.sort(key=lambda s: s['start_timestamp'])
+
+        with open(history_path, 'w') as f:
+            json.dump(history, f)
+        if added > 0 or updated > 0:
+            logger.debug(
+                f"Forecast-History: {added} neue, {updated} aktualisierte Slots, "
+                f"{len(history)} gesamt im 24h-Buffer."
+            )
+    except Exception as e:
+        logger.warning(f"Forecast-History konnte nicht gespeichert werden: {e}")
+
+
+def _update_daily_bias_from_db(
+    site_signature=None,
+    site_descriptor=None,
+    eval_path=FORECAST_EVAL_FILE,
+    db_path=DAILY_STATS_DB_PATH,
+    history_path=None,
+    now=None,
+):
+    """
+    Selbstlernendes EWMA-Bias-System: Vergleicht den gestrigen Ist-Ertrag (aus e3dc_stats.db)
+    mit der gestrigen Prognose (aus pv_forecast_history.json) und aktualisiert
+    einen gleitenden Korrekturfaktor per Exponentially Weighted Moving Average (EWMA).
+
+    Wissenschaftlicher Hintergrund:
+    - EWMA-Bias-Korrektur ist Standard in der PV-Prognoseliteratur (IEA Task 16, SolarAnywhere)
+    - Separate Faktoren pro Jahreszeit verhindern, dass Sommer-Sonnentage den Winter-Bias ueberschreiben
+    - Clearsky-Index-Klassifizierung (sunny/mixed/cloudy) trennt systematische Modell-Fehler
+      von zufaelligen Wolken-Events (nur sunny-Tage fliessen in den Bias ein)
+
+    Speichert den Bias in pv_forecast_eval.json und wendet ihn beim naechsten
+    Forecast-Zyklus via _apply_daily_bias_to_forecast() an.
+    """
+    try:
+        # Nur einmal pro Tag ausfuehren (nach 21 Uhr oder wenn kein Eintrag fuer heute existiert)
+        import time as _t
+        now = now or datetime.now()
+        history_path = history_path or _forecast_history_path()
+        today_str = now.strftime('%Y-%m-%d')
+        yesterday_str = (now - timedelta(days=1)).strftime('%Y-%m-%d')
+
+        previous_signature = None
+        if os.path.exists(eval_path):
+            try:
+                with open(eval_path, 'r') as f:
+                    previous_signature = (json.load(f) or {}).get("site_signature")
+            except Exception:
+                previous_signature = None
+
+        eval_data = _load_forecast_eval(eval_path)
+        eval_data, signature_changed = _ensure_eval_site_signature(
+            eval_data,
+            site_signature=site_signature,
+            site_descriptor=site_descriptor,
+            now=now,
+        )
+        signature_initialized = bool(site_signature and previous_signature != site_signature)
+
+        daily_log = eval_data.get("daily_log", [])
+        existing_dates = {e.get('date') for e in daily_log}
+        if yesterday_str in existing_dates:
+            if signature_initialized:
+                with open(eval_path, 'w') as f:
+                    json.dump(eval_data, f, indent=2)
+            return
+
+        # Nicht mehr als einmal pro Stunde laufen
+        last_update = eval_data.get("last_update", "")
+        if last_update and last_update[:13] == now.strftime('%Y-%m-%dT%H'):
+            return
+
+        # Schritt 1: Gestrigen Ist-Ertrag aus DB laden
+        import sqlite3
+        if not os.path.exists(db_path):
+            if signature_initialized or signature_changed:
+                with open(eval_path, 'w') as f:
+                    json.dump(eval_data, f, indent=2)
+            return
+        conn = sqlite3.connect(db_path)
+        c = conn.cursor()
+        c.execute("SELECT pv_yield FROM daily_stats WHERE date=? AND pv_yield > 5", (yesterday_str,))
+        row = c.fetchone()
+        conn.close()
+        if not row:
+            if signature_initialized or signature_changed:
+                with open(eval_path, 'w') as f:
+                    json.dump(eval_data, f, indent=2)
+            return  # Kein Ertrag oder bewolkter Tag mit < 5 kWh
+        actual_kwh = float(row[0])
+
+        # Schritt 2: Gestrige Prognose aus History-Buffer rekonstruieren
+        if not os.path.exists(history_path):
+            return
+        with open(history_path, 'r') as f:
+            history = json.load(f)
+
+        # Summiere History-Slots des gestrigen Tages (x0.25 fuer kWh aus kW-Werten pro 15min-Slot)
+        yest_slots = [
+            s for s in history
+            if datetime.fromtimestamp(s['start_timestamp'] / 1000).strftime('%Y-%m-%d') == yesterday_str
+        ]
+        if not yest_slots:
+            return  # Noch keine gestrigen Slots im 24h-Buffer
+        raw_forecast_kwh = sum(
+            _slot_kw(s, "raw_predicted_kwh", "predicted_kwh") * 0.25
+            for s in yest_slots
+        )
+        bias_corrected_kwh = sum(
+            _slot_kw(s, "bias_corrected_kwh", "predicted_kwh") * 0.25
+            for s in yest_slots
+        )
+        visible_forecast_kwh = sum(
+            _slot_kw(s, "displayed_predicted_kwh", "predicted_kwh") * 0.25
+            for s in yest_slots
+        )
+        if raw_forecast_kwh < 2.0:
+            return  # Zu wenig Prognose-Daten
+        if visible_forecast_kwh < 2.0:
+            visible_forecast_kwh = bias_corrected_kwh if bias_corrected_kwh >= 2.0 else raw_forecast_kwh
+
+        # Schritt 3: Clearsky-Index berechnen (Klassifizierung des Tages)
+        # Theoretischer Max-Ertrag: kWp * Sonnenstunden (Sommertag Mitteleuropa max ~8.5h)
+        # Einfache Naeherung: wenn Ist-Ertrag > 85% des Forecast -> sonnig
+        bias_raw = actual_kwh / raw_forecast_kwh
+        visible_ratio = actual_kwh / visible_forecast_kwh if visible_forecast_kwh >= 2.0 else None
+        clearsky_class = "sunny" if bias_raw > 1.10 else ("mixed" if bias_raw > 0.80 else "cloudy")
+
+        # Schritt 4: EWMA-Update pro Jahreszeit
+        # Jahreszeiten: Q1=Winter, Q2=Fruehling, Q3=Sommer, Q4=Herbst
+        quarter = _quarter_for_date(now)
+        season_bias = eval_data.get("seasonal_bias", {})
+        old_bias = float(season_bias.get(quarter, 1.0) or 1.0)
+        bias_clamped = max(0.70, min(1.50, bias_raw))
+        target_bias = bias_clamped
+        if visible_ratio is not None and visible_ratio < 0.98:
+            # Wenn die sichtbare, bereits korrigierte Prognose zu hoch war, muss der
+            # gespeicherte Bias schneller nach unten. Das verhindert einen alten Q2-Bias,
+            # der trotz realer Tagesmessung weiter 120+ kWh auf die Anzeige hebt.
+            visible_target = max(0.70, min(1.50, old_bias * visible_ratio))
+            target_bias = min(target_bias, visible_target)
+        alpha = 0.45 if target_bias < old_bias - 0.005 else 0.15
+
+        # Nur Sunny-Tage beeinflussen den Bias (bei Wolkentagen ist die Abweichung zufaellig!)
+        if clearsky_class != "cloudy":
+            new_bias = alpha * target_bias + (1.0 - alpha) * old_bias
+            season_bias[quarter] = round(new_bias, 4)
+            logger.info(
+                f"EWMA-Bias Update {yesterday_str}: Ist={actual_kwh:.1f} kWh, "
+                f"Raw={raw_forecast_kwh:.1f} kWh, Sichtbar={visible_forecast_kwh:.1f} kWh, "
+                f"Bias={bias_raw:.3f}, sichtbar={visible_ratio:.3f} ({clearsky_class}), "
+                f"Neu={quarter}: {old_bias:.3f} -> {new_bias:.3f} (alpha={alpha})"
+            )
+        else:
+            logger.info(
+                f"EWMA-Bias: {yesterday_str} cloudy (bias={bias_raw:.2f}) - kein Update."
+            )
+
+        # Schritt 5: Tages-Log aktualisieren (max 90 Tage)
+        if yesterday_str not in existing_dates:
+            daily_log.append({
+                "schema_version": 3,
+                "forecast_value_schema": "raw_bias_visible",
+                "date": yesterday_str,
+                "actual_kwh": round(actual_kwh, 2),
+                "forecast_kwh": round(visible_forecast_kwh, 2),
+                "raw_forecast_kwh": round(raw_forecast_kwh, 2),
+                "bias_corrected_kwh": round(bias_corrected_kwh, 2),
+                "visible_forecast_kwh": round(visible_forecast_kwh, 2),
+                "bias_raw": round(bias_raw, 4),
+                "visible_ratio": round(visible_ratio, 4) if visible_ratio is not None else None,
+                "bias_old": round(old_bias, 4),
+                "bias_target": round(target_bias, 4),
+                "bias_new": round(season_bias.get(quarter, old_bias), 4),
+                "alpha": round(alpha, 3) if clearsky_class != "cloudy" else 0.0,
+                "clearsky_class": clearsky_class,
+                "quarter": quarter,
+                "site_signature": site_signature,
+                "slots_used": len(yest_slots),
+                "ts": int(_t.time())
+            })
+        eval_data["daily_log"] = daily_log[-90:]
+        eval_data["quarter_samples"] = _quarter_training_counts(
+            eval_data["daily_log"],
+            site_signature=site_signature,
+        )
+        eval_data["daily_log_schema_counts"] = _daily_log_schema_counts(
+            eval_data["daily_log"],
+            site_signature=site_signature,
+        )
+        eval_data["seasonal_bias"] = season_bias
+        eval_data["last_update"] = now.isoformat(timespec='seconds')
+        eval_data["version"] = 3
+
+        with open(eval_path, 'w') as f:
+            json.dump(eval_data, f, indent=2)
+
+    except Exception as e:
+        logger.warning(f"EWMA-Bias Update fehlgeschlagen (unkritisch): {e}")
+
+
+def _get_current_bias_info(site_signature=None, site_descriptor=None, eval_path=FORECAST_EVAL_FILE, now=None) -> dict:
+    """
+    Gibt den aktuellen EWMA-Bias-Status fuer die Metadaten-Datei zurueck.
+    Wird in pv_forecast_meta.json gespeichert (Dashboard-Anzeige).
+    """
+    try:
+        if os.path.exists(eval_path):
+            with open(eval_path, 'r') as f:
+                ev = json.load(f)
+            now = now or datetime.now()
+            quarter = _quarter_for_date(now)
+            stored_signature = str(ev.get("site_signature") or "")
+            if site_signature and stored_signature and stored_signature != str(site_signature):
+                return {
+                    "current_quarter": quarter,
+                    "current_bias": 1.0,
+                    "bias_active": False,
+                    "reason": "site_signature_changed",
+                    "site_signature": site_signature,
+                    "stored_site_signature": stored_signature,
+                    "site_descriptor": site_descriptor,
+                    "days_tracked": 0,
+            }
+            bias = float(ev.get("seasonal_bias", {}).get(quarter, 1.0) or 1.0)
+            log = ev.get("daily_log", [])
+            quarter_samples = ev.get("quarter_samples") or _quarter_training_counts(
+                log,
+                site_signature=site_signature or stored_signature,
+            )
+            quarter_eligible_days = int((quarter_samples.get(quarter) or {}).get("eligible", 0) or 0)
+            schema_counts = _daily_log_schema_counts(
+                log,
+                site_signature=site_signature or stored_signature,
+            )
+            confirmation = _bias_confirmation_status(
+                log,
+                quarter,
+                bias,
+                now=now,
+                site_signature=site_signature or stored_signature,
+            )
+            bias_guard = _recent_schema3_visible_overshoot_guard(
+                log,
+                quarter,
+                bias,
+                now=now,
+                site_signature=site_signature or stored_signature,
+            )
+            has_non_neutral_bias = abs(float(bias or 1.0) - 1.0) >= 0.02
+            has_training = quarter_eligible_days >= PV_BIAS_MIN_QUARTER_DAYS
+            bias_active = has_non_neutral_bias and has_training and bool(confirmation.get("confirmed"))
+            effective_bias = bias if bias_active else 1.0
+            if bias_active and bias_guard.get("active"):
+                try:
+                    effective_bias = min(effective_bias, float(bias_guard.get("effective_bias_cap")))
+                except (TypeError, ValueError):
+                    pass
+            if not has_non_neutral_bias:
+                reason = "neutral_bias"
+            elif not has_training:
+                reason = "insufficient_quarter_samples"
+            elif not confirmation.get("confirmed"):
+                reason = "missing_recent_confirmation"
+            elif bias_guard.get("active"):
+                reason = "active_guarded_by_recent_visible_overshoot"
+            else:
+                reason = "active"
+            return {
+                "current_quarter": quarter,
+                "current_bias": round(bias, 4),
+                "effective_bias": round(effective_bias, 4),
+                "bias_active": bias_active,
+                "bias_confirmed": bool(confirmation.get("confirmed")),
+                "bias_confirmation": confirmation,
+                "bias_guard": bias_guard,
+                "reason": reason,
+                "seasonal_bias": ev.get("seasonal_bias", {}),
+                "quarter_samples": quarter_samples,
+                "quarter_days_tracked": quarter_eligible_days,
+                "min_quarter_days": PV_BIAS_MIN_QUARTER_DAYS,
+                "daily_log_schema_counts": schema_counts,
+                "legacy_log_entries": int(schema_counts.get("legacy_forecast_only", 0) or 0),
+                "days_tracked": len(log),
+                "last_update": ev.get("last_update", ""),
+                "last_entry": log[-1] if log else None,
+                "last_entry_schema": _daily_log_entry_schema(log[-1]) if log else None,
+                "site_signature": site_signature or stored_signature,
+                "stored_site_signature": stored_signature,
+                "site_descriptor": site_descriptor or ev.get("site_descriptor"),
+                "site_signature_seen_at": ev.get("site_signature_seen_at", ""),
+                "site_signature_changed_at": ev.get("site_signature_changed_at", ""),
+            }
+    except Exception:
+        pass
+    return {"current_bias": 1.0, "days_tracked": 0, "bias_active": False}
+
+
+def _apply_daily_bias_to_forecast(
+    ensemble_forecast: list,
+    site_signature=None,
+    eval_path=FORECAST_EVAL_FILE,
+    now=None,
+) -> list:
+    """
+    Wendet den EWMA-Saisonal-Bias auf die Ensemble-Prognose an.
+    Wird im generate_ensemble() NACH der Ensemble-Berechnung aufgerufen.
+
+    Der Bias ist ein multiplikativer Korrekturfaktor aus historischen Ist-vs-Prognose-Vergleichen.
+    Beispiel: bias=1.18 bedeutet, das Modell prognostiziert 18% zu wenig -> Slots x1.18.
+
+    Wichtige Einschraenkungen:
+    - Max-Faktor: 1.40 (40% Erhoehung), Min-Faktor: 0.75 (25% Reduktion)
+    - Nur tagsaktive Slots werden angepasst (predicted_kwh > 0.01 kW)
+    - Bias wird als 'bias_applied' im Slot gespeichert fuer Transparenz
+    """
+    try:
+        ensemble_forecast = _mark_raw_forecast_slots(ensemble_forecast)
+        if not os.path.exists(eval_path):
+            return ensemble_forecast
+        with open(eval_path, 'r') as f:
+            ev = json.load(f)
+        if ev.get("version", 1) < 2:
+            return ensemble_forecast  # Altes Format, noch kein Bias berechnet
+
+        stored_signature = str(ev.get("site_signature") or "")
+        if site_signature and stored_signature and stored_signature != str(site_signature):
+            logger.warning(
+                "EWMA-Bias ignoriert: gespeicherte Dach-/Anlagen-Signatur passt nicht zur aktuellen Konfiguration."
+            )
+            return ensemble_forecast
+
+        now = now or datetime.now()
+        quarter = _quarter_for_date(now)
+        bias = float(ev.get("seasonal_bias", {}).get(quarter, 1.0) or 1.0)
+        daily_log = ev.get("daily_log", [])
+        quarter_samples = ev.get("quarter_samples") or _quarter_training_counts(
+            daily_log,
+            site_signature=site_signature or stored_signature,
+        )
+        quarter_eligible_days = int((quarter_samples.get(quarter) or {}).get("eligible", 0) or 0)
+
+        # Mindestens 7 passende Tage im aktuellen Quartal benoetigt bevor Bias angewendet wird.
+        if quarter_eligible_days < PV_BIAS_MIN_QUARTER_DAYS or abs(bias - 1.0) < 0.02:
+            if quarter_eligible_days < PV_BIAS_MIN_QUARTER_DAYS:
+                logger.debug(
+                    f"EWMA-Bias: Noch nicht genug {quarter}-Daten "
+                    f"({quarter_eligible_days}/{PV_BIAS_MIN_QUARTER_DAYS} Tage). Kein Bias angewendet."
+                )
+            return ensemble_forecast
+
+        confirmation = _bias_confirmation_status(
+            daily_log,
+            quarter,
+            bias,
+            now=now,
+            site_signature=site_signature or stored_signature,
+        )
+        if not confirmation.get("confirmed"):
+            logger.info(
+                f"EWMA-Bias: {quarter} bias={bias:.3f} ist nicht frisch bestätigt "
+                f"({confirmation.get('confirmation_count', 0)}/{PV_BIAS_MIN_CONFIRMATIONS} ähnliche Werte "
+                f"in {PV_BIAS_CONFIRMATION_WINDOW_DAYS} Tagen, "
+                f"{quarter_eligible_days} Trainingstage). Kein Bias angewendet."
+            )
+            return ensemble_forecast
+
+        # Bias sicher begrenzen
+        bias_nominal = max(0.75, min(1.40, bias))
+        bias_safe = bias_nominal
+        bias_guard = _recent_schema3_visible_overshoot_guard(
+            daily_log,
+            quarter,
+            bias,
+            now=now,
+            site_signature=site_signature or stored_signature,
+        )
+        if bias_guard.get("active"):
+            try:
+                bias_safe = min(bias_safe, float(bias_guard.get("effective_bias_cap")))
+            except (TypeError, ValueError):
+                pass
+            logger.info(
+                f"EWMA-Bias Guard aktiv: {quarter} nominal {bias_nominal:.3f} "
+                f"-> effektiv {bias_safe:.3f} ({bias_guard.get('reason')})."
+            )
+        corrected = []
+        for slot in ensemble_forecast:
+            slot = dict(slot)
+            raw_kw = _slot_kw(slot, "raw_predicted_kwh", "predicted_kwh")
+            if raw_kw > 0.01:
+                corrected_kw = raw_kw * bias_safe
+                slot['predicted_kwh'] = round(corrected_kw, 4)
+                slot['bias_corrected_kwh'] = round(corrected_kw, 4)
+                slot['bias_applied'] = round(bias_safe, 4)
+                if bias_guard.get("active"):
+                    slot['bias_nominal'] = round(bias_nominal, 4)
+                    slot['bias_guard_applied'] = True
+                    slot['bias_guard_reason'] = str(bias_guard.get("reason") or "")
+            else:
+                slot['bias_corrected_kwh'] = round(raw_kw, 4)
+            corrected.append(slot)
+
+        logger.info(
+            f"EWMA-Bias angewendet: {quarter} bias={bias_safe:.3f} "
+            f"auf {len([s for s in corrected if s.get('bias_applied')])} aktive Slots "
+            f"({quarter_eligible_days} {quarter}-Trainingstage, "
+            f"{confirmation.get('confirmation_count', 0)} frisch bestätigt)."
+        )
+        return corrected
+    except Exception as e:
+        logger.warning(f"EWMA-Bias konnte nicht angewendet werden: {e}")
+        return ensemble_forecast
+
+
+def _cap_physical_pv_peak(ensemble_forecast: list, installed_kwp, margin: float = PV_PHYSICAL_PEAK_MARGIN):
+    """
+    Begrenze die Momentanleistung auf einen physikalisch plausiblen Anlagenpeak.
+
+    predicted_kwh ist historisch falsch benannt und enthaelt die mittlere kW-Leistung
+    des 15-Minuten-Slots. Der Tages-Bias darf die Energie korrigieren, aber keine
+    unmoeglichen 15-Minuten-Spitzen oberhalb der Anlagenleistung erzeugen.
+
+    Kurze Cloud-Edge-/Reflexionsspitzen bei wechselnder Bewoelkung sind realistisch.
+    Deshalb gilt der enge Deckel nur fuer breite Plateaus; volatile Einzelspitzen
+    duerfen bis zum Cloud-Edge-Puffer stehen bleiben.
+    """
+    try:
+        peak_kw = float(installed_kwp or 0.0)
+    except Exception:
+        peak_kw = 0.0
+    if peak_kw <= 0.0:
+        return ensemble_forecast, 0, 0.0
+
+    try:
+        margin_safe = max(1.0, min(1.10, float(margin)))
+    except Exception:
+        margin_safe = PV_PHYSICAL_PEAK_MARGIN
+    base_cap_kw = peak_kw * margin_safe
+    cloud_edge_cap_kw = peak_kw * PV_CLOUD_EDGE_PEAK_MARGIN
+
+    slots = list(ensemble_forecast or [])
+
+    def _slot_kw(index):
+        try:
+            return float(slots[index].get("predicted_kwh", 0.0) or 0.0)
+        except Exception:
+            return 0.0
+
+    def _cloud_edge_like(index, slot_kw):
+        neighbors = []
+        for offset in (-2, -1, 1, 2):
+            j = index + offset
+            if 0 <= j < len(slots):
+                val = _slot_kw(j)
+                if val > 0.01:
+                    neighbors.append(val)
+        if not neighbors:
+            return False
+        local_min = min(neighbors)
+        local_avg = sum(neighbors) / len(neighbors)
+        # Einzelne Reflexionsspitze: deutlich hoeher als die direkte Umgebung.
+        return (
+            slot_kw >= base_cap_kw
+            and local_min <= slot_kw * 0.86
+            and local_avg <= slot_kw * 0.93
+        )
+
+    corrected = []
+    capped = 0
+    for idx, slot in enumerate(slots):
+        try:
+            slot_kw = float(slot.get("predicted_kwh", 0.0) or 0.0)
+        except Exception:
+            corrected.append(slot)
+            continue
+
+        cap_kw = cloud_edge_cap_kw if _cloud_edge_like(idx, slot_kw) else base_cap_kw
+        if slot_kw > cap_kw:
+            slot = dict(slot)
+            slot["physical_cap_before_kw"] = round(slot_kw, 4)
+            slot["physical_cap_kw"] = round(cap_kw, 4)
+            slot["predicted_kwh"] = round(cap_kw, 4)
+            capped += 1
+        corrected.append(slot)
+    return corrected, capped, round(base_cap_kw, 4)
+
+
+def _config_flag_enabled(config, *keys, default=True):
+    config = config or {}
+    for key in keys:
+        if key in config:
+            value = str(config.get(key)).strip().lower()
+            return value not in ("0", "false", "no", "off", "nein", "aus")
+    return default
+
+
+def _parse_iso_date(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value)[:19]).date()
+    except Exception:
+        try:
+            return datetime.strptime(str(value)[:10], "%Y-%m-%d").date()
+        except Exception:
+            return None
+
+
+def _select_seasonal_daily_cap_samples(rows, forecast_day, min_days, doy_window_days):
+    samples = []
+    for date_str, pv_yield in rows or []:
+        sample_day = _parse_iso_date(date_str)
+        if not sample_day:
+            continue
+        try:
+            value = float(pv_yield)
+        except Exception:
+            continue
+        samples.append({"date": sample_day, "pv_yield": value})
+
+    if not samples:
+        return [], {
+            "seasonal_mode": "no_history",
+            "total_days": 0,
+            "doy_days": 0,
+            "quarter_days": 0,
+        }
+
+    doy_samples = [
+        s for s in samples
+        if _day_of_year_distance(s["date"], forecast_day) <= int(doy_window_days)
+    ]
+    quarter = _quarter_for_date(forecast_day)
+    quarter_samples = [s for s in samples if _quarter_for_date(s["date"]) == quarter]
+
+    if len(doy_samples) >= int(min_days):
+        selected = doy_samples
+        mode = "day_of_year_window"
+    elif len(quarter_samples) >= int(min_days):
+        selected = quarter_samples
+        mode = "quarter"
+    else:
+        return [], {
+            "seasonal_mode": "insufficient_seasonal_history",
+            "total_days": len(samples),
+            "doy_days": len(doy_samples),
+            "quarter_days": len(quarter_samples),
+            "quarter": quarter,
+            "doy_window_days": int(doy_window_days),
+        }
+
+    return [s["pv_yield"] for s in selected], {
+        "seasonal_mode": mode,
+        "total_days": len(samples),
+        "doy_days": len(doy_samples),
+        "quarter_days": len(quarter_samples),
+        "seasonal_days": len(selected),
+        "quarter": quarter,
+        "doy_window_days": int(doy_window_days),
+    }
+
+
+def _recent_daily_pv_cap_kwh(
+    forecast_day,
+    site_signature=None,
+    db_path=DAILY_STATS_DB_PATH,
+    eval_path=FORECAST_EVAL_FILE,
+    history_days=PV_DAILY_SANITY_HISTORY_DAYS,
+    min_days=PV_DAILY_SANITY_MIN_DAYS,
+    margin=PV_DAILY_SANITY_MARGIN,
+    doy_window_days=PV_DAILY_SANITY_DOY_WINDOW_DAYS,
+):
+    """
+    Liefert einen realitätsnahen Tagesenergie-Deckel aus echten Tageserträgen.
+
+    Der Deckel ist bewusst an die Dach-/Anlagen-Signatur gekoppelt. Nach einer
+    Dachänderung sind alte SO-only Tagesmaxima für die neue Geometrie nicht mehr
+    belastbar und werden erst wieder nach neuen Beobachtungstagen genutzt.
+    """
+    try:
+        day = datetime.strptime(str(forecast_day), "%Y-%m-%d").date()
+    except Exception:
+        return None, {"status": "invalid_day", "day": str(forecast_day)}
+
+    eval_data = {}
+    if os.path.exists(eval_path):
+        try:
+            eval_data = _load_forecast_eval(eval_path)
+        except Exception:
+            eval_data = {}
+
+    stored_signature = str(eval_data.get("site_signature") or "")
+    if site_signature and stored_signature and stored_signature != str(site_signature):
+        return None, {
+            "status": "site_signature_mismatch",
+            "day": str(forecast_day),
+            "site_signature": site_signature,
+            "stored_site_signature": stored_signature,
+        }
+
+    changed_at = _parse_iso_date(eval_data.get("site_signature_changed_at"))
+    seen_at = _parse_iso_date(eval_data.get("site_signature_seen_at")) if changed_at else None
+    lower_bound = day - timedelta(days=int(history_days))
+    if seen_at and seen_at > lower_bound:
+        lower_bound = seen_at
+
+    if not os.path.exists(db_path):
+        return None, {"status": "no_db", "day": str(forecast_day)}
+
+    try:
+        import sqlite3
+        conn = sqlite3.connect(db_path)
+        c = conn.cursor()
+        c.execute(
+            """
+            SELECT date, pv_yield
+              FROM daily_stats
+             WHERE date >= ? AND date < ? AND pv_yield > 5
+             ORDER BY date ASC
+            """,
+            (lower_bound.strftime("%Y-%m-%d"), day.strftime("%Y-%m-%d")),
+        )
+        rows = c.fetchall()
+        conn.close()
+    except Exception as exc:
+        return None, {"status": "db_error", "day": str(forecast_day), "error": str(exc)}
+
+    values, seasonal_info = _select_seasonal_daily_cap_samples(
+        rows,
+        day,
+        min_days=min_days,
+        doy_window_days=doy_window_days,
+    )
+    if len(values) < int(min_days):
+        return None, {
+            "status": seasonal_info.get("seasonal_mode", "insufficient_seasonal_history"),
+            "day": str(forecast_day),
+            "days": len(values),
+            "min_days": int(min_days),
+            "history_from": lower_bound.strftime("%Y-%m-%d"),
+            **seasonal_info,
+        }
+
+    values.sort(reverse=True)
+    top_n = min(7, max(5, len(values) // 10))
+    top_values = values[:top_n]
+    observed_max = values[0]
+    robust_top_avg = sum(top_values) / len(top_values)
+    cap_kwh = max(observed_max * 1.03, robust_top_avg * float(margin))
+    return round(cap_kwh, 2), {
+        "status": "ok",
+        "day": str(forecast_day),
+        "cap_kwh": round(cap_kwh, 2),
+        "observed_max_kwh": round(observed_max, 2),
+        "robust_top_avg_kwh": round(robust_top_avg, 2),
+        "top_days": len(top_values),
+        "days": len(values),
+        "history_from": lower_bound.strftime("%Y-%m-%d"),
+        "margin": float(margin),
+        **seasonal_info,
+    }
+
+
+def _cap_daily_forecast_totals(
+    ensemble_forecast: list,
+    installed_kwp=None,
+    site_signature=None,
+    config=None,
+    db_path=DAILY_STATS_DB_PATH,
+    eval_path=FORECAST_EVAL_FILE,
+):
+    if not _config_flag_enabled(
+        config,
+        "pv_forecast_daily_cap_enabled",
+        "pv_daily_sanity_cap_enabled",
+        default=True,
+    ):
+        return ensemble_forecast, [{"status": "disabled"}]
+
+    by_day = {}
+    for slot in ensemble_forecast or []:
+        try:
+            day = datetime.fromtimestamp(slot["start_timestamp"] / 1000).strftime("%Y-%m-%d")
+        except Exception:
+            continue
+        by_day.setdefault(day, []).append(slot)
+
+    summaries = []
+    corrected_by_id = {}
+    for day, day_slots in by_day.items():
+        before_kwh = _slots_energy_kwh(day_slots, "predicted_kwh")
+        cap_kwh, info = _recent_daily_pv_cap_kwh(
+            day,
+            site_signature=site_signature,
+            db_path=db_path,
+            eval_path=eval_path,
+        )
+        info["forecast_before_kwh"] = round(before_kwh, 2)
+        try:
+            info["installed_kwp"] = round(float(installed_kwp or 0.0), 3)
+        except Exception:
+            info["installed_kwp"] = 0.0
+        if cap_kwh is None or before_kwh <= cap_kwh or before_kwh <= 0.01:
+            summaries.append(info)
+            continue
+
+        scale = cap_kwh / before_kwh
+        capped_slots = 0
+        for slot in day_slots:
+            original_id = id(slot)
+            slot = dict(slot)
+            old_kw = _slot_kw(slot, "predicted_kwh")
+            if old_kw > 0.01:
+                slot["daily_cap_before_kw"] = round(old_kw, 4)
+                slot["daily_cap_kwh"] = round(cap_kwh, 2)
+                slot["daily_cap_scale"] = round(scale, 4)
+                slot["predicted_kwh"] = round(old_kw * scale, 4)
+                capped_slots += 1
+            corrected_by_id[original_id] = slot
+        info.update({
+            "status": "applied",
+            "forecast_after_kwh": round(cap_kwh, 2),
+            "scale": round(scale, 4),
+            "slots": capped_slots,
+        })
+        summaries.append(info)
+
+    corrected = []
+    for slot in ensemble_forecast or []:
+        replacement = corrected_by_id.get(id(slot))
+        corrected.append(replacement if replacement is not None else slot)
+
+    applied = [s for s in summaries if s.get("status") == "applied"]
+    for item in applied:
+        logger.warning(
+            "PV-Tagesprognose plausibilisiert: %s %.1f -> %.1f kWh "
+            "(reale Spitzenhistorie %.1f kWh, %d Tage)."
+            % (
+                item.get("day"),
+                item.get("forecast_before_kwh", 0.0),
+                item.get("forecast_after_kwh", 0.0),
+                item.get("observed_max_kwh", 0.0),
+                item.get("days", 0),
+            )
+        )
+    return corrected, summaries
+
+
+
+
+import time
+# HINWEIS: 'datetime' ist bereits oben mit 'from datetime import datetime, timedelta' importiert.
+# KEIN 'import datetime' hier - das wuerde den Klassennamen im globalen Scope ueberschreiben!
+
+# ---------------------------------------------------------------------------
+# Logging: begrenztes Dateilog und Journal-Ausgabe
+# ---------------------------------------------------------------------------
+LOG_DIR_SVC = "/var/www/html/logs"
+if not os.path.exists(LOG_DIR_SVC):
+    LOG_DIR_SVC = RAMDISK_DIR  # Fallback falls logs-Dir noch nicht existiert
+
+_log_file = os.path.join(LOG_DIR_SVC, "pv_forecast.log")
+from runtime_logging import configure_service_logger
+logger = configure_service_logger(
+    "EnsemblePVForecaster",
+    log_path=_log_file,
+    max_bytes=2 * 1024 * 1024,
+    backup_count=3,
+    quiet_interval_s=1800.0,
+)
+
+
+def _get_sleep_seconds():
+    """
+    Haupt-Loop-Intervall (wie oft der Loop laeuft und prft ob ein Modell ablaeuft):
+    - Tagzeit (07-21 Uhr): 60 Minuten
+    - Nacht (21-07 Uhr):  120 Minuten
+    Die echten API-Calls werden durch Modell-TTLs und Solcast-Tagesbudget gesteuert.
+    """
+    hour = datetime.now().hour  # datetime = Klasse aus 'from datetime import datetime'
+    if 7 <= hour < 21:
+        return 60 * 60   # 60 Minuten tags\u00fcber
+    return 120 * 60      # 2 Stunden nachts
+
+
+
+def _forecast_is_stale():
+    """
+    Gibt True zurueck wenn pv_forecast.json aelter als 3 Stunden ist
+    und wir uns in der Tagzeit befinden (dann sofort neu abrufen).
+    """
+    if not os.path.exists(FORECAST_OUTPUT):
+        return True
+    age_secs = time.time() - os.path.getmtime(FORECAST_OUTPUT)
+    hour = datetime.now().hour  # datetime = Klasse aus 'from datetime import datetime'
+    if 7 <= hour < 21 and age_secs > 3 * 3600:
+        logger.warning(f"pv_forecast.json ist {age_secs/3600:.1f}h alt - sofortiger Re-Fetch!")
+        return True
+    return False
+
+
+def _weather_alerts_are_stale():
+    """
+    DWD-Warnungen koennen sehr kurzfristig kommen. Darum laeuft dieser Check
+    unabhaengig vom teuren PV-Forecast-Zyklus.
+    """
+    if not os.path.exists(WEATHER_ALERTS_OUTPUT):
+        return True
+    try:
+        return (time.time() - os.path.getmtime(WEATHER_ALERTS_OUTPUT)) > WEATHER_ALERT_TTL_S
+    except Exception:
+        return True
+
+
+def _ml_prediction_is_stale(max_age_s=ML_PREDICTION_MAX_AGE_S):
+    if not os.path.exists(ML_PREDICTION_OUTPUT):
+        return True
+    try:
+        return (time.time() - os.path.getmtime(ML_PREDICTION_OUTPUT)) > max_age_s
+    except Exception:
+        return True
+
+
+def _run_ml_predict_if_ready(force=False):
+    """
+    Die PV-Prognose liegt in der Ramdisk und wird nach Reboot neu aufgebaut.
+    Die Verbrauchs-/WP-Prognose muss denselben Lifecycle haben, sonst fällt der
+    Simulator nach jedem Neustart auf feste 500W/300W-Ersatzwerte zurück.
+    """
+    if not os.path.exists(ML_MODEL_FILE):
+        logger.info("ML-Modell fehlt (%s) - Verbrauchsprognose bleibt im Fallback.", ML_MODEL_FILE)
+        return False
+    if not force and not _ml_prediction_is_stale():
+        return False
+
+    ml_script = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "ml_predictor.py"))
+    if not os.path.exists(ml_script):
+        logger.warning("ML-Predictor fehlt: %s", ml_script)
+        return False
+
+    python_bin = sys.executable or "python3"
+    try:
+        result = subprocess.run(
+            [python_bin, ml_script, "--predict"],
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+    except Exception as exc:
+        logger.warning("ML-Verbrauchsprognose konnte nicht gestartet werden: %s", exc)
+        return False
+
+    stdout_tail = (result.stdout or "").strip().splitlines()[-6:]
+    stderr_tail = (result.stderr or "").strip().splitlines()[-6:]
+    for line in stdout_tail:
+        logger.info("ml_predictor: %s", line)
+    for line in stderr_tail:
+        logger.warning("ml_predictor stderr: %s", line)
+
+    if result.returncode == 0 and os.path.exists(ML_PREDICTION_OUTPUT):
+        logger.info("ML-Verbrauchsprognose aktualisiert: %s", ML_PREDICTION_OUTPUT)
+        return True
+
+    logger.warning(
+        "ML-Verbrauchsprognose fehlgeschlagen (rc=%s, output_exists=%s).",
+        result.returncode,
+        os.path.exists(ML_PREDICTION_OUTPUT),
+    )
+    return False
+
+
+def _refresh_weather_alerts_only():
+    try:
+        app = EnsemblePVForecaster()
+        app.update_weather_alerts()
+        return True
+    except Exception as exc:
+        logger.warning("Wetterwarnungen konnten nicht separat aktualisiert werden: %s", exc)
+        return False
+
+
+if __name__ == "__main__":
+    import sys as _sys
+    _once = "--once" in _sys.argv  # Einzel-Run: genau ein Zyklus, dann exit (fuer entrypoint)
+
+    logger.info("Starte PV Wetter & Forecast Manager Service (V4)%s..."
+                % (" [ONCE]" if _once else ""))
+    logger.info(f"Log-Datei: {_log_file}")
+
+    while True:
+        try:
+            # Konfiguration bei jedem Zyklus neu laden (UI-Aenderungen wirken ohne Neustart)
+            app = EnsemblePVForecaster()
+            app.generate_ensemble()
+            _run_ml_predict_if_ready(force=_once)
+        except Exception as e:
+            logger.error(f"Unerwarteter Fehler im Forecast-Loop: {e}", exc_info=True)
+
+        if _once:
+            logger.info("--once: Einzel-Fetch abgeschlossen. Beende Prozess.")
+            break  # Kein Daemon - sofort beenden (fuer entrypoint.sh / update.py)
+
+        sleep_secs = _get_sleep_seconds()
+        logger.info(f"Naechster API-Fetch in {sleep_secs // 60} Minuten (Tagzeit={7 <= datetime.now().hour < 21}).")
+
+        # Adaptiv schlafen: alle 60s pruefen ob Prognose veraltet ist
+        slept = 0
+        while slept < sleep_secs:
+            time.sleep(60)
+            slept += 60
+            if _weather_alerts_are_stale():
+                logger.info("Wetterwarnungen veraltet - aktualisiere DWD/ICON ohne PV-Forecast.")
+                _refresh_weather_alerts_only()
+            if _forecast_is_stale():
+                logger.info("Prognose veraltet - breche Schlaf ab und aktualisiere sofort.")
+                break

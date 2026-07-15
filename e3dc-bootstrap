@@ -1,0 +1,61 @@
+#!/bin/sh
+set -eu
+
+usage() {
+    echo "Usage: $0 <install-path> <release-tag> <40-char-sha> <off|master|slave|shadow>" >&2
+    exit 2
+}
+
+[ "$#" -eq 4 ] || usage
+
+TARGET=$1
+TAG=$2
+EXPECTED_SHA=$3
+EXPECTED_ROLE=$4
+
+case "$TARGET" in
+    /*) ;;
+    *) echo "Installationspfad muss absolut sein." >&2; exit 2 ;;
+esac
+
+case "$EXPECTED_ROLE" in
+    off|master|slave|shadow) ;;
+    *) echo "Ungueltige HA-/Shadow-Rolle." >&2; exit 2 ;;
+esac
+
+[ "${#EXPECTED_SHA}" -eq 40 ] || {
+    echo "Ziel-SHA muss genau 40 Zeichen lang sein." >&2
+    exit 2
+}
+case "$EXPECTED_SHA" in
+    *[!0-9a-fA-F]*) echo "Ziel-SHA ist nicht hexadezimal." >&2; exit 2 ;;
+esac
+
+PYTHON=${PYTHON:-python3}
+"$PYTHON" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' || {
+    echo "Dieser Release-Installer benoetigt Python 3.10 oder neuer; es wurde noch nichts veraendert." >&2
+    exit 1
+}
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+[ -f "$SCRIPT_DIR/installer_main.py" ] || {
+    echo "installer_main.py fehlt im Release-Archiv." >&2
+    exit 1
+}
+
+if [ "$(id -u)" -eq 0 ]; then
+    exec "$PYTHON" "$SCRIPT_DIR/installer_main.py" \
+        --unattended \
+        --install-release-tag "$TAG" \
+        --bootstrap-install-path "$TARGET" \
+        --expected-release-sha "$EXPECTED_SHA" \
+        --expected-ha-role "$EXPECTED_ROLE"
+fi
+
+exec sudo -- "$PYTHON" "$SCRIPT_DIR/installer_main.py" \
+    --unattended \
+    --install-release-tag "$TAG" \
+    --bootstrap-install-path "$TARGET" \
+    --expected-release-sha "$EXPECTED_SHA" \
+    --expected-ha-role "$EXPECTED_ROLE"
+

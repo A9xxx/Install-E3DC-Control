@@ -1,0 +1,15 @@
+{
+  "name": "e3dc-matter-bridge",
+  "version": "1.0.0",
+  "description": "Matter Bridge for E3DC-Control",
+  "main": "matter_bridge.js",
+  "type": "module",
+  "scripts": {
+    "start": "npx tsx matter_bridge.js"
+  },
+  "dependencies": {
+    "@project-chip/matter-node.js": "0.7.1",
+    "tsx": "^4.19.2",
+    "qrcode": "^1.5.3"
+  }
+}

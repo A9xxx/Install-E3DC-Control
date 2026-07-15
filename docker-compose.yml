@@ -1,0 +1,45 @@
+services:
+  e3dc-control:
+    image: ghcr.io/a9xxx/install-e3dc-control:v5.3.2b
+    # v5.3.2b ist der parentlose Rollback-Root ohne älteren öffentlichen Rückfall.
+
+    # ZUM SELBST BAUEN: Obige Zeile auskommentieren und stattdessen:
+    # build: .
+
+    container_name: e3dc-control
+    restart: unless-stopped
+    network_mode: host
+
+    volumes:
+      # PERSISTENTE DATEN (Konfiguration, SQLite, Backups)
+      - e3dc_data:/var/www/html/data
+
+      # LOGS (persistent, aber nicht im Repo)
+      - e3dc_logs:/var/www/html/logs
+
+    tmpfs:
+      # RAM-Disk fuer Live-Daten (pv_forecast.json, live_data_py.json, ...)
+      - /var/www/html/ramdisk:size=32M,uid=33,gid=33,mode=2775
+
+    environment:
+      - TZ=Europe/Berlin
+      # Optional fuer NAS/Synology mit belegtem Port 80:
+      # - E3DC_WEB_PORT=8085
+      # Optional auf eine konkrete Host-IP/Schnittstelle binden:
+      # - E3DC_WEB_BIND=192.0.2.20
+
+  watchtower:
+    image: containrrr/watchtower
+    container_name: watchtower
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - TZ=Europe/Berlin
+      - DOCKER_API_VERSION=1.40
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_POLL_INTERVAL=86400
+
+volumes:
+  e3dc_data:
+  e3dc_logs:

@@ -1,0 +1,22 @@
+#!/bin/bash
+# E3DC-Control Wrapper Script
+# Macht den Aufruf des lokalen Tools einfacher (ohne cd und python3 etc.)
+
+SCRIPT_DIR="/home/pi/Install"
+
+# Wenn als root ausgeführt, dann behalte pfad
+if [ "$EUID" -ne 0 ]; then
+    echo "Tipp: Der Setup/Repair-Task wird automatisch als root ausgeführt..."
+    sudo bash "$0" "$@"
+    exit $?
+fi
+
+cd "$SCRIPT_DIR" || exit 1
+
+# Venv aktivieren falls vorhanden
+if [ -d "/home/pi/.venv_e3dc" ]; then
+    source /home/pi/.venv_e3dc/bin/activate
+fi
+
+# Run
+python3 "$SCRIPT_DIR/installer_main.py" "$@"

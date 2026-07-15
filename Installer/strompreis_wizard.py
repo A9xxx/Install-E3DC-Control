@@ -1,0 +1,253 @@
+import os
+import re
+
+from .core import register_command
+from .utils import ensure_dir
+from .installer_config import get_install_path, get_user_ids, get_www_data_gid
+from .logging_manager import get_or_create_logger, log_task_completed, log_error, log_warning
+
+INSTALL_PATH = get_install_path()
+# [DEPRECATED] e3dc.strompreise.txt wird in V4 nicht mehr benoetigt.
+# Strompreise kommen aus epex_daten.json (epex_manager.py) / awattar_cache.json.
+# Diese Datei und der Wizard existieren nur noch fuer Legacy-Systeme im Uebergang.
+PRICE_FILE = os.path.join(INSTALL_PATH, "e3dc.strompreise.txt")
+strom_logger = get_or_create_logger("strompreis")
+
+# Standardwerte
+DEFAULT_ENTRIES = [
+    "2 17.77",
+    "6 24.76",
+    "12 17.77",
+    "13 17.76",
+    "14 17.75",
+    "15 17.74",
+    "16 24.76",
+    "18 29.77",
+    "21 24.76"
+]
+
+
+def validate_entry(line):
+    """Validiert einen Eintrag (Stunde Preis)."""
+    parts = line.strip().split()
+    
+    if len(parts) != 2:
+        return False, "Format ungültig (erwartet: 'Stunde Preis')"
+    
+    try:
+        hour = int(parts[0])
+        price = float(parts[1])
+        
+        if not (0 <= hour <= 23):
+            return False, f"Stunde {hour} ungültig (0-23)"
+        
+        if price < 0:
+            return False, f"Preis {price} kann nicht negativ sein"
+        
+        return True, (hour, price)
+    except ValueError:
+        return False, "Stunde und Preis müssen Zahlen sein"
+
+
+def parse_entries(entries):
+    """Parsed und validiert eine Liste von Einträgen."""
+    parsed = {}
+    errors = []
+    
+    for line in entries:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        
+        valid, result = validate_entry(line)
+        
+        if not valid:
+            errors.append(f"'{line}' → {result}")
+        else:
+            hour, price = result
+            if hour in parsed:
+                errors.append(f"Stunde {hour} doppelt vorhanden – überschreibe")
+            parsed[hour] = price
+    
+    return parsed, errors
+
+
+def create_default_price_file():
+    """Erstellt die Datei mit Standardwerten."""
+    try:
+        if not ensure_dir(INSTALL_PATH):
+            print("✗ Verzeichnis konnte nicht erstellt werden\n")
+            log_error("strompreis", f"Verzeichnis konnte nicht erstellt werden: {INSTALL_PATH}")
+            return False
+        
+        print("→ Erstelle Strompreis-Datei mit Standardwerten…")
+        strom_logger.info("Erstelle Strompreis-Datei mit Standardwerten.")
+        
+        with open(PRICE_FILE, "w") as f:
+            f.write("# Strompreise (Stunde Preis)\n")
+            f.write("# Format: 0-23 (Stunde) und Preis in ct/kWh\n\n")
+            for line in DEFAULT_ENTRIES:
+                f.write(line + "\n")
+        
+        try:
+            uid, _ = get_user_ids()
+            os.chown(PRICE_FILE, uid, get_www_data_gid())
+        except Exception as e:
+            log_warning("strompreis", f"Konnte Besitzrechte nicht setzen: {e}")
+            pass
+        os.chmod(PRICE_FILE, 0o664)
+        print(f"✓ Datei erstellt: {PRICE_FILE}\n")
+        strom_logger.info(f"Datei erstellt: {PRICE_FILE}")
+        return True
+    except Exception as e:
+        print(f"✗ Fehler beim Erstellen der Datei: {e}\n")
+        log_error("strompreis", f"Fehler beim Erstellen der Datei: {e}", e)
+        return False
+
+
+def load_entries():
+    """Liest die Einträge aus der Preis-Datei."""
+    if not os.path.exists(PRICE_FILE):
+        return None
+
+    try:
+        entries = []
+        with open(PRICE_FILE, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    entries.append(line)
+        return entries if entries else []
+    except Exception as e:
+        print(f"✗ Fehler beim Lesen der Datei: {e}\n")
+        log_error("strompreis", f"Fehler beim Lesen der Datei: {e}", e)
+        return None
+
+
+def save_entries(parsed_prices):
+    """Speichert die Strompreise (sortiert nach Stunde)."""
+    try:
+        # Umask setzen für korrekte File-Berechtigungen
+        old_umask = os.umask(0o002)
+        try:
+            with open(PRICE_FILE, "w") as f:
+                f.write("# Strompreise (Stunde Preis)\n")
+                f.write("# Format: 0-23 (Stunde) und Preis in ct/kWh\n\n")
+                
+                for hour in sorted(parsed_prices.keys()):
+                    price = parsed_prices[hour]
+                    f.write(f"{hour} {price}\n")
+        finally:
+            os.umask(old_umask)
+            
+        strom_logger.info(f"Strompreise gespeichert in {PRICE_FILE}")
+        
+        # Setze korrekten Owner und Berechtigungen
+        try:
+            uid, _ = get_user_ids()
+            os.chown(PRICE_FILE, uid, get_www_data_gid())
+            os.chmod(PRICE_FILE, 0o664)      # rw-rw-r-- damit PHP schreiben kann
+            strom_logger.info("Berechtigungen für Strompreis-Datei gesetzt.")
+        except Exception as e:
+            print(f"⚠ Warnung: Berechtigungen konnten nicht vollständig gesetzt werden: {e}")
+            log_warning("strompreis", f"Berechtigungen konnten nicht gesetzt werden: {e}")
+        
+        return True
+    except Exception as e:
+        print(f"✗ Fehler beim Speichern: {e}")
+        log_error("strompreis", f"Fehler beim Speichern der Strompreise: {e}", e)
+        return False
+
+
+def strompreis_wizard(headless=False):
+    """Hauptlogik für Strompreis-Konfiguration."""
+    print("\n=== Strompreis-Wizard ===\n")
+    strom_logger.info("Starte Strompreis-Wizard")
+
+    if headless:
+        print("Headless-Modus: Überspringe interaktive Eingabe.")
+        return
+
+    entries = load_entries()
+    if entries is None: # Datei existiert nicht
+        print("⚠ Strompreis-Datei existiert nicht.")
+        strom_logger.warning(f"Strompreis-Datei existiert nicht: {PRICE_FILE}")
+        choice = input("Jetzt mit Standardwerten erstellen? (j/n): ").strip().lower()
+        if choice == 'j':
+            if create_default_price_file():
+                entries = DEFAULT_ENTRIES.copy()
+            else:
+                return # Fehler beim Erstellen
+        else:
+            # Benutzer möchte manuell eingeben
+            entries = []
+
+    if entries:
+        print("Aktuelle Einträge:\n")
+        for line in entries:
+            print(f"  {line}")
+
+    print("\n--- Neue Werte eingeben ---")
+    print("Format: Stunde (0-23) und Preis")
+    print("Beispiel: '14 25.5'")
+    print("Mehrere Zeilen eingeben, mit leerer Zeile beenden.\n")
+
+    new_entries_lines = []
+    while True:
+        line = input("> ").strip()
+        if not line:
+            break
+        if line.startswith("#"):
+            continue
+        new_entries_lines.append(line)
+
+    # Entscheiden, welche Einträge verarbeitet werden sollen
+    if new_entries_lines:
+        entries_to_process = new_entries_lines
+        print("\n→ Verarbeite neue Eingaben...")
+    elif not entries: # Keine neuen Eingaben UND keine vorherigen Einträge
+        print("\nKeine Eingaben gemacht.")
+        choice = input("Standardwerte übernehmen? (j/n): ").strip().lower()
+        if choice == "j":
+            entries_to_process = DEFAULT_ENTRIES.copy()
+        else:
+            print("→ Abgebrochen.\n")
+            strom_logger.info("Strompreis-Wizard abgebrochen (keine Eingaben).")
+            return
+    else: # Keine neuen Eingaben, aber es gab alte
+        entries_to_process = entries
+        print("\n→ Keine neuen Eingaben, behalte alte Werte bei.")
+
+    # Validiere die ausgewählten Einträge
+    parsed, errors = parse_entries(entries_to_process)
+
+    if errors:
+        print("\n⚠ Fehler bei der Validierung:\n")
+        for error in errors:
+            print(f"  - {error}")
+        strom_logger.warning(f"Validierungsfehler: {errors}")
+
+    if not parsed:
+        print("\n✗ Keine gültigen Einträge – Abbruch.\n")
+        return
+
+    # Bestätigung
+    print("\nValidierte Einträge:\n")
+    for hour in sorted(parsed.keys()):
+        print(f"  {hour:2d}:00 → {parsed[hour]:.2f} ct/kWh")
+
+    choice = input("\nSpeichern? (j/n): ").strip().lower()
+    if choice != "j":
+        print("→ Abgebrochen.\n")
+        strom_logger.info("Strompreis-Wizard abgebrochen (nicht gespeichert).")
+        return
+
+    # Speichern
+    if save_entries(parsed):
+        print("\n✓ Strompreise aktualisiert.\n")
+        log_task_completed("Strompreise aktualisiert")
+    else:
+        print("\n✗ Speichern fehlgeschlagen.\n")
+
+
+register_command("9", "Konfiguration: Strompreise anpassen (Tibber, aWATTar)", strompreis_wizard, sort_order=30)

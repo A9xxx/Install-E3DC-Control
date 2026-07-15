@@ -1,0 +1,420 @@
+# E3DC-Control: Docker Installation & Betrieb
+
+Veröffentlichte Images entstehen ausschließlich aus einem versionierten stabilen Release-Tag. `latest` verweist damit auf die zuletzt veröffentlichte stabile Version.
+
+E3DC-Control kann isoliert über **Docker** betrieben werden. Der Container kapselt die Anwendung; persistente Betriebsdaten liegen in den dafür vorgesehenen Volumes. Der Multi-Architektur-Support (`arm64`, `amd64`) deckt die vorgesehenen Plattformen ab.
+
+---
+
+## 1. Voraussetzungen & Einrichtung
+
+### Schritt 1: Docker installieren
+Falls Docker noch nicht auf deinem Raspberry Pi, NUC oder Ubuntu-System installiert ist, richte das offizielle Docker-APT-Repository mit eigenem Keyring ein:
+```bash
+sudo apt-get update
+sudo apt-get install -y ca-certificates curl
+sudo install -m 0755 -d /etc/apt/keyrings
+. /etc/os-release
+DOCKER_REPO=debian
+DOCKER_CODENAME="${VERSION_CODENAME}"
+if [ "${ID}" = "ubuntu" ] || echo "${ID_LIKE:-}" | grep -qw ubuntu; then
+  DOCKER_REPO=ubuntu
+  DOCKER_CODENAME="${UBUNTU_CODENAME:-$VERSION_CODENAME}"
+fi
+sudo curl -fsSL --proto '=https' --tlsv1.2 \
+  "https://download.docker.com/linux/${DOCKER_REPO}/gpg" \
+  -o /etc/apt/keyrings/docker.asc
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+printf 'Types: deb\nURIs: https://download.docker.com/linux/%s\nSuites: %s\nComponents: stable\nArchitectures: %s\nSigned-By: /etc/apt/keyrings/docker.asc\n' \
+  "$DOCKER_REPO" "$DOCKER_CODENAME" "$(dpkg --print-architecture)" | \
+  sudo tee /etc/apt/sources.list.d/docker.sources > /dev/null
+sudo apt-get update
+sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo usermod -aG docker $USER
+```
+*(Melde dich danach einmal ab und wieder an, damit die Gruppenrechte aktiv werden)*
+
+### Schritt 2: Verzeichnis vorbereiten
+Erstelle einen Ordner fuer E3DC-Control. Die dauerhafte Konfiguration und Historie liegen im Unterordner `data`; der Anwendungscode kommt aus dem Docker-Image.
+```bash
+export E3DC_DOCKER_PATH="/absoluter/pfad/zur/docker-installation"
+mkdir -p "$E3DC_DOCKER_PATH"
+cd "$E3DC_DOCKER_PATH"
+mkdir -p data logs
+```
+Neue Systeme werden im Browser-Wizard bzw. im Config-Editor eingerichtet und speichern nach `data/e3dc_v4.json`. Eine vorhandene `e3dc.config.txt` kannst du optional nach `data/` kopieren; sie wird beim Start als Legacy-Quelle in die aktuelle Konfiguration migriert.
+
+### Schritt 3: Die `docker-compose.yml`
+Erstelle in `$E3DC_DOCKER_PATH` eine Datei namens `docker-compose.yml` und kopiere folgenden Inhalt hinein:
+
+```yaml
+services:
+  e3dc-control:
+    image: ghcr.io/a9xxx/install-e3dc-control:v5.3.2b
+    container_name: e3dc-control
+    restart: unless-stopped
+    network_mode: "host"
+    volumes:
+      # Sichert Konfiguration, SQLite und Historie dauerhaft auf deiner Festplatte
+      - ./data:/var/www/html/data
+      # Persistente Logs ausserhalb des Containers
+      - ./logs:/var/www/html/logs
+    tmpfs:
+      # Schont die SD-Karte extrem, indem temporäre Dateien direkt in den RAM des Hosts geschrieben werden
+      - /var/www/html/ramdisk:size=32M,uid=33,gid=33,mode=2775
+    environment:
+      - TZ=Europe/Berlin
+      # Optional fuer Synology/NAS, wenn Port 80 vom Host belegt oder umgeleitet wird:
+      # - E3DC_WEB_PORT=8085
+      # Optional: Apache nur auf eine bestimmte Host-IP binden:
+      # - E3DC_WEB_BIND=192.0.2.20
+```
+*(Hinweis: `network_mode: "host"` ist sinnvoll, damit die nativen Python-Dienste das E3DC Hauskraftwerk und lokale MQTT-/Wallbox-Geraete direkt erreichen und der Webserver ohne Port-Mapping erreichbar ist).*
+
+**Synology / NAS mit belegtem Port 80:**
+Wenn der Host Port 80 selbst abfaengt oder auf die NAS-GUI umleitet, kannst du
+den Apache-Port im Container per ENV setzen. Mit `network_mode: "host"` gibt es
+kein Docker-`ports:`-Mapping; der Container bindet direkt auf dem Host-Port.
+
+```yaml
+environment:
+  - TZ=Europe/Berlin
+  - E3DC_WEB_PORT=8085
+  # Optional, wenn nur eine bestimmte Host-IP genutzt werden soll:
+  # - E3DC_WEB_BIND=192.0.2.20
+```
+
+Danach erreichst du E3DC-Control z.B. unter
+`http://<NAS-IP>:8085/`. Der Synology Reverse Proxy kann dann auf diesen Port
+weiterleiten. `E3DC_WEB_BIND` erwartet eine IP-Adresse der gewuenschten
+Schnittstelle, keinen Interface-Namen wie `eth0`.
+
+**Wichtig bei bestehenden Images:**
+`docker compose up -d` baut ein vorhandenes Image nicht automatisch neu und
+zieht auch nicht zwingend die neueste Version. Wenn `E3DC_WEB_PORT` im Container
+sichtbar ist, Apache aber trotzdem weiter auf `0.0.0.0:80` hoert, laeuft sehr
+wahrscheinlich noch ein altes Image oder ein alter Container.
+
+Fertiges GitHub-Image aktualisieren:
+
+```bash
+cd "$E3DC_DOCKER_PATH"
+sudo docker compose pull e3dc-control
+sudo docker compose up -d --force-recreate e3dc-control
+```
+
+Gezielte Rückfallversion:
+
+Einen späteren Stable-Container auf den veröffentlichten Rollback-Root
+`v5.3.2b` zurücksetzen:
+
+```bash
+TAG=v5.3.2b
+cd "$E3DC_DOCKER_PATH"
+sudo docker run --rm -v e3dc-docker_e3dc_data:/data -v "$PWD":/backup alpine \
+  sh -lc 'tar czf "/backup/e3dc-data-$(date +%Y%m%d-%H%M%S).tgz" -C /data .'
+sudo cp docker-compose.yml "docker-compose.yml.before-$TAG"
+sudo sed -i -E "s#^([[:space:]]*)image: ghcr.io/a9xxx/install-e3dc-control:.*#\1image: ghcr.io/a9xxx/install-e3dc-control:$TAG#" docker-compose.yml
+sudo docker compose pull e3dc-control
+sudo docker compose up -d --force-recreate e3dc-control
+sudo docker compose ps
+sudo docker logs --tail=80 e3dc-control
+```
+
+Der Rückfall ist bewusst ein Host-Befehl: Der E3DC-Control-Container soll nicht
+den Docker-Daemon des Hosts steuern. Die Weboberfläche kann deshalb die
+passenden Befehle für den gewählten Tag anzeigen, aber sie führt sie im
+Docker-Betrieb nicht selbst aus.
+
+Der Stand `v5.3.2b` ist selbst der Rollback-Root und verweist auf kein älteres
+öffentliches Image. Die Befehle sind daher für den Rückfall von einem späteren
+Stable-Image auf diesen Stand vorgesehen.
+
+Lokales Image aus dem frisch geklonten Repository wirklich neu bauen:
+
+```bash
+cd "$E3DC_DOCKER_PATH"
+sudo docker compose build --no-cache e3dc-control
+sudo docker compose up -d --force-recreate e3dc-control
+```
+
+Das lokale Neubauen funktioniert nur, wenn in der `docker-compose.yml` fuer den
+Dienst `e3dc-control` auch `build: .` aktiv ist. Steht dort nur `image: ...`,
+nutzt Docker das vorhandene oder gepullte Image.
+
+Wenn du bewusst lokal aus dem geklonten Repository bauen willst, muss in der
+Compose-Datei `image: ghcr.io/...` auskommentiert und `build: .` aktiviert
+sein. Danach ist die Ausgabe von `docker inspect e3dc-control --format
+'Image={{.Image}} Created={{.Created}}'` ein guter Plausibilitaetscheck: Das
+`Created`-Datum muss zum gerade ausgefuehrten Build passen. Fuer normale
+Installationen bleibt das fertige GitHub-Image der bequemere Weg. Ein lokaler
+Build ist für Plattformen oder Anpassungen gedacht, die nicht vom fertigen
+Image abgedeckt werden.
+
+In der Ausgabe von `docker compose config` ist `volume: {}` bei
+`e3dc_data`/`e3dc_logs` normal: Das sind benannte Docker-Volumes, deren echter
+Hostpfad von Docker verwaltet wird. Den Pfad siehst du bei Bedarf mit
+`docker volume inspect e3dc-docker_e3dc_data` bzw. dem tatsaechlichen
+Compose-Projektnamen.
+
+Pruefen, ob der neue Entrypoint aktiv ist:
+
+```bash
+sudo docker exec e3dc-control sh -lc '
+echo PORT=$E3DC_WEB_PORT BIND=$E3DC_WEB_BIND
+grep -n "configure_apache_web_port" /usr/local/bin/entrypoint.sh /app/pi/Install/entrypoint.sh 2>/dev/null
+grep -R "^[[:space:]]*Listen[[:space:]]" /etc/apache2/ports.conf /etc/apache2/conf-enabled /etc/apache2/sites-enabled 2>/dev/null
+apache2ctl -S
+'
+```
+
+Erwartung bei `E3DC_WEB_PORT=8085` und `E3DC_WEB_BIND=192.0.2.222`:
+
+```text
+Listen 192.0.2.222:8085
+VirtualHost configuration:
+192.0.2.222:8085 ...
+```
+
+Wenn das Dashboard danach erreichbar ist, aber oben `Warte auf E3DC...` zeigt,
+ist der Webserver repariert und der naechste Schritt ist RSCP: Konfiguration
+speichern, Container neu starten und dann Port/Anmeldung pruefen.
+
+```bash
+sudo docker compose restart e3dc-control
+sudo docker exec e3dc-control sh -lc '
+python3 - <<PY
+import json, socket
+cfg=json.load(open("/var/www/html/data/e3dc_v4.json"))
+print("server_ip=", cfg.get("server_ip"))
+print("server_port=", cfg.get("server_port", 5033))
+print("e3dc_user gesetzt=", bool(cfg.get("e3dc_user")))
+s=socket.create_connection((cfg["server_ip"], int(cfg.get("server_port") or 5033)), 5)
+print("TCP 5033 OK")
+s.close()
+PY
+/opt/venv/bin/python3 /app/pi/Install/Installer/e3dc_live.py --loops 1
+'
+```
+
+Kommt `TCP 5033 OK`, aber `e3dc_live.py` liefert keine Daten, sind meist
+Benutzer, Passwort oder AES-Passwort zu pruefen. Scheitert schon TCP, liegt es
+an IP, Netzwerk, VLAN, Firewall oder daran, dass RSCP am E3DC nicht erreichbar
+ist.
+
+Wenn du nur den Port aendern willst, ist es oft robuster, `E3DC_WEB_BIND`
+wegzulassen. Dann hoert Apache auf allen Host-IP-Adressen auf dem gewaehlten
+Port, z.B. `Listen 8085`.
+
+### Schritt 4: Starten
+Starte den Container im Hintergrund:
+```bash
+sudo docker compose up -d
+```
+Das System lädt nun das fertige Image aus dem Internet herunter, richtet den Webserver, die RAM-Disk und alle Python-Skripte vollautomatisch ein. Du erreichst dein Dashboard sofort über die IP-Adresse deines Raspberry Pi im Browser.
+
+---
+
+## 2. Architektur & Unterschiede zur normalen Installation
+
+Wenn E3DC-Control in Docker läuft, verhält es sich intern etwas anders als bei einer "Bare-Metal" Installation auf dem Raspberry Pi.
+
+* **Keine Cronjobs:** Docker-Container haben von Haus aus keinen Aufgabenplaner (Cron). Diese Aufgabe übernimmt vollautomatisch der in Python geschriebene **Schedule & Notification Manager** (`notification_manager.py`). Er läuft im Hintergrund und triggert die Minutenspeicherung, Backups und Telegram-Nachrichten.
+* **Web-Updates deaktiviert:** Da ein Container „immutable" (unveränderlich) ist, ist der „Update"-Knopf im Web-Dashboard deaktiviert. Klickst du darauf, informiert dich das System, dass Updates über Docker bezogen werden müssen.
+* **Kein Systemd:** Befehle wie `systemctl restart e3dc` funktionieren im Container nicht. Wenn du den Dienst neu starten möchtest, startest du einfach den gesamten Container neu (siehe unten). Logs der Python-Dienste findest du unter `/var/www/html/logs/`.
+* **Auto-Start:** Du benötigst keine Watchdogs oder Crontab-Einträge mehr, damit E3DC nach einem Stromausfall hochfährt. Der Parameter `restart: unless-stopped` in der `docker-compose.yml` sorgt dafür, dass Docker das System immer am Leben hält.
+
+### Aktive Hintergrunddienste im Container
+
+Folgende Python-Dienste starten automatisch über die `entrypoint.sh`. Alle Logs liegen unter `/var/www/html/logs/`:
+
+| Dienst | Startbedingung | Log-Datei |
+|--------|----------------|-----------|
+| `e3dc_websocket.py` | Immer | `e3dc_websocket.log` |
+| `energy_manager.py` | Automatik/Verbrauchslogging im Frontend aktiv | `energy_manager.log` |
+| `lux_live.py` | Wärmepumpen Typ: Luxtronik | `lux_live.log` |
+| `idm_live.py` | Wärmepumpen Typ: IDM und IDM-IP gesetzt | `idm_live.log` |
+| `stiebel/stiebel_live.py` | Wärmepumpen Typ: Stiebel Eltron ISG / WPM und ISG-IP gesetzt | `stiebel_live.log` |
+| `heizstab_manager.py` | Heizstab/Shelly als Waermequelle konfiguriert | `heizstab_manager.log` |
+| `wallbox_manager.py` | `wb_native_enable=1` | `wallbox_manager.log` |
+| `e3dc_mqtt_hub.py` | `mqtt_hub_ip=...` | `e3dc_mqtt_hub.log` |
+| `bluelink_client.py` | `bluelink_refresh_token=...` | `bluelink_client.log` |
+| `epex_manager.py` | Immer | `epex_manager.log` |
+| `Forecast/pv_forecast_service.py` | Immer | `weather_manager.log` |
+| `storage_simulator.py` | Immer | `storage_simulator.log` |
+| `e3dc_live.py` | Immer | `e3dc_live.log` |
+| `notification_manager.py` | Immer | `notification_manager.log` |
+
+Fuer Stiebel Eltron ISG/WPM reicht im Docker-Betrieb nach dem Update auf ein
+Image ab `5.0.4g`: Im Config-Editor unter **Smart Home &
+Verbrauchsprognose** den Schalter **WP-/Verbrauchslogging aktivieren**
+einschalten, bei **Wärmepumpen Typ** **Stiebel Eltron ISG / WPM** waehlen,
+die **ISG IP-Adresse** eintragen und den Container neu starten. Der
+Live-Treiber ist read-only; ein optionaler Shelly-Leistungsmesser wird
+ebenfalls nur gelesen und schaltet kein Relais. Der Dienst startet automatisch
+aus der `entrypoint.sh`.
+
+> **Wichtig:** Wenn du ein Feature **nachträglich** im Config-Editor aktivierst (z.B. Wallbox Manager, Heizstab), muss der Container **einmal neugestartet** werden — erst dann wertet die `entrypoint.sh` die neue Einstellung aus und startet den Dienst!
+
+---
+
+### MQTT-Hub im Docker starten
+
+Im Docker wird kein `systemctl` verwendet. Der MQTT-Hub ist daher nicht als
+klassischer Linux-Dienst zu installieren. Er startet automatisch, sobald in der
+E3DC-Control-Konfiguration ein MQTT-Broker eingetragen ist.
+
+Vorgehen:
+
+1. Im Config-Editor den Bereich **Smart Home MQTT-Hub** oeffnen.
+2. Broker-IP/Host (`mqtt_hub_ip`) und bei Bedarf Port, Benutzer, Passwort und
+   Topics eintragen.
+3. Konfiguration speichern.
+4. Den Container einmal neu starten:
+
+```bash
+cd "$E3DC_DOCKER_PATH"
+sudo docker compose restart e3dc-control
+```
+
+Beim naechsten Start meldet der Container im Log:
+
+```text
+-> MQTT Hub aktiv.
+```
+
+Pruefen kannst du den Dienst so:
+
+```bash
+sudo docker logs e3dc-control | grep "MQTT Hub"
+sudo docker exec e3dc-control tail -50 /var/www/html/logs/e3dc_mqtt_hub.log
+```
+
+Wenn der MQTT Explorer bereits Werte im Broker zeigt, ist der Broker erreichbar.
+E3DC-Control liest diese Werte aber erst ein, wenn der MQTT-Hub im Container
+laeuft und die passenden Subscribe-Topics in der Config gesetzt sind. Der Hub
+uebernimmt nicht automatisch alle MQTT-Werte aus dem Broker.
+
+---
+
+## 3. Automatische Updates mit Watchtower (Empfohlen)
+
+Manuell geht es jederzeit so:
+```bash
+cd "$E3DC_DOCKER_PATH"
+sudo docker compose pull
+sudo docker compose up -d --force-recreate
+```
+`docker compose pull` aktualisiert Python/PHP-Code, Container-Startskript und Systempakete. `--force-recreate` stellt sicher, dass der Container wirklich aus dem neuen Image startet.
+
+Für den Rückfall eines späteren Stable-Images wird in der `docker-compose.yml`
+statt `latest` der von dessen Update-Policy freigegebene Release-Tag gesetzt.
+Der einzige vorgesehene öffentliche Rollback-Root ist
+`ghcr.io/a9xxx/install-e3dc-control:v5.3.2b`; dieser Stand selbst verweist auf
+kein älteres Image. Danach dieselben Pull-/Up-Befehle ausführen. Das
+funktioniert nur für tatsächlich veröffentlichte, verifizierte GHCR-Images.
+
+Da der Update-Knopf im Web-Dashboard deaktiviert ist, empfehlen wir die Nutzung von **Watchtower**. Watchtower ist ein eigener, winziger Docker-Container, der jede Nacht prüft, ob wir auf GitHub eine neue Version hochgeladen haben. Ist das der Fall, lädt er die neue Version herunter und startet dein E3DC-Control nahtlos neu.
+
+Füge Watchtower einfach zu deiner `docker-compose.yml` hinzu (oder starte ihn als eigenen Befehl):
+
+```yaml
+  watchtower:
+    image: containrrr/watchtower
+    container_name: watchtower
+    restart: always
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - DOCKER_API_VERSION=1.40
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_POLL_INTERVAL=86400 # Prüft alle 24h, erster Lauf sofort
+```
+Damit ist der reguläre Update- und Neustartweg dokumentiert; eine Wartungsfreiheit wird nicht zugesichert.
+
+---
+
+## 4. Befehle & Fehlerbehebung (Troubleshooting)
+
+Da du nicht mehr klassisch über die Linux-Konsole auf E3DC zugreifst, nutzt du nun Docker-Befehle, um das System zu steuern:
+
+**Dashboard im Terminal ansehen (E3DC Screen):**
+*Da es keinen klassischen Linux `screen` mehr gibt, schaust du dir einfach den Live-Output des Containers an:*
+```bash
+sudo docker logs -f e3dc-control
+```
+*(Mit `Strg+C` beendest du die Ansicht, der Container läuft im Hintergrund weiter).*
+
+**Einzelne Dienst-Logs ansehen:**
+```bash
+sudo docker exec e3dc-control tail -f /var/www/html/logs/wallbox_manager.log
+sudo docker exec e3dc-control tail -f /var/www/html/logs/e3dc_live.log
+```
+
+**E3DC-Control komplett neu starten (inkl. Webserver und Diensten):**
+```bash
+cd "$E3DC_DOCKER_PATH"
+sudo docker compose restart
+```
+
+**ML-Prognose fehlt (`ml_prediction.json` nicht vorhanden):**
+`/var/www/html/ramdisk` ist im Docker absichtlich ein `tmpfs`. Nach jedem
+Container-Neustart oder `--force-recreate` ist dieser Ordner leer und wird von
+den Diensten neu befuellt. Die Datei `ml_prediction.json` ist kein persistenter
+Bestandteil der Installation, sondern das temporaere Ergebnis von
+`ml_predictor.py --predict`.
+
+Die Datei `/var/www/html/data/ml_model.pkl` wird ebenfalls nicht im Docker-Image
+mitgeliefert. Sie ist ein lokales Lernmodell und wird erst aus den eigenen
+Verlaufsdaten des jeweiligen Systems erzeugt. Bei einer frischen Installation
+oder nach einem Wechsel von einer alten Host-Installation in ein neues Docker-
+Volume kann das Training zunaechst melden:
+
+```text
+Nicht genug Trainingsdaten: 0 Datensaetze (benoetigt: 50).
+```
+
+Das ist kein Docker- oder Rechtefehler. Es bedeutet nur, dass im neuen
+persistent gemounteten `data`-Bereich noch keine verwertbare Historie fuer das
+ML-Modell vorhanden ist. Der Storage Simulator nutzt in dieser Zeit automatisch
+den konservativen Verbrauchs-Fallback.
+
+Ab den neueren Images sichert der Entrypoint beim normalen Container-Stopp
+wichtige Warmstartdaten aus der Ramdisk nach
+`/var/www/html/data/docker_ramdisk_cache/` und spielt sie beim naechsten Start
+wieder ein. Gesichert werden nur unkritische Prognose-, Preis- und
+Verlaufsdaten, keine Steuerflags und keine Live-Schaltzustaende. Dadurch bleibt
+das Dashboard nach einem Rebuild schneller plausibel, waehrend die Dienste die
+Daten anschliessend frisch nachrechnen.
+
+Wichtig ist das persistente Modell unter `/var/www/html/data/ml_model.pkl`.
+Wenn `ml_predictor.py --predict` meldet `Kein Modell gefunden`, liegt das nicht
+an `uid=33,gid=33` der Ramdisk, sondern daran, dass noch kein Modell trainiert
+wurde oder die persistente `data`-Ablage nicht stimmt.
+
+Pruefung im Container:
+```bash
+sudo docker exec -it e3dc-control bash
+ls -ld /var/www/html/ramdisk
+ls -l /var/www/html/data/ml_model.pkl
+/opt/venv/bin/python3 /app/pi/Install/Installer/ml_predictor.py --train
+/opt/venv/bin/python3 /app/pi/Install/Installer/ml_predictor.py --predict
+ls -l /var/www/html/ramdisk/ml_prediction.json
+```
+
+Kommt beim Training `Nicht genug Trainingsdaten`, ist das bei neuen Systemen
+normal. Der Storage Simulator nutzt dann automatisch den konservativen
+Fallback, bis genug Historie vorhanden ist.
+
+Wenn du pruefen moechtest, ob ueberhaupt neue Historie entsteht:
+
+```bash
+sudo docker exec e3dc-control ls -l /var/www/html/ramdisk/live_history.txt
+sudo docker exec e3dc-control tail -5 /var/www/html/ramdisk/live_history.txt
+sudo docker exec e3dc-control ls -l /var/www/html/data
+```
+
+Wachsen dort Live- oder Verlaufsdaten, einfach weiterlaufen lassen. Bleibt das
+Training nach mehreren Tagen weiter bei `0 Datensaetze`, pruefe zuerst, ob dein
+Docker-Volume bzw. Host-Mount fuer `/var/www/html/data` wirklich dauerhaft
+erhalten bleibt.

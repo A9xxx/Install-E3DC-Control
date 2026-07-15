@@ -1,0 +1,15 @@
+tunnel: <DEINE-TUNNEL-ID>
+credentials-file: /etc/cloudflared/<DEINE-TUNNEL-ID>.json
+
+ingress:
+  # Regel für mobile.php (Pfad-basiert)
+  - hostname: deine-domain.de
+    path: /mobile
+    service: http://localhost/mobile.php
+    
+  # Regel für alles andere (index.php)
+  - hostname: deine-domain.de
+    service: http://localhost/index.php
+
+  # 404 Regel (Pflicht am Ende)
+  - service: http_status:404

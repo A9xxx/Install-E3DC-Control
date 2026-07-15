@@ -1,0 +1,11 @@
+/var/www/html/logs/*.log {
+    su root root
+    daily
+    maxsize 2M
+    rotate 3
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+}

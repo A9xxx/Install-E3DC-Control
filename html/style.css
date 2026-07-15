@@ -1,0 +1,638 @@
+/* ============================================================
+   E3DC-Control: Zentrale Dark-Mode CSS
+   
+   Farbpalette (konsistent auf allen Seiten):
+   - Hintergrund: #242424 (sehr dunkelgrau)
+   - Input/Box: #333333 (dunkelgrau)
+   - Accent Box: #2f2f2f (leicht heller)
+   - Primärfarbe: #0073e6 (blue)
+   - Text: #ffffff (weiß)
+   - Secondary Text: #aaaaaa (grau)
+   - Hover: #005b8e (dunkelblau)
+   - Success: #27ae60 (grün)
+   - Error: #e74c3c (rot)
+   ============================================================ */
+
+/* ==================== GLOBALE STYLES ==================== */
+html {
+    scroll-behavior: smooth;
+}
+
+body {
+    margin: 0;
+    padding: 0;
+    background-color: #242424;
+    color: #ffffff;
+    font-family: 'Segoe UI', Arial, sans-serif;
+    overflow-x: hidden;
+    font-size: 16px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+    box-sizing: border-box;
+}
+
+/* Touch-Optimierungen */
+input, button, select, textarea {
+    touch-action: manipulation;
+}
+
+/* Prevent zoom on input focus (iOS) */
+@supports (padding: max(0px)) {
+    body {
+        padding-left: max(0px, env(safe-area-inset-left));
+        padding-right: max(0px, env(safe-area-inset-right));
+    }
+}
+
+/* ==================== CONTAINER & LAYOUT ==================== */
+.container {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 20px;
+    box-sizing: border-box;
+}
+
+/* Timeline Container */
+.wb-timeline-container {
+    background: #1a1f29;
+    border-radius: 12px;
+    padding: 15px 10px;
+    margin-bottom: 20px;
+    border: 1px solid #2d3748;
+}
+
+.wb-timeline-track {
+    height: 30px;
+    background: #0b0e14;
+    border-radius: 6px;
+    position: relative;
+    overflow: hidden;
+    display: flex;
+}
+
+/* Einzelne Slots */
+.timeline-slot {
+    flex: 1;
+    height: 100%;
+    border-right: 1px solid #2d3748;
+    position: relative;
+}
+
+.timeline-slot:last-child { border-right: none; }
+
+/* Lademarkierung */
+.slot-active-A { background-color: #3b82f6; opacity: 0.8; } /* Automatik */
+.slot-active-D { background-color: #fbbf24; opacity: 0.8; } /* Direkt */
+
+/* Stunden-Beschriftung */
+.timeline-labels {
+    display: flex;
+    justify-content: space-between;
+    margin-top: 5px;
+    color: #94a3b8;
+    font-size: 0.65rem;
+    font-weight: bold;
+}
+
+/* Aktueller Zeitmarker */
+.timeline-now-marker {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 2px;
+    background: #f43f5e;
+    z-index: 10;
+    box-shadow: 0 0 5px rgba(244, 63, 94, 0.8);
+}
+
+/* ==================== TYPOGRAFIE ==================== */
+h1 {
+    color: #0073e6;
+    text-align: center;
+    margin: 20px 0;
+    font-size: 2em;
+}
+
+h2 {
+    color: #0073e6;
+    margin-top: 20px;
+    font-size: 1.5em;
+}
+
+h3 {
+    color: #ffffff;
+    margin-top: 15px;
+    font-size: 1.2em;
+}
+
+p {
+    line-height: 1.6;
+    color: #cccccc;
+}
+
+code {
+    background-color: #333333;
+    padding: 2px 6px;
+    border-radius: 3px;
+    color: #87ceeb;
+    font-family: 'Courier New', monospace;
+}
+
+/* ==================== BUTTONS ==================== */
+.form-button,
+.link-button,
+.update-button,
+.config-button,
+.config-small-button {
+    padding: 12px 24px;
+    background-color: #0073e6;
+    color: #ffffff;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 15px;
+    font-weight: 500;
+    transition: all 0.3s ease;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    text-decoration: none;
+    touch-action: manipulation;
+    min-height: 44px;
+    min-width: 44px;
+}
+
+.form-button:hover,
+.link-button:hover,
+.update-button:hover,
+.config-button:hover,
+.config-small-button:hover {
+    background-color: #005b8e;
+    transform: translateY(-2px);
+    box-shadow: 0 4px 8px rgba(0, 115, 230, 0.3);
+}
+
+.form-button:active,
+.link-button:active,
+.update-button:active,
+.config-button:active {
+    transform: translateY(0);
+}
+
+.delete-button {
+    padding: 10px 18px;
+    background-color: #e74c3c;
+    color: #ffffff;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 14px;
+    transition: all 0.3s ease;
+    touch-action: manipulation;
+    min-height: 44px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.delete-button:hover {
+    background-color: #c0392b;
+    box-shadow: 0 4px 8px rgba(231, 76, 60, 0.3);
+}
+
+.confirm-yes {
+    background-color: #27ae60;
+}
+
+.confirm-yes:hover {
+    background-color: #229954;
+}
+
+.confirm-no {
+    background-color: #95a5a6;
+}
+
+.confirm-no:hover {
+    background-color: #7f8c8d;
+}
+
+/* ==================== INPUT-ELEMENTE ==================== */
+input[type="text"],
+input[type="email"],
+input[type="password"],
+input[type="number"],
+select,
+textarea {
+    width: 100%;
+    padding: 10px;
+    margin-top: 5px;
+    border-radius: 4px;
+    border: 1px solid #555555;
+    background-color: #333333;
+    color: #ffffff;
+    font-family: inherit;
+    font-size: 14px;
+    transition: border-color 0.3s ease;
+}
+
+input[type="text"]:focus,
+input[type="email"]:focus,
+input[type="password"]:focus,
+input[type="number"]:focus,
+select:focus,
+textarea:focus {
+    outline: none;
+    border-color: #0073e6;
+    box-shadow: 0 0 6px rgba(0, 115, 230, 0.3);
+}
+
+input[type="checkbox"] {
+    margin-right: 8px;
+    cursor: pointer;
+    accent-color: #0073e6;
+}
+
+/* ==================== BOXEN & CONTAINER ==================== */
+.config-box,
+.wallbox-box {
+    margin-top: 20px;
+    background-color: #2f2f2f;
+    padding: 20px;
+    border-radius: 8px;
+    border-left: 4px solid #0073e6;
+}
+
+.message-box,
+.success-box {
+    margin-top: 15px;
+    padding: 15px 20px;
+    background-color: #2d3d2a;
+    border-left: 4px solid #27ae60;
+    color: #27ae60;
+    font-weight: bold;
+    display: inline-block;
+    border-radius: 4px;
+}
+
+.error-box {
+    margin-top: 20px;
+    padding: 20px;
+    background-color: #3a2f2f;
+    border-left: 4px solid #e74c3c;
+    border-radius: 4px;
+    word-break: break-word;
+    overflow-x: auto;
+}
+
+.error-box h3 {
+    color: #e74c3c;
+    margin-top: 0;
+    font-size: 1.1em;
+}
+
+.error-box p {
+    color: #cccccc;
+    margin: 10px 0 0 0;
+}
+
+/* ==================== FORM-ELEMENTE ==================== */
+.config-item {
+    margin-bottom: 20px;
+    padding: 15px;
+    background-color: #333333;
+    border-radius: 4px;
+}
+
+.config-item label {
+    display: block;
+    margin-bottom: 8px;
+    font-weight: 500;
+    color: #ffffff;
+    font-size: 0.95em;
+}
+
+/* ==================== NAVIGATIONS-MENU ==================== */
+#menu-toggle {
+    display: none;
+}
+
+.menu-icon {
+    display: none;
+    font-size: 28px;
+    padding: 10px;
+    cursor: pointer;
+    color: #ffffff;
+}
+
+.menu-icon:hover {
+    color: #0073e6;
+}
+
+.mobile-menu {
+    display: none;
+    flex-direction: column;
+    background-color: #2f2f2f;
+    border-top: 1px solid #444444;
+}
+
+.mobile-menu a {
+    padding: 15px 20px;
+    color: #ffffff;
+    text-decoration: none;
+    border-bottom: 1px solid #444444;
+    transition: background-color 0.3s ease;
+}
+
+.mobile-menu a:hover {
+    background-color: #0073e6;
+    color: #ffffff;
+}
+
+#menu-toggle:checked + .menu-icon + .mobile-menu {
+    display: flex;
+}
+
+/* Desktop Navigation Buttons */
+.button {
+    padding: 10px 20px;
+    background-color: #0073e6;
+    color: #ffffff;
+    border-radius: 4px;
+    text-decoration: none;
+    margin-right: 10px;
+    display: inline-block;
+    transition: all 0.3s ease;
+}
+
+.button:hover {
+    background-color: #005b8e;
+    box-shadow: 0 4px 8px rgba(0, 115, 230, 0.3);
+}
+
+/* ==================== FOOTER ==================== */
+footer#fussnoten {
+    text-align: center;
+    font-size: 0.85em;
+    padding: 40px 20px;
+    opacity: 0.8;
+    border-top: 1px solid #444444;
+    margin-top: 40px;
+}
+
+footer#fussnoten a {
+    color: #aaaaaa;
+    text-decoration: none;
+    transition: color 0.3s ease;
+}
+
+footer#fussnoten a:hover {
+    color: #0073e6;
+    text-decoration: underline;
+}
+
+/* ==================== TOOLTIP ==================== */
+.tooltip-icon {
+    display: inline-flex;
+    justify-content: center;
+    align-items: center;
+    width: 18px;
+    height: 18px;
+    background-color: #0073e6;
+    color: #ffffff;
+    border-radius: 50%;
+    font-size: 12px;
+    font-weight: bold;
+    margin-left: 6px;
+    cursor: pointer;
+    transition: all 0.3s ease;
+}
+
+.tooltip-icon:hover {
+    background-color: #005b8e;
+    box-shadow: 0 0 8px rgba(0, 115, 230, 0.5);
+}
+
+.tooltip-box {
+    display: none;
+    position: absolute;
+    background-color: #1a1a1a;
+    color: #ffffff;
+    padding: 10px;
+    border-radius: 4px;
+    font-size: 12px;
+    min-width: 200px;
+    border: 1px solid #555555;
+    z-index: 100;
+    margin-top: 5px;
+}
+
+.tooltip-icon:hover + .tooltip-box {
+    display: block;
+}
+
+/* ==================== RESPONSIVE DESIGN ==================== */
+@media (max-width: 768px) {
+    .container {
+        padding: 15px;
+    }
+
+    h1 {
+        font-size: 1.5em;
+    }
+
+    h2 {
+        font-size: 1.2em;
+    }
+
+    p {
+        font-size: 15px;
+    }
+
+    .button {
+        display: none;
+    }
+
+    .menu-icon {
+        display: block;
+    }
+
+    input[type="text"],
+    select,
+    textarea {
+        font-size: 16px; /* Verhindert Zoom auf iOS */
+        padding: 12px;
+    }
+
+    .form-button {
+        width: 100%;
+        padding: 14px 16px;
+        margin-top: 10px;
+        font-size: 16px;
+        min-height: 48px;
+    }
+
+    .delete-button {
+        padding: 12px 14px;
+        font-size: 15px;
+        min-height: 44px;
+        width: 100%;
+    }
+
+    code {
+        font-size: 12px;
+        overflow-x: auto;
+        padding: 8px 4px !important;
+    }
+
+    .error-box {
+        padding: 15px;
+        margin: 15px 0;
+    }
+
+    .error-box h3 {
+        font-size: 1em;
+        margin-bottom: 10px;
+    }
+}
+
+@media (max-width: 480px) {
+    .container {
+        padding: 10px;
+    }
+
+    .config-item {
+        padding: 12px;
+    }
+
+    h1 {
+        font-size: 1.2em;
+        margin: 15px 0;
+    }
+
+    h2 {
+        font-size: 1.1em;
+    }
+
+    p {
+        font-size: 14px;
+    }
+
+    .form-button {
+        padding: 14px 12px;
+        font-size: 15px;
+    }
+}
+
+/* ==================== UTILITY CLASSES ==================== */
+.text-center {
+    text-align: center;
+}
+
+.text-error {
+    color: #e74c3c;
+}
+
+.text-success {
+    color: #27ae60;
+}
+
+.text-muted {
+    color: #aaaaaa;
+}
+
+.hidden {
+    display: none;
+}
+
+.highlight {
+    background-color: #444444;
+    padding: 2px 6px;
+    border-radius: 3px;
+}
+
+/* ==================== ACCORDION (für Config) ==================== */
+.config-accordion details {
+    margin: 10px 0;
+    border: 1px solid #444444;
+    border-radius: 4px;
+    overflow: hidden;
+}
+
+.config-accordion summary {
+    padding: 15px 20px;
+    background-color: #2f2f2f;
+    cursor: pointer;
+    user-select: none;
+    font-weight: 500;
+    color: #ffffff;
+    transition: background-color 0.3s ease;
+}
+
+.config-accordion summary:hover {
+    background-color: #3a3a3a;
+}
+
+.config-accordion summary::-webkit-details-marker {
+    display: none;
+}
+
+.config-accordion summary::after {
+    content: ' ▶';
+    display: inline-block;
+    transition: transform 0.3s ease;
+    margin-left: 10px;
+}
+
+.config-accordion details[open] summary::after {
+    transform: rotate(90deg);
+}
+
+.config-accordion details[open] summary {
+    background-color: #0073e6;
+    color: #ffffff;
+}
+
+.config-accordion .config-item {
+    border-top: 1px solid #444444;
+    margin: 0;
+    border-radius: 0;
+    padding: 15px;
+}
+
+/* ==================== ANIMATIONS ==================== */
+@keyframes fadeIn {
+    from {
+        opacity: 0;
+        transform: translateY(-10px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+.fade-in {
+    animation: fadeIn 0.3s ease;
+}
+
+/* ==================== PRINT STYLES ==================== */
+@media print {
+    body {
+        background-color: #ffffff;
+        color: #000000;
+    }
+
+    .button,
+    .form-button,
+    .update-button {
+        display: none;
+    }
+
+    .container {
+        max-width: 100%;
+    }
+}

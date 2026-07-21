@@ -17,7 +17,14 @@ from logging.handlers import RotatingFileHandler
 import pwd
 import grp
 import socket
+import stat
+import uuid
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - HA owner leases require POSIX flock
+    fcntl = None
 
 from config_secret_permissions import config_secret_dir_mode_text, config_secret_file_mode, config_secret_file_mode_text
 from quiet_logging import install_quiet_info_filter
@@ -45,21 +52,20 @@ def read_paths_config():
         return {}
 
 
-def _validated_install_path(raw_path, default="/home/pi/E3DC-Control"):
+def _validated_install_path(raw_path):
     """Normalisiere den Installationspfad aus der Web-Config defensiv."""
-    try:
-        candidate = Path(str(raw_path or "").strip()).expanduser()
-        if not candidate.is_absolute():
-            raise ValueError("install_path ist nicht absolut")
-        resolved = candidate.resolve(strict=False)
-        allowed_roots = [Path("/home"), Path("/opt"), Path("/srv"), Path("/var/www")]
-        if not any(resolved == root or root in resolved.parents for root in allowed_roots):
-            raise ValueError(f"install_path außerhalb erlaubter Basis: {resolved}")
-        return str(resolved).rstrip("/")
-    except Exception as exc:
-        if "logger" in globals():
-            logger.warning(f"Ungültiger install_path in {PATHS_FILE}: {raw_path!r} ({exc}); nutze {default}")
-        return default
+    candidate = Path(str(raw_path or "").strip())
+    if not candidate.is_absolute():
+        raise ValueError("install_path ist nicht absolut")
+    resolved = candidate.resolve(strict=True)
+    markers = (
+        resolved / "VERSION",
+        resolved / "installer_main.py",
+        resolved / "Installer" / "installer_config.py",
+    )
+    if not all(marker.is_file() for marker in markers):
+        raise ValueError("install_path besitzt nicht alle Release-Marker")
+    return str(resolved).rstrip("/")
 
 
 def validate_peer_ip(peer_ip):
@@ -78,17 +84,21 @@ def _rsync_remote(user, host_ip, path):
     return f"{user}@{host}:{path}"
 
 
-# Pfade
-INSTALL_PATH = "/home/pi/E3DC-Control"
-try:
-    p_data = read_paths_config()
-    if 'install_path' in p_data:
-        INSTALL_PATH = _validated_install_path(p_data['install_path'])
-except: pass
+# Pfade: Der ausgeführte Release-Baum ist die lokale Vertrauenswurzel.
+INSTALL_PATH = _validated_install_path(Path(__file__).resolve().parent.parent)
+p_data = read_paths_config()
+if p_data.get('install_path'):
+    configured_install_path = _validated_install_path(p_data['install_path'])
+    if configured_install_path != INSTALL_PATH:
+        raise RuntimeError("HA-Pfadmetadaten zeigen auf einen anderen Release-Baum")
 
 CONFIG_PATH = "/var/www/html/data/e3dc_v4.json"
 LOG_DIR = "/var/www/html/logs"
 NOTIFY_SCRIPT = "/usr/local/bin/boot_notify.sh"
+HA_LEASE_DIR = "/var/www/html/data/.ha_runtime"
+HA_LEASE_FILE = os.path.join(HA_LEASE_DIR, "owner_lease.json")
+HA_LEASE_LOCK_FILE = os.path.join(HA_LEASE_DIR, "owner_lease.lock")
+HA_LEASE_TTL_S = 180.0
 
 LEGACY_E3DC_SERVICE = "e3dc.service"
 NATIVE_LIVE_SERVICE = "e3dc-live.service"
@@ -138,9 +148,9 @@ def catalog_managed_services():
         "e3dc-heizstab.service",
         "e3dc-climate-live.service",
         "e3dc-climate-control.service",
-        "e3dc-matter-bridge.service",
         "e3dc-bluelink.service",
         "e3dc-mqtt-hub.service",
+        "e3dc-matter-bridge.service",
         "e3dc-notifier.service",
         "e3dc-websocket.service",
         "e3dc-shadow-sync.service",
@@ -201,6 +211,282 @@ def setup_logging():
     return logger
 
 logger = setup_logging()
+
+
+def _ensure_private_runtime_dir(path):
+    try:
+        os.makedirs(path, mode=0o700, exist_ok=True)
+        info = os.lstat(path)
+    except OSError:
+        return False
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        return False
+    if stat.S_IMODE(info.st_mode) & 0o077:
+        return False
+    return info.st_uid == os.geteuid() or os.geteuid() == 0
+
+
+def _read_private_json(path, max_bytes=65536):
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise OSError("owner lease is not a single regular file")
+        if stat.S_IMODE(info.st_mode) & 0o077:
+            raise OSError("owner lease permissions are not private")
+        if info.st_size > max_bytes:
+            raise OSError("owner lease is too large")
+        raw = b""
+        while len(raw) <= max_bytes:
+            chunk = os.read(fd, min(8192, max_bytes + 1 - len(raw)))
+            if not chunk:
+                break
+            raw += chunk
+        if len(raw) > max_bytes:
+            raise OSError("owner lease is too large")
+        payload = json.loads(raw.decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("owner lease is not an object")
+        return payload
+    finally:
+        os.close(fd)
+
+
+def _write_private_json(path, payload):
+    directory = os.path.dirname(path)
+    if not _ensure_private_runtime_dir(directory):
+        raise OSError("owner lease directory is not private")
+    temp_path = "%s.tmp.%d.%s" % (path, os.getpid(), uuid.uuid4().hex)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(temp_path, flags, 0o600)
+    try:
+        raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        offset = 0
+        while offset < len(raw):
+            offset += os.write(fd, raw[offset:])
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    try:
+        os.replace(temp_path, path)
+        os.chmod(path, 0o600)
+    finally:
+        try:
+            if os.path.lexists(temp_path):
+                os.unlink(temp_path)
+        except OSError:
+            pass
+
+
+class OwnerLease:
+    """Prozesslokale exklusive Schreiber-Lease mit prüfbarem TTL-Datensatz."""
+
+    def __init__(
+        self,
+        owner_id=None,
+        node_id=None,
+        ttl_s=HA_LEASE_TTL_S,
+        lease_path=HA_LEASE_FILE,
+        lock_path=HA_LEASE_LOCK_FILE,
+        clock=time.time,
+    ):
+        self.node_id = str(node_id or socket.gethostname())
+        self.owner_id = str(owner_id or "%s:%d:%s" % (self.node_id, os.getpid(), uuid.uuid4().hex))
+        self.ttl_s = max(30.0, float(ttl_s))
+        self.lease_path = str(lease_path)
+        self.lock_path = str(lock_path)
+        self.clock = clock
+        self._lock_file = None
+        self._mode = ""
+        self._peer_ip = ""
+        self.last_error = ""
+
+    def _open_lock(self):
+        if fcntl is None:
+            self.last_error = "posix_flock_unavailable"
+            return False
+        if not _ensure_private_runtime_dir(os.path.dirname(self.lock_path)):
+            self.last_error = "lease_directory_insecure"
+            return False
+        flags = os.O_RDWR | os.O_CREAT
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            fd = os.open(self.lock_path, flags, 0o600)
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise OSError("owner lock is not a single regular file")
+            if stat.S_IMODE(info.st_mode) & 0o077:
+                raise OSError("owner lock permissions are not private")
+            lock_file = os.fdopen(fd, "r+", encoding="utf-8")
+            fd = -1
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (OSError, BlockingIOError) as exc:
+            try:
+                if "lock_file" in locals():
+                    lock_file.close()
+                elif "fd" in locals() and fd >= 0:
+                    os.close(fd)
+            except OSError:
+                pass
+            self.last_error = "lease_lock_busy_or_invalid:%s" % type(exc).__name__
+            return False
+        self._lock_file = lock_file
+        return True
+
+    def _read_record(self):
+        try:
+            return _read_private_json(self.lease_path)
+        except FileNotFoundError:
+            return {}
+        except Exception as exc:
+            self.last_error = "lease_record_invalid:%s" % type(exc).__name__
+            return None
+
+    def _write_record(self, context_valid=True, released=False, reason=""):
+        now = float(self.clock())
+        payload = {
+            "schema": 1,
+            "owner_id": self.owner_id,
+            "node_id": self.node_id,
+            "mode": self._mode,
+            "peer_ip": self._peer_ip,
+            "renewed_at": now,
+            "expires_at": now if released else now + self.ttl_s,
+            "context_valid": bool(context_valid and not released),
+            "released": bool(released),
+            "reason": str(reason or ""),
+        }
+        _write_private_json(self.lease_path, payload)
+        return payload
+
+    def acquire(self, mode, peer_ip, context_valid=True):
+        normalized_peer = validate_peer_ip(peer_ip)
+        if not context_valid or mode not in ("master", "slave") or not normalized_peer:
+            self.last_error = "lease_context_invalid"
+            return False
+        if self._lock_file is not None:
+            return self.renew(mode, normalized_peer, context_valid=context_valid)
+        if not self._open_lock():
+            return False
+        self._mode = str(mode)
+        self._peer_ip = normalized_peer
+        prior = self._read_record()
+        now = float(self.clock())
+        if prior is None or (
+            prior
+            and not prior.get("released")
+            and float(prior.get("expires_at", 0.0) or 0.0) > now
+            and str(prior.get("owner_id") or "") != self.owner_id
+        ):
+            self.last_error = self.last_error or "unexpired_foreign_owner"
+            self._unlock()
+            return False
+        try:
+            self._write_record(context_valid=True)
+        except Exception as exc:
+            self.last_error = "lease_record_write_failed:%s" % type(exc).__name__
+            self._unlock()
+            return False
+        self.last_error = ""
+        return True
+
+    def renew(self, mode, peer_ip, context_valid=True):
+        normalized_peer = validate_peer_ip(peer_ip)
+        if self._lock_file is None or not context_valid:
+            self.last_error = "lease_not_held_or_context_invalid"
+            return False
+        if str(mode) != self._mode or normalized_peer != self._peer_ip:
+            self.last_error = "lease_context_changed"
+            return False
+        record = self._read_record()
+        now = float(self.clock())
+        if not record or str(record.get("owner_id") or "") != self.owner_id:
+            self.last_error = "lease_owner_mismatch"
+            return False
+        if not record.get("context_valid") or float(record.get("expires_at", 0.0) or 0.0) <= now:
+            self.last_error = "lease_expired_or_invalid"
+            return False
+        try:
+            self._write_record(context_valid=True)
+        except Exception as exc:
+            self.last_error = "lease_renew_failed:%s" % type(exc).__name__
+            return False
+        self.last_error = ""
+        return True
+
+    def acquire_or_renew(self, mode, peer_ip, context_valid=True):
+        if self._lock_file is None:
+            return self.acquire(mode, peer_ip, context_valid=context_valid)
+        return self.renew(mode, peer_ip, context_valid=context_valid)
+
+    def valid(self, mode=None, peer_ip=None):
+        if self._lock_file is None:
+            return False
+        record = self._read_record()
+        if not record or str(record.get("owner_id") or "") != self.owner_id:
+            return False
+        if not record.get("context_valid") or record.get("released"):
+            return False
+        if float(record.get("expires_at", 0.0) or 0.0) <= float(self.clock()):
+            return False
+        if mode is not None and str(mode) != str(record.get("mode") or ""):
+            return False
+        if peer_ip is not None and validate_peer_ip(peer_ip) != str(record.get("peer_ip") or ""):
+            return False
+        return True
+
+    def invalidate(self, reason="context_lost"):
+        if self._lock_file is None:
+            return
+        try:
+            self._write_record(context_valid=False, reason=reason)
+        except Exception:
+            pass
+
+    def release(self, reason="released"):
+        if self._lock_file is None:
+            return True
+        try:
+            self._write_record(context_valid=False, released=True, reason=reason)
+        except Exception as exc:
+            self.last_error = "lease_release_record_failed:%s" % type(exc).__name__
+            return False
+        self._unlock()
+        return True
+
+    def snapshot(self):
+        record = self._read_record()
+        return record if isinstance(record, dict) else {}
+
+    @property
+    def held(self):
+        return self._lock_file is not None
+
+    def _unlock(self):
+        lock_file = self._lock_file
+        self._lock_file = None
+        if lock_file is None:
+            return
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            lock_file.close()
+        except Exception:
+            pass
 
 def set_web_permissions(filepath, data=None):
     """Setzt die Dateirechte auf install_user:www-data."""
@@ -293,7 +579,68 @@ def is_host_online(ip):
     res = subprocess.run(["ping", "-c", "1", "-W", "2", ip], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return res.returncode == 0
 
-def write_status(mode, state, peer_online, last_sync=0):
+
+def query_peer_writer_state(peer_ip, runner=subprocess.run):
+    """Read-only-Peerprüfung: aktiv, stillgelegt oder unbekannt, was immer sperrt."""
+    peer_ip = validate_peer_ip(peer_ip)
+    if not peer_ip or peer_points_to_self(peer_ip):
+        return "unknown"
+    services = get_managed_services("stop")
+    command = [
+        "sudo", "-u", "pi", "ssh",
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=5",
+        f"pi@{peer_ip}",
+        "systemctl", "is-active",
+    ] + services
+    try:
+        result = runner(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=15,
+        )
+    except Exception:
+        return "unknown"
+    if result.returncode not in {0, 3, 4}:
+        return "unknown"
+    states = [line.strip().lower() for line in (result.stdout or "").splitlines() if line.strip()]
+    if len(states) != len(services):
+        return "unknown"
+    if any(state in {"active", "activating", "reloading", "deactivating"} for state in states):
+        return "active"
+    if all(state in {"inactive", "failed", "unknown"} for state in states):
+        return "quiesced"
+    return "unknown"
+
+
+def local_writers_quiesced():
+    return all(not service_is_active(service) for service in get_managed_services("stop") if service_exists(service))
+
+
+def side_effect_context_is_clear(peer_ip, owner_lease=None, peer_state_getter=query_peer_writer_state):
+    """Erlaubt Sync nur mit belegtem lokalem Owner oder vollständig gestopptem Knoten."""
+    peer_state = peer_state_getter(peer_ip)
+    if peer_state != "quiesced":
+        return False, "peer_writer_%s" % peer_state
+    if owner_lease is not None and owner_lease.valid(peer_ip=peer_ip):
+        return True, ""
+    if local_writers_quiesced():
+        return True, ""
+    return False, "local_writer_owner_unknown"
+
+
+def owner_admission_allowed(role, already_owner, peer_writer_state):
+    """Ein neuer Owner benötigt immer einen bestätigt stillgelegten Peer; ein bestehender darf dessen Ausfall überbrücken."""
+    if role not in ("master", "slave"):
+        return False
+    if already_owner:
+        return peer_writer_state != "active"
+    return peer_writer_state == "quiesced"
+
+def write_status(mode, state, peer_online, last_sync=0, owner_lease=None, safety_reason=""):
     """Schreibt den aktuellen HA-Status für die Web-Oberfläche in die Ramdisk."""
     try:
         status_data = {
@@ -301,7 +648,11 @@ def write_status(mode, state, peer_online, last_sync=0):
             "state": state,
             "peer_online": peer_online,
             "last_sync": last_sync,
-            "ts": int(time.time())
+            "ts": int(time.time()),
+            "owner_lease_valid": bool(owner_lease and owner_lease.valid()),
+            "owner_id": owner_lease.owner_id if owner_lease and owner_lease.valid() else "",
+            "owner_lease_expires_at": (owner_lease.snapshot().get("expires_at", 0) if owner_lease else 0),
+            "safety_reason": str(safety_reason or ""),
         }
         tmp_file = "/var/www/html/ramdisk/ha_status.tmp"
         with open(tmp_file, "w") as f:
@@ -327,7 +678,7 @@ def merge_config(src, dest):
                     slave_data = {}
         except Exception as e:
             logger.error(f"Fehler beim Lesen der Slave-Config: {e}")
-    
+
     # 2. Master-Config einlesen
     try:
         with open(src, 'r', encoding='utf-8') as f:
@@ -346,7 +697,7 @@ def merge_config(src, dest):
         if k in HA_LOCAL_CONFIG_KEYS or is_secret_config_key(k):
             merged_data[k] = v
             protected_count += 1
-            
+
     # 4. Sicher schreiben
     tmp_dest = dest + ".tmp"
     try:
@@ -358,7 +709,7 @@ def merge_config(src, dest):
     except Exception as e:
         logger.error(f"Fehler beim Speichern der gemergten Config: {e}")
 
-def rsync_data(target_ip, push=True):
+def rsync_data(target_ip, push=True, owner_lease=None, peer_state_getter=query_peer_writer_state):
     """
     Synchronisiert die Daten zwischen den PIs via rsync.
     push=True:  Dieser Pi sendet an den anderen Pi.
@@ -367,6 +718,18 @@ def rsync_data(target_ip, push=True):
     target_ip = validate_peer_ip(target_ip)
     if not target_ip:
         logger.error("Rsync abgebrochen: ungültige HA-Peer-IP.")
+        return False
+
+    context_clear, context_reason = side_effect_context_is_clear(
+        target_ip,
+        owner_lease=owner_lease,
+        peer_state_getter=peer_state_getter,
+    )
+    if not context_clear:
+        logger.error("Rsync blocked: %s", context_reason)
+        return False
+    if not push and not local_writers_quiesced():
+        logger.error("Rsync pull blocked: local writers are not confirmed stopped.")
         return False
 
     user = "pi"
@@ -389,11 +752,11 @@ def rsync_data(target_ip, push=True):
         "--exclude", "e3dc_v4.json.bak*",
     ]
     optional_args = base_args + ["--ignore-missing-args"]
-    
+
     # Quelle und Ziel für Ramdisk (Historie)
     rd_src = "/var/www/html/ramdisk/" if push else _rsync_remote(user, target_ip, "/var/www/html/ramdisk/")
     rd_dst = _rsync_remote(user, target_ip, "/var/www/html/ramdisk/") if push else "/var/www/html/ramdisk/"
-    
+
     # NEU: Quelle und Ziel für dauerhafte Daten (Datenbank, Wallbox-Logs, Archive)
     data_src = "/var/www/html/data/" if push else _rsync_remote(user, target_ip, "/var/www/html/data/")
     data_dst = _rsync_remote(user, target_ip, "/var/www/html/data/") if push else "/var/www/html/data/"
@@ -416,21 +779,82 @@ def rsync_data(target_ip, push=True):
             subprocess.run(optional_args + dat_src + [dat_dst], timeout=45, check=True)
         if txt_src:
             subprocess.run(optional_args + txt_src + [txt_dst], timeout=45, check=True)
-        
+
         # Rechte der geholten Daten in der Ramdisk und Data anpassen (bei Pull)
         if not push:
             subprocess.run(["sudo", "chown", "-R", "pi:www-data", "/var/www/html/ramdisk", "/var/www/html/data"])
             subprocess.run(["sudo", "find", "/var/www/html/ramdisk", "-type", "f", "-exec", "chmod", "664", "{}", "+"])
-            subprocess.run(["sudo", "find", "/var/www/html/data", "-type", "d", "-exec", "chmod", "775", "{}", "+"])
-            subprocess.run(["sudo", "find", "/var/www/html/data", "-type", "f", "-exec", "chmod", "664", "{}", "+"])
+            protected_data = ["(", "-path", "/var/www/html/data/e3dc_v4.json", "-o", "-path", "/var/www/html/data/config_backups", ")", "-prune", "-o"]
+            subprocess.run(["sudo", "find", "-P", "/var/www/html/data", "-xdev", *protected_data, "-type", "d", "-exec", "chmod", "775", "{}", "+"])
+            subprocess.run(["sudo", "find", "-P", "/var/www/html/data", "-xdev", *protected_data, "-type", "f", "-exec", "chmod", "664", "{}", "+"])
             subprocess.run(["sudo", "chmod", config_secret_file_mode_text(), "/var/www/html/data/e3dc_v4.json"], stderr=subprocess.DEVNULL)
             subprocess.run(["sudo", "chmod", config_secret_dir_mode_text(), "/var/www/html/data/config_backups"], stderr=subprocess.DEVNULL)
-            subprocess.run(["sudo", "find", "/var/www/html/data/config_backups", "-type", "f", "-name", "e3dc_v4*", "-exec", "chmod", config_secret_file_mode_text(), "{}", "+"], stderr=subprocess.DEVNULL)
-            
+            migration_backup_dir = "/var/www/html/data/config_backups/aux_inverter_migration"
+            protected_backup = ["-path", migration_backup_dir, "-prune", "-o"]
+            subprocess.run(["sudo", "find", "-P", "/var/www/html/data/config_backups", *protected_backup, "-type", "d", "-exec", "chmod", config_secret_dir_mode_text(), "{}", "+"], stderr=subprocess.DEVNULL)
+            subprocess.run(["sudo", "find", "-P", "/var/www/html/data/config_backups", *protected_backup, "-type", "f", "-exec", "chmod", config_secret_file_mode_text(), "{}", "+"], stderr=subprocess.DEVNULL)
+            if not _harden_aux_inverter_migration_backups(migration_backup_dir):
+                logger.error("Zusatz-WR-Migrationsbackups konnten nicht sicher gehärtet werden.")
+                return False
+
         return True
     except Exception as e:
         logger.error(f"Rsync Fehler: {e}")
         return False
+
+
+def _aux_inverter_migration_backup_structure_safe(path):
+    if not os.path.lexists(path):
+        return True
+    try:
+        root_stat = os.lstat(path)
+        if stat.S_ISLNK(root_stat.st_mode) or not stat.S_ISDIR(root_stat.st_mode):
+            return False
+        for directory, dirnames, filenames in os.walk(path, topdown=True, followlinks=False):
+            for name in dirnames:
+                metadata = os.lstat(os.path.join(directory, name))
+                if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                    return False
+            for name in filenames:
+                metadata = os.lstat(os.path.join(directory, name))
+                if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+                    return False
+        return True
+    except OSError:
+        return False
+
+
+def _verify_aux_inverter_migration_backup_modes(path):
+    if not _aux_inverter_migration_backup_structure_safe(path):
+        return False
+    if not os.path.lexists(path):
+        return True
+    if stat.S_IMODE(os.lstat(path).st_mode) != 0o700:
+        return False
+    for directory, dirnames, filenames in os.walk(path, topdown=True, followlinks=False):
+        if stat.S_IMODE(os.lstat(directory).st_mode) != 0o700:
+            return False
+        for name in dirnames:
+            if stat.S_IMODE(os.lstat(os.path.join(directory, name)).st_mode) != 0o700:
+                return False
+        for name in filenames:
+            if stat.S_IMODE(os.lstat(os.path.join(directory, name)).st_mode) != 0o600:
+                return False
+    return True
+
+
+def _harden_aux_inverter_migration_backups(path):
+    if not os.path.lexists(path):
+        return True
+    if not _aux_inverter_migration_backup_structure_safe(path):
+        return False
+    try:
+        subprocess.run(["sudo", "chmod", "700", path], check=True, stderr=subprocess.DEVNULL)
+        subprocess.run(["sudo", "find", "-P", path, "-type", "d", "-exec", "chmod", "700", "{}", "+"], check=True, stderr=subprocess.DEVNULL)
+        subprocess.run(["sudo", "find", "-P", path, "-type", "f", "-exec", "chmod", "600", "{}", "+"], check=True, stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return _verify_aux_inverter_migration_backup_modes(path)
 
 def service_exists(service):
     """Prueft, ob eine systemd-Unit lokal existiert."""
@@ -475,7 +899,7 @@ def get_managed_services(action="start"):
         services = [s for s in services if s != LEGACY_E3DC_SERVICE]
     return services
 
-def manage_services(action="start"):
+def _legacy_manage_services_unverified(action="start"):
     """Startet oder stoppt alle Dienste, die im HA-Verbund exklusiv sein muessen."""
     if action not in ("start", "stop"):
         logger.error(f"Ungueltige Service-Aktion: {action}")
@@ -509,32 +933,115 @@ def manage_services(action="start"):
             logger.error(f"HA {action} Fehler bei {srv}: {e}")
 
 
+def _systemctl_service_action(action, service):
+    try:
+        result = subprocess.run(
+            ["sudo", "systemctl", action, service],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=20,
+        )
+    except Exception as exc:
+        logger.error("HA %s error for %s: %s", action, service, exc)
+        return False
+    if result.returncode != 0:
+        logger.warning("HA %s failed: %s (rc=%s)", action, service, result.returncode)
+        return False
+    expected_active = action == "start"
+    actual_active = service_is_active(service)
+    if actual_active != expected_active:
+        logger.warning("HA %s unconfirmed: %s (active=%s)", action, service, actual_active)
+        return False
+    logger.info("HA %s: %s", action, service)
+    return True
 
-def main_loop():
+
+def _rollback_started_services(services):
+    rollback_ok = True
+    for service in reversed(list(services)):
+        if service_exists(service) and service_is_active(service):
+            rollback_ok = _systemctl_service_action("stop", service) and rollback_ok
+    return rollback_ok and local_writers_quiesced()
+
+
+def manage_services(action="start", owner_lease=None, mode=None, peer_ip=None, release_lease=True):
+    """Startet oder stoppt die exklusiven HA-Schreiber als eine geprüfte Transaktion."""
+    if action not in ("start", "stop"):
+        logger.error("Invalid HA service action: %s", action)
+        return False
+    if action == "start" and (
+        owner_lease is None
+        or not owner_lease.valid(mode=mode, peer_ip=peer_ip)
+    ):
+        logger.error("HA start blocked: no fresh owner lease.")
+        return False
+
+    services = get_managed_services(action)
+    for srv in services:
+        if not service_exists(srv):
+            continue
+        if action == "start" and not owner_lease.valid(mode=mode, peer_ip=peer_ip):
+            logger.error("HA start aborted: owner lease lost before %s.", srv)
+            rollback_ok = _rollback_started_services(services)
+            if rollback_ok:
+                owner_lease.release("start_context_lost")
+            else:
+                owner_lease.invalidate("start_rollback_failed")
+            return False
+
+        active = service_is_active(srv)
+        if action == "stop" and not active:
+            continue
+        if action == "start" and active:
+            continue
+        if action == "start" and not service_is_enabled(srv):
+            logger.info("HA start skipped (disabled): %s", srv)
+            continue
+        if not _systemctl_service_action(action, srv):
+            if action == "start":
+                rollback_ok = _rollback_started_services(services)
+                if rollback_ok:
+                    owner_lease.release("partial_start_rolled_back")
+                else:
+                    owner_lease.invalidate("partial_start_rollback_failed")
+            return False
+
+    if action == "stop":
+        stopped = local_writers_quiesced()
+        if not stopped:
+            if owner_lease is not None:
+                owner_lease.invalidate("writer_stop_unconfirmed")
+            return False
+        if owner_lease is not None and release_lease:
+            return owner_lease.release("writers_stopped")
+    return True
+
+
+def _legacy_main_loop_unsafe():
     logger.info("E3DC-Control High Availability Manager gestartet.")
-    
+
     fail_counter = 0
     last_sync = 0
     was_active_as_slave = False
     master_auto_recovered = False
     last_config_mtime = 0
     last_master_cfg_mtime = 0
-    
+
     while True:
         config = load_config()
         mode = config.get("ha_mode", "off").lower()
         raw_peer_ip = config.get("ha_peer_ip", "")
         peer_ip = validate_peer_ip(raw_peer_ip)
-        
+
         try: fail_timeout = int(config.get("ha_fail_timeout", "15"))
         except ValueError: fail_timeout = 15
-        
+
         try: sync_interval = int(config.get("ha_sync_interval", "60")) * 60
         except ValueError: sync_interval = 3600
-        
+
         auto_recover = config.get("ha_auto_recover", "1") in ["1", "true"]
         auto_failover = config.get("ha_auto_failover", "1") in ["1", "true"]
-        
+
         if mode == "off" or not raw_peer_ip:
             write_status("off", "inactive", False)
             time.sleep(60)
@@ -558,7 +1065,7 @@ def main_loop():
             write_status(mode, "config_error_self_peer", False, last_sync)
             time.sleep(60)
             continue
-            
+
         # ==========================================
         # MASTER LOGIK (Der Haupt-Raspberry Pi)
         # ==========================================
@@ -573,10 +1080,10 @@ def main_loop():
                     rsync_data(peer_ip, push=False)
                     logger.info("Auto-Recover abgeschlossen. Fahre System hoch.")
                 master_auto_recovered = True
-            
+
             # 2. Stelle sicher, dass die Dienste laufen
             manage_services("start")
-            
+
             # 3. Config-Sync-Artefakt vor dem Datensync frisch und ohne Secrets schreiben
             if os.path.exists(CONFIG_PATH):
                 current_config_mtime = os.path.getmtime(CONFIG_PATH)
@@ -610,13 +1117,13 @@ def main_loop():
         # ==========================================
         elif mode == "slave":
             master_online = is_host_online(peer_ip)
-            
+
             if master_online:
                 # Master ist DA -> Alles entspannt
                 if fail_counter > 0:
                     logger.info(f"Master ({peer_ip}) ist wieder erreichbar.")
                 fail_counter = 0
-                
+
                 # Waren wir aktiv? -> FAILBACK einleiten!
                 if was_active_as_slave:
                     logger.info("Starte Failback: Synchronisiere gesammelte Daten zurück zum Master...")
@@ -636,20 +1143,20 @@ def main_loop():
                     )
                     send_telegram(f"✅ E3DC FAILBACK: Master ({peer_ip}) ist wieder da! Daten wurden synchronisiert. Backup-Pi geht zurück in Standby.")
                     was_active_as_slave = False
-                
+
                 manage_services("stop") # Im Normalbetrieb bleiben wir gestoppt
-                
+
                 # Verhindere Endlos-Spinner im Web-UI, falls jemand auf dem Slave auf Update drückt
                 force_flag = "/var/www/html/ramdisk/force_bluelink.flag"
                 if os.path.exists(force_flag):
                     try: os.remove(force_flag)
                     except: pass
-                
+
             else:
                 # Master antwortet NICHT
                 fail_counter += 1
                 logger.warning(f"Master offline! Fehler-Zähler: {fail_counter}/{fail_timeout} Minuten")
-                
+
                 if fail_counter == fail_timeout:
                     if auto_failover:
                         logger.critical(f"FAILOVER: Master seit {fail_timeout} Minuten offline. ÜBERNEHME KONTROLLE!")
@@ -659,7 +1166,7 @@ def main_loop():
                     else:
                         logger.warning(f"Master offline, aber Auto-Failover ist DEAKTIVIERT. Slave bleibt im Standby.")
                         send_telegram(f"⚠️ E3DC Master ({peer_ip}) ist offline! (Manuelles Eingreifen erforderlich, Auto-Failover ist aus)")
-                    
+
                 elif fail_counter > fail_timeout:
                     if fail_counter % 60 == 0:
                         if auto_failover:
@@ -682,6 +1189,220 @@ def main_loop():
             write_status("slave", current_state, master_online)
 
         time.sleep(60) # Loop läuft einmal pro Minute
+
+def main_loop():
+    """Betreibt HA mit genau einer geprüften Writer-Lease und fehlersicherer Peerfreigabe."""
+    logger.info("E3DC-Control HA manager started with owner lease.")
+
+    owner_lease = OwnerLease()
+    fail_counter = 0
+    last_sync = 0
+    was_active_as_slave = False
+    master_auto_recovered = False
+    last_config_mtime = 0
+    last_master_cfg_mtime = 0
+
+    while True:
+        config = load_config()
+        mode = config.get("ha_mode", "off").lower()
+        raw_peer_ip = config.get("ha_peer_ip", "")
+        peer_ip = validate_peer_ip(raw_peer_ip)
+        try:
+            fail_timeout = int(config.get("ha_fail_timeout", "15"))
+        except ValueError:
+            fail_timeout = 15
+        try:
+            sync_interval = int(config.get("ha_sync_interval", "60")) * 60
+        except ValueError:
+            sync_interval = 3600
+        auto_recover = config.get("ha_auto_recover", "1") in ["1", "true"]
+        auto_failover = config.get("ha_auto_failover", "1") in ["1", "true"]
+
+        if mode not in ("off", "master", "slave", "shadow"):
+            if owner_lease.held:
+                manage_services("stop", owner_lease=owner_lease)
+            write_status(mode, "config_error_invalid_mode", False, last_sync, safety_reason="invalid_mode")
+            time.sleep(60)
+            continue
+        if mode == "off" or not raw_peer_ip:
+            if owner_lease.held:
+                manage_services("stop", owner_lease=owner_lease)
+            write_status("off", "inactive", False, owner_lease=owner_lease)
+            time.sleep(60)
+            continue
+        if mode == "shadow":
+            if owner_lease.held:
+                manage_services("stop", owner_lease=owner_lease)
+            write_status("shadow", "observe_only", False, last_sync, safety_reason="shadow_has_no_writer_lease")
+            time.sleep(60)
+            continue
+        if not peer_ip:
+            if owner_lease.held:
+                manage_services("stop", owner_lease=owner_lease)
+            write_status(mode, "config_error_invalid_peer", False, last_sync, safety_reason="invalid_peer")
+            time.sleep(60)
+            continue
+        if owner_lease.held and not owner_lease.valid(mode=mode, peer_ip=peer_ip):
+            if not manage_services("stop", owner_lease=owner_lease):
+                write_status(
+                    mode, "owner_context_lost", False, last_sync,
+                    owner_lease=owner_lease, safety_reason="writer_stop_unconfirmed",
+                )
+                time.sleep(60)
+                continue
+        if peer_points_to_self(peer_ip):
+            if owner_lease.held:
+                manage_services("stop", owner_lease=owner_lease)
+            write_status(mode, "config_error_self_peer", False, last_sync, safety_reason="self_peer")
+            time.sleep(60)
+            continue
+
+        if mode == "master":
+            peer_online = is_host_online(peer_ip)
+            peer_writer_state = query_peer_writer_state(peer_ip) if peer_online else "unknown"
+            already_owner = owner_lease.valid(mode="master", peer_ip=peer_ip)
+            if not owner_admission_allowed("master", already_owner, peer_writer_state):
+                if owner_lease.held:
+                    manage_services("stop", owner_lease=owner_lease)
+                write_status(
+                    "master", "peer_confirmation_required", peer_online, last_sync,
+                    owner_lease=owner_lease,
+                    safety_reason="initial_owner_blocked_peer_writer_%s" % peer_writer_state,
+                )
+                time.sleep(60)
+                continue
+            if not owner_lease.acquire_or_renew("master", peer_ip, context_valid=True):
+                if owner_lease.held:
+                    manage_services("stop", owner_lease=owner_lease)
+                write_status(
+                    "master", "owner_lease_blocked", peer_online, last_sync,
+                    owner_lease=owner_lease, safety_reason=owner_lease.last_error,
+                )
+                time.sleep(60)
+                continue
+            if peer_writer_state == "active":
+                stopped = manage_services("stop", owner_lease=owner_lease)
+                write_status(
+                    "master", "peer_writer_conflict", peer_online, last_sync,
+                    owner_lease=owner_lease,
+                    safety_reason="peer_writer_active" if stopped else "local_writer_stop_unconfirmed",
+                )
+                time.sleep(60)
+                continue
+
+            if auto_recover and not master_auto_recovered:
+                if peer_online and peer_writer_state == "quiesced":
+                    local_stop_ok = manage_services("stop", owner_lease=owner_lease, release_lease=False)
+                    if local_stop_ok and rsync_data(peer_ip, push=False, owner_lease=owner_lease):
+                        logger.info("HA auto-recovery completed.")
+                    else:
+                        logger.warning("HA auto-recovery blocked; no unverified restore was applied.")
+                elif peer_online:
+                    logger.warning("HA auto-recovery blocked by peer writer state %s.", peer_writer_state)
+                master_auto_recovered = True
+
+            if not manage_services("start", owner_lease=owner_lease, mode="master", peer_ip=peer_ip):
+                write_status(
+                    "master", "writer_start_failed", peer_online, last_sync,
+                    owner_lease=owner_lease, safety_reason=owner_lease.last_error,
+                )
+                time.sleep(60)
+                continue
+
+            if os.path.exists(CONFIG_PATH):
+                current_config_mtime = os.path.getmtime(CONFIG_PATH)
+                if current_config_mtime != last_config_mtime:
+                    try:
+                        with open(CONFIG_PATH, "r", encoding="utf-8") as config_file:
+                            master_data = json.load(config_file)
+                        sync_payload = ha_sync_config_payload(master_data)
+                        sync_tmp = "/var/www/html/ramdisk/master_e3dc_v4.tmp"
+                        with open(sync_tmp, "w", encoding="utf-8") as sync_file:
+                            json.dump(sync_payload, sync_file, indent=4)
+                        set_web_permissions(sync_tmp)
+                        os.replace(sync_tmp, "/var/www/html/ramdisk/master_e3dc_v4.json")
+                        last_config_mtime = current_config_mtime
+                    except Exception as exc:
+                        logger.error("HA config sync preparation failed: %s", exc)
+            if time.time() - last_sync > sync_interval:
+                if peer_online:
+                    if rsync_data(peer_ip, push=True, owner_lease=owner_lease):
+                        last_sync = time.time()
+                    else:
+                        logger.warning("HA backup sync blocked by ambiguous peer/owner state.")
+                else:
+                    logger.warning("HA peer offline; backup sync skipped.")
+            write_status("master", "active", peer_online, last_sync, owner_lease=owner_lease)
+
+        elif mode == "slave":
+            master_online = is_host_online(peer_ip)
+            peer_writer_state = query_peer_writer_state(peer_ip)
+            safety_reason = ""
+            if master_online:
+                fail_counter = 0
+                if was_active_as_slave:
+                    if manage_services("stop", owner_lease=owner_lease):
+                        was_active_as_slave = False
+                        if peer_writer_state == "quiesced" and rsync_data(peer_ip, push=True):
+                            send_telegram("E3DC failback completed; backup node returned to standby.")
+                        else:
+                            safety_reason = "failback_sync_blocked_peer_%s" % peer_writer_state
+                    else:
+                        safety_reason = "failback_local_stop_unconfirmed"
+                standby_stopped = manage_services("stop")
+                if standby_stopped and owner_lease.held:
+                    owner_lease.release("slave_standby")
+                elif owner_lease.held:
+                    owner_lease.invalidate("slave_standby_stop_unconfirmed")
+                force_flag = "/var/www/html/ramdisk/force_bluelink.flag"
+                if os.path.exists(force_flag):
+                    try:
+                        os.remove(force_flag)
+                    except OSError:
+                        pass
+            else:
+                fail_counter += 1
+                logger.warning("HA master offline: %s/%s minutes", fail_counter, fail_timeout)
+                if fail_counter == fail_timeout:
+                    if auto_failover:
+                        if not owner_admission_allowed("slave", False, peer_writer_state):
+                            safety_reason = "failover_blocked_peer_writer_%s" % peer_writer_state
+                        elif owner_lease.acquire("slave", peer_ip, context_valid=True) and manage_services(
+                            "start", owner_lease=owner_lease, mode="slave", peer_ip=peer_ip
+                        ):
+                            send_telegram("E3DC failover: peer confirmed quiesced; backup node owns control.")
+                            was_active_as_slave = True
+                        else:
+                            safety_reason = "failover_owner_lease_failed"
+                    else:
+                        send_telegram("E3DC master offline; automatic failover is disabled.")
+                elif fail_counter > fail_timeout and fail_counter % 60 == 0 and auto_failover and was_active_as_slave:
+                    logger.info("HA remains in verified failover mode.")
+                if was_active_as_slave and not owner_lease.renew("slave", peer_ip, context_valid=True):
+                    safety_reason = "failover_owner_lease_expired"
+                    manage_services("stop", owner_lease=owner_lease)
+                    was_active_as_slave = False
+
+            master_cfg_path = "/var/www/html/ramdisk/master_e3dc_v4.json"
+            if master_online and peer_writer_state != "unknown" and not was_active_as_slave and os.path.exists(master_cfg_path):
+                current_master_cfg_mtime = os.path.getmtime(master_cfg_path)
+                config_artifact_fresh = (time.time() - current_master_cfg_mtime) <= max(180.0, float(sync_interval) * 2.0)
+                if current_master_cfg_mtime != last_master_cfg_mtime and config_artifact_fresh:
+                    try:
+                        merge_config(master_cfg_path, CONFIG_PATH)
+                        last_master_cfg_mtime = current_master_cfg_mtime
+                    except Exception as exc:
+                        logger.error("HA config merge failed: %s", exc)
+            current_state = "failover" if was_active_as_slave else "standby"
+            if safety_reason:
+                current_state = "blocked"
+            write_status(
+                "slave", current_state, master_online,
+                owner_lease=owner_lease, safety_reason=safety_reason,
+            )
+
+        time.sleep(60)
+
 
 if __name__ == "__main__":
     main_loop()

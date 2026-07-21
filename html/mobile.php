@@ -43,10 +43,14 @@ if (isset($_POST['save_lux_global'])) {
 
     if (file_exists('/.dockerenv')) {
         $python = getPythonInterpreter();
-        $script = file_exists('/app/pi/Install/Installer/luxtronik/energy_manager.py') ? '/app/pi/Install/Installer/luxtronik/energy_manager.py' : '/home/pi/Install/Installer/luxtronik/energy_manager.py';
-        shell_exec("pkill -f 'energy_manager.py'");
-        sleep(1);
-        shell_exec("nohup $python $script > /var/www/html/logs/energy_manager.log 2>&1 &");
+        $script = !empty($paths['valid'])
+            ? rtrim($paths['install_path'], '/') . '/Installer/luxtronik/energy_manager.py'
+            : '';
+        if ($script !== '' && is_file($script)) {
+            shell_exec("pkill -f 'energy_manager.py'");
+            sleep(1);
+            shell_exec("nohup " . escapeshellarg($python) . " " . escapeshellarg($script) . " > /var/www/html/logs/energy_manager.log 2>&1 &");
+        }
     } else {
         shell_exec("sudo systemctl restart energy_manager > /dev/null 2>&1 &");
     }
@@ -66,7 +70,7 @@ if (is_dir($luxPath)) {
         foreach ($files as $f) {
             if (preg_match('/luxtronik_(\d{4}-\d{2}-\d{2})\.json/', basename($f), $m)) {
                 $date = $m[1];
-                // Platzhalter-Dateiname für das History-Dropdown
+                // Dummy-Dateiname für das History-Dropdown
                 $luxtronikFiles[] = ['file' => 'history_' . $date . '.txt', 'label' => date('d.m.Y', strtotime($date))];
             }
         }
@@ -136,22 +140,22 @@ if (in_array($seite, $protectedPages) && !isWebAuthenticated()) {
         .nav-item { color: var(--text-muted); text-decoration: none; font-size: 0.75rem; text-align: center; flex: 0 0 auto; min-width: 48px; transition: transform 0.3s, color 0.3s; }
         .nav-item i { display: block; font-size: 1.25rem; margin-bottom: 4px; }
         .nav-item.active { color: #3b82f6; font-weight: bold; }
-        
+
         .bg-nav-custom { background: var(--bg-nav); border: 1px solid var(--border-card); }
         .mobile-nav-toggle-icon { color: var(--text-body); font-size: 1.25rem; line-height: 1; }
         .mobile-nav-close { filter: none; opacity: 0.85; }
         [data-theme="dark"] .mobile-nav-close { filter: invert(1) grayscale(100%) brightness(200%); }
 
-        /* Landscape / Auto-Rotate Optimization */
-        @media (orientation: landscape) {
-            body { 
-                overflow-x: hidden; 
+        /* Landscape / Auto-Rotate gilt nur für echte Tablet-/Mobilbreiten. */
+        @media (max-width: 1200px) and (orientation: landscape) {
+            body {
+                overflow-x: hidden;
                 display: flex;
                 flex-direction: row;
                 align-items: flex-start;
             }
-            .container { 
-                padding-left: 100px !important; 
+            .container {
+                padding-left: 100px !important;
                 padding-top: 10px !important;
                 max-width: none !important;
                 margin: 0 !important;
@@ -213,26 +217,47 @@ if (in_array($seite, $protectedPages) && !isWebAuthenticated()) {
         .mode-desktop .status-kreis { float: left; margin-right: 15px; position: static; }
 
         /* Energiefluss Styles (Mobile angepasst) */
-        .flow-container { background-color: var(--bg-card); border: 1px solid var(--border-card); border-radius: 20px; position: relative; width: 100%; height: 400px; overflow: hidden; font-family: sans-serif; margin-bottom: 10px; }
+        .flow-container { background-color: var(--bg-card); border: 1px solid var(--border-card); border-radius: 20px; position: relative; display: flex; flex-direction: column; width: 100%; height: 400px; overflow: hidden; font-family: sans-serif; margin-bottom: 10px; }
+        .flow-canvas { position: relative; flex: 1 1 auto; min-width: 0; min-height: 0; width: 100%; overflow: hidden; }
         .flow-container.flow-has-wb2 { height: 520px; }
         .flow-container.flow-has-wb2.flow-has-hs { height: 560px; }
+        .flow-container.flow-has-consumption-aggregate { min-height: 540px; }
         .flow-svg { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 1; pointer-events: none; }
         .flow-line { fill: none; stroke-width: 3; opacity: 0.2; }
         .flow-dots { fill: none; stroke-width: 5; stroke-dasharray: 0 20; animation: flowAnim 1s linear infinite; stroke-linecap: round; }
         @keyframes flowAnim { to { stroke-dashoffset: -60; } }
         .flow-dots.reverse { animation-direction: reverse; }
         .flow-dots.stopped { animation-play-state: paused; opacity: 0; }
-        .flow-editor-toolbar { position: absolute; top: 8px; right: 8px; z-index: 40; display: flex; align-items: center; gap: 5px; }
-        .flow-editor-controls { display: none; align-items: center; gap: 5px; padding: 5px; border-radius: 12px; background: rgba(20, 24, 31, 0.86); border: 1px solid var(--border-card); backdrop-filter: blur(10px); }
+        .flow-editor-toolbar { position: relative; z-index: 40; flex: 0 0 auto; display: flex; align-items: flex-start; justify-content: flex-end; flex-wrap: wrap; gap: 5px; width: 100%; min-height: 45px; padding: 6px 8px; border-bottom: 1px solid var(--border-card); }
+        .flow-save-status { flex: 1 1 auto; align-self: center; min-width: 0; color: var(--text-muted); font-size: 0.72rem; font-weight: 700; }
+        .flow-save-status.is-success { color: #22c55e; }
+        .flow-save-status.is-error { color: #ef4444; }
+        .flow-editor-controls { display: none; flex: 1 1 100%; min-width: 0; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 5px; max-width: 100%; padding: 0; overflow-x: auto; }
         .flow-container.flow-editing .flow-editor-controls { display: flex; }
-        .flow-container.flow-editing .flow-node[data-flow-node]:not([data-flow-node="center"]) { cursor: grab; outline: 2px dashed rgba(255,255,255,0.42); outline-offset: 3px; }
+        .flow-container.flow-editing .flow-node[data-flow-node] { cursor: grab; outline: 2px dashed rgba(255,255,255,0.42); outline-offset: 3px; }
         .flow-container.flow-editing .flow-node.flow-selected { outline-style: solid; outline-color: #fff; }
+        .flow-container.flow-editing .external-wr-lock-btn { pointer-events: none; }
+        .flow-container.flow-saving .flow-canvas { pointer-events: none; }
         .flow-color-select { width: auto; max-width: 100px; }
         .flow-color-input { width: 32px; height: 31px; padding: 2px; }
-        .flow-node { position: absolute; transform: translate(-50%, -50%); border-radius: 50%; display: flex; flex-direction: column; align-items: center; justify-content: center; z-index: 10; background: var(--bg-card); border: 3px solid; width: 80px; height: 80px; text-align: center; transition: background 0.3s, border-color 0.3s; }
-        .flow-node .fa-icon { font-size: 1.4rem; margin-bottom: 2px; }
-        .flow-node .val { font-size: 0.9rem; font-weight: bold; }
-        .flow-node .label { font-size: 0.6rem; color: var(--text-muted); text-transform: uppercase; }
+        .flow-label-input { width: 118px; }
+        .flow-drag-handle { display: none; position: absolute; right: -10px; top: -10px; width: 28px; height: 28px; padding: 0; align-items: center; justify-content: center; border: 1px solid #94a3b8; border-radius: 50%; background: #111827; color: #f8fafc; box-shadow: 0 4px 12px rgba(0,0,0,.35); touch-action: none; user-select: none; z-index: 8; }
+        .flow-container.flow-editing .flow-drag-handle { display: inline-flex; }
+        .flow-node .flow-secondary-label { opacity: .78; font-size: .48rem; }
+        .flow-node.node-aggregate { width: 60px; height: 60px; border-style: double; }
+        .flow-node.node-aggregate .fa-icon { font-size: 1.1rem; }
+        .flow-node.node-aggregate .val { font-size: 0.72rem; }
+        .flow-container.flow-has-generation-aggregate .node-center,
+        .flow-container.flow-has-consumption-aggregate .node-center { width: 54px; height: 54px; }
+        .flow-container.flow-has-generation-aggregate .flow-node:not(.node-center):not(.node-aggregate):not(.node-bat):not(.node-grid),
+        .flow-container.flow-has-consumption-aggregate .flow-node:not(.node-center):not(.node-aggregate):not(.node-bat):not(.node-grid) { width: 54px; height: 54px; }
+        .flow-container.flow-has-generation-aggregate .flow-node .label,
+        .flow-container.flow-has-consumption-aggregate .flow-node .label { max-width: 46px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .flow-node { position: absolute; transform: translate(-50%, -50%); border-radius: 50%; display: flex; flex-direction: column; align-items: center; justify-content: center; z-index: 10; box-sizing: border-box; padding: clamp(2px, 0.8vw, 5px); background: var(--bg-card); border: 3px solid; width: 80px; height: 80px; text-align: center; line-height: 1.02; transition: background 0.3s, border-color 0.3s; }
+        .flow-node.flow-dragging { transition: none !important; }
+        .flow-node > .fa-icon { flex: 0 0 auto; max-width: calc(100% - 8px); font-size: clamp(0.9rem, 4.4vw, 1.4rem); margin-bottom: 2px; }
+        .flow-node > .val { display: block; width: calc(100% - 4px); overflow: hidden; white-space: nowrap; font-size: clamp(0.58rem, 2.8vw, 0.86rem); line-height: 1.05; font-weight: bold; font-variant-numeric: tabular-nums; }
+        .flow-node > .label { display: block; width: calc(100% - 6px); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: clamp(0.42rem, 1.9vw, 0.58rem); line-height: 1.05; color: var(--text-muted); text-transform: uppercase; }
         .flow-node .flow-pv-split { max-width: 70px; margin-top: 1px; font-size: 0.46rem; line-height: 1.02; color: inherit; opacity: 0.82; text-transform: none; overflow: hidden; text-overflow: ellipsis; }
         .flow-zero-export-badge { position: absolute; top: -10px; right: -39px; display: inline-flex; align-items: center; justify-content: center; gap: 3px; min-width: 62px; height: 19px; padding: 0 5px; border: 1px solid transparent; border-radius: 999px; color: #fff; font-size: 0.48rem; font-weight: 800; line-height: 1; letter-spacing: 0; white-space: nowrap; z-index: 3; box-shadow: 0 3px 9px rgba(15,23,42,0.28); cursor: help; }
         .flow-zero-export-badge[hidden] { display: none !important; }
@@ -453,8 +478,18 @@ if (in_array($seite, $protectedPages) && !isWebAuthenticated()) {
             overflow: hidden;
         }
         .energy-ring-card {
+            --ring-pv: #2ecc71;
+            --ring-grid-export: #c4f43d;
+            --ring-bat-in: #fbbf24;
+            --ring-bat-out: #38bdf8;
+            --ring-home: #cbd5e1;
+            --ring-wp: #f97316;
+            --ring-climate: #a78bfa;
+            --ring-wb: #f472b6;
+            --ring-wb2: #2dd4bf;
             position: relative;
-            min-height: 500px;
+            min-height: 0;
+            padding-bottom: 18px;
             overflow: hidden;
             border: 1px solid var(--border-card);
             border-radius: 24px;
@@ -465,11 +500,13 @@ if (in_array($seite, $protectedPages) && !isWebAuthenticated()) {
             box-shadow: inset 0 0 0 1px rgba(255,255,255,0.02), 0 14px 35px rgba(0,0,0,0.22);
         }
         .energy-ring-title {
-            position: absolute;
-            top: 22px;
-            left: 24px;
-            right: 24px;
+            position: relative;
             z-index: 4;
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            gap: 14px;
+            padding: 20px 20px 0;
         }
         .energy-ring-title h3 {
             margin: 0 0 10px 0;
@@ -484,9 +521,9 @@ if (in_array($seite, $protectedPages) && !isWebAuthenticated()) {
         }
         .energy-ring-stage {
             position: relative;
-            width: min(92vw, 430px);
-            height: min(92vw, 430px);
-            margin: 44px auto 0 auto;
+            width: min(86vw, 360px);
+            height: min(86vw, 360px);
+            margin: 6px auto 0 auto;
         }
         .energy-ring-svg {
             position: absolute;
@@ -519,36 +556,35 @@ if (in_array($seite, $protectedPages) && !isWebAuthenticated()) {
             stroke-linecap: round;
             filter: drop-shadow(0 0 6px rgba(56,189,248,0.58));
         }
-        .energy-ring-arc-pv { stroke: #2ecc71; filter: drop-shadow(0 0 10px rgba(46,204,113,0.72)); }
+        .energy-ring-arc-pv { stroke: var(--ring-pv); filter: drop-shadow(0 0 10px rgba(46,204,113,0.72)); }
         .energy-ring-arc-grid-import { stroke: #f43f5e; filter: drop-shadow(0 0 8px rgba(244,63,94,0.58)); }
-        .energy-ring-arc-grid-export { stroke: #a3e635; filter: drop-shadow(0 0 8px rgba(163,230,53,0.58)); }
-        .energy-ring-arc-bat-in { stroke: #fbbf24; filter: drop-shadow(0 0 8px rgba(251,191,36,0.58)); }
-        .energy-ring-arc-bat-out { stroke: #38bdf8; filter: drop-shadow(0 0 8px rgba(56,189,248,0.58)); }
-        .energy-ring-arc-home { stroke: #8b949e; }
-        .energy-ring-arc-wp { stroke: #f97316; filter: drop-shadow(0 0 7px rgba(249,115,22,0.52)); }
-        .energy-ring-arc-climate { stroke: #38bdf8; filter: drop-shadow(0 0 7px rgba(56,189,248,0.52)); }
-        .energy-ring-arc-wb { stroke: #22c55e; filter: drop-shadow(0 0 7px rgba(34,197,94,0.52)); }
-        .energy-ring-arc-wb2 { stroke: #14b8a6; filter: drop-shadow(0 0 7px rgba(20,184,166,0.52)); }
+        .energy-ring-arc-grid-export { stroke: var(--ring-grid-export); filter: drop-shadow(0 0 8px rgba(196,244,61,0.58)); }
+        .energy-ring-arc-bat-in { stroke: var(--ring-bat-in); filter: drop-shadow(0 0 8px rgba(251,191,36,0.58)); }
+        .energy-ring-arc-bat-out { stroke: var(--ring-bat-out); filter: drop-shadow(0 0 8px rgba(56,189,248,0.58)); }
+        .energy-ring-arc-home { stroke: var(--ring-home); }
+        .energy-ring-arc-wp { stroke: var(--ring-wp); filter: drop-shadow(0 0 7px rgba(249,115,22,0.52)); }
+        .energy-ring-arc-climate { stroke: var(--ring-climate); filter: drop-shadow(0 0 7px rgba(167,139,250,0.52)); }
+        .energy-ring-arc-wb { stroke: var(--ring-wb); filter: drop-shadow(0 0 7px rgba(244,114,182,0.52)); }
+        .energy-ring-arc-wb2 { stroke: var(--ring-wb2); filter: drop-shadow(0 0 7px rgba(45,212,191,0.52)); }
         .energy-ring-caption { display: none; }
         .energy-ring-content {
             position: absolute;
-            inset: 126px 56px 76px 56px;
+            inset: 30% 22%;
             z-index: 3;
-            display: grid;
-            grid-template-rows: auto 1fr auto;
+            display: flex;
             align-items: center;
-            justify-content: stretch;
+            justify-content: center;
             text-align: center;
             pointer-events: none;
         }
         .energy-ring-main {
-            align-self: center;
-            font-size: clamp(0.98rem, 3.7vw, 1.22rem);
+            max-width: 100%;
+            font-size: clamp(0.82rem, 3.5vw, 1.08rem);
             font-weight: 560;
             color: var(--text-body);
-            margin: 18px 0 20px 0;
-            line-height: 1.18;
-            white-space: nowrap;
+            margin: 0;
+            line-height: 1.22;
+            white-space: normal;
             text-shadow: 0 2px 4px rgba(0,0,0,0.45);
         }
         .energy-ring-row {
@@ -561,42 +597,88 @@ if (in_array($seite, $protectedPages) && !isWebAuthenticated()) {
             color: var(--text-muted);
         }
         .energy-ring-row i { min-width: 20px; text-align: center; }
-        .ring-pv-text { color: #2ecc71; font-size: 1.25rem; }
+        .ring-pv-text { color: var(--ring-pv); font-size: 1.25rem; }
         .ring-pv-stack { display: inline-flex; flex-direction: column; align-items: flex-start; line-height: 1.06; min-width: 0; }
         .ring-pv-detail { display: none; max-width: 220px; margin-top: 2px; font-size: 0.62rem; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-        .ring-grid-text.export { color: #a3e635; }
+        .ring-grid-text.export { color: var(--ring-grid-export); }
         .ring-grid-text.import { color: #f43f5e; }
-        .ring-bat-text.charge { color: #fbbf24; }
-        .ring-bat-text.discharge { color: #22d3ee; }
-        .energy-ring-home { color: #94a3b8; }
+        .ring-bat-text.charge { color: var(--ring-bat-in); }
+        .ring-bat-text.discharge { color: var(--ring-bat-out); }
+        .energy-ring-home { color: var(--ring-home); }
         .energy-ring-input-list,
         .energy-ring-output-list {
-            width: min(76%, 300px);
-            margin: 0 auto;
             display: grid;
             gap: 3px;
         }
-        .energy-ring-input-list { align-self: start; }
-        .energy-ring-output-list { align-self: end; }
+        .energy-ring-legend {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 10px 16px;
+            padding: 0 18px;
+        }
+        .energy-ring-legend-group {
+            min-width: 0;
+            padding: 8px 10px;
+            border: 1px solid rgba(148, 163, 184, 0.18);
+            border-radius: 12px;
+            background: rgba(15, 23, 42, 0.16);
+        }
+        .energy-ring-legend-group.is-source {
+            border-color: rgba(52, 211, 153, 0.48);
+            background: rgba(5, 150, 105, 0.14);
+        }
+        .energy-ring-legend-group.is-use {
+            border-color: rgba(167, 139, 250, 0.48);
+            background: rgba(124, 58, 237, 0.14);
+        }
+        .energy-ring-legend-title {
+            margin-bottom: 4px;
+            color: var(--text-muted);
+            font-size: 0.62rem;
+            font-weight: 750;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+        }
+        .energy-ring-legend-group.is-source .energy-ring-legend-title { color: #a7f3d0; }
+        .energy-ring-legend-group.is-use .energy-ring-legend-title { color: #ddd6fe; }
+        .energy-ring-legend .energy-ring-row {
+            justify-content: flex-start;
+            min-width: 0;
+            font-size: 0.78rem;
+        }
+        .energy-ring-legend .energy-ring-row span { min-width: 0; }
         .energy-ring-row.muted-zero {
             color: rgba(148, 163, 184, 0.46);
         }
-        .ring-wp-text { color: #f97316; }
-        .ring-climate-text { color: #38bdf8; }
-        .ring-wb-text { color: #22c55e; }
-        .ring-wb2-text { color: #14b8a6; }
+        .ring-wp-text { color: var(--ring-wp); }
+        .ring-climate-text { color: var(--ring-climate); }
+        .ring-wb-text { color: var(--ring-wb); }
+        .ring-wb2-text { color: var(--ring-wb2); }
         .energy-ring-soc {
-            position: absolute;
-            left: 50%;
-            top: 52px;
-            transform: translateX(-50%);
+            position: static;
+            flex: 0 0 auto;
             z-index: 4;
-            color: #38bdf8;
+            color: #e0f2fe;
             font-size: 0.82rem;
-            font-weight: 560;
+            font-weight: 750;
             letter-spacing: 0.02em;
+            white-space: nowrap;
+            padding: 5px 10px;
+            border: 1px solid #38bdf8;
+            border-radius: 999px;
+            background: #0f172a;
+            box-shadow: 0 3px 10px rgba(15, 23, 42, 0.28);
         }
         [data-theme="light"] .energy-ring-card {
+            --ring-pv: #15803d;
+            --ring-grid-export: #6d28d9;
+            --ring-bat-in: #b45309;
+            --ring-bat-out: #0369a1;
+            --ring-home: #334155;
+            --ring-wp: #c2410c;
+            --ring-climate: #4338ca;
+            --ring-wb: #be185d;
+            --ring-wb2: #0f766e;
             background:
                 radial-gradient(circle at 50% 45%, rgba(14, 165, 233, 0.12), transparent 42%),
                 linear-gradient(145deg, rgba(255,255,255,0.75), rgba(226,232,240,0.72)),
@@ -604,6 +686,62 @@ if (in_array($seite, $protectedPages) && !isWebAuthenticated()) {
         }
         [data-theme="light"] .energy-ring-main { color: #0f172a; }
         [data-theme="light"] .energy-ring-track { stroke: rgba(100, 116, 139, 0.32); }
+        [data-theme="light"] .energy-ring-legend .energy-ring-row { color: #0f172a; font-weight: 650; }
+        [data-theme="light"] .energy-ring-legend .ring-pv-text i { color: var(--ring-pv); }
+        [data-theme="light"] .energy-ring-legend .ring-grid-text.export i { color: var(--ring-grid-export); }
+        [data-theme="light"] .energy-ring-legend .ring-grid-text.import i { color: #be123c; }
+        [data-theme="light"] .energy-ring-legend .ring-bat-text.charge i { color: var(--ring-bat-in); }
+        [data-theme="light"] .energy-ring-legend .ring-bat-text.discharge i { color: var(--ring-bat-out); }
+        [data-theme="light"] .energy-ring-legend .energy-ring-home i { color: var(--ring-home); }
+        [data-theme="light"] .energy-ring-legend .ring-wp-text i { color: var(--ring-wp); }
+        [data-theme="light"] .energy-ring-legend .ring-climate-text i { color: var(--ring-climate); }
+        [data-theme="light"] .energy-ring-legend .ring-wb-text i { color: var(--ring-wb); }
+        [data-theme="light"] .energy-ring-legend .ring-wb2-text i { color: var(--ring-wb2); }
+        [data-theme="light"] .energy-ring-legend-group.is-source {
+            border-color: #15803d;
+            background: rgba(220, 252, 231, 0.84);
+        }
+        [data-theme="light"] .energy-ring-legend-group.is-use {
+            border-color: #4338ca;
+            background: rgba(238, 242, 255, 0.90);
+        }
+        [data-theme="light"] .energy-ring-legend-group.is-source .energy-ring-legend-title { color: #14532d; }
+        [data-theme="light"] .energy-ring-legend-group.is-use .energy-ring-legend-title { color: #312e81; }
+        [data-theme="light"] .energy-ring-soc {
+            color: #075985;
+            background: #ffffff;
+            border-color: #075985;
+        }
+
+        /* Tablets und die Desktop-Vorschau nutzen die verfügbare Fläche für lesbare Knoten. */
+        @media (min-width: 700px) {
+            .flow-node { width: 100px; height: 100px; }
+            .flow-node.node-aggregate { width: 100px; height: 100px; }
+            .flow-node.node-aggregate .fa-icon { font-size: 1.35rem; }
+            .flow-node.node-aggregate .val { font-size: 0.9rem; }
+            .flow-container.flow-has-generation-aggregate .node-center,
+            .flow-container.flow-has-consumption-aggregate .node-center { width: 70px; height: 70px; }
+            .flow-container.flow-has-generation-aggregate .flow-node:not(.node-center):not(.node-aggregate):not(.node-bat):not(.node-grid),
+            .flow-container.flow-has-consumption-aggregate .flow-node:not(.node-center):not(.node-aggregate):not(.node-bat):not(.node-grid) { width: 108px; height: 108px; }
+            .flow-container.flow-has-generation-aggregate .flow-node .label,
+            .flow-container.flow-has-consumption-aggregate .flow-node .label { max-width: calc(100% - 6px); font-size: 0.72rem; letter-spacing: 0; }
+            .flow-container.flow-has-consumption-aggregate { min-height: 640px; }
+            .flow-node.node-external-pv { width: 102px; height: 102px; }
+            .flow-node.node-external-pv .label { max-width: calc(100% - 6px); font-size: 0.70rem; }
+            .mobile-storage-state-pill,
+            .mobile-storage-chip { padding: 4px 10px; font-size: 0.8rem; }
+        }
+        @media (min-width: 1201px) {
+            body.mode-mobile { display: block; overflow-x: hidden; }
+            body.mode-mobile > .container {
+                width: min(calc(100% - 32px), 1120px);
+                max-width: 1120px !important;
+                margin-right: auto !important;
+                margin-left: auto !important;
+                padding: 12px !important;
+            }
+            body.mode-mobile .flow-container { height: clamp(500px, 64vh, 620px); }
+        }
         .mobile-app-brand {
             display: inline-flex;
             align-items: center;
@@ -623,14 +761,14 @@ if (in_array($seite, $protectedPages) && !isWebAuthenticated()) {
         }
 
         @media (max-width: 380px) {
-            .energy-ring-card { min-height: 455px; }
-            .energy-ring-stage { width: min(92vw, 370px); height: min(92vw, 370px); margin-top: 50px; }
-            .energy-ring-title { top: 18px; left: 20px; }
+            .energy-ring-stage { width: min(84vw, 330px); height: min(84vw, 330px); margin-top: 4px; }
+            .energy-ring-title { padding: 16px 16px 0; }
             .mobile-storage-main { align-items: flex-start; flex-direction: column; gap: 3px; }
             .mobile-storage-anchors { font-size: 0.66rem; }
-            .energy-ring-content { inset: 112px 42px 62px 42px; }
-            .energy-ring-main { font-size: clamp(0.92rem, 3.5vw, 1.05rem); }
-            .energy-ring-soc { top: 46px; font-size: 0.76rem; }
+            .energy-ring-main { font-size: clamp(0.78rem, 3.4vw, 0.95rem); }
+            .energy-ring-soc { font-size: 0.72rem; }
+            .energy-ring-legend { grid-template-columns: 1fr; gap: 7px; padding: 0 14px; }
+            .energy-ring-legend-group { padding: 6px 9px; }
         }
 
     </style>
@@ -728,8 +866,8 @@ if (in_array($seite, $protectedPages) && !isWebAuthenticated()) {
                 <span class="badge border border-secondary text-info ms-2" id="live-time" style="background: var(--bg-card);">--:--:--</span>
             </div>
         </div>
-    
-    
+
+
     <!-- Notstrom Alert -->
     <div id="m-notstrom-alert" class="alert alert-danger d-flex align-items-center mb-3 shadow pulsating mx-2" style="display:none !important; border-radius: 12px;">
         <i class="fas fa-bolt-lightning fs-3 me-3"></i>
@@ -749,7 +887,7 @@ if (in_array($seite, $protectedPages) && !isWebAuthenticated()) {
     </div>
 
         <!-- Live Energiefluss (Ersetzt die alten Kacheln) -->
-        
+
         <!-- Statistik Bar -->
         <div class="dashboard-card mb-2 d-flex justify-content-around align-items-center py-2" onclick="toggleStatsView('mobile')" style="cursor:pointer; background: var(--bg-nav); border-color: var(--border-card);">
             <div class="text-center" title="Autarkie (Momentan)">
@@ -806,8 +944,11 @@ if (in_array($seite, $protectedPages) && !isWebAuthenticated()) {
             <div id="m-flow-ring-view" class="mobile-flow-view" style="display:none;">
                 <div class="energy-ring-card">
                     <div class="energy-ring-title">
-                        <h3>Aktuell</h3>
-                        <div class="energy-ring-vehicle" id="m-ring-vehicle"></div>
+                        <div>
+                            <h3>Aktuell</h3>
+                            <div class="energy-ring-vehicle" id="m-ring-vehicle"></div>
+                        </div>
+                        <div class="energy-ring-soc" id="m-ring-soc" role="status" aria-live="polite">Speicher: --%</div>
                     </div>
                     <div class="energy-ring-stage">
                         <svg class="energy-ring-svg" viewBox="0 0 360 360" aria-hidden="true">
@@ -829,12 +970,20 @@ if (in_array($seite, $protectedPages) && !isWebAuthenticated()) {
                         <div class="energy-ring-caption input">Eingang</div>
                         <div class="energy-ring-caption output">Ausgang</div>
                         <div class="energy-ring-content">
-                            <div class="energy-ring-input-list">
+                            <div class="energy-ring-main" id="m-ring-consumption-text">Verbrauch: --</div>
+                        </div>
+                    </div>
+                    <div class="energy-ring-legend">
+                        <div class="energy-ring-legend-group is-source" aria-label="Quellen und Netzbezug">
+                            <div class="energy-ring-legend-title">Quellen · Zufluss</div>
+                            <div class="energy-ring-input-list" id="m-ring-input-list">
                                 <div class="energy-ring-row ring-pv-text"><i class="fas fa-solar-panel"></i><span class="ring-pv-stack"><span id="m-ring-pv-text">--</span><span id="m-ring-pv-detail" class="ring-pv-detail"></span></span></div>
                                 <div class="energy-ring-row ring-grid-text" id="m-ring-grid-row"><i id="m-ring-grid-icon" class="fas fa-arrow-right"></i><span id="m-ring-grid-text">--</span></div>
                             </div>
-                            <div class="energy-ring-main" id="m-ring-consumption-text">Aktueller Verbrauch: --</div>
-                            <div class="energy-ring-output-list">
+                        </div>
+                        <div class="energy-ring-legend-group is-use" aria-label="Verwendung, Speicherung und Netzeinspeisung">
+                            <div class="energy-ring-legend-title">Verwendung · Abfluss</div>
+                            <div class="energy-ring-output-list" id="m-ring-output-list">
                                 <div class="energy-ring-row ring-bat-text" id="m-ring-bat-row"><i id="m-ring-bat-icon" class="fas fa-car-battery"></i><span id="m-ring-bat-text">--</span></div>
                                 <div class="energy-ring-row energy-ring-home" id="m-ring-home-row"><i class="fas fa-home"></i><span id="m-ring-home-text">--</span></div>
                                 <div class="energy-ring-row ring-wp-text" id="m-ring-wp-row"><i class="fas fa-fire"></i><span id="m-ring-wp-text">--</span></div>
@@ -844,17 +993,16 @@ if (in_array($seite, $protectedPages) && !isWebAuthenticated()) {
                             </div>
                         </div>
                     </div>
-                    <div class="energy-ring-soc" id="m-ring-soc">Speicher: --%</div>
                 </div>
             </div>
-            
+
             <!-- Mobile Statistics View Panel -->
             <div id="m-stats-view" class="position-absolute top-0 start-0 w-100 h-100 p-3" style="display: none; background: var(--bg-card); border-radius: 20px; z-index: 20; overflow-y: auto; border: 1px solid var(--border-card);">
                 <div class="d-flex justify-content-between align-items-center mb-3">
                     <h6 class="fw-bold m-0"><i class="fas fa-chart-pie text-secondary me-2"></i>Tagesstatistik</h6>
                     <button class="btn btn-sm btn-outline-secondary" onclick="toggleStatsView('mobile')"><i class="fas fa-times"></i></button>
                 </div>
-                
+
                 <select class="form-select form-select-sm mb-3 bg-body-secondary text-body border-secondary" id="m-stats-history-select" onchange="loadStatsForDate(this.value, 'mobile')">
                     <option value="today">Heute (Live)</option>
                     <?php foreach ($historyFiles as $hf): ?>
@@ -970,7 +1118,7 @@ if (in_array($seite, $protectedPages) && !isWebAuthenticated()) {
                     <div class="d-flex justify-content-between small mb-2"><span class="text-muted">Summe der Ersparnis:</span> <span id="m-stat-save-total" class="text-info fw-bold">0.00 €</span></div>
                     <div id="m-stat-eeg-row" class="d-flex justify-content-between small mb-1" style="display:none;"><span class="text-muted">EEG-Einspeisevergütung:</span> <span id="m-stat-eeg-total" class="text-success fw-bold">--</span></div>
                     <div id="m-stat-eeg-note" class="small text-muted mb-2" style="display:none; font-size: 0.7rem;"></div>
-                    
+
                     <div class="row g-2 mb-2">
                         <div class="col-6">
                             <div class="p-2 rounded bg-body-tertiary border border-secondary border-opacity-10">
@@ -1099,7 +1247,7 @@ if (in_array($seite, $protectedPages) && !isWebAuthenticated()) {
                 </button>
             </div>
         </div>
-        
+
         <div id="diagramContainer" class="mb-3">
             <div id="diagramControls" class="d-flex justify-content-between align-items-center p-2 flex-wrap gap-2 mb-2">
                 <select class="form-select form-select-sm border-secondary" style="width: auto; max-width: 140px;" id="mobileHistorySelect" onchange="updateDiagramHistory(this.value)">
@@ -1115,7 +1263,7 @@ if (in_array($seite, $protectedPages) && !isWebAuthenticated()) {
                     <button type="button" class="btn btn-outline-info" onclick="setLiveHours(48, this)">48h</button>
                 </div>
             </div>
-            
+
             <div class="dashboard-card" style="height: calc(100vh - 230px); min-height: 450px; display: flex; flex-direction: column; position: relative;">
                 <div style="flex: 1; border-radius: 20px; overflow: hidden; position: relative;">
                     <!-- Live JS Chart Overlay -->
@@ -1161,7 +1309,7 @@ if (in_array($seite, $protectedPages) && !isWebAuthenticated()) {
                         <div class="fw-bold text-info"><i class="fas fa-cloud-download-alt me-2"></i>Updates</div>
                         <div class="small text-muted">Web-UI und Systemstand</div>
                     </div>
-                    <span class="badge border border-secondary text-secondary"><?= htmlspecialchars(trim(@file_get_contents('/var/www/html/VERSION')) ?: 'V4') ?></span>
+                    <span class="badge border border-secondary text-secondary"><?= htmlspecialchars(readInstalledVersion() ?: 'V4') ?></span>
                 </div>
                 <?php if (!$isDocker): ?>
                     <div class="d-grid gap-2 mt-3">
@@ -1186,7 +1334,7 @@ if (in_array($seite, $protectedPages) && !isWebAuthenticated()) {
                 <i class="fas fa-power-off me-2"></i>E3DC-Control Neustart
             </button>
         </div>
-        
+
         <?php $energyManagerServiceExists = file_exists('/etc/systemd/system/energy_manager.service') || file_exists('/.dockerenv'); ?>
         <?php if ($energyManagerServiceExists): ?>
             <div class="dashboard-card mb-3 p-3 d-flex align-items-center justify-content-between">
@@ -1215,7 +1363,7 @@ if (in_array($seite, $protectedPages) && !isWebAuthenticated()) {
     <!-- Footer -->
     <footer class="text-center text-muted mt-5 pt-3 border-top border-secondary">
         <small>
-            E3DC Control &copy; <?= date('Y') ?> | 
+            E3DC Control &copy; <?= date('Y') ?> |
             <a href="#" class="text-decoration-none text-secondary" data-bs-toggle="modal" data-bs-target="#changelogModal">Changelog</a>
             | <a href="https://www.photovoltaikforum.com/thread/259876-e3dc-control-native-python-ki-prognose-dynamische-stromtarife-wallbox-steuerung/?action=lastPost" target="_blank" class="text-decoration-none text-secondary" title="Zum neuen E3DC-Control V4 Thread im PV-Forum (letzter Beitrag)"><i class="fas fa-comments"></i> PV-Forum</a>
             | <a href="help.php" class="text-decoration-none text-secondary">FAQ</a>
@@ -1296,7 +1444,7 @@ function toggleForecast(el) {
     // Icon umschalten
     if (SHOW_FORECAST) el.classList.replace('fa-eye-slash', 'fa-eye');
     else el.classList.replace('fa-eye', 'fa-eye-slash');
-    
+
     // Speichern
     fetch('mobile.php', {
         method: 'POST',
@@ -1314,7 +1462,7 @@ function toggleDarkMode(el) {
     document.documentElement.setAttribute('data-bs-theme', theme); // Bootstrap CSS vars (z.B. --bs-body-bg)
     localStorage.setItem('theme', theme);
     el.className = DARK_MODE ? 'fas fa-sun text-secondary' : 'fas fa-moon text-secondary';
-    
+
     // Speichern
     fetch('mobile.php', {
         method: 'POST',
@@ -1352,11 +1500,9 @@ function updateDashboard() {
         && (Date.now() - window.liveWsLastMessageTs) < 5000;
     if (wsFresh) return;
     if (document.getElementById('m-flow-wrapper') == null) return;
-    
+
     fetch('get_live_json.php?t=' + Date.now()).then(r => r.json()).then(data => {
-        if (data && typeof processMobileData === 'function') {
-            processMobileData(data);
-        }
+        if (data) processMobileData(data);
     }).catch(err => {
         console.error("Fetch Live JSON Error:", err);
         const statusBadge = document.getElementById('connection-status');
@@ -1368,6 +1514,7 @@ function updateDashboard() {
 }
 
 let mobileLivePollTimer = null;
+let mobileLiveTransportStarted = false;
 function mobileLivePollDelayMs() {
     return document.hidden ? 10000 : 2000;
 }
@@ -1380,19 +1527,17 @@ function scheduleMobileLivePoll(immediate = false) {
     }, mobileLivePollDelayMs());
 }
 document.addEventListener('visibilitychange', function() {
-    scheduleMobileLivePoll(!document.hidden);
+    if (mobileLiveTransportStarted) scheduleMobileLivePoll(!document.hidden);
 });
 
 function initWebSocket() {
     const protocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
     window.liveWs = new WebSocket(protocol + window.location.host + '/ws');
-    window.liveWs.onmessage = function(e) { 
+    window.liveWs.onmessage = function(e) {
         try {
             const data = JSON.parse(e.data);
             window.liveWsLastMessageTs = Date.now();
-            if (data && typeof processMobileData === 'function') {
-                processMobileData(data);
-            }
+            if (data) processMobileData(data);
         } catch (err) {
             console.error("WebSocket Message Error:", err);
         }
@@ -1415,7 +1560,25 @@ function placeMobileStatsPanel() {
 }
 
 placeMobileStatsPanel();
-initWebSocket();
+
+// Solar wird mit defer geladen. Der Live-Transport startet genau einmal, nachdem
+// processMobileData vollständig bereitsteht; frühe Pakete können so nicht verloren gehen.
+function startMobileLiveTransportOnce() {
+    if (mobileLiveTransportStarted) return true;
+    if (typeof window.processMobileData !== 'function') return false;
+    mobileLiveTransportStarted = true;
+    initWebSocket();
+    scheduleMobileLivePoll(true);
+    return true;
+}
+window.addEventListener('e3dc:solar-ready', startMobileLiveTransportOnce, {once: true});
+if (window.e3dcSolarScriptReady === true) {
+    startMobileLiveTransportOnce();
+} else if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', startMobileLiveTransportOnce, {once: true});
+} else {
+    startMobileLiveTransportOnce();
+}
 
 function updateLastUpdateDisplay() {
     if (!lastUpdateTs) return;
@@ -1437,13 +1600,13 @@ function toggleDiagram(view = 'normal') {
         c.style.display = 'block';
         CURRENT_VIEW = view;
         updateDashboard(); // Sofort Details aktualisieren
-        
+
         // Reset History Select to Live when opening new tile
         const histSelect = document.getElementById('mobileHistorySelect');
         const histSelectWP = document.getElementById('mobileHistorySelectWP');
         if(histSelect) histSelect.value = '';
         if(histSelectWP) histSelectWP.value = '';
-        
+
         // Toggle correct dropdown
         if (view === 'wp') {
             if(histSelect) histSelect.style.display = 'none';
@@ -1452,12 +1615,12 @@ function toggleDiagram(view = 'normal') {
             if(histSelect) histSelect.style.display = 'block';
             if(histSelectWP) histSelectWP.style.display = 'none';
         }
-        
+
         updateDiagramHistory(''); // Reset UI and trigger update
-    } 
+    }
     // If diagram is visible and we click the same tile again, hide it
-    else { 
-        c.style.display = 'none'; 
+    else {
+        c.style.display = 'none';
     }
 }
 
@@ -1512,9 +1675,9 @@ function updateDiagramHistory(file) {
         const stat = document.getElementById('forecastStatus');
         if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>'; }
         if (stat) stat.innerText = 'Lade...';
-        
+
         if (typeof loadJsForecastChart === 'function') loadJsForecastChart('');
-        
+
         setTimeout(() => {
             if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-sync-alt"></i> Update'; }
             if (stat) stat.innerText = 'Aktualisiert: ' + new Date().toLocaleTimeString('de-DE');
@@ -1522,8 +1685,6 @@ function updateDiagramHistory(file) {
     }
 
 // startSystemUpdate, pollUpdate, finalize entfernt -> jetzt in solar.js
-
-scheduleMobileLivePoll(true);
 
 // Initialisierung für Desktop-Modus
 window.addEventListener('DOMContentLoaded', () => {
@@ -1535,7 +1696,7 @@ window.addEventListener('DOMContentLoaded', () => {
             if (typeof loadJsForecastChart === 'function') loadJsForecastChart('');
         }
     }
-    
+
     // Hybrid Init
     if ('<?= $seite ?>' === 'hybrid') {
         const jsContainer = document.getElementById('liveChartContainer');

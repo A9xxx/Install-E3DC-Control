@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Backend for the secured WebUI installation center.
+"""
+Backend-Grundgerüst für den künftigen autonomen WebUI-Installer.
 
-Read-only diagnosis and planning actions are always available. Write actions
-remain blocked unless the dedicated wrapper, sudoers allowlist and explicit
-write gate are all enabled.
+Das Modul ist noch nicht aus PHP verknüpft. Standardmäßig führt es nur
+Read-only-Diagnoseaufträge aus. Schreibaktionen bleiben gesperrt, bis WebUI-
+Ablauf, sudoers-Wrapper und Testplan bewusst freigegeben werden.
 """
 
 from __future__ import annotations
@@ -78,7 +79,9 @@ CONFIG_FIELD_LABELS = {
     "shelly_sg_ip oder shelly_pause_ip": "SG-Ready Shelly IP",
     "climate_enable": "Klimaanlage aktiv",
     "climate_meter_ip": "Klimaanlagen-Zähler IP",
-    "climate_control_enable": "Toshiba Cloud Status aktiv",
+    "climate_control_enable": "Klimaanlage Regel-Vorbereitung aktiv",
+    "climate_control_provider": "Klimaanlagen-Regelprovider",
+    "climate_control_mode": "Klimaanlagen-Regelmodus",
 }
 
 
@@ -114,8 +117,10 @@ ALLOWED_JOB_TYPES = set(READ_ACTIONS) | set(SERVICE_ACTIONS) | {
     "enable_service",
     "disable_service",
     "repair_permissions",
+    "run_update",
     "install_module",
     "remove_module",
+    "install_missing_packages",
 }
 
 ACTION_ALIASES = {
@@ -176,8 +181,10 @@ WRITE_ACTION_NAMES = sorted(
         "enable_service",
         "disable_service",
         "repair_permissions",
+        "run_update",
         "install_module",
         "remove_module",
+        "install_missing_packages",
     }
 )
 
@@ -749,10 +756,7 @@ def load_last_status() -> dict[str, Any] | None:
 def is_docker() -> bool:
     if Path("/.dockerenv").exists():
         return True
-    try:
-        return Path("/home/pi/e3dc-docker/docker-compose.yml").exists()
-    except PermissionError:
-        return False
+    return str(os.environ.get("E3DC_CONTAINER_MODE") or "").strip().lower() in {"1", "true", "yes"}
 
 
 def installer_status() -> dict[str, Any]:
@@ -926,14 +930,14 @@ def write_readiness(ignore_active_lock: bool = False) -> dict[str, Any]:
             "ok": not WRITE_ACTIONS_ENABLED,
             "hard": False,
             "status": "gesperrt" if not WRITE_ACTIONS_ENABLED else "freigeschaltet",
-            "issue": None if not WRITE_ACTIONS_ENABLED else "nur für bewusst freigegebene Wartungsaktionen aktiv lassen",
+            "issue": None if not WRITE_ACTIONS_ENABLED else "nur für bewusst freigegebene Tests aktiv lassen",
         },
         {
             "label": "Systemtyp",
             "ok": not is_docker(),
             "hard": False,
             "status": "Docker" if is_docker() else "Bare-Metal",
-            "issue": "Docker verwendet einen getrennten Container-Ablauf" if is_docker() else None,
+            "issue": "Docker benötigt später einen eigenen Container-Ablauf" if is_docker() else None,
         },
         service_wrapper,
         installer_wrapper,
@@ -1000,15 +1004,15 @@ def write_readiness(ignore_active_lock: bool = False) -> dict[str, Any]:
         "hard_blocker_count": len(hard_blockers),
         "hard_blockers": hard_blockers,
         "allowed_write_actions": WRITE_ACTION_NAMES,
-        "safety_steps": [
+        "release_steps": [
             "Wrapper und sudoers auf dem Zielsystem prüfen",
-            "Read-only-Installationsprüfung für das optionale Modul ausführen",
-            "Schreibmodus nur für die bestätigte Wartungsaktion freischalten",
-            "Vor der Installation ein vollständiges Backup prüfen",
+            "Job-Test für mindestens ein optionales Modul erfolgreich ausführen",
+            "Schreibmodus nur bewusst und zeitlich begrenzt freischalten",
+            "Erste echte Installation nur auf einem Testsystem mit Backup ausführen",
             "Nach jedem Schreibjob Alive-Datei, Log und Dienststatus prüfen",
         ],
         "next_step": (
-            "Schreibjobs erst nach bestätigtem Backup und Freigabe über den Wrapper ausführen."
+            "Echte Jobs erst nach bewusster Freigabe über Wrapper und Testplan aktivieren."
             if ready_for_enable
             else "Zuerst die harten Blocker beheben, danach erneut prüfen."
         ),
@@ -1016,7 +1020,7 @@ def write_readiness(ignore_active_lock: bool = False) -> dict[str, Any]:
 
 
 def write_permission_plan() -> dict[str, Any]:
-    """Read-only plan for controlled sudoers and wrapper maintenance."""
+    """Read-only-Plan für die spätere Bereinigung von sudoers und Wrappern."""
     sudoers = sudoers_context()
     desired_sudoers = desired_sudoers_lines()
     checks = write_readiness()
@@ -1036,7 +1040,7 @@ def write_permission_plan() -> dict[str, Any]:
         "success": True,
         "read_only": True,
         "write_actions_enabled": WRITE_ACTIONS_ENABLED,
-        "summary": "Freigabe-Plan: keine Änderung am System. Der Plan beschreibt die sichere sudoers-Bereinigung.",
+        "summary": "Freigabe-Plan: keine Änderung am System. Der Plan beschreibt nur die spätere sichere sudoers-Bereinigung.",
         "sudoers_file": str(SUDOERS_FILE),
         "sudoers_source": sudoers["source"],
         "would_change": would_change,
@@ -1058,7 +1062,7 @@ def write_permission_plan() -> dict[str, Any]:
             "Direkte systemctl-Freigaben entfernen; die WebUI darf systemd nur über Wrapper erreichen.",
             "Nur die zwei erlaubten Wrapper-Zeilen für service_wrapper.sh und installer_wrapper.sh setzen.",
             "sudoers-Syntax mit visudo -cf prüfen.",
-            "Freigabe-Check erneut ausführen und den Schreibmodus nur für die bestätigte Wartung aktivieren.",
+            "Freigabe-Check erneut ausführen und erst danach Schreibmodus zeitlich begrenzt testen.",
         ],
         "rollback_plan": [
             "Backup der sudoers-Datei wiederherstellen.",
@@ -1074,14 +1078,14 @@ def write_permission_plan() -> dict[str, Any]:
             "Keine freien Shell-Kommandos aus PHP.",
             "Keine direkten systemctl-Freigaben für www-data.",
             "Der alte C++ Dienst e3dc.service bleibt kein erlaubtes WebUI-Startziel.",
-            "Reparatur erst nach erfolgreicher Read-only-Prüfung und vollständigem Backup.",
+            "Echte Reparatur erst nach erfolgreichem Job-Test auf einem Testsystem.",
         ],
         "readiness": checks,
     }
 
 
 def backup_plan(module_key: str | None = None) -> dict[str, Any]:
-    """Read-only backup and rollback plan before write jobs."""
+    """Read-only-Backup- und Rückfallplan vor späteren Schreibaufträgen."""
     modules = [get_module(module_key)] if module_key else list(iter_modules())
     modules = [module for module in modules if module is not None]
     if module_key and not modules:
@@ -1150,7 +1154,7 @@ def backup_plan(module_key: str | None = None) -> dict[str, Any]:
         "success": True,
         "read_only": True,
         "write_actions_enabled": WRITE_ACTIONS_ENABLED,
-        "summary": "Backup-Plan: keine Änderung am System. Der Plan zeigt den Sicherungsumfang vor Schreibjobs.",
+        "summary": "Backup-Plan: keine Änderung am System. Der Plan zeigt, was vor späteren Schreibjobs gesichert würde.",
         "scope": "module" if module_key else "system",
         "module": module_key,
         "modules": module_names,
@@ -1176,7 +1180,7 @@ def backup_plan(module_key: str | None = None) -> dict[str, Any]:
             "Echte Backups dürfen nur über den Installer-Wrapper entstehen.",
             "Backup-Snapshots liegen außerhalb des Webroots.",
             "Freie Pfade aus der WebUI bleiben verboten.",
-            "Historische Daten und Config werden durch diese Read-only-Prüfung nicht verändert.",
+            "Historische Daten und Konfiguration werden bei Tests auf Feldsystemen nicht verändert.",
         ],
     }
 
@@ -1356,6 +1360,8 @@ def read_journal_preview(service_unit: str | None, max_lines: int = 12) -> dict[
 
 
 JOURNAL_UNHEALTHY_PATTERNS = (
+    "Unvollständige E3DC-RSCP-Konfiguration",
+    "E3DC-RSCP-Ziel oder Zugangsdaten fehlen",
     "Kein e3dc_user",
     "server_ip oder e3dc_user fehlen",
     "Keine E3DC Credentials",
@@ -1707,8 +1713,8 @@ def module_install_dry_run(module_key: str | None = None) -> dict[str, Any]:
                 "log_file": log_path,
                 "alive_file": alive_path,
                 "config_keys": module.config_keys,
-                "runner": module_runner_label(module),
-                "working_directory": str(safe_working_directory(module)),
+                "runner": runner,
+                "working_directory": str(workdir),
                 "service_user": service_user,
             },
         }
@@ -1736,6 +1742,7 @@ def module_install_dry_run(module_key: str | None = None) -> dict[str, Any]:
             "required_files": [
                 item for item in [
                     str(script_path) if script_path else None,
+                    str(package_json) if package_json else None,
                     service_target,
                     log_path,
                     alive_path,
@@ -1910,7 +1917,7 @@ def ensure_module_runtime_files(module: Any) -> dict[str, Any]:
 
 
 def prepare_module_runner(module: Any) -> dict[str, Any]:
-    """Bereitet nicht-Python-Runner vor, bevor systemd sie startet."""
+    """Bereitet Runner für Nicht-Python-Module vor, bevor systemd sie startet."""
     runner = module_runner_label(module)
     if runner != "npm":
         return {"step": "prepare_runner", "ok": True, "runner": runner, "skipped": True}
@@ -2121,7 +2128,7 @@ def install_module(module_key: str | None = None) -> dict[str, Any]:
         return {
             "success": False,
             "module": module.public_dict(),
-            "message": "Docker-Installationen werden über den Container-Ablauf und nicht als WebUI-Schreibaktion ausgeführt.",
+            "message": "Docker-Installation ist vorbereitet, aber noch nicht als WebUI-Schreibaktion freigeschaltet.",
         }
     if not module.service_unit:
         raise RuntimeError("Modul hat keinen erlaubten systemd-Dienst im Katalog.")
@@ -2176,8 +2183,8 @@ def install_module(module_key: str | None = None) -> dict[str, Any]:
     steps = [
         {"step": "write_unit", "ok": True, "target": str(target), "backup": str(backup_path) if backup_path else None},
         ensure_module_runtime_files(module),
-        prepare_module_runner(module),
         prepare_python_module_dependencies(module),
+        prepare_module_runner(module),
         {"step": "daemon_reload", **run_cmd(["systemctl", "daemon-reload"], timeout=20)},
         {"step": "enable", **run_cmd(["systemctl", "enable", module.service_unit], timeout=20)},
         {"step": "restart", **run_cmd(["systemctl", "restart", module.service_unit], timeout=20)},
@@ -2207,7 +2214,7 @@ def remove_module(module_key: str | None = None) -> dict[str, Any]:
             "success": False,
             "module": module.public_dict(),
             "blocked_reasons": ["Core-Module dürfen nicht deinstalliert werden."],
-            "message": "Rückbau abgebrochen: Core-Module dürfen nur diagnostiziert, neu gestartet oder repariert werden.",
+            "message": "Rückbau abgebrochen: Core-Module sind nur für Diagnose, Neustart und spätere Reparatur vorgesehen.",
         }
     if is_docker():
         return {
@@ -2331,7 +2338,7 @@ def permissions_check() -> dict[str, Any]:
         "issue_count": len(issues),
         "issues": issues,
         "repair_available": False,
-        "repair_message": "Rechte-Reparatur bleibt ohne bestätigte Wrapper-Freigabe gesperrt.",
+        "repair_message": "Rechte-Reparatur ist als WebUI-Aktion vorbereitet, aber noch nicht freigeschaltet.",
     }
 
 
@@ -2623,7 +2630,7 @@ def execute_job(job: dict[str, Any]) -> dict[str, Any]:
     if action not in ALLOWED_JOB_TYPES:
         raise RuntimeError(f"Nicht erlaubter Job-Typ: {action}")
 
-    if normalized_action in SERVICE_ACTIONS or normalized_action in {"repair_permissions", "install_module", "remove_module"}:
+    if normalized_action in SERVICE_ACTIONS or normalized_action in {"repair_permissions", "run_update", "install_module", "remove_module", "install_missing_packages"}:
         if not WRITE_ACTIONS_ENABLED:
             return {
                 "success": False,
@@ -2686,7 +2693,7 @@ def execute_job(job: dict[str, Any]) -> dict[str, Any]:
     return {
         "success": False,
         "action": action,
-        "message": "Aktion wird von der Installationszentrale nicht unterstützt.",
+        "message": "Aktion ist bekannt, aber im Scaffold noch nicht implementiert.",
     }
 
 
@@ -2738,9 +2745,9 @@ def run_once(job: dict[str, Any] | None = None, record_status: bool = True) -> d
 
 def main() -> int:
     configure_utf8_stdio()
-    parser = argparse.ArgumentParser(description="E3DC-Control Installationszentrale")
+    parser = argparse.ArgumentParser(description="E3DC-Control Web Installer scaffold")
     parser.add_argument("--job-file", action="store_true", help="Job aus der Ramdisk lesen")
-    parser.add_argument("--action", default="run_diagnosis", help="Direkt auszuführende Aktion")
+    parser.add_argument("--action", default="run_diagnosis", help="Aktion für direkten Testlauf")
     parser.add_argument("--module", default=None, help="Optionaler Modul-Key")
     args = parser.parse_args()
 

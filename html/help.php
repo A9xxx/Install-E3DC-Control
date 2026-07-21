@@ -115,7 +115,7 @@ $paths = getInstallPaths();
     <div class="container">
         <div class="d-flex justify-content-between align-items-center mb-4">
             <a href="index.php" class="nav-link-back"><i class="fas fa-arrow-left me-2"></i>Dashboard</a>
-            <span class="badge bg-success text-light">v5.3.2b Stable</span>
+            <span class="badge bg-success text-light">v5.4.0 Stable</span>
         </div>
         <h1 class="display-4 fw-bold">Hilfe & Support</h1>
         <p class="lead opacity-75">Häufige Fragen und Lösungen rund um E3DC-Control.</p>
@@ -134,10 +134,10 @@ $paths = getInstallPaths();
         <div class="col-12 faq-item" data-tags="docker image stable rollback update">
             <div class="card bg-card border-0 shadow-sm"><div class="card-body">
                 <h5 class="card-title"><span class="tag">Docker</span> Wie prüfe ich Image und Update?</h5>
-                <p>Der freigegebene Stable-Tag wird als <code>image: ghcr.io/a9xxx/install-e3dc-control:v5.3.2b</code> verwendet. Ein lokaler Quellenpfad nutzt <code>build: .</code>.</p>
+                <p>Ein freigegebener Stable-Tag kann als <code>image: ghcr.io/a9xxx/install-e3dc-control:v5.4.0</code> verwendet werden (Dokumentationsform: <code>image: ghcr.io/...</code>). Ein lokaler Quellenpfad nutzt <code>build: .</code>.</p>
                 <pre>docker inspect e3dc-control --format '{{.Config.Image}} {{.State.Status}}'
 docker compose build --no-cache e3dc-control</pre>
-                <p>v5.3.2b ist selbst der parentlose Rollback-Root und gibt keinen älteren öffentlichen Programmstand frei. Ein späterer Stable-Stand darf ausschließlich auf diesen gebundenen Root zurückfallen.</p>
+                <p>Rollback erfolgt ausschließlich auf den in der Update-Policy gebundenen Stable-Stand.</p>
             </div></div>
         </div>
 
@@ -204,23 +204,27 @@ docker compose build --no-cache e3dc-control</pre>
             </div>
         </div>
 
-        <h4 class="mb-4 text-accent"><i class="fas fa-shield-halved me-2"></i>Stable-Release 5.3.2b: bereinigter Root und koordinierte Energieflüsse</h4>
-        <div class="col-12 faq-item" data-tags="5.3.2b stable release historie rscp readback direktvermarktung viertelstunden einspeiselimit null watt wallbox phasenwechsel waermepumpe">
+        <h4 class="mb-4 text-accent"><i class="fas fa-shield-halved me-2"></i>Stable-Release 5.4.0: sichere Energie-Arbitration und transaktionale Migration</h4>
+        <div class="col-12 faq-item" data-tags="5.4.0 stable release owner context backup rollback matter shadow wallbox waermepumpe">
             <div class="card bg-card border-0 shadow-sm">
                 <div class="card-body">
                     <h5 class="card-title">
-                        <span class="tag">5.3.2b</span>
-                        Was ändert das Stable-Release 5.3.2b?
+                        <span class="tag">5.4.0</span>
+                        Was ändert das Stable-Release 5.4.0?
                     </h5>
-                    <p><strong>5.3.2b veröffentlicht den geprüften Produktstand als parentlosen Nullpunkt einer bereinigten Historienepoche.</strong> Der einmalige Wechsel bestehender Installationen läuft über den geprüften Installer-/Bootstrapweg mit externer Sicherung und Hashprüfung.</p>
+                    <p><strong>5.4.0 ordnet Speicher, Direktvermarktung, Wallbox und Wärmeverbraucher einem eindeutigen Regel-Owner zu.</strong> Kontext und Owner werden unmittelbar vor Hardwareausgängen geprüft; Update-, Backup- und Webaktionen hinterlassen bei einem Fehler keinen halben Zustand.</p>
                     <ul>
-                        <li><strong>RSCP:</strong> Lade- und Entladegrenzen gelten erst nach gültiger Antwort und passender Rücklesung als übernommen; Abweichungen erhalten einen kontrollierten Wiederholungsweg.</li>
-                        <li><strong>Direktvermarktung:</strong> Geeignete ENTSO-E- und SMARD-Viertelstunden werden lückenfüllend zusammengeführt. Tarifpreise bleiben getrennt und fehlende Marktdaten erzeugen keine Steuerbefehle.</li>
-                        <li><strong>Wirtschaftlichkeit:</strong> Wirkungsgrad, Batteriekosten, Reserve, Mindestmarge, Mindestenergie und Mindestdauer begrenzen Verkaufs- und Speicherplatzfenster.</li>
-                        <li><strong>0-W-Begrenzung:</strong> Anforderung, externer Regler, Netzpunktwirkung und verbleibende Abweichung werden getrennt dargestellt; eine bloße Vorgabe wird nicht als Erfolg gemeldet.</li>
-                        <li><strong>Wallbox/Wärme:</strong> Phasenwechsel reservieren ihr Leistungsbudget, bis der Zielzustand stabil bestätigt oder das Schutzfenster beendet ist. Neue flexible Wärmefreigaben warten währenddessen.</li>
-                        <li><strong>WebUI:</strong> Prognose, Energiefluss und Diagnose zeigen DV-Laden, Einspeisung, Speicherverlauf, RSCP-Rücklesung und Begrenzungsstatus konsistent.</li>
-                        <li><strong>Rollback:</strong> <code>v5.3.2b</code> ist der parentlose Rollback-Root und verweist auf keinen älteren öffentlichen Stand.</li>
+                        <li><strong>Speicher und Markt:</strong> Ungültige Provider-, Cache- oder Anlagendaten erzeugen einen explizit inaktiven Plan. Reserve und permanente Gerätegrenzen bleiben unangetastet.</li>
+                        <li><strong>Headroom:</strong> Interne DC-PV und zusätzliche AC-Erzeuger werden getrennt bilanziert. DC- und Netzpunktdruck werden mit dem größeren Wert bewertet und nicht doppelt addiert.</li>
+                        <li><strong>Wallbox:</strong> openWB Pro kann eine bestätigte Startfreigabe nach einem veralteten Nullzustand ohne Umstecken erneut übernehmen. Mehrere Ladepunkte werden anhand ihrer L1/L2/L3-Ströme und der Netzpunktreserve verteilt; ein- und dreiphasige Amperewerte werden nicht pauschal addiert. Die ruhige PV-Kurve erlaubt bei laufender Ladung höchstens 75 Wh Batteriestützung.</li>
+                        <li><strong>Wärmepumpe:</strong> Wallboxaktionen oder der Verlust eines Wallboxkontexts stoppen keine bereits laufende Wärmepumpe eigenständig. Hardwarebefehle bleiben an frische, treiberspezifische Rückmeldungen gebunden.</li>
+                        <li><strong>iDM-Diagnose:</strong> Der manuelle Scanner liest Register 1006 genau einmal per FC04. Er schreibt weder dieses Register noch andere Register.</li>
+                        <li><strong>Mobile Energieflüsse:</strong> Desktop- und Mobile-Positionen besitzen getrennte Revisionen; gleichzeitige Änderungen werden erkannt statt überschrieben.</li>
+                        <li><strong>Fehlerpfad:</strong> Der Watchdog beendet Writer geordnet und sendet keine zweite rohe RSCP-, Wallbox- oder Wärmepumpensequenz.</li>
+                        <li><strong>Update und Rollback:</strong> Ein leeres oder unlesbares Backup ist ein harter Fehler. Der Wechsel zum bereinigten Verlauf erfolgt über den Installer-/Bootstrapweg und nicht über <code>git pull</code>.</li>
+                        <li><strong>Matter:</strong> Smart Home bleibt erhalten. Neue Kopplungsdaten werden installationsindividuell und privat gespeichert; bestehende Fabrics werden nicht gelöscht.</li>
+                        <li><strong>Shadow und V2X:</strong> Shadow bleibt eine read-only Vergleichsinstanz ohne Hardwareausgang. V2H-/V2G-Telemetrie bleibt sichtbar, aktive bidirektionale Steuerung ist nicht freigegeben.</li>
+                        <li><strong>Rollback:</strong> Einziger vorgesehener öffentlicher Rückfallstand ist der sanitierte Root <code>v5.3.2b</code>.</li>
                     </ul>
                 </div>
             </div>
@@ -247,6 +251,28 @@ docker compose build --no-cache e3dc-control</pre>
             </div>
         </div>
 
+        <!-- E3/DC wallbox transport, family and backend -->
+        <div class="col-12 faq-item" data-tags="wallbox e3dc efy easy connect multi connect rscp wbchar6 backend capability">
+            <div class="faq-card">
+                <div class="faq-question">
+                    <div>
+                        <span class="tag">Wallbox</span>
+                        Wie unterscheiden sich E3/DC-Wallboxfamilie, RSCP-Transport und Steuer-Backend?
+                    </div>
+                    <i class="fas fa-chevron-down"></i>
+                </div>
+                <div class="faq-answer">
+                    <p><strong>efy, easy connect und multi connect nutzen denselben E3/DC-RSCP-Transport &uuml;ber das Hauskraftwerk.</strong> Ein erreichbarer Ladepunkt oder <code>WB_EXTERN_DATA_ALG</code> beweist deshalb keine bestimmte Produktfamilie. Dashboard und Wallbox-Seite zeigen Familie, Firmware, beobachteten RSCP-Typ, Read-Capability und Backend getrennt.</p>
+                    <p>Drei vorhandene, typg&uuml;ltige Sun-/Auto-/Abort-Readbacks beweisen allein noch keine Schreibsemantik. Sie werden deshalb nur diagnostisch angezeigt. Direkte Sun-/Auto-/Abort-, Maximalstrom- und native Phasenbefehle sind in diesem Stable-Release bedingungslos no-send. Ein beobachteter numerischer RSCP-Typ wird nicht global einer Familie zugeordnet.</p>
+                    <p><strong>E3/DC efy/Easy &ndash; WBchar6-Kompatibilit&auml;tsregelung</strong> bleibt der empfohlene Community-Laufzeitpfad f&uuml;r Modus, Strom und episodischen Start/Stop. efy und Multi Connect erhalten h&ouml;chstens einen Start-Toggle je frisch best&auml;tigter Stop-Episode. F&uuml;r Easy Connect sind h&ouml;chstens drei explizite Startimpulse mit mindestens 60&nbsp;Sekunden Abstand erlaubt; jeder Versuch braucht erneut einen frischen Stop-Readback und endet sofort bei best&auml;tigter Ladung. Nach einem direkten Schreibfehler gibt es im selben Zyklus keinen WBchar6-Retry.</p>
+                    <p>Bei neuen E3/DC-Konfigurationen ist dieser Kompatibilit&auml;tspfad sichtbar vorausgew&auml;hlt. Wer bewusst <em>Nur Status</em> w&auml;hlt, erh&auml;lt keine E3/DC-Regelbefehle; eine ausdr&uuml;cklich gespeicherte <code>0</code> wird bei Updates nicht &uuml;berschrieben. Mode&nbsp;0, Beobachten und Freigabe bleiben ohne eigene frische Ownership schreibstumm.</p>
+                    <div class="alert alert-warning mb-0 border-0">
+                        Native E3/DC-Phasenumschaltung und der direkte Maximalstrom-Setter bleiben gesperrt. F&uuml;r openWB Pro laufen 0&nbsp;A und <code>phasetarget</code> in getrennten Managerzyklen. <code>phasetarget</code> besitzt die CP-Signalisierung; E3DC-Control sendet keinen zweiten CP-Wire-Befehl. Strom wird erst nach mindestens 480&nbsp;Sekunden Schutzzeit sowie frischem CP-inaktiv- und Zielphasen-Readback freigegeben.
+                    </div>
+                </div>
+            </div>
+        </div>
+
         <!-- openWB Autoerkennung -->
         <div class="col-12 faq-item" data-tags="wallbox openwb autoerkennung primary secondary simpleapi ladepunkt">
             <div class="faq-card">
@@ -261,6 +287,7 @@ docker compose build --no-cache e3dc-control</pre>
                     <p>E3DC-Control liest openWB Software 2.x nur aus: Ladepunkte werden über <code>get_chargepoint_all</code> und, wenn erreichbar, über das V1-Config-Topic geprüft. Die openWB selbst wird dabei nicht umgestellt.</p>
                     <p>Erkennt der Treiber einen internen openWB-Ladepunkt oder den Primary-/Serienpfad, nutzt er den Primary-simpleAPI-Pfad. Erkennt oder erzwingt die Konfiguration Secondary/Modbus, bleibt der Sollstrom- und Heartbeat-Pfad aktiv.</p>
                     <p>Meldet eine openWB zwei Ladepunkte und ist WB2 noch leer, kann E3DC-Control den zweiten Ladepunkt zur Laufzeit anzeigen und budgetieren. Nach drei nicht bestätigten Schreibbefehlen wird die Steuerung kurz pausiert und der Fehler sichtbar im Frontend gemeldet.</p>
+                    <p>Bleibt eine angesteckte und freigegebene openWB Pro nach einem abgelaufenen Nullzustand stehen, verwirft der Manager nur veraltete eigene Startanker und projiziert die positive Freigabe nach frischer Bereitschaft erneut. Umstecken, ein Manager-Neustart oder wiederholte CP-Schaltungen sind dafür nicht erforderlich.</p>
                 </div>
             </div>
         </div>
@@ -282,6 +309,7 @@ docker compose build --no-cache e3dc-control</pre>
                         <li><strong>Dreiphasiges Laden:</strong> 16 Ampere * 230 Volt * 3 = ~11.040 Watt (11 kW)</li>
                     </ul>
                     <p>Wenn Ihr Auto nur einphasig lädt, ist bei 16A physikalisch bei 3.6kW Schluss. Haben Sie eine zugelassene <strong>22 kW Wallbox</strong> installiert und wollen bis zu 32A ins Auto schicken (7.2kW einphasig / 22kW dreiphasig), heben Sie im Konfigurations-Editor den globalen Fallback <strong>Max. Ladestrom</strong> oder in <em>Wallbox</em> gezielt <strong>WB1 Max A</strong>/<strong>WB2 Max A</strong> an. So kann z.B. WB1 mit 32A und WB2 weiter mit 16A begrenzt bleiben.</p>
+                    <p>Beim Betrieb mehrerer Ladepunkte addiert E3DC-Control die angezeigten Amperewerte nicht als einzelne Gesamtsumme. Maßgeblich sind die Ströme auf L1, L2 und L3, die reale Phasenzahl, Fahrzeug- und Ladepunktgrenzen sowie die verbleibende Netzpunktreserve.</p>
                 </div>
             </div>
         </div>
@@ -316,7 +344,7 @@ docker compose build --no-cache e3dc-control</pre>
                 </div>
                 <div class="faq-answer">
                     <p><strong>Aus / autonom:</strong> ist NGNA. E3DC-Control beobachtet die Wallbox, sendet aber keine laufenden Ladebefehle. Nur ein bewusster Wechsel auf <code>Aus</code> in der Wallbox-WebUI gibt die Wallbox einmalig auf ihre Grundeinstellung frei.</p>
-                    <p><strong>PV-Kurve ruhig:</strong> lädt entlang der Speicher-Ladekurve mit Hysterese. Kurze Wolken und Lastwechsel werden geglättet, damit die Wallbox nicht taktet.</p>
+                    <p><strong>PV-Kurve ruhig:</strong> lädt entlang der Speicher-Ladekurve mit Hysterese. Kurze Wolken und Lastwechsel werden geglättet, damit die Wallbox nicht taktet. Eine bereits laufende Ladung darf dafür kurzzeitig eine auf 75&nbsp;Wh begrenzte Batteriestützung nutzen; ein Kaltstart oder Phasenwechsel wird nicht aus dem Hausspeicher finanziert. Der Modus <strong>PV + Akku</strong> bleibt davon getrennt.</p>
                     <p><strong>Grundladung stabil:</strong> hält bewusst eine 6A-Grundladung, solange wbminSoC beziehungsweise das Speicherziel erreichbar bleibt. Das ist die Anti-Flatter-Variante für empfindliche Fahrzeuge und Wallboxen.</p>
                     <p><strong>PV + Akku bis Untergrenze:</strong> das Auto darf PV und Hausakku bis zur Hausakku-Reserve nutzen. Bis zu dieser Untergrenze lädt das Auto normal; Netz bleibt aus. Wenn die Wallbox mehr Leistung will, stützt der Akku darunter nur Hausverbrauch und Wärmepumpe.</p>
                     <p><strong>Sofort bis Preislimit:</strong> startet sofort mit PV und Speicher. Netzstrom wird nur genutzt, wenn der aktuelle Preis unter dem eingestellten Wallbox-Preislimit liegt. Damit wird kein Auto versehentlich zu extremen Preisen geladen.</p>
@@ -572,7 +600,7 @@ cat /var/www/html/data/e3dc_v4.json | python3 -c \
   "import sys,json; d=json.load(sys.stdin); print('IP:', d.get('server_ip','FEHLT!'))"</pre>
 
                     <div class="alert alert-warning mt-3 mb-0 border-0">
-                        <strong>💡 Tipp:</strong> Die Ausgabe von <code>journalctl -u e3dc-live.service -n 30 --no-pager</code> verrät in fast allen Fällen sofort was fehlt. Diese Zeile bitte im Support-Forum posten – damit kann man das Problem innerhalb von Minuten lösen.
+                        <strong>💡 Datenschutz:</strong> Erstellen Sie für Supportfälle das redigierte Diagnosepaket in der Installationszentrale. Prüfen Sie es vor jeder Weitergabe. Rohe Journal-, Konfigurations- oder Prozessausgaben können Host-, Pfad-, Nutzer- und Betriebsdaten enthalten und gehören nicht in öffentliche Beiträge.
                     </div>
                 </div>
             </div>
@@ -585,13 +613,13 @@ cat /var/www/html/data/e3dc_v4.json | python3 -c \
                 <div class="faq-question">
                     <div>
                         <span class="tag">System</span>
-                        Dienst-Fehler: "Failed to locate executable /home/pi/.venv_e3dc/bin/python3"
+                        Dienst-Fehler: "Failed to locate executable &lt;HOME&gt;/.venv_e3dc/bin/python3"
                     </div>
                     <i class="fas fa-chevron-down"></i>
                 </div>
                 <div class="faq-answer">
                     <p>Wenn E3DC-Control unter einem anderen Linux-Benutzer als <code>pi</code> installiert wurde oder die Python-Umgebung fehlt, können Dienste mit einem venv-Pfadfehler aussteigen.</p>
-                    <p><strong>Lösung:</strong> Im Installer zuerst <code>8) Systempakete vorbereiten</code> ausführen. Alternativ im Expertenmenü <code>21) Python venv neu aufbauen</code> wählen. Der Installer legt die Umgebung passend zum Installationsbenutzer an und schreibt die Dienstpfade neu.</p>
+                    <p><strong>Lösung:</strong> Im Installer zuerst <em>Systempakete vorbereiten</em> ausführen. Alternativ im Expertenmenü <em>Python-Umgebung neu aufbauen</em> wählen. Der Installer legt die Umgebung passend zum Installationsbenutzer an und schreibt die Dienstpfade neu.</p>
                 </div>
             </div>
         </div>
@@ -624,7 +652,7 @@ cat /var/www/html/data/e3dc_v4.json | python3 -c \
                     <i class="fas fa-chevron-down"></i>
                 </div>
                 <div class="faq-answer">
-                    <p>Wenn das Dashboard minutenlang das gelbe Hinweisschild zeigt, kann der Python-Dienst <code>e3dc-live.service</code> sich nicht per RSCP am Hauskraftwerk anmelden. Häufigste Ursache ist eine falsche IP-Adresse oder ein Tippfehler (Zahlendreher, z.B. <code>.41</code> statt <code>.36</code>).</p>
+                    <p>Wenn das Dashboard minutenlang das gelbe Hinweisschild zeigt, kann der Python-Dienst <code>e3dc-live.service</code> sich nicht per RSCP am Hauskraftwerk anmelden. Häufigste Ursache ist eine falsche IP-Adresse oder ein Tippfehler. Dokumentationsbeispiel: <code>192.0.2.41</code> statt <code>192.0.2.36</code>; tragen Sie ausschließlich die Adresse Ihres eigenen Systems ein.</p>
                     <p><strong>Fehler-Analyse:</strong> Öffnen Sie das Terminal (WinSCP / SSH) und prüfen Sie den Dienst:</p>
                     <pre>journalctl -u e3dc-live -n 20 --no-pager</pre>
                     <p>Sehen Sie dort einen <code>[Errno 113] No route to host</code> oder <code>Connection refused</code>, prüfen Sie im Dashboard unter <em>Konfiguration -> E3DC Auth</em> sofort Ihre eingetragene "E3DC IP-Adresse".</p>
@@ -697,8 +725,8 @@ journalctl -u e3dc-live -n 80 --no-pager</pre>
                     <i class="fas fa-chevron-down"></i>
                 </div>
                 <div class="faq-answer">
-                    Das System erstellt lokale Backups im Installations-/Datenbereich, normalerweise unter <code>~/Install/backups</code> bzw. in den konfigurierten Web-/Datenpfaden.
-                    <p>Um ein Cloud-Backup (z.B. Google Drive oder Dropbox) einzurichten, nutzen Sie das Menue <strong>105 (Rclone)</strong> im Installer. Dort können Sie verschiedene Ziele konfigurieren. Die V4-Konfiguration <code>data/e3dc_v4.json</code> und die SQLite-Datenbank <code>e3dc_stats.db</code> werden dabei automatisch gesichert.</p>
+                    Das System legt Update- und Wiederherstellungsbackups in einem konfigurierten Sicherungsverzeichnis außerhalb des Installationsbaums ab. Jedes vollständige Backup besitzt ein Manifest und SHA-256-Prüfsummen; leere oder unlesbare Sicherungen gelten als Fehler.
+                    <p>Für ein zusätzliches externes Ziel wählen Sie im Installer <em>Cloud-/Rclone-Backup</em>. Konfiguration, Statistikdatenbank, Matter-Kopplungsdaten und persistente Betriebszustände werden nur dann als gesichert gemeldet, wenn die Pflichtdateien lesbar geprüft wurden.</p>
                 </div>
             </div>
         </div>
@@ -715,7 +743,7 @@ journalctl -u e3dc-live -n 80 --no-pager</pre>
                 </div>
                 <div class="faq-answer">
                     Im High-Availability-Modus (HA) werden zwei Systeme parallel betrieben. Einer ist der <strong>Master</strong> (aktiv, steuert das Hauskraftwerk), der andere ist der <strong>Slave</strong> (Standby, horcht auf den Master).
-                    <p>Falls der Master ausfällt (Heartbeat-Loss), übernimmt der Slave innerhalb von 60 Sekunden automatisch die Steuerung (Failover). In diesem Zustand sendet der Slave auch wieder Telegram-Benachrichtigungen.</p>
+                    <p>Bei erkanntem Heartbeat-Verlust kann der Standby-Knoten nach erfolgreicher Kontext- und Rollenprüfung übernehmen. Die tatsächliche Umschaltzeit hängt von Heartbeat, Dienstzustand und Installation ab; vor der Anlagenfreigabe muss der eindeutige Writer bestätigt sein.</p>
                 </div>
             </div>
         </div>
@@ -731,12 +759,12 @@ journalctl -u e3dc-live -n 80 --no-pager</pre>
                     <i class="fas fa-chevron-down"></i>
                 </div>
                 <div class="faq-answer">
-                    Ein Update kann auf drei Arten durchgeführt werden:
+                    Ein Update wird über den sichernden Installer durchgeführt:
                     <ol>
                         <li>Über das Dashboard (Kachel Konfiguration -> "Update suchen").</li>
-                        <li>Über den Installer (Menü 100).</li>
-                        <li>Manuell via Terminal im Programmordner: <code>sudo git pull --ff-only origin main &amp;&amp; sudo python3 installer_main.py --update-e3dc</code>.</li>
+                        <li>Direkt über den Menüpunkt <em>Update</em> im Installer.</li>
                     </ol>
+                    <p>Verwenden Sie für den einmaligen Wechsel auf die bereinigte Historie keinen manuellen <code>git pull --ff-only</code>-Ablauf. Der Installer erstellt und prüft zuerst das externe Backup und validiert anschließend Zielstand, Dienste und Weboberfläche.</p>
                     Updates werden im Changelog oben rechts im Dashboard signalisiert.
                 </div>
             </div>
@@ -753,7 +781,7 @@ journalctl -u e3dc-live -n 80 --no-pager</pre>
                     <i class="fas fa-chevron-down"></i>
                 </div>
                 <div class="faq-answer">
-                    <p><strong>E3DC-Control V4</strong> (dieses System) ist ein Vollpaket, das schrittweise auf native Python-Dienste umgebaut wird (native Wallbox, dynamischer KI-Speichersimulator, Temperatur-Prognosen).</p>
+                    <p><strong>E3DC-Control V4</strong> (dieses System) verwendet native Python-Dienste für Live-Daten, Speicherplanung, Wallbox, Wärmeintegration und Prognosen. Die Installationszentrale zeigt, welche Dienste auf dem eigenen System aktiviert sind.</p>
                     <p>Für Nutzer, die diesen modernen Funktionsumfang nicht benötigen und <strong>ausschließlich</strong> das bewährte ursprüngliche C++-Steuerungsprogramm von Eba-M (Sonnenmodus-Steuerung) laufen lassen wollen, wurde das Projekt <strong>E3DC-Classic</strong> ausgegliedert. Beide Varianten werden weiterhin supportet.</p>
                 </div>
             </div>
@@ -772,7 +800,7 @@ journalctl -u e3dc-live -n 80 --no-pager</pre>
                     <i class="fas fa-chevron-down"></i>
                 </div>
                 <div class="faq-answer">
-                    Der <strong>Smart Home MQTT-Hub</strong> sendet alle Live-Daten (PV, Batterie, Haus, Grid) an Ihren Broker. 
+                    Der <strong>Smart Home MQTT-Hub</strong> sendet alle Live-Daten (PV, Batterie, Haus, Grid) an Ihren Broker.
                     <p>Standard-Präfix ist <code>e3dc/</code>. In Home Assistant können Sie diese via MQTT-Integration abonnieren. Beispiel-Topic für den Hausverbrauch: <code>e3dc/live/home_w</code>. Ein Websocket-Interface steht ebenfalls unter Port 8080 zur Verfügung.</p>
                 </div>
             </div>
@@ -811,7 +839,7 @@ journalctl -u e3dc-live -n 80 --no-pager</pre>
                     <i class="fas fa-chevron-down"></i>
                 </div>
                 <div class="faq-answer">
-                    Das System nutzt die <strong>echten dynamischen Strompreise</strong> (z.B. von Tibber oder Awattar), falls konfiguriert. 
+                    Das System nutzt die <strong>echten dynamischen Strompreise</strong> (z.B. von Tibber oder Awattar), falls konfiguriert.
                     <p>Die <strong>Kosten</strong> ergeben sich aus dem Netzbezug multipliziert mit dem Preis zum jeweiligen Zeitpunkt. Die <strong>Ersparnis</strong> berechnet sich aus dem Eigenverbrauch (PV + Batterie) multipliziert mit dem Netzpreis, den man in diesem Moment gespart hat.</p>
                 </div>
             </div>
@@ -847,7 +875,7 @@ journalctl -u e3dc-live -n 80 --no-pager</pre>
                 <div class="faq-answer">
                     <p>Wenn Anlagen einen PV-Überschuss aufweisen, wurde in der E3DC-History (bis v3.9.5) der Netzbezug fälschlicherweise als "Einspeisung" und die Einspeisung als "Bezug" gespeichert. Ebenso konnte es vorkommen, dass in Datenbanken (z.B. aus Altsystemen) der Netzbezug nicht korrekt zum Hausverbrauch addiert wurde, wodurch der errechnete Hausverbrauch geringer als der Netzbezug war.</p>
                     <p><strong>Lösung ab v3.9.6:</strong> Das Live-System archiviert die Werte nun immer plausibel geprüft. Um die Fehler der Vergangenheit in der SQLite-Datenbank auszubügeln, können Sie im Terminal folgenden Reparatur-Befehl ausführen (dieser korrigiert historische Fehler):</p>
-                    <pre>python3 /home/pi/Install/Installer/repair_home_grid_doublecounting.py --force</pre>
+                    <pre>python3 &lt;INSTALL_PATH&gt;/Installer/repair_home_grid_doublecounting.py --force</pre>
                 </div>
             </div>
         </div>
@@ -916,6 +944,7 @@ journalctl -u e3dc-live -n 80 --no-pager</pre>
                 <div class="faq-answer">
                     <p>Ab v4.8.9 kann der Energy Manager der iDM über Register 74 einen begrenzten PV-Überschuss in kW melden, z.B. maximal 2.0 kW. Rampe, Deadband, Heartbeat und Mindest-Schreibabstand sind im Config-Editor einstellbar.</p>
                     <p>Es werden dabei keine Temperatur-Sollwerte zyklisch geschrieben. Der PV-Boost besitzt zusätzlich Mindestlaufzeit und Wiedereinschaltsperre, damit die Wärmepumpe bei Wolkenwechseln nicht ständig taktet.</p>
+                    <p>Der manuelle iDM-Scanner dient ausschließlich der Diagnose: Er liest Input-Register 1006 einmal per FC04. Ohne passend gebundenes Modell, Protokoll, Firmware und Unit-ID bleibt der Rohwert unbewertet; der Scanner schreibt keine Register.</p>
                 </div>
             </div>
         </div>
@@ -1302,7 +1331,7 @@ journalctl -u e3dc-live -n 80 --no-pager</pre>
         </div>
 
     </div>
-    
+
     <div id="noResults" class="text-center py-5" style="display: none;">
         <i class="fas fa-search fs-1 text-muted mb-3"></i>
         <h4>Keine Hilfethemen gefunden.</h4>
@@ -1335,7 +1364,7 @@ journalctl -u e3dc-live -n 80 --no-pager</pre>
         items.forEach(item => {
             const content = item.innerText.toLowerCase();
             const tags = item.getAttribute('data-tags').toLowerCase();
-            
+
             if (content.includes(term) || tags.includes(term)) {
                 item.style.display = 'block';
                 hasResults = true;

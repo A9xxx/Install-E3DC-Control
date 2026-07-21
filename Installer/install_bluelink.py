@@ -53,7 +53,7 @@ def configure_bluelink():
     config_file = os.path.join(get_install_path(), "e3dc.config.txt")
     curr_token = ""
     curr_vin = ""
-    
+
     try:
         if os.path.exists(config_file):
             with open(config_file, 'r', encoding='utf-8') as f:
@@ -68,7 +68,7 @@ def configure_bluelink():
     print("Dieses Modul fragt den Ladestand deines Hyundai/Kia direkt ab.")
     print("Du benötigst einen gültigen 'Refresh Token'.\n")
 
-    prompt_t = "Bitte gib deinen Bluelink Refresh-Token ein [vorhanden]: " if curr_token else "Bitte gib deinen Bluelink Refresh-Token ein: "
+    prompt_t = f"Bitte gib deinen Bluelink Refresh-Token ein [{curr_token[:10]}...]: " if curr_token else "Bitte gib deinen Bluelink Refresh-Token ein: "
     token = input(prompt_t).strip() or curr_token
     if not token:
         print("Abbruch: Kein Token angegeben.")
@@ -107,11 +107,11 @@ def setup_bluelink_service():
     install_user = get_install_user()
     installer_dir = os.path.dirname(os.path.abspath(__file__))
     script_path = os.path.join(installer_dir, "bluelink_client.py")
-    
+
     venv_name = load_config().get("venv_name", ".venv_e3dc")
     python_bin = "/usr/bin/python3"
     from .installer_config import get_home_dir, get_install_path
-    
+
     venv_path = ""
     if venv_name:
         if os.path.exists(os.path.join(get_home_dir(install_user), venv_name)):

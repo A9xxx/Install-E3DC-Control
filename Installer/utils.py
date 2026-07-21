@@ -6,6 +6,7 @@ from logging.handlers import RotatingFileHandler
 import shutil
 import shlex
 import sys
+from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Zentrale Pfad-Aufloesung (V4) — NIEMALS Pfade hartcodieren!
@@ -14,76 +15,113 @@ import sys
 # ---------------------------------------------------------------------------
 _paths_cache = None
 
+_INSTALLER_DIR = Path(__file__).resolve().parent
+_MODULE_INSTALL_ROOT = _INSTALLER_DIR.parent
+_PATH_METADATA_FILES = (
+    Path("/var/www/html/data/e3dc_v4.json"),
+    Path("/var/www/html/e3dc_paths.json"),
+    _INSTALLER_DIR / "installer_config.json",
+)
+
+
+def _read_path_metadata(path: Path) -> dict:
+    """Liest nur eine kleine reguläre JSON-Metadatendatei und niemals einen Symlink."""
+    try:
+        info = path.lstat()
+        if path.is_symlink() or not path.is_file() or info.st_size > 1024 * 1024:
+            return {}
+        with path.open("r", encoding="utf-8-sig") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError, TypeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    nested = data.get("config")
+    if isinstance(nested, dict):
+        merged = dict(nested)
+        merged.update(data)
+        merged.pop("config", None)
+        return merged
+    return data
+
+
+def _validated_install_root(value) -> Path:
+    """Akzeptiert nur einen vorhandenen Produktroot mit Release-Markern."""
+    candidate = Path(str(value or "").strip())
+    if not candidate.is_absolute():
+        raise RuntimeError("Installationspfad fehlt oder ist nicht absolut")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError("Installationspfad ist nicht aufloesbar") from exc
+    markers = (
+        resolved / "VERSION",
+        resolved / "installer_main.py",
+        resolved / "Installer" / "installer_config.py",
+    )
+    if not all(marker.is_file() for marker in markers):
+        raise RuntimeError("Installationspfad besitzt nicht alle Release-Marker")
+    return resolved
+
+
+def _validated_optional_absolute(value, label: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    candidate = Path(text)
+    if not candidate.is_absolute():
+        raise RuntimeError(f"{label} ist nicht absolut")
+    return str(candidate)
+
+
 def get_paths() -> dict:
-    """
-    Liefert ein Dict mit allen relevanten Systempfaden.
-    Lese-Reihenfolge:
-      1. /var/www/html/data/e3dc_v4.json       (V4 Config, install_path neu seit Migration)
-      2. /var/www/html/e3dc_paths.json          (Legacy-Pfade, installiert durch Installer)
-      3. /home/pi/Install/Installer/installer_config.json (Installer-Metadaten)
-      4. Defaults                               (Fallback fuer neue Installationen)
+    """Löst Laufzeitpfade auf, ohne ein Benutzerverzeichnis zu suchen oder zu raten.
+
+    Der Produktstamm stammt aus einem expliziten Umgebungswert, kanonischen
+    Installermetadaten oder exakt diesem Release-Baum. Fehlende Konto- und
+    Venv-Metadaten bleiben leer, damit Verbraucher fehlersicher sperren können.
     """
     global _paths_cache
     if _paths_cache is not None:
         return _paths_cache
 
+    metadata = [_read_path_metadata(path) for path in _PATH_METADATA_FILES]
+    explicit_root = str(os.environ.get("E3DC_INSTALL_ROOT") or "").strip()
+    configured_root = next(
+        (str(data.get("install_path") or "").strip() for data in metadata if data.get("install_path")),
+        "",
+    )
+    root = _validated_install_root(explicit_root or configured_root or _MODULE_INSTALL_ROOT)
+
+    # Pfadmetadaten dürfen ein laufendes Release nicht still auf einen anderen
+    # Produktbaum umleiten.
+    module_root = _validated_install_root(_MODULE_INSTALL_ROOT)
+    if root != module_root:
+        raise RuntimeError("Pfadmetadaten und ausgeführter Release-Root widersprechen sich")
+
+    def first_value(key: str, env_name: str = "") -> str:
+        if env_name:
+            explicit = str(os.environ.get(env_name) or "").strip()
+            if explicit:
+                return explicit
+        return next((str(data.get(key) or "").strip() for data in metadata if data.get(key)), "")
+
+    home_dir = _validated_optional_absolute(first_value("home_dir", "E3DC_HOME_DIR"), "Home-Verzeichnis")
+    venv_path = _validated_optional_absolute(first_value("venv_path", "E3DC_VENV_PATH"), "Venv-Pfad")
+    install_user = first_value("install_user", "E3DC_INSTALL_USER")
+    normalized_user = install_user.replace("-", "").replace("_", "").replace(".", "")
+    if install_user and not normalized_user.isalnum():
+        raise RuntimeError("Installationsbenutzer ist ungültig")
+
     result = {
-        'install_path':  '/home/pi/Install',        # V4 Standard
-        'home_dir':      '/home/pi',
-        'install_user':  'pi',
-        'venv_path':     '/home/pi/.venv_e3dc',
-        'ramdisk_dir':   '/var/www/html/ramdisk',   # System-Festpfad (tmpfs), nie variabel
-        'data_dir':      '/var/www/html/data',       # Persistente Daten (Docker-Volume)
-        'web_dir':       '/var/www/html',
+        'install_path': str(root),
+        'home_dir': home_dir,
+        'install_user': install_user,
+        'venv_path': venv_path,
+        'ramdisk_dir': '/var/www/html/ramdisk',
+        'data_dir': '/var/www/html/data',
+        'web_dir': '/var/www/html',
     }
-
-    # 1. e3dc_v4.json (V4 kanonisch, hat install_path seit Migration)
-    v4_path = '/var/www/html/data/e3dc_v4.json'
-    if os.path.exists(v4_path):
-        try:
-            with open(v4_path, 'r', encoding='utf-8') as f:
-                v4 = json.load(f)
-            if v4.get('install_path'):
-                result['install_path'] = v4['install_path']
-            if v4.get('home_dir'):
-                result['home_dir'] = v4['home_dir']
-            if v4.get('install_user'):
-                result['install_user'] = v4['install_user']
-        except Exception:
-            pass
-
-    # 2. e3dc_paths.json (Legacy Installer-Output, ueberschreibt nur wenn V4 keine Angabe hat)
-    paths_json = '/var/www/html/e3dc_paths.json'
-    if os.path.exists(paths_json):
-        try:
-            with open(paths_json, 'r', encoding='utf-8') as f:
-                pdata = json.load(f)
-            # Nur uebernehmen wenn V4 keinen install_path gesetzt hat (Legacy-Systeme)
-            if result['install_path'] == '/home/pi/Install' and pdata.get('install_path'):
-                result['install_path'] = pdata['install_path']
-            if pdata.get('venv_path'):
-                result['venv_path'] = pdata['venv_path']
-            if pdata.get('home_dir'):
-                result['home_dir'] = pdata['home_dir']
-        except Exception:
-            pass
-
-    # 3. installer_config.json (Installer-Metadaten)
-    inst_cfg = os.path.join(result['install_path'], 'Installer', 'installer_config.json')
-    if os.path.exists(inst_cfg):
-        try:
-            with open(inst_cfg, 'r', encoding='utf-8') as f:
-                ic = json.load(f)
-            if ic.get('install_user'):
-                result['install_user'] = ic['install_user']
-            if ic.get('home_dir'):
-                result['home_dir'] = ic['home_dir']
-        except Exception:
-            pass
-
-    # venv_path aus home_dir ableiten wenn nicht explizit gesetzt
-    if result['venv_path'] == '/home/pi/.venv_e3dc':
-        result['venv_path'] = os.path.join(result['home_dir'], '.venv_e3dc')
 
     _paths_cache = result
     return result
@@ -105,13 +143,13 @@ def setup_logging():
     global _logging_initialized
     if _logging_initialized:
         return
-    
+
     # Logfile im Ordner Logs oberhalb von Installer
     script_dir = os.path.dirname(os.path.abspath(__file__))
     log_dir = os.path.join(os.path.dirname(script_dir), "logs")
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, "install.log")
-    
+
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO)
     if not root_logger.handlers:
@@ -119,7 +157,7 @@ def setup_logging():
         formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
         handler.setFormatter(formatter)
         root_logger.addHandler(handler)
-        
+
     _logging_initialized = True
 
 def run_command(cmd, timeout=10, use_shell=True, cwd=None):
@@ -135,7 +173,7 @@ def run_command(cmd, timeout=10, use_shell=True, cwd=None):
             logging.info(f"STDOUT: {result.stdout.strip()[:1000]}...") # Gekürzt für das Log
         if result.stderr.strip():
             logging.error(f"STDERR: {result.stderr.strip()[:1000]}...")
-            
+
         return {
             'success': result.returncode == 0,
             'stdout': result.stdout,
@@ -181,11 +219,11 @@ def replace_in_file(path, key, new_line):
     """Ersetzt eine Konfigurationszeile in einer Datei."""
     if not os.path.exists(path):
         return False
-    
+
     try:
         lines = []
         found = False
-        
+
         with open(path, "r") as f:
             for line in f:
                 stripped = line.strip()
@@ -194,13 +232,13 @@ def replace_in_file(path, key, new_line):
                     found = True
                 else:
                     lines.append(line)
-        
+
         if not found:
             lines.append(new_line + "\n")
-        
+
         with open(path, "w") as f:
             f.writelines(lines)
-        
+
         return True
     except Exception as e:
         return False
@@ -232,7 +270,7 @@ def apt_install(pkg):
 
 def ensure_apache_php_module():
     """Stellt sicher, dass Apache PHP-Dateien ausfuehrt statt als Text auszuliefern."""
-    print("â†’ Aktiviere Apache PHP-Modulâ€¦")
+    print("→ Aktiviere Apache PHP-Modul…")
     run_command("sudo a2dismod mpm_event mpm_worker >/dev/null 2>&1 || true", timeout=30)
     run_command("sudo a2enmod mpm_prefork", timeout=30)
     php_module_cmd = (
@@ -242,9 +280,9 @@ def ensure_apache_php_module():
     )
     result = run_command(php_module_cmd, timeout=30)
     if result['success']:
-        print("âœ“ Apache PHP-Modul aktiv.")
+        print("✓ Apache PHP-Modul aktiv.")
     else:
-        print("âš  Apache PHP-Modul konnte nicht sicher aktiviert werden.")
+        print("⚠ Apache PHP-Modul konnte nicht sicher aktiviert werden.")
     run_command("sudo apache2ctl configtest", timeout=30)
 
 
@@ -256,7 +294,7 @@ def pip_install(pkg, venv_path=None, user=None):
         pip_bin = os.path.join(venv_path, "bin", "pip")
         check_cmd = command_as_user(f"{shlex.quote(pip_bin)} show {shlex.quote(pkg)}", user)
         install_cmd = command_as_user(f"{shlex.quote(pip_bin)} install {shlex.quote(pkg)}", user)
-        
+
         print(f"→ Prüfe Python-Paket {pkg} im venv…")
         res = subprocess.run(check_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if res.returncode != 0:
@@ -327,7 +365,7 @@ def cleanup_pycache(start_path):
     """
     setup_logging()
     logging.info(f"Starte __pycache__-Bereinigung in {start_path}")
-    
+
     for root, dirs, files in os.walk(start_path):
         if "__pycache__" in dirs:
             pycache_path = os.path.join(root, "__pycache__")
@@ -338,9 +376,11 @@ def cleanup_pycache(start_path):
             except Exception as e:
                 logging.error(f"Fehler beim Entfernen von {pycache_path}: {e}")
                 print(f"⚠ Fehler beim Entfernen des Caches in {os.path.basename(root)}.")
-    
+
     logging.info("__pycache__-Bereinigung abgeschlossen.")
 
+# --- MIGRATED FROM system.py & service_setup.py ---
+# --- MIGRATED FROM system.py & service_setup.py ---
 from .installer_config import get_install_path, get_install_user, get_home_dir, load_config, get_venv_path, get_venv_name, get_venv_pip, get_user_ids
 import tempfile
 from .logging_manager import get_or_create_logger, log_task_completed, log_error, log_warning
@@ -393,8 +433,10 @@ V4_SYSTEM_PACKAGES = [
     # Python Bibliotheken (via apt, fuer ML / Datenverarbeitung)
     "python3-sklearn", "python3-numpy", "python3-cryptography",
     "python3-bs4",          # Luxtronik WebSocket-Scraping (lux_live.py)
-    # Node.js und lokale Matter-Erkennung
-    "nodejs", "npm", "avahi-daemon", "avahi-utils", "dbus",
+    # Node.js / Matter Bridge
+    "nodejs", "npm",
+    # Netzwerk / Discovery (Matter & mDNS)
+    "avahi-daemon", "avahi-utils", "dbus",
     # System-Hilfspakete
     "curl",                 # allgemein nuetzlich
     "git",                  # Self-Update (UPDATE_POLICY.json)
@@ -458,7 +500,7 @@ def setup_venv(show_header=False):
     """Richtet das Python Virtual Environment ein."""
     if show_header:
         print("\n=== Python Virtual Environment einrichten ===\n")
-    
+
     install_user = get_install_user()
     venv_name, venv_path = resolve_venv_target(install_user)
 
@@ -472,9 +514,9 @@ def setup_venv(show_header=False):
                 print("✓ Altes venv bereinigt.")
             except Exception as e:
                 print(f"⚠ Konnte altes venv nicht löschen: {e}")
-    
+
     print(f"→ Ziel: {venv_path}")
-    
+
     if not os.path.exists(venv_path):
         print("→ Erstelle venv…")
         # Erstelle venv mit Zugriff auf System-Pakete (für apt-installierte Module wie RPi.GPIO falls nötig)
@@ -491,12 +533,12 @@ def setup_venv(show_header=False):
             return False
     else:
         print("✓ venv existiert bereits.")
-    
+
     venv_pip = get_venv_pip(install_user)
-    
+
     # Nutze zentrale Installationsfunktion
     install_python_packages()
-    
+
     if show_header:
         print("\n✓ Python-Umgebung eingerichtet.\n")
         log_task_completed("Python venv eingerichtet")
@@ -506,11 +548,11 @@ def setup_venv(show_header=False):
 def list_venv_packages():
     """Listet installierte Pakete im venv auf."""
     print("\n=== Python venv Pakete ===\n")
-    
+
     install_user = get_install_user()
     venv_name = get_venv_name() or ".venv_e3dc"
     venv_pip = os.path.join(get_home_dir(install_user), venv_name, "bin", "pip")
-    
+
     if not os.path.exists(venv_pip):
         print("✗ Kein venv gefunden.")
         return
@@ -527,10 +569,10 @@ def install_python_packages():
     """Installiert Python-Pakete (bevorzugt im venv)."""
     install_user = get_install_user()
     venv_name, venv_path = resolve_venv_target(install_user)
-    
+
     print(f"\n→ Installiere Python-Pakete im venv ({venv_name})…")
     system_logger.info(f"Installiere {len(PYTHON_PACKAGES)} Python-Pakete im venv.")
-    
+
     for pkg in PYTHON_PACKAGES:
         pip_install(pkg, venv_path=venv_path, user=install_user)
 
@@ -541,7 +583,7 @@ def cleanup_legacy_python_packages(use_venv=True):
     legacy_apt = ["python3-plotly", "python3-pandas"]
     run_command("sudo apt-get remove -y " + " ".join(legacy_apt))
     run_command("sudo apt-get autoremove -y")
-    
+
     legacy_pip = ["plotly", "pandas", "pandas-stubs", "matplotlib", "pytz", "kaleido"]
     install_user = get_install_user()
     if use_venv:
@@ -568,7 +610,7 @@ def install_system_packages(use_venv=True):
 
     packages = get_required_system_packages(include_legacy_cpp=cpp_still_active)
     install_apt_package_list(packages)
-        
+
     cleanup_legacy_python_packages(use_venv)
 
     # --- NEU: Apache PHP + WebSocket Reverse Proxy automatisch einrichten ---
@@ -576,12 +618,12 @@ def install_system_packages(use_venv=True):
     print("\n→ Konfiguriere Apache Reverse Proxy für WebSockets...")
     run_command("sudo a2enmod proxy")
     run_command("sudo a2enmod proxy_wstunnel")
-    
+
     conf_path = "/etc/apache2/sites-available/000-default.conf"
     if os.path.exists(conf_path):
         with open(conf_path, "r") as f:
             content = f.read()
-        
+
         modified = False
         if 'ProxyPass "/ws"' not in content:
             content = content.replace("</VirtualHost>", '    ProxyPass "/ws" "ws://127.0.0.1:8765/"\n</VirtualHost>')
@@ -589,7 +631,7 @@ def install_system_packages(use_venv=True):
         elif '127.0.0.1:8080' in content:
             content = content.replace('127.0.0.1:8080', '127.0.0.1:8765')
             modified = True
-            
+
         if modified:
             with tempfile.NamedTemporaryFile("w", delete=False) as tmp:
                 tmp.write(content)
@@ -600,7 +642,7 @@ def install_system_packages(use_venv=True):
             system_logger.info("Apache Proxy-Regel für WebSockets auf Port 8765 aktualisiert.")
         else:
             print("  ✓ Proxy-Regel existiert bereits korrekt.")
-            
+
     run_command("sudo systemctl restart apache2")
     # ------------------------------------------------------------------
 
@@ -633,21 +675,21 @@ def setup_service_wrapper():
         os.path.join(installer_dir, "installer_wrapper.sh"),
     ]
     existing_wrappers = [path for path in wrapper_paths if os.path.exists(path)]
-    
+
     if existing_wrappers:
         for wrapper_path in existing_wrappers:
             run_command(f"sudo chmod +x {wrapper_path}")
-        
+
         sudoers_content = "".join(
             f"www-data ALL=(root) NOPASSWD: {wrapper_path}\n"
             for wrapper_path in existing_wrappers
         )
         sudoers_file = "/etc/sudoers.d/020_e3dc_services"
-        
+
         with tempfile.NamedTemporaryFile("w", delete=False) as tmp:
             tmp.write(sudoers_content)
             tmp_name = tmp.name
-        
+
         run_command(f"sudo cp {tmp_name} {sudoers_file}")
         run_command(f"sudo chmod 440 {sudoers_file}")
         os.remove(tmp_name)
@@ -663,7 +705,7 @@ def setup_websocket_service():
     install_user = get_install_user()
     install_path = get_install_path()
     installer_dir = os.path.dirname(os.path.abspath(__file__))
-    
+
     service_content = f"""[Unit]
 Description=E3DC WebSocket Server fuer fluessige Dashboard Animationen
 After=network.target apache2.service
@@ -686,7 +728,7 @@ WantedBy=multi-user.target
     with tempfile.NamedTemporaryFile("w", delete=False) as tmp:
         tmp.write(service_content)
         tmp_name = tmp.name
-    
+
     run_command(f"sudo cp {tmp_name} /etc/systemd/system/e3dc-websocket.service")
     os.remove(tmp_name)
     run_command("sudo systemctl daemon-reload")
@@ -709,25 +751,28 @@ def _create_service_file(
 
     install_user = get_install_user()
     service_path = f"/etc/systemd/system/{service_name}.service"
-    
+
     # 100% bombensichere Pfad-Ermittlung durch __file__ (Ort dieses Skripts)!
     installer_dir = os.path.dirname(os.path.abspath(__file__))
-    
+
     script_abs_path = os.path.normpath(os.path.join(installer_dir, python_script_rel_path))
     working_dir = os.path.dirname(script_abs_path)
-    
+
     if not os.path.exists(script_abs_path):
         service_logger.error(f"FATAL: Skript {script_abs_path} nicht gefunden!")
         # Fallback falls relativer Pfad komisch war
         # INSTALL_PATH import fehlt vielleicht, wir nutzen installer_dir
-        
+
     # Virtual Environment laden, falls genutzt
     script_executor = "python3"
     venv_name = load_config().get("venv_name", ".venv_e3dc")
     if os.path.exists(os.path.join(get_install_path(), venv_name, "bin", "python")):
         script_executor = os.path.join(get_install_path(), venv_name, "bin", "python")
-    elif os.path.exists(os.path.join("/home/pi", venv_name, "bin", "python")):
-        script_executor = os.path.join("/home/pi", venv_name, "bin", "python")
+    else:
+        configured_venv = str(get_paths().get("venv_path") or "").strip()
+        configured_python = os.path.join(configured_venv, "bin", "python") if configured_venv else ""
+        if configured_python and os.path.exists(configured_python):
+            script_executor = configured_python
 
     service_content = f"""[Unit]
 Description={description}
@@ -749,7 +794,7 @@ WantedBy=multi-user.target
         with tempfile.NamedTemporaryFile(mode='w', delete=False) as tmp:
             tmp.write(service_content)
             tmp_path = tmp.name
-        
+
         run_command(f"sudo mv {tmp_path} {service_path}")
         run_command(f"sudo chmod 644 {service_path}")
         run_command("sudo systemctl daemon-reload")
@@ -791,10 +836,10 @@ def install_e3dc_live_service(start_service=True):
 
     venv_name = load_config().get("venv_name", ".venv_e3dc")
     python_exec = "/usr/bin/python3"
+    configured_venv = str(get_paths().get("venv_path") or "").strip()
     for candidate in [
         os.path.join(get_install_path(), venv_name, "bin", "python3"),
-        os.path.join("/home/pi", venv_name, "bin", "python3"),
-        os.path.join("/home", install_user, venv_name, "bin", "python3"),
+        os.path.join(configured_venv, "bin", "python3") if configured_venv else "",
     ]:
         if os.path.exists(candidate):
             python_exec = candidate

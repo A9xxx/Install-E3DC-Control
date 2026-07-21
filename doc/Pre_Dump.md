@@ -78,10 +78,10 @@ WP-/Wallbox-/Lastpfade, die die Prognose bewusst als verlässlich behandeln darf
 
 Grenzbeispiel mit genug Headroom:
 
-- Speichergröße: 20 kWh
+- Speichergröße: 35 kWh
 - Ziel-SoC: 95 %
 - erwarteter SoC beim ersten Druckfenster: 80 %
-- sicherer Headroom: 15 % von 20 kWh = 3,0 kWh
+- sicherer Headroom: 15 % von 35 kWh = 5,25 kWh
 - Rohdruck: 3,0 kWh
 
 ```text
@@ -94,10 +94,10 @@ zu überschreiten.
 
 Grenzbeispiel mit echtem Pre-Dump-Bedarf:
 
-- Speichergröße: 20 kWh
+- Speichergröße: 35 kWh
 - Ziel-SoC: 95 %
 - erwarteter SoC beim ersten Druckfenster: 92 %
-- sicherer Headroom: 3 % von 20 kWh = 0,6 kWh
+- sicherer Headroom: 3 % von 35 kWh = 1,05 kWh
 - Rohdruck: 6,0 kWh
 
 ```text
@@ -184,13 +184,6 @@ blind zusätzliche Leistung ins Netz drücken. Dann bleibt nur lokaler Verbrauch
 oder ein späterer, kleinerer Fallback.
 
 ## Komfort-/Fixziel-Pre-Dump
-
-Dieser produktive Pfad ersetzt zusammen mit der Ladekurve die früheren
-Energy-Manager-Funktionen **Morning Boost** und **Superintelligenz**. Deren
-alte Konfigurationsschalter und Zustandsdatei werden nicht mehr ausgewertet.
-Bestehende Betreiberwünsche werden stattdessen über Pre-Dump-Zeitfenster,
-Mindest-SoC, Komfort-Ziel und den ausdrücklich freizugebenden Netz-Fallback
-abgebildet.
 
 Hard-Pre-Dump ist der optionale Komfort- beziehungsweise Fixziel-Modus für
 Nutzer, die den Speicher bewusst bis zu einem festen Wert entladen wollen. Das

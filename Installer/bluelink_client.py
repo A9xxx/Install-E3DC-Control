@@ -7,6 +7,7 @@ import math
 import logging
 import time
 from datetime import datetime
+from pathlib import Path
 
 try:
     from hyundai_kia_connect_api import VehicleManager
@@ -19,11 +20,11 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger("BluelinkClient")
 
 def get_install_path():
-    try:
-        with open('/var/www/html/e3dc_paths.json', 'r') as f:
-            return json.load(f).get('install_path', '/home/pi/E3DC-Control')
-    except:
-        return '/home/pi/E3DC-Control'
+    root = Path(__file__).resolve().parent.parent
+    markers = (root / "VERSION", root / "installer_main.py", root / "Installer")
+    if not all(marker.exists() for marker in markers):
+        raise RuntimeError("Bluelink: Release-Root ist nicht eindeutig aufloesbar")
+    return str(root)
 
 CONFIG_FILE = os.path.join(get_install_path(), "e3dc.config.txt")
 V4_CONFIG_FILE = "/var/www/html/data/e3dc_v4.json"

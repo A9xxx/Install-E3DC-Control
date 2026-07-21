@@ -13,7 +13,7 @@ LEGACY_WEB_CONFIG_FILE = "/var/www/html/e3dc_paths.json"
 WEB_CONFIG_START_DEFAULTS = {
     "server_ip": "",
     "server_port": "5033",
-    "e3dc_user": "local.user",
+    "e3dc_user": "",
     "e3dc_password": "",
     "aes_password": "",
     "wurzelzaehler": "0",
@@ -123,42 +123,46 @@ def _get_from_web_config(key):
 def get_home_dir(install_user=None):
     if not install_user:
         d = _get_from_web_config("home_dir")
-        if d and os.path.exists(d): return d
-        
+        if d and os.path.isabs(str(d)) and os.path.isdir(d):
+            return os.path.realpath(d)
+
+    explicit_home = str(os.environ.get("E3DC_HOME_DIR") or "").strip()
+    if explicit_home:
+        if not os.path.isabs(explicit_home) or not os.path.isdir(explicit_home):
+            raise RuntimeError("E3DC_HOME_DIR ist kein vorhandenes absolutes Verzeichnis")
+        return os.path.realpath(explicit_home)
+
     user = install_user or get_install_user()
     try:
         return pwd.getpwnam(user).pw_dir
-    except KeyError:
-        return os.path.join("/home", user)
+    except KeyError as exc:
+        raise RuntimeError("Home-Verzeichnis ist ohne gültiges Benutzerkonto nicht auflösbar") from exc
+
+
+def _validated_product_root(value):
+    candidate = str(value or "").strip()
+    if not candidate or not os.path.isabs(candidate):
+        raise RuntimeError("Installationspfad fehlt oder ist nicht absolut")
+    resolved = os.path.realpath(candidate)
+    markers = (
+        os.path.join(resolved, "VERSION"),
+        os.path.join(resolved, "installer_main.py"),
+        os.path.join(resolved, "Installer", "installer_config.py"),
+    )
+    if not all(os.path.isfile(path) for path in markers):
+        raise RuntimeError("Installationspfad besitzt nicht alle Release-Marker")
+    return resolved
 
 
 def get_install_path(install_user=None):
-    """Ermittelt den V4 Install-Pfad dynamisch. Primaer: e3dc_v4.json, Fallback: /home/pi/Install."""
-    # 1. V4 Config (kanonisch seit Migration)
-    p = _get_from_web_config("install_path")
-    if p and os.path.exists(p):
-        return p
-
-    user = install_user or get_install_user()
-    home = get_home_dir(user)
-
-    # 2. Neues V4 Standardverzeichnis
-    v4_path = os.path.join(home, "Install")
-    if os.path.exists(v4_path):
-        return v4_path
-
-    # 3. Legacy C++ Verzeichnis (nur wenn vorhanden – Übergangsphase)
-    legacy_path = os.path.join(home, "E3DC-Control")
-    if os.path.exists(legacy_path):
-        return legacy_path
-
-    # 4. Installer-Root (falls wir schon in Install/ laufen)
-    installer_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    if os.path.exists(os.path.join(installer_root, "Installer")):
-        return installer_root
-
-    # Absoluter Fallback: V4 Standardpfad (neues System)
-    return v4_path
+    """Löst den exakten Produktstamm auf, ohne ein Benutzerverzeichnis zu durchsuchen."""
+    explicit = str(os.environ.get("E3DC_INSTALL_ROOT") or "").strip()
+    configured = str(_get_from_web_config("install_path") or "").strip()
+    module_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    root = _validated_product_root(explicit or configured or module_root)
+    if root != _validated_product_root(module_root):
+        raise RuntimeError("Pfadmetadaten und ausgefuehrter Release-Root widersprechen sich")
+    return root
 
 
 def get_user_ids(install_user=None):
@@ -218,7 +222,7 @@ def ensure_web_config(install_user=None):
     """Write V4 web config so PHP can resolve paths and handle tariffs."""
     logger = logging.getLogger("install")
     user = install_user or get_install_user()
-    
+
     # Migriere alte Datei falls vorhanden
     if os.path.exists(LEGACY_WEB_CONFIG_FILE) and not os.path.exists(WEB_CONFIG_FILE):
         os.makedirs(os.path.dirname(WEB_CONFIG_FILE), exist_ok=True)
@@ -329,7 +333,7 @@ def get_venv_path(install_user=None):
     """Gibt den absoluten Pfad zum venv-Ordner zurück."""
     p = _get_from_web_config("venv_path")
     if p and os.path.exists(p): return p
-    
+
     user = install_user or get_install_user()
     return os.path.join(get_home_dir(user), get_venv_name())
 

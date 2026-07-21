@@ -21,7 +21,15 @@ const FLOW_COLOR_DEFAULTS = {
     heatpump: '#f97316',
     heater: '#fd7e14',
     climate: '#38bdf8',
+    generation: '#22c55e',
+    consumption: '#0dcaf0',
     center: '#0d6efd'
+};
+const FLOW_LABEL_DEFAULTS = {
+    pv: 'E3DC-PV', external_pv: 'Zusatz-WR', grid: 'Netz', battery: 'Speicher',
+    home: 'Haus', wallbox: 'Wallbox 1', wallbox2: 'Wallbox 2', heatpump: 'Wärmepumpe',
+    heater: 'Heizstab', climate: 'Klima', generation: 'Erzeugung', consumption: 'Verbrauch',
+    center: 'E3DC-Control'
 };
 let flowEditorState = null;
 
@@ -36,6 +44,31 @@ function normalizeFlowColor(value, fallback = '#6c757d') {
 function getEnergyFlowColors() {
     const stored = window.UI_ENERGY_FLOW && window.UI_ENERGY_FLOW.colors ? window.UI_ENERGY_FLOW.colors : {};
     return {...FLOW_COLOR_DEFAULTS, ...stored};
+}
+
+function normalizeFlowLabel(value) {
+    return String(value ?? '').replace(/[\u0000-\u001f\u007f<>]/g, '').trim().slice(0, 32);
+}
+
+function getEnergyFlowLabels() {
+    const stored = window.UI_ENERGY_FLOW && window.UI_ENERGY_FLOW.labels ? window.UI_ENERGY_FLOW.labels : {};
+    return {...stored};
+}
+
+function getFlowLabel(key) {
+    return normalizeFlowLabel(getEnergyFlowLabels()[key]) || FLOW_LABEL_DEFAULTS[key] || key;
+}
+
+function applyEnergyFlowLabels(container = document.getElementById('flow-view')) {
+    if (!container) return;
+    container.querySelectorAll('[data-flow-label-key]').forEach(label => {
+        label.textContent = getFlowLabel(label.dataset.flowLabelKey);
+    });
+    container.querySelectorAll('[data-flow-node]').forEach(node => {
+        const key = node.dataset.flowNode;
+        const handle = node.querySelector('.flow-drag-handle');
+        if (key && handle) handle.setAttribute('aria-label', `${getFlowLabel(key)} verschieben`);
+    });
 }
 
 function getFlowColor(key, fallback = null) {
@@ -102,9 +135,15 @@ function flowNodePosition(node) {
     };
 }
 
+function flowCanvas(container) {
+    if (!container) return null;
+    return container.querySelector('[data-flow-canvas]') || container;
+}
+
 function flowNodeRenderedCenter(container, node) {
     if (!container || !node) return flowNodePosition(node);
-    const containerRect = container.getBoundingClientRect();
+    const canvas = flowCanvas(container);
+    const containerRect = canvas.getBoundingClientRect();
     const nodeRect = node.getBoundingClientRect();
     if (!containerRect.width || !containerRect.height || !nodeRect.width || !nodeRect.height) {
         return flowNodePosition(node);
@@ -150,17 +189,34 @@ function snapshotEnergyFlow(container) {
     const nodes = {};
     container.querySelectorAll('[data-flow-node]').forEach(node => {
         const key = node.dataset.flowNode;
-        if (key === 'center') return;
         nodes[key] = flowNodePosition(node);
     });
-    return {nodes, colors: {...getEnergyFlowColors()}};
+    const ui = window.UI_ENERGY_FLOW || {};
+    return {
+        nodes,
+        colors: {...getEnergyFlowColors()},
+        labels: {...getEnergyFlowLabels()},
+        revisions: {...(ui.revisions || {})},
+        revision: String(ui.revision || '')
+    };
 }
 
 function setFlowNodePosition(container, key, x, y) {
     const node = flowNodeByKey(container, key);
-    if (!node || key === 'center') return;
-    const px = Math.max(4, Math.min(96, x));
-    const py = Math.max(4, Math.min(96, y));
+    if (!node) return;
+    const canvas = flowCanvas(container);
+    const containerRect = canvas.getBoundingClientRect();
+    const nodeRect = node.getBoundingClientRect();
+    const radiusXPct = containerRect.width > 0 && nodeRect.width > 0
+        ? ((nodeRect.width / 2 + 2) / containerRect.width) * 100
+        : 4;
+    const radiusYPct = containerRect.height > 0 && nodeRect.height > 0
+        ? ((nodeRect.height / 2 + 2) / containerRect.height) * 100
+        : 4;
+    const minX = Math.max(1, radiusXPct);
+    const minY = Math.max(1, radiusYPct);
+    const px = Math.max(minX, Math.min(100 - minX, x));
+    const py = Math.max(minY, Math.min(100 - minY, y));
     node.style.left = `${px}%`;
     node.style.top = `${py}%`;
     node.dataset.flowX = String(Math.round(px * 100) / 100);
@@ -177,11 +233,32 @@ function setFlowNodePosition(container, key, x, y) {
     updateEnergyFlowLines(container);
 }
 
+function clearEnergyFlowDrag(event = null, options = {}) {
+    if (!flowEditorState) return false;
+    const active = flowEditorState.dragging || flowEditorState.pendingDrag;
+    if (!active) return false;
+    const force = options.force === true;
+    const eventPointerId = event && event.pointerId !== undefined ? event.pointerId : undefined;
+    if (!force && eventPointerId !== undefined && eventPointerId !== active.pointerId) return false;
+    const handle = active.handle || null;
+    const node = active.node || null;
+    if (handle && active.pointerId !== undefined) {
+        try {
+            if (typeof handle.hasPointerCapture !== 'function' || handle.hasPointerCapture(active.pointerId)) {
+                handle.releasePointerCapture(active.pointerId);
+            }
+        } catch (e) {}
+    }
+    if (node) node.classList.remove('flow-dragging');
+    flowEditorState.dragging = null;
+    flowEditorState.pendingDrag = null;
+    return true;
+}
+
 function collectEnergyFlowNodes(container) {
     const nodes = {};
     container.querySelectorAll('[data-flow-node]').forEach(node => {
         const key = node.dataset.flowNode;
-        if (key === 'center') return;
         const pos = flowNodePosition(node);
         nodes[key] = {x: Math.round(pos.x * 100) / 100, y: Math.round(pos.y * 100) / 100};
     });
@@ -196,8 +273,15 @@ function setFlowEditorSelected(container, key) {
     if (node) node.classList.add('flow-selected');
     const select = container.querySelector('[data-flow-color-select]');
     const input = container.querySelector('[data-flow-color-input]');
+    const labelInput = container.querySelector('[data-flow-label-input]');
+    const fixedLabel = key === 'center';
     if (select && [...select.options].some(opt => opt.value === key)) select.value = key;
     if (input) input.value = getFlowColor(key);
+    if (labelInput) {
+        labelInput.disabled = fixedLabel;
+        labelInput.value = fixedLabel ? '' : normalizeFlowLabel(getEnergyFlowLabels()[key] || '');
+        labelInput.placeholder = fixedLabel ? 'Feste Beschriftung' : (FLOW_LABEL_DEFAULTS[key] || 'Anzeigename');
+    }
 }
 
 function restoreEnergyFlowSnapshot(container, snapshot) {
@@ -205,11 +289,16 @@ function restoreEnergyFlowSnapshot(container, snapshot) {
     Object.entries(snapshot.nodes || {}).forEach(([key, pos]) => setFlowNodePosition(container, key, pos.x, pos.y));
     window.UI_ENERGY_FLOW = window.UI_ENERGY_FLOW || {};
     window.UI_ENERGY_FLOW.colors = {...FLOW_COLOR_DEFAULTS, ...(snapshot.colors || {})};
+    window.UI_ENERGY_FLOW.labels = {...(snapshot.labels || {})};
+    window.UI_ENERGY_FLOW.revisions = {...(snapshot.revisions || {})};
+    window.UI_ENERGY_FLOW.revision = String(snapshot.revision || '');
     applyEnergyFlowBaseColors(container);
+    applyEnergyFlowLabels(container);
     updateEnergyFlowLines(container);
 }
 
 function autoDistributeEnergyFlow(container) {
+    setFlowNodePosition(container, 'center', 50, 50);
     const nodes = [...container.querySelectorAll('[data-flow-node]')]
         .map(node => node.dataset.flowNode)
         .filter(key => key && key !== 'center');
@@ -217,31 +306,157 @@ function autoDistributeEnergyFlow(container) {
     const layout = container.dataset.flowLayout || 'desktop';
     const rx = layout === 'mobile' ? 34 : 33;
     const ry = layout === 'mobile' ? 34 : 32;
-    const preferred = ['pv', 'external_pv', 'home', 'heatpump', 'wallbox2', 'wallbox', 'heater', 'grid', 'battery'];
+    const preferred = ['generation', 'pv', 'external_pv', 'battery', 'consumption', 'home', 'heatpump', 'wallbox2', 'wallbox', 'heater', 'climate', 'grid'];
     const ordered = preferred.filter(key => nodes.includes(key)).concat(nodes.filter(key => !preferred.includes(key)));
+    const hasGenerationAggregate = nodes.includes('generation');
+    const hasConsumptionAggregate = nodes.includes('consumption');
+    if (hasGenerationAggregate || hasConsumptionAggregate) {
+        const mobile = layout === 'mobile';
+        if (nodes.includes('battery')) setFlowNodePosition(container, 'battery', 50, mobile ? 14 : 16);
+        if (nodes.includes('grid')) setFlowNodePosition(container, 'grid', 50, mobile ? 86 : 84);
+        if (hasGenerationAggregate) {
+            setFlowNodePosition(container, 'generation', mobile ? 30 : 35, 50);
+            if (nodes.includes('pv')) setFlowNodePosition(container, 'pv', mobile ? 10 : 15, 32);
+            if (nodes.includes('external_pv')) setFlowNodePosition(container, 'external_pv', mobile ? 10 : 15, 68);
+        }
+        if (hasConsumptionAggregate) {
+            setFlowNodePosition(container, 'consumption', mobile ? 70 : 65, 50);
+            const consumers = ['home', 'heatpump', 'wallbox', 'wallbox2', 'heater', 'climate'].filter(key => nodes.includes(key));
+            consumers.forEach((key, idx) => {
+                const start = mobile ? 10 : 12;
+                const range = mobile ? 80 : 76;
+                const y = consumers.length === 1 ? 50 : start + idx * (range / Math.max(1, consumers.length - 1));
+                setFlowNodePosition(container, key, mobile ? 90 : 85, y);
+            });
+        }
+        updateEnergyFlowLines(container);
+        return;
+    }
     ordered.forEach((key, idx) => {
         const angle = (-90 + idx * (360 / ordered.length)) * Math.PI / 180;
         setFlowNodePosition(container, key, 50 + Math.cos(angle) * rx, 50 + Math.sin(angle) * ry);
     });
 }
 
-async function saveEnergyFlowLayout(container) {
-    const colors = getEnergyFlowColors();
+function energyFlowColorPatch(current, original) {
+    const patch = {};
+    Object.keys(FLOW_COLOR_DEFAULTS).forEach(key => {
+        const fallback = FLOW_COLOR_DEFAULTS[key];
+        const next = normalizeFlowColor(current && current[key], fallback);
+        const before = normalizeFlowColor(original && original[key], fallback);
+        if (next !== before) patch[key] = next;
+    });
+    return patch;
+}
+
+function energyFlowLabelPatch(current, original) {
+    const patch = {};
+    Object.keys(FLOW_LABEL_DEFAULTS).forEach(key => {
+        if (key === 'center') return;
+        const next = normalizeFlowLabel(current && current[key]);
+        const before = normalizeFlowLabel(original && original[key]);
+        if (next !== before) patch[key] = next;
+    });
+    return patch;
+}
+
+function energyFlowSaveResultMatches(result, payload) {
+    const state = result && result.ui_energy_flow;
+    const savedNodes = state && state[payload.layout] && state[payload.layout].nodes;
+    if (!savedNodes || !state.revisions || !String(state.revision || '')) return false;
+    const nodeMatch = Object.entries(payload.nodes || {}).every(([key, expected]) => {
+        const actual = savedNodes[key];
+        return actual
+            && Math.abs(Number(actual.x) - Number(expected.x)) <= 0.011
+            && Math.abs(Number(actual.y) - Number(expected.y)) <= 0.011;
+    });
+    if (!nodeMatch) return false;
+    const colors = state.colors || {};
+    const colorsMatch = Object.entries(payload.colors_patch || {}).every(([key, expected]) => (
+        normalizeFlowColor(colors[key], FLOW_COLOR_DEFAULTS[key]) === normalizeFlowColor(expected, FLOW_COLOR_DEFAULTS[key])
+    ));
+    if (!colorsMatch) return false;
+    const labels = state.labels || {};
+    return Object.entries(payload.labels_patch || {}).every(([key, expected]) => (
+        normalizeFlowLabel(labels[key]) === normalizeFlowLabel(expected)
+    ));
+}
+
+function setEnergyFlowSaveStatus(container, text, state = '') {
+    const status = container && container.querySelector('[data-flow-save-status]');
+    if (!status) return;
+    status.textContent = text || '';
+    status.classList.toggle('is-success', state === 'success');
+    status.classList.toggle('is-error', state === 'error');
+}
+
+function setEnergyFlowEditorBusy(container, busy) {
+    if (!container) return;
+    const controls = container.querySelectorAll(
+        '[data-flow-edit], [data-flow-save], [data-flow-cancel], [data-flow-auto], ' +
+        '[data-flow-color-select], [data-flow-color-input], [data-flow-label-input], .flow-drag-handle'
+    );
+    if (busy) {
+        clearEnergyFlowDrag(null, {force: true});
+        container.dataset.flowSaving = '1';
+        container.classList.add('flow-saving');
+        controls.forEach(control => {
+            control.dataset.flowBusyWasDisabled = control.disabled ? '1' : '0';
+            control.disabled = true;
+        });
+        return;
+    }
+    controls.forEach(control => {
+        control.disabled = control.dataset.flowBusyWasDisabled === '1';
+        delete control.dataset.flowBusyWasDisabled;
+    });
+    delete container.dataset.flowSaving;
+    container.classList.remove('flow-saving');
+}
+
+function applyEnergyFlowSavedState(container, state, layout) {
+    if (!container || !state) return;
+    window.UI_ENERGY_FLOW = state;
+    const savedNodes = state[layout] && state[layout].nodes;
+    Object.entries(savedNodes || {}).forEach(([key, position]) => {
+        setFlowNodePosition(container, key, Number(position.x), Number(position.y));
+    });
+    applyEnergyFlowBaseColors(container);
+    applyEnergyFlowLabels(container);
+    updateEnergyFlowLines(container);
+}
+
+async function saveEnergyFlowLayout(container, original = null) {
+    const baseline = original || snapshotEnergyFlow(container);
     const payload = {
+        schema_version: 'energy_flow_layout_patch_v2',
         action: 'save_energy_flow_layout',
         layout: container.dataset.flowLayout || 'desktop',
         nodes: collectEnergyFlowNodes(container),
-        colors
+        colors_patch: energyFlowColorPatch(getEnergyFlowColors(), baseline.colors || {}),
+        labels_patch: energyFlowLabelPatch(getEnergyFlowLabels(), baseline.labels || {}),
+        base_revisions: {...(baseline.revisions || {})}
     };
     const response = await fetch(window.location.pathname, {
         method: 'POST',
         credentials: 'same-origin',
-        headers: {'Content-Type': 'application/json'},
+        headers: {
+            'Content-Type': 'application/json',
+            'X-Requested-With': 'XMLHttpRequest',
+            'X-CSRF-Token': String(window.E3DC_CSRF_TOKEN || '')
+        },
         body: JSON.stringify(payload)
     });
-    const result = await response.json();
-    if (!response.ok || !result.success) throw new Error(result.error || 'save_failed');
-    if (result.ui_energy_flow) window.UI_ENERGY_FLOW = result.ui_energy_flow;
+    const responseText = await response.text();
+    let result = null;
+    try { result = JSON.parse(responseText); } catch (e) {}
+    if (!response.ok || !result || !result.success) {
+        const error = new Error((result && result.error) || 'Layout konnte nicht gespeichert werden.');
+        error.status = response.status;
+        throw error;
+    }
+    if (!energyFlowSaveResultMatches(result, payload)) throw new Error('Gespeichertes Layout konnte nicht bestätigt werden.');
+    applyEnergyFlowSavedState(container, result.ui_energy_flow, payload.layout);
     return result;
 }
 
@@ -250,6 +465,7 @@ function initEnergyFlowLayoutEditor() {
         if (container.dataset.flowEditorReady === '1') return;
         container.dataset.flowEditorReady = '1';
         applyEnergyFlowBaseColors(container);
+        applyEnergyFlowLabels(container);
         initEnergyFlowHoverPanel(container);
         requestAnimationFrame(() => updateEnergyFlowLines(container));
 
@@ -259,13 +475,16 @@ function initEnergyFlowLayoutEditor() {
         const autoBtn = container.querySelector('[data-flow-auto]');
         const colorSelect = container.querySelector('[data-flow-color-select]');
         const colorInput = container.querySelector('[data-flow-color-input]');
+        const labelInput = container.querySelector('[data-flow-label-input]');
 
         const beginEdit = () => {
-            flowEditorState = {container, original: snapshotEnergyFlow(container), selected: 'pv', dragging: null};
+            setEnergyFlowSaveStatus(container, '');
+            flowEditorState = {container, original: snapshotEnergyFlow(container), selected: 'pv', dragging: null, pendingDrag: null};
             container.classList.add('flow-editing');
             setFlowEditorSelected(container, 'pv');
         };
         const endEdit = () => {
+            clearEnergyFlowDrag(null, {force: true});
             container.classList.remove('flow-editing');
             container.querySelectorAll('.flow-node.flow-selected').forEach(n => n.classList.remove('flow-selected'));
             flowEditorState = null;
@@ -274,35 +493,42 @@ function initEnergyFlowLayoutEditor() {
         if (editBtn) editBtn.addEventListener('click', (event) => {
             event.preventDefault();
             event.stopPropagation();
+            if (container.dataset.flowSaving === '1') return;
             if (container.classList.contains('flow-editing')) endEdit();
             else beginEdit();
         });
         if (cancelBtn) cancelBtn.addEventListener('click', (event) => {
             event.preventDefault();
             event.stopPropagation();
+            if (container.dataset.flowSaving === '1') return;
             restoreEnergyFlowSnapshot(container, flowEditorState && flowEditorState.original);
             endEdit();
         });
         if (autoBtn) autoBtn.addEventListener('click', (event) => {
             event.preventDefault();
             event.stopPropagation();
+            if (container.dataset.flowSaving === '1') return;
             autoDistributeEnergyFlow(container);
         });
         if (saveBtn) saveBtn.addEventListener('click', async (event) => {
             event.preventDefault();
             event.stopPropagation();
+            if (container.dataset.flowSaving === '1') return;
             const oldHtml = saveBtn.innerHTML;
-            saveBtn.disabled = true;
+            setEnergyFlowEditorBusy(container, true);
             saveBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
+            setEnergyFlowSaveStatus(container, 'Speichern…');
             try {
-                await saveEnergyFlowLayout(container);
+                await saveEnergyFlowLayout(container, flowEditorState && flowEditorState.original);
                 endEdit();
+                setEnergyFlowSaveStatus(container, 'Gespeichert', 'success');
             } catch (err) {
                 console.error('Energy-Flow Layout konnte nicht gespeichert werden', err);
-                alert('Layout konnte nicht gespeichert werden.');
+                setEnergyFlowSaveStatus(container, 'Nicht gespeichert', 'error');
+                alert(err && err.message ? err.message : 'Layout konnte nicht gespeichert werden.');
             } finally {
-                saveBtn.disabled = false;
                 saveBtn.innerHTML = oldHtml;
+                setEnergyFlowEditorBusy(container, false);
             }
         });
         if (colorSelect) colorSelect.addEventListener('change', () => setFlowEditorSelected(container, colorSelect.value));
@@ -313,50 +539,94 @@ function initEnergyFlowLayoutEditor() {
             applyEnergyFlowBaseColors(container);
             setFlowEditorSelected(container, key);
         });
+        if (labelInput) labelInput.addEventListener('input', () => {
+            const key = (flowEditorState && flowEditorState.selected) || 'pv';
+            if (key === 'center') return;
+            const alias = normalizeFlowLabel(labelInput.value);
+            window.UI_ENERGY_FLOW = window.UI_ENERGY_FLOW || {};
+            window.UI_ENERGY_FLOW.labels = {...getEnergyFlowLabels()};
+            if (alias) window.UI_ENERGY_FLOW.labels[key] = alias;
+            else delete window.UI_ENERGY_FLOW.labels[key];
+            applyEnergyFlowLabels(container);
+        });
 
         container.querySelectorAll('[data-flow-node]').forEach(node => {
             const key = node.dataset.flowNode;
-            if (key === 'center') return;
             node.addEventListener('click', (event) => {
-                if (!container.classList.contains('flow-editing')) return;
+                if (!container.classList.contains('flow-editing') || container.dataset.flowSaving === '1') return;
                 event.preventDefault();
                 event.stopImmediatePropagation();
                 event.stopPropagation();
                 setFlowEditorSelected(container, key);
             });
-            node.addEventListener('pointerdown', (event) => {
+            let handle = node.querySelector('.flow-drag-handle');
+            if (!handle) {
+                handle = document.createElement('button');
+                handle.type = 'button';
+                handle.className = 'flow-drag-handle';
+                handle.setAttribute('aria-label', `${getFlowLabel(key)} verschieben`);
+                handle.title = 'Knoten verschieben';
+                handle.innerHTML = '<i class="fas fa-arrows-up-down-left-right" aria-hidden="true"></i>';
+                node.appendChild(handle);
+            }
+            handle.addEventListener('click', (event) => {
                 if (!container.classList.contains('flow-editing')) return;
                 event.preventDefault();
+                event.stopImmediatePropagation();
                 event.stopPropagation();
-                setFlowEditorSelected(container, key);
-                node.setPointerCapture(event.pointerId);
-                flowEditorState.dragging = {key, pointerId: event.pointerId};
             });
-            node.addEventListener('pointermove', (event) => {
-                if (!flowEditorState || !flowEditorState.dragging || flowEditorState.dragging.key !== key) return;
-                const rect = container.getBoundingClientRect();
+            const clearDrag = (event = null) => clearEnergyFlowDrag(event);
+            handle.addEventListener('pointerdown', (event) => {
+                if (!container.classList.contains('flow-editing') || !flowEditorState || container.dataset.flowSaving === '1') return;
+                if (event.isPrimary === false || (event.pointerType === 'mouse' && event.button !== 0)) return;
+                event.stopPropagation();
+                clearEnergyFlowDrag(null, {force: true});
+                setFlowEditorSelected(container, key);
+                flowEditorState.pendingDrag = {
+                    key,
+                    pointerId: event.pointerId,
+                    x: event.clientX,
+                    y: event.clientY,
+                    handle,
+                    node
+                };
+                try { handle.setPointerCapture(event.pointerId); } catch (e) {}
+            });
+            handle.addEventListener('pointermove', (event) => {
+                if (!flowEditorState) return;
+                const pending = flowEditorState.pendingDrag;
+                if (!flowEditorState.dragging && pending && pending.key === key && pending.pointerId === event.pointerId) {
+                    if (Math.hypot(event.clientX - pending.x, event.clientY - pending.y) < 7) return;
+                    flowEditorState.dragging = {key, pointerId: event.pointerId, handle, node};
+                    flowEditorState.pendingDrag = null;
+                    node.classList.add('flow-dragging');
+                }
+                if (!flowEditorState.dragging
+                    || flowEditorState.dragging.key !== key
+                    || flowEditorState.dragging.pointerId !== event.pointerId) return;
+                event.preventDefault();
+                event.stopPropagation();
+                const rect = flowCanvas(container).getBoundingClientRect();
                 const x = ((event.clientX - rect.left) / rect.width) * 100;
                 const y = ((event.clientY - rect.top) / rect.height) * 100;
                 setFlowNodePosition(container, key, x, y);
             });
-            node.addEventListener('pointerup', (event) => {
-                if (flowEditorState && flowEditorState.dragging && flowEditorState.dragging.key === key) {
-                    flowEditorState.dragging = null;
-                    try { node.releasePointerCapture(event.pointerId); } catch (e) {}
-                }
-            });
-            node.addEventListener('pointercancel', (event) => {
-                if (flowEditorState && flowEditorState.dragging && flowEditorState.dragging.key === key) {
-                    flowEditorState.dragging = null;
-                    try { node.releasePointerCapture(event.pointerId); } catch (e) {}
-                }
-            });
+            handle.addEventListener('pointerup', clearDrag);
+            handle.addEventListener('pointercancel', clearDrag);
+            handle.addEventListener('lostpointercapture', clearDrag);
         });
     });
 }
 
 window.addEventListener('resize', () => {
     document.querySelectorAll('.flow-container[data-flow-layout]').forEach(container => updateEnergyFlowLines(container));
+});
+window.addEventListener('orientationchange', () => {
+    clearEnergyFlowDrag(null, {force: true});
+});
+window.addEventListener('blur', () => clearEnergyFlowDrag(null, {force: true}));
+document.addEventListener('visibilitychange', () => {
+    if (document.hidden) clearEnergyFlowDrag(null, {force: true});
 });
 
 function wallboxDisplayLooksActive(data, key) {
@@ -449,12 +719,12 @@ function smoothWallboxDisplayValues(data) {
 function getBatStatus(batVal, soc, notstromReserve) {
     const redThreshold = (notstromReserve || 0) + 10;
     const isLowSoc = soc <= redThreshold;
-    
+
     let iconShape = 'fa-battery-full';
     if (soc <= redThreshold) iconShape = 'fa-battery-quarter';
     else if (soc < 50) iconShape = 'fa-battery-half';
     else if (soc < 80) iconShape = 'fa-battery-three-quarters';
-    
+
     if (batVal > 0) return { hex: getFlowColor('battery_charge', '#2ecc71'), txt: 'text-success', bg: 'bg-success', fill: flowColorAlpha('battery_charge', 0.3, '#2ecc71'), icon: iconShape };
     if (batVal < 0) {
         if (isLowSoc) return { hex: '#dc3545', txt: 'text-danger', bg: 'bg-danger', fill: 'rgba(220, 53, 69, 0.2)', icon: iconShape };
@@ -477,7 +747,7 @@ function applyPhysicalSocFilter(soc, bat) {
     for (let i = 1; i < soc.length; i++) {
         let curr = soc[i];
         let prev = filtered[i - 1];
-        let bw = bat[i] || 0; 
+        let bw = bat[i] || 0;
 
         if (curr === null || curr === undefined || prev === null || prev === undefined) {
             filtered[i] = curr;
@@ -492,7 +762,7 @@ function applyPhysicalSocFilter(soc, bat) {
 
         if (bw < -50) {
             // Entladen: SoC darf physikalisch nicht steigen. Zieht weich (+0.05%) nach.
-            if (curr > prev) filtered[i] = Math.min(curr, prev + 0.05); 
+            if (curr > prev) filtered[i] = Math.min(curr, prev + 0.05);
             else filtered[i] = curr;
         } else if (bw > 50) {
             // Laden: SoC darf physikalisch nicht fallen. Sinkt weich (-0.05%) ab.
@@ -540,18 +810,66 @@ function applyForecastSocSmoothing(soc, startIndex = 0) {
     return smoothed.map(v => v !== null && v !== undefined ? Number(v.toFixed(2)) : v);
 }
 
+function vehicleSocDisplayInfo(vehicle, decimals = 1) {
+    const meta = vehicle && vehicle.soc_meta && typeof vehicle.soc_meta === 'object'
+        ? vehicle.soc_meta
+        : {};
+    const rawValue = meta.value !== undefined && meta.value !== null ? meta.value : (vehicle ? vehicle.soc : null);
+    const value = parseFloat(rawValue);
+    const displayUsable = meta.display_usable !== undefined ? meta.display_usable === true : Number.isFinite(value) && value > 0;
+    if (!displayUsable || !Number.isFinite(value) || value <= 0) {
+        return {known: false, valueText: '--', qualifier: '', standText: '', fullText: '--', stale: true};
+    }
+
+    const sourceClass = String(meta.class || vehicle.soc_source_class || '').toLowerCase();
+    const transportClass = String(meta.transport_class || '').toLowerCase();
+    const stale = meta.stale === true || vehicle.soc_stale === true || transportClass === 'cached';
+    const sourceTs = parseInt(meta.source_ts || vehicle.soc_source_ts || vehicle.last_updated_at || 0, 10);
+    const qualifier = sourceClass === 'estimated'
+        ? 'geschätzt'
+        : (sourceClass === 'manual' ? 'manuell' : (sourceClass === 'cloud' ? 'Cloud' : 'gemessen'));
+    const digits = Math.max(0, Math.min(2, parseInt(decimals, 10) || 0));
+    const valueText = value.toLocaleString('de-DE', {minimumFractionDigits: digits, maximumFractionDigits: digits}) + ' %';
+    let standText = '';
+    if (sourceTs > 0) {
+        const d = new Date(sourceTs * 1000);
+        const pad = n => String(n).padStart(2, '0');
+        standText = `Stand ${pad(d.getDate())}.${pad(d.getMonth() + 1)}. ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    }
+    const fullText = `${valueText} ${qualifier}${standText ? `, ${standText}` : ''}`;
+    return {known: true, value, valueText, qualifier, standText, fullText, stale, sourceClass, transportClass};
+}
+
 function vehicleSocKnown(vehicle) {
-    if (!vehicle) return false;
-    const soc = parseFloat(vehicle.soc);
-    if (!Number.isFinite(soc) || soc <= 0) return false;
-    const confirmed = vehicle.soc_rule_confirmed;
-    if (confirmed === false || confirmed === 0 || confirmed === '0' || confirmed === 'false') return false;
-    const source = String(vehicle.soc_source || vehicle.source || '').trim().toLowerCase();
-    if (source === 'simple_view_start_soc' || source === 'config_start_soc' || source === 'configured_wallbox') return false;
-    if (source.indexOf('wallbox_estimated_from_simple_view_start_soc') === 0) return false;
-    if (source.indexOf('wallbox_estimated_from_config_start_soc') === 0) return false;
-    if (source.indexOf('wallbox_estimated') === 0 && source.indexOf('wallbox_estimated_from_') !== 0) return false;
-    return true;
+    return vehicleSocDisplayInfo(vehicle, 1).known;
+}
+
+function wallboxPrimaryVehicleActive(data, id, power, locked) {
+    const valWb = Math.abs(parseFloat(power) || 0);
+    return locked === true
+        || valWb > 50
+        || (id === 'wb' ? data?.wb_plug === true : data?.wb2_plug === true);
+}
+
+function renderWallboxPrimaryVehicleName(titleElement, carName, active) {
+    if (!titleElement) return '';
+    if (titleElement._e3dcBaseHtml === undefined) {
+        titleElement._e3dcBaseHtml = titleElement.innerHTML;
+        titleElement._e3dcBaseTitle = titleElement.getAttribute('title') || String(titleElement.textContent || '').trim();
+    }
+    const displayName = active ? String(carName || '').trim() : '';
+    if (displayName) {
+        titleElement.textContent = '';
+        const icon = document.createElement('i');
+        icon.className = 'fas fa-car-side me-1';
+        titleElement.appendChild(icon);
+        titleElement.appendChild(document.createTextNode(displayName));
+        titleElement.setAttribute('title', displayName);
+    } else {
+        titleElement.innerHTML = titleElement._e3dcBaseHtml;
+        titleElement.setAttribute('title', titleElement._e3dcBaseTitle);
+    }
+    return String(titleElement.textContent || '').trim();
 }
 
 function updateVehiclePage(data) {
@@ -580,19 +898,19 @@ function updateVehiclePage(data) {
     }
 
     const vehicles = data.vehicles || [];
-    
+
     // Prüfe, ob die Struktur der Tabs neu gezeichnet werden muss (Anzahl, Namen oder Status geändert)
     let needsRedraw = (tabsEl.children.length !== vehicles.length);
     if (!needsRedraw) {
         vehicles.forEach((v, idx) => {
             const currentTabTitle = $(tabsEl.children[idx]).find('.nav-link').text().trim();
             if (currentTabTitle !== v.name) needsRedraw = true;
-            
+
             // Auch wenn sich der Typ (Gast vs. Cloud) ändert, müssen wir die Struktur ggf. anpassen
             const isIntegrated = (v.last_updated_at || v.odometer || v.bat_12v || v.id);
-            const isManualOnly = !!(v.is_manual && !isIntegrated);
+            const isDummy = !!(v.is_manual && !isIntegrated);
             const wasInterpolated = $(contentEl.children[idx]).data('interpolated') === true;
-            if (wasInterpolated !== isManualOnly) needsRedraw = true;
+            if (wasInterpolated !== isDummy) needsRedraw = true;
         });
     }
 
@@ -616,16 +934,16 @@ function updateVehiclePage(data) {
     if (needsRedraw) {
         tabsEl.innerHTML = '';
         contentEl.innerHTML = '';
-        
+
         vehicles.forEach((v, idx) => {
             const isActive = idx === 0 ? 'active' : '';
             const isShow = idx === 0 ? 'show active' : '';
-            
-            // Ein rein manuelles Fahrzeug besteht nur aus einer manuellen Session
-            // und hat keine Hintergrunddaten wie Cloud-Sync, Odo oder 12V.
+
+            // Ein "Dummy" ist ein Fahrzeug, das NUR aus einer manuellen Session besteht
+            // und keine echten Hintergrund-Daten (wie Cloud-Sync, Odo oder 12V) hat.
             const isIntegrated = (v.last_updated_at || v.odometer || v.bat_12v || v.id);
-            const isManualOnly = (v.is_manual && !isIntegrated);
-            
+            const isDummy = (v.is_manual && !isIntegrated);
+
             tabsEl.innerHTML += `
                 <li class="nav-item" role="presentation">
                     <button class="nav-link ${isActive} fw-bold" data-bs-toggle="pill" data-bs-target="#pane-${idx}" type="button" role="tab" style="border-radius: 20px; padding: 8px 20px; margin-right: 5px;">
@@ -633,26 +951,26 @@ function updateVehiclePage(data) {
                     </button>
                 </li>
             `;
-            
+
             contentEl.innerHTML += `
-                <div class="tab-pane fade ${isShow}" id="pane-${idx}" role="tabpanel" data-interpolated="${isManualOnly}">
+                <div class="tab-pane fade ${isShow}" id="pane-${idx}" role="tabpanel" data-interpolated="${isDummy}">
                     <div class="row g-4 mb-4 text-center">
-                        <div class="col-6 col-md-4"><div class="p-3 bg-body-tertiary rounded-4 border border-secondary-subtle h-100"><div class="small text-muted mb-1 text-uppercase fw-bold">Ladestand (SoC)</div><div class="fs-1 fw-bolder text-success" id="fz-soc-${idx}">--%</div></div></div>
+                        <div class="col-6 col-md-4"><div class="p-3 bg-body-tertiary rounded-4 border border-secondary-subtle h-100"><div class="small text-muted mb-1 text-uppercase fw-bold">Fahrzeug-SoC</div><div class="fs-1 fw-bolder text-success" id="fz-soc-${idx}">--</div><div class="small text-muted mt-1" id="fz-soc-meta-${idx}">Quelle nicht verfügbar</div></div></div>
                         <div class="col-6 col-md-4"><div class="p-3 bg-body-tertiary rounded-4 border border-secondary-subtle h-100"><div class="small text-muted mb-1 text-uppercase fw-bold">Reichweite</div><div class="fs-2 fw-bolder text-info" id="fz-range-${idx}">--</div></div></div>
-                        ${isManualOnly ? '' : `<div class="col-12 col-md-4"><div class="p-3 bg-body-tertiary rounded-4 border border-secondary-subtle h-100"><div class="small text-muted mb-1 text-uppercase fw-bold">12V Batterie</div><div class="fs-2 fw-bolder text-warning" id="fz-12v-${idx}">--</div></div></div>`}
+                        ${isDummy ? '' : `<div class="col-12 col-md-4"><div class="p-3 bg-body-tertiary rounded-4 border border-secondary-subtle h-100"><div class="small text-muted mb-1 text-uppercase fw-bold">12V Batterie</div><div class="fs-2 fw-bolder text-warning" id="fz-12v-${idx}">--</div></div></div>`}
                     </div>
                     <div class="row g-3">
                         <div class="col-md-6"><ul class="list-group list-group-flush rounded-4 border border-secondary-subtle shadow-sm">
                             <li class="list-group-item bg-transparent d-flex justify-content-between align-items-center py-3"><span class="text-muted"><i class="fas fa-plug me-2"></i>Kabel-Status</span><span class="fw-bold" id="fz-plugged-${idx}">--</span></li>
                             <li class="list-group-item bg-transparent d-flex justify-content-between align-items-center py-3"><span class="text-muted"><i class="fas fa-bullseye me-2"></i>Lade-Ziel (Auto)</span><span class="fw-bold text-success" id="fz-target-${idx}">--</span></li>
-                            ${isManualOnly ? '' : `<li class="list-group-item bg-transparent d-flex justify-content-between align-items-center py-3"><span class="text-muted"><i class="fas fa-map-marker-alt me-2"></i>Standort</span><span class="fw-bold" id="fz-home-${idx}">--</span></li>`}
-                            ${isManualOnly ? '' : `<li class="list-group-item bg-transparent d-flex justify-content-between align-items-center py-3"><span class="text-muted"><i class="fas fa-tachometer-alt me-2"></i>Kilometerstand</span><span class="fw-bold" id="fz-odo-${idx}">--</span></li>`}
+                            ${isDummy ? '' : `<li class="list-group-item bg-transparent d-flex justify-content-between align-items-center py-3"><span class="text-muted"><i class="fas fa-map-marker-alt me-2"></i>Standort</span><span class="fw-bold" id="fz-home-${idx}">--</span></li>`}
+                            ${isDummy ? '' : `<li class="list-group-item bg-transparent d-flex justify-content-between align-items-center py-3"><span class="text-muted"><i class="fas fa-tachometer-alt me-2"></i>Kilometerstand</span><span class="fw-bold" id="fz-odo-${idx}">--</span></li>`}
                         </ul></div>
                         <div class="col-md-6"><ul class="list-group list-group-flush rounded-4 border border-secondary-subtle shadow-sm">
                             <li class="list-group-item bg-transparent d-flex justify-content-between align-items-center py-3"><span class="text-muted"><i class="fas fa-history me-2"></i>Cloud-Sync</span><span class="fw-bold" id="fz-last-update-${idx}">--</span></li>
-                            ${isManualOnly ? '' : `<li class="list-group-item bg-transparent d-flex justify-content-between align-items-center py-3"><span class="text-muted"><i class="fas fa-lock me-2"></i>Türen / Schloss</span><span class="fw-bold" id="fz-locked-${idx}">--</span></li>`}
-                            ${isManualOnly ? '' : `<li class="list-group-item bg-transparent d-flex justify-content-between align-items-center py-3"><span class="text-muted"><i class="fas fa-door-closed me-2"></i>Türen & Klappen</span><span class="fw-bold" id="fz-doors-${idx}">--</span></li>`}
-                            ${isManualOnly ? '' : `<li class="list-group-item bg-transparent d-flex justify-content-between align-items-center py-3"><span class="text-muted"><i class="fas fa-car-burst me-2"></i>Reifendruck</span><span class="fw-bold" id="fz-tires-${idx}">--</span></li>`}
+                            ${isDummy ? '' : `<li class="list-group-item bg-transparent d-flex justify-content-between align-items-center py-3"><span class="text-muted"><i class="fas fa-lock me-2"></i>Türen / Schloss</span><span class="fw-bold" id="fz-locked-${idx}">--</span></li>`}
+                            ${isDummy ? '' : `<li class="list-group-item bg-transparent d-flex justify-content-between align-items-center py-3"><span class="text-muted"><i class="fas fa-door-closed me-2"></i>Türen & Klappen</span><span class="fw-bold" id="fz-doors-${idx}">--</span></li>`}
+                            ${isDummy ? '' : `<li class="list-group-item bg-transparent d-flex justify-content-between align-items-center py-3"><span class="text-muted"><i class="fas fa-car-burst me-2"></i>Reifendruck</span><span class="fw-bold" id="fz-tires-${idx}">--</span></li>`}
                         </ul></div>
                     </div>
                 </div>
@@ -661,14 +979,17 @@ function updateVehiclePage(data) {
     }
 
     vehicles.forEach((v, idx) => {
-        let socVal = parseFloat(v.soc);
-        const socKnown = vehicleSocKnown(v);
-        if (isNaN(socVal)) socVal = 0;
-        let socText = socKnown ? (socVal.toFixed(2) + '%') : '--';
-        if (socKnown && v.soc_stale) socText = 'zuletzt ' + socText;
-        $(`#fz-soc-${idx}`).text(socText);
+        const socInfo = vehicleSocDisplayInfo(v, 1);
+        const socEl = $(`#fz-soc-${idx}`);
+        socEl.text(socInfo.valueText)
+            .removeClass('text-success text-warning text-muted')
+            .addClass(socInfo.known ? (socInfo.stale || socInfo.sourceClass === 'estimated' ? 'text-warning' : 'text-success') : 'text-muted');
+        $(`#fz-soc-meta-${idx}`)
+            .text(socInfo.known ? `${socInfo.qualifier}${socInfo.standText ? `, ${socInfo.standText}` : ''}` : 'Quelle nicht verfügbar')
+            .toggleClass('text-warning', socInfo.known && (socInfo.stale || socInfo.sourceClass === 'estimated'))
+            .toggleClass('text-muted', !socInfo.known || (!socInfo.stale && socInfo.sourceClass !== 'estimated'));
         let rangeText = v.range_km ? v.range_km + ' km' : '--';
-        if (socKnown && v.soc_stale && v.range_km) rangeText = 'zuletzt ' + rangeText;
+        if (socInfo.known && socInfo.stale && v.range_km) rangeText = 'zuletzt ' + rangeText;
         $(`#fz-range-${idx}`).text(rangeText);
         $(`#fz-12v-${idx}`).text(v.bat_12v ? v.bat_12v + '%' : '--');
         $(`#fz-odo-${idx}`).text(v.odometer ? v.odometer.toLocaleString('de-DE') + ' km' : '--');
@@ -721,7 +1042,7 @@ function updateVehicleWidgets(data) {
             const alias = slot === 2 ? 'wb2' : 'wb1';
             const connected = slot === 2
                 ? (data.wb2_locked === true || data.wb2_plug === true || data.wb2_charging === true || (parseFloat(data.wb2) || 0) > 50)
-                : (data.wb_locked === true || data.wb_plug === true || data.wb_charging === true || (parseFloat(data.wb) || 0) > 50);
+                : (data.wb_plug === true || data.wb_charging === true || (parseFloat(data.wb) || 0) > 50);
             if (!connected) return null;
             const name = data[`${alias}_car_name`] || data[`${prefix}_car_name`] || '';
             const ids = [
@@ -730,12 +1051,13 @@ function updateVehicleWidgets(data) {
                 data[`${alias}_rfid_tag`], data[`${prefix}_rfid_tag`]
             ].map(compactId).filter(Boolean);
             if (!name && ids.length === 0) return null;
-            const nameKey = String(name || '').trim().toLowerCase();
+            const normalizeName = (value) => String(value || '').trim().toLocaleLowerCase('de-DE').replace(/\s+/g, ' ');
+            const nameKey = normalizeName(name);
             const matched = vehicles.find(v => {
                 const vehicleIds = [v.id, v.profile_id, v.vehicle_id, v.cloud_vehicle_id, v.rfid_tag].map(compactId);
                 const idMatch = ids.length > 0 && vehicleIds.some(id => id && ids.includes(id));
-                const vName = String(v.name || '').trim().toLowerCase();
-                return idMatch || (nameKey && vName && (nameKey === vName || nameKey.includes(vName) || vName.includes(nameKey)));
+                const vName = normalizeName(v.name);
+                return idMatch || (nameKey && vName && nameKey === vName);
             }) || {};
             return Object.assign({}, matched, {
                 name: name || matched.name || 'Fahrzeug',
@@ -748,10 +1070,10 @@ function updateVehicleWidgets(data) {
         let activeV1 = bySlot(1) || null;
         let activeV2 = bySlot(2) || null;
 
-        if (!activeV1 && data.wb_locked === true) activeV1 = slotFallback(1) || unslottedPlugged.shift() || null;
+        if (!activeV1 && data.wb_plug === true) activeV1 = slotFallback(1) || unslottedPlugged.shift() || null;
         if (!activeV2 && data.wb2_locked === true) activeV2 = slotFallback(2) || unslottedPlugged.shift() || null;
 
-        const isGuest1 = data.wb_locked === true && !activeV1;
+        const isGuest1 = data.wb_plug === true && !activeV1;
         const isGuest2 = data.wb2_locked === true && !activeV2;
 
         const escapeBadgeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, ch => ({
@@ -772,25 +1094,22 @@ function updateVehicleWidgets(data) {
         const updateBadges = (badges, activeV, isGuest, isWb1) => {
             badges.forEach(el => {
                 if (!el.length) return;
-                
+
                 if (data.car_force_running && isWb1) {
                     if (!el.html().includes('fa-spin')) el.html('<i class="fas fa-sync fa-spin"></i>').show();
                 } else if (isGuest && !activeV) {
                     el.html('(Gast)').css('cursor', 'default').attr('title', 'Gast-Fahrzeug lädt').show();
                 } else if (activeV) {
                     const dispName = compactVehicleName(activeV.name);
-                    let socVal = parseFloat(activeV.soc);
-                    const socKnown = vehicleSocKnown(activeV);
-                    if (isNaN(socVal)) socVal = 0;
-                    let soctxt = socKnown ? (socVal.toFixed(0) + '%') : '--';
-                    if (activeV.is_interpolated && socKnown) soctxt = 'ca. ' + soctxt;
-                    if (activeV.soc_stale && socKnown) soctxt = 'zuletzt ' + soctxt;
+                    const socInfo = vehicleSocDisplayInfo(activeV, 0);
+                    const socKnown = socInfo.known;
+                    const soctxt = socKnown ? `${socInfo.valueText} ${socInfo.qualifier}` : '--';
                     const badgeParts = [];
                     if (dispName) badgeParts.push(`<strong>${escapeBadgeHtml(dispName)}</strong>`);
                     badgeParts.push(`${escapeBadgeHtml(soctxt)} SoC`);
                     const titleParts = [];
                     if (activeV.name) titleParts.push(String(activeV.name).trim());
-                    titleParts.push(socKnown ? `${soctxt} SoC` : 'SoC nicht bestätigt');
+                    titleParts.push(socKnown ? socInfo.fullText : 'Fahrzeug-SoC nicht verfügbar');
                     if (socKnown && activeV.range_km) titleParts.push(`${activeV.range_km} km`);
                     let txt = badgeParts.join(' | ');
                     if (data.car_error && isWb1) txt += ` <i class="fas fa-exclamation-triangle text-warning ms-1" title="${escapeBadgeHtml(data.car_error)}"></i>`;
@@ -804,14 +1123,14 @@ function updateVehicleWidgets(data) {
         updateBadges(badgesWb1, activeV1, isGuest1, true);
         updateBadges(badgesWb2, activeV2, isGuest2, false);
     } else {
-        badgesWb1.forEach(el => { 
+        badgesWb1.forEach(el => {
             if (el.length) {
                 if (data.wb_soc && data.wb_soc > 0) {
                     el.html(`<strong>${data.wb_soc.toFixed(1)}%</strong> SoC`).css('cursor', 'default').attr('title', 'SoC (von Wallbox gespiegelt)').show();
                 } else {
-                    el.hide(); 
+                    el.hide();
                 }
-            } 
+            }
         });
         badgesWb2.forEach(el => { if (el.length) el.hide(); });
     }
@@ -850,6 +1169,32 @@ function initMobileFlowView() {
     setMobileFlowView(preferred);
 }
 
+function storageDispatchRuntimeForDisplay(data = {}) {
+    if (!data || typeof data !== 'object') return null;
+    const runtime = data.storage_dispatch_runtime;
+    const meta = data.storage_plan_meta;
+    const curve = Array.isArray(data.storage_sim_curve) ? data.storage_sim_curve : [];
+    if (!runtime || typeof runtime !== 'object' || runtime.schema_version !== 'storage_dispatch_runtime_v1') return null;
+    if (!meta || typeof meta !== 'object') return null;
+    const planId = typeof meta.plan_id === 'string' ? meta.plan_id : '';
+    const slotId = typeof runtime.slot_id === 'string' ? runtime.slot_id : '';
+    if (!planId || !slotId || runtime.plan_id !== planId) return null;
+    const slotMatches = curve.some(point => point && typeof point === 'object'
+        && point.plan_id === planId
+        && point.slot_id === slotId);
+    return slotMatches ? runtime : null;
+}
+
+function directMarketingSocProjectionUsable(data = {}) {
+    if (!data || typeof data !== 'object') return false;
+    const contract = data.direct_marketing_soc_projection;
+    const meta = data.storage_plan_meta;
+    if (!contract || typeof contract !== 'object' || contract.complete !== true) return false;
+    if (!meta || typeof meta !== 'object') return false;
+    const planId = typeof meta.plan_id === 'string' ? meta.plan_id : '';
+    return /^sha256:[0-9a-f]{64}$/.test(planId) && contract.plan_id === planId;
+}
+
 function cacheStorageCurveData(data) {
     if (!data || typeof data !== 'object') return;
     window._storageLiveData = data;
@@ -861,6 +1206,10 @@ function cacheStorageCurveData(data) {
     else if (!Array.isArray(window._storageSocCeilingCurve)) window._storageSocCeilingCurve = [];
     if (Array.isArray(data.storage_sim_curve)) window._storageSimCurve = data.storage_sim_curve;
     else if (!Array.isArray(window._storageSimCurve)) window._storageSimCurve = [];
+    window._storageDispatchRuntime = storageDispatchRuntimeForDisplay(data);
+    window._storageDispatchRuntimeBinding = data.storage_dispatch_runtime && typeof data.storage_dispatch_runtime === 'object'
+        ? (window._storageDispatchRuntime ? 'bound' : 'mismatch')
+        : 'missing';
     if (Array.isArray(data.storage_curve_anchors)) window._storageCurveAnchors = data.storage_curve_anchors;
     else if (!Array.isArray(window._storageCurveAnchors)) window._storageCurveAnchors = [];
     if (data.storage_plan_meta && typeof data.storage_plan_meta === 'object') window._storagePlanMeta = data.storage_plan_meta;
@@ -874,8 +1223,9 @@ function cacheStorageCurveData(data) {
     if (data.direct_marketing_daily_report && typeof data.direct_marketing_daily_report === 'object') window._directMarketingDailyReport = data.direct_marketing_daily_report;
     else if (data.storage_plan_meta && data.storage_plan_meta.direct_marketing_daily_report && typeof data.storage_plan_meta.direct_marketing_daily_report === 'object') window._directMarketingDailyReport = data.storage_plan_meta.direct_marketing_daily_report;
     else if (!window._directMarketingDailyReport) window._directMarketingDailyReport = {};
-    if (data.direct_marketing_aux_inverter_shelly && typeof data.direct_marketing_aux_inverter_shelly === 'object') window._directMarketingAuxInverterShellyState = data.direct_marketing_aux_inverter_shelly;
-    else if (data.storage_plan_meta && data.storage_plan_meta.direct_marketing_aux_inverter_shelly && typeof data.storage_plan_meta.direct_marketing_aux_inverter_shelly === 'object') window._directMarketingAuxInverterShellyState = data.storage_plan_meta.direct_marketing_aux_inverter_shelly;
+    const auxInverterState = data.direct_marketing_aux_inverter_shelly
+        || data.storage_plan_meta?.direct_marketing_aux_inverter_shelly;
+    if (auxInverterState && typeof auxInverterState === 'object') window._directMarketingAuxInverterShellyState = auxInverterState;
     else if (!window._directMarketingAuxInverterShellyState) window._directMarketingAuxInverterShellyState = {};
     if (data.market_value_solar && typeof data.market_value_solar === 'object') window._marketValueSolar = data.market_value_solar;
     else if (data.storage_plan_meta && data.storage_plan_meta.market_value_solar && typeof data.storage_plan_meta.market_value_solar === 'object') window._marketValueSolar = data.storage_plan_meta.market_value_solar;
@@ -887,6 +1237,162 @@ function cacheStorageCurveData(data) {
     }
     if (data.storage_curve_control_soc !== undefined && data.storage_curve_control_soc !== null && !isNaN(parseFloat(data.storage_curve_control_soc))) {
         window._storageControlSoc = parseFloat(data.storage_curve_control_soc);
+    }
+    renderStorageCurveSparkline(data);
+}
+
+function downsampleStorageSparkline(points, maxPoints = 48) {
+    if (!Array.isArray(points) || points.length <= maxPoints) return Array.isArray(points) ? points.slice() : [];
+    const sorted = points.slice().sort((a, b) => a.ts - b.ts);
+    const kept = [sorted[0]];
+    const interior = sorted.slice(1, -1);
+    const buckets = Math.max(1, Math.floor((maxPoints - 2) / 2));
+    const bucketSize = interior.length / buckets;
+    for (let bucket = 0; bucket < buckets; bucket += 1) {
+        const start = Math.floor(bucket * bucketSize);
+        const end = Math.max(start + 1, Math.floor((bucket + 1) * bucketSize));
+        const slice = interior.slice(start, end);
+        if (!slice.length) continue;
+        const min = slice.reduce((best, point) => point.soc < best.soc ? point : best, slice[0]);
+        const max = slice.reduce((best, point) => point.soc > best.soc ? point : best, slice[0]);
+        [min, max].sort((a, b) => a.ts - b.ts).forEach(point => {
+            if (kept[kept.length - 1].ts !== point.ts) kept.push(point);
+        });
+    }
+    kept.push(sorted[sorted.length - 1]);
+    return kept.slice(0, maxPoints);
+}
+
+function storageSparklineSeries(data = {}) {
+    const meta = data.storage_plan_meta && typeof data.storage_plan_meta === 'object'
+        ? data.storage_plan_meta
+        : {};
+    const planId = typeof meta.plan_id === 'string' ? meta.plan_id : '';
+    if (!/^sha256:[0-9a-f]{64}$/.test(planId)) return {state: 'missing_plan', planId: '', forecast: [], target: []};
+    const simCurve = Array.isArray(data.storage_sim_curve) ? data.storage_sim_curve : [];
+    if (simCurve.length < 2) return {state: 'missing_forecast', planId, forecast: [], target: []};
+    if (simCurve.some(point => !point || point.plan_id !== planId || typeof point.slot_id !== 'string' || !point.slot_id)) {
+        return {state: 'plan_mismatch', planId, forecast: [], target: []};
+    }
+    const pointsFor = key => simCurve.filter(point => point[key] !== null && point[key] !== undefined)
+        .map(point => ({
+            ts: Number(point.ts),
+            soc: Number(point[key])
+        })).filter(point => Number.isFinite(point.ts) && Number.isFinite(point.soc))
+        .map(point => ({ts: point.ts, soc: Math.max(0, Math.min(100, point.soc))}))
+        .sort((a, b) => a.ts - b.ts);
+    const directMarketing = directMarketingSocProjectionUsable(data)
+        ? pointsFor('direct_marketing_soc')
+        : [];
+    const forecast = directMarketing.length >= 2 ? directMarketing : pointsFor('soc');
+    if (forecast.length < 2) return {state: 'missing_forecast', planId, forecast: [], target: []};
+    const target = (Array.isArray(data.storage_target_curve) ? data.storage_target_curve : [])
+        .filter(point => point && (point.soc !== null && point.soc !== undefined || point.target_soc !== null && point.target_soc !== undefined))
+        .map(point => ({ts: Number(point.ts), soc: Number(point.soc ?? point.target_soc)}))
+        .filter(point => Number.isFinite(point.ts) && Number.isFinite(point.soc))
+        .map(point => ({ts: point.ts, soc: Math.max(0, Math.min(100, point.soc))}))
+        .sort((a, b) => a.ts - b.ts);
+    return {
+        state: 'bound',
+        planId,
+        source: directMarketing.length >= 2 ? 'direct_marketing_soc' : 'soc',
+        forecast: downsampleStorageSparkline(forecast),
+        target: downsampleStorageSparkline(target)
+    };
+}
+
+function storageSparklineSvgPoints(points, domain, width = 240, height = 44) {
+    if (!Array.isArray(points) || points.length < 2) return '';
+    const minTs = domain.minTs;
+    const maxTs = domain.maxTs;
+    const minSoc = domain.minSoc;
+    const maxSoc = domain.maxSoc;
+    if (!(maxTs > minTs) || !(maxSoc > minSoc)) return '';
+    return points.map(point => {
+        const x = 2 + ((point.ts - minTs) / (maxTs - minTs)) * (width - 4);
+        const y = height - 3 - ((point.soc - minSoc) / (maxSoc - minSoc)) * (height - 8);
+        return `${x.toFixed(2)},${y.toFixed(2)}`;
+    }).join(' ');
+}
+
+function renderStorageCurveSparkline(data = {}) {
+    const wrap = document.getElementById('stat-regler-sparkline');
+    const forecastLine = document.getElementById('stat-regler-sparkline-forecast');
+    const targetLine = document.getElementById('stat-regler-sparkline-target');
+    const state = document.getElementById('stat-regler-sparkline-state');
+    if (!wrap || !forecastLine || !targetLine || !state) return;
+    const clear = (curveState, text) => {
+        forecastLine.setAttribute('points', '');
+        targetLine.setAttribute('points', '');
+        wrap.dataset.state = curveState;
+        wrap.dataset.runtimeState = curveState;
+        wrap.dataset.curveSource = '';
+        wrap.removeAttribute('title');
+        state.textContent = text;
+    };
+    const meta = data.storage_plan_meta && typeof data.storage_plan_meta === 'object' ? data.storage_plan_meta : {};
+    let planTs = Number(meta.generated_at_ts ?? meta.ts ?? data.storage_plan_ts ?? 0);
+    if (planTs > 1e12) planTs /= 1000;
+    const stale = data.storage_plan_stale === true || meta.stale === true || meta.fresh === false
+        || (planTs > 0 && Date.now() / 1000 - planTs > 1800);
+    if (stale) {
+        clear('stale', 'SoC-Prognose veraltet');
+        return;
+    }
+    const series = storageSparklineSeries(data);
+    if (series.state !== 'bound') {
+        clear(series.state === 'plan_mismatch' ? 'mismatch' : 'missing', series.state === 'plan_mismatch'
+            ? 'Planrevision passt nicht'
+            : 'Keine SoC-Prognose');
+        return;
+    }
+    const domainPoints = series.forecast.concat(series.target);
+    const minTs = series.forecast[0].ts;
+    const maxTs = series.forecast[series.forecast.length - 1].ts;
+    let minSoc = Math.min(...domainPoints.map(point => point.soc));
+    let maxSoc = Math.max(...domainPoints.map(point => point.soc));
+    const minSpan = 12;
+    if (maxSoc - minSoc < minSpan) {
+        const center = (minSoc + maxSoc) / 2;
+        minSoc = Math.max(0, center - minSpan / 2);
+        maxSoc = Math.min(100, minSoc + minSpan);
+        minSoc = Math.max(0, maxSoc - minSpan);
+    } else {
+        const pad = Math.min(4, (maxSoc - minSoc) * 0.08);
+        minSoc = Math.max(0, minSoc - pad);
+        maxSoc = Math.min(100, maxSoc + pad);
+    }
+    const domain = {minTs, maxTs, minSoc, maxSoc};
+    forecastLine.setAttribute('points', storageSparklineSvgPoints(series.forecast, domain));
+    targetLine.setAttribute('points', storageSparklineSvgPoints(
+        series.target.filter(point => point.ts >= minTs && point.ts <= maxTs),
+        domain
+    ));
+    wrap.dataset.state = 'fresh';
+    wrap.dataset.curveSource = series.source;
+    const runtime = storageDispatchRuntimeForDisplay(data);
+    const runtimePresent = data.storage_dispatch_runtime && typeof data.storage_dispatch_runtime === 'object';
+    const sourceLabel = series.source === 'direct_marketing_soc' ? 'SoC-Prognose nach DV-Plan' : 'SoC-Prognose';
+    if (runtime) {
+        const commandsAllowed = runtime.selected === true
+            && runtime.executable === true
+            && runtime.commands_allowed === true;
+        const budgetW = Math.max(0, Number(runtime.charge_budget_w) || 0, Number(runtime.export_budget_w) || 0);
+        wrap.dataset.runtimeState = commandsAllowed ? 'allowed' : 'blocked';
+        state.textContent = commandsAllowed ? `${sourceLabel} · aktiv` : `${sourceLabel} · gebunden`;
+        const owner = typeof runtime.owner === 'string' && runtime.owner ? runtime.owner : 'unbekannt';
+        const detail = commandsAllowed
+            ? `Ausführung freigegeben${budgetW > 0 ? ` · Budget ${Math.round(budgetW).toLocaleString('de-DE')} W` : ''}`
+            : `Ausführung gesperrt${runtime.block_reason_code ? ` · ${runtime.block_reason_code}` : ''}`;
+        wrap.title = `${sourceLabel} aus ${series.planId} · Sollkurve gestrichelt · Owner ${owner} · ${detail}`;
+    } else if (runtimePresent) {
+        wrap.dataset.runtimeState = 'mismatch';
+        wrap.title = `${sourceLabel} aus ${series.planId}; Runtime nicht an diese Planrevision gebunden.`;
+        state.textContent = `${sourceLabel} · Runtime ungebunden`;
+    } else {
+        wrap.dataset.runtimeState = 'missing';
+        wrap.title = `${sourceLabel} aus ${series.planId}; Sollkurve gestrichelt.`;
+        state.textContent = sourceLabel;
     }
 }
 
@@ -1020,6 +1526,12 @@ function setRingRow(id, text, visible = true, muted = false) {
     if (span) span.textContent = text;
 }
 
+function placeRingRow(rowId, listId) {
+    const row = document.getElementById(rowId);
+    const list = document.getElementById(listId);
+    if (row && list && row.parentElement !== list) list.appendChild(row);
+}
+
 function pickMobileRingVehicle(data) {
     const vehicles = Array.isArray(data && data.vehicles) ? data.vehicles : [];
     if (vehicles.length === 0) return null;
@@ -1074,11 +1586,13 @@ function updateMobileRingFlow(data, values) {
     const gridRow = document.getElementById('m-ring-grid-row');
     const gridIcon = document.getElementById('m-ring-grid-icon');
     if (exportW > 20) {
+        placeRingRow('m-ring-grid-row', 'm-ring-output-list');
         if (gridRow) { gridRow.classList.add('export'); gridRow.classList.remove('import'); }
         if (gridIcon) gridIcon.className = 'fas fa-arrow-right';
         setRingText('m-ring-grid-text', 'Einspeisung ' + formatRingPower(exportW));
         if (gridRow) gridRow.style.display = '';
     } else if (importW > 20) {
+        placeRingRow('m-ring-grid-row', 'm-ring-input-list');
         if (gridRow) { gridRow.classList.add('import'); gridRow.classList.remove('export'); }
         if (gridIcon) gridIcon.className = 'fas fa-plug';
         setRingText('m-ring-grid-text', 'Bezug ' + formatRingPower(importW));
@@ -1093,10 +1607,12 @@ function updateMobileRingFlow(data, values) {
     const batRow = document.getElementById('m-ring-bat-row');
     const batIcon = document.getElementById('m-ring-bat-icon');
     if (bat > 50) {
+        placeRingRow('m-ring-bat-row', 'm-ring-output-list');
         if (batRow) { batRow.classList.add('charge'); batRow.classList.remove('discharge'); }
         if (batIcon) batIcon.className = 'fas fa-arrow-right-to-bracket';
         setRingRow('m-ring-bat-row', 'in Speicher ' + formatRingPower(bat), true);
     } else if (bat < -50) {
+        placeRingRow('m-ring-bat-row', 'm-ring-input-list');
         if (batRow) { batRow.classList.add('discharge'); batRow.classList.remove('charge'); }
         if (batIcon) batIcon.className = 'fas fa-arrow-right-from-bracket';
         setRingRow('m-ring-bat-row', 'aus Speicher ' + formatRingPower(bat), true);
@@ -1105,7 +1621,7 @@ function updateMobileRingFlow(data, values) {
         if (batIcon) batIcon.className = 'fas fa-car-battery';
         setRingRow('m-ring-bat-row', 'Speicher ruht', false, true);
     }
-    setRingRow('m-ring-home-row', formatRingPower(home), true, home < 20);
+    setRingRow('m-ring-home-row', 'Haus ' + formatRingPower(home), home > 20);
     setRingRow('m-ring-wp-row', 'WP ' + formatRingPower(wpTotal), wpTotal > 20);
     setRingRow('m-ring-climate-row', 'Klima ' + formatRingPower(climate), climate > 20);
     setRingRow('m-ring-wb-row', 'WB1 ' + formatRingPower(wb), wb > 50);
@@ -1347,10 +1863,10 @@ function directMarketingBlockerLabel(reason) {
         window_observe_only: 'nur Beobachtung',
         export_not_enabled: 'Einspeisung aus',
         grid_charge_not_enabled: 'Netzladen aus',
-        arbitrage_disabled: 'Arbitrage gesperrt',
+        arbitrage_experimental_disabled: 'Arbitrage gesperrt',
         profit_below_threshold: 'Marge zu klein',
-        pv_shift_below_threshold_for_export: 'PV-Marge zu klein',
-        pv_shift_below_threshold_for_pv_store: 'PV-Speicher-Marge zu klein',
+        pv_shift_below_threshold_for_export: 'PV-Verschiebespread unter Freigabeschwelle',
+        pv_shift_below_threshold_for_pv_store: 'PV-Speicher-Spread unter Freigabeschwelle',
         low_price_headroom: 'Speicherplatz vor PV-Speichern',
         negative_price_headroom: 'Speicherplatz vor Negativpreis',
         pv_store_headroom_prioritized: 'Speicherplatz für PV-Speichern priorisiert',
@@ -1377,9 +1893,80 @@ function directMarketingBlockerLabel(reason) {
         contract_version_mismatch: 'Vertrag-Version falsch',
         mode_mismatch: 'Modus passt nicht'
     };
+    if (normalized.startsWith('blocked by margin:')) {
+        const match = normalized.match(/expected\s+profit\s+(-?\d+(?:\.\d+)?)\s+eur\s*<\s*threshold\s+(-?\d+(?:\.\d+)?)\s+eur/);
+        const threshold = match ? parseFloat(match[2]) : NaN;
+        return Number.isFinite(threshold)
+            ? 'Mindestgewinn knapp nicht erreicht: erwarteter Gewinn unter ' + threshold.toLocaleString('de-DE', {minimumFractionDigits: 2, maximumFractionDigits: 2}) + ' €'
+            : 'Mindestgewinn knapp nicht erreicht';
+    }
+    if (normalized === 'economic_export_window_profit_below_user_minimum') return 'Mindestgewinn knapp nicht erreicht';
+    if (normalized === 'economic_export_policy_not_executable') return 'Verkaufsregel aktuell nicht ausführbar';
+    if (normalized === 'policy_contract_blocked') return 'Ausführungsvertrag nicht freigegeben';
     if (normalized.startsWith('price_quality_blocked:')) return 'Preisqualität blockiert';
     if (normalized.startsWith('live_values_missing:')) return 'Live-Messwert fehlt';
     return labels[normalized] || 'Unbekannter Begrenzungsgrund';
+}
+
+function directMarketingProjectedReasonLabel(entry) {
+    if (entry && typeof entry === 'object') {
+        const code = String(entry.code || '');
+        if (code.toLowerCase() === 'economic_export_window_profit_below_user_minimum') {
+            const threshold = parseFloat(entry.minimum_profit_eur);
+            return Number.isFinite(threshold)
+                ? 'Mindestgewinn knapp nicht erreicht: erwarteter Gewinn unter ' + threshold.toLocaleString('de-DE', {minimumFractionDigits: 2, maximumFractionDigits: 2}) + ' €'
+                : 'Mindestgewinn knapp nicht erreicht';
+        }
+        return directMarketingBlockerLabel(code);
+    }
+    return directMarketingBlockerLabel(entry);
+}
+
+function directMarketingReasonGroups(monitor) {
+    monitor = monitor && typeof monitor === 'object' ? monitor : {};
+    const typed = ['global_gate_blockers', 'candidate_rejections', 'allocation_diagnostics']
+        .some(key => Array.isArray(monitor[key]));
+    if (typed) {
+        return {
+            blockers: (monitor.global_gate_blockers || []).map(directMarketingProjectedReasonLabel),
+            candidates: (monitor.candidate_rejections || []).map(directMarketingProjectedReasonLabel),
+            diagnostics: (monitor.allocation_diagnostics || []).map(directMarketingProjectedReasonLabel)
+        };
+    }
+    const diagnostics = new Set(['export_energy_prioritized', 'pv_store_energy_budget_prioritized']);
+    const groups = {blockers: [], candidates: [], diagnostics: []};
+    (Array.isArray(monitor.blocked_reasons) ? monitor.blocked_reasons : []).forEach(reason => {
+        const normalized = String(reason || '').toLowerCase();
+        if (diagnostics.has(normalized)) groups.diagnostics.push(directMarketingBlockerLabel(reason));
+        else if (normalized.startsWith('blocked by margin:') || normalized === 'profit_below_threshold') groups.candidates.push(directMarketingBlockerLabel(reason));
+        else groups.blockers.push(directMarketingBlockerLabel(reason));
+    });
+    return groups;
+}
+
+function directMarketingSelectedExportKwh(plan) {
+    plan = plan && typeof plan === 'object' ? plan : {};
+    const decisions = [];
+    if (plan.policy_decision && typeof plan.policy_decision === 'object') decisions.push(plan.policy_decision);
+    if (Array.isArray(plan.policy_timeline)) decisions.push(...plan.policy_timeline);
+    const seen = new Set();
+    let energyWh = 0;
+    decisions.forEach(decision => {
+        if (!decision || typeof decision !== 'object' || decision.commands_allowed !== true) return;
+        const selected = decision.selected_window && typeof decision.selected_window === 'object' ? decision.selected_window : null;
+        const execution = decision.execution_window && typeof decision.execution_window === 'object' ? decision.execution_window : null;
+        if (!selected || !execution) return;
+        const action = String(selected.action || execution.action || '').toLowerCase();
+        if (!['eco_plus_export_candidate', 'arbitrage_export_candidate'].includes(action)) return;
+        const start = parseFloat(execution.start_ts || selected.start_ts || decision.start_ts || 0);
+        const end = parseFloat(execution.end_ts || selected.end_ts || decision.end_ts || 0);
+        const powerW = Math.max(0, parseFloat((decision.storage_budget || {}).export_budget_w ?? execution.max_power_w ?? selected.max_power_w ?? 0) || 0);
+        const key = [decision.slot_id || '', selected.window_id || selected.market_window_id || '', start, end, powerW].join('|');
+        if (seen.has(key) || !(end > start) || powerW <= 0) return;
+        seen.add(key);
+        energyWh += powerW * ((end - start) / 3600000);
+    });
+    return energyWh > 0 ? energyWh / 1000 : 0;
 }
 
 function directMarketingBlockerSummary(reasons, limit = 2) {
@@ -1399,6 +1986,81 @@ function directMarketingProfitText(value) {
     if (!Number.isFinite(n)) return '';
     const prefix = n >= 0 ? '+' : '';
     return prefix + n.toFixed(2).replace('.', ',') + ' ct/kWh';
+}
+
+function directMarketingSalesWindowContract(monitor, plan) {
+    monitor = monitor && typeof monitor === 'object' ? monitor : {};
+    plan = plan && typeof plan === 'object' ? plan : {};
+    const policy = plan.policy_decision && typeof plan.policy_decision === 'object'
+        ? plan.policy_decision
+        : {};
+    const selected = policy.selected_window && typeof policy.selected_window === 'object'
+        ? policy.selected_window
+        : {};
+    const action = String(monitor.current_action || selected.action || '').toLowerCase();
+    const candidate = action === 'eco_plus_export_candidate' || action === 'arbitrage_export_candidate';
+    const targetState = String(monitor.policy_target_state || policy.dv_target_state || '').toUpperCase();
+    const commandsAllowed = monitor.commands_allowed === true || policy.commands_allowed === true;
+    const selectedForExecution = monitor.selected === true || Object.keys(selected).length > 0;
+    const executionWindow = policy.execution_window && typeof policy.execution_window === 'object'
+        ? policy.execution_window
+        : null;
+    const executable = monitor.executable === true || executionWindow !== null;
+    const storageBudget = policy.storage_budget && typeof policy.storage_budget === 'object'
+        ? policy.storage_budget
+        : {};
+    const exportBudgetW = Math.max(0, parseFloat(
+        monitor.policy_export_budget_w != null
+            ? monitor.policy_export_budget_w
+            : storageBudget.export_budget_w
+    ) || 0);
+    return {
+        action,
+        candidate,
+        selected: selectedForExecution,
+        executable,
+        targetState,
+        commandsAllowed,
+        exportBudgetW,
+        active: candidate
+            && selectedForExecution
+            && executable
+            && targetState === 'FORCE_EXPORT'
+            && commandsAllowed
+            && exportBudgetW > 0
+    };
+}
+
+function directMarketingMarginGateText(monitor, plan, action = '') {
+    monitor = monitor && typeof monitor === 'object' ? monitor : {};
+    plan = plan && typeof plan === 'object' ? plan : {};
+    const policy = plan.policy_decision && typeof plan.policy_decision === 'object'
+        ? plan.policy_decision
+        : {};
+    const policyEconomics = policy.economics && typeof policy.economics === 'object'
+        ? policy.economics
+        : {};
+    const economics = Object.keys(policyEconomics).length
+        ? policyEconomics
+        : ((monitor.economics && typeof monitor.economics === 'object')
+            ? monitor.economics
+            : ((plan.economics && typeof plan.economics === 'object') ? plan.economics : {}));
+    const normalized = String(action || monitor.current_action || '').toLowerCase();
+    const marginRaw = economics.margin_ct_kwh != null
+        ? economics.margin_ct_kwh
+        : directMarketingSpreadForAction(normalized, economics);
+    const minimumRaw = economics.user_min_margin_ct != null
+        ? economics.user_min_margin_ct
+        : economics.min_profit_ct_per_kwh;
+    const margin = parseFloat(marginRaw);
+    const minimum = parseFloat(minimumRaw);
+    if (!Number.isFinite(margin)) return '';
+    const parts = ['Entscheidungsmarge ' + directMarketingProfitText(margin)];
+    if (Number.isFinite(minimum)) {
+        parts.push('Mindestmarge ' + directMarketingProfitText(minimum));
+        parts.push('Fehlbetrag ' + directMarketingProfitText(Math.max(0, minimum - margin)));
+    }
+    return parts.join(' | ');
 }
 
 function directMarketingKwhText(value) {
@@ -1443,10 +2105,15 @@ function directMarketingReasonLabel(reason) {
     return labels[normalized] || normalized.replace(/_/g, ' ');
 }
 
-function directMarketingWindowVisual(action) {
+function directMarketingWindowVisual(action, executionContract = null) {
     const normalized = String(action || '').toLowerCase();
+    if (normalized === 'negative_price_market_window') {
+        return {label: 'Negativpreis-Marktfenster', icon: 'fa-chart-line', color: '#0ea5e9'};
+    }
     if (normalized === 'eco_plus_export_candidate' || normalized === 'arbitrage_export_candidate') {
-        return {label: 'Verkaufsfenster', icon: 'fa-arrow-up', color: '#22c55e'};
+        return executionContract && executionContract.active
+            ? {label: 'Verkaufsfenster', icon: 'fa-arrow-up', color: '#22c55e'}
+            : {label: 'Verkaufskandidat', icon: 'fa-search', color: '#94a3b8'};
     }
     if (normalized === 'arbitrage_grid_charge_candidate') {
         return {label: 'Netzladefenster', icon: 'fa-plug', color: '#38bdf8'};
@@ -1478,12 +2145,230 @@ function directMarketingSpreadForAction(action, economics) {
     return null;
 }
 
-function directMarketingWindowKey(windowEntry) {
+function directMarketingSpreadLabelForAction(action) {
+    const normalized = String(action || '').toLowerCase();
+    if (normalized === 'eco_plus_export_candidate' || normalized === 'eco_plus_store_pv_candidate') {
+        return 'PV-Verschiebespread';
+    }
+    if (normalized === 'arbitrage_grid_charge_candidate' || normalized === 'arbitrage_export_candidate') {
+        return 'Netz-Verschiebespread';
+    }
+    return 'Verschiebespread';
+}
+
+function directMarketingWindowExecutionContract(windowEntry, monitor, plan) {
+    windowEntry = windowEntry && typeof windowEntry === 'object' ? windowEntry : {};
+    monitor = monitor && typeof monitor === 'object' ? monitor : {};
+    plan = plan && typeof plan === 'object' ? plan : {};
+    const action = String(windowEntry.action || '').toLowerCase();
+    const marketOnly = action === 'negative_price_market_window' || windowEntry.market_window_only === true;
+    if (marketOnly) {
+        return {
+            action,
+            selected: false,
+            executable: false,
+            commandsAllowed: false,
+            targetState: 'MARKET_WINDOW_ONLY',
+            exportBudgetW: 0,
+            chargeBudgetW: 0,
+            active: false,
+            candidateOnly: false,
+            marketOnly: true,
+            blockReason: ''
+        };
+    }
+    const start = parseFloat(windowEntry.start_ts || 0) || 0;
+    const end = parseFloat(windowEntry.end_ts || 0) || 0;
+    const decisions = [];
+    if (plan.policy_decision && typeof plan.policy_decision === 'object') decisions.push(plan.policy_decision);
+    if (Array.isArray(plan.policy_timeline)) decisions.push(...plan.policy_timeline.filter(item => item && typeof item === 'object'));
+
+    const overlaps = (leftStart, leftEnd, rightStart, rightEnd) => (
+        leftStart > 0 && leftEnd > leftStart && rightStart > 0 && rightEnd > rightStart
+            ? leftStart < rightEnd && leftEnd > rightStart
+            : true
+    );
+    const decision = decisions.find(item => {
+        const selected = item.selected_window && typeof item.selected_window === 'object'
+            ? item.selected_window
+            : {};
+        if (String(selected.action || '').toLowerCase() !== action) return false;
+        const selectedStart = parseFloat(selected.start_ts || item.start_ts || 0) || 0;
+        const selectedEnd = parseFloat(selected.end_ts || item.end_ts || 0) || 0;
+        return overlaps(start, end, selectedStart, selectedEnd);
+    }) || null;
+    const selectedWindow = decision && decision.selected_window && typeof decision.selected_window === 'object'
+        ? decision.selected_window
+        : {};
+    const executionWindow = decision && decision.execution_window && typeof decision.execution_window === 'object'
+        ? decision.execution_window
+        : null;
+    const targetState = String((decision && decision.dv_target_state) || '').toUpperCase();
+    const storageBudget = decision && decision.storage_budget && typeof decision.storage_budget === 'object'
+        ? decision.storage_budget
+        : {};
+    const exportBudgetW = Math.max(0, parseFloat(storageBudget.export_budget_w) || 0);
+    const chargeBudgetW = Math.max(0, parseFloat(storageBudget.charge_budget_w) || 0);
+    const selected = Boolean(decision && Object.keys(selectedWindow).length);
+    const executable = Boolean(executionWindow);
+    const commandsAllowed = Boolean(decision && decision.commands_allowed === true);
+    const isExport = action === 'eco_plus_export_candidate' || action === 'arbitrage_export_candidate';
+    const isPvStore = action === 'eco_plus_store_pv_candidate';
+    const isHeadroom = action === 'eco_plus_negative_headroom_hold'
+        || action === 'keep_headroom'
+        || action === 'arbitrage_keep_headroom';
+    const active = selected && executable && commandsAllowed && (
+        (isExport && targetState === 'FORCE_EXPORT' && exportBudgetW > 0)
+        || (isPvStore && targetState === 'FORCE_CHARGE_PV' && chargeBudgetW > 0)
+        || (isHeadroom && targetState === 'HEADROOM_EXPORT' && exportBudgetW > 0)
+    );
+    const candidateOnly = (isExport || isPvStore || isHeadroom) && !active;
+    const blockReason = String(
+        (decision && (decision.block_reason_code || decision.block_reason))
+        || (monitor && (monitor.block_reason_code || monitor.block_reason))
+        || (candidateOnly ? 'nicht zur Ausführung freigegeben' : '')
+    );
+    return {
+        action,
+        selected,
+        executable,
+        commandsAllowed,
+        targetState,
+        exportBudgetW,
+        chargeBudgetW,
+        active,
+        candidateOnly,
+        blockReason
+    };
+}
+
+function directMarketingWindowCanonicalBinding(windowEntry, monitor = null, plan = null) {
+    windowEntry = windowEntry && typeof windowEntry === 'object' ? windowEntry : {};
+    monitor = monitor && typeof monitor === 'object' ? monitor : {};
+    plan = plan && typeof plan === 'object' ? plan : {};
+    const action = String(windowEntry.action || '').toLowerCase();
+    const entryStart = parseFloat(windowEntry.start_ts || 0) || 0;
+    const entryEnd = parseFloat(windowEntry.end_ts || 0) || 0;
+    const validBounds = (start, end) => Number.isFinite(start) && Number.isFinite(end) && start > 0 && end > start;
+    const ownId = String(windowEntry.window_id || windowEntry.export_plateau_id || '');
+    const ownStart = parseFloat(
+        windowEntry.source_window_start_ts
+        || windowEntry.export_plateau_origin_start_ts
+        || 0
+    ) || 0;
+    const ownEnd = parseFloat(
+        windowEntry.source_window_end_ts
+        || windowEntry.export_plateau_end_ts
+        || 0
+    ) || 0;
+    if (ownId || validBounds(ownStart, ownEnd)) {
+        return {
+            id: ownId,
+            sourceStart: validBounds(ownStart, ownEnd) ? ownStart : entryStart,
+            sourceEnd: validBounds(ownStart, ownEnd) ? ownEnd : entryEnd,
+            contract: windowEntry
+        };
+    }
+
+    const gate = monitor.policy_executor_gate && typeof monitor.policy_executor_gate === 'object'
+        ? monitor.policy_executor_gate
+        : {};
+    const gateWindow = gate.plan_window && typeof gate.plan_window === 'object' ? gate.plan_window : {};
+    const gateExecution = gate.execution_window && typeof gate.execution_window === 'object' ? gate.execution_window : {};
+    const gateSelected = gate.selected_window && typeof gate.selected_window === 'object' ? gate.selected_window : {};
+    const gateAction = String(gateWindow.action || gateExecution.action || gateSelected.action || '').toLowerCase();
+    const gateStart = parseFloat(
+        gateWindow.source_window_start_ts
+        || gateExecution.plan_window_start_ts
+        || gateWindow.export_plateau_origin_start_ts
+        || 0
+    ) || 0;
+    const gateEnd = parseFloat(
+        gateWindow.source_window_end_ts
+        || gateExecution.plan_window_end_ts
+        || gateWindow.export_plateau_end_ts
+        || 0
+    ) || 0;
+    const gateId = String(
+        gateWindow.window_id
+        || gateWindow.export_plateau_id
+        || gateExecution.window_id
+        || gateSelected.window_id
+        || ''
+    );
+    if (
+        gate.allowed === true
+        && action
+        && action === gateAction
+        && validBounds(gateStart, gateEnd)
+        && validBounds(entryStart, entryEnd)
+        && gateStart <= entryStart
+        && entryEnd <= gateEnd
+    ) {
+        return {id: gateId, sourceStart: gateStart, sourceEnd: gateEnd, contract: gateWindow};
+    }
+
+    const planWindows = Array.isArray(plan.windows) ? plan.windows : [];
+    const exactMatches = planWindows.filter(candidate => {
+        if (!candidate || typeof candidate !== 'object') return false;
+        if (String(candidate.action || '').toLowerCase() !== action) return false;
+        const start = parseFloat(candidate.source_window_start_ts || candidate.start_ts || 0) || 0;
+        const end = parseFloat(candidate.source_window_end_ts || candidate.end_ts || 0) || 0;
+        return validBounds(start, end) && start === entryStart && end === entryEnd;
+    });
+    if (exactMatches.length === 1) {
+        const candidate = exactMatches[0];
+        return {
+            id: String(candidate.window_id || candidate.export_plateau_id || ''),
+            sourceStart: parseFloat(candidate.source_window_start_ts || candidate.start_ts || 0) || entryStart,
+            sourceEnd: parseFloat(candidate.source_window_end_ts || candidate.end_ts || 0) || entryEnd,
+            contract: candidate
+        };
+    }
+    return {id: '', sourceStart: entryStart, sourceEnd: entryEnd, contract: windowEntry};
+}
+
+function directMarketingWindowContractKey(windowEntry, binding = null, monitor = null, plan = null) {
+    windowEntry = windowEntry && typeof windowEntry === 'object' ? windowEntry : {};
+    binding = binding && typeof binding === 'object' ? binding : {};
+    const contract = binding.contract && typeof binding.contract === 'object' ? binding.contract : windowEntry;
+    monitor = monitor && typeof monitor === 'object' ? monitor : {};
+    plan = plan && typeof plan === 'object' ? plan : {};
+    const value = field => contract[field] ?? windowEntry[field] ?? '';
+    return JSON.stringify([
+        value('export_segment_id'),
+        value('export_segment_budget_source'),
+        value('export_segment_budget_wh'),
+        value('export_segment_load_reserve_wh'),
+        value('export_segment_selected_wh'),
+        value('profit_contract_id'),
+        value('profit_contract_version'),
+        value('expected_profit_ct_per_kwh'),
+        value('net_sell_ct'),
+        value('avg_market_ct'),
+        value('avg_billing_ct'),
+        value('execution_contract_id'),
+        value('execution_contract_version'),
+        value('owner_contract_version'),
+        String(plan.controller_owner || monitor.controller_owner || ''),
+        String(plan.plan_owner || monitor.plan_owner || '')
+    ]);
+}
+
+function directMarketingWindowKey(windowEntry, binding = null, monitor = null, plan = null) {
     if (!windowEntry || typeof windowEntry !== 'object') return '';
+    binding = binding && typeof binding === 'object'
+        ? binding
+        : directMarketingWindowCanonicalBinding(windowEntry, monitor, plan);
+    const semanticIdentity = binding.id
+        ? 'id:' + String(binding.id)
+        : ((binding.sourceStart > 0 && binding.sourceEnd > binding.sourceStart)
+            ? 'source:' + String(binding.sourceStart) + ':' + String(binding.sourceEnd)
+            : 'slice:' + String(windowEntry.start_ts || windowEntry.start_t || '') + ':' + String(windowEntry.end_ts || windowEntry.end_t || ''));
     return [
-        String(windowEntry.action || 'unknown'),
-        String(windowEntry.start_ts || windowEntry.start_t || ''),
-        String(windowEntry.end_ts || windowEntry.end_t || '')
+        String(windowEntry.action || 'unknown').toLowerCase(),
+        semanticIdentity,
+        directMarketingWindowContractKey(windowEntry, binding, monitor, plan)
     ].join(':');
 }
 
@@ -1491,13 +2376,43 @@ function collectDirectMarketingWindows(report, monitor, plan) {
     const merged = new Map();
     const addOne = (windowEntry, source) => {
         if (!windowEntry || typeof windowEntry !== 'object') return;
-        const key = directMarketingWindowKey(windowEntry);
-        if (!key) return;
+        const binding = directMarketingWindowCanonicalBinding(windowEntry, monitor, plan);
+        const baseKey = directMarketingWindowKey(windowEntry, binding, monitor, plan);
+        if (!baseKey) return;
+        let key = baseKey;
+        const previous = merged.get(baseKey);
+        if (previous && binding.id) {
+            const previousStart = parseFloat(previous._source_window_start_ts || previous.start_ts || 0) || 0;
+            const previousEnd = parseFloat(previous._source_window_end_ts || previous.end_ts || 0) || 0;
+            const overlaps = previousStart > 0 && previousEnd > previousStart
+                && binding.sourceStart > 0 && binding.sourceEnd > binding.sourceStart
+                && previousStart < binding.sourceEnd && binding.sourceStart < previousEnd;
+            if (!overlaps) key += ':disjoint:' + String(binding.sourceStart) + ':' + String(binding.sourceEnd);
+        }
         const current = merged.get(key) || {_source: source};
+        const wasCurrent = current.current === true;
+        const entryStart = parseFloat(windowEntry.start_ts || 0) || 0;
+        const entryEnd = parseFloat(windowEntry.end_ts || 0) || 0;
         Object.entries(windowEntry).forEach(([field, value]) => {
             if (value !== undefined && value !== null && value !== '') current[field] = value;
         });
-        if (windowEntry.current === true) current.current = true;
+        if (binding.id) current._canonical_window_id = binding.id;
+        if (binding.sourceStart > 0 && binding.sourceEnd > binding.sourceStart) {
+            if (windowEntry.current === true && (entryStart !== binding.sourceStart || entryEnd !== binding.sourceEnd)) {
+                current._current_slice_start_ts = entryStart;
+                current._current_slice_end_ts = entryEnd;
+            }
+            current.start_ts = binding.sourceStart;
+            current.end_ts = binding.sourceEnd;
+            current._source_window_start_ts = binding.sourceStart;
+            current._source_window_end_ts = binding.sourceEnd;
+            const canonical = binding.contract && typeof binding.contract === 'object' ? binding.contract : {};
+            if (canonical.start_t) current.start_t = canonical.start_t;
+            if (canonical.end_t) current.end_t = canonical.end_t;
+            if (!current.start_t) current.start_t = mobileStorageTime(binding.sourceStart);
+            if (!current.end_t) current.end_t = mobileStorageTime(binding.sourceEnd);
+        }
+        if (wasCurrent || windowEntry.current === true) current.current = true;
         if (!current._source) current._source = source;
         merged.set(key, current);
     };
@@ -1510,7 +2425,10 @@ function collectDirectMarketingWindows(report, monitor, plan) {
         addOne(monitor.current_window, 'monitor');
         addMany(monitor.upcoming_windows, 'monitor');
     }
-    if (plan && typeof plan === 'object') addMany(plan.windows, 'plan');
+    if (plan && typeof plan === 'object') {
+        addMany(plan.market_windows, 'market');
+        addMany(plan.windows, 'plan');
+    }
     if (!merged.size && report && typeof report === 'object') addMany(report.windows, 'report');
 
     return Array.from(merged.values()).sort((a, b) => {
@@ -1542,12 +2460,17 @@ function directMarketingWindowDurationH(windowEntry) {
 }
 
 function directMarketingWindowDisplayKwh(windowEntry) {
+    const selectedWh = parseFloat(windowEntry && windowEntry.export_segment_selected_wh);
     const raw = parseFloat(windowEntry && windowEntry.theoretical_kwh);
     const power = parseFloat(windowEntry && windowEntry.max_power_w);
     const durationH = directMarketingWindowDurationH(windowEntry);
     const powerKwh = Number.isFinite(power) && power > 0 && Number.isFinite(durationH) && durationH > 0
         ? (power * durationH) / 1000
         : null;
+    if (Number.isFinite(selectedWh) && selectedWh > 0) {
+        const selectedKwh = selectedWh / 1000;
+        return powerKwh !== null ? Math.min(selectedKwh, powerKwh) : selectedKwh;
+    }
     if (Number.isFinite(raw) && raw > 0) {
         if (powerKwh !== null && raw > powerKwh + 0.05) return powerKwh;
         return raw;
@@ -1591,29 +2514,51 @@ function directMarketingSegmentBudgetText(windowEntry) {
     return '';
 }
 
-function directMarketingWindowRowHtml(windowEntry, economics) {
-    const visual = directMarketingWindowVisual(windowEntry.action);
+function directMarketingWindowRowHtml(windowEntry, economics, executionContract = null) {
+    executionContract = executionContract || {};
+    const visual = directMarketingWindowVisual(windowEntry.action, executionContract);
     const start = windowEntry.start_t || mobileStorageTime(windowEntry.start_ts);
     const end = windowEntry.end_t || mobileStorageTime(windowEntry.end_ts);
     const action = directMarketingActionLabel(windowEntry.action);
     const price = directMarketingPriceText(windowEntry);
     const energy = directMarketingEnergyText(windowEntry);
     const spread = directMarketingProfitText(directMarketingSpreadForAction(windowEntry.action, economics));
+    const spreadLabel = directMarketingSpreadLabelForAction(windowEntry.action);
     const reason = directMarketingReasonLabel(windowEntry.reason);
     const budget = directMarketingSegmentBudgetText(windowEntry);
-    const exportConstraint = windowEntry.hard_export_limit_active || windowEntry.export_constraint_class === 'negative_hard'
-        ? `Negativpreis hart | Exportlimit ${Math.max(0, parseInt(windowEntry.hard_export_limit_w ?? windowEntry.curtail_export_limit_w ?? 0, 10) || 0).toLocaleString('de-DE')} W angefordert`
+    const marginClass = String(windowEntry.margin_class || windowEntry.market_window_margin_class || '');
+    const marginSummary = executionContract.marketOnly
+        ? (marginClass === 'mixed'
+            ? `gemischter Netto-Grenzerlös: ${parseInt(windowEntry.positive_margin_slot_count || 0, 10)} Slot(s) positiv, ${parseInt(windowEntry.nonpositive_margin_slot_count || 0, 10)} nicht positiv`
+            : (marginClass === 'positive'
+                ? 'Netto-Grenzerlös in allen Slots positiv: Einspeisung wirtschaftlich zulässig'
+                : (marginClass === 'nonpositive'
+                    ? 'Netto-Grenzerlös nicht positiv: Einspeisung begrenzen'
+                    : (marginClass.includes('invalid') ? 'Abrechnungsvertrag unvollständig: Einspeisung fail-closed begrenzen' : ''))))
+        : '';
+    const exportConstraint = windowEntry.hard_export_limit_active
+        || windowEntry.export_constraint_class === 'negative_hard'
+        || windowEntry.export_constraint_class === 'negative_net_revenue_hard'
+        || windowEntry.export_constraint_class === 'negative_margin_invalid_hard'
+        ? `Netto-Grenzerlös nicht positiv/ungültig | Exportlimit ${Math.max(0, parseInt(windowEntry.hard_export_limit_w ?? windowEntry.curtail_export_limit_w ?? 0, 10) || 0).toLocaleString('de-DE')} W angefordert`
         : (windowEntry.export_constraint_class === 'eeg_soft' || windowEntry.pv_store_price_class === 'eeg_soft' || windowEntry.pv_store_soft_threshold
             ? 'EEG-Schwelle weich | Einspeisung zulässig'
             : '');
-    const detailParts = [price, energy, spread ? 'Marge ' + spread : '', reason, exportConstraint, budget].filter(Boolean);
+    const executionState = executionContract.marketOnly
+        ? 'reines Marktfenster; PV_STORE und Exportfreigabe werden getrennt geplant'
+        : executionContract.active
+        ? 'zur Ausführung freigegeben'
+        : (executionContract.candidateOnly ? 'nicht freigegeben: ' + (executionContract.blockReason || 'keine ausführbare Planbindung') : '');
+    const detailParts = [price, energy, marginSummary, spread ? spreadLabel + ' ' + spread : '', reason, exportConstraint, budget, executionState].filter(Boolean);
     const titleParts = [
         visual.label + ': ' + (start || '--') + ' bis ' + (end || '--'),
         action,
         ...detailParts
     ].filter(Boolean);
     const currentBadge = windowEntry.current === true
-        ? '<span class="badge bg-success bg-opacity-10 text-success border border-success border-opacity-25">aktuell</span>'
+        ? (executionContract.active
+            ? '<span class="badge bg-success bg-opacity-10 text-success border border-success border-opacity-25">aktuell und freigegeben</span>'
+            : '<span class="badge bg-secondary bg-opacity-10 text-secondary border border-secondary border-opacity-25">aktuell, keine Ausführung</span>')
         : '';
 
     return `
@@ -1684,18 +2629,24 @@ function renderDirectMarketingCurveSection(data = null) {
             : ((monitor && monitor.state === 'waiting') ? 'wartet auf Fenster' : 'beobachtet'));
     const stateColor = active ? 'text-success' : (shadow ? 'text-warning' : 'text-muted');
     const owner = (monitor && monitor.plan_owner) || (plan && plan.plan_owner) || 'direct_marketing';
-    const blockers = Array.isArray(monitor && monitor.blocked_reasons)
-        ? monitor.blocked_reasons.map(directMarketingBlockerLabel).filter(Boolean)
-        : [];
-    const uniqueBlockers = blockers.filter((label, idx, arr) => arr.indexOf(label) === idx).slice(0, 4);
+    const reasonGroups = directMarketingReasonGroups(monitor);
+    const uniqueReasons = values => values.filter(Boolean).filter((label, idx, arr) => arr.indexOf(label) === idx).slice(0, 4);
+    const uniqueBlockers = uniqueReasons(reasonGroups.blockers);
+    const uniqueCandidates = uniqueReasons(reasonGroups.candidates);
+    const uniqueDiagnostics = uniqueReasons(reasonGroups.diagnostics);
     const pvSpread = directMarketingProfitText(economics.pv_shift_spread_ct_per_kwh);
     const gridSpread = directMarketingProfitText(economics.grid_spread_ct_per_kwh);
     const spreadParts = [];
-    if (pvSpread) spreadParts.push('<span>PV-Marge <span class="' + (parseFloat(economics.pv_shift_spread_ct_per_kwh) >= 0 ? 'text-success' : 'text-danger') + ' fw-bold">' + directMarketingHtmlEscape(pvSpread) + '</span></span>');
-    if (gridSpread) spreadParts.push('<span>Netz-Marge <span class="' + (parseFloat(economics.grid_spread_ct_per_kwh) >= 0 ? 'text-success' : 'text-danger') + ' fw-bold">' + directMarketingHtmlEscape(gridSpread) + '</span></span>');
+    if (pvSpread) spreadParts.push('<span>PV-Verschiebespread <span class="' + (parseFloat(economics.pv_shift_spread_ct_per_kwh) >= 0 ? 'text-success' : 'text-danger') + ' fw-bold">' + directMarketingHtmlEscape(pvSpread) + '</span></span>');
+    if (gridSpread) spreadParts.push('<span>Netz-Verschiebespread <span class="' + (parseFloat(economics.grid_spread_ct_per_kwh) >= 0 ? 'text-success' : 'text-danger') + ' fw-bold">' + directMarketingHtmlEscape(gridSpread) + '</span></span>');
     const reportParts = [];
     if (report && typeof report === 'object') {
-        const exportKwh = parseFloat(report.theoretical_export_kwh || 0);
+        const selectedExportKwh = directMarketingSelectedExportKwh(plan);
+        const wearBudget = plan && plan.battery_wear_budget && typeof plan.battery_wear_budget === 'object'
+            ? plan.battery_wear_budget
+            : {};
+        const dailyBudgetKwh = Math.max(0, parseFloat(wearBudget.daily_export_limit_wh || 0) || 0) / 1000;
+        const legacyTheoreticalExportKwh = parseFloat(report.theoretical_export_kwh || 0);
         const gridKwh = parseFloat(report.theoretical_grid_charge_kwh || 0);
         const profit = parseFloat(report.theoretical_window_profit_eur || 0);
         const realExportKwh = parseFloat(report.real_export_kwh || 0);
@@ -1704,7 +2655,9 @@ function renderDirectMarketingCurveSection(data = null) {
         if (realExportKwh > 0) reportParts.push('Ist-Verkauf ' + directMarketingKwhText(realExportKwh));
         if (realPvStoreKwh > 0) reportParts.push('Ist-PV-Speichern ' + directMarketingKwhText(realPvStoreKwh));
         if (realRevenue > 0) reportParts.push('Ist-Erlös ' + realRevenue.toLocaleString('de-DE', {minimumFractionDigits: 2, maximumFractionDigits: 2}) + ' EUR');
-        if (exportKwh > 0) reportParts.push('Plan-Verkauf ' + directMarketingKwhText(exportKwh));
+        if (selectedExportKwh > 0) reportParts.push('Ausgewählter Plan-Verkauf ' + directMarketingKwhText(selectedExportKwh));
+        if (dailyBudgetKwh > 0) reportParts.push('Theoretisches Tagesbudget ' + directMarketingKwhText(dailyBudgetKwh));
+        else if (legacyTheoreticalExportKwh > 0) reportParts.push('Theoretisches Tagesbudget ' + directMarketingKwhText(legacyTheoreticalExportKwh));
         if (gridKwh > 0) reportParts.push('Plan-Netzladen ' + directMarketingKwhText(gridKwh));
         if (profit > 0) reportParts.push('Plan-Fensterwert ' + profit.toLocaleString('de-DE', {minimumFractionDigits: 2, maximumFractionDigits: 2}) + ' EUR');
     }
@@ -1720,26 +2673,48 @@ function renderDirectMarketingCurveSection(data = null) {
                 <span class="text-muted">Regler ${directMarketingHtmlEscape(owner)}</span>
                 ${spreadParts.map(part => '<span class="text-muted">' + part + '</span>').join('')}
             </div>
-            <div class="text-muted">Die Marge bewertet Erlös nach Gebühren, Wirkungsgrad, Batteriealterung und Sicherheitsaufschlag. PV-Marge verschiebt eigenen PV-Ertrag, Netz-Marge bewertet Netzladen plus späteren Verkauf.</div>
+            <div class="text-muted">Die Entscheidungsmarge ist das harte Freigabegate nach Gebühren, Wirkungsgrad, Batteriealterung und Sicherheitsaufschlag. Der PV-/Netz-Verschiebespread beschreibt dagegen nur den Preisabstand der jeweiligen Energiequelle.</div>
             ${uniqueBlockers.length ? '<div class="mt-1 text-warning">Aktuell blockiert: ' + directMarketingHtmlEscape(uniqueBlockers.join(', ')) + '</div>' : ''}
+            ${uniqueCandidates.length ? '<div class="mt-1 text-muted">Nicht ausgewählte Kandidaten: ' + directMarketingHtmlEscape(uniqueCandidates.join(', ')) + '</div>' : ''}
+            ${uniqueDiagnostics.length ? '<div class="mt-1 text-info">Allokationshinweise: ' + directMarketingHtmlEscape(uniqueDiagnostics.join(', ')) + '</div>' : ''}
             ${reportParts.length ? '<div class="mt-1 text-muted" title="' + directMarketingHtmlEscape(marketValueSolarTitle) + '">Tagesfenster: ' + directMarketingHtmlEscape(reportParts.join(' | ')) + '</div>' : ''}
         `;
     }
 
     if (windowsEl) {
-        const shown = windows.slice(0, 10);
-        const hidden = windows.slice(10);
+        const decorated = windows.map(windowEntry => ({
+            windowEntry,
+            execution: directMarketingWindowExecutionContract(windowEntry, monitor, plan)
+        }));
+        const marketWindows = decorated.filter(item => item.execution.marketOnly);
+        const operational = decorated.filter(item => !item.execution.marketOnly && (!item.execution.candidateOnly || item.execution.active));
+        const diagnostic = decorated.filter(item => item.execution.candidateOnly && !item.execution.active);
+        const shown = operational.slice(0, 10);
+        const hidden = operational.slice(10);
         if (!shown.length) {
-            windowsEl.innerHTML = '<div class="border-top border-secondary border-opacity-10 pt-2 text-muted">Noch keine Verkaufs-, Netzlade- oder Speicherplatzfenster im aktuellen Plan.</div>';
+            windowsEl.innerHTML = '<div class="border-top border-secondary border-opacity-10 pt-2 text-muted">Keine freigegebenen Verkaufs-, Lade- oder Speicherplatzfenster im aktuellen Plan.</div>';
         } else {
-            windowsEl.innerHTML = '<div class="border-top border-secondary border-opacity-10 pt-2 fw-bold text-muted">Preisfenster</div>'
-                + shown.map(windowEntry => directMarketingWindowRowHtml(windowEntry, economics)).join('')
+            windowsEl.innerHTML = '<div class="border-top border-secondary border-opacity-10 pt-2 fw-bold text-muted">Wirksamer Plan</div>'
+                + shown.map(item => directMarketingWindowRowHtml(item.windowEntry, economics, item.execution)).join('')
                 + (hidden.length ? `
                     <details class="mt-1">
                         <summary class="text-muted" style="cursor:pointer;">${hidden.length} weitere Fenster anzeigen</summary>
-                        ${hidden.map(windowEntry => directMarketingWindowRowHtml(windowEntry, economics)).join('')}
+                        ${hidden.map(item => directMarketingWindowRowHtml(item.windowEntry, economics, item.execution)).join('')}
                     </details>
                 ` : '');
+        }
+        if (diagnostic.length) {
+            windowsEl.innerHTML += `
+                <details class="mt-2">
+                    <summary class="text-muted" style="cursor:pointer;">${diagnostic.length} nicht freigegebene Kandidaten (Diagnose)</summary>
+                    ${diagnostic.map(item => directMarketingWindowRowHtml(item.windowEntry, economics, item.execution)).join('')}
+                </details>
+            `;
+        }
+        if (marketWindows.length) {
+            windowsEl.innerHTML = '<div class="border-top border-secondary border-opacity-10 pt-2 fw-bold text-muted">Bekannte Marktfenster (keine Aktionswirkung)</div>'
+                + marketWindows.map(item => directMarketingWindowRowHtml(item.windowEntry, economics, item.execution)).join('')
+                + windowsEl.innerHTML;
         }
     }
 }
@@ -1817,6 +2792,7 @@ function renderDirectMarketingDashboardStatus(data = null) {
         windows
     );
     const action = String((monitor && monitor.current_action) || (nextWindow && nextWindow.action) || '');
+    const salesWindow = directMarketingSalesWindowContract(monitor, plan);
     const blockers = Array.isArray(monitor && monitor.blocked_reasons)
         ? monitor.blocked_reasons.map(directMarketingBlockerLabel).filter(Boolean)
         : [];
@@ -1824,20 +2800,32 @@ function renderDirectMarketingDashboardStatus(data = null) {
     const economics = (monitor && monitor.economics && typeof monitor.economics === 'object') ? monitor.economics
         : ((plan && plan.economics && typeof plan.economics === 'object') ? plan.economics : {});
     const spread = directMarketingProfitText(directMarketingSpreadForAction(action, economics) ?? economics.pv_shift_spread_ct_per_kwh);
-    const power = nextWindow ? directMarketingEnergyText(nextWindow) : '';
+    const marginGateText = salesWindow.candidate
+        ? directMarketingMarginGateText(monitor, plan, action)
+        : '';
+    const power = nextWindow && (!salesWindow.candidate || salesWindow.active)
+        ? directMarketingEnergyText(nextWindow)
+        : '';
     const pvSource = livePvSourceInfo(data);
     const externalPvText = pvSource.external > 20
-        ? 'Zusatz-WR ' + mobileStoragePower(pvSource.external) + (pvSource.locked ? ' für Akku gesperrt' : '')
+        ? getFlowLabel('external_pv') + ' ' + mobileStoragePower(pvSource.external) + (pvSource.locked ? ' für Akku gesperrt' : '')
         : '';
-    const windowText = nextWindow ? directMarketingWindowText(nextWindow) : '';
-    const actionText = action ? directMarketingActionLabel(action) : '';
-    const statusText = active ? 'aktiv' : (shadow ? 'Beobachtung' : 'bereit');
+    const windowText = nextWindow && (!salesWindow.candidate || salesWindow.active)
+        ? directMarketingWindowText(nextWindow)
+        : '';
+    const actionText = salesWindow.candidate && !salesWindow.active
+        ? 'keine Verkaufsfreigabe'
+        : (salesWindow.active ? 'Verkaufsfenster' : (action ? directMarketingActionLabel(action) : ''));
+    const displayActive = salesWindow.candidate ? salesWindow.active : active;
+    const statusText = salesWindow.candidate
+        ? (salesWindow.active ? 'aktiv' : 'wirtschaftlich gesperrt')
+        : (active ? 'aktiv' : (shadow ? 'Beobachtung' : 'bereit'));
     const detailParts = [
         actionText,
         windowText,
         power,
         externalPvText,
-        spread ? ('Marge ' + spread) : '',
+        marginGateText || (spread ? ('Verschiebespread ' + spread) : ''),
         marketValueSolarText,
         blockerText ? ('Begrenzt: ' + blockerText) : ''
     ].filter(Boolean);
@@ -1856,7 +2844,7 @@ function renderDirectMarketingDashboardStatus(data = null) {
             : '';
         badge.innerHTML = lockIcon + directMarketingHtmlEscape(modeLabel + ' ' + statusText);
         badge.className = 'badge rounded-pill ' + (
-            active
+            displayActive
                 ? 'bg-success bg-opacity-25 text-success border border-success border-opacity-25'
                 : (shadow
                     ? 'bg-warning bg-opacity-25 text-warning border border-warning border-opacity-25'
@@ -1909,8 +2897,8 @@ function formatDirectMarketingDailyReportTitle(report) {
     if (actions) lines.push('Fenster: ' + actions);
     const blockers = directMarketingTopCountsText(report.blocker_counts, 5, directMarketingBlockerLabel);
     if (blockers) lines.push('Begrenzt: ' + blockers);
-    if (report.best_pv_shift_spread_ct_per_kwh != null) lines.push('Beste PV-Marge: ' + directMarketingProfitText(report.best_pv_shift_spread_ct_per_kwh));
-    if (report.best_grid_spread_ct_per_kwh != null) lines.push('Beste Netz-Marge: ' + directMarketingProfitText(report.best_grid_spread_ct_per_kwh));
+    if (report.best_pv_shift_spread_ct_per_kwh != null) lines.push('Bester PV-Verschiebespread: ' + directMarketingProfitText(report.best_pv_shift_spread_ct_per_kwh));
+    if (report.best_grid_spread_ct_per_kwh != null) lines.push('Bester Netz-Verschiebespread: ' + directMarketingProfitText(report.best_grid_spread_ct_per_kwh));
     if (parseFloat(report.theoretical_window_profit_eur || 0) > 0) {
         lines.push('Theoretischer Fensterwert: ' + parseFloat(report.theoretical_window_profit_eur).toLocaleString('de-DE', {minimumFractionDigits: 2, maximumFractionDigits: 2}) + ' EUR');
     }
@@ -1938,6 +2926,14 @@ function formatDirectMarketingMonitorSummary(monitor, plan = null, compact = fal
     const actionText = windowEntry ? directMarketingWindowText(windowEntry) : '';
     const blockers = directMarketingBlockerSummary(monitor.blocked_reasons, compact ? 1 : 2);
     const profit = directMarketingProfitText(monitor.expected_profit_ct_per_kwh);
+    const salesWindow = directMarketingSalesWindowContract(monitor, plan);
+    if (salesWindow.candidate) {
+        const margin = directMarketingMarginGateText(monitor, plan, salesWindow.action);
+        if (salesWindow.active) {
+            return `${prefix}: Verkaufsfenster aktiv${margin ? ' | ' + margin : ''}`;
+        }
+        return `${prefix}: keine Verkaufsfreigabe${margin ? ' | ' + margin : ''}`;
+    }
     if (monitor.active === true && actionText) {
         return `${prefix}${status}: ${actionText}${profit ? ' ' + profit : ''}`;
     }
@@ -1960,7 +2956,13 @@ function formatDirectMarketingSummary(plan, compact = false) {
     }
     const shadow = plan.shadow === true || (plan.flags && plan.flags.commands_allowed === false);
     const windows = Array.isArray(plan.windows) ? plan.windows : [];
-    const nextWindow = windows.length ? directMarketingWindowText(windows[0]) : '';
+    const policy = plan.policy_decision && typeof plan.policy_decision === 'object' ? plan.policy_decision : {};
+    const budget = policy.storage_budget && typeof policy.storage_budget === 'object' ? policy.storage_budget : {};
+    const executableSale = policy.commands_allowed === true
+        && policy.blocked !== true
+        && String(policy.dv_target_state || '').toUpperCase() === 'FORCE_EXPORT'
+        && (parseFloat(budget.export_budget_w) || 0) > 0;
+    const nextWindow = executableSale && windows.length ? directMarketingWindowText(windows[0]) : '';
     const prefix = compact ? 'DV ' + mode : 'Direktvermarktung ' + mode;
     const suffix = shadow ? ' Beobachtung' : '';
     return nextWindow ? `${prefix}${suffix}: ${nextWindow}` : `${prefix}${suffix}: keine Fenster`;
@@ -1977,8 +2979,8 @@ function formatDirectMarketingMonitorTitle(monitor, plan = null) {
     const economics = monitor.economics && typeof monitor.economics === 'object' ? monitor.economics : {};
     if (reserve.effective_min_soc_pct != null) lines.push('Reserve: ' + parseFloat(reserve.effective_min_soc_pct).toFixed(1).replace('.', ',') + ' %');
     if (reserve.available_export_wh != null) lines.push('Spielraum: ' + mobileStorageKwhFromWh(reserve.available_export_wh));
-    if (economics.pv_shift_spread_ct_per_kwh != null) lines.push('PV-Marge: ' + directMarketingProfitText(economics.pv_shift_spread_ct_per_kwh));
-    if (economics.grid_spread_ct_per_kwh != null) lines.push('Netz-Marge: ' + directMarketingProfitText(economics.grid_spread_ct_per_kwh));
+    if (economics.pv_shift_spread_ct_per_kwh != null) lines.push('PV-Verschiebespread: ' + directMarketingProfitText(economics.pv_shift_spread_ct_per_kwh));
+    if (economics.grid_spread_ct_per_kwh != null) lines.push('Netz-Verschiebespread: ' + directMarketingProfitText(economics.grid_spread_ct_per_kwh));
     if (Array.isArray(monitor.blocked_reasons) && monitor.blocked_reasons.length) {
         lines.push('Blockiert: ' + monitor.blocked_reasons.map(directMarketingBlockerLabel).join(', '));
     }
@@ -2000,7 +3002,7 @@ function formatDirectMarketingTitle(plan) {
     lines.push('Steuerung erlaubt: ' + (flags.commands_allowed === true ? 'ja' : 'nein'));
     if (reserve.effective_min_soc_pct != null) lines.push('Reserve: ' + parseFloat(reserve.effective_min_soc_pct).toFixed(1).replace('.', ',') + ' %');
     if (reserve.available_export_wh != null) lines.push('Spielraum: ' + mobileStorageKwhFromWh(reserve.available_export_wh));
-    if (economics.best_spread_ct_per_kwh != null) lines.push('Marge nach Kosten: ' + parseFloat(economics.best_spread_ct_per_kwh).toFixed(2).replace('.', ',') + ' ct/kWh');
+    if (economics.best_spread_ct_per_kwh != null) lines.push('Verschiebespanne nach Kosten: ' + parseFloat(economics.best_spread_ct_per_kwh).toFixed(2).replace('.', ',') + ' ct/kWh');
     if (Array.isArray(plan.blocked_reasons) && plan.blocked_reasons.length) {
         lines.push('Blockiert: ' + plan.blocked_reasons.map(directMarketingBlockerLabel).join(', '));
     }
@@ -2114,7 +3116,19 @@ function updateMobileStorageStrip(data) {
     } else {
         setMobileStorageText('m-storage-curve', 'Kurve --');
     }
+    const chargeAcceptanceDiagnostic = data.storage_charge_acceptance_diagnostic
+        && typeof data.storage_charge_acceptance_diagnostic === 'object'
+        ? data.storage_charge_acceptance_diagnostic
+        : null;
+    const chargeAcceptanceActive = chargeAcceptanceDiagnostic
+        && chargeAcceptanceDiagnostic.active === true
+        && chargeAcceptanceDiagnostic.control_effect === false
+        && chargeAcceptanceDiagnostic.display_text === 'Ladeannahme begrenzt – Ursache unklar';
+    if (chargeAcceptanceActive) {
+        setMobileStorageText('m-storage-curve', chargeAcceptanceDiagnostic.display_text);
+    }
     const requestParts = [];
+    if (chargeAcceptanceActive) requestParts.push(chargeAcceptanceDiagnostic.display_text);
     if (abregelActive && abregelW !== null && Math.abs(abregelW) > 0) requestParts.push('Abregel ' + mobileStoragePower(abregelW));
     if (!(abregelActive && abregelW !== null && Math.abs(abregelW) > 0) && curtailmentPressureWh !== null && curtailmentPressureWh > 0) {
         requestParts.push('Abregeldruck ' + mobileStorageKwhFromWh(curtailmentPressureWh));
@@ -2325,7 +3339,7 @@ function flowHoverHtml(card) {
 function positionEnergyFlowHoverPanel(container, node) {
     const panel = container ? container.querySelector('[data-flow-hover-panel]') : null;
     if (!container || !node || !panel || !panel.classList.contains('is-visible')) return;
-    const c = container.getBoundingClientRect();
+    const c = flowCanvas(container).getBoundingClientRect();
     const n = node.getBoundingClientRect();
     const p = panel.getBoundingClientRect();
     let left = n.right - c.left + 12;
@@ -2450,7 +3464,7 @@ function updateEnergyFlowHoverCards(data, values = {}) {
                 : ''
         },
         external_pv: {
-            title: 'Zusatz-WR',
+            title: getFlowLabel('external_pv'),
             now: flowPlainWatts(pvSource.external),
             totalLabel: 'Ertrag heute',
             total: flowHoverKwh(stats.pv_external_kwh, 1),
@@ -2596,9 +3610,9 @@ function updateModernDashboardActivity(data, values) {
     const wpPower = num(values && values.wpVal);
     const hsPower = num(values && values.hsVal);
     const climatePower = num(values && values.climateVal);
-    const wb1Locked = data && (data.wb_locked === true || data.wb_locked === 1 || data.wb_locked === '1');
+    const wb1Present = data && (data.wb_plug === true || data.wb_plug === 1 || data.wb_plug === '1');
     const wb2Locked = data && (data.wb2_locked === true || data.wb2_locked === 1 || data.wb2_locked === '1');
-    setModernCardState('card-wb-wrapper', {active: Math.abs(wb1Power) > 50 || wb1Locked, present: true});
+    setModernCardState('card-wb-wrapper', {active: Math.abs(wb1Power) > 50 || wb1Present, present: true});
     setModernCardState('card-wb2-wrapper', {active: Math.abs(wb2Power) > 50 || wb2Locked, present: data && data.wb2 !== undefined});
     setModernCardState('card-wp-wrapper', {active: wpPower >= 100, present: true});
     setModernCardState('card-climate-wrapper', {
@@ -2619,15 +3633,15 @@ function updateModernDashboardActivity(data, values) {
 function calculateLiveAutarky(home, wb, wp, grid, climate = 0) {
     let totalVerbrauch = home + wb + wp + Math.max(0, climate || 0);
     let netzBezug = grid > 0 ? grid : 0;
-    
+
     // Kleine Netzbezüge (Regelabweichungen des WR) ignorieren
     if (netzBezug < 30) netzBezug = 0;
     if (totalVerbrauch <= 0) return 100;
-    
+
     let autarky = ((totalVerbrauch - netzBezug) / totalVerbrauch) * 100;
     // Schwankungen im obersten Bereich unterdrücken (>= 97% -> 100%)
     if (autarky >= 97) autarky = 100;
-    
+
     return Math.max(0, Math.min(100, autarky));
 }
 
@@ -2701,10 +3715,10 @@ function updateDailySavedStats(data, prefix) {
 function updateStatsUI(data, mode) {
     const prefix = mode === 'mobile' ? 'm-' : '';
     updateDailySavedStats(data, prefix);
-    
+
     if (data.autarky_day !== undefined) { const elA = document.getElementById(prefix + 'stat-overlay-autarky'); if (elA) elA.innerText = Math.round(data.autarky_day) + '%'; }
     if (data.selfcon_day !== undefined) { const elS = document.getElementById(prefix + 'stat-overlay-selfcon'); if (elS) elS.innerText = Math.round(data.selfcon_day) + '%'; }
-    
+
     if (data.stats) {
         const stats = data.stats;
         const setStat = (id, val, pct) => { const el = document.getElementById(prefix + id); if (el) el.innerText = `${(val||0).toFixed(2)} kWh (${(pct||0).toFixed(0)}%)`; };
@@ -2713,7 +3727,7 @@ function updateStatsUI(data, mode) {
             const row = document.getElementById(prefix + rowId);
             if (row) row.style.display = (Math.abs(parseFloat(val || 0)) > threshold) ? '' : 'none';
         };
-        
+
         const elPvTotal = document.getElementById(prefix + 'stat-pv-total');
         if (elPvTotal) elPvTotal.innerText = `${(stats.total_pv_kwh||0).toFixed(2)} kWh`;
         const elBatTotal = document.getElementById(prefix + 'stat-bat-total');
@@ -2729,6 +3743,10 @@ function updateStatsUI(data, mode) {
 
         setStat('stat-pv-e3dc', stats.pv_e3dc_kwh, stats.pv_e3dc_pct);
         setStat('stat-pv-external', stats.pv_external_kwh, stats.pv_external_pct);
+        const externalPvStat = document.getElementById(prefix + 'stat-pv-external');
+        if (externalPvStat) {
+            externalPvStat.title = 'Aus der externen Momentanleistung abgeleiteter Tageswert (ca.); kein direkter Energiezähler.';
+        }
         setStatVisible('stat-pv-source-rest', 'stat-pv-source-rest-row', stats.pv_source_rest_kwh, stats.pv_source_rest_pct);
         setStat('stat-pv-home', stats.pv_home_kwh, stats.pv_home_pct); setStat('stat-pv-bat', stats.pv_bat_kwh, stats.pv_bat_pct);
         setStat('stat-pv-wb', pvWb, pctOf(pvWb, stats.total_pv_kwh)); setStat('stat-pv-wp', stats.pv_wp_kwh, stats.pv_wp_pct);
@@ -2798,13 +3816,13 @@ function updateStatsUI(data, mode) {
         setCost('stat-cost-wb', (data.costs.wb || 0) + (data.costs.wb2 || 0));
         setCost('stat-cost-wp', data.costs.wp);
         setCost('stat-cost-climate', data.costs.climate);
-        
+
         setCost('stat-save-total', saveTotal);
         setCost('stat-save-home', data.costs.save_home);
         setCost('stat-save-wb', (data.costs.save_wb || 0) + (data.costs.save_wb2 || 0));
         setCost('stat-save-wp', data.costs.save_wp);
         setCost('stat-save-climate', data.costs.save_climate);
-        
+
         let resultTotal = Number.isFinite(Number(data.costs.result_total))
             ? Number(data.costs.result_total)
             : saveTotal + eegRevenue - costTotal;
@@ -2870,18 +3888,18 @@ function getSunPosition() {
     const start = new Date(now.getFullYear(), 0, 0);
     const diff = now - start;
     const dayOfYear = Math.floor(diff / (1000 * 60 * 60 * 24));
-    
+
     const B = (360 / 365) * (dayOfYear - 81) * rad;
     const declination = 23.45 * Math.sin(B) * rad;
     const eot = 9.87 * Math.sin(2 * B) - 7.53 * Math.cos(B) - 1.5 * Math.sin(B);
-    
+
     const lst = now.getUTCHours() + now.getUTCMinutes() / 60 + LON / 15 + eot / 60;
     const omega = (lst - 12) * 15 * rad;
     const latRad = LAT * rad;
-    
+
     const sinEl = Math.sin(latRad) * Math.sin(declination) + Math.cos(latRad) * Math.cos(declination) * Math.cos(omega);
     const el = Math.asin(sinEl);
-    
+
     return { el, sinEl, declination, omega, latRad };
 }
 
@@ -2894,14 +3912,14 @@ function isDaytime() {
 
 function getTheoreticalPower() {
     if (typeof PV_STRINGS === 'undefined' || !PV_STRINGS || PV_STRINGS.length === 0) return 0;
-    
+
     const pos = getSunPosition();
     if (!pos || pos.el < 0) return 0; // Nacht (geometrisch)
-    
+
     const cosAzS = (Math.sin(pos.latRad) * pos.sinEl - Math.sin(pos.declination)) / (Math.cos(pos.latRad) * Math.cos(pos.el));
     let sunAz = Math.acos(Math.min(1, Math.max(-1, cosAzS)));
     if (pos.omega < 0) sunAz = -sunAz;
-    
+
     let totalW = 0;
     const airMass = 1 / Math.max(0.05, pos.sinEl);
     const transmission = (typeof PV_ATMOSPHERE !== 'undefined') ? PV_ATMOSPHERE : 0.7;
@@ -2922,7 +3940,7 @@ function getTheoreticalPower() {
 
 function restartService(skipConfirm = false) {
     if (!skipConfirm && !confirm('🚨 NOTFALL-NEUSTART & RESET 🚨\n\nMöchtest du alle Dienste neustarten?\nDabei werden auch aktive Boost-Vorgänge (Fahrzeug, Wärmepumpe, Batteriepuffer) zurückgesetzt und genullt.\n\nE3DC-Control beendet sich vorher sicher (Daten speichern).')) return;
-    
+
     fetch('index.php?action=restart_service')
         .then(r => r.json())
         .then(data => {
@@ -2937,7 +3955,7 @@ function restartService(skipConfirm = false) {
 
 function fixPermissions() {
     if (!confirm('Möchtest du eine automatische Rechteprüfung (permissions.py) starten und Fehler reparieren lassen?\n(Dauert einen Moment)')) return;
-    
+
     // UI Feedback
     const btn = event ? event.currentTarget : null;
     let oldHtml = '';
@@ -2946,7 +3964,7 @@ function fixPermissions() {
         btn.innerHTML = '<i class="fas fa-spinner fa-spin me-2"></i>Repariere...';
         btn.disabled = true;
     }
-    
+
     fetch('index.php?action=fix_permissions')
         .then(r => r.json())
         .then(data => {
@@ -2973,10 +3991,10 @@ function showWatchdogLog() {
     if (!modalEl) return;
     const modal = new bootstrap.Modal(modalEl);
     modal.show();
-    
+
     const contentEl = document.getElementById('watchdog-log-content');
     if(contentEl) contentEl.innerText = 'Lade Protokoll...';
-    
+
     // Action ist in helpers.php definiert und überall verfügbar
     fetch('index.php?action=watchdog_log')
         .then(r => r.text())
@@ -2993,10 +4011,10 @@ function showHALog() {
     if (!modalEl) return;
     const modal = new bootstrap.Modal(modalEl);
     modal.show();
-    
+
     const contentEl = document.getElementById('ha-log-content');
     if(contentEl) contentEl.innerText = 'Lade Protokoll...';
-    
+
     // Dynamischer Aufruf relativ zur aktuellen Datei (index.php oder mobile.php)
     fetch('?action=get_ha_log')
         .then(r => r.text())
@@ -3014,10 +4032,10 @@ function showHALog() {
 function handleConnectionClick() {
     const badge = document.getElementById('connection-status');
     if (!badge) return;
-    
+
     // Check auf Klassen (Bootstrap Farben) oder Text
     const isOffline = badge.classList.contains('bg-danger') || badge.classList.contains('bg-warning') || badge.innerText === 'Offline' || badge.innerText.includes('Veraltet');
-    
+
     if (isOffline) {
         if (confirm("Verbindungsprobleme erkannt.\nMöchtest du den E3DC-Service neu starten?")) {
             restartService();
@@ -3040,7 +4058,7 @@ function forceSocUpdate() {
     if (window._hasBluelink === false) return;
 
     const socBadges = document.querySelectorAll('#val-car-soc, #f-val-car-soc, #val-car-soc2, #f-val-car-soc2');
-    
+
     // Schutz: Nicht aufwecken, wenn es ein Gast-Auto ist
     let isGuest = false;
     socBadges.forEach(el => {
@@ -3048,13 +4066,13 @@ function forceSocUpdate() {
             isGuest = true;
         }
     });
-    
+
     if (isGuest) return;
 
     socBadges.forEach(el => {
         if (el) el.innerHTML = '<i class="fas fa-sync fa-spin"></i>';
     });
-    
+
     const fzBtn = document.getElementById('fz-update-btn');
     if (fzBtn) {
         fzBtn.innerHTML = '<i class="fas fa-sync-alt fa-spin me-1"></i> Wecke auf...';
@@ -3201,7 +4219,7 @@ function startInstallerUpdateRun(btn, origText) {
         finishBtn.onclick = null;
     }
     if (modal) modal.show();
-    
+
     fetch(e3dcActionUrl('action=run_self_update&t=' + Date.now()))
     .then(r => e3dcParseJsonResponse(r, 'Web-UI Update-Start'))
     .then(data => {
@@ -3222,7 +4240,7 @@ function startInstallerUpdateRun(btn, origText) {
             checkInstallerUpdate(true);
         }
     })
-    .catch(err => { 
+    .catch(err => {
         const msg = "Update-Start konnte keine gültige JSON-Antwort lesen:\n" + err.message
                   + "\n\nPrüfe das Update-Protokoll weiter; während des Webdatei-Tauschs kann die Oberfläche kurz HTML liefern.";
         if (log) log.innerText = msg;
@@ -3329,7 +4347,7 @@ function startSystemUpdate(btnId = null) {
         btn.innerHTML = '<i class="fas fa-circle-notch fa-spin"></i>';
         btn.disabled = true;
     }
-    
+
     fetch(e3dcActionUrl('action=check_update&t=' + Date.now()))
     .then(r => r.json())
     .then(data => {
@@ -3358,12 +4376,12 @@ function startSystemUpdate(btnId = null) {
         }
 
         if (!proceed) return;
-        
+
         let discard = true;
         if (!force) {
             discard = confirm("Möchtest du eventuelle lokale Code-Änderungen verwerfen (Empfohlen für fehlerfreie Updates)?\n\n(Häufig entstehen lokale Änderungen nur durch Dateirechte-Korrekturen. Ein Verwerfen stellt den Originalzustand wieder her.)");
         }
-        
+
         return fetch(e3dcActionUrl('action=prepare_update&force=' + force + '&discard=' + discard));
     })
     .then(response => {
@@ -3371,13 +4389,13 @@ function startSystemUpdate(btnId = null) {
 
         const modal = new bootstrap.Modal(document.getElementById('updateModal'));
         modal.show();
-        
+
         const title = document.getElementById('update-modal-title');
         const log = document.getElementById('update-log');
         const spinner = document.getElementById('update-spinner');
         const closeBtn = document.getElementById('update-close-btn');
         const finishBtn = document.getElementById('update-finish-btn');
-        
+
         // Reset UI
         if (title) title.innerText = "System Update";
         log.innerText = "Starte Anfrage...\n";
@@ -3386,7 +4404,7 @@ function startSystemUpdate(btnId = null) {
         finishBtn.disabled = true;
         finishBtn.onclick = null;
         finishBtn.innerText = "Schließen";
-        
+
         // Start Request
         fetch(e3dcActionUrl('action=run_update&mode=start&t=' + Date.now()))
             .then(r => r.json())
@@ -3471,7 +4489,7 @@ function pollUpdate(log, spinner, closeBtn, finishBtn) {
                             spinner.classList.add('fa-check-circle', 'text-success');
                             log.innerText += "\n\n✓ Update beendet. Bitte Seite neu laden.";
                             // Optional: Reload triggern oder Badges resetten
-                            if(typeof checkInstallerUpdate === 'function') checkInstallerUpdate(); 
+                            if(typeof checkInstallerUpdate === 'function') checkInstallerUpdate();
                         } else {
                             spinner.classList.add('fa-times-circle', 'text-danger');
                             if (tick >= 360) {
@@ -3667,7 +4685,7 @@ function toggleDarkMode(el) {
     const html = document.documentElement;
     const body = document.body;
     const icon = el || document.getElementById('darkmode-icon') || document.getElementById('mobile-darkmode-icon');
-    
+
     html.setAttribute('data-bs-theme', theme);
     html.setAttribute('data-theme', theme);
     if (body) {
@@ -3679,16 +4697,16 @@ function toggleDarkMode(el) {
         const tone = icon.classList && icon.classList.contains('text-secondary') ? 'text-secondary' : 'text-warning';
         icon.className = (DARK_MODE ? 'fas fa-sun ' : 'fas fa-moon ') + tone;
     }
-    
+
     // Save setting via fetch
     const formData = new FormData();
     formData.append('action', 'save_setting');
     formData.append('key', 'darkmode');
     formData.append('value', DARK_MODE ? '1' : '0');
-    
+
     const endpoint = body && body.classList.contains('mode-mobile') ? 'mobile.php' : 'index.php';
     fetch(endpoint, { method: 'POST', body: formData });
-    
+
     setTimeout(() => {
         window.dispatchEvent(new CustomEvent('themeChanged'));
         if (body && body.classList.contains('mode-mobile')) {
@@ -3705,19 +4723,19 @@ function toggleDarkMode(el) {
 function toggleForecast(el) {
     if (typeof SHOW_FORECAST === 'undefined') return;
     SHOW_FORECAST = !SHOW_FORECAST;
-    
+
     if (el) {
         if (SHOW_FORECAST) el.classList.replace('fa-eye-slash', 'fa-eye');
         else el.classList.replace('fa-eye', 'fa-eye-slash');
     }
-    
+
     const formData = new FormData();
     formData.append('action', 'save_setting');
     formData.append('key', 'show_forecast');
     formData.append('value', SHOW_FORECAST ? '1' : '0');
-    
+
     fetch('index.php', { method: 'POST', body: formData });
-    
+
     if (typeof fetchData === 'function') fetchData();
 }
 
@@ -3741,21 +4759,21 @@ function switchChartMode(mode, view = 'normal') {
         });
         select.style.display = (mode === 'flow') ? 'none' : 'inline-block';
     }
-    
+
     const flipBtn = document.querySelector('.card-header .btn-chart-flip');
     if (flipBtn) flipBtn.style.display = (mode === 'flow') ? 'none' : 'inline-block';
-    
+
     const refreshBtn = document.getElementById('main-refresh-btn');
     if (refreshBtn) refreshBtn.style.display = (mode === 'flow') ? 'none' : 'inline-block';
-    
+
     if (typeof CURRENT_VIEW !== 'undefined') CURRENT_VIEW = view;
-    
+
     // --- NEU: Statistik-Overlay schließen, wenn ein anderes Diagramm aufgerufen wird ---
     if (typeof statsViewActive !== 'undefined' && statsViewActive) {
         statsViewActive = false;
         const statsElDesktop = document.getElementById('stats-view');
         if (statsElDesktop) statsElDesktop.style.display = 'none';
-        
+
         const statsElMobile = document.getElementById('m-stats-view');
         if (statsElMobile) statsElMobile.style.display = 'none';
         const chevron = document.getElementById('m-stats-chevron');
@@ -3767,7 +4785,7 @@ function switchChartMode(mode, view = 'normal') {
         $('#history-select-normal').val('');
         $('#history-select-wp').val('');
     }
-    
+
     const flowView = document.getElementById('flow-view');
     const title = document.getElementById('chart-title');
     const liveControls = document.getElementById('live-controls');
@@ -3803,20 +4821,20 @@ function switchChartMode(mode, view = 'normal') {
         if(liveControls) liveControls.style.display = 'none';
         if(archiveSelect) archiveSelect.style.display = 'none';
         if(jsContainer) jsContainer.style.display = 'none';
-        if(flowView) flowView.style.display = 'block';
-        if(typeof fetchData === 'function') fetchData(); 
+        if(flowView) flowView.style.display = 'flex';
+        if(typeof fetchData === 'function') fetchData();
     } else if (mode === 'price') {
 
         if(title) title.innerHTML = '<i class="fas fa-euro-sign me-2 text-primary"></i>Strompreis & Kosten';
         if(liveControls) liveControls.style.display = 'flex';
-        
+
         document.getElementById('history-select-normal').style.display = 'inline-block';
         document.getElementById('history-select-wp').style.display = 'none';
         if(archiveSelect) archiveSelect.style.display = 'none';
-        
+
         if (jsContainer) {
             jsContainer.style.display = 'block';
-            let hours = 24; 
+            let hours = 24;
             const histNorm = document.getElementById('history-select-normal');
             const file = histNorm ? histNorm.value : null;
             loadJsPriceChart(hours, file);
@@ -3825,7 +4843,7 @@ function switchChartMode(mode, view = 'normal') {
         if(title) title.innerHTML = '<i class="fas fa-chart-line me-2 text-secondary"></i>SoC Prognose';
         if(liveControls) liveControls.style.display = 'none';
         if(archiveSelect) archiveSelect.style.display = 'none';
-        
+
         if (jsContainer) {
             jsContainer.style.display = 'block';
             if (typeof loadJsForecastChart === 'function') loadJsForecastChart('');
@@ -3833,17 +4851,17 @@ function switchChartMode(mode, view = 'normal') {
     } else if (mode === 'hybrid') {
         if(title) title.innerHTML = '<i class="fas fa-chart-pie me-2 text-secondary"></i>Hybrid (Verlauf + Prognose)';
         if(liveControls) liveControls.style.display = 'flex';
-        
+
         document.getElementById('history-select-normal').style.display = 'inline-block';
         document.getElementById('history-select-wp').style.display = 'none';
         if(archiveSelect) archiveSelect.style.display = 'none';
-        
+
         if (jsContainer) {
             jsContainer.style.display = 'block';
             let hours = 6;
             const activeBtn = document.querySelector('#live-controls .btn.active');
             if (activeBtn) hours = parseInt(activeBtn.innerText);
-            
+
             const histNorm = document.getElementById('history-select-normal');
             const file = histNorm ? histNorm.value : null;
             loadJsHybridChart(hours, file);
@@ -3858,10 +4876,10 @@ function switchChartMode(mode, view = 'normal') {
         if (view === 'hs') titleText = 'Heizstab Details';
         if (view === 'wp') titleText = 'Wärmepumpe Details';
         if (view === 'climate') titleText = 'Klima Verlauf';
-        
+
         if(title) title.innerHTML = '<i class="fas fa-chart-area me-2 text-secondary"></i>' + titleText;
         if(liveControls) liveControls.style.display = 'flex';
-        
+
         // Toggle correct dropdown
         if (view === 'wp') {
             document.getElementById('history-select-normal').style.display = 'none';
@@ -3870,13 +4888,13 @@ function switchChartMode(mode, view = 'normal') {
             document.getElementById('history-select-normal').style.display = 'inline-block';
             document.getElementById('history-select-wp').style.display = 'none';
         }
-        
+
         if(archiveSelect) archiveSelect.style.display = 'none';
-        
+
         if (jsContainer) {
             jsContainer.style.display = 'block';
         }
-        
+
         let hours = 6;
         const activeBtn = document.querySelector('#live-controls .btn.active');
         if (activeBtn) hours = parseInt(activeBtn.innerText);
@@ -3891,14 +4909,14 @@ function updateChart(hours, btn) {
         $(btn).addClass('active');
         $('#live-controls select').val('');
     }
-    
+
     const jsContainer = document.getElementById('liveChartContainer');
-    
+
     const histSelect = document.getElementById('history-select-normal') || document.getElementById('mobileHistorySelect');
     const isLive = !histSelect || histSelect.value === "";
     const modeSelect = document.getElementById('chart-mode-select');
     const modeValue = modeSelect ? modeSelect.value : '';
-    
+
     if (isLive && jsContainer) {
         jsContainer.style.display = 'block';
         if (modeValue === 'hybrid') {
@@ -3920,11 +4938,11 @@ function updateChartHistory(file) {
         updateChart(6, document.querySelector('.btn-group-custom .btn:first-child'));
         return;
     }
-    
+
     $('.btn-group-custom .btn').removeClass('active');
-    
+
     const jsContainer = document.getElementById('liveChartContainer');
-    
+
     const modeSelect = document.getElementById('chart-mode-select');
     const modeValue = modeSelect ? modeSelect.value : '';
 
@@ -3988,7 +5006,7 @@ function refreshData(isAuto = false) {
             if (typeof loadJsPriceChart === 'function') loadJsPriceChart(currentLiveHours, file);
         }
     }
-    
+
     if(btn) {
         setTimeout(() => { btn.disabled = false; btn.innerHTML = originalHtml; }, 300);
     }
@@ -4005,13 +5023,13 @@ function saveHiddenDataset(label, isHidden) {
 }
 function applyHiddenState(datasets) {
     let hidden = getHiddenDatasets();
-    datasets.forEach(ds => { 
+    datasets.forEach(ds => {
         if (ds.e3dcAlwaysVisible) {
             ds.hidden = false;
             return;
         }
         if (hidden[ds.label] !== undefined) {
-            ds.hidden = hidden[ds.label]; 
+            ds.hidden = hidden[ds.label];
         }
     });
     return datasets;
@@ -4064,7 +5082,7 @@ function pushPredumpHeadroomDataset(datasets, predumpW, segment = null) {
         return;
     }
     const dataset = {
-        label: 'Pre-Dump / Headroom freihalten',
+        label: 'Speicherplatz schaffen (aktuell freigegeben)',
         data: predumpW.map(v => Math.max(0, Number(v) || 0)),
         backgroundColor: 'rgba(245, 158, 11, 0.32)',
         borderColor: '#f59e0b',
@@ -4076,6 +5094,147 @@ function pushPredumpHeadroomDataset(datasets, predumpW, segment = null) {
     };
     if (segment) dataset.segment = segment;
     datasets.push(dataset);
+}
+
+function pushPredumpCandidateDataset(datasets, candidateW, segment = null) {
+    if (!candidateW || !Array.isArray(candidateW) || !candidateW.some(v => Number(v) > 0)) {
+        return;
+    }
+    const dataset = {
+        label: 'Predump-Kandidat (Simulation)',
+        data: candidateW.map(v => Math.max(0, Number(v) || 0)),
+        backgroundColor: 'rgba(148, 163, 184, 0.18)',
+        borderColor: '#94a3b8',
+        borderDash: [4, 4],
+        type: 'bar',
+        borderWidth: 1,
+        yAxisID: 'y',
+        order: 3,
+        hidden: true
+    };
+    if (segment) dataset.segment = segment;
+    datasets.push(dataset);
+}
+
+function pushDirectMarketingCandidateDataset(datasets, candidateW, segment = null) {
+    if (!Array.isArray(candidateW) || !candidateW.some(v => Number(v) > 0)) return;
+    const dataset = {
+        label: 'DV-Kandidat (Simulation)',
+        data: candidateW.map(v => Math.max(0, Number(v) || 0)),
+        backgroundColor: 'rgba(148, 163, 184, 0.18)',
+        borderColor: '#64748b',
+        borderDash: [4, 4],
+        type: 'bar',
+        borderWidth: 1,
+        yAxisID: 'y',
+        order: 3,
+        hidden: true
+    };
+    if (segment) dataset.segment = segment;
+    datasets.push(dataset);
+}
+
+function pushDirectMarketingPlannedDataset(datasets, plannedW, segment = null) {
+    if (!Array.isArray(plannedW) || !plannedW.some(v => Number(v) > 0)) return;
+    const dataset = {
+        label: 'DV-Verkaufsfenster (geplant)',
+        data: plannedW.map(v => Math.max(0, Number(v) || 0)),
+        backgroundColor: 'rgba(16, 185, 129, 0.28)',
+        borderColor: '#10b981',
+        type: 'bar',
+        borderWidth: 0,
+        borderSkipped: false,
+        barPercentage: 1.0,
+        categoryPercentage: 1.0,
+        yAxisID: 'y',
+        order: 2
+    };
+    if (segment) dataset.segment = segment;
+    datasets.push(dataset);
+}
+
+function pushDirectMarketingAuthorizedDataset(datasets, authorizedW, hardwareEffect = [], segment = null) {
+    if (!Array.isArray(authorizedW) || !authorizedW.some(v => Number(v) > 0)) return;
+    const active = {
+        label: 'DV-Verkauf (aktuell freigegeben)',
+        data: authorizedW.map(v => Math.max(0, Number(v) || 0)),
+        backgroundColor: 'rgba(5, 150, 105, 0.58)',
+        borderColor: '#047857',
+        type: 'bar',
+        borderWidth: 1.5,
+        yAxisID: 'y',
+        order: 1,
+        e3dcAlwaysVisible: true
+    };
+    if (segment) active.segment = segment;
+    datasets.push(active);
+    if (Array.isArray(hardwareEffect) && hardwareEffect.some(Boolean)) {
+        const effect = {
+            label: 'DV-Wirkung bestätigt',
+            data: authorizedW.map((value, index) => hardwareEffect[index] ? Math.max(0, Number(value) || 0) : 0),
+            borderColor: '#34d399',
+            backgroundColor: 'rgba(0,0,0,0)',
+            type: 'line',
+            pointRadius: 3,
+            borderWidth: 2,
+            yAxisID: 'y',
+            order: 0
+        };
+        if (segment) effect.segment = segment;
+        datasets.push(effect);
+    }
+}
+
+function updateForecastProjectionStatus(data) {
+    const container = document.getElementById('liveChartContainer');
+    if (!container) return;
+    let status = container.querySelector('[data-forecast-projection-status]');
+    if (!status) {
+        status = document.createElement('div');
+        status.dataset.forecastProjectionStatus = '1';
+        status.style.cssText = 'position:absolute;left:10px;right:10px;bottom:6px;z-index:3;padding:4px 8px;border-radius:6px;font-size:.78rem;text-align:center;pointer-events:none;';
+        container.appendChild(status);
+    }
+    const contract = data && typeof data.storage_projection_status === 'object'
+        ? data.storage_projection_status
+        : null;
+    if (!contract) {
+        if ((data && data.error) || !data || !Array.isArray(data.labels) || data.labels.length === 0) {
+            status.textContent = 'Ladekurve derzeit nicht verfügbar: Prognosedaten fehlen oder sind ungültig.';
+            status.style.background = 'rgba(220,53,69,.18)';
+            status.style.color = '#dc3545';
+            status.hidden = false;
+            return;
+        }
+        status.hidden = true;
+        status.textContent = '';
+        return;
+    }
+    if (contract.status === 'coherent' && contract.plan_fresh !== false) {
+        status.hidden = true;
+        status.textContent = '';
+        return;
+    }
+    const reasons = {
+        PLAN_INVALID: 'kanonischer Plan ungültig',
+        PLAN_CHANGED_DURING_READ: 'Planrevision wechselte während des Abrufs',
+        RUNTIME_INVALID: 'aktuelle Runtime ungültig',
+        RUNTIME_PLAN_MISMATCH: 'Runtime gehört zu einer anderen Planrevision',
+        RUNTIME_SLOT_MISMATCH: 'aktueller Runtime-Slot fehlt im Plan',
+        SNAPSHOT_MISSING: 'Plan-/Runtime-Snapshot fehlt'
+    };
+    const reason = reasons[contract.reason_code] || String(contract.reason_code || 'unbekannter Status');
+    if (contract.status === 'plan_only' && contract.plan_fresh !== false) {
+        status.textContent = `Planung sichtbar, aktuelle Freigabe nicht zugeordnet: ${reason}.`;
+        status.style.background = 'rgba(245,158,11,.18)';
+        status.style.color = '#f59e0b';
+    } else {
+        const unavailableReason = contract.plan_fresh === false ? 'Planrevision ist abgelaufen' : reason;
+        status.textContent = `Ladekurve derzeit nicht als aktuell verfügbar: ${unavailableReason}.`;
+        status.style.background = 'rgba(220,53,69,.18)';
+        status.style.color = '#dc3545';
+    }
+    status.hidden = false;
 }
 
 function normalizeElectricityPriceSeries(price) {
@@ -4133,39 +5292,82 @@ function livePvSourceInfo(data) {
     const monitor = getDirectMarketingMonitor(data) || {};
     const totalRaw = e3dcFiniteNumberOrNull(data.pv_total_w ?? data.pv);
     const externalRaw = e3dcFiniteNumberOrNull(data.pv_external_w ?? monitor.pv_external_ac_w);
+    const hasMeasurementValidity = Object.prototype.hasOwnProperty.call(data, 'pv_external_power_valid');
+    const measurementValid = data.pv_external_power_valid === true
+        || (!hasMeasurementValidity && externalRaw !== null);
+    const measurementSource = String(data.pv_external_source || '').trim().toLowerCase();
+    const topologyPresent = data.pv_external_topology_present === true || data.pv_external_capable === true;
+    const topologyValid = data.pv_external_topology_valid === true;
     const total = totalRaw !== null ? Math.max(0, totalRaw) : 0;
-    const external = externalRaw !== null ? Math.max(0, Math.min(externalRaw, total)) : 0;
-    const e3dcRaw = e3dcFiniteNumberOrNull(data.pv_e3dc_w);
-    const e3dc = e3dcRaw !== null ? Math.max(0, e3dcRaw) : Math.max(0, total - external);
+    const external = measurementValid && externalRaw !== null
+        ? Math.max(0, Math.min(externalRaw, total))
+        : 0;
+    // Eine Quelle, eine Bilanz: der E3/DC-Anteil ist stets der Rest zum bereits
+    // einmal enthaltenen externen Anteil und wird nicht nochmals addiert.
+    const e3dc = Math.max(0, total - external);
     const guardRaw = e3dcFiniteNumberOrNull(data.pv_external_charge_guard_w ?? monitor.pv_store_external_ac_guard_w);
     const guard = guardRaw !== null ? Math.max(0, guardRaw) : 0;
     const dcOnly = data.pv_dc_only_configured === true || monitor.pv_store_dc_only === true;
     const dcOnlyActive = data.pv_dc_only_active === true;
     const locked = dcOnlyActive && (data.pv_external_charge_locked === true || external > guard);
-    return {total, e3dc, external, dcOnly, dcOnlyActive, locked, guard};
+    return {
+        total,
+        e3dc,
+        external,
+        measurementValid,
+        measurementValidityReported: hasMeasurementValidity,
+        measurementSource,
+        topologyPresent,
+        topologyValid,
+        topologySource: String(data.pv_external_topology_source || 'none'),
+        topologyEvidenceState: String(data.pv_external_topology_evidence_state || 'unknown'),
+        dcOnly,
+        dcOnlyActive,
+        locked,
+        guard
+    };
 }
 
 function livePvSourceSplitText(data, separator = ' | ', compact = false) {
     const pv = livePvSourceInfo(data);
-    if (!(pv.external > 20 || pv.dcOnly)) return '';
-    const e3dcLabel = compact ? 'E3DC' : 'E3DC-PV';
-    const externalLabel = compact ? 'Zusatz' : 'Zusatz-WR';
+    if (!(pv.topologyPresent || pv.external > 20 || pv.dcOnly)) return '';
+    const e3dcLabel = compact && !getEnergyFlowLabels().pv ? 'E3DC' : getFlowLabel('pv');
+    const externalLabel = getFlowLabel('external_pv');
     const parts = [
         `${e3dcLabel} ${flowPlainWatts(pv.e3dc)}`,
-        `${externalLabel} ${flowPlainWatts(pv.external)}${pv.locked ? ' gesperrt' : ''}`
+        `${externalLabel} ${pv.measurementValid ? flowPlainWatts(pv.external) : '--'}${pv.locked ? ' gesperrt' : ''}`
     ];
     return parts.join(separator);
 }
 
 function livePvSourceSplitHtml(data, separator = ' | ', compact = false) {
     const pv = livePvSourceInfo(data);
-    if (!(pv.external > 20 || pv.dcOnly)) return '';
-    const e3dcLabel = compact ? 'E3DC' : 'E3DC-PV';
-    const externalLabel = compact ? 'Zusatz' : 'Zusatz-WR';
+    if (!(pv.topologyPresent || pv.external > 20 || pv.dcOnly)) return '';
+    const e3dcLabel = compact && !getEnergyFlowLabels().pv ? 'E3DC' : getFlowLabel('pv');
+    const externalLabel = getFlowLabel('external_pv');
     const lock = pv.locked
         ? ' <i class="fas fa-lock text-warning" title="Nur E3DC-DC-PV laden: Zusatz-WR ist für Akkuladung gesperrt"></i>'
         : '';
-    return `${e3dcLabel} ${flowPlainWatts(pv.e3dc)}${separator}${externalLabel} ${flowPlainWatts(pv.external)}${lock}`;
+    return `${e3dcLabel} ${flowPlainWatts(pv.e3dc)}${separator}${externalLabel} ${pv.measurementValid ? flowPlainWatts(pv.external) : '--'}${lock}`;
+}
+
+function externalPvTopologyVisual(data, nodeState = {}) {
+    const pv = livePvSourceInfo(data);
+    const configured = nodeState.configured === true;
+    const controlAvailable = nodeState.controlAvailable === true;
+    const positiveLiveEvidence = pv.measurementValidityReported
+        && pv.measurementValid
+        && pv.external > 20
+        && pv.measurementSource === 'e3dc_add_power';
+    return {
+        visible: pv.topologyPresent || configured || positiveLiveEvidence,
+        measurementValid: pv.measurementValid,
+        valueText: pv.measurementValid ? flowPlainWatts(pv.external) : '--',
+        controlAvailable,
+        positiveLiveEvidence,
+        topologySource: pv.topologySource,
+        evidenceState: pv.topologyEvidenceState
+    };
 }
 
 function livePvBreakdownHtml(data) {
@@ -4324,11 +5526,21 @@ function updateEnergyFlowAuxInverterShellyBadge(data, container = document.getEl
     if (Object.keys(state).length) window._directMarketingAuxInverterShellyState = state;
     const pvSource = livePvSourceInfo(data);
     const externalW = pvSource.external;
+    const visual = externalPvTopologyVisual(data, {
+        configured: node.dataset.externalPvConfigured === '1' || state.ip_configured === true,
+        controlAvailable: state.lock_available === true && state.control_available === true
+    });
+    const capable = visual.visible;
+    node.hidden = !capable;
+    container.querySelectorAll('#flow-line-external-pv, #flow-dot-external-pv').forEach(line => {
+        line.style.display = capable ? '' : 'none';
+    });
+    if (!capable) return;
     const status = String(state.status || (externalW > 20 ? 'wr_on' : 'unknown'));
     const manualLocked = state.manual_locked === true || status === 'manual_locked';
     const priceLocked = status === 'wr_off' && !manualLocked;
     const wrEnabled = state.desired_wr_on === true || ['wr_on', 'load_unblocked'].includes(status);
-    const producing = wrEnabled && externalW > 20;
+    const producing = pvSource.measurementValid && externalW > 20;
     const commandStatus = String(state.command_status || '');
     const remaining = Math.max(0, parseInt(state.switch_lock_remaining_s || 0, 10) || 0);
     const exportConstraintClass = String(monitor.export_constraint_class || state.export_constraint_class || '');
@@ -4351,7 +5563,7 @@ function updateEnergyFlowAuxInverterShellyBadge(data, container = document.getEl
     const lockIcon = node.querySelector('#f-external-pv-lock');
     const button = node.querySelector('#f-external-pv-lock-btn');
 
-    if (value) value.textContent = flowPlainWatts(externalW);
+    if (value) value.textContent = visual.valueText;
     node.classList.toggle('is-producing', producing);
     node.classList.toggle('is-manual-locked', manualLocked);
     node.classList.toggle('is-price-locked', priceLocked);
@@ -4369,19 +5581,26 @@ function updateEnergyFlowAuxInverterShellyBadge(data, container = document.getEl
     else if (status === 'local_fallback') labelText = 'Lokal gesteuert';
     else if (status === 'http_error') labelText = 'Shelly-Fehler';
     else if (wrEnabled) labelText = 'Aktiv';
-    if (label) label.textContent = labelText;
+    const displayLabel = getFlowLabel('external_pv');
+    node.dataset.flowStatus = labelText;
+    if (label) label.textContent = displayLabel;
 
     if (button) {
+        const lockAvailable = visual.controlAvailable;
+        button.hidden = !lockAvailable;
+        button.disabled = !lockAvailable;
         button.setAttribute('aria-pressed', manualLocked ? 'true' : 'false');
-        button.title = manualLocked ? 'Manuelle Sperre aufheben' : 'Zusatz-WR manuell sperren';
+        button.title = manualLocked ? `Sperre für ${displayLabel} aufheben` : `${displayLabel} manuell sperren`;
         button.setAttribute('aria-label', button.title);
         const icon = button.querySelector('i');
         if (icon) icon.className = manualLocked ? 'fas fa-lock-open' : 'fas fa-lock';
     }
 
     const title = [
-        `Zusatz-WR: ${labelText}`,
-        `Leistung: ${flowPlainWatts(externalW)}`,
+        `${displayLabel}: ${labelText}`,
+        `Leistung: ${visual.valueText}`,
+        `Topologie: ${visual.evidenceState} (${visual.topologySource})`,
+        !pvSource.measurementValid ? 'Momentanleistung derzeit ungültig oder nicht verfügbar' : '',
         state.price_ct_kwh !== null && state.price_ct_kwh !== undefined ? `Marktpreis: ${Number(state.price_ct_kwh).toLocaleString('de-DE', {maximumFractionDigits: 3})} ct/kWh` : '',
         exportConstraintClass === 'eeg_soft' ? 'EEG-weich: PV-Einspeisung zulässig' : '',
         exportConstraintClass === 'negative_hard' ? 'Negativpreis-hart: Gesamt-Export vermeiden' : '',
@@ -4396,14 +5615,26 @@ function updateEnergyFlowAuxInverterShellyBadge(data, container = document.getEl
 
 function updateEnergyFlowPvNodes(data, container = document.getElementById('flow-view')) {
     const pvSource = livePvSourceInfo(data);
-    const hasExternalNode = !!(container && container.querySelector('[data-flow-node="external_pv"]'));
-    const mainPvW = hasExternalNode ? pvSource.e3dc : pvSource.total;
-    const main = document.getElementById('f-val-pv');
-    if (main) main.textContent = flowPlainWatts(mainPvW);
     updateEnergyFlowPvSplit(data, container);
     updateEnergyFlowLuoxBadge(data, container);
     updateEnergyFlowAuxInverterShellyBadge(data, container);
-    return {mainPvW, externalPvW: hasExternalNode ? pvSource.external : 0};
+    const externalNode = container ? container.querySelector('[data-flow-node="external_pv"]') : null;
+    const externalVisible = !!(externalNode && !externalNode.hidden);
+    const mainPvW = externalVisible ? pvSource.e3dc : pvSource.total;
+    const main = document.getElementById('f-val-pv');
+    if (main) main.textContent = flowPlainWatts(mainPvW);
+    return {mainPvW, externalPvW: externalVisible ? pvSource.external : 0};
+}
+
+function updateEnergyFlowAggregates(values = {}, container = document.getElementById('flow-view')) {
+    const generationW = Math.max(0, Number(values.pv || 0)) + Math.max(0, Number(values.external_pv || 0));
+    const consumptionW = ['home', 'wallbox', 'wallbox2', 'wp', 'hs', 'climate']
+        .reduce((sum, key) => sum + Math.max(0, Number(values[key] || 0)), 0);
+    const generation = container ? container.querySelector('#f-val-generation') : null;
+    const consumption = container ? container.querySelector('#f-val-consumption') : null;
+    if (generation) generation.textContent = flowPlainWatts(generationW);
+    if (consumption) consumption.textContent = flowPlainWatts(consumptionW);
+    return {generationW, consumptionW};
 }
 
 function chartRawY(ctx) {
@@ -4471,13 +5702,13 @@ function toggleChartFlip(applyOnly = false) {
         if (chartFlipNegatives) btn.classList.add('active');
         else btn.classList.remove('active');
     });
-    
+
     if (applyOnly === true) return;
 
     const modeSelect = document.getElementById('chart-mode-select');
     const isForecast = (modeSelect && modeSelect.value === 'forecast') || window.location.search.includes('seite=forecast');
     const isHybridMobile = window.location.search.includes('seite=hybrid');
-    
+
     if (isForecast) {
         if (typeof loadJsForecastChart === 'function') loadJsForecastChart('');
     } else if (isHybridMobile) {
@@ -4514,15 +5745,15 @@ let autoRefreshJsChart = null;
 
 function loadJsLiveChart(hours, file = null) {
     currentLiveHours = hours;
-    
+
     let url = 'get_chart_data.php?hours=' + hours;
     if (file) url += '&file=' + encodeURIComponent(file);
-    
+
     fetch(url)
         .then(r => r.json())
         .then(data => {
             if (data.error) return;
-            
+
             // Forecast-SoC ist eine geplante Kurve, keine BMS-Messreihe.
             if (data.soc && data.bat) {
                 data.soc = applyPhysicalSocFilter(data.soc, data.bat);
@@ -4531,7 +5762,7 @@ function loadJsLiveChart(hours, file = null) {
             const isDarkMode = typeof DARK_MODE !== 'undefined' ? DARK_MODE : true;
             const textColor = isDarkMode ? '#aaa' : '#666';
             const gridColor = isDarkMode ? '#333' : '#e9ecef';
-            
+
             const mapFlip = (arr) => chartFlipNegatives && arr ? arr.map(value => {
                 const n = e3dcFiniteNumberOrNull(value);
                 return n === null ? null : Math.abs(n);
@@ -4542,7 +5773,7 @@ function loadJsLiveChart(hours, file = null) {
                 const p1 = arr ? e3dcFiniteNumberOrNull(arr[ctx.p1DataIndex]) : null;
                 return chartFlipNegatives && ((p0 !== null && p0 < 0) || (p1 !== null && p1 < 0)) ? [4, 4] : undefined;
             };
-            
+
             let datasets = [];
             let yAxes = { y: { type: 'linear', display: true, position: 'left', grid: { color: gridColor }, ticks: { color: textColor } } };
 
@@ -4628,7 +5859,7 @@ function loadJsLiveChart(hours, file = null) {
                 datasets = [
                     { label: 'Sonne (PV)', data: data.pv, borderColor: getFlowColor('pv', '#ffc107'), backgroundColor: flowColorAlpha('pv', 0.15, '#ffc107'), fill: true, tension: 0.3, pointRadius: 0, borderWidth: 2, yAxisID: 'y', order: 10 }
                 ];
-                
+
                 // --- NEU: PEAK SHAVING OVERLAY ---
                 if (typeof SHOW_PEAK_SHAVING !== 'undefined' && SHOW_PEAK_SHAVING && typeof E3DC_LIMITS !== 'undefined' && E3DC_LIMITS.einspeise > 0) {
                     let limitLineData = data.pv.map((_, i) => {
@@ -4639,7 +5870,7 @@ function loadJsLiveChart(hours, file = null) {
                         let rawLimit = E3DC_LIMITS.wr > 0 ? Math.min(E3DC_LIMITS.wr, maxAc) : maxAc;
                         return Math.min(rawLimit, data.pv[i]);
                     });
-                    
+
                     let kuppeData = [...data.pv];
                     let gridLimit = data.pv.map((_, i) => {
                         let h = data.home ? (data.home[i] || 0) : 0;
@@ -4649,7 +5880,7 @@ function loadJsLiveChart(hours, file = null) {
                         let gl = E3DC_LIMITS.einspeise + h + w + c + Math.abs(b);
                         return chartFlipNegatives ? gl : -gl;
                     });
-                    
+
                     datasets.push({ label: '__HIDDEN__Abregel-Limit', data: limitLineData, showLine: false, borderColor: 'rgba(32, 201, 151, 0)', backgroundColor: 'rgba(32, 201, 151, 0)', borderWidth: 0, pointRadius: 0, pointHoverRadius: 0, pointHitRadius: 0, hoverBorderWidth: 0, fill: false, tension: 0.3, yAxisID: 'y', order: 9 });
                     datasets.push({ label: 'Peak-Ersparnis', data: kuppeData, showLine: false, borderColor: 'rgba(32, 201, 151, 0)', fill: { target: '-1', above: 'rgba(32, 201, 151, 0.7)', below: 'rgba(32, 201, 151, 0)' }, tension: 0.3, pointRadius: 0, pointHoverRadius: 0, pointHitRadius: 0, borderWidth: 0, yAxisID: 'y', order: 8 });
                     datasets.push({ label: 'Netzeinspeise-Limit', data: gridLimit, borderColor: 'rgba(255, 0, 0, 0.5)', borderDash: [5, 5], fill: false, tension: 0.3, pointRadius: 0, borderWidth: 1, yAxisID: 'y', order: 11 });
@@ -4663,6 +5894,7 @@ function loadJsLiveChart(hours, file = null) {
                 );
                 pushStorageTargetCurveDataset(datasets, data.storage_target_curve);
                 pushMarketChargeDataset(datasets, data.market_charge);
+                pushPredumpCandidateDataset(datasets, data.predump_candidate_w);
                 pushPredumpHeadroomDataset(datasets, data.predump_w);
                 if (data.wb && data.wb.length > 0 && Math.max(...data.wb.map(Math.abs)) > 0) datasets.push({ label: 'Wallbox 1', data: mapFlip(data.wb), borderColor: getFlowColor('wallbox', '#2ecc71'), tension: 0.3, pointRadius: 0, borderWidth: 2, yAxisID: 'y', segment: { borderDash: dashIfNeg(data.wb) }, order: 10 });
                 if (data.wb2 && data.wb2.length > 0 && Math.max(...data.wb2.map(Math.abs)) > 0) datasets.push({ label: 'Wallbox 2', data: mapFlip(data.wb2), borderColor: getFlowColor('wallbox2', '#34d399'), borderDash: [2, 3], tension: 0.3, pointRadius: 0, borderWidth: 2, yAxisID: 'y', segment: { borderDash: dashIfNeg(data.wb2) }, order: 10 });
@@ -4670,13 +5902,13 @@ function loadJsLiveChart(hours, file = null) {
                 if (data.wp && data.wp.length > 0 && Math.max(...data.wp) > 0) datasets.push({ label: 'Wärmepumpe', data: data.wp, borderColor: getFlowColor('heatpump', '#f97316'), tension: 0.3, pointRadius: 0, borderWidth: 2, yAxisID: 'y', order: 10 });
                 if (data.climate && data.climate.length > 0 && Math.max(...data.climate) > 0) datasets.push({ label: 'Klima', data: data.climate, borderColor: getFlowColor('climate', '#38bdf8'), tension: 0.3, pointRadius: 0, borderWidth: 2, yAxisID: 'y', order: 10 });
                 if (data.dv_grid && data.dv_grid.length > 0 && Math.max(...data.dv_grid) > 0) datasets.push({ label: 'Direktvermarktung (Verkauf)', data: data.dv_grid, backgroundColor: 'rgba(16, 185, 129, 0.6)', borderColor: '#10b981', type: 'bar', borderWidth: 1, yAxisID: 'y', order: 0 });
-                
+
                 yAxes['y1'] = { type: 'linear', display: true, position: 'right', min: 0, max: 100, grid: { drawOnChartArea: false }, ticks: { color: textColor } };
                 if (pushElectricityPriceDataset(datasets, data.price, 'y2', 'Strompreis')) {
                     yAxes['y2'] = { type: 'linear', display: true, position: 'right', grid: { drawOnChartArea: false }, ticks: { color: textColor } };
                 }
             }
-            
+
             datasets = applyHiddenState(datasets);
 
             if (liveLineChart) {
@@ -4691,9 +5923,9 @@ function loadJsLiveChart(hours, file = null) {
                     options: {
                         responsive: true, maintainAspectRatio: false, interaction: { mode: 'index', intersect: false },
                         plugins: {
-                            legend: { 
-                                position: 'top', 
-                                labels: { 
+                            legend: {
+                                position: 'top',
+                                labels: {
                                     usePointStyle: true, boxWidth: 8, padding: 15, color: textColor,
                                     filter: function(item, chart) { return item.text && !item.text.includes('__HIDDEN__'); }
                                 },
@@ -4706,7 +5938,7 @@ function loadJsLiveChart(hours, file = null) {
                                     saveHiddenDataset(legendItem.text, isHidden);
                                 }
                             },
-                            tooltip: { 
+                            tooltip: {
                                 filter: function(item) {
                                     if (item.dataset.label && item.dataset.label.includes('__HIDDEN__')) return false;
                                     if (item.dataset.label === 'Peak-Ersparnis') {
@@ -4724,7 +5956,7 @@ function loadJsLiveChart(hours, file = null) {
                                 if (l.includes('(%)') || l === 'SoC (%)') unit = '%'; else if (l.includes('Spannung')) unit = 'V'; else if (l.includes('Strompreis')) unit = 'ct/kWh'; else if (l.includes('Strom')) unit = 'A';
                                 else if (l.includes('(°C)')) unit = '°C'; else if (l.includes('(Hz)')) unit = 'Hz';
                                 let cleanLabel = l.replace(/\s\([^)]+\)/, ''); // Entfernt "(°C)" aus der Anzeige im Text
-                                
+
                                 let origVal = chartRawY(ctx);
                                 if (chartFlipNegatives) {
                                     if (l === 'Batterie Leistung' || l === 'Batterie') origVal = data.bat[ctx.dataIndex];
@@ -4738,7 +5970,7 @@ function loadJsLiveChart(hours, file = null) {
                                     else if (l === 'Strom') origVal = data.bat_a[ctx.dataIndex];
                                     else if (l === 'Strom K2') origVal = data.bat1_a[ctx.dataIndex];
                                 }
-                                
+
                                 let val = chartRawY(ctx);
                                 if (cleanLabel === 'Peak-Ersparnis') {
                                     let limitIdx = ctx.chart.data.datasets.findIndex(d => d.label === '__HIDDEN__Abregel-Limit');
@@ -4767,7 +5999,7 @@ function loadJsLiveChart(hours, file = null) {
                 const canvas = document.getElementById('liveChartCanvas');
                 if (canvas) canvas.ondblclick = () => { if (liveLineChart) liveLineChart.resetZoom(); };
             }
-            
+
             if (autoRefreshJsChart) clearInterval(autoRefreshJsChart);
             autoRefreshJsChart = setInterval(() => {
                 const container = document.getElementById('liveChartContainer');
@@ -4778,12 +6010,13 @@ function loadJsLiveChart(hours, file = null) {
 
 function loadJsForecastChart(file = '') {
     const url = file ? 'get_forecast_data.php?file=' + encodeURIComponent(file) : 'get_forecast_data.php';
-    
+
     fetch(url)
         .then(r => r.json())
         .then(data => {
+            updateForecastProjectionStatus(data);
             if (data.error || !data.labels || data.labels.length === 0) return;
-            
+
             // SoC kommt aus der physikalischen Batterie-Bilanz der Prognose.
             // Keine nachtraegliche Wert-Glaettung, sonst kann die Linie vor
             // echter Batterieladung ansteigen.
@@ -4791,11 +6024,19 @@ function loadJsForecastChart(file = '') {
             const isDarkMode = typeof DARK_MODE !== 'undefined' ? DARK_MODE : true;
             const textColor = isDarkMode ? '#aaa' : '#666';
             const gridColor = isDarkMode ? '#333' : '#e9ecef';
-            
+
             const mapFlip = (arr) => chartFlipNegatives && arr ? arr.map(Math.abs) : arr;
             const dashIfNeg = (arr) => (ctx) => chartFlipNegatives && arr && (arr[ctx.p0DataIndex] < 0 || arr[ctx.p1DataIndex] < 0) ? [4, 4] : undefined;
-            const directMarketingExport = Array.isArray(data.direct_marketing_export)
-                ? data.direct_marketing_export.map(v => parseFloat(v) || 0)
+            const directMarketingAuthorized = Array.isArray(data.direct_marketing_authorized_export_w)
+                ? data.direct_marketing_authorized_export_w.map(v => Math.max(0, parseFloat(v) || 0))
+                : (Array.isArray(data.direct_marketing_export)
+                    ? data.direct_marketing_export.map(v => Math.max(0, parseFloat(v) || 0))
+                    : []);
+            const directMarketingPlanned = Array.isArray(data.direct_marketing_planned_w)
+                ? data.direct_marketing_planned_w.map(v => Math.max(0, parseFloat(v) || 0))
+                : [];
+            const directMarketingHardwareEffect = Array.isArray(data.direct_marketing_hardware_effect)
+                ? data.direct_marketing_hardware_effect.map(Boolean)
                 : [];
             const directMarketingCharge = Array.isArray(data.direct_marketing_charge)
                 ? data.direct_marketing_charge.map(v => parseFloat(v) || 0)
@@ -4806,31 +6047,26 @@ function loadJsForecastChart(file = '') {
             const predumpHeadroomW = Array.isArray(data.predump_w)
                 ? data.predump_w.map(v => Math.max(0, parseFloat(v) || 0))
                 : [];
-            const hasDirectMarketingExport = directMarketingExport.some(v => Math.abs(v) > 0);
+            const predumpCandidateW = Array.isArray(data.predump_candidate_w)
+                ? data.predump_candidate_w.map(v => Math.max(0, parseFloat(v) || 0))
+                : [];
             const hasDirectMarketingCharge = directMarketingCharge.some(v => Math.abs(v) > 0);
-            const hasDirectMarketingSoc = directMarketingSoc.some(v => v !== null && v !== undefined);
+            const hasDirectMarketingSoc = directMarketingSocProjectionUsable(data)
+                && directMarketingSoc.some(v => v !== null && v !== undefined);
+            const forecastSocCurrent = !data.storage_projection_status
+                || data.storage_projection_status.soc_curve_current !== false;
             const socAfterDirectMarketing = hasDirectMarketingSoc
                 ? data.soc.map((value, index) => directMarketingSoc[index] ?? value)
                 : data.soc;
-            
+
             let datasets = [
                 { label: 'Sonne (PV)', data: data.pv, borderColor: getFlowColor('pv', '#ffc107'), backgroundColor: flowColorAlpha('pv', 0.15, '#ffc107'), fill: true, tension: 0.3, pointRadius: 0, borderWidth: 2, yAxisID: 'y', order: 10 },
                 { label: 'Hausverbrauch', data: data.home, borderColor: getFlowColor('home', '#0dcaf0'), tension: 0.3, pointRadius: 0, borderWidth: 2, yAxisID: 'y', order: 10 },
                 { label: 'Batterie', data: mapFlip(data.bat), borderColor: getFlowColor('battery', '#198754'), tension: 0.3, pointRadius: 0, borderWidth: 2, yAxisID: 'y', segment: { borderDash: dashIfNeg(data.bat) }, order: 10 },
                 { label: 'Netz', data: mapFlip(data.grid), borderColor: getFlowColor('grid', '#6c757d'), tension: 0.3, pointRadius: 0, borderWidth: 2, yAxisID: 'y', segment: { borderDash: dashIfNeg(data.grid) }, order: 10 }
             ];
-            if (hasDirectMarketingExport) {
-                datasets.push({
-                    label: 'DV-Verkauf geplant',
-                    data: directMarketingExport,
-                    backgroundColor: 'rgba(16, 185, 129, 0.42)',
-                    borderColor: '#10b981',
-                    type: 'bar',
-                    borderWidth: 1,
-                    yAxisID: 'y',
-                    order: 1
-                });
-            }
+            pushDirectMarketingPlannedDataset(datasets, directMarketingPlanned);
+            pushDirectMarketingAuthorizedDataset(datasets, directMarketingAuthorized, directMarketingHardwareEffect);
             if (hasDirectMarketingCharge) {
                 datasets.push({
                     label: 'DV-PV-Speichern geplant',
@@ -4843,6 +6079,7 @@ function loadJsForecastChart(file = '') {
                     order: 2
                 });
             }
+            pushPredumpCandidateDataset(datasets, predumpCandidateW);
             pushPredumpHeadroomDataset(datasets, predumpHeadroomW);
             if (hasDirectMarketingSoc) {
                 datasets.push({
@@ -4861,7 +6098,9 @@ function loadJsForecastChart(file = '') {
                 });
             }
             datasets.push({
-                label: hasDirectMarketingSoc ? 'SoC-Prognose nach DV-Plan (%)' : 'SoC (%)',
+                label: forecastSocCurrent
+                    ? (hasDirectMarketingSoc ? 'SoC-Prognose nach DV-Plan (%)' : 'SoC (%)')
+                    : 'SoC-Planung (nicht aktuell) (%)',
                 data: socAfterDirectMarketing,
                 borderColor: hasDirectMarketingSoc ? '#10b981' : '#20c997',
                 backgroundColor: hasDirectMarketingSoc ? 'rgba(16,185,129,0.08)' : 'rgba(32,201,151,0.08)',
@@ -4870,6 +6109,7 @@ function loadJsForecastChart(file = '') {
                 stepped: hasDirectMarketingSoc ? 'after' : false,
                 pointRadius: 0,
                 borderWidth: hasDirectMarketingSoc ? 2.5 : 2,
+                borderDash: forecastSocCurrent ? undefined : [5, 5],
                 yAxisID: 'y1',
                 order: 5
             });
@@ -4881,7 +6121,7 @@ function loadJsForecastChart(file = '') {
             if (data.wp && data.wp.length > 0 && Math.max(...data.wp) > 0) datasets.push({ label: 'Wärmepumpe', data: data.wp, borderColor: getFlowColor('heatpump', '#f97316'), tension: 0.3, pointRadius: 0, borderWidth: 2, yAxisID: 'y', order: 10 });
             if (data.climate && data.climate.length > 0 && Math.max(...data.climate) > 0) datasets.push({ label: 'Klima', data: data.climate, borderColor: getFlowColor('climate', '#38bdf8'), tension: 0.3, pointRadius: 0, borderWidth: 2, yAxisID: 'y', order: 10 });
             if (data.dv_grid && data.dv_grid.length > 0 && Math.max(...data.dv_grid) > 0) datasets.push({ label: 'Direktvermarktung (Verkauf)', data: data.dv_grid, backgroundColor: 'rgba(16, 185, 129, 0.6)', borderColor: '#10b981', type: 'bar', borderWidth: 1, yAxisID: 'y', order: 0 });
-            
+
             let yAxes = {
                 y: { type: 'linear', display: true, position: 'left', grid: { color: gridColor }, ticks: { color: textColor } },
                 y1: { type: 'linear', display: true, position: 'right', min: 0, max: 100, grid: { drawOnChartArea: false }, ticks: { color: textColor } }
@@ -4896,9 +6136,9 @@ function loadJsForecastChart(file = '') {
             if (data.pv_m1 && data.pv_m1.some(v => v !== null)) datasets.push({ label: 'Forecast.Solar', data: data.pv_m1, borderColor: 'rgba(255, 99, 132, 0.6)', borderDash: [3, 3], fill: false, tension: 0.4, pointRadius: 0, borderWidth: 1.5, yAxisID: 'y', hidden: true, order: 9 });
             if (data.pv_m2 && data.pv_m2.some(v => v !== null)) datasets.push({ label: 'Open-Meteo', data: data.pv_m2, borderColor: 'rgba(54, 162, 235, 0.6)', borderDash: [3, 3], fill: false, tension: 0.4, pointRadius: 0, borderWidth: 1.5, yAxisID: 'y', hidden: true, order: 9 });
             if (data.pv_m3 && data.pv_m3.some(v => v !== null)) datasets.push({ label: 'Solcast', data: data.pv_m3, borderColor: 'rgba(255, 206, 86, 0.6)', borderDash: [3, 3], fill: false, tension: 0.4, pointRadius: 0, borderWidth: 1.5, yAxisID: 'y', hidden: true, order: 9 });
-            
+
             datasets = applyHiddenState(datasets);
-            
+
             if (liveLineChart) {
                 liveLineChart.resetZoom();
                 liveLineChart.options.plugins.legend.display = true;
@@ -4912,9 +6152,9 @@ function loadJsForecastChart(file = '') {
                     options: {
                         responsive: true, maintainAspectRatio: false, interaction: { mode: 'index', intersect: false },
                         plugins: {
-                            legend: { 
-                                position: 'top', 
-                                labels: { 
+                            legend: {
+                                position: 'top',
+                                labels: {
                                     usePointStyle: true, boxWidth: 8, padding: 15, color: textColor,
                                     filter: function(item) { return item.text && !item.text.includes('__HIDDEN__'); }
                                 },
@@ -4927,7 +6167,7 @@ function loadJsForecastChart(file = '') {
                                     saveHiddenDataset(legendItem.text, isHidden);
                                 }
                             },
-                            tooltip: { 
+                            tooltip: {
                                 filter: function(item) {
                                     if (item.dataset && item.dataset.label && item.dataset.label.includes('__HIDDEN__')) return false;
                                     return true;
@@ -4937,7 +6177,7 @@ function loadJsForecastChart(file = '') {
                                 if (l && l.includes('__HIDDEN__')) return '';
                                 if (l.includes('(%)') || l === 'SoC (%)') unit = '%'; else if (l.toLowerCase().includes('preis')) unit = 'ct/kWh';
                                 let cleanLabel = l.replace(/\s\([^)]+\)/, '');
-                                
+
                                 let origVal = chartRawY(ctx);
                                 if (chartFlipNegatives) {
                                     if (l === 'Batterie') origVal = data.bat[ctx.dataIndex];
@@ -4945,7 +6185,7 @@ function loadJsForecastChart(file = '') {
                                     else if (l === 'Wallbox 2') origVal = data.wb2[ctx.dataIndex];
                                     else if (l === 'Netz') origVal = data.grid[ctx.dataIndex];
                                 }
-                                
+
                                 let val = chartRawY(ctx);
                                 if (cleanLabel === 'Batterie' || cleanLabel === 'Batterie Leistung') {
                                     cleanLabel = origVal > 0 ? 'Laden' : (origVal < 0 ? 'Entladen' : 'Batterie');
@@ -4970,7 +6210,7 @@ function loadJsForecastChart(file = '') {
                 if (canvas) canvas.ondblclick = () => { if (liveLineChart) liveLineChart.resetZoom(); };
             }
             if (autoRefreshJsChart) clearInterval(autoRefreshJsChart);
-            
+
             // --- Tagessummen in dediziertes Element schreiben (unabhängig von diagramDetails) ---
             const forecastBar = document.getElementById('forecast-kwh-summary');
             if (forecastBar && data.daily_summary) {
@@ -4979,7 +6219,7 @@ function loadJsForecastChart(file = '') {
                     const n = parseFloat(v);
                     return Number.isFinite(n) ? n.toFixed(1) : '?';
                 };
-                
+
                 const hasWpData = (s.tomorrow && s.tomorrow.wp_kwh > 0) || (s.day_after && s.day_after.wp_kwh > 0);
                 const hasClimateData = (s.tomorrow && s.tomorrow.climate_kwh > 0) || (s.day_after && s.day_after.climate_kwh > 0);
                 const forecastSummaryValue = (icon, title, value) =>
@@ -5008,7 +6248,7 @@ function loadJsForecastChart(file = '') {
                     forecastSummaryDayBlock('tomorrow', 'Morgen', s.tomorrow, 'Morgen: Verbrauch'),
                     forecastSummaryDayBlock('day-after', 'Übermorgen', s.day_after, 'Übermorgen: Verbrauch')
                 ].filter(Boolean).join('');
-                
+
                 if (html) {
                     forecastBar.innerHTML = html;
                     forecastBar.style.display = '';
@@ -5021,7 +6261,7 @@ function loadJsForecastChart(file = '') {
 
 function loadJsHybridChart(hours, file = null) {
     currentLiveHours = hours;
-    
+
     // Hälfte der Zeit für Vergangenheit, Hälfte für Zukunft
     const pastHours = hours / 2;
     const futureHours = hours / 2;
@@ -5059,7 +6299,7 @@ function loadJsHybridChart(hours, file = null) {
 
     let urlLive = 'get_chart_data.php?hours=' + pastHours;
     if (file) urlLive += '&file=' + encodeURIComponent(file);
-    
+
     let urlFore = 'get_forecast_data.php';
     if (file) urlFore += '?file=' + encodeURIComponent(file);
 
@@ -5068,6 +6308,7 @@ function loadJsHybridChart(hours, file = null) {
         fetch(urlFore).then(r => r.json())
     ]).then(([data, forecastData]) => {
         if (data.error) return;
+        updateForecastProjectionStatus(forecastData);
         if (forecastData.error || !forecastData.labels) forecastData = { labels: [], pv: [], home: [], bat: [], grid: [], soc: [] };
 
         const isDarkMode = typeof DARK_MODE !== 'undefined' ? DARK_MODE : true;
@@ -5123,7 +6364,7 @@ function loadJsHybridChart(hours, file = null) {
         });
 
         const slotKeys = Object.keys(buckets).map(Number).sort((a, b) => a - b);
-        
+
         // Finde Startpunkt für Prognose (Nahtloser Übergang ab letztem Live-Slot)
         const lastLiveMins = slotKeys.length > 0 ? slotKeys[slotKeys.length - 1] : null;
         const forecastAbsMins = [];
@@ -5151,7 +6392,7 @@ function loadJsHybridChart(hours, file = null) {
             }
         }
 
-        let labels = [], pv = [], home = [], bat = [], grid = [], soc = [], storageTargetCurve = [], marketCharge = [], predumpHeadroomW = [], directMarketingExport = [], directMarketingCharge = [], directMarketingSoc = [], wb = [], wb2 = [], wp = [], hs = [], climate = [], price = [], dv_grid = [];
+        let labels = [], pv = [], home = [], bat = [], grid = [], soc = [], storageTargetCurve = [], marketCharge = [], predumpHeadroomW = [], predumpCandidateW = [], directMarketingCandidate = [], directMarketingPlanned = [], directMarketingAuthorized = [], directMarketingHardwareEffect = [], directMarketingCharge = [], directMarketingSoc = [], directMarketingMarketPrice = [], directMarketingMarketNetSell = [], wb = [], wb2 = [], wp = [], hs = [], climate = [], price = [], dv_grid = [];
         const labelDateParts = [];
         const labelDateTimes = [];
         const daySeparatorIndices = new Set();
@@ -5170,7 +6411,7 @@ function loadJsHybridChart(hours, file = null) {
             if (absMins === null || !Number.isFinite(absMins)) return;
             forecastByAbsSlot[Math.floor(absMins / SLOT) * SLOT] = i;
         });
-        
+
         slotKeys.forEach(slotMin => {
             const b = buckets[slotMin], n = b.count || 1;
             const fmstr = fmtTime(slotMin);
@@ -5184,9 +6425,15 @@ function loadJsHybridChart(hours, file = null) {
             storageTargetCurve.push(null);
             marketCharge.push(0);
             predumpHeadroomW.push(0);
-            directMarketingExport.push(0);
+            predumpCandidateW.push(0);
+            directMarketingCandidate.push(0);
+            directMarketingPlanned.push(0);
+            directMarketingAuthorized.push(0);
+            directMarketingHardwareEffect.push(false);
             directMarketingCharge.push(0);
             directMarketingSoc.push(null);
+            directMarketingMarketPrice.push(null);
+            directMarketingMarketNetSell.push(null);
             if (hasWb1) wb.push(Math.round((b.wb || 0) / n));
             if (hasWb2) wb2.push(Math.round((b.wb2 || 0) / n));
             if (hasWp) wp.push(Math.round((b.wp || 0) / n));
@@ -5194,7 +6441,7 @@ function loadJsHybridChart(hours, file = null) {
             if (hasClimate) climate.push(Math.round((b.climate || 0) / n));
             if (hasPrice) price.push(b.price !== undefined ? +((b.price / n).toFixed(2)) : null);
             dv_grid.push(Math.round((b.dv_grid || 0) / n));
-            
+
             // History (Live-Daten) mit vergangenen Wetter-Prognosen auffüllen
             let m1 = null, m2 = null, m3 = null, ens = null;
             if (forecastData && forecastData.labels) {
@@ -5212,7 +6459,7 @@ function loadJsHybridChart(hours, file = null) {
         if (!hasPrice) price = new Array(labels.length).fill(null);
 
         const historyLength = labels.length;
-        
+
         // Prognose auf futureHours begrenzen
         const lastMins = lastLiveMins !== null ? lastLiveMins : 0;
         const endMinutes = file ? Infinity : lastMins + futureHours * 60;
@@ -5233,9 +6480,29 @@ function loadJsHybridChart(hours, file = null) {
             storageTargetCurve.push(forecastData.storage_target_curve ? (forecastData.storage_target_curve[i] ?? null) : null);
             marketCharge.push(forecastData.market_charge ? (forecastData.market_charge[i] || 0) : 0);
             predumpHeadroomW.push(forecastData.predump_w ? Math.max(0, parseFloat(forecastData.predump_w[i]) || 0) : 0);
-            directMarketingExport.push(forecastData.direct_marketing_export ? (forecastData.direct_marketing_export[i] || 0) : 0);
+            predumpCandidateW.push(forecastData.predump_candidate_w ? Math.max(0, parseFloat(forecastData.predump_candidate_w[i]) || 0) : 0);
+            directMarketingCandidate.push(forecastData.direct_marketing_candidate_w ? (forecastData.direct_marketing_candidate_w[i] || 0) : 0);
+            directMarketingPlanned.push(forecastData.direct_marketing_planned_w ? (forecastData.direct_marketing_planned_w[i] || 0) : 0);
+            directMarketingAuthorized.push(forecastData.direct_marketing_authorized_export_w
+                ? (forecastData.direct_marketing_authorized_export_w[i] || 0)
+                : (forecastData.direct_marketing_export ? (forecastData.direct_marketing_export[i] || 0) : 0));
+            directMarketingHardwareEffect.push(forecastData.direct_marketing_hardware_effect
+                ? Boolean(forecastData.direct_marketing_hardware_effect[i])
+                : false);
             directMarketingCharge.push(forecastData.direct_marketing_charge ? (forecastData.direct_marketing_charge[i] || 0) : 0);
             directMarketingSoc.push(forecastData.direct_marketing_soc ? (forecastData.direct_marketing_soc[i] ?? null) : null);
+            directMarketingMarketPrice.push(
+                forecastData.direct_marketing_market_eligible && forecastData.direct_marketing_market_eligible[i]
+                    ? (forecastData.market_price ? (forecastData.market_price[i] ?? null) : null)
+                    : null
+            );
+            directMarketingMarketNetSell.push(
+                forecastData.direct_marketing_market_eligible && forecastData.direct_marketing_market_eligible[i]
+                    ? (forecastData.direct_marketing_market_net_sell_ct
+                        ? (forecastData.direct_marketing_market_net_sell_ct[i] ?? null)
+                        : null)
+                    : null
+            );
             if (hasWb1) wb.push(forecastData.wb ? (forecastData.wb[i] || 0) : 0);
             if (hasWb2) wb2.push(forecastData.wb2 ? (forecastData.wb2[i] || 0) : 0);
             if (hasWp && forecastData.wp) wp.push(forecastData.wp[i] || 0);
@@ -5243,7 +6510,7 @@ function loadJsHybridChart(hours, file = null) {
             if (hasClimate) climate.push(forecastData.climate ? (forecastData.climate[i] || 0) : 0);
             if (hasPrice) price.push(forecastData.price ? (forecastData.price[i] ?? null) : null);
             dv_grid.push(forecastData.dv_grid ? (forecastData.dv_grid[i] || 0) : 0);
-            
+
             pv_m1.push(forecastData.pv_m1 ? (forecastData.pv_m1[i] ?? null) : null);
             pv_m2.push(forecastData.pv_m2 ? (forecastData.pv_m2[i] ?? null) : null);
             pv_m3.push(forecastData.pv_m3 ? (forecastData.pv_m3[i] ?? null) : null);
@@ -5267,24 +6534,17 @@ function loadJsHybridChart(hours, file = null) {
         if (dv_grid.length > 0 && Math.max(...dv_grid) > 0) {
             datasets.push({ label: 'Direktvermarktung (Verkauf)', data: dv_grid, backgroundColor: 'rgba(16, 185, 129, 0.6)', borderColor: '#10b981', type: 'bar', borderWidth: 1, yAxisID: 'y', order: 0 });
         }
-        const hasDirectMarketingExport = directMarketingExport.some(v => Math.abs(parseFloat(v) || 0) > 0);
         const hasDirectMarketingCharge = directMarketingCharge.some(v => Math.abs(parseFloat(v) || 0) > 0);
-        const hasDirectMarketingSoc = directMarketingSoc.some(v => v !== null && v !== undefined);
+        const hasDirectMarketingSoc = directMarketingSocProjectionUsable(forecastData)
+            && directMarketingSoc.some(v => v !== null && v !== undefined);
+        const forecastSocCurrent = !forecastData.storage_projection_status
+            || forecastData.storage_projection_status.soc_curve_current !== false;
         const socAfterDirectMarketing = hasDirectMarketingSoc
             ? soc.map((value, index) => directMarketingSoc[index] ?? value)
             : soc;
-        if (hasDirectMarketingExport) {
-            datasets.push({
-                label: 'DV-Verkauf geplant',
-                data: directMarketingExport,
-                backgroundColor: 'rgba(16, 185, 129, 0.42)',
-                borderColor: '#10b981',
-                type: 'bar',
-                borderWidth: 1,
-                yAxisID: 'y',
-                order: 1
-            });
-        }
+        const forecastSegment = { borderDash: dashIfNegOrFore(null) };
+        pushDirectMarketingPlannedDataset(datasets, directMarketingPlanned, forecastSegment);
+        pushDirectMarketingAuthorizedDataset(datasets, directMarketingAuthorized, directMarketingHardwareEffect, forecastSegment);
         if (hasDirectMarketingCharge) {
             datasets.push({
                 label: 'DV-PV-Speichern geplant',
@@ -5297,6 +6557,7 @@ function loadJsHybridChart(hours, file = null) {
                 order: 2
             });
         }
+        pushPredumpCandidateDataset(datasets, predumpCandidateW, { borderDash: dashIfNegOrFore(null, [4, 4]) });
         pushPredumpHeadroomDataset(datasets, predumpHeadroomW, { borderDash: dashIfNegOrFore(null) });
 
         datasets.push(
@@ -5318,7 +6579,7 @@ function loadJsHybridChart(hours, file = null) {
                 let rawLimit = E3DC_LIMITS.wr > 0 ? Math.min(E3DC_LIMITS.wr, maxAc) : maxAc;
                 return Math.min(rawLimit, pv[i]);
             });
-            
+
             let kuppeData = [...pv];
             let gridLimit = pv.map((_, i) => {
                 let h = home[i] || 0;
@@ -5328,7 +6589,7 @@ function loadJsHybridChart(hours, file = null) {
                 let gl = E3DC_LIMITS.einspeise + h + w + c + Math.abs(b);
                 return chartFlipNegatives ? gl : -gl;
             });
-            
+
             datasets.push({ label: '__HIDDEN__Abregel-Limit', data: limitLineData, showLine: false, borderColor: 'rgba(32, 201, 151, 0)', backgroundColor: 'rgba(32, 201, 151, 0)', borderWidth: 0, pointRadius: 0, pointHoverRadius: 0, pointHitRadius: 0, hoverBorderWidth: 0, fill: false, tension: 0.3, yAxisID: 'y', order: 9 });
             datasets.push({ label: 'Peak-Ersparnis', data: kuppeData, showLine: false, borderColor: 'rgba(32, 201, 151, 0)', fill: { target: '-1', above: 'rgba(32, 201, 151, 0.7)', below: 'rgba(32, 201, 151, 0)' }, tension: 0.3, pointRadius: 0, pointHoverRadius: 0, pointHitRadius: 0, borderWidth: 0, yAxisID: 'y', order: 8 });
             datasets.push({ label: 'Netzeinspeise-Limit', data: gridLimit, borderColor: 'rgba(255, 0, 0, 0.5)', borderDash: [5, 5], fill: false, tension: 0.3, pointRadius: 0, borderWidth: 1, yAxisID: 'y', order: 11 });
@@ -5357,7 +6618,9 @@ function loadJsHybridChart(hours, file = null) {
             });
         }
         datasets.push({
-            label: hasDirectMarketingSoc ? 'SoC-Prognose nach DV-Plan (%)' : 'SoC (%)',
+            label: forecastSocCurrent
+                ? (hasDirectMarketingSoc ? 'SoC-Prognose nach DV-Plan (%)' : 'SoC (%)')
+                : 'SoC-Planung (nicht aktuell) (%)',
             data: socAfterDirectMarketing,
             borderColor: hasDirectMarketingSoc ? '#10b981' : '#20c997',
             backgroundColor: hasDirectMarketingSoc ? 'rgba(16,185,129,0.08)' : 'rgba(32,201,151,0.08)',
@@ -5367,7 +6630,7 @@ function loadJsHybridChart(hours, file = null) {
             pointRadius: 0,
             borderWidth: hasDirectMarketingSoc ? 2.5 : 2,
             yAxisID: 'y1',
-            segment: { borderDash: dashIfNegOrFore(null) },
+            segment: { borderDash: dashIfNegOrFore(null, forecastSocCurrent ? undefined : [5, 5]) },
             order: 4
         });
         pushStorageTargetCurveDataset(datasets, storageTargetCurve, { borderDash: dashIfNegOrFore(null, [6, 4]) });
@@ -5378,16 +6641,31 @@ function loadJsHybridChart(hours, file = null) {
         if (hs.length > 0 && Math.max(...hs) > 0) datasets.push({ label: 'Heizstab', data: hs, borderColor: getFlowColor('heater', '#fd7e14'), tension: 0.3, pointRadius: 0, borderWidth: 2, yAxisID: 'y', segment: { borderDash: dashIfNegOrFore(null) }, order: 10 });
         if (wp.length > 0 && Math.max(...wp) > 0) datasets.push({ label: 'Wärmepumpe', data: wp, borderColor: getFlowColor('heatpump', '#f97316'), tension: 0.3, pointRadius: 0, borderWidth: 2, yAxisID: 'y', segment: { borderDash: dashIfNegOrFore(null) }, order: 10 });
         if (climate.length > 0 && Math.max(...climate) > 0) datasets.push({ label: 'Klima', data: climate, borderColor: getFlowColor('climate', '#38bdf8'), tension: 0.3, pointRadius: 0, borderWidth: 2, yAxisID: 'y', segment: { borderDash: dashIfNegOrFore(null) }, order: 10 });
-        
+
         let yAxes = {
             y: { type: 'linear', display: true, position: 'left', grid: { color: gridColor }, ticks: { color: textColor } },
             y1: { type: 'linear', display: true, position: 'right', min: 0, max: 100, grid: { drawOnChartArea: false }, ticks: { color: textColor } }
         };
 
-        if (pushElectricityPriceDataset(datasets, price, 'y2', 'Strompreis')) {
+        const hasPriceAxis = pushElectricityPriceDataset(datasets, price, 'y2', 'Strompreis');
+        const hasMarketWindowPrice = pushElectricityPriceDataset(
+            datasets,
+            directMarketingMarketPrice,
+            'y2',
+            'DV-Negativpreisfenster (Rohpreis)',
+            {borderColor: '#0ea5e9', borderWidth: 3, order: 9}
+        );
+        const hasMarketWindowNetSell = pushElectricityPriceDataset(
+            datasets,
+            directMarketingMarketNetSell,
+            'y2',
+            'Netto-Grenzerlös im Negativpreisfenster',
+            {borderColor: '#22c55e', borderWidth: 2.5, order: 8}
+        );
+        if (hasPriceAxis || hasMarketWindowPrice || hasMarketWindowNetSell) {
             yAxes['y2'] = { type: 'linear', display: true, position: 'right', grid: { drawOnChartArea: false }, ticks: { color: textColor } };
         }
-        
+
         datasets = applyHiddenState(datasets);
         const hybridTooltipTitle = (items) => {
             if (!items || !items.length) return '';
@@ -5429,9 +6707,9 @@ function loadJsHybridChart(hours, file = null) {
                 options: {
                     responsive: true, maintainAspectRatio: false, interaction: { mode: 'index', intersect: false },
                     plugins: {
-                        legend: { 
-                            position: 'top', 
-                            labels: { 
+                        legend: {
+                            position: 'top',
+                            labels: {
                                 usePointStyle: true, boxWidth: 8, padding: 15, color: textColor,
                                 filter: function(item, chart) { return item.text && !item.text.includes('__HIDDEN__'); }
                             },
@@ -5444,7 +6722,7 @@ function loadJsHybridChart(hours, file = null) {
                                 saveHiddenDataset(legendItem.text, isHidden);
                             }
                         },
-                            tooltip: { 
+                            tooltip: {
                             filter: function(item) {
                                 if (item.dataset && item.dataset.label && item.dataset.label.includes('__HIDDEN__')) return false;
                                 if (item.dataset && item.dataset.label === 'Peak-Ersparnis') {
@@ -5461,7 +6739,7 @@ function loadJsHybridChart(hours, file = null) {
                             if (l && l.includes('__HIDDEN__')) return '';
                             if (l.includes('(%)') || l === 'SoC (%)') unit = '%'; else if (l.toLowerCase().includes('preis')) unit = 'ct/kWh';
                             let cleanLabel = l.replace(/\s\([^)]+\)/, '');
-                            
+
                             let origVal = chartRawY(ctx);
                             if (chartFlipNegatives) {
                                 if (l === 'Batterie') origVal = bat[ctx.dataIndex];
@@ -5469,7 +6747,7 @@ function loadJsHybridChart(hours, file = null) {
                                     else if (l === 'Wallbox 2') origVal = wb2[ctx.dataIndex];
                                 else if (l === 'Netz') origVal = grid[ctx.dataIndex];
                             }
-                            
+
                             let val = chartRawY(ctx);
                             if (cleanLabel === 'Peak-Ersparnis') {
                                 let limitIdx = ctx.chart.data.datasets.findIndex(d => d.label === '__HIDDEN__Abregel-Limit');
@@ -5498,7 +6776,7 @@ function loadJsHybridChart(hours, file = null) {
             const canvas = document.getElementById('liveChartCanvas');
             if (canvas) canvas.ondblclick = () => { if (liveLineChart) liveLineChart.resetZoom(); };
         }
-        
+
         if (autoRefreshJsChart) clearInterval(autoRefreshJsChart);
         autoRefreshJsChart = setInterval(() => {
             const container = document.getElementById('liveChartContainer');
@@ -5510,10 +6788,10 @@ function loadJsHybridChart(hours, file = null) {
 
 function loadJsPriceChart(hours, file = null) {
     currentLiveHours = hours;
-    
+
     let urlLive = 'get_chart_data.php?hours=' + hours;
     if (file) urlLive += '&file=' + encodeURIComponent(file);
-    
+
     let urlFore = 'get_forecast_data.php';
     if (file) urlFore += '?file=' + encodeURIComponent(file);
 
@@ -5531,11 +6809,11 @@ function loadJsPriceChart(hours, file = null) {
         const isDarkMode = typeof DARK_MODE !== 'undefined' ? DARK_MODE : true;
         const textColor = isDarkMode ? '#aaa' : '#666';
         const gridColor = isDarkMode ? '#333' : '#e9ecef';
-        
+
         let labels = [...data.labels];
         let price = data.price ? [...data.price] : new Array(labels.length).fill(null);
         let ecoScore = data.eco_score ? [...data.eco_score] : new Array(labels.length).fill(null);
-        
+
         const historyLength = labels.length;
         let startIndex = 0;
         let lastLiveMins = 0;
@@ -5586,7 +6864,7 @@ function loadJsPriceChart(hours, file = null) {
             liveLineChart.resetZoom();
             liveLineChart.options.plugins.legend.display = true;
             liveLineChart.data.labels = labels; liveLineChart.data.datasets = datasets;
-            liveLineChart.options.scales = { x: liveLineChart.options.scales.x, ...yAxes }; 
+            liveLineChart.options.scales = { x: liveLineChart.options.scales.x, ...yAxes };
             liveLineChart.options.plugins.tooltip.callbacks.label = (ctx) => {
                 if (ctx.dataset.label === 'Strompreis (ct/kWh)') {
                     return electricityPriceTooltipLabel(ctx, ecoScore);
@@ -5598,7 +6876,7 @@ function loadJsPriceChart(hours, file = null) {
             const ctx = document.getElementById('liveChartCanvas').getContext('2d');
             liveLineChart = new Chart(ctx, { type: 'line', data: { labels: labels, datasets: datasets }, options: { responsive: true, maintainAspectRatio: false, interaction: { mode: 'index', intersect: false }, plugins: { legend: { position: 'top', labels: { usePointStyle: true, boxWidth: 8, padding: 15, color: textColor, filter: function(item) { return item.text && !item.text.includes('__HIDDEN__'); } }, onClick: function(e, legendItem, legend) { const index = legendItem.datasetIndex; const ci = legend.chart; const isHidden = ci.isDatasetVisible(index); if (isHidden) ci.hide(index); else ci.show(index); legendItem.hidden = isHidden; saveHiddenDataset(legendItem.text, isHidden); } }, tooltip: { callbacks: { label: (ctx) => { if (ctx.dataset.label === 'Strompreis (ct/kWh)') { return electricityPriceTooltipLabel(ctx, ecoScore); } else { return ` ${ctx.dataset.label}: ${chartRawY(ctx)}`; } } } }, zoom: { pan: { enabled: true, mode: 'x' }, zoom: { wheel: { enabled: true }, pinch: { enabled: true }, mode: 'x' } } }, scales: { x: { grid: { color: gridColor }, ticks: { maxTicksLimit: 12, color: textColor } }, ...yAxes } } });
         }
-        
+
         const detailsEl = document.getElementById('diagramDetails');
         if (detailsEl) {
             if (costs) {
@@ -6081,7 +7359,7 @@ function processLiveData(data) {
     cacheStorageCurveData(data);
     renderDirectMarketingDashboardStatus(data);
     smoothWallboxDisplayValues(data);
-    
+
     if (data.forecast && data.forecast.length > 0) {
         FORECAST_DATA = data.forecast;
     }
@@ -6093,7 +7371,7 @@ function processLiveData(data) {
     statusBadge.removeClass('bg-secondary bg-success bg-danger bg-warning text-dark text-white text-light');
     if (!data.ts || data.ts === 0) {
         statusBadge.addClass('bg-secondary text-light').text('Warte auf E3DC...');
-    } else if (age > 300) { 
+    } else if (age > 300) {
         statusBadge.addClass('bg-warning text-dark').text('Veraltet (' + Math.floor(age/60) + 'm)');
     } else {
         statusBadge.addClass('bg-success text-white').text('Online');
@@ -6152,12 +7430,15 @@ function processLiveData(data) {
     const wbVal = (parseFloat(data.wb) || 0) + (parseFloat(data.wb2) || 0);
     const batVal = Math.round(data.bat);
     const batAbs = Math.abs(batVal);
-    const batStat = getBatStatus(batVal, data.soc, data.notstrom_reserve);
+    const houseSocValue = data.house_battery_soc && Number.isFinite(parseFloat(data.house_battery_soc.value))
+        ? parseFloat(data.house_battery_soc.value)
+        : parseFloat(data.soc);
+    const batStat = getBatStatus(batVal, houseSocValue, data.notstrom_reserve);
     const gridVal = Math.round(data.grid);
     const gridAbs = Math.abs(gridVal);
     const wpVal = parseFloat(data.wp) || 0;
     const climateVal = Math.max(0, parseFloat(data.climate_power_w ?? data.climate ?? 0) || 0);
-    
+
     // Live Autarkie
     let autarkieLive = calculateLiveAutarky(homeVal, wbVal, wpVal, gridVal, climateVal);
     if (document.getElementById('val-autarky-live')) $('#val-autarky-live').text(autarkieLive.toFixed(0) + '%');
@@ -6165,12 +7446,13 @@ function processLiveData(data) {
     // Header Values Update (Nur auf Unterseiten vorhanden)
         if (document.getElementById('head-pv')) {
         const fmtHead = (v) => formatWatts(v).replace(/<[^>]*>?/gm, '');
-        $('#head-pv').text(fmtHead(data.pv)); $('#head-bat').text(fmtHead(batAbs)); $('#head-soc').text(Math.round(data.soc) + '%');
+        $('#head-pv').text(fmtHead(data.pv)); $('#head-bat').text(fmtHead(batAbs));
+        $('#head-soc').text(Math.round(houseSocValue) + '%').attr('title', 'Hausakku-SoC');
         $('#head-home').text(fmtHead(homeVal)); $('#head-grid').text(fmtHead(gridAbs)); $('#head-wb').text(fmtHead(wbVal));
         if(document.getElementById('head-wp')) $('#head-wp').text(fmtHead(wpVal));
         if(document.getElementById('head-climate')) $('#head-climate').text(fmtHead(climateVal));
     }
-        
+
     // Außentemperatur-Badge (Auf JEDER Seite vorhanden!)
     if(document.getElementById('head-out-temp')) {
         let outTempStr = '';
@@ -6179,12 +7461,12 @@ function processLiveData(data) {
         } else if (data['Außentemperatur'] !== undefined && data['Außentemperatur'] !== null && data['Außentemperatur'] !== '') {
             outTempStr = parseFloat(data['Außentemperatur']).toFixed(1) + ' °C';
         }
-        
+
         if (outTempStr !== '') {
             $('#head-out-temp').text(outTempStr).show();
         } else {
             // Wenn wir gar keine WP-Sensordaten haben
-            $('#head-out-temp').hide(); 
+            $('#head-out-temp').hide();
         }
     }
 
@@ -6212,7 +7494,7 @@ function processLiveData(data) {
         $('#head-price').text(data.price_ct.toLocaleString('de-DE', {minimumFractionDigits: 1, maximumFractionDigits: 1}) + ' ct');
         $('#val-price').text(data.price_ct.toLocaleString('de-DE', {minimumFractionDigits: 1, maximumFractionDigits: 1}) + ' ct');
         $('#card-price-container').attr('style', showDashboardGridPrice ? 'display: flex !important;' : 'display: none !important;');
-        
+
         const hPriceIcon = $('#head-icon-price');
         hPriceIcon.removeClass('text-secondary text-success text-danger text-warning');
         if (data.price_level === 'cheap') hPriceIcon.addClass('text-success');
@@ -6247,10 +7529,10 @@ function processLiveData(data) {
 
     if (document.getElementById('val-pv')) {
         $('#val-pv').html(formatWatts(data.pv));
-        const socText = `${Math.round(data.soc)}%`;
+        const socText = `${Math.round(houseSocValue)}%`;
         const socTitle = (data.notstrom_reserve && data.notstrom_reserve > 0)
-            ? `Batterie SoC ${socText}, Notstromreserve ${data.notstrom_reserve.toFixed(1)}%`
-            : `Batterie SoC ${socText}`;
+            ? `Hausakku-SoC ${socText}, Notstromreserve ${data.notstrom_reserve.toFixed(1)}%`
+            : `Hausakku-SoC ${socText}`;
         $('#val-soc')
             .removeClass('text-success text-warning text-danger text-muted')
             .addClass(batStat.txt)
@@ -6259,7 +7541,7 @@ function processLiveData(data) {
             .attr('aria-label', socTitle);
 
         updateDashboardDailyTiles(data);
-    
+
         const isDay = (typeof isDaytime === 'function') ? isDaytime() : true;
         const iconPvBox = $('#icon-pv-box'); const iconPv = $('#icon-pv');
         if (isDay) {
@@ -6269,7 +7551,7 @@ function processLiveData(data) {
         }
 
         const sollVal = (typeof getTheoreticalPower === 'function') ? getTheoreticalPower() : 0;
-        
+
         let totalForecastKwh = 0;
         let remainingForecastKwh = 0;
         if (typeof FORECAST_DATA !== 'undefined' && Array.isArray(FORECAST_DATA)) {
@@ -6294,7 +7576,7 @@ function processLiveData(data) {
                 totalForecastKwh = stablePvToday;
             }
         }
-        
+
 
         const pvDetails = $('#val-pv-details');
         if (typeof SHOW_FORECAST !== 'undefined' && SHOW_FORECAST && (sollVal > 10 || totalForecastKwh > 0)) {
@@ -6392,7 +7674,7 @@ function processLiveData(data) {
             if (data.bat1_v && data.bat1_v > 0) batDet += ` | K2: ${data.bat1_v}V | ${data.bat1_a}A`;
             $('#bat-details').html(batDet).show();
         } else { $('#bat-details').hide(); }
-        
+
         const setDashboardWallboxPauseButton = (wbIdx, paused, pending = false) => {
             const btn = $(`[data-dashboard-wb-pause="${wbIdx}"]`);
             if (!btn.length) return;
@@ -6456,25 +7738,12 @@ function processLiveData(data) {
             const fmtAmp = (amp, minPrecision = 0) => minPrecision > 0 || !Number.isInteger(amp)
                 ? amp.toLocaleString('de-DE', {minimumFractionDigits: 1, maximumFractionDigits: 1})
                 : String(amp);
-            const titleEl = $(`#wb${wbId}-title`);
-            if (!titleEl.data('base-html')) {
-                titleEl.data('base-html', titleEl.html());
-                titleEl.data('base-title', titleEl.attr('title') || titleEl.text().trim());
-            }
-            const carDisplayName = (isLocked || valWb > 50) ? String(carName || '').trim() : '';
-            const modernFrontendTitle = !!(document.body && document.body.classList.contains('frontend-modern'));
-            if (carDisplayName && !modernFrontendTitle) {
-                titleEl
-                    .empty()
-                    .append($('<i>').addClass('fas fa-car-side me-1'))
-                    .append(document.createTextNode(carDisplayName))
-                    .attr('title', carDisplayName);
-            } else {
-                titleEl.html(titleEl.data('base-html')).attr('title', titleEl.data('base-title'));
-            }
-            
+            const wallboxConnected = wallboxPrimaryVehicleActive(data, id, valWb, isLocked);
+            const carDisplayName = wallboxConnected ? String(carName || '').trim() : '';
+            renderWallboxPrimaryVehicleName(document.getElementById(`wb${wbId}-title`), carDisplayName, !!carDisplayName);
+
             $(`#val-wb${wbId}`).html(formatWatts(valWb));
-            const wbIcon = $(`#icon-wb${wbId}`); 
+            const wbIcon = $(`#icon-wb${wbId}`);
             const wbLockOverlay = $(`#wb${wbId}-lock-overlay`);
 
             if (power > 0) {
@@ -6490,7 +7759,7 @@ function processLiveData(data) {
 
             let activePhases = 0;
             if (p1 > 10) activePhases++; if (p2 > 10) activePhases++; if (p3 > 10) activePhases++;
-            
+
             let phText = "";
             if (p1 !== undefined && (p1 > 0 || p2 > 0 || p3 > 0)) {
                 if (power > 0 && activePhases === 0) activePhases = 1;
@@ -6544,8 +7813,8 @@ function processLiveData(data) {
             if (session !== undefined && session !== null && (session > 0 || isLocked)) {
                 $(`#wb${wbId}-session`).html(session.toLocaleString('de-DE', {minimumFractionDigits: 2, maximumFractionDigits: 2}) + ' kWh Session').show();
                 showSessionContainer = true;
-            } else { 
-                $(`#wb${wbId}-session`).hide(); 
+            } else {
+                $(`#wb${wbId}-session`).hide();
             }
             if (showSessionContainer) {
                 $(`#wb${wbId}-session-container`).show();
@@ -6556,20 +7825,45 @@ function processLiveData(data) {
             if (peaks && peaks[`wb${wbId}_max`] > 0) {
                 $(`#val-wb${wbId}-max`).text(formatWatts(peaks[`wb${wbId}_max`]).replace(/<[^>]*>?/gm, ''));
                 $(`#wb${wbId}-peak-detail`).show();
-            } else { 
-                $(`#wb${wbId}-peak-detail`).hide(); 
+            } else {
+                $(`#wb${wbId}-peak-detail`).hide();
+            }
+        };
+
+        const updateWallboxIdentityUI = (slot) => {
+            const prefix = slot === 2 ? 'wb2' : 'wb';
+            const identity = data[`wb${slot}_vehicle_identity`] || {};
+            const assigned = identity.assigned || {};
+            const liveVehicle = identity.live_vehicle || {};
+            const chargeProfile = identity.charge_profile || {};
+            const parts = [];
+            if (chargeProfile.name) parts.push(`Ladeprofil: ${chargeProfile.name}`);
+            if (liveVehicle.name) {
+                parts.push(`Live-Fahrzeug: ${liveVehicle.name}`);
+            } else if (chargeProfile.name && liveVehicle.stable_identity_present !== true) {
+                parts.push('Live-Fahrzeug: nicht stabil erkannt');
+            }
+            if (assigned.name) parts.push(`E3DC-Zuordnung: ${assigned.name}`);
+            const el = $(`#${prefix}-identity`);
+            if (!el.length) return;
+            if (parts.length) {
+                el.text(parts.join(' · ')).attr('title', parts.join('\n')).show();
+            } else {
+                el.text('').removeAttr('title').hide();
             }
         };
 
         // Wallbox 1 updaten
-        updateSingleWallboxUI('wb', data.wb, data.wb_locked, data.wb_mode, data.wb_p1, data.wb_p2, data.wb_p3, data.wb_session_kwh, data.wb_kva, data.wb_power_factor, data.wb_set_amp, data.wb_cap_amp, data.wb_status_amp, data.wb_offered_current_raw, data.wb_current_step_amp, data.wb_fractional_current_supported, data.peaks, data.wb_car_name);
+        updateSingleWallboxUI('wb', data.wb, data.wb_plug, data.wb_mode, data.wb_p1, data.wb_p2, data.wb_p3, data.wb_session_kwh, data.wb_kva, data.wb_power_factor, data.wb_set_amp, data.wb_cap_amp, data.wb_status_amp, data.wb_offered_current_raw, data.wb_current_step_amp, data.wb_fractional_current_supported, data.peaks, data.wb_display_car_name || data.wb_car_name);
+        updateWallboxIdentityUI(1);
         setDashboardWallboxPauseButton('1', data.wb_manual_pause === true || data.wb_manual_pause === 1 || data.wb_manual_pause === '1');
-        
+
         // Wallbox 2 updaten (falls vorhanden)
         const hasWb2 = data.wb2 !== undefined;
         if (hasWb2) {
             $('#card-wb2-wrapper').show();
-            updateSingleWallboxUI('wb2', data.wb2, data.wb2_locked, data.wb2_mode, data.wb2_p1, data.wb2_p2, data.wb2_p3, data.wb2_session_kwh, data.wb2_kva, data.wb2_power_factor, data.wb2_set_amp, data.wb2_cap_amp, data.wb2_status_amp, data.wb2_offered_current_raw, data.wb2_current_step_amp, data.wb2_fractional_current_supported, data.peaks, data.wb2_car_name);
+            updateSingleWallboxUI('wb2', data.wb2, data.wb2_locked, data.wb2_mode, data.wb2_p1, data.wb2_p2, data.wb2_p3, data.wb2_session_kwh, data.wb2_kva, data.wb2_power_factor, data.wb2_set_amp, data.wb2_cap_amp, data.wb2_status_amp, data.wb2_offered_current_raw, data.wb2_current_step_amp, data.wb2_fractional_current_supported, data.peaks, data.wb2_display_car_name || data.wb2_car_name);
+            updateWallboxIdentityUI(2);
             setDashboardWallboxPauseButton('2', data.wb2_manual_pause === true || data.wb2_manual_pause === 1 || data.wb2_manual_pause === '1');
         } else {
             $('#card-wb2-wrapper').hide();
@@ -6580,8 +7874,8 @@ function processLiveData(data) {
         const hWbIcon = $('#head-icon-wb');
         const anyWbCharging = data.wb > 10 || data.wb2 > 10;
         const anyWbV2H = data.wb < -10 || data.wb2 < -10;
-        if (anyWbCharging) hWbIcon.removeClass('text-secondary text-success').addClass('text-info pulsating'); 
-        else if (anyWbV2H) hWbIcon.removeClass('text-secondary text-info').addClass('text-success pulsating'); 
+        if (anyWbCharging) hWbIcon.removeClass('text-secondary text-success').addClass('text-info pulsating');
+        else if (anyWbV2H) hWbIcon.removeClass('text-secondary text-info').addClass('text-success pulsating');
         else hWbIcon.removeClass('text-info text-success pulsating').addClass('text-secondary');
 
         // Fahrzeug-Badge und Ladezeiten (jetzt Dual-fähig)
@@ -6593,7 +7887,7 @@ function processLiveData(data) {
                 let mins = Math.round(activeV.time_remaining_mins);
                 let h = Math.floor(mins / 60); let m = mins % 60;
                 $('#wb-time-full').html(`<i class="fas fa-battery-full me-1"></i> ${h}:${String(m).padStart(2,'0')}h`).show();
-                
+
                 if (activeV.time_to_target_mins) {
                     let tgtMins = Math.round(activeV.time_to_target_mins);
                     let th = Math.floor(tgtMins / 60); let tm = tgtMins % 60;
@@ -6625,9 +7919,9 @@ function processLiveData(data) {
                 $('#icon-wp').removeClass('bg-danger text-danger').addClass('bg-info text-info');
             }
         }
-        
+
         const wpStatusBadge = $('#wp-status-badge');
-        
+
         // Synthetisiere data.wp_mode für IDM/Luxtronik, falls das Backend nur Ext-Flags liefert.
         if (data.wp_mode === undefined || data.wp_mode === null) {
             if (data.idm_ext_ww === 1) data.wp_mode = 1;
@@ -6650,12 +7944,12 @@ function processLiveData(data) {
                 case 5: wpStatusBadge.addClass('bg-secondary text-white').text('Standby'); break;
                 default: wpStatusBadge.hide();
             }
-        } 
+        }
         // Wir verstecken das Badge NUR, wenn wirklich gar kein Mode-Info vorliegt (Standby/Fehler)
         // Aber wir lassen es stehen, wenn es vorher "Standby" war (kein Flickern)
         else if (!wpStatusBadge.text().includes('Standby')) {
             // Badge nur ausblenden wenn kein Boost läuft (verhindert Flicker beim WP-Hochlauf)
-            if (data.wp_boost_active !== true) {
+            if (data.wp_boost_active !== true && data.mb_state !== 'RUNNING') {
                 wpStatusBadge.hide();
             }
         }
@@ -6676,7 +7970,7 @@ function processLiveData(data) {
         }
 
         if (data.wp_boost_active === true || data.wp_predump_boost === true || data.wp_market_plan === true || data.wp_price_boost === true || data.wp_pause_active === true || data.wp_manual_boost === true) {
-            const badge = $('#wp-auto-boost'); 
+            const badge = $('#wp-auto-boost');
             badge.addClass('pulsating').show();
             const ownerReason = data.heat_manager_owner_reason || data.heat_manager_reason || '';
             if (data.wp_predump_boost === true) { badge.html('<i class="fas fa-magic"></i> Pre-Dump'); badge.attr('title', ownerReason || 'Pre-Dump-Wärmefreigabe aktiv'); }
@@ -6687,9 +7981,15 @@ function processLiveData(data) {
             else { badge.html('<i class="fas fa-fire"></i> Wärmebudget'); badge.attr('title', ownerReason || 'Wärmebudget aktiv'); }
         } else { $('#wp-auto-boost').removeClass('pulsating').hide(); }
 
+        const mbBadge = $('#wp-morning-boost');
+        if (data.mb_state === 'RUNNING') {
+            let icon = 'fa-battery-bolt'; let text = 'Morgen-Boost';
+            if (data.mb_prio === 'wallbox') { icon = 'fa-car-battery'; text = 'WB Boost'; } else if (data.mb_prio === 'heatpump') { icon = 'fa-fan'; text = 'WP Boost'; }
+            mbBadge.addClass('pulsating').html(`<i class="fas ${icon} me-1"></i> ${text}`).show();
+        } else { mbBadge.removeClass('pulsating').hide(); }
 
         if (data.wp_ww_temp != null) { $('#val-wp-ww').text(data.wp_ww_temp.toFixed(1)); $('#wp-temps').show(); }
-        if (data.wp_rl_temp != null) { $('#wp-rl-label').text(data.wp_rl_source === 'external' ? 'RL-Ext:' : 'RL:'); $('#val-wp-rl').text(data.wp_rl_temp.toFixed(1)); $('#wp-rl-container').show(); $('#wp-temps').show(); } 
+        if (data.wp_rl_temp != null) { $('#wp-rl-label').text(data.wp_rl_source === 'external' ? 'RL-Ext:' : 'RL:'); $('#val-wp-rl').text(data.wp_rl_temp.toFixed(1)); $('#wp-rl-container').show(); $('#wp-temps').show(); }
         else { $('#wp-temps').hide(); }
 
         $('#val-bat-container').html(formatWatts(batAbs));
@@ -6711,11 +8011,11 @@ function processLiveData(data) {
         } else {
             batTimeBadge.text('--').addClass('is-placeholder').attr('aria-label', 'Keine Batteriezeit');
         }
-        
+
         const batIcon = $('#icon-bat'); const batContainer = $('#val-bat-container');
         batIcon.removeClass('text-success text-warning text-danger text-muted bg-success bg-warning bg-danger bg-secondary pulsating');
         batContainer.removeClass('text-success text-warning text-danger text-muted');
-        
+
         batIcon.addClass(batStat.txt + ' ' + batStat.bg);
         batContainer.addClass(batStat.txt);
         $('#icon-bat i').removeClass('fa-battery-full fa-battery-three-quarters fa-battery-half fa-battery-quarter fa-battery-empty').addClass(batStat.icon);
@@ -6735,26 +8035,26 @@ function processLiveData(data) {
 
         if (data.price_ct !== undefined && data.price_ct !== null) {
             $('#val-price').html(data.price_ct.toLocaleString('de-DE', {minimumFractionDigits: 1, maximumFractionDigits: 1}) + '&nbsp;<span style="font-size:0.7rem; color:var(--bs-secondary-color);">ct</span>');
-            
-            // Kompatibilitätsupdates für ältere Anzeigeelemente
+
+            // Dummy updates for old elements to avoid errors
             if (data.price_min_ct !== undefined && data.price_min_ct !== null) $('#val-price-min').text(data.price_min_ct);
             if (data.price_max_ct !== undefined && data.price_max_ct !== null) $('#val-price-max').text(data.price_max_ct);
 
             let min = (data.price_min_ct !== undefined && data.price_min_ct !== null) ? data.price_min_ct : 0;
             let max = (data.price_max_ct !== undefined && data.price_max_ct !== null) ? data.price_max_ct : 50;
             let isFlat = (max - min) < 0.1;
-            
+
             $('#card-price-container').attr('style', showDashboardGridPrice ? 'display: flex !important;' : 'display: none !important;');
-            
+
             const badge = $('#card-price-container .badge');
             badge.removeClass('border-success border-danger border-warning border-info');
-            
+
             if (isFlat) {
                 $('#price-trend').html('<i class="fas fa-tag text-info" title="Festpreis / Fixtarif"></i>');
                 badge.addClass('border-info');
             } else {
-                if (data.price_level === 'cheap') { badge.addClass('border-success'); } 
-                else if (data.price_level === 'expensive') { badge.addClass('border-danger'); } 
+                if (data.price_level === 'cheap') { badge.addClass('border-success'); }
+                else if (data.price_level === 'expensive') { badge.addClass('border-danger'); }
                 else { badge.addClass('border-warning'); }
 
                 const prices = data.prices || [];
@@ -6766,8 +8066,8 @@ function processLiveData(data) {
                     const dNowPrice2 = new Date();
                     const curGmtDec = dNowPrice2.getUTCHours() + (dNowPrice2.getUTCMinutes() / 60);
                     let hourDiff = curGmtDec - priceStartHour;
-                    if (hourDiff < 0) hourDiff += 24; 
-                    
+                    if (hourDiff < 0) hourDiff += 24;
+
                     let idx = Math.floor(hourDiff / priceInterval);
                     if (prices[idx] !== undefined && prices[idx+1] !== undefined) {
                         const diff = prices[idx+1] - prices[idx];
@@ -6783,7 +8083,7 @@ function processLiveData(data) {
         const detailsEl = document.getElementById('diagramDetails');
         const modeSelect = document.getElementById('chart-mode-select');
         const isPriceMode = (modeSelect && modeSelect.value === 'price') || (typeof CURRENT_VIEW !== 'undefined' && CURRENT_VIEW === 'price');
-        
+
         if (detailsEl && !isPriceMode) {
             let content = '';
             if (CURRENT_VIEW === 'pv') {
@@ -6876,7 +8176,7 @@ function processLiveData(data) {
     updateModernDashboardActivity(data, {gridVal, wpVal, hsVal, climateVal});
 
     const flowView = document.getElementById('flow-view');
-    if (flowView && flowView.style.display === 'block') {
+    if (flowView && flowView.style.display !== 'none') {
         updateEnergyFlowLines(flowView);
         const updateFlow = (id, val, reverse) => {
             const el = document.getElementById(id); if (!el) return;
@@ -6887,12 +8187,13 @@ function processLiveData(data) {
             if (absVal > 6000) newGap = 10; else if (absVal > 3000) newGap = 15; else if (absVal > 1000) newGap = 20;
             if (cache.stopped) { el.classList.remove('stopped'); cache.stopped = false; }
             if (cache.gap !== newGap) { el.style.strokeDasharray = `0 ${newGap}`; cache.gap = newGap; }
-            let targetRate = 0.15 + (absVal / 10000) * 0.85; targetRate = Math.min(1.5, Math.max(0.15, targetRate)); 
+            let targetRate = 0.15 + (absVal / 10000) * 0.85; targetRate = Math.min(1.5, Math.max(0.15, targetRate));
             if (cache.reverse !== reverse) { if (reverse) el.classList.add('reverse'); else el.classList.remove('reverse'); cache.reverse = reverse; }
-            if (typeof el.getAnimations === 'function') { const anims = el.getAnimations(); if (anims.length > 0) anims[0].playbackRate = targetRate; } 
+            if (typeof el.getAnimations === 'function') { const anims = el.getAnimations(); if (anims.length > 0) anims[0].playbackRate = targetRate; }
             else { let newSpeed = (absVal < 500) ? 6.0 : ((absVal < 2000) ? 5.0 : ((absVal < 4500) ? 4.0 : ((absVal < 9000) ? 3.0 : 2.0))); if (cache.speed !== newSpeed) { el.style.animationDuration = newSpeed + 's'; cache.speed = newSpeed; } }
         };
         const pvFlow = updateEnergyFlowPvNodes(data, flowView); $('#f-val-home').text(formatWatts(homeVal).replace(/<[^>]*>?/gm, ''));
+        const flowAggregates = updateEnergyFlowAggregates({pv: pvFlow.mainPvW, external_pv: pvFlow.externalPvW, home: homeVal, wallbox: data.wb || 0, wallbox2: data.wb2 || 0, wp: wpVal, hs: hsVal, climate: climateVal}, flowView);
         $('#f-val-wb').text(formatWatts(Math.abs(data.wb || 0)).replace(/<[^>]*>?/gm, ''));
         if (data.wb2 !== undefined) $('#f-val-wb2').text(formatWatts(Math.abs(data.wb2 || 0)).replace(/<[^>]*>?/gm, ''));
         $('#f-val-wp').text(formatWatts(wpVal).replace(/<[^>]*>?/gm, ''));
@@ -6909,7 +8210,7 @@ function processLiveData(data) {
                 hsTempNode.hide();
             }
         }
-        
+
         const setWbNodeStyle = (nodeSelector, lineId, dotId, power) => {
             if (power < 0) {
                 const pvColor = getFlowColor('pv', '#ffc107');
@@ -6924,11 +8225,11 @@ function processLiveData(data) {
         };
         setWbNodeStyle('.node-wb-1', 'flow-line-wb', 'flow-dot-wb', data.wb);
         if (data.wb2 !== undefined) setWbNodeStyle('.node-wb-2', 'flow-line-wb2', 'flow-dot-wb2', data.wb2);
-        
+
         $('#f-node-bat').toggleClass('charging', batVal > 0);
         $('#flow-line-bat, #flow-dot-bat').attr('stroke', batStat.hex);
         applyFlowSelectorColor('.node-bat', batStat.hex);
-        
+
         let socPct = Math.round(data.soc);
         const batEl = document.getElementById('f-node-bat');
         if (batEl) {
@@ -6944,55 +8245,57 @@ function processLiveData(data) {
         $('#flow-line-climate, #flow-dot-climate').attr('stroke', getFlowColor('climate', '#38bdf8'));
         if (data.wb_locked === true) { $('#f-wb-lock').show(); } else { $('#f-wb-lock').hide(); }
         if (data.wb2_locked === true) { $('#f-wb2-lock').show(); } else { $('#f-wb2-lock').hide(); }
-        
+
         updateFlow('flow-dot-pv', pvFlow.mainPvW, false);
         updateFlow('flow-dot-external-pv', pvFlow.externalPvW, false);
-        updateFlow('flow-dot-home', homeVal, false); 
+        updateFlow('flow-dot-generation', flowAggregates.generationW, false);
+        updateFlow('flow-dot-consumption', flowAggregates.consumptionW, false);
+        updateFlow('flow-dot-home', homeVal, false);
         updateFlow('flow-dot-wb', data.wb || 0, data.wb < 0);
         updateFlow('flow-dot-wb2', data.wb2 || 0, data.wb2 < 0);
-        updateFlow('flow-dot-wp', wpVal, false); 
+        updateFlow('flow-dot-wp', wpVal, false);
         updateFlow('flow-dot-hs', hsVal, false);
         updateFlow('flow-dot-climate', climateVal, false);
-        updateFlow('flow-dot-grid', gridVal, gridVal < 0); 
+        updateFlow('flow-dot-grid', gridVal, gridVal < 0);
         updateFlow('flow-dot-bat', batVal, batVal > 0);
         $('#f-val-climate').html(formatWatts(climateVal));
         updateEnergyFlowHoverCards(data, {pv: pvFlow.mainPvW, external_pv: pvFlow.externalPvW, home: homeVal, grid: gridVal, bat: batVal, wb: data.wb || 0, wb2: data.wb2 || 0, wp: wpVal, hs: hsVal, climate: climateVal});
     }
-    
+
     // Daily Min/Max Peaks
     if (data.peaks) {
         const p = data.peaks;
         const showPeaks = (typeof SHOW_FORECAST !== 'undefined' && SHOW_FORECAST);
         const fmt = (v) => formatWatts(v).replace(/<[^>]*>?/gm, '');
-        
+
         if (showPeaks && p.pv_max > 0) {
             $('#val-pv-max').text(fmt(p.pv_max));
             $('#pv-peak-detail').show();
         } else { $('#pv-peak-detail').hide(); }
-        
+
         if (showPeaks && p.home_max > 0) {
             $('#val-home-max').text(fmt(p.home_max));
             $('#val-home-min').text(fmt(p.home_min));
             $('#home-peak-detail').show();
         } else { $('#home-peak-detail').hide(); }
-        
+
         if (showPeaks && (p.bat_max_in > 0 || p.bat_max_out > 0)) {
             $('#val-bat-max-in').text(fmt(p.bat_max_in));
             $('#val-bat-max-out').text(fmt(p.bat_max_out));
             $('#bat-peak-detail').show();
         } else { $('#bat-peak-detail').hide(); }
-        
+
         if (showPeaks && (p.grid_max_in > 0 || p.grid_max_out > 0)) {
             $('#val-grid-max-in').text(fmt(p.grid_max_in));
             $('#val-grid-max-out').text(fmt(p.grid_max_out));
             $('#grid-peak-detail').show();
         } else { $('#grid-peak-detail').hide(); }
-        
+
         if (showPeaks && p.wb_max > 0) {
             $('#val-wb-max').text(fmt(p.wb_max));
             $('#wb-peak-detail').show();
         } else { $('#wb-peak-detail').hide(); }
-        
+
         if (showPeaks && p.wp_max > 0) {
             $('#val-wp-max').text(fmt(p.wp_max));
             $('#wp-peak-detail').show();
@@ -7010,17 +8313,17 @@ function processMobileData(data) {
         smoothWallboxDisplayValues(data);
         const timeElem = document.getElementById('live-time');
         if (timeElem) timeElem.innerText = data.time;
-        
+
         const now = Math.floor(Date.now() / 1000);
         const age = now - (data.ts || 0);
         const statusBadge = document.getElementById('connection-status');
         if (statusBadge) {
             if (!data.ts || data.ts === 0) {
                 statusBadge.className = 'badge rounded-pill bg-secondary text-light'; statusBadge.innerText = 'Lade...';
-            } else if (age > 300) { 
-                statusBadge.className = 'badge rounded-pill bg-warning text-dark'; statusBadge.innerText = 'Veraltet'; 
-            } else { 
-                statusBadge.className = 'badge rounded-pill bg-success text-white'; statusBadge.innerText = 'Online'; 
+            } else if (age > 300) {
+                statusBadge.className = 'badge rounded-pill bg-warning text-dark'; statusBadge.innerText = 'Veraltet';
+            } else {
+                statusBadge.className = 'badge rounded-pill bg-success text-white'; statusBadge.innerText = 'Online';
             }
         }
 
@@ -7038,14 +8341,14 @@ function processMobileData(data) {
                 if (data.ha.peer_online) { haBadge.classList.add('bg-success', 'text-white'); haBadge.title = 'HA Master: Sync OK'; haBadge.innerHTML = '<i class="fas fa-server me-1"></i>Master'; }
                 else { haBadge.classList.add('bg-danger', 'text-white'); haBadge.innerHTML = '<i class="fas fa-server me-1"></i>Slave offline!'; }
             } else if (data.ha.mode === 'slave') {
-                if (data.ha.state === 'failover') { haBadge.classList.add('bg-danger', 'text-white', 'pulse-active'); haBadge.innerHTML = '<i class="fas fa-exclamation-triangle me-1"></i>FAILOVER'; } 
-                else if (data.ha.peer_online) { haBadge.classList.add('bg-secondary', 'text-light'); haBadge.innerHTML = '<i class="fas fa-server me-1"></i>Standby'; } 
+                if (data.ha.state === 'failover') { haBadge.classList.add('bg-danger', 'text-white', 'pulse-active'); haBadge.innerHTML = '<i class="fas fa-exclamation-triangle me-1"></i>FAILOVER'; }
+                else if (data.ha.peer_online) { haBadge.classList.add('bg-secondary', 'text-light'); haBadge.innerHTML = '<i class="fas fa-server me-1"></i>Standby'; }
                 else { haBadge.classList.add('bg-warning', 'text-dark'); haBadge.innerHTML = '<i class="fas fa-server me-1"></i>Master offline?'; }
             }
         } else if (haBadge) { haBadge.style.display = 'none'; }
 
         updateWeatherAlert(data);
-        
+
         if (data.notstrom_status === 1 || data.notstrom_status === 4) $('#m-notstrom-alert').attr('style', 'display: flex !important;');
         else $('#m-notstrom-alert').attr('style', 'display: none !important;');
 
@@ -7058,9 +8361,9 @@ function processMobileData(data) {
             if (absVal > 6000) newGap = 10; else if (absVal > 3000) newGap = 15; else if (absVal > 1000) newGap = 20;
             if (cache.stopped) { el.classList.remove('stopped'); cache.stopped = false; }
             if (cache.gap !== newGap) { el.style.strokeDasharray = `0 ${newGap}`; cache.gap = newGap; }
-            let targetRate = 0.15 + (absVal / 10000) * 0.85; targetRate = Math.min(1.5, Math.max(0.15, targetRate)); 
+            let targetRate = 0.15 + (absVal / 10000) * 0.85; targetRate = Math.min(1.5, Math.max(0.15, targetRate));
             if (cache.reverse !== reverse) { if (reverse) el.classList.add('reverse'); else el.classList.remove('reverse'); cache.reverse = reverse; }
-            if (typeof el.getAnimations === 'function') { const anims = el.getAnimations(); if (anims.length > 0) anims[0].playbackRate = targetRate; } 
+            if (typeof el.getAnimations === 'function') { const anims = el.getAnimations(); if (anims.length > 0) anims[0].playbackRate = targetRate; }
             else { let newSpeed = (absVal < 500) ? 6.0 : ((absVal < 2000) ? 5.0 : ((absVal < 4500) ? 4.0 : ((absVal < 9000) ? 3.0 : 2.0))); if (cache.speed !== newSpeed) { el.style.animationDuration = newSpeed + 's'; cache.speed = newSpeed; } }
         };
 
@@ -7079,21 +8382,23 @@ function processMobileData(data) {
         updateMobileRingFlow(data, {pv: pv, bat: bat, grid: grid, home: h, wb: wb, wb2: wb2, wp: wp, hs: hsVal, climate: climate});
         updateEnergyFlowLines(document.getElementById('flow-view'));
 
-        const pvFlow = updateEnergyFlowPvNodes(data, document.getElementById('flow-view')); $('#f-val-home').html(formatWatts(h));
+        const mobileFlowView = document.getElementById('flow-view');
+        const pvFlow = updateEnergyFlowPvNodes(data, mobileFlowView); $('#f-val-home').html(formatWatts(h));
+        const flowAggregates = updateEnergyFlowAggregates({pv: pvFlow.mainPvW, external_pv: pvFlow.externalPvW, home: h, wallbox: wb, wallbox2: wb2, wp, hs: hsVal, climate}, mobileFlowView);
         const yieldTag = $('#f-val-pv-yield');
         if (data.pv_today_kwh != null && data.pv_today_kwh > 0) yieldTag.text(data.pv_today_kwh.toLocaleString('de-DE', {minimumFractionDigits: 2, maximumFractionDigits: 2}) + ' kWh').show();
         else yieldTag.hide();
-        
+
         // WB Sessions
-        if (data.wb_session_kwh != null && (data.wb_session_kwh > 0 || data.wb_locked === true)) $('#f-val-wb-session').text(data.wb_session_kwh.toLocaleString('de-DE', {minimumFractionDigits: 2, maximumFractionDigits: 2}) + ' kWh').show();
+        if (data.wb_session_kwh != null && (data.wb_session_kwh > 0 || data.wb_plug === true)) $('#f-val-wb-session').text(data.wb_session_kwh.toLocaleString('de-DE', {minimumFractionDigits: 2, maximumFractionDigits: 2}) + ' kWh').show();
         else $('#f-val-wb-session').hide();
-        
+
         if (data.wb2_session_kwh != null && (data.wb2_session_kwh > 0 || data.wb2_locked === true)) $('#f-val-wb2-session').text(data.wb2_session_kwh.toLocaleString('de-DE', {minimumFractionDigits: 2, maximumFractionDigits: 2}) + ' kWh').show();
         else $('#f-val-wb2-session').hide();
 
         updateVehicleWidgets(data);
 
-        $('#f-val-wb').html(formatWatts(wb)); $('#f-val-wb2').html(formatWatts(wb2)); 
+        $('#f-val-wb').html(formatWatts(wb)); $('#f-val-wb2').html(formatWatts(wb2));
         $('#f-val-wp').html(formatWatts(wp)); $('#f-val-grid').html(formatWatts(grid));
         $('#f-val-hs').html(formatWatts(hsVal)); $('#f-val-climate').html(formatWatts(climate)); $('#f-val-bat').html(formatWatts(Math.abs(bat)));
         const hsTempNode = $('#f-val-hs-temp');
@@ -7106,17 +8411,17 @@ function processMobileData(data) {
                 hsTempNode.hide();
             }
         }
-        
+
         const batStat = getBatStatus(bat, data.soc, data.notstrom_reserve);
         let resText = (data.notstrom_reserve && data.notstrom_reserve > 0) ? ` (R: ${data.notstrom_reserve.toFixed(0)}%)` : '';
         $('#f-lbl-soc').text(Math.round(data.soc) + '% SoC' + resText);
         $('#f-node-bat .fa-icon').removeClass('fa-battery-full fa-battery-three-quarters fa-battery-half fa-battery-quarter fa-battery-empty').addClass(batStat.icon);
-        
+
         let autarkieLive = calculateLiveAutarky(h, wb, wp, grid, climate);
         if (document.getElementById('m-val-autarky-live')) $('#m-val-autarky-live').text(autarkieLive.toFixed(0) + '%');
         if (data.autarky_day !== undefined) $('#m-val-autarky-day').text(Math.round(data.autarky_day) + '%');
         if (data.selfcon_day !== undefined) $('#m-val-selfcon-day').text(Math.round(data.selfcon_day) + '%');
-        
+
         if (currentStatsDate === 'today' && data.stats) updateStatsUI(data, 'mobile');
 
         const setMobileWbNodeStyle = (selector, lineId, dotId, power, colorKey, fallbackColor) => {
@@ -7130,7 +8435,7 @@ function processMobileData(data) {
         $('#f-node-bat').toggleClass('charging', bat > 0);
         $('#flow-line-bat, #flow-dot-bat').attr('stroke', batStat.hex);
         applyFlowSelectorColor('.node-bat', batStat.hex);
-        
+
         const socPct = Math.round(data.soc);
         const batEl2 = document.getElementById('f-node-bat');
         if (batEl2) {
@@ -7138,7 +8443,7 @@ function processMobileData(data) {
             batEl2.style.setProperty('--bat-soc', socPct + '%');
             batEl2.style.setProperty('--bat-soc-top', Math.min(100, socPct + 10) + '%');
         }
-        if (data.wp_boost_active === true) { $('.node-wp').addClass('boost'); $('#flow-line-wp, #flow-dot-wp').attr('stroke', '#dc3545'); } 
+        if (data.wp_boost_active === true) { $('.node-wp').addClass('boost'); $('#flow-line-wp, #flow-dot-wp').attr('stroke', '#dc3545'); }
         else { $('.node-wp').removeClass('boost'); applyFlowSelectorColor('.node-wp', getFlowColor('heatpump', '#f97316')); $('#flow-line-wp, #flow-dot-wp').attr('stroke', getFlowColor('heatpump', '#f97316')); }
         const gridStat = getGridFlowStatus(grid);
         applyFlowSelectorColor('.node-grid', gridStat.hex);
@@ -7149,6 +8454,7 @@ function processMobileData(data) {
         if (data.wb2_locked === true) { $('#f-wb2-lock').show(); } else { $('#f-wb2-lock').hide(); }
 
         updateFlow('flow-dot-pv', pvFlow.mainPvW, false); updateFlow('flow-dot-external-pv', pvFlow.externalPvW, false); updateFlow('flow-dot-home', h, false);
+        updateFlow('flow-dot-generation', flowAggregates.generationW, false); updateFlow('flow-dot-consumption', flowAggregates.consumptionW, false);
         updateFlow('flow-dot-wb', wb, wb < 0); updateFlow('flow-dot-wb2', wb2, wb2 < 0);
         updateFlow('flow-dot-wp', wp, false); updateFlow('flow-dot-hs', hsVal, false);
         updateFlow('flow-dot-climate', climate, false);
@@ -7175,7 +8481,7 @@ function processMobileData(data) {
             toggleDiagram('wb2');
         });
         const pCard = document.getElementById('card-price'); if (pCard) pCard.onclick = () => toggleDiagram('price');
-        
+
         const priceVal = document.getElementById('val-price');
         const priceCard = document.getElementById('card-price');
         const priceNum = Number(data.price_ct);
@@ -7190,7 +8496,7 @@ function processMobileData(data) {
             let minPrice = '--'; let minTime = '--:--'; let maxPrice = '--'; let maxTime = '--:--';
             if (typeof data.price_min_ct === 'number') minPrice = data.price_min_ct.toLocaleString('de-DE', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
             if (typeof data.price_max_ct === 'number') maxPrice = data.price_max_ct.toLocaleString('de-DE', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-            
+
             let pMinVal = (data.price_min_ct !== undefined && data.price_min_ct !== null) ? Number(data.price_min_ct) : 0;
             let pMaxVal = (data.price_max_ct !== undefined && data.price_max_ct !== null) ? Number(data.price_max_ct) : 50;
             let isFlat = Math.abs(pMaxVal - pMinVal) < 0.1;
@@ -7200,7 +8506,7 @@ function processMobileData(data) {
             let prices = (data.prices && data.prices.length > 0) ? data.prices : (typeof PRICE_HISTORY !== 'undefined' ? PRICE_HISTORY : []);
             let startHour = typeof PRICE_START_HOUR !== 'undefined' ? PRICE_START_HOUR : 0;
             let interval = typeof PRICE_INTERVAL !== 'undefined' ? PRICE_INTERVAL : 1.0;
-            if (typeof USE_STATIC_CHART !== 'undefined' && USE_STATIC_CHART) { prices = typeof PRICE_HISTORY !== 'undefined' ? PRICE_HISTORY : []; } 
+            if (typeof USE_STATIC_CHART !== 'undefined' && USE_STATIC_CHART) { prices = typeof PRICE_HISTORY !== 'undefined' ? PRICE_HISTORY : []; }
             else if (data.prices && data.prices.length > 0) {
                  if (data.price_start_hour !== undefined && data.price_start_hour !== null) startHour = data.price_start_hour;
                  if (data.price_interval !== undefined && data.price_interval !== null) interval = data.price_interval;
@@ -7233,7 +8539,7 @@ function processMobileData(data) {
 
             const fPrice = document.getElementById('f-val-price');
             if (fPrice) {
-                fPrice.style.display = 'block'; 
+                fPrice.style.display = 'block';
                 if (displayEcoScore) {
                     fPrice.innerHTML = '<i class="fas fa-leaf text-success me-1"></i>' + ecoValueToDisplay;
                     fPrice.style.color = '#10b981';
@@ -7282,7 +8588,7 @@ function processMobileData(data) {
                     pathData += ` L ${xStart} ${y} H ${xEnd}`;
                     if (i < prices.length - 1) { const nextY = 100 - ((prices[i+1] - min) / range * 60 + 5); pathData += ` V ${nextY}`; }
                 }
-                pathData += " L 240 100 Z"; 
+                pathData += " L 240 100 Z";
                 let bars = ""; const slotW = 240 / prices.length; const getY = (p) => 100 - ((p - min) / range * 60 + 5);
                 maxIndices.forEach(i => { bars += `<rect x="${i*slotW}" y="${getY(prices[i])}" width="${slotW}" height="${100-getY(prices[i])}" fill="#f43f5e" fill-opacity="0.4" />`; });
                 minIndices.forEach(i => { bars += `<rect x="${i*slotW}" y="${getY(prices[i])}" width="${slotW}" height="${100-getY(prices[i])}" fill="#10b981" fill-opacity="0.7" />`; });
@@ -7299,20 +8605,20 @@ function processMobileData(data) {
                     const nowLocal = new Date(); const localHours = nowLocal.getHours() + (nowLocal.getMinutes() / 60);
                     let posToday = hourDiff - localHours; let posTomorrow = hourDiff + (24 - localHours);
                     const pctToday = (posToday / totalHours) * 100; const pctTomorrow = (posTomorrow / totalHours) * 100;
-                    if (pctTomorrow > 0 && pctTomorrow < 100) { dayLine.style.left = pctTomorrow + '%'; dayLine.style.display = 'block'; if (dayOverlay) { dayOverlay.style.left = pctTomorrow + '%'; dayOverlay.style.display = 'block'; } } 
+                    if (pctTomorrow > 0 && pctTomorrow < 100) { dayLine.style.left = pctTomorrow + '%'; dayLine.style.display = 'block'; if (dayOverlay) { dayOverlay.style.left = pctTomorrow + '%'; dayOverlay.style.display = 'block'; } }
                     else { dayLine.style.display = 'none'; if (dayOverlay) { if (pctTomorrow <= 0) { dayOverlay.style.left = '0%'; dayOverlay.style.display = 'block'; } else { dayOverlay.style.display = 'none'; } } }
                     if (dayLabel) dayLabel.style.display = (pctTomorrow < 100) ? 'block' : 'none';
-                    if (pctToday > 0 && pctToday < 100) { yesterdayLine.style.left = pctToday + '%'; yesterdayLine.style.display = 'block'; } 
+                    if (pctToday > 0 && pctToday < 100) { yesterdayLine.style.left = pctToday + '%'; yesterdayLine.style.display = 'block'; }
                     else { yesterdayLine.style.display = 'none'; }
                     if (yesterdayLabel) yesterdayLabel.style.display = (pctToday > 0) ? 'block' : 'none';
                 }
             }
             if (typeof updateLastUpdateDisplay === 'function') updateLastUpdateDisplay();
 
-            if (isFlat) { priceVal.className = 'value text-body'; if (priceCard) { priceCard.style.background = 'var(--bg-card)'; priceCard.style.borderColor = 'var(--border-card)'; } } 
-            else if (priceNum < 10) { priceVal.className = 'value text-success price-ultra-cheap'; if (priceCard) { priceCard.style.background = 'rgba(16, 185, 129, 0.25)'; priceCard.style.borderColor = '#10b981'; } } 
-            else if (data.price_level === 'cheap') { priceVal.className = 'value text-success'; if (priceCard) { priceCard.style.background = 'rgba(16, 185, 129, 0.13)'; priceCard.style.borderColor = '#2d3748'; } } 
-            else if (data.price_level === 'expensive') { priceVal.className = 'value text-danger'; if (priceCard) { priceCard.style.background = 'rgba(244, 63, 94, 0.13)'; priceCard.style.borderColor = '#2d3748'; } } 
+            if (isFlat) { priceVal.className = 'value text-body'; if (priceCard) { priceCard.style.background = 'var(--bg-card)'; priceCard.style.borderColor = 'var(--border-card)'; } }
+            else if (priceNum < 10) { priceVal.className = 'value text-success price-ultra-cheap'; if (priceCard) { priceCard.style.background = 'rgba(16, 185, 129, 0.25)'; priceCard.style.borderColor = '#10b981'; } }
+            else if (data.price_level === 'cheap') { priceVal.className = 'value text-success'; if (priceCard) { priceCard.style.background = 'rgba(16, 185, 129, 0.13)'; priceCard.style.borderColor = '#2d3748'; } }
+            else if (data.price_level === 'expensive') { priceVal.className = 'value text-danger'; if (priceCard) { priceCard.style.background = 'rgba(244, 63, 94, 0.13)'; priceCard.style.borderColor = '#2d3748'; } }
             else { priceVal.className = 'value'; priceVal.style.color = '#fbbf24'; if (priceCard) { priceCard.style.background = 'rgba(251, 191, 36, 0.13)'; priceCard.style.borderColor = '#2d3748'; } }
         }
 
@@ -7340,7 +8646,7 @@ function showGridHealthModal() {
     let m = bootstrap.Modal.getInstance(el);
     if (!m) m = new bootstrap.Modal(el);
     m.show();
-    
+
     // Attempt an immediate render before next polling tick
     if (typeof getCurrentLiveData === 'function' && getCurrentLiveData()) {
         updateGridHealthUI(getCurrentLiveData());
@@ -7381,11 +8687,11 @@ function updateGridHealthUI(data) {
         $('#gh-freq-text').text('Keine Frequenzdaten verfügbar (E3DC PVI).');
     }
 
-    
+
     // Lese Absicherung (Default 63A) aus globaler PHP Konfiguration
     const maxAmps = typeof GRID_MAX_AMPS !== 'undefined' ? parseFloat(GRID_MAX_AMPS) : 63;
-    const maxWattsPerPhase = maxAmps * 230; 
-    
+    const maxWattsPerPhase = maxAmps * 230;
+
     $('#gh-max-scale').text(`Max: ${maxAmps}A`);
 
     const alertEl = $('#gridHealthAlert');
@@ -7482,12 +8788,12 @@ function updateGridHealthUI(data) {
         $('#gh-wb-l1').text(`${Math.round(data.wb_p1)} W`);
         $('#gh-wb-l2').text(`${Math.round(data.wb_p2)} W`);
         $('#gh-wb-l3').text(`${Math.round(data.wb_p3)} W`);
-        
+
         let phasesActive = 0;
         if (Math.abs(data.wb_p1) > 50) phasesActive++;
         if (Math.abs(data.wb_p2) > 50) phasesActive++;
         if (Math.abs(data.wb_p3) > 50) phasesActive++;
-        
+
         let mBadge = $('#gh-wb-mode');
         mBadge.text(`${phasesActive}p Laden`);
         if (phasesActive === 1) mBadge.removeClass('bg-success bg-primary').addClass('bg-warning text-dark');
@@ -8134,7 +9440,7 @@ function _renderStorageCurveChart(socPoints) {
     const canvas = document.getElementById('storageCurveChart');
     if (!canvas) return;
 
-    // Chart.js über CDN laden falls nicht vorhanden
+    // Chart.js aus dem lokal mitgelieferten, lizenzierten Vendor-Bundle laden.
     function doRender() {
         if (_storageCurveChartInstance) {
             _storageCurveChartInstance.destroy();
@@ -8206,12 +9512,20 @@ function _renderStorageCurveChart(socPoints) {
             if (ts < simCurve[0].ts || ts > simCurve[simCurve.length-1].ts) return null;
             for (let i = 0; i < simCurve.length - 1; i++) {
                 if (ts >= simCurve[i].ts && ts < simCurve[i + 1].ts) {
-                    const watts = parseFloat(simCurve[i].direct_marketing_export_w || 0) || 0;
+                    const watts = parseFloat(
+                        simCurve[i].direct_marketing_planned_w
+                        ?? simCurve[i].direct_marketing_export_w
+                        ?? 0
+                    ) || 0;
                     return watts > 0 ? watts / 1000 : null;
                 }
             }
             const last = simCurve[simCurve.length - 1];
-            const lastWatts = parseFloat(last.direct_marketing_export_w || 0) || 0;
+            const lastWatts = parseFloat(
+                last.direct_marketing_planned_w
+                ?? last.direct_marketing_export_w
+                ?? 0
+            ) || 0;
             return ts === last.ts && lastWatts > 0 ? lastWatts / 1000 : null;
         };
 
@@ -8255,7 +9569,9 @@ function _renderStorageCurveChart(socPoints) {
         const directMarketingChargeData = sortedTs.map(ts => interpDirectMarketingChargeKw(ts));
         const hasSollData = sollData.some(v => v !== null && v !== undefined);
         const simSocData = hasSollData ? sortedTs.map(() => null) : sortedTs.map(ts => interpSimSoc(ts));
-        const directMarketingSocData = sortedTs.map(ts => interpDirectMarketingSoc(ts));
+        const directMarketingSocData = directMarketingSocProjectionUsable(window._storageLiveData || {})
+            ? sortedTs.map(ts => interpDirectMarketingSoc(ts))
+            : sortedTs.map(() => null);
         const hasDirectMarketingSocData = directMarketingSocData.some(v => v !== null && v !== undefined);
         const latestSocPoint = [...socPoints].reverse().find(p => p && p.ts <= nowMs) || null;
         const chartLiveSoc = window._storageControlSoc ?? (latestSocPoint ? latestSocPoint.soc : window._storageLiveSoc);
@@ -8367,12 +9683,15 @@ function _renderStorageCurveChart(socPoints) {
                         yAxisID: 'yPV',
                     },
                     {
-                        label: 'DV-Verkauf (kW)',
+                        label: 'DV-Verkaufsfenster geplant (kW)',
                         data: directMarketingExportData,
                         type: 'bar',
                         borderColor: '#10b981',
                         backgroundColor: 'rgba(16,185,129,0.35)',
-                        borderWidth: 1,
+                        borderWidth: 0,
+                        borderSkipped: false,
+                        barPercentage: 1.0,
+                        categoryPercentage: 1.0,
                         yAxisID: 'yPV',
                     },
                     {
@@ -8431,7 +9750,7 @@ function _renderStorageCurveChart(socPoints) {
                                 if (label === 'SoC-Prognose nach DV-Plan') return 'SoC nach DV-Plan: ' + (ctx.raw !== null ? ctx.raw.toFixed(1) + '%' : '--');
                                 if (label === 'IST-SoC') return 'IST:  ' + (ctx.raw !== null ? ctx.raw.toFixed(1) + '%' : '--');
                                 if (label === 'PV-Prognose (kW)') return 'PV:   ' + (ctx.raw !== null ? ctx.raw.toFixed(2) + ' kW' : '--');
-                                if (label === 'DV-Verkauf (kW)') return 'DV-Verkauf: ' + (ctx.raw !== null ? ctx.raw.toFixed(2) + ' kW' : '--');
+                                if (label === 'DV-Verkaufsfenster geplant (kW)') return 'Geplanter DV-Verkauf: ' + (ctx.raw !== null ? ctx.raw.toFixed(2) + ' kW' : '--');
                                 if (label === 'DV-PV-Speichern (kW)') return 'DV-PV-Speichern: ' + (ctx.raw !== null ? ctx.raw.toFixed(2) + ' kW' : '--');
                                 if (label === 'Zwischenziel') return 'Zwischenziel: ' + (ctx.raw !== null ? ctx.raw.toFixed(1) + '%' : '--');
                                 return '';
@@ -8504,3 +9823,7 @@ function _renderStorageCurveChart(socPoints) {
         doRender();
     }
 }
+
+// Signalisiert den Inline-Transportgates, dass alle Live-Consumer definiert sind.
+window.e3dcSolarScriptReady = true;
+window.dispatchEvent(new CustomEvent('e3dc:solar-ready'));

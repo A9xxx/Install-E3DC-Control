@@ -26,7 +26,11 @@ signal.signal(signal.SIGINT,  _sig)
 # Konfiguration
 RAMDISK_FILE = "/var/www/html/ramdisk/waermepumpe.json"
 LOG_FILE = "/var/www/html/logs/idm_live.log"
-CONFIG_PATHS = ["/var/www/html/data/e3dc.config.txt", "/home/pi/E3DC-Control/e3dc.config.txt", "/home/pi/Install/Installer/luxtronik/e3dc.config.txt"]
+CONFIG_PATHS = [
+    "/var/www/html/data/e3dc.config.txt",
+    os.path.join(os.path.dirname(INSTALLER_DIR), "e3dc.config.txt"),
+    os.path.join(INSTALLER_DIR, "luxtronik", "e3dc.config.txt"),
+]
 _last_log_by_key = {}
 _event_logger = configure_service_logger(
     "IDMLive",
@@ -93,7 +97,7 @@ def load_wp_config():
     ip = "0.0.0.0"
     port = 502
     wp_type = 0
-    
+
     # 1. V4 JSON check
     v4_path = "/var/www/html/data/e3dc_v4.json"
     if os.path.exists(v4_path):
@@ -140,10 +144,10 @@ def read_idm(client):
     last_error = ""
     for addr, (label, dtype) in REGISTER_MAP.items():
         reg_count = 2 if dtype == "FLOAT" else 1
-        
+
         try:
             result = client.read_holding_registers(address=addr, count=reg_count)
-            
+
             if result.isError():
                 err_msg = f"Modbus-Fehler an Adr {addr} ({label}): {result}"
                 log_event(err_msg, key=f"modbus_error:{addr}", interval_s=60)
@@ -155,7 +159,7 @@ def read_idm(client):
                 # IDM Magic: Low-Word (regs[0]) VOR High-Word (regs[1])
                 packed = struct.pack('>HH', regs[1], regs[0])
                 val = struct.unpack('>f', packed)[0]
-                
+
                 # Check ob die IDM einen ungültigen Sensor-Wert (NaN / Inf) sendet
                 if math.isnan(val) or math.isinf(val):
                     log_event(f"Warnung: Sensor {label} (Adr {addr}) liefert NaN/Inf.", key=f"nan:{addr}", interval_s=300)
@@ -163,7 +167,7 @@ def read_idm(client):
                 else:
                     data[label] = round(val, 2)
                     success_count += 1
-                    
+
             elif dtype == "UCHAR" and len(regs) >= 1:
                 val = regs[0]
                 if label == "Betriebszustand_ID":
@@ -173,22 +177,22 @@ def read_idm(client):
                 else:
                     data[label] = val
                 success_count += 1
-                
+
         except Exception as e:
             err_msg = f"Python Fehler an Adr {addr} ({label}): {e}"
             log_event(err_msg, key=f"python_error:{addr}", interval_s=60)
             last_error = err_msg
             break # Bei Exception (Broken Pipe etc.) den aktuellen Zyklus komplett abbrechen!
-                
+
     data["last_error"] = last_error
-    
+
     # IDM liefert Wärmemenge Gesamt (1790) oft als 0.0, wir rechnen es zur Sicherheit einfach zusammen
     wm_hz = data.get("Wärmemenge Heizen") or 0.0
     wm_ww = data.get("Wärmemenge Warmwasser") or 0.0
     wm_ges = data.get("Wärmemenge Gesamt") or 0.0
     if wm_ges == 0.0 and (wm_hz > 0 or wm_ww > 0):
         data["Wärmemenge Gesamt"] = round(wm_hz + wm_ww, 2)
-        
+
     return data, success_count
 
 def save_to_ramdisk(data):
@@ -198,19 +202,19 @@ def save_to_ramdisk(data):
         return False
     data["source"] = "idm_live"
     data['ts'] = time.strftime('%Y-%m-%d %H:%M:%S')
-    
+
     tmp_file = RAMDISK_FILE + ".tmp"
     try:
         with open(tmp_file, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False)
-        
+
         os.chmod(tmp_file, 0o664)
         try:
             import grp
             gid = grp.getgrnam("www-data").gr_gid
             os.chown(tmp_file, -1, gid)
         except: pass
-        
+
         os.replace(tmp_file, RAMDISK_FILE)
         return True
     except Exception as e:
@@ -225,13 +229,13 @@ def main():
         return
 
     log_event(f"Starte IDM Modbus-Live-Stream zu {ip}:{port} (Slave 1)...", key="startup", interval_s=60)
-    
+
     while True:
         try:
             # WICHTIG: Erzeuge das ModbusTcpClient Objekt jede Runde neu!
             # IDM schließt Verbindungen sofort, und pymodbus cacht sonst tote Sockets.
             client = ModbusTcpClient(ip, port=port)
-            
+
             connected = False
             for _ in range(3):
                 if _stop: break
@@ -239,16 +243,16 @@ def main():
                     connected = True
                     break
                 time.sleep(1)
-                
+
             if _stop or not connected:
                 log_event("Verbindung fehlgeschlagen...", key="connect_failed", interval_s=60)
                 save_to_ramdisk({"success": False, "error": "Verbindung fehlgeschlagen", "idm_ip": ip})
                 time.sleep(15)
                 continue
-            
+
             wp_data, count = read_idm(client)
             client.close() # IMMER schließen, damit andere Clients (IDM App, energy_manager) dran kommen!
-            
+
             if count > 0:
                 wp_data["success"] = True
                 wp_data["idm_ip"] = ip
@@ -258,7 +262,7 @@ def main():
                 err_msg = wp_data.get("last_error", "Ungültige Register-Adressen")
                 log_event(f"Keine gültigen Register: {err_msg}", key="no_registers", interval_s=60)
                 save_to_ramdisk({"success": False, "error": f"Keine gültigen Register ({err_msg})", "idm_ip": ip})
-            
+
         except Exception as e:
             log_event(f"Fehler im Loop: {e}", key="loop_error", interval_s=60)
             save_to_ramdisk({"success": False, "error": str(e), "idm_ip": ip})
@@ -266,12 +270,12 @@ def main():
             except: pass
             time.sleep(15)
             continue
-            
+
         # V4 Sleep blockiert nicht durchgehend (bessere SIGTERM Reaktion)
         for _ in range(15):
             if _stop: break
             time.sleep(1)
-            
+
         if _stop:
             break
 

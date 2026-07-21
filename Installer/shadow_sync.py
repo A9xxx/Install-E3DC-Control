@@ -61,6 +61,7 @@ SNAPSHOT_TARGETS: Tuple[Tuple[str, str, str, str], ...] = (
     ("wb_budget_diagnostics", "ramdisk/wb_pv_budget_diagnostics.json", RAMDISK, "shadow_master_wb_pv_budget_diagnostics.json"),
     ("wb_intent", "ramdisk/wallbox_storage_intent.json", RAMDISK, "shadow_master_wallbox_storage_intent.json"),
     ("wallbox_native", "ramdisk/wallbox_native.json", RAMDISK, "shadow_master_wallbox_native.json"),
+    ("config", "data/e3dc_v4.json", DATA_DIR, "shadow_master_e3dc_v4.json"),
 )
 
 SHADOW_STANDBY_SERVICES: Tuple[str, ...] = (
@@ -86,6 +87,17 @@ SHADOW_STANDBY_SERVICES: Tuple[str, ...] = (
     "e3dc-ha",
     "e3dc-notifier",
 )
+
+SECRET_KEY_PARTS = (
+    "password",
+    "passwd",
+    "token",
+    "api_key",
+    "apikey",
+    "secret",
+    "aes",
+)
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -173,6 +185,17 @@ def _append_history(path: str, record: Dict[str, Any], max_lines: int = MAX_HIST
 
 def load_config(config_path: str = CONFIG_FILE) -> Dict[str, Any]:
     return _read_json(config_path)
+
+
+def _redact_config(data: Dict[str, Any]) -> Dict[str, Any]:
+    redacted: Dict[str, Any] = {}
+    for key, value in (data or {}).items():
+        key_text = str(key).lower()
+        if any(part in key_text for part in SECRET_KEY_PARTS):
+            redacted[key] = "***"
+        else:
+            redacted[key] = value
+    return redacted
 
 
 def _normalize_master_url(cfg: Dict[str, Any]) -> str:
@@ -299,8 +322,9 @@ def fetch_master_snapshot(
             data, meta = _fetch_json(master_url, rel_path, timeout_s)
             if not isinstance(data, dict):
                 raise ValueError(f"{rel_path} liefert kein JSON-Objekt")
-            _write_json_atomic(out_path, data)
-            fetched[key] = data
+            stored = _redact_config(data) if key == "config" else data
+            _write_json_atomic(out_path, stored)
+            fetched[key] = stored
             targets[key] = {
                 "ok": True,
                 "path": out_path,
@@ -337,10 +361,9 @@ def run_storage_shadow(fetched: Dict[str, Any], cfg: Dict[str, Any], *, output_p
     plan = fetched.get("storage_plan") if isinstance(fetched.get("storage_plan"), dict) else {}
     wb_budget = fetched.get("wb_budget") if isinstance(fetched.get("wb_budget"), dict) else {}
     wb_intent = fetched.get("wb_intent") if isinstance(fetched.get("wb_intent"), dict) else {}
-    # Die Shadow-Instanz verwendet ausschließlich ihre lokale Konfiguration.
-    # Die vollständige Konfiguration der aktiven Anlage kann Geheimnisse
-    # enthalten und wird deshalb weder abgerufen noch übertragen.
+    master_cfg = fetched.get("config") if isinstance(fetched.get("config"), dict) else {}
     sim_cfg = dict(cfg or {})
+    sim_cfg.update(master_cfg)
     payload = ParallelStorageRegulator(sim_cfg).decide(
         active_state=_shadow_active_state(state, live),
         live=live,
@@ -417,9 +440,9 @@ def run_wallbox_shadow(
     live = fetched.get("live_data") if isinstance(fetched.get("live_data"), dict) else {}
     wb_budget = fetched.get("wb_budget") if isinstance(fetched.get("wb_budget"), dict) else {}
     native = fetched.get("wallbox_native") if isinstance(fetched.get("wallbox_native"), dict) else {}
-    # Vergleichsparameter stammen aus der lokalen Shadow-Konfiguration. Damit
-    # verlassen Zugangsdaten der aktiven Anlage niemals deren System.
+    master_cfg = fetched.get("config") if isinstance(fetched.get("config"), dict) else {}
     sim_cfg = dict(cfg or {})
+    sim_cfg.update(master_cfg)
     simulator = ShadowWallboxSimulator(sim_cfg)
     previous = _read_json(output_path)
     state_data = previous.get("state") if isinstance(previous.get("state"), dict) else {}

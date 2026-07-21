@@ -1,5 +1,5 @@
 <?php
-// klima.php - Statusseite für Klimamessung und read-only Toshiba-Cloud-Daten
+// klima.php - Statusseite für gemessene Klimaanlage und vorbereitete Toshiba-Anbindung
 
 if (session_status() !== PHP_SESSION_ACTIVE) {
     session_start();
@@ -67,6 +67,10 @@ function e3dcClimateFmtTemp($value) {
     return number_format($num, 1, ',', '.') . ' °C';
 }
 
+function e3dcClimateBoolText($value) {
+    return cfgBool($value, false) ? 'ja' : 'nein';
+}
+
 function e3dcClimateStatusBadge($label, $class = 'secondary') {
     return '<span class="badge text-bg-' . e3dcClimateEsc($class) . '">' . e3dcClimateEsc($label) . '</span>';
 }
@@ -81,12 +85,14 @@ function e3dcClimateInfoRow($label, $value, $muted = false) {
 
 function e3dcClimateReasonLabel($reason) {
     $map = [
-        'disabled' => 'Statusdienst deaktiviert',
+        'disabled' => 'Regelung deaktiviert',
+        'mode_off' => 'Modus Aus',
+        'local_adapter_not_available' => 'Lokaler Adapter noch nicht verfügbar',
         'toshiba_cloud_disabled' => 'Toshiba Cloud nicht freigegeben',
         'toshiba_cloud_config_incomplete' => 'Cloud-Zugangsdaten unvollständig',
-        'toshiba_cloud_ready' => 'Cloud-Lesepfad bereit',
         'toshiba_cloud_readonly' => 'Toshiba Cloud wird read-only ausgelesen',
         'toshiba_cloud_read_failed' => 'Toshiba Cloud konnte nicht gelesen werden',
+        'toshiba_adapter_not_implemented' => 'Toshiba-Adapter vorbereitet, noch ohne Kommandos',
     ];
     $reason = (string)$reason;
     return $map[$reason] ?? $reason;
@@ -105,6 +111,7 @@ $confResult = loadE3dcConfig();
 $cfg = empty($confResult['error']) ? ($confResult['config'] ?? []) : [];
 $climateLoad = e3dcClimateReadJson('/var/www/html/ramdisk/climate_load.json');
 $climateControl = e3dcClimateReadJson('/var/www/html/ramdisk/climate_control.json');
+$schedule = is_array($climateControl['schedule'] ?? null) ? $climateControl['schedule'] : [];
 
 $enabled = cfgBool(e3dcClimateCfg($cfg, 'climate_enable', '0'), false);
 $controlEnabled = cfgBool(e3dcClimateCfg($cfg, 'climate_control_enable', '0'), false);
@@ -134,9 +141,14 @@ if ($ageS === null && isset($climateLoad['ts'])) {
 }
 $loadAgeLabel = $ageS === null ? '--' : number_format($ageS, 0, ',', '.') . ' s';
 $targetTemp = e3dcClimateFirst($climateControl, ['target_temp_c']);
+if ($targetTemp === null) {
+    $targetTemp = $schedule['target_temp_c'] ?? e3dcClimateCfg($cfg, 'climate_day_temp_c', '24.0');
+}
+$profile = (string)($schedule['profile'] ?? 'day');
+$profileLabel = $profile === 'night' ? 'Nacht' : 'Tag';
 $roomTemp = e3dcClimateFirst($climateControl, ['room_temp_c', 'indoor_temp_c', 'current_temp_c']);
 $outsideTemp = e3dcClimateFirst($climateControl, ['outside_temp_c', 'outdoor_temp_c']);
-$reason = (string)($climateControl['reason'] ?? ($controlEnabled ? 'toshiba_cloud_ready' : 'disabled'));
+$reason = (string)($climateControl['reason'] ?? ($controlEnabled ? 'toshiba_adapter_not_implemented' : 'disabled'));
 $cloudConnected = cfgBool($climateControl['cloud_connected'] ?? false, false);
 $cloudDeviceCount = (int)($climateControl['cloud_device_count'] ?? ($climateControl['device_count'] ?? 0));
 $configuredDeviceCount = (int)($climateControl['configured_device_count'] ?? 0);
@@ -173,7 +185,7 @@ if (isset($climateControl['devices']) && is_array($climateControl['devices'])) {
     <div class="card-body">
         <?php if (!$enabled): ?>
             <div class="alert alert-secondary small mb-3">
-                Die Klimaanlage ist noch nicht als eigener Verbraucher aktiviert. Messwerte erscheinen nach Aktivierung der Klima-Messung in der Konfiguration.
+                Die Klimaanlage ist noch nicht als eigener Verbraucher aktiviert. Die Seite bleibt vorbereitet; Messwerte erscheinen nach Aktivierung der Klima-Messung in der Konfiguration.
             </div>
         <?php endif; ?>
 
@@ -207,7 +219,8 @@ if (isset($climateControl['devices']) && is_array($climateControl['devices'])) {
                         <h6 class="text-primary fw-bold border-bottom border-primary border-opacity-25 pb-2 mb-3">
                             <i class="fas fa-cloud me-2"></i>Toshiba Cloud
                         </h6>
-                        <?= e3dcClimateInfoRow('Zugriff', 'Toshiba Cloud read-only') ?>
+                        <?= e3dcClimateInfoRow('Provider', e3dcClimateEsc($climateControl['provider'] ?? e3dcClimateCfg($cfg, 'climate_control_provider', 'toshiba_cloud'))) ?>
+                        <?= e3dcClimateInfoRow('Modus', e3dcClimateEsc($climateControl['mode'] ?? e3dcClimateCfg($cfg, 'climate_control_mode', 'off'))) ?>
                         <?= e3dcClimateInfoRow('Zugangsdaten vorhanden', e3dcClimateEsc($hasCredentials ? 'ja' : 'nein')) ?>
                         <?= e3dcClimateInfoRow('Geräteauswahl', e3dcClimateEsc(empty($deviceIds) ? 'automatisch' : implode(', ', $deviceIds))) ?>
                         <?= e3dcClimateInfoRow('Cloud verbunden', e3dcClimateEsc($cloudConnected ? 'ja' : 'nein')) ?>
@@ -215,6 +228,7 @@ if (isset($climateControl['devices']) && is_array($climateControl['devices'])) {
                         <?= e3dcClimateInfoRow('Config-Zuordnung', e3dcClimateEsc(empty($deviceIds) ? 'automatisch' : ($configuredDeviceCount . ' von ' . count($deviceIds) . ' erkannt'))) ?>
                         <?= e3dcClimateInfoRow('Letzter Lesezugriff', e3dcClimateEsc($cloudLastRead !== '' ? $cloudLastRead : '--')) ?>
                         <?= e3dcClimateInfoRow('Lesedauer', e3dcClimateEsc($cloudDurationLabel)) ?>
+                        <?= e3dcClimateInfoRow('Kommandos erlaubt', e3dcClimateEsc(e3dcClimateBoolText($climateControl['commands_allowed'] ?? false))) ?>
                         <?= e3dcClimateInfoRow('Status', e3dcClimateEsc(e3dcClimateReasonLabel($reason))) ?>
                         <?= e3dcClimateInfoRow('Dienst', e3dcClimateEsc($controlServiceStatus)) ?>
                         <?php if ($cloudError !== ''): ?>
@@ -294,7 +308,7 @@ if (isset($climateControl['devices']) && is_array($climateControl['devices'])) {
                 <div class="card bg-body-tertiary border-secondary border-opacity-50">
                     <div class="card-body">
                         <h6 class="fw-bold border-bottom border-secondary border-opacity-25 pb-2 mb-3">
-                            <i class="fas fa-temperature-half me-2 text-info"></i>Temperaturen
+                            <i class="fas fa-sliders me-2 text-info"></i>Temperaturen und Einstellungen
                         </h6>
                         <div class="row g-3">
                             <div class="col-6 col-md-3">
@@ -309,6 +323,18 @@ if (isset($climateControl['devices']) && is_array($climateControl['devices'])) {
                                 <div class="small text-muted">Aktuelles Ziel</div>
                                 <div class="fs-5 fw-bold"><?= e3dcClimateEsc(e3dcClimateFmtTemp($targetTemp)) ?></div>
                             </div>
+                            <div class="col-6 col-md-3">
+                                <div class="small text-muted">Profil</div>
+                                <div class="fs-5 fw-bold"><?= e3dcClimateEsc($profileLabel) ?></div>
+                            </div>
+                        </div>
+                        <div class="row g-2 mt-3">
+                            <div class="col-12 col-md-4"><?= e3dcClimateInfoRow('Tag-Ziel', e3dcClimateEsc(e3dcClimateFmtTemp(e3dcClimateCfg($cfg, 'climate_day_temp_c', '24.0')))) ?></div>
+                            <div class="col-12 col-md-4"><?= e3dcClimateInfoRow('Nacht-Ziel', e3dcClimateEsc(e3dcClimateFmtTemp(e3dcClimateCfg($cfg, 'climate_night_temp_c', '26.0')))) ?></div>
+                            <div class="col-12 col-md-4"><?= e3dcClimateInfoRow('Nachtfenster', e3dcClimateEsc(e3dcClimateCfg($cfg, 'climate_night_start', '22:00') . ' - ' . e3dcClimateCfg($cfg, 'climate_night_end', '06:00'))) ?></div>
+                            <div class="col-12 col-md-4"><?= e3dcClimateInfoRow('Nacht Eco', e3dcClimateEsc(e3dcClimateBoolText(e3dcClimateCfg($cfg, 'climate_night_eco_enable', '1')))) ?></div>
+                            <div class="col-12 col-md-4"><?= e3dcClimateInfoRow('Nacht Leise', e3dcClimateEsc(e3dcClimateBoolText(e3dcClimateCfg($cfg, 'climate_night_quiet_enable', '1')))) ?></div>
+                            <div class="col-12 col-md-4"><?= e3dcClimateInfoRow('High Power Tag', e3dcClimateEsc(e3dcClimateBoolText(e3dcClimateCfg($cfg, 'climate_high_power_enable', '0')))) ?></div>
                         </div>
                     </div>
                 </div>

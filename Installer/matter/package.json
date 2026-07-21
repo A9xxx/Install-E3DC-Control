@@ -1,6 +1,6 @@
 {
   "name": "e3dc-matter-bridge",
-  "version": "1.0.0",
+  "version": "5.4.0",
   "description": "Matter Bridge for E3DC-Control",
   "main": "matter_bridge.js",
   "type": "module",

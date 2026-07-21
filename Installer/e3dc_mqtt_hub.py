@@ -6,6 +6,7 @@ import re
 import logging
 import urllib.request
 import math
+import socket
 from logging.handlers import RotatingFileHandler
 import paho.mqtt.client as mqtt
 
@@ -28,6 +29,7 @@ WB_BUDGET_FILE = "/var/www/html/ramdisk/wb_pv_budget.json"
 WALLBOX_NATIVE_FILE = "/var/www/html/ramdisk/wallbox_native.json"
 HEIZSTAB_DATA_FILE = "/var/www/html/ramdisk/heizstab_data.json"
 HA_INBOUND_FILE = "/var/www/html/ramdisk/mqtt_ha_inbound.json"
+EXTERNAL_WB_FILE = "/var/www/html/ramdisk/external_wb.json"
 PRICE_BOOST_PLAN_FILE = "/var/www/html/ramdisk/price_boost_plan.json"
 PREDUMP_CONSUMER_PLAN_FILE = "/var/www/html/ramdisk/predump_consumer_plan.json"
 AVAILABILITY_TOPIC_SUFFIX = "status/availability"
@@ -41,7 +43,7 @@ def setup_logging():
     logger.propagate = False
     logger.handlers.clear()
     formatter = logging.Formatter('%(asctime)s - %(message)s', datefmt='%d.%m %H:%M:%S')
-    
+
     fh = RotatingFileHandler(os.path.join(LOG_DIR, "e3dc_mqtt_hub.log"), maxBytes=1024*1024, backupCount=1)
     fh.setFormatter(formatter)
     logger.addHandler(fh)
@@ -54,6 +56,32 @@ def setup_logging():
     return logger
 
 logger = setup_logging()
+
+
+def _mqtt_context_valid(refresh=False):
+    """Prüft diesen Dienststamm und mindestens eine kanonische Konfigurationsquelle."""
+    try:
+        module_file = os.path.abspath(__file__)
+        if os.path.islink(module_file) or not os.path.isfile(module_file):
+            return False
+        install_root = os.path.dirname(os.path.dirname(module_file))
+        markers = (
+            os.path.join(install_root, "VERSION"),
+            os.path.join(install_root, "installer_main.py"),
+            os.path.join(install_root, "Installer", "installer_config.py"),
+        )
+        if not all(os.path.isfile(path) and not os.path.islink(path) for path in markers):
+            return False
+        config_sources = (
+            "/var/www/html/data/e3dc_v4.json",
+            "/var/www/html/e3dc_paths.json",
+            os.path.join(install_root, "e3dc.config.txt"),
+            "/var/www/html/data/e3dc.config.txt",
+        )
+        return any(os.path.isfile(path) and not os.path.islink(path) for path in config_sources)
+    except Exception:
+        return False
+
 
 def create_mqtt_client():
     callback_versions = getattr(mqtt, "CallbackAPIVersion", None)
@@ -113,6 +141,41 @@ def write_json_atomic(path, payload, ensure_ascii=False):
         except OSError:
             pass
 
+
+def _disabled_mqtt_config():
+    return {
+        "mqtt_hub_enable": "0",
+        "mqtt_ha_inbound_enable": "0",
+        "mqtt_hub_ip": "",
+        "wb_ip": "",
+        "wb2_ip": "",
+        "context_valid": False,
+    }
+
+
+def _write_disabled_mqtt_state():
+    now = int(time.time())
+    write_json_atomic(
+        HA_INBOUND_FILE,
+        {"ts": now, "enabled": False, "context_valid": False, "sources": {}},
+        ensure_ascii=False,
+    )
+    write_json_atomic(
+        EXTERNAL_WB_FILE,
+        {
+            "ts": now,
+            "power": None,
+            "enabled": False,
+            "context_valid": False,
+            "state": "unknown",
+            "wb1": {"power": None, "ts": now, "context_valid": False, "state": "unknown"},
+            "wb2": {"power": None, "ts": now, "context_valid": False, "state": "unknown"},
+        },
+        ensure_ascii=False,
+    )
+    return False
+
+
 def as_float(value, default=0.0):
     try:
         if value is None:
@@ -150,7 +213,103 @@ def first_number(data, keys, default=0.0):
     return as_float(first_value(data, keys, default), default)
 
 def publish_json(client, topic, payload, retain=False):
+    if not _mqtt_context_valid(refresh=True):
+        _write_disabled_mqtt_state()
+        return False
     client.publish(topic, json.dumps(payload, ensure_ascii=False, separators=(",", ":")), retain=retain)
+    return True
+
+
+def publish_raw(client, topic, payload, retain=False):
+    if not _mqtt_context_valid(refresh=True):
+        _write_disabled_mqtt_state()
+        return False
+    client.publish(topic, payload, retain=retain)
+    return True
+
+
+def publish_retained_offline(client, availability_topic, timeout_s=5.0):
+    """Publiziert und bestätigt retained offline auch nach Verlust des Laufzeitkontexts."""
+    if client is None:
+        return False
+    try:
+        info = client.publish(availability_topic, "offline", qos=1, retain=True)
+        rc = getattr(info, "rc", None)
+        if rc is None and isinstance(info, (tuple, list)) and info:
+            rc = info[0]
+        success_rc = int(getattr(mqtt, "MQTT_ERR_SUCCESS", 0))
+        if rc is None or int(rc) != success_rc:
+            return False
+        wait_for_publish = getattr(info, "wait_for_publish", None)
+        is_published = getattr(info, "is_published", None)
+        if not callable(wait_for_publish) or not callable(is_published):
+            return False
+        try:
+            wait_for_publish(timeout=float(timeout_s))
+        except TypeError:
+            wait_for_publish(float(timeout_s))
+        return bool(is_published())
+    except Exception as exc:
+        logger.error(f"Retained MQTT-offline konnte nicht bestätigt werden: {exc}")
+        return False
+
+
+def _abort_transport_for_lwt(client):
+    """Schließt ungeordnet, damit der Broker das vorkonfigurierte retained LWT sendet."""
+    if client is None:
+        return False
+    try:
+        client.loop_stop()
+    except Exception:
+        pass
+    try:
+        mqtt_socket = client.socket()
+    except Exception:
+        mqtt_socket = None
+    if mqtt_socket is None:
+        return False
+    try:
+        mqtt_socket.shutdown(socket.SHUT_RDWR)
+    except Exception:
+        pass
+    try:
+        mqtt_socket.close()
+        return True
+    except Exception:
+        return False
+
+
+def shutdown_mqtt_for_context_loss(client, other_clients, base_topic):
+    """Sendet keinen regulären Disconnect, bevor retained offline bestätigt ist."""
+    availability_topic = f"{base_topic}/{AVAILABILITY_TOPIC_SUFFIX}"
+    offline_confirmed = publish_retained_offline(client, availability_topic) if client is not None else True
+    if client is not None:
+        if offline_confirmed:
+            try:
+                client.disconnect()
+            except Exception as exc:
+                logger.warning(f"MQTT DISCONNECT nach bestätigtem offline fehlgeschlagen: {exc}")
+                _abort_transport_for_lwt(client)
+            try:
+                client.loop_stop()
+            except Exception:
+                pass
+        else:
+            # Ein geordneter Disconnect unterdrückt das LWT; daher ungeordnet
+            # schließen, damit der Broker das bereits konfigurierte retained offline publiziert.
+            _abort_transport_for_lwt(client)
+    for mqtt_connection in other_clients or ():
+        if mqtt_connection is None:
+            continue
+        try:
+            mqtt_connection.disconnect()
+        except Exception:
+            pass
+        try:
+            mqtt_connection.loop_stop()
+        except Exception:
+            pass
+    return offline_confirmed
 
 def topic_safe(name):
     safe = re.sub(r"[^A-Za-z0-9_-]+", "_", str(name).strip().lower())
@@ -172,6 +331,9 @@ def is_current_window_active(plan):
     return False
 
 def update_inbound_telemetry(device, key, value, source_topic):
+    if not _mqtt_context_valid(refresh=True):
+        return _write_disabled_mqtt_state()
+
     def normalize_device_name(name):
         normalized = topic_safe(name)
         aliases = {
@@ -222,6 +384,8 @@ def update_inbound_telemetry(device, key, value, source_topic):
     data = read_json_file(HA_INBOUND_FILE)
     if not data:
         data = {"ts": int(time.time()), "sources": {}}
+    data["context_valid"] = True
+    data["enabled"] = True
     sources = data.setdefault("sources", {})
     now = int(time.time())
     dev = sources.setdefault(device, {})
@@ -241,6 +405,8 @@ def update_inbound_telemetry(device, key, value, source_topic):
         return False
 
 def handle_inbound_telemetry(base_topic, topic, payload, enabled=True):
+    if not _mqtt_context_valid(refresh=True):
+        return _write_disabled_mqtt_state()
     prefix = f"{base_topic}/in/"
     if not topic.startswith(prefix):
         return False
@@ -256,6 +422,15 @@ def handle_inbound_telemetry(base_topic, topic, payload, enabled=True):
     return True
 
 def build_ha_state(live, cfg=None):
+    if not _mqtt_context_valid(refresh=True):
+        _write_disabled_mqtt_state()
+        return {
+            "ts": int(time.time()),
+            "available": False,
+            "context_valid": False,
+            "mqtt_inbound_fresh": False,
+        }
+
     def fresh_source(source):
         if not isinstance(source, dict):
             return {}
@@ -271,6 +446,8 @@ def build_ha_state(live, cfg=None):
     heizstab = read_json_file(HEIZSTAB_DATA_FILE, max_age_s=180)
     inbound_enabled = as_bool(cfg.get("mqtt_ha_inbound_enable", "1"))
     inbound = read_json_file(HA_INBOUND_FILE, max_age_s=INBOUND_MAX_AGE_S) if inbound_enabled else {}
+    if isinstance(inbound, dict) and inbound.get("context_valid") is False:
+        inbound = {}
     price_boost = read_json_file(PRICE_BOOST_PLAN_FILE, max_age_s=1800)
     predump_plan = read_json_file(PREDUMP_CONSUMER_PLAN_FILE, max_age_s=180)
     inbound_sources = inbound.get("sources", {}) if isinstance(inbound.get("sources"), dict) else {}
@@ -363,6 +540,7 @@ def build_ha_state(live, cfg=None):
         or as_bool(first_value(inbound_wb2, ("charging",), False))
         or wallbox_w > 100
     )
+    v2h_state = live.get("v2h") if isinstance(live.get("v2h"), dict) else {}
 
     state = {
         "ts": int(time.time()),
@@ -394,6 +572,12 @@ def build_ha_state(live, cfg=None):
         "abregel_active": abregel_active,
         "cheap_price_active": cheap_price_active,
         "price_ct": round(price_ct, 3),
+        "v2h_allowed": as_bool(first_value(v2h_state, ("allowed",), first_value(live, ("v2h_allowed",), False))),
+        "v2h_read_only": as_bool(first_value(v2h_state, ("read_only",), True)),
+        "v2h_monitoring": as_bool(first_value(v2h_state, ("monitoring",), False)),
+        "v2h_active": as_bool(first_value(v2h_state, ("active",), False)),
+        "v2h_detected_discharge": as_bool(first_value(v2h_state, ("detected_discharge",), False)),
+        "v2h_reason": str(first_value(v2h_state, ("reason",), "") or ""),
         "wp_mode_text": str(first_value(live, ("wp_mode_text",), first_value(inbound_wp, ("mode", "state"), ""))),
         "wp_ww_temp": first_value(live, ("wp_ww_temp",), first_value(inbound_wp, ("ww_temp",), None)),
         "wp_rl_temp": first_value(live, ("wp_rl_temp",), first_value(inbound_wp, ("return_temp",), None)),
@@ -404,6 +588,9 @@ def build_ha_state(live, cfg=None):
     return state
 
 def read_config():
+    if not _mqtt_context_valid(refresh=True):
+        _write_disabled_mqtt_state()
+        return _disabled_mqtt_config()
     default_v4_file = "/var/www/html/data/e3dc_v4.json"
     try:
         if os.path.exists(CONFIG_CACHE):
@@ -417,18 +604,16 @@ def read_config():
     except: pass
     # Fallback: direkt aus Dateisystem lesen (Pfade dynamisch!)
     config = {}
-    try:
-        import sys, os as _os
-        _sdir = _os.path.dirname(_os.path.abspath(__file__))
-        if _sdir not in sys.path: sys.path.insert(0, _sdir)
-        from utils import get_paths as _gp
-        _paths = _gp()
-        install_path = _paths['install_path']
-        data_dir     = _paths['data_dir']
-    except Exception:
-        install_path = '/home/pi/Install'
-        data_dir     = '/var/www/html/data'
-    
+    import sys, os as _os
+    _sdir = _os.path.dirname(_os.path.abspath(__file__))
+    _repo_root = _os.path.dirname(_sdir)
+    if _repo_root not in sys.path:
+        sys.path.insert(0, _repo_root)
+    from Installer.utils import get_paths as _gp
+    _paths = _gp()
+    install_path = _paths['install_path']
+    data_dir = _paths['data_dir']
+
     # Erst V4 JSON lesen (neue Quelle), dann Legacy e3dc.config.txt als Fallback
     v4_file = os.path.join(data_dir, 'e3dc_v4.json')
     if os.path.exists(v4_file):
@@ -453,6 +638,8 @@ def read_config():
 
 def send_ha_discovery(client, base_topic):
     """Sendet Auto-Discovery Payloads an Home Assistant."""
+    if not _mqtt_context_valid(refresh=True):
+        return _write_disabled_mqtt_state()
     logger.info("Sende Home Assistant Auto-Discovery Konfigurationen...")
     state_topic = f"{base_topic}/ha/state"
     availability_topic = f"{base_topic}/{AVAILABILITY_TOPIC_SUFFIX}"
@@ -515,6 +702,10 @@ def send_ha_discovery(client, base_topic):
         {"id": "predump_active", "name": "Pre-Dump aktiv", "key": "predump_active"},
         {"id": "abregel_active", "name": "Abregelschutz aktiv", "key": "abregel_active"},
         {"id": "cheap_price_active", "name": "Preisfenster aktiv", "key": "cheap_price_active"},
+        {"id": "v2h_allowed", "name": "V2H/V2G erlaubt (Read-only)", "key": "v2h_allowed"},
+        {"id": "v2h_monitoring", "name": "V2H/V2G Beobachtung aktiv", "key": "v2h_monitoring"},
+        {"id": "v2h_active", "name": "V2H/V2G Steuerung aktiv (Read-only)", "key": "v2h_active"},
+        {"id": "v2h_detected_discharge", "name": "V2H/V2G Entladung erkannt", "key": "v2h_detected_discharge"},
     ]
     for s in binary_sensors:
         topic = f"homeassistant/binary_sensor/e3dc_control/{s['id']}/config"
@@ -533,6 +724,9 @@ def send_ha_discovery(client, base_topic):
         publish_json(client, topic, payload, retain=True)
 
 def on_connect(client, userdata, flags, reason_code, properties=None):
+    if not _mqtt_context_valid(refresh=True):
+        _write_disabled_mqtt_state()
+        return
     if mqtt_reason_success(reason_code):
         logger.info("MQTT verbunden. Abonniere Fahrzeug- und HA/ioBroker-Topics...")
         base_topic = str(userdata.get('base_topic', 'e3dc') or 'e3dc').strip().strip('/') or 'e3dc'
@@ -544,23 +738,26 @@ def on_connect(client, userdata, flags, reason_code, properties=None):
             "Abonniere HA/ioBroker Eingangs-Telemetrie: %s/in/# "
             "(u.a. wallbox/power_w, wallbox2/power_w)" % base_topic
         )
-        
+
         # Fallback für ein spezifisches, in der Config definiertes Topic (z.B. EVCC direkt)
         for key in ['sub_topic', 'sub_topic2']:
             st = userdata.get(key, '')
-            if st: 
+            if st:
                 client.subscribe(st)
                 logger.info(f"Abonniere SoC Topic auf Broker: {st}")
     else:
         logger.error(f"MQTT Verbindungsfehler, RC: {reason_code}")
 
 def on_message(client, userdata, msg):
+    if not _mqtt_context_valid(refresh=True):
+        _write_disabled_mqtt_state()
+        return
     topic = msg.topic
     try:
         payload = msg.payload.decode('utf-8').strip()
     except:
         return
-        
+
     try:
         val = float(payload)
         if not math.isfinite(val):
@@ -577,7 +774,7 @@ def on_message(client, userdata, msg):
 
     if handle_inbound_telemetry(base_topic, topic, val, userdata.get('inbound_enable', True)):
         return
-    
+
     # Format: e3dc/vehicle/tesla/soc
     match = re.match(rf"^{re.escape(base_topic)}/vehicle/([^/]+)/([^/]+)$", topic)
     if match:
@@ -606,7 +803,7 @@ def on_message(client, userdata, msg):
 
     vehicles = old_data.get("vehicles", [])
     target_v = next((v for v in vehicles if v.get("id") == v_id), None)
-    
+
     if not target_v:
         target_v = {"id": v_id, "name": v_id.capitalize(), "is_plugged_in": True, "soc": 0}
         vehicles.append(target_v)
@@ -621,7 +818,7 @@ def on_message(client, userdata, msg):
     old_data["vehicles"] = vehicles
     old_data["ts"] = int(time.time())
     if "error" in old_data:
-        del old_data["error"] 
+        del old_data["error"]
 
     try:
         os.makedirs(RAMDISK_DIR, exist_ok=True)
@@ -630,21 +827,24 @@ def on_message(client, userdata, msg):
         logger.error(f"Fehler beim Schreiben der vehicles.json: {e}")
 
 def on_wb_message(client, userdata, msg):
+    if not _mqtt_context_valid(refresh=True):
+        _write_disabled_mqtt_state()
+        return
     try:
         payload = msg.payload.decode('utf-8').strip()
         topic = msg.topic
-        
+
         # --- NEU: Prüfe ob dieses Topic eigentlich ein SoC-Topic ist ---
         sub_topic = userdata.get('sub_topic', '')
         sub_topic2 = userdata.get('sub_topic2', '')
-        
+
         if (sub_topic and topic == sub_topic) or (sub_topic2 and topic == sub_topic2):
              on_message(client, userdata, msg)
              return
 
         wb_id = userdata.get('wb_id', 'wb1')
         power = None
-        
+
         if payload.startswith('{') and payload.endswith('}'):
             try:
                 data = json.loads(payload)
@@ -654,16 +854,21 @@ def on_wb_message(client, userdata, msg):
                         power = finite_float(data_lower[key])
                         break
             except: pass
-            
+
         if power is None:
             power = finite_float(payload)
-            
+
         if power is None: return
         power = max(0.0, power)
 
-        ext_wb_file = "/var/www/html/ramdisk/external_wb.json"
+        ext_wb_file = EXTERNAL_WB_FILE
         os.makedirs(RAMDISK_DIR, exist_ok=True)
-        all_wb_data = {"wb1": {"power": 0, "ts": 0}, "wb2": {"power": 0, "ts": 0}}
+        all_wb_data = {
+            "context_valid": True,
+            "enabled": True,
+            "wb1": {"power": None, "ts": 0, "context_valid": False},
+            "wb2": {"power": None, "ts": 0, "context_valid": False},
+        }
         try:
             if os.path.exists(ext_wb_file):
                 with open(ext_wb_file, 'r') as f:
@@ -672,7 +877,15 @@ def on_wb_message(client, userdata, msg):
                     else: all_wb_data["wb1"] = old_data
         except: pass
 
-        all_wb_data[wb_id] = {"power": power, "ts": int(time.time()), "topic": topic, "source": "direct_mqtt"}
+        all_wb_data["context_valid"] = True
+        all_wb_data["enabled"] = True
+        all_wb_data[wb_id] = {
+            "power": power,
+            "ts": int(time.time()),
+            "topic": topic,
+            "source": "direct_mqtt",
+            "context_valid": True,
+        }
         all_wb_data["power"] = all_wb_data["wb1"]["power"]
         all_wb_data["ts"] = all_wb_data["wb1"]["ts"]
         all_wb_data["source"] = "direct_mqtt"
@@ -687,6 +900,10 @@ def on_wb_message(client, userdata, msg):
         logger.error(f"Fehler in on_wb_message: {e}")
 
 def main():
+    if not _mqtt_context_valid(refresh=True):
+        _write_disabled_mqtt_state()
+        logger.error("MQTT-Hub gesperrt: Installationskontext ist nicht vertrauenswuerdig.")
+        return
     cfg = read_config()
     broker_ip = cfg.get('mqtt_hub_ip', '127.0.0.1')
     broker_port = int(cfg.get('mqtt_hub_port', 1883))
@@ -718,18 +935,21 @@ def main():
         return
 
     def connect_main_mqtt_client():
+        if not _mqtt_context_valid(refresh=True):
+            _write_disabled_mqtt_state()
+            return None
         logger.info(f"Verbinde zu MQTT Broker auf {broker_ip}:{broker_port}...")
         mqtt_client = create_mqtt_client()
         mqtt_client.user_data_set({'base_topic': base_topic, 'sub_topic': sub_topic, 'sub_topic2': sub_topic2, 'sub_topic_name': sub_topic_name, 'sub_topic_name2': sub_topic_name2, 'inbound_enable': inbound_enable})
         mqtt_client.on_connect = on_connect
         mqtt_client.on_message = on_message
-        mqtt_client.will_set(f"{base_topic}/{AVAILABILITY_TOPIC_SUFFIX}", "offline", retain=True)
+        mqtt_client.will_set(f"{base_topic}/{AVAILABILITY_TOPIC_SUFFIX}", "offline", qos=1, retain=True)
         if user: mqtt_client.username_pw_set(user, password)
-        
+
         try:
             mqtt_client.connect(broker_ip, broker_port, 60)
             mqtt_client.loop_start()
-            mqtt_client.publish(f"{base_topic}/{AVAILABILITY_TOPIC_SUFFIX}", "online", retain=True)
+            publish_raw(mqtt_client, f"{base_topic}/{AVAILABILITY_TOPIC_SUFFIX}", "online", retain=True)
             send_ha_discovery(mqtt_client, base_topic)
             return mqtt_client
         except Exception as e:
@@ -742,8 +962,14 @@ def main():
 
     client = connect_main_mqtt_client() if has_main_broker else None
     next_main_retry = time.time() + 60 if has_main_broker and client is None else 0
-            
+
+    wb_client = None
+    wb2_client = None
+
     if has_wb_broker:
+        if not _mqtt_context_valid(refresh=True):
+            _write_disabled_mqtt_state()
+            return
         wb_host, wb_port = split_mqtt_endpoint(wb_ip)
         logger.info(f"Verbinde zu Wallbox 1 MQTT Broker auf {wb_host}:{wb_port} (Topic: {wb_topic})...")
         wb_client = create_mqtt_client()
@@ -761,6 +987,9 @@ def main():
             log_mqtt_connect_error("Wallbox 1 MQTT Broker", wb_host, wb_port, e)
 
     if has_wb2_broker:
+        if not _mqtt_context_valid(refresh=True):
+            _write_disabled_mqtt_state()
+            return
         wb2_host, wb2_port = split_mqtt_endpoint(wb2_ip)
         logger.info(f"Verbinde zu Wallbox 2 MQTT Broker auf {wb2_host}:{wb2_port} (Topic: {wb2_topic})...")
         wb2_client = create_mqtt_client()
@@ -781,6 +1010,20 @@ def main():
     last_ha_state = ""
     last_individual = {}
     while True:
+        if not _mqtt_context_valid(refresh=True):
+            _write_disabled_mqtt_state()
+            offline_confirmed = shutdown_mqtt_for_context_loss(
+                client,
+                (wb_client, wb2_client),
+                base_topic,
+            )
+            if not offline_confirmed:
+                logger.critical(
+                    "MQTT-Kontextverlust: retained offline nicht direkt bestätigt; "
+                    "Transport ungraceful für retained LWT geschlossen."
+                )
+            logger.error("MQTT-Hub beendet: Installationskontext ist nicht mehr vertrauenswuerdig.")
+            return
         if has_main_broker and client is None and time.time() >= next_main_retry:
             client = connect_main_mqtt_client()
             next_main_retry = time.time() + 60 if client is None else 0
@@ -790,7 +1033,7 @@ def main():
                 with urllib.request.urlopen(req, timeout=2) as response:
                     new_data = response.read().decode('utf-8')
                     if new_data != last_data:
-                        client.publish(f"{base_topic}/live", new_data, retain=False)
+                        publish_raw(client, f"{base_topic}/live", new_data, retain=False)
                         live_json = json.loads(new_data)
                         ha_state = build_ha_state(live_json, cfg)
                         ha_state_json = json.dumps(ha_state, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -802,7 +1045,7 @@ def main():
                                 if isinstance(value, (dict, list)):
                                     continue
                                 if last_individual.get(key) != value:
-                                    client.publish(f"{base_topic}/ha/{topic_safe(key)}", str(value), retain=True)
+                                    publish_raw(client, f"{base_topic}/ha/{topic_safe(key)}", str(value), retain=True)
                                     last_individual[key] = value
                         last_data = new_data
             except Exception as e:

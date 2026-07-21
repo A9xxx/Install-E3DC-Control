@@ -23,6 +23,11 @@ try:
 except Exception:  # pragma: no cover - package import fallback
     from .reserve import effective_ep_reserve_pct  # type: ignore
 
+try:
+    from pv_forecast_topology import resolve_buffered_pcc_limit
+except Exception:  # pragma: no cover - package import fallback
+    from .pv_forecast_topology import resolve_buffered_pcc_limit  # type: ignore
+
 
 RAMDISK = "/var/www/html/ramdisk"
 DATA_DIR = "/var/www/html/data"
@@ -39,13 +44,19 @@ SHADOW_DIFF_BRIEF_F = os.path.join(RAMDISK, "storage_parallel_diff_brief.json")
 SHADOW_DIFF_BRIEF_TXT_F = os.path.join(RAMDISK, "storage_parallel_diff_brief.txt")
 
 DIFF_LOG = logging.getLogger("StorageManager.ShadowCompare")
-DISABLED_WALLBOX_TYPES = {"none", "disabled", "deaktiviert", "keine", "keine_wallbox", "no_wallbox", "off", "dummy"}
+DISABLED_WALLBOX_TYPES = {"none", "disabled", "deaktiviert", "keine", "keine_wallbox", "no_wallbox", "off"}
 
 MODE_AUTO = 0
 MODE_IDLE = 1
 MODE_DISCH = 2
 MODE_CHRG = 3
 MODE_GRID = 4
+EMS_POWER_SETTINGS_NONZERO_MIN_W = 300
+# Der etablierte RSCP_POWER_SETTINGS-Vertrag arbeitet mit einem strikten
+# 50-W-Readback-Fenster. Ein frischer Readback innerhalb dieses Fensters
+# bestätigt denselben früheren Cap; ab 50 W bleibt der Pfad fail-closed und
+# hält den zuletzt sicheren Rahmen.
+RSCP_POWER_SETTINGS_TOLERANCE_W = 50
 
 AUTO_HOLD_STATES = {
     "parallel_auto",
@@ -364,8 +375,11 @@ def _dc_coupled_ems_budget(
     wallbox_actual_w: Any,
     battery_max_charge_w: Any,
     soc_pct: Any,
-) -> Dict[str, int]:
-    pv_w = max(0, _safe_int(pv_potential_w, 0))
+    external_ac_pv_w: Any = 0,
+    external_ac_pv_valid: Any = False,
+    external_ac_pv_source: Any = "",
+) -> Dict[str, Any]:
+    pv_total_w = max(0, _safe_int(pv_potential_w, 0))
     wr_limit_w = max(0, _safe_int(wr_max_ac_w, 0))
     feed_limit_w = max(0, _safe_int(export_limit_w, 0))
     fixed_load_w = max(0, _safe_int(home_w, 0)) + max(0, _safe_int(wp_w, 0))
@@ -373,12 +387,40 @@ def _dc_coupled_ems_budget(
     max_charge_w = max(0, _safe_int(battery_max_charge_w, 0))
     soc = _safe_float(soc_pct, 0.0)
 
+    # PV_Power ist die physikalische Gesamt-PV am Netzpunkt. E3DC liefert den
+    # externen AC-Erzeuger separat als EMS_POWER_ADD; e3dc_live hat ihn in
+    # PV_Power bereits eingerechnet. Nur ein typgültiger Quellensplit darf ihn
+    # vor der DC-Wechselrichtergrenze wieder abziehen. Fehlt dieser Nachweis,
+    # bleibt die bisherige konservative Behandlung erhalten.
+    external_source = str(external_ac_pv_source or "").strip()
+    external_value = _safe_float(external_ac_pv_w, 0.0)
+    external_trusted = bool(
+        external_ac_pv_valid is True
+        and external_source == "e3dc_add_power"
+        and not isinstance(external_ac_pv_w, bool)
+        and math.isfinite(external_value)
+        and external_value >= 0.0
+    )
+    external_ac_w = (
+        min(pv_total_w, max(0, int(round(external_value))))
+        if external_trusted
+        else 0
+    )
+    e3dc_dc_pv_w = max(0, pv_total_w - external_ac_w)
+
     if wr_limit_w >= 1000:
-        battery_must_dc_w = max(0, pv_w - wr_limit_w)
-        ac_available_w = min(max(0, pv_w - battery_must_dc_w), wr_limit_w)
+        battery_must_dc_w = max(0, e3dc_dc_pv_w - wr_limit_w)
+        e3dc_ac_available_w = min(
+            max(0, e3dc_dc_pv_w - battery_must_dc_w),
+            wr_limit_w,
+        )
     else:
         battery_must_dc_w = 0
-        ac_available_w = pv_w
+        e3dc_ac_available_w = e3dc_dc_pv_w
+
+    # Der externe AC-Erzeuger belastet nicht die E3DC-DC-/WR-Grenze, gehört
+    # aber weiterhin vollständig in die PCC-/Einspeisebilanz.
+    ac_available_w = e3dc_ac_available_w + external_ac_w
 
     total_ac_load_w = fixed_load_w + wb_w
     export_potential_w = max(0, ac_available_w - total_ac_load_w)
@@ -401,6 +443,12 @@ def _dc_coupled_ems_budget(
     wallbox_budget_increase_w = max(0, wallbox_budget_total_w - wb_w)
 
     return {
+        "pv_total_w": pv_total_w,
+        "e3dc_dc_pv_w": e3dc_dc_pv_w,
+        "e3dc_ac_available_w": e3dc_ac_available_w,
+        "external_ac_pv_w": external_ac_w,
+        "external_ac_pv_trusted": external_trusted,
+        "external_ac_pv_source": external_source,
         "ac_available_w": ac_available_w,
         "battery_must_dc_w": battery_must_dc_w,
         "battery_must_ac_w": battery_must_ac_w,
@@ -1049,7 +1097,7 @@ class ParallelDecision:
 
 
 class ParallelStorageRegulator:
-    """Read-only parallel storage regulator for diagnostic comparison."""
+    """Erste Stufe des neuen Storage-Reglers im Shadow-Modus."""
 
     PASSTHROUGH_STATES = (
         "manual_override",
@@ -1207,12 +1255,32 @@ class ParallelStorageRegulator:
             self.cfg.get("abregel_puffer_w"),
             300,
         ))
-        self.curve_cap_release_band_w = max(100, self.curve_cap_feed_buffer_w)
+        # Der native Pfad verwendet denselben fachlichen Austrittsvertrag wie
+        # die bestehende Konfiguration. Bei älteren Konfigurationen ohne den
+        # Hystereseschlüssel bleibt das bisherige AUTO-Band der konservative
+        # Migrationswert; neue Installationen nutzen abregel_hysterese_w.
+        curve_cap_release_hysteresis_default_w = (
+            _safe_int(self.cfg.get("abregel_auto_band_w"), 1800)
+            if "abregel_auto_band_w" in self.cfg
+            else 2000
+        )
+        self.curve_cap_release_hysteresis_w = max(
+            self.curve_cap_feed_buffer_w,
+            _safe_int(
+                self.cfg.get("abregel_hysterese_w"),
+                curve_cap_release_hysteresis_default_w,
+            ),
+        )
+        self.curve_cap_release_band_w = self.curve_cap_release_hysteresis_w
+        self.curve_cap_release_grace_s = max(
+            0.0,
+            _safe_float(self.cfg.get("abregel_auto_grace_s"), 30.0),
+        )
         self.curve_cap_feedback_band_w = max(
             self.curve_cap_release_band_w,
             _safe_int(
                 self.cfg.get("storage_parallel_curve_cap_feedback_band_w"),
-                self.curve_cap_release_band_w * 3,
+                self.curve_cap_release_band_w,
             ),
         )
         # Der Abregel-Puffer definiert den Zielabstand zum harten Einspeiselimit.
@@ -1559,6 +1627,30 @@ class ParallelStorageRegulator:
             or headroom_reserve_pressure_wh >= 200.0
         )
         headroom_reserve_source = str(active_state.get("headroom_reserve_source") or "")
+        headroom_execution = (
+            active_state.get("headroom_execution")
+            if isinstance(active_state.get("headroom_execution"), dict)
+            else {}
+        )
+        headroom_execution_allowed = bool(
+            headroom_execution.get("schema_version") == 1
+            and headroom_execution.get("allowed") is True
+        )
+        headroom_execution_reason = str(
+            headroom_execution.get("reason_code") or "HEADROOM_EXECUTION_CONTRACT_MISSING"
+        )
+        headroom_execution_residual_wh = max(
+            0.0,
+            _safe_float(headroom_execution.get("residual_wh"), 0.0),
+        )
+        headroom_execution_target_soc = _safe_float(
+            headroom_execution.get("target_soc"),
+            -1.0,
+        )
+        headroom_execution_hard_floor_soc = _safe_float(
+            headroom_execution.get("hard_floor_soc"),
+            -1.0,
+        )
         curve_gap_pct = None if curve_soc is None else float(curve_soc) - float(soc)
         curve_above_pct = max(0.0, -float(curve_gap_pct)) if curve_gap_pct is not None else 0.0
         curve_soft_taper_pct = max(0.2, self.curve_tolerance_pct)
@@ -1670,11 +1762,84 @@ class ParallelStorageRegulator:
             if previous_parallel_state == "parallel_curve_charge_cap"
             else 0
         )
+        curve_cap_release_pending = bool(active_state.get("curve_cap_release_pending"))
+        curve_cap_release_requested = bool(
+            active_state.get("curve_cap_release_requested")
+        )
+        curve_cap_release_confirmed_since_ts = max(
+            0.0,
+            _safe_float(active_state.get("curve_cap_release_confirmed_since_ts"), 0.0),
+        )
+        curve_cap_bounded_zero_w = max(
+            EMS_POWER_SETTINGS_NONZERO_MIN_W,
+            self.abregel_min_charge_w,
+        )
+        curve_cap_tracking_active = bool(
+            (
+                previous_parallel_state == "parallel_curve_charge_cap"
+                and previous_curve_cap_w > 0
+            )
+            or curve_cap_release_pending
+            or curve_cap_release_requested
+        )
         if curve_cap_relevant:
             curve_cap_target_w = 0
         curve_cap_keep_active = False
+        curve_cap_grid_contract_valid = bool(
+            _truthy(live.get("RSCP_Sample_Valid", True))
+            and _truthy(live.get("Grid_Power_Valid", True))
+        )
         grid_import_w = max(0, grid_w, grid_ema_w)
         grid_export_w = 0 if grid_import_w > 0 else max(0, -grid_w, -grid_ema_w)
+        curve_cap_real_grid_import_active = bool(
+            curve_cap_grid_contract_valid
+            and grid_import_w >= self.grid_relief_enter_w
+        )
+        curve_cap_release_below_since_ts = (
+            max(0.0, _safe_float(active_state.get("curve_cap_release_below_since_ts"), 0.0))
+            if (
+                previous_parallel_state == "parallel_curve_charge_cap"
+                and previous_curve_cap_w > 0
+            )
+            else 0.0
+        )
+        curve_cap_post_release_until_ts = max(
+            0.0,
+            _safe_float(active_state.get("curve_cap_post_release_until_ts"), 0.0),
+        )
+        if curve_cap_post_release_until_ts <= now_s:
+            curve_cap_post_release_until_ts = 0.0
+        curve_cap_post_release_guard_initial = bool(curve_cap_post_release_until_ts > now_s)
+        settings_readback_valid = bool(
+            live.get("ems_power_settings_read") is True
+            and live.get("ems_power_settings_valid") is True
+            and isinstance(live.get("power_limits_active"), bool)
+            and isinstance(live.get("ems_max_charge_power_w"), int)
+            and not isinstance(live.get("ems_max_charge_power_w"), bool)
+            and int(live.get("ems_max_charge_power_w")) >= 0
+            and isinstance(live.get("ems_max_discharge_power_w"), int)
+            and not isinstance(live.get("ems_max_discharge_power_w"), bool)
+            and int(live.get("ems_max_discharge_power_w")) >= 0
+            and isinstance(live.get("ems_discharge_start_power_w"), int)
+            and not isinstance(live.get("ems_discharge_start_power_w"), bool)
+            and int(live.get("ems_discharge_start_power_w")) >= 0
+        )
+        settings_bounded_zero_confirmed = bool(
+            settings_readback_valid
+            and live.get("power_limits_active") is True
+            and int(live.get("ems_max_charge_power_w")) <= curve_cap_bounded_zero_w
+        )
+        settings_previous_curve_cap_confirmed = bool(
+            settings_readback_valid
+            and live.get("power_limits_active") is True
+            and previous_curve_cap_w > 0
+            and abs(int(live.get("ems_max_charge_power_w")) - previous_curve_cap_w)
+            < RSCP_POWER_SETTINGS_TOLERANCE_W
+        )
+        settings_release_confirmed = bool(
+            settings_readback_valid
+            and live.get("power_limits_active") is False
+        )
         meter_home_w = home_rule_w + wp_w
         if wallbox_home_includes and wallbox_w > 250:
             meter_home_w += int(wallbox_w)
@@ -1688,24 +1853,14 @@ class ParallelStorageRegulator:
         inverter_limit_w = _inverter_ac_limit_w(self.cfg, active_state, live)
         configured_export_limit_w = _configured_kw_or_w(self.cfg.get("einspeiselimit", 0))
         live_derate_limit_w = _safe_int(live.get("derate_at_power_w", active_state.get("derate_at_power_w")), 0)
-        derate_hard_limit_w = 0
-        derate_limit_source = "none"
-        if configured_export_limit_w > 0 and live_derate_limit_w > 0:
-            derate_hard_limit_w = min(configured_export_limit_w, live_derate_limit_w)
-            if configured_export_limit_w < live_derate_limit_w - 50:
-                derate_limit_w = configured_export_limit_w
-                derate_limit_source = "config_below_rscp"
-            else:
-                derate_limit_w = max(0, derate_hard_limit_w - self.curve_cap_feed_buffer_w)
-                derate_limit_source = "rscp_buffered"
-        elif live_derate_limit_w > 0:
-            derate_hard_limit_w = live_derate_limit_w
-            derate_limit_w = max(0, live_derate_limit_w - self.curve_cap_feed_buffer_w)
-            derate_limit_source = "rscp_buffered"
-        else:
-            derate_hard_limit_w = configured_export_limit_w
-            derate_limit_w = configured_export_limit_w
-            derate_limit_source = "config"
+        pcc_limit_contract = resolve_buffered_pcc_limit(
+            configured_export_limit_w,
+            live_derate_limit_w,
+            self.curve_cap_feed_buffer_w,
+        )
+        derate_hard_limit_w = int(pcc_limit_contract.get("hard_limit_w") or 0)
+        derate_limit_w = int(pcc_limit_contract.get("limit_w") or 0)
+        derate_limit_source = str(pcc_limit_contract.get("source") or "none")
         derating_active = bool(
             _truthy(live.get("pv_derating_active", active_state.get("pv_derating_active", False)))
             or _truthy(live.get("ems_derating_active", active_state.get("ems_derating_active", False)))
@@ -1720,6 +1875,9 @@ class ParallelStorageRegulator:
             wallbox_w,
             self.max_charge_w,
             soc,
+            external_ac_pv_w=live.get("Ext_PV_Power"),
+            external_ac_pv_valid=live.get("Ext_PV_Power_Valid"),
+            external_ac_pv_source=live.get("Ext_PV_Power_Source"),
         )
         inverter_pressure_w = int(ems_budget["battery_must_dc_w"])
         derating_pressure_w = int(ems_budget["battery_must_ac_w"])
@@ -1739,9 +1897,10 @@ class ParallelStorageRegulator:
             grid_export_over_limit_w = max(0, grid_export_error_w)
             curve_cap_below_threshold_w = 0
         curve_cap_feedback_active = bool(
-            previous_curve_cap_w >= self.curve_charge_enter_w
+            curve_cap_tracking_active
+            and curve_cap_grid_contract_valid
             and feed_export_threshold_w > 0
-            and grid_import_w <= max(150, self.grid_limit_w)
+            and not curve_cap_real_grid_import_active
             and (
                 grid_export_over_limit_w > 0
                 or curve_cap_below_threshold_w <= self.curve_cap_feedback_band_w
@@ -1762,11 +1921,12 @@ class ParallelStorageRegulator:
         )
         curve_cap_dc_hold_active = bool(
             previous_curve_cap_w >= self.curve_charge_enter_w
+            and curve_cap_grid_contract_valid
             and curve_above_soft
             and inverter_pressure_w >= max(self.abregel_min_charge_w, self.curve_charge_enter_w)
             and feed_export_threshold_w > 0
             and release_export_threshold_w > 0
-            and grid_import_w <= max(150, self.grid_limit_w)
+            and not curve_cap_real_grid_import_active
             and (
                 int(grid_export_w) + int(curve_cap_dc_hold_margin_w)
                 >= max(0, int(release_export_threshold_w) - int(self.curve_cap_feedback_band_w))
@@ -1780,8 +1940,9 @@ class ParallelStorageRegulator:
         # kann diesen Anteil oft autonom aufnehmen.
         curve_cap_dc_pressure_active = bool(
             inverter_pressure_w > 0
+            and curve_cap_grid_contract_valid
             and feed_export_threshold_w > 0
-            and grid_import_w <= max(150, self.grid_limit_w)
+            and not curve_cap_real_grid_import_active
             and (
                 grid_export_over_limit_w > 0
                 or curve_cap_feedback_active
@@ -1828,10 +1989,28 @@ class ParallelStorageRegulator:
         projected_export_over_limit_w = int(grid_export_over_limit_w)
         current_feed_pressure_w = int(grid_export_over_limit_w)
         curve_cap_hard_pressure_active = bool(
-            curve_cap_pressure_w >= self.curve_cap_export_trigger_w
-            or grid_export_over_limit_w > 0
-            or curve_cap_grid_pressure_w > 0
+            curve_cap_grid_contract_valid
+            and not curve_cap_real_grid_import_active
+            and (
+                curve_cap_pressure_w >= self.curve_cap_export_trigger_w
+                or grid_export_over_limit_w > 0
+                or curve_cap_grid_pressure_w > 0
+            )
         )
+        curve_cap_post_release_reentry_blocked = bool(
+            (
+                curve_cap_release_pending
+                or curve_cap_release_requested
+                or curve_cap_post_release_guard_initial
+            )
+            and grid_export_over_limit_w <= 0
+            and curve_cap_hard_pressure_active
+        )
+        if curve_cap_post_release_reentry_blocked:
+            # Während der bestätigungsgebundenen Freigabe darf alleiniger
+            # DC-/WR-Druck unterhalb der realen Netzpunkt-Eintrittsschwelle
+            # keinen neuen mehr-kW-Laderahmen öffnen.
+            curve_cap_hard_pressure_active = False
         if curve_cap_hard_pressure_active:
             curve_cap_relevant = True
         curve_cap_short_hold_active = bool(
@@ -1846,7 +2025,9 @@ class ParallelStorageRegulator:
             )
         )
         curve_cap_export_room_active = bool(
-            curve_cap_pressure_w > 0
+            curve_cap_grid_contract_valid
+            and not curve_cap_real_grid_import_active
+            and curve_cap_pressure_w > 0
             and curve_cap_hard_pressure_active
             and (
                 feed_export_threshold_w > 0
@@ -1865,8 +2046,208 @@ class ParallelStorageRegulator:
         )
         curve_cap_pv_surplus_w = 0
         curve_cap_proactive_active = False
+        curve_cap_release_below_active = bool(
+            curve_cap_tracking_active
+            and curve_cap_grid_contract_valid
+            and not curve_cap_real_grid_import_active
+            and feed_export_threshold_w > 0
+            and grid_export_w < release_export_threshold_w
+        )
+        curve_cap_release_elapsed_s = 0.0
+        curve_cap_release_grace_active = False
+        curve_cap_release_ramp_active = False
+        curve_cap_hysteresis_hold_active = False
+        curve_cap_hysteresis_amount_follow_active = False
+        curve_cap_hysteresis_floor_w = curve_cap_bounded_zero_w
+        curve_cap_invalid_hold_active = False
+        curve_cap_release_phase = "inactive"
+        if curve_cap_tracking_active:
+            if not curve_cap_grid_contract_valid:
+                # Eine ungültige/stale Netzpunktprobe unterbricht den
+                # Kontinuitätsnachweis. Sie ist weder 0 W noch Zeit unterhalb
+                # der Release-Schwelle.
+                curve_cap_release_below_since_ts = 0.0
+                curve_cap_invalid_hold_active = True
+                curve_cap_release_phase = "hold_invalid_grid"
+            elif curve_cap_real_grid_import_active:
+                curve_cap_release_below_since_ts = 0.0
+                curve_cap_release_confirmed_since_ts = 0.0
+                curve_cap_release_pending = False
+                curve_cap_release_requested = False
+                curve_cap_release_phase = "grid_import_release"
+            elif grid_export_over_limit_w > 0:
+                curve_cap_release_below_since_ts = 0.0
+                curve_cap_release_confirmed_since_ts = 0.0
+                curve_cap_release_pending = False
+                curve_cap_release_requested = False
+                curve_cap_post_release_until_ts = 0.0
+                curve_cap_release_phase = "hard_pressure"
+            elif curve_cap_release_requested:
+                if not curve_cap_release_below_active:
+                    curve_cap_release_requested = False
+                    curve_cap_release_pending = True
+                    curve_cap_release_confirmed_since_ts = 0.0
+                    curve_cap_release_phase = "post_release_hysteresis_hold"
+                elif settings_release_confirmed:
+                    curve_cap_release_requested = False
+                    curve_cap_release_below_since_ts = 0.0
+                    curve_cap_release_confirmed_since_ts = 0.0
+                    curve_cap_release_phase = "released_confirmed"
+                    curve_cap_post_release_until_ts = max(
+                        curve_cap_post_release_until_ts,
+                        now_s + self.curve_cap_release_grace_s,
+                    )
+                elif settings_bounded_zero_confirmed:
+                    # Der finale Freigaberahmen wurde bereits angefordert,
+                    # physisch ist aber noch der sichere Protokollboden aktiv.
+                    # Das ist kein neuer Cap-Eintritt. Bis zum frischen
+                    # limits_used=false-Readback bleibt ausschließlich die
+                    # bestätigungsgebundene Freigabe aktiv.
+                    curve_cap_release_phase = "await_release_readback"
+                else:
+                    # Stale, unbekannt oder oberhalb des bestätigten Bodens:
+                    # nie optimistisch freigeben, sondern auf den sicheren
+                    # begrenzten Nullrahmen zurückfallen.
+                    curve_cap_release_requested = False
+                    curve_cap_release_pending = True
+                    curve_cap_release_confirmed_since_ts = 0.0
+                    curve_cap_release_phase = "post_release_readback_unconfirmed"
+            elif curve_cap_release_pending:
+                if not settings_bounded_zero_confirmed:
+                    curve_cap_release_confirmed_since_ts = 0.0
+                    curve_cap_release_phase = (
+                        "await_zero_readback"
+                        if settings_readback_valid
+                        else "hold_unknown_readback"
+                    )
+                elif not curve_cap_release_below_active:
+                    curve_cap_release_confirmed_since_ts = 0.0
+                    curve_cap_release_phase = "post_release_hysteresis_hold"
+                else:
+                    if curve_cap_release_confirmed_since_ts <= 0.0:
+                        curve_cap_release_confirmed_since_ts = now_s
+                    curve_cap_release_elapsed_s = max(
+                        0.0,
+                        now_s - curve_cap_release_confirmed_since_ts,
+                    )
+                    if curve_cap_release_elapsed_s < self.curve_cap_release_grace_s:
+                        curve_cap_release_phase = "post_release_confirmed_grace"
+                    else:
+                        curve_cap_release_pending = False
+                        curve_cap_release_requested = True
+                        curve_cap_release_phase = "release_requested"
+                        curve_cap_post_release_until_ts = (
+                            now_s + self.curve_cap_release_grace_s
+                        )
+            elif feed_export_threshold_w <= 0:
+                # Ohne belegte Abregelgrenze gibt es keine fachliche
+                # Release-Schwelle. Der historische allgemeine Kurvenpfad
+                # darf dadurch nicht in einem Cap festgehalten werden.
+                curve_cap_release_below_since_ts = 0.0
+                curve_cap_release_phase = "inactive_no_feed_limit"
+            elif curve_cap_release_below_active:
+                if curve_cap_release_below_since_ts <= 0.0:
+                    curve_cap_release_below_since_ts = now_s
+                curve_cap_release_elapsed_s = max(
+                    0.0,
+                    now_s - curve_cap_release_below_since_ts,
+                )
+                curve_cap_release_grace_active = bool(
+                    curve_cap_release_elapsed_s < self.curve_cap_release_grace_s
+                )
+                curve_cap_release_ramp_active = not curve_cap_release_grace_active
+                curve_cap_release_phase = (
+                    "release_grace"
+                    if curve_cap_release_grace_active
+                    else "release_ramp"
+                )
+            else:
+                curve_cap_release_below_since_ts = 0.0
+                curve_cap_hysteresis_hold_active = True
+                curve_cap_release_phase = "hysteresis_hold"
+        elif (
+            curve_cap_post_release_guard_initial
+            and not settings_release_confirmed
+        ):
+            # Eine fehlende/unklare Freigabequittung wird nicht optimistisch
+            # als AUTO interpretiert. Der letzte sichere 0-W-Rahmen wird
+            # erneut als begrenztes Ziel geführt.
+            if settings_bounded_zero_confirmed and curve_cap_release_below_active:
+                curve_cap_release_requested = True
+                curve_cap_release_phase = "await_release_readback"
+            else:
+                curve_cap_release_pending = True
+                curve_cap_release_confirmed_since_ts = 0.0
+                curve_cap_release_phase = "post_release_readback_unconfirmed"
+        elif curve_cap_hard_pressure_active:
+            curve_cap_post_release_until_ts = 0.0
+            curve_cap_release_phase = "hard_entry"
         curve_cap_active = bool(curve_cap_target_w > 0 and curve_cap_keep_active)
-        if curve_cap_relevant and curve_cap_export_room_active:
+        if curve_cap_real_grid_import_active:
+            curve_cap_target_w = 0
+            curve_cap_active = False
+            curve_cap_keep_active = False
+            curve_cap_neutral_keep = False
+        elif curve_cap_release_pending or curve_cap_release_requested:
+            curve_cap_target_w = 0
+            curve_cap_keep_active = True
+            curve_cap_active = True
+        elif curve_cap_invalid_hold_active:
+            curve_cap_target_w = min(self.max_charge_w, previous_curve_cap_w)
+            curve_cap_keep_active = True
+            curve_cap_active = True
+        elif curve_cap_hysteresis_hold_active:
+            # Die Netzpunkthysterese hält den Abregelschutz als Zustand aktiv,
+            # nicht pauschal den Betrag eines früheren Druckframes. Nur ein
+            # frischer, exakt zum letzten Cap passender POWER_SETTINGS-Readback
+            # darf den bereits netzpunkt- und schrittbegrenzten Zielwert
+            # absenken. Der Protokollboden und echter DC-/WR-Druck bleiben
+            # dabei erhalten; eine Erhöhung entsteht aus diesem Hold-Zweig nie.
+            curve_cap_hysteresis_amount_follow_active = bool(
+                curve_cap_grid_contract_valid
+                and not curve_cap_real_grid_import_active
+                and settings_previous_curve_cap_confirmed
+                and curve_cap_pressure_w < previous_curve_cap_w
+            )
+            if curve_cap_hysteresis_amount_follow_active:
+                curve_cap_hysteresis_floor_w = max(
+                    curve_cap_bounded_zero_w,
+                    curve_cap_dc_pressure_w,
+                )
+                curve_cap_target_w = min(
+                    self.max_charge_w,
+                    previous_curve_cap_w,
+                    max(
+                        curve_cap_hysteresis_floor_w,
+                        curve_cap_pressure_w,
+                        previous_curve_cap_w - self.curve_cap_step_w,
+                    ),
+                )
+            else:
+                curve_cap_target_w = min(self.max_charge_w, previous_curve_cap_w)
+            curve_cap_keep_active = True
+            curve_cap_active = True
+        elif curve_cap_release_grace_active:
+            curve_cap_target_w = min(self.max_charge_w, previous_curve_cap_w)
+            curve_cap_keep_active = True
+            curve_cap_active = True
+        elif curve_cap_release_ramp_active:
+            if previous_curve_cap_w <= curve_cap_bounded_zero_w:
+                curve_cap_target_w = 0
+            else:
+                curve_cap_target_w = max(
+                    curve_cap_bounded_zero_w,
+                    previous_curve_cap_w - self.curve_cap_step_w,
+                )
+            curve_cap_keep_active = curve_cap_target_w > 0
+            curve_cap_active = curve_cap_target_w > 0
+            if not curve_cap_active:
+                curve_cap_release_pending = True
+                curve_cap_release_confirmed_since_ts = 0.0
+                curve_cap_keep_active = True
+                curve_cap_active = True
+                curve_cap_release_phase = "await_zero_readback"
+        elif curve_cap_relevant and curve_cap_export_room_active:
             next_curve_cap_target_w = int(max(
                 0,
                 min(self.max_charge_w, curve_cap_pressure_w),
@@ -1876,8 +2257,11 @@ class ParallelStorageRegulator:
                     next_curve_cap_target_w,
                     int(curve_ifc_export_catchup_w),
                 )
-            if next_curve_cap_target_w > 0 and self.abregel_min_charge_w > 0:
-                next_curve_cap_target_w = max(self.abregel_min_charge_w, next_curve_cap_target_w)
+            if next_curve_cap_target_w > 0:
+                next_curve_cap_target_w = max(
+                    curve_cap_bounded_zero_w,
+                    next_curve_cap_target_w,
+                )
             if (
                 previous_curve_cap_w >= self.curve_charge_enter_w
                 and abs(next_curve_cap_target_w - previous_curve_cap_w) < self.curve_cap_step_w
@@ -1893,6 +2277,9 @@ class ParallelStorageRegulator:
             curve_cap_target_w = min(self.max_charge_w, neutral_keep_w)
             curve_cap_keep_active = True
             curve_cap_active = True
+        curve_cap_post_release_guard_active = bool(
+            curve_cap_post_release_until_ts > now_s
+        )
         reserve_live = dict(live or {})
         if active_state.get("ep_reserve_pct") is not None:
             reserve_live["ep_reserve_pct"] = active_state.get("ep_reserve_pct")
@@ -2253,11 +2640,16 @@ class ParallelStorageRegulator:
             and soc < float(curve_soc) - self.night_floor_enter_pct
         )
 
-        headroom_discharge_floor_soc = (
-            float(adaptive_floor_soc)
-            if adaptive_floor_soc is not None
-            else (float(curve_soc) if curve_soc is not None else None)
-        )
+        headroom_floor_candidates = [reserve_soc]
+        if adaptive_floor_soc is not None:
+            headroom_floor_candidates.append(float(adaptive_floor_soc))
+        elif curve_soc is not None:
+            headroom_floor_candidates.append(float(curve_soc))
+        if 0.0 <= headroom_execution_target_soc <= 100.0:
+            headroom_floor_candidates.append(headroom_execution_target_soc)
+        if 0.0 <= headroom_execution_hard_floor_soc <= 100.0:
+            headroom_floor_candidates.append(headroom_execution_hard_floor_soc)
+        headroom_discharge_floor_soc = max(headroom_floor_candidates)
         headroom_discharge_gap_pct = (
             max(0.0, float(soc) - float(headroom_discharge_floor_soc))
             if headroom_discharge_floor_soc is not None
@@ -2312,10 +2704,15 @@ class ParallelStorageRegulator:
             or curve_cap_feedback_active
             or curve_cap_dc_pressure_active
             or curve_cap_pressure_w >= self.curve_cap_export_trigger_w
+            or curve_cap_post_release_guard_active
         )
         headroom_discharge_blocked_reason = ""
         if not self.headroom_discharge_enable:
             headroom_discharge_blocked_reason = "disabled"
+        elif not headroom_execution_allowed:
+            headroom_discharge_blocked_reason = "execution:%s" % headroom_execution_reason.lower()
+        elif headroom_execution_residual_wh <= 0.0:
+            headroom_discharge_blocked_reason = "execution:headroom_residual_depleted"
         elif headroom_discharge_daily_blocked:
             headroom_discharge_blocked_reason = "daily_limit"
         elif headroom_discharge_cooldown_active:
@@ -2354,6 +2751,11 @@ class ParallelStorageRegulator:
                 self.max_discharge_w,
                 self.headroom_discharge_max_w_cfg,
                 headroom_discharge_export_room_w,
+                int(round(
+                    headroom_execution_residual_wh
+                    * 3600.0
+                    / max(15.0, self.headroom_discharge_energy_gap_s)
+                )),
             )
             headroom_discharge_target_w = max(
                 self.headroom_discharge_min_w,
@@ -2432,6 +2834,22 @@ class ParallelStorageRegulator:
             "headroom_reserve_pressure_wh": round(headroom_reserve_pressure_wh, 0),
             "headroom_reserve_source": headroom_reserve_source,
             "headroom_discharge_pressure_wh": round(headroom_discharge_pressure_wh, 0),
+            "headroom_execution_schema_version": headroom_execution.get("schema_version"),
+            "headroom_execution_allowed": headroom_execution_allowed,
+            "headroom_execution_reason_code": headroom_execution_reason,
+            "headroom_execution_plan_id": headroom_execution.get("plan_id"),
+            "headroom_execution_slot_id": headroom_execution.get("slot_id"),
+            "headroom_execution_earliest_start_ts": headroom_execution.get("earliest_start_ts"),
+            "headroom_execution_deadline_ts": headroom_execution.get("deadline_ts"),
+            "headroom_execution_target_soc": headroom_execution.get("target_soc"),
+            "headroom_execution_hard_floor_soc": headroom_execution.get("hard_floor_soc"),
+            "headroom_execution_plan_accounted_wh": headroom_execution.get("plan_accounted_wh", 0.0),
+            "headroom_execution_slot_accounted_wh": headroom_execution.get("slot_accounted_wh", 0.0),
+            "headroom_execution_residual_wh": headroom_execution_residual_wh,
+            "headroom_execution_accounted_observed_w": headroom_execution.get("accounted_observed_w", 0.0),
+            "headroom_execution_accounted_interval_s": headroom_execution.get("accounted_interval_s", 0.0),
+            "headroom_execution_generation_reset": bool(headroom_execution.get("generation_reset", True)),
+            "headroom_execution_last_account_ts": round(now_s, 3),
             "headroom_discharge_min_pressure_wh": round(self.headroom_discharge_min_pressure_wh, 0),
             "headroom_discharge_active": headroom_discharge_active,
             "headroom_discharge_blocked_reason": headroom_discharge_blocked_reason,
@@ -2563,7 +2981,32 @@ class ParallelStorageRegulator:
             "curve_cap_feed_buffer_w": self.curve_cap_feed_buffer_w,
             "curve_cap_release_band_w": self.curve_cap_release_band_w,
             "curve_cap_feedback_band_w": self.curve_cap_feedback_band_w,
-            "curve_cap_min_charge_w": self.abregel_min_charge_w,
+            "curve_cap_release_hysteresis_w": self.curve_cap_release_hysteresis_w,
+            "curve_cap_release_grace_s": self.curve_cap_release_grace_s,
+            "curve_cap_grid_contract_valid": curve_cap_grid_contract_valid,
+            "curve_cap_real_grid_import_active": curve_cap_real_grid_import_active,
+            "curve_cap_release_below_active": curve_cap_release_below_active,
+            "curve_cap_release_below_since_ts": curve_cap_release_below_since_ts,
+            "curve_cap_release_elapsed_s": curve_cap_release_elapsed_s,
+            "curve_cap_release_grace_active": curve_cap_release_grace_active,
+            "curve_cap_release_ramp_active": curve_cap_release_ramp_active,
+            "curve_cap_hysteresis_hold_active": curve_cap_hysteresis_hold_active,
+            "curve_cap_hysteresis_amount_follow_active": curve_cap_hysteresis_amount_follow_active,
+            "curve_cap_hysteresis_floor_w": curve_cap_hysteresis_floor_w,
+            "curve_cap_invalid_hold_active": curve_cap_invalid_hold_active,
+            "curve_cap_release_phase": curve_cap_release_phase,
+            "curve_cap_release_pending": curve_cap_release_pending,
+            "curve_cap_release_requested": curve_cap_release_requested,
+            "curve_cap_release_confirmed_since_ts": curve_cap_release_confirmed_since_ts,
+            "curve_cap_post_release_until_ts": curve_cap_post_release_until_ts,
+            "curve_cap_post_release_guard_active": curve_cap_post_release_guard_active,
+            "curve_cap_post_release_reentry_blocked": curve_cap_post_release_reentry_blocked,
+            "curve_cap_settings_readback_valid": settings_readback_valid,
+            "curve_cap_settings_previous_cap_confirmed": settings_previous_curve_cap_confirmed,
+            "curve_cap_settings_bounded_zero_confirmed": settings_bounded_zero_confirmed,
+            "curve_cap_settings_release_confirmed": settings_release_confirmed,
+            "curve_cap_bounded_zero_w": curve_cap_bounded_zero_w,
+            "curve_cap_min_charge_w": curve_cap_bounded_zero_w,
             "curve_cap_hard_pressure_active": curve_cap_hard_pressure_active,
             "curve_cap_feedback_active": curve_cap_feedback_active,
             "curve_cap_grid_export_error_w": grid_export_error_w,
@@ -2577,6 +3020,12 @@ class ParallelStorageRegulator:
             "live_derate_limit_w": live_derate_limit_w,
             "derating_pressure_w": derating_pressure_w,
             "ems_mandatory_charge_w": ems_mandatory_charge_w,
+            "ems_pv_total_w": ems_budget["pv_total_w"],
+            "ems_e3dc_dc_pv_w": ems_budget["e3dc_dc_pv_w"],
+            "ems_e3dc_ac_available_w": ems_budget["e3dc_ac_available_w"],
+            "ems_external_ac_pv_w": ems_budget["external_ac_pv_w"],
+            "ems_external_ac_pv_trusted": ems_budget["external_ac_pv_trusted"],
+            "ems_external_ac_pv_source": ems_budget["external_ac_pv_source"],
             "ems_ac_available_w": ems_budget["ac_available_w"],
             "ems_wallbox_budget_total_w": ems_budget["wallbox_budget_total_w"],
             "ems_wallbox_budget_increase_w": ems_budget["wallbox_budget_increase_w"],
@@ -3399,6 +3848,22 @@ class ParallelStorageRegulator:
                 "headroom_reserve_pressure_wh": round(headroom_reserve_pressure_wh, 0),
                 "headroom_reserve_source": headroom_reserve_source,
                 "headroom_discharge_pressure_wh": round(headroom_discharge_pressure_wh, 0),
+                "headroom_execution_schema_version": headroom_execution.get("schema_version"),
+                "headroom_execution_allowed": headroom_execution_allowed,
+                "headroom_execution_reason_code": headroom_execution_reason,
+                "headroom_execution_plan_id": headroom_execution.get("plan_id"),
+                "headroom_execution_slot_id": headroom_execution.get("slot_id"),
+                "headroom_execution_earliest_start_ts": headroom_execution.get("earliest_start_ts"),
+                "headroom_execution_deadline_ts": headroom_execution.get("deadline_ts"),
+                "headroom_execution_target_soc": headroom_execution.get("target_soc"),
+                "headroom_execution_hard_floor_soc": headroom_execution.get("hard_floor_soc"),
+                "headroom_execution_plan_accounted_wh": headroom_execution.get("plan_accounted_wh", 0.0),
+                "headroom_execution_slot_accounted_wh": headroom_execution.get("slot_accounted_wh", 0.0),
+                "headroom_execution_residual_wh": headroom_execution_residual_wh,
+                "headroom_execution_accounted_observed_w": headroom_execution.get("accounted_observed_w", 0.0),
+                "headroom_execution_accounted_interval_s": headroom_execution.get("accounted_interval_s", 0.0),
+                "headroom_execution_generation_reset": bool(headroom_execution.get("generation_reset", True)),
+                "headroom_execution_last_account_ts": round(now_s, 3),
                 "headroom_discharge_min_pressure_wh": round(self.headroom_discharge_min_pressure_wh, 0),
                 "headroom_discharge_active": headroom_discharge_active,
                 "headroom_discharge_blocked_reason": headroom_discharge_blocked_reason,
@@ -3566,7 +4031,32 @@ class ParallelStorageRegulator:
                 "curve_cap_feed_buffer_w": self.curve_cap_feed_buffer_w,
                 "curve_cap_release_band_w": self.curve_cap_release_band_w,
                 "curve_cap_feedback_band_w": self.curve_cap_feedback_band_w,
-                "curve_cap_min_charge_w": self.abregel_min_charge_w,
+                "curve_cap_release_hysteresis_w": self.curve_cap_release_hysteresis_w,
+                "curve_cap_release_grace_s": self.curve_cap_release_grace_s,
+                "curve_cap_grid_contract_valid": curve_cap_grid_contract_valid,
+                "curve_cap_real_grid_import_active": curve_cap_real_grid_import_active,
+                "curve_cap_release_below_active": curve_cap_release_below_active,
+                "curve_cap_release_below_since_ts": curve_cap_release_below_since_ts,
+                "curve_cap_release_elapsed_s": curve_cap_release_elapsed_s,
+                "curve_cap_release_grace_active": curve_cap_release_grace_active,
+                "curve_cap_release_ramp_active": curve_cap_release_ramp_active,
+                "curve_cap_hysteresis_hold_active": curve_cap_hysteresis_hold_active,
+                "curve_cap_hysteresis_amount_follow_active": curve_cap_hysteresis_amount_follow_active,
+                "curve_cap_hysteresis_floor_w": curve_cap_hysteresis_floor_w,
+                "curve_cap_invalid_hold_active": curve_cap_invalid_hold_active,
+                "curve_cap_release_phase": curve_cap_release_phase,
+                "curve_cap_release_pending": curve_cap_release_pending,
+                "curve_cap_release_requested": curve_cap_release_requested,
+                "curve_cap_release_confirmed_since_ts": curve_cap_release_confirmed_since_ts,
+                "curve_cap_post_release_until_ts": curve_cap_post_release_until_ts,
+                "curve_cap_post_release_guard_active": curve_cap_post_release_guard_active,
+                "curve_cap_post_release_reentry_blocked": curve_cap_post_release_reentry_blocked,
+                "curve_cap_settings_readback_valid": settings_readback_valid,
+                "curve_cap_settings_previous_cap_confirmed": settings_previous_curve_cap_confirmed,
+                "curve_cap_settings_bounded_zero_confirmed": settings_bounded_zero_confirmed,
+                "curve_cap_settings_release_confirmed": settings_release_confirmed,
+                "curve_cap_bounded_zero_w": curve_cap_bounded_zero_w,
+                "curve_cap_min_charge_w": curve_cap_bounded_zero_w,
                 "curve_cap_hard_pressure_active": curve_cap_hard_pressure_active,
                 "curve_cap_feedback_active": curve_cap_feedback_active,
                 "curve_cap_grid_export_error_w": grid_export_error_w,
@@ -3580,6 +4070,12 @@ class ParallelStorageRegulator:
                 "live_derate_limit_w": live_derate_limit_w,
                 "derating_pressure_w": derating_pressure_w,
                 "ems_mandatory_charge_w": ems_mandatory_charge_w,
+                "ems_pv_total_w": ems_budget["pv_total_w"],
+                "ems_e3dc_dc_pv_w": ems_budget["e3dc_dc_pv_w"],
+                "ems_e3dc_ac_available_w": ems_budget["e3dc_ac_available_w"],
+                "ems_external_ac_pv_w": ems_budget["external_ac_pv_w"],
+                "ems_external_ac_pv_trusted": ems_budget["external_ac_pv_trusted"],
+                "ems_external_ac_pv_source": ems_budget["external_ac_pv_source"],
                 "ems_ac_available_w": ems_budget["ac_available_w"],
                 "ems_wallbox_budget_total_w": ems_budget["wallbox_budget_total_w"],
                 "ems_wallbox_budget_increase_w": ems_budget["wallbox_budget_increase_w"],

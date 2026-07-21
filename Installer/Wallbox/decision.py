@@ -1,8 +1,9 @@
-"""Pure wallbox decision helpers.
+"""Reine Entscheidungshilfen für Wallboxen.
 
-This module intentionally contains no filesystem, network, RAM-disk or driver
-access.  The wallbox manager may gather state at the edge, but phase and
-physical-budget decisions live here so they can be tested in isolation.
+Dieses Modul greift bewusst weder auf Dateisystem, Netzwerk, Ramdisk noch
+Treiber zu. Der Wallbox-Manager darf Zustände am Rand erfassen; Entscheidungen
+über Phasen und physikalische Budgets liegen hier, damit sie isoliert testbar
+bleiben.
 """
 
 import math
@@ -62,7 +63,7 @@ def wallbox_operator_hint_contract(
     battery_departure_start_label: str = "",
     battery_departure_reason: str = "",
 ) -> Dict[str, str]:
-    """Build the user-facing wallbox decision hint without side effects."""
+    """Erzeugt den nutzerseitigen Wallbox-Hinweis ohne Nebenwirkungen."""
 
     mode = normalize_wb_mode(public_mode)
     price_txt = _format_price_ct(current_price_ct)
@@ -226,7 +227,7 @@ def wallbox_detail_status_contract(
     real_power_w: Any = None,
     now_ts: Any = 0,
 ) -> Dict[str, Any]:
-    """Return the compact diagnostic state for one wallbox slot."""
+    """Liefert den kompakten Diagnosezustand eines Wallbox-Slots."""
 
     st = status if isinstance(status, dict) else {}
     box = c_data if isinstance(c_data, dict) else {}
@@ -529,7 +530,7 @@ def valid_phase_count(value: Any, default: int = 0) -> int:
 
 
 def status_connected(status: Optional[Dict[str, Any]]) -> bool:
-    """True only for a real plug/vehicle signal, not for commanded current."""
+    """Ist nur bei einem realen Stecker-/Fahrzeugsignal wahr, nicht bei Sollstrom."""
 
     if not status:
         return False
@@ -595,12 +596,13 @@ def charge_observation_contract(
     now_ts: Any = 0,
     min_power_w: Any = 500.0,
 ) -> Dict[str, Any]:
-    """Normalize hard charging evidence into one truth contract.
+    """Normalisiert belastbare Ladebelege in einen Wahrheitsvertrag.
 
-    ``charging`` is only true when the wallbox gives a trustworthy hardware
-    signal together with meaningful measured power, or when phase power is
-    already verified by the driver. Offered current and stale PM values stay
-    visible but do not count as real charging.
+    ``charging`` ist nur wahr, wenn die Wallbox ein vertrauenswürdiges
+    Hardwaresignal zusammen mit einer aussagekräftigen Messleistung liefert
+    oder der Treiber die Phasenleistung bereits bestätigt hat. Angebotener
+    Strom und veraltete PM-Werte bleiben sichtbar, zählen aber nicht als reales
+    Laden.
     """
 
     st = status or {}
@@ -735,7 +737,7 @@ def charge_observation_contract(
 
 
 def status_real_power(status: Optional[Dict[str, Any]]) -> float:
-    """Measured wallbox power, never derived from commanded amps."""
+    """Liefert gemessene Wallbox-Leistung, niemals aus dem Sollstrom abgeleitet."""
 
     if not status:
         return 0.0
@@ -748,7 +750,7 @@ def status_real_power(status: Optional[Dict[str, Any]]) -> float:
 
 
 def status_real_charging(status: Optional[Dict[str, Any]]) -> bool:
-    """Charging requires the charge-observation contract to prove it."""
+    """Laden gilt nur, wenn der Beobachtungsvertrag es belegt."""
 
     if not status:
         return False
@@ -759,7 +761,7 @@ def status_real_charging(status: Optional[Dict[str, Any]]) -> bool:
 
 
 def status_charge_truth(status: Optional[Dict[str, Any]]) -> str:
-    """Return charging/not_charging/unknown from the normalized contract."""
+    """Liefert charging/not_charging/unknown aus dem normalisierten Vertrag."""
 
     if not status:
         return "not_charging"
@@ -791,11 +793,11 @@ def transient_hold_contract(
     mode_off: bool = False,
     budget_timeout: bool = False,
 ) -> Dict[str, Any]:
-    """Central contract for start and phase-switch transient windows.
+    """Zentraler Vertrag für Übergangsfenster beim Start und Phasenwechsel.
 
-    The manager still owns timestamps and driver calls.  This helper decides
-    whether a temporary 0 W reading belongs to a commanded transition and must
-    not be interpreted as a normal stop condition.
+    Zeitstempel und Treiberaufrufe bleiben beim Manager. Diese Hilfe entscheidet,
+    ob ein vorübergehender 0-W-Messwert zu einem befohlenen Übergang gehört und
+    daher nicht als normale Stoppbedingung ausgelegt werden darf.
     """
 
     st = status or {}
@@ -900,13 +902,13 @@ def e3dc_native_production_contract(
     driver_variant: str = "",
     has_sonnenmodus_surface: bool = False,
 ) -> Dict[str, Any]:
-    """Document the only runtime path allowed for E3DC-native wallboxes."""
+    """Dokumentiert den einzigen erlaubten Laufzeitpfad nativer E3DC-Wallboxen."""
 
     _ = config
     st = status or {}
     class_name = str(charger_class_name or "").strip()
     variant = str(driver_variant or st.get("driver_variant", "") or "").strip()
-    native_variants = {"e3dc_native", "e3dc_multi_connect"}
+    native_variants = {"e3dc_native", "e3dc_multi_connect", "e3dc_rscp"}
     native_classes = {"E3DCCharger", "E3DCMultiConnectCharger"}
     is_native = bool(
         class_name in native_classes
@@ -921,6 +923,12 @@ def e3dc_native_production_contract(
         "canonical_path": runtime_path,
         "driver_class_name": class_name,
         "driver_variant": variant,
+        "transport": str(st.get("e3dc_transport", "") or ""),
+        "device_family": str(st.get("e3dc_device_family", "unknown") or "unknown"),
+        "device_family_source": str(st.get("e3dc_device_family_source", "unknown") or "unknown"),
+        "control_backend": str(st.get("e3dc_control_backend", "status_only") or "status_only"),
+        "direct_readback_complete": bool(st.get("e3dc_direct_readback_complete", False)),
+        "direct_transition_write_allowed": False,
         "legacy_cpp_runtime_allowed": False,
         "legacy_cpp_reference_only": bool(is_native),
         "fallback_role": "reference_only" if is_native else "not_applicable",
@@ -952,12 +960,13 @@ def charge_end_latch_contract(
     target_soc_reached: bool = False,
     now_ts: Any = 0,
 ) -> Dict[str, Any]:
-    """Decide whether a finished vehicle charge should latch or release.
+    """Entscheidet, ob ein beendeter Ladevorgang verriegelt oder freigegeben wird.
 
-    This keeps "vehicle stopped drawing current" separate from RSCP gaps,
-    manager initiated stops and plain start offers.  A new latch requires a
-    prior verified charge; explicit user/config changes and a real self-restart
-    release an existing latch without treating the offered current as proof.
+    Dadurch bleibt „Fahrzeug zieht keinen Strom mehr“ von RSCP-Lücken,
+    managerseitigen Stopps und bloßen Startangeboten getrennt. Eine neue
+    Verriegelung erfordert einen zuvor bestätigten Ladevorgang. Explizite
+    Nutzer-/Konfigurationsänderungen und ein echter Selbstneustart lösen eine
+    bestehende Verriegelung, ohne den angebotenen Strom als Beleg zu werten.
     """
 
     st = status or {}
@@ -1081,7 +1090,7 @@ def openwb_phase_switch_capability(
     status: Optional[Dict[str, Any]] = None,
     config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Return whether Python may send 1p/3p commands to this wallbox."""
+    """Liefert, ob Python 1p-/3p-Befehle an diese Wallbox senden darf."""
 
     _ = config
     st = status or {}
@@ -1112,30 +1121,24 @@ def wallbox_phase_switch_capability(
     status: Optional[Dict[str, Any]] = None,
     config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Return the phase command surface without granting policy permission.
+    """Liefert die Phasen-Befehlsfläche, ohne eine Policy-Freigabe zu erteilen.
 
-    Normal openWB stays secondary-current-only.  E3DC Multi Connect exposes a
-    direct RSCP phase surface, but the manager may still choose observe-only for
-    phase changes.
+    Eine normale openWB bleibt auf sekundäre Stromvorgaben beschränkt. E3DC
+    Multi Connect bleibt im reinen Beobachtungsmodus, bis ein kanonischer
+    Vertrag für CP-Unterbrechung und Rücklesung die 480-Sekunden-Sicherheitsfolge
+    durchgängig belegt.
     """
 
     st = status or {}
     if charger_class_name in ("OpenWBCharger", "OpenWBProCharger"):
         return openwb_phase_switch_capability(charger_class_name, st, config)
     driver_variant = str(st.get("driver_variant", "") or "")
-    if charger_class_name == "E3DCMultiConnectCharger" or driver_variant == "e3dc_multi_connect":
-        reported = bool(st.get("can_switch_phases", False))
-        has_direct_status = bool(
-            st.get("wallbox_type") == 6
-            or valid_phase_count(st.get("number_phases"), 0)
-            or valid_phase_count(st.get("connected_phases"), 0)
-        )
-        can_switch = bool(reported or has_direct_status)
+    if charger_class_name == "E3DCMultiConnectCharger" or driver_variant in {"e3dc_multi_connect", "e3dc_rscp"}:
         return {
-            "can_switch": can_switch,
-            "capability": "e3dc_multi_connect_direct" if can_switch else "e3dc_multi_connect_unknown",
-            "source": "rscp_wb_set_number_phases" if can_switch else "rscp_status",
-            "api_surface": "rscp_wb_req_set_number_phases" if can_switch else "",
+            "can_switch": False,
+            "capability": "e3dc_multi_connect_cp_480_unverified",
+            "source": "disabled_by_hardware_protection",
+            "api_surface": "",
         }
     return {
         "can_switch": False,
@@ -1158,7 +1161,7 @@ def phase_observation_contract(
     charger_class_name: str = "",
     driver_variant: str = "",
 ) -> Dict[str, Any]:
-    """Normalize phase evidence into one diagnostic contract."""
+    """Normalisiert Phasenbelege in einen Diagnosevertrag."""
 
     st = status or {}
     cd = c_data or {}
@@ -1208,6 +1211,8 @@ def phase_observation_contract(
     if charger_class_name == "OpenWBCharger":
         can_switch = False
     normalized_driver = str(driver_variant or st.get("driver_variant", "") or "")
+    if charger_class_name == "E3DCMultiConnectCharger" or normalized_driver in {"e3dc_multi_connect", "e3dc_rscp"}:
+        can_switch = False
     native_fixed_three_phase = bool(
         charger_class_name == "E3DCCharger"
         and normalized_driver == "e3dc_native"
@@ -1275,10 +1280,11 @@ def vehicle_max_ac_phases_from_profiles(
     profiles: Optional[Iterable[Dict[str, Any]]] = None,
     status: Optional[Dict[str, Any]] = None,
 ) -> int:
-    """Return configured or inferred AC phases for the active vehicle.
+    """Liefert konfigurierte oder abgeleitete AC-Phasen des aktiven Fahrzeugs.
 
-    ``profiles`` is supplied by the caller so this helper stays pure.  Live
-    openWB Pro identity wins over a static wallbox assignment.
+    Der Aufrufer übergibt ``profiles``, damit diese Hilfe rein bleibt. Eine
+    aktuelle openWB-Pro-Identität hat Vorrang vor einer statischen
+    Wallbox-Zuordnung.
     """
 
     cfg = config or {}
@@ -1356,6 +1362,78 @@ def vehicle_max_ac_phases_from_profiles(
     return 0
 
 
+def vehicle_max_ac_power_kw_from_profiles(
+    config: Optional[Dict[str, Any]],
+    charger_id: int,
+    profiles: Optional[Iterable[Dict[str, Any]]] = None,
+    status: Optional[Dict[str, Any]] = None,
+) -> float:
+    """Liefere die belastbare AC-OBC-Grenze des aktiven Fahrzeugs.
+
+    Eine in der Ladeplanung angenommene Leistung ist keine Hardwaregrenze.
+    Deshalb werden nur explizite OBC-Felder oder das live/statisch gebundene
+    Fahrzeugprofil ausgewertet. Die Live-Identität der openWB Pro hat Vorrang
+    vor der statischen Ladepunktzuordnung.
+    """
+
+    cfg = config or {}
+    st = status or {}
+    try:
+        cid = int(charger_id or 1)
+    except (TypeError, ValueError):
+        cid = 1
+
+    for key in (f"wb{cid}_obc_max_power_kw", f"wb{cid}_max_ac_power_kw"):
+        try:
+            explicit_kw = float(str(cfg.get(key, "")).replace(",", "."))
+        except (TypeError, ValueError):
+            continue
+        if explicit_kw > 0.0:
+            return explicit_kw
+
+    profile_list = list(profiles or [])
+
+    def find_profile(candidates: Iterable[Any]) -> Optional[Dict[str, Any]]:
+        compact_candidates = {
+            compact_vehicle_identifier(value)
+            for value in candidates
+            if str(value or "").strip()
+        }
+        if not compact_candidates:
+            return None
+        for profile in profile_list:
+            if not isinstance(profile, dict):
+                continue
+            for key in (
+                "id",
+                "profile_id",
+                "cloud_vehicle_id",
+                "vehicle_id",
+                "vehicle_mac",
+                "mac",
+                "rfid",
+                "rfid_tag",
+            ):
+                if compact_vehicle_identifier(profile.get(key)) in compact_candidates:
+                    return profile
+        return None
+
+    profile = find_profile([st.get("car_id"), st.get("vehicle_id"), st.get("rfid_tag")])
+    if not profile:
+        profile = find_profile([cfg.get(f"wb{cid}_car_id")])
+    if not profile:
+        return 0.0
+
+    for key in ("max_ac_power_kw", "ac_power_kw", "charge_power_kw", "charge_power", "power"):
+        try:
+            power_kw = float(str(profile.get(key, "")).replace(",", "."))
+        except (TypeError, ValueError):
+            continue
+        if power_kw > 0.0:
+            return power_kw
+    return 0.0
+
+
 def wallbox_executable_budget(
     status: Optional[Dict[str, Any]] = None,
     c_data: Optional[Dict[str, Any]] = None,
@@ -1375,7 +1453,7 @@ def wallbox_executable_budget(
     charger_class_name: str = "",
     driver_variant: str = "",
 ) -> Dict[str, Any]:
-    """Return whether the current budget can physically start or hold charging."""
+    """Liefert, ob das aktuelle Budget einen Ladestart oder das Weiterladen physikalisch erlaubt."""
 
     st = status or {}
     cd = c_data or {}
@@ -1438,7 +1516,7 @@ def wallbox_executable_budget(
     elif budget_ready:
         reason = "Budget %.0f W deckt Mindestleistung %.0f W (%dp)." % (budget_w, min_power_w, phases)
     elif switch_to_1p_ready:
-        reason = "Budget %.0f W reicht fuer 1p-Start, aber nicht fuer 3p-Mindestleistung %.0f W." % (
+        reason = "Budget %.0f W reicht für den einphasigen Start, aber nicht für die dreiphasige Mindestleistung %.0f W." % (
             budget_w,
             min_power_w,
         )
@@ -1483,11 +1561,11 @@ def budget_to_target_current(
     base_6a_active: bool = False,
     watts_per_amp: float = 0.0,
 ) -> Dict[str, Any]:
-    """Translate an absolute wallbox budget into a target current.
+    """Übersetzt ein absolutes Wallbox-Budget in einen Zielstrom.
 
-    ``allowed_w`` is the total power the wallbox may draw, not an increment on
-    top of the current wallbox load.  Current measured wallbox power is handled
-    by the caller when it builds this budget.
+    ``allowed_w`` ist die gesamte Leistung, welche die Wallbox beziehen darf,
+    kein Aufschlag auf ihre aktuelle Last. Der Aufrufer berücksichtigt die
+    aktuell gemessene Wallbox-Leistung beim Aufbau dieses Budgets.
     """
 
     budget_w = max(0.0, _safe_float(allowed_w, 0.0))
@@ -1593,7 +1671,7 @@ def stable_wallbox_amp_contract(
     stable_budget_jump_deadband_a: Any = 3,
     stable_budget_jump_hold_s: Any = 45.0,
 ) -> Dict[str, Any]:
-    """Dampen wallbox amp changes during an active controlled charge."""
+    """Dämpft Stromänderungen der Wallbox während eines aktiv geregelten Ladevorgangs."""
 
     def amp_int(value: Any, default: int = 0) -> int:
         try:
@@ -1759,12 +1837,16 @@ def pv_hybrid_energy_gate(
     hard_import_w: Any = 2500.0,
     enabled: bool = True,
 ) -> Dict[str, Any]:
-    """Accumulate PV energy evidence for calm wallbox start/stop decisions.
+    """Sammelt PV-Energiebelege für ruhige Start-/Stoppentscheidungen der Wallbox.
 
-    The controller may start quickly on a strong surplus, but a barely sufficient
-    6 A window has to persist as time or energy.  Stops are the mirror image:
-    short negative energy is held, while hard import remains an immediate stop
-    reason for safety.
+    Bei starkem Überschuss darf die Regelung schnell starten, ein nur knapp
+    ausreichendes 6-A-Fenster muss jedoch zeitlich oder energetisch Bestand
+    haben. Stopps verhalten sich spiegelbildlich: Kurzzeitig negative Energie
+    wird überbrückt, während ein harter Netzbezug aus Sicherheitsgründen ein
+    sofortiger Stoppgrund bleibt. Das negative Integral nutzt die gemessene oder
+    konservativ abgeleitete laufende Leistung. Deshalb verbraucht ein großes,
+    batteriegestütztes Defizit den Übergangspuffer früher als eine kurze kleine
+    Wolkendelle.
     """
 
     prev = previous if isinstance(previous, dict) else {}
@@ -1799,6 +1881,13 @@ def pv_hybrid_energy_gate(
             or set_amp >= minimum
         )
     )
+    inferred_running_power_w = max(current, set_amp) * min_power / float(minimum)
+    running_power_w = (
+        hw_power
+        if hw_power > 500.0
+        else max(0.0, inferred_running_power_w)
+    )
+    uncovered_hold_w = max(0.0, running_power_w - budget, grid_w) if running else 0.0
     start_signal = bool(charger_connected and cap >= minimum and budget >= max(1.0, min_power - 120.0))
     stop_signal = bool(running and (cap <= 0 or budget < max(0.0, min_power - 120.0)))
     hard_stop = bool(grid_w >= hard_import)
@@ -1820,9 +1909,8 @@ def pv_hybrid_energy_gate(
         negative_age = 0.0
         negative_wh = 0.0
     elif stop_signal:
-        deficit_w = max(0.0, min_power - budget, grid_w)
         negative_age += dt_s
-        negative_wh += deficit_w * dt_s / 3600.0
+        negative_wh += uncovered_hold_w * dt_s / 3600.0
         positive_age = 0.0
         positive_wh = 0.0
     else:
@@ -1868,6 +1956,8 @@ def pv_hybrid_energy_gate(
         "cap_amp": int(cap),
         "min_amp": int(minimum),
         "running": bool(running),
+        "running_power_w": float(running_power_w),
+        "uncovered_hold_w": float(uncovered_hold_w),
         "start_signal": bool(start_signal),
         "stop_signal": bool(stop_signal),
         "strong_start": bool(strong_start),
@@ -1899,7 +1989,7 @@ def pv_hybrid_hold_action(
     mode_switch_quiet_remaining_s: Any = 0.0,
     floor_battery_guard_active: bool = False,
 ) -> Dict[str, Any]:
-    """Turn the PV-hybrid energy gate into an explicit hold/allow action."""
+    """Übersetzt das PV-Hybrid-Energiegate in eine explizite Halte-/Freigabeaktion."""
 
     st = gate if isinstance(gate, dict) else {}
     def amp_int(value: Any, default: int = 0) -> int:
@@ -1952,10 +2042,14 @@ def pv_hybrid_hold_action(
         and hold_allowed
         and not floor_battery_guard_active
     ):
-        hold_amp = max(minimum, min(maximum, current or set_amp or minimum))
+        # Kein Vollstrom aus dem Akku: Bei fehlendem nachhaltigem Budget wird
+        # zuerst auf den fahrzeugseitigen Mindeststrom abgesenkt. So überbrückt
+        # die Hysterese kurze PV-Dellen ohne unnötiges Schalten, bleibt aber ein
+        # kleiner Übergangspuffer und kein verdeckter Modus "PV + Akku".
+        hold_amp = minimum
         return {
             "action": "HOLD_STOP_PV_HYBRID",
-            "target_amp": int(hold_amp),
+            "target_amp": float(hold_amp),
             "allowed_w": max(budget_w, min_power),
             "min_power_w": min_power,
             "log_key": "pv_hybrid_stop_integral_hold",
@@ -1974,11 +2068,81 @@ def pv_hybrid_hold_action(
     }
 
 
+def native_verified_pv_sink_hold_contract(
+    *,
+    e3dc_native_toggle: bool,
+    control_mode: int,
+    charger_connected: bool,
+    hw_charging: bool,
+    hw_power_w: float,
+    cap_amp: float,
+    budget_ok: bool,
+    live_sample_invalid: bool,
+    status_valid: bool,
+    status_stale: bool,
+    phase_power_verified: bool,
+    priority_forced_stop: bool,
+    budget_timeout: bool,
+    local_price_optimizing_active: bool,
+    local_grid_allowed: bool,
+    price_boost_wallbox_active: bool,
+    predump_wallbox_active: bool,
+    native_battery_drain_zero_budget_active: bool,
+    grid_power_w: float,
+    battery_power_w: float,
+    pv_power_w: float,
+) -> Dict[str, Any]:
+    """Schützt eine bereits bestätigte native PV-Senke vor Speicherverdrängung.
+
+    Dies startet niemals ein stehendes Fahrzeug und lockert nie die reguläre
+    Startschwelle. Es hält ausschließlich einen physikalisch bestätigten
+    Ladevorgang, während frische PV-Leistung zugleich den Hausspeicher lädt und
+    am Netzpunkt kein wesentlicher Bezug vorliegt. Alle expliziten Schutz- und
+    Netzladepfade bleiben harte Blocker.
+    """
+
+    hw_power = max(0.0, _safe_float(hw_power_w, 0.0))
+    grid_w = _safe_float(grid_power_w, 0.0)
+    battery_w = _safe_float(battery_power_w, 0.0)
+    pv_w = max(0.0, _safe_float(pv_power_w, 0.0))
+    active = bool(
+        e3dc_native_toggle
+        and int(round(_safe_float(control_mode, 0))) in (2, 3, 6)
+        and charger_connected
+        and hw_charging
+        and hw_power > 500.0
+        and _safe_float(cap_amp, 0.0) <= 0.0
+        and budget_ok
+        and not live_sample_invalid
+        and status_valid
+        and not status_stale
+        and phase_power_verified
+        and not priority_forced_stop
+        and not budget_timeout
+        and not local_price_optimizing_active
+        and not local_grid_allowed
+        and not price_boost_wallbox_active
+        and not predump_wallbox_active
+        and not native_battery_drain_zero_budget_active
+        and grid_w <= 250.0
+        and battery_w > 500.0
+        and pv_w > hw_power + 500.0
+    )
+    return {
+        "active": active,
+        "reason": "verified_native_pv_sink" if active else "not_eligible",
+        "hw_power_w": hw_power,
+        "grid_power_w": grid_w,
+        "battery_power_w": battery_w,
+        "pv_power_w": pv_w,
+    }
+
+
 def start_stop_hold_action(
     *,
-    cap_amp: int,
-    current_amp: int,
-    current_set_amp: int,
+    cap_amp: float,
+    current_amp: float,
+    current_set_amp: float,
     charger_connected: bool,
     hw_charging: bool,
     hw_power_w: float,
@@ -2015,18 +2179,18 @@ def start_stop_hold_action(
     openwb_phase_transition_grace_active: bool = False,
     transient_contract: Optional[Dict[str, Any]] = None,
     native_battery_drain_zero_budget_active: bool = False,
+    native_verified_pv_sink_hold_active: bool = False,
     openwb_floor_zero_budget_stop_active: bool = False,
 ) -> Dict[str, Any]:
-    """Pick the high-level wallbox action before any driver command is sent.
+    """Wählt die übergeordnete Wallbox-Aktion vor jedem Treiberbefehl.
 
-    The manager still owns timers, logging and the actual driver calls.  This
-    helper only turns already gathered facts into a pure START/SET/HOLD/STOP
-    decision so edge cases can be tested without a wallbox.
+    Timer, Protokollierung und echte Treiberaufrufe bleiben beim Manager. Diese
+    Hilfe übersetzt lediglich bereits erfasste Fakten in eine reine
+    START/SET/HOLD/STOP-Entscheidung, damit Grenzfälle ohne Wallbox testbar sind.
     """
-
-    cap = max(0, int(round(_safe_float(cap_amp, 0))))
-    current = max(0, int(round(_safe_float(current_amp, 0))))
-    set_amp = max(0, int(round(_safe_float(current_set_amp, 0))))
+    cap = max(0.0, _safe_float(cap_amp, 0.0))
+    current = max(0.0, _safe_float(current_amp, 0.0))
+    set_amp = max(0.0, _safe_float(current_set_amp, 0.0))
     hw_power = max(0.0, _safe_float(hw_power_w, 0.0))
     grid_w = _safe_float(grid_power_w, 0.0)
     mode = int(round(_safe_float(control_mode, 0)))
@@ -2039,6 +2203,7 @@ def start_stop_hold_action(
     phase_zero_s = max(0.0, _safe_float(phase_forecast_zero_hold_s, 0.0))
     storage_state = str(budget_storage_state or "")
     native_battery_drain_zero_budget_active = bool(native_battery_drain_zero_budget_active)
+    native_verified_pv_sink_hold_active = bool(native_verified_pv_sink_hold_active)
     openwb_floor_zero_budget_stop_active = bool(openwb_floor_zero_budget_stop_active)
     if native_battery_drain_zero_budget_active:
         native_zero_age = max(native_zero_age, cloud_hold_s + 1.0)
@@ -2070,6 +2235,7 @@ def start_stop_hold_action(
             "native_mode_no_stop_wait": False,
             "native_start_grace_active": bool(native_start_grace_active),
             "native_battery_drain_zero_budget_active": bool(native_battery_drain_zero_budget_active),
+            "native_verified_pv_sink_hold_active": bool(native_verified_pv_sink_hold_active),
             "openwb_phase_transition_grace_active": bool(openwb_phase_transition_grace_active),
             "openwb_phase_transition_offer_active": bool(transient.get("phase_transition_offer_active", False)),
             "transient_hold_active": bool(transient_hold_active),
@@ -2093,8 +2259,8 @@ def start_stop_hold_action(
     ):
         return {
             "action": "HOLD_GRID_WINDOW",
-            "target_amp": int(max(6, current, set_amp)),
-            "hold_amp": int(max(6, current, set_amp)),
+            "target_amp": float(max(6, current, set_amp)),
+            "hold_amp": float(max(6, current, set_amp)),
             "is_new_start": False,
             "min_charge_hold_active": False,
             "multi_zero_budget_hold": False,
@@ -2102,6 +2268,7 @@ def start_stop_hold_action(
             "native_mode_no_stop_wait": False,
             "native_start_grace_active": bool(native_start_grace_active),
             "native_battery_drain_zero_budget_active": bool(native_battery_drain_zero_budget_active),
+            "native_verified_pv_sink_hold_active": bool(native_verified_pv_sink_hold_active),
             "openwb_phase_transition_grace_active": bool(openwb_phase_transition_grace_active),
             "openwb_phase_transition_offer_active": bool(transient.get("phase_transition_offer_active", False)),
             "transient_hold_active": bool(transient_hold_active),
@@ -2287,9 +2454,11 @@ def start_stop_hold_action(
         and not local_price_optimizing_active
         and not local_grid_allowed
         and not price_boost_wallbox_active
+        and not native_battery_drain_zero_budget_active
         and (
             grid_w < -800.0
             or min_charge_hold_active
+            or native_verified_pv_sink_hold_active
             or (
                 native_zero_age < cloud_hold_s
                 and grid_w < 2500.0
@@ -2339,8 +2508,8 @@ def start_stop_hold_action(
     if native_running_charge_hold or native_current_down_hold:
         need_stop_toggle = False
 
-    hold_amp = int(max(6, current, set_amp))
-    native_down_hold_amp = int(max(6, set_amp if set_amp > 0 else current))
+    hold_amp = float(max(6, current, set_amp))
+    native_down_hold_amp = float(max(6, set_amp if set_amp > 0 else current))
     if min_charge_hold_active and not multi_zero_budget_hold and not openwb_zero_budget_hold:
         action = "HOLD_MIN_CHARGE"
         target_amp = hold_amp
@@ -2388,8 +2557,8 @@ def start_stop_hold_action(
 
     return {
         "action": action,
-        "target_amp": int(target_amp),
-        "hold_amp": int(target_amp if action == "HOLD_NATIVE_CURRENT_DOWN" else hold_amp),
+        "target_amp": float(target_amp),
+        "hold_amp": float(target_amp if action == "HOLD_NATIVE_CURRENT_DOWN" else hold_amp),
         "is_new_start": False,
         "min_charge_hold_active": bool(min_charge_hold_active),
         "multi_zero_budget_hold": bool(multi_zero_budget_hold),
@@ -2409,6 +2578,7 @@ def start_stop_hold_action(
         "native_mode_no_stop_wait": bool(native_mode_no_stop_wait),
         "native_start_grace_active": bool(native_start_grace_active),
         "native_battery_drain_zero_budget_active": bool(native_battery_drain_zero_budget_active),
+        "native_verified_pv_sink_hold_active": bool(native_verified_pv_sink_hold_active),
         "need_stop_toggle": bool(need_stop_toggle),
         "reason": action.lower(),
     }
@@ -2425,7 +2595,7 @@ def start_stop_effective_action_contract(
     low_power_one_phase_required_for_wb: bool = False,
     physical_budget: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Apply post start/stop policy overrides without touching hardware."""
+    """Wendet nachgelagerte Start-/Stopp-Policy-Korrekturen ohne Hardwarezugriff an."""
 
     decision = dict(start_stop_decision) if isinstance(start_stop_decision, dict) else {}
     action = str(decision.get("action", "NOOP") or "NOOP")
@@ -2511,7 +2681,7 @@ def phase_switch_recommendation(
     phase_pending_age_s: float,
     phase_confirm_timeout_s: float,
 ) -> Dict[str, Any]:
-    """Recommend a phase action without sending a wallbox command."""
+    """Empfiehlt eine Phasenaktion, ohne einen Wallbox-Befehl zu senden."""
 
     if not openwb_phase_capable:
         return {
@@ -2715,16 +2885,16 @@ def minimum_current_import_action(
     phase_down_reup_block_s: Any = 180.0,
     phase_down_forecast_hold_s: Any = 600.0,
 ) -> Dict[str, Any]:
-    """Choose HOLD, 3p->1p, or STOP at minimum current under grid import.
+    """Wählt bei Netzbezug und Mindeststrom HOLD, 3p->1p oder STOP.
 
-    The runtime module owns the energy integral.  This helper only interprets
-    that status together with the current phase situation, so the stop/hold
-    policy stays testable without driver side effects.
+    Das Laufzeitmodul führt das Energieintegral. Diese Hilfe interpretiert
+    dessen Zustand nur zusammen mit der aktuellen Phasensituation, damit die
+    Stopp-/Halte-Policy ohne Treibernebenwirkungen testbar bleibt.
     """
 
     status = import_status if isinstance(import_status, dict) else {}
-    minimum = max(6, _safe_int(min_amp, 6))
-    current = max(0, _safe_int(current_amp, minimum))
+    minimum = max(6.0, _safe_float(min_amp, 6.0))
+    current = max(0.0, _safe_float(current_amp, minimum))
     hold_amp = max(minimum, current or minimum)
     grid_w = _safe_float(grid_power_w, 0.0)
     wh = max(0.0, _safe_float(status.get("wh", 0.0), 0.0))
@@ -2747,7 +2917,7 @@ def minimum_current_import_action(
         forecast_hold = bool(openwb_like_charger and phase_forecast_hold_active and phases >= 3)
         return {
             "action": "HOLD_MIN_CURRENT_IMPORT",
-            "target_amp": int(hold_amp),
+            "target_amp": float(hold_amp),
             "target_phases": 0,
             "grid_power_w": int(round(grid_w)),
             "import_wh": float(wh),
@@ -2824,11 +2994,11 @@ def fast_grid_current_reduction_action(
     grid_margin_w: Any = 120.0,
     stable_after_fast_hold_s: Any = 60.0,
 ) -> Dict[str, Any]:
-    """Choose the reduced current and driver method for a fast grid guard.
+    """Wählt reduzierten Strom und Treibermethode für einen schnellen Netzwächter.
 
-    The caller still owns driver execution and runtime timestamps.  This keeps
-    the core decision shared across wallbox types while preserving the manager
-    as the side-effect boundary.
+    Treiberausführung und Laufzeitstempel bleiben beim Aufrufer. So wird die
+    Kernentscheidung über Wallbox-Typen hinweg geteilt, während der Manager die
+    Grenze für Nebenwirkungen bleibt.
     """
 
     step = _current_step(current_step_amp, 1.0)
@@ -2945,12 +3115,13 @@ def multi_wallbox_allocation_contract(
     grid_allowed_charger_ids: Any = None,
     min_amp: Any = 6,
 ) -> Dict[str, Any]:
-    """Describe the shared multi-wallbox allocation contract.
+    """Beschreibt den gemeinsamen Zuteilungsvertrag mehrerer Wallboxen.
 
-    The lower allocator may still calculate ampere targets.  This contract
-    names the cross-wallbox decisions around it: whether the configured
-    priority target is actually usable, which secondary charger may only hold
-    an existing charge, and why a sleeping secondary charger must wait.
+    Der untergeordnete Zuteiler darf weiterhin Stromziele berechnen. Dieser
+    Vertrag benennt die wallboxübergreifenden Entscheidungen: ob das
+    konfigurierte Prioritätsziel tatsächlich nutzbar ist, welche nachrangige
+    Wallbox einen bestehenden Ladevorgang nur halten darf und warum eine
+    schlafende nachrangige Wallbox warten muss.
     """
 
     try:
@@ -3051,9 +3222,9 @@ def build_wallbox_decision_payload(
     phase_recommendation: Optional[Dict[str, Any]] = None,
     allowed_w: float = 0.0,
     detected_phases: int = 1,
-    current_amp: int = 0,
-    current_set_amp: int = 0,
-    cap_amp: int = 0,
+    current_amp: float = 0.0,
+    current_set_amp: float = 0.0,
+    cap_amp: float = 0.0,
     max_amp: int = 0,
     charger_connected: bool = False,
     hw_charging: bool = False,
@@ -3069,7 +3240,7 @@ def build_wallbox_decision_payload(
     priority_forced_stop: bool = False,
     budget_timeout: bool = False,
 ) -> Dict[str, Any]:
-    """Build the canonical per-wallbox decision payload for one cycle."""
+    """Erzeugt die kanonische Entscheidungslast einer Wallbox für einen Zyklus."""
 
     current = _decision_map(current_decision)
     start_stop = _decision_map(start_stop_decision)
@@ -3079,8 +3250,8 @@ def build_wallbox_decision_payload(
     current_reason = str(current.get("limiting_reason", "") or "")
     start_reason = str(start_stop.get("reason", start_action.lower()) or "")
     phase_reason = str(phase.get("reason", "stable") or "stable")
-    target_amp = max(0, _safe_int(start_stop.get("target_amp", current.get("target_amp", cap_amp)), 0))
-    hold_amp = max(0, _safe_int(start_stop.get("hold_amp", 0), 0))
+    target_amp = max(0.0, _safe_float(start_stop.get("target_amp", current.get("target_amp", cap_amp)), 0.0))
+    hold_amp = max(0.0, _safe_float(start_stop.get("hold_amp", 0), 0.0))
     phase_target = valid_phase_count(phase.get("target_phases", 0), 0)
 
     return {
@@ -3100,8 +3271,8 @@ def build_wallbox_decision_payload(
         },
         "decisions": {
             "current": {
-                "target_amp": _safe_int(current.get("target_amp", cap_amp), 0),
-                "raw_amp": _safe_int(current.get("raw_amp", current.get("target_amp", cap_amp)), 0),
+                "target_amp": max(0.0, _safe_float(current.get("target_amp", cap_amp), 0.0)),
+                "raw_amp": max(0.0, _safe_float(current.get("raw_amp", current.get("target_amp", cap_amp)), 0.0)),
                 "physically_chargeable": bool(current.get("physically_chargeable", False)),
                 "house_fuse_limited": bool(current.get("house_fuse_limited", False)),
                 "reason": current_reason,
@@ -3124,9 +3295,9 @@ def build_wallbox_decision_payload(
         "inputs": {
             "allowed_w": int(round(_safe_float(allowed_w, 0.0))),
             "detected_phases": valid_phase_count(detected_phases, 1),
-            "current_amp": max(0, _safe_int(current_amp, 0)),
-            "current_set_amp": max(0, _safe_int(current_set_amp, 0)),
-            "cap_amp": max(0, _safe_int(cap_amp, 0)),
+            "current_amp": max(0.0, _safe_float(current_amp, 0.0)),
+            "current_set_amp": max(0.0, _safe_float(current_set_amp, 0.0)),
+            "cap_amp": max(0.0, _safe_float(cap_amp, 0.0)),
             "max_amp": max(0, _safe_int(max_amp, 0)),
             "charger_connected": bool(charger_connected),
             "hw_charging": bool(hw_charging),
@@ -3152,7 +3323,7 @@ def build_wallbox_decision_payload(
 
 
 def driver_command_from_decision_payload(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """Map a canonical decision payload to an abstract driver command."""
+    """Bildet eine kanonische Entscheidungslast auf einen abstrakten Treiberbefehl ab."""
 
     data = payload if isinstance(payload, dict) else {}
     decisions = _decision_map(data.get("decisions"))
@@ -3164,9 +3335,9 @@ def driver_command_from_decision_payload(payload: Optional[Dict[str, Any]]) -> D
     start_action = str(start_stop.get("action", "NOOP") or "NOOP")
     phase_action = str(phase.get("action", "KEEP_PHASES") or "KEEP_PHASES")
     phase_target = valid_phase_count(phase.get("target_phases", 0), 0)
-    target_amp = max(0, _safe_int(start_stop.get("target_amp", inputs.get("cap_amp", 0)), 0))
-    hold_amp = max(0, _safe_int(start_stop.get("hold_amp", 0), 0))
-    current_set_amp = max(0, _safe_int(inputs.get("current_set_amp", 0), 0))
+    target_amp = max(0.0, _safe_float(start_stop.get("target_amp", inputs.get("cap_amp", 0)), 0.0))
+    hold_amp = max(0.0, _safe_float(start_stop.get("hold_amp", 0), 0.0))
+    current_set_amp = max(0.0, _safe_float(inputs.get("current_set_amp", 0), 0.0))
 
     kind = "noop"
     amp = 0
@@ -3202,7 +3373,7 @@ def driver_command_from_decision_payload(payload: Optional[Dict[str, Any]]) -> D
     return {
         "schema_version": "wallbox_driver_command_v1",
         "kind": kind,
-        "amp": int(amp),
+        "amp": float(amp),
         "target_phases": int(target_phases),
         "reason": reason,
         "source": "decision_payload",
@@ -3325,7 +3496,7 @@ def detect_wallbox_command_chatter(
     min_phase_gap_s: int = 180,
     protection_reason_markers: Optional[Iterable[str]] = None,
 ) -> Dict[str, Any]:
-    """Detect unsafe contactor and phase-command chatter in a command stream."""
+    """Erkennt unsicheres Schütz- und Phasenbefehlsflattern in einem Befehlsstrom."""
 
     markers = protection_reason_markers or CONTACTOR_PROTECTION_REASON_MARKERS
     timeline = sorted(

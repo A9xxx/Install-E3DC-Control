@@ -27,14 +27,14 @@ def check_service_details(service_name):
     # Status prüfen
     res_active = run_command(f"systemctl is-active {service_name}")
     is_active = res_active['stdout'].strip() == "active"
-    
+
     res_enabled = run_command(f"systemctl is-enabled {service_name}")
     is_enabled = res_enabled['stdout'].strip() == "enabled"
-    
+
     # Letzte Logs holen (letzte 10 Zeilen für mehr Kontext)
     res_log = run_command(f"journalctl -u {service_name} -n 10 --no-pager")
     log_lines = res_log['stdout'].strip() if res_log['success'] else "Keine Logs verfügbar."
-    
+
     return {
         "status": "installed",
         "active": is_active,
@@ -46,7 +46,7 @@ def show_system_status():
     """Zeigt den Status aller relevanten Dienste an."""
     print("\n=== System-Status & Diagnose ===\n")
     status_logger.info("Starte System-Statusprüfung.")
-    
+
     issues_found = []
 
     # HA Status ermitteln
@@ -127,30 +127,30 @@ def show_system_status():
         # Legacy-Systeme die noch C++ nutzen
         status_icon = f"{GREEN}[OK]{RESET}" if e3dc_srv["active"] else f"  [i] "
         enabled_icon = f"{GREEN}[OK]{RESET}" if e3dc_srv["enabled"] else f"  [i] "
-        
+
         if e3dc_srv["active"] and live_srv["active"]:
             label = 'Aktiv (KRITISCHER FEHLER: Konflikt mit e3dc-live!)'
             status_icon = f"{RED}✗{RESET}"
             issues_found.append("v4_legacy_conflict")
         else:
             label = 'Aktiv (Legacy C++ Modus)' if e3dc_srv["active"] else 'Inaktiv (V4 Native Modus aktiv)'
-            
+
         print(f"{status_icon} Service Status: {label}")
         print(f"{enabled_icon} Autostart:     {'Aktiviert (enabled)' if e3dc_srv['enabled'] else 'Deaktiviert (disabled)'}")
 
     # 2. Watchdog (Piguard)
     print("\n--- Watchdog (Piguard) ---")
     guard_srv = check_service_details("piguard")
-    
+
     if guard_srv["status"] == "not_installed":
         print("⚪ Service 'piguard': Nicht installiert")
     else:
         status_icon = f"{GREEN}✓{RESET}" if guard_srv["active"] else f"{RED}✗{RESET}"
         enabled_icon = f"{GREEN}✓{RESET}" if guard_srv["enabled"] else f"{RED}✗{RESET}"
-        
+
         print(f"{status_icon} Service Status: {'Aktiv (running)' if guard_srv['active'] else 'Inaktiv (stopped/failed)'}")
         print(f"{enabled_icon} Autostart:     {'Aktiviert (enabled)' if guard_srv['enabled'] else 'Deaktiviert (disabled)'}")
-        
+
         if not guard_srv["active"]:
              print("\n  ⚠ Diagnose-Logs (letzte 10 Zeilen):")
              print("  " + "-" * 40)
@@ -163,7 +163,7 @@ def show_system_status():
     # 2c. Energy Manager
     print("\n--- Energy Manager ---")
     lux_srv = check_service_details("energy_manager")
-    
+
     if lux_srv["status"] == "not_installed":
         print("⚪ Service 'energy_manager': Nicht installiert")
     else:
@@ -174,7 +174,7 @@ def show_system_status():
             enabled_icon = f"{GREEN}✓{RESET}" if lux_srv["enabled"] else f"{RED}✗{RESET}"
             print(f"{status_icon} Service Status: {'Aktiv (running)' if lux_srv['active'] else 'Inaktiv'}")
             print(f"{enabled_icon} Autostart:     {'Aktiviert (enabled)' if lux_srv['enabled'] else 'Deaktiviert (disabled)'}")
-            
+
             if not lux_srv["active"] and lux_srv["enabled"]:
                  print("\n  ⚠ Diagnose-Logs (Letzte 10 Zeilen):")
                  print("  " + "-" * 40)
@@ -182,7 +182,7 @@ def show_system_status():
                     if line.strip(): print(f"    {line}")
                  print("  " + "-" * 40)
                  issues_found.append("luxtronik_failed")
-                 
+
     lux_ws_srv = check_service_details("e3dc-lux-live")
     if lux_ws_srv["status"] != "not_installed":
         print(f"  └─ WebSocket Daemon:")
@@ -246,7 +246,7 @@ def show_system_status():
     # 2d. High Availability (Cluster)
     print("\n--- High Availability (Cluster) ---")
     ha_srv = check_service_details("e3dc-ha")
-    
+
     if ha_srv["status"] == "not_installed":
         print("⚪ Service 'e3dc-ha': Nicht installiert")
     else:
@@ -276,7 +276,7 @@ def show_system_status():
     # 2e. Notification Manager
     print("\n--- Notification Manager ---")
     not_srv = check_service_details("e3dc-notifier")
-    
+
     if not_srv["status"] == "not_installed":
         print("⚪ Service 'e3dc-notifier': Nicht installiert")
     else:
@@ -291,7 +291,7 @@ def show_system_status():
     # 2f. WebSocket Server
     print("\n--- WebSocket Server ---")
     ws_srv = check_service_details("e3dc-websocket")
-    
+
     if ws_srv["status"] == "not_installed":
         print("⚪ Service 'e3dc-websocket': Nicht installiert")
     else:
@@ -306,7 +306,7 @@ def show_system_status():
         else:
             status_icon = f"{GREEN}✓{RESET}" if ws_srv["active"] else f"{RED}✗{RESET}"
             enabled_icon = f"{GREEN}✓{RESET}" if ws_srv["enabled"] else f"{RED}✗{RESET}"
-            
+
             print(f"{status_icon} Service Status: {'Aktiv (running)' if ws_srv['active'] else 'Inaktiv'}")
             print(f"{enabled_icon} Autostart:     {'Aktiviert (enabled)' if ws_srv['enabled'] else 'Deaktiviert (disabled)'}")
             if not ws_srv["active"] and ws_srv["enabled"]:
@@ -315,7 +315,7 @@ def show_system_status():
     # 2g. MQTT Hub
     print("\n--- Smart Home MQTT-Hub ---")
     mqtt_srv = check_service_details("e3dc-mqtt-hub")
-    
+
     if mqtt_srv["status"] == "not_installed":
         print("⚪ Service 'e3dc-mqtt-hub': Nicht installiert")
     else:
@@ -450,11 +450,11 @@ def show_system_status():
             enabled_icon = f"{GREEN}✓{RESET}" if web_srv["enabled"] else f"{RED}✗{RESET}"
             print(f"{status_icon} Service Status: {'Aktiv (running)' if web_srv['active'] else 'Inaktiv'}")
             print(f"{enabled_icon} Autostart:     {'Aktiviert (enabled)' if web_srv['enabled'] else 'Deaktiviert (disabled)'}")
-            
+
             if not web_srv["active"] or not web_srv["enabled"]:
                 issues_found.append("apache_issue")
 
-    # Matter Bridge
+    # 2k. Matter Bridge
     print("\n--- Smart Home Matter Bridge ---")
     matter_srv = check_service_details("e3dc-matter-bridge")
     if matter_srv["status"] == "not_installed":
@@ -468,7 +468,7 @@ def show_system_status():
             print(f"{status_icon} Service Status: {'Aktiv (running)' if matter_srv['active'] else 'Inaktiv'}")
             print(f"{enabled_icon} Autostart:     {'Aktiviert (enabled)' if matter_srv['enabled'] else 'Deaktiviert (disabled)'}")
             if not matter_srv["active"] and matter_srv["enabled"]:
-                issues_found.append("matter_bridge_failed")
+                 issues_found.append("matter_bridge_failed")
 
     # 2m. RSCP Live-Dienst (Python-nativ)
     print("\n--- RSCP Live-Dienst (Python-nativ) ---")
@@ -617,7 +617,7 @@ def show_system_status():
             if int(usage_percent.strip('%')) > 90:
                 print("  ⚠ WARNUNG: Speicherplatz fast voll!")
                 issues_found.append("disk_full")
-    
+
     # Uptime
     res_up = run_command("uptime -p")
     if res_up['success']:
@@ -629,13 +629,13 @@ def show_system_status():
     home_dir = get_home_dir(get_install_user())
     config = load_config()
     venv_name = config.get("venv_name", ".venv_e3dc")
-    
+
     if "venv_name" in config and config["venv_name"] is None:
         print("Modus:             System-Python (global)")
     else:
         venv_full_path = os.path.join(install_path, venv_name)
         venv_home_path = os.path.join(home_dir, venv_name)
-        
+
         if os.path.exists(venv_home_path):
             print(f"Modus:             Virtual Environment")
             print(f"Pfad:              {venv_home_path}")
@@ -662,12 +662,12 @@ def show_system_status():
             print("  und: sudo systemctl disable e3dc e3dc-websocket")
         if "internet" in issues_found:
             print("• Internet: Prüfe Netzwerkkabel/WLAN und Router. Prüfe DNS-Einstellungen.")
-        
+
         if "e3dc_not_running" in issues_found or "e3dc_service_failed" in issues_found:
             print("• E3DC C++ (Legacy) Fehler: In V4 wird e3dc-live (Python RSCP) genutzt.")
             print("  Prüfe: sudo systemctl status e3dc-live")
             print("  Neustart: sudo systemctl restart e3dc-live")
-            print("  Oder nutze Menuepunkt '99' (Notfall-Modus).")          
+            print("  Oder nutze Menuepunkt '99' (Notfall-Modus).")
 
         if "watchdog_failed" in issues_found:
             print("• Watchdog Fehler: Nutze Menüpunkt '15' (Watchdog konfigurieren) zur Reparatur.")
@@ -677,14 +677,14 @@ def show_system_status():
 
         if "ramdisk_missing" in issues_found:
             print("• RAM-Disk fehlt: Nutze Menüpunkt '14' (RAM-Disk einrichten).")
-            
+
         if "luxtronik_failed" in issues_found:
             print("• Luxtronik Fehler: Prüfe 'journalctl -u energy_manager -e' oder die config.lux.json.")
-            
+
         if "venv_missing" in issues_found:
             print("• Venv fehlt: Nutze Hauptmenüpunkt '8' (Systempakete vorbereiten) zur Paket-/venv-Reparatur.")
             print("  Alternativ im Expertenmenü: Punkt '21' (Python venv neu aufbauen).")
-            
+
         if "ha_failed" in issues_found:
             print("• HA Cluster Fehler: Prüfe Logs mit 'journalctl -u e3dc-ha -e' auf Probleme.")
         if "ha_running_in_standby" in issues_found:
@@ -695,7 +695,7 @@ def show_system_status():
             print("• Apache Webserver: Der Webserver ist inaktiv oder der Autostart ist deaktiviert.")
             print("  Behebung: Nutze Menüpunkt '2' (Rechte & Webportal reparieren) zur Re-Aktivierung.")
         if "matter_bridge_failed" in issues_found:
-            print("• Matter Bridge Fehler: Der Node.js-Dienst läuft nicht. Prüfen Sie 'journalctl -u e3dc-matter-bridge -e'.")
+            print("• Matter Bridge Fehler: Der Node.js Daemon stürzt ab. Prüfe die Logs mit 'journalctl -u e3dc-matter-bridge -e'.")
         if "wb_native_data_missing" in issues_found:
              print("• Native Wallbox Fehler: Der Dienst läuft, aber liefert keine Daten.")
              print("  Prüfe die Logs mit: journalctl -u e3dc-wallbox-manager -e")

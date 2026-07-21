@@ -50,7 +50,7 @@ Erstelle in `$E3DC_DOCKER_PATH` eine Datei namens `docker-compose.yml` und kopie
 ```yaml
 services:
   e3dc-control:
-    image: ghcr.io/a9xxx/install-e3dc-control:v5.3.2b
+    image: ghcr.io/a9xxx/install-e3dc-control:latest
     container_name: e3dc-control
     restart: unless-stopped
     network_mode: "host"
@@ -105,7 +105,7 @@ sudo docker compose up -d --force-recreate e3dc-control
 
 Gezielte Rückfallversion:
 
-Einen späteren Stable-Container auf den veröffentlichten Rollback-Root
+Den Stable-Container `v5.4.0` auf den veröffentlichten Rollback-Root
 `v5.3.2b` zurücksetzen:
 
 ```bash
@@ -364,8 +364,8 @@ den Diensten neu befuellt. Die Datei `ml_prediction.json` ist kein persistenter
 Bestandteil der Installation, sondern das temporaere Ergebnis von
 `ml_predictor.py --predict`.
 
-Die Datei `/var/www/html/data/ml_model.pkl` wird ebenfalls nicht im Docker-Image
-mitgeliefert. Sie ist ein lokales Lernmodell und wird erst aus den eigenen
+Der private Modellstore `/var/lib/e3dc-control/ml` wird ebenfalls nicht im Docker-Image
+mitgeliefert. Er enthält ein lokales Lernmodell und wird erst aus den eigenen
 Verlaufsdaten des jeweiligen Systems erzeugt. Bei einer frischen Installation
 oder nach einem Wechsel von einer alten Host-Installation in ein neues Docker-
 Volume kann das Training zunaechst melden:
@@ -387,17 +387,19 @@ Verlaufsdaten, keine Steuerflags und keine Live-Schaltzustaende. Dadurch bleibt
 das Dashboard nach einem Rebuild schneller plausibel, waehrend die Dienste die
 Daten anschliessend frisch nachrechnen.
 
-Wichtig ist das persistente Modell unter `/var/www/html/data/ml_model.pkl`.
+Wichtig ist das persistente, separate Modell-Volume unter `/var/lib/e3dc-control/ml`.
 Wenn `ml_predictor.py --predict` meldet `Kein Modell gefunden`, liegt das nicht
 an `uid=33,gid=33` der Ramdisk, sondern daran, dass noch kein Modell trainiert
-wurde oder die persistente `data`-Ablage nicht stimmt.
+wurde oder das separate Modell-Volume nicht korrekt eingebunden ist. Ein altes
+Web-Pickle unter `/var/www/html/data` wird nicht geladen oder übernommen.
 
 Pruefung im Container:
 ```bash
 sudo docker exec -it e3dc-control bash
 ls -ld /var/www/html/ramdisk
-ls -l /var/www/html/data/ml_model.pkl
+ls -la /var/lib/e3dc-control/ml
 /opt/venv/bin/python3 /app/pi/Install/Installer/ml_predictor.py --train
+/opt/venv/bin/python3 /app/pi/Install/Installer/ml_predictor.py --model-ready
 /opt/venv/bin/python3 /app/pi/Install/Installer/ml_predictor.py --predict
 ls -l /var/www/html/ramdisk/ml_prediction.json
 ```

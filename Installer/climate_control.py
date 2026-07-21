@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Read-only Toshiba climate status for dashboard and diagnostics.
+"""
+Vorbereiteter Klimaanlagen-Regelstatus.
 
-The service reads cloud status and writes it to the Ramdisk. It never sends
-cloud, IR, Shelly or local control commands.
+Dieser Dienst plant nur den späteren Toshiba-Regelpfad und schreibt Diagnose in
+die Ramdisk. Er sendet bewusst keine Cloud-, IR-, Shelly- oder lokalen
+Steuerbefehle. Echte Toshiba-Kommandos dürfen erst in einem Adapter ergänzt
+werden, wenn Zugangsdaten, Geräte-IDs und Sicherheitsgrenzen bewusst gesetzt
+sind.
 """
 
 from __future__ import annotations
@@ -36,11 +40,20 @@ RUNNING = True
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "climate_control_enable": "0",
+    "climate_control_provider": "toshiba_cloud",
+    "climate_control_mode": "off",
     "climate_control_poll_s": "60",
     "climate_toshiba_cloud_enable": "0",
     "climate_toshiba_username": "",
     "climate_toshiba_password": "",
     "climate_toshiba_device_ids": "",
+    "climate_day_temp_c": "24.0",
+    "climate_night_temp_c": "26.0",
+    "climate_night_start": "22:00",
+    "climate_night_end": "06:00",
+    "climate_night_eco_enable": "1",
+    "climate_night_quiet_enable": "1",
+    "climate_high_power_enable": "0",
 }
 
 
@@ -110,6 +123,33 @@ def read_json(path: Path) -> dict[str, Any]:
     return {}
 
 
+def normalize_provider(value: Any) -> str:
+    raw = str(value or "toshiba_cloud").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "toshiba": "toshiba_cloud",
+        "toshiba_ac": "toshiba_cloud",
+        "cloud": "toshiba_cloud",
+        "local": "local_only",
+        "none": "local_only",
+    }
+    return aliases.get(raw, raw if raw in {"toshiba_cloud", "local_only"} else "toshiba_cloud")
+
+
+def normalize_mode(value: Any) -> str:
+    raw = str(value or "off").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "0": "off",
+        "aus": "off",
+        "manual": "manual",
+        "manuell": "manual",
+        "1": "schedule",
+        "auto": "schedule",
+        "zeitplan": "schedule",
+        "schedule": "schedule",
+    }
+    return aliases.get(raw, "off")
+
+
 def parse_device_ids(value: Any) -> list[str]:
     if isinstance(value, list):
         raw_items = value
@@ -121,6 +161,55 @@ def parse_device_ids(value: Any) -> list[str]:
         if text:
             ids.append(text)
     return ids
+
+
+def _parse_hhmm(value: Any, default: str) -> tuple[int, int]:
+    raw = str(value or default).strip()
+    try:
+        hour_s, minute_s = raw.split(":", 1)
+        hour = max(0, min(23, int(hour_s)))
+        minute = max(0, min(59, int(minute_s)))
+        return hour, minute
+    except (TypeError, ValueError):
+        hour_s, minute_s = default.split(":", 1)
+        return int(hour_s), int(minute_s)
+
+
+def _minute_of_day(hour_minute: tuple[int, int]) -> int:
+    return hour_minute[0] * 60 + hour_minute[1]
+
+
+def _in_window(now_min: int, start_min: int, end_min: int) -> bool:
+    if start_min == end_min:
+        return False
+    if start_min < end_min:
+        return start_min <= now_min < end_min
+    return now_min >= start_min or now_min < end_min
+
+
+def current_schedule(cfg: dict[str, Any], now_ts: float | None = None) -> dict[str, Any]:
+    now = datetime.fromtimestamp(float(now_ts if now_ts is not None else time.time()))
+    start = _parse_hhmm(cfg.get("climate_night_start"), "22:00")
+    end = _parse_hhmm(cfg.get("climate_night_end"), "06:00")
+    start_min = _minute_of_day(start)
+    end_min = _minute_of_day(end)
+    now_min = now.hour * 60 + now.minute
+    night_active = _in_window(now_min, start_min, end_min)
+    profile = "night" if night_active else "day"
+    target_temp_c = _safe_float(
+        cfg.get("climate_night_temp_c" if night_active else "climate_day_temp_c"),
+        26.0 if night_active else 24.0,
+    )
+    return {
+        "profile": profile,
+        "night_active": night_active,
+        "target_temp_c": round(target_temp_c, 1),
+        "night_start": "%02d:%02d" % start,
+        "night_end": "%02d:%02d" % end,
+        "eco": bool(night_active and _truthy(cfg.get("climate_night_eco_enable", "1"))),
+        "quiet": bool(night_active and _truthy(cfg.get("climate_night_quiet_enable", "1"))),
+        "high_power": bool((not night_active) and _truthy(cfg.get("climate_high_power_enable", "0"))),
+    }
 
 
 def _toshiba_api_request(
@@ -373,7 +462,10 @@ def build_control_status(
 ) -> dict[str, Any]:
     now = float(now_ts if now_ts is not None else time.time())
     climate_load = climate_load if isinstance(climate_load, dict) else {}
+    provider = normalize_provider(cfg.get("climate_control_provider"))
+    mode = normalize_mode(cfg.get("climate_control_mode"))
     device_ids = parse_device_ids(cfg.get("climate_toshiba_device_ids"))
+    schedule = current_schedule(cfg, now)
 
     enabled = _truthy(cfg.get("climate_control_enable", "0"))
     cloud_enabled = _truthy(cfg.get("climate_toshiba_cloud_enable", "0"))
@@ -381,13 +473,18 @@ def build_control_status(
     has_device = bool(device_ids)
 
     reason = "disabled"
+    control_ready = False
     if enabled:
-        if not cloud_enabled:
+        if mode == "off":
+            reason = "mode_off"
+        elif provider == "local_only":
+            reason = "local_adapter_not_available"
+        elif not cloud_enabled:
             reason = "toshiba_cloud_disabled"
         elif not has_account:
             reason = "toshiba_cloud_config_incomplete"
         else:
-            reason = "toshiba_cloud_ready"
+            reason = "toshiba_adapter_not_implemented"
 
     power_w = _safe_float(climate_load.get("power_w", climate_load.get("climate_power_w")), 0.0)
     load_age_s = max(0.0, now - _safe_float(climate_load.get("ts"), now))
@@ -398,7 +495,7 @@ def build_control_status(
     cloud_duration_s: float | None = None
     cloud_read_ts: int | None = None
     cloud_read_iso = ""
-    should_read_cloud = bool(read_cloud and enabled and cloud_enabled and has_account)
+    should_read_cloud = bool(read_cloud and enabled and provider == "toshiba_cloud" and cloud_enabled and has_account)
     if should_read_cloud:
         reader = cloud_reader or read_toshiba_cloud_status
         try:
@@ -412,7 +509,7 @@ def build_control_status(
         cloud_read_iso = str(cloud_status.get("ts_iso") or datetime.fromtimestamp(cloud_read_ts).isoformat(timespec="seconds"))
         devices = _clean_cloud_devices(cloud_status.get("devices"))
         if cloud_connected:
-            reason = "toshiba_cloud_readonly"
+            reason = "mode_off" if mode == "off" else "toshiba_cloud_readonly"
         else:
             reason = "toshiba_cloud_read_failed"
     configured_device_count, unmatched_device_ids = _annotate_configured_devices(devices, device_ids)
@@ -429,8 +526,14 @@ def build_control_status(
         "success": True,
         "enabled": enabled,
         "read_only": True,
+        "prepared": True,
+        "active": False,
+        "commands_allowed": False,
+        "control_ready": control_ready,
         "reason": reason,
-        "provider": "toshiba_cloud",
+        "provider": provider,
+        "mode": mode,
+        "adapter": "planned",
         "cloud_enabled": cloud_enabled,
         "cloud_connected": cloud_connected,
         "cloud_error": cloud_error,
@@ -454,13 +557,14 @@ def build_control_status(
         "ac_status": ac_status,
         "ac_mode": ac_mode,
         "fan": fan,
+        "schedule": schedule,
         "climate_power_w": round(max(0.0, power_w), 1),
         "climate_active": bool(climate_load.get("active", power_w > 50.0)),
         "climate_meter_online": bool(climate_load.get("online", False)),
         "climate_load_age_s": round(load_age_s, 1),
         "ts": int(now),
         "ts_iso": datetime.fromtimestamp(now).isoformat(timespec="seconds"),
-        "note": "Toshiba Cloud wird ausschließlich gelesen; es werden keine Kommandos gesendet.",
+        "note": "Toshiba Cloud read-only; Kommandos bleiben gesperrt." if cloud_connected else "Vorbereitung ohne aktive Toshiba-Kommandos",
     }
     return status
 
@@ -487,7 +591,7 @@ def run_once(config_path: Path, climate_path: Path, output_path: Path) -> dict[s
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Toshiba-Cloud-Status read-only lesen.")
+    parser = argparse.ArgumentParser(description="Klimaanlagen-Regelstatus vorbereiten.")
     parser.add_argument("--config", default=str(CONFIG_FILE))
     parser.add_argument("--climate-load", default=str(CLIMATE_LOAD_FILE))
     parser.add_argument("--output", default=str(RAMDISK_FILE))

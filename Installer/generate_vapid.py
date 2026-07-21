@@ -33,19 +33,19 @@ def generate_vapid_keys():
     # Private Key (prime256v1 / SECP256R1)
     private_key = ec.generate_private_key(ec.SECP256R1())
     private_numbers = private_key.private_numbers()
-    
+
     # Rohe Bytes des Private Key (32 bytes)
     priv_bytes = private_numbers.private_value.to_bytes(32, byteorder='big')
-    
+
     # Public Key
     public_key = private_key.public_key()
     public_numbers = public_key.public_numbers()
-    
+
     # Rohe Bytes des Public Key (Uncompressed format: 0x04 + X + Y)
     pub_bytes = b'\x04' + \
                 public_numbers.x.to_bytes(32, byteorder='big') + \
                 public_numbers.y.to_bytes(32, byteorder='big')
-    
+
     return {
         "private": base64url_encode(priv_bytes),
         "public": base64url_encode(pub_bytes)
@@ -58,6 +58,11 @@ if __name__ == "__main__":
         config_path = sys.argv[1]
     elif os.path.exists("/app/data/e3dc_v4.json"):
         config_path = "/app/data/e3dc_v4.json"
+
+    print("=== VAPID KEYS GENERATED ===")
+    print(f"push_vapid_public = {keys['public']}")
+    print(f"push_vapid_private = {keys['private']}")
+    print("============================")
 
     if os.path.exists(config_path):
         if config_path.endswith(".json"):
@@ -92,4 +97,4 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"Warning setting permissions: {e}")
     else:
-        print(f"Hinweis: {config_path} nicht gefunden. Bitte zuerst die V4-Konfiguration anlegen und den Vorgang wiederholen.")
+        print(f"Hinweis: {config_path} nicht gefunden. Bitte kopiere diese Werte in die V4-Konfiguration.")

@@ -1,36 +1,110 @@
-# v5.3.2b – Stable-Release auf bereinigter Historienbasis
+# v5.4.0
 
-`v5.3.2b` veröffentlicht den fachlich geprüften Produktstand als bereinigten,
-parentlosen Rollback-Root. Keine ältere öffentliche Git-Historie ist sein
-Vorfahr. Commit-SHA, Tree-ID, Git-Archiv-Hash und OCI-Digest werden im
-getrennten Freigabemanifest mit dem annotierten Tag dokumentiert.
+E3DC-Control v5.4.0 bündelt die neue Energie-Arbitration für Speicher,
+Direktvermarktung, Wallbox und Wärmeverbraucher mit einem transaktionalen
+Update-, Backup- und Wiederherstellungsvertrag.
 
-## Nutzerrelevante Änderungen
+## Wichtigste Änderungen
 
-- Der fachliche Produktumfang entspricht dem vollständig geprüften
-  Releasebaum; zusätzliche Produktlogik ist nicht enthalten.
-- Updates und Wiederherstellungen verwenden ein externes, manifestiertes
-  Backup mit SHA-256-Prüfung und brechen bei leeren, unvollständigen oder
-  unlesbaren Sicherungen hart ab.
-- Der einmalige Wechsel aus einer älteren oder nicht verwandten Git-Historie
-  läuft über den geprüften Installer-/Bootstrapweg; ein gewöhnliches
-  `git pull --ff-only` ist dafür nicht vorgesehen.
-- Lokale Hilfe-Assets werden ohne automatische CDN-Aufrufe ausgeliefert.
-  Diagnosehinweise fordern nicht zur öffentlichen Weitergabe roher Logs auf.
-- Matter bleibt als lokale, nicht zertifizierte read-only Bridge erhalten.
-  Kopplungsdaten bleiben lokal und werden in Backups einbezogen.
-- Shadow-Vergleichsbetrieb, modernes Frontend sowie read-only V2H-/V2G-
-  Telemetrie bleiben erhalten. Eine aktive V2H-/V2G-Steuerung ist nicht
-  freigegeben.
-- Morning Boost und Superintelligenz werden über die dokumentierten
-  Pre-Dump-/Ladekurvenpfade abgebildet; die bisherigen Alt-Schalter werden
-  nicht wieder aktiviert.
+- Ein eindeutiger Regel-Owner und ein unmittelbar vor jedem Hardwareausgang
+  geprüfter Anlagenkontext verhindern konkurrierende Aktorzugriffe.
+- Ungültige Markt-, Wallbox- oder Anlagendaten werden als inaktiv oder
+  unbekannt behandelt und nicht als alte Freigabe beziehungsweise gültige
+  `0 W` fortgeschrieben.
+- Plan, Slot, Marktfenster, Freigabe, Geräteanforderung und Rücklesung bleiben
+  über dieselbe Identität gebunden. Interne DC-PV und zusätzliche AC-Erzeuger
+  werden typisiert bilanziert; DC- und Netzpunktdruck werden nicht addiert.
+- Wallboxaktionen oder der Verlust eines Wallboxkontexts stoppen keine bereits
+  laufende Wärmepumpe eigenständig. Hardwarebefehle bleiben an frische,
+  treiberspezifische Rückmeldungen gebunden.
+- Der Watchdog führt nur noch ein einmaliges, geordnetes Quiesce aus. Er sendet
+  keine eigene RSCP-, Wallbox-, Wärmepumpen-, Phasen- oder CP-Sequenz.
+- Update, Rollback und Web-Planung brechen bei unvollständigem Backup, Timeout,
+  Signal oder Teilfehler ab und stellen den letzten gültigen Konfigurations-
+  und Dienstzustand wieder her.
+- Legacy-ML-Pickles werden nicht geladen. Neue Modelle liegen privat,
+  manifest- und hashgebunden in einem separaten persistenten Store.
 
-## Veröffentlichungsvertrag
+## E3/DC-Wallbox: bestätigungsgebundene Community-Kompatibilität
 
-- `v5.3.2b` ist der parentlose Root und besitzt keinen älteren öffentlichen
-  Rollback.
-- Das Image erhält nur versionierte Tags; `latest` darf niemals auf R0 zeigen.
-- GitHub-Release und GHCR-Image entstehen erst nach einer separaten manuellen
-  Freigabe der exakten Git-Objekte. Ein erfolgreicher lokaler Prüfnachweis ist
-  weder ein Image-Build noch eine Veröffentlichungsfreigabe.
+- Für efy, Easy Connect und bestehende E3/DC-Wallboxen bleibt der sechs Byte
+  lange `WB_REQ_SET_EXTERN`-/WBchar6-Laufzeitpfad für Modus, Strom und den
+  episodischen Start/Stop erhalten. Ein Startimpuls ist höchstens einmal je
+  frisch bestätigter physischer Stop-Episode zulässig.
+- `Nur Status` ist eine bewusste Backendwahl und keine generelle Aussage, dass
+  die Wallbox nicht unterstützt wird. Neue E3/DC-Konfigurationen bieten die
+  WBchar6-Kompatibilitätsregelung sichtbar als empfohlenen Community-Pfad an;
+  eine ausdrücklich gespeicherte Deaktivierung bleibt erhalten.
+- Direkte Sun-/Auto-/Abort-, Maximalstrom- und native Phasenbefehle sind kein
+  Bestandteil dieses Stable-Releases. Sie bleiben unabhängig vom beobachteten
+  Readback gesperrt; der bestätigungsgebundene WBchar6-Pfad ist davon getrennt.
+- Netzstrom-Arbitrage bleibt in 5.4.0 wirkungslos. Vorhandene Altwerte werden
+  kompatibel erhalten, können aber keinen ausführbaren Speicher-Owner erzeugen.
+
+## openWB Pro: geschützter Phasenwechsel
+
+- Ein Phasenwechsel läuft über getrennte Managerzyklen: zuerst 0 A und danach
+  bei frischem Nullleistungs-Readback das Phasenziel. Die openWB besitzt mit
+  `phasetarget` die CP-Signalisierung; E3DC-Control sendet dafür keinen zweiten
+  CP-Wire-Befehl.
+- Der Wiederanlauf bleibt gesperrt, solange CP noch aktiv, der Status stale
+  oder unbekannt, die Zielphase nicht frisch bestätigt oder die
+  phasenwechselbezogene Schutzzeit von mindestens 480 Sekunden noch nicht
+  abgelaufen ist. Ein crashfester Intent-/ACK-Zustand verhindert das blinde
+  Wiederholen eines unbestätigten Phasenausgangs.
+
+## Wallbox-Start, Balancing und ruhige PV-Kurve
+
+- Eine angesteckte und freigegebene openWB Pro verwirft abgelaufene
+  Phasenreservierungen und veraltete Nullanker. Nach bestätigter Bereitschaft
+  wird die positive Startfreigabe erneut projiziert, ohne Umstecken oder
+  wiederholte CP-Schaltungen.
+- Das Mehr-Wallbox-Balancing rechnet mit L1/L2/L3-Stromvektoren, realer
+  Phasenzahl und Netzpunktreserve. Einphasige und dreiphasige Stromwerte werden
+  weder pauschal summiert noch als gleiche Ladeleistung behandelt.
+- `PV-Kurve ruhig` folgt dem nachhaltigen PV-/Ladekurvenbudget. Eine bereits
+  laufende Ladung darf kurze Einbrüche mit höchstens 75 Wh Batteriestützung
+  überbrücken; ein Kaltstart oder Phasenwechsel wird nicht aus dem Speicher
+  finanziert. `PV + Akku` bleibt ein eigener Modus.
+
+## iDM-Diagnose und mobiles Energiefluss-Layout
+
+- Der manuelle iDM-Scanner liest Register 1006 genau einmal als dokumentiertes
+  Input-Register. Eine semantische Zuordnung erfolgt nur bei passend gebundenem
+  Modell, Protokoll, Firmware und Unit-ID; fehlende Angaben bleiben unbekannt.
+  Für Register 1006 existiert kein Schreibpfad.
+- Energiefluss-Badges speichern Desktop- und Mobile-Positionen feldgenau mit
+  getrennten Revisionen. Tablet- und Querformatansichten trennen Quellen und
+  Verwendung und melden erfolgreiche oder kollidierende Speicherungen sichtbar.
+
+## Erhaltene Produktfunktionen
+
+- Matter bleibt mit Weboberfläche und drei read-only Statusschaltern erhalten.
+  Neue Commissioning-Daten werden installationsindividuell und privat
+  gespeichert; bestehende Fabrics werden nicht gelöscht.
+- Shadow bleibt als read-only Vergleichs-/Testinstanz ohne Hardwarebefehle und
+  ohne automatischen Failover-Writer erhalten.
+- V2H-/V2G-Telemetrie bleibt sichtbar; aktive bidirektionale Steuerung ist
+  weiterhin nicht freigegeben.
+- Klassisches und modernes Frontend, Direktvermarktung, Wallbox-, Wärme- und
+  Speicherfunktionen bleiben Bestandteil des Releases.
+
+## Update und Rückfall
+
+Der Wechsel aus einer älteren, nicht verwandten Historie erfolgt über den
+geprüften Installer-/Bootstrapweg, nicht über `git pull`. Vor dem Umschreiben
+ist ein externes, manifestiertes und prüfsummengesichertes Backup Pflicht.
+
+Einziger vorgesehener öffentlicher Rückfallstand ist der sanitierte Root
+`v5.3.2b`. Ein Rückfall wird nur angeboten, wenn Tag, Commit-SHA und Artefakt
+in der veröffentlichten Update-Policy exakt übereinstimmen.
+
+## Docker
+
+Die Images werden aus dem veröffentlichten Git-Stand über GitHub Actions
+gebaut. `latest` ist ausschließlich für v5.4.0 vorgesehen; der Rollback-Tag
+bleibt `v5.3.2b`. Matter-Abhängigkeiten stammen aus der Lockdatei, und das
+anlagenspezifische ML-Modell liegt in einem separaten persistenten Volume.
+
+Matter ist weiterhin ein nicht zertifizierter lokaler Integrationspfad.
+V2H/V2G ist read-only, und Shadow besitzt keine Aktorfreigabe.

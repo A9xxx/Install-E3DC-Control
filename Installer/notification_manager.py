@@ -45,13 +45,13 @@ def safe_execute(cmd_list, silent=False):
             
             res = subprocess.run(cmd_list, capture_output=True, text=True, check=False)
             
-            if res.stderr.strip():
+            if res.stderr.strip() and res.returncode != 0:
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Fehler bei {' '.join(cmd_list)}:\n{res.stderr.strip()}", flush=True)
-            elif not silent and res.stdout.strip():
+            elif res.stderr.strip() and not silent:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Hinweis von {' '.join(cmd_list)}:\n{res.stderr.strip()}", flush=True)
+            if not silent and res.stdout.strip():
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Ausgabe:\n{res.stdout.strip()}", flush=True)
             if res.returncode != 0:
-                if not silent and res.stdout.strip() and res.stderr.strip():
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] Ausgabe:\n{res.stdout.strip()}", flush=True)
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Befehl fehlgeschlagen (Rückgabecode {res.returncode}): {' '.join(cmd_list)}", flush=True)
                 return False
             return True

@@ -1,38 +1,27 @@
-const CACHE_NAME = 'e3dc-control-local-vendor-r0-e5-20260712';
+const CACHE_NAME = 'e3dc-control-v5-4-0-static';
 const ASSETS = [
   'assets/vendor/bootstrap/css/bootstrap.min.css',
-  'assets/vendor/bootstrap/js/bootstrap.bundle.min.js',
-  'assets/vendor/bootstrap-icons/bootstrap-icons.min.css',
-  'assets/vendor/bootstrap-icons/fonts/bootstrap-icons.woff2',
-  'assets/vendor/chart.js/chart.umd.min.js',
-  'assets/vendor/chartjs-plugin-zoom/chartjs-plugin-zoom.min.js',
   'assets/vendor/fontawesome/css/all.min.css',
-  'assets/vendor/fontawesome/webfonts/fa-brands-400.ttf',
-  'assets/vendor/fontawesome/webfonts/fa-brands-400.woff2',
-  'assets/vendor/fontawesome/webfonts/fa-regular-400.ttf',
-  'assets/vendor/fontawesome/webfonts/fa-regular-400.woff2',
-  'assets/vendor/fontawesome/webfonts/fa-solid-900.ttf',
-  'assets/vendor/fontawesome/webfonts/fa-solid-900.woff2',
-  'assets/vendor/fontawesome/webfonts/fa-v4compatibility.ttf',
-  'assets/vendor/fontawesome/webfonts/fa-v4compatibility.woff2',
+  'assets/vendor/bootstrap/js/bootstrap.bundle.min.js',
+  'assets/vendor/chart.js/chart.umd.min.js',
   'assets/vendor/hammerjs/hammer.min.js',
-  'assets/vendor/jquery/jquery-3.6.0.min.js'
+  'assets/vendor/chartjs-plugin-zoom/chartjs-plugin-zoom.min.js'
 ];
 
 self.addEventListener('install', event => {
-  event.waitUntil((async () => {
-    const cache = await caches.open(CACHE_NAME);
-    await cache.addAll(ASSETS);
-    await self.skipWaiting();
-  })());
+  self.skipWaiting();
+
+  caches.open(CACHE_NAME).then(cache => {
+    cache.addAll(ASSETS).catch(e => console.warn("Cache fail:", e));
+  }).catch(e => console.warn("Cache-Open fail:", e));
 });
 
 self.addEventListener('activate', event => {
-  event.waitUntil((async () => {
-    const keys = await caches.keys();
-    await Promise.all(keys.filter(key => key !== CACHE_NAME).map(key => caches.delete(key)));
-    await self.clients.claim();
-  })());
+  self.clients.claim();
+
+  caches.keys().then(keys => {
+    keys.filter(key => key !== CACHE_NAME).map(key => caches.delete(key));
+  }).catch(e => console.warn("Cleanup fail:", e));
 });
 
 self.addEventListener('message', event => {
@@ -133,4 +122,3 @@ self.addEventListener('notificationclick', event => {
     })
   );
 });
-

@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-e3dc_live.py  --  Native Python RSCP Live-Service fuer E3DC Stromspeicher
+e3dc_live.py  --  Nativer Python-RSCP-Live-Dienst für E3DC-Stromspeicher
 
 Liest Live- und Tageswerte direkt via RSCP (TCP 5033) vom E3DC-System.
 Im Daemon-Modus (--write --loops 0) schreibt er live_data_py.json atomar
 in die RAM-Disk. get_live_json.php liest diese Datei.
 
 Verzeichnisstruktur:
-  /home/pi/Install/Installer/  <- dieses Skript + rscp_client.py
+  <Release-Root>/Installer/  <- dieses Skript + rscp_client.py
 
 Betrieb:
   Test (Einzel):    python3 e3dc_live.py
@@ -56,6 +56,7 @@ if SCRIPT_DIR not in sys.path:
 
 from rscp_client import (
     RscpConnection, RscpType,
+    RscpTag, decode_wb_extern_data_alg,
     find_tag, find_tag_value, find_all_values,
 )
 from reserve import normalise_live_ep_reserve
@@ -67,6 +68,10 @@ try:
     from rscp_acquisition import RscpAcquisitionSession
 except ImportError:  # pragma: no cover - Paketimport
     from Installer.rscp_acquisition import RscpAcquisitionSession
+try:
+    from external_pv_topology import ExternalPvTopologyEvidenceTracker, read_external_pv_topology
+except ImportError:  # pragma: no cover - Paketimport
+    from Installer.external_pv_topology import ExternalPvTopologyEvidenceTracker, read_external_pv_topology
 
 logger = configure_service_logger(
     "E3DCLive",
@@ -99,7 +104,7 @@ def persistent_acquisition_sections(cfg):
     return [
         ("Power Snapshot", lambda conn: get_power_snapshot(conn, cfg), 0.0, True),
         ("PVI DC/AC", lambda conn: get_pvi(conn), 0.0, False),
-        ("Batterie", lambda conn: get_bat(conn), 0.0, False),
+        ("Batterie", lambda conn: get_bat(conn, cfg), 0.0, False),
         ("Wallbox", lambda conn: get_wb(conn, cfg), 0.0, False),
         # Dieser Block enthält neben Stammdaten auch aktive EMS-Leistungsgrenzen.
         # Er darf deshalb nicht als statischer Bereich gecacht werden.
@@ -138,7 +143,7 @@ def _find_config():
 
 
 def sanitize_for_json(value):
-    """Return a JSON-strict copy with NaN/Infinity replaced by null."""
+    """Liefert eine JSON-strikte Kopie, in der NaN/Infinity durch null ersetzt ist."""
     if isinstance(value, dict):
         return {k: sanitize_for_json(v) for k, v in value.items()}
     if isinstance(value, list):
@@ -150,270 +155,137 @@ def sanitize_for_json(value):
     return value
 
 
+_ENERGY_BALANCE_COMPONENTS = (
+    ("PV_Energy_kWh", "PV_Energy_Valid", "PV_Energy_Source", "supply", True),
+    ("Grid_In_Energy_kWh", "Grid_In_Energy_Valid", "Grid_In_Energy_Source", "supply", True),
+    ("Bat_Out_Energy_kWh", "Bat_Out_Energy_Valid", "Bat_Out_Energy_Source", "supply", True),
+    ("Home_Energy_kWh", "Home_Energy_Valid", "Home_Energy_Source", "demand", True),
+    ("Wallbox_Energy_kWh", "Wallbox_Energy_Valid", "Wallbox_Energy_Source", "demand", False),
+    ("Grid_Out_Energy_kWh", "Grid_Out_Energy_Valid", "Grid_Out_Energy_Source", "demand", True),
+    ("Bat_In_Energy_kWh", "Bat_In_Energy_Valid", "Bat_In_Energy_Source", "demand", True),
+)
+
+
+def calculate_energy_balance_metrics(data):
+    """Berechnet reine Tagesenergiediagnose ohne fehlende Werte als Messnull zu erfinden."""
+
+    components = {}
+    invalid_required = []
+    unavailable_optional = []
+    for key, valid_key, source_key, side, required in _ENERGY_BALANCE_COMPONENTS:
+        raw = data.get(key)
+        valid_flag_present = valid_key in data
+        reported_valid = bool(data.get(valid_key)) if valid_flag_present else True
+        reason = ""
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            value = None
+            reason = "missing" if raw is None else "invalid_type"
+        else:
+            value = float(raw)
+            if not math.isfinite(value):
+                value = None
+                reason = "non_finite"
+            elif value < 0.0:
+                value = None
+                reason = "negative_counter"
+        valid = value is not None and reported_valid
+        if value is not None and not reported_valid:
+            reason = "reported_invalid"
+        source = str(data.get(source_key) or ("numeric_legacy" if valid else reason or "invalid"))
+        components[key] = {
+            "value": value if valid else None,
+            "valid": valid,
+            "source": source,
+            "reason": "valid" if valid else reason or "reported_invalid",
+            "required": required,
+            "side": side,
+        }
+        if not valid:
+            if required:
+                invalid_required.append(key)
+            else:
+                unavailable_optional.append(key)
+
+    required_valid = not invalid_required
+    optional_complete = not unavailable_optional
+    partial_supply = None
+    partial_demand = None
+    partial_valid = False
+    if required_valid:
+        calculated_supply = sum(
+            item["value"] for item in components.values()
+            if item["side"] == "supply" and item["valid"]
+        )
+        calculated_demand = sum(
+            item["value"] for item in components.values()
+            if item["side"] == "demand" and item["valid"]
+        )
+        if optional_complete:
+            supply = calculated_supply
+            demand = calculated_demand
+            loss_kwh = round(supply - demand, 3)
+            loss_pct = round(loss_kwh / supply * 100, 1) if supply > 0 else 0.0
+            completeness = "complete"
+            source = "db_history_complete"
+        else:
+            # Die Teilsummen bleiben rein diagnostisch. Insbesondere darf eine
+            # fehlende WB-Tagesenergie nicht als vermeintlicher Systemverlust
+            # in die kanonische Bilanz gelangen.
+            supply = None
+            demand = None
+            loss_kwh = None
+            loss_pct = None
+            partial_supply = calculated_supply
+            partial_demand = calculated_demand
+            partial_valid = True
+            completeness = "partial_optional"
+            source = "db_history_partial_without_optional_wallbox"
+    else:
+        supply = None
+        demand = None
+        loss_kwh = None
+        loss_pct = None
+        completeness = "degraded_required"
+        source = "degraded_required_input"
+
+    bat_in = components["Bat_In_Energy_kWh"]
+    bat_out = components["Bat_Out_Energy_kWh"]
+    bat_valid = bool(bat_in["valid"] and bat_out["valid"])
+    bat_net_kwh = None
+    bat_rte_pct = None
+    if bat_valid:
+        bi_e = bat_in["value"]
+        bo_e = bat_out["value"]
+        bat_net_kwh = round(bo_e - bi_e, 3)
+        if bi_e > 0.5 and bo_e > 0.1 and bo_e <= bi_e * 1.05:
+            bat_rte_pct = round(bo_e / bi_e * 100, 1)
+
+    return {
+        "sys_energy_supply_kwh": supply,
+        "sys_energy_demand_kwh": demand,
+        "sys_loss_kwh": loss_kwh,
+        "sys_loss_pct": loss_pct,
+        "sys_energy_balance_valid": bool(required_valid and optional_complete),
+        "sys_energy_balance_completeness": completeness,
+        "sys_energy_balance_source": source,
+        "sys_energy_partial_supply_kwh": partial_supply,
+        "sys_energy_partial_demand_kwh": partial_demand,
+        "sys_energy_partial_valid": partial_valid,
+        "sys_energy_balance_invalid_fields": invalid_required,
+        "sys_energy_balance_optional_unavailable_fields": unavailable_optional,
+        "sys_energy_balance_components": components,
+        "bat_net_discharge_kwh": bat_net_kwh,
+        "bat_rte_pct": bat_rte_pct,
+        "bat_energy_metrics_valid": bat_valid,
+        "bat_energy_metrics_source": "db_history_energy_components" if bat_valid else "degraded_required_input",
+    }
+
+
 
 # ---------------------------------------------------------------------------
 # RSCP Tag-Konstanten (aus _rscpTags.py - korrekte Werte!)
 # ---------------------------------------------------------------------------
 
-class T:
-    # EMS Live-Leistungen
-    EMS_REQ_POWER_PV              = 0x01000001
-    EMS_REQ_POWER_BAT             = 0x01000002
-    EMS_REQ_POWER_HOME            = 0x01000003
-    EMS_REQ_POWER_GRID            = 0x01000004
-    EMS_REQ_POWER_ADD             = 0x01000005   # Heizstab/Zusatzlast
-    EMS_REQ_AUTARKY               = 0x01000006
-    EMS_REQ_SELF_CONSUMPTION      = 0x01000007
-    EMS_REQ_BAT_SOC               = 0x01000008
-    EMS_REQ_INSTALLED_PEAK_POWER  = 0x01000013   # Installierte kWp
-    EMS_REQ_DERATE_AT_PERCENT_VALUE = 0x01000014  # Abregelung %
-    EMS_REQ_DERATE_AT_POWER_VALUE = 0x01000015   # Abregelung W
-    EMS_REQ_POWER_WB_ALL          = 0x0100001F   # Wallbox gesamt
-    EMS_REQ_IS_PV_DERATING        = 0x01000024   # Aktive Drosselung?
-    EMS_REQ_AC_POWER_LIMIT        = 0x01000025   # Aktuelle AC-Begrenzung
-    EMS_REQ_POWER_WB_SOLAR        = 0x01000020   # Solaranteil WB-Ladung
-    EMS_REQ_COUPLING_MODE         = 0x01000009   # DC/AC/Hybrid/Island
-    EMS_REQ_EMERGENCY_POWER_STATUS = 0x01000073  # NOT_POSSIBLE=0,ACTIVE=1,NOT_ACTIVE=2,NOT_AVAILABLE=3
-    EMS_REQ_BAT_CURRENT_IN        = 0x01000258   # Batterie Ladestrom (EMS-Ebene)
-    EMS_REQ_BAT_CURRENT_OUT       = 0x01000259   # Batterie Entladestrom (EMS-Ebene)
-    EMS_REQ_GET_POWER_SETTINGS    = 0x0100008B   # Container: liest MAX_CHARGE/DISCHARGE, POWERSAVE etc.
-    EMS_REQ_SET_POWER_SETTINGS    = 0x0100008C   # Container: setzt MAX_CHARGE/DISCHARGE + POWER_LIMITS_USED
-    EMS_REQ_BATTERY_TO_CAR_MODE   = 0x01000077   # E3DC Wallbox: Batterie darf Auto stuetzen
-    EMS_REQ_BATTERY_BEFORE_CAR_MODE = 0x01000079 # E3DC Wallbox: Batterie vor Auto laden
-    EMS_REQ_WB_ENFORCE_POWER_ASSIGNMENT = 0x0100027B
-    EMS_REQ_WB_DISCHARGE_BAT_UNTIL = 0x0100027D  # E3DC Wallbox: Akku bis SoC fuer Auto entladen
-    EMS_REQ_STATUS                = 0x01000040
-    EMS_REQ_USED_CHARGE_LIMIT     = 0x01000041   # Aktuell genutztes Lade-Limit (W)
-    EMS_REQ_BAT_CHARGE_LIMIT      = 0x01000042   # Batterie-Lade-Limit (W)
-    EMS_REQ_USER_CHARGE_LIMIT     = 0x01000044   # Nutzer-Lade-Limit (W)
-    EMS_REQ_USED_DISCHARGE_LIMIT  = 0x01000045   # Aktuell genutztes Entlade-Limit (W)
-    EMS_REQ_REMAINING_BAT_CHARGE_POWER   = 0x01000071
-    EMS_REQ_REMAINING_BAT_DISCHARGE_POWER = 0x01000072
-    EMS_REQ_EP_RESERVE            = 0x01000242   # Notstrom-Reserve
-    EMS_POWER_LIMITS_USED         = 0x01000100   # Bool: Externe Leistungsgrenzen aktiv?
-    EMS_MAX_CHARGE_POWER          = 0x01000101   # SET-Tag! (liefert ERR_UNKNOWN_TAG=7 beim Lesen)
-    EMS_MAX_DISCHARGE_POWER       = 0x01000102   # SET-Tag!
-    EMS_DISCHARGE_START_POWER     = 0x01000103   # Mindest-Leistung fuer Entladen - SET
-    EMS_WEATHER_REGULATED_CHARGE  = 0x01000105   # Wetterbasiertes Laden aktiv?
-    EMS_MANUAL_CHARGE_ACTIVE      = 0x01000151   # Manuelles Laden aktiv?
-    EMS_REQ_GET_SYS_SPECS         = 0x01000097   # KORREKT! (nicht 0x01000099!)
-    EMS_SYS_SPEC_INDEX            = 0x0100009a
-    EMS_SYS_SPEC_NAME             = 0x0100009b
-    EMS_SYS_SPEC_VALUE_INT        = 0x0100009c
-    EMS_SYS_SPEC_VALUE_STRING     = 0x0100009d
-    # EMS SET_POWER - Ladesteuerung (30s Timeout!)
-    # Mode: 0=AUTO, 1=IDLE, 2=ENTLADEN, 3=LADEN, 4=NETZ-LADEN
-    EMS_REQ_SET_POWER             = 0x01000030
-    EMS_REQ_SET_POWER_MODE        = 0x01000031
-    EMS_REQ_SET_POWER_VALUE       = 0x01000032
-    EMS_SET_POWER                 = 0x01800030
-
-    EMS_POWER_PV                  = 0x01800001
-    EMS_POWER_BAT                 = 0x01800002
-    EMS_POWER_HOME                = 0x01800003
-    EMS_POWER_GRID                = 0x01800004
-    EMS_POWER_ADD                 = 0x01800005
-    EMS_AUTARKY                   = 0x01800006
-    EMS_SELF_CONSUMPTION          = 0x01800007
-    EMS_BAT_SOC                   = 0x01800008
-    EMS_INSTALLED_PEAK_POWER      = 0x01800013
-    EMS_DERATE_AT_PERCENT_VALUE   = 0x01800014
-    EMS_DERATE_AT_POWER_VALUE     = 0x01800015
-    EMS_POWER_WB_ALL              = 0x0180001F
-    EMS_POWER_WB_SOLAR            = 0x01800020   # Solaranteil WB-Ladung
-    EMS_COUPLING_MODE             = 0x01800009   # 0=DC,1=DCmulti,2=AC,3=HYBRID,4=ISLAND
-    EMS_EMERGENCY_POWER_STATUS    = 0x01800073   # NOT_POSSIBLE/ACTIVE/NOT_ACTIVE/NOT_AVAILABLE
-    EMS_BAT_CURRENT_IN            = 0x01800258
-    EMS_BAT_CURRENT_OUT           = 0x01800259
-    EMS_GET_POWER_SETTINGS        = 0x0180008B   # Response-Container fuer GET_POWER_SETTINGS
-    EMS_BATTERY_TO_CAR_MODE       = 0x01800077
-    EMS_BATTERY_BEFORE_CAR_MODE   = 0x01800079
-    EMS_WB_ENFORCE_POWER_ASSIGNMENT = 0x0180027B
-    EMS_WB_DISCHARGE_BAT_UNTIL    = 0x0180027D
-    EMS_IS_PV_DERATING            = 0x01800024
-    EMS_AC_POWER_LIMIT            = 0x01800025
-    EMS_STATUS                    = 0x01800040
-    EMS_USED_CHARGE_LIMIT         = 0x01800041   # aktuelles Lade-Limit in W
-    EMS_BAT_CHARGE_LIMIT          = 0x01800042   # Batterie-Lade-Limit in W
-    EMS_USER_CHARGE_LIMIT         = 0x01800044   # Nutzer-Lade-Limit in W
-    EMS_USED_DISCHARGE_LIMIT      = 0x01800045   # aktuelles Entlade-Limit in W
-    EMS_REMAINING_BAT_CHARGE_POWER    = 0x01800071
-    EMS_REMAINING_BAT_DISCHARGE_POWER = 0x01800072
-    EMS_PARAM_MAX_CHARGE_POWER    = 0x01800235   # konfig. Max
-    EMS_PARAM_MAX_DISCHARGE_POWER = 0x01800236
-    EMS_PARAM_MAX_PV_POWER        = 0x01800237
-    EMS_PARAM_MAX_AC_POWER        = 0x01800238
-    EMS_EP_RESERVE                = 0x01800242
-
-    # Emergency Power namespace
-    EP_REQ_EP_RESERVE             = 0x1B000009
-    EP_EP_RESERVE                 = 0x1B800009
-    EP_PARAM_EP_RESERVE           = 0x1B040023
-    EP_PARAM_EP_RESERVE_ENERGY    = 0x1B040033
-    EP_PARAM_EP_RESERVE_MAX_ENERGY = 0x1B040034
-
-    # PVI Wechselrichter - KORREKTE Tags aus _rscpTags.py!
-    PVI_REQ_DATA                  = 0x02040000
-    PVI_DATA                      = 0x02840000
-    PVI_INDEX                     = 0x02040001
-    # DC-String-Anfragen (0x020DC...)
-    PVI_REQ_DC_MAX_STRING_COUNT   = 0x020DC000
-    PVI_REQ_DC_POWER              = 0x020DC001
-    PVI_REQ_DC_VOLTAGE            = 0x020DC002
-    PVI_REQ_DC_CURRENT            = 0x020DC003
-    PVI_REQ_DC_MAX_POWER          = 0x020DC004
-    PVI_REQ_DC_MAX_VOLTAGE        = 0x020DC005
-    PVI_REQ_DC_MIN_VOLTAGE        = 0x020DC006
-    PVI_REQ_DC_MAX_CURRENT        = 0x020DC007
-    PVI_REQ_DC_STRING_ENERGY_ALL  = 0x020DC009
-    # AC-Phasen-Anfragen (0x020AC...)
-    PVI_REQ_AC_MAX_PHASE_COUNT    = 0x020AC000
-    PVI_REQ_AC_POWER              = 0x020AC001
-    PVI_REQ_AC_VOLTAGE            = 0x020AC002
-    PVI_REQ_AC_CURRENT            = 0x020AC003
-    PVI_REQ_AC_ENERGY_ALL         = 0x020AC006
-    PVI_REQ_AC_ENERGY_DAY         = 0x020AC008
-    PVI_REQ_AC_FREQUENCY          = 0x020AC00A
-    PVI_REQ_TEMPERATURE           = 0x02000100
-    # DC-String-Antworten (0x028DC...)
-    PVI_DC_MAX_STRING_COUNT       = 0x028DC000
-    PVI_DC_POWER                  = 0x028DC001
-    PVI_DC_VOLTAGE                = 0x028DC002
-    PVI_DC_CURRENT                = 0x028DC003
-    PVI_DC_MAX_POWER              = 0x028DC004
-    PVI_DC_STRING_ENERGY_ALL      = 0x028DC009
-    # AC-Phasen-Antworten (0x028AC...)
-    PVI_AC_MAX_PHASE_COUNT        = 0x028AC000
-    PVI_AC_POWER                  = 0x028AC001
-    PVI_AC_VOLTAGE                = 0x028AC002
-    PVI_AC_CURRENT                = 0x028AC003
-    PVI_AC_ENERGY_ALL             = 0x028AC006
-    PVI_AC_ENERGY_DAY             = 0x028AC008
-    PVI_AC_FREQUENCY              = 0x028AC00A
-    PVI_TEMPERATURE               = 0x02800100
-
-    # Netzmessgeraet Phasen
-    PM_REQ_DATA                   = 0x05040000
-    PM_DATA                       = 0x05840000
-    PM_INDEX                      = 0x05040001
-    PM_REQ_POWER_L1               = 0x05000001
-    PM_REQ_POWER_L2               = 0x05000002
-    PM_REQ_POWER_L3               = 0x05000003
-    PM_REQ_VOLTAGE_L1             = 0x05000011
-    PM_REQ_VOLTAGE_L2             = 0x05000012
-    PM_REQ_VOLTAGE_L3             = 0x05000013
-    PM_POWER_L1                   = 0x05800001
-    PM_POWER_L2                   = 0x05800002
-    PM_POWER_L3                   = 0x05800003
-    PM_VOLTAGE_L1                 = 0x05800011
-    PM_VOLTAGE_L2                 = 0x05800012
-    PM_VOLTAGE_L3                 = 0x05800013
-
-    # Batterie
-    BAT_REQ_DATA                  = 0x03040000
-    BAT_DATA                      = 0x03840000
-    BAT_INDEX                     = 0x03040001
-    BAT_REQ_VOLTAGE               = 0x03000001  # liefert: Batterie-SOC (!) nicht Voltage!
-    BAT_REQ_CURRENT               = 0x03000002  # liefert: Batteriespannung in V
-    BAT_REQ_CURRENT_REAL          = 0x03000003  # liefert: echten Strom in A
-    BAT_REQ_MAX_CHARGE_CURRENT    = 0x03000005
-    BAT_REQ_EOD_VOLTAGE           = 0x03000006   # Entladeschlussspannung
-    BAT_REQ_CHARGE_CYCLES         = 0x03000008
-    BAT_REQ_DCB_COUNT             = 0x0300000D
-    BAT_REQ_STATUS_CODE           = 0x03000009
-    BAT_REQ_USABLE_CAPACITY       = 0x03000026
-    BAT_REQ_FCC                   = 0x03000010
-    BAT_REQ_SPECIFICATION         = 50331715
-    BAT_SOC_OWN                   = 0x03800001  # BAT eigener SOC
-    BAT_VOLTAGE                   = 0x03800002  # Batteriespannung in V
-    BAT_CURRENT                   = 0x03800003  # Batteriestrom in A
-    BAT_EOD_VOLTAGE               = 0x03800006  # Entladeschlussspannung
-    BAT_MAX_CHARGE_CURRENT        = 0x03800005
-    BAT_CHARGE_CYCLES             = 0x03800008
-    BAT_DCB_COUNT                 = 0x0380000D
-    BAT_STATUS_CODE               = 0x03800009  # Bitfield
-    BAT_USABLE_CAPACITY           = 0x03800026  # Einheit: 0.1 kWh
-    BAT_USABLE_REMAINING_CAPACITY = 0x03800027  # Verbleibende nutzbare Kap. in Wh!
-    BAT_FCC                       = 0x03800010  # Full Charge Capacity, 0.1 kWh
-    BAT_REQ_USABLE_REMAINING_CAPACITY = 0x03000027
-    BAT_SPECIFICATION             = 58720323
-    BAT_SPECIFIED_CAPACITY        = 58720549
-
-    # DCDC Batt.-Wechselrichter (fuer echte Wechselrichter-Effizienz)
-    # P_BAT = Bat-Seite, P_DCL = DC-Link-Seite -> P_DCL/P_BAT = Effizienz
-    DCDC_REQ_DATA                 = 0x04040000
-    DCDC_DATA                     = 0x04840000
-    DCDC_INDEX                    = 0x04040001
-    DCDC_REQ_I_BAT                = 0x04000001  # Batteriestrom DCDC-Seite
-    DCDC_REQ_U_BAT                = 0x04000002  # Batteriespannung DCDC-Seite
-    DCDC_REQ_P_BAT                = 0x04000003  # Batterieleistung DCDC-Seite
-    DCDC_REQ_I_DCL                = 0x04000004  # DC-Link Strom
-    DCDC_REQ_U_DCL                = 0x04000005  # DC-Link Spannung
-    DCDC_REQ_P_DCL                = 0x04000006  # DC-Link Leistung
-    DCDC_I_BAT                    = 0x04800001
-    DCDC_U_BAT                    = 0x04800002
-    DCDC_P_BAT                    = 0x04800003
-    DCDC_I_DCL                    = 0x04800004
-    DCDC_U_DCL                    = 0x04800005
-    DCDC_P_DCL                    = 0x04800006
-
-    # Wallbox
-    WB_REQ_DATA                   = 0x0E040000
-    WB_DATA                       = 0x0E840000
-    WB_INDEX                      = 0x0E040001
-    WB_REQ_PM_POWER_L1            = 0x0E00000C
-    WB_REQ_PM_POWER_L2            = 0x0E00000D
-    WB_REQ_PM_POWER_L3            = 0x0E00000E
-    WB_REQ_DEVICE_CONNECTED       = 0x0E041000
-    WB_REQ_DEVICE_WORKING         = 0x0E041001
-    WB_PM_POWER_L1                = 0x0E80000C
-    WB_PM_POWER_L2                = 0x0E80000D
-    WB_PM_POWER_L3                = 0x0E80000E
-    WB_DEVICE_CONNECTED           = 0x0E841000
-    WB_DEVICE_WORKING             = 0x0E841001
-
-    # INFO (Seriennummer, SW-Version)
-    INFO_REQ_SERIAL_NUMBER        = 0x0A000001
-    INFO_REQ_SW_RELEASE           = 0x0A000019
-    INFO_SERIAL_NUMBER            = 0x0A800001
-    INFO_SW_RELEASE               = 0x0A800019
-
-    # Auth
-    RSCP_REQ_AUTHENTICATION       = 0x00000001
-    RSCP_AUTHENTICATION_USER      = 0x00000002
-    RSCP_AUTHENTICATION_PASSWORD  = 0x00000003
-    RSCP_AUTHENTICATION           = 0x00800001
-
-    # DB-History (Tagesertraege) - UINT64 Timestamps!
-    # KORREKTE Tags aus _rscpTags.py (vorher falsch!)
-    DB_REQ_HISTORY_DATA_DAY       = 0x06000100   # (war falsch: 0x06040004)
-    DB_REQ_HISTORY_TIME_START     = 0x06000101   # (war falsch: 0x06000000)
-    DB_REQ_HISTORY_TIME_INTERVAL  = 0x06000102   # (war falsch: 0x06000001)
-    DB_REQ_HISTORY_TIME_SPAN      = 0x06000103   # (war falsch: 0x06000002)
-    DB_HISTORY_DATA_DAY           = 0x06800100   # Response-Tag
-    DB_SUM_CONTAINER              = 0x06800010   # (war falsch: 0x06800000)
-    DB_BAT_POWER_IN               = 0x06800002   # (war: 0x0680000C)
-    DB_BAT_POWER_OUT              = 0x06800003   # (war: 0x0680000D)
-    DB_DC_POWER                   = 0x06800004   # PV-Erzeugung - unveraendert korrekt
-    DB_GRID_POWER_IN              = 0x06800006   # Haus-Perspektive: IN = vom Netz bezogen = Netzbezug (Grid_In)
-    DB_GRID_POWER_OUT             = 0x06800005   # Haus-Perspektive: OUT = ins Netz eingespeist = Einspeisung (Grid_Out)
-    DB_CONSUMPTION                = 0x06800007   # Hausverbrauch (war: 0x06800010)
-    DB_PM_0_POWER                 = 0x06800008   # Externe Zaehler (z.B. PV extern)
-    DB_PM_1_POWER                 = 0x06800009   
-    DB_WB_ALL_POWER               = 0x06800030   # Wallbox Energie
-    DB_AUTARKY                    = 0x0680000D   # Tages-Autarkiegrad in DB (kWh-basiert)
-    DB_CONSUMED_PRODUCTION        = 0x0680000C   # Eigenverbrauchsquote in DB
-    DB_BAT_CHARGE_LEVEL           = 0x0680000A   # SOC-Verlauf in DB
-    DB_BAT_CYCLE_COUNT            = 0x0680000B   # Zyklen in DB
-
-    # WB Session-Daten (aktuelle Ladesitzung)
-    WB_ENERGY_ALL                 = 0x0E800001   # Gesamtenergie WB seit Inbetriebnahme
-    WB_SESSION                    = 0x0E80002C   # Aktuelle/letzte Session
-    WB_SESSION_CHARGED_ENERGY     = 0x0E74102A   # Geladene Energie akt. Session in Wh
-    WB_SESSION_CHARGED_SUN_ENERGY = 0x0E74102B   # Davon Solar-Anteil in Wh
-    WB_SESSION_START_TIME         = 0x0E741026   # Startzeit akt. Session
-    WB_SESSION_STATUS             = 0x0E741027   # Status akt. Session
-    WB_REQ_SESSION                = 0x0E00002C   # Anfrage aktuelle Session
 
 
 # ---------------------------------------------------------------------------
@@ -443,7 +315,7 @@ def _fv(resp, tag, default=0.0):
         return default
 
 def _optional_float(resp, tag):
-    """Float-Wert mit Verfuegbarkeitsstatus aus Antwort lesen."""
+    """Liest einen Float-Wert mit Verfügbarkeitsstatus aus der Antwort."""
     item = find_tag(resp, tag)
     if item is None:
         return None, "rscp_missing"
@@ -464,6 +336,20 @@ def _iv(resp, tag, default=0):
         return int(v)
     except (TypeError, ValueError):
         return default
+
+
+def _typed_int_tag(resp, tag):
+    """Liefert RSCP-Integer mit expliziter Missing-/0-Unterscheidung."""
+
+    item = find_tag(resp, tag)
+    value = item.get("value") if isinstance(item, dict) else None
+    valid = bool(
+        isinstance(item, dict)
+        and item.get("type") not in {RscpType.Nil, RscpType.Container, RscpType.Error}
+        and isinstance(value, int)
+        and not isinstance(value, bool)
+    )
+    return (int(value) if valid else None, valid)
 
 def _float_in_container(item):
     """Extrahiert Float-Wert aus einem Container-Item."""
@@ -487,48 +373,64 @@ def _today_midnight_ts():
 
 def _ems_live_request_items():
     return [
-        _nil(T.EMS_REQ_POWER_PV),
-        _nil(T.EMS_REQ_POWER_BAT),
-        _nil(T.EMS_REQ_POWER_HOME),
-        _nil(T.EMS_REQ_POWER_GRID),
-        _nil(T.EMS_REQ_POWER_ADD),
-        _nil(T.EMS_REQ_AUTARKY),
-        _nil(T.EMS_REQ_SELF_CONSUMPTION),
-        _nil(T.EMS_REQ_BAT_SOC),
-        _nil(T.EMS_REQ_POWER_WB_ALL),
-        _nil(T.EMS_REQ_IS_PV_DERATING),
-        _nil(T.EMS_REQ_AC_POWER_LIMIT),
-        _nil(T.EMS_REQ_STATUS),
-        _nil(T.EMS_REQ_REMAINING_BAT_CHARGE_POWER),
-        _nil(T.EMS_REQ_REMAINING_BAT_DISCHARGE_POWER),
-        _nil(T.EMS_REQ_EMERGENCY_POWER_STATUS),  # 0=NOT_POSSIBLE, 1=ACTIVE, 2=NOT_ACTIVE, 3=NOT_AVAILABLE
+        _nil(RscpTag.EMS_REQ_POWER_PV),
+        _nil(RscpTag.EMS_REQ_POWER_BAT),
+        _nil(RscpTag.EMS_REQ_POWER_HOME),
+        _nil(RscpTag.EMS_REQ_POWER_GRID),
+        _nil(RscpTag.EMS_REQ_POWER_ADD),
+        _nil(RscpTag.EMS_REQ_AUTARKY),
+        _nil(RscpTag.EMS_REQ_SELF_CONSUMPTION),
+        _nil(RscpTag.EMS_REQ_BAT_SOC),
+        _nil(RscpTag.EMS_REQ_POWER_WB_ALL),
+        _nil(RscpTag.EMS_REQ_STATUS),
+        _nil(RscpTag.EMS_REQ_REMAINING_BAT_CHARGE_POWER),
+        _nil(RscpTag.EMS_REQ_REMAINING_BAT_DISCHARGE_POWER),
+        _nil(RscpTag.EMS_REQ_EMERGENCY_POWER_STATUS),  # 0=NOT_POSSIBLE, 1=ACTIVE, 2=NOT_ACTIVE, 3=NOT_AVAILABLE
     ]
 
 
 def _decode_ems_live_response(resp):
-    pv   = _iv(resp, T.EMS_POWER_PV)
-    bat  = _iv(resp, T.EMS_POWER_BAT)
-    home = _iv(resp, T.EMS_POWER_HOME)
-    grid = _fv(resp, T.EMS_POWER_GRID)
-    add_raw = _iv(resp, T.EMS_POWER_ADD)
-    wb   = _iv(resp, T.EMS_POWER_WB_ALL)
-    soc  = _fv(resp, T.EMS_BAT_SOC)
+    pv   = _iv(resp, RscpTag.EMS_POWER_PV)
+    bat  = _iv(resp, RscpTag.EMS_POWER_BAT)
+    home = _iv(resp, RscpTag.EMS_POWER_HOME)
+    grid = _fv(resp, RscpTag.EMS_POWER_GRID)
+    add_item = find_tag(resp, RscpTag.EMS_POWER_ADD)
+    add_value = add_item.get("value") if isinstance(add_item, dict) else None
+    add_valid = bool(
+        isinstance(add_item, dict)
+        and add_item.get("type") not in {RscpType.Nil, RscpType.Container, RscpType.Error}
+        and not isinstance(add_value, bool)
+        and isinstance(add_value, int)
+    )
+    add_raw = int(add_value) if add_valid else 0
+    wb   = _iv(resp, RscpTag.EMS_POWER_WB_ALL)
+    soc  = _fv(resp, RscpTag.EMS_BAT_SOC)
+    remaining_charge_w, remaining_charge_valid = _typed_int_tag(
+        resp,
+        RscpTag.EMS_REMAINING_BAT_CHARGE_POWER,
+    )
+    remaining_discharge_w, remaining_discharge_valid = _typed_int_tag(
+        resp,
+        RscpTag.EMS_REMAINING_BAT_DISCHARGE_POWER,
+    )
 
     # ADD_POWER: negativ = ext. PV-Erzeuger, positiv = Zusatzlast (Heizstab)
-    ext_pv = 0
+    ext_pv = 0 if add_valid else None
     heizstab = 0
-    if add_raw < 0:
+    if add_valid and add_raw < 0:
         ext_pv = abs(add_raw)
         pv += ext_pv   # Gesamte PV-Leistung analog zu E3DC-Control "PV + Ext = Total"
-    elif add_raw > 0:
+    elif add_valid and add_raw > 0:
         heizstab = add_raw
 
     print(f"     PV={pv}W (davon Ext={ext_pv}W)  Bat={bat:+d}W  Home={home}W  Grid={grid:+.0f}W  WB={wb}W  Heizstab={heizstab}W  SOC={soc:.0f}%")
-    print(f"     Autarkie={_fv(resp,T.EMS_AUTARKY):.1f}%  Eigenverbrauch={_fv(resp,T.EMS_SELF_CONSUMPTION):.1f}%  "
-          f"PV-Drosselung={bool(find_tag_value(resp,T.EMS_IS_PV_DERATING))}  AC-Limit={_iv(resp,T.EMS_AC_POWER_LIMIT)}W")
-    print(f"     Verbl.Lade={_iv(resp,T.EMS_REMAINING_BAT_CHARGE_POWER)}W  Verbl.Entlade={_iv(resp,T.EMS_REMAINING_BAT_DISCHARGE_POWER)}W")
+    print(f"     Autarkie={_fv(resp,RscpTag.EMS_AUTARKY):.1f}%  Eigenverbrauch={_fv(resp,RscpTag.EMS_SELF_CONSUMPTION):.1f}%  "
+          "PV-Drosselung=nicht belegt  AC-Limit=nicht belegt")
+    remaining_charge_text = f"{remaining_charge_w}W" if remaining_charge_valid else "nicht verfügbar"
+    remaining_discharge_text = f"{remaining_discharge_w}W" if remaining_discharge_valid else "nicht verfügbar"
+    print(f"     Verbl.Lade={remaining_charge_text}  Verbl.Entlade={remaining_discharge_text}")
     # EMS_STATUS Bitfeld-Dekodierung (aus E3DC RSCP-Doku)
-    status_raw = find_tag_value(resp, T.EMS_STATUS)
+    status_raw = find_tag_value(resp, RscpTag.EMS_STATUS)
     status_val = None if isinstance(status_raw, (list, dict)) else status_raw
     status_bits = {}
     if isinstance(status_val, int):
@@ -536,7 +438,7 @@ def _decode_ems_live_response(resp):
         status_bits = {
             "charge_locked":    bool(sv & (1 << 0)),  # Bit 0: Laden gesperrt
             "discharge_locked": bool(sv & (1 << 1)),  # Bit 1: Entladen gesperrt
-            "emergency_ready":  bool(sv & (1 << 2)),  # Bit 2: Notstrom MOEGLICH (nicht aktiv!)
+            "emergency_ready":  bool(sv & (1 << 2)),  # Bit 2: Notstrom MÖGLICH (nicht aktiv!)
             "weather_charging": bool(sv & (1 << 3)),  # Bit 3: Wetterbas. Laden aktiv
             "derating_active":  bool(sv & (1 << 4)),  # Bit 4: Abregelung aktiv
             "charge_lock_time": bool(sv & (1 << 5)),  # Bit 5: Ladesperrzeit aktiv
@@ -544,21 +446,35 @@ def _decode_ems_live_response(resp):
         }
         active = [k for k, v in status_bits.items() if v]
         print(f"     EMS-Status={sv} ({', '.join(active) if active else 'Normalbetrieb'})")
-    ep_status_raw = find_tag_value(resp, T.EMS_EMERGENCY_POWER_STATUS)
+    ep_status_raw = find_tag_value(resp, RscpTag.EMS_EMERGENCY_POWER_STATUS)
     ep_status = None if isinstance(ep_status_raw, (list, dict)) else ep_status_raw
     ep_names = {0: 'NOT_POSSIBLE', 1: 'ACTIVE', 2: 'NOT_ACTIVE', 3: 'NOT_AVAILABLE'}
     if ep_status is not None:
         print(f"     Notstrom-Status={ep_status} ({ep_names.get(ep_status, '?')})")
     return {
-        "PV_Power": pv, "Ext_PV_Power": ext_pv, "Battery_Power": bat, "Home_Power": home,
+        "PV_Power": pv, "Ext_PV_Power": ext_pv,
+        "Ext_PV_Power_Valid": add_valid,
+        "Ext_PV_Power_Source": "e3dc_add_power" if add_valid else "rscp_missing_or_invalid",
+        "Ext_PV_Power_Age_S": 0.0 if add_valid else None,
+        "Battery_Power": bat, "Home_Power": home,
         "Grid_Power": grid, "Wallbox_Power": wb, "heizstab_power": heizstab,
         "SOC": soc,
-        "autarky_pct": round(_fv(resp, T.EMS_AUTARKY), 1),
-        "self_consumption_pct": round(_fv(resp, T.EMS_SELF_CONSUMPTION), 1),
-        "pv_derating_active": bool(find_tag_value(resp, T.EMS_IS_PV_DERATING)),
-        "ac_power_limit_w": _iv(resp, T.EMS_AC_POWER_LIMIT),
-        "remaining_charge_w": _iv(resp, T.EMS_REMAINING_BAT_CHARGE_POWER),
-        "remaining_discharge_w": _iv(resp, T.EMS_REMAINING_BAT_DISCHARGE_POWER),
+        "autarky_pct": round(_fv(resp, RscpTag.EMS_AUTARKY), 1),
+        "self_consumption_pct": round(_fv(resp, RscpTag.EMS_SELF_CONSUMPTION), 1),
+        "pv_derating_active": None,
+        "pv_derating_active_valid": False,
+        "pv_derating_active_source": "unsupported_unverified",
+        "ac_power_limit_w": None,
+        "ac_power_limit_w_valid": False,
+        "ac_power_limit_w_source": "unsupported_unverified",
+        "remaining_charge_w": remaining_charge_w,
+        "remaining_charge_w_valid": remaining_charge_valid,
+        "remaining_charge_w_source": "rscp_ems_remaining_bat_charge_power" if remaining_charge_valid else "rscp_missing_or_invalid",
+        "remaining_charge_w_age_s": 0.0 if remaining_charge_valid else None,
+        "remaining_discharge_w": remaining_discharge_w,
+        "remaining_discharge_w_valid": remaining_discharge_valid,
+        "remaining_discharge_w_source": "rscp_ems_remaining_bat_discharge_power" if remaining_discharge_valid else "rscp_missing_or_invalid",
+        "remaining_discharge_w_age_s": 0.0 if remaining_discharge_valid else None,
         "ems_status": status_val,
         "ems_emergency_power_status": ep_status,  # 0=NOT_POSSIBLE,1=ACTIVE,2=NOT_ACTIVE,3=N/A
         **{f"ems_{k}": v for k, v in status_bits.items()},
@@ -575,58 +491,91 @@ def get_ems_config(conn):
     """EMS Anlagenparameter: kWp, Abregelung, Lade-Limits."""
     print("  -> EMS Anlagenparameter ...")
     resp = conn.request([
-        _nil(T.EMS_REQ_INSTALLED_PEAK_POWER),
-        _nil(T.EMS_REQ_DERATE_AT_PERCENT_VALUE),
-        _nil(T.EMS_REQ_DERATE_AT_POWER_VALUE),
-        _nil(T.EMS_REQ_EP_RESERVE),
+        _nil(RscpTag.EMS_REQ_INSTALLED_PEAK_POWER),
+        _nil(RscpTag.EMS_REQ_DERATE_AT_PERCENT_VALUE),
+        _nil(RscpTag.EMS_REQ_DERATE_AT_POWER_VALUE),
         # Korrekte GET-Tags! 0x01000101/102 sind SET-Tags -> liefern Fehlercode 7
-        _nil(T.EMS_REQ_USED_CHARGE_LIMIT),
-        _nil(T.EMS_REQ_USER_CHARGE_LIMIT),
-        _nil(T.EMS_REQ_USED_DISCHARGE_LIMIT),
-        _nil(T.EMS_REQ_BAT_CHARGE_LIMIT),
-        _nil(T.EMS_REQ_GET_POWER_SETTINGS),
-        _nil(T.EMS_REQ_BATTERY_TO_CAR_MODE),
-        _nil(T.EMS_REQ_BATTERY_BEFORE_CAR_MODE),
-        _nil(T.EMS_REQ_WB_ENFORCE_POWER_ASSIGNMENT),
-        _nil(T.EMS_REQ_WB_DISCHARGE_BAT_UNTIL),
-        _nil(T.EMS_MANUAL_CHARGE_ACTIVE),
-        _nil(T.EP_REQ_EP_RESERVE),
+        _nil(RscpTag.EMS_REQ_USED_CHARGE_LIMIT),
+        _nil(RscpTag.EMS_REQ_USER_CHARGE_LIMIT),
+        _nil(RscpTag.EMS_REQ_USED_DISCHARGE_LIMIT),
+        _nil(RscpTag.EMS_REQ_BAT_CHARGE_LIMIT),
+        _nil(RscpTag.EMS_REQ_GET_POWER_SETTINGS),
+        _nil(RscpTag.EMS_REQ_BATTERY_TO_CAR_MODE),
+        _nil(RscpTag.EMS_REQ_BATTERY_BEFORE_CAR_MODE),
+        _nil(RscpTag.EMS_REQ_GET_WB_DISCHARGE_BAT_UNTIL),
+        _nil(RscpTag.EMS_MANUAL_CHARGE_ACTIVE),
+        _nil(RscpTag.SE_REQ_EP_RESERVE),
     ])
-    kwp, peak_source = _optional_float(resp, T.EMS_INSTALLED_PEAK_POWER)
+    kwp, peak_source = _optional_float(resp, RscpTag.EMS_INSTALLED_PEAK_POWER)
     peak_valid = kwp is not None and kwp > 0
     if not peak_valid:
         if kwp is not None and kwp <= 0:
             peak_source = "rscp_zero"
         kwp = None
-    derat_frac = _fv(resp, T.EMS_DERATE_AT_PERCENT_VALUE)
+    derat_frac = _fv(resp, RscpTag.EMS_DERATE_AT_PERCENT_VALUE)
     derat_pct  = round(derat_frac * 100, 1)
-    derat_w    = _iv(resp, T.EMS_DERATE_AT_POWER_VALUE)
-    ep         = _fv(resp, T.EMS_EP_RESERVE)
-    used_ch    = _iv(resp, T.EMS_USED_CHARGE_LIMIT)
-    user_ch    = _iv(resp, T.EMS_USER_CHARGE_LIMIT)
-    used_dis   = abs(_iv(resp, T.EMS_USED_DISCHARGE_LIMIT))  # E3DC liefert negativ
-    bat_ch     = _iv(resp, T.EMS_BAT_CHARGE_LIMIT)
-    settings_read = find_tag(resp, T.EMS_GET_POWER_SETTINGS) is not None
-    settings_max_ch = _iv(resp, T.EMS_MAX_CHARGE_POWER)
-    settings_max_dis = _iv(resp, T.EMS_MAX_DISCHARGE_POWER)
-    settings_dis_start = _iv(resp, T.EMS_DISCHARGE_START_POWER)
-    limits_on  = bool(find_tag_value(resp, T.EMS_POWER_LIMITS_USED))
-    weather_ch = bool(find_tag_value(resp, T.EMS_WEATHER_REGULATED_CHARGE))
-    manual_ch  = bool(find_tag_value(resp, T.EMS_MANUAL_CHARGE_ACTIVE))
-    battery_to_car_mode = bool(find_tag_value(resp, T.EMS_BATTERY_TO_CAR_MODE))
-    battery_before_car_mode = bool(find_tag_value(resp, T.EMS_BATTERY_BEFORE_CAR_MODE))
-    wb_enforce_power_assignment = bool(find_tag_value(resp, T.EMS_WB_ENFORCE_POWER_ASSIGNMENT))
-    wb_discharge_bat_until_soc = _fv(resp, T.EMS_WB_DISCHARGE_BAT_UNTIL, 0.0)
-    ep_reserve_pct = _fv(resp, T.EP_PARAM_EP_RESERVE, ep)
-    ep_reserve_energy_wh = _fv(resp, T.EP_PARAM_EP_RESERVE_ENERGY, 0.0)
-    ep_reserve_max_energy_wh = _fv(resp, T.EP_PARAM_EP_RESERVE_MAX_ENERGY, 0.0)
+    derat_w    = _iv(resp, RscpTag.EMS_DERATE_AT_POWER_VALUE)
+    used_ch    = _iv(resp, RscpTag.EMS_USED_CHARGE_LIMIT)
+    user_ch    = _iv(resp, RscpTag.EMS_USER_CHARGE_LIMIT)
+    used_dis   = abs(_iv(resp, RscpTag.EMS_USED_DISCHARGE_LIMIT))  # E3DC liefert negativ
+    bat_ch     = _iv(resp, RscpTag.EMS_BAT_CHARGE_LIMIT)
+    settings_read = find_tag(resp, RscpTag.EMS_GET_POWER_SETTINGS) is not None
+    settings_limits_item = find_tag(resp, RscpTag.EMS_POWER_LIMITS_USED)
+    settings_max_ch_item = find_tag(resp, RscpTag.EMS_MAX_CHARGE_POWER)
+    settings_max_dis_item = find_tag(resp, RscpTag.EMS_MAX_DISCHARGE_POWER)
+    settings_dis_start_item = find_tag(resp, RscpTag.EMS_DISCHARGE_START_POWER)
+    settings_valid = bool(
+        settings_read
+        and isinstance(settings_limits_item, dict)
+        and settings_limits_item.get("type") != RscpType.Error
+        and isinstance(settings_limits_item.get("value"), bool)
+        and all(
+            isinstance(item, dict)
+            and item.get("type") != RscpType.Error
+            and isinstance(item.get("value"), int)
+            and not isinstance(item.get("value"), bool)
+            and int(item.get("value")) >= 0
+            for item in (
+                settings_max_ch_item,
+                settings_max_dis_item,
+                settings_dis_start_item,
+            )
+        )
+    )
+    settings_max_ch = _iv(resp, RscpTag.EMS_MAX_CHARGE_POWER)
+    settings_max_dis = _iv(resp, RscpTag.EMS_MAX_DISCHARGE_POWER)
+    settings_dis_start = _iv(resp, RscpTag.EMS_DISCHARGE_START_POWER)
+    limits_on  = bool(find_tag_value(resp, RscpTag.EMS_POWER_LIMITS_USED))
+    weather_ch = bool(find_tag_value(resp, RscpTag.EMS_WEATHER_REGULATED_CHARGE_ENABLED))
+    manual_ch  = bool(find_tag_value(resp, RscpTag.EMS_MANUAL_CHARGE_ACTIVE))
+    battery_to_car_mode = bool(find_tag_value(resp, RscpTag.EMS_BATTERY_TO_CAR_MODE))
+    battery_before_car_mode = bool(find_tag_value(resp, RscpTag.EMS_BATTERY_BEFORE_CAR_MODE))
+    wb_floor_tag = find_tag(resp, RscpTag.EMS_GET_WB_DISCHARGE_BAT_UNTIL)
+    wb_floor_raw = wb_floor_tag.get("value") if wb_floor_tag else None
+    wb_floor_type = wb_floor_tag.get("type") if wb_floor_tag else None
+    wb_floor_valid = (
+        wb_floor_type != RscpType.Error
+        and isinstance(wb_floor_raw, int)
+        and not isinstance(wb_floor_raw, bool)
+        and 0 <= wb_floor_raw <= 100
+    )
+    wb_discharge_bat_until_soc = int(wb_floor_raw) if wb_floor_valid else None
+    wb_floor_reason = "ok" if wb_floor_valid else (
+        "missing" if wb_floor_tag is None else "invalid_type_or_range"
+    )
+    ep_reserve_raw, ep_reserve_source = _optional_float(resp, RscpTag.SE_PARAM_EP_RESERVE)
+    ep_reserve_valid = ep_reserve_raw is not None and 0 <= ep_reserve_raw <= 100
+    ep_reserve_pct = ep_reserve_raw if ep_reserve_valid else None
+    ep_reserve_energy_wh = _fv(resp, RscpTag.SE_PARAM_EP_RESERVE_W, 0.0)
+    ep_reserve_max_energy_wh = _fv(resp, RscpTag.SE_PARAM_EP_RESERVE_MAX_W, 0.0)
 
     peak_label = (
         f"{kwp:.0f}Wp ({kwp/1000:.1f}kWp)"
         if peak_valid
-        else f"nicht verfuegbar ({peak_source})"
+        else f"nicht verfügbar ({peak_source})"
     )
-    print(f"     Installiert={peak_label}  Abregelung={derat_pct}% ({derat_w}W)  Notstrom={ep:.2f}%")
+    ep_label = f"{ep_reserve_pct:.2f}%" if ep_reserve_valid else "nicht verfügbar"
+    print(f"     Installiert={peak_label}  Abregelung={derat_pct}% ({derat_w}W)  Notstrom={ep_label}")
     if ep_reserve_energy_wh > 0 or ep_reserve_max_energy_wh > 0:
         print(
             f"     EP-Reserve: raw={ep_reserve_pct:.2f}%  "
@@ -637,8 +586,8 @@ def get_ems_config(conn):
     print(
         f"     E3DC-Wallbox: Batterie->Auto={battery_to_car_mode}  "
         f"Batterie-vor-Auto={battery_before_car_mode}  "
-        f"WB-Zuordnung-erzwingen={wb_enforce_power_assignment}  "
-        f"Akku-bis-SoC={wb_discharge_bat_until_soc:.1f}%"
+        "WB-Zuordnung-erzwingen=nicht belegt  "
+        f"Akku-bis-SoC={wb_discharge_bat_until_soc if wb_floor_valid else 'unbekannt'}"
     )
     if settings_read:
         print(
@@ -653,20 +602,28 @@ def get_ems_config(conn):
         "installed_peak_power_source": peak_source,
         "derate_at_percent": derat_pct,
         "derate_at_power_w": derat_w,
-        "ep_reserve_pct": round(ep_reserve_pct, 2),
-        "ep_reserve_raw_pct": round(ep_reserve_pct, 2),
+        "ep_reserve_pct": round(ep_reserve_pct, 2) if ep_reserve_valid else None,
+        "ep_reserve_raw_pct": round(ep_reserve_pct, 2) if ep_reserve_valid else None,
+        "ep_reserve_valid": bool(ep_reserve_valid),
+        "ep_reserve_source": ep_reserve_source,
         "ep_reserve_energy_wh": round(ep_reserve_energy_wh, 1),
         "ep_reserve_max_energy_wh": round(ep_reserve_max_energy_wh, 1),
         "e3dc_battery_to_car_mode": bool(battery_to_car_mode),
         "e3dc_battery_before_car_mode": bool(battery_before_car_mode),
-        "e3dc_wb_enforce_power_assignment": bool(wb_enforce_power_assignment),
-        "e3dc_wb_discharge_bat_until_soc": round(wb_discharge_bat_until_soc, 2),
+        "e3dc_wb_enforce_power_assignment": None,
+        "e3dc_wb_enforce_power_assignment_valid": False,
+        "e3dc_wb_enforce_power_assignment_source": "unsupported_unverified",
+        "e3dc_wb_discharge_bat_until_soc": wb_discharge_bat_until_soc,
+        "e3dc_wb_discharge_bat_until_soc_valid": bool(wb_floor_valid),
+        "e3dc_wb_discharge_bat_until_soc_source": "rscp_provisional_read_only",
+        "e3dc_wb_discharge_bat_until_soc_reason": wb_floor_reason,
         "used_charge_limit_w": used_ch,
         "user_charge_limit_w": user_ch,
         "bat_charge_limit_w": bat_ch,
         "used_discharge_limit_w": used_dis,
         "power_limits_active": limits_on,
         "ems_power_settings_read": settings_read,
+        "ems_power_settings_valid": settings_valid,
         "ems_max_charge_power_w": settings_max_ch,
         "ems_max_discharge_power_w": settings_max_dis,
         "ems_discharge_start_power_w": settings_dis_start,
@@ -676,24 +633,24 @@ def get_ems_config(conn):
 
 
 def get_db_history(conn):
-    """Tagesertraege via DB-History (Uint64-Timestamps, KEIN Timestamp-Typ!)."""
+    """Tageserträge über DB-History (Uint64-Zeitstempel, KEIN Timestamp-Typ!)."""
     print("  -> DB-History Tagesbilanz ...")
     midnight = _today_midnight_ts()
     print(f"     Mitternacht-TS={midnight}  ({time.strftime('%Y-%m-%d %H:%M', time.localtime(midnight))})")
 
     # Versuch 1: INTERVAL=86400 (Tages-Bucket)
-    resp = conn.request([_container(T.DB_REQ_HISTORY_DATA_DAY, [
-        _uint64(T.DB_REQ_HISTORY_TIME_START,    midnight),
-        _uint64(T.DB_REQ_HISTORY_TIME_INTERVAL, 86400),
-        _uint64(T.DB_REQ_HISTORY_TIME_SPAN,     86400),
+    resp = conn.request([_container(RscpTag.DB_REQ_HISTORY_DATA_DAY, [
+        _uint64(RscpTag.DB_REQ_HISTORY_TIME_START,    midnight),
+        _uint64(RscpTag.DB_REQ_HISTORY_TIME_INTERVAL, 86400),
+        _uint64(RscpTag.DB_REQ_HISTORY_TIME_SPAN,     86400),
     ])])
 
-    hist = find_tag(resp, T.DB_HISTORY_DATA_DAY)
+    hist = find_tag(resp, RscpTag.DB_HISTORY_DATA_DAY)
     summ = None
     if hist and isinstance(hist.get('value'), list):
         tags_found = [f"0x{item.get('tag',0):08X}" for item in hist['value']]
         print(f"     DB-Antwort-Tags: {tags_found}")
-        summ = find_tag(hist['value'], T.DB_SUM_CONTAINER)
+        summ = find_tag(hist['value'], RscpTag.DB_SUM_CONTAINER)
         if summ is None:
             print("     [Hinweis] Kein SUM-Container - summiere alle Buckets")
             agg = {}
@@ -708,7 +665,7 @@ def get_db_history(conn):
                             except (TypeError, ValueError):
                                 pass
             if agg:
-                summ = {'tag': T.DB_SUM_CONTAINER, 'type': 0x0E,
+                summ = {'tag': RscpTag.DB_SUM_CONTAINER, 'type': 0x0E,
                         'value': [{'tag': t, 'type': 0x09, 'value': v}
                                   for t, v in agg.items()]}
     else:
@@ -716,44 +673,70 @@ def get_db_history(conn):
         top_tags = [f"0x{item.get('tag',0):08X}" for item in resp] if resp else []
         print(f"     [!] DB_HISTORY_DATA_DAY nicht gefunden. Antwort-Tags: {top_tags}")
 
-    def _kwh(tag):
-        # DB-Werte sind in Wh (nicht Ws)! Daher /1000 fuer kWh.
+    def _read_kwh(tag):
+        # DB-Werte sind in Wh (nicht Ws)! Daher /1000 für kWh.
         # Beleg: vi=7200 Wh = 7.2 kWh (plausibel) vs 7200 Ws = 2 Wh (unrealistisch)
         if summ and isinstance(summ.get('value'), list):
-            v = find_tag_value(summ['value'], tag)
-            if v is not None:
-                try:
-                    vf = float(v)
-                    if vf > 0 and int(vf) != 0xFFFFFFFF:
-                        return round(vf / 1000.0, 3)  # Wh -> kWh
-                except (TypeError, ValueError):
-                    pass
-        return 0.0
+            item = find_tag(summ['value'], tag)
+            if not isinstance(item, dict) or item.get('value') is None:
+                return None, False, "rscp_db_history_missing"
+            try:
+                vf = float(item.get('value'))
+            except (TypeError, ValueError):
+                return None, False, "rscp_db_history_invalid_type"
+            if not math.isfinite(vf):
+                return None, False, "rscp_db_history_non_finite"
+            if int(vf) == 0xFFFFFFFF:
+                return None, False, "rscp_db_history_invalid_sentinel"
+            if vf < 0.0:
+                return None, False, "rscp_db_history_negative_counter"
+            return round(vf / 1000.0, 3), True, "rscp_db_history_day"
+        return None, False, "rscp_db_history_unavailable"
 
-    pv_kwh = _kwh(T.DB_DC_POWER)
+    def _legacy_optional_kwh(tag):
+        value, valid, _source = _read_kwh(tag)
+        return value if valid else 0.0
+
+    energy_values = {}
+    for key, tag in (
+        ("PV_Energy", RscpTag.DB_DC_POWER),
+        ("Grid_In_Energy", RscpTag.DB_GRID_POWER_OUT),
+        ("Grid_Out_Energy", RscpTag.DB_GRID_POWER_IN),
+        ("Bat_In_Energy", RscpTag.DB_BAT_POWER_IN),
+        ("Bat_Out_Energy", RscpTag.DB_BAT_POWER_OUT),
+        ("Home_Energy", RscpTag.DB_CONSUMPTION),
+    ):
+        energy_values[key] = _read_kwh(tag)
+
+    pv_kwh, pv_valid, pv_source = energy_values["PV_Energy"]
     # ACHTUNG: E3DC benennt Tags aus Haus-Perspektive:
     # DB_GRID_POWER_IN  = Energie ins Haus = Netzbezug (Grid_In)
     # DB_GRID_POWER_OUT = Energie ins Grid = Einspeisung (Grid_Out)
-    gi_kwh = _kwh(T.DB_GRID_POWER_IN)    # Netzbezug
-    go_kwh = _kwh(T.DB_GRID_POWER_OUT)   # Einspeisung
-    bi_kwh = _kwh(T.DB_BAT_POWER_IN)
-    bo_kwh = _kwh(T.DB_BAT_POWER_OUT)
-    hm_kwh = _kwh(T.DB_CONSUMPTION)
-    wb_kwh = _kwh(T.DB_WB_ALL_POWER)
-    pm0_kwh = _kwh(T.DB_PM_0_POWER)
-    pm1_kwh = _kwh(T.DB_PM_1_POWER)
-    
+    gi_kwh, gi_valid, gi_source = energy_values["Grid_In_Energy"]
+    go_kwh, go_valid, go_source = energy_values["Grid_Out_Energy"]
+    bi_kwh, bi_valid, bi_source = energy_values["Bat_In_Energy"]
+    bo_kwh, bo_valid, bo_source = energy_values["Bat_Out_Energy"]
+    hm_kwh, hm_valid, hm_source = energy_values["Home_Energy"]
+    wb_kwh = None
+    pm0_kwh = _legacy_optional_kwh(RscpTag.DB_PM_0_POWER)
+    pm1_kwh = _legacy_optional_kwh(RscpTag.DB_PM_1_POWER)
+
     # Externe Erzeuger zum PV-Feld addieren
     ext_pv_kwh = round(pm0_kwh + pm1_kwh, 3)
-    if ext_pv_kwh > 0:
+    if ext_pv_kwh > 0 and pv_valid:
         pv_kwh = round(pv_kwh + ext_pv_kwh, 3)
 
     ok = "[OK]" if summ else "[!] Leer"
-    print(f"     PV={pv_kwh}kWh (inkl. Ext={ext_pv_kwh}kWh)  GridIn={gi_kwh}kWh  GridOut={go_kwh}kWh  BatIn={bi_kwh}kWh  BatOut={bo_kwh}kWh  {ok}")
-    print(f"     Home={hm_kwh}kWh  Wallbox={wb_kwh}kWh")
+    def _display(value):
+        return f"{value}kWh" if value is not None else "n/a"
+
+    print(f"     PV={_display(pv_kwh)} (inkl. Ext={ext_pv_kwh}kWh)  "
+          f"GridIn={_display(gi_kwh)}  GridOut={_display(go_kwh)}  "
+          f"BatIn={_display(bi_kwh)}  BatOut={_display(bo_kwh)}  {ok}")
+    print(f"     Home={_display(hm_kwh)}  Wallbox=nicht belegt")
 
     # -------------------------------------------------------------------------
-    # PLAUSIBILITAETS-CHECKS: DB-History Sanity (erkennt Tag-Tausch & Vorzeichenfehler)
+    # PLAUSIBILITÄTSPRÜFUNGEN: DB-Historie prüfen (erkennt Tag-Tausch und Vorzeichenfehler)
     # Konventionen (Live-Werte aus EMS_POWER_*):
     #   Grid_Power  < 0 = Einspeisung    -> go_kwh sollte > gi_kwh sein
     #   Grid_Power  > 0 = Netzbezug      -> gi_kwh sollte > go_kwh sein
@@ -761,7 +744,7 @@ def get_db_history(conn):
     #   Battery_Power < 0 = Ladung       -> bi_kwh sollte > bo_kwh sein
     # -------------------------------------------------------------------------
     try:
-        # Aktuelle Live-Werte fuer Kontext-Vergleich lesen (aus Ramdisk)
+        # Aktuelle Live-Werte für den Kontextvergleich lesen (aus der Ramdisk)
         import os, json as _json
         _live_path = "/var/www/html/ramdisk/live_data_py.json"
         _live = {}
@@ -777,41 +760,64 @@ def get_db_history(conn):
         _home_live = float(_live.get("Home_Power", 0) or 0)
 
         # --- GRID: Tag-Tausch-Erkennung ---
-        # Wenn den ganzen Tag stark eingespeist wird, muss go_kwh deutlich groesser sein
-        if _grid_live < -500 and gi_kwh > 0.5 and gi_kwh > go_kwh * 2:
+        # Wenn den ganzen Tag stark eingespeist wird, muss go_kwh deutlich größer sein
+        if gi_valid and go_valid and _grid_live < -500 and gi_kwh > 0.5 and gi_kwh > go_kwh * 2:
             print(f"[!] PLAUSIBEL-CHECK Grid: Einspeisung aktiv ({_grid_live:.0f}W) aber "
-                  f"gi_kwh={gi_kwh:.3f} > go_kwh={go_kwh:.3f} -- moeglicher Tag-Tausch!")
+                  f"gi_kwh={gi_kwh:.3f} > go_kwh={go_kwh:.3f} -- möglicher Tag-Tausch!")
         # Umgekehrt: Netzbezug aktiv aber go_kwh wächst stärker
-        if _grid_live > 500 and go_kwh > 0.5 and go_kwh > gi_kwh * 2:
+        if gi_valid and go_valid and _grid_live > 500 and go_kwh > 0.5 and go_kwh > gi_kwh * 2:
             print(f"[!] PLAUSIBEL-CHECK Grid: Netzbezug aktiv ({_grid_live:.0f}W) aber "
-                  f"go_kwh={go_kwh:.3f} > gi_kwh={gi_kwh:.3f} -- moeglicher Tag-Tausch!")
+                  f"go_kwh={go_kwh:.3f} > gi_kwh={gi_kwh:.3f} -- möglicher Tag-Tausch!")
 
         # --- BATTERIE: Tag-Tausch-Erkennung ---
-        # Battery_Power > 0 = Entladung -> bo_kwh sollte groesser sein
-        if _bat_live > 500 and bi_kwh > 0.5 and bi_kwh > bo_kwh * 2:
+        # Battery_Power > 0 = Entladung -> bo_kwh sollte größer sein
+        if bi_valid and bo_valid and _bat_live > 500 and bi_kwh > 0.5 and bi_kwh > bo_kwh * 2:
             print(f"[!] PLAUSIBEL-CHECK Bat: Entladung aktiv ({_bat_live:.0f}W) aber "
-                  f"bi_kwh={bi_kwh:.3f} > bo_kwh={bo_kwh:.3f} -- moeglicher Tag-Tausch!")
-        # Battery_Power < 0 = Ladung -> bi_kwh sollte groesser sein
-        if _bat_live < -500 and bo_kwh > 0.5 and bo_kwh > bi_kwh * 2:
+                  f"bi_kwh={bi_kwh:.3f} > bo_kwh={bo_kwh:.3f} -- möglicher Tag-Tausch!")
+        # Battery_Power < 0 = Ladung -> bi_kwh sollte größer sein
+        if bi_valid and bo_valid and _bat_live < -500 and bo_kwh > 0.5 and bo_kwh > bi_kwh * 2:
             print(f"[!] PLAUSIBEL-CHECK Bat: Ladung aktiv ({_bat_live:.0f}W) aber "
-                  f"bo_kwh={bo_kwh:.3f} > bi_kwh={bi_kwh:.3f} -- moeglicher Tag-Tausch!")
+                  f"bo_kwh={bo_kwh:.3f} > bi_kwh={bi_kwh:.3f} -- möglicher Tag-Tausch!")
 
         # --- HAUSVERBRAUCH: Negativer Wert (z.B. Balkonkraftwerk) ---
         # DB_CONSUMPTION kann negativ werden wenn ein Balkonkraftwerk mehr erzeugt
-        # als der Haushalt verbraucht UND E3DC das als "Rueckspeisung ins Haus" sieht.
-        if hm_kwh < -0.1:
+        # als der Haushalt verbraucht UND E3DC das als "Rückspeisung ins Haus" sieht.
+        if hm_valid and hm_kwh < -0.1:
             print(f"[!] PLAUSIBEL-CHECK Home: hm_kwh={hm_kwh:.3f}kWh negativ! "
-                  f"Balkonkraftwerk oder externer Erzeuger koennte DB_CONSUMPTION verfaelschen.")
+                  f"Balkonkraftwerk oder externer Erzeuger könnte DB_CONSUMPTION verfälschen.")
 
         # --- PV: Niemals negativ ---
-        if pv_kwh < -0.05:
+        if pv_valid and pv_kwh < -0.05:
             print(f"[!] PLAUSIBEL-CHECK PV: pv_kwh={pv_kwh:.3f}kWh negativ -- DB-Fehler oder falscher Tag!")
 
-        # --- ENERGIEBILANZ: Grobe Konsistenzpruefung ---
+        # --- ENERGIEBILANZ: Grobe Konsistenzprüfung ---
         # PV + gi_kwh + bo_kwh ~ hm_kwh + go_kwh + bi_kwh + wb_kwh (Energieerhaltung)
-        if pv_kwh > 0.5 and hm_kwh > 0:
-            _erzeugung = pv_kwh + gi_kwh + bo_kwh
-            _verbrauch = hm_kwh + go_kwh + bi_kwh + wb_kwh
+        _balance_preview = calculate_energy_balance_metrics({
+            "PV_Energy_kWh": pv_kwh,
+            "PV_Energy_Valid": pv_valid,
+            "PV_Energy_Source": pv_source,
+            "Grid_In_Energy_kWh": gi_kwh,
+            "Grid_In_Energy_Valid": gi_valid,
+            "Grid_In_Energy_Source": gi_source,
+            "Grid_Out_Energy_kWh": go_kwh,
+            "Grid_Out_Energy_Valid": go_valid,
+            "Grid_Out_Energy_Source": go_source,
+            "Bat_In_Energy_kWh": bi_kwh,
+            "Bat_In_Energy_Valid": bi_valid,
+            "Bat_In_Energy_Source": bi_source,
+            "Bat_Out_Energy_kWh": bo_kwh,
+            "Bat_Out_Energy_Valid": bo_valid,
+            "Bat_Out_Energy_Source": bo_source,
+            "Home_Energy_kWh": hm_kwh,
+            "Home_Energy_Valid": hm_valid,
+            "Home_Energy_Source": hm_source,
+            "Wallbox_Energy_kWh": wb_kwh,
+            "Wallbox_Energy_Valid": False,
+            "Wallbox_Energy_Source": "unsupported_unverified",
+        })
+        if _balance_preview["sys_energy_balance_valid"] and pv_kwh > 0.5 and hm_kwh > 0:
+            _erzeugung = _balance_preview["sys_energy_supply_kwh"]
+            _verbrauch = _balance_preview["sys_energy_demand_kwh"]
             _bilanz_err = abs(_erzeugung - _verbrauch)
             if _bilanz_err > max(3.0, _erzeugung * 0.30):  # >30% Abweichung oder >3kWh
                 print(f"[!] PLAUSIBEL-CHECK Bilanz: Erzeugung={_erzeugung:.2f}kWh "
@@ -824,11 +830,21 @@ def get_db_history(conn):
 
     return {
         "PV_Energy_kWh": pv_kwh,
+        "PV_Energy_Valid": pv_valid,
+        "PV_Energy_Source": pv_source,
         "Ext_PV_Energy_kWh": ext_pv_kwh,
         "Grid_In_Energy_kWh": gi_kwh, "Grid_Out_Energy_kWh": go_kwh,
+        "Grid_In_Energy_Valid": gi_valid, "Grid_Out_Energy_Valid": go_valid,
+        "Grid_In_Energy_Source": gi_source, "Grid_Out_Energy_Source": go_source,
         "Bat_In_Energy_kWh": bi_kwh, "Bat_Out_Energy_kWh": bo_kwh,
+        "Bat_In_Energy_Valid": bi_valid, "Bat_Out_Energy_Valid": bo_valid,
+        "Bat_In_Energy_Source": bi_source, "Bat_Out_Energy_Source": bo_source,
         "Home_Energy_kWh": hm_kwh,
+        "Home_Energy_Valid": hm_valid,
+        "Home_Energy_Source": hm_source,
         "Wallbox_Energy_kWh": wb_kwh,
+        "Wallbox_Energy_Valid": False,
+        "Wallbox_Energy_Source": "unsupported_unverified",
         "_db_midnight_ts": midnight,
         "_db_sum_ok": summ is not None,
     }
@@ -841,54 +857,54 @@ def get_pvi(conn):
     Korrekte Tags: 0x020DC... (REQ) / 0x028DC... (RESP)
                    0x020AC... (REQ) / 0x028AC... (RESP)
 
-    Messrauschen: Der E3DC PVI-Wechselrichter hat eine Leistungsaufloesung
+    Messrauschen: Der E3DC-PVI-Wechselrichter hat eine Leistungsauflösung
     von ca. 6W. Leistungswerte innerhalb +/-PVI_NOISE_THRESHOLD_W werden
     auf Null geclamprt, da sie physikalisch bedeutungslos sind (inaktive Phasen
     oder Ruhestand liefern -1W bis +2W Rauschen).
     """
-    PVI_NOISE_THRESHOLD_W = 5  # W - Rausch-Schwelle (PVI Aufloesung ~6W)
+    PVI_NOISE_THRESHOLD_W = 5  # W - Rauschschwelle (PVI-Auflösung ~6 W)
 
     print("  -> PVI DC-Strings + AC-Phasen ...")
     result = {}
 
     # Zuerst: Anzahl DC-Strings und AC-Phasen ermitteln
-    info_req = [_container(T.PVI_REQ_DATA, [
-        _uint16(T.PVI_INDEX, 0),
-        _nil(T.PVI_REQ_DC_MAX_STRING_COUNT),
-        _nil(T.PVI_REQ_AC_MAX_PHASE_COUNT),
-        _nil(T.PVI_REQ_TEMPERATURE),
-        _nil(T.PVI_REQ_AC_FREQUENCY),
+    info_req = [_container(RscpTag.PVI_REQ_DATA, [
+        _uint16(RscpTag.PVI_INDEX, 0),
+        _nil(RscpTag.PVI_REQ_DC_MAX_STRING_COUNT),
+        _nil(RscpTag.PVI_REQ_AC_MAX_PHASE_COUNT),
+        _nil(RscpTag.PVI_REQ_TEMPERATURE),
     ])]
     info_resp = conn.request(info_req)
-    pvi_data = find_tag(info_resp, T.PVI_DATA)
+    pvi_data = find_tag(info_resp, RscpTag.PVI_DATA)
     pd = pvi_data['value'] if pvi_data and isinstance(pvi_data.get('value'), list) else []
 
     dc_count = _iv({'items': pd}, 0) or 2  # Fallback 2 Strings
-    dc_count_tag = find_tag(pd, T.PVI_DC_MAX_STRING_COUNT)
+    dc_count_tag = find_tag(pd, RscpTag.PVI_DC_MAX_STRING_COUNT)
     if dc_count_tag:
         dc_count = int(dc_count_tag.get('value') or 2)
 
-    ac_count_tag = find_tag(pd, T.PVI_AC_MAX_PHASE_COUNT)
+    ac_count_tag = find_tag(pd, RscpTag.PVI_AC_MAX_PHASE_COUNT)
     ac_count = int(ac_count_tag.get('value') or 3) if ac_count_tag else 3
 
-    temp_tag = find_tag(pd, T.PVI_TEMPERATURE)
-    freq_tag = find_tag(pd, T.PVI_AC_FREQUENCY)
+    temp_tag = find_tag(pd, RscpTag.PVI_TEMPERATURE)
     result["pvi_temperature_c"] = round(_float_in_container(temp_tag), 1)
-    result["pvi_frequency_hz"]  = round(_float_in_container(freq_tag), 2)
+    result["pvi_frequency_hz"] = None
+    result["pvi_frequency_valid"] = False
+    result["pvi_frequency_source"] = "unsupported_unverified"
 
-    print(f"     PVI: {dc_count} DC-Strings, {ac_count} AC-Phasen, T={result['pvi_temperature_c']:.1f}C, f={result['pvi_frequency_hz']:.2f}Hz")
+    print(f"     PVI: {dc_count} DC-Strings, {ac_count} AC-Phasen, T={result['pvi_temperature_c']:.1f}C, f=nicht belegt")
 
     # DC-Strings einzeln abfragen
     for s in range(dc_count):
-        dc_req = [_container(T.PVI_REQ_DATA, [
-            _uint16(T.PVI_INDEX, 0),
-            _uint16(T.PVI_REQ_DC_POWER,   s),
-            _uint16(T.PVI_REQ_DC_VOLTAGE,  s),
-            _uint16(T.PVI_REQ_DC_CURRENT,  s),
-            _uint16(T.PVI_REQ_DC_MAX_POWER, s),
+        dc_req = [_container(RscpTag.PVI_REQ_DATA, [
+            _uint16(RscpTag.PVI_INDEX, 0),
+            _uint16(RscpTag.PVI_REQ_DC_POWER,   s),
+            _uint16(RscpTag.PVI_REQ_DC_VOLTAGE,  s),
+            _uint16(RscpTag.PVI_REQ_DC_CURRENT,  s),
+            _uint16(RscpTag.PVI_REQ_DC_MAX_POWER, s),
         ])]
         dc_resp = conn.request(dc_req)
-        dpd = find_tag(dc_resp, T.PVI_DATA)
+        dpd = find_tag(dc_resp, RscpTag.PVI_DATA)
         dv = dpd['value'] if dpd and isinstance(dpd.get('value'), list) else []
 
         def _dc_float(tag):
@@ -899,10 +915,10 @@ def get_pvi(conn):
                         return round(float(sub.get('value') or 0), 2)
             return 0.0
 
-        w = _dc_float(T.PVI_DC_POWER)
-        v = _dc_float(T.PVI_DC_VOLTAGE)
-        a = _dc_float(T.PVI_DC_CURRENT)
-        mp = _dc_float(T.PVI_DC_MAX_POWER)
+        w = _dc_float(RscpTag.PVI_DC_POWER)
+        v = _dc_float(RscpTag.PVI_DC_VOLTAGE)
+        a = _dc_float(RscpTag.PVI_DC_CURRENT)
+        mp = _dc_float(RscpTag.PVI_DC_MAX_POWER)
         # Rausch-Clamping: DC-Leistung unter Schwelle -> 0 (inaktiver String)
         w = 0.0 if abs(w) < PVI_NOISE_THRESHOLD_W else w
         print(f"     DC{s}: {w}W / {v}V / {a}A  (Max={mp}W)")
@@ -913,14 +929,14 @@ def get_pvi(conn):
 
     # AC-Phasen einzeln abfragen
     for p in range(ac_count):
-        ac_req = [_container(T.PVI_REQ_DATA, [
-            _uint16(T.PVI_INDEX, 0),
-            _uint16(T.PVI_REQ_AC_POWER,   p),
-            _uint16(T.PVI_REQ_AC_VOLTAGE,  p),
-            _uint16(T.PVI_REQ_AC_CURRENT,  p),
+        ac_req = [_container(RscpTag.PVI_REQ_DATA, [
+            _uint16(RscpTag.PVI_INDEX, 0),
+            _uint16(RscpTag.PVI_REQ_AC_POWER,   p),
+            _uint16(RscpTag.PVI_REQ_AC_VOLTAGE,  p),
+            _uint16(RscpTag.PVI_REQ_AC_CURRENT,  p),
         ])]
         ac_resp = conn.request(ac_req)
-        apd = find_tag(ac_resp, T.PVI_DATA)
+        apd = find_tag(ac_resp, RscpTag.PVI_DATA)
         av = apd['value'] if apd and isinstance(apd.get('value'), list) else []
 
         def _ac_float(tag):
@@ -931,9 +947,9 @@ def get_pvi(conn):
                         return round(float(sub.get('value') or 0), 2)
             return 0.0
 
-        w = _ac_float(T.PVI_AC_POWER)
-        v = _ac_float(T.PVI_AC_VOLTAGE)
-        a = _ac_float(T.PVI_AC_CURRENT)
+        w = _ac_float(RscpTag.PVI_AC_POWER)
+        v = _ac_float(RscpTag.PVI_AC_VOLTAGE)
+        a = _ac_float(RscpTag.PVI_AC_CURRENT)
         # Rausch-Clamping: AC-Leistung unter Schwelle -> 0 (inaktive Phase / Messrauschen)
         # Hintergrund: Eine inaktive Phase (DC-Kopplung -> nur Phase 0 aktiv)
         # liefert typisch -1W bis +2W. Schwelle 5W sicher unter echter Last.
@@ -967,22 +983,22 @@ def _pm_candidates(cfg=None):
 
 
 def _pm_request_item(idx):
-    return _container(T.PM_REQ_DATA, [
-        _uint16(T.PM_INDEX, idx),
-        _nil(T.PM_REQ_POWER_L1),
-        _nil(T.PM_REQ_POWER_L2),
-        _nil(T.PM_REQ_POWER_L3),
+    return _container(RscpTag.PM_REQ_DATA, [
+        _uint16(RscpTag.PM_INDEX, idx),
+        _nil(RscpTag.PM_REQ_POWER_L1),
+        _nil(RscpTag.PM_REQ_POWER_L2),
+        _nil(RscpTag.PM_REQ_POWER_L3),
     ])
 
 
 def _decode_pm_response(resp, idx, configured_index):
-    pm_data = find_tag(resp, T.PM_DATA)
+    pm_data = find_tag(resp, RscpTag.PM_DATA)
     if not (pm_data and isinstance(pm_data.get('value'), list)):
         return {}
     pd = pm_data['value']
-    p1 = round(float(find_tag_value(pd, T.PM_POWER_L1) or 0), 1)
-    p2 = round(float(find_tag_value(pd, T.PM_POWER_L2) or 0), 1)
-    p3 = round(float(find_tag_value(pd, T.PM_POWER_L3) or 0), 1)
+    p1 = round(float(find_tag_value(pd, RscpTag.PM_POWER_L1) or 0), 1)
+    p2 = round(float(find_tag_value(pd, RscpTag.PM_POWER_L2) or 0), 1)
+    p3 = round(float(find_tag_value(pd, RscpTag.PM_POWER_L3) or 0), 1)
     available = abs(p1) + abs(p2) + abs(p3) > 0.1
     phase_values = (p1, p2, p3) if available else (None, None, None)
     return {
@@ -1019,7 +1035,7 @@ def get_pm(conn, cfg=None):
     raw_configured_index, configured_index, candidates = _pm_candidates(cfg)
     if raw_configured_index > 65535:
         print(
-            f"     Wurzelzaehler {raw_configured_index} ist Seriennummer, kein PM-Index; "
+            f"     Wurzelzähler {raw_configured_index} ist eine Seriennummer, kein PM-Index; "
             f"nutze Auto-Suche 0..{PM_AUTO_PROBE_LAST_INDEX}."
         )
     best = {}
@@ -1040,12 +1056,12 @@ def get_pm(conn, cfg=None):
 
 
 def get_power_snapshot(conn, cfg=None):
-    """Read EMS live powers and root meter phases in one RSCP request when possible."""
+    """Liest EMS-Liveleistungen und Wurzelzählerphasen möglichst in einer RSCP-Anfrage."""
     print("  -> EMS Live-Leistungen + PM Netzphasen ...")
     raw_configured_index, configured_index, candidates = _pm_candidates(cfg)
     if raw_configured_index > 65535:
         print(
-            f"     Wurzelzaehler {raw_configured_index} ist Seriennummer, kein PM-Index; "
+            f"     Wurzelzähler {raw_configured_index} ist eine Seriennummer, kein PM-Index; "
             f"nutze Auto-Suche 0..{PM_AUTO_PROBE_LAST_INDEX}."
         )
     last_response = None
@@ -1094,7 +1110,7 @@ def get_power_snapshot(conn, cfg=None):
 
 
 def _normalise_bat_capacity(cap_kwh, fcc_kwh, dcb_count=1, specified_wh=None):
-    """Return system-level battery capacities from mixed E3DC BAT responses."""
+    """Liefert systemweite Batteriekapazitäten aus gemischten E3DC-BAT-Antworten."""
     cap = round(float(cap_kwh or 0.0), 2)
     fcc = round(float(fcc_kwh or 0.0), 2)
     packs = max(1, int(dcb_count or 1))
@@ -1126,11 +1142,11 @@ def _normalise_bat_capacity(cap_kwh, fcc_kwh, dcb_count=1, specified_wh=None):
 
 
 def _normalise_bat_capacity_from_rscp(cap_raw, fcc_raw, dcb_count=1, specified_wh=None):
-    """Normalise BAT_USABLE_CAPACITY/BAT_FCC from E3DC cabinet responses.
+    """Normalisiert BAT_USABLE_CAPACITY/BAT_FCC aus E3DC-Schrankantworten.
 
-    Newer H20/S10X systems report these tags as Ah, older responses have been
-    seen as 0.1 kWh pack values. Prefer the Ah interpretation when it is
-    plausible against BAT_SPECIFICATION, then fall back to the legacy path.
+    Neuere H20-/S10X-Systeme melden diese Tags in Ah; ältere Antworten wurden
+    als 0,1-kWh-Packwerte beobachtet. Die Ah-Deutung hat Vorrang, wenn sie
+    gegenüber BAT_SPECIFICATION plausibel ist; andernfalls greift der Altpfad.
     """
     packs = max(1, int(dcb_count or 1))
     specified_kwh = 0.0
@@ -1174,7 +1190,7 @@ def _normalise_bat_capacity_from_rscp(cap_raw, fcc_raw, dcb_count=1, specified_w
 
 
 def _add_bat_total_fields(result):
-    """Add explicit system-level battery capacity totals without hiding cabinets."""
+    """Ergänzt explizite systemweite Kapazitätssummen, ohne Batterieschränke auszublenden."""
     usable = 0.0
     full = 0.0
     specified = 0.0
@@ -1215,47 +1231,61 @@ def _add_bat_total_fields(result):
     return result
 
 
-def get_bat(conn):
-    """Batterie: Spannung, Strom, Max-Ladestrom, Kapazitaet (bis 4 Schraenke)."""
+def get_bat(conn, cfg=None):
+    """Batterie: Spannung, Strom, maximaler Ladestrom und Kapazität (bis 4 Schränke)."""
     print("  -> Batterie Spannung/Strom ...")
     result = {}
     for cab_idx, pfx in [(0, "bat"), (1, "bat1"), (2, "bat2"), (3, "bat3")]:
-        resp = conn.request([_container(T.BAT_REQ_DATA, [
-            _uint16(T.BAT_INDEX, cab_idx),
-            _nil(T.BAT_REQ_VOLTAGE),              # 0x03000001 -> liefert SOC
-            _nil(T.BAT_REQ_CURRENT),              # 0x03000002 -> liefert Spannung V
-            _nil(T.BAT_REQ_CURRENT_REAL),         # 0x03000003 -> liefert Strom A
-            _nil(T.BAT_REQ_MAX_CHARGE_CURRENT),
-            _nil(T.BAT_REQ_DCB_COUNT),
-            _nil(T.BAT_REQ_USABLE_CAPACITY),
-            _nil(T.BAT_REQ_FCC),
-            _nil(T.BAT_REQ_CHARGE_CYCLES),        # Ladezyklen
-            _nil(T.BAT_REQ_EOD_VOLTAGE),          # Entladeschlussspannung
-            _nil(T.BAT_REQ_SPECIFICATION),
+        resp = conn.request([_container(RscpTag.BAT_REQ_DATA, [
+            _uint16(RscpTag.BAT_INDEX, cab_idx),
+            _nil(RscpTag.BAT_REQ_RSOC),              # 0x03000001 -> liefert SOC
+            _nil(RscpTag.BAT_REQ_MODULE_VOLTAGE),              # 0x03000002 -> liefert Spannung V
+            _nil(RscpTag.BAT_REQ_CURRENT),         # 0x03000003 -> liefert Strom A
+            _nil(RscpTag.BAT_REQ_MAX_CHARGE_CURRENT),
+            _nil(RscpTag.BAT_REQ_DCB_COUNT),
+            _nil(RscpTag.BAT_REQ_USABLE_CAPACITY),
+            _nil(RscpTag.BAT_REQ_FCC),
+            _nil(RscpTag.BAT_REQ_CHARGE_CYCLES),        # Ladezyklen
+            _nil(RscpTag.BAT_REQ_EOD_VOLTAGE),          # Entladeschlussspannung
+            _nil(RscpTag.BAT_REQ_SPECIFICATION),
         ])])
-        bat_data = find_tag(resp, T.BAT_DATA)
+        bat_data = find_tag(resp, RscpTag.BAT_DATA)
         if bat_data and isinstance(bat_data.get('value'), list):
             bd = bat_data['value']
             # BAT_VOLTAGE = 0x03800002 (Spannung in V, korrekt!)
             # BAT_CURRENT = 0x03800003 (Strom in A, korrekt - war vorher 0x03800002!)
             # BAT_SOC_OWN = 0x03800001 (eigener SOC des Batterie-BMS in %)
-            soc_own = round(float(find_tag_value(bd, T.BAT_SOC_OWN) or 0), 1)
-            v     = round(float(find_tag_value(bd, T.BAT_VOLTAGE) or 0), 2)
-            a     = round(float(find_tag_value(bd, T.BAT_CURRENT) or 0), 2)
-            max_a = round(float(find_tag_value(bd, T.BAT_MAX_CHARGE_CURRENT) or 0), 1)
-            dcb_count = int(find_tag_value(bd, T.BAT_DCB_COUNT) or 0)
-            # BAT_USABLE_CAPACITY/BAT_FCC koennen je nach Firmware Ah oder
-            # alte 0.1-kWh-Packwerte liefern; Normalisierung prueft beides.
-            cap_raw = float(find_tag_value(bd, T.BAT_USABLE_CAPACITY) or 0)
-            fcc_raw = float(find_tag_value(bd, T.BAT_FCC) or 0)
+            soc_own = round(float(find_tag_value(bd, RscpTag.BAT_RSOC) or 0), 1)
+            v     = round(float(find_tag_value(bd, RscpTag.BAT_MODULE_VOLTAGE) or 0), 2)
+            a     = round(float(find_tag_value(bd, RscpTag.BAT_CURRENT) or 0), 2)
+            max_a = round(float(find_tag_value(bd, RscpTag.BAT_MAX_CHARGE_CURRENT) or 0), 1)
+            dcb_count = int(find_tag_value(bd, RscpTag.BAT_DCB_COUNT) or 0)
+            # BAT_USABLE_CAPACITY/BAT_FCC können je nach Firmware Ah oder
+            # alte 0,1-kWh-Packwerte liefern; die Normalisierung prüft beides.
+            cap_value = find_tag_value(bd, RscpTag.BAT_USABLE_CAPACITY)
+            fcc_value = find_tag_value(bd, RscpTag.BAT_FCC)
+            cap_raw = float(cap_value) if isinstance(cap_value, (int, float)) and not isinstance(cap_value, bool) else None
+            fcc_raw = float(fcc_value) if isinstance(fcc_value, (int, float)) and not isinstance(fcc_value, bool) else None
             specified_wh = None
-            bat_spec = find_tag(bd, T.BAT_SPECIFICATION)
+            bat_spec = find_tag(bd, RscpTag.BAT_SPECIFICATION)
             if bat_spec and isinstance(bat_spec.get('value'), list):
-                specified_wh = find_tag_value(bat_spec['value'], T.BAT_SPECIFIED_CAPACITY)
+                specified_wh = find_tag_value(bat_spec['value'], RscpTag.BAT_SPECIFIED_CAPACITY)
             cap_kwh, fcc_kwh, cap_source, specified_kwh = _normalise_bat_capacity_from_rscp(
                 cap_raw, fcc_raw, dcb_count, specified_wh
             )
-            cycles = _iv(bd, T.BAT_CHARGE_CYCLES)
+            local_capacity = None
+            try:
+                candidate = float((cfg or {}).get("speichergroesse"))
+                if 0.1 <= candidate <= 1000.0:
+                    local_capacity = candidate
+            except (TypeError, ValueError):
+                pass
+            telemetry_valid = any(value > 0.1 for value in (cap_kwh, fcc_kwh, specified_kwh))
+            if not telemetry_valid and local_capacity is not None and cab_idx == 0:
+                cap_kwh = local_capacity
+                fcc_kwh = local_capacity
+                cap_source = "validated_local_config_fallback"
+            cycles = _iv(bd, RscpTag.BAT_CHARGE_CYCLES)
             result[f"{pfx}_soc_own"]      = soc_own      # BMS-eigener SOC
             result[f"{pfx}_v"]            = v
             result[f"{pfx}_a"]            = a
@@ -1264,6 +1294,7 @@ def get_bat(conn):
             result[f"{pfx}_usable_kwh"]   = cap_kwh
             result[f"{pfx}_full_cap_kwh"] = fcc_kwh
             result[f"{pfx}_capacity_source"] = cap_source
+            result[f"{pfx}_capacity_valid"] = bool(telemetry_valid)
             if specified_kwh > 0:
                 result[f"{pfx}_specified_kwh"] = specified_kwh
             result[f"{pfx}_charge_cycles"] = cycles
@@ -1286,23 +1317,34 @@ def get_bat(conn):
 def get_wb(conn, cfg):
     """Wallbox Phasen + Verbindungsstatus."""
     print("  -> Wallbox Phasen ...")
-    resp = conn.request([_container(T.WB_REQ_DATA, [
-        _uint16(T.WB_INDEX, 0),
-        _nil(T.WB_REQ_PM_POWER_L1), _nil(T.WB_REQ_PM_POWER_L2), _nil(T.WB_REQ_PM_POWER_L3),
-        _nil(T.WB_REQ_DEVICE_CONNECTED), _nil(T.WB_REQ_DEVICE_WORKING),
+    resp = conn.request([_container(RscpTag.WB_REQ_DATA, [
+        _uint16(RscpTag.WB_INDEX, 0),
+        _nil(RscpTag.WB_REQ_PM_POWER_L1), _nil(RscpTag.WB_REQ_PM_POWER_L2), _nil(RscpTag.WB_REQ_PM_POWER_L3),
+        _nil(RscpTag.WB_REQ_EXTERN_DATA_ALG),
     ])])
-    wb_data = find_tag(resp, T.WB_DATA)
+    wb_data = find_tag(resp, RscpTag.WB_DATA)
     result  = {"wb_p1": 0.0, "wb_p2": 0.0, "wb_p3": 0.0,
-               "wb_locked": False, "wb_charging": False,
+               "wb_plugged": None, "wb_locked": None, "wb_charging": None,
+               "wb_status_valid": False, "wb_status_source": "rscp_wb_extern_data_alg",
+               "wb_status_reason": "missing", "wb_status_age_s": 0.0,
                "wb_mode": int(cfg.get("wbmode", "4"))}
     if wb_data and isinstance(wb_data.get('value'), list):
         wd = wb_data['value']
-        result["wb_p1"]      = round(float(find_tag_value(wd, T.WB_PM_POWER_L1) or 0), 1)
-        result["wb_p2"]      = round(float(find_tag_value(wd, T.WB_PM_POWER_L2) or 0), 1)
-        result["wb_p3"]      = round(float(find_tag_value(wd, T.WB_PM_POWER_L3) or 0), 1)
-        result["wb_locked"]  = bool(find_tag_value(wd, T.WB_DEVICE_CONNECTED))
-        result["wb_charging"] = bool(find_tag_value(wd, T.WB_DEVICE_WORKING))
-    print(f"     L1={result['wb_p1']}W  L2={result['wb_p2']}W  L3={result['wb_p3']}W  Verbunden={result['wb_locked']}  Laedt={result['wb_charging']}")
+        result["wb_p1"]      = round(float(find_tag_value(wd, RscpTag.WB_PM_POWER_L1) or 0), 1)
+        result["wb_p2"]      = round(float(find_tag_value(wd, RscpTag.WB_PM_POWER_L2) or 0), 1)
+        result["wb_p3"]      = round(float(find_tag_value(wd, RscpTag.WB_PM_POWER_L3) or 0), 1)
+        alg = find_tag(wd, RscpTag.WB_EXTERN_DATA_ALG)
+        decoded = decode_wb_extern_data_alg(alg, age_s=0.0)
+        result.update({
+            "wb_plugged": decoded["plugged"],
+            "wb_locked": decoded["plug_locked"],
+            "wb_charging": decoded["charging"],
+            "wb_status_valid": decoded["valid"],
+            "wb_status_source": decoded["source"],
+            "wb_status_reason": decoded["reason"],
+            "wb_status_age_s": decoded["age_s"],
+        })
+    print(f"     L1={result['wb_p1']}W  L2={result['wb_p2']}W  L3={result['wb_p3']}W  Gesteckt={result['wb_plugged']}  Verriegelt={result['wb_locked']}  Lädt={result['wb_charging']}")
     return result
 
 
@@ -1310,11 +1352,11 @@ def get_system_info(conn):
     """Seriennummer und SW-Version."""
     print("  -> System-Info ...")
     resp = conn.request([
-        _nil(T.INFO_REQ_SERIAL_NUMBER),
-        _nil(T.INFO_REQ_SW_RELEASE),
+        _nil(RscpTag.INFO_REQ_SERIAL_NUMBER),
+        _nil(RscpTag.INFO_REQ_SW_RELEASE),
     ])
-    sn  = find_tag_value(resp, T.INFO_SERIAL_NUMBER) or "N/A"
-    rel = find_tag_value(resp, T.INFO_SW_RELEASE)    or "N/A"
+    sn  = find_tag_value(resp, RscpTag.INFO_SERIAL_NUMBER) or "N/A"
+    rel = find_tag_value(resp, RscpTag.INFO_SW_RELEASE)    or "N/A"
     print(f"     Seriennummer={sn}  SW={rel}")
     return {"serial_number": sn, "sw_release": rel}
 
@@ -1375,7 +1417,7 @@ class KwhRetterState:
         - Abregelung: Bereich oberhalb der Einspeise-/Derate-Grenze.
         - AC-Limit: Bereich oberhalb einer vom E3DC gemeldeten WR-Grenze.
 
-        Beide Werte duerfen sich nicht ueberlappen, sonst zaehlt der Gesamtwert
+        Beide Werte dürfen sich nicht überlappen, sonst zählt der Gesamtwert
         die gleiche Energie doppelt. Ein AC-Limit von 0 bedeutet "unbekannt"
         und wird deshalb nicht geraten.
         """
@@ -1408,12 +1450,12 @@ class KwhRetterState:
         if self.last_ts == 0:
             self.last_ts = now_ts
             return
-            
+
         dt_sec = now_ts - self.last_ts
         self.last_ts = now_ts
         if dt_sec > 300 or dt_sec <= 0:
             return
-            
+
         today = datetime.datetime.now().strftime("%Y-%m-%d")
         if today != self.current_date:
             self.today_derating_wsec = 0.0
@@ -1430,7 +1472,7 @@ class KwhRetterState:
             self.today_inverter_wsec += inverter_w * dt_sec
             self.total_inverter_wsec += inverter_w * dt_sec
             changed = True
-                
+
         if changed or dt_sec > 60: # periodisch speichern
             self.save()
 
@@ -1448,10 +1490,10 @@ def apply_pv_zero_glitch_filter(clean, live_path="/var/www/html/ramdisk/live_dat
     """
     Kurze RSCP/PVI-Aussetzer abfangen.
 
-    Einige E3DC melden fuer wenige Sekunden PV=0W und PVI AC/DC=0W, obwohl
+    Einige E3DC melden für wenige Sekunden PV=0 W und PVI AC/DC=0 W, obwohl
     die Stringspannung weiter hoch ist. Ohne Filter interpretiert die Regelung
-    das als echten PV-Einbruch und verlaesst die Ladekurve. Wir halten nur den
-    letzten plausiblen PV-Wert und nur fuer ein enges Zeitfenster.
+    das als echten PV-Einbruch und verlässt die Ladekurve. Wir halten nur den
+    letzten plausiblen PV-Wert und nur für ein enges Zeitfenster.
     """
     try:
         raw_pv = float(clean.get("PV_Power", 0) or 0)
@@ -1554,7 +1596,7 @@ def _cfg_flag(cfg, key, default=False):
 
 
 def _grid_pm_delta_status(delta_w, cfg=None, *, state_path=None, now_s=None):
-    """Classify EMS-vs-PM delta as diagnostic-only or rule-effective."""
+    """Klassifiziert die EMS-/PM-Abweichung als rein diagnostisch oder regelwirksam."""
     cfg_present = isinstance(cfg, dict)
     soft_threshold_w = max(0.0, _cfg_number(cfg, "live_grid_pm_delta_soft_threshold_w", 250.0))
     hard_threshold_w = max(
@@ -1660,7 +1702,7 @@ def apply_power_plausibility(
     grid_pm_state_path=None,
     now_s=None,
 ):
-    """Add real-time plausibility metadata without changing live power values."""
+    """Ergänzt Echtzeit-Plausibilitätsdaten, ohne Liveleistungswerte zu verändern."""
     if not isinstance(clean, dict):
         return clean
     errors = errors or []
@@ -1685,7 +1727,7 @@ def apply_power_plausibility(
     for key, value in raw_sources.items():
         clean.setdefault(key, int(round(value)) if abs(value - round(value)) < 0.001 else round(value, 3))
 
-    # E3DC EMS signs used by this service:
+    # Von diesem Dienst verwendete E3DC-EMS-Vorzeichen:
     # Grid > 0 Bezug, Grid < 0 Einspeisung; Battery > 0 Laden, Battery < 0 Entladen.
     home_balance_w = max(0.0, pv_w + grid_w - bat_w - wb_w - heizstab_w)
     home_delta_w = home_w - home_balance_w
@@ -1900,7 +1942,7 @@ def apply_power_decision_stability(
     state_path=LIVE_DECISION_STABILITY_PATH,
     now_s=None,
 ):
-    """Export diagnostic EWMA/deadband values without changing raw live values."""
+    """Exportiert diagnostische EWMA-/Totbandwerte, ohne Live-Rohwerte zu verändern."""
     if not isinstance(clean, dict):
         return clean
     cfg = cfg or {}
@@ -2033,7 +2075,7 @@ def _round_or_none(value, digits=3):
 
 
 def compact_live_plausibility_frame(clean):
-    """Return a small forensic frame for live-data plausibility diagnosis."""
+    """Liefert einen kompakten forensischen Rahmen für die Live-Daten-Plausibilitätsdiagnose."""
     if not isinstance(clean, dict):
         return {}
     plausibility = clean.get("Power_Plausibility") if isinstance(clean.get("Power_Plausibility"), dict) else {}
@@ -2142,7 +2184,7 @@ def record_live_plausibility_state(
     log_path=None,
     now_s=None,
 ):
-    """Persist compact live-data diagnostics without changing control values."""
+    """Speichert kompakte Live-Daten-Diagnosen, ohne Regelwerte zu verändern."""
     if not isinstance(clean, dict):
         return None
     frame = compact_live_plausibility_frame(clean)
@@ -2200,6 +2242,7 @@ def run_test(host, port, user, pw, aes_pw, cfg, loops=1, interval=3, write=False
     """
     run = 0
     kwh_retter = KwhRetterState()
+    external_pv_topology = ExternalPvTopologyEvidenceTracker()
     daemon_quiet = bool(write and loops == 0)
     persistent_enabled = str(cfg.get("e3dc_live_persistent_connection", "0")).strip().lower() in {
         "1", "true", "yes", "on", "ein",
@@ -2252,7 +2295,7 @@ def run_test(host, port, user, pw, aes_pw, cfg, loops=1, interval=3, write=False
                     ("EMS Anlagendata",  lambda: get_ems_config(conn)),
                     ("DB-History (kWh)", lambda: get_db_history(conn)),
                     ("PVI DC/AC",        lambda: get_pvi(conn)),
-                    ("Batterie",         lambda: get_bat(conn)),
+                    ("Batterie",         lambda: get_bat(conn, cfg)),
                     ("Wallbox",          lambda: get_wb(conn, cfg)),
                     ("System-Info",      lambda: get_system_info(conn)),
                 ]
@@ -2283,54 +2326,36 @@ def run_test(host, port, user, pw, aes_pw, cfg, loops=1, interval=3, write=False
 
         data = normalise_live_ep_reserve(data, cfg)
 
-        # Effizienz & Umwandlungsverluste berechnen
-        # Formel: Eingang - Ausgang = Verluste (Wechselrichter + Batterie + Standby)
-        pv_e  = data.get("PV_Energy_kWh", 0.0)
-        gi_e  = data.get("Grid_In_Energy_kWh", 0.0)
-        go_e  = data.get("Grid_Out_Energy_kWh", 0.0)
-        bi_e  = data.get("Bat_In_Energy_kWh", 0.0)
-        bo_e  = data.get("Bat_Out_Energy_kWh", 0.0)
-        hm_e  = data.get("Home_Energy_kWh", 0.0)
-        wb_e  = data.get("Wallbox_Energy_kWh", 0.0)
+        # Effizienz & Umwandlungsverluste sind reine Diagnose. Fehlende zwingende
+        # DB-Zähler degradieren die Bilanz; die optionale, unbelegte WB-Energie
+        # wird nicht als echte 0 publiziert und beendet den Liveprozess nicht.
+        energy_metrics = calculate_energy_balance_metrics(data)
+        data.update(energy_metrics)
 
-        supply = pv_e + gi_e + bo_e                  # Quellen: PV + Netz + Bat-Entladen
-        demand = hm_e + wb_e + go_e + bi_e           # Senken:  Home + WB + Export + Bat-Laden
-        loss_kwh = round(supply - demand, 3)
-        loss_pct = round(loss_kwh / supply * 100, 1) if supply > 0 else 0.0
-
-        # Batterie-Roundtrip-Effizienz
-        # Nur sinnvoll wenn BatOut <= BatIn (Zyklus innerhalb des Tages abgeschlossen)
-        # BatOut > BatIn = Nacht-Entladung ueberwiegt -> kein echter RTE-Wert
-        bat_net_kwh = round(bo_e - bi_e, 3)   # positiv = Netto-Entladung, negativ = Netto-Laden
-        data["bat_net_discharge_kwh"] = bat_net_kwh
-
-        bat_rte_pct = None
-        if bi_e > 0.5 and bo_e > 0.1 and bo_e <= bi_e * 1.05:
-            # Echter RTE: nur wenn Entladung nicht mehr als 5% ueber Ladung
-            bat_rte_pct = round(bo_e / bi_e * 100, 1)
-        elif bi_e > 0.5 and bo_e > 0.5:
-            # Beide > 0 aber kein vollstaendiger Zyklus heute (Nacht-Entladung dominiert)
-            bat_rte_pct = None  # nicht sinnvoll berechenbar
-
-        data["sys_loss_kwh"]   = loss_kwh
-        data["sys_loss_pct"]   = loss_pct
-        if bat_rte_pct is not None:
-            data["bat_rte_pct"] = bat_rte_pct
-
-        rte_str = f"  Bat-RTE={bat_rte_pct}%" if bat_rte_pct else f"  Bat-Netto-Entladen={bat_net_kwh}kWh"
-        if supply > 0 and not daemon_quiet:
+        supply = energy_metrics["sys_energy_supply_kwh"]
+        demand = energy_metrics["sys_energy_demand_kwh"]
+        loss_kwh = energy_metrics["sys_loss_kwh"]
+        loss_pct = energy_metrics["sys_loss_pct"]
+        bat_net_kwh = energy_metrics["bat_net_discharge_kwh"]
+        bat_rte_pct = energy_metrics["bat_rte_pct"]
+        if energy_metrics["sys_energy_balance_valid"] and supply > 0 and not daemon_quiet:
+            rte_str = (
+                f"  Bat-RTE={bat_rte_pct}%"
+                if bat_rte_pct is not None
+                else f"  Bat-Netto-Entladen={bat_net_kwh}kWh"
+            )
             print(f"  -> Effizienz: Eingang={supply:.3f}kWh  Ausgang={demand:.3f}kWh  "
                   f"Verluste={loss_kwh:.3f}kWh ({loss_pct}%){rte_str}")
 
-        # kWh - Retter ausfuehren
+        # kWh-Retter ausführen
         pv_p = data.get("PV_Power", 0)
         derate_lim = data.get("derate_at_power_w", 0)
         inv_lim = data.get("ac_power_limit_w", 0)
-        
+
         kwh_retter.add_sample(pv_p, derate_lim, inv_lim)
         retter_stats = kwh_retter.get_stats()
         data.update(retter_stats)
-        
+
         # Gebe die Retter-Stats noch im Print aus
         if pv_p > 0 and not daemon_quiet:
             print(f"  -> kWh-Retter: Heute {retter_stats['saved_derating_today_kwh']:.2f} kWh (Abregelung) / {retter_stats['saved_inverter_today_kwh']:.2f} kWh (AC-Limit) gerettet")
@@ -2339,7 +2364,7 @@ def run_test(host, port, user, pw, aes_pw, cfg, loops=1, interval=3, write=False
 
         # Sauberes JSON (interne _ Keys rausfiltern)
         clean = {k: v for k, v in data.items() if not k.startswith("_")}
-        clean["_source"]  = "python_rscp"   # PHP prueft auf diesen Wert
+        clean["_source"]  = "python_rscp"   # PHP prüft auf diesen Wert
         clean["_ts"]      = int(time.time())
         clean["_elapsed"] = round(elapsed, 3)
         clean["RSCP_Acquisition"] = acquisition_diagnostics
@@ -2351,6 +2376,33 @@ def run_test(host, port, user, pw, aes_pw, cfg, loops=1, interval=3, write=False
         clean = apply_grid_power_filtered(clean, cfg)
         clean = apply_power_decision_stability(clean, cfg)
         clean = sanitize_for_json(clean)
+        try:
+            topology = (
+                external_pv_topology.observe(clean, now_s=clean.get("_ts"))
+                if write
+                else {**read_external_pv_topology(external_pv_topology.state_path), "write_performed": False}
+            )
+        except Exception as topology_exc:
+            topology = {
+                "topology_present": False,
+                "valid": False,
+                "source": "none",
+                "evidence_state": "invalid",
+                "reason": "persistence_error",
+                "write_performed": False,
+            }
+            _live_log_limiter.failure(
+                logger,
+                "external_pv_topology",
+                "Zusatz-WR-Topologienachweis ist fail-closed: %s",
+                topology_exc,
+                level=logging.ERROR,
+            )
+        clean["External_PV_Topology_Present"] = bool(topology.get("topology_present"))
+        clean["External_PV_Topology_Valid"] = bool(topology.get("valid"))
+        clean["External_PV_Topology_Source"] = str(topology.get("source") or "none")
+        clean["External_PV_Topology_Evidence_State"] = str(topology.get("evidence_state") or "invalid")
+        clean["External_PV_Topology_Reason"] = str(topology.get("reason") or "")
         try:
             record_live_plausibility_state(clean)
         except Exception as diag_exc:
@@ -2377,7 +2429,7 @@ def run_test(host, port, user, pw, aes_pw, cfg, loops=1, interval=3, write=False
                 with open(tmp_path, 'w', encoding='utf-8') as f:
                     json.dump(clean, f, ensure_ascii=False, separators=(',', ':'), allow_nan=False)
                 os.replace(tmp_path, out_path)  # Atomares Schreiben (kein halb-geschriebenes JSON)
-                os.chmod(out_path, 0o664)       # www-data muss lesend zugreifen koennen
+                os.chmod(out_path, 0o664)       # www-data muss lesend zugreifen können
                 _live_log_limiter.recovery(logger, "live_write", "Live-Daten können wieder geschrieben werden")
                 if not daemon_quiet:
                     print(f"[OK] Geschrieben: {out_path}")
@@ -2401,11 +2453,11 @@ def run_test(host, port, user, pw, aes_pw, cfg, loops=1, interval=3, write=False
                 else:
                     print(f"[!] Schreiben fehlgeschlagen: {we}")
         else:
-            print("--- JSON-Output (wuerde in live_data_py.json geschrieben) ---")
+            print("--- JSON-Ausgabe (würde in live_data_py.json geschrieben) ---")
             print(json.dumps(clean, indent=2, ensure_ascii=False, allow_nan=False))
 
 
-        # Letzte Wartezeit vor naechstem Durchlauf
+        # Letzte Wartezeit vor dem nächsten Durchlauf
         if loops == 0 or run < loops:
             t_elapsed = time.monotonic() - t_start
             sleep_s = max(0.1, interval - t_elapsed)
@@ -2417,6 +2469,19 @@ def run_test(host, port, user, pw, aes_pw, cfg, loops=1, interval=3, write=False
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
+def _rscp_runtime_config_complete(host, port, user, password, rscp_password):
+    try:
+        port_value = int(port)
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        str(host or "").strip()
+        and 1 <= port_value <= 65535
+        and str(user or "").strip()
+        and str(password or "").strip()
+        and str(rscp_password or "").strip()
+    )
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -2437,33 +2502,34 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    print("E3DC Live-Dienst - laedt Konfiguration ...\n")
+    print("E3DC-Live-Dienst - lädt Konfiguration ...\n")
     cfg    = _find_config()
     host   = args.host   or cfg.get("server_ip") or ""
-    port   = args.port   or int(cfg.get("server_port") or 5033)
+    port   = args.port if args.port is not None else (cfg.get("server_port") or 5033)
     user   = args.user   or cfg.get("e3dc_user") or ""
     pw     = args.pw     or cfg.get("e3dc_password") or ""
     aes_pw = args.aes    or cfg.get("aes_password") or pw
 
-    if not host or not user:
-        if args.write and args.loops == 0 and not (args.host or args.user):
-            print("[!] server_ip oder e3dc_user fehlen - warte auf gespeicherte Konfiguration ...")
+    if not _rscp_runtime_config_complete(host, port, user, pw, aes_pw):
+        if args.write and args.loops == 0 and not (args.host or args.user or args.pw or args.aes):
+            print("[!] E3DC-RSCP-Ziel oder Zugangsdaten fehlen - warte auf gespeicherte Konfiguration ...")
             while True:
                 time.sleep(30)
                 cfg    = _find_config()
                 host   = cfg.get("server_ip") or ""
-                port   = int(cfg.get("server_port") or 5033)
+                port   = cfg.get("server_port") or 5033
                 user   = cfg.get("e3dc_user") or ""
                 pw     = cfg.get("e3dc_password") or ""
                 aes_pw = cfg.get("aes_password") or pw
-                if host and user:
+                if _rscp_runtime_config_complete(host, port, user, pw, aes_pw):
                     print("[OK] Konfiguration gefunden, starte RSCP Live-Dienst.")
                     break
-                print("[i] Warte weiter auf server_ip/e3dc_user in /var/www/html/data/e3dc_v4.json ...")
+                print("[i] Warte weiter auf vollständige E3DC-RSCP-Konfiguration in /var/www/html/data/e3dc_v4.json ...")
         else:
-            print("[!] server_ip oder e3dc_user fehlen!")
+            print("[!] E3DC-RSCP-Ziel oder Zugangsdaten fehlen!")
             sys.exit(1)
 
+    port = int(port)
     print(f"\nHost: {host}:{port}  User: {user}")
     if args.loops == 0:
         print(f"[Daemon] Endlosschleife, Intervall {args.interval}s")
@@ -2471,7 +2537,7 @@ if __name__ == "__main__":
         print(f"[N-Shot] {args.loops}x alle {args.interval}s")
     if args.write:
         print("[Write] -> /var/www/html/ramdisk/live_data_py.json")
-        # Ramdisk-Vorab-Check: Schreiben moeglich?
+        # Ramdisk-Vorabprüfung: Schreiben möglich?
         _rdir = '/var/www/html/ramdisk'
         if not os.path.isdir(_rdir):
             print(f"[!] Ramdisk-Verzeichnis fehlt: {_rdir}")
@@ -2479,7 +2545,7 @@ if __name__ == "__main__":
             try:
                 os.makedirs(_rdir, mode=0o775, exist_ok=True)
             except Exception as _e:
-                print(f"[!] Fehler beim Erstellen: {_e} -- Pruefe Berechtigungen!")
+                print(f"[!] Fehler beim Erstellen: {_e} – Berechtigungen prüfen!")
         elif not os.access(_rdir, os.W_OK):
             print(f"[!] Kein Schreibrecht auf {_rdir}!")
             print(f"[!] Fix: sudo chown -R pi:www-data {_rdir} && sudo chmod -R 775 {_rdir}")

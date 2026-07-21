@@ -28,29 +28,29 @@ def copy_existing_config():
     """Kopiert eine vorhandene e3dc.config.txt in den Zielordner."""
     print("\n--- Vorhandene Konfiguration kopieren ---\n")
     config_logger.info("Versuche, eine vorhandene Konfiguration zu kopieren.")
-    
+
     default_source = os.path.join(get_home_dir(get_install_user()), "Install", "e3dc.config.txt")
     source_path = ask("Pfad zur vorhandenen e3dc.config.txt", default_source)
-    
+
     if not os.path.exists(source_path):
         print(f"✗ Datei nicht gefunden: {source_path}")
         log_warning("create_config", f"Zu kopierende Konfigurationsdatei nicht gefunden: {source_path}")
         return False
-    
+
     if not os.path.isfile(source_path):
         print(f"✗ Kein gültiger Dateipfad: {source_path}")
         log_warning("create_config", f"Ungültiger Pfad für Konfigurationsdatei angegeben: {source_path}")
         return False
-    
+
     try:
         # Zielverzeichnis erstellen falls nicht vorhanden
         os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
-        
+
         # Datei kopieren
         shutil.copy2(source_path, CONFIG_FILE)
         print(f"✓ Datei kopiert: {source_path} → {CONFIG_FILE}")
         config_logger.info(f"Konfigurationsdatei kopiert von {source_path} nach {CONFIG_FILE}")
-        
+
         # Berechtigungen setzen
         try:
             uid, _ = get_user_ids()
@@ -61,11 +61,11 @@ def copy_existing_config():
         except Exception as e:
             print(f"⚠ Warnung: Berechtigungen konnten nicht vollständig gesetzt werden: {e}")
             log_warning("create_config", f"Berechtigungen für kopierte Konfigurationsdatei konnten nicht gesetzt werden: {e}")
-        
+
         print(f"\n✓ Konfiguration erfolgreich kopiert und installiert!\n")
         log_task_completed("Konfiguration erstellen", details="Vorhandene Konfiguration kopiert")
         return True
-        
+
     except Exception as e:
         print(f"✗ Fehler beim Kopieren der Datei: {e}")
         log_error("create_config", f"Fehler beim Kopieren der Konfigurationsdatei: {e}", e)
@@ -76,17 +76,17 @@ def create_e3dc_config(headless=False):
     """Kompletter Config-Wizard mit allen Parametern und Defaults."""
     print("\n=== E3DC-Konfiguration erstellen ===\n")
     config_logger.info("Starte Konfigurations-Wizard.")
-    
+
     # Prüfen ob vorhandene Config kopiert werden soll
     copy_existing = ask("Möchtest du eine vorhandene e3dc.config.txt kopieren? (j/n)", "n", headless)
-    
+
     if copy_existing and copy_existing.lower() == "j":
         if copy_existing_config():
             return  # Erfolgreich kopiert, Wizard beenden
         else:
             print("\nFortfahren mit manuellem Wizard...\n")
             config_logger.warning("Kopieren der Konfiguration fehlgeschlagen, fahre mit manuellem Wizard fort.")
-    
+
     cfg = {}
 
     # =========================================================
@@ -95,7 +95,7 @@ def create_e3dc_config(headless=False):
     print("\n--- DIREKTVERMARKTUNG ---\n")
     dv_input = ask("Direktvermarktung aktiv? (j/n)", "n", headless)
     cfg["dv"] = "1" if dv_input.lower() == "j" else "0"
-    
+
     if cfg["dv"] == "1":
         cfg["dvwbkwh"] = ask("Wallbox-Bedarf E-Auto (kWh)", "30", headless)
         cfg["dvmp"] = ask("Marktprämie (€/MWh)", "60", headless)
@@ -109,9 +109,9 @@ def create_e3dc_config(headless=False):
     print("--- GRUNDDATEN ---\n")
     cfg["server_ip"] = ask("E3DC IP-Adresse", "", headless)
     cfg["server_port"] = ask("Port", "5033", headless)
-    cfg["user"] = ask("Benutzername", "local.user", headless)
-    cfg["password"] = ask("Passwort", "1234", headless)
-    cfg["aes"] = ask("AES-Passwort", "1234", headless)
+    cfg["user"] = ask("Benutzername", "", headless)
+    cfg["password"] = ask("Passwort", "", headless)
+    cfg["aes"] = ask("AES-Passwort", "", headless)
 
     # =========================================================
     # LEISTUNGS- UND SPEICHERPARAMETER
@@ -283,7 +283,7 @@ def write_e3dc_config(cfg):
     """Schreibt die Konfigurationsdatei."""
     try:
         os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
-        
+
         # Umask setzen für korrekte File-Berechtigungen
         old_umask = os.umask(0o002)
         try:
@@ -378,9 +378,9 @@ def write_e3dc_config(cfg):
                 write_param(f, "ForecastReserve", cfg.get("ForecastReserve", ""), cfg["openmeteo"])
         finally:
             os.umask(old_umask)
-        
+
         config_logger.info(f"Konfigurationsdatei erfolgreich geschrieben: {CONFIG_FILE}")
-        
+
         # Setze korrekten Owner und Berechtigungen
         try:
             uid, _ = get_user_ids()

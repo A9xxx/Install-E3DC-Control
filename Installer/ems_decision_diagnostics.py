@@ -182,7 +182,7 @@ def build_storage_decision_record(payload: Dict[str, Any]) -> Dict[str, Any]:
         if auto_limit:
             hardware_command["auto_limit"] = auto_limit
 
-    return build_record(
+    record = build_record(
         actor="storage:e3dc",
         domain="storage",
         mode=mode_name,
@@ -204,6 +204,16 @@ def build_storage_decision_record(payload: Dict[str, Any]) -> Dict[str, Any]:
         user_text=payload.get("display_reason") or payload.get("reason") or payload.get("state_label") or payload.get("state"),
         ts=payload.get("ts"),
     )
+    dispatch_runtime = payload.get("storage_dispatch_runtime")
+    if isinstance(dispatch_runtime, dict):
+        # Reine Durchleitung der bereits im Storage Manager gebundenen Fläche;
+        # die gemeinsame Diagnose erfindet keine zweite Dispatchentscheidung.
+        record["storage_dispatch_runtime"] = dispatch_runtime
+        record["plan_id"] = dispatch_runtime.get("plan_id")
+        record["slot_id"] = dispatch_runtime.get("slot_id")
+        record["commands_allowed"] = bool(dispatch_runtime.get("commands_allowed"))
+        record["block_reason_code"] = dispatch_runtime.get("block_reason_code")
+    return record
 
 
 def _wallbox_command_from_detail(detail: Dict[str, Any]) -> Optional[Dict[str, Any]]:

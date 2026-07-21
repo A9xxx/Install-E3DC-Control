@@ -1,10 +1,45 @@
 # 📘 Changelog
 
-Dieser Changelog dokumentiert die fachliche Entwicklung aller veröffentlichten Produktversionen. Personen-, Anlagen- und interne Entwicklungsbezüge wurden eng anonymisiert; technische Änderungen und ihre Nutzerwirkung bleiben erhalten.
+Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröffentlichten Versionen. Personen-, Anlagen- und interne Entwicklungsbezüge wurden eng anonymisiert; technische Änderungen und ihre Nutzerwirkung bleiben erhalten.
 
 ## 🙏 Danksagung
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
+
+## [5.4.0] – 2026-07-21
+
+### 🔋 Speicher und Direktvermarktung
+
+- 🛡️ **Sicherheit:** Pro Domäne und Aktor gibt es genau einen Regel-Owner. Plan, Slot, Marktfenster, Freigabe, Geräteanforderung und Rücklesung bleiben über dieselbe Entscheidung gebunden.
+- ⚙️ **Regelung:** Interne DC-PV und zusätzliche AC-Erzeuger werden getrennt bilanziert. DC- und Netzpunktdruck werden mit dem größeren Wert bewertet und nicht doppelt addiert.
+- 🧱 **Stabilität:** Ungültige oder veraltete Markt-, Anlagen- und Rücklesedaten führen zu einer inaktiven Freigabe. Diagnosekandidaten können keine Hardwarewirkung erhalten.
+- 🛡️ **Sicherheit:** Netzstrom-Arbitrage bleibt in 5.4.0 wirkungslos. Bestehende Altwerte werden kompatibel erhalten, erzeugen aber weder Owner noch Speicherbefehl.
+- 🛡️ **Sicherheit:** Notstromreserve, Gerätegrenzen und dauerhafte RSCP-Einstellungen bleiben von Optimierung und Update unberührt.
+
+### 🔌 Wallboxen und Fahrzeuge
+
+- 🐛 **Fehlerbehebung:** Eine angesteckte und freigegebene openWB Pro verwirft abgelaufene eigene Phasenreservierungen und veraltete Nullanker. Nach bestätigter Bereitschaft wird die positive Startfreigabe ohne Umstecken oder Manager-Neustart erneut projiziert.
+- ⚙️ **Regelung:** Das Mehr-Wallbox-Balancing verwendet die tatsächlichen L1/L2/L3-Stromvektoren, die reale Phasenzahl, Fahrzeug- und Ladepunktgrenzen sowie die Netzpunktreserve. Ein- und dreiphasige Amperewerte werden nicht pauschal addiert.
+- 🧱 **Stabilität:** Die ruhige PV-Kurve folgt dem nachhaltigen PV- und Ladekurvenbudget mit Hysterese und Mindestlaufzeit. Eine bereits laufende Ladung darf kurze Einbrüche mit höchstens 75 Wh Batteriestützung überbrücken; Kaltstart und Phasenwechsel werden nicht aus dem Speicher finanziert.
+- 🛡️ **Sicherheit:** Geschützte openWB-Phasenwechsel setzen zuerst 0 A, übergeben anschließend das Phasenziel an `phasetarget` und warten mindestens 480 Sekunden sowie auf frische, bestätigte Rückmeldungen. E3DC-Control sendet dabei keinen zweiten CP-Befehl. Direkte E3/DC-Sun-/Auto-/Abort-, Maximalstrom- und native Phasenbefehle bleiben gesperrt.
+- 🔄 **Kompatibilität:** Der bestätigungsgebundene WBchar6-Pfad für vorhandene E3/DC-Wallboxen sowie openWB, openWB Pro und go-e bleiben unterstützt. Ein ausdrücklich deaktivierter Ladepunkt bleibt im Nur-Status-Betrieb.
+
+### ♨️ Wärme und iDM
+
+- 🛡️ **Sicherheit:** Wallboxaktionen oder der Verlust eines Wallboxkontexts stoppen keine bereits laufende Wärmepumpe eigenständig. Hardwarebefehle bleiben an frische, treiberspezifische Rückmeldungen gebunden.
+- 🔎 **Diagnose:** Der manuelle iDM-Scanner liest Input-Register 1006 genau einmal per FC04. Ohne passend gebundenes Modell, Protokoll, Firmware und Unit-ID bleibt der Rohwert unbewertet; der Scanner schreibt keine Register.
+- 🧱 **Stabilität:** Teilweise bestätigte Schreibfolgen gelten als Fehler. Die Steuerung fällt ausschließlich auf einen bestätigten sicheren Zustand zurück.
+
+### 🖥️ Weboberfläche und Diagnose
+
+- ✨ **Verbesserung:** Desktop- und Mobile-Layout besitzen getrennte Revisionen. Gleichzeitige Änderungen werden erkannt, unbekannte Felder bleiben erhalten und Tablet-/Querformatansichten ordnen Energiequellen und Verbraucher ohne abgeschnittene Badges an.
+- 🔎 **Diagnose:** Regelruhe, Owner, Freigabe, ACK, Readback und Hardwarewirkung werden getrennt ausgewiesen. Fehlende Historie wird als Beweisgrenze statt als vermeintliche Ruhe behandelt.
+
+### 📦 Installation, Update und Distribution
+
+- 🛡️ **Sicherheit:** Update, Backup, Rollback und Web-Planung arbeiten transaktional. Unvollständige Sicherungen, Timeouts und Teilfehler brechen ab und erhalten den letzten konsistenten Konfigurations- und Dienstzustand.
+- 🔐 **Datenschutz:** Lokale Konfigurationen, Sicherungen, Diagnosen, Zugangsdaten und Repository-Historie sind aus dem Docker-Buildkontext ausgeschlossen.
+- 🔄 **Migration/Kompatibilität:** Einziger vorgesehener öffentlicher Rückfallstand ist der in `UPDATE_POLICY.json` exakt gebundene Release-/Rollback-Tag `v5.3.2b`.
 
 ## [5.3.2b] – 2026-07-15
 

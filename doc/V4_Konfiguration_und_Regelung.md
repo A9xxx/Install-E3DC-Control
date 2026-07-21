@@ -1,6 +1,6 @@
 # Konfiguration und Regelung
 
-Diese Datei beschreibt die aktuelle Konfiguration und die im Betrieb aktiven Dienste.
+Diese Datei beschreibt den aktuellen Stand der nativen Python-Architektur.
 
 ## Konfigurationsquelle
 
@@ -11,16 +11,18 @@ Die kanonische Konfiguration ist:
 ```
 
 `e3dc.config.txt` ist nur noch ein Legacy-Import und Fallback für alte
-Installationen und Migrationen. WebUI-Einstellungen, Dienste und
-Installer-Optionen werden in `e3dc_v4.json` gespeichert.
+Installationen, Migrationen und einzelne Debug-Werkzeuge. Neue
+WebUI-Einstellungen, Dienste und Installer-Optionen sollen in `e3dc_v4.json`
+gespeichert werden.
 
 Wichtige Folgen:
 
 - Der Config-Editor arbeitet direkt mit `e3dc_v4.json`.
 - Python-Dienste lesen zuerst `e3dc_v4.json`.
-- `e3dc.config.txt` ist keine primäre Quelle für den laufenden Betrieb.
+- `e3dc.config.txt` darf nicht mehr als primäre Quelle für neue Features
+  verwendet werden.
 - `e3dc.wallbox.txt` und `e3dc.wallbox.out` bleiben nur für Legacy-Importe,
-  Migration und historische Ladepläne relevant.
+  alte Debug-Werkzeuge und historische Ladepläne relevant.
 
 ## Aktive Dienste
 
@@ -41,7 +43,7 @@ Die Ladekurve ist eine Soll-SoC-Trajektorie für den Speicher. Sie wird vom
 `storage_simulator.py` mit Wetterprognose, Verbrauchsmodell, EPEX/Eco-Score,
 saisonalem Nachtverbrauch und optionalem Mittagsziel erstellt.
 
-Im Betrieb gilt:
+Aktueller Stand:
 
 - vergangene und aktive Stützpunkte werden eingefroren,
 - kommende Punkte werden rollierend geglättet,
@@ -105,3 +107,14 @@ Der netzdienliche Eco-Modus und der Negativpreis-/Preis-Boost sind Opt-in-Pfade.
 Unbekannte externe Dauerlasten werden nicht geraten. Wenn ein BEV, eine
 Wärmepumpe oder ein anderer großer Verbraucher regelrelevant sein soll, muss
 seine Leistung eingebunden oder geplant sein.
+
+## Dokumentationsregel
+
+Wenn eine Doku von Konfiguration spricht, ist damit diese zentrale Datei gemeint:
+
+```text
+data/e3dc_v4.json
+```
+
+Nur Migrations-, Rollback- und Legacy-Abschnitte sollen `e3dc.config.txt` als
+aktive Datei nennen.

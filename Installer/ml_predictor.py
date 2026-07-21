@@ -9,7 +9,22 @@ import datetime
 import pickle
 import grp
 import pwd
+import secrets
 import stat
+import hashlib
+import re
+import statistics
+from contextlib import contextmanager
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Produktion läuft unter Linux; zur Laufzeit fail-closed.
+    fcntl = None
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(SCRIPT_DIR)
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
 # Standard-Ausgabe auf UTF-8 erzwingen (verhindert UnicodeEncodeError)
 try:
@@ -28,7 +43,9 @@ except ImportError:
     HAS_SKLEARN = False
 
 DB_PATH = "/var/www/html/data/e3dc_stats.db"
-MODEL_PATH = "/var/www/html/data/ml_model.pkl"
+MODEL_DIR = os.environ.get("E3DC_ML_MODEL_DIR", "/var/lib/e3dc-control/ml")
+MODEL_PATH = os.path.join(MODEL_DIR, "ml_model.pkl")
+LEGACY_MODEL_PATH = "/var/www/html/data/ml_model.pkl"
 PREDICTION_PATH = "/var/www/html/ramdisk/ml_prediction.json"
 V4_CONFIG_FILE = "/var/www/html/data/e3dc_v4.json"
 ML_CONSUMPTION_EVAL_PATH = "/var/www/html/logs/ml_consumption_eval.json"
@@ -36,6 +53,13 @@ ML_DAILY_FORECAST_MIN_COVERAGE_SLOTS = 80
 ML_DAILY_FORECAST_LEGACY_FULL_DAY_CUTOFF_HOUR = 4
 LIVE_HISTORY_PATH = "/var/www/html/ramdisk/live_history.txt"
 CLIMATE_HISTORY_DIR = "/var/www/html/data/climate_history"
+ML_MODEL_SCHEMA_VERSION = 1
+ML_MODEL_FORMAT = "e3dc-sklearn-pickle"
+ML_MODEL_MAX_BYTES = 128 * 1024 * 1024
+_MODEL_FILE_RE = re.compile(r"^ml_model-([0-9a-f]{64})\.pkl$")
+ML_PREDICTION_SCHEMA_VERSION = 2
+ML_EMPIRICAL_MIN_SAMPLES = 48
+ML_EMPIRICAL_RECENT_DAYS = 56
 
 
 def _set_shared_web_file(path, mode=0o664):
@@ -51,50 +75,383 @@ def _set_shared_web_file(path, mode=0o664):
 
 
 def _trusted_ml_owner_uids():
-    trusted = {os.geteuid(), 0}
     try:
-        with open("/var/www/html/e3dc_paths.json", "r", encoding="utf-8-sig") as f:
-            install_user = str(json.load(f).get("install_user", "")).strip()
-        if install_user:
-            trusted.add(pwd.getpwnam(install_user).pw_uid)
+        _uid, _gid, trusted_uids, _trusted_gids = _trusted_ml_identity()
+        return trusted_uids
     except Exception:
-        pass
+        return set()
+
+
+def _trusted_ml_identity():
+    """Löst unabhängig von Laufzeitpfad-APIs nur den Owner des privaten Speichers auf."""
+
+    model_dir = os.path.dirname(os.path.abspath(MODEL_PATH))
     try:
-        trusted.add(pwd.getpwnam("pi").pw_uid)
-    except Exception:
+        directory = os.lstat(model_dir)
+    except FileNotFoundError:
+        directory = None
+    if directory is not None:
+        if (
+            stat.S_ISLNK(directory.st_mode)
+            or not stat.S_ISDIR(directory.st_mode)
+            or stat.S_IMODE(directory.st_mode) != 0o700
+        ):
+            raise PermissionError("Privater ML-Store besitzt keinen sicheren Verzeichnisvertrag")
+        uid, gid = int(directory.st_uid), int(directory.st_gid)
+    else:
+        uid, gid = os.geteuid(), os.getegid()
+
+    try:
+        account = pwd.getpwuid(uid)
+    except KeyError as exc:
+        raise PermissionError("ML-Store-Owner ist kein lokales Systemkonto") from exc
+    if account.pw_name == "www-data":
+        raise PermissionError("ML-Modell darf nicht dem Web-Benutzer gehoeren")
+    return uid, gid, {0, uid}, {0, gid}
+
+
+def _ml_parent_security_error(path, trusted_uids):
+    candidate = os.path.abspath(str(path or ""))
+    if not os.path.isabs(str(path or "")) or os.path.realpath(candidate) != candidate:
+        return "Modellpfad besitzt keine sichere absolute Elternkette"
+
+    current = os.path.dirname(candidate) or os.sep
+    while True:
+        try:
+            info = os.lstat(current)
+        except OSError:
+            return "Modellverzeichnis konnte nicht sicher geprueft werden"
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            return "Eine Elternkomponente des Modellpfads ist nicht sicher"
+        if info.st_uid not in trusted_uids:
+            return "Eine Elternkomponente gehört keinem bestätigten Besitzer"
+        writable = info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        if writable:
+            # Ein root-eigenes Sticky-Verzeichnis ist nur die Systemgrenze;
+            # darunter müssen ausnahmslos sichere Komponenten liegen.
+            if info.st_uid == 0 and (info.st_mode & stat.S_ISVTX):
+                break
+            return "Eine Elternkomponente ist gruppen- oder weltbeschreibbar"
+        parent = os.path.dirname(current.rstrip(os.sep)) or os.sep
+        if parent == current:
+            break
+        current = parent
+    return None
+
+
+def _ml_file_stat_security_error(file_stat, owner_uid):
+    if not stat.S_ISREG(file_stat.st_mode):
+        return "Modellpfad ist keine regulaere Datei"
+    if stat.S_IMODE(file_stat.st_mode) != 0o600:
+        return "ML-Modell besitzt nicht den vorgeschriebenen Modus 0600"
+    if file_stat.st_uid != owner_uid:
+        return "ML-Modell gehört nicht dem bestätigten Installationsbenutzer"
+    if file_stat.st_nlink != 1:
+        return "ML-Modell besitzt eine unzulaessige Hardlink-Anzahl"
+    return None
+
+
+def _ml_manifest_name(path):
+    stem = os.path.splitext(os.path.basename(path))[0]
+    return f"{stem}.manifest.json"
+
+
+def _ml_lock_name(path):
+    stem = os.path.splitext(os.path.basename(path))[0]
+    return f".{stem}.lock"
+
+
+def _ml_model_directory_security_error(path, owner_uid, trusted_uids):
+    parent_error = _ml_parent_security_error(path, trusted_uids)
+    if parent_error:
+        return parent_error
+    try:
+        directory_stat = os.lstat(os.path.dirname(os.path.abspath(path)))
+    except OSError:
+        return "Privates ML-Modellverzeichnis fehlt"
+    if stat.S_ISLNK(directory_stat.st_mode) or not stat.S_ISDIR(directory_stat.st_mode):
+        return "Privates ML-Modellverzeichnis ist kein echtes Verzeichnis"
+    if directory_stat.st_uid != owner_uid:
+        return "Privates ML-Modellverzeichnis besitzt einen falschen Owner"
+    if stat.S_IMODE(directory_stat.st_mode) != 0o700:
+        return "Privates ML-Modellverzeichnis besitzt nicht den Modus 0700"
+    return None
+
+
+def _ensure_private_ml_model_directory(path):
+    """Erstellt nur das endgültige private Verzeichnis unter einem bereits vertrauenswürdigen Elternpfad."""
+    owner_uid, owner_gid, trusted_uids, _trusted_gids = _trusted_ml_identity()
+    model_dir = os.path.dirname(os.path.abspath(path))
+    parent = os.path.dirname(model_dir.rstrip(os.sep)) or os.sep
+    leaf = os.path.basename(model_dir)
+    if not leaf or os.path.realpath(parent) != parent:
+        raise PermissionError("ML-Modellverzeichnis besitzt keinen sicheren Elternpfad")
+
+    parent_error = _ml_parent_security_error(os.path.join(parent, ".ml-parent-check"), trusted_uids)
+    if parent_error:
+        raise PermissionError(parent_error)
+
+    parent_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    parent_fd = os.open(parent, parent_flags)
+    try:
+        created = False
+        try:
+            os.mkdir(leaf, 0o700, dir_fd=parent_fd)
+            created = True
+        except FileExistsError:
+            pass
+        dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        model_fd = os.open(leaf, dir_flags, dir_fd=parent_fd)
+        try:
+            if created:
+                os.fchown(model_fd, owner_uid, owner_gid)
+                os.fchmod(model_fd, 0o700)
+                os.fsync(model_fd)
+            info = os.fstat(model_fd)
+            if info.st_uid != owner_uid or stat.S_IMODE(info.st_mode) != 0o700:
+                raise PermissionError("Privates ML-Modellverzeichnis besitzt falschen Owner oder Modus")
+            if not stat.S_ISDIR(info.st_mode):
+                raise PermissionError("Privates ML-Modellverzeichnis ist kein Verzeichnis")
+        finally:
+            os.close(model_fd)
+    finally:
+        os.close(parent_fd)
+
+
+def _open_private_ml_model_directory(path, create=False):
+    if create and not os.path.lexists(os.path.dirname(os.path.abspath(path))):
+        _ensure_private_ml_model_directory(path)
+    owner_uid, owner_gid, trusted_uids, _trusted_gids = _trusted_ml_identity()
+    security_error = _ml_model_directory_security_error(path, owner_uid, trusted_uids)
+    if security_error:
+        raise PermissionError(security_error)
+    model_dir = os.path.dirname(os.path.abspath(path))
+    before = os.lstat(model_dir)
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    dir_fd = os.open(model_dir, flags)
+    after = os.fstat(dir_fd)
+    if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+        os.close(dir_fd)
+        raise PermissionError("ML-Modellverzeichnis wurde während der Prüfung ausgetauscht")
+    return dir_fd, owner_uid, owner_gid
+
+
+def _read_secure_regular_file(dir_fd, name, owner_uid, max_bytes):
+    if not name or name in {".", ".."} or os.path.basename(name) != name:
+        raise PermissionError("Ungültiger ML-Dateiname")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    file_fd = os.open(name, flags, dir_fd=dir_fd)
+    try:
+        before = os.fstat(file_fd)
+        security_error = _ml_file_stat_security_error(before, owner_uid)
+        if security_error:
+            raise PermissionError(security_error)
+        if before.st_size < 1 or before.st_size > max_bytes:
+            raise PermissionError("ML-Datei besitzt eine unzulässige Größe")
+        chunks = []
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(file_fd, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(file_fd)
+        signature_before = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+        signature_after = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        if remaining or signature_before != signature_after:
+            raise PermissionError("ML-Datei wurde während der Prüfung verändert")
+        return b"".join(chunks)
+    finally:
+        os.close(file_fd)
+
+
+def _write_secure_atomic_file(dir_fd, name, payload, owner_uid, owner_gid):
+    existing = None
+    try:
+        existing = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    except FileNotFoundError:
         pass
-    return trusted
+    if existing is not None:
+        security_error = _ml_file_stat_security_error(existing, owner_uid)
+        if security_error:
+            raise PermissionError(security_error)
+
+    tmp_name = f".{name}.tmp.{os.getpid()}.{secrets.token_hex(8)}"
+    tmp_fd = None
+    try:
+        tmp_fd = os.open(
+            tmp_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=dir_fd,
+        )
+        # Die Vertraulichkeit wird durch Owner-UID und Modus 0600 erzwungen;
+        # die Dateigruppe besitzt deshalb keinerlei Leserecht. Dienste laufen
+        # teilweise absichtlich als ``User=pi, Group=www-data``. Ein fchown auf
+        # die primäre Installationsgruppe (z. B. pi:pi) ist dann für denselben
+        # UID nicht erlaubt und hatte das sichere wochenweise Neutraining mit
+        # EPERM blockiert. Nur eine wirklich abweichende Owner-UID wird
+        # korrigiert; die beim O_CREAT entstandene effektive Gruppe bleibt bei
+        # privaten 0600-Dateien sicher und ist kein Reader-Vertragsmerkmal.
+        created = os.fstat(tmp_fd)
+        if created.st_uid != owner_uid:
+            os.fchown(tmp_fd, owner_uid, -1)
+        os.fchmod(tmp_fd, 0o600)
+        view = memoryview(payload)
+        while view:
+            written = os.write(tmp_fd, view)
+            if written <= 0:
+                raise OSError("ML-Datei konnte nicht vollständig geschrieben werden")
+            view = view[written:]
+        os.fsync(tmp_fd)
+        security_error = _ml_file_stat_security_error(os.fstat(tmp_fd), owner_uid)
+        if security_error:
+            raise PermissionError(security_error)
+        os.close(tmp_fd)
+        tmp_fd = None
+        os.replace(tmp_name, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        os.fsync(dir_fd)
+    finally:
+        if tmp_fd is not None:
+            os.close(tmp_fd)
+        try:
+            os.unlink(tmp_name, dir_fd=dir_fd)
+        except FileNotFoundError:
+            pass
+
+
+@contextmanager
+def _ml_model_lock(path, exclusive=False, create_directory=False):
+    if fcntl is None:
+        raise PermissionError("ML-Modellsperre ist auf diesem System nicht verfügbar")
+    dir_fd, owner_uid, owner_gid = _open_private_ml_model_directory(path, create=create_directory)
+    lock_fd = None
+    try:
+        lock_name = _ml_lock_name(path)
+        lock_fd = os.open(
+            lock_name,
+            os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=dir_fd,
+        )
+        lock_error = _ml_file_stat_security_error(os.fstat(lock_fd), owner_uid)
+        if lock_error:
+            raise PermissionError(lock_error)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        yield dir_fd, owner_uid, owner_gid
+    finally:
+        if lock_fd is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(lock_fd)
+        os.close(dir_fd)
+
+
+def _read_verified_ml_payload(path):
+    with _ml_model_lock(path, exclusive=False) as (dir_fd, owner_uid, _owner_gid):
+        manifest_bytes = _read_secure_regular_file(
+            dir_fd, _ml_manifest_name(path), owner_uid, 64 * 1024
+        )
+        try:
+            manifest = json.loads(manifest_bytes.decode("utf-8"))
+        except Exception as exc:
+            raise ValueError("ML-Manifest ist unlesbar") from exc
+        if not isinstance(manifest, dict):
+            raise ValueError("ML-Manifest besitzt kein Objektformat")
+        if manifest.get("schema_version") != ML_MODEL_SCHEMA_VERSION:
+            raise ValueError("ML-Manifest besitzt eine unbekannte Version")
+        if manifest.get("format") != ML_MODEL_FORMAT:
+            raise ValueError("ML-Manifest besitzt ein unbekanntes Modellformat")
+        model_file = str(manifest.get("model_file") or "")
+        expected_hash = str(manifest.get("model_sha256") or "")
+        match = _MODEL_FILE_RE.fullmatch(model_file)
+        if match is None or match.group(1) != expected_hash:
+            raise ValueError("ML-Manifest verweist nicht auf ein hashgebundenes Modell")
+        payload = _read_secure_regular_file(dir_fd, model_file, owner_uid, ML_MODEL_MAX_BYTES)
+        actual_hash = hashlib.sha256(payload).hexdigest()
+        if not secrets.compare_digest(actual_hash, expected_hash):
+            raise ValueError("ML-Modellhash stimmt nicht mit dem Manifest ueberein")
+        return payload, manifest
 
 
 def _ml_model_security_error(path):
     try:
-        link_stat = os.lstat(path)
-        if stat.S_ISLNK(link_stat.st_mode):
-            return "Modellpfad ist ein Symlink"
-        file_stat = os.stat(path)
-        if not stat.S_ISREG(file_stat.st_mode):
-            return "Modellpfad ist keine reguläre Datei"
-        if file_stat.st_mode & stat.S_IWOTH:
-            return "ML-Modell ist für alle Benutzer schreibbar"
-        parent_stat = os.stat(os.path.dirname(path) or ".")
-        if parent_stat.st_mode & stat.S_IWOTH:
-            return "ML-Modellverzeichnis ist für alle Benutzer schreibbar"
-        if file_stat.st_uid not in _trusted_ml_owner_uids():
-            return f"ML-Modell gehört keinem vertrauten Benutzer (uid={file_stat.st_uid})"
+        _read_verified_ml_payload(path)
         return None
-    except OSError as exc:
-        return f"ML-Modell konnte nicht geprueft werden: {exc}"
+    except Exception as exc:
+        return str(exc) or "ML-Modell konnte nicht sicher geprueft werden"
 
 
-def _load_ml_model_safely(path):
+def _write_ml_model_safely(path, models):
+    payload = pickle.dumps(models, protocol=pickle.HIGHEST_PROTOCOL)
+    payload_hash = hashlib.sha256(payload).hexdigest()
+    stem, extension = os.path.splitext(os.path.basename(path))
+    artifact_name = f"{stem}-{payload_hash}{extension}"
+    manifest = {
+        "schema_version": ML_MODEL_SCHEMA_VERSION,
+        "format": ML_MODEL_FORMAT,
+        "model_file": artifact_name,
+        "model_sha256": payload_hash,
+        "trained_at": str(models.get("trained_at") or "") if isinstance(models, dict) else "",
+    }
+    manifest_payload = (
+        json.dumps(manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n"
+    ).encode("utf-8")
+
+    with _ml_model_lock(path, exclusive=True, create_directory=True) as (dir_fd, owner_uid, owner_gid):
+        try:
+            existing_payload = _read_secure_regular_file(
+                dir_fd, artifact_name, owner_uid, ML_MODEL_MAX_BYTES
+            )
+        except FileNotFoundError:
+            _write_secure_atomic_file(dir_fd, artifact_name, payload, owner_uid, owner_gid)
+        else:
+            if not secrets.compare_digest(hashlib.sha256(existing_payload).hexdigest(), payload_hash):
+                raise PermissionError("Vorhandenes ML-Artefakt stimmt nicht mit seinem Dateihash ueberein")
+        _write_secure_atomic_file(
+            dir_fd, _ml_manifest_name(path), manifest_payload, owner_uid, owner_gid
+        )
+
     security_error = _ml_model_security_error(path)
     if security_error:
         raise PermissionError(security_error)
-    with open(path, 'rb') as f:
-        models = pickle.load(f)
+
+
+def _load_ml_model_safely(path):
+    payload, _manifest = _read_verified_ml_payload(path)
+    models = pickle.loads(payload)
     if not isinstance(models, dict) or "home" not in models or "wp" not in models:
         raise ValueError("ML-Modell hat kein erwartetes Format")
     return models
+
+
+def ml_model_is_ready(path=MODEL_PATH):
+    try:
+        _read_verified_ml_payload(path)
+        return True
+    except Exception:
+        return False
+
+
+def _legacy_ml_model_notice():
+    if os.path.lexists(LEGACY_MODEL_PATH):
+        return (
+            f"Legacy-Modell wird nicht geladen oder uebernommen: {LEGACY_MODEL_PATH}. "
+            "Neutraining aus lokalen SQLite-/JSON-/Text-Trainingsdaten erforderlich."
+        )
+    return None
+
+
+def _activate_conservative_ml_fallback(reason):
+    try:
+        os.unlink(PREDICTION_PATH)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        print(f"WARNUNG: Alte ML-Prognose konnte nicht entfernt werden: {exc}")
+    print(f"ML-Prognose nicht verfügbar; konservativer System-Fallback bleibt aktiv ({reason}).")
 
 
 def _ensure_ml_training_table(conn):
@@ -154,8 +511,8 @@ def _parse_live_ts(value):
         return None
 
 
-def _seed_ml_training_from_live_history(min_rows=50):
-    """Erzeugt ML-Trainingspunkte aus live_history.txt, wenn Ertrag.X.txt fehlt.
+def _seed_ml_training_from_live_history(min_rows=50, refresh=False):
+    """Erzeugt oder aktualisiert ML-Trainingspunkte aus live_history.txt.
 
     Docker-Installationen haben oft keine alten C++-Ertrag-Dateien. Die
     persistenten Tageswerte reichen fuer Statistiken, aber nicht fuer das
@@ -173,7 +530,7 @@ def _seed_ml_training_from_live_history(min_rows=50):
         existing_rows = c.execute("SELECT COUNT(*) FROM ml_training_data").fetchone()[0]
     except Exception:
         existing_rows = 0
-    if existing_rows >= min_rows:
+    if existing_rows >= min_rows and not refresh:
         conn.close()
         return 0
 
@@ -917,7 +1274,7 @@ def _update_consumption_accuracy_log(timeline):
 
 def load_training_data():
     if not os.path.exists(DB_PATH): return None, None
-        
+
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     _ensure_ml_training_table(conn)
@@ -925,22 +1282,25 @@ def load_training_data():
     row_count = c.execute("SELECT COUNT(*) FROM ml_training_data").fetchone()[0]
     conn.close()
 
-    if row_count < 50:
-        _seed_ml_training_from_live_history()
+    # Auch bei bereits großer, aber alter Tabelle die aktuelle Live-Historie
+    # idempotent nachziehen. INSERT OR REPLACE verhindert Dubletten. Damit
+    # trainiert ein System nach Monaten nicht dauerhaft nur auf dem alten
+    # Installationsfenster weiter.
+    _seed_ml_training_from_live_history(refresh=True)
 
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT date, time_gmt, home_kwh_cum, wp_kwh_cum, temp_c FROM ml_training_data ORDER BY date, time_gmt")
     rows = c.fetchall()
     conn.close()
-    
+
     if len(rows) < 50:
         print(f"Nicht genug Trainingsdaten: {len(rows)} Datensaetze (benoetigt: 50).")
         return None, None
 
     X = []; y_home = []; y_wp = []
     last_date = None; last_home_cum = 0; last_wp_cum = 0; last_time_gmt = 0
-    
+
     for row in rows:
         date_str, time_gmt, home_cum, wp_cum, temp_c = row
         try:
@@ -948,16 +1308,16 @@ def load_training_data():
             day_of_week = dt.weekday() # 0 = Mo, 6 = So
             month = dt.month
         except: continue
-            
+
         if last_date == date_str:
             time_diff = time_gmt - last_time_gmt
             if time_diff < 0: time_diff += 24.0 # Sollte durch ORDER BY nicht passieren
-            
+
             # Ignoriere Lücken > 2 Stunden
             if 0 < time_diff <= 2.0:
                 home_delta = max(0, home_cum - last_home_cum)
                 wp_delta = max(0, wp_cum - last_wp_cum)
-                
+
                 # Normierung auf Leistung (kW) macht das Training immun gegen unregelmäßige Zeitabstände
                 home_kw = home_delta / time_diff
                 wp_kw = wp_delta / time_diff
@@ -971,9 +1331,9 @@ def load_training_data():
                     X.append([time_gmt, day_of_week, month, temp_c])
                     y_home.append(home_kw)
                     y_wp.append(wp_kw)
-        
+
         last_date = date_str; last_home_cum = home_cum; last_wp_cum = wp_cum; last_time_gmt = time_gmt
-        
+
     return np.array(X), (np.array(y_home), np.array(y_wp))
 
 
@@ -1133,14 +1493,218 @@ def _build_luxtronik_temp_index():
     return result
 
 
+def _trimmed_mean(values):
+    """Robuster Erwartungswert für historische Leistungsstichproben."""
+
+    finite = sorted(
+        float(value)
+        for value in values
+        if isinstance(value, (int, float)) and float(value) >= 0.0
+    )
+    if not finite:
+        return None
+    if len(finite) >= 10:
+        trim = max(1, int(len(finite) * 0.1))
+        finite = finite[trim:-trim] or finite
+    return statistics.fmean(finite)
+
+
+def _load_empirical_consumption_profile(now=None):
+    """Liest ein reines, nicht ausführbares Historienprofil ohne Pickle.
+
+    Der Pfad ist der sichere Rückfall, wenn noch kein manifestgebundenes
+    ML-Modell existiert. Er deserialisiert ausdrücklich kein Legacy-Modell.
+    Aus den kumulativen 15-Minuten-Historien werden robuste Leistungswerte je
+    Tagesart und Viertelstunde gebildet. Die jüngsten verfügbaren Tage sind
+    führend; ihr Alter bleibt als Qualitätsmetadatum sichtbar.
+    """
+
+    if not os.path.exists(DB_PATH):
+        return None
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ml_training_data'"
+        ).fetchone()
+        if not table:
+            conn.close()
+            return None
+        rows = conn.execute(
+            """
+            SELECT date, time_gmt, home_kwh_cum, wp_kwh_cum, temp_c
+            FROM ml_training_data
+            ORDER BY date, time_gmt
+            """
+        ).fetchall()
+        conn.close()
+    except Exception as exc:
+        print(f"Historisches Verbrauchsprofil konnte nicht gelesen werden: {exc}")
+        return None
+
+    parsed_dates = []
+    for row in rows:
+        try:
+            parsed_dates.append(datetime.datetime.strptime(str(row[0]), "%Y-%m-%d").date())
+        except Exception:
+            continue
+    if not parsed_dates:
+        return None
+    latest_date = max(parsed_dates)
+    recent_start = latest_date - datetime.timedelta(days=ML_EMPIRICAL_RECENT_DAYS - 1)
+    home_cap = _load_ml_home_cap()
+    samples = []
+    previous = None
+
+    for date_str, time_gmt, home_cum, wp_cum, temp_c in rows:
+        try:
+            day = datetime.datetime.strptime(str(date_str), "%Y-%m-%d").date()
+            hour_value = float(time_gmt)
+            home_value = float(home_cum)
+            wp_value = float(wp_cum)
+        except Exception:
+            previous = None
+            continue
+        if day < recent_start:
+            continue
+        if previous is not None and previous["day"] == day:
+            delta_h = hour_value - previous["hour"]
+            if delta_h < 0.0:
+                delta_h += 24.0
+            if 0.0 < delta_h <= 2.0:
+                home_kw = max(0.0, home_value - previous["home"]) / delta_h
+                wp_kw = max(0.0, wp_value - previous["wp"]) / delta_h
+                if home_kw < 30.0 and wp_kw < 20.0:
+                    slot = int(round(hour_value * 4.0)) % 96
+                    samples.append({
+                        "slot": slot,
+                        "day_type": "weekend" if day.weekday() >= 5 else "weekday",
+                        "home_kw": min(home_kw, home_cap),
+                        "wp_kw": wp_kw,
+                        "temp_c": _as_float(temp_c, 8.5),
+                        "date": day.isoformat(),
+                    })
+        previous = {
+            "day": day,
+            "hour": hour_value,
+            "home": home_value,
+            "wp": wp_value,
+        }
+
+    if len(samples) < ML_EMPIRICAL_MIN_SAMPLES:
+        return None
+
+    current_date = (now or datetime.datetime.now()).date()
+    return {
+        "samples": samples,
+        "sample_count": len(samples),
+        "home_positive_samples": sum(1 for row in samples if row["home_kw"] > 0.0),
+        "wp_positive_samples": sum(1 for row in samples if row["wp_kw"] > 0.0),
+        "first_date": min(row["date"] for row in samples),
+        "last_date": latest_date.isoformat(),
+        "age_days": max(0, (current_date - latest_date).days),
+        "recent_days": ML_EMPIRICAL_RECENT_DAYS,
+    }
+
+
+def _wp_forecast_capable(cfg, profile):
+    try:
+        if int(cfg.get("wp_type", -1)) > 0:
+            return True
+    except Exception:
+        pass
+    if int(profile.get("wp_positive_samples", 0) or 0) >= 4:
+        return True
+    for key in (
+        "luxtronik",
+        "native_heatpump_enable",
+        "market_heatpump_enable",
+        "heat_policy_runtime_enable",
+    ):
+        if _truthy(cfg.get(key), False):
+            return True
+    return False
+
+
+def _empirical_power_for_slot(profile, target_ts, slot_temp, cfg):
+    samples = list(profile.get("samples") or [])
+    slot = target_ts.hour * 4 + int(target_ts.minute / 15)
+    day_type = "weekend" if target_ts.weekday() >= 5 else "weekday"
+
+    candidates = [
+        row for row in samples
+        if row.get("slot") == slot and row.get("day_type") == day_type
+    ]
+    source = "historical_slot_daytype"
+    if len(candidates) < 2:
+        candidates = [row for row in samples if row.get("slot") == slot]
+        source = "historical_slot_all_days"
+    if len(candidates) < 2:
+        candidates = [
+            row for row in samples
+            if min((int(row.get("slot", 0)) - slot) % 96, (slot - int(row.get("slot", 0))) % 96) <= 2
+        ]
+        source = "historical_neighbour_slots"
+    if not candidates:
+        candidates = samples
+        source = "historical_global_profile"
+
+    home_kw = _trimmed_mean([row.get("home_kw") for row in candidates])
+    if home_kw is None or home_kw <= 0.0:
+        home_kw = 0.5
+        home_source = "static_fallback_no_home_history"
+        home_quality = "fallback"
+    else:
+        home_source = source
+        home_quality = "empirical"
+
+    if _wp_forecast_capable(cfg, profile):
+        # Für die WP aus demselben Zeitslot die zur Wetterprognose nächsten
+        # historischen Temperaturen bevorzugen. Mittelwert statt Median bildet
+        # den erwarteten Taktanteil ab, ohne einzelne Leistungsspitzen zu kopieren.
+        ranked = sorted(
+            candidates,
+            key=lambda row: abs(_as_float(row.get("temp_c"), 8.5) - float(slot_temp)),
+        )
+        wp_candidates = ranked[: min(12, max(3, len(ranked)))]
+        wp_kw = _trimmed_mean([row.get("wp_kw") for row in wp_candidates])
+        if wp_kw is None or int(profile.get("wp_positive_samples", 0) or 0) < 4:
+            wp_kw = 0.3
+            wp_source = "static_fallback_no_wp_history"
+            wp_quality = "fallback"
+        else:
+            wp_source = source + "_temperature_matched"
+            wp_quality = "empirical"
+    else:
+        wp_kw = 0.0
+        wp_source = "not_applicable"
+        wp_quality = "not_applicable"
+
+    return {
+        "home_kw": max(0.0, float(home_kw)),
+        "wp_kw": max(0.0, float(wp_kw)),
+        "home_source": home_source,
+        "home_quality": home_quality,
+        "wp_source": wp_source,
+        "wp_quality": wp_quality,
+        "sample_count": len(candidates),
+    }
+
+
 def train_model():
     if not HAS_SKLEARN:
         print("FEHLER: scikit-learn ist nicht installiert. Bitte fuehre im Installer Punkt 3 aus.")
+        _activate_conservative_ml_fallback("scikit-learn fehlt")
         return False
+
+    legacy_notice = _legacy_ml_model_notice()
+    if legacy_notice:
+        print(legacy_notice)
 
     print("Lade und bereite historische Daten auf...")
     res = load_training_data()
-    if res[0] is None: return False
+    if res[0] is None:
+        _activate_conservative_ml_fallback("noch keine ausreichenden Trainingsdaten")
+        return False
 
     X, (y_home, y_wp) = res
 
@@ -1167,35 +1731,65 @@ def train_model():
     model_home.fit(X, y_home)
     model_wp.fit(X,   y_wp)
 
-    with open(MODEL_PATH, 'wb') as f:
-        pickle.dump({'home': model_home, 'wp': model_wp, 'trained_at': datetime.datetime.now().isoformat()}, f)
-    _set_shared_web_file(MODEL_PATH)
-        
+    try:
+        _write_ml_model_safely(
+            MODEL_PATH,
+            {'home': model_home, 'wp': model_wp, 'trained_at': datetime.datetime.now().isoformat()},
+        )
+    except Exception as exc:
+        print(f"FEHLER: ML-Modell konnte nicht sicher gespeichert werden: {exc}")
+        _activate_conservative_ml_fallback("sicheres Modell konnte nicht veroeffentlicht werden")
+        return False
+
     print(f"[OK] ML-Modell erfolgreich trainiert ({MODEL_PATH}).", flush=True)
     return True
 
 def predict_today():
-    if not HAS_SKLEARN:
-        print("FEHLER: scikit-learn ist nicht installiert. Bitte fuehre im Installer Punkt 3 aus.")
-        return False
-
-    if not os.path.exists(MODEL_PATH):
-        print(f"Kein Modell gefunden: {MODEL_PATH}. Bitte erst trainieren:")
-        print("  python3 ml_predictor.py --train")
-        print(f"Hinweis: {PREDICTION_PATH} liegt in der Ramdisk und wird erst nach erfolgreichem --predict erzeugt.")
-        return False
-
-    try:
-        models = _load_ml_model_safely(MODEL_PATH)
-    except Exception as exc:
-        print(f"FEHLER: ML-Modell wird aus Sicherheitsgründen nicht geladen: {exc}")
-        print("Bitte Modell im Installer neu trainieren, falls die Datei absichtlich ersetzt wurde.")
-        return False
-    _set_shared_web_file(MODEL_PATH)
-    model_home = models['home']
-    model_wp   = models['wp']
-
     now = datetime.datetime.now()
+    forecast_mode = "verified_ml_model"
+    model_ready = False
+    model_reason = ""
+    model_home = None
+    model_wp = None
+    empirical_profile = None
+
+    # Das signierte Modell bleibt die führende Quelle. Fehlt sklearn oder ist
+    # das Modell/Manifest nicht vertrauenswürdig, wird niemals ein Legacy-
+    # Pickle geladen. Statt des groben 500/300/0-Systemfallbacks erzeugen wir
+    # jedoch ein reines Historienprofil aus den bereits validierten lokalen
+    # Zählerdaten. Damit bleibt die Verbrauchsprognose variabel, bis ein neues
+    # Modell sicher trainiert und veröffentlicht wurde.
+    if not HAS_SKLEARN:
+        model_reason = "scikit-learn_fehlt"
+    elif not ml_model_is_ready(MODEL_PATH):
+        model_reason = "kein_vertrauenswuerdiges_modell"
+    else:
+        try:
+            models = _load_ml_model_safely(MODEL_PATH)
+            model_home = models['home']
+            model_wp = models['wp']
+            model_ready = True
+        except Exception as exc:
+            model_reason = f"modellpruefung_fehlgeschlagen:{type(exc).__name__}"
+            print(f"FEHLER: ML-Modell wird aus Sicherheitsgründen nicht geladen: {exc}")
+
+    if not model_ready:
+        legacy_notice = _legacy_ml_model_notice()
+        if legacy_notice:
+            print(legacy_notice)
+        empirical_profile = _load_empirical_consumption_profile(now=now)
+        if not empirical_profile:
+            reason = model_reason or "keine_ausreichende_historie"
+            _activate_conservative_ml_fallback(reason)
+            return False
+        forecast_mode = "historical_profile"
+        print(
+            "Kein nutzbares sicheres ML-Modell; verwende variables Historienprofil "
+            f"aus {empirical_profile['sample_count']} Intervallen "
+            f"({empirical_profile['first_date']} bis {empirical_profile['last_date']})."
+        )
+    else:
+        print("Verbrauchsprognose verwendet das manifest- und hashgeprüfte ML-Modell.")
 
     # --- Schritt 1: Aktuelle Aussentemperatur als Fallback ---
     # Prioritaet: 1) weather_forecast.json (Open-Meteo, aktuelle Stunde) - zuverlaessig!
@@ -1289,14 +1883,38 @@ def predict_today():
             slots_with_fallback += 1
         slot_key = target_ts.hour * 4 + int(target_ts.minute / 15)
 
-        # Feature-Vektor: [Stunde_GMT, Wochentag, Monat, Aussentemperatur_Prognose]
-        # WICHTIG: Reihenfolge muss exakt dem Training entsprechen!
-        X_pred = np.array([[time_gmt, d_of_w, m, slot_temp]])
+        if forecast_mode == "verified_ml_model":
+            # Feature-Vektor: [Stunde_GMT, Wochentag, Monat,
+            # Aussentemperatur_Prognose]. Die Reihenfolge muss exakt dem
+            # Training entsprechen.
+            X_pred = np.array([[time_gmt, d_of_w, m, slot_temp]])
+            power_home = max(0, model_home.predict(X_pred)[0])
+            power_wp = max(0, model_wp.predict(X_pred)[0])
+            consumption_slot = {
+                "home_source": "verified_ml_model",
+                "home_quality": "model",
+                "wp_source": "verified_ml_model",
+                "wp_quality": "model",
+                "sample_count": None,
+            }
+        else:
+            consumption_slot = _empirical_power_for_slot(
+                empirical_profile,
+                target_ts,
+                slot_temp,
+                cfg,
+            )
+            power_home = consumption_slot["home_kw"]
+            power_wp = consumption_slot["wp_kw"]
 
         # Leistung in kW (Durchschnittsleistung im 15-Min-Slot)
-        power_home = max(0, model_home.predict(X_pred)[0])
-        power_wp   = max(0, model_wp.predict(X_pred)[0])
         power_climate = _climate_power_kw_for_slot(climate_profile, slot_temp, slot_key)
+        climate_source = (
+            str(climate_profile.get("source") or "historical_climate_profile")
+            if climate_profile.get("enabled")
+            else "not_applicable"
+        )
+        climate_quality = "empirical" if climate_profile.get("enabled") else "not_applicable"
 
         # Energie in kWh = Leistung * 0.25h (für aufsummierte Tages-Statistik)
         energy_home = power_home * 0.25
@@ -1309,6 +1927,13 @@ def predict_today():
             "home_kwh":        round(power_home, 4),  # kW Durchschnittsleistung im Slot
             "wp_kwh":          round(power_wp,   4),
             "climate_kwh":      round(power_climate, 4),
+            "home_source": consumption_slot["home_source"],
+            "home_quality": consumption_slot["home_quality"],
+            "wp_source": consumption_slot["wp_source"],
+            "wp_quality": consumption_slot["wp_quality"],
+            "climate_source": climate_source,
+            "climate_quality": climate_quality,
+            "historical_sample_count": consumption_slot.get("sample_count"),
             "climate_forecast_active": bool(power_climate > 0.0),
             "forecast_temp_c": round(slot_temp,  1),  # NEU: verwendete Prognosetemp (Debug/Dashboard)
         })
@@ -1324,15 +1949,22 @@ def predict_today():
     # Wir berechnen einen EMA-Korrekturfaktor aus Ist- vs. Prognose-Tageswerten.
     bias_home = 1.0
     bias_wp   = 1.0
-    try:
-        eval_log = _load_consumption_eval_log()
-        bias_home, bias_wp, n_home, n_wp = _compute_consumption_bias(eval_log)
-        if bias_home != 1.0 or bias_wp != 1.0:
-            print(f"Bias-Korrektur (ML-Verbrauch): Haus x{bias_home:.2f} ({n_home} Tage), WP x{bias_wp:.2f} ({n_wp} Tage)")
-        else:
-            print("Bias-Korrektur: zu wenig ML-Verbrauchs-Accuracy-Daten - neutraler Bias.")
-    except Exception as be:
-        print(f"Bias-Korrektur konnte nicht berechnet werden: {be}")
+    if forecast_mode == "verified_ml_model":
+        try:
+            eval_log = _load_consumption_eval_log()
+            bias_home, bias_wp, n_home, n_wp = _compute_consumption_bias(eval_log)
+            if bias_home != 1.0 or bias_wp != 1.0:
+                print(f"Bias-Korrektur (ML-Verbrauch): Haus x{bias_home:.2f} ({n_home} Tage), WP x{bias_wp:.2f} ({n_wp} Tage)")
+            else:
+                print("Bias-Korrektur: zu wenig ML-Verbrauchs-Accuracy-Daten - neutraler Bias.")
+        except Exception as be:
+            print(f"Bias-Korrektur konnte nicht berechnet werden: {be}")
+    else:
+        # Das Historienprofil ist bereits ein robuster Erwartungswert realer
+        # Intervalle. Ein alter ML-Bias würde diese Werte ein zweites Mal
+        # korrigieren und kann nach Modellverlust gerade in die falsche
+        # Richtung wirken.
+        print("Bias-Korrektur: für das empirische Historienprofil neutral.")
 
     # Bias auf Timeline anwenden
     if bias_home != 1.0 or bias_wp != 1.0:
@@ -1370,8 +2002,61 @@ def predict_today():
     # Fuer den Energy Manager und Dashboard in der Ramdisk ablegen.
     # Atomic write verhindert, dass der Storage Simulator ein halb geschriebenes
     # ml_prediction.json liest und dann auf den konservativen Fallback springt.
+    def _timeline_values(field):
+        return sorted({
+            str(slot.get(field))
+            for slot in timeline
+            if slot.get(field) not in (None, "")
+        })
+
+    history_profile_meta = None
+    if empirical_profile:
+        history_profile_meta = {
+            key: empirical_profile.get(key)
+            for key in (
+                "sample_count",
+                "home_positive_samples",
+                "wp_positive_samples",
+                "first_date",
+                "last_date",
+                "age_days",
+                "recent_days",
+            )
+        }
+
     prediction_payload = {
+        "schema_version": ML_PREDICTION_SCHEMA_VERSION,
         "ts":         datetime.datetime.now().isoformat(),
+        "forecast_mode": forecast_mode,
+        "model_ready": bool(model_ready),
+        "model_reason": model_reason or None,
+        "history_profile": history_profile_meta,
+        "consumer_sources": {
+            "home": {
+                "sources": _timeline_values("home_source"),
+                "quality": _timeline_values("home_quality"),
+            },
+            "wp": {
+                "sources": _timeline_values("wp_source"),
+                "quality": _timeline_values("wp_quality"),
+            },
+            "climate": {
+                "sources": _timeline_values("climate_source"),
+                "quality": _timeline_values("climate_quality"),
+            },
+            "wallbox": {
+                "sources": ["excluded_dynamic_without_explicit_plan"],
+                "quality": ["not_applicable"],
+            },
+            "heating_element": {
+                "sources": ["included_in_home_or_explicit_planned_load"],
+                "quality": ["no_dedicated_history_series"],
+            },
+            "domestic_hot_water_heatpump": {
+                "sources": ["included_in_home_or_explicit_planned_load"],
+                "quality": ["no_dedicated_history_series"],
+            },
+        },
         "home_kwh":   round(total_home_today, 2),
         "wp_kwh":     round(total_wp_today,   2),
         "climate_kwh": round(total_climate_today, 2),
@@ -1415,7 +2100,7 @@ def analyze_data():
     c.execute("SELECT date, home_consumption, wp_consumption, wb_consumption FROM daily_stats ORDER BY date DESC LIMIT 14")
     for row in c.fetchall():
         print(f"{row[0]:<12} | {row[1] or 0:<10.2f} | {row[2] or 0:<10.2f} | {row[3] or 0:<12.2f}")
-    
+
     print("\n=== ML-Trainingsdaten (Summiert aus Ertrag.X.txt) ===")
     print("Rohe C++ Logdateien von Eba-M (Trainingsgrundlage der KI)")
     print(f"{'Datum':<12} | {'Haus (kWh)':<10} | {'WP (kWh)':<10}")
@@ -1427,6 +2112,11 @@ def analyze_data():
     print()
 
 if __name__ == "__main__":
-    if "--train" in sys.argv: train_model()
-    elif "--predict" in sys.argv: predict_today()
-    elif "--analyze" in sys.argv: analyze_data()
+    if "--train" in sys.argv:
+        raise SystemExit(0 if train_model() else 1)
+    elif "--predict" in sys.argv:
+        raise SystemExit(0 if predict_today() else 1)
+    elif "--model-ready" in sys.argv:
+        raise SystemExit(0 if ml_model_is_ready(MODEL_PATH) else 1)
+    elif "--analyze" in sys.argv:
+        analyze_data()

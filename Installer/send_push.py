@@ -30,12 +30,12 @@ def send_push_message(title, body, url=None, actions_json=None):
     if not vapid_private:
         print(json.dumps({"error": "VAPID private key nicht in e3dc_v4.json gefunden."}))
         return
-        
+
     db_path = "/var/www/html/data/e3dc_stats.db"
     if not os.path.exists(db_path):
         print(json.dumps({"error": "Datenbank e3dc_stats.db existiert nicht."}))
         return
-        
+
     try:
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
@@ -50,7 +50,7 @@ def send_push_message(title, body, url=None, actions_json=None):
     if not rows:
         print(json.dumps({"error": "Keine registrierten Geräte gefunden."}))
         return
-        
+
     payload_dict = {
         "title": title,
         "body": body,
@@ -59,12 +59,12 @@ def send_push_message(title, body, url=None, actions_json=None):
     if actions_json:
         try: payload_dict["actions"] = json.loads(actions_json)
         except: pass
-        
+
     payload = json.dumps(payload_dict)
-    
+
     success_count = 0
     errors = []
-    
+
     for row in rows:
         subscription_info = {
             "endpoint": row["endpoint"],
@@ -73,21 +73,21 @@ def send_push_message(title, body, url=None, actions_json=None):
                 "auth": row["auth"]
             }
         }
-        
+
         try:
             webpush(
                 subscription_info=subscription_info,
                 data=payload,
                 vapid_private_key=vapid_private,
                 vapid_claims={
-                    "sub": "mailto:admin@local.host"
+                    "sub": "mailto:operator@example.invalid"
                 }
             )
             success_count += 1
         except WebPushException as ex:
             errors.append(repr(ex))
             # Optional: Bei Gone (410) könnte man die Row löschen
-            
+
     if success_count > 0:
         print(json.dumps({"success": True, "count": success_count, "errors": errors}))
     else:
@@ -100,5 +100,5 @@ if __name__ == "__main__":
     parser.add_argument("--url", help="Action URL for the notification", default="/")
     parser.add_argument("--actions", help="JSON array of actions", default=None)
     args = parser.parse_args()
-    
+
     send_push_message(args.title, args.body, args.url, args.actions)

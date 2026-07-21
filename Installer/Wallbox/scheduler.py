@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Zentrale Fassade fuer ``Wallbox.scheduler``-Aufrufe.
+"""Kompatibilitätsmodul für alte ``Wallbox.scheduler``-Imports.
 
 Die Wallbox-Ladeplanung gehoert fachlich zu ``Installer/wallbox_planer.py``.
-Dieses Modul bleibt absichtlich eine duenne Fassade, damit bestehende
-Installationen und Erweiterungen denselben Planer nutzen und keine zweite
-Planungslogik entsteht. Aufrufer verwenden die Delegation ueber
-``ScheduleService``.
+Dieses Modul bleibt absichtlich eine duenne Fassade, damit alte Tests,
+Diagnose-Skripte und Fremdaufrufe nicht brechen und keine zweite Planung
+entsteht. Neue Aufrufer können dieselbe Delegation über ``ScheduleService``
+verwenden.
 """
 
 try:
     from .. import wallbox_planer as _planer
-except Exception:  # Aufruf ohne Paketkontext aus /home/pi/Install/Installer
+except Exception:  # Aufruf ohne Paketkontext direkt aus dem Installer-Verzeichnis
     import wallbox_planer as _planer  # type: ignore
 
 
-# Die Fassade haelt die Laufzeitpfade des kanonischen Planers synchron.
+# Alte Tests und Hotfix-Skripte patchen teilweise diese Modulvariablen. Die
+# Wrapper uebertragen sie vor jedem Aufruf in den echten Planer.
 os = _planer.os
 json = _planer.json
 math = _planer.math

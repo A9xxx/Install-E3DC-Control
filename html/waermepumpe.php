@@ -36,11 +36,8 @@ $json = null;
 
 // Konfigurations-Pfad (im Installationsverzeichnis)
 $isDocker = file_exists('/.dockerenv');
-if ($isDocker) {
-    $luxInstallDir = file_exists('/app/pi/Install/Installer/luxtronik/energy_manager.py') ? '/app/pi/Install/Installer/luxtronik/' : '/home/pi/Install/Installer/luxtronik/';
-} else {
-    $luxInstallDir = rtrim($paths['home_dir'], '/') . '/Install/Installer/luxtronik/';
-}
+$installRoot = !empty($paths['valid']) ? rtrim($paths['install_path'], '/') : '';
+$luxInstallDir = $installRoot !== '' ? $installRoot . '/Installer/luxtronik/' : '';
 $configFile = '/var/www/html/data/e3dc_v4.json'; // V4 JSON - Single Source of Truth
 $serviceName = ($wpType === 4) ? 'e3dc-stiebel-live' : (($wpType === 5) ? 'e3dc-dimplex-live' : 'energy_manager'); // Name des Systemd-Services
 $serviceProcessPattern = ($wpType === 4) ? 'stiebel_live.py' : (($wpType === 5) ? 'dimplex_live.py' : 'energy_manager.py');
@@ -82,8 +79,8 @@ if ($wpType == 4) {
     // Hole Status-Felder aus dem Energy-Manager-Ramdisk für IDM
     if (file_exists($ramdiskFile)) {
         $emJson = json_decode(file_get_contents($ramdiskFile), true);
-        foreach (['idm_surplus_kw','boost_active','pv_pause_active',
-                  'price_boost_active','auto_mode',
+        foreach (['idm_surplus_kw','mb_state','boost_active','pv_pause_active',
+                  'price_boost_active','si_state','auto_mode',
                   'idm_ext_ww','idm_ext_hz','idm_ext_khl',
                   'idm_cooling_active','idm_external_cooling_request',
                   'idm_internal_cooling','idm_cooling_origin'] as $k) {
@@ -107,7 +104,7 @@ if ($wpType == 4) {
     }
     if (is_array($json) && file_exists($ramdiskFile)) {
         $emJson = json_decode(file_get_contents($ramdiskFile), true);
-        foreach (['boost_active','pv_pause_active','price_boost_active','auto_mode',
+        foreach (['mb_state','boost_active','pv_pause_active','price_boost_active','si_state','auto_mode',
                   'dimplex_sg_state','dimplex_sg_register','dimplex_sg_address'] as $k) {
             if (isset($emJson[$k])) $json[$k] = $emJson[$k];
         }
@@ -122,10 +119,12 @@ if ($wpType == 4) {
 // FALLBACK NUR NUTZEN, WENN DER DIENST AUSGESCHALTET IST
 if (!$json && !$isServiceRunning && $wpType == 0) {
     $python = getPythonInterpreter();
-    $script = rtrim($paths['home_dir'], '/') . '/Install/Installer/luxtronik/get_luxtronik.py';
-    $cmd = escapeshellarg($python) . " " . escapeshellarg($script);
-    $output = shell_exec($cmd);
-    $json = json_decode($output, true);
+    $script = $luxInstallDir . 'get_luxtronik.py';
+    if ($luxInstallDir !== '' && is_file($script)) {
+        $cmd = escapeshellarg($python) . " " . escapeshellarg($script);
+        $output = shell_exec($cmd);
+        $json = json_decode($output, true);
+    }
 }
 
 // Falls immer noch kein JSON da ist, ein leeres Objekt erstellen
@@ -142,29 +141,53 @@ $error = $json['error'] ?? ($json['error'] ?? '');
 if (isset($_POST['restart_manager'])) {
     requireWebAuth(false);
     if ($isDocker) {
+        if ($installRoot === '') {
+            http_response_code(503);
+            echo 'Installationskontext fehlt; es wurde kein Dienst beendet oder gestartet.';
+            exit;
+        }
         $python = getPythonInterpreter();
+        $pythonArg = escapeshellarg($python);
         if ($isHeaterPage) {
+            $hsPath = $installRoot . '/Installer/heizstab_manager.py';
+            if (!is_file($hsPath)) {
+                http_response_code(503);
+                echo 'Heizstab-Manager wurde im Installationspfad nicht gefunden.';
+                exit;
+            }
             shell_exec("pkill -f 'heizstab_manager.py'");
             sleep(1);
-            $hsScript = escapeshellarg(rtrim($paths['home_dir'], '/') . "/Install/Installer/heizstab_manager.py");
-            shell_exec("nohup $python $hsScript > /var/www/html/logs/heizstab_manager.log 2>&1 &");
+            $hsScript = escapeshellarg($hsPath);
+            shell_exec("nohup $pythonArg $hsScript > /var/www/html/logs/heizstab_manager.log 2>&1 &");
             echo "<script>window.location.href = window.location.href;</script>";
             exit;
         }
         // Beende Hauptdienst und Livedienst
+        $energyManagerPath = $luxInstallDir . 'energy_manager.py';
+        if (!is_file($energyManagerPath)) {
+            http_response_code(503);
+            echo 'Energy-Manager wurde im Installationspfad nicht gefunden.';
+            exit;
+        }
         shell_exec("pkill -f 'energy_manager.py'");
         shell_exec("pkill -f 'idm_live.py'");
         shell_exec("pkill -f 'e3dc_websocket.py'");
         shell_exec("pkill -f 'stiebel_live.py'");
         shell_exec("pkill -f 'dimplex_live.py'");
         sleep(1);
-        shell_exec("nohup $python {$luxInstallDir}energy_manager.py > /proc/1/fd/1 2>&1 &");
+        shell_exec("nohup $pythonArg " . escapeshellarg($energyManagerPath) . " > /proc/1/fd/1 2>&1 &");
         if ($wpType === 4) {
-            $stiebelScript = escapeshellarg(rtrim($paths['home_dir'], '/') . "/Install/Installer/stiebel/stiebel_live.py");
-            shell_exec("nohup $python $stiebelScript > /var/www/html/logs/stiebel_live.log 2>&1 &");
+            $stiebelPath = $installRoot . '/Installer/stiebel/stiebel_live.py';
+            if (is_file($stiebelPath)) {
+                $stiebelScript = escapeshellarg($stiebelPath);
+                shell_exec("nohup $pythonArg $stiebelScript > /var/www/html/logs/stiebel_live.log 2>&1 &");
+            }
         } elseif ($wpType === 5) {
-            $dimplexScript = escapeshellarg(rtrim($paths['home_dir'], '/') . "/Install/Installer/dimplex/dimplex_live.py");
-            shell_exec("nohup $python $dimplexScript > /proc/1/fd/1 2>&1 &");
+            $dimplexPath = $installRoot . '/Installer/dimplex/dimplex_live.py';
+            if (is_file($dimplexPath)) {
+                $dimplexScript = escapeshellarg($dimplexPath);
+                shell_exec("nohup $pythonArg $dimplexScript > /proc/1/fd/1 2>&1 &");
+            }
         }
         // Der Livedienst bei Docker wird meist extern oder im Wrapper gemanagt, ein pkill reicht zum Auslösen eines Neustarts.
     } else {
@@ -188,7 +211,7 @@ if (isset($_POST['restart_manager'])) {
 
 
 // IDM Gesamt-JAZ: Berechnung direkt aus der V4-Konfiguration (idm_e_total=)
-// Kein Eingabefeld im Dashboard noetig - Wert einmalig in Config setzen
+// Kein Eingabefeld im Dashboard nötig – Wert einmalig in der Konfiguration setzen
 $idmETotalCfg = floatval($conf['idm_e_total'] ?? 0);
 $idmJazValue  = 0;
 $idmWGesamt   = 0;
@@ -208,7 +231,7 @@ if ($wpType == 1 && $idmETotalCfg > 0) {
 $configMtime = file_exists($configFile) ? date("d.m. H:i:s", filemtime($configFile)) : '--';
 $pyMtime = file_exists($luxInstallDir . 'energy_manager.py') ? date("d.m. H:i:s", filemtime($luxInstallDir . 'energy_manager.py')) : '--';
 
-// NEU: WP-Verbrauch Logik (Präzise vs. Live-Fallback)
+// WP-Verbrauchslogik: präziser Messwert oder Live-Ersatzwert
 $wp_power_w = 0;
 $wp_source = 'live';
 
@@ -299,7 +322,7 @@ if (file_exists($historyFile)) {
         $stats['p_max'] = 0;
         $stats['cop_min'] = null;
         $stats['cop_max'] = 0;
-        
+
         foreach ($lines as $line) {
             $row = json_decode($line, true);
             if (!$row || !isset($row['ts']) || strpos($row['ts'], $today) !== 0) continue;
@@ -307,7 +330,7 @@ if (file_exists($historyFile)) {
             $p = floatval($d['Leistung_Heiz_kW'] ?? $d['Heizleistung Ist'] ?? 0);
             $v = $d['Leistung_Verdichter_W'] ?? (($d['Leistungsaufnahme'] ?? 0) * 1000);
             $c = ($v > 0 && $p > 0) ? ($p * 1000) / $v : 0;
-            
+
             // Falls wm_start NOCH null ist, können wir ihn aus der History fischen
             $wm = floatval($d['Wärmemenge Gesamt'] ?? $d['Energie_Waerme_kWh'] ?? 0);
             if ($wm > 0 && ($stats['wm_start'] === null || $wm < $stats['wm_start'])) {
@@ -326,16 +349,44 @@ if (file_exists($historyFile)) {
     }
 }
 
+$manualBoostMessage = '';
 if (isset($_POST['manual_boost']) && $wpType != 4) {
     requireWebAuth(false);
+    e3dcRequireCsrfToken(false);
     $action = $_POST['manual_boost'] == 'on' ? 'on' : 'off';
-    $python = getPythonInterpreter();
-    $boostScript = rtrim($paths['home_dir'], '/') . '/Install/Installer/luxtronik/set_manual_boost.py';
-    shell_exec(escapeshellarg($python) . " " . escapeshellarg($boostScript) . " " . $action);
+    $python = e3dcGetTrustedPythonInterpreter();
+    $installRoot = @realpath(rtrim((string)($paths['install_path'] ?? ''), '/'));
+    $boostScript = $installRoot !== false
+        ? $installRoot . '/Installer/luxtronik/set_manual_boost.py'
+        : '';
+    $boostReal = $boostScript !== '' ? @realpath($boostScript) : false;
+    if (
+        $python === null || $boostReal === false || is_link($boostScript)
+        || !is_file($boostReal) || !str_starts_with($boostReal, rtrim((string)$installRoot, '/') . '/Installer/luxtronik/')
+    ) {
+        $manualBoostMessage = errorMessage('Boost-Auftrag nicht gespeichert', 'Interpreter oder Auftragsskript ist nicht eindeutig verfügbar.');
+    } else {
+        $boostResult = e3dcRunArgvProcess(
+            [$python, $boostReal, $action],
+            5.0,
+            ['cwd' => dirname($boostReal), 'max_output_bytes' => 16384]
+        );
+        if (!empty($boostResult['success'])) {
+            $manualBoostMessage = successMessage($action === 'on' ? 'Boost-Auftrag gespeichert.' : 'Boost-Stopp gespeichert.');
+        } else {
+            $reason = !empty($boostResult['timed_out'])
+                ? 'Timeout'
+                : ((int)($boostResult['signal'] ?? 0) > 0
+                    ? 'Signal ' . (int)$boostResult['signal']
+                    : 'rc=' . (int)($boostResult['exit_code'] ?? 1));
+            $manualBoostMessage = errorMessage('Boost-Auftrag nicht gespeichert', 'Das Auftragsskript meldete ' . $reason . '. Es wurde kein Dienst neu gestartet.');
+        }
+    }
 }
 
 if (isset($_POST['manual_ww']) && $wpType != 4) {
     requireWebAuth(false);
+    e3dcRequireCsrfToken(false);
     $action = $_POST['manual_ww'] === 'on' ? 'on' : 'off';
     $flagFile = '/var/www/html/ramdisk/manual_ww_boost.flag';
     if ($action === 'on') {
@@ -348,14 +399,15 @@ if (isset($_POST['manual_ww']) && $wpType != 4) {
 
 if (isset($_POST['toggle_auto_mode'])) {
     requireWebAuth(false);
+    e3dcRequireCsrfToken(false);
     $new_mode = (int)$_POST['toggle_auto_mode'];
-    // V4 JSON schreiben (Single Source of Truth)
+    // V4-JSON als maßgebliche Datenquelle schreiben
     $v4Path = '/var/www/html/data/e3dc_v4.json';
     $v4Data = @json_decode(@file_get_contents($v4Path), true) ?? [];
     $v4Data['auto_mode'] = (string)$new_mode;
     $json = json_encode($v4Data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
     if ($json !== false) e3dcWriteJsonAtomic($v4Path, $json);
-    // Ramdisk-Cache invalidieren
+    // Ramdisk-Zwischenspeicher verwerfen
     @unlink('/var/www/html/ramdisk/e3dc_config_cache.json');
     if ($isDocker) {
         shell_exec("pkill -f 'energy_manager.py'");
@@ -364,12 +416,12 @@ if (isset($_POST['toggle_auto_mode'])) {
     } else {
         e3dcRunServiceWrapperAction('restart', [$serviceName]);
     }
-    
+
     echo "<script>window.location.href = window.location.href;</script>";
     exit;
 }
 
-$manualBoostActive = file_exists('/var/www/html/ramdisk/manual_boost.flag');
+$manualBoostActive = file_exists('/var/www/html/ramdisk/manual_boost.flag') || file_exists('/var/www/html/data/morning_boost_state.json');
 $manualWwActive = file_exists('/var/www/html/ramdisk/manual_ww_boost.flag');
 if ($success) {
     $currP = $heiz_kw;
@@ -381,8 +433,8 @@ if ($success) {
         if ($stats['cop_min'] === null || $cop < $stats['cop_min']) $stats['cop_min'] = $cop;
         if ($cop > $stats['cop_max']) $stats['cop_max'] = $cop;
     }
-    
-    // Tages-Startwerte fuer Waermemenge UND elektrische Energie (IDM-eigene Zaehler)
+
+// Tages-Startwerte für Wärmemenge UND elektrische Energie (IDM-eigene Zähler)
     $current_wm = floatval($data['Wärmemenge Gesamt'] ?? $data['Energie_Waerme_kWh'] ?? 0);
     if ($current_wm > 0 && ($stats['wm_start'] === null || $stats['wm_start'] == 0)) {
         $stats['wm_start'] = $current_wm;
@@ -392,7 +444,7 @@ if ($success) {
         $stats['el_start'] = $current_el;
     }
 
-    // Immer speichern, damit wm_start + el_start ueberleben
+    // Immer speichern, damit wm_start und el_start erhalten bleiben
     file_put_contents($statsFile, json_encode($stats));
 }
 
@@ -498,19 +550,19 @@ if ($isHeaterPage) {
 if (isset($_POST['toggle_hs_auto'])) {
     requireWebAuth(false);
     $new_mode = (int)$_POST['toggle_hs_auto'];
-    // V4 JSON schreiben (Single Source of Truth)
+    // V4-JSON als maßgebliche Datenquelle schreiben
     $v4Path = '/var/www/html/data/e3dc_v4.json';
     $v4Data = @json_decode(@file_get_contents($v4Path), true) ?? [];
     $v4Data['hs_auto_mode'] = (string)$new_mode;
     $json = json_encode($v4Data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
     if ($json !== false) e3dcWriteJsonAtomic($v4Path, $json);
-    // Ramdisk-Cache invalidieren
+    // Ramdisk-Zwischenspeicher verwerfen
     @unlink('/var/www/html/ramdisk/e3dc_config_cache.json');
     echo "<script>window.location.href = window.location.href;</script>";
     exit;
 }
 
-// POST: Heizstab manuell Vollgas / zurueck zur normalen Regelung
+// POST: Heizstab manuell mit voller Leistung oder zurück zur normalen Regelung
 if (isset($_POST['hs_manual_full']) || isset($_POST['hs_manual_auto'])) {
     requireWebAuth(false);
     if (isset($_POST['hs_manual_full'])) {
@@ -591,6 +643,11 @@ if ($isChargingOnly) {
                 <i class="fas fa-info-circle me-2"></i>
                 Ladeplanung läuft über Storage- und Wallbox-Manager. Eine native Wärmepumpe ist dafür nicht erforderlich.
             </div>
+            <?php if (isset($json['mb_state']) && $json['mb_state'] === 'RUNNING'): ?>
+                <div class="alert alert-warning pulsating py-2 small shadow-sm">
+                    <i class="fas fa-car-battery me-2"></i><strong>Boost aktiv!</strong>
+                </div>
+            <?php endif; ?>
         <?php elseif ($isHeaterPage):
 
             // --- Heizstab / myPV AC ELWA-E Dashboard (wp_type=2) ---
@@ -823,6 +880,9 @@ if ($isChargingOnly) {
 
 
         <?php else: // Luxtronik / IDM ?>
+            <?php if ($manualBoostMessage !== ''): ?>
+                <?= $manualBoostMessage ?>
+            <?php endif; ?>
             <?php if (!$success): ?>
                 <div class="alert alert-info d-flex align-items-center small py-2">
                     <i class="fas fa-spinner fa-spin me-2"></i> <strong>Wärmepumpe wird abgefragt...</strong>
@@ -838,12 +898,13 @@ if ($isChargingOnly) {
                 <?php else: ?>
                 <div class="mb-3 d-flex gap-2">
                     <form method="post" class="flex-grow-1 d-flex gap-2">
+                        <?= e3dcCsrfInput() ?>
                         <?php if ($manualBoostActive): ?>
                             <button type="submit" name="manual_boost" value="off" class="btn btn-danger btn-sm w-100 fw-bold"><i class="fas fa-hand-paper me-1"></i> BOOST STOPPEN</button>
                         <?php else: ?>
                             <button type="submit" name="manual_boost" value="on" class="btn btn-outline-warning btn-sm w-100 fw-bold"><i class="fas fa-bolt me-1"></i> BOOST (AKKU LEEREN)</button>
                         <?php endif; ?>
-                        
+
                         <?php if ($manualWwActive): ?>
                             <button type="submit" name="manual_ww" value="off" class="btn btn-danger btn-sm w-100 fw-bold"><i class="fas fa-stop me-1"></i> WW-SOFORT STOPPEN</button>
                         <?php else: ?>
@@ -852,9 +913,10 @@ if ($isChargingOnly) {
                         <?php endif; ?>
                     </form>
                     <form method="post">
+                        <?= e3dcCsrfInput() ?>
                         <?php if ($autoMode == 1): ?>
                             <button type="submit" name="toggle_auto_mode" value="0" class="btn btn-outline-success btn-sm h-100 fw-bold" title="PV Überschuss-Automatik abschalten">
-                                <i class="fas fa-check-circle me-1"></i> AUTO 
+                                <i class="fas fa-check-circle me-1"></i> AUTO
                             </button>
                         <?php else: ?>
                             <button type="submit" name="toggle_auto_mode" value="1" class="btn btn-secondary btn-sm h-100 fw-bold" title="PV Überschuss-Automatik einschalten">
@@ -866,7 +928,7 @@ if ($isChargingOnly) {
                 <?php endif; ?>
 
                                 <?php
-                    // Display logic for Kaeltespeicher
+                    // Anzeigelogik für den Kältespeicher
                     $khlSoll = floatval($conf['khl'] ?? $conf['kuehlsoll'] ?? 0);
                     if ($wpType == 1) {
                         $istKhlTemp = isset($data['Kaeltespeicher_Ist']) && !is_null($data['Kaeltespeicher_Ist']) ? $data['Kaeltespeicher_Ist'] : null;
@@ -880,7 +942,7 @@ if ($isChargingOnly) {
                     <div class="col text-center">
                         <div class="p-2 bg-body-tertiary rounded border h-100 d-flex flex-column justify-content-center">
                             <div class="small text-muted">Außen <span class="fw-normal">(Ist/Mittel)</span></div>
-                            <?php 
+                            <?php
                                 $a_ist = $data['Außentemperatur'] ?? ($data['Aussentemp'] ?? null);
                                 $a_mittel_raw = $data['Außentemperatur_Mittel'] ?? ($data['Aussentemp_Mittel'] ?? ($data['Aussen_Mittel'] ?? null));
                                 $season_raw = $a_mittel_raw ?? ($data['wp_season_temp'] ?? $a_ist);
@@ -1007,14 +1069,14 @@ if ($isChargingOnly) {
                                 <span class="badge bg-secondary">Standby</span>
                             <?php endif; ?>
 
-                            <?php 
+                            <?php
                                 $baText = $data['Betriebszustand'] ?? null;
                                 if (!$baText && isset($data['Betriebsart'])) {
                                     $bmMap = [0 => 'Heizen', 1 => 'Warmwasser', 2 => 'Schwimmbad', 3 => 'E-Sperre', 4 => 'Abtauen', 5 => 'Standby'];
                                     $baText = $bmMap[(int)$data['Betriebsart']] ?? null;
                                 }
                                 if (!$baText) $baText = '--';
-                                
+
                                 $baClass = 'bg-secondary';
                                 if (strpos($baText, 'Heiz') !== false) $baClass = 'bg-warning text-dark';
                                 elseif (strpos($baText, 'Warmwasser') !== false) $baClass = 'bg-danger';
@@ -1022,7 +1084,7 @@ if ($isChargingOnly) {
                                 elseif (strpos($baText, 'Abtau') !== false) $baClass = 'bg-info text-dark';
                             ?>
                             <span class="badge <?= $baClass ?>"><?= htmlspecialchars($baText) ?></span>
-                            
+
                             <?php if (!empty($json['pv_pause_active'])): ?>
                                 <?php
                                     $pauseOwner = (string)($json['pv_pause_owner'] ?? '');
@@ -1039,13 +1101,13 @@ if ($isChargingOnly) {
                                     <i class="fas fa-solid fa-fire-flame-curved me-1"></i> PV-Boost
                                 </span>
                             <?php endif; ?>
-                            
+
                             <?php if ($manualWwActive): ?>
                                 <span class="badge bg-danger" title="Warmwasser-Timer überschrieben">
                                     <i class="fas fa-hot-tub me-1"></i> WW-Sofort Aktiv
                                 </span>
                             <?php endif; ?>
-                            
+
                             <?php
                             $wwTimerEn = (int)($conf['ww_timer_enable'] ?? 0);
                             if ($wwTimerEn == 1):
@@ -1053,12 +1115,12 @@ if ($isChargingOnly) {
                                 $wwBis = floatval($conf['wwbis'] ?? 0);
                                 $circVon = floatval($conf['ww_circ_von'] ?? 0);
                                 $circBis = floatval($conf['ww_circ_bis'] ?? 0);
-                                
+
                                 $nowDec = (float)date('G') + ((float)date('i') / 60.0);
-                                
+
                                 $inWw = ($wwVon <= $wwBis) ? ($nowDec >= $wwVon && $nowDec < $wwBis) : ($nowDec >= $wwVon || $nowDec < $wwBis);
                                 $wwBadgeColor = $inWw ? 'bg-warning text-dark border border-warning' : 'bg-transparent text-muted border border-secondary';
-                                
+
                                 $inCirc = ($circVon <= $circBis) ? ($nowDec >= $circVon && $nowDec < $circBis) : ($nowDec >= $circVon || $nowDec < $circBis);
                                 $circOnMins = (int)($conf['ww_circ_on'] ?? 0);
                                 $circOffMins = (int)($conf['ww_circ_off'] ?? 0);
@@ -1077,7 +1139,7 @@ if ($isChargingOnly) {
                             <?php endif; ?>
                         </div>
                     </div>
-                    
+
                     <div class="col-12 col-xl-5">
                         <h6 class="text-muted text-uppercase small fw-bold mb-2">Wärmequelle</h6>
                         <div class="p-2 bg-body-tertiary rounded border d-flex align-items-center" style="min-height: 46px;">
@@ -1282,13 +1344,13 @@ if ($isChargingOnly) {
 
 
 <?= renderE3dcModalThemeStyles() ?>
-<!-- Energy Manager Log Modal -->
+<!-- Dialog für das Energy-Manager-Protokoll -->
 <div class="modal fade" id="energyManagerLogModal" tabindex="-1" aria-hidden="true">
     <div class="modal-dialog modal-lg modal-dialog-scrollable">
         <div class="modal-content bg-body-secondary text-body border-secondary">
             <div class="modal-header border-secondary">
                 <h5 class="modal-title"><i class="fas fa-robot me-2"></i>Energy Manager Log</h5>
-                <button type="button" class="btn-close e3dc-modal-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                <button type="button" class="btn-close e3dc-modal-close" data-bs-dismiss="modal" aria-label="Schließen"></button>
             </div>
             <div class="modal-body e3dc-log-body p-2">
                 <pre id="energy-manager-log-content" class="e3dc-log-pre">Lade Protokoll...</pre>
@@ -1309,7 +1371,8 @@ function refreshLuxtronik() {
     // Nicht aktualisieren, wenn User gerade editiert
     if (typeof isLuxtronikEditing !== 'undefined' && isLuxtronikEditing) return;
 
-    // Wir suchen das Element mit der ID 'luxtronik-card'.
+    // Wir suchen das Element mit der ID 'luxtronik-card'
+    // Hinweis: Du musst deiner ersten <div class="card..."> die ID 'luxtronik-card' geben!
     const container = document.getElementById('luxtronik-card');
     if (!container) return;
 
@@ -1333,8 +1396,8 @@ function showEnergyManagerLog() {
     const modal = new bootstrap.Modal(document.getElementById('energyManagerLogModal'));
     modal.show();
     document.getElementById('energy-manager-log-content').innerText = 'Lade Protokoll...';
-    
-    // Die Action wird von index.php/mobile.php verarbeitet, je nachdem, wo waermepumpe.php inkludiert ist.
+
+    // Die Aktion wird von index.php oder mobile.php verarbeitet, je nachdem, wo waermepumpe.php eingebunden ist.
     // Wir nutzen einen relativen Pfad, der im aktuellen Kontext funktioniert.
     fetch('?action=get_energy_manager_log')
         .then(r => r.text())

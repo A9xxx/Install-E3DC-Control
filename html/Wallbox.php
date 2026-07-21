@@ -5,6 +5,7 @@
 
 // Pfade und Config-Datei-Pfad VOR der POST-Logik definieren
 require_once __DIR__ . '/helpers.php';
+require_once __DIR__ . '/wallbox_transaction.php';
 $wallboxAuthIsAjax =
     (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST')
     || (isset($_GET['ajax']) && $_GET['ajax'] == '1')
@@ -12,10 +13,17 @@ $wallboxAuthIsAjax =
 requireWebAuth($wallboxAuthIsAjax);
 
 $paths = getInstallPaths();
-$install_user = $paths['install_user'];
-$base_path = rtrim($paths['install_path'], '/') . '/';
+$install_user = !empty($paths['valid']) ? (string)$paths['install_user'] : '';
+$base_path = !empty($paths['valid'])
+    ? rtrim((string)$paths['install_path'], '/') . '/'
+    : '/var/www/html/data/.invalid-install-context/';
 $config_file = $base_path . 'e3dc.config.txt';
 $message = '';
+if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST' && empty($paths['valid'])) {
+    http_response_code(503);
+    echo errorMessage('Wallbox-Aktion nicht ausgeführt', getInstallContextDiagnostic());
+    exit;
+}
 
 function normalizeWallboxVehicleSelection($value) {
     $value = trim((string)$value);
@@ -27,6 +35,22 @@ function wallboxTruthy($value) {
     if ($value === null || $value === '') return false;
     if (is_numeric($value)) return ((float)$value) != 0.0;
     return in_array(strtolower(trim((string)$value)), ['1', 'true', 'yes', 'on', 'locked', 'connected'], true);
+}
+
+function wallboxWantsConfigJsonResponse() {
+    return (string)($_POST['response_format'] ?? '') === 'json';
+}
+
+function wallboxEmitConfigJsonResponse($result, $operation) {
+    $ok = !empty($result['success']);
+    $code = preg_replace('/[^a-z0-9_\-]/i', '', (string)($result['code'] ?? ($ok ? 'ok' : 'unknown'))) ?: 'unknown';
+    if (!$ok) {
+        http_response_code(500);
+        wallboxLogConfigFailure($operation, $code);
+    }
+    header('Content-Type: application/json; charset=utf-8');
+    echo json_encode(['ok' => $ok, 'code' => $code], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+    exit;
 }
 
 function normalizeWallboxModeValue($value) {
@@ -181,14 +205,14 @@ function readWallboxManualSocValue($wbId) {
     return '';
 }
 
-function writeWallboxManualSocSample($wbId, $socValue, $carId, $carName, $capacity, $source = 'manual_start_soc') {
+function buildWallboxManualSocSample($wbId, $socValue, $carId, $carName, $capacity, $source = 'manual_start_soc') {
     $wbId = max(1, min(2, (int)$wbId));
     $socText = trim((string)$socValue);
     if ($socText === '') return false;
     $soc = (float)str_replace(',', '.', $socText);
     if (!is_finite($soc)) return false;
     $soc = max(0.0, min(100.0, $soc));
-    $payload = [
+    return [
         'soc' => $soc,
         'car_id' => trim((string)$carId),
         'name' => trim((string)$carName),
@@ -198,16 +222,6 @@ function writeWallboxManualSocSample($wbId, $socValue, $carId, $carName, $capaci
         'plugged' => true,
         'ts' => time(),
     ];
-    $path = "/var/www/html/ramdisk/manual_soc_wb{$wbId}.json";
-    if (!is_dir(dirname($path))) @mkdir(dirname($path), 0775, true);
-    $json = json_encode($payload, JSON_UNESCAPED_UNICODE);
-    $ok = @file_put_contents($path, $json) !== false;
-    if ($ok) @chmod($path, 0666);
-    if ($ok && $wbId === 1) {
-        if (!is_dir('/var/www/html/tmp')) @mkdir('/var/www/html/tmp', 0775, true);
-        @file_put_contents('/var/www/html/tmp/manual_soc.json', $json);
-    }
-    return $ok;
 }
 
 function normalizeWallboxDepartureTime($value) {
@@ -223,54 +237,6 @@ function normalizeWallboxDepartureWindowHours($value) {
     if (!is_finite($hours) || $hours <= 0) $hours = 3.0;
     $hours = max(1.0, min(36.0, $hours));
     return rtrim(rtrim(number_format($hours, 1, '.', ''), '0'), '.');
-}
-
-function queueWallboxDefaultReleaseRequest($wbId, $newMode, $previousMode) {
-    $wbId = max(1, min(2, (int)$wbId));
-    if ((string)$newMode !== '0' || (string)$previousMode === '0') return;
-    $file = '/var/www/html/ramdisk/wallbox_default_release_request.json';
-    $dir = dirname($file);
-    if (!is_dir($dir)) return;
-    $data = [];
-    if (is_file($file)) {
-        $raw = json_decode((string)@file_get_contents($file), true);
-        if (is_array($raw)) $data = $raw;
-    }
-    $data[(string)$wbId] = [
-        'ts' => time(),
-        'source' => 'Wallbox.php',
-        'reason' => 'mode0_user_switch',
-        'previous_mode' => (string)$previousMode,
-    ];
-    $tmp = $file . '.tmp';
-    if (@file_put_contents($tmp, json_encode($data, JSON_UNESCAPED_SLASHES)) !== false) {
-        @rename($tmp, $file);
-    }
-}
-
-function queueWallboxUserModeRequest($wbId, $newMode, $previousMode) {
-    $wbId = max(1, min(2, (int)$wbId));
-    if ((string)$newMode === (string)$previousMode) return;
-    if ((string)$newMode !== '2') return;
-    $file = '/var/www/html/ramdisk/wallbox_user_mode_request.json';
-    $dir = dirname($file);
-    if (!is_dir($dir)) return;
-    $data = [];
-    if (is_file($file)) {
-        $raw = json_decode((string)@file_get_contents($file), true);
-        if (is_array($raw)) $data = $raw;
-    }
-    $data[(string)$wbId] = [
-        'ts' => time(),
-        'source' => 'Wallbox.php',
-        'reason' => 'mode2_user_switch_pv',
-        'target_mode' => '2',
-        'previous_mode' => (string)$previousMode,
-    ];
-    $tmp = $file . '.tmp';
-    if (@file_put_contents($tmp, json_encode($data, JSON_UNESCAPED_SLASHES)) !== false) {
-        @rename($tmp, $file);
-    }
 }
 
 function clearWallboxManualPauseOnModeChange(&$updates, $wbId, $newMode, $previousMode) {
@@ -520,28 +486,108 @@ function wallboxOpenwbCapabilityRows($cfg) {
     return $rows;
 }
 
+function wallboxE3dcCapabilityRows($cfg) {
+    $runtimePath = '/var/www/html/ramdisk/wallbox_native.json';
+    $runtime = [];
+    if (is_readable($runtimePath) && time() - @filemtime($runtimePath) <= 60) {
+        $decoded = @json_decode((string)@file_get_contents($runtimePath), true);
+        if (is_array($decoded)) $runtime = $decoded;
+    }
+    $details = isset($runtime['wb_details']) && is_array($runtime['wb_details']) ? $runtime['wb_details'] : [];
+    $detailById = [];
+    foreach ($details as $detail) {
+        if (!is_array($detail)) continue;
+        $id = (int)($detail['id'] ?? 0);
+        if ($id > 0) $detailById[$id] = $detail;
+    }
+    $types = [
+        'native', 'e3dc', 'e3dc_legacy', 'e3dc_auto', 'e3dc_efy',
+        'e3dc_easy', 'e3dc_easy_connect', 'e3dc_multi',
+        'e3dc_multi_connect', 'e3dc_multi_connect_ii',
+    ];
+    $rows = [];
+    for ($wb = 1; $wb <= 2; $wb++) {
+        $typeKey = $wb === 1 ? 'wb_native_type' : 'wb_native_type2';
+        $type = normalizeWallboxTypeConfig($cfg[$typeKey] ?? '');
+        if (!in_array($type, $types, true)) continue;
+        $detail = $detailById[$wb] ?? [];
+        $rows[] = [
+            'wb' => $wb,
+            'configured_type' => $type,
+            'family' => (string)($detail['e3dc_device_family'] ?? 'unknown'),
+            'family_source' => (string)($detail['e3dc_device_family_source'] ?? 'unknown'),
+            'firmware' => (string)($detail['firmware_version'] ?? ''),
+            'rscp_type' => $detail['e3dc_rscp_wallbox_type'] ?? null,
+            'capability' => (string)($detail['e3dc_capability_state'] ?? 'status_unavailable'),
+            'readback_complete' => !empty($detail['e3dc_direct_readback_complete']),
+            'backend' => (string)($detail['e3dc_control_backend'] ?? 'status_only'),
+            'backend_label' => (string)($detail['e3dc_backend_label'] ?? 'Nur Status – WBchar6 nicht gewählt; Direkte Übergänge gesperrt'),
+            'fresh' => !empty($detail),
+        ];
+    }
+    return $rows;
+}
+
 function findSavedCarIndexForIdentifiers($cars, $identifiers, $name = '') {
     $probes = [];
-    foreach ($identifiers as $id) {
+    $typed = [
+        'profile_id' => ['id', 'profile_id'],
+        'car_id' => ['id', 'profile_id'],
+        'vehicle_id' => ['vehicle_id', 'vehicle_mac', 'mac'],
+        'rfid_tag' => ['rfid', 'rfid_tag'],
+        'cloud_vehicle_id' => ['cloud_vehicle_id'],
+    ];
+    foreach ($identifiers as $type => $id) {
         $compact = compactVehicleIdentifierWallbox($id);
-        if ($compact !== '') $probes[] = $compact;
+        if ($compact === '') continue;
+        $probeType = is_string($type) && isset($typed[$type]) ? $type : 'legacy_any';
+        if (!isset($probes[$probeType])) $probes[$probeType] = [];
+        $probes[$probeType][] = $compact;
     }
-    $nameNorm = strtolower(trim((string)$name));
+    $nameNorm = normalizeVehicleNameWallbox($name);
 
     foreach ($cars as $idx => $car) {
         if (!is_array($car)) continue;
-        foreach (['id', 'vehicle_id', 'vehicle_mac', 'mac', 'rfid', 'rfid_tag', 'cloud_vehicle_id'] as $key) {
-            $saved = compactVehicleIdentifierWallbox($car[$key] ?? '');
-            if ($saved !== '' && in_array($saved, $probes, true)) {
-                return $idx;
+        foreach ($probes as $type => $values) {
+            $fields = $type === 'legacy_any'
+                ? ['id', 'profile_id', 'vehicle_id', 'vehicle_mac', 'mac', 'rfid', 'rfid_tag', 'cloud_vehicle_id']
+                : $typed[$type];
+            foreach ($fields as $key) {
+                $saved = compactVehicleIdentifierWallbox($car[$key] ?? '');
+                if ($saved !== '' && in_array($saved, $values, true)) return $idx;
             }
         }
-        $savedName = strtolower(trim((string)($car['name'] ?? '')));
-        if ($nameNorm !== '' && $savedName !== '' && ($nameNorm === $savedName || strpos($nameNorm, $savedName) !== false || strpos($savedName, $nameNorm) !== false)) {
-            return $idx;
-        }
+    }
+    if (!empty($probes)) return null;
+    foreach ($cars as $idx => $car) {
+        if (!is_array($car)) continue;
+        $savedName = normalizeVehicleNameWallbox($car['name'] ?? '');
+        if ($nameNorm !== '' && $savedName !== '' && $nameNorm === $savedName) return $idx;
     }
     return null;
+}
+
+function normalizeVehicleNameWallbox($value) {
+    $value = trim((string)$value);
+    $value = preg_replace('/\s+/u', ' ', $value);
+    if (function_exists('mb_strtolower')) return mb_strtolower($value, 'UTF-8');
+    return strtolower($value);
+}
+
+function newSavedCarProfileIdWallbox($cars) {
+    $known = [];
+    foreach ((array)$cars as $car) {
+        if (is_array($car) && !empty($car['id'])) $known[(string)$car['id']] = true;
+    }
+    do {
+        try {
+            $suffix = bin2hex(random_bytes(8));
+        } catch (Throwable $e) {
+            $suffix = str_replace('.', '', uniqid('', true));
+        }
+        $id = 'custom_' . $suffix;
+    } while (isset($known[$id]));
+    return $id;
 }
 
 function getLiveCloudVehiclesForWallbox() {
@@ -577,10 +623,16 @@ function getDetectedOpenwbVehiclesForWallbox($savedCars) {
         $plugged = wallboxTruthy($data['plug_state'] ?? false);
         $charging = wallboxTruthy($data['charge_state'] ?? false) || ((float)($data['power_w'] ?? 0) > 50);
         if (!$plugged && !$charging) continue;
-        $vehicleId = trim((string)($data['vehicle_id'] ?? $data['rfid_tag'] ?? $data['car_id'] ?? ''));
+        $stableIdentityCurrent = !empty($data['stable_vehicle_identity_current']);
+        if (!$stableIdentityCurrent) continue;
+        $vehicleId = trim((string)($data['vehicle_id'] ?? $data['rfid_tag'] ?? ''));
         $name = trim((string)($data['car_name'] ?? ''));
         if ($vehicleId === '' && $name === '') continue;
-        $match = findSavedCarIndexForIdentifiers($savedCars, [$vehicleId, $data['rfid_tag'] ?? '', $data['car_id'] ?? ''], $name);
+        $match = findSavedCarIndexForIdentifiers($savedCars, [
+            'vehicle_id' => $data['vehicle_id'] ?? '',
+            'rfid_tag' => $data['rfid_tag'] ?? '',
+            'car_id' => $data['car_id'] ?? '',
+        ], $name);
         if ($match !== null) continue;
         $socSource = (string)($data['car_soc_source'] ?? '');
         $socConfirmed = wallboxPageSocRuleConfirmed($socSource, $data['car_soc_rule_confirmed'] ?? null);
@@ -597,6 +649,31 @@ function getDetectedOpenwbVehiclesForWallbox($savedCars) {
         ];
     }
     return $detected;
+}
+
+function getObservedOpenwbChargeProfilesForWallbox() {
+    $profiles = [];
+    foreach ([
+        1 => '/var/www/html/ramdisk/openwb_data.json',
+        2 => '/var/www/html/ramdisk/openwb_data_wb2.json',
+    ] as $wb => $path) {
+        $data = readJsonArrayWallbox($path, []);
+        $profileName = trim((string)($data['charge_template_name'] ?? ''));
+        if ($profileName === '') continue;
+        $stableIdentityCurrent = !empty($data['stable_vehicle_identity_current']);
+        $profiles[] = [
+            'wb' => $wb,
+            'name' => $profileName,
+            'vehicle_name' => trim((string)($data['car_name'] ?? '')),
+            'vehicle_id' => $stableIdentityCurrent
+                ? trim((string)($data['vehicle_id'] ?? $data['rfid_tag'] ?? ''))
+                : '',
+            'stable_identity_current' => $stableIdentityCurrent,
+            'retained_identity_present' => !$stableIdentityCurrent
+                && trim((string)($data['vehicle_id'] ?? $data['rfid_tag'] ?? $data['car_id'] ?? '')) !== '',
+        ];
+    }
+    return $profiles;
 }
 
 function wallboxVehicleMaxPhases($vehicle) {
@@ -741,15 +818,15 @@ elseif (!in_array($wb_path_lower, ['true', '1', 'false', '0', '-1', 'yes', 'no',
     }
 }
 
-// NEU: AJAX Handler für Live-Wallbox-Steuerung (Sperre & Modi)
+// AJAX-Behandlung für die Live-Wallbox-Steuerung (Sperre und Modi)
 if (isset($_POST['save_wb_status_ajax'])) {
     $updates = [];
+    $removeEmergency = false;
     $wbId = (int)($_POST['wb_id'] ?? 1);
     if (isset($_POST['wb_locked'])) {
         $updates["wb{$wbId}_locked"] = $_POST['wb_locked'] === '1' ? '1' : '0';
         if ($_POST['wb_locked'] === '0') {
-            $emergencyFlag = '/var/www/html/ramdisk/wallbox_emergency_stop.flag';
-            if (file_exists($emergencyFlag)) @unlink($emergencyFlag);
+            $removeEmergency = true;
         }
     }
     if (isset($_POST['wb_mode'])) {
@@ -772,15 +849,19 @@ if (isset($_POST['save_wb_status_ajax'])) {
     if (isset($_POST['wb_battery_departure_window_h'])) {
         $updates["wb{$wbId}_battery_departure_window_h"] = normalizeWallboxDepartureWindowHours($_POST['wb_battery_departure_window_h']);
     }
-    if (upsertWallboxConfigValues($config_file, $updates)) {
-        if (isset($newMode, $oldMode)) {
-            queueWallboxDefaultReleaseRequest($wbId, $newMode, $oldMode);
-            queueWallboxUserModeRequest($wbId, $newMode, $oldMode);
-        }
+    $txOptions = [
+        'operation' => isset($newMode) ? ($newMode === '0' ? 'clear' : 'plan') : 'preserve',
+        'emergency_flag' => $removeEmergency ? 'remove' : 'preserve',
+    ];
+    if (isset($newMode, $oldMode)) {
+        $txOptions['mode_transition'] = ['wb_id' => $wbId, 'new_mode' => $newMode, 'old_mode' => $oldMode];
+    }
+    $tx = e3dcWallboxPlanTransaction($updates, $txOptions);
+    if (!empty($tx['success'])) {
         echo "OK";
     } else {
         header("HTTP/1.1 500 Internal Server Error");
-        echo "Write Error";
+        echo "Transaction Error: " . ($tx['code'] ?? 'unknown');
     }
     exit;
 }
@@ -788,7 +869,11 @@ if (isset($_POST['save_wb_status_ajax'])) {
 if (isset($_POST['save_wb_manual_pause_ajax'])) {
     $wbId = max(1, min(2, (int)($_POST['wb_id'] ?? 1)));
     $pause = wallboxTruthy($_POST['manual_pause'] ?? '0') ? '1' : '0';
-    if (upsertWallboxConfigValues($config_file, ["wb{$wbId}_manual_pause" => $pause])) {
+    $tx = e3dcWallboxPlanTransaction(
+        ["wb{$wbId}_manual_pause" => $pause],
+        ['operation' => 'preserve']
+    );
+    if (!empty($tx['success'])) {
         $updatedConf = loadE3dcConfig($base_path);
         $updatedConfig = $updatedConf['config'] ?? [];
         $wb1Pause = wallboxTruthy($updatedConfig['wb1_manual_pause'] ?? '0');
@@ -803,7 +888,7 @@ if (isset($_POST['save_wb_manual_pause_ajax'])) {
         ], JSON_UNESCAPED_UNICODE);
     } else {
         header("HTTP/1.1 500 Internal Server Error");
-        echo "Write Error";
+        echo "Schreibfehler";
     }
     exit;
 }
@@ -847,13 +932,16 @@ if (isset($_POST['save_simple_wallbox_mode_ajax'])) {
         $updates['wb_sofort'] = ($planHours === '99') ? '1' : '0';
     }
 
-    if (upsertWallboxConfigValues($config_file, $updates)) {
-        queueWallboxDefaultReleaseRequest($wbId, $newMode, $oldMode);
-        queueWallboxUserModeRequest($wbId, $newMode, $oldMode);
+    $tx = e3dcWallboxPlanTransaction($updates, [
+        'operation' => $planHours === '0' ? 'clear' : 'plan',
+        'abort_flag' => $planHours === '0' ? 'create' : 'remove',
+        'mode_transition' => ['wb_id' => $wbId, 'new_mode' => $newMode, 'old_mode' => $oldMode],
+    ]);
+    if (!empty($tx['success'])) {
         echo "OK";
     } else {
         header("HTTP/1.1 500 Internal Server Error");
-        echo "Write Error";
+        echo "Transaction Error: " . ($tx['code'] ?? 'unknown');
     }
     exit;
 }
@@ -861,14 +949,15 @@ if (isset($_POST['save_simple_wallbox_mode_ajax'])) {
 if (isset($_POST['save_simple_wallbox_limits_ajax'])) {
     $reserveSoc = sanitizeWallboxHouseReserveValue($_POST['simple_house_reserve'] ?? ($confData['config']['wbminsoc'] ?? '70'), 70);
     $priceLimit = normalizeWallboxPriceLimitValue($_POST['simple_price_limit'] ?? ($confData['config']['dvcarlimit'] ?? '0.0'), 0.0);
-    if (upsertWallboxConfigValues($config_file, [
+    $tx = e3dcWallboxPlanTransaction([
         'wbminsoc' => $reserveSoc,
         'dvcarlimit' => $priceLimit,
-    ])) {
+    ], ['operation' => 'preserve']);
+    if (!empty($tx['success'])) {
         echo "OK";
     } else {
         header("HTTP/1.1 500 Internal Server Error");
-        echo "Write Error";
+        echo "Schreibfehler";
     }
     exit;
 }
@@ -934,24 +1023,26 @@ if (isset($_POST['save_simple_wallbox'])) {
         $updates['wb_sofort'] = ($planHours === '99') ? '1' : '0';
     }
 
+    $manualSoc = [];
     if ($targetUnit === 'soc' && trim((string)($_POST['simple_current_soc'] ?? '')) !== '') {
-        writeWallboxManualSocSample($wbId, $_POST['simple_current_soc'], $vehicleId, $vehicleName, $capacity, 'simple_view_start_soc');
+        $sample = buildWallboxManualSocSample($wbId, $_POST['simple_current_soc'], $vehicleId, $vehicleName, $capacity, 'simple_view_start_soc');
+        if (is_array($sample)) $manualSoc[$wbId] = $sample;
     }
 
-    $abort_flag = '/var/www/html/ramdisk/native_schedule_aborted.flag';
-    if (file_exists($abort_flag)) @unlink($abort_flag);
-
-    if (upsertWallboxConfigValues($config_file, $updates)) {
-        queueWallboxDefaultReleaseRequest($wbId, $newMode, $oldMode);
-        queueWallboxUserModeRequest($wbId, $newMode, $oldMode);
+    $tx = e3dcWallboxPlanTransaction($updates, [
+        'operation' => $planHours === '0' && $smartEnabled !== '1' ? 'clear' : 'plan',
+        'abort_flag' => $planHours === '0' && $smartEnabled !== '1' ? 'create' : 'remove',
+        'manual_soc' => $manualSoc,
+        'mode_transition' => ['wb_id' => $wbId, 'new_mode' => $newMode, 'old_mode' => $oldMode],
+    ]);
+    if (!empty($tx['success'])) {
         $message = successMessage('Ladeplan gespeichert. Die Wallbox-Regelung wird neu berechnet.');
-        @shell_exec("/home/pi/.venv_e3dc/bin/python3 -c \"import sys; sys.path.append('/home/pi/Install/Installer'); from Wallbox.config import get_config; from wallbox_planer import generate_native_charging_schedule; generate_native_charging_schedule(get_config())\" > /dev/null 2>&1");
     } else {
-        $message = errorMessage('Schreibberechtigung fehlt', 'Konnte die Wallbox-Einstellungen nicht speichern.');
+        $message = errorMessage('Ladeplan nicht gespeichert', (string)($tx['message'] ?? 'Die transaktionale Planung ist fehlgeschlagen.'));
     }
 }
 
-// AJAX Handler für die Multi-Wallbox-Priorität (0=beide, 1=WB1, 2=WB2).
+// AJAX-Behandlung für die Multi-Wallbox-Priorität (0=beide, 1=WB1, 2=WB2).
 if (isset($_POST['save_wb_priority_ajax'])) {
     requireWebAuth(true);
     $priorityMode = (int)($_POST['wb_native_mode'] ?? 0);
@@ -962,11 +1053,15 @@ if (isset($_POST['save_wb_priority_ajax'])) {
     if (!$canPrioritize) {
         $priorityMode = 0;
     }
-    if (upsertWallboxConfigValues($config_file, ['wb_native_mode' => (string)$priorityMode])) {
+    $tx = e3dcWallboxPlanTransaction(
+        ['wb_native_mode' => (string)$priorityMode],
+        ['operation' => 'preserve']
+    );
+    if (!empty($tx['success'])) {
         echo "OK";
     } else {
         header("HTTP/1.1 500 Internal Server Error");
-        echo "Write Error";
+        echo "Schreibfehler";
     }
     exit;
 }
@@ -996,19 +1091,27 @@ if (isset($_POST['restart_manager'])) {
     $restartResult = e3dcRunServiceWrapperAction('restart', ['e3dc-wallbox-manager']);
     usleep(1000000); // 1 Sekunde warten, damit der neue Log-Eintrag für den Neustart ins Dashboard gerendert wird!
     $message = successMessage('✓ Python Wallbox-Manager wurde im Hintergrund neu gestartet.');
-    if (isset($restartResult) && empty($restartResult['success'])) {
-        $message = errorMessage('Dienst-Neustart fehlgeschlagen', implode("\n", $restartResult['errors'] ?? ['Unbekannter Fehler']));
+    if (
+        empty($restartResult['success'])
+        || !in_array('e3dc-wallbox-manager', $restartResult['changed'] ?? [], true)
+    ) {
+        $details = array_merge(
+            $restartResult['errors'] ?? [],
+            array_map(static fn($service) => $service . ': Dienst fehlt oder ist nicht geladen.', $restartResult['ignored'] ?? [])
+        );
+        $message = errorMessage('Dienst-Neustart fehlgeschlagen', implode("\n", $details ?: ['Kein bestätigter Neustart.']));
     }
 }
 
-// NEU: Handler für Ziel-SoC-Laden
+// Behandlung für Ziel-SoC-Laden
 if (isset($_POST['save_soc_settings'])) {
     $updates = [];
+    $manualSocCandidates = [];
     $savedCarsForSelection = readJsonArrayWallbox('/var/www/html/data/saved_cars.json', []);
     if (isset($_POST['wbminsoc'])) {
         $updates['wbminsoc'] = sanitizeWallboxHouseReserveValue($_POST['wbminsoc'], 70);
     }
-    
+
     // Wallbox 1 (WB1)
     if (isset($_POST['wb1_car_id'])) {
         $updates['wb1_car_id'] = canonicalWallboxVehicleSelection($_POST['wb1_car_id'], $savedCarsForSelection);
@@ -1016,13 +1119,13 @@ if (isset($_POST['save_soc_settings'])) {
         $updates['wb1_target_soc'] = (string)(int)($_POST['wb1_target_soc'] ?? '80');
         $updates['wb1_max_soc_si'] = (string)(int)($_POST['wb1_max_soc_si'] ?? '90');
         $updates['wb1_charge_power'] = (string)(float)str_replace(',', '.', $_POST['wb1_charge_power'] ?? '11.0');
-        
-        // Abwärtskompatibilität: Auch Single-Car Keys setzen
+
+        // Abwärtskompatibilität: Auch die Schlüssel für ein einzelnes Fahrzeug setzen
         $updates['car_capacity'] = $updates['wb1_capacity'];
         $updates['car_target_soc'] = $updates['wb1_target_soc'];
         $updates['car_max_soc_si'] = $updates['wb1_max_soc_si'];
         $updates['car_charge_power'] = $updates['wb1_charge_power'];
-        
+
         // Neu: Wenn Ist-SoC mitgeliefert ("Gastfahrzeug"), dann auch ins RAM schreiben
         if (isset($_POST['manual_soc_wb1']) && trim($_POST['manual_soc_wb1']) !== '') {
             $msoc = (float)str_replace(',', '.', $_POST['manual_soc_wb1']);
@@ -1037,9 +1140,7 @@ if (isset($_POST['save_soc_settings'])) {
                 'plugged' => true,
                 'ts' => time(),
             ];
-            @file_put_contents('/var/www/html/ramdisk/manual_soc_wb1.json', json_encode($jd));
-            @chmod('/var/www/html/ramdisk/manual_soc_wb1.json', 0666);
-            @file_put_contents('/var/www/html/tmp/manual_soc.json', json_encode($jd));
+            $manualSocCandidates[1] = $jd;
         }
     }
 
@@ -1064,13 +1165,12 @@ if (isset($_POST['save_soc_settings'])) {
                 'plugged' => true,
                 'ts' => time(),
             ];
-            @file_put_contents('/var/www/html/ramdisk/manual_soc_wb2.json', json_encode($jd));
-            @chmod('/var/www/html/ramdisk/manual_soc_wb2.json', 0666);
+            $manualSocCandidates[2] = $jd;
         }
     }
 
-    // Native Ladeplanung ist pro Wallbox. Legacy wbhour/wbvon/wbbis bleiben
-    // als Fallback für WB1 erhalten, damit alte Installationen weiterlaufen.
+    // Die native Ladeplanung gilt je Wallbox. Die alten Felder wbhour/wbvon/wbbis
+    // bleiben als Rückfallwerte für WB1 erhalten, damit alte Installationen weiterlaufen.
     for ($planWb = 1; $planWb <= 2; $planWb++) {
         $hoursKey = "native_plan_hours_wb{$planWb}";
         $smartKey = "smart_wbhour_enable_wb{$planWb}";
@@ -1133,30 +1233,37 @@ if (isset($_POST['save_soc_settings'])) {
         $updates['dvcarlimit'] = (string)max(0.0, min(200.0, $limit));
     }
 
-    // Abort-Flag IMMER löschen - unabhängig ob Config-Write erfolgreich
-    // (sonst bleibt der Plan gesperrt wenn das Config-Write kurz haengt)
-    $abort_flag = '/var/www/html/ramdisk/native_schedule_aborted.flag';
-    if (file_exists($abort_flag)) @unlink($abort_flag);
-
-    if (upsertWallboxConfigValues($config_file, $updates)) {
+    // Abbruchflag IMMER löschen – unabhängig vom Erfolg des Konfigurationsschreibzugs
+    // (sonst bleibt der Plan gesperrt, wenn der Konfigurationsschreibzug kurz hängt)
+    $tx = e3dcWallboxPlanTransaction($updates, [
+        'operation' => 'plan',
+        'abort_flag' => 'remove',
+        'manual_soc' => $manualSocCandidates,
+        // e3dc_v4.json ist für diesen AJAX-Pfad autoritativ. Der optionale
+        // Der Altspiegel in der Installationswurzel darf den atomaren V4-Speichervorgang
+        // unter dem Apache-Benutzer nicht blockieren.
+        'sync_legacy_config' => false,
+    ]);
+    if (wallboxWantsConfigJsonResponse()) {
+        wallboxEmitConfigJsonResponse($tx, 'wallbox_assignment');
+    }
+    if (!empty($tx['success'])) {
         $message = successMessage('Ladeplanung je Wallbox gespeichert.');
-        
-        // Synchroner Aufruf des Wallbox-Planers, damit das UI sofort den neuen Plan mit Gast-SoC zeigt
-        @shell_exec("/home/pi/.venv_e3dc/bin/python3 -c \"import sys; sys.path.append('/home/pi/Install/Installer'); from Wallbox.config import get_config; from wallbox_planer import generate_native_charging_schedule; generate_native_charging_schedule(get_config())\" > /dev/null 2>&1");
     } else {
-        $message = errorMessage('Schreibberechtigung fehlt', 'Konnte die V4-Konfiguration nicht schreiben.');
+        $message = errorMessage('Ladeplanung nicht gespeichert', (string)($tx['message'] ?? 'Die transaktionale Planung ist fehlgeschlagen.'));
     }
 }
 
-// Handler: Plan neu erstellen (loescht nur das Abort-Flag -> Scheduler generiert neuen Plan)
+// Behandlung: Plan neu erstellen (löscht nur das Abbruchflag -> Planer erzeugt einen neuen Plan)
 if (isset($_POST['recreate_plan'])) {
-    $abort_flag = '/var/www/html/ramdisk/native_schedule_aborted.flag';
-    if (file_exists($abort_flag)) @unlink($abort_flag);
-    $message = successMessage('&#128640; Ladeplanung wieder aktiviert. Neuer Plan wird generiert...');
+    $tx = e3dcWallboxPlanTransaction([], ['operation' => 'plan', 'abort_flag' => 'remove']);
+    $message = !empty($tx['success'])
+        ? successMessage('&#128640; Ladeplanung wieder aktiviert. Ein neuer Plan wurde validiert.')
+        : errorMessage('Ladeplanung nicht aktiviert', (string)($tx['message'] ?? 'Die transaktionale Planung ist fehlgeschlagen.'));
 }
 
-// Handler: Sanfter Plan-Abbruch (NUR Netz-Ladeplan löschen, PV-Laden läuft weiter)
-// Setzt wbhour=0 und loescht Schedule-Dateien. Wallbox-Sperre (wb_locked) wird NICHT gesetzt.
+// Behandlung: Sanfter Planabbruch (NUR Netzladeplan löschen, PV-Laden läuft weiter)
+// Setzt wbhour=0 und löscht Plandateien. Die Wallbox-Sperre (wb_locked) wird NICHT gesetzt.
 // Setzt native_schedule_aborted.flag damit der Wallbox-Planer die automatische Neu-Generierung
 // pausiert, bis der Nutzer explizit neue Einstellungen speichert.
 if (isset($_POST['abort_charging'])) {
@@ -1180,29 +1287,29 @@ if (isset($_POST['abort_charging'])) {
         'smart_wbhour_enable' => '0',
         'wb_sofort' => '0',
     ];
-    upsertWallboxConfigValues($config_file, $updates);
+    $tx = e3dcWallboxPlanTransaction($updates, [
+        'operation' => 'clear',
+        'abort_flag' => 'create',
+        'delete_legacy_schedule' => true,
+    ]);
 
     // Schedule-Dateien löschen (kein e3dc.wallbox.txt - kein C++ Eingriff)
-    $schedule_files = [
-        '/var/www/html/ramdisk/native_wallbox_schedule.json',
-        '/var/www/html/ramdisk/native_wallbox_schedule_wb1.json',
-        '/var/www/html/ramdisk/native_wallbox_schedule_wb2.json',
-        $base_path . 'e3dc.wallbox.out',
-    ];
-    foreach ($schedule_files as $f) {
-        if (file_exists($f)) @unlink($f);
-    }
+    // Alle Dateiziele wurden bereits atomar in e3dcWallboxPlanTransaction behandelt.
 
-    // Abort-Flag setzen: Wallbox-Planer überspringt Neu-Generierung solange Flag existiert
-    $abort_flag = '/var/www/html/ramdisk/native_schedule_aborted.flag';
-    @file_put_contents($abort_flag, date('c'));
-    @chmod($abort_flag, 0666);
+    // Abbruchflag setzen: Der Wallbox-Planer überspringt die Neuerzeugung, solange es existiert.
+    // Das Abbruchflag ist Bestandteil derselben Transaktion.
 
     // Kein Manager-Neustart nötig: Er respektiert das Flag beim nächsten Zyklus (<30s)
-    $message = successMessage('&#9989; Netz-Ladeplan gelöscht. PV-Laden läuft weiter.');
+    if (!empty($tx['success'])) {
+        $message = (($tx['legacy_cleanup_status'] ?? '') === 'partial_failure')
+            ? successMessage('Netz-Ladeplan kanonisch gelöscht. Hinweis: ' . (string)($tx['message'] ?? 'Die Legacy-Bereinigung blieb unvollständig.'))
+            : successMessage('Netz-Ladeplan gelöscht. PV-Laden läuft weiter.');
+    } else {
+        $message = errorMessage('Ladeplan nicht gelöscht', (string)($tx['message'] ?? 'Die transaktionale Planung ist fehlgeschlagen.'));
+    }
 }
 
-// Handler: NOT-AUS (Physische Sperre, alle Wallboxen gesperrt, kein Laden mehr)
+// Behandlung: NOT-AUS (physische Sperre, alle Wallboxen gesperrt, kein Laden mehr)
 if (isset($_POST['abort_all_charging'])) {
     $updates = [
         'wb1_locked'          => '1',
@@ -1227,47 +1334,47 @@ if (isset($_POST['abort_all_charging'])) {
     ];
 
     // 1. Physische Sperre in Config schreiben
-    upsertWallboxConfigValues($config_file, $updates);
+    $tx = e3dcWallboxPlanTransaction($updates, [
+        'operation' => 'clear',
+        'abort_flag' => 'create',
+        'emergency_flag' => 'create',
+        'delete_legacy_schedule' => true,
+        'delete_legacy_wallbox_command' => true,
+    ]);
 
     // 2. Alle Zeitpläne löschen (inkl. C++ Relikt)
-    $files_to_delete = [
-        '/var/www/html/ramdisk/native_wallbox_schedule.json',
-        '/var/www/html/ramdisk/native_wallbox_schedule_wb1.json',
-        '/var/www/html/ramdisk/native_wallbox_schedule_wb2.json',
-        $base_path . 'e3dc.wallbox.out',
-        $base_path . 'e3dc.wallbox.txt',
-    ];
-    foreach ($files_to_delete as $f) {
-        if (file_exists($f)) @unlink($f);
-    }
+    // Alle Dateiziele wurden bereits atomar in e3dcWallboxPlanTransaction behandelt.
 
-    // 3. Hard-Stop-Flag: Der Manager priorisiert dieses Flag vor jeder Regelung
+    // 3. Hartes Stoppflag: Der Manager priorisiert dieses Flag vor jeder Regelung
     // und setzt alle aktiven Ladepunkte hart auf STOP. Der Manager bleibt aktiv,
     // damit die Sperre gehalten wird; reine Autonom-Freigabe wäre für NOT-AUS
     // zu weich, weil einige Wallboxen dann selbstständig weiterladen könnten.
-    $emergency_flag = '/var/www/html/ramdisk/wallbox_emergency_stop.flag';
-    @file_put_contents($emergency_flag, date('c'));
-    @chmod($emergency_flag, 0666);
+    // Das NOT-AUS-Flag ist der letzte öffentliche Commit-Schritt.
 
     // 4. Manager neustarten damit Sperre sofort greift
-    e3dcRunServiceWrapperAction('restart', ['e3dc-wallbox-manager']);
+    // Kein Dienst-Neustart: Der laufende Manager konsumiert die Sperre im nächsten Zyklus.
 
     $message = errorMessage('&#128680; NOT-AUS', 'Alle Ladepläne gelöscht, Wallboxen gesperrt und Hard-Stop an den Wallbox-Manager übergeben. Zum Freigeben den jeweiligen Ladepunkt wieder einschalten.');
 }
 
-// NEU: Handler für Manuellen SoC
+// Behandlung für manuellen SoC
+if (isset($_POST['abort_all_charging'])) {
+    if (!empty($tx['success'])) {
+        $details = (($tx['legacy_cleanup_status'] ?? '') === 'partial_failure')
+            ? 'Der kanonische Hard-Stop ist aktiv. Hinweis: ' . (string)($tx['message'] ?? 'Die Legacy-Bereinigung blieb unvollständig.')
+            : 'Alle Ladepläne wurden transaktional gelöscht; der laufende Wallbox-Manager übernimmt die Sperre ohne Dienst-Neustart.';
+        $message = errorMessage('NOT-AUS', $details);
+    } else {
+        $message = errorMessage('NOT-AUS nicht vollständig übernommen', (string)($tx['message'] ?? 'Die transaktionale Sperre ist fehlgeschlagen.'));
+    }
+}
+
 if (isset($_POST['save_manual_soc'])) {
     $wbIdx = (int)($_POST['wb_index'] ?? 1);
     $manualSoc = (float)str_replace(',', '.', $_POST['manual_soc_value'] ?? '0');
     if ($manualSoc < 0) $manualSoc = 0;
     if ($manualSoc > 100) $manualSoc = 100;
-    
-    $manualSocFile = "/var/www/html/ramdisk/manual_soc_wb{$wbIdx}.json";
-    // Legacy support for WB1
-    if ($wbIdx === 1) $legacySocFile = '/var/www/html/tmp/manual_soc.json';
 
-    if (!is_dir(dirname($manualSocFile))) { @mkdir(dirname($manualSocFile), 0775, true); }
-    
     $data = [
         'soc' => $manualSoc,
         'car_id' => trim($_POST['manual_car_id'] ?? ''),
@@ -1278,24 +1385,31 @@ if (isset($_POST['save_manual_soc'])) {
         'plugged' => true,
         'ts' => time()
     ];
-    
-    $json = json_encode($data);
-    if (@file_put_contents($manualSocFile, $json)) {
-        @chmod($manualSocFile, 0666);
-        if ($wbIdx === 1 && isset($legacySocFile)) @file_put_contents($legacySocFile, $json);
-        // Abort-Flag IMMER löschen wenn neuer SoC gesetzt
+
+    $tx = e3dcWallboxPlanTransaction([], [
+        'operation' => 'plan',
+        'abort_flag' => 'remove',
+        'manual_soc' => [$wbIdx => $data],
+    ]);
+    if (!empty($tx['success'])) {
+        // Abbruchflag IMMER löschen, wenn ein neuer SoC gesetzt wird
         $abort_flag = '/var/www/html/ramdisk/native_schedule_aborted.flag';
-        if (file_exists($abort_flag)) @unlink($abort_flag);
-        $message = successMessage('&#10003; Manueller Start-SoC (' . round($manualSoc, 1) . '%) für Wallbox ' . $wbIdx . ' erfolgreich gesetzt.');
+        $message = (($tx['legacy_projection_status'] ?? '') === 'partial_failure')
+            ? successMessage('Manueller Start-SoC (' . round($manualSoc, 1) . '%) kanonisch gesetzt. Hinweis: ' . (string)($tx['message'] ?? 'Der Legacy-Spiegel blieb unvollständig.'))
+            : successMessage('&#10003; Manueller Start-SoC (' . round($manualSoc, 1) . '%) für Wallbox ' . $wbIdx . ' erfolgreich gesetzt.');
     } else {
-        $message = errorMessage('Schreibberechtigung fehlt', 'Konnte tmp/manual_soc_wb' . $wbIdx . '.json nicht erstellen.');
+        $message = errorMessage('Manueller Start-SoC nicht übernommen', (string)($tx['message'] ?? 'Der kanonische manuelle SoC konnte nicht geschrieben werden.'));
     }
 }
 
-// NEU: Handler für Fahrzeug-Vorlagen (Custom Cars)
+// Behandlung für Fahrzeugvorlagen
 $saved_cars_file = '/var/www/html/data/saved_cars.json';
+$savedCarsRaw = is_file($saved_cars_file) && !is_link($saved_cars_file)
+    ? @file_get_contents($saved_cars_file)
+    : false;
+$savedCarsExpectedRevision = $savedCarsRaw === false ? 'absent' : hash('sha256', $savedCarsRaw);
 if (isset($_POST['save_custom_car'])) {
-    $cars = file_exists($saved_cars_file) ? json_decode(file_get_contents($saved_cars_file), true) : [];
+    $cars = $savedCarsRaw === false ? [] : json_decode($savedCarsRaw, true);
     if (!is_array($cars)) $cars = [];
     $linkSavedId = trim($_POST['custom_car_link_saved_id'] ?? '');
     $cloudVehicleId = trim($_POST['custom_car_cloud_vehicle_id'] ?? '');
@@ -1311,12 +1425,15 @@ if (isset($_POST['save_custom_car'])) {
         }
     }
     if ($targetIndex === null) {
-        $targetIndex = findSavedCarIndexForIdentifiers($cars, [$vehicleId, $cloudVehicleId], trim($_POST['custom_car_name'] ?? ''));
+        $targetIndex = findSavedCarIndexForIdentifiers($cars, [
+            'vehicle_id' => $vehicleId,
+            'cloud_vehicle_id' => $cloudVehicleId,
+        ], trim($_POST['custom_car_name'] ?? ''));
     }
     $existingCar = ($targetIndex !== null && isset($cars[$targetIndex]) && is_array($cars[$targetIndex])) ? $cars[$targetIndex] : [];
     $carName = trim($_POST['custom_car_name'] ?? '');
     $newCar = [
-        'id' => ($targetIndex !== null && !empty($existingCar['id'])) ? $existingCar['id'] : ('custom_' . time()),
+        'id' => ($targetIndex !== null && !empty($existingCar['id'])) ? $existingCar['id'] : newSavedCarProfileIdWallbox($cars),
         'name' => $carName !== '' ? $carName : ($existingCar['name'] ?? 'Unbenannt'),
         'vehicle_id' => $vehicleId !== '' ? $vehicleId : ($existingCar['vehicle_id'] ?? ''),
         'cloud_vehicle_id' => $cloudVehicleId !== '' ? $cloudVehicleId : ($existingCar['cloud_vehicle_id'] ?? ''),
@@ -1336,32 +1453,29 @@ if (isset($_POST['save_custom_car'])) {
     } else {
         $cars[] = $newCar;
     }
-    if (@file_put_contents($saved_cars_file, json_encode($cars, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT))) {
-        @chmod($saved_cars_file, 0666);
-        $assignWb = (int)($_POST['custom_car_assign_wb'] ?? 0);
-        $assignMessage = '';
-        if (in_array($assignWb, [1, 2], true)) {
-            $assignUpdates = [
+    $assignWb = (int)($_POST['custom_car_assign_wb'] ?? 0);
+    $assignUpdates = [];
+    $manualSocCandidates = [];
+    $assignMessage = '';
+    if (in_array($assignWb, [1, 2], true)) {
+        $assignUpdates = [
                 "wb{$assignWb}_car_id" => normalizeWallboxVehicleSelection($newCar['id']),
                 "wb{$assignWb}_capacity" => (string)$newCar['capacity'],
                 "wb{$assignWb}_target_soc" => (string)$newCar['target_soc'],
                 "wb{$assignWb}_max_soc_si" => (string)$newCar['max_soc'],
                 "wb{$assignWb}_charge_power" => (string)$newCar['power'],
             ];
-            if ($assignWb === 1) {
-                $assignUpdates['car_capacity'] = (string)$newCar['capacity'];
-                $assignUpdates['car_target_soc'] = (string)$newCar['target_soc'];
-                $assignUpdates['car_max_soc_si'] = (string)$newCar['max_soc'];
-                $assignUpdates['car_charge_power'] = (string)$newCar['power'];
-            }
-            if (upsertWallboxConfigValues($config_file, $assignUpdates)) {
-                $assignMessage = " und Wallbox {$assignWb} zugeordnet";
-            }
-
-            $detectedSoc = trim($_POST['custom_car_current_soc'] ?? '');
-            if ($detectedSoc !== '') {
-                $soc = max(0, min(100, (float)str_replace(',', '.', $detectedSoc)));
-                $socPayload = [
+        if ($assignWb === 1) {
+            $assignUpdates['car_capacity'] = (string)$newCar['capacity'];
+            $assignUpdates['car_target_soc'] = (string)$newCar['target_soc'];
+            $assignUpdates['car_max_soc_si'] = (string)$newCar['max_soc'];
+            $assignUpdates['car_charge_power'] = (string)$newCar['power'];
+        }
+        $assignMessage = " und Wallbox {$assignWb} zugeordnet";
+        $detectedSoc = trim($_POST['custom_car_current_soc'] ?? '');
+        if ($detectedSoc !== '') {
+            $soc = max(0, min(100, (float)str_replace(',', '.', $detectedSoc)));
+            $manualSocCandidates[$assignWb] = [
                     'soc' => $soc,
                     'name' => $newCar['id'],
                     'capacity' => (float)$newCar['capacity'],
@@ -1370,52 +1484,69 @@ if (isset($_POST['save_custom_car'])) {
                     'wb' => $assignWb,
                     'source' => 'openwb_profile_link',
                     'ts' => time(),
-                ];
-                $socFile = "/var/www/html/ramdisk/manual_soc_wb{$assignWb}.json";
-                @file_put_contents($socFile, json_encode($socPayload, JSON_UNESCAPED_UNICODE));
-                @chmod($socFile, 0666);
-                if ($assignWb === 1) {
-                    @file_put_contents('/var/www/html/tmp/manual_soc.json', json_encode($socPayload, JSON_UNESCAPED_UNICODE));
-                }
-            }
+            ];
         }
-        $message = successMessage("✓ Fahrzeugprofil '{$newCar['name']}' gespeichert.");
+    }
+    $txOptions = [
+        'operation' => 'plan',
+        'saved_cars' => $cars,
+        'expected_saved_cars_sha256' => $savedCarsExpectedRevision,
+    ];
+    if (!empty($manualSocCandidates)) $txOptions['manual_soc'] = $manualSocCandidates;
+    $tx = e3dcWallboxPlanTransaction($assignUpdates, $txOptions);
+    if (!empty($tx['success']) && !empty($tx['canonical_committed'])) {
+        foreach ($assignUpdates as $key => $value) $confData['config'][$key] = $value;
+        $legacyHint = (($tx['legacy_projection_status'] ?? '') === 'partial_failure')
+            ? ' Hinweis: ' . (string)($tx['message'] ?? 'Der Legacy-SoC-Spiegel blieb unvollständig.')
+            : '';
+        $message = successMessage("✓ Fahrzeugprofil '{$newCar['name']}' gespeichert{$assignMessage}.{$legacyHint}");
+    } else {
+        $message = errorMessage('Fahrzeugprofil nicht übernommen', (string)($tx['message'] ?? 'Der kanonische Profil-Commit ist fehlgeschlagen.'));
     }
 }
 if (isset($_POST['delete_custom_car'])) {
-    $cars = file_exists($saved_cars_file) ? json_decode(file_get_contents($saved_cars_file), true) : [];
+    $cars = $savedCarsRaw === false ? [] : json_decode($savedCarsRaw, true);
     if (!is_array($cars)) $cars = [];
     $delId = $_POST['delete_custom_car'];
     $deletedCars = array_values(array_filter($cars, function($c) use ($delId) {
         return isset($c['id']) && $c['id'] === $delId;
     }));
-    $cars = array_values(array_filter($cars, function($c) use ($delId) { return isset($c['id']) && $c['id'] !== $delId; }));
-    @file_put_contents($saved_cars_file, json_encode($cars));
-    $assignmentUpdates = [];
-    foreach ([1, 2] as $slot) {
-        $key = "wb{$slot}_car_id";
-        $selection = $confData['config'][$key] ?? '';
-        $matchesDeleted = normalizeWallboxVehicleSelection($selection) === normalizeWallboxVehicleSelection($delId);
-        foreach ($deletedCars as $deletedCar) {
-            if (wallboxSavedCarMatchesSelection($deletedCar, $selection)) {
-                $matchesDeleted = true;
-                break;
+    if (empty($deletedCars)) {
+        $message = errorMessage('Fahrzeugprofil nicht gelöscht', 'Das ausgewählte Profil wurde nicht gefunden; es wurde nichts verändert.');
+    } else {
+        $cars = array_values(array_filter($cars, function($c) use ($delId) { return isset($c['id']) && $c['id'] !== $delId; }));
+        $assignmentUpdates = [];
+        foreach ([1, 2] as $slot) {
+            $key = "wb{$slot}_car_id";
+            $selection = $confData['config'][$key] ?? '';
+            $matchesDeleted = normalizeWallboxVehicleSelection($selection) === normalizeWallboxVehicleSelection($delId);
+            foreach ($deletedCars as $deletedCar) {
+                if (wallboxSavedCarMatchesSelection($deletedCar, $selection)) {
+                    $matchesDeleted = true;
+                    break;
+                }
+            }
+            if ($matchesDeleted) {
+                $assignmentUpdates[$key] = '__none';
             }
         }
-        if ($matchesDeleted) {
-            $assignmentUpdates[$key] = '__none';
+        $tx = e3dcWallboxPlanTransaction($assignmentUpdates, [
+            'operation' => 'plan',
+            'saved_cars' => $cars,
+            'expected_saved_cars_sha256' => $savedCarsExpectedRevision,
+        ]);
+        if (!empty($tx['success']) && !empty($tx['canonical_committed'])) {
+            foreach ($assignmentUpdates as $key => $value) {
+                $confData['config'][$key] = $value;
+            }
+            $message = successMessage("✓ Fahrzeugprofil gelöscht" . (!empty($assignmentUpdates) ? " und Wallbox-Zuordnung zurückgesetzt." : "."));
+        } else {
+            $message = errorMessage('Fahrzeugprofil nicht gelöscht', (string)($tx['message'] ?? 'Der kanonische Profil-Commit ist fehlgeschlagen.'));
         }
     }
-    if (!empty($assignmentUpdates)) {
-        upsertWallboxConfigValues($config_file, $assignmentUpdates);
-        foreach ($assignmentUpdates as $key => $value) {
-            $confData['config'][$key] = $value;
-        }
-    }
-    $message = successMessage("✓ Fahrzeugprofil gelöscht" . (!empty($assignmentUpdates) ? " und Wallbox-Zuordnung zurückgesetzt." : "."));
 }
 
-// NEU: Handler für Cloud Integration (Bluelink)
+// Behandlung für die Cloud-Integration (Bluelink)
 if (isset($_POST['save_cloud_integration'])) {
     $updates = [
         'bluelink_vin' => trim($_POST['bluelink_vin'] ?? ''),
@@ -1436,13 +1567,14 @@ $saved_cars = file_exists($saved_cars_file) ? json_decode(file_get_contents($sav
 if (!is_array($saved_cars)) $saved_cars = [];
 $live_cloud_vehicles = getLiveCloudVehiclesForWallbox();
 $unknown_openwb_vehicles = getDetectedOpenwbVehiclesForWallbox($saved_cars);
+$observed_openwb_profiles = getObservedOpenwbChargeProfilesForWallbox();
 
 function applyAwattarPriceLogic($priceRaw, $awmwst, $awnebenkosten)
 {
     $multiplier = ($awmwst / 100.0) + 1.0;
-    
+
     // Der Preis in e3dc.wallbox.out ist der Börsenpreis in €/MWh.
-    // To get the gross price in ct/kWh, we must first divide by 10.
+    // Für den Bruttopreis in ct/kWh muss der Wert zunächst durch 10 geteilt werden.
     return (($priceRaw / 10.0) * $multiplier) + $awnebenkosten;
 }
 
@@ -1452,7 +1584,7 @@ function getTieredPrices($base_path) {
     if (!file_exists($file)) return null;
     $lines = file($file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
     if (!$lines) return null;
-    
+
     $parsed = [];
     foreach ($lines as $line) {
         $parts = preg_split('/\s+/', trim($line));
@@ -1461,7 +1593,7 @@ function getTieredPrices($base_path) {
         }
     }
     ksort($parsed);
-    
+
     $last_price = reset($parsed);
     for ($h = 0; $h < 24; $h++) {
         if (isset($parsed[$h])) {
@@ -1567,7 +1699,7 @@ function parseWallboxConfigValues($filePath) {
             }
         }
     }
-    
+
     // Initialwerte für Wallbox 1 (Abwärtskompatibilität)
     if (empty($result['wb1_car_id'])) $result['wb1_car_id'] = '__none';
     if (empty($result['wb1_capacity']) && !empty($result['car_capacity'])) $result['wb1_capacity'] = $result['car_capacity'];
@@ -1615,7 +1747,17 @@ function parseWallboxConfigValues($filePath) {
     return $result;
 }
 
-function upsertWallboxConfigValues($filePath, $updates) {
+function wallboxConfigUpsertResult($success, $code) {
+    return ['success' => (bool)$success, 'code' => (string)$code];
+}
+
+function wallboxLogConfigFailure($operation, $code) {
+    $operation = preg_replace('/[^a-z0-9_\-]/i', '', (string)$operation) ?: 'unknown';
+    $code = preg_replace('/[^a-z0-9_\-]/i', '', (string)$code) ?: 'unknown';
+    error_log('[E3DC_CONFIG] operation=' . $operation . ' code=' . $code);
+}
+
+function upsertWallboxConfigValuesDetailed($filePath, $updates, $options = []) {
     $normalizedUpdates = [];
     foreach (($updates ?? []) as $key => $value) {
         $key = strtolower(trim((string)$key));
@@ -1626,106 +1768,128 @@ function upsertWallboxConfigValues($filePath, $updates) {
     }
     $updates = $normalizedUpdates;
     if (empty($updates)) {
-        return true;
+        return wallboxConfigUpsertResult(true, 'no_changes');
     }
 
-    $lines = is_file($filePath) ? file($filePath, FILE_IGNORE_NEW_LINES) : [];
-    if ($lines === false) {
-        $lines = [];
+    $testMode = PHP_SAPI === 'cli' && !empty($options['test_mode']);
+    $v4Path = $testMode ? (string)($options['v4_path'] ?? '') : '/var/www/html/data/e3dc_v4.json';
+    $cachePath = $testMode ? (string)($options['cache_path'] ?? '') : '/var/www/html/ramdisk/e3dc_config_cache.json';
+    $failOperation = $testMode ? (string)($options['fail_operation'] ?? '') : '';
+    if ($v4Path === '' || !is_file($v4Path) || is_link($v4Path)) {
+        $result = wallboxConfigUpsertResult(false, 'config_missing');
+        wallboxLogConfigFailure('wallbox_config_upsert', $result['code']);
+        return $result;
     }
 
-    $found = [];
-    foreach ($updates as $key => $_) {
-        $found[$key] = false;
-    }
-
-    $newLines = [];
-    foreach ($lines as $line) {
-        if (preg_match('/^\s*([a-z0-9_]+)\s*=\s*(.*?)\s*$/i', $line, $m)) {
-            $existingKey = trim($m[1]);
-            $existingLower = strtolower($existingKey);
-            if (array_key_exists($existingLower, $updates)) {
-                $newLines[] = $existingKey . ' = ' . $updates[$existingLower];
-                $found[$existingLower] = true;
-                continue;
-            }
-        }
-        $newLines[] = $line;
-    }
-
-    $canonical = [
-        'wbhour' => 'Wbhour',
-        'wbvon' => 'Wbvon',
-        'wbbis' => 'Wbbis',
-        'smart_wbhour_enable' => 'smart_wbhour_enable',
-        'wb1_plan_hours' => 'wb1_plan_hours',
-        'wb1_wbvon' => 'wb1_wbvon',
-        'wb1_wbbis' => 'wb1_wbbis',
-        'wb1_battery_departure_time' => 'wb1_battery_departure_time',
-        'wb1_battery_departure_window_h' => 'wb1_battery_departure_window_h',
-        'wb1_smart_wbhour_enable' => 'wb1_smart_wbhour_enable',
-        'wb1_native_eco' => 'wb1_native_eco',
-        'wb2_plan_hours' => 'wb2_plan_hours',
-        'wb2_wbvon' => 'wb2_wbvon',
-        'wb2_wbbis' => 'wb2_wbbis',
-        'wb2_battery_departure_time' => 'wb2_battery_departure_time',
-        'wb2_battery_departure_window_h' => 'wb2_battery_departure_window_h',
-        'wb2_smart_wbhour_enable' => 'wb2_smart_wbhour_enable',
-        'wb2_native_eco' => 'wb2_native_eco',
-        'car_capacity' => 'car_capacity',
-        'car_target_unit' => 'car_target_unit',
-        'car_target_kwh' => 'car_target_kwh',
-        'car_target_soc' => 'car_target_soc',
-        'car_max_soc_si' => 'car_max_soc_si',
-        'car_charge_power' => 'car_charge_power',
-        'wbminsoc' => 'wbminsoc',
-        'wbmaxladestrom' => 'wbmaxladestrom',
-        'wb1_car_id' => 'wb1_car_id',
-        'wb1_capacity' => 'wb1_capacity',
-        'wb1_target_unit' => 'wb1_target_unit',
-        'wb1_target_kwh' => 'wb1_target_kwh',
-        'wb1_target_soc' => 'wb1_target_soc',
-        'wb1_max_soc_si' => 'wb1_max_soc_si',
-        'wb1_charge_power' => 'wb1_charge_power',
-        'wb1_max_amp' => 'wb1_max_amp',
-        'wb2_car_id' => 'wb2_car_id',
-        'wb2_capacity' => 'wb2_capacity',
-        'wb2_target_unit' => 'wb2_target_unit',
-        'wb2_target_kwh' => 'wb2_target_kwh',
-        'wb2_target_soc' => 'wb2_target_soc',
-        'wb2_max_soc_si' => 'wb2_max_soc_si',
-        'wb2_charge_power' => 'wb2_charge_power',
-        'wb2_max_amp' => 'wb2_max_amp',
-        'wb1_locked' => 'wb1_locked',
-        'wb1_mode'   => 'wb1_mode',
-        'wb1_observe_storage_policy' => 'wb1_observe_storage_policy',
-        'wb1_name'   => 'wb1_name',
-        'wb2_locked' => 'wb2_locked',
-        'wb2_mode'   => 'wb2_mode',
-        'wb2_observe_storage_policy' => 'wb2_observe_storage_policy',
-        'wb2_name'   => 'wb2_name',
-        'wb_native_mode' => 'wb_native_mode',
-        'wb_no_time_limit' => 'wb_no_time_limit',
-        'wb_sofort' => 'wb_sofort',
-        'wb_native_eco' => 'wb_native_eco',
-        'bluelink_refresh_token' => 'bluelink_refresh_token',
-        'bluelink_vin' => 'bluelink_vin',
-        'bluelink_car_name' => 'bluelink_car_name',
-        'bluelink_interval' => 'bluelink_interval',
-        'bluelink_ignore_plug_status' => 'bluelink_ignore_plug_status'
-    ];
-
-    foreach ($updates as $key => $value) {
-        if (!$found[$key]) {
-            $newLines[] = ($canonical[$key] ?? $key) . ' = ' . $value;
+    $lockDir = dirname($v4Path) . '/.wallbox_plan_jobs';
+    if (!is_dir($lockDir)) {
+        $oldUmask = umask(0077);
+        $made = @mkdir($lockDir, 0700, false);
+        umask($oldUmask);
+        if (!$made && !is_dir($lockDir)) {
+            $result = wallboxConfigUpsertResult(false, 'lock_dir_failed');
+            wallboxLogConfigFailure('wallbox_config_upsert', $result['code']);
+            return $result;
         }
     }
+    if (is_link($lockDir) || !@chmod($lockDir, 0700)) {
+        $result = wallboxConfigUpsertResult(false, 'lock_dir_failed');
+        wallboxLogConfigFailure('wallbox_config_upsert', $result['code']);
+        return $result;
+    }
+    $lockPath = $lockDir . '/.transaction.lock';
+    if ($failOperation === 'lock_open') {
+        $result = wallboxConfigUpsertResult(false, 'lock_open_failed');
+        wallboxLogConfigFailure('wallbox_config_upsert', $result['code']);
+        return $result;
+    }
+    $lock = @fopen($lockPath, 'c+b');
+    if ($lock === false) {
+        $result = wallboxConfigUpsertResult(false, 'lock_open_failed');
+        wallboxLogConfigFailure('wallbox_config_upsert', $result['code']);
+        return $result;
+    }
+    @chmod($lockPath, 0660);
+    $locked = $failOperation !== 'lock' && @flock($lock, LOCK_EX);
+    if (!$locked) {
+        @fclose($lock);
+        $result = wallboxConfigUpsertResult(false, 'lock_failed');
+        wallboxLogConfigFailure('wallbox_config_upsert', $result['code']);
+        return $result;
+    }
 
-    $v4Path = '/var/www/html/data/e3dc_v4.json';
-    $v4Available = is_file($v4Path);
-    $success = @file_put_contents($filePath, implode("\n", $newLines), LOCK_EX) !== false;
-    $v4Success = saveE3dcConfigValues($updates);
-    return $v4Available ? $v4Success : ($v4Success || $success);
+    $tmpPath = '';
+    $finish = function($success, $code) use (&$lock, &$tmpPath) {
+        if ($tmpPath !== '' && file_exists($tmpPath)) @unlink($tmpPath);
+        @flock($lock, LOCK_UN);
+        @fclose($lock);
+        $result = wallboxConfigUpsertResult($success, $code);
+        if (!$success) wallboxLogConfigFailure('wallbox_config_upsert', $code);
+        return $result;
+    };
+
+    if ($failOperation === 'read') return $finish(false, 'read_failed');
+    $raw = @file_get_contents($v4Path);
+    if ($raw === false) return $finish(false, 'read_failed');
+    $data = json_decode($raw, true);
+    if (!is_array($data)) return $finish(false, 'json_invalid');
+    foreach ($updates as $key => $value) $data[$key] = $value;
+    $json = json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    if ($json === false) return $finish(false, 'encode_failed');
+    $payload = $json . "\n";
+
+    if ($failOperation === 'temp') return $finish(false, 'temp_create_failed');
+    try {
+        $tmpPath = dirname($v4Path) . '/.e3dc-v4-' . bin2hex(random_bytes(12)) . '.tmp';
+    } catch (Throwable $e) {
+        return $finish(false, 'temp_create_failed');
+    }
+    $tmp = @fopen($tmpPath, 'x+b');
+    if ($tmp === false) return $finish(false, 'temp_create_failed');
+    $ok = @chmod($tmpPath, e3dcJsonAtomicFileMode($v4Path, $json));
+    $written = 0;
+    $length = strlen($payload);
+    while ($ok && $written < $length) {
+        if ($failOperation === 'write') {
+            $ok = false;
+            break;
+        }
+        $count = @fwrite($tmp, substr($payload, $written));
+        if ($count === false || $count <= 0) {
+            $ok = false;
+            break;
+        }
+        $written += $count;
+    }
+    if (!$ok || $written !== $length) {
+        @fclose($tmp);
+        return $finish(false, 'write_failed');
+    }
+    if (!@fflush($tmp)) {
+        @fclose($tmp);
+        return $finish(false, 'flush_failed');
+    }
+    if ($failOperation === 'fsync' || (function_exists('fsync') && !@fsync($tmp))) {
+        @fclose($tmp);
+        return $finish(false, 'fsync_failed');
+    }
+    @fclose($tmp);
+    $verify = @file_get_contents($tmpPath);
+    if ($verify === false || !hash_equals(hash('sha256', $payload), hash('sha256', $verify))) {
+        return $finish(false, 'verify_failed');
+    }
+    if ($failOperation === 'rename' || !@rename($tmpPath, $v4Path)) {
+        return $finish(false, 'rename_failed');
+    }
+    $tmpPath = '';
+    @chmod($v4Path, e3dcJsonAtomicFileMode($v4Path, $json));
+    if ($cachePath !== '' && is_file($cachePath)) @unlink($cachePath);
+    return $finish(true, 'ok');
+}
+
+function upsertWallboxConfigValues($filePath, $updates) {
+    $result = upsertWallboxConfigValuesDetailed($filePath, $updates);
+    return !empty($result['success']);
 }
 
 function parseTimeToMinutes($value) {
@@ -1863,9 +2027,12 @@ $wb_type_labels = [
     'goe' => 'go-e',
     'e3dc' => 'E3DC Easy/Legacy',
     'e3dc_easy' => 'E3DC Easy/Legacy',
-    'e3dc_auto' => 'E3DC Auto',
+    'e3dc_easy_connect' => 'E3DC Easy Connect',
+    'e3dc_efy' => 'E3DC Wallbox efy',
+    'e3dc_auto' => 'E3DC Auto (efy / easy connect / multi connect)',
     'e3dc_multi' => 'E3DC Multi Connect',
     'e3dc_multi_connect' => 'E3DC Multi Connect',
+    'e3dc_multi_connect_ii' => 'E3DC Multi Connect II',
     'shelly' => 'Shelly',
     'tibber' => 'Tibber Pulse',
     'fronius' => 'Fronius'
@@ -1880,10 +2047,13 @@ if (!function_exists('isE3dcNativeWallboxType')) {
             'native',
             'e3dc',
             'e3dc_easy',
+            'e3dc_easy_connect',
             'e3dc_legacy',
             'e3dc_auto',
+            'e3dc_efy',
             'e3dc_multi',
             'e3dc_multi_connect',
+            'e3dc_multi_connect_ii',
         ], true);
     }
 }
@@ -2004,7 +2174,7 @@ $tieredPricesFallback = getTieredPrices($base_path);
 
 // --- POST HANDLER MUSS HIER SEIN, DAMIT SCHEDULER VOR DEM LESEN DES JSONS LÄUFT ---
 if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
-    // Fruehzeitig ermitteln ob Native-Modus aktiv (benötigt für Handler-Logik)
+    // Frühzeitig ermitteln, ob der native Modus aktiv ist (für die Handler-Logik benötigt)
     $isNativeEnabledEarly = in_array(strtolower(trim($wallboxConfig['wb_native_enable'] ?? '0')), ['1', 'true', 'yes']);
     $abort_flag = '/var/www/html/ramdisk/native_schedule_aborted.flag';
 
@@ -2029,7 +2199,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
             // Stattdessen: wbhour in config.txt setzen -> wallbox_manager übernimmt
             $wbhourVal = ($neueDauerInt === 99) ? '99' : (string)$neueDauerInt;
             // wb_sofort=1 NUR bei Max/start_now (Sofortladen ohne Zeitfenster).
-            // Normaler Slider-Save: wb_sofort=0 -> Scheduler respektiert wbvon/wbbis!
+            // Beim normalen Speichern des Schiebereglers gilt wb_sofort=0; die Zeitsteuerung berücksichtigt wbvon/wbbis.
             $ecoMode = isset($_POST['wb_native_eco'])
                 ? (($_POST['wb_native_eco'] === '1') ? '1' : '0')
                 : ($wallboxConfig['wb_native_eco'] ?? '0');
@@ -2059,9 +2229,13 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 $nativeUpdates['wb2_wbbis'] = '00:00';
                 $nativeUpdates['wb2_smart_wbhour_enable'] = '0';
             }
-            if (upsertWallboxConfigValues($config_file, $nativeUpdates)) {
-                // Abort-Flag löschen: Benutzer hat explizit Ladedauer gesetzt
-                if (file_exists($abort_flag)) @unlink($abort_flag);
+            $tx = e3dcWallboxPlanTransaction($nativeUpdates, [
+                'operation' => $neueDauerInt > 0 ? 'plan' : 'clear',
+                'abort_flag' => $neueDauerInt > 0 ? 'remove' : 'create',
+            ]);
+            if (!empty($tx['success'])) {
+                // Abbruchflag löschen: Der Benutzer hat explizit eine Ladedauer gesetzt.
+                // Das Abbruchflag ist Bestandteil derselben Dateitransaktion.
                 if ($quickAction === 'start_now') {
                     $message = successMessage('Sofortladen (Max) aktiviert. wallbox_manager startet die Ladung.');
                 } elseif ($quickAction === 'clear_times') {
@@ -2071,16 +2245,17 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                     $whenLabel = ($wbvonShow === '00:00') ? 'jederzeit (günstigste Stunden)' : 'ab ' . $wbvonShow . ' Uhr';
                     $message = successMessage('Ladedauer (' . $neueDauerInt . 'h) gespeichert. Laden ' . $whenLabel . '.');
                 }
-                
-                // Synchroner Aufruf des Wallbox-Planers, damit das UI sofort den neuen Plan zeigt
-                @shell_exec("/home/pi/.venv_e3dc/bin/python3 -c \"import sys; sys.path.append('/home/pi/Install/Installer'); from Wallbox.config import get_config; from wallbox_planer import generate_native_charging_schedule; generate_native_charging_schedule(get_config())\" > /dev/null 2>&1");
-                
+
+                if (false) {
+                    $message = errorMessage('Einstellung gespeichert, Neuberechnung blockiert', getInstallContextDiagnostic() ?: 'Der validierte Wallbox-Planer ist nicht verfügbar.');
+                }
+
                 $wallboxConfig = parseWallboxConfigValues($config_file);
             } else {
                 $message = errorMessage('Schreibfehler', 'config.txt konnte nicht geschrieben werden.');
             }
         } else {
-            // LEGACY MODUS: e3dc.wallbox.txt schreiben (nur wenn kein Native-Modus!)
+            // ALTMODUS: e3dc.wallbox.txt schreiben (nur wenn kein nativer Modus aktiv ist!)
             $oldUmask = umask(0002);
             $writeResult = @file_put_contents($wallbox_file, $neueDauerInt . PHP_EOL, LOCK_EX);
             umask($oldUmask);
@@ -2094,9 +2269,10 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 } else {
                     $message = successMessage('&#10003; Wallbox-Ladedauer gespeichert.');
                 }
-                
-                // Native Fallback-Schedule updaten falls der Service läuft (wird sonst überschrieben)
-                @shell_exec("/home/pi/.venv_e3dc/bin/python3 -c \"import sys; sys.path.append('/home/pi/Install/Installer'); from Wallbox.config import get_config; from wallbox_planer import generate_native_charging_schedule; generate_native_charging_schedule(get_config())\" > /dev/null 2>&1");
+
+                if (false) {
+                    $message = errorMessage('Einstellung gespeichert, Neuberechnung blockiert', getInstallContextDiagnostic() ?: 'Der validierte Wallbox-Planer ist nicht verfügbar.');
+                }
             } else {
                 $message = errorMessage('Schreibfehler', 'Datei konnte nicht geschrieben werden.');
             }
@@ -2112,19 +2288,19 @@ if (file_exists('/var/www/html/ramdisk/native_wallbox_schedule.json') && is_read
         foreach ($scheduleData as $entry) {
             $ts = (int)($entry['ts'] ?? 0);
             if (!$ts) continue;
-            
+
             $modeStr = $entry['mode'] ?? 'auto';
             $entryWbId = (int)($entry['wb_id'] ?? 1);
             if ($entryWbId === 2) {
                 $modeStr = 'wb2-' . $modeStr;
             }
             $finalPriceCt = isset($entry['price_ct']) ? (float)$entry['price_ct'] : null;
-            
+
             if ($finalPriceCt === null && isset($tieredPricesFallback)) {
                 $hour = (int)date('G', $ts);
                 $finalPriceCt = $tieredPricesFallback[$hour];
             }
-            
+
             $finalPriceEuro = ($finalPriceCt !== null) ? ($finalPriceCt / 100.0) : 0;
             // Rohes ts mit speichern für die Textansicht
             $plannedEntries[] = ['date' => date('j.n.', $ts), 'time' => date('H:i', $ts), 'ts' => $ts, 'source' => $modeStr, 'price' => $finalPriceCt, 'wb_id' => $entryWbId];
@@ -2148,16 +2324,16 @@ if (file_exists('/var/www/html/ramdisk/native_wallbox_schedule.json') && is_read
                 $ts = (int)$parts[1];
                 $mode = (int)$parts[2]; // 0 = manual, 1 = auto
                 $pricePerMwh = (float)$parts[3];
-                
+
                 // Kostenberechnung
                 $finalPriceCt = ($pricePerMwh !== null && $pricePerMwh > 0) ? applyAwattarPriceLogic($pricePerMwh, $awmwst, $awnebenkosten) : null;
-                
-                // HT/NT Fallback if no dynamic price in file
+
+                // HT-/NT-Rückfallwert, wenn die Datei keinen dynamischen Preis enthält
                 if ($finalPriceCt === null && isset($tieredPricesFallback)) {
                     $hour = (int)date('G', $ts);
                     $finalPriceCt = $tieredPricesFallback[$hour];
                 }
-                
+
                 $finalPriceEuro = ($finalPriceCt !== null) ? ($finalPriceCt / 100.0) : 0; // von ct/kWh zu €/kWh
 
                 $plannedEntries[] = [
@@ -2172,12 +2348,12 @@ if (file_exists('/var/www/html/ramdisk/native_wallbox_schedule.json') && is_read
                     $totalKwhs[$key] += $kwh_per_slot;
                     $totalCosts[$key] += $kwh_per_slot * $finalPriceEuro;
                 }
-                
+
                 $chargingSlots++;
             } elseif (count($parts) >= 3) {
                 $ts = (int)$parts[1];
                 $mode = (int)$parts[2];
-                
+
                 $finalPriceCt = null;
                 if (isset($tieredPricesFallback)) {
                     $hour = (int)date('G', $ts);
@@ -2229,7 +2405,7 @@ if (file_exists('/var/www/html/ramdisk/native_wallbox_schedule.json') && is_read
 
                 // !!!!!!! HINWEIS: HIER IST DIE SPERRE ENTFERNT !!!!!!!
                 // WIR LASSEN DIE EINGABE EINFACH DURCH, AUCH WENN Wbvon IN DER VERGANGENHEIT LIEGT
-                
+
                 if ($adjustWbvon && $nowMinutes > $wbvonMinutes) {
                     $nextHourTs = strtotime(date('Y-m-d H:00:00')) + 3600;
                     $wbvonNorm = date('H:00', $nextHourTs);
@@ -2241,7 +2417,7 @@ if (file_exists('/var/www/html/ramdisk/native_wallbox_schedule.json') && is_read
                     'wbbis' => $wbbisNorm,
                     'wb_sofort' => '0'
                 ];
-                
+
                 $message_extra = "";
                 // NEU: Wenn Benutzer Wbhour manuell auf 0 setzt, schalten wir die intelligente Ladezeit ab,
                 // damit der Energy Manager sie nicht sofort wieder überschreibt!
@@ -2262,8 +2438,23 @@ if (file_exists('/var/www/html/ramdisk/native_wallbox_schedule.json') && is_read
                 $needsSafetyReset = $newWbhourValue > 0 && ($hasPreviousDayAutoEntries || ($hasAutoEntries && $isTimeChange));
                 $canWriteAutoSettings = true;
 
+                $tx = e3dcWallboxPlanTransaction($updates, [
+                    'operation' => $newWbhourValue > 0 ? 'plan' : 'clear',
+                    'abort_flag' => $newWbhourValue > 0 ? 'remove' : 'create',
+                ]);
+                if (!empty($tx['success'])) {
+                    $message = successMessage('Automatik-Einstellungen und Ladeplan wurden transaktional gespeichert.' . $message_extra);
+                    $wallboxConfig = parseWallboxConfigValues($config_file);
+                } else {
+                    $message = errorMessage('Automatik-Einstellungen nicht gespeichert', (string)($tx['message'] ?? 'Die transaktionale Planung ist fehlgeschlagen.'));
+                }
+                // Der frühere 0-W-Zwischenstand mit sleep(5) ist absichtlich
+                // deaktiviert: kein sichtbarer Teilzustand vor dem validierten Plan.
+                $needsSafetyReset = false;
+                $canWriteAutoSettings = false;
+
                 if ($needsSafetyReset) {
-                    $resetResult = upsertWallboxConfigValues($config_file, ['wbhour' => '0']);
+                    $resetResult = false;
                     if (!$resetResult) {
                         $message = errorMessage(
                             'Sicherheits-Reset fehlgeschlagen',
@@ -2272,16 +2463,16 @@ if (file_exists('/var/www/html/ramdisk/native_wallbox_schedule.json') && is_read
                         $wallboxConfig = parseWallboxConfigValues($config_file);
                         $canWriteAutoSettings = false;
                     } else {
-                        sleep(5);
+                        // Kein Zwischenzustand und keine Wartephase.
                     }
                 }
 
                 if ($canWriteAutoSettings) {
-                    $writeResult = upsertWallboxConfigValues($config_file, $updates);
+                    $writeResult = false;
                     if ($writeResult) {
-                        // Abort-Flag löschen: Benutzer hat neue Automatik-Einstellungen gespeichert
+                        // Abbruchflag löschen: Der Benutzer hat neue Automatikeinstellungen gespeichert.
                         $abort_flag = '/var/www/html/ramdisk/native_schedule_aborted.flag';
-                        if (file_exists($abort_flag)) @unlink($abort_flag);
+                        // Flag-Änderungen erfolgen ausschließlich in der Transaktion.
 
                         if ($needsSafetyReset) {
                             $message = successMessage('&#10003; Automatik-Einstellungen gespeichert (Sicherheits-Reset 5s mit Wbhour=0 durchgeführt).' . $message_extra);
@@ -2375,7 +2566,7 @@ if (file_exists($dbPath)) {
     } catch (Exception $e) {}
 }
 // Lade Live-Wallbox-Status falls JS läuft
-// Manager schreibt in /logs/, Fallback auf /ramdisk/ (älteres Format)
+// Der Manager schreibt nach /logs/, Rückfall auf /ramdisk/ (älteres Format)
 $wb_live_session = '/var/www/html/logs/wb_live_session.json';
 if (!file_exists($wb_live_session)) {
     $wb_live_session = '/var/www/html/ramdisk/wb_live_session.json';
@@ -2385,7 +2576,7 @@ if (file_exists($wb_live_session)) {
     $wb_live_data = json_decode(file_get_contents($wb_live_session), true);
 }
 
-// Wallbox Manager Logs lesen
+// Wallbox-Manager-Protokolle lesen
 $logFile = '/var/www/html/logs/wallbox_manager.log';
 $logContent = '';
 if (file_exists($logFile)) {
@@ -2397,6 +2588,7 @@ if (file_exists($logFile)) {
 $wallboxGateEvents = e3dcReadWallboxCommandGateEvents(8);
 $wallboxGateLast = $wallboxGateEvents[0] ?? null;
 $openwbCapabilityRows = wallboxOpenwbCapabilityRows($wallboxConfig);
+$e3dcCapabilityRows = wallboxE3dcCapabilityRows($wallboxConfig);
 $openWbProUpdateTargets = wallboxOpenWbProUpdateTargets($confData['config'] ?? []);
 $vehicleSelectOptions = buildWallboxVehicleOptions(
     $saved_cars,
@@ -2612,7 +2804,7 @@ if ($hasWb2) {
             </form>
         </div>
     </div>
-    
+
 
     <?php if (!empty($message)): ?>
         <div class="mb-3"><?= $message ?></div>
@@ -2979,10 +3171,64 @@ if ($hasWb2) {
                 </div>
             </details>
             <?php else: ?>
-            <div class="small text-body-secondary mt-2">Noch kein Audit-Eintrag vorhanden. Sobald ein Treiber schreiben moechte, erscheint hier die Entscheidung des Gates.</div>
+            <div class="small text-body-secondary mt-2">Noch kein Audit-Eintrag vorhanden. Sobald ein Treiber schreiben möchte, erscheint hier die Entscheidung des Gates.</div>
             <?php endif; ?>
         </div>
     </div>
+
+    <?php if (!empty($e3dcCapabilityRows)): ?>
+    <div class="card shadow-sm mb-3" style="border-radius:16px; border:1px solid rgba(13,202,240,0.25);">
+        <div class="card-body p-3">
+            <div class="d-flex justify-content-between align-items-start gap-3 flex-wrap">
+                <div>
+                    <h6 class="fw-bold mb-1 text-info"><i class="fas fa-charging-station me-2"></i>E3/DC-Wallbox: Familie und Backend</h6>
+                    <div class="small text-body-secondary">Der gemeinsame RSCP-Transport, die erkannte beziehungsweise gew&auml;hlte Produktfamilie und das aktive Steuer-Backend werden getrennt ausgewiesen.</div>
+                </div>
+                <span class="badge bg-secondary bg-opacity-25 text-secondary rounded-pill px-3 py-2">Readback-Status</span>
+            </div>
+            <div class="row g-2 mt-2">
+                <?php foreach ($e3dcCapabilityRows as $row): ?>
+                <?php
+                    $familyLabels = [
+                        'efy' => 'E3/DC Wallbox efy',
+                        'easy_connect' => 'E3/DC Easy Connect',
+                        'multi_connect' => 'E3/DC Multi Connect',
+                        'multi_connect_ii' => 'E3/DC Multi Connect II',
+                        'unknown' => 'E3/DC Wallbox (Familie unbekannt)',
+                    ];
+                    $familyLabel = $familyLabels[$row['family']] ?? $familyLabels['unknown'];
+                    $backendClass = $row['backend'] === 'wbchar6_compat' ? 'info' : 'secondary';
+                    $backendLabel = $row['backend'] === 'wbchar6_compat'
+                        ? 'E3/DC efy/Easy – WBchar6-Kompatibilitätsregelung aktiv'
+                        : ($row['backend'] === 'status_only'
+                            ? 'Nur Status – WBchar6 nicht gewählt; Direkte Übergänge gesperrt'
+                            : $row['backend_label']);
+                ?>
+                <div class="col-12 col-lg-6">
+                    <div class="rounded-3 p-3 h-100" style="border:1px solid rgba(108,117,125,0.24); background:rgba(108,117,125,0.06);">
+                        <div class="d-flex align-items-center justify-content-between gap-2">
+                            <div class="fw-bold">WB<?= (int)$row['wb'] ?> <?= htmlspecialchars($familyLabel) ?></div>
+                            <span class="badge bg-<?= $backendClass ?> bg-opacity-25 text-<?= $backendClass ?> rounded-pill"><?= htmlspecialchars($backendLabel) ?></span>
+                        </div>
+                        <div class="small text-body-secondary mt-2">
+                            Transport: <span class="fw-bold text-body">E3/DC RSCP &uuml;ber Hauskraftwerk</span><br>
+                            Firmware: <span class="fw-bold text-body"><?= htmlspecialchars($row['firmware'] ?: '--') ?></span><br>
+                            RSCP-Typ: <span class="fw-bold text-body"><?= $row['rscp_type'] === null ? '--' : htmlspecialchars((string)$row['rscp_type']) ?></span> <span class="text-muted">(beobachtet, keine globale Modellzuordnung)</span><br>
+                            Readback: <span class="fw-bold <?= $row['readback_complete'] ? 'text-info' : 'text-warning' ?>"><?= $row['readback_complete'] ? 'Sun/Auto/Abort vorhanden und typg&uuml;ltig; Semantik separat bewertet' : 'unvollst&auml;ndig oder nicht frisch' ?></span><br>
+                            Schreibvertrag: <span class="fw-bold text-info">nur Readback-Diagnose; keine direkten &Uuml;bergangsschreibbefehle</span><br>
+                            Backend: <span class="fw-bold text-<?= $backendClass ?>"><?= htmlspecialchars($backendLabel) ?></span>
+                            <?php if (!$row['fresh']): ?><br><span class="text-warning">Noch keine frischen E3/DC-Wallbox-Livedaten.</span><?php endif; ?>
+                        </div>
+                    </div>
+                </div>
+                <?php endforeach; ?>
+            </div>
+            <div class="alert alert-warning mt-3 mb-0 py-2 small">
+                Drei vorhandene Bool-Readbacks beweisen allein keine Ger&auml;tesemantik. Bei einer efy ohne Fahrzeug kann der Readback einen inaktiven Schlafzustand zeigen; bis zu einem rein lesenden Wachtest bleibt sie ebenso wie Easy Connect nur f&uuml;r direkte Sun-/Auto-/Abort-Schreibvorg&auml;nge fail-closed. Die ausdr&uuml;cklich gew&auml;hlte WBchar6-Kompatibilit&auml;tsregelung f&uuml;r Modus, Strom und episodischen Start/Stop bleibt davon unber&uuml;hrt. Native Phasenumschaltung und direkter Maximalstrom bleiben gesperrt.
+            </div>
+        </div>
+    </div>
+    <?php endif; ?>
 
     <?php if (!empty($openwbCapabilityRows)): ?>
     <div class="card shadow-sm mb-3" style="border-radius:16px; border:1px solid rgba(168,85,247,0.25);">
@@ -3127,8 +3373,8 @@ if ($hasWb2) {
                     <div class="d-flex justify-content-between align-items-center mb-3 gap-2">
                         <h6 class="card-title text-body fw-bold m-0 d-flex align-items-center w-75">
                             <i class="fas fa-charging-station me-2 text-purple"></i>
-                            <input type="text" value="<?= htmlspecialchars($wb1_name) ?>" 
-                                   class="form-control form-control-sm border-0 bg-transparent fw-bold p-0 text-body shadow-none" 
+                            <input type="text" value="<?= htmlspecialchars($wb1_name) ?>"
+                                   class="form-control form-control-sm border-0 bg-transparent fw-bold p-0 text-body shadow-none"
                                    onchange="saveWbName(1, this.value)" placeholder="Wallbox 1" title="Klicken zum Umbenennen">
                         </h6>
                         <div class="d-flex align-items-center gap-2 flex-shrink-0">
@@ -3230,8 +3476,8 @@ if ($hasWb2) {
                     <div class="d-flex justify-content-between align-items-center mb-3 gap-2">
                         <h6 class="card-title text-body fw-bold m-0 d-flex align-items-center w-75">
                             <i class="fas fa-charging-station me-2 text-info"></i>
-                            <input type="text" value="<?= htmlspecialchars($wb2_name) ?>" 
-                                   class="form-control form-control-sm border-0 bg-transparent fw-bold p-0 text-body shadow-none" 
+                            <input type="text" value="<?= htmlspecialchars($wb2_name) ?>"
+                                   class="form-control form-control-sm border-0 bg-transparent fw-bold p-0 text-body shadow-none"
                                    onchange="saveWbName(2, this.value)" placeholder="Wallbox 2" title="Klicken zum Umbenennen">
                         </h6>
                         <div class="d-flex align-items-center gap-2 flex-shrink-0">
@@ -3335,7 +3581,7 @@ if ($hasWb2) {
                     <i class="fas fa-history me-1"></i>Historie
                 </button>
             </div>
-            
+
             <style>
                 .slot-active-auto { background-color: #0dcaf0 !important; opacity: 0.8; }
                 .slot-active-manual { background-color: #ffc107 !important; opacity: 0.8; }
@@ -3361,10 +3607,10 @@ if ($hasWb2) {
                 // Zeit-Berechnung für rollierende Ansicht (Now zentriert)
                 $tsNow = time();
                 // Auf 15 Min runden für das Raster
-                $tsNowAligned = floor($tsNow / 900) * 900; 
+                $tsNowAligned = floor($tsNow / 900) * 900;
                 // Startzeit: 12h vor "Jetzt"
                 $tsStart = $tsNowAligned - (12 * 3600);
-                
+
                 // Labels generieren (-12h, -6h, Now, +6h, +12h)
                 $tlLabels = [];
                 for ($k=0; $k<=4; $k++) {
@@ -3378,15 +3624,15 @@ if ($hasWb2) {
                     <span><?= $tlLabels[3] ?></span>
                     <span style="width: 30px; text-align: right;"><?= $tlLabels[4] ?></span>
                 </div>
-                
+
                 <div class="wb-timeline-track" style="height: 35px; background: var(--bs-body-bg); border-radius: 8px; position: relative; overflow: hidden; display: flex; border: 1px solid var(--bs-border-color);">
-                    <?php 
+                    <?php
                     // 96 Slots à 15 Minuten (24h Fenster)
                     for ($i = 0; $i < 96; $i++) {
                         $slotTs = $tsStart + ($i * 900);
                         $slotDate = date('j.n.', $slotTs);
                         $slotTime = date('H:i', $slotTs);
-                        
+
                         $sourceClass = '';
                         $slotPrice = null;
                         $slotEntriesForCell = [];
@@ -3410,7 +3656,7 @@ if ($hasWb2) {
                                 $sourceClass = 'slot-active-' . $firstSource;
                             }
                         }
-                        
+
                         // Tooltip erstellen
                         $tooltip = $slotTime . ' Uhr';
                         if (!empty($slotWbIds)) {
@@ -3425,7 +3671,7 @@ if ($hasWb2) {
                         if ($slotTime === '00:00') {
                             $borderStyle = "border-left: 1px dashed #666; border-right: 1px solid rgba(45, 55, 72, 0.3);";
                         }
-                        
+
                         echo '<div class="timeline-slot '.$sourceClass.'" style="flex: 1; height: 100%; '.$borderStyle.'" data-bs-toggle="tooltip" data-bs-placement="top" title="'.htmlspecialchars($tooltip, ENT_QUOTES).'" tabindex="0"></div>';
                     }
                     // Marker dynamisch platzieren (und später per JS aktualisieren)
@@ -3460,10 +3706,10 @@ if ($hasWb2) {
             </div>
 
             <?php
-            // Textuelle Zusammenfassung der Ladezeiten (zusammenhaengende Slots mergen)
+            // Textuelle Zusammenfassung der Ladezeiten (zusammenhängende Slots verbinden)
             $planTextParts = [];
             if (!empty($plannedEntries)) {
-                // Direkt den gespeicherten ts-Wert verwenden (europaeisches Datumsformat ist mit strtotime unzuverlässig)
+                // Direkt den gespeicherten ts-Wert verwenden (europäisches Datumsformat ist mit strtotime unzuverlässig)
                 $slotTsByWb = [];
                 foreach ($plannedEntries as $pe) {
                     $wbId = (int)($pe['wb_id'] ?? 1);
@@ -3471,7 +3717,7 @@ if ($hasWb2) {
                     if (isset($pe['ts']) && $pe['ts'] > 0) {
                         $slotTsByWb[$wbId][] = (int)$pe['ts'];
                     } else {
-                        // Fallback für .out Eintraege
+                        // Rückfallwert für .out-Einträge
                         $t = @strtotime(date('Y') . '-' . str_replace('.', '-', strrev(str_replace('.', '.-', strrev(trim($pe['date'], '.'))))).  ' ' . $pe['time']);
                         if ($t) $slotTsByWb[$wbId][] = $t;
                     }
@@ -3483,7 +3729,7 @@ if ($hasWb2) {
                 foreach ($slotTsByWb as $wbId => $slotTs) {
                     sort($slotTs);
                     $slotTs = array_unique($slotTs);
-                    // Nur zukuenftige Slots
+                    // Nur zukünftige Slots
                     $future = array_values(array_filter($slotTs, fn($t) => $t >= $now_));
                     if (empty($future)) continue;
                     $ranges = [];
@@ -3653,9 +3899,9 @@ if ($hasWb2) {
         </div>
     </div>
 
-    <?php 
+    <?php
     $isNativeEnabled = (isset($wallboxConfig['wb_native_enable']) && in_array(strtolower(trim($wallboxConfig['wb_native_enable'])), ['1', 'true', 'yes']));
-    if (!$isNativeEnabled): 
+    if (!$isNativeEnabled):
     ?>
     <div class="row g-4 mb-4">
         <!-- Direktsteuerung -->
@@ -3663,7 +3909,7 @@ if ($hasWb2) {
             <div class="card shadow-sm h-100" style="border-radius: 16px;">
                 <div class="card-body p-3">
                     <h6 class="card-title text-warning fw-bold mb-3"><i class="fas fa-bolt me-2"></i>Direktsteuerung (Sofort)</h6>
-                    
+
                     <form action="<?= htmlspecialchars($formAction) ?>" method="post">
                         <div class="mb-3">
                             <label class="form-label text-muted small fw-bold d-flex justify-content-between mb-1">
@@ -3673,12 +3919,12 @@ if ($hasWb2) {
                                 </span>
                             </label>
                             <input type="hidden" name="zwei" id="zweiHidden" value="<?= htmlspecialchars(trim($zeile)) ?>">
-                            <input type="range" class="form-range" 
-                                value="<?= trim($zeile) == '99' ? '24' : htmlspecialchars(trim($zeile)) ?>" min="0" max="24" step="1" 
+                            <input type="range" class="form-range"
+                                value="<?= trim($zeile) == '99' ? '24' : htmlspecialchars(trim($zeile)) ?>" min="0" max="24" step="1"
                                 oninput="document.getElementById('zweiHidden').value = this.value; document.getElementById('zweiVal').innerText = this.value + ' h'; document.getElementById('zweiVal').className = 'badge bg-secondary text-white';">
                             <div class="form-text text-muted small">Max (99) Dauerhaft / 0 = Stop/Löschen</div>
                         </div>
-                        
+
                         <div class="row g-2 mb-3">
                             <div class="col-6">
                                 <button type="submit" name="quick_action" value="clear_times" class="btn btn-outline-danger w-100 btn-sm py-2 border-2 fw-bold rounded-pill">
@@ -3776,7 +4022,7 @@ if ($hasWb2) {
             </div>
         </div>
     </div>
-    <?php endif; // End of Legacy Wallbox Block ?>
+    <?php endif; // Ende des alten Wallbox-Blocks ?>
 
     <div class="card shadow-sm mb-4" id="vehicle-assignment-card" style="border-radius: 16px;">
         <div class="card-body p-3">
@@ -4027,7 +4273,7 @@ if ($hasWb2) {
                                     </div>
                                 </div>
                                 <div class="col-6">
-                                    <label class="form-label text-muted small fw-bold mb-1" data-bs-toggle="tooltip" title="Bis zu dieser Uhrzeit soll das geplante Laden fertig sein. Liegt die Uhrzeit schon vorbei, wird automatisch der naechste Tag genommen."><i class="fas fa-flag-checkered me-1"></i>Fertig bis</label>
+                                    <label class="form-label text-muted small fw-bold mb-1" data-bs-toggle="tooltip" title="Bis zu dieser Uhrzeit soll das geplante Laden fertig sein. Liegt die Uhrzeit schon vorbei, wird automatisch der nächste Tag genommen."><i class="fas fa-flag-checkered me-1"></i>Fertig bis</label>
                                     <input type="time" name="wbbis_time_wb<?= $planWb ?>" class="form-control form-control-sm rounded-pill"
                                            value="<?= htmlspecialchars($planPanel['to']) ?>">
                                 </div>
@@ -4163,7 +4409,25 @@ if ($hasWb2) {
             </script>
         </div>
     </div>
-    
+
+    <?php if (!empty($observed_openwb_profiles)): ?>
+    <div class="card shadow-sm mb-4 border-info" style="border-radius: 16px;">
+        <div class="card-body p-3">
+            <h6 class="card-title text-info fw-bold mb-2"><i class="fas fa-id-badge me-2"></i>openWB-Ladeprofil (beobachtet)</h6>
+            <p class="small text-muted mb-3">Das Ladeprofil ist eine Live-Beobachtung aus openWB. Es ändert weder ein gespeichertes Fahrzeug noch die statische E3DC-Zuordnung.</p>
+            <?php foreach ($observed_openwb_profiles as $profile): ?>
+                <div class="d-flex flex-wrap gap-2 align-items-center mb-2 small">
+                    <span class="badge text-bg-info">WB<?= (int)$profile['wb'] ?></span>
+                    <strong>Ladeprofil: <?= htmlspecialchars($profile['name']) ?></strong>
+                    <span class="text-muted">Live-Fahrzeug: <?= htmlspecialchars($profile['vehicle_name'] !== '' ? $profile['vehicle_name'] : 'nicht namentlich erkannt') ?></span>
+                    <span class="text-muted">Aktuell stabile Kennung: <?= htmlspecialchars(!empty($profile['stable_identity_current']) && $profile['vehicle_id'] !== '' ? $profile['vehicle_id'] : 'nicht geliefert') ?></span>
+                    <?php if (!empty($profile['retained_identity_present'])): ?><span class="text-warning">Alte Sitzungskennung nur diagnostisch erhalten</span><?php endif; ?>
+                </div>
+            <?php endforeach; ?>
+        </div>
+    </div>
+    <?php endif; ?>
+
     <?php if (!empty($unknown_openwb_vehicles)): ?>
     <div class="card shadow-sm mb-4 border-warning" style="border-radius: 16px;">
         <div class="card-body p-3">
@@ -4287,7 +4551,7 @@ if ($hasWb2) {
                 <div class="card-body p-3">
                     <h6 class="card-title text-success fw-bold mb-3"><i class="fas fa-car me-2"></i>Eigene Fahrzeug-Vorlagen</h6>
                     <p class="small text-muted mb-3">Speichere eigene Fahrzeuge ohne Cloud-Anbindung als feste Vorlage für die Dropdowns ab.</p>
-                    
+
                     <form action="<?= htmlspecialchars($formAction) ?>" method="post" class="mb-4">
                         <input type="hidden" name="custom_car_cloud_vehicle_name" value="" data-cloud-name-hidden="manual">
                         <div class="row g-2 mb-3">
@@ -4399,33 +4663,33 @@ if ($hasWb2) {
                 <div class="card-body p-3">
                     <h6 class="card-title text-info fw-bold mb-3"><i class="fas fa-cloud me-2"></i>Fahrzeug Cloud-Integration (Auto SoC)</h6>
                     <p class="small text-muted mb-3">Verbinde dein Fahrzeug (Hyundai / Kia Bluelink), um den Echtzeit-Ladezustand (SoC) und Batterie-Infos automatisch abzurufen.</p>
-                    
+
                     <form action="<?= htmlspecialchars($formAction) ?>" method="post">
                         <div class="row g-3 mb-3">
                             <div class="col-12">
                                 <label class="form-label text-muted small fw-bold mb-1">Token (Refresh Token)</label>
-                                <input type="password" name="bluelink_refresh_token" class="form-control form-control-sm rounded-pill" 
+                                <input type="password" name="bluelink_refresh_token" class="form-control form-control-sm rounded-pill"
                                        value="<?= htmlspecialchars($wallboxConfig['bluelink_refresh_token'] ?? '') ?>">
                             </div>
                             <div class="col-12 col-md-6">
                                 <label class="form-label text-muted small fw-bold mb-1">VIN (Fahrgestellnummer)</label>
-                                <input type="text" name="bluelink_vin" class="form-control form-control-sm rounded-pill" 
+                                <input type="text" name="bluelink_vin" class="form-control form-control-sm rounded-pill"
                                        value="<?= htmlspecialchars($wallboxConfig['bluelink_vin'] ?? '') ?>">
                             </div>
                             <div class="col-12 col-md-6">
                                 <label class="form-label text-muted small fw-bold mb-1">Anzeigename</label>
-                                <input type="text" name="bluelink_car_name" class="form-control form-control-sm rounded-pill" 
-                                       value="<?= htmlspecialchars($wallboxConfig['bluelink_car_name'] ?? '') ?>" placeholder="z.B. Beispielfahrzeug">
+                                <input type="text" name="bluelink_car_name" class="form-control form-control-sm rounded-pill"
+                                       value="<?= htmlspecialchars($wallboxConfig['bluelink_car_name'] ?? '') ?>" placeholder="z.B. Hyundai IONIQ 5">
                             </div>
                             <div class="col-12 col-md-6">
                                 <label class="form-label text-muted small fw-bold mb-1">Abfrage-Intervall (Min)</label>
-                                <input type="number" name="bluelink_interval" class="form-control form-control-sm rounded-pill" 
+                                <input type="number" name="bluelink_interval" class="form-control form-control-sm rounded-pill"
                                        value="<?= htmlspecialchars($wallboxConfig['bluelink_interval'] ?? '15') ?>">
                             </div>
                             <div class="col-12 col-md-6 mt-md-4 pt-md-3">
                                 <div class="form-check form-switch ps-5">
                                     <input type="hidden" name="bluelink_ignore_plug_status" value="0">
-                                    <input class="form-check-input" type="checkbox" name="bluelink_ignore_plug_status" value="1" id="blue_plug" 
+                                    <input class="form-check-input" type="checkbox" name="bluelink_ignore_plug_status" value="1" id="blue_plug"
                                            <?= (isset($wallboxConfig['bluelink_ignore_plug_status']) && $wallboxConfig['bluelink_ignore_plug_status'] == '1') ? 'checked' : '' ?> style="transform: scale(1.2); margin-left: -2.5em;">
                                     <label class="form-check-label ms-1 text-muted small fw-bold" for="blue_plug" title="Immer abfragen, auch wenn das Auto laut API nicht eingesteckt ist.">
                                         Plug-Status ignorieren
@@ -4484,17 +4748,17 @@ if ($hasWb2) {
                 <div class="table-responsive">
                     <table class="table mb-0 align-middle" style="font-size: 0.85rem;">
                         <tbody>
-                            <?php 
+                            <?php
                             $lastDate = '';
                             $bgClass = '';
-                            foreach ($wbSessions as $s): 
+                            foreach ($wbSessions as $s):
                                 $date = date('d.m.Y', $s['tsStart']);
                                 $timeSpan = date('H:i', $s['tsStart']) . ' - ' . date('H:i', $s['tsEnd']);
                                 $durationMins = round(($s['tsEnd'] - $s['tsStart']) / 60);
                                 $durH = floor($durationMins / 60);
                                 $durM = $durationMins % 60;
                                 $durationStr = ($durH > 0 ? $durH . 'h ' : '') . sprintf('%02d', $durM) . 'm';
-                                
+
                                 // Tagesschnitt zur Schätzung des Wallbox-Mix
                                 $dayAutarky = 100;
                                 if (isset($dailyDbData[$date])) {
@@ -4502,10 +4766,10 @@ if ($hasWb2) {
                                     if ($dayAutarky < 0) $dayAutarky = 0;
                                     if ($dayAutarky > 100) $dayAutarky = 100;
                                 }
-                                
+
                                 $pvShareKwh = $s['kwh'] * ($dayAutarky / 100);
                                 $gridShareKwh = $s['kwh'] - $pvShareKwh;
-                                
+
                                 if ($date !== $lastDate) {
                                     $bgClass = ($bgClass === '') ? 'table-active' : '';
                                     echo '<tr class="'.$bgClass.' border-top border-2 border-secondary-subtle">';
@@ -5156,13 +5420,13 @@ function updateWallboxLiveStatus() {
             const statusCard = document.getElementById('wb-live-status');
             const valDisplay = document.getElementById('live-wb-val');
             const pulse     = document.getElementById('status-pulse');
-            
+
             const wbPower = parseFloat(data.wb) || 0;
 
             if (wbPower > 10) { // Schwelle von 10W um Rauschen zu vermeiden
                 if (statusCard) statusCard.style.display = 'block';
                 if (pulse) pulse.classList.add('pulse-active');
-                
+
                 // Formatierung der Watt-Zahl
                 if (valDisplay) {
                     if (wbPower >= 1000) {
@@ -5441,6 +5705,7 @@ function appendVehicleFormValue(formData, name) {
 function saveVehicleAssignment(wbIdx = null, options = {}) {
     const formData = new FormData();
     formData.append('save_soc_settings', '1');
+    formData.append('response_format', 'json');
     appendVehicleFormValue(formData, 'wbminsoc');
 
     const targets = wbIdx ? [Number(wbIdx)] : [1, 2];
@@ -5457,32 +5722,39 @@ function saveVehicleAssignment(wbIdx = null, options = {}) {
     return fetch(WALLBOX_AJAX_ENDPOINT, {
         method: 'POST',
         body: formData
-    }).then(res => {
-        if (!res.ok) throw new Error('Speichern fehlgeschlagen');
+    }).then(async res => {
+        let payload = null;
+        try { payload = await res.json(); } catch (_) { payload = null; }
+        if (!res.ok || !payload || payload.ok !== true) {
+            const code = payload && payload.code ? String(payload.code) : 'http_' + res.status;
+            const error = new Error('Speichern fehlgeschlagen (' + code + ')');
+            error.code = code;
+            throw error;
+        }
         if (!options.silent) setVehicleAssignmentStatus('Gespeichert', 'success');
         if (window.e3dcSimpleWallboxSync) window.e3dcSimpleWallboxSync.assignmentFromAdvanced(wbIdx);
-        return res.text();
+        return payload;
     }).catch(err => {
-        if (!options.silent) setVehicleAssignmentStatus('Fehler', 'danger');
+        if (!options.silent) setVehicleAssignmentStatus('Fehler: ' + String(err.code || 'unbekannt'), 'danger');
         throw err;
     });
 }
 
-// Event-Listener für Cross-Exclusion, Auto-Fill und Auto-Save
+// Ereignisbehandlung für gegenseitigen Ausschluss, automatisches Ausfüllen und Speichern
 document.querySelectorAll('.car-selector').forEach(sel => {
     sel.addEventListener('change', function() {
         this.dataset.userSelectedAt = String(Date.now());
         const wbIdx = this.dataset.wb;
         const otherWbIdx = wbIdx == 1 ? 2 : 1;
         const otherSel = document.querySelector(`.car-selector[data-wb="${otherWbIdx}"]`);
-        
+
         if (otherSel && otherSel.value === this.value && this.value !== 'none' && this.value !== '__none') {
             otherSel.value = '';
             otherSel.value = '__none';
             updateCarSelectors();
             saveVehicleAssignment(otherWbIdx, {silent: true}).catch(() => {});
         }
-        
+
         // Auto-Fill für gespeicherte Vorlagen und Fahrzeuge mit Profilwerten
         if (this.value && this.value !== '__none') {
             const selectedOpt = this.options[this.selectedIndex];
@@ -5516,7 +5788,7 @@ function setManualSoC(wbIdx) {
 
     const selector = document.querySelector(`.car-selector[data-wb="${wbIdx}"]`);
     const carId = selector ? selector.value : '';
-    
+
     let carName = carId;
     if (selector && selector.selectedIndex >= 0) {
         const selectedOpt = selector.options[selector.selectedIndex];
@@ -5616,14 +5888,14 @@ function toggleWbMode(wbIdx) {
     const modeSelect = document.getElementById('wb' + wbIdx + 'ModeSelect');
     const observeSelect = document.getElementById('wb' + wbIdx + 'ObserveStoragePolicy');
     updateWbModeHelp(wbIdx);
-    
+
     // Checkbox checked = AN = not locked. Checkbox unchecked = AUS = locked!
     const isLocked = lockSwitch.checked ? '0' : '1';
     const mode = modeSelect.value;
     const previousMode = String(modeSelect.dataset.savedMode || '');
     const observePolicy = observeSelect ? (observeSelect.value || 'curve') : 'curve';
-    
-    // UI Update feedback (disable interaction while saving)
+
+    // UI-Rückmeldung aktualisieren und Bedienung während des Speicherns sperren
     lockSwitch.disabled = true;
     modeSelect.disabled = true;
     if (observeSelect) observeSelect.disabled = true;

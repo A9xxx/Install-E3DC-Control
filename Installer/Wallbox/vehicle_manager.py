@@ -147,6 +147,18 @@ def vehicle_max_ac_phases(config, charger_id, status=None, profiles=None):
     )
 
 
+def vehicle_max_ac_power_kw(config, charger_id, status=None, profiles=None):
+    """Liefere nur eine profil- oder OBC-gebundene AC-Leistungsgrenze."""
+
+    profile_list = load_saved_car_profiles() if profiles is None else profiles
+    return wallbox_decision.vehicle_max_ac_power_kw_from_profiles(
+        config,
+        charger_id,
+        profile_list,
+        status,
+    )
+
+
 class VehicleManager:
     """Facade composing the established tracker, profile and identity APIs."""
 
@@ -294,6 +306,15 @@ class VehicleManager:
             profiles=profiles,
         )
 
+    @staticmethod
+    def vehicle_max_ac_power_kw(config, charger_id, status=None, profiles=None):
+        return vehicle_max_ac_power_kw(
+            config,
+            charger_id,
+            status=status,
+            profiles=profiles,
+        )
+
 
 __all__ = [
     "VehicleManager",
@@ -304,4 +325,5 @@ __all__ = [
     "resolve_vehicle_profile",
     "session_vehicle_key_from_status",
     "vehicle_max_ac_phases",
+    "vehicle_max_ac_power_kw",
 ]

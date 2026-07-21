@@ -16,9 +16,9 @@ LABEL org.opencontainers.image.title="E3DC-Control" \
       io.e3dc.git.tree="${E3DC_TREE}" \
       io.e3dc.source.manifest="${E3DC_SOURCE_MANIFEST}"
 
-# 1. Systempakete (Laufzeitumgebung - aendert sich selten)
+# 1. Systempakete (Laufzeitumgebung - ändert sich selten)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git curl jq \
+    git curl jq util-linux \
     apache2 php libapache2-mod-php php-curl php-sqlite3 php-mbstring \
     python3 python3-pip python3-venv python3-dev unzip python3-sklearn python3-numpy \
     ca-certificates pkg-config libffi-dev \
@@ -28,7 +28,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm avahi-daemon avahi-utils dbus && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# 2. Apache PHP + Reverse Proxy fuer WebSockets
+# 2. Apache PHP + Reverse Proxy für WebSockets
 RUN PHP_APACHE_MOD="$(php -r 'echo "php".PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')" && \
     (a2dismod mpm_event >/dev/null 2>&1 || true) && \
     (a2dismod mpm_worker >/dev/null 2>&1 || true) && \
@@ -36,7 +36,7 @@ RUN PHP_APACHE_MOD="$(php -r 'echo "php".PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION
     echo "ServerName localhost" >> /etc/apache2/apache2.conf && \
     sed -i 's|</VirtualHost>|    ProxyPass "/ws" "ws://127.0.0.1:8765/"\n</VirtualHost>|' /etc/apache2/sites-available/000-default.conf
 
-# 3. Python VENV mit allen Abhaengigkeiten
+# 3. Python VENV mit allen Abhängigkeiten
 RUN python3 -m venv --system-site-packages /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 RUN pip3 install --upgrade pip wheel setuptools && \
@@ -46,7 +46,7 @@ RUN pip3 install --upgrade pip wheel setuptools && \
 RUN mkdir -p /app/pi/Install /var/www/html/tmp /var/www/html/logs /var/www/html/data /var/www/html/ramdisk && \
     chown -R www-data:www-data /var/www/html
 
-# Pfad-Konfiguration fuer PHP (statisch, kennt die Container-Struktur)
+# Pfad-Konfiguration für PHP (statisch, kennt die Container-Struktur)
 RUN echo '{"install_user": "root", "home_dir": "/app", "install_path": "/app/pi/Install", "venv_name": null, "venv_path": "/opt/venv"}' > /var/www/html/e3dc_paths.json && \
     chown www-data:www-data /var/www/html/e3dc_paths.json
 
@@ -58,10 +58,13 @@ COPY entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/entrypoint.sh && \
     ln -sf /usr/local/bin/entrypoint.sh /app/entrypoint.sh
 
-# 6. Anwendungscode fuer production/image-only Docker.
-# Dev-Setups duerfen /app/pi/Install weiterhin per Volume ueberlagern.
+# 6. Anwendungscode für Production-/Image-only-Docker.
+# Entwicklungsumgebungen dürfen /app/pi/Install weiterhin per Volume überlagern.
 COPY . /app/pi/Install/
-RUN chmod +x /app/pi/Install/entrypoint.sh && \
+RUN test -f /app/pi/Install/Installer/matter/package-lock.json && \
+    cd /app/pi/Install/Installer/matter && \
+    npm ci --omit=dev --ignore-scripts && \
+    chmod +x /app/pi/Install/entrypoint.sh && \
     find /app/pi/Install/Installer -name "*.py" -exec chmod 755 {} \;
 
 WORKDIR /app/pi/Install

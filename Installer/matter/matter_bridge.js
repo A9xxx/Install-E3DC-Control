@@ -6,8 +6,21 @@ import path from "path";
 import http from "http";
 import { spawn, execSync } from "child_process";
 import { StorageManager, StorageBackendDisk } from "@project-chip/matter-node.js/storage";
+import { loadOrCreateCommissioningCredentials } from "./commissioning_credentials.js";
 
 const PAIRING_FILE = "/var/www/html/ramdisk/matter_pairing.json";
+
+function writePairingData(data) {
+    const tmp = `${PAIRING_FILE}.${process.pid}.tmp`;
+    try {
+        fs.writeFileSync(tmp, JSON.stringify(data), { encoding: "utf-8", mode: 0o640 });
+        fs.renameSync(tmp, PAIRING_FILE);
+        fs.chmodSync(PAIRING_FILE, 0o640);
+    } catch (error) {
+        try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch (_) {}
+        console.error("Matter-Kopplungsstatus konnte nicht lokal gespeichert werden.");
+    }
+}
 
 // --- mDNS Proxy via avahi-publish-service ---
 let avahiProcess = null;
@@ -15,14 +28,10 @@ let avahiProcess = null;
 function startAvahiProxy(discriminator, vendorId, productId) {
     stopAvahiProxy();
     try {
-        try { execSync('systemctl is-active avahi-daemon', { stdio: 'ignore' }); }
-        catch {
-            try { execSync('systemctl start avahi-daemon', { stdio: 'ignore' }); }
-            catch(e) { console.log("Avahi-Daemon konnte nicht gestartet werden:", e.message); return; }
-        }
+        execSync('command -v avahi-publish-service', { stdio: 'ignore', shell: '/bin/sh' });
         const shortDiscriminator = discriminator >> 8;
         const vpStr = `${vendorId}+${productId}`;
-        console.log(`[mDNS] Registriere _matterc._udp via avahi (D=${discriminator}, VP=${vpStr})`);
+        console.log("[mDNS] Registriere lokalen Matter-Commissioning-Dienst via Avahi.");
         avahiProcess = spawn('avahi-publish-service', [
             '--subtype', `_L${discriminator}._sub._matterc._udp`,
             '--subtype', `_S${shortDiscriminator}._sub._matterc._udp`,
@@ -45,23 +54,23 @@ async function main() {
     let storageLocation = path.join(process.cwd(), "matter-storage");
     if (fs.existsSync("/var/www/html/data")) storageLocation = "/var/www/html/data/matter-storage";
 
+    const commissioningCredentials = loadOrCreateCommissioningCredentials(storageLocation);
+
     const storage = new StorageBackendDisk(storageLocation);
     const storageManager = new StorageManager(storage);
     await storageManager.initialize();
 
     const matterServer = new MatterServer(storageManager);
 
-    const DISCRIMINATOR = 3840;
     const VENDOR_ID  = 0xFFF1;
     const PRODUCT_ID = 0x8001;
-    const PASSCODE   = 20202021;
 
     const commissioningServer = new CommissioningServer({
         port: 5540,
         deviceName: "E3DC Hauskraftwerk",
         deviceType: 0x000E, // Matter DeviceType für AGGREGATOR (Bridge)
-        passcode: PASSCODE,
-        discriminator: DISCRIMINATOR,
+        passcode: commissioningCredentials.passcode,
+        discriminator: commissioningCredentials.discriminator,
         basicInformation: {
             vendorName: "A9x",
             vendorId: VENDOR_ID,
@@ -127,27 +136,25 @@ async function main() {
     const isCommissioned = commissioningServer.isCommissioned();
     if (!isCommissioned) {
         const pairingCode = commissioningServer.getPairingCode();
-        console.log("Manual Pairing Code:", pairingCode.manualPairingCode);
-        console.log("QR Code:", pairingCode.qrPairingCode);
+        console.log("Matter Bridge wartet auf eine lokale Kopplung über die geschützte Weboberfläche.");
 
         const pairingData = {
             manual: pairingCode.manualPairingCode,
-            qrText: pairingCode.qrPairingCode,
             isCommissioned: false
         };
-        try { fs.writeFileSync(PAIRING_FILE, JSON.stringify(pairingData), 'utf-8'); } catch(e) {}
+        writePairingData(pairingData);
 
-        startAvahiProxy(DISCRIMINATOR, VENDOR_ID, PRODUCT_ID);
+        startAvahiProxy(commissioningCredentials.discriminator, VENDOR_ID, PRODUCT_ID);
         const watcher = setInterval(() => {
             if (commissioningServer.isCommissioned()) {
                 stopAvahiProxy();
-                try { fs.writeFileSync(PAIRING_FILE, JSON.stringify({ isCommissioned: true }), 'utf-8'); } catch {}
+                writePairingData({ isCommissioned: true });
                 clearInterval(watcher);
             }
         }, 10000);
     } else {
         console.log("Gerät ist bereits gepairt.");
-        try { fs.writeFileSync(PAIRING_FILE, JSON.stringify({ isCommissioned: true }), 'utf-8'); } catch {}
+        writePairingData({ isCommissioned: true });
     }
 
     // =====================================================================

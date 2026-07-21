@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Central service and module catalog for installer and WebUI.
+"""
+Zentraler Dienst- und Modulkatalog für den künftigen WebUI-Installer.
 
-This module is intentionally side-effect free: it does not call systemctl,
-write files or import heavy project modules. It is the shared source of truth
-for WebUI, installer, status checks and wrappers.
+Dieses Modul ist bewusst nebenwirkungsfrei: Es ruft systemctl nicht auf,
+schreibt keine Dateien und importiert keine umfangreichen Projektmodule. Es ist
+die gemeinsame Wahrheitsquelle, die WebUI, Installer, Statusprüfungen und
+Wrapper schrittweise übernehmen können.
 """
 
 from __future__ import annotations
@@ -26,6 +28,8 @@ LOAD_OBSERVE = "observe"
 
 READ_ACTIONS = ("status", "diagnose", "validate_config")
 SERVICE_ACTIONS = ("start", "stop", "restart", "enable", "disable")
+INSTALL_ACTIONS = ("install_module", "remove_module", "repair_permissions", "run_update", "install_missing_packages")
+
 ACTIVE_CONTROL_MODULES = {"storage_manager", "wallbox", "heatpump", "heizstab"}
 ESSENTIAL_LOAD_MODULES = {"live", "epex", "weather", "storage_simulator", "notifier"}
 OBSERVE_LOAD_MODULES = {
@@ -188,7 +192,7 @@ MODULES: dict[str, ServiceModule] = {
             "Installieren nur, wenn die native Wallbox-Regelung bewusst aktiviert ist und keine alte C++-Wallboxsteuerung parallel läuft."
         ),
         install_notes=(
-            "Nach der Installation zuerst Read-only-Prüfung und Diagnose ausführen.",
+            "Nach der Installation erst mit Job-Test und Diagnose prüfen.",
             "Bei E3DC Multi Connect, Easy Connect und openWB sind echte Messwerte wichtiger als Soll-/Phantomwerte.",
         ),
         optional=True,
@@ -202,7 +206,7 @@ MODULES: dict[str, ServiceModule] = {
         service="energy_manager",
         script="luxtronik/energy_manager.py",
         log_file="/var/www/html/logs/energy_manager.log",
-        alive_file="/var/www/html/ramdisk/waermepumpe.json",
+        alive_file="/var/www/html/ramdisk/luxtronik.json",
         alive_max_age_s=120,
         config_keys=("luxtronik", "wp_type", "luxtronik_ip", "idm_ip", "stiebel_isg_ip", "dimplex_ip", "shelly_sg_ip", "shelly_pause_ip", "auto_mode"),
         dependencies=("live", "epex"),
@@ -334,21 +338,29 @@ MODULES: dict[str, ServiceModule] = {
         key="climate_control",
         display_name="Klimaanlage Status",
         group=CONSUMERS,
-        description="Liest den Toshiba-Cloud-Status read-only und sendet keine Klimaanlagen-Kommandos.",
+        description="Liest Toshiba-Status read-only, bereitet Zeitprofile vor und sendet keine Klimaanlagen-Kommandos.",
         service="e3dc-climate-control",
         script="climate_control.py",
         log_file="/var/www/html/logs/climate_control.log",
         alive_file="/var/www/html/ramdisk/climate_control.json",
         alive_max_age_s=180,
         config_keys=(
-            "climate_control_enable", "climate_control_poll_s",
+            "climate_control_enable", "climate_control_provider", "climate_control_mode",
             "climate_toshiba_cloud_enable", "climate_toshiba_username",
             "climate_toshiba_password", "climate_toshiba_device_ids",
+            "climate_day_temp_c", "climate_night_temp_c",
+            "climate_night_start", "climate_night_end",
+            "climate_night_eco_enable", "climate_night_quiet_enable",
+            "climate_high_power_enable",
         ),
         required_config_keys=(),
         dependencies=("climate_live",),
+        install_warning=(
+            "Vorbereitungsmodul ohne aktive Kommandos. Toshiba-Cloud-Zugangsdaten erst setzen, "
+            "wenn ein echter Adapter bewusst aktiviert wird."
+        ),
         install_notes=(
-            "Der Dienst liest Toshiba read-only und schreibt climate_control.json.",
+            "Aktuell liest der Dienst Toshiba read-only und schreibt climate_control.json.",
             "Leistung und Bilanz kommen weiterhin aus Klimaanlage Live/Shelly.",
         ),
         optional=True,
@@ -371,9 +383,9 @@ MODULES: dict[str, ServiceModule] = {
     ),
     "shadow": ServiceModule(
         key="shadow",
-        display_name="Shadow-Vergleichsinstanz",
+        display_name="Shadow-Simulation",
         group=SYSTEM,
-        description="Liest die aktive Instanz read-only und berechnet lokale Vergleichsentscheidungen ohne Steuerbefehle oder Failover.",
+        description="Liest Master-Livedaten read-only und simuliert lokale Entscheidungen ohne Steuerbefehle.",
         service="e3dc-shadow-sync",
         script="shadow_sync.py",
         log_file="/var/www/html/logs/shadow_sync.log",
@@ -390,7 +402,7 @@ MODULES: dict[str, ServiceModule] = {
         key="matter",
         display_name="Matter Bridge",
         group=INTEGRATIONS,
-        description="Stellt drei lokale read-only Statusschalter für Apple Home, Google Home und andere Matter-Systeme bereit.",
+        description="Stellt Matter-Geräte für Apple Home und Google Home bereit.",
         service="e3dc-matter-bridge",
         script="matter/matter_bridge.js",
         runner="npm",

@@ -4,12 +4,15 @@ sendNoCacheHeaders();
 requireWebAuth(true);
 header('Content-Type: application/json; charset=utf-8');
 
-// Lese e3dc_paths für Install_User Pfade (Wrapper liegt im Setup-Verzeichnis)
-$paths_json = @file_get_contents('/var/www/html/e3dc_paths.json');
-$paths = $paths_json ? json_decode($paths_json, true) : null;
-$install_path = isset($paths['install_path']) ? rtrim($paths['install_path'], '/') : '/home/pi/Install';
+$paths = getInstallPaths();
+if (empty($paths['valid'])) {
+    http_response_code(503);
+    echo json_encode(['success' => false, 'error' => $paths['error'] ?? 'Installationskontext fehlt.']);
+    exit;
+}
+$install_path = rtrim($paths['install_path'], '/');
 // Wrapper liegt im Installer-Ordner des konfigurierten Installationspfads.
-$wrapper_path = $install_path . '/Installer/service_wrapper.sh';
+$wrapper_path = e3dcFindServiceWrapper();
 
 function loadServiceCatalogForControl($install_path) {
     $installer_path = rtrim($install_path, '/') . '/Installer';
@@ -63,7 +66,7 @@ $fallback_allowed_services = [
     "e3dc-storage-simulator.service" => ["name" => "Batterie-Simulator", "group" => "core", "desc" => "Plant vorausschauend Speicher-Entladungen basierend auf Preisen und dynamischen Prognosen."],
     "e3dc-storage-manager.service" => ["name" => "V4 Speicher-Algorithmus", "group" => "core", "desc" => "Erzwingt Lade/Entlade-Korridore auf E3DC-Ebene (V4 Brain Limiter)."],
     "e3dc-websocket.service" => ["name" => "WebUI Live-Animationen", "group" => "core", "desc" => "Liefert WebSockets für das flüssige Live-Dashboard in Echtzeit-Ansicht (V4 UI)."],
-    
+
     "e3dc-wallbox-manager.service" => ["name" => "Wallbox Steuerung", "group" => "ext", "desc" => "Native Ladungssteuerung für externe Wallboxen inkl. Phasenanschluss-Regelung."],
     "energy_manager.service" => ["name" => "Wärmepumpe Manager", "group" => "ext", "desc" => "PV-Boost und smarte Überschuss-Verschiebung für SG-Ready Wärmepumpen."],
     "e3dc-lux-live.service" => ["name" => "Luxtronik Daten", "group" => "ext", "desc" => "WebSocket-Überwachung der Alpha-Innotec / Novelan Wärmepumpen (Live State)."],
@@ -72,13 +75,13 @@ $fallback_allowed_services = [
     "e3dc-dimplex-live.service" => ["name" => "Dimplex WPM Live", "group" => "ext", "desc" => "Read-only Modbus-Livewerte für Dimplex WPM Touch / NWPM."],
     "e3dc-heizstab.service" => ["name" => "Heizstab Logger", "group" => "ext", "desc" => "Speichert Verbrauchs-Bilanzen autarker Heizstäbe/Shellys."],
     "e3dc-climate-live.service" => ["name" => "Klimaanlage Live", "group" => "ext", "desc" => "Liest Klimaanlagenverbrauch über einen eigenen Shelly-Zähler read-only."],
-    "e3dc-climate-control.service" => ["name" => "Toshiba Cloud Status", "group" => "ext", "desc" => "Liest Toshiba-Cloud-Daten read-only und sendet keine Kommandos."],
+    "e3dc-climate-control.service" => ["name" => "Klimaanlage Regel-Vorbereitung", "group" => "ext", "desc" => "Schreibt Toshiba-Zeitprofil und Regelstatus ohne aktive Kommandos."],
     "e3dc-ha.service" => ["name" => "Home Assistant Bridge", "group" => "ext", "desc" => "Stellt ausfallsichere Redundanz für gekoppelte HA-Installationen (Cluster Mode) her."],
-    "e3dc-matter-bridge.service" => ["name" => "Apple Home / Matter", "group" => "ext", "desc" => "Stellt drei lokale read-only Statusschalter für Matter-Routinen bereit."],
+    "e3dc-matter-bridge.service" => ["name" => "Apple Home / Matter", "group" => "ext", "desc" => "Stellt drei lokale read-only Statusschalter ohne Anlagenbefehle für Matter bereit."],
     "e3dc-bluelink.service" => ["name" => "Hyundai/Kia Bluelink", "group" => "ext", "desc" => "Fragt Fahrzeug-SoC von Hyundai/Kia für das automatische Lade-Planungs Profil ab."],
     "e3dc-notifier.service" => ["name" => "Push & Telegram Meldungen", "group" => "ext", "desc" => "Ereignisgesteuerte und periodische Nachrichten an verknüpfte Endgeräte/Chatbots."],
     "e3dc-mqtt-hub.service" => ["name" => "MQTT Hub", "group" => "ext", "desc" => "Verteilt E3DC-Control Werte per MQTT."],
-    "e3dc-shadow-sync.service" => ["name" => "Shadow-Vergleichsinstanz", "group" => "ext", "desc" => "Liest die aktive Instanz read-only und berechnet lokale Vergleichsentscheidungen ohne Steuerbefehle oder Failover."]
+    "e3dc-shadow-sync.service" => ["name" => "Shadow-Simulation", "group" => "ext", "desc" => "Liest Master-Livedaten read-only und simuliert lokale Entscheidungen ohne Steuerbefehle."]
 ];
 
 $fallback_core_locked = [
@@ -100,10 +103,7 @@ $action = isset($_GET['action']) ? $_GET['action'] : (isset($_POST['action']) ? 
 $service = isset($_GET['service']) ? $_GET['service'] : (isset($_POST['service']) ? $_POST['service'] : '');
 
 // Sichert ab, ob der Wrapper existiert
-if (!file_exists($wrapper_path)) {
-    // Fallback falls der Ordner anders heisst
-    $wrapper_path = '/home/pi/Install/Installer/service_wrapper.sh';
-}
+$wrapper_path = ($wrapper_path && file_exists($wrapper_path)) ? $wrapper_path : '';
 
 // Docker-Erkennung und Alive-Files global definiert (genutzt in status_all UND action-Handler)
 $is_docker = file_exists('/.dockerenv') ||
@@ -331,7 +331,7 @@ if (in_array($action, ['start', 'stop', 'restart', 'enable', 'disable'])) {
             "error_code" => "unit_missing",
             "error" => "Dienst ist noch nicht installiert.",
             "message" => "$module_name ist im Katalog bekannt, aber die systemd-Service-Datei fehlt noch.",
-            "hint" => "Bitte zuerst die Read-only-Installationsprüfung ausführen. Die Installation bleibt bis zur bestätigten Wrapper-Freigabe gesperrt.",
+            "hint" => "Bitte zuerst den Installations-Dry-Run bzw. Job-Test prüfen. Echte Installation bleibt bis zur separaten Freigabe gesperrt.",
             "service" => $service,
             "status" => "missing",
             "enabled" => false,
@@ -365,7 +365,12 @@ if (in_array($action, ['start', 'stop', 'restart', 'enable', 'disable'])) {
         }
     }
 
-    // Bare-Metal: Wrapper mit sudo
+    // Bare-Metal: nur der Wrapper im validierten Release-Root ist erlaubt.
+    if ($wrapper_path === '') {
+        http_response_code(503);
+        echo json_encode(['success' => false, 'error' => 'Service-Wrapper im Installationspfad nicht gefunden.']);
+        exit;
+    }
     $cmd = "sudo " . escapeshellarg($wrapper_path) . " " . escapeshellarg($action) . " " . escapeshellarg($service) . " 2>&1";
     $output = shell_exec($cmd);
 

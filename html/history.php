@@ -1,16 +1,16 @@
 <?php
 /* =====================================================================
-   history.php - Historie mit Zeitauswahl
+   history.php - Mobile Historie mit Zeitauswahl
    ===================================================================== */
 $paths = getInstallPaths();
 $backups = getHistoryBackupFiles();
 
-// Die Aktualisierung erfolgt auf Anforderung über den Update-Button.
+// Automatisches Update beim Laden der Seite wurde entfernt. Update nur noch manuell per Button.
 ?>
 
 <div id="historyHeader" class="d-flex justify-content-between align-items-center mb-3 px-1">
     <h5 class="m-0 fw-bold text-info">Live-Verlauf</h5>
-    
+
     <div class="btn-group btn-group-sm mx-2" role="group" id="timeFilterGroup">
         <button type="button" class="btn btn-outline-info active" data-hours="6">6h</button>
         <button type="button" class="btn btn-outline-info" data-hours="12">12h</button>
@@ -80,7 +80,7 @@ $backups = getHistoryBackupFiles();
     var currentHours = 6; // Standardwert
     var currentFile = '';
     var currentView = 'normal';
-    window.triggerHistoryUpdate = triggerUpdate;
+    window.triggerHistoryUpdate = triggerUpdate; // Make it globally accessible
 
     // Button Click-Logik für Zeitauswahl
     timeBtns.forEach(function(tBtn) {
@@ -88,7 +88,7 @@ $backups = getHistoryBackupFiles();
             // Aktiven Status umschalten
             timeBtns.forEach(b => b.classList.remove('active'));
             this.classList.add('active');
-            
+
             // Stunden setzen und sofort Update triggern
             currentHours = this.getAttribute('data-hours');
             currentFile = '';
@@ -130,10 +130,10 @@ $backups = getHistoryBackupFiles();
         archiveSelect.disabled = true;
         viewSelect.disabled = true;
         timeBtns.forEach(b => b.disabled = true); // Buttons sperren während geladen wird
-        
+
         var msg = currentFile ? 'Lade Archiv ' + archiveSelect.options[archiveSelect.selectedIndex].text + '...' : 'Erstelle ' + currentHours + 'h Diagramm…';
         if (status) status.textContent = msg;
-        
+
         var jsContainer = document.getElementById('liveChartContainer');
         if (jsContainer) {
             jsContainer.style.display = 'block';

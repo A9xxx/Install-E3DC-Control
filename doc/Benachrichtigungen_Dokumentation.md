@@ -6,10 +6,18 @@ Langzeitaufgaben des Systems koordiniert.
 
 ## 1. Warum ein eigener Dienst?
 
-Der **Notification Manager** liest die Einstellungen zentral aus
-`e3dc_v4.json` und führt zeitgesteuerte Aufgaben nach Vorgabe des
-Web-Interfaces aus. Dadurch nutzen Benachrichtigungen, Backups und
-Langzeitaufgaben dieselbe Konfiguration.
+Ursprünglich wurden tägliche Nachrichten und Backups über Linux-Cronjobs
+geregelt. Dies führte zu mehreren Problemen:
+
+* Die Konfiguration von Uhrzeiten und Aktivierung war über das Web-Interface
+  umständlich, weil PHP direkt in die `crontab` eingreifen musste.
+* Bei Updates kam es oft zu Rechte- und Quoting-Konflikten.
+* Watchdog und Telegram-Skripte mussten eigene Konfigurationsdaten parallel
+  verwalten.
+
+Mit dem **Notification Manager** entfällt das: Eine zentrale Stelle liest die
+Einstellungen aus `e3dc_v4.json` und triggert Aufgaben nach Vorgabe des
+Web-Interfaces.
 
 ## 2. Welche Aufgaben übernimmt der Dienst?
 
@@ -37,9 +45,10 @@ Installation, Update und Rechte-Reparatur mitgeprüft. Auf Altinstallationen
 reicht normalerweise:
 
 ```bash
-cd ~/Install
-sudo python3 installer_main.py --fix-permissions
-sudo python3 installer_main.py --update-e3dc
+export E3DC_INSTALL_PATH="/absoluter/pfad/zur/installation"
+test -f "$E3DC_INSTALL_PATH/e3dc-setup"
+bash "$E3DC_INSTALL_PATH/e3dc-setup" --fix-permissions
+bash "$E3DC_INSTALL_PATH/e3dc-setup" --update-e3dc
 ```
 
 Die Einrichtung erfolgt danach im **Config Editor**:

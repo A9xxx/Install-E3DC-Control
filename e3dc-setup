@@ -1,22 +1,83 @@
-#!/bin/bash
-# E3DC-Control Wrapper Script
-# Macht den Aufruf des lokalen Tools einfacher (ohne cd und python3 etc.)
+#!/usr/bin/env bash
+# Portabler lokaler Einstieg für Setup und Reparatur.
 
-SCRIPT_DIR="/home/pi/Install"
+set -euo pipefail
 
-# Wenn als root ausgeführt, dann behalte pfad
-if [ "$EUID" -ne 0 ]; then
-    echo "Tipp: Der Setup/Repair-Task wird automatisch als root ausgeführt..."
-    sudo bash "$0" "$@"
-    exit $?
+SOURCE=$BASH_SOURCE
+while [[ -L "$SOURCE" ]]; do
+    SOURCE_DIR=$(cd -P -- "$(dirname -- "$SOURCE")" >/dev/null 2>&1 && pwd)
+    LINK_TARGET=$(readlink -- "$SOURCE")
+    if [[ "$LINK_TARGET" = /* ]]; then
+        SOURCE=$LINK_TARGET
+    else
+        SOURCE=$SOURCE_DIR/$LINK_TARGET
+    fi
+done
+SCRIPT_DIR=$(cd -P -- "$(dirname -- "$SOURCE")" >/dev/null 2>&1 && pwd)
+
+if [[ ! -f "$SCRIPT_DIR/VERSION" ||
+      ! -f "$SCRIPT_DIR/installer_main.py" ||
+      ! -f "$SCRIPT_DIR/Installer/installer_config.py" ]]; then
+    echo "Setup abgebrochen: Der lokale Produkt-Root ist nicht eindeutig." >&2
+    exit 2
 fi
 
-cd "$SCRIPT_DIR" || exit 1
-
-# Venv aktivieren falls vorhanden
-if [ -d "/home/pi/.venv_e3dc" ]; then
-    source /home/pi/.venv_e3dc/bin/activate
+if [[ -f /.dockerenv && "$SCRIPT_DIR" != "/app/pi/Install" ]]; then
+    echo "Setup abgebrochen: Der Container-Root entspricht nicht dem Image-Vertrag." >&2
+    exit 2
 fi
 
-# Run
-python3 "$SCRIPT_DIR/installer_main.py" "$@"
+if [[ $EUID -ne 0 ]]; then
+    CALLING_USER=$(id -un)
+    if [[ -z "$CALLING_USER" || "$CALLING_USER" = "www-data" ]]; then
+        echo "Setup abgebrochen: Das lokale Installationskonto ist nicht bestätigt." >&2
+        exit 2
+    fi
+    exec sudo env \
+        "E3DC_BOOTSTRAP_ROOT=$SCRIPT_DIR" \
+        "E3DC_BOOTSTRAP_USER=$CALLING_USER" \
+        "$SCRIPT_DIR/e3dc-setup" "$@"
+fi
+
+export E3DC_BOOTSTRAP_ROOT="$SCRIPT_DIR"
+
+if [[ -f /.dockerenv ]]; then
+    SYSTEM_PYTHON=/opt/venv/bin/python3
+else
+    SYSTEM_PYTHON=/usr/bin/python3
+fi
+if [[ ! -x "$SYSTEM_PYTHON" ]]; then
+    echo "Setup abgebrochen: Kein freigegebener Bootstrap-Interpreter vorhanden." >&2
+    exit 2
+fi
+
+PYTHON_EXEC=$(
+    cd -- "$SCRIPT_DIR"
+    "$SYSTEM_PYTHON" - "$SCRIPT_DIR" <<'PY'
+import os
+import sys
+
+root = os.path.realpath(sys.argv[1])
+sys.path.insert(0, root)
+from Installer.transition_context import get_transition_context
+
+context = get_transition_context(
+    explicit_install_path=root,
+    explicit_install_user=os.environ.get("E3DC_BOOTSTRAP_USER") or None,
+    require_trusted=True,
+)
+candidate = context.venv_python
+if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+    print(candidate)
+else:
+    print(sys.executable)
+PY
+)
+
+if [[ -z "$PYTHON_EXEC" || ! -x "$PYTHON_EXEC" ]]; then
+    echo "Setup abgebrochen: Der Installationsinterpreter ist nicht validierbar." >&2
+    exit 2
+fi
+
+cd -- "$SCRIPT_DIR"
+exec "$PYTHON_EXEC" "$SCRIPT_DIR/installer_main.py" "$@"

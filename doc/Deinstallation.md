@@ -8,8 +8,9 @@ Installationspfade liegen.
 ## Ausführen
 
 ```bash
-cd ~/Install
-sudo python3 installer_main.py
+export E3DC_INSTALL_PATH="/absoluter/pfad/zur/installation"
+test -f "$E3DC_INSTALL_PATH/e3dc-setup"
+bash "$E3DC_INSTALL_PATH/e3dc-setup"
 ```
 
 Wähle im Hauptmenü **`9) Deinstallation`**. Für einzelne
@@ -38,7 +39,7 @@ bereinigt.
 
 ## Was manuell zu prüfen ist
 
-* `~/Install` enthält Repository, Logs, lokale Backups und Diagnoseausgaben.
+* `$E3DC_INSTALL_PATH` enthält Programmdateien und lokale Betriebsprotokolle.
 * `/var/www/html/data` enthält Konfiguration und Langzeitdaten.
 * Docker-Installationen haben eigene Volumes, z.B. `./data` und `./logs` neben
   der `docker-compose.yml`.

@@ -46,13 +46,18 @@ if (isset($_POST['save_lux_global'])) {
     requireWebAuth(false);
     $val = isset($_POST['lux_active']) ? '1' : '0';
     saveE3dcConfigValue('luxtronik', $val);
-    
+
     if (file_exists('/.dockerenv')) {
         $python = getPythonInterpreter();
-        $script = file_exists('/app/pi/Install/Installer/luxtronik/energy_manager.py') ? '/app/pi/Install/Installer/luxtronik/energy_manager.py' : '/home/pi/Install/Installer/luxtronik/energy_manager.py';
-        shell_exec("pkill -f 'energy_manager.py'");
-        sleep(1);
-        shell_exec("nohup $python $script > /var/www/html/logs/energy_manager.log 2>&1 &");
+        $runtimePaths = getInstallPaths();
+        $script = !empty($runtimePaths['valid'])
+            ? rtrim($runtimePaths['install_path'], '/') . '/Installer/luxtronik/energy_manager.py'
+            : '';
+        if ($script !== '' && is_file($script)) {
+            shell_exec("pkill -f 'energy_manager.py'");
+            sleep(1);
+            shell_exec("nohup " . escapeshellarg($python) . " " . escapeshellarg($script) . " > /var/www/html/logs/energy_manager.log 2>&1 &");
+        }
     } else {
         e3dcRunServiceWrapperAction('restart', ['energy_manager']);
     }
@@ -86,7 +91,7 @@ if (isset($_GET['ajax']) && $_GET['ajax'] == '1') {
 
     // Historie aus der ramdisk (Python-nativ) scannen
     $historyFiles = getHistoryBackupFiles();
-    
+
     // Luxtronik History Files (deaktiviert - Langzeit-Statistik nutzen)
     $luxtronikFiles = [];
 ?>
@@ -108,7 +113,7 @@ if (isset($_GET['ajax']) && $_GET['ajax'] == '1') {
         /* Dark Mode Defaults (Bootstrap handles most via data-bs-theme="dark") */
         [data-bs-theme="dark"] body { background-color: #121212; color: #e0e0e0; }
         [data-bs-theme="dark"] .card { background-color: #1e1e1e; border-color: #333; box-shadow: 0 4px 10px rgba(0,0,0,0.3); }
-        
+
         /* Light Mode Overrides */
         [data-bs-theme="light"] body { background-color: #eef2f6; color: #334155; }
         [data-bs-theme="light"] .card { background-color: #f8fafc; border-color: #cbd5e1; box-shadow: 0 4px 6px rgba(0,0,0,0.05); }
@@ -265,6 +270,7 @@ if (isset($_GET['ajax']) && $_GET['ajax'] == '1') {
         body.detail-compact .dashboard-consumer-badge .tile-kwh-badge,
         body.detail-compact .dashboard-consumer-badge .wallbox-car-badge,
         body.detail-compact .dashboard-consumer-badge [id$="-session-container"],
+        body.detail-compact .dashboard-consumer-badge #wp-morning-boost,
         body.detail-compact .dashboard-consumer-badge #wp-season-badge,
         body.detail-compact .dashboard-consumer-badge #wp-status-badge,
         body.detail-compact .dashboard-consumer-badge #hs-status-badge,
@@ -535,6 +541,7 @@ if (isset($_GET['ajax']) && $_GET['ajax'] == '1') {
 	        body.frontend-modern.detail-normal #right-column-cards .dashboard-consumer-badge.modern-inactive .tile-kwh-badge,
 	        body.frontend-modern.detail-normal #right-column-cards .dashboard-consumer-badge.modern-inactive .wallbox-car-badge,
 	        body.frontend-modern.detail-normal #right-column-cards .dashboard-consumer-badge.modern-inactive [id$="-session-container"],
+	        body.frontend-modern.detail-normal #right-column-cards .dashboard-consumer-badge.modern-inactive #wp-morning-boost,
 	        body.frontend-modern.detail-normal #right-column-cards .dashboard-consumer-badge.modern-inactive #wp-season-badge,
 	        body.frontend-modern.detail-normal #right-column-cards .dashboard-consumer-badge.modern-inactive #wp-status-badge,
 	        body.frontend-modern.detail-normal #right-column-cards .dashboard-consumer-badge.modern-inactive #hs-status-badge,
@@ -821,6 +828,17 @@ if (isset($_GET['ajax']) && $_GET['ajax'] == '1') {
 	        body.frontend-modern #card-regler-wrapper .card-body {
 	            min-height: 0 !important;
 	        }
+	        .storage-curve-sparkline { position: relative; height: 48px; margin: 0 0 .55rem; border: 1px solid rgba(34,211,238,.16); border-radius: 8px; background: rgba(34,211,238,.035); overflow: hidden; }
+	        .storage-curve-sparkline svg { display: block; width: 100%; height: 100%; }
+	        .storage-curve-sparkline .sparkline-grid { fill: none; stroke: rgba(148,163,184,.18); stroke-width: 1; }
+	        .storage-curve-sparkline .sparkline-forecast { fill: none; stroke: #22c55e; stroke-width: 2.4; stroke-linecap: round; stroke-linejoin: round; }
+	        .storage-curve-sparkline .sparkline-target { fill: none; stroke: #22d3ee; stroke-width: 1.25; stroke-dasharray: 4 3; opacity: .72; stroke-linecap: round; stroke-linejoin: round; }
+	        .storage-curve-sparkline-state { position: absolute; right: 6px; bottom: 3px; padding: 1px 5px; border-radius: 999px; background: rgba(15,23,42,.72); color: #94a3b8; font-size: .58rem; }
+	        .storage-curve-sparkline[data-state="stale"] .sparkline-forecast { stroke: #f59e0b; stroke-dasharray: 4 3; }
+	        .storage-curve-sparkline[data-state="missing"] polyline,
+	        .storage-curve-sparkline[data-state="mismatch"] polyline,
+	        .storage-curve-sparkline[data-state="stale"] polyline { display: none; }
+	        body.frontend-modern.detail-compact .storage-curve-sparkline { display: none; }
 	        body.frontend-modern.detail-compact #dashboard-status-cards-home {
 	            display: none !important;
 	        }
@@ -966,28 +984,43 @@ if (isset($_GET['ajax']) && $_GET['ajax'] == '1') {
 	                height: 470px;
 	            }
 	        }
-		        /* Anpassungen für inkludierte Seiten */
+
+	        /* Anpassungen für inkludierte Seiten */
 	        .container-fluid { max-width: 1920px; }
         /* --- Energiefluss Ansicht --- */
-    .flow-container { background-color: #1e1e1e; color: #fff; border-radius: 0 0 12px 12px; position: relative; width: 100%; height: 100%; overflow: hidden; font-family: sans-serif; }
+    .flow-container { background-color: #1e1e1e; color: #fff; border-radius: 0 0 12px 12px; position: relative; display: flex; flex-direction: column; width: 100%; height: 100%; overflow: hidden; font-family: sans-serif; }
+    .flow-canvas { position: relative; flex: 1 1 auto; min-width: 0; min-height: 0; width: 100%; overflow: hidden; }
     .flow-svg { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 1; pointer-events: none; }
     .flow-line { fill: none; stroke-width: 4; opacity: 0.2; }
     .flow-dots { fill: none; stroke-width: 6; stroke-dasharray: 0 20; animation: flowAnim 1s linear infinite; stroke-linecap: round; }
     @keyframes flowAnim { to { stroke-dashoffset: -60; } }
     .flow-dots.reverse { animation-direction: reverse; }
     .flow-dots.stopped { animation-play-state: paused; opacity: 0; }
-    .flow-editor-toolbar { position: absolute; top: 10px; right: 10px; z-index: 40; display: flex; align-items: center; gap: 6px; }
-    .flow-editor-controls { display: none; align-items: center; gap: 6px; padding: 6px; border-radius: 10px; background: rgba(20, 24, 31, 0.82); border: 1px solid rgba(148, 163, 184, 0.32); backdrop-filter: blur(10px); }
+    .flow-editor-toolbar { position: relative; z-index: 40; flex: 0 0 auto; display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 6px; width: 100%; min-height: 47px; padding: 7px 10px; border-bottom: 1px solid rgba(148, 163, 184, 0.22); }
+    .flow-save-status { flex: 1 1 auto; align-self: center; min-width: 0; color: var(--bs-secondary-color, #94a3b8); font-size: 0.76rem; font-weight: 700; }
+    .flow-save-status.is-success { color: #22c55e; }
+    .flow-save-status.is-error { color: #ef4444; }
+    .flow-editor-controls { display: none; flex: 1 1 430px; min-width: 0; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 6px; padding: 0; }
     .flow-container.flow-editing .flow-editor-controls { display: flex; }
-    .flow-container.flow-editing .flow-node[data-flow-node]:not([data-flow-node="center"]) { cursor: grab; outline: 2px dashed rgba(255,255,255,0.42); outline-offset: 4px; }
+    .flow-container.flow-editing .flow-node[data-flow-node] { cursor: grab; outline: 2px dashed rgba(255,255,255,0.42); outline-offset: 4px; }
     .flow-container.flow-editing .flow-node.flow-selected { outline-style: solid; outline-color: #fff; }
+    .flow-container.flow-editing .external-wr-lock-btn { pointer-events: none; }
+    .flow-container.flow-saving .flow-canvas { pointer-events: none; }
     .flow-color-select { width: auto; min-width: 112px; }
     .flow-color-input { width: 34px; height: 31px; padding: 2px; }
+    .flow-label-input { width: 150px; }
+    .flow-drag-handle { display: none; position: absolute; right: -12px; top: -12px; width: 30px; height: 30px; padding: 0; align-items: center; justify-content: center; border: 1px solid #94a3b8; border-radius: 50%; background: #111827; color: #f8fafc; box-shadow: 0 4px 12px rgba(0,0,0,.35); touch-action: none; user-select: none; z-index: 8; }
+    .flow-container.flow-editing .flow-drag-handle { display: inline-flex; }
+    .flow-node .flow-secondary-label { opacity: .78; font-size: .58rem; }
+    .flow-node.node-aggregate { width: 108px; height: 108px; border-style: double; }
+    .flow-node.node-aggregate .fa-icon { font-size: 1.7rem; }
+    .flow-node.node-aggregate .val { font-size: 1.05rem; }
 
-    .flow-node { position: absolute; transform: translate(-50%, -50%); border-radius: 50%; display: flex; flex-direction: column; align-items: center; justify-content: center; z-index: 10; background: #1e1e1e; border: 4px solid; width: 130px; height: 130px; text-align: center; }
-    .flow-node .fa-icon { font-size: 2.2rem; margin-bottom: 4px; }
-    .flow-node .val { font-size: 1.3rem; font-weight: bold; }
-    .flow-node .label { font-size: 0.7rem; color: #aaa; text-transform: uppercase; }
+    .flow-node { position: absolute; transform: translate(-50%, -50%); border-radius: 50%; display: flex; flex-direction: column; align-items: center; justify-content: center; z-index: 10; box-sizing: border-box; padding: clamp(3px, 0.7vw, 9px); background: #1e1e1e; border: 4px solid; width: 130px; height: 130px; text-align: center; line-height: 1.03; }
+    .flow-node.flow-dragging { transition: none !important; }
+    .flow-node > .fa-icon { flex: 0 0 auto; max-width: calc(100% - 12px); font-size: clamp(1.35rem, 2.2vw, 2.2rem); margin-bottom: 4px; }
+    .flow-node > .val { display: block; width: calc(100% - 8px); overflow: hidden; white-space: nowrap; font-size: clamp(0.78rem, 1.35vw, 1.3rem); line-height: 1.05; font-weight: bold; font-variant-numeric: tabular-nums; }
+    .flow-node > .label { display: block; width: calc(100% - 10px); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: clamp(0.52rem, 0.75vw, 0.7rem); line-height: 1.05; color: #aaa; text-transform: uppercase; }
     .flow-node .flow-pv-split { max-width: 112px; margin-top: 1px; font-size: 0.58rem; line-height: 1.05; color: inherit; opacity: 0.82; text-transform: none; overflow: hidden; text-overflow: ellipsis; }
     .flow-zero-export-badge { position: absolute; top: -13px; right: -38px; display: inline-flex; align-items: center; justify-content: center; gap: 4px; min-width: 78px; height: 23px; padding: 0 7px; border: 1px solid transparent; border-radius: 999px; color: #fff; font-size: 0.61rem; font-weight: 800; line-height: 1; letter-spacing: 0; white-space: nowrap; z-index: 3; box-shadow: 0 4px 12px rgba(15,23,42,0.28); cursor: help; }
     .flow-zero-export-badge[hidden] { display: none !important; }
@@ -1040,7 +1073,7 @@ if (isset($_GET['ajax']) && $_GET['ajax'] == '1') {
     .node-wp.boost { border-color: #dc3545; color: #dc3545; box-shadow: 0 0 25px rgba(220,53,69,0.8); }
     .node-center { background: transparent; border: none; box-shadow: none; width: 90px; height: 90px; top: 50%; left: 50%; padding: 0; }
     .node-center img { width: 100%; height: 100%; border-radius: 50%; box-shadow: 0 0 30px #0d6efd; }
-    
+
     @media (max-width: 900px) {
         .flow-node, .flow-node-back { transform: translate(-50%, -50%) scale(0.60); }
         .node-pv { left: 20%; }
@@ -1050,6 +1083,9 @@ if (isset($_GET['ajax']) && $_GET['ajax'] == '1') {
         .flow-container { min-height: 450px; }
         .flow-container.flow-has-wb2 { min-height: 560px; }
         .flow-container.flow-has-wb2.flow-has-hs { min-height: 590px; }
+        .flow-container.flow-has-consumption-aggregate { min-height: 590px; }
+        .flow-editor-toolbar { align-items: flex-start; }
+        .flow-editor-controls { flex-basis: 100%; max-width: 100%; overflow-x: auto; }
     }
 
     /* Light Mode Flow Overrides */
@@ -1222,7 +1258,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
             <?php if ($seite !== 'dashboard'): ?>
             <div class="d-none d-lg-flex gap-2 mx-auto align-items-center bg-body-secondary px-3 py-1 rounded-pill border border-secondary-subtle shadow-sm small e3dc-header-live" id="header-live-values">
                 <div title="PV Leistung"><i class="fas fa-sun text-warning"></i> <span id="head-pv" class="fw-bold">--</span></div>
-                <div title="Batterie"><i class="fas fa-battery-half text-muted" id="head-icon-bat"></i> <span id="head-bat" class="fw-bold">--</span> <span id="head-soc" class="text-muted" style="font-size:0.85em">--%</span></div>
+                <div title="Hausakku"><i class="fas fa-battery-half text-muted" id="head-icon-bat"></i> <span id="head-bat" class="fw-bold">--</span> <span id="head-soc" class="text-muted" style="font-size:0.85em" title="Hausakku-SoC">--%</span></div>
                 <div title="Hausverbrauch"><i class="fas fa-home text-info"></i> <span id="head-home" class="fw-bold">--</span></div>
                 <div title="Netz"><i class="fas fa-network-wired text-secondary" id="head-icon-grid"></i> <span id="head-grid" class="fw-bold">--</span></div>
                 <?php if($wbEnabled): ?>
@@ -1267,7 +1303,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                     <i class="fas fa-bolt fa-lg text-warning"></i>
                 </button>
                 <?php if (!empty($dashCfg['matter_bridge']) && $dashCfg['matter_bridge'] == '1'): ?>
-                <a href="index.php?seite=matter" title="Matter Smart Home Bridge (Beta)">
+                <a href="index.php?seite=matter" title="Matter Smart Home Bridge">
                     <i class="fas fa-atom fa-lg text-primary"></i>
                 </a>
                 <?php endif; ?>
@@ -1279,7 +1315,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                     <i class="fas fa-shield-alt"></i>
                 </span>
                 <span id="cpu-badge" class="badge bg-body-tertiary text-secondary border border-secondary-subtle" style="font-family:monospace; display:none; font-size: 0.75rem;" title="CPU Load (1min) / Temperatur">CPU: --</span>
-                
+
                 <button class="btn btn-link p-0" onclick="toggleDarkMode()" title="Dark Mode umschalten">
                     <i class="fas fa-<?= $darkMode ? 'sun' : 'moon' ?> text-warning" id="darkmode-icon"></i>
                 </button>
@@ -1289,7 +1325,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                 <a href="help.php" title="Hilfe & FAQ">
                     <i class="fas fa-question-circle fa-lg text-info"></i>
                 </a>
-                
+
         <?php if (!empty($dashCfg['web_pin'])): ?>
             <?php if (isWebAuthenticated()): ?>
                 <a href="?action=web_logout" class="ms-1" title="Sperren (Logout)"><i class="fas fa-unlock text-success fa-lg"></i></a>
@@ -1383,14 +1419,14 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                 </div>
 
                 <!-- === Spalte 3: Wallbox Regelung (mitte) === -->
-                <div id="wb-native-col2" class="d-flex flex-column justify-content-center px-3" style="<?php if(!$nativeWallboxStatusEnabled): ?>display:none; <?php endif; ?>min-width:210px; flex-shrink:0; border-right:1px solid rgba(108,117,125,0.22);">
+                <div id="wb-native-col2" data-wallbox-configured="<?= $nativeWallboxStatusEnabled ? '1' : '0' ?>" class="<?= $nativeWallboxStatusEnabled ? 'd-flex ' : 'd-none ' ?>flex-column justify-content-center px-3" <?php if(!$nativeWallboxStatusEnabled): ?>hidden aria-hidden="true"<?php else: ?>aria-hidden="false"<?php endif; ?> style="<?php if(!$nativeWallboxStatusEnabled): ?>display:none !important; <?php endif; ?>min-width:210px; flex-shrink:0; border-right:1px solid rgba(108,117,125,0.22);">
                     <div class="text-uppercase fw-bold d-flex align-items-center gap-1 mb-1" style="font-size:0.6rem; letter-spacing:0.06em; color:#a855f7;">
                         <i class="fas fa-sliders-h" style="font-size:0.62rem;"></i> Wallbox Regelung
                         <span class="badge rounded-pill bg-secondary bg-opacity-25 text-secondary ms-auto" id="wb-native-count" style="font-size:0.58rem;">-- WB</span>
                     </div>
                     <div class="d-flex align-items-center gap-3">
                         <div>
-                            <div class="fw-bold" style="font-size:1.2rem; color:#a855f7; line-height:1;"><span id="wb-native-amp">0</span><small style="font-size:0.62rem; margin-left:2px;">A</small></div>
+                            <div class="fw-bold" style="font-size:1.2rem; color:#a855f7; line-height:1;"><span id="wb-native-amp">0</span><small id="wb-native-amp-unit" style="font-size:0.62rem; margin-left:2px;">A</small></div>
                             <div class="text-muted" style="font-size:0.65rem;" id="wb-native-amp-label">Soll-Strom</div>
                         </div>
                         <div class="d-flex flex-column gap-1">
@@ -1407,7 +1443,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                 </div>
 
                 <!-- === Spalte 4: Verbindungsstatus + WB-Name + WB-Details (rechts) === -->
-                <div id="wb-native-col3" class="d-flex flex-column justify-content-center ps-3" style="<?php if(!$nativeWallboxStatusEnabled): ?>display:none; <?php endif; ?>min-width:290px; flex-shrink:0;">
+                <div id="wb-native-col3" data-wallbox-configured="<?= $nativeWallboxStatusEnabled ? '1' : '0' ?>" class="<?= $nativeWallboxStatusEnabled ? 'd-flex ' : 'd-none ' ?>flex-column justify-content-center ps-3" <?php if(!$nativeWallboxStatusEnabled): ?>hidden aria-hidden="true"<?php else: ?>aria-hidden="false"<?php endif; ?> style="<?php if(!$nativeWallboxStatusEnabled): ?>display:none !important; <?php endif; ?>min-width:290px; flex-shrink:0;">
                     <div class="d-flex align-items-center">
                         <div id="wb-native-pulse" class="rounded-circle me-2 flex-shrink-0" style="width:12px; height:12px; background:#a855f7;"></div>
                         <div style="min-width:0;">
@@ -1481,7 +1517,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                             <div>
                                 <div class="battery-value-row">
                                     <div class="val-large text-success" id="val-bat-container" style="line-height:1;">--<span class="val-unit">W</span></div>
-                                    <span id="val-soc" class="battery-soc-chip text-success" title="Batterie SoC" aria-label="Batterie SoC">--%</span>
+                                    <span id="val-soc" class="battery-soc-chip text-success" title="Hausakku-SoC" aria-label="Hausakku-SoC">--%</span>
                                 </div>
                                 <div class="small text-muted tile-detail" id="bat-details" style="display:none; font-size: 0.75rem;"></div>
                                 <div id="bat-peak-detail" style="display:none;" class="small text-muted mt-1 tile-detail"><i class="fas fa-arrow-down text-success opacity-75" title="Max Laden"></i> <span id="val-bat-max-in" class="fw-bold">--</span> &bull; <i class="fas fa-arrow-up text-danger opacity-75" title="Max Entladen"></i> <span id="val-bat-max-out" class="fw-bold">--</span></div>
@@ -1568,7 +1604,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                     <div class="card-header bg-transparent border-secondary d-flex justify-content-between align-items-center py-3">
                         <div class="d-flex align-items-center gap-3">
                             <h6 class="mb-0 fw-bold text-nowrap" id="chart-title"><i class="fas fa-chart-line me-2 text-secondary"></i>SoC Prognose</h6>
-                            
+
                             <!-- Header Info für Lade-Fahrplan (Nur auf großen Bildschirmen) -->
                             <div id="header-regler-plan" class="small d-none align-items-center gap-3 border-start border-secondary ms-2 ps-3 fw-bold" style="font-size: 0.8rem;">
                                 <span id="head-rb-wrap" title="Startanker / Kurvenbeginn"><i class="fas fa-play text-success opacity-75"></i> <span id="head-rb" class="text-body">--:--</span></span>
@@ -1627,7 +1663,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                         <!-- Live Energiefluss (Desktop Layout) -->
                         <?= renderEnergyFlow('desktop', '', 'style="display: none;"') ?>
                     </div>
-                    
+
                     <!-- Statistics View Overlay (now covers the whole card including header) -->
                     <div id="stats-view" class="w-100 h-100 position-absolute top-0 start-0 p-4" style="display: none; background-color: var(--bs-card-bg); overflow-y: auto; z-index: 30;">
                         <div class="d-flex justify-content-between align-items-center mb-4">
@@ -1642,7 +1678,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                                 <button class="btn btn-sm btn-outline-secondary" onclick="toggleStatsView('desktop')"><i class="fas fa-times"></i></button>
                             </div>
                         </div>
-                        
+
                         <!-- Hidden data carriers for JS -->
                         <span id="stat-grid-out-total" style="display:none;">0 kWh</span>
                         <span id="stat-bat-in-total" style="display:none;">0 kWh</span>
@@ -1745,7 +1781,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                                     </div>
                                 </div>
                             </div>
-                            
+
                             <div class="col-md-5" id="detail-card-bat" style="display:none;">
                                 <div class="card bg-body-tertiary border-success h-100 shadow-sm">
                                     <div class="card-body">
@@ -1767,7 +1803,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
 	                                    </div>
 	                                </div>
                             </div>
-                            
+
                             <div class="col-md-5" id="detail-card-grid" style="display:none;">
                                 <div class="card bg-body-tertiary border-danger h-100 shadow-sm">
                                     <div class="card-body">
@@ -1859,7 +1895,10 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                         'goe' => 'go-e',
                         'go-e' => 'go-e',
                         'e3dc' => 'E3DC Easy',
-                        'e3dc_auto' => 'E3DC Auto',
+                        'e3dc_auto' => 'E3DC Wallbox Auto',
+                        'e3dc_efy' => 'E3DC Wallbox efy',
+                        'e3dc_easy' => 'E3DC Easy Connect',
+                        'e3dc_easy_connect' => 'E3DC Easy Connect',
                         'e3dc_multi' => 'E3DC Multi',
                         'e3dc_multi_connect' => 'E3DC Multi',
                         'shelly' => 'Shelly',
@@ -1870,8 +1909,13 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                     $dashWb2TypeRaw = normalizeWallboxTypeConfig($dashWbCfg['wb_native_type2'] ?? 'wb2');
                     $dashWb1Type = $dashWbTypeLabels[$dashWb1TypeRaw] ?? 'Wallbox';
                     $dashWb2Type = $dashWbTypeLabels[$dashWb2TypeRaw] ?? 'Wallbox';
-                    $dashWb1Title = !empty($dashWbCfg['wb1_name']) ? (string)$dashWbCfg['wb1_name'] : "$dashWb1Type (WB 1)";
-                    $dashWb2Title = !empty($dashWbCfg['wb2_name']) ? (string)$dashWbCfg['wb2_name'] : "$dashWb2Type (WB 2)";
+                    $dashFlowLabels = getEnergyFlowUiConfig()['labels'] ?? [];
+                    $dashWb1ConfiguredName = sanitizeEnergyFlowLabel($dashWbCfg['wb1_name'] ?? '');
+                    $dashWb2ConfiguredName = sanitizeEnergyFlowLabel($dashWbCfg['wb2_name'] ?? '');
+                    $dashWb1Title = sanitizeEnergyFlowLabel($dashFlowLabels['wallbox'] ?? '')
+                        ?: (($dashWb1ConfiguredName !== '' && strlen((string)($dashWbCfg['wb1_name'] ?? '')) <= 32) ? $dashWb1ConfiguredName : 'Wallbox 1');
+                    $dashWb2Title = sanitizeEnergyFlowLabel($dashFlowLabels['wallbox2'] ?? '')
+                        ?: (($dashWb2ConfiguredName !== '' && strlen((string)($dashWbCfg['wb2_name'] ?? '')) <= 32) ? $dashWb2ConfiguredName : 'Wallbox 2');
                     ?>
                     <!-- Wallbox Card 1 -->
                     <?php if($dashHasWb1): ?>
@@ -1890,6 +1934,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                                                 <div class="val-large text-body" id="val-wb" style="line-height:1;">0<span class="val-unit">W</span></div>
                                             </div>
                                             <div class="small text-muted text-truncate tile-detail" id="wb-status">Bereit</div>
+                                            <div class="small text-muted tile-detail wallbox-identity-detail" id="wb-identity" style="display:none; font-size:0.7rem;"></div>
                                             <div class="small text-muted mt-1 tile-detail" id="wb-details" style="display:none; font-size: 0.7rem;"></div>
                                             <div id="wb-peak-detail" style="display:none;" class="small text-muted mt-1 tile-detail"><i class="fas fa-arrow-up text-danger opacity-75"></i> <span id="val-wb-max" class="fw-bold">--</span> (Max)</div>
                                         </div>
@@ -1932,6 +1977,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                                                 <div class="val-large text-body" id="val-wb2" style="line-height:1;">0<span class="val-unit">W</span></div>
                                             </div>
                                             <div class="small text-muted text-truncate tile-detail" id="wb2-status">Bereit</div>
+                                            <div class="small text-muted tile-detail wallbox-identity-detail" id="wb2-identity" style="display:none; font-size:0.7rem;"></div>
                                             <div class="small text-muted mt-1 tile-detail" id="wb2-details" style="display:none; font-size: 0.7rem;"></div>
                                             <div id="wb2-peak-detail" style="display:none;" class="small text-muted mt-1 tile-detail"><i class="fas fa-arrow-up text-danger opacity-75"></i> <span id="val-wb2-max" class="fw-bold">--</span> (Max)</div>
                                         </div>
@@ -1976,6 +2022,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                                                 <span class="badge bg-warning text-dark pulsating border w-100 text-end" title="Batterie leeren aktiv"><i class="fas fa-bolt"></i> Boost</span>
                                             <?php endif; ?>
                                             <span id="wp-today" class="badge bg-body-tertiary text-body border border-secondary-subtle tile-kwh-badge w-100 text-end" title="Wärmepumpe heute"><i class="fas fa-calendar-day text-danger me-1"></i><span id="wp-today-value">-- kWh</span></span>
+                                            <span id="wp-morning-boost" class="badge bg-warning text-dark border w-100 text-end" style="display:none;" title="Morning Boost aktiv"></span>
                                             <span id="wp-season-badge" class="badge bg-secondary text-white border w-100 text-end" style="display:none;" title="Heiz-/Sommerbetrieb"></span>
                                             <span id="wp-status-badge" class="badge w-100 text-end w-auto" style="display:none;<?= $wpEnabled ? ' cursor:pointer;' : '' ?>" <?= $wpEnabled ? 'onclick="event.stopPropagation(); window.location.href=\'index.php?seite=waermepumpe\'"' : '' ?>></span>
                                         </div>
@@ -2086,6 +2133,14 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                                     <span><i class="fas fa-route me-1"></i> Ladekurve <span id="stat-regler-day" class="badge bg-info bg-opacity-10 text-info border border-info border-opacity-25 ms-1" style="font-size: 0.65rem; font-weight: 600;">Heute</span> <span id="stat-storage-phase" class="badge bg-info bg-opacity-10 text-info border border-info border-opacity-25 ms-1" style="font-size: 0.65rem; font-weight: 600;"></span></span>
                                     <i class="fas fa-chart-area text-info opacity-50" style="font-size:0.75rem;"></i>
                                 </h6>
+                                <div id="stat-regler-sparkline" class="storage-curve-sparkline" data-state="missing" aria-label="Ladekurvenvorschau">
+                                    <svg viewBox="0 0 240 48" preserveAspectRatio="none" aria-hidden="true">
+                                        <path class="sparkline-grid" d="M0 36H240 M0 24H240 M0 12H240"></path>
+                                        <polyline id="stat-regler-sparkline-target" class="sparkline-target" points=""></polyline>
+                                        <polyline id="stat-regler-sparkline-forecast" class="sparkline-forecast" points=""></polyline>
+                                    </svg>
+                                    <span id="stat-regler-sparkline-state" class="storage-curve-sparkline-state">Keine Plandaten</span>
+                                </div>
                                 <div class="d-flex justify-content-between small mb-1 align-items-center">
                                     <span class="text-muted"><i class="fas fa-play text-success opacity-75 me-1"></i><span id="stat-regler-rb-label">Kurvenstart:</span></span>
                                     <span class="fw-bold">
@@ -2178,15 +2233,6 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                     <?php include 'Wallbox.php'; ?>
                 </div>
             </div>
-        <?php elseif ($seite === 'matter'): ?>
-            <div class="row justify-content-center">
-                <div class="col-12 col-xl-10">
-                    <div class="mb-3">
-                        <a href="index.php" class="btn btn-outline-secondary btn-sm"><i class="fas fa-arrow-left me-2"></i>Zurück zum Dashboard</a>
-                    </div>
-                    <?php include 'matter.php'; ?>
-                </div>
-            </div>
     <?php elseif ($seite === 'lock'): ?>
         <div class="row justify-content-center mt-5 pt-5">
             <div class="col-12 col-md-6 col-lg-4">
@@ -2211,6 +2257,15 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                 </div>
             </div>
         </div>
+        <?php elseif ($seite === 'matter'): ?>
+            <div class="row justify-content-center">
+                <div class="col-12 col-xl-10">
+                    <div class="mb-3">
+                        <a href="index.php" class="btn btn-outline-secondary btn-sm"><i class="fas fa-arrow-left me-2"></i>Zurück zum Dashboard</a>
+                    </div>
+                    <?php include 'matter.php'; ?>
+                </div>
+            </div>
         <?php elseif ($seite === 'fahrzeug'): ?>
             <div class="row justify-content-center">
                 <div class="col-12 col-lg-10 col-xl-8">
@@ -2279,7 +2334,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                             <button class="btn btn-danger btn-sm" onclick="restartService()" title="Setzt alle Dienste sanft zurück und entfernt temporäre Boosts"><i class="fas fa-power-off me-2"></i>Notfall-Neustart (Reset)</button>
                         </div>
                     </div>
-                    
+
 
                     <?php include 'config_editor.php'; ?>
                 </div>
@@ -2289,7 +2344,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
         <!-- Footer -->
         <footer class="text-center text-muted mt-5 pt-3 border-top border-secondary">
             <small>
-                E3DC Control &copy; <?= date('Y') ?> | 
+                E3DC Control &copy; <?= date('Y') ?> |
                 <a href="#" class="text-decoration-none text-secondary" data-bs-toggle="modal" data-bs-target="#changelogModal">Changelog</a>
                 | <a href="https://www.photovoltaikforum.com/thread/259876-e3dc-control-native-python-ki-prognose-dynamische-stromtarife-wallbox-steuerung/?action=lastPost" target="_blank" class="text-decoration-none text-secondary" title="Zum neuen E3DC-Control V4 Thread im PV-Forum (letzter Beitrag)"><i class="fas fa-comments"></i> PV-Forum</a>
                 | <a href="help.php" class="text-decoration-none text-secondary">FAQ</a>
@@ -2529,13 +2584,13 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
             DARK_MODE = !DARK_MODE;
             // Bootstrap 5 (Desktop) verlangt den Theme-Tag zwingend auf <html> (documentElement)
             document.documentElement.setAttribute('data-bs-theme', DARK_MODE ? 'dark' : 'light');
-            document.body.setAttribute('data-bs-theme', DARK_MODE ? 'dark' : 'light'); 
-            
+            document.body.setAttribute('data-bs-theme', DARK_MODE ? 'dark' : 'light');
+
             const icon = document.getElementById('darkmode-icon');
             if (icon) {
                 icon.className = DARK_MODE ? 'fas fa-sun' : 'fas fa-moon';
             }
-            
+
             fetch('index.php', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/x-www-form-urlencoded'},
@@ -3050,7 +3105,8 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                             || data.wp_price_boost === true
                             || data.wp_predump_boost === true
                             || data.wp_manual_boost === true
-                            || data.wp_pre_pause_active === true;
+                            || data.wp_pre_pause_active === true
+                            || String(data.mb_state || '').toUpperCase() === 'RUNNING';
                         let heatLabel = data.heat_manager_label || '';
                         if (!heatLabel || (heatLabel === 'Beobachtet' && budgetW !== null && budgetW > 0)) {
                             if (data.wp_predump_boost === true) heatLabel = 'Pre-Dump';
@@ -3058,6 +3114,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                             else if (data.wp_market_plan === true) heatLabel = 'Marktfenster';
                             else if (data.wp_price_boost === true) heatLabel = 'Preisfenster';
                             else if (data.wp_manual_boost === true) heatLabel = 'Manuell';
+                            else if (String(data.mb_state || '').toUpperCase() === 'RUNNING') heatLabel = 'Morgen-Boost';
                             else if (data.wp_boost_active === true) heatLabel = data.heat_manager_owner_label || 'Wärmebudget';
                             else if (budgetW !== null && budgetW > 0) heatLabel = 'Budget bereit';
                             else heatLabel = 'Beobachtet';
@@ -3087,7 +3144,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                         }
                     }
                 }
-                
+
                 // Show the banner if we have storage manager data
                 const wbAlert = document.getElementById('wb-native-alert');
                 if (wbAlert && data.storage_state) {
@@ -3323,6 +3380,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
         }
 
         let livePollTimer = null;
+        let desktopLiveTransportStarted = false;
         function livePollDelayMs() {
             return document.hidden ? 10000 : 2000;
         }
@@ -3335,16 +3393,16 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
             }, livePollDelayMs());
         }
         document.addEventListener('visibilitychange', function() {
-            scheduleLivePoll(!document.hidden);
+            if (desktopLiveTransportStarted) scheduleLivePoll(!document.hidden);
         });
 
         function initWebSocket() {
             const protocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
             window.liveWs = new WebSocket(protocol + window.location.host + '/ws');
-            window.liveWs.onmessage = function(e) { 
+            window.liveWs.onmessage = function(e) {
                 const data = JSON.parse(e.data);
                 window.liveWsLastMessageTs = Date.now();
-                processLiveData(data); 
+                processLiveData(data);
                 updatePeakShaving(data);
             };
             window.liveWs.onclose = function() { window.liveWsLastMessageTs = 0; setTimeout(initWebSocket, 3000); }; // Auto-Reconnect
@@ -3355,15 +3413,28 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
 
         // startSystemUpdate(), pollUpdate() entfernt -> jetzt in solar.js (nutze Button ID 'btn-update-config')
 
-        // Init
-        initWebSocket();
-        scheduleLivePoll(true);
-        
+        // Solar wird mit defer geladen. Erst nach dessen vollständiger Ausführung darf
+        // der erste Live-Transport Daten an processLiveData übergeben.
+        function startDesktopLiveTransportOnce() {
+            if (desktopLiveTransportStarted) return true;
+            if (typeof window.processLiveData !== 'function') return false;
+            desktopLiveTransportStarted = true;
+            initWebSocket();
+            scheduleLivePoll(true);
+            return true;
+        }
+        window.addEventListener('e3dc:solar-ready', startDesktopLiveTransportOnce, {once: true});
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', startDesktopLiveTransportOnce, {once: true});
+        } else {
+            startDesktopLiveTransportOnce();
+        }
+
         // Diagramm beim Laden aktualisieren, um veraltete Daten/falschen Modus zu vermeiden
-        $(document).ready(function() { 
+        $(document).ready(function() {
             if ('<?= $seite ?>' === 'dashboard') {
                 switchChartMode('flow');
-                refreshData(true); 
+                refreshData(true);
             }
         });
 
@@ -3387,7 +3458,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                 } else {
                     badge.hide();
                 }
-            
+
             // --- NEU: Diagnose Errors verarbeiten ---
             if (data.diagnose_errors) {
                 window.currentDiagnoseErrors = data.diagnose_errors;
@@ -3485,10 +3556,10 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
             const selfcon = parseVal('stat-overlay-selfcon');
 
             chartMix.data.datasets[0].data = [pv, bat, grid];
-            
+
             const gridColor = DARK_MODE ? '#333' : '#e9ecef';
             const borderColor = DARK_MODE ? '#1e1e1e' : '#ffffff';
-            
+
             chartMix.data.datasets[0].borderColor = borderColor;
             chartMix.update();
 
@@ -3546,7 +3617,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                 new MutationObserver(() => {
                     if (statsView.style.display !== 'none') setTimeout(updateInteractiveCharts, 50);
                 }).observe(statsView, { attributes: true, attributeFilter: ['style'] });
-                
+
                 const dataNode = document.getElementById('stat-pv-total');
                 if (dataNode) {
                     new MutationObserver(() => {
@@ -3613,7 +3684,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                 nav.classList.toggle('scrolled', window.scrollY > 4);
             }, { passive: true });
         })();
-        
+
         // Native Wallbox Updater (Isolated)
         let nativeWallboxDisplayCache = null;
         const nativeWallboxHoldMs = 18000;
@@ -3701,6 +3772,47 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
             };
         }
 
+        function nativeWallboxE3dcInfo(details) {
+            if (!Array.isArray(details)) return {label: '', familyLabel: '', detail: '', className: 'text-muted'};
+            const wb = details.find(item => item && item.e3dc_transport === 'e3dc_rscp_via_home_power_station');
+            if (!wb) return {label: '', familyLabel: '', detail: '', className: 'text-muted'};
+            const familyLabels = {
+                efy: 'E3/DC Wallbox efy',
+                easy_connect: 'E3/DC Easy Connect',
+                multi_connect: 'E3/DC Multi Connect',
+                multi_connect_ii: 'E3/DC Multi Connect II',
+                unknown: 'E3/DC Wallbox'
+            };
+            const backendLabels = {
+                wbchar6_compat: 'E3/DC efy/Easy – WBchar6-Kompatibilitätsregelung aktiv',
+                status_only: 'Nur Status – WBchar6 nicht gewählt; direkte Schreibausgänge gesperrt'
+            };
+            const family = String(wb.e3dc_device_family || 'unknown').toLowerCase();
+            const backend = String(wb.e3dc_control_backend || 'status_only').toLowerCase();
+            const familyLabel = familyLabels[family] || familyLabels.unknown;
+            const runtimeBackendLabel = String(wb.e3dc_backend_label || '');
+            const backendLabel = backend === 'wbchar6_compat' || backend === 'status_only'
+                ? backendLabels[backend]
+                : String(runtimeBackendLabel || backendLabels[backend] || backendLabels.status_only);
+            const parts = [
+                familyLabel,
+                wb.firmware_version ? ('Firmware ' + String(wb.firmware_version)) : '',
+                wb.e3dc_rscp_wallbox_type !== null && wb.e3dc_rscp_wallbox_type !== undefined
+                    ? ('beobachteter RSCP-Typ ' + String(wb.e3dc_rscp_wallbox_type)) : '',
+                wb.e3dc_direct_readback_complete === true
+                    ? 'Sun/Auto/Abort-Readback vorhanden und typgültig; nur Diagnose'
+                    : 'direkter Readback unvollständig oder nicht frisch',
+                'direkte Schreibausgänge nicht freigegeben (no-send)',
+                backendLabel
+            ].filter(Boolean);
+            return {
+                label: backendLabel,
+                familyLabel,
+                detail: parts.join('\n'),
+                className: backend === 'wbchar6_compat' ? 'text-info' : 'text-muted'
+            };
+        }
+
         function nativeWallboxLooksActive(data) {
             if (!data) return false;
             const status = String(data.status_msg || '').toLowerCase();
@@ -3764,10 +3876,21 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
 
         const nativeWallboxEnabled = <?= $nativeWallboxStatusEnabled ? 'true' : 'false' ?>;
         function setNativeWallboxColumnsVisible(visible) {
+            const shouldShow = nativeWallboxEnabled && visible === true;
             const col2 = document.getElementById('wb-native-col2');
             const col3 = document.getElementById('wb-native-col3');
-            if (col2) col2.style.display = visible ? 'flex' : 'none';
-            if (col3) col3.style.display = visible ? 'flex' : 'none';
+            [col2, col3].forEach(col => {
+                if (!col) return;
+                col.hidden = !shouldShow;
+                col.setAttribute('aria-hidden', shouldShow ? 'false' : 'true');
+                col.classList.toggle('d-none', !shouldShow);
+                col.classList.toggle('d-flex', shouldShow);
+                if (shouldShow) {
+                    col.style.removeProperty('display');
+                } else {
+                    col.style.setProperty('display', 'none', 'important');
+                }
+            });
         }
 
         async function updateNativeWallboxBanner() {
@@ -3780,7 +3903,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                 const response = await fetch('ramdisk/wallbox_native.json?t=' + new Date().getTime());
                 let hideWallboxData = false;
                 let data = {};
-                
+
                 if (!response.ok) {
                     hideWallboxData = true;
                 } else {
@@ -3796,7 +3919,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                 } else if (!hideWallboxData) {
                     data = smoothNativeWallboxData(data);
                 }
-                
+
                 // Kachel-Sichtbarkeit wird vom Storage Manager Update gesteuert.
                 // Hier blenden wir nur die Wallbox-spezifischen Spalten aus/ein.
                 if (hideWallboxData) {
@@ -3804,7 +3927,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                     return;
                 }
                 setNativeWallboxColumnsVisible(true);
-                
+
                 // Kachel einblenden
                 const wbAlert = document.getElementById('wb-native-alert');
                 if(wbAlert.style.display === 'none') {
@@ -3813,7 +3936,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                     wbAlert.style.opacity = 0;
                     setTimeout(() => { wbAlert.style.transition = 'opacity 0.5s'; wbAlert.style.opacity = 1; }, 50);
                 }
-                
+
                 // Werte einfügen
                 const wbDetails = Array.isArray(data.wb_details) ? data.wb_details : [];
                 const wbCount = wbDetails.length > 1 ? wbDetails.length : ((data.wb2 !== undefined || data.is_external_wb2) ? 2 : 1);
@@ -3919,11 +4042,23 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                 if (wbCountEl) wbCountEl.textContent = wbCount + ' WB';
                 const wbAmpLabelEl = document.getElementById('wb-native-amp-label');
                 const wbAmpEl = document.getElementById('wb-native-amp');
-                const wbAmpLabel = wbDisplayAmp > 0 ? 'Regel-Soll' : 'Soll-Strom';
+                const wbAmpUnitEl = document.getElementById('wb-native-amp-unit');
+                const typedTargetPowerW = Math.max(0, parseFloat(data.set_power_w || 0));
+                const typedPhaseAmp = Array.isArray(data.set_phase_amp) ? data.set_phase_amp.map(v => parseFloat(v || 0)) : null;
+                const multiPowerDisplay = wbCount > 1 && typedTargetPowerW > 0;
+                const wbAmpLabel = multiPowerDisplay ? 'Sollleistung' : (wbDisplayAmp > 0 ? 'Regel-Soll' : 'Soll-Strom');
                 const wbAmpTitleParts = [];
                 if (wbCount > 1) {
-                    wbAmpTitleParts.push('Regel-Soll aktiver Wallboxen: ' + fmtAmp(wbActiveAmp, wbDisplayPrecision) + ' A');
-                    wbAmpTitleParts.push('Freigaben gesamt: ' + fmtAmp(wbOfferedAmp, wbDisplayPrecision) + ' A');
+                    wbAmpRows.forEach(wb => {
+                        const phaseLabel = wb.phases > 0 ? wb.phases + 'p' : '?p';
+                        wbAmpTitleParts.push('WB' + wb.id + ': ' + fmtAmp(wb.displaySetAmp, wb.precision) + ' A × ' + phaseLabel + ' · ' + (wb.power / 1000).toFixed(1) + ' kW');
+                    });
+                    wbAmpTitleParts.push('Sollleistung gesamt: ' + (typedTargetPowerW / 1000).toFixed(1) + ' kW');
+                    if (typedPhaseAmp && typedPhaseAmp.length === 3) {
+                        wbAmpTitleParts.push('Phasenvektor am Netzpunkt: L1 ' + fmtAmp(typedPhaseAmp[0], 1) + ' / L2 ' + fmtAmp(typedPhaseAmp[1], 1) + ' / L3 ' + fmtAmp(typedPhaseAmp[2], 1) + ' A');
+                    } else {
+                        wbAmpTitleParts.push('Phasenvektor: 1p-Zuordnung noch nicht gebunden');
+                    }
                     if (wbActiveCapAmp > 0) {
                         wbAmpTitleParts.push('Regel-Cap aktiver Wallboxen: ' + fmtAmp(wbActiveCapAmp) + ' A');
                     }
@@ -3934,7 +4069,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                         wbAmpTitleParts.push('Davon Startfreigabe ohne echte Ladeleistung: ' + fmtAmp(wbStartReleaseAmp, wbDisplayPrecision) + ' A');
                     }
                     if (wbFineAmpLabel) wbAmpTitleParts.push('0,1-A-Feinregelung aktiv: ' + wbFineAmpLabel);
-                    wbAmpTitleParts.push('Ampere sind Regel-Sollwerte/Freigaben, nicht die gemessene kW-Wirkleistung.');
+                    wbAmpTitleParts.push('Ein- und dreiphasige Ampere werden nicht skalar addiert.');
                 } else if (wbFineAmpLabel) {
                     wbAmpTitleParts.push('0,1-A-Feinregelung aktiv: ' + wbFineAmpLabel);
                 }
@@ -3942,11 +4077,17 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                     wbAmpLabelEl.textContent = wbAmpLabel;
                     wbAmpLabelEl.title = wbAmpTitleParts.join('\n');
                 }
-                document.getElementById('wb-native-type').textContent = wbCount > 1 ? `Multi (${wbCount} WB)` : (data.wb_type || 'Wallbox');
+                const e3dcInfo = nativeWallboxE3dcInfo(wbDetails);
+                document.getElementById('wb-native-type').textContent = wbCount > 1
+                    ? `Multi (${wbCount} WB)`
+                    : (e3dcInfo.familyLabel || data.wb_type || 'Wallbox');
                 if (wbAmpEl) {
-                    wbAmpEl.textContent = fmtAmp(wbDisplayAmp, wbDisplayPrecision);
+                    wbAmpEl.textContent = multiPowerDisplay
+                        ? (typedTargetPowerW / 1000).toFixed(1)
+                        : fmtAmp(wbDisplayAmp, wbDisplayPrecision);
                     wbAmpEl.title = wbAmpTitleParts.join('\n');
                 }
+                if (wbAmpUnitEl) wbAmpUnitEl.textContent = multiPowerDisplay ? 'kW' : 'A';
                 const wbNativeStatusEl = document.getElementById('wb-native-status');
                 if (wbNativeStatusEl) {
                     const nativeOperatorHint = data.operator_hint || data.status_msg || 'Bereit';
@@ -3971,7 +4112,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                     wbNativeStatusEl.className = nativeHintClasses[nativeHintLevel] || nativeHintClasses.info;
                     const statusDetailEl = document.getElementById('wb-native-status-detail');
                     if (statusDetailEl) {
-                        const wallboxType = wbCount > 1 ? `Multi (${wbCount} WB)` : (data.wb_type || 'Wallbox');
+                        const wallboxType = wbCount > 1 ? `Multi (${wbCount} WB)` : (e3dcInfo.familyLabel || data.wb_type || 'Wallbox');
                         const controlInfo = nativeWallboxControlInfo(data, wbDetails);
                         const rscpInfo = nativeWallboxRscpInfo(data, wbDetails);
                         const controlHtml = controlInfo.label
@@ -3983,12 +4124,15 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                         const rscpHtml = rscpInfo.label
                             ? ' | <span class="' + rscpInfo.className + '">' + escapeHtmlText(rscpInfo.label) + '</span>'
                             : '';
+                        const e3dcHtml = e3dcInfo.label
+                            ? ' | <span class="' + e3dcInfo.className + '">' + escapeHtmlText(e3dcInfo.label) + '</span>'
+                            : '';
                         const priorityHtml = wbPriorityLabel
                             ? ' · <span class="' + (wbPriorityMode ? 'text-info fw-bold' : 'text-muted') + '">' + escapeHtmlText(wbPriorityLabel) + '</span>'
                             : '';
                         statusDetailEl.innerHTML = '<i class="fas fa-charging-station text-warning me-1" style="font-size:0.65rem;"></i><span id="wb-native-type">' + escapeHtmlText(wallboxType) + '</span>' + priorityHtml + (nativeStatusDetail ? ' · ' + escapeHtmlText(nativeStatusDetail) : '') + controlHtml;
-                        statusDetailEl.innerHTML += floorHtml + rscpHtml;
-                        statusDetailEl.title = [nativeOperatorHint, wbFloorNote, controlInfo.detail, rscpInfo.detail].filter(Boolean).join('\n');
+                        statusDetailEl.innerHTML += floorHtml;
+                        statusDetailEl.title = [nativeOperatorHint, wbFloorNote, e3dcInfo.detail, controlInfo.detail, rscpInfo.detail].filter(Boolean).join('\n');
                     }
                 }
 
@@ -4111,7 +4255,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                         kvaEl.style.display = 'none';
                     }
                 }
-                
+
                 // Pulsation basierend auf Lade-Satus
                 const pulseEl = document.getElementById('wb-native-pulse');
                 if(data.charging_active) {
@@ -4121,7 +4265,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                     pulseEl.className = "rounded-circle me-3";
                     pulseEl.style.background = data.connected ? "#f39c12" : "#6c757d"; // Orange (warten) oder Grau (nicht verbunden)
                 }
-                
+
                 // Multi-Wallbox Details anzeigen, falls vorhanden
                 const multiDiv = document.getElementById('wb-native-multi-details');
                 if(wbDetails.length > 1) {
@@ -4135,18 +4279,40 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                         const curPrioEl = document.getElementById('wb-native-'+wb.id+'-priority');
                         const stateBaseText = String(wb.state || 'Idle');
                         let stateText = stateBaseText;
-                        const phaseWaitS = parseInt(wb.openwb_pro_session_phase_wait_remaining_s || 0, 10);
+                        const transition = wb.transition_state && typeof wb.transition_state === 'object' ? wb.transition_state : {};
+                        const transitionStage = String(transition.state || 'idle').toLowerCase();
+                        const transitionTarget = parseInt(transition.target_phases || 0, 10);
+                        const transitionRemainingS = Math.max(0, Math.ceil(parseFloat(transition.remaining_s || 0)));
+                        const transitionLabels = {
+                            await_budget: 'wartet auf Leistungsbudget',
+                            ramp_to_zero: 'Strom wird auf 0 A reduziert',
+                            zero_settle: '0-A-Beruhigungszeit',
+                            set_phase: 'Phasenziel wird gesetzt',
+                            cp_interrupt: 'CP-Unterbrechung',
+                            restart_delay: 'Wiederanlauf-Wartezeit',
+                            confirm_target: 'Zielphasen werden bestätigt',
+                            recovery_hold: 'sicherer Wiederanlauf nach Neustart',
+                            fault: 'Störung'
+                        };
+                        const transitionActive = Object.prototype.hasOwnProperty.call(transitionLabels, transitionStage);
                         const stopS = parseInt(wb.openwb_pro_session_stop_remaining_s || 0, 10);
                         const startHoldS = parseInt(wb.openwb_pro_session_start_hold_remaining_s || 0, 10);
                         const wakeupS = parseInt(wb.openwb_pro_session_wakeup_remaining_s || 0, 10);
-                        if (phaseWaitS > 0) {
-                            stateText += ` (Umschaltung ${phaseWaitS}s)`;
+                        if (transitionActive) {
+                            const direction = transitionTarget > 0 ? ` → ${transitionTarget}p` : '';
+                            const countdown = transitionRemainingS > 0 ? ` · ${transitionRemainingS}s` : '';
+                            stateText = `Phasenwechsel${direction}: ${transitionLabels[transitionStage]}${countdown}`;
                         } else if (wakeupS > 0) {
                             stateText += ` (Wake-up ${wakeupS}s)`;
                         } else if (startHoldS > 0) {
                             stateText += ` (Start-Sperre ${startHoldS}s)`;
                         } else if (stopS > 0 && (stateBaseText.toLowerCase().includes('stopp') || stateBaseText.toLowerCase().includes('stop'))) {
                             stateText += ` (Stopp-Sperre ${stopS}s)`;
+                        }
+                        const phaseCooldown = wb.phase_cooldown && typeof wb.phase_cooldown === 'object' ? wb.phase_cooldown : {};
+                        const cooldownS = Math.max(0, Math.ceil(parseFloat(phaseCooldown.remaining_s || 0)));
+                        if (!transitionActive && phaseCooldown.active === true && cooldownS > 0) {
+                            stateText += ` · Phasensperre ${cooldownS}s`;
                         }
                         const stateLevel = String(wb.state_level || '').toLowerCase();
                         const controlLabel = String(wb.control_label || '');
@@ -4204,8 +4370,8 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                 } else {
                     multiDiv.classList.add('d-none');
                 }
-                
-                
+
+
             } catch (error) {
                 if (nativeWallboxDisplayCache && (Date.now() - nativeWallboxDisplayCache.seenMs < nativeWallboxHoldMs)) {
                     return;
@@ -4214,7 +4380,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                 setNativeWallboxColumnsVisible(false);
             }
         }
-        
+
         // Polling alle 5 Sekunden (analog zum Dashboard)
         if(document.getElementById('wb-native-alert')) {
             setInterval(updateNativeWallboxBanner, 5000);

@@ -74,6 +74,7 @@ APPROVED_STALE_DELETE_FILES = frozenset({
     "/var/www/html/reorder.py",
     "/var/www/html/ramdisk/bluelink_debug.json",
     "/var/www/html/data/morning_boost_state.json",
+    "/var/www/html/assets/vendor/ASSET_PROVENANCE.json",
 })
 APPROVED_STALE_DELETE_DIRS = frozenset({"/var/www/html/app"})
 
@@ -753,22 +754,107 @@ def _prepare_webroot_dirs() -> None:
     run_command("sudo mkdir -p /var/www/html/data /var/www/html/logs /var/www/html/ramdisk /var/www/html/tmp", timeout=20)
 
 
-def _fix_webroot_permissions() -> None:
+def _aux_inverter_migration_backup_structure_safe(path: str) -> bool:
+    if not os.path.lexists(path):
+        return True
+    try:
+        root_stat = os.lstat(path)
+        if stat.S_ISLNK(root_stat.st_mode) or not stat.S_ISDIR(root_stat.st_mode):
+            return False
+        for directory, dirnames, filenames in os.walk(path, topdown=True, followlinks=False):
+            for name in dirnames:
+                metadata = os.lstat(os.path.join(directory, name))
+                if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                    return False
+            for name in filenames:
+                metadata = os.lstat(os.path.join(directory, name))
+                if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+                    return False
+        return True
+    except OSError:
+        return False
+
+
+def _verify_aux_inverter_migration_backup_modes(path: str) -> bool:
+    if not _aux_inverter_migration_backup_structure_safe(path):
+        return False
+    if not os.path.lexists(path):
+        return True
+    if stat.S_IMODE(os.lstat(path).st_mode) != 0o700:
+        return False
+    for directory, dirnames, filenames in os.walk(path, topdown=True, followlinks=False):
+        if stat.S_IMODE(os.lstat(directory).st_mode) != 0o700:
+            return False
+        for name in dirnames:
+            if stat.S_IMODE(os.lstat(os.path.join(directory, name)).st_mode) != 0o700:
+                return False
+        for name in filenames:
+            if stat.S_IMODE(os.lstat(os.path.join(directory, name)).st_mode) != 0o600:
+                return False
+    return True
+
+
+def _harden_aux_inverter_migration_backups(path: str) -> bool:
+    if not os.path.lexists(path):
+        return True
+    if not _aux_inverter_migration_backup_structure_safe(path):
+        return False
+    quoted = shlex.quote(path)
+    commands = (
+        f"sudo chmod 700 {quoted}",
+        f"sudo find -P {quoted} -type d -exec chmod 700 {{}} +",
+        f"sudo find -P {quoted} -type f -exec chmod 600 {{}} +",
+    )
+    for command in commands:
+        result = run_command(command, timeout=10)
+        if not isinstance(result, dict) or not result.get("success"):
+            return False
+    return _verify_aux_inverter_migration_backup_modes(path)
+
+
+def _fix_webroot_permissions() -> bool:
     install_user = shlex.quote(get_install_user())
     secret_file_mode = config_secret_file_mode_text()
     secret_dir_mode = config_secret_dir_mode_text()
     repo_v4_config = shlex.quote(os.path.join(get_install_path(), "data", "e3dc_v4.json"))
+    web_backup_dir = "/var/www/html/data/config_backups"
+    repo_backup_dir = os.path.join(get_install_path(), "data", "config_backups")
     run_command(f"sudo usermod -aG www-data {install_user} 2>/dev/null || true", timeout=10)
     run_command(f"sudo chown -R {install_user}:www-data /var/www/html", timeout=60)
-    run_command("sudo find /var/www/html -type d -exec chmod 775 {} +", timeout=60)
-    run_command("sudo find /var/www/html -type f -exec chmod 664 {} +", timeout=60)
+    run_command(
+        "sudo find -P /var/www/html -xdev "
+        "\\( -path /var/www/html/data/e3dc_v4.json -o -path /var/www/html/data/config_backups \\) -prune -o "
+        "-type d -exec chmod 775 {} +",
+        timeout=60,
+    )
+    run_command(
+        "sudo find -P /var/www/html -xdev "
+        "\\( -path /var/www/html/data/e3dc_v4.json -o -path /var/www/html/data/config_backups \\) -prune -o "
+        "-type f -exec chmod 664 {} +",
+        timeout=60,
+    )
     run_command("sudo chmod 2775 /var/www/html/data /var/www/html/logs /var/www/html/ramdisk /var/www/html/tmp 2>/dev/null || true", timeout=10)
     run_command(f"sudo chmod {secret_file_mode} /var/www/html/data/e3dc_v4.json 2>/dev/null || true", timeout=5)
     run_command(f"sudo chmod {secret_file_mode} {repo_v4_config} 2>/dev/null || true", timeout=5)
-    run_command(f"sudo chmod {secret_dir_mode} /var/www/html/data/config_backups 2>/dev/null || true", timeout=5)
-    run_command(f"sudo find /var/www/html/data/config_backups -type d -exec chmod {secret_dir_mode} {{}} + 2>/dev/null || true", timeout=10)
-    run_command(f"sudo find /var/www/html/data/config_backups -type f -name 'e3dc_v4*' -exec chmod {secret_file_mode} {{}} + 2>/dev/null || true", timeout=10)
+    for raw_backup_dir in (web_backup_dir, repo_backup_dir):
+        raw_migration_dir = os.path.join(raw_backup_dir, "aux_inverter_migration")
+        config_backup_dir = shlex.quote(raw_backup_dir)
+        migration_backup_dir = shlex.quote(raw_migration_dir)
+        run_command(f"sudo chmod {secret_dir_mode} {config_backup_dir} 2>/dev/null || true", timeout=5)
+        run_command(
+            f"sudo find -P {config_backup_dir} -path {migration_backup_dir} -prune -o "
+            f"-type d -exec chmod {secret_dir_mode} {{}} + 2>/dev/null || true",
+            timeout=10,
+        )
+        run_command(
+            f"sudo find -P {config_backup_dir} -path {migration_backup_dir} -prune -o "
+            f"-type f -exec chmod {secret_file_mode} {{}} + 2>/dev/null || true",
+            timeout=10,
+        )
+        if not _harden_aux_inverter_migration_backups(raw_migration_dir):
+            raise RuntimeError("Zusatz-WR-Migrationsbackups konnten nicht sicher gehärtet werden")
     run_command("sudo chmod 664 /var/www/html/ramdisk/value_filter.json 2>/dev/null || true", timeout=5)
+    return True
 
 
 def _send_telegram(message: str):
@@ -1372,9 +1458,9 @@ def _stop_v4_services(services=None):
     except Exception as exc:
         print(f"  [!] Service-Katalog nicht lesbar: {exc}")
         return False
-    for srv in _normalize_restart_services(services):
-        if srv not in all_names and srv not in {"piguard", "e3dc"}:
-            errors.append(f"Nicht katalogisierter Stop-Dienst: {srv}")
+    for name in _normalize_restart_services(services):
+        if name not in all_names and name not in {"piguard", "e3dc"}:
+            errors.append(f"Nicht katalogisierter Stop-Dienst: {name}")
     for srv in (*all_names, "piguard", "e3dc"):
         if _service_unit_exists(srv):
             res = run_command(f'sudo systemctl stop {srv}', timeout=15)
@@ -1853,30 +1939,8 @@ def _sync_release_web(repo_dir: str, policy: dict) -> None:
     if not repair_legacy_paths_file():
         raise RuntimeError("Legacy-Pfadvertrag konnte nicht repariert werden")
     if not policy.get("run_permissions", True):
-        _fix_webroot_permissions()
-
-
-def _install_runtime_logging_policy(repo_dir: str) -> None:
-    """Install the versioned journald and logrotate policy from the target tree."""
-    journald_source = os.path.join(
-        repo_dir, "Installer", "systemd", "20-e3dc-control-limits.conf"
-    )
-    logrotate_source = os.path.join(repo_dir, "Installer", "logrotate", "e3dc-control")
-    for source, target in (
-        (journald_source, "/etc/systemd/journald.conf.d/20-e3dc-control-limits.conf"),
-        (logrotate_source, "/etc/logrotate.d/e3dc-control"),
-    ):
-        if not os.path.isfile(source) or os.path.islink(source):
-            raise RuntimeError(f"Release-Loggingdatei fehlt oder ist Symlink: {source}")
-        result = _run_argv(["sudo", "install", "-D", "-m", "0644", source, target], timeout=15)
-        if not result["success"]:
-            raise RuntimeError(f"Runtime-Loggingdatei konnte nicht installiert werden: {target}")
-    reload_result = _run_argv(
-        ["sudo", "systemctl", "kill", "-s", "HUP", "systemd-journald.service"],
-        timeout=15,
-    )
-    if not reload_result["success"]:
-        raise RuntimeError("journald-Laufzeitlimit konnte nicht neu geladen werden")
+        if _fix_webroot_permissions() is not True:
+            raise RuntimeError("Webroot-Rechtehärtung fehlgeschlagen")
 
 
 def _restore_legacy_runtime_state(state: TransitionState) -> bool:
@@ -1929,7 +1993,6 @@ def _recover_failed_transition(
         )
         restore_verified_backup(backup_dir, install_path=repo_dir)
         _restore_recovery_surface(recovery_inventory, state)
-        _install_runtime_logging_policy(repo_dir)
         from .permissions import harden_web_program_permissions
         if not harden_web_program_permissions():
             raise RuntimeError("Web-Programmrechte konnten nach Recovery nicht gehaertet werden")
@@ -2120,7 +2183,6 @@ def update_e3dc(
             raise RuntimeError("Stale-Delete-Positivliste verletzt: " + "; ".join(delete_errors))
 
         _sync_release_web(repo_dir, policy)
-        _install_runtime_logging_policy(repo_dir)
 
         if policy.get("run_permissions", True):
             from .permissions import run_permissions_wizard
@@ -2156,7 +2218,7 @@ def update_e3dc(
             raise RuntimeError(f"Boot-Sanitycheck konnte nicht ausgefuehrt werden: {exc}") from exc
         if not boot_ok:
             _stop_v4_services(restart_services)
-            raise RuntimeError("Boot-Sanitycheck meldet Auffaelligkeiten; Gate fehlgeschlagen")
+            raise RuntimeError("Boot-Sanity-Gate fehlgeschlagen")
 
         _verify_transition_state(state)
         run_initial_forecast(os.path.join(repo_dir, "Installer"))
@@ -2235,11 +2297,8 @@ def run_initial_forecast(installer_dir: str | None = None):
          privaten Manifest-/Hashvertrag. Fehlt er, wird aus nicht ausfuehrbaren
          lokalen Trainingsdaten neu trainiert; sonst bleibt der Fallback aktiv.
 
-    NICHT ausgefuehrt:
-      - pv_evaluator.py: Braucht echten PV-Ertrag vom laufenden Tag.
-        Verfaelscht Modell-Gewichte wenn heute noch kein Ertrag da ist.
-        Wird automatisch vom weather-manager taeglich aufgerufen.
-      - Ein Legacy-Pickle wird niemals geladen oder uebernommen.
+    NICHT ausgeführt:
+      - Ein Legacy-Pickle wird niemals geladen oder übernommen.
     """
     # In Docker: kein direkter Script-Aufruf noetig (Service startet selbst)
     if os.path.exists('/.dockerenv'):
@@ -2346,4 +2405,3 @@ def update_menu():
 # Im Docker-Container kein Update-Menueintrag
 if not os.path.exists('/.dockerenv'):
     register_command('11', 'Installation / Update', update_menu, sort_order=11)
-

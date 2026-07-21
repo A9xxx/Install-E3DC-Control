@@ -40,8 +40,9 @@ Die Installation erfolgt bequem über den zentralen Installer.
 
 1.  Starte den Installer auf dem Raspberry Pi:
     ```bash
-    cd ~/Install
-    sudo python3 installer_main.py
+    export E3DC_INSTALL_PATH="/absoluter/pfad/zur/installation"
+    test -f "$E3DC_INSTALL_PATH/e3dc-setup"
+    bash "$E3DC_INSTALL_PATH/e3dc-setup"
     ```
 
 2.  Wähle im Hauptmenü unter **Erweiterungen** den Punkt:
@@ -142,7 +143,7 @@ selbst, wird der externe Auftrag freigegeben.
 
 ## 6. Dateistruktur
 
-Die Dateien befinden sich im Ordner `~/Install/Installer/luxtronik/`:
+Die Dateien befinden sich unter `$E3DC_INSTALL_PATH/Installer/luxtronik/`:
 
 *   `energy_manager.py`: Das Haupt-Steuerungsskript (Python).
 *   `luxtronik.py`: Hilfsdatei für die Modbus-Kommunikation.

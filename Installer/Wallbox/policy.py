@@ -39,7 +39,10 @@ CONTROL_MODE_PARAMS: Dict[int, Dict[str, Any]] = {
     0: {"bat": False, "band_up": 0.0, "band_dn": 0.0},
     1: {"bat": False, "band_up": 0.0, "band_dn": 0.0},
     2: {"bat": True, "band_up": 2.0, "band_dn": 2.0},
-    3: {"bat": True, "band_up": 3.0, "band_dn": 4.0},
+    # PV-Kurve nutzt im stationären Sollwert nur das PV-/Ladekurvenbudget.
+    # Kurze Batteriestützung gegen Wolken- und Messwerttransienten wird
+    # getrennt, zeit- und energiebegrenzt im PV-Hybrid-Gate behandelt.
+    3: {"bat": False, "band_up": 3.0, "band_dn": 4.0},
     4: {"bat": True, "band_up": 3.0, "band_dn": 0.0},
     5: {"bat": True, "band_up": 3.0, "band_dn": 4.0, "eco": True},
     6: {"bat": True, "band_up": 3.0, "band_dn": 4.0, "base_6a": True},
@@ -570,11 +573,33 @@ def decide_energy_policy(ctx: EnergyPolicyInput) -> Dict[str, Any]:
             _safe_float(ctx.raw_iaval_w, 0.0),
             _safe_float(ctx.free_for_limbs_w, 0.0),
         )
-    openwb_pro_curve_direct_real_pv_w = max(
+    openwb_pro_curve_direct_candidate_w = max(
         0.0,
+        wb_actual
+        + _safe_float(ctx.grid_export_room_w, 0.0)
+        - _safe_float(ctx.grid_import_for_budget_w, 0.0),
         _safe_float(ctx.pv_surplus_ex_wb_w, 0.0),
         openwb_pro_curve_direct_grid_pv_w,
         openwb_pro_curve_direct_storage_pv_w,
+    )
+    # Netzpunkt und Storage-Budget können eine bereits laufende, vom Akku
+    # gestützte Wallbox wie PV-Überschuss aussehen lassen. Der stationäre
+    # openWB-Pro-Sollwert darf deshalb höchstens das batterieneutral belegte
+    # Gesamtbudget halten: aktuelle WB-Leistung nach Abzug der gemessenen
+    # Batterieentladung oder PV abzüglich Hauslast und Netzreserve. Ein kurzer
+    # Übergangspuffer bleibt ausschließlich dem PV-Hybrid-Gate vorbehalten.
+    openwb_pro_curve_direct_battery_neutral_w = max(
+        0.0,
+        _safe_float(ctx.pv_only_allowed_w, 0.0),
+        _safe_float(ctx.pv_surplus_ex_wb_w, 0.0),
+    )
+    openwb_pro_curve_direct_real_pv_w = min(
+        openwb_pro_curve_direct_candidate_w,
+        openwb_pro_curve_direct_battery_neutral_w,
+    )
+    openwb_pro_curve_direct_battery_clamp_active = bool(
+        openwb_pro_curve_direct_candidate_w
+        > openwb_pro_curve_direct_real_pv_w + 1.0
     )
     openwb_pro_curve_direct_pv_start_ready = bool(
         openwb_pro_curve_direct_real_pv_w >= openwb_pro_curve_direct_start_min_w
@@ -609,13 +634,7 @@ def decide_energy_policy(ctx: EnergyPolicyInput) -> Dict[str, Any]:
     )
     openwb_pro_curve_direct_w = 0.0
     if openwb_pro_curve_direct_active:
-        openwb_pro_curve_direct_w = max(
-            0.0,
-            wb_actual
-            + _safe_float(ctx.grid_export_room_w, 0.0)
-            - _safe_float(ctx.grid_import_for_budget_w, 0.0),
-            openwb_pro_curve_direct_real_pv_w,
-        )
+        openwb_pro_curve_direct_w = openwb_pro_curve_direct_real_pv_w
         allowed_w = min(max_phys_wb_w, openwb_pro_curve_direct_w)
 
     grid_import_budget_clamp_active = bool(
@@ -671,6 +690,17 @@ def decide_energy_policy(ctx: EnergyPolicyInput) -> Dict[str, Any]:
         "openwb_pro_curve_direct_w": max(0.0, float(openwb_pro_curve_direct_w)),
         "openwb_pro_curve_direct_pv_start_ready": bool(openwb_pro_curve_direct_pv_start_ready),
         "openwb_pro_curve_direct_real_pv_w": max(0.0, float(openwb_pro_curve_direct_real_pv_w)),
+        "openwb_pro_curve_direct_candidate_w": max(
+            0.0,
+            float(openwb_pro_curve_direct_candidate_w),
+        ),
+        "openwb_pro_curve_direct_battery_neutral_w": max(
+            0.0,
+            float(openwb_pro_curve_direct_battery_neutral_w),
+        ),
+        "openwb_pro_curve_direct_battery_clamp_active": bool(
+            openwb_pro_curve_direct_battery_clamp_active
+        ),
         "openwb_pro_curve_direct_start_min_w": max(0.0, float(openwb_pro_curve_direct_start_min_w)),
         "openwb_pro_curve_direct_storage_soft_release": bool(openwb_pro_curve_direct_storage_soft_release),
         "openwb_pro_curve_direct_direct_marketing_block": bool(dm_blocks_direct),

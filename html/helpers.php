@@ -1097,7 +1097,7 @@ function handleSystemLog() {
         requireWebAuth(true);
         header('Content-Type: text/plain; charset=utf-8');
         $logType = $_GET['log'] ?? '';
-        
+
         $logFiles = [
             'storage_manager'=> '/var/www/html/logs/storage_manager.log',
             'storage_simulator'=> '/var/www/html/logs/storage_simulator.log',
@@ -1122,7 +1122,7 @@ function handleSystemLog() {
             }
             exit;
         }
-        
+
         if ($logType === 'watchtower') {
             if (file_exists('/.dockerenv')) {
                 echo "Das System läuft in Docker.\n\nDas Watchtower-Log (Auto-Updater) kann über die Konsole des Hosts abgerufen werden:\n";
@@ -1227,10 +1227,28 @@ function handleSystemLog() {
                 if ($data) {
                     echo "--- Wärmepumpe Status & Diagnose ---\n\n";
                     echo "Quelle: " . basename($file) . "\n";
-                    echo "Letztes Update: " . (!empty($data['ts']) ? date('d.m.Y H:i:s', strtotime($data['ts'])) : 'Unbekannt') . "\n";
-                    echo "Verbindung: " . (!empty($data['success']) ? "Erfolgreich" : "FEHLGESCHLAGEN") . "\n";
+                    $wpTimestamp = null;
+                    $wpTimestampRaw = $data['ts'] ?? null;
+                    if (is_numeric($wpTimestampRaw)) {
+                        $wpTimestamp = (float)$wpTimestampRaw;
+                        if ($wpTimestamp > 100000000000.0) {
+                            $wpTimestamp /= 1000.0;
+                        }
+                        $wpTimestamp = $wpTimestamp > 0 ? (int)floor($wpTimestamp) : null;
+                    } elseif (is_string($wpTimestampRaw) && trim($wpTimestampRaw) !== '') {
+                        $parsedWpTimestamp = strtotime($wpTimestampRaw);
+                        $wpTimestamp = $parsedWpTimestamp !== false ? (int)$parsedWpTimestamp : null;
+                    }
+                    echo "Letztes Update: " . ($wpTimestamp !== null ? date('d.m.Y H:i:s', $wpTimestamp) : 'Unbekannt') . "\n";
+                    if (array_key_exists('success', $data)) {
+                        echo "Verbindung: " . (!empty($data['success']) ? "Erfolgreich" : "FEHLGESCHLAGEN") . "\n";
+                    } elseif (!empty($data['error'])) {
+                        echo "Verbindung: FEHLER GEMELDET\n";
+                    } else {
+                        echo "Verbindung: Statusdaten vorhanden; kein separates Erfolgsfeld gemeldet\n";
+                    }
                     if (!empty($data['error'])) echo "System-Meldung: " . $data['error'] . "\n";
-                    
+
                     // Fehlerhistorie aus RAM-Disk (ws_data_error.json)
                     $wsErrFile = '/var/www/html/ramdisk/ws_data_error.json';
                     if (file_exists($wsErrFile)) {
@@ -1316,7 +1334,7 @@ function handleSystemLog() {
 
 /**
  * Prüft den Dateizugriff und zeigt eine benutzerfreundliche Fehlermeldung
- * 
+ *
  * @param string $path Dateipfad
  * @param string $operation 'read', 'write', or 'exists'
  * @return bool|string true bei Erfolg, oder HTML mit Fehlermeldung
@@ -1346,7 +1364,7 @@ function checkFileAccess($path, $operation = 'read') {
     if ($operation === 'write' && !is_writable($path)) {
         $parent = dirname($path);
         $isParentWritable = is_writable($parent) ? "ja" : "nein";
-        
+
         return errorMessage(
             "Schreibberechtigung fehlt",
             "Die Datei <code>" . htmlspecialchars($path) . "</code> kann nicht geschrieben werden. " .
@@ -1358,7 +1376,7 @@ function checkFileAccess($path, $operation = 'read') {
         if (!@mkdir($path, 0755, true)) {
             return errorMessage(
                 "Verzeichnis konnte nicht erstellt werden",
-                "Das Verzeichnis <code>" . htmlspecialchars($path) . 
+                "Das Verzeichnis <code>" . htmlspecialchars($path) .
                 "</code> existiert nicht und konnte nicht erstellt werden."
             );
         }
@@ -1382,45 +1400,105 @@ function errorMessage($title, $details = '') {
 
 // ==================== INSTALL PATH ====================
 
+/** Liest eine kleine reguläre JSON-Metadatendatei; symbolische Links sind keine Autorität. */
+function e3dcReadPathMetadata($file) {
+    if (!is_string($file) || $file === '' || !is_file($file) || is_link($file) || !is_readable($file)) {
+        return [];
+    }
+    $size = @filesize($file);
+    if ($size === false || $size < 2 || $size > 1048576) return [];
+    $data = @json_decode((string)@file_get_contents($file), true);
+    if (!is_array($data)) return [];
+    if (isset($data['config']) && is_array($data['config'])) {
+        $nested = $data['config'];
+        unset($data['config']);
+        $data = array_replace($nested, $data);
+    }
+    return $data;
+}
+
+/** Prüft einen bestehenden Produktstamm anhand expliziter oder persistierter Autorität. */
+function e3dcValidatedProductRoot($candidate) {
+    $candidate = trim((string)$candidate);
+    if ($candidate === '' || !str_starts_with($candidate, '/') || strpos($candidate, "\0") !== false) return null;
+    $resolved = @realpath($candidate);
+    if ($resolved === false || !is_dir($resolved)) return null;
+    foreach (['VERSION', 'installer_main.py', 'Installer/installer_config.py'] as $marker) {
+        if (!is_file($resolved . '/' . $marker)) return null;
+    }
+    return rtrim($resolved, '/');
+}
+
+function e3dcInvalidInstallPaths($reason) {
+    return [
+        'valid' => false,
+        'error' => (string)$reason,
+        'install_user' => '',
+        'install_path' => '',
+        'home_dir' => '',
+        'venv_path' => '',
+    ];
+}
+
 /**
- * Liefert Installationspfade aus e3dc_v4.json (Single Source of Truth).
- * e3dc_paths.json ist obsolet und wird nicht mehr verwendet.
+ * Löst den exakten Release-Stamm aus expliziter Autorität oder Installermetadaten auf.
+ * Benutzerverzeichnisse werden nicht durchsucht; Konto-, Installations- und Venv-Pfade werden nicht geraten.
  */
 function getInstallPaths() {
-    $defaultUser = 'pi';
-    $defaultPath = '/home/pi/Install/';
     $v4File = '/var/www/html/data/e3dc_v4.json';
+    $legacyFile = '/var/www/html/e3dc_paths.json';
+    $v4Data = e3dcReadPathMetadata($v4File);
+    $legacyData = e3dcReadPathMetadata($legacyFile);
+    $metadata = !empty($v4Data['install_path']) ? $v4Data : $legacyData;
 
-    if (is_readable($v4File)) {
-        $data = @json_decode(@file_get_contents($v4File), true);
-        if (is_array($data) && !empty($data['install_path'])) {
-            $path = rtrim($data['install_path'], '/') . '/';
-            return [
-                'install_user' => $data['install_user'] ?? $defaultUser,
-                'install_path' => $path,
-                'home_dir'     => $data['home_dir'] ?? '/home/' . ($data['install_user'] ?? $defaultUser)
-            ];
-        }
+    $explicitRoot = trim((string)(getenv('E3DC_INSTALL_ROOT') ?: ''));
+    $configuredRoot = trim((string)($metadata['install_path'] ?? ''));
+    $sourceRoot = e3dcValidatedProductRoot(dirname(__DIR__));
+    $containerRoot = is_file('/.dockerenv') ? e3dcValidatedProductRoot('/app/pi/Install') : null;
+    $authoritativeRaw = $explicitRoot !== '' ? $explicitRoot : $configuredRoot;
+    if ($authoritativeRaw !== '') {
+        $installRoot = e3dcValidatedProductRoot($authoritativeRaw);
+        if ($installRoot === null) return e3dcInvalidInstallPaths('Installationsmetadaten sind ungültig.');
+    } else {
+        $installRoot = $containerRoot ?: $sourceRoot;
+    }
+    if ($installRoot === null) return e3dcInvalidInstallPaths('Installationskontext fehlt.');
+    if ($sourceRoot !== null && $sourceRoot !== $installRoot) {
+        return e3dcInvalidInstallPaths('Installationsmetadaten und ausgefuehrter Release-Baum widersprechen sich.');
     }
 
-    $legacyFile = '/var/www/html/e3dc_paths.json';
-    if (is_readable($legacyFile)) {
-        $data = @json_decode(@file_get_contents($legacyFile), true);
-        if (is_array($data) && !empty($data['install_path'])) {
-            $path = rtrim($data['install_path'], '/') . '/';
-            $user = $data['install_user'] ?? $defaultUser;
-            return [
-                'install_user' => $user,
-                'install_path' => $path,
-                'home_dir'     => $data['home_dir'] ?? '/home/' . $user
-            ];
-        }
+    $installUser = trim((string)(getenv('E3DC_INSTALL_USER') ?: ($metadata['install_user'] ?? '')));
+    if ($installUser === '' && function_exists('posix_getpwuid')) {
+        $owner = @posix_getpwuid((int)@fileowner($installRoot));
+        if (is_array($owner)) $installUser = trim((string)($owner['name'] ?? ''));
+    }
+    if ($installUser === '' || !preg_match('/^[A-Za-z0-9_.-]+$/', $installUser)) {
+        return e3dcInvalidInstallPaths('Installationsbenutzer fehlt oder ist ungültig.');
+    }
+
+    $homeDir = trim((string)(getenv('E3DC_HOME_DIR') ?: ($metadata['home_dir'] ?? '')));
+    if ($homeDir === '' && function_exists('posix_getpwnam')) {
+        $account = @posix_getpwnam($installUser);
+        if (is_array($account)) $homeDir = trim((string)($account['dir'] ?? ''));
+    }
+    if ($homeDir === '' || !str_starts_with($homeDir, '/') || !is_dir($homeDir)) {
+        return e3dcInvalidInstallPaths('Home-Verzeichnis fehlt oder ist ungültig.');
+    }
+    $homeDir = (string)@realpath($homeDir);
+    if ($homeDir === '') return e3dcInvalidInstallPaths('Home-Verzeichnis ist nicht aufloesbar.');
+
+    $venvPath = trim((string)(getenv('E3DC_VENV_PATH') ?: ($metadata['venv_path'] ?? '')));
+    if ($venvPath !== '' && !str_starts_with($venvPath, '/')) {
+        return e3dcInvalidInstallPaths('Venv-Pfad ist nicht absolut.');
     }
 
     return [
-        'install_user' => $defaultUser,
-        'install_path' => $defaultPath,
-        'home_dir'     => '/home/' . $defaultUser
+        'valid' => true,
+        'error' => '',
+        'install_user' => $installUser,
+        'install_path' => $installRoot . '/',
+        'home_dir' => $homeDir,
+        'venv_path' => $venvPath,
     ];
 }
 
@@ -1436,7 +1514,8 @@ function getInstallPath() {
 function getPythonInterpreter() {
     $paths = getInstallPaths();
     $v4 = @json_decode(@file_get_contents('/var/www/html/data/e3dc_v4.json'), true);
-    $venvName = $v4['venv_name'] ?? '.venv_e3dc';
+    $v4 = is_array($v4) ? $v4 : [];
+    $venvName = trim((string)($v4['venv_name'] ?? ''));
 
     // 1. Expliziter venv_path aus V4 Config
     if (!empty($v4['venv_path']) && file_exists($v4['venv_path'] . '/bin/python3')) {
@@ -1444,8 +1523,10 @@ function getPythonInterpreter() {
     }
 
     // 2. Standard Pfad: home_dir / venv_name
-    $venvPython = rtrim($paths['home_dir'], '/') . '/' . $venvName . '/bin/python3';
-    if (file_exists($venvPython) && is_executable($venvPython)) {
+    $venvPython = !empty($paths['valid']) && $venvName !== ''
+        ? rtrim($paths['home_dir'], '/') . '/' . $venvName . '/bin/python3'
+        : '';
+    if ($venvPython !== '' && file_exists($venvPython) && is_executable($venvPython)) {
         return $venvPython;
     }
 
@@ -1455,6 +1536,185 @@ function getPythonInterpreter() {
     }
 
     return '/usr/bin/python3';
+}
+
+/**
+ * Löst einen explizit konfigurierten Python-Interpreter auf.
+ * Keine PATH-Suche und kein aus POST-Daten zusammengesetzter Pfad.
+ */
+function e3dcGetTrustedPythonInterpreter() {
+    $v4Path = '/var/www/html/data/e3dc_v4.json';
+    $raw = is_readable($v4Path) ? @json_decode((string)@file_get_contents($v4Path), true) : null;
+    $cfg = is_array($raw) ? $raw : [];
+    if (isset($cfg['config']) && is_array($cfg['config'])) {
+        $cfg = array_replace($cfg['config'], $cfg);
+        unset($cfg['config']);
+    }
+
+    $candidates = [];
+    $venvPath = trim((string)($cfg['venv_path'] ?? ''));
+    if ($venvPath !== '' && str_starts_with($venvPath, '/')) {
+        $candidates[] = rtrim($venvPath, '/') . '/bin/python3';
+    }
+    $homeDir = trim((string)($cfg['home_dir'] ?? ''));
+    $venvName = trim((string)($cfg['venv_name'] ?? ''));
+    if ($homeDir !== '' && $venvName !== '' && str_starts_with($homeDir, '/') && strpos($venvName, '/') === false) {
+        $candidates[] = rtrim($homeDir, '/') . '/' . $venvName . '/bin/python3';
+    }
+    if (is_file('/.dockerenv')) {
+        $candidates[] = '/opt/venv/bin/python3';
+    }
+    // Der Systeminterpreter ist ein fester, nicht durch Request-Daten steuerbarer
+    // Kompatibilitätspfad für bestehende v5.3.2a-/v5.3.2b-Installationen ohne venv_path.
+    $candidates[] = '/usr/bin/python3';
+
+    foreach (array_values(array_unique($candidates)) as $candidate) {
+        if (!str_starts_with($candidate, '/') || is_link($candidate) && @realpath($candidate) === false) continue;
+        $resolved = @realpath($candidate);
+        if ($resolved === false || !is_file($resolved) || !is_executable($candidate)) continue;
+        return $candidate;
+    }
+    return null;
+}
+
+/**
+ * Startet ein festes argv ohne Shell und liefert Exitcode, Timeout und Signal
+ * getrennt zurück. stdout/stderr werden begrenzt, damit ein fehlerhafter
+ * Prozess den PHP-Worker nicht unbegrenzt belegen kann.
+ */
+function e3dcRunArgvProcess(array $argv, $timeoutSeconds = 20.0, array $options = []) {
+    $result = [
+        'success' => false,
+        'exit_code' => 127,
+        'timed_out' => false,
+        'signal' => 0,
+        'stdout' => '',
+        'stderr' => '',
+        'error' => '',
+        'duration_ms' => 0,
+    ];
+    if (empty($argv)) {
+        $result['error'] = 'Leerer Prozessaufruf.';
+        return $result;
+    }
+    $cleanArgv = [];
+    foreach ($argv as $value) {
+        if (!is_scalar($value) || strpos((string)$value, "\0") !== false) {
+            $result['error'] = 'Ungültiges Prozessargument.';
+            return $result;
+        }
+        $cleanArgv[] = (string)$value;
+    }
+    $executable = $cleanArgv[0];
+    if (!str_starts_with($executable, '/') || !is_file($executable) || !is_executable($executable)) {
+        $result['error'] = 'Interpreter oder Programm nicht verfügbar.';
+        return $result;
+    }
+    $timeoutSeconds = max(0.1, min(300.0, (float)$timeoutSeconds));
+    $maxOutput = max(1024, min(1024 * 1024, (int)($options['max_output_bytes'] ?? 65536)));
+    $cwd = isset($options['cwd']) && is_string($options['cwd']) && is_dir($options['cwd'])
+        ? $options['cwd']
+        : null;
+    $environment = null;
+    if (isset($options['env']) && is_array($options['env'])) {
+        $baseEnv = getenv();
+        $environment = array_merge(is_array($baseEnv) ? $baseEnv : [], $options['env']);
+    }
+    $descriptors = [
+        0 => ['pipe', 'r'],
+        1 => ['pipe', 'w'],
+        2 => ['pipe', 'w'],
+    ];
+    $pipes = [];
+    $start = microtime(true);
+    $process = @proc_open(
+        $cleanArgv,
+        $descriptors,
+        $pipes,
+        $cwd,
+        $environment,
+        ['bypass_shell' => true, 'suppress_errors' => true]
+    );
+    if (!is_resource($process)) {
+        $result['error'] = 'Prozess konnte nicht gestartet werden.';
+        $result['duration_ms'] = (int)round((microtime(true) - $start) * 1000);
+        return $result;
+    }
+    @fclose($pipes[0]);
+    @stream_set_blocking($pipes[1], false);
+    @stream_set_blocking($pipes[2], false);
+    $exitCode = null;
+    $signal = 0;
+    $wasSignaled = false;
+    while (true) {
+        foreach ([1 => 'stdout', 2 => 'stderr'] as $index => $key) {
+            $chunk = @stream_get_contents($pipes[$index]);
+            if ($chunk !== false && $chunk !== '' && strlen($result[$key]) < $maxOutput) {
+                $result[$key] .= substr($chunk, 0, $maxOutput - strlen($result[$key]));
+            }
+        }
+        $status = @proc_get_status($process);
+        if (!is_array($status)) {
+            $result['error'] = 'Prozessstatus nicht lesbar.';
+            break;
+        }
+        if (!$status['running']) {
+            $exitCode = isset($status['exitcode']) ? (int)$status['exitcode'] : null;
+            $signal = isset($status['termsig']) ? (int)$status['termsig'] : 0;
+            $wasSignaled = !empty($status['signaled']);
+            break;
+        }
+        if ((microtime(true) - $start) >= $timeoutSeconds) {
+            $result['timed_out'] = true;
+            @proc_terminate($process, 15);
+            $graceUntil = microtime(true) + 0.5;
+            do {
+                usleep(20000);
+                $status = @proc_get_status($process);
+            } while (is_array($status) && !empty($status['running']) && microtime(true) < $graceUntil);
+            if (is_array($status) && !empty($status['running'])) {
+                @proc_terminate($process, 9);
+            }
+            if (is_array($status)) {
+                $signal = isset($status['termsig']) ? (int)$status['termsig'] : 15;
+            }
+            $exitCode = 124;
+            break;
+        }
+        usleep(20000);
+    }
+    foreach ([1 => 'stdout', 2 => 'stderr'] as $index => $key) {
+        $chunk = @stream_get_contents($pipes[$index]);
+        if ($chunk !== false && $chunk !== '' && strlen($result[$key]) < $maxOutput) {
+            $result[$key] .= substr($chunk, 0, $maxOutput - strlen($result[$key]));
+        }
+        @fclose($pipes[$index]);
+    }
+    $closeCode = @proc_close($process);
+    if ($exitCode === null || $exitCode < 0) {
+        $exitCode = is_int($closeCode) && $closeCode >= 0 ? $closeCode : 1;
+    }
+    if ($wasSignaled && $signal === 0 && is_int($closeCode) && $closeCode > 0 && $closeCode <= 64) {
+        $signal = $closeCode;
+        $exitCode = 128 + $signal;
+    }
+    // Einige proc_open-Implementierungen stellen ein Signal nur über den
+    // konventionellen Exit-Status 128+Signal des argv-Kindprozesses bereit.
+    if ($signal === 0 && $exitCode >= 129 && $exitCode <= 192) {
+        $signal = $exitCode - 128;
+    }
+    $result['exit_code'] = (int)$exitCode;
+    $result['signal'] = (int)$signal;
+    $result['duration_ms'] = (int)round((microtime(true) - $start) * 1000);
+    if ($result['timed_out']) {
+        $result['error'] = 'Prozess-Timeout.';
+    } elseif ($result['signal'] > 0) {
+        $result['error'] = 'Prozess durch Signal beendet.';
+    } elseif ($result['exit_code'] !== 0) {
+        $result['error'] = 'Prozess meldete einen Fehler.';
+    }
+    $result['success'] = !$result['timed_out'] && $result['signal'] === 0 && $result['exit_code'] === 0;
+    return $result;
 }
 
 /**
@@ -1476,7 +1736,7 @@ function getContextPageUrl($seite, $params = []) {
  * Gibt Erfolgs- oder Info-Meldung aus
  */
 function successMessage($message) {
-    return '<div class="success-box" style="background:#2d3d2a; border-left:4px solid #27ae60; padding:15px; margin:15px 0; border-radius:4px; color:#27ae60; font-weight:bold;">' 
+    return '<div class="success-box" style="background:#2d3d2a; border-left:4px solid #27ae60; padding:15px; margin:15px 0; border-radius:4px; color:#27ae60; font-weight:bold;">'
            . htmlspecialchars($message) . '</div>';
 }
 
@@ -1484,7 +1744,7 @@ function successMessage($message) {
 
 /**
  * Sichere Datei-Leseoperation mit Fehlerbehandlung
- * 
+ *
  * @param string $path Dateipfad
  * @param bool $asArray true = array, false = string
  * @return array|string|false Dateiinhalt oder false bei Fehler
@@ -1751,8 +2011,38 @@ function energyFlowDefaultColors() {
         'heatpump' => '#f97316',
         'heater' => '#fd7e14',
         'climate' => '#38bdf8',
+        'generation' => '#22c55e',
+        'consumption' => '#0dcaf0',
         'center' => '#0d6efd'
     ];
+}
+
+function energyFlowDefaultLabels() {
+    return [
+        'pv' => 'E3DC-PV', 'external_pv' => 'Zusatz-WR', 'grid' => 'Netz',
+        'battery' => 'Speicher', 'home' => 'Haus', 'wallbox' => 'Wallbox 1',
+        'wallbox2' => 'Wallbox 2', 'heatpump' => 'Wärmepumpe', 'heater' => 'Heizstab',
+        'climate' => 'Klima', 'generation' => 'Erzeugung', 'consumption' => 'Verbrauch'
+    ];
+}
+
+function sanitizeEnergyFlowLabel($value) {
+    if (!is_scalar($value)) return '';
+    $value = trim(strip_tags((string)$value));
+    $value = preg_replace('/[\x00-\x1F\x7F]/u', '', $value) ?? '';
+    if ($value === '') return '';
+    return function_exists('mb_substr') ? mb_substr($value, 0, 32, 'UTF-8') : substr($value, 0, 32);
+}
+
+function sanitizeEnergyFlowLabels($labels) {
+    $clean = [];
+    if (!is_array($labels)) return $clean;
+    foreach (array_keys(energyFlowDefaultLabels()) as $key) {
+        if (!array_key_exists($key, $labels)) continue;
+        $alias = sanitizeEnergyFlowLabel($labels[$key]);
+        if ($alias !== '') $clean[$key] = $alias;
+    }
+    return $clean;
 }
 
 function normalizeEnergyFlowColor($value, $fallback = '#6c757d') {
@@ -1771,7 +2061,7 @@ function normalizeEnergyFlowPercent($value, $fallback) {
 }
 
 function sanitizeEnergyFlowNodes($nodes) {
-    $allowed = ['pv', 'external_pv', 'grid', 'battery', 'home', 'wallbox', 'wallbox2', 'heatpump', 'heater', 'climate'];
+    $allowed = ['pv', 'external_pv', 'grid', 'battery', 'home', 'wallbox', 'wallbox2', 'heatpump', 'heater', 'climate', 'generation', 'consumption', 'center'];
     $clean = [];
     if (!is_array($nodes)) return $clean;
     foreach ($allowed as $key) {
@@ -1784,8 +2074,8 @@ function sanitizeEnergyFlowNodes($nodes) {
     return $clean;
 }
 
-function getEnergyFlowUiConfig() {
-    $raw = loadE3dcRawConfigData();
+function normalizeEnergyFlowUiConfig($raw) {
+    if (!is_array($raw)) $raw = [];
     $stored = (isset($raw['ui_energy_flow']) && is_array($raw['ui_energy_flow'])) ? $raw['ui_energy_flow'] : [];
     $defaults = energyFlowDefaultColors();
     $colors = $defaults;
@@ -1796,11 +2086,163 @@ function getEnergyFlowUiConfig() {
             }
         }
     }
-    return [
+    $state = [
         'desktop' => ['nodes' => sanitizeEnergyFlowNodes($stored['desktop']['nodes'] ?? [])],
         'mobile' => ['nodes' => sanitizeEnergyFlowNodes($stored['mobile']['nodes'] ?? [])],
-        'colors' => $colors
+        'colors' => $colors,
+        'labels' => sanitizeEnergyFlowLabels($stored['labels'] ?? [])
     ];
+    $canonical = function($value) {
+        $json = json_encode($value, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        return hash('sha256', $json === false ? '' : $json);
+    };
+    $state['revisions'] = [
+        'desktop' => $canonical($state['desktop']['nodes']),
+        'mobile' => $canonical($state['mobile']['nodes']),
+        'appearance' => $canonical(['colors' => $state['colors'], 'labels' => $state['labels']])
+    ];
+    $state['revision'] = $canonical([
+        'desktop' => $state['desktop'],
+        'mobile' => $state['mobile'],
+        'colors' => $state['colors'],
+        'labels' => $state['labels']
+    ]);
+    return $state;
+}
+
+function getEnergyFlowUiConfig() {
+    return normalizeEnergyFlowUiConfig(loadE3dcRawConfigData());
+}
+
+function saveEnergyFlowUiPatchLocked($layout, $nodes, $colorPatch, $labelPatch, $baseRevisions = [], $v4Path = null, $cacheFile = null) {
+    $layout = strtolower(trim((string)$layout));
+    if (!in_array($layout, ['desktop', 'mobile'], true)) {
+        return ['success' => false, 'status' => 'invalid_layout'];
+    }
+    $nodePatch = sanitizeEnergyFlowNodes($nodes);
+    if (!is_array($nodes) || count($nodePatch) === 0) {
+        return ['success' => false, 'status' => 'invalid_nodes'];
+    }
+    $expectedLayoutRevision = is_array($baseRevisions) ? strtolower(trim((string)($baseRevisions[$layout] ?? ''))) : '';
+    $appearanceChanges = (is_array($colorPatch) && count($colorPatch) > 0)
+        || (is_array($labelPatch) && count($labelPatch) > 0);
+    $expectedAppearanceRevision = is_array($baseRevisions) ? strtolower(trim((string)($baseRevisions['appearance'] ?? ''))) : '';
+    if (!preg_match('/^[0-9a-f]{64}$/', $expectedLayoutRevision)
+        || ($appearanceChanges && !preg_match('/^[0-9a-f]{64}$/', $expectedAppearanceRevision))) {
+        return ['success' => false, 'status' => 'invalid_base_revision'];
+    }
+    $v4Path = is_string($v4Path) && $v4Path !== '' ? $v4Path : '/var/www/html/data/e3dc_v4.json';
+    $cacheFile = is_string($cacheFile) && $cacheFile !== '' ? $cacheFile : '/var/www/html/ramdisk/e3dc_config_cache.json';
+    if (!file_exists($v4Path) || !is_writable($v4Path)) {
+        return ['success' => false, 'status' => 'config_not_writable'];
+    }
+
+    $fh = @fopen($v4Path, 'c+');
+    if ($fh === false) return ['success' => false, 'status' => 'config_open_failed'];
+    $result = ['success' => false, 'status' => 'config_lock_failed'];
+    if (@flock($fh, LOCK_EX)) {
+        @rewind($fh);
+        $original = @stream_get_contents($fh);
+        $decoded = is_string($original) ? @json_decode($original, true) : null;
+        if (!is_array($decoded)) {
+            $result = ['success' => false, 'status' => 'config_invalid_json'];
+        } else {
+            $before = normalizeEnergyFlowUiConfig($decoded);
+            $layoutConflict = !e3dcWebAuthHashEquals($before['revisions'][$layout] ?? '', $expectedLayoutRevision);
+            $appearanceConflict = $appearanceChanges
+                && !e3dcWebAuthHashEquals($before['revisions']['appearance'] ?? '', $expectedAppearanceRevision);
+
+            if ($layoutConflict || $appearanceConflict) {
+                $result = [
+                    'success' => false,
+                    'status' => 'revision_conflict',
+                    'conflicts' => array_values(array_filter([
+                        $layoutConflict ? $layout : null,
+                        $appearanceConflict ? 'appearance' : null
+                    ])),
+                    'ui_energy_flow' => $before,
+                    'revision' => $before['revision'] ?? '',
+                    'revisions' => $before['revisions'] ?? []
+                ];
+            } else {
+                $ui = (isset($decoded['ui_energy_flow']) && is_array($decoded['ui_energy_flow']))
+                    ? $decoded['ui_energy_flow']
+                    : [];
+                $ui[$layout] = is_array($ui[$layout] ?? null) ? $ui[$layout] : [];
+                $storedNodes = (isset($ui[$layout]['nodes']) && is_array($ui[$layout]['nodes']))
+                    ? $ui[$layout]['nodes']
+                    : [];
+                foreach ($nodePatch as $key => $position) {
+                    $storedNode = is_array($storedNodes[$key] ?? null) ? $storedNodes[$key] : [];
+                    $storedNode['x'] = $position['x'];
+                    $storedNode['y'] = $position['y'];
+                    $storedNodes[$key] = $storedNode;
+                }
+                $ui[$layout]['nodes'] = $storedNodes;
+
+                $defaults = energyFlowDefaultColors();
+                $storedColors = (isset($ui['colors']) && is_array($ui['colors'])) ? $ui['colors'] : [];
+                if (is_array($colorPatch)) {
+                    foreach ($colorPatch as $key => $value) {
+                        if (!array_key_exists($key, $defaults)) continue;
+                        $storedColors[$key] = normalizeEnergyFlowColor($value, $defaults[$key]);
+                    }
+                }
+                $ui['colors'] = $storedColors;
+
+                $storedLabels = (isset($ui['labels']) && is_array($ui['labels'])) ? $ui['labels'] : [];
+                if (is_array($labelPatch)) {
+                    foreach ($labelPatch as $key => $value) {
+                        if (!array_key_exists($key, energyFlowDefaultLabels())) continue;
+                        $alias = sanitizeEnergyFlowLabel($value);
+                        if ($alias === '') unset($storedLabels[$key]);
+                        else $storedLabels[$key] = $alias;
+                    }
+                }
+                $ui['labels'] = $storedLabels;
+                $decoded['ui_energy_flow'] = $ui;
+
+                $json = json_encode($decoded, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+                if ($json === false) {
+                    $result = ['success' => false, 'status' => 'config_encode_failed'];
+                } else {
+                    $payload = $json . "\n";
+                    @rewind($fh);
+                    $bytes = @fwrite($fh, $payload);
+                    $written = $bytes === strlen($payload)
+                        && @ftruncate($fh, strlen($payload))
+                        && @fflush($fh);
+                    if (!$written) {
+                        @rewind($fh);
+                        if (is_string($original)) {
+                            @fwrite($fh, $original);
+                            @ftruncate($fh, strlen($original));
+                            @fflush($fh);
+                        }
+                        $result = ['success' => false, 'status' => 'config_write_failed'];
+                    } else {
+                        $after = normalizeEnergyFlowUiConfig($decoded);
+                        $result = [
+                            'success' => true,
+                            'status' => 'saved',
+                            'layout' => $layout,
+                            'ui_energy_flow' => $after,
+                            'revision' => $after['revision'] ?? '',
+                            'revisions' => $after['revisions'] ?? []
+                        ];
+                    }
+                }
+            }
+        }
+        @flock($fh, LOCK_UN);
+    }
+    @fclose($fh);
+    if (!empty($result['success'])) {
+        @chgrp($v4Path, 'www-data');
+        @chmod($v4Path, e3dcConfigSecretFileModeFromData($decoded ?? []));
+        if (file_exists($cacheFile)) @unlink($cacheFile);
+    }
+    return $result;
 }
 
 function handleEnergyFlowLayout() {
@@ -1817,6 +2259,7 @@ function handleEnergyFlowLayout() {
     if ($payload === null) return;
 
     requireWebAuth(true);
+    e3dcRequireCsrfToken(true);
     header('Content-Type: application/json; charset=utf-8');
 
     $layout = strtolower(trim((string)($payload['layout'] ?? '')));
@@ -1826,23 +2269,40 @@ function handleEnergyFlowLayout() {
         exit;
     }
 
-    $raw = loadE3dcRawConfigData();
-    $ui = (isset($raw['ui_energy_flow']) && is_array($raw['ui_energy_flow'])) ? $raw['ui_energy_flow'] : [];
-    $ui[$layout]['nodes'] = sanitizeEnergyFlowNodes($payload['nodes'] ?? []);
-
-    $defaults = energyFlowDefaultColors();
-    $storedColors = (isset($ui['colors']) && is_array($ui['colors'])) ? $ui['colors'] : [];
-    $incomingColors = (isset($payload['colors']) && is_array($payload['colors'])) ? $payload['colors'] : [];
-    $colors = [];
-    foreach ($defaults as $key => $fallback) {
-        $candidate = $incomingColors[$key] ?? $storedColors[$key] ?? $fallback;
-        $colors[$key] = normalizeEnergyFlowColor($candidate, $fallback);
+    $schemaVersion = trim((string)($payload['schema_version'] ?? ''));
+    $colorPatch = isset($payload['colors_patch']) && is_array($payload['colors_patch'])
+        ? $payload['colors_patch']
+        : [];
+    $labelPatch = isset($payload['labels_patch']) && is_array($payload['labels_patch'])
+        ? $payload['labels_patch']
+        : [];
+    if ($schemaVersion !== 'energy_flow_layout_patch_v2') {
+        http_response_code(409);
+        echo json_encode([
+            'success' => false,
+            'status' => 'client_refresh_required',
+            'error' => 'Seite neu laden, bevor das Layout gespeichert wird.'
+        ]);
+        exit;
     }
-    $ui['colors'] = $colors;
 
-    $raw['ui_energy_flow'] = $ui;
-    $ok = saveE3dcRawConfigData($raw);
-    echo json_encode(['success' => $ok, 'ui_energy_flow' => getEnergyFlowUiConfig()]);
+    $result = saveEnergyFlowUiPatchLocked(
+        $layout,
+        $payload['nodes'] ?? [],
+        $colorPatch,
+        $labelPatch,
+        $payload['base_revisions'] ?? []
+    );
+    if (empty($result['success'])) {
+        $status = (string)($result['status'] ?? '');
+        http_response_code(in_array($status, ['revision_conflict', 'invalid_base_revision'], true) ? 409 : 500);
+        $result['error'] = $status === 'revision_conflict'
+            ? 'Das Layout wurde zwischenzeitlich geändert. Bitte Seite neu laden.'
+            : ($status === 'invalid_base_revision'
+                ? 'Seite neu laden, bevor das Layout gespeichert wird.'
+                : 'Layout konnte nicht gespeichert werden.');
+    }
+    echo json_encode($result, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
     exit;
 }
 
@@ -1854,10 +2314,87 @@ function cfgBool($value, $default = false) {
     return $default;
 }
 
+function e3dcPayloadContextValid($payload) {
+    if (!is_array($payload)) return false;
+    if (!array_key_exists('context_valid', $payload)) return true;
+    $value = $payload['context_valid'];
+    if (is_bool($value)) return $value;
+    return !in_array(strtolower(trim((string)$value)), ['0', 'false', 'no', 'off', 'invalid'], true);
+}
+
 function cfgHasAddress($value) {
     $v = trim((string)($value ?? ''));
     $vLower = strtolower($v);
     return $v !== '' && !in_array($vLower, ['0', '0.0.0.0', 'none', 'null', 'false', 'off', 'disabled'], true);
+}
+
+function readExternalPvTopologyEvidence($path = '/var/www/html/data/external_pv_topology.json') {
+    $unknown = [
+        'topology_present' => false,
+        'valid' => false,
+        'source' => 'none',
+        'evidence_state' => 'unknown',
+        'reason' => 'not_confirmed',
+    ];
+    if (is_link($path)) {
+        return array_merge($unknown, ['evidence_state' => 'invalid', 'reason' => 'state_not_regular']);
+    }
+    $metadata = @lstat($path);
+    if ($metadata === false) {
+        return file_exists($path)
+            ? array_merge($unknown, ['evidence_state' => 'invalid', 'reason' => 'state_metadata_unavailable'])
+            : $unknown;
+    }
+    if (($metadata['mode'] & 0170000) !== 0100000 || ($metadata['mode'] & 0777) !== 0664) {
+        return array_merge($unknown, ['evidence_state' => 'invalid', 'reason' => 'state_mode_or_type_invalid']);
+    }
+    $raw = @file_get_contents($path);
+    if (!is_string($raw) || $raw === '' || strlen($raw) > 4096) {
+        return array_merge($unknown, ['evidence_state' => 'invalid', 'reason' => 'state_untrusted']);
+    }
+    $payload = json_decode($raw, true);
+    $expectedKeys = [
+        'schema_version', 'topology_present', 'valid', 'source', 'evidence_state',
+        'confirmation_samples', 'minimum_power_w', 'confirmed_at',
+    ];
+    if (!is_array($payload)) {
+        return array_merge($unknown, ['evidence_state' => 'invalid', 'reason' => 'state_untrusted']);
+    }
+    $actualKeys = array_keys($payload);
+    sort($actualKeys);
+    $sortedExpected = $expectedKeys;
+    sort($sortedExpected);
+    if ($actualKeys !== $sortedExpected) {
+        return array_merge($unknown, ['evidence_state' => 'invalid', 'reason' => 'schema_fields_invalid']);
+    }
+    foreach ($expectedKeys as $key) {
+        if (substr_count($raw, '"' . $key . '"') !== 1) {
+            return array_merge($unknown, ['evidence_state' => 'invalid', 'reason' => 'duplicate_or_missing_field']);
+        }
+    }
+    $confirmedAt = $payload['confirmed_at'] ?? null;
+    $samples = $payload['confirmation_samples'] ?? null;
+    $minimumPower = $payload['minimum_power_w'] ?? null;
+    $valid = ($payload['schema_version'] ?? null) === 'external_pv_topology_v1'
+        && ($payload['topology_present'] ?? null) === true
+        && ($payload['valid'] ?? null) === true
+        && ($payload['source'] ?? null) === 'e3dc_add_power'
+        && ($payload['evidence_state'] ?? null) === 'confirmed'
+        && is_int($samples) && $samples >= 3
+        && (is_int($minimumPower) || is_float($minimumPower)) && is_finite((float)$minimumPower) && (float)$minimumPower >= 100.0
+        && is_int($confirmedAt) && $confirmedAt > 0;
+    if (!$valid) {
+        return array_merge($unknown, ['evidence_state' => 'invalid', 'reason' => 'state_contract_invalid']);
+    }
+    return [
+        'topology_present' => true,
+        'valid' => true,
+        'source' => 'e3dc_add_power',
+        'evidence_state' => 'confirmed',
+        'reason' => 'multi_sample_confirmed',
+        'confirmation_samples' => $samples,
+        'confirmed_at' => $confirmedAt,
+    ];
 }
 
 function normalizeWallboxTypeConfig($type) {
@@ -1874,7 +2411,6 @@ function normalizeWallboxTypeConfig($type) {
         'native' => 'e3dc',
         'off' => 'none',
         'disabled' => 'none',
-        'dummy' => 'none',
         'deaktiviert' => 'none',
         'keine' => 'none',
         'false' => 'none',
@@ -1918,8 +2454,8 @@ function hasWallbox1Config($cfg) {
 
     if (cfgBool($cfg['wb_native_enable'] ?? null, false)) return true;
 
-    // Legacy installs used to show the internal E3DC wallbox unless explicitly disabled.
-    return true;
+    // Ohne positiven Capability-/Konfigurationsbeleg gibt es keine Wallbox-Kachel.
+    return false;
 }
 
 function hasWallbox2Config($cfg) {
@@ -1997,6 +2533,7 @@ function hasFreshMqttHeatpumpInbound($cfg = null, $maxAgeSeconds = 180) {
     if ($raw === false || $raw === '') return false;
     $data = @json_decode($raw, true);
     if (!is_array($data)) return false;
+    if (!e3dcPayloadContextValid($data)) return false;
 
     $sources = (isset($data['sources']) && is_array($data['sources'])) ? $data['sources'] : [];
     $heatpump = (isset($sources['heatpump']) && is_array($sources['heatpump'])) ? $sources['heatpump'] : [];
@@ -2029,6 +2566,22 @@ function isHeaterEnabledConfig($cfg) {
 /**
  * Optionales Logging (für Debugging)
  */
+function debugLog($message, $data = null) {
+    if (!defined('DEBUG_MODE') || !DEBUG_MODE) {
+        return;
+    }
+
+    $logFile = '/var/www/html/logs/debug.log';
+    $timestamp = date('Y-m-d H:i:s');
+    $logMessage = "[$timestamp] " . $message;
+
+    if ($data !== null) {
+        $logMessage .= " | " . json_encode($data);
+    }
+
+    @error_log($logMessage . "\n", 3, $logFile);
+}
+
 // ==================== HTML UTILITIES ====================
 
 /**
@@ -2046,10 +2599,10 @@ function formatDateTime($timestamp, $format = 'd.m.Y H:i') {
  */
 function createButton($label, $url = '', $class = 'form-button', $onclick = '') {
     if ($url) {
-        return '<a href="' . htmlspecialchars($url) . '" class="' . $class . '">' 
+        return '<a href="' . htmlspecialchars($url) . '" class="' . $class . '">'
                . htmlspecialchars($label) . '</a>';
     }
-    return '<button type="button" class="' . $class . '" onclick="' . htmlspecialchars($onclick) . '">' 
+    return '<button type="button" class="' . $class . '" onclick="' . htmlspecialchars($onclick) . '">'
            . htmlspecialchars($label) . '</button>';
 }
 
@@ -2130,8 +2683,8 @@ function e3dcDockerReleaseCommandText($tag) {
     $image = 'ghcr.io/a9xxx/install-e3dc-control:' . $tag;
     return implode("\n", [
         'TAG=' . $tag,
-        'cd ~/e3dc-docker',
-        'sudo docker run --rm -v e3dc-docker_e3dc_data:/data -v "$PWD":/backup alpine \\',
+        'cd "${E3DC_DOCKER_DIR:?E3DC_DOCKER_DIR auf den Compose-Pfad setzen}"',
+        'sudo docker run --rm -v "${E3DC_DATA_VOLUME:?E3DC_DATA_VOLUME auf das Datenvolume setzen}:/data" -v "$PWD":/backup alpine \\',
         '  sh -lc \'tar czf "/backup/e3dc-data-$(date +%Y%m%d-%H%M%S).tgz" -C /data .\'',
         'sudo cp docker-compose.yml "docker-compose.yml.before-$TAG"',
         'sudo sed -i -E "s#^([[:space:]]*)image: ghcr.io/a9xxx/install-e3dc-control:.*#\1image: ' . $image . '#" docker-compose.yml',
@@ -2206,11 +2759,8 @@ function e3dcBuildReleaseRollbackOptions() {
 
 function e3dcFindInstallerMainAndWrapper() {
     $paths = getInstallPaths();
-    $candidates = [
-        rtrim($paths['install_path'], '/') . '/../Install/installer_main.py',
-        rtrim($paths['install_path'], '/') . '/Install/installer_main.py',
-        $paths['home_dir'] . '/Install/installer_main.py'
-    ];
+    if (empty($paths['valid'])) return null;
+    $candidates = [rtrim($paths['install_path'], '/') . '/installer_main.py'];
     foreach ($candidates as $candidate) {
         if (file_exists($candidate)) {
             $installerMain = realpath($candidate);
@@ -2420,7 +2970,7 @@ function handleUpdateCheck() {
         header('Pragma: no-cache');
         header('Expires: 0');
         header('Content-Type: application/json');
-        
+
         // Docker-Installationen werden über Image/Container-Updates aktualisiert.
         if (file_exists('/.dockerenv')) {
             echo json_encode(['success' => true, 'missing' => 0, 'skipped' => true, 'message' => 'Docker']);
@@ -2436,19 +2986,17 @@ function handleUpdateCheck() {
         }
 
         $cacheFile = '/var/www/html/ramdisk/e3dc_update_status.json';
-        
+
         // Kurzer Cache gegen GitHub-Spam; ?force_check=1 umgeht ihn.
         if (!isset($_GET['force_check']) && file_exists($cacheFile) && (time() - filemtime($cacheFile) < 840)) {
             echo file_get_contents($cacheFile);
             exit;
         }
-        
+
         $paths = getInstallPaths();
-        $repoCandidates = [
-            rtrim($paths['install_path'], '/'),
-            rtrim($paths['home_dir'], '/') . '/Install',
-            rtrim($paths['install_path'], '/') . '/../Install'
-        ];
+        $repoCandidates = !empty($paths['valid'])
+            ? [rtrim($paths['install_path'], '/')]
+            : [];
 
         $repoDir = null;
         foreach ($repoCandidates as $candidate) {
@@ -2476,7 +3024,7 @@ function handleUpdateCheck() {
                 'repo' => $repoDir,
                 'error' => "Installer-Wrapper update_check fehlgeschlagen:\n" . ($wrapperCheck['error'] ?? 'unbekannter Fehler')
             ];
-        
+
         file_put_contents($cacheFile, json_encode($res));
         @chmod($cacheFile, 0666);
         echo json_encode($res);
@@ -2492,7 +3040,7 @@ function handleSelfUpdateCheck() {
     if (isset($_GET['action']) && $_GET['action'] === 'check_self_update') {
         header('Cache-Control: no-cache, no-store, must-revalidate');
         header('Content-Type: application/json');
-        
+
         // Docker: Updates erfolgen über Watchtower / Image Pull
         if (file_exists('/.dockerenv')) {
             echo json_encode(['success' => true, 'missing' => 0, 'skipped' => true, 'message' => 'Docker']);
@@ -2507,25 +3055,14 @@ function handleSelfUpdateCheck() {
         }
 
         $paths = getInstallPaths();
-        $home = $paths['home_dir']; // z.B. /home/pi
-        
-        $installPath = rtrim($paths['install_path'], '/');
-        $candidates = [
-            $installPath,
-            $home . '/Install',
-            $installPath . '/../Install',
-            $installPath . '/Install'
-        ];
-        $installDir = $home . '/Install'; // Fallback
-        foreach ($candidates as $c) {
-            if (is_dir($c . '/.git')) {
-                $installDir = $c;
-                break;
-            }
+        if (empty($paths['valid'])) {
+            echo json_encode(['success' => false, 'missing' => 0, 'error' => $paths['error'] ?? 'Installationskontext fehlt.']);
+            exit;
         }
-        
+        $installDir = rtrim($paths['install_path'], '/');
+
         $missing = 0;
-        
+
         // Git-Prüfung läuft auch für die Self-Update-Anzeige über den
         // Installer-Wrapper. Direkte www-data->git-Sudo-Freigaben sind im
         // Wrapper-only-Zielzustand nicht erlaubt.
@@ -2608,16 +3145,15 @@ function handleRunSelfUpdate() {
     if (isset($_GET['action']) && $_GET['action'] === 'run_self_update') {
         requireWebAuth(true);
         header('Content-Type: application/json');
-        
+
         $paths = getInstallPaths();
+        if (empty($paths['valid'])) {
+            echo json_encode(['success' => false, 'message' => $paths['error'] ?? 'Installationskontext fehlt.']);
+            exit;
+        }
         // Pfad zum self_update.py ermitteln
-        $candidates = [
-            rtrim($paths['install_path'], '/') . '/installer_main.py',
-            $paths['home_dir'] . '/Install/installer_main.py',
-            rtrim($paths['install_path'], '/') . '/../Install/installer_main.py',
-            rtrim($paths['install_path'], '/') . '/Install/installer_main.py'
-        ];
-        
+        $candidates = [rtrim($paths['install_path'], '/') . '/installer_main.py'];
+
         $script = false;
         foreach ($candidates as $c) {
             if (file_exists($c)) { $script = $c; break; }
@@ -2644,7 +3180,7 @@ function handleRunSelfUpdate() {
             }
             @unlink($pidFile);
         }
-        
+
         // Log-Datei vorbereiten und bei jedem Lauf leeren
         @file_put_contents($logFile, "=== Starting V4 Web-Update at ".date('Y-m-d H:i:s')." ===\n\n");
         @chmod($logFile, 0664);
@@ -2700,7 +3236,7 @@ function handleRunSelfUpdate() {
         file_put_contents($logFile, "Start-Befehl: $selectedRunCmd\n--------------------------------\n", FILE_APPEND);
         $cmd = sprintf("nohup %s >> %s 2>&1 & echo $!", $selectedRunCmd, escapeshellarg($logFile));
         $pid = trim((string)shell_exec($cmd));
-        
+
         if ($pid !== '') {
             @file_put_contents($pidFile, $pid);
             @chmod($pidFile, 0666);
@@ -2733,12 +3269,9 @@ function e3dcSystemdServiceStatus($service) {
 
 function e3dcFindServiceWrapper() {
     $paths = getInstallPaths();
-    $installPath = rtrim($paths['install_path'] ?? '/home/pi/Install', '/');
-    $wrapperCandidates = [
-        $installPath . '/Installer/service_wrapper.sh',
-        '/home/pi/Install/Installer/service_wrapper.sh',
-        '/app/pi/Install/Installer/service_wrapper.sh'
-    ];
+    if (empty($paths['valid'])) return null;
+    $installPath = rtrim($paths['install_path'], '/');
+    $wrapperCandidates = [$installPath . '/Installer/service_wrapper.sh'];
     foreach ($wrapperCandidates as $candidate) {
         if ($candidate && file_exists($candidate)) {
             return $candidate;
@@ -2768,6 +3301,22 @@ function e3dcRunServiceWrapperAction($action, array $services) {
         ];
     }
 
+    $sudo = null;
+    foreach (['/usr/bin/sudo', '/bin/sudo'] as $candidate) {
+        if (is_file($candidate) && is_executable($candidate)) {
+            $sudo = $candidate;
+            break;
+        }
+    }
+    if ($sudo === null) {
+        return [
+            'success' => false,
+            'changed' => [],
+            'ignored' => [],
+            'errors' => ['sudo ist für den Service-Wrapper nicht verfügbar.'],
+        ];
+    }
+
     $changed = [];
     $ignored = [];
     $errors = [];
@@ -2777,18 +3326,23 @@ function e3dcRunServiceWrapperAction($action, array $services) {
             $errors[] = 'Unzulaessiger Dienstname: ' . $service;
             continue;
         }
-        $cmd = 'sudo -n ' . escapeshellarg($serviceWrapper) . ' ' . escapeshellarg($action) . ' ' . escapeshellarg($service) . ' 2>&1';
-        $lines = [];
-        $code = 1;
-        exec($cmd, $lines, $code);
-        $text = trim(implode("\n", $lines));
+        $process = e3dcRunArgvProcess(
+            [$sudo, '-n', $serviceWrapper, $action, $service],
+            30.0,
+            ['max_output_bytes' => 32768]
+        );
+        $code = (int)($process['exit_code'] ?? 1);
+        $text = trim((string)($process['stdout'] ?? '') . "\n" . (string)($process['stderr'] ?? ''));
         $isMissing = preg_match('/not found|not loaded|could not be found|does not exist|nicht gefunden|ist nicht geladen|Unit .* not found/i', $text);
-        if ($code === 0) {
+        if (!empty($process['success']) && $code === 0) {
             $changed[] = $service;
         } elseif ($isMissing) {
             $ignored[] = $service;
         } else {
-            $errors[] = $service . ': ' . ($text !== '' ? $text : 'unbekannter Fehler');
+            $detail = $text !== '' ? $text : (string)($process['error'] ?? 'unbekannter Fehler');
+            if (!empty($process['timed_out'])) $detail = 'Timeout: ' . $detail;
+            if ((int)($process['signal'] ?? 0) > 0) $detail = 'Signal ' . (int)$process['signal'] . ': ' . $detail;
+            $errors[] = $service . ' (rc=' . $code . '): ' . $detail;
         }
     }
 
@@ -2804,12 +3358,13 @@ function handleServiceRestart() {
     if (isset($_GET['action']) && $_GET['action'] === 'restart_service') {
         requireWebAuth(true);
         header('Content-Type: application/json');
-        
+
         // RAM-Disk Variablen und Speicher-Flags vor Neustart löschen (Notfall-Reset)
         $flags = [
             '/var/www/html/ramdisk/manual_boost.flag',
             '/var/www/html/ramdisk/pv_boost.flag',
             '/var/www/html/ramdisk/wallbox_force.flag',
+            '/var/www/html/data/morning_boost_state.json',
             '/var/www/html/data/home_soc_state.json'
         ];
         foreach($flags as $f) { if (file_exists($f)) @unlink($f); }
@@ -2819,20 +3374,8 @@ function handleServiceRestart() {
             @chmod('/var/www/html/ramdisk/restart_container.flag', 0666);
             echo json_encode(['success' => true, 'message' => 'Docker-Container wird im Hintergrund neu gestartet.']);
         } else {
-            $paths = getInstallPaths();
-            $installPath = rtrim($paths['install_path'] ?? '/home/pi/Install', '/');
-            $wrapperCandidates = [
-                $installPath . '/Installer/service_wrapper.sh',
-                '/home/pi/Install/Installer/service_wrapper.sh',
-                '/app/pi/Install/Installer/service_wrapper.sh'
-            ];
-            $serviceWrapper = null;
-            foreach ($wrapperCandidates as $candidate) {
-                if ($candidate && file_exists($candidate)) {
-                    $serviceWrapper = $candidate;
-                    break;
-                }
-            }
+            // service_wrapper.sh wird ausschließlich über den validierten Release-Root aufgelöst.
+            $serviceWrapper = e3dcFindServiceWrapper();
 
             if (!$serviceWrapper) {
                 echo json_encode([
@@ -2897,16 +3440,15 @@ function handleFixPermissions() {
     if (isset($_GET['action']) && $_GET['action'] === 'fix_permissions') {
         requireWebAuth(true);
         header('Content-Type: application/json');
-        
+
         $paths = getInstallPaths();
+        if (empty($paths['valid'])) {
+            echo json_encode(['success' => false, 'message' => $paths['error'] ?? 'Installationskontext fehlt.']);
+            exit;
+        }
         $candidates = [
             rtrim($paths['install_path'], '/') . '/installer_main.py',
-            $paths['home_dir'] . '/Install/installer_main.py',
-            rtrim($paths['install_path'], '/') . '/../Install/installer_main.py',
-            rtrim($paths['install_path'], '/') . '/Install/installer_main.py',
-            $paths['home_dir'] . '/Install/Installer/self_update.py',
-            rtrim($paths['install_path'], '/') . '/../Install/Installer/self_update.py',
-            rtrim($paths['install_path'], '/') . '/Install/Installer/self_update.py'
+            rtrim($paths['install_path'], '/') . '/Installer/self_update.py'
         ];
         $installerScript = false;
         foreach ($candidates as $c) {
@@ -2948,14 +3490,14 @@ function handleFixPermissions() {
             $out = $attemptOut;
             $ret = $attemptRet;
         }
-        
+
         if ($ret === 0) {
             $filtered = [];
             foreach ($out as $line) {
                 // ANSI Colors entfernen
                 $clean_line = preg_replace('/\e\[[0-9;]*m/', '', $line);
                 $trim_line = trim($clean_line);
-                
+
                 // Wir filtern alles heraus, was auf Erfolg oder reine Status-Info hindeutet
                 if ($trim_line === '') continue;
                 if (strpos($trim_line, '✓') !== false) continue;
@@ -2963,10 +3505,10 @@ function handleFixPermissions() {
                 if (strpos($trim_line, '===') === 0) continue;
                 if (strpos($trim_line, '---') === 0) continue;
                 if (strpos($trim_line, 'Prüfe ') === 0) continue;
-                
+
                 $filtered[] = $clean_line; // Wir behalten das Original (clean_line wg. Einrückungen)
             }
-            
+
             // Wenn nach dem Filtern nur noch "→ Korrigiere..." Action-Header übrig bleiben, war alles OK
             $has_real_issues = false;
             foreach ($filtered as $f) {
@@ -2975,7 +3517,7 @@ function handleFixPermissions() {
                     break;
                 }
             }
-            
+
             if (!$has_real_issues) {
                 $filtered = ["\nAlles OK! Es waren keine Reparaturen notwendig."];
             }
@@ -3010,14 +3552,14 @@ function handleFixPermissions() {
 function handleWatchdogStatus() {
     if (isset($_GET['action']) && $_GET['action'] === 'watchdog_status') {
         header('Content-Type: application/json');
-        
+
         $scriptPath = '/usr/local/bin/pi_guard.sh';
         $heartbeat = '/var/www/html/ramdisk/watchdog.heartbeat';
         if (!file_exists($scriptPath) && !file_exists($heartbeat)) {
             echo json_encode(['installed' => false]);
             exit;
         }
-        
+
         $warning = false;
         $isActive = false;
 
@@ -3030,7 +3572,7 @@ function handleWatchdogStatus() {
             exec("systemctl is-active piguard 2>&1", $out, $ret);
             $isActive = (trim(implode('', $out)) === 'active');
         }
-        
+
         $message = $isActive ? 'Watchdog aktiv' : 'Watchdog inaktiv';
         if ($warning) $message = 'Watchdog warnt vor Fehlern!';
 
@@ -3054,7 +3596,7 @@ function handleWatchdogStatus() {
                         $monFile = str_replace('{{day}}', $days[date('N')], $monFile);
                     }
                 }
-                
+
                 if (file_exists($monFile)) {
                     $age = time() - filemtime($monFile);
                     if ($age > 900) { // > 15 Min (900 Sek)
@@ -3065,7 +3607,7 @@ function handleWatchdogStatus() {
                 }
             }
         }
-        
+
         // --- NEU: Diagnose Fehler finden (Delta-Check) ---
         $errorLogs = [];
         $ackFile = '/var/www/html/ramdisk/diagnose_ack.json';
@@ -3076,7 +3618,7 @@ function handleWatchdogStatus() {
         $c = $confData['config'] ?? [];
         $isDocker = file_exists('/.dockerenv');
         $isLux = (isset($c['luxtronik']) && in_array(strtolower(trim($c['luxtronik'])), ['1', 'true']));
-        $isEM = $isLux || (isset($c['auto_mode']) && in_array(strtolower(trim($c['auto_mode'])), ['1', 'true']));
+        $isEM = $isLux || (isset($c['auto_mode']) && in_array(strtolower(trim($c['auto_mode'])), ['1', 'true'])) || (isset($c['morning_boost_enable']) && in_array(strtolower(trim($c['morning_boost_enable'])), ['1', 'true']));
         $isBlue = !empty($c['bluelink_refresh_token']);
         $isMqtt = !empty($c['mqtt_hub_ip']) && $c['mqtt_hub_ip'] !== '0.0.0.0';
         $isHa = (isset($c['ha_mode']) && !in_array(strtolower(trim($c['ha_mode'])), ['off', '']));
@@ -3094,7 +3636,7 @@ function handleWatchdogStatus() {
             $logFiles['update'] = '/var/www/html/logs/update.log';
             $logFiles['self_update'] = '/var/www/html/logs/self_update_php.log';
         }
-        
+
         foreach ($logFiles as $key => $file) {
             $lastSize = $ackState['sizes'][$key] ?? 0;
             if (file_exists($file)) {
@@ -3133,9 +3675,9 @@ function handleWatchdogStatus() {
         }
 
         echo json_encode([
-            'installed' => true, 
-            'active' => $isActive, 
-            'warning' => $warning, 
+            'installed' => true,
+            'active' => $isActive,
+            'warning' => $warning,
             'message' => $message,
             'diagnose_errors' => $errorLogs
         ]);
@@ -3316,7 +3858,7 @@ function renderChangelogModal($dialogClass = 'modal-lg modal-dialog-scrollable')
     if (file_exists($logFile)) {
         $content = htmlspecialchars(file_get_contents($logFile));
     }
-    
+
     return '
     <div class="modal fade" id="changelogModal" tabindex="-1" aria-hidden="true">
         <div class="modal-dialog ' . $dialogClass . '">
@@ -3341,11 +3883,11 @@ function renderDiagnoseModal($dialogClass = 'modal-lg modal-dialog-scrollable') 
     $c = $confData['config'] ?? [];
     $isDocker = file_exists('/.dockerenv');
     $isLux = (isset($c['luxtronik']) && in_array(strtolower(trim($c['luxtronik'])), ['1', 'true']));
-    $isEM = $isLux || (isset($c['auto_mode']) && in_array(strtolower(trim($c['auto_mode'])), ['1', 'true']));
+    $isEM = $isLux || (isset($c['auto_mode']) && in_array(strtolower(trim($c['auto_mode'])), ['1', 'true'])) || (isset($c['morning_boost_enable']) && in_array(strtolower(trim($c['morning_boost_enable'])), ['1', 'true']));
     $isBlue = !empty($c['bluelink_refresh_token']);
     $isMqtt = !empty($c['mqtt_hub_ip']) && $c['mqtt_hub_ip'] !== '0.0.0.0';
     $isHa = (isset($c['ha_mode']) && !in_array(strtolower(trim($c['ha_mode'])), ['off', '']));
-    
+
     $html = renderE3dcModalThemeStyles() . '
     <div class="modal fade" id="diagnoseModal" tabindex="-1" aria-hidden="true">
         <div class="modal-dialog ' . $dialogClass . '">
@@ -3359,7 +3901,7 @@ function renderDiagnoseModal($dialogClass = 'modal-lg modal-dialog-scrollable') 
                         </div>
                     </div>
                     <select class="form-select form-select-sm bg-body text-body border-secondary w-100" id="diagnoseLogSelect" onchange="loadDiagnoseLog()">';
-                    
+
     if ($isEM) $html .= '<option value="energy_manager">Energy Manager</option>';
     $html .= '<option value="wallbox_manager">Native Wallbox Manager</option>';
     if ($isLux) $html .= '<option value="wp_status">Wärmepumpe Status & Fehler</option>';
@@ -3400,15 +3942,15 @@ function renderDiagnoseModal($dialogClass = 'modal-lg modal-dialog-scrollable') 
     </div>
     <script>
     function showDiagnoseModal() { const m = new bootstrap.Modal(document.getElementById("diagnoseModal")); m.show(); updateDiagnoseDropdown(); loadDiagnoseLog(); }
-    function showDiagnoseLog(type) { 
+    function showDiagnoseLog(type) {
         const el = document.getElementById("diagnoseModal");
         let m = bootstrap.Modal.getInstance(el);
         if (!m) m = new bootstrap.Modal(el);
-        m.show(); 
-        updateDiagnoseDropdown(); 
-        const sel = document.getElementById("diagnoseLogSelect"); 
-        if (sel) { sel.value = type; } 
-        loadDiagnoseLog(); 
+        m.show();
+        updateDiagnoseDropdown();
+        const sel = document.getElementById("diagnoseLogSelect");
+        if (sel) { sel.value = type; }
+        loadDiagnoseLog();
     }
     function updateDiagnoseDropdown() {
         const sel = document.getElementById("diagnoseLogSelect"); let hasErr = false;
@@ -3434,7 +3976,7 @@ function renderDiagnoseModal($dialogClass = 'modal-lg modal-dialog-scrollable') 
         });
     }
     </script>';
-    
+
     return $html;
 }
 
@@ -3445,7 +3987,7 @@ function renderDiagnoseModal($dialogClass = 'modal-lg modal-dialog-scrollable') 
 function loadStaticPriceData($vat = 0) {
     $paths = getInstallPaths();
     $basePath = $paths['install_path'];
-    
+
     // Zeitabhängige Priorisierung:
     // 18:00 - 06:00: Bevorzuge Mittags-Datei (11/12/13 Uhr), um Vorschau auf morgen zu haben.
     // 06:00 - 18:00: Bevorzuge Nacht-Datei (23/00 Uhr) für stabilen Tagesverlauf.
@@ -3455,7 +3997,7 @@ function loadStaticPriceData($vat = 0) {
     } else {
         $candidates = ['awattardebug.23.txt', 'awattardebug.0.txt', 'awattardebug.12.txt', 'awattardebug.13.txt'];
     }
-    
+
     $lines = false;
     $loadedFile = '';
 
@@ -3467,26 +4009,26 @@ function loadStaticPriceData($vat = 0) {
                 exec("cat " . escapeshellarg($basePath . $f), $out, $ret);
                 if ($ret === 0 && !empty($out)) $lines = $out;
             }
-            
+
             if ($lines) {
                 $loadedFile = $f;
                 break;
             }
         }
     }
-    
+
     if (!$lines) return false;
 
     $prices = [];
     $startHour = null;
     $interval = null;
     $lastH = null;
-    
+
     foreach ($lines as $line) {
         // BOM entfernen (UTF-8)
         $line = preg_replace('/^\xEF\xBB\xBF/', '', $line);
         $line = trim($line);
-        
+
         // Header überspringen
         if (empty($line) || (!is_numeric(substr($line, 0, 1)) && substr($line, 0, 1) !== '-')) {
             if (!empty($prices)) break; // Stop bei neuem Block (z.B. "Data")
@@ -3499,7 +4041,7 @@ function loadStaticPriceData($vat = 0) {
         if (count($parts) >= 2 && is_numeric($parts[0])) {
             $rawT = (float)str_replace(',', '.', trim($parts[0]));
             $val = (float)str_replace(',', '.', trim($parts[1]));
-            
+
             // Timestamp (> 48) zu Stunde (0-23.99) konvertieren
             if ($rawT > 48) {
                 $h = (float)gmdate('G', (int)$rawT) + ((int)gmdate('i', (int)$rawT)/60);
@@ -3507,13 +4049,13 @@ function loadStaticPriceData($vat = 0) {
                 $h = $rawT;
             }
 
-            
+
             // Duplikat-Check: Wenn wir wieder beim Start sind (z.B. neuer Block)
             if ($startHour !== null && abs($h - $startHour) < 0.001 && count($prices) > 0) break;
 
             if ($vat > 0) $val = $val * (1 + ($vat / 100));
             $prices[] = $val;
-            
+
             if ($startHour === null) {
                 $startHour = $h;
             } elseif ($interval === null) {
@@ -3524,10 +4066,10 @@ function loadStaticPriceData($vat = 0) {
             $lastH = $h;
         }
     }
-    
+
     return empty($prices) ? false : [
-        'prices' => $prices, 
-        'start_hour' => $startHour, 
+        'prices' => $prices,
+        'start_hour' => $startHour,
         'interval' => ($interval ?: 1),
         'source' => $loadedFile
     ];
@@ -3617,10 +4159,10 @@ function handleSaveSetting() {
     if (isset($_POST['action']) && $_POST['action'] === 'save_setting') {
         requireWebAuth(true);
         if (!isset($_POST['key'], $_POST['value'])) exit;
-        
+
         $key = trim($_POST['key']);
         $val = trim($_POST['value']);
-        
+
         if (!preg_match('/^[a-z0-9_]+$/i', $key)) { http_response_code(400); exit; }
 
         if (saveE3dcConfigValue($key, $val)) echo "ok";
@@ -3653,7 +4195,8 @@ function handleDirectMarketingDashboardAction() {
             'source' => 'dashboard',
         ];
         $json = json_encode($payload, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
-        $ok = $json !== false && e3dcWriteJsonAtomic($path, $json);
+        $ok = $json !== false;
+        $ok = $ok && e3dcWriteJsonAtomic($path, $json);
     } else {
         $ok = !file_exists($path) || @unlink($path);
     }
@@ -3676,18 +4219,18 @@ function handleRunUpdate() {
         header('Expires: 0');
         header('Content-Type: application/json');
         $paths = getInstallPaths();
-        
+        if (empty($paths['valid'])) {
+            echo json_encode(['status' => 'error', 'message' => $paths['error'] ?? 'Installationskontext fehlt.']);
+            exit;
+        }
+
         // Installer suchen
-        $candidates = [
-            rtrim($paths['install_path'], '/') . '/../Install/installer_main.py',
-            rtrim($paths['install_path'], '/') . '/Install/installer_main.py',
-            $paths['home_dir'] . '/Install/installer_main.py'
-        ];
+        $candidates = [rtrim($paths['install_path'], '/') . '/installer_main.py'];
         $installer_main = false;
         foreach ($candidates as $candidate) {
             if (file_exists($candidate)) { $installer_main = realpath($candidate); break; }
         }
-        
+
         if (!$installer_main) {
             echo json_encode(['status' => 'error', 'message' => "Installer nicht gefunden."]);
             exit;
@@ -3705,14 +4248,14 @@ function handleRunUpdate() {
                 @unlink($pidFile);
             }
             @unlink($statusFile);
-            
+
             // 1. Log-Datei vorbereiten & Rechte prüfen
             if (file_put_contents($logFile, "=== UPDATE DIAGNOSE START ===\n") === false) {
                 echo json_encode(['status' => 'error', 'message' => 'PHP kann Log-Datei nicht schreiben.']);
                 exit;
             }
             @chmod($logFile, 0666);
-            
+
             // 2. Pfad-Check
             if (!$installer_main) {
                 file_put_contents($logFile, "FEHLER: installer_main.py konnte nicht gefunden werden.\n", FILE_APPEND);
@@ -3723,7 +4266,7 @@ function handleRunUpdate() {
 
             // 3. Shell-Test (Kann www-data überhaupt schreiben?)
             exec("echo 'Shell-Write-Test: OK' >> " . escapeshellarg($logFile));
-            
+
             // 4. Sudo-Test (Darf www-data sudo nutzen?)
             // (Entfernt, da 'true' nicht zwingend in sudoers steht und zu falschen Fehlern führt)
             // Sudoers expects the unquoted explicit path!
@@ -3764,7 +4307,7 @@ function handleRunUpdate() {
                 exit;
             }
             file_put_contents($logFile, "Start-Befehl: $cmd\n--------------------------------\n", FILE_APPEND);
-            
+
             // Der kleine Shell-Wrapper schreibt nach Prozessende einen Exitcode.
             // Dadurch kann das Frontend ein erfolgreiches Update auch dann erkennen,
             // wenn die letzte Logzeile wegen Webserver-/Dateitausch leicht verzögert sichtbar wird.
@@ -3775,22 +4318,22 @@ function handleRunUpdate() {
                 . '; exit "$ret"';
             $fullCmd = 'nohup /bin/sh -c ' . escapeshellarg($runner) . ' >/dev/null 2>&1 & echo $!';
             $pid = exec($fullCmd);
-            
-            if ($pid) { 
-                file_put_contents($pidFile, $pid); 
+
+            if ($pid) {
+                file_put_contents($pidFile, $pid);
                 file_put_contents($logFile, "Prozess gestartet mit PID: $pid\n", FILE_APPEND);
-                echo json_encode(['status' => 'started', 'pid' => $pid]); 
+                echo json_encode(['status' => 'started', 'pid' => $pid]);
             }
             else { echo json_encode(['status' => 'error', 'message' => 'Konnte Prozess nicht starten.']); }
         } elseif ($mode === 'poll') {
             clearstatcache(true, $logFile);
             $log = '';
             $debugInfo = "";
-            
+
             if (file_exists($logFile)) {
                 $size = filesize($logFile);
                 $content = file_get_contents($logFile);
-                
+
                 if ($content === false) {
                     $log = "FEHLER: Log-Datei existiert, kann aber nicht gelesen werden (Rechte?).";
                 } elseif (empty($content)) {
@@ -3813,7 +4356,7 @@ function handleRunUpdate() {
                     $exitCode = (int)$rawStatus;
                 }
             }
-            
+
             // JSON Flags für Robustheit (verhindert Absturz bei Emojis/Sonderzeichen)
             $flags = 0;
             if (defined('JSON_INVALID_UTF8_SUBSTITUTE')) $flags |= JSON_INVALID_UTF8_SUBSTITUTE;
@@ -3826,7 +4369,7 @@ function handleRunUpdate() {
                 'completed' => !$running && $exitCode !== null,
                 'success' => !$running && $exitCode === 0,
             ], $flags);
-            
+
             if ($json === false) {
                 echo json_encode(['running' => $running, 'log' => "JSON-Fehler: " . json_last_error_msg()]);
             } else {
@@ -4102,7 +4645,7 @@ function minuteToSlotLabel($minute) {
  */
 function parsePricesFromAwattarDebug($debugFile, $awmwst, $awnebenkosten, $speichergroesse) {
     if (!file_exists($debugFile)) return [null, null, null, null, null, null, null, null, null, [], null, 1.0, []];
-    
+
     $lines = @file($debugFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
     if (!$lines) return [null, null, null, null, null, null, null, null, null, [], null, 1.0, []];
 
@@ -4135,7 +4678,7 @@ function parsePricesFromAwattarDebug($debugFile, $awmwst, $awnebenkosten, $speic
                 }
                 $candidateRaw = (float)$parts[1];
                 $candidate = calculateAwattarPrice($candidateRaw, $sourceTs, $awmwst, $awnebenkosten);
-                
+
                 if ($candidate >= 0 && $candidate <= 100) {
                     if ($priceStartHour === null) $priceStartHour = (float)$parts[0];
                     elseif (count($prices) === 1) {
@@ -4144,7 +4687,7 @@ function parsePricesFromAwattarDebug($debugFile, $awmwst, $awnebenkosten, $speic
                     }
                     $prices[] = $candidate;
                     if ($minuteOfDay !== null) $entries[] = ['minute' => $minuteOfDay, 'price' => $candidate];
-                    
+
                     // Prognose (Spalte 4)
                     if (count($parts) >= 5) {
                         $pvRaw = (float)$parts[4];
@@ -4197,6 +4740,11 @@ function renderEnergyFlow($layout = 'mobile', $extraClass = '', $extraAttributes
     $uiFlow = getEnergyFlowUiConfig();
     $storedNodes = $uiFlow[$layout]['nodes'] ?? [];
     $colors = $uiFlow['colors'] ?? energyFlowDefaultColors();
+    $aliases = $uiFlow['labels'] ?? [];
+    $labelFor = function($key, $fallback) use ($aliases) {
+        $alias = sanitizeEnergyFlowLabel($aliases[$key] ?? '');
+        return htmlspecialchars($alias !== '' ? $alias : $fallback, ENT_QUOTES, 'UTF-8');
+    };
 
     $showWpConfigured = isset($wpEnabled) ? $wpEnabled : isHeatpumpEnabledConfig($cfg);
     $showWp = $showWpConfigured || hasFreshMqttHeatpumpInbound($cfg);
@@ -4209,8 +4757,19 @@ function renderEnergyFlow($layout = 'mobile', $extraClass = '', $extraAttributes
     $showHs = isset($hsEnabled) ? $hsEnabled : isHeaterEnabledConfig($cfg);
     $showClimate = cfgBool($cfg['climate_enable'] ?? '0', false);
     $shellyOverride = strtolower(trim((string)($cfg['direct_marketing_aux_inverter_shelly_override'] ?? 'local')));
-    $showExternalWr = cfgHasAddress($cfg['direct_marketing_aux_inverter_shelly_ip'] ?? '')
+    $externalPvTopology = readExternalPvTopologyEvidence();
+    $externalPvControlConfigured = cfgHasAddress($cfg['direct_marketing_aux_inverter_shelly_ip'] ?? '');
+    $externalPvExplicitConfigured = $externalPvControlConfigured
         || in_array($shellyOverride, ['1', 'true', 'yes', 'on', 'ein', 'central', 'zentral'], true);
+    $showExternalWr = $externalPvExplicitConfigured || !empty($externalPvTopology['topology_present']);
+    $consumerKeys = ['home'];
+    if ($showWp) $consumerKeys[] = 'heatpump';
+    if ($showWb) $consumerKeys[] = 'wallbox';
+    if ($showWb2) $consumerKeys[] = 'wallbox2';
+    if ($showHs) $consumerKeys[] = 'heater';
+    if ($showClimate) $consumerKeys[] = 'climate';
+    $aggregateGeneration = $showExternalWr;
+    $aggregateConsumption = count($consumerKeys) > 1;
 
     $wb1_type_raw = isset($cfg['wb_native_type']) && !empty($cfg['wb_native_type']) ? normalizeWallboxTypeConfig($cfg['wb_native_type']) : 'e3dc';
     $wb2_type_raw = isset($cfg['wb_native_type2']) && !empty($cfg['wb_native_type2']) ? normalizeWallboxTypeConfig($cfg['wb_native_type2']) : 'wb2';
@@ -4242,10 +4801,10 @@ function renderEnergyFlow($layout = 'mobile', $extraClass = '', $extraAttributes
     $wb2_type = $wb_type_labels[strtolower($wb2_type_raw)] ?? ucfirst($wb2_type_raw);
     $wb1_name_full = isset($cfg['wb1_name']) && !empty($cfg['wb1_name']) ? (string)$cfg['wb1_name'] : "$wb1_type (WB 1)";
     $wb2_name_full = isset($cfg['wb2_name']) && !empty($cfg['wb2_name']) ? (string)$cfg['wb2_name'] : "$wb2_type (WB 2)";
-    $wb1_short_type = $short_type_labels[strtolower($wb1_type_raw)] ?? $wb1_type;
-    $wb2_short_type = $short_type_labels[strtolower($wb2_type_raw)] ?? $wb2_type;
-    $wb1_name = htmlspecialchars(strlen($wb1_name_full) > 15 ? "$wb1_short_type WB1" : $wb1_name_full);
-    $wb2_name = htmlspecialchars(strlen($wb2_name_full) > 15 ? "$wb2_short_type WB2" : $wb2_name_full);
+    $wb1_config_alias = sanitizeEnergyFlowLabel($cfg['wb1_name'] ?? '');
+    $wb2_config_alias = sanitizeEnergyFlowLabel($cfg['wb2_name'] ?? '');
+    $wb1_name = $labelFor('wallbox', ($wb1_config_alias !== '' && strlen((string)($cfg['wb1_name'] ?? '')) <= 32) ? $wb1_config_alias : 'Wallbox 1');
+    $wb2_name = $labelFor('wallbox2', ($wb2_config_alias !== '' && strlen((string)($cfg['wb2_name'] ?? '')) <= 32) ? $wb2_config_alias : 'Wallbox 2');
     $wb1_title = htmlspecialchars($wb1_name_full);
     $wb2_title = htmlspecialchars($wb2_name_full);
 
@@ -4278,6 +4837,8 @@ function renderEnergyFlow($layout = 'mobile', $extraClass = '', $extraAttributes
             'wallbox' => $pos('wallbox', $showWb2 ? 38 : 72, $showWb2 ? 78 : 68),
             'wallbox2' => $pos('wallbox2', 62, 78),
             'climate' => $pos('climate', $showWb2 ? 82 : 84, $showWb2 ? 78 : 84),
+            'generation' => $pos('generation', 35, 50),
+            'consumption' => $pos('consumption', 65, 50),
         ];
         $hsDefaultX = $showWp ? ($showWb2 ? 62 : 55) : $positions['heatpump']['x'];
         $hsDefaultY = $showWp ? ($showWb2 ? 64 : 84) : $positions['heatpump']['y'];
@@ -4298,13 +4859,34 @@ function renderEnergyFlow($layout = 'mobile', $extraClass = '', $extraAttributes
             'wallbox2' => $pos('wallbox2', 62, 80),
             'heater' => $pos('heater', $showWb2 ? 62 : 55, $showWb2 ? 66 : 84),
             'climate' => $pos('climate', $showWb2 ? 82 : 76, $showWb2 ? 64 : 90),
+            'generation' => $pos('generation', 34, 50),
+            'consumption' => $pos('consumption', 66, 50),
         ];
         $hsSize = $showWp ? 'width: 60px; height: 60px; border-width: 2px;' : '';
         $hsIconSize = $showWp ? 'font-size: 1.0rem; margin-bottom: 0;' : '';
         $hsValSize = $showWp ? 'font-size: 0.7rem;' : '';
         $nodeGlow = 15;
     }
-    $positions['center'] = ['x' => 50.0, 'y' => 50.0];
+    if ($aggregateGeneration) {
+        $positions['pv'] = $pos('pv', $layout === 'desktop' ? 15 : 10, 32);
+        $positions['external_pv'] = $pos('external_pv', $layout === 'desktop' ? 15 : 10, 68);
+        $positions['generation'] = $pos('generation', $layout === 'desktop' ? 35 : 30, 50);
+    }
+    if ($aggregateConsumption) {
+        $count = count($consumerKeys);
+        foreach ($consumerKeys as $idx => $key) {
+            $rangeStart = $layout === 'desktop' ? 12 : 10;
+            $rangeSize = $layout === 'desktop' ? 76 : 80;
+            $defaultY = $count === 1 ? 50 : $rangeStart + ($idx * ($rangeSize / max(1, $count - 1)));
+            $positions[$key] = $pos($key, $layout === 'desktop' ? 85 : 90, $defaultY);
+        }
+        $positions['consumption'] = $pos('consumption', $layout === 'desktop' ? 65 : 70, 50);
+    }
+    if ($aggregateGeneration || $aggregateConsumption) {
+        $positions['battery'] = $pos('battery', 50, $layout === 'desktop' ? 16 : 14);
+        $positions['grid'] = $pos('grid', 50, $layout === 'desktop' ? 84 : 86);
+    }
+    $positions['center'] = $pos('center', 50, 50);
 
     $nodeStyle = function($nodeKey, $colorKey, $extra = '') use ($positions, $colors, $pct, $rgba, $nodeGlow) {
         $p = $positions[$nodeKey];
@@ -4339,54 +4921,69 @@ function renderEnergyFlow($layout = 'mobile', $extraClass = '', $extraAttributes
     if ($showWp) $colorOptions['heatpump'] = 'WP';
     if ($showHs) $colorOptions['heater'] = 'Heizstab';
     if ($showClimate) $colorOptions['climate'] = 'Klima';
+    if ($aggregateGeneration) $colorOptions['generation'] = 'Erzeugung';
+    if ($aggregateConsumption) $colorOptions['consumption'] = 'Verbrauch';
+    $colorOptions['center'] = 'E3DC-Control';
     $colorSelect = '';
     foreach ($colorOptions as $key => $label) {
         $colorSelect .= '<option value="' . htmlspecialchars($key) . '">' . htmlspecialchars($label) . '</option>';
     }
 
-    $flowFlags = trim(($showWb2 ? ' flow-has-wb2' : '') . ($showWp ? ' flow-has-wp' : '') . ($showHs ? ' flow-has-hs' : '') . ($showClimate ? ' flow-has-climate' : '') . ($showExternalWr ? ' flow-has-external-wr' : ''));
+    $flowFlags = trim(($showWb2 ? ' flow-has-wb2' : '') . ($showWp ? ' flow-has-wp' : '') . ($showHs ? ' flow-has-hs' : '') . ($showClimate ? ' flow-has-climate' : '') . ($showExternalWr ? ' flow-has-external-wr' : '') . ($aggregateGeneration ? ' flow-has-generation-aggregate' : '') . ($aggregateConsumption ? ' flow-has-consumption-aggregate' : ''));
     $flowClasses = trim('flow-container ' . trim($extraClass) . ' ' . $flowFlags);
 
     return '
     <div id="flow-view" class="' . $flowClasses . '" data-flow-layout="' . htmlspecialchars($layout) . '" ' . $extraAttributes . '>
         <div class="flow-editor-toolbar" data-flow-toolbar>
+            <span class="flow-save-status" data-flow-save-status role="status" aria-live="polite"></span>
             <button type="button" class="btn btn-sm btn-outline-secondary" data-flow-edit title="Layout bearbeiten" aria-label="Layout bearbeiten"><i class="fas fa-pen"></i></button>
             <div class="flow-editor-controls">
                 <button type="button" class="btn btn-sm btn-outline-secondary" data-flow-auto title="Standardlayout" aria-label="Standardlayout"><i class="fas fa-wand-magic-sparkles"></i></button>
                 <select class="form-select form-select-sm flow-color-select" data-flow-color-select title="Node-Farbe" aria-label="Node-Farbe">' . $colorSelect . '</select>
                 <input type="color" class="form-control form-control-color flow-color-input" data-flow-color-input value="' . htmlspecialchars($colors['pv'] ?? '#ffc107') . '" title="Farbe" aria-label="Farbe">
+                <input type="text" class="form-control form-control-sm flow-label-input" data-flow-label-input maxlength="32" autocomplete="off" placeholder="Anzeigename" title="Optionaler Anzeigename" aria-label="Optionaler Anzeigename">
                 <button type="button" class="btn btn-sm btn-success" data-flow-save title="Speichern" aria-label="Speichern"><i class="fas fa-check"></i></button>
                 <button type="button" class="btn btn-sm btn-outline-secondary" data-flow-cancel title="Abbrechen" aria-label="Abbrechen"><i class="fas fa-times"></i></button>
             </div>
         </div>
+        <div class="flow-canvas" data-flow-canvas>
         <svg class="flow-svg">
-            ' . $linePair('pv', 'pv', 'center', 'pv', 'flow-line-pv', 'flow-dot-pv') . '
-            ' . ($showExternalWr ? $linePair('external_pv', 'external_pv', 'center', 'external_pv', 'flow-line-external-pv', 'flow-dot-external-pv') : '') . '
+            ' . ($aggregateGeneration
+                ? $linePair('pv', 'pv', 'generation', 'pv', 'flow-line-pv', 'flow-dot-pv')
+                    . $linePair('external_pv', 'external_pv', 'generation', 'external_pv', 'flow-line-external-pv', 'flow-dot-external-pv')
+                    . $linePair('generation', 'generation', 'center', 'generation', 'flow-line-generation', 'flow-dot-generation')
+                : $linePair('pv', 'pv', 'center', 'pv', 'flow-line-pv', 'flow-dot-pv')
+                    . $linePair('external_pv', 'external_pv', 'center', 'external_pv', 'flow-line-external-pv', 'flow-dot-external-pv')) . '
             ' . $linePair('grid', 'grid', 'center', 'grid', 'flow-line-grid', 'flow-dot-grid') . '
             ' . $linePair('battery', 'battery', 'center', 'battery', 'flow-line-bat', 'flow-dot-bat') . '
-            ' . $linePair('home', 'center', 'home', 'home', 'flow-line-home', 'flow-dot-home') . '
-            ' . ($showWp ? $linePair('heatpump', 'center', 'heatpump', 'heatpump', 'flow-line-wp', 'flow-dot-wp') : '') . '
-            ' . ($showWb ? $linePair('wallbox', 'center', 'wallbox', 'wallbox', 'flow-line-wb', 'flow-dot-wb') : '') . '
-            ' . ($showWb2 ? $linePair('wallbox2', 'center', 'wallbox2', 'wallbox2', 'flow-line-wb2', 'flow-dot-wb2') : '') . '
-            ' . ($showHs ? $linePair('heater', 'center', 'heater', 'heater', 'flow-line-hs', 'flow-dot-hs') : '') . '
-            ' . ($showClimate ? $linePair('climate', 'center', 'climate', 'climate', 'flow-line-climate', 'flow-dot-climate') : '') . '
+            ' . ($aggregateConsumption ? $linePair('consumption', 'center', 'consumption', 'consumption', 'flow-line-consumption', 'flow-dot-consumption') : '') . '
+            ' . $linePair('home', $aggregateConsumption ? 'consumption' : 'center', 'home', 'home', 'flow-line-home', 'flow-dot-home') . '
+            ' . ($showWp ? $linePair('heatpump', $aggregateConsumption ? 'consumption' : 'center', 'heatpump', 'heatpump', 'flow-line-wp', 'flow-dot-wp') : '') . '
+            ' . ($showWb ? $linePair('wallbox', $aggregateConsumption ? 'consumption' : 'center', 'wallbox', 'wallbox', 'flow-line-wb', 'flow-dot-wb') : '') . '
+            ' . ($showWb2 ? $linePair('wallbox2', $aggregateConsumption ? 'consumption' : 'center', 'wallbox2', 'wallbox2', 'flow-line-wb2', 'flow-dot-wb2') : '') . '
+            ' . ($showHs ? $linePair('heater', $aggregateConsumption ? 'consumption' : 'center', 'heater', 'heater', 'flow-line-hs', 'flow-dot-hs') : '') . '
+            ' . ($showClimate ? $linePair('climate', $aggregateConsumption ? 'consumption' : 'center', 'climate', 'climate', 'flow-line-climate', 'flow-dot-climate') : '') . '
         </svg>
 
         <div class="flow-node-back" id="f-node-bat-back" data-flow-back="battery" ' . $nodeAttrs('battery') . ' style="top: '.$pct($positions['battery']['y']).'%; left: '.$pct($positions['battery']['x']).'%;"></div>
 
-        <div class="flow-node node-pv" id="f-node-pv" data-flow-node="pv" data-flow-color-key="pv" ' . $nodeAttrs('pv') . ' style="' . $nodeStyle('pv', 'pv') . '"><i class="fas fa-sun fa-icon"></i><div class="val" id="f-val-pv">0W</div><div class="label flow-pv-split" id="f-val-pv-split" style="display:none;"></div><div class="label">Sonne</div><div class="price-tag" id="f-val-pv-yield" style="display:none;"></div><span class="flow-zero-export-badge" id="f-pv-zero-export-badge" role="status" aria-live="polite" hidden><i class="fas fa-shield-alt" aria-hidden="true"></i><span id="f-pv-zero-export-label">LUOX 0 W</span></span></div>
-        ' . ($showExternalWr ? '<div class="flow-node node-external-pv" id="f-node-external-pv" data-flow-node="external_pv" data-flow-color-key="external_pv" ' . $nodeAttrs('external_pv') . ' style="' . $nodeStyle('external_pv', 'external_pv') . '"><i class="fas fa-solar-panel fa-icon"></i><div class="val" id="f-val-external-pv">0W</div><div class="label" id="f-label-external-pv">Zusatz-WR</div><i class="fas fa-lock" id="f-external-pv-lock" style="display:none;"></i><button type="button" class="external-wr-lock-btn" id="f-external-pv-lock-btn" title="Zusatz-WR manuell sperren" aria-label="Zusatz-WR manuell sperren" aria-pressed="false" onclick="event.stopPropagation(); toggleDirectMarketingAuxInverterShellyLock(this);"><i class="fas fa-lock"></i></button></div>' : '') . '
-        <div class="flow-node node-grid" id="f-node-grid" data-flow-node="grid" data-flow-color-key="grid" ' . $nodeAttrs('grid') . ' style="' . $nodeStyle('grid', 'grid') . '"><i class="fas fa-network-wired fa-icon"></i><div class="val" id="f-val-grid">0W</div><div class="label">Netz</div><div class="price-tag" id="f-val-price" style="display:none;"></div></div>
-        <div class="flow-node node-bat" id="f-node-bat" data-flow-node="battery" data-flow-color-key="battery" ' . $nodeAttrs('battery') . ' style="' . $nodeStyle('battery', 'battery') . '"><i class="fas fa-battery-half fa-icon"></i><div class="val" id="f-val-bat">0W</div><div class="label" id="f-lbl-soc">0%</div></div>
-        <div class="flow-node node-home" id="f-node-home" data-flow-node="home" data-flow-color-key="home" ' . $nodeAttrs('home') . ' style="' . $nodeStyle('home', 'home') . '"><i class="fas fa-home fa-icon"></i><div class="val" id="f-val-home">0W</div><div class="label">Haus</div></div>
-        ' . ($showWp ? '<div class="flow-node node-wp" id="f-node-wp" data-flow-node="heatpump" data-flow-color-key="heatpump" ' . $nodeAttrs('heatpump') . ' style="' . $nodeStyle('heatpump', 'heatpump') . '"><i class="fas fa-fire fa-icon"></i><div class="val" id="f-val-wp">0W</div><div class="label">WP</div></div>' : '') . '
-        ' . ($showWb ? '<div class="flow-node node-wb node-wb-1" id="f-node-wb" data-flow-node="wallbox" data-flow-color-key="wallbox" ' . $nodeAttrs('wallbox') . ' style="' . $nodeStyle('wallbox', 'wallbox') . '" title="'.$wb1_title.'"><i class="fas fa-charging-station fa-icon"></i><div class="val" id="f-val-wb">0W</div><div class="label">'.$wb1_name.'</div><i class="fas fa-lock" id="f-wb-lock" style="display:none; position:absolute; top:12%; right:22%; font-size:0.7rem; color:#ffc107;"></i><div class="price-tag" id="f-val-wb-session" style="display:none;"></div><div class="price-tag text-success border-success" id="f-val-car-soc" style="display:none; bottom: -42px; background: rgba(16, 185, 129, 0.1); cursor:pointer;" onclick="forceSocUpdate()" title="SoC vom Auto abrufen (Aufwecken)"></div></div>' : '') . '
-        ' . ($showWb2 ? '<div class="flow-node node-wb node-wb-2" id="f-node-wb2" data-flow-node="wallbox2" data-flow-color-key="wallbox2" ' . $nodeAttrs('wallbox2') . ' style="' . $nodeStyle('wallbox2', 'wallbox2') . '" title="'.$wb2_title.'"><i class="fas fa-charging-station fa-icon"></i><div class="val" id="f-val-wb2">0W</div><div class="label">'.$wb2_name.'</div><i class="fas fa-lock" id="f-wb2-lock" style="display:none; position:absolute; top:12%; right:22%; font-size:0.7rem; color:#ffc107;"></i><div class="price-tag" id="f-val-wb2-session" style="display:none;"></div><div class="price-tag text-success border-success" id="f-val-car-soc2" style="display:none; bottom: -42px; background: rgba(16, 185, 129, 0.1); cursor:pointer;" onclick="forceSocUpdate()" title="SoC vom Auto abrufen (Aufwecken)"></div></div>' : '') . '
-        ' . ($showHs ? '<div class="flow-node node-hs" id="f-node-hs" data-flow-node="heater" data-flow-color-key="heater" ' . $nodeAttrs('heater') . ' style="' . $nodeStyle('heater', 'heater', $hsSize) . '"><i class="fas fa-fire-burner fa-icon" style="'.$hsIconSize.'"></i><div class="val" id="f-val-hs" style="'.$hsValSize.'">0W</div><div class="label" style="'.($showWp ? 'font-size: 0.5rem;' : '').'">Heizstab</div><div class="price-tag text-warning border-warning" id="f-val-hs-temp" style="display:none; bottom:-26px; background:rgba(253,126,20,0.12);"></div></div>' : '') . '
-        ' . ($showClimate ? '<div class="flow-node node-climate" id="f-node-climate" data-flow-node="climate" data-flow-color-key="climate" ' . $nodeAttrs('climate') . ' style="' . $nodeStyle('climate', 'climate') . '"><i class="fas fa-snowflake fa-icon"></i><div class="val" id="f-val-climate">0W</div><div class="label">Klima</div></div>' : '') . '
+        ' . ($aggregateGeneration ? '<div class="flow-node node-aggregate node-generation" id="f-node-generation" data-flow-node="generation" data-flow-color-key="generation" ' . $nodeAttrs('generation') . ' style="' . $nodeStyle('generation', 'generation') . '"><i class="fas fa-bolt fa-icon"></i><div class="val" id="f-val-generation">0W</div><div class="label" data-flow-label-key="generation">' . $labelFor('generation', 'Erzeugung') . '</div></div>' : '') . '
+        ' . ($aggregateConsumption ? '<div class="flow-node node-aggregate node-consumption" id="f-node-consumption" data-flow-node="consumption" data-flow-color-key="consumption" ' . $nodeAttrs('consumption') . ' style="' . $nodeStyle('consumption', 'consumption') . '"><i class="fas fa-gauge-high fa-icon"></i><div class="val" id="f-val-consumption">0W</div><div class="label" data-flow-label-key="consumption">' . $labelFor('consumption', 'Verbrauch') . '</div></div>' : '') . '
 
-        <div class="flow-node node-center" data-flow-node="center" data-flow-color-key="center" ' . $nodeAttrs('center') . ' style="cursor:pointer;" onclick="showDiagnoseLog(\'storage_manager\')" title="Storage Manager Protokoll anzeigen"><img src="app-icon-512.png" alt="Hub"></div>
+        <div class="flow-node node-pv" id="f-node-pv" data-flow-node="pv" data-flow-color-key="pv" ' . $nodeAttrs('pv') . ' style="' . $nodeStyle('pv', 'pv') . '"><i class="fas fa-sun fa-icon"></i><div class="val" id="f-val-pv">0W</div><div class="label flow-pv-split" id="f-val-pv-split" style="display:none;"></div><div class="label" data-flow-label-key="pv">' . $labelFor('pv', 'E3DC-PV') . '</div><div class="price-tag" id="f-val-pv-yield" style="display:none;"></div><span class="flow-zero-export-badge" id="f-pv-zero-export-badge" role="status" aria-live="polite" hidden><i class="fas fa-shield-alt" aria-hidden="true"></i><span id="f-pv-zero-export-label">LUOX 0 W</span></span></div>
+        <div class="flow-node node-external-pv" id="f-node-external-pv" data-flow-node="external_pv" data-flow-color-key="external_pv" data-external-pv-configured="' . ($showExternalWr ? '1' : '0') . '" data-external-pv-topology="' . (!empty($externalPvTopology['topology_present']) ? '1' : '0') . '" data-external-pv-control-configured="' . ($externalPvControlConfigured ? '1' : '0') . '" ' . ($showExternalWr ? '' : 'hidden ') . $nodeAttrs('external_pv') . ' style="' . $nodeStyle('external_pv', 'external_pv') . '"><i class="fas fa-solar-panel fa-icon"></i><div class="val" id="f-val-external-pv">0W</div><div class="label" id="f-label-external-pv" data-flow-label-key="external_pv">' . $labelFor('external_pv', 'Zusatz-WR') . '</div><i class="fas fa-lock" id="f-external-pv-lock" style="display:none;"></i><button type="button" class="external-wr-lock-btn" id="f-external-pv-lock-btn" title="Zusatz-WR manuell sperren" aria-label="Zusatz-WR manuell sperren" aria-pressed="false" onclick="event.stopPropagation(); toggleDirectMarketingAuxInverterShellyLock(this);"' . ($externalPvControlConfigured ? '' : ' hidden disabled') . '><i class="fas fa-lock"></i></button></div>
+        <div class="flow-node node-grid" id="f-node-grid" data-flow-node="grid" data-flow-color-key="grid" ' . $nodeAttrs('grid') . ' style="' . $nodeStyle('grid', 'grid') . '"><i class="fas fa-network-wired fa-icon"></i><div class="val" id="f-val-grid">0W</div><div class="label" data-flow-label-key="grid">' . $labelFor('grid', 'Netz') . '</div><div class="price-tag" id="f-val-price" style="display:none;"></div></div>
+        <div class="flow-node node-bat" id="f-node-bat" data-flow-node="battery" data-flow-color-key="battery" ' . $nodeAttrs('battery') . ' style="' . $nodeStyle('battery', 'battery') . '"><i class="fas fa-battery-half fa-icon"></i><div class="val" id="f-val-bat">0W</div><div class="label" data-flow-label-key="battery">' . $labelFor('battery', 'Speicher') . '</div><div class="label flow-secondary-label" id="f-lbl-soc">0%</div></div>
+        <div class="flow-node node-home" id="f-node-home" data-flow-node="home" data-flow-color-key="home" ' . $nodeAttrs('home') . ' style="' . $nodeStyle('home', 'home') . '"><i class="fas fa-home fa-icon"></i><div class="val" id="f-val-home">0W</div><div class="label" data-flow-label-key="home">' . $labelFor('home', 'Haus') . '</div></div>
+        ' . ($showWp ? '<div class="flow-node node-wp" id="f-node-wp" data-flow-node="heatpump" data-flow-color-key="heatpump" ' . $nodeAttrs('heatpump') . ' style="' . $nodeStyle('heatpump', 'heatpump') . '"><i class="fas fa-fire fa-icon"></i><div class="val" id="f-val-wp">0W</div><div class="label" data-flow-label-key="heatpump">' . $labelFor('heatpump', 'Wärmepumpe') . '</div></div>' : '') . '
+        ' . ($showWb ? '<div class="flow-node node-wb node-wb-1" id="f-node-wb" data-flow-node="wallbox" data-flow-color-key="wallbox" ' . $nodeAttrs('wallbox') . ' style="' . $nodeStyle('wallbox', 'wallbox') . '" title="'.$wb1_title.'"><i class="fas fa-charging-station fa-icon"></i><div class="val" id="f-val-wb">0W</div><div class="label" data-flow-label-key="wallbox">'.$wb1_name.'</div><i class="fas fa-lock" id="f-wb-lock" style="display:none; position:absolute; top:12%; right:22%; font-size:0.7rem; color:#ffc107;"></i><div class="price-tag" id="f-val-wb-session" style="display:none;"></div><div class="price-tag text-success border-success" id="f-val-car-soc" style="display:none; bottom: -42px; background: rgba(16, 185, 129, 0.1); cursor:pointer;" onclick="forceSocUpdate()" title="SoC vom Auto abrufen (Aufwecken)"></div></div>' : '') . '
+        ' . ($showWb2 ? '<div class="flow-node node-wb node-wb-2" id="f-node-wb2" data-flow-node="wallbox2" data-flow-color-key="wallbox2" ' . $nodeAttrs('wallbox2') . ' style="' . $nodeStyle('wallbox2', 'wallbox2') . '" title="'.$wb2_title.'"><i class="fas fa-charging-station fa-icon"></i><div class="val" id="f-val-wb2">0W</div><div class="label" data-flow-label-key="wallbox2">'.$wb2_name.'</div><i class="fas fa-lock" id="f-wb2-lock" style="display:none; position:absolute; top:12%; right:22%; font-size:0.7rem; color:#ffc107;"></i><div class="price-tag" id="f-val-wb2-session" style="display:none;"></div><div class="price-tag text-success border-success" id="f-val-car-soc2" style="display:none; bottom: -42px; background: rgba(16, 185, 129, 0.1); cursor:pointer;" onclick="forceSocUpdate()" title="SoC vom Auto abrufen (Aufwecken)"></div></div>' : '') . '
+        ' . ($showHs ? '<div class="flow-node node-hs" id="f-node-hs" data-flow-node="heater" data-flow-color-key="heater" ' . $nodeAttrs('heater') . ' style="' . $nodeStyle('heater', 'heater', $hsSize) . '"><i class="fas fa-fire-burner fa-icon" style="'.$hsIconSize.'"></i><div class="val" id="f-val-hs" style="'.$hsValSize.'">0W</div><div class="label" data-flow-label-key="heater" style="'.($showWp ? 'font-size: 0.5rem;' : '').'">' . $labelFor('heater', 'Heizstab') . '</div><div class="price-tag text-warning border-warning" id="f-val-hs-temp" style="display:none; bottom:-26px; background:rgba(253,126,20,0.12);"></div></div>' : '') . '
+        ' . ($showClimate ? '<div class="flow-node node-climate" id="f-node-climate" data-flow-node="climate" data-flow-color-key="climate" ' . $nodeAttrs('climate') . ' style="' . $nodeStyle('climate', 'climate') . '"><i class="fas fa-snowflake fa-icon"></i><div class="val" id="f-val-climate">0W</div><div class="label" data-flow-label-key="climate">' . $labelFor('climate', 'Klima') . '</div></div>' : '') . '
+
+        <div class="flow-node node-center" data-flow-node="center" data-flow-color-key="center" ' . $nodeAttrs('center') . ' style="cursor:pointer;" onclick="if (!this.closest(\'.flow-container\').classList.contains(\'flow-editing\')) { showDiagnoseLog(\'storage_manager\'); }" title="Storage Manager Protokoll anzeigen"><img src="app-icon-512.png" alt="Hub"></div>
         <div class="flow-hover-panel" data-flow-hover-panel aria-hidden="true"></div>
+        </div>
     </div>';
 }
 
@@ -4981,7 +5578,7 @@ function calculateDailyEnergyStats($historyLines, $options = []) {
             $dt = $ts - $lastTs; // in Sekunden
             if ($dt > 0 && $dt < 3600) {
                 $dtHours = $dt / 3600;
-                
+
                 $pNow = $d['price_ct'] ?? null;
                 $pPrev = $lastRow['price_ct'] ?? null;
                 if (is_numeric($pNow) && is_numeric($pPrev)) {
@@ -5084,7 +5681,7 @@ function calculateDailyEnergyStats($historyLines, $options = []) {
 
                 $stats['bat_grid_kwh'] += ($bat_to_grid * $dtHours) / 1000;
                 $stats['cost_grid_out'] += (($pv_to_grid + $bat_to_grid) * $dtHours / 1000) * $price_ct;
-                
+
                 if ($loads > 0) {
                     $stats['pv_home_kwh'] += ($pv_to_loads * ($home / $loads) * $dtHours) / 1000;
                     $stats['pv_wb_kwh'] += ($pv_to_loads * ($wb / $loads) * $dtHours) / 1000;
@@ -5111,14 +5708,14 @@ function calculateDailyEnergyStats($historyLines, $options = []) {
                 $stats['grid_bat_kwh'] += ($grid_to_bat * $dtHours) / 1000;
                 $stats['cost_total'] += ($grid_in * $dtHours / 1000) * $price_ct;
                 $stats['cost_bat'] += ($grid_to_bat * $dtHours / 1000) * $price_ct;
-                
+
                 if ($loads > 0) {
                     $stats['grid_home_kwh'] += ($grid_to_loads * ($home / $loads) * $dtHours) / 1000;
                     $stats['grid_wb_kwh'] += ($grid_to_loads * ($wb / $loads) * $dtHours) / 1000;
                     $stats['grid_wb2_kwh'] += ($grid_to_loads * ($wb2 / $loads) * $dtHours) / 1000;
                     $stats['grid_wp_kwh'] += ($grid_to_loads * ($wp / $loads) * $dtHours) / 1000;
                     $stats['grid_climate_kwh'] += ($grid_to_loads * ($climate / $loads) * $dtHours) / 1000;
-                    
+
                     $stats['cost_home'] += ($grid_to_loads * ($home / $loads) * $dtHours / 1000) * $price_ct;
                     $stats['cost_wb'] += ($grid_to_loads * ($wb / $loads) * $dtHours / 1000) * $price_ct;
                     $stats['cost_wb2'] += ($grid_to_loads * ($wb2 / $loads) * $dtHours / 1000) * $price_ct;
@@ -5160,15 +5757,15 @@ function calculateDailyEnergyStats($historyLines, $options = []) {
     $finalExact = ['e_pv' => 0, 'e_grid_in' => 0, 'e_grid_out' => 0, 'e_bat_out' => 0, 'e_bat_in' => 0, 'e_home' => 0, 'e_wb' => 0, 'e_wb2' => 0, 'e_wp' => 0, 'e_climate' => 0];
     $finalExactSource = array_fill_keys(array_keys($finalExact), '');
     $exactBaselines = e3dcDailyExactBaselines($historyLines, $activeDate, array_keys($finalExact), $options);
-    
+
     foreach ($historyLines as $ln) {
         $d = json_decode($ln, true);
         if (!$d || !isset($d['ts']) || strpos($d['ts'], $activeDate) !== 0) continue;
-        
+
         foreach (array_keys($finalExact) as $k) {
             if (isset($d[$k])) {
                 $val = (float)$d[$k];
-                
+
                 // Schutz gegen massive RSCP-Glitches (z.B. 0xFFFFFFFF Fehler = 4294967 kWh).
                 // 0.0 ist nach Mitternacht ein gültiger Reset und darf alte
                 // Hangover-Werte von gestern aktiv überschreiben.
@@ -5181,7 +5778,7 @@ function calculateDailyEnergyStats($historyLines, $options = []) {
                     // 1. Er noch 0 ist (Start)
                     // 2. Er wächst (normaler Tagesverlauf)
                     // 3. Er massiv (> 5 kWh) fällt => Löst das Problem des "Hangover-Glitches":
-                    //    Wenn E3DC kurz nach 0 Uhr noch den Wert von gestern funkt (z.B. 52 kWh) 
+                    //    Wenn E3DC kurz nach 0 Uhr noch den Wert von gestern funkt (z.B. 52 kWh)
                     //    und im folgenden Tick auf reale 0.001 kWh fällt.
                     if ($finalExact[$k] == 0 || $val > $finalExact[$k] || ($finalExact[$k] - $val > 5.0)) {
                         $finalExact[$k] = $val;
@@ -5237,7 +5834,7 @@ function calculateDailyEnergyStats($historyLines, $options = []) {
         $stats['pv_source_rest_kwh'] = max(0.0, $stats['total_pv'] - $pvSourceSum);
     }
     $wallboxExactSanity = [];
-    
+
     // Exact Values für Wallbox und WP anwenden, falls vorhanden (native Zähler aus C++)
     if ($finalExact['e_wb'] > 0) {
         $wbSum = $stats['pv_wb_kwh'] + $stats['grid_wb_kwh'] + $stats['bat_wb_kwh'];
@@ -5408,7 +6005,7 @@ function calculateDailyEnergyStats($historyLines, $options = []) {
             $res['stats']["pv_{$pvSource}_{$destination}_pct"] = round(($value / $sourceTotal) * 100);
         }
     }
-    
+
     $res['stats']['total_home_kwh'] = round(($stats['pv_home_kwh'] + $stats['grid_home_kwh'] + $stats['bat_home_kwh']), 2);
     $res['stats']['total_wb_kwh'] = round(($stats['pv_wb_kwh'] + $stats['grid_wb_kwh'] + $stats['bat_wb_kwh']), 2);
     $res['stats']['total_wb2_kwh'] = round(($stats['pv_wb2_kwh'] + $stats['grid_wb2_kwh'] + $stats['bat_wb2_kwh']), 2);
@@ -5432,7 +6029,7 @@ function calculateDailyEnergyStats($historyLines, $options = []) {
         $res['stats']["bat_{$key}_kwh"] = round($val, 2);
         $res['stats']["bat_{$key}_pct"] = round(($val / $totalBatOut) * 100);
     }
-    
+
     $res['costs'] = [
         'total' => round($stats['cost_total'] / 100, 2),
         'home' => round($stats['cost_home'] / 100, 2),
@@ -5490,7 +6087,7 @@ function renderGridHealthModal($dialogClass = 'modal-md modal-dialog-scrollable'
                     <button type="button" class="btn-close e3dc-modal-close" data-bs-dismiss="modal" aria-label="Close"></button>
                 </div>
                 <div class="modal-body p-3">
-                    
+
                     <!-- Netzfrequenz-Anzeige -->
                     <div class=mb-4>
                         <h6 class=text-muted text-uppercase small fw-bold mb-2 d-flex justify-content-between align-items-center>
@@ -5514,12 +6111,12 @@ function renderGridHealthModal($dialogClass = 'modal-md modal-dialog-scrollable'
                             <div class="small" id="gridHealthText">Netzbelastung ist symmetrisch.</div>
                         </div>
                     </div>
-                    
+
                     <h6 class="text-muted text-uppercase small fw-bold mb-3 d-flex justify-content-between align-items-center">
                         Hausnetz (Sensor)
                         <span id="gh-max-scale" class="badge bg-secondary" style="font-size: 0.65em;">Max: --A</span>
                     </h6>
-                    
+
                     <div class="mb-3">
                         <div class="d-flex justify-content-between small mb-1">
                             <span class="text-body">L1 (Phase 1)</span>
@@ -5530,7 +6127,7 @@ function renderGridHealthModal($dialogClass = 'modal-md modal-dialog-scrollable'
                         </div>
                         <div class="text-end mt-1"><span id="gh-l1-a" class="text-muted" style="font-size: 0.75rem;">0.0 A</span></div>
                     </div>
-                    
+
                     <div class="mb-3">
                         <div class="d-flex justify-content-between small mb-1">
                             <span class="text-body">L2 (Phase 2)</span>
@@ -5541,7 +6138,7 @@ function renderGridHealthModal($dialogClass = 'modal-md modal-dialog-scrollable'
                         </div>
                         <div class="text-end mt-1"><span id="gh-l2-a" class="text-muted" style="font-size: 0.75rem;">0.0 A</span></div>
                     </div>
-                    
+
                     <div class="mb-3">
                         <div class="d-flex justify-content-between small mb-1">
                             <span class="text-body">L3 (Phase 3)</span>
@@ -5552,7 +6149,7 @@ function renderGridHealthModal($dialogClass = 'modal-md modal-dialog-scrollable'
                         </div>
                         <div class="text-end mt-1"><span id="gh-l3-a" class="text-muted" style="font-size: 0.75rem;">0.0 A</span></div>
                     </div>
-                    
+
                     <!-- Optionale Wallbox-Phasen (blenden sich ein wenn vorhanden) -->
                     <div id="gh-wb-container" style="display: none;">
                         <hr class="border-secondary my-4">
@@ -5580,7 +6177,7 @@ function renderGridHealthModal($dialogClass = 'modal-md modal-dialog-scrollable'
                             </div>
                         </div>
                     </div>
-                    
+
                 </div>
             </div>
         </div>
@@ -5617,7 +6214,7 @@ function saveDailyStats($date, $data, $action = 'save') {
         $grid_out = (float)str_replace(',', '.', $data['grid_out'] ?? 0);
         $bat_in = (float)str_replace(',', '.', $data['bat_in'] ?? 0);
         $bat_out = (float)str_replace(',', '.', $data['bat_out'] ?? 0);
-        
+
 	        $totalCons = $home + $wb + $wb2 + $wp + $climate;
         $autarky = ($totalCons > 0) ? max(0, min(100, (($totalCons - $grid_in) / $totalCons) * 100)) : 0;
         $self_con = ($pv > 0) ? max(0, min(100, (($pv - $grid_out) / $pv) * 100)) : 0;
@@ -5635,7 +6232,7 @@ function saveDailyStats($date, $data, $action = 'save') {
 	            $cols = "date, pv_yield, home_consumption, grid_in, grid_out, bat_in, bat_out, wb_consumption, wb2_consumption, wp_consumption, climate_consumption, autarky, self_con";
 	            $placeholders = "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?";
 	            $params = [$date, $pv, $home, $grid_in, $grid_out, $bat_in, $bat_out, $wb, $wb2, $wp, $climate, $autarky, $self_con];
-    
+
             $stmt = $db->prepare("INSERT INTO daily_stats ($cols) VALUES ($placeholders)");
             return $stmt->execute($params);
         }
@@ -5658,14 +6255,11 @@ function getAjaxActionUrl($page) {
  */
 function getFooterInstallRootCandidates() {
     $paths = function_exists('getInstallPaths') ? getInstallPaths() : [];
-    $installPath = rtrim($paths['install_path'] ?? '', '/');
-    $homeDir = rtrim($paths['home_dir'] ?? '', '/');
+    $installPath = !empty($paths['valid']) ? rtrim($paths['install_path'], '/') : '';
+    $sourceRoot = e3dcValidatedProductRoot(dirname(__DIR__));
     $candidates = [
         $installPath,
-        $homeDir ? $homeDir . '/Install' : '',
-        dirname(__DIR__),
-        '/home/pi/Install',
-        '/app/pi/Install',
+        $sourceRoot ?: '',
     ];
 
     $unique = [];
@@ -5678,17 +6272,29 @@ function getFooterInstallRootCandidates() {
     return array_values($unique);
 }
 
-function readInstalledVersion() {
-    $versionFiles = ['/var/www/html/VERSION'];
-    foreach (getFooterInstallRootCandidates() as $root) {
-        $versionFiles[] = $root . '/VERSION';
+function e3dcReadReleaseVersionFile($file) {
+    if (!is_string($file) || $file === '' || !is_file($file) || is_link($file) || !is_readable($file)) {
+        return '';
     }
-    foreach ($versionFiles as $file) {
-        if (!is_readable($file)) continue;
-        $version = trim((string)@file_get_contents($file));
+    $size = @filesize($file);
+    if ($size === false || $size < 1 || $size > 64) return '';
+    $version = trim((string)@file_get_contents($file));
+    return preg_match('/^[0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9._-]*$/', $version) ? $version : '';
+}
+
+/**
+ * Liest die installierte Produktversion aus dem validierten Release-Baum.
+ * Das Webroot-Duplikat ist nur ein fail-closed Fallback für Altinstallationen.
+ */
+function readInstalledVersion($productRoots = null, $webrootVersionFile = '/var/www/html/VERSION') {
+    $roots = $productRoots === null ? getFooterInstallRootCandidates() : (array)$productRoots;
+    foreach ($roots as $root) {
+        $validatedRoot = e3dcValidatedProductRoot($root);
+        if ($validatedRoot === null) continue;
+        $version = e3dcReadReleaseVersionFile($validatedRoot . '/VERSION');
         if ($version !== '') return $version;
     }
-    return '';
+    return e3dcReadReleaseVersionFile($webrootVersionFile);
 }
 
 function getInstalledReleaseInfo() {
@@ -5697,10 +6303,11 @@ function getInstalledReleaseInfo() {
         'date' => null,
         'date_raw' => null,
     ];
-    $policyFiles = ['/var/www/html/UPDATE_POLICY.json'];
+    $policyFiles = [];
     foreach (getFooterInstallRootCandidates() as $root) {
         $policyFiles[] = $root . '/UPDATE_POLICY.json';
     }
+    $policyFiles[] = '/var/www/html/UPDATE_POLICY.json';
 
     foreach ($policyFiles as $file) {
         if (!is_readable($file)) continue;

@@ -16,6 +16,7 @@ import socket
 import time
 import zlib
 import logging
+from contextlib import contextmanager
 
 # Rijndael-256-CBC via pycryptodome (Standard-Paket, kein Sonder-Fork)
 # pip install pycryptodome
@@ -367,154 +368,564 @@ class RscpType:
 
 # Bekannte Tag-Codes (Subset für vital_stats / Batterie-Diagnostik)
 class RscpTag:
-    # Auth
-    RSCP_REQ_AUTHENTICATION       = 0x00000001
-    RSCP_AUTHENTICATION_USER      = 0x00000002
-    RSCP_AUTHENTICATION_PASSWORD  = 0x00000003
-    RSCP_AUTHENTICATION           = 0x00800001
+    """Single productive RSCP tag registry."""
+    BAT_ASOC                                    = 0x0380000F
+    BAT_CHARGE_CYCLES                           = 0x03800008
+    BAT_CURRENT                                 = 0x03800003
+    BAT_DATA                                    = 0x03840000
+    BAT_DCB_ALL_CELL_TEMPERATURES               = 0x03800018
+    BAT_DCB_ALL_CELL_VOLTAGES                   = 0x0380001A
+    BAT_DCB_CELL_TEMPERATURE                    = 0x03800019
+    BAT_DCB_CELL_VOLTAGE                        = 0x0380001B
+    BAT_DCB_COUNT                               = 0x0380000D
+    BAT_DCB_CYCLE_COUNT                         = 0x03800110
+    BAT_DCB_INDEX                               = 0x03800100
+    BAT_DCB_INFO                                = 0x03800042
+    BAT_DCB_SOH                                 = 0x03800109
+    BAT_DCB_SOH_H20                             = 0x03800116
+    BAT_FCC                                     = 0x03800010
+    BAT_INDEX                                   = 0x03040001
+    BAT_INFO                                    = 0x03800020
+    BAT_MAX_CHARGE_CURRENT                      = 0x03800005
+    BAT_MAX_DCB_CELL_TEMPERATURE                = 0x03800016
+    BAT_MIN_DCB_CELL_TEMPERATURE                = 0x03800017
+    BAT_MODULE_VOLTAGE                          = 0x03800002
+    BAT_RC                                      = 0x03800011
+    BAT_REQ_ASOC                                = 0x0300000F
+    BAT_REQ_CHARGE_CYCLES                       = 0x03000008
+    BAT_REQ_CURRENT                             = 0x03000003
+    BAT_REQ_DATA                                = 0x03040000
+    BAT_REQ_DCB_ALL_CELL_TEMPERATURES           = 0x03000018
+    BAT_REQ_DCB_ALL_CELL_VOLTAGES               = 0x0300001A
+    BAT_REQ_DCB_COUNT                           = 0x0300000D
+    BAT_REQ_DCB_INFO                            = 0x03000042
+    BAT_REQ_EOD_VOLTAGE                         = 0x03000006
+    BAT_REQ_FCC                                 = 0x03000010
+    BAT_REQ_INFO                                = 0x03000020
+    BAT_REQ_MAX_CHARGE_CURRENT                  = 0x03000005
+    BAT_REQ_MAX_DCB_CELL_TEMPERATURE            = 0x03000016
+    BAT_REQ_MIN_DCB_CELL_TEMPERATURE            = 0x03000017
+    BAT_REQ_MODULE_VOLTAGE                      = 0x03000002
+    BAT_REQ_RC                                  = 0x03000011
+    BAT_REQ_RSOC                                = 0x03000001
+    BAT_REQ_SPECIFICATION                       = 0x03000043
+    BAT_REQ_USABLE_CAPACITY                     = 0x03000026
+    BAT_RSOC                                    = 0x03800001
+    BAT_SPECIFICATION                           = 0x03800043
+    BAT_SPECIFIED_CAPACITY                      = 0x03800125
+    BAT_USABLE_CAPACITY                         = 0x03800026
+    DB_BAT_POWER_IN                             = 0x06800002
+    DB_BAT_POWER_OUT                            = 0x06800003
+    DB_CONSUMPTION                              = 0x06800007
+    DB_DC_POWER                                 = 0x06800004
+    DB_GRID_POWER_IN                            = 0x06800005
+    DB_GRID_POWER_OUT                           = 0x06800006
+    DB_HISTORY_DATA_DAY                         = 0x06800100
+    DB_PM_0_POWER                               = 0x06800008
+    DB_PM_1_POWER                               = 0x06800009
+    DB_REQ_HISTORY_DATA_DAY                     = 0x06000100
+    DB_REQ_HISTORY_TIME_INTERVAL                = 0x06000102
+    DB_REQ_HISTORY_TIME_SPAN                    = 0x06000103
+    DB_REQ_HISTORY_TIME_START                   = 0x06000101
+    DB_SUM_CONTAINER                            = 0x06800010
+    EMS_AUTARKY                                 = 0x01800006
+    EMS_BATTERY_BEFORE_CAR_MODE                 = 0x01800079
+    EMS_BATTERY_TO_CAR_MODE                     = 0x01800077
+    EMS_BAT_CHARGE_LIMIT                        = 0x01800042
+    EMS_BAT_SOC                                 = 0x01800008
+    EMS_DERATE_AT_PERCENT_VALUE                 = 0x01800014
+    EMS_DERATE_AT_POWER_VALUE                   = 0x01800015
+    EMS_DISCHARGE_START_POWER                   = 0x01000103
+    EMS_EMERGENCY_POWER_STATUS                  = 0x01800073
+    EMS_GET_POWER_SETTINGS                      = 0x0180008B
+    EMS_GET_WB_DISCHARGE_BAT_UNTIL              = 0x0180027D
+    EMS_INSTALLED_PEAK_POWER                    = 0x01800013
+    EMS_MANUAL_CHARGE_ACTIVE                    = 0x01000151
+    EMS_MAX_CHARGE_POWER                        = 0x01000101
+    EMS_MAX_DISCHARGE_POWER                     = 0x01000102
+    EMS_POWER_ADD                               = 0x01800005
+    EMS_POWER_BAT                               = 0x01800002
+    EMS_POWER_GRID                              = 0x01800004
+    EMS_POWER_HOME                              = 0x01800003
+    EMS_POWER_LIMITS_USED                       = 0x01000100
+    EMS_POWER_PV                                = 0x01800001
+    EMS_POWER_WB_ALL                            = 0x0180001F
+    EMS_REMAINING_BAT_CHARGE_POWER              = 0x01800071
+    EMS_REMAINING_BAT_DISCHARGE_POWER           = 0x01800072
+    EMS_REQ_AUTARKY                             = 0x01000006
+    EMS_REQ_BATTERY_BEFORE_CAR_MODE             = 0x01000079
+    EMS_REQ_BATTERY_TO_CAR_MODE                 = 0x01000077
+    EMS_REQ_BAT_CHARGE_LIMIT                    = 0x01000042
+    EMS_REQ_BAT_SOC                             = 0x01000008
+    EMS_REQ_DERATE_AT_PERCENT_VALUE             = 0x01000014
+    EMS_REQ_DERATE_AT_POWER_VALUE               = 0x01000015
+    EMS_REQ_EMERGENCY_POWER_STATUS              = 0x01000073
+    EMS_REQ_GET_POWER_SETTINGS                  = 0x0100008B
+    EMS_REQ_GET_WB_DISCHARGE_BAT_UNTIL          = 0x0100027D
+    EMS_REQ_INSTALLED_PEAK_POWER                = 0x01000013
+    EMS_REQ_MODE                                = 0x01000011
+    EMS_REQ_POWER_ADD                           = 0x01000005
+    EMS_REQ_POWER_BAT                           = 0x01000002
+    EMS_REQ_POWER_GRID                          = 0x01000004
+    EMS_REQ_POWER_HOME                          = 0x01000003
+    EMS_REQ_POWER_PV                            = 0x01000001
+    EMS_REQ_POWER_WB_ALL                        = 0x0100001F
+    EMS_REQ_REMAINING_BAT_CHARGE_POWER          = 0x01000071
+    EMS_REQ_REMAINING_BAT_DISCHARGE_POWER       = 0x01000072
+    EMS_REQ_SELF_CONSUMPTION                    = 0x01000007
+    EMS_REQ_SET_MAX_CHARGE_POWER                = 0x01000101
+    EMS_REQ_SET_MAX_DISCHARGE_POWER             = 0x01000102
+    EMS_REQ_SET_POWER                           = 0x01000030
+    EMS_REQ_SET_POWER_MODE                      = 0x01000031
+    EMS_REQ_SET_POWER_SETTINGS                  = 0x0100008C
+    EMS_REQ_SET_POWER_VALUE                     = 0x01000032
+    EMS_REQ_STATUS                              = 0x01000040
+    EMS_REQ_USED_CHARGE_LIMIT                   = 0x01000041
+    EMS_REQ_USED_DISCHARGE_LIMIT                = 0x01000045
+    EMS_REQ_USER_CHARGE_LIMIT                   = 0x01000044
+    EMS_SELF_CONSUMPTION                        = 0x01800007
+    EMS_SET_POWER_SETTINGS                      = 0x0180008C
+    EMS_STATUS                                  = 0x01800040
+    EMS_USED_CHARGE_LIMIT                       = 0x01800041
+    EMS_USED_DISCHARGE_LIMIT                    = 0x01800045
+    EMS_USER_CHARGE_LIMIT                       = 0x01800044
+    EMS_WEATHER_REGULATED_CHARGE_ENABLED        = 0x01000105
+    INFO_FS_USE_PERCENT                         = 0x0A800031
+    INFO_GET_FS_USAGE                           = 0x0A80002D
+    INFO_MAC_ADDRESS                            = 0x0A80000A
+    INFO_PRODUCTION_DATE                        = 0x0A800002
+    INFO_REQ_GET_FS_USAGE                       = 0x0A000025
+    INFO_REQ_MAC_ADDRESS                        = 0x0A00000A
+    INFO_REQ_PRODUCTION_DATE                    = 0x0A000002
+    INFO_REQ_SERIAL_NUMBER                      = 0x0A000001
+    INFO_REQ_SW_RELEASE                         = 0x0A000019
+    INFO_SERIAL_NUMBER                          = 0x0A800001
+    INFO_SW_RELEASE                             = 0x0A800019
+    PM_DATA                                     = 0x05840000
+    PM_INDEX                                    = 0x05040001
+    PM_POWER_L1                                 = 0x05800001
+    PM_POWER_L2                                 = 0x05800002
+    PM_POWER_L3                                 = 0x05800003
+    PM_REQ_DATA                                 = 0x05040000
+    PM_REQ_POWER_L1                             = 0x05000001
+    PM_REQ_POWER_L2                             = 0x05000002
+    PM_REQ_POWER_L3                             = 0x05000003
+    PVI_AC_CURRENT                              = 0x028AC003
+    PVI_AC_MAX_PHASE_COUNT                      = 0x028AC000
+    PVI_AC_POWER                                = 0x028AC001
+    PVI_AC_VOLTAGE                              = 0x028AC002
+    PVI_DATA                                    = 0x02840000
+    PVI_DC_CURRENT                              = 0x028DC003
+    PVI_DC_MAX_POWER                            = 0x028DC004
+    PVI_DC_MAX_STRING_COUNT                     = 0x028DC000
+    PVI_DC_POWER                                = 0x028DC001
+    PVI_DC_VOLTAGE                              = 0x028DC002
+    PVI_INDEX                                   = 0x02040001
+    PVI_REQ_AC_CURRENT                          = 0x020AC003
+    PVI_REQ_AC_MAX_PHASE_COUNT                  = 0x020AC000
+    PVI_REQ_AC_POWER                            = 0x020AC001
+    PVI_REQ_AC_VOLTAGE                          = 0x020AC002
+    PVI_REQ_DATA                                = 0x02040000
+    PVI_REQ_DC_CURRENT                          = 0x020DC003
+    PVI_REQ_DC_MAX_POWER                        = 0x020DC004
+    PVI_REQ_DC_MAX_STRING_COUNT                 = 0x020DC000
+    PVI_REQ_DC_POWER                            = 0x020DC001
+    PVI_REQ_DC_VOLTAGE                          = 0x020DC002
+    PVI_REQ_TEMPERATURE                         = 0x02000100
+    PVI_TEMPERATURE                             = 0x02800100
+    RSCP_AUTHENTICATION                         = 0x00800001
+    RSCP_AUTHENTICATION_PASSWORD                = 0x00000003
+    RSCP_AUTHENTICATION_USER                    = 0x00000002
+    RSCP_REQ_AUTHENTICATION                     = 0x00000001
+    SE_PARAM_EP_RESERVE                         = 0x1B040023
+    SE_PARAM_EP_RESERVE_MAX_W                   = 0x1B040034
+    SE_PARAM_EP_RESERVE_W                       = 0x1B040033
+    SE_REQ_EP_RESERVE                           = 0x1B000009
+    WB_ABORT_CHARGING                           = 0x0E84103D
+    WB_AUTO_PHASE_SWITCH_ENABLED                = 0x0E800039
+    WB_AVAILABLE_SOLAR_POWER                    = 0x0E841000
+    WB_DATA                                     = 0x0E840000
+    WB_DEVICE_CONNECTED                         = 0x0E860001
+    WB_DEVICE_IN_SERVICE                        = 0x0E860003
+    WB_DEVICE_NAME                              = 0x0E800042
+    WB_DEVICE_STATE                             = 0x0E860000
+    WB_DEVICE_WORKING                           = 0x0E860002
+    WB_EXTERN_DATA                              = 0x0E042010
+    WB_EXTERN_DATA_ALG                          = 0x0E841014
+    WB_EXTERN_DATA_LEN                          = 0x0E042011
+    WB_FIRMWARE_VERSION                         = 0x0E80002F
+    WB_INDEX                                    = 0x0E040001
+    WB_LOWER_CURRENT_LIMIT                      = 0x0E841046
+    WB_MAX_CHARGE_CURRENT                       = 0x0E841047
+    WB_NUMBER_PHASES                            = 0x0E84103B
+    WB_PM_POWER_L1                              = 0x0E80000C
+    WB_PM_POWER_L2                              = 0x0E80000D
+    WB_PM_POWER_L3                              = 0x0E80000E
+    WB_POWER                                    = 0x0E041001
+    WB_REQ_ABORT_CHARGING                       = 0x0E04103D
+    WB_REQ_AUTO_PHASE_SWITCH_ENABLED            = 0x0E000039
+    WB_REQ_AVAILABLE_SOLAR_POWER                = 0x0E041000
+    WB_REQ_DATA                                 = 0x0E040000
+    WB_REQ_DEVICE_NAME                          = 0x0E000042
+    WB_REQ_EXTERN_DATA_ALG                      = 0x0E041014
+    WB_REQ_FIRMWARE_VERSION                     = 0x0E00002F
+    WB_REQ_LOWER_CURRENT_LIMIT                  = 0x0E041046
+    WB_REQ_MAX_CHARGE_CURRENT                   = 0x0E041047
+    WB_REQ_NUMBER_PHASES                        = 0x0E04103B
+    WB_REQ_PARAM_1                              = 0x0E04101B
+    WB_REQ_PARAM_2                              = 0x0E04101A
+    WB_REQ_PM_POWER_L1                          = 0x0E00000C
+    WB_REQ_PM_POWER_L2                          = 0x0E00000D
+    WB_REQ_PM_POWER_L3                          = 0x0E00000E
+    WB_REQ_SESSION                              = 0x0E00002C
+    WB_REQ_SET_ABORT_CHARGING                   = 0x0E04103E
+    WB_REQ_SET_AUTO_PHASE_SWITCH_ENABLED        = 0x0E000038
+    WB_REQ_SET_EXTERN                           = 0x0E041010
+    WB_REQ_SET_MAX_CHARGE_CURRENT               = 0x0E041049
+    WB_REQ_SET_NUMBER_PHASES                    = 0x0E04103C
+    WB_REQ_SET_PARAM_1                          = 0x0E041018
+    WB_REQ_SET_PARAM_2                          = 0x0E041019
+    WB_REQ_SET_SUN_MODE_ACTIVE                  = 0x0E041039
+    WB_REQ_SUN_MODE_ACTIVE                      = 0x0E041038
+    WB_REQ_UPPER_CURRENT_LIMIT                  = 0x0E041045
+    WB_REQ_WALLBOX_TYPE                         = 0x0E041036
+    WB_RSP_PARAM_1                              = 0x0E84101B
+    WB_RSP_PARAM_2                              = 0x0E84101A
+    WB_SESSION                                  = 0x0E80002C
+    WB_SESSION_AUTH_DATA                        = 0x0E741030
+    WB_SESSION_CHARGED_ENERGY                   = 0x0E74102A
+    WB_SESSION_CHARGED_SUN_ENERGY               = 0x0E74102B
+    WB_SESSION_START_TIME                       = 0x0E741026
+    WB_SESSION_STATUS                           = 0x0E741027
+    WB_SET_ABORT_CHARGING                       = 0x0E84103F
+    WB_SET_AUTO_PHASE_SWITCH_ENABLED            = 0x0E800038
+    WB_SET_MAX_CHARGE_CURRENT                   = 0x0E841049
+    WB_SET_NUMBER_PHASES                        = 0x0E84103C
+    WB_SET_PARAM_1                              = 0x0E841018
+    WB_SET_PARAM_2                              = 0x0E841019
+    WB_SET_SUN_MODE_ACTIVE                      = 0x0E841039
+    WB_SUN_MODE_ACTIVE                          = 0x0E841038
+    WB_UPPER_CURRENT_LIMIT                      = 0x0E841045
+    WB_WALLBOX_TYPE                             = 0x0E841036
 
-    # Info
-    INFO_REQ_SW_RELEASE           = 0x06000004
-    INFO_REQ_PRODUCTION_DATE      = 0x06000002
-    INFO_REQ_MAC_ADDRESS          = 0x06000007
-    # INFO_REQ
-    INFO_REQ_MAC_ADDRESS          = 0x0A00000A
-    INFO_REQ_PRODUCTION_DATE      = 0x0A000002
-    INFO_REQ_SW_RELEASE           = 0x0A000019
-    INFO_REQ_GET_FS_USAGE         = 0x0A000025
-    
-    # INFO
-    INFO_MAC_ADDRESS              = 0x0A80000A
-    INFO_PRODUCTION_DATE          = 0x0A800002
-    INFO_SW_RELEASE               = 0x0A800019
-    INFO_GET_FS_USAGE             = 0x0A80002D
-    INFO_FS_USE_PERCENT           = 0x0A800031
 
-    # Batterie
-    BAT_REQ_DATA                  = 0x03040000
-    BAT_INDEX                     = 0x03040001
-    BAT_REQ_INFO                  = 0x03000020
-    BAT_REQ_ASOC                  = 0x0300000F
-    BAT_REQ_CHARGE_CYCLES         = 0x03000008
-    BAT_REQ_MAX_DCB_CELL_TEMPERATURE = 0x03000016
-    BAT_REQ_MIN_DCB_CELL_TEMPERATURE = 0x03000017
-    BAT_REQ_DCB_COUNT             = 0x0300000D
-    BAT_REQ_USABLE_CAPACITY       = 0x03000026  # Einheit: Ah (NICHT Wh!) - bestaetigt via RSCPGui
-    BAT_REQ_FCC                   = 0x03000010  # Einheit: Ah (NICHT Wh!) - bestaetigt via RSCPGui
-    BAT_REQ_MODULE_VOLTAGE        = 0x03000002  # Batterie-String-Spannung in V
-    BAT_REQ_DCB_INFO              = 0x03000042
-    BAT_REQ_DCB_ALL_CELL_TEMPERATURES = 0x03000018
-    BAT_REQ_DCB_ALL_CELL_VOLTAGES = 0x0300001A
-    BAT_REQ_RC                    = 0x03000011
+# Provenienzquarantäne: Diese Namen sind zentral registriert, damit kein
+# Produktmodul eine Schatten-Tagklasse benötigt. Sie sind bewusst *nicht* als
+# herstellerkanonisch attestiert. Request-Mitglieder sind Read-only-Nil-Abfragen;
+# Response-Mitglieder sind nie zulässige ausgehende Tags.
+PROVISIONAL_READ_ONLY_REQUEST_TAG_NAMES = frozenset({
+    "BAT_REQ_FCC",
+    "BAT_REQ_SPECIFICATION",
+    "BAT_REQ_USABLE_CAPACITY",
+    "EMS_REQ_GET_WB_DISCHARGE_BAT_UNTIL",
+})
+PROVISIONAL_READ_ONLY_RESPONSE_TAG_NAMES = frozenset({
+    "BAT_FCC",
+    "BAT_SPECIFICATION",
+    "BAT_SPECIFIED_CAPACITY",
+    "BAT_USABLE_CAPACITY",
+    "EMS_GET_WB_DISCHARGE_BAT_UNTIL",
+})
+PROVISIONAL_READ_ONLY_TAG_PROVENANCE = {
+    name: "provisional_read_only"
+    for name in (
+        PROVISIONAL_READ_ONLY_REQUEST_TAG_NAMES
+        | PROVISIONAL_READ_ONLY_RESPONSE_TAG_NAMES
+    )
+}
 
-    # Batterie-Antwort-Tags
-    BAT_DATA                      = 0x03840000
-    BAT_INFO                      = 0x03800020
-    BAT_ASOC                      = 0x0380000F
-    BAT_CHARGE_CYCLES             = 0x03800008
-    BAT_MAX_DCB_CELL_TEMPERATURE  = 0x03800016
-    BAT_MIN_DCB_CELL_TEMPERATURE  = 0x03800017
-    BAT_DCB_COUNT                 = 0x0380000D
-    BAT_USABLE_CAPACITY           = 0x03800026  # Ah
-    BAT_FCC                       = 0x03800010  # Ah
-    BAT_MODULE_VOLTAGE            = 0x03800002  # V (String-Spannung)
-    BAT_DCB_INFO                  = 0x03800042
-    BAT_DCB_INDEX                 = 0x03800100
-    BAT_DCB_SOH                   = 0x03800109
-    BAT_DCB_SOH_H20               = 0x03800116  # H20/S10X: Pack-SOH liegt hier (RSCP liefert 0x03800109 nicht)
-    BAT_DCB_CYCLE_COUNT           = 0x03800110
-    BAT_DCB_CELL_TEMPERATURE      = 0x03800019
-    BAT_DCB_ALL_CELL_TEMPERATURES = 0x03800018
-    BAT_DCB_ALL_CELL_VOLTAGES     = 0x0380001A
-    BAT_DCB_CELL_VOLTAGE          = 0x0380001B
-    BAT_RC                        = 0x03800011
+# Zusätzliche RSCPGui-/Feld-Tags vor 2024 bleiben read-only und werden bewusst
+# nicht in einen herstellerkanonischen Status hochgestuft.
+COMMUNITY_READ_ONLY_REQUEST_TAG_NAMES = frozenset({
+    "BAT_REQ_ASOC",
+    "BAT_REQ_DCB_ALL_CELL_TEMPERATURES",
+    "BAT_REQ_DCB_ALL_CELL_VOLTAGES",
+    "BAT_REQ_DCB_INFO",
+    "INFO_REQ_GET_FS_USAGE",
+})
+COMMUNITY_READ_ONLY_RESPONSE_TAG_NAMES = frozenset({
+    "BAT_ASOC",
+    "BAT_DCB_ALL_CELL_TEMPERATURES",
+    "BAT_DCB_ALL_CELL_VOLTAGES",
+    "BAT_DCB_INFO",
+    "INFO_GET_FS_USAGE",
+    "INFO_FS_USE_PERCENT",
+})
+COMMUNITY_READ_ONLY_RESPONSE_TYPES = {
+    "BAT_ASOC": RscpType.Float32,
+    "BAT_DCB_ALL_CELL_TEMPERATURES": RscpType.Container,
+    "BAT_DCB_ALL_CELL_VOLTAGES": RscpType.Container,
+    "BAT_DCB_INFO": RscpType.Container,
+    "INFO_GET_FS_USAGE": RscpType.Container,
+    "INFO_FS_USE_PERCENT": RscpType.CString,
+}
 
-    # EMS
-    EMS_REQ_BAT_SOC               = 0x01000008
-    EMS_BAT_SOC                   = 0x01800008
-    EMS_REQ_GET_POWER_SETTINGS    = 0x0100008B
-    EMS_GET_POWER_SETTINGS        = 0x0180008B
-    EMS_REQ_SET_POWER_SETTINGS    = 0x0100008C
-    EMS_SET_POWER_SETTINGS        = 0x0180008C
-    EMS_REQ_SET_POWER             = 0x01000030
-    EMS_REQ_SET_POWER_MODE        = 0x01000031
-    EMS_REQ_SET_POWER_VALUE       = 0x01000032
-    EMS_POWER_LIMITS_USED         = 0x01000100
-    EMS_MAX_CHARGE_POWER          = 0x01000101
-    EMS_MAX_DISCHARGE_POWER       = 0x01000102
-    EMS_DISCHARGE_START_POWER     = 0x01000103
-    EMS_REQ_SET_MAX_CHARGE_POWER  = 0x01000101
-    EMS_REQ_SET_MAX_DISCHARGE_POWER = 0x01000102
-    EMS_REQ_MODE                  = 0x01000011
+# Commit-gebundener Spiegel der Tagliste 01/2024. Er heißt bewusst
+# "mirror_read" und besitzt keine offizielle/kanonische Provenienz.
+MANUFACTURER_2024_MIRROR_READ_REQUEST_TYPES = {
+    "WB_REQ_ABORT_CHARGING": RscpType.Nil,
+    "WB_REQ_AUTO_PHASE_SWITCH_ENABLED": RscpType.Nil,
+    "WB_REQ_DEVICE_NAME": RscpType.Nil,
+    "WB_REQ_FIRMWARE_VERSION": RscpType.Nil,
+    "WB_REQ_NUMBER_PHASES": RscpType.Nil,
+    "WB_REQ_SESSION": RscpType.UChar8,
+    "WB_REQ_SUN_MODE_ACTIVE": RscpType.Nil,
+    "WB_REQ_WALLBOX_TYPE": RscpType.Nil,
+}
+MANUFACTURER_2024_MIRROR_READ_RESPONSE_TYPES = {
+    "WB_ABORT_CHARGING": RscpType.Bool,
+    "WB_AUTO_PHASE_SWITCH_ENABLED": RscpType.Bool,
+    "WB_DEVICE_NAME": RscpType.CString,
+    "WB_FIRMWARE_VERSION": RscpType.CString,
+    "WB_MAX_CHARGE_CURRENT": RscpType.Int32,
+    "WB_NUMBER_PHASES": RscpType.UChar8,
+    "WB_SESSION": RscpType.Container,
+    "WB_SESSION_AUTH_DATA": RscpType.CString,
+    "WB_SESSION_CHARGED_ENERGY": RscpType.Double64,
+    "WB_SESSION_START_TIME": RscpType.Uint64,
+    "WB_SUN_MODE_ACTIVE": RscpType.Bool,
+    "WB_WALLBOX_TYPE": RscpType.Uint32,
+}
+BLOCKED_UNRELEASED_TRANSITION_NO_SEND_TAG_NAMES = frozenset({
+    "WB_REQ_SET_SUN_MODE_ACTIVE",
+    "WB_REQ_SET_AUTO_PHASE_SWITCH_ENABLED",
+    "WB_REQ_SET_ABORT_CHARGING",
+})
+BLOCKED_TYPE_CONFLICT_NO_SEND_TAG_NAMES = frozenset({
+    "WB_REQ_MAX_CHARGE_CURRENT",
+    "WB_REQ_SET_MAX_CHARGE_CURRENT",
+})
+BLOCKED_HARDWARE_PROTECTION_NO_SEND_TAG_NAMES = frozenset({
+    "WB_REQ_SET_NUMBER_PHASES",
+})
 
-    # Wallbox
-    WB_REQ_DATA                   = 0x0E040000
-    WB_DATA                       = 0x0E840000
-    WB_INDEX                      = 0x0E040001
-    WB_REQ_PM_POWER_L1            = 0x0E00000C
-    WB_REQ_PM_POWER_L2            = 0x0E00000D
-    WB_REQ_PM_POWER_L3            = 0x0E00000E
-    WB_REQ_EXTERN_DATA_ALG        = 0x0E041014
-    WB_EXTERN_DATA_ALG            = 0x0E841014
-    WB_PM_POWER_L1                = 0x0E80000C
-    WB_PM_POWER_L2                = 0x0E80000D
-    WB_PM_POWER_L3                = 0x0E80000E
-    WB_REQ_FIRMWARE_VERSION       = 0x0E00002F
-    WB_FIRMWARE_VERSION           = 0x0E80002F
-    WB_REQ_SET_AUTO_PHASE_SWITCH_ENABLED = 0x0E000038
-    WB_REQ_AUTO_PHASE_SWITCH_ENABLED     = 0x0E000039
-    WB_SET_AUTO_PHASE_SWITCH_ENABLED     = 0x0E800038
-    WB_AUTO_PHASE_SWITCH_ENABLED         = 0x0E800039
-    WB_REQ_WALLBOX_TYPE          = 0x0E041036
-    WB_WALLBOX_TYPE              = 0x0E841036
-    WB_REQ_DEVICE_NAME            = 0x0E000042
-    WB_DEVICE_NAME                = 0x0E800042
-    WB_REQ_SUN_MODE_ACTIVE        = 0x0E041038
-    WB_REQ_SET_SUN_MODE_ACTIVE    = 0x0E041039
-    WB_SUN_MODE_ACTIVE            = 0x0E841038
-    WB_SET_SUN_MODE_ACTIVE        = 0x0E841039
-    WB_REQ_NUMBER_PHASES          = 0x0E04103B
-    WB_REQ_SET_NUMBER_PHASES      = 0x0E04103C
-    WB_NUMBER_PHASES              = 0x0E84103B
-    WB_SET_NUMBER_PHASES          = 0x0E84103C
-    WB_REQ_ABORT_CHARGING         = 0x0E04103D
-    WB_REQ_SET_ABORT_CHARGING     = 0x0E04103E
-    WB_ABORT_CHARGING             = 0x0E84103D
-    WB_SET_ABORT_CHARGING         = 0x0E84103F
-    WB_REQ_UPPER_CURRENT_LIMIT    = 0x0E041045
-    WB_REQ_LOWER_CURRENT_LIMIT    = 0x0E041046
-    WB_REQ_MAX_CHARGE_CURRENT     = 0x0E041047
-    WB_REQ_SET_MAX_CHARGE_CURRENT = 0x0E041049
-    WB_UPPER_CURRENT_LIMIT        = 0x0E841045
-    WB_LOWER_CURRENT_LIMIT        = 0x0E841046
-    WB_MAX_CHARGE_CURRENT         = 0x0E841047
-    WB_SET_MAX_CHARGE_CURRENT     = 0x0E841049
-    WB_REQ_SET_EXTERN             = 0x0E041010
-    WB_REQ_SET_PARAM_1            = 0x0E041018
-    WB_REQ_SET_PARAM_2            = 0x0E041019
-    WB_REQ_PARAM_2                = 0x0E04101A
-    WB_REQ_PARAM_1                = 0x0E04101B
-    WB_EXTERN_DATA                = 0x0E042010
-    WB_EXTERN_DATA_LEN            = 0x0E042011
-    WB_SET_PARAM_1                = 0x0E841018
-    WB_SET_PARAM_2                = 0x0E841019
-    WB_RSP_PARAM_2                = 0x0E84101A
-    WB_RSP_PARAM_1                = 0x0E84101B
-    WB_DEVICE_STATE               = 0x0E860000
-    WB_DEVICE_CONNECTED           = 0x0E860001
-    WB_DEVICE_WORKING             = 0x0E860002
-    WB_DEVICE_IN_SERVICE          = 0x0E860003
-    # Request-Tags fuer Verbindungsstatus (innerhalb WB_REQ_DATA Container)
-    WB_REQ_DEVICE_CONNECTED       = 0x0E041000
-    WB_REQ_DEVICE_WORKING         = 0x0E041001
-    # Session-Daten (aktuelle Ladesitzung) - direkt aus E3DC-Firmware
-    WB_REQ_SESSION                = 0x0E00002C   # Anfrage aktuelle Session
-    WB_SESSION                    = 0x0E80002C   # Antwort-Tag Session-Container
-    WB_SESSION_START_TIME         = 0x0E741026   # Unix-Timestamp Beginn der Session
-    WB_SESSION_STATUS             = 0x0E741027   # Status der Session
-    WB_SESSION_CHARGED_ENERGY     = 0x0E74102A   # Geladene Energie in Wh (aktuelle Session)
-    WB_SESSION_CHARGED_SUN_ENERGY = 0x0E74102B   # Davon Solar-Anteil in Wh
-    WB_SESSION_AUTH_DATA          = 0x0E741030   # RFID/Autorisierungsdaten
+RSCP_TAG_PROVENANCE_CLASS = {
+    **PROVISIONAL_READ_ONLY_TAG_PROVENANCE,
+    **{
+        name: "provisional_read_only_community"
+        for name in (
+            COMMUNITY_READ_ONLY_REQUEST_TAG_NAMES
+            | COMMUNITY_READ_ONLY_RESPONSE_TAG_NAMES
+        )
+    },
+    **{
+        name: "manufacturer_2024_list_mirror_read"
+        for name in (
+            set(MANUFACTURER_2024_MIRROR_READ_REQUEST_TYPES)
+            | set(MANUFACTURER_2024_MIRROR_READ_RESPONSE_TYPES)
+        )
+    },
+    **{
+        name: "blocked_unreleased_transition_no_send"
+        for name in BLOCKED_UNRELEASED_TRANSITION_NO_SEND_TAG_NAMES
+    },
+    **{
+        name: "blocked_type_conflict_no_send"
+        for name in BLOCKED_TYPE_CONFLICT_NO_SEND_TAG_NAMES
+    },
+    **{
+        name: "hardware_protection_no_send"
+        for name in BLOCKED_HARDWARE_PROTECTION_NO_SEND_TAG_NAMES
+    },
+}
+RSCP_TAG_PROVENANCE_SOURCE = {
+    **{
+        name: {
+            "source": "git-kick/ioBroker.e3dc-rscp@38dbdea01ef2b6eb8ae40320a405061590bb78f8",
+            "blob_sha256": "eab7e984a3ed5b17640e3a034d6acd1df29d3cf2929a2a60519a331d478ee536",
+            "qualification": "pre-2024 imported from rxhan/RSCPGui; community/field provenance only",
+        }
+        for name in (
+            COMMUNITY_READ_ONLY_REQUEST_TAG_NAMES
+            | COMMUNITY_READ_ONLY_RESPONSE_TAG_NAMES
+        )
+    },
+    **{
+        name: {
+            "source": "git-kick/ioBroker.e3dc-rscp@38dbdea01ef2b6eb8ae40320a405061590bb78f8",
+            "blob_sha256": "eab7e984a3ed5b17640e3a034d6acd1df29d3cf2929a2a60519a331d478ee536",
+            "qualification": "commit-bound mirror of 01/2024 manufacturer tag list; not a direct manufacturer artifact",
+        }
+        for name in (
+            set(MANUFACTURER_2024_MIRROR_READ_REQUEST_TYPES)
+            | set(MANUFACTURER_2024_MIRROR_READ_RESPONSE_TYPES)
+            | set(BLOCKED_UNRELEASED_TRANSITION_NO_SEND_TAG_NAMES)
+            | set(BLOCKED_TYPE_CONFLICT_NO_SEND_TAG_NAMES)
+            | set(BLOCKED_HARDWARE_PROTECTION_NO_SEND_TAG_NAMES)
+        )
+    },
+}
+
+
+def validate_outbound_rscp_items(
+    items: list,
+    *,
+    authorized_transition_tags=frozenset(),
+) -> None:
+    """Sperrt quarantänisierte Lese-Tags und nicht freigegebene Wallboxwrites."""
+    request_tags = {
+        getattr(RscpTag, name)
+        for name in (
+            PROVISIONAL_READ_ONLY_REQUEST_TAG_NAMES
+            | COMMUNITY_READ_ONLY_REQUEST_TAG_NAMES
+        )
+    }
+    response_tags = {
+        getattr(RscpTag, name)
+        for name in (
+            PROVISIONAL_READ_ONLY_RESPONSE_TAG_NAMES
+            | COMMUNITY_READ_ONLY_RESPONSE_TAG_NAMES
+        )
+    }
+    mirror_request_types = {
+        getattr(RscpTag, name): expected
+        for name, expected in MANUFACTURER_2024_MIRROR_READ_REQUEST_TYPES.items()
+    }
+    mirror_response_tags = {
+        getattr(RscpTag, name)
+        for name in MANUFACTURER_2024_MIRROR_READ_RESPONSE_TYPES
+    }
+    blocked_unreleased_transition_tags = {
+        getattr(RscpTag, name)
+        for name in BLOCKED_UNRELEASED_TRANSITION_NO_SEND_TAG_NAMES
+    }
+    blocked_type_conflict_tags = {
+        getattr(RscpTag, name) for name in BLOCKED_TYPE_CONFLICT_NO_SEND_TAG_NAMES
+    }
+    blocked_hardware_tags = {
+        getattr(RscpTag, name) for name in BLOCKED_HARDWARE_PROTECTION_NO_SEND_TAG_NAMES
+    }
+    _ = authorized_transition_tags
+
+    def walk(values):
+        if not isinstance(values, list):
+            raise ValueError("RSCP outbound payload must be a list")
+        for item in values:
+            if not isinstance(item, dict):
+                raise ValueError("RSCP outbound item must be a dict")
+            tag = item.get("tag")
+            type_byte = item.get("type")
+            value = item.get("value")
+            if tag in response_tags:
+                raise ValueError("provisional response tag is not outbound-capable")
+            if tag in request_tags and not (
+                type_byte == RscpType.Nil and value is None
+            ):
+                raise ValueError("provisional request tag permits Nil read only")
+            if tag in mirror_response_tags:
+                raise ValueError("mirror response tag is not outbound-capable")
+            if tag in mirror_request_types:
+                expected = mirror_request_types[tag]
+                if expected == RscpType.Nil:
+                    if type_byte != RscpType.Nil or value is not None:
+                        raise ValueError("mirror request tag permits Nil read only")
+                elif not (
+                    expected == RscpType.UChar8
+                    and type_byte == expected
+                    and type(value) is int
+                    and 0 <= value <= 255
+                ):
+                    raise ValueError("mirror request tag has invalid type or value")
+            if tag in blocked_type_conflict_tags:
+                raise ValueError("blocked type-conflict tag is never outbound-capable")
+            if tag in blocked_hardware_tags:
+                raise ValueError("hardware-protected tag is never outbound-capable")
+            if tag in blocked_unreleased_transition_tags:
+                raise ValueError("unreleased transition tag is never outbound-capable")
+            if type_byte == RscpType.Container:
+                walk(value)
+
+    walk(items)
+
+
+def validate_mirror_read_item(item: dict, tag_name: str):
+    """Liefert einen strikt typisierten Spiegelwert oder ``(None, False)``."""
+    expected = MANUFACTURER_2024_MIRROR_READ_RESPONSE_TYPES.get(tag_name)
+    if expected is None or not isinstance(item, dict):
+        return None, False
+    if item.get("tag") != getattr(RscpTag, tag_name) or item.get("type") != expected:
+        return None, False
+    value = item.get("value")
+    if expected == RscpType.Bool:
+        return (value, True) if type(value) is bool else (None, False)
+    if expected in (RscpType.UChar8, RscpType.Uint32, RscpType.Uint64):
+        return (value, True) if type(value) is int and value >= 0 else (None, False)
+    if expected == RscpType.Int32:
+        return (value, True) if type(value) is int else (None, False)
+    if expected == RscpType.Double64:
+        return (value, True) if type(value) is float else (None, False)
+    if expected == RscpType.CString:
+        return (value, True) if type(value) is str else (None, False)
+    if expected == RscpType.Container:
+        return (value, True) if isinstance(value, list) else (None, False)
+    return None, False
+
+
+def validate_community_read_item(item: dict, tag_name: str):
+    """Strictly validate provisional community response shape and type."""
+    expected = COMMUNITY_READ_ONLY_RESPONSE_TYPES.get(tag_name)
+    if expected is None or not isinstance(item, dict):
+        return None, False
+    if item.get("tag") != getattr(RscpTag, tag_name) or item.get("type") != expected:
+        return None, False
+    value = item.get("value")
+    if expected == RscpType.Float32:
+        return (value, True) if type(value) is float else (None, False)
+    if expected == RscpType.CString:
+        return (value, True) if type(value) is str else (None, False)
+    if expected == RscpType.Container:
+        return (value, True) if isinstance(value, list) else (None, False)
+    return None, False
+
+
+def decode_wb_extern_data_alg(value, *, age_s=0.0, max_age_s=10.0) -> dict:
+    """Dekodiert das Read-only-E3DC-Wallbox-Statusbyte, ohne Idle zu erfinden."""
+    result = {
+        "plugged": None,
+        "plug_locked": None,
+        "charging": None,
+        "valid": False,
+        "source": "rscp_wb_extern_data_alg",
+        "reason": "missing",
+        "age_s": None,
+        "flags": None,
+    }
+    try:
+        age = float(age_s)
+    except (TypeError, ValueError):
+        age = None
+    result["age_s"] = age
+    if age is None or age < 0 or age > float(max_age_s):
+        result["reason"] = "stale"
+        return result
+
+    raw = value
+    if isinstance(raw, dict):
+        raw = raw.get("value")
+    if isinstance(raw, list):
+        extern = find_tag(raw, RscpTag.WB_EXTERN_DATA)
+        raw = extern.get("value") if extern else None
+    if isinstance(raw, bytearray):
+        raw = bytes(raw)
+    if not isinstance(raw, bytes):
+        result["reason"] = "wrong_type"
+        return result
+    if len(raw) < 3:
+        result["reason"] = "wrong_length"
+        return result
+
+    flags = int(raw[2])
+    result.update({
+        "plugged": bool(flags & 0x08),
+        "plug_locked": bool(flags & 0x10),
+        "charging": bool(flags & 0x20),
+        "valid": True,
+        "reason": "ok",
+        "flags": flags,
+        "raw_hex": raw.hex(),
+    })
+    return result
+
 
 
 # ---------------------------------------------------------------------------
@@ -788,6 +1199,16 @@ class RscpConnection:
         self._sock = None
         self._cipher = None
         self._authenticated = False
+        self._authorized_transition_tags = frozenset()
+
+    @contextmanager
+    def authorized_transition_write(self, *tag_names: str):
+        """Lehnt nicht freigegebene direkte Wallboxtransitionen ausnahmslos ab."""
+        unknown = set(tag_names) - set(BLOCKED_UNRELEASED_TRANSITION_NO_SEND_TAG_NAMES)
+        if unknown:
+            raise ValueError(f"unsupported transition guard: {sorted(unknown)}")
+        raise ValueError("direct wallbox transition writes are not released")
+        yield self
 
     def connect(self):
         """Öffnet TCP-Verbindung und authentifiziert sich."""
@@ -800,6 +1221,10 @@ class RscpConnection:
 
     def _send_frame(self, payload_items: list):
         """Kodiert, verschlüsselt und sendet einen RSCP-Frame."""
+        validate_outbound_rscp_items(
+            payload_items,
+            authorized_transition_tags=self._authorized_transition_tags,
+        )
         payload = _encode_tlv_list(payload_items)
         frame = _build_frame(payload)
         encrypted = self._cipher.encrypt(frame)
@@ -886,19 +1311,21 @@ def fetch_battery_vitals(host: str, port: int, portal_user: str,
             {'tag': RscpTag.INFO_REQ_PRODUCTION_DATE, 'type': RscpType.Nil,  'value': None},
             {'tag': RscpTag.INFO_REQ_MAC_ADDRESS,     'type': RscpType.Nil,  'value': None},
             {'tag': RscpTag.INFO_REQ_GET_FS_USAGE,    'type': RscpType.Nil,  'value': None},
-            {'tag': 167772161,                        'type': RscpType.Nil,  'value': None}, # INFO_REQ_SERIAL_NUMBER
+            {'tag': RscpTag.INFO_REQ_SERIAL_NUMBER,   'type': RscpType.Nil,  'value': None},
         ]
         sys_resp = conn.request(sys_req)
         fs_usage = find_tag(sys_resp, RscpTag.INFO_GET_FS_USAGE)
         fs_perc = None
-        if fs_usage and isinstance(fs_usage.get('value'), list):
-            fs_perc = find_tag_value(fs_usage['value'], RscpTag.INFO_FS_USE_PERCENT)
+        fs_values, fs_valid = validate_community_read_item(fs_usage, 'INFO_GET_FS_USAGE')
+        if fs_valid:
+            fs_item = find_tag(fs_values, RscpTag.INFO_FS_USE_PERCENT)
+            fs_perc, _ = validate_community_read_item(fs_item, 'INFO_FS_USE_PERCENT')
 
         result['system_info'] = {
             'sw_release':          find_tag_value(sys_resp, RscpTag.INFO_SW_RELEASE) or 'N/A',
             'production_date':     find_tag_value(sys_resp, RscpTag.INFO_PRODUCTION_DATE) or 'N/A',
             'mac_address':         find_tag_value(sys_resp, RscpTag.INFO_MAC_ADDRESS) or 'N/A',
-            'serial_number':       find_tag_value(sys_resp, 176160769) or 'N/A', # INFO_SERIAL_NUMBER
+            'serial_number':       find_tag_value(sys_resp, RscpTag.INFO_SERIAL_NUMBER) or 'N/A',
             'disk_usage_percent':  fs_perc,
         }
 
@@ -915,7 +1342,7 @@ def fetch_battery_vitals(host: str, port: int, portal_user: str,
                 {'tag': RscpTag.BAT_REQ_USABLE_CAPACITY,         'type': RscpType.Nil,    'value': None},
                 {'tag': RscpTag.BAT_REQ_FCC,                     'type': RscpType.Nil,    'value': None},
                 {'tag': RscpTag.BAT_REQ_MODULE_VOLTAGE,          'type': RscpType.Nil,    'value': None},
-                {'tag': 50331715,                                'type': RscpType.Nil,    'value': None}, # RscpTag.BAT_REQ_SPECIFICATION
+                {'tag': RscpTag.BAT_REQ_SPECIFICATION,           'type': RscpType.Nil,    'value': None},
             ]}]
 
             bat_resp = conn.request(bat_req)
@@ -929,7 +1356,10 @@ def fetch_battery_vitals(host: str, port: int, portal_user: str,
                 continue
 
             dcb_count = int(dcb_count)
-            asoc = find_tag_value(bd, RscpTag.BAT_ASOC)
+            asoc, _ = validate_community_read_item(
+                find_tag(bd, RscpTag.BAT_ASOC),
+                'BAT_ASOC',
+            )
             cycles = find_tag_value(bd, RscpTag.BAT_CHARGE_CYCLES)
             t_max = find_tag_value(bd, RscpTag.BAT_MAX_DCB_CELL_TEMPERATURE)
             t_min = find_tag_value(bd, RscpTag.BAT_MIN_DCB_CELL_TEMPERATURE)
@@ -945,9 +1375,9 @@ def fetch_battery_vitals(host: str, port: int, portal_user: str,
             if cycles is None: cycles = find_tag_value(bi, RscpTag.BAT_CHARGE_CYCLES)
 
             spec_cap = None
-            bat_spec = find_tag(bd, 58720323) # BAT_SPECIFICATION
+            bat_spec = find_tag(bd, RscpTag.BAT_SPECIFICATION)
             if bat_spec and isinstance(bat_spec.get('value'), list):
-                spec_cap = find_tag_value(bat_spec['value'], 58720549) # BAT_SPECIFIED_CAPACITY
+                spec_cap = find_tag_value(bat_spec['value'], RscpTag.BAT_SPECIFIED_CAPACITY)
 
             # BAT_MODULE_VOLTAGE: String-Spannung des Akkus in Volt (Live-Wert, schwankt!)
             # Fuer die Umrechnung von Ah in Wh nutzen wir die nominale Spannung von 51.8V
@@ -1025,9 +1455,9 @@ def fetch_battery_vitals(host: str, port: int, portal_user: str,
             for dcb_idx in range(dcb_count):
                 dcb_req = [{'tag': RscpTag.BAT_REQ_DATA, 'type': RscpType.Container, 'value': [
                     {'tag': RscpTag.BAT_INDEX,                       'type': RscpType.Uint16, 'value': cab_idx},
-                    {'tag': RscpTag.BAT_REQ_DCB_INFO,                'type': RscpType.Uint16, 'value': dcb_idx},
-                    {'tag': RscpTag.BAT_REQ_DCB_ALL_CELL_TEMPERATURES,'type': RscpType.Uint16,'value': dcb_idx},
-                    {'tag': RscpTag.BAT_REQ_DCB_ALL_CELL_VOLTAGES,   'type': RscpType.Uint16, 'value': dcb_idx},
+                    {'tag': RscpTag.BAT_REQ_DCB_INFO,                'type': RscpType.Nil, 'value': None},
+                    {'tag': RscpTag.BAT_REQ_DCB_ALL_CELL_TEMPERATURES,'type': RscpType.Nil,'value': None},
+                    {'tag': RscpTag.BAT_REQ_DCB_ALL_CELL_VOLTAGES,   'type': RscpType.Nil, 'value': None},
                 ]}]
                 dcb_resp = conn.request(dcb_req)
                 dcb_bd = find_tag(dcb_resp, RscpTag.BAT_DATA)
@@ -1035,9 +1465,9 @@ def fetch_battery_vitals(host: str, port: int, portal_user: str,
                     continue
 
                 dcb_info = find_tag(dcb_bd['value'], RscpTag.BAT_DCB_INFO)
-                if not dcb_info or not isinstance(dcb_info.get('value'), list):
+                di, dcb_info_valid = validate_community_read_item(dcb_info, 'BAT_DCB_INFO')
+                if not dcb_info_valid:
                     continue
-                di = dcb_info['value']
                 soh = find_tag_value(di, RscpTag.BAT_DCB_SOH)
                 if soh is None:
                     soh = find_tag_value(di, RscpTag.BAT_DCB_SOH_H20)
@@ -1057,8 +1487,11 @@ def fetch_battery_vitals(host: str, port: int, portal_user: str,
                 temp_min_idx = None
                 temp_max_idx = None
                 all_temps_tag = find_tag(dcb_bd['value'], RscpTag.BAT_DCB_ALL_CELL_TEMPERATURES)
-                if all_temps_tag and isinstance(all_temps_tag.get('value'), list):
-                    temps = find_all_values(all_temps_tag['value'], RscpTag.BAT_DCB_CELL_TEMPERATURE)
+                all_temps, temps_valid = validate_community_read_item(
+                    all_temps_tag, 'BAT_DCB_ALL_CELL_TEMPERATURES'
+                )
+                if temps_valid:
+                    temps = find_all_values(all_temps, RscpTag.BAT_DCB_CELL_TEMPERATURE)
                     clean = [t for t in temps if t != 0.0 and not (3.0 <= t <= 4.5)]
                     if not clean: clean = temps
                     if clean:
@@ -1076,8 +1509,11 @@ def fetch_battery_vitals(host: str, port: int, portal_user: str,
                 clean_volts = []
                 voltage_min_idx = None
                 voltage_max_idx = None
-                if all_volts_tag and isinstance(all_volts_tag.get('value'), list):
-                    volts = find_all_values(all_volts_tag['value'], RscpTag.BAT_DCB_CELL_VOLTAGE)
+                all_volts, volts_valid = validate_community_read_item(
+                    all_volts_tag, 'BAT_DCB_ALL_CELL_VOLTAGES'
+                )
+                if volts_valid:
+                    volts = find_all_values(all_volts, RscpTag.BAT_DCB_CELL_VOLTAGE)
                     if len(volts) >= 2:
                         clean_volts = [round(float(v), 3) for v in volts]
                         v_min = round(min(volts), 3)
@@ -1148,7 +1584,7 @@ def fetch_ems_data(host: str, port: int, portal_user: str,
         ems_req = [
             {'tag': RscpTag.EMS_REQ_BAT_SOC, 'type': RscpType.Nil, 'value': None}
         ]
-        
+
         ems_resp = conn.request(ems_req)
         soc = find_tag_value(ems_resp, RscpTag.EMS_BAT_SOC)
         if soc is not None:
@@ -1177,7 +1613,7 @@ def set_e3dc_power(host: str, port: int, portal_user: str,
     try:
         conn.connect()
         conn.authenticate(portal_user, portal_password)
-        
+
         set_req = [
             {'tag': RscpTag.EMS_REQ_SET_POWER, 'type': RscpType.Container, 'value': [
                 {'tag': RscpTag.EMS_REQ_SET_POWER_MODE,  'type': RscpType.UChar8, 'value': mode},
@@ -1186,7 +1622,7 @@ def set_e3dc_power(host: str, port: int, portal_user: str,
             # Zusätzlich MODE abfragen um sicherzugehen und den Status bei E3/DC zu refreshen
             {'tag': RscpTag.EMS_REQ_MODE, 'type': RscpType.Nil, 'value': None}
         ]
-        
+
         conn.request(set_req)
         return True
     except Exception as e:
@@ -1196,16 +1632,84 @@ def set_e3dc_power(host: str, port: int, portal_user: str,
         conn.close()
 
 
+# ---------------------------------------------------------------------------
+# CLI-Test
+# ---------------------------------------------------------------------------
+def test_connection(host: str, port: int, portal_user: str,
+                    portal_password: str, rscp_password: str) -> bool:
+    """
+    Niedrig-Level Diagnose-Test: zeigt genau was gesendet und empfangen wird.
+    """
+    import socket as _sock
+    print(f"[DEBUG] Verbinde mit {host}:{port} ...")
+    s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+    s.settimeout(10.0)
+    try:
+        s.connect((host, port))
+        print(f"[DEBUG] TCP-Verbindung erfolgreich hergestellt")
+    except Exception as e:
+        print(f"[DEBUG] TCP-Verbindung FEHLGESCHLAGEN: {e}")
+        return False
+
+    # Key + Cipher
+    key = rscp_password.encode('latin-1')[:32].ljust(32, b'\xff')
+    print(f"[DEBUG] RSCP-Key (hex): {key.hex()}")
+    cipher = RscpCipher(key)
+
+    # Auth-Frame bauen
+    items = [{'tag': RscpTag.RSCP_REQ_AUTHENTICATION, 'type': RscpType.Container, 'value': [
+        {'tag': RscpTag.RSCP_AUTHENTICATION_USER,     'type': RscpType.CString, 'value': portal_user},
+        {'tag': RscpTag.RSCP_AUTHENTICATION_PASSWORD, 'type': RscpType.CString, 'value': portal_password},
+    ]}]
+    payload  = _encode_tlv_list(items)
+    frame    = _build_frame(payload)
+    encrypted = cipher.encrypt(frame)
+
+    print(f"[DEBUG] Payload:     {payload.hex()}")
+    print(f"[DEBUG] Frame[0:18]: {frame[0:18].hex()} (Header)")
+    print(f"[DEBUG] Frame Gesamt: {len(frame)} Bytes")
+    print(f"[DEBUG] Verschl. Gesamt: {len(encrypted)} Bytes")
+    print(f"[DEBUG] Sende {len(encrypted)} Bytes ...")
+
+    try:
+        s.sendall(encrypted)
+        print(f"[DEBUG] Gesendet. Warte auf Antwort ...")
+        s.settimeout(5.0)
+        try:
+            raw = s.recv(65536)
+            if raw:
+                print("[DEBUG] ANTWORT erhalten: %d Bytes (hex: %s...)" % (len(raw), raw[:32].hex()))
+            else:
+                print("[DEBUG] ANTWORT LEER - Verbindung wurde von E3DC geschlossen (b'' empfangen)!")
+                return False
+        except _sock.timeout:
+            print("[DEBUG] TIMEOUT - keine Antwort innerhalb 5 Sekunden")
+            return False
+    except Exception as e:
+        print(f"[DEBUG] Sendefehler: {e}")
+        return False
+    finally:
+        s.close()
+    return True
+
+
 if __name__ == '__main__':
     import json, sys, argparse
 
-    parser = argparse.ArgumentParser(description='RSCP-Batteriedaten abrufen')
+    parser = argparse.ArgumentParser(description='RSCP-Client Selbsttest')
     parser.add_argument('--host',     required=True,  help='E3DC IP-Adresse')
     parser.add_argument('--port',     type=int, default=5033, help='RSCP-Port (Standard: 5033)')
     parser.add_argument('--user',     required=True,  help='E3DC Portal-Benutzername')
     parser.add_argument('--password', required=True,  help='E3DC Portal-Passwort')
     parser.add_argument('--rscp',     required=True,  help='RSCP-Passwort (lokal am Gerät gesetzt)')
-    args = parser.parse_args()
+    parser.add_argument('--debug',    action='store_true', help='Verbesserte Debug-Ausgabe')
+    args = parser.parse_args()\
+
+    if args.debug:
+        print(f"rscp_client.py DEBUG-MODUS")
+        print(f"Python Rijndael-256 ShiftRows: Nb=8, Shifts=[0,1,3,4] (korrekt für RSCP)")
+        test_connection(args.host, args.port, args.user, args.password, args.rscp)
+        sys.exit(0)
 
     try:
         data = fetch_battery_vitals(args.host, args.port, args.user, args.password, args.rscp)

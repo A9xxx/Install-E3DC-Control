@@ -138,18 +138,23 @@ else
     echo "   -> WARNUNG: /app/pi/Install/html nicht gefunden! Repo korrekt gemountet?"
 fi
 
-# Matter-Abhängigkeiten einmalig im Container installieren
+# Matter-Abhängigkeiten einmalig im Container installieren.
 MATTER_DIR="/app/pi/Install/Installer/matter"
-if [ -f "$MATTER_DIR/package.json" ] && [ ! -d "$MATTER_DIR/node_modules" ]; then
+if [ -f "$MATTER_DIR/package.json" ] && [ ! -f "$MATTER_DIR/package-lock.json" ]; then
+    echo "-> FEHLER: Matter-Lockdatei fehlt; Start wird abgebrochen."
+    exit 1
+fi
+if [ -f "$MATTER_DIR/package-lock.json" ] && [ ! -d "$MATTER_DIR/node_modules" ]; then
     echo "-> Installiere Matter-Abhängigkeiten..."
-    cd "$MATTER_DIR" && npm install && cd /app/pi/Install
+    cd "$MATTER_DIR" && npm ci --omit=dev --ignore-scripts && cd /app/pi/Install
 fi
 
 # Rechte des persistenten Daten-Ordners korrigieren
 mkdir -p /var/www/html/data/matter-storage
 chown -R www-data:www-data /var/www/html/data
-chmod 775 /var/www/html/data
-chmod 775 /var/www/html/data/matter-storage
+chmod 2775 /var/www/html/data
+find /var/www/html/data/matter-storage -type d -exec chmod 700 {} \;
+find /var/www/html/data/matter-storage -type f -exec chmod 600 {} \;
 
 # Config Management: Die Config lebt jetzt PERSISTENT im data-Ordner!
 V4_CONFIG="/var/www/html/data/e3dc_v4.json"
@@ -235,13 +240,15 @@ else
     echo "   -> Forecast-Init fehlgeschlagen (API nicht erreichbar). Daemon holt nach."
 fi
 
-# ML-Vorhersage: Modell ist anlagenspezifisch und liegt persistent im data-Volume.
-# Bei neuen Docker-Volumes wird es nicht mitgeliefert, sondern aus der lokalen Historie trainiert.
-if [ ! -f "/var/www/html/data/ml_model.pkl" ]; then
+# ML-Vorhersage: Das anlagenspezifische Modell liegt in einem privaten Volume.
+# Ein altes Web-Pickle wird niemals geladen oder übernommen.
+export E3DC_ML_MODEL_DIR="/var/lib/e3dc-control/ml"
+install -d -o root -g root -m 0700 "$E3DC_ML_MODEL_DIR"
+if ! $PYTHON_EXEC ml_predictor.py --model-ready >/dev/null 2>&1; then
     echo "   -> Kein ML-Modell vorhanden: versuche einmaliges Training aus lokaler Historie..."
     $PYTHON_EXEC ml_predictor.py --train >> /var/www/html/logs/storage_simulator.log 2>&1 || true
 fi
-if [ -f "/var/www/html/data/ml_model.pkl" ]; then
+if $PYTHON_EXEC ml_predictor.py --model-ready >/dev/null 2>&1; then
     echo "   -> ML-Vorhersage (ml_predictor --predict)..."
     $PYTHON_EXEC ml_predictor.py --predict >> /var/www/html/logs/storage_simulator.log 2>&1 || true
 else
@@ -351,11 +358,10 @@ nohup $PYTHON_EXEC notification_manager.py > /var/www/html/logs/notification_man
 # Matter Bridge (optional, read-only Statusendpunkte)
 MATTER=$(get_v4_val "matter_bridge")
 if [ "$MATTER" = "1" ] || [ "$MATTER" = "true" ]; then
-    if [ -d "matter/node_modules" ]; then
+    if [ -d "$MATTER_DIR/node_modules" ]; then
         echo "   -> Matter Bridge aktiv."
-        cd matter
-        nohup npm run start > /var/www/html/logs/matter_bridge.log 2>&1 &
-        cd ..
+        nohup runuser -u www-data -- sh -c "cd '$MATTER_DIR' && exec npm run start" \
+            > /var/www/html/logs/matter_bridge.log 2>&1 &
     else
         echo "   -> Matter Bridge kann ohne installierte NPM-Abhängigkeiten nicht starten."
     fi

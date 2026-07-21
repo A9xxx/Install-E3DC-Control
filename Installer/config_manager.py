@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import re
 import shutil
 import datetime
 import sys
@@ -11,7 +12,7 @@ try:
         sys.stdout.reconfigure(encoding='utf-8', line_buffering=True)
     else:
         sys.stdout.reconfigure(encoding='utf-8')\
-    
+
 except Exception:
     pass
 
@@ -25,6 +26,11 @@ from .installer_config import (
 )
 from .config_secret_permissions import apply_config_secret_permissions, config_secret_dir_mode_text, config_secret_file_mode_text
 from .logging_manager import get_or_create_logger, log_task_completed, log_error, log_warning
+from .aux_inverter_contract import (
+    CONTRACT_REASON_KEY as AUX_INVERTER_CONTRACT_REASON_KEY,
+    CONTRACT_STATUS_KEY as AUX_INVERTER_CONTRACT_STATUS_KEY,
+    migrate_config_file as migrate_aux_inverter_config_file,
+)
 
 INSTALL_PATH = get_install_path()
 INSTALLER_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -35,9 +41,9 @@ RED   = '\033[91m'
 RESET = '\033[0m'
 
 # =============================================================================
-# V4-SCHLUESSEL-INVENTAR (kanonische Liste aller gueltigen Konfigurations-Keys)
-# Strukturiert in logische Bloecke. NUR diese Keys werden in e3dc_v4.json
-# zugelassen – alles andere (Laufzeit-Zustaende, Eba-M Altlasten) wird entfernt.
+# V4-SCHLÜSSEL-INVENTAR (kanonische Liste aller gültigen Konfigurationsschlüssel)
+# Strukturiert in logische Blöcke. NUR diese Schlüssel werden in e3dc_v4.json
+# zugelassen – alles andere (Laufzeitzustände, Eba-M-Altlasten) wird entfernt.
 # =============================================================================
 
 # --- Block 1: E3DC Verbindung ---
@@ -54,10 +60,14 @@ V4_BLOCK_CONNECTION = {
 V4_BLOCK_PV = {
     'hoehe', 'laenge',
     'openmeteo',
-    'forecast1', 'forecast2', 'forecast3',  # Dachflaechen (Neigung/Azimuth/kWp)
+    'forecast1', 'forecast2', 'forecast3',  # Dachflächen (Neigung/Azimut/kWp)
     'solcast_api_key', 'solcast_api_key_2',
     'solcast_calls_per_day', 'solcast_calls_per_day_2',
-    'solcast_resource_id', 'solcast_resource_id_2', 'solcast_resource_id_3',
+    'solcast_resource_id', 'solcast_resource_id_2', 'solcast_resource_id_3', 'solcast_resource_id_4',
+    'solcast_api_slot_fc1', 'solcast_api_slot_fc2', 'solcast_api_slot_fc3', 'solcast_api_slot_fc4',
+    'pv_forecast_coupling_fc1', 'pv_forecast_coupling_fc2',
+    'pv_forecast_coupling_fc3', 'pv_forecast_coupling_fc4',
+    'pv_e3dc_dc_inverter_limit_w', 'pv_external_ac_inverter_limit_w',
     'ml_home_cap_kw',   # Max. Hausverbrauch im ML-Training (kW) – verhindert WB-Artefakte
 }
 
@@ -91,17 +101,24 @@ V4_BLOCK_TARIFF = {
     'market_battery_grid_charge_enable', 'market_battery_hold_enable',
     'market_wallbox_enable',
     'market_heatpump_enable', 'market_heater_enable',
-    # Direktvermarktung: Der Storage Manager bleibt alleiniger Owner.
+    # Direktvermarktung: nur Konfigurationsrahmen; Storage Manager bleibt alleiniger Owner.
     'direct_marketing_enable', 'direct_marketing_mode', 'direct_marketing_profit_profile', 'direct_marketing_provider_name',
     'direct_marketing_settlement_basis', 'direct_marketing_revenue_offset_ct',
-    'direct_marketing_fee_ct_per_kwh', 'direct_marketing_fee_pct',
+    'direct_marketing_fee_ct_per_kwh', 'direct_marketing_fee_pct', 'direct_marketing_monthly_fee_eur',
+    'direct_marketing_variable_fee_basis', 'direct_marketing_variable_fee_basis_ct_per_kwh',
+    'direct_marketing_service_vat_pct', 'direct_marketing_input_vat_recoverable',
+    'direct_marketing_installed_kwp', 'direct_marketing_balancing_cost_eur_per_kwp_month',
+    'direct_marketing_balancing_cost_actual_eur_per_kwp_month',
     'direct_marketing_min_margin_pct', 'direct_marketing_min_profit_ct_per_kwh',
     'direct_marketing_min_window_profit_eur', 'direct_marketing_min_export_energy_kwh',
-    'direct_marketing_min_export_window_min',
+    'direct_marketing_min_export_window_min', 'direct_marketing_preferred_export_plateau_min',
+    'direct_marketing_price_plateau_tolerance_ct', 'direct_marketing_max_daily_export_kwh',
+    'direct_marketing_deep_cycle_threshold_pct', 'direct_marketing_deep_cycle_lcos_factor',
     'direct_marketing_profit_hold_ct_per_kwh', 'direct_marketing_margin_hold_pct',
     'direct_marketing_degradation_ct_per_kwh', 'direct_marketing_roundtrip_efficiency_pct',
     'direct_marketing_safety_margin_ct_per_kwh', 'direct_marketing_export_enable',
     'direct_marketing_grid_charge_enable', 'direct_marketing_arbitrage_enable',
+    'direct_marketing_arbitrage_experimental_enable',
     'direct_marketing_pv_store_enable', 'direct_marketing_pv_store_threshold_ct',
     'direct_marketing_pv_store_max_w', 'direct_marketing_pv_store_min_surplus_w',
     'direct_marketing_pv_store_import_guard_w', 'direct_marketing_pv_store_min_hold_s',
@@ -109,7 +126,7 @@ V4_BLOCK_TARIFF = {
     'direct_marketing_pv_store_external_ac_guard_w',
     'direct_marketing_pv_store_export_limit_guard_w', 'direct_marketing_pv_store_export_limit_ramp_bypass_w',
     'direct_marketing_price_max_age_s',
-    'direct_marketing_max_export_w',
+    'direct_marketing_v2x_discharge_enable', 'direct_marketing_max_export_w',
     'direct_marketing_min_grid_export_w', 'direct_marketing_max_grid_charge_w', 'direct_marketing_max_cycles_per_day',
     'direct_marketing_home_reserve_soc_pct', 'direct_marketing_night_reserve_soc_pct',
     'direct_marketing_morning_export_target_soc_pct', 'direct_marketing_negative_price_no_export',
@@ -124,6 +141,7 @@ V4_BLOCK_TARIFF = {
     'direct_marketing_aux_inverter_shelly_override', 'direct_marketing_aux_inverter_shelly_ip',
     'direct_marketing_aux_inverter_shelly_invert', 'direct_marketing_aux_inverter_shelly_dynamic_unblock_enable',
     'direct_marketing_aux_inverter_shelly_unblock_threshold_w',
+    AUX_INVERTER_CONTRACT_STATUS_KEY, AUX_INVERTER_CONTRACT_REASON_KEY,
     'netztransparenz_client_id', 'netztransparenz_client_secret',
     'direct_marketing_eeg_enable', 'direct_marketing_eeg_commissioning_date',
     'direct_marketing_eeg_support_years', 'direct_marketing_eeg_tariff_tiers',
@@ -132,12 +150,17 @@ V4_BLOCK_TARIFF = {
     'direct_marketing_eeg_grid_export_risk_ack',
 }
 
-# --- Block 4: Speicher-Manager (Fallback-Werte) ---
+# --- Block 4: Speicher-Manager (Ersatzwerte) ---
 V4_BLOCK_STORAGE = {
     'speichergroesse',           # Batteriegröße kWh (Fallback wenn RSCP nicht liefert)
     'maximumladeleistung',       # Max Ladeleistung W (Lade-Limit)
     'maximaleentladeleistung',   # Max Entladeleistung W
     'ems_budget_runtime_enable',
+    # Kanonischer Storage-Dispatch: fehlend/unbekannt bleibt strikt Shadow.
+    'storage_dispatch_runtime_mode', 'storage_dispatch_activation_gate',
+    'storage_dispatch_activation_evidence_sha256',
+    'storage_dispatch_activation_candidate_fingerprint',
+    'storage_dispatch_runtime_budget_ms',
     'einspeiselimit',            # Einspeise-Limit W (für PV-Derating)
     'storage_curve_target_mode', 'storage_curve_sliding_horizon_enable',
     'storage_curve_charge_servo_mode', 'storage_curve_charge_servo_min_w',
@@ -154,34 +177,34 @@ V4_BLOCK_STORAGE = {
     'predump_grid_guard_w', 'predump_pause_grid_guard_w',
     'storage_absorb_pct', 'storage_release_pct',
     'storage_hysteresis_cycles', 'ep_reserve_pct',
-    # Einstellbare Zwischenziele fuer mehrteilige Ladekurve
-    'storage_mid_target_soc',   # Fruehes Zwischenziel (0=aus, z.B. 60)
-    'storage_mid_hour',         # Ziel-Uhrzeit fuer fruehes Zwischenziel
+    # Einstellbare Zwischenziele für mehrteilige Ladekurve
+    'storage_mid_target_soc',   # Frühes Zwischenziel (0=aus, z. B. 60)
+    'storage_mid_hour',         # Ziel-Uhrzeit für frühes Zwischenziel
     'storage_noon_target_soc',  # Soll-SoC bis noon_hour (0=aus, z.B. 85)
-    'storage_noon_hour',        # Ziel-Uhrzeit fuer Zwischenziel (z.B. 14 = 14:00 Uhr)
+    'storage_noon_hour',        # Ziel-Uhrzeit für Zwischenziel (z. B. 14 = 14:00 Uhr)
     'storage_emergency_noon_target_soc',
     'storage_emergency_forecast_factor',
     'storage_manual_override_max_age_h',
-    # Unwetterwaechter: Wetterwarnungen koennen nur warnen oder die Ladekurve anheben.
+    # Unwetterwächter: Wetterwarnungen können nur warnen oder die Ladekurve anheben.
     'storm_guard_mode', 'storm_guard_min_level',
     'storm_guard_precharge_lead_min', 'storm_guard_min_precharge_kwh',
     'storm_guard_max_soc', 'storm_guard_grid_enable', 'storm_guard_grid_min_level',
     'storm_guard_grid_morning_soc',
     # Netz-Laden / Preis-Override Schwellen (storage_manager.py price_override())
-    'netz_laden_enable',          # 1 = Netz-Laden bei guenstigen Preisen aktiv
+    'netz_laden_enable',          # 1 = Netzladen bei günstigen Preisen aktiv
     'grid_discharge_enable',      # 1 = Netz-Entladen bei teuren Preisen aktiv
-    'netz_laden_price_limit',     # Max. Endkundenpreis ct/kWh fuer Guenstig-Trigger (default 20.0)
-    'netz_entladen_price_limit',  # Min. Endkundenpreis ct/kWh fuer Teuer-Trigger  (default 35.0)
-    'grid_max_reserve_amp',       # Reserve am Hausanschluss fuer echtes Preis-Netzladen
-    # PV-Ueberschuss-Floor (Ladekurve Hysterese)
-    'storage_pv_floor_ratio',       # 0.0=aus, 0.15=15% des Ueberschusses
-    'storage_pv_floor_threshold_w', # Erst ab diesem Ueberschuss aktiv (W)
+    'netz_laden_price_limit',     # Max. Endkundenpreis ct/kWh für Günstig-Trigger (Standard 20.0)
+    'netz_entladen_price_limit',  # Min. Endkundenpreis ct/kWh für Teuer-Trigger (Standard 35.0)
+    'grid_max_reserve_amp',       # Reserve am Hausanschluss für echtes Preis-Netzladen
+    # PV-Überschussboden (Ladekurvenhysterese)
+    'storage_pv_floor_ratio',       # 0.0=aus, 0.15=15 % des Überschusses
+    'storage_pv_floor_threshold_w', # Erst ab diesem Überschuss aktiv (W)
     'storage_pv_floor_max_w',       # Obere Grenze des Floors (W)
-    # Dokumentierter Firmware-Kompatibilitaetsschalter fuer alternative Ladebefehle.
-    'storage_ems_charge_quirk',     # 1 = EMS_CHARGE statt set_limit() bei Ueber-Kurve
+    # Firmware-Quirk Workaround (E3DC P10_2026_02 ignoriert SET_MAX_CHARGE_POWER)
+    'storage_ems_charge_quirk',     # 1 = EMS_CHARGE statt set_limit() oberhalb der Kurve
     # Trajectory-Clamping (Ladekurve aus target_timeline aktiv verfolgen)
     'pd_eco_min', 'pd_eco_max', 'pd_max_hours', 'eco_dump_regelbuffer_pct',
-    'eco_dump_min_soc',           # Legacy-Alias; storage_predump_min_soc bleibt fuehrend
+    'eco_dump_min_soc',           # Altbestandsalias; storage_predump_min_soc bleibt führend
     'abregel_puffer_w', 'abregel_hysterese_w', 'abregel_min_charge_w',
     'abregel_auto_band_w', 'abregel_auto_grace_s',
     'tl_autodump_enable', 'tl_autodump_start_pct',
@@ -189,15 +212,18 @@ V4_BLOCK_STORAGE = {
     'tl_autodump_min_w',
     'tl_enable',           # 1 = Clamping aktiv (default), 0 = reines Eba-Verhalten
     'tl_tolerance_pct',    # % SOC Toleranzband oberhalb der Kurve bevor Bremse greift (default 3.0)
-    'tl_emergency_tolerance_pct', # Mindest-Toleranz fuer harte TL-Notbremse (default 30.0)
-    'tl_lookahead_h',      # Stunden Vorausschau fuer iFc-Zwischenziel (default 2.0)
-    'tl_grid_limit_w',     # Max. Netzbezug (W) bevor Bremse aufgehoben wird (Grid-Waechter, default 100)
-    'storage_parallel_curve_tolerance_pct',
+    'tl_emergency_tolerance_pct', # Mindest-Toleranz für harte TL-Notbremse (Standard 30.0)
+    'tl_lookahead_h',      # Stunden Vorausschau für iFc-Zwischenziel (Standard 2.0)
+    'tl_grid_limit_w',     # Max. Netzbezug (W), bevor die Bremse aufgehoben wird (Netzwächter, Standard 100)
+    # Parallelregler im Shadow-Modus: schreibt nur Ramdisk-Trace, nie RSCP.
+    'storage_parallel_enable', 'storage_parallel_history_enable',
+    'storage_parallel_history_max_lines', 'storage_parallel_curve_tolerance_pct',
     'storage_parallel_wb_hold_s', 'storage_parallel_auto_hold_s',
     'storage_parallel_wb_auto_grid_abort_w', 'storage_parallel_grid_relief_enter_w',
     'storage_curve_mode_wallbox_discharge_protect',
     'storage_live_stale_guard_s', 'storage_parallel_curve_charge_reenter_w',
-    'storage_parallel_curve_guard_enter_below_pct',
+    'storage_parallel_curve_guard_enter_below_pct', 'storage_parallel_diff_enable',
+    'storage_parallel_diff_min_w', 'storage_parallel_diff_log_interval_s',
     'storage_auto_limit_heartbeat_enable', 'storage_auto_limit_heartbeat_s',
     'storage_curve_sliding_horizon_min_open_s',
     'storage_curve_latest_charge_freeze_s', 'storage_curve_latest_charge_replan_margin_s',
@@ -210,7 +236,7 @@ V4_BLOCK_STORAGE = {
     'energy_decision_history_retention_days', 'energy_decision_history_interval_s',
     'e3dc_live_persistent_connection', 'e3dc_live_static_poll_s',
     'e3dc_live_history_poll_s', 'e3dc_live_system_poll_s',
-    # Explizite Zeitfenster fuer grosse, statische Fremdlasten.
+    # Explizite Zeitfenster für große, statische Fremdlasten.
     'planned_load_enable', 'planned_load_min_power_w',
     'planned_load_min_duration_min', 'planned_load_confirm_grace_min',
     'planned_load_late_grace_min', 'planned_load_early_grace_min',
@@ -221,8 +247,12 @@ V4_BLOCK_STORAGE = {
 
 # --- Block 5: Preis-/KI-Logik ---
 V4_BLOCK_INTELLIGENCE = {
+    'super_intelligence_enable', 'super_intelligence_deadline',
     'price_boost_enable', 'price_limit', 'price_hard_limit',
     'price_pause_limit', 'price_min_duration', 'price_max_daily',
+    'morning_boost_enable', 'morning_boost_prio', 'morning_boost_wb_power',
+    'morning_boost_deadline', 'morning_boost_target_soc',
+    'morning_boost_min_hours', 'morning_boost_min_pv_pct',
     'consumer_priority_order', 'consumer_priority_wp_runon_s',
     'show_forecast', 'frontend_variant', 'frontend_detail_mode',
     'check_updates', 'auto_update_enable', 'auto_update_time',
@@ -232,10 +262,15 @@ V4_BLOCK_INTELLIGENCE = {
 V4_BLOCK_WALLBOX = {
     'wb_native_enable', 'wb_native_type', 'wb_native_ip',
     'wb_native_type2', 'wb_native_ip2',
+    'wb1_e3dc_wbchar6_compat_enable', 'wb2_e3dc_wbchar6_compat_enable',
+    'wb_e3dc_compat_migration_status',
+    'wb1_e3dc_device_family', 'wb2_e3dc_device_family',
     'wb_native_mode', 'wb_native_eco', 'wbmaxladestrom',
     'wb1_max_amp', 'wb2_max_amp',
     'wb1_current_step_amp', 'wb2_current_step_amp',
-    'grid_max_amps', 'dvcarlimit',
+    'wb_surplus_target_grid_w', 'wb_surplus_noise_w',
+    'phase_transition_safety_margin_w', 'heatpump_start_settle_s',
+    'grid_max_amps', 'grid_wallbox_reserve_amps', 'dvcarlimit',
     'wb_restart_delay_s', 'wb_min_charge_time_s',
     'wb_cloud_stop_delay_s', 'wb_phase_change_hold_s',
     'wb1_restart_delay_s', 'wb1_min_charge_time_s',
@@ -243,6 +278,8 @@ V4_BLOCK_WALLBOX = {
     'wb2_restart_delay_s', 'wb2_min_charge_time_s',
     'wb2_cloud_stop_delay_s', 'wb2_phase_change_hold_s',
     'wb_openwb_zero_budget_hold_s',
+    'openwb_pro_phase_wait_s', 'openwb_pro_phase_cp_interrupt_duration_s',
+    'openwb_pro_phase_restart_delay_s', 'openwb_pro_start_wakeup_delay_s',
     'wb_shadow_start_delay_s', 'wb_shadow_power_ramp_s',
     'wb_shadow_meter_delay_s', 'wb_shadow_meter_ramp_s',
     'wb_shadow_phase_pause_s', 'wb_shadow_zero_budget_stop_s',
@@ -266,15 +303,20 @@ V4_BLOCK_WALLBOX = {
     'wb1_mode', 'wb1_observe_storage_policy',
     'wb1_car_id', 'wb1_capacity', 'wb1_target_unit', 'wb1_target_kwh', 'wb1_target_soc',
     'wb1_charge_power', 'wb1_max_soc_si',
+    'wb1_obc_max_power_kw', 'wb1_obc_max_phases',
+    'wb1_grid_phase', 'wb1_grid_phase_rotation',
     'wb2_mode', 'wb2_observe_storage_policy',
     'wb2_car_id', 'wb2_capacity', 'wb2_target_unit', 'wb2_target_kwh', 'wb2_target_soc',
     'wb2_charge_power', 'wb2_max_soc_si',
+    'wb2_obc_max_power_kw', 'wb2_obc_max_phases',
+    'wb2_grid_phase', 'wb2_grid_phase_rotation',
     'smart_wbhour_enable', 'wbcostpowers',
     'shelly_wb_ip', 'shelly_wb2_ip',
-    'wbminsoc',              # Mindest-SoC Batterie fuer Wallbox-Betrieb (Haus-Prio)
+    'v2h_enable', 'v2h_min_soc', 'v2h_bat_soc_limit',
+    'wbminsoc',              # Mindest-SoC der Batterie für Wallbox-Betrieb (Hauspriorität)
 }
 
-# --- Block 7: Waermepumpe / Energie-Manager ---
+# --- Block 7: Wärmepumpe / Energie-Manager ---
 V4_BLOCK_HEATPUMP = {
     'wp_type', 'wp_source_type', 'luxtronik', 'luxtronik_ip',
     'luxtronik_pause_setpoint_c',
@@ -301,7 +343,7 @@ V4_BLOCK_HEATPUMP = {
     'shelly_3em_ip',       # IP des Shelly Pro3EM (Energiemessung + optionales Relais)
     'shelly_3em_relay_id', # Relais-ID 0-2 (-1 = nur messen, nicht schalten)
     'shelly_3em_wp_min_w', # WP Mindestleistung als Einschaltschwelle (W)
-    'shelly_3em_wp_max_w', # WP Nennleistung fuer Budget-Berechnung (W)
+    'shelly_3em_wp_max_w', # WP-Nennleistung für Budgetberechnung (W)
     'shelly_3em_enable',   # 1=PV-Auto-Schalten, 0=nur Messen
     # Klimaanlage / gemessener Zusatzverbraucher
     'climate_enable',
@@ -315,11 +357,20 @@ V4_BLOCK_HEATPUMP = {
     'climate_history_interval_s',
     'climate_forecast_enable',
     'climate_control_enable',
+    'climate_control_provider',
+    'climate_control_mode',
     'climate_control_poll_s',
     'climate_toshiba_cloud_enable',
     'climate_toshiba_username',
     'climate_toshiba_password',
     'climate_toshiba_device_ids',
+    'climate_day_temp_c',
+    'climate_night_temp_c',
+    'climate_night_start',
+    'climate_night_end',
+    'climate_night_eco_enable',
+    'climate_night_quiet_enable',
+    'climate_high_power_enable',
     # Stiebel Eltron ISG / WPM (wp_type=4)
     'stiebel_isg_ip',
     'stiebel_isg_port',
@@ -406,14 +457,15 @@ V4_BLOCK_UI = {
     'logfile', 'ui_energy_flow',
 }
 
-# --- Block 8: System und Installationspfade ---
+# --- Block 8: System, Entwicklung und Altbestand ---
 V4_BLOCK_SYSTEM = {
     'e3dcwallboxtxt',
-    # WICHTIG: Pfade muessen in der v4 JSON bleiben, da PHP sie braucht!
+    'installer_debug_console',
+    # WICHTIG: Pfade müssen in der V4-JSON bleiben, da PHP sie benötigt!
     'install_user', 'home_dir', 'install_path', 'venv_name', 'venv_path', '_comment'
 }
 
-# Gesamtes gueltiges Inventar
+# Gesamtes gültiges Inventar
 V4_ALL_KEYS = (
     V4_BLOCK_CONNECTION | V4_BLOCK_PV | V4_BLOCK_TARIFF |
     V4_BLOCK_STORAGE | V4_BLOCK_INTELLIGENCE | V4_BLOCK_WALLBOX |
@@ -423,11 +475,11 @@ V4_ALL_KEYS = (
 
 V4_LOCAL_PATH_KEYS = {'install_user', 'home_dir', 'install_path', 'venv_name', 'venv_path'}
 
-# Keys die NIEMALS in e3dc_v4.json gespeichert werden duerfen
+# Schlüssel, die NIEMALS in e3dc_v4.json gespeichert werden dürfen
 V4_BLACKLIST = {
-    # Laufzeit-Zustaende (gehoeren in Ramdisk)
+    # Laufzeitzustände (gehören in die Ramdisk)
     'wbhour', 'wb_sofort', 'wb_locked', 'wb2_locked', 'wbbis', 'wbvon', 'wbmode',
-    # Lokale Installationspfade sind gueltige Metadaten. Import/Rollback schuetzt sie
+    # Lokale Installationspfade sind gültige Metadaten. Import/Rollback schützt sie
     # separat gegen Fremdwerte; Cleanup darf sie nicht zyklisch entfernen.
     # Dopplung
     'config',
@@ -452,19 +504,8 @@ V4_BLACKLIST = {
     'pvatmosphere',
     # Logfile Pfad (C++ intern; Python nutzt journald/systemd)
     'logfile',
-    # Veralteter Legacy-Schalter
+    # Veralteter Altbestandsschalter
     'openwb',
-    # Stillgelegte Test-, Vergleichs- und Zukunftspfade. Vorhandene Altwerte
-    # werden beim Cleanup entfernt, damit sie nicht versehentlich reaktiviert werden.
-    'storage_parallel_enable', 'storage_parallel_history_enable',
-    'storage_parallel_history_max_lines', 'storage_parallel_diff_enable',
-    'storage_parallel_diff_min_w', 'storage_parallel_diff_log_interval_s',
-    'direct_marketing_arbitrage_experimental_enable',
-    'super_intelligence_enable', 'super_intelligence_deadline',
-    'morning_boost_enable', 'morning_boost_prio', 'morning_boost_wb_power',
-    'morning_boost_deadline', 'morning_boost_target_soc',
-    'morning_boost_min_hours', 'morning_boost_min_pv_pct',
-    'v2h_enable', 'v2h_min_soc', 'v2h_bat_soc_limit',
     'shelly0v10v', 'shelly0v10v_ip', 'shelly0v10vmin', 'shelly0v10vmax',
     'shelly0v10vezh1', 'shelly0v10vezh2', 'shelly0v10vezh3', 'shelly0v10vezh4',
     'tasmota',
@@ -477,13 +518,13 @@ V4_BLACKLIST = {
     'wpehz', 'wpzwe', 'wpzwepvon', 'wpoffset', 'wpdyncop',
     # Redundanz: car_* ist jetzt wb1_*
     'car_capacity', 'car_target_unit', 'car_target_kwh', 'car_target_soc', 'car_max_soc_si', 'car_charge_power',
-    # C++ Legacy: Wallbox-Wirkungsgrad-Keys (leere Strings -> float() Crash)
-    # Grossbuchstaben-Duplikate die config_editor.php faelschlicherweise schreibt
+    # C++-Altbestand: Schlüssel für den Wallbox-Wirkungsgrad (leere Strings führen zum float()-Abbruch)
+    # Großbuchstaben-Duplikate, die config_editor.php fälschlicherweise schreibt
     # (Korrekte Kleinbuchstaben-Keys existieren bereits)
     'GRID_START_LIMIT', 'MIN_SOC', 'HEIZGRENZE_TEMP', 'WWS', 'WWW', 'HZ', 'KHL',
 }
 
-# Reihenfolge der Bloecke fuer strukturierte JSON-Ausgabe
+# Reihenfolge der Blöcke für die strukturierte JSON-Ausgabe
 V4_BLOCK_ORDER = [
     ('E3DC Verbindung',             V4_BLOCK_CONNECTION),
     ('PV-Anlage & Standort',        V4_BLOCK_PV),
@@ -503,7 +544,6 @@ WALLBOX_TYPE_ALIASES = {
     'none': 'none',
     'off': 'none',
     'disabled': 'none',
-    'dummy': 'none',
     'goe': 'go-e',
     'go-echarger': 'go-e',
     'openwb-pro': 'openwb_pro',
@@ -513,7 +553,11 @@ WALLBOX_TYPE_ALIASES = {
     'e3dc multi': 'e3dc_multi',
     'multiconnect': 'e3dc_multi',
     'multi_connect': 'e3dc_multi',
-    'e3dc_easy': 'e3dc',
+    'e3dc_easy': 'e3dc_easy_connect',
+    'easy_connect': 'e3dc_easy_connect',
+    'e3dc easy connect': 'e3dc_easy_connect',
+    'efy': 'e3dc_efy',
+    'e3dc efy': 'e3dc_efy',
     'e3dc_legacy': 'e3dc',
     'native': 'e3dc',
 }
@@ -557,10 +601,10 @@ def _normalise_flow_color(value, fallback: str) -> str:
 
 
 def _normalise_ui_energy_flow(value) -> dict:
-    """Keep the Energy-Flow layout as structured UI config during cleanup."""
+    """Bewahrt das Energiefluss-Layout bei der Bereinigung als strukturierte UI-Konfiguration."""
     if not isinstance(value, dict):
         return {}
-    allowed_nodes = ('pv', 'external_pv', 'grid', 'battery', 'home', 'wallbox', 'wallbox2', 'heatpump', 'heater', 'climate')
+    allowed_nodes = ('pv', 'external_pv', 'grid', 'battery', 'home', 'wallbox', 'wallbox2', 'heatpump', 'heater', 'climate', 'generation', 'consumption', 'center')
     default_colors = {
         'pv': '#ffc107',
         'external_pv': '#22c55e',
@@ -575,6 +619,8 @@ def _normalise_ui_energy_flow(value) -> dict:
         'heatpump': '#f97316',
         'heater': '#fd7e14',
         'climate': '#38bdf8',
+        'generation': '#22c55e',
+        'consumption': '#0dcaf0',
         'center': '#0d6efd',
     }
     clean: dict = {}
@@ -600,6 +646,19 @@ def _normalise_ui_energy_flow(value) -> dict:
             colors[key] = _normalise_flow_color(raw_colors.get(key, fallback), fallback)
     if colors:
         clean['colors'] = colors
+    allowed_labels = ('pv', 'external_pv', 'grid', 'battery', 'home', 'wallbox', 'wallbox2', 'heatpump', 'heater', 'climate', 'generation', 'consumption')
+    raw_labels = value.get('labels', {})
+    labels = {}
+    if isinstance(raw_labels, dict):
+        for key in allowed_labels:
+            raw_label = raw_labels.get(key)
+            if not isinstance(raw_label, (str, int, float)):
+                continue
+            label = re.sub(r'[\x00-\x1f\x7f]', '', str(raw_label)).replace('<', '').replace('>', '').strip()[:32]
+            if label:
+                labels[key] = label
+    if labels:
+        clean['labels'] = labels
     return clean
 
 
@@ -613,8 +672,101 @@ def _normalise_v4_values(data: dict) -> dict:
         result['ui_energy_flow'] = _normalise_ui_energy_flow(result.get('ui_energy_flow'))
     return result
 
+
+def _enabled_config_value(value) -> bool:
+    return str(value or '').strip().lower() in {'1', 'true', 'yes', 'on'}
+
+
+def resolve_legacy_e3dc_auto_wbchar6_migration(data: dict) -> tuple[dict, dict]:
+    """Bewahrt einen aktiven alten e3dc_auto-Regelpfad genau einmal.
+
+    Ein fehlender neuer Schlüssel entspricht keiner expliziten Nutzerwahl. Nur
+    ein bereits aktiver nativer Manager zusammen mit dem alten automatischen
+    E3/DC-Typ belegt, dass der frühere WBchar6-Kompatibilitätspfad verwendet
+    wurde. Neuinstallationen bleiben deaktiviert; eine explizite Null wird nie
+    überschrieben.
+    """
+    source = dict(data or {})
+    result = dict(source)
+    migrated = []
+    if _enabled_config_value(source.get('wb_native_enable')):
+        for wb_id, type_key, compat_key in (
+            (1, 'wb_native_type', 'wb1_e3dc_wbchar6_compat_enable'),
+            (2, 'wb_native_type2', 'wb2_e3dc_wbchar6_compat_enable'),
+        ):
+            if compat_key in source:
+                continue
+            if _normalise_wallbox_type(source.get(type_key)) != 'e3dc_auto':
+                continue
+            result[compat_key] = '1'
+            migrated.append(wb_id)
+    if migrated:
+        result['wb_e3dc_compat_migration_status'] = (
+            'legacy_e3dc_auto_wbchar6_compat_enabled:'
+            + ','.join(f'wb{wb_id}' for wb_id in migrated)
+        )
+    return result, {
+        'changed': bool(migrated),
+        'migrated_wallboxes': migrated,
+        'reason': 'legacy_e3dc_auto_active_missing_key' if migrated else 'not_applicable_or_explicit',
+    }
+
+
+def migrate_legacy_e3dc_auto_wbchar6_config(path: str, dry_run: bool = False) -> dict:
+    """Sichert und migriert ausschließlich eine belegte aktive Altkonfiguration atomar."""
+    log = logging.getLogger('config_manager')
+    config_path = os.path.abspath(path)
+    try:
+        with open(config_path, 'r', encoding='utf-8') as handle:
+            source = json.load(handle)
+    except Exception as exc:
+        return {'changed': False, 'ok': False, 'reason': f'config_unreadable:{type(exc).__name__}'}
+    if not isinstance(source, dict):
+        return {'changed': False, 'ok': False, 'reason': 'config_not_object'}
+    migrated, status = resolve_legacy_e3dc_auto_wbchar6_migration(source)
+    status['ok'] = True
+    status['backup_path'] = None
+    if not status['changed'] or dry_run:
+        return status
+
+    backup_dir = os.path.join(os.path.dirname(config_path), 'config_backups')
+    os.makedirs(backup_dir, exist_ok=True)
+    timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+    backup_path = os.path.join(
+        backup_dir,
+        f'e3dc_v4_{timestamp}_pre_wbchar6_compat_migration.json.bak',
+    )
+    temporary = config_path + f'.wbchar6-migrate-{os.getpid()}'
+    try:
+        shutil.copy2(config_path, backup_path)
+        with open(temporary, 'w', encoding='utf-8') as handle:
+            json.dump(migrated, handle, indent=4, ensure_ascii=False)
+            handle.write('\n')
+        os.replace(temporary, config_path)
+        try:
+            apply_config_secret_permissions(backup_path, install_user=get_install_user(), data=source)
+            apply_config_secret_permissions(config_path, install_user=get_install_user(), data=migrated)
+        except Exception:
+            pass
+    except Exception as exc:
+        try:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+        except Exception:
+            pass
+        log.error('E3/DC-WBchar6-Kompatibilitätsmigration fehlgeschlagen: %s', type(exc).__name__)
+        return {'changed': False, 'ok': False, 'reason': f'write_failed:{type(exc).__name__}', 'backup_path': backup_path}
+
+    status['backup_path'] = backup_path
+    log.info(
+        'E3/DC-WBchar6-Kompatibilität einmalig migriert: %s; Backup=%s',
+        ','.join(f'WB{wb_id}' for wb_id in status['migrated_wallboxes']),
+        os.path.basename(backup_path),
+    )
+    return status
+
 def _load_v4() -> dict:
-    """Laedt e3dc_v4.json. Gibt {} zurueck bei Fehler."""
+    """Lädt e3dc_v4.json. Gibt bei einem Fehler {} zurück."""
     if not os.path.exists(V4_CONFIG_FILE):
         return {}
     try:
@@ -643,8 +795,6 @@ def _save_v4(data: dict) -> bool:
     except Exception as e:
         logging.getLogger('config_manager').error(f'Fehler beim Schreiben von e3dc_v4.json: {e}')
         return False
-
-
 def _sort_by_blocks(data: dict) -> dict:
     """Sortiert ein Dict nach der kanonischen Block-Reihenfolge."""
     data = _normalise_v4_values(data)
@@ -655,7 +805,7 @@ def _sort_by_blocks(data: dict) -> dict:
             if key in data and key not in seen:
                 result[key] = data[key]
                 seen.add(key)
-    # Verbleibende (unbekannte, aber nicht blacklisted) ans Ende
+    # Verbleibende (unbekannte, aber nicht gesperrte) Schlüssel ans Ende
     for key in sorted(data.keys()):
         if key not in seen:
             result[key] = data[key]
@@ -669,11 +819,11 @@ def _sort_by_blocks(data: dict) -> dict:
 def cleanup_v4_config(dry_run: bool = False) -> bool:
     """
     Bereinigt e3dc_v4.json:
-    1. Entfernt blacklisted & unbekannte Keys (Laufzeit-Zustaende, Eba-M Altlasten)
+    1. Entfernt gesperrte und unbekannte Schlüssel (Laufzeitzustände, Eba-M-Altlasten)
     2. Sortiert nach kanonischer Block-Struktur
     3. Erstellt vorher ein Backup
 
-    dry_run=True: zeigt nur an, was geloescht wuerden haette, schreibt nicht.
+    dry_run=True: zeigt nur an, was gelöscht und ergänzt würde, schreibt aber nicht.
     """
     log = logging.getLogger('config_manager')
     print('\n=== V4 Konfigurations-Bereinigung ===\n')
@@ -682,7 +832,34 @@ def cleanup_v4_config(dry_run: bool = False) -> bool:
         print(f'  [!] {V4_CONFIG_FILE} nicht gefunden. Nichts zu bereinigen.')
         return True
 
-    # Backup
+    # Der vollständige Zusatz-WR-Vertrag muss vor den Standardwerten aufgelöst
+    # sein, sonst kann die Bereinigung unbekannter Schlüssel eine Seite der
+    # Rückfallbrücke verwerfen.
+    try:
+        migration = migrate_aux_inverter_config_file(V4_CONFIG_FILE, dry_run=dry_run)
+    except Exception as exc:
+        print(f'  [!] Zusatz-WR-Konfigurationsmigration fehlgeschlagen: {type(exc).__name__}')
+        log.error('Zusatz-WR-Konfigurationsmigration fehlgeschlagen: %s', type(exc).__name__)
+        return False
+    if migration.get('blocked'):
+        reason = migration.get('reason', 'unvollständiger oder widersprüchlicher Altvertrag')
+        print(f'  [!] Zusatz-WR-Konfigurationsmigration blockiert: {reason}')
+        log.error('Zusatz-WR-Konfigurationsmigration blockiert: %s', reason)
+        return False
+    if migration.get('changed'):
+        print(f"  [OK] Zusatz-WR-Vertrag: {migration.get('reason', 'migriert')}")
+
+    compat_migration = migrate_legacy_e3dc_auto_wbchar6_config(V4_CONFIG_FILE, dry_run=dry_run)
+    if not compat_migration.get('ok'):
+        print(f"  [!] E3/DC-WBchar6-Kompatibilitätsmigration fehlgeschlagen: {compat_migration.get('reason')}")
+        log.error('E3/DC-WBchar6-Kompatibilitätsmigration fehlgeschlagen: %s', compat_migration.get('reason'))
+        return False
+    if compat_migration.get('changed'):
+        wallboxes = ', '.join(f"WB{wb_id}" for wb_id in compat_migration.get('migrated_wallboxes', []))
+        suffix = 'Dry-run, noch kein Backup/Write' if dry_run else 'Backup angelegt'
+        print(f"  [OK] E3/DC-WBchar6-Kompatibilität erhalten: {wallboxes}; {suffix}.")
+
+    # Sicherung
     if not dry_run:
         ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
         backup_dir = os.path.join(os.path.dirname(V4_CONFIG_FILE), 'config_backups')
@@ -690,7 +867,7 @@ def cleanup_v4_config(dry_run: bool = False) -> bool:
         try:
             run_command(f'sudo chgrp www-data {backup_dir} && sudo chmod {config_secret_dir_mode_text()} {backup_dir}')
         except: pass
-        
+
         bak = os.path.join(backup_dir, f'e3dc_v4_{ts}.json.bak')
         try:
             shutil.copy2(V4_CONFIG_FILE, bak)
@@ -735,34 +912,34 @@ def cleanup_v4_config(dry_run: bool = False) -> bool:
         for k in removed_unknown:
             print(f'    - {k}')
     if filled_defaults:
-        print(f'  Ergaenze {len(filled_defaults)} Start-Defaults:')
+        print(f'  Ergänze {len(filled_defaults)} Start-Standardwerte:')
         for k in filled_defaults:
-            print(f'    + {k}')
+            print(f'    + {k} = {data.get(k)}')
 
     if not removed_blacklist and not removed_unknown and not filled_defaults:
         print(f'  [OK] Keine Altlasten gefunden. Datei ist sauber.')
     else:
         total = len(removed_blacklist) + len(removed_unknown)
         if dry_run:
-            print(f'\n  [Dry-Run] {total} Keys WUERDEN entfernt, {len(filled_defaults)} Defaults WUERDEN ergaenzt.')
+            print(f'\n  [Dry-Run] {total} Schlüssel WÜRDEN entfernt, {len(filled_defaults)} Standardwerte WÜRDEN ergänzt.')
         else:
             sorted_kept = _sort_by_blocks(kept)
             if _save_v4(sorted_kept):
-                print(f'\n  [OK] {total} Keys entfernt, {len(filled_defaults)} Defaults ergaenzt. Datei nach Block-Schema sortiert.')
+                print(f'\n  [OK] {total} Schlüssel entfernt, {len(filled_defaults)} Standardwerte ergänzt. Datei nach Blockschema sortiert.')
             else:
                 print(f'  [!] Fehler beim Schreiben der bereinigten Datei.')
                 return False
 
-    log.info(f'V4 Cleanup: {len(removed_blacklist)} blacklisted, {len(removed_unknown)} unbekannt entfernt, {len(filled_defaults)} defaults ergaenzt.')
+    log.info(f'V4-Bereinigung: {len(removed_blacklist)} gesperrte, {len(removed_unknown)} unbekannte Schlüssel entfernt, {len(filled_defaults)} Standardwerte ergänzt.')
     return True
 
 
 def reorder_v4_config() -> bool:
-    """Sortiert e3dc_v4.json nach Block-Schema ohne Inhalte zu aendern."""
+    """Sortiert e3dc_v4.json nach Blockschema, ohne Inhalte zu ändern."""
     data = _load_v4()
     if not data:
         return False
-    # Blacklisted Keys trotzdem rausfiltern
+    # Gesperrte Schlüssel trotzdem herausfiltern
     clean = {k: v for k, v in data.items() if k.lower() not in V4_BLACKLIST}
     sorted_data = _sort_by_blocks(clean)
     if _save_v4(sorted_data):
@@ -772,9 +949,9 @@ def reorder_v4_config() -> bool:
 
 
 def check_config_duplicates():
-    """Prueft e3dc.config.txt auf doppelte Eintraege und entfernt Duplikate."""
+    """Prüft e3dc.config.txt auf doppelte Einträge und entfernt Duplikate."""
     log = logging.getLogger('config_manager')
-    print('\n=== Konfigurations-Duplikat-Pruefung (e3dc.config.txt) ===\n')
+    print('\n=== Prüfung auf Konfigurationsduplikate (e3dc.config.txt) ===\n')
 
     config_candidates = [
         os.path.join('/var/www/html/data', 'e3dc.config.txt'),
@@ -783,7 +960,7 @@ def check_config_duplicates():
     config_file = next((p for p in config_candidates if os.path.exists(p)), None)
 
     if not config_file:
-        print(f'  [OK] e3dc.config.txt nicht gefunden – kein Check noetig (V4 Pure).')
+        print(f'  [OK] e3dc.config.txt nicht gefunden – keine Prüfung nötig (V4 Pure).')
         return True
 
     try:
@@ -817,12 +994,12 @@ def check_config_duplicates():
         return True
     except Exception as e:
         print(f'  [!] Fehler: {e}')
-        log.error(f'Duplikat-Pruefung fehlgeschlagen: {e}')
+        log.error(f'Duplikatprüfung fehlgeschlagen: {e}')
         return False
 
 
 def _migrate_luxtronik_config():
-    """Prueft auf alte config.lux.json und migriert die Werte in e3dc_v4.json."""
+    """Prüft auf eine alte config.lux.json und migriert die Werte in e3dc_v4.json."""
     log = logging.getLogger('config_manager')
     lux_path = os.path.join(INSTALLER_DIR, 'luxtronik', 'config.lux.json')
     if not os.path.exists(lux_path):
@@ -840,7 +1017,7 @@ def _migrate_luxtronik_config():
             key_lower = k.lower()
             if key_lower in V4_ALL_KEYS:
                 v4[key_lower] = str(v)
-                print(f'  [OK] Migriert: {key_lower}')
+                print(f'  [OK] Migriert: {key_lower} = {v}')
 
         _save_v4(_sort_by_blocks(v4))
         os.rename(lux_path, lux_path + '.migrated')
@@ -852,7 +1029,7 @@ def _migrate_luxtronik_config():
 
 
 def _migrate_txt_config():
-    """Prueft e3dc.config.txt und migriert fehlende Werte in e3dc_v4.json."""
+    """Prüft e3dc.config.txt und migriert fehlende Werte in e3dc_v4.json."""
     log = logging.getLogger('config_manager')
     config_candidates = [
         os.path.join('/var/www/html/data', 'e3dc.config.txt'),
@@ -874,16 +1051,16 @@ def _migrate_txt_config():
             stripped = line.strip()
             if not stripped or stripped.startswith('#') or '=' not in stripped:
                 continue
-            
+
             key, val = stripped.split('=', 1)
             key = key.strip().lower()
             val = val.strip()
 
-            # Nur gueltige Keys migrieren und nur, wenn sie im JSON noch nicht existieren
+            # Nur gültige Schlüssel migrieren, die im JSON noch nicht existieren
             if key in V4_ALL_KEYS and key not in v4 and val != '':
                 v4[key] = val
                 migrated_keys += 1
-                print(f'  [OK] V3-Migration: {key} in e3dc_v4.json uebernommen.')
+                print(f'  [OK] V3-Migration: {key} in e3dc_v4.json übernommen.')
 
         if migrated_keys > 0:
             _save_v4(_sort_by_blocks(v4))
@@ -895,12 +1072,29 @@ def _migrate_txt_config():
 
 
 def run_config_wizard():
-    """Fuehrt alle Konfigurations-Checks und Migrationen aus."""
-    log_task_completed('Konfigurations-Management gestartet', details='V4 Pruefe & migriere')
+    """Führt alle Konfigurationsprüfungen und Migrationen aus."""
+    log_task_completed('Konfigurations-Management gestartet', details='V4 prüfen und migrieren')
+
+    try:
+        migration = migrate_aux_inverter_config_file(V4_CONFIG_FILE)
+    except Exception as exc:
+        logging.getLogger('config_manager').error(
+            'Zusatz-WR-Konfigurationsmigration vor Wizard fehlgeschlagen: %s',
+            type(exc).__name__,
+        )
+        return False
+    if migration.get('blocked'):
+        logging.getLogger('config_manager').error(
+            'Zusatz-WR-Konfigurationsmigration vor Wizard blockiert: %s',
+            migration.get('reason', 'unvollständiger oder widersprüchlicher Altvertrag'),
+        )
+        return False
 
     _migrate_luxtronik_config()
     _migrate_txt_config()
     check_config_duplicates()
-    cleanup_v4_config(dry_run=False)
+    if not cleanup_v4_config(dry_run=False):
+        return False
 
     log_task_completed('Konfigurations-Management beendet')
+    return True

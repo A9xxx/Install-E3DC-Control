@@ -1,46 +1,46 @@
 #!/usr/bin/env python3
 """
-heizstab_manager.py - Autonomer Heizstab / Shelly-Heizluefter / Shelly-3EM-WP Manager
+heizstab_manager.py - Autonomer Heizstab / Shelly-Heizlüfter / Shelly-3EM-WP-Manager
 
-Heizstab/BWWP laeuft als Zusatzverbraucher parallel zu Luxtronik/IDM.
-wp_type bleibt der echte Waermepumpentyp:
+Heizstab/BWWP läuft als Zusatzverbraucher parallel zu Luxtronik/IDM.
+wp_type bleibt der echte Wärmepumpentyp:
     0: Luxtronik
     1: IDM
     3: Shelly Pro3EM WP-Messung + optionale Relaissteuerung (keine native WP-Anbindung)
 Legacy wp_type=2 wird noch akzeptiert, aber nicht mehr neu gesetzt.
 
 Architektur:
-- Liest PV-Ueberschuss aus live_data_py.json (Python RSCP)
+- Liest PV-Überschuss aus live_data_py.json (Python RSCP)
 - Steuert Heizstab via Modbus-TCP (Zusatzverbraucher):
     Register 1000 = Sollleistung setzen (W, wie C++ Kern)
     Register 1014 = Istleistung lesen  (W, wie C++ Kern)
-- Steuert Shelly Heizluefter via HTTP API (Shelly Plug S / Pro)
+- Steuert Shelly-Heizlüfter über die HTTP-API (Shelly Plug S / Pro)
 - Liest WP-Leistung via Shelly Pro3EM (wp_type=3, Gen2 RPC)
 - Schaltet WP-Relais via Shelly Pro3EM (wp_type=3, optional)
 - Schreibt Status in /var/www/html/ramdisk/heizstab_data.json
-- Keine Dauerverbindungen! Modbus Socket nach jedem Zugriff SOFORT schliessen.
+- Keine Dauerverbindungen! Modbus-Socket nach jedem Zugriff SOFORT schließen.
 
 Konfiguration in e3dc_v4.json:
     wp_type         = 0/1/3             (Luxtronik/IDM/Shelly-3EM-WP)
     heizstab        = 1                 (Zusatzverbraucher Heizstab/BWWP aktiv)
     heizstab_type   = generic           (generic | mypv_elwa)
-    heizstab_ip     = 192.168.178.xxx   (0.0.0.0 = deaktiviert)
+    heizstab_ip     = 192.0.2.81        (0.0.0.0 = deaktiviert)
     heizstab_port   = 502
     heizstab_max_w  = 3000
-    shelly_heiz_ip  = 192.168.178.yyy   (0.0.0.0 = deaktiviert)
-    shelly_heiz_w   = 1500              (Nennleistung des Shelly-Geraets fuer Berechnung)
+    shelly_heiz_ip  = 192.0.2.82        (0.0.0.0 = deaktiviert)
+    shelly_heiz_w   = 1500              (Nennleistung des Shelly-Geräts für Berechnung)
     hs_auto_mode    = 1                 (0=Manuell, 1=PV-Auto)
-    hs_min_surplus_w = 500              (Mindest-PV-Ueberschuss zum Einschalten)
-    hs_min_soc      = 20                (Mindest-Batterie-SOC fuer Betrieb)
+    hs_min_surplus_w = 500              (Mindest-PV-Überschuss zum Einschalten)
+    hs_min_soc      = 20                (Mindest-Batterie-SOC für Betrieb)
 
     Shelly Pro3EM WP-Integration (wp_type=3):
-    shelly_3em_ip        = 192.0.2.163  (IP des Shelly Pro3EM)
+    shelly_3em_ip        = 192.0.2.90       (IP des Shelly Pro3EM)
     shelly_3em_relay_id  = 0                (Relay-ID 0-2, -1 = kein Schalten)
     shelly_3em_wp_min_w  = 1000            (WP-Mindestleistung: Einschaltschwelle)
-    shelly_3em_wp_max_w  = 3000            (WP-Nennleistung: fuer Budget-Berechnung)
+    shelly_3em_wp_max_w  = 3000            (WP-Nennleistung: für Budget-Berechnung)
     shelly_3em_enable    = 1               (1=Relaissteuerung aktiv, 0=nur messen)
-    wp_min_runtime_min   = 30              (Taktschutz: Mindestlaufzeit fuer WP-Relais)
-    wp_restart_block_min = 20              (Taktschutz: Wiedereinschaltsperre fuer WP-Relais)
+    wp_min_runtime_min   = 30              (Taktschutz: Mindestlaufzeit für WP-Relais)
+    wp_restart_block_min = 20              (Taktschutz: Wiedereinschaltsperre für WP-Relais)
 
 myPV AC ELWA-E Modbus Register (heizstab_type = mypv_elwa):
     Register 1000 R/W  Sollleistung (W, 0-3000)
@@ -48,7 +48,7 @@ myPV AC ELWA-E Modbus Register (heizstab_type = mypv_elwa):
     Register 1002 R    Ziel-Temperatur  (x0.1 degC)
     Register 1003 R    Status (2=Heizen, 3=Standby, 4=Boost, 5=Fertig, 201+=Fehler)
     Register 1004 R/W  Modbus-Timeout (60s empfohlen)
-    HINWEIS: Register 1014 = Sicherungsgroesse (13/16A) - NICHT Istleistung!
+    HINWEIS: Register 1014 = Sicherungsgröße (13/16A) - NICHT Istleistung!
 """
 
 import os
@@ -57,6 +57,9 @@ import json
 import time
 import urllib.request
 import urllib.error
+
+_INSTALLER_DIR = os.path.dirname(os.path.abspath(__file__))
+_INSTALL_ROOT = os.path.dirname(_INSTALLER_DIR)
 
 try:
     from consumer_priority import CONSUMER_MIN_W
@@ -72,12 +75,13 @@ except Exception:
 try:
     from Installer.Heat import forecast as heat_forecast
     from Installer.Heat import policy as heat_policy
+    from Installer.heat_actuator_safety import default_heat_actuator_gate
 except ModuleNotFoundError:
-    _INSTALLER_DIR = os.path.dirname(os.path.abspath(__file__))
     if _INSTALLER_DIR not in sys.path:
         sys.path.insert(0, _INSTALLER_DIR)
     from Heat import forecast as heat_forecast
     from Heat import policy as heat_policy
+    from heat_actuator_safety import default_heat_actuator_gate
 
 # Modbus: nur importieren wenn verfuegbar
 try:
@@ -116,8 +120,8 @@ HS_MANUAL_FILE = "/var/www/html/ramdisk/heizstab_manual_override.json"
 # Legacy Fallback: e3dc.config.txt (C++ Kern)
 CONFIG_PATHS = [
     "/var/www/html/data/e3dc.config.txt",
-    "/home/pi/E3DC-Control/e3dc.config.txt",
-    "/home/pi/Install/Installer/luxtronik/e3dc.config.txt",
+    os.path.join(_INSTALL_ROOT, "e3dc.config.txt"),
+    os.path.join(_INSTALLER_DIR, "luxtronik", "e3dc.config.txt"),
 ]
 
 POLL_INTERVAL      = 15   # Sekunden zwischen Zyklen (war 10 - hoeher = weniger Modbus-Stress)
@@ -125,6 +129,61 @@ STARTUP_DELAY      = 30   # Sekunden warten nach (Re-)Start bevor erster Modbus-
 CONN_ERR_BACKOFF   = 60   # Sekunden Pause nach Connection refused
 HS_HYSTERESIS_W    = 500  # Deadband: Abschalten erst wenn Ueberschuss < min - 500W
 SHELLY_TIMEOUT     = 3    # HTTP Timeout
+
+
+_HEATER_ACTUATOR_GATE = None
+
+
+def _heater_actuator_gate():
+    global _HEATER_ACTUATOR_GATE
+    if _HEATER_ACTUATOR_GATE is None:
+        _HEATER_ACTUATOR_GATE = default_heat_actuator_gate(
+            __file__,
+            "Installer/heizstab_manager.py",
+            "heizstab_manager",
+        )
+    return _HEATER_ACTUATOR_GATE
+
+
+def _authorize_heater_output(
+    driver_key,
+    action,
+    *,
+    safety_gate=None,
+    safe_release=False,
+    preserve_existing=False,
+):
+    gate = safety_gate or _heater_actuator_gate()
+    verdict = gate.authorize(
+        driver_key,
+        action,
+        allow_release_on_invalid=bool(safe_release),
+        preserve_existing=bool(preserve_existing),
+    )
+    if not verdict.allowed:
+        print(f"  [!] Aktorausgang blockiert: {verdict.reason}")
+    return verdict.allowed
+
+
+def _invoke_actuator(func, *args, safety_gate=None):
+    """Erhält bestehende Aufrufsignaturen und erlaubt die explizite Gate-Übergabe."""
+    if safety_gate is None:
+        return func(*args)
+    return func(*args, safety_gate=safety_gate)
+
+
+def _with_actuator_safety_status(status, safety_gate=None):
+    gate = safety_gate or _HEATER_ACTUATOR_GATE
+    authorization = getattr(gate, "last_authorization", None) if gate is not None else None
+    status["actor_writes_blocked"] = bool(
+        authorization is not None and not getattr(authorization, "allowed", False)
+    )
+    status["actor_write_block_reason"] = (
+        str(getattr(authorization, "reason", ""))
+        if status["actor_writes_blocked"]
+        else ""
+    )
+    return status
 
 
 # ---------------------------------------------------------------------------
@@ -307,7 +366,7 @@ def _modbus_read_regs(ip, port, start, count=1):
         client.close()
 
 
-def _modbus_write_reg(ip, port, register, value):
+def _modbus_write_reg_raw(ip, port, register, value):
     """Schreibt einen Wert in ein Holding-Register. Socket wird IMMER geschlossen."""
     if not MODBUS_OK:
         return False
@@ -323,7 +382,7 @@ def _modbus_write_reg(ip, port, register, value):
                 result = client.write_register(register, int(max(0, value)), slave=1)
             except TypeError:
                 result = client.write_register(register, int(max(0, value)), unit=1)
-        return not result.isError()
+        return bool(result is not None and not (hasattr(result, "isError") and result.isError()))
     except Exception as e:
         print(f"  [!] Modbus Schreiben ({ip} Reg {register}={value}): {e}")
         return False
@@ -345,9 +404,41 @@ def heizstab_read_power(ip, port):
     return None
 
 
-def heizstab_set_power(ip, port, power_w):
+def _modbus_write_confirmed(
+    ip,
+    port,
+    register,
+    value,
+    *,
+    driver_key,
+    safety_gate=None,
+    safe_release=False,
+):
+    if not _authorize_heater_output(
+        driver_key,
+        f"modbus:{register}:{value}",
+        safety_gate=safety_gate,
+        safe_release=safe_release,
+    ):
+        return False
+    if not _modbus_write_reg_raw(ip, port, register, value):
+        return False
+    readback = _modbus_read_regs(ip, port, register, count=1)
+    return bool(readback and int(readback[0]) == int(max(0, value)))
+
+
+def heizstab_set_power(ip, port, power_w, safety_gate=None):
     """Generic: Setzt Sollleistung in Register 1000 (W)."""
-    return _modbus_write_reg(ip, port, 1000, power_w)
+    value = int(max(0, power_w))
+    return _modbus_write_confirmed(
+        ip,
+        port,
+        1000,
+        value,
+        driver_key=f"transport:modbus-tcp:{ip}:{port}",
+        safety_gate=safety_gate,
+        safe_release=value == 0,
+    )
 
 
 # --- myPV AC ELWA-E ---
@@ -355,14 +446,22 @@ def heizstab_set_power(ip, port, power_w):
 _elwa_timeout_set = {}  # {ip: True} - Timeout einmalig gesetzt
 
 
-def elwa_ensure_timeout(ip, port, timeout_s=60):
+def elwa_ensure_timeout(ip, port, timeout_s=60, safety_gate=None):
     """
     Setzt Modbus-Timeout einmalig auf 60s (Register 1004).
     Schreibt selten um EEPROM-Verschleiss zu vermeiden (nur beim ersten Zyklus).
     """
     if _elwa_timeout_set.get(ip):
         return
-    ok = _modbus_write_reg(ip, port, 1004, timeout_s)
+    ok = _modbus_write_confirmed(
+        ip,
+        port,
+        1004,
+        timeout_s,
+        driver_key=f"transport:modbus-tcp:{ip}:{port}",
+        safety_gate=safety_gate,
+        safe_release=False,
+    )
     if ok:
         print(f"  [ELWA] Modbus Timeout auf {timeout_s}s gesetzt (Register 1004)")
         _elwa_timeout_set[ip] = True
@@ -400,9 +499,18 @@ def elwa_read_status(ip, port):
     }
 
 
-def elwa_set_power(ip, port, power_w):
+def elwa_set_power(ip, port, power_w, safety_gate=None):
     """Setzt Sollleistung am AC ELWA-E (Register 1000, 0-3000W)."""
-    return _modbus_write_reg(ip, port, 1000, power_w)
+    value = int(max(0, power_w))
+    return _modbus_write_confirmed(
+        ip,
+        port,
+        1000,
+        value,
+        driver_key=f"transport:modbus-tcp:{ip}:{port}",
+        safety_gate=safety_gate,
+        safe_release=value == 0,
+    )
 
 
 def elwa_can_accept_power(status_code):
@@ -460,12 +568,34 @@ def shelly_3em_read(ip):
         return None
 
 
-def shelly_3em_set_relay(ip, relay_id, on: bool):
+def shelly_3em_get_relay(ip, relay_id):
+    """Liest den exakten Gen2-Relaiskanal und liefert bool oder None."""
+    try:
+        url = f"http://{ip}/rpc/Switch.GetStatus?id={int(relay_id)}"
+        with urllib.request.urlopen(url, timeout=SHELLY_TIMEOUT) as response:
+            data = json.loads(response.read().decode())
+        if not isinstance(data, dict) or "output" not in data:
+            return None
+        return bool(data.get("output"))
+    except Exception:
+        return None
+
+
+def shelly_3em_set_relay(ip, relay_id, on: bool, safety_gate=None):
     """
     Schaltet ein Relais des Shelly Pro3EM (Gen2 RPC Switch.Set).
     relay_id: 0, 1 oder 2 (je nach Shelly-Modell und Verdrahtung).
     Gibt True bei Erfolg, False bei Fehler.
     """
+    driver_key = f"transport:http-shelly:{ip}:switch:{int(relay_id)}"
+    if not _authorize_heater_output(
+        driver_key,
+        f"shelly-3em:{'on' if on else 'off'}",
+        safety_gate=safety_gate,
+        safe_release=False,
+        preserve_existing=True,
+    ):
+        return False
     try:
         body = json.dumps({"id": int(relay_id), "on": bool(on)}).encode()
         req = urllib.request.Request(
@@ -479,6 +609,13 @@ def shelly_3em_set_relay(ip, relay_id, on: bool):
         # Gen2 antwortet mit {"was_on": bool} oder {"error": ...}
         if "error" in resp:
             print(f"  [!] Shelly 3EM Relay {relay_id}: {resp['error']}")
+            return False
+        confirmed = shelly_3em_get_relay(ip, relay_id)
+        if confirmed != bool(on):
+            print(
+                f"  [!] Shelly 3EM Relay {relay_id}: Readback unbestätigt "
+                f"(Soll={bool(on)} Ist={confirmed})"
+            )
             return False
         return True
     except Exception as e:
@@ -519,7 +656,9 @@ def shelly_get_state(ip):
         url = f"http://{ip}/relay/0"
         with urllib.request.urlopen(url, timeout=SHELLY_TIMEOUT) as r:
             relay = json.loads(r.read().decode())
-        is_on = bool(relay.get("ison", False))
+        if not isinstance(relay, dict) or "ison" not in relay:
+            raise ValueError("Gen1 relay response has no ison field")
+        is_on = bool(relay["ison"])
 
         # Leistung (meter)
         power = 0.0
@@ -539,8 +678,10 @@ def shelly_get_state(ip):
         url = f"http://{ip}/rpc/Switch.GetStatus?id=0"
         with urllib.request.urlopen(url, timeout=SHELLY_TIMEOUT) as r:
             data = json.loads(r.read().decode())
+        if not isinstance(data, dict) or "output" not in data:
+            return None
         return {
-            "on":      bool(data.get("output", False)),
+            "on":      bool(data["output"]),
             "power_w": float(data.get("apower", 0)),
             "gen":     2,
         }
@@ -549,20 +690,36 @@ def shelly_get_state(ip):
         return None
 
 
-def shelly_set_state(ip, on: bool):
+def shelly_set_state(ip, on: bool, safety_gate=None):
     """Schaltet Shelly Plug ein oder aus (Gen1 und Gen2)."""
     turn = "on" if on else "off"
+    driver_key = f"transport:http-shelly:{ip}:switch:0"
 
     # Gen1
-    try:
-        url = f"http://{ip}/relay/0?turn={turn}"
-        with urllib.request.urlopen(url, timeout=SHELLY_TIMEOUT):
+    if _authorize_heater_output(
+        driver_key,
+        f"shelly-gen1:{turn}",
+        safety_gate=safety_gate,
+        safe_release=not on,
+    ):
+        try:
+            url = f"http://{ip}/relay/0?turn={turn}"
+            with urllib.request.urlopen(url, timeout=SHELLY_TIMEOUT):
+                pass
+            confirmed = shelly_get_state(ip)
+            if confirmed is not None and confirmed.get("on") == bool(on):
+                return True
+        except Exception:
             pass
-        return True
-    except Exception:
-        pass
 
     # Gen2
+    if not _authorize_heater_output(
+        driver_key,
+        f"shelly-gen2:{turn}",
+        safety_gate=safety_gate,
+        safe_release=not on,
+    ):
+        return False
     try:
         body = json.dumps({"id": 0, "on": on}).encode()
         req = urllib.request.Request(
@@ -573,6 +730,13 @@ def shelly_set_state(ip, on: bool):
         )
         with urllib.request.urlopen(req, timeout=SHELLY_TIMEOUT):
             pass
+        confirmed = shelly_get_state(ip)
+        if confirmed is None or confirmed.get("on") != bool(on):
+            print(
+                f"  [!] Shelly {ip}: Readback unbestätigt "
+                f"(Soll={bool(on)} Ist={None if confirmed is None else confirmed.get('on')})"
+            )
+            return False
         return True
     except Exception as e:
         print(f"  [!] Shelly {ip} Schalten fehlgeschlagen: {e}")
@@ -630,6 +794,53 @@ def calc_surplus(live, current_hs_power_w=0, cfg=None):
         pass
 
     return grid_surplus_w
+
+
+def wallbox_phase_transition_active(now_ts=None, max_age_s=30.0):
+    """Liefert nur bei einer frischen, explizit aktiven Wallboxtransition True."""
+    now_value = time.time() if now_ts is None else float(now_ts)
+    try:
+        if not os.path.exists(WB_BUDGET_FILE):
+            return False
+        if now_value - os.path.getmtime(WB_BUDGET_FILE) > max(1.0, float(max_age_s)):
+            return False
+        with open(WB_BUDGET_FILE, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        if not isinstance(data, dict):
+            return False
+        nested = data.get("wallbox_phase_transition")
+        nested = nested if isinstance(nested, dict) else {}
+        active = bool(data.get("wallbox_phase_transition_active") or nested.get("active"))
+        expires_ts = float(
+            data.get(
+                "wallbox_phase_transition_until_ts",
+                nested.get("expires_ts", 0),
+            )
+            or 0
+        )
+        return bool(active and (expires_ts <= 0 or now_value <= expires_ts))
+    except Exception:
+        return False
+
+
+def shelly_wp_relay_should_run(
+    *,
+    wp_is_on,
+    soc_ok,
+    surplus_w,
+    threshold_on_w,
+    threshold_off_w,
+    wp_min_w,
+    wallbox_transition,
+):
+    """Preserve a running WP through wallbox transitions; block new starts."""
+    if wp_is_on:
+        return bool(soc_ok and (wallbox_transition or surplus_w >= threshold_off_w))
+    return bool(
+        not wallbox_transition
+        and soc_ok
+        and surplus_w >= max(wp_min_w, threshold_on_w)
+    )
 
 
 def read_predump_heater_budget(cfg):
@@ -838,7 +1049,7 @@ def read_manual_override():
         return None
 
 
-def control_cycle(cfg, live, hs_state):
+def control_cycle(cfg, live, hs_state, safety_gate=None):
     """
     Haupt-Regelzyklus: entscheidet ob und mit wieviel Leistung aktiviert wird.
     Unterstuetzt heizstab_type = generic (Standard) und mypv_elwa (myPV AC ELWA-E).
@@ -943,7 +1154,7 @@ def control_cycle(cfg, live, hs_state):
     if has_hs and MODBUS_OK and elwa_modbus_available:
         if is_elwa:
             # myPV AC ELWA-E: Timeout einmalig setzen + Status-Block lesen
-            elwa_ensure_timeout(hs_ip, hs_port)
+            _invoke_actuator(elwa_ensure_timeout, hs_ip, hs_port, safety_gate=safety_gate)
             elwa_data = elwa_read_status(hs_ip, hs_port)
             if elwa_data:
                 hs_state["elwa_fail_count"] = 0
@@ -1000,7 +1211,7 @@ def control_cycle(cfg, live, hs_state):
     if is_elwa and has_hs and not elwa_modbus_available and not has_sh:
         # ELWA ist das einzige Verbraucher-Modul und Modbus ist gerade offline.
         # Keine weiteren 0W-/Sollwert-Schreibversuche bis zum Backoff-Ende.
-        return status
+        return _with_actuator_safety_status(status, safety_gate)
 
     heater_price_block_limit_ct = cfg_float(cfg, "heat_price_block_limit_ct", 35.0)
     heater_empty_soc = cfg_float(cfg, "heat_price_block_empty_soc", 10.0)
@@ -1080,7 +1291,7 @@ def control_cycle(cfg, live, hs_state):
             status["hs_reason"] = f"Manuell Vollgas: {target_w:.0f}W angefordert"
             if has_hs and MODBUS_OK and elwa_modbus_available:
                 if is_elwa:
-                    ok = elwa_set_power(hs_ip, hs_port, target_w)
+                    ok = _invoke_actuator(elwa_set_power, hs_ip, hs_port, target_w, safety_gate=safety_gate)
                     if ok:
                         status["hs_requested_w"] = target_w
                         status["hs_target_w"] = target_w
@@ -1096,8 +1307,11 @@ def control_cycle(cfg, live, hs_state):
                             status["hs_active"] = False
                             hs_state["is_on"] = False
                             hs_state["current_w"] = 0
+                    else:
+                        status["success"] = False
+                        status["hs_reason"] = "ELWA Sollwert-Write/Readback nicht bestätigt"
                 else:
-                    ok = heizstab_set_power(hs_ip, hs_port, target_w)
+                    ok = _invoke_actuator(heizstab_set_power, hs_ip, hs_port, target_w, safety_gate=safety_gate)
                     if ok:
                         status["Heizstab_Power"] = target_w
                         status["hs_actual_w"] = target_w
@@ -1106,67 +1320,118 @@ def control_cycle(cfg, live, hs_state):
                         status["hs_active"] = target_w > 0
                         hs_state["is_on"] = True
                         hs_state["current_w"] = target_w
+                    else:
+                        status["success"] = False
+                        status["hs_reason"] = "Heizstab Sollwert-Write/Readback nicht bestätigt"
             if has_sh:
-                shelly_set_state(sh_ip, True)
-                status["shelly_heiz_on"] = True
-                status["hs_active"] = True
-                status["Heizstab_Power"] = max(float(status.get("Heizstab_Power", 0) or 0), sh_nominal_w)
-                status["hs_actual_w"] = max(float(status.get("hs_actual_w", 0) or 0), sh_nominal_w)
-                hs_state["is_on"] = True
-                hs_state["current_w"] = max(float(hs_state.get("current_w", 0) or 0), sh_nominal_w)
-            return status
+                shelly_ok = _invoke_actuator(shelly_set_state, sh_ip, True, safety_gate=safety_gate)
+                if shelly_ok:
+                    status["shelly_heiz_on"] = True
+                    status["hs_active"] = True
+                    status["Heizstab_Power"] = max(float(status.get("Heizstab_Power", 0) or 0), sh_nominal_w)
+                    status["hs_actual_w"] = max(float(status.get("hs_actual_w", 0) or 0), sh_nominal_w)
+                    hs_state["is_on"] = True
+                    hs_state["current_w"] = max(float(hs_state.get("current_w", 0) or 0), sh_nominal_w)
+                else:
+                    status["success"] = False
+                    status["hs_reason"] = "Shelly EIN nicht bestätigt"
+            return _with_actuator_safety_status(status, safety_gate)
 
         if manual_mode == "off":
             status["hs_mode"] = "manual_off"
             status["hs_reason"] = "Manuell AUS: Heizstab gestoppt"
+            release_ok = True
             if has_hs and MODBUS_OK and elwa_modbus_available:
                 if is_elwa:
-                    elwa_set_power(hs_ip, hs_port, 0)
+                    release_ok = _invoke_actuator(
+                        elwa_set_power,
+                        hs_ip,
+                        hs_port,
+                        0,
+                        safety_gate=safety_gate,
+                    ) and release_ok
                 else:
-                    heizstab_set_power(hs_ip, hs_port, 0)
+                    release_ok = _invoke_actuator(
+                        heizstab_set_power,
+                        hs_ip,
+                        hs_port,
+                        0,
+                        safety_gate=safety_gate,
+                    ) and release_ok
             if has_sh and status.get("shelly_heiz_on"):
-                shelly_set_state(sh_ip, False)
-                status["shelly_heiz_on"] = False
+                shelly_off_ok = _invoke_actuator(shelly_set_state, sh_ip, False, safety_gate=safety_gate)
+                release_ok = shelly_off_ok and release_ok
+                if shelly_off_ok:
+                    status["shelly_heiz_on"] = False
             if has_s3em and s3_enable and s3_relay >= 0:
-                shelly_3em_set_relay(s3_ip, s3_relay, False)
-                hs_state["s3em_on"] = False
-                status["wp_relay_on"] = False
-            status["Heizstab_Power"] = 0
-            status["hs_actual_w"] = 0
-            status["hs_target_w"] = 0
-            status["hs_requested_w"] = 0
-            status["hs_active"] = False
-            hs_state["is_on"] = False
-            hs_state["current_w"] = 0
-            return status
+                # Ein Kontextverlust darf eine bereits laufende Wärmepumpe nie stoppen.
+                s3_off_ok = _invoke_actuator(
+                    shelly_3em_set_relay,
+                    s3_ip,
+                    s3_relay,
+                    False,
+                    safety_gate=safety_gate,
+                )
+                release_ok = s3_off_ok and release_ok
+                if s3_off_ok:
+                    hs_state["s3em_on"] = False
+                    status["wp_relay_on"] = False
+            if release_ok:
+                status["Heizstab_Power"] = 0
+                status["hs_actual_w"] = 0
+                status["hs_target_w"] = 0
+                status["hs_requested_w"] = 0
+                status["hs_active"] = False
+                hs_state["is_on"] = False
+                hs_state["current_w"] = 0
+            else:
+                status["success"] = False
+                status["hs_reason"] = "Manuell AUS fehlgeschlagen: Safe-Readback nicht bestätigt"
+            return _with_actuator_safety_status(status, safety_gate)
 
     if not auto_mode:
         # Explizit stoppen - nicht im alten Zustand belassen!
         status["hs_reason"] = "Globale Automatik deaktiviert - Geraete auf Idle" if not global_auto else "Auto-Modus deaktiviert - Heizstab gestoppt"
+        release_ok = True
         if has_hs and MODBUS_OK and elwa_modbus_available:
             if is_elwa:
-                elwa_set_power(hs_ip, hs_port, 0)
+                heater_off_ok = _invoke_actuator(elwa_set_power, hs_ip, hs_port, 0, safety_gate=safety_gate)
             else:
-                heizstab_set_power(hs_ip, hs_port, 0)
-            status["Heizstab_Power"] = 0
-            status["hs_actual_w"] = 0
-            status["hs_target_w"] = 0
-            status["hs_active"] = False
-            hs_state['is_on'] = False
-            hs_state['current_w'] = 0
-            print(f"  -> Heizstab 0W gesetzt (Auto-Modus AUS)")
+                heater_off_ok = _invoke_actuator(heizstab_set_power, hs_ip, hs_port, 0, safety_gate=safety_gate)
+            release_ok = heater_off_ok and release_ok
+            if heater_off_ok:
+                status["Heizstab_Power"] = 0
+                status["hs_actual_w"] = 0
+                status["hs_target_w"] = 0
+                status["hs_active"] = False
+                hs_state['is_on'] = False
+                hs_state['current_w'] = 0
+                print(f"  -> Heizstab 0W gesetzt (Auto-Modus AUS)")
         if has_sh and status.get("shelly_heiz_on"):
-            shelly_set_state(sh_ip, False)
-            status["shelly_heiz_on"] = False
-            print(f"  -> Shelly AUS gesetzt (Auto-Modus AUS)")
+            shelly_off_ok = _invoke_actuator(shelly_set_state, sh_ip, False, safety_gate=safety_gate)
+            release_ok = shelly_off_ok and release_ok
+            if shelly_off_ok:
+                status["shelly_heiz_on"] = False
+                print(f"  -> Shelly AUS gesetzt (Auto-Modus AUS)")
         if has_s3em and s3_enable and s3_relay >= 0:
-            shelly_3em_set_relay(s3_ip, s3_relay, False)
-            hs_state["s3em_on"] = False
-            status["wp_relay_on"] = False
-            print(f"  -> Shelly Pro3EM Relais {s3_relay} AUS gesetzt (Auto-Modus AUS)")
+            s3_off_ok = _invoke_actuator(
+                shelly_3em_set_relay,
+                s3_ip,
+                s3_relay,
+                False,
+                safety_gate=safety_gate,
+            )
+            release_ok = s3_off_ok and release_ok
+            if s3_off_ok:
+                hs_state["s3em_on"] = False
+                status["wp_relay_on"] = False
+                print(f"  -> Shelly Pro3EM Relais {s3_relay} AUS gesetzt (Auto-Modus AUS)")
         elif has_s3em and not (has_hs or has_sh):
             status["hs_reason"] = "WP nur Messung - keine Relaissteuerung"
-        return status
+        if not release_ok:
+            status["success"] = False
+            status["hs_reason"] = "Auto AUS fehlgeschlagen: Safe-Readback nicht bestätigt"
+            return _with_actuator_safety_status(status, safety_gate)
 
     # --- PV-Ueberschuss-Regelung mit Hysterese ---
     # Einschalten: Ueberschuss muss >= threshold_on_w sein.
@@ -1214,7 +1479,7 @@ def control_cycle(cfg, live, hs_state):
 
         if has_hs and MODBUS_OK and elwa_modbus_available:
             if is_elwa:
-                ok = elwa_set_power(hs_ip, hs_port, target_w)
+                ok = _invoke_actuator(elwa_set_power, hs_ip, hs_port, target_w, safety_gate=safety_gate)
                 if ok:
                     status["hs_requested_w"]   = target_w
                     status["hs_target_w"]     = target_w
@@ -1236,8 +1501,11 @@ def control_cycle(cfg, live, hs_state):
                         hs_state['is_on'] = False
                         hs_state['current_w'] = 0
                     print(f"  [ELWA] -> Sollleistung {target_w:.0f}W gesetzt")
+                else:
+                    status["success"] = False
+                    status["hs_reason"] = "ELWA Sollwert-Write/Readback nicht bestätigt"
             else:
-                ok = heizstab_set_power(hs_ip, hs_port, target_w)
+                ok = _invoke_actuator(heizstab_set_power, hs_ip, hs_port, target_w, safety_gate=safety_gate)
                 if ok:
                     status["Heizstab_Power"] = target_w
                     status["hs_actual_w"] = target_w
@@ -1246,17 +1514,24 @@ def control_cycle(cfg, live, hs_state):
                     hs_state['is_on']    = True
                     hs_state['current_w'] = target_w
                     print(f"  -> Heizstab auf {target_w:.0f}W gesetzt")
+                else:
+                    status["success"] = False
+                    status["hs_reason"] = "Heizstab Sollwert-Write/Readback nicht bestätigt"
 
         if has_sh and surplus_w >= sh_nominal_w:
-            shelly_set_state(sh_ip, True)
-            status["shelly_heiz_on"] = True
-            status["Heizstab_Power"] = max(float(status.get("Heizstab_Power", 0) or 0), sh_nominal_w)
-            status["hs_actual_w"] = max(float(status.get("hs_actual_w", 0) or 0), sh_nominal_w)
-            status["hs_target_w"] = max(float(status.get("hs_target_w", 0) or 0), sh_nominal_w)
-            status["hs_active"] = True
-            hs_state['is_on'] = True
-            hs_state['current_w'] = max(target_w, sh_nominal_w)
-            print(f"  -> Shelly EINgeschaltet")
+            shelly_on_ok = _invoke_actuator(shelly_set_state, sh_ip, True, safety_gate=safety_gate)
+            if shelly_on_ok:
+                status["shelly_heiz_on"] = True
+                status["Heizstab_Power"] = max(float(status.get("Heizstab_Power", 0) or 0), sh_nominal_w)
+                status["hs_actual_w"] = max(float(status.get("hs_actual_w", 0) or 0), sh_nominal_w)
+                status["hs_target_w"] = max(float(status.get("hs_target_w", 0) or 0), sh_nominal_w)
+                status["hs_active"] = True
+                hs_state['is_on'] = True
+                hs_state['current_w'] = max(target_w, sh_nominal_w)
+                print(f"  -> Shelly EINgeschaltet")
+            else:
+                status["success"] = False
+                status["hs_reason"] = "Shelly EIN nicht bestätigt"
 
     else:
         if heat_policy_runtime_enabled and heat_policy_decision.target_state == heat_policy.TARGET_BLOCKED:
@@ -1270,40 +1545,65 @@ def control_cycle(cfg, live, hs_state):
         else:
             status["hs_reason"] = f"PV-Ueberschuss zu gering ({surplus_w:.0f}W < {threshold_off_w:.0f}W Ausschalt-Schwelle)"
 
+        aux_release_ok = True
         if has_hs and MODBUS_OK and elwa_modbus_available:
+            heater_off_ok = True
             if is_elwa:
                 if is_currently_on or float(hs_state.get('current_w', 0) or 0) > 0:
-                    elwa_set_power(hs_ip, hs_port, 0)
-                    print(f"  [ELWA] -> Sollleistung 0W (deaktiviert)")
-                status["elwa_setpoint_w"] = 0
-                hs_state['is_on']    = False
-                hs_state['current_w'] = 0
+                    heater_off_ok = _invoke_actuator(elwa_set_power, hs_ip, hs_port, 0, safety_gate=safety_gate)
+                    if heater_off_ok:
+                        print(f"  [ELWA] -> Sollleistung 0W (deaktiviert)")
+                if heater_off_ok:
+                    status["elwa_setpoint_w"] = 0
+                    hs_state['is_on']    = False
+                    hs_state['current_w'] = 0
             else:
-                heizstab_set_power(hs_ip, hs_port, 0)
-                hs_state['is_on']    = False
-                hs_state['current_w'] = 0
-            status["Heizstab_Power"] = 0
-            status["hs_actual_w"] = 0
-            status["hs_target_w"] = 0
-            status["hs_active"] = False
+                heater_off_ok = _invoke_actuator(heizstab_set_power, hs_ip, hs_port, 0, safety_gate=safety_gate)
+                if heater_off_ok:
+                    hs_state['is_on']    = False
+                    hs_state['current_w'] = 0
+            if heater_off_ok:
+                status["Heizstab_Power"] = 0
+                status["hs_actual_w"] = 0
+                status["hs_target_w"] = 0
+                status["hs_active"] = False
+            else:
+                status["success"] = False
+                status["hs_reason"] = "Heizstab AUS fehlgeschlagen: Register-Readback nicht bestätigt"
+                aux_release_ok = False
 
         if has_sh and status.get("shelly_heiz_on"):
-            shelly_set_state(sh_ip, False)
-            status["shelly_heiz_on"] = False
-            print(f"  -> Shelly AUSgeschaltet")
-        hs_state['is_on'] = False
-        hs_state['current_w'] = 0
+            shelly_off_ok = _invoke_actuator(shelly_set_state, sh_ip, False, safety_gate=safety_gate)
+            if shelly_off_ok:
+                status["shelly_heiz_on"] = False
+                print(f"  -> Shelly AUSgeschaltet")
+            else:
+                status["success"] = False
+                status["hs_reason"] = "Shelly AUS fehlgeschlagen: Relais-Readback nicht bestätigt"
+                aux_release_ok = False
+        if aux_release_ok and not status.get("hs_active") and not status.get("shelly_heiz_on"):
+            hs_state['is_on'] = False
+            hs_state['current_w'] = 0
 
-    # ══ SHELLY PRO3EM WAERMEPUMPE (wp_type=3) ══
+    # ══ SHELLY PRO3EM WÄRMEPUMPE (wp_type=3) ══
     if has_s3em:
         # Relais-Steuerung (nur wenn s3_enable=1 und relay_id >= 0)
         if s3_enable and auto_mode and s3_relay >= 0:
-            # WP hat Mindestleistung: Einschalten nur wenn genuegend Ueberschuss
+            # WP hat Mindestleistung: Einschalten nur bei genügend Überschuss
             wp_is_on = status.get("wp_is_running", False) or hs_state.get("s3em_on", False)
-            if wp_is_on:
-                should_wp = soc_ok and (surplus_w >= threshold_off_w)
-            else:
-                should_wp = soc_ok and (surplus_w >= max(s3_min_w, threshold_on_w))
+            wallbox_transition = wallbox_phase_transition_active()
+            # Ein Wallbox-Phasen-/Stromübergang darf das gemeinsame Budget reservieren,
+            # aber einen bereits laufenden Verdichter nie stoppen. Der unabhängige
+            # SoC-Schutz bleibt unverändert.
+            should_wp = shelly_wp_relay_should_run(
+                wp_is_on=wp_is_on,
+                soc_ok=soc_ok,
+                surplus_w=surplus_w,
+                threshold_on_w=threshold_on_w,
+                threshold_off_w=threshold_off_w,
+                wp_min_w=s3_min_w,
+                wallbox_transition=wallbox_transition,
+            )
 
             now_ts = time.time()
             last_on_ts = float(hs_state.get("s3em_last_on_ts", 0) or 0)
@@ -1313,6 +1613,12 @@ def control_cycle(cfg, live, hs_state):
             # SoC-Schutz und manuelles/Auto-Aus bleiben harte Stops. Reine Wolkenkanten
             # halten wir bis zur Mindestlaufzeit, damit das WP-Relais nicht taktet.
             relay_emergency_stop = not soc_ok
+
+            if wallbox_transition and wp_is_on and not relay_emergency_stop:
+                status["wp_relay_on"] = True
+                status["wp_takt_protect_active"] = True
+                status["hs_reason"] = "WP läuft weiter: Wallbox-Übergang darf sie nicht stoppen"
+                return _with_actuator_safety_status(status, safety_gate)
 
             if should_wp and not hs_state.get("s3em_on", False):
                 if restart_left_s > 0:
@@ -1324,8 +1630,8 @@ def control_cycle(cfg, live, hs_state):
                         f"(Überschuss {surplus_w:.0f}W)"
                     )
                     print(f"  [3EM] WP Relais bleibt AUS (Wiedereinschaltsperre {restart_left_s/60:.1f} Min)")
-                    return status
-                ok = shelly_3em_set_relay(s3_ip, s3_relay, True)
+                    return _with_actuator_safety_status(status, safety_gate)
+                ok = _invoke_actuator(shelly_3em_set_relay, s3_ip, s3_relay, True, safety_gate=safety_gate)
                 if ok:
                     hs_state["s3em_on"] = True
                     hs_state["s3em_last_on_ts"] = now_ts
@@ -1335,6 +1641,10 @@ def control_cycle(cfg, live, hs_state):
                     status["hs_reason"] = (f"WP EIN: Ueberschuss {surplus_w:.0f}W >= "
                                            f"{s3_min_w:.0f}W Min-WP (SOC {soc:.0f}%)")
                     print(f"  [3EM] -> WP Relais {s3_relay} EINgeschaltet")
+                else:
+                    status["success"] = False
+                    status["wp_relay_on"] = bool(hs_state.get("s3em_on", False))
+                    status["hs_reason"] = "WP EIN blockiert oder Readback nicht bestätigt"
             elif not should_wp and hs_state.get("s3em_on", False):
                 if runtime_left_s > 0 and not relay_emergency_stop:
                     hs_state["s3em_on"] = True
@@ -1346,8 +1656,8 @@ def control_cycle(cfg, live, hs_state):
                         f"(Überschuss {surplus_w:.0f}W < {threshold_off_w:.0f}W)"
                     )
                     print(f"  [3EM] WP Relais bleibt EIN (Mindestlaufzeit {runtime_left_s/60:.1f} Min)")
-                    return status
-                ok = shelly_3em_set_relay(s3_ip, s3_relay, False)
+                    return _with_actuator_safety_status(status, safety_gate)
+                ok = _invoke_actuator(shelly_3em_set_relay, s3_ip, s3_relay, False, safety_gate=safety_gate)
                 if ok:
                     hs_state["s3em_on"] = False
                     hs_state["s3em_last_off_ts"] = now_ts
@@ -1358,20 +1668,29 @@ def control_cycle(cfg, live, hs_state):
                                   else f"Ueberschuss zu gering ({surplus_w:.0f}W < {threshold_off_w:.0f}W)")
                     status["hs_reason"] = f"WP AUS: {reason_off}"
                     print(f"  [3EM] -> WP Relais {s3_relay} AUSgeschaltet ({reason_off})")
+                else:
+                    status["success"] = False
+                    status["wp_relay_on"] = True
+                    status["hs_reason"] = (
+                        "WP AUS blockiert oder Readback nicht bestätigt; "
+                        "laufender Zustand wird nicht verändert"
+                    )
             else:
                 status["wp_relay_on"] = hs_state.get("s3em_on", False)
                 status["wp_takt_protect_active"] = False
+                if status["wp_relay_on"] and wallbox_transition:
+                    status["hs_reason"] = "WP läuft weiter: Wallbox-Übergang darf sie nicht stoppen"
                 if status["wp_relay_on"] and runtime_left_s > 0:
                     status["wp_min_runtime_remaining_s"] = round(runtime_left_s)
                 elif (not status["wp_relay_on"]) and restart_left_s > 0:
                     status["wp_restart_block_remaining_s"] = round(restart_left_s)
         else:
-            status["wp_relay_on"] = False
+            status["wp_relay_on"] = bool(hs_state.get("s3em_on", False))
             status["wp_takt_protect_active"] = False
             if (not s3_enable or s3_relay < 0) and not (has_hs or has_sh):
                 status["hs_reason"] = "WP nur Messung - keine Relaissteuerung"
 
-    return status
+    return _with_actuator_safety_status(status, safety_gate)
 
 
 # ---------------------------------------------------------------------------
@@ -1424,9 +1743,10 @@ def main():
         save_to_ramdisk({"success": False, "error": "wp_type=3: shelly_3em_ip fehlt", "Heizstab_Power": 0})
         return
 
-    # Warnung: Luxtronik-IP (192.168.77.x) als heizstab_ip ist ein haeufiger Fehler!
-    if hs_ip not in ("", "0.0.0.0") and hs_ip.startswith("192.168.77."):
-        print(f"[!] WARNUNG: heizstab_ip={hs_ip} sieht nach einer Luxtronik-IP aus!")
+    # Derselbe Endpunkt darf nicht gleichzeitig Luxtronik und Heizstab sein.
+    luxtronik_ip = str(cfg.get("luxtronik_ip", "")).strip()
+    if hs_ip not in ("", "0.0.0.0") and luxtronik_ip and hs_ip == luxtronik_ip:
+        print("[!] WARNUNG: heizstab_ip entspricht dem konfigurierten Luxtronik-Endpunkt!")
         print("    Heizstab Modbus wird auf dieser IP NICHT funktionieren.")
         print("    Setze heizstab_ip = 0.0.0.0 wenn kein Modbus-Heizstab vorhanden ist.")
 
@@ -1444,25 +1764,41 @@ def main():
         nonlocal _hs_stop
         _hs_stop = True
         print(f"[{time.strftime('%H:%M:%S')}] SIGTERM: Heizstab und Shelly werden abgeschaltet...")
+        release_ok = True
         _hs = cfg.get("heizstab_ip", "0.0.0.0").strip()
         _sh = cfg.get("shelly_heiz_ip", "0.0.0.0").strip()
         _ht = str(cfg.get("heizstab_type", "generic")).strip().lower()
         if _hs not in ("", "0.0.0.0") and MODBUS_OK:
             try:
                 if _ht == "mypv_elwa":
-                    elwa_set_power(_hs, cfg.get("heizstab_port", "502"), 0)
+                    heater_off_ok = elwa_set_power(_hs, cfg.get("heizstab_port", "502"), 0)
                 else:
-                    heizstab_set_power(_hs, cfg.get("heizstab_port", "502"), 0)
-                print(f"  Heizstab {_hs} -> 0W gesetzt")
+                    heater_off_ok = heizstab_set_power(_hs, cfg.get("heizstab_port", "502"), 0)
+                release_ok = heater_off_ok and release_ok
+                if heater_off_ok:
+                    print(f"  Heizstab {_hs} -> 0W gesetzt und bestätigt")
+                else:
+                    print(f"  [!] Heizstab {_hs}: 0W-Readback nicht bestätigt")
             except Exception as e:
+                release_ok = False
                 print(f"  [!] Heizstab Stop-Fehler: {e}")
         if _sh not in ("", "0.0.0.0"):
             try:
-                shelly_set_state(_sh, False)
-                print(f"  Shelly {_sh} -> AUS gesetzt")
+                shelly_off_ok = shelly_set_state(_sh, False)
+                release_ok = shelly_off_ok and release_ok
+                if shelly_off_ok:
+                    print(f"  Shelly {_sh} -> AUS gesetzt und bestätigt")
+                else:
+                    print(f"  [!] Shelly {_sh}: AUS-Readback nicht bestätigt")
             except Exception as e:
+                release_ok = False
                 print(f"  [!] Shelly Stop-Fehler: {e}")
-        save_to_ramdisk({"success": False, "error": "Dienst beendet", "Heizstab_Power": 0})
+        save_to_ramdisk({
+            "success": False,
+            "error": "Dienst beendet" if release_ok else "Dienst beendet; Safe-Release unvollständig",
+            "Heizstab_Power": 0 if release_ok else None,
+            "safe_release_confirmed": bool(release_ok),
+        })
     _signal.signal(_signal.SIGTERM, _handle_stop)
     _signal.signal(_signal.SIGINT,  _handle_stop)
 

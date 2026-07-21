@@ -46,7 +46,7 @@ Wichtige Felder:
 ```ini
 wb_native_enable = 1
 wb_native_type = e3dc|openwb|openwb_pro|goe|none
-wb_native_ip = 192.168.178.x
+wb_native_ip = 192.0.2.50
 wb_native_mode = 0|1|2   # Dual-Wallbox-Priorität: 0=beide, 1=WB1, 2=WB2
 wb1_mode = 0|2|3|4|5
 wb2_mode = 0|2|3|4|5
@@ -134,6 +134,11 @@ Messwert-Rückmeldung und nicht als absoluter Start-/Stop-Schalter:
   Ladung niemals wieder starten.
 * `force_state=2` ist der explizite Startimpuls. Er darf erst gesendet werden,
   wenn das physische Budget für die Mindestleistung plausibel da ist.
+  Bei einer Easy Connect sind je frisch bestätigter Stop-Episode höchstens drei
+  solche Impulse mit mindestens 60 Sekunden Abstand zulässig. Jeder Impuls
+  benötigt erneut einen frischen Stop-Readback; Laden, Abstecken oder ein neuer
+  Stopzustand beendet beziehungsweise erneuert die Episode. Andere native
+  E3/DC-Familien bleiben bei genau einem Startimpuls je Stop-Episode.
 * `force_state=1` ist der harte Stopimpuls. Er darf nur für echte harte
   Stopgründe und bei verifizierter aktiver Ladung verwendet werden.
 

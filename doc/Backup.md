@@ -4,7 +4,7 @@ Der Installer legt vor jedem Update und Rollback einen verifizierten
 Sicherungspunkt an. Ein fehlendes, leeres, unvollstaendiges oder nicht lesbares
 Backup bricht den Vorgang ab. Diese Sperre kann nicht umgangen werden.
 
-Die Konsolenbeispiele verwenden den zuvor geprueften absoluten Produktpfad:
+Die Konsolenbeispiele verwenden den zuvor geprüften absoluten Produktpfad:
 
 ```bash
 export E3DC_INSTALL_PATH="/absoluter/pfad/zur/installation"
@@ -66,4 +66,3 @@ bash "$E3DC_INSTALL_PATH/e3dc-setup"
 ```
 
 Waehle **`13) System-Backup erstellen / verwalten`**.
-

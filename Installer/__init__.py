@@ -4,7 +4,7 @@ E3DC-Control Installer Package
 Ein modulares Installer-System für E3DC-Control mit dynamischer Menüregistrierung.
 """
 
-__version__ = "5.3.2b"
+__version__ = "5.4.0"
 
 
 
@@ -20,6 +20,7 @@ __all__ = [
     "backup",
     "update",
     "rollback",
+    "diagrammphp",
     "config_wizard",
     "create_config",
     "strompreis_wizard",
@@ -40,6 +41,7 @@ __all__ = [
     "venv_tools",
     "change_venv",
     "data_models",
+    "service_setup",
     "service_catalog",
     "service_load_snapshot",
     "web_installer",

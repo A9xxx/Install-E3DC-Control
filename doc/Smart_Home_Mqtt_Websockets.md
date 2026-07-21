@@ -1,9 +1,9 @@
 # E3DC-Control: Smart Home MQTT & WebSocket Architektur
 
-E3DC-Control nutzt fuer Web, MQTT und externe Automationen eine entkoppelte RAM-Disk-Schnittstelle. Die nativen Python-Dienste halten RSCP, Web, MQTT und Regelung getrennt, damit Netzwerkprobleme nicht direkt die Speicher- oder Wallboxregelung blockieren.
+E3DC-Control nutzt für Web, MQTT und externe Automationen eine entkoppelte RAM-Disk-Schnittstelle. Die nativen Python-Dienste halten RSCP, Web, MQTT und Regelung getrennt, damit Netzwerkprobleme nicht direkt die Speicher- oder Wallboxregelung blockieren.
 
 ## 1. Die Kern-Architektur (Atomares JSON)
-Der Dienst `e3dc-live` liest ueber RSCP die Live-Daten aus dem E3DC-Speicher und erzeugt jede Sekunde ein JSON-Dokument in der RAM-Disk (`/var/www/html/ramdisk/live_data_py.json`).
+Der Dienst `e3dc-live` liest über RSCP die Live-Daten aus dem E3DC-Speicher und erzeugt jede Sekunde ein JSON-Dokument in der RAM-Disk (`/var/www/html/ramdisk/live_data_py.json`).
 
 Der Schreibvorgang erfolgt **atomar** (durch Schreiben in eine `.tmp` Datei und anschließendes `rename`), sodass Drittprogramme niemals unvollständige Dateien einlesen können.
 
@@ -22,7 +22,7 @@ Da moderne Webbrowser unsichere Verbindungen (`ws://` auf Port 8080) hart blocki
 
 Der Browser baut die Verbindung scheinbar normal über den Standard-Port 80 (`/ws`) auf. Apache tunnelt diesen Traffic dann intern an den Python-Dienst weiter. Das System umschifft so eleganterweise jegliche Firewall- und HTTPS-Einschränkungen.
 
-**Installation:** 
+**Installation:**
 Der Dienst wird vollautomatisch mit dem Befehl "Systempakete installieren" (Menüpunkt 3) im Installer aktiviert.
 
 ---
@@ -86,13 +86,13 @@ e3dc/in/house/extra_power_w
 ```
 
 ### Welche Werte soll Home Assistant senden?
-Die folgenden Werte sind die fuer Nutzer relevanten MQTT-Eingangswerte. Nur die
+Die folgenden Werte sind die für Nutzer relevanten MQTT-Eingangswerte. Nur die
 als **direkt wirksam** markierten Werte werden aktuell im Dashboard angezeigt
 und optional in Live-History/Prognose uebernommen.
 
 | Topic | Einheit / Typ | Quelle in Home Assistant | Wirkung in E3DC-Control |
 | --- | --- | --- | --- |
-| `e3dc/in/heatpump/power_w` | W | elektrische Leistungsaufnahme der Waermepumpe | direkt wirksam: WP-Kachel, E-Flow, Live-History, Prognose; wird aus dem reinen Hausverbrauch herausgerechnet |
+| `e3dc/in/heatpump/power_w` | W | elektrische Leistungsaufnahme der Wärmepumpe | direkt wirksam: WP-Kachel, E-Flow, Live-History, Prognose; wird aus dem reinen Hausverbrauch herausgerechnet |
 | `e3dc/in/heatpump/ww_temp` | Grad C | Warmwasser-Isttemperatur | direkt wirksam: WP-Kachel und Detailanzeige |
 | `e3dc/in/heatpump/ww_target_temp` | Grad C | Warmwasser-Solltemperatur | direkt wirksam: WP-Kachel und Detailanzeige |
 | `e3dc/in/heatpump/flow_temp` | Grad C | Vorlauf | direkt wirksam: WP-Diagnose/Detailanzeige |
@@ -100,18 +100,18 @@ und optional in Live-History/Prognose uebernommen.
 | `e3dc/in/heatpump/outside_temp` | Grad C | Aussen-/Zulufttemperatur | direkt wirksam: WP-Diagnose/Detailanzeige |
 | `e3dc/in/heatpump/heat_kw` | kW | thermische Leistung, falls vorhanden | direkt wirksam: Diagnosewert |
 | `e3dc/in/heatpump/mode` | Text | Betriebsart, z.B. `WW`, `Heizen`, `Sommer` | direkt wirksam: lesbarer WP-Status |
-| `e3dc/in/heatpump/state` | Text | optionaler Status | Telemetrie, Fallback fuer Status |
+| `e3dc/in/heatpump/state` | Text | optionaler Status | Telemetrie, Fallback für Status |
 | `e3dc/in/heatpump/boost_active` | Bool | externer Boost aktiv | Telemetrie, Freigabe-/Statussensor |
 | `e3dc/in/heater/power_w` | W | Heizstab-/ELWA-Leistung | direkt wirksam: Heizstab-Kachel, E-Flow, Live-History, Prognose; wird aus dem reinen Hausverbrauch herausgerechnet |
 | `e3dc/in/heater/water_temp` | Grad C | Wasser-Isttemperatur | direkt wirksam: Heizstab-Kachel |
 | `e3dc/in/heater/target_temp` | Grad C | Wasser-Solltemperatur | direkt wirksam: Heizstab-Kachel |
 | `e3dc/in/heater/state` | Text | optionaler Status | Telemetrie |
 | `e3dc/in/heater/mode` | Text | optionaler Modus | Telemetrie |
-| `e3dc/in/wallbox/power_w` | W | externe Wallbox-Leistung fuer Wallbox 1 | direkt wirksam: WB1-Kachel, E-Flow, Live-History, Prognose; wird aus dem reinen Hausverbrauch herausgerechnet |
-| `e3dc/in/wallbox1/power_w` | W | externe Wallbox-1-Leistung | Alias fuer `wallbox/power_w`, sinnvoll bei zwei Wallboxen |
+| `e3dc/in/wallbox/power_w` | W | externe Wallbox-Leistung für Wallbox 1 | direkt wirksam: WB1-Kachel, E-Flow, Live-History, Prognose; wird aus dem reinen Hausverbrauch herausgerechnet |
+| `e3dc/in/wallbox1/power_w` | W | externe Wallbox-1-Leistung | Alias für `wallbox/power_w`, sinnvoll bei zwei Wallboxen |
 | `e3dc/in/wallbox2/power_w` | W | externe Wallbox-2-Leistung | direkt wirksam: WB2-Kachel, E-Flow, Live-History, Prognose; wird aus dem reinen Hausverbrauch herausgerechnet |
-| `e3dc/in/wallbox/plugged` | Bool | Fahrzeug verbunden | direkt wirksam: Status/Automation fuer WB1 |
-| `e3dc/in/wallbox/charging` | Bool | Fahrzeug laedt | direkt wirksam: Status/Automation fuer WB1 |
+| `e3dc/in/wallbox/plugged` | Bool | Fahrzeug verbunden | direkt wirksam: Status/Automation für WB1 |
+| `e3dc/in/wallbox/charging` | Bool | Fahrzeug lädt | direkt wirksam: Status/Automation für WB1 |
 | `e3dc/in/wallbox/soc` | Prozent | Fahrzeug-SoC | direkt wirksam als bestätigter Wallbox-SoC; für reine Fahrzeug-SoC-Quellen bleiben die dedizierten `mqtt_hub_sub_soc_topic` Felder möglich |
 | `e3dc/in/wallbox/range_km` | km | Fahrzeug-Reichweite | direkt wirksam in der Fahrzeug-/Wallboxanzeige |
 
@@ -148,8 +148,8 @@ Wenn Broker, Topic, Benutzer oder Passwort im Config-Editor geaendert werden,
 leert die WebUI den Ramdisk-Konfigurationscache und startet den Dienst
 `e3dc-mqtt-hub` neu, damit die neuen Abos ohne manuellen Neustart greifen.
 
-Bool-Werte koennen als `true/false`, `on/off`, `1/0` oder `ein/aus`
-gesendet werden. Zahlen duerfen mit Punkt oder Komma kommen, z.B. `1234.5`
+Bool-Werte können als `true/false`, `on/off`, `1/0` oder `ein/aus`
+gesendet werden. Zahlen dürfen mit Punkt oder Komma kommen, z.B. `1234.5`
 oder `1234,5`.
 
 Beispiel Home-Assistant-Automation für eine Stiebel-/KNX-Wärmepumpe:
@@ -178,7 +178,7 @@ action:
       retain: false
 ```
 
-Beispiel fuer externe Wallbox-Leistung aus Home Assistant:
+Beispiel für externe Wallbox-Leistung aus Home Assistant:
 
 ```yaml
 alias: E3DC-Control sendet Wallbox-1-Leistung
@@ -201,7 +201,10 @@ genutzt und aus dem reinen Hausverbrauch herausgerechnet.
 Sollte Home Assistant neu starten oder das Netzwerk kurzzeitig ausfallen, läuft die E3DC-Control-Regelung unbeeindruckt weiter. MQTT liefert Zusatzdaten und Automationssignale, ersetzt aber nicht den lokalen RSCP-Regelkern.
 
 ### Einrichtung
-1. Starten Sie den Installer: `sudo python3 installer_main.py`
+Setzen und prüfen Sie zuerst den absoluten Produktpfad wie in
+[Installer](Installer.md) beschrieben.
+
+1. Starten Sie den Installer: `bash "$E3DC_INSTALL_PATH/e3dc-setup"`
 2. Navigieren Sie zu den **Erweiterungen** und wählen Sie Punkt **104 (Smart Home MQTT-Hub einrichten)**.
 3. Geben Sie die IP-Adresse Ihres Smart-Home-Servers (Broker) ein.
 4. (Optional) Passen Sie Port, Benutzername, Passwort und das Basis-Topic an.

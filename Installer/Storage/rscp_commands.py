@@ -15,6 +15,7 @@ except ModuleNotFoundError:
 
 try:
     from Installer.storage_parallel_regulator import (
+        EMS_POWER_SETTINGS_NONZERO_MIN_W,
         MODE_AUTO,
         MODE_CHRG,
         MODE_DISCH,
@@ -23,6 +24,7 @@ try:
     )
 except ModuleNotFoundError:
     from storage_parallel_regulator import (  # type: ignore
+        EMS_POWER_SETTINGS_NONZERO_MIN_W,
         MODE_AUTO,
         MODE_CHRG,
         MODE_DISCH,
@@ -39,8 +41,9 @@ except ModuleNotFoundError:
 ACTIVE_REFRESH_MODES = {MODE_DISCH, MODE_CHRG, MODE_GRID}
 ACTIVE_RELEASE_MODES = {MODE_IDLE, MODE_DISCH, MODE_CHRG, MODE_GRID}
 RSCP_COMMAND_CONTRACT_VERSION = 2
-RSCP_POWER_SETTINGS_CONTRACT_VERSION = 1
+RSCP_POWER_SETTINGS_CONTRACT_VERSION = 2
 RSCP_POWER_SETTINGS_RETRY_S = 10.0
+RSCP_POWER_SETTINGS_READBACK_GRACE_S = 10.0
 RSCP_POWER_SETTINGS_TOLERANCE_W = 50
 
 log = logging.getLogger("StorageManager")
@@ -77,6 +80,13 @@ class BattCtrl:
         self._settings_discharge_start = -1
         self._settings_limits_used: Optional[bool] = None
         self._settings_retry_after_monotonic = 0.0
+        self._settings_pending_target: Optional[Dict[str, Any]] = None
+        self._settings_pending_bounded_zero_w = 0
+        self._settings_pending_started_monotonic = 0.0
+        self._settings_pending_deadline_monotonic = 0.0
+        self._settings_pending_started_ts = 0
+        self._settings_pending_response_codes: Optional[list] = None
+        self._settings_last_reconcile_fresh = False
         self._settings_set_requests = 0
         self._settings_get_requests = 0
         self._settings_suppressed = 0
@@ -115,12 +125,16 @@ class BattCtrl:
         discharge_w: int,
         discharge_start_w: int,
         limits_used: bool,
+        bounded_zero_w: int = 0,
     ) -> bool:
         if self._settings_limits_used is False and limits_used is False:
             return True
+        charge_matches = abs(charge_w - self._settings_charge_cap) < RSCP_POWER_SETTINGS_TOLERANCE_W
+        if limits_used and charge_w == 0 and bounded_zero_w > 0:
+            charge_matches = 0 <= self._settings_charge_cap <= bounded_zero_w
         return bool(
             self._settings_limits_used is limits_used
-            and abs(charge_w - self._settings_charge_cap) < RSCP_POWER_SETTINGS_TOLERANCE_W
+            and charge_matches
             and abs(discharge_w - self._settings_discharge_cap) < RSCP_POWER_SETTINGS_TOLERANCE_W
             and abs(discharge_start_w - self._settings_discharge_start) < RSCP_POWER_SETTINGS_TOLERANCE_W
         )
@@ -206,13 +220,18 @@ class BattCtrl:
         discharge_w: int,
         discharge_start_w: int,
         limits_used: bool,
+        bounded_zero_w: int = 0,
     ) -> bool:
         if not isinstance(readback, dict) or readback.get("limits_used") is not limits_used:
             return False
         if not limits_used:
             return True
+        readback_charge_w = int(readback.get("max_charge_w", -1))
+        charge_matches = abs(readback_charge_w - charge_w) < RSCP_POWER_SETTINGS_TOLERANCE_W
+        if charge_w == 0 and bounded_zero_w > 0:
+            charge_matches = 0 <= readback_charge_w <= bounded_zero_w
         return bool(
-            abs(int(readback.get("max_charge_w", -1)) - charge_w) < RSCP_POWER_SETTINGS_TOLERANCE_W
+            charge_matches
             and abs(int(readback.get("max_discharge_w", -1)) - discharge_w) < RSCP_POWER_SETTINGS_TOLERANCE_W
             and abs(int(readback.get("discharge_start_w", -1)) - discharge_start_w) < RSCP_POWER_SETTINGS_TOLERANCE_W
         )
@@ -225,6 +244,7 @@ class BattCtrl:
         limits_used: bool,
         *,
         stage: str,
+        bounded_zero_w: int = 0,
     ) -> bool:
         requested = {
             "limits_used": limits_used,
@@ -267,41 +287,67 @@ class BattCtrl:
                 discharge_w,
                 discharge_start_w,
                 limits_used,
+                bounded_zero_w,
             )
             if readback_matches:
                 break
             if attempt == 0:
                 time.sleep(0.05)
         if not readback_matches:
+            now_monotonic = time.monotonic()
+            self._settings_pending_target = dict(requested)
+            self._settings_pending_bounded_zero_w = max(0, int(bounded_zero_w))
+            self._settings_pending_started_monotonic = now_monotonic
+            self._settings_pending_deadline_monotonic = (
+                now_monotonic + RSCP_POWER_SETTINGS_READBACK_GRACE_S
+            )
+            self._settings_pending_started_ts = int(time.time())
+            self._settings_pending_response_codes = list(response_codes)
+            self._settings_retry_after_monotonic = 0.0
             self._power_settings_diag = {
                 "schema": "rscp_power_settings_v1",
                 "contract_version": RSCP_POWER_SETTINGS_CONTRACT_VERSION,
-                "status": "readback_mismatch" if readback is not None else "readback_missing",
+                "status": "pending_readback" if readback is not None else "pending_readback_missing",
                 "stage": stage,
                 "confirmed": False,
+                "acknowledged": True,
                 "requested": requested,
                 "response_codes": response_codes,
                 "readback": readback,
-                "ts": int(time.time()),
+                "readback_source": "command_verification",
+                "bounded_zero_w": max(0, int(bounded_zero_w)),
+                "ts": self._settings_pending_started_ts,
             }
             return False
 
-        self._settings_charge_cap = charge_w
-        self._settings_discharge_cap = discharge_w
-        self._settings_discharge_start = discharge_start_w
-        self._settings_limits_used = limits_used
-        self._charge_cap = charge_w
-        self._discharge_cap = discharge_w
+        self._settings_charge_cap = int(readback["max_charge_w"])
+        self._settings_discharge_cap = int(readback["max_discharge_w"])
+        self._settings_discharge_start = int(readback["discharge_start_w"])
+        self._settings_limits_used = bool(readback["limits_used"])
+        self._charge_cap = int(readback["max_charge_w"])
+        self._discharge_cap = int(readback["max_discharge_w"])
+        self._clear_pending_power_settings()
         self._settings_retry_after_monotonic = 0.0
+        bounded_zero_equivalent = bool(
+            limits_used
+            and charge_w == 0
+            and 0 < int(readback["max_charge_w"]) <= max(0, int(bounded_zero_w))
+        )
         self._power_settings_diag = {
             "schema": "rscp_power_settings_v1",
             "contract_version": RSCP_POWER_SETTINGS_CONTRACT_VERSION,
-            "status": "confirmed_nonoptimal" if any(code == 1 for code in response_codes) else "confirmed",
+            "status": (
+                "confirmed_bounded_zero"
+                if bounded_zero_equivalent
+                else ("confirmed_nonoptimal" if any(code == 1 for code in response_codes) else "confirmed")
+            ),
             "stage": stage,
             "confirmed": True,
             "requested": requested,
             "response_codes": response_codes,
             "readback": readback,
+            "bounded_zero_w": max(0, int(bounded_zero_w)),
+            "bounded_zero_equivalent": bounded_zero_equivalent,
             "ts": int(time.time()),
         }
         return True
@@ -315,7 +361,190 @@ class BattCtrl:
             max(0.0, self._settings_retry_after_monotonic - time.monotonic()),
             1,
         )
+        diag["pending_remaining_s"] = round(
+            max(0.0, self._settings_pending_deadline_monotonic - time.monotonic()),
+            1,
+        )
         return diag
+
+    def _clear_pending_power_settings(self) -> None:
+        self._settings_pending_target = None
+        self._settings_pending_bounded_zero_w = 0
+        self._settings_pending_started_monotonic = 0.0
+        self._settings_pending_deadline_monotonic = 0.0
+        self._settings_pending_started_ts = 0
+        self._settings_pending_response_codes = None
+
+    @staticmethod
+    def _power_settings_target_dict(
+        charge_w: int,
+        discharge_w: int,
+        discharge_start_w: int,
+        limits_used: bool,
+    ) -> Dict[str, Any]:
+        return {
+            "limits_used": bool(limits_used),
+            "max_charge_w": int(charge_w),
+            "max_discharge_w": int(discharge_w),
+            "discharge_start_w": int(discharge_start_w),
+        }
+
+    def _pending_target_matches(
+        self,
+        target: Dict[str, Any],
+        bounded_zero_w: int,
+    ) -> bool:
+        pending = self._settings_pending_target
+        if not isinstance(pending, dict):
+            return False
+        if pending.get("limits_used") is not target.get("limits_used"):
+            return False
+        if target.get("limits_used") is False:
+            return True
+        pending_charge_w = int(pending.get("max_charge_w", -1))
+        target_charge_w = int(target.get("max_charge_w", -1))
+        charge_matches = abs(pending_charge_w - target_charge_w) < RSCP_POWER_SETTINGS_TOLERANCE_W
+        if target_charge_w == 0 and bounded_zero_w > 0:
+            charge_matches = 0 <= pending_charge_w <= bounded_zero_w
+        return bool(
+            charge_matches
+            and abs(int(pending.get("max_discharge_w", -1)) - int(target.get("max_discharge_w", -1)))
+            < RSCP_POWER_SETTINGS_TOLERANCE_W
+            and abs(int(pending.get("discharge_start_w", -1)) - int(target.get("discharge_start_w", -1)))
+            < RSCP_POWER_SETTINGS_TOLERANCE_W
+        )
+
+    def _pending_target_may_be_superseded(self, target: Dict[str, Any]) -> bool:
+        pending = self._settings_pending_target
+        if not isinstance(pending, dict):
+            return True
+        if target.get("limits_used") is False:
+            return True
+        if pending.get("limits_used") is False:
+            return True
+        return bool(
+            int(target.get("max_charge_w", 0)) <= int(pending.get("max_charge_w", 0))
+            and int(target.get("max_discharge_w", 0)) <= int(pending.get("max_discharge_w", 0))
+        )
+
+    def reconcile_power_settings(self, snapshot: Dict[str, Any], *, fresh: bool) -> bool:
+        """Übernimmt einen frischen kanonischen GET_POWER_SETTINGS-Readback ohne Write."""
+        self._settings_last_reconcile_fresh = False
+        if (
+            not fresh
+            or snapshot.get("ems_power_settings_read") is not True
+            or snapshot.get("ems_power_settings_valid") is not True
+        ):
+            return False
+        limits_used = snapshot.get("ems_power_limits_active")
+        charge_w = snapshot.get("ems_max_charge_power_w")
+        discharge_w = snapshot.get("ems_max_discharge_power_w")
+        discharge_start_w = snapshot.get("ems_discharge_start_power_w")
+        if not isinstance(limits_used, bool):
+            return False
+        if any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+            for value in (charge_w, discharge_w, discharge_start_w)
+        ):
+            return False
+        readback = {
+            "limits_used": limits_used,
+            "max_charge_w": int(charge_w),
+            "max_discharge_w": int(discharge_w),
+            "discharge_start_w": int(discharge_start_w),
+        }
+        self._settings_last_reconcile_fresh = True
+        if isinstance(self._settings_pending_target, dict):
+            pending = dict(self._settings_pending_target)
+            bounded_zero_w = self._settings_pending_bounded_zero_w
+            if self._power_settings_readback_matches(
+                readback,
+                int(pending["max_charge_w"]),
+                int(pending["max_discharge_w"]),
+                int(pending["discharge_start_w"]),
+                bool(pending["limits_used"]),
+                bounded_zero_w,
+            ):
+                response_codes = list(self._settings_pending_response_codes or [])
+                self._settings_limits_used = bool(readback["limits_used"])
+                self._settings_charge_cap = int(readback["max_charge_w"])
+                self._settings_discharge_cap = int(readback["max_discharge_w"])
+                self._settings_discharge_start = int(readback["discharge_start_w"])
+                self._charge_cap = int(readback["max_charge_w"])
+                self._discharge_cap = int(readback["max_discharge_w"])
+                self._settings_retry_after_monotonic = 0.0
+                self._clear_pending_power_settings()
+                self._power_settings_diag = {
+                    "schema": "rscp_power_settings_v1",
+                    "contract_version": RSCP_POWER_SETTINGS_CONTRACT_VERSION,
+                    "status": "confirmed_from_live_readback",
+                    "stage": "live_reconciliation",
+                    "confirmed": True,
+                    "acknowledged": True,
+                    "requested": pending,
+                    "response_codes": response_codes,
+                    "readback": readback,
+                    "readback_source": "canonical_live",
+                    "readback_cycle_ts": snapshot.get("_ts"),
+                    "bounded_zero_w": bounded_zero_w,
+                    "bounded_zero_equivalent": bool(
+                        pending["limits_used"]
+                        and int(pending["max_charge_w"]) == 0
+                        and 0 < int(readback["max_charge_w"]) <= bounded_zero_w
+                    ),
+                    "ts": int(time.time()),
+                }
+                return True
+            now_monotonic = time.monotonic()
+            if now_monotonic < self._settings_pending_deadline_monotonic:
+                self._power_settings_diag = {
+                    **self._power_settings_diag,
+                    "status": "pending_readback",
+                    "confirmed": False,
+                    "acknowledged": True,
+                    "requested": pending,
+                    "readback": readback,
+                    "readback_source": "canonical_live",
+                    "readback_cycle_ts": snapshot.get("_ts"),
+                    "bounded_zero_w": bounded_zero_w,
+                    "ts": int(time.time()),
+                }
+                return False
+            if self._settings_retry_after_monotonic <= 0.0:
+                self._settings_retry_after_monotonic = now_monotonic + RSCP_POWER_SETTINGS_RETRY_S
+            self._power_settings_diag = {
+                **self._power_settings_diag,
+                "status": "readback_mismatch",
+                "confirmed": False,
+                "acknowledged": True,
+                "requested": pending,
+                "readback": readback,
+                "readback_source": "canonical_live",
+                "readback_cycle_ts": snapshot.get("_ts"),
+                "bounded_zero_w": bounded_zero_w,
+                "pending_expired": True,
+                "ts": int(time.time()),
+            }
+            return False
+        self._settings_limits_used = limits_used
+        self._settings_charge_cap = int(charge_w)
+        self._settings_discharge_cap = int(discharge_w)
+        self._settings_discharge_start = int(discharge_start_w)
+        self._charge_cap = int(charge_w)
+        self._discharge_cap = int(discharge_w)
+        self._settings_retry_after_monotonic = 0.0
+        self._power_settings_diag = {
+            "schema": "rscp_power_settings_v1",
+            "contract_version": RSCP_POWER_SETTINGS_CONTRACT_VERSION,
+            "status": "confirmed_from_live_readback",
+            "stage": "live_reconciliation",
+            "confirmed": True,
+            "readback": readback,
+            "readback_source": "canonical_live",
+            "readback_cycle_ts": snapshot.get("_ts"),
+            "ts": int(time.time()),
+        }
+        return True
 
     def set_power_limit_settings(
         self,
@@ -324,16 +553,73 @@ class BattCtrl:
         discharge_start_w: int = 0,
         limits_used: bool = True,
         force: bool = False,
+        bounded_zero_w: int = 0,
     ) -> bool:
         charge_w = max(0, int(charge_w or 0))
         discharge_w = max(0, int(discharge_w or 0))
         discharge_start_w = max(0, int(discharge_start_w or 0))
         limits_used = bool(limits_used)
+        bounded_zero_w = max(0, int(bounded_zero_w or 0)) if limits_used and charge_w == 0 else 0
+        target = self._power_settings_target_dict(
+            charge_w,
+            discharge_w,
+            discharge_start_w,
+            limits_used,
+        )
+        if isinstance(self._settings_pending_target, dict):
+            now_monotonic = time.monotonic()
+            if self._pending_target_matches(target, bounded_zero_w):
+                self._settings_suppressed += 1
+                if self._power_settings_diag.get("status") == "readback_mismatch":
+                    return False
+                if now_monotonic < self._settings_pending_deadline_monotonic:
+                    pending_status = (
+                        "pending_readback"
+                        if isinstance(self._power_settings_diag.get("readback"), dict)
+                        else "pending_readback_missing"
+                    )
+                    self._power_settings_diag = {
+                        **self._power_settings_diag,
+                        "status": pending_status,
+                        "confirmed": False,
+                        "ts": int(time.time()),
+                    }
+                    return False
+                if now_monotonic < self._settings_retry_after_monotonic:
+                    self._power_settings_diag = {
+                        **self._power_settings_diag,
+                        "status": "retry_backoff",
+                        "confirmed": False,
+                        "ts": int(time.time()),
+                    }
+                    return False
+                if not self._settings_last_reconcile_fresh:
+                    self._power_settings_diag = {
+                        **self._power_settings_diag,
+                        "status": "readback_stale",
+                        "confirmed": False,
+                        "ts": int(time.time()),
+                    }
+                    return False
+                self._clear_pending_power_settings()
+            elif not self._pending_target_may_be_superseded(target):
+                self._power_settings_diag = {
+                    **self._power_settings_diag,
+                    "status": "pending_target_conflict",
+                    "confirmed": False,
+                    "next_requested": target,
+                    "ts": int(time.time()),
+                }
+                return False
+            else:
+                self._clear_pending_power_settings()
+                self._settings_retry_after_monotonic = 0.0
         if not force and self._power_settings_target_matches(
             charge_w,
             discharge_w,
             discharge_start_w,
             limits_used,
+            bounded_zero_w,
         ):
             self._settings_suppressed += 1
             self._power_settings_diag = {
@@ -361,28 +647,16 @@ class BattCtrl:
             }
             return False
         try:
-            if (
-                limits_used
-                and charge_w > 0
-                and self._settings_limits_used is True
-                and 0 <= self._settings_charge_cap < 50
-            ):
-                if not self._write_and_verify_power_settings(
-                    charge_w,
-                    discharge_w,
-                    discharge_start_w,
-                    False,
-                    stage="rearm_release",
-                ):
-                    raise RuntimeError("POWER_SETTINGS-Rearm konnte nicht bestaetigt werden")
-                log.info("RSCP POWER_SETTINGS REARM: Ladegrenze 0W -> %dW", charge_w)
             if not self._write_and_verify_power_settings(
                 charge_w,
                 discharge_w,
                 discharge_start_w,
                 limits_used,
                 stage="target",
+                bounded_zero_w=bounded_zero_w,
             ):
+                if str(self._power_settings_diag.get("status") or "").startswith("pending_readback"):
+                    return False
                 raise RuntimeError("POWER_SETTINGS-Readback stimmt nicht mit der Vorgabe ueberein")
             log.info(
                 "RSCP POWER_SETTINGS: limits=%s max_charge=%dW max_discharge=%dW discharge_start=%dW",
@@ -509,6 +783,9 @@ class BattCtrl:
                 _auto_limit_int("discharge_start_w", 0),
                 limits_used=True,
                 force=False,
+                bounded_zero_w=(
+                    EMS_POWER_SETTINGS_NONZERO_MIN_W if auto_charge_cap == 0 else 0
+                ),
             ):
                 return
             should_set_power_auto = bool(command_contract.get("set_power_auto"))

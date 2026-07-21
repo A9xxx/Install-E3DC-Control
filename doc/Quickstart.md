@@ -20,9 +20,9 @@ Klonen Sie das Repository, das den Installer enthält. Wenn Sie dieses Dokument 
 
 ```bash
 # Beispiel für das Klonen in das Home-Verzeichnis
-cd ~
-git clone https://github.com/A9xxx/Install-E3DC-Control.git Install
-cd Install
+export E3DC_INSTALL_PATH="/absoluter/pfad/zur/installation"
+git clone https://github.com/A9xxx/Install-E3DC-Control.git "$E3DC_INSTALL_PATH"
+cd "$E3DC_INSTALL_PATH"
 ```
 *Hinweis: Passen Sie die URL und die Verzeichnisnamen entsprechend an.*
 
@@ -31,7 +31,7 @@ cd Install
 Führen Sie das Haupt-Installationsskript im `Install`-Verzeichnis mit `sudo` aus. Dies startet den interaktiven Installer.
 
 ```bash
-sudo python3 installer_main.py
+bash "$E3DC_INSTALL_PATH/e3dc-setup"
 ```
 
 Das flache Hauptmenü zeigt nur noch die direkt benötigten Aktionen. Erweiterungen und Spezialfälle liegen gesammelt im Expertenmenü.
@@ -48,7 +48,7 @@ Für eine Erstinstallation oder ein Update ist die empfohlene Option **"1 Instal
 2) Systemstatus anzeigen
 3) Rechte prüfen & korrigieren
 4) Notfallmodus / System reparieren
-5) Rollback auf Git-Stand
+5) Policygebundener Stable-Rollback
 6) Backup erstellen / verwalten
 7) Expertenmenü
 8) Systempakete vorbereiten
@@ -105,10 +105,11 @@ newgrp docker
 2. **Verzeichnis vorbereiten:**
 Erstellen Sie einen neuen Ordner mit persistentem `data`-Verzeichnis. Der Anwendungscode kommt aus dem Docker-Image.
 ```bash
-mkdir ~/e3dc-docker
-cd ~/e3dc-docker
+export E3DC_DOCKER_PATH="/absoluter/pfad/zur/docker-installation"
+mkdir -p "$E3DC_DOCKER_PATH"
+cd "$E3DC_DOCKER_PATH"
 mkdir -p data logs
-# optional fuer Altanlagen:
+# optional für Altanlagen:
 # cp /dein/pfad/e3dc.config.txt data/
 ```
 3. **docker-compose.yml erstellen:**
@@ -116,7 +117,7 @@ Legen Sie folgende `docker-compose.yml` in diesem Ordner an:
 ```yaml
 services:
   e3dc-control:
-    image: ghcr.io/a9xxx/install-e3dc-control:v5.3.2b
+    image: ghcr.io/a9xxx/install-e3dc-control:latest
     container_name: e3dc-control
     restart: unless-stopped
     network_mode: "host"
@@ -141,19 +142,17 @@ Das System richtet sich nun im Hintergrund selbst ein und ist nach ca. 60 Sekund
 
 **Docker-Updates:**
 ```bash
-cd ~/e3dc-docker
+cd "$E3DC_DOCKER_PATH"
 docker compose pull
 docker compose up -d --force-recreate
 ```
 `pull` holt das aktuelle GHCR-Image, `--force-recreate` startet den Container
 wirklich aus diesem neuen Image.
 
-Ein Docker-Rückfall eines späteren Stable-Images auf diesen Rollback-Root ist nur nach Prüfung der jeweiligen Update-Policy zulässig; `v5.3.2b` selbst besitzt keinen älteren öffentlichen Rollback.
-
-**Docker-Rückfall auf ein stabiles Release:**
+**Docker-Rückfall von v5.4.0 auf den veröffentlichten Rollback-Root:**
 ```bash
 TAG=v5.3.2b
-cd ~/e3dc-docker
+cd "$E3DC_DOCKER_PATH"
 cp docker-compose.yml "docker-compose.yml.before-$TAG"
 sed -i -E "s#^([[:space:]]*)image: ghcr.io/a9xxx/install-e3dc-control:.*#\1image: ghcr.io/a9xxx/install-e3dc-control:$TAG#" docker-compose.yml
 docker compose pull e3dc-control
@@ -162,17 +161,19 @@ docker logs --tail=80 e3dc-control
 ```
 Der Container kann den Docker-Daemon des Hosts absichtlich nicht selbst
 bedienen. Die Weboberfläche zeigt für Docker deshalb nur die passenden
-Host-Befehle zur gewählten Version an.
+Host-Befehle zur gewählten Version an. `v5.3.2b` ist der einzige vorgesehene
+öffentliche Rückfallstand und gibt selbst keinen älteren Image-Tag frei.
 
-**Wichtig zur Ramdisk im Docker:** `/var/www/html/ramdisk` ist fluechtig und
+**Wichtig zur Ramdisk im Docker:** `/var/www/html/ramdisk` ist flüchtig und
 nach jedem Container-Neustart leer. Dateien wie `ml_prediction.json` werden
 erst von den Diensten neu erzeugt. Wenn `ml_predictor.py --predict`
-`Kein Modell gefunden` meldet, fehlt das persistente Modell
-`/var/www/html/data/ml_model.pkl`; das ist kein Fehler der `uid=33,gid=33`
-Ramdisk-Konfiguration.
+`Kein Modell gefunden` meldet, fehlt ein gültiges Manifest im privaten
+Modell-Volume `/var/lib/e3dc-control/ml`; das ist kein Fehler der
+`uid=33,gid=33`-Ramdisk-Konfiguration. Eine alte Datei
+`/var/www/html/data/ml_model.pkl` wird aus Sicherheitsgründen nicht geladen.
 
 Bei einem normalen Container-Stopp/Rebuild legt E3DC-Control einen kleinen
-Warmstart-Cache unter `data/docker_ramdisk_cache/` an. Dieser Cache enthaelt
+Warmstart-Cache unter `data/docker_ramdisk_cache/` an. Dieser Cache enthält
 Prognose-, Preis- und Verlaufsdaten, aber keine Steuerflags. So startet das
 Dashboard nach `docker compose up -d --force-recreate` schneller mit
 plausiblen Daten und wird danach von den Diensten aktualisiert.
@@ -190,7 +191,7 @@ Mit `network_mode: host` wird kein `ports:`-Mapping genutzt; Apache bindet
 direkt auf diesem Host-Port. Danach z.B. `http://<NAS-IP>:8085/` aufrufen oder
 den Synology Reverse Proxy auf diesen Port zeigen lassen.
 
-Wenn die Weboberflaeche laeuft, aber `Warte auf E3DC...` zeigt, ist Docker/Port
+Wenn die Weboberfläche läuft, aber `Warte auf E3DC...` zeigt, ist Docker/Port
 bereits in Ordnung. Dann im Config-Editor RSCP-IP, Port 5033, E3DC-Benutzer,
 Passwort und AES-Passwort speichern und den Container einmal neu starten.
 
@@ -198,7 +199,7 @@ Passwort und AES-Passwort speichern und den Container einmal neu starten.
 
 ## Wichtige Befehle für die Wartung
 
-Nach der Installation können Sie den Installer für Wartungsaufgaben verwenden. Führen Sie immer wieder `sudo python3 installer_main.py` im `Install`-Verzeichnis aus und wählen Sie die gewünschte Option:
+Nach der Installation können Sie den Installer über `bash "$E3DC_INSTALL_PATH/e3dc-setup"` starten und die gewünschte Wartungsoption wählen:
 
 - **E3DC-Control installieren oder aktualisieren:**
   - Option `1` (Installation / Update)
@@ -212,7 +213,7 @@ Nach der Installation können Sie den Installer für Wartungsaufgaben verwenden.
   - Option `6` (Backup erstellen / verwalten)
   - Erstellen, Wiederherstellen oder Löschen von Backups.
 
-- **Laufende Dienste ueberpruefen:**
+- **Laufende Dienste überprüfen:**
   ```bash
   systemctl is-active e3dc-live e3dc-storage-manager e3dc-wallbox-manager apache2
   journalctl -u e3dc-live -n 80 --no-pager

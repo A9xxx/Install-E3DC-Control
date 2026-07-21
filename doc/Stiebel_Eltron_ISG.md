@@ -3,17 +3,17 @@
 Diese Dokumentation beschreibt die Stiebel-Eltron-Anbindung ab E3DC-Control
 `5.0.5`. Der Dienst `e3dc-stiebel-live` ist bewusst als
 Read-only-Live-Treiber gebaut. Er liest Werte aus dem ISG/WPM aus und speist
-sie in die bestehende Waermepumpen-Anzeige ein. Aktive SG-Ready- oder
+sie in die bestehende Wärmepumpen-Anzeige ein. Aktive SG-Ready- oder
 Temperatur-Schreibzugriffe sind in diesem Live-Dienst nicht enthalten.
 
 ## Funktionsumfang
 
-- Live-Monitoring ueber Stiebel ISG / WPM per Modbus TCP.
-- Anzeige von Aussen-, Vorlauf-, Ruecklauf-, Warmwasser- und
+- Live-Monitoring über Stiebel ISG / WPM per Modbus TCP.
+- Anzeige von Außen-, Vorlauf-, Rücklauf-, Warmwasser- und
   Quellentemperatur.
 - Auslesen von Betriebsart, Verdichterstatus, SG-Ready-Zustand und
-  Tages-Energiezaehlern, soweit die ISG-Firmware die Register liefert.
-- Schaetzung der aktuellen elektrischen Leistungsaufnahme der Waermepumpe.
+  Tages-Energiezählern, soweit die ISG-Firmware die Register liefert.
+- Schätzung der aktuellen elektrischen Leistungsaufnahme der Wärmepumpe.
 - Optionaler externer Shelly-Leistungsmesser als bevorzugte Live-Leistung,
   z.B. Shelly Pro 3EM, Shelly 3EM, Shelly Plug/Plus oder Shelly PM.
 - Optionales Auslesen der Verdichterfrequenz aus der ISG-Webseite
@@ -32,7 +32,7 @@ Insbesondere werden nicht geschrieben:
 - keine Komforttemperaturen,
 - keine Warmwasser-Solltemperaturen,
 - keine Betriebsart,
-- keine SG-Ready-Zustaende,
+- keine SG-Ready-Zustände,
 - keine EEPROM-relevanten Sollwerte.
 
 Das ist Absicht. Die Heizung ist kritische Infrastruktur, und viele
@@ -45,8 +45,8 @@ bewusster Nutzerfreigabe getestet werden.
 - Stiebel Eltron ISG im lokalen Netz.
 - Modbus TCP im ISG/WPM aktiviert.
 - Der E3DC-Control Host erreicht das ISG auf Port `502`.
-- Fuer die optionale Verdichter-Hz-Erkennung muss die ISG-Webseite erreichbar
-  sein. Falls die Webseite ein Login verlangt, koennen Benutzer und Passwort
+- Für die optionale Verdichter-Hz-Erkennung muss die ISG-Webseite erreichbar
+  sein. Falls die Webseite ein Login verlangt, können Benutzer und Passwort
   in der Config eingetragen werden.
 
 ## Konfiguration
@@ -54,46 +54,46 @@ bewusster Nutzerfreigabe getestet werden.
 Die Einrichtung erfolgt im Frontend, nicht durch manuelles Setzen von
 Roh-Keys.
 
-1. Config-Editor oeffnen.
-2. Bereich **Smart Home & Verbrauchsprognose** oeffnen.
+1. Config-Editor öffnen.
+2. Bereich **Smart Home & Verbrauchsprognose** öffnen.
 3. **WP-/Verbrauchslogging aktivieren** einschalten.
-4. Bei **Wärmepumpen Typ** den Eintrag **Stiebel Eltron ISG / WPM** waehlen.
+4. Bei **Wärmepumpen Typ** den Eintrag **Stiebel Eltron ISG / WPM** wählen.
 5. **ISG IP-Adresse** eintragen, z.B. `192.0.2.233`.
 6. **Port** auf `502` und **Unit-ID** auf `1` lassen, falls am ISG nichts
    anderes eingestellt ist.
 7. **Hz aus Web** nur auf **Ja** stellen, wenn die ISG-Prozessdaten-Seite aus
    dem Host oder Docker-Container wirklich erreichbar ist. Bei wiederholten
    Timeouts pausiert der Dienst automatisch 30 Minuten; Modbus/Shelly-Werte
-   laufen weiter. Wenn die Meldung stoert, auf **Nein** lassen.
+   laufen weiter. Wenn die Meldung stört, auf **Nein** lassen.
 8. Optional einen **Externen Leistungsmesser** aktivieren, wenn ein separater
-   Shelly die elektrische Waermepumpenleistung misst.
+   Shelly die elektrische Wärmepumpenleistung misst.
 
-Der Schalter **Automatik darf Geräte steuern** kann fuer reines Stiebel-Live-
+Der Schalter **Automatik darf Geräte steuern** kann für reines Stiebel-Live-
 Monitoring ausgeschaltet bleiben. Der Live-Dienst liest nur Werte. SG-Ready-
 Schreiben bleibt separat abgesichert.
 
-Die folgenden internen Keys sind nur fuer Support, Diagnose und JSON-Pruefung
-gedacht. Nutzer muessen sie normalerweise nicht direkt anfassen:
+Die folgenden internen Keys sind nur für Support, Diagnose und JSON-Prüfung
+gedacht. Nutzer müssen sie normalerweise nicht direkt anfassen:
 
 | Frontend-Feld | interner Key | Hinweis |
 | --- | --- | --- |
-| WP-/Verbrauchslogging aktivieren | `luxtronik` | Historischer Key fuer den gemeinsamen Waermepumpen-/Energy-Manager-Pfad. |
+| WP-/Verbrauchslogging aktivieren | `luxtronik` | Historischer Key für den gemeinsamen Wärmepumpen-/Energy-Manager-Pfad. |
 | Wärmepumpen Typ: Stiebel Eltron ISG / WPM | `wp_type` | Wird vom Frontend automatisch auf Stiebel gesetzt. |
 | ISG IP-Adresse | `stiebel_isg_ip` | IP-Adresse des ISG, z.B. `192.0.2.233`. |
 | Port | `stiebel_isg_port` | Modbus-TCP-Port, Standard `502`. |
 | Unit-ID | `stiebel_isg_device_id` | Modbus Unit-ID, Standard `1`. |
-| HZ Leistung (W) | `stiebel_isg_power_heating_w` | Nenn-/Schaetzleistung in Watt fuer Heizbetrieb. |
-| WW Leistung (W) | `stiebel_isg_power_dhw_w` | Nenn-/Schaetzleistung in Watt fuer Warmwasser. |
-| COP Schätzung | `stiebel_isg_cop_estimate` | Faktor fuer die angezeigte thermische Momentanleistung, wenn das ISG keine echte Waermeleistung liefert. |
+| HZ Leistung (W) | `stiebel_isg_power_heating_w` | Nenn-/Schätzleistung in Watt für Heizbetrieb. |
+| WW Leistung (W) | `stiebel_isg_power_dhw_w` | Nenn-/Schätzleistung in Watt für Warmwasser. |
+| COP Schätzung | `stiebel_isg_cop_estimate` | Faktor für die angezeigte thermische Momentanleistung, wenn das ISG keine echte Wärmeleistung liefert. |
 | Standby (W) | `stiebel_isg_standby_w` | Standby-Leistung der WP-Steuerung in Watt. |
-| Max Hz | `stiebel_isg_max_hz` | Maximal angenommene Verdichterfrequenz fuer lineare Hz-Schaetzung. |
+| Max Hz | `stiebel_isg_max_hz` | Maximal angenommene Verdichterfrequenz für lineare Hz-Schätzung. |
 | Hz/Watt Kennlinie | `stiebel_isg_hz_power_map` | Optionale Kennlinie, z.B. `0:35,15:400,30:850,60:1800`. |
 | Hz aus Web | `stiebel_isg_scrape_hz_enable` | Optionales Lesen der ISG-Prozessdaten-Seite, Standard `Nein`; nach drei Timeouts pausiert der Dienst 30 Minuten. |
 | Web Benutzer | `stiebel_isg_web_user` | Optionaler ISG-Weblogin-Benutzer. |
 | Web Passwort | `stiebel_isg_web_password` | Optionales ISG-Weblogin-Passwort. |
 | Externer Leistungsmesser | `stiebel_isg_power_meter_enable` | Nutzt einen Shelly read-only als bevorzugte elektrische WP-Leistung. |
-| Zaehler-IP | `stiebel_isg_power_meter_ip` | IP-Adresse des Shelly-Leistungsmessers. |
-| Zaehlertyp | `stiebel_isg_power_meter_type` | `auto`, `shelly_3em`, `shelly_plug` oder `shelly_pm`. |
+| Zähler-IP | `stiebel_isg_power_meter_ip` | IP-Adresse des Shelly-Leistungsmessers. |
+| Zählertyp | `stiebel_isg_power_meter_type` | `auto`, `shelly_3em`, `shelly_plug` oder `shelly_pm`. |
 
 ## Bare-Metal-Betrieb
 
@@ -109,7 +109,7 @@ journalctl -u e3dc-stiebel-live -n 80
 Die wichtigsten Dateien:
 
 ```text
-/home/pi/Install/Installer/stiebel/stiebel_live.py
+<INSTALL_PATH>/Installer/stiebel/stiebel_live.py
 /var/www/html/logs/stiebel_live.log
 /var/www/html/ramdisk/stiebel_isg.json
 /var/www/html/ramdisk/waermepumpe.json
@@ -125,13 +125,14 @@ passt:
 - **Wärmepumpen Typ** steht auf **Stiebel Eltron ISG / WPM**.
 - **ISG IP-Adresse** ist gesetzt und nicht `0.0.0.0`.
 
-Nach einer Config-Aenderung muss der Container einmal neu gestartet oder neu
+Nach einer Config-Änderung muss der Container einmal neu gestartet oder neu
 erstellt werden, weil die Startlogik nur beim Containerstart ausgewertet wird.
 
 Fertiges Image aktualisieren:
 
 ```bash
-cd ~/e3dc-docker
+export E3DC_DOCKER_PATH="/absoluter/pfad/zur/docker-installation"
+cd "$E3DC_DOCKER_PATH"
 sudo docker compose pull e3dc-control
 sudo docker compose up -d --force-recreate e3dc-control
 ```
@@ -139,12 +140,12 @@ sudo docker compose up -d --force-recreate e3dc-control
 Lokales Image aus einem frisch gezogenen Repository neu bauen:
 
 ```bash
-cd ~/e3dc-docker
+cd "$E3DC_DOCKER_PATH"
 sudo docker compose build --no-cache e3dc-control
 sudo docker compose up -d --force-recreate e3dc-control
 ```
 
-Pruefen:
+Prüfen:
 
 ```bash
 sudo docker logs e3dc-control | grep "Stiebel ISG Live"
@@ -165,7 +166,7 @@ Der Dienst pollt alle 30 Sekunden:
 4. Optional externen Shelly-Leistungsmesser read-only lesen.
 5. Werte normalisieren.
 6. JSON atomar in die RAM-Disk schreiben.
-7. Dashboard, Waermepumpen-Seite, MQTT-Hub und R5-Diagnose lesen diese
+7. Dashboard, Wärmepumpen-Seite, MQTT-Hub und R5-Diagnose lesen diese
    normalisierten Daten.
 
 ## Gelesene Register
@@ -182,7 +183,7 @@ Quelle: `https://www.stiebel-eltron.de/toolbox/content/docs/anleitungen/installa
 | --- | ---: | ---: | --- |
 | FC04 Input | `501` | `500` | Systemwerte, u.a. Temperaturen |
 | FC04 Input | `2501` | `2500` | Statuswerte, u.a. Verdichter und Pumpen |
-| FC04 Input | `3501` | `3500` | Energiezaehler fuer Tag/Verbrauch |
+| FC04 Input | `3501` | `3500` | Energiezähler für Tag/Verbrauch |
 | FC04 Input | `5001` | `5000` | SG-Ready-/Reglerinformation |
 | FC04 Input | `6128` | `6127` | Verdichterleistung in Prozent, falls Firmware/Register vorhanden |
 | FC03 Holding | `1501..1511` | `1500..1510` | Betriebsart und Soll-/Komfortparameter, read-only im Live-Dienst |
@@ -221,7 +222,7 @@ Stiebel-Register `2520` und wird als aktive passive Kühlung übernommen.
 Bekannte ISG-/FHEM-Mappings werden bevorzugt beruecksichtigt, u.a.
 `i506` Aussen und `i521` Warmwasser-Ist. Die Quellentemperatur kommt nach
 offizieller Tabelle von `536`, also als Codeadresse `535`; `537`/`536` bleibt
-als Fallback fuer abweichende Firmware erhalten.
+als Fallback für abweichende Firmware erhalten.
 
 ## Leistungsaufnahme
 
@@ -234,7 +235,7 @@ Treiber schaetzt deshalb die Aufnahme in dieser Reihenfolge:
 3. Verdichterleistung in Prozent (Doku `6128`, Code `6127`), wenn vorhanden.
 4. Verdichterfrequenz in Hz aus der ISG-Prozessdaten-Seite, wenn aktiviert.
 5. Standby-Leistung, wenn der Verdichter aus ist.
-6. Konfigurierter Nennwert fuer WW oder Heizen als Fallback.
+6. Konfigurierter Nennwert für WW oder Heizen als Fallback.
 
 Die Quelle steht im JSON-Feld `stiebel_power_source`, z.B.:
 
@@ -264,17 +265,17 @@ summiert L1+L2+L3, wenn alle drei Phasen plausibel lesbar sind.
 
 | Quelle | L1 Doku | L2 Doku | L3 Doku | L1 Code |
 | --- | ---: | ---: | ---: | ---: |
-| Primaere Waermepumpe | `6118` | `6119` | `6120` | `6117` |
-| Sekundaere Waermepumpe 1 | `6268` | `6269` | `6270` | `6267` |
-| Sekundaere Waermepumpe 2 | `6418` | `6419` | `6420` | `6417` |
-| Sekundaere Waermepumpe 3 | `6568` | `6569` | `6570` | `6567` |
-| Sekundaere Waermepumpe 4 | `6718` | `6719` | `6720` | `6717` |
-| Sekundaere Waermepumpe 5 | `6868` | `6869` | `6870` | `6867` |
+| Primäre Wärmepumpe | `6118` | `6119` | `6120` | `6117` |
+| Sekundäre Wärmepumpe 1 | `6268` | `6269` | `6270` | `6267` |
+| Sekundäre Wärmepumpe 2 | `6418` | `6419` | `6420` | `6417` |
+| Sekundäre Wärmepumpe 3 | `6568` | `6569` | `6570` | `6567` |
+| Sekundäre Wärmepumpe 4 | `6718` | `6719` | `6720` | `6717` |
+| Sekundäre Wärmepumpe 5 | `6868` | `6869` | `6870` | `6867` |
 | System-/Sammeladresse | `36118` | `36119` | `36120` | `36117` |
 
 Auf Ursis ISG Plus sind diese Register aktuell nicht freigeschaltet
 (`Modbus exception 2`). Das ist kein Fehler im Treiber; dann faellt E3DC-Control
-automatisch auf Verdichterstatus, Prozent/Hz, Shelly oder Nennwerte zurueck.
+automatisch auf Verdichterstatus, Prozent/Hz, Shelly oder Nennwerte zurück.
 
 Wenn eine Anlage kalibriert werden soll, ist `stiebel_isg_hz_power_map` der
 genaueste Weg. Beispiel:
@@ -287,17 +288,17 @@ Zwischen den Stuetzpunkten wird linear interpoliert.
 
 ### Externer Shelly-Leistungsmesser
 
-Viele Nutzer messen die Waermepumpe bereits mit einem separaten Shelly. Fuer
+Viele Nutzer messen die Wärmepumpe bereits mit einem separaten Shelly. Für
 Stiebel ist das der beste Weg, wenn ISG/Modbus keine elektrische Live-Leistung
 liefert oder die Verdichter-Hz-Seite nicht erreichbar ist.
 
 Unterstuetzt werden read-only:
 
-- Shelly Pro 3EM / Shelly 3EM ueber `EM.GetStatus` oder `/status`,
-- Shelly Plug / Plus Plug ueber `Switch.GetStatus` oder `/meter/0`,
-- Shelly PM ueber `PM1.GetStatus`.
+- Shelly Pro 3EM / Shelly 3EM über `EM.GetStatus` oder `/status`,
+- Shelly Plug / Plus Plug über `Switch.GetStatus` oder `/meter/0`,
+- Shelly PM über `PM1.GetStatus`.
 
-Der Messwert ueberschreibt nur die Felder `Leistung_Verdichter_W` und
+Der Messwert überschreibt nur die Felder `Leistung_Verdichter_W` und
 `Leistungsaufnahme` im Live-JSON. Er schaltet kein Relais und schreibt keine
 Stiebel-Register. Zusatzfelder wie `stiebel_external_power_w`,
 `stiebel_external_power_source` und die Phasenwerte helfen bei Diagnose und
@@ -318,7 +319,7 @@ Der Live-Dienst liest die Betriebsart aus Doku-Register `1501` (Codeadresse
 | `5` | Warmwasserbetrieb |
 
 SG-Ready-Informationen werden gelesen und im Dashboard angezeigt. Die aktive
-SG-Ready-Regelung ist nicht Teil dieses Live-Dienstes. Fuer spaetere aktive
+SG-Ready-Regelung ist nicht Teil dieses Live-Dienstes. Für spätere aktive
 Regelung gilt: erst Vor-Ort-Test, dann Watchdog, dann Opt-in.
 
 ## Troubleshooting
@@ -339,13 +340,13 @@ sudo docker logs e3dc-control | grep "Stiebel ISG"
 sudo docker exec e3dc-control sh -lc 'tail -n 80 /var/www/html/logs/stiebel_live.log'
 ```
 
-Pruefen:
+Prüfen:
 
 - Ist im Config-Editor unter **Smart Home & Verbrauchsprognose** der Schalter
   **WP-/Verbrauchslogging aktivieren** eingeschaltet?
 - Ist bei **Wärmepumpen Typ** **Stiebel Eltron ISG / WPM** ausgewaehlt?
 - Ist die **ISG IP-Adresse** korrekt eingetragen?
-- Fuer reines Live-Monitoring darf **Automatik darf Geräte steuern**
+- Für reines Live-Monitoring darf **Automatik darf Geräte steuern**
   ausgeschaltet bleiben.
 - Erreicht der Host `http://<ISG-IP>/`?
 - Ist Port `502` erreichbar?
@@ -353,15 +354,15 @@ Pruefen:
 ### Leistungsaufnahme wirkt ungenau
 
 Das ist normal, wenn das ISG weder Verdichter-Prozent noch Verdichter-Hz
-liefert. Dann nutzt E3DC-Control die konfigurierten Nennwerte. Fuer bessere
+liefert. Dann nutzt E3DC-Control die konfigurierten Nennwerte. Für bessere
 Werte die Hz-Erkennung aktivieren oder eine Kennlinie in
 `stiebel_isg_hz_power_map` eintragen.
 
 ### Prozessdaten-Hz nicht lesbar / Timeout
 
-Das betrifft nur das optionale Auslesen der ISG-Webseite fuer die
+Das betrifft nur das optionale Auslesen der ISG-Webseite für die
 Verdichterfrequenz. Modbus-Livewerte und externe Shelly-Leistungsmesser laufen
-trotzdem weiter. Nach drei Web-Timeouts pausiert der Dienst die Hz-Abfrage fuer
+trotzdem weiter. Nach drei Web-Timeouts pausiert der Dienst die Hz-Abfrage für
 30 Minuten und loggt nur gedrosselt. Wenn die Meldung dauerhaft stoert, im
 Config-Editor bei Stiebel `Hz aus Web` auf `Nein` stellen oder den externen
 Shelly-Leistungsmesser verwenden.
@@ -374,7 +375,7 @@ diese Daten nur, um die Prozessdaten-Seite read-only zu lesen.
 ### Docker startet den Stiebel-Prozess nicht
 
 Der Container wertet die Startbedingungen nur beim Start aus. Nach einer
-Config-Aenderung:
+Config-Änderung:
 
 ```bash
 sudo docker compose restart e3dc-control

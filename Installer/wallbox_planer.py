@@ -13,9 +13,12 @@ Battery-Care Zwei-Phasen Strategie (inspiriert von Wallbox/ai_scheduler.py):
   - Just-In-Time Score:         Bei gleichem Preis werden spaetere ("naehere") Slots
     bevorzugt (aus ai_scheduler.py Battery-Care Algorithmus).
 """
+import argparse
+import hashlib
 import os
 import json
 import math
+import stat
 import time
 import datetime
 import logging
@@ -23,7 +26,7 @@ import logging
 try:
     from .Wallbox.config import get_config, CONFIG_FILE, V4_CONFIG_FILE, RAMDISK_DIR, INSTALL_DIR
     from .config_secret_permissions import apply_config_secret_permissions
-except ImportError:  # Aufruf als Script-Modul aus /home/pi/Install/Installer
+except ImportError:  # Aufruf als Script-Modul direkt aus dem Installer-Verzeichnis
     from Wallbox.config import get_config, CONFIG_FILE, V4_CONFIG_FILE, RAMDISK_DIR, INSTALL_DIR
     from config_secret_permissions import apply_config_secret_permissions
 
@@ -46,6 +49,19 @@ JIT_BONUS_CT_PER_H = 0.005
 
 MISSING_SOC_WARNING_INTERVAL_S = 600
 _last_missing_soc_warning_ts = 0.0
+_CANDIDATE_MODE = False
+
+_CANDIDATE_SCHEMA = "wallbox_plan_candidate_v1"
+_CANDIDATE_RESULT_SCHEMA = "wallbox_plan_candidate_result_v1"
+_CANDIDATE_REQUEST_FILE = "candidate_request.json"
+_CANDIDATE_CONFIG_FILE = "candidate_config.json"
+_CANDIDATE_RESULT_FILE = "planner_result.json"
+_CANDIDATE_PLAN_FILES = (
+    "native_wallbox_schedule_wb1.json",
+    "native_wallbox_schedule_wb2.json",
+    "native_wallbox_schedule.json",
+)
+_MAX_CANDIDATE_JSON_BYTES = 4 * 1024 * 1024
 
 
 def _warn_missing_vehicle_soc(now=None):
@@ -166,6 +182,8 @@ def _clear_consumed_manual_plan(wb_id, reason=""):
         try:
             if os.path.abspath(path) == os.path.abspath(V4_CONFIG_FILE):
                 apply_config_secret_permissions(path, data=data if isinstance(data, dict) else None)
+            elif _CANDIDATE_MODE:
+                os.chmod(path, 0o600)
             else:
                 os.chmod(path, 0o664)
         except Exception:
@@ -191,7 +209,7 @@ def _write_schedule_file(path, slots, wb_id=None, combined=False):
         logger.error("[Scheduler] Fehler beim Schreiben des %s: %s", label, e)
         return False
     try:
-        os.chmod(path, 0o664)
+        os.chmod(path, 0o600 if _CANDIDATE_MODE else 0o664)
     except PermissionError:
         # Datei kann von www-data angelegt sein. Solange das Schreiben gelang,
         # ist das kein Planungsfehler und soll nicht jede Runde den Log fuellen.
@@ -398,7 +416,7 @@ def generate_native_charging_schedule(config, wb_id=None):
             _remove_schedule_file(schedule_file, wb_id, "Wallbox-Modus aus - alten Schedule geloescht.")
         return []
 
-    NATIVE_TYPES = {'openwb', 'openwb_pro', 'go-e', 'e3dc', 'e3dc_auto', 'e3dc_multi', 'e3dc_multi_connect'}
+    NATIVE_TYPES = {'openwb', 'openwb_pro', 'go-e', 'e3dc', 'e3dc_auto', 'e3dc_efy', 'e3dc_easy_connect', 'e3dc_multi', 'e3dc_multi_connect', 'e3dc_multi_connect_ii', 'dummy'}
     use_native_soc_path = wb_native and wb_native_type in NATIVE_TYPES
     # Native Systeme duerfen den Fahrzeug-SoC liefern, aber ein automatischer
     # Zielplan entsteht nur, wenn die Smart-Zielplanung explizit aktiv ist.
@@ -459,7 +477,7 @@ def generate_native_charging_schedule(config, wb_id=None):
             # 1. manuel_soc_wb1.json (openWB MQTT oder manuelle UI-Eingabe)
             for soc_file in [
                 os.path.join(RAMDISK_DIR, f"manual_soc_wb{wb_id}.json"),
-                "/var/www/html/tmp/manual_soc.json" if wb_id == 1 else "",
+                "/var/www/html/tmp/manual_soc.json" if wb_id == 1 and not _CANDIDATE_MODE else "",
             ]:
                 if not soc_file:
                     continue
@@ -937,7 +955,7 @@ def get_planned_charging_status(wb_id=None):
     2. e3dc.wallbox.out (Legacy C++ Plan, nur wenn kein nativer Typ konfiguriert)
     """
     current_ts  = int(time.time())
-    NATIVE_TYPES = {'openwb', 'openwb_pro', 'go-e', 'e3dc', 'e3dc_auto', 'e3dc_multi', 'e3dc_multi_connect'}
+    NATIVE_TYPES = {'openwb', 'openwb_pro', 'go-e', 'e3dc', 'e3dc_auto', 'e3dc_efy', 'e3dc_easy_connect', 'e3dc_multi', 'e3dc_multi_connect', 'e3dc_multi_connect_ii', 'dummy'}
 
     try:
         cfg       = get_config()
@@ -1017,4 +1035,385 @@ def get_planned_charging_status(wb_id=None):
             pass
 
     return False
+
+# Trusted WebUI candidate mode
+# ---------------------------------------------------------------------------
+def _candidate_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while True:
+            chunk = handle.read(65536)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _candidate_private_directory(path):
+    raw = os.path.abspath(str(path or ""))
+    if not raw or os.path.islink(raw):
+        raise ValueError("candidate_directory_invalid")
+    resolved = os.path.realpath(raw)
+    if raw != resolved:
+        raise ValueError("candidate_directory_alias")
+    info = os.stat(resolved)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+        raise ValueError("candidate_directory_untrusted")
+    if stat.S_IMODE(info.st_mode) & 0o077:
+        raise ValueError("candidate_directory_not_private")
+    parent = os.path.dirname(resolved)
+    parent_info = os.stat(parent)
+    if not stat.S_ISDIR(parent_info.st_mode) or parent_info.st_uid != os.geteuid():
+        raise ValueError("candidate_parent_untrusted")
+    if stat.S_IMODE(parent_info.st_mode) & 0o077:
+        raise ValueError("candidate_parent_not_private")
+    return resolved
+
+
+def _candidate_read_private_json(path, *, max_bytes=_MAX_CANDIDATE_JSON_BYTES):
+    if os.path.islink(path):
+        raise ValueError("candidate_file_symlink")
+    before = os.stat(path)
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_uid != os.geteuid()
+        or before.st_nlink != 1
+        or stat.S_IMODE(before.st_mode) & 0o077
+        or before.st_size < 2
+        or before.st_size > max_bytes
+    ):
+        raise ValueError("candidate_file_untrusted")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        opened = os.fstat(fd)
+        signature = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+        if signature != (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns):
+            raise ValueError("candidate_file_replaced")
+        payload = b""
+        while len(payload) <= max_bytes:
+            chunk = os.read(fd, min(65536, max_bytes + 1 - len(payload)))
+            if not chunk:
+                break
+            payload += chunk
+        after = os.fstat(fd)
+        if signature != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+            raise ValueError("candidate_file_changed")
+    finally:
+        os.close(fd)
+    if len(payload) > max_bytes:
+        raise ValueError("candidate_file_too_large")
+    try:
+        return json.loads(payload.decode("utf-8-sig"))
+    except Exception as exc:
+        raise ValueError("candidate_json_invalid") from exc
+
+
+def _candidate_atomic_json(path, payload):
+    directory = os.path.dirname(path)
+    name = ".planner-result-%d-%d.tmp" % (os.getpid(), time.time_ns())
+    tmp = os.path.join(directory, name)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(tmp, flags, 0o600)
+    try:
+        encoded = (json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+        view = memoryview(encoded)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError("candidate_result_short_write")
+            view = view[written:]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+    os.chmod(path, 0o600)
+
+
+def _candidate_flat_config(raw):
+    if not isinstance(raw, dict):
+        raise ValueError("candidate_config_not_object")
+    nested = raw.get("config")
+    flat = dict(nested) if isinstance(nested, dict) else {}
+    for key, value in raw.items():
+        if key != "config":
+            flat[key] = value
+    return flat
+
+
+def _candidate_finite(value, key, minimum, maximum):
+    try:
+        number = float(str(value).strip().replace(",", "."))
+    except Exception as exc:
+        raise ValueError("candidate_config_invalid_%s" % key) from exc
+    if not math.isfinite(number) or number < minimum or number > maximum:
+        raise ValueError("candidate_config_invalid_%s" % key)
+
+
+def _validate_candidate_config(raw):
+    encoded = json.dumps(raw, ensure_ascii=False).encode("utf-8")
+    if len(encoded) > _MAX_CANDIDATE_JSON_BYTES:
+        raise ValueError("candidate_config_too_large")
+    flat = _candidate_flat_config(raw)
+    if len(flat) > 4096:
+        raise ValueError("candidate_config_too_many_keys")
+    for key, value in flat.items():
+        if not isinstance(key, str) or not key or len(key) > 128:
+            raise ValueError("candidate_config_key_invalid")
+        if any(ord(char) < 32 for char in key):
+            raise ValueError("candidate_config_key_control")
+        if isinstance(value, str) and (len(value) > 65536 or "\x00" in value):
+            raise ValueError("candidate_config_value_invalid")
+
+    for wb_id in (1, 2):
+        for key in (f"wb{wb_id}_mode",):
+            if key in flat:
+                _candidate_finite(flat[key], key, 0, 20)
+        for key in (
+            f"wb{wb_id}_locked",
+            f"wb{wb_id}_smart_wbhour_enable",
+            f"wb{wb_id}_native_eco",
+            f"wb{wb_id}_sofort",
+            f"wb{wb_id}_manual_pause",
+        ):
+            if key in flat and str(flat[key]).strip().lower() not in (
+                "0", "1", "true", "false", "yes", "no", "on", "off",
+            ):
+                raise ValueError("candidate_config_invalid_%s" % key)
+        for key in (f"wb{wb_id}_plan_hours", f"wb{wb_id}_wbhour"):
+            if key in flat:
+                _candidate_finite(flat[key], key, 0, 99)
+        for key in (f"wb{wb_id}_target_soc", f"wb{wb_id}_max_soc_si", f"wb{wb_id}_current_soc"):
+            if key in flat and str(flat[key]).strip() != "":
+                _candidate_finite(flat[key], key, 0, 100)
+        for key in (f"wb{wb_id}_capacity", f"wb{wb_id}_target_kwh"):
+            if key in flat and str(flat[key]).strip() != "":
+                _candidate_finite(flat[key], key, 0, 500)
+        key = f"wb{wb_id}_charge_power"
+        if key in flat and str(flat[key]).strip() != "":
+            _candidate_finite(flat[key], key, 0.1, 100)
+        key = f"wb{wb_id}_target_unit"
+        if key in flat and str(flat[key]).strip().lower() not in ("soc", "kwh"):
+            raise ValueError("candidate_config_invalid_%s" % key)
+        for key in (f"wb{wb_id}_wbvon", f"wb{wb_id}_wbbis", f"wb{wb_id}_battery_departure_time"):
+            if key not in flat:
+                continue
+            value = str(flat[key]).strip().lower()
+            if value in ("now", "jetzt") and key.endswith("_wbvon"):
+                continue
+            try:
+                hour, minute = [int(part) for part in value.split(":", 1)]
+            except Exception as exc:
+                raise ValueError("candidate_config_invalid_%s" % key) from exc
+            if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+                raise ValueError("candidate_config_invalid_%s" % key)
+
+    for key in ("wbhour", "Wbhour"):
+        if key in flat:
+            _candidate_finite(flat[key], key.lower(), 0, 99)
+    for key in ("wbminsoc", "car_target_soc", "car_max_soc_si"):
+        if key in flat and str(flat[key]).strip() != "":
+            _candidate_finite(flat[key], key, 0, 100)
+    for key in ("car_capacity", "car_target_kwh"):
+        if key in flat and str(flat[key]).strip() != "":
+            _candidate_finite(flat[key], key, 0, 500)
+    if "car_charge_power" in flat and str(flat["car_charge_power"]).strip() != "":
+        _candidate_finite(flat["car_charge_power"], "car_charge_power", 0.1, 100)
+    if "dvcarlimit" in flat and str(flat["dvcarlimit"]).strip() != "":
+        _candidate_finite(flat["dvcarlimit"], "dvcarlimit", 0, 500)
+    return flat
+
+
+def _candidate_int(value, default=0):
+    try:
+        return int(float(str(value).strip().replace(",", ".")))
+    except Exception:
+        return default
+
+
+def _candidate_manual_plan_required(config, wb_id):
+    mode_value = config.get(f"wb{wb_id}_mode")
+    if mode_value is not None and str(mode_value).strip() != "" and _candidate_int(mode_value, 0) == 0:
+        return False
+    legacy_hours = config.get("wbhour", config.get("Wbhour", 0)) if wb_id == 1 else 0
+    hours = _candidate_int(
+        config.get(f"wb{wb_id}_plan_hours", config.get(f"wb{wb_id}_wbhour", legacy_hours)),
+        0,
+    )
+    legacy_sofort = config.get("wb_sofort", "0") if wb_id == 1 else "0"
+    sofort = str(config.get(f"wb{wb_id}_sofort", legacy_sofort)).strip().lower() in ("1", "true", "yes")
+    return hours > 0 or sofort
+
+
+def _validate_candidate_plan(path, wb_id=None):
+    data = _candidate_read_private_json(path)
+    if not isinstance(data, list) or len(data) > 10000:
+        raise ValueError("candidate_plan_invalid")
+    previous = None
+    seen = set()
+    has_live_slot = not data
+    now_ts = int(time.time())
+    normalized = []
+    for entry in data:
+        if not isinstance(entry, dict):
+            raise ValueError("candidate_plan_entry_invalid")
+        try:
+            ts = int(entry["ts"])
+            price = float(entry["price_ct"])
+            market_price = float(entry["market_price_ct"])
+            entry_wb = int(entry["wb_id"])
+        except Exception as exc:
+            raise ValueError("candidate_plan_entry_incomplete") from exc
+        if not math.isfinite(price) or not math.isfinite(market_price):
+            raise ValueError("candidate_plan_price_invalid")
+        if entry_wb not in (1, 2) or (wb_id is not None and entry_wb != int(wb_id)):
+            raise ValueError("candidate_plan_wallbox_invalid")
+        if str(entry.get("mode", "")) not in ("auto", "manual"):
+            raise ValueError("candidate_plan_mode_invalid")
+        order = (ts, entry_wb)
+        if previous is not None and order < previous:
+            raise ValueError("candidate_plan_unsorted")
+        if order in seen:
+            raise ValueError("candidate_plan_duplicate")
+        if ts < 0 or ts > now_ts + 14 * 86400:
+            raise ValueError("candidate_plan_timestamp_invalid")
+        if ts + 900 > now_ts:
+            has_live_slot = True
+        previous = order
+        seen.add(order)
+        normalized.append(entry)
+    if data and not has_live_slot:
+        raise ValueError("candidate_plan_stale")
+    return normalized
+
+
+def run_candidate_directory(candidate_dir):
+    """Erzeugt und prüft einen Plan vollständig in einem privaten Transaktionslauf."""
+    global RAMDISK_DIR, V4_CONFIG_FILE, CONFIG_FILE, INSTALL_DIR, _CANDIDATE_MODE
+
+    directory = _candidate_private_directory(candidate_dir)
+    request_path = os.path.join(directory, _CANDIDATE_REQUEST_FILE)
+    config_path = os.path.join(directory, _CANDIDATE_CONFIG_FILE)
+    result_path = os.path.join(directory, _CANDIDATE_RESULT_FILE)
+    request = _candidate_read_private_json(request_path, max_bytes=65536)
+    if not isinstance(request, dict) or request.get("schema") != _CANDIDATE_SCHEMA:
+        raise ValueError("candidate_request_schema_invalid")
+    operation = str(request.get("operation", ""))
+    if operation not in ("plan", "clear", "preserve"):
+        raise ValueError("candidate_operation_invalid")
+    raw_config = _candidate_read_private_json(config_path)
+    config = _validate_candidate_config(raw_config)
+    required = request.get("require_plan", [])
+    if not isinstance(required, list) or any(int(value) not in (1, 2) for value in required):
+        raise ValueError("candidate_required_plan_invalid")
+    required = sorted(set(int(value) for value in required))
+    derived_required = [wb_id for wb_id in (1, 2) if _candidate_manual_plan_required(config, wb_id)]
+    if required != derived_required:
+        raise ValueError("candidate_required_plan_mismatch")
+
+    previous_globals = (RAMDISK_DIR, V4_CONFIG_FILE, CONFIG_FILE, INSTALL_DIR, _CANDIDATE_MODE)
+    try:
+        RAMDISK_DIR = directory
+        V4_CONFIG_FILE = config_path
+        CONFIG_FILE = config_path
+        INSTALL_DIR = directory
+        _CANDIDATE_MODE = True
+
+        if operation == "clear":
+            for filename in _CANDIDATE_PLAN_FILES:
+                path = os.path.join(directory, filename)
+                if os.path.exists(path):
+                    os.remove(path)
+        elif operation == "plan":
+            if required:
+                epex_path = os.path.join(directory, "epex_daten.json")
+                epex = _candidate_read_private_json(epex_path)
+                if not isinstance(epex, list) or not epex:
+                    raise ValueError("candidate_market_data_missing")
+            # Die Kandidatenkonfiguration wird nach allen kopierten Kontinuitätseingaben geschrieben.
+            # Erneutes Berühren verhindert, dass ein stale kopierter Zeitplan den Freshness-Check gewinnt.
+            now_ns = time.time_ns()
+            os.utime(config_path, ns=(now_ns, now_ns))
+            generate_native_charging_schedule(config)
+        # preserve prüft ausschließlich und lässt kopierte Pläne byteidentisch.
+
+        final_raw_config = _candidate_read_private_json(config_path)
+        _validate_candidate_config(final_raw_config)
+        plans = {}
+        per_wb = {}
+        for filename in _CANDIDATE_PLAN_FILES:
+            path = os.path.join(directory, filename)
+            if not os.path.exists(path):
+                continue
+            wb_id = 1 if filename.endswith("wb1.json") else 2 if filename.endswith("wb2.json") else None
+            validated = _validate_candidate_plan(path, wb_id=wb_id)
+            plans[filename] = {
+                "sha256": _candidate_sha256(path),
+                "entries": len(validated),
+            }
+            if wb_id is not None:
+                per_wb[wb_id] = validated
+
+        for wb_id in required:
+            filename = f"native_wallbox_schedule_wb{wb_id}.json"
+            if filename not in plans or plans[filename]["entries"] <= 0:
+                raise ValueError("candidate_required_plan_empty_wb%d" % wb_id)
+
+        combined_path = os.path.join(directory, "native_wallbox_schedule.json")
+        expected_combined = sorted(
+            per_wb.get(1, []) + per_wb.get(2, []),
+            key=lambda entry: (int(entry.get("ts", 0)), int(entry.get("wb_id", 1))),
+        )
+        if expected_combined:
+            if not os.path.exists(combined_path):
+                raise ValueError("candidate_combined_plan_missing")
+            actual_combined = _validate_candidate_plan(combined_path)
+            if actual_combined != expected_combined:
+                raise ValueError("candidate_combined_plan_mismatch")
+        elif os.path.exists(combined_path):
+            actual_combined = _validate_candidate_plan(combined_path)
+            if actual_combined:
+                raise ValueError("candidate_combined_plan_unexpected")
+
+        result = {
+            "schema": _CANDIDATE_RESULT_SCHEMA,
+            "success": True,
+            "operation": operation,
+            "config_sha256": _candidate_sha256(config_path),
+            "plans": plans,
+            "generated_at": int(time.time()),
+        }
+        _candidate_atomic_json(result_path, result)
+        return result
+    finally:
+        RAMDISK_DIR, V4_CONFIG_FILE, CONFIG_FILE, INSTALL_DIR, _CANDIDATE_MODE = previous_globals
+
+
+def _candidate_cli(argv=None):
+    parser = argparse.ArgumentParser(description="Validate a private Wallbox planning transaction")
+    parser.add_argument("--candidate-dir", required=True)
+    args = parser.parse_args(argv)
+    result_path = os.path.join(os.path.abspath(args.candidate_dir), _CANDIDATE_RESULT_FILE)
+    try:
+        run_candidate_directory(args.candidate_dir)
+        return 0
+    except Exception as exc:
+        try:
+            directory = _candidate_private_directory(args.candidate_dir)
+            result_path = os.path.join(directory, _CANDIDATE_RESULT_FILE)
+            _candidate_atomic_json(result_path, {
+                "schema": _CANDIDATE_RESULT_SCHEMA,
+                "success": False,
+                "error": str(exc)[:256] or "candidate_failed",
+                "generated_at": int(time.time()),
+            })
+        except Exception:
+            pass
+        logger.error("[Scheduler] Kandidatenplanung fehlgeschlagen: %s", exc)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(_candidate_cli())
 

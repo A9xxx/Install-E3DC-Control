@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Config plausibility checks against live E3DC/RSCP values.
+"""Plausibilitätsprüfung der Konfiguration gegen aktuelle E3DC-/RSCP-Werte.
 
-The validator is intentionally advisory: user inputs keep priority where the
-manager already supports them, but strong deviations from E3DC live values are
-made visible in the WebUI.
+Die Prüfung ist bewusst beratend: Nutzereingaben behalten Vorrang, wo der
+Manager sie bereits unterstützt; starke Abweichungen von aktuellen E3DC-Werten
+werden jedoch in der WebUI deutlich angezeigt.
 """
 
 from __future__ import annotations
@@ -30,6 +30,14 @@ try:
     from .json_cache import atomic_write_on_change as _atomic_write_on_change
 except Exception:  # pragma: no cover - direct script execution fallback
     from json_cache import atomic_write_on_change as _atomic_write_on_change  # type: ignore
+try:
+    from .aux_inverter_contract import effective_contract as _aux_inverter_contract
+except Exception:  # pragma: no cover - direct script execution fallback
+    from aux_inverter_contract import effective_contract as _aux_inverter_contract  # type: ignore
+try:
+    from .pv_forecast_topology import build_pv_forecast_topology
+except Exception:  # pragma: no cover - direct script execution fallback
+    from pv_forecast_topology import build_pv_forecast_topology  # type: ignore
 
 
 RAMDISK = "/var/www/html/ramdisk"
@@ -109,7 +117,7 @@ def _battery_pack_count(live: Dict[str, Any]) -> int:
 
 
 def _normalise_capacity_kwh(live: Dict[str, Any], value: float, key: str) -> Tuple[float, str]:
-    """Normalise E3DC capacity values that are sometimes reported per pack."""
+    """Normalisiert E3DC-Kapazitätswerte, die teilweise je Batteriepack gemeldet werden."""
     pack_count = _battery_pack_count(live)
     if key in {"bat_usable_kwh", "bat_full_cap_kwh", "bat_capacity_kwh"}:
         if pack_count > 1 and 0.1 < value < 5.0:
@@ -229,22 +237,155 @@ def _warning_count(*groups: Dict[str, Dict[str, Any]]) -> int:
     return sum(1 for group in groups for item in group.values() if item.get("severity") == "warning")
 
 
-def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """Return advisory storage config validation.
+def validate_solcast_config(cfg: Optional[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Validiert die nichtgeheime Site-zu-Account-Zuordnung fail-closed."""
+    cfg = {str(k).lower(): v for k, v in (cfg or {}).items()}
+    key_available = {
+        1: bool(str(cfg.get("solcast_api_key") or "").strip()),
+        2: bool(str(cfg.get("solcast_api_key_2") or "").strip()),
+    }
+    legacy_secondary_slot = 2 if key_available[2] else 1
+    result: Dict[str, Dict[str, Any]] = {}
+    for label, resource_key, mapping_key, legacy_slot in (
+        ("FC1", "solcast_resource_id", "solcast_api_slot_fc1", 1),
+        ("FC2", "solcast_resource_id_2", "solcast_api_slot_fc2", legacy_secondary_slot),
+        ("FC3", "solcast_resource_id_3", "solcast_api_slot_fc3", legacy_secondary_slot),
+        ("FC4", "solcast_resource_id_4", "solcast_api_slot_fc4", legacy_secondary_slot),
+    ):
+        resource_configured = bool(str(cfg.get(resource_key) or "").strip())
+        raw_slot = str(cfg.get(mapping_key) or "").strip()
+        explicit = bool(raw_slot)
+        valid_slot = raw_slot in {"1", "2"} if explicit else True
+        effective_slot = int(raw_slot) if valid_slot and explicit else int(legacy_slot)
+        severity = "ok"
+        message = f"{label} nutzt Konto {effective_slot}."
+        if not resource_configured:
+            severity = "info"
+            message = f"{label} ist nicht konfiguriert."
+        elif not valid_slot:
+            severity = "warning"
+            message = f"{label}: Accountslot muss 1 oder 2 sein; M3 bleibt gesperrt."
+        elif not key_available[effective_slot]:
+            severity = "warning"
+            message = f"{label}: Gewähltes Konto {effective_slot} besitzt keinen Schlüssel; M3 bleibt gesperrt."
+        result[mapping_key] = _entry(
+            key=mapping_key,
+            label=f"Solcast {label} Konto",
+            unit="-",
+            configured=int(raw_slot) if raw_slot in {"1", "2"} else None,
+            live_value=None,
+            live_key=None,
+            effective=effective_slot if valid_slot else None,
+            source="user" if explicit else "legacy_default",
+            severity=severity,
+            message=message,
+        )
+    return result
 
-    Source order:
-    - charge/discharge/capacity: valid user input -> RSCP live -> project default
-    - emergency reserve: E3DC live reserve is the safety floor; configured value
-      is only a fallback/additional floor and must not undercut RSCP.
+
+def validate_pv_forecast_topology_config(cfg: Optional[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Projiziert den typisierten Topologievertrag in die Config-Diagnose."""
+
+    cfg = {str(k).lower(): v for k, v in (cfg or {}).items()}
+    contract = build_pv_forecast_topology(cfg)
+    result: Dict[str, Dict[str, Any]] = {}
+    by_key = {
+        str(item.get("coupling_key")): item
+        for item in contract.get("resources", [])
+        if isinstance(item, dict) and item.get("coupling_key")
+    }
+    for _label, _forecast_key, _resource_key, coupling_key in (
+        ("FC1", "forecast1", "solcast_resource_id", "pv_forecast_coupling_fc1"),
+        ("FC2", "forecast2", "solcast_resource_id_2", "pv_forecast_coupling_fc2"),
+        ("FC3", "forecast3", "solcast_resource_id_3", "pv_forecast_coupling_fc3"),
+        ("FC4", None, "solcast_resource_id_4", "pv_forecast_coupling_fc4"),
+    ):
+        item = by_key.get(coupling_key)
+        configured = cfg.get(coupling_key) if _has_user_value(cfg, coupling_key) else None
+        if item is None:
+            severity = "info"
+            message = f"{_label} ist nicht als Forecastressource konfiguriert."
+            effective = None
+        elif item.get("coupling") in {"E3DC_DC", "EXTERNAL_AC"}:
+            severity = "ok"
+            effective = item.get("coupling")
+            message = f"{_label} ist eindeutig an {effective} gebunden."
+        else:
+            severity = "warning"
+            effective = None
+            message = f"{_label} ist topologisch nicht gebunden; zusätzlicher DC-Headroom bleibt gesperrt."
+        result[coupling_key] = _entry(
+            key=coupling_key,
+            label=f"PV-Topologie {_label}",
+            unit="-",
+            configured=configured,
+            live_value=None,
+            live_key=None,
+            effective=effective,
+            source="user" if configured is not None else "missing",
+            severity=severity,
+            message=message,
+        )
+
+    external_limit = safe_float(cfg.get("pv_external_ac_inverter_limit_w"), 0.0)
+    external_required = bool(contract.get("external_ac_bound"))
+    result["pv_external_ac_inverter_limit_w"] = _entry(
+        key="pv_external_ac_inverter_limit_w",
+        label="Externer AC-Wechselrichter",
+        unit="W",
+        configured=external_limit if _has_user_value(cfg, "pv_external_ac_inverter_limit_w") else None,
+        live_value=None,
+        live_key=None,
+        effective=external_limit if external_limit > 0.0 else None,
+        source="user" if external_limit > 0.0 else "missing",
+        severity="warning" if external_required and external_limit <= 0.0 else "ok",
+        message=(
+            "Für EXTERNAL_AC fehlt das separate AC-WR-Limit; der Topologiesplit bleibt gesperrt."
+            if external_required and external_limit <= 0.0
+            else "Das externe AC-WR-Limit ist typisiert gebunden."
+            if external_limit > 0.0
+            else "Kein externer AC-Wechselrichter gebunden."
+        ),
+    )
+    e3dc_limit = safe_float(cfg.get("pv_e3dc_dc_inverter_limit_w"), 0.0)
+    result["pv_e3dc_dc_inverter_limit_w"] = _entry(
+        key="pv_e3dc_dc_inverter_limit_w",
+        label="E3DC-DC-Wechselrichterlimit",
+        unit="W",
+        configured=e3dc_limit if _has_user_value(cfg, "pv_e3dc_dc_inverter_limit_w") else None,
+        live_value=None,
+        live_key=None,
+        effective=e3dc_limit if e3dc_limit > 0.0 else None,
+        source="user" if e3dc_limit > 0.0 else "rscp_runtime",
+        severity="ok" if e3dc_limit > 0.0 else "info",
+        message=(
+            "Konfiguriertes E3DC-DC-Limit dient als Fallback zum frischen PVI-Readback."
+            if e3dc_limit > 0.0
+            else "Ohne Konfigwert muss der frische PVI-Readback das E3DC-DC-Limit liefern."
+        ),
+    )
+    return result
+
+
+def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Liefert die beratende Prüfung der Speicherkonfiguration.
+
+    Quellenreihenfolge:
+    - Laden/Entladen/Kapazität: gültige Nutzereingabe -> RSCP-Livewert -> Projektstandard
+    - Notstromreserve: Die E3DC-Livereserve ist die Schutzgrenze. Der konfigurierte
+      Wert dient nur als zusätzlicher Rückfallboden und darf RSCP nicht unterschreiten.
     """
 
     cfg = {str(k).lower(): v for k, v in (cfg or {}).items()}
+    aux_inverter_contract = _aux_inverter_contract(cfg)
     live = live or {}
     now = int(time.time())
     storage: Dict[str, Dict[str, Any]] = {}
     wallbox: Dict[str, Dict[str, Any]] = {}
     consumer: Dict[str, Dict[str, Any]] = {}
     price: Dict[str, Dict[str, Any]] = {}
+    forecast = validate_solcast_config(cfg)
+    forecast.update(validate_pv_forecast_topology_config(cfg))
 
     power_rules = {
         "maximumladeleistung": {
@@ -270,7 +411,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         source = "default"
         effective = float(rule["default"])
         severity = "info"
-        message = "Kein RSCP-Wert verfuegbar; Projekt-Default wirkt."
+        message = "Kein RSCP-Wert verfügbar; der Projektstandard wirkt."
         if configured is not None and math.isfinite(configured) and configured >= 300.0:
             source = "user"
             effective = configured
@@ -282,7 +423,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
                     severity = "warning"
                     message = (
                         "Nutzereingabe weicht deutlich vom E3DC-RSCP-Wert ab. "
-                        "Die Eingabe bleibt aktiv; bitte bewusst pruefen."
+                        "Die Eingabe bleibt aktiv; bitte bewusst prüfen."
                     )
         elif live_value is not None:
             source = "rscp"
@@ -307,7 +448,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     capacity_effective = 15.0
     capacity_source = "default"
     capacity_severity = "info"
-    capacity_message = "Kein RSCP-Kapazitaetswert verfuegbar; Fallback-Wert wirkt."
+    capacity_message = "Kein RSCP-Kapazitätswert verfügbar; der Rückfallwert wirkt."
     if capacity_cfg is not None and math.isfinite(capacity_cfg) and capacity_cfg > 0.1:
         capacity_effective = capacity_cfg
         capacity_source = "user"
@@ -318,8 +459,8 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
             if delta >= 2.0 and rel >= 0.20:
                 capacity_severity = "warning"
                 capacity_message = (
-                    "Nutzbare Speichergroesse weicht deutlich vom E3DC-Wert ab. "
-                    "Die Eingabe bleibt aktiv; bitte Datenblatt/RSCP pruefen."
+                    "Nutzbare Speichergröße weicht deutlich vom E3DC-Wert ab. "
+                    "Die Eingabe bleibt aktiv; bitte Datenblatt/RSCP prüfen."
                 )
     elif capacity_live is not None:
         capacity_effective = capacity_live
@@ -328,7 +469,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         capacity_message = "RSCP-Wert wird als Default/Fallback genutzt."
     storage["speichergroesse"] = _entry(
         key="speichergroesse",
-        label="Speichergroesse",
+        label="Speichergröße",
         unit="kWh",
         configured=capacity_cfg if capacity_cfg is not None and math.isfinite(capacity_cfg) else None,
         live_value=capacity_live,
@@ -351,21 +492,21 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     )
     reserve_source = "rscp" if reserve_live is not None else ("user" if reserve_cfg is not None else "default")
     reserve_severity = "ok" if reserve_live is not None else "info"
-    reserve_message = "E3DC-Notstromreserve ist Sicherheits-Fuehrung; Fallback greift nur, wenn RSCP fehlt."
+    reserve_message = "Die E3DC-Notstromreserve ist die Sicherheitsführung; der Rückfallwert greift nur, wenn RSCP fehlt."
     if reserve_details.get("normalised"):
         reserve_message = (
-            "E3DC-Notstromreserve wurde aus Wh auf die Gesamt-Speicherkapazitaet normalisiert; "
+            "E3DC-Notstromreserve wurde aus Wh auf die Gesamtspeicherkapazität normalisiert; "
             "der Prozent-Rohwert bezieht sich nur auf den Reserve-Kreis."
         )
     if reserve_live is None:
-        reserve_message = "Kein RSCP-Reservewert verfuegbar; Fallback-Reserve wirkt."
+        reserve_message = "Kein RSCP-Reservewert verfügbar; die Rückfallreserve wirkt."
     elif reserve_cfg is not None and math.isfinite(reserve_cfg):
         delta, _rel = _deviation(reserve_cfg, safe_float(reserve_live, 0.0))
         if delta >= 2.0 and not reserve_details.get("normalised"):
             reserve_severity = "warning"
             reserve_message = (
                 "Fallback-Reserve weicht vom E3DC-Wert ab. "
-                "Die Regelung nutzt sicherheitshalber den hoeheren Wert."
+                "Die Regelung nutzt sicherheitshalber den höheren Wert."
             )
     storage["ep_reserve_pct"] = _entry(
         key="ep_reserve_pct",
@@ -414,7 +555,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
             message = "Wallbox-Ladestrom sollte zwischen 6 A und 32 A liegen."
         elif effective > grid_amps:
             severity = "warning"
-            message = "Wallbox-Ladestrom liegt ueber der Hausabsicherung je Phase."
+            message = "Der Wallbox-Ladestrom liegt über der Hausabsicherung je Phase."
         wallbox[key] = _entry(
             key=key,
             label=label,
@@ -513,16 +654,19 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         openwb_pro_phase_wait_configured if openwb_pro_phase_wait_configured is not None else 480.0,
     )
     openwb_pro_phase_wait_severity = "ok"
-    openwb_pro_phase_wait_message = "Phasenwechsel-Wartezeit schützt die openWB Pro plausibel."
+    openwb_pro_phase_wait_message = (
+        "Phasenwechsel-Cooldown und Reservierung sind plausibel; dieser Wert ist kein CP-Dauernachweis."
+    )
     if openwb_pro_phase_wait_configured is not None and openwb_pro_phase_wait_configured < 480.0:
         openwb_pro_phase_wait_severity = "warning"
         openwb_pro_phase_wait_message = (
-            "Phasenwechsel-Wartezeit ist kleiner als 480s; die Regelung hebt diesen Wert "
-            "zum Hardwareschutz automatisch an."
+            "Phasenwechsel-Cooldown ist kleiner als 480s; die Regelung hebt ihn automatisch an. "
+            "Der Cooldown ist kein CP-Dauernachweis; die reale CP-Unterbrechung besitzt einen "
+            "getrennten Schutzwert."
         )
     wallbox["openwb_pro_phase_wait_s"] = _entry(
         key="openwb_pro_phase_wait_s",
-        label="openWB Pro Phasenwartezeit",
+        label="openWB Pro Phasen-Cooldown",
         unit="s",
         configured=openwb_pro_phase_wait_configured,
         live_value=None,
@@ -531,6 +675,38 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         source="user" if openwb_pro_phase_wait_configured is not None else "default",
         severity=openwb_pro_phase_wait_severity,
         message=openwb_pro_phase_wait_message,
+    )
+
+    phase_cp_configured = (
+        safe_float(cfg.get("openwb_pro_phase_cp_interrupt_duration_s"), 480.0)
+        if _has_user_value(cfg, "openwb_pro_phase_cp_interrupt_duration_s")
+        else None
+    )
+    phase_cp_effective = max(
+        480.0,
+        phase_cp_configured if phase_cp_configured is not None else 480.0,
+    )
+    phase_cp_severity = "ok"
+    phase_cp_message = (
+        "Die reale CP-Unterbrechung beim openWB-Pro-Phasenwechsel beträgt mindestens 480s."
+    )
+    if phase_cp_configured is not None and phase_cp_configured < 480.0:
+        phase_cp_severity = "warning"
+        phase_cp_message = (
+            "Der konfigurierte Wert liegt unter 480s und wird zum Hardwareschutz wirksam auf 480s korrigiert. "
+            "Kurze Wake-up-CP-Impulse bleiben davon getrennt."
+        )
+    wallbox["openwb_pro_phase_cp_interrupt_duration_s"] = _entry(
+        key="openwb_pro_phase_cp_interrupt_duration_s",
+        label="openWB Pro Phasen-CP-Unterbrechung",
+        unit="s",
+        configured=phase_cp_configured,
+        live_value=None,
+        live_key=None,
+        effective=phase_cp_effective,
+        source="user" if phase_cp_configured is not None else "default",
+        severity=phase_cp_severity,
+        message=phase_cp_message,
     )
 
     valid_priority = ["heatpump", "wallbox", "heater"]
@@ -544,16 +720,16 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     if _is_enabled(cfg, "heizstab") or _has_user_value(cfg, "heizstab_ip") or _has_user_value(cfg, "shelly_heiz_ip"):
         active_consumers.append("heater")
     priority_severity = "ok"
-    priority_message = "Verbraucherprioritaet ist plausibel."
+    priority_message = "Verbraucherpriorität ist plausibel."
     if sorted(order) != sorted(valid_priority) or len(set(order)) != len(order):
         priority_severity = "warning"
-        priority_message = "Verbraucherprioritaet muss heatpump, wallbox und heater genau einmal enthalten."
+        priority_message = "Verbraucherpriorität muss heatpump, wallbox und heater genau einmal enthalten."
     elif "heatpump" in active_consumers and order[0] != "heatpump":
         priority_severity = "warning"
-        priority_message = "Waermepumpe ist aktiv, steht aber nicht an erster Stelle; Nachlauf/Komfort bewusst pruefen."
+        priority_message = "Die Wärmepumpe ist aktiv, steht aber nicht an erster Stelle; Nachlauf und Komfort bitte bewusst prüfen."
     consumer["consumer_priority_order"] = _entry(
         key="consumer_priority_order",
-        label="Verbraucherprioritaet",
+        label="Verbraucherpriorität",
         unit="",
         configured=order_raw,
         live_value=None,
@@ -638,7 +814,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     octopus_bad_order = tariff == "octopus_heat" and not (cheap < basis < uht)
     price["strompreis_cheap"] = _entry(
         key="strompreis_cheap",
-        label="Guensigpreis",
+        label="Günstigpreis",
         unit="ct/kWh",
         configured=cheap if _has_user_value(cfg, "strompreis_cheap") else None,
         live_value=None,
@@ -647,7 +823,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         source="user" if _has_user_value(cfg, "strompreis_cheap") else "default",
         severity="warning" if octopus_bad_order else "ok",
         message=(
-            "Octopus-Heat-Preise sollten guenstig < normal < Hochpreis sein."
+            "Octopus-Heat-Preise sollten günstig < normal < Hochpreis sein."
             if octopus_bad_order else "Preisfeld ist plausibel."
         ),
     )
@@ -661,7 +837,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         effective=basis,
         source="user" if _has_user_value(cfg, "strompreis_basis") else "default",
         severity="warning" if basis <= 0.0 or octopus_bad_order else "ok",
-        message="Normalpreis wirkt unplausibel." if basis <= 0.0 else ("Octopus-Heat-Preise sollten guenstig < normal < Hochpreis sein." if octopus_bad_order else "Preisfeld ist plausibel."),
+        message="Normalpreis wirkt unplausibel." if basis <= 0.0 else ("Octopus-Heat-Preise sollten günstig < normal < Hochpreis sein." if octopus_bad_order else "Preisfeld ist plausibel."),
     )
     price["strompreis_uht"] = _entry(
         key="strompreis_uht",
@@ -674,7 +850,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         source="user" if _has_user_value(cfg, "strompreis_uht") else "default",
         severity="warning" if octopus_bad_order else "ok",
         message=(
-            "Octopus-Heat-Preise sollten guenstig < normal < Hochpreis sein."
+            "Octopus-Heat-Preise sollten günstig < normal < Hochpreis sein."
             if octopus_bad_order else "Preisfeld ist plausibel."
         ),
     )
@@ -692,7 +868,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
             message = "Preislimit sollte nicht negativ sein."
         elif key in {"price_limit", "price_pause_limit"} and price_order_warning:
             severity = "warning"
-            message = "Boost-Preislimit liegt ueber dem Sperr-Preislimit; Reihenfolge pruefen."
+            message = "Das Boost-Preislimit liegt über dem Sperr-Preislimit; bitte die Reihenfolge prüfen."
         elif key == "cheap_grid_price_limit_ct" and cheap_grid_enabled and not cheap_grid_supported:
             severity = "warning"
             message = "Preis-Boost ist nur für dynamische EPEX-/Börsentarife und Octopus Heat gedacht."
@@ -879,9 +1055,9 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         source="user" if _has_user_value(cfg, "heat_policy_runtime_enable") else "default",
         severity="warning" if heat_policy_runtime else "ok",
         message=(
-            "Aktiv: Zentrale Wärme-Policy darf WP-Starts und Heizstab-Netzboost begrenzen."
+            "Pilot aktiv: zentrale Wärme-Policy darf WP-Starts und Heizstab-Netzboost begrenzen."
             if heat_policy_runtime
-            else "Diagnosemodus: Zentrale Wärme-Policy schreibt Status, die bestehende Regelung bleibt führend."
+            else "Shadow-Betrieb: zentrale Wärme-Policy schreibt Diagnose, bestehende Logik bleibt führend."
         ),
     )
     price["ems_budget_runtime_enable"] = _entry(
@@ -895,9 +1071,9 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         source="user" if _has_user_value(cfg, "ems_budget_runtime_enable") else "default",
         severity="warning" if ems_budget_runtime else "ok",
         message=(
-            "Aktiv: Verbraucherbudgets werden nur nach zentralem Budget-Latch und gültigem Ack freigegeben; bei Datenverlust fällt das System auf AUTO-Freilauf zurück."
+            "Pilot aktiv: produktive Verbraucherbudgets werden nur noch nach zentralem Budget-Latch und gültigem Ack freigegeben; bei Datenverlust fällt das System auf AUTO-Freilauf zurück."
             if ems_budget_runtime
-            else "Diagnosemodus: Budget-Arbitration wird ausgewertet, greift aber nicht in Verbraucherbudgets ein."
+            else "Shadow-Betrieb: Budget-Arbitration wird diagnostiziert, greift aber nicht produktiv in Verbraucherbudgets ein."
         ),
     )
     price["heat_heater_grid_boost_enable"] = _entry(
@@ -1022,19 +1198,36 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         dm_profit_profile_warning = False
     dm_export_enabled = _is_enabled(cfg, "direct_marketing_export_enable")
     dm_grid_charge_enabled = _is_enabled(cfg, "direct_marketing_grid_charge_enable")
-    dm_arbitrage = _is_enabled(cfg, "direct_marketing_arbitrage_enable")
+    dm_arbitrage_requested = bool(
+        _is_enabled(cfg, "direct_marketing_arbitrage_enable")
+        or _is_enabled(cfg, "direct_marketing_arbitrage_experimental_enable")
+        or dm_mode == "arbitrage"
+    )
     dm_pv_store_enabled = str(cfg.get("direct_marketing_pv_store_enable", "1")).strip().lower() in {"1", "true", "yes", "on", "ein"}
     dm_min_margin = safe_float(cfg.get("direct_marketing_min_margin_pct"), 10.0)
     dm_min_profit = safe_float(cfg.get("direct_marketing_min_profit_ct_per_kwh"), 0.0)
-    dm_min_window_profit_eur = safe_float(cfg.get("direct_marketing_min_window_profit_eur"), 0.10)
-    dm_min_export_energy_kwh = safe_float(cfg.get("direct_marketing_min_export_energy_kwh"), 1.0)
-    dm_min_export_window_min = safe_float(cfg.get("direct_marketing_min_export_window_min"), 60.0)
+    dm_min_window_profit_eur = safe_float(cfg.get("direct_marketing_min_window_profit_eur"), 0.25)
+    dm_min_export_energy_kwh = safe_float(cfg.get("direct_marketing_min_export_energy_kwh"), 1.5)
+    dm_min_export_window_min = safe_float(cfg.get("direct_marketing_min_export_window_min"), 15.0)
+    dm_preferred_export_plateau_min = safe_float(cfg.get("direct_marketing_preferred_export_plateau_min"), 60.0)
+    dm_price_plateau_tolerance_ct = safe_float(cfg.get("direct_marketing_price_plateau_tolerance_ct"), 0.75)
+    dm_max_daily_export_kwh = safe_float(cfg.get("direct_marketing_max_daily_export_kwh"), 0.0)
+    dm_deep_cycle_threshold_pct = safe_float(cfg.get("direct_marketing_deep_cycle_threshold_pct"), 20.0)
+    dm_deep_cycle_lcos_factor = safe_float(cfg.get("direct_marketing_deep_cycle_lcos_factor"), 0.5)
     dm_profit_hold = safe_float(cfg.get("direct_marketing_profit_hold_ct_per_kwh"), 0.5)
     dm_margin_hold = safe_float(cfg.get("direct_marketing_margin_hold_pct"), 5.0)
     dm_degradation = safe_float(cfg.get("direct_marketing_degradation_ct_per_kwh"), 4.0)
     dm_efficiency = safe_float(cfg.get("direct_marketing_roundtrip_efficiency_pct"), 85.0)
     dm_fee_ct = safe_float(cfg.get("direct_marketing_fee_ct_per_kwh"), 0.0)
     dm_fee_pct = safe_float(cfg.get("direct_marketing_fee_pct"), 0.0)
+    dm_monthly_fee = safe_float(cfg.get("direct_marketing_monthly_fee_eur"), 0.0)
+    dm_variable_fee_basis = str(cfg.get("direct_marketing_variable_fee_basis", "sell_revenue") or "sell_revenue").strip().lower().replace("-", "_")
+    dm_variable_fee_basis_ct = safe_float(cfg.get("direct_marketing_variable_fee_basis_ct_per_kwh"), 0.0)
+    dm_service_vat_pct = safe_float(cfg.get("direct_marketing_service_vat_pct"), 19.0)
+    dm_input_vat_recoverable = _is_enabled(cfg, "direct_marketing_input_vat_recoverable")
+    dm_installed_kwp = safe_float(cfg.get("direct_marketing_installed_kwp"), 0.0)
+    dm_balancing_cost_estimate = safe_float(cfg.get("direct_marketing_balancing_cost_eur_per_kwp_month"), 0.0)
+    dm_balancing_cost_actual = safe_float(cfg.get("direct_marketing_balancing_cost_actual_eur_per_kwp_month"), 0.0)
     dm_revenue_offset = safe_float(cfg.get("direct_marketing_revenue_offset_ct"), 0.0)
     dm_safety_margin = safe_float(cfg.get("direct_marketing_safety_margin_ct_per_kwh"), 0.0)
     dm_max_export_w = safe_float(cfg.get("direct_marketing_max_export_w"), 0.0)
@@ -1065,37 +1258,17 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     dm_market_value_solar_source = str(cfg.get("direct_marketing_market_value_solar_source", "netztransparenz_hochrechnung_solar") or "netztransparenz_hochrechnung_solar").strip()
     nt_client_id = str(cfg.get("netztransparenz_client_id", "") or "").strip()
     nt_client_secret = str(cfg.get("netztransparenz_client_secret", "") or "").strip()
-    dm_aux_inverter_shelly_override_raw = str(cfg.get("direct_marketing_aux_inverter_shelly_override", "0") or "0").strip().lower()
-    dm_aux_inverter_shelly_override = dm_aux_inverter_shelly_override_raw in {"1", "true", "yes", "on", "ein", "central", "zentral"}
-    dm_aux_inverter_shelly_override_known = dm_aux_inverter_shelly_override_raw in {
-        "0",
-        "false",
-        "no",
-        "off",
-        "aus",
-        "local",
-        "lokal",
-        "1",
-        "true",
-        "yes",
-        "on",
-        "ein",
-        "central",
-        "zentral",
-    }
-    dm_aux_inverter_shelly_ip = str(cfg.get("direct_marketing_aux_inverter_shelly_ip", "") or "").strip()
-    dm_aux_inverter_shelly_ip_valid = bool(
-        dm_aux_inverter_shelly_ip
-        and re.match(r"^(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)$", dm_aux_inverter_shelly_ip)
-    )
-    dm_aux_inverter_shelly_invert = _is_enabled(cfg, "direct_marketing_aux_inverter_shelly_invert")
-    dm_aux_inverter_shelly_dynamic_unblock = str(
-        cfg.get("direct_marketing_aux_inverter_shelly_dynamic_unblock_enable", "0") or "0"
-    ).strip().lower() in {"1", "true", "yes", "on", "ein"}
-    dm_aux_inverter_shelly_unblock_threshold_w = safe_float(
-        cfg.get("direct_marketing_aux_inverter_shelly_unblock_threshold_w"),
+    dm_aux_shelly_override = aux_inverter_contract.get("override") == "central"
+    dm_aux_shelly_ip = str(aux_inverter_contract.get("ip") or "").strip()
+    dm_aux_shelly_ip_valid = bool(dm_aux_shelly_ip)
+    dm_aux_shelly_invert = bool(aux_inverter_contract.get("invert"))
+    dm_aux_shelly_dynamic_unblock = bool(aux_inverter_contract.get("dynamic_unblock_enable"))
+    dm_aux_shelly_unblock_threshold_w = safe_float(
+        aux_inverter_contract.get("unblock_threshold_w"),
         3000.0,
     )
+    dm_aux_migration = aux_inverter_contract.get("migration") or {}
+    dm_aux_contract_blocked = bool(aux_inverter_contract.get("commands_blocked"))
     dm_negative_no_export = _is_enabled(cfg, "direct_marketing_negative_price_no_export")
     dm_low_no_export = _is_enabled(cfg, "direct_marketing_low_price_no_export")
     dm_eeg_enabled = _is_enabled(cfg, "direct_marketing_eeg_enable")
@@ -1202,7 +1375,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         effective=dm_eeg_enabled,
         source="user" if _has_user_value(cfg, "direct_marketing_eeg_enable") else "default",
         severity="ok",
-        message="EEG-/Marktpraemienbewertung ist aktiv." if dm_eeg_enabled else "EEG-/Marktpraemienbewertung ist aus.",
+        message="EEG-/Marktprämienbewertung ist aktiv." if dm_eeg_enabled else "EEG-/Marktprämienbewertung ist aus.",
     )
     eeg_rate_sources = {"manual", "bnetza_archive", "bnetza_current_2026_02"}
     eeg_auto_source = dm_eeg_rate_source in {"bnetza_archive", "bnetza_current_2026_02"}
@@ -1220,7 +1393,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     )
     price["direct_marketing_eeg_rate_source"] = _entry(
         key="direct_marketing_eeg_rate_source",
-        label="DV-EEG-Verguetungsquelle",
+        label="DV-EEG-Vergütungsquelle",
         unit="-",
         configured=dm_eeg_rate_source if _has_user_value(cfg, "direct_marketing_eeg_rate_source") else None,
         live_value=None,
@@ -1229,10 +1402,10 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         source="user" if _has_user_value(cfg, "direct_marketing_eeg_rate_source") else "default",
         severity="warning" if dm_eeg_enabled and (eeg_source_invalid or eeg_auto_date_outside or eeg_archive_date_missing or eeg_archive_date_outside) else "ok",
         message=(
-            "Unbekannte EEG-Verguetungsquelle; bitte manuelle Stufen verwenden."
+            "Unbekannte EEG-Vergütungsquelle; bitte manuelle Stufen verwenden."
             if eeg_source_invalid
             else (
-                "Aktuelle BNetzA-Tabelle gilt nur fuer Inbetriebnahmen vom 2026-02-01 bis 2026-07-31."
+                "Die aktuelle BNetzA-Tabelle gilt nur für Inbetriebnahmen vom 2026-02-01 bis 2026-07-31."
                 if eeg_auto_date_outside
                 else (
                     "BNetzA-Archiv automatisch braucht ein Inbetriebnahmedatum."
@@ -1240,7 +1413,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
                     else (
                         "Eingebettetes BNetzA-Archiv deckt aktuell nur 2018-01-01 bis 2026-07-31 ab."
                         if eeg_archive_date_outside
-                        else "EEG-Verguetungsquelle ist plausibel."
+                        else "EEG-Vergütungsquelle ist plausibel."
                     )
                 )
             )
@@ -1301,7 +1474,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     )
     price["direct_marketing_eeg_tariff_tiers"] = _entry(
         key="direct_marketing_eeg_tariff_tiers",
-        label="DV-EEG-Verguetungsstufen",
+        label="DV-EEG-Vergütungsstufen",
         unit="ct/kWh",
         configured=dm_eeg_tiers if _has_user_value(cfg, "direct_marketing_eeg_tariff_tiers") else None,
         live_value=None,
@@ -1310,8 +1483,8 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         source="user" if _has_user_value(cfg, "direct_marketing_eeg_tariff_tiers") else "default",
         severity="warning" if dm_eeg_enabled and not eeg_auto_source and not dm_eeg_tiers else "ok",
         message=(
-            "EEG-Anlage ist aktiv, aber es sind keine Verguetungsstufen hinterlegt."
-            if dm_eeg_enabled and not eeg_auto_source and not dm_eeg_tiers else "Verguetungsstufen sind hinterlegt, automatisch ableitbar oder EEG ist aus."
+            "EEG-Anlage ist aktiv, aber es sind keine Vergütungsstufen hinterlegt."
+            if dm_eeg_enabled and not eeg_auto_source and not dm_eeg_tiers else "Vergütungsstufen sind hinterlegt, automatisch ableitbar oder EEG ist aus."
         ),
     )
     eeg_grid_export_risk = bool(dm_enabled and dm_eeg_enabled and dm_grid_charge_enabled and dm_export_enabled)
@@ -1326,9 +1499,9 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         source="user" if _has_user_value(cfg, "direct_marketing_eeg_grid_export_risk_ack") else "default",
         severity="warning" if eeg_grid_export_risk and not dm_eeg_grid_export_ack else "ok",
         message=(
-            "EEG-Anlage mit Netzladen und Einspeisung braucht bestaetigtes Mess-/Vertragskonzept; sonst bleiben Arbitrage-Befehle blockiert."
+            "Eine EEG-Anlage mit Netzladen und Einspeisung benötigt ein bestätigtes Mess-/Vertragskonzept; sonst bleiben Arbitrage-Befehle blockiert."
             if eeg_grid_export_risk and not dm_eeg_grid_export_ack
-            else "Kein unbestaetigter EEG-Netzstrom-Export-Risikobetrieb."
+            else "Kein unbestätigter Risikobetrieb mit EEG-Netzstromexport."
         ),
     )
 
@@ -1429,22 +1602,38 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         severity="warning" if dm_market_value_solar_enabled and not nt_client_secret else "ok",
         message="Client-Secret ist gesetzt und wird nicht ausgegeben." if nt_client_secret else "Client-Secret fehlt für den Marktwert-Solar-Monitor.",
     )
+    price["direct_marketing_aux_inverter_shelly_contract_status"] = _entry(
+        key="direct_marketing_aux_inverter_shelly_contract_status",
+        label="DV-Zusatz-WR Konfigurationsvertrag",
+        unit="-",
+        configured=None,
+        live_value=None,
+        live_key=None,
+        effective="blocked" if dm_aux_contract_blocked else "ok",
+        source=str(dm_aux_migration.get("source") or "safe_defaults"),
+        severity="warning" if dm_aux_contract_blocked else "ok",
+        message=(
+            "Widersprüchliche oder unvollständige Zusatz-WR-Konfiguration: Zentralsteuerung bleibt sicher deaktiviert."
+            if dm_aux_contract_blocked
+            else "Kanonischer Zusatz-WR-Vertrag ist vollständig und konfliktfrei."
+        ),
+    )
     price["direct_marketing_aux_inverter_shelly_override"] = _entry(
         key="direct_marketing_aux_inverter_shelly_override",
         label="DV-Zusatz-WR Shelly-Steuerung",
         unit="-",
-        configured=cfg.get("direct_marketing_aux_inverter_shelly_override") if _has_user_value(cfg, "direct_marketing_aux_inverter_shelly_override") else None,
+        configured=str(aux_inverter_contract.get("override") or "local"),
         live_value=None,
         live_key=None,
-        effective="central" if dm_aux_inverter_shelly_override else "local",
-        source="user" if _has_user_value(cfg, "direct_marketing_aux_inverter_shelly_override") else "default",
-        severity="warning" if dm_enabled and not dm_aux_inverter_shelly_override_known else "ok",
+        effective="central" if dm_aux_shelly_override else "local",
+        source=str(dm_aux_migration.get("source") or "default"),
+        severity="warning" if dm_aux_contract_blocked else "ok",
         message=(
-            "Unbekannter Wert; lokales Shelly-Skript bleibt als sicherer Fallback maßgeblich."
-            if dm_enabled and not dm_aux_inverter_shelly_override_known
+            "Konfigurationskonflikt; lokales Shelly-Skript bleibt als sicherer Fallback maßgeblich."
+            if dm_aux_contract_blocked
             else (
                 "E3DC-Control übernimmt die Shelly-Relaissteuerung für den ungeregelten Zusatzwechselrichter."
-                if dm_aux_inverter_shelly_override
+                if dm_aux_shelly_override
                 else "Shelly-Zusatzwechselrichter bleibt lokal/fallback-gesteuert; E3DC-Control sendet keine Relaisbefehle."
             )
         ),
@@ -1453,18 +1642,18 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         key="direct_marketing_aux_inverter_shelly_ip",
         label="DV-Zusatz-WR Shelly-IP",
         unit="-",
-        configured=dm_aux_inverter_shelly_ip if _has_user_value(cfg, "direct_marketing_aux_inverter_shelly_ip") else None,
+        configured="konfiguriert" if dm_aux_shelly_ip else None,
         live_value=None,
         live_key=None,
-        effective=dm_aux_inverter_shelly_ip,
-        source="user" if _has_user_value(cfg, "direct_marketing_aux_inverter_shelly_ip") else "default",
-        severity="warning" if dm_aux_inverter_shelly_override and not dm_aux_inverter_shelly_ip_valid else "ok",
+        effective=bool(dm_aux_shelly_ip),
+        source=str(dm_aux_migration.get("source") or "default"),
+        severity="warning" if dm_aux_shelly_override and not dm_aux_shelly_ip_valid else "ok",
         message=(
             "Zentrale Shelly-Steuerung ist aktiv, aber es ist keine gültige IPv4-Adresse hinterlegt."
-            if dm_aux_inverter_shelly_override and not dm_aux_inverter_shelly_ip_valid
+            if dm_aux_shelly_override and not dm_aux_shelly_ip_valid
             else (
                 "Shelly-IP ist plausibel."
-                if dm_aux_inverter_shelly_ip
+                if dm_aux_shelly_ip
                 else "Keine Shelly-IP hinterlegt; ohne zentrale Freigabe ist das in Ordnung."
             )
         ),
@@ -1473,15 +1662,15 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         key="direct_marketing_aux_inverter_shelly_invert",
         label="DV-Zusatz-WR Shelly-Schütz invertiert",
         unit="-",
-        configured=cfg.get("direct_marketing_aux_inverter_shelly_invert") if _has_user_value(cfg, "direct_marketing_aux_inverter_shelly_invert") else None,
+        configured=bool(dm_aux_shelly_invert),
         live_value=None,
         live_key=None,
-        effective=bool(dm_aux_inverter_shelly_invert),
-        source="user" if _has_user_value(cfg, "direct_marketing_aux_inverter_shelly_invert") else "default",
-        severity="warning" if dm_aux_inverter_shelly_override and dm_aux_inverter_shelly_invert else "ok",
+        effective=bool(dm_aux_shelly_invert),
+        source=str(dm_aux_migration.get("source") or "default"),
+        severity="warning" if dm_aux_shelly_override and dm_aux_shelly_invert else "ok",
         message=(
             "Invertiert aktiv: Shelly-Relais EIN bedeutet Zusatzwechselrichter AUS (NC-Schütz/stromlos geschlossen)."
-            if dm_aux_inverter_shelly_invert
+            if dm_aux_shelly_invert
             else "Normale Logik: Shelly-Relais EIN bedeutet Zusatzwechselrichter EIN."
         ),
     )
@@ -1489,15 +1678,15 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         key="direct_marketing_aux_inverter_shelly_dynamic_unblock_enable",
         label="DV-Zusatz-WR dynamische Last-Freigabe",
         unit="-",
-        configured=cfg.get("direct_marketing_aux_inverter_shelly_dynamic_unblock_enable") if _has_user_value(cfg, "direct_marketing_aux_inverter_shelly_dynamic_unblock_enable") else None,
+        configured=bool(dm_aux_shelly_dynamic_unblock),
         live_value=None,
         live_key=None,
-        effective=bool(dm_aux_inverter_shelly_dynamic_unblock),
-        source="user" if _has_user_value(cfg, "direct_marketing_aux_inverter_shelly_dynamic_unblock_enable") else "default",
-        severity="warning" if dm_aux_inverter_shelly_override and dm_aux_inverter_shelly_dynamic_unblock else "ok",
+        effective=bool(dm_aux_shelly_dynamic_unblock),
+        source=str(dm_aux_migration.get("source") or "default"),
+        severity="warning" if dm_aux_shelly_override and dm_aux_shelly_dynamic_unblock else "ok",
         message=(
             "Dynamische Freigabe ist bewusst aktiviert. Sie nutzt gültige Netz-/Lastwerte und eine 600-s-Schaltsperre; der gewählte Lastwert garantiert allein keinen exportfreien Betrieb."
-            if dm_aux_inverter_shelly_dynamic_unblock
+            if dm_aux_shelly_dynamic_unblock
             else "Sicherer Standard: Bei Negativpreis bleibt der Zusatzwechselrichter statisch gesperrt."
         ),
     )
@@ -1505,28 +1694,83 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         key="direct_marketing_aux_inverter_shelly_unblock_threshold_w",
         label="DV-Zusatz-WR Last-Freigabeschwelle",
         unit="W",
-        configured=cfg.get("direct_marketing_aux_inverter_shelly_unblock_threshold_w") if _has_user_value(cfg, "direct_marketing_aux_inverter_shelly_unblock_threshold_w") else None,
+        configured=dm_aux_shelly_unblock_threshold_w,
         live_value=None,
         live_key=None,
-        effective=dm_aux_inverter_shelly_unblock_threshold_w,
-        source="user" if _has_user_value(cfg, "direct_marketing_aux_inverter_shelly_unblock_threshold_w") else "default",
-        severity="warning" if dm_aux_inverter_shelly_dynamic_unblock and not (100.0 <= dm_aux_inverter_shelly_unblock_threshold_w <= 100000.0) else "ok",
+        effective=dm_aux_shelly_unblock_threshold_w,
+        source=str(dm_aux_migration.get("source") or "default"),
+        severity="warning" if dm_aux_shelly_dynamic_unblock and not (100.0 <= dm_aux_shelly_unblock_threshold_w <= 100000.0) else "ok",
         message=(
             "Last-Freigabeschwelle muss zwischen 100 W und 100.000 W liegen; wirksam werden mindestens 100 W angesetzt."
-            if dm_aux_inverter_shelly_dynamic_unblock and not (100.0 <= dm_aux_inverter_shelly_unblock_threshold_w <= 100000.0)
+            if dm_aux_shelly_dynamic_unblock and not (100.0 <= dm_aux_shelly_unblock_threshold_w <= 100000.0)
             else "Last-Freigabeschwelle ist plausibel; sie muss zur Leistung des Zusatzwechselrichters und der schaltbaren Last passen."
         ),
     )
 
+    variable_fee_bases = {"sell_revenue", "eeg_compensation", "manual"}
+    variable_fee_basis_known = dm_variable_fee_basis in variable_fee_bases
+    variable_fee_basis_ready = bool(
+        dm_variable_fee_basis == "sell_revenue"
+        or (dm_variable_fee_basis == "manual" and dm_variable_fee_basis_ct > 0.0)
+        or (
+            dm_variable_fee_basis == "eeg_compensation"
+            and dm_eeg_enabled
+            and bool(dm_eeg_tiers)
+        )
+    )
+    price["direct_marketing_variable_fee_basis"] = _entry(
+        key="direct_marketing_variable_fee_basis",
+        label="DV-Basis variable Gebühr",
+        unit="-",
+        configured=dm_variable_fee_basis if _has_user_value(cfg, "direct_marketing_variable_fee_basis") else None,
+        live_value=None,
+        live_key=None,
+        effective=dm_variable_fee_basis,
+        source="user" if _has_user_value(cfg, "direct_marketing_variable_fee_basis") else "default",
+        severity="warning" if dm_fee_pct > 0.0 and (not variable_fee_basis_known or not variable_fee_basis_ready) else "ok",
+        message=(
+            "Die variable Gebühr ist aktiv, aber ihre Abrechnungsbasis ist unbekannt oder unvollständig."
+            if dm_fee_pct > 0.0 and (not variable_fee_basis_known or not variable_fee_basis_ready)
+            else "Die variable Gebühr wird auf die konfigurierte Abrechnungsbasis gerechnet."
+        ),
+    )
+    price["direct_marketing_input_vat_recoverable"] = _entry(
+        key="direct_marketing_input_vat_recoverable",
+        label="DV-Vorsteuerabzug",
+        unit="-",
+        configured=cfg.get("direct_marketing_input_vat_recoverable") if _has_user_value(cfg, "direct_marketing_input_vat_recoverable") else None,
+        live_value=None,
+        live_key=None,
+        effective=dm_input_vat_recoverable,
+        source="user" if _has_user_value(cfg, "direct_marketing_input_vat_recoverable") else "default",
+        severity="warning" if dm_enabled and (dm_fee_pct > 0.0 or dm_monthly_fee > 0.0 or dm_balancing_cost_estimate > 0.0) and not _has_user_value(cfg, "direct_marketing_input_vat_recoverable") else "ok",
+        message=(
+            "Bitte steuerlich klären, ob die Umsatzsteuer auf Vermarktungskosten als Vorsteuer abziehbar ist."
+            if dm_enabled and (dm_fee_pct > 0.0 or dm_monthly_fee > 0.0 or dm_balancing_cost_estimate > 0.0) and not _has_user_value(cfg, "direct_marketing_input_vat_recoverable")
+            else ("Vorsteuer wird kostenmindernd berücksichtigt." if dm_input_vat_recoverable else "Umsatzsteuer wird als Kostenbestandteil berücksichtigt.")
+        ),
+    )
+
     dm_numeric_checks = (
-        ("direct_marketing_fee_ct_per_kwh", "DV-Gebuehr fix", dm_fee_ct, "ct/kWh", 0.0, None),
-        ("direct_marketing_fee_pct", "DV-Gebuehr variabel", dm_fee_pct, "%", 0.0, 100.0),
-        ("direct_marketing_revenue_offset_ct", "DV-Erloes-Korrektur", dm_revenue_offset, "ct/kWh", None, None),
+        ("direct_marketing_fee_ct_per_kwh", "DV-Gebühr fix", dm_fee_ct, "ct/kWh", 0.0, None),
+        ("direct_marketing_fee_pct", "DV-Gebühr variabel", dm_fee_pct, "%", 0.0, 100.0),
+        ("direct_marketing_monthly_fee_eur", "DV-Grundgebühr", dm_monthly_fee, "EUR/Monat", 0.0, None),
+        ("direct_marketing_variable_fee_basis_ct_per_kwh", "DV-Manuelle Gebührenbasis", dm_variable_fee_basis_ct, "ct/kWh", 0.0, None),
+        ("direct_marketing_service_vat_pct", "DV-Umsatzsteuer Dienstleistung", dm_service_vat_pct, "%", 0.0, 100.0),
+        ("direct_marketing_installed_kwp", "DV-Abrechnungsleistung", dm_installed_kwp, "kWp", 0.0, None),
+        ("direct_marketing_balancing_cost_eur_per_kwp_month", "DV-Ausgleichskosten Abschlag", dm_balancing_cost_estimate, "EUR/kWp/Monat", 0.0, None),
+        ("direct_marketing_balancing_cost_actual_eur_per_kwp_month", "DV-Ausgleichskosten tatsächlich", dm_balancing_cost_actual, "EUR/kWp/Monat", 0.0, None),
+        ("direct_marketing_revenue_offset_ct", "DV-Erlös-Korrektur", dm_revenue_offset, "ct/kWh", None, None),
         ("direct_marketing_min_margin_pct", "DV-Mindestmarge", dm_min_margin, "%", 0.0, None),
         ("direct_marketing_min_profit_ct_per_kwh", "DV-Mindestgewinn", dm_min_profit, "ct/kWh", 0.0, None),
         ("direct_marketing_min_window_profit_eur", "DV-Mindestfenstergewinn", dm_min_window_profit_eur, "EUR", 0.0, None),
         ("direct_marketing_min_export_energy_kwh", "DV-Mindestexportenergie", dm_min_export_energy_kwh, "kWh", 0.0, None),
-        ("direct_marketing_min_export_window_min", "DV-Mindestexportdauer", dm_min_export_window_min, "min", 0.0, 1440.0),
+        ("direct_marketing_min_export_window_min", "DV-Mindestexportdauer", dm_min_export_window_min, "min", 15.0, 1440.0),
+        ("direct_marketing_preferred_export_plateau_min", "DV-Bevorzugte Plateaudauer", dm_preferred_export_plateau_min, "min", 15.0, 1440.0),
+        ("direct_marketing_price_plateau_tolerance_ct", "DV-Preisplateau-Toleranz", dm_price_plateau_tolerance_ct, "ct/kWh", 0.0, 20.0),
+        ("direct_marketing_max_daily_export_kwh", "DV-Tagesexportlimit", dm_max_daily_export_kwh, "kWh/Tag", 0.0, None),
+        ("direct_marketing_deep_cycle_threshold_pct", "DV-Tiefzyklus-Schwelle", dm_deep_cycle_threshold_pct, "%", 0.0, 100.0),
+        ("direct_marketing_deep_cycle_lcos_factor", "DV-Tiefzyklus-LCOS-Faktor", dm_deep_cycle_lcos_factor, "Faktor", 0.0, 5.0),
         ("direct_marketing_profit_hold_ct_per_kwh", "DV-Gewinn-Halteband", dm_profit_hold, "ct/kWh", 0.0, None),
         ("direct_marketing_margin_hold_pct", "DV-Margen-Halteband", dm_margin_hold, "%", 0.0, 50.0),
         ("direct_marketing_degradation_ct_per_kwh", "DV-Degeneration", dm_degradation, "ct/kWh", 0.0, None),
@@ -1552,7 +1796,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         ("direct_marketing_negative_headroom_min_surplus_wh", "DV-Preisfenster-Mindestüberschuss", dm_negative_headroom_min_surplus_wh, "Wh", 0.0, None),
         ("direct_marketing_negative_headroom_buffer_pct", "DV-Preisfenster-Headroom-Puffer", dm_negative_headroom_buffer_pct, "%", 0.0, 50.0),
         ("direct_marketing_low_price_curtail_limit_w", "DV-Billigpreis-Restexport", dm_curtail_limit_w, "W", 0.0, None),
-        ("direct_marketing_eeg_support_years", "DV-EEG-Foerderjahre", dm_eeg_support_years, "Jahre", 0.0, 30.0),
+        ("direct_marketing_eeg_support_years", "DV-EEG-Förderjahre", dm_eeg_support_years, "Jahre", 0.0, 30.0),
     )
     for key, label, value, unit, minimum, maximum in dm_numeric_checks:
         severity = "ok"
@@ -1564,7 +1808,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
                 message = "Wert darf nicht negativ oder unter der Mindestgrenze liegen."
             elif maximum is not None and value > maximum:
                 severity = "warning"
-                message = "Wert liegt ueber der plausiblen Obergrenze."
+                message = "Der Wert liegt über der plausiblen Obergrenze."
             elif key == "direct_marketing_safety_margin_ct_per_kwh" and value < 0.0:
                 severity = "warning"
                 message = "Negative Korrektur macht die Regelung aggressiver; Mindestmarge bleibt als Schutz aktiv."
@@ -1623,17 +1867,24 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
 
     price["direct_marketing_arbitrage_enable"] = _entry(
         key="direct_marketing_arbitrage_enable",
-        label="DV-Arbitrage-Scharfschalter",
+        label="DV-Arbitrage",
         unit="-",
-        configured=cfg.get("direct_marketing_arbitrage_enable") if _has_user_value(cfg, "direct_marketing_arbitrage_enable") else None,
+        configured=(
+            cfg.get("direct_marketing_arbitrage_enable")
+            if _has_user_value(cfg, "direct_marketing_arbitrage_enable")
+            else cfg.get("direct_marketing_arbitrage_experimental_enable")
+            if _has_user_value(cfg, "direct_marketing_arbitrage_experimental_enable")
+            else None
+        ),
         live_value=None,
         live_key=None,
-        effective=dm_arbitrage,
-        source="user" if _has_user_value(cfg, "direct_marketing_arbitrage_enable") else "default",
-        severity="warning" if dm_enabled and dm_mode == "arbitrage" and not dm_arbitrage else "ok",
+        effective=False,
+        source="user" if dm_arbitrage_requested else "default",
+        severity="warning" if dm_arbitrage_requested else "ok",
         message=(
-            "Arbitrage ist gewaehlt, aber die zusaetzliche Sicherheitsfreigabe ist aus."
-            if dm_enabled and dm_mode == "arbitrage" and not dm_arbitrage else "Arbitrage-Sicherheitsfreigabe ist plausibel."
+            "Arbitrage ist in 5.4.0 nicht freigegeben; vorhandene Altwerte bleiben erhalten, aber wirkungslos."
+            if dm_arbitrage_requested
+            else "Arbitrage ist in 5.4.0 nicht freigegeben."
         ),
     )
     price["direct_marketing_export_enable"] = _entry(
@@ -1676,7 +1927,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
             effective=value,
             source="user" if _has_user_value(cfg, key) else "default",
             severity="warning" if dm_enabled and not value else "ok",
-            message="Schutz ist aktiv." if value else "Schutz ist aus; Verkauf in unguenstigen Preisfenstern waere spaeter moeglich.",
+            message="Schutz ist aktiv." if value else "Schutz ist aus; ein Verkauf in ungünstigen Preisfenstern wäre später möglich.",
         )
     price["direct_marketing_low_price_curtail_enable"] = _entry(
         key="direct_marketing_low_price_curtail_enable",
@@ -1694,7 +1945,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         ),
     )
 
-    warnings = _warning_count(storage, wallbox, consumer, price)
+    warnings = _warning_count(storage, wallbox, consumer, price, forecast)
     return {
         "ts": now,
         "version": 2,
@@ -1707,6 +1958,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         "wallbox": wallbox,
         "consumer": consumer,
         "price": price,
+        "forecast": forecast,
     }
 
 

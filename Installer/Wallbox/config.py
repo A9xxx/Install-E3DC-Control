@@ -15,6 +15,9 @@ from logging.handlers import RotatingFileHandler
 _INSTALLER_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _INSTALLER_DIR not in sys.path:
     sys.path.insert(0, _INSTALLER_DIR)
+_REPO_ROOT = os.path.dirname(_INSTALLER_DIR)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 try:
     from quiet_logging import install_quiet_info_filter
@@ -28,13 +31,13 @@ try:
     from json_cache import atomic_write_on_change, file_signature, read_json_cached
 except ModuleNotFoundError:
     from Installer.json_cache import atomic_write_on_change, file_signature, read_json_cached
+from Installer.utils import get_paths
 
 # ---------------------------------------------------------------------------
 # Pfade (dynamisch, funktioniert auf Bare-Metal und in Docker)
 # ---------------------------------------------------------------------------
-INSTALL_DIR = "/home/pi/E3DC-Control"
-if not os.path.exists(INSTALL_DIR):
-    INSTALL_DIR = "/var/www/html"  # Fallback Docker
+_PATHS = get_paths()
+INSTALL_DIR = _PATHS["install_path"]
 
 CONFIG_FILE = os.path.join(INSTALL_DIR, "e3dc.config.txt")
 V4_CONFIG_FILE = "/var/www/html/data/e3dc_v4.json"
@@ -69,19 +72,49 @@ if not os.path.exists(LOG_DIR):
 # ---------------------------------------------------------------------------
 # Logger (einmalig aufsetzen; Submodule holen sich Kinder-Logger)
 # ---------------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        RotatingFileHandler(
-            os.path.join(LOG_DIR, "wallbox_manager.log"),
-            maxBytes=2 * 1024 * 1024,
-            backupCount=2,
-            encoding="utf-8",
-        ),
-        logging.StreamHandler()
-    ]
-)
+def _configure_wallbox_logging():
+    """Ergänzt die Wallbox-Handler auch bei bereits konfiguriertem Root-Logger.
+
+    ``logging.basicConfig`` ist wirkungslos, sobald der Dienststarter oder ein
+    zuvor importiertes Modul bereits einen Handler angelegt hat. Das führte zu
+    einem stabil laufenden Manager, aber dauerhaft leerer Web-Diagnosedatei.
+    """
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    log_path = os.path.abspath(os.path.join(LOG_DIR, "wallbox_manager.log"))
+    has_file_handler = any(
+        isinstance(handler, RotatingFileHandler)
+        and os.path.abspath(getattr(handler, "baseFilename", "")) == log_path
+        for handler in root_logger.handlers
+    )
+    if not has_file_handler:
+        try:
+            file_handler = RotatingFileHandler(
+                log_path,
+                maxBytes=2 * 1024 * 1024,
+                backupCount=2,
+                encoding="utf-8",
+            )
+            file_handler.setFormatter(formatter)
+            root_logger.addHandler(file_handler)
+        except OSError:
+            # Journal/STDERR bleibt der sichere Diagnosepfad, wenn das
+            # Dateisystem den optionalen Web-Loghandler nicht zulässt.
+            pass
+    has_console_handler = any(
+        isinstance(handler, logging.StreamHandler)
+        and not isinstance(handler, logging.FileHandler)
+        for handler in root_logger.handlers
+    )
+    if not has_console_handler:
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(formatter)
+        root_logger.addHandler(console_handler)
+
+
+_configure_wallbox_logging()
 logger = logging.getLogger("WallboxManager")
 install_quiet_info_filter(
     logger,
@@ -215,7 +248,7 @@ def _load_config_uncached():
                         if '//' in s: s = s.split('//')[0]
                         if '#' in s: s = s.split('#')[0]
                         return s.strip()
-                        
+
                     # PHP Speichert manchmal keys verschachtelt unter {"config": {"key": "val"}}
                     for k, v in v4_data.items():
                         if isinstance(v, dict):

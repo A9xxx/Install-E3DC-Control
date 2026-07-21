@@ -6,6 +6,7 @@ import time
 import json
 import logging
 import re
+import stat
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -16,11 +17,14 @@ from datetime import datetime, timedelta, timezone
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
+REPO_ROOT = os.path.dirname(SCRIPT_DIR)
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 try:
+    from Installer.utils import get_paths as _get_paths
+except ImportError:  # pragma: no cover - package-less compatibility
     from utils import get_paths as _get_paths
-    _p = _get_paths()
-except Exception:
-    _p = {'install_path': '/home/pi/Install', 'ramdisk_dir': '/var/www/html/ramdisk', 'data_dir': '/var/www/html/data'}
+_p = _get_paths()
 try:
     from runtime_logging import configure_service_logger
 except ImportError:  # pragma: no cover - Paketimport
@@ -134,6 +138,149 @@ def write_json_atomic(path, payload, indent=None):
         json.dump(payload, f, indent=indent)
     os.replace(temp_file, path)
 
+
+MARKET_CONSUMERS = ("battery", "wallbox", "heatpump", "heater")
+
+
+def _path_is_within(path, base_dir):
+    """Liefert nur dann True, wenn der Pfad unterhalb des erwarteten Laufzeitverzeichnisses liegt."""
+    try:
+        path_real = os.path.realpath(os.path.abspath(path))
+        base_real = os.path.realpath(os.path.abspath(base_dir))
+        return os.path.commonpath((path_real, base_real)) == base_real
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def market_safety_context(config):
+    """Enges Fail-closed-Gate für Preisartefakte ohne Installationsresolver."""
+    if not isinstance(config, dict) or not config:
+        return False, "config_unavailable"
+    if not os.path.isabs(RAMDISK_DIR) or not os.path.isabs(DATA_DIR):
+        return False, "runtime_path_not_absolute"
+    if not os.path.isdir(RAMDISK_DIR) or not os.path.isdir(DATA_DIR):
+        return False, "runtime_directory_missing"
+    if not os.path.isfile(V4_CONFIG_FILE):
+        return False, "config_file_missing"
+    try:
+        config_info = os.lstat(V4_CONFIG_FILE)
+    except OSError:
+        return False, "config_file_unreadable"
+    if not stat.S_ISREG(config_info.st_mode) or config_info.st_nlink != 1:
+        return False, "config_file_not_regular"
+
+    for path in (EPEX_OUTPUT_FILE, ECO_SCORE_FILE, PRICE_BOOST_PLAN_FILE, MARKET_VALUE_SOLAR_FILE):
+        if not _path_is_within(path, RAMDISK_DIR):
+            return False, "ramdisk_path_outside_context"
+    for path in (V4_CONFIG_FILE, EPEX_CACHE_FILE, MARKET_VALUE_SOLAR_CACHE_FILE):
+        if not _path_is_within(path, DATA_DIR):
+            return False, "data_path_outside_context"
+    if not os.access(RAMDISK_DIR, os.W_OK) or not os.access(DATA_DIR, os.W_OK):
+        return False, "runtime_directory_not_writable"
+    return True, ""
+
+
+def _evaluate_market_safety_gate(config, safety_gate=None):
+    gate = safety_gate or market_safety_context
+    try:
+        result = gate(config)
+    except Exception:
+        return False, "safety_gate_error"
+    if isinstance(result, tuple) and len(result) >= 2:
+        return bool(result[0]), str(result[1] or "")
+    if result is True:
+        return True, ""
+    return False, "safety_context_invalid"
+
+
+def disabled_market_plan(config, reason, now_ms=None):
+    """Erstellt bei ungültigen Eingangsdaten den einzig zulässigen Marktvertrag."""
+    tariff = str((config or {}).get("stromtarif_typ", "static")).strip().lower()
+    supported = tariff in ("tibber", "awattar", "dynamic", "epex", "octopus_heat")
+    return {
+        "ts": int(time.time() * 1000) if now_ms is None else int(now_ms),
+        "enabled": False,
+        "supported": supported,
+        "unsupported_reason": "" if supported else "Preis-Boost ist nur für EPEX-/Börsentarife und Octopus Heat",
+        "active": False,
+        "context_valid": False,
+        "release_valid": False,
+        "disabled_reason": str(reason or "market_input_invalid"),
+        "price_limit_ct": None,
+        "min_duration_min": None,
+        "active_window": None,
+        "windows": [],
+        "allow": {consumer: False for consumer in MARKET_CONSUMERS},
+        "consumer_releases": {consumer: False for consumer in MARKET_CONSUMERS},
+        "limits": {},
+    }
+
+
+def publish_disabled_market_state(config, reason):
+    """Ersetzt alle verbraucherseitigen Marktartefakte atomar durch einen gesperrten Zustand."""
+    if (
+        not os.path.isabs(RAMDISK_DIR)
+        or not os.path.isdir(RAMDISK_DIR)
+        or not os.access(RAMDISK_DIR, os.W_OK)
+        or any(not _path_is_within(path, RAMDISK_DIR) for path in (
+            EPEX_OUTPUT_FILE,
+            ECO_SCORE_FILE,
+            PRICE_BOOST_PLAN_FILE,
+        ))
+    ):
+        raise OSError("consumer-facing market paths are not safe for closure")
+    plan = disabled_market_plan(config, reason)
+    # Der Plan wird zuerst gesperrt, damit ein Teilschreibvorgang nie eine alte Freigabe behält.
+    write_json_atomic(PRICE_BOOST_PLAN_FILE, plan, indent=2)
+    write_json_atomic(ECO_SCORE_FILE, [], indent=2)
+    write_json_atomic(EPEX_OUTPUT_FILE, [], indent=2)
+    update_market_value_solar_monitor(config or {}, [])
+    return plan
+
+
+def publish_market_state(config, data, safety_gate=None, cache_write=True, source="provider"):
+    """Prüft und veröffentlicht einen vollständigen Marktstatus und erhält den gültigen Normalpfad."""
+    context_valid, context_reason = _evaluate_market_safety_gate(config, safety_gate)
+    if not context_valid:
+        return False, [], publish_disabled_market_state(config, context_reason), context_reason
+    if not price_data_has_future_slots(data, min_horizon_s=900):
+        reason = "price_data_missing_or_stale"
+        return False, [], publish_disabled_market_state(config, reason), reason
+
+    scores = generate_eco_score(data, config)
+    if not isinstance(scores, list) or not scores:
+        reason = "eco_score_empty"
+        return False, [], publish_disabled_market_state(config, reason), reason
+
+    boost_plan = generate_price_boost_plan(data, scores, config)
+    if not isinstance(boost_plan, dict):
+        reason = "price_plan_invalid"
+        return False, [], publish_disabled_market_state(config, reason), reason
+
+    # Schließt eine ältere Freigabe, bevor die zugehörigen Datendateien ersetzt
+    # werden. Der endgültige Plan wird bewusst zuletzt veröffentlicht.
+    write_json_atomic(PRICE_BOOST_PLAN_FILE, disabled_market_plan(config, "publishing"), indent=2)
+    try:
+        write_json_atomic(EPEX_OUTPUT_FILE, data)
+        write_json_atomic(ECO_SCORE_FILE, scores, indent=2)
+        if cache_write:
+            persist_price_cache(data)
+        boost_plan = dict(boost_plan)
+        boost_plan["context_valid"] = True
+        boost_plan["release_valid"] = True
+        boost_plan["source_status"] = str(source or "provider")
+        boost_plan["consumer_releases"] = {
+            consumer: bool(boost_plan.get("enabled") and boost_plan.get("active")
+                           and (boost_plan.get("allow") or {}).get(consumer, False))
+            for consumer in MARKET_CONSUMERS
+        }
+        write_json_atomic(PRICE_BOOST_PLAN_FILE, boost_plan, indent=2)
+        update_market_value_solar_monitor(config, data)
+    except Exception:
+        publish_disabled_market_state(config, "market_publish_error")
+        raise
+    return True, scores, boost_plan, ""
+
 def price_data_has_future_slots(data, min_horizon_s=3600):
     if not isinstance(data, list):
         return False
@@ -187,7 +334,11 @@ def persist_price_cache(data):
     except Exception as e:
         logger.warning(f"EPEX-Cache konnte nicht geschrieben werden: {e}")
 
-def restore_cached_prices(config):
+def restore_cached_prices(config, safety_gate=None):
+    context_valid, context_reason = _evaluate_market_safety_gate(config, safety_gate)
+    if not context_valid:
+        publish_disabled_market_state(config, context_reason)
+        return False
     if price_output_is_fresh():
         return False
     if not os.path.exists(EPEX_CACHE_FILE):
@@ -202,18 +353,34 @@ def restore_cached_prices(config):
         logger.warning("EPEX-Cache ist zu alt und wird nicht wiederhergestellt.")
         return False
 
-    write_json_atomic(EPEX_OUTPUT_FILE, data)
-    scores = generate_eco_score(data, config)
-    if scores:
-        write_json_atomic(ECO_SCORE_FILE, scores, indent=2)
-    boost_plan = generate_price_boost_plan(data, scores, config)
-    write_json_atomic(PRICE_BOOST_PLAN_FILE, boost_plan, indent=2)
-    update_market_value_solar_monitor(config, data)
+    published, _scores, _boost_plan, reason = publish_market_state(
+        config,
+        data,
+        safety_gate=safety_gate,
+        cache_write=False,
+        source="cache",
+    )
+    if not published:
+        logger.warning("EPEX-Cache wurde aus Sicherheitsgruenden verworfen: %s", reason)
+        return False
     logger.warning(
         "Nutze letzten gueltigen EPEX-Cache (%d Eintraege), weil Live-Abruf fehlgeschlagen ist.",
         len(data),
     )
     return True
+
+
+def recover_or_disable_market(config, safety_gate=None):
+    """Nutzt einen gültigen Cache oder schließt alle veralteten Marktfreigaben explizit."""
+    if safety_gate is None:
+        if restore_cached_prices(config):
+            return True
+    elif restore_cached_prices(config, safety_gate=safety_gate):
+        return True
+    context_valid, context_reason = _evaluate_market_safety_gate(config, safety_gate)
+    reason = "provider_and_cache_unavailable" if context_valid else context_reason
+    publish_disabled_market_state(config, reason)
+    return False
 
 def load_v4_config():
     config = {}
@@ -223,7 +390,7 @@ def load_v4_config():
                 config = json.load(f)
         except Exception as e:
             logger.error(f"Fehler beim Lesen der V4 Config: {e}")
-            
+
     # Legacy Fallback für Benutzer, die das V4 UI noch nicht gespeichert haben
     legacy_stromtarif_typ = None
     if os.path.exists(os.path.join(INSTALL_DIR, "e3dc.config.txt")):
@@ -237,10 +404,10 @@ def load_v4_config():
                             legacy_stromtarif_typ = "tibber"
         except Exception as e:
             logger.warning(f"Feature Fallback: e3dc.config.txt konnte nicht gelesen werden: {e}")
-            
+
     if legacy_stromtarif_typ and "stromtarif_typ" not in config:
         config["stromtarif_typ"] = legacy_stromtarif_typ
-        
+
     return config
 
 def fetch_awattar_data():
@@ -837,24 +1004,24 @@ def generate_eco_score(price_data, config):
     """Generates market-based Eco-Score data plus the user's billing price."""
     if not price_data:
         return {}
-        
+
     now_ms = time.time() * 1000
-    
+
     # Extract prices for the next 48 hours to fully cover day-ahead auctions
     future_prices = []
     for d in price_data:
         if d["start_timestamp"] >= (now_ms - 3600*1000) and d["start_timestamp"] < (now_ms + 48*3600*1000):
             future_prices.append(d)
-            
+
     if not future_prices:
         return {}
-        
+
     prices = [p["marketprice"] for p in future_prices]
     min_p = min(prices)
     max_p = max(prices)
     span = max_p - min_p
     if span == 0: span = 1
-        
+
     def safe_float(val, default_val):
         try:
             if val is None or str(val).strip() == "":
@@ -871,31 +1038,31 @@ def generate_eco_score(price_data, config):
     strompreis_uht = safe_float(config.get("strompreis_uht", 32.0), 32.0)
     strompreis_spezial = config.get("strompreis_spezial", "")
     grid_friendly_mode = str(config.get("grid_friendly_mode", "1")).lower() in ["1", "true"]
-    
+
     eco_scores = []
     from datetime import datetime
-    
+
     for d in future_prices:
         ts = int(d["start_timestamp"] / 1000)
         dt = datetime.fromtimestamp(ts)
         hour = dt.hour
-        
+
         # 1. Pure Eco Score (Wann ist der Netz-Strom dreckig / sauber?)
         pure_eco_score = 100.0 - (((d["marketprice"] - min_p) / span) * 100.0)
         if d["marketprice"] < 0: pure_eco_score = 100.0
-        
+
         # 2. Billing Price (Was zahlt der Nutzer?)
         direct_billing_raw = d.get("billing_price_ct")
         if direct_billing_raw is not None and str(direct_billing_raw).strip() != "":
             billing_price = safe_float(direct_billing_raw, d["marketprice"] / 10.0)
         elif stromtarif_typ in ("tibber", "awattar", "dynamic", "epex"):
             # Grobe Schätzung: (Spot-Preis in EUR/MWh / 10) + Steuern + Netz für ct/kWh
-            # Hier reichen uns relative Verhältnisse für den Score. Im V4 UI werden wir 
+            # Hier reichen uns relative Verhältnisse für den Score. Im V4 UI werden wir
             # demnächst die exakten Steueranteile definieren. Für jetzt:
             taxes = safe_float(config.get("awnebenkosten", 15.915), 15.915)
             vat = safe_float(config.get("awmwst", 19), 19.0) / 100.0
             billing_price = (d["marketprice"] / 10.0) * (1.0 + vat) + taxes
-            
+
         elif stromtarif_typ == "octopus_heat":
             if (2 <= hour < 6) or (12 <= hour < 16):
                 billing_price = strompreis_cheap # Low Tarif (LT)
@@ -906,23 +1073,23 @@ def generate_eco_score(price_data, config):
 
         elif stromtarif_typ in ("special", "spezial", "special_tariff"):
             billing_price = special_tariff_price_for_dt(strompreis_spezial, dt, strompreis_basis)
-                
+
         else:
             # Static Tarif
             billing_price = strompreis_basis
-            
+
         # 3. Eco-Score fuer netzdienliche Regelung
         # Kein Cheap-Score: Netzdienlichkeit kommt aus dem Marktpreis,
         # Nutzerkosten bleiben separat in billing_price.
         optimization_score = pure_eco_score
         if stromtarif_typ in ("static", "fix", "fixed", "flat") and not grid_friendly_mode:
             optimization_score = 50.0
-        
+
         # Override rules
         if d["marketprice"] < -50.0:  # Extrem negativ
             optimization_score = 100.0
-            
-        eco_scores.append({
+
+        score_entry = {
             "start_timestamp": d["start_timestamp"],
             "end_timestamp": d["end_timestamp"],
             "market_price": round(d["marketprice"], 2),
@@ -932,8 +1099,26 @@ def generate_eco_score(price_data, config):
             "source_resolution_min": d.get("source_resolution_min"),
             "pure_eco_score": round(pure_eco_score, 1),
             "optimization_score": round(optimization_score, 1)
-        })
-        
+        }
+        direct_market_ct = d.get("direct_marketing_market_price_ct")
+        direct_market_eur_mwh = d.get("direct_marketing_marketprice")
+        if direct_market_ct is not None and str(direct_market_ct).strip() != "":
+            score_entry["direct_marketing_market_price_ct"] = round(
+                safe_float(direct_market_ct, 0.0),
+                5,
+            )
+        if direct_market_eur_mwh is not None and str(direct_market_eur_mwh).strip() != "":
+            score_entry["direct_marketing_marketprice"] = round(
+                safe_float(direct_market_eur_mwh, 0.0),
+                5,
+            )
+        if "direct_marketing_market_price_ct" in score_entry or "direct_marketing_marketprice" in score_entry:
+            score_entry["direct_marketing_price_source"] = d.get("direct_marketing_price_source") or ""
+            score_entry["direct_marketing_price_resolution_min"] = d.get("direct_marketing_price_resolution_min")
+            score_entry["direct_marketing_source_resolution_min"] = d.get("direct_marketing_source_resolution_min")
+            score_entry["direct_marketing_price_available"] = bool(d.get("direct_marketing_price_available", True))
+        eco_scores.append(score_entry)
+
     return eco_scores
 
 def generate_price_boost_plan(price_data, eco_scores, config):
@@ -1078,7 +1263,7 @@ def generate_price_boost_plan(price_data, eco_scores, config):
 
 def run():
     logger.info("Starte EPEX Manager (V4)...")
-    
+
     while True:
         try:
             config = load_v4_config()
@@ -1086,7 +1271,7 @@ def run():
             provider = str(config.get("tariff_provider", "smard")).strip().lower()
             if tariff_type == "tibber":
                 provider = "tibber"
-            
+
             data = None
             smard_data = None
             entsoe_data = None
@@ -1199,7 +1384,7 @@ def run():
                     price_data_window_text(data),
                 )
                 data = None
-                    
+
             if data:
                 direct_market_data = _fetch_direct_marketing_market_data(
                     config,
@@ -1209,16 +1394,20 @@ def run():
                 if direct_market_data:
                     data = apply_direct_marketing_market_overlay(data, direct_market_data, config)
 
+                published, scores, boost_plan, publish_reason = publish_market_state(config, data)
+
                 # 1. Speichere Rohdaten (für C++ Engine & Wallbox Kompatibilität)
-                write_json_atomic(EPEX_OUTPUT_FILE, data)
-                persist_price_cache(data)
+                if not published:
+                    logger.error("Marktfreigabe sicher deaktiviert: %s", publish_reason)
+                    time.sleep(1800)
+                    continue
                 logger.info(f"Spot-Preise gesichert ({len(data)} Einträge).")
-                
+
                 # 2. Generiere den neuen Netzdienlichkeits-Eco-Score (V4 Modul)
-                scores = generate_eco_score(data, config)
+                scores = scores if published else []
                 if scores:
-                    write_json_atomic(ECO_SCORE_FILE, scores, indent=2)
-                    
+                    # Already published atomically by publish_market_state().
+
                     # Logge aktuellen Score
                     now_ms = time.time() * 1000
                     for s in scores:
@@ -1226,10 +1415,7 @@ def run():
                             logger.info(f"Aktueller Optimization-Score: {s['optimization_score']}/100 (Billing: {s['billing_price']} ct/kWh)")
                             break
 
-                boost_plan = generate_price_boost_plan(data, scores, config)
-                write_json_atomic(PRICE_BOOST_PLAN_FILE, boost_plan, indent=2)
-                update_market_value_solar_monitor(config, data)
-                if boost_plan.get("enabled"):
+                if published and boost_plan.get("enabled"):
                     logger.info(
                         "Preis-Boost: %d Fenster unter %.2f ct/kWh%s" % (
                             len(boost_plan.get("windows", [])),
@@ -1237,17 +1423,21 @@ def run():
                             " (jetzt aktiv)" if boost_plan.get("active") else ""
                         )
                     )
-                            
+
             else:
-                if restore_cached_prices(config):
+                if recover_or_disable_market(config):
                     logger.warning("Konnte Spot-Preise nicht live laden; Ramdisk aus EPEX-Cache wiederhergestellt.")
                 else:
-                    update_market_value_solar_monitor(config, [])
+                    # recover_or_disable_market hat bereits einen gesperrten Zustand publiziert.
                     logger.error("Konnte Spot-Preise von keinem Provider laden! Nächster Versuch in 5 Minuten.")
-                
+
         except Exception as e:
             logger.error(f"Unerwarteter Fehler im EPEX Manager Loop: {e}")
-            
+            try:
+                publish_disabled_market_state(locals().get("config", {}), "market_loop_error")
+            except Exception as close_error:
+                logger.critical("Marktfreigabe konnte nicht geschlossen werden: %s", close_error)
+
         # Aktualisiere stündlich (oder falls unglücklich gestartet, alle 30 min probieren, um keine Sprünge zu verpassen)
         # Die Strombörse wird täglich um 14:00 für den nächsten Tag veröffentlicht. Wir polen einfach alle 30 Mins.
         time.sleep(1800)
@@ -1279,7 +1469,8 @@ def install_epex_service(start_services=True):
     if os.path.exists(storage_path):
         _create_service_file("e3dc-storage-simulator", "E3DC Storage Simulator", "storage_simulator.py", "python3", start_service=start_services)
 
-    # 5. Storage Manager. Der aktuelle Regler ist kanonisch storage_manager.py.
+    # 5. Storage Manager. Der aktuelle Regler ist kanonisch storage_manager.py;
+    # der alte Regler bleibt nur als storage_manager_legacy.py im Repository.
     print("\n[5/5] Storage Manager...")
     mgr_path = os.path.join(os.path.dirname(__file__), "storage_manager.py")
     if os.path.exists(mgr_path):
@@ -1291,4 +1482,3 @@ def install_epex_service(start_services=True):
 if __name__ != "__main__":
     from .core import register_command
     register_command("400", "Kern-Dienste & Manager installieren", install_epex_service, sort_order=400, category="Kernsystem & Update")
-

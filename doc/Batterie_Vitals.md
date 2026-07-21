@@ -31,18 +31,18 @@ vitals.php -> vital_stats.py -> rscp_client.py -> E3DC RSCP Port 5033
 - Zell-Drift unter 30 mV ist sehr gut.
 - 30 bis 50 mV ist im Alltag meist unkritisch.
 - 50 bis 100 mV sollte beobachtet werden.
-- Ueber 100 mV kann auf Zellalterung, Balancing oder Messprobleme hinweisen.
+- Über 100 mV kann auf Zellalterung, Balancing oder Messprobleme hinweisen.
 
 ## Fehlerbehebung
 
 Wenn keine Daten erscheinen:
 
-1. RSCP-Zugangsdaten im Config-Editor pruefen.
-2. Port 5033 und AES-Key pruefen.
+1. RSCP-Zugangsdaten im Config-Editor prüfen.
+2. Port 5033 und AES-Key prüfen.
 3. Test auf der Konsole ausfuehren:
 
 ```bash
-/home/pi/.venv_e3dc/bin/python3 /home/pi/Install/Installer/vital_stats.py --once
+<VENV_PATH>/bin/python3 <INSTALL_PATH>/Installer/vital_stats.py --once
 ```
 
 Logs liegen unter:

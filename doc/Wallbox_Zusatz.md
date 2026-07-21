@@ -38,8 +38,8 @@ schreibt sie in Dashboard, Historie, Planung und Hausverbrauchsbereinigung.
 ### Shelly-Messung
 
 ```text
-shelly_wb_ip  = 192.168.178.x
-shelly_wb2_ip = 192.168.178.y
+shelly_wb_ip  = 192.0.2.50
+shelly_wb2_ip = 192.0.2.51
 ```
 
 ### Native Steuerung

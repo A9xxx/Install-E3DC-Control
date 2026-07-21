@@ -1,5 +1,9 @@
 # Ladekurve - technische Dokumentation
 
+> **Quellcode:** `Installer/storage_simulator.py` (Berechnung) ·
+> `Installer/storage_manager.py` und `Installer/storage_parallel_regulator.py`
+> (Regelung)
+>
 > **Stand:** V5.2.2a, aktualisiert am 2026-06-16
 
 Die Ladekurve ist eine regelungsnahe Soll-SoC-Kurve für den laufenden Tag. Sie
@@ -136,7 +140,7 @@ Die Kurvenladung besteht aus drei Größen:
 - verfügbare PV-/Exportreserve: was physikalisch ohne Netzbezug und ohne
   unnötiges Ping-Pong geladen werden kann.
 
-Der Rückstand wird nicht als harter Vollgas-Sprung behandelt.
+Seit 5.0.6 wird der Rückstand nicht mehr als harter Vollgas-Sprung behandelt.
 Der Manager mittelt den Aufholbedarf über ein Zeitfenster, tapert ihn nahe der
 Kurve ab und integriert den sichtbaren Batteriefluss in einen
 `curve_control_soc`. Dadurch reagieren Regler und Anzeige weniger auf

@@ -3,6 +3,7 @@ session_start();
 require_once 'helpers.php';
 
 $v4_config_file_path = '/var/www/html/data/e3dc_v4.json';
+$wizardPathContext = getInstallPaths();
 
 // Wenn Config existiert, wurde Setup bereits abgeschlossen
 if (file_exists($v4_config_file_path)) {
@@ -17,18 +18,26 @@ $data_dir = dirname($v4_config_file_path);
 if (!file_exists($data_dir)) {
     @mkdir($data_dir, 0775, true);
     // Rechte reparieren falls möglich
-    if (function_exists('posix_getpwnam')) @chown($data_dir, posix_getpwnam('pi')['uid']);
+    $wizardOwner = (string)($wizardPathContext['install_user'] ?? '');
+    if ($wizardOwner !== '' && function_exists('posix_getpwnam')) {
+        $wizardAccount = @posix_getpwnam($wizardOwner);
+        if (is_array($wizardAccount)) @chown($data_dir, $wizardAccount['uid']);
+    }
     if (function_exists('posix_getgrnam')) @chgrp($data_dir, posix_getgrnam('www-data')['gid']);
 }
 
-// Formulardaten in Session sammeln
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+// Formulardaten in Session sammeln. Ohne eindeutigen Installationskontext
+// werden weder Konfiguration noch Dienste verändert.
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && empty($wizardPathContext['valid'])) {
+    http_response_code(503);
+    $error = $wizardPathContext['error'] ?? 'Installationskontext fehlt.';
+} elseif ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if (isset($_POST['wizard_data'])) {
         foreach ($_POST['wizard_data'] as $key => $value) {
             $_SESSION['wizard_data'][$key] = trim($value);
         }
     }
-    
+
     if (isset($_POST['next'])) {
         // Validation for step 2 (E3DC IP)
         if ($step === 2 && empty($_SESSION['wizard_data']['server_ip'])) {
@@ -54,37 +63,43 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             "einspeiselimit" => "7.0",
             "speichergroesse" => "15",
             "auto_mode" => "1",
+            "wb_native_type" => "e3dc_auto",
+            "wb1_e3dc_wbchar6_compat_enable" => "1",
             "config_secret_protection_mode" => "standard"
         ];
-        
+
         $final_data = array_merge($defaults, $_SESSION['wizard_data'] ?? []);
-        
+
         // Typkonvertierung von Zahlen
         foreach ($final_data as $k => $v) {
             if (is_numeric($v)) {
                 $final_data[$k] = (strpos($v, '.') !== false) ? floatval($v) : intval($v);
             }
         }
-        
+
         // JSON Speichern
         $json_content = json_encode($final_data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
-        
+
         if (file_put_contents($v4_config_file_path, $json_content)) {
             // Sudo chmod für www-data
             $wizardPaths = getInstallPaths();
-            $wizardInstallUser = preg_replace('/[^A-Za-z0-9_.-]/', '', (string)($wizardPaths['install_user'] ?? 'pi')) ?: 'pi';
+            $wizardInstallUser = !empty($wizardPaths['valid'])
+                ? preg_replace('/[^A-Za-z0-9_.-]/', '', (string)$wizardPaths['install_user'])
+                : '';
             $wizardFileMode = sprintf('%o', e3dcConfigSecretFileModeFromData($final_data));
-            exec("sudo chown " . escapeshellarg($wizardInstallUser . ":www-data") . " " . escapeshellarg($v4_config_file_path) . " && sudo chmod " . escapeshellarg($wizardFileMode) . " " . escapeshellarg($v4_config_file_path));
-            
+            if ($wizardInstallUser !== '') {
+                exec("sudo chown " . escapeshellarg($wizardInstallUser . ":www-data") . " " . escapeshellarg($v4_config_file_path) . " && sudo chmod " . escapeshellarg($wizardFileMode) . " " . escapeshellarg($v4_config_file_path));
+            }
+
             // Jetzt die essenziellen Dienste starten (falls der Wrapper existiert)
-            $wrapper_path = '/home/pi/Install/Installer/service_wrapper.sh';
+            $wrapper_path = $wizardInstallUser !== '' ? (e3dcFindServiceWrapper() ?: '') : '';
             if(file_exists($wrapper_path)) {
                 exec("sudo $wrapper_path restart e3dc-live");
                 exec("sudo $wrapper_path restart e3dc-weather-manager");
                 exec("sudo $wrapper_path restart e3dc-epex-manager");
                 exec("sudo $wrapper_path restart e3dc-storage-simulator");
             }
-            
+
             // Aufräumen und zum Dashboard springen
             unset($_SESSION['wizard_data']);
             header("Location: index.php?setup=success");
@@ -133,7 +148,7 @@ $data = $_SESSION['wizard_data'] ?? [];
             <?php endfor; ?>
         </div>
     </div>
-    
+
     <form method="POST">
         <div class="wizard-body">
             <?php if(isset($error)): ?>
@@ -147,14 +162,14 @@ $data = $_SESSION['wizard_data'] ?? [];
                     <h4>Willkommen zur V4!</h4>
                     <p class="text-muted">Willkommen beim neuen, nativen und autonomen Energiemanagement. Bevor es losgeht, benötigen wir einige Basisinformationen.</p>
                 </div>
-                
+
                 <h6 class="text-info fw-bold mb-3 border-bottom border-secondary pb-2">Allgemeines</h6>
-                
+
                 <div class="form-floating mb-3">
                     <input type="password" class="form-control" id="web_pin" name="wizard_data[web_pin]" placeholder="PIN (Optional)" value="<?= htmlspecialchars($data['web_pin'] ?? '') ?>">
                     <label for="web_pin">Schutz-PIN für dieses Web-Dashboard (Optional)</label>
                 </div>
-                
+
                 <div class="row g-2 mb-3">
                     <div class="col-6">
                         <label class="form-label small text-muted mb-1">Einspeiselimit (kW)</label>
@@ -175,15 +190,15 @@ $data = $_SESSION['wizard_data'] ?? [];
                 </div>
 
                 <div class="form-floating mb-3">
-                    <input type="text" class="form-control" id="server_ip" name="wizard_data[server_ip]" placeholder="192.0.2.50" value="<?= htmlspecialchars($data['server_ip'] ?? '') ?>" required>
-                    <label for="server_ip">IP-Adresse d. E3DC (z.B. 192.0.2.50) *</label>
+                        <input type="text" class="form-control" id="server_ip" name="wizard_data[server_ip]" placeholder="192.0.2.50" value="<?= htmlspecialchars($data['server_ip'] ?? '') ?>" required>
+                        <label for="server_ip">IP-Adresse d. E3DC (z.B. 192.0.2.50) *</label>
                 </div>
-                
+
                 <div class="form-floating mb-3">
                     <input type="text" class="form-control" id="e3dc_user" name="wizard_data[e3dc_user]" placeholder="Email" value="<?= htmlspecialchars($data['e3dc_user'] ?? '') ?>" required>
                     <label for="e3dc_user">E3DC Portal Benutzername (Email) *</label>
                 </div>
-                
+
                 <div class="row g-2 mb-3">
                     <div class="col-6">
                         <div class="form-floating">
@@ -218,13 +233,13 @@ $data = $_SESSION['wizard_data'] ?? [];
                         <input type="text" class="form-control" name="wizard_data[laenge]" placeholder="z.b. 10.448" value="<?= htmlspecialchars($data['laenge'] ?? '') ?>" required>
                     </div>
                 </div>
-                
+
                 <div class="form-floating mb-4">
                     <input type="text" class="form-control" id="forecast1" name="wizard_data[forecast1]" placeholder="35/0/10.0" value="<?= htmlspecialchars($data['forecast1'] ?? '35/0/10.0') ?>" required>
                     <label for="forecast1">String 1: Neigung / Ausrichtung / kWp</label>
                     <div class="form-text mt-1 text-muted">Ausrichtung: Süd=0, Ost=-90, West=+90. Beispiel: 35/0/10.0</div>
                 </div>
-                
+
                 <h6 class="text-success fw-bold mb-3 border-bottom border-secondary pb-2">Dynamischer Stromtarif</h6>
                 <div class="row g-2 mb-3">
                     <div class="col-6">
@@ -250,16 +265,36 @@ $data = $_SESSION['wizard_data'] ?? [];
                     <h4>Smart Home Integration</h4>
                     <p class="text-muted">Wähle aus, welche Erweiterungen vom Energy-Manager gesteuert werden sollen.</p>
                 </div>
-                
+
                 <div class="card bg-body-tertiary border-secondary mb-3">
                     <div class="card-body">
                         <div class="form-check form-switch mb-0 fs-5 d-flex align-items-center">
-                            <input class="form-check-input me-3" type="checkbox" role="switch" id="wb_native_enable" name="wizard_data[wb_native_enable]" value="1" <?= ($data['wb_native_enable'] ?? '') == '1' ? 'checked' : '' ?>>
-                            <label class="form-check-label fw-bold" for="wb_native_enable"><i class="fas fa-charging-station text-warning me-2"></i>Native Wallbox (openWB, go-e)</label>
+                            <input class="form-check-input me-3" type="checkbox" role="switch" id="wb_native_enable" name="wizard_data[wb_native_enable]" value="1" <?= ($data['wb_native_enable'] ?? '') == '1' ? 'checked' : '' ?> onchange="document.getElementById('wallbox_backend_details').style.display = this.checked ? 'block' : 'none'">
+                            <label class="form-check-label fw-bold" for="wb_native_enable"><i class="fas fa-charging-station text-warning me-2"></i>Wallbox-Regelung (E3/DC efy/Easy, openWB, go-e)</label>
+                        </div>
+                        <div id="wallbox_backend_details" class="mt-3 border-top border-secondary pt-3" style="display: <?= ($data['wb_native_enable'] ?? '') == '1' ? 'block' : 'none' ?>;">
+                            <label class="form-label small">Wallbox-Modell / API</label>
+                            <select class="form-select mb-3" name="wizard_data[wb_native_type]" id="wizard_wb_native_type">
+                                <?php $wizardWbType = (string)($data['wb_native_type'] ?? 'e3dc_auto'); ?>
+                                <option value="e3dc_auto" <?= $wizardWbType === 'e3dc_auto' ? 'selected' : '' ?>>E3/DC automatisch (efy / Easy Connect / Multi Connect)</option>
+                                <option value="e3dc_efy" <?= $wizardWbType === 'e3dc_efy' ? 'selected' : '' ?>>E3/DC Wallbox efy</option>
+                                <option value="e3dc_easy_connect" <?= $wizardWbType === 'e3dc_easy_connect' ? 'selected' : '' ?>>E3/DC Easy Connect</option>
+                                <option value="e3dc_multi" <?= $wizardWbType === 'e3dc_multi' ? 'selected' : '' ?>>E3/DC Multi Connect</option>
+                                <option value="openwb" <?= $wizardWbType === 'openwb' ? 'selected' : '' ?>>openWB Controller</option>
+                                <option value="openwb_pro" <?= $wizardWbType === 'openwb_pro' ? 'selected' : '' ?>>openWB Pro</option>
+                                <option value="go-e" <?= $wizardWbType === 'go-e' ? 'selected' : '' ?>>go-eCharger</option>
+                            </select>
+                            <label class="form-label small">E3/DC-Regelbackend</label>
+                            <?php $wizardWbCompat = (string)($data['wb1_e3dc_wbchar6_compat_enable'] ?? '1'); ?>
+                            <select class="form-select" name="wizard_data[wb1_e3dc_wbchar6_compat_enable]">
+                                <option value="1" <?= $wizardWbCompat !== '0' ? 'selected' : '' ?>>Empfohlen: WBchar6-Kompatibilit&auml;tsregelung f&uuml;r Modus und Strom</option>
+                                <option value="0" <?= $wizardWbCompat === '0' ? 'selected' : '' ?>>Nur Status – keine E3/DC-Regelbefehle</option>
+                            </select>
+                            <div class="small text-muted mt-2">Direkte Sun-/Auto-/Abort-, Maximalstrom- und native E3/DC-Phasenbefehle sind nicht freigegeben.</div>
                         </div>
                     </div>
                 </div>
-                
+
                 <div class="card bg-body-tertiary border-secondary mb-3">
                     <div class="card-body">
                         <div class="form-check form-switch mb-2 fs-5 d-flex align-items-center">
@@ -290,17 +325,17 @@ $data = $_SESSION['wizard_data'] ?? [];
                         <div class="small text-muted mt-2">Lokale read-only Statusschalter für Wallbox, PV-Produktion und Netzeinspeisung.</div>
                     </div>
                 </div>
-                
+
             <?php endif; ?>
         </div>
-        
+
         <div class="wizard-footer">
             <?php if($step > 1): ?>
                 <button type="submit" name="prev" class="btn btn-outline-secondary px-4"><i class="fas fa-chevron-left me-2"></i>Zurück</button>
             <?php else: ?>
                 <div></div>
             <?php endif; ?>
-            
+
             <?php if($step < 4): ?>
                 <button type="submit" name="next" class="btn btn-primary px-4 fw-bold shadow-sm">Weiter<i class="fas fa-chevron-right ms-2"></i></button>
             <?php else: ?>

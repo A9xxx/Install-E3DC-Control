@@ -14,6 +14,7 @@ parallel storage regulator.
 from __future__ import annotations
 
 import datetime
+import copy
 import json
 import logging
 import math
@@ -51,8 +52,15 @@ from Wallbox.modes import (  # noqa: E402
     price_limit_ct,
     storage_floor_mode,
 )
+from Wallbox import phase_transition as wallbox_phase_transition_policy  # noqa: E402
 from runtime_logging import configure_service_logger  # noqa: E402
 from config_validator import write_config_validation  # noqa: E402
+from aux_inverter_contract import (  # noqa: E402
+    effective_contract as aux_inverter_effective_contract,
+    migrate_state_files as migrate_aux_inverter_state_files,
+    state_migration_required as aux_inverter_state_migration_required,
+    write_canonical_state as write_aux_inverter_canonical_state,
+)
 from decision_history import write_history_record  # noqa: E402
 from ems_decision_diagnostics import (  # noqa: E402
     build_storage_decision_record,
@@ -65,6 +73,24 @@ from data_models import (  # noqa: E402
     WallboxStatusSnapshot,
     live_power_plausibility,
 )
+try:
+    from Installer.storage_dispatch_contract import (  # noqa: E402
+        build_runtime_overlay,
+        load_validated_canonical_plan_snapshot,
+        ValidatedCanonicalPlanSnapshot,
+        validate_canonical_plan,
+    )
+except ModuleNotFoundError:
+    from storage_dispatch_contract import (  # type: ignore  # noqa: E402
+        build_runtime_overlay,
+        load_validated_canonical_plan_snapshot,
+        ValidatedCanonicalPlanSnapshot,
+        validate_canonical_plan,
+    )
+try:
+    from Installer.storage_dispatch_phase5 import phase5_arbitration_contract  # noqa: E402
+except ModuleNotFoundError:
+    from storage_dispatch_phase5 import phase5_arbitration_contract  # type: ignore  # noqa: E402
 try:
     from Installer.Storage.common import mode_label, safe_float, safe_int  # noqa: E402
 except ModuleNotFoundError:
@@ -194,9 +220,9 @@ OBSERVE_RESERVE_RELEASE_AUTO_STATES = {
 }
 STORAGE_OWNER_CONTRACT_VERSION = 1
 HARD_MODE_GUARD_CONTRACT_VERSION = 1
-AUTO_LIMIT_CONTRACT_VERSION = 1
+AUTO_LIMIT_CONTRACT_VERSION = 5
 CURVE_CONTEXT_CONTRACT_VERSION = 1
-STORAGE_DECISION_PATH_CONTRACT_VERSION = 1
+STORAGE_DECISION_PATH_CONTRACT_VERSION = 7
 MARKET_PATH_CONTRACT_VERSION = 1
 DIRECT_MARKETING_PATH_CONTRACT_VERSION = 1
 DIRECT_MARKETING_POLICY_SCHEMA = "direct_marketing_policy_v1"
@@ -207,7 +233,7 @@ DIRECT_MARKETING_POLICY_ACTIVE_STATES = DIRECT_MARKETING_POLICY_EXPORT_STATES | 
 DIRECT_MARKETING_EXPORT_EXECUTION_SCHEMA = "direct_marketing_export_execution_v1"
 EP_RESERVE_VETO_SIGNATURE = "STORAGE_EP_RESERVE_VETO"
 PREDUMP_PATH_CONTRACT_VERSION = 1
-PROTECTION_PATH_CONTRACT_VERSION = 1
+PROTECTION_PATH_CONTRACT_VERSION = 2
 BUDGET_READINESS_CONTRACT_VERSION = 1
 BUDGET_ARBITRATION_CONTRACT_VERSION = 1
 BUDGET_STABILITY_CONTRACT_VERSION = 1
@@ -238,6 +264,7 @@ LOG_DIR = "/var/www/html/logs"
 V4_CFG = os.path.join(DATA_DIR, "e3dc_v4.json")
 LIVE_F = os.path.join(RAMDISK, "live_data_py.json")
 PLAN_F = os.path.join(RAMDISK, "storage_plan.json")
+DISPATCH_RUNTIME_F = os.path.join(RAMDISK, "storage_dispatch_runtime.json")
 STATE_F = os.path.join(RAMDISK, "storage_manager_state.json")
 WB_F = os.path.join(RAMDISK, "wb_pv_budget.json")
 WB_DIAGNOSTIC_F = os.path.join(RAMDISK, "wb_pv_budget_diagnostics.json")
@@ -259,6 +286,10 @@ DIRECT_MARKETING_AUX_INVERTER_SHELLY_GUARD_F = os.path.join(
     DATA_DIR,
     "direct_marketing_aux_inverter_shelly_guard_state.json",
 )
+DIRECT_MARKETING_AUX_INVERTER_SHELLY_MIGRATION_F = os.path.join(
+    DATA_DIR,
+    "direct_marketing_aux_inverter_shelly_migration.json",
+)
 EPEX_F = os.path.join(RAMDISK, "epex_daten.json")
 DECISION_HISTORY_PREFIX = "storage_decision_history_"
 EMS_REACTION_LATEST_F = os.path.join(RAMDISK, "ems_reaction_latest.json")
@@ -273,6 +304,7 @@ _budget_stability_shadow_state: Dict[str, Any] = {}
 _budget_executor_latch_shadow_state: Dict[str, Any] = {}
 _budget_executor_ack_shadow_state: Dict[str, Any] = {}
 _direct_marketing_aux_inverter_shelly_state: Dict[str, Any] = {}
+_direct_marketing_aux_inverter_migration_failure_latches: Dict[tuple, Dict[str, Any]] = {}
 _JSON_READ_CACHE: Dict[str, Dict[str, Any]] = {}
 _JSON_WRITE_CACHE: Dict[str, Dict[str, Any]] = {}
 _JSON_WRITE_NOISE_KEYS = {
@@ -447,13 +479,31 @@ def storage_auto_limit_contract(
         source_class = "market"
     elif state_l.startswith("pre_discharge") or "pre-dump" in reason_l or "predump" in reason_l:
         source_class = "predump"
-    elif state_l.startswith("parallel_headroom") or any(
-        token in reason_l for token in ("abregel", "notstrom", "schutz", "reserve")
+    elif (
+        state_l in ("parallel_no_data", "parallel_passthrough", "parallel_emergency_auto", "live_stale_auto")
+        or state_l.startswith("hard_mode_guard")
+        or state_l.startswith("live_plausibility")
     ):
         source_class = "protection"
-    elif state_l.startswith("parallel_wb") or "wallbox" in reason_l or "wbminsoc" in reason_l:
+    # Ein typisierter Wallbox-State ist die führende Quelle. Freier
+    # Begründungstext wie "Hausreserve" beschreibt hier nur die zulässige
+    # Entladegrenze und darf den untergeordneten Release nicht nachträglich
+    # als unabhängigen Schutzpfad klassifizieren.
+    elif state_l.startswith("parallel_wb"):
         source_class = "wallbox"
-    elif state_l.startswith("parallel_curve") or "kurve" in reason_l or "korridor" in reason_l:
+    # Auch der typisierte Kurvenzustand ist führend. Ein nachgelagerter
+    # Präsentationstext darf die Quelle nicht zu Wallbox oder Schutz
+    # umklassifizieren (z. B. "Wallbox regelt Ladeleistung" in einer
+    # parallel_curve_auto_hold-Ladegrenze).
+    elif state_l == "parallel_curve_charge_cap" or state_l.startswith("parallel_headroom"):
+        source_class = "protection"
+    elif state_l.startswith("parallel_curve"):
+        source_class = "curve"
+    elif any(token in reason_l for token in ("abregel", "notstrom", "schutz", "reserve")):
+        source_class = "protection"
+    elif "wallbox" in reason_l or "wbminsoc" in reason_l:
+        source_class = "wallbox"
+    elif "kurve" in reason_l or "korridor" in reason_l:
         source_class = "curve"
     elif bool(direct_marketing_active):
         source_class = "direct_marketing_observer"
@@ -704,7 +754,15 @@ def storage_direct_marketing_path_contract(
     state_name, state_l, reason_text, reason_l = _payload_state_reason(payload)
     monitor = payload.get("direct_marketing_monitor") if isinstance(payload.get("direct_marketing_monitor"), dict) else {}
     policy_ctx = direct_marketing_policy_context_from_payload(payload, plan)
-    policy_active = bool(policy_ctx.get("commands_allowed"))
+    policy_gate = {"allowed": True, "reason": "not_applicable"}
+    if policy_ctx.get("present") and isinstance(plan, dict):
+        policy_gate = direct_marketing_policy_executor_gate(
+            direct_marketing_plan(plan),
+            policy_ctx,
+            safe_float(payload.get("ts"), time.time()),
+            plan,
+        )
+    policy_active = bool(policy_ctx.get("commands_allowed") and policy_gate.get("allowed"))
     policy_action = direct_marketing_policy_action(str(policy_ctx.get("target_state") or "")) if policy_ctx.get("present") else ""
     action = str(payload.get("direct_marketing_action") or monitor.get("current_action") or monitor.get("action") or policy_action or "")
     active = bool(_has_direct_marketing_marker(payload, state_l) or policy_active)
@@ -745,9 +803,12 @@ def storage_direct_marketing_path_contract(
     policy_block_reason = str(policy_ctx.get("block_reason") or "")
     if policy_ctx.get("present") and policy_block_reason and not policy_active:
         blocked_reasons.append(policy_block_reason)
+    if policy_ctx.get("present") and not policy_gate.get("allowed"):
+        blocked_reasons.append(str(policy_gate.get("reason") or "policy_executor_gate_blocked"))
     return {
         "contract_version": DIRECT_MARKETING_PATH_CONTRACT_VERSION,
         "active": active,
+        "policy_selected": policy_active,
         "path_name": "direct_marketing",
         "state": state_name,
         "action": action,
@@ -761,6 +822,7 @@ def storage_direct_marketing_path_contract(
         "policy_target_state": policy_ctx.get("target_state") if policy_ctx.get("present") else None,
         "policy_blocked": policy_ctx.get("blocked") if policy_ctx.get("present") else None,
         "policy_block_reason": policy_block_reason if policy_ctx.get("present") else "",
+        "policy_executor_gate": policy_gate if policy_ctx.get("present") else None,
         "policy_export_budget_w": policy_ctx.get("export_budget_w") if policy_ctx.get("present") else 0,
         "policy_charge_budget_w": policy_ctx.get("charge_budget_w") if policy_ctx.get("present") else 0,
         "pv_store_auto_limit_active": pv_store_auto_limit_active,
@@ -827,8 +889,17 @@ def storage_protection_path_contract(
     plan: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Describe safety/fallback storage ownership without becoming a guard."""
-    state_name, state_l, reason_text, reason_l = _payload_state_reason(payload)
+    state_name, state_l, reason_text, _reason_l = _payload_state_reason(payload)
+    priority_l = str(payload.get("priority") or "").lower()
+    control_reason_l = str(payload.get("reason") or payload.get("priority") or "").lower()
     mode_value = safe_int(payload.get("mode"), MODE_AUTO)
+    raw_protected = bool(payload.get("protected"))
+    typed_headroom_protected = bool(
+        state_l == "parallel_headroom_discharge"
+        and mode_value == MODE_DISCH
+        and _contract_bool(payload.get("headroom_discharge_active"))
+    )
+    protected = bool(raw_protected or typed_headroom_protected)
     headroom_active = bool(
         state_l.startswith("parallel_headroom")
         or _contract_bool(payload.get("abregel_active"))
@@ -848,12 +919,13 @@ def storage_protection_path_contract(
     )
     active = bool(
         state_l in ("parallel_no_data", "parallel_passthrough", "parallel_emergency_auto", "live_stale_auto")
+        or priority_l == "safety"
         or headroom_active
         or state_l.startswith("hard_mode_guard")
         or state_l.startswith("live_plausibility")
         or live_glitch
         or any(
-            token in reason_l
+            token in control_reason_l
             for token in (
                 "notstrom",
                 "schutz",
@@ -866,19 +938,23 @@ def storage_protection_path_contract(
                 "hard mode",
             )
         )
-        or (headroom_active and "abregel" in reason_l)
+        or (headroom_active and "abregel" in control_reason_l)
     )
-    if state_l in ("parallel_no_data", "parallel_passthrough") or "no data" in reason_l or "keine daten" in reason_l:
+    if state_l in ("parallel_no_data", "parallel_passthrough") or "no data" in control_reason_l or "keine daten" in control_reason_l:
         protection_class = "no_data"
-    elif state_l.startswith("live_plausibility") or live_glitch or "plausibil" in reason_l or "glitch" in reason_l:
+    elif state_l.startswith("live_plausibility") or live_glitch or "plausibil" in control_reason_l or "glitch" in control_reason_l:
         protection_class = "live_plausibility"
-    elif state_l.startswith("hard_mode_guard") or "hard-mode" in reason_l or "hard mode" in reason_l:
+    elif state_l.startswith("hard_mode_guard") or "hard-mode" in control_reason_l or "hard mode" in control_reason_l:
         protection_class = "hard_mode_guard"
     elif headroom_active:
         protection_class = "headroom"
-    elif state_l == "parallel_emergency_auto" or "notstrom" in reason_l:
+    elif (
+        state_l == "parallel_emergency_auto"
+        or "notstrom" in control_reason_l
+        or (priority_l == "safety" and "reserve" in control_reason_l)
+    ):
         protection_class = "emergency"
-    elif "stale" in reason_l:
+    elif "stale" in control_reason_l:
         protection_class = "stale"
     elif active:
         protection_class = "generic"
@@ -895,7 +971,7 @@ def storage_protection_path_contract(
     veto_reasons: List[str] = []
     if active and protection_class == "no_data" and mode_value != MODE_AUTO:
         veto_reasons.append("no_data_not_auto")
-    if active and mode_value in (MODE_DISCH, MODE_CHRG, MODE_GRID) and not bool(payload.get("protected")):
+    if active and mode_value in (MODE_DISCH, MODE_CHRG, MODE_GRID) and not protected:
         veto_reasons.append("active_mode_unprotected")
     return {
         "contract_version": PROTECTION_PATH_CONTRACT_VERSION,
@@ -905,7 +981,14 @@ def storage_protection_path_contract(
         "protection_class": protection_class,
         "mode": mode_value,
         "mode_name": mode_label(mode_value),
-        "protected": bool(payload.get("protected")),
+        "protected": protected,
+        "raw_protected": raw_protected,
+        "typed_headroom_protected": typed_headroom_protected,
+        "protection_binding": (
+            "typed_headroom_discharge"
+            if typed_headroom_protected
+            else ("explicit_protected" if raw_protected else "none")
+        ),
         "auto_limit_source_class": auto_contract.get("source_class"),
         "auto_limit_command_class": auto_contract.get("command_class"),
         "reason": reason_text,
@@ -2115,6 +2198,298 @@ def storage_budget_runtime_contract_suite(
     }
 
 
+def _direct_marketing_policy_owns_storage_cycle(contract: Dict[str, Any]) -> bool:
+    """Akzeptiert nur eine vollständig ausgewählte, gerichtete DV-Policy als Zyklus-Owner."""
+    gate = contract.get("policy_executor_gate") if isinstance(contract.get("policy_executor_gate"), dict) else {}
+    target_state = str(contract.get("policy_target_state") or "").strip().upper()
+    charge_budget_w = max(0, safe_int(contract.get("policy_charge_budget_w"), 0))
+    export_budget_w = max(0, safe_int(contract.get("policy_export_budget_w"), 0))
+    common = bool(
+        contract.get("active")
+        and contract.get("policy_selected") is True
+        and contract.get("commands_allowed") is True
+        and contract.get("shadow") is False
+        and contract.get("policy_schema") == DIRECT_MARKETING_POLICY_SCHEMA
+        and contract.get("policy_blocked") is False
+        and gate.get("allowed") is True
+    )
+    if not common:
+        return False
+    if target_state == "FORCE_CHARGE_PV":
+        return bool(charge_budget_w > 0 and export_budget_w == 0)
+    if target_state == "FORCE_EXPORT":
+        return bool(export_budget_w > 0 and charge_budget_w == 0)
+    return False
+
+
+def _phase5_decision_only_hold_path_projection(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Bindet einen wirkungslosen HOLD exakt an den Legacy-Hardwareowner."""
+
+    phase5 = (
+        payload.get("storage_dispatch_phase5")
+        if isinstance(payload.get("storage_dispatch_phase5"), dict)
+        else {}
+    )
+    intent = phase5.get("execution_intent") if isinstance(phase5.get("execution_intent"), dict) else {}
+    decision_hold = (
+        phase5.get("decision_only_hold")
+        if isinstance(phase5.get("decision_only_hold"), dict)
+        else {}
+    )
+    translation = phase5.get("translation") if isinstance(phase5.get("translation"), dict) else {}
+    claimed = bool(
+        str(phase5.get("selection_class") or "") == "decision_only_hold"
+        or str(intent.get("class") or "") == "decision_only_hold"
+        or decision_hold.get("active") is True
+    )
+    if not claimed:
+        return {
+            "schema_version": "phase5_decision_only_hold_path_projection_v1",
+            "claimed": False,
+            "valid": False,
+            "blockers": [],
+        }
+
+    blockers: List[str] = []
+
+    def require(condition: bool, code: str) -> None:
+        if not condition and code not in blockers:
+            blockers.append(code)
+
+    def is_exact_zero(value: Any) -> bool:
+        return bool(
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and float(value) == 0.0
+        )
+
+    def is_sha256_id(value: Any) -> bool:
+        text = str(value or "")
+        suffix = text[7:] if text.startswith("sha256:") else ""
+        return bool(len(suffix) == 64 and all(char in "0123456789abcdef" for char in suffix))
+
+    require(phase5.get("schema_version") == "storage_dispatch_phase5_v1", "PHASE5_HOLD_SCHEMA_INVALID")
+    require(phase5.get("selected") is True, "PHASE5_HOLD_NOT_SELECTED")
+    require(phase5.get("executable") is False, "PHASE5_HOLD_EXECUTABLE_CLAIM")
+    require(phase5.get("commands_allowed") is False, "PHASE5_HOLD_COMMANDS_ALLOWED_CLAIM")
+    require(phase5.get("selection_class") == "decision_only_hold", "PHASE5_HOLD_SELECTION_CLASS_INVALID")
+    require(decision_hold.get("active") is True, "PHASE5_HOLD_DECISION_CONTRACT_INACTIVE")
+    require(
+        phase5.get("selected_source") == "canonical_phase5_decision_only_hold",
+        "PHASE5_HOLD_SOURCE_INVALID",
+    )
+    require(str(phase5.get("selected_action") or "").upper() == "HOLD", "PHASE5_HOLD_ACTION_INVALID")
+    require(
+        "selected_power_w" in phase5 and is_exact_zero(phase5.get("selected_power_w")),
+        "PHASE5_HOLD_POWER_NONZERO_OR_MISSING",
+    )
+    require(phase5.get("requested") is False, "PHASE5_HOLD_REQUESTED_CLAIM")
+    require(phase5.get("issued") is False, "PHASE5_HOLD_ISSUED_CLAIM")
+    require(phase5.get("hardware_effect") is False, "PHASE5_HOLD_EFFECT_CLAIM")
+    require(
+        "request" in phase5 and phase5.get("request") is None,
+        "PHASE5_HOLD_REQUEST_PAYLOAD_PRESENT_OR_UNTYPED",
+    )
+    require(
+        "request_attempted_by" in phase5 and phase5.get("request_attempted_by") is None,
+        "PHASE5_HOLD_REQUEST_ATTEMPT_PRESENT_OR_UNTYPED",
+    )
+    require(
+        "power_settings_after_request" in phase5 and phase5.get("power_settings_after_request") is None,
+        "PHASE5_HOLD_POWER_SETTINGS_TRANSACTION_PRESENT_OR_UNTYPED",
+    )
+    require(intent.get("class") == "decision_only_hold", "PHASE5_HOLD_INTENT_CLASS_INVALID")
+    require(intent.get("authorized") is False, "PHASE5_HOLD_INTENT_AUTHORIZED")
+    require(str(intent.get("action") or "").upper() == "HOLD", "PHASE5_HOLD_INTENT_ACTION_INVALID")
+    require(
+        "power_w" in intent and is_exact_zero(intent.get("power_w")),
+        "PHASE5_HOLD_INTENT_POWER_NONZERO_OR_MISSING",
+    )
+    require(intent.get("owner") == "legacy_storage_manager", "PHASE5_HOLD_INTENT_OWNER_INVALID")
+    require(str(translation.get("action") or "").upper() == "HOLD", "PHASE5_HOLD_TRANSLATION_ACTION_INVALID")
+    require(translation.get("translated") is False, "PHASE5_HOLD_TRANSLATION_EFFECT_CLAIM")
+    require(
+        "requested_power_w" in translation
+        and is_exact_zero(translation.get("requested_power_w")),
+        "PHASE5_HOLD_TRANSLATION_POWER_NONZERO_OR_MISSING",
+    )
+    require(is_sha256_id(phase5.get("plan_id")), "PHASE5_HOLD_PLAN_ID_INVALID")
+    require(is_sha256_id(phase5.get("slot_id")), "PHASE5_HOLD_SLOT_ID_INVALID")
+    phase5_ts_ms = safe_int(phase5.get("ts_ms"), 0)
+    payload_ts_ms = int(round(safe_float(payload.get("ts"), 0.0) * 1000.0))
+    require(
+        phase5_ts_ms > 0
+        and payload_ts_ms > 0
+        and abs(phase5_ts_ms - payload_ts_ms) <= 2000,
+        "PHASE5_HOLD_CYCLE_BINDING_INVALID",
+    )
+    return {
+        "schema_version": "phase5_decision_only_hold_path_projection_v1",
+        "claimed": True,
+        "valid": not blockers,
+        "blockers": blockers,
+        "intent_owner": intent.get("owner"),
+        "plan_id": phase5.get("plan_id"),
+        "slot_id": phase5.get("slot_id"),
+    }
+
+
+def _direct_marketing_effectless_no_action_path_projection(
+    payload: Dict[str, Any],
+    direct_marketing_contract: Dict[str, Any],
+    curve_contract: Dict[str, Any],
+    auto_contract: Dict[str, Any],
+    protection_contract: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Trennt einen passiven DV-Monitor vom tatsächlichen Kurvenowner."""
+
+    phase5 = (
+        payload.get("storage_dispatch_phase5")
+        if isinstance(payload.get("storage_dispatch_phase5"), dict)
+        else {}
+    )
+    monitor = (
+        payload.get("direct_marketing_monitor")
+        if isinstance(payload.get("direct_marketing_monitor"), dict)
+        else {}
+    )
+    state_l = str(payload.get("state") or "").strip().lower()
+    action_l = str(
+        payload.get("direct_marketing_action")
+        or monitor.get("current_action")
+        or monitor.get("action")
+        or ""
+    ).strip().lower()
+    monitor_state_l = str(monitor.get("state") or "").strip().lower()
+    passive_actions = {"", "hold", "policy_hold", "normal", "auto", "wait", "waiting"}
+    passive_monitor_states = {"hold", "waiting", "idle", "observe", "shadow"}
+    claimed = bool(
+        direct_marketing_contract.get("active")
+        and state_l.startswith("parallel_curve")
+        and action_l in passive_actions
+        and monitor_state_l in passive_monitor_states
+        and phase5.get("selected") is not True
+    )
+    if not claimed:
+        return {
+            "schema_version": "direct_marketing_effectless_no_action_path_projection_v1",
+            "claimed": False,
+            "valid": False,
+            "blockers": [],
+        }
+
+    blockers: List[str] = []
+
+    def require(condition: bool, code: str) -> None:
+        if not condition and code not in blockers:
+            blockers.append(code)
+
+    def is_exact_zero(value: Any) -> bool:
+        return bool(
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and float(value) == 0.0
+        )
+
+    require(
+        not _direct_marketing_policy_owns_storage_cycle(direct_marketing_contract),
+        "DIRECT_MARKETING_POLICY_OWNS_CYCLE",
+    )
+    require(
+        direct_marketing_contract.get("policy_selected") is False,
+        "DIRECT_MARKETING_POLICY_SELECTION_UNTYPED",
+    )
+    require(
+        max(0, safe_int(direct_marketing_contract.get("policy_charge_budget_w"), 0)) == 0
+        and max(0, safe_int(direct_marketing_contract.get("policy_export_budget_w"), 0)) == 0,
+        "DIRECT_MARKETING_DIRECTIONAL_BUDGET_PRESENT",
+    )
+    require(
+        safe_int(payload.get("mode"), MODE_AUTO) == MODE_AUTO
+        and is_exact_zero(payload.get("val")),
+        "DIRECT_MARKETING_EFFECTLESS_MODE_OR_POWER_INVALID",
+    )
+    require(
+        protection_contract.get("active") is False,
+        "DIRECT_MARKETING_EFFECTLESS_PROTECTION_ACTIVE",
+    )
+    require(
+        curve_contract.get("in_curve_state") is True
+        and curve_contract.get("action_class") in {
+            "auto_limit_hold_zero_charge",
+            "auto_limit_release",
+        },
+        "DIRECT_MARKETING_EFFECTLESS_CURVE_CONTRACT_INVALID",
+    )
+    require(
+        auto_contract.get("active") is True
+        and auto_contract.get("source_class") == "curve"
+        and auto_contract.get("command_class") in {"limit", "release"},
+        "DIRECT_MARKETING_EFFECTLESS_AUTO_CONTRACT_INVALID",
+    )
+    if phase5:
+        require(
+            phase5.get("schema_version") == "storage_dispatch_phase5_v1",
+            "DIRECT_MARKETING_EFFECTLESS_PHASE5_SCHEMA_INVALID",
+        )
+        for key in (
+            "selected",
+            "executable",
+            "commands_allowed",
+            "requested",
+            "issued",
+            "hardware_effect",
+        ):
+            require(
+                phase5.get(key) is False,
+                "DIRECT_MARKETING_EFFECTLESS_PHASE5_%s_CLAIM" % key.upper(),
+            )
+        require(
+            phase5.get("selected_action") in (None, "HOLD")
+            and is_exact_zero(phase5.get("selected_power_w")),
+            "DIRECT_MARKETING_EFFECTLESS_PHASE5_ACTION_OR_POWER_INVALID",
+        )
+        for key in ("request", "request_attempted_by", "power_settings_after_request"):
+            require(
+                key in phase5 and phase5.get(key) is None,
+                "DIRECT_MARKETING_EFFECTLESS_PHASE5_%s_PRESENT_OR_UNTYPED" % key.upper(),
+            )
+    return {
+        "schema_version": "direct_marketing_effectless_no_action_path_projection_v1",
+        "claimed": True,
+        "valid": not blockers,
+        "blockers": blockers,
+        "state": payload.get("state"),
+        "action": action_l or None,
+        "monitor_state": monitor_state_l or None,
+        "plan_id": phase5.get("plan_id") if phase5 else None,
+        "slot_id": phase5.get("slot_id") if phase5 else None,
+    }
+
+
+def _curve_release_is_direct_marketing_subcontract(
+    payload: Dict[str, Any],
+    direct_marketing_contract: Dict[str, Any],
+    curve_contract: Dict[str, Any],
+    auto_contract: Dict[str, Any],
+    protection_contract: Dict[str, Any],
+) -> bool:
+    """Klassifiziert nur eine befehlslose AUTO-Freigabe unter einer ausgewählten DV-Policy."""
+    return bool(
+        _direct_marketing_policy_owns_storage_cycle(direct_marketing_contract)
+        and protection_contract.get("active") is False
+        and curve_contract.get("in_curve_state") is True
+        and curve_contract.get("action_class") == "auto_limit_release"
+        and safe_int(payload.get("mode"), MODE_AUTO) == MODE_AUTO
+        and max(0, safe_int(payload.get("val"), 0)) == 0
+        and auto_contract.get("active") is True
+        and auto_contract.get("release") is True
+        and auto_contract.get("enabled") is False
+        and auto_contract.get("command_class") == "release"
+        and auto_contract.get("source_class") == "curve"
+    )
+
+
 def storage_decision_path_contract(
     payload: Dict[str, Any],
     plan: Optional[Dict[str, Any]] = None,
@@ -2141,6 +2516,36 @@ def storage_decision_path_contract(
     direct_marketing_contract = storage_direct_marketing_path_contract(payload, plan)
     predump_contract = storage_predump_path_contract(payload, plan)
     protection_contract = storage_protection_path_contract(payload, plan)
+    phase5_hold_projection = _phase5_decision_only_hold_path_projection(payload)
+    effectless_phase5_hold = phase5_hold_projection.get("valid") is True
+    effectless_no_action_projection = _direct_marketing_effectless_no_action_path_projection(
+        payload,
+        direct_marketing_contract,
+        curve_contract,
+        auto_contract,
+        protection_contract,
+    )
+    effectless_direct_marketing_no_action = effectless_no_action_projection.get("valid") is True
+    direct_marketing_policy_owns_cycle = bool(
+        not effectless_phase5_hold
+        and _direct_marketing_policy_owns_storage_cycle(direct_marketing_contract)
+    )
+    curve_is_direct_marketing_release_subcontract = bool(
+        not effectless_phase5_hold
+        and _curve_release_is_direct_marketing_subcontract(
+            payload,
+            direct_marketing_contract,
+            curve_contract,
+            auto_contract,
+            protection_contract,
+        )
+    )
+    predump_is_protection_subcontract = bool(
+        state_l == "wallbox_predump_floor_hold"
+        and mode_value == MODE_AUTO
+        and protection_contract.get("active")
+        and predump_contract.get("active")
+    )
     candidates: List[str] = []
     candidate_reasons: Dict[str, str] = {}
 
@@ -2153,15 +2558,27 @@ def storage_decision_path_contract(
         add_candidate("protection", "subcontract")
     if state_l.startswith("manual_override"):
         add_candidate("manual", "state")
-    if bool(direct_marketing_contract.get("active")):
+    if (
+        bool(direct_marketing_contract.get("active"))
+        and not effectless_phase5_hold
+        and not effectless_direct_marketing_no_action
+    ):
         add_candidate("direct_marketing", "subcontract")
     if bool(market_contract.get("active")):
         add_candidate("market_price", "subcontract")
-    if bool(predump_contract.get("active")):
+    if bool(predump_contract.get("active")) and not predump_is_protection_subcontract:
         add_candidate("predump", "subcontract")
     if state_l.startswith("parallel_wb") or bool(payload.get("wbminsoc_pv_charge_active")) or "wbminsoc" in reason_l:
         add_candidate("wallbox_support", "state_or_flag")
-    if state_l.startswith("parallel_curve") or str(payload.get("priority") or "").lower() == "curve":
+    curve_is_headroom_protection_subcontract = bool(
+        state_l == "parallel_curve_charge_cap"
+        and protection_contract.get("active") is True
+        and protection_contract.get("protection_class") == "headroom"
+    )
+    if (
+        state_l.startswith("parallel_curve")
+        or str(payload.get("priority") or "").lower() == "curve"
+    ) and not curve_is_headroom_protection_subcontract and not curve_is_direct_marketing_release_subcontract:
         add_candidate("curve", "state_or_priority")
     if not candidates and mode_value != MODE_AUTO:
         add_candidate("storage_active", "active_rscp_mode")
@@ -2191,21 +2608,93 @@ def storage_decision_path_contract(
     auto_source = str(auto_contract.get("source_class") or "none")
     subordinate_paths: List[str] = []
     veto_reasons: List[str] = []
+    if effectless_phase5_hold and bool(direct_marketing_contract.get("active")):
+        subordinate_paths.append("direct_marketing:phase5_decision_only_hold_diagnostic")
+    if effectless_direct_marketing_no_action and bool(direct_marketing_contract.get("active")):
+        subordinate_paths.append("direct_marketing:effectless_no_action_diagnostic")
+    if phase5_hold_projection.get("claimed") is True and not effectless_phase5_hold:
+        veto_reasons.append("phase5_decision_only_hold_projection_invalid")
+    if (
+        effectless_no_action_projection.get("claimed") is True
+        and not effectless_direct_marketing_no_action
+    ):
+        veto_reasons.append("direct_marketing_effectless_no_action_projection_invalid")
+    if predump_is_protection_subcontract:
+        subordinate_paths.append("predump:wallbox_floor_protection_subcontract")
+    if curve_is_headroom_protection_subcontract:
+        subordinate_paths.append("curve:headroom_protection_subcontract")
+    if curve_is_direct_marketing_release_subcontract:
+        subordinate_paths.append("curve:direct_marketing_auto_release_subcontract")
     if bool(auto_contract.get("active")):
         subordinate_paths.append("auto_limit:%s:%s" % (auto_source, auto_contract.get("command_class") or "unknown"))
         aligned_sources = {expected_auto_source, "auto_limit", "guard", "none"}
+        if predump_is_protection_subcontract:
+            aligned_sources.add("predump")
+        if curve_is_direct_marketing_release_subcontract:
+            aligned_sources.add("curve")
         aligned_sources.discard(None)
         if expected_auto_source and auto_source not in aligned_sources:
             veto_reasons.append("auto_limit_source_mismatch:%s->%s" % (primary_path, auto_source))
     if bool(curve_contract.get("has_curve")) and primary_path != "curve":
         subordinate_paths.append("curve_context:%s" % (curve_contract.get("curve_position") or "unknown"))
+    protection_subordinate_paths = {"wallbox_support", "curve"}
+    if primary_path == "protection":
+        if (
+            "direct_marketing" in candidates
+            and (
+                direct_marketing_contract.get("shadow") is True
+                or direct_marketing_contract.get("commands_allowed") is False
+            )
+        ):
+            protection_subordinate_paths.add("direct_marketing")
+        if (
+            "market_price" in candidates
+            and (
+                market_contract.get("shadow") is True
+                or market_contract.get("commands_allowed") is False
+            )
+        ):
+            protection_subordinate_paths.add("market_price")
+        for path in candidates:
+            if path in protection_subordinate_paths:
+                subordinate_paths.append("%s:protection_override" % path)
     hard_candidates = [
         path for path in candidates
-        if path not in ("e3dc_auto", "storage_active") and path != primary_path
+        if path not in ("e3dc_auto", "storage_active")
+        and path != primary_path
+        and not (primary_path == "protection" and path in protection_subordinate_paths)
     ]
     if hard_candidates:
         veto_reasons.append("multiple_policy_candidates:%s" % ",".join(hard_candidates))
-    if primary_path in ("direct_marketing", "market_price", "predump") and str(owner_contract.get("contract_owner")) == "E3DC_AUTONOM":
+    if effectless_phase5_hold:
+        incompatible_hold_paths = [
+            path
+            for path in candidates
+            if path in {"protection", "manual", "market_price", "predump", "wallbox_support", "storage_active"}
+        ]
+        if incompatible_hold_paths:
+            veto_reasons.append(
+                "phase5_decision_only_hold_legacy_path_conflict:%s"
+                % ",".join(incompatible_hold_paths)
+            )
+    effective_owner_control = owner_contract.get("control_owner")
+    effective_owner_contract = owner_contract.get("contract_owner")
+    effective_owner_binding = "legacy_state_contract"
+    if effectless_phase5_hold:
+        effective_owner_binding = "phase5_decision_only_hold_legacy_state_contract"
+        if primary_path == "e3dc_auto":
+            # Ein reiner DV-Zustands-/Monitor-Marker ist in diesem exakt
+            # wirkungslosen HOLD kein Hardwareowner. Ohne einen anderen
+            # typisierten Legacy-Unterpfad bleibt E3DC-AUTO führend.
+            effective_owner_control = "e3dc_auto"
+            effective_owner_contract = "E3DC_AUTONOM"
+    if effectless_direct_marketing_no_action:
+        effective_owner_binding = "direct_marketing_effectless_no_action_legacy_state_contract"
+    if primary_path == "direct_marketing" and direct_marketing_policy_owns_cycle:
+        effective_owner_control = "direct_marketing"
+        effective_owner_contract = "MARKET_DIRECT"
+        effective_owner_binding = "selected_direct_marketing_policy"
+    if primary_path in ("direct_marketing", "market_price", "predump") and str(effective_owner_contract) == "E3DC_AUTONOM":
         veto_reasons.append("owner_contract_not_market_owned")
     if primary_path == "curve" and str(curve_contract.get("action_class")) == "active_discharge":
         veto_reasons.append("curve_path_active_discharge")
@@ -2216,6 +2705,13 @@ def storage_decision_path_contract(
         "protection": protection_contract,
     }
     for path_name, contract in subcontracts.items():
+        if (
+            (effectless_phase5_hold or effectless_direct_marketing_no_action)
+            and path_name == "direct_marketing"
+        ):
+            continue
+        if primary_path == "protection" and path_name in protection_subordinate_paths:
+            continue
         for reason in contract.get("veto_reasons") if isinstance(contract.get("veto_reasons"), list) else []:
             veto_reasons.append("%s:%s" % (path_name, reason))
     return {
@@ -2224,12 +2720,17 @@ def storage_decision_path_contract(
         "active_paths": candidates,
         "subordinate_paths": subordinate_paths,
         "subcontracts": subcontracts,
+        "phase5_decision_only_hold_projection": phase5_hold_projection,
+        "direct_marketing_effectless_no_action_projection": effectless_no_action_projection,
         "candidate_reasons": candidate_reasons,
         "path_conflict": bool(veto_reasons),
         "veto_required": bool(veto_reasons),
         "veto_reasons": veto_reasons,
-        "owner_control": owner_contract.get("control_owner"),
-        "owner_contract": owner_contract.get("contract_owner"),
+        "owner_control": effective_owner_control,
+        "owner_contract": effective_owner_contract,
+        "owner_binding": effective_owner_binding,
+        "raw_owner_control": owner_contract.get("control_owner"),
+        "raw_owner_contract": owner_contract.get("contract_owner"),
         "execution_class": owner_contract.get("execution_class"),
         "auto_limit_source_class": auto_source,
         "auto_limit_command_class": auto_contract.get("command_class"),
@@ -2304,11 +2805,9 @@ def configured_export_target_w(cfg: Dict[str, Any], live: Dict[str, Any]) -> int
     buffer_w = max(0, safe_int(cfg.get("abregel_puffer_w"), 300))
     if configured_w > 0 and live_derate_w > 0:
         hard_limit_w = min(configured_w, live_derate_w)
-        if configured_w < live_derate_w - 50:
-            return configured_w
         return max(0, hard_limit_w - buffer_w)
     if configured_w > 0:
-        return configured_w
+        return max(0, configured_w - buffer_w)
     if live_derate_w > 0:
         return max(0, live_derate_w - buffer_w)
     return 0
@@ -2628,16 +3127,23 @@ def direct_marketing_aux_inverter_shelly_control(
     state_path: str = DIRECT_MARKETING_AUX_INVERTER_SHELLY_F,
     manual_lock_path: str = DIRECT_MARKETING_AUX_INVERTER_SHELLY_MANUAL_LOCK_F,
     guard_path: str = DIRECT_MARKETING_AUX_INVERTER_SHELLY_GUARD_F,
+    migration_status_path: str = DIRECT_MARKETING_AUX_INVERTER_SHELLY_MIGRATION_F,
     timeout_s: float = 1.0,
 ) -> Dict[str, Any]:
-    """Optional central control for an ungeregelten AC-Zusatz-WR Shelly contactor.
+    """Optionale zentrale Steuerung eines Schützes für ungeregelte AC-Zusatz-WR.
 
-    Default is intentionally local/off. This function must never influence the
-    storage decision or block RSCP control.
+    Der Standard ist bewusst lokal/aus. Diese Funktion darf weder die
+    Speicherentscheidung beeinflussen noch die RSCP-Steuerung sperren.
     """
     global _direct_marketing_aux_inverter_shelly_state
 
-    override_requested = _boolish_direct_marketing_shelly_override(cfg.get("direct_marketing_aux_inverter_shelly_override", "0"))
+    contract = aux_inverter_effective_contract(cfg)
+    config_blocked = bool(contract.get("commands_blocked"))
+    override_requested = bool(contract.get("override") == "central" and not config_blocked)
+    contract_migration_required = aux_inverter_state_migration_required(
+        contract,
+        override_requested=override_requested,
+    )
     direct_marketing_explicitly_disabled = bool(
         "direct_marketing_enable" in cfg
         and not cfg_bool(cfg, "direct_marketing_enable", False)
@@ -2649,16 +3155,79 @@ def direct_marketing_aux_inverter_shelly_control(
         and not direct_marketing_explicitly_disabled
         and not observe_only_mode
     )
-    ip = str(cfg.get("direct_marketing_aux_inverter_shelly_ip", "") or "").strip()
-    invert = cfg_bool(cfg, "direct_marketing_aux_inverter_shelly_invert", False)
+    capability_active = bool(override)
+    ip = str(contract.get("ip") or "").strip()
+    invert = bool(contract.get("invert"))
     # Eine Lastschwelle allein kann die Aufnahmeleistung eines großen Zusatz-WR
     # nicht garantieren. Deshalb bleibt die dynamische Freigabe opt-in.
-    dynamic_unblock = cfg_bool(cfg, "direct_marketing_aux_inverter_shelly_dynamic_unblock_enable", False)
+    dynamic_unblock = bool(contract.get("dynamic_unblock_enable"))
     unblock_threshold_w = max(
         100,
-        safe_int(cfg.get("direct_marketing_aux_inverter_shelly_unblock_threshold_w"), 3000),
+        safe_int(contract.get("unblock_threshold_w"), 3000),
     )
     min_switch_interval_s = 600.0
+    migration_identity = tuple(
+        os.path.abspath(os.path.normpath(path))
+        for path in (state_path, manual_lock_path, guard_path, migration_status_path)
+    )
+
+    if config_blocked:
+        migration = {
+            "status": "blocked",
+            "terminal": False,
+            "blocked": True,
+            "reasons": ["config_contract_blocked"],
+        }
+    elif not contract_migration_required:
+        migration = {
+            "status": "not_applicable_unconfigured",
+            "terminal": False,
+            "blocked": False,
+            "reasons": [],
+            "cleanup_complete": False,
+            "command_sent": False,
+        }
+    elif migration_identity in _direct_marketing_aux_inverter_migration_failure_latches:
+        migration = dict(_direct_marketing_aux_inverter_migration_failure_latches[migration_identity])
+    else:
+        try:
+            migration = migrate_aux_inverter_state_files(
+                canonical_state_path=state_path,
+                canonical_lock_path=manual_lock_path,
+                canonical_guard_path=guard_path,
+                status_path=migration_status_path,
+                now_s=now_s,
+                config_blocked=False,
+                capability_active=capability_active,
+                override_requested=override_requested,
+                min_switch_interval_s=min_switch_interval_s,
+            )
+            if bool(migration.get("blocked")) and any(
+                str(reason).endswith("_backup_failed")
+                for reason in migration.get("reasons") or []
+            ):
+                migration = {
+                    **migration,
+                    "latched": True,
+                    "latch_scope": "process_path_identity",
+                }
+                _direct_marketing_aux_inverter_migration_failure_latches[migration_identity] = dict(migration)
+        except Exception as exc:
+            migration = {
+                "status": "blocked",
+                "terminal": False,
+                "blocked": True,
+                "reasons": ["state_migration_error"],
+                "error_type": type(exc).__name__,
+                "latched": True,
+                "latch_scope": "process_path_identity",
+            }
+            _direct_marketing_aux_inverter_migration_failure_latches[migration_identity] = dict(migration)
+
+    migration_required = bool(
+        migration.get("migration_required", contract_migration_required)
+    )
+
     live = live if isinstance(live, dict) else {}
     grid_w = safe_float(live.get("grid_w", live.get("Grid_Power")), 0.0)
     house_w = max(0.0, safe_float(live.get("house_w", live.get("home_w", live.get("House_Power"))), 0.0))
@@ -2669,10 +3238,16 @@ def direct_marketing_aux_inverter_shelly_control(
     live_valid = bool(live and not live_stale and live_sample_valid)
     manual_lock = read_json_file(manual_lock_path)
     manual_locked = bool(manual_lock.get("locked") is True)
-    previous = _direct_marketing_aux_inverter_shelly_state if isinstance(_direct_marketing_aux_inverter_shelly_state, dict) else {}
-    if not previous:
+    previous = (
+        _direct_marketing_aux_inverter_shelly_state
+        if isinstance(_direct_marketing_aux_inverter_shelly_state, dict)
+        else {}
+    )
+    if not migration_required:
+        previous = {}
+    elif not previous:
         previous = read_json_file(state_path)
-    persisted_guard = read_json_file(guard_path)
+    persisted_guard = read_json_file(guard_path) if migration_required else {}
     if safe_float(persisted_guard.get("last_state_change_ts"), 0.0) > safe_float(previous.get("last_state_change_ts"), 0.0):
         previous = {
             **previous,
@@ -2692,6 +3267,11 @@ def direct_marketing_aux_inverter_shelly_control(
     previous_send_ts = safe_float(previous.get("last_send_ts"), 0.0)
     previous_attempt_ts = safe_float(previous.get("last_attempt_ts"), previous_send_ts)
     previous_change_ts = safe_float(previous.get("last_state_change_ts"), 0.0)
+    guard_block_until = max(
+        safe_float(persisted_guard.get("block_until"), 0.0),
+        safe_float(persisted_guard.get("next_switch_allowed_ts"), 0.0),
+        previous_change_ts + min_switch_interval_s if previous_change_ts > 0 else 0.0,
+    )
     state: Dict[str, Any] = {
         "schema": "direct_marketing_aux_inverter_shelly_v2",
         "ts": int(now_s),
@@ -2702,8 +3282,15 @@ def direct_marketing_aux_inverter_shelly_control(
         "mode": "central" if override else "local",
         "invert": bool(invert),
         "relay_semantics": "nc_contactor_shelly_on_means_wr_off" if invert else "normal_shelly_on_means_wr_on",
+        "contract_status": "blocked" if config_blocked else "ok",
+        "contract_reason": str((contract.get("migration") or {}).get("reason") or ""),
+        "migration_status": str(migration.get("status") or "blocked"),
+        "migration_reasons": list(migration.get("reasons") or []),
+        "migration_required": bool(migration_required),
         "ip_configured": bool(ip),
         "ip_valid": _valid_ipv4(ip),
+        "control_available": bool(override and _valid_ipv4(ip) and not config_blocked),
+        "lock_available": bool(override and _valid_ipv4(ip) and not config_blocked),
         "price_ct_kwh": None,
         "threshold_ct_kwh": -0.0001,
         "dynamic_unblock_enabled": bool(dynamic_unblock),
@@ -2718,7 +3305,7 @@ def direct_marketing_aux_inverter_shelly_control(
         "manual_lock_ts": manual_lock.get("ts") if manual_locked else None,
         "min_switch_interval_s": int(min_switch_interval_s),
         "last_state_change_ts": previous_change_ts,
-        "switch_lock_remaining_s": max(0, int(round(min_switch_interval_s - max(0.0, now_s - previous_change_ts)))) if previous_change_ts > 0 else 0,
+        "switch_lock_remaining_s": max(0, int(round(guard_block_until - now_s))),
         "requested_wr_on": None,
         "requested_relay_on": None,
         "desired_wr_on": None,
@@ -2729,25 +3316,35 @@ def direct_marketing_aux_inverter_shelly_control(
         "status": "local_fallback",
         "error": "",
     }
+
+    def persist_state() -> Dict[str, Any]:
+        global _direct_marketing_aux_inverter_shelly_state
+        _direct_marketing_aux_inverter_shelly_state = dict(state)
+        try:
+            write_aux_inverter_canonical_state(state_path, state, mode=0o664)
+        except Exception:
+            pass
+        return state
+
+    if config_blocked:
+        state["status"] = "migration_blocked"
+        state["command_status"] = "blocked"
+        state["error"] = "config_contract_blocked"
+        return persist_state()
+    if bool(migration.get("blocked")):
+        state["status"] = "migration_blocked"
+        state["command_status"] = "blocked"
+        state["error"] = "state_contract_blocked"
+        return persist_state()
     if not override:
         if direct_marketing_explicitly_disabled:
             state["status"] = "direct_marketing_disabled"
         elif observe_only_mode:
             state["status"] = "strategy_observe_only"
-        _direct_marketing_aux_inverter_shelly_state = state
-        try:
-            atomic_write(state_path, state, indent=2)
-        except Exception:
-            pass
-        return state
+        return persist_state()
     if not state["ip_valid"]:
         state["status"] = "invalid_ip"
-        _direct_marketing_aux_inverter_shelly_state = state
-        try:
-            atomic_write(state_path, state, indent=2)
-        except Exception:
-            pass
-        return state
+        return persist_state()
 
     settlement_basis = str(cfg.get("direct_marketing_settlement_basis", "day_ahead_15min") or "day_ahead_15min").strip().lower()
     tariff_provider = str(cfg.get("tariff_provider", "") or "").strip().lower()
@@ -2763,12 +3360,7 @@ def direct_marketing_aux_inverter_shelly_control(
     state["price_meta"] = price_meta
     if price_ct is None and not manual_locked:
         state["status"] = "price_unavailable"
-        _direct_marketing_aux_inverter_shelly_state = state
-        try:
-            atomic_write(state_path, state, indent=2)
-        except Exception:
-            pass
-        return state
+        return persist_state()
 
     state["price_ct_kwh"] = round(float(price_ct), 6) if price_ct is not None else None
     negative_price = bool(price_ct is not None and float(price_ct) < -0.0001)
@@ -2823,13 +3415,8 @@ def direct_marketing_aux_inverter_shelly_control(
         state["last_send_ts"] = previous_send_ts
         state["last_attempt_ts"] = previous_attempt_ts
         state["hold_reason"] = "retry_backoff"
-        state["error"] = str(previous.get("error") or "")[:180]
-        _direct_marketing_aux_inverter_shelly_state = state
-        try:
-            atomic_write(state_path, state, indent=2)
-        except Exception:
-            pass
-        return state
+        state["error"] = str(previous.get("error") or "")[:80]
+        return persist_state()
 
     switch_lock_remaining_s = state["switch_lock_remaining_s"]
     manual_off_bypass = bool(manual_locked and requested_wr_on is False)
@@ -2842,12 +3429,7 @@ def direct_marketing_aux_inverter_shelly_control(
         state["last_send_ts"] = previous_send_ts
         state["last_attempt_ts"] = previous_attempt_ts
         state["hold_reason"] = "anti_flatter_600s"
-        _direct_marketing_aux_inverter_shelly_state = state
-        try:
-            atomic_write(state_path, state, indent=2)
-        except Exception:
-            pass
-        return state
+        return persist_state()
 
     state["desired_wr_on"] = bool(requested_wr_on)
     state["desired_on"] = bool(requested_wr_on)
@@ -2860,24 +3442,17 @@ def direct_marketing_aux_inverter_shelly_control(
         state["last_send_ts"] = previous_send_ts
         state["last_attempt_ts"] = previous_attempt_ts
         state["hold_reason"] = "retry_backoff" if previous.get("command_status") == "http_error" or previous.get("status") == "http_error" else "unchanged_state"
-        _direct_marketing_aux_inverter_shelly_state = state
-        try:
-            atomic_write(state_path, state, indent=2)
-        except Exception:
-            pass
-        return state
+        return persist_state()
 
     url = f"http://{ip}/rpc/Switch.Set?id=0&on={'true' if requested_relay_on else 'false'}"
-    state["url"] = url
     try:
         request = urllib.request.Request(url, headers={"User-Agent": "E3DC-Control-DV-Shelly/1"})
         with urllib.request.urlopen(request, timeout=max(0.2, float(timeout_s))) as response:
             state["http_status"] = getattr(response, "status", None)
             try:
-                body = response.read(512)
-                state["response_preview"] = body.decode("utf-8", errors="replace")[:160]
+                response.read(512)
             except Exception:
-                state["response_preview"] = ""
+                pass
         state["relay_status"] = "relay_on" if requested_relay_on else "relay_off"
         state["command_sent"] = True
         state["command_status"] = "sent"
@@ -2887,23 +3462,22 @@ def direct_marketing_aux_inverter_shelly_control(
             state["last_state_change_ts"] = now_s
             state["switch_lock_remaining_s"] = int(min_switch_interval_s)
             try:
-                atomic_write(
-                    guard_path,
-                    {
-                        "schema": "direct_marketing_aux_inverter_shelly_guard_v1",
-                        "last_state_change_ts": now_s,
-                        "last_send_ts": now_s,
-                        "desired_wr_on": bool(requested_wr_on),
-                        "relay_on": bool(requested_relay_on),
-                    },
-                    indent=2,
-                )
+                guard_payload = {
+                    "schema": "direct_marketing_aux_inverter_shelly_guard_v1",
+                    "last_state_change_ts": now_s,
+                    "last_send_ts": now_s,
+                    "block_until": now_s + min_switch_interval_s,
+                    "next_switch_allowed_ts": now_s + min_switch_interval_s,
+                    "desired_wr_on": bool(requested_wr_on),
+                    "relay_on": bool(requested_relay_on),
+                }
+                write_aux_inverter_canonical_state(guard_path, guard_payload, mode=0o660)
             except Exception:
                 pass
     except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
         state["status"] = "http_error"
         state["command_status"] = "http_error"
-        state["error"] = str(exc)[:180]
+        state["error"] = type(exc).__name__
         state["last_send_ts"] = previous_send_ts
         state["last_attempt_ts"] = now_s
         state["last_state_change_ts"] = previous_change_ts
@@ -2912,12 +3486,7 @@ def direct_marketing_aux_inverter_shelly_control(
             state["desired_wr_on"] = previous_wr_on
             state["desired_on"] = previous_wr_on
 
-    _direct_marketing_aux_inverter_shelly_state = state
-    try:
-        atomic_write(state_path, state, indent=2)
-    except Exception:
-        pass
-    return state
+    return persist_state()
 
 
 def acknowledge_manual_override_done(
@@ -3025,7 +3594,7 @@ def live_data_age_s(live: Dict[str, Any], now_s: Optional[float] = None) -> floa
 @dataclass(frozen=True)
 class StorageInputSnapshot:
     live: LiveDataSnapshot
-    plan: StoragePlanSnapshot
+    plan: Any
     wallbox: WallboxStatusSnapshot
 
 
@@ -3052,7 +3621,7 @@ def build_storage_input_snapshot(
 ) -> StorageInputSnapshot:
     return StorageInputSnapshot(
         live=LiveDataSnapshot.from_dict(live, now_s=now_s),
-        plan=StoragePlanSnapshot.from_dict(plan),
+        plan=plan if isinstance(plan, ValidatedCanonicalPlanSnapshot) else StoragePlanSnapshot.from_dict(plan),
         wallbox=WallboxStatusSnapshot.from_dict(wb_native or {}),
     )
 
@@ -3263,7 +3832,7 @@ def storage_live_plausibility_preserved_discharge_owner(
     now_s: float,
     previous_state: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Hold a just-active protected discharge owner through one short power-frame glitch."""
+    """Hält einen gerade aktiven Entladepfad durch einen kurzen Messwertaussetzer."""
 
     previous_state = previous_state or {}
     previous_name = str(previous_state.get("state") or "")
@@ -3283,11 +3852,16 @@ def storage_live_plausibility_preserved_discharge_owner(
         return None
 
     hold_owner = ""
-    if previous_name.startswith(("direct_marketing_eco_plus_export", "direct_marketing_arbitrage_export")):
+    if previous_name.startswith("direct_marketing_eco_plus_export"):
         direct = direct_marketing_plan(plan)
+        direct_mode = str(direct.get("mode") or "").strip().lower().replace("-", "_").replace(" ", "_")
+        if direct_mode in {"eco+", "ecoplus"}:
+            direct_mode = "eco_plus"
+        if direct_mode != "eco_plus":
+            return None
         window = direct_marketing_current_window(direct, now_s)
         action = str((window or {}).get("action") or "")
-        if action not in DIRECT_MARKETING_EXPORT_ACTIONS:
+        if action != "eco_plus_export_candidate":
             return None
         previous_action = str(previous_state.get("direct_marketing_action") or "")
         if previous_action and previous_action != action:
@@ -3345,7 +3919,7 @@ def storage_live_plausibility_preserved_charge_owner(
     now_s: float,
     previous_state: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Hold a just-active protected PV-store owner through one short power-frame glitch."""
+    """Hält einen gerade aktiven PV-Speicherpfad durch einen kurzen Messwertaussetzer."""
 
     previous_state = previous_state or {}
     previous_name = str(previous_state.get("state") or "")
@@ -3979,7 +4553,7 @@ def build_decision_history_record_with_context(
         "time": datetime.datetime.fromtimestamp(ts).isoformat(timespec="seconds"),
         "service": "storage_manager",
         # Keep the full execution evidence in the latest/history envelope. The
-        # compact decision projection alone is insufficient for offline
+        # compact decision projection alone is insufficient for offline D9/D10
         # diagnostics and must not turn a missing field into a false claim.
         "direct_marketing_monitor": direct_monitor,
         "direct_marketing_export_execution": direct_export_execution,
@@ -4102,13 +4676,21 @@ def build_decision_history_record_with_context(
             "path_conflict": bool(path_contract.get("path_conflict")),
             "veto_required": bool(path_contract.get("veto_required")),
             "veto_reasons": path_contract.get("veto_reasons") if isinstance(path_contract.get("veto_reasons"), list) else [],
+            "owner_control": path_contract.get("owner_control"),
+            "owner_contract": path_contract.get("owner_contract"),
+            "owner_binding": path_contract.get("owner_binding"),
+            "raw_owner_control": path_contract.get("raw_owner_control"),
+            "raw_owner_contract": path_contract.get("raw_owner_contract"),
         },
         "r5": {
             "storage_owner_contract_version": safe_int(owner_contract.get("contract_version"), 0),
             "storage_decision_path_contract_version": safe_int(path_contract.get("contract_version"), 0),
             "auto_limit_contract_version": safe_int(owner_contract.get("auto_limit_contract_version"), 0),
-            "control_owner": owner_contract.get("control_owner"),
-            "contract_owner": owner_contract.get("contract_owner"),
+            "control_owner": path_contract.get("owner_control", owner_contract.get("control_owner")),
+            "contract_owner": path_contract.get("owner_contract", owner_contract.get("contract_owner")),
+            "owner_binding": path_contract.get("owner_binding"),
+            "raw_control_owner": owner_contract.get("control_owner"),
+            "raw_contract_owner": owner_contract.get("contract_owner"),
             "execution_class": owner_contract.get("execution_class"),
             "state_reason": owner_contract.get("state_reason"),
             "value_signature": owner_contract.get("value_signature"),
@@ -4403,11 +4985,14 @@ def _history_event_write_due(
     now_value = float(now_s if now_s is not None else time.time())
     mode_value = str((payload or {}).get("mode"))
     val_w = safe_int((payload or {}).get("val"), 0)
+    rscp_event = _rscp_power_settings_event_signature(payload)
     if "last_ts" not in state:
         return True
     if state.get("mode") != mode_value:
         return True
     if abs(val_w - safe_int(state.get("val"), 0)) > max(0, int(power_delta_w)):
+        return True
+    if state.get("rscp_power_settings_event") != rscp_event:
         return True
     return now_value - safe_float(state.get("last_ts"), 0.0) >= max(0.0, force_interval_s)
 
@@ -4416,6 +5001,29 @@ def _remember_history_event_write(payload: Dict[str, Any], state: Dict[str, Any]
     state["last_ts"] = float(now_s if now_s is not None else time.time())
     state["mode"] = str((payload or {}).get("mode"))
     state["val"] = safe_int((payload or {}).get("val"), 0)
+    state["rscp_power_settings_event"] = _rscp_power_settings_event_signature(payload)
+
+
+def _rscp_power_settings_event_signature(payload: Dict[str, Any]) -> Tuple[Any, ...]:
+    diag = payload.get("rscp_power_settings") if isinstance(payload, dict) else None
+    if not isinstance(diag, dict):
+        return ()
+    requested = diag.get("requested") if isinstance(diag.get("requested"), dict) else {}
+    readback = diag.get("readback") if isinstance(diag.get("readback"), dict) else {}
+    return (
+        diag.get("status"),
+        diag.get("stage"),
+        diag.get("confirmed"),
+        diag.get("acknowledged"),
+        requested.get("limits_used"),
+        requested.get("max_charge_w"),
+        requested.get("max_discharge_w"),
+        requested.get("discharge_start_w"),
+        readback.get("limits_used"),
+        readback.get("max_charge_w"),
+        readback.get("max_discharge_w"),
+        readback.get("discharge_start_w"),
+    )
 
 
 def write_decision_history(payload: Dict[str, Any], plan: Dict[str, Any], cfg: Dict[str, Any]) -> None:
@@ -4504,6 +5112,18 @@ def write_decision_history(payload: Dict[str, Any], plan: Dict[str, Any], cfg: D
             "r5.budget_executor_ack_productive_allowed_shadow",
             "r5.budget_executor_ack_fallback_action",
             "r5.budget_executor_ack_blockers",
+            "rscp_power_settings.status",
+            "rscp_power_settings.stage",
+            "rscp_power_settings.confirmed",
+            "rscp_power_settings.acknowledged",
+            "rscp_power_settings.requested.limits_used",
+            "rscp_power_settings.requested.max_charge_w",
+            "rscp_power_settings.requested.max_discharge_w",
+            "rscp_power_settings.requested.discharge_start_w",
+            "rscp_power_settings.readback.limits_used",
+            "rscp_power_settings.readback.max_charge_w",
+            "rscp_power_settings.readback.max_discharge_w",
+            "rscp_power_settings.readback.discharge_start_w",
         ),
         default_interval_s=60,
         default_max_bytes=8 * 1024 * 1024,
@@ -4874,14 +5494,12 @@ HARD_DISCHARGE_OWNER_PREFIXES = (
     "tl_autodump",
     "direct_marketing_eco_plus_export",
     "direct_marketing_eco_plus_headroom_export",
-    "direct_marketing_arbitrage_export",
 )
 HARD_GRID_OWNER_PREFIXES = (
     "price_boost_grid",
     "storm_guard_grid",
     "market_grid_charge",
     "market_negative_absorb_grid",
-    "direct_marketing_arbitrage_grid_charge",
 )
 HARD_IDLE_OWNER_PREFIXES = ("emergency_power",)
 
@@ -4908,7 +5526,7 @@ def hard_mode_justification_errors(live: Dict[str, Any], decision: Dict[str, Any
         if not (discharge_owner or headroom_discharge_owner):
             errors.append(f"DISCH {val_w} W ohne geschützten Entlade-Besitzer: {state or 'unbekannt'}")
 
-        if discharge_owner and state.startswith(("direct_marketing_eco_plus_export", "direct_marketing_arbitrage_export")):
+        if discharge_owner and state.startswith("direct_marketing_eco_plus_export"):
             dm_guard = direct_marketing_export_import_guard({}, live, val_w)
             if dm_guard.get("blocked"):
                 errors.append(
@@ -4948,7 +5566,7 @@ def hard_mode_guard_contract(
     *,
     now_s: float,
 ) -> Dict[str, Any]:
-    """Build the hard-mode guard decision without logging or sending RSCP."""
+    """Erzeugt die Hard-Mode-Schutzentscheidung ohne Logging oder RSCP-Ausgang."""
     errors = hard_mode_justification_errors(live, decision)
     if not errors:
         return {
@@ -5134,6 +5752,112 @@ def curve_relation_text(
             f"unter {target_label} {curve_txt}{live_suffix}"
         )
     return f"{prefix} {relation_soc:.1f}% liegt nahe {neutral_label} {curve_txt}{live_suffix}"
+
+
+def charge_acceptance_diagnostic_contract(
+    cfg: Dict[str, Any],
+    live: Dict[str, Any],
+    payload: Dict[str, Any],
+    plan: Dict[str, Any],
+    previous_state: Dict[str, Any],
+    *,
+    now_s: float,
+) -> Dict[str, Any]:
+    """Diagnostiziert begrenzte Ladeannahme ohne Voll- oder Regelclaim."""
+
+    schema = "storage_charge_acceptance_diagnostic_v1"
+    text = "Ladeannahme begrenzt – Ursache unklar"
+    plan_id = plan.get("plan_id") if isinstance(plan, dict) else None
+    generation_valid = bool(
+        isinstance(plan_id, str)
+        and len(plan_id) == 71
+        and plan_id.startswith("sha256:")
+    )
+    remaining_valid = live.get("remaining_charge_w_valid") is True
+    remaining_w = (
+        safe_float(live.get("remaining_charge_w"), float("nan"))
+        if remaining_valid
+        else float("nan")
+    )
+    remaining_age_s = safe_float(live.get("remaining_charge_w_age_s"), float("nan"))
+    battery_w = safe_float(live.get("Battery_Power"), float("nan"))
+    offer_w = max(0.0, safe_float(payload.get("storage_charge_request_w"), 0.0))
+    max_charge_w = safe_float(live.get("ems_max_charge_power_w"), float("nan"))
+    live_age_s = safe_float(payload.get("live_age_s"), float("nan"))
+    sources_valid = bool(
+        generation_valid
+        and remaining_valid
+        and math.isfinite(remaining_w)
+        and remaining_w >= 0.0
+        and str(live.get("remaining_charge_w_source") or "")
+        == "rscp_ems_remaining_bat_charge_power"
+        and math.isfinite(remaining_age_s)
+        and 0.0 <= remaining_age_s <= 30.0
+        and math.isfinite(battery_w)
+        and math.isfinite(live_age_s)
+        and -5.0 <= live_age_s <= 30.0
+        and payload.get("live_sample_valid", True)
+        and not payload.get("live_stale")
+    )
+    power_settings_permissive = bool(
+        live.get("ems_power_settings_read") is True
+        and live.get("ems_power_settings_valid") is True
+        and live.get("power_limits_active") is True
+        and math.isfinite(max_charge_w)
+        and offer_w >= 300.0
+        and max_charge_w + 1.0 >= offer_w
+    )
+    low_threshold_w = max(150.0, min(300.0, offer_w * 0.15))
+    limited_sample = bool(
+        sources_valid
+        and power_settings_permissive
+        and remaining_w <= low_threshold_w
+        and max(0.0, battery_w) <= low_threshold_w
+    )
+    previous = previous_state.get("charge_acceptance_diagnostic") if isinstance(previous_state, dict) else None
+    previous = previous if isinstance(previous, dict) else {}
+    previous_ts = safe_float(previous.get("ts"), 0.0)
+    same_generation = previous.get("plan_id") == plan_id
+    contiguous = bool(same_generation and 0.0 <= now_s - previous_ts <= 30.0)
+    samples = safe_int(previous.get("coherent_limited_samples"), 0) + 1 if limited_sample and contiguous else (1 if limited_sample else 0)
+    active = bool(limited_sample and samples >= 3)
+    if not sources_valid:
+        status = "UNAVAILABLE"
+        reason_code = "CHARGE_ACCEPTANCE_SOURCE_MISSING_INVALID_OR_STALE"
+    elif not power_settings_permissive:
+        status = "NOT_APPLICABLE_NO_PERMISSIVE_CHARGE_OFFER"
+        reason_code = "PERMISSIVE_CHARGE_OFFER_NOT_BOUND"
+    elif not limited_sample:
+        status = "ACCEPTANCE_NOT_LIMITED"
+        reason_code = None
+    elif not active:
+        status = "OBSERVING"
+        reason_code = "MULTI_CYCLE_CONFIRMATION_PENDING"
+    else:
+        status = "LIMITED_CAUSE_UNKNOWN"
+        reason_code = "CHARGE_ACCEPTANCE_LIMITED_CAUSE_UNKNOWN"
+    return {
+        "schema_version": schema,
+        "ts": round(now_s, 3),
+        "plan_id": plan_id if generation_valid else None,
+        "status": status,
+        "reason_code": reason_code,
+        "active": active,
+        "display_text": text if active else None,
+        "coherent_limited_samples": samples,
+        "required_samples": 3,
+        "ttl_s": 30.0,
+        "remaining_charge_w": round(remaining_w, 3) if math.isfinite(remaining_w) else None,
+        "remaining_charge_w_valid": remaining_valid,
+        "actual_charge_w": round(max(0.0, battery_w), 3) if math.isfinite(battery_w) else None,
+        "charge_offer_w": round(offer_w, 3),
+        "low_acceptance_threshold_w": round(low_threshold_w, 3),
+        "power_settings_permissive": power_settings_permissive,
+        "sources_valid": sources_valid,
+        "physical_full": False,
+        "target_reached": False,
+        "control_effect": False,
+    }
 
 
 def build_display(payload: Dict[str, Any]) -> Dict[str, str]:
@@ -6482,12 +7206,11 @@ def direct_marketing_policy_window(policy_ctx: Dict[str, Any], now_s: float) -> 
     """Build a stable diagnostic window from a policy decision."""
     policy = policy_ctx.get("policy") if isinstance(policy_ctx.get("policy"), dict) else {}
     selected = policy.get("selected_window") if isinstance(policy.get("selected_window"), dict) else {}
-    now_ms = int(float(now_s) * 1000.0)
     target_state = str(policy_ctx.get("target_state") or "")
     action = direct_marketing_policy_action(target_state)
     window = {
-        "start_ts": safe_int(selected.get("start_ts"), now_ms),
-        "end_ts": safe_int(selected.get("end_ts"), now_ms + 900_000),
+        "start_ts": safe_int(selected.get("start_ts"), 0),
+        "end_ts": safe_int(selected.get("end_ts"), 0),
         "action": action,
         "reason": str(selected.get("reason") or policy_ctx.get("block_reason") or target_state.lower()),
         "policy_target_state": target_state,
@@ -6536,6 +7259,338 @@ def direct_marketing_current_window(direct: Dict[str, Any], now_s: float) -> Opt
     return None
 
 
+def direct_marketing_policy_executor_gate(
+    direct: Dict[str, Any],
+    policy_ctx: Dict[str, Any],
+    now_s: float,
+    plan: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Bindet ein Policy-Ausführungsfenster an den aktuellen kanonischen Planslot."""
+    now_ms = int(float(now_s) * 1000.0)
+    policy = policy_ctx.get("policy") if isinstance(policy_ctx.get("policy"), dict) else {}
+    selected = policy.get("selected_window") if isinstance(policy.get("selected_window"), dict) else {}
+    execution = policy.get("execution_window") if isinstance(policy.get("execution_window"), dict) else {}
+    target_state = str(policy_ctx.get("target_state") or "").strip().upper()
+    blocked = {
+        "allowed": False,
+        "reason": "policy_window_bounds_missing",
+        "target_state": target_state,
+        "now_ms": now_ms,
+    }
+    if not policy_ctx.get("schema_valid") or not policy_ctx.get("commands_allowed"):
+        blocked["reason"] = "policy_contract_blocked"
+        return blocked
+    if str(direct.get("controller_owner") or "") != "storage_manager" or not str(
+        direct.get("plan_owner") or ""
+    ).startswith(DIRECT_MARKETING_OWNER_PREFIX):
+        blocked["reason"] = "policy_owner_mismatch"
+        return blocked
+
+    def bounds(document: Dict[str, Any]) -> Optional[Tuple[int, int]]:
+        start = safe_int(document.get("start_ts"), 0)
+        end = safe_int(document.get("end_ts"), 0)
+        if start < 10_000_000_000 or end < 10_000_000_000 or end <= start:
+            return None
+        return start, end
+
+    segment_bounds = bounds(policy)
+    selected_bounds = bounds(selected)
+    execution_bounds = bounds(execution)
+    if segment_bounds is None or selected_bounds is None:
+        return blocked
+    segment_start, segment_end = segment_bounds
+    selected_start, selected_end = selected_bounds
+    canonical = None
+    canonical_slot: Dict[str, Any] = {}
+    if isinstance(plan, dict):
+        canonical = validate_canonical_plan(plan, now_ms)
+        if not canonical.get("valid"):
+            blocked["reason"] = "canonical_%s" % str(
+                canonical.get("block_reason_code") or "plan_invalid"
+            ).lower()
+            blocked["plan_id"] = canonical.get("plan_id")
+            return blocked
+        canonical_direct = direct_marketing_plan(plan)
+        if direct != canonical_direct:
+            blocked["reason"] = "canonical_direct_marketing_mismatch"
+            blocked["plan_id"] = canonical.get("plan_id")
+            blocked["slot_id"] = canonical.get("slot_id")
+            return blocked
+        canonical_slot = canonical.get("slot") if isinstance(canonical.get("slot"), dict) else {}
+
+    # Bereits persistierte kanonische Pläne aus der vorherigen Vertragsversion
+    # besitzen noch kein execution_window. Nur ein gültiger aktueller
+    # plan_id/slot_id-Snapshot darf daraus genau ein Ausführungsfenster ableiten.
+    if execution_bounds is None and isinstance(canonical, dict):
+        canonical_start = safe_int(canonical_slot.get("start_ts_ms"), 0)
+        canonical_end = safe_int(canonical_slot.get("end_ts_ms"), 0)
+        selected_action = str(selected.get("action") or "")
+        selected_window_id = str(selected.get("window_id") or policy.get("window_id") or "")
+        fallback_matches = []
+        for window in direct.get("windows") if isinstance(direct.get("windows"), list) else []:
+            if not isinstance(window, dict):
+                continue
+            window_start = safe_int(window.get("start_ts"), 0)
+            window_end = safe_int(window.get("end_ts"), 0)
+            window_id = str(window.get("export_plateau_id") or window.get("window_id") or "")
+            if (
+                str(window.get("action") or "") == selected_action
+                and window_start <= canonical_start < canonical_end <= window_end
+                and window_end == selected_end
+                and (not selected_window_id or not window_id or selected_window_id == window_id)
+            ):
+                fallback_matches.append(window)
+        if len(fallback_matches) == 1:
+            fallback_window = fallback_matches[0]
+            execution = {
+                "contract_version": 1,
+                "action": selected_action,
+                "start_ts": max(
+                    safe_int(fallback_window.get("start_ts"), 0),
+                    segment_start,
+                    canonical_start,
+                ),
+                "end_ts": min(
+                    safe_int(fallback_window.get("end_ts"), 0),
+                    segment_end,
+                    canonical_end,
+                ),
+                "plan_window_start_ts": safe_int(fallback_window.get("start_ts"), 0),
+                "plan_window_end_ts": safe_int(fallback_window.get("end_ts"), 0),
+                "origin_start_ts": selected_start,
+                "window_id": selected_window_id or str(
+                    fallback_window.get("export_plateau_id")
+                    or fallback_window.get("window_id")
+                    or ""
+                ),
+                "source": "canonical_slot_legacy_policy_adapter_v1",
+                "plan_id": canonical.get("plan_id"),
+                "slot_id": canonical.get("slot_id"),
+            }
+            execution_bounds = bounds(execution)
+            blocked["execution_window_adapter"] = execution.get("source")
+        elif len(fallback_matches) > 1:
+            blocked["reason"] = "policy_execution_window_ambiguous"
+            blocked["plan_id"] = canonical.get("plan_id")
+            blocked["slot_id"] = canonical.get("slot_id")
+            return blocked
+    if execution_bounds is None:
+        blocked["reason"] = "policy_execution_window_missing"
+        if isinstance(canonical, dict):
+            blocked["plan_id"] = canonical.get("plan_id")
+            blocked["slot_id"] = canonical.get("slot_id")
+        return blocked
+    execution_start, execution_end = execution_bounds
+    if not (segment_start <= now_ms < segment_end):
+        blocked["reason"] = "policy_segment_expired" if now_ms >= segment_end else "policy_segment_not_started"
+        return blocked
+    if not (selected_start <= now_ms < selected_end):
+        blocked["reason"] = "policy_selected_window_expired" if now_ms >= selected_end else "policy_selected_window_future"
+        return blocked
+    if not (execution_start <= now_ms < execution_end):
+        blocked["reason"] = "policy_execution_window_expired" if now_ms >= execution_end else "policy_execution_window_future"
+        return blocked
+
+    selected_action = str(selected.get("action") or "")
+    execution_action = str(execution.get("action") or "")
+    source_action = str(policy.get("source_action") or selected_action)
+    executable_action = str(policy.get("executable_action") or "")
+    expected_actions = {
+        "FORCE_CHARGE_PV": {"eco_plus_store_pv_candidate"},
+        "FORCE_EXPORT": {"eco_plus_export_candidate"},
+        "HEADROOM_EXPORT": {"eco_plus_negative_headroom_hold"},
+    }.get(target_state, set())
+    if (
+        not expected_actions
+        or selected_action not in expected_actions
+        or execution_action != selected_action
+        or source_action != selected_action
+        or executable_action != selected_action
+    ):
+        blocked["reason"] = "policy_window_mismatch"
+        return blocked
+    storage_budget = policy_ctx.get("storage_budget") if isinstance(policy_ctx.get("storage_budget"), dict) else {}
+    if target_state == "FORCE_EXPORT" and safe_int(storage_budget.get("export_budget_w"), 0) <= 0:
+        blocked["reason"] = "policy_budget_missing"
+        return blocked
+    if target_state == "FORCE_CHARGE_PV" and safe_int(storage_budget.get("charge_budget_w"), 0) <= 0:
+        blocked["reason"] = "policy_budget_missing"
+        return blocked
+
+    source_window_start = safe_int(execution.get("plan_window_start_ts"), 0)
+    source_window_end = safe_int(execution.get("plan_window_end_ts"), 0)
+    execution_window_id = str(execution.get("window_id") or "")
+    matching_windows = []
+    for window in direct.get("windows") if isinstance(direct.get("windows"), list) else []:
+        if not isinstance(window, dict):
+            continue
+        window_id = str(
+            window.get("export_plateau_id")
+            or window.get("window_id")
+            or ""
+        )
+        if (
+            str(window.get("action") or "") == selected_action
+            and safe_int(window.get("start_ts"), 0) == source_window_start
+            and safe_int(window.get("end_ts"), 0) == source_window_end
+            and (not execution_window_id or not window_id or execution_window_id == window_id)
+        ):
+            matching_windows.append(window)
+    if len(matching_windows) != 1:
+        blocked["reason"] = "policy_window_mismatch"
+        return blocked
+    matching_window = matching_windows[0]
+
+    if not (
+        selected_start <= execution_start < execution_end <= selected_end
+        and segment_start <= execution_start < execution_end <= segment_end
+    ):
+        blocked["reason"] = "policy_execution_window_mismatch"
+        return blocked
+
+    plan_valid_until = safe_int(direct.get("valid_until_ts"), 0)
+    if plan_valid_until < 10_000_000_000:
+        blocked["reason"] = "plan_bounds_missing"
+        return blocked
+    effective_end = min(segment_end, selected_end, execution_end, plan_valid_until)
+    effective_start = max(segment_start, selected_start, execution_start)
+
+    if isinstance(plan, dict):
+        canonical_start = safe_int(canonical_slot.get("start_ts_ms"), 0)
+        canonical_end = safe_int(canonical_slot.get("end_ts_ms"), 0)
+        if not (
+            effective_start <= canonical_start <= now_ms < canonical_end <= effective_end
+        ):
+            blocked["reason"] = "canonical_slot_policy_window_mismatch"
+            blocked["plan_id"] = canonical.get("plan_id")
+            blocked["slot_id"] = canonical.get("slot_id")
+            return blocked
+        effective_start = canonical_start
+        effective_end = canonical_end
+    if now_ms < effective_start:
+        blocked["reason"] = "policy_window_not_started"
+        return blocked
+    if now_ms >= effective_end:
+        blocked["reason"] = "plan_expired" if now_ms >= plan_valid_until else "policy_selected_window_expired"
+        return blocked
+    bound_window = dict(matching_window)
+    bound_window.update({
+        "source_window_start_ts": source_window_start,
+        "source_window_end_ts": source_window_end,
+        "selected_window_origin_start_ts": selected_start,
+        "start_ts": effective_start,
+        "end_ts": effective_end,
+        "plan_id": canonical.get("plan_id") if isinstance(canonical, dict) else None,
+        "slot_id": canonical.get("slot_id") if isinstance(canonical, dict) else None,
+        "generation_contract": "canonical_plan_slot_v1" if isinstance(canonical, dict) else "policy_window_only_v1",
+    })
+    return {
+        "allowed": True,
+        "reason": "ok",
+        "target_state": target_state,
+        "now_ms": now_ms,
+        "effective_start_ts": effective_start,
+        "effective_end_ts": effective_end,
+        "plan_id": canonical.get("plan_id") if isinstance(canonical, dict) else None,
+        "slot_id": canonical.get("slot_id") if isinstance(canonical, dict) else None,
+        "execution_window_source": str(execution.get("source") or ""),
+        "selected_window": selected,
+        "execution_window": execution,
+        "plan_window": bound_window,
+    }
+
+
+def direct_marketing_future_pv_store_reservation(
+    plan: Dict[str, Any],
+    now_s: float,
+) -> Dict[str, Any]:
+    direct = direct_marketing_plan(plan or {})
+    reservation = direct.get("future_pv_store_reservation") if isinstance(direct.get("future_pv_store_reservation"), dict) else {}
+    result = dict(reservation)
+    result.setdefault("active", False)
+    result.setdefault("reason", "reservation_missing")
+    result["valid"] = False
+    if reservation.get("schema") != "direct_marketing_future_pv_store_reservation_v1":
+        result["reason"] = "reservation_schema_invalid"
+        return result
+    if not bool(reservation.get("active")) or not bool(reservation.get("commands_allowed")):
+        return result
+    next_window = reservation.get("next_window") if isinstance(reservation.get("next_window"), dict) else {}
+    start_ms = safe_int(next_window.get("start_ts"), 0)
+    end_ms = safe_int(next_window.get("end_ts"), 0)
+    valid_until = safe_int(reservation.get("valid_until_ts"), 0)
+    now_ms = int(float(now_s) * 1000.0)
+    if min(start_ms, end_ms, valid_until) < 10_000_000_000 or end_ms <= start_ms:
+        result.update({"active": False, "reason": "reservation_bounds_invalid"})
+        return result
+    if now_ms >= start_ms or now_ms >= valid_until:
+        result.update({"active": False, "reason": "reservation_expired"})
+        return result
+    if str(next_window.get("action") or "") != "eco_plus_store_pv_candidate":
+        result.update({"active": False, "reason": "reservation_window_mismatch"})
+        return result
+    if str(reservation.get("data_quality") or "") != "ok":
+        result.update({"active": False, "reason": "reservation_data_quality_invalid"})
+        return result
+    result["valid"] = True
+    return result
+
+
+def direct_marketing_curve_charge_reservation_cap(
+    cfg: Dict[str, Any],
+    plan: Dict[str, Any],
+    now_s: float,
+    *,
+    auto_state: str,
+    current_limit_w: int,
+    current_release: bool,
+    max_charge_w: int,
+    pv_after_fixed_w: int,
+    grid_w: int,
+) -> Dict[str, Any]:
+    """Übersetzt eine gültige Reservierung in eine flüchtige AUTO-Ladegrenze."""
+    reservation = direct_marketing_future_pv_store_reservation(plan, now_s)
+    result = {
+        "active": False,
+        "max_charge_w": max(0, safe_int(current_limit_w, 0)),
+        "reservation": reservation,
+        "reason": str(reservation.get("reason") or "reservation_inactive"),
+        "grid_import_w": max(0, safe_int(grid_w, 0)),
+    }
+    if not reservation.get("valid") or auto_state not in {
+        "parallel_curve_auto_hold",
+        "parallel_curve_auto_no_surplus",
+        "parallel_curve_charge",
+    }:
+        return result
+    cap_w = max(
+        0,
+        min(
+            max(0, safe_int(max_charge_w, 0)),
+            safe_int(reservation.get("max_curve_charge_w"), 0),
+        ),
+    )
+    import_guard_w = max(0, safe_int(cfg.get("direct_marketing_pv_store_import_guard_w"), 80))
+    grid_import_w = max(0, safe_int(grid_w, 0))
+    pv_charge_available_w = max(0, safe_int(pv_after_fixed_w, 0), max(0, -safe_int(grid_w, 0)))
+    if grid_import_w > import_guard_w:
+        cap_w = 0
+    elif cap_w > 0:
+        cap_w = min(cap_w, pv_charge_available_w)
+    opens_existing_hold = bool(current_release or safe_int(current_limit_w, 0) <= 0)
+    applied_cap_w = cap_w if opens_existing_hold else min(max(0, safe_int(current_limit_w, 0)), cap_w)
+    return {
+        "active": True,
+        "max_charge_w": applied_cap_w,
+        "reservation": reservation,
+        "reason": str(reservation.get("reason") or "future_pv_store_headroom_reserved"),
+        "grid_import_w": grid_import_w,
+        "import_guard_w": import_guard_w,
+        "pv_charge_available_w": pv_charge_available_w,
+        "opens_existing_hold": opens_existing_hold,
+    }
+
+
 def direct_marketing_contract_errors(
     cfg: Dict[str, Any],
     direct: Dict[str, Any],
@@ -6562,9 +7617,14 @@ def direct_marketing_contract_errors(
     flags = direct.get("flags") if isinstance(direct.get("flags"), dict) else {}
     if not bool(flags.get("commands_allowed")):
         errors.append("commands_not_allowed")
+    mode = str(direct.get("mode") or cfg.get("direct_marketing_mode") or "").strip().lower()
+    if mode == "arbitrage":
+        errors.append("arbitrage_not_released")
     valid_until = safe_int(direct.get("valid_until_ts"), 0)
     now_ms = int(float(now_s) * 1000.0)
-    if valid_until > 0 and valid_until < now_ms:
+    if 0 < valid_until < 10_000_000_000:
+        errors.append("plan_bounds_missing")
+    elif valid_until > 0 and valid_until <= now_ms:
         errors.append("plan_expired")
     return errors
 
@@ -6985,8 +8045,10 @@ def direct_marketing_storage_decision(
     if not state:
         return True, None
     action = direct_marketing_policy_action(target_state, mode_name)
-    window = direct_marketing_policy_window(policy_ctx, now_s)
-    current_window = direct_marketing_current_window(direct, now_s)
+    executor_gate = direct_marketing_policy_executor_gate(direct, policy_ctx, now_s, plan)
+    if not executor_gate.get("allowed"):
+        return True, None
+    window = executor_gate.get("plan_window") if isinstance(executor_gate.get("plan_window"), dict) else {}
     reserve = direct.get("reserve") if isinstance(direct.get("reserve"), dict) else {}
     economics = direct.get("economics") if isinstance(direct.get("economics"), dict) else {}
     flags = direct.get("flags") if isinstance(direct.get("flags"), dict) else {}
@@ -7018,6 +8080,8 @@ def direct_marketing_storage_decision(
         "direct_marketing_policy_charge_budget_w": policy_ctx.get("charge_budget_w"),
         "direct_marketing_policy_protected_reserve_wh": policy_ctx.get("protected_reserve_wh"),
         "direct_marketing_policy_sellable_wh": policy_ctx.get("sellable_wh"),
+        "direct_marketing_policy_executor_gate": executor_gate,
+        "direct_marketing_policy_effective_end_ts": executor_gate.get("effective_end_ts"),
         "direct_marketing_policy_export_constraint": policy_ctx.get("export_constraint"),
         "direct_marketing_mode": mode_name,
         "direct_marketing_owner": str(direct.get("plan_owner") or ""),
@@ -7150,7 +8214,7 @@ def direct_marketing_storage_decision(
         return True, result
 
     if target_state == "FORCE_CHARGE_PV":
-        control_window = current_window if isinstance(current_window, dict) else window
+        control_window = window
         fallback_target_soc = safe_float(
             reserve.get("target_soc_pct"),
             safe_float(cfg.get("storage_target_soc"), 100.0),
@@ -7484,16 +8548,7 @@ def direct_marketing_decision(
         if not bool(economics.get("pv_shift_profit_ok")) and not bool(hold_ctx.get("allowed")):
             return None
     elif action in ("arbitrage_grid_charge_candidate", "arbitrage_export_candidate"):
-        if mode != "arbitrage":
-            return None
-        if not bool(flags.get("arbitrage_enable")):
-            return None
-        if not bool(flags.get("export_enable")) or safe_int(flags.get("max_export_w"), 0) <= 0:
-            return None
-        if not bool(flags.get("grid_charge_enable")) or safe_int(flags.get("max_grid_charge_w"), 0) <= 0:
-            return None
-        if not bool(economics.get("grid_profit_ok")):
-            return None
+        return None
 
     soc = safe_float(live.get("SOC"), 0.0)
     reserve_floor = max(
@@ -8517,6 +9572,11 @@ def _direct_marketing_public_window(window: Dict[str, Any], now_ms: int) -> Dict
         "storage_action",
         "headroom_limited",
         "net_sell_ct",
+        "gross_sell_ct",
+        "fee_cost_ct",
+        "fee_basis",
+        "fee_basis_ct",
+        "fee_pct",
         "pv_store_price_class",
         "pv_store_soft_threshold",
         "pv_store_threshold_ct",
@@ -8599,6 +9659,51 @@ def _direct_marketing_expected_profit_ct(
     return None
 
 
+_DIRECT_MARKETING_ALLOCATION_DIAGNOSTICS = {
+    "export_energy_prioritized",
+    "pv_store_energy_budget_prioritized",
+}
+
+
+def _direct_marketing_reason_projection(reasons: Any) -> Dict[str, List[Dict[str, Any]]]:
+    """Trenne Ausführungsgates, Kandidatenablehnungen und Allokationshinweise."""
+    projected: Dict[str, List[Dict[str, Any]]] = {
+        "global_gate_blockers": [],
+        "candidate_rejections": [],
+        "allocation_diagnostics": [],
+    }
+    seen = set()
+    for raw_value in reasons if isinstance(reasons, list) else []:
+        raw = str(raw_value or "").strip()
+        if not raw or raw in seen:
+            continue
+        seen.add(raw)
+        normalized = raw.lower()
+        if normalized in _DIRECT_MARKETING_ALLOCATION_DIAGNOSTICS:
+            projected["allocation_diagnostics"].append({"code": normalized})
+            continue
+        if normalized.startswith("blocked by margin:"):
+            numbers = []
+            for token in normalized.replace("<", " ").split():
+                try:
+                    numbers.append(float(token))
+                except (TypeError, ValueError):
+                    continue
+            projected["candidate_rejections"].append({
+                "code": "ECONOMIC_EXPORT_WINDOW_PROFIT_BELOW_USER_MINIMUM",
+                "expected_profit_eur": numbers[0] if numbers else None,
+                "minimum_profit_eur": numbers[1] if len(numbers) > 1 else None,
+            })
+            continue
+        if normalized in {"profit_below_threshold", "economic_export_window_profit_below_user_minimum"}:
+            projected["candidate_rejections"].append({
+                "code": "ECONOMIC_EXPORT_WINDOW_PROFIT_BELOW_USER_MINIMUM",
+            })
+            continue
+        projected["global_gate_blockers"].append({"code": raw})
+    return projected
+
+
 def direct_marketing_monitor(
     cfg: Dict[str, Any],
     live: Dict[str, Any],
@@ -8612,6 +9717,12 @@ def direct_marketing_monitor(
     """Expose the direct-marketing owner contract without changing decisions."""
     direct = direct_marketing_plan(plan)
     policy_ctx = direct_marketing_policy_context(direct)
+    policy_executor_gate = (
+        direct_marketing_policy_executor_gate(direct, policy_ctx, now_s, plan)
+        if policy_ctx.get("present") and policy_ctx.get("commands_allowed")
+        else {"allowed": False, "reason": "policy_not_active"}
+    )
+    future_store_reservation = direct_marketing_future_pv_store_reservation(plan, now_s)
     flags = direct.get("flags") if isinstance(direct.get("flags"), dict) else {}
     economics = direct.get("economics") if isinstance(direct.get("economics"), dict) else {}
     reserve = direct.get("reserve") if isinstance(direct.get("reserve"), dict) else {}
@@ -8653,6 +9764,8 @@ def direct_marketing_monitor(
             policy_soc = safe_float(live.get("SOC"), 0.0)
             if policy_ep_reserve_pct > 0.0 and policy_soc <= policy_ep_reserve_pct:
                 blockers.add("ep_reserve_floor_reached")
+        if policy_ctx.get("commands_allowed") and not policy_executor_gate.get("allowed"):
+            blockers.add(str(policy_executor_gate.get("reason") or "policy_executor_gate_blocked"))
     hold_active_decision = bool(decision and decision.get("direct_marketing_hold_active"))
     if hold_active_decision:
         blockers.discard("commands_not_allowed")
@@ -8702,16 +9815,7 @@ def direct_marketing_monitor(
             if not bool(economics.get("pv_shift_profit_ok")):
                 blockers.add("pv_shift_below_threshold_for_export")
         elif current_action in ("arbitrage_grid_charge_candidate", "arbitrage_export_candidate"):
-            if mode != "arbitrage":
-                blockers.add("mode_mismatch")
-            if not bool(flags.get("arbitrage_enable")):
-                blockers.add("arbitrage_disabled")
-            if not bool(flags.get("export_enable")) or safe_int(flags.get("max_export_w"), 0) <= 0:
-                blockers.add("export_not_enabled")
-            if not bool(flags.get("grid_charge_enable")) or safe_int(flags.get("max_grid_charge_w"), 0) <= 0:
-                blockers.add("grid_charge_not_enabled")
-            if not bool(economics.get("grid_profit_ok")):
-                blockers.add("profit_below_threshold")
+            blockers.add("arbitrage_not_released")
 
         soc = safe_float(live.get("SOC"), 0.0)
         reserve_floor = max(
@@ -8800,6 +9904,8 @@ def direct_marketing_monitor(
         active_window = decision.get("direct_marketing_window")
         if isinstance(active_window, dict):
             current_window = active_window
+    elif bool(decision and decision.get("direct_marketing_future_pv_store_reservation_active")):
+        monitor_state = "reservation"
     elif not cfg_enabled or mode == "off":
         monitor_state = "off"
     elif bool(direct.get("shadow")) or not bool(flags.get("commands_allowed")):
@@ -8815,7 +9921,11 @@ def direct_marketing_monitor(
     else:
         profit_ct = _direct_marketing_expected_profit_ct(mode, current_action, economics)
 
-    effective_commands_allowed = bool(flags.get("commands_allowed")) or hold_active_decision or bool(policy_ctx.get("commands_allowed"))
+    effective_commands_allowed = (
+        bool(flags.get("commands_allowed"))
+        or hold_active_decision
+        or bool(policy_ctx.get("commands_allowed") and policy_executor_gate.get("allowed"))
+    )
 
     def pv_store_diag_value(decision_key: str, control_key: str, default: Any = None) -> Any:
         if isinstance(decision, dict) and decision.get(decision_key) is not None:
@@ -8902,6 +10012,7 @@ def direct_marketing_monitor(
             else "hard_export_limit_violation"
         )
 
+    reason_projection = _direct_marketing_reason_projection(sorted(blockers))
     return {
         "enabled": bool(cfg_enabled),
         "active": active_decision,
@@ -8911,10 +10022,22 @@ def direct_marketing_monitor(
         "commands_allowed": effective_commands_allowed,
         "policy_schema": policy_ctx.get("schema") if policy_ctx.get("present") else None,
         "policy_target_state": policy_ctx.get("target_state") if policy_ctx.get("present") else None,
-        "policy_commands_allowed": bool(policy_ctx.get("commands_allowed")),
+        "policy_commands_allowed": bool(
+            policy_ctx.get("commands_allowed") and policy_executor_gate.get("allowed")
+        ),
+        "policy_export_budget_w": policy_ctx.get("export_budget_w") if policy_ctx.get("present") else 0,
+        "policy_charge_budget_w": policy_ctx.get("charge_budget_w") if policy_ctx.get("present") else 0,
+        "policy_executable_action": (
+            policy_ctx.get("policy", {}).get("executable_action")
+            if isinstance(policy_ctx.get("policy"), dict)
+            else None
+        ),
         "policy_blocked": policy_ctx.get("blocked") if policy_ctx.get("present") else None,
         "policy_block_reason": policy_ctx.get("block_reason") if policy_ctx.get("present") else "",
         "policy_export_constraint": policy_ctx.get("export_constraint") if policy_ctx.get("present") else {},
+        "policy_executor_gate": policy_executor_gate if policy_ctx.get("present") else None,
+        "future_pv_store_reservation": future_store_reservation,
+        "future_pv_store_reservation_active": bool(decision and decision.get("direct_marketing_future_pv_store_reservation_active")),
         "hold_active": hold_active_decision,
         "headroom_hold_active": bool(decision and decision.get("direct_marketing_headroom_hold_active")),
         "headroom_soc_ceiling_pct": safe_float((decision or {}).get("direct_marketing_headroom_soc_ceiling_pct"), 0.0),
@@ -9063,6 +10186,9 @@ def direct_marketing_monitor(
         "contract_expected_version": DIRECT_MARKETING_CONTRACT_VERSION,
         "reason": str(direct.get("reason") or ""),
         "blocked_reasons": sorted(blockers),
+        "global_gate_blockers": reason_projection["global_gate_blockers"],
+        "candidate_rejections": reason_projection["candidate_rejections"],
+        "allocation_diagnostics": reason_projection["allocation_diagnostics"],
         "contract_errors": sorted(set(contract_errors)),
         "contract_warnings": contract_warnings,
         "price_domain_policy": str(
@@ -9076,11 +10202,12 @@ def direct_marketing_monitor(
         "upcoming_windows": _direct_marketing_public_windows(direct, now_s),
         "expected_profit_ct_per_kwh": round(profit_ct, 2) if profit_ct is not None else None,
         "economics": economics,
+        "settlement_accounting": direct.get("settlement_accounting") if isinstance(direct.get("settlement_accounting"), dict) else {},
         "reserve": reserve,
         "flags": {
             "export_enable": bool(flags.get("export_enable")),
             "grid_charge_enable": bool(flags.get("grid_charge_enable")),
-            "arbitrage_enable": bool(flags.get("arbitrage_enable")),
+            "arbitrage_release_allowed": False,
             "pv_store_enable": bool(flags.get("pv_store_enable")),
             "negative_price_no_export": bool(flags.get("negative_price_no_export")),
             "low_price_no_export": bool(flags.get("low_price_no_export")),
@@ -9144,7 +10271,17 @@ def _direct_marketing_report_empty(day: str, ts: int) -> Dict[str, Any]:
         "real_headroom_export_kwh": 0.0,
         "real_pv_store_kwh": 0.0,
         "real_export_revenue_eur": 0.0,
+        "real_gross_export_revenue_eur": 0.0,
+        "real_variable_fee_cost_eur": 0.0,
+        "real_net_export_revenue_eur": 0.0,
         "real_expected_profit_eur": 0.0,
+        "policy_export_budget_kwh": 0.0,
+        "export_tracking_error_kwh": 0.0,
+        "missed_export_kwh": 0.0,
+        "missed_export_cycles": 0,
+        "policy_battery_throughput_kwh": 0.0,
+        "policy_battery_discharge_kwh": 0.0,
+        "policy_battery_charge_kwh": 0.0,
         "last_energy_sample_ts": None,
         "house_supply_windows": 0,
         "headroom_windows": 0,
@@ -9158,9 +10295,11 @@ def _direct_marketing_report_empty(day: str, ts: int) -> Dict[str, Any]:
         "best_pv_shift_spread_ct_per_kwh": None,
         "best_grid_spread_ct_per_kwh": None,
         "latest_economics": {},
+        "latest_settlement_accounting": {},
         "latest_reserve": {},
         "latest_external_derating": {},
         "latest_export_execution": {},
+        "latest_export_tracking": {},
         "latest_summary": {},
     }
 
@@ -9382,7 +10521,6 @@ def update_direct_marketing_daily_report(
     plan: Dict[str, Any],
     cfg: Dict[str, Any],
 ) -> Optional[Dict[str, Any]]:
-    del plan  # The report is derived from the validated monitor contract.
     monitor = payload.get("direct_marketing_monitor") if isinstance(payload.get("direct_marketing_monitor"), dict) else {}
     if not monitor:
         return None
@@ -9427,6 +10565,9 @@ def update_direct_marketing_daily_report(
         _direct_marketing_report_count(report.setdefault("warning_counts", {}), str(warning or "unknown"))
 
     policy_target = str(monitor.get("policy_target_state") or "").strip().upper()
+    policy_decision = payload.get("direct_marketing_policy_decision") if isinstance(payload.get("direct_marketing_policy_decision"), dict) else {}
+    policy_storage_budget = policy_decision.get("storage_budget") if isinstance(policy_decision.get("storage_budget"), dict) else {}
+    policy_export_budget_w = max(0.0, safe_float(policy_storage_budget.get("export_budget_w"), 0.0))
     policy_active = bool(
         monitor.get("active")
         and monitor.get("policy_commands_allowed")
@@ -9440,14 +10581,24 @@ def update_direct_marketing_daily_report(
         and decision_state.startswith((
             "direct_marketing_eco_plus_export",
             "direct_marketing_eco_plus_headroom_export",
-            "direct_marketing_arbitrage_export",
         ))
     )
     bat_w = safe_float(payload.get("bat_w"), 0.0)
     grid_w = safe_float(payload.get("grid_w"), 0.0)
+    if policy_active and elapsed_s > 0.0:
+        throughput_kwh = abs(bat_w) * elapsed_s / 3600000.0
+        report["policy_battery_throughput_kwh"] = round(
+            safe_float(report.get("policy_battery_throughput_kwh"), 0.0) + throughput_kwh,
+            4,
+        )
+        throughput_key = "policy_battery_discharge_kwh" if bat_w < 0.0 else "policy_battery_charge_kwh"
+        report[throughput_key] = round(safe_float(report.get(throughput_key), 0.0) + throughput_kwh, 4)
+
+    actual_export_kwh = 0.0
     if actual_policy_export and elapsed_s > 0.0:
         battery_to_grid_w = min(max(0.0, -bat_w), max(0.0, -grid_w))
         export_kwh = battery_to_grid_w * elapsed_s / 3600000.0
+        actual_export_kwh = export_kwh
         report["real_export_kwh"] = round(safe_float(report.get("real_export_kwh"), 0.0) + export_kwh, 4)
         target_key = "real_headroom_export_kwh" if policy_target == "HEADROOM_EXPORT" else "real_profit_export_kwh"
         report[target_key] = round(safe_float(report.get(target_key), 0.0) + export_kwh, 4)
@@ -9456,11 +10607,24 @@ def update_direct_marketing_daily_report(
             current_window.get("net_sell_ct"),
             safe_float(current_window.get("avg_market_ct"), 0.0),
         )
+        gross_sell_ct = safe_float(current_window.get("gross_sell_ct"), net_sell_ct)
+        fee_cost_ct = max(0.0, safe_float(current_window.get("fee_cost_ct"), gross_sell_ct - net_sell_ct))
         report["real_export_revenue_eur"] = round(
             safe_float(report.get("real_export_revenue_eur"), 0.0) + export_kwh * net_sell_ct / 100.0,
             4,
         )
-        policy_decision = payload.get("direct_marketing_policy_decision") if isinstance(payload.get("direct_marketing_policy_decision"), dict) else {}
+        report["real_gross_export_revenue_eur"] = round(
+            safe_float(report.get("real_gross_export_revenue_eur"), 0.0) + export_kwh * gross_sell_ct / 100.0,
+            4,
+        )
+        report["real_variable_fee_cost_eur"] = round(
+            safe_float(report.get("real_variable_fee_cost_eur"), 0.0) + export_kwh * fee_cost_ct / 100.0,
+            4,
+        )
+        report["real_net_export_revenue_eur"] = round(
+            safe_float(report.get("real_net_export_revenue_eur"), 0.0) + export_kwh * net_sell_ct / 100.0,
+            4,
+        )
         policy_economics = policy_decision.get("economics") if isinstance(policy_decision.get("economics"), dict) else {}
         margin_ct = policy_economics.get("margin_ct_kwh")
         if margin_ct is not None:
@@ -9469,6 +10633,23 @@ def update_direct_marketing_daily_report(
                 + export_kwh * safe_float(margin_ct, 0.0) / 100.0,
                 4,
             )
+    if policy_active and policy_target in {"FORCE_EXPORT", "HEADROOM_EXPORT"} and elapsed_s > 0.0:
+        budget_kwh = policy_export_budget_w * elapsed_s / 3600000.0
+        tracking_error_kwh = max(0.0, budget_kwh - actual_export_kwh)
+        report["policy_export_budget_kwh"] = round(
+            safe_float(report.get("policy_export_budget_kwh"), 0.0) + budget_kwh,
+            4,
+        )
+        report["export_tracking_error_kwh"] = round(
+            safe_float(report.get("export_tracking_error_kwh"), 0.0) + tracking_error_kwh,
+            4,
+        )
+        if tracking_error_kwh > 0.0001:
+            report["missed_export_kwh"] = round(
+                safe_float(report.get("missed_export_kwh"), 0.0) + tracking_error_kwh,
+                4,
+            )
+            report["missed_export_cycles"] = safe_int(report.get("missed_export_cycles"), 0) + 1
     elif policy_active and elapsed_s > 0.0 and policy_target == "FORCE_CHARGE_PV":
         import_guard_w = max(0.0, safe_float(cfg.get("direct_marketing_pv_store_import_guard_w"), 80.0))
         grid_import_w = max(0.0, grid_w - import_guard_w)
@@ -9481,6 +10662,15 @@ def update_direct_marketing_daily_report(
 
     economics = monitor.get("economics") if isinstance(monitor.get("economics"), dict) else {}
     reserve = monitor.get("reserve") if isinstance(monitor.get("reserve"), dict) else {}
+    direct_plan = plan.get("direct_marketing") if isinstance(plan, dict) and isinstance(plan.get("direct_marketing"), dict) else plan
+    settlement_accounting = (
+        direct_plan.get("settlement_accounting")
+        if isinstance(direct_plan, dict) and isinstance(direct_plan.get("settlement_accounting"), dict)
+        else {}
+    )
+    if not settlement_accounting and isinstance(monitor.get("settlement_accounting"), dict):
+        settlement_accounting = monitor.get("settlement_accounting")
+    report["latest_settlement_accounting"] = dict(settlement_accounting)
     report["latest_economics"] = {
         "pv_shift_spread_ct_per_kwh": economics.get("pv_shift_spread_ct_per_kwh"),
         "pv_shift_margin_pct": economics.get("pv_shift_margin_pct"),
@@ -9738,20 +10928,20 @@ def controlled_wallbox_auto_freerun_requested(
     )
 
 
-def _observe_wallbox_storage_policy_requested(
+def _observe_wallbox_storage_policy_value(
     cfg: Dict[str, Any],
     wb_intent: Dict[str, Any],
     wb_mode: int,
     *,
     allow_inactive: bool = False,
-) -> bool:
-    """Storage-only reserve policy for a wallbox that stays in observe mode."""
+) -> str:
+    """Liefert die exakte Speicherpolicy für eine Wallbox im Beobachtungsmodus."""
     if wb_mode != MODE_OFF:
-        return False
+        return ""
     reason = str(wb_intent.get("reason") or "").strip().lower()
     request = str(wb_intent.get("battery_request") or "").strip().lower()
     if reason in ("no_vehicle_connected", "manual_pause", "bev_full_blocked") or request == "release":
-        return False
+        return ""
     active = bool(
         wb_intent.get("active")
         or wb_intent.get("car_active")
@@ -9761,7 +10951,7 @@ def _observe_wallbox_storage_policy_requested(
         or abs(safe_float(wb_intent.get("wb_power_w"), 0.0)) > 500.0
     )
     if not active and not allow_inactive:
-        return False
+        return ""
     raw_policy = wb_intent.get("observe_storage_policy")
     if raw_policy is None:
         wb_id = safe_int(wb_intent.get("wb_id", wb_intent.get("charger_id", 1)), 1)
@@ -9783,8 +10973,40 @@ def _observe_wallbox_storage_policy_requested(
                     break
             if raw_policy is not None:
                 break
-    text = str(raw_policy or "").strip().lower()
-    return text in ("reserve", "pv_battery", "battery", "akku", "wbminsoc", "floor", "1", "true", "yes", "on")
+    return str(raw_policy or "").strip().lower()
+
+
+def _observe_wallbox_storage_policy_requested(
+    cfg: Dict[str, Any],
+    wb_intent: Dict[str, Any],
+    wb_mode: int,
+    *,
+    allow_inactive: bool = False,
+) -> bool:
+    """Speicherreserve-Policy für eine extern gesteuerte Wallbox."""
+    policy = _observe_wallbox_storage_policy_value(
+        cfg,
+        wb_intent,
+        wb_mode,
+        allow_inactive=allow_inactive,
+    )
+    return policy in ("reserve", "pv_battery", "battery", "akku", "wbminsoc", "floor", "1", "true", "yes", "on")
+
+
+def _observe_wallbox_curve_floor_guard_requested(
+    cfg: Dict[str, Any],
+    wb_intent: Dict[str, Any],
+    wb_mode: int,
+    *,
+    allow_inactive: bool = False,
+) -> bool:
+    """Erhält die harte wbminSoC-Untergrenze, während der Speicher sonst seiner Kurve folgt."""
+    return _observe_wallbox_storage_policy_value(
+        cfg,
+        wb_intent,
+        wb_mode,
+        allow_inactive=allow_inactive,
+    ) == "curve"
 
 
 def observe_wallbox_reserve_release_context(
@@ -9869,7 +11091,13 @@ def unmanaged_wallbox_wbminsoc_hold_decision(
         wb_mode,
         allow_inactive=previous_hold_grace,
     )
-    if observe_storage_floor and request in ("", "none"):
+    observe_curve_floor_guard = _observe_wallbox_curve_floor_guard_requested(
+        cfg,
+        wb_intent,
+        wb_mode,
+        allow_inactive=previous_hold_grace,
+    )
+    if (observe_storage_floor or observe_curve_floor_guard) and request in ("", "none"):
         request = "hold_discharge"
     controlled_waiting_wbmin = bool(
         intent_fresh
@@ -9900,7 +11128,8 @@ def unmanaged_wallbox_wbminsoc_hold_decision(
     if floor_soc <= 0.0:
         return None
 
-    wallbox_w = abs(safe_float(live.get("Wallbox_Power"), 0.0))
+    wb_power = wallbox_actual_power_snapshot(live, wb_native)
+    wallbox_w = abs(safe_float(wb_power.get("power_w"), 0.0))
     intent_w = abs(safe_float(wb_intent.get("wb_power_w"), 0.0))
     native_charging = bool((wb_native or {}).get("charging_active"))
     details = (wb_native or {}).get("wb_details") or []
@@ -9975,7 +11204,11 @@ def unmanaged_wallbox_wbminsoc_hold_decision(
         )
     )
     previous_curve_charge = previous_pv_charge_active
-    external_wb_owner = bool((external_manager and wb_mode != MODE_OFF) or observe_storage_floor)
+    external_wb_owner = bool(
+        (external_manager and wb_mode != MODE_OFF)
+        or observe_storage_floor
+        or observe_curve_floor_guard
+    )
     hold_active = bool(
         soc <= floor_soc
         or controlled_waiting_wbmin
@@ -9984,7 +11217,18 @@ def unmanaged_wallbox_wbminsoc_hold_decision(
     if not hold_active:
         return None
 
-    house_wp_cap_w = house_heatpump_discharge_cap_w(live, observed_wallbox_w, max_discharge_w)
+    live_with_wallbox = dict(live)
+    live_with_wallbox["Wallbox_Power"] = observed_wallbox_w
+    live_with_wallbox["Wallbox_Power_Source"] = str(wb_power.get("source") or "live_data")
+    live_with_wallbox["Wallbox_Live_Power"] = abs(safe_float(wb_power.get("live_w"), 0.0))
+    live_with_wallbox["Wallbox_Home_Includes"] = bool(wb_power.get("home_includes_wallbox"))
+    live_with_wallbox = live_with_wallbox_native_balance(live_with_wallbox, wb_native)
+
+    house_wp_cap_w = house_heatpump_discharge_cap_w(
+        live_with_wallbox,
+        observed_wallbox_w,
+        max_discharge_w,
+    )
     house_wp_cap_w = smooth_house_heatpump_discharge_cap_w(cfg, house_wp_cap_w, previous_state)
     intent_reason = str(wb_intent.get("reason") or "").strip()
     scheduled_grid_charge = bool(
@@ -10013,8 +11257,8 @@ def unmanaged_wallbox_wbminsoc_hold_decision(
             curve_soc = floor_soc
         else:
             curve_soc = max(float(curve_soc), floor_soc)
-    pv_house_surplus_w = pv_surplus_after_house_heatpump_w(live, observed_wallbox_w)
-    grid_power_w = safe_float(live.get("Grid_Power"), 0.0)
+    pv_house_surplus_w = pv_surplus_after_house_heatpump_w(live_with_wallbox, observed_wallbox_w)
+    grid_power_w = safe_float(live_with_wallbox.get("Grid_Power"), 0.0)
     grid_import_w = max(0, int(round(grid_power_w)))
     grid_export_w = max(0, int(round(-grid_power_w)))
     current_battery_charge_w = max(0.0, safe_float(live.get("Battery_Power"), 0.0))
@@ -10127,6 +11371,12 @@ def unmanaged_wallbox_wbminsoc_hold_decision(
                 "freie PV nach Haus/WP %.0fW lädt den Speicher bis zur Hausakku-Reserve; "
                 "die Wallbox bleibt beobachtet, Netz bleibt aus"
             ) % (floor_soc, soc, curve_txt, pv_house_surplus_w)
+        elif observe_curve_floor_guard:
+            reason = (
+                "Beobachten + Ladekurve am wbminSoC-Hartboden %.1f%% (SoC %.1f%%, Kurve %s): "
+                "freie PV nach Haus/WP %.0fW folgt weiter der Speicherkurve; "
+                "die Wallbox bleibt ausschließlich beobachtet"
+            ) % (floor_soc, soc, curve_txt, pv_house_surplus_w)
         elif explicit_external_wallbox_mode:
             reason = (
                 "Bekannte Wallbox in PV + Akku bis Untergrenze %.1f%% (SoC %.1f%%, Kurve %s): "
@@ -10156,6 +11406,10 @@ def unmanaged_wallbox_wbminsoc_hold_decision(
             "unmanaged_wallbox_wbminsoc_hold": True,
             "wbminsoc_pv_charge_active": True,
             "observe_storage_policy": "reserve" if observe_storage_floor else "curve",
+            "observe_curve_floor_guard": bool(observe_curve_floor_guard),
+            "wallbox_power_w": int(round(observed_wallbox_w)),
+            "wallbox_power_source": str(wb_power.get("source") or "live_data"),
+            "wallbox_home_includes": bool(wb_power.get("home_includes_wallbox")),
             "house_heatpump_discharge_cap_w": house_wp_cap_w,
             "planned_grid_pv_charge_w": charge_w,
             "planned_grid_pv_surplus_w": pv_charge_available_w,
@@ -10193,6 +11447,12 @@ def unmanaged_wallbox_wbminsoc_hold_decision(
             "Wallbox bleibt beobachtet; oberhalb der Reserve darf das Auto den Akku nutzen. "
             "Unterhalb der Reserve stützt der Speicher nur Haus/WP-Defizit bis %dW"
         ) % (floor_txt, house_wp_cap_w)
+    elif observe_curve_floor_guard:
+        reason = (
+            "Beobachten + Ladekurve am wbminSoC-Hartboden %s: "
+            "die Wallbox bleibt fremdgesteuert; der Speicher folgt oberhalb der Untergrenze seiner Kurve. "
+            "Am Hartboden stützt er nur Haus/WP-Defizit bis %dW"
+        ) % (floor_txt, house_wp_cap_w)
     elif external_manager and wb_mode != MODE_OFF:
         reason = (
             "Bekannte Wallbox im Modus PV + Akku bis Untergrenze %s: "
@@ -10228,6 +11488,10 @@ def unmanaged_wallbox_wbminsoc_hold_decision(
         "unmanaged_wallbox_wbminsoc_hold": True,
         "wbminsoc_target_active": external_wb_owner,
         "observe_storage_policy": "reserve" if observe_storage_floor else "curve",
+        "observe_curve_floor_guard": bool(observe_curve_floor_guard),
+        "wallbox_power_w": int(round(observed_wallbox_w)),
+        "wallbox_power_source": str(wb_power.get("source") or "live_data"),
+        "wallbox_home_includes": bool(wb_power.get("home_includes_wallbox")),
         "house_heatpump_discharge_cap_w": house_wp_cap_w,
         "auto_limit": auto_limit,
         "scheduled_grid_charge": scheduled_grid_charge,
@@ -10890,78 +12154,123 @@ def wallbox_phase_transition_reservation_contract(
     *,
     now_s: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """Validiere eine kurzlebige Wallbox-Reservierung ohne Geräte-I/O."""
+    """Prüft unabhängige Aufträge je Wallbox ohne slotübergreifende Sperren."""
 
     intent = wb_intent if isinstance(wb_intent, dict) else {}
     now_value = float(now_s if now_s is not None else time.time())
     intent_ts = safe_float(intent.get("ts"), 0.0)
-    expires_ts = safe_float(intent.get("phase_transition_until_ts"), 0.0)
-    requested_w = max(0, safe_int(intent.get("phase_transition_reserved_w"), 0))
-    requested = bool(intent.get("phase_transition_active"))
-    fresh = bool(intent) and (
-        intent_ts <= 0.0
-        or (now_value - intent_ts) <= 60.0
-    )
-    expired = bool(expires_ts > 0.0 and now_value >= expires_ts)
-    live_connected = bool(
-        intent.get("active")
-        or intent.get("car_active")
-        or intent.get("connected")
-        or intent.get("plugged")
-        or intent.get("charging_active")
-        or intent.get("start_requested")
-    )
-    # CP-Unterbrechungen sind Bestandteil mehrerer Phasenwechsel-Sequenzen und
-    # sehen kurz wie ein abgestecktes Fahrzeug aus. Solange der Wallbox-Manager
-    # die frische, zeitlich begrenzte Reservierung aktiv hält, ist genau diese
-    # Reservierung der belastbarere Verbindungsnachweis.
-    connection_held_by_transition = bool(requested and requested_w > 0 and not expired)
-    connected = bool(live_connected or connection_held_by_transition)
-    manual_pause = bool(intent.get("manual_pause"))
-    bev_full_blocked = bool(intent.get("bev_full_blocked"))
-    mode_off = bool(
-        "wb_mode_active" in intent
-        and normalize_wb_mode(intent.get("wb_mode_active")) == MODE_OFF
-    )
-    blockers: List[str] = []
-    if not requested:
-        blockers.append("not_requested")
-    if not fresh:
-        blockers.append("stale_intent")
-    if requested_w <= 0:
-        blockers.append("no_reservation")
-    if expired:
-        blockers.append("reservation_expired")
-    if not connected:
-        blockers.append("no_vehicle")
-    if manual_pause:
-        blockers.append("manual_pause")
-    if bev_full_blocked:
-        blockers.append("bev_full")
-    if mode_off:
-        blockers.append("wallbox_off")
+    fresh = bool(intent) and (intent_ts <= 0.0 or (now_value - intent_ts) <= 60.0)
+    raw_items = intent.get("phase_transition_reservations")
+    items: List[Dict[str, Any]] = []
+    if isinstance(raw_items, list):
+        for raw in raw_items:
+            if not isinstance(raw, dict):
+                continue
+            item = dict(raw)
+            lease_until = safe_float(item.get("lease_until_ts", item.get("expires_ts")), 0.0)
+            requested_w = max(0, safe_int(item.get("requested_w", item.get("reserved_w")), 0))
+            committed = str(item.get("grant_state") or "") == "committed" or safe_int(item.get("committed_w"), 0) > 0
+            blockers: List[str] = []
+            if not fresh:
+                blockers.append("stale_intent")
+            if not item.get("active"):
+                blockers.append("not_requested")
+            if requested_w <= 0:
+                blockers.append("no_reservation")
+            if lease_until > 0.0 and now_value >= lease_until:
+                blockers.append("reservation_expired")
+            # Slotlokale Pause-/Voll-Evidenz darf einen neuen Auftrag ablehnen.
+            # Der globale Ladeende-Latch einer anderen Wallbox wird bewusst nicht
+            # herangezogen; eine bereits gebundene Sequenz bleibt maßgeblich.
+            if not committed and item.get("manual_pause"):
+                blockers.append("manual_pause")
+            if not committed and item.get("bev_full_blocked"):
+                blockers.append("bev_full")
+            if blockers:
+                continue
+            item.update({
+                "reservation_id": str(item.get("reservation_id") or item.get("transition_id") or ""),
+                "wb_id": max(0, safe_int(item.get("wb_id"), 0)),
+                "requested_w": requested_w,
+                "reserved_w": requested_w,
+                "lease_until_ts": lease_until,
+                "expires_ts": lease_until,
+                "blockers": [],
+            })
+            items.append(item)
 
-    active = not blockers
+    if not isinstance(raw_items, list):
+        expires_ts = safe_float(intent.get("phase_transition_until_ts"), 0.0)
+        requested_w = max(0, safe_int(intent.get("phase_transition_reserved_w"), 0))
+        requested = bool(intent.get("phase_transition_active"))
+        expired = bool(expires_ts > 0.0 and now_value >= expires_ts)
+        blockers = []
+        if not requested:
+            blockers.append("not_requested")
+        if not fresh:
+            blockers.append("stale_intent")
+        if requested_w <= 0:
+            blockers.append("no_reservation")
+        if expired:
+            blockers.append("reservation_expired")
+        if bool(intent.get("manual_pause")):
+            blockers.append("manual_pause")
+        if bool(intent.get("bev_full_blocked")):
+            blockers.append("bev_full")
+        if "wb_mode_active" in intent and normalize_wb_mode(intent.get("wb_mode_active")) == MODE_OFF:
+            blockers.append("wallbox_off")
+        if not blockers:
+            items.append({
+                "schema_version": "wallbox_phase_transition_v1_compat",
+                "reservation_id": str(intent.get("phase_transition_reservation_id") or "legacy-phase-transition"),
+                "wb_id": safe_int((intent.get("phase_transition_charger_ids") or [0])[0], 0),
+                "stage": "recovery_hold",
+                "target_phases": safe_int(intent.get("phase_transition_target_phases"), 0),
+                "requested_w": requested_w,
+                "reserved_w": requested_w,
+                "lease_until_ts": expires_ts,
+                "expires_ts": expires_ts,
+                "started_ts": safe_float(intent.get("phase_transition_started_ts"), 0.0),
+                "source": str(intent.get("phase_transition_source") or "legacy"),
+                "reason_code": "legacy_phase_transition",
+                "active": True,
+                "grant_state": "waiting",
+            })
+
+    reserved_w = sum(max(0, safe_int(item.get("requested_w"), 0)) for item in items)
+    targets = sorted({safe_int(item.get("target_phases"), 0) for item in items if safe_int(item.get("target_phases"), 0) in (1, 3)})
     return {
-        "contract": "wallbox_phase_transition_reservation_v1",
-        "active": active,
-        "requested": requested,
-        "reserved_w": requested_w if active else 0,
-        "requested_w": requested_w,
+        "contract": "wallbox_phase_transition_reservation_v2",
+        "active": bool(items),
+        "requested": bool(items),
+        "reservations": items,
+        "reserved_w": reserved_w,
+        "requested_w": reserved_w,
         "fresh": fresh,
-        "connected": connected,
-        "live_connected": live_connected,
-        "connection_held_by_transition": connection_held_by_transition,
-        "expired": expired,
+        "connected": bool(items),
+        "live_connected": bool(intent.get("active") or intent.get("car_active") or intent.get("charging_active")),
+        "connection_held_by_transition": bool(items),
+        "expired": False,
         "intent_ts": intent_ts,
-        "started_ts": safe_float(intent.get("phase_transition_started_ts"), 0.0),
-        "expires_ts": expires_ts,
-        "remaining_s": max(0.0, expires_ts - now_value) if active and expires_ts > 0.0 else 0.0,
-        "target_phases": safe_int(intent.get("phase_transition_target_phases"), 0),
-        "targets": intent.get("phase_transition_targets") if isinstance(intent.get("phase_transition_targets"), list) else [],
-        "charger_ids": intent.get("phase_transition_charger_ids") if isinstance(intent.get("phase_transition_charger_ids"), list) else [],
-        "source": str(intent.get("phase_transition_source") or ""),
-        "blockers": blockers,
+        "started_ts": min((safe_float(item.get("started_ts"), 0.0) for item in items), default=0.0),
+        "expires_ts": max((safe_float(item.get("lease_until_ts"), 0.0) for item in items), default=0.0),
+        "remaining_s": max((max(0.0, safe_float(item.get("lease_until_ts"), 0.0) - now_value) for item in items), default=0.0),
+        "target_phases": targets[0] if len(targets) == 1 else 0,
+        "targets": targets,
+        "charger_ids": [safe_int(item.get("wb_id"), 0) for item in items],
+        "source": "per_wallbox_request_grant_commit",
+        "blockers": [] if items else ["no_valid_reservation"],
+    }
+    budget_kwh = safe_float(report.get("policy_export_budget_kwh"), 0.0)
+    report["latest_export_tracking"] = {
+        "budget_kwh": round(budget_kwh, 4),
+        "real_export_kwh": round(safe_float(report.get("real_export_kwh"), 0.0), 4),
+        "tracking_error_kwh": round(safe_float(report.get("export_tracking_error_kwh"), 0.0), 4),
+        "fulfilment_pct": round(
+            100.0 * safe_float(report.get("real_export_kwh"), 0.0) / budget_kwh,
+            1,
+        ) if budget_kwh > 0.0 else None,
+        "missed_export_cycles": safe_int(report.get("missed_export_cycles"), 0),
     }
 
 
@@ -11042,7 +12351,7 @@ def wallbox_actual_power_snapshot(
             "source": "wallbox_native",
             "live_w": live_w,
             "native_w": native_w,
-            "home_includes_wallbox": live_w <= 50.0,
+            "home_includes_wallbox": bool(live.get("Wallbox_Home_Includes", False)) or live_w <= 50.0,
         }
     return {
         "power_w": live_w,
@@ -11790,7 +13099,7 @@ def hardening_contracts_from_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
     scope = plan.get("hardening_contracts_scope") or meta.get("hardening_contracts_scope")
     return {
         "version": str(version or "hardening_contracts_v1"),
-        "scope": str(scope or "storage_hardening_v1"),
+        "scope": str(scope or "roadmap_3_to_7"),
         "contracts": contracts,
     }
 
@@ -11865,7 +13174,7 @@ def build_multi_wallbox_fairness_contract(
         status = "observe_or_stale"
 
     return {
-        "contract_item": 5,
+        "roadmap_item": 5,
         "name": "Multi-Wallbox-Fairness",
         "owner": "wallbox_manager+storage_manager",
         "active": bool(configured_count > 1 or active_count > 0),
@@ -12559,6 +13868,248 @@ def protected_decision(
     return None
 
 
+HEADROOM_EXECUTION_CONTRACT_VERSION = 1
+
+
+def _headroom_typed_number(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    parsed = float(value)
+    return parsed if math.isfinite(parsed) else None
+
+
+def _headroom_timestamp_s(value: Any) -> Optional[float]:
+    parsed = _headroom_typed_number(value)
+    if parsed is None or parsed <= 0.0:
+        return None
+    return parsed / 1000.0 if parsed > 100_000_000_000.0 else parsed
+
+
+def legacy_headroom_execution_contract(
+    cfg: Dict[str, Any],
+    live: Dict[str, Any],
+    plan: Dict[str, Any],
+    previous_state: Dict[str, Any],
+    now_s: float,
+) -> Dict[str, Any]:
+    """Bindet die Legacy-Headroomentladung an den aktuellen kanonischen Slot.
+
+    Der globale Prognosedruck bleibt Diagnose. Eine reale DISCH-Freigabe entsteht
+    erst aus einem frischen, hashgültigen Plan, dessen aktueller Slot innerhalb
+    des expliziten Pre-Dump-Fensters positive Restenergie ausweist.
+    """
+
+    blocked: Dict[str, Any] = {
+        "schema_version": HEADROOM_EXECUTION_CONTRACT_VERSION,
+        "allowed": False,
+        "reason_code": "HEADROOM_PLAN_UNVALIDATED",
+        "plan_id": None,
+        "slot_id": None,
+        "earliest_start_ts": None,
+        "deadline_ts": None,
+        "target_soc": None,
+        "hard_floor_soc": None,
+        "plan_accounted_wh": 0.0,
+        "slot_accounted_wh": 0.0,
+        "residual_wh": 0.0,
+        "accounted_observed_w": 0.0,
+        "accounted_interval_s": 0.0,
+        "generation_reset": True,
+    }
+    validation = validate_canonical_plan(plan, int(now_s * 1000.0))
+    blocked["plan_id"] = validation.get("plan_id")
+    blocked["slot_id"] = validation.get("slot_id")
+    if not validation.get("valid"):
+        blocked["reason_code"] = "HEADROOM_%s" % str(
+            validation.get("block_reason_code") or "PLAN_INVALID"
+        )
+        return blocked
+
+    plan_id = str(validation.get("plan_id") or "")
+    slot_id = str(validation.get("slot_id") or "")
+    slot = validation.get("slot") if isinstance(validation.get("slot"), dict) else {}
+    slots = plan.get("slots") if isinstance(plan.get("slots"), list) else []
+    execution_slots = []
+    execution_deadlines = set()
+    for item in slots:
+        if not isinstance(item, dict):
+            blocked["reason_code"] = "HEADROOM_PLAN_SLOT_INVALID"
+            return blocked
+        item_headroom = item.get("headroom_wh") if isinstance(item.get("headroom_wh"), dict) else None
+        item_residual_wh = (
+            _headroom_typed_number(item_headroom.get("residual"))
+            if item_headroom is not None
+            else None
+        )
+        if item_residual_wh is None or item_residual_wh < 0.0:
+            blocked["reason_code"] = "HEADROOM_PLAN_SLOT_RESIDUAL_INVALID"
+            return blocked
+        if item_residual_wh <= 0.0:
+            continue
+        item_start_s = _headroom_timestamp_s(item.get("start_ts_ms"))
+        item_deadline_s = _headroom_timestamp_s(item_headroom.get("deadline_ts_ms"))
+        if item_start_s is None or item_deadline_s is None or item_start_s >= item_deadline_s:
+            blocked["reason_code"] = "HEADROOM_PLAN_SLOT_WINDOW_INVALID"
+            return blocked
+        execution_slots.append((item, item_residual_wh, item_start_s, item_deadline_s))
+        execution_deadlines.add(round(item_deadline_s, 3))
+    if not execution_slots:
+        blocked["reason_code"] = "HEADROOM_PLAN_RESIDUAL_DEPLETED"
+        return blocked
+    if len(execution_deadlines) != 1:
+        blocked["reason_code"] = "HEADROOM_PLAN_DEADLINE_INCONSISTENT"
+        return blocked
+
+    start_s = min(item[2] for item in execution_slots)
+    deadline_s = execution_slots[0][3]
+    blocked["earliest_start_ts"] = start_s
+    blocked["deadline_ts"] = deadline_s
+    if start_s is None:
+        blocked["reason_code"] = "HEADROOM_EARLIEST_START_MISSING_OR_INVALID"
+        return blocked
+    if deadline_s is None or start_s >= deadline_s:
+        blocked["reason_code"] = "HEADROOM_DEADLINE_MISSING_OR_INVALID"
+        return blocked
+    if now_s < start_s:
+        blocked["reason_code"] = "HEADROOM_EXECUTION_BEFORE_START"
+        return blocked
+    if now_s >= deadline_s:
+        blocked["reason_code"] = "HEADROOM_EXECUTION_AFTER_DEADLINE"
+        return blocked
+
+    slot_start_s = _headroom_timestamp_s(slot.get("start_ts_ms"))
+    slot_end_s = _headroom_timestamp_s(slot.get("end_ts_ms"))
+    if (
+        not slot_id
+        or slot_start_s is None
+        or slot_end_s is None
+        or not slot_start_s <= now_s < slot_end_s
+    ):
+        blocked["reason_code"] = "HEADROOM_CURRENT_SLOT_BINDING_INVALID"
+        return blocked
+
+    slot_headroom = slot.get("headroom_wh") if isinstance(slot.get("headroom_wh"), dict) else None
+    if slot_headroom is None:
+        blocked["reason_code"] = "HEADROOM_CURRENT_SLOT_RESIDUAL_MISSING"
+        return blocked
+    slot_required_wh = _headroom_typed_number(slot_headroom.get("required"))
+    slot_residual_wh = _headroom_typed_number(slot_headroom.get("residual"))
+    slot_deadline_s = _headroom_timestamp_s(slot_headroom.get("deadline_ts_ms"))
+    if (
+        slot_required_wh is None
+        or slot_residual_wh is None
+        or slot_required_wh < 0.0
+        or slot_residual_wh < 0.0
+        or slot_residual_wh > slot_required_wh + 0.5
+        or slot_deadline_s is None
+        or abs(slot_deadline_s - deadline_s) > 1.0
+    ):
+        blocked["reason_code"] = "HEADROOM_CURRENT_SLOT_RESIDUAL_INVALID"
+        return blocked
+
+    # Nur die hashgebundenen kanonischen Slots sind ausführungsautoritativ.
+    # Die Legacy-Wurzelfelder bleiben Diagnose und dürfen keine Freigabe oder
+    # Restenergie am plan_id-Vertrag vorbei erzeugen.
+    total_residual_wh = sum(item[1] for item in execution_slots)
+    projection = slot.get("projection") if isinstance(slot.get("projection"), dict) else {}
+    target_soc = _headroom_typed_number(projection.get("target_soc_pct"))
+    if target_soc is None or not 0.0 <= target_soc <= 100.0:
+        blocked["reason_code"] = "HEADROOM_TARGET_SOC_MISSING_OR_INVALID"
+        return blocked
+    soc_contract = slot.get("soc_pct") if isinstance(slot.get("soc_pct"), dict) else {}
+    hard_floor_candidates = [target_soc]
+    for value in (
+        soc_contract.get("reserve_floor"),
+        soc_contract.get("notstrom_floor"),
+        cfg.get("storage_predump_min_soc"),
+        cfg.get("emergency_power_reserve"),
+    ):
+        parsed = _headroom_typed_number(value)
+        if parsed is not None and 0.0 <= parsed <= 100.0:
+            hard_floor_candidates.append(parsed)
+    hard_floor_soc = max(hard_floor_candidates)
+    blocked["target_soc"] = round(target_soc, 3)
+    blocked["hard_floor_soc"] = round(hard_floor_soc, 3)
+
+    previous_plan_id = str(previous_state.get("headroom_execution_plan_id") or "")
+    previous_deadline_s = _headroom_timestamp_s(
+        previous_state.get("headroom_execution_deadline_ts")
+    )
+    same_generation = bool(
+        previous_plan_id == plan_id
+        and previous_deadline_s is not None
+        and abs(previous_deadline_s - deadline_s) <= 1.0
+    )
+    plan_accounted_wh = 0.0
+    slot_accounted_wh = 0.0
+    if same_generation:
+        plan_accounted_wh = max(
+            0.0,
+            _headroom_typed_number(previous_state.get("headroom_execution_plan_accounted_wh")) or 0.0,
+        )
+        if str(previous_state.get("headroom_execution_slot_id") or "") == slot_id:
+            slot_accounted_wh = max(
+                0.0,
+                _headroom_typed_number(previous_state.get("headroom_execution_slot_accounted_wh")) or 0.0,
+            )
+
+    accounted_interval_s = 0.0
+    accounted_observed_w = 0.0
+    if (
+        same_generation
+        and str(previous_state.get("parallel_state") or previous_state.get("state") or "")
+        == "parallel_headroom_discharge"
+    ):
+        last_account_ts = _headroom_typed_number(
+            previous_state.get("headroom_execution_last_account_ts")
+        )
+        max_gap_s = max(
+            15.0,
+            min(180.0, safe_float(cfg.get("storage_headroom_discharge_energy_gap_s"), 180.0)),
+        )
+        if last_account_ts is not None and 0.0 < last_account_ts <= now_s:
+            accounted_interval_s = min(max_gap_s, max(0.0, now_s - last_account_ts))
+            accounted_observed_w = max(0.0, -safe_float(live.get("Battery_Power"), 0.0))
+            realized_wh = accounted_observed_w * accounted_interval_s / 3600.0
+            plan_accounted_wh += realized_wh
+            if str(previous_state.get("headroom_execution_slot_id") or "") == slot_id:
+                slot_accounted_wh += realized_wh
+
+    remaining_plan_wh = max(0.0, total_residual_wh - plan_accounted_wh)
+    remaining_slot_wh = max(0.0, slot_residual_wh - slot_accounted_wh)
+    residual_wh = min(remaining_plan_wh, remaining_slot_wh)
+    blocked.update({
+        "plan_id": plan_id,
+        "slot_id": slot_id,
+        "plan_accounted_wh": round(plan_accounted_wh, 3),
+        "slot_accounted_wh": round(slot_accounted_wh, 3),
+        "slot_required_wh": round(slot_required_wh, 3),
+        "slot_residual_planned_wh": round(slot_residual_wh, 3),
+        "total_residual_planned_wh": round(total_residual_wh, 3),
+        "residual_wh": round(residual_wh, 3),
+        "accounted_observed_w": round(accounted_observed_w, 3),
+        "accounted_interval_s": round(accounted_interval_s, 3),
+        "generation_reset": not same_generation,
+    })
+    soc = _headroom_typed_number(live.get("SOC"))
+    if soc is None:
+        blocked["reason_code"] = "HEADROOM_LIVE_SOC_MISSING_OR_INVALID"
+        return blocked
+    if soc <= hard_floor_soc:
+        blocked["reason_code"] = "HEADROOM_TARGET_OR_HARD_FLOOR_REACHED"
+        return blocked
+    if residual_wh <= 0.0:
+        blocked["reason_code"] = "HEADROOM_RESIDUAL_DEPLETED"
+        return blocked
+
+    return {
+        **blocked,
+        "allowed": True,
+        "reason_code": "HEADROOM_EXECUTION_WINDOW_ACTIVE",
+        "generation_reset": not same_generation,
+    }
+
+
 def decide_next_cycle(
     cfg: Dict[str, Any],
     live: Dict[str, Any],
@@ -12577,7 +14128,11 @@ def decide_next_cycle(
     input_snapshot = build_storage_input_snapshot(live, plan, wb_native, now_s=now_s)
     live_model = input_snapshot.live
     live = live_model.to_legacy_dict()
-    plan = input_snapshot.plan.to_legacy_dict()
+    plan = (
+        input_snapshot.plan
+        if isinstance(input_snapshot.plan, ValidatedCanonicalPlanSnapshot)
+        else input_snapshot.plan.to_legacy_dict()
+    )
     wb_native = input_snapshot.wallbox.to_legacy_dict()
     live_plausibility = live_model.plausibility if isinstance(live_model.plausibility, dict) else live_power_plausibility(live)
     live_sample_invalid = not bool(live_plausibility.get("sample_valid", True))
@@ -13144,6 +14699,13 @@ def decide_next_cycle(
         elif not can_reach_target:
             state_name = "auto"
 
+        headroom_execution = legacy_headroom_execution_contract(
+            cfg,
+            live,
+            plan,
+            previous_state,
+            now_s,
+        )
         active_state = {
             "state": state_name,
             "storage_state": state_name,
@@ -13240,6 +14802,7 @@ def decide_next_cycle(
             "headroom_reserve_active": headroom_reserve_active,
             "headroom_reserve_pressure_wh": headroom_reserve_pressure_wh,
             "headroom_reserve_source": headroom_reserve_source,
+            "headroom_execution": headroom_execution,
             "iAVal_w": base_wb_budget_w,
             "wb_possible_power_w": wb_possible_w,
             "ac_power_limit_w": safe_int(live.get("ac_power_limit_w"), 0),
@@ -13251,6 +14814,11 @@ def decide_next_cycle(
             "pv_derating_active": bool(live.get("pv_derating_active")),
             "ems_derating_active": bool(live.get("ems_derating_active")),
             "power_limits_active": bool(live.get("power_limits_active")),
+            "ems_power_settings_read": live.get("ems_power_settings_read") is True,
+            "ems_power_settings_valid": live.get("ems_power_settings_valid") is True,
+            "ems_max_charge_power_w": live.get("ems_max_charge_power_w"),
+            "ems_max_discharge_power_w": live.get("ems_max_discharge_power_w"),
+            "ems_discharge_start_power_w": live.get("ems_discharge_start_power_w"),
             "curve_release_ts_s": release_ts_s,
             "evening_release_active": evening_release,
             "evening_release_blocked_by_target": evening_release_blocked_by_target,
@@ -13302,6 +14870,11 @@ def decide_next_cycle(
             "headroom_discharge_today_wh",
             "headroom_discharge_last_active_ts",
             "headroom_discharge_last_account_ts",
+            "curve_cap_release_below_since_ts",
+            "curve_cap_release_pending",
+            "curve_cap_release_requested",
+            "curve_cap_release_confirmed_since_ts",
+            "curve_cap_post_release_until_ts",
         ):
             if previous_state.get(key) is not None:
                 active_state[key] = previous_state.get(key)
@@ -13326,6 +14899,10 @@ def decide_next_cycle(
             live={
                 "SOC": soc,
                 "PV_Power": pv_w,
+                "Ext_PV_Power": live.get("Ext_PV_Power"),
+                "Ext_PV_Power_Valid": live.get("Ext_PV_Power_Valid") is True,
+                "Ext_PV_Power_Source": live.get("Ext_PV_Power_Source"),
+                "Ext_PV_Power_Age_S": live.get("Ext_PV_Power_Age_S"),
                 "Grid_Power": grid_w,
                 "Home_Power": home_w,
                 "Home_Power_Valid": bool(live_plausibility.get("home_valid", True)),
@@ -13349,6 +14926,11 @@ def decide_next_cycle(
                 "pv_derating_active": bool(live.get("pv_derating_active")),
                 "ems_derating_active": bool(live.get("ems_derating_active")),
                 "power_limits_active": bool(live.get("power_limits_active")),
+                "ems_power_settings_read": live.get("ems_power_settings_read") is True,
+                "ems_power_settings_valid": live.get("ems_power_settings_valid") is True,
+                "ems_max_charge_power_w": live.get("ems_max_charge_power_w"),
+                "ems_max_discharge_power_w": live.get("ems_max_discharge_power_w"),
+                "ems_discharge_start_power_w": live.get("ems_discharge_start_power_w"),
             },
             plan=plan,
             wb_budget=wb_budget_in,
@@ -13400,6 +14982,22 @@ def decide_next_cycle(
             "headroom_discharge_cooldown_active",
             "headroom_discharge_last_active_ts",
             "headroom_discharge_last_account_ts",
+            "headroom_execution_schema_version",
+            "headroom_execution_allowed",
+            "headroom_execution_reason_code",
+            "headroom_execution_plan_id",
+            "headroom_execution_slot_id",
+            "headroom_execution_earliest_start_ts",
+            "headroom_execution_deadline_ts",
+            "headroom_execution_target_soc",
+            "headroom_execution_hard_floor_soc",
+            "headroom_execution_plan_accounted_wh",
+            "headroom_execution_slot_accounted_wh",
+            "headroom_execution_residual_wh",
+            "headroom_execution_accounted_observed_w",
+            "headroom_execution_accounted_interval_s",
+            "headroom_execution_generation_reset",
+            "headroom_execution_last_account_ts",
         ):
             if key in shadow_inputs:
                 decision[key] = shadow_inputs.get(key)
@@ -13419,6 +15017,32 @@ def decide_next_cycle(
             "curve_charge_servo_step_up_w",
             "curve_charge_servo_step_down_w",
             "curve_charge_servo_max_age_s",
+        ):
+            if key in shadow_inputs:
+                decision[key] = shadow_inputs.get(key)
+        for key in (
+            "curve_cap_release_hysteresis_w",
+            "curve_cap_release_grace_s",
+            "curve_cap_grid_contract_valid",
+            "curve_cap_real_grid_import_active",
+            "curve_cap_release_below_active",
+            "curve_cap_release_below_since_ts",
+            "curve_cap_release_elapsed_s",
+            "curve_cap_release_grace_active",
+            "curve_cap_release_ramp_active",
+            "curve_cap_hysteresis_hold_active",
+            "curve_cap_invalid_hold_active",
+            "curve_cap_release_phase",
+            "curve_cap_release_pending",
+            "curve_cap_release_requested",
+            "curve_cap_release_confirmed_since_ts",
+            "curve_cap_post_release_until_ts",
+            "curve_cap_post_release_guard_active",
+            "curve_cap_post_release_reentry_blocked",
+            "curve_cap_settings_readback_valid",
+            "curve_cap_settings_bounded_zero_confirmed",
+            "curve_cap_settings_release_confirmed",
+            "curve_cap_bounded_zero_w",
         ):
             if key in shadow_inputs:
                 decision[key] = shadow_inputs.get(key)
@@ -13930,7 +15554,21 @@ def decide_next_cycle(
                             f"E3DC lädt {safe_int(smoothing.get('actual_charge_w'), 0)}W)"
                         )
             elif auto_state == "parallel_curve_charge_cap":
-                auto_limit_reason = "Abregel-/WR-Pflichtladung: E3DC-AUTO mit EMS-Ladegrenze"
+                release_requested = bool(
+                    shadow_inputs.get("curve_cap_release_requested")
+                )
+                if release_requested:
+                    auto_limit_charge_w = max_charge_w
+                    auto_limit_enabled = False
+                    auto_limit_release = True
+                    auto_storage_req_w = 0
+                    decision["val"] = 0
+                    auto_limit_reason = (
+                        "Abregel-/WR-Pflichtladung: physischer Rampenboden bestätigt; "
+                        "EMS-Grenzen readback-gebunden freigeben"
+                    )
+                else:
+                    auto_limit_reason = "Abregel-/WR-Pflichtladung: E3DC-AUTO mit EMS-Ladegrenze"
             elif auto_state == "parallel_wb_auto":
                 auto_limit_charge_w = max_charge_w
                 auto_limit_enabled = False
@@ -14222,6 +15860,38 @@ def decide_next_cycle(
                             f"EMS-Ladegrenze steigt weich auf {auto_limit_charge_w}W"
                         )
 
+            reservation_cap = direct_marketing_curve_charge_reservation_cap(
+                cfg,
+                plan,
+                now_s,
+                auto_state=auto_state,
+                current_limit_w=auto_limit_charge_w,
+                current_release=auto_limit_release,
+                max_charge_w=max_charge_w,
+                pv_after_fixed_w=pv_after_fixed_w,
+                grid_w=grid_w,
+            )
+            if reservation_cap.get("active"):
+                future_store_reservation = reservation_cap.get("reservation") or {}
+                auto_limit_enabled = True
+                auto_limit_release = False
+                auto_limit_charge_w = max(0, safe_int(reservation_cap.get("max_charge_w"), 0))
+                auto_storage_req_w = min(auto_storage_req_w, auto_limit_charge_w)
+                decision["val"] = auto_limit_charge_w
+                decision["direct_marketing_future_pv_store_reservation"] = future_store_reservation
+                decision["direct_marketing_future_pv_store_reservation_active"] = True
+                decision["direct_marketing_future_pv_store_reservation_cap_w"] = auto_limit_charge_w
+                decision["direct_marketing_future_pv_store_reservation_grid_import_w"] = reservation_cap.get("grid_import_w")
+                decision["direct_marketing_future_pv_store_reservation_import_guard_w"] = reservation_cap.get("import_guard_w")
+                reservation_reason = str(future_store_reservation.get("reason") or "")
+                if reservation_reason == "reserve_recovery":
+                    reservation_text = "Kurvenladung wegen harter Reserve zugelassen"
+                elif reservation_reason == "future_window_energy_insufficient":
+                    reservation_text = "Kurvenladung wegen Prognosedefizit zugelassen"
+                else:
+                    reservation_text = "Kurvenladung für kommendes DV-PV-Fenster zurückgestellt"
+                auto_limit_reason = f"{reservation_text}: Ladegrenze {auto_limit_charge_w}W"
+
             if auto_limit_enabled and 0 < auto_limit_charge_w < 300:
                 auto_limit_charge_w = 0
                 if auto_state in {"parallel_curve_auto_hold", "parallel_curve_auto_no_surplus", "parallel_curve_charge"}:
@@ -14400,19 +16070,44 @@ def decide_next_cycle(
         decision,
         previous_state,
     )
+    heatpump_running = bool(wp_w > max(100, safe_int(cfg.get("heatpump_running_threshold_w"), 150)))
+    heatpump_running_commitment_w = wp_w if heatpump_running else 0
+    heatpump_starting_until_ts = safe_float(previous_state.get("heatpump_starting_until_ts"), 0.0)
+    if heatpump_running and not bool(previous_state.get("heatpump_running")):
+        heatpump_starting_until_ts = now_s + max(
+            10.0,
+            safe_float(cfg.get("heatpump_start_settle_s"), 30.0),
+        )
+    heatpump_starting = bool(heatpump_running and now_s < heatpump_starting_until_ts)
+    current_wallbox_commitment_w = max(0, safe_int(wb_intent.get("wb_power_w"), 0))
+    phase_transition_grants = wallbox_phase_transition_policy.arbitrate_grants(
+        wallbox_phase_transition.get("reservations", []),
+        available_w=(
+            max(0, safe_int(budget_w, 0))
+            + heatpump_running_commitment_w
+            + current_wallbox_commitment_w
+        ),
+        heatpump_running=heatpump_running,
+        heatpump_running_commitment_w=heatpump_running_commitment_w,
+        safety_margin_w=max(0, safe_int(cfg.get("phase_transition_safety_margin_w"), 0)),
+        now_ts=now_s,
+    )
     phase_transition_reserved_w = max(
         0,
-        safe_int(wallbox_phase_transition.get("reserved_w"), 0),
+        safe_int(phase_transition_grants.get("reserved_w_total"), 0),
     )
-    flexible_consumer_budget_w = (
-        max(0, safe_int(budget_w, 0) - phase_transition_reserved_w)
-        if wallbox_phase_transition.get("active")
-        else max(0, safe_int(budget_w, 0))
+    phase_transition_requested_w = max(
+        0,
+        safe_int(wallbox_phase_transition.get("requested_w"), 0),
+    )
+    flexible_consumer_budget_w = max(
+        0,
+        safe_int(phase_transition_grants.get("flexible_budget_after_commitments_w"), budget_w),
     )
     phase_transition_allocations = (
         {
-            "wallbox": min(max(0, safe_int(budget_w, 0)), phase_transition_reserved_w),
-            "heatpump": flexible_consumer_budget_w,
+            "wallbox": phase_transition_reserved_w,
+            "heatpump": heatpump_running_commitment_w if heatpump_running else flexible_consumer_budget_w,
             "heater": flexible_consumer_budget_w,
         }
         if wallbox_phase_transition.get("active")
@@ -14423,7 +16118,7 @@ def decide_next_cycle(
         "budget_w": budget_w,
         "iAVal_w": budget_w,
         "raw_iAVal_w": raw_iaval_w,
-        "wb_min_required_w": phase_transition_reserved_w,
+        "wb_min_required_w": phase_transition_requested_w,
         "wallbox_phase_transition_active": bool(wallbox_phase_transition.get("active")),
         "wallbox_phase_transition_reserved_w": phase_transition_reserved_w,
         "wallbox_phase_transition_flexible_budget_w": flexible_consumer_budget_w,
@@ -14431,6 +16126,15 @@ def decide_next_cycle(
         "wallbox_phase_transition_until_ts": safe_float(wallbox_phase_transition.get("expires_ts"), 0.0),
         "wallbox_phase_transition_source": str(wallbox_phase_transition.get("source") or ""),
         "wallbox_phase_transition": wallbox_phase_transition,
+        "wallbox_phase_transition_grants": phase_transition_grants,
+        "wallbox_phase_transition_requested_w_total": phase_transition_requested_w,
+        "wallbox_phase_transition_reserved_w_total": phase_transition_reserved_w,
+        "heatpump_running": heatpump_running,
+        "heatpump_running_commitment_w": heatpump_running_commitment_w,
+        "heatpump_starting": heatpump_starting,
+        "heatpump_starting_until_ts": heatpump_starting_until_ts,
+        "heatpump_new_start_allowed": not bool(wallbox_phase_transition.get("active")),
+        "flexible_budget_after_commitments_w": flexible_consumer_budget_w,
         "iFc_w": i_fc_w,
         "iMinLade_w": i_min_lade_w,
         "curve_frame_base_smoothing_active": curve_frame_base_smoothing_active,
@@ -14839,6 +16543,71 @@ def decide_next_cycle(
             decision.get("headroom_discharge_last_account_ts"),
             shadow_inputs.get("headroom_discharge_last_account_ts", now_s),
         ),
+        "headroom_execution_schema_version": decision.get(
+            "headroom_execution_schema_version",
+            shadow_inputs.get("headroom_execution_schema_version"),
+        ),
+        "headroom_execution_allowed": bool(
+            decision.get("headroom_execution_allowed", shadow_inputs.get("headroom_execution_allowed", False))
+        ),
+        "headroom_execution_reason_code": str(
+            decision.get(
+                "headroom_execution_reason_code",
+                shadow_inputs.get("headroom_execution_reason_code", "HEADROOM_EXECUTION_CONTRACT_MISSING"),
+            )
+            or "HEADROOM_EXECUTION_CONTRACT_MISSING"
+        ),
+        "headroom_execution_plan_id": decision.get(
+            "headroom_execution_plan_id",
+            shadow_inputs.get("headroom_execution_plan_id"),
+        ),
+        "headroom_execution_slot_id": decision.get(
+            "headroom_execution_slot_id",
+            shadow_inputs.get("headroom_execution_slot_id"),
+        ),
+        "headroom_execution_earliest_start_ts": decision.get(
+            "headroom_execution_earliest_start_ts",
+            shadow_inputs.get("headroom_execution_earliest_start_ts"),
+        ),
+        "headroom_execution_deadline_ts": decision.get(
+            "headroom_execution_deadline_ts",
+            shadow_inputs.get("headroom_execution_deadline_ts"),
+        ),
+        "headroom_execution_target_soc": decision.get(
+            "headroom_execution_target_soc",
+            shadow_inputs.get("headroom_execution_target_soc"),
+        ),
+        "headroom_execution_hard_floor_soc": decision.get(
+            "headroom_execution_hard_floor_soc",
+            shadow_inputs.get("headroom_execution_hard_floor_soc"),
+        ),
+        "headroom_execution_plan_accounted_wh": round(
+            max(0.0, safe_float(decision.get("headroom_execution_plan_accounted_wh"), shadow_inputs.get("headroom_execution_plan_accounted_wh", 0.0))),
+            3,
+        ),
+        "headroom_execution_slot_accounted_wh": round(
+            max(0.0, safe_float(decision.get("headroom_execution_slot_accounted_wh"), shadow_inputs.get("headroom_execution_slot_accounted_wh", 0.0))),
+            3,
+        ),
+        "headroom_execution_residual_wh": round(
+            max(0.0, safe_float(decision.get("headroom_execution_residual_wh"), shadow_inputs.get("headroom_execution_residual_wh", 0.0))),
+            3,
+        ),
+        "headroom_execution_accounted_observed_w": round(
+            max(0.0, safe_float(decision.get("headroom_execution_accounted_observed_w"), shadow_inputs.get("headroom_execution_accounted_observed_w", 0.0))),
+            3,
+        ),
+        "headroom_execution_accounted_interval_s": round(
+            max(0.0, safe_float(decision.get("headroom_execution_accounted_interval_s"), shadow_inputs.get("headroom_execution_accounted_interval_s", 0.0))),
+            3,
+        ),
+        "headroom_execution_generation_reset": bool(
+            decision.get("headroom_execution_generation_reset", shadow_inputs.get("headroom_execution_generation_reset", True))
+        ),
+        "headroom_execution_last_account_ts": safe_float(
+            decision.get("headroom_execution_last_account_ts"),
+            shadow_inputs.get("headroom_execution_last_account_ts", now_s),
+        ),
         "curve_frame_lift_active": bool(decision.get("curve_frame_lift_active")),
         "curve_frame_lift_w": curve_frame_lift_w,
         "curve_frame_lift_desired_w": curve_frame_lift_desired_w,
@@ -14871,6 +16640,10 @@ def decide_next_cycle(
         "direct_marketing_policy_charge_budget_w": safe_int(decision.get("direct_marketing_policy_charge_budget_w"), 0),
         "direct_marketing_policy_protected_reserve_wh": safe_int(decision.get("direct_marketing_policy_protected_reserve_wh"), 0),
         "direct_marketing_policy_sellable_wh": safe_int(decision.get("direct_marketing_policy_sellable_wh"), 0),
+        "direct_marketing_policy_executor_gate": decision.get("direct_marketing_policy_executor_gate") if isinstance(decision.get("direct_marketing_policy_executor_gate"), dict) else None,
+        "direct_marketing_future_pv_store_reservation": decision.get("direct_marketing_future_pv_store_reservation") if isinstance(decision.get("direct_marketing_future_pv_store_reservation"), dict) else None,
+        "direct_marketing_future_pv_store_reservation_active": bool(decision.get("direct_marketing_future_pv_store_reservation_active")),
+        "direct_marketing_future_pv_store_reservation_cap_w": safe_int(decision.get("direct_marketing_future_pv_store_reservation_cap_w"), 0),
         "direct_marketing_mode": decision.get("direct_marketing_mode"),
         "direct_marketing_owner": decision.get("direct_marketing_owner"),
         "direct_marketing_contract_version": decision.get("direct_marketing_contract_version"),
@@ -15086,6 +16859,27 @@ def decide_next_cycle(
         "abregel_rscp_limit_w": abregel_rscp_limit_w,
         "abregel_source": abregel_source,
         "abregel_active": abregel_active,
+        "curve_cap_release_hysteresis_w": safe_int(decision.get("curve_cap_release_hysteresis_w"), 0),
+        "curve_cap_release_grace_s": safe_float(decision.get("curve_cap_release_grace_s"), 0.0),
+        "curve_cap_grid_contract_valid": bool(decision.get("curve_cap_grid_contract_valid")),
+        "curve_cap_real_grid_import_active": bool(decision.get("curve_cap_real_grid_import_active")),
+        "curve_cap_release_below_active": bool(decision.get("curve_cap_release_below_active")),
+        "curve_cap_release_below_since_ts": safe_float(decision.get("curve_cap_release_below_since_ts"), 0.0),
+        "curve_cap_release_elapsed_s": safe_float(decision.get("curve_cap_release_elapsed_s"), 0.0),
+        "curve_cap_release_grace_active": bool(decision.get("curve_cap_release_grace_active")),
+        "curve_cap_release_ramp_active": bool(decision.get("curve_cap_release_ramp_active")),
+        "curve_cap_hysteresis_hold_active": bool(decision.get("curve_cap_hysteresis_hold_active")),
+        "curve_cap_invalid_hold_active": bool(decision.get("curve_cap_invalid_hold_active")),
+        "curve_cap_release_phase": str(decision.get("curve_cap_release_phase") or "inactive"),
+        "curve_cap_release_pending": bool(decision.get("curve_cap_release_pending")),
+        "curve_cap_release_requested": bool(decision.get("curve_cap_release_requested")),
+        "curve_cap_release_confirmed_since_ts": safe_float(decision.get("curve_cap_release_confirmed_since_ts"), 0.0),
+        "curve_cap_post_release_until_ts": safe_float(decision.get("curve_cap_post_release_until_ts"), 0.0),
+        "curve_cap_post_release_guard_active": bool(decision.get("curve_cap_post_release_guard_active")),
+        "curve_cap_post_release_reentry_blocked": bool(decision.get("curve_cap_post_release_reentry_blocked")),
+        "curve_cap_settings_readback_valid": bool(decision.get("curve_cap_settings_readback_valid")),
+        "curve_cap_settings_bounded_zero_confirmed": bool(decision.get("curve_cap_settings_bounded_zero_confirmed")),
+        "curve_cap_settings_release_confirmed": bool(decision.get("curve_cap_settings_release_confirmed")),
         "energy_score": {
             "pv_surplus_w": pv_after_fixed_w,
             "free_for_limbs_w": flexible_consumer_budget_w,
@@ -15298,6 +17092,8 @@ def decide_next_cycle(
         "last_valid_soc": soc_jump_guard.get("last_valid_soc", soc),
         "last_valid_soc_ts": soc_jump_guard.get("last_valid_soc_ts", now_s),
         "ems_power_limits_active": bool(live.get("power_limits_active")) if "power_limits_active" in live else None,
+        "ems_power_settings_read": live.get("ems_power_settings_read") is True,
+        "ems_power_settings_valid": live.get("ems_power_settings_valid") is True,
         "ems_max_charge_power_w": live.get("ems_max_charge_power_w"),
         "ems_max_discharge_power_w": live.get("ems_max_discharge_power_w"),
         "ems_discharge_start_power_w": live.get("ems_discharge_start_power_w"),
@@ -15307,7 +17103,7 @@ def decide_next_cycle(
         "remaining_discharge_w": live.get("remaining_discharge_w"),
         "wb_car_present": wb_car_present,
         "wb_possible_power_w": wb_possible_w,
-        "wb_min_required_w": phase_transition_reserved_w,
+        "wb_min_required_w": phase_transition_requested_w,
         "wallbox_phase_transition_active": bool(wallbox_phase_transition.get("active")),
         "wallbox_phase_transition_reserved_w": phase_transition_reserved_w,
         "wallbox_phase_transition_flexible_budget_w": flexible_consumer_budget_w,
@@ -15315,6 +17111,15 @@ def decide_next_cycle(
         "wallbox_phase_transition_until_ts": safe_float(wallbox_phase_transition.get("expires_ts"), 0.0),
         "wallbox_phase_transition_source": str(wallbox_phase_transition.get("source") or ""),
         "wallbox_phase_transition": wallbox_phase_transition,
+        "wallbox_phase_transition_grants": phase_transition_grants,
+        "wallbox_phase_transition_requested_w_total": phase_transition_requested_w,
+        "wallbox_phase_transition_reserved_w_total": phase_transition_reserved_w,
+        "heatpump_running": heatpump_running,
+        "heatpump_running_commitment_w": heatpump_running_commitment_w,
+        "heatpump_starting": heatpump_starting,
+        "heatpump_starting_until_ts": heatpump_starting_until_ts,
+        "heatpump_new_start_allowed": not bool(wallbox_phase_transition.get("active")),
+        "flexible_budget_after_commitments_w": flexible_consumer_budget_w,
         "curve_soc": curve_soc,
         "target_soc": target_soc,
         "target_ts": target_ts,
@@ -15489,6 +17294,24 @@ def decide_next_cycle(
         "headroom_discharge_cooldown_active": bool(budget.get("headroom_discharge_cooldown_active")),
         "headroom_discharge_last_active_ts": budget.get("headroom_discharge_last_active_ts", 0.0),
         "headroom_discharge_last_account_ts": budget.get("headroom_discharge_last_account_ts", now_s),
+        "headroom_execution_schema_version": budget.get("headroom_execution_schema_version"),
+        "headroom_execution_allowed": bool(budget.get("headroom_execution_allowed")),
+        "headroom_execution_reason_code": str(
+            budget.get("headroom_execution_reason_code") or "HEADROOM_EXECUTION_CONTRACT_MISSING"
+        ),
+        "headroom_execution_plan_id": budget.get("headroom_execution_plan_id"),
+        "headroom_execution_slot_id": budget.get("headroom_execution_slot_id"),
+        "headroom_execution_earliest_start_ts": budget.get("headroom_execution_earliest_start_ts"),
+        "headroom_execution_deadline_ts": budget.get("headroom_execution_deadline_ts"),
+        "headroom_execution_target_soc": budget.get("headroom_execution_target_soc"),
+        "headroom_execution_hard_floor_soc": budget.get("headroom_execution_hard_floor_soc"),
+        "headroom_execution_plan_accounted_wh": budget.get("headroom_execution_plan_accounted_wh", 0.0),
+        "headroom_execution_slot_accounted_wh": budget.get("headroom_execution_slot_accounted_wh", 0.0),
+        "headroom_execution_residual_wh": budget.get("headroom_execution_residual_wh", 0.0),
+        "headroom_execution_accounted_observed_w": budget.get("headroom_execution_accounted_observed_w", 0.0),
+        "headroom_execution_accounted_interval_s": budget.get("headroom_execution_accounted_interval_s", 0.0),
+        "headroom_execution_generation_reset": bool(budget.get("headroom_execution_generation_reset", True)),
+        "headroom_execution_last_account_ts": budget.get("headroom_execution_last_account_ts", now_s),
         "curve_frame_lift_active": bool(decision.get("curve_frame_lift_active")),
         "curve_frame_lift_w": curve_frame_lift_w,
         "curve_frame_lift_desired_w": curve_frame_lift_desired_w,
@@ -15521,6 +17344,10 @@ def decide_next_cycle(
         "direct_marketing_policy_charge_budget_w": safe_int(decision.get("direct_marketing_policy_charge_budget_w"), 0),
         "direct_marketing_policy_protected_reserve_wh": safe_int(decision.get("direct_marketing_policy_protected_reserve_wh"), 0),
         "direct_marketing_policy_sellable_wh": safe_int(decision.get("direct_marketing_policy_sellable_wh"), 0),
+        "direct_marketing_policy_executor_gate": decision.get("direct_marketing_policy_executor_gate") if isinstance(decision.get("direct_marketing_policy_executor_gate"), dict) else None,
+        "direct_marketing_future_pv_store_reservation": decision.get("direct_marketing_future_pv_store_reservation") if isinstance(decision.get("direct_marketing_future_pv_store_reservation"), dict) else None,
+        "direct_marketing_future_pv_store_reservation_active": bool(decision.get("direct_marketing_future_pv_store_reservation_active")),
+        "direct_marketing_future_pv_store_reservation_cap_w": safe_int(decision.get("direct_marketing_future_pv_store_reservation_cap_w"), 0),
         "direct_marketing_mode": decision.get("direct_marketing_mode"),
         "direct_marketing_owner": decision.get("direct_marketing_owner"),
         "direct_marketing_contract_version": decision.get("direct_marketing_contract_version"),
@@ -15657,6 +17484,27 @@ def decide_next_cycle(
         "abregel_rscp_limit_w": abregel_rscp_limit_w,
         "abregel_source": abregel_source,
         "abregel_active": abregel_active,
+        "curve_cap_release_hysteresis_w": safe_int(decision.get("curve_cap_release_hysteresis_w"), 0),
+        "curve_cap_release_grace_s": safe_float(decision.get("curve_cap_release_grace_s"), 0.0),
+        "curve_cap_grid_contract_valid": bool(decision.get("curve_cap_grid_contract_valid")),
+        "curve_cap_real_grid_import_active": bool(decision.get("curve_cap_real_grid_import_active")),
+        "curve_cap_release_below_active": bool(decision.get("curve_cap_release_below_active")),
+        "curve_cap_release_below_since_ts": safe_float(decision.get("curve_cap_release_below_since_ts"), 0.0),
+        "curve_cap_release_elapsed_s": safe_float(decision.get("curve_cap_release_elapsed_s"), 0.0),
+        "curve_cap_release_grace_active": bool(decision.get("curve_cap_release_grace_active")),
+        "curve_cap_release_ramp_active": bool(decision.get("curve_cap_release_ramp_active")),
+        "curve_cap_hysteresis_hold_active": bool(decision.get("curve_cap_hysteresis_hold_active")),
+        "curve_cap_invalid_hold_active": bool(decision.get("curve_cap_invalid_hold_active")),
+        "curve_cap_release_phase": str(decision.get("curve_cap_release_phase") or "inactive"),
+        "curve_cap_release_pending": bool(decision.get("curve_cap_release_pending")),
+        "curve_cap_release_requested": bool(decision.get("curve_cap_release_requested")),
+        "curve_cap_release_confirmed_since_ts": safe_float(decision.get("curve_cap_release_confirmed_since_ts"), 0.0),
+        "curve_cap_post_release_until_ts": safe_float(decision.get("curve_cap_post_release_until_ts"), 0.0),
+        "curve_cap_post_release_guard_active": bool(decision.get("curve_cap_post_release_guard_active")),
+        "curve_cap_post_release_reentry_blocked": bool(decision.get("curve_cap_post_release_reentry_blocked")),
+        "curve_cap_settings_readback_valid": bool(decision.get("curve_cap_settings_readback_valid")),
+        "curve_cap_settings_bounded_zero_confirmed": bool(decision.get("curve_cap_settings_bounded_zero_confirmed")),
+        "curve_cap_settings_release_confirmed": bool(decision.get("curve_cap_settings_release_confirmed")),
         "hardening_contracts_version": hardening_contracts.get("version"),
         "hardening_contracts_scope": hardening_contracts.get("scope"),
         "hardening_contracts": hardening_contracts.get("contracts", {}),
@@ -15728,6 +17576,14 @@ def decide_next_cycle(
         ),
         "shadow_payload": decision.get("shadow_payload"),
     }
+    payload["charge_acceptance_diagnostic"] = charge_acceptance_diagnostic_contract(
+        cfg,
+        live,
+        payload,
+        plan,
+        previous_state,
+        now_s=now_s,
+    )
     display = build_display(payload)
     payload.update(display)
     budget.update({
@@ -15802,12 +17658,24 @@ def write_state(payload: Dict[str, Any], plan: Dict[str, Any]) -> None:
         "iFc_w": payload.get("iFc_w", 0),
         "iMinLade_w": payload.get("iMinLade_w", 0),
         "storage_charge_request_w": payload.get("storage_charge_request_w", 0),
+        "charge_acceptance_diagnostic": copy.deepcopy(payload.get("charge_acceptance_diagnostic"))
+        if isinstance(payload.get("charge_acceptance_diagnostic"), dict)
+        else None,
         "wallbox_phase_transition_active": bool(payload.get("wallbox_phase_transition_active")),
         "wallbox_phase_transition_reserved_w": payload.get("wallbox_phase_transition_reserved_w", 0),
         "wallbox_phase_transition_flexible_budget_w": payload.get("wallbox_phase_transition_flexible_budget_w", 0),
         "wallbox_phase_transition_target_phases": payload.get("wallbox_phase_transition_target_phases", 0),
         "wallbox_phase_transition_until_ts": payload.get("wallbox_phase_transition_until_ts", 0.0),
         "wallbox_phase_transition_source": payload.get("wallbox_phase_transition_source", ""),
+        "wallbox_phase_transition_grants": payload.get("wallbox_phase_transition_grants") if isinstance(payload.get("wallbox_phase_transition_grants"), dict) else None,
+        "wallbox_phase_transition_requested_w_total": payload.get("wallbox_phase_transition_requested_w_total", 0),
+        "wallbox_phase_transition_reserved_w_total": payload.get("wallbox_phase_transition_reserved_w_total", 0),
+        "heatpump_running": bool(payload.get("heatpump_running")),
+        "heatpump_running_commitment_w": payload.get("heatpump_running_commitment_w", 0),
+        "heatpump_starting": bool(payload.get("heatpump_starting")),
+        "heatpump_starting_until_ts": payload.get("heatpump_starting_until_ts", 0.0),
+        "heatpump_new_start_allowed": bool(payload.get("heatpump_new_start_allowed", True)),
+        "flexible_budget_after_commitments_w": payload.get("flexible_budget_after_commitments_w", 0),
         "wallbox_curve_reserve_w": payload.get("wallbox_curve_reserve_w", 0),
         "wallbox_curve_reserve_target_w": payload.get("wallbox_curve_reserve_target_w", 0),
         "wallbox_curve_reserve_step_w": payload.get("wallbox_curve_reserve_step_w", 0),
@@ -15882,6 +17750,10 @@ def write_state(payload: Dict[str, Any], plan: Dict[str, Any]) -> None:
         "direct_marketing_policy_charge_budget_w": payload.get("direct_marketing_policy_charge_budget_w"),
         "direct_marketing_policy_protected_reserve_wh": payload.get("direct_marketing_policy_protected_reserve_wh"),
         "direct_marketing_policy_sellable_wh": payload.get("direct_marketing_policy_sellable_wh"),
+        "direct_marketing_policy_executor_gate": payload.get("direct_marketing_policy_executor_gate") if isinstance(payload.get("direct_marketing_policy_executor_gate"), dict) else None,
+        "direct_marketing_future_pv_store_reservation": payload.get("direct_marketing_future_pv_store_reservation") if isinstance(payload.get("direct_marketing_future_pv_store_reservation"), dict) else None,
+        "direct_marketing_future_pv_store_reservation_active": bool(payload.get("direct_marketing_future_pv_store_reservation_active")),
+        "direct_marketing_future_pv_store_reservation_cap_w": payload.get("direct_marketing_future_pv_store_reservation_cap_w"),
         "direct_marketing_mode": payload.get("direct_marketing_mode"),
         "direct_marketing_owner": payload.get("direct_marketing_owner"),
         "direct_marketing_contract_version": payload.get("direct_marketing_contract_version"),
@@ -16067,6 +17939,11 @@ _WB_BUDGET_CONTROL_KEYS = {
     "wallbox_phase_transition_reserved_w", "wallbox_phase_transition_flexible_budget_w",
     "wallbox_phase_transition_target_phases", "wallbox_phase_transition_until_ts",
     "wallbox_phase_transition_source", "wallbox_phase_transition",
+    "wallbox_phase_transition_grants", "wallbox_phase_transition_reserved_w_total",
+    "wallbox_phase_transition_requested_w_total",
+    "heatpump_running", "heatpump_running_commitment_w", "heatpump_new_start_allowed",
+    "heatpump_starting", "heatpump_starting_until_ts",
+    "flexible_budget_after_commitments_w",
     "wb_storage_cap_w", "wb_storage_extra_w", "wallbox_curve_reserve_w",
     "forecast_curve_landing_hold_active", "sliding_horizon_active", "evening_shortfall_wh",
     "shortfall_target_gap_pct", "forecast_floor_target_gap_pct", "latest_charge_start_ts",
@@ -16151,12 +18028,22 @@ def write_wb_budget(payload: Dict[str, Any]) -> None:
     budget["budget_w"] = w
     if bool(budget.get("wallbox_phase_transition_active")):
         reserved_w = max(0, safe_int(budget.get("wallbox_phase_transition_reserved_w"), 0))
-        flexible_w = max(0, w - reserved_w)
-        allocations = {
-            "wallbox": min(w, reserved_w),
-            "heatpump": flexible_w,
-            "heater": flexible_w,
-        }
+        flexible_w = max(
+            0,
+            safe_int(
+                budget.get("flexible_budget_after_commitments_w"),
+                budget.get("wallbox_phase_transition_flexible_budget_w", max(0, w - reserved_w)),
+            ),
+        )
+        allocations = budget.get("consumer_allocations") if isinstance(budget.get("consumer_allocations"), dict) else {}
+        allocations = dict(allocations)
+        allocations["wallbox"] = reserved_w
+        allocations["heatpump"] = (
+            max(0, safe_int(budget.get("heatpump_running_commitment_w"), 0))
+            if budget.get("heatpump_running")
+            else flexible_w
+        )
+        allocations["heater"] = flexible_w
         budget["wallbox_phase_transition_flexible_budget_w"] = flexible_w
         budget["consumer_allocations"] = allocations
         budget["consumer_priority_order"] = ["wallbox", "heatpump", "heater"]
@@ -16228,7 +18115,16 @@ def write_safe_start_state(
         "safe_start": True,
     }
     payload.update(build_display(payload))
+    payload["storage_dispatch_runtime"] = build_runtime_overlay(
+        {}, payload, {}, now_ms=int(payload["ts"] * 1000)
+    )
     atomic_write(STATE_F, payload, indent=2)
+    atomic_write_on_change(
+        DISPATCH_RUNTIME_F,
+        payload["storage_dispatch_runtime"],
+        force_interval_s=15.0,
+        indent=2,
+    )
     atomic_write(
         WB_F,
         {
@@ -16251,12 +18147,447 @@ def write_safe_start_state(
 
 
 
+def _phase5_legacy_fallback(
+    legacy: Dict[str, Any],
+    arbitration: Dict[str, Any],
+    reason_code: Optional[str] = None,
+) -> Dict[str, Any]:
+    result = copy.deepcopy(legacy)
+    diagnostic = copy.deepcopy(arbitration)
+    if reason_code:
+        blockers = list(diagnostic.get("blockers") or [])
+        if reason_code not in blockers:
+            blockers.insert(0, reason_code)
+        diagnostic.update({
+            "selected": False,
+            "executable": False,
+            "commands_allowed": False,
+            "selected_source": "legacy_fallback",
+            "selected_action": None,
+            "selected_power_w": 0.0,
+            "block_reason_code": reason_code,
+            "blockers": blockers,
+        })
+    diagnostic.update({
+        "requested": False,
+        "issued": False,
+        "request_attempted_by": None,
+        "request": None,
+        "power_settings_after_request": None,
+        "hardware_effect": False,
+    })
+    result["storage_dispatch_phase5"] = diagnostic
+    return result
+
+
+_PHASE5_COMMAND_ACTIONS = frozenset({
+    "PV_STORE",
+    "HOUSE_SUPPLY",
+    "ECONOMIC_EXPORT",
+    "HEADROOM_EXPORT",
+})
+
+
+def _phase5_command_intent_error(arbitration: Dict[str, Any]) -> Optional[str]:
+    """Validiert den Phase-5-Befehlsintent vor jeder Managerübersetzung."""
+
+    action = str(arbitration.get("selected_action") or "HOLD").upper()
+    power_w = max(0, safe_int(arbitration.get("selected_power_w"), 0))
+    if action == "HOLD":
+        effect_claimed = bool(
+            arbitration.get("executable")
+            or arbitration.get("commands_allowed")
+            or power_w > 0
+            or arbitration.get("requested")
+            or arbitration.get("issued")
+            or arbitration.get("hardware_effect")
+            or arbitration.get("request") is not None
+        )
+        return "PHASE5_HOLD_EFFECT_CLAIM_INVALID" if effect_claimed else None
+    if action == "GRID_CHARGE":
+        return "PHASE5_GRID_CHARGE_NOT_RELEASED"
+    if action not in _PHASE5_COMMAND_ACTIONS:
+        return "PHASE5_ACTION_TRANSLATION_UNKNOWN"
+    if not bool(
+        arbitration.get("selected")
+        and arbitration.get("executable")
+        and arbitration.get("commands_allowed")
+        and power_w >= 300
+    ):
+        return "PHASE5_COMMAND_INTENT_INCOMPLETE"
+    return None
+
+
+def _phase5_economic_export_binding_valid(arbitration: Dict[str, Any]) -> bool:
+    """Bindet einen Exportintent erneut an den kanonisch ausgewählten Eco+-Slot."""
+
+    candidate = arbitration.get("candidate") if isinstance(arbitration.get("candidate"), dict) else {}
+    canonical = (
+        arbitration.get("canonical_direct_marketing_slot")
+        if isinstance(arbitration.get("canonical_direct_marketing_slot"), dict)
+        else {}
+    )
+    candidate_power_w = safe_float(candidate.get("power_w"), -1.0)
+    planned_w = safe_float(canonical.get("planned_w"), -1.0)
+    selected_power_w = safe_float(arbitration.get("selected_power_w"), -1.0)
+    return bool(
+        candidate.get("action") == "ECONOMIC_EXPORT"
+        and arbitration.get("selected_source") == "canonical_phase5"
+        and candidate.get("selection_source") == "canonical_slot_projection"
+        and candidate.get("source_action") == "eco_plus_export_candidate"
+        and candidate.get("source_mode") == "eco_plus"
+        and canonical.get("valid_selected_contract") is True
+        and canonical.get("action") == "ECONOMIC_EXPORT"
+        and canonical.get("source_action") == "eco_plus_export_candidate"
+        and canonical.get("source_mode") == "eco_plus"
+        and candidate.get("window_id") == canonical.get("window_id")
+        and candidate.get("action_id") == canonical.get("action_id")
+        and candidate.get("segment_id") == canonical.get("segment_id")
+        and candidate_power_w >= 300.0
+        and planned_w >= 300.0
+        and abs(candidate_power_w - planned_w) <= 1.0
+        and 300.0 <= selected_power_w <= planned_w + 1.0
+    )
+
+
+def _phase5_effectless_hold(
+    legacy: Dict[str, Any],
+    arbitration: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Publiziert HOLD als Entscheidung, ohne den Legacy-Hardwarepfad zu ersetzen."""
+
+    result = copy.deepcopy(legacy)
+    diagnostic = copy.deepcopy(arbitration)
+    diagnostic.update({
+        "executable": False,
+        "commands_allowed": False,
+        "selected_power_w": 0.0,
+        "requested": False,
+        "issued": False,
+        "request_attempted_by": None,
+        "request": None,
+        "power_settings_after_request": None,
+        "hardware_effect": False,
+        "execution_intent": {
+            "class": "decision_only_hold",
+            "authorized": False,
+            "action": "HOLD",
+            "power_w": 0,
+            "owner": "legacy_storage_manager",
+        },
+        "translation": {
+            "action": "HOLD",
+            "requested_power_w": 0,
+            "translated": False,
+            "reason_code": "PHASE5_HOLD_NO_ACTUATION",
+        },
+    })
+    result["storage_dispatch_phase5"] = diagnostic
+    return result
+
+
+def apply_storage_dispatch_phase5(
+    cfg: Dict[str, Any],
+    plan: Dict[str, Any],
+    legacy: Dict[str, Any],
+    live: Dict[str, Any],
+    power_settings: Dict[str, Any],
+    previous_state: Optional[Dict[str, Any]] = None,
+    *,
+    now_s: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Ersetzt eine vollständige Legacyentscheidung transaktional oder gar nicht."""
+
+    now_value = time.time() if now_s is None else float(now_s)
+    baseline = copy.deepcopy(legacy if isinstance(legacy, dict) else {})
+    try:
+        path_contract = storage_decision_path_contract(baseline, plan)
+        arbitration = phase5_arbitration_contract(
+            cfg,
+            plan,
+            baseline,
+            live,
+            power_settings,
+            path_contract,
+            previous_state,
+            now_ms=int(now_value * 1000.0),
+        )
+    except Exception as exc:
+        arbitration = {
+            "schema_version": "storage_dispatch_phase5_v1",
+            "selected": False,
+            "executable": False,
+            "commands_allowed": False,
+            "selected_source": "legacy_fallback",
+            "selected_action": None,
+            "selected_power_w": 0.0,
+            "block_reason_code": "PHASE5_ARBITRATION_EXCEPTION",
+            "blockers": ["PHASE5_ARBITRATION_EXCEPTION"],
+            "technical_blockers": ["PHASE5_ARBITRATION_EXCEPTION"],
+            "arbitration_exception": type(exc).__name__,
+            "hardware_effect": False,
+        }
+        return _phase5_legacy_fallback(baseline, arbitration)
+    if not arbitration.get("selected"):
+        return _phase5_legacy_fallback(baseline, arbitration)
+
+    intent_error = _phase5_command_intent_error(arbitration)
+    if intent_error:
+        return _phase5_legacy_fallback(baseline, arbitration, intent_error)
+    if str(arbitration.get("selected_action") or "HOLD").upper() == "HOLD":
+        return _phase5_effectless_hold(baseline, arbitration)
+
+    try:
+        decision = copy.deepcopy(baseline)
+        action = str(arbitration.get("selected_action") or "HOLD")
+        requested_w = max(0, safe_int(arbitration.get("selected_power_w"), 0))
+        max_charge_w = max(300, safe_int(decision.get("max_charge_w"), configured_charge_limit_w(cfg, live)))
+        max_discharge_w = max(
+            300,
+            safe_int(decision.get("max_discharge_w"), configured_discharge_limit_w(cfg, live, max_charge_w)),
+        )
+        reason = "Kanonischer Phase-5-Dispatch: %s" % action
+        translation: Dict[str, Any] = {"action": action, "requested_power_w": requested_w}
+
+        if action == "PV_STORE":
+            control = direct_marketing_pv_store_control_w(
+                cfg,
+                live,
+                {"max_power_w": requested_w},
+                {"pv_store_max_w": requested_w},
+                min(max_charge_w, requested_w),
+                now_value,
+            )
+            translation["pv_store_control"] = control
+            if control.get("blocked"):
+                return _phase5_legacy_fallback(baseline, arbitration, "PHASE5_PV_STORE_LIVE_GUARD")
+            charge_w = min(requested_w, max_charge_w, max(0, safe_int(control.get("charge_w"), 0)))
+            if charge_w < 300:
+                return _phase5_legacy_fallback(baseline, arbitration, "PHASE5_PV_STORE_BELOW_MINIMUM")
+            decision.update({
+                "state": "direct_marketing_phase5_pv_store",
+                "mode": MODE_AUTO,
+                "val": charge_w,
+                "priority": "direct_marketing",
+                "protected": False,
+                "storage_req_w": charge_w,
+                "budget_w": charge_w,
+                "auto_limit": charge_cap_auto_limit(cfg, charge_w, max_discharge_w, reason),
+                "direct_marketing_pv_store_control": control,
+            })
+            translation["translated_power_w"] = charge_w
+        elif action == "HOUSE_SUPPLY":
+            local_deficit_w = direct_marketing_local_deficit_w(live)
+            discharge_w = min(requested_w, max_discharge_w, max(0, int(local_deficit_w)))
+            if discharge_w < 300:
+                return _phase5_legacy_fallback(baseline, arbitration, "PHASE5_HOUSE_SUPPLY_NO_LOCAL_DEFICIT")
+            decision.update({
+                "state": "direct_marketing_phase5_house_supply",
+                "mode": MODE_AUTO,
+                "val": discharge_w,
+                "priority": "direct_marketing",
+                "protected": False,
+                "storage_req_w": -discharge_w,
+                "budget_w": discharge_w,
+                "auto_limit": discharge_cap_auto_limit(cfg, max_charge_w, discharge_w, reason),
+            })
+            translation.update({"local_deficit_w": local_deficit_w, "translated_power_w": discharge_w})
+        elif action == "ECONOMIC_EXPORT":
+            if not _phase5_economic_export_binding_valid(arbitration):
+                return _phase5_legacy_fallback(
+                    baseline,
+                    arbitration,
+                    "PHASE5_ECONOMIC_EXPORT_SOURCE_NOT_RELEASED",
+                )
+            import_guard = direct_marketing_export_import_guard(cfg, live, requested_w)
+            translation["import_guard"] = import_guard
+            if import_guard.get("blocked"):
+                return _phase5_legacy_fallback(baseline, arbitration, "PHASE5_EXPORT_IMPORT_GUARD")
+            control = direct_marketing_export_control_w(
+                cfg,
+                live,
+                previous_state or {},
+                requested_w,
+                max_discharge_w,
+            )
+            discharge_w = min(requested_w, max_discharge_w, max(0, safe_int(control.get("target_w"), 0)))
+            if discharge_w < 300:
+                return _phase5_legacy_fallback(baseline, arbitration, "PHASE5_EXPORT_BELOW_MINIMUM")
+            decision.update({
+                "state": "direct_marketing_eco_plus_export_phase5",
+                "mode": MODE_DISCH,
+                "val": discharge_w,
+                "priority": "direct_marketing",
+                "protected": True,
+                "storage_req_w": -discharge_w,
+                "budget_w": discharge_w,
+                "auto_limit": {"enabled": False, "release": False, "reason": reason},
+                "direct_marketing_export_control": control,
+            })
+            translation.update({"export_control": control, "translated_power_w": discharge_w})
+        elif action == "HEADROOM_EXPORT":
+            headroom = predump_grid_export_headroom(cfg, live)
+            hard_limit_w = hard_predump_grid_limit_w(cfg, max_discharge_w)
+            sink_limit_w = max(0, safe_int(headroom.get("discharge_limit_w"), 0))
+            discharge_w = min(requested_w, max_discharge_w, hard_limit_w, sink_limit_w)
+            import_guard = direct_marketing_export_import_guard(cfg, live, discharge_w)
+            translation.update({"headroom": headroom, "hard_sink_limit_w": hard_limit_w, "import_guard": import_guard})
+            if import_guard.get("blocked"):
+                return _phase5_legacy_fallback(baseline, arbitration, "PHASE5_HEADROOM_IMPORT_GUARD")
+            if discharge_w < 300:
+                return _phase5_legacy_fallback(baseline, arbitration, "PHASE5_HEADROOM_SINK_ROOM_BELOW_MINIMUM")
+            decision.update({
+                "state": "direct_marketing_eco_plus_headroom_export_phase5",
+                "mode": MODE_DISCH,
+                "val": discharge_w,
+                "priority": "direct_marketing",
+                "protected": True,
+                "storage_req_w": -discharge_w,
+                "budget_w": discharge_w,
+                "auto_limit": {"enabled": False, "release": False, "reason": reason},
+                "predump_grid_fallback": True,
+                "predump_active": True,
+                "predump_grid_export_headroom": headroom,
+            })
+            translation["translated_power_w"] = discharge_w
+        else:
+            return _phase5_legacy_fallback(baseline, arbitration, "PHASE5_ACTION_TRANSLATION_UNKNOWN")
+
+        decision.update({
+            "mode_name": mode_label(safe_int(decision.get("mode"), MODE_AUTO)),
+            "reason": reason,
+            "display_reason": reason,
+            "direct_marketing_active": True,
+            "direct_marketing_action": action,
+            "direct_marketing_target_state": action,
+            "storage_dispatch_selected_plan_id": arbitration.get("plan_id"),
+            "storage_dispatch_selected_slot_id": arbitration.get("slot_id"),
+        })
+        errors = hard_mode_justification_errors(live, decision)
+        if errors:
+            arbitration["translation_guard_errors"] = errors
+            return _phase5_legacy_fallback(baseline, arbitration, "PHASE5_HARD_MODE_TRANSLATION_GUARD")
+        arbitration["translation"] = translation
+        arbitration["translated_mode"] = decision.get("mode")
+        arbitration["translated_mode_name"] = decision.get("mode_name")
+        arbitration["translated_power_w"] = decision.get("val")
+        arbitration["translated_state"] = decision.get("state")
+        arbitration["execution_intent"] = {
+            "class": "authorized_command",
+            "authorized": True,
+            "action": action,
+            "power_w": max(0, safe_int(decision.get("val"), 0)),
+            "owner": "direct_marketing",
+        }
+        arbitration["requested"] = False
+        arbitration["issued"] = False
+        arbitration["request_attempted_by"] = None
+        arbitration["request"] = None
+        arbitration["power_settings_after_request"] = None
+        arbitration["hardware_effect"] = False
+        decision["storage_dispatch_phase5"] = arbitration
+        return decision
+    except Exception as exc:
+        arbitration["translation_exception"] = type(exc).__name__
+        return _phase5_legacy_fallback(baseline, arbitration, "PHASE5_TRANSLATION_EXCEPTION")
+
+
+def _rscp_runtime_settings_complete(settings: Tuple[str, int, str, str, str]) -> bool:
+    host, port, user, password, rscp_password = settings
+    return bool(
+        str(host or "").strip()
+        and 1 <= safe_int(port, 0) <= 65535
+        and str(user or "").strip()
+        and str(password or "").strip()
+        and str(rscp_password or "").strip()
+    )
+
+
+def execute_rscp_cycle(ctrl: BattCtrl, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Bindet Live-Readback, Soll und Ausgang in genau einem Managerzyklus."""
+    payload_auto_limit = payload.get("auto_limit") if isinstance(payload.get("auto_limit"), dict) else {}
+    ctrl.set_auto_discharge_cap(safe_int(payload.get("max_discharge_w"), 0))
+    rscp_contract = rscp_command_contract(
+        payload["mode"],
+        payload["val"],
+        current_mode=getattr(ctrl, "_mode", -1),
+        auto_limit=payload_auto_limit,
+        discharge_cap_w=safe_int(payload.get("max_discharge_w"), 0),
+        auto_discharge_cap_w=getattr(ctrl, "_auto_discharge_cap", 0),
+    )
+    payload["rscp_command_contract_version"] = safe_int(rscp_contract.get("contract_version"), 0)
+    payload["rscp_command_path"] = rscp_contract.get("path")
+    payload["rscp_active_refresh"] = bool(rscp_contract.get("active_refresh"))
+    payload["rscp_limit_refresh"] = bool(rscp_contract.get("limit_refresh"))
+    payload["rscp_power_settings_reconciled"] = ctrl.reconcile_power_settings(
+        payload,
+        fresh=bool(
+            not payload.get("live_stale")
+            and payload.get("live_sample_valid", True)
+            and payload.get("grid_power_valid", True)
+        ),
+    )
+    ctrl.send(
+        payload["mode"],
+        payload["val"],
+        force=bool(payload["protected"])
+        or bool(rscp_contract.get("active_refresh"))
+        or bool(rscp_contract.get("limit_refresh")),
+        discharge_cap_w=safe_int(payload.get("max_discharge_w"), 0),
+        auto_limit=payload_auto_limit,
+    )
+    payload["rscp_power_settings"] = ctrl.power_settings_diagnostics()
+    return payload["rscp_power_settings"]
+
+
+def finalize_storage_dispatch_phase5_request(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Bindet einen echten Phase-5-Request an die bereits übersetzte Managerentscheidung."""
+
+    phase5 = payload.get("storage_dispatch_phase5") if isinstance(payload.get("storage_dispatch_phase5"), dict) else {}
+    if not phase5:
+        return phase5
+    action = str(phase5.get("selected_action") or "HOLD").upper()
+    intent = phase5.get("execution_intent") if isinstance(phase5.get("execution_intent"), dict) else {}
+    translation = phase5.get("translation") if isinstance(phase5.get("translation"), dict) else {}
+    translated_power_w = max(0, safe_int(translation.get("translated_power_w"), phase5.get("translated_power_w", 0)))
+    request_authorized = bool(
+        action in _PHASE5_COMMAND_ACTIONS
+        and phase5.get("selected")
+        and phase5.get("executable")
+        and phase5.get("commands_allowed")
+        and intent.get("authorized") is True
+        and intent.get("class") == "authorized_command"
+        and str(intent.get("action") or "").upper() == action
+        and str(translation.get("action") or "").upper() == action
+        and translated_power_w >= 300
+        and payload.get("direct_marketing_active") is True
+        and str(payload.get("priority") or "").lower() == "direct_marketing"
+        and max(0, safe_int(payload.get("val"), 0)) >= 300
+    )
+    phase5["requested"] = request_authorized
+    phase5["issued"] = request_authorized
+    phase5["request_attempted_by"] = "storage_manager" if request_authorized else None
+    phase5["hardware_effect"] = request_authorized
+    phase5["request"] = {
+        "mode": payload.get("mode_name"),
+        "mode_value": payload.get("mode"),
+        "power_w": payload.get("val"),
+        "rscp_path": payload.get("rscp_command_path"),
+    } if request_authorized else None
+    phase5["power_settings_after_request"] = (
+        copy.deepcopy(payload.get("rscp_power_settings"))
+        if request_authorized
+        else None
+    )
+    return phase5
+
+
 def main() -> None:
     log.info("=== E3DC Storage Manager gestartet ===")
     cfg = load_cfg()
     cfg_ts = time.time()
     rscp_settings = rscp_settings_from_cfg(cfg)
-    ctrl: Optional[BattCtrl] = BattCtrl(*rscp_settings) if rscp_settings[2] else None
+    ctrl: Optional[BattCtrl] = BattCtrl(*rscp_settings) if _rscp_runtime_settings_complete(rscp_settings) else None
     previous_state: Dict[str, Any] = {}
     last_decision_log_sig: Optional[Tuple[Any, ...]] = None
     while not _stop:
@@ -16269,7 +18600,7 @@ def main() -> None:
                 if ctrl:
                     ctrl.close()
                 rscp_settings = new_settings
-                ctrl = BattCtrl(*rscp_settings) if rscp_settings[2] else None
+                ctrl = BattCtrl(*rscp_settings) if _rscp_runtime_settings_complete(rscp_settings) else None
         cycle_s = auto_limit_heartbeat_s(cfg) if auto_limit_heartbeat_enabled(cfg) else CYCLE_S
         if not ctrl:
             write_safe_start_state(
@@ -16277,7 +18608,7 @@ def main() -> None:
                 reason="Keine E3DC-RSCP-Konfiguration",
                 mode=-1,
             )
-            log.error("Kein e3dc_user. Warte auf gespeicherte Konfiguration.")
+            log.error("Unvollständige E3DC-RSCP-Konfiguration. Warte auf Ziel und Zugangsdaten.")
             time.sleep(cycle_s)
             continue
         live = read_json_file(LIVE_F, max_age_s=30)
@@ -16293,7 +18624,9 @@ def main() -> None:
             write_config_validation(cfg, live)
         except Exception as exc:
             log.debug("Config-Validierung konnte nicht geschrieben werden: %s", exc)
-        plan = read_json_file(PLAN_F, max_age_s=1800)
+        # Pro Zyklus genau eine stabile, statisch validierte Planrevision.
+        # Bei Replace, Hash- oder Generationsabweichung gibt es keinen Altplan-Fallback.
+        plan = load_validated_canonical_plan_snapshot(PLAN_F, max_age_s=1800) or {}
         wb_intent = read_json_file(WB_INTENT_F, max_age_s=90)
         wb_native = read_json_file(WB_NATIVE_F, max_age_s=90)
         manual_max_age_s = manual_override_max_age_s(cfg)
@@ -16342,35 +18675,39 @@ def main() -> None:
                 "set_power_auto": False,
                 "reason": "ems_budget_runtime_safe_fallback",
             }
+        # Phase 5 arbitriert erst nach vollständiger Legacy-/Safetyentscheidung
+        # und unmittelbar vor dem einzigen RSCP-Ausgang. Der bestätigte
+        # POWER_SETTINGS-Zustand stammt aus dem vorherigen Managerzyklus; ein
+        # Phase-5-Fehler verändert die Legacyentscheidung nicht.
+        payload = apply_storage_dispatch_phase5(
+            cfg,
+            plan,
+            payload,
+            live,
+            ctrl.power_settings_diagnostics(),
+            previous_state,
+            now_s=start,
+        )
         payload_auto_limit = payload.get("auto_limit") if isinstance(payload.get("auto_limit"), dict) else {}
         if payload_auto_limit and payload_auto_limit.get("enabled"):
             cycle_s = max(1.0, min(3.0, safe_float(payload_auto_limit.get("heartbeat_s"), auto_limit_heartbeat_s(cfg))))
-        ctrl.set_auto_discharge_cap(safe_int(payload.get("max_discharge_w"), 0))
-        # Aktive Eingriffe muessen gehalten werden: einige E3DC-Firmwares fallen
-        # sonst nach wenigen Sekunden in interne PV-Ladung/Entladung zurueck.
+        # Aktive Eingriffe müssen gehalten werden: einige E3DC-Firmwares fallen
+        # sonst nach wenigen Sekunden in interne PV-Ladung/Entladung zurück.
         # AUTO bleibt der einzige bewusst nicht ge-heartbeatete Freilaufpfad.
-        rscp_contract = rscp_command_contract(
-            payload["mode"],
-            payload["val"],
-            current_mode=getattr(ctrl, "_mode", -1),
-            auto_limit=payload_auto_limit,
-            discharge_cap_w=safe_int(payload.get("max_discharge_w"), 0),
-            auto_discharge_cap_w=getattr(ctrl, "_auto_discharge_cap", 0),
+        execute_rscp_cycle(ctrl, payload)
+        finalize_storage_dispatch_phase5_request(payload)
+        payload["storage_dispatch_runtime"] = build_runtime_overlay(
+            plan,
+            payload,
+            live,
+            now_ms=int(start * 1000),
         )
-        payload["rscp_command_contract_version"] = safe_int(rscp_contract.get("contract_version"), 0)
-        payload["rscp_command_path"] = rscp_contract.get("path")
-        payload["rscp_active_refresh"] = bool(rscp_contract.get("active_refresh"))
-        payload["rscp_limit_refresh"] = bool(rscp_contract.get("limit_refresh"))
-        active_refresh = bool(rscp_contract.get("active_refresh"))
-        limit_refresh = bool(rscp_contract.get("limit_refresh"))
-        ctrl.send(
-            payload["mode"],
-            payload["val"],
-            force=bool(payload["protected"]) or active_refresh or limit_refresh,
-            discharge_cap_w=safe_int(payload.get("max_discharge_w"), 0),
-            auto_limit=payload.get("auto_limit") if isinstance(payload.get("auto_limit"), dict) else None,
+        atomic_write_on_change(
+            DISPATCH_RUNTIME_F,
+            payload["storage_dispatch_runtime"],
+            force_interval_s=15.0,
+            indent=2,
         )
-        payload["rscp_power_settings"] = ctrl.power_settings_diagnostics()
         acknowledge_manual_override_done(manual, payload, now_s=start)
         ems_reaction_history_due = _history_event_write_due(payload, _ems_reaction_history_event_state, now_s=start)
         try:
@@ -16390,15 +18727,15 @@ def main() -> None:
             if isinstance(shelly_state, dict):
                 payload["direct_marketing_aux_inverter_shelly"] = shelly_state
         except Exception as exc:
-            payload["direct_marketing_aux_inverter_shelly"] = {
+            fallback_state = {
                 "schema": "direct_marketing_aux_inverter_shelly_v2",
                 "ts": int(start),
-                "enabled": _boolish_direct_marketing_shelly_override(
-                    cfg.get("direct_marketing_aux_inverter_shelly_override", "0")
-                ),
+                "enabled": False,
+                "command_sent": False,
                 "status": "exception",
-                "error": str(exc)[:180],
+                "error": type(exc).__name__,
             }
+            payload["direct_marketing_aux_inverter_shelly"] = fallback_state
             log.debug("DV-Shelly-Zusatz-WR-Check konnte nicht ausgeführt werden: %s", exc)
         write_state(payload, plan)
         write_wb_budget(payload)

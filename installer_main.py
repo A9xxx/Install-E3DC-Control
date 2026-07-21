@@ -223,22 +223,6 @@ def main():
     parser.add_argument("--unattended", action="store_true", help="Ohne Benutzereingaben ausführen (für PHP/Cron)")
     parser.add_argument("--update-e3dc", action="store_true", help="E3DC-Control aktualisieren (headless)")
     parser.add_argument("--install-release-tag", default="", help="Gezielt einen validierten Release-Tag installieren")
-    parser.add_argument(
-        "--bootstrap-install-path",
-        default="",
-        help="Absoluter Zielpfad fuer eine gepruefte V3/ZIP- oder V4-Altinstallation",
-    )
-    parser.add_argument(
-        "--expected-release-sha",
-        default="",
-        help="Explizit freigegebene volle 40-stellige Ziel-SHA (fuer Bootstrap verpflichtend)",
-    )
-    parser.add_argument(
-        "--expected-ha-role",
-        choices=("off", "master", "slave", "shadow"),
-        default="",
-        help="Vor dem Bootstrap erwartete und danach unveraenderte HA-/Shadow-Rolle",
-    )
     parser.add_argument("--fix-permissions", action="store_true", help="Dateirechte und Dienste headless pruefen/reparieren")
     parser.add_argument("--prepare-system-packages", action="store_true", help="Nur Systempakete/Python-Abhängigkeiten installieren und danach beenden")
     parser.add_argument("--install-all", action="store_true", help="Vollständige Installation durchführen (headless)")
@@ -275,12 +259,7 @@ def main():
             print("→ Starte Update-Modul...")
             sys.stdout.flush()
             from Installer.update import update_e3dc
-            update_ok = update_e3dc(
-                headless=True,
-                target_install_path=args.bootstrap_install_path or None,
-                expected_release_sha=args.expected_release_sha or None,
-                expected_ha_role=args.expected_ha_role or None,
-            )
+            update_ok = update_e3dc(headless=True)
             
             # Sicherstellen, dass e3dc_paths.json nach Update aktuell ist
             config = load_config()
@@ -292,17 +271,10 @@ def main():
             sys.exit(0 if update_ok is not False else 1)
 
         if args.install_release_tag:
-            action_label = "Release-Bootstrap" if args.bootstrap_install_path else "Release-Rueckfall"
-            print(f"-> Starte {action_label} auf {args.install_release_tag}...")
+            print(f"-> Starte Release-Rückfall auf {args.install_release_tag}...")
             sys.stdout.flush()
             from Installer.update import update_e3dc
-            update_ok = update_e3dc(
-                headless=True,
-                target_ref=args.install_release_tag,
-                target_install_path=args.bootstrap_install_path or None,
-                expected_release_sha=args.expected_release_sha or None,
-                expected_ha_role=args.expected_ha_role or None,
-            )
+            update_ok = update_e3dc(headless=True, target_ref=args.install_release_tag)
 
             config = load_config()
             user = config.get("install_user")
@@ -428,4 +400,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

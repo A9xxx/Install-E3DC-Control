@@ -184,7 +184,7 @@ foreach ($lines as $line) {
 }
 
 // V4 Zukunfts-Puffer: Immer 72h ab jetzt vorausschauen.
-// $now auf volle Stunde runden = saubere Slot-Grenzen fuer den Preis-Join mit eco_score.json.
+// $now auf volle Stunde runden = saubere Slot-Grenzen für den Preis-Join mit eco_score.json.
 $now = floor(time() / 3600) * 3600;
 $limit = $now + (72 * 3600); // Immer 72h ab jetzt (robust, unabhaengig von Mitternacht)
 
@@ -252,186 +252,358 @@ $data = [
     'storage_target_curve' => [],
     'market_charge' => [], 'market_hold' => [], 'market_action' => [],
     'wp' => [], 'climate' => [], 'wb' => [], 'wb2' => [], 'price' => [], 'market_price' => [], 'eco_score' => [], 'dv_grid' => [],
+    'home_source' => [], 'home_quality' => [],
+    'wp_source' => [], 'wp_quality' => [],
+    'climate_source' => [], 'climate_quality' => [],
     'direct_marketing_export' => [], 'direct_marketing_charge' => [], 'direct_marketing_soc' => [], 'direct_marketing_action' => [],
+    'direct_marketing_candidate' => [], 'direct_marketing_candidate_w' => [], 'direct_marketing_candidate_action' => [],
+    'direct_marketing_selected' => [], 'direct_marketing_executable' => [], 'direct_marketing_commands_allowed' => [],
+    'direct_marketing_plan_executable' => [], 'direct_marketing_plan_commands_allowed' => [],
+    'direct_marketing_block_reason' => [], 'direct_marketing_planned_w' => [],
+    'direct_marketing_authorized_export_w' => [], 'direct_marketing_active' => [],
+    'direct_marketing_hardware_effect' => [], 'direct_marketing_window_id' => [],
+    'direct_marketing_selection_invariant' => [],
+    'direct_marketing_export_segment_id' => [],
+    'direct_marketing_market_eligible' => [], 'direct_marketing_market_window_id' => [],
+    'direct_marketing_market_window_start_ts' => [], 'direct_marketing_market_window_end_ts' => [],
+    'direct_marketing_market_margin_class' => [], 'direct_marketing_market_net_sell_ct' => [],
     'predump' => [], 'predump_w' => [],
+    'predump_candidate_w' => [], 'predump_executable_w' => [], 'predump_status' => [],
+    'storage_slot_id' => [],
+    'pv_e3dc_dc' => [], 'pv_external_ac' => [],
+    'pv_topology_status' => [], 'pv_topology_reason' => [], 'pv_topology_revision' => [],
+    'pv_topology_source' => [], 'pv_topology_quality' => [],
+    'pv_resource_projection_status' => [], 'pv_resource_projection_reason' => [],
+    'headroom_dc_pressure_wh' => [], 'headroom_pcc_pressure_wh' => [],
+    'headroom_combined_pressure_wh' => [], 'headroom_deadline_ts' => [],
     'pv_m1' => [], 'pv_m2' => [], 'pv_m3' => [], 'pv_ensemble' => [],
     'pv_history' => []   // KI-Prognose Vergangenheits-Overlay (was predicted, now past)
 
 ];
 
-function forecastMarketContractForTs($marketPlan, $targetTsMs) {
-    if (!is_array($marketPlan) || empty($marketPlan)) return null;
-    $contracts = [];
-    if (isset($marketPlan['active_contract']) && is_array($marketPlan['active_contract'])) {
-        $contracts[] = $marketPlan['active_contract'];
-    }
-    if (isset($marketPlan['contracts']) && is_array($marketPlan['contracts'])) {
-        foreach ($marketPlan['contracts'] as $contract) {
-            if (is_array($contract)) $contracts[] = $contract;
-        }
-    }
-    foreach ($contracts as $contract) {
-        $start = isset($contract['start_ts']) ? (float)$contract['start_ts'] : 0.0;
-        $end = isset($contract['end_ts']) ? (float)$contract['end_ts'] : 0.0;
-        if ($start <= $targetTsMs && $targetTsMs < $end) {
-            return $contract;
-        }
+function forecastCanonicalDispatchPlanValid($plan) {
+    if (!is_array($plan)) return false;
+    if (($plan['schema_version'] ?? '') !== 'storage_dispatch_plan_v1') return false;
+    $planId = (string)($plan['plan_id'] ?? '');
+    return preg_match('/^sha256:[0-9a-f]{64}$/', $planId) === 1
+        && isset($plan['slots'])
+        && is_array($plan['slots']);
+}
+
+function forecastCanonicalDispatchSlotForTs($plan, $targetTsMs) {
+    if (!forecastCanonicalDispatchPlanValid($plan)) return null;
+    foreach ($plan['slots'] as $slot) {
+        if (!is_array($slot)) continue;
+        $start = isset($slot['start_ts_ms']) ? (float)$slot['start_ts_ms'] : 0.0;
+        $end = isset($slot['end_ts_ms']) ? (float)$slot['end_ts_ms'] : 0.0;
+        if ($start <= $targetTsMs && $targetTsMs < $end) return $slot;
     }
     return null;
 }
 
-function forecastMarketGridChargeAction($action) {
-    return in_array((string)$action, ['grid_charge', 'grid_charge_candidate', 'negative_price_absorb'], true);
+function forecastCanonicalDispatchProjection($slot) {
+    if (!is_array($slot)) return null;
+    $projection = $slot['projection'] ?? null;
+    return is_array($projection) ? $projection : null;
 }
 
-function forecastMarketContractReleases($contract, $consumer) {
-    if (!is_array($contract) || !isset($contract['released_consumers']) || !is_array($contract['released_consumers'])) {
-        return false;
-    }
-    $needle = strtolower((string)$consumer);
-    foreach ($contract['released_consumers'] as $released) {
-        if (strtolower(trim((string)$released)) === $needle) {
-            return true;
+function forecastReadDispatchGeneration($planFile, $runtimeFile, $maxAttempts = 2) {
+    $attempts = max(1, (int)$maxAttempts);
+    $lastPlan = [];
+    $lastRuntime = [];
+    $stablePlan = [];
+    $canonicalInputSeen = false;
+    $reason = 'snapshot_missing';
+    for ($attempt = 1; $attempt <= $attempts; $attempt++) {
+        $planBefore = file_exists($planFile)
+            ? @json_decode(file_get_contents($planFile), true)
+            : null;
+        $runtime = file_exists($runtimeFile)
+            ? @json_decode(file_get_contents($runtimeFile), true)
+            : null;
+        $planAfter = file_exists($planFile)
+            ? @json_decode(file_get_contents($planFile), true)
+            : null;
+        $lastPlan = is_array($planAfter) ? $planAfter : [];
+        $lastRuntime = is_array($runtime) ? $runtime : [];
+        $canonicalInputSeen = $canonicalInputSeen
+            || (is_array($planBefore) && (($planBefore['schema_version'] ?? '') === 'storage_dispatch_plan_v1'))
+            || (is_array($planAfter) && (($planAfter['schema_version'] ?? '') === 'storage_dispatch_plan_v1'));
+        if (!forecastCanonicalDispatchPlanValid($planBefore)
+            || !forecastCanonicalDispatchPlanValid($planAfter)) {
+            $reason = 'plan_invalid';
+            continue;
         }
+        $planIdBefore = (string)($planBefore['plan_id'] ?? '');
+        $planIdAfter = (string)($planAfter['plan_id'] ?? '');
+        if ($planIdBefore === '' || $planIdBefore !== $planIdAfter) {
+            $reason = 'plan_changed_during_read';
+            continue;
+        }
+        $stablePlan = $planAfter;
+        if (!is_array($runtime)
+            || (($runtime['schema_version'] ?? '') !== 'storage_dispatch_runtime_v1')) {
+            $reason = 'runtime_invalid';
+            continue;
+        }
+        if (($runtime['plan_id'] ?? null) !== $planIdAfter) {
+            $reason = 'runtime_plan_mismatch';
+            continue;
+        }
+        $runtimeSlotId = (string)($runtime['slot_id'] ?? '');
+        $slotMatched = false;
+        foreach (($planAfter['slots'] ?? []) as $slot) {
+            if (is_array($slot) && $runtimeSlotId !== '' && ($slot['slot_id'] ?? null) === $runtimeSlotId) {
+                $slotMatched = true;
+                break;
+            }
+        }
+        if (!$slotMatched) {
+            $reason = 'runtime_slot_mismatch';
+            continue;
+        }
+        return [
+            'plan' => $planAfter,
+            'runtime' => $runtime,
+            'coherent' => true,
+            'plan_coherent' => true,
+            'runtime_coherent' => true,
+            'projection_status' => 'coherent',
+            'canonical_input_seen' => true,
+            'attempts' => $attempt,
+            'reason' => 'ok',
+            'plan_id' => $planIdAfter,
+            'slot_id' => $runtimeSlotId,
+        ];
     }
-    return false;
+    return [
+        'plan' => $stablePlan,
+        'runtime' => $lastRuntime,
+        'coherent' => false,
+        'plan_coherent' => !empty($stablePlan),
+        'runtime_coherent' => false,
+        'projection_status' => !empty($stablePlan) ? 'plan_only' : 'unavailable',
+        'canonical_input_seen' => $canonicalInputSeen,
+        'attempts' => $attempts,
+        'reason' => $reason,
+        'plan_id' => $stablePlan['plan_id'] ?? null,
+        'slot_id' => $lastRuntime['slot_id'] ?? null,
+    ];
 }
 
-function forecastMarketHoldAction($action) {
-    return in_array((string)$action, ['hold_discharge', 'house_supply_candidate'], true);
+function forecastDispatchGenerationDiagnostics($generation) {
+    $reason = (string)($generation['reason'] ?? 'snapshot_missing');
+    return [
+        'schema_version' => 'forecast_storage_projection_status_v1',
+        'status' => (string)($generation['projection_status'] ?? 'unavailable'),
+        'reason_code' => strtoupper($reason),
+        'plan_coherent' => !empty($generation['plan_coherent']),
+        'runtime_coherent' => !empty($generation['runtime_coherent']),
+        'plan_id' => $generation['plan_id'] ?? null,
+        'runtime_slot_id' => $generation['slot_id'] ?? null,
+        'attempts' => (int)($generation['attempts'] ?? 0),
+    ];
 }
 
-function forecastMarketPlannedChargeW($contract, $stBat, $maxChargeW) {
-    $maxChargeW = max(0.0, (float)$maxChargeW);
-    if ($maxChargeW <= 0.0 || !is_array($contract)) return 0.0;
-    $action = (string)($contract['action'] ?? '');
-    if ($action === 'negative_price_absorb') return $maxChargeW;
-    if ($stBat !== null && (float)$stBat > 0.0) return min($maxChargeW, (float)$stBat);
-    $forecast = isset($contract['forecast']) && is_array($contract['forecast']) ? $contract['forecast'] : [];
-    $needWh = isset($forecast['grid_charge_need_wh']) ? max(0.0, (float)$forecast['grid_charge_need_wh']) : 0.0;
-    $slots = max(1.0, (float)($contract['slot_count'] ?? 1.0));
-    if ($needWh > 0.0) {
-        return min($maxChargeW, max(300.0, ($needWh / $slots) / 0.25));
-    }
-    return min($maxChargeW, 1200.0);
-}
-
-function forecastDirectMarketingExportAction($action) {
-    return in_array((string)$action, ['eco_plus_export_candidate', 'arbitrage_export_candidate'], true);
-}
-
-function forecastDirectMarketingWindows($directMarketingPlan) {
-    if (!is_array($directMarketingPlan)) return [];
-    return (isset($directMarketingPlan['windows']) && is_array($directMarketingPlan['windows']))
-        ? $directMarketingPlan['windows']
+function forecastDirectMarketingSlotState($projection, $runtime, $runtimeMatchesSlot, $requiresPrice) {
+    $projection = is_array($projection) ? $projection : [];
+    $runtime = is_array($runtime) ? $runtime : [];
+    $runtimeCandidate = $runtimeMatchesSlot && is_array($runtime['candidate'] ?? null)
+        ? $runtime['candidate']
         : [];
-}
-
-function forecastDirectMarketingWindowForTs($directMarketingPlan, $targetTsMs) {
-    foreach (forecastDirectMarketingWindows($directMarketingPlan) as $window) {
-        if (!is_array($window) || !forecastDirectMarketingExportAction($window['action'] ?? '')) continue;
-        $start = isset($window['start_ts']) ? (float)$window['start_ts'] : 0.0;
-        $end = isset($window['end_ts']) ? (float)$window['end_ts'] : 0.0;
-        if ($start <= $targetTsMs && $targetTsMs < $end) {
-            return $window;
-        }
-    }
-    return null;
-}
-
-function forecastDirectMarketingHasExportWindows($directMarketingPlan) {
-    foreach (forecastDirectMarketingWindows($directMarketingPlan) as $window) {
-        if (is_array($window) && forecastDirectMarketingExportAction($window['action'] ?? '')) return true;
-    }
-    return false;
-}
-
-function forecastDirectMarketingExportPowerW($window) {
-    if (!is_array($window) || !forecastDirectMarketingExportAction($window['action'] ?? '')) return 0.0;
-    $power = isset($window['max_power_w']) ? max(0.0, (float)$window['max_power_w']) : 0.0;
-    $start = isset($window['start_ts']) ? (float)$window['start_ts'] : 0.0;
-    $end = isset($window['end_ts']) ? (float)$window['end_ts'] : 0.0;
-    $durationH = $end > $start ? (($end - $start) / 3600000.0) : 0.0;
-    $kwh = isset($window['theoretical_kwh']) ? max(0.0, (float)$window['theoretical_kwh']) : 0.0;
-    if ($durationH > 0.0 && $kwh > 0.0) {
-        $avgPower = ($kwh * 1000.0) / $durationH;
-        $power = $power > 0.0 ? min($power, $avgPower) : $avgPower;
-    }
-    return $power;
-}
-
-function forecastDirectMarketingPolicyDecision($directMarketingPlan) {
-    if (!is_array($directMarketingPlan)) return [];
-    $policy = $directMarketingPlan['policy_decision'] ?? [];
-    return is_array($policy) ? $policy : [];
-}
-
-function forecastDirectMarketingPolicyTimeline($directMarketingPlan) {
-    if (!is_array($directMarketingPlan)) return [];
-    $timeline = $directMarketingPlan['policy_timeline'] ?? [];
-    return is_array($timeline) ? $timeline : [];
-}
-
-function forecastDirectMarketingPolicyDecisionForTs($directMarketingPlan, $targetTsMs) {
-    foreach (forecastDirectMarketingPolicyTimeline($directMarketingPlan) as $policy) {
-        if (!is_array($policy)) continue;
-        $start = isset($policy['start_ts']) ? (float)$policy['start_ts'] : 0.0;
-        $end = isset($policy['end_ts']) ? (float)$policy['end_ts'] : 0.0;
-        if ($start <= $targetTsMs && $targetTsMs < $end) return $policy;
-    }
-
-    // Alte Pläne besitzen nur die Entscheidung für den aktuellen Slot. Diese
-    // darf nicht mehr versehentlich auf alle späteren Fenster angewendet werden.
-    $policy = forecastDirectMarketingPolicyDecision($directMarketingPlan);
-    $selected = is_array($policy['selected_window'] ?? null) ? $policy['selected_window'] : [];
-    $start = isset($selected['start_ts']) ? (float)$selected['start_ts'] : 0.0;
-    $end = isset($selected['end_ts']) ? (float)$selected['end_ts'] : 0.0;
-    return ($start <= $targetTsMs && $targetTsMs < $end) ? $policy : [];
-}
-
-function forecastDirectMarketingPolicyCommandsAllowed($policy) {
-    if (!is_array($policy) || empty($policy)) return false;
-    if (($policy['schema'] ?? null) !== 'direct_marketing_policy_v1') return false;
-    if (!empty($policy['blocked'])) return false;
-    if (array_key_exists('commands_allowed', $policy) && !$policy['commands_allowed']) return false;
-    $target = strtoupper(trim((string)($policy['dv_target_state'] ?? '')));
-    return in_array($target, ['FORCE_EXPORT', 'HEADROOM_EXPORT', 'FORCE_CHARGE_PV'], true);
-}
-
-function forecastDirectMarketingPolicyTargetState($policy) {
-    return is_array($policy) ? strtoupper(trim((string)($policy['dv_target_state'] ?? ''))) : '';
-}
-
-function forecastDirectMarketingPolicyExportPowerW($policy, $windowPowerW) {
-    if (!forecastDirectMarketingPolicyCommandsAllowed($policy)) return 0.0;
-    $target = forecastDirectMarketingPolicyTargetState($policy);
-    if (!in_array($target, ['FORCE_EXPORT', 'HEADROOM_EXPORT'], true)) return 0.0;
-    $budget = 0.0;
-    $storageBudget = $policy['storage_budget'] ?? [];
-    if (is_array($storageBudget) && isset($storageBudget['export_budget_w'])) {
-        $budget = max(0.0, (float)$storageBudget['export_budget_w']);
-    }
-    if ($budget <= 0.0) return 0.0;
-    $windowPowerW = max(0.0, (float)$windowPowerW);
-    return $windowPowerW > 0.0 ? min($windowPowerW, $budget) : $budget;
-}
-
-function forecastDirectMarketingPolicyChargePowerW($policy) {
-    if (!forecastDirectMarketingPolicyCommandsAllowed($policy)) return 0.0;
-    if (forecastDirectMarketingPolicyTargetState($policy) !== 'FORCE_CHARGE_PV') return 0.0;
-    $storageBudget = $policy['storage_budget'] ?? [];
-    return is_array($storageBudget) && isset($storageBudget['charge_budget_w'])
-        ? max(0.0, (float)$storageBudget['charge_budget_w'])
+    $runtimeAction = strtoupper((string)($runtimeCandidate['action'] ?? ''));
+    $runtimeSelectedAction = strtoupper((string)(
+        $runtime['phase5']['selected_action']
+        ?? $runtime['actual_manager_action']
+        ?? ''
+    ));
+    $authorizedExportW = $runtimeMatchesSlot
+        ? max(0.0, (float)($runtime['export_budget_w'] ?? 0.0))
         : 0.0;
+    $authorizedChargeW = $runtimeMatchesSlot
+        ? max(0.0, (float)($runtime['charge_budget_w'] ?? 0.0))
+        : 0.0;
+    $commandAction = in_array($runtimeAction, ['ECONOMIC_EXPORT', 'PV_STORE'], true);
+    $executable = $requiresPrice
+        && $runtimeMatchesSlot
+        && !empty($runtime['executable'])
+        && $commandAction;
+    $commandsAllowed = $requiresPrice
+        && $runtimeMatchesSlot
+        && !empty($runtime['commands_allowed'])
+        && $commandAction;
+    $candidate = $requiresPrice && !empty($projection['direct_marketing_candidate']);
+    $candidateW = $candidate
+        ? max(0.0, (float)($projection['direct_marketing_candidate_w'] ?? 0.0))
+        : 0.0;
+    $selected = $requiresPrice && !empty($projection['direct_marketing_selected']);
+    $planExecutable = $requiresPrice && !empty($projection['direct_marketing_plan_executable']);
+    $planCommandsAllowed = $requiresPrice && !empty($projection['direct_marketing_plan_commands_allowed']);
+    $plannedW = $selected && $planExecutable && $planCommandsAllowed
+        ? max(0.0, (float)($projection['direct_marketing_planned_w'] ?? 0.0))
+        : 0.0;
+    $windowId = $projection['direct_marketing_window_id'] ?? null;
+    $planAction = strtoupper((string)($projection['direct_marketing_plan_action'] ?? ''));
+    $planActionId = $projection['direct_marketing_plan_action_id'] ?? null;
+    $planSegmentId = $projection['direct_marketing_plan_segment_id'] ?? null;
+    $planActionHorizon = is_array($projection['direct_marketing_action_horizon_contract'] ?? null)
+        ? $projection['direct_marketing_action_horizon_contract']
+        : [];
+    $planEconomicGate = is_array($projection['direct_marketing_economic_export_gate'] ?? null)
+        ? $projection['direct_marketing_economic_export_gate']
+        : [];
+    $planSelectionComplete = $selected
+        && $planExecutable
+        && $planCommandsAllowed
+        && $plannedW > 0.0
+        && in_array($planAction, ['ECONOMIC_EXPORT', 'PV_STORE'], true)
+        && is_string($windowId)
+        && trim($windowId) !== ''
+        && is_string($planActionId)
+        && trim($planActionId) !== ''
+        && is_string($planSegmentId)
+        && trim($planSegmentId) !== ''
+        && (($planActionHorizon['schema_version'] ?? '') === 'storage_dispatch_action_horizon_v1')
+        && (($planActionHorizon['action'] ?? '') === $planAction)
+        && !empty($planActionHorizon['complete'])
+        && (
+            $planAction !== 'ECONOMIC_EXPORT'
+            || (
+                !empty($planEconomicGate['allowed'])
+                && empty($planEconomicGate['blockers'])
+            )
+        );
+    $runtimeClaimsAction = $runtimeMatchesSlot
+        && $commandAction
+        && (
+            (!empty($runtime['selected']) && $runtimeSelectedAction === $runtimeAction)
+            || !empty($runtime['executable'])
+            || !empty($runtime['commands_allowed'])
+            || $authorizedExportW > 0.0
+            || $authorizedChargeW > 0.0
+            || !empty($runtime['requested']['issued'])
+            || !empty($runtime['phase5']['requested'])
+            || !empty($runtime['phase5']['issued'])
+            || !empty($runtime['phase5']['hardware_effect'])
+        );
+    $runtimeCandidatePowerW = is_numeric($runtimeCandidate['power_w'] ?? null)
+        ? max(0.0, (float)$runtimeCandidate['power_w'])
+        : null;
+    $selectionInvariantValid = !$runtimeClaimsAction || (
+        $planSelectionComplete
+        && $runtimeAction === $planAction
+        && (($runtimeCandidate['window_id'] ?? null) === $windowId)
+        && (($runtimeCandidate['action_id'] ?? null) === $planActionId)
+        && (($runtimeCandidate['segment_id'] ?? null) === $planSegmentId)
+        && $runtimeCandidatePowerW !== null
+        && abs($runtimeCandidatePowerW - $plannedW) <= 1.0
+    );
+    if (!$selectionInvariantValid) {
+        $authorizedExportW = 0.0;
+        $authorizedChargeW = 0.0;
+        $executable = false;
+        $commandsAllowed = false;
+    }
+    $active = $selected
+        && $selectionInvariantValid
+        && !empty($runtime['selected'])
+        && $executable
+        && $commandsAllowed
+        && (
+            ($runtimeAction === 'ECONOMIC_EXPORT' && $authorizedExportW > 0.0)
+            || ($runtimeAction === 'PV_STORE' && $authorizedChargeW > 0.0)
+        );
+    return [
+        'candidate' => $candidate,
+        'candidate_w' => $candidateW,
+        'candidate_action' => $candidate
+            ? ($projection['direct_marketing_candidate_action'] ?? 'ECONOMIC_EXPORT')
+            : null,
+        'selected' => $selected,
+        'plan_executable' => $planExecutable,
+        'plan_commands_allowed' => $planCommandsAllowed,
+        'planned_w' => $plannedW,
+        'plan_action' => $planAction ?: null,
+        'runtime_action' => $runtimeAction ?: null,
+        'executable' => $executable,
+        'commands_allowed' => $commandsAllowed,
+        'authorized_export_w' => $active && $runtimeAction === 'ECONOMIC_EXPORT'
+            ? $authorizedExportW
+            : 0.0,
+        'authorized_charge_w' => $active && $runtimeAction === 'PV_STORE'
+            ? $authorizedChargeW
+            : 0.0,
+        'active' => $active,
+        'hardware_effect' => $selectionInvariantValid
+            && $runtimeMatchesSlot
+            && (($runtime['phase5']['schema_version'] ?? '') === 'storage_dispatch_phase5_v1')
+            && !empty($runtime['phase5']['hardware_effect']),
+        'window_id' => $windowId,
+        'export_segment_id' => $projection['direct_marketing_export_segment_id'] ?? null,
+        'selection_invariant_valid' => $selectionInvariantValid,
+        'selection_invariant_reason' => $selectionInvariantValid
+            ? null
+            : 'PLAN_RUNTIME_SELECTION_INVARIANT_VIOLATION',
+        'block_reason' => !$selectionInvariantValid
+            ? 'PLAN_RUNTIME_SELECTION_INVARIANT_VIOLATION'
+            : ($runtimeMatchesSlot
+            ? ($runtimeCandidate['block_reason_code']
+                ?? $runtime['technical_block_reason_code']
+                ?? $runtime['block_reason_code']
+                ?? null)
+            : ($projection['direct_marketing_block_reason'] ?? null)),
+    ];
 }
 
-function forecastDirectMarketingPolicyHasActiveSchedule($directMarketingPlan) {
-    foreach (forecastDirectMarketingPolicyTimeline($directMarketingPlan) as $policy) {
-        if (forecastDirectMarketingPolicyCommandsAllowed($policy)) return true;
-    }
-    return forecastDirectMarketingPolicyCommandsAllowed(
-        forecastDirectMarketingPolicyDecision($directMarketingPlan)
-    );
+function forecastLegacyStorageProjection($slot) {
+    if (!is_array($slot)) return null;
+    $pvW = isset($slot['pv_w']) ? (float)$slot['pv_w'] : null;
+    $homeW = isset($slot['home_w']) ? (float)$slot['home_w'] : null;
+    $wpW = isset($slot['wp_w']) ? (float)$slot['wp_w'] : null;
+    $climateW = isset($slot['climate_w']) ? (float)$slot['climate_w'] : null;
+    $batteryW = isset($slot['charge_w']) ? (float)$slot['charge_w'] : null;
+    $gridW = ($pvW !== null && $homeW !== null && $batteryW !== null)
+        ? $homeW + ($wpW ?? 0.0) + ($climateW ?? 0.0) + $batteryW - $pvW
+        : null;
+    $candidateW = isset($slot['predump_candidate_w'])
+        ? max(0.0, (float)$slot['predump_candidate_w'])
+        : max(0.0, (float)($slot['grid_dump_w'] ?? 0.0));
+    return [
+        'pv_w' => $pvW,
+        'home_w' => $homeW,
+        'wp_w' => $wpW,
+        'climate_w' => $climateW,
+        'wallbox_w' => 0.0,
+        'battery_w' => $batteryW,
+        'grid_w' => $gridW,
+        'soc_pct' => isset($slot['soc']) ? (float)$slot['soc'] : null,
+        'target_soc_pct' => null,
+        'predump_candidate_w' => $candidateW,
+        'predump_executable_w' => 0.0,
+        'predump_status' => $candidateW > 0.0 ? 'candidate_only' : 'none',
+        'direct_marketing_candidate' => false,
+        'direct_marketing_candidate_w' => 0.0,
+        'direct_marketing_selected' => false,
+        'direct_marketing_executable' => false,
+        'direct_marketing_commands_allowed' => false,
+        'direct_marketing_plan_executable' => false,
+        'direct_marketing_plan_commands_allowed' => false,
+        'direct_marketing_block_reason' => null,
+        'direct_marketing_export_w' => 0.0,
+        'direct_marketing_planned_w' => 0.0,
+        'direct_marketing_soc_pct' => null,
+        'direct_marketing_window_id' => null,
+        'direct_marketing_export_segment_id' => null,
+        'direct_marketing_charge_w' => 0.0,
+        'direct_marketing_action' => null,
+        'direct_marketing_candidate_action' => null,
+        'headroom_export_candidate_w' => 0.0,
+        'headroom_export_reason' => null,
+        'market_charge_w' => 0.0,
+        'market_hold' => false,
+        'market_action' => null,
+        'source' => 'legacy_projection_no_resimulation'
+    ];
 }
 
 function interpolateStorageTargetSoc($timeline, $targetTsMs) {
@@ -456,7 +628,7 @@ function interpolateStorageTargetSoc($timeline, $targetTsMs) {
     usort($points, function($a, $b) { return $a['ts'] <=> $b['ts']; });
 
     // Die Ladekurve ist tagesbezogen. Nicht versehentlich die heutige Zielkurve
-    // als 72h-SOC fuer morgen/uebermorgen fortschreiben.
+    // als 72h-SOC für morgen/übermorgen fortschreiben.
     $targetDay = date('Y-m-d', (int)floor($targetTsMs / 1000));
     $planDay = date('Y-m-d', (int)floor($points[0]['ts'] / 1000));
     if ($targetDay !== $planDay) {
@@ -592,132 +764,6 @@ function displayCurveEffectiveEpReservePct($conf) {
     return max($cfgPct, clampDisplaySoc($livePct ?? 0.0));
 }
 
-function smoothDisplayRatio($ratio) {
-    $ratio = max(0.0, min(1.0, (float)$ratio));
-    return $ratio * $ratio * (3.0 - 2.0 * $ratio);
-}
-
-function interpolateDisplayStorageCurveSoc($timeline, $targetTsMs, $conf, $meta = []) {
-    if (empty($timeline) || !is_array($timeline)) {
-        return null;
-    }
-
-    $targetTs = (int)floor($targetTsMs / 1000);
-    $dayStart = strtotime(date('Y-m-d', $targetTs) . ' 00:00:00');
-    if ($dayStart === false) {
-        return null;
-    }
-    $dayEnd = $dayStart + 86400;
-
-    $slots = [];
-    $lastPvTs = null;
-    $lastSurplusTs = null;
-    $firstSoc = null;
-
-    foreach ($timeline as $point) {
-        if (!isset($point['ts'])) {
-            continue;
-        }
-        $ts = (int)floor(((int)$point['ts']) / 1000);
-        if ($ts < $dayStart || $ts >= $dayEnd) {
-            continue;
-        }
-
-        $pv = isset($point['pv_w']) ? (float)$point['pv_w'] : 0.0;
-        $home = isset($point['home_w']) ? (float)$point['home_w'] : 0.0;
-        $wp = isset($point['wp_w']) ? (float)$point['wp_w'] : 0.0;
-        $surplus = isset($point['surplus_w']) ? (float)$point['surplus_w'] : ($pv - $home - $wp);
-        $soc = isset($point['soc']) ? (float)$point['soc'] : null;
-        if ($firstSoc === null && $soc !== null) {
-            $firstSoc = $soc;
-        }
-        if ($pv > 100.0) {
-            $lastPvTs = $ts;
-        }
-        if ($pv > 500.0 && $surplus > 200.0) {
-            $lastSurplusTs = $ts;
-        }
-
-        $slots[] = ['ts' => $ts, 'pv' => $pv, 'soc' => $soc];
-    }
-
-    if (!$slots) {
-        return null;
-    }
-
-    $morningSoc = isset($meta['morning_target'])
-        ? (float)$meta['morning_target']
-        : displayCurveConfigFloat($conf, 'storage_morning_soc', 20.0);
-    if ($morningSoc <= 0.0) {
-        $morningSoc = $firstSoc !== null ? $firstSoc : 0.0;
-    }
-
-    $targetSoc = displayCurveConfigFloat($conf, 'storage_target_soc', 90.0);
-
-    $morningHour = displayCurveConfigFloat($conf, 'storage_morning_hour', 9.0);
-    $startTs = $dayStart + (int)round($morningHour * 3600);
-
-    $curveEndCandidate = null;
-    if ($lastSurplusTs !== null) {
-        $curveEndCandidate = $lastSurplusTs - (90 * 60);
-    } elseif ($lastPvTs !== null) {
-        $curveEndCandidate = $lastPvTs - (90 * 60);
-    }
-    $endTs = $curveEndCandidate !== null ? $curveEndCandidate : ($dayStart + (int)round(18.25 * 3600));
-    $endTs = max($startTs + 3600, min($dayEnd - 900, $endTs));
-
-    $anchors = [
-        ['ts' => $startTs, 'soc' => clampDisplaySoc($morningSoc)]
-    ];
-
-    $configuredAnchors = [
-        [
-            'soc' => displayCurveConfigFloat($conf, 'storage_mid_target_soc', 0.0),
-            'hour' => displayCurveConfigFloat($conf, 'storage_mid_hour', 11.0),
-        ],
-        [
-            'soc' => displayCurveConfigFloat($conf, 'storage_noon_target_soc', 0.0),
-            'hour' => displayCurveConfigFloat($conf, 'storage_noon_hour', 14.0),
-        ],
-    ];
-    foreach ($configuredAnchors as $configuredAnchor) {
-        $anchorSoc = (float)$configuredAnchor['soc'];
-        $anchorTs = $dayStart + (int)round(((float)$configuredAnchor['hour']) * 3600);
-        if ($anchorSoc > 0.0 && $anchorTs > $startTs && $anchorTs < $endTs) {
-            $anchors[] = ['ts' => $anchorTs, 'soc' => clampDisplaySoc($anchorSoc)];
-        }
-    }
-
-    $anchors[] = ['ts' => $endTs, 'soc' => clampDisplaySoc($targetSoc)];
-    usort($anchors, function($a, $b) { return $a['ts'] <=> $b['ts']; });
-
-    if ($targetTs <= $anchors[0]['ts']) {
-        $nightStartSoc = clampDisplaySoc(max($targetSoc, $anchors[0]['soc']));
-        if ($targetTs <= $dayStart) {
-            return $nightStartSoc;
-        }
-        $span = max(1, $anchors[0]['ts'] - $dayStart);
-        $ratio = smoothDisplayRatio(($targetTs - $dayStart) / $span);
-        return clampDisplaySoc($nightStartSoc + (($anchors[0]['soc'] - $nightStartSoc) * $ratio));
-    }
-    $last = $anchors[count($anchors) - 1];
-    if ($targetTs >= $last['ts']) {
-        return $last['soc'];
-    }
-
-    for ($i = 1; $i < count($anchors); $i++) {
-        $prev = $anchors[$i - 1];
-        $next = $anchors[$i];
-        if ($targetTs <= $next['ts']) {
-            $span = max(1, $next['ts'] - $prev['ts']);
-            $ratio = smoothDisplayRatio(($targetTs - $prev['ts']) / $span);
-            return clampDisplaySoc($prev['soc'] + (($next['soc'] - $prev['soc']) * $ratio));
-        }
-    }
-
-    return null;
-}
-
 function repairShortMidnightPriceGaps(&$prices, $labels) {
     $n = count($prices);
     if ($n < 3) {
@@ -794,8 +840,29 @@ function repeatPriceForSlot($segments, $targetTsMs) {
     return null;
 }
 
-function forecastMarketPriceCt($row, $fallback = null) {
+function forecastDirectMarketingPriceCt($row, $fallback = null) {
     if (!is_array($row)) {
+        return $fallback;
+    }
+    foreach (['direct_marketing_market_price_ct', 'direct_marketing_market_ct'] as $key) {
+        if (array_key_exists($key, $row) && is_numeric($row[$key])) {
+            return round((float)$row[$key], 5);
+        }
+    }
+    foreach (['direct_marketing_marketprice', 'direct_marketing_market_price_eur_mwh'] as $key) {
+        if (array_key_exists($key, $row) && is_numeric($row[$key])) {
+            return round(((float)$row[$key]) / 10.0, 5);
+        }
+    }
+    return $fallback;
+}
+
+function forecastMarketPriceCt($row, $fallback = null, $requireDirectMarketingPrice = false) {
+    $directMarketingPrice = forecastDirectMarketingPriceCt($row, null);
+    if ($directMarketingPrice !== null) {
+        return $directMarketingPrice;
+    }
+    if ($requireDirectMarketingPrice || !is_array($row)) {
         return $fallback;
     }
     foreach (['market_price', 'marketprice'] as $key) {
@@ -805,6 +872,9 @@ function forecastMarketPriceCt($row, $fallback = null) {
     }
     return $fallback;
 }
+
+$forecastRequiresDirectMarketingPrice = displayCurveConfigBool($conf, 'direct_marketing_enable', false);
+$data['direct_marketing_enabled'] = $forecastRequiresDirectMarketingPrice;
 
 function addRepeatPriceSegment(&$segments, &$uniquePrices, $startMinute, $endMinute, $price) {
     $priceVal = round((float)$price, 2);
@@ -884,41 +954,8 @@ if ($stromtarifTyp === 'octopus_heat') {
 $repeatPricePattern = $repeatPriceAllowed && count($repeatPriceSegments) > 0 && count($repeatPriceUnique) <= 8;
 
 $midnightMs = strtotime("today midnight") * 1000;
-$forecastSocState = null;
-$forecastSocLastTsMs = null;
-$forecastSocLastBatW = 0.0;
-$forecastSocCapacityWh = max(1000.0, $batCapacity * 1000.0);
-$directMarketingSocOffsetWh = 0.0;
-$forecastPredumpEnabled = displayCurveConfigBool($conf, 'predump_enable', true);
-$forecastMaxChargeW = displayCurveConfigFloat($conf, 'maximumladeleistung', 4500.0);
-if ($forecastMaxChargeW > 0.0 && $forecastMaxChargeW < 100.0) {
-    $forecastMaxChargeW *= 1000.0;
-}
-$forecastMaxChargeW = max(500.0, $forecastMaxChargeW);
-$forecastMaxDischargeW = $forecastMaxChargeW;
-$forecastPredumpFloorSoc = displayCurveConfigFloat(
-    $conf,
-    'storage_predump_min_soc',
-    displayCurveConfigFloat(
-        $conf,
-        'eco_dump_min_soc',
-        displayCurveConfigFloat($conf, 'ep_reserve_pct', 8.0)
-    )
-);
-$forecastPredumpFloorSoc = max(0.0, min(100.0, $forecastPredumpFloorSoc));
 $forecastDischargeFloorSoc = displayCurveEffectiveEpReservePct($conf);
 $data['forecast_reserve_floor_soc'] = round($forecastDischargeFloorSoc, 1);
-$forecastMorningSoc = max(0.0, min(100.0, displayCurveConfigFloat($conf, 'storage_morning_soc', 20.0)));
-$forecastMorningHour = displayCurveConfigFloat($conf, 'storage_morning_hour', 9.0);
-$forecastPredumpMaxW = min($forecastMaxDischargeW, 4500.0);
-$forecastFeedLimitW = displayCurveConfigFloat($conf, 'einspeiselimit', 0.0);
-if ($forecastFeedLimitW > 0.0 && $forecastFeedLimitW < 100.0) {
-    $forecastFeedLimitW *= 1000.0;
-}
-$forecastAbregelBufferW = max(0.0, displayCurveConfigFloat($conf, 'abregel_puffer_w', 300.0));
-$forecastExportLimitW = $forecastFeedLimitW > 0.0
-    ? max(0.0, $forecastFeedLimitW - $forecastAbregelBufferW)
-    : 0.0;
 $lastStorageCurveDay = null;
 $lastStorageCurveSource = null;
 $lastStorageCurveValue = null;
@@ -963,7 +1000,7 @@ foreach ($merged as $key => &$row) {
 
     // V4 Eco-Score einlesen
     $finalPrice = isset($row['price']) ? round($row['price'], 2) : 0;
-    $finalMarketPrice = forecastMarketPriceCt($row, null);
+    $finalMarketPrice = forecastMarketPriceCt($row, null, $forecastRequiresDirectMarketingPrice);
     $finalScore = null;
     $hasV4Price = false;
     $maxEcoTs = 0;
@@ -973,7 +1010,7 @@ foreach ($merged as $key => &$row) {
             if ($score['end_timestamp'] > $maxEcoTs) { $maxEcoTs = $score['end_timestamp']; }
             if ($targetTsMs >= $score['start_timestamp'] && $targetTsMs < $score['end_timestamp']) {
                 $finalPrice = round($score['billing_price'], 2);
-                $finalMarketPrice = forecastMarketPriceCt($score, null);
+                $finalMarketPrice = forecastMarketPriceCt($score, null, $forecastRequiresDirectMarketingPrice);
                 $finalScore = round($score['optimization_score']);
                 $hasV4Price = true;
                 break;
@@ -1012,7 +1049,7 @@ foreach ($merged as $key => &$row) {
         $pvForecastFile = '/var/www/html/ramdisk/pv_forecast.json';
         $pvForecastsParsed = file_exists($pvForecastFile) ? @json_decode(file_get_contents($pvForecastFile), true) : false;
     }
-    // History-Buffer: Was hat das KI-Ensemble fuer vergangene Slots vorhergesagt?
+    // History-Buffer: Was hat das KI-Ensemble für vergangene Slots vorhergesagt?
     static $pvHistoryParsed = null;
     if ($pvHistoryParsed === null) {
         $histFile = '/var/www/html/ramdisk/pv_forecast_history.json';
@@ -1031,7 +1068,7 @@ foreach ($merged as $key => &$row) {
             }
         }
     }
-    // Vergangenheits-Overlay: KI-Prognose fuer abgelaufene Slots
+    // Vergangenheits-Overlay: KI-Prognose für abgelaufene Slots
     if ($pvHistoryParsed && $targetTsMs < (time() * 1000)) {
         foreach ($pvHistoryParsed as $pvH) {
             if ($targetTsMs >= $pvH['start_timestamp'] && $targetTsMs < $pvH['end_timestamp']) {
@@ -1074,66 +1111,152 @@ foreach ($merged as $key => &$row) {
     static $storagePlanParsed = null;
     static $storageTargetTimelineParsed = null;
     static $storagePlanMeta = [];
-    static $storagePlanMaxTs  = 0;
+    static $storageCanonicalSlotsParsed = [];
+    static $storageDispatchRuntime = [];
+    static $storageDispatchGeneration = [];
     if ($storagePlanParsed === null) {
         $stFile = '/var/www/html/ramdisk/storage_plan.json';
-        $stData = file_exists($stFile) ? @json_decode(file_get_contents($stFile), true) : false;
+        $runtimeFile = '/var/www/html/ramdisk/storage_dispatch_runtime.json';
+        $storageDispatchGeneration = forecastReadDispatchGeneration($stFile, $runtimeFile, 2);
+        $stData = $storageDispatchGeneration['plan'] ?? [];
         $storagePlanParsed = $stData && isset($stData['timeline']) ? $stData['timeline'] : [];
         $storageTargetTimelineParsed = $stData && isset($stData['target_timeline']) ? $stData['target_timeline'] : [];
         $storagePlanMeta = is_array($stData) ? $stData : [];
-        if ($storagePlanParsed) {
-            $storagePlanMaxTs = $storagePlanParsed[count($storagePlanParsed)-1]['ts'];
-        }
+        $storageCanonicalSlotsParsed = forecastCanonicalDispatchPlanValid($storagePlanMeta)
+            ? ($storagePlanMeta['slots'] ?? [])
+            : [];
+        $runtimeData = $storageDispatchGeneration['runtime'] ?? [];
+        $storageDispatchRuntime = is_array($runtimeData) ? $runtimeData : [];
     }
 
-    $st_bat = null; $st_soc = null; $st_home = null; $st_wp = null; $st_climate = null; $st_grid_dump = null;
-    if (!empty($storagePlanParsed)) {
-        foreach ($storagePlanParsed as $sP) {
-            if ($targetTsMs >= $sP['ts'] && $targetTsMs < $sP['ts'] + 900000) {
-                $st_bat  = $sP['charge_w'];
-                $st_soc  = isset($sP['soc'])    ? $sP['soc']    : null;
-                $st_home = isset($sP['home_w'])  ? $sP['home_w'] : null;
-                $st_wp   = isset($sP['wp_w'])    ? $sP['wp_w']   : null;
-                $st_climate = isset($sP['climate_w']) ? $sP['climate_w'] : null;
-                $st_grid_dump = isset($sP['grid_dump_w']) ? $sP['grid_dump_w'] : null;
-                // Sanfte End-Daempfung: In den letzten 6h der Simulations-Timeline
-                // wird der Konfidenz-Score linear von 1.0 auf 0.7 reduziert
-                // (verhindert harten Abschnitt, signalisiert "unsicherer Bereich")
-                if ($storagePlanMaxTs > 0) {
-                    $remainingMs = $storagePlanMaxTs - $targetTsMs;
-                    $taperWindowMs = 6 * 3600 * 1000;
-                    if ($remainingMs < $taperWindowMs && $remainingMs > 0) {
-                        $taper = 0.7 + 0.3 * ($remainingMs / $taperWindowMs);
-                        if ($st_home !== null) $st_home *= $taper;
-                        if ($st_wp   !== null) $st_wp   *= $taper;
-                        if ($st_climate !== null) $st_climate *= $taper;
-                    }
+    $canonicalSlot = !empty($storageDispatchGeneration['plan_coherent'])
+        ? forecastCanonicalDispatchSlotForTs($storagePlanMeta, $targetTsMs)
+        : null;
+    $storageProjection = forecastCanonicalDispatchProjection($canonicalSlot);
+    $st_bat = null; $st_soc = null; $st_home = null; $st_wp = null; $st_climate = null;
+    $st_predump_candidate_w = 0.0; $st_predump_executable_w = 0.0; $st_predump_status = 'none';
+    $allowLegacyProjection = empty($storageDispatchGeneration['canonical_input_seen']);
+    if (!is_array($storageProjection) && $allowLegacyProjection) {
+        $legacySlot = null;
+        if (!empty($storagePlanParsed)) {
+            foreach ($storagePlanParsed as $sP) {
+                if ($targetTsMs >= $sP['ts'] && $targetTsMs < $sP['ts'] + 900000) {
+                    $legacySlot = $sP;
+                    break;
                 }
-                break;
             }
         }
+        $storageProjection = forecastLegacyStorageProjection($legacySlot);
     }
-
-    $marketContract = forecastMarketContractForTs($storagePlanMeta['market_plan'] ?? [], $targetTsMs);
-    $marketAction = is_array($marketContract) ? (string)($marketContract['action'] ?? '') : '';
-    $marketStorageReleased = forecastMarketContractReleases($marketContract, 'storage');
-    $marketGridCharge = $marketStorageReleased && forecastMarketGridChargeAction($marketAction);
-    $marketHold = $marketStorageReleased && forecastMarketHoldAction($marketAction);
-    $marketPlannedChargeW = $marketGridCharge
-        ? forecastMarketPlannedChargeW($marketContract, $st_bat, $forecastMaxChargeW)
-        : 0.0;
-    $directMarketingPlan = (isset($storagePlanMeta['direct_marketing']) && is_array($storagePlanMeta['direct_marketing']))
-        ? $storagePlanMeta['direct_marketing']
+    if (is_array($storageProjection)) {
+        $st_bat = $storageProjection['battery_w'] ?? null;
+        $st_soc = $storageProjection['soc_pct'] ?? null;
+        $st_home = $storageProjection['home_w'] ?? null;
+        $st_wp = $storageProjection['wp_w'] ?? ($storageProjection['heat_w'] ?? null);
+        $st_climate = $storageProjection['climate_w'] ?? null;
+        $st_predump_candidate_w = max(0.0, (float)($storageProjection['predump_candidate_w'] ?? 0.0));
+        $st_predump_executable_w = max(0.0, (float)($storageProjection['predump_executable_w'] ?? 0.0));
+        $st_predump_status = (string)($storageProjection['predump_status'] ?? 'none');
+    }
+    $data['storage_plan_id'] = $storagePlanMeta['plan_id'] ?? null;
+    $data['storage_plan_generated_at'] = $storagePlanMeta['generated_at'] ?? null;
+    $data['storage_plan_schema_version'] = $storagePlanMeta['schema_version'] ?? null;
+    $data['storage_plan_valid_from'] = $storagePlanMeta['valid_from'] ?? null;
+    $data['storage_plan_valid_until'] = $storagePlanMeta['valid_until'] ?? null;
+    $data['storage_plan_horizon_end'] = $storagePlanMeta['horizon_end'] ?? null;
+    $data['storage_plan_fresh'] = !empty($storageDispatchGeneration['plan_coherent'])
+        && forecastCanonicalDispatchPlanValid($storagePlanMeta)
+        && ((float)($storagePlanMeta['valid_from_ts_ms'] ?? 0) <= (microtime(true) * 1000.0))
+        && ((microtime(true) * 1000.0) < (float)($storagePlanMeta['valid_until_ts_ms'] ?? 0));
+    $data['storage_plan_meta'] = forecastCanonicalDispatchPlanValid($storagePlanMeta)
+        ? [
+            'schema_version' => $storagePlanMeta['schema_version'] ?? null,
+            'plan_id' => $storagePlanMeta['plan_id'] ?? null,
+            'generated_at' => $storagePlanMeta['generated_at'] ?? null,
+            'valid_from' => $storagePlanMeta['valid_from'] ?? null,
+            'valid_until' => $storagePlanMeta['valid_until'] ?? null,
+            'planning_target_soc' => $storagePlanMeta['planning_target_soc'] ?? null,
+            'target_soc' => $storagePlanMeta['target_soc'] ?? null,
+            'pv_topology' => is_array($storagePlanMeta['pv_topology'] ?? null)
+                ? $storagePlanMeta['pv_topology']
+                : null,
+            'headroom_topology' => is_array($storagePlanMeta['headroom_topology'] ?? null)
+                ? $storagePlanMeta['headroom_topology']
+                : null,
+            'consumption_forecast' => is_array($storagePlanMeta['consumption_forecast'] ?? null)
+                ? $storagePlanMeta['consumption_forecast']
+                : null,
+            'direct_marketing' => (
+                $forecastRequiresDirectMarketingPrice
+                && !empty($storageDispatchGeneration['plan_coherent'])
+                && is_array($storagePlanMeta['direct_marketing'] ?? null)
+            ) ? $storagePlanMeta['direct_marketing'] : null,
+        ]
+        : null;
+    $data['direct_marketing'] = is_array($data['storage_plan_meta']['direct_marketing'] ?? null)
+        ? $data['storage_plan_meta']['direct_marketing']
+        : null;
+    $directMarketingSocProjection = is_array($storagePlanMeta['planner']['direct_marketing_projection'] ?? null)
+        ? $storagePlanMeta['planner']['direct_marketing_projection']
         : [];
-    $directMarketingPolicy = forecastDirectMarketingPolicyDecisionForTs($directMarketingPlan, $targetTsMs);
-    $directMarketingPolicyTarget = forecastDirectMarketingPolicyTargetState($directMarketingPolicy);
-    $directMarketingPolicyCanExport = forecastDirectMarketingPolicyCommandsAllowed($directMarketingPolicy)
-        && in_array($directMarketingPolicyTarget, ['FORCE_EXPORT', 'HEADROOM_EXPORT'], true);
-    $directMarketingWindow = forecastDirectMarketingWindowForTs($directMarketingPlan, $targetTsMs);
-    $directMarketingWindowExportW = forecastDirectMarketingExportPowerW($directMarketingWindow);
-    $directMarketingExportW = forecastDirectMarketingPolicyExportPowerW($directMarketingPolicy, $directMarketingWindowExportW);
-    $directMarketingChargeBudgetW = forecastDirectMarketingPolicyChargePowerW($directMarketingPolicy);
-    $directMarketingHasPolicyPlan = forecastDirectMarketingPolicyHasActiveSchedule($directMarketingPlan);
+    $data['direct_marketing_soc_projection'] = [
+        'schema_version' => $directMarketingSocProjection['schema_version'] ?? null,
+        'complete' => !empty($directMarketingSocProjection['complete'])
+            && !empty($storageDispatchGeneration['plan_coherent']),
+        'plan_id' => $storagePlanMeta['plan_id'] ?? null,
+        'action_horizon_end_ts_ms' => $directMarketingSocProjection['action_horizon_end_ts_ms'] ?? null,
+        'projection_horizon_end_ts_ms' => $directMarketingSocProjection['projection_horizon_end_ts_ms'] ?? null,
+        'soc_source' => $directMarketingSocProjection['soc_source'] ?? null,
+        'reason_code' => !empty($directMarketingSocProjection['complete'])
+            ? null
+            : ($directMarketingSocProjection['status'] ?? 'DIRECT_MARKETING_SOC_PROJECTION_INCOMPLETE'),
+    ];
+    $data['storage_dispatch_runtime'] = $storageDispatchRuntime;
+    $data['storage_dispatch_generation'] = forecastDispatchGenerationDiagnostics($storageDispatchGeneration);
+    $data['storage_projection_status'] = array_merge(
+        $data['storage_dispatch_generation'],
+        [
+            'plan_fresh' => !empty($data['storage_plan_fresh']),
+            'soc_curve_current' => !empty($storageDispatchGeneration['plan_coherent'])
+                && !empty($data['storage_plan_fresh']),
+        ]
+    );
+    $data['storage_slot_id'][] = is_array($canonicalSlot) ? ($canonicalSlot['slot_id'] ?? null) : null;
+    $canonicalForecast = is_array($canonicalSlot['forecast_w'] ?? null)
+        ? $canonicalSlot['forecast_w']
+        : [];
+    $canonicalPvTopology = is_array($canonicalForecast['topology'] ?? null)
+        ? $canonicalForecast['topology']
+        : [];
+    $canonicalHeadroom = is_array($canonicalSlot['headroom_wh'] ?? null)
+        ? $canonicalSlot['headroom_wh']
+        : [];
+    $data['pv_e3dc_dc'][] = isset($canonicalForecast['e3dc_dc_pv']['p50'])
+        ? round((float)$canonicalForecast['e3dc_dc_pv']['p50'])
+        : null;
+    $data['pv_external_ac'][] = isset($canonicalForecast['external_ac_pv']['p50'])
+        ? round((float)$canonicalForecast['external_ac_pv']['p50'])
+        : null;
+    $data['pv_topology_status'][] = $canonicalPvTopology['status'] ?? 'topology_unbound';
+    $data['pv_topology_reason'][] = $canonicalPvTopology['reason'] ?? 'CANONICAL_SLOT_TOPOLOGY_MISSING';
+    $data['pv_topology_revision'][] = $canonicalPvTopology['revision'] ?? null;
+    $data['pv_topology_source'][] = $canonicalPvTopology['source'] ?? null;
+    $data['pv_topology_quality'][] = $canonicalPvTopology['quality'] ?? null;
+    $data['pv_resource_projection_status'][] = $canonicalPvTopology['resource_projection_status'] ?? null;
+    $data['pv_resource_projection_reason'][] = $canonicalPvTopology['resource_projection_reason'] ?? null;
+    $data['headroom_dc_pressure_wh'][] = isset($canonicalHeadroom['dc_pressure'])
+        ? round((float)$canonicalHeadroom['dc_pressure'], 3)
+        : 0.0;
+    $data['headroom_pcc_pressure_wh'][] = isset($canonicalHeadroom['pcc_pressure'])
+        ? round((float)$canonicalHeadroom['pcc_pressure'], 3)
+        : 0.0;
+    $data['headroom_combined_pressure_wh'][] = isset($canonicalHeadroom['combined_pressure'])
+        ? round((float)$canonicalHeadroom['combined_pressure'], 3)
+        : 0.0;
+    $data['headroom_deadline_ts'][] = $canonicalHeadroom['deadline_ts_ms'] ?? null;
+
+    $marketGridCharge = is_array($storageProjection)
+        && (float)($storageProjection['market_charge_w'] ?? 0.0) > 0.0;
 
     // V4 KI-Arrays haben Vorrang vor Legacy-Werten (die durch das leere $lines-Array ohnehin leer sind).
     // Prioritaet: pv_ensemble > storage_plan > Leerwert
@@ -1142,7 +1265,7 @@ foreach ($merged as $key => &$row) {
     if ($ml_home !== null) {
         $row['home'] = $ml_home;
     } elseif ($st_home !== null) {
-        $row['home'] = $st_home;  // Fallback: storage_sim Wert fuer Stunden jenseits ml_prediction
+        $row['home'] = $st_home;  // Fallback: storage_sim Wert für Stunden jenseits ml_prediction
     }
     if ($ml_wp !== null) {
         $row['wp'] = $ml_wp;
@@ -1168,195 +1291,167 @@ foreach ($merged as $key => &$row) {
     $row['wb'] = $plannedWallboxPower ? (float)($plannedWallboxPower[1] ?? 0.0) : 0.0;
     $row['wb2'] = $plannedWallboxPower ? (float)($plannedWallboxPower[2] ?? 0.0) : 0.0;
 
-    $target_soc = interpolateStorageTargetSoc($storageTargetTimelineParsed, $targetTsMs);
-    $target_from_frozen_curve = ($target_soc !== null);
-    $target_curve_source = $target_from_frozen_curve ? 'frozen' : 'display';
-    if ($target_soc === null) {
-        $target_soc = interpolateDisplayStorageCurveSoc($storagePlanParsed, $targetTsMs, $conf, $storagePlanMeta);
+    // Ein kanonischer Slot ist die einzige fachliche Forecastquelle. Externe
+    // Dateien dürfen für Legacydarstellung helfen, aber keine Slotwerte einer
+    // plan_id überschreiben oder neu berechnen.
+    if (is_array($canonicalSlot) && is_array($storageProjection)) {
+        $row['pv'] = $storageProjection['pv_w'] ?? null;
+        $row['home'] = $storageProjection['home_w'] ?? null;
+        $row['wp'] = $storageProjection['wp_w'] ?? null;
+        $row['climate'] = $storageProjection['climate_w'] ?? null;
+        $row['wb'] = $storageProjection['wallbox_w'] ?? 0.0;
+        $row['wb2'] = 0.0;
+        $row['bat'] = $storageProjection['battery_w'] ?? null;
     }
 
-    $nextTsMs = $targetTsMs + 900000;
-    $target_soc_next = interpolateStorageTargetSoc($storageTargetTimelineParsed, $nextTsMs);
-    $target_next_from_frozen_curve = ($target_soc_next !== null);
-    if ($target_soc_next === null) {
-        $target_soc_next = interpolateDisplayStorageCurveSoc($storagePlanParsed, $nextTsMs, $conf, $storagePlanMeta);
+    $runtimeMatchesSlot = is_array($canonicalSlot)
+        && is_array($storageDispatchRuntime)
+        && !empty($storageDispatchGeneration['runtime_coherent'])
+        && (($storageDispatchRuntime['schema_version'] ?? '') === 'storage_dispatch_runtime_v1')
+        && (($storageDispatchRuntime['plan_id'] ?? null) === ($storagePlanMeta['plan_id'] ?? null))
+        && (($storageDispatchRuntime['slot_id'] ?? null) === ($canonicalSlot['slot_id'] ?? null));
+    $runtimeCommandsAllowed = $runtimeMatchesSlot && !empty($storageDispatchRuntime['commands_allowed']);
+    $runtimeSelected = $runtimeMatchesSlot && !empty($storageDispatchRuntime['selected']);
+    $runtimeExecutable = $runtimeMatchesSlot && !empty($storageDispatchRuntime['executable']);
+    $runtimeCandidate = $runtimeMatchesSlot && is_array($storageDispatchRuntime['candidate'] ?? null)
+        ? $storageDispatchRuntime['candidate']
+        : [];
+    $runtimeCandidateAction = strtoupper((string)($runtimeCandidate['action'] ?? ''));
+    $runtimeExportBudgetW = $runtimeMatchesSlot
+        ? max(0.0, (float)($storageDispatchRuntime['export_budget_w'] ?? 0.0))
+        : 0.0;
+    $directMarketingState = forecastDirectMarketingSlotState(
+        $storageProjection,
+        $storageDispatchRuntime,
+        $runtimeMatchesSlot,
+        $forecastRequiresDirectMarketingPrice
+    );
+    $runtimeDirectMarketingCharge = $forecastRequiresDirectMarketingPrice
+        && !empty($directMarketingState['active'])
+        && ($directMarketingState['runtime_action'] ?? null) === 'PV_STORE'
+        && ($directMarketingState['authorized_charge_w'] ?? 0.0) > 0.0;
+    if ($runtimeCommandsAllowed && $runtimeSelected && $runtimeExecutable && $runtimeCandidateAction === 'HEADROOM_EXPORT') {
+        $st_predump_executable_w = max(
+            0.0,
+            (float)($storageDispatchRuntime['export_budget_w'] ?? ($runtimeCandidate['power_w'] ?? 0.0))
+        );
+        $st_predump_status = 'selected_executable';
     }
 
-    $fallback_soc = $target_soc !== null ? $target_soc : ($row['soc'] ?? null);
+    $target_soc = is_array($storageProjection)
+        ? ($storageProjection['target_soc_pct'] ?? null)
+        : null;
+    $target_curve_source = is_array($canonicalSlot) ? 'canonical' : 'legacy_projection';
+    $fallback_soc = $st_soc !== null ? (float)$st_soc : ($row['soc'] ?? null);
     $plan_soc = $st_soc !== null ? (float)$st_soc : null;
+    $row['_forecast_predump_active'] = $st_predump_executable_w > 0.0;
+    $row['_forecast_predump_w'] = $row['_forecast_predump_active'] ? $st_predump_executable_w : 0.0;
+    $row['_forecast_predump_candidate_w'] = $st_predump_candidate_w;
+    $row['_forecast_predump_status'] = $st_predump_status;
 
-    if ($forecastSocState === null) {
-        $initialSoc = $plan_soc !== null ? $plan_soc : ($fallback_soc !== null ? (float)$fallback_soc : null);
-        $forecastSocState = $initialSoc !== null ? clampDisplaySoc(max($forecastDischargeFloorSoc, $initialSoc)) : null;
-        $forecastSocLastTsMs = $targetTsMs;
-    } elseif ($forecastSocState !== null && $forecastSocLastTsMs !== null) {
-        $dtHours = max(0.0, min(1.0, ($targetTsMs - $forecastSocLastTsMs) / 3600000.0));
-        $forecastSocState = clampDisplaySoc(max(
-            $forecastDischargeFloorSoc,
-            $forecastSocState + (($forecastSocLastBatW * $dtHours) / $forecastSocCapacityWh) * 100.0
-        ));
-        $forecastSocLastTsMs = $targetTsMs;
+    // Reine Projektion: Batterie, SoC und Grid stammen aus demselben Slot.
+    // PHP wählt keine Lade-/Entladerichtung und integriert keinen zweiten SoC.
+    $st_soc_val = is_array($storageProjection)
+        ? ($storageProjection['soc_pct'] ?? $fallback_soc)
+        : $fallback_soc;
+    $grid = is_array($storageProjection) && array_key_exists('grid_w', $storageProjection)
+        ? $storageProjection['grid_w']
+        : null;
+    if ($grid === null && $row['pv'] !== null && $row['home'] !== null && $row['bat'] !== null) {
+        $grid = (float)$row['home']
+            + (float)($row['wp'] ?? 0.0)
+            + (float)($row['climate'] ?? 0.0)
+            + (float)($row['wb'] ?? 0.0)
+            + (float)($row['wb2'] ?? 0.0)
+            + (float)$row['bat']
+            - (float)$row['pv'];
     }
-
-    // Geregelt simulieren statt den rohen Batterieplan zu zeichnen:
-    // PV deckt Haus/WP/Klima/Wallbox. Der Speicher folgt C++-nah der Ladekurve:
-    // Pre-Dump schafft Platz, Abregelspitzen werden zusaetzlich in den Akku
-    // geschoben, sonst bleibt Ueberschuss als Einspeisung sichtbar.
-    if ($forecastSocState !== null && $row['pv'] !== null && $row['home'] !== null) {
-        $slotHours = 0.25;
-        $pvW = (float)($row['pv'] ?? 0.0);
-        $homeW = (float)($row['home'] ?? 0.0);
-        $wpW = (float)($row['wp'] ?? 0.0);
-        $climateW = (float)($row['climate'] ?? 0.0);
-        $wbW = (float)($row['wb'] ?? 0.0) + (float)($row['wb2'] ?? 0.0);
-        $rawSurplusW = $pvW - $homeW - $wpW - $climateW - $wbW;
-        $controlledBatW = 0.0;
-        $predumpAvailablePct = $forecastPredumpEnabled ? max(0.0, $forecastSocState - $forecastPredumpFloorSoc) : 0.0;
-        $predumpAvailableW = $forecastPredumpEnabled ? (($predumpAvailablePct / 100.0) * $forecastSocCapacityWh) / $slotHours : 0.0;
-        $dischargeAvailablePct = max(0.0, $forecastSocState - $forecastDischargeFloorSoc);
-        $dischargeAvailableW = (($dischargeAvailablePct / 100.0) * $forecastSocCapacityWh) / $slotHours;
-        $row['_forecast_predump_active'] = false;
-        $row['_forecast_predump_w'] = 0.0;
-
-        $slotDayStartSec = strtotime(date('Y-m-d', (int)floor($targetTsMs / 1000)) . ' 00:00:00');
-        $slotMorningTsMs = $slotDayStartSec !== false
-            ? (($slotDayStartSec + (int)round($forecastMorningHour * 3600)) * 1000)
-            : null;
-        $planDumpW = $st_grid_dump !== null ? max(0.0, (float)$st_grid_dump) : 0.0;
-        $predumpPlannedW = $planDumpW;
-
-        // Pre-Dump im Chart ist ausschliesslich aktive Simulatorplanung.
-        // Die Anzeige darf keine eigene Entladung zum Pre-Dump-Minimum erfinden.
-
-        if ($forecastPredumpEnabled && $predumpPlannedW > 0.0 && $predumpAvailableW > 0.0) {
-            $loadCoverW = $rawSurplusW < 0.0 ? abs($rawSurplusW) : 0.0;
-            $predumpW = min(max($predumpPlannedW, $loadCoverW), $forecastPredumpMaxW, $predumpAvailableW);
-            if ($forecastExportLimitW > 0.0) {
-                $predumpW = min($predumpW, max(0.0, $forecastExportLimitW - $rawSurplusW));
-            }
-            if ($predumpW > 0.0) {
-                $controlledBatW = -$predumpW;
-                $row['_forecast_predump_active'] = true;
-                $row['_forecast_predump_w'] = $predumpW;
-            }
-        }
-
-        if (!$row['_forecast_predump_active'] && $marketGridCharge && $marketPlannedChargeW > 0.0) {
-            $controlledBatW = min($forecastMaxChargeW, $marketPlannedChargeW);
-        } elseif (!$row['_forecast_predump_active'] && $marketHold && $rawSurplusW < 0.0) {
-            $controlledBatW = 0.0;
-        } elseif (!$row['_forecast_predump_active'] && $rawSurplusW > 0.0) {
-            $targetForSlot = $target_soc_next !== null ? $target_soc_next : ($target_soc !== null ? $target_soc : $forecastSocState);
-            $needPct = max(0.0, $targetForSlot - $forecastSocState);
-            $neededW = (($needPct / 100.0) * $forecastSocCapacityWh) / $slotHours;
-            if ($target_soc !== null && $forecastSocState < $target_soc - 0.3) {
-                $catchupPct = max(0.0, $target_soc - $forecastSocState);
-                $neededW = max($neededW, (($catchupPct / 100.0) * $forecastSocCapacityWh) / $slotHours);
-            }
-            if ($target_soc === null && $target_soc_next === null && $st_bat !== null) {
-                $neededW = max($neededW, (float)$st_bat);
-            }
-            $controlledBatW = min($rawSurplusW, $forecastMaxChargeW, max(0.0, $neededW));
-
-            // C++-nahe Abregelreserve: wenn die Rest-Einspeisung ueber dem
-            // konfigurierten Limit laege, wird die Batterie zusaetzlich geladen.
-            $exportAfterChargeW = $rawSurplusW - $controlledBatW;
-            if ($forecastExportLimitW > 0.0 && $exportAfterChargeW > $forecastExportLimitW && $forecastSocState < 99.8) {
-                $socRoomW = (((100.0 - $forecastSocState) / 100.0) * $forecastSocCapacityWh) / $slotHours;
-                $abregelExtraW = min(
-                    $exportAfterChargeW - $forecastExportLimitW,
-                    max(0.0, $forecastMaxChargeW - $controlledBatW),
-                    max(0.0, $socRoomW)
-                );
-                $controlledBatW += max(0.0, $abregelExtraW);
-            }
-        } elseif (!$row['_forecast_predump_active'] && $rawSurplusW < 0.0) {
-            $controlledBatW = -min(abs($rawSurplusW), $forecastMaxDischargeW, max(0.0, $dischargeAvailableW));
-        }
-
-        $row['bat'] = $controlledBatW;
-    }
-
 
     $data['pv'][] = $row['pv'] !== null ? round($row['pv']) : null;
     $data['home'][] = $row['home'] !== null ? round($row['home']) : null;
     $data['wp'][] = $row['wp'] !== null ? round($row['wp']) : null;
     $data['climate'][] = $row['climate'] !== null ? round($row['climate']) : null;
+    $data['home_source'][] = is_array($storageProjection) ? ($storageProjection['home_source'] ?? null) : null;
+    $data['home_quality'][] = is_array($storageProjection) ? ($storageProjection['home_quality'] ?? null) : null;
+    $data['wp_source'][] = is_array($storageProjection) ? ($storageProjection['wp_source'] ?? null) : null;
+    $data['wp_quality'][] = is_array($storageProjection) ? ($storageProjection['wp_quality'] ?? null) : null;
+    $data['climate_source'][] = is_array($storageProjection) ? ($storageProjection['climate_source'] ?? null) : null;
+    $data['climate_quality'][] = is_array($storageProjection) ? ($storageProjection['climate_quality'] ?? null) : null;
     $data['wb'][] = $row['wb'] !== null ? round($row['wb']) : null;
     $data['wb2'][] = $row['wb2'] !== null ? round($row['wb2']) : null;
-
-    // Fallback Variablen für die Mathe
-    $c_home = $row['home'] ?? 0;
-    $c_wp = $row['wp'] ?? 0;
-    $c_climate = $row['climate'] ?? 0;
-    $c_wb = ($row['wb'] ?? 0) + ($row['wb2'] ?? 0);
-    $c_bat = $row['bat'] ?? 0;
-    $c_pv = $row['pv'] ?? 0;
-
-    // Bilanzgleichung: Grid = Home + WP + Klima + WB + BatterieLaden - PV
-    $grid = $c_home + $c_wp + $c_climate + $c_wb + $c_bat - $c_pv;
-
-    // Physikalischer Bilanzausgleich zwischen Batterie-, PV-, Haus- und Wärmepumpenwerten.
-    $allowGridCharging = $marketGridCharge || ($finalPrice !== null && $finalPrice <= 15.0);
-
-    if ($c_bat > 0 && $grid > 0 && !$allowGridCharging) {
-        $correction = min($c_bat, $grid);
-        $row['bat'] -= $correction;
-        $c_bat -= $correction;
-        $grid -= $correction;
-    } elseif ($c_bat <= 0 && $grid > 0 && ($forecastSocState ?? ($row['soc'] ?? 0)) > ($forecastDischargeFloorSoc + 0.5)) {
-        $correctionSoc = (float)($forecastSocState ?? ($row['soc'] ?? 0.0));
-        $correctionDischargeW = (((max(0.0, $correctionSoc - $forecastDischargeFloorSoc) / 100.0) * $forecastSocCapacityWh) / 0.25);
-        $maxDischargePossible = -min($forecastMaxDischargeW, $correctionDischargeW);
-        $moeglicheErhoehung = $c_bat - $maxDischargePossible;
-        if ($moeglicheErhoehung > 0) {
-            $correction = min($moeglicheErhoehung, $grid);
-            $row['bat'] -= $correction;
-            $c_bat -= $correction;
-            $grid -= $correction;
-        }
-    } elseif ($c_bat < 0 && $grid < 0 && empty($row['_forecast_predump_active'])) {
-        $correction = min(abs($c_bat), abs($grid));
-        $row['bat'] += $correction;
-        $c_bat += $correction;
-        $grid += $correction;
-    }
-
-    $st_soc_val = $forecastSocState !== null ? $forecastSocState : $fallback_soc;
-    if ($st_soc_val !== null) {
-        $st_soc_val = max($forecastDischargeFloorSoc, (float)$st_soc_val);
-    }
-
-    $data['soc'][] = $st_soc_val !== null ? round($st_soc_val, 1) : null;
-    $directMarketingChargeW = 0.0;
-    $directMarketingChargeDeltaW = 0.0;
-    $directMarketingCommandsAllowed = forecastDirectMarketingPolicyCommandsAllowed($directMarketingPolicy);
-    $directMarketingSuppressBaselineCharge = $directMarketingCommandsAllowed
-        && in_array($directMarketingPolicyTarget, ['FORCE_EXPORT', 'HEADROOM_EXPORT'], true);
-    $baselineChargeW = max(0.0, $c_bat);
-    if ($directMarketingSuppressBaselineCharge) {
-        $directMarketingChargeDeltaW = -$baselineChargeW;
-    } elseif ($directMarketingChargeBudgetW > 0.0) {
-        $policyPvSurplusW = max(0.0, $c_pv - $c_home - $c_wp - $c_climate - $c_wb);
-        $directMarketingChargeW = min($directMarketingChargeBudgetW, $forecastMaxChargeW, $policyPvSurplusW);
-        $directMarketingChargeDeltaW = $directMarketingChargeW - $baselineChargeW;
-    }
-    $directMarketingSoc = null;
-    if ($directMarketingHasPolicyPlan && $st_soc_val !== null) {
-        $directMarketingSoc = min(100.0, max(
-            $forecastDischargeFloorSoc,
-            (float)$st_soc_val + (($directMarketingSocOffsetWh / $forecastSocCapacityWh) * 100.0)
-        ));
-    }
-    $data['direct_marketing_export'][] = round(max(0.0, $directMarketingExportW));
-    $data['direct_marketing_charge'][] = round(max(0.0, $directMarketingChargeW));
+    $data['soc'][] = $st_soc_val !== null ? round((float)$st_soc_val, 1) : null;
+    // Zukunftsplanung stammt ausschließlich aus der plan_id/slot_id-gebundenen
+    // Projektion. Nur der aktuelle Runtime-Slot darf Ausführbarkeit ergänzen.
+    $directMarketingCandidate = $directMarketingState['candidate'];
+    $directMarketingCandidateW = $directMarketingState['candidate_w'];
+    $directMarketingSelected = $directMarketingState['selected'];
+    $directMarketingExecutable = $directMarketingState['executable'];
+    $directMarketingCommandsAllowed = $directMarketingState['commands_allowed'];
+    $directMarketingPlanExecutable = $directMarketingState['plan_executable'];
+    $directMarketingPlanCommandsAllowed = $directMarketingState['plan_commands_allowed'];
+    $directMarketingBlockReason = $directMarketingState['block_reason'];
+    $directMarketingExportW = $directMarketingState['authorized_export_w'];
+    $directMarketingPlannedW = $directMarketingState['planned_w'];
+    $directMarketingAuthorizedExportW = $directMarketingState['authorized_export_w'];
+    $directMarketingHardwareEffect = $directMarketingState['hardware_effect'];
+    $directMarketingChargeW = $runtimeDirectMarketingCharge
+        ? (float)$directMarketingState['authorized_charge_w']
+        : 0.0;
+    // Der Adapter materialisiert die DV-Folgeprojektion einmal plan-id-gebunden.
+    // PHP übernimmt sie nur; es integriert keine Energie und berechnet keinen SoC.
+    $directMarketingSoc = is_array($storageProjection)
+        && !empty($data['direct_marketing_soc_projection']['complete'])
+        && (($data['direct_marketing_soc_projection']['plan_id'] ?? null) === ($data['storage_plan_id'] ?? null))
+        && isset($storageProjection['direct_marketing_soc_pct'])
+        && is_numeric($storageProjection['direct_marketing_soc_pct'])
+        ? (float)$storageProjection['direct_marketing_soc_pct']
+        : null;
+    $directMarketingAction = $directMarketingState['active']
+        ? ($directMarketingState['runtime_action'] ?? null)
+        : ($directMarketingPlannedW > 0.0
+            ? ($directMarketingState['plan_action'] ?? null)
+            : ($runtimeDirectMarketingCharge ? 'PV_STORE' : null));
+    $directMarketingCandidateAction = $directMarketingState['candidate_action'];
+    $data['direct_marketing_export'][] = round($directMarketingExportW);
+    $data['direct_marketing_charge'][] = round($directMarketingChargeW);
     $data['direct_marketing_soc'][] = $directMarketingSoc !== null ? round($directMarketingSoc, 1) : null;
-    $directMarketingSocOffsetWh += (
-        $directMarketingChargeDeltaW - max(0.0, $directMarketingExportW)
-    ) * 0.25;
-    $data['direct_marketing_action'][] = $directMarketingCommandsAllowed
-        ? ($directMarketingPolicy['source_action'] ?? ($directMarketingWindow['action'] ?? strtolower($directMarketingPolicyTarget)))
-        : ($directMarketingPolicyTarget !== '' ? strtolower($directMarketingPolicyTarget) : null);
+    $data['direct_marketing_action'][] = $directMarketingAction;
+    $data['direct_marketing_candidate'][] = $directMarketingCandidate;
+    $data['direct_marketing_candidate_w'][] = round($directMarketingCandidateW);
+    $data['direct_marketing_candidate_action'][] = $directMarketingCandidateAction;
+    $data['direct_marketing_selected'][] = $directMarketingSelected;
+    $data['direct_marketing_executable'][] = $directMarketingExecutable;
+    $data['direct_marketing_commands_allowed'][] = $directMarketingCommandsAllowed;
+    $data['direct_marketing_plan_executable'][] = $directMarketingPlanExecutable;
+    $data['direct_marketing_plan_commands_allowed'][] = $directMarketingPlanCommandsAllowed;
+    $data['direct_marketing_block_reason'][] = $directMarketingBlockReason;
+    $data['direct_marketing_planned_w'][] = round($directMarketingPlannedW);
+    $data['direct_marketing_authorized_export_w'][] = round($directMarketingAuthorizedExportW);
+    $data['direct_marketing_active'][] = $directMarketingState['active'];
+    $data['direct_marketing_hardware_effect'][] = $directMarketingHardwareEffect;
+    $data['direct_marketing_selection_invariant'][] = [
+        'valid' => $directMarketingState['selection_invariant_valid'],
+        'reason_code' => $directMarketingState['selection_invariant_reason'],
+    ];
+    $data['direct_marketing_window_id'][] = $directMarketingState['window_id'];
+    $data['direct_marketing_export_segment_id'][] = $directMarketingState['export_segment_id'];
+    $data['direct_marketing_market_eligible'][] = is_array($storageProjection)
+        && !empty($storageProjection['direct_marketing_market_eligible']);
+    $data['direct_marketing_market_window_id'][] = is_array($storageProjection)
+        ? ($storageProjection['direct_marketing_market_window_id'] ?? null)
+        : null;
+    $data['direct_marketing_market_window_start_ts'][] = is_array($storageProjection)
+        ? ($storageProjection['direct_marketing_market_window_start_ts_ms'] ?? null)
+        : null;
+    $data['direct_marketing_market_window_end_ts'][] = is_array($storageProjection)
+        ? ($storageProjection['direct_marketing_market_window_end_ts_ms'] ?? null)
+        : null;
+    $data['direct_marketing_market_margin_class'][] = is_array($storageProjection)
+        ? ($storageProjection['direct_marketing_market_margin_class'] ?? null)
+        : null;
+    $data['direct_marketing_market_net_sell_ct'][] = is_array($storageProjection)
+        ? ($storageProjection['direct_marketing_market_net_sell_ct'] ?? null)
+        : null;
     $storageCurveValue = $target_soc !== null ? round($target_soc, 1) : null;
     $storageCurveDay = date('Y-m-d', (int)floor($targetTsMs / 1000));
     $storageCurveBreak = $storageCurveValue !== null
@@ -1373,17 +1468,22 @@ foreach ($merged as $key => &$row) {
     } else {
         $lastStorageCurveValue = null;
     }
-    $data['market_charge'][] = $marketGridCharge ? round($marketPlannedChargeW) : 0;
-    $data['market_hold'][] = $marketHold ? 1 : 0;
-    $data['market_action'][] = $marketAction !== '' ? $marketAction : null;
+    $data['market_charge'][] = is_array($storageProjection)
+        ? round(max(0.0, (float)($storageProjection['market_charge_w'] ?? 0.0)))
+        : 0;
+    $data['market_hold'][] = is_array($storageProjection) && !empty($storageProjection['market_hold']) ? 1 : 0;
+    $data['market_action'][] = is_array($storageProjection)
+        ? ($storageProjection['market_action'] ?? null)
+        : null;
 
     $gridIsNull = ($row['pv'] === null && $row['home'] === null && $row['bat'] === null);
     $data['grid'][] = $gridIsNull ? null : round($grid);
     $data['bat'][] = $row['bat'] !== null ? round($row['bat']) : null;
     $data['predump'][] = !empty($row['_forecast_predump_active']) ? 1 : 0;
     $data['predump_w'][] = round((float)($row['_forecast_predump_w'] ?? 0.0));
-    $forecastSocLastBatW = (float)($row['bat'] ?? 0.0);
-
+    $data['predump_candidate_w'][] = round((float)($row['_forecast_predump_candidate_w'] ?? 0.0));
+    $data['predump_executable_w'][] = round((float)($row['_forecast_predump_w'] ?? 0.0));
+    $data['predump_status'][] = $row['_forecast_predump_status'] ?? 'none';
     $dv_power = 0;
     if (isset($row['dv_grid_kwh']) && $row['dv_grid_kwh'] > 0) {
         $prev = $last_dv_kwh !== null ? $last_dv_kwh : 0;
@@ -1553,8 +1653,8 @@ if (isset($pvForecastsParsed) && $pvForecastsParsed) {
     $data['stable_today_pv_kwh'] = null;
 }
 
-// Fuer die Kopfzeile zaehlt "Heute" als Restprognose ab jetzt. Die normale
-// Tagesaggregation oben bleibt fuer Morgen/Uebermorgen erhalten, aber heute
+// Für die Kopfzeile zählt "Heute" als Restprognose ab jetzt. Die normale
+// Tagesaggregation oben bleibt für Morgen/Übermorgen erhalten, aber heute
 // darf spaet am Abend nicht mehr den bereits vergangenen Haus-/WP-Verbrauch
 // anzeigen.
 $todayRest = (isset($storagePlanParsed) && $storagePlanParsed)

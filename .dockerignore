@@ -14,6 +14,8 @@ AGENTS.md
 **/AGENTS.md
 *.md
 **/*.md
+!README.md
+!NOTICE.md
 
 # Local state, test and work artifacts
 .*_local
@@ -28,6 +30,9 @@ doc
 **/doc
 Tools
 **/Tools
+!Tools/
+Tools/*
+!Tools/decision_history_analysis.py
 test_*.py
 **/test_*.py
 *_test.py
@@ -40,11 +45,24 @@ simulator.py
 **/simulator.py
 html/*_analysis.php
 **/html/*_analysis.php
+!html/rule_calm_analysis.php
 html/*.py
 **/html/*.py
 Installer/**/*_remote.py
 Installer/**/*_probe.py
 Installer/storage_manager_v*_stable.py
+
+# Lokale Sonderwerkzeuge und hostseitiger Tunnel sind kein Image-Runtimebestand.
+Installer/Forecast/pv_evaluator.py
+Installer/change_user.py
+Installer/force_discharge.py
+Installer/luxtronik/Register.txt
+Installer/permissions_helper.py
+Installer/recover_history_rscp.py
+Installer/repair_db_inversion.py
+html/wallbox_log.php
+Tunnel
+**/Tunnel
 
 # Language caches and dependency trees
 __pycache__

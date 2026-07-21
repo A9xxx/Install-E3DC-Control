@@ -24,7 +24,7 @@ def install_mqtt():
     print("→ Installiere MQTT-Pakete…")
     print("  Dies kann einige Minuten dauern…\n")
     openwb_logger.info("Starte Installation der MQTT-Pakete.")
-    
+
     for package in MQTT_PACKAGES:
         try:
             result = run_command(f"apt-get install -y {package}", timeout=300)
@@ -39,7 +39,7 @@ def install_mqtt():
             print(f"  ✗ Fehler: {e}")
             log_error("openwb_mqtt", f"Exception bei der Installation von {package}: {e}", e)
             return False
-    
+
     return True
 
 
@@ -48,7 +48,7 @@ def validate_ip(ip):
     pattern = r'^(\d{1,3}\.){3}\d{1,3}$'
     if not re.match(pattern, ip):
         return False
-    
+
     parts = ip.split('.')
     for part in parts:
         try:
@@ -56,7 +56,7 @@ def validate_ip(ip):
                 return False
         except ValueError:
             return False
-    
+
     return True
 
 
@@ -66,17 +66,17 @@ def get_mqtt_config():
     print("  openWB MQTT Integration Setup")
     print("="*50 + "\n")
     openwb_logger.info("Starte interaktive MQTT-Konfiguration.")
-    
+
     # IP-Adresse des MQTT Brokers
     while True:
-        ip = input("IP-Adresse der openWB Wallbox (z.B. 192.168.178.100): ").strip()
+        ip = input("IP-Adresse der openWB Wallbox (Dokumentationsbeispiel 192.0.2.100): ").strip()
         if validate_ip(ip):
             break
         print("✗ Ungültige IP-Adresse! Bitte versuche es erneut.")
         log_warning("openwb_mqtt", f"Ungültige IP-Adresse eingegeben: {ip}")
-    
+
     print()
-    
+
     # MQTT Topic
     while True:
         topic = input("MQTT Topic (Standard: openWB/internal_chargepoint/0/get/power): ").strip()
@@ -86,21 +86,21 @@ def get_mqtt_config():
             break
         print("✗ Topic darf nicht leer sein!")
         log_warning("openwb_mqtt", "Leeres MQTT-Topic eingegeben.")
-    
+
     print()
-    
+
     # Port (optional)
     port = input("MQTT Port (Standard: 1883) [Enter für Standard]: ").strip()
     if not port:
         port = "1883"
-    
+
     try:
         int(port)
     except ValueError:
         print("✗ Port muss eine Zahl sein! Nutze Standard: 1883")
         log_warning("openwb_mqtt", f"Ungültiger Port eingegeben: {port}. Fallback auf 1883.")
         port = "1883"
-    
+
     config_data = {
         'ip': ip,
         'topic': topic,
@@ -153,14 +153,14 @@ def test_mqtt_connection(ip, port):
     """Testet die Verbindung zum MQTT Broker."""
     print("\n→ Teste MQTT-Verbindung…")
     openwb_logger.info(f"Teste MQTT-Verbindung zu {ip}:{port}.")
-    
+
     try:
         import socket
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(3)
         result = sock.connect_ex((ip, int(port)))
         sock.close()
-        
+
         if result == 0:
             print(f"✓ Verbindung zum MQTT Broker ({ip}:{port}) erfolgreich!")
             openwb_logger.info(f"MQTT-Verbindung zu {ip}:{port} erfolgreich.")
@@ -181,33 +181,33 @@ def setup_openwb_mqtt():
     print("\n" + "="*50)
     print("  openWB MQTT Integration")
     print("="*50 + "\n")
-    
+
     print("Dieses Modul installiert MQTT und konfiguriert")
     print("die Integration mit einer openWB Wallbox.\n")
     openwb_logger.info("Starte openWB MQTT Integration Setup.")
-    
+
     # MQTT installieren
     if not install_mqtt():
         print("\n✗ MQTT-Installation fehlgeschlagen!")
         log_error("openwb_mqtt", "MQTT-Installation fehlgeschlagen.")
         return
-    
+
     print("\n✓ MQTT installiert\n")
     log_task_completed("MQTT-Pakete installieren")
-    
+
     # Konfiguration abfragen
     config = get_mqtt_config()
-    
+
     # Verbindung testen
     test_success = test_mqtt_connection(config['ip'], config['port'])
-    
+
     if not test_success:
         choice = input("\nFortfahren trotzdem? (j/n): ").strip().lower()
         if choice != "j":
             print("→ Setup abgebrochen.")
             openwb_logger.warning("Setup nach fehlgeschlagenem Verbindungstest abgebrochen.")
             return
-    
+
     # Konfiguration speichern
     if update_config(config):
         print("\n" + "="*50)

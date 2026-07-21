@@ -11,17 +11,115 @@ import math
 import re
 import zipfile
 import xml.etree.ElementTree as ET
+import tempfile
 from datetime import datetime, timedelta
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 INSTALLER_DIR = os.path.dirname(SCRIPT_DIR)
+REPO_ROOT = os.path.dirname(INSTALLER_DIR)
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 if INSTALLER_DIR not in sys.path:
     sys.path.insert(0, INSTALLER_DIR)
 
-# Dynamischer Pfad analog zum Rest des Systems
-CONFIG_FILE = "/home/pi/E3DC-Control/e3dc.config.txt"
-if os.path.exists("/var/www/html/data/e3dc.config.txt"):
-    CONFIG_FILE = "/var/www/html/data/e3dc.config.txt"
+from pv_forecast_topology import (
+    RESOURCE_PROJECTION_ABS_TOLERANCE_W,
+    RESOURCE_PROJECTION_REL_TOLERANCE,
+    build_pv_forecast_topology,
+    project_slot_topology,
+    topology_resource_keys,
+)
+
+
+def _resource_projection_state_for_models(
+    *,
+    timestamp,
+    model_values,
+    model_weights,
+    resource_models,
+    resource_keys,
+):
+    """Prüft neutrale Ressourcenbeiträge vor dem Ensemble-Mischen.
+
+    Alte Modellcaches ohne ``resource_data`` bleiben damit ausdrücklich ohne
+    DC-/AC-Splitwirkung. Nur Modelle mit einem wirksamen Gewicht und positiver
+    Gesamtprognose benötigen einen vollständigen, summenkohärenten Beitrag.
+    """
+
+    required = tuple(str(key) for key in resource_keys if str(key))
+    if not required:
+        return {"status": "complete", "reason": "OK"}
+
+    incomplete = False
+    mismatch = False
+    for model_id in ("m1", "m2", "m3"):
+        try:
+            weight = float(model_weights.get(model_id) or 0.0)
+            model_total = max(0.0, float(model_values.get(model_id) or 0.0))
+        except (TypeError, ValueError):
+            incomplete = True
+            continue
+        if weight <= 0.0 or model_total <= 0.005:
+            continue
+        model_resources = resource_models.get(model_id) or {}
+        if any(
+            key not in model_resources
+            or timestamp not in (model_resources.get(key) or {})
+            for key in required
+        ):
+            incomplete = True
+            continue
+        try:
+            resource_total = sum(
+                max(0.0, float(model_resources[key][timestamp] or 0.0))
+                for key in required
+            )
+        except (TypeError, ValueError):
+            incomplete = True
+            continue
+        tolerance_kw = max(
+            RESOURCE_PROJECTION_ABS_TOLERANCE_W / 1000.0,
+            model_total * RESOURCE_PROJECTION_REL_TOLERANCE,
+        )
+        if abs(model_total - resource_total) > tolerance_kw:
+            mismatch = True
+
+    if mismatch:
+        return {"status": "unbound", "reason": "RESOURCE_PROJECTION_TOTAL_MISMATCH"}
+    if incomplete:
+        return {"status": "unbound", "reason": "RESOURCE_PROJECTION_INCOMPLETE"}
+    return {"status": "complete", "reason": "OK"}
+
+
+def _merge_resource_projection_states(*states):
+    reasons = {
+        str((state or {}).get("reason") or "RESOURCE_PROJECTION_INCOMPLETE")
+        for state in states
+        if str((state or {}).get("status") or "") != "complete"
+    }
+    if "RESOURCE_PROJECTION_TOTAL_MISMATCH" in reasons:
+        return {"status": "unbound", "reason": "RESOURCE_PROJECTION_TOTAL_MISMATCH"}
+    if reasons:
+        return {"status": "unbound", "reason": "RESOURCE_PROJECTION_INCOMPLETE"}
+    return {"status": "complete", "reason": "OK"}
+
+def _legacy_config_files():
+    """Nutzt nur die modullokale und kanonische Webkonfiguration; Home-Pfade werden nie geraten."""
+    result = []
+    for candidate in (
+        os.path.join(REPO_ROOT, "e3dc.config.txt"),
+        "/var/www/html/data/e3dc.config.txt",
+        "/var/www/html/e3dc.config.txt",
+    ):
+        lexical = os.path.abspath(candidate)
+        if lexical != os.path.realpath(lexical) or not os.path.isfile(lexical):
+            continue
+        result.append(lexical)
+    return tuple(result)
+
+
+_INITIAL_LEGACY_CONFIG_FILES = _legacy_config_files()
+CONFIG_FILE = _INITIAL_LEGACY_CONFIG_FILES[0] if _INITIAL_LEGACY_CONFIG_FILES else ""
 
 RAMDISK_DIR = "/var/www/html/ramdisk"
 if not os.path.exists(RAMDISK_DIR):
@@ -29,7 +127,7 @@ if not os.path.exists(RAMDISK_DIR):
 FORECAST_OUTPUT = os.path.join(RAMDISK_DIR, "pv_forecast.json")
 WEATHER_ALERTS_OUTPUT = os.path.join(RAMDISK_DIR, "weather_alerts.json")
 ML_PREDICTION_OUTPUT = os.path.join(RAMDISK_DIR, "ml_prediction.json")
-ML_MODEL_FILE = "/var/www/html/data/ml_model.pkl"
+LEGACY_ML_MODEL_FILE = "/var/www/html/data/ml_model.pkl"  # Nur ein Signal; wird weder gelesen noch geladen.
 MODEL_CACHE_FILE = "/var/www/html/logs/forecast_model_cache.json"
 FORECAST_EVAL_FILE = "/var/www/html/logs/pv_forecast_eval.json"
 DAILY_STATS_DB_PATH = "/var/www/html/data/e3dc_stats.db"
@@ -51,6 +149,8 @@ WEATHER_ALERT_TTL_S = 5 * 60
 ML_PREDICTION_MAX_AGE_S = 90 * 60
 SOLCAST_DEFAULT_CALLS_PER_DAY = 10
 SOLCAST_MIN_TTL_S = 60 * 60
+SOLCAST_CACHE_SCHEMA_VERSION = 3
+SOLCAST_SIGNATURE_SCHEMA = "solcast_sites_v3"
 PV_PHYSICAL_PEAK_MARGIN = 1.03
 PV_CLOUD_EDGE_PEAK_MARGIN = 1.15
 PV_DAILY_SANITY_HISTORY_DAYS = 730
@@ -519,25 +619,29 @@ class EnsemblePVForecaster:
         self.config = self._load_config()
         self.v4_config = self._load_v4_config()
         self._model_cache = self._load_model_cache()
-        
+        self._model_resource_data = {}
+        self.pv_topology_contract = build_pv_forecast_topology(self.v4_config)
+
         # Favorisiere v4_config für Standortdaten
-        self.lat = float(self.v4_config.get('hoehe', self.config.get('hoehe', 51.16)))
-        self.lon = float(self.v4_config.get('laenge', self.config.get('laenge', 10.45)))
-        
-        # Parsen aller Dachflächen (z.B. "35/0/10.0" = Neigung/Azimuth/kWp)
+        self.lat = float(self.v4_config.get('hoehe', self.config.get('hoehe', 48.6)))
+        self.lon = float(self.v4_config.get('laenge', self.config.get('laenge', 13.4)))
+
+        # Parsen aller Dachflächen (z.B. "37/-45/15.4" = Neigung/Azimuth/kWp)
         self.roofs = []
-        for key in ['forecast1', 'forecast2', 'forecast3']:
+        for resource_index, key in enumerate(['forecast1', 'forecast2', 'forecast3'], start=1):
             # V4-Config hat Vorrang, Fallback auf alte e3dc.config.txt
             val = self.v4_config.get(key) or self.config.get(key)
             roofs = _parse_roof_config(val)
             if roofs:
+                for roof in roofs:
+                    roof["resource_key"] = f"FC{resource_index}"
                 self.roofs.extend(roofs)
             elif val:
                 logger.error(f"Ungueltiges Format fuer Dach: {val}")
         # Fallback falls nichts konfiguriert
         if not self.roofs:
             self.roofs.append({"tilt": 35, "azimuth": 0, "kwp": 10.0})
-        
+
         # Für Open-Meteo (welches keine Ausrichtung kennt) berechnen wir die Gesamt-kWp
         self.configured_total_kwp = sum(r['kwp'] for r in self.roofs)
         self.total_kwp = self.configured_total_kwp
@@ -593,8 +697,8 @@ class EnsemblePVForecaster:
         self.weight_m2 = float(self.config.get('pv_score_m2', 0.2))
         self.weight_m3 = float(self.config.get('pv_score_m3', 0.4)) # Solcast
 
-        # Solcast Rooftop Sites (bevorzugt aus v4.json).
-        # FC1 nutzt Konto 1. FC2/FC3 nutzen Konto 2 wenn gesetzt, sonst Konto 1.
+        # Solcast Rooftop Sites (bevorzugt aus v4.json). Der Accountslot ist
+        # pro Site explizit; bei fehlendem Mapping bleibt der Legacy-Vertrag erhalten.
         self.solcast_api_key = str(self.v4_config.get('solcast_api_key', self.config.get('solcast_api_key', '')) or '').strip()
         self.solcast_api_key_2 = str(self.v4_config.get('solcast_api_key_2', self.config.get('solcast_api_key_2', '')) or '').strip()
         self.solcast_calls_per_day = self._solcast_calls_per_day("solcast_calls_per_day", SOLCAST_DEFAULT_CALLS_PER_DAY)
@@ -602,19 +706,77 @@ class EnsemblePVForecaster:
         self.solcast_resource_id = str(self.v4_config.get('solcast_resource_id', self.config.get('solcast_resource_id', '')) or '').strip()
         self.solcast_resource_id_2 = str(self.v4_config.get('solcast_resource_id_2', self.config.get('solcast_resource_id_2', '')) or '').strip()
         self.solcast_resource_id_3 = str(self.v4_config.get('solcast_resource_id_3', self.config.get('solcast_resource_id_3', '')) or '').strip()
+        self.solcast_resource_id_4 = str(self.v4_config.get('solcast_resource_id_4', self.config.get('solcast_resource_id_4', '')) or '').strip()
+        self.solcast_api_keys = {1: self.solcast_api_key, 2: self.solcast_api_key_2}
+        self.solcast_slot_limits = {1: self.solcast_calls_per_day, 2: self.solcast_calls_per_day_2}
+        self.solcast_configured_sites = []
         self.solcast_sites = []
-        if self.solcast_resource_id and self.solcast_api_key:
-            self.solcast_sites.append(("FC1", self.solcast_resource_id, self.solcast_api_key))
-        if self.solcast_resource_id_2:
-            api_key = self.solcast_api_key_2 or self.solcast_api_key
-            if api_key:
-                self.solcast_sites.append(("FC2", self.solcast_resource_id_2, api_key))
-        if self.solcast_resource_id_3:
-            api_key = self.solcast_api_key_2 or self.solcast_api_key
-            if api_key:
-                self.solcast_sites.append(("FC3", self.solcast_resource_id_3, api_key))
-        sig_src = "|".join(f"{label}:{resource}" for label, resource, _api in self.solcast_sites)
+        self.solcast_mapping_blocked = False
+        self.solcast_mapping_reason = ""
+        legacy_secondary_slot = 2 if self.solcast_api_key_2 else 1
+        site_specs = (
+            ("FC1", self.solcast_resource_id, "solcast_api_slot_fc1", 1),
+            ("FC2", self.solcast_resource_id_2, "solcast_api_slot_fc2", legacy_secondary_slot),
+            ("FC3", self.solcast_resource_id_3, "solcast_api_slot_fc3", legacy_secondary_slot),
+            ("FC4", self.solcast_resource_id_4, "solcast_api_slot_fc4", legacy_secondary_slot),
+        )
+        for label, resource_id, mapping_key, legacy_slot in site_specs:
+            if not resource_id:
+                continue
+            raw_slot = self.v4_config.get(mapping_key, self.config.get(mapping_key))
+            slot_text = str(raw_slot).strip() if raw_slot is not None else ""
+            explicit = bool(slot_text)
+            if explicit and slot_text not in {"1", "2"}:
+                account_slot = None
+                reason = "invalid_account_slot"
+            else:
+                account_slot = int(slot_text) if explicit else int(legacy_slot)
+                reason = ""
+            site = {
+                "label": label,
+                "resource_id": resource_id,
+                "account_slot": account_slot,
+                "credential_ref": f"solcast_api_key{'_2' if account_slot == 2 else ''}" if account_slot else "",
+                "mapping_source": "explicit" if explicit else "legacy_default",
+            }
+            self.solcast_configured_sites.append(site)
+            if reason:
+                self.solcast_mapping_blocked = True
+                self.solcast_mapping_reason = reason
+                continue
+            if not self.solcast_api_keys.get(account_slot, ""):
+                self.solcast_mapping_blocked = True
+                self.solcast_mapping_reason = "missing_selected_key"
+                continue
+            self.solcast_sites.append(site)
+        sig_src = json.dumps(
+            {
+                "schema": SOLCAST_SIGNATURE_SCHEMA,
+                "sites": [
+                    {
+                        "label": site["label"],
+                        "resource": site["resource_id"],
+                        "account_slot": site["account_slot"],
+                    }
+                    for site in self.solcast_configured_sites
+                ],
+                "topology_revision": self._pv_topology_contract_or_unbound().get("revision"),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
         self.solcast_signature = hashlib.sha256(sig_src.encode("utf-8")).hexdigest() if sig_src else ""
+        if not self.solcast_configured_sites:
+            state = "disabled_no_sites"
+        elif self.solcast_mapping_blocked or len(self.solcast_sites) != len(self.solcast_configured_sites):
+            state = "blocked_missing_selected_key" if self.solcast_mapping_reason == "missing_selected_key" else "incomplete_refresh"
+        else:
+            state = "incomplete_refresh"
+        self.solcast_status = self._solcast_status(
+            state,
+            successful=0,
+            failed_labels=[site["label"] for site in self.solcast_configured_sites] if self.solcast_mapping_blocked else [],
+        )
         self.solcast_ttl_s = self._solcast_dynamic_ttl_s()
 
     def _solar_window_hours(self, day_date):
@@ -647,33 +809,79 @@ class EnsemblePVForecaster:
             calls = int(default)
         return max(1, min(500, calls))
 
+    def _solcast_status(self, state, successful=0, failed_labels=None):
+        configured = list(getattr(self, "solcast_configured_sites", []) or [])
+        return {
+            "schema": "solcast_status_v2",
+            "state": str(state),
+            "configured_sites": len(configured),
+            "successful_sites": int(successful),
+            "failed_labels": sorted({str(label) for label in (failed_labels or []) if str(label) in {"FC1", "FC2", "FC3", "FC4"}}),
+            "site_accounts": {
+                str(site.get("label")): int(site.get("account_slot"))
+                for site in configured
+                if site.get("label") in {"FC1", "FC2", "FC3", "FC4"} and site.get("account_slot") in {1, 2}
+            },
+            "signature": str(getattr(self, "solcast_signature", "")),
+        }
+
+    @staticmethod
+    def _solcast_credential_id(api_key):
+        return hashlib.sha256(str(api_key or "").encode("utf-8")).hexdigest()
+
     def _solcast_limit_for_api_key(self, api_key):
-        if self.solcast_api_key_2 and api_key == self.solcast_api_key_2:
-            return self.solcast_calls_per_day_2
-        return self.solcast_calls_per_day
+        limits = []
+        if api_key and api_key == self.solcast_api_key:
+            limits.append(self.solcast_calls_per_day)
+        if api_key and api_key == self.solcast_api_key_2:
+            limits.append(self.solcast_calls_per_day_2)
+        return min(limits) if limits else self.solcast_calls_per_day
+
+    def _solcast_credential_groups(self):
+        groups = {}
+        api_keys = getattr(self, "solcast_api_keys", {1: self.solcast_api_key, 2: self.solcast_api_key_2})
+        slot_limits = getattr(
+            self,
+            "solcast_slot_limits",
+            {1: self.solcast_calls_per_day, 2: self.solcast_calls_per_day_2},
+        )
+        for site in self.solcast_sites:
+            account_slot = int(site["account_slot"])
+            api_key = api_keys.get(account_slot, "")
+            if not api_key:
+                continue
+            credential_id = self._solcast_credential_id(api_key)
+            group = groups.setdefault(
+                credential_id,
+                {"api_key": api_key, "site_count": 0, "limits": []},
+            )
+            group["site_count"] += 1
+            group["limits"].append(int(slot_limits.get(account_slot, SOLCAST_DEFAULT_CALLS_PER_DAY)))
+        for group in groups.values():
+            group["calls_per_day"] = min(group.pop("limits") or [SOLCAST_DEFAULT_CALLS_PER_DAY])
+        return groups
 
     def _solcast_dynamic_ttl_s(self):
-        """Keeps each Solcast API key below the configured daily request quota."""
+        """Hält jede reale Credentialidentität unter ihrem Tagesbudget."""
         if not self.solcast_sites:
             return MODEL_TTL["m3"]
-        sites_per_key = {}
-        for _label, _resource_id, api_key in self.solcast_sites:
-            sites_per_key[api_key] = sites_per_key.get(api_key, 0) + 1
+        credential_groups = self._solcast_credential_groups()
         ttl_requirements = []
-        for api_key, site_count in sites_per_key.items():
-            calls_per_day = self._solcast_limit_for_api_key(api_key)
+        for group in credential_groups.values():
+            site_count = int(group["site_count"])
+            calls_per_day = int(group["calls_per_day"])
             ttl_requirements.append(math.ceil((24 * 60 * 60 * site_count) / calls_per_day))
         min_ttl_for_quota = max(ttl_requirements or [MODEL_TTL["m3"]])
-        # Auf 15-Minuten-Grenzen aufrunden, damit Restarts die Tagesquote nicht langsam ueberziehen.
+        # Auf 15-Minuten-Grenzen aufrunden, damit Restarts die Tagesquote nicht langsam überziehen.
         quota_safe_ttl = int(math.ceil(min_ttl_for_quota / 900.0) * 900)
         ttl = max(SOLCAST_MIN_TTL_S, quota_safe_ttl)
-        if ttl != MODEL_TTL["m3"] or len(sites_per_key) > 1:
+        if ttl != MODEL_TTL["m3"] or len(credential_groups) > 1:
             logger.info(
-                "Model 3 (Solcast): %d Site(s) auf %d API-Key(s), Tagesbudget %s -> TTL %.2fh."
+                "Model 3 (Solcast): %d Site(s) auf %d Credential(s), Tagesbudget %s -> TTL %.2fh."
                 % (
                     len(self.solcast_sites),
-                    len(sites_per_key),
-                    ",".join(str(self._solcast_limit_for_api_key(k)) for k in sites_per_key.keys()),
+                    len(credential_groups),
+                    ",".join(str(group["calls_per_day"]) for group in credential_groups.values()),
                     ttl / 3600.0,
                 )
             )
@@ -690,40 +898,141 @@ class EnsemblePVForecaster:
         return {}
 
     def _save_model_cache(self):
-        """Persistiert den Model-Cache auf Disk (ueberlebt Neustarts)."""
+        """Persistiert den Model-Cache atomar auf Disk (überlebt Neustarts)."""
+        directory = os.path.dirname(MODEL_CACHE_FILE) or "."
+        tmp_path = ""
         try:
-            with open(MODEL_CACHE_FILE, 'w') as f:
+            os.makedirs(directory, exist_ok=True)
+            fd, tmp_path = tempfile.mkstemp(prefix="forecast_model_cache.", suffix=".tmp", dir=directory)
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
                 json.dump(self._model_cache, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, MODEL_CACHE_FILE)
+            tmp_path = ""
+            try:
+                dir_fd = os.open(directory, os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except OSError:
+                pass
         except Exception as e:
             logger.warning(f"Konnte Model-Cache nicht speichern: {e}")
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+    def _trusted_solcast_cache_entry(self):
+        cached = self._model_cache.get("m3", {})
+        if not isinstance(cached, dict):
+            return None
+        if int(cached.get("schema_version") or 0) != SOLCAST_CACHE_SCHEMA_VERSION:
+            return None
+        if cached.get("completeness") != "complete":
+            return None
+        if cached.get("sig") != getattr(self, "solcast_signature", ""):
+            return None
+        data = cached.get("data")
+        if not isinstance(data, dict) or not data:
+            return None
+        return cached
 
     def _model_is_stale(self, model_id: str) -> bool:
         """Gibt True zurueck wenn das Modell neu abgerufen werden muss."""
         import time as _t
         cached = self._model_cache.get(model_id, {})
-        if model_id == "m3" and cached.get("sig", "") != getattr(self, "solcast_signature", ""):
-            logger.info("Modell m3: Solcast-Konfiguration geaendert - Cache wird erneuert.")
-            return True
+        if model_id == "m3":
+            if not getattr(self, "solcast_configured_sites", []):
+                self.solcast_status = self._solcast_status("disabled_no_sites")
+                return False
+            if getattr(self, "solcast_mapping_blocked", False):
+                return True
+            cached = self._trusted_solcast_cache_entry()
+            if cached is None:
+                logger.info("Modell m3: Kein vollständig gebundener Solcast-Cache; Abruf erforderlich.")
+                return True
         last_ts = cached.get('ts', 0)
         ttl = getattr(self, "solcast_ttl_s", MODEL_TTL.get(model_id, 3600)) if model_id == "m3" else MODEL_TTL.get(model_id, 3600)
         age = _t.time() - last_ts
         if age >= ttl:
             logger.info(f"Modell {model_id}: Abruf noetig (Alter {age/60:.0f}min, TTL {ttl/60:.0f}min).")
             return True
-        logger.info(f"Modell {model_id}: Cache gueltig ({age/60:.0f}min alt, TTL {ttl/60:.0f}min) - ueberspringe API Call.")
+        logger.info(f"Modell {model_id}: Cache gültig ({age/60:.0f}min alt, TTL {ttl/60:.0f}min) - überspringe API Call.")
+        if model_id == "m3":
+            self.solcast_status = self._solcast_status(
+                "complete_cached",
+                successful=int(cached.get("successful_sites") or len(self.solcast_configured_sites)),
+            )
         return False
 
     def _get_model_data(self, model_id: str):
         """Gibt gecachte Modell-Daten zurueck (dict ts->kwh), oder leeres dict."""
+        if model_id == "m3":
+            cached = self._trusted_solcast_cache_entry()
+            return dict(cached.get("data", {})) if cached else {}
         return self._model_cache.get(model_id, {}).get('data', {})
+
+    def _pv_topology_contract_or_unbound(self):
+        """Liefert den Vertrag ohne ihn an Fallback-Teilobjekten zu erfinden."""
+
+        contract = getattr(self, "pv_topology_contract", None)
+        if isinstance(contract, dict):
+            return contract
+        return {
+            "schema_version": "pv_forecast_topology_v1",
+            "status": "topology_unbound",
+            "reason": "TOPOLOGY_CONTRACT_MISSING",
+            "revision": None,
+            "resources": [],
+            "split_usable": False,
+        }
+
+    def _record_model_resource_data(self, model_id, resource_data):
+        if not isinstance(getattr(self, "_model_resource_data", None), dict):
+            self._model_resource_data = {}
+        self._model_resource_data[str(model_id)] = dict(resource_data or {})
+
+    def _get_model_resource_data(self, model_id: str):
+        """Liefert neutrale FC-Beiträge; alte Caches bleiben ohne Splitwirkung."""
+        cached = self._trusted_solcast_cache_entry() if model_id == "m3" else self._model_cache.get(model_id, {})
+        current_revision = self._pv_topology_contract_or_unbound().get("revision")
+        cached_revision = cached.get("topology_revision") if isinstance(cached, dict) else None
+        if not current_revision or cached_revision != current_revision:
+            return {}
+        data = cached.get("resource_data", {}) if isinstance(cached, dict) else {}
+        if not isinstance(data, dict):
+            return {}
+        return {
+            str(label): dict(values)
+            for label, values in data.items()
+            if str(label) in {"FC1", "FC2", "FC3", "FC4"} and isinstance(values, dict)
+        }
 
     def _set_model_data(self, model_id: str, data: dict):
         """Speichert Modell-Daten in den Cache."""
         import time as _t
         if data:  # Nur bei echten Daten cachen, nicht bei leeren Ergebnissen
             entry = {'ts': _t.time(), 'data': data}
+            resource_data = getattr(self, "_model_resource_data", {}).get(model_id, {})
+            if isinstance(resource_data, dict) and resource_data:
+                entry["resource_data"] = resource_data
+                entry["resource_schema"] = "neutral_fc_contributions_v1"
+                entry["topology_revision"] = self._pv_topology_contract_or_unbound().get("revision")
             if model_id == "m3":
+                if self.solcast_status.get("state") != "complete_fresh":
+                    return
+                if self.solcast_status.get("successful_sites") != len(self.solcast_configured_sites):
+                    return
+                entry["schema_version"] = SOLCAST_CACHE_SCHEMA_VERSION
+                entry["completeness"] = "complete"
                 entry["sig"] = getattr(self, "solcast_signature", "")
+                entry["configured_sites"] = len(self.solcast_configured_sites)
+                entry["successful_sites"] = len(self.solcast_configured_sites)
             self._model_cache[model_id] = entry
             self._save_model_cache()
 
@@ -738,13 +1047,19 @@ class EnsemblePVForecaster:
 
     def _load_config(self):
         conf = {}
-        if not os.path.exists(CONFIG_FILE): return conf
-        with open(CONFIG_FILE, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith('#') or '=' not in line: continue
-                k, v = line.split('=', 1)
-                conf[k.strip().lower()] = v.strip()
+        candidates = list(_legacy_config_files())
+        if CONFIG_FILE and CONFIG_FILE not in candidates:
+            candidates.insert(0, CONFIG_FILE)
+        for config_file in candidates:
+            if not os.path.isfile(config_file):
+                continue
+            with open(config_file, 'r', encoding='utf-8', errors='ignore') as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith('#') or '=' not in line: continue
+                    k, v = line.split('=', 1)
+                    conf[k.strip().lower()] = v.strip()
+            break
         return conf
 
     def _write_weather_alerts(self, payload):
@@ -1067,21 +1382,24 @@ class EnsemblePVForecaster:
     def fetch_model_1_forecast_solar(self):
         """Holt Prognose von Forecast.Solar (Standard in der PV Community)"""
         parsed_model_total = {}
+        parsed_resource_total = {}
         successful_fetches = 0
-        
+
         for idx, roof in enumerate(self.roofs):
+            resource_key = str(roof.get("resource_key") or f"FC{idx + 1}")
+            parsed_resource = parsed_resource_total.setdefault(resource_key, {})
             # API Erwartet Azimuth: 0=Süd, -90=Ost
             url = f"https://api.forecast.solar/estimate/{self.lat}/{self.lon}/{roof['tilt']}/{roof['azimuth']}/{roof['kwp']}"
             logger.info(f"Hole Model 1 (Forecast.Solar) Tag {idx+1}: {url}")
-            
+
             try:
                 req = urllib.request.Request(url, headers={'User-Agent': 'E3DC-Control-V4'})
                 with urllib.request.urlopen(req, timeout=10) as response:
                     data = json.loads(response.read().decode())
-                    
+
                     # Format: {"result": {"watts": {"2024-10-10 08:00:00": 1500, ...}}}
                     hourly_watts = data.get('result', {}).get('watts', {})
-                    
+
                     for time_str, watts in hourly_watts.items():
                         # Parse "YYYY-MM-DD HH:MM:SS" -> datetime object
                         dt = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
@@ -1092,28 +1410,33 @@ class EnsemblePVForecaster:
                             parsed_model_total[unix_h] += kwh
                         else:
                             parsed_model_total[unix_h] = kwh
+                        parsed_resource[unix_h] = parsed_resource.get(unix_h, 0.0) + kwh
                     successful_fetches += 1
             except Exception as e:
                 logger.error(f"Fehler bei Model 1 Dach {idx+1}: {e}")
-                
+
         if successful_fetches > 0:
+            self._record_model_resource_data("m1", parsed_resource_total)
             return parsed_model_total
         return {}
 
     def fetch_model_2_open_meteo(self):
         """Holt Strahlung UND Temperatur von Open-Meteo (Zweit-Modell + Wetter-Prognose)"""
         # Wir berechnen den PV-Ertrag auf Basis der exakten Dach-Geometrie (global_tilted_irradiance)
-        # und nutzen dafuer direkt das Ensemble aus: best_match, icon_d2, ecmwf_ifs025 
-        
+        # und nutzen dafuer direkt das Ensemble aus: best_match, icon_d2, ecmwf_ifs025
+
         parsed_model_total = {}
+        parsed_resource_total = {}
         weather_by_ts = {}
         successful_fetches = 0
 
         for idx, roof in enumerate(self.roofs):
+            resource_key = str(roof.get("resource_key") or f"FC{idx + 1}")
+            parsed_resource = parsed_resource_total.setdefault(resource_key, {})
             # Open-Meteo nutzt dieselbe Solar-Konvention wie Forecast.Solar:
             # Sued=0, West=90, Ost=-90
             om_azimuth = roof['azimuth']
-            
+
             url = (
                 f"https://api.open-meteo.com/v1/forecast"
                 f"?latitude={self.lat}&longitude={self.lon}"
@@ -1127,17 +1450,17 @@ class EnsemblePVForecaster:
                 req = urllib.request.Request(url, headers={'User-Agent': 'E3DC-Control-V4'})
                 with urllib.request.urlopen(req, timeout=10) as response:
                     data = json.loads(response.read().decode())
-                    
+
                     times = data['hourly']['time']
-                    
+
                     # Modelle abrufen (Falls ein Modell fehlt, z.B. icon_d2 ausserhalb Europas, Fallback)
                     rad_best  = data['hourly'].get('global_tilted_irradiance_best_match', [])
                     rad_icon  = data['hourly'].get('global_tilted_irradiance_icon_d2', [])
                     rad_ecmwf = data['hourly'].get('global_tilted_irradiance_ecmwf_ifs025', [])
-                    
+
                     if not rad_best:
                         rad_best = data['hourly'].get('global_tilted_irradiance', [])
-                    
+
                     if not rad_icon: rad_icon = rad_best
                     if not rad_ecmwf: rad_ecmwf = rad_best
 
@@ -1168,6 +1491,7 @@ class EnsemblePVForecaster:
                             parsed_model_total[unix_h] += est_kwh
                         else:
                             parsed_model_total[unix_h] = est_kwh
+                        parsed_resource[unix_h] = parsed_resource.get(unix_h, 0.0) + est_kwh
 
                         # Temperatur im ML Cache speichern
                         if idx == 0 and i < len(temp_2m) and temp_2m[i] is not None:
@@ -1175,7 +1499,7 @@ class EnsemblePVForecaster:
                                 "temp_c": round(float(temp_2m[i]), 1),
                                 "radiation_wm2": round(float(blended_rad), 1)
                             }
-                    
+
                     successful_fetches += 1
 
             except Exception as e:
@@ -1197,48 +1521,113 @@ class EnsemblePVForecaster:
             except Exception: pass
 
         if successful_fetches > 0:
+            self._record_model_resource_data("m2", parsed_resource_total)
             return parsed_model_total
         return {}
 
 
     def fetch_model_3_solcast(self):
-        """Holt und summiert Solcast-Prognosen fuer bis zu drei Rooftop Sites."""
-        if not self.solcast_sites:
-            logger.info("Model 3 (Solcast): Uebersprungen (keine vollstaendige Site in e3dc_v4.json)")
+        """Holt M3 nur als vollständige Summe aller konfigurierten Sites."""
+        if not self.solcast_configured_sites:
+            self.solcast_status = self._solcast_status("disabled_no_sites")
+            logger.info("Model 3 (Solcast): Übersprungen (keine Site konfiguriert)")
+            return {}
+        if self.solcast_mapping_blocked or len(self.solcast_sites) != len(self.solcast_configured_sites):
+            state = "blocked_missing_selected_key" if self.solcast_mapping_reason == "missing_selected_key" else "incomplete_refresh"
+            labels = [site["label"] for site in self.solcast_configured_sites]
+            self.solcast_status = self._solcast_status(state, failed_labels=labels)
+            logger.error("Model 3 (Solcast): Accountzuordnung ist nicht ausführbar; kein Abruf.")
             return {}
 
         parsed_model_total = {}
+        parsed_resource_total = {}
         successful_fetches = 0
+        failed_labels = []
 
-        for label, resource_id, api_key in self.solcast_sites:
-            url = f"https://api.solcast.com.au/rooftop_sites/{resource_id}/forecasts?format=json&api_key={api_key}"
+        for site in self.solcast_sites:
+            label = site["label"]
+            resource_id = site["resource_id"]
+            api_key = self.solcast_api_keys[int(site["account_slot"])]
+            url = f"https://api.solcast.com.au/rooftop_sites/{resource_id}/forecasts?format=json"
             logger.info(f"Hole Model 3 (Solcast {label})")
 
             try:
-                req = urllib.request.Request(url)
+                req = urllib.request.Request(
+                    url,
+                    headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"},
+                )
                 with urllib.request.urlopen(req, timeout=10) as response:
                     data = json.loads(response.read().decode())
 
                     forecasts = data.get('forecasts', [])
+                    if not isinstance(forecasts, list) or not forecasts:
+                        raise ValueError("forecast_list_missing")
+                    parsed_site = {}
                     for entry in forecasts:
+                        if not isinstance(entry, dict) or 'period_end' not in entry or 'pv_estimate' not in entry:
+                            raise ValueError("forecast_entry_invalid")
                         time_str = entry['period_end'].replace('Z', '+00:00')
                         dt = datetime.fromisoformat(time_str)
                         unix_h = int(dt.replace(minute=0, second=0).timestamp())
 
                         est_kw = float(entry['pv_estimate'])
-                        parsed_model_total[unix_h] = parsed_model_total.get(unix_h, 0.0) + est_kw * 0.5
+                        if not math.isfinite(est_kw) or est_kw < 0.0:
+                            raise ValueError("forecast_value_invalid")
+                        parsed_site[unix_h] = parsed_site.get(unix_h, 0.0) + est_kw * 0.5
+                    if not parsed_site:
+                        raise ValueError("forecast_empty")
+                    for unix_h, value in parsed_site.items():
+                        parsed_model_total[unix_h] = parsed_model_total.get(unix_h, 0.0) + value
+                    parsed_resource_total[label] = parsed_site
                     successful_fetches += 1
             except urllib.error.HTTPError as e:
+                failed_labels.append(label)
                 if e.code == 429:
-                    logger.error(f"Fehler bei Model 3 ({label}): Solcast API Limit / Roar exhausted (429)")
+                    logger.error(f"Fehler bei Model 3 ({label}): Tagesbudget erschöpft (HTTP 429)")
                 else:
-                    logger.error(f"Fehler bei Model 3 ({label}): {e}")
-            except Exception as e:
-                logger.error(f"Fehler bei Model 3 ({label}): {e}")
+                    logger.error(f"Fehler bei Model 3 ({label}): HTTP {int(e.code)}")
+            except Exception as error:
+                failed_labels.append(label)
+                logger.error(f"Fehler bei Model 3 ({label}): {type(error).__name__}")
 
-        if successful_fetches > 0:
-            logger.info(f"Model 3 (Solcast): {successful_fetches}/{len(self.solcast_sites)} Site(s) erfolgreich summiert.")
+        if successful_fetches == len(self.solcast_configured_sites):
+            self._record_model_resource_data("m3", parsed_resource_total)
+            self.solcast_status = self._solcast_status("complete_fresh", successful=successful_fetches)
+            logger.info(f"Model 3 (Solcast): {successful_fetches}/{len(self.solcast_sites)} Site(s) vollständig summiert.")
             return parsed_model_total
+        self.solcast_status = self._solcast_status(
+            "incomplete_refresh",
+            successful=successful_fetches,
+            failed_labels=failed_labels,
+        )
+        logger.warning(
+            f"Model 3 (Solcast): unvollständig ({successful_fetches}/{len(self.solcast_sites)}); Teilsumme wird verworfen."
+        )
+        return {}
+
+    def _resolve_solcast_model(self):
+        """Liefert ausschließlich vollständiges frisches oder vertrauenswürdig gecachtes M3."""
+        if not self.solcast_configured_sites:
+            self.solcast_status = self._solcast_status("disabled_no_sites")
+            return {}
+        if self.solcast_mapping_blocked:
+            return self.fetch_model_3_solcast()
+        if not self._model_is_stale("m3"):
+            return self._get_model_data("m3")
+
+        stale_complete = self._get_model_data("m3")
+        fresh = self.fetch_model_3_solcast()
+        if self.solcast_status.get("state") == "complete_fresh":
+            self._set_model_data("m3", fresh)
+            return fresh
+        if stale_complete:
+            refresh_status = dict(self.solcast_status)
+            self.solcast_status = self._solcast_status(
+                "stale_complete_fallback",
+                successful=int(refresh_status.get("successful_sites") or 0),
+                failed_labels=refresh_status.get("failed_labels", []),
+            )
+            return stale_complete
         return {}
 
     def _check_connectivity(self):
@@ -1286,12 +1675,8 @@ class EnsemblePVForecaster:
             if not use_openmeteo:
                 logger.info("Model 2 (Open-Meteo): Deaktiviert via Config.")
 
-        if self._model_is_stale('m3'):
-            m3 = self.fetch_model_3_solcast()
-            self._set_model_data('m3', m3)
-        else:
-            m3 = self._get_model_data('m3')
-        
+        m3 = self._resolve_solcast_model()
+
         ensemble_forecast = []
 
         # Vereine alle vorkommenden Zeitstempel
@@ -1306,6 +1691,14 @@ class EnsemblePVForecaster:
         m1 = {int(k): v for k, v in m1.items()}
         m2 = {int(k): v for k, v in m2.items()}
         m3 = {int(k): v for k, v in m3.items()}
+        resource_models = {}
+        for model_id in ("m1", "m2", "m3"):
+            resource_models[model_id] = {
+                label: {int(ts): value for ts, value in values.items()}
+                for label, values in self._get_model_resource_data(model_id).items()
+            }
+        pv_topology_contract = self._pv_topology_contract_or_unbound()
+        resource_keys = tuple(topology_resource_keys(pv_topology_contract))
 
         # Nur Zeitstempel der naechsten 72h behalten (Prognose-Horizont)
         import time as _t2
@@ -1395,24 +1788,41 @@ class EnsemblePVForecaster:
                     norm_w3 = ww3 / ww_total
 
             final_kwh = ((val1 or 0) * norm_w1 + (val2 or 0) * norm_w2 + (val3 or 0) * norm_w3)
+            resource_projection_state = _resource_projection_state_for_models(
+                timestamp=ts,
+                model_values={"m1": val1, "m2": val2, "m3": val3},
+                model_weights={"m1": norm_w1, "m2": norm_w2, "m3": norm_w3},
+                resource_models=resource_models,
+                resource_keys=resource_keys,
+            )
+            resource_kwh = {}
+            for resource_key in resource_keys:
+                resource_kwh[resource_key] = (
+                    (resource_models["m1"].get(resource_key, {}).get(ts, 0.0) or 0.0) * norm_w1
+                    + (resource_models["m2"].get(resource_key, {}).get(ts, 0.0) or 0.0) * norm_w2
+                    + (resource_models["m3"].get(resource_key, {}).get(ts, 0.0) or 0.0) * norm_w3
+                )
             hourly_values.append({
                 "ts": ts, "kwh": final_kwh, "m1": val1, "m2": val2, "m3": val3,
                 "w1_eff": round(norm_w1, 3), "w2_eff": round(norm_w2, 3),
-                "hours_ahead": round(hours_ahead, 1)
+                "hours_ahead": round(hours_ahead, 1),
+                "resource_kwh": resource_kwh,
+                "resource_projection_state": resource_projection_state,
             })
-            
+
         # Weiche Interpolation auf 15-Minuten Blöcke
         for i, hr in enumerate(hourly_values):
             curr_kw = hr["kwh"]
             prev_kw = hourly_values[i-1]["kwh"] if i > 0 else curr_kw
             next_kw = hourly_values[i+1]["kwh"] if i < len(hourly_values)-1 else curr_kw
-            
+
             for q in range(4):
                 if q == 0: slotted_kw = (prev_kw * 0.25) + (curr_kw * 0.75)
                 elif q == 1: slotted_kw = (prev_kw * 0.10) + (curr_kw * 0.90)
                 elif q == 2: slotted_kw = (next_kw * 0.10) + (curr_kw * 0.90)
                 else: slotted_kw = (next_kw * 0.25) + (curr_kw * 0.75)
-                
+                uncapped_slotted_kw = max(0.0, slotted_kw)
+
                 start_s = int(hr["ts"]) + q * 900
                 daylight_factor = self._pv_daylight_factor(datetime.fromtimestamp(start_s + 450))
                 if daylight_factor <= 0.0:
@@ -1423,6 +1833,58 @@ class EnsemblePVForecaster:
                         self.total_kwp * PV_CLOUD_EDGE_PEAK_MARGIN * daylight_factor,
                     )
 
+                slotted_resources_w = {}
+                for resource_key in resource_keys:
+                    current_resource = (hr.get("resource_kwh") or {}).get(resource_key, 0.0)
+                    previous_resource = (
+                        (hourly_values[i - 1].get("resource_kwh") or {}).get(resource_key, current_resource)
+                        if i > 0 else current_resource
+                    )
+                    next_resource = (
+                        (hourly_values[i + 1].get("resource_kwh") or {}).get(resource_key, current_resource)
+                        if i < len(hourly_values) - 1 else current_resource
+                    )
+                    if q == 0:
+                        resource_kw = previous_resource * 0.25 + current_resource * 0.75
+                    elif q == 1:
+                        resource_kw = previous_resource * 0.10 + current_resource * 0.90
+                    elif q == 2:
+                        resource_kw = next_resource * 0.10 + current_resource * 0.90
+                    else:
+                        resource_kw = next_resource * 0.25 + current_resource * 0.75
+                    slotted_resources_w[resource_key] = max(0.0, resource_kw * 1000.0)
+
+                adjacent_hr = (
+                    hourly_values[i - 1] if q < 2 and i > 0
+                    else hourly_values[i + 1] if q >= 2 and i < len(hourly_values) - 1
+                    else hr
+                )
+                slot_projection_state = _merge_resource_projection_states(
+                    hr.get("resource_projection_state"),
+                    adjacent_hr.get("resource_projection_state"),
+                )
+                if slot_projection_state["status"] == "complete" and resource_keys:
+                    source_total_w = uncapped_slotted_kw * 1000.0
+                    resource_total_w = sum(slotted_resources_w.values())
+                    source_tolerance_w = max(
+                        RESOURCE_PROJECTION_ABS_TOLERANCE_W,
+                        source_total_w * RESOURCE_PROJECTION_REL_TOLERANCE,
+                    )
+                    if abs(source_total_w - resource_total_w) > source_tolerance_w:
+                        slot_projection_state = {
+                            "status": "unbound",
+                            "reason": "RESOURCE_PROJECTION_TOTAL_MISMATCH",
+                        }
+                    elif resource_total_w > 0.0:
+                        # Tageslicht-/physikalische Site-Caps sind explizite
+                        # Gesamttransformationen und werden proportional auf
+                        # vollständig belegte Ressourcenbeiträge angewandt.
+                        site_scale = (slotted_kw * 1000.0) / resource_total_w
+                        slotted_resources_w = {
+                            key: value * site_scale
+                            for key, value in slotted_resources_w.items()
+                        }
+
                 start_ms = start_s * 1000
                 ensemble_forecast.append({
                     "start_timestamp": start_ms,
@@ -1430,9 +1892,13 @@ class EnsemblePVForecaster:
                     "predicted_kwh": round(slotted_kw, 4),
                     "m1_raw": hr.get("m1"),
                     "m2_raw": hr.get("m2"),
-                    "m3_raw": hr.get("m3")
+                    "m3_raw": hr.get("m3"),
+                    "pv_resource_raw_w": slotted_resources_w,
+                    "pv_resource_reference_w": max(0.0, slotted_kw * 1000.0),
+                    "pv_resource_projection_status": slot_projection_state["status"],
+                    "pv_resource_projection_reason": slot_projection_state["reason"],
                 })
-            
+
         site_signature, site_descriptor = _forecast_site_signature(self.roofs, self.total_kwp)
 
         # Tages-Bias-Update: einmal pro Tag mit Ist-Ertrag aus DB vs. History-Summe.
@@ -1470,6 +1936,71 @@ class EnsemblePVForecaster:
             site_signature=site_signature,
             config=self.v4_config,
         )
+        topology_status_counts = {}
+        topology_slots = []
+        for slot in ensemble_forecast:
+            slot = dict(slot)
+            slot_total_w = _slot_kw(slot, "predicted_kwh") * 1000.0
+            resource_raw_w = slot.pop("pv_resource_raw_w", {})
+            projection_status = slot.pop("pv_resource_projection_status", "unbound")
+            projection_reason = slot.pop(
+                "pv_resource_projection_reason",
+                "RESOURCE_PROJECTION_INCOMPLETE",
+            )
+            reference_w = max(0.0, _slot_kw(slot, "pv_resource_reference_w"))
+            slot.pop("pv_resource_reference_w", None)
+            if projection_status == "complete" and resource_keys:
+                resource_total_w = sum(
+                    max(0.0, float(resource_raw_w.get(key) or 0.0))
+                    for key in resource_keys
+                )
+                reference_tolerance_w = max(
+                    RESOURCE_PROJECTION_ABS_TOLERANCE_W,
+                    reference_w * RESOURCE_PROJECTION_REL_TOLERANCE,
+                )
+                if abs(reference_w - resource_total_w) > reference_tolerance_w:
+                    projection_status = "unbound"
+                    projection_reason = "RESOURCE_PROJECTION_TOTAL_MISMATCH"
+                elif resource_total_w > 0.0:
+                    # Bias und Tagescap sind bereits fachlich auf den
+                    # Gesamtforecast angewandt. Bei belegter Projektion folgt
+                    # der Split proportional; fehlende Beiträge werden nie so
+                    # kaschiert.
+                    aggregate_scale = slot_total_w / resource_total_w
+                    resource_raw_w = {
+                        key: max(0.0, float(value or 0.0)) * aggregate_scale
+                        for key, value in resource_raw_w.items()
+                    }
+                elif slot_total_w > reference_tolerance_w:
+                    projection_status = "unbound"
+                    projection_reason = "RESOURCE_PROJECTION_TOTAL_MISMATCH"
+            topology_slot = project_slot_topology(
+                slot_total_w,
+                resource_raw_w,
+                pv_topology_contract,
+                projection_status=projection_status,
+                projection_reason=projection_reason,
+            )
+            slot["predicted_kwh"] = round(float(topology_slot.get("total_pv_w") or 0.0) / 1000.0, 4)
+            slot["pv_topology_status"] = topology_slot.get("status")
+            slot["pv_topology_reason"] = topology_slot.get("reason")
+            slot["pv_topology_revision"] = topology_slot.get("topology_revision")
+            slot["e3dc_dc_pv_w"] = topology_slot.get("e3dc_dc_pv_w")
+            slot["external_ac_pv_w"] = topology_slot.get("external_ac_pv_w")
+            slot["pv_resources"] = topology_slot.get("resources", [])
+            slot["pv_external_ac_capped_w"] = topology_slot.get("external_ac_capped_w", 0.0)
+            slot["pv_resource_projection_status"] = topology_slot.get("resource_projection_status")
+            slot["pv_resource_projection_reason"] = topology_slot.get("resource_projection_reason")
+            slot["pv_topology_source"] = "resource_forecast_ensemble_v1"
+            slot["pv_topology_quality"] = (
+                "complete"
+                if topology_slot.get("status") == "bound"
+                else "missing_or_incoherent_resource_projection"
+            )
+            status_key = str(topology_slot.get("status") or "unknown")
+            topology_status_counts[status_key] = topology_status_counts.get(status_key, 0) + 1
+            topology_slots.append(slot)
+        ensemble_forecast = topology_slots
         ensemble_forecast = _mark_displayed_forecast_slots(ensemble_forecast)
         full_day_forecast_totals = _daily_forecast_totals(ensemble_forecast)
 
@@ -1520,6 +2051,9 @@ class EnsemblePVForecaster:
             with open(meta_path, 'w') as f:
                 json.dump({"fetched_at": output["fetched_at"], "slots": output["slots"],
                            "models_ok": output["models_ok"],
+                           "solcast": dict(self.solcast_status),
+                           "pv_topology": dict(pv_topology_contract),
+                           "pv_topology_slot_status_counts": topology_status_counts,
                            "calibration": bias_info,
                            "daily_caps": daily_caps,
                            "forecast_totals": {
@@ -2335,6 +2869,188 @@ def _cap_daily_forecast_totals(
     return corrected, summaries
 
 
+def _update_model_weights(accuracy_info: dict):
+    """
+    ML Weight Evaluator: Speichert taeglich die Prognose-Abweichung pro Modell
+    in pv_forecast_eval.json (Disk-persistent).
+    Nach 7+ Tagen mit genuegend Tagesertrag (>= 5 kWh) werden die Gewichte
+    (pv_score_m1/m2/m3) in e3dc_v4.json proportional zur inversen MAE angepasst.
+    """
+    if not accuracy_info or accuracy_info.get('error_pct') is None:
+        return
+
+    import time as _t
+    EVAL_FILE = "/var/www/html/logs/pv_forecast_eval.json"
+    V4_CONFIG = "/var/www/html/data/e3dc_v4.json"
+
+    try:
+        # Evaluations-History laden
+        if os.path.exists(EVAL_FILE):
+            with open(EVAL_FILE, 'r') as f:
+                eval_data = json.load(f)
+        else:
+            eval_data = {"daily_errors": [], "last_weight_update": 0, "current_weights": {}}
+
+        # Nur bei relevantem Tagesertrag (nicht um Mitternacht mit 0 kWh)
+        today_kwh = accuracy_info.get('today_actual_total_kwh', 0)
+        if today_kwh < 2.0:  # Kein Ertrag / Nacht -> ueberspringe
+            return
+
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        error_pct = accuracy_info.get('error_pct', 0)
+        slot_pred = accuracy_info.get('slot_predicted_kwh', 0)
+        slot_actual = accuracy_info.get('slot_actual_kwh_est', 0)
+
+        # Tages-Eintrag (nur einmal pro Tag, letzten Eintrag ggf. ueberschreiben)
+        daily = eval_data.get('daily_errors', [])
+        if daily and daily[-1].get('date') == today_str:
+            daily[-1].update({'error_pct': error_pct, 'today_kwh': today_kwh,
+                              'pred_kwh': slot_pred, 'actual_kwh': slot_actual})
+        else:
+            daily.append({'date': today_str, 'error_pct': error_pct,
+                          'today_kwh': today_kwh, 'pred_kwh': slot_pred,
+                          'actual_kwh': slot_actual, 'ts': int(_t.time())})
+        # Nur letzten 90 Tage behalten
+        eval_data['daily_errors'] = daily[-90:]
+
+        # Prüfe, ob genügend Daten für eine Gewichtsanpassung vorhanden sind
+        eligible_days = [d for d in daily if d.get('today_kwh', 0) >= 5.0]
+        days_since_update = (_t.time() - eval_data.get('last_weight_update', 0)) / 86400
+
+        if len(eligible_days) >= 7 and days_since_update >= 7:
+            # -------------------------------------------------------------------
+            # Einfaches MAE-basiertes Gewichts-Update:
+            # Wir haben pro Slot nur den Ensemble-Fehler, nicht pro Modell.
+            # Da wir m1_raw, m2_raw einzeln gespeichert haben, berechnen wir
+            # die MAE pro Modell aus der History (pv_forecast_history.json).
+            # -------------------------------------------------------------------
+            history_path = os.path.join(RAMDISK_DIR, "pv_forecast_history.json")
+            live_path = os.path.join(RAMDISK_DIR, "live_data_py.json")
+
+            if os.path.exists(history_path) and os.path.exists(live_path):
+                with open(history_path, 'r') as f:
+                    hist = json.load(f)
+
+                # Pro Modell: absolute Fehler aufsammeln
+                m1_errs, m2_errs, m3_errs = [], [], []
+                for slot in hist:
+                    actual = slot.get('actual_kwh')  # Wird erst unten geschrieben
+                    pred_m1 = slot.get('m1_raw')
+                    pred_m2 = slot.get('m2_raw')
+                    pred_m3 = slot.get('m3_raw')
+                    ens = slot.get('predicted_kwh', 0)
+                    if actual is None or ens == 0:
+                        continue
+                    # Skaliere Modell-Rohwerte auf Ensemble-Ebene
+                    if pred_m1 is not None: m1_errs.append(abs(pred_m1 - actual))
+                    if pred_m2 is not None: m2_errs.append(abs(pred_m2 - actual))
+                    if pred_m3 is not None: m3_errs.append(abs(pred_m3 - actual))
+
+                if m1_errs and m2_errs:
+                    mae_m1 = sum(m1_errs) / len(m1_errs)
+                    mae_m2 = sum(m2_errs) / len(m2_errs)
+                    mae_m3 = sum(m3_errs) / len(m3_errs) if m3_errs else mae_m2
+
+                    # Inverser Fehler -> besseres Modell bekommt hoehere Gewichtung
+                    # Epsilon vermeidet Division durch Null bei perfektem Modell
+                    inv_m1 = 1.0 / (mae_m1 + 0.001)
+                    inv_m2 = 1.0 / (mae_m2 + 0.001)
+                    inv_m3 = 1.0 / (mae_m3 + 0.001)
+                    total_inv = inv_m1 + inv_m2 + inv_m3
+
+                    # Neue Gewichte (auf 2 Dezimalen gerundet, Summe = 1.0)
+                    new_w1 = round(inv_m1 / total_inv, 2)
+                    new_w2 = round(inv_m2 / total_inv, 2)
+                    new_w3 = round(1.0 - new_w1 - new_w2, 2)  # Rest-Gewicht (Summe = 1.0)
+
+                    # Plausibilitätsprüfung: kein Modell unter 5 % oder über 70 %
+                    new_w1 = max(0.05, min(0.70, new_w1))
+                    new_w2 = max(0.05, min(0.70, new_w2))
+                    new_w3 = max(0.05, min(0.70, new_w3))
+                    total_new = new_w1 + new_w2 + new_w3
+                    new_w1 /= total_new; new_w2 /= total_new; new_w3 /= total_new
+
+                    # In e3dc_v4.json schreiben (nur wenn Datei schreibbar)
+                    if os.path.exists(V4_CONFIG):
+                        with open(V4_CONFIG, 'r') as f:
+                            v4 = json.load(f)
+                        old_w = (v4.get('pv_score_m1', '?'), v4.get('pv_score_m2', '?'), v4.get('pv_score_m3', '?'))
+                        v4['pv_score_m1'] = round(new_w1, 4)
+                        v4['pv_score_m2'] = round(new_w2, 4)
+                        v4['pv_score_m3'] = round(new_w3, 4)
+                        with open(V4_CONFIG, 'w') as f:
+                            json.dump(v4, f, indent=2)
+                        logger.info(
+                            f"ML Weight-Update: M1 {old_w[0]}->{new_w1:.3f} "
+                            f"(MAE {mae_m1:.4f}), "
+                            f"M2 {old_w[1]}->{new_w2:.3f} (MAE {mae_m2:.4f}), "
+                            f"M3 {old_w[2]}->{new_w3:.3f} (MAE {mae_m3:.4f}). "
+                            f"Basis: {len(m1_errs)} Vergleichsslots."
+                        )
+                        eval_data['last_weight_update'] = int(_t.time())
+                        eval_data['current_weights'] = {
+                            'pv_score_m1': round(new_w1, 4),
+                            'pv_score_m2': round(new_w2, 4),
+                            'pv_score_m3': round(new_w3, 4),
+                            'mae_m1': round(mae_m1, 4),
+                            'mae_m2': round(mae_m2, 4),
+                            'mae_m3': round(mae_m3, 4),
+                            'sample_count': len(m1_errs),
+                            'updated_at': datetime.now().isoformat(timespec='seconds')
+                        }
+
+        with open(EVAL_FILE, 'w') as f:
+            json.dump(eval_data, f, indent=2)
+
+    except Exception as e:
+        logger.warning(f"Weight-Evaluator Fehler (unkritisch): {e}")
+
+def _compute_forecast_accuracy(current_forecast):
+    """
+    Vergleicht den heutigen Ist-Ertrag (aus live_data_py.json) gegen die Prognose
+    für diese Stunde und gibt ein Dict mit Abweichungsinformationen zurück.
+    Wird in pv_forecast_meta.json gespeichert (Diagnose / zukuenftige Gewichtsanpassung).
+    """
+    try:
+        import time as _t
+        live_path = os.path.join(RAMDISK_DIR, "live_data_py.json")
+        if not os.path.exists(live_path):
+            return {}
+        with open(live_path, 'r') as f:
+            live = json.load(f)
+        actual_pv_w = float(live.get('PV_Power', live.get('pv_power', 0)))
+        actual_kwh_today = float(live.get('PV_Energy_kWh', live.get('pv_energy_kwh', 0)))
+
+        # Welcher Forecast-Slot entspricht der aktuellen Stunde?
+        now_ms = int(_t.time() * 1000)
+        matching = [s for s in current_forecast
+                    if s['start_timestamp'] <= now_ms < s['end_timestamp']]
+        if not matching:
+            return {"status": "kein passender Slot"}
+        predicted_kwh = matching[0]['predicted_kwh']
+        actual_slot_kwh = actual_pv_w / 1000.0 * 0.25  # 15-Min-Slot -> kWh Schaetzung
+
+        error_pct = 0.0
+        if predicted_kwh > 0:
+            error_pct = round((actual_slot_kwh - predicted_kwh) / predicted_kwh * 100, 1)
+
+        result = {
+            "slot_predicted_kwh": round(predicted_kwh, 3),
+            "slot_actual_kwh_est": round(actual_slot_kwh, 3),
+            "error_pct": error_pct,
+            "today_actual_total_kwh": round(actual_kwh_today, 2),
+            "ts": int(_t.time())
+        }
+        if abs(error_pct) > 25:
+            logger.warning(
+                f"Prognose-Abweichung: {error_pct:+.1f}% "
+                f"(Prognose {predicted_kwh:.3f} kWh vs Ist-Schaetzung {actual_slot_kwh:.3f} kWh). "
+                f"Tages-Ist bisher: {actual_kwh_today:.1f} kWh."
+            )
+        return result
+    except Exception as e:
+        logger.debug(f"Accuracy-Check fehlgeschlagen: {e}")
+        return {}
 
 
 import time
@@ -2416,9 +3132,6 @@ def _run_ml_predict_if_ready(force=False):
     Die Verbrauchs-/WP-Prognose muss denselben Lifecycle haben, sonst fällt der
     Simulator nach jedem Neustart auf feste 500W/300W-Ersatzwerte zurück.
     """
-    if not os.path.exists(ML_MODEL_FILE):
-        logger.info("ML-Modell fehlt (%s) - Verbrauchsprognose bleibt im Fallback.", ML_MODEL_FILE)
-        return False
     if not force and not _ml_prediction_is_stale():
         return False
 
@@ -2429,6 +3142,12 @@ def _run_ml_predict_if_ready(force=False):
 
     python_bin = sys.executable or "python3"
     try:
+        ready_result = subprocess.run(
+            [python_bin, ml_script, "--model-ready"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
         result = subprocess.run(
             [python_bin, ml_script, "--predict"],
             capture_output=True,
@@ -2447,7 +3166,24 @@ def _run_ml_predict_if_ready(force=False):
         logger.warning("ml_predictor stderr: %s", line)
 
     if result.returncode == 0 and os.path.exists(ML_PREDICTION_OUTPUT):
-        logger.info("ML-Verbrauchsprognose aktualisiert: %s", ML_PREDICTION_OUTPUT)
+        forecast_mode = "unknown"
+        try:
+            with open(ML_PREDICTION_OUTPUT, "r", encoding="utf-8") as prediction_file:
+                prediction = json.load(prediction_file)
+            if isinstance(prediction, dict):
+                forecast_mode = str(prediction.get("forecast_mode") or "unknown")
+        except Exception:
+            pass
+        if ready_result.returncode != 0 and forecast_mode == "historical_profile":
+            logger.info(
+                "Kein manifest- und hashgeprüftes ML-Modell; "
+                "variables lokales Historienprofil wurde veröffentlicht."
+            )
+        logger.info(
+            "Verbrauchsprognose aktualisiert: %s (mode=%s)",
+            ML_PREDICTION_OUTPUT,
+            forecast_mode,
+        )
         return True
 
     logger.warning(

@@ -1,7 +1,7 @@
 # Installationszentrale
 
-Die Installationszentrale ist die sichere WebUI-Seite fuer Diagnose,
-Konfiguration, Modulinstallation, Neustart und Rueckbau von E3DC-Control
+Die Installationszentrale ist die sichere WebUI-Seite für Diagnose,
+Konfiguration, Modulinstallation, Neustart und Rückbau von E3DC-Control
 Diensten.
 
 ## Sicherheitsmodell
@@ -10,24 +10,24 @@ Diensten.
 - Freie Shell-Befehle, freie Dateipfade und beliebige Dienstnamen sind nicht
   erlaubt.
 - Der alte C++-Dienst `e3dc.service` ist kein Installationsziel der WebUI.
-- Core-Module wie Live-Daten, Storage Simulator und Storage Manager koennen
-  diagnostiziert und neu gestartet, aber nicht ueber die WebUI deinstalliert
+- Core-Module wie Live-Daten, Storage Simulator und Storage Manager können
+  diagnostiziert und neu gestartet, aber nicht über die WebUI deinstalliert
   werden.
-- Optionale Module werden vor echten Schreibjobs gesichert. Der Rueckbau
-  entfernt nur die systemd-Unit und laesst Config, Historie, Logs und Scripts
+- Optionale Module werden vor echten Schreibjobs gesichert. Der Rückbau
+  entfernt nur die systemd-Unit und lässt Config, Historie, Logs und Scripts
   unangetastet.
 
 ## Standardaktionen
 
 - `Diagnose`: liest Dienststatus, Konfiguration, Alive-Datei, Logauszug und
   Journal-Zeilen.
-- `Konfiguration`: zeigt die fuer das Modul relevanten Config-Felder direkt in
+- `Konfiguration`: zeigt die für das Modul relevanten Config-Felder direkt in
   einem Dialog und speichert nur erlaubte Werte.
-- `Auftragspruefung`: prueft den Ramdisk-Auftrag ohne Systemaenderung.
+- `Job-Test`: prüft den späteren Ramdisk-Jobpfad ohne Systemänderung.
 - `Installieren`: installiert ein optionales Modul erst nach expliziter
-  Schreibfreigabe ueber den Installer-Wrapper.
+  Schreibfreigabe über den Installer-Wrapper.
 - `Neustart` / `Stop`: nutzt nur erlaubte Dienste aus dem Katalog.
-- `Rueckbau`: ist nur fuer optionale Module erlaubt und legt vorher ein Backup
+- `Rückbau`: ist nur für optionale Module erlaubt und legt vorher ein Backup
   an.
 
 ## Service-Katalog und Pflichtdienste
@@ -57,22 +57,22 @@ dieselbe Datei appendieren.
 
 ## Diagnosepaket
 
-Das Diagnosepaket wird lokal erzeugt und enthaelt nur technische Hilfsdaten:
+Das Diagnosepaket wird lokal erzeugt und enthält nur technische Hilfsdaten:
 
-- maskierte Konfiguration ohne Passwoerter, Tokens, E-Mail-Adressen und
+- maskierte Konfiguration ohne Passwörter, Tokens, E-Mail-Adressen und
   Standortwerte,
 - Installer-Status, Moduldiagnose und Jobstatus,
-- ausgewaehlte Logs,
-- ausgewaehlte Ramdisk-Dateien wie Live-Daten, Speicherplan und Modulstatus.
+- ausgewählte Logs,
+- ausgewählte Ramdisk-Dateien wie Live-Daten, Speicherplan und Modulstatus.
 
-LAN-IPs, Dienstnamen und technische Zustaende bleiben bewusst enthalten, weil
-sie fuer die Fehlersuche wichtig sind. Das Paket sollte vor dem Versenden kurz
-geoeffnet und geprueft werden.
+LAN-IPs, Dienstnamen und technische Zustände bleiben bewusst enthalten, weil
+sie für die Fehlersuche wichtig sind. Das Paket sollte vor dem Versenden kurz
+geöffnet und geprüft werden.
 
 ## Docker
 
 Das Diagnosepaket funktioniert auch im Docker-Betrieb, solange der Container
-die ueblichen Pfade lesen kann:
+die üblichen Pfade lesen kann:
 
 - `/var/www/html/data`
 - `/var/www/html/logs`
@@ -80,11 +80,11 @@ die ueblichen Pfade lesen kann:
 
 Die ZIP-Erzeugung benoetigt keine systemd-Rechte. Falls die PHP-Erweiterung
 `ZipArchive` fehlt, nutzt die WebUI einen eingebauten ZIP-Fallback. Journal-
-Zeilen koennen im Docker-Betrieb fehlen; das Diagnosepaket bleibt trotzdem
+Zeilen können im Docker-Betrieb fehlen; das Diagnosepaket bleibt trotzdem
 brauchbar.
 
 Echte systemd-Installationen sind Bare-Metal-Funktionen. Docker-Module werden
-ueber feste Prozess-Mappings und die Container-Startlogik behandelt, nicht ueber
+über feste Prozess-Mappings und die Container-Startlogik behandelt, nicht über
 freie systemd-Kommandos.
 
 ## Waermepumpen-Module
@@ -105,4 +105,3 @@ im Config-Editor unter **Smart Home & Verbrauchsprognose** der Schalter
 auf **Stiebel Eltron ISG / WPM** gestellt und die **ISG IP-Adresse**
 eingetragen ist. Im Docker-Betrieb wird kein systemd-Service erzeugt; der
 Prozess startet beim naechsten Containerstart aus der `entrypoint.sh`.
-

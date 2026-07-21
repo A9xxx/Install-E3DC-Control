@@ -10,12 +10,9 @@ $paths = getInstallPaths();
 $installPath = $paths['install_path'];
 $python = getPythonInterpreter();
 $vitalsScript = null;
-$candidateScripts = [
-    rtrim($installPath, '/') . '/Installer/vital_stats.py',
-    rtrim(dirname($installPath), '/') . '/Install/Installer/vital_stats.py',
-    '/app/pi/Install/Installer/vital_stats.py',
-    '/home/pi/Install/Installer/vital_stats.py',
-];
+$candidateScripts = !empty($paths['valid'])
+    ? [rtrim($installPath, '/') . '/Installer/vital_stats.py']
+    : [];
 foreach ($candidateScripts as $candidateScript) {
     if (file_exists($candidateScript)) {
         $vitalsScript = $candidateScript;

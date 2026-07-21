@@ -32,7 +32,7 @@ Hyundai und Kia nutzen ein hCaptcha, weshalb der Login über ein Skript am Compu
 2. Führe das Skript aus und logge dich im sich öffnenden Chrome-Fenster mit deinen Bluelink-Daten ein.
 3. Kopiere den im Terminal generierten, sehr langen `refresh_token`.
 4. Führe den Menüpunkt **107 (Hyundai/Kia SoC-Abfrage einrichten)** im E3DC-Installer aus.
-5. Füge dort deinen Token ein. 
+5. Füge dort deinen Token ein.
 
 **Konfiguration im Web-Dashboard:**
 Im Config-Editor unter der neuen Gruppe **Fahrzeug Integration (Bluelink)** kannst du nun jederzeit:
@@ -56,7 +56,7 @@ Wenn du EVCC bereits nutzt, kann dieses System den Auto-SoC an E3DC-Control send
    ```
 2. Öffne den **Config-Editor** im E3DC Web-Dashboard.
 3. Gehe zur Gruppe **Smart Home MQTT-Hub**.
-4. Trage bei `mqtt_hub_sub_soc_topic` das korrekte Topic deines Autos ein. 
+4. Trage bei `mqtt_hub_sub_soc_topic` das korrekte Topic deines Autos ein.
    *(Beispiel: `evcc/vehicles/db:4/soc` oder `evcc/loadpoints/1/vehicleSoc`)*
 
 Wichtig: `evcc/loadpoints/1/chargePower` ist die Ladeleistung der Wallbox und gehoert in den Bereich **Wallbox-Leistung per MQTT** (`wb_topic`), nicht in das SoC-Feld.
@@ -74,8 +74,7 @@ Wenn dein Auto bereits in Home Assistant integriert ist, kannst du eine einfache
 ---
 
 ## Weg 4: Manuelle Web-Eingabe (Ohne Cloud-Integration)
-Wenn dein Fahrzeug über keine App oder offene Cloud-Schnittstelle verfügt,
-kannst du das intelligente Lademanagement weiterhin nutzen.
+Wenn dein Fahrzeug über keine App oder offene Cloud-Schnittstelle verfügt, kannst du dennoch vom intelligenten Lademanagement (und V2H-Schutz) profitieren!
 
 **Einrichtung & Ablauf:**
 1. Wechsle im Dashboard-Menü auf **Wallbox**.
@@ -91,5 +90,5 @@ kannst du das intelligente Lademanagement weiterhin nutzen.
 Das System ist für den Betrieb mehrerer Fahrzeuge optimiert. Wenn du z. B. zwei Fahrzeuge über MQTT (`mqtt_hub_sub_soc_topic` und `mqtt_hub_sub_soc_topic_2`) anbindest:
 *   **DUAL-WALLBOX UI:** Im Dashboard (Seitenleiste und Energiefluss-Diagramm) ordnet das System nun das erste angesteckte Fahrzeug optisch vollautomatisch der "Wallbox 1" zu und das zweite der "Wallbox 2" – perfekt für das Monitoring paralleler Ladevorgänge.
 *   **DASHBOARD-TABS:** Das System erkennt die verschiedenen Fahrzeuge (`bluelink_vin` oder MQTT-Topics) und erstellt automatisch für jedes Auto einen eigenen Reiter (Tab) in der Detailansicht.
-*   **WALLBOX-ZUORDNUNG:** Im Hauptmenuepunkt "Wallbox" kannst du oben in einer eigenen Karte exakt konfigurieren, welches Fahrzeug an Wallbox 1 oder 2 laedt. Die Auswahl wird sofort gespeichert und ist besonders wichtig fuer Wallboxen ohne eigene Fahrzeugerkennung.
+*   **WALLBOX-ZUORDNUNG:** Im Hauptmenüpunkt "Wallbox" kannst du oben in einer eigenen Karte exakt konfigurieren, welches Fahrzeug an Wallbox 1 oder 2 lädt. Die Auswahl wird sofort gespeichert und ist besonders wichtig für Wallboxen ohne eigene Fahrzeugerkennung.
 *   **AUTOMATISCHE PLANUNG:** Änderungen am Ladeziel, die du direkt in der App deines Autos machst, werden vom System zeitnah erkannt und lokal synchronisiert.

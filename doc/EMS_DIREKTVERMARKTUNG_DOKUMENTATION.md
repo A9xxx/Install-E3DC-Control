@@ -41,14 +41,14 @@ Erwartung:
 
 ### Safe Shadow
 
-Beobachtungsmodus ohne Direktvermarktungsvertrag:
+Test- und Beobachtungsmodus ohne Direktvermarktungsvertrag:
 
 ```text
 direct_marketing_enable = 1
 direct_marketing_mode = safe
 direct_marketing_export_enable = 0
 direct_marketing_grid_charge_enable = 0
-direct_marketing_arbitrage_enable = 0
+direct_marketing_v2x_discharge_enable = 0
 direct_marketing_low_price_curtail_enable = 0
 ```
 
@@ -61,7 +61,7 @@ Erwartung:
 - kein Netzladen,
 - keine WR-/PV-Abregelung.
 
-## Empfohlene sichere Startwerte
+## Empfohlene Safe-Testwerte
 
 Für ein großes Heimspeichersystem ohne aktive Direktvermarktung:
 
@@ -70,11 +70,11 @@ Für ein großes Heimspeichersystem ohne aktive Direktvermarktung:
 | `direct_marketing_home_reserve_soc_pct` | `35` | Hausreserve schützen |
 | `direct_marketing_night_reserve_soc_pct` | `35` | Nachtreserve schützen |
 | `direct_marketing_keep_headroom_pct` | `25` | Speicherplatz bei günstigen Preisen freihalten |
-| `direct_marketing_min_margin_pct` | `10` | Mindestmarge für wirtschaftliche Fenster |
+| `direct_marketing_min_margin_pct` | `10` | spätere Wirtschaftlichkeitsschwelle |
 | `direct_marketing_degradation_ct_per_kwh` | `4.0` | Batteriekosten konservativ rechnen |
 | `direct_marketing_roundtrip_efficiency_pct` | `85.0` | Speicherverluste berücksichtigen |
 | `direct_marketing_safety_margin_ct_per_kwh` | `1.0` | Prognose-/Messrisiko puffern |
-| `direct_marketing_max_cycles_per_day` | `0.5` | zusätzliche Zyklen konservativ begrenzen |
+| `direct_marketing_max_cycles_per_day` | `0.5` | Degeneration im Test konservativ halten |
 
 ## Modi
 
@@ -154,32 +154,19 @@ Aktiver Owner:
   Verkaufsfenster. Er nutzt nur PV-Shift-Wirtschaftlichkeit, schützt Reserve und
   sperrt bei aktiver Wallbox.
 
-### Arbitrage
+### Netzstrom-Arbitrage
 
-Arbitrage ist standardmäßig gesperrt. Sie braucht immer:
+Netzstrom-Arbitrage ist in 5.4.0 nicht freigegeben. Die Preisrechnung darf
+weiterhin mögliche Kauf-/Verkaufsfenster diagnostisch bewerten, erzeugt daraus
+aber weder einen ausführbaren Owner noch einen Speicherbefehl. Ein möglicher
+Netzladeslot erscheint ausschließlich als Diagnosekandidat
+`arbitrage_grid_charge_candidate`; dieser Schlüssel ist keine Freigabe und darf
+niemals allein zu `selected`, `requested`, `issued` oder Hardwarewirkung führen.
 
-```text
-direct_marketing_mode = arbitrage
-direct_marketing_arbitrage_enable = 1
-direct_marketing_export_enable = 1
-direct_marketing_grid_charge_enable = 1
-```
-
-Zusätzlich muss die Wirtschaftlichkeit nach Gebühren, Degeneration,
-Wirkungsgrad und Sicherheitsmarge positiv sein.
-
-Arbitrage nutzt die strengere Netzbezugsrechnung `grid_profit_ok`. Nur wenn
-diese positiv ist, entstehen `arbitrage_grid_charge_candidate` und
-`arbitrage_export_candidate`.
-
-Aktive Owner:
-
-- `direct_marketing_arbitrage_grid_charge`: geschützter GRID-Owner für günstige
-  Netzladefenster.
-- `direct_marketing_arbitrage_export`: geschützter DISCH-Owner für teure
-  Verkaufsfenster.
-
-Beide Owner brauchen zusätzlich `direct_marketing_arbitrage_enable = 1`.
+Die früheren Konfigurationsfelder `direct_marketing_arbitrage_enable` und
+`direct_marketing_arbitrage_experimental_enable` bleiben beim Einlesen und
+Speichern erhalten, sind in 5.4.0 jedoch wirkungslos. Für die freigegebene
+Direktvermarktung stehen Safe, Eco und Eco+ zur Verfügung.
 
 ## Kein Verkauf bei Billigpreis
 
@@ -254,7 +241,7 @@ wenn Export nur knapp über dem Mindestwert liegt:
 ```
 
 Wichtig: `Home_Power` ist in diesem Pfad Diagnose- und Sicherheitsgröße, aber
-kein schneller Führungswert. Im laufenden Betrieb kann der abgeleitete Hausverbrauch
+kein schneller Führungswert. In Live-Tests kann der abgeleitete Hausverbrauch
 mit Batterie- und Netzpunktwerten mitschwingen. Würde der Regler diese Größe
 wattgenau verfolgen, entstünde ein 200-Watt-Pendel. Deshalb gilt:
 
@@ -265,6 +252,16 @@ wattgenau verfolgen, entstünde ein 200-Watt-Pendel. Deshalb gilt:
 - Der harte Sicherheitswächter bleibt aktiv: Wenn ein erzwungener DISCH-Wert bei
   echtem Netzbezug unter der lokalen Last liegt, fällt der Storage Manager auf
   AUTO zurück.
+
+Aktuelle interne Defaultwerte:
+
+| Key | Standard | Wirkung |
+|---|---:|---|
+| `direct_marketing_min_grid_export_w` | `100 W` | gewünschter Mindestexport im Verkaufsfenster |
+| `direct_marketing_netpoint_deadband_w` | `30 W` | Mess-/Totband gegen Kleinsignale |
+| `direct_marketing_netpoint_ramp_up_w` | `1000 W` | schnelle Erhöhung bei Netzbezug |
+| `direct_marketing_netpoint_ramp_down_w` | `100 W` | ruhige Rücknahme Richtung Basis |
+| `direct_marketing_netpoint_release_margin_w` | `80 W` | Rücknahme erst, wenn Export mindestens Mindestexport plus Margin erreicht |
 
 ## Gewinn-Hysterese laufender Verkaufsfenster
 
@@ -331,7 +328,7 @@ berechnet. Deshalb darf der Storage Manager profitable Hochpreisfenster weiter
 als echten Mehrerlös betrachten. Die EEG-Vergütung dient zusätzlich als
 Vergleichs- und Förderbasis für PV-förderfähige Einspeisung.
 
-Wichtig für die Regelung:
+Wichtig für die Architektur:
 
 - EEG-/Marktprämienwerte gelten nur für förderfähige PV-Einspeisung.
 - Beim PV-Speichern dient der gewichtete EEG-/Tarifwert als nachvollziehbare
@@ -344,9 +341,8 @@ Wichtig für die Regelung:
   Netzbetreiberfreigabe kann diese Betriebsweise Förderansprüche gefährden.
 - Nach Ende des Förderzeitraums fällt dieser EEG-Vergleich weg; dann zählt nur
   der echte Direktvermarktungserlös nach Kosten.
-- Gestaffelte Anlagen werden über kWp-Schwellen gewichtet. Vereinfachtes
-  Rechenbeispiel: `10 | 8,00` und `20 | 7,00` ergibt bei 15 kWp rund
-  7,67 ct/kWh.
+- Gestaffelte Anlagen werden über kWp-Schwellen gewichtet. Beispiel:
+  `10 | 8,16` und `15,4 | 7,93` ergibt bei 15,4 kWp rund 8,08 ct/kWh.
 - Die BNetzA-Archivtabellen von 01.01.2018 bis 31.07.2026 können anhand des
   Inbetriebnahmedatums automatisch übernommen werden. Der sichere Standard
   bleibt `manual`, damit Sondertarife und Netzbetreiber-Abrechnungen weiterhin
@@ -368,9 +364,10 @@ Eingebettete aktuelle BNetzA-Tabelle für Inbetriebnahmen vom 01.02.2026 bis
 | Marktprämie / anzulegender Wert | sonstige Anlage | Teil-/Volleinspeisung | bis 1000 kW: 6,66 |
 
 Für historische Inbetriebnahmen ab 01.01.2018 nutzt `bnetza_archive` die
-passende offizielle XLSX-Archivzeile. Die konkrete Vergütungsstaffel wird aus
-Inbetriebnahmedatum, Gebäude-/Freiflächenart, Einspeiseart und
-Vergütungsgrundlage bestimmt. Für ältere XLS/PDF-Zeiträume oder
+passende offizielle XLSX-Archivzeile. Beispiel: Inbetriebnahme 05.01.2021,
+Gebäude, Teileinspeisung, feste Einspeisevergütung ergibt die Stufen
+`10 | 8,16`, `40 | 7,93`, `100 | 6,22`, passend zur typischen
+Netzbetreiber-Abrechnung dieses Zeitraums. Für ältere XLS/PDF-Zeiträume oder
 Sonderfälle bleibt `Manuell / Sondertarif` vorgesehen. Das UI schreibt die
 gewählte Tabelle sichtbar in `direct_marketing_eeg_tariff_tiers`, damit die
 Rechengrundlage prüfbar bleibt.
@@ -439,7 +436,7 @@ Quellen:
 - Netztransparenz Marktwertübersicht als offizielle Monatswert-Referenz:
   https://www.netztransparenz.de/de-de/Erneuerbare-Energien-und-Umlagen/EEG/Transparenzanforderungen/Marktpr%C3%A4mie/Marktwert%C3%BCbersicht
 
-## Technische Grundlage und Betriebsregel
+## Technische Grundlage und Architekturregel
 
 Die Direktvermarktung folgt dem in Technik und Wissenschaft üblichen
 Arbitrage-Modell: Ertrag wird aus niedrigen und hohen Preiszeitpunkten unter
@@ -465,7 +462,7 @@ Quellen und Begründung:
   degradation-aware, also nicht als reine Preis-Spitzen-Jagd:
   https://www.research-collection.ethz.ch/server/api/core/bitstreams/9c1c5b69-56df-4c77-ae35-a016e4f63a2c/content
 
-Betriebsregel für E3DC-Control:
+Architekturregel für E3DC-Control:
 
 - Keine harte Speichergrößen-Sperre wie "Direktvermarktung erst ab X kWh".
 - `speichergroesse` begrenzt nur `available_export_kwh` und
@@ -473,9 +470,9 @@ Betriebsregel für E3DC-Control:
 - Wirtschaftlichkeit wird ausschließlich über Nettoerlös, Bezugskosten,
   Gebühren, Wirkungsgrad, Degeneration, Sicherheitsaufschlag,
   Mindestgewinn und Mindestmarge freigegeben.
-- `direct_marketing_min_window_profit_eur` bildet eine konfigurierbare
-  No-Trade-Zone für den erwarteten Gewinn des gesamten Verkaufsfensters und
-  ist keine versteckte Speichergrößenregel.
+- Eine spätere Euro-Schwelle wie `direct_marketing_min_window_profit_eur` darf
+  als konfigurierbare No-Trade-Zone ergänzt werden, aber nicht als versteckte
+  Speichergrößenregel.
 - Aktive Befehle bleiben an den Storage-Manager-Owner-Vertrag gebunden.
 
 ## Konfigurationsvariablen
@@ -484,21 +481,37 @@ Betriebsregel für E3DC-Control:
 |---|---:|---|
 | `direct_marketing_enable` | 0/1 | Harter Hauptschalter. `0` bedeutet: kein Plan, keine Befehle, kein Einfluss auf die bestehende Regelung. |
 | `direct_marketing_mode` | Text | Strategie: `safe`, `eco`, `eco_plus` oder `arbitrage`. Eco speichert PV ohne Batterieverkauf; Eco+ ergänzt wirtschaftlich geprüften Export. |
-| `direct_marketing_provider_name` | Text | Anzeigename des Direktvermarkters. |
+| `direct_marketing_provider_name` | Text | Anzeigename des Direktvermarkters, z.B. Luox Energy oder Shadow-Test. |
 | `direct_marketing_settlement_basis` | Text | Abrechnungsbasis: Day-Ahead 15 min, Stundenindex, Intraday, Monatsmarktwert oder eigener Vertragsindex. |
 | `direct_marketing_revenue_offset_ct` | ct/kWh | Fester Auf- oder Abschlag auf den Börsenpreis vor Gebühren. |
 | `direct_marketing_fee_ct_per_kwh` | ct/kWh | Feste Direktvermarktergebühr je verkaufter kWh. |
-| `direct_marketing_fee_pct` | % | Variable Gebühr auf positiven Bruttoerlös. |
+| `direct_marketing_fee_pct` | % | Variable Gebühr auf die separat konfigurierte Vertragsbasis. |
+| `direct_marketing_monthly_fee_eur` | €/Monat | Grundgebühr. Sie beeinflusst die Kurve nicht slotweise, gehört aber in die spätere Tages-/Monatswirtschaftlichkeit. |
+| `direct_marketing_variable_fee_basis` | Text | `sell_revenue`, `eeg_compensation` oder `manual`. Eine unvollständige aktive EEG-/manuelle Basis blockiert Befehle. |
+| `direct_marketing_variable_fee_basis_ct_per_kwh` | ct/kWh | Manuelle Vertragsbasis der prozentualen Gebühr. Nur bei `manual` wirksam. |
+| `direct_marketing_service_vat_pct` | % | USt. auf Dienstleistungs-, variable und Ausgleichskosten, Standard 19 %. |
+| `direct_marketing_input_vat_recoverable` | 0/1 | `1` nur bei tatsächlich möglichem Vorsteuerabzug. Standard `0` rechnet USt. konservativ als Kosten. Keine Steuerberatung. |
+| `direct_marketing_installed_kwp` | kWp | Abrechnungsleistung für Ausgleichskosten. `0` nutzt die Summe der PV-Prognoseanlagen. |
+| `direct_marketing_balancing_cost_eur_per_kwp_month` | €/kWp/Monat | Aktueller Abschlag/Schätzwert der Ausgleichskosten. Nur Monatsabrechnung, keine Slot-Umsortierung. |
+| `direct_marketing_balancing_cost_actual_eur_per_kwp_month` | €/kWp/Monat | Nachträglich abgerechneter Ist-Wert für Diagnose und Abgleich. |
 | `direct_marketing_min_margin_pct` | % | Mindestmarge auf die jeweilige Kosten-/Opportunitätsbasis. Grenzwerte können wegen Rundung in der Anzeige um 0,1 Prozentpunkt wirken. |
 | `direct_marketing_min_profit_ct_per_kwh` | ct/kWh | Absolute Mindestspanne. `0` bedeutet: nur die Prozentmarge entscheidet. |
+| `direct_marketing_min_window_profit_eur` | €/Fenster | Absoluter Mindestgewinn im Standardprofil, Standard `0,25 €`. |
+| `direct_marketing_min_export_energy_kwh` | kWh/Fenster | Mindestenergie im Standardprofil, Standard `1,5 kWh`. |
+| `direct_marketing_min_export_window_min` | min | Technisches Hardgate für einen neuen Verkauf, Standard 15 Minuten. |
+| `direct_marketing_preferred_export_plateau_min` | min | Weiche Laufruhepräferenz, Standard 60 Minuten; verbietet kein profitables 15-Minuten-Produkt. |
+| `direct_marketing_price_plateau_tolerance_ct` | ct/kWh | Maximaler Preisabstand für ein gemeinsames, gleichmäßig gefahrenes Plateau. |
+| `direct_marketing_max_daily_export_kwh` | kWh/Tag | Zusätzliches Tagesexportlimit; `0` nutzt das Zyklenlimit. |
+| `direct_marketing_deep_cycle_threshold_pct` | %-Punkte | Entladetiefe, ab der zusätzlicher Tiefentlade-LCOS beginnt. |
+| `direct_marketing_deep_cycle_lcos_factor` | Faktor | Stärke des zusätzlichen Tiefentlade-LCOS. |
 | `direct_marketing_profit_hold_ct_per_kwh` | ct/kWh | Halteband für bereits aktive Eco+-Verkaufsfenster. Neue Fenster starten weiterhin streng. |
 | `direct_marketing_margin_hold_pct` | %-Punkte | Margen-Halteband für bereits aktive Eco+-Verkaufsfenster. |
 | `direct_marketing_degradation_ct_per_kwh` | ct/kWh | Angenommene Batteriealterungs-/Zykluskosten je umgesetzter kWh. |
 | `direct_marketing_roundtrip_efficiency_pct` | % | Speicherwirkungsgrad für Laden plus Entladen. |
 | `direct_marketing_safety_margin_ct_per_kwh` | ct/kWh | Sicherheitsaufschlag gegen Preis-, Prognose- und Messfehler. |
 | `direct_marketing_export_enable` | 0/1 | Erlaubt aktive Batterieeinspeisung im Direktvermarktungszweig. |
-| `direct_marketing_grid_charge_enable` | 0/1 | Erlaubt Netzladen für Arbitrage. Ohne positive Wirtschaftlichkeitsrechnung bleibt es trotzdem aus. |
-| `direct_marketing_arbitrage_enable` | 0/1 | Zusätzlicher Scharfschalter für Arbitrage. |
+| `direct_marketing_grid_charge_enable` | 0/1 | Für 5.4.0 ohne Hardwarewirkung; Netzstrom-Arbitrage ist nicht freigegeben. |
+| `direct_marketing_arbitrage_enable` / `direct_marketing_arbitrage_experimental_enable` | 0/1 | Kompatible Altwerte; werden erhalten, bleiben in 5.4.0 aber wirkungslos. |
 | `direct_marketing_pv_store_enable` | 0/1 | Erlaubt Eco+, PV-Überschuss in niedrigen Nettoerlösfenstern aktiv zu speichern. Standard `1`, aber ohne Hauptschalter wirkungslos. |
 | `direct_marketing_pv_store_threshold_ct` | ct/kWh | Optionale Nettoerlös-Schwelle für PV-Speichern. Leer = EEG-/Tarifwert, wenn berechenbar, sonst EcoScore. |
 | `direct_marketing_pv_store_max_w` | W | Maximale PV-Speicherladeleistung. `0` bedeutet System-Ladelimit und realen PV-Überschuss nutzen. |
@@ -511,7 +524,8 @@ Betriebsregel für E3DC-Control:
 | `direct_marketing_pv_store_export_limit_guard_w` | W | Toleranz über dem DV-Exportlimit, bevor PV-Speichern die Laderampe beschleunigen darf. Standard `100 W`. |
 | `direct_marketing_pv_store_export_limit_ramp_bypass_w` | W | Restexport-Schwelle, ab der Exportlimit-0-Fenster die normale PV-Laderampe übersteuern dürfen. Standard `300 W`. |
 | `direct_marketing_price_max_age_s` | s | Optionales Maximalalter, wenn die Preisquelle ein Alter liefert. `0` nutzt nur explizite Stale-Markierungen. |
-| `direct_marketing_max_export_w` | W | Basis-Entladung im Verkaufsfenster. Der Netzpunktwächter darf darüber erhöhen, wenn sonst Netzbezug entsteht. |
+| `direct_marketing_v2x_discharge_enable` | 0/1 | Reserviert für spätere Auto-/V2X-Entladung. Aktuell ohne aktive Befehle. |
+| `direct_marketing_max_export_w` | W | Harte Obergrenze der Batterieentladung im Verkaufsfenster. Lokale Wächter dürfen nur drosseln, niemals über das Policy-Budget erhöhen. |
 | `direct_marketing_min_grid_export_w` | W | Mindest-Netzeinspeisung im aktiven Verkaufsfenster. Standard `100 W`; `0` deaktiviert den Netzpunkt-Puffer. |
 | `direct_marketing_max_grid_charge_w` | W | Maximale Netzladeleistung im Arbitrage-Zweig. |
 | `direct_marketing_max_cycles_per_day` | Zyklen/Tag | Tageslimit für zusätzliche Direktvermarktungs-Zyklen. |
@@ -545,17 +559,18 @@ Betriebsregel für E3DC-Control:
 | `direct_marketing_eeg_system_type` | Typ | `building` für Gebäude/Lärmschutzwand oder `other` für sonstige Anlagen. |
 | `direct_marketing_eeg_feed_type` | Typ | `partial` für Teileinspeisung oder `full` für Volleinspeisung. |
 | `direct_marketing_eeg_compensation_basis` | Basis | `feed_in_tariff` für feste Einspeisevergütung oder `market_premium` für anzulegenden Wert/Marktprämie. |
-| `direct_marketing_eeg_tariff_tiers` | kWp/ct | Vergütungsstufen, eine Zeile pro Stufe; vereinfachtes Formatbeispiel: `10 | 8,00`, `20 | 7,00`. |
+| `direct_marketing_eeg_tariff_tiers` | kWp/ct | Vergütungsstufen, eine Zeile pro Stufe: `10 | 8,16`, `15,4 | 7,93`. |
 | `direct_marketing_eeg_grid_export_risk_ack` | 0/1 | Explizite Bestätigung, dass Netzladen mit späterer Einspeisung bei einer EEG-Anlage vertraglich/messkonzeptionell erlaubt ist. Ohne diese Bestätigung bleiben Arbitrage-Befehle blockiert. |
 
 ### Zusatz-WR-Schützschutz
 
-Der Dashboard-Button schreibt nur den persistenten Sperrwunsch
-`data/direct_marketing_aux_inverter_shelly_manual_lock.json`. Ausschließlich der Storage
-Manager übersetzt ihn unter Beachtung der konfigurierten NC-/NO-Logik in einen
-Shelly-RPC-Befehl. Jede erfolgreiche Relaisänderung schreibt einmalig
-`data/direct_marketing_aux_inverter_shelly_guard_state.json` und startet damit eine auch
-über Dienst- und Hostneustarts erhaltene Sperrzeit von 600 Sekunden. Nur eine
+Der Dashboard-Button schreibt nur den persistenten Sperrwunsch in den kanonischen
+Zusatz-WR-Zustand. Ausschließlich der Storage Manager übersetzt ihn unter
+Beachtung der konfigurierten NC-/NO-Logik in einen Shelly-RPC-Befehl. Jede
+erfolgreiche Relaisänderung aktualisiert den kanonischen Schutzstatus und startet
+damit eine auch über Dienst- und Hostneustarts erhaltene Sperrzeit von 600
+Sekunden. Bestehende Installationen mit älteren Schlüsseln und Zuständen werden
+beim Update automatisch gespiegelt beziehungsweise migriert. Nur eine
 neue manuelle Sperre darf diese Zeit in
 Richtung `desired_wr_on = false` übergehen; das Aufheben der Sperre wartet den
 Schützschutz ab.
@@ -576,9 +591,15 @@ Die Config-Vorschau nutzt für Direktvermarktung den verfügbaren Marktpreis-Hor
 
 ```text
 gross_sell_ct = market_price_ct + direct_marketing_revenue_offset_ct
-variable_fee_ct = max(0, gross_sell_ct) * direct_marketing_fee_pct / 100
-net_sell_ct = gross_sell_ct - direct_marketing_fee_ct_per_kwh - variable_fee_ct
+variable_fee_net_ct = variable_fee_basis_ct * direct_marketing_fee_pct / 100
+vat_multiplier = 1 oder (1 + direct_marketing_service_vat_pct / 100)
+fee_cost_ct = (direct_marketing_fee_ct_per_kwh + variable_fee_net_ct) * vat_multiplier
+net_sell_ct = gross_sell_ct - fee_cost_ct
 ```
+
+Der USt.-Multiplikator ist nur bei nicht abziehbarer Vorsteuer größer als 1.
+Monatliche Grundgebühr und Ausgleichskosten werden separat ausgewiesen und
+ändern `net_sell_ct` nicht.
 
 `net_sell_ct` ist die weiße Nettoerlöskurve in der Vorschau. Sie ist die
 Sortiergröße für knappe Verkaufsenergie: Wenn die Reserve nur für einen Teil der
@@ -648,7 +669,7 @@ billigen Fenster. Netzbezug spielt in dieser Variante keine Rolle.
 
 ```text
 pv_shift_revenue_ct = best_high_net_sell_ct * efficiency
-pv_shift_opportunity_ct = best_low_net_sell_ct + fixed_fee_ct
+pv_shift_opportunity_ct = max(best_low_net_sell_ct, best_low_gross_sell_ct)
 pv_shift_cost_basis_ct = abs(pv_shift_opportunity_ct)
                        + direct_marketing_degradation_ct_per_kwh
                        + direct_marketing_safety_margin_ct_per_kwh
@@ -659,10 +680,9 @@ pv_shift_spread_ct = pv_shift_revenue_ct
 pv_shift_margin_pct = pv_shift_spread_ct / max(1, pv_shift_cost_basis_ct) * 100
 ```
 
-Die feste Direktvermarktergebühr wird beim billigen Opportunitätswert wieder
-addiert, weil dieselbe kWh nur einmal verkauft wird. Eine höhere feste Gebühr
-reduziert dadurch den späteren Nettoerlös, macht den billigen Nicht-Verkauf aber
-nicht künstlich wertvoller.
+Vermiedene Direktvermarktergebühren werden konservativ nicht als zusätzlicher
+Batteriegewinn gutgeschrieben. Eine höhere Gebühr darf deshalb keinen weiteren
+Zyklus scheinbar attraktiver machen.
 
 Eco+ darf verkaufen, wenn gilt:
 
@@ -688,9 +708,8 @@ grid_margin_pct = grid_spread_ct
                 * 100
 ```
 
-Arbitrage darf nur aktiv werden, wenn Hauptschalter, Export, Netzladen und
-zusätzliche Arbitrage-Sicherheitsfreigabe aktiv sind und `grid_spread_ct` sowie
-`grid_margin_pct` die Mindestwerte erreichen.
+Die Kennzahlen bleiben Diagnosewerte. Sie können in 5.4.0 keine
+Netzlade- oder Arbitrage-Exportfreigabe erzeugen.
 
 ### Reserve, Zyklen und Fensterpriorität
 
@@ -713,6 +732,18 @@ in das spätere Exportbudget eingehen. Danach werden alle Verkaufs-Slots nach
 `net_sell_ct` sortiert. Teurere Slots gewinnen, auch wenn sie später liegen.
 Nicht mehr bedienbare Slots werden in der Vorschau als Hausversorgung bzw.
 reservebegrenzt markiert.
+
+## Beobachtung im Shadow-Test
+
+Nach neuen EPEX-Werten prüfen:
+
+1. Gibt es nur Fenster mit echten Preis-/EcoScore-Daten?
+2. Sind mittägliche günstige Fenster als `keep_headroom` sichtbar?
+3. Sind teure Abendfenster als `safe_house_supply` sichtbar?
+4. Bleibt `commands_allowed = false` im Safe-Modus?
+5. Wird `commands_allowed = true` nur bei Eco+/Arbitrage mit gültiger Marge,
+   passenden Freigaben und aktuellem Fenster?
+6. Zeigt der Storage Manager weiter normale Kurvenführung?
 
 ## Live-Dateien
 
@@ -805,5 +836,5 @@ Bei aktiver Steuerung schreibt der Storage Manager zusätzlich:
 - `direct_marketing_pv_store_dc_surplus_w`,
 - `direct_marketing_window`.
 
-Der Entscheidungsverlauf setzt `control_owner = direct_marketing`, sobald einer
-der aktiven Owner den Zyklus besitzt.
+Der Decision-Verlauf setzt `control_owner = direct_marketing`, sobald einer der
+aktiven Owner den Zyklus besitzt.

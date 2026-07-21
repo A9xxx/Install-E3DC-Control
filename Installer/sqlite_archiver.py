@@ -6,6 +6,7 @@ import sqlite3
 import os
 import datetime
 import sys
+from pathlib import Path
 
 # Standard-Ausgabe auf UTF-8 erzwingen (verhindert UnicodeEncodeError z.B. bei cron oder SSH ohne Locale)
 try:
@@ -44,11 +45,11 @@ def keep_integrated_pv_total_for_external_ac(integrated_pv_kwh, integrated_dc_kw
     return abs(integrated_dc - exact) <= max(5.0, exact * 0.20)
 
 def get_install_path():
-    try:
-        with open('/var/www/html/e3dc_paths.json', 'r') as f:
-            return json.load(f).get('install_path', '/home/pi/Install')
-    except:
-        return '/home/pi/Install'
+    root = Path(__file__).resolve().parent.parent
+    markers = (root / "VERSION", root / "installer_main.py", root / "Installer")
+    if not all(marker.exists() for marker in markers):
+        raise RuntimeError("SQLite-Archiv: Release-Root ist nicht eindeutig aufloesbar")
+    return str(root)
 
 def init_db():
     os.makedirs(DB_DIR, exist_ok=True)
@@ -71,14 +72,14 @@ def init_db():
             self_con REAL
         )
     ''')
-    
+
     # Automatische Migration: Neue Spalten hinzufügen
     for col in ['cost_total', 'cost_home', 'cost_bat', 'cost_wb', 'cost_wp', 'wb2_consumption', 'cost_wb2', 'climate_consumption', 'cost_climate', 'pv_balance_rest', 'bat_balance_rest', 'balance_unknown_rest', 'saved_u', 'saved_td', 'saved_wb', 'pv_e3dc', 'pv_external', 'pv_source_rest', 'pv_grid', 'bat_grid']:
         try:
             cursor.execute(f"ALTER TABLE daily_stats ADD COLUMN {col} REAL DEFAULT 0")
         except sqlite3.OperationalError:
             pass # Spalte existiert bereits, alles gut!
-            
+
     # Tabelle für Machine Learning Trainingsdaten (15-Minuten Raster aus Ertrag.X.txt)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS ml_training_data (
@@ -184,7 +185,7 @@ def archive_today():
     # Autarkie-Fallback: Falls E3DC keinen Wert meldet, selbst berechnen
     if autarky == 0.0 and home_consumption > 0.1:
         autarky = round(max(0.0, min(100.0, (1 - grid_in / home_consumption) * 100)), 1)
-    
+
     # Reale Kosten erfassen
     cost_total = float(costs.get('total', 0.0) or 0.0)
     cost_home = float(costs.get('home', 0.0) or 0.0)
@@ -734,11 +735,11 @@ def import_ertrag_file(filepath, file_date, cursor):
     try:
         with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
             lines = f.readlines()
-            
+
         for line in lines:
-            if "Day Prognose" in line or "30Tage" in line or "Zeit Stat" in line: 
+            if "Day Prognose" in line or "30Tage" in line or "Zeit Stat" in line:
                 continue
-                
+
             parts = line.split()
             if len(parts) >= 14 and parts[4] == '/' and parts[8] == '/':
                 try:
@@ -749,9 +750,9 @@ def import_ertrag_file(filepath, file_date, cursor):
                     wp_kwh_cum = float(parts[10])
                     temp_c = float(parts[11].replace('°', ''))
                     grid_kwh_cum = float(parts[13])
-                    
+
                     record_id = f"{file_date.isoformat()}_{time_gmt:.2f}"
-                    
+
                     cursor.execute('''
                         INSERT OR REPLACE INTO ml_training_data
                         (id, date, time_gmt, pv_prog_pct, pv_real_pct, home_kwh_cum, wp_kwh_cum, temp_c, grid_kwh_cum)
@@ -766,9 +767,9 @@ def archive_ml_data():
     """Liest die Ertrag.X.txt Datei des heutigen Tages."""
     today = datetime.date.today()
     ertrag_file = os.path.join(get_install_path(), f"Ertrag.{today.day}.txt")
-    
+
     if not os.path.exists(ertrag_file): return
-        
+
     conn = init_db()
     cursor = conn.cursor()
     import_ertrag_file(ertrag_file, today, cursor)
@@ -782,7 +783,7 @@ def backfill_ml_data():
     cursor = conn.cursor()
     today = datetime.date.today()
     total_count = 0
-    
+
     for i in range(1, 32):
         ertrag_file = os.path.join(install_path, f"Ertrag.{i}.txt")
         if os.path.exists(ertrag_file):
@@ -797,12 +798,12 @@ def backfill_ml_data():
             except ValueError:
                 mtime = os.path.getmtime(ertrag_file)
                 file_date = datetime.date.fromtimestamp(mtime)
-                
+
             added = import_ertrag_file(ertrag_file, file_date, cursor)
             if added > 0:
                 print(f"✓ {os.path.basename(ertrag_file)} importiert ({file_date.isoformat()}) -> {added} Einträge")
             total_count += added
-            
+
     conn.commit()
     conn.close()
     print(f"\nBackfill erfolgreich! Insgesamt {total_count} 15-Minuten-Datensätze geladen.")

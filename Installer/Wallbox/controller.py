@@ -58,7 +58,8 @@ def _status_running(status):
 
 
 def allocate_power(available_watts, chargers_status, mode, max_amp,
-                   wb_charge_mode, price_optimizing_active=False):
+                   wb_charge_mode, price_optimizing_active=False,
+                   max_amp_by_id=None, fairness_weight_by_id=None):
     """
     Verteilt 'available_watts' auf alle verbundenen Wallboxen.
 
@@ -70,11 +71,17 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
     wb_charge_mode[id]: oeffentlicher WB-Modus 0/2/3/4/5/12 (Legacy-Werte werden normalisiert)
     price_optimizing_active: True oder Ladepunkt-IDs -> Sofortladen bevorzugt
 
-    Gibt dict { wb_id: {'target_amp': int, 'state': int (1=Stop, 2=An)} } zurueck.
+    ``max_amp_by_id`` bindet EVSE-, Kabel- und Fahrzeuggrenzen je Ladepunkt.
+    Im ausgeglichenen Modus wird nach Leistung statt nach einer physikalisch
+    bedeutungslosen Summe aus ein- und dreiphasigen Amperewerten verteilt.
+
+    Gibt dict { wb_id: {'target_amp': int, 'state': int (1=Stop, 2=An)} } zurück.
     """
     alloc = {}
-    remaining_watts = available_watts
+    remaining_watts = max(0.0, float(available_watts or 0.0))
     active_chargers = []
+    per_charger_limits = max_amp_by_id if isinstance(max_amp_by_id, dict) else {}
+    fairness_weights = fairness_weight_by_id if isinstance(fairness_weight_by_id, dict) else {}
 
     # --- Phase 1: Sofortladen / Ladekorridor Vorab-Zuteilung -----------------
     for c in chargers_status:
@@ -102,7 +109,16 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
         phases    = 3 if pha == 56 else (1 if pha in [8, 16, 32] else 3)
         w_per_amp = 230.0 * phases
         min_w     = 6 * w_per_amp
-        max_w     = max_amp * w_per_amp
+        try:
+            charger_max_amp = int(per_charger_limits.get(c_id, max_amp) or max_amp)
+        except (TypeError, ValueError):
+            charger_max_amp = int(max_amp)
+        charger_max_amp = max(0, min(int(max_amp), charger_max_amp))
+        max_w     = charger_max_amp * w_per_amp
+        try:
+            fairness_weight = max(0.01, float(fairness_weights.get(c_id, 1.0) or 1.0))
+        except (TypeError, ValueError):
+            fairness_weight = 1.0
 
         # Zeitplan aktiv -> immer Sofortladen (ueberschreibt c_mode)
         if local_price_optimizing_active:
@@ -110,9 +126,12 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
 
         if behavior == 'instant':
             # Sofort mit Max-Strom laden (Netz-Bezug in Kauf nehmen)
-            alloc[c_id] = {'target_amp': max_amp, 'state': 2}
+            alloc[c_id] = {
+                'target_amp': charger_max_amp,
+                'state': 2,
+            }
             remaining_watts -= max_w
-            logger.debug(f"WB{c_id} Sofortladen ({c_mode=}): {max_amp}A")
+            logger.debug(f"WB{c_id} Sofortladen ({c_mode=}): {charger_max_amp}A")
 
         elif behavior == 'corridor':
             # Mindest-Amp (6A) immer zuteilen, Rest aus Ueberschuss
@@ -125,6 +144,8 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
                 'w_per_amp':     w_per_amp,
                 'min_w':         min_w,
                 'max_w':         max_w,
+                'max_amp':       charger_max_amp,
+                'fairness_weight': fairness_weight,
                 'mode':          c_mode,
                 'allocated_amp': allocated_amp,
                 'state':         2,  # Immer AN (Mindest-Ladestrom sicherstellen)
@@ -141,6 +162,8 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
                 'w_per_amp':     w_per_amp,
                 'min_w':         min_w,
                 'max_w':         max_w,
+                'max_amp':       charger_max_amp,
+                'fairness_weight': fairness_weight,
                 'mode':          c_mode,
                 'allocated_amp': 0,
                 'state':         1,  # Default: Stop, wird in Phase 2 gesetzt
@@ -165,15 +188,28 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
                 c['allocated_amp'] = 6
                 c['state'] = 2
 
+        # Progressive Füllung nach zugeteilter Wirkleistung. Damit sind z. B.
+        # 16 A einphasig und 6 A dreiphasig annähernd energiefair, während
+        # 16 A + 16 A dies nicht wären. Ein optionales Gewicht bildet später
+        # Deadline-/Energieschuld ab, ohne die Safety-Caps zu verändern.
         while remaining_watts > 0:
-            allocated_any = False
-            for c in active_chargers:
-                if c['state'] == 2 and c['allocated_amp'] < max_amp and remaining_watts >= c['w_per_amp']:
-                    c['allocated_amp'] += 1
-                    remaining_watts    -= c['w_per_amp']
-                    allocated_any = True
-            if not allocated_any:
+            candidates = [
+                c for c in active_chargers
+                if c['state'] == 2
+                and c['allocated_amp'] < c['max_amp']
+                and remaining_watts >= c['w_per_amp']
+            ]
+            if not candidates:
                 break
+            chosen = min(
+                candidates,
+                key=lambda c: (
+                    (c['allocated_amp'] * c['w_per_amp']) / c['fairness_weight'],
+                    c['id'],
+                ),
+            )
+            chosen['allocated_amp'] += 1
+            remaining_watts -= chosen['w_per_amp']
     else:
         # Prioritaet: die gewaehlte Box bekommt zuerst Mindeststrom und den
         # ersten Extra-Ampere je Runde. Sobald das Budget fuer weitere
@@ -219,7 +255,7 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
         while remaining_watts > 0:
             allocated_any = False
             for c in active_chargers:
-                if c['state'] == 2 and c['allocated_amp'] < max_amp and remaining_watts >= c['w_per_amp']:
+                if c['state'] == 2 and c['allocated_amp'] < c['max_amp'] and remaining_watts >= c['w_per_amp']:
                     c['allocated_amp'] += 1
                     remaining_watts -= c['w_per_amp']
                     allocated_any = True
@@ -227,7 +263,10 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
                 break
 
     for c in active_chargers:
-        alloc[c['id']] = {'target_amp': c['allocated_amp'], 'state': c['state']}
+        alloc[c['id']] = {
+            'target_amp': c['allocated_amp'],
+            'state': c['state'],
+        }
 
     return alloc
 

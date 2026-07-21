@@ -1,11 +1,11 @@
 # Update-Prozess
 
-Updates werden ausschliesslich über den Installer ausgeführt. Ein manuelles
+Updates werden ausschließlich über den Installer ausgeführt. Ein manuelles
 `git pull --ff-only` ist für den einmaligen Wechsel auf die bereinigte
 Release-Historie ungeeignet, weil alter und neuer Git-Stand nicht miteinander
-verwandt sein muessen.
+verwandt sein müssen.
 
-Die Konsolenbeispiele verwenden den zuvor geprueften absoluten Produktpfad:
+Die Konsolenbeispiele verwenden den zuvor geprüften absoluten Produktpfad:
 
 ```bash
 export E3DC_INSTALL_PATH="/absoluter/pfad/zur/installation"
@@ -14,8 +14,8 @@ test -f "$E3DC_INSTALL_PATH/e3dc-setup"
 
 ## Normales Update
 
-Der bevorzugte Weg ist der Update-Button der Weboberflaeche. Auf der Konsole
-steht derselbe Installer-Pfad zur Verfuegung:
+Der bevorzugte Weg ist der Update-Button der Weboberfläche. Auf der Konsole
+steht derselbe Installer-Pfad zur Verfügung:
 
 ```bash
 bash "$E3DC_INSTALL_PATH/e3dc-setup" --check
@@ -31,9 +31,9 @@ bash "$E3DC_INSTALL_PATH/e3dc-setup" --check
 
 ## Einmaliger Wechsel von alten Installationen
 
-Der Bootstrap gilt auch für V4.0.1 bis V4.0.5 sowie für V3-/ZIP-Staende ohne
-`.git`. Lade das veroeffentlichte Release-Archiv in ein temporaeres Verzeichnis
-und pruefe dessen veroeffentlichte SHA-256. Notiere ausserdem den vollstaendigen
+Der Bootstrap gilt auch für V4.0.1 bis V4.0.5 sowie für V3-/ZIP-Stände ohne
+`.git`. Lade das veröffentlichte Release-Archiv in ein temporäres Verzeichnis
+und prüfe dessen veröffentlichte SHA-256. Notiere außerdem den vollständigen
 40-stelligen Commit-SHA und die bestehende HA-/Shadow-Rolle (`off`, `master`,
 `slave` oder `shadow`).
 
@@ -47,23 +47,23 @@ und pruefe dessen veroeffentlichte SHA-256. Notiere ausserdem den vollstaendigen
 
 Tag, SHA und Rolle werden durch die auf der Release-Seite freigegebenen Werte
 und die zuvor geprüfte Rolle ersetzt. Der Launcher verlangt Python 3.10 oder
-neuer und beendet sich bei einer aelteren Laufzeit, bevor der Zielbaum
-veraendert wird. Bei einer V3-Installation kann der absolute Zielpfad zum
+neuer und beendet sich bei einer älteren Laufzeit, bevor der Zielbaum
+verändert wird. Bei einer V3-Installation kann der absolute Zielpfad zum
 Beispiel `$HOME/E3DC-Control` sein.
 
-Der Bootstrap akzeptiert nur einen annotierten Tag, dessen aufgeloester Commit
-exakt dem angegebenen SHA entspricht. Er sichert zuerst den tatsaechlichen
-Zielbaum. Erst nach Manifest- und Pruefsummengate werden Git initialisiert und
+Der Bootstrap akzeptiert nur einen annotierten Tag, dessen aufgelöster Commit
+exakt dem angegebenen SHA entspricht. Er sichert zuerst den tatsächlichen
+Zielbaum. Erst nach Manifest- und Prüfsummengate werden Git initialisiert und
 der neue Release-Stand eingespielt. Ein vorhandener alter Git-Verlauf muss
 keinen gemeinsamen Vorfahren mit dem neuen Verlauf besitzen.
 
 ## Harte Gates
 
-Der Installer fuehrt den Wechsel in dieser Reihenfolge aus:
+Der Installer führt den Wechsel in dieser Reihenfolge aus:
 
-1. externes Backup mit vollstaendigem Manifest und SHA-256 erstellen;
+1. externes Backup mit vollständigem Manifest und SHA-256 erstellen;
 2. alle katalogisierten Writer-/Integrationsdienste und den Watchdog stoppen;
-3. annotierten Ziel-Tag und vollstaendigen Ziel-SHA gegen manuelle Freigabe
+3. annotierten Ziel-Tag und vollständigen Ziel-SHA gegen manuelle Freigabe
    beziehungsweise die Rollback-Policy binden;
 4. `UPDATE_POLICY.json` direkt aus dem verifizierten Commit-Objekt lesen;
 5. den Installationsbaum auf genau diesen SHA setzen und `HEAD` erneut prüfen;
@@ -73,17 +73,18 @@ Der Installer fuehrt den Wechsel in dieser Reihenfolge aus:
    Dienste, lokale HTTP-Endpunkte und Boot-Sanity hart prüfen.
 
 Scheitert ein Gate nach einer Änderung, setzt der Installer den alten Git-Stand
-zurueck, entfernt bei einem ZIP-Bootstrap die neu angelegte `.git`-Struktur,
-stellt das Sicherheits-Backup wieder her und prueft Rolle, Dienste und HTTP
-erneut. Ist diese Wiederherstellung nicht vollstaendig beweisbar, bleiben die
+zurück, entfernt bei einem ZIP-Bootstrap die neu angelegte `.git`-Struktur,
+stellt das Sicherheits-Backup wieder her und prüft Rolle, Dienste und HTTP
+erneut. Ist diese Wiederherstellung nicht vollständig beweisbar, bleiben die
 Writer-/Aktor-Dienste gestoppt.
 
 ## Gezielter Rückfall
 
-Der bereinigte Stand `v5.3.2b` ist selbst der Rollback-Root und gibt keinen
-älteren öffentlichen Tag frei. Ein späterer Stable-Stand darf `v5.3.2b` als
-einzigen Rollback anbieten. Freie Commit-Hashes sind nie Rückfallversionen;
-jeder angebotene Tag ist in der Policy an genau einen SHA gebunden.
+`v5.4.0` bietet als einzigen öffentlichen Rollback den bereinigten Root
+`v5.3.2b` an. Dieser Root gibt selbst keinen älteren öffentlichen Tag frei.
+Freie Commit-Hashes sind keine Rückfallversionen; der angebotene Tag ist in der
+Policy an genau einen SHA gebunden. Weitere öffentliche Rückfall-Tags werden
+nicht angeboten.
 
 ## Docker-Update
 
@@ -95,6 +96,6 @@ docker compose up -d --force-recreate
 docker compose ps
 ```
 
-Ein Docker-Rückfall verwendet ausschliesslich einen freigegebenen Image-Tag
+Ein Docker-Rückfall verwendet ausschließlich einen freigegebenen Image-Tag
 beziehungsweise den verifizierten Digest. Der Container steuert den Host-Docker
 nicht selbst.

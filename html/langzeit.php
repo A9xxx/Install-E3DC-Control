@@ -7,7 +7,7 @@ if (!headers_sent()) {
 $dbPath = '/var/www/html/data/e3dc_stats.db';
 require_once __DIR__ . '/eeg_tariff_tables.php';
 
-// --- AJAX Handler fuer Statistik-Editor ---
+// --- AJAX Handler für Statistik-Editor ---
 if (isset($_GET['ajax']) && $_GET['ajax'] == '1') {
     header('Content-Type: application/json; charset=utf-8');
     header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
@@ -21,7 +21,7 @@ if (isset($_GET['ajax']) && $_GET['ajax'] == '1') {
     e3dcRequireCsrfToken(true);
     $action = $_POST['action'] ?? 'save';
     $date = $_POST['date'] ?? null;
-    
+
     if (!$date) {
         echo json_encode(['success' => false, 'error' => 'Kein Datum angegeben.']);
         exit;
@@ -32,7 +32,7 @@ if (isset($_GET['ajax']) && $_GET['ajax'] == '1') {
     } else {
         $res = saveDailyStats($date, $_POST, 'save');
     }
-    
+
     echo json_encode(['success' => (bool)$res]);
     exit;
 }
@@ -309,14 +309,14 @@ if (file_exists($dbPath)) {
     try {
         $db = new PDO('sqlite:' . $dbPath);
         $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-        
+
         // --- Auto-Migration: Neue Kosten-Spalten anlegen falls sie fehlen ---
         $newCols = ['cost_total', 'cost_home', 'cost_bat', 'cost_wb', 'cost_wp', 'wb2_consumption', 'cost_wb2', 'climate_consumption', 'cost_climate', 'pv_balance_rest', 'bat_balance_rest', 'balance_unknown_rest', 'saved_u', 'saved_td', 'saved_wb', 'pv_e3dc', 'pv_external', 'pv_source_rest', 'pv_grid', 'bat_grid'];
         foreach ($newCols as $col) {
             try { $db->exec("ALTER TABLE daily_stats ADD COLUMN $col REAL DEFAULT 0"); } catch (Exception $e) { }
         }
-        
-        // --- Auto-Migration: Index fuer massive Beschleunigung der Langzeit-Statistiken ---
+
+// --- Auto-Migration: Index für massive Beschleunigung der Langzeit-Statistiken ---
         try {
             $db->exec("CREATE INDEX IF NOT EXISTS idx_ml_date ON ml_training_data(date)");
             $db->exec("CREATE INDEX IF NOT EXISTS idx_ds_date ON daily_stats(date DESC)");
@@ -325,9 +325,9 @@ if (file_exists($dbPath)) {
         $cutoffDate = date('Y-m-d', strtotime('-35 days'));
         $realCostDayExpr = "(ABS(COALESCE(d.cost_total, 0)) > 0.0001 OR ABS(COALESCE(d.cost_home, 0)) > 0.0001 OR ABS(COALESCE(d.cost_wb, 0)) > 0.0001 OR ABS(COALESCE(d.cost_wb2, 0)) > 0.0001 OR ABS(COALESCE(d.cost_wp, 0)) > 0.0001 OR ABS(COALESCE(d.cost_climate, 0)) > 0.0001)";
         $realCostAggExpr = "(ABS(COALESCE(cost_total, 0)) > 0.0001 OR ABS(COALESCE(cost_home, 0)) > 0.0001 OR ABS(COALESCE(cost_wb, 0)) > 0.0001 OR ABS(COALESCE(cost_wb2, 0)) > 0.0001 OR ABS(COALESCE(cost_wp, 0)) > 0.0001 OR ABS(COALESCE(cost_climate, 0)) > 0.0001)";
-        
+
         // Hole Tagesdaten (letzte 30 Tage) inkl. ML-Trainingsdaten
-        $queryDay = "SELECT 
+        $queryDay = "SELECT
             d.date as day,
             d.pv_yield as pv,
             d.home_consumption as home,
@@ -365,12 +365,12 @@ if (file_exists($dbPath)) {
             CASE WHEN $realCostDayExpr THEN 0 ELSE d.bat_in END as bat_in_sim
         FROM (SELECT * FROM daily_stats ORDER BY date DESC) d
         ORDER BY d.date DESC";
-        
+
         $stmtDay = $db->query($queryDay);
         $dailyDataDesc = $stmtDay->fetchAll(PDO::FETCH_ASSOC);
         $dailyData = array_reverse($dailyDataDesc);
 
-        // --- NEU: Live-Daten fuer heute einmischen, um stuendliche DB-Verzoegerung zu umgehen ---
+// --- NEU: Live-Daten für heute einmischen, um stündliche DB-Verzögerung zu umgehen ---
         $statsFile = '/var/www/html/ramdisk/daily_stats.json';
         if (file_exists($statsFile)) {
             $liveStats = @json_decode(file_get_contents($statsFile), true);
@@ -434,7 +434,7 @@ if (file_exists($dbPath)) {
                     }
                 }
                 unset($row);
-                
+
                 if (!$foundToday) {
                     $savedLive = lzReadLiveSavedFields($liveStats);
                     $newRow = [
@@ -487,13 +487,13 @@ if (file_exists($dbPath)) {
                     lzAddPvTotalFields($newRow);
                     $dailyData[] = $newRow;
                 }
-                // Synchronisiere dailyDataDesc fuer die Tabelle!
+// Synchronisiere dailyDataDesc für die Tabelle!
                 $dailyDataDesc = array_reverse($dailyData);
             }
         }
 
         // Hole Monatsdaten
-        $queryMonth = "SELECT 
+        $queryMonth = "SELECT
             strftime('%Y-%m', date) as month,
             SUM(pv_yield) as pv,
             SUM(CASE WHEN COALESCE(grid_out, 0) > 0.5 AND COALESCE(grid_out, 0) > COALESCE(pv_yield, 0) + 0.5 AND COALESCE(grid_out, 0) > MAX(1.0, COALESCE(bat_out, 0) * 1.5) THEN COALESCE(pv_yield, 0) + COALESCE(grid_out, 0) ELSE COALESCE(pv_yield, 0) END) as pv_total,
@@ -533,12 +533,12 @@ if (file_exists($dbPath)) {
         FROM daily_stats
         GROUP BY month
         ORDER BY month ASC";
-        
+
         $stmtMonth = $db->query($queryMonth);
         $monthlyData = $stmtMonth->fetchAll(PDO::FETCH_ASSOC);
 
         // Hole Jahresdaten
-        $queryYear = "SELECT 
+        $queryYear = "SELECT
             strftime('%Y', date) as year,
             SUM(pv_yield) as pv,
             SUM(CASE WHEN COALESCE(grid_out, 0) > 0.5 AND COALESCE(grid_out, 0) > COALESCE(pv_yield, 0) + 0.5 AND COALESCE(grid_out, 0) > MAX(1.0, COALESCE(bat_out, 0) * 1.5) THEN COALESCE(pv_yield, 0) + COALESCE(grid_out, 0) ELSE COALESCE(pv_yield, 0) END) as pv_total,
@@ -578,7 +578,7 @@ if (file_exists($dbPath)) {
         FROM daily_stats
         GROUP BY year
         ORDER BY year ASC";
-        
+
         $stmtYear = $db->query($queryYear);
         $yearlyData = $stmtYear->fetchAll(PDO::FETCH_ASSOC);
 
@@ -598,7 +598,7 @@ $chartDataDayJson = json_encode($dailyData);
 $chartDataMonthJson = json_encode($monthlyData);
 $chartDataYearJson = json_encode($yearlyData);
 
-// Lese den Basis-Strompreis aus der e3dc.strompreise.txt als Default fuer die Simulation
+// Lese den Basis-Strompreis aus der e3dc.strompreise.txt als Default für die Simulation
 $defaultSimulationPrice = 30.0;
 $strompreiseFile = '/var/www/html/e3dc.strompreise.txt';
 if (file_exists($strompreiseFile)) {
@@ -611,7 +611,7 @@ if (file_exists($strompreiseFile)) {
             // Nimmt den ersten validen Preis, was bei statischen Tarifen reicht
             if (count($parts) >= 2 && is_numeric($parts[1])) {
                 $defaultSimulationPrice = (float)str_replace(',', '.', $parts[1]);
-                break; 
+                break;
             }
         }
     }
@@ -650,10 +650,10 @@ foreach ([$dailyData, $monthlyData, $yearlyData] as $rows) {
         color: var(--bs-secondary-color);
         font-size: .82rem;
         font-weight: 700;
-        text-transform: uppercase;
         letter-spacing: 0;
         margin-bottom: .45rem;
     }
+    .lz-balance-head span:first-child { text-transform: uppercase; }
     .lz-stack {
         display: flex;
         min-height: 42px;
@@ -663,7 +663,7 @@ foreach ([$dailyData, $monthlyData, $yearlyData] as $rows) {
         background: rgba(127, 127, 127, .09);
     }
     .lz-stack-seg {
-        min-width: 22px;
+        min-width: 0;
         display: flex;
         align-items: center;
         justify-content: center;
@@ -672,6 +672,8 @@ foreach ([$dailyData, $monthlyData, $yearlyData] as $rows) {
         font-weight: 800;
         white-space: nowrap;
         overflow: hidden;
+        padding: 0 .35rem;
+        text-overflow: clip;
     }
     .lz-stack-seg.is-dark {
         color: #fff;
@@ -684,6 +686,8 @@ foreach ([$dailyData, $monthlyData, $yearlyData] as $rows) {
         color: var(--bs-secondary-color);
         font-size: .82rem;
     }
+    .lz-balance-legend:empty { display: none; }
+    .lz-balance-legend strong { color: var(--bs-body-color); }
     .lz-dot {
         display: inline-block;
         width: .65rem;
@@ -730,16 +734,9 @@ foreach ([$dailyData, $monthlyData, $yearlyData] as $rows) {
         .lz-balance-grid {
             grid-template-columns: 1fr;
         }
-        .lz-stack {
-            flex-direction: column;
-            min-height: 0;
-        }
-        .lz-stack-seg {
-            width: 100% !important;
-            min-height: 28px;
-            justify-content: flex-start;
-            padding-left: .65rem;
-        }
+        .lz-stack { min-height: 38px; }
+        .lz-stack-seg { padding: 0 .2rem; font-size: .7rem; }
+        .lz-balance-legend { gap: .35rem .7rem; font-size: .76rem; }
     }
 </style>
 
@@ -765,7 +762,7 @@ foreach ([$dailyData, $monthlyData, $yearlyData] as $rows) {
             </div>
         </div>
     </div>
-    
+
     <!-- NEU: Summary Header (CO2, Autarkie, Kosten) -->
     <div class="row g-3 mb-4 justify-content-center align-items-stretch" id="lz-summary-header">
         <!-- CO2-Baum -->
@@ -941,7 +938,6 @@ foreach ([$dailyData, $monthlyData, $yearlyData] as $rows) {
         </div>
     <?php endif; ?>
 </div>
-<!-- Chart.js von CDN laden -->
 <script src="assets/vendor/chart.js/chart.umd.min.js"></script>
 
 <script>
@@ -974,8 +970,8 @@ document.addEventListener("DOMContentLoaded", function() {
 
     // Achsen-Farben auswerten: HTML (Desktop) und Body (Mobile)
     const getThemeColors = () => {
-        const isDarkMode = document.documentElement.getAttribute('data-bs-theme') === 'dark' || 
-                           document.body.getAttribute('data-bs-theme') === 'dark' || 
+        const isDarkMode = document.documentElement.getAttribute('data-bs-theme') === 'dark' ||
+                           document.body.getAttribute('data-bs-theme') === 'dark' ||
                            document.body.getAttribute('data-theme') === 'dark';
         return {
             textColor: isDarkMode ? '#e0e0e0' : '#333333',
@@ -983,7 +979,7 @@ document.addEventListener("DOMContentLoaded", function() {
         };
     };
 
-    // Initialisiere Jahr-Filter Optionen und setze Defaults fuer die Kalender
+// Initialisiere Jahr-Filter Optionen und setze Defaults für die Kalender
     function initYearFilter() {
         const filter = document.getElementById('lz-year-picker');
         if (!filter) return;
@@ -994,8 +990,8 @@ document.addEventListener("DOMContentLoaded", function() {
             opt.innerText = y;
             filter.appendChild(opt);
         });
-        
-        // Defaults fuer Kalender setzen (heute / aktueller Monat)
+
+// Defaults für Kalender setzen (heute / aktueller Monat)
         const dateInput = document.getElementById('lz-date-picker');
         const monthFilter = document.getElementById('lz-month-picker');
 
@@ -1052,9 +1048,9 @@ document.addEventListener("DOMContentLoaded", function() {
     function lzCurrentRows() {
         let rawData = currentViewMode === 'day' ? dayData : (currentViewMode === 'month' ? monthData : yearData);
         rawData = Array.isArray(rawData) ? [...rawData] : [];
-        const selectedDate = document.getElementById('lz-date-picker').value; 
-        const selectedMonth = document.getElementById('lz-month-picker').value; 
-        const selectedYear = document.getElementById('lz-year-picker').value; 
+        const selectedDate = document.getElementById('lz-date-picker').value;
+        const selectedMonth = document.getElementById('lz-month-picker').value;
+        const selectedYear = document.getElementById('lz-year-picker').value;
         if (currentViewMode === 'day' && selectedDate) {
             rawData = rawData.filter(d => d.day === selectedDate);
         } else if (currentViewMode === 'month' && selectedMonth) {
@@ -1135,10 +1131,27 @@ document.addEventListener("DOMContentLoaded", function() {
         return item.tooltip || `${item.label}: ${lzKwh(item.value)}`;
     }
 
-    function lzLegend(items) {
+    function lzInlineLabel(item, total) {
+        if (!(total > 0) || !(item.value > 0.05)) return '';
+        const label = `${lzKwh(item.value, item.value >= 10 ? 1 : 2)} ${item.label}`;
+        const grid = document.querySelector('.lz-balance-grid');
+        const gridWidth = grid?.clientWidth || Math.max(240, Math.min(window.innerWidth - 40, 720));
+        const stackWidth = window.matchMedia('(max-width: 820px)').matches
+            ? gridWidth
+            : Math.max(240, (gridWidth - 20) / 2);
+        const canvas = lzInlineLabel.canvas || (lzInlineLabel.canvas = document.createElement('canvas'));
+        const context = canvas.getContext('2d');
+        context.font = window.matchMedia('(max-width: 820px)').matches
+            ? '800 11.2px system-ui, sans-serif'
+            : '800 12.48px system-ui, sans-serif';
+        const requiredWidth = context.measureText(label).width + 12;
+        return (item.value / total) * stackWidth >= requiredWidth ? label : '';
+    }
+
+    function lzLegend(items, total) {
         return `<div class="lz-balance-legend">${items
-            .filter(item => item.value > 0.05)
-            .map(item => `<span title="${lzAttr(lzItemTooltip(item))}"><i class="lz-dot" style="background:${item.color}"></i>${item.label}</span>`)
+            .filter(item => item.value > 0.05 && !lzInlineLabel(item, total))
+            .map(item => `<span title="${lzAttr(lzItemTooltip(item))}"><i class="lz-dot" style="background:${item.color}"></i>${item.label} <strong>${lzKwh(item.value, item.value >= 10 ? 1 : 2)}</strong></span>`)
             .join('')}</div>`;
     }
 
@@ -1146,8 +1159,8 @@ document.addEventListener("DOMContentLoaded", function() {
         const visible = items.filter(item => item.value > 0.05);
         if (visible.length === 0) return '<div class="text-muted small">Keine Werte</div>';
         return `<div class="lz-stack">${visible.map(item => {
-            const width = total > 0 ? Math.max(2, item.value / total * 100) : 0;
-            const label = item.value >= total * 0.045 ? lzKwh(item.value, item.value >= 10 ? 1 : 2).replace(' kWh', '') : '';
+            const width = total > 0 ? item.value / total * 100 : 0;
+            const label = lzInlineLabel(item, total);
             return `<div class="lz-stack-seg${item.dark ? ' is-dark' : ''}" style="width:${width.toFixed(3)}%;background:${item.color}" title="${lzAttr(lzItemTooltip(item))}">${label}</div>`;
         }).join('')}</div>`;
     }
@@ -1197,15 +1210,16 @@ document.addEventListener("DOMContentLoaded", function() {
             {label: 'Bilanzrest', value: sum.balanceUnknownRest, color: '#9aa5ac', dark: true, tooltip: lzBalanceRestTooltip(sum)}
         ];
         const singleMode = document.getElementById('lz-balance-single')?.checked;
+        const sharedBalanceBasis = Math.max(sum.supply, sum.use, 0.001);
         balanceEl.innerHTML = singleMode
             ? lzSingleBars([...supplyItems, ...useItems])
             : `
                 <div class="lz-balance-head"><span>Energielieferung</span><span>${lzKwh(sum.supply)}</span></div>
-                ${lzStack(supplyItems, sum.supply)}
-                ${lzLegend(supplyItems)}
+                ${lzStack(supplyItems, sharedBalanceBasis)}
+                ${lzLegend(supplyItems, sharedBalanceBasis)}
                 <div class="lz-balance-head mt-3"><span>Energieverwendung</span><span>${lzKwh(sum.use)}</span></div>
-                ${lzStack(useItems, sum.use)}
-                ${lzLegend(useItems)}
+                ${lzStack(useItems, sharedBalanceBasis)}
+                ${lzLegend(useItems, sharedBalanceBasis)}
             `;
 
         const rankingItems = useItems
@@ -1216,6 +1230,11 @@ document.addEventListener("DOMContentLoaded", function() {
         rankingEl.innerHTML = lzSingleBars(rankingItems);
         renderLangzeitDetailTable(rows);
     };
+    let lzBalanceResizeTimer = null;
+    window.addEventListener('resize', () => {
+        window.clearTimeout(lzBalanceResizeTimer);
+        lzBalanceResizeTimer = window.setTimeout(() => window.renderLangzeitBalance(), 120);
+    }, {passive: true});
 
     function renderLangzeitDetailTable(rows) {
         const tbody = document.getElementById('lz-detail-body');
@@ -1268,7 +1287,7 @@ document.addEventListener("DOMContentLoaded", function() {
             if (langzeitChart) {
                 langzeitChart.destroy();
             }
-            
+
             const ctx = document.getElementById('langzeitChart').getContext('2d');
             const colors = getThemeColors();
             let rawData = lzCurrentRows();
@@ -1312,8 +1331,8 @@ document.addEventListener("DOMContentLoaded", function() {
                     maintainAspectRatio: false,
                     color: colors.textColor,
                     plugins: {
-                        legend: { 
-                            position: 'bottom', 
+                        legend: {
+                            position: 'bottom',
                             labels: { color: colors.textColor, padding: 20 },
                             onClick: function(e, legendItem, legend) {
                                 const index = legendItem.datasetIndex;
@@ -1369,7 +1388,7 @@ document.addEventListener("DOMContentLoaded", function() {
             renderChart();
         }
     });
-    
+
     themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['data-bs-theme', 'data-theme'] });
     themeObserver.observe(document.body, { attributes: true, attributeFilter: ['data-bs-theme', 'data-theme'] });
 
@@ -1378,9 +1397,9 @@ document.addEventListener("DOMContentLoaded", function() {
     if (savedPrice) {
         document.getElementById('lz-price-input').value = savedPrice;
     }
-    
+
     // --- Initialisierung wurde ans Ende verschoben ---
-    
+
     // --- NEU: LZ Summary Charts & Logic ---
     let chartAutarky = null;
     let chartSelfcon = null;
@@ -1388,7 +1407,7 @@ document.addEventListener("DOMContentLoaded", function() {
     function initLzSummaryCharts() {
         const colors = getThemeColors();
         const gridColor = colors.gridColor;
-        
+
         if (chartAutarky) chartAutarky.destroy();
         if (chartSelfcon) chartSelfcon.destroy();
 
@@ -1417,7 +1436,7 @@ document.addEventListener("DOMContentLoaded", function() {
         let rawData = lzCurrentRows();
         if (!rawData || rawData.length === 0) return;
 
-        // Summen bilden (inkl. externem Generator fuer korrekte Autarkie/Eigenverbrauch!)
+// Summen bilden (inkl. externem Generator für korrekte Autarkie/Eigenverbrauch!)
         let sPV = 0, sHome = 0, sGridIn = 0, sGridOut = 0, sBatOut = 0, sBatIn = 0;
         let sCostTotal = 0, sCostHome = 0, sCostWb = 0, sCostWp = 0, sCostClimate = 0;
         let sGridInReal = 0, sHomeReal = 0, sWbReal = 0, sWpReal = 0, sClimateReal = 0;
@@ -1503,12 +1522,12 @@ document.addEventListener("DOMContentLoaded", function() {
         const homeSim = Math.max(0, (sHome - sWbReal - sWpReal - sClimateReal) - (sHomeReal - sWbReal - sWpReal - sClimateReal)); // Vereinfacht
         // Besser: Nutze Anteile wie in updateLangzeitCosts
         // Da wir hier aber globale Summen haben, machen wir es proportional
-        
+
         let totalCost = sCostTotal + (gridSim * priceEur);
         let totalSave = Math.max(0, (sHome - sGridIn) * priceEur);
         const eegRevenue = lzEegRevenue(sGridOut);
         let finalResult = totalSave + eegRevenue - totalCost;
-        
+
         document.getElementById('stat-cost-total-lz').innerText = totalCost.toLocaleString('de-DE', {style: 'currency', currency: 'EUR'});
         document.getElementById('stat-save-total-lz').innerText = totalSave.toLocaleString('de-DE', {style: 'currency', currency: 'EUR'});
         document.getElementById('stat-result-total-lz').innerText = finalResult.toLocaleString('de-DE', {style: 'currency', currency: 'EUR'});
@@ -1531,18 +1550,18 @@ document.addEventListener("DOMContentLoaded", function() {
                 eegNoteEl.innerText = '';
             }
         }
-        
+
         // Split (Proportional zum Verbrauch)
         const sWb = rawData.reduce((a, b) => a + (parseFloat(b.wb)||0), 0);
         const sWp = rawData.reduce((a, b) => a + (parseFloat(b.wp)||0), 0);
         const sClimate = rawData.reduce((a, b) => a + (parseFloat(b.climate)||0), 0);
         const sHomeOnly = sHome - sWb - sWp - sClimate;
-        
+
         const updateSplit = (idCost, idSave, consumption, realCost) => {
             const elCost = document.getElementById(idCost);
             const elSave = document.getElementById(idSave);
             if (!elCost || !elSave) return;
-            
+
             const ratio = sHome > 0 ? consumption / sHome : 0;
             const cost = realCost + (gridSim * ratio * priceEur);
             const save = Math.max(0, (consumption - (sGridIn * ratio)) * priceEur);
@@ -1584,7 +1603,7 @@ document.addEventListener("DOMContentLoaded", function() {
         const rounded = Math.round((numberValue + Number.EPSILON) * 100) / 100;
         return Object.is(rounded, -0) || rounded === 0 ? '0' : rounded.toFixed(2);
     }
-    
+
     window.openStatsEditor = function(data) {
         document.getElementById('edit-date').value = data.day;
         document.getElementById('edit-pv').value = lzFormatEditKwh(data.pv_total ?? data.pv);
@@ -1597,7 +1616,7 @@ document.addEventListener("DOMContentLoaded", function() {
         document.getElementById('edit-wb2').value = lzFormatEditKwh(data.wb2 ?? 0);
         document.getElementById('edit-wp').value = lzFormatEditKwh(data.wp);
         document.getElementById('edit-climate').value = lzFormatEditKwh(data.climate);
-        
+
         const isToday = (data.day === new Date().toISOString().substring(0, 10));
         let warningEl = document.getElementById('edit-today-warning');
         if (!warningEl) {
@@ -1610,7 +1629,7 @@ document.addEventListener("DOMContentLoaded", function() {
         }
         warningEl.style.display = isToday ? 'block' : 'none';
         document.getElementById('btn-save-stats').disabled = isToday;
-        
+
         statsModal.show();
     };
 
@@ -1634,7 +1653,7 @@ document.addEventListener("DOMContentLoaded", function() {
 
     window.deleteStatsEntry = function(date) {
         if (!confirm("Eintrag für " + date + " wirklich löschen?")) return;
-        
+
         const formData = new FormData();
         formData.append('date', date);
         formData.append('action', 'delete');

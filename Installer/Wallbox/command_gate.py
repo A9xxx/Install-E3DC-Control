@@ -1,8 +1,9 @@
-"""Wallbox outbound command gate and compact audit log.
+"""Ausgangssperre für Wallbox-Befehle mit kompaktem Auditprotokoll.
 
-The gate is deliberately close to the driver write paths. If higher-level
-control code accidentally calls a write method while a charger is in NGNA/Aus,
-the command is blocked before a packet leaves the process.
+Die Sperre liegt bewusst nahe an den schreibenden Treiberpfaden. Ruft eine
+übergeordnete Regelung versehentlich eine Schreibmethode auf, während eine
+Wallbox auf NGNA/Aus steht, wird der Befehl blockiert, bevor ein Paket den
+Prozess verlässt.
 """
 from __future__ import annotations
 
@@ -10,7 +11,7 @@ import contextlib
 import json
 import os
 import time
-from typing import Any, Dict, Iterator, Optional
+from typing import Any, Callable, Dict, Iterator, Optional
 
 
 AUDIT_LOG = os.path.join("/var/www/html/logs", "wallbox_command_audit.log")
@@ -103,7 +104,7 @@ def audit_event(charger: Any, *, action: str, decision: str, reason: str = "", p
         with open(AUDIT_LOG, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n")
     except Exception:
-        # The audit must never break charging or safety stops.
+        # Das Audit darf weder das Laden noch sicherheitsbedingte Stopps stören.
         pass
 
 
@@ -117,9 +118,17 @@ def configure_charger(
     driver: str = "",
     owner: str = "wallbox_manager",
     observe_only: bool = False,
+    runtime_validation_required: bool = False,
+    runtime_validator: Optional[Callable[[], Any]] = None,
+    safe_handoff: Optional[Callable[[Any, str], Any]] = None,
+    owner_lease_token: Any = None,
+    owner_lease_expires_ts: Optional[float] = None,
 ) -> None:
     if charger is None:
         return
+    previous = getattr(charger, "_command_gate_context", {}) or {}
+    if not isinstance(previous, dict):
+        previous = {}
     charger._command_gate_context = {
         "wb_id": _safe_int(wb_id if wb_id is not None else getattr(charger, "wb_id", 0), 0),
         "mode": _safe_int(mode, 0),
@@ -129,7 +138,122 @@ def configure_charger(
         "driver": driver or charger.__class__.__name__,
         "owner": owner,
         "ts": time.time(),
+        "runtime_validation_required": bool(runtime_validation_required),
+        "runtime_validator": runtime_validator,
+        "safe_handoff": safe_handoff,
+        "owner_lease_token": owner_lease_token,
+        "owner_lease_expires_ts": owner_lease_expires_ts,
+        "_runtime_last_valid": bool(previous.get("_runtime_last_valid", True)),
+        "_runtime_handoff_done": bool(previous.get("_runtime_handoff_done", False)),
+        "_runtime_handoff_result": previous.get("_runtime_handoff_result"),
     }
+
+
+def _normalize_runtime_validation(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        result = dict(value)
+        result["valid"] = bool(result.get("valid", False))
+        result["reason"] = str(result.get("reason") or ("runtime_valid" if result["valid"] else "runtime_invalid"))
+        return result
+    if isinstance(value, (tuple, list)) and value:
+        valid = bool(value[0])
+        reason = str(value[1] if len(value) > 1 else ("runtime_valid" if valid else "runtime_invalid"))
+        return {"valid": valid, "reason": reason}
+    valid = bool(value)
+    return {"valid": valid, "reason": "runtime_valid" if valid else "runtime_invalid"}
+
+
+def _validate_runtime_context(charger: Any, ctx: Dict[str, Any], owner: str) -> Dict[str, Any]:
+    """Prüft Kontext und Owner unmittelbar vor einem ausgehenden Schreibzug erneut."""
+    if not bool(ctx.get("runtime_validation_required", False)):
+        return {"valid": True, "reason": "legacy_local_gate"}
+
+    expected_owner = str(ctx.get("owner") or "")
+    if not expected_owner or expected_owner != str(owner or ""):
+        return {"valid": False, "reason": "owner_mismatch"}
+
+    lease_expires = ctx.get("owner_lease_expires_ts")
+    try:
+        lease_valid = lease_expires is not None and float(lease_expires) > time.time()
+    except (TypeError, ValueError):
+        lease_valid = False
+    if not lease_valid or ctx.get("owner_lease_token") is None:
+        return {"valid": False, "reason": "owner_lease_expired_or_missing"}
+
+    validator = ctx.get("runtime_validator")
+    if not callable(validator):
+        return {"valid": False, "reason": "runtime_validator_missing"}
+    try:
+        return _normalize_runtime_validation(validator())
+    except Exception:
+        return {"valid": False, "reason": "runtime_validator_exception"}
+
+
+def _perform_safe_handoff(charger: Any, ctx: Dict[str, Any], reason: str) -> Dict[str, Any]:
+    handoff = ctx.get("safe_handoff")
+    if not callable(handoff):
+        return {
+            "status": "unconfirmed",
+            "confirmed": False,
+            "strategy": "command_silence_only",
+            "reason": "safe_handoff_missing",
+        }
+    try:
+        raw = handoff(charger, reason)
+        if isinstance(raw, dict):
+            result = dict(raw)
+            result.setdefault("confirmed", bool(result.get("status") == "confirmed"))
+            result.setdefault("status", "confirmed" if result["confirmed"] else "unconfirmed")
+            return result
+        confirmed = bool(raw)
+        return {
+            "status": "confirmed" if confirmed else "unconfirmed",
+            "confirmed": confirmed,
+            "strategy": "driver_callback",
+        }
+    except Exception:
+        return {
+            "status": "unconfirmed",
+            "confirmed": False,
+            "strategy": "driver_callback",
+            "reason": "safe_handoff_exception",
+        }
+
+
+def _block_invalid_runtime(
+    charger: Any,
+    ctx: Dict[str, Any],
+    *,
+    action: str,
+    payload: Any,
+    owner: str,
+    reason: str,
+) -> bool:
+    was_valid = bool(ctx.get("_runtime_last_valid", True))
+    handoff_done = bool(ctx.get("_runtime_handoff_done", False))
+    handoff_result = ctx.get("_runtime_handoff_result")
+    if was_valid and not handoff_done:
+        handoff_result = _perform_safe_handoff(charger, ctx, reason)
+        ctx["_runtime_handoff_done"] = True
+        ctx["_runtime_handoff_result"] = handoff_result
+    ctx["_runtime_last_valid"] = False
+    charger._command_gate_context = ctx
+    charger._command_gate_runtime_status = {
+        "valid": False,
+        "reason": reason,
+        "action": str(action or ""),
+        "handoff": handoff_result,
+        "ts": time.time(),
+    }
+    audit_event(
+        charger,
+        action=action,
+        decision="blocked",
+        reason=reason,
+        payload={"command": payload, "safe_handoff": handoff_result},
+        owner=owner,
+    )
+    return False
 
 
 def is_default_release_allowed(charger: Any) -> bool:
@@ -161,10 +285,10 @@ def allow_command(
     reason: str = "",
     audit_allowed: bool = True,
 ) -> bool:
-    """Return True if a wallbox write may leave the process.
+    """Liefert ``True``, wenn ein Wallbox-Schreibzug den Prozess verlassen darf.
 
-    Missing or invalid context is blocked and audited. The production manager
-    sets a complete context every cycle.
+    Ein fehlender oder ungültiger Kontext wird blockiert und protokolliert. Der
+    produktive Manager setzt in jedem Zyklus einen vollständigen Kontext.
     """
     ctx = getattr(charger, "_command_gate_context", None)
     if not isinstance(ctx, dict) or not ctx:
@@ -177,6 +301,28 @@ def allow_command(
             owner=owner,
         )
         return False
+
+    runtime = _validate_runtime_context(charger, ctx, owner)
+    if not bool(runtime.get("valid", False)):
+        return _block_invalid_runtime(
+            charger,
+            ctx,
+            action=action,
+            payload=payload,
+            owner=owner,
+            reason=str(runtime.get("reason") or "runtime_context_invalid"),
+        )
+    if not bool(ctx.get("_runtime_last_valid", True)):
+        ctx["_runtime_handoff_done"] = False
+        ctx["_runtime_handoff_result"] = None
+    ctx["_runtime_last_valid"] = True
+    charger._command_gate_context = ctx
+    charger._command_gate_runtime_status = {
+        "valid": True,
+        "reason": str(runtime.get("reason") or "runtime_valid"),
+        "action": str(action or ""),
+        "ts": time.time(),
+    }
 
     mode = _safe_int(ctx.get("mode"), 0)
     native_enabled = bool(ctx.get("native_enabled", True))

@@ -23,8 +23,8 @@ CATEGORY_MAP = {
     "24": CAT_ENV, "25": CAT_ENV, "26": CAT_ENV, "27": CAT_ENV,
     "28": CAT_ENV, "29": CAT_ENV,
     "31": CAT_DOCKER, "32": CAT_DOCKER,
-    "41": CAT_EXTENSIONS, "42": CAT_EXTENSIONS, "43": CAT_EXTENSIONS, 
-    "44": CAT_EXTENSIONS, "45": CAT_EXTENSIONS, "46": CAT_EXTENSIONS, 
+    "41": CAT_EXTENSIONS, "42": CAT_EXTENSIONS, "43": CAT_EXTENSIONS,
+    "44": CAT_EXTENSIONS, "45": CAT_EXTENSIONS, "46": CAT_EXTENSIONS,
     "47": CAT_EXTENSIONS, "48": CAT_EXTENSIONS, "49": CAT_EXTENSIONS
 }
 
@@ -61,7 +61,7 @@ class Command:
         self.func = func        # Callable
         self.sort_order = sort_order
         self.category = category or CAT_OTHER
-    
+
     def __repr__(self):
         return f"Command({self.key}, {self.label})"
 
@@ -80,12 +80,12 @@ def register_command(key, label, func, sort_order=100, category=None):
 def auto_discover_modules():
     """Lädt alle Module im Installer-Paket und lässt sie ihre Commands registrieren."""
     global _modules_loaded
-    
+
     if _modules_loaded:
         return
-    
+
     package_path = os.path.dirname(__file__)
-    
+
     # Legacy-Setup-Skripte ignorieren wir; normale Einrichtung läuft über
     # Installation/Update und danach über WebUI bzw. Config-Editor.
     IGNORE_MODULES = (
@@ -93,11 +93,13 @@ def auto_discover_modules():
         "bluelink_client", "sqlite_archiver", "notification_manager", "ha_manager",
         "ml_predictor", "generate_vapid", "wallbox_manager", "energy_manager", "idm_live",
         "heizstab_manager", "climate_live", "climate_control", "stiebel", "e3dc_live", "storage_manager", "storage_simulator",
-        
-        # Module mit separatem Aufrufpfad nicht automatisch registrieren:
+
+        # Obsolete Installer Module verbannen (Echte Dateinamen!):
         "install_all", "config_wizard", "create_config", "strompreis_wizard",
-        "system", "ramdisk", "self_update", "e3dc_setup",
-        # Nicht als Installer-Modul behandeln:
+        "system", "ramdisk", "self_update", "change_user", "diagrammphp", "e3dc_setup",
+        # Lokale Entwicklungs- und Reparaturwerkzeuge sind keine Bedienbefehle.
+        "force_discharge", "recover_history_rscp", "repair_db_inversion", "permissions_helper",
+        # Integrations-Guide: importiert get_registered_commands (existiert nicht -> Warnung)
         "INTEGRATIONS_GUIDE",
     )
 
@@ -115,7 +117,7 @@ def auto_discover_modules():
             importlib.import_module(full_name)
         except Exception as e:
             print(f"⚠ Warnung: Konnte Modul '{module_name}' nicht laden: {e}")
-    
+
     _modules_loaded = True
 
 
@@ -123,7 +125,7 @@ def get_menu_commands():
     """Gibt eine sortierte Liste der registrierten Commands zurück."""
     if not _modules_loaded:
         auto_discover_modules()
-    
+
     # Sortierung nach sort_order, dann Label
     return sorted(COMMANDS, key=lambda c: (c.sort_order, c.label.lower()))
 
@@ -157,7 +159,7 @@ def print_expert_menu(commands):
             current_category = cmd.category
             print(f"  {current_category}")
         print(f"    {cmd.key}) {cmd.label}")
-    
+
     print(f"\n  q) Zurück zum Hauptmenü")
     print()
 
@@ -193,18 +195,18 @@ def run_main_menu(restart_callback=None):
     auto_discover_modules()
     setup_installation_loggers()
     install_user = get_install_user()
-    
+
     commands = get_menu_commands()
-    
+
     commands_by_key = _commands_by_key(commands)
     expert_commands = _expert_commands(commands)
     current_view = "main"
-    
+
     while True:
         if current_view == "main":
             print_main_menu(commands_by_key)
             choice = input(f"Auswahl ({install_user}): ").strip().lower()
-            
+
             if choice == "q":
                 print("→ Beende Installer.\n")
                 break
@@ -232,7 +234,7 @@ def run_main_menu(restart_callback=None):
             if choice == "q":
                 current_view = "main"
                 continue
-            
+
             matched = [c for c in expert_commands if c.key == choice]
 
             if matched:

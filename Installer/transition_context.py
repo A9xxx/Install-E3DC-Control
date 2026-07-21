@@ -1,8 +1,9 @@
-"""Strict context for release bootstrap, backup, update and rollback only.
+"""Strikter Kontext nur für Release-Bootstrap, Sicherung, Update und Rollback.
 
-The normal v5.3.2b runtime keeps its published path semantics.  This module is
-deliberately separate so the unrelated-history transition never has to guess a
-user, home, installation root or virtual environment.
+Die normale Produktlaufzeit behält ihre etablierte Pfadsemantik. Dieses Modul
+ist bewusst getrennt, damit der Übergang aus einer unabhängigen Historie weder
+Nutzer, Home-Verzeichnis, Installationswurzel noch virtuelle Umgebung erraten
+muss.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ from typing import Iterable
 
 
 class TransitionContextError(RuntimeError):
-    """Raised when the one-shot release context is not unambiguous."""
+    """Wird ausgelöst, wenn der einmalige Release-Kontext nicht eindeutig ist."""
 
 
 @dataclass(frozen=True)
@@ -160,7 +161,7 @@ def get_transition_context(
     explicit_home_dir: str | None = None,
     require_trusted: bool = False,
 ) -> TransitionContext:
-    """Resolve an exact one-shot transition context without legacy guessing."""
+    """Löst einen exakten einmaligen Übergangskontext ohne Altbestandsannahmen auf."""
 
     try:
         bootstrap_root = str(os.environ.get("E3DC_BOOTSTRAP_ROOT") or "").strip()
@@ -181,10 +182,11 @@ def get_transition_context(
             try:
                 data = _flatten_metadata(_read_metadata(path))
             except TransitionContextError:
-                # Published 5.3.2b installations may still contain a 0664
-                # installer_config.json.  Such data is ignored, never trusted;
-                # a secure canonical record or complete root-owned bootstrap
-                # authority must still resolve the context.
+                # Veröffentlichte 5.3.2a-Installationen können noch eine
+                # installer_config.json mit Modus 0664 enthalten. Solche Daten
+                # werden ignoriert und nie als vertrauenswürdig behandelt; ein
+                # sicherer kanonischer Datensatz oder eine vollständige
+                # root-eigene Bootstrap-Autorität muss den Kontext auflösen.
                 rejected_metadata = True
                 continue
             if data:
@@ -252,7 +254,7 @@ def get_transition_context(
 
 
 def get_legacy_config_candidates(filename: str, *, include_web_root: bool = False) -> tuple[str, ...]:
-    """Return only allowlisted legacy files below an already trusted context."""
+    """Liefert nur freigegebene Altdateien unterhalb eines bereits vertrauenswürdigen Kontexts."""
 
     if not filename or os.path.basename(filename) != filename:
         raise TransitionContextError("Ungültiger Legacy-Dateiname")
@@ -277,4 +279,3 @@ def get_legacy_config_candidates(filename: str, *, include_web_root: bool = Fals
         except OSError:
             continue
     return tuple(candidates)
-

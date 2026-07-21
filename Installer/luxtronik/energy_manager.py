@@ -6,6 +6,7 @@ import sys
 import subprocess
 import shutil
 import math
+import stat
 from datetime import datetime, timedelta
 import logging
 from logging.handlers import RotatingFileHandler
@@ -36,15 +37,46 @@ except ModuleNotFoundError:
 try:
     from Installer.Heat import forecast as heat_forecast
     from Installer.Heat import policy as heat_policy
+    from Installer.heat_actuator_safety import default_heat_actuator_gate
 except ModuleNotFoundError:
     _INSTALLER_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if _INSTALLER_DIR not in sys.path:
         sys.path.insert(0, _INSTALLER_DIR)
     from Heat import forecast as heat_forecast
     from Heat import policy as heat_policy
+    from heat_actuator_safety import default_heat_actuator_gate
 
 logger = logging.getLogger("EnergyManager")
 _SESSION_WRITE_WARNED = set()
+
+
+def _new_energy_actuator_gate():
+    return default_heat_actuator_gate(
+        __file__,
+        "Installer/luxtronik/energy_manager.py",
+        "energy_manager",
+    )
+
+
+def _authorize_heatpump_output(instance, action, driver_key=None):
+    """Prüft exakten Tree und Treiber-Lease unmittelbar vor I/O erneut.
+
+    Aus einem ungültigen Kontext ist keine Wärmepumpenfreigabe erlaubt. Das Halten
+    des Vorzustands ist beabsichtigt: Ein laufender Verdichter darf nicht allein
+    wegen eines verlorenen lokalen Installationskontexts gestoppt oder pausiert werden.
+    """
+    verdict = instance._actuator_gate.authorize(
+        driver_key or instance._actuator_driver_key,
+        action,
+        allow_release_on_invalid=False,
+        preserve_existing=True,
+    )
+    instance.actor_writes_blocked = not verdict.allowed
+    instance.actor_write_block_reason = "" if verdict.allowed else verdict.reason
+    if not verdict.allowed:
+        logger.error("%s: Aktorausgang blockiert (%s)", instance.__class__.__name__, verdict.reason)
+    return verdict.allowed
+
 
 def write_json_atomic_tolerant(path, payload, mode=0o664, warn_label="Session-Datei"):
     """Write helper-state JSON without letting stale permissions kill the manager."""
@@ -88,9 +120,9 @@ def write_json_atomic_tolerant(path, payload, mode=0o664, warn_label="Session-Da
 
 class SafeLuxtronik:
     """Stateful Modbus Wrapper. Hält EINE Verbindung dauerhaft offen.
-    Verhindert Fehler 816 (Mehrere Quellen) durch Port-Wiederverwendung und 
+    Verhindert Fehler 816 (Mehrere Quellen) durch Port-Wiederverwendung und
     Fehler 1313 (Timeout) durch regelmäßige Keep-Alive Pings."""
-    def __init__(self, ip):
+    def __init__(self, ip, safety_gate=None):
         from luxtronik import LuxtronikModbus
         self.wp = LuxtronikModbus(ip)
         self.ip = ip
@@ -106,7 +138,11 @@ class SafeLuxtronik:
         self.last_failed_hz = None
         self.last_failed_ww_time = 0.0
         self.last_failed_hz_time = 0.0
-        
+        self._actuator_gate = safety_gate or _new_energy_actuator_gate()
+        self._actuator_driver_key = f"transport:luxtronik-shi:{self.ip}:502"
+        self.actor_writes_blocked = False
+        self.actor_write_block_reason = ""
+
     def connect(self):
         if self._connected and getattr(self.wp, 'socket', None) is not None:
             return True
@@ -117,19 +153,21 @@ class SafeLuxtronik:
             logger.debug(f"Luxtronik Modbus TCP Verbindung erfolgreich aufgebaut ({self.ip})")
             return True
         return False
-        
+
     def set_boost(self, hz_mode, hz_temp, ww_mode, ww_temp, kuehl_mode=0, kuehl_soll=None, wp_data=None):
         success = False
+        if not _authorize_heatpump_output(self, "luxtronik:set_boost_preflight"):
+            return False
         if self.connect():
             try:
                 # --- Software Thermostat für Luxtronik ---
                 new_hz_mode = hz_mode
                 new_ww_mode = ww_mode
-                
+
                 if wp_data:
                     ist_ww = wp_data.get('Warmwasser_Ist')
                     ist_hz = wp_data.get('Ruecklauf_Ist')
-                    
+
                     if ww_mode == 1 and ww_temp and ist_ww is not None:
                         target_ww = float(ww_temp)
                         ww_physically_running = heatpump_compressor_running(wp_data)
@@ -145,7 +183,7 @@ class SafeLuxtronik:
                             # Ein niedrigerer interner Sollwert ist allein kein
                             # Startsignal. So entsteht am Ziel kein 55/Auto-Flattern.
                             new_ww_mode = 0
-                            
+
                     if hz_mode == 1 and hz_temp and ist_hz is not None:
                         target_hz = float(hz_temp)
                         if ist_hz < (target_hz - 2.0):
@@ -154,10 +192,10 @@ class SafeLuxtronik:
                             new_hz_mode = 0
                         else:
                             new_hz_mode = getattr(self, 'curr_ext_hz', 0)
-                            
+
                 res1, res2 = True, True
                 close_on_failure = False
-                
+
                 # Sende nur, wenn sich der Zustand geändert hat (verhindert ständige Modbus-Writes & Takten!)
                 if hz_mode is not None:
                     target_hz_tuple = (new_hz_mode, hz_temp if new_hz_mode else None)
@@ -169,8 +207,11 @@ class SafeLuxtronik:
                         ):
                             res1 = False
                         else:
-                            hz_write_attempted = True
-                            res1 = self.wp.write_hz_boost(new_hz_mode, target_hz_tuple[1])
+                            if _authorize_heatpump_output(self, "luxtronik:write_hz_boost"):
+                                hz_write_attempted = True
+                                res1 = self.wp.write_hz_boost(new_hz_mode, target_hz_tuple[1])
+                            else:
+                                res1 = False
                         if res1 is not False and res1 is not None:
                             self.last_sent_hz = target_hz_tuple
                             self.last_sent_hz_time = time.time()
@@ -184,7 +225,7 @@ class SafeLuxtronik:
                             close_on_failure = True
                     else:
                         self.curr_ext_hz = new_hz_mode
-                            
+
                 if ww_mode is not None:
                     target_ww_tuple = (new_ww_mode, ww_temp if new_ww_mode else None)
                     if self.last_sent_ww != target_ww_tuple:
@@ -195,8 +236,11 @@ class SafeLuxtronik:
                         ):
                             res2 = False
                         else:
-                            ww_write_attempted = True
-                            res2 = self.wp.write_ww_boost(new_ww_mode, target_ww_tuple[1])
+                            if _authorize_heatpump_output(self, "luxtronik:write_ww_boost"):
+                                ww_write_attempted = True
+                                res2 = self.wp.write_ww_boost(new_ww_mode, target_ww_tuple[1])
+                            else:
+                                res2 = False
                         if res2 is not False and res2 is not None:
                             self.last_sent_ww = target_ww_tuple
                             self.last_sent_ww_time = time.time()
@@ -210,20 +254,20 @@ class SafeLuxtronik:
                             close_on_failure = True
                     else:
                         self.curr_ext_ww = new_ww_mode
-                
+
                 if res1 is None or res1 is False or res2 is None or res2 is False:
                     if close_on_failure:
                         self.close()
                 else:
                     success = True
                     self.last_activity = time.time()
-            except: 
+            except:
                 self.close()
         return success
-        
+
     def write_hz_boost(self, mode, temp=None):
         return self.set_boost(mode, temp, None, None)
-        
+
     def write_ww_boost(self, mode, temp=45.0):
         return self.set_boost(None, None, mode, temp)
 
@@ -270,29 +314,33 @@ class SafeLuxtronik:
         except Exception:
             self.close()
             return {}
-        
+
     def write_zirkulation(self, mode):
         success = False
+        if not _authorize_heatpump_output(self, "luxtronik:write_zirkulation_preflight"):
+            return False
         if self.connect():
             try:
+                if not _authorize_heatpump_output(self, "luxtronik:write_zirkulation"):
+                    return False
                 res = self.wp.write_zirkulation(mode)
                 if res is None or res is False:
                     self.close()
                 else:
                     success = True
                     self.last_activity = time.time()
-            except: 
+            except:
                 self.close()
         return success
-        
+
     def keep_alive(self, force_open=True):
         """Hält die Modbus-Verbindung offen. Gibt die Modbus-Außentemperatur zurueck
         (oder None bei Fehler) -- wird im Hauptloop mit WebSocket-Wert verglichen."""
         if not force_open:
             self.close()
             return None
-            
-        # WICHTIG: Die Wärmepumpe fällt in den Automatik-Modus zurück, wenn 
+
+        # WICHTIG: Die Wärmepumpe fällt in den Automatik-Modus zurück, wenn
         # die Modbus-Verbindung geschlossen wird oder idled. MUSS offen bleiben!
         # Polling: Lese Außentemperatur (Input-Reg 10108, FC4) als Keep-Alive, max alle 5s
         if self.connect():
@@ -353,7 +401,7 @@ class SafeLuxtronik:
 
 class ShellyHeatpump:
     """Wrapper für Wärmepumpen via Shelly (SG-Ready Boost und/oder EVU Pause)."""
-    def __init__(self, sg_ip, pause_ip, state_path=""):
+    def __init__(self, sg_ip, pause_ip, state_path="", safety_gate=None):
         self.sg_ip = sg_ip
         self.pause_ip = pause_ip
         self.state_path = state_path
@@ -363,6 +411,10 @@ class ShellyHeatpump:
         self.last_sync_reason = ""
         self.last_live_sg_state = None
         self.last_live_pause_state = None
+        self._actuator_gate = safety_gate or _new_energy_actuator_gate()
+        self._actuator_driver_key = f"heatpump:shelly-controller:{self.sg_ip}:{self.pause_ip}"
+        self.actor_writes_blocked = False
+        self.actor_write_block_reason = ""
         self._load_persisted_state()
 
     @staticmethod
@@ -460,15 +512,45 @@ class ShellyHeatpump:
             self._persist_state("refresh")
         return {"sg": sg_live, "pause": pause_live}
 
+    @staticmethod
+    def _relay_configured(ip):
+        return bool(str(ip or "").strip() not in ("", "0.0.0.0"))
+
+    def relay_readback_contract(self, relay_states):
+        """Bewertet nur frische Aktorzustände, keine Wärmepumpen-Telemetrie."""
+
+        states = relay_states if isinstance(relay_states, dict) else {}
+        configured = {
+            "sg": self._relay_configured(self.sg_ip),
+            "pause": self._relay_configured(self.pause_ip),
+        }
+        required = tuple(name for name, is_configured in configured.items() if is_configured)
+        valid = bool(required) and all(isinstance(states.get(name), bool) for name in required)
+        return {
+            "valid": valid,
+            "required_contacts": required,
+            "confirmed_contacts": tuple(
+                name for name in required if isinstance(states.get(name), bool)
+            ),
+            "source": "shelly_relay_readback",
+        }
+
     def _write_relay_state(self, ip, target_on):
         if not ip or ip == '0.0.0.0':
             return True
+        if not _authorize_heatpump_output(
+            self,
+            f"shelly:relay:{ip}:{'on' if target_on else 'off'}",
+            driver_key=f"transport:http-shelly:{ip}:switch:0",
+        ):
+            return False
         state_str = "on" if target_on else "off"
+        write_ok = False
         try:
             response = requests.get(f"http://{ip}/relay/0?turn={state_str}", timeout=2)
             if hasattr(response, "raise_for_status"):
                 response.raise_for_status()
-            return True
+            write_ok = True
         except Exception:
             try:
                 response = requests.post(
@@ -478,44 +560,88 @@ class ShellyHeatpump:
                 )
                 if hasattr(response, "raise_for_status"):
                     response.raise_for_status()
-                return True
+                write_ok = True
             except Exception:
                 return False
-        
+        if not write_ok:
+            return False
+        confirmed = self._read_relay_state(ip)
+        if confirmed != bool(target_on):
+            logger.error(
+                "Shelly WP %s: Relais-Readback unbestätigt (Soll=%s Ist=%s)",
+                ip,
+                bool(target_on),
+                confirmed,
+            )
+            return False
+        return True
+
+    def _rollback_safe_state(self):
+        """Bestätigt nach einem Teilschreibvorgang: kein externer Boost und keine EVU-Pause."""
+        results = []
+        if self.sg_ip and self.sg_ip != '0.0.0.0':
+            sg_ok = self._write_relay_state(self.sg_ip, False)
+            results.append(sg_ok)
+            if sg_ok:
+                self.sg_state = False
+        if self.pause_ip and self.pause_ip != '0.0.0.0':
+            pause_ok = self._write_relay_state(self.pause_ip, True)
+            results.append(pause_ok)
+            if pause_ok:
+                self.pause_state = True
+        rollback_ok = bool(results and all(results)) if results else True
+        self.last_sync_reason = (
+            "partial_write_safe_rollback_confirmed"
+            if rollback_ok
+            else "partial_write_safe_rollback_incomplete"
+        )
+        self._persist_state(self.last_sync_reason)
+        return rollback_ok
+
     def connect(self): return True
     def close(self): pass
     def keep_alive(self, force_open=True): pass
-    
+
     def set_boost(self, hz_mode, hz_temp, ww_mode, ww_temp, kuehl_mode=0, kuehl_soll=None, wp_data=None, force=False, reason=""):
+        if not _authorize_heatpump_output(self, "shelly:set_boost_preflight"):
+            return False
         # Luxtronik-Pause (Aushungern) erkennen: hz_mode=1, hz_temp<=20.0
         is_pause = (hz_mode == 1 and hz_temp is not None and hz_temp <= 20.0)
         is_boost = False if is_pause else (hz_mode == 1 or ww_mode == 1)
-        
+
         success = True
+        write_attempted = False
         self.last_sync_reason = reason or ("pause" if is_pause else ("boost" if is_boost else "normal"))
-        
+
         # 1. EVU / Pause Kontakt (Normally Closed -> On = Heizen, Off = Pause/Gesperrt)
         if self.pause_ip and self.pause_ip != '0.0.0.0':
             target_pause = False if is_pause else True
             if force or target_pause != self.pause_state:
+                write_attempted = True
                 if self._write_relay_state(self.pause_ip, target_pause):
                     self.pause_state = target_pause
                 else:
                     success = False
 
         # 2. SG-Ready Boost Kontakt
-        if self.sg_ip and self.sg_ip != '0.0.0.0':
+        if success and self.sg_ip and self.sg_ip != '0.0.0.0':
             if force or is_boost != self.sg_state:
+                write_attempted = True
                 if self._write_relay_state(self.sg_ip, is_boost):
                     self.sg_state = is_boost
                 else:
                     success = False
 
-        if success:
-            self._persist_state(self.last_sync_reason)
-                
+        if not success and write_attempted:
+            rollback_ok = self._rollback_safe_state()
+            if not rollback_ok:
+                logger.error("Shelly WP: bestätigter Safe-State-Rollback unvollständig")
+            return False
+
+        self._persist_state(self.last_sync_reason)
+
         return success
-        
+
     def write_hz_boost(self, mode, temp=None): self.set_boost(mode, temp, 0, None)
     def write_ww_boost(self, mode, temp=45.0): self.set_boost(0, None, mode, temp)
     def write_zirkulation(self, mode): pass
@@ -527,7 +653,7 @@ class IDMHeatpump:
     """Modbus Wrapper für IDM-Wärmepumpen (Native Überschusssteuerung via Reg 74)."""
     COOLING_START_HYSTERESIS_C = 2.0
 
-    def __init__(self, ip):
+    def __init__(self, ip, safety_gate=None):
         self.ip = ip
         self._connected = False
         self.client = None
@@ -543,12 +669,32 @@ class IDMHeatpump:
         self.surplus_heartbeat_s = 60.0
         self.surplus_min_write_interval_s = 10.0
         self.last_surplus_info_bucket = None
-        
+
         # Interner Status für Thermostat-Hysterese
         self.curr_ext_ww = False
         self.curr_ext_hz = False
         self.curr_ext_khl = False
-        
+        self._actuator_gate = safety_gate or _new_energy_actuator_gate()
+        self._actuator_driver_key = f"transport:modbus-tcp:{self.ip}:502"
+        self.actor_writes_blocked = False
+        self.actor_write_block_reason = ""
+        self.last_boost_outcome = {
+            "status": "idle",
+            "attempted": False,
+            "command_sent": False,
+            "readback_confirmed": False,
+            "reason": "",
+        }
+
+    def _set_boost_outcome(self, status, *, attempted, command_sent, readback_confirmed, reason=""):
+        self.last_boost_outcome = {
+            "status": str(status),
+            "attempted": bool(attempted),
+            "command_sent": bool(command_sent),
+            "readback_confirmed": bool(readback_confirmed),
+            "reason": str(reason or ""),
+        }
+
     def connect(self):
         # Modbus-TCP Server (speziell IDM) hassen Dauerverbindungen!
         # Daher versuchen wir hier in der Hauptschleife gar nicht erst einen Socket
@@ -586,7 +732,63 @@ class IDMHeatpump:
         import struct
         packed = struct.pack('>f', float(value))
         regs = struct.unpack('>HH', packed)
-        client.write_registers(address, [regs[1], regs[0]])
+        return client.write_registers(address, [regs[1], regs[0]])
+
+    @staticmethod
+    def _response_ok(result):
+        return bool(result is not None and not (hasattr(result, "isError") and result.isError()))
+
+    def _write_register_confirmed(self, client, address, value, action):
+        if not _authorize_heatpump_output(self, action):
+            return False
+        result = client.write_register(address=address, value=int(value))
+        if not self._response_ok(result):
+            return False
+        readback = client.read_holding_registers(address=address, count=1)
+        if not self._response_ok(readback) or not getattr(readback, "registers", None):
+            return False
+        return int(readback.registers[0]) == int(value)
+
+    def _write_float_confirmed(self, client, address, value, action):
+        if not _authorize_heatpump_output(self, action):
+            return False
+        result = self._write_float(client, address, value)
+        if not self._response_ok(result):
+            return False
+        readback = self._read_float(client, address)
+        return readback is not None and abs(float(readback) - float(value)) <= 0.11
+
+    def _rollback_safe_state_confirmed(self, client, reason):
+        """Entfernt alle schreibbaren externen Anforderungen.
+
+        Register 1006 ist der vom Navigator gemeldete Read-only-Smart-Grid-Status
+        und darf nie Teil eines Befehls oder Rollbacks sein.
+        """
+        steps = (
+            (1710, 0, "idm:rollback_heat_request"),
+            (1712, 0, "idm:rollback_ww_request"),
+            (1711, 0, "idm:rollback_cooling_request"),
+        )
+        results = []
+        for address, value, action in steps:
+            try:
+                results.append(self._write_register_confirmed(client, address, value, action))
+            except Exception:
+                results.append(False)
+        rollback_ok = bool(results and all(results))
+        if rollback_ok:
+            self.curr_ext_hz = False
+            self.curr_ext_ww = False
+            self.curr_ext_khl = False
+            self.last_ext_states = (False, False, False)
+            logger.warning("IDM Safe-State-Rollback bestätigt (%s)", reason)
+        else:
+            self.curr_ext_hz = None
+            self.curr_ext_ww = None
+            self.curr_ext_khl = None
+            self.last_ext_states = None
+            logger.error("IDM Safe-State-Rollback unvollständig (%s)", reason)
+        return rollback_ok
 
     def _ramp_surplus_kw(self, target_kw):
         current = float(getattr(self, 'last_sent_surplus_kw', 0.0) or 0.0)
@@ -598,20 +800,37 @@ class IDMHeatpump:
 
     def set_boost(self, hz_mode, hz_temp, ww_mode, ww_temp, kuehl_mode=0, kuehl_soll=None, wp_data=None):
         """Software-Thermostat: Überwacht Ist-Temperaturen und schaltet nur 1710/1711/1712."""
+        if not _authorize_heatpump_output(self, "idm:set_boost_preflight"):
+            self._set_boost_outcome(
+                "blocked",
+                attempted=True,
+                command_sent=False,
+                readback_confirmed=False,
+                reason=self.actor_write_block_reason or "actor_gate_denied",
+            )
+            return False
         from pymodbus.client import ModbusTcpClient
         client = ModbusTcpClient(self.ip, port=502)
-        
+
         connected = False
         for _ in range(3):
             if client.connect():
                 connected = True
                 break
             time.sleep(1)
-            
+
         if not connected:
+            self._set_boost_outcome(
+                "failed",
+                attempted=True,
+                command_sent=False,
+                readback_confirmed=False,
+                reason="modbus_connect_failed",
+            )
             logger.error(f"IDM set_boost: Modbus-Verbindung zu {self.ip} fehlgeschlagen (Port belegt?)")
             return False
-        
+
+        writes_started = False
         try:
             # 1. Ist-Werte auslesen
             ist_ww_zapf = self._read_float(client, 1030) # Warmwasserzapftemperatur
@@ -619,10 +838,10 @@ class IDMHeatpump:
             ist_ww = ist_ww_oben if ist_ww_oben is not None else ist_ww_zapf
             ist_hz = self._read_float(client, 1008) # Wärmespeichertemperatur
             ist_khl = self._read_float(client, 1010) # Kältespeichertemperatur
-            
+
             # --- PV-Pause Logik (Aushungern) ---
             is_pause = (hz_mode == 1 and hz_temp is not None and hz_temp <= 20.0)
-            
+
             new_ext_ww = False
             new_ext_hz = False
             new_ext_khl = False
@@ -632,13 +851,13 @@ class IDMHeatpump:
                 if ww_mode == 1 and ww_temp and ist_ww is not None:
                     target_ww = float(ww_temp)
                     # 8°C Hysterese für Warmwasser, um WP-Takten im Minutentakt zu verhindern!
-                    if ist_ww < (target_ww - 8.0): 
+                    if ist_ww < (target_ww - 8.0):
                         new_ext_ww = True
                     elif ist_ww >= target_ww:
                         new_ext_ww = False
-                    else: 
+                    else:
                         new_ext_ww = getattr(self, 'curr_ext_ww', False)
-                
+
                 # --- Heizung Logik ---
                 if hz_mode == 1 and hz_temp and ist_hz is not None:
                     target_hz = float(hz_temp)
@@ -648,7 +867,7 @@ class IDMHeatpump:
                         new_ext_hz = False
                     else:
                         new_ext_hz = getattr(self, 'curr_ext_hz', False)
-                
+
                 # --- Kühlung Logik ---
                 if kuehl_mode == 1 and kuehl_soll and ist_khl is not None:
                     target_khl = float(kuehl_soll)
@@ -659,47 +878,55 @@ class IDMHeatpump:
                     else:
                         new_ext_khl = getattr(self, 'curr_ext_khl', False)
 
-            # --- Register 1006 (Smart Grid) bestimmen ---
-            if is_pause:
-                target_1006 = 0 # Sperre
-            elif new_ext_ww or new_ext_hz or new_ext_khl:
-                target_1006 = 2 # PV-Überschuss aktiv -> WP auf Hochtouren
-            else:
-                target_1006 = 1 # Normalbetrieb
-                
-            if not hasattr(self, 'curr_1006') or self.curr_1006 != target_1006:
-                client.write_register(1006, target_1006)
-                self.curr_1006 = target_1006
-                modes = {0: "SPERRE (0)", 1: "NORMAL (1)", 2: "PV-Vollgas (2)"}
-                logger.info(f"IDM Smart Grid Status (1006) -> {modes.get(target_1006, str(target_1006))}")
-            
             # --- 2. Register nur schreiben wenn nötig ---
             val_ww = 1 if new_ext_ww else 0
             val_hz = 1 if new_ext_hz else 0
             val_khl = 1 if new_ext_khl else 0
-            
+
             status_ww = f"EIN (Speicher oben: {ist_ww}°C < Soll: {ww_temp}°C)" if new_ext_ww else f"AUS (Speicher oben: {ist_ww}°C, Zapf: {ist_ww_zapf}°C)"
             status_hz = f"EIN (Ist: {ist_hz}°C < Soll: {hz_temp}°C)" if new_ext_hz else f"AUS (Ist: {ist_hz}°C)"
             status_khl = f"EIN (Ist: {ist_khl}°C > Soll: {kuehl_soll}°C)" if new_ext_khl else (f"AUS (Ist: {ist_khl}°C)" if ist_khl is not None else "AUS")
-            
+
             log_str = f"WW: {status_ww} | HZ: {status_hz} | KHL: {status_khl}" if (ww_mode == 1 or hz_mode == 1 or kuehl_mode == 1) else "Alle externen Anforderungen deaktiviert."
-            
+
             current_states = (new_ext_ww, new_ext_hz, new_ext_khl)
             if not hasattr(self, 'last_ext_states') or self.last_ext_states != current_states:
-                client.write_register(address=1712, value=val_ww)
-                client.write_register(address=1710, value=val_hz)
-                client.write_register(address=1711, value=val_khl)
+                writes_started = True
+                writes_ok = (
+                    self._write_register_confirmed(client, 1712, val_ww, "idm:write_ww_request")
+                    and self._write_register_confirmed(client, 1710, val_hz, "idm:write_heat_request")
+                    and self._write_register_confirmed(client, 1711, val_khl, "idm:write_cooling_request")
+                )
+                if not writes_ok:
+                    raise RuntimeError("IDM Thermostat-Write/Readback nicht vollständig bestätigt")
                 self.curr_ext_ww = new_ext_ww
                 self.curr_ext_hz = new_ext_hz
                 self.curr_ext_khl = new_ext_khl
                 logger.info(f"IDM Thermostat Status-Wechsel -> {log_str}")
                 self.last_ext_states = current_states
-                
+
         except Exception as e:
+            if writes_started:
+                self._rollback_safe_state_confirmed(client, "set_boost_partial_failure")
+            self._set_boost_outcome(
+                "failed",
+                attempted=True,
+                command_sent=writes_started,
+                readback_confirmed=False,
+                reason=f"write_or_readback_failed:{type(e).__name__}",
+            )
             logger.error(f"Fehler im IDM Thermostat (set_boost): {e}")
+            return False
         finally:
             client.close()
-            
+
+        self._set_boost_outcome(
+            "confirmed",
+            attempted=True,
+            command_sent=writes_started,
+            readback_confirmed=True,
+            reason="typed_register_readback" if writes_started else "cached_confirmed_register_state",
+        )
         return True
 
     def write_hz_boost(self, mode, temp=None):
@@ -712,19 +939,22 @@ class IDMHeatpump:
         """Manueller Boost: schreibt Register 1710/1711/1712 DIREKT ohne Hysterese-Check.
         Optionale Schutz-Limits verhindern eine Aktivierung bei bereits erfülltem Ziel.
         Externe Kühlung wird ohne gültige Kältespeicher-Mindestgrenze nie freigegeben."""
+        if not _authorize_heatpump_output(self, "idm:force_boost_preflight"):
+            return False
         from pymodbus.client import ModbusTcpClient
         client = ModbusTcpClient(self.ip, port=502)
-        
+
         connected = False
         for _ in range(3):
             if client.connect():
                 connected = True
                 break
             time.sleep(1)
-            
+
         if not connected:
             logger.error("IDM force_boost: Modbus Verbindung fehlgeschlagen")
             return False
+        writes_started = False
         try:
             # Schutz-Check: Ist-Temperaturen direkt vor dem Modbus-Schreiben lesen.
             if ww_max is not None or hz_max is not None:
@@ -763,18 +993,22 @@ class IDMHeatpump:
                         )
                         khl_on = False
 
-            client.write_register(address=1710, value=1 if hz_on else 0)
-            client.write_register(address=1712, value=1 if ww_on else 0)
-            client.write_register(address=1711, value=1 if khl_on else 0)
-            sg_val = 2 if (hz_on or ww_on or khl_on) else 1
-            client.write_register(1006, sg_val)
+            writes_started = True
+            writes_ok = (
+                self._write_register_confirmed(client, 1710, 1 if hz_on else 0, "idm:force_heat")
+                and self._write_register_confirmed(client, 1712, 1 if ww_on else 0, "idm:force_ww")
+                and self._write_register_confirmed(client, 1711, 1 if khl_on else 0, "idm:force_cooling")
+            )
+            if not writes_ok:
+                raise RuntimeError("IDM Force-Boost-Write/Readback nicht vollständig bestätigt")
             self.curr_ext_hz  = hz_on
             self.curr_ext_ww  = ww_on
             self.curr_ext_khl = khl_on
-            self.curr_1006    = sg_val
-            logger.info(f"IDM force_boost: HZ={hz_on} WW={ww_on} KHL={khl_on} SmartGrid={sg_val}")
+            logger.info(f"IDM force_boost: HZ={hz_on} WW={ww_on} KHL={khl_on}")
             return True
         except Exception as e:
+            if writes_started:
+                self._rollback_safe_state_confirmed(client, "force_boost_partial_failure")
             logger.error(f"IDM force_boost Fehler: {e}")
             return False
         finally:
@@ -787,6 +1021,8 @@ class IDMHeatpump:
         fluechtige PV-Vorgabe und eignet sich fuer eine ruhige iDM-Grundlast,
         z.B. auf 2 kW begrenzt.
         """
+        if not _authorize_heatpump_output(self, "idm:update_surplus_preflight"):
+            return False
         from pymodbus.client import ModbusTcpClient
 
         if not self.surplus_enabled:
@@ -827,7 +1063,8 @@ class IDMHeatpump:
             logger.error(f"IDM update_surplus: Modbus-Verbindung zu {self.ip} fehlgeschlagen")
             return False
         try:
-            self._write_float(client, 74, send_kw)
+            if not self._write_float_confirmed(client, 74, send_kw, "idm:write_surplus"):
+                raise RuntimeError("IDM Überschuss-Write/Readback nicht bestätigt")
             self.last_sent_surplus_kw = send_kw
             self.last_surplus_write_ts = now_ts
             source_bucket = "force" if force_kw is not None else ("off" if not self.surplus_enabled else "auto")
@@ -853,7 +1090,7 @@ class DimplexHeatpump:
     SG_RED = 12
     SG_DARK_GREEN = 13
 
-    def __init__(self, ip, port=502, unit_id=1, sg_register=5167, zero_based=False, heartbeat_s=300, allow_dark_green=False):
+    def __init__(self, ip, port=502, unit_id=1, sg_register=5167, zero_based=False, heartbeat_s=300, allow_dark_green=False, safety_gate=None):
         self.ip = str(ip or "").strip()
         self.port = int(float(port or 502))
         self.unit_id = int(float(unit_id or 1))
@@ -865,6 +1102,10 @@ class DimplexHeatpump:
         self.curr_sg_state = None
         self.last_sent_sg_state = None
         self.last_sg_write_ts = 0.0
+        self._actuator_gate = safety_gate or _new_energy_actuator_gate()
+        self._actuator_driver_key = f"transport:modbus-tcp:{self.ip}:{self.port}"
+        self.actor_writes_blocked = False
+        self.actor_write_block_reason = ""
 
     @property
     def sg_address(self):
@@ -907,6 +1148,8 @@ class DimplexHeatpump:
         return self.SG_NORMAL
 
     def _write_sg_state(self, target_state, reason=""):
+        if not _authorize_heatpump_output(self, "dimplex:write_sg_preflight"):
+            return False
         if not self.connect():
             logger.error("Dimplex SG: IP nicht konfiguriert")
             return False
@@ -930,14 +1173,38 @@ class DimplexHeatpump:
             logger.error(f"Dimplex SG: Modbus-Verbindung zu {self.ip}:{self.port} fehlgeschlagen")
             return False
         try:
+            # Verbindungswiederholungen können mehrere Sekunden dauern. Deshalb
+            # direkt vor dem physischen Schreibvorgang erneut prüfen.
+            if not _authorize_heatpump_output(self, "dimplex:write_sg_state"):
+                return False
             result = self._call_modbus(
                 client,
                 "write_register",
                 address=self.sg_address,
                 value=int(target_state),
             )
-            if result is not None and hasattr(result, "isError") and result.isError():
+            if result is None or (hasattr(result, "isError") and result.isError()):
                 logger.error(f"Dimplex SG: Register {self.sg_register} write error: {result}")
+                return False
+            if not _authorize_heatpump_output(self, "dimplex:confirm_sg_write"):
+                return False
+            readback = self._call_modbus(
+                client,
+                "read_holding_registers",
+                address=self.sg_address,
+                count=1,
+            )
+            if (
+                readback is None
+                or (hasattr(readback, "isError") and readback.isError())
+                or not getattr(readback, "registers", None)
+                or int(readback.registers[0]) != int(target_state)
+            ):
+                logger.error(
+                    "Dimplex SG: Register %s Readback unbestätigt (Soll=%s)",
+                    self.sg_register,
+                    target_state,
+                )
                 return False
             self.curr_sg_state = int(target_state)
             self.last_sent_sg_state = int(target_state)
@@ -1007,6 +1274,7 @@ BACKUP_DIR = "/var/www/html/data/luxtronik_archive"
 LUXTRONIK_RAMDISK_HISTORY_MAX_LINES = 1440
 LUXTRONIK_RAMDISK_HISTORY_MAX_BYTES = 8 * 1024 * 1024
 LUXTRONIK_RAMDISK_HISTORY_TRIM_INTERVAL_S = 600
+LEGACY_ENERGY_STATE_FILE = "/var/www/html/data/morning_boost_state.json"
 ENERGY_STATE_FILE = "/var/www/html/data/energy_manager_state.json"
 SHELLY_HEATPUMP_STATE_FILE = "/var/www/html/data/shelly_heatpump_state.json"
 ENERGY_STATE_ACTIVE_RESTORE_MAX_AGE_S = 1200.0
@@ -1025,6 +1293,158 @@ HEAT_POLICY_LATEST_PATH = "/var/www/html/ramdisk/heat_policy_latest.json"
 ENERGY_DECISION_HISTORY_PREFIX = "energy_decision_history_"
 
 _energy_decision_history_state = {}
+
+def read_manual_boost_command(path=FLAG_FILE):
+    """Liest einen privaten atomaren Auftrag, ohne Links zu folgen oder Inode-Wechsel zu überholen."""
+    absent = {"present": False, "valid": False, "action": "none", "reason": "absent"}
+    try:
+        lst = os.lstat(path)
+    except FileNotFoundError:
+        return absent
+    except OSError as exc:
+        return {**absent, "present": True, "reason": f"lstat_error:{type(exc).__name__}"}
+
+    if not stat.S_ISREG(lst.st_mode) or lst.st_nlink != 1:
+        return {**absent, "present": True, "reason": "not_regular_single_link"}
+    if lst.st_mode & 0o007:
+        return {**absent, "present": True, "reason": "world_accessible"}
+    if lst.st_size <= 0 or lst.st_size > 4096:
+        return {**absent, "present": True, "reason": "invalid_size"}
+
+    fd = None
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags)
+        opened = os.fstat(fd)
+        if (
+            opened.st_dev != lst.st_dev
+            or opened.st_ino != lst.st_ino
+            or not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+        ):
+            return {**absent, "present": True, "reason": "inode_changed"}
+        chunks = []
+        remaining = 4097
+        while remaining > 0:
+            chunk = os.read(fd, min(remaining, 1024))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        if len(raw) > 4096:
+            return {**absent, "present": True, "reason": "oversize"}
+        text = raw.decode("utf-8", errors="strict").strip()
+    except (OSError, UnicodeError) as exc:
+        return {**absent, "present": True, "reason": f"read_error:{type(exc).__name__}"}
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    action = "on"
+    schema = "legacy_manual_boost_flag"
+    if text.startswith("{"):
+        try:
+            payload = json.loads(text)
+        except (TypeError, ValueError):
+            return {**absent, "present": True, "reason": "invalid_json"}
+        if not isinstance(payload, dict) or payload.get("schema") != "manual_heatpump_command_v1":
+            return {**absent, "present": True, "reason": "invalid_schema"}
+        action = str(payload.get("action") or "").strip().lower()
+        if action not in ("on", "off"):
+            return {**absent, "present": True, "reason": "invalid_action"}
+        schema = "manual_heatpump_command_v1"
+    elif not text:
+        return {**absent, "present": True, "reason": "empty_legacy_flag"}
+
+    return {
+        "present": True,
+        "valid": True,
+        "action": action,
+        "schema": schema,
+        "mtime": float(lst.st_mtime),
+        "dev": int(lst.st_dev),
+        "ino": int(lst.st_ino),
+        "reason": "ok",
+    }
+
+
+def manual_boost_command_is_current(command, path=FLAG_FILE):
+    """Prüft, ob ein bereits gelesener Auftrag weiterhin den aktuellen Inode bezeichnet."""
+    if not isinstance(command, dict) or not command.get("valid"):
+        return False
+    try:
+        current = os.lstat(path)
+        return bool(
+            stat.S_ISREG(current.st_mode)
+            and current.st_nlink == 1
+            and int(current.st_dev) == int(command.get("dev", -1))
+            and int(current.st_ino) == int(command.get("ino", -1))
+        )
+    except OSError:
+        return False
+
+
+def _lock_manual_command_directory(path):
+    """Sperrt das von Web-Submitter und Owner gemeinsam verwendete Befehlsverzeichnis."""
+    import fcntl
+
+    parent = os.path.dirname(os.path.abspath(path))
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(parent, flags)
+    metadata = os.fstat(fd)
+    if not stat.S_ISDIR(metadata.st_mode):
+        os.close(fd)
+        raise OSError("manual command parent is not a directory")
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+
+def _unlock_manual_command_directory(fd):
+    import fcntl
+
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def consume_manual_boost_command(command, path=FLAG_FILE):
+    """Übernimmt und verbraucht atomar nur den exakt erfolgreich angewendeten Auftrag."""
+    lock_fd = None
+    claim_path = ""
+    try:
+        lock_fd = _lock_manual_command_directory(path)
+        if not manual_boost_command_is_current(command, path):
+            return False
+        claim_path = f"{path}.claimed.{os.getpid()}.{time.time_ns()}"
+        os.replace(path, claim_path)
+        claimed = os.lstat(claim_path)
+        if (
+            int(claimed.st_dev) != int(command.get("dev", -1))
+            or int(claimed.st_ino) != int(command.get("ino", -1))
+            or not stat.S_ISREG(claimed.st_mode)
+            or claimed.st_nlink != 1
+        ):
+            if not os.path.lexists(path):
+                os.replace(claim_path, path)
+                claim_path = ""
+            return False
+        os.unlink(claim_path)
+        claim_path = ""
+        os.fsync(lock_fd)
+        return True
+    except OSError:
+        return False
+    finally:
+        if lock_fd is not None:
+            try:
+                _unlock_manual_command_directory(lock_fd)
+            except OSError:
+                pass
 
 def _safe_float(value, default=0.0):
     try:
@@ -1169,6 +1589,99 @@ def heatpump_budget_allows_start(storage_manager_owns_energy, free_for_limbs_w, 
     return _safe_float(soc, 0.0) >= _safe_float(min_soc, 80.0)
 
 
+def attempt_heatpump_pv_boost_start(
+    wp,
+    boost_args,
+    *,
+    now_ts=None,
+    retry_not_before_ts=0.0,
+    retry_backoff_s=60.0,
+):
+    """Führt ausschließlich einen PV-Boost-Start mit typisiertem Ergebnis aus.
+
+    Der Backoff begrenzt fehlgeschlagene Startversuche. Stop-, Nutzer-Aus- und
+    Safety-Pfade rufen diesen Starthelfer bewusst nicht auf und bleiben daher
+    jederzeit ausführbar.
+    """
+    now_value = time.time() if now_ts is None else _safe_float(now_ts, time.time())
+    retry_at = max(0.0, _safe_float(retry_not_before_ts, 0.0))
+    if now_value < retry_at:
+        return {
+            "status": "backoff",
+            "pending": True,
+            "attempted": False,
+            "confirmed": False,
+            "failed": False,
+            "command_sent": False,
+            "readback_confirmed": False,
+            "reason": "retry_backoff_active",
+            "retry_not_before_ts": retry_at,
+        }
+
+    if wp is None:
+        return {
+            "status": "failed",
+            "pending": False,
+            "attempted": False,
+            "confirmed": False,
+            "failed": True,
+            "command_sent": False,
+            "readback_confirmed": False,
+            "reason": "heatpump_driver_missing",
+            "retry_not_before_ts": now_value + max(1.0, _safe_float(retry_backoff_s, 60.0)),
+        }
+
+    raw_result = False
+    raised_reason = ""
+    try:
+        raw_result = bool(wp.set_boost(*tuple(boost_args)))
+    except Exception as exc:
+        raised_reason = f"driver_exception:{type(exc).__name__}"
+
+    driver_outcome = getattr(wp, "last_boost_outcome", None)
+    if isinstance(driver_outcome, dict):
+        attempted = bool(driver_outcome.get("attempted", True))
+        command_sent = bool(driver_outcome.get("command_sent", False))
+        readback_confirmed = bool(driver_outcome.get("readback_confirmed", False))
+        reason = str(driver_outcome.get("reason", "") or raised_reason)
+        driver_status = str(driver_outcome.get("status", "") or "failed")
+        confirmed = bool(raw_result and driver_status == "confirmed" and readback_confirmed)
+    else:
+        # Bestehende Nicht-IDM-Treiber liefern True nur nach ihrem bestätigten
+        # Treibervertrag. Der neue IDM-Pfad verwendet immer das typisierte Dict.
+        attempted = True
+        command_sent = bool(raw_result)
+        readback_confirmed = bool(raw_result)
+        reason = raised_reason or ("legacy_driver_confirmed" if raw_result else "legacy_driver_failed")
+        driver_status = "confirmed" if raw_result else "failed"
+        confirmed = bool(raw_result)
+
+    if confirmed:
+        return {
+            "status": "confirmed",
+            "pending": False,
+            "attempted": attempted,
+            "confirmed": True,
+            "failed": False,
+            "command_sent": command_sent,
+            "readback_confirmed": readback_confirmed,
+            "reason": reason,
+            "retry_not_before_ts": 0.0,
+        }
+
+    return {
+        "status": "blocked" if driver_status == "blocked" else "failed",
+        "pending": True,
+        "attempted": attempted,
+        "confirmed": False,
+        "failed": True,
+        "command_sent": command_sent,
+        "readback_confirmed": readback_confirmed,
+        "reason": reason or "start_not_confirmed",
+        "retry_not_before_ts": now_value + max(1.0, _safe_float(retry_backoff_s, 60.0)),
+    }
+
+
 def wallbox_phase_transition_blocks_heatpump_start(budget_surface, now_ts=None):
     """Blockiere nur neue WP-Starts während einer frischen Wallbox-Umschaltung."""
 
@@ -1181,13 +1694,9 @@ def wallbox_phase_transition_blocks_heatpump_start(budget_surface, now_ts=None):
     )
     reserved_w = max(
         0,
-        _safe_int(
-            data.get(
-                "wallbox_phase_transition_reserved_w",
-                nested.get("reserved_w", 0),
-            ),
-            0,
-        ),
+        _safe_int(data.get("wallbox_phase_transition_reserved_w"), 0),
+        _safe_int(data.get("wallbox_phase_transition_requested_w_total"), 0),
+        _safe_int(nested.get("requested_w", nested.get("reserved_w", 0)), 0),
     )
     expires_ts = _safe_float(
         data.get(
@@ -1211,165 +1720,17 @@ def heatpump_surplus_budget_during_phase_transition(
     heatpump_running=False,
     heatpump_running_commitment_w=0,
 ):
-    """Block new starts while preserving a confirmed running iDM hold."""
+    """Sperrt neue Starts, erhält aber eine bereits laufende Wärmepumpenfreigabe."""
 
-    available_w = max(0, _safe_int(free_for_limbs_w, 0))
-    if not wallbox_phase_transition_active:
-        return available_w
-    if heatpump_running:
-        return max(available_w, max(0, _safe_int(heatpump_running_commitment_w, 0)))
-    return 0
-
-
-def heatpump_surplus_write_allowed_during_phase_transition(
-    wallbox_phase_transition_active,
-    heatpump_running_observation_valid,
-    heatpump_running=False,
-    heatpump_running_commitment_w=0,
-):
-    """Only a fresh, positive confirmed hold may be rewritten in transition."""
-
-    if not wallbox_phase_transition_active:
-        return True
-    return bool(
-        heatpump_running_observation_valid
-        and heatpump_running
-        and _safe_int(heatpump_running_commitment_w, 0) > 0
-    )
-
-
-def heatpump_confirmed_running_commitment(
-    wp_data,
-    *,
-    wp_type=-1,
-    wp=None,
-    compressor_running=False,
-    observation_valid=False,
-):
-    """Return only fresh physical power or an iDM register-74 hold."""
-
-    if not observation_valid or not compressor_running:
-        return {"commitment_w": 0, "source": "none"}
-    observed_w, power_known, _accepting = heatpump_power_observation(
-        wp_data if isinstance(wp_data, dict) else {}
-    )
-    if power_known and _safe_float(observed_w, 0.0) > 100.0:
-        return {
-            "commitment_w": max(0, _safe_int(observed_w, 0)),
-            "source": "fresh_physical_readback",
-        }
-    if _safe_int(wp_type, -1) == 1 and wp is not None:
-        idm_hold_w = max(
-            0,
-            _safe_int(_safe_float(getattr(wp, "last_sent_surplus_kw", 0.0), 0.0) * 1000.0, 0),
-        )
-        if idm_hold_w > 0:
-            return {"commitment_w": idm_hold_w, "source": "idm_register74_confirmed_hold"}
-    return {"commitment_w": 0, "source": "none"}
-
-
-def heatpump_transition_stop_allowed(
-    wallbox_phase_transition_active,
-    compressor_observation_valid,
-    compressor_running,
-    *,
-    emergency_stop=False,
-    hard_user_off=False,
-    price_pain=False,
-    invalid_actuator=False,
-    connection_limit=False,
-):
-    """Executable F040 contract for every normal stop/null output."""
-
-    if emergency_stop or hard_user_off or price_pain or invalid_actuator or connection_limit:
-        return True
-    if not wallbox_phase_transition_active:
-        return True
-    # During a transition both a fresh running compressor and stale/unknown
-    # state fail closed against a transition-induced stop or zero command.
-    if not compressor_observation_valid:
-        return False
-    return not bool(compressor_running)
-
-
-def wallbox_transition_preserves_running_heatpump(
-    wallbox_phase_transition_active,
-    compressor_observation_valid,
-    compressor_running,
-    *,
-    emergency_stop=False,
-):
-    return not heatpump_transition_stop_allowed(
-        wallbox_phase_transition_active,
-        compressor_observation_valid,
-        compressor_running,
-        emergency_stop=emergency_stop,
-    )
-
-
-def execute_transition_guarded_heatpump_stop(
-    wp,
-    ww_temp,
-    *,
-    wallbox_phase_transition_active,
-    compressor_observation_valid,
-    compressor_running,
-    emergency_stop=False,
-    hard_user_off=False,
-    price_pain=False,
-    invalid_actuator=False,
-    connection_limit=False,
-):
-    """The executable edge for normal transition-reachable WP stop writes."""
-
-    allowed = heatpump_transition_stop_allowed(
-        wallbox_phase_transition_active,
-        compressor_observation_valid,
-        compressor_running,
-        emergency_stop=emergency_stop,
-        hard_user_off=hard_user_off,
-        price_pain=price_pain,
-        invalid_actuator=invalid_actuator,
-        connection_limit=connection_limit,
-    )
-    if not allowed:
-        return {"allowed": False, "executed": False, "success": False}
-    if wp is None:
-        return {"allowed": True, "executed": False, "success": False}
-    success = bool(wp.set_boost(0, None, 0, ww_temp))
-    return {"allowed": True, "executed": True, "success": success}
-
-
-def execute_transition_guarded_heatpump_surplus_update(
-    wp,
-    grid_w,
-    free_for_limbs_w,
-    *,
-    wallbox_phase_transition_active,
-    compressor_observation_valid,
-    compressor_running,
-    confirmed_commitment_w,
-):
-    """Executable iDM output edge; never synthesize a transition-time zero."""
-
-    allowed = heatpump_surplus_write_allowed_during_phase_transition(
-        wallbox_phase_transition_active,
-        compressor_observation_valid,
-        heatpump_running=compressor_running,
-        heatpump_running_commitment_w=confirmed_commitment_w,
-    )
-    if not allowed or wp is None:
-        return {"allowed": allowed, "executed": False}
-    wp.update_surplus(
-        grid_w,
-        free_for_limbs_w=heatpump_surplus_budget_during_phase_transition(
-            free_for_limbs_w,
-            wallbox_phase_transition_active,
-            heatpump_running=compressor_running,
-            heatpump_running_commitment_w=confirmed_commitment_w,
-        ),
-    )
-    return {"allowed": True, "executed": True}
+    if wallbox_phase_transition_active:
+        if heatpump_running:
+            return max(
+                0,
+                _safe_int(heatpump_running_commitment_w, 0),
+                _safe_int(free_for_limbs_w, 0),
+            )
+        return 0
+    return max(0, _safe_int(free_for_limbs_w, 0))
 
 
 def heatpump_takt_start_block(wp_takt_protect, last_stop_ts, restart_block_min, now_ts=None):
@@ -1789,13 +2150,6 @@ def build_energy_decision_record(ctx):
     decision_state = "beobachtet"
     decision_reason = "Keine aktive Waermefreigabe"
     observed_wp_power_w, heatpump_power_known, heatpump_accepting_power = heatpump_power_observation(wp_data)
-    confirmed_commitment = heatpump_confirmed_running_commitment(
-        wp_data,
-        wp_type=ctx.get("wp_type", -1),
-        wp=ctx.get("wp"),
-        compressor_running=ctx.get("wp_compressor_running_now", False),
-        observation_valid=ctx.get("wp_compressor_observation_valid", False),
-    )
     if predump_heatpump_active:
         decision_state = "predump_waerme_hold" if predump_heatpump_hold_active else "predump_waerme_start"
         decision_reason = "Pre-Dump gibt Waermepumpe frei; Mindestlaufzeit schuetzt vor kurzem Takten"
@@ -1906,7 +2260,7 @@ def build_energy_decision_record(ctx):
             "heatpump_pause_request": heatpump_pause_request,
         },
         "heatpump": {
-            "configured": bool(ctx.get("wp_configured", ctx.get("wp"))),
+            "configured": bool(ctx.get("wp")),
             "connected": bool(ctx.get("wp_connected", False)),
             "type": _safe_int(ctx.get("wp_type", -1), -1),
             "wp_power_w": observed_wp_power_w,
@@ -1920,8 +2274,6 @@ def build_energy_decision_record(ctx):
             "ww_mode": wp_status.get("WW_Mode"),
             "compressor_running": bool(ctx.get("wp_compressor_running_now", False)),
             "compressor_observation_valid": bool(ctx.get("wp_compressor_observation_valid", False)),
-            "confirmed_commitment_w": int(confirmed_commitment.get("commitment_w", 0) or 0),
-            "confirmed_commitment_source": str(confirmed_commitment.get("source") or "none"),
             "compressor_history_valid": bool(ctx.get("wp_compressor_history_valid", False)),
             "compressor_last_start_ts": _safe_float(ctx.get("wp_compressor_last_start_ts", 0.0), 0.0),
             "compressor_last_stop_ts": _safe_float(ctx.get("wp_compressor_last_stop_ts", 0.0), 0.0),
@@ -2526,25 +2878,20 @@ def send_webpush(config_key, title, body, url="/", actions=None):
     if push_enabled:
         logger.info(f"Sende Web-Push '{title}': {body}")
         try:
-            home_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(script_dir))))
-            if not home_dir or home_dir == "/": home_dir = "/home/pi"
-            
-            # Pfad zum Push Sender im Installer Verzeichnis
-            push_script = os.path.join(home_dir, "Install", "Installer", "send_push.py")
-            venv_python = os.path.join(home_dir, ".venv_e3dc", "bin", "python")
-            
-            cmd_python = venv_python if os.path.exists(venv_python) else "python3"
-            
-            if os.path.exists(push_script):
-                # Wir rufen es asynchron (fire and forget) per subprocess auf, 
+            install_root = os.path.dirname(os.path.dirname(os.path.abspath(script_dir)))
+            push_script = os.path.join(install_root, "Installer", "send_push.py")
+            cmd_python = sys.executable if os.path.isabs(sys.executable) and os.path.isfile(sys.executable) else ""
+
+            if cmd_python and os.path.exists(push_script):
+                # Wir rufen es asynchron (fire and forget) per subprocess auf,
                 # damit der energy_manager nicht auf eine Antwort der Apple/Google Server warten muss!
                 cmd_args = [cmd_python, push_script, title, body, "--url", url]
                 if actions:
                     cmd_args.extend(["--actions", actions])
-                    
+
                 subprocess.Popen(cmd_args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             else:
-                logger.error(f"Push-Skript nicht gefunden unter: {push_script}")
+                logger.error("Push-Aufruf blockiert: Release-Skript oder aktueller Interpreter fehlt")
         except Exception as e:
              logger.error(f"Fehler beim Web-Push Aufruf: {e}")
 
@@ -2552,22 +2899,22 @@ def setup_logging():
     """Initialisiert ein rotierendes Logfile für den Energy Manager."""
     os.makedirs(LOG_DIR, exist_ok=True)
     log_file = os.path.join(LOG_DIR, "energy_manager.log")
-    
+
     logger.setLevel(logging.INFO)
-    
+
     formatter = logging.Formatter('%(asctime)s - %(message)s', datefmt='%d.%m %H:%M:%S')
-    
+
     if not logger.handlers:
         # 1. Dateiausgabe (für das Web-Dashboard)
         file_handler = RotatingFileHandler(log_file, maxBytes=1024*1024, backupCount=1, encoding='utf-8')
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
-        
+
         # 2. Konsolenausgabe (für journalctl)
         console_handler = logging.StreamHandler()
         console_handler.setFormatter(formatter)
         logger.addHandler(console_handler)
-        
+
     # Berechtigungen für das Logfile setzen, damit es vom Webserver gelesen werden kann
     install_quiet_info_filter(
         logger,
@@ -2589,7 +2936,7 @@ def setup_logging():
             "morning-boost beendet",
         ),
     )
-    try: 
+    try:
         os.chmod(log_file, 0o664)
         # Owner/Group vom Verzeichnis erben
         st = os.stat(LOG_DIR)
@@ -2644,7 +2991,7 @@ def load_e3dc_config_dict():
     except Exception as e:
         logger = logging.getLogger("EnergyManager")
         logger.error(f"Fehler beim Laden von e3dc_v4.json: {e}")
-        
+
     return config
 
 def get_cfg_value(config_dict, key, default=None):
@@ -2659,6 +3006,25 @@ def get_cfg_int(config_dict, key, default=0):
     val = get_cfg_value(config_dict, key, default)
     try: return int(float(val))
     except: return default
+
+def cleanup_legacy_energy_state_file(path=LEGACY_ENERGY_STATE_FILE):
+    """Remove stale Morning-Boost/SI state left by pre-V5 Energy Manager runs."""
+    if not os.path.exists(path):
+        return False
+    mode = "unknown"
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            state_data = json.load(f)
+            mode = str(state_data.get("mode") or mode)
+    except Exception:
+        pass
+    try:
+        os.remove(path)
+        logger.info("Entferne alten Energy-Manager-Status %s: V5 nutzt Pre-Dump, Ladekurve und Storage-Manager-Auftraege.", mode)
+        return True
+    except Exception as exc:
+        logger.debug("Alter Energy-Manager-Status konnte nicht entfernt werden: %s", exc)
+        return False
 
 def load_previous_energy_state(paths=None, now_obj=None):
     """Load the newest Energy-Manager state from ramdisk or persistent data."""
@@ -2762,26 +3128,71 @@ def restored_heatpump_state_contract(
     }
 
 
-def revalidate_restored_heatpump_state(contract, *, live_state_valid, auto_mode_enabled, now_ts=None):
+def revalidate_restored_heatpump_state(
+    contract,
+    *,
+    live_state_valid,
+    auto_mode_enabled,
+    actuator_state_valid=False,
+    validation_source="heatpump_live",
+    now_ts=None,
+):
     """Bestätigt nur den frischen physischen Zustand, nie den alten Aktor-Cache."""
 
     result = dict(contract) if isinstance(contract, dict) else {}
     live_valid = bool(live_state_valid)
+    actuator_valid = bool(actuator_state_valid)
     auto_enabled = bool(auto_mode_enabled)
     result["auto_mode_enabled"] = auto_enabled
     result["physical_state_valid"] = bool(live_valid and auto_enabled)
-    result["actuator_state_valid"] = False
+    result["actuator_state_valid"] = bool(actuator_valid and auto_enabled)
+    result["validation_source"] = str(validation_source or "unknown")
     result["restore_active_commands"] = False
     if not auto_enabled:
         result["safe_stop_required"] = True
         result["reason"] = "Nutzer-Aus: Wärmepumpe bleibt ohne EMS-Aktorbefehl"
-    elif not live_valid:
+    elif not (live_valid or actuator_valid):
         result["safe_stop_required"] = True
         result["reason"] = "Physischer Zustand weiterhin unbekannt oder stale: sicherer Stillstand"
     else:
         result["safe_stop_required"] = False
         result["revalidated_at"] = time.time() if now_ts is None else _safe_float(now_ts, time.time())
-        result["reason"] = "Frischer physischer Zustand validiert; Policy entscheidet ohne alten Aktor-Cache neu"
+        if actuator_valid and not live_valid:
+            result["reason"] = (
+                "Frischer Shelly-Relaiszustand validiert; "
+                "Policy entscheidet ohne Verdichter- oder Bedarfsannahme neu"
+            )
+        else:
+            result["reason"] = "Frischer physischer Zustand validiert; Policy entscheidet ohne alten Aktor-Cache neu"
+    return result
+
+
+def revalidate_shelly_restart_state(contract, wp, *, auto_mode_enabled, now_ts=None):
+    """Liest konfigurierte Shelly-Kontakte einmal frisch und öffnet nur den Aktorpfad."""
+
+    if not isinstance(wp, ShellyHeatpump):
+        raise TypeError("ShellyHeatpump erforderlich")
+    if not bool(auto_mode_enabled):
+        return revalidate_restored_heatpump_state(
+            contract,
+            live_state_valid=False,
+            actuator_state_valid=False,
+            auto_mode_enabled=False,
+            validation_source="shelly_relay_readback",
+            now_ts=now_ts,
+        )
+    relay_states = wp.refresh_relay_states()
+    relay_contract = wp.relay_readback_contract(relay_states)
+    result = revalidate_restored_heatpump_state(
+        contract,
+        live_state_valid=False,
+        actuator_state_valid=relay_contract["valid"],
+        auto_mode_enabled=True,
+        validation_source=relay_contract["source"],
+        now_ts=now_ts,
+    )
+    result["relay_required_contacts"] = relay_contract["required_contacts"]
+    result["relay_confirmed_contacts"] = relay_contract["confirmed_contacts"]
     return result
 
 
@@ -2791,15 +3202,15 @@ def get_v4_eco_score():
         path = "/var/www/html/ramdisk/eco_score.json"
         if not os.path.exists(path):
             return None, None
-            
+
         with open(path, "r") as f:
             scores = json.load(f)
-            
+
         now_ms = time.time() * 1000
         for s in scores:
             if s["start_timestamp"] <= now_ms < s["end_timestamp"]:
                 return s.get("optimization_score", 50.0), s.get("billing_price", 99.9)
-                
+
     except Exception as e:
         logger.error(f"Fehler beim Lesen der V4 Eco-Score JSON: {e}")
     return None, None
@@ -2980,12 +3391,6 @@ def main():
         (shelly_sg_ip and shelly_sg_ip != '0.0.0.0')
         or (shelly_pause_ip and shelly_pause_ip != '0.0.0.0')
     )
-    # Configuration intent and live driver availability are distinct. Failed
-    # initialization must remain configured/unknown to the wallbox gate.
-    wp_configured = bool(
-        (luxtronik_enabled and wp_type >= 0)
-        or has_shelly_heatpump
-    )
 
     if wp_type == 1 and idm_ip and luxtronik_enabled:
         try:
@@ -3029,7 +3434,7 @@ def main():
             logger.info("Neustart durch Update erkannt. Erster Auto-Update-Check wird übersprungen.")
         except Exception as e:
             logger.warning(f"Konnte Update-Flag nicht entfernen: {e}")
-            
+
     # Altes Flag im /tmp Verzeichnis sicherheitshalber ignorieren/löschen
     if os.path.exists("/tmp/em_restarted_by_update.flag"):
         try: os.remove("/tmp/em_restarted_by_update.flag")
@@ -3038,7 +3443,7 @@ def main():
     # Vorab-Deklaration für send_telegram (Closure Scope)
     TELEGRAM_TOKEN = ''
     TELEGRAM_CHAT_ID = ''
-    
+
     # Wenn durch Update neugestartet, den ersten Check überspringen.
     update_checked_today = restarted_by_update
 
@@ -3082,8 +3487,21 @@ def main():
     last_source_recovery_release_error_log_time = 0.0
     last_idm_cooling_gate_log_time = 0.0
     pv_boost_pending_start = None
+    pv_boost_retry_not_before_ts = 0.0
+    pv_boost_last_outcome = {
+        "status": "idle",
+        "pending": False,
+        "attempted": False,
+        "confirmed": False,
+        "failed": False,
+        "command_sent": False,
+        "readback_confirmed": False,
+        "reason": "",
+        "retry_not_before_ts": 0.0,
+    }
     pv_pause_pending_end = None
     pv_pause_blocked_until = 0
+    legacy_discharge_warned = False
     legacy_autonomy_warned = False
     smart_wbhour_handoff_logged = False
 
@@ -3092,7 +3510,7 @@ def main():
     e3dc_initialized = False
     guest_car_active = False
     last_history_write = 0
-    
+
     # Web-Push State Trackers
     last_push_soc_sent = False
     last_push_unplugged_sent = False
@@ -3165,6 +3583,8 @@ def main():
         except Exception as exc:
             logger.debug("Energy-Manager-Status konnte nicht wiederhergestellt werden: %s", exc)
 
+    cleanup_legacy_energy_state_file()
+
     # Init Ramdisk
     init_json = {"ts": datetime.now().isoformat(), "success": False, "error": "Dienst startet...", "data": {}, "status": {}}
     write_json_atomic_tolerant(RAMDISK_FILE, init_json, mode=0o664, warn_label="Luxtronik-Live-Datei")
@@ -3234,14 +3654,14 @@ def main():
         heat_forecast_result = None
         heat_policy_price_gate_reason = ""
         heat_policy_runtime_enabled = False
-        
+
         # ML-Prognose: Jeden Tag um 00:06 Uhr laden (Notifier erstellt sie um 00:05)
         if now.hour == 0 and now.minute == 6 and now.second < 5:
             ml_data = get_ml_prediction()
             if ml_data:
                 logger.info(f"🧠 KI Tages-Prognose geladen: Haus ~{ml_data.get('home_kwh', 0):.1f} kWh | WP ~{ml_data.get('wp_kwh', 0):.1f} kWh")
             time.sleep(5) # Verhindert Mehrfach-Ausführung in der gleichen Minute
-        
+
         # HA Standby Check: Wenn dieser Pi der Slave ist, darf er nicht auf Modbus zugreifen!
         is_standby = False
         try:
@@ -3250,14 +3670,14 @@ def main():
                     ha_data = json.load(f)
                     is_standby = (ha_data.get('mode') == 'slave' and ha_data.get('state') != 'failover')
         except: pass
-        
+
         if is_standby:
             if wp: wp.close() # Modbus-Schnittstelle sofort für den Master freigeben!
             time.sleep(10)
             continue # Schleife abbrechen, nichts regel
-        
+
         wp_write_allowed = (time.time() - script_start_time) > 65
-        
+
         # 1. Konfiguration nur bei Dateiänderung neu laden (Smart Caching)
         try:
             if os.path.exists(V4_CONFIG_PATH):
@@ -3268,16 +3688,16 @@ def main():
                     logger.info("Konfiguration aktualisiert (Dateiaenderung erkannt).")
         except Exception as e:
             logger.error(f"Fehler beim Konfigurations-Check: {e}")
-        
+
         current_config = config_cache
-        
+
         try:
             # Dynamisches Nachladen wichtiger Parameter sicher im Try-Block
             AUTO_UPDATE_ENABLE = get_cfg_int(current_config, 'auto_update_enable', 0)
             update_time_str = str(get_cfg_value(current_config, 'auto_update_time', "23:00"))
             try: update_hour, update_minute = map(int, update_time_str.split(':'))
             except: update_hour, update_minute = 23, 0
-                
+
             GRID_START_LIMIT = get_cfg_value(current_config, 'GRID_START_LIMIT', -3500)
             PV_BOOST_DELAY = get_cfg_int(current_config, 'pv_boost_delay', 30)
             STOP_DELAY_MINUTES = get_cfg_int(current_config, 'stop_delay_minutes', 10)
@@ -3343,6 +3763,12 @@ def main():
             MANUAL_BOOST_MIN_SOC = get_cfg_value(current_config, 'manual_boost_min_soc', 25)
             MANUAL_BOOST_MAX_DURATION = get_cfg_value(current_config, 'manual_boost_max_duration', 180)
 
+            legacy_mb_enable = get_cfg_int(current_config, 'morning_boost_enable', 0)
+            legacy_si_enable = get_cfg_int(current_config, 'super_intelligence_enable', 0)
+            if not legacy_discharge_warned and (legacy_mb_enable == 1 or legacy_si_enable == 1):
+                logger.info("Legacy-Speicherentladung im Energy Manager ist deaktiviert; Storage Manager/Simulator steuern Pre-Dump und Ladekurve.")
+                legacy_discharge_warned = True
+
             SMART_WBHOUR_ENABLE_RAW = get_cfg_int(current_config, 'smart_wbhour_enable', 0)
             SMART_WBHOUR_ENABLE = SMART_WBHOUR_ENABLE_RAW if energy_autonomy_allowed else 0
             try: CAR_CAPACITY = float(get_cfg_value(current_config, 'car_capacity', 72.0))
@@ -3351,6 +3777,10 @@ def main():
             except: CAR_TARGET_SOC = 80.0
             try: CAR_CHARGE_POWER = float(get_cfg_value(current_config, 'car_charge_power', 11.0))
             except: CAR_CHARGE_POWER = 11.0
+
+            V2H_ENABLE = get_cfg_int(current_config, 'v2h_enable', 0)
+            V2H_MIN_SOC = float(get_cfg_value(current_config, 'v2h_min_soc', 40.0))
+            V2H_BAT_SOC_LIMIT = float(get_cfg_value(current_config, 'v2h_bat_soc_limit', 10.0))
 
             BL_IGNORE_PLUG = get_cfg_int(current_config, 'bluelink_ignore_plug_status', 0)
 
@@ -3378,6 +3808,8 @@ def main():
                     local_autonomy_blocked.append("PV-Pause")
                 if SMART_WBHOUR_ENABLE_RAW == 1:
                     local_autonomy_blocked.append("Smart-wbhour")
+                if legacy_mb_enable == 1 or legacy_si_enable == 1:
+                    local_autonomy_blocked.append("Legacy-Morning/SI")
                 if local_autonomy_blocked and not legacy_autonomy_warned:
                     logger.info(
                         "V5-Besitzerregel aktiv: Storage Manager entscheidet Energieverteilung; "
@@ -3386,28 +3818,28 @@ def main():
                         ", ".join(local_autonomy_blocked),
                     )
                     legacy_autonomy_warned = True
-            
+
             # Auto-Update Check oder Update-Benachrichtigung
             push_notify_updates = str(get_cfg_value(current_config, 'push_notify_updates', '0')).lower() in ['1', 'true']
-            
+
             if AUTO_UPDATE_ENABLE == 1 or push_notify_updates:
                 if now.hour == update_hour and now.minute == update_minute:
                     if not update_checked_today:
                         logger.info(f"Starte tägliche Update-Prüfung ({update_hour:02d}:{update_minute:02d} Uhr)...")
                         install_root = os.path.abspath(os.path.join(script_dir, "../../"))
-                        
+
                         if AUTO_UPDATE_ENABLE == 1:
                             installer_main = os.path.join(install_root, "installer_main.py")
                             if os.path.exists(installer_main):
                                 try:
                                     log_file = os.path.join(LOG_DIR, "auto_self_update.log")
                                     cmd = f"sudo /usr/bin/python3 {installer_main} --update-e3dc --unattended"
-                                    
+
                                     with open(log_file, "w") as f:
                                         f.write(f"=== Starting Auto-Update at {datetime.now()} ===\n")
                                         f.write(f"Command: {cmd}\n---\n")
                                     os.chmod(log_file, 0o664)
-    
+
                                     logger.info(f"Führe Update-Kommando aus: {cmd}")
                                     subprocess.Popen(f"nohup {cmd} >> {log_file} 2>&1 &", shell=True)
                                     logger.info("Update-Prozess im Hintergrund gestartet.")
@@ -3415,7 +3847,7 @@ def main():
                                     logger.error(f"Fehler beim Starten des Auto-Updates: {e}")
                             else:
                                 logger.error("Auto-Update fehlgeschlagen: self_update.py nicht gefunden.")
-                        
+
                         # Nur Benachrichtigung (kein Auto-Update)
                         elif push_notify_updates:
                             try:
@@ -3431,13 +3863,13 @@ def main():
                                         if local_hash_res.returncode == 0:
                                             local_hash = local_hash_res.stdout.strip()
                                             notified_file = "/var/www/html/ramdisk/last_notified_update_hash.txt"
-                                            
+
                                             already_notified = False
                                             if os.path.exists(notified_file):
                                                 with open(notified_file, "r") as nf:
                                                     if nf.read().strip() == local_hash:
                                                         already_notified = True
-                                            
+
                                             if not already_notified:
                                                 actions = json.dumps([
                                                     {"action": "update_now", "title": "Jetzt Aktualisieren"}
@@ -3447,21 +3879,21 @@ def main():
                                                     nf.write(local_hash)
                             except Exception as e:
                                 logger.error(f"Fehler bei Update-Prüfung für Web-Push: {e}")
-                                
+
                         update_checked_today = True
                 else:
                     update_checked_today = False
 
-            wp_data = {}   
-            wp_status = {} 
+            wp_data = {}
+            wp_status = {}
             wp_compressor_running_now = False
             wp_compressor_observation_valid = False
             wp_live_age_s = None
             wp_live_fresh = False
-            at = 20.0 
+            at = 20.0
             at_mittel = at
-            success = False 
-            wq_aus = 10.0 
+            success = False
+            wq_aus = 10.0
             wp_error_msg = ""
             if not wp: success = True
 
@@ -3480,7 +3912,7 @@ def main():
                         ws_data = dict(raw_ws_data.get("data") or {})
                     # Mappe das WebSocket-JSON auf die alten Modbus-Keys für Kompatibilität, aber behalte Originale!
                     wp_data = dict(ws_data)
-                    
+
 
 
                     # Helper Funktion um nur echte Werte zu mappen ohne Fake-Defaults wie 30.0 / 10.0 zu erzeugen
@@ -3515,7 +3947,7 @@ def main():
                         for _k, _v in _src_temps.items():
                             if _v is not None and (wp_data.get(_k) is None or wp_data.get(_k) == ''):
                                 wp_data[_k] = _v
-                    
+
                     operating_mode_ws = normalize_luxtronik_operating_mode(ws_data.get('Betriebszustand'))
                     if operating_mode_ws is not None:
                         wp_data['Betriebsart'] = operating_mode_ws
@@ -3528,20 +3960,20 @@ def main():
                         wp_live_fresh
                         and (shi_hz_mode is not None or shi_ww_mode is not None)
                     )
-                    
+
                     # Pausiere Steuerung, wenn WP manuell in den Ferien- oder Frostschutzmodus versetzt wurde
                     wp_is_vacation = False
                     for m_str in [str(hz_mode_raw).lower(), str(ww_mode_raw).lower()]:
                         if any(x in m_str for x in ['ferien', 'urlaub', 'frost']):
                             wp_is_vacation = True
-                    
+
                     if wp_is_vacation:
                         wp_write_allowed = False
-                    
+
                     # Luxtronik hat den statischen "Sollwert Warmw." und das aktuelle Live-Ziel "Warmwasser-Soll"
                     ww_soll = ws_data.get('Warmwasser-Soll', ws_data.get('Sollwert Warmw.', 45.0))
                     if not isinstance(ww_soll, (int, float)): ww_soll = 45.0
-                    
+
                     hz_soll = ws_data.get('Sollwert Heizen', 20.0)
                     if not isinstance(hz_soll, (int, float)): hz_soll = 20.0
 
@@ -3565,20 +3997,37 @@ def main():
             except Exception as e:
                 logger.debug(f"Konnte waermepumpe.json nicht lesen: {e}")
 
-            restart_was_physically_valid = bool(restart_revalidation.get("physical_state_valid"))
-            restart_revalidation = revalidate_restored_heatpump_state(
-                restart_revalidation,
-                live_state_valid=bool(wp_status.get("valid")),
-                auto_mode_enabled=bool(AUTO_MODE),
-            )
+            restart_was_valid = not bool(restart_revalidation.get("safe_stop_required", True))
+            if isinstance(wp, ShellyHeatpump):
+                if bool(restart_revalidation.get("actuator_state_valid")) and bool(AUTO_MODE):
+                    restart_revalidation = revalidate_restored_heatpump_state(
+                        restart_revalidation,
+                        live_state_valid=False,
+                        actuator_state_valid=True,
+                        auto_mode_enabled=True,
+                        validation_source="shelly_relay_readback",
+                    )
+                else:
+                    restart_revalidation = revalidate_shelly_restart_state(
+                        restart_revalidation,
+                        wp,
+                        auto_mode_enabled=bool(AUTO_MODE),
+                    )
+            else:
+                restart_revalidation = revalidate_restored_heatpump_state(
+                    restart_revalidation,
+                    live_state_valid=bool(wp_status.get("valid")),
+                    auto_mode_enabled=bool(AUTO_MODE),
+                )
             if restart_revalidation.get("safe_stop_required"):
                 # Stale oder unbekannte Messwerte dürfen nach der Anlaufwartezeit
                 # keinen neuen Aktorbefehl freigeben. Nutzer-Aus bleibt ebenfalls Aus.
                 wp_write_allowed = False
-            if restart_revalidation.get("physical_state_valid") and not restart_was_physically_valid:
+            if not restart_revalidation.get("safe_stop_required") and not restart_was_valid:
                 logger.info(
-                    "%s: Frische Wärmepumpendaten bestätigt; Policy entscheidet neu.",
+                    "%s: Frischer %s-Zustand bestätigt; Policy entscheidet neu.",
                     restart_revalidation.get("diagnostic_signature", "HEATPUMP_RESTART_REVALIDATION"),
+                    restart_revalidation.get("validation_source", "Wärmepumpen-Live"),
                 )
 
             wp_connected = False
@@ -3635,16 +4084,16 @@ def main():
                     at_mittel = heatpump_live_float(wp_data, ('Aussentemp_Mittel',), at)
                     cooling_boost_allowed = idm_cooling_boost_allowed(wp_type, at_mittel, IDM_COOLING_BOOST_MIN_AT)
                     cooling_boost_mode = 1 if cooling_boost_allowed else 0
-                    
+
                     if first_run: first_run = False
-                    
+
                     # Prüfe vorab auf WW-Timer und WW-Sofort, damit der Sicherheitscheck WW nicht fälschlicherweise abwürgt
                     is_ww_timer_running = False
                     if WW_TIMER_ENABLE:
                         cur_h = now.hour + (now.minute / 60.0)
                         if WW_VON <= WW_BIS: is_ww_timer_running = (WW_VON <= cur_h < WW_BIS)
                         else: is_ww_timer_running = (cur_h >= WW_VON or cur_h < WW_BIS)
-                    
+
                     man_flag = "/var/www/html/ramdisk/manual_ww_boost.flag"
                     if os.path.exists(man_flag) and (time.time() - os.path.getmtime(man_flag)) < (WW_SOFORT_DURATION * 60):
                         is_ww_timer_running = True
@@ -3748,8 +4197,8 @@ def main():
                                 price_boost_active = False
                                 pre_pause_active = False
                                 pv_pause_active = False
-                    
-                    success = True 
+
+                    success = True
                 else:
                     wp_error_msg = "Verbindung zur Wärmepumpe im Modbus-Netzwerk fehlgeschlagen."
                     logger.warning("Verbindung zur WP fehlgeschlagen")
@@ -3766,17 +4215,20 @@ def main():
             price_start_hour = 0
             price_interval = 1.0
             e3dc_valid = False
-            is_tiered_nt = False 
-            
+            is_tiered_nt = False
+            v2h_allowed = False
+            v2h_reason = "V2H deaktiviert"
+
             # --- KI 3.0: Gehirn lesen (Storage Manager) ---
             # Primaer: wb_pv_budget.json (wird alle 5s frisch geschrieben, inkl. tl_brake)
             # Fallback: storage_manager_state.json energy_score
-            free_for_limbs_w = 0 
+            free_for_limbs_w = 0
             must_consume_w = 0
             consumer_allocations = {}
             wallbox_phase_transition_active = False
             wallbox_phase_transition_reserved_w = 0
             wallbox_phase_transition_until_ts = 0.0
+            heatpump_running_commitment_w = 0
             heatpump_pause_request = {}
             source_recovery_request_seen = False
             source_recovery_pause_requested = False
@@ -3819,10 +4271,15 @@ def main():
                         wallbox_phase_transition_reserved_w = max(
                             0,
                             _safe_int(wb_budget_data.get('wallbox_phase_transition_reserved_w'), 0),
+                            _safe_int(wb_budget_data.get('wallbox_phase_transition_requested_w_total'), 0),
                         )
                         wallbox_phase_transition_until_ts = _safe_float(
                             wb_budget_data.get('wallbox_phase_transition_until_ts'),
                             0.0,
+                        )
+                        heatpump_running_commitment_w = max(
+                            0,
+                            _safe_int(wb_budget_data.get('heatpump_running_commitment_w'), 0),
                         )
                         if isinstance(wb_budget_data.get('heatpump_pause_request'), dict):
                             heatpump_pause_request = wb_budget_data.get('heatpump_pause_request') or {}
@@ -3847,10 +4304,15 @@ def main():
                     wallbox_phase_transition_reserved_w = max(
                         0,
                         _safe_int(sm_data.get('wallbox_phase_transition_reserved_w'), 0),
+                        _safe_int(sm_data.get('wallbox_phase_transition_requested_w_total'), 0),
                     )
                     wallbox_phase_transition_until_ts = _safe_float(
                         sm_data.get('wallbox_phase_transition_until_ts'),
                         0.0,
+                    )
+                    heatpump_running_commitment_w = max(
+                        0,
+                        _safe_int(sm_data.get('heatpump_running_commitment_w'), 0),
                     )
                     if isinstance(sm_data.get('heatpump_pause_request'), dict):
                         heatpump_pause_request = sm_data.get('heatpump_pause_request') or {}
@@ -3869,7 +4331,7 @@ def main():
 
             except Exception:
                 pass
-            
+
             try:
                 e3dc = read_e3dc_live_for_energy_manager(timeout=10)
                 grid = e3dc.get('grid')
@@ -3937,10 +4399,10 @@ def main():
                             wb1_locked = bool(_wls.get('car_connected', wb1_locked))
                 except Exception:
                     pass  # Fallback auf C++ Wert
-            
+
             wb1_car_id = get_cfg_value(current_config, 'wb1_car_id', 'car1')
             wb2_car_id = get_cfg_value(current_config, 'wb2_car_id', '')
-            
+
             all_vehicles = []
             try:
                 if os.path.exists(VEHICLES_JSON_FILE):
@@ -3966,10 +4428,10 @@ def main():
             def process_car_session(wb_idx, car_id, session_kwh, is_locked, wb_power_w):
                 session_file = f"/var/www/html/tmp/car_charge_session_wb{wb_idx}.json"
                 if wb_idx == 1: session_file = "/var/www/html/tmp/car_charge_session.json"
-                
+
                 manual_soc_file = f"/var/www/html/ramdisk/manual_soc_wb{wb_idx}.json"
                 if wb_idx == 1 and not os.path.exists(manual_soc_file): manual_soc_file = "/var/www/html/tmp/manual_soc.json"
-                
+
                 # Temporäre RSCP Kollisionen beim Regeln können kurzzeitig is_locked=False erzeugen!
                 # Daher löschen wir die Session-/Fahrzeugdaten NICHT mehr blindlings weg ("Auto bleibt gesetzt").
                 # Wenn das Auto wirklich abgesteckt wurde, fällt session_kwh beim nächsten Anstecken auf 0,
@@ -3978,7 +4440,7 @@ def main():
                     return None
 
                 if not car_id or car_id == '': return None
-                
+
                 target_v = next((v for v in all_vehicles if v.get('id') == car_id), None)
                 if not target_v and car_id == 'car1' and all_vehicles: target_v = all_vehicles[0]
                 soc_raw = target_v.get('soc', 0) if target_v else None
@@ -4001,7 +4463,7 @@ def main():
                 if not car_soc_confirmed:
                     car_soc = None
 
-                
+
                 manual_data = None
                 if os.path.exists(manual_soc_file):
                     try:
@@ -4032,7 +4494,7 @@ def main():
                 except (ValueError, TypeError):
                     session_kwh = None
 
-                # RSCP Glitch Protection: Wenn der session_kwh Wert plötzlich auf 0 fällt (während das Auto noch angesteckt ist), 
+                # RSCP Glitch Protection: Wenn der session_kwh Wert plötzlich auf 0 fällt (während das Auto noch angesteckt ist),
                 # ist das ein Polling-Glitch des C++ Kerns aufgrund von RSCP-Kollisionen.
                 # Wir stellen den alten Wert aus der Session wieder her.
                 if session_kwh in [0, 0.0, None] and sess.get('start_kwh', 0) > 0:
@@ -4068,29 +4530,29 @@ def main():
                     sess['last_valid_session_kwh'] = session_kwh or 0
 
                 added_kwh = max(0, (session_kwh or 0) - sess.get('start_kwh', 0))
-                net_added_kwh = added_kwh * 0.92 
-                
+                net_added_kwh = added_kwh * 0.92
+
                 conf_cap = get_cfg_value(current_config, f'wb{wb_idx}_capacity', CAR_CAPACITY)
                 if sess.get('car_capacity', 0) > 0: cap = sess['car_capacity']
                 elif target_v and target_v.get('capacity'): cap = float(target_v['capacity'])
                 else: cap = float(conf_cap)
                 if cap <= 0: cap = 72.0
-                
+
                 virtual_soc = sess.get('start_soc', 0) + ((net_added_kwh / cap) * 100.0)
                 current_soc = min(100.0, virtual_soc)
                 if car_soc is not None and current_soc < car_soc and not sess.get('is_manual'): current_soc = car_soc
-                
+
                 sess['current_virtual_soc'] = round(current_soc, 2)
                 sess['car_id'] = car_id
                 sess['car_capacity'] = cap
                 sess['ts'] = time.time()
-                
+
                 target_soc = float(get_cfg_value(current_config, f'wb{wb_idx}_target_soc', CAR_TARGET_SOC))
                 if target_v and target_v.get('target_soc'):
                     car_limit = float(target_v['target_soc'])
                     if car_limit > 0: target_soc = min(target_soc, car_limit)
                 sess['target_soc'] = target_soc
-                
+
                 if wb_power_w > 500:
                     needed_kwh = max(0, (target_soc - current_soc) * cap / 100.0)
                     kw = wb_power_w / 1000.0
@@ -4103,14 +4565,38 @@ def main():
 
             processed_wb1 = process_car_session(1, wb1_car_id, wb1_session_kwh, wb1_locked, abs(e3dc.get('wb', 0)))
             processed_wb2 = process_car_session(2, wb2_car_id, wb2_session_kwh, wb2_locked, abs(e3dc.get('wb2', 0)))
-            
+
             primary_sess = processed_wb1 or processed_wb2
             car_soc = primary_sess['current_virtual_soc'] if primary_sess else (all_vehicles[0].get('soc') if all_vehicles else None)
-            
+
             car_needs_energy = True
             if car_soc is not None:
                 p_target = primary_sess['target_soc'] if primary_sess else CAR_TARGET_SOC
                 if car_soc >= (p_target - 1): car_needs_energy = False
+
+            if V2H_ENABLE == 1:
+                v2h_allowed = True
+                v2h_reason = ""
+                if not (wb1_locked or wb2_locked):
+                    v2h_allowed = False
+                    v2h_reason = "Kein Fahrzeug"
+                elif car_soc is None:
+                    v2h_allowed = False
+                    v2h_reason = "SoC unbekannt"
+                elif soc > V2H_BAT_SOC_LIMIT:
+                    v2h_allowed = False
+                    v2h_reason = "Hausakku > Limit"
+                elif car_soc <= V2H_MIN_SOC:
+                    v2h_allowed = False
+                    v2h_reason = "Autoakku am Limit"
+                if not v2h_allowed and e3dc.get('wb', 0) < -50:
+                    # V2H/V2G bleibt beobachtend. Das Ergebnis wird als Telemetrie
+                    # exportiert, aber dieser Dienst darf nie zweiter Wallbox-Schreiber
+                    # werden oder CP, Phasen beziehungsweise Leistung ändern.
+                    logger.warning(
+                        "[V2H] Read-only monitoring reports a limit violation; "
+                        "no wallbox command is issued."
+                    )
 
             car_blocks_pause = False
             car_blocks_boost = False
@@ -4148,7 +4634,7 @@ def main():
                             if p_kw <= 0: p_kw = 11.0
                             h = int(math.ceil(m_k / float(p_kw)))
                             if h > max_h: max_h = h
-                    
+
                     # --- Wakeup Trigger & Guest Car Logic ---
                     if e3dc_valid:
                         # Wakeup Trigger (Force Refresh)
@@ -4159,7 +4645,7 @@ def main():
                                     with open("/var/www/html/ramdisk/force_bluelink.flag", 'w') as f: f.write("1")
                                     last_wakeup_trigger_time = time.time()
                                 except: pass
-                                
+
                             # Action-Push
                             try:
                                 actions_json = json.dumps([
@@ -4181,12 +4667,12 @@ def main():
                                     last_push_soc_sent = True
                             elif car_needs_energy and (wb1_locked or wb2_locked):
                                 last_push_soc_sent = False
-                        
+
                         # Push: Fahrzeug nicht angesteckt bei Ladeplanung (nur abends zwischen 18 und 23 Uhr zur Erinnerung max 1x)
                         if not wb1_locked and not wb2_locked:
                             active_plan = False
                             if current_wbh > 0: active_plan = True
-                            
+
                             if active_plan:
                                 h = now.hour
                                 if (18 <= h <= 23) and not last_push_unplugged_sent:
@@ -4217,26 +4703,49 @@ def main():
             # --- Ende Fahrzeug & SoC management ---
 
             # Manueller Boost Check
-            if os.path.exists(FLAG_FILE) and wp:
+            manual_boost_command = read_manual_boost_command()
+            if manual_boost_command.get("present") and not manual_boost_command.get("valid"):
+                _warn_once(
+                    f"manual_boost_command:{manual_boost_command.get('reason')}",
+                    "Manueller Wärmepumpenauftrag wird nicht ausgeführt (%s).",
+                    manual_boost_command.get("reason"),
+                )
+            if (
+                manual_boost_command.get("valid")
+                and wp
+                and manual_boost_command_is_current(manual_boost_command)
+            ):
                 try:
-                    if wq_aus < WQ_MIN_TEMP:
+                    if manual_boost_command.get("action") == "off":
+                        if wp_write_allowed:
+                            if wp.set_boost(0, None, 0, CONF_WWW):
+                                last_wp_command_time = time.time()
+                                if not consume_manual_boost_command(manual_boost_command):
+                                    logger.info(
+                                        "Manueller Boost wurde beendet; ein neuerer Auftrag bleibt zur Verarbeitung liegen."
+                                    )
+                            else:
+                                logger.error(
+                                    "Manueller Boost-OFF-Auftrag bleibt offen: Treiber-Release nicht bestätigt."
+                                )
+                    elif wq_aus < WQ_MIN_TEMP:
                         if wp_write_allowed:
                             logger.warning(f"NOT-AUS (Manuell): WQ Aus zu kalt ({wq_aus}°C).")
                             if wp.set_boost(0, None, 0, CONF_WWW):
                                 last_wp_command_time = time.time()
-                                os.remove(FLAG_FILE)
-                    elif soc < MANUAL_BOOST_MIN_SOC:                        
+                                consume_manual_boost_command(manual_boost_command)
+                    elif soc < MANUAL_BOOST_MIN_SOC:
                         if wp_write_allowed:
                             logger.info(f"Manueller Boost gestoppt: SoC niedrig ({soc}%).")
                             if wp.set_boost(0, None, 0, CONF_WWW):
                                 last_wp_command_time = time.time()
-                                os.remove(FLAG_FILE)
-                    elif (time.time() - os.path.getmtime(FLAG_FILE)) > (MANUAL_BOOST_MAX_DURATION * 60):
+                                consume_manual_boost_command(manual_boost_command)
+                    elif (time.time() - manual_boost_command.get("mtime", time.time())) > (MANUAL_BOOST_MAX_DURATION * 60):
                         if wp_write_allowed:
                             logger.info("Manueller Boost abgelaufen.")
                             if wp.set_boost(0, None, 0, CONF_WWW):
                                 last_wp_command_time = time.time()
-                                os.remove(FLAG_FILE)
+                                consume_manual_boost_command(manual_boost_command)
                     else:
                         # Keep-Alive fuer manuellen Boost: Temperaturwerte alle 30s nachschreiben
                         # damit Config-Aenderungen (z.B. www=55) sofort wirken
@@ -4397,7 +4906,7 @@ def main():
                                     if release_heatpump_pause(wp, wp_type, pv_pause_owner, CONF_WWW):
                                         last_wp_command_time = time.time()
                                         pv_pause_active = False; boost_active = False; pv_pause_start_time = None
-                        
+
                         elif car_blocks_pause:
                             if pv_pause_active:
                                 if wp_write_allowed:
@@ -4406,7 +4915,7 @@ def main():
                                         last_wp_command_time = time.time()
                                         pv_pause_active = False; boost_active = False; pv_pause_start_time = None
                                         pv_pause_pending_end = None
-                        
+
                         elif pv_pause_active:
                             # Temperatur-Hysterese prüfen (Auskühlschutz)
                             is_idm = (wp_type == 1)
@@ -4423,7 +4932,7 @@ def main():
                                 temp_drop = curr_soll - curr_ist
                                 max_drop = pause_max_drop_k
                                 log_var = f"RL {curr_ist}°C"
-                            
+
                             if temp_drop >= max_drop:
                                 if wp_write_allowed:
                                     logger.warning(f"PV-Pause Notabbruch! Haus kühlt aus ({log_var} ist {temp_drop:.1f}K unter Soll {curr_soll}°C).")
@@ -4455,18 +4964,18 @@ def main():
                                                 )
                                                 pv_pause_blocked_until = max(pv_pause_blocked_until, time.time() + cooldown_s)
 
-                            elif e3dc_valid and soc > 0 and soc < (PV_PAUSE_SOC - 5):                                    
+                            elif e3dc_valid and soc > 0 and soc < (PV_PAUSE_SOC - 5):
                                 if wp_write_allowed:
                                     logger.warning("PV-Pause abgebrochen (SoC tief).")
                                     if release_heatpump_pause(wp, wp_type, pv_pause_owner, CONF_WWW):
                                         last_wp_command_time = time.time()
-                                        pv_pause_active = False; boost_active = False; pv_pause_start_time = None                            
+                                        pv_pause_active = False; boost_active = False; pv_pause_start_time = None
                             elif pv_pause_start_time and (time.time() - pv_pause_start_time) > pause_timeout_s:
                                 if wp_write_allowed:
                                     logger.warning("PV-Pause Timeout. Sperre erneute Pause für 3 Stunden.")
                                     if release_heatpump_pause(wp, wp_type, pv_pause_owner, CONF_WWW):
                                         last_wp_command_time = time.time()
-                                        pv_pause_active = False; boost_active = False; pv_pause_start_time = None                            
+                                        pv_pause_active = False; boost_active = False; pv_pause_start_time = None
                                         pv_pause_blocked_until = time.time() + pause_restart_block_s
                             elif forecast and not source_recovery_pause_eligible:
                                 gmt = time.gmtime(); now_gmt = gmt.tm_hour + gmt.tm_min / 60.0
@@ -4484,7 +4993,7 @@ def main():
                                         if release_heatpump_pause(wp, wp_type, pv_pause_owner, CONF_WWW):
                                             last_wp_command_time = time.time()
                                             pv_pause_active = False; boost_active = False; pv_pause_start_time = None
-                            
+
                             # Hysterese: Timer abbrechen, wenn Netzbezug um 500W über Limit steigt
                             if pv_pause_active and pv_pause_pending_end is not None and grid > (GRID_START_LIMIT + 500):
                                 pv_pause_pending_end = None
@@ -4494,12 +5003,12 @@ def main():
                                     gmt = time.gmtime(); now_gmt = gmt.tm_hour + gmt.tm_min / 60.0
                                     max_future_w = 0.0; current_w = 0.0
                                     for entry in forecast:
-                                        h = entry['h']; 
+                                        h = entry['h'];
                                         if h < (now_gmt - 12): h += 24
                                         if abs(h - now_gmt) < 0.25: current_w = entry['w']
                                         if now_gmt < h <= (now_gmt + 1.5) and entry['w'] > max_future_w: max_future_w = entry['w']
                                     if max_future_w >= PV_PAUSE_WATT and max_future_w > (current_w * 1.1): peak_found = True
-                                
+
                                     if peak_found:
                                         if wp_write_allowed:
                                             logger.info(f"Starte PV-Pause (Prognose > {PV_PAUSE_WATT}W).")
@@ -4602,7 +5111,7 @@ def main():
                         and not predump_heatpump_targets_reached
                         and not predump_heatpump_protect_block
                     )
-                    
+
                     if energy_autonomy_allowed and PRICE_BOOST_ENABLE == 1:
                         # COP-Schätzung & thermische Preisanpassung (Sole vs. Luft)
                         wq_ein = wp_data.get('Sole_Ein', wp_data.get('WQ_Eintritt', at))
@@ -4610,15 +5119,15 @@ def main():
                         effective_price_limit = PRICE_LIMIT * (estimated_cop / 3.5)
 
                         v4_opt_score, v4_billing_price = get_v4_eco_score()
-                        
+
                         if v4_opt_score is not None:
                             # V4 System ist aktiv. Logik erfolgt ausschließlich über den intelligenten Score
                             if current_price <= PRICE_HARD_LIMIT: price_action = "BOOST"
                             elif v4_opt_score >= 80.0: price_action = "BOOST"
                             elif v4_opt_score <= 20.0: price_action = "PAUSE_HIGH_PRICE"
-                        elif current_price <= 0: 
+                        elif current_price <= 0:
                             price_action = "BOOST"
-                        elif current_price >= PRICE_PAUSE_LIMIT: 
+                        elif current_price >= PRICE_PAUSE_LIMIT:
                             price_action = "PAUSE_HIGH_PRICE"
                         elif prices: # Legacy PHP Logic
                             gmt = time.gmtime(); now_gmt = gmt.tm_hour + gmt.tm_min / 60.0
@@ -4626,7 +5135,7 @@ def main():
                             if h_diff < -12: h_diff += 24
                             if h_diff > 36: h_diff -= 24
                             # Placeholder für Nutzer, deren Skript die alte PHP Prices liefert
-                            pass                         
+                            pass
                         is_hard = (current_price <= PRICE_HARD_LIMIT)
                         if wq_aus < WQ_MIN_TEMP: price_action = "NONE"
                         elif daily_boost_counter >= PRICE_MAX_DAILY and price_action == "BOOST" and not is_hard: price_action = "NONE"
@@ -4829,16 +5338,6 @@ def main():
                             and not heat_policy_allows_active_heatpump
                             and not (price_boost_active or pre_pause_active or pv_pause_active or predump_heatpump_active)
                             and not os.path.exists(FLAG_FILE)
-                            and heatpump_transition_stop_allowed(
-                                wallbox_phase_transition_active,
-                                wp_compressor_observation_valid,
-                                wp_compressor_running_now,
-                                emergency_stop=bool(
-                                    (e3dc_valid and _safe_float(soc, 0.0) > 0 and _safe_float(soc, 0.0) < max(5.0, _safe_float(MIN_SOC, 80.0) - 5.0))
-                                    or (_safe_float(grid, 0.0) > 2500.0 and _safe_float(soc, 0.0) <= _safe_float(MIN_SOC, 80.0))
-                                ),
-                                price_pain=heat_policy_decision.owner in ("price_block", "ww_price_pain"),
-                            )
                         ):
                             ww_below_target, ww_actual_c, ww_target_c = heatpump_ww_temperature_below_target(
                                 wp_status,
@@ -4876,16 +5375,7 @@ def main():
                                         heat_policy_target,
                                         heat_policy_decision.block_reason,
                                     )
-                                    stop_result = execute_transition_guarded_heatpump_stop(
-                                        wp,
-                                        CONF_WWW,
-                                        wallbox_phase_transition_active=wallbox_phase_transition_active,
-                                        compressor_observation_valid=wp_compressor_observation_valid,
-                                        compressor_running=wp_compressor_running_now,
-                                        emergency_stop=ww_stop_abort_allowed and heat_policy_decision.owner not in ("price_block", "ww_price_pain"),
-                                        price_pain=heat_policy_decision.owner in ("price_block", "ww_price_pain"),
-                                    )
-                                    if stop_result["success"]:
+                                    if wp.set_boost(0, None, 0, CONF_WWW):
                                         last_wp_command_time = time.time()
                                         wp_last_pv_boost_stop_ts = time.time()
                                 boost_active = False
@@ -4904,116 +5394,33 @@ def main():
                         )
 
                     if shelly_startup_sync_pending and isinstance(wp, ShellyHeatpump):
-                        sync_ok = False
-                        sync_reason = "shelly_startup_sync_%s" % shelly_startup_sync_source
-                        explicit_heat_owner = bool(
-                            predump_heatpump_active
-                            or market_heatpump_active
-                            or legacy_price_heatpump_active
-                            or price_action in ("BOOST", "PAUSE", "PAUSE_HIGH_PRICE")
-                            or pv_pause_active
-                        )
-                        restored_pv_boost_valid = bool(
-                            boost_active
-                            and not (price_boost_active or pre_pause_active or pv_pause_active)
-                            and heatpump_budget_allows_start(
-                                storage_manager_owns_energy,
-                                free_for_limbs_w,
-                                GRID_START_LIMIT,
-                                soc,
-                                MIN_SOC,
+                        if restart_revalidation.get("actuator_state_valid"):
+                            # Der frische Readback ist nur Aktor-Evidence. Es wird hier
+                            # weder ein alter Sollzustand wiederholt noch ein sicherer
+                            # Gleichzustands-Write erzwungen. Erst die reguläre Policy
+                            # darf in einem späteren Schritt eine Schaltkante erzeugen.
+                            shelly_startup_sync_pending = False
+                            logger.info(
+                                "Shelly Recreate-Readback abgeschlossen: SG=%s Pause=%s Quelle=%s",
+                                getattr(wp, "last_live_sg_state", None),
+                                getattr(wp, "last_live_pause_state", None),
+                                shelly_startup_sync_source,
                             )
-                        )
-                        try:
-                            wp.refresh_relay_states()
-                            if price_action in ("PAUSE", "PAUSE_HIGH_PRICE") or pv_pause_active:
-                                sync_ok = wp.set_boost(
-                                    1,
-                                    20.0,
-                                    0,
-                                    CONF_WWW,
-                                    force=True,
-                                    reason=sync_reason,
-                                )
-                            elif (
-                                wallbox_phase_transition_active
-                                and (explicit_heat_owner or restored_pv_boost_valid)
-                            ):
-                                if (time.time() - last_shelly_startup_sync_log_time) > 60:
-                                    logger.info(
-                                        "Shelly Recreate-Sync wartet auf abgeschlossenen "
-                                        "Wallbox-Phasenwechsel (Reservierung %dW).",
-                                        wallbox_phase_transition_reserved_w,
-                                    )
-                                    last_shelly_startup_sync_log_time = time.time()
-                            elif explicit_heat_owner or restored_pv_boost_valid:
-                                if at_mittel > HEIZGRENZE_TEMP:
-                                    sync_ok = wp.set_boost(
-                                        0,
-                                        None,
-                                        1,
-                                        CONF_WWS,
-                                        cooling_boost_mode,
-                                        CONF_KHL,
-                                        wp_data=wp_data,
-                                        force=True,
-                                        reason=sync_reason,
-                                    )
-                                else:
-                                    sync_ok = wp.set_boost(
-                                        1,
-                                        CONF_HZ,
-                                        1,
-                                        CONF_WWW,
-                                        wp_data=wp_data,
-                                        force=True,
-                                        reason=sync_reason,
-                                    )
-                            else:
-                                sync_ok = wp.set_boost(
-                                    0,
-                                    None,
-                                    0,
-                                    CONF_WWW,
-                                    force=True,
-                                    reason=sync_reason,
-                                )
-                                boost_active = False
-                                price_boost_active = False
-                                pre_pause_active = False
-                                pv_pause_active = False
-                                pv_pause_start_time = None
-                                pv_pause_owner = "none"
-                                source_recovery_pause_context = {}
-                                pv_boost_pending_start = None
-                                predump_heatpump_started_ts = 0.0
-                                predump_heatpump_hold_until = 0.0
-                            if sync_ok:
-                                shelly_startup_sync_pending = False
-                                last_wp_command_time = time.time()
-                                logger.info(
-                                    "Shelly Recreate-Sync abgeschlossen: SG=%s Pause=%s Quelle=%s",
-                                    getattr(wp, "sg_state", None),
-                                    getattr(wp, "pause_state", None),
-                                    shelly_startup_sync_source,
-                                )
-                            elif (time.time() - last_shelly_startup_sync_log_time) > 60:
-                                logger.warning("Shelly Recreate-Sync konnte noch nicht abgeschlossen werden.")
-                                last_shelly_startup_sync_log_time = time.time()
-                        except Exception as exc:
-                            if (time.time() - last_shelly_startup_sync_log_time) > 60:
-                                logger.warning("Shelly Recreate-Sync fehlgeschlagen: %s", exc)
-                                last_shelly_startup_sync_log_time = time.time()
+                        elif (time.time() - last_shelly_startup_sync_log_time) > 60:
+                            logger.warning(
+                                "Shelly Recreate-Readback unvollständig; konfigurierte Kontakte bleiben schreibgesperrt."
+                            )
+                            last_shelly_startup_sync_log_time = time.time()
 
                     if price_action == "PAUSE" or price_action == "PAUSE_HIGH_PRICE":
                         if not pre_pause_active:
-                            if wp_write_allowed: 
+                            if wp_write_allowed:
                                 reason = "Preis-Pause (Vorlauf)" if price_action == "PAUSE" else f"Hochpreis-Pause (> {PRICE_PAUSE_LIMIT}ct)"
                                 logger.info(f"Start {reason}.")
                                 if wp.set_boost(1, PAUSE_SETPOINT_C, 0, CONF_WWW):
                                     last_wp_command_time = time.time()
                                     pre_pause_active = True; price_boost_active = False; boost_active = True
-                                    
+
                     elif (
                         price_heatpump_start_requested
                         and wallbox_phase_transition_active
@@ -5044,7 +5451,7 @@ def main():
                                 else:
                                     msg = f"Start Preis-Boost ({current_price} ct)" if price_action == "BOOST" else f"Start Nachtstrom-Boost (NT: {current_price} ct)"
                                 logger.info(msg)
-                                
+
                                 # Web-Push für extrem billigen Strom
                                 if price_action == "BOOST" and current_price <= 0:
                                     if not last_push_awattar_sent:
@@ -5055,7 +5462,7 @@ def main():
                                         last_push_awattar_sent = True
                                 elif current_price > 0:
                                     last_push_awattar_sent = False
-                                        
+
                                 if at_mittel > HEIZGRENZE_TEMP: success_w = wp.set_boost(0, None, 1, CONF_WWS, wp_data=wp_data)
                                 else: success_w = wp.set_boost(1, CONF_HZ, 1, CONF_WWW, wp_data=wp_data)
                                 if success_w:
@@ -5089,7 +5496,7 @@ def main():
                                     price_boost_active = True; pre_pause_active = False; boost_active = True
                         if price_action == "BOOST" and not predump_heatpump_active:
                              daily_boost_counter += 0.5 # Nur bei dynamischem Boost das tägliche Limit zählen
-                             
+
                     elif (price_boost_active or pre_pause_active) and price_action == "NONE" and not is_tiered_nt:
                         emergency_stop = (e3dc_valid and soc > 0 and soc < max(5, MIN_SOC - 5)) or (grid > 2500 and free_for_limbs_w < 0)
                         if price_boost_active and not predump_heatpump_active:
@@ -5137,30 +5544,34 @@ def main():
                             if at_mittel > HEIZGRENZE_TEMP: wp.set_boost(0, None, 1, CONF_WWS, cooling_boost_mode, CONF_KHL, wp_data=wp_data)
                             else: wp.set_boost(1, CONF_HZ, 1, CONF_WWW, wp_data=wp_data)
                             last_wp_command_time = time.time()
-                            
-                        # DEFIZIT-Check (Strenge Version): 
-                        # Wir stoppen, wenn wir massiv importieren (grid > 100) UND 
-                        # entweder der Akku nicht mehr massiv lädt (bat < 500) 
+
+                        # DEFIZIT-Check (Strenge Version):
+                        # Wir stoppen, wenn wir massiv importieren (grid > 100) UND
+                        # entweder der Akku nicht mehr massiv lädt (bat < 500)
                         # ODER das Gehirn sagt, dass kein Budget mehr da ist.
-                        is_strict_deficit = (grid > 200) and (free_for_limbs_w < 500)
-                        is_budget_deficit = heatpump_budget_deficit(
+                        transition_protects_running_heatpump = bool(
+                            wallbox_phase_transition_active
+                            and (boost_active or wp_compressor_running_now)
+                        )
+                        independent_safety_stop = bool(
+                            (e3dc_valid and soc > 0 and soc < max(5, MIN_SOC - 5))
+                            or grid > 2500
+                        )
+                        is_strict_deficit = bool(
+                            (grid > 200)
+                            and (free_for_limbs_w < 500)
+                            and (not transition_protects_running_heatpump or independent_safety_stop)
+                        )
+                        is_budget_deficit = (not transition_protects_running_heatpump) and heatpump_budget_deficit(
                             storage_manager_owns_energy,
                             free_for_limbs_w,
                             GRID_START_LIMIT,
                         )
+                        if transition_protects_running_heatpump and not independent_safety_stop:
+                            is_deficit = False
+                            deficit_start_time = None
 
-                        emergency_stop = (
-                            (e3dc_valid and soc > 0 and soc < max(5, MIN_SOC - 5))
-                            or (grid > 2500 and free_for_limbs_w < 0)
-                        )
-                        transition_preserves_running_wp = wallbox_transition_preserves_running_heatpump(
-                            wallbox_phase_transition_active,
-                            wp_compressor_observation_valid,
-                            wp_compressor_running_now,
-                            emergency_stop=emergency_stop,
-                        )
-
-                        if (is_deficit or is_strict_deficit or is_budget_deficit) and not transition_preserves_running_wp:
+                        if is_deficit or is_strict_deficit or is_budget_deficit:
                             if deficit_start_time is None:
                                 deficit_start_time = now
                                 reason_str = "Gehirn-Budget" if is_budget_deficit else "Standard"
@@ -5169,21 +5580,14 @@ def main():
                                 min_runtime_left_s = 0.0
                                 if WP_TAKT_PROTECT and wp_last_pv_boost_start_ts and WP_MIN_RUNTIME_MIN > 0:
                                     min_runtime_left_s = (WP_MIN_RUNTIME_MIN * 60) - (time.time() - wp_last_pv_boost_start_ts)
+                                emergency_stop = (e3dc_valid and soc > 0 and soc < max(5, MIN_SOC - 5)) or (grid > 2500 and free_for_limbs_w < 0)
                                 if min_runtime_left_s > 0 and not emergency_stop:
                                     if (time.time() - last_wp_takt_log_time) > 300:
                                         logger.info(f"WP-Taktschutz: Stop PV-Boost noch {min_runtime_left_s/60:.1f} Min verzögert (Mindestlaufzeit {WP_MIN_RUNTIME_MIN:.0f} Min).")
                                         last_wp_takt_log_time = time.time()
                                 elif wp_write_allowed:
                                     logger.info(f"Stop PV-Boost (Defizit | Netz: {grid:.0f}W, Free: {free_for_limbs_w}W).")
-                                    stop_result = execute_transition_guarded_heatpump_stop(
-                                        wp,
-                                        CONF_WWW,
-                                        wallbox_phase_transition_active=wallbox_phase_transition_active,
-                                        compressor_observation_valid=wp_compressor_observation_valid,
-                                        compressor_running=wp_compressor_running_now,
-                                        emergency_stop=emergency_stop,
-                                    )
-                                    if stop_result["success"]:
+                                    if wp.set_boost(0, None, 0, CONF_WWW):
                                         last_wp_command_time = time.time()
                                         wp_last_pv_boost_stop_ts = time.time()
                                         boost_active = False; deficit_start_time = None
@@ -5199,7 +5603,7 @@ def main():
                     ):
                         # KI 3.0: Wir verzichten auf die eigenmächtige Grid-Prüfung (grid <= GRID_START_LIMIT)
                         # und vertrauen voll auf den Storage Manager (Gehirn).
-                        # Der GRID_START_LIMIT dient hier als Schwellwert für den vom Gehirn 
+                        # Der GRID_START_LIMIT dient hier als Schwellwert für den vom Gehirn
                         # ausgewiesenen 'echten' Überschuss nach Batterieladung.
                         restart_block_left_s = 0.0
                         if WP_TAKT_PROTECT and wp_last_pv_boost_stop_ts and WP_RESTART_BLOCK_MIN > 0:
@@ -5230,43 +5634,62 @@ def main():
                                 pv_boost_pending_start = now
                             elif (now - pv_boost_pending_start).total_seconds() > PV_BOOST_DELAY:
                                 if wp_write_allowed:
-                                    logger.info(f"Start PV-Boost bestätigt (Gehirn-Budget: {free_for_limbs_w}W >= {abs(GRID_START_LIMIT)}W).")
-                                    if at_mittel > HEIZGRENZE_TEMP: 
+                                    if at_mittel > HEIZGRENZE_TEMP:
                                         if wp_type == 1 and not cooling_boost_allowed and (time.time() - last_idm_cooling_gate_log_time) > 300:
                                             logger.info(f"iDM Kühl-Boost bleibt aus: Außentemperatur {_safe_float(at_mittel, 0.0):.1f}°C < Kühlgrenze {_safe_float(IDM_COOLING_BOOST_MIN_AT, 23.0):.1f}°C.")
                                             last_idm_cooling_gate_log_time = time.time()
-                                        if wp.set_boost(0, None, 1, CONF_WWS, cooling_boost_mode, CONF_KHL, wp_data=wp_data):
-                                            last_wp_command_time = time.time()
-                                            wp_last_pv_boost_start_ts = time.time()
-                                            boost_active = True; deficit_start_time = None
-                                            pv_boost_pending_start = None
-                                    else: 
-                                        if wp.set_boost(1, CONF_HZ, 1, CONF_WWW, wp_data=wp_data):
-                                            last_wp_command_time = time.time()
-                                            wp_last_pv_boost_start_ts = time.time()
-                                            boost_active = True; deficit_start_time = None
-                                            pv_boost_pending_start = None
+                                        boost_args = (0, None, 1, CONF_WWS, cooling_boost_mode, CONF_KHL, wp_data)
+                                    else:
+                                        boost_args = (1, CONF_HZ, 1, CONF_WWW, 0, None, wp_data)
+                                    pv_boost_last_outcome = attempt_heatpump_pv_boost_start(
+                                        wp,
+                                        boost_args,
+                                        now_ts=time.time(),
+                                        retry_not_before_ts=pv_boost_retry_not_before_ts,
+                                        retry_backoff_s=60.0,
+                                    )
+                                    pv_boost_retry_not_before_ts = _safe_float(
+                                        pv_boost_last_outcome.get("retry_not_before_ts"),
+                                        pv_boost_retry_not_before_ts,
+                                    )
+                                    if pv_boost_last_outcome.get("confirmed"):
+                                        logger.info(
+                                            "Start PV-Boost bestätigt (Gehirn-Budget: %sW >= %sW; "
+                                            "command_sent=%s, readback_confirmed=%s).",
+                                            free_for_limbs_w,
+                                            abs(GRID_START_LIMIT),
+                                            pv_boost_last_outcome.get("command_sent"),
+                                            pv_boost_last_outcome.get("readback_confirmed"),
+                                        )
+                                        last_wp_command_time = time.time()
+                                        wp_last_pv_boost_start_ts = time.time()
+                                        boost_active = True; deficit_start_time = None
+                                        pv_boost_pending_start = None
+                                    elif pv_boost_last_outcome.get("status") != "backoff":
+                                        logger.warning(
+                                            "Start PV-Boost nicht bestätigt (status=%s, command_sent=%s, "
+                                            "readback_confirmed=%s, reason=%s); neuer Startversuch frühestens in 60s.",
+                                            pv_boost_last_outcome.get("status"),
+                                            pv_boost_last_outcome.get("command_sent"),
+                                            pv_boost_last_outcome.get("readback_confirmed"),
+                                            pv_boost_last_outcome.get("reason"),
+                                        )
                         elif restart_block_left_s <= 0:
                             pv_boost_pending_start = None
 
-                    # Native iDM Überschusssteuerung 
-                    confirmed_surplus = heatpump_confirmed_running_commitment(
-                        wp_data,
-                        wp_type=wp_type,
-                        wp=wp,
-                        compressor_running=wp_compressor_running_now,
-                        observation_valid=wp_compressor_observation_valid,
-                    )
-                    confirmed_surplus_w = int(confirmed_surplus.get("commitment_w", 0) or 0)
+                    # Native iDM Überschusssteuerung
                     if wp_write_allowed and wp:
-                        execute_transition_guarded_heatpump_surplus_update(
-                            wp,
+                        wp.update_surplus(
                             grid,
-                            free_for_limbs_w,
-                            wallbox_phase_transition_active=wallbox_phase_transition_active,
-                            compressor_observation_valid=wp_compressor_observation_valid,
-                            compressor_running=wp_compressor_running_now,
-                            confirmed_commitment_w=confirmed_surplus_w,
+                            free_for_limbs_w=heatpump_surplus_budget_during_phase_transition(
+                                free_for_limbs_w,
+                                wallbox_phase_transition_active,
+                                heatpump_running=bool(boost_active or wp_compressor_running_now),
+                                heatpump_running_commitment_w=max(
+                                    heatpump_running_commitment_w,
+                                    observed_wp_power_w,
+                                ),
+                            ),
                         )
 
                     # Modbus Keep-Alive + Dual-Channel Health-Check
@@ -5280,7 +5703,7 @@ def main():
                             price_boost_active,
                         )
                         modbus_at = wp.keep_alive(force_open=force_socket_open)
-                        
+
                         # Health-Check: Nur wenn beide Quellen frische Werte haben
                         ws_at = wp_data.get('Aussentemp') if wp_data else None
                         if modbus_at is not None and ws_at is not None:
@@ -5303,11 +5726,11 @@ def main():
 
                     if wp_write_allowed and wp:
                         current_hour_decimal = now.hour + (now.minute / 60.0)
-                        
+
                         target_ww_mode = None
                         target_ww_temp = None
                         target_circ = None
-                        
+
                         active_boost_type = (boost_active and not (pre_pause_active or pv_pause_active))
                         boost_ww_temp = CONF_WWS if at_mittel > HEIZGRENZE_TEMP else CONF_WWW
                         force_ww = (active_boost_type or manual_ww_active)
@@ -5316,7 +5739,7 @@ def main():
                             pv_pause_active
                             and pv_pause_owner == "source_recovery_heatpump"
                         )
-                        
+
                         if force_pause and source_recovery_owns_pause:
                             target_ww_mode = None
                             target_ww_temp = None
@@ -5333,7 +5756,7 @@ def main():
                             else:
                                 in_ww = (current_hour_decimal >= WW_VON or current_hour_decimal < WW_BIS)
                             target_ww_temp = WW_NORMAL if in_ww else WW_ECO
-                            
+
                         # Zirkulationstimer (laeuft IMMER, unabhaengig von force_ww/force_pause)
                         # WW_CIRC_BOOST kann target_circ auf 1 erzwingen, aber nicht loeschen.
                         if WW_TIMER_ENABLE and not force_pause:
@@ -5341,7 +5764,7 @@ def main():
                                 in_circ = (WW_CIRC_VON <= current_hour_decimal < WW_CIRC_BIS)
                             else:
                                 in_circ = (current_hour_decimal >= WW_CIRC_VON or current_hour_decimal < WW_CIRC_BIS)
-                                
+
                             if in_circ and (WW_CIRC_ON + WW_CIRC_OFF) > 0:
                                 cycle_time_minutes = (now.hour * 60 + now.minute) % (WW_CIRC_ON + WW_CIRC_OFF)
                                 target_circ = 1 if cycle_time_minutes < WW_CIRC_ON else 0
@@ -5456,14 +5879,14 @@ def main():
                                     send_ww_temp,
                                     ww_update_reason,
                                 )
-                                
+
                         if target_circ is not None:
                             # Zirkulation: Statuswechsel sofort schreiben, plus 90s-Heartbeat
                             # (SHI-Register werden intern periodic zurueckgesetzt wie WW/HZ)
                             time_since_last_circ_cmd = time.time() - getattr(wp, 'last_circ_cmd_time', 0)
                             circ_mode_changed = getattr(wp, 'last_circ_mode', None) != target_circ
                             circ_heartbeat    = time_since_last_circ_cmd >= WW_HEARTBEAT_SECS
-                            
+
                             if circ_mode_changed or circ_heartbeat:
                                 success_circ = wp.write_zirkulation(target_circ)
                                 if success_circ:
@@ -5475,7 +5898,7 @@ def main():
                                         logger.info(f"Zirkulation Set: {target_circ}")
                                 else:
                                     # GANZ WICHTIG: mode auf target_circ setzen, auch bei Fehler!
-                                    # Wenn es auf 'None' bleibt, versucht die nächste Iteration (2 Sek später) 
+                                    # Wenn es auf 'None' bleibt, versucht die nächste Iteration (2 Sek später)
                                     # wieder zu senden, weil "circ_mode_changed" dann True ist -> DEADLOCK / SPAMMING!
                                     wp.last_circ_mode = target_circ
                                     wp.last_circ_cmd_time = time.time()
@@ -5484,7 +5907,10 @@ def main():
                 except Exception as req_err: logger.error(f"Fehler Logik: {req_err}")
 
             # 3. Daten schreiben
-            manual_heatpump_active = os.path.exists(FLAG_FILE)
+            manual_heatpump_active = bool(
+                manual_boost_command.get("valid")
+                and manual_boost_command.get("action") == "on"
+            )
             manual_ww_boost_active_export = os.path.exists("/var/www/html/ramdisk/manual_ww_boost.flag")
             heatpump_boost_owner = "none"
             if predump_heatpump_active:
@@ -5557,6 +5983,8 @@ def main():
                 "wallbox_phase_transition_active": wallbox_phase_transition_active,
                 "wallbox_phase_transition_reserved_w": wallbox_phase_transition_reserved_w,
                 "wallbox_phase_transition_until_ts": wallbox_phase_transition_until_ts,
+                "heatpump_running_commitment_w": heatpump_running_commitment_w,
+                "heatpump_new_start_allowed": not wallbox_phase_transition_active,
                 "heatpump_pause_request": heatpump_pause_request,
                 "source_recovery_pause_context": source_recovery_pause_context,
                 "source_recovery_pause_requested": source_recovery_pause_requested,
@@ -5580,6 +6008,8 @@ def main():
                 "manual_ww_boost_active": manual_ww_boost_active_export,
                 "wp_last_pv_boost_start_ts": wp_last_pv_boost_start_ts,
                 "wp_last_pv_boost_stop_ts": wp_last_pv_boost_stop_ts,
+                "pv_boost_start_outcome": dict(pv_boost_last_outcome),
+                "pv_boost_retry_not_before_ts": pv_boost_retry_not_before_ts,
                 "wp_last_ww_cycle_start_ts": wp_last_ww_cycle_start_ts,
                 "wp_last_ww_cycle_target_c": wp_last_ww_cycle_target_c,
                 "wp_compressor_running": bool(wp_compressor_running_now),
@@ -5639,12 +6069,27 @@ def main():
                 "shelly_pause_state": getattr(wp, 'pause_state', None) if has_shelly_heatpump and wp else None,
                 "shelly_live_sg_state": getattr(wp, 'last_live_sg_state', None) if has_shelly_heatpump and wp else None,
                 "shelly_live_pause_state": getattr(wp, 'last_live_pause_state', None) if has_shelly_heatpump and wp else None,
-                "shelly_startup_sync_pending": bool(shelly_startup_sync_pending)
+                "shelly_startup_sync_pending": bool(shelly_startup_sync_pending),
+                "actor_writes_blocked": bool(getattr(wp, "actor_writes_blocked", False)) if wp else False,
+                "actor_write_block_reason": str(getattr(wp, "actor_write_block_reason", "") or "") if wp else "",
+                "manual_heatpump_command": {
+                    "valid": bool(manual_boost_command.get("valid")),
+                    "action": str(manual_boost_command.get("action") or "none"),
+                    "reason": str(manual_boost_command.get("reason") or "absent"),
+                },
+                "v2h": {
+                    "active": False,
+                    "monitoring": V2H_ENABLE == 1,
+                    "read_only": True,
+                    "allowed": v2h_allowed,
+                    "detected_discharge": bool(e3dc.get('wb', 0) < -50),
+                    "reason": v2h_reason,
+                }
             }
             write_json_atomic_tolerant(RAMDISK_FILE, json_export, mode=0o664, warn_label="Luxtronik-Live-Datei")
             write_json_atomic_tolerant(ENERGY_STATE_FILE, json_export, mode=0o664, warn_label="Energy-Manager-Statusdatei")
             write_json_atomic_tolerant(HEAT_POLICY_LATEST_PATH, heat_policy_export, mode=0o664, warn_label="Heat-Policy-Latest")
-            
+
             if time.time() - last_history_write >= 60:
                 append_luxtronik_history(json_export, now)
                 last_history_write = time.time()
@@ -5749,7 +6194,7 @@ def main():
                     "heatpump_pause_request": heatpump_pause_request,
                 },
                 "heatpump": {
-                    "configured": bool(wp_configured),
+                    "configured": bool(wp),
                     "connected": bool(wp_connected),
                     "type": int(wp_type),
                     "wp_power_w": observed_wp_power_w,
@@ -5800,7 +6245,7 @@ def main():
                     if os.path.exists(AWATTAR_DEBUG_PATH):
                         dst = os.path.join(os.path.dirname(AWATTAR_DEBUG_PATH), f"awattardebug.{now.hour}.txt")
                         shutil.copy2(AWATTAR_DEBUG_PATH, dst)
-                    
+
                     if now.hour == 0:
                         dv_src = os.path.join(os.path.dirname(AWATTAR_DEBUG_PATH), "dv.txt")
                         if os.path.exists(dv_src):
@@ -5851,7 +6296,7 @@ def main():
                 mode=0o664,
                 warn_label="Luxtronik-Live-Datei",
             )
-        
+
         # --- Freeze Detection / Auto-Restart Hook (ENTFERNT) ---
         # Wurde für das alte C++ System benutzt. Da das V6 System rein Python-basiert ist,
         # und e3dc.service (Eba-M) ausgemustert wurde, wurde dieser Watchdog-Restart deaktiviert.
@@ -5862,7 +6307,7 @@ def main():
             except Exception:
                 pass
 
-                
+
         time.sleep(2)
 
 if __name__ == "__main__":

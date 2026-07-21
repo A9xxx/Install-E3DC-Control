@@ -1,6 +1,6 @@
-# IDM Wärmepumpen-Integration für E3DC-Control
+# iDM-Wärmepumpen-Integration für E3DC-Control
 
-Dieses Modul ermöglicht die Anbindung von **IDM-Wärmepumpen** (z.B. AERO, TERRA mit Navigator 1.7 oder 2.0 Regler) an das E3DC-Control Web-Portal. Die Kommunikation erfolgt über **Modbus-TCP**.
+Dieses Modul ermöglicht die Anbindung von **iDM-Wärmepumpen** (z. B. AERO, TERRA mit Navigator 1.7 oder 2.0 Regler) an das E3DC-Control Web-Portal. Die Kommunikation erfolgt über **Modbus-TCP**.
 
 ---
 
@@ -8,11 +8,11 @@ Dieses Modul ermöglicht die Anbindung von **IDM-Wärmepumpen** (z.B. AERO, TERR
 
 *   **Live-Monitoring:** Anzeige von Außentemperatur (inkl. Mitteltemperatur), Verdichterfrequenz (Hz), Vorlauf, Rücklauf-Soll, Warmwasser (Soll/Ist), Heizleistung und aktuellem Betriebszustand im Dashboard.
 *   **Interaktive native Steuerung:** Volle native Unterstützung für **Modbus-Register 74 (PV-Überschuss)**. Der `energy_manager.py` teilt der Wärmepumpe vollautomatisch und ohne Umwege alle 10 Sekunden den stufenlosen PV-Überschuss des Hauskraftwerks mit, um die Eigenverbrauchsquote ohne Cloud/MQTT zu maximieren.
-*   **Intelligentes Kühlen (Sommer):** Vollautomatische Aktivierung der IDM-Kühlung (Register `1711` & `1010`) bei hohen Außentemperaturen (>Heizgrenze) inklusive Boost-Modus für Smart Grid (`1006=2`).
+*   **Intelligentes Kühlen (Sommer):** Der Software-Thermostat liest die Kältespeichertemperatur aus Register `1010` und steuert die externe Kühlanforderung über Register `1711` mit Hysterese. Der Smart-Grid-Status in Register `1006` wird ausschließlich gelesen.
 *   **COP-Berechnung:** Automatische Berechnung des aktuellen Wirkungsgrades (Arbeitszahl) basierend auf thermischer Leistung und elektrischer Aufnahme.
 *   **Historisierung:** Erfassung der Wärmepumpen-Daten in der SQLite-Datenbank für Langzeit-Statistiken inkl. präziser **Tages-Arbeitszahl**.
 *   **MQTT-Bridge:** Nahtlose Integration in Smart-Home-Systeme via MQTT Hub.
-*   **UI-Übersetzung:** Rohe Betriebszustände der IDM (1, 2, 3...) werden im Dashboard automatisch in verständliche Betriebsarten (Heizen, Kühlen, Warmwasser, Abtauen) übersetzt.
+*   **UI-Übersetzung:** Rohe Betriebszustände der iDM (1, 2, 3 ...) werden im Dashboard automatisch in verständliche Betriebsarten (Heizen, Kühlen, Warmwasser, Abtauen) übersetzt.
 
 ---
 
@@ -29,8 +29,8 @@ Dieses Modul ermöglicht die Anbindung von **IDM-Wärmepumpen** (z.B. AERO, TERR
 Die Einrichtung erfolgt über Web-Config und Installationszentrale:
 
 1. Öffne den **Config Editor**.
-2. Aktiviere **WP-/Verbrauchslogging** und wähle als Wärmepumpen-Typ **IDM**.
-3. Trage die lokale IDM-IP ein und speichere die Konfiguration.
+2. Aktiviere **WP-/Verbrauchslogging** und wähle als Wärmepumpen-Typ **iDM**.
+3. Trage die lokale iDM-IP ein und speichere die Konfiguration.
 4. Öffne die **Installationszentrale** und installiere beziehungsweise starte
    `e3dc-idm-live` und den gemeinsamen Wärmepumpen-Manager `energy_manager`.
    Die benötigte Bibliothek `pymodbus` wird dabei vorbereitet.
@@ -43,8 +43,8 @@ Die Einstellungen werden in `data/e3dc_v4.json` gespeichert und bequem über den
 
 | Parameter | Beschreibung |
 | :--- | :--- |
-| `wp_type` | Muss auf `1` stehen (IDM Modbus). |
-| `idm_ip` | Die lokale IP-Adresse deiner IDM Wärmepumpe. |
+| `wp_type` | Muss auf `1` stehen (iDM Modbus). |
+| `idm_ip` | Die lokale IP-Adresse deiner iDM-Wärmepumpe. |
 | `khl` | Kühlung Soll in Grad C. Wird als Software-Grenze genutzt, nicht zyklisch als EEPROM-Temperatur geschrieben. |
 
 ---
@@ -52,14 +52,14 @@ Die Einstellungen werden in `data/e3dc_v4.json` gespeichert und bequem über den
 ## 5. Technik & Datenfluss
 
 ### Der Live-Dienst (`idm_live.py`)
-Dieser Dienst fungiert als Modbus-Client und fragt die IDM alle **5 Sekunden** ab.
-*   **Word-Swap:** Da IDM Daten im Big-Endian Format mit vertauschten Words (CD AB) sendet, führt das Skript automatisch ein Word-Swapping durch, um korrekte IEEE 754 Float-Werte zu erhalten.
+Dieser Dienst fungiert als Modbus-Client und fragt die IDM alle **5 Sekunden** ab (optimiert in v3.8.7.7).
+*   **Word-Swap:** Da iDM die Daten im Big-Endian-Format mit vertauschten Words (CD AB) sendet, führt das Skript automatisch ein Word-Swapping durch, um korrekte IEEE-754-Float-Werte zu erhalten.
 *   **Daten-Übergabe:** Die Werte werden in `/var/www/html/ramdisk/waermepumpe.json` geschrieben.
 
 ### Die native Überschusssteuerung (`energy_manager.py`)
-Die Überschusssteuerung erfolgt nativ über den Energy Manager:
+Ab Version 3.8.8.1 wurde die veraltete und unsichere "IDM MQTT Bridge" komplett beerdigt. Die Steuerung erfolgt jetzt nativ und blitzschnell direkt aus dem Kern des E3DC-Control Smart-Homes:
 *   **Register 74 (Überschuss):** Erkennt das Hauskraftwerk eine Einspeisung ins Netz (Überschuss), so übermittelt der `energy_manager.py` diesen Wert (z.B. `-2.5 kW`) sofort per ModbusTCP direkt an die Wärmepumpe. Die IDM regelt stufenlos hoch und schmiegt sich an den Überschuss an. Um den Modbus nicht zu fluten, ist ein 10-Sekunden-Ratenlimit implementiert.
-*   **Kühl-Intervention (Register 1711):** Im Sommer-Betrieb (Außentemperatur > Heizgrenze) verlagert sich die Überschusssteuerung. Ist PV-Leistung vorhanden und der manuelle "Boost" wird betätigt, schreibt die Steuerung automatisch auf Register `1711`. Gleichzeitig wird das Smart Grid Register `1006` auf "2" gesetzt, um der Maschine die Freigabe für Vollgas-Kühlung zu erteilen.
+*   **Kühlanforderung (Register 1711):** Im Sommerbetrieb bewertet der Software-Thermostat die aus Register `1010` gelesene Kältespeichertemperatur und schreibt die bestätigte externe Kühlanforderung als `0` oder `1` auf Register `1711`. Register `1006` wird nicht gesetzt.
 
 
 ### Ruhige PV-Grundlast mit Leistungsobergrenze
@@ -76,20 +76,21 @@ Die Schutzlogik besteht aus:
 
 ## 6. Boost-Steuerung & Software-Thermostat
 
-> **Wichtiger Architektur-Hinweis:** Die IDM verhält sich anders als die Luxtronik!
+> **Wichtiger Architektur-Hinweis:** Die iDM verhält sich anders als die Luxtronik!
 
 ### Das Problem: Externe Register überschreiben den internen Setpoint
 
-Wenn in den IDM-Modbus-Registern eine externe Anforderung gesetzt wird, **ignoriert die IDM ihren intern konfigurierten Temperatur-Setpoint** und heizt/kühlt ohne eigene Begrenzung:
+Wenn in den iDM-Modbus-Registern eine externe Anforderung gesetzt wird, **ignoriert die iDM ihren intern konfigurierten Temperatur-Setpoint** und heizt/kühlt ohne eigene Begrenzung:
 
 | Register | Funktion | Wert `1` = |
 | :--- | :--- | :--- |
-| `1710` | Externe Heizanforderung | IDM heizt, ignoriert internen HZ-Setpoint |
-| `1711` | Externe Kühlanforderung | IDM kühlt, ignoriert internen KHL-Setpoint |
-| `1712` | Externe WW-Anforderung | IDM heizt WW, ignoriert internen WW-Setpoint |
-| `1006` | Smart Grid | `0`=Sperre, `1`=Normal, `2`=PV-Vollgas |
+| `1710` | Externe Heizanforderung | iDM heizt, ignoriert internen HZ-Setpoint |
+| `1711` | Externe Kühlanforderung | iDM kühlt, ignoriert internen KHL-Setpoint |
+| `1712` | Externe WW-Anforderung | iDM heizt WW, ignoriert internen WW-Setpoint |
 
-Die in `e3dc_v4.json` konfigurierten Grenzwerte (`wws`, `www`, `hz`, `khl`) kennt die IDM **nicht** als eigene interne Sollwerte. E3DC-Control nutzt sie als Software-Thermostat mit Hysterese und Nachlaufzeit.
+Register `1006` ist ein read-only Smart-Grid-Status. Der manuelle Scanner liest ihn genau einmal als Input-Register per FC04; die Werte `0`, `1` und `2` sind ausschließlich Diagnosewerte und werden von E3DC-Control nicht geschrieben.
+
+Die in `e3dc_v4.json` konfigurierten Grenzwerte (`wws`, `www`, `hz`, `khl`) kennt die iDM **nicht** als eigene interne Sollwerte. E3DC-Control nutzt sie als Software-Thermostat mit Hysterese und Nachlaufzeit.
 
 ### Die zwei Steuerungs-Modi
 

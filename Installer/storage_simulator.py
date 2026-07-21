@@ -19,6 +19,24 @@ except Exception:
     from direct_marketing import build_direct_marketing_shadow_plan
 
 try:
+    from .storage_dispatch_contract import build_canonical_dispatch_plan
+except Exception:
+    from storage_dispatch_contract import build_canonical_dispatch_plan
+
+try:
+    from .pv_forecast_topology import (
+        build_pv_forecast_topology,
+        resolve_buffered_pcc_limit,
+        slot_headroom_pressure,
+    )
+except Exception:
+    from pv_forecast_topology import (
+        build_pv_forecast_topology,
+        resolve_buffered_pcc_limit,
+        slot_headroom_pressure,
+    )
+
+try:
     from .market_economics import build_market_economics_plan
 except Exception:
     from market_economics import build_market_economics_plan
@@ -54,6 +72,7 @@ RAMDISK_DIR = "/var/www/html/ramdisk"
 V4_CONFIG_FILE = "/var/www/html/data/e3dc_v4.json"
 LIVE_DATA_FILE = os.path.join(RAMDISK_DIR, "live_data_py.json")
 PV_ENV_FILE = os.path.join(RAMDISK_DIR, "pv_forecast.json")
+PV_META_FILE = os.path.join(RAMDISK_DIR, "pv_forecast_meta.json")
 ML_PRED_FILE = os.path.join(RAMDISK_DIR, "ml_prediction.json")
 EPEX_DATA_FILE = os.path.join(RAMDISK_DIR, "epex_daten.json")
 ECO_SCORE_FILE = os.path.join(RAMDISK_DIR, "eco_score.json")
@@ -63,14 +82,32 @@ WEATHER_FORECAST_FILE = os.path.join(RAMDISK_DIR, "weather_forecast.json")
 LIVE_HISTORY_FILE = os.path.join(RAMDISK_DIR, "live_history.txt")
 MANUAL_ANCHOR_FILE = os.path.join(RAMDISK_DIR, "manual_bat_anchor.json")
 OUTPUT_FILE = os.path.join(RAMDISK_DIR, "storage_plan.json")
+DIRECT_MARKETING_REPORT_FILE = os.path.join(RAMDISK_DIR, "direct_marketing_daily_report.json")
 WB_INTENT_FILE = os.path.join(RAMDISK_DIR, "wallbox_storage_intent.json")
 HISTORY_DIR = "/var/www/html/data/history_backups"
 EMERGENCY_CURVE_FILE = os.path.join(RAMDISK_DIR, "storage_emergency_curve.json")
+
+
+def direct_marketing_runtime_config(config, daily_report, today=None):
+    """Liefert eine Konfigurationskopie mit gemessenem DV-Tagesdurchsatz."""
+    result = dict(config or {})
+    if not isinstance(daily_report, dict):
+        return result
+    today = str(today or datetime.now().strftime("%Y-%m-%d"))
+    if str(daily_report.get("date") or "") != today:
+        return result
+    try:
+        export_kwh = max(0.0, float(daily_report.get("real_export_kwh") or 0.0))
+    except (TypeError, ValueError):
+        export_kwh = 0.0
+    result["_runtime_direct_marketing_daily_export_used_wh"] = export_kwh * 1000.0
+    return result
 SIM_INTERVAL_S = 900
 SIM_INPUT_POLL_S = 30
 SIM_REPLAN_INPUT_FILES = (
     V4_CONFIG_FILE,
     PV_ENV_FILE,
+    PV_META_FILE,
     ML_PRED_FILE,
     EPEX_DATA_FILE,
     ECO_SCORE_FILE,
@@ -226,6 +263,48 @@ def check_awattar(epex_slots, current_soc, target_soc, v4_config):
 
 
 class StorageSimulator:
+    @staticmethod
+    def _retain_slot_headroom_evidence(slot, pressure, reserve_pressure=None):
+        """Hält Slot-Evidence nur für gebundene Topologie oder echten Druck.
+
+        Der Legacy-/topology_unbound-Nullfall bleibt über den Top-Level-Vertrag
+        explizit, dupliziert aber keinen großen Druckdatensatz in jedem Slot.
+        """
+
+        def _positive(contract):
+            if not isinstance(contract, dict):
+                return False
+            for key in ("dc_pressure_w", "pcc_pressure_w", "combined_pressure_w"):
+                try:
+                    if float(contract.get(key, 0.0) or 0.0) > 0.0:
+                        return True
+                except (TypeError, ValueError):
+                    continue
+            return False
+
+        bound = str(slot.get("pv_topology_status") or "") == "bound"
+        material = bound or _positive(pressure) or _positive(reserve_pressure)
+        if not material:
+            for key in (
+                "headroom_pressure",
+                "headroom_reserve_pressure",
+                "dc_headroom_pressure_w",
+                "pcc_headroom_pressure_w",
+                "headroom_pressure_w",
+            ):
+                slot.pop(key, None)
+            return False
+
+        slot["headroom_pressure"] = pressure
+        if isinstance(reserve_pressure, dict):
+            slot["headroom_reserve_pressure"] = reserve_pressure
+        else:
+            slot.pop("headroom_reserve_pressure", None)
+        slot["dc_headroom_pressure_w"] = pressure.get("dc_pressure_w", 0.0)
+        slot["pcc_headroom_pressure_w"] = pressure.get("pcc_pressure_w", 0.0)
+        slot["headroom_pressure_w"] = pressure.get("combined_pressure_w", 0.0)
+        return True
+
     def _safe_float(self, value, default_val):
         try:
             if value is None or str(value).strip() == "":
@@ -241,6 +320,55 @@ class StorageSimulator:
             return value
         return str(value).strip().lower() in ("1", "true", "yes", "on", "ja", "ein")
 
+    def _refresh_pcc_headroom_limit_contract(self, live_readback_limit_w=None):
+        configured_limit_w = self._safe_float(self.v4_config.get("einspeiselimit", 0.0), 0.0)
+        if 0.0 < configured_limit_w < 100.0:
+            configured_limit_w *= 1000.0
+        buffer_w = max(
+            0.0,
+            self._safe_float(self.v4_config.get("abregel_puffer_w", 300.0), 300.0),
+        )
+        self.configured_export_limit_w = max(0.0, configured_limit_w)
+        self.live_derate_limit_w = (
+            max(0.0, self._safe_float(live_readback_limit_w, 0.0))
+            if live_readback_limit_w is not None
+            else 0.0
+        )
+        self.pcc_headroom_limit_contract = resolve_buffered_pcc_limit(
+            self.configured_export_limit_w,
+            self.live_derate_limit_w,
+            buffer_w,
+        )
+        return self.pcc_headroom_limit_contract
+
+    def _pcc_headroom_limit_for_topology(self, topology_status):
+        """Wählt die PCC-Grenze ohne aggressivere Legacy-Wirkung.
+
+        Der gepufferte Reglervertrag wirkt erst bei vollständig typisiertem
+        DC/AC-Split. Ungebundene Altpläne behalten exakt die bisherige
+        ungepufferte PCC-Grenze.
+        """
+
+        contract = dict(getattr(self, "pcc_headroom_limit_contract", {}) or {})
+        if str(topology_status or "") == "bound" and contract.get("active") is True:
+            return {
+                **contract,
+                "applied": True,
+                "application": "typed_topology_buffered_pcc",
+            }
+        legacy_limit = max(0.0, self._safe_float(getattr(self, "export_limit_w", 0.0), 0.0))
+        return {
+            "schema_version": contract.get("schema_version", "pcc_headroom_limit_v1"),
+            "active": legacy_limit > 0.0,
+            "limit_w": legacy_limit if legacy_limit > 0.0 else None,
+            "hard_limit_w": legacy_limit if legacy_limit > 0.0 else None,
+            "buffer_w": 0.0,
+            "source": getattr(self, "export_limit_source", "unavailable"),
+            "applied": legacy_limit > 0.0,
+            "application": "legacy_topology_unbound_unchanged",
+            "typed_candidate": contract,
+            "zero_semantics": "MISSING_UNLESS_EXPLICITLY_ACTIVE",
+        }
     @staticmethod
     def _percentile_value(values, q):
         clean = []
@@ -1083,7 +1211,7 @@ class StorageSimulator:
         storm_grid_charge=None,
         market_plan=None,
     ):
-        """Expose hardening fields as machine-readable runtime contracts."""
+        """Stellt Härtungsfelder als maschinenlesbare Laufzeitverträge bereit."""
         def _sf(value, default=0.0):
             try:
                 number = float(value)
@@ -1125,7 +1253,7 @@ class StorageSimulator:
             headroom_sources.append("comfort_limited")
 
         def contract(
-            contract_item,
+            roadmap_item,
             name,
             owner,
             active,
@@ -1137,7 +1265,7 @@ class StorageSimulator:
             exports=None,
         ):
             return {
-                "contract_item": int(contract_item),
+                "roadmap_item": int(roadmap_item),
                 "name": name,
                 "owner": owner,
                 "active": bool(active),
@@ -1239,7 +1367,7 @@ class StorageSimulator:
                     if direct.get("active") or direct_blocked
                     else "off"
                 ),
-                "Direct marketing is a Storage-Manager-owned contract; arbitrage needs explicit experimental and profit gates.",
+                "Direktvermarktung bleibt ein Storage-Manager-Vertrag; Arbitrage ist in 5.4 nicht freigegeben und bleibt wirkungslos.",
                 signals={
                     "mode": direct.get("mode", "off"),
                     "shadow": direct.get("shadow"),
@@ -1263,7 +1391,7 @@ class StorageSimulator:
         }
         return {
             "version": "hardening_contracts_v1",
-            "scope": "storage_hardening_v1",
+            "scope": "roadmap_3_to_7",
             "contracts": contracts,
         }
 
@@ -1428,6 +1556,11 @@ class StorageSimulator:
         min_need_wh=300.0,
         comfort_soc=0.0,
         large_storage_threshold_kwh=25.0,
+        topology_contract=None,
+        e3dc_dc_limit_w=0.0,
+        e3dc_dc_limit_source="",
+        pcc_limit_source="",
+        pcc_limit_contract=None,
     ):
         """Build a floor/ceiling band from real preventable curtailment pressure.
 
@@ -1454,6 +1587,10 @@ class StorageSimulator:
         large_threshold_kwh = max(1.0, _sf(large_storage_threshold_kwh, 25.0))
         comfort_target_soc = max(0.0, min(target, _sf(comfort_soc, 0.0)))
         storage_class = "large" if storage_kwh >= large_threshold_kwh else "small"
+        topology = dict(topology_contract or {})
+        topology_revision = topology.get("revision")
+        dc_limit = max(0.0, _sf(e3dc_dc_limit_w, 0.0))
+        typed_pcc_contract = dict(pcc_limit_contract or {})
 
         floor_points = []
         for point in target_timeline or []:
@@ -1489,38 +1626,147 @@ class StorageSimulator:
             climate_w = _sf(slot.get("climate_w", 0.0), 0.0) if trust_wp_forecast_sink else 0.0
             return home_w + wp_w + climate_w + _slot_planned_load_w(slot)
 
-        def _slot_export_limit_w(slot):
-            slot_limit = _sf(slot.get("curtailment_limit_w", 0.0), 0.0)
-            if slot_limit > 0.0 and export_limit > 0.0:
-                return min(export_limit, slot_limit)
-            if slot_limit > 0.0:
-                return slot_limit
-            return export_limit
+        def _slot_export_limit_contract(slot):
+            topology_bound = (
+                str(slot.get("pv_topology_status") or "") == "bound"
+                and str(slot.get("pv_topology_revision") or "") == str(topology_revision or "")
+            )
+            if topology_bound and typed_pcc_contract.get("active") is True:
+                base_active = True
+                base_limit = max(0.0, _sf(typed_pcc_contract.get("limit_w"), 0.0))
+                base_source = str(typed_pcc_contract.get("source") or "none")
+                application = "typed_topology_buffered_pcc"
+            else:
+                base_active = export_limit > 0.0
+                base_limit = max(0.0, export_limit)
+                base_source = str(pcc_limit_source or "unavailable")
+                application = "legacy_topology_unbound_unchanged"
+
+            slot_key = None
+            for candidate in ("hard_export_limit_w", "curtailment_limit_w"):
+                if candidate in slot:
+                    slot_key = candidate
+                    break
+            raw_slot_limit = _sf(slot.get(slot_key), 0.0) if slot_key else 0.0
+            slot_explicit_active = (
+                slot.get("hard_export_limit_active") is True
+                or slot.get("curtailment_limit_active") is True
+            )
+            slot_active = bool(slot_key) and (raw_slot_limit > 0.0 or slot_explicit_active)
+            if not slot_active:
+                return {
+                    "active": base_active,
+                    "limit_w": base_limit if base_active else None,
+                    "source": base_source,
+                    "application": application,
+                    "slot_limit_active": False,
+                }
+
+            slot_limit = max(0.0, raw_slot_limit)
+            effective = min(base_limit, slot_limit) if base_active else slot_limit
+            return {
+                "active": True,
+                "limit_w": effective,
+                "source": f"{base_source}+slot:{slot_key}",
+                "application": application,
+                "slot_limit_active": True,
+                "slot_limit_w": slot_limit,
+                "slot_zero_explicit": slot_limit == 0.0 and slot_explicit_active,
+            }
 
         pressure_samples = []
         curtailment_pressure_wh = 0.0
+        dc_pressure_wh = 0.0
+        pcc_pressure_wh = 0.0
         headroom_reserve_pressure_wh = 0.0
         headroom_reserve_slots = 0
         curtailment_unavoidable_wh = 0.0
-        if export_limit > 0.0 and charge_limit > 0.0 and capacity > 0.0:
+        applied_pcc_contracts = {}
+        pcc_candidate_active = bool(export_limit > 0.0 or typed_pcc_contract.get("active") is True)
+        if (pcc_candidate_active or dc_limit > 0.0) and charge_limit > 0.0 and capacity > 0.0:
             for slot in day_slots or []:
                 ts = _sf(slot.get("ts", 0.0), 0.0)
                 if ts < now - 60000:
                     continue
                 pv_w = _sf(slot.get("pv_w", 0.0), 0.0)
-                slot_export_limit = _slot_export_limit_w(slot)
-                pressure_w = max(0.0, pv_w - slot_export_limit - _safe_consumers_w(slot))
-                preventable_w = min(charge_limit, pressure_w)
-                unavoidable_w = max(0.0, pressure_w - preventable_w)
+                slot_export_contract = _slot_export_limit_contract(slot)
+                slot_export_limit = slot_export_contract.get("limit_w")
+                contract_key = (
+                    bool(slot_export_contract.get("active") is True),
+                    slot_export_limit,
+                    str(slot_export_contract.get("source") or "unavailable"),
+                    str(slot_export_contract.get("application") or "unknown"),
+                )
+                applied_pcc_contracts[contract_key] = applied_pcc_contracts.get(contract_key, 0) + 1
+                safe_consumers_w = _safe_consumers_w(slot)
+                pressure = slot_headroom_pressure(
+                    total_pv_w=pv_w,
+                    e3dc_dc_pv_w=slot.get("e3dc_dc_pv_w"),
+                    external_ac_pv_w=slot.get("external_ac_pv_w"),
+                    topology_status=slot.get("pv_topology_status"),
+                    topology_revision=slot.get("pv_topology_revision"),
+                    expected_topology_revision=topology_revision,
+                    e3dc_dc_limit_w=dc_limit,
+                    pcc_limit_w=slot_export_limit,
+                    pcc_limit_active=slot_export_contract.get("active") is True,
+                    safe_consumers_w=safe_consumers_w,
+                    charge_limit_w=charge_limit,
+                    e3dc_dc_limit_source=e3dc_dc_limit_source,
+                    pcc_limit_source=slot_export_contract.get("source", pcc_limit_source),
+                )
+                pressure_w = float(pressure.get("combined_pressure_w", 0.0) or 0.0)
+                preventable_w = float(pressure.get("preventable_w", 0.0) or 0.0)
+                unavoidable_w = float(pressure.get("unavoidable_w", 0.0) or 0.0)
                 reserve_pv_w = max(
                     pv_w,
                     _sf(slot.get("pv_headroom_w", 0.0), 0.0),
                     _sf(slot.get("cloud_edge_pv_w", 0.0), 0.0),
                 )
-                reserve_pressure_w = max(0.0, reserve_pv_w - slot_export_limit - _safe_consumers_w(slot))
-                reserve_preventable_w = min(charge_limit, reserve_pressure_w)
+                reserve_dc_w = slot.get("e3dc_dc_pv_w")
+                reserve_external_w = slot.get("external_ac_pv_w")
+                if pv_w > 0.0 and reserve_pv_w > pv_w and reserve_dc_w is not None and reserve_external_w is not None:
+                    _reserve_scale = reserve_pv_w / pv_w
+                    reserve_dc_w = max(0.0, _sf(reserve_dc_w, 0.0)) * _reserve_scale
+                    reserve_external_w = max(0.0, _sf(reserve_external_w, 0.0)) * _reserve_scale
+                    _external_limit_w = max(
+                        0.0,
+                        _sf((topology.get("limits_w") or {}).get("external_ac_inverter"), 0.0),
+                    )
+                    if _external_limit_w > 0.0:
+                        reserve_external_w = min(reserve_external_w, _external_limit_w)
+                        reserve_dc_w = max(0.0, reserve_pv_w - reserve_external_w)
+                reserve_pressure = slot_headroom_pressure(
+                    total_pv_w=reserve_pv_w,
+                    e3dc_dc_pv_w=reserve_dc_w,
+                    external_ac_pv_w=reserve_external_w,
+                    topology_status=slot.get("pv_topology_status"),
+                    topology_revision=slot.get("pv_topology_revision"),
+                    expected_topology_revision=topology_revision,
+                    e3dc_dc_limit_w=dc_limit,
+                    pcc_limit_w=slot_export_limit,
+                    pcc_limit_active=slot_export_contract.get("active") is True,
+                    safe_consumers_w=safe_consumers_w,
+                    charge_limit_w=charge_limit,
+                    e3dc_dc_limit_source=e3dc_dc_limit_source,
+                    pcc_limit_source=slot_export_contract.get("source", pcc_limit_source),
+                )
+                reserve_pressure_w = float(reserve_pressure.get("combined_pressure_w", 0.0) or 0.0)
+                reserve_preventable_w = float(reserve_pressure.get("preventable_w", 0.0) or 0.0)
                 reserve_extra_w = max(0.0, reserve_preventable_w - preventable_w)
                 total_preventable_w = max(preventable_w, reserve_preventable_w)
+                StorageSimulator._retain_slot_headroom_evidence(
+                    slot,
+                    pressure,
+                    reserve_pressure,
+                )
+                dc_pressure_wh += max(
+                    float(pressure.get("dc_pressure_w", 0.0) or 0.0),
+                    float(reserve_pressure.get("dc_pressure_w", 0.0) or 0.0),
+                ) * 0.25
+                pcc_pressure_wh += max(
+                    float(pressure.get("pcc_pressure_w", 0.0) or 0.0),
+                    float(reserve_pressure.get("pcc_pressure_w", 0.0) or 0.0),
+                ) * 0.25
                 if reserve_extra_w > 0.0:
                     headroom_reserve_slots += 1
                     headroom_reserve_pressure_wh += reserve_extra_w * 0.25
@@ -1531,6 +1777,7 @@ class StorageSimulator:
                         "curtailment_w": preventable_w,
                         "reserve_extra_w": reserve_extra_w,
                         "unavoidable_w": unavoidable_w,
+                        "pcc_limit_contract": slot_export_contract,
                     })
                 curtailment_pressure_wh += preventable_w * 0.25
                 curtailment_unavoidable_wh += unavoidable_w * 0.25
@@ -1672,6 +1919,41 @@ class StorageSimulator:
                     if acc_wh >= target_need_with_margin_wh:
                         break
 
+        if len(applied_pcc_contracts) == 1:
+            (active, limit_w, source, application), samples = next(iter(applied_pcc_contracts.items()))
+            applied_pcc_contract = {
+                "schema_version": "pcc_headroom_limit_application_v1",
+                "active": active,
+                "limit_w": limit_w if active else None,
+                "source": source,
+                "application": application,
+                "samples": samples,
+                "typed_candidate": typed_pcc_contract,
+            }
+        else:
+            applied_pcc_contract = {
+                "schema_version": "pcc_headroom_limit_application_v1",
+                "active": None,
+                "limit_w": None,
+                "source": "per_slot_mixed",
+                "application": "per_slot_typed_or_legacy",
+                "samples": sum(applied_pcc_contracts.values()),
+                "variants": [
+                    {
+                        "active": key[0],
+                        "limit_w": key[1] if key[0] else None,
+                        "source": key[2],
+                        "application": key[3],
+                        "samples": count,
+                    }
+                    for key, count in sorted(
+                        applied_pcc_contracts.items(),
+                        key=lambda item: (item[0][2], str(item[0][1])),
+                    )
+                ],
+                "typed_candidate": typed_pcc_contract,
+            }
+
         return {
             "adaptive_headroom_required_wh": round(required_headroom_wh, 0),
             "adaptive_headroom_available_wh": round(available_headroom_wh, 0),
@@ -1703,6 +1985,18 @@ class StorageSimulator:
             "adaptive_comfort_active": bool(comfort_active),
             "adaptive_comfort_limited_by_headroom": bool(comfort_limited_by_headroom),
             "curtailment_pressure_wh": round(curtailment_pressure_wh, 0),
+            "combined_headroom_pressure_wh": round(total_headroom_pressure_wh, 0),
+            "dc_headroom_pressure_wh": round(dc_pressure_wh, 0),
+            "pcc_headroom_pressure_wh": round(pcc_pressure_wh, 0),
+            "headroom_combination_rule": "max_dc_pcc_no_double_count",
+            "pv_topology_status": topology.get("status", "topology_unbound"),
+            "pv_topology_reason": topology.get("reason", "TOPOLOGY_UNAVAILABLE"),
+            "pv_topology_revision": topology_revision,
+            "e3dc_dc_limit_w": round(dc_limit, 0) if dc_limit > 0.0 else None,
+            "e3dc_dc_limit_source": str(e3dc_dc_limit_source or "unavailable"),
+            "pcc_limit_w": applied_pcc_contract.get("limit_w"),
+            "pcc_limit_source": str(applied_pcc_contract.get("source") or "unavailable"),
+            "pcc_limit_contract": applied_pcc_contract,
             "curtailment_unavoidable_wh": round(curtailment_unavoidable_wh, 0),
             "curtailment_first_pressure_ts": int(first_pressure_ts),
             "curtailment_soc_at_first_pressure": round(soc_at_first_pressure, 2),
@@ -1742,6 +2036,13 @@ class StorageSimulator:
                 continue
             slot_w = actual_wh / 0.25
             slot["grid_dump_w"] = max(_sf(slot.get("grid_dump_w", 0.0), 0.0), slot_w)
+            slot["predump_candidate_w"] = slot["grid_dump_w"]
+            slot["predump_candidate"] = True
+            slot["predump_selected"] = False
+            slot["predump_executable"] = False
+            slot["predump_commands_allowed"] = False
+            slot["predump_status"] = "candidate_only"
+            slot["predump_block_reason"] = "awaiting_storage_manager_selection"
             dumped_wh += actual_wh
             remaining_wh -= actual_wh
 
@@ -1852,11 +2153,11 @@ class StorageSimulator:
 
     def __init__(self):
         self.v4_config = self._load_v4_config()
-        
+
         # Batteriegroesse aus V4 Config (Fallback wenn RSCP keinen Wert liefert)
         self.capacity_kwh = self._safe_float(self.v4_config.get('speichergroesse', '10.0'), 10.0)
         self.capacity_wh = self.capacity_kwh * 1000.0
-        
+
         # Max Lade-Grenzleistung
         self.max_charge_w = self._safe_float(self.v4_config.get('maximumladeleistung', '3000'), 3000.0)
         self.max_discharge_w = self.max_charge_w
@@ -1871,6 +2172,9 @@ class StorageSimulator:
         self.export_limit_w = self._safe_float(self.v4_config.get('einspeiselimit', 0.0), 0.0)
         if self.export_limit_w < 100.0 and self.export_limit_w > 0:
             self.export_limit_w *= 1000.0
+        self.export_limit_source = "config:einspeiselimit" if self.export_limit_w > 0.0 else "unavailable"
+        self.pv_topology_contract = build_pv_forecast_topology(self.v4_config)
+        self._refresh_pcc_headroom_limit_contract()
 
         # Optionale Zwischenanker fuer Auto-/Wallbox-Tage:
         # Danach steigt die Kurve nur noch bis zum Tagesziel/Freilauf weiter.
@@ -1915,14 +2219,14 @@ class StorageSimulator:
         try:
             # Config jedes Mal neu laden damit Aenderungen sofort wirken
             self.v4_config = self._load_v4_config()
+            self.pv_topology_contract = build_pv_forecast_topology(self.v4_config)
             with open(LIVE_DATA_FILE, 'r') as f:
                 d = json.load(f)
 
             # 1. Nutzbare Kapazitaet: Config hat IMMER Vorrang (User weiss besser als RSCP).
             #    RSCP-Fallback NUR wenn Config komplett fehlt (0 oder leer).
             #    WICHTIG: RSCP-Wert darf Config-Wert NICHT ueberschreiben!
-            #    Unterschiedliche Rundungen von Config und RSCP dürfen die
-            #    Kapazität im Plan nicht zwischen zwei Werten springen lassen.
+            #    (Bug-Ursache: cfg_cap=35kWh, RSCP=34.21kWh -> bat_cap im Plan schwankte)
             cfg_cap = self._safe_float(self.v4_config.get('speichergroesse', 0), 0.0)
             if cfg_cap > 0:
                 # Config gesetzt -> capacity_kwh/capacity_wh immer auf Config-Wert halten
@@ -1944,8 +2248,19 @@ class StorageSimulator:
                 self.max_charge_w = float(d["bat_charge_limit_w"])
 
             # 3. Einspeiselimit (Abregelung) - kein eigener Config-Key, RSCP-Wert OK
+            _live_derate_limit_w = None
             if "derate_at_power_w" in d and float(d["derate_at_power_w"]) > 0:
-                self.export_limit_w = float(d["derate_at_power_w"])
+                _live_derate_limit_w = float(d["derate_at_power_w"])
+                self.export_limit_w = _live_derate_limit_w
+                self.export_limit_source = "live:derate_at_power_w"
+            else:
+                _cfg_export_limit_w = self._safe_float(self.v4_config.get('einspeiselimit', 0.0), 0.0)
+                if 0.0 < _cfg_export_limit_w < 100.0:
+                    _cfg_export_limit_w *= 1000.0
+                if _cfg_export_limit_w > 0.0:
+                    self.export_limit_w = _cfg_export_limit_w
+                    self.export_limit_source = "config:einspeiselimit"
+            self._refresh_pcc_headroom_limit_contract(_live_derate_limit_w)
 
             self.target_soc = self._safe_float(self.v4_config.get('storage_target_soc', self.target_soc), self.target_soc)
             self.curve_target_mode = self._curve_target_mode_from_config(self.v4_config)
@@ -1983,7 +2298,7 @@ class StorageSimulator:
 
         except: pass
 
-            
+
     def _load_v4_config(self):
         if os.path.exists(V4_CONFIG_FILE):
             try:
@@ -2013,7 +2328,7 @@ class StorageSimulator:
                     # Support für live_data_py.json (Native V4)
                     if "SOC" in data: return float(data["SOC"])
                     if "batterie_soc" in data: return float(data["batterie_soc"])
-                    
+
                     for k, v in data.items():
                         if str(k).lower() in ["soc", "batterie_soc", "bat_soc"]:
                             return float(str(v).replace(',', '.'))
@@ -3704,23 +4019,61 @@ class StorageSimulator:
             logger.warning("Preis-Boost Plan Fehler: %s" % e)
             return _empty("Fehler: %s" % e)
 
+    @staticmethod
+    def _bind_forecast_slot_topology(slot, forecast_slot):
+        """Materialisiert Split oder typisierte Missingness für jeden PV-Slot."""
+
+        status = str(forecast_slot.get("pv_topology_status") or "topology_unbound")
+        reason = str(forecast_slot.get("pv_topology_reason") or "SLOT_TOPOLOGY_MISSING")
+        dc_w = forecast_slot.get("e3dc_dc_pv_w")
+        external_w = forecast_slot.get("external_ac_pv_w")
+        if status == "bound" and (dc_w is None or external_w is None):
+            status = "topology_unbound"
+            reason = "RESOURCE_PROJECTION_INCOMPLETE"
+        slot["pv_topology_status"] = status
+        slot["pv_topology_reason"] = reason
+        slot["pv_topology_revision"] = forecast_slot.get("pv_topology_revision")
+        slot["pv_topology_source"] = str(
+            forecast_slot.get("pv_topology_source") or "pv_forecast_slot"
+        )
+        slot["pv_topology_quality"] = str(
+            forecast_slot.get("pv_topology_quality")
+            or ("complete" if status == "bound" else "missing_or_incoherent_resource_projection")
+        )
+        slot["pv_resource_projection_status"] = str(
+            forecast_slot.get("pv_resource_projection_status")
+            or ("complete" if status == "bound" else "unbound")
+        )
+        slot["pv_resource_projection_reason"] = str(
+            forecast_slot.get("pv_resource_projection_reason") or reason
+        )
+        slot["e3dc_dc_pv_w"] = dc_w if status == "bound" else None
+        slot["external_ac_pv_w"] = external_w if status == "bound" else None
+        slot["pv_resource_contributions"] = (
+            forecast_slot.get("pv_resources")
+            if isinstance(forecast_slot.get("pv_resources"), list)
+            else []
+        )
+        slot["pv_external_ac_capped_w"] = forecast_slot.get("pv_external_ac_capped_w", 0.0)
+
     def generate_plan(self):
         # Update Hardware-Params vor jedem Lauf
         self._update_params_from_live()
         forecast_only_curve = self._forecast_only_curve_enabled()
         if forecast_only_curve:
             self.target_soc = 100.0
-        
+
         logger.info(f"Generiere V4 Fahrplan ({self.capacity_kwh:.1f} kWh Akku, {self.max_charge_w:.0f} W Limit)...")
-        
+
         current_soc = self.get_live_soc()
         if current_soc is None:
             return False
         storm_guard = self._storm_empty("Unwetterwächter noch nicht bewertet")
         storm_grid_charge = self._storm_grid_empty(current_soc)
-        
+
         # Lade externe Arrays
         pv_tl = []
+        pv_source_meta = {}
         if os.path.exists(PV_ENV_FILE):
             try:
                 with open(PV_ENV_FILE, 'r', encoding='utf-8-sig') as f: pv_tl = json.load(f)
@@ -3730,20 +4083,34 @@ class StorageSimulator:
                 logger.error(f"Fehler beim Laden von {PV_ENV_FILE}: {e}")
         else:
             logger.warning(f"Datei nicht gefunden: {PV_ENV_FILE}")
+        if os.path.exists(PV_META_FILE):
+            try:
+                with open(PV_META_FILE, 'r', encoding='utf-8-sig') as f:
+                    _pv_source_meta = json.load(f)
+                if isinstance(_pv_source_meta, dict):
+                    pv_source_meta = _pv_source_meta
+            except Exception as e:
+                logger.warning(f"PV-Metadaten nicht nutzbar ({PV_META_FILE}): {e}")
         pv_forecast_missing = not bool(pv_tl)
         forecast_meta = {
             "forecast_source": "pv_forecast",
             "forecast_trust": "forecast",
             "forecast_confidence": 1.0,
             "emergency_curve_active": False,
+            "pv_topology": pv_source_meta.get("pv_topology")
+            if isinstance(pv_source_meta.get("pv_topology"), dict)
+            else self.pv_topology_contract,
         }
-            
+
         home_tl = []; wp_tl = []
+        ml_data = {}
         ml_tl = []
         if os.path.exists(ML_PRED_FILE):
             try:
                 with open(ML_PRED_FILE, 'r', encoding='utf-8-sig') as f:
                     ml_data = json.load(f)
+                    if not isinstance(ml_data, dict):
+                        ml_data = {}
                     ml_tl = ml_data.get('timeline', [])
             except Exception as e:
                 logger.error(f"Fehler beim Laden von {ML_PRED_FILE}: {e}")
@@ -3769,6 +4136,35 @@ class StorageSimulator:
         _fallback_home_w = 500.0
         _fallback_wp_w = 300.0 if _wp_type > 0 else 0.0
 
+        consumption_forecast_meta = {
+            "schema_version": ml_data.get("schema_version") if ml_available else None,
+            "forecast_mode": ml_data.get("forecast_mode") if ml_available else "static_m1_fallback",
+            "model_ready": bool(ml_data.get("model_ready")) if ml_available else False,
+            "model_reason": ml_data.get("model_reason") if ml_available else "ml_prediction_missing",
+            "generated_at": ml_data.get("ts") if ml_available else None,
+            "history_profile": ml_data.get("history_profile") if ml_available else None,
+            "consumer_sources": ml_data.get("consumer_sources") if ml_available else {
+                "home": {"sources": ["static_m1_fallback"], "quality": ["fallback"]},
+                "wp": {
+                    "sources": ["static_m1_fallback" if _wp_type > 0 else "not_applicable"],
+                    "quality": ["fallback" if _wp_type > 0 else "not_applicable"],
+                },
+                "climate": {"sources": ["not_applicable"], "quality": ["not_applicable"]},
+                "wallbox": {
+                    "sources": ["excluded_dynamic_without_explicit_plan"],
+                    "quality": ["not_applicable"],
+                },
+                "heating_element": {
+                    "sources": ["included_in_home_or_explicit_planned_load"],
+                    "quality": ["no_dedicated_history_series"],
+                },
+                "domestic_hot_water_heatpump": {
+                    "sources": ["included_in_home_or_explicit_planned_load"],
+                    "quality": ["no_dedicated_history_series"],
+                },
+            },
+        }
+
         ml_profile = {}
         if ml_available:
             for m in ml_tl:
@@ -3781,10 +4177,22 @@ class StorageSimulator:
                     climate_w = float(m.get("climate_kwh", 0) or 0) * 1000.0
                     if home_w <= 0 and wp_w <= 0 and climate_w <= 0:
                         continue
-                    ml_profile.setdefault(slot_key, {"home": [], "wp": [], "climate": []})
+                    ml_profile.setdefault(slot_key, {
+                        "home": [], "wp": [], "climate": [],
+                        "home_source": [], "home_quality": [],
+                        "wp_source": [], "wp_quality": [],
+                        "climate_source": [], "climate_quality": [],
+                    })
                     ml_profile[slot_key]["home"].append(home_w)
                     ml_profile[slot_key]["wp"].append(wp_w)
                     ml_profile[slot_key]["climate"].append(climate_w)
+                    for field in (
+                        "home_source", "home_quality",
+                        "wp_source", "wp_quality",
+                        "climate_source", "climate_quality",
+                    ):
+                        if m.get(field) not in (None, ""):
+                            ml_profile[slot_key][field].append(str(m.get(field)))
                 except Exception:
                     continue
 
@@ -3797,6 +4205,24 @@ class StorageSimulator:
                 "home_w": sum(homes) / len(homes) if homes else _fallback_home_w,
                 "wp_w": sum(wps) / len(wps) if wps else _fallback_wp_w,
                 "climate_w": sum(climates) / len(climates) if climates else 0.0,
+                "home_source": "profile_extension:" + str(
+                    (values.get("home_source") or [consumption_forecast_meta["forecast_mode"]])[0]
+                ),
+                "home_quality": "profile_extension:" + str(
+                    (values.get("home_quality") or ["fallback"])[0]
+                ),
+                "wp_source": "profile_extension:" + str(
+                    (values.get("wp_source") or ["not_applicable"])[0]
+                ),
+                "wp_quality": "profile_extension:" + str(
+                    (values.get("wp_quality") or ["not_applicable"])[0]
+                ),
+                "climate_source": "profile_extension:" + str(
+                    (values.get("climate_source") or ["not_applicable"])[0]
+                ),
+                "climate_quality": "profile_extension:" + str(
+                    (values.get("climate_quality") or ["not_applicable"])[0]
+                ),
             }
 
         if not ml_available:
@@ -3810,6 +4236,9 @@ class StorageSimulator:
         _live_pv_w = None
         _live_grid_w = 0.0
         _live_derate_w = 0.0
+        _live_external_ac_w = None
+        _live_e3dc_dc_limit_w = 0.0
+        _live_e3dc_dc_limit_source = "unavailable"
         _live_power_limits_active = False
         _live_ts = 0.0
         _live_d = {}
@@ -3826,6 +4255,18 @@ class StorageSimulator:
                     _live_pv_w = max(0.0, float(_pv_live or 0.0))
                 _live_grid_w = float(_live_d.get('Grid_Power', _live_d.get('grid_power', 0)) or 0)
                 _live_derate_w = max(0.0, float(_live_d.get('derate_at_power_w', 0) or 0))
+                if _live_d.get('Ext_PV_Power_Valid') is True:
+                    _ext_live = max(0.0, float(_live_d.get('Ext_PV_Power', 0) or 0))
+                    if _live_pv_w is not None and _ext_live <= _live_pv_w + 5.0:
+                        _live_external_ac_w = min(_ext_live, _live_pv_w)
+                _dc_limit_parts = []
+                for _dc_index in range(4):
+                    _dc_limit_part = max(0.0, float(_live_d.get(f'dc{_dc_index}_max_w', 0) or 0))
+                    if _dc_limit_part > 0.0:
+                        _dc_limit_parts.append(_dc_limit_part)
+                if _dc_limit_parts:
+                    _live_e3dc_dc_limit_w = sum(_dc_limit_parts)
+                    _live_e3dc_dc_limit_source = "live:pvi_dc_max_power_sum"
                 _live_power_limits_active = self._cfg_bool(
                     _live_d.get('power_limits_active', _live_d.get('ems_derating_active', False)),
                     False,
@@ -3835,9 +4276,21 @@ class StorageSimulator:
             _live_pv_w = None
             _live_grid_w = 0.0
             _live_derate_w = 0.0
+            _live_external_ac_w = None
+            _live_e3dc_dc_limit_w = 0.0
+            _live_e3dc_dc_limit_source = "unavailable"
             _live_power_limits_active = False
             _live_ts = 0.0
             _live_d = {}
+
+        if _live_e3dc_dc_limit_w <= 0.0:
+            _configured_dc_limit_w = self._safe_float(
+                (self.pv_topology_contract.get("limits_w") or {}).get("e3dc_dc_configured"),
+                0.0,
+            )
+            if _configured_dc_limit_w > 0.0:
+                _live_e3dc_dc_limit_w = _configured_dc_limit_w
+                _live_e3dc_dc_limit_source = "config:pv_e3dc_dc_inverter_limit_w"
 
         try:
             _configured_ep_reserve_soc = self._safe_float(self.v4_config.get("ep_reserve_pct", 8.0), 8.0)
@@ -3910,17 +4363,29 @@ class StorageSimulator:
                     self.noon_hour = float(forecast_meta.get("emergency_noon_hour", self.noon_hour))
                     forecast_meta["emergency_noon_anchor_injected"] = True
                     forecast_meta["emergency_noon_target_soc"] = round(float(self.noon_target_soc), 1)
-        
+
         timeline = []
         for offset in range(n_slots):
             ts_start = start_ms + (offset * slot_ms)
             timeline.append({
                 "ts": ts_start, "pv_w": 0, "home_w": 0, "wp_w": 0, "climate_w": 0,
+                "home_source": "unresolved", "home_quality": "missing",
+                "wp_source": "unresolved", "wp_quality": "missing",
+                "climate_source": "unresolved", "climate_quality": "missing",
                 "surplus_w": 0, "charge_w": 0, "soc": 0,
                 "marketprice": 0.0, "billing_price_ct": None,
                 "optimization_score": None, "pure_eco_score": None,
-                "price_available": False, "eco_score_available": False,
-                "grid_dump_w": 0
+                "price_available": False, "price_fresh": False,
+                "price_stale": True, "price_status": "source_interval_missing",
+                "eco_score_available": False,
+                "grid_dump_w": 0,
+                "predump_candidate_w": 0,
+                "predump_candidate": False,
+                "predump_selected": False,
+                "predump_executable": False,
+                "predump_commands_allowed": False,
+                "predump_status": "none",
+                "predump_block_reason": None
             })
 
         def _refresh_slot_energy(slot):
@@ -3937,7 +4402,7 @@ class StorageSimulator:
         _ml_base_slots = 0
         for slot in timeline:
             ts = slot["ts"]
-            
+
             # Interpoliere PV:
             # predicted_kwh aus dem Ensemble-Forecast ist bereits mittlere Leistung in kW
             # (nicht Energie! Siehe pv_forecast_service.py: slotted_kw wird als predicted_kwh gespeichert)
@@ -3945,8 +4410,18 @@ class StorageSimulator:
             for p in pv_tl:
                 if ts >= p["start_timestamp"] and ts < p["end_timestamp"]:
                     slot["pv_w"] = p.get("predicted_kwh", 0) * 1000.0
+                    if self.pv_topology_contract.get("split_usable") or any(
+                        key in p
+                        for key in (
+                            "pv_topology_status",
+                            "pv_topology_revision",
+                            "e3dc_dc_pv_w",
+                            "external_ac_pv_w",
+                        )
+                    ):
+                        self._bind_forecast_slot_topology(slot, p)
                     break
-                    
+
             # Interpoliere ML (Home / WP / Klima):
             ml_matched = False
             for m in ml_tl:
@@ -3954,6 +4429,12 @@ class StorageSimulator:
                     slot["home_w"] = m.get("home_kwh", 0) * 1000.0
                     slot["wp_w"] = m.get("wp_kwh", 0) * 1000.0
                     slot["climate_w"] = m.get("climate_kwh", 0) * 1000.0
+                    slot["home_source"] = m.get("home_source", ml_data.get("forecast_mode", "unknown"))
+                    slot["home_quality"] = m.get("home_quality", "unknown")
+                    slot["wp_source"] = m.get("wp_source", ml_data.get("forecast_mode", "unknown"))
+                    slot["wp_quality"] = m.get("wp_quality", "unknown")
+                    slot["climate_source"] = m.get("climate_source", "not_applicable")
+                    slot["climate_quality"] = m.get("climate_quality", "not_applicable")
                     ml_matched = True
                     _ml_direct_slots += 1
                     break
@@ -3967,11 +4448,23 @@ class StorageSimulator:
                     slot["home_w"] = prof["home_w"]
                     slot["wp_w"] = prof["wp_w"]
                     slot["climate_w"] = prof["climate_w"]
+                    for field in (
+                        "home_source", "home_quality",
+                        "wp_source", "wp_quality",
+                        "climate_source", "climate_quality",
+                    ):
+                        slot[field] = prof[field]
                     _ml_profile_slots += 1
                 else:
                     slot["home_w"] = _fallback_home_w
                     slot["wp_w"] = _fallback_wp_w
                     slot["climate_w"] = 0.0
+                    slot["home_source"] = "static_m1_fallback"
+                    slot["home_quality"] = "fallback"
+                    slot["wp_source"] = "static_m1_fallback" if _fallback_wp_w > 0.0 else "not_applicable"
+                    slot["wp_quality"] = "fallback" if _fallback_wp_w > 0.0 else "not_applicable"
+                    slot["climate_source"] = "not_applicable"
+                    slot["climate_quality"] = "not_applicable"
                     _ml_base_slots += 1
 
             if _live_home_w is not None and _live_ts > 0:
@@ -3986,12 +4479,15 @@ class StorageSimulator:
                             _live_home_clamped_slots += 1
                 except Exception:
                     pass
-                    
+
             # Interpoliere EPEX (Marketprice):
             for e in epex_tl:
                 if ts >= e["start_timestamp"] and ts < e["end_timestamp"]:
                     slot["marketprice"] = float(e.get("marketprice", 0.0))
                     slot["price_available"] = True
+                    slot["price_fresh"] = True
+                    slot["price_stale"] = False
+                    slot["price_status"] = "source_interval_match"
                     for key in (
                         "price_source",
                         "tariff_provider",
@@ -4022,7 +4518,7 @@ class StorageSimulator:
                     if pure_eco_score is not None:
                         slot["pure_eco_score"] = float(pure_eco_score)
                     break
-                    
+
             # Netto PV Überschuss
             _refresh_slot_energy(slot)
 
@@ -4078,8 +4574,8 @@ class StorageSimulator:
         # --- 3. V4 Intelligenz: Peak-Shaving & Sunset-Targeting für volle 3-4 Tage ---
         midnight_today = now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000
         days = [
-            midnight_today, 
-            midnight_today + 86400000, 
+            midnight_today,
+            midnight_today + 86400000,
             midnight_today + 172800000,
             midnight_today + 259200000
         ]
@@ -4197,7 +4693,7 @@ class StorageSimulator:
             if wallbox_target_soc_active:
                 planning_target_soc = wallbox_target_soc
                 self.target_soc = wallbox_target_soc
-        
+
         # Hilfsfunktion für Vorwärts-Projektion des SoC zum Tagesbeginn
         def project_soc(start_soc, until_ts):
             psoc = start_soc
@@ -4210,23 +4706,23 @@ class StorageSimulator:
 
         for day_ms in days:
             day_end_ms = day_ms + 86400000
-            
+
             sunset_ts = 0
             peaking_slots = []
-            
+
             for slot in timeline:
                 if slot["ts"] >= day_end_ms: break
                 if slot["ts"] >= day_ms:
                     if slot["pv_w"] > 100: sunset_ts = slot["ts"]
                     if self.export_limit_w > 0 and slot["surplus_w"] > self.export_limit_w:
                         peaking_slots.append(slot)
-                        
+
             if sunset_ts == 0: continue
-            
-            # Neu in V4.1: Wir berechnen die benötigte Energie nicht ab Mitternacht, 
+
+            # Neu in V4.1: Wir berechnen die benötigte Energie nicht ab Mitternacht,
             # sondern ab dem prognostizierten Tiefpunkt am Morgen (Morning Dip).
             day_slots = [s for s in timeline if s["ts"] >= day_ms and s["ts"] < day_end_ms]
-            
+
             # Simuliere den SoC-Verlauf in der Nacht bis zum PV-Start
             temp_soc = current_soc if day_ms == midnight_today else project_soc(current_soc, day_ms)
             min_soc_today = temp_soc
@@ -4237,13 +4733,13 @@ class StorageSimulator:
                 temp_soc -= (discharge_wh / self.capacity_wh) * 100.0
                 temp_soc = max(0, temp_soc)
                 if temp_soc < min_soc_today: min_soc_today = temp_soc
-            
+
             required_wh = self.capacity_wh * max(0.0, (self.target_soc - min_soc_today)) / 100.0
-            
+
             if required_wh > 0:
                 day_name = _curve_day_label(day_ms)
                 logger.info(f"Battery Target {day_name}: Brauche {required_wh:.0f} Wh (berechnet ab {min_soc_today:.1f}% SoC Tiefstwert, Ziel {self.target_soc:.0f}%) bis Sonnenuntergang.")
-            
+
             # A) PRIO 1: Peak-Shaving (Vorsorgliche Ladung in extremen Spitzen sichern)
             peak_charge_wh = 0
             for slot in peaking_slots:
@@ -4251,7 +4747,7 @@ class StorageSimulator:
                 excess_w = slot["surplus_w"] - self.export_limit_w
                 charge_power = min(excess_w, self.max_charge_w)
                 slot["is_peak"] = True
-                
+
                 # Wenn wir im Peak laden, tracken wir das bereits
                 slot["target_charge_w"] = charge_power
                 peak_charge_wh += (charge_power * 0.25)
@@ -4259,7 +4755,7 @@ class StorageSimulator:
                 slot["surplus_w"] -= charge_power
 
             remaining_wh = required_wh - peak_charge_wh
-            
+
             # B) PRIO 2: Ladeverzögerung / Glattes Aufteilen des Restes über alle sonnigen Stunden bis Sunset
             if remaining_wh > 0:
                 chargeable_slots = []
@@ -4271,7 +4767,7 @@ class StorageSimulator:
                         if slot.get("is_peak"): continue
                         if slot["surplus_w"] > 0:
                             chargeable_slots.append(slot)
-                        
+
                 if chargeable_slots:
                     slots_left = len(chargeable_slots)
                     # KRITISCH: Mindest-Lade-Leistung die sicherstellt, dass required_wh
@@ -4280,16 +4776,16 @@ class StorageSimulator:
                     # (z.B. 14.7kWp mit 94kWh Tag: remaining_surplus >> required_wh*1.5 immer True,
                     # avg_w bleibt bei 63W statt 342W -> Max SoC nie ueber 86%)
                     min_charge_w = (remaining_wh / (slots_left * 0.25)) if slots_left > 0 else 0
-                    
+
                     for i, slot in enumerate(chargeable_slots):
                         if remaining_wh <= 0:
                             slot["target_charge_w"] = 0
                             continue
-                            
+
                         # Vorausblick: Wie viel Überschuss Energie (Wh) erwartet uns heute noch INSGESAMT?
                         remaining_surplus_wh = sum(s["surplus_w"] * 0.25 for s in chargeable_slots[i:])
-                        
-                        # Wenn der gesamte noch kommende Sonnenüberschuss eh nur noch knapp reicht 
+
+                        # Wenn der gesamte noch kommende Sonnenüberschuss eh nur noch knapp reicht
                         # (mit 50% Puffer für Wolken-Sicherheit), dann nehmen wir alles!
                         if remaining_surplus_wh <= (remaining_wh * 1.5):
                             target = slot["surplus_w"]
@@ -4298,17 +4794,17 @@ class StorageSimulator:
                             # min_charge_w stellt sicher dass Ziel-SoC erreichbar bleibt.
                             avg_w_required = remaining_wh / (slots_left * 0.25)
                             target = max(min_charge_w, min(avg_w_required, slot["surplus_w"]))
-                            
+
                         target = min(target, self.max_charge_w)
                         slot["target_charge_w"] = target
-                        
+
                         remaining_wh -= (target * 0.25)
                         # min_charge_w dynamisch anpassen wenn remaining_wh sinkt
                         if slots_left > 1:
                             min_charge_w = (remaining_wh / ((slots_left - 1) * 0.25)) if slots_left > 1 else 0
                         slots_left -= 1
 
-                        
+
         # --- 4. Simulation von SoC anwenden ---
         sim_soc = current_soc
         for idx, slot in enumerate(timeline):
@@ -4317,18 +4813,18 @@ class StorageSimulator:
 
             if "target_charge_w" in slot:
                 slot["charge_w"] = slot["target_charge_w"]
-                
+
             # Lade-Logik limitiert durch SoC!
             actual_charge_w = slot["charge_w"]
             if sim_soc >= 100 and slot["charge_w"] > 0:
                 actual_charge_w = 0
             elif sim_soc <= 0 and slot["charge_w"] < 0:
                 actual_charge_w = 0
-                
+
             # SoC-Update testen
             energy_wh = actual_charge_w * 0.25
             next_soc = sim_soc + (energy_wh / self.capacity_wh) * 100.0
-            
+
             # Hatten wir Überladung im Frame?
             if next_soc > 100:
                 actual_charge_w = ((100.0 - sim_soc) / 100.0) * self.capacity_wh * 4.0
@@ -4336,7 +4832,7 @@ class StorageSimulator:
             elif next_soc < 0:
                 actual_charge_w = ((0.0 - sim_soc) / 100.0) * self.capacity_wh * 4.0
                 next_soc = 0.0
-            
+
             slot["charge_w"] = actual_charge_w
             sim_soc = next_soc
             if idx > 0:
@@ -4448,7 +4944,19 @@ class StorageSimulator:
                             )
                             or _old_adaptive_floor_invalid
                         )
-                        if not _old_has_headroom_guard:
+                        _old_topology = _old_plan.get("pv_topology") if isinstance(_old_plan.get("pv_topology"), dict) else {}
+                        _old_topology_revision = str(_old_topology.get("revision") or "")
+                        _current_topology_revision = str(self.pv_topology_contract.get("revision") or "")
+                        _topology_revision_changed = bool(
+                            not _old_topology_revision
+                            or _old_topology_revision != _current_topology_revision
+                        )
+                        if _topology_revision_changed:
+                            _predump_lock_reset_today = True
+                            logger.info(
+                                "Eco-Dump Lock neu bewertet: PV-Topologierevision fehlt oder hat sich geändert."
+                            )
+                        elif not _old_has_headroom_guard:
                             _predump_lock_reset_today = True
                             logger.info(
                                 f"Eco-Dump Lock neu bewertet: {today_date_str} hatte {_old_dump_wh:.0f}Wh "
@@ -4536,7 +5044,11 @@ class StorageSimulator:
             if not self.predump_enabled:
                 continue
             _hard_predump_requested = bool(self.hard_predump_enabled)
-            if self.export_limit_w <= 0 and not _hard_predump_requested:
+            _typed_dc_pressure_available = bool(
+                self.pv_topology_contract.get("split_usable")
+                and _live_e3dc_dc_limit_w > 0.0
+            )
+            if self.export_limit_w <= 0 and not _typed_dc_pressure_available and not _hard_predump_requested:
                 continue
 
             day_slots = [s for s in timeline if day_ms <= s["ts"] < day_end_ms]
@@ -4663,9 +5175,28 @@ class StorageSimulator:
                 # Pre-Dump must reserve space against PV pressure. Forecast or
                 # live-derived home spikes are not guaranteed sinks here.
                 home_sink_w = min_home_w
-                pressure_w = max(0.0, s["pv_w"] - (self.export_limit_w + home_sink_w + wp_sink_w))
-                preventable_pressure_w = min(max(0.0, float(self.max_charge_w)), pressure_w)
-                unavoidable_pressure_w = max(0.0, pressure_w - preventable_pressure_w)
+                _predump_pcc_contract = self._pcc_headroom_limit_for_topology(
+                    s.get("pv_topology_status")
+                )
+                _predump_pressure = slot_headroom_pressure(
+                    total_pv_w=s.get("pv_w", 0.0),
+                    e3dc_dc_pv_w=s.get("e3dc_dc_pv_w"),
+                    external_ac_pv_w=s.get("external_ac_pv_w"),
+                    topology_status=s.get("pv_topology_status"),
+                    topology_revision=s.get("pv_topology_revision"),
+                    expected_topology_revision=self.pv_topology_contract.get("revision"),
+                    e3dc_dc_limit_w=_live_e3dc_dc_limit_w,
+                    pcc_limit_w=_predump_pcc_contract.get("limit_w"),
+                    pcc_limit_active=_predump_pcc_contract.get("active") is True,
+                    safe_consumers_w=home_sink_w + wp_sink_w,
+                    charge_limit_w=self.max_charge_w,
+                    e3dc_dc_limit_source=_live_e3dc_dc_limit_source,
+                    pcc_limit_source=_predump_pcc_contract.get("source", self.export_limit_source),
+                )
+                pressure_w = float(_predump_pressure.get("combined_pressure_w", 0.0) or 0.0)
+                preventable_pressure_w = float(_predump_pressure.get("preventable_w", 0.0) or 0.0)
+                unavoidable_pressure_w = float(_predump_pressure.get("unavoidable_w", 0.0) or 0.0)
+                StorageSimulator._retain_slot_headroom_evidence(s, _predump_pressure)
                 if preventable_pressure_w > 0.0 and first_pressure_ts is None:
                     first_pressure_ts = s["ts"]
                     soc_at_first_pressure = hw_soc
@@ -4912,8 +5443,10 @@ class StorageSimulator:
             selected_predump_reason = "Pre-Dump deaktiviert"
         elif weather_reserve_active:
             selected_predump_reason = "Pre-Dump pausiert: Schlechtwetterreserve haelt Energie im Speicher."
-        elif self.export_limit_w <= 0:
-            selected_predump_reason = "Kein Pre-Dump: kein Einspeiselimit fuer Abregelungsbewertung hinterlegt."
+        elif self.export_limit_w <= 0 and not (
+            self.pv_topology_contract.get("split_usable") and _live_e3dc_dc_limit_w > 0.0
+        ):
+            selected_predump_reason = "Kein Pre-Dump: weder PCC- noch typisiertes E3DC-DC-Limit verfügbar."
         else:
             selected_predump_reason = "Kein Pre-Dump: Prognose sieht kein relevantes Abregelrisiko."
         morning_soc_tl  = current_soc
@@ -5758,15 +6291,15 @@ class StorageSimulator:
                         for s in today_slots_tl
                         if float(s['ts']) < float(until_ts)
                     )
-                    
+
                     total_planned_wh = sum(
                         _slot_charge_w(s) * 0.25
                         for s in today_slots_tl
                         if float(s['ts']) < float(curve_end_ts)
                     )
-                    
+
                     needed_wh = (float(self.target_soc) - float(morning_soc_tl)) * (self.capacity_wh / 100.0)
-                    
+
                     if total_planned_wh > needed_wh and total_planned_wh > 0:
                         # Geplante Energie ist groesser als Bedarf -> Kurve ueber den Tag strecken.
                         fraction = planned_wh / total_planned_wh
@@ -5774,7 +6307,7 @@ class StorageSimulator:
                     else:
                         # Prognose reicht knapp/nicht -> alles laden was nach Wetter/ML kommt.
                         gain = (planned_wh / self.capacity_wh) * 100.0 if self.capacity_wh > 0 else 0.0
-                        
+
                     return min(float(self.target_soc), float(morning_soc_tl) + gain)
 
                 def _apply_user_curve_anchors(anchors):
@@ -6411,7 +6944,7 @@ class StorageSimulator:
         for slot in timeline:
             if reach_day_start_ms <= slot["ts"] < reach_day_end_ms:
                 max_soc_today = max(max_soc_today, slot.get("soc", 0))
-        
+
         # BUGFIX: can_reach_target darf NICHT auf max_soc_today der gedrosselten Simulation basieren!
         # Die Simulation drosselt das Laden bewusst (Ladeverzoegerungs-Algorithmus fuer Punktlandung),
         # was bei grossen PV-Anlagen (z.B. 14.7kWp mit 94kWh/Tag) dazu fuehrt dass die simulierte
@@ -6674,7 +7207,43 @@ class StorageSimulator:
                     trust_wp_forecast_sink=_adaptive_trust_wp_sink,
                     comfort_soc=_adaptive_comfort_soc,
                     large_storage_threshold_kwh=_adaptive_large_threshold_kwh,
+                    topology_contract=self.pv_topology_contract,
+                    e3dc_dc_limit_w=_live_e3dc_dc_limit_w,
+                    e3dc_dc_limit_source=_live_e3dc_dc_limit_source,
+                    pcc_limit_source=self.export_limit_source,
+                    pcc_limit_contract=self.pcc_headroom_limit_contract,
                 )
+                _observed_dc_pv_w = None
+                if _live_pv_w is not None and _live_external_ac_w is not None:
+                    _observed_dc_pv_w = max(0.0, _live_pv_w - _live_external_ac_w)
+                _observed_topology_status = (
+                    "bound" if self.pv_topology_contract.get("split_usable") else "topology_unbound"
+                )
+                _observed_pcc_contract = self._pcc_headroom_limit_for_topology(
+                    _observed_topology_status
+                )
+                adaptive_headroom["observed_pressure"] = {
+                    **slot_headroom_pressure(
+                        total_pv_w=_live_pv_w or 0.0,
+                        e3dc_dc_pv_w=_observed_dc_pv_w,
+                        external_ac_pv_w=_live_external_ac_w,
+                        topology_status=_observed_topology_status,
+                        topology_revision=self.pv_topology_contract.get("revision"),
+                        expected_topology_revision=self.pv_topology_contract.get("revision"),
+                        e3dc_dc_limit_w=_live_e3dc_dc_limit_w,
+                        pcc_limit_w=_observed_pcc_contract.get("limit_w"),
+                        pcc_limit_active=_observed_pcc_contract.get("active") is True,
+                        safe_consumers_w=_live_home_w or 0.0,
+                        charge_limit_w=self.max_charge_w,
+                        e3dc_dc_limit_source=_live_e3dc_dc_limit_source,
+                        pcc_limit_source=_observed_pcc_contract.get("source", self.export_limit_source),
+                    ),
+                    "observed_at": int(_live_ts) if _live_ts > 0.0 else None,
+                    "live_sample_available": bool(_live_ts > 0.0 and _live_pv_w is not None),
+                    "external_ac_split_valid": bool(_live_external_ac_w is not None),
+                    "evidence_scope": "observed_output_not_latent_clipping_proof",
+                    "pcc_limit_contract": _observed_pcc_contract,
+                }
                 _reserve_sources = []
                 if historical_headroom_meta.get("active"):
                     _reserve_sources.append(historical_headroom_meta.get("source", "historical_peak"))
@@ -6820,14 +7389,46 @@ class StorageSimulator:
             logger.info('CheckaWATTar (simple): mode=%d %s' % (awattar_mode, awattar_reason))
 
         cheap_grid_charge = self._cheap_grid_charge_plan(timeline, current_soc, target_timeline)
+        _previous_direct_marketing_policy = None
+        _previous_direct_marketing_market_windows = None
+        try:
+            if os.path.exists(OUTPUT_FILE):
+                with open(OUTPUT_FILE, "r", encoding="utf-8") as _previous_plan_handle:
+                    _previous_plan = json.load(_previous_plan_handle)
+                _previous_direct = (
+                    _previous_plan.get("direct_marketing")
+                    if isinstance(_previous_plan, dict) and isinstance(_previous_plan.get("direct_marketing"), dict)
+                    else {}
+                )
+                if isinstance(_previous_direct.get("policy_decision"), dict):
+                    _previous_direct_marketing_policy = _previous_direct.get("policy_decision")
+                if isinstance(_previous_direct.get("market_windows"), list):
+                    _previous_direct_marketing_market_windows = _previous_direct.get("market_windows")
+        except Exception as _previous_direct_err:
+            logger.debug("DV-Fortsetzungsvertrag konnte nicht gelesen werden: %s", _previous_direct_err)
+
+        _direct_marketing_config = dict(self.v4_config)
+        try:
+            if os.path.exists(DIRECT_MARKETING_REPORT_FILE):
+                with open(DIRECT_MARKETING_REPORT_FILE, "r", encoding="utf-8") as _dm_report_handle:
+                    _dm_report = json.load(_dm_report_handle)
+                _direct_marketing_config = direct_marketing_runtime_config(
+                    self.v4_config,
+                    _dm_report,
+                )
+        except Exception as _dm_report_err:
+            logger.debug("DV-Tagesdurchsatz konnte nicht gelesen werden: %s", _dm_report_err)
+
         direct_marketing = build_direct_marketing_shadow_plan(
-            self.v4_config,
+            _direct_marketing_config,
             timeline,
             current_soc,
             self.capacity_wh,
             self.target_soc,
             now_ms=time.time() * 1000,
             target_timeline=target_timeline,
+            previous_policy_decision=_previous_direct_marketing_policy,
+            previous_market_windows=_previous_direct_marketing_market_windows,
         )
         _market_economics_config = dict(self.v4_config)
         try:
@@ -6940,10 +7541,41 @@ class StorageSimulator:
                     except Exception:
                         pass
 
-            json.dump({
+            _storage_plan_payload = {
                 "ts":              now.isoformat(),
                 "battery_capacity": self.capacity_wh,
                 "bat_cap_kwh":     round(self.capacity_kwh, 2),
+                "max_charge_w":    round(float(self.max_charge_w), 0),
+                "max_discharge_w": round(float(self.max_discharge_w), 0),
+                "export_limit_w":  round(float(self.export_limit_w), 0),
+                "pv_topology": self.pv_topology_contract,
+                "headroom_topology": {
+                    "schema_version": "pv_headroom_topology_evidence_v1",
+                    "topology_status": adaptive_headroom.get("pv_topology_status", "topology_unbound"),
+                    "topology_reason": adaptive_headroom.get("pv_topology_reason", "TOPOLOGY_UNAVAILABLE"),
+                    "topology_revision": adaptive_headroom.get("pv_topology_revision"),
+                    "dc_pressure_wh": adaptive_headroom.get("dc_headroom_pressure_wh", 0.0),
+                    "pcc_pressure_wh": adaptive_headroom.get("pcc_headroom_pressure_wh", 0.0),
+                    "combined_pressure_wh": adaptive_headroom.get("combined_headroom_pressure_wh", 0.0),
+                    "combination_rule": adaptive_headroom.get("headroom_combination_rule", "max_dc_pcc_no_double_count"),
+                    "limits_w": {
+                        "e3dc_dc": adaptive_headroom.get("e3dc_dc_limit_w"),
+                        "pcc": adaptive_headroom.get("pcc_limit_w"),
+                    },
+                    "limit_sources": {
+                        "e3dc_dc": adaptive_headroom.get("e3dc_dc_limit_source", "unavailable"),
+                        "pcc": adaptive_headroom.get("pcc_limit_source", "unavailable"),
+                    },
+                    "pcc_limit_contract": adaptive_headroom.get(
+                        "pcc_limit_contract",
+                        self.pcc_headroom_limit_contract,
+                    ),
+                    "first_pressure_ts": adaptive_headroom.get("curtailment_first_pressure_ts", 0),
+                    "deadline_ts": selected_predump_end_ts or adaptive_headroom.get("curtailment_first_pressure_ts", 0),
+                    "observed_pressure": adaptive_headroom.get("observed_pressure", {}),
+                },
+                "physical_reserve_soc": round(float(_ep_reserve_floor_soc), 2),
+                "current_soc":      round(float(current_soc), 3),
                 "target_soc":      round(config_target_soc, 1),
                 "planning_target_soc": round(planning_target_soc, 1),
                 "wallbox_target_soc_active": bool(wallbox_target_soc_active),
@@ -7019,6 +7651,8 @@ class StorageSimulator:
                 "headroom_reserve_forecast_ratio": adaptive_headroom.get("headroom_reserve_forecast_ratio", 0.0),
                 "headroom_reserve_horizon_h": adaptive_headroom.get("headroom_reserve_horizon_h", 0.0),
                 "curtailment_pressure_wh": adaptive_headroom.get("curtailment_pressure_wh", selected_predump_raw_pressure_wh),
+                "dc_headroom_pressure_wh": adaptive_headroom.get("dc_headroom_pressure_wh", 0.0),
+                "pcc_headroom_pressure_wh": adaptive_headroom.get("pcc_headroom_pressure_wh", 0.0),
                 "curtailment_unavoidable_wh": adaptive_headroom.get("curtailment_unavoidable_wh", selected_predump_unavoidable_clipping_wh),
                 "curtailment_first_pressure_ts": adaptive_headroom.get("curtailment_first_pressure_ts", 0),
                 "curtailment_soc_at_first_pressure": adaptive_headroom.get("curtailment_soc_at_first_pressure", None),
@@ -7069,6 +7703,7 @@ class StorageSimulator:
                 "storm_guard": storm_guard,
                 "storm_grid_charge": storm_grid_charge,
                 "planned_loads": planned_load_meta,
+                "consumption_forecast": consumption_forecast_meta,
                 "forecast_source": forecast_meta.get("forecast_source", "pv_forecast"),
                 "forecast_trust": forecast_meta.get("forecast_trust", "forecast"),
                 "forecast_confidence": forecast_meta.get("forecast_confidence", 1.0),
@@ -7081,11 +7716,26 @@ class StorageSimulator:
                 "soc_ceiling_curve": adaptive_headroom.get("soc_ceiling_curve", []),
                 "curve_anchors":    curve_anchors,
                 "target_curve_meta": target_curve_meta,
-            }, f)
+            }
+            _dispatch_started = time.perf_counter()
+            _storage_plan_payload = build_canonical_dispatch_plan(_storage_plan_payload)
+            _dispatch_runtime_ms = round((time.perf_counter() - _dispatch_started) * 1000.0, 3)
+            _shadow_runtime = _storage_plan_payload.get("shadow_dispatch")
+            if isinstance(_shadow_runtime, dict):
+                # runtime_ms ist im Planhash bewusst ausgeschlossen. So bleibt
+                # der fachliche Plan deterministisch, die Pi-Laufzeit aber
+                # für Shadow-/Phase-5-Gates sichtbar.
+                _shadow_runtime["runtime_ms"] = _dispatch_runtime_ms
+                _shadow_runtime["runtime_measurement"] = "storage_simulator_perf_counter"
+            f.write(json.dumps(
+                _storage_plan_payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ))
         os.replace(_tmp_file, OUTPUT_FILE)  # Atomar: kein Leser sieht korruptes JSON
         try: os.chmod(OUTPUT_FILE, 0o664)
         except: pass
-        
+
         logger.info(f"[OK] V4 Speicher-Plan generiert und in {OUTPUT_FILE} gespeichert.")
 
 import time
@@ -7114,7 +7764,11 @@ def run_service():
         # Die Simulation baut auf der PV Prognose auf. Alle 15 Minuten updaten reicht völlig aus.
         # Config-/Forecast-Aenderungen sollen aber zeitnah sichtbar werden, ohne dass Nutzer
         # den Dienst neu starten muessen.
-        deadline = time.time() + SIM_INTERVAL_S
+        # Nach dem ersten Start exakt an die 15-Minuten-Slotgrenze takten.
+        # So endet der ausführbare Receding-Horizon-Slot nie vor dem nächsten
+        # regulären Replan; Eingangsänderungen lösen weiterhin sofort neu aus.
+        now_s = time.time()
+        deadline = (int(now_s // SIM_INTERVAL_S) + 1) * SIM_INTERVAL_S + 0.05
         while time.time() < deadline:
             time.sleep(min(SIM_INPUT_POLL_S, max(0.2, deadline - time.time())))
             current_signature = _storage_plan_input_signature()

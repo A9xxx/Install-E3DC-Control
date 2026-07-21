@@ -1,11 +1,12 @@
 import os
+import shlex
 import tempfile
 import time
 
 from .core import register_command
 from .utils import run_command, apt_install
-from .installer_config import get_install_path, get_install_use
-from .logging_manager import get_or_create_logger, log_task_completed, log_erro
+from .installer_config import get_install_path, get_install_user
+from .logging_manager import get_or_create_logger, log_task_completed, log_error
 
 INSTALL_PATH = get_install_path()
 INSTALLER_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -24,13 +25,19 @@ def install_matter_bridge(headless=False):
         print(f"✗ Matter-Verzeichnis nicht gefunden: {matter_dir}")
         return False
 
-    # avahi-utils wird für die lokale Matter-Erkennung benötigt.
+    storage_result = run_command(
+        "sudo install -d -m 700 "
+        f"-o {shlex.quote(install_user)} -g www-data /var/www/html/data/matter-storage"
+    )
+    if not storage_result.get("success"):
+        print("✗ Privater Matter-Storage konnte nicht vorbereitet werden.")
+        return False
+
+    # Fix 1: avahi-utils sicherstellen (benötigt für avahi-publish-service in matter_bridge.js)
     print("→ Prüfe avahi-utils (mDNS Proxy für Matter Discovery)...")
     if run_command("which avahi-publish-service")['success'] is False:
-        print("→ Avahi nicht vollständig installiert, installiere...")
-        apt_install("avahi-daemon")
+        print("→ avahi-utils nicht gefunden, installiere...")
         apt_install("avahi-utils")
-        apt_install("dbus")
     run_command("sudo systemctl enable avahi-daemon")
     run_command("sudo systemctl start avahi-daemon")
     print("✓ avahi-daemon läuft.")
@@ -45,12 +52,20 @@ def install_matter_bridge(headless=False):
             print("✗ Installation von npm fehlgeschlagen!")
             return False
 
-    print("→ Installiere fehlende NPM-Pakete (npm install)...")
-    run_command("npm install", cwd=matter_dir)
+    lock_path = os.path.join(matter_dir, "package-lock.json")
+    if not os.path.isfile(lock_path):
+        print("✗ Matter-Lockdatei fehlt; Installation wird abgebrochen.")
+        return False
+    print("→ Installiere hashgebundene NPM-Pakete (npm ci)...")
+    npm_result = run_command("npm ci --omit=dev --ignore-scripts", cwd=matter_dir)
+    if not npm_result.get("success"):
+        print("✗ Matter-Abhängigkeiten konnten nicht aus der Lockdatei installiert werden.")
+        return False
     print("✓ NPM-Pakete installiert.")
 
     print("→ Erstelle Systemd Service...")
-    # Avahi muss vor der Bridge bereitstehen.
+    # Fix 2: avahi-daemon als Abhängigkeit eintragen, damit es immer vor der Bridge läuft
+    # Fix 3: Sicherstellen dass Matter-Pakete korrekt gelinkt werden (Netzwerk + avahi)
     service_content = f"""[Unit]
 Description=E3DC Matter Bridge
 After=network-online.target avahi-daemon.service
@@ -99,5 +114,5 @@ WantedBy=multi-user.target
 
     return True
 
-# Untergruppe für Smart Home / Matte
-register_command("45", "Smart Home Matter Bridge (Beta)", install_matter_bridge, sort_order=45)
+# Untergruppe für Smart Home / Matter
+register_command("45", "Smart Home Matter Bridge", install_matter_bridge, sort_order=45)

@@ -414,8 +414,115 @@ def predump_request_from_plan(
     max_discharge_w: int,
     previous_state: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    def timeline_dump_wh() -> float:
+        points = sorted(
+            (
+                safe_float(item.get("ts"), 0.0),
+                max(0.0, safe_float(item.get("grid_dump_w"), 0.0)),
+            )
+            for item in plan.get("timeline") or []
+            if isinstance(item, dict) and safe_float(item.get("ts"), 0.0) > 0.0
+        )
+        total_wh = 0.0
+        for index, (timestamp, power_w) in enumerate(points):
+            next_timestamp = points[index + 1][0] if index + 1 < len(points) else timestamp + 900_000.0
+            duration_h = max(0.0, min(3_600_000.0, next_timestamp - timestamp)) / 3_600_000.0
+            total_wh += power_w * duration_h
+        return total_wh
+
+    def physical_headroom_gate(planned_dump_wh: float) -> Dict[str, Any]:
+        meta = plan.get("target_curve_meta") if isinstance(plan.get("target_curve_meta"), dict) else {}
+        required_present = (
+            "adaptive_headroom_required_wh" in plan
+            or "adaptive_headroom_required_wh" in meta
+        )
+        preventable_present = (
+            "predump_preventable_clipping_wh" in plan
+            or "predump_preventable_clipping_wh" in meta
+        )
+        required_wh = max(0.0, safe_float(
+            plan.get("adaptive_headroom_required_wh", meta.get("adaptive_headroom_required_wh"))
+            if required_present
+            else planned_dump_wh,
+            0.0,
+        ))
+        preventable_wh = max(
+            0.0,
+            safe_float(
+                plan.get("predump_preventable_clipping_wh", meta.get("predump_preventable_clipping_wh"))
+                if preventable_present
+                else planned_dump_wh,
+                0.0,
+            ),
+        )
+        time_window = predump_time_window(cfg, plan)
+        deadline_s = safe_float(time_window.get("deadline_ts"), 0.0)
+        deadline_source = time_window.get("deadline_source")
+        deadline_valid = bool(time_window.get("valid") and deadline_s > now_s)
+        if not deadline_valid:
+            explicit_request = plan.get("predump_request") if isinstance(plan.get("predump_request"), dict) else {}
+            explicit_deadline = safe_float(explicit_request.get("deadline_ts"), 0.0)
+            if explicit_deadline > 100_000_000_000:
+                explicit_deadline /= 1000.0
+            if explicit_deadline > now_s:
+                deadline_s = explicit_deadline
+                deadline_source = "predump_request.deadline_ts"
+                deadline_valid = True
+        if not deadline_valid:
+            timeline_points = sorted(
+                (
+                    safe_float(item.get("ts"), 0.0),
+                    safe_float(item.get("grid_dump_w"), 0.0),
+                )
+                for item in plan.get("timeline") or []
+                if isinstance(item, dict) and safe_float(item.get("ts"), 0.0) > 0.0
+            )
+            for index, (timestamp_ms, grid_dump_w) in enumerate(timeline_points):
+                timestamp_s = timestamp_ms / 1000.0 if timestamp_ms > 100_000_000_000 else timestamp_ms
+                next_timestamp_ms = (
+                    timeline_points[index + 1][0]
+                    if index + 1 < len(timeline_points)
+                    else timestamp_ms + 900_000.0
+                )
+                next_timestamp_s = (
+                    next_timestamp_ms / 1000.0
+                    if next_timestamp_ms > 100_000_000_000
+                    else next_timestamp_ms
+                )
+                if timestamp_s <= now_s < next_timestamp_s and grid_dump_w > 0.0:
+                    deadline_s = next_timestamp_s
+                    deadline_source = "current_timeline_slot_end"
+                    deadline_valid = deadline_s > now_s
+                    break
+        residual_wh = min(max(0.0, planned_dump_wh), required_wh, preventable_wh)
+        if required_wh < 200.0:
+            reason = "Pre-Dump blockiert: kein residualer Headroombedarf belegt"
+        elif preventable_wh < 200.0:
+            reason = "Pre-Dump blockiert: keine vermeidbare Abregelenergie belegt"
+        elif not deadline_valid:
+            reason = "Pre-Dump blockiert: physikalische Deadline fehlt oder ist abgelaufen"
+        elif residual_wh < 200.0:
+            reason = "Pre-Dump blockiert: residualer Headroom unter Mindestschwelle"
+        else:
+            reason = ""
+        return {
+            "allowed": not reason,
+            "reason": reason,
+            "required_wh": required_wh,
+            "preventable_wh": preventable_wh,
+            "residual_wh": residual_wh,
+            "deadline_ts": deadline_s or None,
+            "deadline_source": deadline_source,
+            "required_source": "adaptive_headroom_required_wh" if required_present else "legacy_predump_dump_wh",
+            "preventable_source": "predump_preventable_clipping_wh" if preventable_present else "legacy_predump_dump_wh",
+            "accounting_contract": "RESIDUAL_HEADROOM_ONLY_NOT_DV_SALE",
+        }
+
     def adaptive_gate(target_soc: float, planned_dump_wh: float, hard_predump: bool) -> Dict[str, Any]:
         meta = plan.get("target_curve_meta") if isinstance(plan.get("target_curve_meta"), dict) else {}
+        pressure = physical_headroom_gate(planned_dump_wh)
+        if not pressure.get("allowed"):
+            return pressure
         if hard_predump:
             headroom_target_soc = safe_float(
                 plan.get("adaptive_headroom_target_soc", meta.get("adaptive_headroom_target_soc")),
@@ -441,20 +548,34 @@ def predump_request_from_plan(
                         effective_dump_wh,
                         (soc - effective_target_soc) * capacity_wh / 100.0,
                     )
+                effective_dump_wh = min(
+                    effective_dump_wh,
+                    safe_float(pressure.get("residual_wh"), 0.0),
+                )
+                if capacity_wh > 0.0:
+                    effective_target_soc = max(
+                        effective_target_soc,
+                        soc - effective_dump_wh * 100.0 / capacity_wh,
+                    )
                 return {
+                    **pressure,
                     "allowed": True,
                     "target_soc": effective_target_soc,
                     "planned_dump_wh": effective_dump_wh,
                     "adaptive_headroom_target_soc": headroom_target_soc,
                     "reason": (
-                        "Hard-Pre-Dump adaptiv auf Abregel-Headroom %.1f%% begrenzt"
-                        % effective_target_soc
+                        "Hard-Pre-Dump auf residualen Abregel-Headroom %.0fWh / %.1f%% begrenzt"
+                        % (effective_dump_wh, effective_target_soc)
                     ),
                 }
             return {
+                **pressure,
                 "allowed": True,
                 "target_soc": target_soc,
-                "planned_dump_wh": max(0.0, planned_dump_wh),
+                "planned_dump_wh": min(
+                    max(0.0, planned_dump_wh),
+                    safe_float(pressure.get("residual_wh"), 0.0),
+                ),
                 "reason": "",
             }
 
@@ -507,6 +628,16 @@ def predump_request_from_plan(
                     % (effective_dump_wh, capped_dump_wh)
                 )
             effective_dump_wh = capped_dump_wh
+        pressure_capped_wh = min(
+            effective_dump_wh,
+            safe_float(pressure.get("residual_wh"), 0.0),
+        )
+        if pressure_capped_wh < effective_dump_wh - 50.0:
+            cap_reason = "residual begrenzt %.0fWh -> %.0fWh" % (
+                effective_dump_wh,
+                pressure_capped_wh,
+            )
+        effective_dump_wh = pressure_capped_wh
 
         if effective_dump_wh < 200.0:
             return {
@@ -527,6 +658,7 @@ def predump_request_from_plan(
             )
 
         return {
+            **pressure,
             "allowed": True,
             "target_soc": max(0.0, min(100.0, effective_target_soc)),
             "planned_dump_wh": effective_dump_wh,
@@ -552,6 +684,10 @@ def predump_request_from_plan(
         planned_dump_wh = safe_float(gate.get("planned_dump_wh"), planned_dump_wh)
         explicit["target_soc"] = target_soc
         explicit["planned_dump_wh"] = planned_dump_wh
+        explicit["headroom_required_wh"] = gate.get("required_wh")
+        explicit["preventable_clipping_wh"] = gate.get("preventable_wh")
+        explicit["residual_headroom_wh"] = gate.get("residual_wh")
+        explicit["headroom_accounting_contract"] = gate.get("accounting_contract")
         if gate.get("adaptive_headroom_target_soc") is not None:
             explicit["adaptive_headroom_target_soc"] = gate.get("adaptive_headroom_target_soc")
         if gate.get("reason"):
@@ -603,7 +739,15 @@ def predump_request_from_plan(
                 return {}
             meta = plan.get("target_curve_meta") or {}
             target_soc = safe_float(plan.get("predump_curve_soc", meta.get("predump_curve_soc")), min_soc)
+            legacy_timeline_energy_only = bool(
+                plan.get("predump_dump_wh") is None
+                and meta.get("predump_dump_wh") is None
+                and plan.get("adaptive_headroom_required_wh") is None
+                and meta.get("adaptive_headroom_required_wh") is None
+            )
             planned_dump_wh = safe_float(plan.get("predump_dump_wh", meta.get("predump_dump_wh")), 0.0)
+            if planned_dump_wh < 200.0:
+                planned_dump_wh = timeline_dump_wh()
             hard_predump = predump_plan_is_hard(plan)
             gate = adaptive_gate(target_soc, planned_dump_wh, hard_predump)
             if not gate.get("allowed"):
@@ -620,21 +764,58 @@ def predump_request_from_plan(
             landing_band = predump_consumer_landing_band(
                 cfg, live, plan, target_soc, capacity_wh, previous_state
             )
-            trajectory = predump_trajectory_state(
-                cfg,
-                live,
-                plan,
-                now_s,
-                target_soc,
-                planned_dump_wh,
-                landing_floor_soc=landing_band.get("floor_soc") if landing_band else None,
+            time_window = predump_time_window(cfg, plan)
+            window_start_s = safe_float(time_window.get("start_ts"), 0.0)
+            window_deadline_s = safe_float(time_window.get("deadline_ts"), 0.0)
+            timeline_slot_only = bool(
+                not time_window.get("valid")
+                and time_window.get("reason_code") == "predump_deadline_missing"
+                and window_start_s <= 0.0
             )
-            if trajectory.get("phase") in ("waiting", "expired", "done"):
+            if not time_window.get("valid") and not timeline_slot_only:
+                return {}
+            if time_window.get("valid") and (
+                now_s < window_start_s or now_s >= window_deadline_s
+            ):
+                return {}
+            if timeline_slot_only:
+                time_window = {
+                    **time_window,
+                    "valid": True,
+                    "status": "legacy_timeline_slot_only",
+                    "reason_code": "predump_timeline_slot_current",
+                    "deadline_source": "timeline_slot_only",
+                }
+            if timeline_slot_only or legacy_timeline_energy_only:
+                trajectory = {
+                    "phase": "active",
+                    "required_w": grid_dump_w,
+                    "deadline_ts": next_ts / 1000.0,
+                    "deadline_source": (
+                        "timeline_slot_only"
+                        if timeline_slot_only
+                        else time_window.get("deadline_source")
+                    ),
+                    "legacy_deadline_ignored": False,
+                    "trajectory_soc": None,
+                    "start_soc": None,
+                    "hours_remaining": round(max(0.0, next_ts / 1000.0 - now_s) / 3600.0, 2),
+                    "remaining_wh": round(planned_dump_wh, 0),
+                }
+            else:
+                trajectory = predump_trajectory_state(
+                    cfg,
+                    live,
+                    plan,
+                    now_s,
+                    target_soc,
+                    planned_dump_wh,
+                    landing_floor_soc=landing_band.get("floor_soc") if landing_band else None,
+                )
+            if trajectory.get("phase") in ("waiting", "expired", "done", "invalid"):
                 return {}
             discharge_w = max(300, min(max_discharge_w, safe_int(trajectory.get("required_w"), grid_dump_w) or grid_dump_w))
             discharge_w = max(300, min(max_discharge_w, predump_round_budget_w(cfg, discharge_w)))
-            deadline_raw = safe_float(plan.get("ladestart_ts"), 0.0) or safe_float(plan.get("predump_end_ts"), 0.0)
-            deadline_s = deadline_raw / 1000.0 if deadline_raw > 10000000000.0 else deadline_raw
             return stabilize_predump_request(cfg, live, {
                 "active": True,
                 "discharge_w": discharge_w,
@@ -644,7 +825,13 @@ def predump_request_from_plan(
                 "adaptive_headroom_required_wh": gate.get("adaptive_headroom_required_wh"),
                 "adaptive_headroom_target_soc": gate.get("adaptive_headroom_target_soc"),
                 "evening_shortfall_wh": gate.get("evening_shortfall_wh"),
-                "deadline_ts": deadline_s,
+                "headroom_required_wh": gate.get("required_wh"),
+                "preventable_clipping_wh": gate.get("preventable_wh"),
+                "residual_headroom_wh": gate.get("residual_wh"),
+                "headroom_accounting_contract": gate.get("accounting_contract"),
+                "deadline_ts": time_window.get("deadline_ts"),
+                "deadline_source": time_window.get("deadline_source"),
+                "legacy_deadline_ignored": time_window.get("legacy_deadline_ignored", False),
                 "trajectory_soc": trajectory.get("trajectory_soc"),
                 "trajectory_start_soc": trajectory.get("start_soc"),
                 "hours_remaining": trajectory.get("hours_remaining"),
@@ -686,13 +873,6 @@ def predump_request_from_plan(
     reopen_block = predump_reopen_blocked(cfg, live, now_s, curve_soc, previous_state)
     if reopen_block:
         return {}
-    start_ms = safe_float(plan.get("predump_start_ts", meta.get("predump_start_ts")), 0.0)
-    end_ms = safe_float(plan.get("predump_end_ts", meta.get("predump_end_ts")), 0.0)
-    if start_ms > 0.0 and now_ms < start_ms:
-        return {}
-    if end_ms > 0.0 and now_ms >= end_ms:
-        return {}
-
     soc = safe_float(live.get("SOC"), 0.0)
     capacity_wh = safe_float(plan.get("battery_capacity"), safe_float(cfg.get("speichergroesse"), 10.0) * 1000.0)
     landing_band = predump_consumer_landing_band(
@@ -707,14 +887,12 @@ def predump_request_from_plan(
         dump_wh,
         landing_floor_soc=landing_band.get("floor_soc") if landing_band else None,
     )
-    if trajectory.get("phase") in ("waiting", "expired", "done"):
+    if trajectory.get("phase") in ("waiting", "expired", "done", "invalid"):
         return {}
-    ladestart_s = safe_float(plan.get("ladestart_ts"), 0.0) / 1000.0
     discharge_w = int(max(300, min(max_discharge_w, safe_int(trajectory.get("required_w"), 0))))
     discharge_w = max(300, min(max_discharge_w, predump_round_budget_w(cfg, discharge_w)))
     if discharge_w <= 0:
         return {}
-    deadline_s = ladestart_s if ladestart_s > 0.0 else (end_ms / 1000.0 if end_ms > 0.0 else 0.0)
     return stabilize_predump_request(cfg, live, {
         "active": True,
         "discharge_w": discharge_w,
@@ -724,7 +902,13 @@ def predump_request_from_plan(
         "adaptive_headroom_required_wh": gate.get("adaptive_headroom_required_wh"),
         "adaptive_headroom_target_soc": gate.get("adaptive_headroom_target_soc"),
         "evening_shortfall_wh": gate.get("evening_shortfall_wh"),
-        "deadline_ts": deadline_s,
+        "headroom_required_wh": gate.get("required_wh"),
+        "preventable_clipping_wh": gate.get("preventable_wh"),
+        "residual_headroom_wh": gate.get("residual_wh"),
+        "headroom_accounting_contract": gate.get("accounting_contract"),
+        "deadline_ts": trajectory.get("deadline_ts"),
+        "deadline_source": trajectory.get("deadline_source"),
+        "legacy_deadline_ignored": trajectory.get("legacy_deadline_ignored", False),
         "trajectory_soc": trajectory.get("trajectory_soc"),
         "trajectory_start_soc": trajectory.get("start_soc"),
         "hours_remaining": trajectory.get("hours_remaining"),
@@ -820,6 +1004,78 @@ def predump_consumer_landing_band(
     }
 
 
+def _predump_timestamp_s(value: Any) -> float:
+    raw = safe_float(value, 0.0)
+    return raw / 1000.0 if raw > 10000000000.0 else raw
+
+
+def predump_time_window(cfg: Dict[str, Any], plan: Dict[str, Any]) -> Dict[str, Any]:
+    """Löst genau einen fehlersicheren Pre-Dump-Zeitvertrag auf.
+
+    ``predump_end_ts`` ist autoritativ. ``ladestart_ts`` bleibt nur als
+    Kompatibilitätsrückfall für Pläne ohne explizit veröffentlichtes Ende erhalten.
+    """
+    meta = plan.get("target_curve_meta") if isinstance(plan.get("target_curve_meta"), dict) else {}
+    start_raw = plan.get("predump_start_ts")
+    if safe_float(start_raw, 0.0) <= 0.0:
+        start_raw = meta.get("predump_start_ts")
+    explicit_end_raw = plan.get("predump_end_ts")
+    if safe_float(explicit_end_raw, 0.0) <= 0.0:
+        explicit_end_raw = meta.get("predump_end_ts")
+    legacy_end_raw = plan.get("ladestart_ts")
+
+    start_s = _predump_timestamp_s(start_raw)
+    explicit_end_s = _predump_timestamp_s(explicit_end_raw)
+    legacy_end_s = _predump_timestamp_s(legacy_end_raw)
+    explicit_start = start_s > 0.0
+    deadline_s = explicit_end_s if explicit_end_s > 0.0 else legacy_end_s
+    deadline_source = "predump_end_ts" if explicit_end_s > 0.0 else "ladestart_ts_legacy_fallback"
+    legacy_ignored = bool(
+        explicit_end_s > 0.0
+        and legacy_end_s > 0.0
+        and abs(explicit_end_s - legacy_end_s) > 1.0
+    )
+
+    base = {
+        "start_ts": start_s,
+        "deadline_ts": deadline_s,
+        "deadline_source": deadline_source,
+        "legacy_ladestart_ts": legacy_end_s or None,
+        "legacy_deadline_ignored": legacy_ignored,
+    }
+    if deadline_s <= 0.0:
+        return {
+            **base,
+            "valid": False,
+            "status": "invalid",
+            "reason_code": "predump_deadline_missing",
+            "reason": "Pre-Dump-Zeitvertrag ohne Deadline",
+        }
+    if explicit_start and start_s >= deadline_s:
+        return {
+            **base,
+            "valid": False,
+            "status": "invalid",
+            "reason_code": "predump_window_order_invalid",
+            "reason": "Pre-Dump-Zeitvertrag ungültig: Start liegt nicht vor Ende",
+        }
+    if not explicit_start:
+        window_h_raw = safe_float(cfg.get("pd_max_hours"), 5.0)
+        window_h = window_h_raw if window_h_raw > 0.0 else 5.0
+        start_s = deadline_s - max(0.25, window_h) * 3600.0
+        base["start_ts"] = start_s
+        base["start_source"] = "pd_max_hours_fallback"
+    else:
+        base["start_source"] = "predump_start_ts"
+    return {
+        **base,
+        "valid": True,
+        "status": "valid",
+        "reason_code": "predump_time_window_valid",
+        "reason": "Pre-Dump-Zeitvertrag gültig",
+    }
+
+
 def predump_trajectory_state(
     cfg: Dict[str, Any],
     live: Dict[str, Any],
@@ -834,33 +1090,22 @@ def predump_trajectory_state(
     if capacity_wh <= 0.0 or target_soc < 0.0 or planned_dump_wh < 200.0:
         return {}
 
-    meta = plan.get("target_curve_meta") or {}
-    start_raw = safe_float(plan.get("predump_start_ts", meta.get("predump_start_ts")), 0.0)
-    end_raw = (
-        safe_float(plan.get("ladestart_ts"), 0.0)
-        or safe_float(plan.get("predump_end_ts", meta.get("predump_end_ts")), 0.0)
-    )
-    start_s = start_raw / 1000.0 if start_raw > 10000000000.0 else start_raw
-    end_s = end_raw / 1000.0 if end_raw > 10000000000.0 else end_raw
-    if end_s <= 0.0:
-        return {}
-    if start_s <= 0.0 or start_s >= end_s:
-        window_h_raw = safe_float(cfg.get("pd_max_hours"), 5.0)
-        window_h = window_h_raw if window_h_raw > 0 else 5.0
-        start_s = end_s - max(0.25, window_h) * 3600.0
+    time_window = predump_time_window(cfg, plan)
+    start_s = safe_float(time_window.get("start_ts"), 0.0)
+    end_s = safe_float(time_window.get("deadline_ts"), 0.0)
+    if not time_window.get("valid"):
+        return {**time_window, "phase": "invalid"}
 
     if now_s < start_s:
         return {
+            **time_window,
             "phase": "waiting",
-            "start_ts": start_s,
-            "deadline_ts": end_s,
             "reason": "Pre-Dump wartet auf Startfenster",
         }
     if now_s >= end_s:
         return {
+            **time_window,
             "phase": "expired",
-            "start_ts": start_s,
-            "deadline_ts": end_s,
             "reason": "Pre-Dump-Fenster ist abgelaufen",
         }
 
@@ -885,9 +1130,8 @@ def predump_trajectory_state(
         phase = "ahead"
 
     return {
+        **time_window,
         "phase": phase,
-        "start_ts": start_s,
-        "deadline_ts": end_s,
         "start_soc": round(start_soc, 2),
         "trajectory_soc": round(trajectory_soc, 2),
         "target_soc": round(target_soc, 2),
@@ -1195,14 +1439,12 @@ def predump_wallbox_block_window(
 ) -> Dict[str, Any]:
     target_soc = safe_float(predump.get("target_soc"), -1.0)
     capacity_wh = safe_float(plan.get("battery_capacity"), safe_float(cfg.get("speichergroesse"), 10.0) * 1000.0)
-    deadline_s = safe_float(predump.get("deadline_ts"), 0.0)
+    time_window = predump_time_window(cfg, plan)
+    if not time_window.get("valid"):
+        return {}
+    deadline_s = safe_float(time_window.get("deadline_ts"), 0.0)
     if deadline_s <= 0.0:
-        meta = plan.get("target_curve_meta") if isinstance(plan.get("target_curve_meta"), dict) else {}
-        raw_deadline = (
-            safe_float(plan.get("ladestart_ts"), 0.0)
-            or safe_float(plan.get("predump_end_ts", meta.get("predump_end_ts")), 0.0)
-        )
-        deadline_s = raw_deadline / 1000.0 if raw_deadline > 10000000000.0 else raw_deadline
+        deadline_s = safe_float(predump.get("deadline_ts"), 0.0)
     if target_soc < 0.0 or capacity_wh <= 0.0 or deadline_s <= now_s:
         return {}
 
@@ -1211,13 +1453,7 @@ def predump_wallbox_block_window(
     if remaining_wh < 100.0:
         return {}
 
-    meta = plan.get("target_curve_meta") if isinstance(plan.get("target_curve_meta"), dict) else {}
-    raw_start = safe_float(plan.get("predump_start_ts", meta.get("predump_start_ts")), 0.0)
-    window_start_s = raw_start / 1000.0 if raw_start > 10000000000.0 else raw_start
-    if window_start_s <= 0.0 or window_start_s >= deadline_s:
-        window_h_raw = safe_float(cfg.get("pd_max_hours"), 5.0)
-        window_h = window_h_raw if window_h_raw > 0.0 else 5.0
-        window_start_s = deadline_s - max(0.25, window_h) * 3600.0
+    window_start_s = safe_float(time_window.get("start_ts"), 0.0)
 
     sink_power_w = min(max(0, int(max_discharge_w)), max(0, int(wallbox_min_power_w)))
     if sink_power_w < 300:

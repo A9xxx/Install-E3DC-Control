@@ -60,7 +60,7 @@ $matterActive = matterServiceActive();
 // Pairing Datei lesen (wird vom matter_bridge.js Knoten geschrieben)
 $pairingFile = '/var/www/html/ramdisk/matter_pairing.json';
 
-$pairingData = ['isCommissioned' => false, 'manual' => '', 'qrText' => ''];
+$pairingData = ['isCommissioned' => false, 'manual' => ''];
 
 if (file_exists($pairingFile)) {
     $content = file_get_contents($pairingFile);
@@ -110,10 +110,10 @@ if (file_exists($pairingFile)) {
                             </div>
                         <?php else: ?>
                             <div class="text-muted mb-3">
-                                Scanne diesen QR-Code mit der Home App (iOS) oder Google Home App (Android), um das "E3DC Hauskraftwerk" hinzuzufügen.
+                                Verwende den lokalen manuellen Code in Apple Home, Google Home oder einem anderen Matter-Controller, um das "E3DC Hauskraftwerk" hinzuzufügen.
                             </div>
 
-                            <?php if (!empty($pairingData['qrText'])): ?>
+                            <?php if (!empty($pairingData['manual'])): ?>
                                 <div class="alert alert-info mb-3 text-start">
                                     <i class="fas fa-shield-halved me-2"></i>Der Pairing-Code wird aus Datenschutzgründen nicht an einen externen QR-Dienst übertragen. Bitte verwenden Sie den manuellen Code in Ihrer Home-App.
                                 </div>
@@ -158,7 +158,7 @@ if (file_exists($pairingFile)) {
                                 <?php endif; ?>
                             </li>
                             <li class="list-group-item d-flex justify-content-between align-items-center">
-                                Zertifizierung (Beta)
+                                Zertifizierung
                                 <span class="badge bg-warning text-dark rounded-pill">Uncertified Node</span>
                             </li>
                             <li class="list-group-item d-flex justify-content-between align-items-center">

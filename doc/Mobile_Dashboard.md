@@ -5,8 +5,9 @@ Die Datei `mobile.php` dient als zentrale, mobil-optimierte Oberfläche zur Übe
 ## Hauptfunktionen
 
 ### 1. Live-Dashboard
-*   **Photovoltaik:** Anzeige der aktuellen Erzeugung. 
+*   **Photovoltaik:** Anzeige der aktuellen Erzeugung.
     *   Berechnet die Summe aller konfigurierten Strings (`forecast1` bis `forecast5`).
+    *   Vergleicht die Live-Leistung mit dem theoretischen Sonnenstand (Soll) und der E3DC-Prognose aus der `awattardebug.txt`.
     *   Farbliches Feedback: Grün bei >90% Effizienz, Rot bei <50% der Prognose.
 *   **Batterie:** Anzeige von SoC (%) und aktueller Leistung.
     *   Dynamische Puls-Animation: Die Geschwindigkeit und Intensität des Pulsierens passt sich der Lade-/Entladeleistung an.
@@ -22,7 +23,13 @@ Die Datei `mobile.php` dient als zentrale, mobil-optimierte Oberfläche zur Übe
     *   Hervorhebung: Die Karte leuchtet grün, wenn der Preis unter 10 ct/kWh fällt.
 *   **Min/Max Werte:** Anzeige der günstigsten und teuersten Zeitpunkte für heute bzw. morgen.
 
-### 3. Tagesstatistik & CO₂-Bilanz
+### 3. Interaktives Diagramm
+*   Die Ansicht **Historie** unter `mobile.php?seite=history` zeigt lokale
+    Leistungs-, PV-, Batterie-, Netz-, Preis- und optionale Verbraucherdaten.
+*   Zeiträume und Archivtag werden direkt im Browser ausgewählt; der
+    Update-Knopf lädt die gewählte lokale Datenansicht neu.
+
+### 3b. Tagesstatistik & CO₂-Bilanz
 *   **Statistik-Overlay:** Tippe auf die Autarkie-/Eigenverbrauch-Leiste, um die detaillierte Tagesstatistik zu öffnen. Die Daten werden beim Öffnen automatisch vom Backend geladen.
 *   **CO₂-Baum:** Zwischen Autarkie und Eigenverbrauch wächst ein animierter Baum, der den Autarkiegrad visualisiert (🌱→🌿→🪴→🌳→🌲🌳→🌲🌳🌲). Darunter werden die eingesparten kg CO₂ angezeigt.
 *   **Energiebilanz-Badges:** Farbcodierte Badges zeigen die Tageswerte für PV-Ertrag (☀), Einspeisung (📤), Netzbezug (⚡), Batterie laden (🔋↓) und Batterie entladen (🔋↑) kompakt an.
@@ -38,11 +45,13 @@ Die Datei `mobile.php` dient als zentrale, mobil-optimierte Oberfläche zur Übe
 
 ### Verwendete Dateien
 *   `e3dc_v4.json`: Auslesen von kWp, Speicherkapazität, Standort (Lat/Lon), maximaler Ladeleistung und UI-Einstellungen.
+*   `awattardebug.0.txt` / `awattardebug.txt`: Datenbasis für Strompreise und PV-Prognose.
 *   `live_history.txt`: Berechnung der 24h-Mittelwerte für die Skalierung der Balken.
 *   `get_live_json.php`: Datenquelle für die Echtzeit-Werte.
 
 ### Berechnungen
 *   **Sonnenstand:** Mathematische Berechnung von Elevation und Azimut basierend auf Zeit und Geoposition zur Ermittlung der theoretischen PV-Leistung.
+*   **GMT-Korrektur:** Alle Zeitstempel aus den Debug-Dateien werden von UTC/GMT in die lokale Browserzeit umgerechnet.
 *   **Prognose-Leistung:** Umrechnung der Prozentwerte aus der Prognose-Datei in reale Watt-Leistung unter Berücksichtigung der Speichergröße und des Zeitintervalls.
 
 ## Navigation

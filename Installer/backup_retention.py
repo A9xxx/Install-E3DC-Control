@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Manifest-bound retention for dedicated E3DC backup collections."""
+"""Manifestgebundene Aufbewahrung für eigene E3DC-Sicherungssammlungen."""
 
 from __future__ import annotations
 
 import os
 import stat
-import sys
 import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
-if __package__ in (None, ""):
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from backup_integrity import (
+try:
+    from .backup_integrity import (
         BackupIntegrityError,
         ROOT_MARKER_NAME,
         SYSTEM_BACKUP_KIND,
@@ -24,8 +22,8 @@ if __package__ in (None, ""):
         validate_existing_backup_root,
         verify_backup,
     )
-else:
-    from .backup_integrity import (
+except ImportError:  # pragma: no cover - Rückfall für direkte Skriptausführung
+    from backup_integrity import (
         BackupIntegrityError,
         ROOT_MARKER_NAME,
         SYSTEM_BACKUP_KIND,
@@ -71,7 +69,7 @@ def _remove_directory_entry(
     expected_dev: Optional[int] = None,
     expected_ino: Optional[int] = None,
 ) -> None:
-    """Remove one already quarantined tree without following any symlink."""
+    """Entfernt einen bereits isolierten Verzeichnisbaum, ohne Symlinks zu folgen."""
 
     descriptor = os.open(
         name,
@@ -81,7 +79,7 @@ def _remove_directory_entry(
     try:
         opened = os.fstat(descriptor)
         if expected_dev is not None and (opened.st_dev, opened.st_ino) != (expected_dev, expected_ino):
-            raise BackupIntegrityError("Quarantaene-Eintrag wurde vor dem Oeffnen ausgetauscht.")
+            raise BackupIntegrityError("Quarantäne-Eintrag wurde vor dem Öffnen ausgetauscht.")
         for child in sorted(os.listdir(descriptor)):
             metadata = os.stat(child, dir_fd=descriptor, follow_symlinks=False)
             if stat.S_ISLNK(metadata.st_mode):
@@ -96,7 +94,7 @@ def _remove_directory_entry(
         os.close(descriptor)
     current = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
     if expected_dev is not None and (current.st_dev, current.st_ino) != (expected_dev, expected_ino):
-        raise BackupIntegrityError("Quarantaene-Eintrag wurde vor dem Entfernen ausgetauscht.")
+        raise BackupIntegrityError("Quarantäne-Eintrag wurde vor dem Entfernen ausgetauscht.")
     os.rmdir(name, dir_fd=parent_descriptor)
 
 
@@ -112,11 +110,12 @@ def prune_backup_dir(
     expected_kind: str = SYSTEM_BACKUP_KIND,
     preserve_paths: Optional[Iterable[PathValue]] = None,
 ) -> Dict[str, Any]:
-    """Rotate only verified direct-child manifests of ``expected_kind``.
+    """Rotiert nur verifizierte direkte Kind-Manifeste des ``expected_kind``.
 
-    Unknown folders, symlinks, incomplete backups and foreign artifacts are
-    never candidates. Deletion first atomically renames the selected directory
-    inside its trusted collection and then removes it descriptor-by-descriptor.
+    Unbekannte Verzeichnisse, Symlinks, unvollständige Sicherungen und fremde
+    Artefakte sind niemals Kandidaten. Zum Löschen wird das ausgewählte
+    Verzeichnis zunächst innerhalb seiner vertrauenswürdigen Sammlung atomar
+    umbenannt und danach Deskriptor für Deskriptor entfernt.
     """
 
     root = _lexical_absolute(backup_root)
@@ -157,7 +156,7 @@ def prune_backup_dir(
         for name in sorted(os.listdir(root_descriptor)):
             candidate = root / name
             if name == ROOT_MARKER_NAME or name in preserved_names or candidate in preserved_paths:
-                result["skipped"].append({"path": str(candidate), "reason": "geschuetzt"})
+                result["skipped"].append({"path": str(candidate), "reason": "geschützt"})
                 continue
             try:
                 metadata = os.stat(name, dir_fd=root_descriptor, follow_symlinks=False)
@@ -170,7 +169,7 @@ def prune_backup_dir(
                 verify_backup(candidate, expected_kind=expected_kind)
                 verified_metadata = os.stat(name, dir_fd=root_descriptor, follow_symlinks=False)
                 if (metadata.st_dev, metadata.st_ino) != (verified_metadata.st_dev, verified_metadata.st_ino):
-                    raise BackupIntegrityError("Backup wurde waehrend der Verifikation ausgetauscht.")
+                    raise BackupIntegrityError("Backup wurde während der Verifikation ausgetauscht.")
                 candidates.append((metadata.st_mtime, name, candidate, metadata.st_dev, metadata.st_ino))
             except Exception as exc:
                 result["skipped"].append({"path": str(candidate), "reason": "nicht verifiziert: {}".format(exc)})
@@ -197,7 +196,7 @@ def prune_backup_dir(
                 os.rename(name, quarantine, src_dir_fd=root_descriptor, dst_dir_fd=root_descriptor)
                 quarantined = os.stat(quarantine, dir_fd=root_descriptor, follow_symlinks=False)
                 if (quarantined.st_dev, quarantined.st_ino) != (verified_dev, verified_ino):
-                    raise BackupIntegrityError("Backupname wurde vor dem Quarantaene-Rename ausgetauscht.")
+                    raise BackupIntegrityError("Backupname wurde vor dem Quarantäne-Rename ausgetauscht.")
                 verify_backup(root / quarantine, expected_kind=expected_kind)
                 _remove_directory_entry(root_descriptor, quarantine, verified_dev, verified_ino)
                 result["removed"].append({"path": str(path), "reason": reason})
@@ -213,7 +212,7 @@ def prune_backup_dir(
                         pass
                 except Exception:
                     pass
-                result["skipped"].append({"path": str(path), "reason": "Loeschen fehlgeschlagen: {}".format(exc)})
+                result["skipped"].append({"path": str(path), "reason": "Löschen fehlgeschlagen: {}".format(exc)})
     finally:
         os.close(root_descriptor)
     return result
@@ -224,7 +223,7 @@ def delete_verified_backup(
     collection_root: PathValue,
     expected_kind: str = SYSTEM_BACKUP_KIND,
 ) -> None:
-    """Delete one verified direct child through atomic quarantine."""
+    """Löscht ein verifiziertes direktes Kind über eine atomare Quarantäne."""
 
     root = _assert_no_symlink_components(collection_root)
     target = _assert_no_symlink_components(backup_path)
@@ -240,12 +239,12 @@ def delete_verified_backup(
         verify_backup(target, expected_kind=expected_kind)
         after = os.stat(target.name, dir_fd=root_descriptor, follow_symlinks=False)
         if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
-            raise BackupIntegrityError("Backup wurde waehrend der Verifikation ausgetauscht.")
+            raise BackupIntegrityError("Backup wurde während der Verifikation ausgetauscht.")
         os.rename(target.name, quarantine, src_dir_fd=root_descriptor, dst_dir_fd=root_descriptor)
         try:
             quarantined = os.stat(quarantine, dir_fd=root_descriptor, follow_symlinks=False)
             if (quarantined.st_dev, quarantined.st_ino) != (before.st_dev, before.st_ino):
-                raise BackupIntegrityError("Backupname wurde vor dem Quarantaene-Rename ausgetauscht.")
+                raise BackupIntegrityError("Backupname wurde vor dem Quarantäne-Rename ausgetauscht.")
             verify_backup(root / quarantine, expected_kind=expected_kind)
             _remove_directory_entry(root_descriptor, quarantine, before.st_dev, before.st_ino)
         except Exception:
@@ -263,13 +262,13 @@ def prune_heavy_backup_payloads(
     logger: Any = None,
     dry_run: bool = False,
 ) -> Dict[str, Any]:
-    """Deprecated no-op: manifest payloads are immutable after finalization."""
+    """Veraltete wirkungslose Funktion: Manifestinhalte bleiben nach Abschluss unveränderlich."""
 
     return {
         "success": True,
         "root": str(_lexical_absolute(backup_root)),
         "removed": [],
-        "skipped": [{"reason": "Manifest-Backups werden niemals nachtraeglich veraendert."}],
+        "skipped": [{"reason": "Manifest-Backups werden niemals nachträglich verändert."}],
         "dry_run": bool(dry_run),
     }
 
@@ -280,7 +279,7 @@ def prune_install_backups(
     backup_root: Optional[PathValue] = None,
     preserve_paths: Optional[Iterable[PathValue]] = None,
 ) -> Dict[str, Any]:
-    """Apply retention only inside the validated dedicated backup namespace."""
+    """Wendet die Aufbewahrung nur im validierten eigenen Sicherungsnamensraum an."""
 
     install = _lexical_absolute(install_path)
     if backup_root is None:

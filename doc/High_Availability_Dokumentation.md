@@ -23,7 +23,10 @@ Das Cluster-System basiert auf einer **Aktiv/Passiv (Master/Slave)** Architektur
 
 ### Schritt 1: Zertifikatstausch (Installer)
 Damit der Master seine Daten automatisch zum Slave kopieren kann, müssen sich die Geräte vertrauen.
-1. Starte auf dem **Master** den Installer (`sudo python3 installer_main.py`).
+Setze auf jedem System den zuvor geprüften absoluten Produktpfad als
+`E3DC_INSTALL_PATH`.
+
+1. Starte auf dem **Master** den Installer (`bash "$E3DC_INSTALL_PATH/e3dc-setup"`).
 2. Wähle im Menü "Erweiterungen" -> **"High Availability (Cluster) einrichten"**.
 3. Wähle die Rolle `1` (Master).
 4. Gib die IP-Adresse des **Slaves** ein und bestätige das Passwort des Slaves. Das System tauscht nun die SSH-Keys aus.

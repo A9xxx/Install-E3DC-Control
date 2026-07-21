@@ -10,6 +10,7 @@ from copy import deepcopy
 from typing import Any, Dict, Optional
 
 from . import openwb_pro_session
+from . import phase_transition
 
 
 _SEQUENCE_STATE_KEYS = (
@@ -33,11 +34,11 @@ _SEQUENCE_STATE_KEYS = (
     "_openwb_last_cp_start_ts",
     "_last_phase_switch_ts",
     "_wallbox_phase_transition_reservation",
+    "_openwb_pro_phase_output_intent",
+    "_openwb_pro_phase_output_ack",
+    "_openwb_pro_phase_recovery_hold",
 )
 
-_PHASE_TRANSITION_CONFIRM_S = 10.0
-_PHASE_TRANSITION_TIMEOUT_S = 120.0
-_PHASE_TRANSITION_DISCONNECT_CONFIRM_S = 60.0
 _NOMINAL_PHASE_VOLTAGE_V = 230.0
 _MIN_CHARGE_CURRENT_A = 6
 
@@ -100,49 +101,63 @@ def begin_phase_transition_reservation(
     charger_max_amp: Any = 32,
     source: str = "manager_phase_command",
     reason: str = "phase_transition",
+    wb_id: Any = None,
+    from_phases: Any = None,
+    restart_amp: Any = None,
+    current_step_amp: Any = None,
+    effective_w_per_amp: Any = None,
+    lease_s: Any = None,
+    transition_id: Any = None,
 ) -> Dict[str, Any]:
-    """Starte eine generische EMS-Reservierung für einen bestätigten Wechsel."""
+    """Erstellt den allgemeinen Auftrag, bevor ein Gerätebefehl gesendet wird."""
 
     data = state if isinstance(state, dict) else {}
+    st = status if isinstance(status, dict) else {}
     target = _safe_int(target_phases, 0)
     if target not in (1, 3):
         return {}
-    now_value = _safe_float(now_ts, 0.0)
-    started_value = (
-        now_value
-        if started_ts is None
-        else _safe_float(started_ts, now_value)
+    now_value = _safe_float(now_ts, 0.0) if started_ts is None else _safe_float(started_ts, now_ts)
+    current = max(
+        _safe_float(restart_amp, 0.0),
+        _safe_float(data.get("current_set_amp"), 0.0),
+        _safe_float(st.get("offered_current_raw"), 0.0),
+        _safe_float(st.get("evse_current"), 0.0),
+        _safe_float(st.get("amp"), 0.0),
+        float(_MIN_CHARGE_CURRENT_A),
     )
-    settle_s = max(0.0, _safe_float(zero_settle_s, 0.0))
-    restart_s = max(0.0, _safe_float(restart_delay_s, 0.0))
-    max_amp = max(
-        _MIN_CHARGE_CURRENT_A,
-        min(32, _safe_int(charger_max_amp, 32)),
+    current = min(max(float(_MIN_CHARGE_CURRENT_A), current), max(float(_MIN_CHARGE_CURRENT_A), _safe_float(charger_max_amp, 32.0)))
+    actual_phases = _safe_int(from_phases, 0) or _status_phase_count(st)
+    step = (
+        _safe_float(current_step_amp, 0.0)
+        or _safe_float(st.get("current_step_amp"), 0.0)
+        or _safe_float(getattr(data.get("charger"), "current_step_amp", 0.0), 0.0)
+        or 1.0
     )
-    minimum_target_w = int(
-        round(_MIN_CHARGE_CURRENT_A * _NOMINAL_PHASE_VOLTAGE_V * target)
+    w_per_amp = _safe_float(effective_w_per_amp, 0.0) or (_NOMINAL_PHASE_VOLTAGE_V * target)
+    duration_s = max(
+        phase_transition.DEFAULT_LEASE_S,
+        max(0.0, _safe_float(zero_settle_s, 0.0))
+        + max(0.0, _safe_float(restart_delay_s, 0.0))
+        + 120.0,
+        max(0.0, _safe_float(lease_s, 0.0)),
     )
-    maximum_target_w = int(round(max_amp * _NOMINAL_PHASE_VOLTAGE_V * target))
-    observed_w = int(round(_status_power_w(status)))
-    reserved_w = min(maximum_target_w, max(minimum_target_w, observed_w))
-    timeout_s = max(
-        _PHASE_TRANSITION_TIMEOUT_S,
-        settle_s + restart_s + 60.0,
+    return phase_transition.begin_reservation(
+        data,
+        wb_id=_safe_int(wb_id, _safe_int(data.get("id"), 0)),
+        from_phases=actual_phases,
+        target_phases=target,
+        restart_amp=current,
+        current_step_amp=step,
+        effective_w_per_amp=w_per_amp,
+        observed_before_w=_status_power_w(st),
+        now_ts=now_value,
+        lease_s=duration_s,
+        owner="wallbox_manager",
+        source=source,
+        reason_code=reason,
+        max_power_w=max(float(_MIN_CHARGE_CURRENT_A), _safe_float(charger_max_amp, 32.0)) * w_per_amp,
+        transition_id=transition_id,
     )
-    reservation = {
-        "active": True,
-        "target_phases": target,
-        "reserved_w": reserved_w,
-        "observed_before_w": observed_w,
-        "started_ts": started_value,
-        "expires_ts": started_value + timeout_s,
-        "stable_since_ts": 0.0,
-        "disconnected_since_ts": 0.0,
-        "source": str(source or "manager_phase_command"),
-        "reason": str(reason or "phase_transition"),
-    }
-    data["_wallbox_phase_transition_reservation"] = reservation
-    return deepcopy(reservation)
 
 
 def phase_transition_reservation(
@@ -152,73 +167,14 @@ def phase_transition_reservation(
     now_ts: Any = 0,
     connected: Optional[bool] = None,
 ) -> Dict[str, Any]:
-    """Aktualisiere und liefere die generische Phasenwechsel-Reservierung."""
+    """Aktualisiert und veröffentlicht die allgemeine Reservierung je Wallbox."""
 
-    data = state if isinstance(state, dict) else {}
-    raw = data.get("_wallbox_phase_transition_reservation")
-    reservation = dict(raw) if isinstance(raw, dict) else {}
-    now_value = _safe_float(now_ts, 0.0)
-    target = _safe_int(reservation.get("target_phases"), 0)
-    reserved_w = max(0, _safe_int(reservation.get("reserved_w"), 0))
-    expires_ts = _safe_float(reservation.get("expires_ts"), 0.0)
-
-    inactive_reason = "not_active"
-    if reservation and expires_ts > 0.0 and now_value >= expires_ts:
-        inactive_reason = "timeout"
-        reservation = {}
-    elif reservation and connected is False:
-        disconnected_since_ts = _safe_float(
-            reservation.get("disconnected_since_ts"),
-            0.0,
-        )
-        if disconnected_since_ts <= 0.0:
-            reservation["disconnected_since_ts"] = now_value
-        elif now_value - disconnected_since_ts >= _PHASE_TRANSITION_DISCONNECT_CONFIRM_S:
-            inactive_reason = "vehicle_disconnected"
-            reservation = {}
-    elif reservation and _safe_float(reservation.get("disconnected_since_ts"), 0.0) > 0.0:
-        reservation["disconnected_since_ts"] = 0.0
-
-    if reservation:
-        power_w = _status_power_w(status)
-        actual_phases = _status_phase_count(status)
-        confirmed = bool(power_w > 500.0 and actual_phases == target)
-        stable_since_ts = _safe_float(reservation.get("stable_since_ts"), 0.0)
-        if confirmed:
-            if stable_since_ts <= 0.0:
-                stable_since_ts = now_value
-                reservation["stable_since_ts"] = stable_since_ts
-            if now_value - stable_since_ts >= _PHASE_TRANSITION_CONFIRM_S:
-                inactive_reason = "target_charge_confirmed"
-                reservation = {}
-        elif stable_since_ts > 0.0:
-            reservation["stable_since_ts"] = 0.0
-
-    if not reservation:
-        data.pop("_wallbox_phase_transition_reservation", None)
-        return {
-            "active": False,
-            "reserved_w": 0,
-            "target_phases": 0,
-            "started_ts": 0.0,
-            "expires_ts": 0.0,
-            "remaining_s": 0.0,
-            "source": "manager_phase_command",
-            "reason": inactive_reason,
-        }
-
-    data["_wallbox_phase_transition_reservation"] = reservation
-    return {
-        "active": True,
-        "reserved_w": reserved_w,
-        "target_phases": target,
-        "started_ts": _safe_float(reservation.get("started_ts"), 0.0),
-        "expires_ts": expires_ts,
-        "remaining_s": max(0.0, expires_ts - now_value) if expires_ts > 0.0 else 0.0,
-        "stable_since_ts": _safe_float(reservation.get("stable_since_ts"), 0.0),
-        "source": str(reservation.get("source") or "manager_phase_command"),
-        "reason": str(reservation.get("reason") or "phase_transition"),
-    }
+    return phase_transition.update_reservation(
+        state,
+        status=status,
+        now_ts=now_ts,
+        connected=connected,
+    )
 
 
 class PhaseSwitchSequencer:
@@ -236,7 +192,7 @@ class PhaseSwitchSequencer:
         self._pending_config: Dict[str, Any] = {}
         self._pending_charger_max_amp: Any = 32
         self._pending_status: Dict[str, Any] = {}
-        self._pending_restart_delay_s: float = 30.0
+        self._pending_restart_delay_s: float = 0.0
 
     def propose(
         self,
@@ -274,7 +230,7 @@ class PhaseSwitchSequencer:
             else restart_delay_s
         )
         effective_cp_payload = (
-            openwb_pro_session.cp_interrupt_payload(cfg, st)
+            openwb_pro_session.phase_cp_interrupt_payload(cfg, st)
             if cp_payload is None
             else cp_payload
         )
@@ -297,7 +253,7 @@ class PhaseSwitchSequencer:
         self._pending_status = deepcopy(st)
         self._pending_restart_delay_s = max(
             0.0,
-            _safe_float(effective_restart_delay_s, 30.0),
+            _safe_float(effective_restart_delay_s, 0.0),
         )
         return contract
 
@@ -312,8 +268,8 @@ class PhaseSwitchSequencer:
         """Übernehme einen vorgeschlagenen Schritt nach dessen Ausführung.
 
         ``success`` bezeichnet ausschließlich den Erfolg eines vorhandenen
-        Treiberkommandos. ``send_zero``, ``send_phase`` und ``send_cp``
-        schreiten nur nach erfolgreicher Treiberbestätigung fort. Damit kann
+        Treiberkommandos. ``send_zero`` und ``send_phase`` schreiten nur nach
+        erfolgreicher Treiberbestätigung fort. Damit kann
         insbesondere ein abgelehntes 0-A-Kommando niemals nach Ablauf des
         Settle-Timers unbemerkt in ``phasetarget`` weiterlaufen.
         """
@@ -354,9 +310,25 @@ class PhaseSwitchSequencer:
                 restart_delay_s=self._pending_restart_delay_s,
                 charger_max_amp=max_amp,
             )
+            phase_transition.mark_committed(
+                self._state,
+                stage="ramp_to_zero",
+                now_ts=started_ts,
+            )
+            phase_transition.set_stage(
+                self._state,
+                "zero_settle",
+                now_ts=started_ts,
+                deadline_ts=sequence.get("zero_until", 0.0),
+            )
 
         elif action == "wait_zero":
             self._state["_openwb_pro_phase_sequence_stage"] = "zero_wait"
+            phase_transition.set_stage(
+                self._state,
+                "zero_settle",
+                deadline_ts=self._active_sequence().get("zero_until", 0.0),
+            )
 
         elif action == "send_phase" and success:
             sequence = self._active_sequence()
@@ -377,10 +349,49 @@ class PhaseSwitchSequencer:
                 config=phase_wait_config,
                 charger_max_amp=max_amp,
             )
-            self._state["_openwb_pro_phase_sequence_stage"] = "cp_after_phase"
+            current_allowed_after = _safe_float(
+                sequence.get("current_allowed_after"),
+                phase_sent_ts + openwb_pro_session.phase_wait_s(cfg),
+            )
+            self._state["_openwb_pro_phase_sequence_stage"] = "restart_delay"
             self._state["_openwb_pro_phase_sequence_phase_sent_ts"] = phase_sent_ts
+            self._state["_openwb_pro_phase_sequence_cp_sent_ts"] = 0.0
+            self._state[
+                "_openwb_pro_phase_sequence_current_allowed_after"
+            ] = current_allowed_after
             self._state["_last_phase_switch_ts"] = phase_sent_ts
             self._state["current_set_amp"] = 0
+            phase_transition.set_stage(
+                self._state,
+                "restart_delay",
+                now_ts=phase_sent_ts,
+                deadline_ts=current_allowed_after,
+            )
+
+        elif action == "adopt_phase_settle":
+            sequence = self._active_sequence()
+            patch = contract.get("sequence_patch")
+            if isinstance(patch, dict):
+                sequence.update(deepcopy(patch))
+            self._state["_openwb_pro_phase_sequence"] = sequence
+            phase_sent_ts = _safe_float(sequence.get("phase_sent_ts"), 0.0)
+            current_allowed_after = _safe_float(
+                sequence.get("current_allowed_after"),
+                phase_sent_ts + openwb_pro_session.phase_wait_s(cfg),
+            )
+            self._state["_openwb_pro_phase_sequence_stage"] = "restart_delay"
+            self._state["_openwb_pro_phase_sequence_phase_sent_ts"] = phase_sent_ts
+            self._state["_openwb_pro_phase_sequence_cp_sent_ts"] = 0.0
+            self._state[
+                "_openwb_pro_phase_sequence_current_allowed_after"
+            ] = current_allowed_after
+            self._state["current_set_amp"] = 0
+            phase_transition.set_stage(
+                self._state,
+                "restart_delay",
+                now_ts=phase_sent_ts,
+                deadline_ts=current_allowed_after,
+            )
 
         elif action == "send_cp" and success:
             sequence = self._active_sequence()
@@ -391,7 +402,9 @@ class PhaseSwitchSequencer:
             cp_sent_ts = _safe_float(sequence.get("cp_sent_ts"), 0.0)
             current_allowed_after = _safe_float(
                 sequence.get("current_allowed_after"),
-                cp_sent_ts + openwb_pro_session.phase_restart_delay_s(cfg),
+                cp_sent_ts
+                + openwb_pro_session.phase_cp_interrupt_duration_s(cfg)
+                + openwb_pro_session.phase_restart_delay_s(cfg),
             )
             self._state["_openwb_pro_phase_sequence_stage"] = "restart_delay"
             self._state["_openwb_pro_phase_sequence_cp_sent_ts"] = cp_sent_ts
@@ -404,9 +417,20 @@ class PhaseSwitchSequencer:
             ] = current_allowed_after
             self._state["_openwb_cp_start_sent"] = True
             self._state["_openwb_last_cp_start_ts"] = cp_sent_ts
+            phase_transition.set_stage(
+                self._state,
+                "restart_delay",
+                now_ts=cp_sent_ts,
+                deadline_ts=current_allowed_after,
+            )
 
         elif action == "wait_restart":
             self._state["_openwb_pro_phase_sequence_stage"] = "restart_delay"
+            phase_transition.set_stage(
+                self._state,
+                "restart_delay",
+                deadline_ts=self._active_sequence().get("current_allowed_after", 0.0),
+            )
 
         elif action == "ready" and success:
             last_sequence = contract.get("sequence")
@@ -417,12 +441,13 @@ class PhaseSwitchSequencer:
             self._state["_openwb_pro_phase_sequence_stage"] = "ready"
             self._state["_openwb_pro_phase_sequence_target"] = 0
             self._state["_openwb_pro_phase_sequence_current_allowed_after"] = 0.0
+            phase_transition.set_stage(self._state, "confirm_target")
 
         self._pending = None
         self._pending_config = {}
         self._pending_charger_max_amp = 32
         self._pending_status = {}
-        self._pending_restart_delay_s = 30.0
+        self._pending_restart_delay_s = 0.0
         return self.snapshot()
 
     def transition_reservation(
@@ -460,14 +485,20 @@ class PhaseSwitchSequencer:
         self._state["_openwb_pro_phase_sequence_current_allowed_after"] = 0.0
         self._state["_openwb_pro_phase_sequence_phase_sent_ts"] = 0.0
         self._state["_openwb_pro_phase_sequence_cp_sent_ts"] = 0.0
-        self._state.pop("_wallbox_phase_transition_reservation", None)
+        reservation = self._state.get("_wallbox_phase_transition_reservation")
+        if isinstance(reservation, dict) and reservation.get("active"):
+            phase_transition.set_stage(
+                self._state,
+                "aborted" if not reservation.get("committed_w") else "recovery_hold",
+                reason_code="sequence_reset",
+            )
         if clear_phase_wait:
             openwb_pro_session.clear_phase_wait(self._state)
         self._pending = None
         self._pending_config = {}
         self._pending_charger_max_amp = 32
         self._pending_status = {}
-        self._pending_restart_delay_s = 30.0
+        self._pending_restart_delay_s = 0.0
         return self.snapshot()
 
     def snapshot(self) -> Dict[str, Any]:
@@ -492,6 +523,9 @@ class PhaseSwitchSequencer:
         restart_delay_s: Any,
         charger_max_amp: Any,
     ) -> None:
+        existing = self._state.get("_wallbox_phase_transition_reservation")
+        if isinstance(existing, dict) and existing.get("active"):
+            return
         begin_phase_transition_reservation(
             self._state,
             target_phases,

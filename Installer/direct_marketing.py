@@ -13,6 +13,8 @@ Architecture guard:
 - Active commands always require the Storage-Manager owner contract.
 """
 
+import hashlib
+import json
 import math
 import time
 from datetime import datetime
@@ -362,6 +364,9 @@ def _slot_power_present(slot, keys):
 
 def _slot_forecast_power(slot):
     pv_w = _slot_power(slot, ("pv_w", "pv", "PV_Power"))
+    e3dc_pv_w = _slot_power(slot, ("e3dc_pv_w", "pv_dc_w", "E3DC_PV_Power"))
+    external_pv_w = _slot_power(slot, ("external_pv_w", "ext_pv_w", "Ext_PV_Power"))
+    has_e3dc_pv_forecast = _slot_power_present(slot, ("e3dc_pv_w", "pv_dc_w", "E3DC_PV_Power"))
     home_w = _slot_power(slot, ("home_w", "home", "Home_Power", "load_w"))
     wp_w = _slot_power(slot, ("wp_w", "heatpump_w", "WP_Power"))
     heater_w = _slot_power(slot, ("heater_w", "heizstab_w", "Heizstab_Power"))
@@ -377,13 +382,19 @@ def _slot_forecast_power(slot):
         surplus_w = safe_float(slot.get("surplus_w", slot.get("surplus")), pv_w - home_w - wp_w - heater_w - wallbox_w)
     else:
         surplus_w = pv_w - home_w - wp_w - heater_w - wallbox_w
+    controlled_load_w = home_w + wp_w + heater_w + wallbox_w
+    dc_surplus_w = max(0.0, e3dc_pv_w - controlled_load_w) if has_e3dc_pv_forecast else 0.0
     return {
         "pv_w": pv_w,
+        "e3dc_pv_w": e3dc_pv_w,
+        "external_pv_w": external_pv_w,
+        "has_e3dc_pv_forecast": has_e3dc_pv_forecast,
         "home_w": home_w,
         "wp_w": wp_w,
         "heater_w": heater_w,
         "wallbox_w": wallbox_w,
         "forecast_surplus_w": max(0.0, surplus_w),
+        "forecast_dc_surplus_w": dc_surplus_w,
         "forecast_deficit_w": max(0.0, -surplus_w),
         "has_power_forecast": has_power,
     }
@@ -404,12 +415,124 @@ def _price_score(slot, min_market_ct, max_market_ct):
 
 
 def _net_sell_ct(market_ct, config):
+    return _net_sell_components(market_ct, config)["net_sell_ct"]
+
+
+def _input_vat_multiplier(config):
+    vat_pct = _clamp(safe_float((config or {}).get("direct_marketing_service_vat_pct"), 19.0), 0.0, 100.0)
+    recoverable = cfg_bool((config or {}).get("direct_marketing_input_vat_recoverable"), False)
+    return 1.0 if recoverable else 1.0 + (vat_pct / 100.0)
+
+
+def _eeg_compensation_rate_ct(config):
+    tiers = _parse_eeg_tariff_tiers((config or {}).get("direct_marketing_eeg_tariff_tiers"))
+    if not tiers:
+        return None
+    return _weighted_eeg_rate_ct(tiers, _configured_pv_capacity_kwp(config))
+
+
+def _variable_fee_basis(config, gross_sell_ct):
+    mode = str((config or {}).get("direct_marketing_variable_fee_basis", "sell_revenue") or "sell_revenue")
+    mode = mode.strip().lower().replace("-", "_")
+    if mode in {"manual", "manual_ct", "manual_ct_per_kwh"}:
+        manual_ct = _configured_optional_float(config, "direct_marketing_variable_fee_basis_ct_per_kwh")
+        return "manual", max(0.0, safe_float(manual_ct, 0.0)), manual_ct is not None
+    if mode in {"eeg", "eeg_compensation", "market_premium"}:
+        eeg_ct = _eeg_compensation_rate_ct(config)
+        return "eeg_compensation", max(0.0, safe_float(eeg_ct, 0.0)), eeg_ct is not None
+    if mode in {"sell_revenue", "sales_revenue", "export_revenue"}:
+        return "sell_revenue", max(0.0, gross_sell_ct), True
+    return mode or "unknown", 0.0, False
+
+
+def _net_sell_components(market_ct, config):
+    config = config or {}
     revenue_offset = safe_float(config.get("direct_marketing_revenue_offset_ct"), 0.0)
-    fee_ct = safe_float(config.get("direct_marketing_fee_ct_per_kwh"), 0.0)
-    fee_pct = safe_float(config.get("direct_marketing_fee_pct"), 0.0)
-    gross = market_ct + revenue_offset
-    variable_fee = max(0.0, gross) * max(0.0, fee_pct) / 100.0
-    return gross - max(0.0, fee_ct) - variable_fee
+    fee_ct_net = max(0.0, safe_float(config.get("direct_marketing_fee_ct_per_kwh"), 0.0))
+    fee_pct = max(0.0, safe_float(config.get("direct_marketing_fee_pct"), 0.0))
+    gross = safe_float(market_ct, 0.0) + revenue_offset
+    fee_basis_mode, fee_basis_ct, fee_basis_valid = _variable_fee_basis(config, gross)
+    variable_fee_net_ct = fee_basis_ct * fee_pct / 100.0
+    vat_multiplier = _input_vat_multiplier(config)
+    fee_cost_ct = (fee_ct_net + variable_fee_net_ct) * vat_multiplier
+    return {
+        "gross_sell_ct": round(gross, 6),
+        "net_sell_ct": round(gross - fee_cost_ct, 6),
+        "fee_basis": fee_basis_mode,
+        "fee_basis_ct": round(fee_basis_ct, 6),
+        "fee_basis_valid": bool(fee_basis_valid),
+        "fee_pct": round(fee_pct, 6),
+        "fixed_fee_net_ct": round(fee_ct_net, 6),
+        "variable_fee_net_ct": round(variable_fee_net_ct, 6),
+        "fee_cost_ct": round(fee_cost_ct, 6),
+        "service_vat_pct": round(_clamp(safe_float(config.get("direct_marketing_service_vat_pct"), 19.0), 0.0, 100.0), 3),
+        "input_vat_recoverable": cfg_bool(config.get("direct_marketing_input_vat_recoverable"), False),
+    }
+
+
+def _settlement_accounting(config):
+    config = config or {}
+    capacity_override = _configured_optional_float(config, "direct_marketing_installed_kwp")
+    forecast_capacity_kwp = _configured_pv_capacity_kwp(config)
+    installed_kwp = max(
+        0.0,
+        safe_float(capacity_override, forecast_capacity_kwp)
+        if capacity_override is not None and capacity_override > 0.0
+        else forecast_capacity_kwp,
+    )
+    monthly_fee_net = max(0.0, safe_float(config.get("direct_marketing_monthly_fee_eur"), 0.0))
+    balancing_estimate_per_kwp = max(
+        0.0,
+        safe_float(config.get("direct_marketing_balancing_cost_eur_per_kwp_month"), 0.0),
+    )
+    balancing_actual_per_kwp = _configured_optional_float(
+        config,
+        "direct_marketing_balancing_cost_actual_eur_per_kwp_month",
+    )
+    balancing_estimate_net = installed_kwp * balancing_estimate_per_kwp
+    balancing_actual_net = (
+        installed_kwp * max(0.0, safe_float(balancing_actual_per_kwp, 0.0))
+        if balancing_actual_per_kwp is not None
+        else None
+    )
+    vat_multiplier = _input_vat_multiplier(config)
+    sample = _net_sell_components(0.0, config)
+    return {
+        "schema": "direct_marketing_settlement_v1",
+        "variable_fee": {
+            "percent": sample["fee_pct"],
+            "basis": sample["fee_basis"],
+            "basis_ct_per_kwh": sample["fee_basis_ct"] if sample["fee_basis"] != "sell_revenue" else None,
+            "basis_valid": sample["fee_basis_valid"],
+            "fixed_net_ct_per_kwh": sample["fixed_fee_net_ct"],
+            "marginal_policy_cost": True,
+        },
+        "tax": {
+            "service_vat_pct": sample["service_vat_pct"],
+            "input_vat_recoverable": sample["input_vat_recoverable"],
+            "cost_multiplier": round(vat_multiplier, 6),
+        },
+        "installed_capacity_kwp": round(installed_kwp, 3),
+        "monthly_service_fee": {
+            "net_eur": round(monthly_fee_net, 2),
+            "effective_eur": round(monthly_fee_net * vat_multiplier, 2),
+        },
+        "balancing_cost": {
+            "estimate_eur_per_kwp_month": round(balancing_estimate_per_kwp, 4),
+            "estimate_net_eur": round(balancing_estimate_net, 2),
+            "estimate_effective_eur": round(balancing_estimate_net * vat_multiplier, 2),
+            "actual_eur_per_kwp_month": round(max(0.0, balancing_actual_per_kwp), 4) if balancing_actual_per_kwp is not None else None,
+            "actual_net_eur": round(balancing_actual_net, 2) if balancing_actual_net is not None else None,
+            "actual_effective_eur": round(balancing_actual_net * vat_multiplier, 2) if balancing_actual_net is not None else None,
+            "policy_effect": "diagnostic_only",
+        },
+        "monthly_fixed_cost_estimate": {
+            "net_eur": round(monthly_fee_net + balancing_estimate_net, 2),
+            "effective_eur": round((monthly_fee_net + balancing_estimate_net) * vat_multiplier, 2),
+            "marginal_policy_cost": False,
+        },
+        "market_value_solar_role": "monitor_and_reconciliation_only",
+    }
 
 
 def _format_t(ts):
@@ -456,15 +579,33 @@ def _policy_empty_decision(block_reason="", reserve=None, flags=None):
 
 
 def _slot_export_constraint(slot, flags):
-    """Classify PV export independently from storage charge priority."""
+    """Klassifiziert PV-Export unabhängig von der Speicherladepriorität.
+
+    Ein negativer Rohmarktpreis kennzeichnet das Marktfenster, ist für sich
+    allein aber kein Exportveto. Der Aktorvertrag folgt dem marginalen Nettoerlös
+    nach konfiguriertem Abrechnungsoffset und variablen Gebühren.
+    """
 
     is_negative = bool((slot or {}).get("is_negative"))
-    negative_hard = bool(
+    negative_policy_enabled = bool(
         is_negative
         and (
             cfg_bool((flags or {}).get("negative_price_no_export"), True)
             or cfg_bool((flags or {}).get("low_price_curtail_enable"), False)
         )
+    )
+    net_sell_ct = safe_float((slot or {}).get("net_sell_ct"), float("nan"))
+    settlement_valid = bool((slot or {}).get("fee_basis_valid") is True and math.isfinite(net_sell_ct))
+    economic_release = bool(is_negative and settlement_valid and net_sell_ct > 0.0)
+    # Die aktuelle Produktclosure kann den autonomen Zusatz-WR-/Shelly-Pfad nicht
+    # als Consumer derselben Grenzerlösfreigabe binden. Bis beide Aktorpfade
+    # typisiert geschlossen sind, bleibt der bestehende Rohnegativpreis-Veto
+    # deshalb hardwarewirksam. Das Marktfenster und der positive Grenzerlös
+    # bleiben davon getrennt sichtbar.
+    actuator_field_ready = False
+    negative_hard = bool(
+        negative_policy_enabled
+        and (not economic_release or not actuator_field_ready)
     )
     if negative_hard:
         limit_w = (
@@ -472,14 +613,34 @@ def _slot_export_constraint(slot, flags):
             if cfg_bool((flags or {}).get("low_price_curtail_enable"), False)
             else 0
         )
+        if not settlement_valid:
+            marginal_classification = "negative_margin_invalid_hard"
+        elif net_sell_ct <= 0.0:
+            marginal_classification = "negative_net_revenue_hard"
+        else:
+            marginal_classification = "negative_net_positive_allowed"
         return {
             "export_constraint_class": "negative_hard",
+            "marginal_export_class": marginal_classification,
             "hard_export_limit_active": True,
             "hard_export_limit_w": limit_w,
             "export_constraint_scope": "grid_connection",
             "pv_export_allowed": False,
             "export_constraint_enforcement": "requested",
             "export_constraint_execution_owner": "external_e3dc_luox",
+            "marginal_net_sell_ct": round(net_sell_ct, 6) if settlement_valid else None,
+            "marginal_settlement_valid": settlement_valid,
+            "actuator_closure": {
+                "schema": "direct_marketing_export_actuator_closure_v1",
+                "required_paths": ["e3dc_luox", "aux_inverter_shelly"],
+                "economic_release": economic_release,
+                "field_ready": actuator_field_ready,
+                "reason": (
+                    "both_consumers_not_runtime_bound"
+                    if economic_release
+                    else ("net_revenue_nonpositive" if settlement_valid else "settlement_contract_invalid")
+                ),
+            },
         }
 
     if is_negative:
@@ -490,13 +651,165 @@ def _slot_export_constraint(slot, flags):
         classification = "low_price_soft"
     return {
         "export_constraint_class": classification,
+        "marginal_export_class": "negative_net_positive_allowed" if is_negative else classification,
         "hard_export_limit_active": False,
         "hard_export_limit_w": None,
         "export_constraint_scope": "storage_priority",
         "pv_export_allowed": True,
         "export_constraint_enforcement": "storage_priority",
         "export_constraint_execution_owner": "storage_manager",
+        "marginal_net_sell_ct": round(net_sell_ct, 6) if settlement_valid else None,
+        "marginal_settlement_valid": settlement_valid,
+        "actuator_closure": {
+            "schema": "direct_marketing_export_actuator_closure_v1",
+            "required_paths": ["e3dc_luox", "aux_inverter_shelly"],
+            "economic_release": bool(is_negative and settlement_valid and net_sell_ct > 0.0),
+            "field_ready": False,
+            "reason": "both_consumers_not_runtime_bound" if is_negative else "outside_negative_market_window",
+        },
     }
+
+
+def _market_window_digest(slots):
+    material = [
+        {
+            "start_ts": int(slot["ts"]),
+            "end_ts": int(slot["end_ts"]),
+            "market_ct": round(safe_float(slot.get("market_ct"), 0.0), 6),
+            "source": str(slot.get("market_price_source") or ""),
+            "resolution_min": safe_int(slot.get("market_price_resolution_min"), 0),
+        }
+        for slot in slots
+    ]
+    return hashlib.sha256(
+        json.dumps(material, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _build_negative_price_market_windows(annotated, previous_market_windows=None):
+    """Erstellt stabile Rohpreisfenster unabhängig von jeder Speicheraktion."""
+
+    grouped = []
+    for slot in sorted(
+        (item for item in annotated if item.get("is_negative")),
+        key=lambda item: int(item.get("ts", 0)),
+    ):
+        if not grouped or int(grouped[-1][-1]["end_ts"]) != int(slot["ts"]):
+            grouped.append([slot])
+        else:
+            grouped[-1].append(slot)
+
+    previous = [item for item in (previous_market_windows or []) if isinstance(item, dict)]
+    windows = []
+    for slots in grouped:
+        start_ts = int(slots[0]["ts"])
+        end_ts = int(slots[-1]["end_ts"])
+        digest = _market_window_digest(slots)
+        stable_start = start_ts
+        stable_id = None
+        matched_old = None
+        for old in previous:
+            old_start = safe_int(old.get("start_ts"), 0)
+            old_end = safe_int(old.get("end_ts"), 0)
+            old_slots = old.get("slot_prices") if isinstance(old.get("slot_prices"), list) else []
+            old_by_ts = {
+                safe_int(item.get("start_ts"), 0): round(safe_float(item.get("market_ct"), 0.0), 6)
+                for item in old_slots if isinstance(item, dict)
+            }
+            suffix_matches = bool(old_by_ts) and all(
+                old_by_ts.get(int(slot["ts"])) == round(safe_float(slot.get("market_ct"), 0.0), 6)
+                for slot in slots
+            )
+            if old_start <= start_ts < old_end and old_end == end_ts and suffix_matches:
+                stable_start = old_start
+                stable_id = str(old.get("market_window_id") or "") or None
+                matched_old = old
+                break
+        if stable_id is None:
+            stable_id = "market:negative_price:%d:%d:%s" % (stable_start, end_ts, digest[:16])
+
+        valid_values = [
+            safe_float(slot.get("net_sell_ct"), float("nan"))
+            for slot in slots
+            if slot.get("fee_basis_valid") is True
+            and math.isfinite(safe_float(slot.get("net_sell_ct"), float("nan")))
+        ]
+        invalid_count = len(slots) - len(valid_values)
+        positive_count = sum(1 for value in valid_values if value > 0.0)
+        nonpositive_count = sum(1 for value in valid_values if value <= 0.0)
+        if invalid_count:
+            margin_class = "invalid" if not valid_values else "mixed_invalid"
+        elif positive_count and nonpositive_count:
+            margin_class = "mixed"
+        elif positive_count:
+            margin_class = "positive"
+        else:
+            margin_class = "nonpositive"
+        window = {
+            "schema": "direct_marketing_negative_market_window_v1",
+            "market_window_id": stable_id,
+            "window_id": stable_id,
+            "action": "negative_price_market_window",
+            "reason": "raw_market_price_negative",
+            "start_ts": stable_start,
+            "end_ts": end_ts,
+            "start_t": _format_t(stable_start),
+            "end_t": _format_t(end_ts),
+            "slot_count": len(slots),
+            "observed_start_ts": start_ts,
+            "observed_slot_count": len(slots),
+            "price_revision_sha256": digest,
+            "min_market_ct": round(min(safe_float(slot.get("market_ct"), 0.0) for slot in slots), 3),
+            "max_market_ct": round(max(safe_float(slot.get("market_ct"), 0.0) for slot in slots), 3),
+            "avg_market_ct": round(sum(safe_float(slot.get("market_ct"), 0.0) for slot in slots) / len(slots), 3),
+            "min_net_sell_ct": round(min(valid_values), 3) if valid_values else None,
+            "max_net_sell_ct": round(max(valid_values), 3) if valid_values else None,
+            "margin_class": margin_class,
+            "positive_margin_slot_count": positive_count,
+            "nonpositive_margin_slot_count": nonpositive_count,
+            "invalid_margin_slot_count": invalid_count,
+            "market_window_only": True,
+            "planned_power_w": 0,
+            "soc_effect": False,
+            "action_overlay_separate": True,
+            "slot_prices": [
+                {"start_ts": int(slot["ts"]), "market_ct": round(safe_float(slot.get("market_ct"), 0.0), 6)}
+                for slot in slots
+            ],
+        }
+        if isinstance(matched_old, dict):
+            # Die Preisrevision ist unverändert; nur der Replan-Horizont hat
+            # bereits vergangene Slots abgeschnitten. Vollständige semantische
+            # Fenstergrenzen und Aggregationen bleiben revisionsstabil.
+            for key in (
+                "slot_count",
+                "price_revision_sha256",
+                "min_market_ct",
+                "max_market_ct",
+                "avg_market_ct",
+                "min_net_sell_ct",
+                "max_net_sell_ct",
+                "margin_class",
+                "positive_margin_slot_count",
+                "nonpositive_margin_slot_count",
+                "invalid_margin_slot_count",
+                "slot_prices",
+            ):
+                if key in matched_old:
+                    window[key] = matched_old[key]
+        windows.append(window)
+        for slot in slots:
+            slot.update({
+                "market_window_id": stable_id,
+                "market_window_start_ts": stable_start,
+                "market_window_end_ts": end_ts,
+                "market_window_margin_class": margin_class,
+                "market_margin_class": (
+                    "invalid" if slot.get("fee_basis_valid") is not True
+                    else ("positive" if safe_float(slot.get("net_sell_ct"), 0.0) > 0.0 else "nonpositive")
+                ),
+            })
+    return windows
 
 
 def _policy_consumer_budget(config, reason):
@@ -527,9 +840,18 @@ def _policy_lcos_ct(config, profile):
 
 def _policy_thresholds(config):
     return {
-        "min_window_profit_eur": max(0.0, safe_float(config.get("direct_marketing_min_window_profit_eur"), 0.10)),
-        "min_export_energy_kwh": max(0.0, safe_float(config.get("direct_marketing_min_export_energy_kwh"), 1.0)),
-        "min_export_window_min": max(0.0, safe_float(config.get("direct_marketing_min_export_window_min"), 60.0)),
+        "min_window_profit_eur": max(0.0, safe_float(config.get("direct_marketing_min_window_profit_eur"), 0.25)),
+        "min_export_energy_kwh": max(0.0, safe_float(config.get("direct_marketing_min_export_energy_kwh"), 1.5)),
+        "min_export_window_min": max(15.0, safe_float(config.get("direct_marketing_min_export_window_min"), 15.0)),
+        "preferred_export_plateau_min": max(
+            15.0,
+            safe_float(config.get("direct_marketing_preferred_export_plateau_min"), 60.0),
+        ),
+        "price_plateau_tolerance_ct": _clamp(
+            safe_float(config.get("direct_marketing_price_plateau_tolerance_ct"), 0.75),
+            0.0,
+            20.0,
+        ),
         "min_margin_pct": max(0.0, safe_float(config.get("direct_marketing_min_margin_pct"), 10.0)),
         "user_min_margin_ct": max(
             0.0,
@@ -542,6 +864,85 @@ def _policy_thresholds(config):
             ),
         ),
     }
+
+
+def _annotate_export_price_plateaus(annotated, config):
+    """Expand high-price seeds into calm, adjacent net-sell plateaus."""
+
+    ordered = sorted((dict(slot) for slot in (annotated or [])), key=lambda item: safe_float(item.get("ts"), 0.0))
+    if not ordered:
+        return ordered
+    thresholds = _policy_thresholds(config)
+    tolerance_ct = safe_float(thresholds.get("price_plateau_tolerance_ct"), 0.75)
+    preferred_min = safe_float(thresholds.get("preferred_export_plateau_min"), 60.0)
+    selected = set()
+    for seed_idx, seed in enumerate(ordered):
+        if not seed.get("is_high") or seed.get("is_low") or seed.get("is_negative"):
+            continue
+        seed_price = safe_float(seed.get("net_sell_ct"), safe_float(seed.get("market_ct"), 0.0))
+        selected.add(seed_idx)
+        for direction in (-1, 1):
+            idx = seed_idx + direction
+            previous_idx = seed_idx
+            while 0 <= idx < len(ordered):
+                candidate = ordered[idx]
+                previous = ordered[previous_idx]
+                if candidate.get("is_low") or candidate.get("is_negative"):
+                    break
+                if direction < 0:
+                    contiguous = abs(safe_float(candidate.get("end_ts"), 0.0) - safe_float(previous.get("ts"), 0.0)) <= 1000.0
+                else:
+                    contiguous = abs(safe_float(previous.get("end_ts"), 0.0) - safe_float(candidate.get("ts"), 0.0)) <= 1000.0
+                if not contiguous:
+                    break
+                candidate_price = safe_float(candidate.get("net_sell_ct"), safe_float(candidate.get("market_ct"), 0.0))
+                if candidate_price + 0.000001 < seed_price - tolerance_ct:
+                    break
+                selected.add(idx)
+                previous_idx = idx
+                idx += direction
+
+    groups = []
+    current = []
+    for idx in sorted(selected):
+        candidate_price = safe_float(ordered[idx].get("net_sell_ct"), safe_float(ordered[idx].get("market_ct"), 0.0))
+        current_prices = [
+            safe_float(ordered[item].get("net_sell_ct"), safe_float(ordered[item].get("market_ct"), 0.0))
+            for item in current
+        ]
+        price_range_too_wide = bool(
+            current_prices
+            and max(current_prices + [candidate_price]) - min(current_prices + [candidate_price]) > tolerance_ct + 0.000001
+        )
+        if current and (idx != current[-1] + 1 or price_range_too_wide):
+            groups.append(current)
+            current = []
+        current.append(idx)
+    if current:
+        groups.append(current)
+
+    for group in groups:
+        start_ts = int(safe_float(ordered[group[0]].get("ts"), 0.0))
+        end_ts = int(safe_float(ordered[group[-1]].get("end_ts"), start_ts + SLOT_MS))
+        duration_min = max(0.0, end_ts - start_ts) / 60000.0
+        prices = [safe_float(ordered[idx].get("net_sell_ct"), safe_float(ordered[idx].get("market_ct"), 0.0)) for idx in group]
+        peak_ct = max(prices)
+        plateau_id = "export:%d:%d" % (end_ts, int(round(peak_ct * 100.0)))
+        for idx in group:
+            ordered[idx].update({
+                "is_export_plateau": True,
+                "export_plateau_id": plateau_id,
+                "export_plateau_origin_start_ts": start_ts,
+                "export_plateau_end_ts": end_ts,
+                "export_plateau_duration_min": round(duration_min, 1),
+                "export_plateau_peak_net_sell_ct": round(peak_ct, 3),
+                "export_plateau_tolerance_ct": round(tolerance_ct, 3),
+                "export_plateau_preferred_min": round(preferred_min, 1),
+                "export_plateau_preferred_met": duration_min + 0.000001 >= preferred_min,
+            })
+    for idx, slot in enumerate(ordered):
+        slot.setdefault("is_export_plateau", idx in selected)
+    return ordered
 
 
 def _policy_current_slot(annotated, now_ms):
@@ -633,7 +1034,7 @@ def _policy_reserve_state(config, reserve, annotated, now_ms, current_soc, capac
     }
 
 
-def _policy_export_economics(config, window, economics, profile, sellable_wh):
+def _policy_export_economics(config, window, economics, profile, sellable_wh, capacity_wh=0.0, annotated=None):
     duration_h = _entry_duration_h(window)
     duration_min = duration_h * 60.0
     max_power_w = max(0.0, safe_float(window.get("max_power_w"), 0.0))
@@ -644,8 +1045,41 @@ def _policy_export_economics(config, window, economics, profile, sellable_wh):
         safe_float(window.get("net_sell_ct"), safe_float(window.get("avg_market_ct"), 0.0)),
     )
     opportunity_cost_ct = _configured_optional_float(config, "direct_marketing_opportunity_cost_ct")
+    opportunity_cost_source = "configured"
     if opportunity_cost_ct is None:
-        opportunity_cost_ct = safe_float(economics.get("pv_shift_opportunity_ct"), 0.0)
+        next_recharge_ts = safe_float(window.get("export_segment_next_recharge_ts"), 0.0)
+        recharge_slots = []
+        if next_recharge_ts > 0.0:
+            collecting = False
+            previous_end_ts = 0.0
+            for slot in sorted(annotated or [], key=lambda item: safe_float(item.get("ts"), 0.0)):
+                start_ts = safe_float(slot.get("ts"), 0.0)
+                end_ts = safe_float(slot.get("end_ts"), start_ts + SLOT_MS)
+                if not collecting and abs(start_ts - next_recharge_ts) <= 1000.0:
+                    collecting = True
+                if not collecting:
+                    continue
+                if previous_end_ts > 0.0 and abs(start_ts - previous_end_ts) > 1000.0:
+                    break
+                if not slot.get("is_pv_store"):
+                    break
+                duration_h = max(0.0, end_ts - start_ts) / 3600000.0
+                forecast_wh = max(0.0, safe_float(slot.get("forecast_surplus_w"), 0.0)) * duration_h
+                weight = forecast_wh if forecast_wh > 0.0 else duration_h
+                net_revenue_ct = safe_float(slot.get("net_sell_ct"), 0.0)
+                gross_revenue_ct = safe_float(slot.get("gross_sell_ct"), net_revenue_ct)
+                # Avoided Vermarktungsgebühren werden konservativ nicht als
+                # zusätzlicher Batterie-Arbitragegewinn gutgeschrieben.
+                recharge_slots.append((max(net_revenue_ct, gross_revenue_ct), weight))
+                previous_end_ts = end_ts
+        if recharge_slots and sum(weight for _value, weight in recharge_slots) > 0.0:
+            opportunity_cost_ct = sum(value * weight for value, weight in recharge_slots) / sum(
+                weight for _value, weight in recharge_slots
+            )
+            opportunity_cost_source = "next_recharge_window"
+        else:
+            opportunity_cost_ct = safe_float(economics.get("pv_shift_opportunity_ct"), 0.0)
+            opportunity_cost_source = "global_fallback"
     efficiency_pct = _clamp(
         safe_float(config.get("direct_marketing_roundtrip_efficiency_pct"), 85.0),
         1.0,
@@ -653,7 +1087,25 @@ def _policy_export_economics(config, window, economics, profile, sellable_wh):
     )
     efficiency = efficiency_pct / 100.0
     efficiency_loss_ct = max(0.0, sell_net_ct * (1.0 - efficiency))
-    lcos_ct = _policy_lcos_ct(config, profile)
+    base_lcos_ct = _policy_lcos_ct(config, profile)
+    discharge_depth_pct = (
+        planned_wh / max(1.0, safe_float(capacity_wh, 0.0)) * 100.0
+        if safe_float(capacity_wh, 0.0) > 0.0
+        else 0.0
+    )
+    deep_cycle_threshold_pct = _clamp(
+        safe_float(config.get("direct_marketing_deep_cycle_threshold_pct"), 20.0),
+        0.0,
+        100.0,
+    )
+    deep_cycle_lcos_factor = _clamp(
+        safe_float(config.get("direct_marketing_deep_cycle_lcos_factor"), 0.5),
+        0.0,
+        5.0,
+    )
+    deep_cycle_excess = max(0.0, discharge_depth_pct - deep_cycle_threshold_pct)
+    depth_lcos_ct = base_lcos_ct * deep_cycle_lcos_factor * (deep_cycle_excess / 100.0)
+    lcos_ct = base_lcos_ct + depth_lcos_ct
     safety_margin_ct = _clamp(
         safe_float(config.get("direct_marketing_safety_margin_ct_per_kwh"), 0.0),
         -10.0,
@@ -671,9 +1123,27 @@ def _policy_export_economics(config, window, economics, profile, sellable_wh):
         "export_energy_kwh": round(export_energy_kwh, 3),
         "duration_min": round(duration_min, 1),
         "sell_net_ct_kwh": round(sell_net_ct, 3),
+        "sell_gross_ct_kwh": round(
+            safe_float(window.get("avg_gross_sell_ct"), safe_float(window.get("gross_sell_ct"), sell_net_ct)),
+            3,
+        ),
+        "marketing_fee_cost_ct_kwh": round(
+            max(0.0, safe_float(window.get("avg_fee_cost_ct"), safe_float(window.get("fee_cost_ct"), 0.0))),
+            3,
+        ),
+        "marketing_fee_basis": window.get("fee_basis"),
+        "marketing_fee_basis_ct_kwh": window.get("fee_basis_ct"),
+        "marketing_fee_pct": window.get("fee_pct"),
         "opportunity_cost_ct": round(opportunity_cost_ct, 3),
+        "opportunity_cost_source": opportunity_cost_source,
+        "next_recharge_ts": int(safe_float(window.get("export_segment_next_recharge_ts"), 0.0)) or None,
         "efficiency_loss_ct": round(efficiency_loss_ct, 3),
+        "base_lcos_ct": round(base_lcos_ct, 3),
+        "depth_lcos_ct": round(depth_lcos_ct, 3),
         "lcos_ct": round(lcos_ct, 3),
+        "planned_discharge_depth_pct": round(discharge_depth_pct, 2),
+        "deep_cycle_threshold_pct": round(deep_cycle_threshold_pct, 1),
+        "deep_cycle_lcos_factor": round(deep_cycle_lcos_factor, 2),
         "safety_margin_ct": round(safety_margin_ct, 3),
         "margin_ct_kwh": round(margin_ct, 3),
         "cost_basis_ct_kwh": round(cost_basis_ct, 3),
@@ -705,31 +1175,88 @@ def _policy_export_allowed(profile, export_economics):
             safe_float(export_economics.get("margin_pct"), 0.0),
             safe_float(export_economics.get("min_margin_pct"), 10.0),
         )
-    if profit + 0.000001 < safe_float(export_economics.get("min_window_profit_eur"), 0.10):
+    if profit + 0.000001 < safe_float(export_economics.get("min_window_profit_eur"), 0.25):
         return False, "Blocked by Margin: Expected Profit %.2f EUR < Threshold %.2f EUR" % (
             profit,
-            safe_float(export_economics.get("min_window_profit_eur"), 0.10),
+            safe_float(export_economics.get("min_window_profit_eur"), 0.25),
         )
     if safe_float(export_economics.get("export_energy_kwh"), 0.0) + 0.000001 < safe_float(
         export_economics.get("min_export_energy_kwh"),
-        1.0,
+        1.5,
     ):
         return False, "Blocked by Energy: %.2f kWh < Threshold %.2f kWh" % (
             safe_float(export_economics.get("export_energy_kwh"), 0.0),
-            safe_float(export_economics.get("min_export_energy_kwh"), 1.0),
+            safe_float(export_economics.get("min_export_energy_kwh"), 1.5),
         )
     if safe_float(export_economics.get("duration_min"), 0.0) + 0.000001 < safe_float(
         export_economics.get("min_export_window_min"),
-        60.0,
+        15.0,
     ):
         return False, "Blocked by Duration: %.1f min < Threshold %.1f min" % (
             safe_float(export_economics.get("duration_min"), 0.0),
-            safe_float(export_economics.get("min_export_window_min"), 60.0),
+            safe_float(export_economics.get("min_export_window_min"), 15.0),
         )
     return True, "Profit export allowed"
 
 
-def _build_policy_decision(config, annotated, windows, reserve, flags, economics, mode, now_ms, current_soc, capacity_wh, blocked_reasons):
+def _policy_export_previous_window_context(previous_policy, export_window, profile, now_ms):
+    """Gleicht ein bereits freigegebenes Exportfenster ohne Policy-Persistenz ab."""
+    previous = previous_policy if isinstance(previous_policy, dict) else {}
+    selected = previous.get("selected_window") if isinstance(previous.get("selected_window"), dict) else {}
+    if (
+        previous.get("schema") != POLICY_SCHEMA
+        or bool(previous.get("blocked"))
+        or not cfg_bool(previous.get("commands_allowed"), False)
+        or str(previous.get("dv_target_state") or "").strip().upper() != "FORCE_EXPORT"
+        or _normalize_profit_profile(previous.get("profit_profile", "standard")) != profile
+    ):
+        return {"matched": False}
+
+    previous_action = str(selected.get("action") or previous.get("source_action") or "")
+    current_action = str((export_window or {}).get("action") or "")
+    previous_window_id = str(selected.get("window_id") or previous.get("window_id") or "")
+    current_window_id = str((export_window or {}).get("export_plateau_id") or "")
+    previous_end_ts = safe_float(selected.get("end_ts", previous.get("end_ts")), 0.0)
+    current_end_ts = safe_float((export_window or {}).get("end_ts"), 0.0)
+    if (
+        previous_action != current_action
+        or (previous_window_id and current_window_id and previous_window_id != current_window_id)
+        or previous_end_ts <= 0.0
+        or current_end_ts <= 0.0
+        or abs(previous_end_ts - current_end_ts) > 1000.0
+        or safe_float(now_ms, 0.0) >= current_end_ts
+    ):
+        return {"matched": False}
+
+    origin_start_ts = safe_float(
+        previous.get("window_origin_start_ts", selected.get("start_ts", previous.get("start_ts"))),
+        0.0,
+    )
+    if origin_start_ts <= 0.0 or safe_float(now_ms, 0.0) < origin_start_ts:
+        return {"matched": False}
+    return {
+        "matched": True,
+        "origin_start_ts": int(origin_start_ts),
+        "end_ts": int(current_end_ts),
+        "action": current_action,
+        "window_id": previous_window_id or current_window_id,
+    }
+
+
+def _build_policy_decision_legacy(
+    config,
+    annotated,
+    windows,
+    reserve,
+    flags,
+    economics,
+    mode,
+    now_ms,
+    current_soc,
+    capacity_wh,
+    blocked_reasons,
+    previous_policy_decision=None,
+):
     profile = _normalize_profit_profile(config.get("direct_marketing_profit_profile", "standard"))
     reserve_policy = _policy_reserve_state(config, reserve, annotated, now_ms, current_soc, capacity_wh)
     reserve = dict(reserve or {})
@@ -859,10 +1386,15 @@ def _build_policy_decision(config, annotated, windows, reserve, flags, economics
             100.0,
         )
         headroom_target_soc_pct = max(protected_soc_pct, 100.0 - required_headroom_pct)
-        headroom_deficit_wh = min(
+        protected_limited_deficit_wh = min(
             safe_float(reserve_policy.get("sellable_wh"), 0.0),
             max(0.0, (safe_float(current_soc, 0.0) - headroom_target_soc_pct) / 100.0 * safe_float(capacity_wh, 0.0)),
         )
+        additional_headroom_wh = max(
+            0.0,
+            safe_float(headroom_window.get("negative_headroom_additional_wh"), protected_limited_deficit_wh),
+        )
+        headroom_deficit_wh = min(protected_limited_deficit_wh, additional_headroom_wh)
         remaining_h = max(
             0.001,
             (safe_float(headroom_window.get("end_ts"), now_ms + SLOT_MS) - safe_float(now_ms, 0.0)) / 3600000.0,
@@ -892,6 +1424,8 @@ def _build_policy_decision(config, annotated, windows, reserve, flags, economics
                 "protected_reserve_wh": reserve_policy["protected_energy_wh"],
                 "sellable_wh": reserve_policy["sellable_wh"],
                 "headroom_deficit_wh": round(headroom_deficit_wh, 0),
+                "headroom_required_wh": headroom_window.get("negative_headroom_required_wh"),
+                "headroom_free_before_wh": headroom_window.get("negative_headroom_free_before_wh"),
                 "headroom_target_soc_pct": round(headroom_target_soc_pct, 1),
                 "headroom_hold_active": bool(headroom_control_released and not active_headroom_export),
             },
@@ -917,6 +1451,9 @@ def _build_policy_decision(config, annotated, windows, reserve, flags, economics
                 "future_low_market_ct_kwh": economics.get("best_low_market_ct") if isinstance(economics, dict) else None,
                 "headroom_export_energy_kwh": round(min(headroom_deficit_wh, export_w * remaining_h) / 1000.0, 3),
                 "forecast_absorption_wh": round(safe_float(headroom_window.get("negative_headroom_forecast_surplus_wh"), 0.0), 0),
+                "required_headroom_wh": round(safe_float(headroom_window.get("negative_headroom_required_wh"), 0.0), 0),
+                "free_headroom_before_wh": round(safe_float(headroom_window.get("negative_headroom_free_before_wh"), 0.0), 0),
+                "additional_headroom_wh": round(additional_headroom_wh, 0),
             },
             "selected_window": {
                 "action": headroom_window.get("action"),
@@ -926,6 +1463,9 @@ def _build_policy_decision(config, annotated, windows, reserve, flags, economics
                 "next_charge_window_start_ts": headroom_window.get("negative_headroom_next_start_ts"),
                 "headroom_export_selected": bool(headroom_window.get("headroom_export_selected")),
                 "headroom_export_budget_wh": headroom_window.get("headroom_export_budget_wh"),
+                "headroom_required_wh": headroom_window.get("negative_headroom_required_wh"),
+                "headroom_free_before_wh": headroom_window.get("negative_headroom_free_before_wh"),
+                "headroom_additional_wh": headroom_window.get("negative_headroom_additional_wh"),
             },
         })
         return decision
@@ -1009,8 +1549,24 @@ def _build_policy_decision(config, annotated, windows, reserve, flags, economics
             economics or {},
             profile,
             reserve_policy["sellable_wh"],
+            capacity_wh,
+            annotated,
         )
         allowed, reason = _policy_export_allowed(profile, export_economics)
+        previous_window = _policy_export_previous_window_context(
+            previous_policy_decision,
+            export_window,
+            profile,
+            now_ms,
+        )
+        continuation_active = bool(
+            previous_window.get("matched")
+            and not allowed
+            and str(reason).startswith("Blocked by Duration:")
+        )
+        if continuation_active:
+            allowed = True
+            reason = "Profit export continuation: startup duration gate already satisfied"
         allowed = bool(
             allowed
             and mode in {"eco_plus", "arbitrage"}
@@ -1034,12 +1590,37 @@ def _build_policy_decision(config, annotated, windows, reserve, flags, economics
             },
             "block_reason": reason,
             "blocked": not allowed,
+            "continuation_active": continuation_active,
+            "window_origin_start_ts": int(
+                previous_window.get("origin_start_ts")
+                if previous_window.get("matched")
+                else safe_float(export_window.get("start_ts"), now_ms)
+            ),
+            "window_id": str(
+                previous_window.get("window_id")
+                or export_window.get("export_plateau_id")
+                or "export:%d" % int(safe_float(export_window.get("end_ts"), now_ms + SLOT_MS))
+            ),
             "economics": export_economics,
             "selected_window": {
+                "window_id": str(
+                    previous_window.get("window_id")
+                    or export_window.get("export_plateau_id")
+                    or "export:%d" % int(safe_float(export_window.get("end_ts"), now_ms + SLOT_MS))
+                ),
                 "action": export_window.get("action"),
                 "reason": export_window.get("reason"),
-                "start_ts": export_window.get("start_ts"),
+                "start_ts": int(
+                    previous_window.get("origin_start_ts")
+                    if previous_window.get("matched")
+                    else safe_float(export_window.get("start_ts"), now_ms)
+                ),
                 "end_ts": export_window.get("end_ts"),
+                "plateau_duration_min": export_window.get("export_plateau_duration_min"),
+                "plateau_preferred_min": export_window.get("export_plateau_preferred_min"),
+                "plateau_preferred_met": export_window.get("export_plateau_preferred_met"),
+                "plateau_tolerance_ct": export_window.get("export_plateau_tolerance_ct"),
+                "plateau_dispatch_power_w": export_window.get("plateau_dispatch_power_w"),
             },
         })
         return decision
@@ -1069,6 +1650,169 @@ def _build_policy_decision(config, annotated, windows, reserve, flags, economics
             "blocked": False,
         })
     return decision
+
+
+_POLICY_CANDIDATE_PRIORITY = (
+    "eco_plus_negative_headroom_hold",
+    "eco_plus_store_pv_candidate",
+    "eco_plus_export_candidate",
+    "arbitrage_export_candidate",
+    "arbitrage_grid_charge_candidate",
+    "eco_plus_house_supply",
+    "eco_house_supply",
+    "safe_house_supply",
+)
+
+
+def _policy_active_candidate_windows(windows, now_ms):
+    active = []
+    for window in windows or []:
+        if not isinstance(window, dict):
+            continue
+        start_ts = safe_float(window.get("start_ts"), 0.0)
+        end_ts = safe_float(window.get("end_ts"), start_ts + SLOT_MS)
+        if start_ts <= safe_float(now_ms, 0.0) < end_ts:
+            active.append(window)
+    priority = {action: index for index, action in enumerate(_POLICY_CANDIDATE_PRIORITY)}
+    return sorted(
+        active,
+        key=lambda item: (
+            priority.get(str(item.get("action") or ""), len(priority)),
+            safe_float(item.get("start_ts"), 0.0),
+            str(item.get("action") or ""),
+        ),
+    )
+
+
+def _enrich_policy_candidate_contract(decision, windows, now_ms):
+    """Stellt Kandidat-, Auswahl- und Ausführungsrollen ohne Prioritätsänderung bereit."""
+    result = dict(decision or {})
+    active_windows = _policy_active_candidate_windows(windows, now_ms)
+    candidate_actions = []
+    for window in active_windows:
+        action = str(window.get("action") or "")
+        if action and action not in candidate_actions:
+            candidate_actions.append(action)
+
+    selected = result.get("selected_window") if isinstance(result.get("selected_window"), dict) else None
+    selected_action = str((selected or {}).get("action") or "")
+    selected_end_ts = safe_int((selected or {}).get("end_ts"), 0)
+    selected_window_id = str(
+        (selected or {}).get("window_id")
+        or result.get("window_id")
+        or ""
+    )
+    execution_matches = []
+    for window in active_windows:
+        if str(window.get("action") or "") != selected_action:
+            continue
+        window_end_ts = safe_int(window.get("end_ts"), 0)
+        if selected_end_ts > 0 and window_end_ts != selected_end_ts:
+            continue
+        window_id = str(
+            window.get("export_plateau_id")
+            or window.get("window_id")
+            or ""
+        )
+        if selected_window_id and window_id and selected_window_id != window_id:
+            continue
+        execution_matches.append(window)
+
+    execution_window = None
+    if len(execution_matches) == 1:
+        plan_window = execution_matches[0]
+        execution_window = {
+            "contract_version": 1,
+            "action": selected_action,
+            "start_ts": safe_int(plan_window.get("start_ts"), 0),
+            "end_ts": safe_int(plan_window.get("end_ts"), 0),
+            "plan_window_start_ts": safe_int(plan_window.get("start_ts"), 0),
+            "plan_window_end_ts": safe_int(plan_window.get("end_ts"), 0),
+            "origin_start_ts": safe_int(
+                result.get("window_origin_start_ts"),
+                safe_int((selected or {}).get("start_ts"), 0),
+            ),
+            "window_id": selected_window_id or str(
+                plan_window.get("export_plateau_id")
+                or plan_window.get("window_id")
+                or ""
+            ),
+            "source": "active_plan_window",
+        }
+    result["execution_window"] = execution_window
+    result["execution_window_match_count"] = len(execution_matches)
+    result["candidate_actions"] = candidate_actions
+    result["selected_candidate"] = dict(selected) if selected else None
+    result["source_action"] = selected_action or None
+    result["suppressed_candidates"] = [
+        {
+            "action": action,
+            "reason": "superseded_by:%s" % selected_action if selected_action else "not_selected",
+        }
+        for action in candidate_actions
+        if action != selected_action
+    ]
+
+    target_state = str(result.get("dv_target_state") or "").strip().upper()
+    budget = result.get("storage_budget") if isinstance(result.get("storage_budget"), dict) else {}
+    execution_required = bool(
+        target_state in {"FORCE_EXPORT", "FORCE_CHARGE_PV", "HEADROOM_EXPORT"}
+        and result.get("commands_allowed")
+        and not result.get("blocked")
+        and selected_action
+    )
+    if execution_required and execution_window is None:
+        budget = dict(budget)
+        budget["charge_budget_w"] = 0
+        budget["export_budget_w"] = 0
+        result["storage_budget"] = budget
+        result["commands_allowed"] = False
+        result["blocked"] = True
+        result["execution_contract_block_reason"] = "policy_execution_window_missing_fail_closed"
+        previous_reason = str(result.get("block_reason") or "").strip()
+        result["block_reason"] = "; ".join(
+            part for part in (previous_reason, "policy_execution_window_missing_fail_closed") if part
+        )
+    executable = bool(result.get("commands_allowed") and not result.get("blocked") and selected_action)
+    if target_state == "FORCE_EXPORT":
+        executable = executable and safe_float(budget.get("export_budget_w"), 0.0) > 0.0
+    elif target_state == "FORCE_CHARGE_PV":
+        executable = executable and safe_float(budget.get("charge_budget_w"), 0.0) > 0.0
+    elif target_state != "HEADROOM_EXPORT":
+        executable = False
+    result["executable_action"] = selected_action if executable else None
+    return result
+
+
+def _build_policy_decision(
+    config,
+    annotated,
+    windows,
+    reserve,
+    flags,
+    economics,
+    mode,
+    now_ms,
+    current_soc,
+    capacity_wh,
+    blocked_reasons,
+    previous_policy_decision=None,
+):
+    decision = _build_policy_decision_legacy(
+        config,
+        annotated,
+        windows,
+        reserve,
+        flags,
+        economics,
+        mode,
+        now_ms,
+        current_soc,
+        capacity_wh,
+        blocked_reasons,
+        previous_policy_decision=previous_policy_decision,
+    )
+    return _enrich_policy_candidate_contract(decision, windows, now_ms)
 
 
 def _policy_target_soc_at(target_timeline, target_ts):
@@ -1211,19 +1955,32 @@ def _build_policy_timeline(
     blocked_reasons,
     target_timeline=None,
     forecast_timeline=None,
+    previous_policy_decision=None,
 ):
     timeline = []
     projection_points, projection_source = _policy_projection_points(forecast_timeline, target_timeline)
     policy_soc = _clamp(safe_float(current_soc, 0.0), 0.0, 100.0)
     cursor_ts = safe_float(now_ms, 0.0)
-    for window in sorted(windows or [], key=lambda item: safe_float(item.get("start_ts"), 0.0)):
-        if not isinstance(window, dict):
-            continue
-        start_ts = safe_float(window.get("start_ts"), 0.0)
-        end_ts = safe_float(window.get("end_ts"), start_ts + SLOT_MS)
-        if start_ts <= 0.0 or end_ts <= start_ts:
-            continue
-        if end_ts <= safe_float(now_ms, 0.0):
+    valid_windows = [
+        window for window in (windows or [])
+        if isinstance(window, dict)
+        and safe_float(window.get("start_ts"), 0.0) > 0.0
+        and safe_float(window.get("end_ts"), 0.0) > safe_float(window.get("start_ts"), 0.0)
+        and safe_float(window.get("end_ts"), 0.0) > safe_float(now_ms, 0.0)
+    ]
+    boundaries = sorted({
+        int(boundary)
+        for window in valid_windows
+        for boundary in (safe_float(window.get("start_ts"), 0.0), safe_float(window.get("end_ts"), 0.0))
+        if boundary > 0.0
+    })
+    for start_ts, end_ts in zip(boundaries, boundaries[1:]):
+        segment_windows = [
+            window for window in valid_windows
+            if safe_float(window.get("start_ts"), 0.0) < end_ts
+            and safe_float(window.get("end_ts"), 0.0) > start_ts
+        ]
+        if not segment_windows or end_ts <= safe_float(now_ms, 0.0):
             continue
         effective_start_ts = max(start_ts, safe_float(now_ms, 0.0), cursor_ts)
         if effective_start_ts > cursor_ts:
@@ -1237,7 +1994,7 @@ def _build_policy_timeline(
         segment_decision = _build_policy_decision(
             config,
             annotated,
-            windows,
+            segment_windows,
             reserve,
             flags,
             economics,
@@ -1246,8 +2003,29 @@ def _build_policy_timeline(
             projected_soc,
             capacity_wh,
             blocked_reasons,
+            previous_policy_decision=(
+                previous_policy_decision
+                if start_ts <= safe_float(now_ms, 0.0) < end_ts
+                else None
+            ),
         )
         segment_decision = dict(segment_decision or {})
+        execution_window = (
+            dict(segment_decision.get("execution_window"))
+            if isinstance(segment_decision.get("execution_window"), dict)
+            else None
+        )
+        if execution_window is not None:
+            execution_window["start_ts"] = int(max(
+                safe_float(execution_window.get("start_ts"), start_ts),
+                safe_float(start_ts, 0.0),
+            ))
+            execution_window["end_ts"] = int(min(
+                safe_float(execution_window.get("end_ts"), end_ts),
+                safe_float(end_ts, 0.0),
+            ))
+            if execution_window["end_ts"] <= execution_window["start_ts"]:
+                execution_window = None
         baseline_start_soc = _policy_target_soc_at(projection_points, effective_start_ts)
         baseline_end_soc = _policy_target_soc_at(projection_points, end_ts)
         baseline_delta_pct = (
@@ -1267,11 +2045,20 @@ def _build_policy_timeline(
         segment_decision.update({
             "start_ts": int(start_ts),
             "end_ts": int(end_ts),
-            "source_action": window.get("action"),
-            "source_reason": window.get("reason"),
+            "source_action": (
+                (segment_decision.get("selected_window") or {}).get("action")
+                if isinstance(segment_decision.get("selected_window"), dict)
+                else None
+            ),
+            "source_reason": (
+                (segment_decision.get("selected_window") or {}).get("reason")
+                if isinstance(segment_decision.get("selected_window"), dict)
+                else None
+            ),
             "projected_soc_pct": round(projected_soc, 1),
             "projected_soc_end_pct": round(projected_end_soc, 1),
             "projected_soc_source": projected_soc_source,
+            "execution_window": execution_window,
         })
         timeline.append(segment_decision)
         policy_soc = projected_end_soc
@@ -1284,7 +2071,7 @@ def _base_plan(mode, reason, now_ms, blocked_reasons=None, economics=None, reser
     plan_flags.setdefault("commands_allowed", False)
     plan_flags.setdefault("owner_contract_version", OWNER_CONTRACT_VERSION)
     plan_flags.setdefault("price_domain_policy", "negative_hard_eeg_soft_score_fallback")
-    plan_flags.setdefault("optimization_model", "rule_based_segment_budget_v2")
+    plan_flags.setdefault("optimization_model", "rolling_plateau_budget_v3")
     plan_flags.setdefault("profit_profile", "standard")
     policy_reason = reason
     if not cfg_bool(plan_flags.get("live_soc_valid"), True):
@@ -1301,12 +2088,23 @@ def _base_plan(mode, reason, now_ms, blocked_reasons=None, economics=None, reser
         "created_ts": int(now_ms),
         "valid_until_ts": int(now_ms + SLOT_MS),
         "windows": [],
+        "market_windows": [],
         "reserve": reserve or {},
         "economics": economics or {},
         "flags": plan_flags,
         "blocked_reasons": list(blocked_reasons or []),
         "policy_decision": policy_decision,
         "policy_timeline": [],
+        "future_pv_store_reservation": {
+            "schema": "direct_marketing_future_pv_store_reservation_v1",
+            "active": False,
+            "commands_allowed": False,
+            "reason": reason,
+            "data_quality": "blocked",
+            "next_window": None,
+            "valid_until_ts": None,
+            "max_curve_charge_w": None,
+        },
     }
 
 
@@ -1369,8 +2167,6 @@ def _economic_state(config, annotated):
     )
     min_margin_pct = max(0.0, safe_float(config.get("direct_marketing_min_margin_pct"), 10.0))
     min_profit_ct = max(0.0, safe_float(config.get("direct_marketing_min_profit_ct_per_kwh"), 0.0))
-    fixed_fee_ct = max(0.0, safe_float(config.get("direct_marketing_fee_ct_per_kwh"), 0.0))
-
     if not annotated:
         return {
             "roundtrip_efficiency_pct": round(efficiency_pct, 1),
@@ -1399,11 +2195,14 @@ def _economic_state(config, annotated):
 
     # Eco+ verschiebt PV-Ertrag: Kostenbasis ist der entgangene Billigpreis-
     # Verkauf, nicht der komplette Netzbezug wie bei echter Arbitrage.
-    # Die fixe Direktvermarktergebühr darf dabei nicht als positiver
-    # Opportunitätskosten-Abzug wirken, sonst würde eine höhere Gebühr den
-    # PV-Shift-Spread künstlich verbessern.
+    # Variable, mengenbezogene Vermarktungsentgelte mindern den tatsächlich
+    # entgangenen Verkaufserlös. Monatliche Fixkosten bleiben bewusst außerhalb
+    # dieser marginalen Slotentscheidung.
     pv_shift_revenue = best_high["net_sell_ct"] * efficiency
-    pv_shift_opportunity = best_low_market["net_sell_ct"] + fixed_fee_ct
+    pv_shift_opportunity = max(
+        best_low_market["net_sell_ct"],
+        safe_float(best_low_market.get("gross_sell_ct"), best_low_market["net_sell_ct"]),
+    )
     pv_shift_cost_basis = abs(pv_shift_opportunity) + degradation + safety_margin
     pv_shift_spread = pv_shift_revenue - pv_shift_opportunity - degradation - safety_margin
     pv_shift_margin = (pv_shift_spread / max(1.0, pv_shift_cost_basis)) * 100.0
@@ -1456,13 +2255,36 @@ def _new_slot_action(slot, action, reason, extra=None):
     }
     for key in (
         "pv_w",
+        "e3dc_pv_w",
+        "external_pv_w",
+        "has_e3dc_pv_forecast",
         "home_w",
         "wp_w",
         "heater_w",
         "wallbox_w",
         "forecast_surplus_w",
+        "forecast_dc_surplus_w",
         "forecast_deficit_w",
         "has_power_forecast",
+        "is_export_plateau",
+        "export_plateau_id",
+        "export_plateau_origin_start_ts",
+        "export_plateau_end_ts",
+        "export_plateau_duration_min",
+        "export_plateau_peak_net_sell_ct",
+        "export_plateau_tolerance_ct",
+        "export_plateau_preferred_min",
+        "export_plateau_preferred_met",
+        "gross_sell_ct",
+        "fee_basis",
+        "fee_basis_ct",
+        "fee_basis_valid",
+        "fee_pct",
+        "fixed_fee_net_ct",
+        "variable_fee_net_ct",
+        "fee_cost_ct",
+        "service_vat_pct",
+        "input_vat_recoverable",
     ):
         if key in slot:
             entry[key] = slot[key]
@@ -1674,6 +2496,202 @@ def _apply_pv_store_energy_budget(entries, reserve, capacity_wh, flags, efficien
     return filtered, changed
 
 
+def _build_future_pv_store_reservation(
+    config,
+    entries,
+    reserve,
+    annotated,
+    capacity_wh,
+    current_soc,
+    now_ms,
+    flags,
+    mode,
+    efficiency,
+):
+    """Reserviert physischen Headroom, ohne Hardware-Entscheider zu werden."""
+    result = {
+        "schema": "direct_marketing_future_pv_store_reservation_v1",
+        "active": False,
+        "commands_allowed": False,
+        "reason": "no_future_pv_store_window",
+        "data_quality": "not_evaluated",
+        "next_window": None,
+        "valid_until_ts": None,
+        "max_curve_charge_w": None,
+    }
+    if mode not in {"eco", "eco_plus"} or not cfg_bool(flags.get("pv_store_enable"), False):
+        result.update({"reason": "strategy_not_released", "data_quality": "ok"})
+        return result
+    if not cfg_bool(flags.get("commands_allowed"), False):
+        result.update({"reason": "commands_not_released", "data_quality": "ok"})
+        return result
+    if not cfg_bool(flags.get("live_soc_valid"), True) or safe_float(capacity_wh, 0.0) <= 0.0:
+        result.update({"reason": "live_storage_values_invalid", "data_quality": "invalid"})
+        return result
+
+    ordered = sorted(
+        (dict(item) for item in (entries or []) if isinstance(item, dict)),
+        key=lambda item: safe_float(item.get("start_ts"), 0.0),
+    )
+    current_store = next(
+        (
+            item for item in ordered
+            if item.get("action") == "eco_plus_store_pv_candidate"
+            and safe_float(item.get("start_ts"), 0.0) <= now_ms < safe_float(item.get("end_ts"), 0.0)
+        ),
+        None,
+    )
+    if current_store is not None:
+        result.update({"reason": "current_pv_store_window", "data_quality": "ok"})
+        return result
+
+    lookahead_min = max(
+        15.0,
+        safe_float(config.get("direct_marketing_future_pv_store_reservation_lookahead_min"), 360.0),
+    )
+    lookahead_end = now_ms + lookahead_min * 60_000.0
+    future_store = [
+        item for item in ordered
+        if item.get("action") == "eco_plus_store_pv_candidate"
+        and safe_float(item.get("start_ts"), 0.0) > now_ms
+        and safe_float(item.get("start_ts"), 0.0) <= lookahead_end
+    ]
+    if not future_store:
+        result.update({"data_quality": "ok"})
+        return result
+
+    first_start = safe_float(future_store[0].get("start_ts"), 0.0)
+    next_export_start = min(
+        (
+            safe_float(item.get("start_ts"), 0.0)
+            for item in ordered
+            if item.get("action") in {"eco_plus_export_candidate", "arbitrage_export_candidate"}
+            and safe_float(item.get("start_ts"), 0.0) > first_start
+        ),
+        default=lookahead_end + 1.0,
+    )
+    selected_store = [
+        item for item in future_store
+        if safe_float(item.get("start_ts"), 0.0) < next_export_start
+    ]
+    if not selected_store or any(not cfg_bool(item.get("has_power_forecast"), False) for item in selected_store):
+        result.update({
+            "reason": "future_forecast_incomplete",
+            "data_quality": "invalid",
+            "valid_until_ts": int(first_start) if first_start > 0 else None,
+        })
+        return result
+
+    safe_future_wh = sum(
+        _pv_store_entry_stored_wh(item, flags, efficiency)
+        for item in selected_store
+    )
+    if safe_future_wh <= 50.0:
+        result.update({
+            "reason": "future_window_energy_insufficient",
+            "data_quality": "ok",
+            "valid_until_ts": int(first_start),
+        })
+        return result
+
+    cap_wh = max(0.0, safe_float(capacity_wh, 0.0))
+    soc = _clamp(safe_float(current_soc, 0.0), 0.0, 100.0)
+    current_storage_wh = cap_wh * soc / 100.0
+    reserve_policy = _policy_reserve_state(config, reserve, annotated, now_ms, soc, cap_wh)
+    protected_wh = min(cap_wh, max(0.0, safe_float(reserve_policy.get("protected_energy_wh"), 0.0)))
+    house_need_to_window_wh, house_forecast_used = _forecast_deficit_wh(
+        annotated or [],
+        now_ms,
+        first_start,
+        enabled=True,
+    )
+    if not house_forecast_used:
+        result.update({
+            "reason": "future_forecast_incomplete",
+            "data_quality": "invalid",
+            "valid_until_ts": int(first_start),
+        })
+        return result
+
+    target_soc = max(
+        [safe_float(item.get("target_soc_pct"), 0.0) for item in selected_store]
+        + [safe_float(reserve.get("target_soc_pct"), 100.0)],
+    )
+    target_soc = _clamp(target_soc if target_soc > 0.0 else 100.0, 0.0, 100.0)
+    target_storage_wh = cap_wh * target_soc / 100.0
+    expected_storage_at_window_wh = max(0.0, current_storage_wh - house_need_to_window_wh)
+    target_need_wh = max(0.0, target_storage_wh - expected_storage_at_window_wh)
+    future_energy_insufficient = safe_future_wh + 50.0 < target_need_wh
+    required_headroom_wh = min(safe_future_wh, max(0.0, cap_wh - protected_wh))
+    headroom_cap_now_wh = min(
+        cap_wh,
+        max(protected_wh, cap_wh - required_headroom_wh + house_need_to_window_wh),
+    )
+    allowed_curve_charge_wh = max(0.0, headroom_cap_now_wh - current_storage_wh)
+    reserve_recovery_wh = max(0.0, protected_wh - current_storage_wh)
+    if reserve_recovery_wh > 0.0:
+        allowed_curve_charge_wh = max(allowed_curve_charge_wh, reserve_recovery_wh)
+
+    max_charge_w = max(0.0, safe_float(config.get("maximumladeleistung"), safe_float(flags.get("pv_store_max_w"), 0.0)))
+    seconds_to_window = max(1.0, (first_start - now_ms) / 1000.0)
+    if reserve_recovery_wh > 0.0:
+        max_curve_charge_w = max_charge_w
+        reason = "reserve_recovery"
+    elif allowed_curve_charge_wh <= 50.0:
+        max_curve_charge_w = 0.0
+        reason = "future_pv_store_headroom_reserved"
+    else:
+        proven_precharge_wh = allowed_curve_charge_wh
+        if future_energy_insufficient:
+            proven_precharge_wh = min(
+                allowed_curve_charge_wh,
+                max(0.0, target_need_wh - safe_future_wh),
+            )
+            reason = "future_window_energy_insufficient"
+        else:
+            reason = "house_need_until_future_window"
+        max_curve_charge_w = min(
+            max_charge_w,
+            max(0.0, proven_precharge_wh * 3600.0 / seconds_to_window),
+        )
+        if 0.0 < max_curve_charge_w < 300.0:
+            max_curve_charge_w = 0.0
+
+    last_end = max(safe_float(item.get("end_ts"), first_start) for item in selected_store)
+    result.update({
+        "active": True,
+        "commands_allowed": True,
+        "reason": reason,
+        "data_quality": "ok",
+        "next_window": {
+            "start_ts": int(first_start),
+            "end_ts": int(last_end),
+            "action": "eco_plus_store_pv_candidate",
+            "slot_count": len(selected_store),
+        },
+        "valid_until_ts": int(first_start),
+        "safe_future_pv_absorption_wh": round(safe_future_wh, 0),
+        "required_headroom_wh": round(required_headroom_wh, 0),
+        "protected_energy_wh": round(protected_wh, 0),
+        "protected_soc_pct": round((protected_wh / cap_wh) * 100.0 if cap_wh > 0 else 0.0, 2),
+        "current_storage_wh": round(current_storage_wh, 0),
+        "current_soc_pct": round(soc, 2),
+        "house_need_until_window_wh": round(house_need_to_window_wh, 0),
+        "target_storage_wh": round(target_storage_wh, 0),
+        "target_soc_pct": round(target_soc, 2),
+        "target_need_wh": round(target_need_wh, 0),
+        "future_energy_insufficient": bool(future_energy_insufficient),
+        "reserve_recovery_wh": round(reserve_recovery_wh, 0),
+        "max_storage_before_window_wh": round(headroom_cap_now_wh, 0),
+        "max_storage_before_window_soc_pct": round((headroom_cap_now_wh / cap_wh) * 100.0 if cap_wh > 0 else 0.0, 2),
+        "max_curve_charge_energy_wh": round(allowed_curve_charge_wh, 0),
+        "max_curve_charge_w": int(round(max_curve_charge_w)),
+        "no_grid_charge": True,
+        "consumer_budgets_untouched": True,
+    })
+    return result
+
+
 def _negative_headroom_slot_wh(entry, flags):
     duration_h = _entry_duration_h(entry)
     if duration_h <= 0.0:
@@ -1683,7 +2701,8 @@ def _negative_headroom_slot_wh(entry, flags):
         safe_float(entry.get("max_power_w"), safe_float(flags.get("pv_store_max_w"), 0.0)),
     )
     if entry.get("has_power_forecast"):
-        forecast_surplus_w = max(0.0, safe_float(entry.get("forecast_surplus_w"), 0.0))
+        surplus_key = "forecast_dc_surplus_w" if cfg_bool(flags.get("pv_store_dc_only_enable"), False) else "forecast_surplus_w"
+        forecast_surplus_w = max(0.0, safe_float(entry.get(surplus_key), 0.0))
         max_power_w = min(max_power_w, forecast_surplus_w) if max_power_w > 0.0 else forecast_surplus_w
     return max(0.0, max_power_w * duration_h)
 
@@ -1783,8 +2802,15 @@ def _apply_negative_headroom_holds(entries, annotated, reserve, capacity_wh, fla
                 continue
         negative_limited = group_kind == "negative_price"
         required_headroom_pct = 0.0
+        required_headroom_wh = 0.0
+        free_headroom_before_wh = max(
+            0.0,
+            (100.0 - _clamp(safe_float(reserve.get("current_soc_pct"), 0.0), 0.0, 100.0)) / 100.0 * cap_wh,
+        )
         if cap_wh > 0.0:
-            required_headroom_pct = _clamp((surplus_wh / cap_wh) * 100.0 + buffer_pct, 0.0, 100.0)
+            required_headroom_wh = min(cap_wh, surplus_wh + (buffer_pct / 100.0) * cap_wh)
+            required_headroom_pct = _clamp((required_headroom_wh / cap_wh) * 100.0, 0.0, 100.0)
+        additional_headroom_wh = max(0.0, required_headroom_wh - free_headroom_before_wh)
         headroom_ceiling = soc_ceiling
         if required_headroom_pct > 0.0:
             headroom_ceiling = min(headroom_ceiling, 100.0 - required_headroom_pct)
@@ -1803,6 +2829,9 @@ def _apply_negative_headroom_holds(entries, annotated, reserve, capacity_wh, fla
                 1,
             ),
             "negative_headroom_forecast_surplus_wh": round(surplus_wh, 0),
+            "negative_headroom_required_wh": round(required_headroom_wh, 0),
+            "negative_headroom_free_before_wh": round(free_headroom_before_wh, 0),
+            "negative_headroom_additional_wh": round(additional_headroom_wh, 0),
             "negative_headroom_required_pct": round(required_headroom_pct, 1),
             "negative_headroom_lookahead_min": round(lookahead_ms / 60000.0, 1),
             "storage_action": "charge_block_auto_limit",
@@ -1874,6 +2903,43 @@ def _apply_negative_headroom_holds(entries, annotated, reserve, capacity_wh, fla
     return sorted_entries, changed
 
 
+def _uniform_plateau_allocation(candidates, budget_wh):
+    """Verteilt ein Plateaubudget mit der kleinstmöglichen konstanten Leistung."""
+
+    allocations = {}
+    active = [dict(candidate) for candidate in candidates if candidate.get("duration_h", 0.0) > 0.0]
+    remaining_wh = min(
+        max(0.0, safe_float(budget_wh, 0.0)),
+        sum(max(0.0, safe_float(item.get("energy_wh"), 0.0)) for item in active),
+    )
+    while active and remaining_wh > 0.01:
+        total_h = sum(max(0.0, safe_float(item.get("duration_h"), 0.0)) for item in active)
+        if total_h <= 0.0:
+            break
+        target_w = remaining_wh / total_h
+        constrained = [
+            item for item in active
+            if safe_float(item.get("max_power_w"), 0.0) + 0.000001 < target_w
+        ]
+        if not constrained:
+            for item in active:
+                duration_h = safe_float(item.get("duration_h"), 0.0)
+                take_wh = min(
+                    safe_float(item.get("energy_wh"), 0.0),
+                    target_w * duration_h,
+                )
+                allocations[item["idx"]] = max(0.0, take_wh)
+            remaining_wh = 0.0
+            break
+        constrained_ids = {item["idx"] for item in constrained}
+        for item in constrained:
+            take_wh = max(0.0, safe_float(item.get("energy_wh"), 0.0))
+            allocations[item["idx"]] = take_wh
+            remaining_wh = max(0.0, remaining_wh - take_wh)
+        active = [item for item in active if item["idx"] not in constrained_ids]
+    return allocations
+
+
 def _prioritize_export_entries(entries, reserve, capacity_wh, flags, efficiency, annotated=None):
     export_actions = {"eco_plus_export_candidate", "arbitrage_export_candidate"}
     recharge_actions = {"eco_plus_store_pv_candidate", "arbitrage_grid_charge_candidate"}
@@ -1885,8 +2951,13 @@ def _prioritize_export_entries(entries, reserve, capacity_wh, flags, efficiency,
         available_wh,
         max(0.0, ((100.0 - safe_float(reserve.get("effective_min_soc_pct"), 0.0)) / 100.0) * max(0.0, safe_float(capacity_wh, 0.0))),
     )
-    max_cycle_wh = max(0.0, safe_float(flags.get("max_cycles_per_day"), 1.0)) * max(0.0, safe_float(capacity_wh, 0.0))
-    global_remaining_wh = max_cycle_wh if max_cycle_wh > 0.0 else None
+    cap_wh = max(0.0, safe_float(capacity_wh, 0.0))
+    max_cycle_wh = max(0.0, safe_float(flags.get("max_cycles_per_day"), 1.0)) * cap_wh
+    configured_daily_wh = max(0.0, safe_float(flags.get("max_daily_export_kwh"), 0.0)) * 1000.0
+    daily_limit_candidates = [value for value in (max_cycle_wh, configured_daily_wh) if value > 0.0]
+    daily_limit_wh = min(daily_limit_candidates) if daily_limit_candidates else 0.0
+    daily_used_wh = max(0.0, safe_float(flags.get("daily_export_used_wh"), 0.0))
+    global_remaining_wh = max(0.0, daily_limit_wh - daily_used_wh) if daily_limit_wh > 0.0 else None
     load_reserve_enabled = cfg_bool(flags.get("export_segment_load_reserve_enable"), True)
     ordered_indices = sorted(range(len(entries)), key=lambda idx: safe_float(entries[idx].get("start_ts"), 0.0))
     adjusted = [dict(entry) for entry in entries]
@@ -1930,20 +3001,34 @@ def _prioritize_export_entries(entries, reserve, capacity_wh, flags, efficiency,
                 "idx": idx,
                 "energy_wh": energy_wh,
                 "max_power_w": max_power_w,
+                "duration_h": duration_h,
                 "net_sell_ct": safe_float(entry.get("net_sell_ct"), safe_float(entry.get("market_ct"), 0.0)),
                 "start_ts": safe_float(entry.get("start_ts"), 0.0),
+                "plateau_id": str(entry.get("export_plateau_id") or "slot:%d" % idx),
             })
 
         selected = {}
         remaining_wh = export_budget_wh
-        for candidate in sorted(candidates, key=lambda item: (item["net_sell_ct"], item["start_ts"]), reverse=True):
+        plateau_groups = {}
+        for candidate in candidates:
+            plateau_groups.setdefault(candidate["plateau_id"], []).append(candidate)
+        ordered_plateaus = sorted(
+            plateau_groups.values(),
+            key=lambda group: (
+                sum(item["net_sell_ct"] * item["duration_h"] for item in group)
+                / max(0.001, sum(item["duration_h"] for item in group)),
+                max(item["start_ts"] for item in group),
+            ),
+            reverse=True,
+        )
+        for plateau in ordered_plateaus:
             if remaining_wh <= 50.0:
                 break
-            take_wh = min(candidate["energy_wh"], remaining_wh)
-            if take_wh <= 50.0:
-                continue
-            selected[candidate["idx"]] = take_wh
-            remaining_wh -= take_wh
+            plateau_capacity_wh = sum(item["energy_wh"] for item in plateau)
+            plateau_budget_wh = min(plateau_capacity_wh, remaining_wh)
+            plateau_selected = _uniform_plateau_allocation(plateau, plateau_budget_wh)
+            selected.update(plateau_selected)
+            remaining_wh = max(0.0, remaining_wh - sum(plateau_selected.values()))
 
         selected_wh = sum(selected.values())
         if global_remaining_wh is not None:
@@ -1961,6 +3046,12 @@ def _prioritize_export_entries(entries, reserve, capacity_wh, flags, efficiency,
             "export_segment_load_reserve_wh": round(load_reserve_wh, 0),
             "export_segment_load_forecast_used": bool(used_load_forecast),
             "export_segment_selected_wh": round(selected_wh, 0),
+            "daily_export_limit_wh": round(daily_limit_wh, 0),
+            "daily_export_used_wh": round(daily_used_wh, 0),
+            "daily_export_remaining_wh": round(
+                max(0.0, (global_remaining_wh if global_remaining_wh is not None else export_capacity_wh)),
+                0,
+            ),
         }
         if next_recharge_ts is not None:
             segment_meta["export_segment_next_recharge_ts"] = next_recharge_ts
@@ -1987,6 +3078,8 @@ def _prioritize_export_entries(entries, reserve, capacity_wh, flags, efficiency,
             next_entry = dict(entry)
             next_entry.update(segment_meta)
             next_entry["max_power_w"] = int(round(min(original_w, chosen_wh / duration_h)))
+            next_entry["plateau_dispatch_power_w"] = next_entry["max_power_w"]
+            next_entry["plateau_dispatch_uniform"] = True
             if chosen_wh + 1.0 < original_w * duration_h:
                 next_entry["energy_limited"] = True
                 segment_limited += 1
@@ -2044,6 +3137,10 @@ def _group_windows(entries):
             and current.get("negative_headroom_required_pct") == entry.get("negative_headroom_required_pct")
             and current.get("pv_store_headroom_next_reason") == entry.get("pv_store_headroom_next_reason")
             and current.get("export_segment_id") == entry.get("export_segment_id")
+            and (
+                current.get("action") not in {"eco_plus_export_candidate", "arbitrage_export_candidate"}
+                or current.get("export_plateau_id") == entry.get("export_plateau_id")
+            )
         )
         if not mergeable:
             item = {
@@ -2059,6 +3156,14 @@ def _group_windows(entries):
                 "_score": [entry["score"]],
                 "_net_sell": [(
                     safe_float(entry.get("net_sell_ct"), safe_float(entry.get("market_ct"), 0.0)),
+                    max(0.0, _entry_duration_h(entry)),
+                )],
+                "_gross_sell": [(
+                    safe_float(entry.get("gross_sell_ct"), safe_float(entry.get("market_ct"), 0.0)),
+                    max(0.0, _entry_duration_h(entry)),
+                )],
+                "_fee_cost": [(
+                    max(0.0, safe_float(entry.get("fee_cost_ct"), 0.0)),
                     max(0.0, _entry_duration_h(entry)),
                 )],
             }
@@ -2078,6 +3183,16 @@ def _group_windows(entries):
                 "net_sell_ct",
                 "market_price_source",
                 "market_price_resolution_min",
+                "gross_sell_ct",
+                "fee_basis",
+                "fee_basis_ct",
+                "fee_basis_valid",
+                "fee_pct",
+                "fixed_fee_net_ct",
+                "variable_fee_net_ct",
+                "fee_cost_ct",
+                "service_vat_pct",
+                "input_vat_recoverable",
                 "energy_limited",
                 "pv_store_budget_limited",
                 "pv_store_budget_need_wh",
@@ -2102,6 +3217,9 @@ def _group_windows(entries):
                 "negative_headroom_next_end_ts",
                 "negative_headroom_window_min",
                 "negative_headroom_forecast_surplus_wh",
+                "negative_headroom_required_wh",
+                "negative_headroom_free_before_wh",
+                "negative_headroom_additional_wh",
                 "negative_headroom_required_pct",
                 "negative_headroom_lookahead_min",
                 "pv_store_headroom_limited",
@@ -2123,6 +3241,28 @@ def _group_windows(entries):
                 "export_segment_selected_wh",
                 "export_segment_next_recharge_ts",
                 "export_segment_next_recharge_action",
+                "export_plateau_id",
+                "export_plateau_origin_start_ts",
+                "export_plateau_end_ts",
+                "export_plateau_duration_min",
+                "export_plateau_peak_net_sell_ct",
+                "export_plateau_tolerance_ct",
+                "export_plateau_preferred_min",
+                "export_plateau_preferred_met",
+                "plateau_dispatch_power_w",
+                "plateau_dispatch_uniform",
+                "daily_export_limit_wh",
+                "daily_export_used_wh",
+                "daily_export_remaining_wh",
+                "market_window_id",
+                "market_window_start_ts",
+                "market_window_end_ts",
+                "market_window_margin_class",
+                "market_margin_class",
+                "marginal_net_sell_ct",
+                "marginal_settlement_valid",
+                "marginal_export_class",
+                "actuator_closure",
             ):
                 if key in entry:
                     item[key] = entry[key]
@@ -2141,12 +3281,22 @@ def _group_windows(entries):
             safe_float(entry.get("net_sell_ct"), safe_float(entry.get("market_ct"), 0.0)),
             max(0.0, _entry_duration_h(entry)),
         ))
+        current["_gross_sell"].append((
+            safe_float(entry.get("gross_sell_ct"), safe_float(entry.get("market_ct"), 0.0)),
+            max(0.0, _entry_duration_h(entry)),
+        ))
+        current["_fee_cost"].append((
+            max(0.0, safe_float(entry.get("fee_cost_ct"), 0.0)),
+            max(0.0, _entry_duration_h(entry)),
+        ))
 
     for item in windows:
         market = item.pop("_market")
         billing = item.pop("_billing")
         score = item.pop("_score")
         net_sell = item.pop("_net_sell")
+        gross_sell = item.pop("_gross_sell")
+        fee_cost = item.pop("_fee_cost")
         net_sell_duration_h = sum(duration_h for _value, duration_h in net_sell)
         avg_net_sell_ct = (
             sum(value * duration_h for value, duration_h in net_sell) / net_sell_duration_h
@@ -2160,6 +3310,16 @@ def _group_windows(entries):
         item["avg_score"] = round(sum(score) / max(1, len(score)), 1)
         item["net_sell_ct"] = round(avg_net_sell_ct, 3)
         item["avg_net_sell_ct"] = round(avg_net_sell_ct, 3)
+        item["gross_sell_ct"] = round(
+            sum(value * duration_h for value, duration_h in gross_sell) / max(0.000001, sum(duration_h for _value, duration_h in gross_sell)),
+            3,
+        )
+        item["avg_gross_sell_ct"] = item["gross_sell_ct"]
+        item["fee_cost_ct"] = round(
+            sum(value * duration_h for value, duration_h in fee_cost) / max(0.000001, sum(duration_h for _value, duration_h in fee_cost)),
+            3,
+        )
+        item["avg_fee_cost_ct"] = item["fee_cost_ct"]
         item["min_net_sell_ct"] = round(min(value for value, _duration_h in net_sell), 3)
         item["max_net_sell_ct"] = round(max(value for value, _duration_h in net_sell), 3)
         item["theoretical_kwh"] = round(
@@ -2179,6 +3339,8 @@ def build_direct_marketing_shadow_plan(
     target_soc=None,
     now_ms=None,
     target_timeline=None,
+    previous_policy_decision=None,
+    previous_market_windows=None,
 ):
     """Return a side-effect-free owner contract for Safe, Eco, Eco+ and Arbitrage.
 
@@ -2197,9 +3359,12 @@ def build_direct_marketing_shadow_plan(
     flags = {
         "export_enable": cfg_bool(config.get("direct_marketing_export_enable"), False),
         "grid_charge_enable": cfg_bool(config.get("direct_marketing_grid_charge_enable"), False),
-        "arbitrage_enable": cfg_bool(
-            config.get("direct_marketing_arbitrage_enable"), False
+        "arbitrage_requested": bool(
+            cfg_bool(config.get("direct_marketing_arbitrage_enable"), False)
+            or cfg_bool(config.get("direct_marketing_arbitrage_experimental_enable"), False)
+            or mode == "arbitrage"
         ),
+        "arbitrage_release_allowed": False,
         "pv_store_enable": cfg_bool(config.get("direct_marketing_pv_store_enable"), True),
         "pv_store_threshold_ct": pv_store_threshold.get("value"),
         "pv_store_threshold_source": pv_store_threshold.get("source"),
@@ -2213,6 +3378,7 @@ def build_direct_marketing_shadow_plan(
         "pv_store_external_ac_guard_w": max(0.0, safe_float(config.get("direct_marketing_pv_store_external_ac_guard_w"), 100.0)),
         "pv_store_export_limit_guard_w": max(0.0, safe_float(config.get("direct_marketing_pv_store_export_limit_guard_w"), 100.0)),
         "pv_store_export_limit_ramp_bypass_w": max(0.0, safe_float(config.get("direct_marketing_pv_store_export_limit_ramp_bypass_w"), 300.0)),
+        "v2x_discharge_enable": cfg_bool(config.get("direct_marketing_v2x_discharge_enable"), False),
         "negative_price_no_export": cfg_bool(config.get("direct_marketing_negative_price_no_export"), True),
         "negative_headroom_enable": cfg_bool(config.get("direct_marketing_negative_headroom_enable"), True),
         "negative_headroom_lookahead_min": max(0.0, safe_float(config.get("direct_marketing_negative_headroom_lookahead_min"), 240.0)),
@@ -2233,6 +3399,23 @@ def build_direct_marketing_shadow_plan(
         "max_export_w": max(0.0, safe_float(config.get("direct_marketing_max_export_w"), 0.0)),
         "max_grid_charge_w": max(0.0, safe_float(config.get("direct_marketing_max_grid_charge_w"), 0.0)),
         "max_cycles_per_day": max(0.0, safe_float(config.get("direct_marketing_max_cycles_per_day"), 1.0)),
+        "max_daily_export_kwh": max(
+            0.0,
+            safe_float(config.get("direct_marketing_max_daily_export_kwh"), 0.0),
+        ),
+        "daily_export_used_wh": max(
+            0.0,
+            safe_float(config.get("_runtime_direct_marketing_daily_export_used_wh"), 0.0),
+        ),
+        "preferred_export_plateau_min": max(
+            15.0,
+            safe_float(config.get("direct_marketing_preferred_export_plateau_min"), 60.0),
+        ),
+        "price_plateau_tolerance_ct": _clamp(
+            safe_float(config.get("direct_marketing_price_plateau_tolerance_ct"), 0.75),
+            0.0,
+            20.0,
+        ),
         "export_segment_load_reserve_enable": cfg_bool(
             config.get("direct_marketing_export_segment_load_reserve_enable"),
             True,
@@ -2241,8 +3424,11 @@ def build_direct_marketing_shadow_plan(
     flags["commands_allowed"] = False
     flags["owner_contract_version"] = OWNER_CONTRACT_VERSION
     flags["price_domain_policy"] = "negative_hard_eeg_soft_score_fallback"
-    flags["optimization_model"] = "rule_based_segment_budget_v2"
+    flags["optimization_model"] = "rolling_plateau_budget_v3"
     flags["profit_profile"] = _normalize_profit_profile(config.get("direct_marketing_profit_profile", "standard"))
+    settlement_accounting = _settlement_accounting(config)
+    flags["settlement_fee_basis"] = settlement_accounting["variable_fee"]["basis"]
+    flags["settlement_fee_basis_valid"] = settlement_accounting["variable_fee"]["basis_valid"]
 
     flags["live_soc_valid"] = _valid_soc_input(current_soc)
     current_soc = safe_float(current_soc, 0.0) if flags["live_soc_valid"] else 0.0
@@ -2306,7 +3492,8 @@ def build_direct_marketing_shadow_plan(
         market_ct = _market_ct(slot)
         billing_ct = _billing_ct(slot, market_ct)
         score = _price_score(slot, min_market_ct, max_market_ct)
-        net_sell_ct = _net_sell_ct(market_ct, config)
+        sell_components = _net_sell_components(market_ct, config)
+        net_sell_ct = sell_components["net_sell_ct"]
         is_negative = market_ct < 0.0
         is_score_low = score >= profile["low_score_min"]
         is_threshold_low = bool(threshold_ct is not None and net_sell_ct <= safe_float(threshold_ct, 0.0))
@@ -2330,17 +3517,27 @@ def build_direct_marketing_shadow_plan(
             "is_pv_store": is_negative or is_threshold_low or is_score_pv_store,
             "is_high": score <= profile["high_score_max"],
             "net_sell_ct": net_sell_ct,
+            **{key: value for key, value in sell_components.items() if key != "net_sell_ct"},
             **forecast_power,
         })
 
+    annotated = _annotate_export_price_plateaus(annotated, config)
+    market_windows = _build_negative_price_market_windows(
+        annotated,
+        previous_market_windows=previous_market_windows,
+    )
     economics = _economic_state(config, annotated)
     blocked_reasons = list(current_price_quality_blockers)
+    if (
+        settlement_accounting["variable_fee"]["percent"] > 0.0
+        and not settlement_accounting["variable_fee"]["basis_valid"]
+    ):
+        blocked_reasons.append("settlement_fee_basis_missing")
     if not flags["live_soc_valid"]:
         blocked_reasons.append("live_values_missing:current_soc")
 
     if mode == "arbitrage":
-        if not flags["arbitrage_enable"]:
-            blocked_reasons.append("arbitrage_disabled")
+        blocked_reasons.append("arbitrage_not_released")
         if not flags["export_enable"] or flags["max_export_w"] <= 0.0:
             blocked_reasons.append("export_not_enabled")
         if not flags["grid_charge_enable"] or flags["max_grid_charge_w"] <= 0.0:
@@ -2410,6 +3607,8 @@ def build_direct_marketing_shadow_plan(
                 )
                 if not flags["pv_store_enable"] or not slot.get("is_pv_store") or not pv_store_profit_ok:
                     continue
+                # PV_STORE verwendet das höchste aktuell erlaubte Planungsziel.
+                # Das rohe Marktfenster bleibt von dieser Aktion unabhängig.
                 target_soc = max(target_soc_limit, negative_charge_target) if slot["is_negative"] else target_soc_limit
                 if soft_threshold:
                     target_soc = min(target_soc, soc_ceiling)
@@ -2439,6 +3638,11 @@ def build_direct_marketing_shadow_plan(
                     "pv_store_export_limit_ramp_bypass_w": int(flags["pv_store_export_limit_ramp_bypass_w"]),
                     "pv_store_threshold_source": flags.get("pv_store_threshold_source"),
                     "expected_profit_ct_per_kwh": economics.get("pv_shift_spread_ct_per_kwh"),
+                    "market_window_id": slot.get("market_window_id"),
+                    "market_window_start_ts": slot.get("market_window_start_ts"),
+                    "market_window_end_ts": slot.get("market_window_end_ts"),
+                    "market_window_margin_class": slot.get("market_window_margin_class"),
+                    "market_margin_class": slot.get("market_margin_class"),
                 }
                 if max_power_w > 0:
                     extra["max_power_w"] = max_power_w
@@ -2457,7 +3661,7 @@ def build_direct_marketing_shadow_plan(
                 }
                 entries.append(_new_slot_action(slot, "keep_headroom", low_reason, extra))
 
-        if not slot["is_high"]:
+        if not slot.get("is_export_plateau", slot["is_high"]):
             continue
         if reserve.get("available_export_soc_pct", 0.0) <= 1.0:
             continue
@@ -2558,6 +3762,18 @@ def build_direct_marketing_shadow_plan(
     if prioritized_limited > 0:
         blocked_reasons.append("export_energy_prioritized")
 
+    future_pv_store_reservation = _build_future_pv_store_reservation(
+        config,
+        entries,
+        reserve,
+        annotated,
+        capacity_wh,
+        current_soc,
+        now_ms,
+        flags,
+        mode,
+        efficiency,
+    )
     windows = _group_windows(entries)
     if not windows and not blocked_reasons:
         blocked_reasons.append("no_candidate_windows")
@@ -2582,22 +3798,11 @@ def build_direct_marketing_shadow_plan(
         and "eco_plus_negative_headroom_hold" in active_actions
     )
     eco_commands = bool(eco_pv_store_commands or eco_plus_export_commands or eco_negative_headroom_commands)
-    arbitrage_commands = bool(
-        mode == "arbitrage"
-        and flags["arbitrage_enable"]
-        and flags["export_enable"]
-        and flags["max_export_w"] > 0.0
-        and flags["grid_charge_enable"]
-        and flags["max_grid_charge_w"] > 0.0
-        and (not flags["eeg_enable"] or flags["eeg_grid_export_risk_ack"])
-        and economics.get("grid_profit_ok")
-        and active_actions.intersection({
-            "arbitrage_grid_charge_candidate",
-            "arbitrage_export_candidate",
-        })
-    )
+    arbitrage_commands = False
     flags["commands_allowed"] = bool(eco_commands or arbitrage_commands)
     if not flags["live_soc_valid"]:
+        flags["commands_allowed"] = False
+    if not flags.get("settlement_fee_basis_valid", True):
         flags["commands_allowed"] = False
 
     valid_until_ts = min((w["end_ts"] for w in windows), default=now_ms + SLOT_MS)
@@ -2615,6 +3820,7 @@ def build_direct_marketing_shadow_plan(
         blocked_reasons,
         target_timeline=target_timeline,
         forecast_timeline=raw_slots,
+        previous_policy_decision=previous_policy_decision,
     )
     policy_decision = next(
         (
@@ -2636,7 +3842,34 @@ def build_direct_marketing_shadow_plan(
             current_soc,
             capacity_wh,
             blocked_reasons,
+            previous_policy_decision=previous_policy_decision,
         )
+
+    planned_export_wh = sum(
+        max(0.0, safe_float(window.get("max_power_w"), 0.0)) * _entry_duration_h(window)
+        for window in windows
+        if window.get("action") in {"eco_plus_export_candidate", "arbitrage_export_candidate"}
+    )
+    cap_wh = max(0.0, safe_float(capacity_wh, 0.0))
+    cycle_limit_wh = max(0.0, safe_float(flags.get("max_cycles_per_day"), 0.0)) * cap_wh
+    configured_daily_wh = max(0.0, safe_float(flags.get("max_daily_export_kwh"), 0.0)) * 1000.0
+    daily_limits = [value for value in (cycle_limit_wh, configured_daily_wh) if value > 0.0]
+    effective_daily_limit_wh = min(daily_limits) if daily_limits else 0.0
+    daily_used_wh = max(0.0, safe_float(flags.get("daily_export_used_wh"), 0.0))
+    battery_wear_budget = {
+        "planned_export_wh": round(planned_export_wh, 0),
+        "planned_equivalent_full_cycles": round(planned_export_wh / cap_wh, 4) if cap_wh > 0.0 else 0.0,
+        "daily_export_limit_wh": round(effective_daily_limit_wh, 0),
+        "daily_export_used_wh": round(daily_used_wh, 0),
+        "daily_export_remaining_wh": round(
+            max(0.0, effective_daily_limit_wh - daily_used_wh)
+            if effective_daily_limit_wh > 0.0
+            else 0.0,
+            0,
+        ),
+        "lcos_model": "base_plus_depth",
+        "temperature_guard": "not_available" if not cfg_bool(config.get("_runtime_direct_marketing_battery_temperature_valid"), False) else "runtime_input",
+    }
 
     return {
         "active": bool(windows),
@@ -2649,8 +3882,11 @@ def build_direct_marketing_shadow_plan(
         "created_ts": int(now_ms),
         "valid_until_ts": int(valid_until_ts),
         "windows": windows,
+        "market_windows": market_windows,
         "reserve": reserve,
         "economics": economics,
+        "settlement_accounting": settlement_accounting,
+        "battery_wear_budget": battery_wear_budget,
         "flags": flags,
         "blocked_reasons": sorted(set(blocked_reasons)),
         "price_quality": {
@@ -2663,4 +3899,5 @@ def build_direct_marketing_shadow_plan(
         },
         "policy_decision": policy_decision,
         "policy_timeline": policy_timeline,
+        "future_pv_store_reservation": future_pv_store_reservation,
     }

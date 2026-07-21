@@ -16,16 +16,16 @@ WIZARD_KEYS = [
     # === PFLICHT: Ohne diese Keys startet gar nichts ===
     ('server_ip',      'E3DC IP-Adresse',              ''),
     ('server_port',    'RSCP-Port',                    '5033'),
-    ('e3dc_user',      'E3DC Portal Benutzername',     'local.user'),
+    ('e3dc_user',      'E3DC Portal Benutzername',     ''),
     ('e3dc_password',  'E3DC Portal Passwort',         ''),
     ('aes_password',   'RSCP AES-Passwort (am Geraet vergeben)', ''),
     ('wurzelzaehler',  'Legacy-PM-Index fuer Phasendiagnose (0=auto)', '0'),
     ('wurzelzaehler_invertiert', 'Legacy-PM-Phasen invertiert (0/1)', '0'),
 
     # === PFLICHT: Standort fuer PV-Prognose ===
-    ('hoehe',          'Breitengrad (Latitude, z.B. 51.163)', '51.163375'),
-    ('laenge',         'Laengengrad (Longitude, z.B. 10.448)', '10.447683'),
-    ('forecast1',      'PV-Anlage: Neigung/Azimuth/kWp (z.B. 35/0/10.0)', '35/0/10.0'),
+    ('hoehe',          'Breitengrad (Latitude, z.B. 48.604)', '48.60442'),
+    ('laenge',         'Laengengrad (Longitude, z.B. 13.415)', '13.41513'),
+    ('forecast1',      'PV-Anlage: Neigung/Azimuth/kWp (z.B. 40/-50/15.4)', '40/-50/15.4'),
     ('speichergroesse','Speichergroesse in kWh (Fallback)',   '15'),
     ('ems_budget_runtime_enable', 'EMS-Budget-Runtime (0=Shadow, 1=zentraler Budget-Executor)', '0'),
 
@@ -37,9 +37,21 @@ WIZARD_KEYS = [
     # === OPTIONAL: Direktvermarktung Central Policy ===
     ('direct_marketing_settlement_basis', 'DV-Abrechnungsbasis (aktive Regelung: day_ahead_15min)', 'day_ahead_15min'),
     ('direct_marketing_profit_profile', 'DV-Profitprofil (standard/aggressive/expert)', 'standard'),
-    ('direct_marketing_min_window_profit_eur', 'DV-Mindestgewinn je Verkaufsfenster in EUR', '0.10'),
-    ('direct_marketing_min_export_energy_kwh', 'DV-Mindestenergie je Verkaufsfenster in kWh', '1.0'),
-    ('direct_marketing_min_export_window_min', 'DV-Mindestdauer je Verkaufsfenster in Minuten', '60'),
+    ('direct_marketing_min_window_profit_eur', 'DV-Mindestgewinn je Verkaufsfenster in EUR', '0.25'),
+    ('direct_marketing_min_export_energy_kwh', 'DV-Mindestenergie je Verkaufsfenster in kWh', '1.5'),
+    ('direct_marketing_min_export_window_min', 'DV-Technisches Mindestfenster in Minuten', '15'),
+    ('direct_marketing_preferred_export_plateau_min', 'DV-Bevorzugte Plateau-Dauer in Minuten', '60'),
+    ('direct_marketing_price_plateau_tolerance_ct', 'DV-Preisplateau-Toleranz in ct/kWh', '0.75'),
+    ('direct_marketing_max_daily_export_kwh', 'DV-Maximaler Batterieexport pro Tag in kWh (0=Zyklenlimit)', '0'),
+    ('direct_marketing_deep_cycle_threshold_pct', 'DV-Tiefzyklus-Schwelle in Prozentpunkten', '20'),
+    ('direct_marketing_deep_cycle_lcos_factor', 'DV-Tiefzyklus-LCOS-Faktor', '0.5'),
+    ('direct_marketing_variable_fee_basis', 'DV-Basis der variablen Gebuehr (sell_revenue/eeg_compensation/manual)', 'sell_revenue'),
+    ('direct_marketing_variable_fee_basis_ct_per_kwh', 'DV-Manuelle Gebuehrenbasis in ct/kWh', '0'),
+    ('direct_marketing_service_vat_pct', 'DV-Umsatzsteuer auf Dienstleistungskosten in Prozent', '19'),
+    ('direct_marketing_input_vat_recoverable', 'DV-Vorsteuer abziehbar (0/1)', '0'),
+    ('direct_marketing_installed_kwp', 'DV-Abrechnungsleistung in kWp (0=PV-Prognose)', '0'),
+    ('direct_marketing_balancing_cost_eur_per_kwp_month', 'DV-Ausgleichskosten-Abschlag in EUR/kWp/Monat', '0'),
+    ('direct_marketing_balancing_cost_actual_eur_per_kwp_month', 'DV-Tatsaechliche Ausgleichskosten in EUR/kWp/Monat (leer=unbekannt)', ''),
 
     # === OPTIONAL: Direktvermarktung Zusatz-Wechselrichter-Shelly ===
     ('direct_marketing_aux_inverter_shelly_override', 'DV-Zusatz-WR Shelly-Steuerung (local/off oder central/on)', 'local'),

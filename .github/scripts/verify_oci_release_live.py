@@ -10,7 +10,13 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "Tools"))
-from oci_release_contract import DIGEST_RE, SPDX, SLSA_PREFIX, verify  # noqa: E402
+from oci_release_contract import DIGEST_RE, SOURCE, SPDX, SLSA_PREFIX, verify  # noqa: E402
+
+
+ATTESTATION_REFERENCE_DIGEST = "vnd.docker.reference.digest"
+ATTESTATION_REFERENCE_TYPE = "vnd.docker.reference.type"
+ATTESTATION_MANIFEST = "attestation-manifest"
+IN_TOTO_JSON = "application/vnd.in-toto+json"
 
 
 def run(*args: str) -> str:
@@ -20,19 +26,80 @@ def run(*args: str) -> str:
     return result.stdout
 
 
-def find_values(value, key: str):
-    if isinstance(value, dict):
-        if key in value:
-            yield value[key]
-        for child in value.values():
-            yield from find_values(child, key)
-    elif isinstance(value, list):
-        for child in value:
-            yield from find_values(child, key)
-
-
 def first_json(command: list[str]):
     return json.loads(run(*command))
+
+
+def _sbom_count(value) -> int:
+    if not isinstance(value, dict):
+        return 0
+    count = 1 if value.get("SPDX") is not None else 0
+    additional = value.get("AdditionalSPDXs", [])
+    if isinstance(additional, list):
+        count += len(additional)
+    return count
+
+
+def _normalize_slsa_v1(value, revision: str, platform: str, errors: list[str]):
+    if not isinstance(value, dict) or not isinstance(value.get("SLSA"), dict):
+        errors.append(f"SLSA payload {platform}")
+        return None, None
+    predicate = value["SLSA"]
+    definition = predicate.get("buildDefinition")
+    if not isinstance(definition, dict):
+        errors.append(f"SLSA buildDefinition {platform}")
+        return None, None
+    external = definition.get("externalParameters")
+    resolved = definition.get("resolvedDependencies")
+    if not isinstance(external, dict):
+        errors.append(f"SLSA externalParameters {platform}")
+        return None, None
+    if not isinstance(resolved, list) or any(not isinstance(item, dict) for item in resolved):
+        errors.append(f"SLSA resolvedDependencies {platform}")
+        return None, None
+    config_source = external.get("configSource")
+    request = external.get("request")
+    if not isinstance(config_source, dict) or not isinstance(request, dict):
+        errors.append(f"SLSA source/request {platform}")
+        return None, None
+
+    source_uri = config_source.get("uri")
+    source_digest = config_source.get("digest")
+    allowed_uris = {f"{SOURCE}#{revision}", f"{SOURCE}.git#{revision}"}
+    if source_uri not in allowed_uris or source_digest != {"sha1": revision}:
+        errors.append(f"SLSA configSource {platform}")
+        return None, None
+
+    source_dependencies = [
+        item
+        for item in resolved
+        if item.get("uri") in allowed_uris and item.get("digest") == {"sha1": revision}
+    ]
+    if len(source_dependencies) != 1:
+        errors.append(f"SLSA source dependency {platform}")
+        return None, None
+    materials = []
+    for item in resolved:
+        material = dict(item)
+        if item is source_dependencies[0]:
+            material["uri"] = source_uri.split("#", 1)[0]
+        materials.append(material)
+
+    args = request.get("args")
+    if not isinstance(args, dict):
+        errors.append(f"SLSA request args {platform}")
+        return None, None
+    build_args = {
+        key.removeprefix("build-arg:"): value
+        for key, value in args.items()
+        if isinstance(key, str) and key.startswith("build-arg:")
+    }
+    return materials, build_args
+
+
+def _fail(index_digest: str, errors: list[str]) -> int:
+    print(json.dumps({"index_digest": index_digest, "status": "FAIL", "errors": errors}, sort_keys=True))
+    return 1
 
 
 def main(argv: list[str]) -> int:
@@ -45,41 +112,127 @@ def main(argv: list[str]) -> int:
     if not re.fullmatch(r"[^/@\s]+(?:/[^/@\s]+)+", image):
         print(json.dumps({"index_digest": index_digest, "status": "FAIL", "errors": ["image reference format"]}, sort_keys=True))
         return 1
-    index = first_json(["docker", "buildx", "imagetools", "inspect", f"{image}@{index_digest}", "--raw"])
-    runtimes = []
-    attestations = []
-    for descriptor in index.get("manifests", []):
-        platform = descriptor.get("platform", {})
-        os_name, arch = platform.get("os"), platform.get("architecture")
-        digest = descriptor.get("digest", "")
-        if os_name == "unknown" and arch == "unknown":
-            continue
-        name = f"{os_name}/{arch}"
-        run("docker", "pull", "--platform", name, f"{image}@{digest}")
-        labels = first_json(["docker", "image", "inspect", f"{image}@{digest}", "--format", "{{json .Config.Labels}}"])
-        runtimes.append({"platform": name, "digest": digest, "labels": labels})
+    try:
+        index = first_json(["docker", "buildx", "imagetools", "inspect", f"{image}@{index_digest}", "--raw"])
+    except (RuntimeError, json.JSONDecodeError) as exc:
+        return _fail(index_digest, [f"index read: {exc}"])
+    descriptors = index.get("manifests", []) if isinstance(index, dict) else []
+    if not isinstance(descriptors, list) or any(not isinstance(item, dict) for item in descriptors):
+        return _fail(index_digest, ["index manifests list"])
 
-        sbom = first_json(["docker", "buildx", "imagetools", "inspect", f"{image}@{digest}", "--format", "{{json .SBOM}}"])
-        if sbom:
-            attestations.append({"subject_digest": digest, "predicate_type": SPDX})
-        provenance = first_json(["docker", "buildx", "imagetools", "inspect", f"{image}@{digest}", "--format", "{{json .Provenance}}"])
-        predicate_types = sorted({str(value) for value in find_values(provenance, "predicateType") if str(value).startswith(SLSA_PREFIX)})
-        material_values = list(find_values(provenance, "materials"))
-        build_arg_values = list(find_values(provenance, "build-args"))
-        for predicate_type in predicate_types:
-            attestations.append({
-                "subject_digest": digest,
-                "predicate_type": predicate_type,
-                "materials": material_values[0] if len(material_values) == 1 else None,
-                "build_args": build_arg_values[0] if len(build_arg_values) == 1 else None,
-            })
+    runtime_descriptors = []
+    attestation_descriptors = []
+    collection_errors: list[str] = []
+    for descriptor in descriptors:
+        platform = descriptor.get("platform", {})
+        os_name = platform.get("os") if isinstance(platform, dict) else None
+        arch = platform.get("architecture") if isinstance(platform, dict) else None
+        if os_name == "unknown" and arch == "unknown":
+            annotations = descriptor.get("annotations", {})
+            if not isinstance(annotations, dict) or annotations.get(ATTESTATION_REFERENCE_TYPE) != ATTESTATION_MANIFEST:
+                collection_errors.append("unexpected unknown/unknown descriptor")
+                continue
+            attestation_descriptors.append(descriptor)
+        else:
+            runtime_descriptors.append(descriptor)
+
+    runtimes = []
+    runtime_by_digest = {}
+    for descriptor in runtime_descriptors:
+        platform = descriptor.get("platform", {})
+        os_name = platform.get("os") if isinstance(platform, dict) else None
+        arch = platform.get("architecture") if isinstance(platform, dict) else None
+        digest = descriptor.get("digest", "")
+        name = f"{os_name}/{arch}"
+        if not isinstance(digest, str) or not DIGEST_RE.fullmatch(digest):
+            collection_errors.append(f"runtime descriptor digest {name}")
+            continue
+        try:
+            run("docker", "pull", "--platform", name, f"{image}@{digest}")
+            labels = first_json(["docker", "image", "inspect", f"{image}@{digest}", "--format", "{{json .Config.Labels}}"])
+        except (RuntimeError, json.JSONDecodeError) as exc:
+            collection_errors.append(f"runtime inspect {name}: {exc}")
+            continue
+        runtimes.append({"platform": name, "digest": digest, "labels": labels})
+        runtime_by_digest[digest] = name
+
+    attachments_by_runtime: dict[str, list[dict]] = {digest: [] for digest in runtime_by_digest}
+    for descriptor in attestation_descriptors:
+        annotations = descriptor.get("annotations", {})
+        subject = annotations.get(ATTESTATION_REFERENCE_DIGEST)
+        digest = descriptor.get("digest", "")
+        if subject not in attachments_by_runtime:
+            collection_errors.append(f"unexpected attestation subject {subject}")
+            continue
+        if not isinstance(digest, str) or not DIGEST_RE.fullmatch(digest):
+            collection_errors.append(f"attestation descriptor digest {subject}")
+            continue
+        attachments_by_runtime[subject].append(descriptor)
+
+    root_reference = f"{image}@{index_digest}"
+    try:
+        sboms = first_json(["docker", "buildx", "imagetools", "inspect", root_reference, "--format", "{{json .SBOM}}"])
+        provenances = first_json(["docker", "buildx", "imagetools", "inspect", root_reference, "--format", "{{json .Provenance}}"])
+    except (RuntimeError, json.JSONDecodeError) as exc:
+        collection_errors.append(f"attestation payload read: {exc}")
+        sboms, provenances = {}, {}
+    if not isinstance(sboms, dict):
+        collection_errors.append("SBOM platform map")
+        sboms = {}
+    if not isinstance(provenances, dict):
+        collection_errors.append("provenance platform map")
+        provenances = {}
+
+    attestations = []
+    for subject, platform in runtime_by_digest.items():
+        linked = attachments_by_runtime.get(subject, [])
+        if len(linked) != 1:
+            collection_errors.append(f"one attestation manifest subject {subject}")
+            continue
+        attestation_digest = linked[0]["digest"]
+        try:
+            manifest = first_json(["docker", "buildx", "imagetools", "inspect", f"{image}@{attestation_digest}", "--raw"])
+        except (RuntimeError, json.JSONDecodeError) as exc:
+            collection_errors.append(f"attestation manifest read {subject}: {exc}")
+            continue
+        layers = manifest.get("layers", []) if isinstance(manifest, dict) else []
+        if not isinstance(layers, list) or any(not isinstance(layer, dict) for layer in layers):
+            collection_errors.append(f"attestation layers {subject}")
+            continue
+
+        spdx_layers = 0
+        slsa_layers = 0
+        for layer in layers:
+            annotations = layer.get("annotations", {})
+            predicate_type = annotations.get("in-toto.io/predicate-type") if isinstance(annotations, dict) else None
+            if layer.get("mediaType") != IN_TOTO_JSON or not isinstance(predicate_type, str):
+                collection_errors.append(f"in-toto layer descriptor {subject}")
+                continue
+            layer_digest = layer.get("digest", "")
+            if not isinstance(layer_digest, str) or not DIGEST_RE.fullmatch(layer_digest):
+                collection_errors.append(f"in-toto layer digest {subject}")
+                continue
+            attestation = {"subject_digest": subject, "predicate_type": predicate_type}
+            if predicate_type == SPDX:
+                spdx_layers += 1
+            elif predicate_type.startswith(SLSA_PREFIX):
+                slsa_layers += 1
+                materials, build_args = _normalize_slsa_v1(provenances.get(platform), revision, platform, collection_errors)
+                attestation["materials"] = materials
+                attestation["build_args"] = build_args
+            attestations.append(attestation)
+
+        if _sbom_count(sboms.get(platform)) != spdx_layers:
+            collection_errors.append(f"SPDX payload count {platform}")
+        if slsa_layers != 1:
+            collection_errors.append(f"SLSA layer count {platform}")
 
     bundle = {
         "expected": {"revision": revision, "tree": tree, "version": version, "created": created, "source_manifest": source_manifest},
         "runtimes": runtimes,
         "attestations": attestations,
     }
-    errors = verify(bundle)
+    errors = collection_errors + verify(bundle)
     print(json.dumps({"index_digest": index_digest, "status": "PASS" if not errors else "FAIL", "errors": errors}, sort_keys=True))
     return 1 if errors else 0
 

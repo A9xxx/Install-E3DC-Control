@@ -1,18 +1,20 @@
-# V2H / V2G: Statusanzeige und technische Vorbereitung
+# V2H/V2G-Telemetrie (read-only)
 
-E3DC-Control 5.3.2b erkennt und visualisiert bidirektionale Leistungsflüsse einer kompatiblen Wallbox. Ein negativer Wallbox-Leistungswert wird im Dashboard als Entladung aus dem Fahrzeug dargestellt. Bei openWB Pro werden außerdem gemeldete Fähigkeitsdaten wie `v2g_ready` sowie maximale Lade- und Entladeleistung in den Wallbox-Status übernommen.
+E3DC-Control erkennt negative Wallboxleistung als bidirektionalen Energiefluss und stellt diesen Zustand im Dashboard und über die lokale Telemetrie dar. Die Integration ist in v5.4.0 ausschließlich lesend: Sie startet oder stoppt keine Entladung, ändert keine Wallboxleistung, schaltet keine Phasen und betätigt weder CP noch ein Schütz.
 
-## Funktionsumfang in 5.3.2b
+## Anzeige und Grenzwerte
 
-- V2H-Leistungsfluss im Dashboard erkennen und darstellen;
-- negative Wallboxleistung in Diagrammen von normaler Ladung unterscheiden;
-- von einer kompatiblen Wallbox gemeldete V2G-Fähigkeits- und Leistungsdaten auslesen;
-- vorhandene Fahrzeug-SoC- und Wallboxdaten als Grundlage für eine spätere Schutzlogik bereitstellen.
+Bei erkanntem Energiefluss vom Fahrzeug zum Haus zeigt das Dashboard den V2H/V2G-Zustand und die Flussrichtung an. Mit `v2h_enable=1` wird zusätzlich die lokale Grenzwertauswertung aktiviert:
 
-## Noch nicht freigegeben
+- `v2h_min_soc` ist die Warnschwelle für den Fahrzeug-SoC.
+- `v2h_bat_soc_limit` ist die Warnschwelle für den Haus-Speicher-SoC.
 
-E3DC-Control startet, regelt oder beendet in 5.3.2b keine V2H-/V2G-Entladung. Es gibt keinen allgemein freigegebenen V2H-Schalter, keinen V2G-Einspeisesollwert und keine zugesicherte SoC-Abschaltung über den Wallbox-Manager. Die Anzeige eines negativen Leistungsflusses ist daher keine Bestätigung, dass E3DC-Control die Entladung steuert.
+Das Ergebnis ist eine read-only Empfehlung (`allowed`) samt Begründung. Auch bei einer Grenzwertverletzung erzeugt E3DC-Control keinen Hardwarebefehl. Der Betreiber muss die Schutz- und Abschaltlogik im zertifizierten bidirektionalen Lade- beziehungsweise Fahrzeugsystem konfigurieren.
 
-Für den Betrieb gelten weiterhin ausschließlich die Schutzgrenzen und Freigaben des Fahrzeugs, der Wallbox, des Wechselrichters sowie des jeweiligen Herstellers. Nutzer dürfen sich für Mindest-SoC, Netzfreigabe oder Abschaltung nicht auf E3DC-Control 5.3.2b verlassen.
+## Home Assistant und MQTT
 
-Eine spätere aktive Integration benötigt einen ausdrücklich unterstützten Treiber, bestätigte Befehlsrückmeldungen, eindeutige Hardware-Owner-Regeln, Fahrzeug- und Hausspeichergrenzen sowie eigene Gesamt- und Sicherheitstests. Bis dahin bleibt der Pfad read-only.
+Der lokale MQTT-Hub kann den Sensor `binary_sensor.e3dc_ctrl_v2h_allowed` bereitstellen. Er dient nur als Zustandsinformation für eine externe, vom Betreiber verantwortete Automation. Ein Wechsel des Sensors führt innerhalb von E3DC-Control zu keiner Wallboxaktion.
+
+## Sicherheitsgrenze
+
+Aktive V2H-/V2G-Steuerung ist nicht Bestandteil dieses Releases. Vor einer späteren Freigabe sind ein dokumentierter Gerätevertrag, eine eindeutige Writer-/Owner-Lease, ein dokumentierter Herstellernachweis und ein bestätigter Hardware-Safe-State erforderlich.

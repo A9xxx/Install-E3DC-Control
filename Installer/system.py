@@ -41,7 +41,7 @@ def setup_venv(show_header=False):
     """Richtet das Python Virtual Environment ein."""
     if show_header:
         print("\n=== Python Virtual Environment einrichten ===\n")
-    
+
     install_user = get_install_user()
     venv_name, venv_path = resolve_venv_target(install_user)
 
@@ -55,9 +55,9 @@ def setup_venv(show_header=False):
                 print("✓ Altes venv bereinigt.")
             except Exception as e:
                 print(f"⚠ Konnte altes venv nicht löschen: {e}")
-    
+
     print(f"→ Ziel: {venv_path}")
-    
+
     if not os.path.exists(venv_path):
         print("→ Erstelle venv…")
         # Erstelle venv mit Zugriff auf System-Pakete (für apt-installierte Module wie RPi.GPIO falls nötig)
@@ -74,12 +74,12 @@ def setup_venv(show_header=False):
             return False
     else:
         print("✓ venv existiert bereits.")
-    
+
     venv_pip = get_venv_pip(install_user)
-    
+
     # Nutze zentrale Installationsfunktion
     install_python_packages()
-    
+
     if show_header:
         print("\n✓ Python-Umgebung eingerichtet.\n")
         log_task_completed("Python venv eingerichtet")
@@ -88,11 +88,11 @@ def setup_venv(show_header=False):
 def list_venv_packages():
     """Listet installierte Pakete im venv auf."""
     print("\n=== Python venv Pakete ===\n")
-    
+
     install_user = get_install_user()
     venv_name = get_venv_name() or ".venv_e3dc"
     venv_pip = os.path.join(get_home_dir(install_user), venv_name, "bin", "pip")
-    
+
     if not os.path.exists(venv_pip):
         print("✗ Kein venv gefunden.")
         return
@@ -108,10 +108,10 @@ def install_python_packages():
     """Installiert Python-Pakete (bevorzugt im venv)."""
     install_user = get_install_user()
     venv_name, venv_path = resolve_venv_target(install_user)
-    
+
     print(f"\n→ Installiere Python-Pakete im venv ({venv_name})…")
     system_logger.info(f"Installiere {len(PYTHON_PACKAGES)} Python-Pakete im venv.")
-    
+
     for pkg in PYTHON_PACKAGES:
         pip_install(pkg, venv_path=venv_path, user=install_user)
 
@@ -121,7 +121,7 @@ def cleanup_legacy_python_packages(use_venv=True):
     legacy_apt = ["python3-plotly", "python3-pandas"]
     run_command("sudo apt-get remove -y " + " ".join(legacy_apt))
     run_command("sudo apt-get autoremove -y")
-    
+
     legacy_pip = ["plotly", "pandas", "pandas-stubs", "matplotlib", "pytz", "kaleido"]
     install_user = get_install_user()
     if use_venv:
@@ -151,8 +151,10 @@ def install_system_packages(use_venv=True):
         # Python Bibliotheken (via apt, fuer ML / Datenverarbeitung)
         "python3-sklearn", "python3-numpy", "python3-cryptography",
         "python3-bs4",          # Luxtronik WebSocket-Scraping (lux_live.py)
-        # Node.js und lokale Matter-Erkennung
-        "nodejs", "npm", "avahi-daemon", "avahi-utils", "dbus",
+        # Node.js / Matter Bridge
+        "nodejs", "npm",
+        # Netzwerk / Discovery (Matter & mDNS)
+        "avahi-daemon", "avahi-utils", "dbus",
         # System-Hilfspakete
         "curl",                 # allgemein nuetzlich
         "git",                  # Self-Update (UPDATE_POLICY.json)
@@ -192,7 +194,7 @@ def install_system_packages(use_venv=True):
         apt_install(pkg)
 
     cleanup_legacy_python_packages(use_venv)
-    
+
     install_rscpgui()
 
     # --- NEU: Apache PHP + WebSocket Reverse Proxy automatisch einrichten ---
@@ -200,12 +202,12 @@ def install_system_packages(use_venv=True):
     print("\n→ Konfiguriere Apache Reverse Proxy für WebSockets...")
     run_command("sudo a2enmod proxy")
     run_command("sudo a2enmod proxy_wstunnel")
-    
+
     conf_path = "/etc/apache2/sites-available/000-default.conf"
     if os.path.exists(conf_path):
         with open(conf_path, "r") as f:
             content = f.read()
-        
+
         modified = False
         if 'ProxyPass "/ws"' not in content:
             content = content.replace("</VirtualHost>", '    ProxyPass "/ws" "ws://127.0.0.1:8765/"\n</VirtualHost>')
@@ -213,7 +215,7 @@ def install_system_packages(use_venv=True):
         elif '127.0.0.1:8080' in content:
             content = content.replace('127.0.0.1:8080', '127.0.0.1:8765')
             modified = True
-            
+
         if modified:
             with tempfile.NamedTemporaryFile("w", delete=False) as tmp:
                 tmp.write(content)
@@ -224,7 +226,7 @@ def install_system_packages(use_venv=True):
             system_logger.info("Apache Proxy-Regel für WebSockets auf Port 8765 aktualisiert.")
         else:
             print("  ✓ Proxy-Regel existiert bereits korrekt.")
-            
+
     run_command("sudo systemctl restart apache2")
     # ------------------------------------------------------------------
 
@@ -256,21 +258,21 @@ def setup_service_wrapper():
         os.path.join(installer_dir, "installer_wrapper.sh"),
     ]
     existing_wrappers = [path for path in wrapper_paths if os.path.exists(path)]
-    
+
     if existing_wrappers:
         for wrapper_path in existing_wrappers:
             run_command(f"sudo chmod +x {wrapper_path}")
-        
+
         sudoers_content = "".join(
             f"www-data ALL=(root) NOPASSWD: {wrapper_path}\n"
             for wrapper_path in existing_wrappers
         )
         sudoers_file = "/etc/sudoers.d/020_e3dc_services"
-        
+
         with tempfile.NamedTemporaryFile("w", delete=False) as tmp:
             tmp.write(sudoers_content)
             tmp_name = tmp.name
-        
+
         run_command(f"sudo cp {tmp_name} {sudoers_file}")
         run_command(f"sudo chmod 440 {sudoers_file}")
         os.remove(tmp_name)
@@ -285,7 +287,7 @@ def setup_websocket_service(start_service=True):
     install_user = get_install_user()
     install_path = get_install_path()
     installer_dir = os.path.dirname(os.path.abspath(__file__))
-    
+
     service_content = f"""[Unit]
 Description=E3DC WebSocket Server fuer fluessige Dashboard Animationen
 After=network.target apache2.service
@@ -308,7 +310,7 @@ WantedBy=multi-user.target
     with tempfile.NamedTemporaryFile("w", delete=False) as tmp:
         tmp.write(service_content)
         tmp_name = tmp.name
-    
+
     run_command(f"sudo cp {tmp_name} /etc/systemd/system/e3dc-websocket.service")
     os.remove(tmp_name)
     run_command("sudo systemctl daemon-reload")

@@ -90,7 +90,6 @@ def _catalog_service_names(include_legacy=False, exclude=None):
 HA_MANAGED_SERVICES = _catalog_service_names(include_legacy=True, exclude={"e3dc-ha"})
 SHADOW_MANAGED_SERVICES = _catalog_service_names(include_legacy=True, exclude={"e3dc-shadow-sync"})
 
-
 def _ml_directory_snapshot(path):
     try:
         metadata = os.lstat(path)
@@ -196,7 +195,7 @@ def refresh_watchdog_guard_script():
         if not router_ip:
             print(f"{RED}[!]{RESET} Watchdog-Skript nicht verändert: keine Router-IP konfiguriert.")
             log_warning("permissions", "Watchdog-Skript nicht verändert: keine Router-IP konfiguriert.")
-            return True
+            return False
         monitor_file = current.get("MONITOR_FILE") or ""
         create_pi_guard(router_ip, monitor_file)
         run_command("sudo systemctl restart piguard.service", timeout=20)
@@ -387,7 +386,7 @@ def check_permissions():
         else:
             print(f"{GREEN}✓{RESET} {INSTALL_PATH} hat korrekte Rechte (755)")
             perm_logger.info(f"INSTALL_PATH Modus OK: 755")
-            
+
         # Apache/PHP starts some diagnostics directly from Installer/.
         # File mode 755 is not enough if the containing directory is 700.
         if os.path.isdir(INSTALLER_DIR):
@@ -421,7 +420,7 @@ def check_permissions():
                 issues.append("venv_owner")
             else:
                 print(f"{GREEN}✓{RESET} {venv_name} gehört {INSTALL_USER}")
-            
+
             # Prüfen ob executables ausführbar sind
             pip_bin = os.path.join(venv_path, "bin", "pip")
             if os.path.exists(pip_bin) and not os.access(pip_bin, os.X_OK):
@@ -445,25 +444,15 @@ def _private_matter_storage_issues(storage_path):
     if not os.path.lexists(storage_path):
         return findings
     try:
-        parent_stat = os.lstat(os.path.dirname(os.path.abspath(storage_path)))
         root_stat = os.lstat(storage_path)
     except OSError:
-        return {"unsafe"}
-    if stat.S_ISLNK(parent_stat.st_mode) or not stat.S_ISDIR(parent_stat.st_mode):
         return {"unsafe"}
     if stat.S_ISLNK(root_stat.st_mode) or not stat.S_ISDIR(root_stat.st_mode):
         return {"unsafe"}
 
     entries = [(storage_path, root_stat, "dir")]
     try:
-        def raise_walk_error(error):
-            raise error
-
-        for current_dir, dirnames, filenames in os.walk(
-            storage_path,
-            followlinks=False,
-            onerror=raise_walk_error,
-        ):
+        for current_dir, dirnames, filenames in os.walk(storage_path, followlinks=False):
             for name in dirnames:
                 path = os.path.join(current_dir, name)
                 entries.append((path, os.lstat(path), "dir"))
@@ -587,6 +576,7 @@ def check_webportal_permissions():
                         issues.append(f"{folder_name}_mode")
                 else:
                     print(f"{GREEN}✓{RESET} {folder_path} OK ({INSTALL_USER}:www-data, {expected_mode})")
+
                 # tmp-Ordner Schreibprüfung für www-data
                 if os.path.basename(folder_path) == "tmp":
                     www_data_gid = get_www_data_gid()
@@ -625,8 +615,10 @@ def check_webportal_permissions():
                         perm_logger.warning(f"Mount-Check fuer Ramdisk fehlgeschlagen: {_me}")
 
 
-        # R0 behält Fabric und Commissioning-Verhalten unverändert, schützt
-        # deren persistente Dateien aber vor Gruppen- oder Weltzugriffen.
+        # Matter-Fabric und Commissioning-Zugangsdaten bleiben auch nach einer
+        # allgemeinen Rechtekorrektur strikt privat. Neben dem Root-Verzeichnis
+        # werden deshalb alle vorhandenen Einträge geprüft; Links und sonstige
+        # Sonderdateien werden nicht automatisch verändert.
         matter_storage = f"{wp_path}/data/matter-storage"
         for matter_issue in sorted(_private_matter_storage_issues(matter_storage)):
             issue_key = f"matter-storage_{matter_issue}"
@@ -670,6 +662,7 @@ FILE_DEFINITIONS = [
     # [LEGACY C++] e3dc.wallbox.txt: NUR im Legacy-Modus (wb_native_enable=0). In V4 Native: DARF nicht beschrieben werden!
     {"path": f"{INSTALL_PATH}/e3dc.wallbox.txt", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": "/var/www/html/data/e3dc_v4.json", "mode": CONFIG_SECRET_FILE_MODE, "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
+    {"path": "/var/www/html/data/wallbox_phase_transition_state.json", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": f"{INSTALL_PATH}/data/e3dc_v4.json", "mode": CONFIG_SECRET_FILE_MODE, "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     # [LEGACY C++] e3dc.strompreise.txt: in V4 wird epex_daten.json genutzt. Datei ist obsolet.
     {"path": f"{INSTALL_PATH}/e3dc.strompreise.txt", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
@@ -697,6 +690,7 @@ FILE_DEFINITIONS = [
     {"path": "/var/www/html/logic.php", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": False, "executable": False},
     {"path": "/var/www/html/solar.js", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": False, "executable": False},
     {"path": "/var/www/html/solar.min.js", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": False, "executable": False},
+    {"path": "/var/www/html/minify_solar.py", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": "/var/www/html/Wallbox.php", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": "/var/www/html/mobile.php", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": False, "executable": False},
     {"path": "/var/www/html/history.php", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
@@ -719,6 +713,8 @@ FILE_DEFINITIONS = [
     {"path": "/var/www/html/get_forecast_data.php", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": "/var/www/html/fahrzeug.php", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": "/var/www/html/webhook.php", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
+    {"path": "/var/www/html/data/morning_boost_state.json", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
+    {"path": "/var/www/html/data/external_pv_topology.json", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": "/var/www/html/data/e3dc_stats.db", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     # Wallbox-Session-Helferdateien: PHP/www-data und Python-Dienste lesen/schreiben gemeinsam.
     {"path": "/var/www/html/tmp/car_charge_session.json", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
@@ -734,6 +730,7 @@ FILE_DEFINITIONS = [
     {"path": f"{INSTALLER_DIR}/luxtronik/energy_manager.py", "mode": "755", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": True},
     {"path": f"{INSTALLER_DIR}/luxtronik/lux_live.py", "mode": "755", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": True},
     {"path": f"{INSTALLER_DIR}/idm/idm_live.py", "mode": "755", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": True},
+    {"path": f"{INSTALLER_DIR}/idm/idm_scanner.py", "mode": "755", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": True},
     {"path": f"{INSTALLER_DIR}/stiebel/stiebel_live.py", "mode": "755", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": True},
     {"path": f"{INSTALLER_DIR}/dimplex/dimplex_live.py", "mode": "755", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": True},
     {"path": "/var/www/html/ramdisk/waermepumpe.json", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
@@ -755,9 +752,11 @@ FILE_DEFINITIONS = [
     {"path": "/var/www/html/logs/shadow_sync.log", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     # Notifier Dateien
     {"path": f"{INSTALLER_DIR}/notification_manager.py", "mode": "755", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": True},
-    # Matter Bridge
-    {"path": f"{INSTALLER_DIR}/matter/matter_bridge.js", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
-    {"path": f"{INSTALLER_DIR}/matter/package.json", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
+    # Matter Dateien
+    {"path": f"{INSTALLER_DIR}/matter/matter_bridge.js", "mode": "644", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
+    {"path": f"{INSTALLER_DIR}/matter/commissioning_credentials.js", "mode": "644", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
+    {"path": f"{INSTALLER_DIR}/matter/package.json", "mode": "644", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
+    {"path": f"{INSTALLER_DIR}/matter/package-lock.json", "mode": "644", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": f"{INSTALLER_DIR}/install_matter.py", "mode": "755", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": True},
     {"path": "/var/www/html/matter.php", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     # Neue Wallbox & MQTT Hub Dateien
@@ -789,6 +788,7 @@ FILE_DEFINITIONS = [
     # value_filter.json: get_live_json.php schreibt (PHP/www-data), solar.js liest -> gruppenschreibbar
     {"path": "/var/www/html/ramdisk/value_filter.json", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
 ]
+
 
 # Program and Git files may be world-readable/executable where required, but
 # are writable only by the installation user. Shared operational files remain
@@ -860,7 +860,6 @@ def harden_web_program_permissions(web_root="/var/www/html", install_user=None, 
         perm_logger.error("Web-Programmrechte konnten nicht gehaertet werden: %s", exc)
         return False
 
-
 def check_file_permissions():
     """Prüft Dateien, die PHP schreiben muss (config/wallbox) und Python-Dateien."""
     print("\n=== Datei-Rechteprüfung ===\n")
@@ -901,7 +900,7 @@ def check_file_permissions():
                     # Wenn noch nicht in der Liste, hinzufügen
                     if not any(d['path'] == fpath for d in FILE_DEFINITIONS):
                         FILE_DEFINITIONS.append({
-                            "path": fpath, "mode": "755", "owner": INSTALL_USER, "group": "www-data", "optional": False, "executable": True
+                            "path": fpath, "mode": "755", "owner": INSTALL_USER, "group": INSTALL_GROUP, "optional": False, "executable": True
                         })
         except Exception:
             pass
@@ -1083,6 +1082,8 @@ def fix_webportal_permissions(issues):
     success = True
     wp_path = "/var/www/html"
     matter_storage = f"{wp_path}/data/matter-storage"
+    v4_json_path = f"{wp_path}/data/e3dc_v4.json"
+    config_backup_dir = f"{wp_path}/data/config_backups"
     for matter_issue in sorted(_private_matter_storage_issues(matter_storage)):
         issue_key = f"matter-storage_{matter_issue}"
         if issue_key not in issues:
@@ -1118,7 +1119,8 @@ def fix_webportal_permissions(issues):
     if "wp_owner" in issues:
         print(f"  → Setze Besitzer rekursiv: {wp_path} -> {INSTALL_USER}:www-data")
         result = run_command(
-            f"sudo find {wp_path} -path {matter_storage} -prune -o "
+            f"sudo find -P {wp_path} -xdev "
+            f"\\( -path {matter_storage} -o -path {v4_json_path} -o -path {config_backup_dir} \\) -prune -o "
             f"\\( -type d -o -type f \\) -exec chown {INSTALL_USER}:www-data {{}} +"
         )
         if result['success']:
@@ -1128,7 +1130,8 @@ def fix_webportal_permissions(issues):
     if "wp_mode" in issues:
         print(f"  → Setze Verzeichnisrechte rekursiv: {wp_path} -> 775")
         result_dirs = run_command(
-            f"sudo find {wp_path} -path {matter_storage} -prune -o "
+            f"sudo find -P {wp_path} -xdev "
+            f"\\( -path {matter_storage} -o -path {v4_json_path} -o -path {config_backup_dir} \\) -prune -o "
             f"-type d -exec chmod 775 {{}} +"
         )
         if result_dirs['success']:
@@ -1139,7 +1142,8 @@ def fix_webportal_permissions(issues):
 
         print(f"  → Setze Dateirechte rekursiv: {wp_path} -> 664")
         result_files = run_command(
-            f"sudo find {wp_path} -path {matter_storage} -prune -o "
+            f"sudo find -P {wp_path} -xdev "
+            f"\\( -path {matter_storage} -o -path {v4_json_path} -o -path {config_backup_dir} \\) -prune -o "
             f"-type f -exec chmod 664 {{}} +"
         )
         if result_files['success']:
@@ -1236,7 +1240,7 @@ def fix_webportal_permissions(issues):
             print(f"{GREEN}✓{RESET} history_backups-Rechte korrigiert")
         else:
             success = False
-            
+
     if "luxtronik_archive_missing" in issues:
         print(f"  → Erstelle Archiv-Verzeichnis: {wp_path}/data/luxtronik_archive")
         result = run_command(f"sudo mkdir -p {wp_path}/data/luxtronik_archive")
@@ -1262,7 +1266,42 @@ def fix_webportal_permissions(issues):
             print(f"{GREEN}✓{RESET} luxtronik_archive-Rechte korrigiert")
         else:
             success = False
-            
+
+    if "matter-storage_missing" in issues:
+        print(f"  → Erstelle Matter-Storage: {wp_path}/data/matter-storage")
+        result = run_command(
+            f"sudo install -d -m 700 -o {INSTALL_USER} -g www-data "
+            f"{wp_path}/data/matter-storage"
+        )
+        if result['success']:
+            print(f"{GREEN}✓{RESET} matter-storage-Ordner erstellt")
+        else:
+            success = False
+    if "matter-storage_owner" in issues and "matter-storage_unsafe" not in issues:
+        print(f"  → Setze Matter-Storage Besitzer: {wp_path}/data/matter-storage -> {INSTALL_USER}:www-data")
+        result = run_command(
+            f"sudo find {wp_path}/data/matter-storage -xdev "
+            f"\\( -type d -o -type f \\) -exec chown {INSTALL_USER}:www-data {{}} +"
+        )
+        if result['success']:
+            print(f"{GREEN}✓{RESET} matter-storage-Besitzer korrigiert")
+        else:
+            success = False
+    if (
+        ("matter-storage_missing" in issues or "matter-storage_mode" in issues)
+        and "matter-storage_unsafe" not in issues
+    ):
+        print(f"  → Setze Matter-Storage Rechte: {wp_path}/data/matter-storage -> 700/600")
+        result_dirs = run_command(f"sudo find {wp_path}/data/matter-storage -xdev -type d -exec chmod 700 {{}} +")
+        result_files = run_command(f"sudo find {wp_path}/data/matter-storage -xdev -type f -exec chmod 600 {{}} +")
+        if result_dirs['success'] and result_files['success']:
+            print(f"{GREEN}✓{RESET} matter-storage-Rechte korrigiert")
+        else:
+            success = False
+    if "matter-storage_unsafe" in issues:
+        print(f"{RED}✗{RESET} Matter-Storage enthält unsichere Links oder Sonderdateien; keine automatische Änderung.")
+        success = False
+
     if "data_missing" in issues:
         print(f"  → Erstelle Datenbank-Verzeichnis: {wp_path}/data")
         result = run_command(f"sudo mkdir -p {wp_path}/data")
@@ -1280,47 +1319,28 @@ def fix_webportal_permissions(issues):
         print(f"  -> Setze Datenbank-Verzeichnis Rechte: {wp_path}/data -> 2775")
         run_command(f"sudo chmod 2775 {wp_path}/data")  # KEIN -R: Unterverzeichnisse (history_backups, luxtronik_archive) haben eigene Soll-Rechte!
 
-    if "matter-storage_missing" in issues and "matter-storage_unsafe" not in issues:
-        print(f"  → Erstelle Matter-Storage: {wp_path}/data/matter-storage")
-        result = run_command(
-            f"sudo install -d -m 700 -o {INSTALL_USER} -g www-data "
-            f"{wp_path}/data/matter-storage"
-        )
-        if not result['success']:
-            success = False
-    if "matter-storage_owner" in issues and "matter-storage_unsafe" not in issues:
-        result = run_command(
-            f"sudo find {wp_path}/data/matter-storage -xdev "
-            f"\\( -type d -o -type f \\) -exec chown {INSTALL_USER}:www-data {{}} +"
-        )
-        if not result['success']:
-            success = False
-    if (
-        ("matter-storage_missing" in issues or "matter-storage_mode" in issues)
-        and "matter-storage_unsafe" not in issues
-    ):
-        result_dirs = run_command(f"sudo find {wp_path}/data/matter-storage -xdev -type d -exec chmod 700 {{}} +")
-        result_files = run_command(f"sudo find {wp_path}/data/matter-storage -xdev -type f -exec chmod 600 {{}} +")
-        if not result_dirs['success'] or not result_files['success']:
-            success = False
-    if "matter-storage_unsafe" in issues:
-        print(f"{RED}✗{RESET} Matter-Storage enthält unsichere Links oder Sonderdateien; keine automatische Änderung.")
-        success = False
-
     # Explizit e3dc_v4.json Rechte reparieren (kann nach WinSCP-Direktbearbeitung falsch sein)
-    v4_json_path = f"{wp_path}/data/e3dc_v4.json"
     if os.path.exists(v4_json_path):
         print(f"  -> Setze e3dc_v4.json Rechte: {v4_json_path} -> {INSTALL_USER}:www-data {CONFIG_SECRET_FILE_MODE}")
         run_command(f"sudo chown {INSTALL_USER}:www-data {v4_json_path}")
         run_command(f"sudo chmod {CONFIG_SECRET_FILE_MODE} {v4_json_path}")
         print(f"{GREEN}✓{RESET} e3dc_v4.json Rechte korrigiert")
 
-    config_backup_dir = f"{wp_path}/data/config_backups"
     if os.path.isdir(config_backup_dir):
         print(f"  -> Setze Config-Backup-Rechte: {config_backup_dir} -> {INSTALL_USER}:www-data {CONFIG_SECRET_DIR_MODE}/{CONFIG_SECRET_FILE_MODE}")
         run_command(f"sudo chown -R {INSTALL_USER}:www-data {config_backup_dir}")
-        run_command(f"sudo find {config_backup_dir} -type d -exec chmod {CONFIG_SECRET_DIR_MODE} {{}} +")
-        run_command(f"sudo find {config_backup_dir} -type f -name 'e3dc_v4*' -exec chmod {CONFIG_SECRET_FILE_MODE} {{}} +")
+        migration_backup_dir = f"{config_backup_dir}/aux_inverter_migration"
+        run_command(
+            f"sudo find -P {config_backup_dir} -path {migration_backup_dir} -prune -o "
+            f"-type d -exec chmod {CONFIG_SECRET_DIR_MODE} {{}} +"
+        )
+        run_command(
+            f"sudo find -P {config_backup_dir} -path {migration_backup_dir} -prune -o "
+            f"-type f -exec chmod {CONFIG_SECRET_FILE_MODE} {{}} +"
+        )
+        if not _harden_aux_inverter_migration_backups(migration_backup_dir):
+            print(f"{RED}✗{RESET} Zusatz-WR-Migrationsbackups konnten nicht sicher gehärtet werden")
+            success = False
 
     if "apache_service" in issues:
         print("  → Repariere Apache Webserver (Start & Enable)…")
@@ -1333,6 +1353,63 @@ def fix_webportal_permissions(issues):
             success = False
 
     return success
+
+
+def _aux_inverter_migration_backup_structure_safe(path):
+    if not os.path.lexists(path):
+        return True
+    try:
+        root_stat = os.lstat(path)
+        if stat.S_ISLNK(root_stat.st_mode) or not stat.S_ISDIR(root_stat.st_mode):
+            return False
+        for directory, dirnames, filenames in os.walk(path, topdown=True, followlinks=False):
+            for name in dirnames:
+                metadata = os.lstat(os.path.join(directory, name))
+                if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                    return False
+            for name in filenames:
+                metadata = os.lstat(os.path.join(directory, name))
+                if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+                    return False
+        return True
+    except OSError:
+        return False
+
+
+def _verify_aux_inverter_migration_backup_modes(path):
+    if not _aux_inverter_migration_backup_structure_safe(path):
+        return False
+    if not os.path.lexists(path):
+        return True
+    if stat.S_IMODE(os.lstat(path).st_mode) != 0o700:
+        return False
+    for directory, dirnames, filenames in os.walk(path, topdown=True, followlinks=False):
+        if stat.S_IMODE(os.lstat(directory).st_mode) != 0o700:
+            return False
+        for name in dirnames:
+            if stat.S_IMODE(os.lstat(os.path.join(directory, name)).st_mode) != 0o700:
+                return False
+        for name in filenames:
+            if stat.S_IMODE(os.lstat(os.path.join(directory, name)).st_mode) != 0o600:
+                return False
+    return True
+
+
+def _harden_aux_inverter_migration_backups(path):
+    if not os.path.lexists(path):
+        return True
+    if not _aux_inverter_migration_backup_structure_safe(path):
+        return False
+    quoted = shlex.quote(path)
+    for command in (
+        f"sudo chmod 700 {quoted}",
+        f"sudo find -P {quoted} -type d -exec chmod 700 {{}} +",
+        f"sudo find -P {quoted} -type f -exec chmod 600 {{}} +",
+    ):
+        result = run_command(command, timeout=10)
+        if not isinstance(result, dict) or not result.get("success"):
+            return False
+    return _verify_aux_inverter_migration_backup_modes(path)
 
 
 def cleanup_root_owned_files():
@@ -2071,7 +2148,11 @@ def run_permissions_wizard(headless=False):
     """Hauptlogik für Rechteprüfung und -korrektur."""
     
     # Führe zuerst alle Konfigurations-Checks und Migrationen aus
-    run_config_wizard()
+    config_ready = run_config_wizard()
+    if config_ready is not True:
+        print("⚠ Konfigurationsmigration fehlgeschlagen; Rechte- und Servicekorrekturen werden nicht gestartet.")
+        perm_logger.error("Konfigurationsmigration fehlgeschlagen; Permissions-Wizard bricht fail-closed ab.")
+        return False
     ml_store_ready = ensure_private_ml_model_store()
 
     # Als erstes: Bereinige root-eigene Dateien falls vorhanden
@@ -2151,4 +2232,3 @@ register_command("24", "Rechte prüfen & korrigieren", run_permissions_wizard, s
 
 if __name__ == "__main__":
     sys.exit(0 if run_permissions_wizard(headless=True) is not False else 1)
-

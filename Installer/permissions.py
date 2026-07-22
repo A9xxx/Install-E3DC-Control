@@ -1698,6 +1698,50 @@ def cleanup_legacy_cronjobs():
     return True
 
 
+def check_wrapper_integrity():
+    """Bindet die beiden sudo-freigegebenen Wrapper read-only an Git-HEAD."""
+    print("\n=== Wrapper-Integritätsprüfung (lokaler Git-HEAD) ===\n")
+    try:
+        if __package__ in (None, ""):
+            from Installer import web_installer
+        else:
+            from . import web_installer
+        result = web_installer.wrapper_integrity_preview(INSTALL_ROOT)
+    except Exception as exc:
+        print(f"{RED}✗{RESET} Wrapper-Integrität konnte nicht geprüft werden: {exc}")
+        return [{"wrapper_integrity": True, "status": "check_error", "error": str(exc)}]
+
+    if result.get("success") and not result.get("repair_needed"):
+        print(f"{GREEN}✓{RESET} Beide Wrapper stimmen bytegenau mit Git-HEAD {result.get('head', '')[:12]} überein.")
+        return []
+
+    labels = {
+        "missing": "fehlt und kann ausschließlich aus Git-HEAD wiederhergestellt werden",
+        "crlf_only": "hat ausschließlich CRLF-Zeilenenden und kann atomar aus Git-HEAD repariert werden",
+        "content_drift": "weicht inhaltlich von Git-HEAD ab; automatische Reparatur ist gesperrt",
+        "symlink": "ist ein Symlink; automatische Reparatur ist gesperrt",
+        "hardlink": "hat mehrere Hardlinks; automatische Reparatur ist gesperrt",
+        "not_regular": "ist keine reguläre Datei; automatische Reparatur ist gesperrt",
+        "read_error": "konnte nicht sicher gelesen werden",
+    }
+    for item in result.get("items", []):
+        status = str(item.get("status") or "unknown")
+        if status == "ok":
+            continue
+        detail = labels.get(status, f"hat den unbekannten Zustand {status}")
+        print(f"{RED}✗{RESET} {item.get('path')}: {detail}.")
+    for blocker in result.get("hard_blockers", []):
+        if blocker.get("status") == "head_error":
+            print(f"{RED}✗{RESET} Git-HEAD-Bindung fehlgeschlagen: {blocker.get('error', 'unbekannt')}")
+    return [{
+        "wrapper_integrity": True,
+        "file": INSTALLER_DIR,
+        "head": result.get("head"),
+        "repairable": bool(result.get("success")),
+        "result": result,
+    }]
+
+
 def check_sudoers_permissions():
     """Prüft, ob www-data die notwendigen Sudo-Rechte für Web-Funktionen hat."""
     print("\n=== Sudoers-Prüfung (Web-Funktionen) ===\n")
@@ -2172,7 +2216,7 @@ def run_permissions_wizard(headless=False):
     issues = check_permissions()
     wp_issues = check_webportal_permissions()
     file_issues = check_file_permissions()
-    sudo_issues = check_sudoers_permissions()
+    sudo_issues = check_wrapper_integrity() + check_sudoers_permissions()
     service_issues = check_services()
     legacy_issues = check_legacy_autostart()
     watchdog_installed = os.path.exists(PI_GUARD_PATH) or os.path.exists(PIGUARD_SERVICE)

@@ -1,4 +1,34 @@
-# v5.4.0
+# v5.4.0a
+
+E3DC-Control v5.4.0a ist ein enger Kompatibilitäts-Hotfix auf Basis von
+v5.4.0. Die Regelungsarchitektur und ihre Schutzverträge bleiben unverändert.
+
+## Korrekturen in v5.4.0a
+
+- Das normale Bare-Metal-Update installiert keine optionalen Matter-Pakete
+  mehr. Node.js, npm, Avahi und D-Bus werden ausschließlich bei einer
+  ausdrücklich gestarteten Matter-Installation gemeinsam geprüft und
+  installiert. Ein Apt-Konflikt dieser optionalen Pakete blockiert damit kein
+  E3DC-Control-Update mehr.
+- Der Web-Updater prüft seinen privilegierten Installer-Wrapper jetzt vor der
+  sudo-Freigabe gegen den veröffentlichten Git-Stand. Eine reine
+  CRLF-Beschädigung kann kontrolliert auf die exakten Release-Bytes repariert
+  werden; andere Abweichungen brechen sicher ab und werden eindeutig erklärt.
+- Alte Shelly-EM-Zähler der ersten Generation können über ihre lokale
+  read-only-Status-API eingebunden werden. Die automatische Erkennung fällt
+  nach einer nicht unterstützten RPC-Antwort auf Gen1 zurück; Kanal und Summe
+  werden explizit ausgewertet, fehlende oder ungültige Messwerte bleiben
+  unbekannt.
+
+## Update und Docker
+
+Bare-Metal-Nutzer können v5.4.0a über den Web- oder Konsolen-Updater
+installieren. Das veröffentlichte Container-Image trägt den Tag
+`v5.4.0a`; `latest` wird erst nach bestandener Kandidaten- und
+Attestierungsprüfung auf denselben Digest gesetzt. Der vorgesehene öffentliche
+Rückfallstand bleibt `v5.3.2b`.
+
+## Funktionsumfang der Basis v5.4.0
 
 E3DC-Control v5.4.0 bündelt die neue Energie-Arbitration für Speicher,
 Direktvermarktung, Wallbox und Wärmeverbraucher mit einem transaktionalen
@@ -102,7 +132,7 @@ in der veröffentlichten Update-Policy exakt übereinstimmen.
 ## Docker
 
 Die Images werden aus dem veröffentlichten Git-Stand über GitHub Actions
-gebaut. `latest` ist ausschließlich für v5.4.0 vorgesehen; der Rollback-Tag
+gebaut. `latest` ist ausschließlich für v5.4.0a vorgesehen; der Rollback-Tag
 bleibt `v5.3.2b`. Matter-Abhängigkeiten stammen aus der Lockdatei, und das
 anlagenspezifische ML-Modell liegt in einem separaten persistenten Volume.
 

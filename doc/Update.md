@@ -80,7 +80,7 @@ Writer-/Aktor-Dienste gestoppt.
 
 ## Gezielter Rückfall
 
-`v5.4.0` bietet als einzigen öffentlichen Rollback den bereinigten Root
+`v5.4.0a` bietet als einzigen öffentlichen Rollback den bereinigten Root
 `v5.3.2b` an. Dieser Root gibt selbst keinen älteren öffentlichen Tag frei.
 Freie Commit-Hashes sind keine Rückfallversionen; der angebotene Tag ist in der
 Policy an genau einen SHA gebunden. Weitere öffentliche Rückfall-Tags werden

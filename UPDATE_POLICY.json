@@ -1,9 +1,9 @@
 {
-  "version": "5.4.0",
+  "version": "5.4.0a",
   "min_version": "4.0.0",
-  "stable_release": "v5.4.0",
-  "release_date": "2026-07-21",
-  "description": "v5.4.0 - sichere Energie-Arbitration und transaktionale Migration",
+  "stable_release": "v5.4.0a",
+  "release_date": "2026-07-22",
+  "description": "v5.4.0a - Installer- und Shelly-EM-Kompatibilitätsfix",
   "installer_requires": "python3",
   "sanitized_republication": false,
   "history_transition": {
@@ -72,12 +72,7 @@
     "python3-sklearn",
     "python3-numpy",
     "python3-cryptography",
-    "python3-websockets",
-    "nodejs",
-    "npm",
-    "avahi-daemon",
-    "avahi-utils",
-    "dbus"
+    "python3-websockets"
   ],
   "pip_packages": [
     "paho-mqtt",

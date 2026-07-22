@@ -105,7 +105,7 @@ sudo docker compose up -d --force-recreate e3dc-control
 
 Gezielte Rückfallversion:
 
-Den Stable-Container `v5.4.0` auf den veröffentlichten Rollback-Root
+Den Stable-Container `v5.4.0a` auf den veröffentlichten Rollback-Root
 `v5.3.2b` zurücksetzen:
 
 ```bash

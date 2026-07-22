@@ -429,14 +429,17 @@ function installCenterModuleConfigFields($moduleKey) {
             installCenterConfigField('climate_meter_ip', 'Shelly-Zähler IP', 'text', [], '', false, '192.0.2.102'),
             installCenterConfigField('climate_meter_type', 'Zählertyp', 'select', [
                 ['value' => 'shelly_pro3em', 'label' => 'Shelly Pro3EM / 3EM Gen2'],
+                ['value' => 'shelly_em_gen1', 'label' => 'Shelly EM Gen1 (2 Kanäle)'],
                 ['value' => 'shelly_em_mini_gen4', 'label' => 'Shelly EM Mini Gen4'],
                 ['value' => 'shelly_pm_mini', 'label' => 'Shelly PM Mini'],
                 ['value' => 'auto', 'label' => 'Auto-Erkennung'],
             ]),
-            installCenterConfigField('climate_meter_phase', 'Phase', 'select', [
+            installCenterConfigField('climate_meter_phase', 'Phase / Kanal', 'select', [
                 ['value' => 'a', 'label' => 'A / L1'],
                 ['value' => 'b', 'label' => 'B / L2'],
                 ['value' => 'c', 'label' => 'C / L3'],
+                ['value' => 'channel0', 'label' => 'Kanal 0 (Shelly EM Gen1)'],
+                ['value' => 'channel1', 'label' => 'Kanal 1 (Shelly EM Gen1)'],
                 ['value' => 'total', 'label' => 'Summe'],
             ]),
             installCenterConfigField('climate_min_power_w', 'Aktiv ab W', 'number', [], '', false, '50'),

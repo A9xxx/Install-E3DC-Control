@@ -115,7 +115,7 @@ $paths = getInstallPaths();
     <div class="container">
         <div class="d-flex justify-content-between align-items-center mb-4">
             <a href="index.php" class="nav-link-back"><i class="fas fa-arrow-left me-2"></i>Dashboard</a>
-            <span class="badge bg-success text-light">v5.4.0 Stable</span>
+            <span class="badge bg-success text-light">v5.4.0a Stable</span>
         </div>
         <h1 class="display-4 fw-bold">Hilfe & Support</h1>
         <p class="lead opacity-75">Häufige Fragen und Lösungen rund um E3DC-Control.</p>
@@ -134,7 +134,7 @@ $paths = getInstallPaths();
         <div class="col-12 faq-item" data-tags="docker image stable rollback update">
             <div class="card bg-card border-0 shadow-sm"><div class="card-body">
                 <h5 class="card-title"><span class="tag">Docker</span> Wie prüfe ich Image und Update?</h5>
-                <p>Ein freigegebener Stable-Tag kann als <code>image: ghcr.io/a9xxx/install-e3dc-control:v5.4.0</code> verwendet werden (Dokumentationsform: <code>image: ghcr.io/...</code>). Ein lokaler Quellenpfad nutzt <code>build: .</code>.</p>
+                <p>Ein freigegebener Stable-Tag kann als <code>image: ghcr.io/a9xxx/install-e3dc-control:v5.4.0a</code> verwendet werden (Dokumentationsform: <code>image: ghcr.io/...</code>). Ein lokaler Quellenpfad nutzt <code>build: .</code>.</p>
                 <pre>docker inspect e3dc-control --format '{{.Config.Image}} {{.State.Status}}'
 docker compose build --no-cache e3dc-control</pre>
                 <p>Rollback erfolgt ausschließlich auf den in der Update-Policy gebundenen Stable-Stand.</p>
@@ -204,7 +204,24 @@ docker compose build --no-cache e3dc-control</pre>
             </div>
         </div>
 
-        <h4 class="mb-4 text-accent"><i class="fas fa-shield-halved me-2"></i>Stable-Release 5.4.0: sichere Energie-Arbitration und transaktionale Migration</h4>
+        <h4 class="mb-4 text-accent"><i class="fas fa-screwdriver-wrench me-2"></i>Stable-Hotfix 5.4.0a: Update- und Shelly-Kompatibilität</h4>
+        <div class="col-12 faq-item" data-tags="5.4.0a hotfix update apt matter wrapper crlf sudo shelly em gen1 klima">
+            <div class="card bg-card border-0 shadow-sm">
+                <div class="card-body">
+                    <h5 class="card-title">
+                        <span class="tag">5.4.0a</span>
+                        Was korrigiert der Stable-Hotfix 5.4.0a?
+                    </h5>
+                    <ul>
+                        <li><strong>Core-Update:</strong> Optionale Node.js-, npm-, Avahi- und D-Bus-Pakete werden nur noch bei einer ausdrücklich gestarteten Matter-Installation benötigt. Konflikte dieser Pakete blockieren das normale E3DC-Control-Update nicht mehr.</li>
+                        <li><strong>Web-Updater:</strong> Der Installer-Wrapper wird vor der sudo-Freigabe gegen die veröffentlichten Git-Bytes geprüft. Eine reine CRLF-Shebang-Beschädigung lässt sich kontrolliert reparieren; unbekannte Abweichungen brechen sicher ab.</li>
+                        <li><strong>Shelly EM Gen1:</strong> Alte Shelly-EM-Zähler können im Klima-Verbraucher über ihre lokale read-only-Status-API eingebunden werden. Kanal 0, Kanal 1 oder die Summe werden ausdrücklich ausgewählt; ungültige Messwerte bleiben unbekannt.</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+
+        <h4 class="mb-4 text-accent"><i class="fas fa-shield-halved me-2"></i>Basis-Release 5.4.0: sichere Energie-Arbitration und transaktionale Migration</h4>
         <div class="col-12 faq-item" data-tags="5.4.0 stable release owner context backup rollback matter shadow wallbox waermepumpe">
             <div class="card bg-card border-0 shadow-sm">
                 <div class="card-body">

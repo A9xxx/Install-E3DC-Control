@@ -433,16 +433,23 @@ V4_SYSTEM_PACKAGES = [
     # Python Bibliotheken (via apt, fuer ML / Datenverarbeitung)
     "python3-sklearn", "python3-numpy", "python3-cryptography",
     "python3-bs4",          # Luxtronik WebSocket-Scraping (lux_live.py)
-    # Node.js / Matter Bridge
-    "nodejs", "npm",
-    # Netzwerk / Discovery (Matter & mDNS)
-    "avahi-daemon", "avahi-utils", "dbus",
     # System-Hilfspakete
     "curl",                 # allgemein nuetzlich
     "git",                  # Self-Update (UPDATE_POLICY.json)
     # Rust (pywebpush braucht dies beim pip-compile)
     "rustc", "cargo", "libffi-dev", "python3-dev",
 ]
+
+# Matter ist eine optionale Produktfunktion. Diese Pakete dürfen deshalb weder
+# den Core-Updatepfad noch eine Snapshot- oder Neuinstallation blockieren.
+# Ausschließlich der explizite Matter-Installer installiert sie gemeinsam.
+MATTER_SYSTEM_PACKAGES = (
+    "nodejs",
+    "npm",
+    "avahi-daemon",
+    "avahi-utils",
+    "dbus",
+)
 
 LEGACY_CPP_PACKAGES = [
     "build-essential", "cmake",
@@ -468,6 +475,58 @@ def install_apt_package_list(packages, *, log_label="Systempakete"):
     system_logger.info(f"Installiere {len(packages)} {log_label}.")
     for pkg in packages:
         apt_install(pkg)
+
+
+def _apt_package_installed(package):
+    """Prüft den dpkg-Status eines Pakets ohne Seiteneffekt."""
+    result = subprocess.run(
+        ["dpkg-query", "-W", "-f=${Status}", package],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result.returncode == 0 and result.stdout.strip() == "install ok installed"
+
+
+def install_apt_package_transaction(packages, *, log_label="optionale Systempakete"):
+    """Installiert eine explizite Paketgruppe in genau einer Apt-Transaktion.
+
+    Paketentfernungen sind untersagt. Ein Apt-Fehler oder ein unvollständiger
+    Endzustand wird als ``False`` zurückgegeben, damit der Aufrufer fail-closed
+    vor weiteren Produkt- oder Servicewirkungen abbrechen kann.
+    """
+    normalized = []
+    for package in packages:
+        package = str(package).strip()
+        if not package or any(not (char.isalnum() or char in "+-.") for char in package):
+            print(f"✗ Ungültiger Apt-Paketname: {package!r}")
+            return False
+        if package not in normalized:
+            normalized.append(package)
+
+    if not normalized:
+        return True
+
+    missing = [package for package in normalized if not _apt_package_installed(package)]
+    if not missing:
+        print(f"✓ {log_label} bereits vollständig installiert.")
+        return True
+
+    print(f"→ Installiere {log_label} gemeinsam: {', '.join(normalized)}")
+    apt_argv = ["sudo", "apt-get", "install", "-y", "--no-remove", "--", *normalized]
+    installation = run_command(apt_argv, timeout=300, use_shell=False)
+    if not installation.get("success"):
+        detail = (installation.get("stderr") or installation.get("stdout") or "unbekannter Apt-Fehler").strip()
+        print(f"✗ Apt-Installation für {log_label} fehlgeschlagen: {detail}")
+        return False
+
+    missing_after = [package for package in normalized if not _apt_package_installed(package)]
+    if missing_after:
+        print(f"✗ Apt-Endzustand unvollständig; weiterhin fehlend: {', '.join(missing_after)}")
+        return False
+
+    print(f"✓ {log_label} vollständig installiert.")
+    return True
 
 
 def prepare_system_packages_for_snapshot(use_venv=True):
@@ -667,35 +726,24 @@ def install_system_packages(use_venv=True):
 
 
 def setup_service_wrapper():
-    """Richtet den sudo-Wrapper für die Web-UI Systemd-Steuerung ein."""
+    """Delegiert Wrapper und sudoers an den zentralen fail-closed Reparaturpfad."""
     print("→ Richte Web-UI Service Wrapper ein...")
-    installer_dir = os.path.dirname(os.path.abspath(__file__))
-    wrapper_paths = [
-        os.path.join(installer_dir, "service_wrapper.sh"),
-        os.path.join(installer_dir, "installer_wrapper.sh"),
-    ]
-    existing_wrappers = [path for path in wrapper_paths if os.path.exists(path)]
+    from . import web_installer
 
-    if existing_wrappers:
-        for wrapper_path in existing_wrappers:
-            run_command(f"sudo chmod +x {wrapper_path}")
+    if web_installer.is_docker():
+        print("  ✓ Docker: kein systemd-/sudoers-Wrapper erforderlich.")
+        return True
 
-        sudoers_content = "".join(
-            f"www-data ALL=(root) NOPASSWD: {wrapper_path}\n"
-            for wrapper_path in existing_wrappers
-        )
-        sudoers_file = "/etc/sudoers.d/020_e3dc_services"
+    result = web_installer.repair_permissions(repair_runtime=False)
+    if not result.get("success"):
+        message = result.get("message") or "Wrapper-/sudoers-Reparatur fehlgeschlagen."
+        system_logger.error("Zentrale Wrapper-/sudoers-Reparatur fehlgeschlagen: %s", result)
+        raise RuntimeError(message)
 
-        with tempfile.NamedTemporaryFile("w", delete=False) as tmp:
-            tmp.write(sudoers_content)
-            tmp_name = tmp.name
-
-        run_command(f"sudo cp {tmp_name} {sudoers_file}")
-        run_command(f"sudo chmod 440 {sudoers_file}")
-        os.remove(tmp_name)
-        print(f"  ✓ Sudo-Rechte für {len(existing_wrappers)} Wrapper konfiguriert.")
-    else:
-        print("  ⚠ Service-/Installer-Wrapper fehlen, wird übersprungen.")
+    head = str((result.get("wrapper_integrity") or {}).get("head") or "")[:12]
+    suffix = f" (Git-HEAD {head})" if head else ""
+    print(f"  ✓ Wrapperintegrität und sudoers atomar geprüft{suffix}.")
+    return True
 
 
 

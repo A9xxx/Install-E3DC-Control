@@ -149,7 +149,7 @@ docker compose up -d --force-recreate
 `pull` holt das aktuelle GHCR-Image, `--force-recreate` startet den Container
 wirklich aus diesem neuen Image.
 
-**Docker-Rückfall von v5.4.0 auf den veröffentlichten Rollback-Root:**
+**Docker-Rückfall von v5.4.0a auf den veröffentlichten Rollback-Root:**
 ```bash
 TAG=v5.3.2b
 cd "$E3DC_DOCKER_PATH"

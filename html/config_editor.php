@@ -786,8 +786,8 @@ $tooltips = [
     "climate_enable"         => "Aktiviert die Klimaanlage als eigenen gemessenen Zusatzverbraucher. Der Dienst liest nur den Energiezähler; er schaltet weder Shelly noch Toshiba.",
     "climate_name"           => "Anzeigename der gemessenen Klimaanlage.",
     "climate_meter_ip"       => "IP-Adresse des Shelly-Zählers, der die Klimaanlage misst, z.B. 192.0.2.102.",
-    "climate_meter_type"     => "Zählertyp für die Klimaanlage. Unterstützt Shelly Pro3EM/3EM Gen2, Shelly EM Mini Gen4 und Shelly PM Mini per lokaler RPC-API.",
-    "climate_meter_phase"    => "Phase, auf der die Klimaanlage am Shelly hängt. Beim Mini-Zähler wird der einzige Messkanal gelesen; die Phase bleibt nur die Zuordnung im Dashboard.",
+    "climate_meter_type"     => "Zählertyp für die Klimaanlage. Unterstützt Shelly EM Gen1 read-only über /status sowie Shelly Pro3EM/3EM Gen2, Shelly EM Mini Gen4 und Shelly PM Mini per lokaler RPC-API.",
+    "climate_meter_phase"    => "Phase oder Messkanal der Klimaanlage. Beim Shelly EM Gen1 Kanal 0, Kanal 1 oder Summe wählen; bei den übrigen Zählern die elektrische Phase.",
     "climate_min_power_w"    => "Leistungsschwelle, ab der die Klimaanlage als aktiv gilt. Das ist nur Diagnose und kein Schaltwert.",
     "climate_poll_s"         => "Leseintervall des Klima-Messdienstes in Sekunden.",
     "climate_history_enable" => "Speichert eine eigene Klima-Historie unter data/climate_history, damit Prognose und Auswertung später nicht aus dem Hausverbrauch raten müssen.",
@@ -4520,12 +4520,14 @@ if ($available_backups) {
                                         <input type="text" name="values[climate_meter_ip]" class="form-control config-input" value="<?= $val('climate_meter_ip') ?>" placeholder="192.0.2.102">
                                     </div>
                                     <div class="col-6 col-md-2">
-                                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['climate_meter_phase'] ?? '') ?>">Phase</label>
+                                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['climate_meter_phase'] ?? '') ?>">Phase / Kanal</label>
                                         <?php $climatePhase = strtolower((string)($val('climate_meter_phase') ?: 'c')); ?>
                                         <select name="values[climate_meter_phase]" class="form-select config-input">
                                             <option value="a" <?= $climatePhase === 'a' ? 'selected' : '' ?>>A / L1</option>
                                             <option value="b" <?= $climatePhase === 'b' ? 'selected' : '' ?>>B / L2</option>
                                             <option value="c" <?= ($climatePhase === 'c' || $climatePhase === '') ? 'selected' : '' ?>>C / L3</option>
+                                            <option value="channel0" <?= in_array($climatePhase, ['channel0','channel_0','ch0','emeter0','emeter:0','emeter/0'], true) ? 'selected' : '' ?>>Kanal 0 (Shelly EM Gen1)</option>
+                                            <option value="channel1" <?= in_array($climatePhase, ['channel1','channel_1','ch1','emeter1','emeter:1','emeter/1'], true) ? 'selected' : '' ?>>Kanal 1 (Shelly EM Gen1)</option>
                                             <option value="total" <?= $climatePhase === 'total' ? 'selected' : '' ?>>Summe</option>
                                         </select>
                                     </div>
@@ -4538,6 +4540,7 @@ if ($available_backups) {
                                         <?php $climateMeterType = strtolower((string)($val('climate_meter_type') ?: 'shelly_pro3em')); ?>
                                         <select name="values[climate_meter_type]" class="form-select config-input">
                                             <option value="shelly_pro3em" <?= in_array($climateMeterType, ['shelly_pro3em','shelly_3em','shelly_gen2'], true) ? 'selected' : '' ?>>Shelly Pro3EM / 3EM Gen2</option>
+                                            <option value="shelly_em_gen1" <?= in_array($climateMeterType, ['shelly_em_gen1','shelly_em','shelly_em_legacy','em_gen1','gen1_em'], true) ? 'selected' : '' ?>>Shelly EM Gen1 (2 Kanäle)</option>
                                             <option value="shelly_em_mini_gen4" <?= in_array($climateMeterType, ['shelly_em_mini_gen4','shelly_mini_em_gen4','shelly_em_mini'], true) ? 'selected' : '' ?>>Shelly EM Mini Gen4</option>
                                             <option value="shelly_pm_mini" <?= in_array($climateMeterType, ['shelly_pm_mini','shelly_pm_mini_gen3','shelly_pm_mini_gen4','shelly_pm1'], true) ? 'selected' : '' ?>>Shelly PM Mini</option>
                                             <option value="auto" <?= $climateMeterType === 'auto' ? 'selected' : '' ?>>Auto-Erkennung</option>

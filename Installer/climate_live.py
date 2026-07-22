@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import signal
 import sys
@@ -132,9 +133,21 @@ def normalize_phase(value: Any) -> str:
         "single": "single",
         "em1": "single",
         "pm1": "single",
+        "channel_0": "channel0",
+        "ch0": "channel0",
+        "emeter0": "channel0",
+        "emeter:0": "channel0",
+        "emeter/0": "channel0",
+        "kanal0": "channel0",
+        "channel_1": "channel1",
+        "ch1": "channel1",
+        "emeter1": "channel1",
+        "emeter:1": "channel1",
+        "emeter/1": "channel1",
+        "kanal1": "channel1",
     }
     raw = aliases.get(raw, raw)
-    return raw if raw in {"a", "b", "c", "total", "single"} else "c"
+    return raw if raw in {"a", "b", "c", "total", "single", "channel0", "channel1"} else "c"
 
 
 def normalize_meter_type(value: Any) -> str:
@@ -147,6 +160,10 @@ def normalize_meter_type(value: Any) -> str:
         "shelly_pro_3em": "shelly_pro3em",
         "pro3em": "shelly_pro3em",
         "3em": "shelly_pro3em",
+        "shelly_em": "shelly_em_gen1",
+        "shelly_em_legacy": "shelly_em_gen1",
+        "em_gen1": "shelly_em_gen1",
+        "gen1_em": "shelly_em_gen1",
         "shelly_mini_em_gen4": "shelly_em_mini_gen4",
         "shelly_em_mini": "shelly_em_mini_gen4",
         "shelly_mini_em": "shelly_em_mini_gen4",
@@ -176,6 +193,11 @@ def http_json(url: str, timeout_s: float = SHELLY_TIMEOUT_S) -> dict[str, Any]:
 
 def read_shelly_status(ip: str, timeout_s: float = SHELLY_TIMEOUT_S) -> dict[str, Any]:
     return http_json(f"http://{ip}/rpc/Shelly.GetStatus", timeout_s=timeout_s)
+
+
+def read_shelly_em_gen1(ip: str, timeout_s: float = SHELLY_TIMEOUT_S) -> dict[str, Any]:
+    """Liest den Status eines Shelly EM Gen1 ohne einen Steuerbefehl auszulösen."""
+    return http_json(f"http://{ip}/status", timeout_s=timeout_s)
 
 
 def read_shelly_em_mini_gen4(ip: str, timeout_s: float = SHELLY_TIMEOUT_S) -> dict[str, Any]:
@@ -278,6 +300,7 @@ def _build_meter_status(
         "age_s": 0,
         "power_w": round(power_w, 1),
         "raw_power_w": round(raw_power_w, 3),
+        "measurement_valid": True,
         "active": bool(power_w >= min_power_w),
         "min_power_w": min_power_w,
         "apparent_power_va": round(apparent_va, 1) if apparent_va is not None else None,
@@ -316,6 +339,8 @@ def parse_shelly_pro3em_status(payload: dict[str, Any], cfg: dict[str, Any] | No
         raise ValueError("Shelly.GetStatus enthaelt keinen em:0 Block")
 
     phase = normalize_phase(cfg_text(cfg, "climate_meter_phase", "c"))
+    if phase not in {"a", "b", "c", "total"}:
+        raise ValueError("Shelly Pro3EM benötigt Phase A, B, C oder Summe")
     phases = {p: _phase_status(em, emdata, p) for p in ("a", "b", "c")}
 
     if phase == "total":
@@ -351,6 +376,106 @@ def parse_shelly_pro3em_status(payload: dict[str, Any], cfg: dict[str, Any] | No
         energy_wh=energy_wh,
         meter_channel="em:0",
         extra={"phases": phases},
+    )
+
+
+def normalize_shelly_em_gen1_channel(value: Any) -> str:
+    raw = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "a": "channel0",
+        "l1": "channel0",
+        "phase_a": "channel0",
+        "phase1": "channel0",
+        "single": "channel0",
+        "channel_0": "channel0",
+        "ch0": "channel0",
+        "emeter0": "channel0",
+        "emeter:0": "channel0",
+        "emeter/0": "channel0",
+        "kanal0": "channel0",
+        "b": "channel1",
+        "l2": "channel1",
+        "phase_b": "channel1",
+        "phase2": "channel1",
+        "channel_1": "channel1",
+        "ch1": "channel1",
+        "emeter1": "channel1",
+        "emeter:1": "channel1",
+        "emeter/1": "channel1",
+        "kanal1": "channel1",
+        "sum": "total",
+        "all": "total",
+        "gesamt": "total",
+    }
+    channel = aliases.get(raw, raw)
+    if channel not in {"channel0", "channel1", "total"}:
+        raise ValueError("Shelly EM Gen1 benötigt Kanal 0, Kanal 1 oder Summe")
+    return channel
+
+
+def _finite_number_or_none(value: Any) -> float | None:
+    parsed = _safe_float_or_none(value)
+    if parsed is None or not math.isfinite(parsed):
+        return None
+    return parsed
+
+
+def _parse_shelly_em_gen1_channel(payload: dict[str, Any], index: int) -> dict[str, Any]:
+    emeters = payload.get("emeters")
+    if not isinstance(emeters, list) or index >= len(emeters):
+        raise ValueError(f"Shelly EM Gen1 enthält keinen emeters[{index}] Kanal")
+    emeter = emeters[index]
+    if not isinstance(emeter, dict):
+        raise ValueError(f"Shelly EM Gen1 emeters[{index}] ist kein Objekt")
+    if emeter.get("is_valid") is not True:
+        raise ValueError(f"Shelly EM Gen1 emeters[{index}] ist nicht gültig")
+    power_w = _finite_number_or_none(emeter.get("power"))
+    if power_w is None:
+        raise ValueError(f"Shelly EM Gen1 emeters[{index}] enthält keine gültige Leistung")
+    return {
+        "index": index,
+        "power_w_raw": power_w,
+        "reactive_power_var": _finite_number_or_none(emeter.get("reactive")),
+        "voltage_v": _finite_number_or_none(emeter.get("voltage")),
+        "energy_total_wh": _finite_number_or_none(emeter.get("total")),
+        "energy_returned_wh": _finite_number_or_none(emeter.get("total_returned")),
+        "is_valid": True,
+    }
+
+
+def parse_shelly_em_gen1_status(payload: dict[str, Any], cfg: dict[str, Any] | None = None, now_ts: float | None = None) -> dict[str, Any]:
+    cfg = cfg or DEFAULT_CONFIG
+    payload = unwrap_shelly_status_payload(payload)
+    channel = normalize_shelly_em_gen1_channel(cfg_text(cfg, "climate_meter_phase", ""))
+
+    indices = (0, 1) if channel == "total" else (0 if channel == "channel0" else 1,)
+    channels = [_parse_shelly_em_gen1_channel(payload, index) for index in indices]
+    raw_power_w = sum(float(item["power_w_raw"]) for item in channels)
+
+    energy_values = [item["energy_total_wh"] for item in channels]
+    energy_wh = sum(float(value) for value in energy_values) if all(value is not None for value in energy_values) else None
+    reactive_values = [item["reactive_power_var"] for item in channels]
+    reactive_var = sum(float(value) for value in reactive_values) if all(value is not None for value in reactive_values) else None
+    voltage_v = channels[0]["voltage_v"] if len(channels) == 1 else None
+
+    return _build_meter_status(
+        payload,
+        cfg,
+        source="shelly_em_gen1",
+        phase=channel,
+        now_ts=now_ts,
+        raw_power_w=raw_power_w,
+        apparent_va=None,
+        current_a=None,
+        voltage_v=voltage_v,
+        pf=None,
+        freq_hz=None,
+        energy_wh=energy_wh,
+        meter_channel="emeter:sum" if channel == "total" else f"emeter:{indices[0]}",
+        extra={
+            "channels": {str(item["index"]): item for item in channels},
+            "reactive_power_var": round(reactive_var, 3) if reactive_var is not None else None,
+        },
     )
 
 
@@ -424,7 +549,14 @@ def parse_shelly_status(payload: dict[str, Any], cfg: dict[str, Any] | None = No
         return parse_shelly_em_mini_gen4_status(payload, cfg, now_ts=now_ts)
     if meter_type == "shelly_pm_mini" or (meter_type == "auto" and isinstance(payload.get("pm1:0"), dict)):
         return parse_shelly_pm_mini_status(payload, cfg, now_ts=now_ts)
+    if meter_type == "shelly_em_gen1" or (meter_type == "auto" and isinstance(payload.get("emeters"), list)):
+        return parse_shelly_em_gen1_status(payload, cfg, now_ts=now_ts)
     raise ValueError(f"Nicht unterstuetzter Zaehler-Typ: {meter_type}")
+
+
+def _has_supported_rpc_meter(payload: dict[str, Any]) -> bool:
+    payload = unwrap_shelly_status_payload(payload)
+    return any(isinstance(payload.get(key), dict) for key in ("em:0", "em1:0", "pm1:0"))
 
 
 def disabled_status(cfg: dict[str, Any], reason: str = "disabled") -> dict[str, Any]:
@@ -441,6 +573,7 @@ def disabled_status(cfg: dict[str, Any], reason: str = "disabled") -> dict[str, 
         "ts": int(now_ts),
         "ts_iso": datetime.fromtimestamp(now_ts).isoformat(timespec="seconds"),
         "power_w": 0,
+        "measurement_valid": True,
         "daily_kwh": None,
         "active": False,
         "reason": reason,
@@ -462,7 +595,9 @@ def error_status(cfg: dict[str, Any], exc: Exception | str) -> dict[str, Any]:
         "phase": normalize_phase(cfg_text(cfg, "climate_meter_phase", "c")),
         "ts": int(now_ts),
         "ts_iso": datetime.fromtimestamp(now_ts).isoformat(timespec="seconds"),
-        "power_w": 0,
+        "power_w": None,
+        "raw_power_w": None,
+        "measurement_valid": False,
         "daily_kwh": None,
         "active": False,
         "error": str(exc),
@@ -569,11 +704,23 @@ def collect_status(cfg: dict[str, Any]) -> dict[str, Any]:
     if not valid_ip_config(ip):
         return error_status(cfg, "climate_meter_ip fehlt")
     meter_type = normalize_meter_type(cfg_text(cfg, "climate_meter_type", "shelly_pro3em"))
-    if meter_type not in {"auto", "shelly_pro3em", "shelly_em_mini_gen4", "shelly_pm_mini"}:
+    if meter_type not in {"auto", "shelly_pro3em", "shelly_em_gen1", "shelly_em_mini_gen4", "shelly_pm_mini"}:
         return error_status(cfg, f"Nicht unterstuetzter Zaehler-Typ: {meter_type}")
 
-    if meter_type == "shelly_em_mini_gen4":
+    if meter_type == "shelly_em_gen1":
+        payload = read_shelly_em_gen1(ip)
+    elif meter_type == "shelly_em_mini_gen4":
         payload = read_shelly_em_mini_gen4(ip)
+    elif meter_type == "auto":
+        try:
+            payload = read_shelly_status(ip)
+        except urllib.error.HTTPError as exc:
+            if exc.code not in {400, 404, 405, 501}:
+                raise
+            payload = read_shelly_em_gen1(ip)
+        else:
+            if not _has_supported_rpc_meter(payload):
+                payload = read_shelly_em_gen1(ip)
     else:
         payload = read_shelly_status(ip)
     status = parse_shelly_status(payload, cfg)

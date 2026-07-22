@@ -1,6 +1,6 @@
 services:
   e3dc-control:
-    image: ghcr.io/a9xxx/install-e3dc-control:v5.4.0
+    image: ghcr.io/a9xxx/install-e3dc-control:v5.4.0a
     # Rückfall auf ein stabiles Release:
     # Gezielter Rollback-Root (nur nach Prüfung der jeweiligen Update-Policy):
     # image: ghcr.io/a9xxx/install-e3dc-control:v5.3.2b

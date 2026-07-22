@@ -6,6 +6,19 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.0a] – 2026-07-22
+
+### 📦 Installation und Update
+
+- 🐛 **Fehlerbehebung:** Optionale Matter-Abhängigkeiten werden nicht mehr im normalen Core-Update installiert. Damit blockieren Konflikte zwischen Node.js-, npm- oder Avahi-Paketen das E3DC-Control-Update nicht mehr.
+- 🛡️ **Sicherheit:** Der Web-Updater prüft seinen privilegierten Wrapper gegen die exakten Release-Bytes. Eine reine CRLF-Shebang-Beschädigung kann kontrolliert repariert werden; unbekannte Byteabweichungen, Symlinks oder Mehrfachlinks brechen sicher ab.
+- 🔎 **Diagnose:** Die Weboberfläche unterscheidet einen beschädigten oder nicht ausführbaren Wrapper von einer fehlenden passwortlosen sudo-Freigabe und zeigt den passenden Reparaturweg.
+
+### ♨️ Klima und Shelly
+
+- 🔄 **Kompatibilität:** Alte Shelly-EM-Zähler der ersten Generation werden über die lokale read-only-Status-API unterstützt. Die automatische Erkennung kann von RPC auf Gen1 zurückfallen; Kanal 0, Kanal 1 oder die Summe werden explizit ausgewertet.
+- 🛡️ **Sicherheit:** Fehlende, nicht endliche oder vom Gerät als ungültig markierte Shelly-Messwerte werden nicht als echte `0 W` übernommen und erzeugen keine Regelwirkung.
+
 ## [5.4.0] – 2026-07-21
 
 ### 🔋 Speicher und Direktvermarktung

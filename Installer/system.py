@@ -151,10 +151,6 @@ def install_system_packages(use_venv=True):
         # Python Bibliotheken (via apt, fuer ML / Datenverarbeitung)
         "python3-sklearn", "python3-numpy", "python3-cryptography",
         "python3-bs4",          # Luxtronik WebSocket-Scraping (lux_live.py)
-        # Node.js / Matter Bridge
-        "nodejs", "npm",
-        # Netzwerk / Discovery (Matter & mDNS)
-        "avahi-daemon", "avahi-utils", "dbus",
         # System-Hilfspakete
         "curl",                 # allgemein nuetzlich
         "git",                  # Self-Update (UPDATE_POLICY.json)
@@ -250,35 +246,24 @@ def install_system_packages(use_venv=True):
     log_task_completed("Systempakete installieren")
 
 def setup_service_wrapper():
-    """Richtet den sudo-Wrapper für die Web-UI Systemd-Steuerung ein."""
+    """Delegiert Wrapper und sudoers an den zentralen fail-closed Reparaturpfad."""
     print("→ Richte Web-UI Service Wrapper ein...")
-    installer_dir = os.path.dirname(os.path.abspath(__file__))
-    wrapper_paths = [
-        os.path.join(installer_dir, "service_wrapper.sh"),
-        os.path.join(installer_dir, "installer_wrapper.sh"),
-    ]
-    existing_wrappers = [path for path in wrapper_paths if os.path.exists(path)]
+    from . import web_installer
 
-    if existing_wrappers:
-        for wrapper_path in existing_wrappers:
-            run_command(f"sudo chmod +x {wrapper_path}")
+    if web_installer.is_docker():
+        print("  ✓ Docker: kein systemd-/sudoers-Wrapper erforderlich.")
+        return True
 
-        sudoers_content = "".join(
-            f"www-data ALL=(root) NOPASSWD: {wrapper_path}\n"
-            for wrapper_path in existing_wrappers
-        )
-        sudoers_file = "/etc/sudoers.d/020_e3dc_services"
+    result = web_installer.repair_permissions(repair_runtime=False)
+    if not result.get("success"):
+        message = result.get("message") or "Wrapper-/sudoers-Reparatur fehlgeschlagen."
+        system_logger.error("Zentrale Wrapper-/sudoers-Reparatur fehlgeschlagen: %s", result)
+        raise RuntimeError(message)
 
-        with tempfile.NamedTemporaryFile("w", delete=False) as tmp:
-            tmp.write(sudoers_content)
-            tmp_name = tmp.name
-
-        run_command(f"sudo cp {tmp_name} {sudoers_file}")
-        run_command(f"sudo chmod 440 {sudoers_file}")
-        os.remove(tmp_name)
-        print(f"  ✓ Sudo-Rechte für {len(existing_wrappers)} Wrapper konfiguriert.")
-    else:
-        print("  ⚠ Service-/Installer-Wrapper fehlen, wird übersprungen.")
+    head = str((result.get("wrapper_integrity") or {}).get("head") or "")[:12]
+    suffix = f" (Git-HEAD {head})" if head else ""
+    print(f"  ✓ Wrapperintegrität und sudoers atomar geprüft{suffix}.")
+    return True
 
 
 def setup_websocket_service(start_service=True):

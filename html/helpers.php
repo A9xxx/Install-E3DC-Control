@@ -2775,6 +2775,107 @@ function e3dcFindInstallerMainAndWrapper() {
     return null;
 }
 
+function e3dcInspectInstallerWrapper($wrapper) {
+    $wrapper = (string)$wrapper;
+    $result = [
+        'ok' => false,
+        'path' => $wrapper,
+        'status' => 'missing',
+        'repairable' => true,
+    ];
+    if ($wrapper === '') {
+        return $result;
+    }
+
+    clearstatcache(true, $wrapper);
+    if (is_link($wrapper)) {
+        $result['status'] = 'symlink';
+        $result['repairable'] = false;
+        return $result;
+    }
+    $metadata = @lstat($wrapper);
+    if ($metadata === false) {
+        return $result;
+    }
+    $result['nlink'] = (int)($metadata['nlink'] ?? 0);
+    $result['mode'] = (int)($metadata['mode'] ?? 0);
+    if (($result['mode'] & 0170000) !== 0100000) {
+        $result['status'] = 'not_regular';
+        $result['repairable'] = false;
+        return $result;
+    }
+    if ($result['nlink'] !== 1) {
+        $result['status'] = 'hardlink';
+        $result['repairable'] = false;
+        return $result;
+    }
+
+    $handle = @fopen($wrapper, 'rb');
+    if ($handle === false) {
+        $result['status'] = 'not_readable';
+        $result['repairable'] = false;
+        return $result;
+    }
+    $prefix = (string)@fread($handle, 64);
+    @fclose($handle);
+    if (substr($prefix, 0, 13) === "#!/bin/bash\r\n") {
+        $result['status'] = 'crlf_shebang';
+        return $result;
+    }
+    if (substr($prefix, 0, 12) !== "#!/bin/bash\n") {
+        $result['status'] = 'invalid_shebang';
+        $result['repairable'] = false;
+        return $result;
+    }
+
+    $result['ok'] = true;
+    $result['status'] = 'ok';
+    $result['repairable'] = false;
+    return $result;
+}
+
+function e3dcInstallerWrapperIssueText($inspection) {
+    $status = (string)($inspection['status'] ?? 'unknown');
+    $messages = [
+        'missing' => 'der Installer-Wrapper fehlt',
+        'crlf_shebang' => 'der Installer-Wrapper hat Windows-Zeilenenden in der Shebang und kann deshalb vom Linux-Kernel nicht gestartet werden',
+        'symlink' => 'der Installer-Wrapper ist ein Symlink und wird aus Sicherheitsgründen nicht automatisch verwendet',
+        'hardlink' => 'der Installer-Wrapper hat mehrere Hardlinks und wird aus Sicherheitsgründen nicht automatisch verwendet',
+        'not_regular' => 'der Installer-Wrapper ist keine reguläre Datei',
+        'not_readable' => 'der Installer-Wrapper ist für den Webserver nicht lesbar',
+        'invalid_shebang' => 'der Installer-Wrapper hat eine ungültige Shebang oder unbekannte Zeilenenden',
+    ];
+    return $messages[$status] ?? 'der Installer-Wrapper konnte nicht sicher geprüft werden';
+}
+
+function e3dcInstallerPrivilegeFailureMessage($operation, $baseDir, $wrapperInspection, $responses = []) {
+    $operation = trim((string)$operation);
+    $baseDir = rtrim((string)$baseDir, '/');
+    $fixCmd = 'cd ' . escapeshellarg($baseDir) . ' && sudo python3 installer_main.py --fix-permissions';
+    $responseText = implode("\n\n", array_filter((array)$responses));
+    $cannotStart = ($operation === 'Web-Update')
+        ? 'Web-Update kann nicht starten'
+        : $operation . ' kann nicht starten';
+
+    if (empty($wrapperInspection['ok'])) {
+        $reason = e3dcInstallerWrapperIssueText($wrapperInspection);
+        if (!empty($wrapperInspection['repairable'])) {
+            $message = $cannotStart . ", weil " . $reason . ".\n"
+                     . "Bitte einmal per SSH reparieren:\n" . $fixCmd;
+        } else {
+            $message = $cannotStart . ", weil " . $reason . ".\n"
+                     . "Die automatische Ersetzung bleibt fail-closed gesperrt. Bitte den Wrapper gegen den freigegebenen Release-Stand prüfen.";
+        }
+    } else {
+        $message = $cannotStart . ", weil die passwortlose sudo-Freigabe für den geprüften Installer-Wrapper fehlt.\n"
+                 . "Bitte einmal per SSH ausführen:\n" . $fixCmd;
+    }
+    if ($responseText !== '') {
+        $message .= "\n\nAntwort:\n" . $responseText;
+    }
+    return $message;
+}
+
 function handleReleaseRollback() {
     if (isset($_GET['action']) && $_GET['action'] === 'release_rollback_options') {
         requireWebAuth(true);
@@ -2853,8 +2954,9 @@ function handleReleaseRollback() {
         @chmod($logFile, 0666);
         $wrapper = $install['wrapper'];
         $repoDir = $install['repo_dir'];
+        $wrapperInspection = e3dcInspectInstallerWrapper($wrapper);
         $attempts = [];
-        if ($wrapper && file_exists($wrapper)) {
+        if ($wrapper && !empty($wrapperInspection['ok'])) {
             $attempts[] = [
                 'label' => 'installer_wrapper.sh',
                 'preflight' => 'sudo -n ' . escapeshellarg($wrapper) . ' check',
@@ -2880,8 +2982,7 @@ function handleReleaseRollback() {
             $sudoErrors[] = $attempt['label'] . " fehlgeschlagen:\n" . implode("\n", $out);
         }
         if ($cmd === '') {
-            $fixCmd = 'cd ' . escapeshellarg($repoDir) . ' && sudo python3 installer_main.py --fix-permissions';
-            $msg = "Release-Rückfall kann nicht starten, weil die sudo-Freigabe fehlt.\nBitte einmal per SSH ausfuehren:\n" . $fixCmd . "\n\n" . implode("\n\n", $sudoErrors);
+            $msg = e3dcInstallerPrivilegeFailureMessage('Release-Rückfall', $repoDir, $wrapperInspection, $sudoErrors);
             @file_put_contents($logFile, $msg . "\n", FILE_APPEND);
             echo json_encode(['status' => 'error', 'message' => $msg]);
             exit;
@@ -2919,11 +3020,16 @@ function handleUpdatePreparation() {
 
 function runInstallerWrapperUpdateCheck($repoDir) {
     $wrapper = rtrim($repoDir, '/') . '/Installer/installer_wrapper.sh';
-    if (!file_exists($wrapper)) {
+    $wrapperInspection = e3dcInspectInstallerWrapper($wrapper);
+    if (empty($wrapperInspection['ok'])) {
+        $nextStep = !empty($wrapperInspection['repairable'])
+            ? 'Bitte Rechte-Reparatur ausführen.'
+            : 'Die automatische Reparatur bleibt aus Sicherheitsgründen gesperrt.';
         return [
             'ok' => false,
-            'error' => 'Installer-Wrapper nicht gefunden. Bitte Rechte-Reparatur ausführen.',
-            'wrapper' => $wrapper
+            'error' => ucfirst(e3dcInstallerWrapperIssueText($wrapperInspection)) . '. ' . $nextStep,
+            'wrapper' => $wrapper,
+            'wrapper_status' => $wrapperInspection['status'] ?? 'unknown',
         ];
     }
 
@@ -3194,8 +3300,9 @@ function handleRunSelfUpdate() {
         // Installationen können noch die direkte installer_main.py-Freigabe
         // besitzen. Beide Pfade werden non-interaktiv getestet.
         $installerWrapper = $baseDir . '/Installer/installer_wrapper.sh';
+        $wrapperInspection = e3dcInspectInstallerWrapper($installerWrapper);
         $sudoAttempts = [];
-        if (basename($script) === 'installer_main.py' && file_exists($installerWrapper)) {
+        if (basename($script) === 'installer_main.py' && !empty($wrapperInspection['ok'])) {
             $sudoAttempts[] = [
                 'label' => 'installer_wrapper.sh',
                 'preflight' => "sudo -n " . escapeshellarg($installerWrapper) . " check",
@@ -3224,10 +3331,10 @@ function handleRunSelfUpdate() {
         }
         if ($selectedRunCmd === null) {
             $consoleCmd = "cd " . escapeshellarg($baseDir) . " && sudo python3 installer_main.py --update-e3dc";
-            $fixCmd = "cd " . escapeshellarg($baseDir) . " && sudo python3 installer_main.py --fix-permissions";
-            $msg = "Web-Update kann nicht starten, weil der Webserver keine passwortlose sudo-Freigabe hat.\n"
-                 . "Bitte einmal per SSH ausfuehren:\n" . $fixCmd . "\n" . $consoleCmd . "\n\n"
-                 . "Antwort:\n" . implode("\n", $preflightOut);
+            $msg = e3dcInstallerPrivilegeFailureMessage('Web-Update', $baseDir, $wrapperInspection, $preflightOut);
+            if (!empty($wrapperInspection['ok']) || !empty($wrapperInspection['repairable'])) {
+                $msg .= "\n" . $consoleCmd;
+            }
             file_put_contents($logFile, $msg . "\n", FILE_APPEND);
             echo json_encode(['success' => false, 'message' => $msg]);
             exit;
@@ -3460,8 +3567,9 @@ function handleFixPermissions() {
         }
         $repoDir = (basename($installerScript) === 'installer_main.py') ? dirname($installerScript) : dirname(dirname($installerScript));
         $installerWrapper = $repoDir . '/Installer/installer_wrapper.sh';
+        $wrapperInspection = e3dcInspectInstallerWrapper($installerWrapper);
         $attempts = [];
-        if (basename($installerScript) === 'installer_main.py' && file_exists($installerWrapper)) {
+        if (basename($installerScript) === 'installer_main.py' && !empty($wrapperInspection['ok'])) {
             $attempts[] = [
                 'label' => 'installer_wrapper.sh',
                 'cmd' => "sudo -n " . escapeshellarg($installerWrapper) . " fix_permissions",
@@ -3531,9 +3639,16 @@ function handleFixPermissions() {
                 implode("\n\n", $failedAttempts),
                 implode("\n", $out),
             ]));
-            if (preg_match('/sudo:|password|not in the sudoers|terminal is required/i', $sudoText)) {
+            if (empty($wrapperInspection['ok'])) {
+                $err_msg = e3dcInstallerPrivilegeFailureMessage(
+                    'Rechte-Reparatur',
+                    $repoDir,
+                    $wrapperInspection,
+                    [$sudoText]
+                );
+            } elseif (preg_match('/sudo:|password|not in the sudoers|terminal is required/i', $sudoText)) {
                 $err_msg = "Die WebUI darf die Rechte-Reparatur noch nicht per sudo starten.\n\n"
-                         . "Bitte einmal per SSH ausfuehren:\n" . $consoleCmd . "\n\n"
+                         . "Bitte einmal per SSH ausführen:\n" . $consoleCmd . "\n\n"
                          . "Danach Apache neu laden und die Seite aktualisieren.\n\n"
                          . "Antwort:\n" . $sudoText;
             } else {
@@ -4272,8 +4387,9 @@ function handleRunUpdate() {
             // Sudoers expects the unquoted explicit path!
             $repoDir = dirname($installer_main);
             $installerWrapper = $repoDir . '/Installer/installer_wrapper.sh';
+            $wrapperInspection = e3dcInspectInstallerWrapper($installerWrapper);
             $attempts = [];
-            if (file_exists($installerWrapper)) {
+            if (!empty($wrapperInspection['ok'])) {
                 $attempts[] = [
                     'label' => 'installer_wrapper.sh',
                     'preflight' => 'sudo -n ' . escapeshellarg($installerWrapper) . ' check',
@@ -4298,10 +4414,7 @@ function handleRunUpdate() {
                 $sudoErrors[] = $attempt['label'] . " fehlgeschlagen:\n" . implode("\n", $attemptOut);
             }
             if ($cmd === '') {
-                $fixCmd = 'cd ' . escapeshellarg($repoDir) . ' && sudo python3 installer_main.py --fix-permissions';
-                $msg = "Web-Update kann nicht starten, weil der Webserver keine passwortlose sudo-Freigabe hat.\n"
-                     . "Bitte einmal per SSH ausfuehren:\n" . $fixCmd . "\n\n"
-                     . "Antwort:\n" . implode("\n\n", $sudoErrors);
+                $msg = e3dcInstallerPrivilegeFailureMessage('Web-Update', $repoDir, $wrapperInspection, $sudoErrors);
                 file_put_contents($logFile, $msg . "\n", FILE_APPEND);
                 echo json_encode(['status' => 'error', 'message' => $msg]);
                 exit;

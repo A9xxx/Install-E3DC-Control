@@ -14,7 +14,7 @@ test -f "$E3DC_INSTALL_PATH/e3dc-setup"
 
 ## Programmstand zurücksetzen
 
-`v5.4.0` darf ausschließlich den öffentlichen Rollback-Root `v5.3.2b`
+`v5.4.0a` darf ausschließlich den öffentlichen Rollback-Root `v5.3.2b`
 anbieten. Dieser Root enthält keinen älteren öffentlichen Tag.
 
 Freie Commit-Hashes und Zwischencommits sind keine Rückfallversionen. Sie

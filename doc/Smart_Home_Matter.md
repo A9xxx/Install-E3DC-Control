@@ -25,6 +25,11 @@ matter_bridge = 1
 matter_port = 5540
 ```
 
+Matter ist ein optionales Modul. Das normale E3DC-Control-Update installiert
+deshalb keine Node.js-, npm-, Avahi- oder D-Bus-Pakete. Erst die ausdrücklich
+gestartete Matter-Installation prüft diese Paketgruppe gemeinsam und bricht bei
+einem Solverfehler ab, ohne die Core-Aktualisierung zu blockieren.
+
 ## Dienst
 
 Bare Metal:

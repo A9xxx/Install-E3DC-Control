@@ -1,12 +1,12 @@
 # E3DC-Control Web-Portal & Installer
 
-Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.4.0</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
+Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.4.0a</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
 
 ![E3DC-Control Dashboard](html/app-icon-512.png)
 
 ## Aktuelle Version und Update
 
-Die aktuelle stabile Version ist **5.4.0**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur geprüften Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Einziger vorgesehener öffentlicher Rückfallstand ist der sanitierte Root **v5.3.2b**; der Übergang zwischen den nicht verwandten Historien erfolgt ausschließlich über den geprüften Installer-/Bootstrapweg.
+Die aktuelle stabile Version ist **5.4.0a**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur geprüften Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Einziger vorgesehener öffentlicher Rückfallstand ist der sanitierte Root **v5.3.2b**; der Übergang zwischen den nicht verwandten Historien erfolgt ausschließlich über den geprüften Installer-/Bootstrapweg.
 
 > [!WARNING]
 > **⚠️ Achtung: Nutzung auf eigenes Risiko!**
@@ -19,6 +19,8 @@ Die aktuelle stabile Version ist **5.4.0**. Hinweise zum Web-, Konsolen- und Doc
 > **Config-Schutz:** Standardinstallationen speichern `data/e3dc_v4.json` und lokale Config-Backups mit `660` für Install-User und `www-data`, damit WebUI und Dienste weiter automatisch starten, die Datei aber nicht mehr weltlesbar ist. Der normale Config-Download ist redigiert; der Raw-Download enthält Zugangsdaten und wird nur angeboten, wenn eine Web-PIN gesetzt ist. Der Kompatibilitätsmodus (`664`) ist nur für eigene externe Leser gedacht.
 
 > **Bedienansichten:** Config-Editor und Wallbox-Seite unterscheiden zwischen einfacher Ansicht für Einrichtung und täglichen Betrieb sowie erweiterter Ansicht für alle Detailparameter. Die Logik und Abgrenzung sind in [doc/Frontend_Ansichten.md](doc/Frontend_Ansichten.md) dokumentiert.
+
+> **Neu in 5.4.0a Stable:** Das Core-Update ist von optionalen Matter-Paketen getrennt, der Web-Updater erkennt und repariert eine reine CRLF-Beschädigung seines veröffentlichten Wrappers kontrolliert, und alte Shelly-EM-Zähler der ersten Generation können über ihre lokale read-only-Status-API eingebunden werden.
 
 > **Neu in 5.4.0 Stable:** Speicher, Direktvermarktung, Wallbox und Wärmeverbraucher verwenden einen eindeutigen Regel-Owner und einen vor jedem Hardwareausgang erneut geprüften Anlagenkontext. Plan, Slot, Freigabe, ACK und Readback bleiben gebunden. Interne DC-PV und zusätzliche AC-Erzeuger werden getrennt bilanziert; DC- und Netzpunktdruck werden mit dem größeren Wert statt als Summe bewertet. openWB Pro erhält eine bestätigungsgebundene Start-Recovery. Das Mehr-Wallbox-Balancing verteilt anhand der L1/L2/L3-Stromvektoren und nicht anhand einer pauschalen Ampere-Summe. Die ruhige PV-Kurve erlaubt bei laufender Ladung höchstens 75 Wh Batteriestützung. Der manuelle iDM-Scanner liest Register 1006 ausschließlich einmalig per FC04. Mobile Energiefluss-Badges speichern Desktop- und Tablet-Positionen revisionssicher getrennt. Update, Backup und Web-Planung sind transaktional gehärtet.
 

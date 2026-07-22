@@ -11,11 +11,14 @@ Ablauf, sudoers-Wrapper und Testplan bewusst freigegeben werden.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -190,9 +193,359 @@ WRITE_ACTION_NAMES = sorted(
 
 SERVICE_WRAPPER = INSTALLER_DIR / "service_wrapper.sh"
 INSTALLER_WRAPPER = INSTALLER_DIR / "installer_wrapper.sh"
+WRAPPER_RELATIVE_PATHS = (
+    "Installer/service_wrapper.sh",
+    "Installer/installer_wrapper.sh",
+)
 SUDOERS_FILE = Path("/etc/sudoers.d/020_e3dc_services")
 SUDOERS_DIR = Path("/etc/sudoers.d")
 MAX_BACKUP_FILE_BYTES = 10 * 1024 * 1024
+
+
+def _git_head_wrapper_bytes(repo_root: Path) -> tuple[str, dict[str, bytes]]:
+    """Liest die freigegebenen Wrapperbytes direkt aus dem lokalen Git-HEAD."""
+    root = Path(repo_root)
+    try:
+        head_result = subprocess.run(
+            ["git", "-c", f"safe.directory={root}", "-C", str(root), "rev-parse", "--verify", "HEAD^{commit}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Lokaler Git-HEAD konnte nicht gebunden werden: {exc}") from exc
+    head = head_result.stdout.strip().lower()
+    if head_result.returncode != 0 or len(head) != 40 or any(ch not in "0123456789abcdef" for ch in head):
+        error = head_result.stderr.strip() or "ungültige HEAD-Antwort"
+        raise RuntimeError(f"Lokaler Git-HEAD konnte nicht gebunden werden: {error}")
+
+    canonical: dict[str, bytes] = {}
+    for relative_path in WRAPPER_RELATIVE_PATHS:
+        try:
+            blob_result = subprocess.run(
+                ["git", "-c", f"safe.directory={root}", "-C", str(root), "cat-file", "blob", f"{head}:{relative_path}"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=10,
+                check=False,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"HEAD-Blob fehlt für {relative_path}: {exc}") from exc
+        if blob_result.returncode != 0:
+            error = blob_result.stderr.decode("utf-8", errors="replace").strip() or "Blob nicht lesbar"
+            raise RuntimeError(f"HEAD-Blob fehlt für {relative_path}: {error}")
+        payload = bytes(blob_result.stdout)
+        if not payload.startswith(b"#!/bin/bash\n") or b"\r" in payload:
+            raise RuntimeError(f"HEAD-Blob ist kein LF-kodierter Bash-Wrapper: {relative_path}")
+        canonical[relative_path] = payload
+    return head, canonical
+
+
+def _classify_wrapper(path: Path, canonical: bytes) -> dict[str, Any]:
+    expected_sha256 = hashlib.sha256(canonical).hexdigest()
+    item: dict[str, Any] = {
+        "path": str(path),
+        "expected_sha256": expected_sha256,
+        "status": "unknown",
+        "repairable": False,
+        "needs_repair": True,
+    }
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        item.update({"status": "missing", "repairable": True})
+        return item
+    except Exception as exc:
+        item.update({"status": "read_error", "error": str(exc)})
+        return item
+
+    item.update({
+        "mode": f"{stat.S_IMODE(metadata.st_mode):04o}",
+        "uid": int(metadata.st_uid),
+        "gid": int(metadata.st_gid),
+        "nlink": int(metadata.st_nlink),
+    })
+    if stat.S_ISLNK(metadata.st_mode):
+        item["status"] = "symlink"
+        return item
+    if not stat.S_ISREG(metadata.st_mode):
+        item["status"] = "not_regular"
+        return item
+    if metadata.st_nlink != 1:
+        item["status"] = "hardlink"
+        return item
+    try:
+        actual = path.read_bytes()
+    except Exception as exc:
+        item.update({"status": "read_error", "error": str(exc)})
+        return item
+
+    actual_sha256 = hashlib.sha256(actual).hexdigest()
+    item["actual_sha256"] = actual_sha256
+    if actual == canonical:
+        item.update({"status": "ok", "repairable": True, "needs_repair": False})
+    elif b"\r\n" in actual and actual.replace(b"\r\n", b"\n") == canonical:
+        item.update({"status": "crlf_only", "repairable": True})
+    else:
+        item["status"] = "content_drift"
+    return item
+
+
+def _collect_wrapper_integrity(repo_root: Path) -> dict[str, Any]:
+    root = Path(repo_root)
+    try:
+        head, canonical = _git_head_wrapper_bytes(root)
+    except Exception as exc:
+        return {
+            "success": False,
+            "repo_root": str(root),
+            "head": None,
+            "items": [],
+            "hard_blockers": [{"status": "head_error", "error": str(exc)}],
+            "canonical": {},
+        }
+
+    items: list[dict[str, Any]] = []
+    for relative_path in WRAPPER_RELATIVE_PATHS:
+        item = _classify_wrapper(root / relative_path, canonical[relative_path])
+        item["relative_path"] = relative_path
+        items.append(item)
+    hard_blockers = [item for item in items if not item.get("repairable")]
+    return {
+        "success": not hard_blockers,
+        "repo_root": str(root),
+        "head": head,
+        "items": items,
+        "hard_blockers": hard_blockers,
+        "canonical": canonical,
+    }
+
+
+def wrapper_integrity_preview(repo_root: Path | str | None = None) -> dict[str, Any]:
+    """Prüft Wrapper gegen HEAD, ohne Dateien oder Rechte zu verändern."""
+    state = _collect_wrapper_integrity(Path(repo_root) if repo_root is not None else INSTALL_ROOT)
+    return {
+        "success": state["success"],
+        "repo_root": state["repo_root"],
+        "head": state["head"],
+        "items": state["items"],
+        "hard_blockers": state["hard_blockers"],
+        "repair_needed": any(item.get("needs_repair") for item in state["items"]),
+    }
+
+
+def _wrapper_owner_ids(user: str | None, group: str | None) -> tuple[int, int]:
+    uid = -1
+    gid = -1
+    if user is not None:
+        import pwd
+
+        uid = int(pwd.getpwnam(user).pw_uid)
+    if group is not None:
+        import grp
+
+        gid = int(grp.getgrnam(group).gr_gid)
+    return uid, gid
+
+
+def _atomic_write_wrapper(path: Path, payload: bytes, user: str | None, group: str | None) -> None:
+    parent_meta = os.lstat(path.parent)
+    if stat.S_ISLNK(parent_meta.st_mode) or not stat.S_ISDIR(parent_meta.st_mode):
+        raise RuntimeError(f"Wrapper-Elternpfad ist kein echtes Verzeichnis: {path.parent}")
+
+    uid, gid = _wrapper_owner_ids(user, group)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.repair-", dir=str(path.parent))
+    tmp_path = Path(tmp_name)
+    try:
+        offset = 0
+        while offset < len(payload):
+            offset += os.write(fd, payload[offset:])
+        if uid != -1 or gid != -1:
+            os.fchown(fd, uid, gid)
+        os.fchmod(fd, 0o755)
+        os.fsync(fd)
+        os.replace(tmp_path, path)
+        directory_fd = os.open(str(path.parent), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        os.close(fd)
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _set_verified_wrapper_permissions(path: Path, canonical: bytes, user: str | None, group: str | None) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(str(path), flags)
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise RuntimeError(f"Wrapper ist beim Rechte-Endgate nicht mehr regulär/nlink=1: {path}")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        if b"".join(chunks) != canonical:
+            raise RuntimeError(f"Wrapperbytes änderten sich beim Rechte-Endgate: {path}")
+        uid, gid = _wrapper_owner_ids(user, group)
+        if uid != -1 or gid != -1:
+            os.fchown(fd, uid, gid)
+        os.fchmod(fd, 0o755)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def repair_wrapper_integrity(
+    repo_root: Path | str | None = None,
+    user: str | None = None,
+    group: str | None = None,
+) -> dict[str, Any]:
+    """Repariert nur fehlende oder reine CRLF-Wrapper aus dem gebundenen HEAD."""
+    root = Path(repo_root) if repo_root is not None else INSTALL_ROOT
+    state = _collect_wrapper_integrity(root)
+    public_state = {
+        "success": state["success"],
+        "repo_root": state["repo_root"],
+        "head": state["head"],
+        "items": state["items"],
+        "hard_blockers": state["hard_blockers"],
+        "repair_needed": any(item.get("needs_repair") for item in state["items"]),
+    }
+    if not state["success"]:
+        public_state["message"] = "Wrapper-Reparatur fail-closed abgebrochen: unsicherer Wrapperzustand."
+        public_state["steps"] = []
+        return public_state
+
+    # Zweites reines Lesegate unmittelbar vor der ersten Mutation schützt vor
+    # einem zwischenzeitlichen HEAD- oder Dateigenerationswechsel.
+    rebound = _collect_wrapper_integrity(root)
+    if (
+        not rebound["success"]
+        or rebound["head"] != state["head"]
+        or [(item.get("relative_path"), item.get("status"), item.get("actual_sha256")) for item in rebound["items"]]
+        != [(item.get("relative_path"), item.get("status"), item.get("actual_sha256")) for item in state["items"]]
+    ):
+        public_state.update({
+            "success": False,
+            "message": "Wrapper-Reparatur abgebrochen: HEAD oder Wrapperzustand hat sich während des Gates geändert.",
+            "steps": [],
+        })
+        return public_state
+
+    steps: list[dict[str, Any]] = []
+    try:
+        for item in state["items"]:
+            relative_path = str(item["relative_path"])
+            path = root / relative_path
+            canonical = state["canonical"][relative_path]
+            current = _classify_wrapper(path, canonical)
+            if current.get("status") != item.get("status") or current.get("actual_sha256") != item.get("actual_sha256"):
+                raise RuntimeError(f"Wrapperzustand änderte sich vor dem Schreiben: {path}")
+
+            if item["status"] in {"missing", "crlf_only"}:
+                _atomic_write_wrapper(path, canonical, user, group)
+                steps.append({
+                    "step": "restore_wrapper_from_head",
+                    "ok": True,
+                    "path": str(path),
+                    "source": f"{state['head']}:{relative_path}",
+                    "reason": item["status"],
+                    "sha256": hashlib.sha256(canonical).hexdigest(),
+                })
+            else:
+                _set_verified_wrapper_permissions(path, canonical, user, group)
+                steps.append({
+                    "step": "verify_wrapper_from_head",
+                    "ok": True,
+                    "path": str(path),
+                    "source": f"{state['head']}:{relative_path}",
+                    "sha256": hashlib.sha256(canonical).hexdigest(),
+                })
+
+        final_state = _collect_wrapper_integrity(root)
+        final_ok = (
+            final_state["success"]
+            and final_state["head"] == state["head"]
+            and all(item.get("status") == "ok" for item in final_state["items"])
+        )
+        if not final_ok:
+            raise RuntimeError("Wrapper-Endgate stimmt nicht vollständig mit dem gebundenen Git-HEAD überein")
+        return {
+            "success": True,
+            "message": "Wrapperintegrität ist gegen den lokalen Git-HEAD gebunden.",
+            "repo_root": str(root),
+            "head": state["head"],
+            "items": final_state["items"],
+            "hard_blockers": [],
+            "repair_needed": False,
+            "steps": steps,
+        }
+    except Exception as exc:
+        steps.append({"step": "wrapper_integrity", "ok": False, "error": str(exc)})
+        return {
+            "success": False,
+            "message": f"Wrapper-Reparatur abgebrochen: {exc}",
+            "repo_root": str(root),
+            "head": state["head"],
+            "items": state["items"],
+            "hard_blockers": [],
+            "repair_needed": True,
+            "steps": steps,
+        }
+
+
+def validate_wrapper_backup_coverage(wrapper_preview: dict[str, Any], backup_snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Beweist vor Mutation das Snapshot-Preimage jedes vorhandenen Wrappers."""
+    copied_by_source = {
+        str(item.get("path") or ""): item
+        for item in backup_snapshot.get("copied", [])
+        if str(item.get("path") or "")
+    }
+    checks: list[dict[str, Any]] = []
+    for wrapper in wrapper_preview.get("items", []):
+        if wrapper.get("status") == "missing":
+            checks.append({
+                "path": wrapper.get("path"),
+                "ok": True,
+                "skipped": True,
+                "reason": "kein Preimage vorhanden",
+            })
+            continue
+
+        source = str(wrapper.get("path") or "")
+        copied = copied_by_source.get(source)
+        check: dict[str, Any] = {"path": source, "ok": False}
+        if not copied:
+            check["error"] = "Wrapper fehlt in backup_snapshot.copied"
+            checks.append(check)
+            continue
+        backup_path = Path(str(copied.get("backup") or ""))
+        try:
+            metadata = os.lstat(backup_path)
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                raise RuntimeError("Backup ist nicht regulär/nlink=1")
+            backup_sha256 = hashlib.sha256(backup_path.read_bytes()).hexdigest()
+            expected_sha256 = str(wrapper.get("actual_sha256") or "")
+            if not expected_sha256 or backup_sha256 != expected_sha256:
+                raise RuntimeError("Backup-Hash stimmt nicht mit dem gebundenen Wrapper-Preimage überein")
+            check.update({"ok": True, "backup": str(backup_path), "sha256": backup_sha256})
+        except Exception as exc:
+            check.update({"backup": str(backup_path), "error": str(exc)})
+        checks.append(check)
+
+    return {
+        "success": bool(wrapper_preview.get("success")) and all(item.get("ok") for item in checks),
+        "checks": checks,
+    }
 
 
 def backup_relative_path(path: Path) -> str:
@@ -916,6 +1269,8 @@ def write_readiness(ignore_active_lock: bool = False) -> dict[str, Any]:
 
     service_wrapper = file_check(SERVICE_WRAPPER, "Service-Wrapper", executable=True)
     installer_wrapper = file_check(INSTALLER_WRAPPER, "Installer-Wrapper", executable=True)
+    wrapper_integrity = wrapper_integrity_preview()
+    wrapper_integrity_ok = bool(wrapper_integrity.get("success")) and not wrapper_integrity.get("repair_needed")
     sudoers_exists = SUDOERS_FILE.exists()
     sudoers_has_service = str(SERVICE_WRAPPER) in sudoers_text
     sudoers_has_installer = str(INSTALLER_WRAPPER) in sudoers_text
@@ -941,6 +1296,14 @@ def write_readiness(ignore_active_lock: bool = False) -> dict[str, Any]:
         },
         service_wrapper,
         installer_wrapper,
+        {
+            "label": "Wrapperintegrität gegen lokalen Git-HEAD",
+            "ok": wrapper_integrity_ok,
+            "hard": True,
+            "status": wrapper_integrity.get("head") or "nicht gebunden",
+            "issue": None if wrapper_integrity_ok else "Wrapper fehlen, haben CRLF-Drift oder weichen unsicher von Git-HEAD ab",
+            "details": wrapper_integrity,
+        },
         {
             "label": "sudoers-Datei",
             "path": str(SUDOERS_FILE),
@@ -2395,20 +2758,22 @@ def repair_runtime_permissions(user: str) -> list[dict[str, Any]]:
     return steps
 
 
-def repair_permissions() -> dict[str, Any]:
+def repair_permissions(*, repair_runtime: bool = True) -> dict[str, Any]:
     """Write-mode only: replace sudoers with the wrapper-only target."""
     readiness = write_readiness()
-    wrappers_ok = SERVICE_WRAPPER.exists() and INSTALLER_WRAPPER.exists()
-    if not wrappers_ok:
-        return {
-            "success": False,
-            "message": "Rechte-Reparatur abgebrochen: Wrapper-Dateien fehlen.",
-            "readiness": readiness,
-        }
     if is_docker():
         return {
             "success": False,
             "message": "Rechte-Reparatur abgebrochen: Docker-Systeme nutzen keinen systemd/sudoers-Bare-Metal-Pfad.",
+            "readiness": readiness,
+        }
+
+    wrapper_preview = wrapper_integrity_preview()
+    if not wrapper_preview.get("success"):
+        return {
+            "success": False,
+            "message": "Rechte-Reparatur fail-closed abgebrochen: Wrapper stimmen nicht sicher mit dem lokalen Git-HEAD überein.",
+            "wrapper_integrity": wrapper_preview,
             "readiness": readiness,
         }
 
@@ -2436,34 +2801,58 @@ def repair_permissions() -> dict[str, Any]:
             "copied_count": backup_snapshot.get("copied_count", 0),
         })
 
+        backup_coverage = validate_wrapper_backup_coverage(wrapper_preview, backup_snapshot)
+        steps.append({
+            "step": "validate_wrapper_backup_coverage",
+            "ok": bool(backup_coverage.get("success")),
+            "checks": backup_coverage.get("checks", []),
+        })
+        if not backup_coverage.get("success"):
+            return {
+                "success": False,
+                "message": "Rechte-Reparatur abgebrochen: Wrapper-Preimages sind im Snapshot nicht vollständig gebunden.",
+                "steps": steps,
+                "wrapper_integrity": wrapper_preview,
+                "backup_snapshot": backup_snapshot,
+                "backup_coverage": backup_coverage,
+                "readiness": readiness,
+            }
+
         user = install_user()
-        steps.extend(repair_runtime_permissions(user))
-        for wrapper in (SERVICE_WRAPPER, INSTALLER_WRAPPER):
-            if not wrapper.exists():
-                steps.append({
-                    "step": "repair_wrapper_permissions",
-                    "ok": False,
-                    "path": str(wrapper),
-                    "error": "Wrapper fehlt",
-                })
-                continue
-            try:
-                shutil.chown(wrapper, user=user, group="www-data")
-                os.chmod(wrapper, 0o755)
-                steps.append({
-                    "step": "repair_wrapper_permissions",
-                    "ok": True,
-                    "path": str(wrapper),
-                    "owner": f"{user}:www-data",
-                    "mode": "755",
-                })
-            except Exception as exc:
-                steps.append({
-                    "step": "repair_wrapper_permissions",
-                    "ok": False,
-                    "path": str(wrapper),
-                    "error": str(exc),
-                })
+        wrapper_repair = repair_wrapper_integrity(user=user, group="www-data")
+        steps.extend(wrapper_repair.get("steps", []))
+        if not wrapper_repair.get("success"):
+            return {
+                "success": False,
+                "message": wrapper_repair.get("message") or "Wrapper-Reparatur fehlgeschlagen.",
+                "steps": steps,
+                "wrapper_integrity": wrapper_repair,
+                "backup_snapshot": backup_snapshot,
+                "readiness": readiness,
+            }
+
+        if repair_runtime:
+            steps.extend(repair_runtime_permissions(user))
+        wrapper_endgate = wrapper_integrity_preview()
+        wrapper_endgate_ok = (
+            wrapper_endgate.get("success")
+            and wrapper_endgate.get("head") == wrapper_repair.get("head")
+            and not wrapper_endgate.get("repair_needed")
+        )
+        steps.append({
+            "step": "validate_wrapper_integrity_before_sudoers",
+            "ok": bool(wrapper_endgate_ok),
+            "head": wrapper_endgate.get("head"),
+        })
+        if not wrapper_endgate_ok:
+            return {
+                "success": False,
+                "message": "Rechte-Reparatur abgebrochen: Wrapper-Endgate vor sudoers ist nicht grün.",
+                "steps": steps,
+                "wrapper_integrity": wrapper_endgate,
+                "backup_snapshot": backup_snapshot,
+                "readiness": readiness,
+            }
 
         if SUDOERS_FILE.exists():
             backup_path.write_text(SUDOERS_FILE.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
@@ -2539,6 +2928,7 @@ def repair_permissions() -> dict[str, Any]:
             "steps": steps,
             "backup": str(backup_path) if backup_path.exists() else None,
             "backup_snapshot": backup_snapshot,
+            "wrapper_integrity": wrapper_endgate,
             "readiness": post,
             "rollback_plan": [
                 f"Backup zurueckspielen: {backup_path}",

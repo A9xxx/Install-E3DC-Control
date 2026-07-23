@@ -152,7 +152,7 @@ Ein fester Tag bleibt absichtlich fest; `config --images` zeigt vorab das
 tatsächlich gewählte Image. `--force-recreate` startet den Container daraus
 neu.
 
-**Docker-Rückfall von v5.4.0b auf den veröffentlichten Docker-Rollback-Root:**
+**Docker-Rückfall von v5.4.0c auf den veröffentlichten Docker-Rollback-Root:**
 ```bash
 TAG=v5.3.2b
 cd "$E3DC_DOCKER_PATH"

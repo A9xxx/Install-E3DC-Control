@@ -1,9 +1,9 @@
 {
-  "version": "5.4.0b",
+  "version": "5.4.0c",
   "min_version": "4.0.0",
-  "stable_release": "v5.4.0b",
+  "stable_release": "v5.4.0c",
   "release_date": "2026-07-23",
-  "description": "v5.4.0b - Update-, Wallbox- und POWER_SETTINGS-Hotfix",
+  "description": "v5.4.0c - Alt-Updater-, openWB-Pro- und SoC-Hotfix",
   "installer_requires": "python3",
   "sanitized_republication": false,
   "history_transition": {
@@ -24,7 +24,7 @@
       "rollback_root": true,
       "bare_metal_supported": false,
       "docker_supported": true,
-      "notes": "Sanitierter parentloser Docker-Rollback-Root; wegen des fehlenden zielgebundenen Finalizers kein Bare-Metal-Programm-Rückfall."
+      "notes": "Sanitierter parentloser Docker-Rollback-Root; wegen des fehlenden zielgebundenen Finalizers kein Bare-Metal-Programm-Rollback."
     }
   ],
   "rollback_release_shas": {

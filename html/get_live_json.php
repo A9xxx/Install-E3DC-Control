@@ -627,6 +627,10 @@ function vehicleSocSourcePriority($source, $isInterpolated = false, $lastUpdated
     }
     if (in_array($source, ['openwb_pro_raw', 'ccs_wallbox', 'ccs_wallbox_wb2', 'openwb_mqtt'], true)) return 4;
     if (in_array($source, ['openwb_pro_estimated', 'manual_soc', 'manual'], true)) return 3;
+    // Eine frische, profilgebundene Interpolation aus einem bestätigten
+    // Fahrzeuganker darf einen inzwischen alten Cloud-Anker fortschreiben.
+    // Roh- und Eigenwerte der openWB Pro bleiben im Merge trotzdem vorrangig.
+    if (strpos($source, 'wallbox_estimated_from_') === 0 && wallboxSocRuleConfirmed($source, null)) return 3;
     return !empty($isInterpolated) ? 2 : 1;
 }
 
@@ -1113,6 +1117,24 @@ function mergeVehicleRecords($base, $incoming) {
     $basePriority = vehicleSocSourcePriority($merged['soc_source'] ?? '', $merged['is_interpolated'] ?? false, $merged['last_updated_at'] ?? null);
     $incomingSocWins = vehicleValuePresent($incoming['soc'] ?? null)
         && (!vehicleValuePresent($merged['soc'] ?? null) || $incomingPriority >= $basePriority);
+    $baseSocSource = strtolower(trim((string)($merged['soc_source'] ?? '')));
+    $incomingSocSource = strtolower(trim((string)($incoming['soc_source'] ?? '')));
+    if (in_array($baseSocSource, ['openwb_pro_raw', 'openwb_pro_estimated'], true)
+        && strpos($incomingSocSource, 'wallbox_estimated_from_') === 0) {
+        $incomingSocWins = false;
+    }
+    $baseIsProfileFallback = !empty($merged['soc_profile_bound'])
+        || strpos($baseSocSource, 'wallbox_estimated') === 0;
+    if (!empty($incoming['soc_profile_binding_invalid'])) {
+        $incomingSocWins = false;
+        if (!vehicleValuePresent($merged['soc'] ?? null) || $baseIsProfileFallback) {
+            $merged['soc'] = null;
+            unset($merged['range_km']);
+            $merged['soc_source'] = 'wallbox_estimated_profile_binding_invalid';
+            $merged['soc_rule_confirmed'] = false;
+            $merged['soc_profile_binding_invalid'] = true;
+        }
+    }
     if ($incomingSocWins) {
         foreach (['soc', 'range_km', 'soc_source', 'soc_source_previous', 'soc_rule_confirmed', 'soc_stale', 'soc_cache_ts', 'is_interpolated', 'last_updated_at'] as $key) {
             if (array_key_exists($key, $incoming)) {
@@ -1120,6 +1142,9 @@ function mergeVehicleRecords($base, $incoming) {
             } else {
                 unset($merged[$key]);
             }
+        }
+        if (empty($incoming['soc_profile_binding_invalid'])) {
+            unset($merged['soc_profile_binding_invalid']);
         }
     }
     $basePlugged = liveBoolValue($merged['is_plugged_in'] ?? false) || liveBoolValue($merged['is_charging'] ?? false);
@@ -4197,15 +4222,29 @@ if (!empty($savedCars)) {
                 $mD = @json_decode(file_get_contents($manSoC), true);
                 $manualCarId = $mD['car_id'] ?? '';
                 $manualProfileId = savedCarIdForVehicleIdentifiers($savedCars, [
-                    'profile_id' => $manualCarId,
+                    'profile_id' => $mD['profile_id'] ?? $manualCarId,
+                    'car_id' => $manualCarId,
                     'vehicle_id' => $mD['vehicle_id'] ?? '',
                 ], $mD['name'] ?? '');
                 $manualSlot = (int)($mD['wb'] ?? $idx);
                 $manualSocConfirmed = $mD && wallboxSocRuleConfirmed($mD['source'] ?? '', $mD['soc_rule_confirmed'] ?? null);
+                if ($mD
+                    && !empty($mD['soc_profile_binding_invalid'])
+                    && $manualProfileId !== null
+                    && $manualProfileId === ($sc['id'] ?? '')
+                    && wallboxSlotLooksConnected($data, $manualSlot)) {
+                    $sc['soc_profile_binding_invalid'] = true;
+                    $sc['soc_source'] = 'wallbox_estimated_profile_binding_invalid';
+                    $sc['soc_rule_confirmed'] = false;
+                    $sc['wb_slot'] = $manualSlot;
+                    $sc['is_plugged_in'] = true;
+                    $sc['is_charging'] = false;
+                }
                 if ($mD && $manualSocConfirmed && $manualProfileId !== null && $manualProfileId === ($sc['id'] ?? '') && wallboxSlotLooksConnected($data, $manualSlot)) {
                     $sc['soc'] = $mD['soc'];
                     $sc['soc_source'] = $mD['source'] ?? 'manual_soc';
                     $sc['soc_rule_confirmed'] = true;
+                    $sc['soc_profile_bound'] = !empty($mD['soc_profile_bound']);
                     $sc['is_interpolated'] = !empty($mD['is_interpolated']) || strpos((string)($mD['source'] ?? ''), 'estimated') !== false;
                     if (!empty($mD['range_km'])) $sc['range_km'] = (float)$mD['range_km'];
                     if (!empty($mD['consumption_kwh_100km'])) $sc['consumption_kwh_100km'] = (float)$mD['consumption_kwh_100km'];

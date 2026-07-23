@@ -441,6 +441,10 @@ class PhaseSwitchSequencer:
             self._state["_openwb_pro_phase_sequence_stage"] = "ready"
             self._state["_openwb_pro_phase_sequence_target"] = 0
             self._state["_openwb_pro_phase_sequence_current_allowed_after"] = 0.0
+            # Die kurze Geräte-Settle-Sperre endet mit dem bestätigten Ziel.
+            # Die separat persistierte 480-s-Phasenwechsel-Sperre bleibt
+            # unangetastet und verhindert nur die nächste Umschaltung.
+            openwb_pro_session.clear_phase_wait(self._state)
             phase_transition.set_stage(self._state, "confirm_target")
 
         self._pending = None

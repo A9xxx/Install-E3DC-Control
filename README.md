@@ -1,12 +1,12 @@
 # E3DC-Control Web-Portal & Installer
 
-Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.4.0b</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
+Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.4.0c</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
 
 ![E3DC-Control Dashboard](html/app-icon-512.png)
 
 ## Aktuelle Version und Update
 
-Die aktuelle stabile Version ist **5.4.0b**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur geprüften Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
+Die aktuelle stabile Version ist **5.4.0c**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur geprüften Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
 
 > [!WARNING]
 > **⚠️ Achtung: Nutzung auf eigenes Risiko!**
@@ -20,7 +20,7 @@ Die aktuelle stabile Version ist **5.4.0b**. Hinweise zum Web-, Konsolen- und Do
 
 > **Bedienansichten:** Config-Editor und Wallbox-Seite unterscheiden zwischen einfacher Ansicht für Einrichtung und täglichen Betrieb sowie erweiterter Ansicht für alle Detailparameter. Die Logik und Abgrenzung sind in [doc/Frontend_Ansichten.md](doc/Frontend_Ansichten.md) dokumentiert.
 
-> **Neu in 5.4.0b Stable:** Der Updater arbeitet auf PEP-668-Systemen ausschließlich im gebundenen Benutzer-venv und verweist Docker-Nutzer auf das Image-Update am Host. Systemd-Masken, Wrapper und sudoers werden transaktional behandelt. openWB Pro erkennt eine neue Stecksession entprellt, startet stromgeführt und nutzt den kurzen CP-Wake-up im Automatikmodus nur bei belegter Gerätefähigkeit und ausbleibender Ladeannahme. Der gemeinsame Zero-Budget-Vertrag hält oder stoppt alle Wallboxpfade konsistent. Unklare `POWER_SETTINGS`-SET-Antworten können nur durch einen exakt passenden GET-Readback bestätigt werden; temporäre Grenzen werden nicht als dauerhafte Ladefähigkeit geplant.
+> **Neu in 5.4.0c Stable:** Der Web-Updater schließt den echten Übergang aus 5.3.2a/b ohne System-`pip` und ohne falschen Dienstfehler. openWB Pro startet nach bestätigtem Anstecken zügig, verwendet beim Phasenwechsel nur eine kurze sichere CP-Unterbrechung und sperrt danach 480 Sekunden ausschließlich einen weiteren Wechsel. Pause, stecksessiongebundene SoC-Interpolation und Ladeende-Persistenz melden nur bestätigte Wirkung.
 
 > **Neu in 5.4.0a Stable:** Das Core-Update ist von optionalen Matter-Paketen getrennt, der Web-Updater erkennt und repariert eine reine CRLF-Beschädigung seines veröffentlichten Wrappers kontrolliert, und alte Shelly-EM-Zähler der ersten Generation können über ihre lokale read-only-Status-API eingebunden werden.
 
@@ -255,7 +255,7 @@ docker compose up -d --force-recreate e3dc-control
 > `ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}`. Ohne Eintrag
 > folgt sie dem geprüften Stable-Tag `latest`. Ein fester Versions-Tag wechselt
 > bei `pull` absichtlich nicht; für einen bewussten Pin wird
-> `E3DC_IMAGE_TAG=v5.4.0b` in `.env` gesetzt. `config --images` zeigt vor dem
+> `E3DC_IMAGE_TAG=v5.4.0c` in `.env` gesetzt. `config --images` zeigt vor dem
 > Pull das tatsächlich gewählte Image.
 
 > **Wichtig bei zusätzlichen Code-Volumes:** Ein lokales Verzeichnis unter

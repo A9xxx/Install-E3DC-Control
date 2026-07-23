@@ -28,7 +28,7 @@ if __package__ in (None, ""):
     from Installer.config_manager import run_config_wizard
     from Installer.config_secret_permissions import config_secret_dir_mode_text, config_secret_file_mode_text
     from Installer.service_catalog import allowed_services, iter_modules
-    from Installer.backup_integrity import BackupIntegrityError, PRIVATE_ML_ROOT, validate_private_ml_store
+    from Installer.backup_integrity import BackupIntegrityError, PRIVATE_ML_ROOT, _open_regular_file_nofollow, validate_private_ml_store
 else:
     from .core import CAT_ENV, register_command
     from .utils import run_command
@@ -37,7 +37,7 @@ else:
     from .config_manager import run_config_wizard
     from .config_secret_permissions import config_secret_dir_mode_text, config_secret_file_mode_text
     from .service_catalog import allowed_services, iter_modules
-    from .backup_integrity import BackupIntegrityError, PRIVATE_ML_ROOT, validate_private_ml_store
+    from .backup_integrity import BackupIntegrityError, PRIVATE_ML_ROOT, _open_regular_file_nofollow, validate_private_ml_store
 
 INSTALL_USER = get_install_user()
 INSTALL_HOME = get_home_dir(INSTALL_USER)
@@ -56,6 +56,8 @@ NATIVE_LIVE_SERVICE = "e3dc-live"
 LEGACY_SCREEN_NAMES = ("e3dc", "E3DC")
 PI_GUARD_PATH = "/usr/local/bin/pi_guard.sh"
 PIGUARD_SERVICE = "/etc/systemd/system/piguard.service"
+WATCHDOG_UPDATE_PAUSE_FILE = "/var/www/html/ramdisk/watchdog.update_pause"
+WALLBOX_PLAN_JOB_ROOT = "/var/www/html/data/.wallbox_plan_jobs"
 HA_MANAGED_SERVICES = (
     "e3dc", "e3dc-live", "e3dc-storage-manager", "e3dc-storage-simulator",
     "e3dc-epex-manager", "e3dc-weather-manager", "e3dc-wallbox-manager",
@@ -177,6 +179,7 @@ def ensure_private_ml_model_store():
 # ANSI Colors
 GREEN = '\033[92m'
 RED = '\033[91m'
+YELLOW = '\033[93m'
 RESET = '\033[0m'
 
 
@@ -197,8 +200,8 @@ def refresh_watchdog_guard_script():
             log_warning("permissions", "Watchdog-Skript nicht verändert: keine Router-IP konfiguriert.")
             return False
         monitor_file = current.get("MONITOR_FILE") or ""
-        create_pi_guard(router_ip, monitor_file)
-        run_command("sudo systemctl restart piguard.service", timeout=20)
+        if create_pi_guard(router_ip, monitor_file) is not True:
+            raise RuntimeError("Watchdog-Bundle-Transaktion meldet keinen Erfolg")
         print(f"{GREEN}[OK]{RESET} Watchdog-Skript aktualisiert.")
         return True
     except Exception as exc:
@@ -489,7 +492,63 @@ def _private_matter_storage_issues(storage_path):
     return findings
 
 
-def check_webportal_permissions():
+def _private_wallbox_plan_job_issues(storage_path=WALLBOX_PLAN_JOB_ROOT):
+    """Prüft den ausschließlich von www-data verwendeten Planner-Transaktionsbaum."""
+
+    if not os.path.lexists(storage_path):
+        return {"missing"}
+    findings = set()
+    try:
+        root_stat = os.lstat(storage_path)
+    except OSError:
+        return {"unsafe"}
+    if stat.S_ISLNK(root_stat.st_mode) or not stat.S_ISDIR(root_stat.st_mode):
+        return {"unsafe"}
+
+    entries = [(storage_path, root_stat, "dir")]
+    try:
+        for current_dir, dirnames, filenames in os.walk(
+            storage_path,
+            topdown=True,
+            followlinks=False,
+        ):
+            for name in dirnames:
+                path = os.path.join(current_dir, name)
+                entries.append((path, os.lstat(path), "dir"))
+            for name in filenames:
+                path = os.path.join(current_dir, name)
+                entries.append((path, os.lstat(path), "file"))
+    except OSError:
+        findings.add("unsafe")
+
+    for _path, metadata, expected_kind in entries:
+        expected_type = (
+            stat.S_ISDIR(metadata.st_mode)
+            if expected_kind == "dir"
+            else stat.S_ISREG(metadata.st_mode)
+        )
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not expected_type
+            or (expected_kind == "file" and metadata.st_nlink != 1)
+        ):
+            findings.add("unsafe")
+            continue
+        try:
+            owner = pwd.getpwuid(metadata.st_uid).pw_name
+            group = grp.getgrgid(metadata.st_gid).gr_name
+        except KeyError:
+            findings.add("owner")
+        else:
+            if owner != "www-data" or group != "www-data":
+                findings.add("owner")
+        expected_mode = 0o700 if expected_kind == "dir" else 0o600
+        if stat.S_IMODE(metadata.st_mode) != expected_mode:
+            findings.add("mode")
+    return findings
+
+
+def check_webportal_permissions(include_service_checks=True):
     """Prüft Webportal-Verzeichnis."""
     print("\n=== Webportal-Rechteprüfung ===\n")
     perm_logger.info("--- Starte Webportal-Rechteprüfung ---")
@@ -624,12 +683,16 @@ def check_webportal_permissions():
             issue_key = f"matter-storage_{matter_issue}"
             if issue_key not in issues:
                 issues.append(issue_key)
+        for planner_issue in sorted(_private_wallbox_plan_job_issues()):
+            issue_key = f"wallbox-plan-jobs_{planner_issue}"
+            if issue_key not in issues:
+                issues.append(issue_key)
 
 
         # NEU (Bare Metal): Prüfe ob Apache läuft und enabled ist
         home_dir = get_home_dir(INSTALL_USER)
         is_docker = os.path.exists(os.path.join(home_dir, "e3dc-docker", "docker-compose.yml"))
-        if not is_docker:
+        if include_service_checks and not is_docker:
             res_active = run_command("systemctl is-active apache2")
             res_enabled = run_command("systemctl is-enabled apache2")
             php_mod = run_command("apache2ctl -M 2>/dev/null | grep -E 'php.*_module|php_module'")
@@ -1082,10 +1145,15 @@ def fix_webportal_permissions(issues):
     success = True
     wp_path = "/var/www/html"
     matter_storage = f"{wp_path}/data/matter-storage"
+    wallbox_plan_jobs = WALLBOX_PLAN_JOB_ROOT
     v4_json_path = f"{wp_path}/data/e3dc_v4.json"
     config_backup_dir = f"{wp_path}/data/config_backups"
     for matter_issue in sorted(_private_matter_storage_issues(matter_storage)):
         issue_key = f"matter-storage_{matter_issue}"
+        if issue_key not in issues:
+            issues.append(issue_key)
+    for planner_issue in sorted(_private_wallbox_plan_job_issues(wallbox_plan_jobs)):
+        issue_key = f"wallbox-plan-jobs_{planner_issue}"
         if issue_key not in issues:
             issues.append(issue_key)
     if not _ensure_install_user_www_data_group():
@@ -1120,7 +1188,8 @@ def fix_webportal_permissions(issues):
         print(f"  → Setze Besitzer rekursiv: {wp_path} -> {INSTALL_USER}:www-data")
         result = run_command(
             f"sudo find -P {wp_path} -xdev "
-            f"\\( -path {matter_storage} -o -path {v4_json_path} -o -path {config_backup_dir} \\) -prune -o "
+            f"\\( -path {matter_storage} -o -path {wallbox_plan_jobs} "
+            f"-o -path {v4_json_path} -o -path {config_backup_dir} \\) -prune -o "
             f"\\( -type d -o -type f \\) -exec chown {INSTALL_USER}:www-data {{}} +"
         )
         if result['success']:
@@ -1131,7 +1200,8 @@ def fix_webportal_permissions(issues):
         print(f"  → Setze Verzeichnisrechte rekursiv: {wp_path} -> 775")
         result_dirs = run_command(
             f"sudo find -P {wp_path} -xdev "
-            f"\\( -path {matter_storage} -o -path {v4_json_path} -o -path {config_backup_dir} \\) -prune -o "
+            f"\\( -path {matter_storage} -o -path {wallbox_plan_jobs} "
+            f"-o -path {v4_json_path} -o -path {config_backup_dir} \\) -prune -o "
             f"-type d -exec chmod 775 {{}} +"
         )
         if result_dirs['success']:
@@ -1143,7 +1213,8 @@ def fix_webportal_permissions(issues):
         print(f"  → Setze Dateirechte rekursiv: {wp_path} -> 664")
         result_files = run_command(
             f"sudo find -P {wp_path} -xdev "
-            f"\\( -path {matter_storage} -o -path {v4_json_path} -o -path {config_backup_dir} \\) -prune -o "
+            f"\\( -path {matter_storage} -o -path {wallbox_plan_jobs} "
+            f"-o -path {v4_json_path} -o -path {config_backup_dir} \\) -prune -o "
             f"-type f -exec chmod 664 {{}} +"
         )
         if result_files['success']:
@@ -1312,12 +1383,60 @@ def fix_webportal_permissions(issues):
     if "data_owner" in issues:
         print(f"  → Setze Datenbank-Verzeichnis Besitzer: {wp_path}/data -> {INSTALL_USER}:www-data")
         run_command(
-            f"sudo find {wp_path}/data -path {matter_storage} -prune -o "
+            f"sudo find -P {wp_path}/data "
+            f"\\( -path {matter_storage} -o -path {wallbox_plan_jobs} \\) -prune -o "
             f"\\( -type d -o -type f \\) -exec chown {INSTALL_USER}:www-data {{}} +"
         )
     if "data_missing" in issues or "data_mode" in issues:
         print(f"  -> Setze Datenbank-Verzeichnis Rechte: {wp_path}/data -> 2775")
         run_command(f"sudo chmod 2775 {wp_path}/data")  # KEIN -R: Unterverzeichnisse (history_backups, luxtronik_archive) haben eigene Soll-Rechte!
+
+    # Der Planner-Transaktionsbaum gehört ausschließlich dem PHP-Prozess.
+    # Alle breiten Web-/data-Reparaturen prunen ihn; erst danach wird seine
+    # private 0700/0600-Grenze als eigener Endzustand gesetzt.
+    if "wallbox-plan-jobs_missing" in issues:
+        print(f"  → Erstelle privaten Wallbox-Planer-Transaktionsbaum: {wallbox_plan_jobs}")
+        result = run_command(
+            f"sudo install -d -m 0700 -o www-data -g www-data {wallbox_plan_jobs}"
+        )
+        if not result["success"]:
+            print(f"{RED}✗{RESET} Privater Wallbox-Planer-Transaktionsbaum konnte nicht erstellt werden.")
+            success = False
+    if "wallbox-plan-jobs_unsafe" in issues:
+        print(
+            f"{RED}✗{RESET} Wallbox-Planer-Transaktionsbaum enthält Links, "
+            "Sonderdateien oder Mehrfachlinks; keine automatische Änderung."
+        )
+        success = False
+    elif os.path.lexists(wallbox_plan_jobs):
+        print(
+            "  → Setze privaten Wallbox-Planer-Transaktionsbaum: "
+            f"{wallbox_plan_jobs} -> www-data:www-data 700/600"
+        )
+        owner_result = run_command(
+            f"sudo find -P {wallbox_plan_jobs} -xdev "
+            f"\\( -type d -o -type f \\) -exec chown www-data:www-data {{}} +"
+        )
+        directory_result = run_command(
+            f"sudo find -P {wallbox_plan_jobs} -xdev -type d -exec chmod 0700 {{}} +"
+        )
+        file_result = run_command(
+            f"sudo find -P {wallbox_plan_jobs} -xdev -type f -exec chmod 0600 {{}} +"
+        )
+        if not (
+            owner_result["success"]
+            and directory_result["success"]
+            and file_result["success"]
+        ):
+            print(f"{RED}✗{RESET} Private Wallbox-Planer-Rechte konnten nicht exakt gesetzt werden.")
+            success = False
+        remaining = _private_wallbox_plan_job_issues(wallbox_plan_jobs)
+        if remaining:
+            print(
+                f"{RED}✗{RESET} Private Wallbox-Planer-Rechte bleiben unvollständig: "
+                + ", ".join(sorted(remaining))
+            )
+            success = False
 
     # Explizit e3dc_v4.json Rechte reparieren (kann nach WinSCP-Direktbearbeitung falsch sein)
     if os.path.exists(v4_json_path):
@@ -1748,46 +1867,45 @@ def check_sudoers_permissions():
     print("\n=== Sudoers-Prüfung (Web-Funktionen) ===\n")
     perm_logger.info("--- Starte Sudoers-Prüfung ---")
 
-    service_wrapper_path = os.path.join(INSTALLER_DIR, 'service_wrapper.sh')
-    installer_wrapper_path = os.path.join(INSTALLER_DIR, 'installer_wrapper.sh')
-    wrapper_sudoers_content = "\n".join([
-        "# E3DC-Control WebUI wrapper permissions",
-        "# Managed by the Web-Installer. Do not add direct systemctl commands here.",
-        f"www-data ALL=(root) NOPASSWD: {service_wrapper_path}",
-        f"www-data ALL=(root) NOPASSWD: {installer_wrapper_path}",
-    ])
+    try:
+        if __package__ in (None, ""):
+            from Installer import web_installer
+        else:
+            from . import web_installer
+        sudoers_findings = web_installer.sudoers_file_findings()
+        wrapper_sudoers_content = web_installer.desired_sudoers_content().strip()
+        sudoers_file_path = str(web_installer.SUDOERS_FILE)
+    except Exception as e:
+        print(f"{RED}FEHLER{RESET} Zentrale Sudoers-Klassifizierung fehlgeschlagen: {e}")
+        perm_logger.error("Zentrale Sudoers-Klassifizierung fehlgeschlagen: %s", e)
+        return [{"scan_error": True, "file": "/etc/sudoers.d", "error": str(e)}]
 
     expected_sudoers_files = [
         {
-            "file": "/etc/sudoers.d/020_e3dc_services",
+            "file": sudoers_file_path,
             "content": wrapper_sudoers_content,
             "description": "WebUI Service-/Installer-Wrapper"
         }
     ]
 
     issues = []
-    legacy_findings = []
-    try:
-        for name in sorted(os.listdir("/etc/sudoers.d")):
-            if ".bak-webinstaller-" in name or ".tmp-webinstaller-" in name:
-                continue
-            path = os.path.join("/etc/sudoers.d", name)
-            if not os.path.isfile(path):
-                continue
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
-                for line_no, raw_line in enumerate(f.read().splitlines(), start=1):
-                    line = raw_line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    is_wrapper = service_wrapper_path in line or installer_wrapper_path in line
-                    is_direct_web = "www-data" in line and "NOPASSWD:" in line and not is_wrapper
-                    is_direct_systemctl = "systemctl" in line and not is_wrapper
-                    is_legacy = "e3dc.service" in line
-                    if is_direct_web or is_direct_systemctl or is_legacy:
-                        legacy_findings.append(f"{path}:{line_no}: {line}")
-    except Exception as e:
-        print(f"{RED}FEHLER{RESET} Sudoers-Scan konnte nicht vollstaendig lesen: {e}")
-        perm_logger.warning("Sudoers-Scan konnte nicht vollstaendig lesen: %s", e)
+    repairable_findings = [
+        f"{item.get('file')}:{item.get('line_no')}: {item.get('line')}"
+        for item in sudoers_findings.get("repairable_lines", [])
+    ]
+    external_systemctl_findings = [
+        f"{item.get('file')}:{item.get('line_no')}: {item.get('line')}"
+        for item in sudoers_findings.get("external_systemctl_lines", [])
+    ]
+    external_web_findings = [
+        f"{item.get('file')}:{item.get('line_no')}: {item.get('line')}"
+        for item in sudoers_findings.get("external_direct_web_lines", [])
+    ]
+    external_e3dc_systemctl_findings = [
+        f"{item.get('file')}:{item.get('line_no')}: {item.get('line')}"
+        for item in sudoers_findings.get("e3dc_systemctl_lines", [])
+        if item.get("scope") != "e3dc"
+    ]
 
     for sudo_def in expected_sudoers_files:
         sudoers_file = sudo_def["file"]
@@ -1827,25 +1945,88 @@ def check_sudoers_permissions():
                 print(f"{RED}✗{RESET} Fehler beim Lesen von {sudoers_file}: {e}")
                 perm_logger.error(f"Fehler beim Lesen von {sudoers_file}: {e}")
                 issues.append({"error": True, "file": sudoers_file})
-    if legacy_findings:
-        print(f"{RED}FEHLER{RESET} Alte direkte WebUI-sudoers-Freigaben gefunden ({len(legacy_findings)} Zeile(n)).")
-        for finding in legacy_findings[:8]:
+    if repairable_findings:
+        print(f"{RED}FEHLER{RESET} Alte direkte E3DC-WebUI-sudoers-Freigaben gefunden ({len(repairable_findings)} Zeile(n)).")
+        for finding in repairable_findings[:8]:
             print(f"  - {finding}")
-        if len(legacy_findings) > 8:
-            print(f"  ... {len(legacy_findings) - 8} weitere Zeile(n)")
-        perm_logger.warning("Alte direkte WebUI-sudoers-Freigaben gefunden: %s", legacy_findings)
+        if len(repairable_findings) > 8:
+            print(f"  ... {len(repairable_findings) - 8} weitere Zeile(n)")
+        perm_logger.warning("Alte direkte E3DC-WebUI-sudoers-Freigaben gefunden: %s", repairable_findings)
         issues.append({
             "legacy_cleanup": True,
             "file": "/etc/sudoers.d",
             "content": wrapper_sudoers_content,
-            "findings": legacy_findings,
+            "findings": repairable_findings,
         })
+    if external_web_findings:
+        print(
+            f"{RED}FEHLER{RESET} Fremdes sudoers-Fragment gewährt www-data direkte Kommandos "
+            f"({len(external_web_findings)} Zeile(n)); der E3DC-Installer verändert es nicht automatisch."
+        )
+        for finding in external_web_findings[:8]:
+            print(f"  - {finding}")
+        if len(external_web_findings) > 8:
+            print(f"  ... {len(external_web_findings) - 8} weitere Zeile(n)")
+        perm_logger.error(
+            "Fremde direkte www-data-Freigaben blockieren fail-closed: %s",
+            external_web_findings,
+        )
+        issues.append({
+            "external_direct_web": True,
+            "file": "/etc/sudoers.d",
+            "findings": external_web_findings,
+        })
+    if external_e3dc_systemctl_findings:
+        print(
+            f"{RED}FEHLER{RESET} Fremdes sudoers-Fragment steuert E3DC-Dienste direkt "
+            f"({len(external_e3dc_systemctl_findings)} Zeile(n)); "
+            "der E3DC-Installer verändert es nicht automatisch."
+        )
+        for finding in external_e3dc_systemctl_findings[:8]:
+            print(f"  - {finding}")
+        if len(external_e3dc_systemctl_findings) > 8:
+            print(f"  ... {len(external_e3dc_systemctl_findings) - 8} weitere Zeile(n)")
+        perm_logger.error(
+            "Fremde direkte E3DC-systemctl-Freigaben blockieren fail-closed: %s",
+            external_e3dc_systemctl_findings,
+        )
+        issues.append({
+            "external_e3dc_systemctl": True,
+            "file": "/etc/sudoers.d",
+            "findings": external_e3dc_systemctl_findings,
+        })
+    if external_systemctl_findings:
+        print(
+            f"{YELLOW}⚠{RESET} Fremdverwaltete direkte sudoers-Freigaben gefunden "
+            f"({len(external_systemctl_findings)} Zeile(n)); sie bleiben unverändert und blockieren das Update nicht."
+        )
+        for finding in external_systemctl_findings[:8]:
+            print(f"  - {finding}")
+        if len(external_systemctl_findings) > 8:
+            print(f"  ... {len(external_systemctl_findings) - 8} weitere Zeile(n)")
+        perm_logger.warning(
+            "Fremdverwaltete sudoers-Freigaben bleiben unverändert: %s",
+            external_systemctl_findings,
+        )
     return issues
 
 def fix_sudoers_permissions(issues):
     """Erstellt oder korrigiert die Sudoers-Dateien für Web-Funktionen."""
     print("\n→ Richte Sudoers für Web-Funktionen ein…\n")
     if issues:
+        if any(
+            issue.get("external_direct_web") or issue.get("external_e3dc_systemctl")
+            for issue in issues
+            if isinstance(issue, dict)
+        ):
+            print(
+                f"{RED}FEHLER{RESET} Fremde direkte Web-/E3DC-Freigaben werden aus Sicherheitsgründen "
+                "weder automatisch verändert noch durch einen E3DC-Reparaturlauf überdeckt."
+            )
+            perm_logger.error(
+                "Sudoers-Reparatur ohne Mutation abgebrochen: fremde direkte Web-/E3DC-Freigabe."
+            )
+            return False
         try:
             if __package__ in (None, ""):
                 from Installer import web_installer
@@ -1860,7 +2041,10 @@ def fix_sudoers_permissions(issues):
                 path = step.get("path") or step.get("backup") or ""
                 print(f"  {status} {label} {path}")
             if result.get("success"):
-                print(f"{GREEN}OK{RESET} Sudoers-Reparatur abgeschlossen: nur noch Wrapper-Freigaben aktiv.")
+                print(
+                    f"{GREEN}OK{RESET} Sudoers-Reparatur abgeschlossen: "
+                    "E3DC-WebUI nur noch über Wrapper; fremde Fragmente unverändert."
+                )
                 perm_logger.info("Sudoers ueber Web-Installer-Reparatur bereinigt.")
                 return True
             print(f"{RED}FEHLER{RESET} Web-Installer-Reparatur meldet Fehler: {result.get('message', 'unbekannt')}")
@@ -2189,8 +2373,57 @@ def fix_legacy_autostart(issues):
             
     return success
 
-def run_permissions_wizard(headless=False):
+def _release_quiesced_from_current_process(*, required_uid=0, max_age_s=3600):
+    """Erkennt ausschließlich das frische Update-Pausefenster dieses Prozesses."""
+    try:
+        descriptor, before = _open_regular_file_nofollow(WATCHDOG_UPDATE_PAUSE_FILE)
+        try:
+            if (
+                before.st_uid != int(required_uid)
+                or before.st_nlink != 1
+                or before.st_size < 2
+                or before.st_size > 4096
+                or before.st_mode & stat.S_IWOTH
+            ):
+                return False
+            payload_raw = os.read(descriptor, before.st_size + 1)
+            after = os.fstat(descriptor)
+            if (
+                len(payload_raw) != before.st_size
+                or (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+                != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+            ):
+                return False
+        finally:
+            os.close(descriptor)
+        payload = json.loads(payload_raw.decode("utf-8"))
+        if not isinstance(payload, dict) or payload.get("active") is not True:
+            return False
+        if int(payload.get("pid")) != os.getpid():
+            return False
+        if str(payload.get("reason") or "") not in {
+            "self-update",
+            "release-rollback",
+            "release-bootstrap",
+        }:
+            return False
+        timestamp = float(payload.get("ts"))
+        age_s = time.time() - timestamp
+        return -5.0 <= age_s <= float(max_age_s)
+    except (OSError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+
+
+def run_permissions_wizard(headless=False, release_quiesced=None):
     """Hauptlogik für Rechteprüfung und -korrektur."""
+    if release_quiesced is None:
+        # Kompatibilität für alte, bereits veröffentlichte Updater: Nach deren
+        # git reset lädt der laufende Prozess diese neue Funktion, übergibt den
+        # Parameter aber noch nicht. Nur das eigene frische Pausefenster darf
+        # den service-neutralen Release-Modus aktivieren.
+        release_quiesced = _release_quiesced_from_current_process()
+    else:
+        release_quiesced = bool(release_quiesced)
     
     # Führe zuerst alle Konfigurations-Checks und Migrationen aus
     config_ready = run_config_wizard()
@@ -2207,30 +2440,36 @@ def run_permissions_wizard(headless=False):
         log_warning("permissions", "Cleanup von root-Dateien hatte Fehler")
 
     # NEU: Alten Grabber endgültig entfernen
-    cleanup_legacy_grabber()
-    cleanup_stale_v4_processes()
+    if not release_quiesced:
+        cleanup_legacy_grabber()
+        cleanup_stale_v4_processes()
     cleanup_legacy_plots()
     
     # Alle alten Cronjobs aus dem System löschen
     cleanup_legacy_cronjobs()
 
     issues = check_permissions()
-    wp_issues = check_webportal_permissions()
+    wp_issues = check_webportal_permissions(include_service_checks=not release_quiesced)
     file_issues = check_file_permissions()
     sudo_issues = check_wrapper_integrity() + check_sudoers_permissions()
-    service_issues = check_services()
-    legacy_issues = check_legacy_autostart()
+    service_issues = [] if release_quiesced else check_services()
+    legacy_issues = [] if release_quiesced else check_legacy_autostart()
     watchdog_installed = os.path.exists(PI_GUARD_PATH) or os.path.exists(PIGUARD_SERVICE)
-    watchdog_refreshed = refresh_watchdog_guard_script()
+    watchdog_refreshed = True if release_quiesced else refresh_watchdog_guard_script()
     web_program_hardened = harden_web_program_permissions()
 
     has_issues = bool(issues) or bool(wp_issues) or bool(file_issues) or bool(sudo_issues) or bool(service_issues) or bool(legacy_issues) or not watchdog_refreshed or not web_program_hardened or not ml_store_ready
     if not has_issues:
-        print(f"\n{GREEN}✓{RESET} Alle Berechtigungen und Services sind korrekt.\n")
-        perm_logger.info("✓ Prüfung bestanden: Keine Probleme gefunden.")
-        details = "Alle Checks OK"
+        if release_quiesced:
+            print(f"\n{GREEN}✓{RESET} Service-neutrale Release-Berechtigungsprüfung bestanden.\n")
+            perm_logger.info("✓ Service-neutrale Release-Berechtigungsprüfung bestanden.")
+            details = "Release-Berechtigungen OK; Dienste absichtlich nicht geprüft"
+        else:
+            print(f"\n{GREEN}✓{RESET} Alle Berechtigungen und Services sind korrekt.\n")
+            perm_logger.info("✓ Prüfung bestanden: Keine Probleme gefunden.")
+            details = "Alle Checks OK"
         if watchdog_installed and watchdog_refreshed:
-            details += ", Watchdog aktualisiert"
+            details += ", Watchdog aktualisiert" if not release_quiesced else ", Watchdog unverändert"
         log_task_completed("Rechte prüfen & korrigieren", details=details)
         return True
 

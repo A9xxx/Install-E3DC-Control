@@ -262,7 +262,7 @@ $defaults = [
     "wb_restart_delay_s" => "60", "wb_min_charge_time_s" => "300", "wb_cloud_stop_delay_s" => "180", "wb_phase_change_hold_s" => "180",
     "wb1_restart_delay_s" => "", "wb1_min_charge_time_s" => "", "wb1_cloud_stop_delay_s" => "", "wb1_phase_change_hold_s" => "",
     "wb2_restart_delay_s" => "", "wb2_min_charge_time_s" => "", "wb2_cloud_stop_delay_s" => "", "wb2_phase_change_hold_s" => "", "wb_openwb_zero_budget_hold_s" => "300",
-    "openwb_pro_phase_wait_s" => "480", "openwb_pro_phase_cp_interrupt_duration_s" => "480", "openwb_pro_phase_restart_delay_s" => "0", "openwb_pro_start_wakeup_delay_s" => "5",
+    "openwb_pro_phase_wait_s" => "480", "openwb_pro_phase_cp_interrupt_duration_s" => "5", "openwb_pro_phase_restart_delay_s" => "0", "openwb_pro_start_wakeup_delay_s" => "5",
     "wb_openwb_primary_enable" => "0", "wb_openwb_auto_discovery" => "1", "wb_openwb_auto_role_enable" => "1", "wb_openwb_command_fail_limit" => "3", "wb_openwb_command_block_s" => "300", "wb_openwb_modbus_secondary_enable" => "0", "wb_openwb_modbus_port" => "1502", "wb_openwb_modbus_unit" => "1", "wb_openwb_modbus_connector" => "", "wb_openwb_modbus_offset" => "0",
     "wb_shadow_start_delay_s" => "75", "wb_shadow_power_ramp_s" => "60", "wb_shadow_meter_delay_s" => "30", "wb_shadow_meter_ramp_s" => "10", "wb_shadow_phase_pause_s" => "120", "wb_shadow_zero_budget_stop_s" => "300", "wb_shadow_zero_budget_grid_stop_s" => "90",
     "wb_native_enable" => "0", "wb_native_type" => "e3dc_auto", "wb_native_ip" => "", "wb1_topic_prefix" => "", "wb_native_type2" => "", "wb_native_ip2" => "", "wb2_topic_prefix" => "", "wb_native_mode" => "0", "dvcarlimit" => "0.0",
@@ -377,7 +377,7 @@ $tooltips = [
     "wb2_phase_change_hold_s" => "Optionaler WB2-Override für die Phasenwechsel-Haltezeit. Leer = globaler Wert.",
     "wb_openwb_zero_budget_hold_s" => "Legacy-Fallback für openWB Pro 0W-Haltezeit; neue Installationen nutzen die Wallbox-Zeitparameter oben.",
     "openwb_pro_phase_wait_s" => "Cooldown und Leistungsreservierung nach einem openWB-Pro-Phasenwechsel. Dieser Wert belegt nicht die reale CP-Unterbrechungsdauer.",
-    "openwb_pro_phase_cp_interrupt_duration_s" => "Reale CP-Unterbrechungsdauer ausschließlich beim Phasenwechsel. Wirksam immer mindestens 480 Sekunden; kleinere Altwerte werden sichtbar auf 480 Sekunden korrigiert.",
+    "openwb_pro_phase_cp_interrupt_duration_s" => "Kurzer Geräteimpuls beim Phasenwechsel, wirksam 2 bis 30 Sekunden. Ein früherer Wert von 480 Sekunden wird auf 5 Sekunden migriert; der getrennte 480-Sekunden-Cooldown sperrt nur einen weiteren Phasenwechsel.",
     "openwb_pro_phase_restart_delay_s" => "Zusätzliche Wiederanlaufverzögerung nach Ende der Phasen-CP-Unterbrechung. Strom wird außerdem nur bei frischem CP-inaktiv- und Zielphasen-Readback freigegeben.",
     "openwb_pro_start_wakeup_delay_s" => "Kurze Wartezeit nach einem separaten Start-/Wake-up-CP-Impuls. Dieser Impuls bleibt kurz und wird nicht auf 480 Sekunden verlängert.",
     "wb_openwb_auto_discovery" => "Liest openWB Software 2.x read-only aus und erkennt vorhandene Ladepunkte automatisch.",
@@ -5384,8 +5384,8 @@ if ($available_backups) {
                         <?= $configValidationMarker('openwb_pro_phase_wait_s') ?>
                     </div>
                     <div class="col-6 col-lg-3">
-                        <label class="config-label text-danger" data-tooltip="<?= htmlspecialchars($tooltipMap['openwb_pro_phase_cp_interrupt_duration_s'] ?? '') ?>">Pro Phasen-CP real (s)</label>
-                        <input type="number" min="1" max="7200" name="values[openwb_pro_phase_cp_interrupt_duration_s]" class="form-control config-input" value="<?= $val('openwb_pro_phase_cp_interrupt_duration_s') ?>" placeholder="480">
+                        <label class="config-label text-danger" data-tooltip="<?= htmlspecialchars($tooltipMap['openwb_pro_phase_cp_interrupt_duration_s'] ?? '') ?>">Kurzer CP-Impuls (s)</label>
+                        <input type="number" min="2" max="30" name="values[openwb_pro_phase_cp_interrupt_duration_s]" class="form-control config-input" value="<?= $val('openwb_pro_phase_cp_interrupt_duration_s') ?>" placeholder="5">
                         <?= $configValidationMarker('openwb_pro_phase_cp_interrupt_duration_s') ?>
                     </div>
                     <div class="col-6 col-lg-3">

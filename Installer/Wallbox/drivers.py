@@ -3391,7 +3391,7 @@ class E3DCMultiConnectCharger(E3DCCharger):
         """C++-konforme Multi-Connect-Freigabe über WBchar6/SET_EXTERN.
 
         Die direkten Multi-Tags liefern saubere Statuswerte und setzen den
-        Stromdeckel, starten die Multi Connect auf Alex' Anlage aber nicht
+        Stromdeckel, starten bestimmte Multi-Connect-Installationen aber nicht
         zuverlässig. Das alte C++-Programm nutzt für Start/Stop WBchar6:
         Byte 0 = Modus (1 Sonnenmodus, 2 Misch/Netz), Byte 1 = Ampere,
         Byte 4 = Toggle. Der Toggle darf nur als Impuls gesendet werden.
@@ -4732,7 +4732,10 @@ class OpenWBProCharger(WallboxDriver):
             action="openwb_pro_set_amp_and_state",
             payload={"target_amp": target_amp, "force_state": force_state},
         ):
-            return True
+            # Ein vom zentralen Ausgangsgate blockierter Schreibzug hat das
+            # Gerät nicht erreicht. Er darf deshalb weder als erfolgreicher
+            # STOP noch als übernommener Sollstrom an den Manager zurücklaufen.
+            return False
         try:
             raw_amp = float(target_amp or 0.0)
         except (TypeError, ValueError):

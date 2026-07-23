@@ -29,12 +29,31 @@ bash "$E3DC_INSTALL_PATH/e3dc-setup" --fix-permissions
 bash "$E3DC_INSTALL_PATH/e3dc-setup" --check
 ```
 
+Ist bei einer alten 5.3.2a-/5.3.2b-Installation bereits der privilegierte
+Web-Launcher fehlend oder nicht ausführbar, kann die Weboberfläche genau
+diesen Einstieg nicht selbst reparieren. Dann ist einmalig eine interaktive
+SSH-Konsole erforderlich:
+
+```bash
+cd "$E3DC_INSTALL_PATH"
+sudo python3 installer_main.py --fix-permissions
+sudo python3 installer_main.py --update-e3dc
+```
+
+Eine Passwortabfrage von `sudo` ist an der interaktiven SSH-Konsole in diesem
+Fall normal. Nach der erfolgreichen Reparatur steht der reguläre Web-Update-
+Pfad wieder zur Verfügung.
+
 Python-Abhängigkeiten werden bei einem Release-Wechsel ausschließlich im
 gebundenen Benutzer-venv installiert. Auf Debian-Systemen mit PEP 668 wird
 deshalb kein System-`pip` und kein `--break-system-packages` verwendet. Fehlt
-das Standard-venv, darf der Installer nach Installation von `python3-venv`
-genau dieses venv im Home des Installationsbenutzers neu anlegen. Abweichende
-oder mehrdeutige venv-Pfade brechen den Updatevorgang ab.
+das Standard-venv, darf der neue Installer nach Installation von
+`python3-venv` genau dieses venv im Home des Installationsbenutzers neu
+anlegen. Beim direkten ersten Wechsel aus 5.3.2a oder 5.3.2b läuft bis zum
+Git-Wechsel noch der alte Prozess; für diesen ersten Schritt muss das
+gebundene Benutzer-venv bereits vorhanden sein. Andernfalls bricht der
+Altprozess ab und stellt den Ausgangszustand wieder her. Abweichende oder
+mehrdeutige venv-Pfade brechen den Updatevorgang ebenfalls ab.
 
 In einer Docker-Installation führen weder Weboberfläche noch Konsole einen
 Release-Wechsel im laufenden Container aus. Sie zeigen stattdessen die drei
@@ -70,7 +89,8 @@ keinen gemeinsamen Vorfahren mit dem neuen Verlauf besitzen.
 
 ## Harte Gates
 
-Der Installer führt den Wechsel in dieser Reihenfolge aus:
+Sobald der neue Updater selbst läuft, führt er den Wechsel in dieser
+Reihenfolge aus:
 
 1. externes Backup mit vollständigem Manifest, SHA-256 und dem Zustand
    kanonischer systemd-Masken erstellen;
@@ -86,6 +106,13 @@ Der Installer führt den Wechsel in dieser Reihenfolge aus:
 8. eingefrorene HA-/Shadow-Rolle und Feature-Konfiguration, alle erwarteten
    Dienste, lokale HTTP-Endpunkte und Boot-Sanity hart prüfen.
 
+Beim direkten ersten Wechsel aus 5.3.2a oder 5.3.2b bleibt der bereits
+gestartete Altprozess bis zum Abschluss aktiv. Nach dem Git-Wechsel importiert
+er die neue, dienstneutrale Rechteprüfung; der zielgebundene Finalizer gilt ab
+dem anschließend laufenden neuen Updater. Der erste Wechsel behauptet deshalb
+keine nachträgliche Ausführung eines Finalizers, den der Altprozess noch nicht
+kennt.
+
 Scheitert ein Gate nach einer Änderung, setzt der Installer den alten Git-Stand
 zurück, entfernt bei einem ZIP-Bootstrap die neu angelegte `.git`-Struktur,
 stellt das Sicherheits-Backup wieder her und prüft Rolle, Dienste und HTTP
@@ -94,7 +121,7 @@ Writer-/Aktor-Dienste gestoppt.
 
 ## Gezielter Rückfall
 
-`v5.4.0b` bietet den bereinigten Root `v5.3.2b` ausschließlich als
+`v5.4.0c` bietet den bereinigten Root `v5.3.2b` ausschließlich als
 Docker-Rückfall-Image an. Dieser Root gibt selbst keinen älteren öffentlichen
 Tag frei. Auf Bare Metal wird `v5.3.2b` nicht als Programm-Rückfall angeboten,
 weil der Altstand keinen zielgebundenen Release-Finalizer enthält. Freie

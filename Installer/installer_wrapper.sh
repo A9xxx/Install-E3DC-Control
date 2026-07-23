@@ -10,9 +10,31 @@ set -u
 ACTION=${1:-}
 MODULE=${2:-}
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PYTHON_BIN="/usr/bin/python3"
+SYSTEM_PYTHON="/usr/bin/python3"
+PRODUCT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
+PYTHON_BIN="$SYSTEM_PYTHON"
 WEB_INSTALLER="${SCRIPT_DIR}/web_installer.py"
 INSTALLER_MAIN="${SCRIPT_DIR}/../installer_main.py"
+
+select_installer_python() {
+    local selected
+    if ! selected="$(
+        E3DC_INSTALL_ROOT="$PRODUCT_ROOT" \
+        PYTHONNOUSERSITE=1 \
+        PYTHONPATH= \
+        "$SYSTEM_PYTHON" -c \
+        'import os,sys; root=os.path.realpath(sys.argv[1]); sys.path.insert(0,root); from Installer.update import select_wrapper_python; print(select_wrapper_python(sys.argv[2]))' \
+        "$PRODUCT_ROOT" "$ACTION"
+    )"; then
+        echo "Vertrauenswürdiger Python-Interpreter für ${ACTION} konnte nicht gebunden werden." >&2
+        return 1
+    fi
+    if [ -z "$selected" ] || [ "${selected#/}" = "$selected" ] || [ ! -x "$selected" ]; then
+        echo "Ungültiger Python-Interpreter für ${ACTION}." >&2
+        return 1
+    fi
+    PYTHON_BIN="$selected"
+}
 
 usage() {
     echo "Usage: $0 <catalog|diagnose|status|validate_config|update_check|run_job|run_write_job|check|fix_permissions|update_e3dc|install_release> [module/tag]"
@@ -45,6 +67,10 @@ fi
 if [[ "$ACTION" =~ ^(check|fix_permissions|update_e3dc|install_release)$ ]] && [ ! -f "$INSTALLER_MAIN" ]; then
     echo "installer_main.py nicht gefunden: $INSTALLER_MAIN"
     exit 1
+fi
+
+if [[ "$ACTION" =~ ^(check|fix_permissions|update_e3dc|install_release)$ ]]; then
+    select_installer_python || exit 1
 fi
 
 case "$ACTION" in

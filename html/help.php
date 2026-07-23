@@ -115,7 +115,7 @@ $paths = getInstallPaths();
     <div class="container">
         <div class="d-flex justify-content-between align-items-center mb-4">
             <a href="index.php" class="nav-link-back"><i class="fas fa-arrow-left me-2"></i>Dashboard</a>
-            <span class="badge bg-success text-light">v5.4.0b Stable</span>
+            <span class="badge bg-success text-light">v5.4.0c Stable</span>
         </div>
         <h1 class="display-4 fw-bold">Hilfe & Support</h1>
         <p class="lead opacity-75">Häufige Fragen und Lösungen rund um E3DC-Control.</p>
@@ -134,7 +134,7 @@ $paths = getInstallPaths();
         <div class="col-12 faq-item" data-tags="docker image stable rollback update">
             <div class="card bg-card border-0 shadow-sm"><div class="card-body">
                 <h5 class="card-title"><span class="tag">Docker</span> Wie prüfe ich Image und Update?</h5>
-                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem geprüften Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.0b</code> in <code>.env</code> gesetzt.</p>
+                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem geprüften Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.0c</code> in <code>.env</code> gesetzt.</p>
                 <pre>docker compose config --images
 docker compose pull e3dc-control
 docker compose up -d --force-recreate e3dc-control
@@ -203,6 +203,25 @@ docker compose build --no-cache e3dc-control</pre>
                         <li>Nach der Freigabe im Account den RESTful API Security Token erzeugen.</li>
                         <li>Im Config-Editor unter <em>Tarif</em> den ENTSO-E-Token als Fallback-Token eintragen und mit <em>ENTSO-E testen</em> prüfen.</li>
                     </ol>
+                </div>
+            </div>
+        </div>
+
+        <h4 class="mb-4 text-accent"><i class="fas fa-screwdriver-wrench me-2"></i>Stable-Hotfix 5.4.0c: Alt-Updater und openWB Pro</h4>
+        <div class="col-12 faq-item" data-tags="5.4.0c hotfix update 5.3.2a 5.3.2b pep668 sudoers openwb pro pause soc stecksession ladeende phasenwechsel">
+            <div class="card bg-card border-0 shadow-sm">
+                <div class="card-body">
+                    <h5 class="card-title">
+                        <span class="tag">5.4.0c</span>
+                        Was korrigiert das Stable-Release 5.4.0c?
+                    </h5>
+                    <ul>
+                        <li><strong>Alt-Updater:</strong> Der Web-Update-Pfad aus 5.3.2a und 5.3.2b übernimmt nach dem Git-Wechsel den neuen Rechtevertrag. Vom Updater selbst angehaltene Dienste sind kein Rechtefehler; leere Paketlisten starten kein System-<code>pip</code>. Für den ersten Wechsel muss das Benutzer-venv bereits vorhanden sein. Ist der alte privilegierte Web-Launcher selbst fehlend oder nicht ausführbar, ist einmalig die interaktive SSH-Reparatur aus der Update-Anleitung erforderlich.</li>
+                        <li><strong>Sudoers:</strong> Klar abgegrenzte fremde ioBroker-Freigaben bleiben unverändert und blockieren das E3DC-Control-Update nicht. Fremde direkte E3DC-<code>systemctl</code>-Freigaben bleiben gesperrt.</li>
+                        <li><strong>openWB Pro:</strong> Der Start folgt nach bestätigtem Anstecken zügig dem verfügbaren Budget. Der Phasenwechsel nutzt eine kurze sichere CP-Unterbrechung; die folgenden 480 Sekunden sperren nur einen weiteren Phasenwechsel und nicht die Ladung.</li>
+                        <li><strong>Pause und SoC:</strong> Eine Pause gilt erst nach bestätigtem STOP. Der SoC-Fallback verwendet ausschließlich die aktuelle Stecksession und überschreibt keine echten Fahrzeug- oder Wallboxwerte.</li>
+                        <li><strong>Ladeende:</strong> Ein bestätigtes Ladeende bleibt über einen Manager-Neustart gesperrt, bis eine neue Stecksession, eine ausdrückliche Nutzeränderung oder eine echte Wiederaufnahme belegt ist.</li>
+                    </ul>
                 </div>
             </div>
         </div>
@@ -306,7 +325,7 @@ docker compose build --no-cache e3dc-control</pre>
                     <p><strong>E3/DC efy/Easy &ndash; WBchar6-Kompatibilit&auml;tsregelung</strong> bleibt der empfohlene Community-Laufzeitpfad f&uuml;r Modus, Strom und episodischen Start/Stop. efy und Multi Connect erhalten h&ouml;chstens einen Start-Toggle je frisch best&auml;tigter Stop-Episode. F&uuml;r Easy Connect sind h&ouml;chstens drei explizite Startimpulse mit mindestens 60&nbsp;Sekunden Abstand erlaubt; jeder Versuch braucht erneut einen frischen Stop-Readback und endet sofort bei best&auml;tigter Ladung. Nach einem direkten Schreibfehler gibt es im selben Zyklus keinen WBchar6-Retry.</p>
                     <p>Bei neuen E3/DC-Konfigurationen ist dieser Kompatibilit&auml;tspfad sichtbar vorausgew&auml;hlt. Wer bewusst <em>Nur Status</em> w&auml;hlt, erh&auml;lt keine E3/DC-Regelbefehle; eine ausdr&uuml;cklich gespeicherte <code>0</code> wird bei Updates nicht &uuml;berschrieben. Mode&nbsp;0, Beobachten und Freigabe bleiben ohne eigene frische Ownership schreibstumm.</p>
                     <div class="alert alert-warning mb-0 border-0">
-                        Native E3/DC-Phasenumschaltung und der direkte Maximalstrom-Setter bleiben gesperrt. F&uuml;r openWB Pro laufen 0&nbsp;A und <code>phasetarget</code> in getrennten Managerzyklen. <code>phasetarget</code> besitzt die CP-Signalisierung; E3DC-Control sendet keinen zweiten CP-Wire-Befehl. Strom wird erst nach mindestens 480&nbsp;Sekunden Schutzzeit sowie frischem CP-inaktiv- und Zielphasen-Readback freigegeben.
+                        Native E3/DC-Phasenumschaltung und der direkte Maximalstrom-Setter bleiben gesperrt. F&uuml;r openWB Pro laufen 0&nbsp;A und <code>phasetarget</code> in getrennten Managerzyklen. <code>phasetarget</code> besitzt die CP-Signalisierung; ein zus&auml;tzlicher CP-Impuls bleibt kurz. Nach frischem CP-inaktiv- und Zielphasen-Readback darf die Ladung wieder anlaufen; mindestens 480&nbsp;Sekunden sind nur bis zum n&auml;chsten Phasenwechsel gesperrt.
                     </div>
                 </div>
             </div>

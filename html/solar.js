@@ -1035,7 +1035,12 @@ function updateVehicleWidgets(data) {
         const vehicles = Array.isArray(data.vehicles) ? data.vehicles : [];
         const isPlugged = (v) => v && (v.is_plugged_in === true || v.is_plugged_in == 1 || v.is_charging === true);
         const compactId = (value) => String(value || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-        const bySlot = (slot) => vehicles.find(v => parseInt(v.wb_slot || 0) === slot && isPlugged(v));
+        const bySlot = (slot) => {
+            const candidates = vehicles.filter(v => parseInt(v.wb_slot || 0) === slot && isPlugged(v));
+            return candidates.find(v => v.soc_profile_bound === true && vehicleSocKnown(v))
+                || candidates.find(v => vehicleSocKnown(v))
+                || candidates[0];
+        };
         const unslottedPlugged = vehicles.filter(v => isPlugged(v) && !parseInt(v.wb_slot || 0));
         const slotFallback = (slot) => {
             const prefix = slot === 2 ? 'wb2' : 'wb';

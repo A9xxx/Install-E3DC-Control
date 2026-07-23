@@ -1,15 +1,74 @@
-# v5.4.0b
+# v5.4.0c
 
-E3DC-Control v5.4.0b ist der zweite Kompatibilitäts- und Stabilitäts-Hotfix auf
-Basis von v5.4.0. Er enthält auch die Korrekturen aus v5.4.0a.
+E3DC-Control v5.4.0c schließt die beim ersten Feldbetrieb von v5.4.0b
+sichtbar gewordenen Alt-Updater- und openWB-Pro-Kanten. Es enthält weiterhin
+alle Korrekturen aus v5.4.0a und v5.4.0b.
 
-## Korrekturen in v5.4.0b
+## Korrekturen in v5.4.0c
+
+- Der reale Web-Update-Übergang aus 5.3.2a und 5.3.2b verwendet nach dem
+  Git-Wechsel den neuen Rechtevertrag. Die vom Updater selbst angehaltenen
+  E3DC-Control-Dienste werden dabei nicht mehr als Rechtefehler bewertet.
+- Leere Paketlisten lösen keinen System-`pip`-Aufruf aus. PEP-668-Systeme
+  bleiben vollständig im gebundenen Benutzer-venv.
+- Kann eine alte 5.3.2a-Installation ihren privilegierten Wrapper noch nicht
+  ausführen, ist einmalig der interaktive Konsolenaufruf des Installers nötig.
+  Ein nicht startbarer privilegierter Einstieg kann sich aus der Weboberfläche
+  heraus bewusst nicht selbst reparieren.
+- Klar abgegrenzte fremde ioBroker-Sudoers-Zeilen bleiben unverändert und
+  blockieren den Releasewechsel nicht. Fremde direkte E3DC-`systemctl`-
+  Freigaben bleiben gesperrt.
+- openWB Pro startet nach bestätigtem Anstecken ohne alten Nullanker und führt
+  den Sollstrom zügig bis zum verfügbaren Budget nach. Ein Phasenwechsel nutzt
+  eine kurze sichere CP-Unterbrechung; die folgenden 480 Sekunden sperren nur
+  einen weiteren Phasenwechsel und nicht die wieder angelaufene Ladung.
+- Eine manuelle Wallbox-Pause gilt erst nach bestätigtem STOP oder bereits
+  real stehender Wallbox als übernommen. Ein am zentralen Ausgang blockierter
+  Befehl wird nicht mehr als Erfolg gemeldet.
+- Der SoC-Fallback für eine openWB Pro ist an Fahrzeugprofil und Stecksession
+  gebunden. Er verwendet nur die Energie der aktuellen Ladesitzung und hat
+  keinen Vorrang vor echten Fahrzeug- oder Wallboxwerten.
+- Ein bestätigtes Fahrzeug-Ladeende bleibt über einen Manager-Neustart an
+  dieselbe Stecksession gebunden. Ein interpolierter SoC unter Ziel, ein
+  einzelnes Disconnect-Bild oder ein Phasenübergang lösen keinen neuen
+  Startversuch aus.
+
+## Einmaliger Wechsel aus 5.3.2a oder 5.3.2b
+
+Für eine laufende 5.3.2b-Installation und eine bereits reparierte
+5.3.2a-Installation bleibt der Web-Update-Button der normale Weg. Wenn das
+Web-Protokoll dagegen ausdrücklich meldet, dass
+`Installer/installer_wrapper.sh` fehlt oder nicht ausführbar ist, muss der
+alte privilegierte Einstieg einmalig an einer interaktiven SSH-Konsole
+repariert werden:
+
+```bash
+cd "/absoluter/pfad/zur/Install"
+sudo python3 installer_main.py --fix-permissions
+sudo python3 installer_main.py --update-e3dc
+```
+
+Den Pfad bitte an den tatsächlichen Installationsbenutzer anpassen. Eine
+Passwortabfrage von `sudo` ist an der SSH-Konsole normal. Nach diesem
+erfolgreichen Wechsel steht der reguläre Web-Update-Pfad für spätere Releases
+wieder zur Verfügung.
+
+Der erste direkte Wechsel setzt das bereits für den laufenden Altstand
+verwendete Benutzer-venv voraus. Fehlt diese Python-Umgebung tatsächlich, bitte
+weder System-`pip` noch `--break-system-packages` verwenden, sondern den
+veröffentlichten Bootstrapweg aus der
+[Update-Anleitung](https://github.com/A9xxx/Install-E3DC-Control/blob/v5.4.0c/doc/Update.md)
+nutzen.
+
+## Enthaltene Korrekturen aus v5.4.0b
 
 - Auf Debian-Systemen mit PEP 668 aktualisiert der Bare-Metal-Updater
   Python-Abhängigkeiten ausschließlich im gebundenen Benutzer-venv. Es gibt
-  keinen System-`pip`-Eingriff und kein `--break-system-packages`. Fehlt das
-  Standard-venv, wird es nach Installation von `python3-venv` kontrolliert neu
-  angelegt.
+  keinen System-`pip`-Eingriff und kein `--break-system-packages`. Ab dem neuen
+  Updater kann ein fehlendes Standard-venv nach Installation von
+  `python3-venv` kontrolliert neu angelegt werden. Der einmalige direkte
+  Wechsel aus 5.3.2a/b setzt das dort bereits verwendete venv voraus und
+  bricht andernfalls mit Wiederherstellung ab.
 - Docker-Installationen werden im Web- und Konsolen-Updater erkannt. Der
   Container versucht nicht, sich selbst zu ersetzen, sondern zeigt die drei
   notwendigen `docker compose`-Befehle für den Host.
@@ -21,16 +80,20 @@ Basis von v5.4.0. Er enthält auch die Korrekturen aus v5.4.0a.
   Historische Release-Quellen werden dabei weiterhin exakt gebaut, aber mit
   dem zum gestarteten Workflow gehörenden OCI-Prüfer kontrolliert.
 - Wrapper, sudoers und kanonische systemd-Masken werden vor Änderungen gebunden
-  gesichert und bei Teilfehlern kontrolliert zurückgesetzt. Nach dem Git-Wechsel
-  setzt ein eigener, an Ziel-SHA und Zielbaum gebundener Finalizer die
-  Installation ausschließlich mit Modulen des neuen Stands fort.
+  gesichert und bei Teilfehlern kontrolliert zurückgesetzt. Ab dem neuen
+  Updater setzt nach dem Git-Wechsel ein eigener, an Ziel-SHA und Zielbaum
+  gebundener Finalizer die Installation ausschließlich mit Modulen des neuen
+  Stands fort. Der erste Wechsel aus 5.3.2a/b nutzt noch dessen laufenden
+  Altprozess und übernimmt nach dem Reset den neuen service-neutralen
+  Rechtevertrag.
 - Eine openWB Pro erhält nach einem bestätigten Ab- und Wiederanstecken eine
   neue entprellte Stecksession. Die Startfreigabe wird stromgeführt projiziert;
   ein kurzer CP-Wake-up ist nur bei ausbleibender Ladeannahme, unterstützter API
   und innerhalb eines persistent begrenzten Versuchsbudgets zulässig.
 - Bereits bestätigte Phasenziele werden ohne unnötigen Wechsel übernommen. Nach
-  einem tatsächlichen Phasenwechsel bleibt das Schutzfenster von mindestens
-  480 Sekunden vollständig erhalten.
+  einem tatsächlichen Phasenwechsel bleibt die Sperre von mindestens
+  480 Sekunden bis zum nächsten Phasenwechsel vollständig erhalten; sie ist
+  keine CP-Unterbrechung und blockiert die laufende Ladung nicht.
 - Alle unterstützten Wallboxpfade verwenden denselben typisierten Halte- und
   Stoppvertrag bei fehlendem PV-Budget. Eine bereits laufende PV-Ladung darf
   kurze Einbrüche nur innerhalb des vorhandenen Batteriestützbudgets überbrücken.
@@ -56,9 +119,9 @@ Basis von v5.4.0. Er enthält auch die Korrekturen aus v5.4.0a.
 
 ## Update und Docker
 
-Bare-Metal-Nutzer können v5.4.0b über den Web- oder Konsolen-Updater
+Bare-Metal-Nutzer können v5.4.0c über den Web- oder Konsolen-Updater
 installieren. Das veröffentlichte Container-Image trägt den Tag
-`v5.4.0b`; `latest` wird erst nach bestandener Kandidaten- und
+`v5.4.0c`; `latest` wird erst nach bestandener Kandidaten- und
 Attestierungsprüfung auf denselben Digest gesetzt. Der vorgesehene öffentliche
 Docker-Rückfallstand bleibt `v5.3.2b`; Bare Metal bietet für diesen Altstand
 keinen Programm-Rückfall an.
@@ -113,10 +176,11 @@ Update-, Backup- und Wiederherstellungsvertrag.
   `phasetarget` die CP-Signalisierung; E3DC-Control sendet dafür keinen zweiten
   CP-Wire-Befehl.
 - Der Wiederanlauf bleibt gesperrt, solange CP noch aktiv, der Status stale
-  oder unbekannt, die Zielphase nicht frisch bestätigt oder die
-  phasenwechselbezogene Schutzzeit von mindestens 480 Sekunden noch nicht
-  abgelaufen ist. Ein crashfester Intent-/ACK-Zustand verhindert das blinde
-  Wiederholen eines unbestätigten Phasenausgangs.
+  oder unbekannt oder die Zielphase nicht frisch bestätigt ist. Nach dem
+  bestätigten Zielzustand darf die Ladung wieder anlaufen; die persistente
+  480-Sekunden-Sperre verhindert ausschließlich einen weiteren Phasenwechsel.
+  Ein crashfester Intent-/ACK-Zustand verhindert das blinde Wiederholen eines
+  unbestätigten Phasenausgangs.
 
 ## Wallbox-Start, Balancing und ruhige PV-Kurve
 
@@ -169,7 +233,7 @@ kein Programm-Rückfall angeboten. Verifizierte Datei-Backups bleiben nutzbar.
 ## Docker
 
 Die Images werden aus dem veröffentlichten Git-Stand über GitHub Actions
-gebaut. `latest` ist ausschließlich für v5.4.0b vorgesehen; der Rollback-Tag
+gebaut. `latest` ist ausschließlich für v5.4.0c vorgesehen; der Rollback-Tag
 bleibt `v5.3.2b` und ist ausdrücklich Docker-only. Matter-Abhängigkeiten stammen aus der Lockdatei, und das
 anlagenspezifische ML-Modell liegt in einem separaten persistenten Volume.
 

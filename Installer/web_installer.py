@@ -14,6 +14,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -1112,11 +1113,71 @@ def sudoers_file_preview() -> dict[str, Any]:
     }
 
 
+def _classify_sudoers_line(path: Path | None, line: str) -> dict[str, bool]:
+    """Trennt E3DC-eigene sudoers-Zeilen von fremden Dienstfreigaben."""
+
+    normalized = str(line or "").strip()
+    lowered = normalized.lower()
+    allowed_wrapper = normalized in desired_sudoers_lines()
+    direct_web = "www-data" in lowered and "nopasswd:" in lowered and not allowed_wrapper
+    direct_systemctl = "systemctl" in lowered and not allowed_wrapper
+    legacy = "e3dc.service" in lowered
+    path_name = path.name.lower() if path is not None else ""
+    e3dc_owned = bool(
+        path is not None
+        and (
+            path == SUDOERS_FILE
+            or re.fullmatch(r"(?:\d+[_-])?e3dc(?:[_-].*)?", path_name)
+        )
+    )
+    e3dc_related = bool(
+        e3dc_owned
+        or "e3dc" in lowered
+        or str(INSTALL_ROOT).lower() in lowered
+        or str(SERVICE_WRAPPER).lower() in lowered
+        or str(INSTALLER_WRAPPER).lower() in lowered
+    )
+    managed_direct = bool(e3dc_owned and (direct_web or direct_systemctl or legacy))
+    external_direct = bool(not e3dc_owned and (direct_web or direct_systemctl))
+    return {
+        "allowed_wrapper": allowed_wrapper,
+        "direct_web": direct_web,
+        "direct_systemctl": direct_systemctl,
+        "legacy": legacy,
+        "e3dc_owned": e3dc_owned,
+        "e3dc_related": e3dc_related,
+        "managed_direct": managed_direct,
+        "external_direct": external_direct,
+    }
+
+
+def _unique_sudoers_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    unique: list[dict[str, Any]] = []
+    seen: set[tuple[str, int, str]] = set()
+    for item in items:
+        key = (
+            str(item.get("file") or ""),
+            int(item.get("line_no") or 0),
+            str(item.get("line") or ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    return unique
+
+
 def sudoers_file_findings() -> dict[str, Any]:
-    """Scan sudoers fragments for direct www-data commands outside the wrappers."""
+    """Scannt sudoers und bindet nur E3DC-eigene Zeilen an Reparaturen."""
+
     files: list[dict[str, Any]] = []
     direct_web_lines: list[dict[str, Any]] = []
     direct_systemctl_lines: list[dict[str, Any]] = []
+    managed_direct_lines: list[dict[str, Any]] = []
+    managed_direct_systemctl_lines: list[dict[str, Any]] = []
+    e3dc_systemctl_lines: list[dict[str, Any]] = []
+    external_systemctl_lines: list[dict[str, Any]] = []
+    external_direct_web_lines: list[dict[str, Any]] = []
     legacy_lines: list[dict[str, Any]] = []
     try:
         candidates = sorted(SUDOERS_DIR.glob("*"))
@@ -1134,6 +1195,11 @@ def sudoers_file_findings() -> dict[str, Any]:
                 "reason": "Web-Installer Backup/Temp-Datei, keine aktive sudoers-Freigabe",
                 "direct_web_lines": [],
                 "direct_systemctl_lines": [],
+                "managed_direct_lines": [],
+                "managed_direct_systemctl_lines": [],
+                "e3dc_systemctl_lines": [],
+                "external_systemctl_lines": [],
+                "external_direct_web_lines": [],
                 "legacy_lines": [],
             })
             continue
@@ -1145,20 +1211,45 @@ def sudoers_file_findings() -> dict[str, Any]:
 
         file_direct: list[dict[str, Any]] = []
         file_systemctl: list[dict[str, Any]] = []
+        file_managed: list[dict[str, Any]] = []
+        file_managed_systemctl: list[dict[str, Any]] = []
+        file_e3dc_systemctl: list[dict[str, Any]] = []
+        file_external_systemctl: list[dict[str, Any]] = []
+        file_external_web: list[dict[str, Any]] = []
         file_legacy: list[dict[str, Any]] = []
         for line_no, raw_line in enumerate(text.splitlines(), start=1):
             line = raw_line.strip()
             if not line or line.startswith("#"):
                 continue
             item = {"file": str(path), "line_no": line_no, "line": line}
-            is_wrapper = str(SERVICE_WRAPPER) in line or str(INSTALLER_WRAPPER) in line
-            if "www-data" in line and "NOPASSWD:" in line and not is_wrapper:
+            classification = _classify_sudoers_line(path, line)
+            item["scope"] = (
+                "e3dc"
+                if classification["e3dc_owned"]
+                else ("external-e3dc-related" if classification["e3dc_related"] else "external")
+            )
+            if classification["direct_web"]:
                 file_direct.append(item)
                 direct_web_lines.append(item)
-            if "systemctl" in line and not is_wrapper:
+            if classification["direct_systemctl"]:
                 file_systemctl.append(item)
                 direct_systemctl_lines.append(item)
-            if "e3dc.service" in line:
+                if classification["e3dc_related"]:
+                    file_e3dc_systemctl.append(item)
+                    e3dc_systemctl_lines.append(item)
+                if classification["e3dc_owned"]:
+                    file_managed_systemctl.append(item)
+                    managed_direct_systemctl_lines.append(item)
+                elif not classification["e3dc_related"] and not classification["direct_web"]:
+                    file_external_systemctl.append(item)
+                    external_systemctl_lines.append(item)
+            if classification["direct_web"] and not classification["e3dc_owned"]:
+                file_external_web.append(item)
+                external_direct_web_lines.append(item)
+            if classification["managed_direct"]:
+                file_managed.append(item)
+                managed_direct_lines.append(item)
+            if classification["legacy"]:
                 file_legacy.append(item)
                 legacy_lines.append(item)
 
@@ -1167,15 +1258,35 @@ def sudoers_file_findings() -> dict[str, Any]:
             "readable": True,
             "direct_web_lines": file_direct,
             "direct_systemctl_lines": file_systemctl,
+            "managed_direct_lines": file_managed,
+            "managed_direct_systemctl_lines": file_managed_systemctl,
+            "e3dc_systemctl_lines": file_e3dc_systemctl,
+            "external_systemctl_lines": file_external_systemctl,
+            "external_direct_web_lines": file_external_web,
             "legacy_lines": file_legacy,
         })
 
+    repairable_lines = _unique_sudoers_items(managed_direct_lines)
     return {
         "files": files,
-        "direct_web_lines": direct_web_lines,
-        "direct_systemctl_lines": direct_systemctl_lines,
-        "legacy_lines": legacy_lines,
-        "affected_files": sorted({item["file"] for item in direct_web_lines + direct_systemctl_lines + legacy_lines}),
+        "direct_web_lines": _unique_sudoers_items(direct_web_lines),
+        "direct_systemctl_lines": _unique_sudoers_items(direct_systemctl_lines),
+        "managed_direct_lines": _unique_sudoers_items(managed_direct_lines),
+        "managed_direct_systemctl_lines": _unique_sudoers_items(managed_direct_systemctl_lines),
+        "e3dc_systemctl_lines": _unique_sudoers_items(e3dc_systemctl_lines),
+        "external_systemctl_lines": _unique_sudoers_items(external_systemctl_lines),
+        "external_direct_web_lines": _unique_sudoers_items(external_direct_web_lines),
+        "legacy_lines": _unique_sudoers_items(legacy_lines),
+        "repairable_lines": repairable_lines,
+        "affected_files": sorted({
+            item["file"]
+            for item in (
+                direct_web_lines
+                + direct_systemctl_lines
+                + external_direct_web_lines
+                + legacy_lines
+            )
+        }),
     }
 
 
@@ -1751,18 +1862,50 @@ def sudoers_context() -> dict[str, Any]:
         for line in sudoers_text.splitlines()
         if line.strip() and not line.lstrip().startswith("#")
     ]
-    direct_systemctl_lines = [
-        line
-        for line in active_lines
-        if "systemctl" in line and "service_wrapper.sh" not in line
-    ]
-    legacy_lines = [line for line in active_lines if "e3dc.service" in line]
+    effective_managed_systemctl: list[str] = []
+    effective_external_systemctl: list[str] = []
+    effective_legacy: list[str] = []
+    for line in active_lines:
+        classification = _classify_sudoers_line(None, line)
+        if classification["direct_systemctl"]:
+            if classification["e3dc_related"]:
+                effective_managed_systemctl.append(line)
+            elif not classification["direct_web"]:
+                effective_external_systemctl.append(line)
+        if classification["legacy"]:
+            effective_legacy.append(line)
+
+    managed_systemctl_lines = list(dict.fromkeys(
+        [
+            str(item.get("line") or "")
+            for item in file_findings["e3dc_systemctl_lines"]
+            if str(item.get("line") or "")
+        ]
+        + effective_managed_systemctl
+    ))
+    external_systemctl_lines = list(dict.fromkeys(
+        [
+            str(item.get("line") or "")
+            for item in file_findings["external_systemctl_lines"]
+            if str(item.get("line") or "")
+        ]
+        + effective_external_systemctl
+    ))
+    legacy_lines = list(dict.fromkeys(
+        [
+            str(item.get("line") or "")
+            for item in file_findings["legacy_lines"]
+            if str(item.get("line") or "")
+        ]
+        + effective_legacy
+    ))
 
     return {
         "text": sudoers_text,
         "source": sudoers_source,
         "active_lines": active_lines,
-        "direct_systemctl_lines": direct_systemctl_lines,
+        "direct_systemctl_lines": managed_systemctl_lines,
+        "external_systemctl_lines": external_systemctl_lines,
         "legacy_lines": legacy_lines,
         "file_findings": file_findings,
     }
@@ -1782,6 +1925,7 @@ def write_readiness(ignore_active_lock: bool = False) -> dict[str, Any]:
     sudoers_has_installer = str(INSTALLER_WRAPPER) in sudoers_text
     sudoers_direct_systemctl = bool(sudoers["direct_systemctl_lines"])
     sudoers_direct_web_commands = bool(sudoers["file_findings"]["direct_web_lines"])
+    external_systemctl_lines = sudoers["external_systemctl_lines"]
     legacy_service_allowed = bool(sudoers["legacy_lines"])
     catalog_legacy = any((module.service_unit or "") == "e3dc.service" for module in iter_modules())
 
@@ -1834,13 +1978,26 @@ def write_readiness(ignore_active_lock: bool = False) -> dict[str, Any]:
             "label": "keine freien systemctl-Kommandos",
             "ok": not sudoers_direct_systemctl,
             "hard": True,
-            "issue": "sudoers enthält direkte systemctl-Freigaben" if sudoers_direct_systemctl else None,
+            "issue": "E3DC-sudoers enthält direkte systemctl-Freigaben" if sudoers_direct_systemctl else None,
+        },
+        {
+            "label": "fremde systemctl-Freigaben bleiben fremdverwaltet",
+            "ok": not external_systemctl_lines,
+            "hard": False,
+            "issue": (
+                "sudoers enthält direkte systemctl-Freigaben außerhalb des E3DC-Besitzbereichs; "
+                "sie werden nur gemeldet, nicht verändert und blockieren den Release-Wechsel nicht"
+                if external_systemctl_lines
+                else None
+            ),
+            "details": external_systemctl_lines,
         },
         {
             "label": "keine direkten www-data-Kommandos",
             "ok": not sudoers_direct_web_commands,
             "hard": True,
             "issue": "sudoers.d enthält alte direkte www-data-Freigaben außerhalb der Wrapper" if sudoers_direct_web_commands else None,
+            "details": sudoers["file_findings"]["direct_web_lines"],
         },
         {
             "label": "alter C++ Dienst bleibt gesperrt",
@@ -1893,15 +2050,17 @@ def write_permission_plan() -> dict[str, Any]:
     sudoers = sudoers_context()
     desired_sudoers = desired_sudoers_lines()
     checks = write_readiness()
-    remove_lines = list(dict.fromkeys(sudoers["direct_systemctl_lines"] + sudoers["legacy_lines"]))
+    repairable_items = sudoers["file_findings"]["repairable_lines"]
+    remove_lines = list(dict.fromkeys(
+        str(item.get("line") or "")
+        for item in repairable_items
+        if str(item.get("line") or "")
+    ))
     missing_lines = [line for line in desired_sudoers if line not in sudoers["text"]]
-    legacy_file_findings = sudoers["file_findings"]
     would_change = bool(
         remove_lines
         or missing_lines
         or not SUDOERS_FILE.exists()
-        or legacy_file_findings["direct_web_lines"]
-        or legacy_file_findings["legacy_lines"]
     )
     file_preview = sudoers_file_preview()
 
@@ -1916,6 +2075,7 @@ def write_permission_plan() -> dict[str, Any]:
         "current": {
             "active_lines": sudoers["active_lines"],
             "direct_systemctl_lines": sudoers["direct_systemctl_lines"],
+            "external_systemctl_lines": sudoers["external_systemctl_lines"],
             "legacy_lines": sudoers["legacy_lines"],
             "file_findings": sudoers["file_findings"],
         },
@@ -1928,7 +2088,7 @@ def write_permission_plan() -> dict[str, Any]:
         "file_preview": file_preview,
         "planned_steps": [
             "Bestehende sudoers-Datei sichern, bevor sie ersetzt wird.",
-            "Direkte systemctl-Freigaben entfernen; die WebUI darf systemd nur über Wrapper erreichen.",
+            "Nur E3DC-eigene direkte systemctl-/WebUI-Freigaben entfernen; fremde Fragmente bleiben byte- und metadatengleich.",
             "Nur die zwei erlaubten Wrapper-Zeilen für service_wrapper.sh und installer_wrapper.sh setzen.",
             "sudoers-Syntax mit visudo -cf prüfen.",
             "Freigabe-Check erneut ausführen und erst danach Schreibmodus zeitlich begrenzt testen.",
@@ -1945,7 +2105,8 @@ def write_permission_plan() -> dict[str, Any]:
         ],
         "safety_rules": [
             "Keine freien Shell-Kommandos aus PHP.",
-            "Keine direkten systemctl-Freigaben für www-data.",
+            "Keine direkten E3DC-systemctl-Freigaben für www-data.",
+            "Fremde sudoers-Fragmente werden ausschließlich gemeldet und niemals vom E3DC-Installer verändert.",
             "Der alte C++ Dienst e3dc.service bleibt kein erlaubtes WebUI-Startziel.",
             "Echte Reparatur erst nach erfolgreichem Job-Test auf einem Testsystem.",
         ],
@@ -1984,7 +2145,7 @@ def backup_plan(module_key: str | None = None) -> dict[str, Any]:
     sudoers_findings = sudoers_file_findings()
     system_files.extend(
         Path(str(item.get("file") or ""))
-        for item in sudoers_findings.get("direct_web_lines", []) + sudoers_findings.get("legacy_lines", [])
+        for item in sudoers_findings.get("repairable_lines", [])
         if str(item.get("file") or "")
     )
     for module in modules:
@@ -3321,7 +3482,7 @@ def repair_permissions(*, repair_runtime: bool = False) -> dict[str, Any]:
             sudoers_paths = {SUDOERS_FILE}
             sudoers_paths.update(
                 Path(str(item.get("file") or ""))
-                for item in findings.get("direct_web_lines", []) + findings.get("legacy_lines", [])
+                for item in findings.get("repairable_lines", [])
                 if str(item.get("file") or "")
             )
             sudoers_preimages = [
@@ -3487,7 +3648,7 @@ def repair_permissions(*, repair_runtime: bool = False) -> dict[str, Any]:
 
         target_file = str(SUDOERS_FILE)
         removable_by_file: dict[str, set[tuple[int, str]]] = {}
-        for item in findings["direct_web_lines"] + findings["legacy_lines"]:
+        for item in findings["repairable_lines"]:
             if item["file"] == target_file:
                 continue
             removable_by_file.setdefault(item["file"], set()).add((int(item["line_no"]), str(item["line"])))

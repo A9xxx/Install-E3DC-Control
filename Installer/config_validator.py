@@ -678,23 +678,28 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     )
 
     phase_cp_configured = (
-        safe_float(cfg.get("openwb_pro_phase_cp_interrupt_duration_s"), 480.0)
+        safe_float(cfg.get("openwb_pro_phase_cp_interrupt_duration_s"), 5.0)
         if _has_user_value(cfg, "openwb_pro_phase_cp_interrupt_duration_s")
         else None
     )
-    phase_cp_effective = max(
-        480.0,
-        phase_cp_configured if phase_cp_configured is not None else 480.0,
-    )
+    phase_cp_requested = phase_cp_configured if phase_cp_configured is not None else 5.0
+    phase_cp_legacy = phase_cp_requested >= 480.0
+    phase_cp_effective = 5.0 if phase_cp_legacy else min(30.0, max(2.0, phase_cp_requested))
     phase_cp_severity = "ok"
     phase_cp_message = (
-        "Die reale CP-Unterbrechung beim openWB-Pro-Phasenwechsel beträgt mindestens 480s."
+        "Kurzer Geräteimpuls für den Phasenwechsel; der getrennte 480-s-Cooldown sperrt nur einen weiteren Wechsel."
     )
-    if phase_cp_configured is not None and phase_cp_configured < 480.0:
+    if phase_cp_legacy:
         phase_cp_severity = "warning"
         phase_cp_message = (
-            "Der konfigurierte Wert liegt unter 480s und wird zum Hardwareschutz wirksam auf 480s korrigiert. "
-            "Kurze Wake-up-CP-Impulse bleiben davon getrennt."
+            "Der frühere 480-s-CP-Wert wird als Altvertrag erkannt und wirksam auf 5s migriert. "
+            "Der 480-s-Schutz bleibt getrennt als Sperre gegen den nächsten Phasenwechsel bestehen."
+        )
+    elif phase_cp_configured is not None and not 2.0 <= phase_cp_configured <= 30.0:
+        phase_cp_severity = "warning"
+        phase_cp_message = (
+            "Die CP-Dauer liegt außerhalb 2 bis 30s und wird auf den sicheren Bereich begrenzt. "
+            "Der Phasenwechsel-Cooldown bleibt davon getrennt."
         )
     wallbox["openwb_pro_phase_cp_interrupt_duration_s"] = _entry(
         key="openwb_pro_phase_cp_interrupt_duration_s",

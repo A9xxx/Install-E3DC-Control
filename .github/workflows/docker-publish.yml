@@ -9,10 +9,10 @@ on:
         type: choice
         options: [b1a-candidate, b1b-promote]
       release_tag:
-        description: "Exactly v5.3.2b, v5.4.0, v5.4.0a or v5.4.0b"
+        description: "Exactly v5.3.2b, v5.4.0, v5.4.0a, v5.4.0b or v5.4.0c"
         required: true
         type: choice
-        options: [v5.3.2b, v5.4.0, v5.4.0a, v5.4.0b]
+        options: [v5.3.2b, v5.4.0, v5.4.0a, v5.4.0b, v5.4.0c]
       release_sha:
         description: "Approved 40-hex release commit"
         required: true
@@ -117,6 +117,17 @@ jobs:
             [ "$(git rev-parse HEAD^^)" = "59e5907d1b517cf04e60611ae6e7765c184b00f8" ]
             [ "$(git rev-parse HEAD^^^)" = "$ROOT_SHA" ]
             [ "$(git rev-parse HEAD^^^^{tree})" = "$ROOT_TREE" ]
+            [ "$(git rev-list --parents -n 1 "$ROOT_SHA" | awk '{print NF-1}')" -eq 0 ]
+          elif [ "$RELEASE_TAG" = "v5.4.0c" ]; then
+            [ "$(git rev-list --parents -n 1 HEAD | awk '{print NF-1}')" -eq 1 ]
+            [ "$(git rev-list --parents -n 1 HEAD^ | awk '{print NF-1}')" -eq 1 ]
+            [ "$(git rev-list --parents -n 1 HEAD^^ | awk '{print NF-1}')" -eq 1 ]
+            [ "$(git rev-list --parents -n 1 HEAD^^^ | awk '{print NF-1}')" -eq 1 ]
+            [ "$(git rev-parse HEAD^)" = "6a1b24c7865b2bbc1c5d21d69b7c73553a0de78e" ]
+            [ "$(git rev-parse HEAD^^)" = "6e4660379c5fcc6849e6b76f49fc4bd727273aa5" ]
+            [ "$(git rev-parse HEAD^^^)" = "59e5907d1b517cf04e60611ae6e7765c184b00f8" ]
+            [ "$(git rev-parse HEAD^^^^)" = "$ROOT_SHA" ]
+            [ "$(git rev-parse HEAD^^^^^{tree})" = "$ROOT_TREE" ]
             [ "$(git rev-list --parents -n 1 "$ROOT_SHA" | awk '{print NF-1}')" -eq 0 ]
           else
             exit 1
@@ -290,7 +301,7 @@ jobs:
           docker buildx imagetools create --tag "${image}:${{ inputs.release_tag }}" "${image}@${digest}"
           docker buildx imagetools create --tag "${image}:${{ needs.validate.outputs.version }}" "${image}@${digest}"
           [ "$(docker buildx imagetools inspect "${image}:${{ inputs.release_tag }}" | awk '$1 == "Digest:" {print $2; exit}')" = "$digest" ]
-          if [ "${{ inputs.release_tag }}" = "v5.4.0b" ]; then
+          if [ "${{ inputs.release_tag }}" = "v5.4.0c" ]; then
             docker buildx imagetools create --tag "${image}:latest" "${image}@${digest}"
             [ "$(docker buildx imagetools inspect "${image}:latest" | awk '$1 == "Digest:" {print $2; exit}')" = "$digest" ]
           fi

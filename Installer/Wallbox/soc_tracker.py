@@ -24,11 +24,24 @@ TMP_DIR = "/var/www/html/tmp"
 ESTIMATED_PREFIX = "wallbox_estimated"
 OPENWB_PRO_SOURCES = ("openwb_pro_raw", "openwb_pro_estimated")
 NO_VEHICLE_IDS = ("", "__none", "none", "no_vehicle", "kein_fahrzeug", "0", "false")
+PROFILE_ALIAS_KEYS = (
+    "id",
+    "profile_id",
+    "cloud_vehicle_id",
+    "vehicle_id",
+    "vehicle_mac",
+    "mac",
+    "rfid",
+    "rfid_tag",
+)
+LIVE_STATUS_ID_KEYS = ("car_id", "vehicle_id", "rfid_tag")
 SESSION_SCOPED_ANCHOR_SOURCES = ("manual_start_soc", "simple_view_start_soc", "config_start_soc")
 UNMETERED_SESSION_ANCHOR_MAX_AGE_S = 36 * 3600
 CONFIRMED_MANUAL_SOC_SOURCES = ("manual_start_soc", "manual_soc", "manual", "openwb_profile_link")
 CONFIRMED_VEHICLE_SOC_KEYWORDS = ("mqtt", "bluelink", "wallbox", "openwb", "vehicle", "car_soc", "hyundai", "kia")
 UNCONFIRMED_SOC_SOURCES = ("simple_view_start_soc", "config_start_soc")
+OPENWB_PRO_STATUS_MAX_AGE_S = 60
+OPENWB_PRO_VEHICLE_SOC_MAX_AGE_S = 8 * 3600
 
 
 def _compact_id(value):
@@ -117,6 +130,16 @@ def _vehicle_aliases(vehicle):
     return aliases
 
 
+def _compact_aliases(vehicle, keys=PROFILE_ALIAS_KEYS):
+    if not isinstance(vehicle, dict):
+        return set()
+    return {
+        compact
+        for compact in (_compact_id(vehicle.get(key)) for key in keys)
+        if compact
+    }
+
+
 def _matches_vehicle(vehicle, selected_id):
     selected = str(selected_id or "").strip()
     if not selected or selected.lower() in NO_VEHICLE_IDS:
@@ -142,6 +165,292 @@ def _load_live_vehicles():
     if isinstance(data, dict):
         data = data.get("vehicles", [])
     return data if isinstance(data, list) else []
+
+
+def _unique_saved_profile(selected_id):
+    """Löse die konfigurierte Auswahl auf genau ein gespeichertes Profil auf."""
+
+    selected = str(selected_id or "").strip()
+    if not selected or selected.lower() in NO_VEHICLE_IDS:
+        return None
+    matches = [
+        car
+        for car in _load_saved_cars()
+        if isinstance(car, dict) and _matches_vehicle(car, selected)
+    ]
+    return dict(matches[0]) if len(matches) == 1 else None
+
+
+def _truthy(value):
+    if isinstance(value, bool):
+        return value
+    if value in (None, ""):
+        return False
+    if isinstance(value, (int, float)):
+        return float(value) != 0.0
+    return str(value).strip().lower() in ("1", "true", "yes", "on", "connected", "plugged")
+
+
+def _fresh_timestamp(value, now, max_age_s):
+    sample_ts = _timestamp(value, 0.0)
+    if sample_ts <= 0.0:
+        return 0.0
+    age_s = float(now) - sample_ts
+    if age_s < -300.0 or age_s > float(max_age_s):
+        return 0.0
+    return sample_ts
+
+
+def _plug_session_started_ts(plug_session_id, now):
+    """Löse die epochbasierte Startzeit einer openWB-Pro-Stecksession auf."""
+
+    raw = str(plug_session_id or "").rsplit(":", 1)[-1].strip()
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    if value > 1.0e17:
+        value /= 1.0e9
+    elif value > 1.0e14:
+        value /= 1.0e6
+    elif value > 1.0e11:
+        value /= 1.0e3
+    # Monotone Prozessuhren oder beliebige Tokens dürfen nicht wie eine
+    # belastbare Steckzeit behandelt werden.
+    if value < 1577836800.0 or value > float(now) + 300.0:
+        return 0.0
+    return value
+
+
+def _openwb_pro_session_meter_wh(status):
+    """Liefere ausschließlich den zur Stecksession gehörenden Energiezähler."""
+
+    if not isinstance(status, dict) or status.get("session_kwh") is None:
+        return None
+    value = _safe_float(status.get("session_kwh"), -1.0)
+    return value * 1000.0 if value >= 0.0 else None
+
+
+def _openwb_pro_same_session_sample(
+    wb_id,
+    profile,
+    profile_aliases,
+    plug_session_id,
+    plug_session_started_ts,
+    meter_wh,
+    now,
+):
+    """Binde eine bestätigte Pro-Schätzung an dieselbe Stecksession."""
+
+    data = _read_json(_manual_soc_path(wb_id), None)
+    if not isinstance(data, dict):
+        return None
+    source = str(data.get("source") or "").strip()
+    raw_source = str(data.get("raw_source") or "").strip()
+    is_raw_pro_sample = source in OPENWB_PRO_SOURCES
+    is_bound_pro_estimate = bool(
+        source.startswith(ESTIMATED_PREFIX)
+        and raw_source in OPENWB_PRO_SOURCES
+        and data.get("soc_profile_bound") is True
+        and data.get("soc_profile_binding_invalid") is not True
+        and data.get("estimate_expired") is not True
+        and str(data.get("plug_session_id") or "").strip() == plug_session_id
+    )
+    if not (is_raw_pro_sample or is_bound_pro_estimate):
+        return None
+    sample_source = source if is_raw_pro_sample else raw_source
+    rule_confirmed = data.get("soc_rule_confirmed")
+    if (
+        not _is_confirmed_soc_source(sample_source)
+        or (rule_confirmed is not None and not _truthy(rule_confirmed))
+    ):
+        return None
+
+    soc = _safe_float(
+        data.get("soc") if is_raw_pro_sample else data.get("raw_soc"),
+        -1.0,
+    )
+    sample_ts = _timestamp(data.get("raw_soc_ts", data.get("ts")), 0.0)
+    if (
+        soc <= 0.0
+        or sample_ts <= 0.0
+        or sample_ts + 1.0 < plug_session_started_ts
+        or sample_ts > float(now) + 300.0
+    ):
+        return None
+
+    aliases = {
+        compact
+        for compact in (
+            _compact_id(data.get(key))
+            for key in ("profile_id", "car_id", "vehicle_id", "rfid_tag")
+        )
+        if compact
+    }
+    if not aliases or not aliases.issubset(profile_aliases):
+        return None
+
+    anchor_kwh = _safe_float(
+        data.get("session_kwh")
+        if is_raw_pro_sample
+        else data.get("anchor_session_kwh"),
+        -1.0,
+    )
+    anchor_meter_wh = anchor_kwh * 1000.0
+    if anchor_kwh < 0.0 or meter_wh is None or meter_wh + 0.1 < anchor_meter_wh:
+        return None
+
+    return {
+        "soc": _clamp_percent(soc),
+        "ts": sample_ts,
+        "source": sample_source,
+        "car_id": profile.get("id") or "",
+        "vehicle_id": "",
+        "name": profile.get("name") or str(data.get("name") or "").strip(),
+        "capacity_kwh": _safe_float(profile.get("capacity_kwh"), 0.0),
+        "profile_id": profile.get("id") or "",
+        "soc_profile_bound": True,
+        "anchor_meter_wh": anchor_meter_wh,
+    }
+
+
+def _openwb_pro_profile_binding(config, wb_id, status, selected_id, now=None):
+    """Liefere eine fail-closed Profil-/Live-SoC-Bindung für openWB Pro.
+
+    Die openWB Pro liefert nicht auf jeder Anlage eine nutzbare Fahrzeug-ID.
+    Dann darf das explizit konfigurierte Wallboxprofil nur verwendet werden,
+    wenn es eindeutig ist und ein bestätigter SoC-Anker aus derselben
+    Stecksession oder genau ein frischer Live-Datensatz über einen Profilalias
+    gebunden ist. Das Ergebnis bleibt bewusst nur profilgebunden und behauptet
+    keine von der Pro gemeldete stabile Identität.
+    """
+
+    now = time.time() if now is None else float(now)
+    status = status or {}
+    if (
+        status.get("driver_status_valid") is not True
+        or status.get("driver_status_stale") is True
+        or status.get("driver_status_degraded") is True
+        or not _truthy(status.get("plug_state"))
+    ):
+        return None
+    if not _fresh_timestamp(
+        status.get("driver_status_last_sample_ts"),
+        now,
+        OPENWB_PRO_STATUS_MAX_AGE_S,
+    ):
+        return None
+    plug_session_id = str(status.get("plug_session_id") or "").strip()
+    if not plug_session_id:
+        return None
+    plug_session_started_ts = _plug_session_started_ts(plug_session_id, now)
+    meter_wh = _openwb_pro_session_meter_wh(status)
+    if not plug_session_started_ts or meter_wh is None:
+        return None
+
+    saved_car = _unique_saved_profile(selected_id)
+    if not saved_car:
+        return None
+    profile_aliases = _compact_aliases(saved_car)
+    if not profile_aliases:
+        return None
+
+    # Eine aktuelle oder erhaltene explizite Pro-ID darf dem Profil nie
+    # widersprechen. Eine leere ID ist erlaubt und begründet diesen Fallback.
+    for key in LIVE_STATUS_ID_KEYS:
+        live_id = _compact_id(status.get(key))
+        if live_id and live_id not in profile_aliases:
+            return None
+
+    profile = _profile_for(config, wb_id, selected_id)
+    session_sample = _openwb_pro_same_session_sample(
+        wb_id,
+        profile,
+        profile_aliases,
+        plug_session_id,
+        plug_session_started_ts,
+        meter_wh,
+        now,
+    )
+    if session_sample:
+        return {
+            "sample": session_sample,
+            "profile": profile,
+            "plug_session_id": plug_session_id,
+            "meter_wh": meter_wh,
+            "meter_source": "session_kwh",
+        }
+
+    candidates = []
+    for vehicle in _load_live_vehicles():
+        if not isinstance(vehicle, dict):
+            continue
+        vehicle_aliases = _compact_aliases(vehicle)
+        if not vehicle_aliases.intersection(profile_aliases):
+            continue
+        if not _truthy(vehicle.get("is_plugged_in", vehicle.get("plugged"))):
+            continue
+        try:
+            vehicle_slot = int(vehicle.get("wb_slot") or 0)
+        except (TypeError, ValueError):
+            vehicle_slot = 0
+        if vehicle_slot not in (0, int(wb_id)):
+            continue
+
+        # Zusätzliche typisierte Live-IDs müssen ebenfalls zum Profil gehören.
+        strong_live_aliases = _compact_aliases(
+            vehicle,
+            ("cloud_vehicle_id", "vehicle_id", "vehicle_mac", "mac", "rfid", "rfid_tag"),
+        )
+        if strong_live_aliases and not strong_live_aliases.issubset(profile_aliases):
+            continue
+        soc = _safe_float(vehicle.get("soc", vehicle.get("battery_soc")), -1.0)
+        source = str(vehicle.get("soc_source") or vehicle.get("source") or "").strip()
+        sample_ts = _fresh_timestamp(
+            vehicle.get(
+                "last_updated_at",
+                vehicle.get("updated_at", vehicle.get("ts", vehicle.get("timestamp"))),
+            ),
+            now,
+            OPENWB_PRO_VEHICLE_SOC_MAX_AGE_S,
+        )
+        if soc <= 0.0 or not sample_ts or not _is_confirmed_soc_source(source):
+            continue
+        candidates.append((vehicle, soc, source, sample_ts))
+
+    if len(candidates) != 1:
+        return None
+
+    vehicle, soc, source, sample_ts = candidates[0]
+    live_vehicle_id = ""
+    for key in ("vehicle_id", "cloud_vehicle_id", "id", "rfid", "rfid_tag"):
+        probe = str(vehicle.get(key) or "").strip()
+        if probe and _compact_id(probe) in profile_aliases:
+            live_vehicle_id = probe
+            break
+    sample = {
+        "soc": _clamp_percent(soc),
+        "ts": sample_ts,
+        "source": source,
+        # Die Profil-ID wird separat gespeichert, ohne sie als Pro-Live-ID
+        # auszugeben.
+        "car_id": profile.get("id") or str(selected_id or "").strip(),
+        "vehicle_id": live_vehicle_id,
+        "name": profile.get("name") or str(vehicle.get("name") or "").strip(),
+        "capacity_kwh": _safe_float(profile.get("capacity_kwh"), 0.0),
+        "profile_id": profile.get("id") or str(selected_id or "").strip(),
+        "soc_profile_bound": True,
+        # Ein Cloud-SoC ist eine aktuelle Verankerung. Frühere Energie aus
+        # derselben Stecksession darf nicht nachträglich addiert werden.
+        "anchor_meter_wh": meter_wh,
+    }
+    return {
+        "sample": sample,
+        "profile": profile,
+        "plug_session_id": plug_session_id,
+        "meter_wh": meter_wh,
+        "meter_source": "session_kwh",
+    }
 
 
 def _profile_for(config, wb_id, selected_id, fallback_name=""):
@@ -421,15 +730,55 @@ class VehicleSocTracker:
         config = config or {}
         status = status or {}
         source_status = str(status.get("car_soc_source") or "").strip()
-        if str(charger_class or "") == "OpenWBProCharger" or source_status in OPENWB_PRO_SOURCES:
+        is_openwb_pro = str(charger_class or "") == "OpenWBProCharger"
+        status_soc = _safe_float(status.get("car_soc"), -1.0)
+        # Ein bestätigter Roh-/Treiberschätzwert bleibt autoritativ. Der
+        # generische Fallback überschreibt weder Status noch Manual-SoC-Datei.
+        if (
+            source_status in OPENWB_PRO_SOURCES
+            and status_soc > 0.0
+            and _is_confirmed_soc_source(source_status)
+        ):
             return None
 
         selected_id = str(config.get(f"wb{wb_id}_car_id") or "").strip()
         if selected_id.lower() in NO_VEHICLE_IDS:
             selected_id = ""
-        sample = self._best_anchor_sample(wb_id, config, status, selected_id)
-        fallback_name = str((sample or {}).get("name") or status.get("car_name") or status.get("charge_template_name") or "").strip()
-        profile = _profile_for(config, wb_id, selected_id, fallback_name=fallback_name)
+        profile_binding = (
+            _openwb_pro_profile_binding(
+                config,
+                wb_id,
+                status,
+                selected_id,
+                now=now,
+            )
+            if is_openwb_pro
+            else None
+        )
+        if is_openwb_pro:
+            if not profile_binding:
+                self._invalidate_profile_fallback(
+                    wb_id,
+                    connected=_status_connected(status),
+                    reason="profile_binding_invalid",
+                )
+                return None
+            sample = profile_binding["sample"]
+            profile = profile_binding["profile"]
+        else:
+            sample = self._best_anchor_sample(wb_id, config, status, selected_id)
+            fallback_name = str(
+                (sample or {}).get("name")
+                or status.get("car_name")
+                or status.get("charge_template_name")
+                or ""
+            ).strip()
+            profile = _profile_for(
+                config,
+                wb_id,
+                selected_id,
+                fallback_name=fallback_name,
+            )
         capacity = _safe_float(profile.get("capacity_kwh"), 0.0)
         efficiency = _safe_float(profile.get("efficiency"), 0.90)
         efficiency = max(0.50, min(1.00, efficiency or 0.90))
@@ -440,7 +789,16 @@ class VehicleSocTracker:
         state = self._load_state(wb_id)
         connected = _status_connected(status)
         charging = _status_power_w(status) > 500.0
-        meter_wh, meter_source = _status_meter_wh(status)
+        if profile_binding:
+            meter_wh = profile_binding.get("meter_wh")
+            meter_source = str(profile_binding.get("meter_source") or "")
+        else:
+            meter_wh, meter_source = _status_meter_wh(status)
+        plug_session_id = (
+            str(profile_binding.get("plug_session_id") or "").strip()
+            if profile_binding
+            else ""
+        )
         active_car_id = str((sample or {}).get("car_id") or profile.get("id") or selected_id or "").strip()
         vehicle_key = _compact_id(active_car_id or (sample or {}).get("vehicle_id") or selected_id or f"wb{wb_id}")
         meter_reset = (
@@ -449,13 +807,21 @@ class VehicleSocTracker:
             and meter_wh + 100.0 < _safe_float(state.get("anchor_meter_wh"), 0.0)
         )
         car_changed = bool(state.get("vehicle_key") and vehicle_key and state.get("vehicle_key") != vehicle_key)
+        plug_session_changed = bool(
+            is_openwb_pro
+            and state.get("plug_session_id")
+            and plug_session_id
+            and state.get("plug_session_id") != plug_session_id
+        )
         source_newer = False
         if sample:
             source_newer = _timestamp(sample.get("ts"), 0.0) > _timestamp(state.get("anchor_sample_ts"), 0.0) + 1.0
         needs_anchor = (
             not state.get("anchor_soc")
+            or (is_openwb_pro and (not state.get("soc_profile_bound") or not state.get("plug_session_id")))
             or not connected
             or car_changed
+            or plug_session_changed
             or meter_reset
             or (sample is not None and source_newer)
         )
@@ -489,7 +855,11 @@ class VehicleSocTracker:
                 "anchor_soc": _clamp_percent(sample.get("soc")),
                 "anchor_sample_ts": _timestamp(sample.get("ts"), now),
                 "anchor_source": str(sample.get("source") or "start_soc"),
-                "anchor_meter_wh": meter_wh,
+                "anchor_meter_wh": (
+                    _safe_float(sample.get("anchor_meter_wh"), meter_wh)
+                    if sample.get("anchor_meter_wh") is not None
+                    else meter_wh
+                ),
                 "last_meter_wh": meter_wh,
                 "meter_source": meter_source,
                 "power_integrated_wh": 0.0,
@@ -497,6 +867,9 @@ class VehicleSocTracker:
                 "capacity_kwh": capacity,
                 "efficiency": efficiency,
                 "consumption_kwh_100km": consumption,
+                "profile_id": str(sample.get("profile_id") or profile.get("id") or "").strip(),
+                "soc_profile_bound": bool(sample.get("soc_profile_bound", False)),
+                "plug_session_id": plug_session_id,
             }
         elif not state.get("anchor_soc"):
             return None
@@ -541,17 +914,45 @@ class VehicleSocTracker:
             "raw_soc": round(_safe_float(state.get("anchor_soc"), estimated_soc), 1),
             "raw_source": raw_source,
             "raw_soc_ts": int(_timestamp(state.get("anchor_sample_ts"), now)),
-            "car_id": state.get("car_id") or active_car_id,
-            "vehicle_id": state.get("vehicle_id") or "",
+            # Bei einer Profilbindung ohne Pro-Live-ID bleibt die Runtime-ID
+            # leer. Das Profil wird separat transportiert und ist keine
+            # Behauptung einer stabilen, von der Wallbox gelesenen Identität.
+            "car_id": (
+                str(status.get("car_id") or "").strip()
+                if bool(state.get("soc_profile_bound", False))
+                else state.get("car_id") or active_car_id
+            ),
+            "vehicle_id": (
+                str(status.get("vehicle_id") or "").strip()
+                if bool(state.get("soc_profile_bound", False))
+                else state.get("vehicle_id") or ""
+            ),
             "name": state.get("name") or profile.get("name") or active_car_id,
             "capacity": capacity,
             "wb": wb_id,
             "plugged": connected,
             "charging": charging,
             "is_interpolated": delivered_wh > 20.0,
-            "session_kwh": round(delivered_wh / 1000.0, 3),
+            "profile_id": state.get("profile_id") or "",
+            "soc_profile_bound": bool(state.get("soc_profile_bound", False)),
+            "plug_session_id": state.get("plug_session_id") or "",
+            "session_kwh": round(
+                meter_wh / 1000.0
+                if state.get("meter_source") == "session_kwh"
+                and meter_wh is not None
+                else delivered_wh / 1000.0,
+                3,
+            ),
             "ts": int(now),
         }
+        if (
+            state.get("meter_source") == "session_kwh"
+            and state.get("anchor_meter_wh") is not None
+        ):
+            result["anchor_session_kwh"] = round(
+                _safe_float(state.get("anchor_meter_wh"), 0.0) / 1000.0,
+                3,
+            )
         if consumption > 0:
             result["consumption_kwh_100km"] = consumption
             result["range_km"] = round((capacity * estimated_soc / 100.0) / consumption * 100.0, 0)
@@ -566,6 +967,31 @@ class VehicleSocTracker:
         if int(wb_id) == 1:
             legacy = os.path.join(TMP_DIR, "manual_soc.json")
             _write_json_atomic(legacy, payload)
+
+    def _invalidate_profile_fallback(self, wb_id, connected, reason):
+        """Sperre eine nicht mehr belastbar gebundene Pro-/Profil-Schätzung."""
+
+        path = _manual_soc_path(wb_id)
+        data = _read_json(path, None)
+        if not isinstance(data, dict):
+            return
+        source = str(data.get("source") or "").strip()
+        if (
+            source not in OPENWB_PRO_SOURCES
+            and not bool(data.get("soc_profile_bound", False))
+        ):
+            return
+        data.update({
+            "source": f"{ESTIMATED_PREFIX}_{str(reason or 'invalid')}",
+            "soc_rule_confirmed": False,
+            "plugged": bool(connected),
+            "charging": False,
+            "is_interpolated": False,
+            "estimate_expired": True,
+            "soc_profile_binding_invalid": True,
+            "ts": int(time.time()),
+        })
+        self._write_manual_soc(wb_id, data)
 
     def _mark_manual_unplugged(self, wb_id, state):
         path = _manual_soc_path(wb_id)

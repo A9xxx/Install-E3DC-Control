@@ -109,6 +109,11 @@ LEGACY_PIP_POLICY_KEY = "pip_packages"
 VALID_HA_ROLES = frozenset({"off", "master", "slave", "shadow"})
 HA_CONFIG_PATH = "/var/www/html/data/e3dc_v4.json"
 TARGET_FINALIZER_SUCCESS = "E3DC_RELEASE_TARGET_FINALIZER_OK"
+TARGET_FINALIZER_RELATIVE_FILES = (
+    "Installer/__init__.py",
+    "Installer/release_finalize.py",
+    "Installer/update.py",
+)
 
 
 def _is_docker_environment() -> bool:
@@ -182,6 +187,22 @@ def _run_argv(argv, *, timeout: int = 30, env=None) -> dict:
         "stderr": completed.stderr or "",
         "returncode": completed.returncode,
     }
+
+
+def _combined_process_diagnostics(result: dict, maximum: int = 4000) -> str:
+    """Bewahrt stdout und stderr eines fehlgeschlagenen Kindprozesses gemeinsam."""
+    stdout = str(result.get("stdout") or "").strip()
+    stderr = str(result.get("stderr") or "").strip()
+    streams = sum(bool(value) for value in (stdout, stderr))
+    if streams == 0:
+        return "kein Fehlertext"
+    per_stream = max(256, int(maximum) // streams - 16)
+    sections = []
+    if stdout:
+        sections.append("stdout:\n" + stdout[-per_stream:])
+    if stderr:
+        sections.append("stderr:\n" + stderr[-per_stream:])
+    return "\n".join(sections)
 
 
 def _git_argv(repo_dir: str, install_user: str, *args: str, timeout: int = 30) -> dict:
@@ -1006,10 +1027,13 @@ def _read_policy_from_commit(repo_dir: str, commit: str, install_user: str | Non
     """Read UPDATE_POLICY.json from one verified commit object, never the worktree."""
     verified_commit = _validate_full_commit(commit)
     user = install_user or get_install_user()
-    result = _git_argv(repo_dir, user, "show", f"{verified_commit}:UPDATE_POLICY.json", timeout=15)
-    if not result["success"]:
-        raise RuntimeError("UPDATE_POLICY.json fehlt im verifizierten Ziel-Commit")
-    raw = result["stdout"].encode("utf-8")
+    raw = _read_commit_blob(
+        repo_dir,
+        verified_commit,
+        "UPDATE_POLICY.json",
+        user,
+        maximum=1024 * 1024,
+    )
     if not raw or len(raw) > 1024 * 1024:
         raise RuntimeError("UPDATE_POLICY.json ist leer oder zu gross")
     try:
@@ -2327,11 +2351,15 @@ def finalize_release_from_target(
     _sync_release_web(target_root, policy)
     if policy.get("run_permissions", True):
         from .permissions import run_permissions_wizard
-        if run_permissions_wizard(headless=True) is False:
+        if run_permissions_wizard(headless=True, release_quiesced=True) is False:
             raise RuntimeError("Berechtigungsreparatur fehlgeschlagen")
         _secure_repo_permissions(target_root, install_user)
 
-    from .permissions import ensure_private_ml_model_store, harden_web_program_permissions
+    from .permissions import (
+        ensure_private_ml_model_store,
+        harden_web_program_permissions,
+        refresh_watchdog_guard_script,
+    )
     if not ensure_private_ml_model_store():
         raise RuntimeError("Privater ML-Modellspeicher konnte nicht sicher vorbereitet werden")
     if not harden_web_program_permissions():
@@ -2348,6 +2376,9 @@ def finalize_release_from_target(
         transition_state=state,
     ):
         raise RuntimeError("Erwartete Dienste konnten nicht vollständig gestartet werden")
+    if not refresh_watchdog_guard_script():
+        _stop_v4_services(restart_services)
+        raise RuntimeError("Watchdog-Guard konnte nach dem finalen Dienststart nicht aktualisiert werden")
     if not _post_update_healthcheck(restart_services, transition_state=state):
         _stop_v4_services(restart_services)
         raise RuntimeError("Dienst-/HTTP-/HA-Gesundheitsgate fehlgeschlagen")
@@ -2387,11 +2418,7 @@ def _invoke_target_finalizer(
             relative_path=relative_path,
             install_user=install_user,
         )
-        for relative_path in (
-            "Installer/__init__.py",
-            "Installer/release_finalize.py",
-            "Installer/update.py",
-        )
+        for relative_path in TARGET_FINALIZER_RELATIVE_FILES
     }
     finalizer = os.path.join(repo_dir, "Installer", "release_finalize.py")
     python = str(sys.executable or "")
@@ -2410,6 +2437,8 @@ def _invoke_target_finalizer(
         environment.pop(name, None)
     environment["E3DC_INSTALL_ROOT"] = repo_dir
     environment["PYTHONNOUSERSITE"] = "1"
+    environment["LC_ALL"] = "C.UTF-8"
+    environment["LANG"] = "C.UTF-8"
 
     for relative_path, expected_identity in bound_target_files.items():
         current = os.lstat(os.path.join(repo_dir, relative_path))
@@ -2446,8 +2475,10 @@ def _invoke_target_finalizer(
     marker = f"{TARGET_FINALIZER_SUCCESS} {target_commit} {target_tag}"
     lines = [line.strip() for line in result.get("stdout", "").splitlines()]
     if not result.get("success") or lines.count(marker) != 1:
-        detail = (result.get("stderr") or result.get("stdout") or "kein Fehlertext").strip()
-        raise RuntimeError("Target-Finalizer fehlgeschlagen: " + detail[-2000:])
+        raise RuntimeError(
+            "Target-Finalizer fehlgeschlagen: "
+            + _combined_process_diagnostics(result)
+        )
 
 
 def _file_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
@@ -2524,6 +2555,133 @@ def _read_commit_blob(
     if len(payload) != expected_size:
         raise RuntimeError("Target-Blobgröße driftete während des Lesens")
     return payload
+
+
+def _read_commit_file_mode(
+    repo_dir: str,
+    target_commit: str,
+    relative_path: str,
+    install_user: str,
+) -> int:
+    """Liest den freigegebenen Git-Dateimodus ohne locale-abhängige Textumwandlung."""
+    commit = _validate_full_commit(target_commit)
+    if relative_path.startswith("/") or ".." in Path(relative_path).parts:
+        raise RuntimeError("Target-Moduspfad ist nicht relativ und kanonisch")
+    try:
+        completed = subprocess.run(
+            [
+                "sudo", "-H", "-u", str(install_user),
+                "git", "-C", str(repo_dir),
+                "ls-tree", "-z", commit, "--", relative_path,
+            ],
+            capture_output=True,
+            text=False,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("Target-Dateimodus konnte nicht gelesen werden") from exc
+    if completed.returncode != 0:
+        detail = (completed.stderr or b"").decode("utf-8", errors="replace").strip()
+        raise RuntimeError("Target-Dateimodus fehlt im freigegebenen Commit: " + detail[-500:])
+    records = [record for record in bytes(completed.stdout or b"").split(b"\0") if record]
+    if len(records) != 1:
+        raise RuntimeError("Target-Dateimodus ist nicht eindeutig")
+    try:
+        header, raw_path = records[0].split(b"\t", 1)
+        raw_mode, object_type, _object_id = header.split(b" ", 2)
+        parsed_path = raw_path.decode("utf-8")
+        mode_text = raw_mode.decode("ascii")
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise RuntimeError("Target-Dateimodus besitzt ein ungültiges Git-Format") from exc
+    if parsed_path != relative_path or object_type != b"blob" or mode_text not in {"100644", "100755"}:
+        raise RuntimeError("Target-Dateimodus ist nicht als reguläre Produktdatei freigegeben")
+    return 0o755 if mode_text == "100755" else 0o644
+
+
+def _read_descriptor_bytes(descriptor: int, maximum: int) -> bytes:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    chunks = []
+    total = 0
+    while True:
+        chunk = os.read(descriptor, min(64 * 1024, maximum + 1 - total))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > maximum:
+            raise RuntimeError("Target-Datei ist größer als der freigegebene Blob")
+    return b"".join(chunks)
+
+
+def _normalize_target_finalizer_files(
+    *,
+    repo_dir: str,
+    target_commit: str,
+    install_user: str,
+) -> None:
+    """Normalisiert nur bytegenau gebundene Finalizer-Dateien über offene FDs."""
+    try:
+        account = pwd.getpwnam(str(install_user))
+    except KeyError as exc:
+        raise RuntimeError("Installationsbenutzer für Target-Normalisierung fehlt") from exc
+    root = os.path.abspath(repo_dir)
+    for relative_path in TARGET_FINALIZER_RELATIVE_FILES:
+        target = os.path.abspath(os.path.join(root, relative_path))
+        if os.path.commonpath((root, target)) != root:
+            raise RuntimeError("Target-Normalisierung verlässt das Installationsverzeichnis")
+        expected = _read_commit_blob(
+            repo_dir,
+            target_commit,
+            relative_path,
+            install_user,
+        )
+        expected_mode = _read_commit_file_mode(
+            repo_dir,
+            target_commit,
+            relative_path,
+            install_user,
+        )
+        descriptor, before = _open_regular_file_nofollow(target)
+        try:
+            if before.st_nlink != 1:
+                raise RuntimeError("Target-Datei besitzt mehrere Hardlinks")
+            if before.st_uid not in (0, account.pw_uid):
+                raise RuntimeError("Target-Datei besitzt einen nicht vertrauenswürdigen Eigentümer")
+            if before.st_size != len(expected):
+                raise RuntimeError("Target-Dateigröße stimmt nicht mit dem freigegebenen Commit überein")
+            if _read_descriptor_bytes(descriptor, len(expected)) != expected:
+                raise RuntimeError("Target-Datei stimmt nicht bytegenau mit dem freigegebenen Commit überein")
+            stable_before = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+            current = os.fstat(descriptor)
+            if (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns) != stable_before:
+                raise RuntimeError("Target-Datei driftete vor der Metadaten-Normalisierung")
+            os.fchown(descriptor, account.pw_uid, account.pw_gid)
+            os.fchmod(descriptor, expected_mode)
+            os.fsync(descriptor)
+            after = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(after.st_mode)
+                or after.st_nlink != 1
+                or after.st_uid != account.pw_uid
+                or after.st_gid != account.pw_gid
+                or stat.S_IMODE(after.st_mode) != expected_mode
+                or (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) != stable_before
+            ):
+                raise RuntimeError("Target-Metadaten konnten nicht exakt normalisiert werden")
+            if _read_descriptor_bytes(descriptor, len(expected)) != expected:
+                raise RuntimeError("Target-Datei driftete während der Metadaten-Normalisierung")
+        finally:
+            os.close(descriptor)
+        current_path = os.lstat(target)
+        if (
+            current_path.st_dev != before.st_dev
+            or current_path.st_ino != before.st_ino
+            or current_path.st_uid != account.pw_uid
+            or current_path.st_gid != account.pw_gid
+            or stat.S_IMODE(current_path.st_mode) != expected_mode
+        ):
+            raise RuntimeError("Target-Datei wurde nach der Metadaten-Normalisierung ausgetauscht")
 
 
 def _bind_target_file_to_commit(
@@ -2651,7 +2809,6 @@ def update_e3dc(
     if target_install_path and (not expected_sha or not expected_ha_role):
         print("[!] Bootstrap verlangt --expected-release-sha und --expected-ha-role.")
         return False
-
     transition_name = "release-bootstrap" if target_install_path else ("release-rollback" if target_tag else "self-update")
     if not sys.stdout.isatty():
         headless = True
@@ -2783,6 +2940,12 @@ def update_e3dc(
         new_commit = _resolve_git_commit(repo_dir, "HEAD", install_user)
         if not new_commit or not _exact_commit_matches(target_commit, new_commit):
             raise RuntimeError("HEAD stimmt nicht exakt mit dem freigegebenen Ziel-SHA ueberein")
+
+        _normalize_target_finalizer_files(
+            repo_dir=repo_dir,
+            target_commit=target_commit,
+            install_user=install_user,
+        )
 
         packages_mutated = True
         _invoke_target_finalizer(
@@ -2930,6 +3093,49 @@ def _find_venv_python(install_user: str | None = None) -> str | None:
         return str(candidate)
     except (OSError, KeyError, TypeError, ValueError, RuntimeError, json.JSONDecodeError):
         return None
+
+
+def _trusted_system_python() -> str:
+    """Liefert ausschließlich den festen, root-kontrollierten Systeminterpreter."""
+    candidate = Path("/usr/bin/python3")
+    try:
+        link_info = candidate.lstat()
+        target = candidate.resolve(strict=True)
+        target_info = target.stat()
+    except OSError as exc:
+        raise RuntimeError("Fester System-Python ist nicht verfügbar") from exc
+    if not (stat.S_ISLNK(link_info.st_mode) or stat.S_ISREG(link_info.st_mode)):
+        raise RuntimeError("Fester System-Python ist weder Link noch reguläre Datei")
+    if link_info.st_uid != 0 or link_info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise RuntimeError("System-Python-Pfad besitzt unsichere Metadaten")
+    if (
+        not stat.S_ISREG(target_info.st_mode)
+        or target_info.st_uid != 0
+        or target_info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        or not os.access(candidate, os.X_OK)
+    ):
+        raise RuntimeError("System-Python-Ziel besitzt unsichere Metadaten")
+    return str(candidate)
+
+
+def select_wrapper_python(action: str) -> str:
+    """Wählt für Wrapper-Aktionen deterministisch venv oder sicheren Bootstrap-Python."""
+    normalized = str(action or "").strip().lower()
+    if normalized not in {"check", "fix_permissions", "update_e3dc", "install_release"}:
+        raise RuntimeError("Wrapper-Python darf für diese Aktion nicht gewählt werden")
+    install_user = get_install_user()
+    venv_python = _find_venv_python(install_user)
+    if venv_python:
+        return venv_python
+    if normalized in {"update_e3dc", "install_release"}:
+        if _is_docker_environment():
+            # Im Container führt update_e3dc keinen Release-Wechsel aus,
+            # sondern gibt ausschließlich den Host-Compose-Hinweis aus.
+            return _trusted_system_python()
+        raise RuntimeError(
+            "Release-Wechsel benötigt einen vorhandenen und vertrauenswürdigen Python-venv"
+        )
+    return _trusted_system_python()
 
 
 def run_initial_forecast(installer_dir: str | None = None):

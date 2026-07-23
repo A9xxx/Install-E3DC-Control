@@ -6,18 +6,35 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.0c] – 2026-07-23
+
+### 📦 Web-Update und Installation
+
+- 🐛 **Altstand-Übergang:** Der reale Web-Update-Pfad aus 5.3.2a und 5.3.2b übernimmt nach dem Git-Wechsel den neuen, service-neutralen Rechtevertrag. Die vom Updater selbst angehaltenen Dienste gelten nicht mehr als Fehler.
+- 🐍 **PEP 668:** Leere Paketlisten lösen keinen System-`pip`-Aufruf aus. Abhängigkeiten bleiben an das verwaltete Benutzer-venv gebunden.
+- 🔧 **5.3.2a-Bootstrap:** Ist der alte privilegierte Wrapper nicht ausführbar, erfolgt einmalig ein interaktiver Konsolenaufruf. Ein nicht startbarer Root-Einstieg wird nicht aus dem Webprozess heraus umgeschrieben.
+- 🔐 **Sudoers-Kompatibilität:** Fremde, klar abgegrenzte ioBroker-Freigaben werden gemeldet, aber nicht verändert und blockieren das E3DC-Control-Update nicht. Fremde direkte E3DC-`systemctl`-Freigaben bleiben fail-closed.
+- 🔎 **Diagnose:** Fehler aus Rechteprüfung, Ziel-Finalizer und Dienststart werden vollständig an Weboberfläche und Konsole weitergereicht.
+
+### 🔌 openWB Pro
+
+- 🐛 **Start und Phasenwechsel:** Nach einem bestätigten Anstecken wird die Stromfreigabe ohne alten Nullanker zügig bis zum zulässigen Budget nachgeführt. Der eigentliche Phasenwechsel nutzt eine kurze sichere CP-Unterbrechung; die anschließenden 480 Sekunden sperren nur einen weiteren Phasenwechsel, nicht den Wiederanlauf.
+- ⏸️ **Manuelle Pause:** Ein zentral blockierter STOP gilt nicht mehr als erfolgreich. Die Pause wird erst nach bestätigtem STOP oder bereits real stehender Wallbox übernommen; das private Transaktionsverzeichnis erhält die passenden Webserverrechte.
+- 🔋 **Fahrzeug-SoC:** Der Ioniq-5-Fallback ist eindeutig an Fahrzeugprofil und Stecksession gebunden und verwendet ausschließlich die Energie der aktuellen openWB-Pro-Ladesitzung. Echte Fahrzeug- oder Wallboxwerte haben Vorrang.
+- 🛡️ **Ladeende nach Neustart:** Ein bestätigtes Ladeende bleibt über einen Manager-Neustart an dieselbe Stecksession gebunden. Ein niedrigerer interpolierter SoC, ein einzelnes Disconnect-Bild oder ein Phasenübergang dürfen keinen neuen 6-A-Start auslösen.
+
 ## [5.4.0b] – 2026-07-23
 
 ### 📦 Installation, Update und Docker
 
-- 🐛 **Fehlerbehebung:** Auf Debian-Systemen mit PEP 668 installiert das Release-Update keine Python-Pakete mehr in die verwaltete Systemumgebung. Abhängigkeiten werden im gebundenen Benutzer-venv aktualisiert; fehlt das Standard-venv, wird es nach Installation von `python3-venv` kontrolliert neu angelegt.
+- 🐛 **Fehlerbehebung:** Auf Debian-Systemen mit PEP 668 installiert das Release-Update keine Python-Pakete mehr in die verwaltete Systemumgebung. Ab dem neuen Updater werden Abhängigkeiten im gebundenen Benutzer-venv aktualisiert; ein fehlendes Standard-venv kann nach Installation von `python3-venv` kontrolliert neu angelegt werden. Der direkte erste Wechsel aus 5.3.2a/b setzt das vorhandene venv voraus.
 - 🔄 **Kompatibilität:** Docker-Installationen werden im Web- und Konsolen-Updater eindeutig erkannt. Statt eines ungeeigneten Release-Wechsels im Container werden die notwendigen `docker compose`-Befehle für den Host angezeigt.
 - 🐳 **Docker-Update:** Die mitgelieferte Compose-Datei folgt ohne bewussten Pin dem geprüften Stable-Tag `latest`. Ein fest eingetragener Versions-Tag bleibt fest; `docker compose config --images` macht das Ziel vor dem Pull sichtbar.
 - 🛡️ **Docker-Rückfall:** Ein Stable-Container wird nur noch freigegeben, wenn das in der Update-Policy beworbene Rückfall-Image tatsächlich für AMD64 und ARM64 verfügbar ist. Historische Quellbytes und der aktuelle OCI-Prüfer bleiben dabei getrennt gebunden.
 - 🛡️ **Bare-Metal-Rückfall:** `v5.3.2b` bleibt als Docker-Image verfügbar, wird auf Bare Metal aber nicht mehr als Programm-Rückfall angeboten. Der Altstand besitzt keinen zielgebundenen Finalizer; verifizierte Datei-Backups bleiben der sichere Bare-Metal-Rückweg.
 - 🛡️ **Sicherheit:** Wrapper- und sudoers-Reparatur verwenden einen gebundenen Snapshot und rollen Teilfehler atomar zurück. Runtime- und Session-Rechte werden von diesem engen Reparaturpfad nicht nebenbei verändert.
 - 🧱 **Stabilität:** Kanonische systemd-Masken auf `/dev/null` werden als Zustand gesichert und beim Restore verifiziert. Sie werden nicht mehr fälschlich wie reguläre Unit-Dateien behandelt; andere Symlinks bleiben gesperrt.
-- 🔐 **Sicherheit:** Nach dem Git-Wechsel führt ein eigener, an Ziel-SHA und Zielbaum gebundener Finalizer die Installation fort. Dadurch werden keine bereits importierten Module des alten Release-Stands in den neuen Zielbaum übernommen.
+- 🔐 **Sicherheit:** Ab dem neuen Updater führt nach dem Git-Wechsel ein eigener, an Ziel-SHA und Zielbaum gebundener Finalizer die Installation fort. Der erste Wechsel aus 5.3.2a/b bleibt im alten Prozess, übernimmt aber nach dem Reset den neuen service-neutralen Rechtevertrag.
 
 ### 🔌 Wallboxen und PV-Kurve
 
@@ -61,7 +78,7 @@ Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame
 - 🐛 **Fehlerbehebung:** Eine angesteckte und freigegebene openWB Pro verwirft abgelaufene eigene Phasenreservierungen und veraltete Nullanker. Nach bestätigter Bereitschaft wird die positive Startfreigabe ohne Umstecken oder Manager-Neustart erneut projiziert.
 - ⚙️ **Regelung:** Das Mehr-Wallbox-Balancing verwendet die tatsächlichen L1/L2/L3-Stromvektoren, die reale Phasenzahl, Fahrzeug- und Ladepunktgrenzen sowie die Netzpunktreserve. Ein- und dreiphasige Amperewerte werden nicht pauschal addiert.
 - 🧱 **Stabilität:** Die ruhige PV-Kurve folgt dem nachhaltigen PV- und Ladekurvenbudget mit Hysterese und Mindestlaufzeit. Eine bereits laufende Ladung darf kurze Einbrüche mit höchstens 75 Wh Batteriestützung überbrücken; Kaltstart und Phasenwechsel werden nicht aus dem Speicher finanziert.
-- 🛡️ **Sicherheit:** Geschützte openWB-Phasenwechsel setzen zuerst 0 A, übergeben anschließend das Phasenziel an `phasetarget` und warten mindestens 480 Sekunden sowie auf frische, bestätigte Rückmeldungen. E3DC-Control sendet dabei keinen zweiten CP-Befehl. Direkte E3/DC-Sun-/Auto-/Abort-, Maximalstrom- und native Phasenbefehle bleiben gesperrt.
+- 🛡️ **Sicherheit:** Geschützte openWB-Phasenwechsel setzen zuerst 0 A, übergeben anschließend das Phasenziel an `phasetarget` und warten auf frische, bestätigte Rückmeldungen. Danach sperrt ein persistenter 480-Sekunden-Cooldown ausschließlich den nächsten Phasenwechsel. E3DC-Control sendet dabei keinen zweiten CP-Befehl. Direkte E3/DC-Sun-/Auto-/Abort-, Maximalstrom- und native Phasenbefehle bleiben gesperrt.
 - 🔄 **Kompatibilität:** Der bestätigungsgebundene WBchar6-Pfad für vorhandene E3/DC-Wallboxen sowie openWB, openWB Pro und go-e bleiben unterstützt. Ein ausdrücklich deaktivierter Ladepunkt bleibt im Nur-Status-Betrieb.
 
 ### ♨️ Wärme und iDM

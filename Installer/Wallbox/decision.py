@@ -2786,6 +2786,8 @@ def phase_switch_recommendation(
     one_phase_confirmed: bool,
     phase_pending_age_s: float,
     phase_confirm_timeout_s: float,
+    prefer_current_first_before_phase_up: bool = False,
+    phase_up_min_runtime_s: float = 0.0,
 ) -> Dict[str, Any]:
     """Empfiehlt eine Phasenaktion, ohne einen Wallbox-Befehl zu senden."""
 
@@ -2820,10 +2822,36 @@ def phase_switch_recommendation(
             "remaining_s": int(round(max(0.0, wait_val - age_val))),
         }
 
+    if (
+        prefer_current_first_before_phase_up
+        and openwb_pro
+        and charger_connected
+        and mode > 0
+        and public_mode > 0
+        and not hw_charging
+        and cap >= 6
+        and (
+            (target == 1 and switch_phases in (0, 1))
+            or (
+                target == 0
+                and switch_phases == 0
+                and cap_phases >= 3
+            )
+        )
+    ):
+        return {
+            "action": "KEEP_PHASES",
+            "target_phases": 0,
+            "reason": "openwb_pro_current_first_before_phase_up",
+            "wait_s": 0,
+            "remaining_s": 0,
+        }
+
     known_3p_recovery_possible = bool(
         openwb_pro
         and mode > 0
         and public_mode > 0
+        and not hw_charging
         and cap > 0
         and phase_3p_supported
         and not vehicle_1p_only
@@ -2935,7 +2963,11 @@ def phase_switch_recommendation(
         and not phase_block_active
     )
     if phase_up_possible:
-        up_wait_s = 0.0 if (openwb_pro or predump_wallbox_active) else 45.0
+        up_wait_s = (
+            max(0.0, _safe_float(phase_up_min_runtime_s, 0.0))
+            if openwb_pro
+            else (0.0 if predump_wallbox_active else 45.0)
+        )
         if (
             phase_forecast_hold_for_wb
             and not phase_configured_3p
@@ -3464,9 +3496,24 @@ def driver_command_from_decision_payload(payload: Optional[Dict[str, Any]]) -> D
         target_phases = phase_target
         reason = str(phase.get("reason", "phase_switch") or "phase_switch")
     elif phase_action.startswith("WAIT"):
-        kind = "wait"
-        target_phases = phase_target
-        reason = str(phase.get("reason", "phase_wait") or "phase_wait")
+        # Eine noch laufende 30-/60-s-Umschalthysterese ist kein Ladeverbot.
+        # Auf den vorhandenen Phasen folgt die Wallbox weiter der Stromkurve;
+        # nur der spätere Schütz-/phasetarget-Befehl wartet.
+        hw_charging = bool(inputs.get("hw_charging", False))
+        if hw_charging and start_action in ("START", "SET_CURRENT") and target_amp > 0:
+            kind = "set_current"
+            amp = target_amp
+            reason = "phase_hysteresis_hold_current"
+        elif hw_charging and start_action.startswith("HOLD_") and max(
+            hold_amp, target_amp, current_set_amp
+        ) > 0:
+            kind = "hold_current"
+            amp = max(hold_amp, target_amp, current_set_amp)
+            reason = "phase_hysteresis_hold_current"
+        else:
+            kind = "wait"
+            target_phases = phase_target
+            reason = str(phase.get("reason", "phase_wait") or "phase_wait")
     elif start_action.startswith("HOLD_"):
         kind = "hold_current" if max(hold_amp, target_amp, current_set_amp) > 0 else "hold_state"
         amp = max(hold_amp, target_amp, current_set_amp)

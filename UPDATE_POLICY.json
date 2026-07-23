@@ -1,9 +1,9 @@
 {
-  "version": "5.4.0c",
+  "version": "5.4.0d",
   "min_version": "4.0.0",
-  "stable_release": "v5.4.0c",
+  "stable_release": "v5.4.0d",
   "release_date": "2026-07-23",
-  "description": "v5.4.0c - Alt-Updater-, openWB-Pro- und SoC-Hotfix",
+  "description": "v5.4.0d - Rechtevertrag-Hotfix für Alt-Updater",
   "installer_requires": "python3",
   "sanitized_republication": false,
   "history_transition": {

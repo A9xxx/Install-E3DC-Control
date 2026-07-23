@@ -1,10 +1,25 @@
-# v5.4.0c
+# v5.4.0d
 
-E3DC-Control v5.4.0c schließt die beim ersten Feldbetrieb von v5.4.0b
-sichtbar gewordenen Alt-Updater- und openWB-Pro-Kanten. Es enthält weiterhin
-alle Korrekturen aus v5.4.0a und v5.4.0b.
+E3DC-Control v5.4.0d korrigiert die im realen Altstand-Pilot sichtbar
+gewordene letzte Rechtekante des Bare-Metal-Updaters. Es enthält unverändert
+alle Korrekturen aus v5.4.0a, v5.4.0b und v5.4.0c.
 
-## Korrekturen in v5.4.0c
+## Korrektur in v5.4.0d
+
+- Private Verzeichnisse werden auch unter einem vererbenden `setgid`-
+  Datenordner exakt auf `0700` gesetzt. GNU `chmod` darf das geerbte Sonderbit
+  nicht mehr als `2700` bewahren.
+- Der klassische Wallbox-Konfigurationspfad und der transaktionale
+  Wallbox-Planer verwenden für ihre gemeinsame private Lockdatei jetzt
+  einheitlich den Modus `0600`.
+- Matter-Storage, Wallbox-Planer und private Zusatz-WR-Migrationsbackups
+  verwenden denselben exakten Modusvertrag. Der Wiederherstellungspfad
+  überspringt die beiden privaten Webbäume bei breiten Rechtekorrekturen.
+- Der private Transaktionsbaum bleibt ausschließlich `www-data:www-data`
+  vorbehalten. Die Sicherheitsprüfung wurde nicht gelockert.
+- Die openWB-Pro-Regelung aus v5.4.0c wurde nicht verändert.
+
+## Enthaltene Korrekturen aus v5.4.0c
 
 - Der reale Web-Update-Übergang aus 5.3.2a und 5.3.2b verwendet nach dem
   Git-Wechsel den neuen Rechtevertrag. Die vom Updater selbst angehaltenen
@@ -43,21 +58,28 @@ alte privilegierte Einstieg einmalig an einer interaktiven SSH-Konsole
 repariert werden:
 
 ```bash
-cd "/absoluter/pfad/zur/Install"
-sudo python3 installer_main.py --fix-permissions
-sudo python3 installer_main.py --update-e3dc
+export E3DC_INSTALL_PATH="$HOME/Install"
+test -f "$E3DC_INSTALL_PATH/installer_main.py"
+test -x "$HOME/.venv_e3dc/bin/python3"
+cd "$E3DC_INSTALL_PATH"
+sudo /usr/bin/python3 installer_main.py --fix-permissions
+sudo /usr/bin/python3 installer_main.py --check
+sudo /usr/bin/python3 installer_main.py --update-e3dc
+cat VERSION
+systemctl --failed --no-pager
 ```
 
-Den Pfad bitte an den tatsächlichen Installationsbenutzer anpassen. Eine
-Passwortabfrage von `sudo` ist an der SSH-Konsole normal. Nach diesem
-erfolgreichen Wechsel steht der reguläre Web-Update-Pfad für spätere Releases
-wieder zur Verfügung.
+Bei einem abweichenden Installationsort bitte nur die erste Zeile an den
+tatsächlichen absoluten Pfad anpassen. Eine Passwortabfrage von `sudo` ist an
+der SSH-Konsole normal. Schlägt eine der beiden `test`-Zeilen fehl, bitte dort
+stoppen. Nach diesem erfolgreichen Wechsel steht der reguläre Web-Update-Pfad
+für spätere Releases wieder zur Verfügung.
 
 Der erste direkte Wechsel setzt das bereits für den laufenden Altstand
 verwendete Benutzer-venv voraus. Fehlt diese Python-Umgebung tatsächlich, bitte
 weder System-`pip` noch `--break-system-packages` verwenden, sondern den
 veröffentlichten Bootstrapweg aus der
-[Update-Anleitung](https://github.com/A9xxx/Install-E3DC-Control/blob/v5.4.0c/doc/Update.md)
+[Update-Anleitung](https://github.com/A9xxx/Install-E3DC-Control/blob/v5.4.0d/doc/Update.md)
 nutzen.
 
 ## Enthaltene Korrekturen aus v5.4.0b
@@ -119,9 +141,9 @@ nutzen.
 
 ## Update und Docker
 
-Bare-Metal-Nutzer können v5.4.0c über den Web- oder Konsolen-Updater
+Bare-Metal-Nutzer können v5.4.0d über den Web- oder Konsolen-Updater
 installieren. Das veröffentlichte Container-Image trägt den Tag
-`v5.4.0c`; `latest` wird erst nach bestandener Kandidaten- und
+`v5.4.0d`; `latest` wird erst nach bestandener Kandidaten- und
 Attestierungsprüfung auf denselben Digest gesetzt. Der vorgesehene öffentliche
 Docker-Rückfallstand bleibt `v5.3.2b`; Bare Metal bietet für diesen Altstand
 keinen Programm-Rückfall an.
@@ -233,7 +255,7 @@ kein Programm-Rückfall angeboten. Verifizierte Datei-Backups bleiben nutzbar.
 ## Docker
 
 Die Images werden aus dem veröffentlichten Git-Stand über GitHub Actions
-gebaut. `latest` ist ausschließlich für v5.4.0c vorgesehen; der Rollback-Tag
+gebaut. `latest` ist ausschließlich für v5.4.0d vorgesehen; der Rollback-Tag
 bleibt `v5.3.2b` und ist ausdrücklich Docker-only. Matter-Abhängigkeiten stammen aus der Lockdatei, und das
 anlagenspezifische ML-Modell liegt in einem separaten persistenten Volume.
 

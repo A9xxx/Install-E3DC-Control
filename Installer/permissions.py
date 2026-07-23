@@ -1363,8 +1363,8 @@ def fix_webportal_permissions(issues):
         and "matter-storage_unsafe" not in issues
     ):
         print(f"  → Setze Matter-Storage Rechte: {wp_path}/data/matter-storage -> 700/600")
-        result_dirs = run_command(f"sudo find {wp_path}/data/matter-storage -xdev -type d -exec chmod 700 {{}} +")
-        result_files = run_command(f"sudo find {wp_path}/data/matter-storage -xdev -type f -exec chmod 600 {{}} +")
+        result_dirs = run_command(f"sudo find {wp_path}/data/matter-storage -xdev -type d -exec chmod 00700 {{}} +")
+        result_files = run_command(f"sudo find {wp_path}/data/matter-storage -xdev -type f -exec chmod 00600 {{}} +")
         if result_dirs['success'] and result_files['success']:
             print(f"{GREEN}✓{RESET} matter-storage-Rechte korrigiert")
         else:
@@ -1418,10 +1418,10 @@ def fix_webportal_permissions(issues):
             f"\\( -type d -o -type f \\) -exec chown www-data:www-data {{}} +"
         )
         directory_result = run_command(
-            f"sudo find -P {wallbox_plan_jobs} -xdev -type d -exec chmod 0700 {{}} +"
+            f"sudo find -P {wallbox_plan_jobs} -xdev -type d -exec chmod 00700 {{}} +"
         )
         file_result = run_command(
-            f"sudo find -P {wallbox_plan_jobs} -xdev -type f -exec chmod 0600 {{}} +"
+            f"sudo find -P {wallbox_plan_jobs} -xdev -type f -exec chmod 00600 {{}} +"
         )
         if not (
             owner_result["success"]
@@ -1521,9 +1521,9 @@ def _harden_aux_inverter_migration_backups(path):
         return False
     quoted = shlex.quote(path)
     for command in (
-        f"sudo chmod 700 {quoted}",
-        f"sudo find -P {quoted} -type d -exec chmod 700 {{}} +",
-        f"sudo find -P {quoted} -type f -exec chmod 600 {{}} +",
+        f"sudo chmod 00700 {quoted}",
+        f"sudo find -P {quoted} -type d -exec chmod 00700 {{}} +",
+        f"sudo find -P {quoted} -type f -exec chmod 00600 {{}} +",
     ):
         result = run_command(command, timeout=10)
         if not isinstance(result, dict) or not result.get("success"):

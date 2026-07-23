@@ -849,9 +849,9 @@ def _harden_aux_inverter_migration_backups(path):
     if not _aux_inverter_migration_backup_structure_safe(path):
         return False
     try:
-        subprocess.run(["sudo", "chmod", "700", path], check=True, stderr=subprocess.DEVNULL)
-        subprocess.run(["sudo", "find", "-P", path, "-type", "d", "-exec", "chmod", "700", "{}", "+"], check=True, stderr=subprocess.DEVNULL)
-        subprocess.run(["sudo", "find", "-P", path, "-type", "f", "-exec", "chmod", "600", "{}", "+"], check=True, stderr=subprocess.DEVNULL)
+        subprocess.run(["sudo", "chmod", "00700", path], check=True, stderr=subprocess.DEVNULL)
+        subprocess.run(["sudo", "find", "-P", path, "-type", "d", "-exec", "chmod", "00700", "{}", "+"], check=True, stderr=subprocess.DEVNULL)
+        subprocess.run(["sudo", "find", "-P", path, "-type", "f", "-exec", "chmod", "00600", "{}", "+"], check=True, stderr=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError):
         return False
     return _verify_aux_inverter_migration_backup_modes(path)

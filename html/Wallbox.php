@@ -1809,7 +1809,7 @@ function upsertWallboxConfigValuesDetailed($filePath, $updates, $options = []) {
         wallboxLogConfigFailure('wallbox_config_upsert', $result['code']);
         return $result;
     }
-    @chmod($lockPath, 0660);
+    @chmod($lockPath, 0600);
     $locked = $failOperation !== 'lock' && @flock($lock, LOCK_EX);
     if (!$locked) {
         @fclose($lock);

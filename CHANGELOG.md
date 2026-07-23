@@ -6,6 +6,16 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.0d] – 2026-07-23
+
+### 📦 Web-Update und Installation
+
+- 🐛 **Private Verzeichnisse:** Auch unter einem `setgid`-Datenordner werden private Verzeichnisse exakt auf `0700` gesetzt. Matter-Storage, Wallbox-Planer und Zusatz-WR-Migrationsbackups verwenden denselben Modusvertrag.
+- 🐛 **Private Wallbox-Lockdatei:** Klassischer Konfigurationspfad, transaktionaler Planer und Installer verwenden jetzt einheitlich den Dateimodus `0600`.
+- 🛡️ **Wiederherstellung:** Breite Webroot-Reparaturen überspringen die privaten Matter- und Wallbox-Bäume, statt deren Eigentümer oder Modi zu verbreitern.
+- 🔐 **Sicherheitsgrenze:** Der private Planer-Transaktionsbaum bleibt ausschließlich `www-data:www-data` vorbehalten; der Rechtevertrag wurde nicht gelockert.
+- 🔌 **Unveränderte Wallbox-Regelung:** Start, Phasenwechsel, Pause und SoC-Verfolgung der openWB Pro entsprechen unverändert dem in 5.4.0c geprüften Stand.
+
 ## [5.4.0c] – 2026-07-23
 
 ### 📦 Web-Update und Installation

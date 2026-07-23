@@ -856,9 +856,9 @@ def _harden_aux_inverter_migration_backups(path: str) -> bool:
         return False
     quoted = shlex.quote(path)
     commands = (
-        f"sudo chmod 700 {quoted}",
-        f"sudo find -P {quoted} -type d -exec chmod 700 {{}} +",
-        f"sudo find -P {quoted} -type f -exec chmod 600 {{}} +",
+        f"sudo chmod 00700 {quoted}",
+        f"sudo find -P {quoted} -type d -exec chmod 00700 {{}} +",
+        f"sudo find -P {quoted} -type f -exec chmod 00600 {{}} +",
     )
     for command in commands:
         result = run_command(command, timeout=10)
@@ -875,16 +875,29 @@ def _fix_webroot_permissions() -> bool:
     web_backup_dir = "/var/www/html/data/config_backups"
     repo_backup_dir = os.path.join(get_install_path(), "data", "config_backups")
     run_command(f"sudo usermod -aG www-data {install_user} 2>/dev/null || true", timeout=10)
-    run_command(f"sudo chown -R {install_user}:www-data /var/www/html", timeout=60)
+    protected_wallbox_jobs = "/var/www/html/data/.wallbox_plan_jobs"
+    protected_matter_storage = "/var/www/html/data/matter-storage"
     run_command(
         "sudo find -P /var/www/html -xdev "
-        "\\( -path /var/www/html/data/e3dc_v4.json -o -path /var/www/html/data/config_backups \\) -prune -o "
+        f"\\( -path {protected_wallbox_jobs} \\) -prune -o "
+        f"\\( -type d -o -type f \\) -exec chown {install_user}:www-data {{}} +",
+        timeout=60,
+    )
+    run_command(
+        "sudo find -P /var/www/html -xdev "
+        "\\( -path /var/www/html/data/e3dc_v4.json "
+        "-o -path /var/www/html/data/config_backups "
+        f"-o -path {protected_matter_storage} "
+        f"-o -path {protected_wallbox_jobs} \\) -prune -o "
         "-type d -exec chmod 775 {} +",
         timeout=60,
     )
     run_command(
         "sudo find -P /var/www/html -xdev "
-        "\\( -path /var/www/html/data/e3dc_v4.json -o -path /var/www/html/data/config_backups \\) -prune -o "
+        "\\( -path /var/www/html/data/e3dc_v4.json "
+        "-o -path /var/www/html/data/config_backups "
+        f"-o -path {protected_matter_storage} "
+        f"-o -path {protected_wallbox_jobs} \\) -prune -o "
         "-type f -exec chmod 664 {} +",
         timeout=60,
     )

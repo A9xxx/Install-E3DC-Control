@@ -15,7 +15,7 @@ SOURCE = "https://github.com/A9xxx/Install-E3DC-Control"
 TITLE = "E3DC-Control"
 DESCRIPTION = "Lokales Energie- und Installationssystem für E3DC-Anlagen"
 LICENSE = "AGPL-3.0-or-later"
-RELEASE_VERSIONS = {"5.3.2b", "5.4.0", "5.4.0a", "5.4.0b", "5.4.0c"}
+RELEASE_VERSIONS = {"5.3.2b", "5.4.0", "5.4.0a", "5.4.0b", "5.4.0c", "5.4.0d"}
 DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
 
 

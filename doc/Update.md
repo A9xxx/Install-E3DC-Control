@@ -32,17 +32,28 @@ bash "$E3DC_INSTALL_PATH/e3dc-setup" --check
 Ist bei einer alten 5.3.2a-/5.3.2b-Installation bereits der privilegierte
 Web-Launcher fehlend oder nicht ausführbar, kann die Weboberfläche genau
 diesen Einstieg nicht selbst reparieren. Dann ist einmalig eine interaktive
-SSH-Konsole erforderlich:
+SSH-Konsole erforderlich. Bei der üblichen Installation ist folgende Kette
+vollständig kopierbar:
 
 ```bash
+export E3DC_INSTALL_PATH="$HOME/Install"
+test -f "$E3DC_INSTALL_PATH/installer_main.py"
+test -x "$HOME/.venv_e3dc/bin/python3"
 cd "$E3DC_INSTALL_PATH"
-sudo python3 installer_main.py --fix-permissions
-sudo python3 installer_main.py --update-e3dc
+sudo /usr/bin/python3 installer_main.py --fix-permissions
+sudo /usr/bin/python3 installer_main.py --check
+sudo /usr/bin/python3 installer_main.py --update-e3dc
+cat VERSION
+systemctl --failed --no-pager
 ```
 
-Eine Passwortabfrage von `sudo` ist an der interaktiven SSH-Konsole in diesem
-Fall normal. Nach der erfolgreichen Reparatur steht der reguläre Web-Update-
-Pfad wieder zur Verfügung.
+Liegt E3DC-Control nicht unter `$HOME/Install`, muss ausschließlich die erste
+Zeile an den tatsächlichen absoluten Installationspfad angepasst werden. Eine
+Passwortabfrage von `sudo` ist an der interaktiven SSH-Konsole in diesem Fall
+normal. Schlägt eine der beiden `test`-Zeilen fehl, bitte dort stoppen und
+weder System-`pip` noch `--break-system-packages` verwenden. Nach der
+erfolgreichen Reparatur steht der reguläre Web-Update-Pfad wieder zur
+Verfügung.
 
 Python-Abhängigkeiten werden bei einem Release-Wechsel ausschließlich im
 gebundenen Benutzer-venv installiert. Auf Debian-Systemen mit PEP 668 wird
@@ -121,7 +132,7 @@ Writer-/Aktor-Dienste gestoppt.
 
 ## Gezielter Rückfall
 
-`v5.4.0c` bietet den bereinigten Root `v5.3.2b` ausschließlich als
+`v5.4.0d` bietet den bereinigten Root `v5.3.2b` ausschließlich als
 Docker-Rückfall-Image an. Dieser Root gibt selbst keinen älteren öffentlichen
 Tag frei. Auf Bare Metal wird `v5.3.2b` nicht als Programm-Rückfall angeboten,
 weil der Altstand keinen zielgebundenen Release-Finalizer enthält. Freie

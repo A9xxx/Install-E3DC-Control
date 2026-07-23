@@ -29,7 +29,7 @@ bash "$E3DC_INSTALL_PATH/e3dc-setup" --fix-permissions
 bash "$E3DC_INSTALL_PATH/e3dc-setup" --check
 ```
 
-Ist bei einer alten 5.3.2a-/5.3.2b-Installation bereits der privilegierte
+Ist bei einer 5.3.2b-Installation bereits der privilegierte
 Web-Launcher fehlend oder nicht ausführbar, kann die Weboberfläche genau
 diesen Einstieg nicht selbst reparieren. Dann ist einmalig eine interaktive
 SSH-Konsole erforderlich. Bei der üblichen Installation ist folgende Kette
@@ -47,6 +47,12 @@ cat VERSION
 systemctl --failed --no-pager
 ```
 
+Für den einmaligen Wechsel aus 5.3.2b sind ausschließlich der
+Web-Update-Button oder der oben gezeigte direkte Aufruf mit
+`--update-e3dc` freigegeben. Der interaktive Installer-Menüpunkt lädt im
+Altprozess bereits vor dem Git-Wechsel zusätzliche Module und darf für diesen
+Hybridübergang nicht verwendet werden.
+
 Liegt E3DC-Control nicht unter `$HOME/Install`, muss ausschließlich die erste
 Zeile an den tatsächlichen absoluten Installationspfad angepasst werden. Eine
 Passwortabfrage von `sudo` ist an der interaktiven SSH-Konsole in diesem Fall
@@ -60,7 +66,7 @@ gebundenen Benutzer-venv installiert. Auf Debian-Systemen mit PEP 668 wird
 deshalb kein System-`pip` und kein `--break-system-packages` verwendet. Fehlt
 das Standard-venv, darf der neue Installer nach Installation von
 `python3-venv` genau dieses venv im Home des Installationsbenutzers neu
-anlegen. Beim direkten ersten Wechsel aus 5.3.2a oder 5.3.2b läuft bis zum
+anlegen. Beim direkten ersten Wechsel aus 5.3.2b läuft bis zum
 Git-Wechsel noch der alte Prozess; für diesen ersten Schritt muss das
 gebundene Benutzer-venv bereits vorhanden sein. Andernfalls bricht der
 Altprozess ab und stellt den Ausgangszustand wieder her. Abweichende oder
@@ -72,8 +78,10 @@ Host-Befehle aus dem Abschnitt [Docker-Update](#docker-update).
 
 ## Einmaliger Wechsel von alten Installationen
 
-Der Bootstrap gilt auch für V4.0.1 bis V4.0.5 sowie für V3-/ZIP-Stände ohne
-`.git`. Lade das veröffentlichte Release-Archiv in ein temporäres Verzeichnis
+Der Bootstrap gilt auch für 5.3.2a, V4.0.1 bis V4.0.5 sowie für V3-/ZIP-Stände
+ohne `.git`. Diese Stände wechseln zuerst auf die bewusst dafür veröffentlichte
+Übergangsbasis 5.3.2b und führen danach deren regulären Updatepfad aus. Lade
+das veröffentlichte 5.3.2b-Release-Archiv in ein temporäres Verzeichnis
 und prüfe dessen veröffentlichte SHA-256. Notiere außerdem den vollständigen
 40-stelligen Commit-SHA und die bestehende HA-/Shadow-Rolle (`off`, `master`,
 `slave` oder `shadow`).
@@ -117,12 +125,23 @@ Reihenfolge aus:
 8. eingefrorene HA-/Shadow-Rolle und Feature-Konfiguration, alle erwarteten
    Dienste, lokale HTTP-Endpunkte und Boot-Sanity hart prüfen.
 
-Beim direkten ersten Wechsel aus 5.3.2a oder 5.3.2b bleibt der bereits
+Beim direkten ersten Wechsel aus 5.3.2b bleibt der bereits
 gestartete Altprozess bis zum Abschluss aktiv. Nach dem Git-Wechsel importiert
 er die neue, dienstneutrale Rechteprüfung; der zielgebundene Finalizer gilt ab
 dem anschließend laufenden neuen Updater. Der erste Wechsel behauptet deshalb
 keine nachträgliche Ausführung eines Finalizers, den der Altprozess noch nicht
 kennt.
+
+Für diesen ersten Hybridwechsel enthält die Zielpolicy ausschließlich die
+sieben Pflichtdienste. Der Altprozess erfasst die vor dem Wechsel bereits
+installierten Zusatzdienste und die gebundene HA-/Shadow-Rolle. Nur die in der
+eingefrorenen Konfiguration aktiven Zusatzdienste werden gestartet;
+deaktivierte Zusatzdienste bleiben aus. Eine
+vorbereitete Konfiguration allein installiert oder startet keine bislang
+fehlende Wallbox-, Wärme- oder Integrationssteuerung. Solche konfigurierten,
+aber nicht installierten Zusatzmodule werden im Updateprotokoll genannt und
+können nach dem Release-Wechsel bewusst über das Install-Center eingerichtet
+werden.
 
 Scheitert ein Gate nach einer Änderung, setzt der Installer den alten Git-Stand
 zurück, entfernt bei einem ZIP-Bootstrap die neu angelegte `.git`-Struktur,
@@ -132,7 +151,7 @@ Writer-/Aktor-Dienste gestoppt.
 
 ## Gezielter Rückfall
 
-`v5.4.0d` bietet den bereinigten Root `v5.3.2b` ausschließlich als
+`v5.4.0e` bietet den bereinigten Root `v5.3.2b` ausschließlich als
 Docker-Rückfall-Image an. Dieser Root gibt selbst keinen älteren öffentlichen
 Tag frei. Auf Bare Metal wird `v5.3.2b` nicht als Programm-Rückfall angeboten,
 weil der Altstand keinen zielgebundenen Release-Finalizer enthält. Freie

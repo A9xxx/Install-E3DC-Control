@@ -43,6 +43,13 @@ Für eine Erstinstallation oder ein Update ist die empfohlene Option **"1 Instal
 2.  Der Installer richtet Pakete, Dienste, Webdateien, Rechte und den Web-Wizard ein.
 3.  Folgen Sie den Anweisungen auf dem Bildschirm.
 
+**Einmalige Ausnahme für Version 5.3.2b:** Der erste Wechsel auf 5.4.0e
+erfolgt über den Web-Update-Button oder direkt mit
+`sudo /usr/bin/python3 installer_main.py --update-e3dc`. Der interaktive
+Menüpunkt darf für genau diesen ersten Hybridwechsel nicht verwendet werden,
+weil sein Altprozess bereits zusätzliche 5.3.2b-Module geladen hat. Die
+vollständige geprüfte SSH-Kette steht in [Update.md](Update.md).
+
 ```text
 1) Installation / Update
 2) Systemstatus anzeigen
@@ -152,7 +159,7 @@ Ein fester Tag bleibt absichtlich fest; `config --images` zeigt vorab das
 tatsächlich gewählte Image. `--force-recreate` startet den Container daraus
 neu.
 
-**Docker-Rückfall von v5.4.0d auf den veröffentlichten Docker-Rollback-Root:**
+**Docker-Rückfall von v5.4.0e auf den veröffentlichten Docker-Rollback-Root:**
 ```bash
 TAG=v5.3.2b
 cd "$E3DC_DOCKER_PATH"
@@ -209,6 +216,9 @@ Nach der Installation können Sie den Installer über `bash "$E3DC_INSTALL_PATH/
 - **E3DC-Control installieren oder aktualisieren:**
   - Option `1` (Installation / Update)
   - Hält Anwendung, Webdateien, Dienste und Rechte auf dem aktuellen Stand.
+  - Ausnahme: Für den einmaligen Wechsel von 5.3.2b auf 5.4.0e den
+    Web-Update-Button oder den direkten `--update-e3dc`-Aufruf aus
+    [Update.md](Update.md) verwenden, nicht den interaktiven Menüpunkt.
 
 - **Berechtigungen überprüfen & korrigieren:**
   - Option `3` (Rechte prüfen & korrigieren)

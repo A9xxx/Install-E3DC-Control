@@ -44,8 +44,10 @@ from .logging_manager import get_or_create_logger, log_task_completed, log_error
 from .config_secret_permissions import config_secret_dir_mode_text, config_secret_file_mode_text
 try:
     from .service_catalog import allowed_services, get_module_by_service
+    from .optional_service_contract import preinstalled_optional_service_expected
 except ImportError:  # pragma: no cover - direct script execution fallback
     from service_catalog import allowed_services, get_module_by_service
+    from optional_service_contract import preinstalled_optional_service_expected
 
 INSTALL_PATH   = get_install_path()
 INSTALLER_DIR  = os.path.dirname(os.path.abspath(__file__))
@@ -111,6 +113,7 @@ HA_CONFIG_PATH = "/var/www/html/data/e3dc_v4.json"
 TARGET_FINALIZER_SUCCESS = "E3DC_RELEASE_TARGET_FINALIZER_OK"
 TARGET_FINALIZER_RELATIVE_FILES = (
     "Installer/__init__.py",
+    "Installer/optional_service_contract.py",
     "Installer/release_finalize.py",
     "Installer/update.py",
 )
@@ -1224,39 +1227,14 @@ def _secure_repo_permissions(repo_dir: str, install_user: str) -> None:
     os.chmod(root, 0o755)
 
 
-def _truthy_feature_value(value) -> bool:
-    if isinstance(value, dict):
-        for key in ("enabled", "active", "enable"):
-            if key in value:
-                return _truthy_feature_value(value.get(key))
-        return bool(value)
-    if isinstance(value, str):
-        return value.strip().lower() not in {"", "0", "false", "off", "none", "null", "disabled", "nein"}
-    return bool(value)
-
-
-OPTIONAL_SERVICE_ENABLE_KEYS = {
-    "e3dc-wallbox-manager": ("wb_native_enable",),
-    "energy_manager": ("luxtronik", "wp_type", "luxtronik_ip", "idm_ip", "stiebel_isg_ip", "dimplex_ip"),
-    "e3dc-lux-live": ("luxtronik", "luxtronik_ip"),
-    "e3dc-idm-live": ("idm_ip",),
-    "e3dc-stiebel-live": ("stiebel_isg_ip",),
-    "e3dc-dimplex-live": ("dimplex_ip",),
-    "e3dc-heizstab": ("heizstab", "heizstab_ip", "shelly_heiz_ip"),
-    "e3dc-climate-live": ("climate_enable",),
-    "e3dc-climate-control": ("climate_control_enable",),
-    "e3dc-matter-bridge": ("matter_bridge",),
-    "e3dc-bluelink": ("bluelink_refresh_token", "bluelink_vin"),
-    "e3dc-mqtt-hub": ("mqtt_hub_ip", "mqtt_hub_topic"),
-}
-
-
 def _service_expected(service: str, state: TransitionState) -> tuple[bool, str]:
     name = str(service).removesuffix(".service")
     if name == "e3dc":
         return False, "Legacy-C++-Dienst bleibt dauerhaft deaktiviert"
     if name in _ha_slave_standby_services(state):
         return False, f"durch Rolle {state.ha_role} explizit Standby"
+    if name in INSTALL_CENTER_CORE_SERVICES:
+        return True, "Pflichtdienst des Install-Centers"
     unit = _unit_name(name)
     module = get_module_by_service(unit)
     if module is None:
@@ -1269,15 +1247,17 @@ def _service_expected(service: str, state: TransitionState) -> tuple[bool, str]:
         return state.ha_role in {"master", "slave"}, f"HA-Rolle ist {state.ha_role}"
     if name == "e3dc-shadow-sync":
         return state.ha_role == "shadow", f"HA-/Shadow-Rolle ist {state.ha_role}"
-    keys = OPTIONAL_SERVICE_ENABLE_KEYS.get(name)
-    if keys is not None and not any(_truthy_feature_value(state.config.get(key)) for key in keys):
+    expected_when_installed = preinstalled_optional_service_expected(name, state.config)
+    if not expected_when_installed:
         return False, "Feature ist in eingefrorener Konfiguration explizit deaktiviert"
-    if unit in state.preinstalled_units:
-        return True, "vor dem Wechsel installiert und nicht explizit deaktiviert"
-    return True, "Policy erwartet Dienst; kein expliziter Feature-Disable vorhanden"
+    if unit not in state.preinstalled_units:
+        return False, "optionaler Dienst war vor dem Wechsel nicht installiert"
+    return True, "vor dem Wechsel installiert und nicht explizit deaktiviert"
 
 
 def _validated_restart_services(policy: dict, state: TransitionState) -> list[str]:
+    if str(policy.get("restart_service_contract") or "") != "core_plus_preinstalled_v1":
+        raise RuntimeError("restart_service_contract ist unbekannt oder fehlt")
     raw = policy.get("restart_services")
     if not isinstance(raw, list) or not raw:
         raise RuntimeError("restart_services fehlt oder ist leer")
@@ -1289,6 +1269,10 @@ def _validated_restart_services(policy: dict, state: TransitionState) -> list[st
             raise RuntimeError(f"Nicht freigegebener Restart-Dienst: {item!r}")
         if name not in normalized:
             normalized.append(name)
+    if tuple(normalized) != INSTALL_CENTER_CORE_SERVICES:
+        raise RuntimeError(
+            "restart_services muss exakt die Pflichtdienste des Install-Centers enthalten"
+        )
     role_service = {"master": "e3dc-ha", "slave": "e3dc-ha", "shadow": "e3dc-shadow-sync"}.get(state.ha_role)
     if role_service and role_service not in normalized:
         normalized.append(role_service)

@@ -115,7 +115,7 @@ $paths = getInstallPaths();
     <div class="container">
         <div class="d-flex justify-content-between align-items-center mb-4">
             <a href="index.php" class="nav-link-back"><i class="fas fa-arrow-left me-2"></i>Dashboard</a>
-            <span class="badge bg-success text-light">v5.4.0d Stable</span>
+            <span class="badge bg-success text-light">v5.4.0e Stable</span>
         </div>
         <h1 class="display-4 fw-bold">Hilfe & Support</h1>
         <p class="lead opacity-75">Häufige Fragen und Lösungen rund um E3DC-Control.</p>
@@ -134,7 +134,7 @@ $paths = getInstallPaths();
         <div class="col-12 faq-item" data-tags="docker image stable rollback update">
             <div class="card bg-card border-0 shadow-sm"><div class="card-body">
                 <h5 class="card-title"><span class="tag">Docker</span> Wie prüfe ich Image und Update?</h5>
-                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem geprüften Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.0d</code> in <code>.env</code> gesetzt.</p>
+                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem geprüften Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.0e</code> in <code>.env</code> gesetzt.</p>
                 <pre>docker compose config --images
 docker compose pull e3dc-control
 docker compose up -d --force-recreate e3dc-control
@@ -207,6 +207,25 @@ docker compose build --no-cache e3dc-control</pre>
             </div>
         </div>
 
+        <h4 class="mb-4 text-accent"><i class="fas fa-screwdriver-wrench me-2"></i>Stable-Hotfix 5.4.0e: Dienstgeneration des Alt-Updaters</h4>
+        <div class="col-12 faq-item" data-tags="5.4.0e hotfix update 5.3.2b dienste module install center">
+            <div class="card bg-card border-0 shadow-sm">
+                <div class="card-body">
+                    <h5 class="card-title">
+                        <span class="tag">5.4.0e</span>
+                        Was korrigiert das Stable-Release 5.4.0e?
+                    </h5>
+                    <ul>
+                        <li><strong>Definierter 5.3.2b-Übergang:</strong> Der noch laufende Alt-Updater startet nach dem Git-Wechsel ausschließlich die Pflichtdienste und die vor dem Wechsel bereits installierten, in der eingefrorenen Konfiguration aktiven Zusatzdienste. Deaktivierte Zusatzdienste bleiben aus.</li>
+                        <li><strong>Erster Aufruf:</strong> Für diesen einmaligen Übergang bitte den Web-Update-Button oder ausdrücklich <code>installer_main.py --update-e3dc</code> verwenden, nicht den interaktiven Installer-Menüpunkt. Ältere Installationen wechseln zuerst über den dokumentierten Bootstrap auf 5.3.2b.</li>
+                        <li><strong>Keine unerwartete Aktivierung:</strong> Vorhandene Konfigurationsfelder allein installieren oder starten keine neue Wallbox-, Wärme- oder Integrationssteuerung.</li>
+                        <li><strong>Sichtbare Diagnose:</strong> Konfigurierte, aber bislang nicht installierte Zusatzmodule werden im Updateprotokoll genannt und können anschließend bewusst über das Install-Center eingerichtet werden.</li>
+                        <li><strong>Unveränderte Regelung:</strong> Betriebskonfiguration, openWB-Pro-Regelung und andere fachliche Reglerbytes wurden nicht verändert.</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+
         <h4 class="mb-4 text-accent"><i class="fas fa-screwdriver-wrench me-2"></i>Stable-Hotfix 5.4.0d: Rechtevertrag des Alt-Updaters</h4>
         <div class="col-12 faq-item" data-tags="5.4.0d hotfix update 5.3.2a 5.3.2b rechte wallbox planer lockdatei">
             <div class="card bg-card border-0 shadow-sm">
@@ -226,7 +245,7 @@ docker compose build --no-cache e3dc-control</pre>
         </div>
 
         <h4 class="mb-4 text-accent"><i class="fas fa-screwdriver-wrench me-2"></i>Stable-Hotfix 5.4.0c: Alt-Updater und openWB Pro</h4>
-        <div class="col-12 faq-item" data-tags="5.4.0c hotfix update 5.3.2a 5.3.2b pep668 sudoers openwb pro pause soc stecksession ladeende phasenwechsel">
+        <div class="col-12 faq-item" data-tags="5.4.0c hotfix update 5.3.2b pep668 sudoers openwb pro pause soc stecksession ladeende phasenwechsel">
             <div class="card bg-card border-0 shadow-sm">
                 <div class="card-body">
                     <h5 class="card-title">
@@ -234,7 +253,7 @@ docker compose build --no-cache e3dc-control</pre>
                         Was korrigiert das Stable-Release 5.4.0c?
                     </h5>
                     <ul>
-                        <li><strong>Alt-Updater:</strong> Der Web-Update-Pfad aus 5.3.2a und 5.3.2b übernimmt nach dem Git-Wechsel den neuen Rechtevertrag. Vom Updater selbst angehaltene Dienste sind kein Rechtefehler; leere Paketlisten starten kein System-<code>pip</code>. Für den ersten Wechsel muss das Benutzer-venv bereits vorhanden sein. Ist der alte privilegierte Web-Launcher selbst fehlend oder nicht ausführbar, ist einmalig die interaktive SSH-Reparatur aus der Update-Anleitung erforderlich.</li>
+                        <li><strong>Alt-Updater:</strong> Der Web-Update-Pfad aus 5.3.2b übernimmt nach dem Git-Wechsel den neuen Rechtevertrag. Vom Updater selbst angehaltene Dienste sind kein Rechtefehler; leere Paketlisten starten kein System-<code>pip</code>. Für den ersten Wechsel muss das Benutzer-venv bereits vorhanden sein. Ist der alte privilegierte Web-Launcher selbst fehlend oder nicht ausführbar, ist einmalig die SSH-Reparatur mit dem ausdrücklich dokumentierten <code>--update-e3dc</code>-Aufruf erforderlich.</li>
                         <li><strong>Sudoers:</strong> Klar abgegrenzte fremde ioBroker-Freigaben bleiben unverändert und blockieren das E3DC-Control-Update nicht. Fremde direkte E3DC-<code>systemctl</code>-Freigaben bleiben gesperrt.</li>
                         <li><strong>openWB Pro:</strong> Der Start folgt nach bestätigtem Anstecken zügig dem verfügbaren Budget. Der Phasenwechsel nutzt eine kurze sichere CP-Unterbrechung; die folgenden 480 Sekunden sperren nur einen weiteren Phasenwechsel und nicht die Ladung.</li>
                         <li><strong>Pause und SoC:</strong> Eine Pause gilt erst nach bestätigtem STOP. Der SoC-Fallback verwendet ausschließlich die aktuelle Stecksession und überschreibt keine echten Fahrzeug- oder Wallboxwerte.</li>
@@ -838,8 +857,9 @@ journalctl -u e3dc-live -n 80 --no-pager</pre>
                     Ein Update wird über den sichernden Installer durchgeführt:
                     <ol>
                         <li>Über das Dashboard (Kachel Konfiguration -> "Update suchen").</li>
-                        <li>Direkt über den Menüpunkt <em>Update</em> im Installer.</li>
+                        <li>Bei aktuellen Ständen direkt über den Menüpunkt <em>Update</em> im Installer.</li>
                     </ol>
+                    <p><strong>Einmalige Ausnahme für 5.3.2b:</strong> Den ersten Wechsel auf 5.4.0e ausschließlich über den Web-Update-Button oder per SSH mit <code>sudo /usr/bin/python3 installer_main.py --update-e3dc</code> starten. Der interaktive Menüpunkt ist für diesen Hybridwechsel nicht freigegeben, weil der 5.3.2b-Altprozess bereits zusätzliche Module geladen hat.</p>
                     <p>Verwenden Sie für den einmaligen Wechsel auf die bereinigte Historie keinen manuellen <code>git pull --ff-only</code>-Ablauf. Der Installer erstellt und prüft zuerst das externe Backup und validiert anschließend Zielstand, Dienste und Weboberfläche.</p>
                     Updates werden im Changelog oben rechts im Dashboard signalisiert.
                 </div>

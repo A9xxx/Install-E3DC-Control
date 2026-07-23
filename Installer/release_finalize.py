@@ -77,6 +77,7 @@ def _bind_target_modules(root: Path, expected_commit: str) -> None:
         raise RuntimeError("Erwartete Release-SHA ist ungültig")
     for relative_path in (
         "Installer/__init__.py",
+        "Installer/optional_service_contract.py",
         "Installer/release_finalize.py",
         "Installer/update.py",
     ):

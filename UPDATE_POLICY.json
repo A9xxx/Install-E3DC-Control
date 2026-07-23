@@ -1,9 +1,9 @@
 {
-  "version": "5.4.0d",
+  "version": "5.4.0e",
   "min_version": "4.0.0",
-  "stable_release": "v5.4.0d",
+  "stable_release": "v5.4.0e",
   "release_date": "2026-07-23",
-  "description": "v5.4.0d - Rechtevertrag-Hotfix für Alt-Updater",
+  "description": "v5.4.0e - 5.3.2b-Hybridupdate mit erhaltener Dienstgeneration",
   "installer_requires": "python3",
   "sanitized_republication": false,
   "history_transition": {
@@ -30,27 +30,15 @@
   "rollback_release_shas": {
     "v5.3.2b": "4b19d7136bcd7c5906dcdd2d49903a2fd4645192"
   },
+  "restart_service_contract": "core_plus_preinstalled_v1",
   "restart_services": [
     "e3dc-live",
-    "e3dc-heizstab",
     "e3dc-epex-manager",
-    "energy_manager",
-    "e3dc-lux-live",
-    "e3dc-idm-live",
-    "e3dc-stiebel-live",
-    "e3dc-dimplex-live",
-    "e3dc-climate-live",
-    "e3dc-climate-control",
-    "e3dc-ha",
-    "e3dc-notifier",
-    "e3dc-websocket",
-    "e3dc-mqtt-hub",
-    "e3dc-bluelink",
-    "e3dc-matter-bridge",
-    "e3dc-wallbox-manager",
     "e3dc-weather-manager",
     "e3dc-storage-simulator",
-    "e3dc-storage-manager"
+    "e3dc-storage-manager",
+    "e3dc-websocket",
+    "e3dc-notifier"
   ],
   "run_permissions": true,
   "delete_files": [

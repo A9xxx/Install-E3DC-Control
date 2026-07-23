@@ -9,6 +9,9 @@ import sys
 import time
 import shlex
 import stat
+import inspect
+import hashlib
+import types
 
 # Standard-Ausgabe auf UTF-8 erzwingen
 try:
@@ -28,6 +31,10 @@ if __package__ in (None, ""):
     from Installer.config_manager import run_config_wizard
     from Installer.config_secret_permissions import config_secret_dir_mode_text, config_secret_file_mode_text
     from Installer.service_catalog import allowed_services, iter_modules
+    from Installer.optional_service_contract import (
+        configured_optional_services,
+        preinstalled_optional_service_expected,
+    )
     from Installer.backup_integrity import BackupIntegrityError, PRIVATE_ML_ROOT, _open_regular_file_nofollow, validate_private_ml_store
 else:
     from .core import CAT_ENV, register_command
@@ -37,6 +44,10 @@ else:
     from .config_manager import run_config_wizard
     from .config_secret_permissions import config_secret_dir_mode_text, config_secret_file_mode_text
     from .service_catalog import allowed_services, iter_modules
+    from .optional_service_contract import (
+        configured_optional_services,
+        preinstalled_optional_service_expected,
+    )
     from .backup_integrity import BackupIntegrityError, PRIVATE_ML_ROOT, _open_regular_file_nofollow, validate_private_ml_store
 
 INSTALL_USER = get_install_user()
@@ -2414,6 +2425,351 @@ def _release_quiesced_from_current_process(*, required_uid=0, max_age_s=3600):
         return False
 
 
+def _release_configured_missing_optional_services(config):
+    """Meldet konfigurierte, aber bislang nicht installierte Zusatzmodule."""
+    return [
+        service
+        for service in configured_optional_services(config)
+        if not _systemd_unit_exists(service)
+    ]
+
+
+def _read_release_config_nofollow(path="/var/www/html/data/e3dc_v4.json"):
+    descriptor, before = _open_regular_file_nofollow(path)
+    try:
+        if before.st_size < 2 or before.st_size > 4 * 1024 * 1024:
+            raise RuntimeError("Betriebskonfiguration besitzt eine unzulässige Größe")
+        chunks = []
+        remaining = before.st_size
+        while remaining > 0:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        after = os.fstat(descriptor)
+        if (
+            len(payload) != before.st_size
+            or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        ):
+            raise RuntimeError("Betriebskonfiguration änderte sich während der Prüfung")
+    finally:
+        os.close(descriptor)
+    config = json.loads(payload.decode("utf-8"))
+    if not isinstance(config, dict):
+        raise RuntimeError("Betriebskonfiguration ist kein JSON-Objekt")
+    return config
+
+
+LEGACY_532B_COMMIT = "4b19d7136bcd7c5906dcdd2d49903a2fd4645192"
+LEGACY_532B_UPDATE_SOURCE_SHA256 = "e32ab215f8396381ce114b986792fd46eed5a9bf38448659d5f37df0862f49b6"
+TARGET_540E_POLICY_SHA256 = "4223f2e35fe9f4f170b6de99d3e313afe38cc899ffcab2ca1d50b8ba2bd7ba6d"
+RELEASE_CORE_SERVICES = (
+    "e3dc-live",
+    "e3dc-epex-manager",
+    "e3dc-weather-manager",
+    "e3dc-storage-simulator",
+    "e3dc-storage-manager",
+    "e3dc-websocket",
+    "e3dc-notifier",
+)
+LEGACY_532B_BOUND_FUNCTIONS = (
+    "_service_expected",
+    "_validated_restart_services",
+    "_restart_v4_services",
+    "_post_update_healthcheck",
+    "_recover_failed_transition",
+    "run_initial_forecast",
+    "update_e3dc",
+)
+
+
+def _release_git_read(repo_dir, *args, maximum=2 * 1024 * 1024):
+    command = ["/usr/bin/git", "-C", str(repo_dir), *[str(item) for item in args]]
+    completed = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=20,
+        check=False,
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError("Git-Bindung des 5.3.2b-Ersthops fehlgeschlagen: " + detail[-500:])
+    if len(completed.stdout) > maximum:
+        raise RuntimeError("Git-Bindung des 5.3.2b-Ersthops ist unplausibel groß")
+    return completed.stdout
+
+
+def _top_level_function_codes(source, filename):
+    module_code = compile(
+        source.decode("utf-8"),
+        filename,
+        "exec",
+        dont_inherit=True,
+        optimize=sys.flags.optimize,
+    )
+    found = {}
+    for constant in module_code.co_consts:
+        if isinstance(constant, types.CodeType) and constant.co_name in LEGACY_532B_BOUND_FUNCTIONS:
+            if constant.co_name in found:
+                raise RuntimeError("5.3.2b-Quellbindung enthält eine doppelte Funktion")
+            found[constant.co_name] = constant
+    if tuple(sorted(found)) != tuple(sorted(LEGACY_532B_BOUND_FUNCTIONS)):
+        raise RuntimeError("5.3.2b-Quellbindung ist unvollständig")
+    return found
+
+
+def _loaded_legacy_functions_match(update_module, source):
+    update_entry = getattr(update_module, "update_e3dc", None)
+    update_code = getattr(update_entry, "__code__", None)
+    if not isinstance(update_code, types.CodeType):
+        return False
+    expected = _top_level_function_codes(source, update_code.co_filename)
+    for name in LEGACY_532B_BOUND_FUNCTIONS:
+        actual = getattr(getattr(update_module, name, None), "__code__", None)
+        if not isinstance(actual, types.CodeType):
+            return False
+        if actual != expected[name]:
+            return False
+    return True
+
+
+def _stack_contains_code(code):
+    frame = inspect.currentframe()
+    try:
+        frame = frame.f_back if frame is not None else None
+        while frame is not None:
+            if frame.f_code is code:
+                return True
+            frame = frame.f_back
+    finally:
+        del frame
+    return False
+
+
+def _legacy_532b_update_context(update_entry):
+    frame = inspect.currentframe()
+    try:
+        frame = frame.f_back if frame is not None else None
+        for _ in range(32):
+            if frame is None:
+                break
+            if frame.f_code is getattr(update_entry, "__code__", None):
+                return dict(frame.f_locals)
+            frame = frame.f_back
+    finally:
+        del frame
+    raise RuntimeError("5.3.2b-Updatekontext ist im laufenden Prozess nicht gebunden")
+
+
+def _install_legacy_532b_service_contract():
+    """Begrenzt den bekannten 5.3.2b-Ersthop und erhält dessen Recovery unverändert."""
+
+    update_module = sys.modules.get("Installer.update")
+    if update_module is None and __package__:
+        update_module = sys.modules.get(f"{__package__}.update")
+    if update_module is None or callable(
+        getattr(update_module, "finalize_release_from_target", None)
+    ):
+        return False
+
+    package_module = sys.modules.get("Installer")
+    service_expected = getattr(update_module, "_service_expected", None)
+    validated_services = getattr(update_module, "_validated_restart_services", None)
+    restart_services_function = getattr(update_module, "_restart_v4_services", None)
+    healthcheck_function = getattr(update_module, "_post_update_healthcheck", None)
+    recover_transition = getattr(update_module, "_recover_failed_transition", None)
+    initial_forecast = getattr(update_module, "run_initial_forecast", None)
+    update_entry = getattr(update_module, "update_e3dc", None)
+    expected_core = tuple(getattr(update_module, "INSTALL_CENTER_CORE_SERVICES", ()))
+    context = _legacy_532b_update_context(update_entry)
+    state = context.get("state")
+    policy = context.get("policy")
+    restart_services = context.get("restart_services")
+    old_commit = str(context.get("old_commit") or "").strip().lower()
+    target_commit = str(context.get("target_commit") or "").strip().lower()
+    repo_dir = str(context.get("repo_dir") or "")
+    install_user = str(context.get("install_user") or "")
+    old_source = _release_git_read(
+        repo_dir,
+        "show",
+        f"{LEGACY_532B_COMMIT}:Installer/update.py",
+    )
+    current_head = _release_git_read(
+        repo_dir,
+        "rev-parse",
+        "--verify",
+        "HEAD^{commit}",
+        maximum=256,
+    ).decode("ascii", errors="strict").strip().lower()
+    target_policy_raw = _release_git_read(
+        repo_dir,
+        "show",
+        f"{target_commit}:UPDATE_POLICY.json",
+    )
+    target_version = _release_git_read(
+        repo_dir,
+        "show",
+        f"{target_commit}:VERSION",
+        maximum=256,
+    ).decode("utf-8", errors="strict").strip()
+    remote_url = _release_git_read(
+        repo_dir,
+        "remote",
+        "get-url",
+        "origin",
+        maximum=1024,
+    ).decode("utf-8", errors="strict").strip()
+    try:
+        target_policy = json.loads(target_policy_raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Zielpolicy des 5.3.2b-Ersthops ist ungültig") from exc
+    signature_ok = (
+        getattr(update_module, "__name__", "") == "Installer.update"
+        and str(getattr(package_module, "__version__", "") or "") == "5.3.2b"
+        and callable(service_expected)
+        and callable(validated_services)
+        and callable(restart_services_function)
+        and callable(healthcheck_function)
+        and callable(recover_transition)
+        and callable(initial_forecast)
+        and callable(update_entry)
+        and expected_core == RELEASE_CORE_SERVICES
+        and old_commit == LEGACY_532B_COMMIT
+        and len(target_commit) == 40
+        and all(character in "0123456789abcdef" for character in target_commit)
+        and isinstance(policy, dict)
+        and policy.get("restart_service_contract") == "core_plus_preinstalled_v1"
+        and tuple(policy.get("restart_services") or ()) == RELEASE_CORE_SERVICES
+        and state is not None
+        and isinstance(getattr(state, "config", None), dict)
+        and list(restart_services or ()) == list(validated_services(policy, state))
+        and context.get("headless") is True
+        and context.get("target_ref") is None
+        and context.get("target_install_path") is None
+        and context.get("transition_name") == "self-update"
+        and context.get("mutated") is True
+        and "--update-e3dc" in sys.argv
+        and os.path.abspath(repo_dir) == os.path.abspath(INSTALL_ROOT)
+        and os.path.realpath(repo_dir) == os.path.abspath(repo_dir)
+        and install_user == INSTALL_USER
+        and current_head == target_commit
+        and hashlib.sha256(old_source).hexdigest() == LEGACY_532B_UPDATE_SOURCE_SHA256
+        and _loaded_legacy_functions_match(update_module, old_source)
+        and hashlib.sha256(target_policy_raw).hexdigest() == TARGET_540E_POLICY_SHA256
+        and target_policy == policy
+        and target_version == "5.4.0e"
+        and remote_url == getattr(update_module, "SELFUPDATE_REPO", None)
+    )
+    if not signature_ok:
+        raise RuntimeError("Laufender Alt-Updater besitzt nicht den gebundenen 5.3.2b-Vertrag")
+
+    def bounded_service_expected(service, transition_state):
+        name = str(service).removesuffix(".service")
+        if name == "e3dc":
+            return False, "Legacy-C++-Dienst bleibt dauerhaft deaktiviert"
+        if name in update_module._ha_slave_standby_services(transition_state):
+            return False, f"durch Rolle {transition_state.ha_role} explizit Standby"
+        if name in RELEASE_CORE_SERVICES:
+            return True, "Pflichtdienst des Install-Centers"
+        unit = update_module._unit_name(name)
+        module = update_module.get_module_by_service(unit)
+        if module is None:
+            if name == "piguard":
+                return (
+                    unit in transition_state.preinstalled_units,
+                    "Watchdog war vor dem Wechsel nicht installiert",
+                )
+            raise RuntimeError(f"Dienst fehlt im Service-Katalog: {unit}")
+        if not module.optional:
+            return True, "Pflichtdienst"
+        if name == "e3dc-ha":
+            return (
+                transition_state.ha_role in {"master", "slave"},
+                f"HA-Rolle ist {transition_state.ha_role}",
+            )
+        if name == "e3dc-shadow-sync":
+            return (
+                transition_state.ha_role == "shadow",
+                f"HA-/Shadow-Rolle ist {transition_state.ha_role}",
+            )
+        expected_when_installed = preinstalled_optional_service_expected(
+            name,
+            transition_state.config,
+        )
+        if not expected_when_installed:
+            return False, "Feature ist in eingefrorener Konfiguration explizit deaktiviert"
+        if unit not in transition_state.preinstalled_units:
+            return False, "optionaler Dienst war vor dem Wechsel nicht installiert"
+        return True, "vor dem Wechsel installiert und nicht explizit deaktiviert"
+
+    forward_names = tuple(str(item).removesuffix(".service") for item in restart_services)
+    recovery_names = frozenset(
+        str(unit).removesuffix(".service")
+        for unit in state.preinstalled_units
+        if str(unit) != "e3dc.service"
+    )
+
+    def bound_call(function, args, kwargs):
+        signature = inspect.signature(function)
+        call = signature.bind_partial(*args, **kwargs)
+        call.apply_defaults()
+        if call.arguments.get("transition_state") is not state:
+            raise RuntimeError("5.3.2b-Dienstübergang verlor die eingefrorene Generation")
+        names = tuple(
+            str(item).removesuffix(".service")
+            for item in (call.arguments.get("services") or ())
+        )
+        if names != forward_names and frozenset(names) != recovery_names:
+            raise RuntimeError("5.3.2b-Dienstübergang besitzt eine fremde Dienstmenge")
+        if not _stack_contains_code(update_entry.__code__):
+            raise RuntimeError("5.3.2b-Dienstübergang liegt außerhalb des gebundenen Updates")
+        update_module._service_expected = bounded_service_expected
+        try:
+            return function(*args, **kwargs)
+        finally:
+            if update_module._service_expected is not bounded_service_expected:
+                raise RuntimeError("5.3.2b-Dienstvertrag wurde während des Aufrufs verändert")
+            update_module._service_expected = service_expected
+
+    def cleanup():
+        replacements = (
+            ("_restart_v4_services", restart_with_bounded_service_contract, restart_services_function),
+            ("_post_update_healthcheck", healthcheck_with_bounded_service_contract, healthcheck_function),
+            ("_recover_failed_transition", recover_with_cleanup, recover_transition),
+            ("run_initial_forecast", forecast_with_cleanup, initial_forecast),
+        )
+        for name, wrapper, original in replacements:
+            if getattr(update_module, name, None) is wrapper:
+                setattr(update_module, name, original)
+        if getattr(update_module, "_service_expected", None) is bounded_service_expected:
+            update_module._service_expected = service_expected
+
+    def restart_with_bounded_service_contract(*args, **kwargs):
+        return bound_call(restart_services_function, args, kwargs)
+
+    def healthcheck_with_bounded_service_contract(*args, **kwargs):
+        return bound_call(healthcheck_function, args, kwargs)
+
+    def recover_with_cleanup(*args, **kwargs):
+        cleanup()
+        return recover_transition(*args, **kwargs)
+
+    def forecast_with_cleanup(*args, **kwargs):
+        result = initial_forecast(*args, **kwargs)
+        cleanup()
+        return result
+
+    update_module._restart_v4_services = restart_with_bounded_service_contract
+    update_module._post_update_healthcheck = healthcheck_with_bounded_service_contract
+    update_module._recover_failed_transition = recover_with_cleanup
+    update_module.run_initial_forecast = forecast_with_cleanup
+    return True
+
+
 def run_permissions_wizard(headless=False, release_quiesced=None):
     """Hauptlogik für Rechteprüfung und -korrektur."""
     if release_quiesced is None:
@@ -2425,12 +2781,53 @@ def run_permissions_wizard(headless=False, release_quiesced=None):
     else:
         release_quiesced = bool(release_quiesced)
     
-    # Führe zuerst alle Konfigurations-Checks und Migrationen aus
-    config_ready = run_config_wizard()
+    # Die Release-Transaktion hat die Betriebskonfiguration bereits eingefroren.
+    # Eine Migration in diesem Fenster würde den Rückfallvertrag des alten wie
+    # des neuen Updaters verletzen. Reguläre Rechteprüfungen migrieren weiter.
+    if release_quiesced:
+        config_ready = True
+        print("→ Betriebskonfiguration bleibt im Release-Fenster unverändert.")
+    else:
+        config_ready = run_config_wizard()
     if config_ready is not True:
         print("⚠ Konfigurationsmigration fehlgeschlagen; Rechte- und Servicekorrekturen werden nicht gestartet.")
         perm_logger.error("Konfigurationsmigration fehlgeschlagen; Permissions-Wizard bricht fail-closed ab.")
         return False
+    configured_missing_services = []
+    release_ha_mode = "off"
+    legacy_532b_contract_bound = False
+    if release_quiesced:
+        try:
+            legacy_532b_contract_bound = _install_legacy_532b_service_contract()
+            release_config = _read_release_config_nofollow()
+            release_ha_mode = str(release_config.get("ha_mode") or "off").strip().lower()
+            configured_missing_services = _release_configured_missing_optional_services(release_config)
+        except Exception as exc:
+            print(f"{RED}[!]{RESET} Konfigurierte Zusatzmodule konnten nicht sicher geprüft werden: {exc}")
+            perm_logger.error("Release-Zusatzmodulprüfung fehlgeschlagen: %s", exc)
+            return False
+        if configured_missing_services:
+            role_note = (
+                f" in der gebundenen Rolle {release_ha_mode}"
+                if release_ha_mode in {"slave", "shadow"}
+                else ""
+            )
+            print(
+                f"{YELLOW}[i]{RESET} Konfigurierte, bislang nicht installierte "
+                f"Zusatzdienste werden{role_note} nicht automatisch aktiviert:"
+            )
+            for service in configured_missing_services:
+                hint = (
+                    "vor einem Rollenwechsel bewusst über das Install-Center prüfen"
+                    if release_ha_mode in {"slave", "shadow"}
+                    else "bei Bedarf bewusst über das Install-Center installieren"
+                )
+                print(f"    - {service} ({hint})")
+            perm_logger.warning(
+                "Release erhält den Vorzustand: konfigurierte Zusatzdienste ohne "
+                "vorinstallierte Unit: %s",
+                ", ".join(configured_missing_services),
+            )
     ml_store_ready = ensure_private_ml_model_store()
 
     # Als erstes: Bereinige root-eigene Dateien falls vorhanden
@@ -2470,6 +2867,10 @@ def run_permissions_wizard(headless=False, release_quiesced=None):
             details = "Alle Checks OK"
         if watchdog_installed and watchdog_refreshed:
             details += ", Watchdog aktualisiert" if not release_quiesced else ", Watchdog unverändert"
+        if configured_missing_services:
+            details += ", konfigurierte Zusatzdienste bewusst unverändert"
+        if legacy_532b_contract_bound:
+            details += ", 5.3.2b-Ersthop recovery-sicher gebunden"
         log_task_completed("Rechte prüfen & korrigieren", details=details)
         return True
 

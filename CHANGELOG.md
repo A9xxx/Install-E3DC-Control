@@ -6,6 +6,16 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.0e] – 2026-07-23
+
+### 📦 Definierter Übergang aus 5.3.2b
+
+- 🐛 **Hybrid-Updater:** Der vor dem Git-Wechsel gestartete 5.3.2b-Prozess übernimmt aus der Zielpolicy nur die sieben Pflichtdienste und erfasst ausschließlich bereits installierte Zusatzdienste. Davon werden nur die in der eingefrorenen Konfiguration aktiven Dienste gestartet; deaktivierte Dienste bleiben aus. 5.3.2b ist dafür die bewusst veröffentlichte Übergangsbasis; ältere oder nicht verwandte Installationen verwenden zuerst deren Bootstrap.
+- 🛡️ **Keine implizite Hardwareaktivierung:** Alte oder vorbereitete Konfigurationsfelder installieren und starten keine bislang fehlenden Wallbox-, Wärme- oder Integrationsdienste.
+- 🔎 **Sichtbare Diagnose:** Konfigurierte, aber nicht installierte Zusatzmodule werden im Updateprotokoll ausdrücklich genannt und bleiben bis zu einer bewussten Installation über das Install-Center unverändert.
+- 🔐 **Eingefrorene Konfiguration:** Die Rechteprüfung migriert oder verändert die bereits gebundene Betriebskonfiguration während des Release-Wechsels nicht.
+- 🔌 **Unveränderte Regelung:** openWB Pro, Speicher, Direktvermarktung, Wärmepumpe und sonstige fachliche Reglerbytes entsprechen unverändert 5.4.0d.
+
 ## [5.4.0d] – 2026-07-23
 
 ### 📦 Web-Update und Installation
@@ -20,9 +30,9 @@ Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame
 
 ### 📦 Web-Update und Installation
 
-- 🐛 **Altstand-Übergang:** Der reale Web-Update-Pfad aus 5.3.2a und 5.3.2b übernimmt nach dem Git-Wechsel den neuen, service-neutralen Rechtevertrag. Die vom Updater selbst angehaltenen Dienste gelten nicht mehr als Fehler.
+- 🐛 **Altstand-Übergang:** Der reale Web-Update-Pfad aus 5.3.2b übernimmt nach dem Git-Wechsel den neuen, service-neutralen Rechtevertrag. Die vom Updater selbst angehaltenen Dienste gelten nicht mehr als Fehler.
 - 🐍 **PEP 668:** Leere Paketlisten lösen keinen System-`pip`-Aufruf aus. Abhängigkeiten bleiben an das verwaltete Benutzer-venv gebunden.
-- 🔧 **5.3.2a-Bootstrap:** Ist der alte privilegierte Wrapper nicht ausführbar, erfolgt einmalig ein interaktiver Konsolenaufruf. Ein nicht startbarer Root-Einstieg wird nicht aus dem Webprozess heraus umgeschrieben.
+- 🔧 **Alt-Wrapper-Bootstrap:** Ist der alte privilegierte Wrapper nicht ausführbar, erfolgt einmalig ein interaktiver Konsolenaufruf. Ein nicht startbarer Root-Einstieg wird nicht aus dem Webprozess heraus umgeschrieben.
 - 🔐 **Sudoers-Kompatibilität:** Fremde, klar abgegrenzte ioBroker-Freigaben werden gemeldet, aber nicht verändert und blockieren das E3DC-Control-Update nicht. Fremde direkte E3DC-`systemctl`-Freigaben bleiben fail-closed.
 - 🔎 **Diagnose:** Fehler aus Rechteprüfung, Ziel-Finalizer und Dienststart werden vollständig an Weboberfläche und Konsole weitergereicht.
 
@@ -37,14 +47,14 @@ Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame
 
 ### 📦 Installation, Update und Docker
 
-- 🐛 **Fehlerbehebung:** Auf Debian-Systemen mit PEP 668 installiert das Release-Update keine Python-Pakete mehr in die verwaltete Systemumgebung. Ab dem neuen Updater werden Abhängigkeiten im gebundenen Benutzer-venv aktualisiert; ein fehlendes Standard-venv kann nach Installation von `python3-venv` kontrolliert neu angelegt werden. Der direkte erste Wechsel aus 5.3.2a/b setzt das vorhandene venv voraus.
+- 🐛 **Fehlerbehebung:** Auf Debian-Systemen mit PEP 668 installiert das Release-Update keine Python-Pakete mehr in die verwaltete Systemumgebung. Ab dem neuen Updater werden Abhängigkeiten im gebundenen Benutzer-venv aktualisiert; ein fehlendes Standard-venv kann nach Installation von `python3-venv` kontrolliert neu angelegt werden. Der direkte erste Wechsel aus 5.3.2b setzt das vorhandene venv voraus.
 - 🔄 **Kompatibilität:** Docker-Installationen werden im Web- und Konsolen-Updater eindeutig erkannt. Statt eines ungeeigneten Release-Wechsels im Container werden die notwendigen `docker compose`-Befehle für den Host angezeigt.
 - 🐳 **Docker-Update:** Die mitgelieferte Compose-Datei folgt ohne bewussten Pin dem geprüften Stable-Tag `latest`. Ein fest eingetragener Versions-Tag bleibt fest; `docker compose config --images` macht das Ziel vor dem Pull sichtbar.
 - 🛡️ **Docker-Rückfall:** Ein Stable-Container wird nur noch freigegeben, wenn das in der Update-Policy beworbene Rückfall-Image tatsächlich für AMD64 und ARM64 verfügbar ist. Historische Quellbytes und der aktuelle OCI-Prüfer bleiben dabei getrennt gebunden.
 - 🛡️ **Bare-Metal-Rückfall:** `v5.3.2b` bleibt als Docker-Image verfügbar, wird auf Bare Metal aber nicht mehr als Programm-Rückfall angeboten. Der Altstand besitzt keinen zielgebundenen Finalizer; verifizierte Datei-Backups bleiben der sichere Bare-Metal-Rückweg.
 - 🛡️ **Sicherheit:** Wrapper- und sudoers-Reparatur verwenden einen gebundenen Snapshot und rollen Teilfehler atomar zurück. Runtime- und Session-Rechte werden von diesem engen Reparaturpfad nicht nebenbei verändert.
 - 🧱 **Stabilität:** Kanonische systemd-Masken auf `/dev/null` werden als Zustand gesichert und beim Restore verifiziert. Sie werden nicht mehr fälschlich wie reguläre Unit-Dateien behandelt; andere Symlinks bleiben gesperrt.
-- 🔐 **Sicherheit:** Ab dem neuen Updater führt nach dem Git-Wechsel ein eigener, an Ziel-SHA und Zielbaum gebundener Finalizer die Installation fort. Der erste Wechsel aus 5.3.2a/b bleibt im alten Prozess, übernimmt aber nach dem Reset den neuen service-neutralen Rechtevertrag.
+- 🔐 **Sicherheit:** Ab dem neuen Updater führt nach dem Git-Wechsel ein eigener, an Ziel-SHA und Zielbaum gebundener Finalizer die Installation fort. Der erste Wechsel aus 5.3.2b bleibt im alten Prozess, übernimmt aber nach dem Reset den neuen service-neutralen Rechtevertrag.
 
 ### 🔌 Wallboxen und PV-Kurve
 

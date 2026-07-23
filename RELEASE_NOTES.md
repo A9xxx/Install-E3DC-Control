@@ -1,10 +1,32 @@
-# v5.4.0d
+# v5.4.0e
 
-E3DC-Control v5.4.0d korrigiert die im realen Altstand-Pilot sichtbar
-gewordene letzte Rechtekante des Bare-Metal-Updaters. Es enthält unverändert
-alle Korrekturen aus v5.4.0a, v5.4.0b und v5.4.0c.
+E3DC-Control v5.4.0e schließt den definierten Erstübergang aus der eigens
+dafür veröffentlichten Übergangsbasis 5.3.2b. Der bis zum Abschluss laufende Alt-Updater startet nach dem
+Git-Wechsel nur die Pflichtdienste und die bereits vor dem Wechsel
+installierten, in der eingefrorenen Konfiguration aktiven Zusatzdienste. Es
+enthält unverändert alle Korrekturen aus
+v5.4.0a bis v5.4.0d.
 
-## Korrektur in v5.4.0d
+## Korrektur in v5.4.0e
+
+- Die Zielpolicy enthält genau die sieben Pflichtdienste des Install-Centers.
+  Bereits installierte Zusatzdienste sowie die gebundene HA-/Shadow-Rolle
+  werden aus dem Ausgangszustand erfasst; deaktivierte Zusatzdienste bleiben
+  gestoppt.
+- Alte oder vorbereitete Konfigurationsfelder installieren und aktivieren
+  während eines Release-Wechsels keine bislang fehlenden Wallbox-, Wärme- oder
+  Integrationsdienste.
+- Konfigurierte, aber nicht installierte Zusatzmodule erscheinen ausdrücklich
+  im Updateprotokoll. Sie bleiben bis zu einer bewussten Installation über das
+  Install-Center unverändert.
+- Die bereits eingefrorene Betriebskonfiguration wird von der
+  Release-Rechteprüfung weder migriert noch verändert.
+- Der Watchdog wird im alten Erstübergang nicht außerhalb seines vollständigen
+  Backup- und Recovery-Vertrags ersetzt.
+- Die openWB-Pro- und sonstige fachliche Regelung aus v5.4.0d wurde nicht
+  verändert.
+
+## Enthaltene Korrektur aus v5.4.0d
 
 - Private Verzeichnisse werden auch unter einem vererbenden `setgid`-
   Datenordner exakt auf `0700` gesetzt. GNU `chmod` darf das geerbte Sonderbit
@@ -21,12 +43,12 @@ alle Korrekturen aus v5.4.0a, v5.4.0b und v5.4.0c.
 
 ## Enthaltene Korrekturen aus v5.4.0c
 
-- Der reale Web-Update-Übergang aus 5.3.2a und 5.3.2b verwendet nach dem
+- Der reale Web-Update-Übergang aus 5.3.2b verwendet nach dem
   Git-Wechsel den neuen Rechtevertrag. Die vom Updater selbst angehaltenen
   E3DC-Control-Dienste werden dabei nicht mehr als Rechtefehler bewertet.
 - Leere Paketlisten lösen keinen System-`pip`-Aufruf aus. PEP-668-Systeme
   bleiben vollständig im gebundenen Benutzer-venv.
-- Kann eine alte 5.3.2a-Installation ihren privilegierten Wrapper noch nicht
+- Kann eine alte Installation ihren privilegierten Wrapper noch nicht
   ausführen, ist einmalig der interaktive Konsolenaufruf des Installers nötig.
   Ein nicht startbarer privilegierter Einstieg kann sich aus der Weboberfläche
   heraus bewusst nicht selbst reparieren.
@@ -48,10 +70,11 @@ alle Korrekturen aus v5.4.0a, v5.4.0b und v5.4.0c.
   einzelnes Disconnect-Bild oder ein Phasenübergang lösen keinen neuen
   Startversuch aus.
 
-## Einmaliger Wechsel aus 5.3.2a oder 5.3.2b
+## Einmaliger Wechsel aus 5.3.2b
 
-Für eine laufende 5.3.2b-Installation und eine bereits reparierte
-5.3.2a-Installation bleibt der Web-Update-Button der normale Weg. Wenn das
+Für eine laufende 5.3.2b-Installation bleibt der Web-Update-Button der
+normale Weg. Ältere oder nicht verwandte Installationen wechseln zuerst über
+den dokumentierten, verifizierten Bootstrap auf 5.3.2b. Wenn das
 Web-Protokoll dagegen ausdrücklich meldet, dass
 `Installer/installer_wrapper.sh` fehlt oder nicht ausführbar ist, muss der
 alte privilegierte Einstieg einmalig an einer interaktiven SSH-Konsole
@@ -69,6 +92,11 @@ cat VERSION
 systemctl --failed --no-pager
 ```
 
+Für diesen ersten Wechsel bitte ausschließlich den Web-Update-Button oder den
+oben gezeigten direkten Aufruf mit `--update-e3dc` verwenden. Der interaktive
+Installer-Menüpunkt lädt im Altprozess bereits vor dem Git-Wechsel weitere
+Module und ist für diesen einmaligen Hybridübergang nicht freigegeben.
+
 Bei einem abweichenden Installationsort bitte nur die erste Zeile an den
 tatsächlichen absoluten Pfad anpassen. Eine Passwortabfrage von `sudo` ist an
 der SSH-Konsole normal. Schlägt eine der beiden `test`-Zeilen fehl, bitte dort
@@ -79,7 +107,7 @@ Der erste direkte Wechsel setzt das bereits für den laufenden Altstand
 verwendete Benutzer-venv voraus. Fehlt diese Python-Umgebung tatsächlich, bitte
 weder System-`pip` noch `--break-system-packages` verwenden, sondern den
 veröffentlichten Bootstrapweg aus der
-[Update-Anleitung](https://github.com/A9xxx/Install-E3DC-Control/blob/v5.4.0d/doc/Update.md)
+[Update-Anleitung](https://github.com/A9xxx/Install-E3DC-Control/blob/v5.4.0e/doc/Update.md)
 nutzen.
 
 ## Enthaltene Korrekturen aus v5.4.0b
@@ -89,7 +117,7 @@ nutzen.
   keinen System-`pip`-Eingriff und kein `--break-system-packages`. Ab dem neuen
   Updater kann ein fehlendes Standard-venv nach Installation von
   `python3-venv` kontrolliert neu angelegt werden. Der einmalige direkte
-  Wechsel aus 5.3.2a/b setzt das dort bereits verwendete venv voraus und
+  Wechsel aus 5.3.2b setzt das dort bereits verwendete venv voraus und
   bricht andernfalls mit Wiederherstellung ab.
 - Docker-Installationen werden im Web- und Konsolen-Updater erkannt. Der
   Container versucht nicht, sich selbst zu ersetzen, sondern zeigt die drei
@@ -105,7 +133,7 @@ nutzen.
   gesichert und bei Teilfehlern kontrolliert zurückgesetzt. Ab dem neuen
   Updater setzt nach dem Git-Wechsel ein eigener, an Ziel-SHA und Zielbaum
   gebundener Finalizer die Installation ausschließlich mit Modulen des neuen
-  Stands fort. Der erste Wechsel aus 5.3.2a/b nutzt noch dessen laufenden
+  Stands fort. Der erste Wechsel aus 5.3.2b nutzt noch dessen laufenden
   Altprozess und übernimmt nach dem Reset den neuen service-neutralen
   Rechtevertrag.
 - Eine openWB Pro erhält nach einem bestätigten Ab- und Wiederanstecken eine
@@ -141,9 +169,9 @@ nutzen.
 
 ## Update und Docker
 
-Bare-Metal-Nutzer können v5.4.0d über den Web- oder Konsolen-Updater
+Bare-Metal-Nutzer können v5.4.0e über den Web- oder Konsolen-Updater
 installieren. Das veröffentlichte Container-Image trägt den Tag
-`v5.4.0d`; `latest` wird erst nach bestandener Kandidaten- und
+`v5.4.0e`; `latest` wird erst nach bestandener Kandidaten- und
 Attestierungsprüfung auf denselben Digest gesetzt. Der vorgesehene öffentliche
 Docker-Rückfallstand bleibt `v5.3.2b`; Bare Metal bietet für diesen Altstand
 keinen Programm-Rückfall an.
@@ -255,7 +283,7 @@ kein Programm-Rückfall angeboten. Verifizierte Datei-Backups bleiben nutzbar.
 ## Docker
 
 Die Images werden aus dem veröffentlichten Git-Stand über GitHub Actions
-gebaut. `latest` ist ausschließlich für v5.4.0d vorgesehen; der Rollback-Tag
+gebaut. `latest` ist ausschließlich für v5.4.0e vorgesehen; der Rollback-Tag
 bleibt `v5.3.2b` und ist ausdrücklich Docker-only. Matter-Abhängigkeiten stammen aus der Lockdatei, und das
 anlagenspezifische ML-Modell liegt in einem separaten persistenten Volume.
 

@@ -150,6 +150,7 @@
 !/Installer/ml_predictor.py
 !/Installer/notification_manager.py
 !/Installer/openwb_mqtt.py
+!/Installer/optional_service_contract.py
 !/Installer/package_prepare.py
 !/Installer/permissions.py
 !/Installer/planned_loads.py

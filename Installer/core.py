@@ -77,6 +77,32 @@ def register_command(key, label, func, sort_order=100, category=None):
     COMMANDS.append(Command(key, label, func, sort_order, category))
 
 
+def _install_matter_bridge_lazy(headless=False):
+    """Lädt die optionale Matter-Installation erst bei ausdrücklicher Auswahl."""
+    try:
+        module = importlib.import_module(f"{PACKAGE_NAME}.install_matter")
+        installer = getattr(module, "install_matter_bridge")
+    except (AttributeError, ImportError) as exc:
+        print(
+            "✗ Matter-Installation kann nicht geladen werden. "
+            "Bitte den E3DC-Control-Installer zuerst vollständig aktualisieren."
+        )
+        print(f"  Technisches Detail: {exc}")
+        return False
+
+    return installer(headless=headless)
+
+
+# Matter ist eine optionale Erweiterung. Ihr Abhängigkeitsbaum darf deshalb
+# weder den normalen Installerstart noch ein Core-Update blockieren.
+register_command(
+    "45",
+    "Smart Home Matter Bridge",
+    _install_matter_bridge_lazy,
+    sort_order=45,
+)
+
+
 def auto_discover_modules():
     """Lädt alle Module im Installer-Paket und lässt sie ihre Commands registrieren."""
     global _modules_loaded
@@ -101,6 +127,8 @@ def auto_discover_modules():
         "force_discharge", "recover_history_rscp", "repair_db_inversion", "permissions_helper",
         # Integrations-Guide: importiert get_registered_commands (existiert nicht -> Warnung)
         "INTEGRATIONS_GUIDE",
+        # Optionaler Abhängigkeitsbaum: nur über _install_matter_bridge_lazy laden.
+        "install_matter",
     )
 
     for _, module_name, is_pkg in pkgutil.iter_modules([package_path]):

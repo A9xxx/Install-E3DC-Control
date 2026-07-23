@@ -2758,17 +2758,74 @@ def _rscp_power_limit_w(live: Dict[str, Any], *keys: str) -> int:
     return 0
 
 
-def configured_charge_limit_w(cfg: Dict[str, Any], live: Optional[Dict[str, Any]] = None) -> int:
-    live = live or {}
-    user_limit_w = _configured_power_limit_w(cfg, "maximumladeleistung")
-    if user_limit_w:
-        return user_limit_w
-    rscp_limit_w = _rscp_power_limit_w(
-        live,
-        "user_charge_limit_w",
-        "bat_charge_limit_w",
+def _fresh_rscp_charge_limits_w(
+    cfg: Dict[str, Any],
+    live: Dict[str, Any],
+    *,
+    now_s: Optional[float] = None,
+) -> List[int]:
+    """Liefert ausschließlich frische, typisierte RSCP-Ladegrenzen.
+
+    ``EMS_USER_CHARGE_LIMIT`` und ``EMS_BAT_CHARGE_LIMIT`` sind Obergrenzen.
+    Sie dürfen einen konfigurierten Sollwert deshalb nur absenken, niemals
+    anheben. Temporäre ``EMS_POWER_SETTINGS``-Readbacks werden hier bewusst
+    nicht verwendet, damit eine vorherige dynamische Begrenzung nicht als
+    neue Hardwarefähigkeit festgeschrieben wird.
+    """
+
+    if (
+        live.get("ems_power_settings_read") is not True
+        or live.get("ems_power_settings_valid") is not True
+        or live.get("RSCP_Sample_Valid") is not True
+        or live.get("Power_Decision_Usable") is not True
+    ):
+        return []
+    raw_ts = live.get("_ts")
+    if (
+        not isinstance(raw_ts, (int, float))
+        or isinstance(raw_ts, bool)
+        or not math.isfinite(float(raw_ts))
+        or float(raw_ts) <= 0.0
+    ):
+        return []
+    now_value = time.time() if now_s is None else float(now_s)
+    max_age_s = max(
+        1.0,
+        min(30.0, safe_float(cfg.get("storage_live_stale_guard_s"), 10.0)),
     )
-    return rscp_limit_w or 12000
+    age_s = now_value - float(raw_ts)
+    if not math.isfinite(age_s) or age_s < -5.0 or age_s > max_age_s:
+        return []
+
+    limits: List[int] = []
+    for key in ("user_charge_limit_w", "bat_charge_limit_w"):
+        value = live.get(key)
+        if (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and value >= 300
+        ):
+            limits.append(int(value))
+    return limits
+
+
+def configured_charge_limit_w(
+    cfg: Dict[str, Any],
+    live: Optional[Dict[str, Any]] = None,
+    *,
+    now_s: Optional[float] = None,
+) -> int:
+    live = live or {}
+    configured_limit_w = _configured_power_limit_w(cfg, "maximumladeleistung")
+    fresh_rscp_limits_w = _fresh_rscp_charge_limits_w(
+        cfg,
+        live,
+        now_s=now_s,
+    )
+    if fresh_rscp_limits_w:
+        hardware_limit_w = min(fresh_rscp_limits_w)
+        return min(configured_limit_w, hardware_limit_w) if configured_limit_w else hardware_limit_w
+    return configured_limit_w or 12000
 
 
 def configured_discharge_limit_w(

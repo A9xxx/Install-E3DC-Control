@@ -285,7 +285,10 @@ def _classify_wrapper(path: Path, canonical: bytes) -> dict[str, Any]:
     actual_sha256 = hashlib.sha256(actual).hexdigest()
     item["actual_sha256"] = actual_sha256
     if actual == canonical:
-        item.update({"status": "ok", "repairable": True, "needs_repair": False})
+        if stat.S_IMODE(metadata.st_mode) == 0o755:
+            item.update({"status": "ok", "repairable": True, "needs_repair": False})
+        else:
+            item.update({"status": "mode_drift", "repairable": True})
     elif b"\r\n" in actual and actual.replace(b"\r\n", b"\n") == canonical:
         item.update({"status": "crlf_only", "repairable": True})
     else:
@@ -350,7 +353,13 @@ def _wrapper_owner_ids(user: str | None, group: str | None) -> tuple[int, int]:
     return uid, gid
 
 
-def _atomic_write_wrapper(path: Path, payload: bytes, user: str | None, group: str | None) -> None:
+def _atomic_write_wrapper(
+    path: Path,
+    payload: bytes,
+    user: str | None,
+    group: str | None,
+    preimage: dict[str, Any] | None = None,
+) -> None:
     parent_meta = os.lstat(path.parent)
     if stat.S_ISLNK(parent_meta.st_mode) or not stat.S_ISDIR(parent_meta.st_mode):
         raise RuntimeError(f"Wrapper-Elternpfad ist kein echtes Verzeichnis: {path.parent}")
@@ -366,7 +375,14 @@ def _atomic_write_wrapper(path: Path, payload: bytes, user: str | None, group: s
             os.fchown(fd, uid, gid)
         os.fchmod(fd, 0o755)
         os.fsync(fd)
+        if preimage is not None:
+            # Das beim Snapshot gebundene Objekt erst am Commitpunkt erneut
+            # prüfen. Ein Rebind vor dem Temp-Schreiben lässt sonst ein
+            # Zeitfenster, in dem eine legitime Fremdänderung verloren geht.
+            _assert_preimage_unchanged(preimage)
         os.replace(tmp_path, path)
+        if preimage is not None:
+            _bind_transaction_output(preimage)
         directory_fd = os.open(str(path.parent), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
         try:
             os.fsync(directory_fd)
@@ -380,7 +396,15 @@ def _atomic_write_wrapper(path: Path, payload: bytes, user: str | None, group: s
             pass
 
 
-def _set_verified_wrapper_permissions(path: Path, canonical: bytes, user: str | None, group: str | None) -> None:
+def _set_verified_wrapper_permissions(
+    path: Path,
+    canonical: bytes,
+    user: str | None,
+    group: str | None,
+    preimage: dict[str, Any] | None = None,
+) -> None:
+    if preimage is not None:
+        _assert_preimage_unchanged(preimage)
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(str(path), flags)
     try:
@@ -393,21 +417,230 @@ def _set_verified_wrapper_permissions(path: Path, canonical: bytes, user: str | 
             if not chunk:
                 break
             chunks.append(chunk)
-        if b"".join(chunks) != canonical:
+        opened_payload = b"".join(chunks)
+        if opened_payload != canonical:
             raise RuntimeError(f"Wrapperbytes änderten sich beim Rechte-Endgate: {path}")
+        if preimage is not None and (
+            not preimage.get("existed")
+            or metadata.st_dev != int(preimage.get("dev", -1))
+            or metadata.st_ino != int(preimage.get("ino", -1))
+            or metadata.st_uid != int(preimage.get("uid", -1))
+            or metadata.st_gid != int(preimage.get("gid", -1))
+            or stat.S_IMODE(metadata.st_mode) != int(preimage.get("mode", -1))
+            or opened_payload != bytes(preimage.get("payload") or b"")
+        ):
+            raise RuntimeError(f"Wrapper-Preimage driftete vor dem Rechte-Commit: {path}")
         uid, gid = _wrapper_owner_ids(user, group)
         if uid != -1 or gid != -1:
             os.fchown(fd, uid, gid)
         os.fchmod(fd, 0o755)
         os.fsync(fd)
+        if preimage is not None:
+            _bind_transaction_output(preimage)
     finally:
         os.close(fd)
+
+
+def _capture_file_preimage(path: Path) -> dict[str, Any]:
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        return {"path": str(path), "existed": False}
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        raise RuntimeError(f"Preimage ist nicht regulär/nlink=1: {path}")
+    descriptor = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+            raise RuntimeError(f"Preimage wurde beim Öffnen ausgetauscht: {path}")
+        chunks = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        before_identity = (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_size, opened.st_mtime_ns)
+        after_identity = (after.st_dev, after.st_ino, after.st_mode, after.st_size, after.st_mtime_ns)
+        if before_identity != after_identity:
+            raise RuntimeError(f"Preimage driftete während des Lesens: {path}")
+    finally:
+        os.close(descriptor)
+    return {
+        "path": str(path),
+        "existed": True,
+        "payload": b"".join(chunks),
+        "dev": int(metadata.st_dev),
+        "ino": int(metadata.st_ino),
+        "uid": int(metadata.st_uid),
+        "gid": int(metadata.st_gid),
+        "mode": stat.S_IMODE(metadata.st_mode),
+    }
+
+
+def _bind_transaction_output(preimage: dict[str, Any]) -> None:
+    """Bindet ein von dieser Transaktion neu erzeugtes Objekt für den Rücklauf."""
+    current = _capture_file_preimage(Path(str(preimage["path"])))
+    if not current.get("existed"):
+        raise RuntimeError(f"Transaktionsausgabe fehlt nach dem Schreiben: {preimage['path']}")
+    preimage["transaction_identity"] = {
+        "dev": current.get("dev"),
+        "ino": current.get("ino"),
+        "uid": current.get("uid"),
+        "gid": current.get("gid"),
+        "mode": current.get("mode"),
+        "sha256": hashlib.sha256(bytes(current.get("payload") or b"")).hexdigest(),
+    }
+
+
+def _assert_preimage_unchanged(preimage: dict[str, Any]) -> None:
+    """Verhindert, dass ein zwischenzeitlich verändertes sudoers-Objekt überschrieben wird."""
+    current = _capture_file_preimage(Path(str(preimage["path"])))
+    if bool(current.get("existed")) != bool(preimage.get("existed")):
+        raise RuntimeError(f"Transaktionspfad änderte seinen Existenzzustand: {preimage['path']}")
+    if not preimage.get("existed"):
+        return
+    for key in ("dev", "ino", "uid", "gid", "mode", "payload"):
+        if current.get(key) != preimage.get(key):
+            raise RuntimeError(f"Transaktions-Preimage driftete vor dem Schreiben: {preimage['path']}")
+
+
+def _assert_transaction_output_unchanged(preimage: dict[str, Any]) -> None:
+    """Bindet den Rücklauf an genau das von der Transaktion erzeugte Objekt."""
+    path = Path(str(preimage["path"]))
+    current = _capture_file_preimage(path)
+    identity = preimage.get("transaction_identity")
+    if not identity or not current.get("existed"):
+        raise RuntimeError(f"Transaktionsausgabe fehlt vor dem Rücklauf: {path}")
+    current_identity = {
+        "dev": current.get("dev"),
+        "ino": current.get("ino"),
+        "uid": current.get("uid"),
+        "gid": current.get("gid"),
+        "mode": current.get("mode"),
+        "sha256": hashlib.sha256(bytes(current.get("payload") or b"")).hexdigest(),
+    }
+    if current_identity != identity:
+        raise RuntimeError(f"Transaktionspfad driftete vor dem Rücklauf: {path}")
+
+
+def _atomic_restore_preimage(preimage: dict[str, Any]) -> None:
+    path = Path(str(preimage["path"]))
+    if not preimage.get("existed"):
+        current = _capture_file_preimage(path)
+        if not current.get("existed"):
+            return
+        identity = preimage.get("transaction_identity")
+        if not identity:
+            raise RuntimeError(f"Neu erzeugter Pfad besitzt keine Transaktionsbindung: {path}")
+        _assert_transaction_output_unchanged(preimage)
+        path.unlink()
+        directory_fd = os.open(str(path.parent), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        return
+
+    payload = bytes(preimage["payload"])
+    identity = preimage.get("transaction_identity")
+    if not identity:
+        return
+    _assert_transaction_output_unchanged(preimage)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.rollback-", dir=str(path.parent))
+    tmp_path = Path(tmp_name)
+    try:
+        offset = 0
+        while offset < len(payload):
+            offset += os.write(fd, payload[offset:])
+        os.fchown(fd, int(preimage["uid"]), int(preimage["gid"]))
+        os.fchmod(fd, int(preimage["mode"]))
+        os.fsync(fd)
+        _assert_transaction_output_unchanged(preimage)
+        os.replace(tmp_path, path)
+        if preimage is not None:
+            _bind_transaction_output(preimage)
+        directory_fd = os.open(str(path.parent), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        os.close(fd)
+        tmp_path.unlink(missing_ok=True)
+
+    restored = _capture_file_preimage(path)
+    if (
+        not restored.get("existed")
+        or restored.get("payload") != payload
+        or restored.get("uid") != int(preimage["uid"])
+        or restored.get("gid") != int(preimage["gid"])
+        or restored.get("mode") != int(preimage["mode"])
+    ):
+        raise RuntimeError(f"Preimage-Rücklauf konnte nicht verifiziert werden: {path}")
+
+
+def _sudoers_owner_ids() -> tuple[int, int]:
+    """Produktiver sudoers-Vertrag; als Funktion separat testbar."""
+    return 0, 0
+
+
+def _atomic_write_sudoers(
+    path: Path,
+    payload: bytes,
+    preimage: dict[str, Any] | None = None,
+) -> None:
+    """Schreibt ein sudoers-Fragment same-FS, root:root/0440 und dauerhaft."""
+    parent = path.parent
+    parent_meta = os.lstat(parent)
+    if stat.S_ISLNK(parent_meta.st_mode) or not stat.S_ISDIR(parent_meta.st_mode):
+        raise RuntimeError(f"sudoers-Elternpfad ist kein echtes Verzeichnis: {parent}")
+    descriptor, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.txn-", dir=str(parent))
+    tmp_path = Path(tmp_name)
+    try:
+        offset = 0
+        while offset < len(payload):
+            offset += os.write(descriptor, payload[offset:])
+        owner_uid, owner_gid = _sudoers_owner_ids()
+        os.fchown(descriptor, owner_uid, owner_gid)
+        os.fchmod(descriptor, 0o440)
+        os.fsync(descriptor)
+        if preimage is not None:
+            # Rebind direkt vor dem einzigen sichtbaren Commit. Der Aufrufer
+            # darf damit keinen Stand überschreiben, der nach dem Snapshot
+            # von einem anderen Prozess atomar publiziert wurde.
+            _assert_preimage_unchanged(preimage)
+        os.replace(tmp_path, path)
+        if preimage is not None:
+            _bind_transaction_output(preimage)
+        directory_fd = os.open(str(parent), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        os.close(descriptor)
+        tmp_path.unlink(missing_ok=True)
+
+
+def _restore_preimages(preimages: list[dict[str, Any]]) -> dict[str, Any]:
+    restored = []
+    errors = []
+    for preimage in reversed(preimages):
+        try:
+            _atomic_restore_preimage(preimage)
+            restored.append(str(preimage.get("path")))
+        except Exception as exc:
+            errors.append({"path": str(preimage.get("path")), "error": str(exc)})
+    return {"success": not errors, "restored": restored, "errors": errors}
 
 
 def repair_wrapper_integrity(
     repo_root: Path | str | None = None,
     user: str | None = None,
     group: str | None = None,
+    bound_preimages: list[dict[str, Any]] | None = None,
+    rollback_on_failure: bool = True,
 ) -> dict[str, Any]:
     """Repariert nur fehlende oder reine CRLF-Wrapper aus dem gebundenen HEAD."""
     root = Path(repo_root) if repo_root is not None else INSTALL_ROOT
@@ -443,6 +676,27 @@ def repair_wrapper_integrity(
 
     steps: list[dict[str, Any]] = []
     try:
+        expected_paths = {str(root / str(item["relative_path"])) for item in state["items"]}
+        if bound_preimages is None:
+            preimages = [
+                _capture_file_preimage(root / str(item["relative_path"]))
+                for item in state["items"]
+            ]
+        else:
+            preimages = bound_preimages
+            if {str(item.get("path") or "") for item in preimages} != expected_paths:
+                raise RuntimeError("Gebundene Wrapper-Preimages stimmen nicht mit der Mutationsmenge überein")
+            for preimage in preimages:
+                _assert_preimage_unchanged(preimage)
+        preimages_by_path = {str(item["path"]): item for item in preimages}
+    except Exception as exc:
+        public_state.update({
+            "success": False,
+            "message": f"Wrapper-Reparatur abgebrochen: Preimages konnten nicht gebunden werden: {exc}",
+            "steps": [],
+        })
+        return public_state
+    try:
         for item in state["items"]:
             relative_path = str(item["relative_path"])
             path = root / relative_path
@@ -452,7 +706,13 @@ def repair_wrapper_integrity(
                 raise RuntimeError(f"Wrapperzustand änderte sich vor dem Schreiben: {path}")
 
             if item["status"] in {"missing", "crlf_only"}:
-                _atomic_write_wrapper(path, canonical, user, group)
+                _atomic_write_wrapper(
+                    path,
+                    canonical,
+                    user,
+                    group,
+                    preimages_by_path[str(path)],
+                )
                 steps.append({
                     "step": "restore_wrapper_from_head",
                     "ok": True,
@@ -462,7 +722,13 @@ def repair_wrapper_integrity(
                     "sha256": hashlib.sha256(canonical).hexdigest(),
                 })
             else:
-                _set_verified_wrapper_permissions(path, canonical, user, group)
+                _set_verified_wrapper_permissions(
+                    path,
+                    canonical,
+                    user,
+                    group,
+                    preimages_by_path[str(path)],
+                )
                 steps.append({
                     "step": "verify_wrapper_from_head",
                     "ok": True,
@@ -470,6 +736,7 @@ def repair_wrapper_integrity(
                     "source": f"{state['head']}:{relative_path}",
                     "sha256": hashlib.sha256(canonical).hexdigest(),
                 })
+            _bind_transaction_output(preimages_by_path[str(path)])
 
         final_state = _collect_wrapper_integrity(root)
         final_ok = (
@@ -477,6 +744,11 @@ def repair_wrapper_integrity(
             and final_state["head"] == state["head"]
             and all(item.get("status") == "ok" for item in final_state["items"])
         )
+        expected_uid, expected_gid = _wrapper_owner_ids(user, group)
+        if expected_uid != -1:
+            final_ok = final_ok and all(item.get("uid") == expected_uid for item in final_state["items"])
+        if expected_gid != -1:
+            final_ok = final_ok and all(item.get("gid") == expected_gid for item in final_state["items"])
         if not final_ok:
             raise RuntimeError("Wrapper-Endgate stimmt nicht vollständig mit dem gebundenen Git-HEAD überein")
         return {
@@ -491,15 +763,27 @@ def repair_wrapper_integrity(
         }
     except Exception as exc:
         steps.append({"step": "wrapper_integrity", "ok": False, "error": str(exc)})
+        rollback = _restore_preimages(preimages) if rollback_on_failure else None
+        if rollback is not None:
+            steps.append({"step": "wrapper_rollback", "ok": rollback["success"], **rollback})
         return {
             "success": False,
-            "message": f"Wrapper-Reparatur abgebrochen: {exc}",
+            "message": (
+                f"Wrapper-Reparatur abgebrochen und vollständig zurückgerollt: {exc}"
+                if rollback is not None and rollback["success"]
+                else (
+                    f"Wrapper-Reparatur abgebrochen; Rücklauf unvollständig: {exc}"
+                    if rollback is not None
+                    else f"Wrapper-Reparatur abgebrochen; Rücklauf bleibt bei der äußeren Transaktion: {exc}"
+                )
+            ),
             "repo_root": str(root),
             "head": state["head"],
             "items": state["items"],
             "hard_blockers": [],
             "repair_needed": True,
             "steps": steps,
+            "rollback": rollback,
         }
 
 
@@ -554,6 +838,228 @@ def backup_relative_path(path: Path) -> str:
     if len(raw) >= 2 and raw[1] == ":":
         raw = f"{raw[0]}_drive{raw[2:]}"
     return raw.lstrip("/")
+
+
+def _write_snapshot_payload(path: Path, payload: bytes) -> None:
+    """Schreibt ein privates Snapshot-Artefakt exklusiv und dauerhaft."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(
+        str(path),
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        offset = 0
+        while offset < len(payload):
+            offset += os.write(descriptor, payload[offset:])
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def create_bound_preimage_snapshot(
+    action: str,
+    preimages: list[dict[str, Any]],
+    category_by_path: dict[str, str],
+) -> dict[str, Any]:
+    """Versiegelt exakt die bereits gebundene Mutationsmenge.
+
+    Die Quelle wird bewusst nicht erneut gelesen. Damit sind persistenter
+    Snapshot, In-Memory-Rücklauf und die spätere Commitprüfung dieselbe
+    Dateigeneration. Fehlende Preimages werden als ``missing`` im Manifest
+    festgehalten, damit auch ein ADD-Rücklauf selbsttragend beschrieben ist.
+    """
+    safe_action = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in action) or "job"
+    collection_root = default_backup_root(INSTALL_ROOT) / "web_installer"
+    copied: list[dict[str, Any]] = []
+    mapped_entries: list[dict[str, Any]] = []
+    source_records: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    backup_root: Path | None = None
+
+    try:
+        collection_root.mkdir(parents=True, exist_ok=True)
+        apply_config_backup_dir_permissions(collection_root, install_user=install_user())
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        backup_root = Path(
+            tempfile.mkdtemp(
+                prefix=f"{timestamp}-{safe_action}-permissions-",
+                dir=str(collection_root),
+            )
+        )
+        apply_config_backup_dir_permissions(backup_root, install_user=install_user())
+
+        for preimage in preimages:
+            source = Path(str(preimage.get("path") or ""))
+            source_text = str(source)
+            if not source.is_absolute() or source_text in seen:
+                raise RuntimeError(f"Ungültiger oder doppelter Snapshot-Pfad: {source}")
+            seen.add(source_text)
+            category = str(category_by_path.get(source_text) or "").strip().lower()
+            if not category:
+                raise RuntimeError(f"Snapshot-Kategorie fehlt: {source}")
+
+            existed = bool(preimage.get("existed"))
+            source_records.append({
+                "category": category,
+                "source": source_text,
+                "present": existed,
+                "files": 1 if existed else 0,
+                "source_type": "file" if existed else "missing",
+                "exclude_top_level": [],
+                "exclude_anywhere": [],
+                "directories": [],
+            })
+            if not existed:
+                continue
+
+            payload = bytes(preimage.get("payload") or b"")
+            for field in ("uid", "gid", "mode"):
+                if field not in preimage:
+                    raise RuntimeError(f"Snapshot-Metadatum {field} fehlt: {source}")
+            archive_relative = Path("recovery") / category / backup_relative_path(source)
+            target = backup_root / archive_relative
+            _write_snapshot_payload(target, payload)
+            digest = hashlib.sha256(payload).hexdigest()
+            mapped_entries.append({
+                "backup_path": archive_relative.as_posix(),
+                "restore_path": source_text,
+                "category": category,
+                "restore_mode": int(preimage["mode"]),
+                "restore_uid": int(preimage["uid"]),
+                "restore_gid": int(preimage["gid"]),
+            })
+            copied.append({
+                "path": source_text,
+                "backup": str(target),
+                "size": len(payload),
+                "sha256": digest,
+                "uid": int(preimage["uid"]),
+                "gid": int(preimage["gid"]),
+                "mode": int(preimage["mode"]),
+                "category": category,
+            })
+
+        if set(seen) != set(category_by_path):
+            raise RuntimeError("Snapshot-Kategorien und Preimage-Menge weichen voneinander ab")
+        if not copied:
+            marker = backup_root / "snapshot.json"
+            _write_snapshot_payload(
+                marker,
+                (
+                    json.dumps(
+                        {
+                            "schema": "web_installer_preimage_snapshot_v1",
+                            "action": safe_action,
+                            "missing_paths": sorted(seen),
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    + "\n"
+                ).encode("utf-8"),
+            )
+
+        secure_backup_tree(backup_root)
+        manifest = finalize_backup(
+            backup_root,
+            mapped_entries,
+            source_records,
+            kind=WEB_SNAPSHOT_KIND,
+            install_root=INSTALL_ROOT,
+        )
+        retention = prune_backup_dir(
+            collection_root,
+            keep_count=WEB_INSTALLER_BACKUP_KEEP_COUNT,
+            expected_kind=WEB_SNAPSHOT_KIND,
+        )
+        return {
+            "success": True,
+            "root": str(backup_root),
+            "copied_count": len(copied),
+            "skipped_count": 0,
+            "copied": copied,
+            "manifest": manifest,
+            "categories": dict(category_by_path),
+            "retention": retention,
+            "message": "Gebundener Transaktions-Snapshot angelegt.",
+        }
+    except Exception as exc:
+        return {
+            "success": False,
+            "root": str(backup_root) if backup_root is not None else None,
+            "copied_count": len(copied),
+            "skipped_count": max(0, len(preimages) - len(copied)),
+            "copied": copied,
+            "message": f"Gebundener Transaktions-Snapshot fehlgeschlagen: {exc}",
+        }
+
+
+def validate_bound_preimage_snapshot(
+    preimages: list[dict[str, Any]],
+    snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    """Bindet Manifest, Restore-Metadaten und Payload an jedes Preimage."""
+    checks: list[dict[str, Any]] = []
+    if not snapshot.get("success") or not isinstance(snapshot.get("manifest"), dict):
+        return {"success": False, "checks": checks, "error": "Snapshot oder Manifest fehlt"}
+
+    manifest = snapshot["manifest"]
+    sources = {
+        str(item.get("source") or ""): item
+        for item in manifest.get("sources", [])
+        if isinstance(item, dict) and str(item.get("source") or "")
+    }
+    files = {
+        str(item.get("restore_path") or ""): item
+        for item in manifest.get("files", [])
+        if isinstance(item, dict) and str(item.get("restore_path") or "")
+    }
+    copied = {
+        str(item.get("path") or ""): item
+        for item in snapshot.get("copied", [])
+        if str(item.get("path") or "")
+    }
+    expected_paths = {str(item.get("path") or "") for item in preimages}
+    if set(sources) != expected_paths:
+        return {
+            "success": False,
+            "checks": checks,
+            "error": "Manifest-Quellmenge stimmt nicht mit den Preimages überein",
+        }
+
+    for preimage in preimages:
+        path = str(preimage.get("path") or "")
+        source = sources.get(path, {})
+        existed = bool(preimage.get("existed"))
+        check: dict[str, Any] = {"path": path, "ok": False, "existed": existed}
+        if not existed:
+            check["ok"] = source.get("source_type") == "missing" and not bool(source.get("present"))
+            checks.append(check)
+            continue
+
+        payload = bytes(preimage.get("payload") or b"")
+        digest = hashlib.sha256(payload).hexdigest()
+        copied_item = copied.get(path, {})
+        manifest_item = files.get(path, {})
+        check["ok"] = (
+            source.get("source_type") == "file"
+            and bool(source.get("present"))
+            and copied_item.get("sha256") == digest
+            and int(copied_item.get("uid", -1)) == int(preimage.get("uid", -2))
+            and int(copied_item.get("gid", -1)) == int(preimage.get("gid", -2))
+            and int(copied_item.get("mode", -1)) == int(preimage.get("mode", -2))
+            and manifest_item.get("sha256") == digest
+            and int(manifest_item.get("uid", -1)) == int(preimage.get("uid", -2))
+            and int(manifest_item.get("gid", -1)) == int(preimage.get("gid", -2))
+            and int(manifest_item.get("mode", -1)) == int(preimage.get("mode", -2))
+        )
+        checks.append(check)
+
+    return {
+        "success": len(checks) == len(preimages) and all(item.get("ok") for item in checks),
+        "checks": checks,
+    }
 
 
 def desired_sudoers_lines() -> list[str]:
@@ -1475,6 +1981,12 @@ def backup_plan(module_key: str | None = None) -> dict[str, Any]:
         SERVICE_WRAPPER,
         INSTALLER_WRAPPER,
     ]
+    sudoers_findings = sudoers_file_findings()
+    system_files.extend(
+        Path(str(item.get("file") or ""))
+        for item in sudoers_findings.get("direct_web_lines", []) + sudoers_findings.get("legacy_lines", [])
+        if str(item.get("file") or "")
+    )
     for module in modules:
         if module.service_unit:
             system_files.append(Path("/etc/systemd/system") / module.service_unit)
@@ -1558,6 +2070,8 @@ def create_backup_snapshot(action: str, module_key: str | None = None) -> dict[s
     plan = backup_plan(module_key)
     copied: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
+    mapped_entries: list[dict[str, Any]] = []
+    source_records: list[dict[str, Any]] = []
 
     if not plan.get("success"):
         return {
@@ -1583,17 +2097,29 @@ def create_backup_snapshot(action: str, module_key: str | None = None) -> dict[s
         }
     for item in plan.get("items", []):
         source = Path(str(item.get("path") or ""))
+        category = str(item.get("category") or "files").strip().lower()
         if not item.get("exists"):
             skipped.append({"path": str(source), "reason": "Quelle fehlt"})
-            continue
-        if not source.is_file():
-            skipped.append({"path": str(source), "reason": "Quelle ist keine Datei"})
+            source_records.append({
+                "category": category,
+                "source": str(source),
+                "present": False,
+                "files": 0,
+                "source_type": "missing",
+                "exclude_top_level": [],
+                "exclude_anywhere": [],
+                "directories": [],
+            })
             continue
         try:
-            size = source.stat().st_size
+            metadata = os.lstat(source)
         except Exception as exc:
             skipped.append({"path": str(source), "reason": f"Quelle nicht lesbar: {exc}"})
             continue
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            skipped.append({"path": str(source), "reason": "Quelle ist nicht regulär/nlink=1 oder ist ein Symlink"})
+            continue
+        size = int(metadata.st_size)
         if size > MAX_BACKUP_FILE_BYTES:
             skipped.append({
                 "path": str(source),
@@ -1601,19 +2127,51 @@ def create_backup_snapshot(action: str, module_key: str | None = None) -> dict[s
                 "size": size,
             })
             continue
-        target = backup_root / str(item.get("category") or "files") / backup_relative_path(source)
+        target = backup_root / category / backup_relative_path(source)
         try:
+            preimage = _capture_file_preimage(source)
+            payload = bytes(preimage.get("payload") or b"")
+            if not preimage.get("existed") or len(payload) != size:
+                raise RuntimeError("Quelle driftete vor der Sicherung")
             target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, target)
+            target.write_bytes(payload)
+            os.chmod(target, int(preimage["mode"]))
             if str(item.get("category") or "") == "config":
                 apply_config_backup_dir_permissions(target.parent, install_user=install_user())
                 apply_config_secret_permissions(target, install_user=install_user())
-            copied.append({"path": str(source), "backup": str(target), "size": size})
+            archive_relative = target.relative_to(backup_root).as_posix()
+            mapped_entries.append({
+                "backup_path": archive_relative,
+                "restore_path": str(source),
+                "category": category,
+                "restore_mode": int(preimage["mode"]),
+                "restore_uid": int(preimage["uid"]),
+                "restore_gid": int(preimage["gid"]),
+            })
+            source_records.append({
+                "category": category,
+                "source": str(source),
+                "present": True,
+                "files": 1,
+                "source_type": "file",
+                "exclude_top_level": [],
+                "exclude_anywhere": [],
+                "directories": [],
+            })
+            copied.append({
+                "path": str(source),
+                "backup": str(target),
+                "size": size,
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "uid": preimage.get("uid"),
+                "gid": preimage.get("gid"),
+                "mode": preimage.get("mode"),
+            })
         except Exception as exc:
             skipped.append({"path": str(source), "reason": f"Kopie fehlgeschlagen: {exc}", "size": size})
 
     existing_count = int(plan.get("would_backup_count") or 0)
-    success = bool(copied) or existing_count == 0
+    success = len(copied) == existing_count
     if success:
         try:
             if not copied:
@@ -1634,8 +2192,8 @@ def create_backup_snapshot(action: str, module_key: str | None = None) -> dict[s
             secure_backup_tree(backup_root)
             finalize_backup(
                 backup_root,
-                [],
-                [],
+                mapped_entries,
+                source_records,
                 kind=WEB_SNAPSHOT_KIND,
                 install_root=INSTALL_ROOT,
             )
@@ -2705,62 +3263,18 @@ def permissions_check() -> dict[str, Any]:
     }
 
 
-def repair_runtime_permissions(user: str) -> list[dict[str, Any]]:
-    """Repair shared WebUI/runtime paths used by PHP and Python services."""
-    steps: list[dict[str, Any]] = []
-    runtime_dirs = [
-        (WEB_ROOT, 0o775),
-        (TMP_DIR, 0o775),
-        (RAMDISK_DIR, 0o2775),
-        (LOG_DIR, 0o775),
-        (DATA_DIR, 0o775),
-    ]
-    for path, mode in runtime_dirs:
-        try:
-            path.mkdir(parents=True, exist_ok=True)
-            shutil.chown(path, user=user, group="www-data")
-            os.chmod(path, mode)
-            steps.append({
-                "step": "repair_runtime_dir",
-                "ok": True,
-                "path": str(path),
-                "owner": f"{user}:www-data",
-                "mode": oct(mode)[2:],
-            })
-        except Exception as exc:
-            steps.append({
-                "step": "repair_runtime_dir",
-                "ok": False,
-                "path": str(path),
-                "error": str(exc),
-            })
-
-    for path in SESSION_FILES:
-        if not path.exists():
-            continue
-        try:
-            shutil.chown(path, user=user, group="www-data")
-            os.chmod(path, 0o664)
-            steps.append({
-                "step": "repair_session_file",
-                "ok": True,
-                "path": str(path),
-                "owner": f"{user}:www-data",
-                "mode": "664",
-            })
-        except Exception as exc:
-            steps.append({
-                "step": "repair_session_file",
-                "ok": False,
-                "path": str(path),
-                "error": str(exc),
-            })
-    return steps
-
-
-def repair_permissions(*, repair_runtime: bool = True) -> dict[str, Any]:
-    """Write-mode only: replace sudoers with the wrapper-only target."""
+def repair_permissions(*, repair_runtime: bool = False) -> dict[str, Any]:
+    """Ersetzt atomar nur die commitgebundenen Wrapper und sudoers-Fragmente."""
     readiness = write_readiness()
+    if repair_runtime:
+        return {
+            "success": False,
+            "message": (
+                "Wrapper-/sudoers-Reparatur abgebrochen: Runtime- und Session-Rechte "
+                "gehören in den separaten allgemeinen Rechte-Wizard."
+            ),
+            "readiness": readiness,
+        }
     if is_docker():
         return {
             "success": False,
@@ -2777,19 +3291,65 @@ def repair_permissions(*, repair_runtime: bool = True) -> dict[str, Any]:
             "readiness": readiness,
         }
 
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    backup_path = SUDOERS_FILE.with_name(f"{SUDOERS_FILE.name}.bak-webinstaller-{timestamp}")
-    target_content = desired_sudoers_content()
-    tmp_path = SUDOERS_FILE.with_name(f"{SUDOERS_FILE.name}.tmp-webinstaller-{timestamp}")
+    target_payload = desired_sudoers_content().encode("utf-8")
     steps: list[dict[str, Any]] = []
-    findings = sudoers_file_findings()
+    findings: dict[str, Any] = {}
+    wrapper_preimages: list[dict[str, Any]] = []
+    sudoers_preimages: list[dict[str, Any]] = []
+    validation_tmp_path: Path | None = None
+    mutation_started = False
+
+    def rollback_permissions() -> dict[str, Any]:
+        rollback = _restore_preimages([*wrapper_preimages, *sudoers_preimages])
+        syntax = run_cmd(["visudo", "-cf", "/etc/sudoers"], timeout=10)
+        rollback["visudo"] = syntax
+        rollback["success"] = bool(rollback.get("success")) and bool(syntax.get("ok"))
+        steps.append({"step": "permissions_rollback", "ok": rollback["success"], **rollback})
+        return rollback
 
     try:
-        backup_snapshot = create_backup_snapshot("repair_permissions", None)
+        try:
+            # Die Mutationsmenge wird genau einmal gebildet. Derselbe Satz
+            # liefert In-Memory-Preimages, persistenten Snapshot und alle
+            # späteren Forward-Writer; ein zweiter Findings-Scan darf den
+            # Schreibumfang nicht unbemerkt erweitern.
+            findings = sudoers_file_findings()
+            wrapper_preimages = [
+                _capture_file_preimage(Path(str(item.get("path") or "")))
+                for item in wrapper_preview.get("items", [])
+            ]
+            sudoers_paths = {SUDOERS_FILE}
+            sudoers_paths.update(
+                Path(str(item.get("file") or ""))
+                for item in findings.get("direct_web_lines", []) + findings.get("legacy_lines", [])
+                if str(item.get("file") or "")
+            )
+            sudoers_preimages = [
+                _capture_file_preimage(path)
+                for path in sorted(sudoers_paths, key=lambda item: str(item))
+            ]
+        except Exception as exc:
+            return {
+                "success": False,
+                "message": f"Rechte-Reparatur abgebrochen: Transaktions-Preimages fehlen: {exc}",
+                "steps": steps,
+                "readiness": readiness,
+            }
+
+        all_preimages = [*wrapper_preimages, *sudoers_preimages]
+        category_by_path = {
+            **{str(item["path"]): "wrapper" for item in wrapper_preimages},
+            **{str(item["path"]): "sudoers" for item in sudoers_preimages},
+        }
+        backup_snapshot = create_bound_preimage_snapshot(
+            "repair_permissions",
+            all_preimages,
+            category_by_path,
+        )
         if not backup_snapshot.get("success"):
             return {
                 "success": False,
-                "message": "Rechte-Reparatur abgebrochen: Backup-Snapshot konnte nicht angelegt werden.",
+                "message": "Rechte-Reparatur abgebrochen: Gebundener Transaktions-Snapshot fehlt.",
                 "steps": steps,
                 "backup_snapshot": backup_snapshot,
                 "readiness": readiness,
@@ -2801,16 +3361,16 @@ def repair_permissions(*, repair_runtime: bool = True) -> dict[str, Any]:
             "copied_count": backup_snapshot.get("copied_count", 0),
         })
 
-        backup_coverage = validate_wrapper_backup_coverage(wrapper_preview, backup_snapshot)
+        backup_coverage = validate_bound_preimage_snapshot(all_preimages, backup_snapshot)
         steps.append({
-            "step": "validate_wrapper_backup_coverage",
+            "step": "validate_bound_preimage_snapshot",
             "ok": bool(backup_coverage.get("success")),
             "checks": backup_coverage.get("checks", []),
         })
         if not backup_coverage.get("success"):
             return {
                 "success": False,
-                "message": "Rechte-Reparatur abgebrochen: Wrapper-Preimages sind im Snapshot nicht vollständig gebunden.",
+                "message": "Rechte-Reparatur abgebrochen: Preimage-Snapshot ist nicht vollständig gebunden.",
                 "steps": steps,
                 "wrapper_integrity": wrapper_preview,
                 "backup_snapshot": backup_snapshot,
@@ -2818,21 +3378,44 @@ def repair_permissions(*, repair_runtime: bool = True) -> dict[str, Any]:
                 "readiness": readiness,
             }
 
-        user = install_user()
-        wrapper_repair = repair_wrapper_integrity(user=user, group="www-data")
-        steps.extend(wrapper_repair.get("steps", []))
-        if not wrapper_repair.get("success"):
+        try:
+            for preimage in all_preimages:
+                _assert_preimage_unchanged(preimage)
+        except Exception as exc:
             return {
                 "success": False,
-                "message": wrapper_repair.get("message") or "Wrapper-Reparatur fehlgeschlagen.",
+                "message": f"Rechte-Reparatur abgebrochen: Preimage driftete nach dem Snapshot: {exc}",
+                "steps": steps,
+                "backup_snapshot": backup_snapshot,
+                "backup_coverage": backup_coverage,
+                "readiness": readiness,
+            }
+
+        user = install_user()
+        mutation_started = True
+        wrapper_repair = repair_wrapper_integrity(
+            user=user,
+            group="www-data",
+            bound_preimages=wrapper_preimages,
+            rollback_on_failure=False,
+        )
+        steps.extend(wrapper_repair.get("steps", []))
+        if not wrapper_repair.get("success"):
+            rollback = rollback_permissions()
+            return {
+                "success": False,
+                "message": (
+                    wrapper_repair.get("message") or "Wrapper-Reparatur fehlgeschlagen."
+                ) + (" Rücklauf vollständig." if rollback["success"] else " Rücklauf unvollständig."),
                 "steps": steps,
                 "wrapper_integrity": wrapper_repair,
                 "backup_snapshot": backup_snapshot,
                 "readiness": readiness,
+                "rollback": rollback,
             }
+        for preimage in wrapper_preimages:
+            _bind_transaction_output(preimage)
 
-        if repair_runtime:
-            steps.extend(repair_runtime_permissions(user))
         wrapper_endgate = wrapper_integrity_preview()
         wrapper_endgate_ok = (
             wrapper_endgate.get("success")
@@ -2845,6 +3428,7 @@ def repair_permissions(*, repair_runtime: bool = True) -> dict[str, Any]:
             "head": wrapper_endgate.get("head"),
         })
         if not wrapper_endgate_ok:
+            rollback = rollback_permissions()
             return {
                 "success": False,
                 "message": "Rechte-Reparatur abgebrochen: Wrapper-Endgate vor sudoers ist nicht grün.",
@@ -2852,30 +3436,53 @@ def repair_permissions(*, repair_runtime: bool = True) -> dict[str, Any]:
                 "wrapper_integrity": wrapper_endgate,
                 "backup_snapshot": backup_snapshot,
                 "readiness": readiness,
+                "rollback": rollback,
             }
 
-        if SUDOERS_FILE.exists():
-            backup_path.write_text(SUDOERS_FILE.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
-            os.chmod(backup_path, 0o440)
-            steps.append({"step": "backup_sudoers", "ok": True, "path": str(backup_path)})
-        else:
-            steps.append({"step": "backup_sudoers", "ok": True, "path": None, "message": "sudoers-Datei war noch nicht vorhanden"})
+        sudoers_by_path = {str(item["path"]): item for item in sudoers_preimages}
+        target_preimage = sudoers_by_path[str(SUDOERS_FILE)]
+        _assert_preimage_unchanged(target_preimage)
 
-        tmp_path.write_text(target_content, encoding="utf-8")
-        os.chmod(tmp_path, 0o440)
-        syntax_tmp = run_cmd(["visudo", "-cf", str(tmp_path)], timeout=10)
+        validation_fd, validation_tmp_name = tempfile.mkstemp(
+            prefix=".e3dc-wrapper-sudoers-validate-",
+            dir=str(SUDOERS_DIR),
+        )
+        validation_tmp_path = Path(validation_tmp_name)
+        try:
+            offset = 0
+            while offset < len(target_payload):
+                offset += os.write(validation_fd, target_payload[offset:])
+            os.fchown(validation_fd, 0, 0)
+            os.fchmod(validation_fd, 0o440)
+            os.fsync(validation_fd)
+        finally:
+            os.close(validation_fd)
+        syntax_tmp = run_cmd(["visudo", "-cf", str(validation_tmp_path)], timeout=10)
         steps.append({"step": "validate_target", **syntax_tmp})
         if not syntax_tmp.get("ok"):
-            tmp_path.unlink(missing_ok=True)
+            validation_tmp_path.unlink(missing_ok=True)
+            validation_tmp_path = None
+            rollback = rollback_permissions()
             return {
                 "success": False,
                 "message": "Rechte-Reparatur abgebrochen: Ziel-sudoers hat die visudo-Pruefung nicht bestanden.",
                 "steps": steps,
-                "backup": str(backup_path) if backup_path.exists() else None,
+                "backup_snapshot": backup_snapshot,
+                "rollback": rollback,
             }
+        validation_tmp_path.unlink(missing_ok=True)
+        validation_tmp_path = None
 
-        os.replace(tmp_path, SUDOERS_FILE)
-        os.chmod(SUDOERS_FILE, 0o440)
+        _atomic_write_sudoers(SUDOERS_FILE, target_payload, target_preimage)
+        sudoers_uid, sudoers_gid = _sudoers_owner_ids()
+        written_target = _capture_file_preimage(SUDOERS_FILE)
+        if (
+            written_target.get("payload") != target_payload
+            or written_target.get("uid") != sudoers_uid
+            or written_target.get("gid") != sudoers_gid
+            or written_target.get("mode") != 0o440
+        ):
+            raise RuntimeError("Ziel-sudoers stimmt nach dem atomaren Schreiben nicht exakt")
         steps.append({"step": "write_sudoers", "ok": True, "path": str(SUDOERS_FILE)})
 
         target_file = str(SUDOERS_FILE)
@@ -2887,13 +3494,11 @@ def repair_permissions(*, repair_runtime: bool = True) -> dict[str, Any]:
 
         for file_name, removable in sorted(removable_by_file.items()):
             path = Path(file_name)
-            if not path.exists() or not path.is_file():
-                steps.append({"step": "clean_legacy_sudoers", "ok": False, "path": file_name, "message": "Datei fehlt"})
-                continue
-            old_text = path.read_text(encoding="utf-8", errors="replace")
-            backup_other = path.with_name(f"{path.name}.bak-webinstaller-{timestamp}")
-            backup_other.write_text(old_text, encoding="utf-8")
-            os.chmod(backup_other, 0o440)
+            preimage = sudoers_by_path.get(file_name)
+            if preimage is None:
+                raise RuntimeError(f"Legacy-sudoers besitzt kein Transaktions-Preimage: {file_name}")
+            _assert_preimage_unchanged(preimage)
+            old_text = bytes(preimage.get("payload") or b"").decode("utf-8", errors="replace")
             kept_lines = []
             removed_count = 0
             for line_no, raw_line in enumerate(old_text.splitlines(), start=1):
@@ -2902,14 +3507,23 @@ def repair_permissions(*, repair_runtime: bool = True) -> dict[str, Any]:
                     removed_count += 1
                     continue
                 kept_lines.append(raw_line)
+            if removed_count != len(removable):
+                raise RuntimeError(f"Legacy-sudoers-Zeilensatz driftete: {file_name}")
             new_text = "\n".join(kept_lines).rstrip() + "\n"
-            path.write_text(new_text, encoding="utf-8")
-            os.chmod(path, 0o440)
+            new_payload = new_text.encode("utf-8")
+            _atomic_write_sudoers(path, new_payload, preimage)
+            written = _capture_file_preimage(path)
+            if (
+                written.get("payload") != new_payload
+                or written.get("uid") != sudoers_uid
+                or written.get("gid") != sudoers_gid
+                or written.get("mode") != 0o440
+            ):
+                raise RuntimeError(f"Legacy-sudoers-Endgate ist nicht exakt: {file_name}")
             steps.append({
                 "step": "clean_legacy_sudoers",
                 "ok": True,
                 "path": file_name,
-                "backup": str(backup_other),
                 "removed_lines": removed_count,
             })
 
@@ -2922,25 +3536,46 @@ def repair_permissions(*, repair_runtime: bool = True) -> dict[str, Any]:
         # Der Lock ist hier kein Fehler, sondern der Schutzrahmen des gerade
         # erfolgreich ausgefuehrten Reparaturjobs.
         post = write_readiness(ignore_active_lock=True)
+        success = bool(syntax_final.get("ok")) and bool(syntax_all.get("ok")) and post.get("hard_blocker_count", 1) == 0
+        rollback = None
+        if not success:
+            rollback = rollback_permissions()
         return {
-            "success": bool(syntax_final.get("ok")) and bool(syntax_all.get("ok")) and post.get("hard_blocker_count", 1) == 0,
-            "message": "Rechte-Reparatur abgeschlossen." if syntax_final.get("ok") and syntax_all.get("ok") else "Rechte-Reparatur geschrieben, aber Validierung meldet Fehler.",
+            "success": success,
+            "message": (
+                "Rechte-Reparatur abgeschlossen."
+                if success
+                else "Rechte-Reparatur validierte nicht und wurde automatisch zurückgerollt."
+            ),
             "steps": steps,
-            "backup": str(backup_path) if backup_path.exists() else None,
+            "backup": backup_snapshot.get("root"),
             "backup_snapshot": backup_snapshot,
             "wrapper_integrity": wrapper_endgate,
             "readiness": post,
+            "rollback": rollback,
             "rollback_plan": [
-                f"Backup zurueckspielen: {backup_path}",
-                f"visudo -cf {SUDOERS_FILE} ausfuehren",
+                "Gebundene Transaktions-Preimages atomar zurückspielen",
+                "visudo -cf /etc/sudoers ausführen",
                 "Freigabe-Check erneut starten",
             ],
         }
+    except Exception as exc:
+        rollback = rollback_permissions() if mutation_started else None
+        return {
+            "success": False,
+            "message": (
+                f"Rechte-Reparatur abgebrochen und automatisch zurückgerollt: {exc}"
+                if rollback and rollback.get("success")
+                else f"Rechte-Reparatur abgebrochen; Rücklauf unvollständig oder nicht erforderlich: {exc}"
+            ),
+            "steps": steps,
+            "backup_snapshot": locals().get("backup_snapshot"),
+            "rollback": rollback,
+            "readiness": readiness,
+        }
     finally:
-        try:
-            tmp_path.unlink()
-        except FileNotFoundError:
-            pass
+        if validation_tmp_path is not None:
+            validation_tmp_path.unlink(missing_ok=True)
 
 
 def load_job_file() -> dict[str, Any]:
@@ -3056,12 +3691,10 @@ def execute_job(job: dict[str, Any]) -> dict[str, Any]:
         return {
             "success": True,
             "write_actions_enabled": WRITE_ACTIONS_ENABLED,
-            "summary": "Dry-Run: Rechte-Reparatur würde Projektpfade prüfen und sudoers auf Wrapper-only bereinigen.",
+            "summary": "Dry-Run: Wrapper-/sudoers-Reparatur würde die commitgebundenen Wrapper und sudoers prüfen.",
             "would_change": bool(plan.get("would_change")),
             "planned_steps": [
-                "Webroot, ramdisk, logs und data auf Besitzer/Gruppe/Rechte prüfen",
-                "Installationsordner und Installer-Skripte auf www-data-Gruppe prüfen",
-                "sudoers-Wrapper für service_wrapper.sh und installer_wrapper.sh prüfen",
+                "Commitgebundene Wrapper für service_wrapper.sh und installer_wrapper.sh prüfen",
                 "Direkte systemctl-Freigaben aus der WebUI-sudoers entfernen",
                 "Ziel-sudoers mit visudo prüfen, bevor sie aktiv wird",
                 "Keine Änderung ohne explizite Freischaltung und separaten Reparatur-Job",

@@ -41,7 +41,7 @@ if (isset($_POST['save_lux_global'])) {
     if ($json !== false) e3dcWriteJsonAtomic($v4Path, $json);
     @unlink('/var/www/html/ramdisk/e3dc_config_cache.json');
 
-    if (file_exists('/.dockerenv')) {
+    if (e3dcIsDockerEnvironment()) {
         $python = getPythonInterpreter();
         $script = !empty($paths['valid'])
             ? rtrim($paths['install_path'], '/') . '/Installer/luxtronik/energy_manager.py'
@@ -94,7 +94,7 @@ $seite = $_GET['seite'] ?? 'live';
 if ($seite === 'charging') {
     $seite = !empty($wbEnabled) ? 'wallbox' : 'live';
 }
-$isDocker = file_exists('/.dockerenv');
+$isDocker = e3dcIsDockerEnvironment();
 
 $protectedPages = ['config', 'wallbox', 'waermepumpe'];
 if (in_array($seite, $protectedPages) && !isWebAuthenticated()) {
@@ -1335,7 +1335,7 @@ if (in_array($seite, $protectedPages) && !isWebAuthenticated()) {
             </button>
         </div>
 
-        <?php $energyManagerServiceExists = file_exists('/etc/systemd/system/energy_manager.service') || file_exists('/.dockerenv'); ?>
+        <?php $energyManagerServiceExists = file_exists('/etc/systemd/system/energy_manager.service') || e3dcIsDockerEnvironment(); ?>
         <?php if ($energyManagerServiceExists): ?>
             <div class="dashboard-card mb-3 p-3 d-flex align-items-center justify-content-between">
                 <div>

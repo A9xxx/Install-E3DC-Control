@@ -1,12 +1,12 @@
 # E3DC-Control Web-Portal & Installer
 
-Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.4.0a</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
+Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.4.0b</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
 
 ![E3DC-Control Dashboard](html/app-icon-512.png)
 
 ## Aktuelle Version und Update
 
-Die aktuelle stabile Version ist **5.4.0a**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur geprüften Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Einziger vorgesehener öffentlicher Rückfallstand ist der sanitierte Root **v5.3.2b**; der Übergang zwischen den nicht verwandten Historien erfolgt ausschließlich über den geprüften Installer-/Bootstrapweg.
+Die aktuelle stabile Version ist **5.4.0b**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur geprüften Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
 
 > [!WARNING]
 > **⚠️ Achtung: Nutzung auf eigenes Risiko!**
@@ -19,6 +19,8 @@ Die aktuelle stabile Version ist **5.4.0a**. Hinweise zum Web-, Konsolen- und Do
 > **Config-Schutz:** Standardinstallationen speichern `data/e3dc_v4.json` und lokale Config-Backups mit `660` für Install-User und `www-data`, damit WebUI und Dienste weiter automatisch starten, die Datei aber nicht mehr weltlesbar ist. Der normale Config-Download ist redigiert; der Raw-Download enthält Zugangsdaten und wird nur angeboten, wenn eine Web-PIN gesetzt ist. Der Kompatibilitätsmodus (`664`) ist nur für eigene externe Leser gedacht.
 
 > **Bedienansichten:** Config-Editor und Wallbox-Seite unterscheiden zwischen einfacher Ansicht für Einrichtung und täglichen Betrieb sowie erweiterter Ansicht für alle Detailparameter. Die Logik und Abgrenzung sind in [doc/Frontend_Ansichten.md](doc/Frontend_Ansichten.md) dokumentiert.
+
+> **Neu in 5.4.0b Stable:** Der Updater arbeitet auf PEP-668-Systemen ausschließlich im gebundenen Benutzer-venv und verweist Docker-Nutzer auf das Image-Update am Host. Systemd-Masken, Wrapper und sudoers werden transaktional behandelt. openWB Pro erkennt eine neue Stecksession entprellt, startet stromgeführt und nutzt den kurzen CP-Wake-up im Automatikmodus nur bei belegter Gerätefähigkeit und ausbleibender Ladeannahme. Der gemeinsame Zero-Budget-Vertrag hält oder stoppt alle Wallboxpfade konsistent. Unklare `POWER_SETTINGS`-SET-Antworten können nur durch einen exakt passenden GET-Readback bestätigt werden; temporäre Grenzen werden nicht als dauerhafte Ladefähigkeit geplant.
 
 > **Neu in 5.4.0a Stable:** Das Core-Update ist von optionalen Matter-Paketen getrennt, der Web-Updater erkennt und repariert eine reine CRLF-Beschädigung seines veröffentlichten Wrappers kontrolliert, und alte Shelly-EM-Zähler der ersten Generation können über ihre lokale read-only-Status-API eingebunden werden.
 
@@ -71,7 +73,7 @@ Die aktuelle stabile Version ist **5.4.0a**. Hinweise zum Web-, Konsolen- und Do
 ### 🔄 Auto-Update & Rollback
 * **Web-Updater:** Freigegebene Stable-Stände lassen sich über das Web-Dashboard (`index.php`) installieren. Der Browser zeigt den Installationsfortschritt; Fehler brechen den Vorgang ab und bleiben diagnostizierbar.
 * **Optionale Updateprüfung:** Das System kann nachts nach einem freigegebenen Stable-Stand suchen und den geprüften Installerweg starten.
-* **Policygebundener Rückfall:** Vor dem Update wird ein externes, manifestiertes und prüfsummengesichertes Backup verlangt. Ein Rückfall ist nur auf den in `UPDATE_POLICY.json` exakt gebundenen Stable-Rollback möglich und setzt ein lesbar validiertes Backup voraus.
+* **Umgebungsgebundener Rückfall:** Docker kann auf das in `UPDATE_POLICY.json` exakt gebundene Image `v5.3.2b` zurückgesetzt werden. Bare-Metal-Installationen bieten für diesen Altstand keinen Programm-Rückfall an; verifizierte Datei-Backups bleiben wiederherstellbar.
 
 ## 💬 Community & Support
 
@@ -162,7 +164,7 @@ Das Konsolenmenü ist bewusst klein gehalten:
 2) Systemstatus anzeigen
 3) Rechte prüfen & korrigieren
 4) Notfallmodus / System reparieren
-5) Policygebundener Stable-Rollback
+5) Policygebundener Programm-Rückfall (falls für Bare Metal freigegeben)
 6) Backup erstellen / verwalten
 7) Expertenmenü
 8) Systempakete vorbereiten
@@ -245,12 +247,16 @@ Das Docker-Image enthaelt den Anwendungscode. Das geklonte Repository liefert di
 
 ### Updates einspielen
 ```bash
-docker compose pull
-docker compose up -d --force-recreate
+docker compose config --images
+docker compose pull e3dc-control
+docker compose up -d --force-recreate e3dc-control
 ```
-> `docker compose pull` holt das aktuelle Release inklusive Python/PHP, Startskript
-> und Systempaketen. `--force-recreate` stellt sicher, dass der Container wirklich
-> aus dem neuen Image gestartet wird.
+> Die mitgelieferte Compose-Datei verwendet
+> `ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}`. Ohne Eintrag
+> folgt sie dem geprüften Stable-Tag `latest`. Ein fester Versions-Tag wechselt
+> bei `pull` absichtlich nicht; für einen bewussten Pin wird
+> `E3DC_IMAGE_TAG=v5.4.0b` in `.env` gesetzt. `config --images` zeigt vor dem
+> Pull das tatsächlich gewählte Image.
 
 > **Wichtig bei zusätzlichen Code-Volumes:** Ein lokales Verzeichnis unter
 > `/app/pi/Install` überschreibt den Release-Code aus dem Docker-Image. Für den

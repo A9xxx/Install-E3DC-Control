@@ -4168,6 +4168,13 @@ function startInstallerUpdate() {
     fetch(e3dcActionUrl('action=check_self_update&force=1&t=' + Date.now()))
         .then(r => e3dcParseJsonResponse(r, 'Web-UI Update-Check'))
         .then(data => {
+            if (data && data.docker) {
+                const message = data.message
+                    || 'Docker-Installation erkannt. Bitte das Container-Image auf dem Docker-Host aktualisieren.';
+                alert(message);
+                if (btn) { btn.innerHTML = origText; btn.disabled = false; }
+                return;
+            }
             const missing = Number(data && data.missing);
             let question = "Möchtest du das Web-Interface & Diagramm-Skripte aktualisieren?";
             if (data && data.success && Number.isFinite(missing) && missing <= 0) {
@@ -4356,6 +4363,11 @@ function startSystemUpdate(btnId = null) {
             btn.disabled = false;
         }
 
+        if (data && data.docker) {
+            alert(data.message || 'Docker-Installation erkannt. Bitte das Container-Image auf dem Docker-Host aktualisieren.');
+            return;
+        }
+
         let missing = data.missing || 0;
         let force = false;
         let proceed = false;
@@ -4412,6 +4424,11 @@ function startSystemUpdate(btnId = null) {
                 if (data.status === 'started' || data.status === 'running') {
                     log.innerText = "Update gestartet. Warte auf Ausgabe...\n";
                     pollUpdate(log, spinner, closeBtn, finishBtn);
+                } else if (data.status === 'docker') {
+                    log.innerText = data.message || 'Docker-Installation erkannt. Bitte das Container-Image auf dem Docker-Host aktualisieren.';
+                    spinner.classList.remove('fa-spin', 'fa-sync');
+                    spinner.classList.add('fa-info-circle', 'text-info');
+                    finishBtn.disabled = false;
                 } else {
                     log.innerText = "Fehler: " + (data.message || "Unbekannter Fehler");
                     finishBtn.disabled = false;
@@ -4597,10 +4614,17 @@ function openReleaseRollback() {
                 select.appendChild(opt);
             });
             if (!select.options.length) {
-                warning.innerText = 'Keine validierte Rückfallversion hinterlegt.';
+                if (envBadge && !data.docker) envBadge.innerText = 'Bare Metal: kein Programm-Rückfall';
+                warning.innerText = data.empty_message || 'Keine validierte Rückfallversion hinterlegt.';
                 preview.innerText = '';
+                select.disabled = true;
+                const runBtn = document.getElementById('rollback-run-btn');
+                const copyBtn = document.getElementById('rollback-copy-btn');
+                if (runBtn) runBtn.style.display = 'none';
+                if (copyBtn) copyBtn.style.display = 'none';
                 return;
             }
+            select.disabled = false;
             select.onchange = updateReleaseRollbackPreview;
             updateReleaseRollbackPreview();
         })

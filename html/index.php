@@ -47,7 +47,7 @@ if (isset($_POST['save_lux_global'])) {
     $val = isset($_POST['lux_active']) ? '1' : '0';
     saveE3dcConfigValue('luxtronik', $val);
 
-    if (file_exists('/.dockerenv')) {
+    if (e3dcIsDockerEnvironment()) {
         $python = getPythonInterpreter();
         $runtimePaths = getInstallPaths();
         $script = !empty($runtimePaths['valid'])
@@ -69,7 +69,7 @@ $seite = $_GET['seite'] ?? 'dashboard';
 if ($seite === 'charging') {
     $seite = !empty($wbEnabled) ? 'wallbox' : 'dashboard';
 }
-$isDocker = file_exists('/.dockerenv');
+$isDocker = e3dcIsDockerEnvironment();
 $nativeWallboxStatusEnabled = hasNativeWallboxStatusConfig($_c ?? []);
 $protectedPages = ['config', 'wallbox', 'waermepumpe', 'klima'];
 
@@ -4291,10 +4291,11 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                             cp_interrupt: 'CP-Unterbrechung',
                             restart_delay: 'Wiederanlauf-Wartezeit',
                             confirm_target: 'Zielphasen werden bestätigt',
-                            recovery_hold: 'sicherer Wiederanlauf nach Neustart',
+                            recovery_hold: 'Ausgangsbestätigung wird sicher geprüft',
                             fault: 'Störung'
                         };
-                        const transitionActive = Object.prototype.hasOwnProperty.call(transitionLabels, transitionStage);
+                        const transitionActive = transition.active === true
+                            && Object.prototype.hasOwnProperty.call(transitionLabels, transitionStage);
                         const stopS = parseInt(wb.openwb_pro_session_stop_remaining_s || 0, 10);
                         const startHoldS = parseInt(wb.openwb_pro_session_start_hold_remaining_s || 0, 10);
                         const wakeupS = parseInt(wb.openwb_pro_session_wakeup_remaining_s || 0, 10);

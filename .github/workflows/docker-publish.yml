@@ -9,10 +9,10 @@ on:
         type: choice
         options: [b1a-candidate, b1b-promote]
       release_tag:
-        description: "Exactly v5.3.2b, v5.4.0 or v5.4.0a"
+        description: "Exactly v5.3.2b, v5.4.0, v5.4.0a or v5.4.0b"
         required: true
         type: choice
-        options: [v5.3.2b, v5.4.0, v5.4.0a]
+        options: [v5.3.2b, v5.4.0, v5.4.0a, v5.4.0b]
       release_sha:
         description: "Approved 40-hex release commit"
         required: true
@@ -64,7 +64,7 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ inputs.release_sha }}
-          fetch-depth: 3
+          fetch-depth: 4
           fetch-tags: false
           persist-credentials: false
       - name: Validate exact release identity and topology
@@ -82,6 +82,7 @@ jobs:
           PHASE: ${{ inputs.phase }}
         run: |
           set -euo pipefail
+          [ "$GITHUB_REF" = "refs/heads/main" ]
           [[ "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$RELEASE_TREE" =~ ^[0-9a-f]{40}$ ]]
           [[ "$ROOT_SHA" =~ ^[0-9a-f]{40}$ ]]
@@ -108,6 +109,15 @@ jobs:
             [ "$(git rev-parse HEAD^^)" = "$ROOT_SHA" ]
             [ "$(git rev-parse HEAD^^^{tree})" = "$ROOT_TREE" ]
             [ "$(git rev-list --parents -n 1 "$ROOT_SHA" | awk '{print NF-1}')" -eq 0 ]
+          elif [ "$RELEASE_TAG" = "v5.4.0b" ]; then
+            [ "$(git rev-list --parents -n 1 HEAD | awk '{print NF-1}')" -eq 1 ]
+            [ "$(git rev-list --parents -n 1 HEAD^ | awk '{print NF-1}')" -eq 1 ]
+            [ "$(git rev-list --parents -n 1 HEAD^^ | awk '{print NF-1}')" -eq 1 ]
+            [ "$(git rev-parse HEAD^)" = "6e4660379c5fcc6849e6b76f49fc4bd727273aa5" ]
+            [ "$(git rev-parse HEAD^^)" = "59e5907d1b517cf04e60611ae6e7765c184b00f8" ]
+            [ "$(git rev-parse HEAD^^^)" = "$ROOT_SHA" ]
+            [ "$(git rev-parse HEAD^^^^{tree})" = "$ROOT_TREE" ]
+            [ "$(git rev-list --parents -n 1 "$ROOT_SHA" | awk '{print NF-1}')" -eq 0 ]
           else
             exit 1
           fi
@@ -127,14 +137,45 @@ jobs:
       contents: read
       packages: write
     steps:
-      - name: Checkout verifier from exact approved commit
+      - name: Checkout exact approved release source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ inputs.release_sha }}
+          path: release
           fetch-depth: 1
           persist-credentials: false
+      - name: Checkout verifier from workflow commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: verifier
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Bind release source and verifier
+        shell: bash
+        env:
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          [ "$GITHUB_REF" = "refs/heads/main" ]
+          [ "$(git -C release rev-parse HEAD)" = "$RELEASE_SHA" ]
+          [ "$(git -C verifier rev-parse HEAD)" = "$WORKFLOW_SHA" ]
       - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - name: Verify advertised rollback images
+        if: ${{ inputs.release_tag != 'v5.3.2b' }}
+        shell: bash
+        working-directory: release
+        run: |
+          set -euo pipefail
+          mapfile -t rollback_images < <(python3 -c 'import json; policy=json.load(open("UPDATE_POLICY.json", encoding="utf-8")); print("\n".join(str(item.get("docker_image") or "").strip() for item in policy.get("rollback_releases", []) if isinstance(item, dict) and item.get("docker_supported") is True))')
+          [ "${#rollback_images[@]}" -gt 0 ]
+          for image in "${rollback_images[@]}"; do
+            [[ "$image" =~ ^ghcr\.io/a9xxx/install-e3dc-control:v[0-9A-Za-z._-]+$ ]]
+            raw="$(docker buildx imagetools inspect --raw "$image")"
+            python3 -c 'import json, sys; data=json.load(sys.stdin); found={str(item.get("platform", {}).get("os"))+"/"+str(item.get("platform", {}).get("architecture")) for item in data.get("manifests", [])}; required={"linux/amd64", "linux/arm64"}; missing=sorted(required-found); assert not missing, "fehlende Plattformen: "+", ".join(missing)' <<<"$raw"
+          done
       - uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
           registry: ${{ env.REGISTRY }}
@@ -169,6 +210,7 @@ jobs:
           provenance: mode=max
       - name: Verify candidate before any stable tag exists
         shell: bash
+        working-directory: verifier
         run: |
           set -euo pipefail
           bash .github/scripts/verify-oci-release.sh \
@@ -186,13 +228,44 @@ jobs:
       contents: read
       packages: write
     steps:
-      - name: Checkout verifier from exact approved commit
+      - name: Checkout exact approved release source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ inputs.release_sha }}
+          path: release
           fetch-depth: 1
           persist-credentials: false
+      - name: Checkout verifier from workflow commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: verifier
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Bind release source and verifier
+        shell: bash
+        env:
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          [ "$GITHUB_REF" = "refs/heads/main" ]
+          [ "$(git -C release rev-parse HEAD)" = "$RELEASE_SHA" ]
+          [ "$(git -C verifier rev-parse HEAD)" = "$WORKFLOW_SHA" ]
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - name: Verify advertised rollback images
+        if: ${{ inputs.release_tag != 'v5.3.2b' }}
+        shell: bash
+        working-directory: release
+        run: |
+          set -euo pipefail
+          mapfile -t rollback_images < <(python3 -c 'import json; policy=json.load(open("UPDATE_POLICY.json", encoding="utf-8")); print("\n".join(str(item.get("docker_image") or "").strip() for item in policy.get("rollback_releases", []) if isinstance(item, dict) and item.get("docker_supported") is True))')
+          [ "${#rollback_images[@]}" -gt 0 ]
+          for image in "${rollback_images[@]}"; do
+            [[ "$image" =~ ^ghcr\.io/a9xxx/install-e3dc-control:v[0-9A-Za-z._-]+$ ]]
+            raw="$(docker buildx imagetools inspect --raw "$image")"
+            python3 -c 'import json, sys; data=json.load(sys.stdin); found={str(item.get("platform", {}).get("os"))+"/"+str(item.get("platform", {}).get("architecture")) for item in data.get("manifests", [])}; required={"linux/amd64", "linux/arm64"}; missing=sorted(required-found); assert not missing, "fehlende Plattformen: "+", ".join(missing)' <<<"$raw"
+          done
       - uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
           registry: ${{ env.REGISTRY }}
@@ -200,6 +273,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Reverify immutable candidate digest
         shell: bash
+        working-directory: verifier
         run: |
           set -euo pipefail
           bash .github/scripts/verify-oci-release.sh \
@@ -216,7 +290,7 @@ jobs:
           docker buildx imagetools create --tag "${image}:${{ inputs.release_tag }}" "${image}@${digest}"
           docker buildx imagetools create --tag "${image}:${{ needs.validate.outputs.version }}" "${image}@${digest}"
           [ "$(docker buildx imagetools inspect "${image}:${{ inputs.release_tag }}" | awk '$1 == "Digest:" {print $2; exit}')" = "$digest" ]
-          if [ "${{ inputs.release_tag }}" = "v5.4.0a" ]; then
+          if [ "${{ inputs.release_tag }}" = "v5.4.0b" ]; then
             docker buildx imagetools create --tag "${image}:latest" "${image}@${digest}"
             [ "$(docker buildx imagetools inspect "${image}:latest" | awk '$1 == "Digest:" {print $2; exit}')" = "$digest" ]
           fi

@@ -50,7 +50,7 @@ Erstelle in `$E3DC_DOCKER_PATH` eine Datei namens `docker-compose.yml` und kopie
 ```yaml
 services:
   e3dc-control:
-    image: ghcr.io/a9xxx/install-e3dc-control:latest
+    image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"
     container_name: e3dc-control
     restart: unless-stopped
     network_mode: "host"
@@ -99,13 +99,42 @@ Fertiges GitHub-Image aktualisieren:
 
 ```bash
 cd "$E3DC_DOCKER_PATH"
+sudo docker compose config --images
 sudo docker compose pull e3dc-control
 sudo docker compose up -d --force-recreate e3dc-control
 ```
 
+Ohne `E3DC_IMAGE_TAG` folgt diese Compose-Datei dem geprüften Stable-Tag
+`latest`. Ein fester Tag bleibt bei `pull` absichtlich unverändert. Für einen
+bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.0b` in der Datei `.env`
+gesetzt. `docker compose config --images` zeigt vorab das tatsächlich gewählte
+Image.
+
+Ältere Installationen können in ihrer `docker-compose.yml` noch einen Tag
+direkt in der `image:`-Zeile enthalten, zum Beispiel `v5.3.2b` oder
+`v5.4.0a`. Bei diesen Dateien hat `E3DC_IMAGE_TAG` noch keine Wirkung. Stelle
+die Zeile deshalb einmalig auf die variable Form um:
+
+```yaml
+image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"
+```
+
+Sichere die vorhandene Compose-Datei vorher und prüfe anschließend die
+tatsächlich aufgelöste Image-Adresse:
+
+```bash
+cp -a docker-compose.yml docker-compose.yml.before-image-variable
+sudo docker compose config --images
+```
+
+Erst wenn dort der gewünschte Tag erscheint, folgen `pull` und
+`up -d --force-recreate`. Ein eventuell bereits vorhandener Eintrag
+`E3DC_IMAGE_TAG=...` in `.env` bleibt dabei die maßgebliche bewusste
+Versionswahl.
+
 Gezielte Rückfallversion:
 
-Den Stable-Container `v5.4.0a` auf den veröffentlichten Rollback-Root
+Den Stable-Container `v5.4.0b` auf den veröffentlichten Rollback-Root
 `v5.3.2b` zurücksetzen:
 
 ```bash
@@ -113,10 +142,9 @@ TAG=v5.3.2b
 cd "$E3DC_DOCKER_PATH"
 sudo docker run --rm -v e3dc-docker_e3dc_data:/data -v "$PWD":/backup alpine \
   sh -lc 'tar czf "/backup/e3dc-data-$(date +%Y%m%d-%H%M%S).tgz" -C /data .'
-sudo cp docker-compose.yml "docker-compose.yml.before-$TAG"
-sudo sed -i -E "s#^([[:space:]]*)image: ghcr.io/a9xxx/install-e3dc-control:.*#\1image: ghcr.io/a9xxx/install-e3dc-control:$TAG#" docker-compose.yml
-sudo docker compose pull e3dc-control
-sudo docker compose up -d --force-recreate e3dc-control
+sudo env E3DC_IMAGE_TAG="$TAG" docker compose config --images
+sudo env E3DC_IMAGE_TAG="$TAG" docker compose pull e3dc-control
+sudo env E3DC_IMAGE_TAG="$TAG" docker compose up -d --force-recreate e3dc-control
 sudo docker compose ps
 sudo docker logs --tail=80 e3dc-control
 ```
@@ -125,6 +153,10 @@ Der Rückfall ist bewusst ein Host-Befehl: Der E3DC-Control-Container soll nicht
 den Docker-Daemon des Hosts steuern. Die Weboberfläche kann deshalb die
 passenden Befehle für den gewählten Tag anzeigen, aber sie führt sie im
 Docker-Betrieb nicht selbst aus.
+
+Für einen dauerhaft festgehaltenen Tag wird derselbe Wert zusätzlich als
+`E3DC_IMAGE_TAG=v5.3.2b` in einer vorhandenen `.env` ergänzt, ohne andere dort
+gespeicherte Werte zu überschreiben.
 
 Der Stand `v5.3.2b` ist selbst der Rollback-Root und verweist auf kein älteres
 öffentliches Image. Die Befehle sind daher für den Rückfall von einem späteren
@@ -302,13 +334,18 @@ uebernimmt nicht automatisch alle MQTT-Werte aus dem Broker.
 Manuell geht es jederzeit so:
 ```bash
 cd "$E3DC_DOCKER_PATH"
-sudo docker compose pull
-sudo docker compose up -d --force-recreate
+sudo docker compose config --images
+sudo docker compose pull e3dc-control
+sudo docker compose up -d --force-recreate e3dc-control
 ```
-`docker compose pull` aktualisiert Python/PHP-Code, Container-Startskript und Systempakete. `--force-recreate` stellt sicher, dass der Container wirklich aus dem neuen Image startet.
+`docker compose pull` aktualisiert Python/PHP-Code, Container-Startskript und
+Systempakete nur innerhalb des von `config --images` angezeigten Tags.
+`--force-recreate` stellt sicher, dass der Container wirklich aus dem neuen
+Image startet.
 
-Für den Rückfall eines späteren Stable-Images wird in der `docker-compose.yml`
-statt `latest` der von dessen Update-Policy freigegebene Release-Tag gesetzt.
+Für den Rückfall eines späteren Stable-Images wird `E3DC_IMAGE_TAG` einmalig
+vor die drei Compose-Befehle gesetzt oder für einen dauerhaften Pin in `.env`
+eingetragen. Die `docker-compose.yml` selbst muss dafür nicht verändert werden.
 Der einzige vorgesehene öffentliche Rollback-Root ist
 `ghcr.io/a9xxx/install-e3dc-control:v5.3.2b`; dieser Stand selbst verweist auf
 kein älteres Image. Danach dieselben Pull-/Up-Befehle ausführen. Das

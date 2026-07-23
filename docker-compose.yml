@@ -1,9 +1,9 @@
 services:
   e3dc-control:
-    image: ghcr.io/a9xxx/install-e3dc-control:v5.4.0a
-    # Rückfall auf ein stabiles Release:
-    # Gezielter Rollback-Root (nur nach Prüfung der jeweiligen Update-Policy):
-    # image: ghcr.io/a9xxx/install-e3dc-control:v5.3.2b
+    # Ohne E3DC_IMAGE_TAG folgt die Installation dem geprüften Stable-Tag
+    # "latest". Ein fester Pin oder Rückfall wird bewusst in .env gesetzt,
+    # zum Beispiel: E3DC_IMAGE_TAG=v5.4.0b
+    image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"
 
     # ZUM SELBST BAUEN: Obige Zeile auskommentieren und stattdessen:
     # build: .
@@ -28,6 +28,7 @@ services:
 
     environment:
       - TZ=Europe/Berlin
+      - E3DC_CONTAINER_MODE=1
       # Optional für NAS/Synology mit belegtem Port 80:
       # - E3DC_WEB_PORT=8085
       # Optional auf eine konkrete Host-IP/Schnittstelle binden:

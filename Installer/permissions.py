@@ -1718,6 +1718,7 @@ def check_wrapper_integrity():
     labels = {
         "missing": "fehlt und kann ausschließlich aus Git-HEAD wiederhergestellt werden",
         "crlf_only": "hat ausschließlich CRLF-Zeilenenden und kann atomar aus Git-HEAD repariert werden",
+        "mode_drift": "stimmt bytegenau mit Git-HEAD überein, ist aber nicht mit Modus 0755 ausführbar",
         "content_drift": "weicht inhaltlich von Git-HEAD ab; automatische Reparatur ist gesperrt",
         "symlink": "ist ein Symlink; automatische Reparatur ist gesperrt",
         "hardlink": "hat mehrere Hardlinks; automatische Reparatur ist gesperrt",
@@ -1852,7 +1853,7 @@ def fix_sudoers_permissions(issues):
                 from . import web_installer
 
             print("  -> Nutze zentrale Web-Installer-Rechte-Reparatur (Wrapper-only, mit Backup/visudo).")
-            result = web_installer.repair_permissions()
+            result = web_installer.repair_permissions(repair_runtime=False)
             for step in result.get("steps", []):
                 status = GREEN + "OK" + RESET if step.get("ok") else RED + "FEHLER" + RESET
                 label = step.get("step", "step")

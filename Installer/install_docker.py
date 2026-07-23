@@ -241,7 +241,9 @@ def install_docker_routine():
     # 4. docker-compose.yml generieren (inkl. Watchtower)
     compose_content = f"""services:
   e3dc-control:
-    image: ghcr.io/a9xxx/install-e3dc-control:latest
+    # Ohne E3DC_IMAGE_TAG folgt die Installation dem Stable-Tag "latest".
+    # Ein bewusster Versions-Pin wird in der nebenliegenden .env gesetzt.
+    image: "ghcr.io/a9xxx/install-e3dc-control:${{E3DC_IMAGE_TAG:-latest}}"
     container_name: e3dc-control
     restart: unless-stopped
     network_mode: host # Benötigt für stabile RSCP-Verbindung zum E3DC im LAN
@@ -252,6 +254,7 @@ def install_docker_routine():
       - /var/www/html/ramdisk:size=32M,uid=33,gid=33,mode=2775
     environment:
       - TZ=Europe/Berlin
+      - E3DC_CONTAINER_MODE=1
 
   watchtower:
     image: containrrr/watchtower

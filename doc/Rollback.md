@@ -1,9 +1,9 @@
 # Rollback
 
-Ein Rollback besteht aus zwei getrennten Teilen: Der Programmstand wird auf
-einen in `UPDATE_POLICY.json` freigegebenen Release-/Rollback-Tag gesetzt;
-persistente Betriebsdaten können aus einem manifestierten Sicherungspunkt
-wiederhergestellt werden.
+Ein Rollback besteht aus zwei getrennten Teilen: Ein Docker-Programmstand kann
+auf einen in `UPDATE_POLICY.json` für Docker freigegebenen Image-Tag gesetzt
+werden; persistente Betriebsdaten einer Bare-Metal-Installation können aus
+einem manifestierten Sicherungspunkt wiederhergestellt werden.
 
 Die Konsolenbeispiele verwenden den zuvor geprüften absoluten Produktpfad:
 
@@ -14,15 +14,17 @@ test -f "$E3DC_INSTALL_PATH/e3dc-setup"
 
 ## Programmstand zurücksetzen
 
-`v5.4.0a` darf ausschließlich den öffentlichen Rollback-Root `v5.3.2b`
-anbieten. Dieser Root enthält keinen älteren öffentlichen Tag.
+`v5.4.0b` bietet den öffentlichen Rollback-Root `v5.3.2b` ausschließlich als
+Docker-Image an. Dieser Root enthält keinen älteren öffentlichen Tag. Auf Bare
+Metal wird er nicht als Programm-Rückfall angeboten, weil ihm der
+zielgebundene Release-Finalizer des aktuellen Transaktionsvertrags fehlt.
 
 Freie Commit-Hashes und Zwischencommits sind keine Rückfallversionen. Sie
 können weder im Konsolenmenü noch über den Installer ausgeführt werden.
-Jeder angebotene Tag ist in der verifizierten HEAD-Policy an genau einen
-vollständigen Commit-SHA gebunden. Programm-Rollback, Update und Bootstrap
-verwenden denselben Backup-, Websync-, Migrations-, Boot-, HTTP-, Dienst- und
-HA-/Shadow-Prüfpfad. Der Legacy-Dienst `e3dc.service` wird nie neu gestartet.
+Jeder angebotene Docker-Tag ist in der verifizierten HEAD-Policy an genau einen
+vollständigen Commit-SHA und ein Image gebunden. Ein freier Bare-Metal-Checkout
+auf den Altstand ist kein unterstützter Rückweg. Der Legacy-Dienst
+`e3dc.service` wird nie neu gestartet.
 
 ## Betriebsdaten wiederherstellen
 

@@ -15,6 +15,20 @@ if (!defined('WEB_AUTH_FAILURE_WINDOW_S')) {
 }
 
 /**
+ * Erkennt den Containerkontext unabhängig von einem einzelnen Docker-Marker.
+ *
+ * Offizielle Images setzen E3DC_CONTAINER_MODE. /.dockerenv erhält die
+ * Kompatibilität zu älteren Docker-Installationen, ohne dafür Zugriff auf den
+ * Docker-Socket zu benötigen.
+ */
+function e3dcIsDockerEnvironment() {
+    if (is_file('/.dockerenv')) return true;
+
+    $explicit = strtolower(trim((string)(getenv('E3DC_CONTAINER_MODE') ?: '')));
+    return in_array($explicit, ['1', 'true', 'yes', 'docker'], true);
+}
+
+/**
  * Sendet HTTP-Header, die das Caching der PHP-Seite durch Browser und Proxies strikt verbieten.
  */
 function sendNoCacheHeaders() {
@@ -2677,26 +2691,41 @@ function e3dcReadUpdatePolicy() {
     return [];
 }
 
-function e3dcDockerReleaseCommandText($tag) {
-    $tag = e3dcNormalizeReleaseTag($tag);
-    if (!$tag) return '';
-    $image = 'ghcr.io/a9xxx/install-e3dc-control:' . $tag;
+function e3dcDockerHostUpdateCommandText() {
     return implode("\n", [
-        'TAG=' . $tag,
-        'cd "${E3DC_DOCKER_DIR:?E3DC_DOCKER_DIR auf den Compose-Pfad setzen}"',
-        'sudo docker run --rm -v "${E3DC_DATA_VOLUME:?E3DC_DATA_VOLUME auf das Datenvolume setzen}:/data" -v "$PWD":/backup alpine \\',
-        '  sh -lc \'tar czf "/backup/e3dc-data-$(date +%Y%m%d-%H%M%S).tgz" -C /data .\'',
-        'sudo cp docker-compose.yml "docker-compose.yml.before-$TAG"',
-        'sudo sed -i -E "s#^([[:space:]]*)image: ghcr.io/a9xxx/install-e3dc-control:.*#\1image: ' . $image . '#" docker-compose.yml',
-        'sudo docker compose pull e3dc-control',
-        'sudo docker compose up -d --force-recreate e3dc-control',
-        'sudo docker compose ps',
-        'sudo docker logs --tail=80 e3dc-control',
+        'docker compose config --images',
+        'docker compose pull e3dc-control',
+        'docker compose up -d --force-recreate e3dc-control',
     ]);
 }
 
-function e3dcBuildReleaseRollbackOptions() {
+function e3dcDockerHostUpdateMessage() {
+    return "Docker-Installation erkannt. Der Web-Updater führt im Container bewusst keinen Release-Wechsel aus.\n"
+         . "Bitte auf dem Docker-Host in das Verzeichnis Deiner vorhandenen Compose-Konfiguration wechseln und dort ausführen:\n\n"
+         . e3dcDockerHostUpdateCommandText();
+}
+
+function e3dcDockerReleaseCommandText($tag) {
+    $tag = e3dcNormalizeReleaseTag($tag);
+    if (!$tag) return '';
+    return implode("\n", [
+        'TAG=' . $tag,
+        'cd "${E3DC_DOCKER_PATH:?E3DC_DOCKER_PATH auf den Compose-Pfad setzen}"',
+        'BACKUP="e3dc-data-$(date +%Y%m%d-%H%M%S).tgz"',
+        'sudo docker compose exec -T e3dc-control tar czf - -C /var/www/html/data . > "$BACKUP"',
+        'test -s "$BACKUP"',
+        'sudo env E3DC_IMAGE_TAG="$TAG" docker compose config --images',
+        'sudo env E3DC_IMAGE_TAG="$TAG" docker compose pull e3dc-control',
+        'sudo env E3DC_IMAGE_TAG="$TAG" docker compose up -d --force-recreate e3dc-control',
+        'sudo docker compose ps',
+        'sudo docker logs --tail=80 e3dc-control',
+        '# Für einen dauerhaften Pin E3DC_IMAGE_TAG=' . $tag . ' in einer vorhandenen .env ergänzen.',
+    ]);
+}
+
+function e3dcBuildReleaseRollbackOptions($dockerEnvironment = null) {
     $policy = e3dcReadUpdatePolicy();
+    $isDocker = is_bool($dockerEnvironment) ? $dockerEnvironment : e3dcIsDockerEnvironment();
     $currentVersion = readInstalledVersion();
     if ($currentVersion === '' && !empty($policy['version'])) {
         $currentVersion = trim((string)$policy['version']);
@@ -2706,22 +2735,15 @@ function e3dcBuildReleaseRollbackOptions() {
 
     $rawReleases = $policy['rollback_releases'] ?? [];
     if (!is_array($rawReleases)) $rawReleases = [];
-    if (empty($rawReleases) && $stableTag) {
-        $rawReleases[] = [
-            'version' => e3dcReleaseVersionValue($stableTag),
-            'tag' => $stableTag,
-            'label' => $stableTag . ' Stable',
-            'release_date' => $policy['release_date'] ?? '',
-            'stable' => true,
-        ];
-    }
-
     $releases = [];
     $seen = [];
     foreach ($rawReleases as $entry) {
         if (!is_array($entry)) continue;
         $tag = e3dcNormalizeReleaseTag($entry['tag'] ?? ($entry['version'] ?? ''));
         if (!$tag || isset($seen[$tag])) continue;
+        $bareMetalSupported = (($entry['bare_metal_supported'] ?? null) === true);
+        $dockerSupported = (($entry['docker_supported'] ?? null) === true);
+        if (($isDocker && !$dockerSupported) || (!$isDocker && !$bareMetalSupported)) continue;
         $seen[$tag] = true;
         $version = e3dcReleaseVersionValue($entry['version'] ?? $tag);
         $isStable = !empty($entry['stable']) || ($stableTag && $tag === $stableTag);
@@ -2737,10 +2759,14 @@ function e3dcBuildReleaseRollbackOptions() {
             'stable' => $isStable,
             'current' => $isCurrent,
             'downgrade' => $isDowngrade,
+            'bare_metal_supported' => $bareMetalSupported,
+            'docker_supported' => $dockerSupported,
             'docker_image' => $image,
             'notes' => trim((string)($entry['notes'] ?? '')),
-            'docker_commands' => e3dcDockerReleaseCommandText($tag),
-            'bare_metal_summary' => "Backup, Dienststopp, git fetch --tags, Checkout auf $tag, Rechte-Reparatur und Gesundheitstest.",
+            'docker_commands' => $dockerSupported ? e3dcDockerReleaseCommandText($tag) : '',
+            'bare_metal_summary' => $bareMetalSupported
+                ? "Backup, Dienststopp, git fetch --tags, Checkout auf $tag, Rechte-Reparatur und Gesundheitstest."
+                : '',
         ];
     }
 
@@ -2750,9 +2776,12 @@ function e3dcBuildReleaseRollbackOptions() {
 
     return [
         'success' => true,
-        'docker' => file_exists('/.dockerenv'),
+        'docker' => $isDocker,
         'current_version' => $currentVersion,
         'stable_release' => $stableTag,
+        'empty_message' => $isDocker
+            ? 'Für Docker ist keine validierte Rückfallversion hinterlegt.'
+            : 'Für Bare Metal ist derzeit kein sicher finalisierbarer Programm-Rückfall freigegeben. Verifizierte Datei-Backups bleiben davon unberührt.',
         'releases' => $releases,
     ];
 }
@@ -2773,6 +2802,20 @@ function e3dcFindInstallerMainAndWrapper() {
         }
     }
     return null;
+}
+
+function e3dcResolveGitObjectId($repoDir, $objectSpec) {
+    $repoDir = (string)$repoDir;
+    $objectSpec = (string)$objectSpec;
+    if ($repoDir === '' || $objectSpec === '') return null;
+    $cmd = 'git -c ' . escapeshellarg('safe.directory=' . $repoDir)
+         . ' -C ' . escapeshellarg($repoDir)
+         . ' rev-parse --verify ' . escapeshellarg($objectSpec) . ' 2>/dev/null';
+    $lines = [];
+    $code = 1;
+    exec($cmd, $lines, $code);
+    $value = strtolower(trim(implode("\n", $lines)));
+    return ($code === 0 && preg_match('/^[0-9a-f]{40}$/', $value)) ? $value : null;
 }
 
 function e3dcInspectInstallerWrapper($wrapper) {
@@ -2810,21 +2853,69 @@ function e3dcInspectInstallerWrapper($wrapper) {
         return $result;
     }
 
+    $repoDir = realpath(dirname(dirname($wrapper)));
+    $wrapperParent = realpath(dirname($wrapper));
+    if ($repoDir === false || $wrapperParent === false
+        || $wrapperParent !== $repoDir . '/Installer'
+        || basename($wrapper) !== 'installer_wrapper.sh') {
+        $result['status'] = 'unbound_path';
+        $result['repairable'] = false;
+        return $result;
+    }
+    $head = e3dcResolveGitObjectId($repoDir, 'HEAD^{commit}');
+    $blob = $head ? e3dcResolveGitObjectId($repoDir, $head . ':Installer/installer_wrapper.sh') : null;
+    if ($head === null || $blob === null) {
+        $result['status'] = 'head_unbound';
+        $result['repairable'] = false;
+        return $result;
+    }
+    $result['head'] = $head;
+
     $handle = @fopen($wrapper, 'rb');
     if ($handle === false) {
         $result['status'] = 'not_readable';
         $result['repairable'] = false;
         return $result;
     }
-    $prefix = (string)@fread($handle, 64);
+    $openedBefore = @fstat($handle);
+    $actual = (string)@stream_get_contents($handle);
+    $openedAfter = @fstat($handle);
     @fclose($handle);
-    if (substr($prefix, 0, 13) === "#!/bin/bash\r\n") {
-        $result['status'] = 'crlf_shebang';
+    if (!is_array($openedBefore) || !is_array($openedAfter)
+        || ($openedBefore['dev'] ?? null) !== ($openedAfter['dev'] ?? null)
+        || ($openedBefore['ino'] ?? null) !== ($openedAfter['ino'] ?? null)
+        || ($openedBefore['size'] ?? null) !== ($openedAfter['size'] ?? null)
+        || ($openedBefore['mtime'] ?? null) !== ($openedAfter['mtime'] ?? null)
+        || (int)($openedBefore['nlink'] ?? 0) !== 1) {
+        $result['status'] = 'read_drift';
+        $result['repairable'] = false;
         return $result;
     }
-    if (substr($prefix, 0, 12) !== "#!/bin/bash\n") {
+
+    $actualBlob = sha1('blob ' . strlen($actual) . "\0" . $actual);
+    $result['actual_sha256'] = hash('sha256', $actual);
+    if (!hash_equals($blob, $actualBlob)) {
+        $normalized = str_replace("\r\n", "\n", $actual);
+        $normalizedBlob = sha1('blob ' . strlen($normalized) . "\0" . $normalized);
+        if (strpos($actual, "\r\n") !== false && hash_equals($blob, $normalizedBlob)) {
+            $result['status'] = 'crlf_shebang';
+            return $result;
+        }
+        $result['status'] = 'content_drift';
+        $result['repairable'] = false;
+        return $result;
+    }
+    if (($result['mode'] & 0777) !== 0755) {
+        $result['status'] = 'invalid_mode';
+        return $result;
+    }
+    if (substr($actual, 0, 12) !== "#!/bin/bash\n") {
         $result['status'] = 'invalid_shebang';
         $result['repairable'] = false;
+        return $result;
+    }
+    if (substr($actual, 0, 13) === "#!/bin/bash\r\n") {
+        $result['status'] = 'crlf_shebang';
         return $result;
     }
 
@@ -2844,6 +2935,11 @@ function e3dcInstallerWrapperIssueText($inspection) {
         'not_regular' => 'der Installer-Wrapper ist keine reguläre Datei',
         'not_readable' => 'der Installer-Wrapper ist für den Webserver nicht lesbar',
         'invalid_shebang' => 'der Installer-Wrapper hat eine ungültige Shebang oder unbekannte Zeilenenden',
+        'invalid_mode' => 'der Installer-Wrapper ist nicht mit dem freigegebenen Modus 0755 ausführbar',
+        'content_drift' => 'der Installer-Wrapper weicht inhaltlich vom gebundenen Git-HEAD ab',
+        'head_unbound' => 'der Installer-Wrapper konnte nicht an den lokalen Git-HEAD gebunden werden',
+        'unbound_path' => 'der Installer-Wrapper liegt nicht am gebundenen Release-Pfad',
+        'read_drift' => 'der Installer-Wrapper änderte sich während der Prüfung',
     ];
     return $messages[$status] ?? 'der Installer-Wrapper konnte nicht sicher geprüft werden';
 }
@@ -2926,7 +3022,7 @@ function handleReleaseRollback() {
             echo json_encode(['status' => 'error', 'message' => 'Rückfall erfordert Nutzerbestaetigung.']);
             exit;
         }
-        if (file_exists('/.dockerenv')) {
+        if (e3dcIsDockerEnvironment()) {
             echo json_encode([
                 'status' => 'docker',
                 'message' => 'Docker-Rückfall wird nicht im Container ausgefuehrt.',
@@ -3007,12 +3103,21 @@ function handleReleaseRollback() {
  */
 function handleUpdatePreparation() {
     if (isset($_GET['action']) && $_GET['action'] === 'prepare_update') {
+        header('Content-Type: application/json');
+        if (e3dcIsDockerEnvironment()) {
+            echo json_encode([
+                'success' => false,
+                'docker' => true,
+                'message' => e3dcDockerHostUpdateMessage(),
+                'commands' => e3dcDockerHostUpdateCommandText(),
+            ]);
+            exit;
+        }
         $force = isset($_GET['force']) && $_GET['force'] === 'true';
         $discard = isset($_GET['discard']) && $_GET['discard'] === 'true';
         $flagFile = '/var/www/html/ramdisk/e3dc_update_flags.json';
         file_put_contents($flagFile, json_encode(['force' => $force, 'discard' => $discard]));
         @chmod($flagFile, 0666);
-        header('Content-Type: application/json');
         echo json_encode(['success' => true]);
         exit;
     }
@@ -3078,8 +3183,15 @@ function handleUpdateCheck() {
         header('Content-Type: application/json');
 
         // Docker-Installationen werden über Image/Container-Updates aktualisiert.
-        if (file_exists('/.dockerenv')) {
-            echo json_encode(['success' => true, 'missing' => 0, 'skipped' => true, 'message' => 'Docker']);
+        if (e3dcIsDockerEnvironment()) {
+            echo json_encode([
+                'success' => true,
+                'missing' => 0,
+                'skipped' => true,
+                'docker' => true,
+                'message' => e3dcDockerHostUpdateMessage(),
+                'commands' => e3dcDockerHostUpdateCommandText(),
+            ]);
             exit;
         }
 
@@ -3148,8 +3260,15 @@ function handleSelfUpdateCheck() {
         header('Content-Type: application/json');
 
         // Docker: Updates erfolgen über Watchtower / Image Pull
-        if (file_exists('/.dockerenv')) {
-            echo json_encode(['success' => true, 'missing' => 0, 'skipped' => true, 'message' => 'Docker']);
+        if (e3dcIsDockerEnvironment()) {
+            echo json_encode([
+                'success' => true,
+                'missing' => 0,
+                'skipped' => true,
+                'docker' => true,
+                'message' => e3dcDockerHostUpdateMessage(),
+                'commands' => e3dcDockerHostUpdateCommandText(),
+            ]);
             exit;
         }
 
@@ -3251,6 +3370,16 @@ function handleRunSelfUpdate() {
     if (isset($_GET['action']) && $_GET['action'] === 'run_self_update') {
         requireWebAuth(true);
         header('Content-Type: application/json');
+
+        if (e3dcIsDockerEnvironment()) {
+            echo json_encode([
+                'success' => false,
+                'docker' => true,
+                'message' => e3dcDockerHostUpdateMessage(),
+                'commands' => e3dcDockerHostUpdateCommandText(),
+            ]);
+            exit;
+        }
 
         $paths = getInstallPaths();
         if (empty($paths['valid'])) {
@@ -4333,6 +4462,16 @@ function handleRunUpdate() {
         header('Pragma: no-cache');
         header('Expires: 0');
         header('Content-Type: application/json');
+        $mode = $_GET['mode'] ?? 'start';
+        if (e3dcIsDockerEnvironment()) {
+            echo json_encode([
+                'status' => 'docker',
+                'running' => false,
+                'message' => e3dcDockerHostUpdateMessage(),
+                'commands' => e3dcDockerHostUpdateCommandText(),
+            ]);
+            exit;
+        }
         $paths = getInstallPaths();
         if (empty($paths['valid'])) {
             echo json_encode(['status' => 'error', 'message' => $paths['error'] ?? 'Installationskontext fehlt.']);
@@ -4354,8 +4493,6 @@ function handleRunUpdate() {
         $logFile = '/var/www/html/logs/update.log';
         $pidFile = '/var/www/html/tmp/update.pid';
         $statusFile = '/var/www/html/tmp/update.status';
-        $mode = $_GET['mode'] ?? 'start';
-
         if ($mode === 'start') {
             if (file_exists($pidFile)) {
                 $pid = (int)trim(file_get_contents($pidFile));

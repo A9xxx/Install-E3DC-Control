@@ -33,7 +33,12 @@ from .installer_config import (
     ensure_web_config,
     get_install_path,
     get_install_user,
+    get_venv_path,
     load_config,
+)
+from .transition_context import (
+    venv_directory_chain_is_trusted,
+    venv_metadata_is_trusted,
 )
 from .logging_manager import get_or_create_logger, log_task_completed, log_error, log_warning
 from .config_secret_permissions import config_secret_dir_mode_text, config_secret_file_mode_text
@@ -87,12 +92,31 @@ APPROVED_APT_PACKAGES = frozenset({
     "python3-websockets", "nodejs", "npm", "avahi-daemon", "avahi-utils",
     "dbus", "rsync",
 })
+# Alte signierte Policies führen diese optionalen Pakete noch im Core-Block.
+# Sie bleiben prüfbar, werden aber ausschließlich vom Matter-Installer gesetzt.
+MATTER_ONLY_APT_PACKAGES = frozenset({
+    "nodejs", "npm", "avahi-daemon", "avahi-utils", "dbus",
+})
 APPROVED_PIP_PACKAGES = frozenset({
     "paho-mqtt", "requests", "hyundai_kia_connect_api", "websocket-client",
     "websockets", "pymodbus", "pywebpush", "pycryptodome",
 })
+MANAGED_VENV_APT_POLICY_KEY = "managed_venv_apt_packages"
+APPROVED_MANAGED_VENV_APT_PACKAGES = frozenset({"python3-venv"})
+MANAGED_VENV_PIP_POLICY_KEY = "managed_venv_pip_packages"
+VENV_PIP_POLICY_KEY = "venv_pip_packages"
+LEGACY_PIP_POLICY_KEY = "pip_packages"
 VALID_HA_ROLES = frozenset({"off", "master", "slave", "shadow"})
 HA_CONFIG_PATH = "/var/www/html/data/e3dc_v4.json"
+TARGET_FINALIZER_SUCCESS = "E3DC_RELEASE_TARGET_FINALIZER_OK"
+
+
+def _is_docker_environment() -> bool:
+    """Erkennt offizielle Images über Docker-Marker oder expliziten Modus."""
+    if Path("/.dockerenv").is_file():
+        return True
+    explicit = str(os.environ.get("E3DC_CONTAINER_MODE") or "").strip().lower()
+    return explicit in {"1", "true", "yes", "docker"}
 
 
 @dataclass(frozen=True)
@@ -120,8 +144,18 @@ class PackageTransactionState:
     apt_before: frozenset[str]
     pip_before: tuple[tuple[str, str], ...]
     venv_python: str | None
+    install_user: str
     apt_requested: tuple[str, ...]
     pip_requested: tuple[str, ...]
+    venv_path: str | None = None
+    venv_existed: bool = True
+
+
+def _transition_units_sha256(units) -> str:
+    """Bindet die vollständige, sortierte Unit-Ausgangsmenge ohne Pfadannahmen."""
+
+    payload = "\n".join(sorted(str(unit) for unit in units)).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _run_argv(argv, *, timeout: int = 30, env=None) -> dict:
@@ -988,7 +1022,7 @@ def _read_policy_from_commit(repo_dir: str, commit: str, install_user: str | Non
 
 
 def _rollback_release_map(repo_dir: str, *, head_commit: str | None = None, install_user: str | None = None) -> dict[str, str]:
-    """Return the current HEAD policy's unique tag -> exact SHA rollback map."""
+    """Liefert nur explizit für Bare Metal freigegebene Tag-zu-SHA-Bindungen."""
     user = install_user or get_install_user()
     commit = head_commit or _resolve_git_commit(repo_dir, "HEAD", user)
     if not commit:
@@ -997,6 +1031,7 @@ def _rollback_release_map(repo_dir: str, *, head_commit: str | None = None, inst
     explicit = policy.get("rollback_release_shas") or {}
     if not isinstance(explicit, dict):
         raise RuntimeError("rollback_release_shas muss ein Objekt sein")
+    declared: dict[str, str] = {}
     result: dict[str, str] = {}
     for item in policy.get("rollback_releases") or []:
         if not isinstance(item, dict):
@@ -1004,10 +1039,16 @@ def _rollback_release_map(repo_dir: str, *, head_commit: str | None = None, inst
         tag = _normalize_release_tag(str(item.get("tag") or item.get("version") or ""))
         raw_sha = item.get("commit_sha") or item.get("sha") or explicit.get(tag)
         sha = _validate_full_commit(str(raw_sha or ""))
-        if tag in result and result[tag] != sha:
+        bare_metal_supported = item.get("bare_metal_supported")
+        docker_supported = item.get("docker_supported")
+        if not isinstance(bare_metal_supported, bool) or not isinstance(docker_supported, bool):
+            raise RuntimeError(f"Rollback-Ziel {tag} besitzt keine eindeutige Umgebungsfreigabe")
+        if tag in declared and declared[tag] != sha:
             raise RuntimeError(f"Rollback-Tag ist mehrdeutig: {tag}")
-        result[tag] = sha
-    if set(explicit) - set(result):
+        declared[tag] = sha
+        if bare_metal_supported:
+            result[tag] = sha
+    if set(explicit) - set(declared):
         raise RuntimeError("rollback_release_shas enthaelt nicht deklarierte Tags")
     return result
 
@@ -1066,6 +1107,42 @@ def _validate_policy_packages(policy: dict, key: str, allowlist: frozenset[str])
             raise RuntimeError(f"Doppeltes Paket in {key}: {item}")
         packages.append(item)
     return packages
+
+
+def _validated_venv_pip_packages(policy: dict) -> list[str]:
+    """Liest den neuen Managed-Key und bleibt für alte Policies kompatibel."""
+    managed = _validate_policy_packages(
+        policy,
+        MANAGED_VENV_PIP_POLICY_KEY,
+        APPROVED_PIP_PACKAGES,
+    )
+    explicit = _validate_policy_packages(policy, VENV_PIP_POLICY_KEY, APPROVED_PIP_PACKAGES)
+    legacy = _validate_policy_packages(policy, LEGACY_PIP_POLICY_KEY, APPROVED_PIP_PACKAGES)
+    if managed:
+        if (explicit and explicit != managed) or (legacy and legacy != managed):
+            raise RuntimeError("Managed-venv- und Legacy-pip-Pakete widersprechen sich")
+        return managed
+    if explicit and legacy and explicit != legacy:
+        raise RuntimeError("venv_pip_packages und pip_packages widersprechen sich")
+    return explicit or legacy
+
+
+def _validated_core_apt_packages(policy: dict) -> list[str]:
+    """Hält optionale Matter-Abhängigkeiten aus dem Core-Update heraus."""
+    packages = _validate_policy_packages(policy, "apt_packages", APPROVED_APT_PACKAGES)
+    return [package for package in packages if package not in MATTER_ONLY_APT_PACKAGES]
+
+
+def _validated_release_apt_packages(policy: dict) -> list[str]:
+    """Verbindet alte Core-Pakete mit dem altupdater-neutralen venv-Bootstrap."""
+
+    core = _validated_core_apt_packages(policy)
+    managed = _validate_policy_packages(
+        policy,
+        MANAGED_VENV_APT_POLICY_KEY,
+        APPROVED_MANAGED_VENV_APT_PACKAGES,
+    )
+    return [*core, *(package for package in managed if package not in core)]
 
 
 def _verify_worktree_policy(repo_dir: str, verified_policy: dict) -> None:
@@ -1185,9 +1262,94 @@ def _validated_restart_services(policy: dict, state: TransitionState) -> list[st
     return normalized
 
 
-def _apply_verified_package_policy(policy: dict, install_user: str) -> None:
-    apt_packages = _validate_policy_packages(policy, "apt_packages", APPROVED_APT_PACKAGES)
-    pip_packages = _validate_policy_packages(policy, "pip_packages", APPROVED_PIP_PACKAGES)
+def _release_venv_path(install_user: str) -> str:
+    """Bindet den einzigen für einen Release-Bootstrap erlaubten venv-Pfad."""
+
+    user = str(install_user or "").strip()
+    try:
+        account = pwd.getpwnam(user)
+    except KeyError as exc:
+        raise RuntimeError("Installationsbenutzer für venv-Bootstrap fehlt") from exc
+    home_raw = Path(account.pw_dir)
+    if not home_raw.is_absolute() or home_raw.is_symlink() or not home_raw.is_dir():
+        raise RuntimeError("Home-Verzeichnis für venv-Bootstrap ist nicht eindeutig")
+    home = home_raw.resolve(strict=True)
+    if home != home_raw:
+        raise RuntimeError("Home-Verzeichnis für venv-Bootstrap enthält einen Alias")
+    home_info = home.stat()
+    if (
+        home_info.st_uid not in (0, account.pw_uid)
+        or home_info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        raise RuntimeError("Home-Verzeichnis für venv-Bootstrap ist nicht vertrauenswürdig")
+
+    config = load_config()
+    name = str(config.get("venv_name") or ".venv_e3dc").strip()
+    if (
+        not name
+        or name in {".", ".."}
+        or os.path.basename(name) != name
+        or "\x00" in name
+    ):
+        raise RuntimeError("venv-Name für Release-Bootstrap ist ungültig")
+    candidate = home / name
+    if candidate.parent != home:
+        raise RuntimeError("venv-Pfad liegt nicht direkt im Benutzer-Home")
+
+    # Bei einem fehlenden venv darf kein historisch konfigurierter Custom-Pfad
+    # still ignoriert und daneben ein zweites Environment angelegt werden.
+    # Vorhandene Custom-venvs werden ausschließlich von _find_venv_python()
+    # geprüft; diese Funktion bindet nur den Missing-Bootstrap.
+    configured_paths: list[tuple[str, object]] = [
+        ("Installer-Konfiguration", config.get("venv_path")),
+    ]
+    if os.path.lexists(HA_CONFIG_PATH):
+        web_config, _raw = _read_json_nofollow(HA_CONFIG_PATH)
+        configured_paths.append(("Web-Konfiguration", web_config.get("venv_path")))
+    for source, raw_path in configured_paths:
+        value = str(raw_path or "").strip()
+        if not value:
+            continue
+        configured = Path(value)
+        if not configured.is_absolute() or configured != candidate:
+            raise RuntimeError(
+                f"{source} bindet einen abweichenden venv-Pfad; Missing-Bootstrap stoppt"
+            )
+    return str(candidate)
+
+
+def _create_release_venv(install_user: str, expected_path: str) -> str:
+    """Erzeugt ein zuvor als fehlend gebundenes Benutzer-venv ohne System-pip."""
+
+    planned = _release_venv_path(install_user)
+    if os.path.abspath(str(expected_path or "")) != planned:
+        raise RuntimeError("Erwarteter venv-Pfad driftete vor der Erstellung")
+    if os.path.lexists(planned):
+        raise RuntimeError("Als fehlend gebundenes venv ist vor der Erstellung vorhanden")
+    result = _run_argv(
+        [
+            "sudo", "-H", "-u", str(install_user),
+            "python3", "-m", "venv", "--system-site-packages", planned,
+        ],
+        timeout=120,
+    )
+    if not result["success"]:
+        raise RuntimeError("Benutzer-venv konnte nicht erstellt werden: " + result["stderr"].strip())
+    venv_python = _find_venv_python(install_user)
+    if not venv_python or str(Path(venv_python).parent.parent) != planned:
+        raise RuntimeError("Neu erstelltes Benutzer-venv konnte nicht verifiziert werden")
+    return venv_python
+
+
+def _apply_verified_package_policy(
+    policy: dict,
+    install_user: str,
+    *,
+    expected_venv_state: str = "present",
+    expected_venv_path: str = "",
+) -> None:
+    apt_packages = _validated_release_apt_packages(policy)
+    pip_packages = _validated_venv_pip_packages(policy)
     git_repos = policy.get("git_repos") or []
     if git_repos:
         raise RuntimeError("Externe Git-Repositories sind im Release-Update nicht freigegeben")
@@ -1196,12 +1358,48 @@ def _apply_verified_package_policy(policy: dict, install_user: str) -> None:
         if not result["success"]:
             raise RuntimeError("apt-Installation fehlgeschlagen: " + result["stderr"].strip())
     if pip_packages:
-        venv_python = _find_venv_python()
-        if not venv_python:
+        if expected_venv_state not in {"present", "missing"}:
+            raise RuntimeError("Erwarteter venv-Ausgangszustand ist ungültig")
+        venv_python = _find_venv_python(install_user)
+        if expected_venv_state == "missing":
+            if venv_python:
+                raise RuntimeError("Als fehlend gebundenes venv ist vor Paketinstallation vorhanden")
+            if "python3-venv" not in apt_packages:
+                raise RuntimeError("Missing-venv-Bootstrap verlangt python3-venv in der Release-Policy")
+            venv_python = _create_release_venv(install_user, expected_venv_path)
+        elif not venv_python:
             raise RuntimeError("Python-Pakete angefordert, aber kein verifiziertes venv gefunden")
-        result = _run_argv([venv_python, "-m", "pip", "install", "--quiet", "--no-deps", "--", *pip_packages], timeout=180)
+        actual_venv_path = str(Path(venv_python).parent.parent)
+        if expected_venv_state == "present" and not expected_venv_path:
+            # Direkte interne Aufrufer dürfen einen bereits verifizierten
+            # Bestands-Pfad übernehmen. Der prozessübergreifende Finalizer
+            # liefert immer den zuvor gebundenen absoluten Pfad.
+            expected_venv_path = actual_venv_path
+        if os.path.abspath(str(expected_venv_path or "")) != actual_venv_path:
+            raise RuntimeError("Verifiziertes venv weicht vom gebundenen Paket-Preimage ab")
+        pip_argv = [
+            "sudo", "-H", "-u", str(install_user),
+            venv_python, "-m", "pip", "install", "--quiet",
+        ]
+        if expected_venv_state == "present":
+            # Ein bestehendes Installations-venv besitzt bereits seine
+            # transitive Laufzeitbasis. Beim Releasewechsel dürfen deshalb nur
+            # die policygebundenen Top-Level-Pakete verändert werden.
+            pip_argv.append("--no-deps")
+        else:
+            # Ein neu erzeugtes venv wäre mit reinen Top-Level-Wheels nicht
+            # lauffähig. Die dabei zusätzlich aufgelösten Abhängigkeiten werden
+            # vom Paket-Preimage vollständig erfasst und bei einem Rücklauf
+            # wieder entfernt.
+            pip_argv.append("--prefer-binary")
+        pip_argv.extend(["--", *pip_packages])
+        result = _run_argv(pip_argv, timeout=180)
         if not result["success"]:
-            raise RuntimeError("pip-Installation fehlgeschlagen: " + result["stderr"].strip())
+            package_names = ", ".join(pip_packages)
+            raise RuntimeError(
+                f"venv-pip-Installation fehlgeschlagen (Pakete: {package_names}): "
+                + result["stderr"].strip()
+            )
 
 
 def _installed_apt_packages() -> frozenset[str]:
@@ -1225,9 +1423,12 @@ def _normalize_python_package_name(value: str) -> str:
     return re.sub(r"[-_.]+", "-", str(value or "").strip().lower())
 
 
-def _installed_pip_packages(venv_python: str) -> dict[str, str]:
+def _installed_pip_packages(venv_python: str, install_user: str) -> dict[str, str]:
     result = _run_argv(
-        [venv_python, "-m", "pip", "list", "--format=json", "--disable-pip-version-check"],
+        [
+            "sudo", "-H", "-u", str(install_user),
+            venv_python, "-m", "pip", "list", "--format=json", "--disable-pip-version-check",
+        ],
         timeout=90,
     )
     if not result["success"]:
@@ -1250,26 +1451,106 @@ def _installed_pip_packages(venv_python: str) -> dict[str, str]:
     return installed
 
 
-def _capture_package_transaction(policy: dict) -> PackageTransactionState:
-    apt_requested = tuple(_validate_policy_packages(policy, "apt_packages", APPROVED_APT_PACKAGES))
-    pip_requested = tuple(_validate_policy_packages(policy, "pip_packages", APPROVED_PIP_PACKAGES))
+def _capture_package_transaction(
+    policy: dict,
+    install_user: str,
+    *,
+    allow_missing_venv: bool = False,
+) -> PackageTransactionState:
+    apt_requested = tuple(_validated_release_apt_packages(policy))
+    pip_requested = tuple(_validated_venv_pip_packages(policy))
     apt_before = _installed_apt_packages() if apt_requested else frozenset()
-    venv_python = _find_venv_python() if pip_requested else None
+    venv_python = _find_venv_python(install_user) if pip_requested else None
+    venv_existed = bool(venv_python)
+    venv_path = str(Path(venv_python).parent.parent) if venv_python else None
     if pip_requested and not venv_python:
-        raise RuntimeError("Python-Pakete angefordert, aber kein verifiziertes venv gefunden")
-    pip_before = _installed_pip_packages(venv_python) if venv_python else {}
+        if not allow_missing_venv:
+            raise RuntimeError("Python-Pakete angefordert, aber kein verifiziertes venv gefunden")
+        if "python3-venv" not in apt_requested:
+            raise RuntimeError("Missing-venv-Bootstrap verlangt python3-venv in der Release-Policy")
+        venv_path = _release_venv_path(install_user)
+        if os.path.lexists(venv_path):
+            raise RuntimeError("Fehlendes venv ist durch einen bestehenden Pfad blockiert")
+    pip_before = _installed_pip_packages(venv_python, install_user) if venv_python else {}
     return PackageTransactionState(
         apt_before=apt_before,
         pip_before=tuple(sorted(pip_before.items())),
         venv_python=venv_python,
+        install_user=str(install_user),
         apt_requested=apt_requested,
         pip_requested=pip_requested,
+        venv_path=venv_path,
+        venv_existed=venv_existed,
     )
+
+
+def _remove_transaction_created_venv(state: PackageTransactionState) -> None:
+    """Entfernt ausschließlich ein vor der Transaktion nachweislich fehlendes venv."""
+
+    if state.venv_existed or not state.venv_path:
+        return
+    expected = _release_venv_path(state.install_user)
+    path = os.path.abspath(state.venv_path)
+    if path != expected:
+        raise RuntimeError("Neu erzeugtes venv weicht vom gebundenen Rücklaufpfad ab")
+    if not os.path.lexists(path):
+        return
+    metadata = os.lstat(path)
+    try:
+        account = pwd.getpwnam(state.install_user)
+    except KeyError as exc:
+        raise RuntimeError("Installationsbenutzer für venv-Rücklauf fehlt") from exc
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid not in (0, account.pw_uid)
+        or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        or os.path.realpath(path) != path
+    ):
+        raise RuntimeError("Neu erzeugtes venv ist für sicheren Rücklauf nicht eindeutig")
+    shutil.rmtree(path)
+    if os.path.lexists(path):
+        raise RuntimeError("Neu erzeugtes venv blieb nach Rücklauf vorhanden")
 
 
 def _restore_package_transaction(state: PackageTransactionState) -> None:
     """Remove only packages introduced by this no-upgrade/no-deps transaction."""
 
+    if state.pip_requested:
+        if not state.venv_existed:
+            _remove_transaction_created_venv(state)
+        else:
+            if not state.venv_python:
+                raise RuntimeError("venv-Python fehlt fuer Paket-Ruecklauf")
+            before = dict(state.pip_before)
+            after = _installed_pip_packages(state.venv_python, state.install_user)
+            introduced = sorted(set(after) - set(before))
+            changed = sorted(name for name in set(after) & set(before) if after[name] != before[name])
+            if introduced:
+                result = _run_argv(
+                    [
+                        "sudo", "-H", "-u", state.install_user,
+                        state.venv_python, "-m", "pip", "uninstall", "--yes", "--",
+                        *introduced,
+                    ],
+                    timeout=180,
+                )
+                if not result["success"]:
+                    raise RuntimeError("Neu installierte venv-Pakete konnten nicht entfernt werden")
+            if changed:
+                pins = ["{}=={}".format(name, before[name]) for name in changed]
+                result = _run_argv(
+                    [
+                        "sudo", "-H", "-u", state.install_user,
+                        state.venv_python, "-m", "pip", "install", "--quiet", "--no-deps", "--",
+                        *pins,
+                    ],
+                    timeout=180,
+                )
+                if not result["success"]:
+                    raise RuntimeError("Geaenderte venv-Paketversionen konnten nicht restauriert werden")
+            if _installed_pip_packages(state.venv_python, state.install_user) != before:
+                raise RuntimeError("venv-Paketstand stimmt nach Ruecklauf nicht exakt")
     if state.apt_requested:
         apt_after = _installed_apt_packages()
         introduced = sorted(apt_after - state.apt_before)
@@ -1279,30 +1560,6 @@ def _restore_package_transaction(state: PackageTransactionState) -> None:
                 raise RuntimeError("Neu installierte apt-Pakete konnten nicht zurueckgerollt werden")
         if _installed_apt_packages() != state.apt_before:
             raise RuntimeError("apt-Paketstand stimmt nach Ruecklauf nicht exakt")
-    if state.pip_requested:
-        if not state.venv_python:
-            raise RuntimeError("venv-Python fehlt fuer Paket-Ruecklauf")
-        before = dict(state.pip_before)
-        after = _installed_pip_packages(state.venv_python)
-        introduced = sorted(set(after) - set(before))
-        changed = sorted(name for name in set(after) & set(before) if after[name] != before[name])
-        if introduced:
-            result = _run_argv(
-                [state.venv_python, "-m", "pip", "uninstall", "--yes", "--", *introduced],
-                timeout=180,
-            )
-            if not result["success"]:
-                raise RuntimeError("Neu installierte venv-Pakete konnten nicht entfernt werden")
-        if changed:
-            pins = ["{}=={}".format(name, before[name]) for name in changed]
-            result = _run_argv(
-                [state.venv_python, "-m", "pip", "install", "--quiet", "--no-deps", "--", *pins],
-                timeout=180,
-            )
-            if not result["success"]:
-                raise RuntimeError("Geaenderte venv-Paketversionen konnten nicht restauriert werden")
-        if _installed_pip_packages(state.venv_python) != before:
-            raise RuntimeError("venv-Paketstand stimmt nach Ruecklauf nicht exakt")
 
 
 def _release_version_tuple(version: str) -> tuple:
@@ -1876,7 +2133,13 @@ def _fetch_target_commit(repo_dir: str, install_user: str, target_tag: str | Non
     return commit
 
 
-def _validate_target_release(policy: dict, repo_dir: str, target_commit: str, target_tag: str | None, install_user: str) -> None:
+def _validate_target_release(
+    policy: dict,
+    repo_dir: str,
+    target_commit: str,
+    target_tag: str | None,
+    install_user: str,
+) -> str:
     version = _read_commit_text(repo_dir, target_commit, "VERSION", install_user).strip().lstrip("v")
     if not version or str(policy.get("version") or "").strip().lstrip("v") != version:
         raise RuntimeError("VERSION und verifizierte UPDATE_POLICY stimmen nicht ueberein")
@@ -1895,6 +2158,7 @@ def _validate_target_release(policy: dict, repo_dir: str, target_commit: str, ta
         stable_commit = _resolve_git_commit(repo_dir, storage_ref, install_user)
         if not stable_commit or not _exact_commit_matches(stable_commit, target_commit):
             raise RuntimeError("origin/main ist nicht exakt durch den Stable-Tag der Policy gebunden")
+    return stable
 
 
 def _assert_tree_no_symlinks(root: str) -> None:
@@ -1962,6 +2226,335 @@ def _restore_legacy_runtime_state(state: TransitionState) -> bool:
     return activity in {"inactive", "failed"}
 
 
+def _verify_bound_target_state(
+    state: TransitionState,
+    *,
+    expected_config_state: str,
+    expected_config_sha256: str,
+    expected_units_sha256: str,
+    expected_legacy_activity: str,
+) -> None:
+    """Beweist, dass Archiv- und Target-Prozess denselben Ausgangszustand sehen."""
+
+    if expected_config_state not in {"present", "missing"}:
+        raise RuntimeError("Ungültiger erwarteter Konfigurationszustand")
+    expected_missing = expected_config_state == "missing"
+    if bool(state.bootstrap_legacy_config) != expected_missing:
+        raise RuntimeError("Konfigurationszustand driftete zwischen Archiv und Target-Finalizer")
+    if not re.fullmatch(r"[0-9a-f]{64}", str(expected_config_sha256 or "")):
+        raise RuntimeError("Erwarteter Konfigurationshash ist ungültig")
+    if state.config_sha256 != expected_config_sha256:
+        raise RuntimeError("Konfiguration driftete zwischen Archiv und Target-Finalizer")
+    if not re.fullmatch(r"[0-9a-f]{64}", str(expected_units_sha256 or "")):
+        raise RuntimeError("Erwarteter Unit-Inventarhash ist ungültig")
+    if _transition_units_sha256(state.preinstalled_units) != expected_units_sha256:
+        raise RuntimeError("Unit-Inventar driftete zwischen Archiv und Target-Finalizer")
+    if expected_legacy_activity not in {"absent", "active", "inactive", "failed"}:
+        raise RuntimeError("Erwarteter Legacy-Betriebszustand ist ungültig")
+    if state.legacy_e3dc_activity != expected_legacy_activity:
+        raise RuntimeError("Legacy-Betriebszustand driftete zwischen Archiv und Target-Finalizer")
+
+
+def finalize_release_from_target(
+    *,
+    repo_dir: str,
+    target_commit: str,
+    target_tag: str,
+    expected_role: str,
+    expected_config_state: str,
+    expected_config_sha256: str,
+    expected_units_sha256: str,
+    expected_legacy_activity: str,
+    expected_venv_state: str,
+    expected_venv_path: str,
+    headless: bool = True,
+) -> None:
+    """Finalisiert einen Reset ausschließlich aus den geladenen Target-Dateien."""
+
+    target_root = _validate_bootstrap_install_path(repo_dir)
+    loaded_root = os.path.dirname(INSTALLER_DIR)
+    if os.path.realpath(loaded_root) != target_root or os.path.realpath(INSTALL_PATH) != target_root:
+        raise RuntimeError("Target-Finalizer wurde nicht aus dem gebundenen Zielbaum geladen")
+    commit = _validate_full_commit(target_commit)
+    tag = _normalize_release_tag(target_tag)
+    role = str(expected_role or "").strip().lower()
+    if role not in VALID_HA_ROLES:
+        raise RuntimeError("Erwartete HA-/Shadow-Rolle ist ungültig")
+
+    actual_commit = _resolve_git_commit(target_root, "HEAD", get_install_user())
+    if not actual_commit or not _exact_commit_matches(commit, actual_commit):
+        raise RuntimeError("Target-Finalizer sieht nicht den freigegebenen Ziel-Commit")
+
+    state = _capture_transition_state(
+        expected_role=role,
+        allow_missing_config=expected_config_state == "missing",
+    )
+    _verify_bound_target_state(
+        state,
+        expected_config_state=expected_config_state,
+        expected_config_sha256=expected_config_sha256,
+        expected_units_sha256=expected_units_sha256,
+        expected_legacy_activity=expected_legacy_activity,
+    )
+
+    install_user = get_install_user()
+    policy = _read_policy_from_commit(target_root, commit, install_user)
+    _validate_target_release(policy, target_root, commit, tag, install_user)
+    restart_services = _validated_restart_services(policy, state)
+    pip_packages = _validated_venv_pip_packages(policy)
+    if pip_packages:
+        if expected_venv_state not in {"present", "missing"}:
+            raise RuntimeError("Paket-Preimage besitzt keinen gültigen venv-Zustand")
+        if not os.path.isabs(str(expected_venv_path or "")):
+            raise RuntimeError("Paket-Preimage besitzt keinen absoluten venv-Pfad")
+    elif expected_venv_state != "unused" or expected_venv_path:
+        raise RuntimeError("venv-Preimage ist ohne Python-Paketpolicy unzulässig")
+
+    _secure_repo_permissions(target_root, install_user)
+    _verify_worktree_policy(target_root, policy)
+    _migrate_bootstrap_legacy_config(target_root, state)
+    _apply_verified_package_policy(
+        policy,
+        install_user,
+        expected_venv_state=expected_venv_state,
+        expected_venv_path=expected_venv_path,
+    )
+
+    delete_ok, delete_errors = _delete_approved_stale_paths(policy.get("delete_files") or [])
+    if not delete_ok:
+        raise RuntimeError("Stale-Delete-Positivliste verletzt: " + "; ".join(delete_errors))
+
+    _sync_release_web(target_root, policy)
+    if policy.get("run_permissions", True):
+        from .permissions import run_permissions_wizard
+        if run_permissions_wizard(headless=True) is False:
+            raise RuntimeError("Berechtigungsreparatur fehlgeschlagen")
+        _secure_repo_permissions(target_root, install_user)
+
+    from .permissions import ensure_private_ml_model_store, harden_web_program_permissions
+    if not ensure_private_ml_model_store():
+        raise RuntimeError("Privater ML-Modellspeicher konnte nicht sicher vorbereitet werden")
+    if not harden_web_program_permissions():
+        raise RuntimeError("Web-Programmrechte konnten nicht gehärtet werden")
+    if not _ensure_install_center_core_services():
+        raise RuntimeError("Kernservice-Installation ist unvollständig")
+    if not migrate_storage_manager_next_override():
+        raise RuntimeError("Storage-Service-Migration ist fehlgeschlagen")
+
+    _verify_transition_state(state)
+    if not _restart_v4_services(
+        headless=headless,
+        services=restart_services,
+        transition_state=state,
+    ):
+        raise RuntimeError("Erwartete Dienste konnten nicht vollständig gestartet werden")
+    if not _post_update_healthcheck(restart_services, transition_state=state):
+        _stop_v4_services(restart_services)
+        raise RuntimeError("Dienst-/HTTP-/HA-Gesundheitsgate fehlgeschlagen")
+
+    try:
+        from .boot_sanity import check_boot_sanity
+        boot_ok = check_boot_sanity(verbose=True)
+    except Exception as exc:
+        raise RuntimeError(f"Boot-Sanitycheck konnte nicht ausgeführt werden: {exc}") from exc
+    if not boot_ok:
+        _stop_v4_services(restart_services)
+        raise RuntimeError("Boot-Sanity-Gate fehlgeschlagen")
+
+    _verify_transition_state(state)
+    if expected_config_state == "present":
+        _config, raw = _read_json_nofollow(state.config_path)
+        if hashlib.sha256(raw).hexdigest() != expected_config_sha256:
+            raise RuntimeError("Betriebskonfiguration driftete während des Target-Finalizers")
+    run_initial_forecast(os.path.join(target_root, "Installer"))
+
+
+def _invoke_target_finalizer(
+    *,
+    repo_dir: str,
+    target_commit: str,
+    target_tag: str,
+    state: TransitionState,
+    package_transaction: PackageTransactionState,
+) -> None:
+    """Startet den SHA-gebundenen zweiten Prozess mit bereinigtem Importkontext."""
+
+    install_user = get_install_user()
+    bound_target_files = {
+        relative_path: _bind_target_file_to_commit(
+            repo_dir=repo_dir,
+            target_commit=target_commit,
+            relative_path=relative_path,
+            install_user=install_user,
+        )
+        for relative_path in (
+            "Installer/__init__.py",
+            "Installer/release_finalize.py",
+            "Installer/update.py",
+        )
+    }
+    finalizer = os.path.join(repo_dir, "Installer", "release_finalize.py")
+    python = str(sys.executable or "")
+    if not os.path.isabs(python) or not os.access(python, os.X_OK):
+        raise RuntimeError("Python-Interpreter des Archiv-Runners ist nicht eindeutig ausführbar")
+
+    environment = dict(os.environ)
+    for name in (
+        "E3DC_BOOTSTRAP_ROOT",
+        "E3DC_BOOTSTRAP_RUNNER_ROOT",
+        "E3DC_BOOTSTRAP_USER",
+        "E3DC_BOOTSTRAP_VENV",
+        "PYTHONHOME",
+        "PYTHONPATH",
+    ):
+        environment.pop(name, None)
+    environment["E3DC_INSTALL_ROOT"] = repo_dir
+    environment["PYTHONNOUSERSITE"] = "1"
+
+    for relative_path, expected_identity in bound_target_files.items():
+        current = os.lstat(os.path.join(repo_dir, relative_path))
+        if _file_identity(current) != expected_identity:
+            raise RuntimeError(f"Target-Modul wurde nach der Commit-Bindung ausgetauscht: {relative_path}")
+
+    config_state = "missing" if state.bootstrap_legacy_config else "present"
+    if not package_transaction.pip_requested:
+        venv_state = "unused"
+        venv_path = ""
+    else:
+        venv_state = "present" if package_transaction.venv_existed else "missing"
+        venv_path = str(package_transaction.venv_path or "")
+        if not os.path.isabs(venv_path):
+            raise RuntimeError("Paket-Preimage besitzt keinen absoluten venv-Pfad")
+    result = _run_argv(
+        [
+            python,
+            finalizer,
+            "--install-path", repo_dir,
+            "--expected-release-sha", target_commit,
+            "--expected-release-tag", target_tag,
+            "--expected-ha-role", state.ha_role,
+            "--expected-config-state", config_state,
+            "--expected-config-sha256", state.config_sha256,
+            "--expected-units-sha256", _transition_units_sha256(state.preinstalled_units),
+            "--expected-legacy-activity", state.legacy_e3dc_activity,
+            "--expected-venv-state", venv_state,
+            "--expected-venv-path", venv_path,
+        ],
+        timeout=900,
+        env=environment,
+    )
+    marker = f"{TARGET_FINALIZER_SUCCESS} {target_commit} {target_tag}"
+    lines = [line.strip() for line in result.get("stdout", "").splitlines()]
+    if not result.get("success") or lines.count(marker) != 1:
+        detail = (result.get("stderr") or result.get("stdout") or "kein Fehlertext").strip()
+        raise RuntimeError("Target-Finalizer fehlgeschlagen: " + detail[-2000:])
+
+
+def _file_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+    )
+
+
+def _read_bound_regular_file(path: str, maximum: int = 1024 * 1024) -> tuple[bytes, tuple[int, int, int, int, int]]:
+    descriptor, before = _open_regular_file_nofollow(path)
+    try:
+        if before.st_nlink != 1 or before.st_size < 1 or before.st_size > maximum:
+            raise RuntimeError("Target-Datei besitzt unzulässige Metadaten")
+        chunks = []
+        while True:
+            chunk = os.read(descriptor, 64 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        if _file_identity(after) != _file_identity(before):
+            raise RuntimeError("Target-Datei wurde während der Commit-Bindung verändert")
+    finally:
+        os.close(descriptor)
+    return b"".join(chunks), _file_identity(before)
+
+
+def _read_commit_blob(
+    repo_dir: str,
+    target_commit: str,
+    relative_path: str,
+    install_user: str,
+    maximum: int = 1024 * 1024,
+) -> bytes:
+    commit = _validate_full_commit(target_commit)
+    if relative_path.startswith("/") or ".." in Path(relative_path).parts:
+        raise RuntimeError("Target-Blobpfad ist nicht relativ und kanonisch")
+    size_result = _git_argv(
+        repo_dir,
+        install_user,
+        "cat-file",
+        "-s",
+        f"{commit}:{relative_path}",
+        timeout=15,
+    )
+    try:
+        expected_size = int(size_result["stdout"].strip()) if size_result["success"] else -1
+    except (TypeError, ValueError):
+        expected_size = -1
+    if expected_size < 1 or expected_size > maximum:
+        raise RuntimeError("Target-Blob fehlt oder besitzt eine unzulässige Größe")
+    try:
+        completed = subprocess.run(
+            [
+                "sudo", "-H", "-u", str(install_user),
+                "git", "-C", str(repo_dir),
+                "cat-file", "blob", f"{commit}:{relative_path}",
+            ],
+            capture_output=True,
+            text=False,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("Target-Blob konnte nicht gelesen werden") from exc
+    if completed.returncode != 0:
+        detail = (completed.stderr or b"").decode("utf-8", errors="replace").strip()
+        raise RuntimeError("Target-Blob fehlt im freigegebenen Commit: " + detail[-500:])
+    payload = bytes(completed.stdout or b"")
+    if len(payload) != expected_size:
+        raise RuntimeError("Target-Blobgröße driftete während des Lesens")
+    return payload
+
+
+def _bind_target_file_to_commit(
+    *,
+    repo_dir: str,
+    target_commit: str,
+    relative_path: str,
+    install_user: str,
+) -> tuple[int, int, int, int, int]:
+    target = os.path.join(os.path.abspath(repo_dir), relative_path)
+    payload, identity = _read_bound_regular_file(target)
+    metadata = os.lstat(target)
+    try:
+        account = pwd.getpwnam(str(install_user))
+    except KeyError as exc:
+        raise RuntimeError("Installationsbenutzer für Target-Bindung fehlt") from exc
+    if metadata.st_uid not in (0, account.pw_uid) or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise RuntimeError("Target-Datei besitzt keine vertrauenswürdigen Eigentümer-/Schreibrechte")
+    expected = _read_commit_blob(
+        repo_dir,
+        target_commit,
+        relative_path,
+        install_user,
+    )
+    if payload != expected:
+        raise RuntimeError("Target-Datei stimmt nicht bytegenau mit dem freigegebenen Commit überein")
+    if _file_identity(metadata) != identity:
+        raise RuntimeError("Target-Datei driftete nach der Commit-Bindung")
+    return identity
+
+
 def _recover_failed_transition(
     *,
     repo_dir: str,
@@ -1993,9 +2586,11 @@ def _recover_failed_transition(
         )
         restore_verified_backup(backup_dir, install_path=repo_dir)
         _restore_recovery_surface(recovery_inventory, state)
-        from .permissions import harden_web_program_permissions
-        if not harden_web_program_permissions():
-            raise RuntimeError("Web-Programmrechte konnten nach Recovery nicht gehaertet werden")
+        # Recovery installiert keine Units aus dem temporären Archivbaum. Die
+        # verifizierte Sicherung stellt die alten Unitdateien wieder her; hier
+        # werden ausschließlich Web- und Repo-Rechte am Zielbaum gehärtet.
+        if not _fix_webroot_permissions():
+            raise RuntimeError("Web-Programmrechte konnten nach Recovery nicht gehärtet werden")
         _secure_repo_permissions(repo_dir, install_user)
         _verify_transition_state(
             state,
@@ -2036,8 +2631,11 @@ def update_e3dc(
     expected_ha_role: str | None = None,
 ):
     """Transactional stable update, SHA-bound rollback, or unrelated-history bootstrap."""
-    if os.path.exists("/.dockerenv"):
-        print("[i] Docker-Umgebung: Updates erfolgen ausschliesslich ueber verifizierte Images.")
+    if _is_docker_environment():
+        print("[i] Docker-Umgebung erkannt: Im Container wird kein Release-Wechsel ausgeführt.")
+        print("    Bitte auf dem Docker-Host im Compose-Verzeichnis ausführen:")
+        print("    docker compose pull")
+        print("    docker compose up -d --force-recreate")
         return True
 
     try:
@@ -2161,9 +2759,23 @@ def update_e3dc(
             raise RuntimeError("Release-Tag ist nicht durch exakte Policy-/SHA-Bindung autorisiert")
 
         policy = _read_policy_from_commit(repo_dir, target_commit, install_user)
-        _validate_target_release(policy, repo_dir, target_commit, target_tag, install_user)
-        restart_services = _validated_restart_services(policy, state)
-        package_transaction = _capture_package_transaction(policy)
+        bound_target_tag = _validate_target_release(
+            policy,
+            repo_dir,
+            target_commit,
+            target_tag,
+            install_user,
+        )
+        _validated_restart_services(policy, state)
+        package_transaction = _capture_package_transaction(
+            policy,
+            install_user,
+            # Auch ein normaler Self-Update darf einen wirklich fehlenden,
+            # policygebundenen Benutzer-venv erstmals erzeugen. Capture
+            # erlaubt dies nur bei freigegebenem python3-venv und exakt
+            # absentem kanonischem Zielpfad; jeder belegte Fremdpfad stoppt.
+            allow_missing_venv=True,
+        )
 
         reset = _git_argv(repo_dir, install_user, "reset", "--hard", target_commit, timeout=120)
         if not reset["success"]:
@@ -2172,56 +2784,14 @@ def update_e3dc(
         if not new_commit or not _exact_commit_matches(target_commit, new_commit):
             raise RuntimeError("HEAD stimmt nicht exakt mit dem freigegebenen Ziel-SHA ueberein")
 
-        _secure_repo_permissions(repo_dir, install_user)
-        _verify_worktree_policy(repo_dir, policy)
-        _migrate_bootstrap_legacy_config(repo_dir, state)
         packages_mutated = True
-        _apply_verified_package_policy(policy, install_user)
-
-        delete_ok, delete_errors = _delete_approved_stale_paths(policy.get("delete_files") or [])
-        if not delete_ok:
-            raise RuntimeError("Stale-Delete-Positivliste verletzt: " + "; ".join(delete_errors))
-
-        _sync_release_web(repo_dir, policy)
-
-        if policy.get("run_permissions", True):
-            from .permissions import run_permissions_wizard
-            if run_permissions_wizard(headless=True) is False:
-                raise RuntimeError("Berechtigungsreparatur fehlgeschlagen")
-            _secure_repo_permissions(repo_dir, install_user)
-        from .permissions import ensure_private_ml_model_store, harden_web_program_permissions
-        if not ensure_private_ml_model_store():
-            raise RuntimeError("Privater ML-Modellspeicher konnte nicht sicher vorbereitet werden")
-        if not harden_web_program_permissions():
-            raise RuntimeError("Web-Programmrechte konnten nicht gehaertet werden")
-
-        if not _ensure_install_center_core_services():
-            raise RuntimeError("Kernservice-Installation ist unvollstaendig")
-        if not migrate_storage_manager_next_override():
-            raise RuntimeError("Storage-Service-Migration ist fehlgeschlagen")
-
-        _verify_transition_state(state)
-        if not _restart_v4_services(
-            headless=headless,
-            services=restart_services,
-            transition_state=state,
-        ):
-            raise RuntimeError("Erwartete Dienste konnten nicht vollstaendig gestartet werden")
-        if not _post_update_healthcheck(restart_services, transition_state=state):
-            _stop_v4_services(restart_services)
-            raise RuntimeError("Dienst-/HTTP-/HA-Gesundheitsgate fehlgeschlagen")
-
-        try:
-            from .boot_sanity import check_boot_sanity
-            boot_ok = check_boot_sanity(verbose=True)
-        except Exception as exc:
-            raise RuntimeError(f"Boot-Sanitycheck konnte nicht ausgefuehrt werden: {exc}") from exc
-        if not boot_ok:
-            _stop_v4_services(restart_services)
-            raise RuntimeError("Boot-Sanity-Gate fehlgeschlagen")
-
-        _verify_transition_state(state)
-        run_initial_forecast(os.path.join(repo_dir, "Installer"))
+        _invoke_target_finalizer(
+            repo_dir=repo_dir,
+            target_commit=target_commit,
+            target_tag=bound_target_tag,
+            state=state,
+            package_transaction=package_transaction,
+        )
     except Exception as exc:
         print(f"[!] {transition_name} fehlgeschlagen: {exc}")
         update_logger.error(f"{transition_name} fehlgeschlagen: {exc}")
@@ -2272,14 +2842,94 @@ def update_e3dc(
     return True
 
 
-def _find_venv_python() -> str | None:
-    """Return only the absolute interpreter already running this updater."""
-    candidate = str(sys.executable or "")
-    if not os.path.isabs(candidate):
+def _find_venv_python(install_user: str | None = None) -> str | None:
+    """Liefert nur einen nachweislich aktiven Interpreter des Benutzer-venv."""
+    try:
+        user = str(install_user or get_install_user()).strip()
+        account = pwd.getpwnam(user)
+        raw_home = Path(account.pw_dir)
+        if not raw_home.is_absolute() or raw_home.is_symlink():
+            return None
+        home = raw_home.resolve(strict=True)
+        if home != raw_home or not venv_metadata_is_trusted(
+            home,
+            account,
+            kind="directory",
+        ):
+            return None
+        raw_venv = Path(get_venv_path(user))
+        if not raw_venv.is_absolute() or raw_venv.is_symlink() or not raw_venv.is_dir():
+            return None
+        venv = raw_venv.resolve(strict=True)
+        if venv != raw_venv:
+            return None
+        if os.path.commonpath((str(home), str(venv))) != str(home):
+            return None
+        if not venv_directory_chain_is_trusted(home, venv, account):
+            return None
+
+        marker = venv / "pyvenv.cfg"
+        if not venv_metadata_is_trusted(
+            marker,
+            account,
+            kind="regular",
+            single_link=True,
+        ):
+            return None
+
+        bin_dir = venv / "bin"
+        if not venv_directory_chain_is_trusted(venv, bin_dir, account):
+            return None
+
+        candidate = bin_dir / "python3"
+        link_info = candidate.lstat()
+        target = candidate.resolve(strict=True)
+        if not (stat.S_ISLNK(link_info.st_mode) or stat.S_ISREG(link_info.st_mode)):
+            return None
+        if link_info.st_uid not in (0, account.pw_uid):
+            return None
+        if not venv_metadata_is_trusted(target, account, kind="regular"):
+            return None
+        if not os.access(candidate, os.X_OK):
+            return None
+
+        probe = _run_argv(
+            [
+                "sudo", "-H", "-u", user,
+                str(candidate),
+                "-c",
+                (
+                    "import json,os,sys,sysconfig; import pip; "
+                    "print(json.dumps({'prefix':sys.prefix,'base_prefix':sys.base_prefix,"
+                    "'executable':sys.executable,'purelib':sysconfig.get_paths()['purelib'],"
+                    "'purelib_writable':os.access(sysconfig.get_paths()['purelib'],os.W_OK),"
+                    "'bin_writable':os.access(os.path.dirname(sys.executable),os.W_OK)},sort_keys=True))"
+                ),
+            ],
+            timeout=15,
+        )
+        if not probe["success"]:
+            return None
+        payload = json.loads(probe["stdout"].strip())
+        if os.path.realpath(str(payload.get("prefix") or "")) != str(venv):
+            return None
+        if os.path.realpath(str(payload.get("base_prefix") or "")) == str(venv):
+            return None
+        if os.path.abspath(str(payload.get("executable") or "")) != str(candidate):
+            return None
+        raw_purelib = Path(str(payload.get("purelib") or ""))
+        if not raw_purelib.is_absolute() or raw_purelib.is_symlink():
+            return None
+        purelib = raw_purelib.resolve(strict=True)
+        if purelib != raw_purelib or os.path.commonpath((str(venv), str(purelib))) != str(venv):
+            return None
+        if not venv_directory_chain_is_trusted(venv, purelib, account):
+            return None
+        if payload.get("purelib_writable") is not True or payload.get("bin_writable") is not True:
+            return None
+        return str(candidate)
+    except (OSError, KeyError, TypeError, ValueError, RuntimeError, json.JSONDecodeError):
         return None
-    if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-        return candidate
-    return None
 
 
 def run_initial_forecast(installer_dir: str | None = None):
@@ -2301,7 +2951,7 @@ def run_initial_forecast(installer_dir: str | None = None):
       - Ein Legacy-Pickle wird niemals geladen oder übernommen.
     """
     # In Docker: kein direkter Script-Aufruf noetig (Service startet selbst)
-    if os.path.exists('/.dockerenv'):
+    if _is_docker_environment():
         print('[i] Docker: Forecast-Init wird vom Container-Daemon uebernommen.')
         return
 
@@ -2403,5 +3053,5 @@ def update_menu():
 
 
 # Im Docker-Container kein Update-Menueintrag
-if not os.path.exists('/.dockerenv'):
+if not _is_docker_environment():
     register_command('11', 'Installation / Update', update_menu, sort_order=11)

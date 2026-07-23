@@ -3,7 +3,6 @@ import shlex
 import tempfile
 import time
 
-from .core import register_command
 from .utils import (
     MATTER_SYSTEM_PACKAGES,
     command_exists,
@@ -143,6 +142,3 @@ WantedBy=multi-user.target
             os.unlink(tmp_path)
 
     return True
-
-# Untergruppe für Smart Home / Matter
-register_command("45", "Smart Home Matter Bridge", install_matter_bridge, sort_order=45)

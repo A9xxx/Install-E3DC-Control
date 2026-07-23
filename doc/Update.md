@@ -29,6 +29,17 @@ bash "$E3DC_INSTALL_PATH/e3dc-setup" --fix-permissions
 bash "$E3DC_INSTALL_PATH/e3dc-setup" --check
 ```
 
+Python-Abhängigkeiten werden bei einem Release-Wechsel ausschließlich im
+gebundenen Benutzer-venv installiert. Auf Debian-Systemen mit PEP 668 wird
+deshalb kein System-`pip` und kein `--break-system-packages` verwendet. Fehlt
+das Standard-venv, darf der Installer nach Installation von `python3-venv`
+genau dieses venv im Home des Installationsbenutzers neu anlegen. Abweichende
+oder mehrdeutige venv-Pfade brechen den Updatevorgang ab.
+
+In einer Docker-Installation führen weder Weboberfläche noch Konsole einen
+Release-Wechsel im laufenden Container aus. Sie zeigen stattdessen die drei
+Host-Befehle aus dem Abschnitt [Docker-Update](#docker-update).
+
 ## Einmaliger Wechsel von alten Installationen
 
 Der Bootstrap gilt auch für V4.0.1 bis V4.0.5 sowie für V3-/ZIP-Stände ohne
@@ -61,15 +72,18 @@ keinen gemeinsamen Vorfahren mit dem neuen Verlauf besitzen.
 
 Der Installer führt den Wechsel in dieser Reihenfolge aus:
 
-1. externes Backup mit vollständigem Manifest und SHA-256 erstellen;
+1. externes Backup mit vollständigem Manifest, SHA-256 und dem Zustand
+   kanonischer systemd-Masken erstellen;
 2. alle katalogisierten Writer-/Integrationsdienste und den Watchdog stoppen;
 3. annotierten Ziel-Tag und vollständigen Ziel-SHA gegen manuelle Freigabe
    beziehungsweise die Rollback-Policy binden;
 4. `UPDATE_POLICY.json` direkt aus dem verifizierten Commit-Objekt lesen;
 5. den Installationsbaum auf genau diesen SHA setzen und `HEAD` erneut prüfen;
-6. Webdateien synchronisieren und veraltete Pfade nur über feste Positivlisten
+6. einen eigenen Target-Finalizer aus dem verifizierten Zielbaum gegen
+   Ziel-SHA, Ziel-Tag und gebundene Ausgangsdaten prüfen und starten;
+7. Webdateien synchronisieren und veraltete Pfade nur über feste Positivlisten
    entfernen;
-7. eingefrorene HA-/Shadow-Rolle und Feature-Konfiguration, alle erwarteten
+8. eingefrorene HA-/Shadow-Rolle und Feature-Konfiguration, alle erwarteten
    Dienste, lokale HTTP-Endpunkte und Boot-Sanity hart prüfen.
 
 Scheitert ein Gate nach einer Änderung, setzt der Installer den alten Git-Stand
@@ -80,22 +94,35 @@ Writer-/Aktor-Dienste gestoppt.
 
 ## Gezielter Rückfall
 
-`v5.4.0a` bietet als einzigen öffentlichen Rollback den bereinigten Root
-`v5.3.2b` an. Dieser Root gibt selbst keinen älteren öffentlichen Tag frei.
-Freie Commit-Hashes sind keine Rückfallversionen; der angebotene Tag ist in der
-Policy an genau einen SHA gebunden. Weitere öffentliche Rückfall-Tags werden
-nicht angeboten.
+`v5.4.0b` bietet den bereinigten Root `v5.3.2b` ausschließlich als
+Docker-Rückfall-Image an. Dieser Root gibt selbst keinen älteren öffentlichen
+Tag frei. Auf Bare Metal wird `v5.3.2b` nicht als Programm-Rückfall angeboten,
+weil der Altstand keinen zielgebundenen Release-Finalizer enthält. Freie
+Commit-Hashes oder ein manueller Checkout sind kein Ersatz; dort bleibt die
+Wiederherstellung eines verifizierten Datei-Backups der sichere Rückweg.
 
 ## Docker-Update
 
 ```bash
 export E3DC_DOCKER_PATH="/absoluter/pfad/zur/docker-installation"
 cd "$E3DC_DOCKER_PATH"
-docker compose pull
-docker compose up -d --force-recreate
+docker compose config --images
+docker compose pull e3dc-control
+docker compose up -d --force-recreate e3dc-control
 docker compose ps
 ```
 
-Ein Docker-Rückfall verwendet ausschließlich einen freigegebenen Image-Tag
-beziehungsweise den verifizierten Digest. Der Container steuert den Host-Docker
-nicht selbst.
+Der Web-Updater erkennt den Containerkontext auch über den Marker des
+offiziellen Images und zeigt diese Befehle an. Er benötigt keinen Zugriff auf
+den Docker-Socket und versucht bewusst nicht, den eigenen Container zu
+ersetzen.
+
+Die mitgelieferte Compose-Datei verwendet standardmäßig
+`ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}`. Ein in der
+Compose-Datei oder über `.env` fest eingestellter Versions-Tag bleibt bei
+`pull` unverändert. `docker compose config --images` muss deshalb vor dem
+Update den gewünschten Stable-Tag oder `latest` anzeigen.
+
+Ein Docker-Rückfall verwendet ausschließlich einen Eintrag mit
+`docker_supported: true`, dessen freigegebenen Image-Tag beziehungsweise den
+verifizierten Digest. Der Container steuert den Host-Docker nicht selbst.

@@ -44,7 +44,10 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 }
 
 if [ "$(id -u)" -eq 0 ]; then
-    exec "$PYTHON" "$SCRIPT_DIR/installer_main.py" \
+    exec env \
+        E3DC_BOOTSTRAP_ROOT="$TARGET" \
+        E3DC_BOOTSTRAP_RUNNER_ROOT="$SCRIPT_DIR" \
+        "$PYTHON" "$SCRIPT_DIR/installer_main.py" \
         --unattended \
         --install-release-tag "$TAG" \
         --bootstrap-install-path "$TARGET" \
@@ -52,10 +55,12 @@ if [ "$(id -u)" -eq 0 ]; then
         --expected-ha-role "$EXPECTED_ROLE"
 fi
 
-exec sudo -- "$PYTHON" "$SCRIPT_DIR/installer_main.py" \
+exec sudo -- env \
+    E3DC_BOOTSTRAP_ROOT="$TARGET" \
+    E3DC_BOOTSTRAP_RUNNER_ROOT="$SCRIPT_DIR" \
+    "$PYTHON" "$SCRIPT_DIR/installer_main.py" \
     --unattended \
     --install-release-tag "$TAG" \
     --bootstrap-install-path "$TARGET" \
     --expected-release-sha "$EXPECTED_SHA" \
     --expected-ha-role "$EXPECTED_ROLE"
-

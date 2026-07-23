@@ -3,7 +3,9 @@ import os
 import pwd
 import grp
 import logging
+import stat
 import tempfile
+from pathlib import Path
 
 from .config_secret_permissions import config_secret_file_mode
 
@@ -154,15 +156,79 @@ def _validated_product_root(value):
     return resolved
 
 
+def _validated_strict_product_root(value, label):
+    """Bindet einen echten Produktbaum ohne Symlink-Komponente."""
+
+    candidate = str(value or "").strip()
+    if not candidate or not os.path.isabs(candidate):
+        raise RuntimeError(f"{label} fehlt oder ist nicht absolut")
+    normalized = os.path.abspath(candidate)
+    current = os.path.sep
+    for component in Path(normalized).parts[1:]:
+        current = os.path.join(current, component)
+        try:
+            metadata = os.lstat(current)
+        except FileNotFoundError as exc:
+            raise RuntimeError(f"{label} existiert nicht") from exc
+        if stat.S_ISLNK(metadata.st_mode):
+            raise RuntimeError(f"{label} enthält eine Symlink-Komponente")
+    if not stat.S_ISDIR(os.lstat(normalized).st_mode):
+        raise RuntimeError(f"{label} ist kein Verzeichnis")
+    if os.path.realpath(normalized) != normalized:
+        raise RuntimeError(f"{label} ist nicht kanonisch")
+    markers = (
+        os.path.join(normalized, "VERSION"),
+        os.path.join(normalized, "installer_main.py"),
+        os.path.join(normalized, "Installer", "installer_config.py"),
+    )
+    for marker in markers:
+        try:
+            metadata = os.lstat(marker)
+        except FileNotFoundError as exc:
+            raise RuntimeError(f"{label} besitzt nicht alle Release-Marker") from exc
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise RuntimeError(f"{label} besitzt keinen eindeutigen Release-Marker")
+    return normalized
+
+
+def _resolve_install_root(module_root, explicit_root="", configured_root=""):
+    """Erlaubt einen fremden Zielroot nur im vollständig dual gebundenen Bootstrap."""
+
+    module = _validated_product_root(module_root)
+    bootstrap_target = str(os.environ.get("E3DC_BOOTSTRAP_ROOT") or "").strip()
+    bootstrap_runner = str(os.environ.get("E3DC_BOOTSTRAP_RUNNER_ROOT") or "").strip()
+    if bool(bootstrap_target) != bool(bootstrap_runner):
+        raise RuntimeError("Bootstrap-Root und Bootstrap-Runner müssen gemeinsam gebunden sein")
+
+    if bootstrap_target:
+        runner = _validated_strict_product_root(bootstrap_runner, "Bootstrap-Runner")
+        target = _validated_strict_product_root(bootstrap_target, "Bootstrap-Ziel")
+        strict_module = _validated_strict_product_root(module_root, "Ausgeführter Release-Root")
+        if runner != strict_module or module != strict_module:
+            raise RuntimeError("Bootstrap-Runner stimmt nicht mit dem ausgeführten Release-Root überein")
+        common = os.path.commonpath((runner, target))
+        if runner == target or common in {runner, target}:
+            raise RuntimeError("Bootstrap-Runner und Bootstrap-Ziel müssen getrennte Bäume sein")
+        for candidate, label in (
+            (explicit_root, "E3DC_INSTALL_ROOT"),
+            (configured_root, "Pfadmetadaten"),
+        ):
+            if candidate and _validated_strict_product_root(candidate, label) != target:
+                raise RuntimeError(f"{label} widersprechen dem gebundenen Bootstrap-Ziel")
+        return target
+
+    root = _validated_product_root(explicit_root or configured_root or module_root)
+    if root != module:
+        raise RuntimeError("Pfadmetadaten und ausgeführter Release-Root widersprechen sich")
+    return root
+
+
 def get_install_path(install_user=None):
     """Löst den exakten Produktstamm auf, ohne ein Benutzerverzeichnis zu durchsuchen."""
     explicit = str(os.environ.get("E3DC_INSTALL_ROOT") or "").strip()
     configured = str(_get_from_web_config("install_path") or "").strip()
     module_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    root = _validated_product_root(explicit or configured or module_root)
-    if root != _validated_product_root(module_root):
-        raise RuntimeError("Pfadmetadaten und ausgefuehrter Release-Root widersprechen sich")
-    return root
+    return _resolve_install_root(module_root, explicit, configured)
 
 
 def get_user_ids(install_user=None):

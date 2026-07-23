@@ -1,9 +1,9 @@
 {
-  "version": "5.4.0a",
+  "version": "5.4.0b",
   "min_version": "4.0.0",
-  "stable_release": "v5.4.0a",
-  "release_date": "2026-07-22",
-  "description": "v5.4.0a - Installer- und Shelly-EM-Kompatibilitätsfix",
+  "stable_release": "v5.4.0b",
+  "release_date": "2026-07-23",
+  "description": "v5.4.0b - Update-, Wallbox- und POWER_SETTINGS-Hotfix",
   "installer_requires": "python3",
   "sanitized_republication": false,
   "history_transition": {
@@ -22,7 +22,9 @@
       "docker_image": "ghcr.io/a9xxx/install-e3dc-control:v5.3.2b",
       "stable": false,
       "rollback_root": true,
-      "notes": "Sanitierter parentloser Rollback-Root; kein älterer öffentlicher Rückfall."
+      "bare_metal_supported": false,
+      "docker_supported": true,
+      "notes": "Sanitierter parentloser Docker-Rollback-Root; wegen des fehlenden zielgebundenen Finalizers kein Bare-Metal-Programm-Rückfall."
     }
   ],
   "rollback_release_shas": {
@@ -60,7 +62,6 @@
     "/var/www/html/test_diff.php",
     "/var/www/html/test_merge.php",
     "/var/www/html/reorder.py",
-    "/var/www/html/assets/vendor/ASSET_PROVENANCE.json",
     "/var/www/html/ramdisk/bluelink_debug.json",
     "/var/www/html/data/morning_boost_state.json"
   ],
@@ -74,7 +75,12 @@
     "python3-cryptography",
     "python3-websockets"
   ],
-  "pip_packages": [
+  "pip_packages": [],
+  "venv_pip_packages": [],
+  "managed_venv_apt_packages": [
+    "python3-venv"
+  ],
+  "managed_venv_pip_packages": [
     "paho-mqtt",
     "requests",
     "hyundai_kia_connect_api",

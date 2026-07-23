@@ -32,8 +32,11 @@ PathValue = Union[str, os.PathLike]
 MANIFEST_NAME = "backup-manifest.json"
 MANIFEST_DIGEST_NAME = "backup-manifest.sha256"
 ROOT_MARKER_NAME = ".e3dc-backup-root.json"
-MANIFEST_SCHEMA = 2
+MANIFEST_SCHEMA = 3
+LEGACY_MANIFEST_SCHEMA = 2
 ROOT_MARKER_SCHEMA = 1
+SYSTEMD_MASK_STATE_SCHEMA = 1
+SYSTEMD_ADMIN_UNIT_DIR = Path("/etc/systemd/system")
 BACKUP_ROOT_NAMES = {"e3dc-control-backups", ".e3dc-control-backups"}
 DEFAULT_BACKUP_ROOT = Path("/srv/e3dc-control-backups")
 SYSTEM_BACKUP_KIND = "system-backup"
@@ -54,6 +57,75 @@ _ML_MODEL_FILE_RE = re.compile(r"ml_model-([0-9a-f]{64})\.pkl\Z")
 
 class BackupIntegrityError(RuntimeError):
     """The backup or restore contract is incomplete or unsafe."""
+
+
+def _normalized_systemd_mask_entries(entries: Iterable[Dict[str, object]]) -> List[Dict[str, object]]:
+    """Prüft und kanonisiert den manifestgebundenen systemd-Maskenumfang."""
+
+    normalized: List[Dict[str, object]] = []
+    seen: Set[str] = set()
+    for raw in entries:
+        if not isinstance(raw, dict) or set(raw) != {"path", "state", "target"}:
+            raise BackupIntegrityError("Ungültiger systemd-Maskeneintrag im Manifest")
+        path = _lexical_absolute(str(raw.get("path") or ""))
+        if path.parent != SYSTEMD_ADMIN_UNIT_DIR or path.name in {"", ".", ".."}:
+            raise BackupIntegrityError("Systemd-Maskenpfad liegt außerhalb der Admin-Unitfläche")
+        if "/" in path.name or "\\" in path.name:
+            raise BackupIntegrityError("Ungültiger systemd-Unitname im Maskenvertrag")
+        path_text = str(path)
+        if path_text in seen:
+            raise BackupIntegrityError("Doppelter systemd-Maskeneintrag im Manifest")
+        seen.add(path_text)
+        state = str(raw.get("state") or "")
+        target = raw.get("target")
+        if state == "masked":
+            if target != "/dev/null":
+                raise BackupIntegrityError("Systemd-Maske zeigt nicht kanonisch auf /dev/null")
+        elif state == "unmasked":
+            if target is not None:
+                raise BackupIntegrityError("Unmaskierter systemd-Eintrag darf kein Ziel besitzen")
+        else:
+            raise BackupIntegrityError("Ungültiger systemd-Maskenzustand im Manifest")
+        normalized.append({"path": path_text, "state": state, "target": target})
+    normalized.sort(key=lambda item: str(item["path"]))
+    if not normalized:
+        raise BackupIntegrityError("Systemd-Maskenumfang darf nicht leer sein")
+    return normalized
+
+
+def build_systemd_mask_state_contract(entries: Iterable[Dict[str, object]]) -> Dict[str, object]:
+    """Erzeugt einen deterministischen, eigenständig gehashten Maskenvertrag."""
+
+    normalized = _normalized_systemd_mask_entries(entries)
+    encoded = json.dumps(
+        normalized,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    return {
+        "schema": SYSTEMD_MASK_STATE_SCHEMA,
+        "algorithm": "sha256",
+        "entries": normalized,
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+    }
+
+
+def verify_systemd_mask_state_contract(value: object) -> Dict[str, object]:
+    """Prüft inneren Hash und exaktes Schema eines systemd-Maskenvertrags."""
+
+    if not isinstance(value, dict) or set(value) != {"schema", "algorithm", "entries", "sha256"}:
+        raise BackupIntegrityError("Ungültiger systemd-Maskenzustandsvertrag")
+    if value.get("schema") != SYSTEMD_MASK_STATE_SCHEMA or value.get("algorithm") != "sha256":
+        raise BackupIntegrityError("Nicht unterstützter systemd-Maskenzustandsvertrag")
+    entries = value.get("entries")
+    if not isinstance(entries, list):
+        raise BackupIntegrityError("Systemd-Maskeneinträge müssen eine Liste sein")
+    normalized = _normalized_systemd_mask_entries(entries)
+    expected = build_systemd_mask_state_contract(normalized)
+    if value.get("sha256") != expected["sha256"] or entries != normalized:
+        raise BackupIntegrityError("Systemd-Maskenzustand stimmt nicht mit seiner SHA-256 überein")
+    return expected
 
 
 @dataclass(frozen=True)
@@ -864,6 +936,7 @@ def finalize_backup(
     source_records: Iterable[Dict[str, object]],
     kind: str = SYSTEM_BACKUP_KIND,
     install_root: Optional[PathValue] = None,
+    systemd_mask_state: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
     backup = _assert_no_symlink_components(backup_dir)
     if kind not in {SYSTEM_BACKUP_KIND, WEB_SNAPSHOT_KIND}:
@@ -890,7 +963,11 @@ def finalize_backup(
     if unknown:
         raise BackupIntegrityError("Manifestzuordnung verweist auf fehlende Dateien: {}".format(unknown[:3]))
     manifest: Dict[str, object] = {
-        "schema": MANIFEST_SCHEMA,
+        # Nur Backups mit Maskenvertrag verwenden Schema 3. Alle bestehenden
+        # Aufrufer ohne diese Erweiterung schreiben weiterhin Schema 2. Damit
+        # lehnt alter Restore-Code maskengebundene Backups sicher ab, statt das
+        # neue Feld zu ignorieren und eine Maske als fehlende Datei zu deuten.
+        "schema": MANIFEST_SCHEMA if systemd_mask_state is not None else LEGACY_MANIFEST_SCHEMA,
         "kind": kind,
         "state": "complete",
         "backup_id": str(uuid.uuid4()),
@@ -899,6 +976,10 @@ def finalize_backup(
         "files": manifest_files,
         "sources": list(source_records),
     }
+    if systemd_mask_state is not None:
+        if kind != SYSTEM_BACKUP_KIND:
+            raise BackupIntegrityError("Systemd-Maskenzustand ist nur für System-Backups zulässig")
+        manifest["systemd_mask_state"] = verify_systemd_mask_state_contract(systemd_mask_state)
     encoded = (json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
     manifest_path = backup / MANIFEST_NAME
     digest_path = backup / MANIFEST_DIGEST_NAME
@@ -935,8 +1016,14 @@ def verify_backup(
         manifest = json.loads(manifest_bytes.decode("utf-8"))
     except (UnicodeError, json.JSONDecodeError) as exc:
         raise BackupIntegrityError("Manifest ist nicht lesbar: {}".format(exc))
-    if not isinstance(manifest, dict) or manifest.get("schema") != MANIFEST_SCHEMA:
-        raise BackupIntegrityError("Nicht unterstuetzte Backup-Manifestversion.")
+    if not isinstance(manifest, dict):
+        raise BackupIntegrityError("Nicht unterstützte Backup-Manifestversion.")
+    schema_value = manifest.get("schema")
+    if isinstance(schema_value, bool) or not isinstance(schema_value, int) or schema_value not in {
+        LEGACY_MANIFEST_SCHEMA,
+        MANIFEST_SCHEMA,
+    }:
+        raise BackupIntegrityError("Nicht unterstützte Backup-Manifestversion.")
     if manifest.get("state") != "complete" or manifest.get("kind") not in {SYSTEM_BACKUP_KIND, WEB_SNAPSHOT_KIND}:
         raise BackupIntegrityError("Backup ist nicht als vollstaendig markiert.")
     if expected_kind and manifest.get("kind") != expected_kind:
@@ -1005,8 +1092,22 @@ def verify_backup(
                 sorted(expected_paths - actual_paths)[:3], sorted(actual_paths - expected_paths)[:3]
             )
         )
+    schema = schema_value
+    if schema == MANIFEST_SCHEMA and manifest.get("kind") != SYSTEM_BACKUP_KIND:
+        raise BackupIntegrityError("Manifest-Schema 3 ist ausschließlich für maskengebundene System-Backups zulässig")
+    if schema == LEGACY_MANIFEST_SCHEMA and "systemd_mask_state" in manifest:
+        raise BackupIntegrityError("Legacy-Manifest darf keinen unbeachteten systemd-Maskenzustand enthalten")
+    if schema == MANIFEST_SCHEMA and manifest.get("kind") == SYSTEM_BACKUP_KIND:
+        if "systemd_mask_state" not in manifest:
+            raise BackupIntegrityError("System-Backup Schema 3 fehlt der systemd-Maskenzustand")
+        verify_systemd_mask_state_contract(manifest["systemd_mask_state"])
     if manifest.get("kind") == SYSTEM_BACKUP_KIND:
+        # Kompatibilitätsentscheidung: Schema 2 bleibt verifizierbar, sein
+        # fehlender Maskenzustand wird beim Restore aber niemals als
+        # "unmasked" interpretiert. Nur Schema 3 autorisiert die Mutation.
         _verify_private_ml_backup_contract(backup, manifest)
+    elif "systemd_mask_state" in manifest:
+        raise BackupIntegrityError("Web-Snapshot darf keinen systemd-Maskenzustand enthalten")
     return manifest
 
 
@@ -1531,6 +1632,7 @@ def restore_persistent_payload(
     allowed_files: Sequence[PathValue] = (),
     exchange_func=None,
     rollback_replace_func=os.replace,
+    before_commit=None,
 ) -> int:
     """Restore the complete mapped and source surface as one fd-bound transaction."""
 
@@ -1946,8 +2048,13 @@ def restore_persistent_payload(
                 item["placeholder_removed"] = True
                 _verify_parent_binding(destination.parent, parent_descriptor, item["parent_metadata"])
 
-            # From here the visible recovery surface is complete and verified.
-            # Removing hidden quarantine entries is post-commit housekeeping.
+            # Dieser Callback ist die letzte fehlschlagbare Änderung am
+            # sichtbaren Zustand. Ein Fehler läuft in den vollständigen
+            # Payload-Rücklauf. Nach erfolgreicher Rückkehr wird nur noch das
+            # nicht fehlschlagbare Commit-Flag gesetzt; die versteckte
+            # Quarantänebereinigung ist reine Nacharbeit nach dem Commit.
+            if before_commit is not None:
+                before_commit()
             committed = True
         except Exception as restore_exc:
             rollback_errors: List[str] = []

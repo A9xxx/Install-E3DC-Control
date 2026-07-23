@@ -2230,7 +2230,10 @@ def build_runtime_overlay(
     export_budget_w = value_w if commands_allowed and candidate_action in {"ECONOMIC_EXPORT", "HEADROOM_EXPORT"} else 0
     power_diag = payload.get("rscp_power_settings") if isinstance(payload.get("rscp_power_settings"), dict) else {}
     readback = power_diag.get("readback") if isinstance(power_diag.get("readback"), dict) else {}
-    acknowledged = bool(power_diag.get("acknowledged") or power_diag.get("response_codes") is not None or power_diag.get("confirmed"))
+    if "acknowledged" in power_diag:
+        acknowledged = power_diag.get("acknowledged") is True
+    else:
+        acknowledged = bool(power_diag.get("response_codes") is not None or power_diag.get("confirmed"))
     confirmed = bool(power_diag.get("confirmed"))
     requested = {
         "mode": mode_name,
@@ -2278,6 +2281,7 @@ def build_runtime_overlay(
             "acknowledged": acknowledged,
             "dispatch_acknowledged": bool(explicit_phase5 and phase5.get("requested") and acknowledged),
             "settings_acknowledged": acknowledged,
+            "acknowledgement_status": power_diag.get("acknowledgement_status"),
             "scope": "POWER_SETTINGS_ONLY_NO_SET_POWER_ACK",
             "status": power_diag.get("status"),
             "response_codes": power_diag.get("response_codes"),
@@ -2285,7 +2289,13 @@ def build_runtime_overlay(
         },
         "readback": {
             "confirmed": confirmed,
-            "fresh": bool(power_diag.get("readback_source") == "canonical_live" or power_diag.get("stage") == "live_reconciliation"),
+            "fresh": bool(
+                power_diag.get("readback_source") in {
+                    "canonical_live",
+                    "command_get_after_invalid_set_response",
+                }
+                or power_diag.get("stage") == "live_reconciliation"
+            ),
             "status": power_diag.get("status"),
             "values": readback or None,
             "ts_ms": _to_ts_ms(power_diag.get("readback_cycle_ts", power_diag.get("ts"))) or None,

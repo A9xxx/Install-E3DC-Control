@@ -48,7 +48,7 @@ Für eine Erstinstallation oder ein Update ist die empfohlene Option **"1 Instal
 2) Systemstatus anzeigen
 3) Rechte prüfen & korrigieren
 4) Notfallmodus / System reparieren
-5) Policygebundener Stable-Rollback
+5) Policygebundener Programm-Rückfall (falls für Bare Metal freigegeben)
 6) Backup erstellen / verwalten
 7) Expertenmenü
 8) Systempakete vorbereiten
@@ -117,7 +117,7 @@ Legen Sie folgende `docker-compose.yml` in diesem Ordner an:
 ```yaml
 services:
   e3dc-control:
-    image: ghcr.io/a9xxx/install-e3dc-control:latest
+    image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"
     container_name: e3dc-control
     restart: unless-stopped
     network_mode: "host"
@@ -143,26 +143,31 @@ Das System richtet sich nun im Hintergrund selbst ein und ist nach ca. 60 Sekund
 **Docker-Updates:**
 ```bash
 cd "$E3DC_DOCKER_PATH"
-docker compose pull
-docker compose up -d --force-recreate
+docker compose config --images
+docker compose pull e3dc-control
+docker compose up -d --force-recreate e3dc-control
 ```
-`pull` holt das aktuelle GHCR-Image, `--force-recreate` startet den Container
-wirklich aus diesem neuen Image.
+Ohne `E3DC_IMAGE_TAG` holt `pull` das aktuelle geprüfte Stable-Image `latest`.
+Ein fester Tag bleibt absichtlich fest; `config --images` zeigt vorab das
+tatsächlich gewählte Image. `--force-recreate` startet den Container daraus
+neu.
 
-**Docker-Rückfall von v5.4.0a auf den veröffentlichten Rollback-Root:**
+**Docker-Rückfall von v5.4.0b auf den veröffentlichten Docker-Rollback-Root:**
 ```bash
 TAG=v5.3.2b
 cd "$E3DC_DOCKER_PATH"
-cp docker-compose.yml "docker-compose.yml.before-$TAG"
-sed -i -E "s#^([[:space:]]*)image: ghcr.io/a9xxx/install-e3dc-control:.*#\1image: ghcr.io/a9xxx/install-e3dc-control:$TAG#" docker-compose.yml
-docker compose pull e3dc-control
-docker compose up -d --force-recreate e3dc-control
+E3DC_IMAGE_TAG="$TAG" docker compose config --images
+E3DC_IMAGE_TAG="$TAG" docker compose pull e3dc-control
+E3DC_IMAGE_TAG="$TAG" docker compose up -d --force-recreate e3dc-control
 docker logs --tail=80 e3dc-control
 ```
+Soll der Pin dauerhaft gelten, wird `E3DC_IMAGE_TAG=v5.3.2b` in einer
+vorhandenen `.env` ergänzt, ohne andere Werte darin zu überschreiben.
 Der Container kann den Docker-Daemon des Hosts absichtlich nicht selbst
 bedienen. Die Weboberfläche zeigt für Docker deshalb nur die passenden
 Host-Befehle zur gewählten Version an. `v5.3.2b` ist der einzige vorgesehene
-öffentliche Rückfallstand und gibt selbst keinen älteren Image-Tag frei.
+öffentliche Docker-Rückfallstand und gibt selbst keinen älteren Image-Tag frei.
+Auf Bare Metal wird dieser Altstand nicht als Programm-Rückfall angeboten.
 
 **Wichtig zur Ramdisk im Docker:** `/var/www/html/ramdisk` ist flüchtig und
 nach jedem Container-Neustart leer. Dateien wie `ml_prediction.json` werden

@@ -115,7 +115,7 @@ $paths = getInstallPaths();
     <div class="container">
         <div class="d-flex justify-content-between align-items-center mb-4">
             <a href="index.php" class="nav-link-back"><i class="fas fa-arrow-left me-2"></i>Dashboard</a>
-            <span class="badge bg-success text-light">v5.4.0a Stable</span>
+            <span class="badge bg-success text-light">v5.4.0b Stable</span>
         </div>
         <h1 class="display-4 fw-bold">Hilfe & Support</h1>
         <p class="lead opacity-75">Häufige Fragen und Lösungen rund um E3DC-Control.</p>
@@ -134,10 +134,13 @@ $paths = getInstallPaths();
         <div class="col-12 faq-item" data-tags="docker image stable rollback update">
             <div class="card bg-card border-0 shadow-sm"><div class="card-body">
                 <h5 class="card-title"><span class="tag">Docker</span> Wie prüfe ich Image und Update?</h5>
-                <p>Ein freigegebener Stable-Tag kann als <code>image: ghcr.io/a9xxx/install-e3dc-control:v5.4.0a</code> verwendet werden (Dokumentationsform: <code>image: ghcr.io/...</code>). Ein lokaler Quellenpfad nutzt <code>build: .</code>.</p>
-                <pre>docker inspect e3dc-control --format '{{.Config.Image}} {{.State.Status}}'
+                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem geprüften Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.0b</code> in <code>.env</code> gesetzt.</p>
+                <pre>docker compose config --images
+docker compose pull e3dc-control
+docker compose up -d --force-recreate e3dc-control
+docker inspect e3dc-control --format '{{.Config.Image}} {{.State.Status}}'
 docker compose build --no-cache e3dc-control</pre>
-                <p>Rollback erfolgt ausschließlich auf den in der Update-Policy gebundenen Stable-Stand.</p>
+                <p>Der Docker-Rückfall erfolgt ausschließlich auf ein in der Update-Policy mit <code>docker_supported</code> freigegebenes Image. <code>v5.3.2b</code> ist nicht als Bare-Metal-Programm-Rückfall freigegeben.</p>
             </div></div>
         </div>
 
@@ -204,6 +207,25 @@ docker compose build --no-cache e3dc-control</pre>
             </div>
         </div>
 
+        <h4 class="mb-4 text-accent"><i class="fas fa-screwdriver-wrench me-2"></i>Stable-Hotfix 5.4.0b: Update-, Wallbox- und Speicherkompatibilität</h4>
+        <div class="col-12 faq-item" data-tags="5.4.0b hotfix update pep668 venv docker wrapper sudoers systemd maske openwb pro stecksession cp phasenwechsel pv kurve zero budget power settings readback headroom">
+            <div class="card bg-card border-0 shadow-sm">
+                <div class="card-body">
+                    <h5 class="card-title">
+                        <span class="tag">5.4.0b</span>
+                        Was korrigiert das Stable-Release 5.4.0b?
+                    </h5>
+                    <ul>
+                        <li><strong>Update:</strong> Python-Abhängigkeiten werden auf PEP-668-Systemen im gebundenen Benutzer-venv installiert. Docker-Installationen zeigen stattdessen die notwendigen <code>docker compose</code>-Befehle für den Host.</li>
+                        <li><strong>Transaktion:</strong> Wrapper, sudoers und kanonische systemd-Masken werden vor einer Änderung gebunden gesichert und bei einem Teilfehler kontrolliert zurückgesetzt. Der neue Zielstand wird nach dem Git-Wechsel nur aus dem freigegebenen Zielbaum finalisiert.</li>
+                        <li><strong>openWB Pro:</strong> Ein bestätigtes Ab- und Wiederanstecken erzeugt eine neue Stecksession. Die Stromfreigabe erfolgt vor einem optionalen, begrenzten CP-Wake-up, der im Automatikmodus eine unterstützte Geräte-API verlangt; bereits passende Phasen werden ohne unnötigen Wechsel übernommen.</li>
+                        <li><strong>PV-Kurve:</strong> Alle unterstützten Wallboxpfade verwenden denselben Halte-/Stoppvertrag bei fehlendem PV-Budget. Kurze Batteriestützung einer laufenden Ladung bleibt im vorhandenen Energiebudget erlaubt.</li>
+                        <li><strong>Speicher:</strong> Eine unklare <code>POWER_SETTINGS</code>-SET-Antwort gilt nur bei exakt passendem GET-Readback als bestätigt. Frische Hardwaregrenzen können den konfigurierten Ladewert absenken, aber temporäre Grenzen werden nicht als neue Ladefähigkeit geplant.</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+
         <h4 class="mb-4 text-accent"><i class="fas fa-screwdriver-wrench me-2"></i>Stable-Hotfix 5.4.0a: Update- und Shelly-Kompatibilität</h4>
         <div class="col-12 faq-item" data-tags="5.4.0a hotfix update apt matter wrapper crlf sudo shelly em gen1 klima">
             <div class="card bg-card border-0 shadow-sm">
@@ -241,7 +263,7 @@ docker compose build --no-cache e3dc-control</pre>
                         <li><strong>Update und Rollback:</strong> Ein leeres oder unlesbares Backup ist ein harter Fehler. Der Wechsel zum bereinigten Verlauf erfolgt über den Installer-/Bootstrapweg und nicht über <code>git pull</code>.</li>
                         <li><strong>Matter:</strong> Smart Home bleibt erhalten. Neue Kopplungsdaten werden installationsindividuell und privat gespeichert; bestehende Fabrics werden nicht gelöscht.</li>
                         <li><strong>Shadow und V2X:</strong> Shadow bleibt eine read-only Vergleichsinstanz ohne Hardwareausgang. V2H-/V2G-Telemetrie bleibt sichtbar, aktive bidirektionale Steuerung ist nicht freigegeben.</li>
-                        <li><strong>Rollback:</strong> Einziger vorgesehener öffentlicher Rückfallstand ist der sanitierte Root <code>v5.3.2b</code>.</li>
+                        <li><strong>Rollback:</strong> Der sanitierte Root <code>v5.3.2b</code> bleibt als Docker-Rückfall-Image verfügbar. Auf Bare Metal bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der unterstützte Rückweg.</li>
                     </ul>
                 </div>
             </div>

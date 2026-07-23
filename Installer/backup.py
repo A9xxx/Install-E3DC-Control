@@ -1,5 +1,7 @@
 import os
 import datetime
+import stat
+import subprocess
 import sys
 from pathlib import Path
 
@@ -19,8 +21,10 @@ from .backup_integrity import (
     LEGACY_ML_MODEL,
     PRIVATE_ML_ROOT,
     PersistentSource,
+    SYSTEMD_ADMIN_UNIT_DIR,
     SYSTEM_BACKUP_KIND,
     _lexical_absolute,
+    build_systemd_mask_state_contract,
     copy_persistent_sources,
     default_backup_root,
     finalize_backup,
@@ -28,6 +32,7 @@ from .backup_integrity import (
     secure_backup_tree,
     validate_private_ml_store,
     verify_backup,
+    verify_systemd_mask_state_contract,
 )
 from .installer_config import get_install_path, get_user_ids, get_www_data_gid, load_config
 from .logging_manager import get_or_create_logger, log_task_completed, log_error, log_warning
@@ -35,12 +40,17 @@ from .service_catalog import allowed_services
 
 INSTALL_PATH = get_install_path()
 backup_logger = get_or_create_logger("backup")
+SYSTEMD_UNIT_DIRS = (
+    SYSTEMD_ADMIN_UNIT_DIR,
+    Path("/usr/lib/systemd/system"),
+    Path("/lib/systemd/system"),
+)
 
 
 def _systemd_unit_paths():
     units = sorted(set(allowed_services()) | {"piguard.service", "e3dc.service"})
     paths = []
-    for unit_dir in (Path("/etc/systemd/system"), Path("/usr/lib/systemd/system"), Path("/lib/systemd/system")):
+    for unit_dir in SYSTEMD_UNIT_DIRS:
         current = Path("/")
         unsafe = False
         for component in unit_dir.parts[1:]:
@@ -54,13 +64,109 @@ def _systemd_unit_paths():
     return paths
 
 
+def _systemd_path_state_at(parent_fd, name, path):
+    """Liefert missing, regular oder masked, ohne einem Eintrag zu folgen."""
+
+    try:
+        before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return "missing"
+    if stat.S_ISLNK(before.st_mode):
+        target = os.readlink(name, dir_fd=parent_fd)
+        state = "masked" if target == "/dev/null" else "unsafe-symlink"
+    elif stat.S_ISREG(before.st_mode):
+        state = "regular"
+    else:
+        raise BackupIntegrityError(f"Systemd-Unitpfad hat unzulässigen Dateityp: {path}")
+    after = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if (
+        before.st_dev,
+        before.st_ino,
+        before.st_mode,
+        before.st_size,
+        before.st_mtime_ns,
+    ) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_mode,
+        after.st_size,
+        after.st_mtime_ns,
+    ):
+        raise BackupIntegrityError(f"Systemd-Unitpfad wurde während der Prüfung ausgetauscht: {path}")
+    if state == "unsafe-symlink":
+        raise BackupIntegrityError(
+            f"Nichtkanonischer systemd-Symlink ist nicht sicherbar: {path}"
+        )
+    return state
+
+
+def _systemd_path_state(unit_path):
+    path = Path(unit_path)
+    if path.parent != SYSTEMD_ADMIN_UNIT_DIR:
+        raise BackupIntegrityError(f"Systemd-Maskenpfad liegt außerhalb der Admin-Unitfläche: {path}")
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        parent_fd = os.open(str(path.parent), flags)
+    except FileNotFoundError:
+        return "missing"
+    try:
+        return _systemd_path_state_at(parent_fd, path.name, path)
+    finally:
+        os.close(parent_fd)
+
+
+def _is_expected_systemd_mask(unit_path):
+    """Bindet ausschließlich eine kanonische systemd-Maske ohne Zielauflösung."""
+
+    path = Path(unit_path)
+    return path.parent == SYSTEMD_ADMIN_UNIT_DIR and _systemd_path_state(path) == "masked"
+
+
+def _systemd_admin_unit_paths():
+    return sorted(path for path in _systemd_unit_paths() if path.parent == SYSTEMD_ADMIN_UNIT_DIR)
+
+
+def _systemd_mask_state_contract():
+    entries = []
+    for path in _systemd_admin_unit_paths():
+        masked = _systemd_path_state(path) == "masked"
+        entries.append({
+            "path": str(path),
+            "state": "masked" if masked else "unmasked",
+            "target": "/dev/null" if masked else None,
+        })
+    return build_systemd_mask_state_contract(entries)
+
+
+def _mask_entries_by_path(contract):
+    verified = verify_systemd_mask_state_contract(contract)
+    entries = {Path(str(item["path"])): item for item in verified["entries"]}
+    expected = set(_systemd_admin_unit_paths())
+    if set(entries) != expected:
+        raise BackupIntegrityError("Systemd-Maskenumfang stimmt nicht mit dem Unitkatalog überein")
+    return entries
+
+
+def _missing_systemd_source_record(path):
+    return {
+        "category": "systemd",
+        "source": str(path),
+        "present": False,
+        "files": 0,
+        "source_type": "missing",
+        "exclude_top_level": [],
+        "exclude_anywhere": [],
+        "directories": [],
+    }
+
+
 def get_backup_root(install_path=None):
     """Return a protected backup root outside the installation tree."""
     install = _lexical_absolute(install_path or INSTALL_PATH)
     return str(default_backup_root(install))
 
 
-def _persistent_sources(install_path=None):
+def _persistent_sources(install_path=None, systemd_mask_state=None):
     """Return the complete legacy and current recovery surface."""
     install = _lexical_absolute(install_path or INSTALL_PATH)
     configured_venv = str(load_config().get("venv_name") or ".venv_e3dc").strip()
@@ -90,7 +196,14 @@ def _persistent_sources(install_path=None):
         PersistentSource("system-state", Path("/var/lib/e3dc-control")),
         PersistentSource("system-config", Path("/etc/e3dc-control")),
     ]
+    mask_entries = _mask_entries_by_path(systemd_mask_state or _systemd_mask_state_contract())
     for unit_path in _systemd_unit_paths():
+        # Eine kanonische /dev/null-Maske ist kein Unit-Payload. Sie wird als
+        # vollständiger SHA-256-gebundener Zustandsvertrag manifestiert. Der
+        # synthetische missing-Source-Eintrag wird erst nach der Dateikopie
+        # ergänzt, damit Restore die Maskenstelle transaktional freiräumt.
+        if unit_path.parent == SYSTEMD_ADMIN_UNIT_DIR and mask_entries[unit_path]["state"] == "masked":
+            continue
         sources.append(PersistentSource("systemd", unit_path))
     for watchdog in (Path("/usr/local/bin/boot_notify.sh"), Path("/usr/local/bin/pi_guard.sh")):
         sources.append(PersistentSource("watchdog", watchdog))
@@ -122,10 +235,19 @@ def _backup_current_version_v2(install_path=None, preserve_backup_paths=None):
         backup_dir = backup_root / timestamp
         os.mkdir(str(backup_dir), 0o700)
         print(f"→ Erstelle verifiziertes Backup unter {backup_dir}…")
+        systemd_mask_state = _systemd_mask_state_contract()
+        mask_entries = _mask_entries_by_path(systemd_mask_state)
         mapped_entries, source_records = copy_persistent_sources(
             backup_dir,
-            _persistent_sources(active_install_path),
+            _persistent_sources(active_install_path, systemd_mask_state),
         )
+        source_records.extend(
+            _missing_systemd_source_record(path)
+            for path, entry in mask_entries.items()
+            if entry["state"] == "masked"
+        )
+        if _systemd_mask_state_contract() != systemd_mask_state:
+            raise BackupIntegrityError("Systemd-Maskenzustand driftete während des Backups")
         if not mapped_entries:
             raise BackupIntegrityError("Es wurden keine wiederherstellbaren Dateien gesichert.")
         secure_backup_tree(backup_dir)
@@ -135,6 +257,7 @@ def _backup_current_version_v2(install_path=None, preserve_backup_paths=None):
             source_records,
             kind=SYSTEM_BACKUP_KIND,
             install_root=active_install_path,
+            systemd_mask_state=systemd_mask_state,
         )
         verify_backup(backup_dir, expected_kind=SYSTEM_BACKUP_KIND)
         try:
@@ -229,14 +352,229 @@ def choose_backup_version(action_text="wiederherstellen"):
         return None
 
 
+def _systemd_identity(metadata):
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+    )
+
+
+def _remove_canonical_systemd_mask(path, expected_identity=None):
+    path = Path(path)
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    parent_fd = os.open(str(path.parent), flags)
+    try:
+        state = _systemd_path_state_at(parent_fd, path.name, path)
+        if state != "masked":
+            raise BackupIntegrityError(f"Erwartete kanonische systemd-Maske fehlt: {path}")
+        before = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        if expected_identity is not None and _systemd_identity(before) != expected_identity:
+            raise BackupIntegrityError(f"Systemd-Maske wurde vor dem Entfernen ausgetauscht: {path}")
+        os.unlink(path.name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+        if _systemd_path_state_at(parent_fd, path.name, path) != "missing":
+            raise BackupIntegrityError(f"Systemd-Maske konnte nicht sicher entfernt werden: {path}")
+    finally:
+        os.close(parent_fd)
+
+
+def _create_canonical_systemd_mask(path):
+    path = Path(path)
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    parent_fd = os.open(str(path.parent), flags)
+    created_identity = None
+    try:
+        if _systemd_path_state_at(parent_fd, path.name, path) != "missing":
+            raise BackupIntegrityError(f"Systemd-Maskenziel ist vor dem Restore nicht frei: {path}")
+        os.symlink("/dev/null", path.name, dir_fd=parent_fd)
+        created_identity = _systemd_identity(
+            os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        )
+        os.fsync(parent_fd)
+        if _systemd_path_state_at(parent_fd, path.name, path) != "masked":
+            raise BackupIntegrityError(f"Systemd-Maske konnte nicht verifiziert werden: {path}")
+        if _systemd_identity(os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)) != created_identity:
+            raise BackupIntegrityError(f"Systemd-Maske driftete nach ihrer Erzeugung: {path}")
+        return created_identity
+    except Exception as create_exc:
+        if created_identity is not None:
+            try:
+                current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+                if _systemd_identity(current) != created_identity:
+                    raise BackupIntegrityError("erzeugte Maske wurde fremd ersetzt")
+                os.unlink(path.name, dir_fd=parent_fd)
+                os.fsync(parent_fd)
+            except Exception as rollback_exc:
+                raise BackupIntegrityError(
+                    f"Maskenerzeugung und Rücklauf sind fehlgeschlagen: {create_exc}; {rollback_exc}"
+                ) from create_exc
+        raise
+    finally:
+        os.close(parent_fd)
+
+
+def _apply_systemd_mask_states(states, *, allow_existing=False):
+    """Setzt einen vollständigen Maskensatz mit Rücklauf bei Teilfehlern."""
+
+    paths = sorted(states)
+    for path in paths:
+        state = _systemd_path_state(path)
+        if states[path] and state not in {"missing", "masked"}:
+            raise BackupIntegrityError(f"Maskierter Backupzustand trifft auf Unit-Payload: {path}")
+        if states[path] and state == "masked" and not allow_existing:
+            raise BackupIntegrityError(f"Systemd-Maske erschien unerwartet während der Transaktion: {path}")
+        if not states[path] and state == "masked":
+            raise BackupIntegrityError(f"Unerwartete systemd-Maske am unmaskierten Ziel: {path}")
+
+    created = {}
+    try:
+        for path in paths:
+            if states[path] and _systemd_path_state(path) == "missing":
+                created[path] = _create_canonical_systemd_mask(path)
+        for path in paths:
+            actual = _systemd_path_state(path)
+            if states[path] != (actual == "masked"):
+                raise BackupIntegrityError(f"Systemd-Maskenzustand wurde nicht exakt restauriert: {path}")
+    except Exception:
+        rollback_errors = []
+        for path in reversed(list(created)):
+            try:
+                _remove_canonical_systemd_mask(path, created[path])
+            except Exception as exc:
+                rollback_errors.append(f"{path}: {exc}")
+        if rollback_errors:
+            raise BackupIntegrityError(
+                "Maskenrestore und dessen Rücklauf sind fehlgeschlagen: " + "; ".join(rollback_errors)
+            )
+        raise
+    return created
+
+
+def _remove_created_systemd_masks(created):
+    errors = []
+    for path in reversed(list(created)):
+        try:
+            _remove_canonical_systemd_mask(path, created[path])
+        except Exception as exc:
+            errors.append(f"{path}: {exc}")
+    if errors:
+        raise BackupIntegrityError("Erzeugte systemd-Masken konnten nicht sicher entfernt werden: " + "; ".join(errors))
+
+
+def _reload_and_verify_systemd_mask_states(states):
+    """Lädt systemd neu und bindet dessen Sicht an den Plattenzustand."""
+
+    reload_result = subprocess.run(
+        ["systemctl", "daemon-reload"],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    if reload_result.returncode != 0:
+        raise BackupIntegrityError(
+            "systemd daemon-reload nach Maskenrestore fehlgeschlagen: "
+            + (reload_result.stderr or reload_result.stdout or "unbekannter Fehler").strip()
+        )
+    allowed = {
+        "enabled", "enabled-runtime", "disabled", "static", "indirect",
+        "generated", "transient", "alias", "linked", "linked-runtime",
+        "not-found", "masked", "masked-runtime",
+    }
+    for path in sorted(states):
+        result = subprocess.run(
+            ["systemctl", "is-enabled", path.name],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        value = (result.stdout or result.stderr or "").strip().splitlines()
+        status = value[0].strip().lower() if value else ""
+        if status not in allowed:
+            raise BackupIntegrityError(f"Systemd-Maskenzustand ist nicht lesbar: {path}")
+        is_masked = status in {"masked", "masked-runtime"}
+        if states[path] != is_masked:
+            raise BackupIntegrityError(
+                f"Systemd meldet unerwarteten Maskenzustand {status!r}: {path}"
+            )
+
+
+def _restore_payload_with_mask_contract(backup_path, manifest, allowed_roots, allowed_files):
+    contract = manifest.get("systemd_mask_state")
+    if contract is None:
+        # Bestehende Schema-2-Backups hatten keinen Maskenvertrag. Sie bleiben
+        # lesbar, autorisieren aber bewusst weder mask noch unmask. Dadurch wird
+        # aus fehlender Alt-Evidenz kein erfundener Aktivierungszustand.
+        return restore_persistent_payload(
+            backup_path,
+            allowed_roots=allowed_roots,
+            allowed_files=allowed_files,
+        )
+
+    entries = _mask_entries_by_path(contract)
+    expected = {path: entry["state"] == "masked" for path, entry in entries.items()}
+    original = {path: _systemd_path_state(path) == "masked" for path in entries}
+    try:
+        for path in sorted(entries):
+            if original[path]:
+                _remove_canonical_systemd_mask(path)
+    except Exception as exc:
+        try:
+            _apply_systemd_mask_states(original, allow_existing=True)
+            _reload_and_verify_systemd_mask_states(original)
+        except Exception as rollback_exc:
+            raise BackupIntegrityError(
+                f"Masken-Preflight und Rücklauf sind fehlgeschlagen: {exc}; {rollback_exc}"
+            ) from exc
+        raise
+
+    def apply_masks_before_commit():
+        created = {}
+        try:
+            created = _apply_systemd_mask_states(expected)
+            _reload_and_verify_systemd_mask_states(expected)
+        except Exception as exc:
+            try:
+                _remove_created_systemd_masks(created)
+                _reload_and_verify_systemd_mask_states({path: False for path in entries})
+            except Exception as rollback_exc:
+                raise BackupIntegrityError(
+                    f"Masken-Commit und sein Rücklauf sind fehlgeschlagen: {exc}; {rollback_exc}"
+                ) from exc
+            raise
+
+    try:
+        restored = restore_persistent_payload(
+            backup_path,
+            allowed_roots=allowed_roots,
+            allowed_files=allowed_files,
+            before_commit=apply_masks_before_commit,
+        )
+    except Exception as exc:
+        try:
+            _apply_systemd_mask_states(original, allow_existing=True)
+            _reload_and_verify_systemd_mask_states(original)
+        except Exception as rollback_exc:
+            raise BackupIntegrityError(
+                f"Payload-Restore und Maskenrücklauf sind fehlgeschlagen: {exc}; {rollback_exc}"
+            ) from exc
+        raise
+    return restored
+
+
 def restore_verified_backup(backup_path, install_path=None):
     """Restore the complete manifested recovery surface without prompting."""
-    verify_backup(backup_path, expected_kind=SYSTEM_BACKUP_KIND)
+    manifest = verify_backup(backup_path, expected_kind=SYSTEM_BACKUP_KIND)
     allowed_roots, allowed_files = _restore_allowlist(install_path)
-    restored = restore_persistent_payload(
+    restored = _restore_payload_with_mask_contract(
         backup_path,
-        allowed_roots=allowed_roots,
-        allowed_files=allowed_files,
+        manifest,
+        allowed_roots,
+        allowed_files,
     )
     validate_private_ml_store(PRIVATE_ML_ROOT, allow_missing=True)
     return restored

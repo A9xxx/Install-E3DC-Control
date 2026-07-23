@@ -75,12 +75,12 @@ müssen folgende Punkte geprüft werden:
 4. Eine laufende Schutzfrist wurde nicht verkürzt.
 5. Bei unklarem Zustand bleibt die Schaltfunktion gesperrt.
 
-Der eingefrorene Rollback-Stand v5.3.2b versteht bereits den neutralen
-Konfigurationsvertrag. Deshalb bleibt die aktive kanonische Konfiguration bei
-einem Rückfall von v5.4.0 auf v5.3.2b direkt lesbar; ein spezieller
-Alt-Schlüssel-Restore existiert nicht. Der Releasewechsel erstellt weiterhin
-ein verifiziertes Systembackup. Ein Rollback ohne lesbares,
-prüfsummengesichertes Systembackup wird abgebrochen.
+Der eingefrorene Stand v5.3.2b versteht bereits den neutralen
+Konfigurationsvertrag, ist in der aktuellen Policy aber ausschließlich als
+Docker-Rückfall-Image freigegeben. Auf Bare Metal erfolgt kein Programmwechsel
+auf diesen Altstand; dort ist ein verifiziertes Systembackup der unterstützte
+Rückweg. Eine Wiederherstellung ohne lesbares, prüfsummengesichertes Backup wird
+abgebrochen.
 
 ## Störungsbehebung
 

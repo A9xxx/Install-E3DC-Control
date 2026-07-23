@@ -196,22 +196,29 @@ class BattCtrl:
         raw_charge_w = value_for(RscpTag.EMS_MAX_CHARGE_POWER)
         raw_discharge_w = value_for(RscpTag.EMS_MAX_DISCHARGE_POWER)
         raw_discharge_start_w = value_for(RscpTag.EMS_DISCHARGE_START_POWER)
-        if any(value is None for value in (
-            raw_limits_used,
-            raw_charge_w,
-            raw_discharge_w,
-            raw_discharge_start_w,
-        )):
+        if not isinstance(raw_limits_used, bool):
             return None
-        try:
-            return {
-                "limits_used": bool(raw_limits_used),
-                "max_charge_w": max(0, int(raw_charge_w)),
-                "max_discharge_w": max(0, int(raw_discharge_w)),
-                "discharge_start_w": max(0, int(raw_discharge_start_w)),
-            }
-        except (TypeError, ValueError):
+        if any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+            for value in (raw_charge_w, raw_discharge_w, raw_discharge_start_w)
+        ):
             return None
+        return {
+            "limits_used": raw_limits_used,
+            "max_charge_w": raw_charge_w,
+            "max_discharge_w": raw_discharge_w,
+            "discharge_start_w": raw_discharge_start_w,
+        }
+
+    def _accept_power_settings_readback(self, readback: Dict[str, Any]) -> None:
+        self._settings_charge_cap = int(readback["max_charge_w"])
+        self._settings_discharge_cap = int(readback["max_discharge_w"])
+        self._settings_discharge_start = int(readback["discharge_start_w"])
+        self._settings_limits_used = bool(readback["limits_used"])
+        self._charge_cap = int(readback["max_charge_w"])
+        self._discharge_cap = int(readback["max_discharge_w"])
+        self._clear_pending_power_settings()
+        self._settings_retry_after_monotonic = 0.0
 
     @staticmethod
     def _power_settings_readback_matches(
@@ -234,6 +241,29 @@ class BattCtrl:
             charge_matches
             and abs(int(readback.get("max_discharge_w", -1)) - discharge_w) < RSCP_POWER_SETTINGS_TOLERANCE_W
             and abs(int(readback.get("discharge_start_w", -1)) - discharge_start_w) < RSCP_POWER_SETTINGS_TOLERANCE_W
+        )
+
+    @staticmethod
+    def _power_settings_readback_matches_exact(
+        readback: Optional[Dict[str, Any]],
+        charge_w: int,
+        discharge_w: int,
+        discharge_start_w: int,
+        limits_used: bool,
+        bounded_zero_w: int = 0,
+    ) -> bool:
+        if not isinstance(readback, dict) or readback.get("limits_used") is not limits_used:
+            return False
+        if not limits_used:
+            return True
+        readback_charge_w = int(readback.get("max_charge_w", -1))
+        charge_matches = readback_charge_w == charge_w
+        if charge_w == 0 and bounded_zero_w > 0:
+            charge_matches = 0 <= readback_charge_w <= bounded_zero_w
+        return bool(
+            charge_matches
+            and int(readback.get("max_discharge_w", -1)) == discharge_w
+            and int(readback.get("discharge_start_w", -1)) == discharge_start_w
         )
 
     def _write_and_verify_power_settings(
@@ -265,14 +295,55 @@ class BattCtrl:
         }])
         response_codes = self._power_settings_response_codes(response)
         if response_codes is None or len(response_codes) < 4:
+            # Manche E3DC-Generationen übernehmen eine sichere Begrenzung,
+            # liefern aber keine für diesen Vertrag auswertbare SET-Antwort.
+            # Genau ein kanonischer GET darf die Wirkung bestätigen; ohne
+            # exakten, typisierten Match bleibt der Ausgang fail-closed.
+            readback = self._read_power_settings()
+            readback_matches = self._power_settings_readback_matches_exact(
+                readback,
+                charge_w,
+                discharge_w,
+                discharge_start_w,
+                limits_used,
+                bounded_zero_w,
+            )
+            if readback_matches:
+                assert isinstance(readback, dict)
+                self._accept_power_settings_readback(readback)
+                self._power_settings_diag = {
+                    "schema": "rscp_power_settings_v1",
+                    "contract_version": RSCP_POWER_SETTINGS_CONTRACT_VERSION,
+                    "status": "confirmed_from_get_ack_unknown",
+                    "stage": stage,
+                    "confirmed": True,
+                    "acknowledged": None,
+                    "acknowledgement_status": "unknown_invalid_set_response",
+                    "requested": requested,
+                    "response_codes": response_codes,
+                    "readback": readback,
+                    "readback_source": "command_get_after_invalid_set_response",
+                    "bounded_zero_w": max(0, int(bounded_zero_w)),
+                    "ts": int(time.time()),
+                }
+                return True
             self._power_settings_diag = {
                 "schema": "rscp_power_settings_v1",
                 "contract_version": RSCP_POWER_SETTINGS_CONTRACT_VERSION,
-                "status": "set_response_invalid",
+                "status": (
+                    "set_response_invalid_readback_mismatch"
+                    if readback is not None
+                    else "set_response_invalid_readback_missing"
+                ),
                 "stage": stage,
                 "confirmed": False,
+                "acknowledged": None,
+                "acknowledgement_status": "unknown_invalid_set_response",
                 "requested": requested,
                 "response_codes": response_codes,
+                "readback": readback,
+                "readback_source": "command_get_after_invalid_set_response",
+                "bounded_zero_w": max(0, int(bounded_zero_w)),
                 "ts": int(time.time()),
             }
             return False
@@ -320,14 +391,7 @@ class BattCtrl:
             }
             return False
 
-        self._settings_charge_cap = int(readback["max_charge_w"])
-        self._settings_discharge_cap = int(readback["max_discharge_w"])
-        self._settings_discharge_start = int(readback["discharge_start_w"])
-        self._settings_limits_used = bool(readback["limits_used"])
-        self._charge_cap = int(readback["max_charge_w"])
-        self._discharge_cap = int(readback["max_discharge_w"])
-        self._clear_pending_power_settings()
-        self._settings_retry_after_monotonic = 0.0
+        self._accept_power_settings_readback(readback)
         bounded_zero_equivalent = bool(
             limits_used
             and charge_w == 0
@@ -657,14 +721,33 @@ class BattCtrl:
             ):
                 if str(self._power_settings_diag.get("status") or "").startswith("pending_readback"):
                     return False
-                raise RuntimeError("POWER_SETTINGS-Readback stimmt nicht mit der Vorgabe ueberein")
-            log.info(
-                "RSCP POWER_SETTINGS: limits=%s max_charge=%dW max_discharge=%dW discharge_start=%dW",
-                "on" if limits_used else "off",
-                charge_w,
-                discharge_w,
-                discharge_start_w,
-            )
+                status = str(self._power_settings_diag.get("status") or "")
+                if status == "set_response_invalid_readback_missing":
+                    raise RuntimeError(
+                        "POWER_SETTINGS-SET-Antwort ungültig; kanonischer Readback fehlt"
+                    )
+                if status == "set_response_invalid_readback_mismatch":
+                    raise RuntimeError(
+                        "POWER_SETTINGS-SET-Antwort ungültig; kanonischer Readback weicht von der Vorgabe ab"
+                    )
+                raise RuntimeError("POWER_SETTINGS-Readback stimmt nicht mit der Vorgabe überein")
+            if self._power_settings_diag.get("status") == "confirmed_from_get_ack_unknown":
+                log.warning(
+                    "RSCP POWER_SETTINGS: SET-Antwort unbekannt; kanonischer GET bestätigt "
+                    "limits=%s max_charge=%dW max_discharge=%dW discharge_start=%dW",
+                    "on" if limits_used else "off",
+                    charge_w,
+                    discharge_w,
+                    discharge_start_w,
+                )
+            else:
+                log.info(
+                    "RSCP POWER_SETTINGS: limits=%s max_charge=%dW max_discharge=%dW discharge_start=%dW",
+                    "on" if limits_used else "off",
+                    charge_w,
+                    discharge_w,
+                    discharge_start_w,
+                )
             return True
         except Exception as exc:
             log.error("RSCP power_settings: %s", exc)

@@ -6,6 +6,33 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.0b] – 2026-07-23
+
+### 📦 Installation, Update und Docker
+
+- 🐛 **Fehlerbehebung:** Auf Debian-Systemen mit PEP 668 installiert das Release-Update keine Python-Pakete mehr in die verwaltete Systemumgebung. Abhängigkeiten werden im gebundenen Benutzer-venv aktualisiert; fehlt das Standard-venv, wird es nach Installation von `python3-venv` kontrolliert neu angelegt.
+- 🔄 **Kompatibilität:** Docker-Installationen werden im Web- und Konsolen-Updater eindeutig erkannt. Statt eines ungeeigneten Release-Wechsels im Container werden die notwendigen `docker compose`-Befehle für den Host angezeigt.
+- 🐳 **Docker-Update:** Die mitgelieferte Compose-Datei folgt ohne bewussten Pin dem geprüften Stable-Tag `latest`. Ein fest eingetragener Versions-Tag bleibt fest; `docker compose config --images` macht das Ziel vor dem Pull sichtbar.
+- 🛡️ **Docker-Rückfall:** Ein Stable-Container wird nur noch freigegeben, wenn das in der Update-Policy beworbene Rückfall-Image tatsächlich für AMD64 und ARM64 verfügbar ist. Historische Quellbytes und der aktuelle OCI-Prüfer bleiben dabei getrennt gebunden.
+- 🛡️ **Bare-Metal-Rückfall:** `v5.3.2b` bleibt als Docker-Image verfügbar, wird auf Bare Metal aber nicht mehr als Programm-Rückfall angeboten. Der Altstand besitzt keinen zielgebundenen Finalizer; verifizierte Datei-Backups bleiben der sichere Bare-Metal-Rückweg.
+- 🛡️ **Sicherheit:** Wrapper- und sudoers-Reparatur verwenden einen gebundenen Snapshot und rollen Teilfehler atomar zurück. Runtime- und Session-Rechte werden von diesem engen Reparaturpfad nicht nebenbei verändert.
+- 🧱 **Stabilität:** Kanonische systemd-Masken auf `/dev/null` werden als Zustand gesichert und beim Restore verifiziert. Sie werden nicht mehr fälschlich wie reguläre Unit-Dateien behandelt; andere Symlinks bleiben gesperrt.
+- 🔐 **Sicherheit:** Nach dem Git-Wechsel führt ein eigener, an Ziel-SHA und Zielbaum gebundener Finalizer die Installation fort. Dadurch werden keine bereits importierten Module des alten Release-Stands in den neuen Zielbaum übernommen.
+
+### 🔌 Wallboxen und PV-Kurve
+
+- 🐛 **Fehlerbehebung:** Eine openWB Pro erhält nach einem bestätigten Ab- und Wiederanstecken eine neue, entprellte Stecksession. Alte Stop-, Null- und Wake-up-Belege blockieren den nächsten berechtigten Ladestart nicht mehr.
+- 🛡️ **Sicherheit:** Die Startwiederherstellung gibt zuerst den Ladestrom aus. Im Automatikmodus folgt ein kurzer CP-Wake-up nur bei ausbleibender Ladeannahme und unterstützter openWB-Pro-API; ausdrückliche Nutzerfreigabe oder -sperre bleibt erhalten. Das Versuchsbudget ist begrenzt und persistent.
+- 🧱 **Stabilität:** Ein bereits frisch bestätigtes Phasenziel wird ohne neuen Phasenwechsel übernommen. Nach einem tatsächlichen Wechsel bleibt das vollständige 480-Sekunden-Schutzfenster aktiv; fremde alte Ausgangsbelege werden nicht mit einer neuen Reservierung vermischt.
+- ⚙️ **Regelung:** Alle unterstützten Wallboxpfade verwenden für fehlendes PV-Budget denselben typisierten Halte-/Stoppvertrag. Kurze Batteriestützung einer bereits laufenden PV-Ladung bleibt innerhalb des bestehenden Energiebudgets zulässig; harte Stopps und ein verbrauchtes Budget haben Vorrang.
+- 🔎 **Diagnose:** Die Anzeige „sicherer Wiederanlauf nach Neustart“ erscheint nur noch, wenn die zugehörige Phasentransition tatsächlich aktiv ist.
+
+### 🔋 Speicher und Ladefähigkeit
+
+- 🐛 **Fehlerbehebung:** Liefert eine E3/DC-Generation keine vollständig auswertbare `POWER_SETTINGS`-SET-Antwort, kann ein unmittelbar anschließender, exakt passender und typisierter GET-Readback die sichere Wirkung bestätigen. Die unbekannte SET-Bestätigung bleibt dabei ausdrücklich als unbekannt ausgewiesen.
+- 🛡️ **Sicherheit:** Fehlende oder abweichende GET-Werte bleiben ein Fehler und werden nicht als erfolgreiche Bestätigung umgedeutet.
+- ⚙️ **Regelung:** Frische RSCP-Hardwaregrenzen dürfen den konfigurierten Ladewert nur absenken. Temporäre `POWER_SETTINGS`-Werte werden nicht als neue dauerhafte Ladefähigkeit in PV-Kurve oder Headroom-Planung übernommen.
+
 ## [5.4.0a] – 2026-07-22
 
 ### 📦 Installation und Update
@@ -52,7 +79,7 @@ Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame
 
 - 🛡️ **Sicherheit:** Update, Backup, Rollback und Web-Planung arbeiten transaktional. Unvollständige Sicherungen, Timeouts und Teilfehler brechen ab und erhalten den letzten konsistenten Konfigurations- und Dienstzustand.
 - 🔐 **Datenschutz:** Lokale Konfigurationen, Sicherungen, Diagnosen, Zugangsdaten und Repository-Historie sind aus dem Docker-Buildkontext ausgeschlossen.
-- 🔄 **Migration/Kompatibilität:** Einziger vorgesehener öffentlicher Rückfallstand ist der in `UPDATE_POLICY.json` exakt gebundene Release-/Rollback-Tag `v5.3.2b`.
+- 🔄 **Migration/Kompatibilität:** Der in `UPDATE_POLICY.json` exakt gebundene Rückfall-Tag `v5.3.2b` ist ausschließlich für Docker freigegeben; Bare Metal bietet für diesen Altstand keinen Programm-Rückfall an.
 
 ## [5.3.2b] – 2026-07-15
 

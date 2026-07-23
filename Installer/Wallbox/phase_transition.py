@@ -306,6 +306,111 @@ def update_reservation(state, *, status=None, now_ts=0.0, connected=None):
     return public_reservation(reservation, now)
 
 
+def _evidence_generation_match(evidence_id, reservation_id):
+    """Bindet eine persistierte Ausgangs-ID an genau eine Reservierung.
+
+    ``None`` bedeutet, dass ein älteres Schema keine eindeutige ID liefert und
+    deshalb weiterhin konservativ als möglicherweise zugehörig gilt.
+    """
+
+    evidence = str(evidence_id or "")
+    reservation = str(reservation_id or "")
+    if not evidence or not reservation:
+        return None
+    return bool(evidence == reservation or evidence.startswith(reservation + ":"))
+
+
+def output_evidence_binding_contract(
+    reservation,
+    *,
+    sequence=None,
+    output_intent=None,
+    output_ack=None,
+    recovery_hold=None,
+    restart_authorized=None,
+):
+    """Ordnet persistierte Phasenausgänge ihrer Reservierung zu.
+
+    Vor älteren Managerständen konnten ein bereits bestätigter Ausgang und
+    eine spätere, noch uncommittete Reservierung gemeinsam gespeichert werden.
+    Beim Neustart durfte daraus keine künstliche Mischgeneration entstehen.
+    Nur explizit fremde Evidenz wird verworfen; bei fehlenden IDs bleibt der
+    Vertrag bewusst fail-closed.
+    """
+
+    item = reservation if isinstance(reservation, dict) else {}
+    reservation_id = str(
+        item.get("transition_id") or item.get("reservation_id") or ""
+    )
+    reservation_target = _int(item.get("target_phases"), 0)
+
+    intent = output_intent if isinstance(output_intent, dict) else {}
+    intent_id = str(intent.get("intent_id") or "")
+    intent_match = _evidence_generation_match(
+        intent.get("transition_id") or intent_id,
+        reservation_id,
+    )
+    ack = output_ack if isinstance(output_ack, dict) else {}
+    ack_id = str(ack.get("intent_id") or "")
+    supported_intent = bool(
+        str(intent.get("schema") or "")
+        == "openwb_pro_phase_output_intent_v1"
+        and (
+            (
+                str(intent.get("action") or "") == "send_zero"
+                and str(intent.get("method") or "") == "set_amp_and_state"
+            )
+            or (
+                str(intent.get("action") or "") == "send_phase"
+                and str(intent.get("method") or "") == "set_phases"
+            )
+        )
+    )
+    closed_foreign_pair = bool(
+        intent
+        and ack
+        and intent_match is False
+        and supported_intent
+        and str(ack.get("schema") or "") == "openwb_pro_phase_output_ack_v1"
+        and intent_id
+        and ack_id == intent_id
+        and ack.get("success") is True
+    )
+    intent_unrelated = bool(closed_foreign_pair)
+    ack_unrelated = bool(closed_foreign_pair)
+    intent_bound = bool(intent and not closed_foreign_pair)
+    ack_bound = bool(ack and not closed_foreign_pair)
+
+    seq = sequence if isinstance(sequence, dict) else {}
+    sequence_unrelated = False
+    sequence_bound = bool(seq)
+
+    recovery = recovery_hold if isinstance(recovery_hold, dict) else {}
+    recovery_unrelated = False
+    recovery_bound = bool(recovery)
+
+    restart = restart_authorized if isinstance(restart_authorized, dict) else {}
+    restart_unrelated = False
+    restart_bound = bool(restart)
+
+    return {
+        "contract": "wallbox_phase_output_generation_binding_v1",
+        "reservation_id": reservation_id,
+        "reservation_target": reservation_target,
+        "closed_foreign_intent_ack_pair": closed_foreign_pair,
+        "output_intent_bound": intent_bound,
+        "output_intent_ignored_unrelated": intent_unrelated,
+        "output_ack_bound": ack_bound,
+        "output_ack_ignored_unrelated": ack_unrelated,
+        "sequence_bound": sequence_bound,
+        "sequence_ignored_unrelated": sequence_unrelated,
+        "recovery_hold_bound": recovery_bound,
+        "recovery_hold_ignored_unrelated": recovery_unrelated,
+        "restart_authorized_bound": restart_bound,
+        "restart_authorized_ignored_unrelated": restart_unrelated,
+    }
+
+
 def expiration_resolution_contract(
     reservation,
     *,
@@ -357,14 +462,22 @@ def expiration_resolution_contract(
         and _float(item.get("committed_ts"), 0.0) <= 0.0
         and _int(item.get("valid_frames"), 0) == 0
     )
-    sequence_present = bool(isinstance(sequence, dict) and sequence)
-    intent_present = bool(isinstance(output_intent, dict) and output_intent)
-    ack_present = bool(isinstance(output_ack, dict) and output_ack)
+    generation_binding = output_evidence_binding_contract(
+        item,
+        sequence=sequence,
+        output_intent=output_intent,
+        output_ack=output_ack,
+        recovery_hold=recovery_hold,
+        restart_authorized=restart_authorized,
+    )
+    sequence_present = bool(generation_binding["sequence_bound"])
+    intent_present = bool(generation_binding["output_intent_bound"])
+    ack_present = bool(generation_binding["output_ack_bound"])
     recovery = recovery_hold if isinstance(recovery_hold, dict) else {}
-    recovery_present = bool(recovery)
+    recovery_present = bool(generation_binding["recovery_hold_bound"])
 
     restart = restart_authorized if isinstance(restart_authorized, dict) else {}
-    restart_present = bool(restart)
+    restart_present = bool(generation_binding["restart_authorized_bound"])
     restart_target = _int(restart.get("target"), 0)
     readback_target = 0
     for key in ("phases_target", "target_phases", "phase_wallbox_phases"):
@@ -441,6 +554,29 @@ def expiration_resolution_contract(
         "wakeup_active": bool(wakeup_active),
         "restart_target": restart_target,
         "readback_target": readback_target,
+        "output_intent_bound": bool(generation_binding["output_intent_bound"]),
+        "output_intent_ignored_unrelated": bool(
+            generation_binding["output_intent_ignored_unrelated"]
+        ),
+        "output_ack_bound": bool(generation_binding["output_ack_bound"]),
+        "output_ack_ignored_unrelated": bool(
+            generation_binding["output_ack_ignored_unrelated"]
+        ),
+        "sequence_bound": bool(generation_binding["sequence_bound"]),
+        "sequence_ignored_unrelated": bool(
+            generation_binding["sequence_ignored_unrelated"]
+        ),
+        "recovery_hold_bound": bool(generation_binding["recovery_hold_bound"]),
+        "recovery_hold_ignored_unrelated": bool(
+            generation_binding["recovery_hold_ignored_unrelated"]
+        ),
+        "restart_authorized_bound": bool(
+            generation_binding["restart_authorized_bound"]
+        ),
+        "restart_authorized_ignored_unrelated": bool(
+            generation_binding["restart_authorized_ignored_unrelated"]
+        ),
+        "generation_binding": generation_binding,
         "ts": now,
     }
 
@@ -567,6 +703,7 @@ def status_dimensions(reservation, *, charge_truth="unknown", inhibit_owner="non
     cooldown_until = _float(item.get("cooldown_until_ts"), 0.0)
     return {
         "transition_state": {
+            "active": bool(item.get("active")),
             "state": visible_stage,
             "transition_id": str(item.get("transition_id") or item.get("reservation_id") or ""),
             "target_phases": _int(item.get("target_phases"), 0),

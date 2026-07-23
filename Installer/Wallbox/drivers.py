@@ -3871,6 +3871,9 @@ class OpenWBProCharger(WallboxDriver):
             "_soc_raw_value": None,
             "serial": None,
             "version": None,
+            "openwb_pro_api_version": 0,
+            "automatic_start_cp_supported": False,
+            "automatic_start_cp_capability_source": "connect_php_version_unknown",
             "v2g_ready": 0,
             "evse_signaling": "",
             "offered_current_raw": 0.0,
@@ -4396,6 +4399,14 @@ class OpenWBProCharger(WallboxDriver):
             "rfid_timestamp": self.state.get("rfid_timestamp"),
             "serial": self.state.get("serial"),
             "version": self.state.get("version"),
+            "openwb_pro_api_version": self.state.get("openwb_pro_api_version", 0),
+            "automatic_start_cp_supported": bool(
+                self.state.get("automatic_start_cp_supported", False)
+            ),
+            "automatic_start_cp_capability_source": self.state.get(
+                "automatic_start_cp_capability_source",
+                "connect_php_version_missing_or_legacy",
+            ),
             "v2g_ready": self.state.get("v2g_ready", 0),
             "evse_signaling": self.state.get("evse_signaling", ""),
             "offered_current_raw": self.state.get("offered_current_raw", 0.0),
@@ -4543,6 +4554,11 @@ class OpenWBProCharger(WallboxDriver):
 
         visible_current = offered_current if effective_plug_state else 0.0
 
+        raw_api_version = data.get("version")
+        try:
+            api_version = max(0, int(float(raw_api_version)))
+        except (TypeError, ValueError):
+            api_version = 0
         self.state.update({
             "plug_state": effective_plug_state,
             "plug_state_raw": plug_state,
@@ -4582,7 +4598,14 @@ class OpenWBProCharger(WallboxDriver):
             "stable_vehicle_identity_current": bool(stable_vehicle_identity_current),
             "rfid_timestamp": data.get("rfid_timestamp"),
             "serial": data.get("serial"),
-            "version": data.get("version"),
+            "version": raw_api_version,
+            "openwb_pro_api_version": api_version,
+            "automatic_start_cp_supported": bool(api_version >= 9),
+            "automatic_start_cp_capability_source": (
+                "connect_php_version_gte_9"
+                if api_version >= 9
+                else "connect_php_version_missing_or_legacy"
+            ),
             "v2g_ready": data.get("v2g_ready", 0),
             "evse_signaling": data.get("evse_signaling", ""),
             "offered_current_raw": offered_current,

@@ -9,6 +9,8 @@ muss.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import errno
+import grp
 import json
 import os
 from pathlib import Path
@@ -126,31 +128,120 @@ def _untrusted(error: str) -> TransitionContext:
     return TransitionContext("", "", "", "", "", False, "blocked", _is_container(), error)
 
 
-def _validate_venv_python(venv: Path, account_uid: int) -> Path:
-    marker = venv / "pyvenv.cfg"
-    if marker.is_symlink() or not marker.is_file():
-        raise TransitionContextError("Venv besitzt keinen eindeutigen pyvenv.cfg-Marker")
-    marker_info = marker.stat()
-    if marker_info.st_nlink != 1 or marker_info.st_uid not in (0, account_uid):
-        raise TransitionContextError("Venv-Marker besitzt keinen vertrauenswürdigen Eigentümer")
-    if marker_info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-        raise TransitionContextError("Venv-Marker ist gruppen- oder weltbeschreibbar")
+def venv_group_is_private(group_id: int, install_user: str) -> bool:
+    """Akzeptiert Gruppen-Schreibrechte nur ohne fremde Gruppenmitglieder."""
+    try:
+        group = grp.getgrgid(int(group_id))
+        principals = {
+            entry.pw_name
+            for entry in pwd.getpwall()
+            if int(entry.pw_gid) == int(group_id)
+        }
+        principals.update(str(name) for name in group.gr_mem if str(name))
+    except (KeyError, OSError, TypeError, ValueError):
+        return False
+    return principals.issubset({"root", str(install_user)})
 
-    python = venv / "bin" / "python3"
+
+def venv_has_extended_acl(path: Path) -> bool:
+    """Unbekannte oder erweiterte POSIX-ACLs bleiben an der Vertrauensgrenze rot."""
+    try:
+        names = set(os.listxattr(
+            path,
+            follow_symlinks=False,
+        ))
+        return bool({"system.posix_acl_access", "system.posix_acl_default"} & names)
+    except AttributeError:
+        return False
+    except OSError as exc:
+        if exc.errno in {
+            getattr(errno, "ENODATA", -1),
+            getattr(errno, "ENOTSUP", -1),
+            getattr(errno, "EOPNOTSUPP", -1),
+        }:
+            return False
+        return True
+
+
+def venv_metadata_is_trusted(
+    path: Path,
+    account,
+    *,
+    kind: str,
+    single_link: bool = False,
+) -> bool:
+    try:
+        metadata = path.lstat()
+    except OSError:
+        return False
+    if path.is_symlink():
+        return False
+    if kind == "directory" and not stat.S_ISDIR(metadata.st_mode):
+        return False
+    if kind == "regular" and not stat.S_ISREG(metadata.st_mode):
+        return False
+    if single_link and metadata.st_nlink != 1:
+        return False
+    if metadata.st_uid not in (0, account.pw_uid):
+        return False
+    if metadata.st_mode & stat.S_IWOTH:
+        return False
+    if metadata.st_mode & stat.S_IWGRP and not venv_group_is_private(
+        metadata.st_gid,
+        account.pw_name,
+    ):
+        return False
+    return not venv_has_extended_acl(path)
+
+
+def venv_directory_chain_is_trusted(root: Path, target: Path, account) -> bool:
+    try:
+        relative = target.relative_to(root)
+    except ValueError:
+        return False
+    current = root
+    if not venv_metadata_is_trusted(current, account, kind="directory"):
+        return False
+    for component in relative.parts:
+        current = current / component
+        if not venv_metadata_is_trusted(current, account, kind="directory"):
+            return False
+    return True
+
+
+def _validate_venv_python(venv: Path, account) -> Path:
+    marker = venv / "pyvenv.cfg"
+    if not venv_metadata_is_trusted(
+        marker,
+        account,
+        kind="regular",
+        single_link=True,
+    ):
+        raise TransitionContextError("Venv besitzt keinen vertrauenswürdigen pyvenv.cfg-Marker")
+
+    bin_dir = venv / "bin"
+    if not venv_directory_chain_is_trusted(venv, bin_dir, account):
+        raise TransitionContextError("Venv-bin besitzt keinen vertrauenswürdigen Pfad")
+
+    python = bin_dir / "python3"
     try:
         link_info = python.lstat()
         target = python.resolve(strict=True)
         target_info = target.stat()
     except OSError as exc:
         raise TransitionContextError("Venv-Interpreter ist nicht auflösbar") from exc
-    if not stat.S_ISREG(target_info.st_mode) or not os.access(python, os.X_OK):
+    if not os.access(python, os.X_OK):
         raise TransitionContextError("Venv-Interpreter ist nicht ausführbar")
-    if link_info.st_uid not in (0, account_uid) or target_info.st_uid not in (0, account_uid):
+    if link_info.st_uid not in (0, account.pw_uid):
         raise TransitionContextError("Venv-Interpreter besitzt keinen vertrauenswürdigen Eigentümer")
-    if not stat.S_ISLNK(link_info.st_mode) and link_info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-        raise TransitionContextError("Venv-Interpreter-Link ist gruppen- oder weltbeschreibbar")
-    if target_info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-        raise TransitionContextError("Venv-Interpreterziel ist gruppen- oder weltbeschreibbar")
+    if not stat.S_ISLNK(link_info.st_mode) and not venv_metadata_is_trusted(
+        python,
+        account,
+        kind="regular",
+    ):
+        raise TransitionContextError("Venv-Interpreterdatei ist nicht vertrauenswürdig")
+    if not venv_metadata_is_trusted(target, account, kind="regular"):
+        raise TransitionContextError("Venv-Interpreterziel ist nicht vertrauenswürdig")
     return python
 
 
@@ -216,7 +307,11 @@ def get_transition_context(
         home_values = _unique_nonempty(
             (explicit_home_dir, *(data.get("home_dir") for _, data in metadata))
         )
-        account_home = str(Path(account.pw_dir).resolve(strict=True))
+        raw_account_home = Path(account.pw_dir)
+        account_home_path = _real_directory(str(raw_account_home), "Benutzer-Home")
+        if not venv_metadata_is_trusted(account_home_path, account, kind="directory"):
+            raise TransitionContextError("Benutzer-Home ist nicht vertrauenswürdig")
+        account_home = str(account_home_path)
         if home_values:
             homes = {str(_real_directory(value, "Home-Verzeichnis")) for value in home_values}
             if homes != {account_home}:
@@ -237,7 +332,9 @@ def get_transition_context(
         venv_python = ""
         if venv_values:
             venv = _real_directory(venv_values[0], "Venv-Verzeichnis")
-            python = _validate_venv_python(venv, account.pw_uid)
+            if not venv_directory_chain_is_trusted(account_home_path, venv, account):
+                raise TransitionContextError("Venv-Pfad ist nicht vertrauenswürdig")
+            python = _validate_venv_python(venv, account)
             venv_path = str(venv)
             venv_python = str(python)
 

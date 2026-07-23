@@ -8,6 +8,8 @@ import shlex
 import sys
 from pathlib import Path
 
+from .installer_config import _resolve_install_root
+
 # ---------------------------------------------------------------------------
 # Zentrale Pfad-Aufloesung (V4) — NIEMALS Pfade hartcodieren!
 # Lese-Reihenfolge: e3dc_v4.json → e3dc_paths.json → installer_config.json → Defaults
@@ -91,13 +93,7 @@ def get_paths() -> dict:
         (str(data.get("install_path") or "").strip() for data in metadata if data.get("install_path")),
         "",
     )
-    root = _validated_install_root(explicit_root or configured_root or _MODULE_INSTALL_ROOT)
-
-    # Pfadmetadaten dürfen ein laufendes Release nicht still auf einen anderen
-    # Produktbaum umleiten.
-    module_root = _validated_install_root(_MODULE_INSTALL_ROOT)
-    if root != module_root:
-        raise RuntimeError("Pfadmetadaten und ausgeführter Release-Root widersprechen sich")
+    root = Path(_resolve_install_root(_MODULE_INSTALL_ROOT, explicit_root, configured_root))
 
     def first_value(key: str, env_name: str = "") -> str:
         if env_name:

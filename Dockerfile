@@ -39,6 +39,7 @@ RUN PHP_APACHE_MOD="$(php -r 'echo "php".PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION
 # 3. Python VENV mit allen Abhängigkeiten
 RUN python3 -m venv --system-site-packages /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
+ENV E3DC_CONTAINER_MODE=1
 RUN pip3 install --upgrade pip wheel setuptools && \
     pip3 install --prefer-binary paho-mqtt requests websocket-client websockets luxtronik hyundai_kia_connect_api pywebpush pycryptodome pymodbus
 

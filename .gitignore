@@ -156,6 +156,7 @@
 !/Installer/pv_forecast_topology.py
 !/Installer/quiet_logging.py
 !/Installer/ramdisk.py
+!/Installer/release_finalize.py
 !/Installer/repair_home_grid_doublecounting.py
 !/Installer/reserve.py
 !/Installer/rollback.py

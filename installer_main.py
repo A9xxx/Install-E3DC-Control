@@ -26,6 +26,13 @@ except ImportError:
 # V4: Web-UI Zero Touch übernimmt die Konfiguration, Console ist immer Unattended
 UNATTENDED_MODE = True
 
+
+def _is_docker_environment():
+    if os.path.isfile('/.dockerenv'):
+        return True
+    marker = str(os.environ.get('E3DC_CONTAINER_MODE') or '').strip().lower()
+    return marker in {'1', 'true', 'yes', 'docker'}
+
 # Standard-Ausgabe auf UTF-8 erzwingen (verhindert UnicodeEncodeError z.B. bei sudo ohne Locale)
 # und Pufferung für Non-TTY Umgebungen (Web-Interface) anpassen
 try:
@@ -223,6 +230,22 @@ def main():
     parser.add_argument("--unattended", action="store_true", help="Ohne Benutzereingaben ausführen (für PHP/Cron)")
     parser.add_argument("--update-e3dc", action="store_true", help="E3DC-Control aktualisieren (headless)")
     parser.add_argument("--install-release-tag", default="", help="Gezielt einen validierten Release-Tag installieren")
+    parser.add_argument(
+        "--bootstrap-install-path",
+        default="",
+        help="Absoluter Zielpfad für eine geprüfte V3/ZIP- oder V4-Altinstallation",
+    )
+    parser.add_argument(
+        "--expected-release-sha",
+        default="",
+        help="Explizit freigegebene volle 40-stellige Ziel-SHA (für Bootstrap verpflichtend)",
+    )
+    parser.add_argument(
+        "--expected-ha-role",
+        choices=("off", "master", "slave", "shadow"),
+        default="",
+        help="Vor dem Bootstrap erwartete und danach unveränderte HA-/Shadow-Rolle",
+    )
     parser.add_argument("--fix-permissions", action="store_true", help="Dateirechte und Dienste headless pruefen/reparieren")
     parser.add_argument("--prepare-system-packages", action="store_true", help="Nur Systempakete/Python-Abhängigkeiten installieren und danach beenden")
     parser.add_argument("--install-all", action="store_true", help="Vollständige Installation durchführen (headless)")
@@ -230,16 +253,37 @@ def main():
     args = parser.parse_args()
     UNATTENDED_MODE = args.unattended
 
+    bootstrap_values = (
+        args.bootstrap_install_path,
+        args.expected_release_sha,
+        args.expected_ha_role,
+    )
+    if any(bootstrap_values) and not args.install_release_tag:
+        parser.error("Bootstrap-Optionen sind nur zusammen mit --install-release-tag zulässig")
+
+    if (args.update_e3dc or args.install_release_tag) and _is_docker_environment():
+        print("[i] Docker-Installation erkannt: Im Container wird kein Release-Wechsel ausgeführt.")
+        print("    Bitte auf dem Docker-Host im Verzeichnis Deiner vorhandenen Compose-Konfiguration ausführen:")
+        print("    docker compose config --images")
+        print("    docker compose pull e3dc-control")
+        print("    docker compose up -d --force-recreate e3dc-control")
+        print("    Hinweis: Ein fest eingetragener Versions-Tag bleibt fest. Für automatische Stable-Updates")
+        print("    muss die Compose-Datei latest bzw. ${E3DC_IMAGE_TAG:-latest} verwenden.")
+        sys.exit(0)
+
     try:
         # Führe den BOM-Fixer aus, um Dateikodierungsprobleme zu beheben
-        if fix_bom_main:
+        if fix_bom_main and not args.bootstrap_install_path:
             print("→ Prüfe Dateikodierungen (BOM)...")
             sys.stdout.flush()
             fix_bom_main()
             print("✓ BOM-Prüfung abgeschlossen.")
             sys.stdout.flush()
-        else:
+        elif not fix_bom_main:
             print("⚠ Warnung: BOM-Fixer-Skript (fix_bom.py) nicht gefunden.")
+            sys.stdout.flush()
+        else:
+            print("→ Release-Bootstrap: BOM-Prüfung bleibt bis nach dem verifizierten Backup ausgesetzt.")
             sys.stdout.flush()
 
         setup_logging()
@@ -271,16 +315,26 @@ def main():
             sys.exit(0 if update_ok is not False else 1)
 
         if args.install_release_tag:
-            print(f"-> Starte Release-Rückfall auf {args.install_release_tag}...")
+            action_label = "Release-Bootstrap" if args.bootstrap_install_path else "Release-Rückfall"
+            print(f"-> Starte {action_label} auf {args.install_release_tag}...")
             sys.stdout.flush()
             from Installer.update import update_e3dc
-            update_ok = update_e3dc(headless=True, target_ref=args.install_release_tag)
+            update_ok = update_e3dc(
+                headless=True,
+                target_ref=args.install_release_tag,
+                target_install_path=args.bootstrap_install_path or None,
+                expected_release_sha=args.expected_release_sha or None,
+                expected_ha_role=args.expected_ha_role or None,
+            )
 
-            config = load_config()
-            user = config.get("install_user")
-            if user:
-                logger = logging.getLogger("install")
-                ensure_web_config_safe(user, logger)
+            # Im Archiv-Bootstrap darf nach dem Reset ausschließlich der
+            # SHA-gebundene Target-Finalizer Zielcode ausführen.
+            if not args.bootstrap_install_path:
+                config = load_config()
+                user = config.get("install_user")
+                if user:
+                    logger = logging.getLogger("install")
+                    ensure_web_config_safe(user, logger)
 
             sys.exit(0 if update_ok is not False else 1)
 

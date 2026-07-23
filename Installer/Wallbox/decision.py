@@ -2068,6 +2068,45 @@ def pv_hybrid_hold_action(
     }
 
 
+def zero_budget_contract_from_pv_hybrid_gate(
+    gate: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Normalisiert das gemeinsame PV-Hybrid-Gate für die Start-/Stopp-Policy.
+
+    Die Zeit- und Energiebilanz ist für alle regelbaren Wallboxtypen gleich.
+    Treiberspezifische Alterszähler bleiben nur noch ein Legacy-Fallback, wenn
+    kein gültiger Vertrag aus dem gemeinsamen Gate vorliegt.
+    """
+
+    st = gate if isinstance(gate, dict) else {}
+    valid = str(st.get("schema_version") or "") == "wallbox_pv_hybrid_energy_gate_v1"
+    enabled = bool(st.get("enabled", False))
+    active = bool(
+        valid
+        and enabled
+        and st.get("running", False)
+        and st.get("stop_signal", False)
+    )
+    hard_stop = bool(active and st.get("hard_stop", False))
+    hold_allowed = bool(active and st.get("hold_allowed", False) and not hard_stop)
+    stop_allowed = bool(active and (st.get("stop_allowed", False) or hard_stop))
+    released = bool(active and stop_allowed and not hold_allowed)
+    return {
+        "schema_version": "wallbox_zero_budget_contract_v1",
+        "source": "pv_hybrid_energy_gate",
+        "source_valid": bool(valid),
+        "enabled": bool(enabled),
+        "active": bool(active),
+        "age_s": max(0.0, _safe_float(st.get("negative_age_s", 0.0), 0.0)),
+        "deficit_wh": max(0.0, _safe_float(st.get("negative_wh", 0.0), 0.0)),
+        "hold_allowed": bool(hold_allowed),
+        "stop_allowed": bool(stop_allowed),
+        "released": bool(released),
+        "hard_stop": bool(hard_stop),
+        "reason": str(st.get("reason", "invalid") or "invalid"),
+    }
+
+
 def native_verified_pv_sink_hold_contract(
     *,
     e3dc_native_toggle: bool,
@@ -2181,6 +2220,7 @@ def start_stop_hold_action(
     native_battery_drain_zero_budget_active: bool = False,
     native_verified_pv_sink_hold_active: bool = False,
     openwb_floor_zero_budget_stop_active: bool = False,
+    zero_budget_contract: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Wählt die übergeordnete Wallbox-Aktion vor jedem Treiberbefehl.
 
@@ -2222,6 +2262,45 @@ def start_stop_hold_action(
         and transient.get("active_or_offered", False)
     )
     transient_hold_reason = str(transient.get("reason", "") or "")
+
+    zero_budget = zero_budget_contract if isinstance(zero_budget_contract, dict) else {}
+    zero_budget_valid = bool(
+        str(zero_budget.get("schema_version") or "") == "wallbox_zero_budget_contract_v1"
+        and zero_budget.get("source_valid", False)
+    )
+    zero_budget_active = bool(zero_budget_valid and zero_budget.get("active", False))
+    zero_budget_hold_allowed = bool(
+        zero_budget_active
+        and zero_budget.get("hold_allowed", False)
+        and not zero_budget.get("hard_stop", False)
+    )
+    zero_budget_stop_allowed = bool(
+        zero_budget_active
+        and zero_budget.get("stop_allowed", False)
+        and not zero_budget_hold_allowed
+    )
+    zero_budget_hard_stop = bool(
+        zero_budget_active and zero_budget.get("hard_stop", False)
+    )
+    zero_budget_age = (
+        max(0.0, _safe_float(zero_budget.get("age_s", 0.0), 0.0))
+        if zero_budget_active
+        else (openwb_zero_age if openwb_like_charger else native_zero_age)
+    )
+    zero_budget_deficit_wh = (
+        max(0.0, _safe_float(zero_budget.get("deficit_wh", 0.0), 0.0))
+        if zero_budget_active
+        else 0.0
+    )
+    timed_zero_budget_hold_allowed = bool(
+        not zero_budget_active or zero_budget_hold_allowed
+    )
+
+    # Ein harter gemeinsamer Gate-Stopp darf von einem inkonsistenten positiven
+    # Upstream-Cap nicht wieder geöffnet werden. Die übrigen Schutzpfade werden
+    # wie bisher bereits vor diesem Aufruf auf cap=0 normalisiert.
+    if zero_budget_hard_stop:
+        cap = 0.0
 
     if cap > 0:
         return {
@@ -2323,9 +2402,14 @@ def start_stop_hold_action(
         and not local_grid_allowed
     ):
         multi_zero_budget_hold = bool(
-            (grid_w < 800.0 and native_zero_age < 180.0)
-            or native_zero_age < 45.0
-            or min_charge_hold_active
+            min_charge_hold_active
+            or (
+                timed_zero_budget_hold_allowed
+                and (
+                    (grid_w < 800.0 and zero_budget_age < 180.0)
+                    or zero_budget_age < 45.0
+                )
+            )
         )
 
     openwb_zero_budget_hard_stop = bool(
@@ -2379,27 +2463,38 @@ def start_stop_hold_action(
                 clean_hold_s = max(0.0, cloud_hold_s)
                 openwb_zero_budget_hold = bool(
                     min_charge_hold_active
-                    or (grid_w < 700.0 and openwb_zero_age < clean_hold_s)
-                    or (openwb_zero_age < 20.0 and grid_w < 1500.0)
                     or (
-                        hw_charging
-                        and hw_power > 500.0
-                        and grid_w < 1500.0
-                        and openwb_zero_age < min(180.0, clean_hold_s)
+                        timed_zero_budget_hold_allowed
+                        and (
+                            (grid_w < 700.0 and zero_budget_age < clean_hold_s)
+                            or (zero_budget_age < 20.0 and grid_w < 1500.0)
+                            or (
+                                hw_charging
+                                and hw_power > 500.0
+                                and grid_w < 1500.0
+                                and zero_budget_age < min(180.0, clean_hold_s)
+                            )
+                        )
                     )
                     or openwb_phase_transition_offer_active
                     or (transient.get("start_hold_active", False) and transient_offer_active)
                     or (
-                        phase_forecast_hold_for_wb
+                        timed_zero_budget_hold_allowed
+                        and phase_forecast_hold_for_wb
                         and grid_w < max(phase_down_w * 1.5, phase_down_w + 1200.0)
-                        and openwb_zero_age < phase_zero_s
+                        and zero_budget_age < phase_zero_s
                     )
                 )
         else:
             openwb_zero_budget_hold = bool(
                 min_charge_hold_active
-                or openwb_zero_age < min(45.0, cloud_hold_s)
-                or (grid_w < 5000.0 and openwb_zero_age < cloud_hold_s)
+                or (
+                    timed_zero_budget_hold_allowed
+                    and (
+                        zero_budget_age < min(45.0, cloud_hold_s)
+                        or (grid_w < 5000.0 and zero_budget_age < cloud_hold_s)
+                    )
+                )
             )
 
     controllable_export_cloud_hold = bool(
@@ -2420,6 +2515,7 @@ def start_stop_hold_action(
         and not local_price_optimizing_active
         and not local_grid_allowed
         and not price_boost_wallbox_active
+        and not native_battery_drain_zero_budget_active
         and (
             (
                 e3dc_native_toggle
@@ -2434,7 +2530,8 @@ def start_stop_hold_action(
             grid_w < -800.0
             or min_charge_hold_active
             or (
-                native_zero_age < cloud_hold_s
+                timed_zero_budget_hold_allowed
+                and zero_budget_age < cloud_hold_s
                 and grid_w < 2500.0
             )
         )
@@ -2460,7 +2557,8 @@ def start_stop_hold_action(
             or min_charge_hold_active
             or native_verified_pv_sink_hold_active
             or (
-                native_zero_age < cloud_hold_s
+                timed_zero_budget_hold_allowed
+                and zero_budget_age < cloud_hold_s
                 and grid_w < 2500.0
             )
         )
@@ -2579,6 +2677,14 @@ def start_stop_hold_action(
         "native_start_grace_active": bool(native_start_grace_active),
         "native_battery_drain_zero_budget_active": bool(native_battery_drain_zero_budget_active),
         "native_verified_pv_sink_hold_active": bool(native_verified_pv_sink_hold_active),
+        "zero_budget_contract_valid": bool(zero_budget_valid),
+        "zero_budget_contract_active": bool(zero_budget_active),
+        "zero_budget_hold_allowed": bool(zero_budget_hold_allowed),
+        "zero_budget_stop_allowed": bool(zero_budget_stop_allowed),
+        "zero_budget_hard_stop": bool(zero_budget_hard_stop),
+        "zero_budget_age_s": float(zero_budget_age),
+        "zero_budget_deficit_wh": float(zero_budget_deficit_wh),
+        "zero_budget_contract_source": str(zero_budget.get("source", "legacy_timer") or "legacy_timer"),
         "need_stop_toggle": bool(need_stop_toggle),
         "reason": action.lower(),
     }

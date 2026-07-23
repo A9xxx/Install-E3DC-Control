@@ -1,32 +1,67 @@
-# v5.4.0a
+# v5.4.0b
 
-E3DC-Control v5.4.0a ist ein enger Kompatibilitäts-Hotfix auf Basis von
-v5.4.0. Die Regelungsarchitektur und ihre Schutzverträge bleiben unverändert.
+E3DC-Control v5.4.0b ist der zweite Kompatibilitäts- und Stabilitäts-Hotfix auf
+Basis von v5.4.0. Er enthält auch die Korrekturen aus v5.4.0a.
 
-## Korrekturen in v5.4.0a
+## Korrekturen in v5.4.0b
 
-- Das normale Bare-Metal-Update installiert keine optionalen Matter-Pakete
-  mehr. Node.js, npm, Avahi und D-Bus werden ausschließlich bei einer
-  ausdrücklich gestarteten Matter-Installation gemeinsam geprüft und
-  installiert. Ein Apt-Konflikt dieser optionalen Pakete blockiert damit kein
-  E3DC-Control-Update mehr.
-- Der Web-Updater prüft seinen privilegierten Installer-Wrapper jetzt vor der
-  sudo-Freigabe gegen den veröffentlichten Git-Stand. Eine reine
-  CRLF-Beschädigung kann kontrolliert auf die exakten Release-Bytes repariert
-  werden; andere Abweichungen brechen sicher ab und werden eindeutig erklärt.
+- Auf Debian-Systemen mit PEP 668 aktualisiert der Bare-Metal-Updater
+  Python-Abhängigkeiten ausschließlich im gebundenen Benutzer-venv. Es gibt
+  keinen System-`pip`-Eingriff und kein `--break-system-packages`. Fehlt das
+  Standard-venv, wird es nach Installation von `python3-venv` kontrolliert neu
+  angelegt.
+- Docker-Installationen werden im Web- und Konsolen-Updater erkannt. Der
+  Container versucht nicht, sich selbst zu ersetzen, sondern zeigt die drei
+  notwendigen `docker compose`-Befehle für den Host.
+- Die mitgelieferte Compose-Datei folgt ohne bewussten Pin dem geprüften
+  Stable-Tag `latest`. Ein fester Versions-Tag bleibt fest; die tatsächlich
+  gewählte Image-Referenz wird vor dem Pull sichtbar geprüft.
+- Die Container-Freigabe bricht ab, solange ein in der Update-Policy
+  beworbenes Rückfall-Image nicht für AMD64 und ARM64 verfügbar ist.
+  Historische Release-Quellen werden dabei weiterhin exakt gebaut, aber mit
+  dem zum gestarteten Workflow gehörenden OCI-Prüfer kontrolliert.
+- Wrapper, sudoers und kanonische systemd-Masken werden vor Änderungen gebunden
+  gesichert und bei Teilfehlern kontrolliert zurückgesetzt. Nach dem Git-Wechsel
+  setzt ein eigener, an Ziel-SHA und Zielbaum gebundener Finalizer die
+  Installation ausschließlich mit Modulen des neuen Stands fort.
+- Eine openWB Pro erhält nach einem bestätigten Ab- und Wiederanstecken eine
+  neue entprellte Stecksession. Die Startfreigabe wird stromgeführt projiziert;
+  ein kurzer CP-Wake-up ist nur bei ausbleibender Ladeannahme, unterstützter API
+  und innerhalb eines persistent begrenzten Versuchsbudgets zulässig.
+- Bereits bestätigte Phasenziele werden ohne unnötigen Wechsel übernommen. Nach
+  einem tatsächlichen Phasenwechsel bleibt das Schutzfenster von mindestens
+  480 Sekunden vollständig erhalten.
+- Alle unterstützten Wallboxpfade verwenden denselben typisierten Halte- und
+  Stoppvertrag bei fehlendem PV-Budget. Eine bereits laufende PV-Ladung darf
+  kurze Einbrüche nur innerhalb des vorhandenen Batteriestützbudgets überbrücken.
+- Kann eine `POWER_SETTINGS`-SET-Antwort nicht vollständig ausgewertet werden,
+  bestätigt ausschließlich ein unmittelbar folgender, typisierter und exakt
+  passender GET-Readback die Wirkung. Fehlende oder abweichende Werte bleiben
+  ein Fehler.
+- Frische RSCP-Hardwaregrenzen dürfen einen konfigurierten Ladewert nur
+  absenken. Temporäre `POWER_SETTINGS`-Werte werden nicht als neue dauerhafte
+  Ladefähigkeit in PV-Kurve oder Headroom-Planung übernommen.
+
+## Enthaltene Korrekturen aus v5.4.0a
+
+- Das normale Bare-Metal-Update installiert keine optionalen Matter-Pakete.
+  Node.js, npm, Avahi und D-Bus werden nur bei einer ausdrücklich gestarteten
+  Matter-Installation gemeinsam geprüft und installiert.
+- Der Web-Updater bindet seinen privilegierten Installer-Wrapper an den
+  veröffentlichten Git-Stand und repariert eine reine CRLF-Beschädigung
+  kontrolliert auf die exakten Release-Bytes.
 - Alte Shelly-EM-Zähler der ersten Generation können über ihre lokale
-  read-only-Status-API eingebunden werden. Die automatische Erkennung fällt
-  nach einer nicht unterstützten RPC-Antwort auf Gen1 zurück; Kanal und Summe
-  werden explizit ausgewertet, fehlende oder ungültige Messwerte bleiben
+  read-only-Status-API eingebunden werden; ungültige Messwerte bleiben
   unbekannt.
 
 ## Update und Docker
 
-Bare-Metal-Nutzer können v5.4.0a über den Web- oder Konsolen-Updater
+Bare-Metal-Nutzer können v5.4.0b über den Web- oder Konsolen-Updater
 installieren. Das veröffentlichte Container-Image trägt den Tag
-`v5.4.0a`; `latest` wird erst nach bestandener Kandidaten- und
+`v5.4.0b`; `latest` wird erst nach bestandener Kandidaten- und
 Attestierungsprüfung auf denselben Digest gesetzt. Der vorgesehene öffentliche
-Rückfallstand bleibt `v5.3.2b`.
+Docker-Rückfallstand bleibt `v5.3.2b`; Bare Metal bietet für diesen Altstand
+keinen Programm-Rückfall an.
 
 ## Funktionsumfang der Basis v5.4.0
 
@@ -125,15 +160,17 @@ Der Wechsel aus einer älteren, nicht verwandten Historie erfolgt über den
 geprüften Installer-/Bootstrapweg, nicht über `git pull`. Vor dem Umschreiben
 ist ein externes, manifestiertes und prüfsummengesichertes Backup Pflicht.
 
-Einziger vorgesehener öffentlicher Rückfallstand ist der sanitierte Root
-`v5.3.2b`. Ein Rückfall wird nur angeboten, wenn Tag, Commit-SHA und Artefakt
-in der veröffentlichten Update-Policy exakt übereinstimmen.
+Der sanitierte Root `v5.3.2b` bleibt als Docker-Rückfall-Image veröffentlicht.
+Er wird nur im Docker-Kontext angeboten und nur, wenn Tag, Commit-SHA und Image
+in der veröffentlichten Update-Policy exakt übereinstimmen. Für Bare Metal
+fehlt diesem Altstand der zielgebundene Release-Finalizer; deshalb wird dort
+kein Programm-Rückfall angeboten. Verifizierte Datei-Backups bleiben nutzbar.
 
 ## Docker
 
 Die Images werden aus dem veröffentlichten Git-Stand über GitHub Actions
-gebaut. `latest` ist ausschließlich für v5.4.0a vorgesehen; der Rollback-Tag
-bleibt `v5.3.2b`. Matter-Abhängigkeiten stammen aus der Lockdatei, und das
+gebaut. `latest` ist ausschließlich für v5.4.0b vorgesehen; der Rollback-Tag
+bleibt `v5.3.2b` und ist ausdrücklich Docker-only. Matter-Abhängigkeiten stammen aus der Lockdatei, und das
 anlagenspezifische ML-Modell liegt in einem separaten persistenten Volume.
 
 Matter ist weiterhin ein nicht zertifizierter lokaler Integrationspfad.

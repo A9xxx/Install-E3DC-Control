@@ -55,11 +55,13 @@ ACTIVATION_TRANSACTION_KEYS = {
 POWER_SETTINGS_CONFIRMED_STATUSES = frozenset({
     "confirmed",
     "confirmed_bounded_zero",
+    "confirmed_from_get_ack_unknown",
     "confirmed_from_live_readback",
     "confirmed_nonoptimal",
     "confirmed_unchanged",
 })
 POWER_SETTINGS_LIVE_READBACK_STATUS = "confirmed_from_live_readback"
+POWER_SETTINGS_GET_ACK_UNKNOWN_STATUS = "confirmed_from_get_ack_unknown"
 POWER_SETTINGS_SCHEMA = "rscp_power_settings_v1"
 POWER_SETTINGS_CONTRACT_VERSION = 2
 SHADOW_INPUT_BINDING_SCHEMA = "storage_dispatch_shadow_input_binding_v2"
@@ -629,11 +631,72 @@ def _power_settings_contract(settings: Dict[str, Any]) -> Dict[str, Any]:
                 for key in ("max_charge_w", "max_discharge_w", "discharge_start_w")
             )
         )
+    get_ack_unknown_valid = True
+    if status == POWER_SETTINGS_GET_ACK_UNKNOWN_STATUS:
+        requested = settings.get("requested") if isinstance(settings.get("requested"), dict) else {}
+        readback = settings.get("readback") if isinstance(settings.get("readback"), dict) else {}
+        requested_limits_used = requested.get("limits_used")
+        readback_limits_used = readback.get("limits_used")
+        requested_values_valid = bool(
+            isinstance(requested_limits_used, bool)
+            and all(
+                isinstance(requested.get(key), int)
+                and not isinstance(requested.get(key), bool)
+                and requested.get(key) >= 0
+                for key in ("max_charge_w", "max_discharge_w", "discharge_start_w")
+            )
+        )
+        readback_values_valid = bool(
+            isinstance(readback_limits_used, bool)
+            and all(
+                isinstance(readback.get(key), int)
+                and not isinstance(readback.get(key), bool)
+                and readback.get(key) >= 0
+                for key in ("max_charge_w", "max_discharge_w", "discharge_start_w")
+            )
+        )
+        bounded_zero_w = settings.get("bounded_zero_w")
+        bounded_zero_valid = bool(
+            isinstance(bounded_zero_w, int)
+            and not isinstance(bounded_zero_w, bool)
+            and bounded_zero_w >= 0
+        )
+        values_match = False
+        if requested_values_valid and readback_values_valid and bounded_zero_valid:
+            if requested_limits_used is False and readback_limits_used is False:
+                values_match = True
+            elif requested_limits_used is True and readback_limits_used is True:
+                requested_charge_w = requested["max_charge_w"]
+                readback_charge_w = readback["max_charge_w"]
+                charge_matches = readback_charge_w == requested_charge_w
+                if requested_charge_w == 0 and bounded_zero_w > 0:
+                    charge_matches = 0 <= readback_charge_w <= bounded_zero_w
+                values_match = bool(
+                    charge_matches
+                    and readback["max_discharge_w"] == requested["max_discharge_w"]
+                    and readback["discharge_start_w"] == requested["discharge_start_w"]
+                )
+        response_codes = settings.get("response_codes")
+        set_response_unknown = bool(
+            response_codes is None
+            or (isinstance(response_codes, list) and len(response_codes) < 4)
+        )
+        get_ack_unknown_valid = bool(
+            settings.get("schema") == POWER_SETTINGS_SCHEMA
+            and settings.get("contract_version") == POWER_SETTINGS_CONTRACT_VERSION
+            and settings.get("stage") == "target"
+            and settings.get("readback_source") == "command_get_after_invalid_set_response"
+            and settings.get("acknowledged") is None
+            and settings.get("acknowledgement_status") == "unknown_invalid_set_response"
+            and set_response_unknown
+            and values_match
+        )
     valid = bool(
         settings.get("confirmed") is True
         and status in POWER_SETTINGS_CONFIRMED_STATUSES
         and timers_valid
         and live_readback_valid
+        and get_ack_unknown_valid
     )
     return {
         "valid": valid,
@@ -642,6 +705,7 @@ def _power_settings_contract(settings: Dict[str, Any]) -> Dict[str, Any]:
         "pending_remaining_s": pending_s,
         "timers_valid": timers_valid,
         "live_readback_valid": live_readback_valid,
+        "get_ack_unknown_valid": get_ack_unknown_valid,
     }
 
 

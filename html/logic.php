@@ -64,11 +64,13 @@ $hsEnabled = isHeaterEnabledConfig($_c);
 $awattar = (int)($_c['awattar'] ?? 0);
 $showPriceTrend = ($awattar === 1);
 if (!$showPriceTrend) {
-    // Fallback: e3dc.strompreise.txt (Legacy) pruefen
+    // Fallback: e3dc.strompreise.txt (Legacy) prüfen. Die optionale Datei darf
+    // bei fehlender Leseberechtigung oder einem Race niemals das Frontend
+    // durch count(false) unbenutzbar machen.
     $strompreiseFile = rtrim($paths['install_path'], '/') . '/e3dc.strompreise.txt';
-    if (file_exists($strompreiseFile)) {
-        $lines = file($strompreiseFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
-        if (count($lines) > 1) { $showPriceTrend = true; }
+    if (is_file($strompreiseFile) && is_readable($strompreiseFile)) {
+        $lines = @file($strompreiseFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+        if (is_array($lines) && count($lines) > 1) { $showPriceTrend = true; }
     }
 }
 

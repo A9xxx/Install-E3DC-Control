@@ -1,12 +1,12 @@
 # E3DC-Control Web-Portal & Installer
 
-Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.4.0e</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
+Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.4.1</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
 
 ![E3DC-Control Dashboard](html/app-icon-512.png)
 
 ## Aktuelle Version und Update
 
-Die aktuelle stabile Version ist **5.4.0e**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur geprüften Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
+Die aktuelle stabile Version ist **5.4.1**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur geprüften Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
 
 > [!WARNING]
 > **⚠️ Achtung: Nutzung auf eigenes Risiko!**
@@ -20,11 +20,13 @@ Die aktuelle stabile Version ist **5.4.0e**. Hinweise zum Web-, Konsolen- und Do
 
 > **Bedienansichten:** Config-Editor und Wallbox-Seite unterscheiden zwischen einfacher Ansicht für Einrichtung und täglichen Betrieb sowie erweiterter Ansicht für alle Detailparameter. Die Logik und Abgrenzung sind in [doc/Frontend_Ansichten.md](doc/Frontend_Ansichten.md) dokumentiert.
 
+> **Neu in 5.4.1 Stable:** Die openWB Pro startet und wechselt Phasen bestätigungsgebunden, ohne dass der 480-Sekunden-Schutz den Wiederanlauf blockiert. Fahrzeug-, Nutzer- und Ladepunktgrenzen sowie ein- und dreiphasige Ladeleistungen fließen in eine leistungsfaire Mehr-Wallbox-Zuteilung ein. Der Web-/Konsolen-Updater härtet den unterstützten Erstwechsel aus 5.3.2b; die Docker-Migration prüft Zielimage und gestartete Version. Docker-Images werden in einem zusammenhängenden, attestierten Build-und-Promote-Lauf erzeugt. Netzfrequenz, SG-Ready-/Shelly-Aktivität und wichtige Regelkonflikte sind im Frontend sichtbar. Batterie-Vitals adressiert jeden DCB-Pack einzeln und bindet vorhandene Antwortindizes. Gemeldete Status- und Fehlertexte im Konfigurationseditor werden ohne HTML-Injektion dargestellt. Eine echte phasenaufgelöste Anschlussfreigabe über 20 A bleibt fail-closed, bis ein bestätigter PCC-RMS-Stromvektor vorliegt.
+
 > **Neu in 5.4.0e Stable:** Der direkte Übergang aus der eigens dafür veröffentlichten Übergangsbasis 5.3.2b startet nur die sieben Pflichtdienste und bereits vor dem Wechsel installierte, in der eingefrorenen Konfiguration aktive Zusatzdienste. Deaktivierte Zusatzdienste bleiben aus. Alte Konfigurationsfelder allein aktivieren keine Wallbox-, Wärme- oder Integrationsdienste. Solche konfigurierten, aber nicht installierten Zusatzmodule werden im Update sichtbar genannt und können anschließend bewusst über das Install-Center eingerichtet werden. Die Betriebskonfiguration und die openWB-Pro-Regelung bleiben unverändert. Ältere oder nicht verwandte Installationen wechseln zuerst über den dokumentierten Bootstrap auf 5.3.2b.
 
 > **Neu in 5.4.0a Stable:** Das Core-Update ist von optionalen Matter-Paketen getrennt, der Web-Updater erkennt und repariert eine reine CRLF-Beschädigung seines veröffentlichten Wrappers kontrolliert, und alte Shelly-EM-Zähler der ersten Generation können über ihre lokale read-only-Status-API eingebunden werden.
 
-> **Neu in 5.4.0 Stable:** Speicher, Direktvermarktung, Wallbox und Wärmeverbraucher verwenden einen eindeutigen Regel-Owner und einen vor jedem Hardwareausgang erneut geprüften Anlagenkontext. Plan, Slot, Freigabe, ACK und Readback bleiben gebunden. Interne DC-PV und zusätzliche AC-Erzeuger werden getrennt bilanziert; DC- und Netzpunktdruck werden mit dem größeren Wert statt als Summe bewertet. openWB Pro erhält eine bestätigungsgebundene Start-Recovery. Das Mehr-Wallbox-Balancing verteilt anhand der L1/L2/L3-Stromvektoren und nicht anhand einer pauschalen Ampere-Summe. Die ruhige PV-Kurve erlaubt bei laufender Ladung höchstens 75 Wh Batteriestützung. Der manuelle iDM-Scanner liest Register 1006 ausschließlich einmalig per FC04. Mobile Energiefluss-Badges speichern Desktop- und Tablet-Positionen revisionssicher getrennt. Update, Backup und Web-Planung sind transaktional gehärtet.
+> **Neu in 5.4.0 Stable:** Speicher, Direktvermarktung, Wallbox und Wärmeverbraucher verwenden einen eindeutigen Regel-Owner und einen vor jedem Hardwareausgang erneut geprüften Anlagenkontext. Plan, Slot, Freigabe, ACK und Readback bleiben gebunden. Interne DC-PV und zusätzliche AC-Erzeuger werden getrennt bilanziert; DC- und Netzpunktdruck werden mit dem größeren Wert statt als Summe bewertet. openWB Pro erhält eine bestätigungsgebundene Start-Recovery. Das Mehr-Wallbox-Balancing verteilt anhand der L1/L2/L3-Stromvektoren und der Netzpunktreserve; ein- und dreiphasige Amperewerte werden nicht pauschal addiert. Die strengere leistungsfaire Zuteilung und die konservative PCC-RMS-Freigabe gelten ab 5.4.1. Die ruhige PV-Kurve erlaubt bei laufender Ladung höchstens 75 Wh Batteriestützung. Der manuelle iDM-Scanner liest Register 1006 ausschließlich einmalig per FC04. Mobile Energiefluss-Badges speichern Desktop- und Tablet-Positionen revisionssicher getrennt. Update, Backup und Web-Planung sind transaktional gehärtet.
 
 > **Dynamische Preisquellen:** SMARD bleibt die Standardquelle für Börsenstrompreise. Optional kann ein ENTSO-E Transparency Platform Security Token als 15-Minuten-Fallback hinterlegt werden; danach bleibt aWATTar der grobe Stundenfallback. Den ENTSO-E-Zugang erhältst du über einen Transparency-Platform-Account, eine E-Mail mit Betreff `RESTful API access` an `transparency@entsoe.eu`, die Freigabe durch ENTSO-E und anschließend die Token-Erzeugung im Account.
 
@@ -243,20 +245,47 @@ Neue Installationen werden über den Web-Wizard bzw. den Config-Editor in `data/
 docker compose up -d
 ```
 
-Das Docker-Image enthaelt den Anwendungscode. Das geklonte Repository liefert die `docker-compose.yml`; Konfiguration und Historie liegen dauerhaft im Docker-Volume bzw. Datenverzeichnis.
+Das Docker-Image enthält den Anwendungscode. Das geklonte Repository liefert die `docker-compose.yml`; Konfiguration und Historie liegen dauerhaft im Docker-Volume bzw. Datenverzeichnis.
 
 ### Updates einspielen
 ```bash
-docker compose config --images
-docker compose pull e3dc-control
-docker compose up -d --force-recreate e3dc-control
+(
+  set -euo pipefail
+  docker compose config --images
+  docker compose pull e3dc-control
+  docker compose up -d --force-recreate e3dc-control
+  docker inspect e3dc-control --format '{{.Config.Image}} {{.State.Status}}'
+  docker exec e3dc-control cat /app/pi/Install/VERSION
+)
 ```
 > Die mitgelieferte Compose-Datei verwendet
 > `ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}`. Ohne Eintrag
 > folgt sie dem geprüften Stable-Tag `latest`. Ein fester Versions-Tag wechselt
 > bei `pull` absichtlich nicht; für einen bewussten Pin wird
-> `E3DC_IMAGE_TAG=v5.4.0e` in `.env` gesetzt. `config --images` zeigt vor dem
+> `E3DC_IMAGE_TAG=v5.4.1` in `.env` gesetzt. `config --images` zeigt vor dem
 > Pull das tatsächlich gewählte Image.
+>
+> Ein fehlgeschlagener `pull` ist ein harter Abbruch. Danach darf weder ein
+> vorhandenes Altimage als erfolgreiches Update gemeldet noch dessen Container
+> als neue Version ausgegeben werden. Erst die übereinstimmende Image-Referenz,
+> der laufende Container und die `VERSION` im Container bestätigen den Wechsel.
+
+Automatische Updates über Watchtower sind bewusst kein Standardstart. Das
+Upstream-Projekt wird nicht mehr gepflegt; zudem benötigt der Dienst für
+Container-Updates weitreichenden Zugriff auf den Docker-Socket des Hosts. Er
+bleibt nur für bestehende Installationen im Compose-Profil `auto-update`.
+Wer diese Risiken bewusst akzeptiert, aktiviert ausschließlich E3DC-Control
+für Watchtower:
+
+```bash
+docker compose --profile auto-update up -d watchtower
+```
+
+Ohne diesen ausdrücklichen Opt-in startet `docker compose up -d` nur
+E3DC-Control. Ein bereits aus einer älteren Compose-Datei laufender
+Watchtower wird einmalig mit
+`docker compose --profile auto-update stop watchtower && docker compose --profile auto-update rm -f watchtower`
+deaktiviert.
 
 > **Wichtig bei zusätzlichen Code-Volumes:** Ein lokales Verzeichnis unter
 > `/app/pi/Install` überschreibt den Release-Code aus dem Docker-Image. Für den

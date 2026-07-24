@@ -3603,6 +3603,41 @@ function setModernCardState(elementId, state) {
     el.classList.toggle('modern-offline', offline);
 }
 
+function heatSgReadyPresentation(data) {
+    const live = data || {};
+    const state = String(live.wp_sg_ready_state || '');
+    const valid = live.wp_sg_ready_valid === true;
+    const active = live.wp_sg_ready_active === true;
+    const blocked = state === 'blocked';
+    const visible = valid && ((state === 'boost' && active) || blocked);
+    const source = String(live.wp_sg_ready_source || '');
+    const ageRaw = live.wp_sg_ready_age_s;
+    const parsedAgeS = ageRaw === null || ageRaw === undefined || ageRaw === ''
+        ? Number.NaN
+        : Number(ageRaw);
+    const ageSuffix = Number.isFinite(parsedAgeS) && parsedAgeS >= 0
+        ? ` Alter ${Math.round(parsedAgeS)} s.`
+        : '';
+    const label = String(live.wp_sg_ready_label || (
+        blocked ? 'SG-Ready EVU-Sperre' : 'SG-Ready aktiv'
+    ));
+    const sourceTitle = (source === 'shelly_relay_confirmed_readback'
+        ? 'Shelly-Relaisstatus durch Readback bestätigt.'
+        : (
+            source === 'dimplex_modbus_confirmed_readback'
+                || source === 'dimplex_modbus_live_readback'
+                ? 'Dimplex-SG-Ready-Register durch Readback bestätigt.'
+                : 'Bestätigter SG-Ready-Aktorstatus.'
+        )) + ageSuffix;
+    return {
+        visible,
+        blocked,
+        label,
+        sourceTitle,
+        iconClass: blocked ? 'fa-ban' : 'fa-toggle-on'
+    };
+}
+
 function updateModernDashboardActivity(data, values) {
     if (!document.body || !document.body.classList.contains('frontend-modern')) return;
     const num = (value) => {
@@ -3617,9 +3652,10 @@ function updateModernDashboardActivity(data, values) {
     const climatePower = num(values && values.climateVal);
     const wb1Present = data && (data.wb_plug === true || data.wb_plug === 1 || data.wb_plug === '1');
     const wb2Locked = data && (data.wb2_locked === true || data.wb2_locked === 1 || data.wb2_locked === '1');
+    const wpSgReadyVisible = heatSgReadyPresentation(data).visible;
     setModernCardState('card-wb-wrapper', {active: Math.abs(wb1Power) > 50 || wb1Present, present: true});
     setModernCardState('card-wb2-wrapper', {active: Math.abs(wb2Power) > 50 || wb2Locked, present: data && data.wb2 !== undefined});
-    setModernCardState('card-wp-wrapper', {active: wpPower >= 100, present: true});
+    setModernCardState('card-wp-wrapper', {active: wpPower >= 100 || wpSgReadyVisible, present: true});
     setModernCardState('card-climate-wrapper', {
         active: climatePower > 50,
         present: data && data.climate_online !== false,
@@ -7998,6 +8034,22 @@ function processLiveData(data) {
             wpSeasonBadge.hide();
         }
 
+        const wpSgReadyBadge = $('#wp-sg-ready-badge');
+        const wpSgReady = heatSgReadyPresentation(data);
+        if (wpSgReadyBadge.length && wpSgReady.visible) {
+            wpSgReadyBadge
+                .show()
+                .toggleClass('pulsating', !wpSgReady.blocked)
+                .removeClass('bg-success bg-danger bg-secondary text-white text-dark')
+                .addClass(wpSgReady.blocked ? 'bg-danger text-white' : 'bg-success text-white')
+                .attr('title', wpSgReady.sourceTitle)
+                .empty()
+                .append($('<i>', {class: `fas ${wpSgReady.iconClass} me-1`}))
+                .append(document.createTextNode(wpSgReady.label));
+        } else {
+            wpSgReadyBadge.removeClass('pulsating').hide().empty();
+        }
+
         if (data.wp_boost_active === true || data.wp_predump_boost === true || data.wp_market_plan === true || data.wp_price_boost === true || data.wp_pause_active === true || data.wp_manual_boost === true) {
             const badge = $('#wp-auto-boost');
             badge.addClass('pulsating').show();
@@ -8682,38 +8734,124 @@ function showGridHealthModal() {
     }
 }
 
+function resolveGridFrequencyDisplay(data) {
+    const candidates = [
+        {
+            reportedValid: data && data.grid_frequency_valid === true,
+            value: data ? data.grid_frequency_hz : null,
+            source: data ? data.grid_frequency_source : '',
+            ageS: data ? data.grid_frequency_age_s : null
+        },
+        {
+            reportedValid: data && data.pvi_frequency_valid === true,
+            value: data ? data.pvi_frequency_hz : null,
+            source: data ? data.pvi_frequency_source : '',
+            ageS: null
+        }
+    ];
+    const selected = candidates.find(candidate => (
+        candidate.reportedValid
+        && typeof candidate.value === 'number'
+        && Number.isFinite(candidate.value)
+        && candidate.value >= 45
+        && candidate.value <= 55
+    ));
+    if (!selected) {
+        return {
+            valid: false,
+            frequencyHz: null,
+            source: '',
+            ageS: null,
+            badgeClass: 'bg-secondary',
+            textClass: 'text-muted',
+            iconClass: 'fa-circle-question',
+            message: 'Keine bestätigten oder frischen Frequenzdaten verfügbar.'
+        };
+    }
+
+    const frequencyHz = selected.value;
+    const differenceHz = Math.abs(frequencyHz - 50.0);
+    if (differenceHz < 0.05) {
+        return {
+            valid: true,
+            frequencyHz,
+            source: String(selected.source || ''),
+            ageS: selected.ageS,
+            badgeClass: 'bg-success',
+            textClass: 'text-success',
+            iconClass: 'fa-circle-check',
+            message: 'Messwert liegt nahe 50 Hz.'
+        };
+    }
+    if (differenceHz < 0.2) {
+        return {
+            valid: true,
+            frequencyHz,
+            source: String(selected.source || ''),
+            ageS: selected.ageS,
+            badgeClass: 'bg-info text-dark',
+            textClass: 'text-info',
+            iconClass: 'fa-circle-info',
+            message: 'Messwert weicht leicht von 50 Hz ab.'
+        };
+    }
+    return {
+        valid: true,
+        frequencyHz,
+        source: String(selected.source || ''),
+        ageS: selected.ageS,
+        badgeClass: 'bg-warning text-dark',
+        textClass: 'text-warning',
+        iconClass: 'fa-triangle-exclamation',
+        message: 'Messwert weicht deutlich von 50 Hz ab. Messquelle und Zeitstempel prüfen.'
+    };
+}
+
 function updateGridHealthUI(data) {
     if (!data) return;
 
     // --- Netzfrequenz-Anzeige ---
-    // ENTSO-E Grenzwerte: Normal 49.95-50.05, Warnung 49.8-50.2, Kritisch darunter/drüber
-    const freq = (typeof data.pvi_frequency_hz !== 'undefined' && data.pvi_frequency_hz > 0)
-        ? parseFloat(data.pvi_frequency_hz) : null;
-    if (freq !== null) {
+    // Reine Messwertdarstellung: Aus einem einzelnen lokalen Frequenzwert
+    // werden keine übergeordneten Netz- oder Systemzustände abgeleitet.
+    const frequencyDisplay = resolveGridFrequencyDisplay(data);
+    if (frequencyDisplay.valid) {
+        const freq = frequencyDisplay.frequencyHz;
         const CENTER = 50.0;
         const RANGE  = 0.3;   // Skalenbreite: 49.7 bis 50.3 Hz
         // Marker-Position: 0%=links(49.7), 50%=mitte(50.0), 100%=rechts(50.3)
         const pct = Math.max(0, Math.min(100, ((freq - (CENTER - RANGE)) / (2 * RANGE)) * 100));
-        $('#gh-freq-marker').css('left', pct + '%');
+        $('#gh-freq-marker').show().css('left', pct + '%');
 
-        const diff = Math.abs(freq - CENTER);
-        let badgeCls, freqMsg;
-        if (diff < 0.05) {
-            badgeCls = 'bg-success';
-            freqMsg = '<span class=text-success><i class=fas fa-check-circle me-1></i>Normalbereich &ndash; Netz stabil</span>';
-        } else if (diff < 0.2) {
-            badgeCls = 'bg-warning text-dark';
-            freqMsg = '<span class=text-warning><i class=fas fa-exclamation-circle me-1></i>Leichte Abweichung &ndash; Regelenergie aktiv</span>';
-        } else {
-            badgeCls = 'bg-danger';
-            freqMsg = '<span class=text-danger><i class=fas fa-skull-crossbones me-1></i>Kritische Abweichung &ndash; Netznotfall!</span>';
-        }
-        $('#gh-freq-badge').removeClass('bg-success bg-warning bg-danger text-dark').addClass(badgeCls);
-        $('#gh-freq-badge').text(freq.toFixed(2) + ' Hz');
-        $('#gh-freq-text').html(freqMsg);
+        const ageText = typeof frequencyDisplay.ageS === 'number'
+            ? `, Alter ${frequencyDisplay.ageS.toFixed(1)} s`
+            : '';
+        $('#gh-freq-badge')
+            .removeClass('bg-success bg-info bg-warning bg-danger text-dark')
+            .addClass(frequencyDisplay.badgeClass);
+        $('#gh-freq-badge')
+            .text(freq.toFixed(2) + ' Hz')
+            .attr(
+                'title',
+                frequencyDisplay.source
+                    ? `Messquelle: ${frequencyDisplay.source}${ageText}`
+                    : `Bestätigte Live-Messung${ageText}`
+            );
+        $('#gh-freq-text')
+            .empty()
+            .append(
+                $('<span>')
+                    .addClass(frequencyDisplay.textClass)
+                    .append($('<i>').addClass(`fas ${frequencyDisplay.iconClass} me-1`))
+                    .append(document.createTextNode(frequencyDisplay.message))
+            );
     } else {
-        $('#gh-freq-badge').text('-- Hz').removeClass('bg-success bg-warning bg-danger').addClass('bg-secondary');
-        $('#gh-freq-text').text('Keine Frequenzdaten verfügbar (E3DC PVI).');
+        $('#gh-freq-marker').hide();
+        $('#gh-freq-badge')
+            .text('-- Hz')
+            .removeClass('bg-success bg-info bg-warning bg-danger text-dark')
+            .addClass('bg-secondary')
+            .attr('title', 'Keine bestätigte Live-Messung');
+        $('#gh-freq-text').text(frequencyDisplay.message);
     }
 
 

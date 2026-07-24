@@ -98,15 +98,18 @@ wahrscheinlich noch ein altes Image oder ein alter Container.
 Fertiges GitHub-Image aktualisieren:
 
 ```bash
-cd "$E3DC_DOCKER_PATH"
-sudo docker compose config --images
-sudo docker compose pull e3dc-control
-sudo docker compose up -d --force-recreate e3dc-control
+(
+  set -euo pipefail
+  cd "$E3DC_DOCKER_PATH"
+  sudo docker compose config --images
+  sudo docker compose pull e3dc-control
+  sudo docker compose up -d --force-recreate e3dc-control
+)
 ```
 
 Ohne `E3DC_IMAGE_TAG` folgt diese Compose-Datei dem geprüften Stable-Tag
 `latest`. Ein fester Tag bleibt bei `pull` absichtlich unverändert. Für einen
-bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.0e` in der Datei `.env`
+bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.1` in der Datei `.env`
 gesetzt. `docker compose config --images` zeigt vorab das tatsächlich gewählte
 Image.
 
@@ -134,19 +137,22 @@ Versionswahl.
 
 Gezielte Rückfallversion:
 
-Den Stable-Container `v5.4.0e` auf den veröffentlichten Rollback-Root
+Den Stable-Container `v5.4.1` auf den veröffentlichten Rollback-Root
 `v5.3.2b` zurücksetzen:
 
 ```bash
-TAG=v5.3.2b
-cd "$E3DC_DOCKER_PATH"
-sudo docker run --rm -v e3dc-docker_e3dc_data:/data -v "$PWD":/backup alpine \
-  sh -lc 'tar czf "/backup/e3dc-data-$(date +%Y%m%d-%H%M%S).tgz" -C /data .'
-sudo env E3DC_IMAGE_TAG="$TAG" docker compose config --images
-sudo env E3DC_IMAGE_TAG="$TAG" docker compose pull e3dc-control
-sudo env E3DC_IMAGE_TAG="$TAG" docker compose up -d --force-recreate e3dc-control
-sudo docker compose ps
-sudo docker logs --tail=80 e3dc-control
+(
+  set -euo pipefail
+  TAG=v5.3.2b
+  cd "$E3DC_DOCKER_PATH"
+  sudo docker run --rm -v e3dc-docker_e3dc_data:/data -v "$PWD":/backup alpine \
+    sh -lc 'tar czf "/backup/e3dc-data-$(date +%Y%m%d-%H%M%S).tgz" -C /data .'
+  sudo env E3DC_IMAGE_TAG="$TAG" docker compose config --images
+  sudo env E3DC_IMAGE_TAG="$TAG" docker compose pull e3dc-control
+  sudo env E3DC_IMAGE_TAG="$TAG" docker compose up -d --force-recreate e3dc-control
+  sudo docker compose ps
+  sudo docker logs --tail=80 e3dc-control
+)
 ```
 
 Der Rückfall ist bewusst ein Host-Befehl: Der E3DC-Control-Container soll nicht
@@ -329,19 +335,30 @@ uebernimmt nicht automatisch alle MQTT-Werte aus dem Broker.
 
 ---
 
-## 3. Automatische Updates mit Watchtower (Empfohlen)
+## 3. Updates und optionaler Watchtower
 
-Manuell geht es jederzeit so:
+Der sichere Standardweg bleibt bewusst auf dem Docker-Host:
 ```bash
-cd "$E3DC_DOCKER_PATH"
-sudo docker compose config --images
-sudo docker compose pull e3dc-control
-sudo docker compose up -d --force-recreate e3dc-control
+(
+  set -euo pipefail
+  cd "$E3DC_DOCKER_PATH"
+  sudo docker compose config --images
+  sudo docker compose pull e3dc-control
+  sudo docker compose up -d --force-recreate e3dc-control
+  sudo docker inspect e3dc-control --format '{{.Config.Image}} {{.State.Status}}'
+  sudo docker exec e3dc-control cat /app/pi/Install/VERSION
+)
 ```
 `docker compose pull` aktualisiert Python/PHP-Code, Container-Startskript und
 Systempakete nur innerhalb des von `config --images` angezeigten Tags.
 `--force-recreate` stellt sicher, dass der Container wirklich aus dem neuen
 Image startet.
+
+Schlägt `pull` fehl, ist der Updateversuch beendet. Ein bereits vorhandenes
+Altimage darf danach weder automatisch neu gestartet noch als aktualisierte
+Version gemeldet werden. Die Image-Referenz aus `config --images`, der
+laufende Containerstatus und die `VERSION` im Container müssen gemeinsam
+zum erwarteten Release passen.
 
 Für den Rückfall eines späteren Stable-Images wird `E3DC_IMAGE_TAG` einmalig
 vor die drei Compose-Befehle gesetzt oder für einen dauerhaften Pin in `.env`
@@ -351,23 +368,24 @@ Der einzige vorgesehene öffentliche Rollback-Root ist
 kein älteres Image. Danach dieselben Pull-/Up-Befehle ausführen. Das
 funktioniert nur für tatsächlich veröffentlichte, verifizierte GHCR-Images.
 
-Da der Update-Knopf im Web-Dashboard deaktiviert ist, empfehlen wir die Nutzung von **Watchtower**. Watchtower ist ein eigener, winziger Docker-Container, der jede Nacht prüft, ob wir auf GitHub eine neue Version hochgeladen haben. Ist das der Fall, lädt er die neue Version herunter und startet dein E3DC-Control nahtlos neu.
+Watchtower ist nur noch ein ausdrückliches Opt-in. Das Upstream-Projekt wird
+nicht mehr gepflegt. Der Dienst liegt für bestehende Installationen im
+Compose-Profil `auto-update` und startet bei einem normalen
+`docker compose up -d` nicht. Sein notwendiger Zugriff auf
+`/var/run/docker.sock` gibt dem Container weitreichende Kontrolle über den
+Docker-Host. Wer diese Risiken bewusst akzeptiert, aktiviert das Profil:
 
-Füge Watchtower einfach zu deiner `docker-compose.yml` hinzu (oder starte ihn als eigenen Befehl):
-
-```yaml
-  watchtower:
-    image: containrrr/watchtower
-    container_name: watchtower
-    restart: always
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    environment:
-      - DOCKER_API_VERSION=1.40
-      - WATCHTOWER_CLEANUP=true
-      - WATCHTOWER_POLL_INTERVAL=86400 # Prüft alle 24h, erster Lauf sofort
+```bash
+cd "$E3DC_DOCKER_PATH"
+sudo docker compose --profile auto-update up -d watchtower
 ```
-Damit ist der reguläre Update- und Neustartweg dokumentiert; eine Wartungsfreiheit wird nicht zugesichert.
+
+Der Enable-Label-Filter begrenzt Watchtower dabei auf E3DC-Control; andere
+Container des Hosts werden nicht automatisch aktualisiert. Ein bereits aus
+einer älteren Compose-Datei laufender Watchtower wird mit
+`sudo docker compose --profile auto-update stop watchtower` und danach
+`sudo docker compose --profile auto-update rm -f watchtower` deaktiviert.
+Eine Wartungsfreiheit wird auch im Opt-in-Betrieb nicht zugesichert.
 
 ---
 

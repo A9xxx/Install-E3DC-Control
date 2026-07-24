@@ -3,16 +3,11 @@ name: Build and promote verified release images
 on:
   workflow_dispatch:
     inputs:
-      phase:
-        description: "B1a builds a candidate; B1b promotes an already verified digest"
-        required: true
-        type: choice
-        options: [b1a-candidate, b1b-promote]
       release_tag:
-        description: "Exactly v5.3.2b, v5.4.0, v5.4.0a, v5.4.0b, v5.4.0c, v5.4.0d or v5.4.0e"
+        description: "Exact approved release tag"
         required: true
         type: choice
-        options: [v5.3.2b, v5.4.0, v5.4.0a, v5.4.0b, v5.4.0c, v5.4.0d, v5.4.0e]
+        options: [v5.3.2b, v5.4.0, v5.4.0a, v5.4.0b, v5.4.0c, v5.4.0d, v5.4.0e, v5.4.1]
       release_sha:
         description: "Approved 40-hex release commit"
         required: true
@@ -37,10 +32,6 @@ on:
         description: "SHA-256 of the approved public source manifest"
         required: true
         type: string
-      candidate_digest:
-        description: "Required only for B1b; verified B1a OCI index digest"
-        required: false
-        type: string
 
 concurrency:
   group: e3dc-release-b1-transaction
@@ -64,7 +55,7 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ inputs.release_sha }}
-          fetch-depth: 7
+          fetch-depth: 8
           fetch-tags: false
           persist-credentials: false
       - name: Validate exact release identity and topology
@@ -78,8 +69,6 @@ jobs:
           ROOT_TREE: ${{ inputs.root_tree }}
           CREATED: ${{ inputs.created }}
           SOURCE_MANIFEST: ${{ inputs.source_manifest_sha256 }}
-          CANDIDATE_DIGEST: ${{ inputs.candidate_digest }}
-          PHASE: ${{ inputs.phase }}
         run: |
           set -euo pipefail
           [ "$GITHUB_REF" = "refs/heads/main" ]
@@ -157,24 +146,40 @@ jobs:
             [ "$(git rev-parse HEAD~6)" = "$ROOT_SHA" ]
             [ "$(git rev-parse 'HEAD~6^{tree}')" = "$ROOT_TREE" ]
             [ "$(git rev-list --parents -n 1 "$ROOT_SHA" | awk '{print NF-1}')" -eq 0 ]
+          elif [ "$RELEASE_TAG" = "v5.4.1" ]; then
+            [ "$(git rev-list --parents -n 1 HEAD | awk '{print NF-1}')" -eq 1 ]
+            [ "$(git rev-list --parents -n 1 HEAD^ | awk '{print NF-1}')" -eq 1 ]
+            [ "$(git rev-list --parents -n 1 HEAD^^ | awk '{print NF-1}')" -eq 1 ]
+            [ "$(git rev-list --parents -n 1 HEAD^^^ | awk '{print NF-1}')" -eq 1 ]
+            [ "$(git rev-list --parents -n 1 HEAD^^^^ | awk '{print NF-1}')" -eq 1 ]
+            [ "$(git rev-list --parents -n 1 HEAD~5 | awk '{print NF-1}')" -eq 1 ]
+            [ "$(git rev-list --parents -n 1 HEAD~6 | awk '{print NF-1}')" -eq 1 ]
+            [ "$(git rev-parse HEAD^)" = "f65fb584c7d01a721c41d863f59a140de49be8a1" ]
+            [ "$(git rev-parse HEAD^^)" = "2bad44d80ff24775d8f4e8ff0e99dd07aa516be0" ]
+            [ "$(git rev-parse HEAD^^^)" = "a251ba9c346ec227c6ac4785945479fd25cb8839" ]
+            [ "$(git rev-parse HEAD^^^^)" = "6a1b24c7865b2bbc1c5d21d69b7c73553a0de78e" ]
+            [ "$(git rev-parse HEAD~5)" = "6e4660379c5fcc6849e6b76f49fc4bd727273aa5" ]
+            [ "$(git rev-parse HEAD~6)" = "59e5907d1b517cf04e60611ae6e7765c184b00f8" ]
+            [ "$(git rev-parse HEAD~7)" = "$ROOT_SHA" ]
+            [ "$(git rev-parse 'HEAD~7^{tree}')" = "$ROOT_TREE" ]
+            [ "$(git rev-list --parents -n 1 "$ROOT_SHA" | awk '{print NF-1}')" -eq 0 ]
           else
             exit 1
-          fi
-          if [ "$PHASE" = "b1b-promote" ]; then
-            [[ "$CANDIDATE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
           fi
           echo "image=${REGISTRY}/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
           echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
           echo "short_sha=${RELEASE_SHA:0:12}" >> "$GITHUB_OUTPUT"
 
-  b1a-candidate:
-    if: ${{ inputs.phase == 'b1a-candidate' }}
+  b1a_candidate:
+    name: B1a - build and verify candidate
     needs: validate
     runs-on: ubuntu-latest
     timeout-minutes: 120
     permissions:
       contents: read
       packages: write
+    outputs:
+      candidate_digest: ${{ steps.verified.outputs.candidate_digest }}
     steps:
       - name: Checkout exact approved release source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -248,19 +253,24 @@ jobs:
           sbom: true
           provenance: mode=max
       - name: Verify candidate before any stable tag exists
+        id: verified
         shell: bash
         working-directory: verifier
+        env:
+          CANDIDATE_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           set -euo pipefail
+          [[ "$CANDIDATE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
           bash .github/scripts/verify-oci-release.sh \
-            "${{ needs.validate.outputs.image }}" "${{ steps.build.outputs.digest }}" \
+            "${{ needs.validate.outputs.image }}" "$CANDIDATE_DIGEST" \
             "${{ inputs.release_sha }}" "${{ inputs.release_tree }}" \
             "${{ needs.validate.outputs.version }}" "${{ inputs.created }}" \
             "${{ inputs.source_manifest_sha256 }}"
+          echo "candidate_digest=$CANDIDATE_DIGEST" >> "$GITHUB_OUTPUT"
 
-  b1b-promote:
-    if: ${{ inputs.phase == 'b1b-promote' }}
-    needs: validate
+  b1b_promote:
+    name: B1b - reverify and promote digest
+    needs: [validate, b1a_candidate]
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -313,23 +323,60 @@ jobs:
       - name: Reverify immutable candidate digest
         shell: bash
         working-directory: verifier
+        env:
+          CANDIDATE_DIGEST: ${{ needs.b1a_candidate.outputs.candidate_digest }}
         run: |
           set -euo pipefail
+          [[ "$CANDIDATE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
           bash .github/scripts/verify-oci-release.sh \
-            "${{ needs.validate.outputs.image }}" "${{ inputs.candidate_digest }}" \
+            "${{ needs.validate.outputs.image }}" "$CANDIDATE_DIGEST" \
             "${{ inputs.release_sha }}" "${{ inputs.release_tree }}" \
             "${{ needs.validate.outputs.version }}" "${{ inputs.created }}" \
             "${{ inputs.source_manifest_sha256 }}"
       - name: Promote verified digest to stable version tags
         shell: bash
+        env:
+          CANDIDATE_DIGEST: ${{ needs.b1a_candidate.outputs.candidate_digest }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           set -euo pipefail
           image="${{ needs.validate.outputs.image }}"
-          digest="${{ inputs.candidate_digest }}"
-          docker buildx imagetools create --tag "${image}:${{ inputs.release_tag }}" "${image}@${digest}"
-          docker buildx imagetools create --tag "${image}:${{ needs.validate.outputs.version }}" "${image}@${digest}"
-          [ "$(docker buildx imagetools inspect "${image}:${{ inputs.release_tag }}" | awk '$1 == "Digest:" {print $2; exit}')" = "$digest" ]
-          if [ "${{ inputs.release_tag }}" = "v5.4.0e" ]; then
+          digest="$CANDIDATE_DIGEST"
+          version="${{ needs.validate.outputs.version }}"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+
+          verify_immutable_tag() {
+            local ref="$1"
+            local inspect_output
+            local inspect_status
+            local current_digest
+            set +e
+            inspect_output="$(docker buildx imagetools inspect "$ref" 2>&1)"
+            inspect_status=$?
+            set -e
+            if [ "$inspect_status" -eq 0 ]; then
+              current_digest="$(awk '$1 == "Digest:" {print $2; exit}' <<<"$inspect_output")"
+              [ -n "$current_digest" ]
+              if [ "$current_digest" != "$digest" ]; then
+                echo "Unveränderlicher Release-Tag $ref zeigt bereits auf $current_digest statt $digest." >&2
+                exit 1
+              fi
+              return 0
+            fi
+            if grep -Eqi 'manifest unknown|unexpected status[^[:cntrl:]]*404|404[[:space:]]+not found|(^|[[:space:]:])not found([[:space:]]|$)' <<<"$inspect_output"; then
+              return 0
+            fi
+            printf '%s\n' "$inspect_output" >&2
+            exit "$inspect_status"
+          }
+
+          verify_immutable_tag "${image}:${RELEASE_TAG}"
+          verify_immutable_tag "${image}:${version}"
+          docker buildx imagetools create --tag "${image}:${RELEASE_TAG}" "${image}@${digest}"
+          docker buildx imagetools create --tag "${image}:${version}" "${image}@${digest}"
+          [ "$(docker buildx imagetools inspect "${image}:${RELEASE_TAG}" | awk '$1 == "Digest:" {print $2; exit}')" = "$digest" ]
+          [ "$(docker buildx imagetools inspect "${image}:${version}" | awk '$1 == "Digest:" {print $2; exit}')" = "$digest" ]
+          if [ "$RELEASE_TAG" = "v5.4.1" ]; then
             docker buildx imagetools create --tag "${image}:latest" "${image}@${digest}"
             [ "$(docker buildx imagetools inspect "${image}:latest" | awk '$1 == "Digest:" {print $2; exit}')" = "$digest" ]
           fi

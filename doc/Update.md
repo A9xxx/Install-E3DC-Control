@@ -151,7 +151,7 @@ Writer-/Aktor-Dienste gestoppt.
 
 ## Gezielter Rückfall
 
-`v5.4.0e` bietet den bereinigten Root `v5.3.2b` ausschließlich als
+`v5.4.1` bietet den bereinigten Root `v5.3.2b` ausschließlich als
 Docker-Rückfall-Image an. Dieser Root gibt selbst keinen älteren öffentlichen
 Tag frei. Auf Bare Metal wird `v5.3.2b` nicht als Programm-Rückfall angeboten,
 weil der Altstand keinen zielgebundenen Release-Finalizer enthält. Freie
@@ -161,18 +161,37 @@ Wiederherstellung eines verifizierten Datei-Backups der sichere Rückweg.
 ## Docker-Update
 
 ```bash
-export E3DC_DOCKER_PATH="/absoluter/pfad/zur/docker-installation"
-cd "$E3DC_DOCKER_PATH"
-docker compose config --images
-docker compose pull e3dc-control
-docker compose up -d --force-recreate e3dc-control
-docker compose ps
+(
+  set -euo pipefail
+  export E3DC_DOCKER_PATH="/absoluter/pfad/zur/docker-installation"
+  cd "$E3DC_DOCKER_PATH"
+  docker compose config --images
+  docker compose pull e3dc-control
+  docker compose up -d --force-recreate e3dc-control
+  docker compose ps
+)
 ```
 
 Der Web-Updater erkennt den Containerkontext auch über den Marker des
 offiziellen Images und zeigt diese Befehle an. Er benötigt keinen Zugriff auf
 den Docker-Socket und versucht bewusst nicht, den eigenen Container zu
 ersetzen.
+
+Der optionale Watchtower-Dienst startet nicht zusammen mit der
+Standardanwendung. Das Upstream-Projekt wird nicht mehr gepflegt und sein
+Docker-Socket-Zugriff ermöglicht weitreichende Kontrolle über den Docker-Host.
+Der Dienst bleibt nur für bestehende Installationen im Compose-Profil
+`auto-update`. Der bewusste Opt-in lautet:
+
+```bash
+docker compose --profile auto-update up -d watchtower
+```
+
+Watchtower berücksichtigt dabei durch den Enable-Label-Filter ausschließlich
+den E3DC-Control-Container. Ein bereits aus einer älteren Compose-Datei
+laufender Watchtower kann mit
+`docker compose --profile auto-update stop watchtower` und anschließend
+`docker compose --profile auto-update rm -f watchtower` entfernt werden.
 
 Die mitgelieferte Compose-Datei verwendet standardmäßig
 `ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}`. Ein in der

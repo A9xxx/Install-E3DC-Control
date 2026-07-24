@@ -49,6 +49,109 @@ function liveOptionalFloatValue($value, $precision = 2) {
     return round((float)$value, (int)$precision);
 }
 
+function liveReadbackAgeSeconds($timestamp, $nowTs = null) {
+    if ($timestamp === null || $timestamp === '') return null;
+    if (is_numeric($timestamp)) {
+        $readbackTs = (float)$timestamp;
+        if ($readbackTs > 20000000000.0) $readbackTs /= 1000.0;
+    } else {
+        $parsed = strtotime((string)$timestamp);
+        if ($parsed === false) return null;
+        $readbackTs = (float)$parsed;
+    }
+    if (!is_finite($readbackTs) || $readbackTs <= 0.0) return null;
+    $now = $nowTs === null ? microtime(true) : (float)$nowTs;
+    if (($readbackTs - $now) > 5.0) return null;
+    return max(0.0, $now - $readbackTs);
+}
+
+function liveSgReadyReadbackProjection($source, $nowTs = null, $maxAgeS = 45.0) {
+    $projection = [
+        'wp_sg_ready_active' => null,
+        'wp_sg_ready_valid' => false,
+        'wp_sg_ready_state' => 'unavailable',
+        'wp_sg_ready_source' => 'unavailable',
+        'wp_sg_ready_label' => '',
+        'wp_sg_ready_age_s' => null,
+    ];
+    if (!is_array($source)) return $projection;
+
+    $nested = isset($source['data']) && is_array($source['data'])
+        ? $source['data']
+        : [];
+    $maxAge = max(1.0, (float)$maxAgeS);
+
+    $shellyState = $source['shelly_sg_readback_state'] ?? null;
+    $shellyReadbackSource = (string)($source['shelly_sg_readback_source'] ?? '');
+    $shellyAgeS = liveReadbackAgeSeconds(
+        $source['shelly_sg_readback_ts'] ?? null,
+        $nowTs
+    );
+    $shellyValid = is_bool($shellyState)
+        && ($source['shelly_sg_readback_confirmed'] ?? false) === true
+        && $shellyReadbackSource === 'shelly_relay_confirmed_readback'
+        && $shellyAgeS !== null
+        && $shellyAgeS <= $maxAge;
+    if ($shellyValid) {
+        return [
+            'wp_sg_ready_active' => $shellyState,
+            'wp_sg_ready_valid' => true,
+            'wp_sg_ready_state' => $shellyState ? 'boost' : 'normal',
+            'wp_sg_ready_source' => $shellyReadbackSource,
+            'wp_sg_ready_label' => $shellyState ? 'Shelly Boost aktiv' : 'SG-Ready Normalbetrieb',
+            'wp_sg_ready_age_s' => round($shellyAgeS, 1),
+        ];
+    }
+
+    $dimplexRaw = $source['dimplex_sg_readback_state']
+        ?? $nested['dimplex_sg_readback_state']
+        ?? null;
+    $dimplexReadbackTs = $source['dimplex_sg_readback_ts']
+        ?? $nested['dimplex_sg_readback_ts']
+        ?? null;
+    $dimplexReadbackSource = (string)(
+        $source['dimplex_sg_readback_source']
+        ?? $nested['dimplex_sg_readback_source']
+        ?? ''
+    );
+    $dimplexConfirmed = (
+        $source['dimplex_sg_readback_confirmed']
+        ?? $nested['dimplex_sg_readback_confirmed']
+        ?? false
+    ) === true;
+    $dimplexAgeS = liveReadbackAgeSeconds($dimplexReadbackTs, $nowTs);
+    $dimplexState = is_numeric($dimplexRaw) ? (int)$dimplexRaw : null;
+    $dimplexLabels = [
+        0 => 'SG-Ready Normalbetrieb',
+        10 => 'SG-Ready Normalbetrieb',
+        11 => 'SG-Ready Anhebung aktiv',
+        12 => 'SG-Ready EVU-Sperre',
+        13 => 'SG-Ready maximale Anhebung',
+    ];
+    $dimplexValid = $dimplexState !== null
+        && array_key_exists($dimplexState, $dimplexLabels)
+        && $dimplexConfirmed
+        && in_array($dimplexReadbackSource, [
+            'dimplex_modbus_live_readback',
+            'dimplex_modbus_confirmed_readback',
+        ], true)
+        && $dimplexAgeS !== null
+        && $dimplexAgeS <= $maxAge;
+    if (!$dimplexValid) return $projection;
+
+    $active = in_array($dimplexState, [11, 13], true);
+    return [
+        'wp_sg_ready_active' => $active,
+        'wp_sg_ready_valid' => true,
+        'wp_sg_ready_state' => $dimplexState === 12
+            ? 'blocked'
+            : ($active ? 'boost' : 'normal'),
+        'wp_sg_ready_source' => $dimplexReadbackSource,
+        'wp_sg_ready_label' => $dimplexLabels[$dimplexState],
+        'wp_sg_ready_age_s' => round($dimplexAgeS, 1),
+    ];
+}
+
 function fetchShellyPower($ip) {
     if (empty($ip) || $ip === '0.0.0.0') return false;
 
@@ -1238,6 +1341,12 @@ $data = [
     'wp_boost_owner' => 'none',
     'wp_pause_active' => false,
     'wp_pre_pause_active' => false,
+    'wp_sg_ready_active' => null,
+    'wp_sg_ready_valid' => false,
+    'wp_sg_ready_state' => 'unavailable',
+    'wp_sg_ready_source' => 'unavailable',
+    'wp_sg_ready_label' => '',
+    'wp_sg_ready_age_s' => null,
     'mb_state' => 'IDLE',
     'mb_prio' => '',
     'heat_manager_active' => false,
@@ -1275,6 +1384,13 @@ $data = [
     'grid_pm_available' => false,
     'grid_pm_index' => null,
     'grid_pm_source' => '',
+    'pvi_frequency_hz' => null,
+    'pvi_frequency_valid' => false,
+    'pvi_frequency_source' => 'unavailable',
+    'grid_frequency_hz' => null,
+    'grid_frequency_valid' => false,
+    'grid_frequency_source' => 'unavailable',
+    'grid_frequency_age_s' => null,
     'bat_v' => 0, 'bat_a' => 0,
     'bat1_v' => 0, 'bat1_a' => 0,
     'wb_status' => '',
@@ -1694,9 +1810,31 @@ if (is_array($liveData) && isset($liveData['PV_Power'])) {
                 $data['climate_source'] = (string)($climateData['source'] ?? 'climate_live');
                 $data['climate_name'] = (string)($climateData['name'] ?? 'Klimaanlage');
                 $data['climate_phase'] = (string)($climateData['phase'] ?? '');
-                $data['climate_meter_age_s'] = isset($climateData['ts']) && is_numeric($climateData['ts'])
-                    ? max(0, time() - (int)$climateData['ts'])
-                    : null;
+                $data['climate_meter_age_s'] = e3dcLiveMeasurementAgeSeconds(
+                    $climateData['ts'] ?? null,
+                    microtime(true)
+                );
+                $climatePollS = isset($confData['config']['climate_poll_s'])
+                    && is_numeric($confData['config']['climate_poll_s'])
+                    ? max(5, (int)$confData['config']['climate_poll_s'])
+                    : 15;
+                $climateFrequencyMaxAgeS = max(30, min(120, 3 * $climatePollS));
+                $climateFrequency = e3dcLiveFrequencyProjection(
+                    $climateData['freq_hz'] ?? null,
+                    e3dcLiveMeasurementConfirmed(
+                        $climateData['measurement_valid'] ?? null,
+                        $climateData['online'] ?? null
+                    ),
+                    'climate_meter:' . (string)($climateData['source'] ?? 'unknown'),
+                    $data['climate_meter_age_s'],
+                    $climateFrequencyMaxAgeS
+                );
+                if (!$data['grid_frequency_valid'] && $climateFrequency['valid']) {
+                    $data['grid_frequency_hz'] = $climateFrequency['frequency_hz'];
+                    $data['grid_frequency_valid'] = true;
+                    $data['grid_frequency_source'] = $climateFrequency['source'];
+                    $data['grid_frequency_age_s'] = $climateFrequency['age_s'];
+                }
                 if (isset($climateData['daily_kwh']) && is_numeric($climateData['daily_kwh'])) {
                     $data['climate_daily_kwh'] = round((float)$climateData['daily_kwh'], 3);
                 }
@@ -2172,9 +2310,31 @@ if (is_array($liveData) && isset($liveData['PV_Power'])) {
         if (($data['wb_source'] ?? '') !== 'openwb_native') {
             $data['wb_p1'] = round((float)($liveData['wb_p1'] ?? 0), 2); $data['wb_p2'] = round((float)($liveData['wb_p2'] ?? 0), 2); $data['wb_p3'] = round((float)($liveData['wb_p3'] ?? 0), 2);
         }
-        $data['pvi_frequency_hz'] = isset($liveData['pvi_frequency_hz']) && is_numeric($liveData['pvi_frequency_hz'])
-            ? round((float)$liveData['pvi_frequency_hz'], 3) : null;
-        $data['pvi_frequency_valid'] = !empty($liveData['pvi_frequency_valid']);
+        $pviFrequencyAgeS = $mtime > 0 ? max(0, time() - (int)$mtime) : null;
+        $pviFrequency = e3dcLiveFrequencyProjection(
+            $liveData['pvi_frequency_hz'] ?? null,
+            ($liveData['pvi_frequency_valid'] ?? false) === true,
+            (string)($liveData['pvi_frequency_source'] ?? 'unavailable'),
+            $pviFrequencyAgeS,
+            15.0
+        );
+        $data['pvi_frequency_hz'] = $pviFrequency['frequency_hz'];
+        $data['pvi_frequency_valid'] = $pviFrequency['valid'];
+        $data['pvi_frequency_source'] = $pviFrequency['source'];
+        $currentFrequency = [
+            'frequency_hz' => $data['grid_frequency_hz'],
+            'valid' => $data['grid_frequency_valid'] === true,
+            'source' => $data['grid_frequency_source'],
+            'age_s' => $data['grid_frequency_age_s'],
+        ];
+        $gridFrequency = e3dcSelectLiveFrequencyProjection(
+            $pviFrequency,
+            $currentFrequency
+        );
+        $data['grid_frequency_hz'] = $gridFrequency['frequency_hz'];
+        $data['grid_frequency_valid'] = $gridFrequency['valid'];
+        $data['grid_frequency_source'] = $gridFrequency['source'];
+        $data['grid_frequency_age_s'] = $gridFrequency['age_s'];
 
         // Der native E3DC-Status ist nur maßgeblich, wenn EXTERN_DATA_ALG frisch
         // und strukturell validiert wurde. Stecker, Verriegelung und Laden sind
@@ -2717,6 +2877,15 @@ if ($wpSourceFile !== '' && (time() - filemtime($wpSourceFile) < 150)) { // jün
                 }
             }
         }
+    }
+}
+
+if (is_array($heatManagerSource)) {
+    // Die alle zwei Sekunden neu geschriebene Managerdatei beweist allein
+    // keinen aktuellen Aktorzustand. Sichtbar wird nur ein explizit
+    // zeitgestempelter, bestätigter Relais-/Register-Readback.
+    foreach (liveSgReadyReadbackProjection($heatManagerSource) as $key => $value) {
+        $data[$key] = $value;
     }
 }
 

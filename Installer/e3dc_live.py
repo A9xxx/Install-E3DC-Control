@@ -361,6 +361,26 @@ def _float_in_container(item):
         return float(item.get('value') or 0)
     return 0.0
 
+
+def _optional_float_in_container(item):
+    """Extrahiere einen Float, ohne Missingness in einen 0-Wert umzudeuten."""
+
+    candidates = item.get("value") if isinstance(item, dict) else None
+    if not isinstance(candidates, list):
+        candidates = [item] if isinstance(item, dict) else []
+    for sub in candidates:
+        if not isinstance(sub, dict):
+            continue
+        if sub.get("type") not in (RscpType.Float32, RscpType.Double64):
+            continue
+        try:
+            value = float(sub.get("value"))
+        except (TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) else None
+    return None
+
+
 def _today_midnight_ts():
     from datetime import datetime
     now = datetime.now()
@@ -873,6 +893,7 @@ def get_pvi(conn):
         _nil(RscpTag.PVI_REQ_DC_MAX_STRING_COUNT),
         _nil(RscpTag.PVI_REQ_AC_MAX_PHASE_COUNT),
         _nil(RscpTag.PVI_REQ_TEMPERATURE),
+        _nil(RscpTag.PVI_REQ_AC_FREQUENCY),
     ])]
     info_resp = conn.request(info_req)
     pvi_data = find_tag(info_resp, RscpTag.PVI_DATA)
@@ -888,11 +909,31 @@ def get_pvi(conn):
 
     temp_tag = find_tag(pd, RscpTag.PVI_TEMPERATURE)
     result["pvi_temperature_c"] = round(_float_in_container(temp_tag), 1)
-    result["pvi_frequency_hz"] = None
-    result["pvi_frequency_valid"] = False
-    result["pvi_frequency_source"] = "unsupported_unverified"
+    frequency_hz = _optional_float_in_container(
+        find_tag(pd, RscpTag.PVI_AC_FREQUENCY)
+    )
+    frequency_valid = bool(
+        frequency_hz is not None and 45.0 <= frequency_hz <= 55.0
+    )
+    result["pvi_frequency_hz"] = (
+        round(frequency_hz, 3) if frequency_valid else None
+    )
+    result["pvi_frequency_valid"] = frequency_valid
+    result["pvi_frequency_source"] = (
+        "rscp_pvi_ac_frequency"
+        if frequency_valid
+        else "rscp_pvi_ac_frequency_missing_or_invalid"
+    )
 
-    print(f"     PVI: {dc_count} DC-Strings, {ac_count} AC-Phasen, T={result['pvi_temperature_c']:.1f}C, f=nicht belegt")
+    frequency_text = (
+        f"{result['pvi_frequency_hz']:.3f}Hz"
+        if frequency_valid
+        else "nicht verfügbar"
+    )
+    print(
+        f"     PVI: {dc_count} DC-Strings, {ac_count} AC-Phasen, "
+        f"T={result['pvi_temperature_c']:.1f}C, f={frequency_text}"
+    )
 
     # DC-Strings einzeln abfragen
     for s in range(dc_count):

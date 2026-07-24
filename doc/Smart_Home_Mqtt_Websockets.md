@@ -14,13 +14,22 @@ Das Webportal empfängt Änderungen über den WebSocket-Dienst. Dadurch bleiben
 auch mehrere geöffnete Geräte ohne enges HTTP-Polling aktuell.
 
 ### Der WebSocket Daemon (`e3dc_websocket.py`)
-Dieser Python-Dienst (als Systemd `e3dc-websocket.service` eingerichtet) wartet auf Verbindungen von Web-Browsern. Sobald ein Client das Dashboard öffnet, streamt er Änderungen im JSON-File verzögerungsfrei an das Dashboard.
+Dieser Python-Dienst (als Systemd `e3dc-websocket.service` eingerichtet) wartet
+ausschließlich auf der lokalen Loopback-Adresse `127.0.0.1:8765`. Browser
+greifen weder bei einer nativen Installation noch im Docker-Betrieb direkt auf
+diesen internen Port zu. Sobald ein Client das Dashboard öffnet, streamt der
+Dienst Änderungen im JSON-File verzögerungsfrei an das Dashboard.
 Das Dashboard kann dadurch extrem flüssige Ladeanimationen im Takt von unter einer Sekunde berechnen.
 
 ### Apache Reverse Proxy (Der Cloudflare-Trick)
-Da moderne Webbrowser unsichere Verbindungen (`ws://` auf Port 8080) hart blockieren, wenn die Webseite über SSL (`https://`, z.B. via Cloudflare Tunnel) geladen wird, konfiguriert der Installer den Apache-Webserver automatisch als "Reverse Proxy".
+Da moderne Webbrowser unsichere Verbindungen (`ws://`) blockieren, wenn die
+Webseite über SSL (`https://`, z. B. via Cloudflare Tunnel) geladen wird,
+konfiguriert der Installer den Apache-Webserver automatisch als Reverse Proxy.
 
-Der Browser baut die Verbindung scheinbar normal über den Standard-Port 80 (`/ws`) auf. Apache tunnelt diesen Traffic dann intern an den Python-Dienst weiter. Das System umschifft so eleganterweise jegliche Firewall- und HTTPS-Einschränkungen.
+Der Browser verwendet am gleichen Host und Port wie das Dashboard den Pfad
+`/ws`. Apache tunnelt diesen Verkehr intern an `127.0.0.1:8765` weiter. Damit
+bleibt der Python-Port selbst im LAN geschlossen; TLS und die externe
+Erreichbarkeit enden am Webserver.
 
 **Installation:**
 Der Dienst wird vollautomatisch mit dem Befehl "Systempakete installieren" (Menüpunkt 3) im Installer aktiviert.

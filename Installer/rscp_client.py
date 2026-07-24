@@ -511,6 +511,7 @@ class RscpTag:
     PM_REQ_POWER_L2                             = 0x05000002
     PM_REQ_POWER_L3                             = 0x05000003
     PVI_AC_CURRENT                              = 0x028AC003
+    PVI_AC_FREQUENCY                            = 0x028AC00A
     PVI_AC_MAX_PHASE_COUNT                      = 0x028AC000
     PVI_AC_POWER                                = 0x028AC001
     PVI_AC_VOLTAGE                              = 0x028AC002
@@ -522,6 +523,7 @@ class RscpTag:
     PVI_DC_VOLTAGE                              = 0x028DC002
     PVI_INDEX                                   = 0x02040001
     PVI_REQ_AC_CURRENT                          = 0x020AC003
+    PVI_REQ_AC_FREQUENCY                        = 0x020AC00A
     PVI_REQ_AC_MAX_PHASE_COUNT                  = 0x020AC000
     PVI_REQ_AC_POWER                            = 0x020AC001
     PVI_REQ_AC_VOLTAGE                          = 0x020AC002
@@ -611,8 +613,10 @@ class RscpTag:
 
 # Provenienzquarantäne: Diese Namen sind zentral registriert, damit kein
 # Produktmodul eine Schatten-Tagklasse benötigt. Sie sind bewusst *nicht* als
-# herstellerkanonisch attestiert. Request-Mitglieder sind Read-only-Nil-Abfragen;
-# Response-Mitglieder sind nie zulässige ausgehende Tags.
+# herstellerkanonisch attestiert. Provisorische Request-Mitglieder sind
+# Read-only-Nil-Abfragen; separat registrierte Community-Selektoren dürfen nur
+# den explizit typisierten Uint16-Index tragen. Response-Mitglieder sind nie
+# zulässige ausgehende Tags.
 PROVISIONAL_READ_ONLY_REQUEST_TAG_NAMES = frozenset({
     "BAT_REQ_FCC",
     "BAT_REQ_SPECIFICATION",
@@ -643,6 +647,11 @@ COMMUNITY_READ_ONLY_REQUEST_TAG_NAMES = frozenset({
     "BAT_REQ_DCB_INFO",
     "INFO_REQ_GET_FS_USAGE",
 })
+COMMUNITY_INDEXED_READ_REQUEST_TYPES = {
+    "BAT_REQ_DCB_ALL_CELL_TEMPERATURES": RscpType.Uint16,
+    "BAT_REQ_DCB_ALL_CELL_VOLTAGES": RscpType.Uint16,
+    "BAT_REQ_DCB_INFO": RscpType.Uint16,
+}
 COMMUNITY_READ_ONLY_RESPONSE_TAG_NAMES = frozenset({
     "BAT_ASOC",
     "BAT_DCB_ALL_CELL_TEMPERATURES",
@@ -770,6 +779,10 @@ def validate_outbound_rscp_items(
             | COMMUNITY_READ_ONLY_REQUEST_TAG_NAMES
         )
     }
+    community_indexed_request_types = {
+        getattr(RscpTag, name): expected
+        for name, expected in COMMUNITY_INDEXED_READ_REQUEST_TYPES.items()
+    }
     response_tags = {
         getattr(RscpTag, name)
         for name in (
@@ -808,10 +821,19 @@ def validate_outbound_rscp_items(
             value = item.get("value")
             if tag in response_tags:
                 raise ValueError("provisional response tag is not outbound-capable")
-            if tag in request_tags and not (
-                type_byte == RscpType.Nil and value is None
-            ):
-                raise ValueError("provisional request tag permits Nil read only")
+            if tag in request_tags:
+                indexed_type = community_indexed_request_types.get(tag)
+                if indexed_type is not None:
+                    if not (
+                        type_byte == indexed_type
+                        and type(value) is int
+                        and 0 <= value <= 65535
+                    ):
+                        raise ValueError(
+                            "community indexed read tag has invalid type or value"
+                        )
+                elif type_byte != RscpType.Nil or value is not None:
+                    raise ValueError("provisional request tag permits Nil read only")
             if tag in mirror_response_tags:
                 raise ValueError("mirror response tag is not outbound-capable")
             if tag in mirror_request_types:
@@ -1455,9 +1477,9 @@ def fetch_battery_vitals(host: str, port: int, portal_user: str,
             for dcb_idx in range(dcb_count):
                 dcb_req = [{'tag': RscpTag.BAT_REQ_DATA, 'type': RscpType.Container, 'value': [
                     {'tag': RscpTag.BAT_INDEX,                       'type': RscpType.Uint16, 'value': cab_idx},
-                    {'tag': RscpTag.BAT_REQ_DCB_INFO,                'type': RscpType.Nil, 'value': None},
-                    {'tag': RscpTag.BAT_REQ_DCB_ALL_CELL_TEMPERATURES,'type': RscpType.Nil,'value': None},
-                    {'tag': RscpTag.BAT_REQ_DCB_ALL_CELL_VOLTAGES,   'type': RscpType.Nil, 'value': None},
+                    {'tag': RscpTag.BAT_REQ_DCB_INFO,                'type': RscpType.Uint16, 'value': dcb_idx},
+                    {'tag': RscpTag.BAT_REQ_DCB_ALL_CELL_TEMPERATURES,'type': RscpType.Uint16,'value': dcb_idx},
+                    {'tag': RscpTag.BAT_REQ_DCB_ALL_CELL_VOLTAGES,   'type': RscpType.Uint16, 'value': dcb_idx},
                 ]}]
                 dcb_resp = conn.request(dcb_req)
                 dcb_bd = find_tag(dcb_resp, RscpTag.BAT_DATA)
@@ -1468,6 +1490,20 @@ def fetch_battery_vitals(host: str, port: int, portal_user: str,
                 di, dcb_info_valid = validate_community_read_item(dcb_info, 'BAT_DCB_INFO')
                 if not dcb_info_valid:
                     continue
+                response_dcb_index_item = find_tag(di, RscpTag.BAT_DCB_INDEX)
+                response_dcb_index = None
+                if response_dcb_index_item is not None:
+                    response_dcb_index = response_dcb_index_item.get('value')
+                    if (
+                        response_dcb_index_item.get('type') != RscpType.Uint16
+                        or type(response_dcb_index) is not int
+                        or not 0 <= response_dcb_index <= 65535
+                        or response_dcb_index != dcb_idx
+                    ):
+                        # Ein falsch typisierter oder abweichender Antwortindex
+                        # darf niemals unter dem angeforderten Packindex
+                        # angezeigt werden.
+                        continue
                 soh = find_tag_value(di, RscpTag.BAT_DCB_SOH)
                 if soh is None:
                     soh = find_tag_value(di, RscpTag.BAT_DCB_SOH_H20)
@@ -1524,6 +1560,8 @@ def fetch_battery_vitals(host: str, port: int, portal_user: str,
 
                 cab['packs'].append({
                     'index': dcb_idx,
+                    'response_index': response_dcb_index,
+                    'index_confirmed': response_dcb_index == dcb_idx,
                     'soh': round(soh_f, 2),
                     'soh_source': 'BAT_DCB_SOH' if find_tag_value(di, RscpTag.BAT_DCB_SOH) is not None else 'BAT_DCB_SOH_H20',
                     'cycles': int(pack_cycles) if pack_cycles is not None else cab['cycles'],

@@ -257,7 +257,10 @@ $defaults = [
     "dimplex_temp_scale" => "auto", "dimplex_sg_heartbeat_s" => "300", "dimplex_allow_dark_green" => "0",
 
     // Wallbox & Auto
-    "wbminsoc" => "70", "wbcostpowers" => "7.2, 11.0, 22.0", "wbmaxladestrom" => "16", "wb1_max_amp" => "", "wb2_max_amp" => "", "wb1_current_step_amp" => "1.0", "wb2_current_step_amp" => "1.0", "grid_max_amps" => "63", "grid_wallbox_reserve_amps" => "2",
+    "wbminsoc" => "70", "wbcostpowers" => "7.2, 11.0, 22.0", "wbmaxladestrom" => "16", "wb1_max_amp" => "", "wb2_max_amp" => "", "wb1_current_step_amp" => "1.0", "wb2_current_step_amp" => "1.0",
+    "grid_max_amps" => "63", "grid_max_amps_l1" => "", "grid_max_amps_l2" => "", "grid_max_amps_l3" => "",
+    "grid_wallbox_reserve_amps" => "2", "grid_wallbox_reserve_amps_l1" => "", "grid_wallbox_reserve_amps_l2" => "", "grid_wallbox_reserve_amps_l3" => "",
+    "wb1_grid_phase" => "", "wb2_grid_phase" => "", "wb1_openwb_pro_1p_max_amp" => "", "wb2_openwb_pro_1p_max_amp" => "",
     "wb_surplus_target_grid_w" => "-125", "wb_surplus_noise_w" => "100", "phase_transition_safety_margin_w" => "0", "heatpump_start_settle_s" => "30",
     "wb_restart_delay_s" => "60", "wb_min_charge_time_s" => "300", "wb_cloud_stop_delay_s" => "180", "wb_phase_change_hold_s" => "180",
     "wb1_restart_delay_s" => "", "wb1_min_charge_time_s" => "", "wb1_cloud_stop_delay_s" => "", "wb1_phase_change_hold_s" => "",
@@ -704,7 +707,17 @@ $tooltips = [
     "phase_transition_safety_margin_w" => "Zusätzliche Leistungsreserve je aktivem Phasenwechsel in Watt. 0 verwendet die automatisch berechnete Reserve.",
     "heatpump_start_settle_s" => "Zeit in Sekunden, in der nach einem erkannten Wärmepumpenstart keine Wallbox-Aufregelung erfolgt.",
     "grid_max_amps"          => "Hausabsicherung/SLS in Ampere je Phase. Netz-Modi wie Sofort MAX und Preis-Laden dürfen Netz nutzen, werden aber vor dem Wallbox-Ampere-Befehl auf diese Grenze begrenzt.",
+    "grid_max_amps_l1"       => "Optionales abweichendes Betriebslimit für Netzphase L1. Leer verwendet die globale Hausabsicherung. Nur einen tatsächlich bekannten Wert eintragen.",
+    "grid_max_amps_l2"       => "Optionales abweichendes Betriebslimit für Netzphase L2. Leer verwendet die globale Hausabsicherung. Nur einen tatsächlich bekannten Wert eintragen.",
+    "grid_max_amps_l3"       => "Optionales abweichendes Betriebslimit für Netzphase L3. Leer verwendet die globale Hausabsicherung. Nur einen tatsächlich bekannten Wert eintragen.",
     "grid_wallbox_reserve_amps" => "Betriebsreserve unterhalb der Hausabsicherung je Phase. Der Wallbox-Regler begrenzt auf Hausabsicherung minus Reserve; bei 50 A und 10 A Reserve also auf höchstens 40 A je Phase.",
+    "grid_wallbox_reserve_amps_l1" => "Optionale zusätzliche Reserve für Netzphase L1. Leer verwendet die globale Wallbox-Reserve.",
+    "grid_wallbox_reserve_amps_l2" => "Optionale zusätzliche Reserve für Netzphase L2. Leer verwendet die globale Wallbox-Reserve.",
+    "grid_wallbox_reserve_amps_l3" => "Optionale zusätzliche Reserve für Netzphase L3. Leer verwendet die globale Wallbox-Reserve.",
+    "wb1_grid_phase"         => "Physische Zuordnung der lokalen Wallbox-Phase L1 zum Netzanschlusspunkt L1, L2 oder L3. Erst nach Messprüfung setzen; keine automatische Vermutung.",
+    "wb2_grid_phase"         => "Physische Zuordnung der lokalen Wallbox-Phase L1 zum Netzanschlusspunkt L1, L2 oder L3. Erst nach Messprüfung setzen; keine automatische Vermutung.",
+    "wb1_openwb_pro_1p_max_amp" => "Nutzergrenze für einphasiges Laden an openWB Pro 1. Über 20 A benötigen zusätzlich eine gebundene, frische phasenaufgelöste PCC-RMS-Strommessung. Reine Wirkleistung reicht als Sicherungsschutz nicht aus.",
+    "wb2_openwb_pro_1p_max_amp" => "Nutzergrenze für einphasiges Laden an openWB Pro 2. Über 20 A benötigen zusätzlich eine gebundene, frische phasenaufgelöste PCC-RMS-Strommessung. Reine Wirkleistung reicht als Sicherungsschutz nicht aus.",
     "wbcostpowers"           => "Typische Wallbox-Ladeleistungen in kW für Kostenberechnung, z.B. '7.2, 11.0, 22.0'.",
     "smart_wbhour_enable"    => "Dynamische Ladeplanung: 1=Auto (SoC-basiert), 0=Manuell (wbhour aus UI).",
     "car_capacity"           => "Fahrzeug-Batteriekapazität in kWh (für SoC-basierte Ladeplanung ohne Bluelink).",
@@ -2399,7 +2412,10 @@ $groups = [
     "Wallbox & Fahrzeug" => [
         "wb_native_enable", "wb_native_mode", "wb_native_type", "wb_native_ip", "wb_native_cp_id", "wb1_topic_prefix", "wb_native_type2", "wb_native_ip2", "wb2_topic_prefix", "wb_native_eco", "dvcarlimit",
         "wb1_e3dc_wbchar6_compat_enable", "wb2_e3dc_wbchar6_compat_enable",
-        "wbminsoc", "wbcostpowers", "wbmaxladestrom", "wb1_max_amp", "wb2_max_amp", "wb1_current_step_amp", "wb2_current_step_amp", "grid_max_amps", "grid_wallbox_reserve_amps",
+        "wbminsoc", "wbcostpowers", "wbmaxladestrom", "wb1_max_amp", "wb2_max_amp", "wb1_current_step_amp", "wb2_current_step_amp",
+        "grid_max_amps", "grid_max_amps_l1", "grid_max_amps_l2", "grid_max_amps_l3",
+        "grid_wallbox_reserve_amps", "grid_wallbox_reserve_amps_l1", "grid_wallbox_reserve_amps_l2", "grid_wallbox_reserve_amps_l3",
+        "wb1_grid_phase", "wb2_grid_phase", "wb1_openwb_pro_1p_max_amp", "wb2_openwb_pro_1p_max_amp",
         "wb_surplus_target_grid_w", "wb_surplus_noise_w", "phase_transition_safety_margin_w", "heatpump_start_settle_s",
         "wb_restart_delay_s", "wb_min_charge_time_s", "wb_cloud_stop_delay_s", "wb_phase_change_hold_s",
         "wb1_restart_delay_s", "wb1_min_charge_time_s", "wb1_cloud_stop_delay_s", "wb1_phase_change_hold_s",
@@ -2681,6 +2697,22 @@ if ($available_backups) {
         document.documentElement.setAttribute('data-e3dc-config-editor-view', 'simple');
     }
 })();
+
+function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') {
+    if (!target) return;
+    target.textContent = '';
+
+    const wrapper = document.createElement('span');
+    if (wrapperClass) wrapper.className = wrapperClass;
+    if (iconClass) {
+        const icon = document.createElement('i');
+        icon.className = iconClass;
+        wrapper.appendChild(icon);
+        wrapper.appendChild(document.createTextNode(' '));
+    }
+    wrapper.appendChild(document.createTextNode(String(message ?? '')));
+    target.appendChild(wrapper);
+}
 </script>
 <style>
     .config-card { border-radius: 16px; margin-bottom: 12px; overflow: hidden; }
@@ -5313,6 +5345,21 @@ if ($available_backups) {
                         <input type="number" name="values[wbmaxladestrom]" class="form-control config-input" value="<?= $val('wbmaxladestrom') ?>" placeholder="<?= $defaults['wbmaxladestrom'] ?>">
                         <?= $configValidationMarker('wbmaxladestrom') ?>
                     </div>
+                    <?php foreach ([1, 2, 3] as $gridPhase): ?>
+                    <div class="col-6 col-lg-2">
+                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['grid_max_amps_l' . $gridPhase] ?? '') ?>">Netz L<?= $gridPhase ?> Limit (A)</label>
+                        <input type="number" min="6" max="125" step="0.5" name="values[grid_max_amps_l<?= $gridPhase ?>]" class="form-control config-input" value="<?= $val('grid_max_amps_l' . $gridPhase) ?>" placeholder="leer = global">
+                    </div>
+                    <div class="col-6 col-lg-2">
+                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['grid_wallbox_reserve_amps_l' . $gridPhase] ?? '') ?>">Netz L<?= $gridPhase ?> Reserve (A)</label>
+                        <input type="number" min="0" max="64" step="0.5" name="values[grid_wallbox_reserve_amps_l<?= $gridPhase ?>]" class="form-control config-input" value="<?= $val('grid_wallbox_reserve_amps_l' . $gridPhase) ?>" placeholder="leer = global">
+                    </div>
+                    <?php endforeach; ?>
+                    <div class="col-12">
+                        <small class="text-muted">
+                            Phasenwerte sind optional. Leer bedeutet globale Hausgrenze bzw. globale Reserve; eine höhere openWB-Pro-Freigabe benötigt zusätzlich eine bestätigte Wallbox-zu-Netzphasen-Zuordnung und frische Messwerte.
+                        </small>
+                    </div>
                     <div class="col-6">
                         <label class="config-label text-info" data-tooltip="<?= htmlspecialchars($tooltipMap['wb1_max_amp'] ?? '') ?>">WB1 Max. Ladestrom (A)</label>
                         <input type="number" min="6" max="32" name="values[wb1_max_amp]" class="form-control config-input" value="<?= $val('wb1_max_amp') ?>" placeholder="leer = Fallback">
@@ -5326,6 +5373,19 @@ if ($available_backups) {
                             <?php endforeach; ?>
                         </select>
                     </div>
+                    <div class="col-6 col-lg-3">
+                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb1_grid_phase'] ?? '') ?>">WB1 lokale L1 liegt auf Netzphase</label>
+                        <select name="values[wb1_grid_phase]" class="form-select config-input">
+                            <option value="" <?= $rawVal('wb1_grid_phase') === '' ? 'selected' : '' ?>>nicht gebunden</option>
+                            <?php foreach ([1, 2, 3] as $phase): ?>
+                                <option value="<?= $phase ?>" <?= $rawVal('wb1_grid_phase') === (string)$phase ? 'selected' : '' ?>>L<?= $phase ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+                    <div class="col-6 col-lg-3">
+                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb1_openwb_pro_1p_max_amp'] ?? '') ?>">WB1 openWB Pro 1p Max. (A)</label>
+                        <input type="number" min="6" max="32" step="0.5" name="values[wb1_openwb_pro_1p_max_amp]" class="form-control config-input" value="<?= $val('wb1_openwb_pro_1p_max_amp') ?>" placeholder="leer = sicher 20 A">
+                    </div>
                     <div class="col-6">
                         <label class="config-label text-info" data-tooltip="<?= htmlspecialchars($tooltipMap['wb2_max_amp'] ?? '') ?>">WB2 Max. Ladestrom (A)</label>
                         <input type="number" min="6" max="32" name="values[wb2_max_amp]" class="form-control config-input" value="<?= $val('wb2_max_amp') ?>" placeholder="leer = Fallback">
@@ -5338,6 +5398,19 @@ if ($available_backups) {
                                 <option value="<?= htmlspecialchars($stepValue) ?>" <?= ((string)$val('wb2_current_step_amp') === $stepValue) ? 'selected' : '' ?>><?= htmlspecialchars($stepLabel) ?></option>
                             <?php endforeach; ?>
                         </select>
+                    </div>
+                    <div class="col-6 col-lg-3">
+                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb2_grid_phase'] ?? '') ?>">WB2 lokale L1 liegt auf Netzphase</label>
+                        <select name="values[wb2_grid_phase]" class="form-select config-input">
+                            <option value="" <?= $rawVal('wb2_grid_phase') === '' ? 'selected' : '' ?>>nicht gebunden</option>
+                            <?php foreach ([1, 2, 3] as $phase): ?>
+                                <option value="<?= $phase ?>" <?= $rawVal('wb2_grid_phase') === (string)$phase ? 'selected' : '' ?>>L<?= $phase ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+                    <div class="col-6 col-lg-3">
+                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb2_openwb_pro_1p_max_amp'] ?? '') ?>">WB2 openWB Pro 1p Max. (A)</label>
+                        <input type="number" min="6" max="32" step="0.5" name="values[wb2_openwb_pro_1p_max_amp]" class="form-control config-input" value="<?= $val('wb2_openwb_pro_1p_max_amp') ?>" placeholder="leer = sicher 20 A">
                     </div>
                     <div class="col-6 col-lg-3">
                         <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb_surplus_target_grid_w'] ?? '') ?>">PV-Netzziel (W)</label>
@@ -7129,7 +7202,7 @@ if ($available_backups) {
             async function subscribePush() {
                 const status = document.getElementById('push-status');
                 try {
-                    status.innerHTML = '<i class="fas fa-spinner fa-spin"></i> 1/6 Frage nach Erlaubnis...';
+                    renderConfigStatus(status, '1/6 Frage nach Erlaubnis...', '', 'fas fa-spinner fa-spin');
                     if (!("Notification" in window)) {
                         throw new Error("Dieser Browser unterstützt keine Push-Benachrichtigungen.");
                     }
@@ -7143,21 +7216,21 @@ if ($available_backups) {
                         throw new Error("Benachrichtigungen sind dauerhaft blockiert. Bitte in den Browser-Einstellungen erlauben.");
                     }
 
-                    status.innerHTML = '<i class="fas fa-spinner fa-spin"></i> 2/6 Registriere Service Worker...';
+                    renderConfigStatus(status, '2/6 Registriere Service Worker...', '', 'fas fa-spinner fa-spin');
                     // Den Zwischenspeicher des Service Workers bewusst umgehen, damit sicher die neueste bereitgestellte Version läuft.
                     const reg = await navigator.serviceWorker.register('sw.js?v=' + Date.now());
 
-                    status.innerHTML = '<i class="fas fa-spinner fa-spin"></i> 3/6 Lade E3DC Zertifikat (VAPID)...';
+                    renderConfigStatus(status, '3/6 Lade E3DC Zertifikat (VAPID)...', '', 'fas fa-spinner fa-spin');
                     const res = await fetch('webpush_api.php?action=get_vapid');
                     const vapidData = await res.json();
 
                     if (vapidData.error) {
-                        status.innerHTML = '<span class="text-danger"><i class="fas fa-exclamation-triangle"></i> ' + vapidData.error + '</span>';
+                        renderConfigStatus(status, vapidData.error, 'text-danger', 'fas fa-exclamation-triangle');
                         return;
                     }
 
                     const rawKey = vapidData.public_key.trim();
-                    status.innerHTML = '<i class="fas fa-spinner fa-spin"></i> 4/5 Kontaktiere Apple/Google Push-Server...';
+                    renderConfigStatus(status, '4/5 Kontaktiere Apple/Google Push-Server...', '', 'fas fa-spinner fa-spin');
                     const applicationServerKey = await urlBase64ToUint8Array(rawKey);
 
                     // Fange Timeout oder Hänger explizit mit Race auf
@@ -7171,7 +7244,7 @@ if ($available_backups) {
                         new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout bei Verbindung zum Apple/Google Push-Service. Keine Internetverbindung?")), 15000))
                     ]);
 
-                    status.innerHTML = '<i class="fas fa-spinner fa-spin"></i> 5/5 Sichere Schlüssel in E3DC Datenbank...';
+                    renderConfigStatus(status, '5/5 Sichere Schlüssel in E3DC Datenbank...', '', 'fas fa-spinner fa-spin');
                     const subData = subscription.toJSON();
                     subData.device_name = navigator.userAgent; // Basic identifier
 
@@ -7183,15 +7256,15 @@ if ($available_backups) {
 
                     const saveJson = await saveRes.json();
                     if(saveJson.success) {
-                        status.innerHTML = '<span class="text-success"><i class="fas fa-check-circle fs-5 d-block mb-1"></i> Gerät erfolgreich gesichert!</span>';
+                        renderConfigStatus(status, 'Gerät erfolgreich gesichert!', 'text-success', 'fas fa-check-circle fs-5 d-block mb-1');
                     } else {
-                        status.innerHTML = '<span class="text-danger"><i class="fas fa-times"></i> DB-Fehler: ' + saveJson.error + '</span>';
+                        renderConfigStatus(status, 'DB-Fehler: ' + String(saveJson.error ?? 'Unbekannter Fehler'), 'text-danger', 'fas fa-times');
                     }
                 } catch (err) {
                     if (err.name === "NotAllowedError") {
-                        status.innerHTML = '<span class="text-danger"><i class="fas fa-times"></i> Erlaubnis verweigert. Browser URL Einstellungen prüfen!</span>';
+                        renderConfigStatus(status, 'Erlaubnis verweigert. Browser URL Einstellungen prüfen!', 'text-danger', 'fas fa-times');
                     } else {
-                        status.innerHTML = '<span class="text-danger"><i class="fas fa-times"></i> Abbruch: ' + err.message + '</span>';
+                        renderConfigStatus(status, 'Abbruch: ' + String(err?.message ?? err), 'text-danger', 'fas fa-times');
                     }
                 }
             }
@@ -7232,17 +7305,17 @@ if ($available_backups) {
 
             async function testPush() {
                 const status = document.getElementById('push-status');
-                status.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Sende Testnachricht...';
+                renderConfigStatus(status, 'Sende Testnachricht...', '', 'fas fa-spinner fa-spin');
                 try {
                     const res = await fetch('webpush_api.php?action=test_push');
                     const json = await res.json();
                     if(json.success) {
-                        status.innerHTML = '<span class="text-success"><i class="fas fa-check"></i> Testnachricht erfolgreich versendet! (' + json.count + ' Geräte)</span>';
+                        renderConfigStatus(status, 'Testnachricht erfolgreich versendet! (' + String(json.count ?? 0) + ' Geräte)', 'text-success', 'fas fa-check');
                     } else {
-                        status.innerHTML = '<span class="text-danger"><i class="fas fa-times"></i> Fehler: ' + json.error + '</span>';
+                        renderConfigStatus(status, 'Fehler: ' + String(json.error ?? 'Unbekannter Fehler'), 'text-danger', 'fas fa-times');
                     }
                 } catch(e) {
-                    status.innerHTML = '<span class="text-danger"><i class="fas fa-exclamation-triangle"></i> Fehler: ' + e + '</span>';
+                    renderConfigStatus(status, 'Fehler: ' + String(e?.message ?? e), 'text-danger', 'fas fa-exclamation-triangle');
                 }
             }
             </script>
@@ -8340,7 +8413,7 @@ if ($available_backups) {
                     const btns = ['bat-btn-charge','bat-btn-discharge','bat-btn-auto'];
                     btns.forEach(id => { const b = document.getElementById(id); if(b) b.disabled = true; });
                     const result = document.getElementById('bat-cmd-result');
-                    result.innerHTML = '<i class="fas fa-circle-notch fa-spin me-1 text-info"></i> Sende Befehl...';
+                    renderConfigStatus(result, 'Sende Befehl...', '', 'fas fa-circle-notch fa-spin me-1 text-info');
 
                     const targetSoc = document.getElementById('bat_target_soc_range').value;
                     const fd = new FormData();
@@ -8352,27 +8425,40 @@ if ($available_backups) {
                         const res = await fetch('manual_bat_cmd.php', { method: 'POST', body: fd });
                         const data = await res.json();
                         if (data.ok) {
-                            result.innerHTML = '<i class="fas fa-check-circle text-success me-1"></i>' + data.msg;
+                            renderConfigStatus(result, data.msg ?? 'Befehl übernommen.', '', 'fas fa-check-circle text-success me-1');
                             // Badge sofort aktualisieren (kein Seitenreload nötig)
                             const badge = document.getElementById('bat-status-badge');
                             if (badge) {
-                                if (action === 'charge') {
-                                    badge.innerHTML = `<span class="badge rounded-pill px-3 py-2 shadow-sm" style="font-size:0.75em; background:rgba(16,185,129,0.25); color:#6ee7b7; border:1px solid #6ee7b7;"><i class="fas fa-arrow-up me-1"></i>Laden aktiv &mdash; Ziel: ${targetSoc}%</span>`;
-                                } else if (action === 'discharge') {
-                                    badge.innerHTML = `<span class="badge rounded-pill px-3 py-2 shadow-sm" style="font-size:0.75em; background:rgba(239,68,68,0.25); color:#fca5a5; border:1px solid #fca5a5;"><i class="fas fa-arrow-down me-1"></i>Entladen aktiv &mdash; Ziel: ${targetSoc}%</span>`;
+                                badge.textContent = '';
+                                const statusBadge = document.createElement('span');
+                                const statusIcon = document.createElement('i');
+                                if (action === 'charge' || action === 'discharge') {
+                                    const charging = action === 'charge';
+                                    statusBadge.className = 'badge rounded-pill px-3 py-2 shadow-sm';
+                                    statusBadge.style.cssText = charging
+                                        ? 'font-size:0.75em; background:rgba(16,185,129,0.25); color:#6ee7b7; border:1px solid #6ee7b7;'
+                                        : 'font-size:0.75em; background:rgba(239,68,68,0.25); color:#fca5a5; border:1px solid #fca5a5;';
+                                    statusIcon.className = charging ? 'fas fa-arrow-up me-1' : 'fas fa-arrow-down me-1';
+                                    statusBadge.appendChild(statusIcon);
+                                    statusBadge.appendChild(document.createTextNode((charging ? 'Laden' : 'Entladen') + ' aktiv — Ziel: ' + String(targetSoc) + '%'));
                                 } else {
-                                    badge.innerHTML = '<span class="badge bg-secondary rounded-pill px-3 py-1" style="font-size:0.75em;"><i class="fas fa-robot me-1"></i>Automatik</span>';
+                                    statusBadge.className = 'badge bg-secondary rounded-pill px-3 py-1';
+                                    statusBadge.style.fontSize = '0.75em';
+                                    statusIcon.className = 'fas fa-robot me-1';
+                                    statusBadge.appendChild(statusIcon);
+                                    statusBadge.appendChild(document.createTextNode('Automatik'));
                                 }
+                                badge.appendChild(statusBadge);
                             }
                         } else {
-                            result.innerHTML = '<i class="fas fa-exclamation-triangle text-danger me-1"></i>' + data.msg;
+                            renderConfigStatus(result, data.msg ?? 'Befehl abgelehnt.', '', 'fas fa-exclamation-triangle text-danger me-1');
                         }
                     } catch(e) {
-                        result.innerHTML = '<i class="fas fa-times text-danger me-1"></i>Fehler: ' + e;
+                        renderConfigStatus(result, 'Fehler: ' + String(e?.message ?? e), '', 'fas fa-times text-danger me-1');
                     }
 
                     setTimeout(() => btns.forEach(id => { const b = document.getElementById(id); if(b) b.disabled = false; }), 1500);
-                    setTimeout(() => { const r = document.getElementById('bat-cmd-result'); if(r) r.innerHTML = ''; }, 8000);
+                    setTimeout(() => { const r = document.getElementById('bat-cmd-result'); if(r) r.textContent = ''; }, 8000);
                 }
                 </script>
                 <?php endif; ?>
@@ -8925,22 +9011,22 @@ if ($available_backups) {
                     const btn = document.getElementById('gps-btn');
                     const status = document.getElementById('gps-status');
                     if (!navigator.geolocation) {
-                        status.innerHTML = '<i class="fas fa-exclamation-triangle text-warning me-1"></i>Browser unterstützt kein GPS.';
+                        renderConfigStatus(status, 'Browser unterstützt kein GPS.', '', 'fas fa-exclamation-triangle text-warning me-1');
                         return;
                     }
                     if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin me-1"></i>Wird ermittelt...'; }
-                    status.innerHTML = '<i class="fas fa-spinner fa-spin me-1"></i>GPS wird abgerufen (einmalig, keine Speicherung durch Browser)...';
+                    renderConfigStatus(status, 'GPS wird abgerufen (einmalig, keine Speicherung durch Browser)...', '', 'fas fa-spinner fa-spin me-1');
                     navigator.geolocation.getCurrentPosition(
                         function(pos) {
                             const lat = pos.coords.latitude.toFixed(6);
                             const lon = pos.coords.longitude.toFixed(6);
                             setWizardLocation(lat, lon);
-                            status.innerHTML = '<i class="fas fa-check-circle text-success me-1"></i>Standort erkannt: ' + lat + '&deg;N / ' + lon + '&deg;E (Genauigkeit &plusmn;' + Math.round(pos.coords.accuracy) + 'm) &mdash; bitte Speichern.';
+                            renderConfigStatus(status, 'Standort erkannt: ' + lat + '°N / ' + lon + '°E (Genauigkeit ±' + Math.round(pos.coords.accuracy) + 'm) — bitte Speichern.', '', 'fas fa-check-circle text-success me-1');
                             if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-check text-success me-1"></i>Erkannt'; }
                         },
                         function(err) {
                             const msgs = {1:'Zugriff verweigert (Browser-Einstellung)',2:'Position nicht verfügbar',3:'Zeitüberschreitung'};
-                            status.innerHTML = '<i class="fas fa-times text-danger me-1"></i>' + (msgs[err.code] || err.message);
+                            renderConfigStatus(status, msgs[err.code] || err.message, '', 'fas fa-times text-danger me-1');
                             if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-location-crosshairs me-1"></i>Meinen Standort erkennen'; }
                         },
                         {enableHighAccuracy: false, timeout: 10000, maximumAge: 300000}
@@ -9014,7 +9100,7 @@ if ($available_backups) {
                     if (hidEl) hidEl.value = fcstr;
                     const prev = document.getElementById('wiz_preview'+n);
                     if (prev) prev.textContent = fcstr;
-                    showWizResult('forecast' + n + ' = <code>' + fcstr + '</code> eingetragen &mdash; bitte Speichern.');
+                    showWizResult('forecast' + n + ' = ' + fcstr + ' eingetragen — bitte Speichern.');
                 }
 
                 function addFC(n) {
@@ -9023,7 +9109,7 @@ if ($available_backups) {
                     const hidEl = document.querySelector('input[name="values[forecast'+n+']"]');
                     if (hidEl) hidEl.value = '35/0/1.0'; // Platzhalter -> wird als "konfiguriert" erkannt
                     // Sofort speichern und das Neuladen auslösen
-                    showWizResult('Dachfläche '+n+' angelegt &mdash; Seite wird neu geladen...', false);
+                    showWizResult('Dachfläche ' + n + ' angelegt — Seite wird neu geladen...', false);
                     setTimeout(() => {
                         const form = document.querySelector('form');
                         if (form) {
@@ -9036,7 +9122,7 @@ if ($available_backups) {
                 function removeFC(n) {
                     const hidEl = document.querySelector('input[name="values[forecast'+n+']"]');
                     if (hidEl) hidEl.value = '';
-                    showWizResult('Dachfläche ' + n + ' entfernt &mdash; bitte Speichern.');
+                    showWizResult('Dachfläche ' + n + ' entfernt — bitte Speichern.');
                     const panel = document.getElementById('fc-panel-'+n);
                     if (panel) { panel.style.opacity='0.4'; panel.style.pointerEvents='none'; }
                 }
@@ -9046,7 +9132,7 @@ if ($available_backups) {
                     const key = n === 1 ? 'solcast_api_key' : 'solcast_api_key_2';
                     const el = document.querySelector('input[name="values['+key+']"]');
                     if (el) { el.value = val; showScResult('API Key ' + n + ' eingetragen.'); }
-                    else { showScResult('Feld '+key+' nicht gefunden &mdash; bitte oben manuell eintragen.', true); }
+                    else { showScResult('Feld ' + key + ' nicht gefunden — bitte oben manuell eintragen.', true); }
                 }
 
                 function applyScRes(n) {
@@ -9054,20 +9140,20 @@ if ($available_backups) {
                     const key = n === 1 ? 'solcast_resource_id' : 'solcast_resource_id_'+n;
                     const el = document.querySelector('input[name="values['+key+']"]');
                     if (el) { el.value = val; showScResult('Resource ID ' + n + ' ('+key+') eingetragen.'); }
-                    else { showScResult('Feld '+key+' nicht vorhanden &mdash; wird beim Speichern angelegt.', false); }
+                    else { showScResult('Feld ' + key + ' nicht vorhanden — wird beim Speichern angelegt.', false); }
                 }
 
                 function showWizResult(msg, isErr) {
                     const r = document.getElementById('wizard-result');
                     if (!r) return;
-                    r.innerHTML = '<i class="fas fa-' + (isErr ? 'exclamation-triangle text-danger' : 'check-circle text-success') + ' me-1"></i>' + msg;
-                    setTimeout(() => { if(r) r.innerHTML = ''; }, 7000);
+                    renderConfigStatus(r, msg, '', isErr ? 'fas fa-exclamation-triangle text-danger me-1' : 'fas fa-check-circle text-success me-1');
+                    setTimeout(() => { if(r) r.textContent = ''; }, 7000);
                 }
                 function showScResult(msg, isErr) {
                     const r = document.getElementById('solcast-result');
                     if (!r) return;
-                    r.innerHTML = '<i class="fas fa-' + (isErr ? 'exclamation-triangle text-warning' : 'check-circle text-success') + ' me-1"></i>' + msg;
-                    setTimeout(() => { if(r) r.innerHTML = ''; }, 7000);
+                    renderConfigStatus(r, msg, '', isErr ? 'fas fa-exclamation-triangle text-warning me-1' : 'fas fa-check-circle text-success me-1');
+                    setTimeout(() => { if(r) r.textContent = ''; }, 7000);
                 }
                 </script>
 

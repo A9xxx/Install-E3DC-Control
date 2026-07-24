@@ -115,7 +115,7 @@ $paths = getInstallPaths();
     <div class="container">
         <div class="d-flex justify-content-between align-items-center mb-4">
             <a href="index.php" class="nav-link-back"><i class="fas fa-arrow-left me-2"></i>Dashboard</a>
-            <span class="badge bg-success text-light">v5.4.0e Stable</span>
+            <span class="badge bg-success text-light">v5.4.1 Stable</span>
         </div>
         <h1 class="display-4 fw-bold">Hilfe & Support</h1>
         <p class="lead opacity-75">Häufige Fragen und Lösungen rund um E3DC-Control.</p>
@@ -134,12 +134,16 @@ $paths = getInstallPaths();
         <div class="col-12 faq-item" data-tags="docker image stable rollback update">
             <div class="card bg-card border-0 shadow-sm"><div class="card-body">
                 <h5 class="card-title"><span class="tag">Docker</span> Wie prüfe ich Image und Update?</h5>
-                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem geprüften Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.0e</code> in <code>.env</code> gesetzt.</p>
-                <pre>docker compose config --images
-docker compose pull e3dc-control
-docker compose up -d --force-recreate e3dc-control
-docker inspect e3dc-control --format '{{.Config.Image}} {{.State.Status}}'
-docker compose build --no-cache e3dc-control</pre>
+                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem geprüften Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.1</code> in <code>.env</code> gesetzt.</p>
+                <pre>(
+  set -euo pipefail
+  docker compose config --images
+  docker compose pull e3dc-control
+  docker compose up -d --force-recreate e3dc-control
+  docker inspect e3dc-control --format '{{.Config.Image}} {{.State.Status}}'
+  docker exec e3dc-control cat /app/pi/Install/VERSION
+)</pre>
+                <p>Der nicht mehr gepflegte Watchtower ist wegen seines weitreichenden Docker-Socket-Zugriffs kein Standardstart. Der bewusste Opt-in lautet <code>docker compose --profile auto-update up -d watchtower</code>; ohne diesen Befehl bleibt der manuelle Updateweg aktiv.</p>
                 <p>Der Docker-Rückfall erfolgt ausschließlich auf ein in der Update-Policy mit <code>docker_supported</code> freigegebenes Image. <code>v5.3.2b</code> ist nicht als Bare-Metal-Programm-Rückfall freigegeben.</p>
             </div></div>
         </div>
@@ -203,6 +207,25 @@ docker compose build --no-cache e3dc-control</pre>
                         <li>Nach der Freigabe im Account den RESTful API Security Token erzeugen.</li>
                         <li>Im Config-Editor unter <em>Tarif</em> den ENTSO-E-Token als Fallback-Token eintragen und mit <em>ENTSO-E testen</em> prüfen.</li>
                     </ol>
+                </div>
+            </div>
+        </div>
+
+        <h4 class="mb-4 text-accent"><i class="fas fa-layer-group me-2"></i>Stable 5.4.1: Wallbox-, Update- und Diagnosekonsolidierung</h4>
+        <div class="col-12 faq-item" data-tags="5.4.1 stable openwb pro phasenwechsel balancing update docker frequenz sg ready shelly sicherheit batterie vitals dcb">
+            <div class="card bg-card border-0 shadow-sm">
+                <div class="card-body">
+                    <h5 class="card-title">
+                        <span class="tag">5.4.1</span>
+                        Was bringt das Stable-Release 5.4.1?
+                    </h5>
+                    <ul>
+                        <li><strong>openWB Pro:</strong> Start, Pause, Ladeende und Phasenwechsel bleiben an frische Stecksession und bestätigte Rückmeldungen gebunden. Die 480-Sekunden-Sperre verhindert nur einen weiteren Phasenwechsel.</li>
+                        <li><strong>Balancing:</strong> Ein- und dreiphasige Fahrzeuge werden anhand ihrer tatsächlichen Phasenzahl leistungsfair statt nach einer pauschalen Ampere-Summe verteilt. Die konfigurierbare Phasenzuordnung bleibt Diagnose; ohne echten PCC-RMS-Stromvektor bleibt eine einphasige Freigabe über 20 A gesperrt.</li>
+                        <li><strong>Update und Docker:</strong> Der unterstützte Erstwechsel aus 5.3.2b behält Konfiguration und installierte optionale Dienste. Docker-Build, Attestierungsprüfung und Stable-Promotion laufen als zusammenhängende Transaktion.</li>
+                        <li><strong>Diagnose:</strong> Netzfrequenz, SG-Ready-/Shelly-Aktivität und externe Wetterlade-Konflikte sind sichtbar. Batterie-Vitals fragt jeden DCB-Pack mit seinem typisierten Index ab und bindet vorhandene Antwortindizes. Fehlende neue optionale Statuswerte bleiben unbekannt.</li>
+                        <li><strong>Sicherheit:</strong> Watchtower ist nur noch ein bewusster Opt-in; gemeldete Status- und Fehlertexte werden im Konfigurationseditor nicht als ungeprüftes HTML eingesetzt.</li>
+                    </ul>
                 </div>
             </div>
         </div>
@@ -311,7 +334,7 @@ docker compose build --no-cache e3dc-control</pre>
                     <ul>
                         <li><strong>Speicher und Markt:</strong> Ungültige Provider-, Cache- oder Anlagendaten erzeugen einen explizit inaktiven Plan. Reserve und permanente Gerätegrenzen bleiben unangetastet.</li>
                         <li><strong>Headroom:</strong> Interne DC-PV und zusätzliche AC-Erzeuger werden getrennt bilanziert. DC- und Netzpunktdruck werden mit dem größeren Wert bewertet und nicht doppelt addiert.</li>
-                        <li><strong>Wallbox:</strong> openWB Pro kann eine bestätigte Startfreigabe nach einem veralteten Nullzustand ohne Umstecken erneut übernehmen. Mehrere Ladepunkte werden anhand ihrer L1/L2/L3-Ströme und der Netzpunktreserve verteilt; ein- und dreiphasige Amperewerte werden nicht pauschal addiert. Die ruhige PV-Kurve erlaubt bei laufender Ladung höchstens 75 Wh Batteriestützung.</li>
+                        <li><strong>Wallbox:</strong> openWB Pro kann eine bestätigte Startfreigabe nach einem veralteten Nullzustand ohne Umstecken erneut übernehmen. Mehrere Ladepunkte werden anhand ihrer L1/L2/L3-Ströme und der Netzpunktreserve verteilt; ein- und dreiphasige Amperewerte werden nicht pauschal addiert. Die strengere leistungsfaire Zuteilung und die konservative PCC-RMS-Freigabe gelten ab 5.4.1. Die ruhige PV-Kurve erlaubt bei laufender Ladung höchstens 75 Wh Batteriestützung.</li>
                         <li><strong>Wärmepumpe:</strong> Wallboxaktionen oder der Verlust eines Wallboxkontexts stoppen keine bereits laufende Wärmepumpe eigenständig. Hardwarebefehle bleiben an frische, treiberspezifische Rückmeldungen gebunden.</li>
                         <li><strong>iDM-Diagnose:</strong> Der manuelle Scanner liest Register 1006 genau einmal per FC04. Er schreibt weder dieses Register noch andere Register.</li>
                         <li><strong>Mobile Energieflüsse:</strong> Desktop- und Mobile-Positionen besitzen getrennte Revisionen; gleichzeitige Änderungen werden erkannt statt überschrieben.</li>
@@ -404,7 +427,7 @@ docker compose build --no-cache e3dc-control</pre>
                         <li><strong>Dreiphasiges Laden:</strong> 16 Ampere * 230 Volt * 3 = ~11.040 Watt (11 kW)</li>
                     </ul>
                     <p>Wenn Ihr Auto nur einphasig lädt, ist bei 16A physikalisch bei 3.6kW Schluss. Haben Sie eine zugelassene <strong>22 kW Wallbox</strong> installiert und wollen bis zu 32A ins Auto schicken (7.2kW einphasig / 22kW dreiphasig), heben Sie im Konfigurations-Editor den globalen Fallback <strong>Max. Ladestrom</strong> oder in <em>Wallbox</em> gezielt <strong>WB1 Max A</strong>/<strong>WB2 Max A</strong> an. So kann z.B. WB1 mit 32A und WB2 weiter mit 16A begrenzt bleiben.</p>
-                    <p>Beim Betrieb mehrerer Ladepunkte addiert E3DC-Control die angezeigten Amperewerte nicht als einzelne Gesamtsumme. Maßgeblich sind die Ströme auf L1, L2 und L3, die reale Phasenzahl, Fahrzeug- und Ladepunktgrenzen sowie die verbleibende Netzpunktreserve.</p>
+                    <p>Beim Betrieb mehrerer Ladepunkte addiert E3DC-Control die angezeigten Amperewerte nicht als einzelne Gesamtsumme. Maßgeblich für die leistungsfaire Verteilung sind die reale Phasenzahl sowie Fahrzeug- und Ladepunktgrenzen; gemessene L1/L2/L3-Ströme am Ladepunkt bleiben zusätzliche Diagnose. Solange kein bestätigter phasenaufgelöster PCC-RMS-Stromvektor vorhanden ist, bleibt der Hausanschlussschutz konservativ; aus phasenbezogener Wirkleistung wird keine zusätzliche Amperefreigabe abgeleitet.</p>
                 </div>
             </div>
         </div>
@@ -859,7 +882,7 @@ journalctl -u e3dc-live -n 80 --no-pager</pre>
                         <li>Über das Dashboard (Kachel Konfiguration -> "Update suchen").</li>
                         <li>Bei aktuellen Ständen direkt über den Menüpunkt <em>Update</em> im Installer.</li>
                     </ol>
-                    <p><strong>Einmalige Ausnahme für 5.3.2b:</strong> Den ersten Wechsel auf 5.4.0e ausschließlich über den Web-Update-Button oder per SSH mit <code>sudo /usr/bin/python3 installer_main.py --update-e3dc</code> starten. Der interaktive Menüpunkt ist für diesen Hybridwechsel nicht freigegeben, weil der 5.3.2b-Altprozess bereits zusätzliche Module geladen hat.</p>
+                    <p><strong>Einmalige Ausnahme für 5.3.2b:</strong> Den ersten Wechsel auf 5.4.1 ausschließlich über den Web-Update-Button oder per SSH mit <code>sudo /usr/bin/python3 installer_main.py --update-e3dc</code> starten. Der interaktive Menüpunkt ist für diesen Hybridwechsel nicht freigegeben, weil der 5.3.2b-Altprozess bereits zusätzliche Module geladen hat.</p>
                     <p>Verwenden Sie für den einmaligen Wechsel auf die bereinigte Historie keinen manuellen <code>git pull --ff-only</code>-Ablauf. Der Installer erstellt und prüft zuerst das externe Backup und validiert anschließend Zielstand, Dienste und Weboberfläche.</p>
                     Updates werden im Changelog oben rechts im Dashboard signalisiert.
                 </div>
@@ -897,7 +920,7 @@ journalctl -u e3dc-live -n 80 --no-pager</pre>
                 </div>
                 <div class="faq-answer">
                     Der <strong>Smart Home MQTT-Hub</strong> sendet alle Live-Daten (PV, Batterie, Haus, Grid) an Ihren Broker.
-                    <p>Standard-Präfix ist <code>e3dc/</code>. In Home Assistant können Sie diese via MQTT-Integration abonnieren. Beispiel-Topic für den Hausverbrauch: <code>e3dc/live/home_w</code>. Ein Websocket-Interface steht ebenfalls unter Port 8080 zur Verfügung.</p>
+                    <p>Standard-Präfix ist <code>e3dc/</code>. In Home Assistant können Sie diese via MQTT-Integration abonnieren. Beispiel-Topic für den Hausverbrauch: <code>e3dc/live/home_w</code>. Das Dashboard nutzt den WebSocket ausschließlich über den gleichursprünglichen Webserver-Pfad <code>/ws</code>; ein direkter LAN-Port ist nicht erforderlich.</p>
                 </div>
             </div>
         </div>
@@ -1337,6 +1360,7 @@ journalctl -u e3dc-live -n 80 --no-pager</pre>
                 </div>
                 <div class="faq-answer">
                     <p>Ab v4.9.0 ist <code>AUTO</code> nur noch ein Freigabe-Befehl. Wenn der E3DC bereits im AUTO-Modus ist, sendet Python keinen wiederholten RSCP-Befehl mehr. Die E3DC-Firmware regelt Hausversorgung, Speicher und Netzpunkt dann allein.</p>
+                    <p><strong>Wetterbasiertes Laden im E3/DC:</strong> Wenn E3DC-Control die Ladekurve führt, sollte diese E3/DC-Funktion ausgeschaltet sein. Sie ist ein zweiter Ladeplaner und kann Ladekapazität zurückhalten, obwohl E3DC-Control bereits eine passende AUTO-Ladeobergrenze bereitstellt. Die Open-Meteo-/Forecast-Prognose von E3DC-Control bleibt davon unabhängig aktiv. Bei gleichzeitigem E3/DC-Status <em>Laden gesperrt</em> und <em>Warten auf Sonnenschein</em> zeigt E3DC-Control das externe Veto an, verändert die Geräteeinstellung aber nicht automatisch.</p>
                     <p>Ab v4.9.1a gibt die Nachtfreigabe den E3DC bei <code>PV=0W</code> wieder in <code>AUTO</code> frei, statt die Tagesladekurve nachts mit <code>IDLE</code> oder Autodump zu erzwingen. Aktiver Pre-Discharge ist davon ausgenommen und läuft weiter.</p>
                     <p>Ab v4.9.1b folgt Pre-Discharge einer eigenen Entladerampe mit Hysterese. Die normale Ladekurve kann den morgendlichen Pre-Dump dadurch nicht mehr zu frueh pausieren.</p>
                     <p>Ab v4.9.1c sendet die aktive Ladekurve ihren berechneten <code>iFc</code>-Wert direkt als Lade- oder Entlade-Führung. Dadurch entstehen keine kurzen Gegenkorrekturen mehr, bei denen zuerst ein um 100 W versetzter Wert und danach sofort der begrenzte Wert an den E3DC gesendet wird.</p>

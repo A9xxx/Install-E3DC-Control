@@ -6,6 +6,31 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.1] – 2026-07-24
+
+### 🔌 Wallboxen und Fahrzeuge
+
+- 🐛 **openWB Pro:** Start, Wiederanlauf, Pause, Ladeende und Phasenwechsel sind an frische Stecksession, Sollabsicht und bestätigten Geräte-Readback gebunden. Die 480-Sekunden-Sperre verhindert ausschließlich einen weiteren Phasenwechsel und blockiert nicht die laufende Ladung.
+- ⚙️ **Leistungsfaires Balancing:** Fahrzeug-, Nutzer- und Ladepunktgrenzen werden anhand der tatsächlichen Phasenzahl in Leistung umgerechnet. Ein- und dreiphasige Amperewerte werden nicht mehr als bedeutungslose skalare Summe behandelt.
+- 🛡️ **Phasenschutz:** Die physische Zuordnung der Wallboxphasen zum Netzanschlusspunkt ist konfigurierbar. Eine dynamische einphasige Freigabe über 20 A bleibt ohne echten, frischen PCC-RMS-Stromvektor fail-closed.
+- 🔋 **Fahrzeug-SoC:** Der Ioniq-5-Fallback verwendet ausschließlich die Energie der aktuellen Stecksession und bleibt hinter echten Fahrzeug- oder Wallboxwerten zurück.
+
+### 📦 Update und Docker
+
+- 🐛 **Alt-Updater:** Der unterstützte Erstwechsel aus 5.3.2b bindet Rechte-, Wrapper-, Dienst- und venv-Übergänge an den verifizierten Zielbaum. Konfigurationen und bereits installierte optionale Dienste werden erhalten, statt aus bloßen Altwerten neu aktiviert zu werden.
+- 🐳 **Docker-Migration:** Die Installation prüft offizielle Docker-Pakete, Compose-Version, Zielimage und Containerzustand explizit. Ein fehlgeschlagener Pull darf kein altes Image als erfolgreiches Update ausgeben.
+- 🔐 **Container-Promotion:** Ein einziger GitHub-Workflow baut den Multiarch-Kandidaten, prüft Digest, SBOM und Provenance erneut und setzt erst danach die unveränderlichen Versions-Tags sowie `latest`.
+- 🛡️ **Watchtower:** Der nicht mehr gepflegte Updater ist kein Standarddienst mehr und bleibt nur als ausdrücklich aktiviertes Compose-Profil verfügbar.
+
+### 🖥️ Frontend, Diagnose und Sicherheit
+
+- ✨ **Statusanzeigen:** Netzfrequenz sowie aktive SG-Ready-/Shelly-Freigaben sind im Dashboard sichtbar; neue optionale Statuswerte bleiben bei fehlender Quelle unbekannt statt als falsche Nullwerte zu erscheinen.
+- 🔎 **Regelkonflikte:** Eine gleichzeitig aktive E3/DC-Wetterladung wird als externer Speicher-Vetozustand sichtbar, ohne E3/DC-Einstellungen automatisch umzuschreiben.
+- 🔐 **XSS-Härtung:** Gemeldete Status- und Fehlertexte im Konfigurationseditor werden als Text statt als ungeprüftes HTML eingesetzt.
+- 🐛 **Frontend-Verfügbarkeit:** Der optionale Legacy-Preisfallback erhält einen eindeutigen Nur-Lese-Rechtevertrag für den Webserver. Eine fehlende oder vorübergehend nicht lesbare Preisdatei wird ignoriert und kann Startseite oder Vitals nicht mehr mit HTTP 500 blockieren.
+- 🐛 **Batterie-Vitals:** Jeder DCB-Pack wird mit seinem typisierten Packindex abgefragt und, wenn vorhanden, an den passenden Antwortindex gebunden. Dadurch wird nicht mehr derselbe erste Pack mehrfach angezeigt.
+- 🧱 **WebSocket:** Der Dienst bindet nur noch an `127.0.0.1:8765`; das Dashboard greift gleichursprünglich über den Webserver-Pfad `/ws` zu.
+
 ## [5.4.0e] – 2026-07-23
 
 ### 📦 Definierter Übergang aus 5.3.2b

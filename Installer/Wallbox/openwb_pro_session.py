@@ -1819,7 +1819,11 @@ def temporary_ems_stop_contract(
     real_power_w = max(status_real_power(st), _safe_float(stable_hw_power_w, 0.0))
     real_charging = bool(status_real_charging(st) or real_power_w > 500.0)
     zero_anchor = bool(manager_zero_anchor_active or data.get("_manager_zero_anchor_active", False))
-    stop_pending = bool(manager_stop_pending or st.get("manager_stop_pending", False))
+    # Der Manager übergibt die aktuelle Stoppwahrheit ausdrücklich. Das
+    # Statusobjekt wird zyklusübergreifend wiederverwendet und kann noch den
+    # vorherigen Anzeigemarker enthalten; dieser darf einen aufgehobenen Stopp
+    # niemals wieder aktivieren.
+    stop_pending = bool(manager_stop_pending)
     last_stop_known = bool(
         _safe_float(data.get("_last_manager_stop_request_ts", 0.0), 0.0) > 0.0
         or _safe_float(data.get("_last_manager_zero_anchor_ts", 0.0), 0.0) > 0.0

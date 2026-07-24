@@ -540,6 +540,105 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         message=grid_message,
     )
 
+    grid_reserve = safe_float(cfg.get("grid_wallbox_reserve_amps"), 2.0)
+    phase_grid_limits = {}
+    phase_grid_reserves = {}
+    phase_grid_contract_valid = {}
+    for phase in (1, 2, 3):
+        limit_key = f"grid_max_amps_l{phase}"
+        reserve_key = f"grid_wallbox_reserve_amps_l{phase}"
+        limit_present = _has_user_value(cfg, limit_key)
+        reserve_present = _has_user_value(cfg, reserve_key)
+        limit_candidate = (
+            safe_float(cfg.get(limit_key), float("nan"))
+            if limit_present
+            else None
+        )
+        reserve_candidate = (
+            safe_float(cfg.get(reserve_key), float("nan"))
+            if reserve_present
+            else None
+        )
+        limit_invalid = bool(
+            limit_present
+            and (
+                limit_candidate is None
+                or not math.isfinite(limit_candidate)
+            )
+        )
+        reserve_invalid = bool(
+            reserve_present
+            and (
+                reserve_candidate is None
+                or not math.isfinite(reserve_candidate)
+            )
+        )
+        limit_configured = None if limit_invalid else limit_candidate
+        reserve_configured = None if reserve_invalid else reserve_candidate
+        limit_effective = (
+            None
+            if limit_invalid
+            else (limit_configured if limit_configured is not None else grid_amps)
+        )
+        phase_reserve_effective = (
+            None
+            if reserve_invalid
+            else (
+                reserve_configured
+                if reserve_configured is not None
+                else grid_reserve
+            )
+        )
+        phase_grid_limits[phase] = limit_effective
+        phase_grid_reserves[phase] = phase_reserve_effective
+        phase_severity = "ok"
+        phase_message = "Phasenlimit und Wallbox-Reserve sind plausibel."
+        if limit_invalid or reserve_invalid:
+            phase_severity = "warning"
+            phase_message = (
+                "Ein expliziter Phasenwert ist ungültig; diese Netzphase "
+                "bleibt für dynamische Freigaben gesperrt."
+            )
+        elif limit_effective <= 0.0 or phase_reserve_effective < 0.0:
+            phase_severity = "warning"
+            phase_message = "Phasenlimit und Reserve müssen positiv bzw. nichtnegativ sein."
+        elif phase_reserve_effective >= limit_effective:
+            phase_severity = "warning"
+            phase_message = "Die Wallbox-Reserve muss kleiner als das Phasenlimit sein."
+        phase_grid_contract_valid[phase] = phase_severity == "ok"
+        wallbox[limit_key] = _entry(
+            key=limit_key,
+            label=f"Netzphase L{phase}",
+            unit="A",
+            configured=limit_configured,
+            live_value=None,
+            live_key=None,
+            effective=limit_effective,
+            source=(
+                "invalid"
+                if limit_invalid
+                else ("user" if limit_configured is not None else "global")
+            ),
+            severity=phase_severity,
+            message=phase_message,
+        )
+        wallbox[reserve_key] = _entry(
+            key=reserve_key,
+            label=f"Wallbox-Reserve L{phase}",
+            unit="A",
+            configured=reserve_configured,
+            live_value=None,
+            live_key=None,
+            effective=phase_reserve_effective,
+            source=(
+                "invalid"
+                if reserve_invalid
+                else ("user" if reserve_configured is not None else "global")
+            ),
+            severity=phase_severity,
+            message=phase_message,
+        )
+
     global_wb_max = safe_float(cfg.get("wbmaxladestrom"), 16.0)
     for key, label, fallback in (
         ("wbmaxladestrom", "Wallbox global max.", 16.0),
@@ -569,30 +668,159 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
             message=message,
         )
 
-    total_3p_wallbox_amps = max(0.0, wallbox["wb1_max_amp"]["effective"]) + max(0.0, wallbox["wb2_max_amp"]["effective"])
-    wallbox_sum_exceeds_grid = total_3p_wallbox_amps > grid_amps
-    native_wallbox_active = _is_enabled(cfg, "wb_native_enable")
-    wallbox_sum_severity = "warning" if wallbox_sum_exceeds_grid and not native_wallbox_active else "ok"
-    if wallbox_sum_exceeds_grid and native_wallbox_active:
-        wallbox_sum_message = (
-            "Summe der Wallbox-Maximalströme liegt über der Hausabsicherung; "
-            "die native Wallbox-Regelung begrenzt den gleichzeitigen Sollstrom dynamisch."
+    for charger_id in (1, 2):
+        phase_key = f"wb{charger_id}_grid_phase"
+        limit_key = f"wb{charger_id}_openwb_pro_1p_max_amp"
+        phase_raw = cfg.get(phase_key)
+        try:
+            phase_value = float(phase_raw)
+        except (TypeError, ValueError):
+            phase_value = float("nan")
+        phase_valid = bool(
+            math.isfinite(phase_value)
+            and phase_value.is_integer()
+            and int(phase_value) in (1, 2, 3)
         )
-    elif wallbox_sum_exceeds_grid:
-        wallbox_sum_message = "Summe der 3-phasigen Wallbox-Maximalströme kann die Hausabsicherung übersteigen."
-    else:
-        wallbox_sum_message = "Wallbox-Summe liegt innerhalb der Hausabsicherung."
-    wallbox["wallbox_grid_sum"] = _entry(
-        key="wallbox_grid_sum",
-        label="WB-Summe 3p",
-        unit="A",
-        configured=total_3p_wallbox_amps,
+        if phase_valid:
+            mapped_phase = int(phase_value)
+        else:
+            mapped_phase = 0
+        configured_limit_candidate = (
+            safe_float(cfg.get(limit_key), float("nan"))
+            if _has_user_value(cfg, limit_key)
+            else None
+        )
+        configured_limit_invalid = bool(
+            _has_user_value(cfg, limit_key)
+            and (
+                configured_limit_candidate is None
+                or not math.isfinite(configured_limit_candidate)
+            )
+        )
+        configured_limit = (
+            None if configured_limit_invalid else configured_limit_candidate
+        )
+        requested_limit = (
+            configured_limit if configured_limit is not None else 20.0
+        )
+        # Im aktuellen Hardwarevertrag gibt es keine gebundene
+        # phasenaufgelöste PCC-RMS-Stromquelle. Ein Nutzerwert über 20 A ist
+        # deshalb sichtbar konfiguriert, aber nicht wirksam freigegeben.
+        effective_limit = min(requested_limit, 20.0)
+        severity = "ok"
+        message = "Einphasige openWB-Pro-Grenze bleibt beim sicheren 20-A-Fallback."
+        if configured_limit_invalid:
+            severity = "warning"
+            message = (
+                "Die einphasige openWB-Pro-Grenze ist ungültig; "
+                "der sichere 20-A-Fallback bleibt aktiv."
+            )
+        elif requested_limit < 6.0 or requested_limit > 32.0:
+            severity = "warning"
+            message = "Die einphasige openWB-Pro-Grenze muss zwischen 6 A und 32 A liegen."
+        elif requested_limit > 20.0:
+            phase_limit_explicit = bool(
+                phase_valid
+                and _has_user_value(
+                    cfg,
+                    f"grid_max_amps_l{mapped_phase}",
+                )
+            )
+            if not phase_valid:
+                severity = "warning"
+                message = (
+                    "Mehr als 20 A bleiben gesperrt, bis lokale Wallbox-L1 "
+                    "eindeutig einer Netzphase zugeordnet ist."
+                )
+            elif not phase_limit_explicit:
+                severity = "warning"
+                message = (
+                    "Mehr als 20 A bleiben gesperrt, bis für die zugeordnete "
+                    "Netzphase ein explizites Anschlusslimit vorliegt."
+                )
+            elif not phase_grid_contract_valid.get(mapped_phase, False):
+                severity = "warning"
+                message = (
+                    "Mehr als 20 A bleiben gesperrt, weil Phasenlimit oder "
+                    "Reserve ungültig sind."
+                )
+            else:
+                operating_limit = (
+                    phase_grid_limits[mapped_phase]
+                    - phase_grid_reserves[mapped_phase]
+                )
+                if operating_limit < 6.0:
+                    severity = "warning"
+                    message = "Das phasenbezogene Betriebslimit lässt keinen sicheren Ladestrom zu."
+                else:
+                    severity = "warning"
+                    message = (
+                        "Mehr als 20 A bleiben gesperrt, bis eine bestätigte "
+                        "phasenaufgelöste PCC-RMS-Strommessung verfügbar ist. "
+                        "Wirkleistung geteilt durch 230 V reicht dafür nicht."
+                    )
+        wallbox[phase_key] = _entry(
+            key=phase_key,
+            label=f"WB{charger_id} lokale L1 auf Netzphase",
+            unit="",
+            configured=mapped_phase if phase_valid else None,
+            live_value=None,
+            live_key=None,
+            effective=mapped_phase if phase_valid else None,
+            source="user" if phase_valid else "unbound",
+            severity=(
+                "ok"
+                if phase_valid or requested_limit <= 20.0
+                else "warning"
+            ),
+            message=(
+                "Phasenzuordnung ist gebunden."
+                if phase_valid
+                else "Keine Phasenzuordnung hinterlegt."
+            ),
+        )
+        wallbox[limit_key] = _entry(
+            key=limit_key,
+            label=f"WB{charger_id} openWB Pro 1p max.",
+            unit="A",
+            configured=configured_limit,
+            live_value=None,
+            live_key=None,
+            effective=effective_limit,
+            source=(
+                "invalid"
+                if configured_limit_invalid
+                else (
+                    "user_capped_no_pcc_rms"
+                    if configured_limit is not None and configured_limit > 20.0
+                    else ("user" if configured_limit is not None else "safe_fallback")
+                )
+            ),
+            severity=severity,
+            message=message,
+        )
+
+    native_wallbox_active = _is_enabled(cfg, "wb_native_enable")
+    wallbox["wallbox_phase_budget"] = _entry(
+        key="wallbox_phase_budget",
+        label="Wallbox-Phasenbudget",
+        unit="",
+        configured=None,
         live_value=None,
         live_key=None,
-        effective=total_3p_wallbox_amps,
-        source="derived",
-        severity=wallbox_sum_severity,
-        message=wallbox_sum_message,
+        effective="runtime_phase_vector" if native_wallbox_active else "status_only",
+        source="phase_vector_contract",
+        severity="ok",
+        message=(
+            "Die native Regelung verteilt nach Ladeleistung und projiziert jeden "
+            "Ladepunkt auf L1/L2/L3. Ein- und dreiphasige Amperewerte werden "
+            "nicht skalar addiert."
+            if native_wallbox_active
+            else
+            "Ohne native Regelung werden Wallbox-Maximalströme nur einzeln "
+            "geprüft; eine pauschale Ampere-Summe wäre physikalisch nicht "
+            "aussagekräftig."
+        ),
     )
 
     wbminsoc_val = safe_float(cfg.get("wbminsoc"), 70.0)

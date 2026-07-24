@@ -13,6 +13,8 @@ logging.basicConfig(level=logging.WARNING, format="%(asctime)s - %(message)s")
 
 CLIENTS = set()
 LAST_DATA = ""
+WEBSOCKET_BIND_HOST = "127.0.0.1"
+WEBSOCKET_PORT = 8765
 
 async def fetch_and_broadcast():
     global LAST_DATA
@@ -22,7 +24,7 @@ async def fetch_and_broadcast():
                 req = urllib.request.Request("http://127.0.0.1/get_live_json.php")
                 with urllib.request.urlopen(req, timeout=2) as response:
                     new_data = response.read().decode('utf-8')
-                    
+
                     # Nur senden, wenn sich die Daten geändert haben (Reduziert Traffic)
                     if new_data != LAST_DATA:
                         LAST_DATA = new_data
@@ -32,7 +34,7 @@ async def fetch_and_broadcast():
                             except: pass
         except Exception as e:
             pass # PHP Server evtl. kurzzeitig nicht erreichbar
-        
+
         await asyncio.sleep(1) # Taktung für flüssige Animationen
 
 async def handler(websocket, *args, **kwargs):
@@ -42,16 +44,20 @@ async def handler(websocket, *args, **kwargs):
     if LAST_DATA:
         try: await websocket.send(LAST_DATA) # Sofort den letzten Stand senden
         except: pass
-        
+
     try: await websocket.wait_closed()
-    finally: 
+    finally:
         CLIENTS.remove(websocket)
         logging.info(f"Client getrennt: {client_ip} (Gesamt: {len(CLIENTS)})")
 
 async def main():
-    logging.info("Starte E3DC WebSocket Server auf Port 8765...")
+    logging.info(
+        "Starte E3DC WebSocket Server auf %s:%s...",
+        WEBSOCKET_BIND_HOST,
+        WEBSOCKET_PORT,
+    )
     asyncio.create_task(fetch_and_broadcast())
-    async with websockets.serve(handler, "0.0.0.0", 8765):
+    async with websockets.serve(handler, WEBSOCKET_BIND_HOST, WEBSOCKET_PORT):
         await asyncio.Future()
 
 if __name__ == "__main__":

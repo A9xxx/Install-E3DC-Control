@@ -409,6 +409,7 @@ def read_dimplex(client: Any, cfg: dict[str, Any], unit_id: int) -> dict[str, An
         heat_power_standby_suppressed = True
     sg_color, sg_state = sg_text(sg_raw)
     sg_known = sg_raw is not None and int(sg_raw) in SG_STATES
+    sg_readback_ts = time.time() if sg_known else 0.0
     sg_note = None if sg_known or sg_raw is None else f"Rohwert {sg_raw} liegt außerhalb der gemappten SG-Ready-Werte 0/10/11/12/13."
     sg_value = safe_int(sg_raw, 0)
     sg_boost_active = sg_value in (11, 13)
@@ -457,6 +458,10 @@ def read_dimplex(client: Any, cfg: dict[str, Any], unit_id: int) -> dict[str, An
         "dimplex_sg_color": sg_color,
         "dimplex_sg_state": sg_state,
         "dimplex_sg_active": sg_boost_active,
+        "dimplex_sg_readback_state": int(sg_raw) if sg_known else None,
+        "dimplex_sg_readback_ts": sg_readback_ts,
+        "dimplex_sg_readback_source": "dimplex_modbus_live_readback" if sg_known else "",
+        "dimplex_sg_readback_confirmed": bool(sg_known),
         "dimplex_operating_mode": operating_mode if operating_mode >= 0 else None,
         "dimplex_operating_mode_text": operating_mode_text,
         "dimplex_heat_power_w": heat_power_w,

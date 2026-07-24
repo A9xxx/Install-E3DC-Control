@@ -58,6 +58,15 @@ Aktueller Stand:
 - abends wird nicht mehr zwanghaft auf die Kurve entladen, weil das Haus den
   Speicher ohnehin natürlich nutzt.
 
+Wenn E3DC-Control diese Ladekurve führt, sollte das wetterbasierte Laden im
+E3/DC-Hauskraftwerk deaktiviert sein. Die E3/DC-Funktion ist ein eigener
+Ladeplaner und kann die Batterieladung trotz einer von E3DC-Control gesetzten
+AUTO-Ladeobergrenze zurückhalten. Die Open-Meteo-/Forecast-Prognose von
+E3DC-Control arbeitet davon unabhängig weiter. Erkennt E3DC-Control gleichzeitig
+die E3/DC-Statussignale `Laden gesperrt` und `Warten auf Sonnenschein`, wird die
+Kurvenladung als extern zurückgehalten angezeigt. Die Geräteeinstellung wird
+weder automatisch noch zyklisch über RSCP verändert.
+
 ## Wallbox-Regelung
 
 Die Wallbox-Regelung arbeitet pro Wallbox mit Modus, Mindest-SoC, Budget und

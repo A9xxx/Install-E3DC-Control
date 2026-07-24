@@ -738,8 +738,8 @@ FILE_DEFINITIONS = [
     {"path": "/var/www/html/data/e3dc_v4.json", "mode": CONFIG_SECRET_FILE_MODE, "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": "/var/www/html/data/wallbox_phase_transition_state.json", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": f"{INSTALL_PATH}/data/e3dc_v4.json", "mode": CONFIG_SECRET_FILE_MODE, "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
-    # [LEGACY C++] e3dc.strompreise.txt: in V4 wird epex_daten.json genutzt. Datei ist obsolet.
-    {"path": f"{INSTALL_PATH}/e3dc.strompreise.txt", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
+    # [LEGACY C++] e3dc.strompreise.txt: optionaler, vom PHP-Frontend gelesener Preis-Fallback.
+    {"path": f"{INSTALL_PATH}/e3dc.strompreise.txt", "mode": "640", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": f"{INSTALLER_DIR}/wallbox_manager.py", "mode": "755", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": True},
     {"path": f"{INSTALLER_DIR}/storage_manager.py", "mode": "755", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": True},
     {"path": f"{INSTALLER_DIR}/storage_manager_legacy.py", "mode": "755", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": True},
@@ -869,13 +869,17 @@ FILE_DEFINITIONS = [
 # under /var/www with their explicit www-data contract.
 for _definition in FILE_DEFINITIONS:
     _definition_path = os.path.abspath(str(_definition.get("path") or ""))
+    _definition_basename = os.path.basename(_definition_path)
     try:
         _inside_repo = os.path.commonpath((_definition_path, os.path.abspath(INSTALL_ROOT))) == os.path.abspath(INSTALL_ROOT)
     except ValueError:
         _inside_repo = False
     if _inside_repo:
-        _definition["group"] = INSTALL_GROUP
-        if os.path.basename(_definition_path) in {
+        # Der Legacy-Preis-Fallback ist keine Geheimniskonfiguration und wird
+        # weiterhin direkt vom PHP-Frontend gelesen. Alle anderen Repo-Dateien
+        # bleiben an die private Installationsgruppe gebunden.
+        _definition["group"] = "www-data" if _definition_basename == "e3dc.strompreise.txt" else INSTALL_GROUP
+        if _definition_basename in {
             "e3dc_v4.json",
             "e3dc.config.txt",
             "e3dc.wallbox.txt",
@@ -2465,7 +2469,17 @@ def _read_release_config_nofollow(path="/var/www/html/data/e3dc_v4.json"):
 
 LEGACY_532B_COMMIT = "4b19d7136bcd7c5906dcdd2d49903a2fd4645192"
 LEGACY_532B_UPDATE_SOURCE_SHA256 = "e32ab215f8396381ce114b986792fd46eed5a9bf38448659d5f37df0862f49b6"
-TARGET_540E_POLICY_SHA256 = "4223f2e35fe9f4f170b6de99d3e313afe38cc899ffcab2ca1d50b8ba2bd7ba6d"
+LEGACY_532B_HYBRID_POLICY_KEY = "legacy_hybrid_updates"
+LEGACY_532B_SAFE_APT_PACKAGES = (
+    "php-sqlite3",
+    "php-mbstring",
+    "libapache2-mod-php",
+    "mosquitto-clients",
+    "python3-sklearn",
+    "python3-numpy",
+    "python3-cryptography",
+    "python3-websockets",
+)
 RELEASE_CORE_SERVICES = (
     "e3dc-live",
     "e3dc-epex-manager",
@@ -2565,6 +2579,52 @@ def _legacy_532b_update_context(update_entry):
     raise RuntimeError("5.3.2b-Updatekontext ist im laufenden Prozess nicht gebunden")
 
 
+def _legacy_532b_target_policy_supported(target_policy, target_version):
+    """Bindet künftige Zielreleases nur über einen expliziten Altpfadvertrag."""
+
+    if not isinstance(target_policy, dict):
+        return False
+    contracts = target_policy.get(LEGACY_532B_HYBRID_POLICY_KEY)
+    if not isinstance(contracts, list) or len(contracts) != 1:
+        return False
+    contract = contracts[0]
+    expected_contract = {
+        "source_version": "5.3.2b",
+        "source_commit": LEGACY_532B_COMMIT,
+        "source_update_sha256": LEGACY_532B_UPDATE_SOURCE_SHA256,
+        "entrypoint": "--update-e3dc",
+        "requires_existing_venv": True,
+        "bare_metal_supported": True,
+    }
+    if not isinstance(contract, dict) or contract != expected_contract:
+        return False
+
+    version = str(target_version or "").strip().lstrip("v")
+    policy_version = str(target_policy.get("version") or "").strip().lstrip("v")
+    stable_release = str(target_policy.get("stable_release") or "").strip()
+    history = target_policy.get("history_transition")
+    required_history = {
+        "strategy": "installer_bootstrap",
+        "manual_git_pull_supported": False,
+        "requires_verified_external_backup": True,
+        "requires_exact_target_sha": True,
+        "requires_safe_actor_state": True,
+        "requires_boot_service_http_ha_health_validation": True,
+    }
+    return bool(
+        version
+        and policy_version == version
+        and stable_release == f"v{version}"
+        and target_policy.get("restart_service_contract") == "core_plus_preinstalled_v1"
+        and tuple(target_policy.get("restart_services") or ()) == RELEASE_CORE_SERVICES
+        and tuple(target_policy.get("apt_packages") or ()) == LEGACY_532B_SAFE_APT_PACKAGES
+        and target_policy.get("pip_packages") == []
+        and target_policy.get("venv_pip_packages") == []
+        and target_policy.get("run_permissions") is True
+        and history == required_history
+    )
+
+
 def _install_legacy_532b_service_contract():
     """Begrenzt den bekannten 5.3.2b-Ersthop und erhält dessen Recovery unverändert."""
 
@@ -2659,9 +2719,8 @@ def _install_legacy_532b_service_contract():
         and current_head == target_commit
         and hashlib.sha256(old_source).hexdigest() == LEGACY_532B_UPDATE_SOURCE_SHA256
         and _loaded_legacy_functions_match(update_module, old_source)
-        and hashlib.sha256(target_policy_raw).hexdigest() == TARGET_540E_POLICY_SHA256
         and target_policy == policy
-        and target_version == "5.4.0e"
+        and _legacy_532b_target_policy_supported(target_policy, target_version)
         and remote_url == getattr(update_module, "SELFUPDATE_REPO", None)
     )
     if not signature_ok:

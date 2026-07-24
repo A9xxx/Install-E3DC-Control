@@ -411,6 +411,9 @@ class ShellyHeatpump:
         self.last_sync_reason = ""
         self.last_live_sg_state = None
         self.last_live_pause_state = None
+        self.last_live_sg_ts = 0.0
+        self.last_live_pause_ts = 0.0
+        self.last_sg_readback_attempt_ts = 0.0
         self._actuator_gate = safety_gate or _new_energy_actuator_gate()
         self._actuator_driver_key = f"heatpump:shelly-controller:{self.sg_ip}:{self.pause_ip}"
         self.actor_writes_blocked = False
@@ -457,6 +460,8 @@ class ShellyHeatpump:
             "pause_state": self.pause_state,
             "live_sg_state": self.last_live_sg_state,
             "live_pause_state": self.last_live_pause_state,
+            "live_sg_ts": self.last_live_sg_ts,
+            "live_pause_ts": self.last_live_pause_ts,
             "reason": reason or self.last_sync_reason,
         }
         write_json_atomic_tolerant(
@@ -499,18 +504,56 @@ class ShellyHeatpump:
                 continue
         return None
 
+    def _record_live_relay_state(self, ip, state, now_ts=None):
+        """Materialisiert ausschließlich einen tatsächlich gelesenen Relaiszustand."""
+
+        if not isinstance(state, bool):
+            return False
+        readback_ts = time.time() if now_ts is None else _safe_float(now_ts, 0.0)
+        if readback_ts <= 0.0:
+            return False
+        recorded = False
+        if self._relay_configured(self.sg_ip) and ip == self.sg_ip:
+            self.last_live_sg_state = state
+            self.last_live_sg_ts = readback_ts
+            recorded = True
+        if self._relay_configured(self.pause_ip) and ip == self.pause_ip:
+            self.last_live_pause_state = state
+            self.last_live_pause_ts = readback_ts
+            recorded = True
+        return recorded
+
     def refresh_relay_states(self):
+        self.last_sg_readback_attempt_ts = time.time()
         sg_live = self._read_relay_state(self.sg_ip)
         pause_live = self._read_relay_state(self.pause_ip)
+        readback_ts = time.time()
         if sg_live is not None:
             self.sg_state = sg_live
-            self.last_live_sg_state = sg_live
+            self._record_live_relay_state(self.sg_ip, sg_live, readback_ts)
         if pause_live is not None:
             self.pause_state = pause_live
-            self.last_live_pause_state = pause_live
+            self._record_live_relay_state(self.pause_ip, pause_live, readback_ts)
         if sg_live is not None or pause_live is not None:
             self._persist_state("refresh")
         return {"sg": sg_live, "pause": pause_live}
+
+    def refresh_sg_readback_if_due(self, now_ts=None, min_interval_s=30.0):
+        """Aktualisiert nur die Anzeigeevidenz, nie Sollzustand oder Regelentscheidung."""
+
+        if not self._relay_configured(self.sg_ip):
+            return None
+        current_ts = time.time() if now_ts is None else _safe_float(now_ts, 0.0)
+        if current_ts <= 0.0:
+            return None
+        interval_s = max(5.0, _safe_float(min_interval_s, 30.0))
+        if (current_ts - self.last_sg_readback_attempt_ts) < interval_s:
+            return self.last_live_sg_state
+        self.last_sg_readback_attempt_ts = current_ts
+        sg_live = self._read_relay_state(self.sg_ip)
+        if isinstance(sg_live, bool):
+            self._record_live_relay_state(self.sg_ip, sg_live, time.time())
+        return sg_live
 
     @staticmethod
     def _relay_configured(ip):
@@ -574,6 +617,7 @@ class ShellyHeatpump:
                 confirmed,
             )
             return False
+        self._record_live_relay_state(ip, confirmed, time.time())
         return True
 
     def _rollback_safe_state(self):
@@ -1102,6 +1146,8 @@ class DimplexHeatpump:
         self.curr_sg_state = None
         self.last_sent_sg_state = None
         self.last_sg_write_ts = 0.0
+        self.last_sg_readback_state = None
+        self.last_sg_readback_ts = 0.0
         self._actuator_gate = safety_gate or _new_energy_actuator_gate()
         self._actuator_driver_key = f"transport:modbus-tcp:{self.ip}:{self.port}"
         self.actor_writes_blocked = False
@@ -1206,8 +1252,11 @@ class DimplexHeatpump:
                     target_state,
                 )
                 return False
-            self.curr_sg_state = int(target_state)
-            self.last_sent_sg_state = int(target_state)
+            confirmed_state = int(readback.registers[0])
+            self.curr_sg_state = confirmed_state
+            self.last_sent_sg_state = confirmed_state
+            self.last_sg_readback_state = confirmed_state
+            self.last_sg_readback_ts = time.time()
             self.last_sg_write_ts = now_ts
             labels = {
                 self.SG_NORMAL: "Gelb/Normalbetrieb",
@@ -4019,6 +4068,10 @@ def main():
                     live_state_valid=bool(wp_status.get("valid")),
                     auto_mode_enabled=bool(AUTO_MODE),
                 )
+            if isinstance(wp, ShellyHeatpump):
+                # Reine Anzeigeevidenz: Der zyklische Readback verändert weder
+                # den Sollcache noch die Policy und löst niemals einen Write aus.
+                wp.refresh_sg_readback_if_due()
             if restart_revalidation.get("safe_stop_required"):
                 # Stale oder unbekannte Messwerte dürfen nach der Anlaufwartezeit
                 # keinen neuen Aktorbefehl freigeben. Nutzer-Aus bleibt ebenfalls Aus.
@@ -5961,6 +6014,33 @@ def main():
                 wp_data,
                 getattr(wp, "curr_ext_khl", False) if wp else False,
             )
+            dimplex_sg_readback_state = wp_data.get("dimplex_sg_readback_state")
+            dimplex_sg_readback_ts = _safe_float(
+                wp_data.get("dimplex_sg_readback_ts"),
+                0.0,
+            )
+            dimplex_sg_readback_source = str(
+                wp_data.get("dimplex_sg_readback_source") or ""
+            )
+            dimplex_sg_readback_confirmed = bool(
+                wp_data.get("dimplex_sg_readback_confirmed") is True
+                and dimplex_sg_readback_state is not None
+                and dimplex_sg_readback_ts > 0.0
+            )
+            dimplex_write_readback_ts = _safe_float(
+                getattr(wp, "last_sg_readback_ts", 0.0) if wp else 0.0,
+                0.0,
+            )
+            if (
+                wp_type == 5
+                and wp
+                and getattr(wp, "last_sg_readback_state", None) is not None
+                and dimplex_write_readback_ts > dimplex_sg_readback_ts
+            ):
+                dimplex_sg_readback_state = int(wp.last_sg_readback_state)
+                dimplex_sg_readback_ts = dimplex_write_readback_ts
+                dimplex_sg_readback_source = "dimplex_modbus_confirmed_readback"
+                dimplex_sg_readback_confirmed = True
 
             json_export = {
                 "ts": now.isoformat(), "data": wp_data, "status": wp_status,
@@ -6062,6 +6142,10 @@ def main():
                 "idm_ext_khl": int(getattr(wp, 'curr_ext_khl', False) or 0) if wp else 0,
                 **idm_cooling_diag,
                 "dimplex_sg_state": getattr(wp, 'curr_sg_state', None) if wp_type == 5 and wp else None,
+                "dimplex_sg_readback_state": dimplex_sg_readback_state if wp_type == 5 else None,
+                "dimplex_sg_readback_ts": dimplex_sg_readback_ts if wp_type == 5 else 0.0,
+                "dimplex_sg_readback_source": dimplex_sg_readback_source if wp_type == 5 else "",
+                "dimplex_sg_readback_confirmed": bool(dimplex_sg_readback_confirmed) if wp_type == 5 else False,
                 "dimplex_sg_register": getattr(wp, 'sg_register', None) if wp_type == 5 and wp else None,
                 "dimplex_sg_address": getattr(wp, 'sg_address', None) if wp_type == 5 and wp else None,
                 "dimplex_allow_dark_green": bool(getattr(wp, 'allow_dark_green', False)) if wp_type == 5 and wp else False,
@@ -6069,6 +6153,15 @@ def main():
                 "shelly_pause_state": getattr(wp, 'pause_state', None) if has_shelly_heatpump and wp else None,
                 "shelly_live_sg_state": getattr(wp, 'last_live_sg_state', None) if has_shelly_heatpump and wp else None,
                 "shelly_live_pause_state": getattr(wp, 'last_live_pause_state', None) if has_shelly_heatpump and wp else None,
+                "shelly_sg_readback_state": getattr(wp, 'last_live_sg_state', None) if has_shelly_heatpump and wp else None,
+                "shelly_sg_readback_ts": _safe_float(getattr(wp, 'last_live_sg_ts', 0.0), 0.0) if has_shelly_heatpump and wp else 0.0,
+                "shelly_sg_readback_source": "shelly_relay_confirmed_readback" if has_shelly_heatpump and wp else "",
+                "shelly_sg_readback_confirmed": bool(
+                    has_shelly_heatpump
+                    and wp
+                    and isinstance(getattr(wp, 'last_live_sg_state', None), bool)
+                    and _safe_float(getattr(wp, 'last_live_sg_ts', 0.0), 0.0) > 0.0
+                ),
                 "shelly_startup_sync_pending": bool(shelly_startup_sync_pending),
                 "actor_writes_blocked": bool(getattr(wp, "actor_writes_blocked", False)) if wp else False,
                 "actor_write_block_reason": str(getattr(wp, "actor_write_block_reason", "") or "") if wp else "",

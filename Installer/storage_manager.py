@@ -4615,6 +4615,9 @@ def build_decision_history_record_with_context(
         "direct_marketing_monitor": direct_monitor,
         "direct_marketing_export_execution": direct_export_execution,
         "rscp_power_settings": rscp_power_settings,
+        "external_veto": copy.deepcopy(payload.get("smartcharge_external_veto"))
+        if isinstance(payload.get("smartcharge_external_veto"), dict)
+        else None,
         "decision": {
             "state": payload.get("state"),
             "label": payload.get("state_label", payload.get("state")),
@@ -5811,6 +5814,121 @@ def curve_relation_text(
     return f"{prefix} {relation_soc:.1f}% liegt nahe {neutral_label} {curve_txt}{live_suffix}"
 
 
+def storage_smartcharge_external_veto_contract(
+    live: Dict[str, Any],
+    payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Bindet eine E3DC-SmartCharge-Sperre als Diagnose, niemals als Schreibpfad."""
+
+    def typed_optional_bool(key: str) -> Optional[bool]:
+        if key not in live:
+            return None
+        value = live.get(key)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)) and value in (0, 1):
+            return bool(value)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in ("1", "true", "yes", "on"):
+                return True
+            if normalized in ("0", "false", "no", "off"):
+                return False
+        return None
+
+    charge_locked = typed_optional_bool("ems_charge_locked")
+    ems_weather_charging = typed_optional_bool("ems_weather_charging")
+    weather_regulated_charge = typed_optional_bool("weather_regulated_charge")
+
+    state = str(payload.get("state") or "")
+    mode = safe_int(payload.get("mode"), MODE_AUTO)
+    auto_limit = (
+        payload.get("auto_limit")
+        if isinstance(payload.get("auto_limit"), dict)
+        else {}
+    )
+    auto_limit_active = bool(auto_limit.get("enabled")) and not bool(
+        auto_limit.get("release")
+    )
+    auto_limit_charge_w = max(0, safe_int(auto_limit.get("max_charge_w"), 0))
+    charge_request_w = max(
+        0,
+        safe_int(
+            payload.get(
+                "storage_charge_request_w",
+                payload.get("storage_req_w"),
+            ),
+            0,
+        ),
+    )
+    curve_charge_offer = bool(
+        state.startswith("parallel_curve")
+        and mode == MODE_AUTO
+        and auto_limit_active
+        and auto_limit_charge_w >= 300
+        and charge_request_w >= 300
+    )
+    sources_valid = bool(
+        charge_locked is not None
+        and ems_weather_charging is not None
+        and payload.get("live_sample_valid", True)
+        and not payload.get("live_stale")
+    )
+    active = bool(
+        curve_charge_offer
+        and sources_valid
+        and charge_locked is True
+        and ems_weather_charging is True
+    )
+
+    if not curve_charge_offer:
+        status = "NOT_APPLICABLE_NO_CURVE_CHARGE_OFFER"
+        reason_code = "CURVE_CHARGE_OFFER_NOT_ACTIVE"
+    elif not sources_valid:
+        status = "UNAVAILABLE"
+        reason_code = "SMARTCHARGE_STATUS_MISSING_INVALID_OR_STALE"
+    elif active:
+        status = "EXTERNAL_VETO_ACTIVE"
+        reason_code = "E3DC_SMARTCHARGE_WEATHER_CHARGE_LOCK"
+    else:
+        status = "CLEAR"
+        reason_code = None
+
+    display_text = None
+    if active:
+        display_text = (
+            "E3DC-Wetterladen hält die Batterieladung zurück. "
+            f"E3DC-Control stellt für die Sollkurve einen Laderahmen bis "
+            f"{auto_limit_charge_w} W bereit, erzwingt aber keine Ladung. "
+            "Eine tatsächliche Batterieladung ist nicht bestätigt."
+        )
+
+    return {
+        "schema_version": "storage_external_veto_v1",
+        "status": status,
+        "reason_code": reason_code,
+        "active": active,
+        "external_veto": active,
+        "owner_conflict": active,
+        "external_owner": "e3dc_smartcharge" if active else None,
+        "requested_action": "CURVE_CHARGE" if curve_charge_offer else None,
+        "request_method": "AUTO_POWER_SETTINGS" if curve_charge_offer else None,
+        "charge_request_w": charge_request_w,
+        "auto_limit_charge_w": auto_limit_charge_w,
+        "curve_charge_offer": curve_charge_offer,
+        "sources_valid": sources_valid,
+        "ems_charge_locked": charge_locked,
+        "ems_weather_charging": ems_weather_charging,
+        "weather_regulated_charge": weather_regulated_charge,
+        "weather_charging_active": ems_weather_charging,
+        "physical_charging_confirmed": False if active else None,
+        "control_effect": False if active else None,
+        "settings_mutation_attempted": False,
+        "override_attempted": False,
+        "display_text": display_text,
+    }
+
+
 def charge_acceptance_diagnostic_contract(
     cfg: Dict[str, Any],
     live: Dict[str, Any],
@@ -6372,6 +6490,19 @@ def build_display(payload: Dict[str, Any]) -> Dict[str, str]:
         )
     else:
         reason = str(payload.get("reason") or label)
+    smartcharge_veto = (
+        payload.get("smartcharge_external_veto")
+        if isinstance(payload.get("smartcharge_external_veto"), dict)
+        else {}
+    )
+    if smartcharge_veto.get("active") is True:
+        label = "Kurvenladung extern zurückgehalten"
+        if control_owner:
+            label = f"{control_owner} führt: {label}"
+        reason = str(
+            smartcharge_veto.get("display_text")
+            or "E3DC-Wetterladen hält die Batterieladung zurück."
+        )
     return {
         "manager_title": "Speicher-Regelung",
         "control_owner": control_owner,
@@ -17633,6 +17764,21 @@ def decide_next_cycle(
         ),
         "shadow_payload": decision.get("shadow_payload"),
     }
+    payload["smartcharge_external_veto"] = storage_smartcharge_external_veto_contract(
+        live,
+        payload,
+    )
+    payload["external_veto_active"] = bool(
+        payload["smartcharge_external_veto"].get("active")
+    )
+    payload["external_veto_reason_code"] = payload[
+        "smartcharge_external_veto"
+    ].get("reason_code")
+    budget["smartcharge_external_veto"] = copy.deepcopy(
+        payload["smartcharge_external_veto"]
+    )
+    budget["external_veto_active"] = payload["external_veto_active"]
+    budget["external_veto_reason_code"] = payload["external_veto_reason_code"]
     payload["charge_acceptance_diagnostic"] = charge_acceptance_diagnostic_contract(
         cfg,
         live,
@@ -17715,6 +17861,13 @@ def write_state(payload: Dict[str, Any], plan: Dict[str, Any]) -> None:
         "iFc_w": payload.get("iFc_w", 0),
         "iMinLade_w": payload.get("iMinLade_w", 0),
         "storage_charge_request_w": payload.get("storage_charge_request_w", 0),
+        "smartcharge_external_veto": copy.deepcopy(
+            payload.get("smartcharge_external_veto")
+        )
+        if isinstance(payload.get("smartcharge_external_veto"), dict)
+        else None,
+        "external_veto_active": bool(payload.get("external_veto_active")),
+        "external_veto_reason_code": payload.get("external_veto_reason_code"),
         "charge_acceptance_diagnostic": copy.deepcopy(payload.get("charge_acceptance_diagnostic"))
         if isinstance(payload.get("charge_acceptance_diagnostic"), dict)
         else None,
@@ -18146,6 +18299,10 @@ def write_wb_budget(payload: Dict[str, Any]) -> None:
 def write_storage_decision_surface(payload: Dict[str, Any]) -> None:
     try:
         record = build_storage_decision_record(payload)
+        if isinstance(payload.get("smartcharge_external_veto"), dict):
+            record["external_veto"] = copy.deepcopy(
+                payload["smartcharge_external_veto"]
+            )
         if not _json_write_payload_changed(EMS_DECISION_F, record):
             return
         write_decision_surface_record(record, path=EMS_DECISION_F)

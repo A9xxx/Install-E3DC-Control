@@ -61,6 +61,89 @@ function getAssetUrl($filePath) {
     return $filePath;
 }
 
+/**
+ * Berechnet das Alter nur aus einem echten, plausiblen JSON-Zeitstempel.
+ */
+function e3dcLiveMeasurementAgeSeconds($timestamp, $nowTs) {
+    if ((!is_int($timestamp) && !is_float($timestamp))
+        || (!is_int($nowTs) && !is_float($nowTs))
+    ) {
+        return null;
+    }
+    $reportedAt = (float)$timestamp;
+    $now = (float)$nowTs;
+    if (!is_finite($reportedAt)
+        || !is_finite($now)
+        || $reportedAt <= 0.0
+        || ($reportedAt - $now) > 5.0
+    ) {
+        return null;
+    }
+    return round(max(0.0, $now - $reportedAt), 1);
+}
+
+/**
+ * Messwertverträge akzeptieren ausschließlich explizite JSON-Booleans.
+ */
+function e3dcLiveMeasurementConfirmed($reportedValid, $online) {
+    return $reportedValid === true && $online === true;
+}
+
+/**
+ * Validiert eine Netzfrequenz-Messung als strikt typisierten, frischen Wert.
+ *
+ * Ein numerischer String ist kein Messwertvertrag. Der Aufrufer muss die
+ * Messung ausdrücklich bestätigen und ihr Alter aus der tatsächlichen
+ * Publikationszeit ableiten.
+ */
+function e3dcLiveFrequencyProjection($value, $reportedValid, $source, $ageS, $maxAgeS) {
+    $projection = [
+        'frequency_hz' => null,
+        'valid' => false,
+        'source' => (string)($source ?: 'unavailable'),
+        'age_s' => null,
+    ];
+    if (!is_int($value) && !is_float($value)) return $projection;
+    if (!is_int($ageS) && !is_float($ageS)) return $projection;
+
+    $frequency = (float)$value;
+    $age = (float)$ageS;
+    $maxAge = max(0.0, (float)$maxAgeS);
+    if ($reportedValid !== true
+        || !is_finite($frequency)
+        || $frequency < 45.0
+        || $frequency > 55.0
+        || !is_finite($age)
+        || $age < 0.0
+        || $age > $maxAge
+    ) {
+        return $projection;
+    }
+
+    $projection['frequency_hz'] = round($frequency, 3);
+    $projection['valid'] = true;
+    $projection['age_s'] = round($age, 1);
+    return $projection;
+}
+
+/**
+ * Bevorzugt eine gültige Primärmessung, sonst eine gültige Ersatzmessung.
+ */
+function e3dcSelectLiveFrequencyProjection($primary, $fallback) {
+    if (is_array($primary) && ($primary['valid'] ?? false) === true) {
+        return $primary;
+    }
+    if (is_array($fallback) && ($fallback['valid'] ?? false) === true) {
+        return $fallback;
+    }
+    return [
+        'frequency_hz' => null,
+        'valid' => false,
+        'source' => 'unavailable',
+        'age_s' => null,
+    ];
+}
+
 // ==================== AUTHENTHIFIZIERUNG ====================
 
 function e3dcWebAuthHashEquals($expected, $actual) {

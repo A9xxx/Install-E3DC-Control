@@ -271,6 +271,7 @@ if (isset($_GET['ajax']) && $_GET['ajax'] == '1') {
         body.detail-compact .dashboard-consumer-badge .wallbox-car-badge,
         body.detail-compact .dashboard-consumer-badge [id$="-session-container"],
         body.detail-compact .dashboard-consumer-badge #wp-morning-boost,
+        body.detail-compact .dashboard-consumer-badge #wp-sg-ready-badge,
         body.detail-compact .dashboard-consumer-badge #wp-season-badge,
         body.detail-compact .dashboard-consumer-badge #wp-status-badge,
         body.detail-compact .dashboard-consumer-badge #hs-status-badge,
@@ -542,6 +543,7 @@ if (isset($_GET['ajax']) && $_GET['ajax'] == '1') {
 	        body.frontend-modern.detail-normal #right-column-cards .dashboard-consumer-badge.modern-inactive .wallbox-car-badge,
 	        body.frontend-modern.detail-normal #right-column-cards .dashboard-consumer-badge.modern-inactive [id$="-session-container"],
 	        body.frontend-modern.detail-normal #right-column-cards .dashboard-consumer-badge.modern-inactive #wp-morning-boost,
+	        body.frontend-modern.detail-normal #right-column-cards .dashboard-consumer-badge.modern-inactive #wp-sg-ready-badge,
 	        body.frontend-modern.detail-normal #right-column-cards .dashboard-consumer-badge.modern-inactive #wp-season-badge,
 	        body.frontend-modern.detail-normal #right-column-cards .dashboard-consumer-badge.modern-inactive #wp-status-badge,
 	        body.frontend-modern.detail-normal #right-column-cards .dashboard-consumer-badge.modern-inactive #hs-status-badge,
@@ -2023,6 +2025,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                                             <?php endif; ?>
                                             <span id="wp-today" class="badge bg-body-tertiary text-body border border-secondary-subtle tile-kwh-badge w-100 text-end" title="Wärmepumpe heute"><i class="fas fa-calendar-day text-danger me-1"></i><span id="wp-today-value">-- kWh</span></span>
                                             <span id="wp-morning-boost" class="badge bg-warning text-dark border w-100 text-end" style="display:none;" title="Morning Boost aktiv"></span>
+                                            <span id="wp-sg-ready-badge" class="badge border w-100 text-end" style="display:none;" title="Bestätigter SG-Ready-Aktorstatus"></span>
                                             <span id="wp-season-badge" class="badge bg-secondary text-white border w-100 text-end" style="display:none;" title="Heiz-/Sommerbetrieb"></span>
                                             <span id="wp-status-badge" class="badge w-100 text-end w-auto" style="display:none;<?= $wpEnabled ? ' cursor:pointer;' : '' ?>" <?= $wpEnabled ? 'onclick="event.stopPropagation(); window.location.href=\'index.php?seite=waermepumpe\'"' : '' ?>></span>
                                         </div>

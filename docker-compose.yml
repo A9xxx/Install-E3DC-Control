@@ -2,7 +2,7 @@ services:
   e3dc-control:
     # Ohne E3DC_IMAGE_TAG folgt die Installation dem geprüften Stable-Tag
     # "latest". Ein fester Pin oder Rückfall wird bewusst in .env gesetzt,
-    # zum Beispiel: E3DC_IMAGE_TAG=v5.4.0e
+    # zum Beispiel: E3DC_IMAGE_TAG=v5.4.1
     image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"
 
     # ZUM SELBST BAUEN: Obige Zeile auskommentieren und stattdessen:
@@ -11,6 +11,8 @@ services:
     container_name: e3dc-control
     restart: unless-stopped
     network_mode: host
+    labels:
+      - com.centurylinklabs.watchtower.enable=true
 
     volumes:
       # PERSISTENTE DATEN (Konfiguration, SQLite, Backups)
@@ -38,12 +40,15 @@ services:
     image: containrrr/watchtower
     container_name: watchtower
     restart: unless-stopped
+    profiles:
+      - auto-update
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
       - TZ=Europe/Berlin
       - DOCKER_API_VERSION=1.40
       - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_LABEL_ENABLE=true
       - WATCHTOWER_POLL_INTERVAL=86400
 
 volumes:

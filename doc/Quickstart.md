@@ -43,7 +43,7 @@ Für eine Erstinstallation oder ein Update ist die empfohlene Option **"1 Instal
 2.  Der Installer richtet Pakete, Dienste, Webdateien, Rechte und den Web-Wizard ein.
 3.  Folgen Sie den Anweisungen auf dem Bildschirm.
 
-**Einmalige Ausnahme für Version 5.3.2b:** Der erste Wechsel auf 5.4.0e
+**Einmalige Ausnahme für Version 5.3.2b:** Der erste Wechsel auf 5.4.1
 erfolgt über den Web-Update-Button oder direkt mit
 `sudo /usr/bin/python3 installer_main.py --update-e3dc`. Der interaktive
 Menüpunkt darf für genau diesen ersten Hybridwechsel nicht verwendet werden,
@@ -149,24 +149,36 @@ Das System richtet sich nun im Hintergrund selbst ein und ist nach ca. 60 Sekund
 
 **Docker-Updates:**
 ```bash
-cd "$E3DC_DOCKER_PATH"
-docker compose config --images
-docker compose pull e3dc-control
-docker compose up -d --force-recreate e3dc-control
+(
+  set -euo pipefail
+  cd "$E3DC_DOCKER_PATH"
+  docker compose config --images
+  docker compose pull e3dc-control
+  docker compose up -d --force-recreate e3dc-control
+)
 ```
 Ohne `E3DC_IMAGE_TAG` holt `pull` das aktuelle geprüfte Stable-Image `latest`.
 Ein fester Tag bleibt absichtlich fest; `config --images` zeigt vorab das
 tatsächlich gewählte Image. `--force-recreate` startet den Container daraus
 neu.
 
-**Docker-Rückfall von v5.4.0e auf den veröffentlichten Docker-Rollback-Root:**
+Der optionale, nicht mehr gepflegte Watchtower startet nicht automatisch, weil
+er weitreichenden Zugriff auf den Docker-Socket des Hosts benötigt. Ein
+bewusster Opt-in erfolgt mit
+`docker compose --profile auto-update up -d watchtower`; standardmäßig bleibt
+der oben gezeigte manuelle Updateweg aktiv.
+
+**Docker-Rückfall von v5.4.1 auf den veröffentlichten Docker-Rollback-Root:**
 ```bash
-TAG=v5.3.2b
-cd "$E3DC_DOCKER_PATH"
-E3DC_IMAGE_TAG="$TAG" docker compose config --images
-E3DC_IMAGE_TAG="$TAG" docker compose pull e3dc-control
-E3DC_IMAGE_TAG="$TAG" docker compose up -d --force-recreate e3dc-control
-docker logs --tail=80 e3dc-control
+(
+  set -euo pipefail
+  TAG=v5.3.2b
+  cd "$E3DC_DOCKER_PATH"
+  E3DC_IMAGE_TAG="$TAG" docker compose config --images
+  E3DC_IMAGE_TAG="$TAG" docker compose pull e3dc-control
+  E3DC_IMAGE_TAG="$TAG" docker compose up -d --force-recreate e3dc-control
+  docker logs --tail=80 e3dc-control
+)
 ```
 Soll der Pin dauerhaft gelten, wird `E3DC_IMAGE_TAG=v5.3.2b` in einer
 vorhandenen `.env` ergänzt, ohne andere Werte darin zu überschreiben.
@@ -216,7 +228,7 @@ Nach der Installation können Sie den Installer über `bash "$E3DC_INSTALL_PATH/
 - **E3DC-Control installieren oder aktualisieren:**
   - Option `1` (Installation / Update)
   - Hält Anwendung, Webdateien, Dienste und Rechte auf dem aktuellen Stand.
-  - Ausnahme: Für den einmaligen Wechsel von 5.3.2b auf 5.4.0e den
+  - Ausnahme: Für den einmaligen Wechsel von 5.3.2b auf 5.4.1 den
     Web-Update-Button oder den direkten `--update-e3dc`-Aufruf aus
     [Update.md](Update.md) verwenden, nicht den interaktiven Menüpunkt.
 

@@ -1,9 +1,9 @@
 {
-  "version": "5.4.0e",
+  "version": "5.4.1",
   "min_version": "4.0.0",
-  "stable_release": "v5.4.0e",
-  "release_date": "2026-07-23",
-  "description": "v5.4.0e - 5.3.2b-Hybridupdate mit erhaltener Dienstgeneration",
+  "stable_release": "v5.4.1",
+  "release_date": "2026-07-24",
+  "description": "v5.4.1 - stabile Wallbox-, Update-, Docker- und Diagnosekonsolidierung",
   "installer_requires": "python3",
   "sanitized_republication": false,
   "history_transition": {
@@ -14,6 +14,16 @@
     "requires_safe_actor_state": true,
     "requires_boot_service_http_ha_health_validation": true
   },
+  "legacy_hybrid_updates": [
+    {
+      "source_version": "5.3.2b",
+      "source_commit": "4b19d7136bcd7c5906dcdd2d49903a2fd4645192",
+      "source_update_sha256": "e32ab215f8396381ce114b986792fd46eed5a9bf38448659d5f37df0862f49b6",
+      "entrypoint": "--update-e3dc",
+      "requires_existing_venv": true,
+      "bare_metal_supported": true
+    }
+  ],
   "rollback_releases": [
     {
       "version": "5.3.2b",
@@ -50,6 +60,7 @@
     "/var/www/html/test_diff.php",
     "/var/www/html/test_merge.php",
     "/var/www/html/reorder.py",
+    "/var/www/html/assets/vendor/ASSET_PROVENANCE.json",
     "/var/www/html/ramdisk/bluelink_debug.json",
     "/var/www/html/data/morning_boost_state.json"
   ],

@@ -27,6 +27,11 @@ if [[ -f /.dockerenv && "$SCRIPT_DIR" != "/app/pi/Install" ]]; then
     exit 2
 fi
 
+# Der lokale Setup-Einstieg ist kein Release-Bootstrap. Fremde oder nur
+# teilweise gesetzte Bootstrap-Bindungen dürfen deshalb nicht in den
+# normalen Installationskontext hineinreichen.
+unset E3DC_BOOTSTRAP_ROOT E3DC_BOOTSTRAP_RUNNER_ROOT
+
 if [[ $EUID -ne 0 ]]; then
     CALLING_USER=$(id -un)
     if [[ -z "$CALLING_USER" || "$CALLING_USER" = "www-data" ]]; then
@@ -34,12 +39,9 @@ if [[ $EUID -ne 0 ]]; then
         exit 2
     fi
     exec sudo env \
-        "E3DC_BOOTSTRAP_ROOT=$SCRIPT_DIR" \
         "E3DC_BOOTSTRAP_USER=$CALLING_USER" \
         "$SCRIPT_DIR/e3dc-setup" "$@"
 fi
-
-export E3DC_BOOTSTRAP_ROOT="$SCRIPT_DIR"
 
 if [[ -f /.dockerenv ]]; then
     SYSTEM_PYTHON=/opt/venv/bin/python3

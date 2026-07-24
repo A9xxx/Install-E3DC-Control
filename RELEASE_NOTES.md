@@ -1,79 +1,68 @@
-# E3DC-Control v5.4.1
+# E3DC-Control v5.4.1a
 
-E3DC-Control 5.4.1 ist ein Konsolidierungsrelease für Wallboxen, Installation,
-Docker und Betriebsdiagnose. Der Umfang wurde nach den Feldtests eingefroren;
-neue experimentelle Regelpfade sind nicht Bestandteil dieses Releases.
+E3DC-Control 5.4.1a ist ein eng begrenztes Wartungsrelease für Update,
+Backup und Erstinstallation. Speicher-, Wallbox-, Wärme- und
+Direktvermarktungsregelung entsprechen unverändert 5.4.1.
 
-## openWB Pro und Mehr-Wallbox-Balancing
+## Web-Update
 
-- Start, Pause, Ladeende und Phasenwechsel sind an eine frische Stecksession,
-  Sollabsicht und bestätigte Gerätewerte gebunden.
-- Ein Phasenwechsel setzt zunächst 0 A, wartet auf den bestätigten Stillstand,
-  übergibt das Phasenziel und gibt danach den zulässigen Ladestrom frei.
-- Die persistente Sperre von mindestens 480 Sekunden verhindert ausschließlich
-  einen weiteren Phasenwechsel. Sie blockiert weder den bestätigten
-  Wiederanlauf noch die laufende Ladung.
-- Fahrzeug-, Wallbox- und Nutzergrenzen werden gemeinsam ausgewertet.
-  Ein Fahrzeug mit 11 kW und drei Phasen wird dadurch auf rund 16 A je Phase
-  begrenzt, auch wenn der Ladepunkt 32 A anbietet.
-- Mehrere Ladepunkte werden leistungsfair anhand der tatsächlichen Phasenzahl
-  verteilt. Ein- und dreiphasige Amperewerte werden nicht pauschal addiert.
-- Die physische Zuordnung der lokalen Wallboxphasen zum Netzanschlusspunkt ist
-  konfigurierbar. Ohne einen echten, frischen PCC-RMS-Stromvektor bleibt eine
-  dynamische einphasige Freigabe über 20 A aus Sicherheitsgründen gesperrt.
-- Der Ioniq-5-SoC-Fallback verwendet nur die Energie der aktuellen
-  Stecksession. Echte Fahrzeug- oder Wallboxwerte haben immer Vorrang.
+- Der Web-Updater erhält neben dem Log einen strukturierten Exitcode und
+  Abschlussstatus.
+- Der kanonische Installer-Marker
+  `[OK] self-update auf <Commit-SHA> abgeschlossen.` bleibt als
+  Kompatibilitätsbeleg erhalten.
+- Ein laufender Prozess, ein Fehlertext oder ein von null verschiedener
+  Exitcode kann nicht als Erfolg erscheinen.
+- Nach Prozessende wartet die Oberfläche kurz auf die letzte Status- und
+  Logpublikation, statt vorschnell einen unklaren Fehler auszugeben.
 
-## Update und Docker
+## ML-Backup
 
-- Der unterstützte Erstwechsel aus 5.3.2b läuft ausschließlich über den
-  verifizierten Installer-/Bootstrapweg. Konfiguration, Rollen und bereits
-  installierte optionale Dienste werden vor dem Wechsel gebunden.
-- Alte Konfigurationsfelder installieren oder aktivieren während des Updates
-  keine bisher fehlenden Wallbox-, Wärme- oder Integrationsdienste.
-- Python-Abhängigkeiten bleiben im verwalteten Benutzer-venv; es gibt keinen
-  System-`pip`-Eingriff und kein `--break-system-packages`.
-- Der Docker-Installer prüft offizielle Paketquellen, Compose-Fähigkeit,
-  Zielimage, Pull-Ergebnis und gestartete Containerversion explizit.
-- Ein fehlgeschlagener Pull darf kein vorhandenes Altimage als erfolgreiches
-  Update melden.
-- Watchtower ist wegen des weitreichenden Docker-Socket-Zugriffs kein
-  Standarddienst mehr. Er bleibt nur als bewusstes Compose-Profil verfügbar.
-- Der GitHub-Workflow baut AMD64 und ARM64 als einen Kandidatendigest, prüft
-  SBOM und Provenance und setzt erst danach die unveränderlichen Tags
-  `v5.4.1`, `5.4.1` und `latest`.
+- Eine neu erzeugte `.ml_model.lock` erhält unmittelbar den gebundenen
+  Installationsbenutzer und Modus `0600`.
+- Die Rechteprüfung kann ausschließlich einen regulären, unverlinkten,
+  größenbegrenzten und aktuell nicht belegten Alt-Lock normalisieren.
+- Symlinks, Sonderdateien, Hardlinks, fremde Eigentümer, Übergröße und ein
+  belegter Lock bleiben ohne Änderung gesperrt.
+- Modell- und Manifestbytes werden vor der Reparatur vollständig validiert,
+  aber weder deserialisiert noch verändert.
+- Ein bereits durch diesen Altbestand blockierter 5.4.0e-/5.4.1-Updater kann
+  den neuen Code nicht selbst erreichen, weil er sein Backup vorher prüft.
+  Dafür gilt einmalig die eng begrenzte SSH-Feldreparatur aus der
+  Update-Anleitung.
 
-## Frontend, Diagnose und Sicherheit
+## Frische Erstinstallation
 
-- Netzfrequenz sowie aktive SG-Ready-/Shelly-Freigaben werden im Dashboard
-  sichtbar dargestellt.
-- Gleichzeitig aktive E3/DC-Wetterladung wird als externer Vetozustand für die
-  eigene Speicherregelung erkannt. E3/DC-Einstellungen werden dabei nicht
-  automatisch verändert.
-- Neue optionale Statuswerte bleiben bei fehlender oder ungültiger Quelle
-  unbekannt, statt als echte `0` ausgegeben zu werden.
-- Gemeldete Status- und Fehlertexte im Konfigurationseditor werden als Text
-  dargestellt und nicht als ungeprüftes HTML eingefügt.
-- Der optionale Legacy-Preisfallback bleibt für den Webserver lesbar. Fehlt die
-  Datei oder ist sie vorübergehend nicht lesbar, bleibt das gesamte Frontend
-  einschließlich Vitals erreichbar.
-- Jeder Batterie-DCB-Pack wird mit seinem typisierten Packindex gelesen und,
-  wenn vorhanden, an den Antwortindex gebunden. Der erste Pack wird dadurch
-  nicht mehr mehrfach unter verschiedenen Nummern angezeigt.
-- Der WebSocket-Dienst bindet nur noch an `127.0.0.1:8765`; das Dashboard nutzt
-  den gleichursprünglichen Webserver-Pfad `/ws`.
+- Der normale Einstieg `e3dc-setup` entfernt fremde oder unvollständige
+  Release-Bootstrap-Variablen.
+- Er übergibt ausschließlich den tatsächlichen Installationsbenutzer an den
+  privilegierten Installationsprozess.
+- Der echte Release-Bootstrap bleibt weiterhin an getrennten Runner- und
+  Zielbaum, annotierten Tag und vollständige Ziel-SHA gebunden.
+- Unvollständige, identische oder fremde Bootstrap-Bindungen bleiben
+  fail-closed.
 
-## Update
+## Empfohlene E3/DC-Einstellungen
 
-Bare-Metal-Nutzer installieren v5.4.1 über den Web- oder Konsolen-Updater.
-Für den einmaligen Wechsel aus 5.3.2b gelten weiterhin die Stopbedingungen und
-die genaue Befehlskette der
-[Update-Anleitung](https://github.com/A9xxx/Install-E3DC-Control/blob/v5.4.1/doc/Update.md).
-Ein abgebrochener Update-, Backup- oder Rechtepfad erhält den zuletzt
-konsistenten Zustand und gilt nicht als Erfolg.
+- Die E3/DC-eigene Wetterladung sollte ausgeschaltet sein, wenn E3DC-Control
+  die Speicher-Ladekurve führt.
+- Open-Meteo und die Dachflächenprognose von E3DC-Control bleiben davon
+  unabhängig aktiv.
+- RSCP-Zugang, physische Notstromreserve sowie Netz-, Batterie- und
+  Wechselrichtergrenzen bleiben aktiv.
+- Pro Speicher beziehungsweise Wallbox darf nur ein Regler Hardwarebefehle
+  ausgeben.
+- E3/DC und Host benötigen eine gemeinsame korrekte Uhrzeit, Zeitzone und
+  NTP-Synchronisation.
 
-Docker-Nutzer prüfen zuerst das konfigurierte Image und recreaten ausschließlich
-nach einem erfolgreichen Pull:
+## Installation und Update
+
+Bare-Metal-Nutzer verwenden den Web- oder Konsolen-Updater. Ein bereits am
+ML-Lock gestoppter Altstand führt zuerst die ausdrücklich dokumentierte
+Feldreparatur aus und startet danach den normalen Updater erneut.
+
+Docker-Nutzer prüfen das konfigurierte Image und recreaten ausschließlich nach
+einem erfolgreichen Pull:
 
 ```bash
 (
@@ -86,9 +75,9 @@ nach einem erfolgreichen Pull:
 )
 ```
 
-Ein fester Eintrag `E3DC_IMAGE_TAG` bleibt absichtlich fest. Für v5.4.1 lautet
-der Pin `E3DC_IMAGE_TAG=v5.4.1`; ohne Pin folgt die Compose-Datei dem nach der
-Attestierungsprüfung gesetzten Stable-Tag `latest`.
+Ein fester Eintrag `E3DC_IMAGE_TAG` bleibt absichtlich fest. Für v5.4.1a
+lautet der Pin `E3DC_IMAGE_TAG=v5.4.1a`; ohne Pin folgt die Compose-Datei dem
+erst nach erfolgreicher Attestierungsprüfung gesetzten Stable-Tag `latest`.
 
 Der öffentliche Docker-Rückfallstand bleibt `v5.3.2b`. Dieser Stand ist nicht
 als Bare-Metal-Programm-Rückfall freigegeben; dort bleibt ein verifiziertes

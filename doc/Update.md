@@ -72,6 +72,158 @@ gebundene Benutzer-venv bereits vorhanden sein. Andernfalls bricht der
 Altprozess ab und stellt den Ausgangszustand wieder her. Abweichende oder
 mehrdeutige venv-Pfade brechen den Updatevorgang ebenfalls ab.
 
+## Einmalige ML-Lock-Reparatur für 5.4.0e und 5.4.1
+
+Diese Reparatur ist ausschließlich für einen Updateabbruch mit der exakten
+Meldung `Unsicherer privater ML-Eintrag: .ml_model.lock` vorgesehen. Der alte
+Updater prüft das Backup, bevor er die neuen Releasebytes lädt, und kann diese
+Kante deshalb nicht selbst reparieren.
+
+Der folgende Block muss in der SSH-Sitzung des normalen
+Installationsbenutzers ausgeführt werden, nicht aus einer direkten Root-Shell.
+Er verändert ausschließlich Eigentümer, Gruppe und Modus einer eindeutig
+regulären, unverlinkten, größenbegrenzten und aktuell nicht belegten
+Sperrdatei. Modell, Manifest und Konfiguration bleiben unverändert.
+
+```bash
+sudo /usr/bin/python3 - <<'PY'
+import fcntl
+import os
+import pwd
+import stat
+import time
+from pathlib import Path
+
+store = Path("/var/lib/e3dc-control/ml")
+lock_name = ".ml_model.lock"
+
+def stop(message):
+    raise SystemExit("ABBRUCH: " + message)
+
+user = os.environ.get("SUDO_USER", "")
+if not user or user == "root":
+    stop("bitte direkt als Installationsbenutzer mit sudo ausführen")
+
+account = pwd.getpwnam(user)
+
+try:
+    resolved = store.resolve(strict=True)
+except FileNotFoundError:
+    stop("privater ML-Store fehlt")
+
+if resolved != store:
+    stop("Symlink-Komponente im privaten ML-Store")
+
+store_info = os.lstat(store)
+if (
+    not stat.S_ISDIR(store_info.st_mode)
+    or stat.S_IMODE(store_info.st_mode) != 0o700
+    or store_info.st_uid != account.pw_uid
+):
+    stop("ML-Store ist nicht das erwartete 0700-Verzeichnis des Installationsbenutzers")
+
+directory_fd = os.open(
+    store,
+    os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+)
+
+lock_fd = None
+locked = False
+try:
+    opened_store = os.fstat(directory_fd)
+    if (opened_store.st_dev, opened_store.st_ino) != (
+        store_info.st_dev,
+        store_info.st_ino,
+    ):
+        stop("ML-Store wurde beim Öffnen ausgetauscht")
+
+    try:
+        path_before = os.stat(
+            lock_name,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        print("OK: ML-Sperrdatei fehlt; keine Reparatur erforderlich")
+        raise SystemExit(0)
+
+    if (
+        not stat.S_ISREG(path_before.st_mode)
+        or path_before.st_nlink != 1
+        or path_before.st_size > 64 * 1024
+        or path_before.st_uid not in {0, account.pw_uid}
+    ):
+        stop("ML-Sperrdatei ist nicht sicher normalisierbar")
+
+    lock_fd = os.open(
+        lock_name,
+        os.O_RDWR
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0),
+        dir_fd=directory_fd,
+    )
+
+    opened_lock = os.fstat(lock_fd)
+    if (opened_lock.st_dev, opened_lock.st_ino) != (
+        path_before.st_dev,
+        path_before.st_ino,
+    ):
+        stop("ML-Sperrdatei wurde beim Öffnen ausgetauscht")
+
+    deadline = time.monotonic() + 10.0
+    while True:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            locked = True
+            break
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                stop("ML-Sperrdatei ist länger als 10 Sekunden belegt")
+            time.sleep(0.1)
+
+    before = os.fstat(lock_fd)
+    os.fchown(lock_fd, account.pw_uid, store_info.st_gid)
+    os.fchmod(lock_fd, 0o600)
+    os.fsync(lock_fd)
+    after = os.fstat(lock_fd)
+
+    if (
+        (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+        or after.st_nlink != 1
+        or after.st_uid != account.pw_uid
+        or after.st_gid != store_info.st_gid
+        or stat.S_IMODE(after.st_mode) != 0o600
+    ):
+        stop("Metadaten wurden nicht exakt normalisiert")
+
+    path_after = os.stat(
+        lock_name,
+        dir_fd=directory_fd,
+        follow_symlinks=False,
+    )
+    if (path_after.st_dev, path_after.st_ino) != (
+        after.st_dev,
+        after.st_ino,
+    ):
+        stop("Lockpfad wurde während der Reparatur ausgetauscht")
+
+    print("OK: ausschließlich die Metadaten der ML-Sperrdatei wurden repariert")
+finally:
+    if lock_fd is not None:
+        try:
+            if locked:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+    os.close(directory_fd)
+PY
+```
+
+Nach einer `OK`-Meldung kann der normale Web- oder Konsolen-Updater erneut
+gestartet werden. Bei `ABBRUCH` nichts löschen und insbesondere
+`.ml_model.lock`, Modell und Manifest nicht manuell entfernen.
+
 In einer Docker-Installation führen weder Weboberfläche noch Konsole einen
 Release-Wechsel im laufenden Container aus. Sie zeigen stattdessen die drei
 Host-Befehle aus dem Abschnitt [Docker-Update](#docker-update).
@@ -151,7 +303,7 @@ Writer-/Aktor-Dienste gestoppt.
 
 ## Gezielter Rückfall
 
-`v5.4.1` bietet den bereinigten Root `v5.3.2b` ausschließlich als
+`v5.4.1a` bietet den bereinigten Root `v5.3.2b` ausschließlich als
 Docker-Rückfall-Image an. Dieser Root gibt selbst keinen älteren öffentlichen
 Tag frei. Auf Bare Metal wird `v5.3.2b` nicht als Programm-Rückfall angeboten,
 weil der Altstand keinen zielgebundenen Release-Finalizer enthält. Freie

@@ -35,7 +35,7 @@ if __package__ in (None, ""):
         configured_optional_services,
         preinstalled_optional_service_expected,
     )
-    from Installer.backup_integrity import BackupIntegrityError, PRIVATE_ML_ROOT, _open_regular_file_nofollow, validate_private_ml_store
+    from Installer.backup_integrity import BackupIntegrityError, PRIVATE_ML_ROOT, _open_regular_file_nofollow, normalize_private_ml_lock_metadata, validate_private_ml_store
 else:
     from .core import CAT_ENV, register_command
     from .utils import run_command
@@ -48,7 +48,7 @@ else:
         configured_optional_services,
         preinstalled_optional_service_expected,
     )
-    from .backup_integrity import BackupIntegrityError, PRIVATE_ML_ROOT, _open_regular_file_nofollow, validate_private_ml_store
+    from .backup_integrity import BackupIntegrityError, PRIVATE_ML_ROOT, _open_regular_file_nofollow, normalize_private_ml_lock_metadata, validate_private_ml_store
 
 INSTALL_USER = get_install_user()
 INSTALL_HOME = get_home_dir(INSTALL_USER)
@@ -135,7 +135,7 @@ def _rollback_ml_directories(snapshots):
 
 
 def ensure_private_ml_model_store():
-    """Create/repair only the two private ML directories as one reversible step."""
+    """Repariert die privaten ML-Verzeichnisse und nur die bekannte Sperrdatei."""
 
     try:
         account = pwd.getpwnam(INSTALL_USER)
@@ -176,6 +176,18 @@ def ensure_private_ml_model_store():
             or stat.S_IMODE(base_metadata.st_mode) != 0o711
         ):
             raise BackupIntegrityError("ML-Basisverzeichnis besitzt nicht root:root 0711")
+        ml_preflight = validate_private_ml_store(
+            PRIVATE_ML_ROOT,
+            expected_uid=account.pw_uid,
+            allow_missing=False,
+            allow_repairable_lock=True,
+        )
+        if ml_preflight.get("repairable_lock"):
+            normalize_private_ml_lock_metadata(
+                PRIVATE_ML_ROOT,
+                expected_uid=account.pw_uid,
+                expected_gid=account.pw_gid,
+            )
         validate_private_ml_store(PRIVATE_ML_ROOT, expected_uid=account.pw_uid, allow_missing=False)
         perm_logger.info("Privater ML-Store ist manifestgebunden und nicht webbeschreibbar.")
         return True

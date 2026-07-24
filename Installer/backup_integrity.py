@@ -21,11 +21,17 @@ import shutil
 import sqlite3
 import stat
 import tempfile
+import time
 import uuid
 from contextlib import closing
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Produktivbetrieb erfolgt unter Linux.
+    fcntl = None
 
 
 PathValue = Union[str, os.PathLike]
@@ -288,11 +294,220 @@ def _read_private_ml_entry(
         os.close(descriptor)
 
 
+def _private_ml_lock_requires_normalization(
+    directory_descriptor: int,
+    owner_uid: int,
+    owner_gid: int,
+) -> bool:
+    """Prüft einen reparierbaren Alt-Lock vollständig, ohne ihn zu verändern."""
+
+    before = os.stat(
+        ML_MODEL_LOCK_NAME,
+        dir_fd=directory_descriptor,
+        follow_symlinks=False,
+    )
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+        or before.st_size > 64 * 1024
+        or before.st_uid not in {0, owner_uid}
+    ):
+        raise BackupIntegrityError(
+            "Unsicherer privater ML-Eintrag: {}".format(ML_MODEL_LOCK_NAME)
+        )
+    descriptor = os.open(
+        ML_MODEL_LOCK_NAME,
+        os.O_RDONLY | _NOFOLLOW,
+        dir_fd=directory_descriptor,
+    )
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            raise BackupIntegrityError(
+                "Privater ML-Eintrag wurde beim Öffnen ausgetauscht: {}".format(
+                    ML_MODEL_LOCK_NAME
+                )
+            )
+        payload_size = 0
+        while payload_size <= 64 * 1024:
+            chunk = os.read(descriptor, min(64 * 1024 + 1 - payload_size, 64 * 1024))
+            if not chunk:
+                break
+            payload_size += len(chunk)
+        after = os.fstat(descriptor)
+        before_signature = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+        after_signature = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        if payload_size != before.st_size or before_signature != after_signature:
+            raise BackupIntegrityError(
+                "Privater ML-Eintrag wurde während des Lesens verändert: {}".format(
+                    ML_MODEL_LOCK_NAME
+                )
+            )
+        return (
+            before.st_uid != owner_uid
+            or before.st_gid != owner_gid
+            or stat.S_IMODE(before.st_mode) != 0o600
+        )
+    finally:
+        os.close(descriptor)
+
+
+def normalize_private_ml_lock_metadata(
+    model_root: PathValue = PRIVATE_ML_ROOT,
+    *,
+    expected_uid: int,
+    expected_gid: int,
+    timeout_s: float = 10.0,
+) -> Dict[str, object]:
+    """Normalisiert ausschließlich eine vorhandene, eindeutig sichere ML-Sperrdatei."""
+
+    owner_uid = int(expected_uid)
+    owner_gid = int(expected_gid)
+    if owner_uid < 0 or owner_gid < 0:
+        raise BackupIntegrityError("ML-Sperrdatei besitzt keine gültige Zielidentität")
+    if fcntl is None:
+        raise BackupIntegrityError("ML-Sperrdatei kann auf diesem System nicht verriegelt werden")
+
+    root = _lexical_absolute(model_root)
+    if Path(os.path.realpath(str(root))) != root:
+        raise BackupIntegrityError("Privater ML-Modellpfad ist nicht kanonisch")
+
+    parent_descriptor = _open_directory_nofollow(root.parent)
+    try:
+        directory_before = os.stat(root.name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if (
+            stat.S_ISLNK(directory_before.st_mode)
+            or not stat.S_ISDIR(directory_before.st_mode)
+            or stat.S_IMODE(directory_before.st_mode) != 0o700
+            or directory_before.st_uid != owner_uid
+            or directory_before.st_gid != owner_gid
+        ):
+            raise BackupIntegrityError(
+                "Privates ML-Modellverzeichnis ist für die Sperrreparatur nicht eindeutig gebunden"
+            )
+        directory_descriptor = os.open(
+            root.name,
+            os.O_RDONLY | _DIRECTORY | _NOFOLLOW,
+            dir_fd=parent_descriptor,
+        )
+        directory_opened = os.fstat(directory_descriptor)
+        if (directory_opened.st_dev, directory_opened.st_ino) != (
+            directory_before.st_dev,
+            directory_before.st_ino,
+        ):
+            os.close(directory_descriptor)
+            raise BackupIntegrityError(
+                "Privates ML-Modellverzeichnis wurde beim Öffnen ausgetauscht"
+            )
+    finally:
+        os.close(parent_descriptor)
+
+    lock_descriptor = None
+    locked = False
+    try:
+        try:
+            path_before = os.stat(
+                ML_MODEL_LOCK_NAME,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return {"state": "absent", "changed": False, "root": str(root)}
+        if (
+            not stat.S_ISREG(path_before.st_mode)
+            or path_before.st_nlink != 1
+            or path_before.st_size > 64 * 1024
+            or path_before.st_uid not in {0, owner_uid}
+        ):
+            raise BackupIntegrityError(
+                "ML-Sperrdatei ist kein sicher normalisierbarer Altbestand"
+            )
+        try:
+            lock_descriptor = os.open(
+                ML_MODEL_LOCK_NAME,
+                os.O_RDWR | _NOFOLLOW,
+                dir_fd=directory_descriptor,
+            )
+        except FileNotFoundError:
+            return {"state": "absent", "changed": False, "root": str(root)}
+        except OSError as exc:
+            raise BackupIntegrityError(
+                "ML-Sperrdatei ist keine eindeutig öffnbare reguläre Datei"
+            ) from exc
+
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        while True:
+            try:
+                fcntl.flock(lock_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+                break
+            except BlockingIOError as exc:
+                if time.monotonic() >= deadline:
+                    raise BackupIntegrityError(
+                        "ML-Sperrdatei blieb während der Rechteprüfung belegt"
+                    ) from exc
+                time.sleep(0.1)
+
+        before = os.fstat(lock_descriptor)
+        if (path_before.st_dev, path_before.st_ino) != (before.st_dev, before.st_ino):
+            raise BackupIntegrityError("ML-Sperrdatei wurde beim Öffnen ausgetauscht")
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_size > 64 * 1024
+            or before.st_uid not in {0, owner_uid}
+        ):
+            raise BackupIntegrityError(
+                "ML-Sperrdatei ist kein sicher normalisierbarer Altbestand"
+            )
+
+        changed = (
+            before.st_uid != owner_uid
+            or before.st_gid != owner_gid
+            or stat.S_IMODE(before.st_mode) != 0o600
+        )
+        if before.st_uid != owner_uid or before.st_gid != owner_gid:
+            os.fchown(lock_descriptor, owner_uid, owner_gid)
+        if stat.S_IMODE(before.st_mode) != 0o600:
+            os.fchmod(lock_descriptor, 0o600)
+        if changed:
+            os.fsync(lock_descriptor)
+
+        after = os.fstat(lock_descriptor)
+        path_after = os.stat(
+            ML_MODEL_LOCK_NAME,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            (after.st_dev, after.st_ino, after.st_size)
+            != (before.st_dev, before.st_ino, before.st_size)
+            or after.st_nlink != 1
+            or after.st_uid != owner_uid
+            or after.st_gid != owner_gid
+            or stat.S_IMODE(after.st_mode) != 0o600
+            or (path_after.st_dev, path_after.st_ino) != (after.st_dev, after.st_ino)
+        ):
+            raise BackupIntegrityError(
+                "ML-Sperrdatei konnte nicht eindeutig normalisiert werden"
+            )
+        return {"state": "ready", "changed": changed, "root": str(root)}
+    finally:
+        if lock_descriptor is not None:
+            try:
+                if locked:
+                    fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(lock_descriptor)
+        os.close(directory_descriptor)
+
+
 def validate_private_ml_store(
     model_root: PathValue = PRIVATE_ML_ROOT,
     *,
     expected_uid: Optional[int] = None,
     allow_missing: bool = True,
+    allow_repairable_lock: bool = False,
 ) -> Dict[str, object]:
     """Validate the non-web-writable ML store without deserializing its model."""
 
@@ -315,6 +530,7 @@ def validate_private_ml_store(
         if stat.S_IMODE(before.st_mode) != 0o700:
             raise BackupIntegrityError("Privates ML-Modellverzeichnis besitzt nicht Modus 0700")
         owner_uid = int(before.st_uid)
+        owner_gid = int(before.st_gid)
         if expected_uid is not None and owner_uid != int(expected_uid):
             raise BackupIntegrityError("Privates ML-Modellverzeichnis besitzt einen falschen Owner")
         try:
@@ -350,6 +566,7 @@ def validate_private_ml_store(
     try:
         names = sorted(os.listdir(descriptor))
         model_names = []
+        repairable_lock = False
         for name in names:
             if name in {ML_MODEL_MANIFEST_NAME, ML_MODEL_LOCK_NAME}:
                 maximum = 64 * 1024
@@ -358,6 +575,13 @@ def validate_private_ml_store(
                 maximum = ML_MODEL_MAX_BYTES
             else:
                 raise BackupIntegrityError("Nicht manifestgebundener Eintrag im privaten ML-Store: {}".format(name))
+            if name == ML_MODEL_LOCK_NAME and allow_repairable_lock:
+                repairable_lock = _private_ml_lock_requires_normalization(
+                    descriptor,
+                    owner_uid,
+                    owner_gid,
+                )
+                continue
             _read_private_ml_entry(
                 descriptor,
                 name,
@@ -369,7 +593,13 @@ def validate_private_ml_store(
         if ML_MODEL_MANIFEST_NAME not in names:
             if model_names:
                 raise BackupIntegrityError("ML-Modellartefakt ohne Manifest ist nicht zulaessig")
-            return {"state": "untrained", "root": str(root), "files": len(names), "uid": owner_uid}
+            return {
+                "state": "untrained",
+                "root": str(root),
+                "files": len(names),
+                "uid": owner_uid,
+                "repairable_lock": repairable_lock,
+            }
 
         manifest_payload = _read_private_ml_entry(
             descriptor, ML_MODEL_MANIFEST_NAME, owner_uid, 64 * 1024
@@ -401,6 +631,7 @@ def validate_private_ml_store(
             "files": len(names),
             "uid": owner_uid,
             "model_sha256": model_hash,
+            "repairable_lock": repairable_lock,
         }
     finally:
         os.close(descriptor)

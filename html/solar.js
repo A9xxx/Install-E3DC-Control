@@ -4302,9 +4302,48 @@ function startInstallerUpdateRun(btn, origText) {
     });
 }
 
+function e3dcClassifyInstallerUpdatePoll(data) {
+    const payload = (data && typeof data === "object") ? data : {};
+    const logText = (typeof payload.log === "string") ? payload.log : "";
+    const running = payload.running === true;
+    const successMarkerFound = logText.includes("Update erfolgreich abgeschlossen") ||
+                               logText.includes("Update abgeschlossen") ||
+                               /\[OK\]\s+self-update auf [0-9a-f]{40} abgeschlossen\./i.test(logText) ||
+                               logText.includes("Du bist auf dem neuesten Stand");
+    const exitCode = Number.isInteger(payload.exit_code) ? payload.exit_code : null;
+    const exitKnown = exitCode !== null;
+    const exitOk = exitKnown && exitCode === 0;
+    const exitFailed = exitKnown && exitCode !== 0;
+    const completionSucceeded = payload.completion === "success";
+    const completionFailed = payload.completion === "failed";
+    const abortedFound = logText.includes("Vorgang abgebrochen");
+    const errorFound = /(traceback|exception|critical|fatal|permission denied|\[!\]\s+self-update fehlgeschlagen|self-update fehlgeschlagen:|web-update kann nicht starten|konnte update-prozess nicht starten)/i.test(logText);
+    const successFound = !running &&
+                         !exitFailed &&
+                         !completionFailed &&
+                         !errorFound &&
+                         (exitOk ||
+                          (!running && completionSucceeded) ||
+                          (!running && !exitKnown && successMarkerFound));
+
+    return {
+        logText,
+        running,
+        exitCode,
+        exitKnown,
+        exitFailed,
+        completionFailed,
+        abortedFound,
+        errorFound,
+        successFound,
+    };
+}
+
 function pollInstallerUpdate(log, spinner, closeBtn, finishBtn, btn, origText) {
     let tick = 0;
+    let stoppedPolls = 0;
     let transientPollErrors = 0;
+    const maxStoppedGracePolls = 6;
     const maxTransientPollErrors = 5;
     const interval = setInterval(() => {
         tick++;
@@ -4325,31 +4364,56 @@ function pollInstallerUpdate(log, spinner, closeBtn, finishBtn, btn, origText) {
             })
             .then(data => {
                 transientPollErrors = 0;
-                const logText = (data && typeof data.log === 'string') ? data.log : "";
+                const updateStatus = e3dcClassifyInstallerUpdatePoll(data);
+                const {
+                    logText,
+                    running,
+                    exitCode,
+                    exitKnown,
+                    exitFailed,
+                    completionFailed,
+                    abortedFound,
+                    errorFound,
+                    successFound,
+                } = updateStatus;
                 if (log && logText) {
                     log.innerText = logText;
                     const modalBody = log.parentElement;
                     if (modalBody) modalBody.scrollTop = modalBody.scrollHeight;
                 }
 
-                const successFound = logText.includes("Update erfolgreich abgeschlossen") ||
-                                     logText.includes("Update abgeschlossen") ||
-                                     logText.includes("Du bist auf dem neuesten Stand") ||
-                                     logText.includes("Vorgang abgebrochen");
-                const errorFound = /(traceback|exception|critical|fatal|permission denied|web-update kann nicht starten|konnte update-prozess nicht starten)/i.test(logText);
+                if (!running && !successFound && !exitKnown && !completionFailed && !abortedFound && !errorFound && tick < 240) {
+                    stoppedPolls++;
+                    if (stoppedPolls <= maxStoppedGracePolls) {
+                        if (stoppedPolls === 1 && log) {
+                            log.innerText += "\n\n[INFO] Update-Prozess beendet, warte auf Abschlussstatus und letzte Logzeilen...";
+                        }
+                        return;
+                    }
+                } else {
+                    stoppedPolls = 0;
+                }
 
-                if (!data.running || successFound || errorFound || tick >= 240) {
+                if (!running || successFound || exitKnown || completionFailed || abortedFound || errorFound || tick >= 240) {
                     clearInterval(interval);
-                    const ok = successFound && !errorFound;
+                    const ok = successFound && !exitFailed && !completionFailed && !errorFound;
                     if (spinner) {
                         spinner.classList.remove('fa-spin', 'fa-sync');
-                        spinner.classList.add(ok ? 'fa-check-circle' : 'fa-times-circle', ok ? 'text-success' : 'text-danger');
+                        if (abortedFound && !ok) {
+                            spinner.classList.add('fa-info-circle', 'text-info');
+                        } else {
+                            spinner.classList.add(ok ? 'fa-check-circle' : 'fa-times-circle', ok ? 'text-success' : 'text-danger');
+                        }
                     }
                     if (log) {
                         if (ok) {
                             log.innerText += "\n\n[OK] Web-UI Update beendet. Bitte Seite neu laden.";
+                        } else if (abortedFound) {
+                            log.innerText += "\n\n[INFO] Web-UI Update wurde abgebrochen.";
                         } else if (tick >= 240) {
                             log.innerText += "\n\n[FEHLER] Web-UI Update: Zeitüberschreitung. Bitte Diagnose-Log prüfen.";
+                        } else if (exitFailed) {
+                            log.innerText += "\n\n[FEHLER] Web-UI Update beendet mit Exitcode " + exitCode + ".";
                         } else {
                             log.innerText += "\n\n[FEHLER] Web-UI Update beendet, aber ohne eindeutige Erfolgsmeldung.";
                         }

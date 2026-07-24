@@ -6,6 +6,19 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.1a] – 2026-07-24
+
+### 📦 Update, Backup und Erstinstallation
+
+- 🐛 **Web-Update-Abschluss:** Die Weboberfläche wertet den strukturierten Exitcode und den kanonischen Erfolgsmarker des Installers aus. Ein erfolgreich abgeschlossener Release-Wechsel wird nicht mehr fälschlich als unklarer Fehler angezeigt; laufende oder tatsächlich fehlgeschlagene Prozesse bleiben davon getrennt.
+- 🛡️ **Private ML-Sperrdatei:** Neu erzeugte `.ml_model.lock`-Dateien erhalten unmittelbar den gebundenen Installationsbenutzer und Modus `0600`. Die Rechteprüfung kann ausschließlich einen eindeutig regulären, unverlinkten und unbelegten Alt-Lock normalisieren; Modell- und Manifestbytes bleiben unverändert.
+- 🐛 **Frische Erstinstallation:** Der normale Einstieg `e3dc-setup` übernimmt keine unvollständige Release-Bootstrap-Bindung mehr. Der SHA-gebundene Runner-/Zielvertrag für echte Release-Bootstraps bleibt unverändert fail-closed.
+- 🔎 **Bestandsinstallationen:** Ein bereits durch einen unsicheren ML-Lock blockierter Alt-Updater benötigt einmalig die dokumentierte enge SSH-Reparatur, weil der alte Prozess sein Backup vor dem Laden der neuen Releasebytes prüft.
+
+### 📖 Dokumentation
+
+- 📝 **E3/DC-Geräteeinstellungen:** README und Hilfe trennen die E3/DC-eigene Wetterladung von der unabhängigen Open-Meteo-/Forecast-Prognose. RSCP-Zugang, Dachflächen, Notstromreserve, Hardwaregrenzen, Ein-Entscheider-Regel und gemeinsame Systemzeit sind als empfohlene Betriebsgrundlage dokumentiert.
+
 ## [5.4.1] – 2026-07-24
 
 ### 🔌 Wallboxen und Fahrzeuge

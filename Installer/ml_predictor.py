@@ -329,16 +329,42 @@ def _ml_model_lock(path, exclusive=False, create_directory=False):
     lock_fd = None
     try:
         lock_name = _ml_lock_name(path)
-        lock_fd = os.open(
-            lock_name,
-            os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
-            0o600,
-            dir_fd=dir_fd,
-        )
-        lock_error = _ml_file_stat_security_error(os.fstat(lock_fd), owner_uid)
+        created = False
+        try:
+            lock_fd = os.open(
+                lock_name,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=dir_fd,
+            )
+            created = True
+        except FileExistsError:
+            lock_fd = os.open(
+                lock_name,
+                os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=dir_fd,
+            )
+        if created:
+            created_info = os.fstat(lock_fd)
+            if os.geteuid() == 0:
+                os.fchown(lock_fd, owner_uid, owner_gid)
+            elif created_info.st_uid != owner_uid:
+                # Dienste können absichtlich mit Group=www-data laufen. Die
+                # private 0600-Datei benötigt nur den gebundenen Owner; ein
+                # Gruppenwechsel wäre ohne Root nicht auf jedem System erlaubt.
+                os.fchown(lock_fd, owner_uid, -1)
+            os.fchmod(lock_fd, 0o600)
+            os.fsync(lock_fd)
+        lock_info = os.fstat(lock_fd)
+        lock_error = _ml_file_stat_security_error(lock_info, owner_uid)
         if lock_error:
             raise PermissionError(lock_error)
+        if created and os.geteuid() == 0 and lock_info.st_gid != owner_gid:
+            raise PermissionError("ML-Modellsperre besitzt nicht die gebundene Store-Gruppe")
         fcntl.flock(lock_fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        path_info = os.stat(lock_name, dir_fd=dir_fd, follow_symlinks=False)
+        if (path_info.st_dev, path_info.st_ino) != (lock_info.st_dev, lock_info.st_ino):
+            raise PermissionError("ML-Modellsperre wurde vor der Nutzung ausgetauscht")
         yield dir_fd, owner_uid, owner_gid
     finally:
         if lock_fd is not None:

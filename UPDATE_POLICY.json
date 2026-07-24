@@ -1,9 +1,9 @@
 {
-  "version": "5.4.1",
+  "version": "5.4.1a",
   "min_version": "4.0.0",
-  "stable_release": "v5.4.1",
+  "stable_release": "v5.4.1a",
   "release_date": "2026-07-24",
-  "description": "v5.4.1 - stabile Wallbox-, Update-, Docker- und Diagnosekonsolidierung",
+  "description": "v5.4.1a - Wartungsrelease für Update, Backup und Erstinstallation",
   "installer_requires": "python3",
   "sanitized_republication": false,
   "history_transition": {

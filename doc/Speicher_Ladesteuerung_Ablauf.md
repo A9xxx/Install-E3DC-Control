@@ -1,6 +1,6 @@
 # Speicher-Ladesteuerung - Systemablauf
 
-> **Stand:** v5.4.1, gegen den veröffentlichten Betriebsvertrag geprüft am 2026-07-24
+> **Stand:** v5.4.1a, gegen den veröffentlichten Betriebsvertrag geprüft am 2026-07-24
 >
 > **Dateien:** `Installer/storage_simulator.py`,
 > `Installer/storage_manager.py`, `Installer/storage_parallel_regulator.py`

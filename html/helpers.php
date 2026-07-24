@@ -3419,6 +3419,38 @@ function handleSelfUpdateCheck() {
 /**
  * Führt das Installer-Update (Diagramme) aus.
  */
+function e3dcSelfUpdateLogHasCanonicalSuccess($log) {
+    return preg_match(
+        '/(?:^|\R)\[OK\]\s+self-update auf [0-9a-f]{40} abgeschlossen\.\s*(?:\R|$)/i',
+        (string)$log
+    ) === 1;
+}
+
+function e3dcSelfUpdateLogHasTerminalFailure($log) {
+    return preg_match(
+        '/traceback|exception|critical|fatal|permission denied|'
+        . '\[!\]\s+self-update fehlgeschlagen|self-update fehlgeschlagen:|'
+        . 'web-update kann nicht starten|konnte update-prozess nicht starten/i',
+        (string)$log
+    ) === 1;
+}
+
+function e3dcClassifySelfUpdateCompletion($running, $exitCode, $log) {
+    if ($running === true) {
+        return 'running';
+    }
+    if (is_int($exitCode)) {
+        return ($exitCode === 0) ? 'success' : 'failed';
+    }
+    if (e3dcSelfUpdateLogHasTerminalFailure($log)) {
+        return 'failed';
+    }
+    if (e3dcSelfUpdateLogHasCanonicalSuccess($log)) {
+        return 'success';
+    }
+    return 'unknown';
+}
+
 function handleRunSelfUpdate() {
     if (isset($_GET['action']) && $_GET['action'] === 'poll_self_update') {
         requireWebAuth(true);
@@ -3427,6 +3459,7 @@ function handleRunSelfUpdate() {
 
         $logFile = '/var/www/html/logs/self_update_php.log';
         $pidFile = '/var/www/html/tmp/self_update.pid';
+        $statusFile = '/var/www/html/tmp/self_update.status';
         $log = 'Status: Initialisiere... (Log-Datei noch nicht erstellt)';
         if (file_exists($logFile)) {
             $content = file_get_contents($logFile);
@@ -3443,10 +3476,34 @@ function handleRunSelfUpdate() {
             }
         }
 
+        $exitCode = null;
+        if (file_exists($statusFile)) {
+            $rawExitCode = trim((string)file_get_contents($statusFile));
+            if (preg_match('/^-?\d+$/', $rawExitCode)) {
+                $exitCode = (int)$rawExitCode;
+            }
+        }
+
+        $completion = e3dcClassifySelfUpdateCompletion($running, $exitCode, $log);
+        if ($completion === 'success' && $exitCode === null) {
+            // Kompatibilitätsbrücke für einen Lauf, den eine ältere Webdatei
+            // noch ohne Exitcode-Datei gestartet hat. Der zurückgegebene
+            // Marker wird auch von älteren bereits geladenen Browsern erkannt.
+            if (strpos($log, 'Update abgeschlossen') === false) {
+                $log .= "\n[OK] Update abgeschlossen.\n";
+            }
+        }
+
         $flags = 0;
         if (defined('JSON_INVALID_UTF8_SUBSTITUTE')) $flags |= JSON_INVALID_UTF8_SUBSTITUTE;
         if (defined('JSON_PARTIAL_OUTPUT_ON_ERROR')) $flags |= JSON_PARTIAL_OUTPUT_ON_ERROR;
-        echo json_encode(['success' => true, 'running' => $running, 'log' => $log], $flags);
+        echo json_encode([
+            'success' => true,
+            'running' => $running,
+            'log' => $log,
+            'exit_code' => $exitCode,
+            'completion' => $completion,
+        ], $flags);
         exit;
     }
 
@@ -3489,6 +3546,7 @@ function handleRunSelfUpdate() {
         $baseDir = (basename($script) === 'installer_main.py') ? dirname($script) : dirname(dirname($script)); // .../Install
         $logFile = '/var/www/html/logs/self_update_php.log';
         $pidFile = '/var/www/html/tmp/self_update.pid';
+        $statusFile = '/var/www/html/tmp/self_update.status';
 
         if (file_exists($pidFile)) {
             $pid = (int)trim(file_get_contents($pidFile));
@@ -3502,6 +3560,7 @@ function handleRunSelfUpdate() {
         // Log-Datei vorbereiten und bei jedem Lauf leeren
         @file_put_contents($logFile, "=== Starting V4 Web-Update at ".date('Y-m-d H:i:s')." ===\n\n");
         @chmod($logFile, 0664);
+        @unlink($statusFile);
         $zeroPayload = json_encode(['success' => true, 'missing' => 0, 'updating' => true]);
         foreach (['/var/www/html/ramdisk/e3dc_self_update_status.json', '/var/www/html/ramdisk/e3dc_update_status.json'] as $cacheFile) {
             @file_put_contents($cacheFile, $zeroPayload);
@@ -3553,7 +3612,12 @@ function handleRunSelfUpdate() {
         }
 
         file_put_contents($logFile, "Start-Befehl: $selectedRunCmd\n--------------------------------\n", FILE_APPEND);
-        $cmd = sprintf("nohup %s >> %s 2>&1 & echo $!", $selectedRunCmd, escapeshellarg($logFile));
+        $runner = $selectedRunCmd
+            . ' >> ' . escapeshellarg($logFile)
+            . ' 2>&1; ret=$?; umask 022; printf "%s\n" "$ret" > '
+            . escapeshellarg($statusFile)
+            . '; exit "$ret"';
+        $cmd = 'nohup /bin/sh -c ' . escapeshellarg($runner) . ' >/dev/null 2>&1 & echo $!';
         $pid = trim((string)shell_exec($cmd));
 
         if ($pid !== '') {

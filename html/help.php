@@ -115,7 +115,7 @@ $paths = getInstallPaths();
     <div class="container">
         <div class="d-flex justify-content-between align-items-center mb-4">
             <a href="index.php" class="nav-link-back"><i class="fas fa-arrow-left me-2"></i>Dashboard</a>
-            <span class="badge bg-success text-light">v5.4.1 Stable</span>
+            <span class="badge bg-success text-light">v5.4.1a Stable</span>
         </div>
         <h1 class="display-4 fw-bold">Hilfe & Support</h1>
         <p class="lead opacity-75">Häufige Fragen und Lösungen rund um E3DC-Control.</p>
@@ -134,7 +134,7 @@ $paths = getInstallPaths();
         <div class="col-12 faq-item" data-tags="docker image stable rollback update">
             <div class="card bg-card border-0 shadow-sm"><div class="card-body">
                 <h5 class="card-title"><span class="tag">Docker</span> Wie prüfe ich Image und Update?</h5>
-                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem geprüften Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.1</code> in <code>.env</code> gesetzt.</p>
+                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem geprüften Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.1a</code> in <code>.env</code> gesetzt.</p>
                 <pre>(
   set -euo pipefail
   docker compose config --images
@@ -207,6 +207,24 @@ $paths = getInstallPaths();
                         <li>Nach der Freigabe im Account den RESTful API Security Token erzeugen.</li>
                         <li>Im Config-Editor unter <em>Tarif</em> den ENTSO-E-Token als Fallback-Token eintragen und mit <em>ENTSO-E testen</em> prüfen.</li>
                     </ol>
+                </div>
+            </div>
+        </div>
+
+        <h4 class="mb-4 text-accent"><i class="fas fa-screwdriver-wrench me-2"></i>Stable 5.4.1a: Update- und Installationswartung</h4>
+        <div class="col-12 faq-item" data-tags="5.4.1a stable update backup ml lock erstinstallation bootstrap wetterladung open meteo">
+            <div class="card bg-card border-0 shadow-sm">
+                <div class="card-body">
+                    <h5 class="card-title">
+                        <span class="tag">5.4.1a</span>
+                        Was korrigiert das Wartungsrelease 5.4.1a?
+                    </h5>
+                    <ul>
+                        <li><strong>Web-Update:</strong> Exitcode und kanonischer Installer-Erfolgsmarker werden gemeinsam ausgewertet. Ein erfolgreicher Wechsel erscheint nicht mehr als unklarer Fehler.</li>
+                        <li><strong>ML-Backup:</strong> Sichere Altbestände der privaten Sperrdatei können ohne Änderung von Modell oder Manifest normalisiert werden; unsichere Pfade, Links oder belegte Locks bleiben gesperrt.</li>
+                        <li><strong>Erstinstallation:</strong> <code>e3dc-setup</code> erzeugt keine unvollständige Release-Bootstrap-Bindung mehr. Der strenge SHA-gebundene Releasepfad bleibt unverändert.</li>
+                        <li><strong>Geräteeinstellungen:</strong> Bei geführter E3DC-Control-Ladekurve sollte die E3/DC-Wetterladung aus sein. Open-Meteo und die konfigurierten Dachflächen bleiben davon unabhängig aktiv.</li>
+                    </ul>
                 </div>
             </div>
         </div>
@@ -882,7 +900,7 @@ journalctl -u e3dc-live -n 80 --no-pager</pre>
                         <li>Über das Dashboard (Kachel Konfiguration -> "Update suchen").</li>
                         <li>Bei aktuellen Ständen direkt über den Menüpunkt <em>Update</em> im Installer.</li>
                     </ol>
-                    <p><strong>Einmalige Ausnahme für 5.3.2b:</strong> Den ersten Wechsel auf 5.4.1 ausschließlich über den Web-Update-Button oder per SSH mit <code>sudo /usr/bin/python3 installer_main.py --update-e3dc</code> starten. Der interaktive Menüpunkt ist für diesen Hybridwechsel nicht freigegeben, weil der 5.3.2b-Altprozess bereits zusätzliche Module geladen hat.</p>
+                    <p><strong>Einmalige Ausnahme für 5.3.2b:</strong> Den ersten Wechsel auf 5.4.1a ausschließlich über den Web-Update-Button oder per SSH mit <code>sudo /usr/bin/python3 installer_main.py --update-e3dc</code> starten. Der interaktive Menüpunkt ist für diesen Hybridwechsel nicht freigegeben, weil der 5.3.2b-Altprozess bereits zusätzliche Module geladen hat.</p>
                     <p>Verwenden Sie für den einmaligen Wechsel auf die bereinigte Historie keinen manuellen <code>git pull --ff-only</code>-Ablauf. Der Installer erstellt und prüft zuerst das externe Backup und validiert anschließend Zielstand, Dienste und Weboberfläche.</p>
                     Updates werden im Changelog oben rechts im Dashboard signalisiert.
                 </div>

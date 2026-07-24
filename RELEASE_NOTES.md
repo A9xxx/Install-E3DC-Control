@@ -1,22 +1,25 @@
-# E3DC-Control v5.4.1b
+# E3DC-Control v5.4.1c
 
-E3DC-Control 5.4.1b korrigiert ausschließlich das vorgelagerte
-Docker-Release-Gate. Der Workflow lädt für die Prüfung der vollständigen
-Release-Abstammung nun die gesamte Git-Historie statt einer mit jedem Release
-zu klein werdenden festen Commit-Tiefe. Produktbytes und Regelung entsprechen
-5.4.1a.
+E3DC-Control 5.4.1c korrigiert ausschließlich den semantischen
+OCI-Release-Verifier. Die erwartete, bereits durch Workflow, Tag, `VERSION`,
+Commit und Tree gebundene Releaseversion wird nun streng syntaktisch geprüft,
+statt zusätzlich in einer bei jedem Release manuell zu erweiternden Liste zu
+stehen. Produktbytes und Regelung entsprechen unverändert 5.4.1a.
 
 ## Docker-Release
 
-- Der Topologieprüfer kann den parentlosen Veröffentlichungs-Root unabhängig
-  von der Anzahl späterer Wartungsreleases sicher erreichen.
+- Der Topologieprüfer lädt weiterhin die vollständige Historie und bindet den
+  parentlosen Veröffentlichungs-Root.
+- Der OCI-Verifier akzeptiert die vom Workflow exakt gebundene 5.4.1c-Version
+  und weist leere, mehrteilige, großgeschriebene oder anderweitig unzulässige
+  Versionsformen weiterhin zurück.
 - Das Gate bleibt fail-closed: Commit, Tree, Version, Noreply-Identität,
   vollständige Abstammung und Quellenmanifest müssen weiterhin exakt passen.
-- Der fehlgeschlagene erste Docker-Lauf für 5.4.1a endete vor Build, SBOM,
-  Provenance und Tag-Promotion. Es wurde kein unvollständiges Image
-  veröffentlicht.
+- Der 5.4.1b-Lauf erzeugte einen vollständigen temporären Multiarch-Kandidaten
+  samt SBOM und Provenance, endete aber vor Stable-Tag-Promotion an der
+  veralteten Versionsliste.
 
-## Änderungen aus 5.4.1a
+## Änderungen aus 5.4.1a und 5.4.1b
 
 ## Web-Update
 
@@ -89,8 +92,8 @@ einem erfolgreichen Pull:
 )
 ```
 
-Ein fester Eintrag `E3DC_IMAGE_TAG` bleibt absichtlich fest. Für v5.4.1b
-lautet der Pin `E3DC_IMAGE_TAG=v5.4.1b`; ohne Pin folgt die Compose-Datei dem
+Ein fester Eintrag `E3DC_IMAGE_TAG` bleibt absichtlich fest. Für v5.4.1c
+lautet der Pin `E3DC_IMAGE_TAG=v5.4.1c`; ohne Pin folgt die Compose-Datei dem
 erst nach erfolgreicher Attestierungsprüfung gesetzten Stable-Tag `latest`.
 
 Der öffentliche Docker-Rückfallstand bleibt `v5.3.2b`. Dieser Stand ist nicht

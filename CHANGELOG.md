@@ -6,6 +6,13 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.1c] – 2026-07-24
+
+### 🐳 OCI-Verifikation
+
+- 🐛 **Releaseversion:** Der OCI-Verifier prüft die vom Workflow bereits exakt gebundene Releaseversion mit einer strengen Versionssyntax statt einer bei jedem Wartungsrelease manuell zu erweiternden statischen Liste.
+- 🛡️ **Keine ungeprüfte Promotion:** Der 5.4.1b-Lauf erzeugte einen vollständigen temporären AMD64-/ARM64-Kandidaten mit SBOM und Provenance, endete aber vor den unveränderlichen Stable-Tags. 5.4.1c ändert keine Speicher-, Wallbox-, Wärme- oder Direktvermarktungsregelung.
+
 ## [5.4.1b] – 2026-07-24
 
 ### 🐳 Docker-Veröffentlichung

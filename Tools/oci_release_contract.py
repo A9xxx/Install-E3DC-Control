@@ -15,17 +15,7 @@ SOURCE = "https://github.com/A9xxx/Install-E3DC-Control"
 TITLE = "E3DC-Control"
 DESCRIPTION = "Lokales Energie- und Installationssystem für E3DC-Anlagen"
 LICENSE = "AGPL-3.0-or-later"
-RELEASE_VERSIONS = {
-    "5.3.2b",
-    "5.4.0",
-    "5.4.0a",
-    "5.4.0b",
-    "5.4.0c",
-    "5.4.0d",
-    "5.4.0e",
-    "5.4.1",
-    "5.4.1a",
-}
+RELEASE_VERSION_RE = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+[a-z]?")
 DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
 
 
@@ -71,7 +61,7 @@ def verify(bundle: dict) -> list[str]:
     if not re.fullmatch(r"[0-9a-f]{40}", tree): errors.append("expected tree")
     if not re.fullmatch(r"[0-9a-f]{64}", source_manifest): errors.append("expected source manifest")
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z", created): errors.append("expected created")
-    if version not in RELEASE_VERSIONS: errors.append("expected release version")
+    if not RELEASE_VERSION_RE.fullmatch(version): errors.append("expected release version")
 
     runtimes = bundle.get("runtimes", [])
     if not isinstance(runtimes, list):

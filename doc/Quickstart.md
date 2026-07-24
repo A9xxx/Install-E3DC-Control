@@ -43,7 +43,7 @@ Für eine Erstinstallation oder ein Update ist die empfohlene Option **"1 Instal
 2.  Der Installer richtet Pakete, Dienste, Webdateien, Rechte und den Web-Wizard ein.
 3.  Folgen Sie den Anweisungen auf dem Bildschirm.
 
-**Einmalige Ausnahme für Version 5.3.2b:** Der erste Wechsel auf 5.4.1b
+**Einmalige Ausnahme für Version 5.3.2b:** Der erste Wechsel auf 5.4.1c
 erfolgt über den Web-Update-Button oder direkt mit
 `sudo /usr/bin/python3 installer_main.py --update-e3dc`. Der interaktive
 Menüpunkt darf für genau diesen ersten Hybridwechsel nicht verwendet werden,
@@ -168,7 +168,7 @@ bewusster Opt-in erfolgt mit
 `docker compose --profile auto-update up -d watchtower`; standardmäßig bleibt
 der oben gezeigte manuelle Updateweg aktiv.
 
-**Docker-Rückfall von v5.4.1b auf den veröffentlichten Docker-Rollback-Root:**
+**Docker-Rückfall von v5.4.1c auf den veröffentlichten Docker-Rollback-Root:**
 ```bash
 (
   set -euo pipefail
@@ -228,7 +228,7 @@ Nach der Installation können Sie den Installer über `bash "$E3DC_INSTALL_PATH/
 - **E3DC-Control installieren oder aktualisieren:**
   - Option `1` (Installation / Update)
   - Hält Anwendung, Webdateien, Dienste und Rechte auf dem aktuellen Stand.
-  - Ausnahme: Für den einmaligen Wechsel von 5.3.2b auf 5.4.1b den
+  - Ausnahme: Für den einmaligen Wechsel von 5.3.2b auf 5.4.1c den
     Web-Update-Button oder den direkten `--update-e3dc`-Aufruf aus
     [Update.md](Update.md) verwenden, nicht den interaktiven Menüpunkt.
 

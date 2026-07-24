@@ -6,6 +6,13 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.1b] – 2026-07-24
+
+### 🐳 Docker-Veröffentlichung
+
+- 🐛 **Vollständige Release-Historie:** Das vorgelagerte Docker-Gate lädt die Git-Historie vollständig, bevor es Commit, Tree, Noreply-Identität und den parentlosen Veröffentlichungs-Root prüft. Eine mit jedem Wartungsrelease zu klein werdende feste Checkout-Tiefe kann den Build dadurch nicht mehr vorzeitig blockieren.
+- 🛡️ **Fail-closed beibehalten:** Der fehlgeschlagene erste 5.4.1a-Lauf endete vor Image-Build, SBOM, Provenance und Tag-Promotion. 5.4.1b ändert keine Speicher-, Wallbox-, Wärme- oder Direktvermarktungsregelung.
+
 ## [5.4.1a] – 2026-07-24
 
 ### 📦 Update, Backup und Erstinstallation

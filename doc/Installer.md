@@ -1,6 +1,6 @@
 # E3DC-Control Installer
 
-Dokumentation Stand: 5.4.1a
+Dokumentation Stand: 5.4.1b
 
 Der Installer verwaltet Bare-Metal-Installation, Update, Rechte, Dienste,
 Backup, Rollback und optionale Produktmodule. Er ermittelt Benutzer, Home,
@@ -28,7 +28,7 @@ bash "$E3DC_INSTALL_PATH/e3dc-setup" --update-e3dc
 Rechte und startet den Installer mit dem zur Installation gehörenden
 Interpreter. Ein manuelles `git pull` ersetzt diesen Weg nicht.
 
-Für den einmaligen Wechsel von 5.3.2b auf 5.4.1a gilt eine engere
+Für den einmaligen Wechsel von 5.3.2b auf 5.4.1b gilt eine engere
 Startbedingung: ausschließlich Web-Update oder der direkte
 `sudo /usr/bin/python3 installer_main.py --update-e3dc`-Aufruf aus
 [Update.md](Update.md). Der interaktive Menüpunkt lädt im 5.3.2b-Altprozess

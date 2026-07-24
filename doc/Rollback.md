@@ -14,7 +14,7 @@ test -f "$E3DC_INSTALL_PATH/e3dc-setup"
 
 ## Programmstand zurücksetzen
 
-`v5.4.1a` bietet den öffentlichen Rollback-Root `v5.3.2b` ausschließlich als
+`v5.4.1b` bietet den öffentlichen Rollback-Root `v5.3.2b` ausschließlich als
 Docker-Image an. Dieser Root enthält keinen älteren öffentlichen Tag. Auf Bare
 Metal wird er nicht als Programm-Rückfall angeboten, weil ihm der
 zielgebundene Release-Finalizer des aktuellen Transaktionsvertrags fehlt.

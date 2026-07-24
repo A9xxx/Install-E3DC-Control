@@ -303,7 +303,7 @@ Writer-/Aktor-Dienste gestoppt.
 
 ## Gezielter Rückfall
 
-`v5.4.1a` bietet den bereinigten Root `v5.3.2b` ausschließlich als
+`v5.4.1b` bietet den bereinigten Root `v5.3.2b` ausschließlich als
 Docker-Rückfall-Image an. Dieser Root gibt selbst keinen älteren öffentlichen
 Tag frei. Auf Bare Metal wird `v5.3.2b` nicht als Programm-Rückfall angeboten,
 weil der Altstand keinen zielgebundenen Release-Finalizer enthält. Freie

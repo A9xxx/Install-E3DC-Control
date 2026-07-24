@@ -1,9 +1,9 @@
 {
-  "version": "5.4.1a",
+  "version": "5.4.1b",
   "min_version": "4.0.0",
-  "stable_release": "v5.4.1a",
+  "stable_release": "v5.4.1b",
   "release_date": "2026-07-24",
-  "description": "v5.4.1a - Wartungsrelease für Update, Backup und Erstinstallation",
+  "description": "v5.4.1b - Docker-Workflow-Korrektur für vollständige Release-Historie",
   "installer_requires": "python3",
   "sanitized_republication": false,
   "history_transition": {

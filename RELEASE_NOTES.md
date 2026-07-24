@@ -1,8 +1,22 @@
-# E3DC-Control v5.4.1a
+# E3DC-Control v5.4.1b
 
-E3DC-Control 5.4.1a ist ein eng begrenztes Wartungsrelease für Update,
-Backup und Erstinstallation. Speicher-, Wallbox-, Wärme- und
-Direktvermarktungsregelung entsprechen unverändert 5.4.1.
+E3DC-Control 5.4.1b korrigiert ausschließlich das vorgelagerte
+Docker-Release-Gate. Der Workflow lädt für die Prüfung der vollständigen
+Release-Abstammung nun die gesamte Git-Historie statt einer mit jedem Release
+zu klein werdenden festen Commit-Tiefe. Produktbytes und Regelung entsprechen
+5.4.1a.
+
+## Docker-Release
+
+- Der Topologieprüfer kann den parentlosen Veröffentlichungs-Root unabhängig
+  von der Anzahl späterer Wartungsreleases sicher erreichen.
+- Das Gate bleibt fail-closed: Commit, Tree, Version, Noreply-Identität,
+  vollständige Abstammung und Quellenmanifest müssen weiterhin exakt passen.
+- Der fehlgeschlagene erste Docker-Lauf für 5.4.1a endete vor Build, SBOM,
+  Provenance und Tag-Promotion. Es wurde kein unvollständiges Image
+  veröffentlicht.
+
+## Änderungen aus 5.4.1a
 
 ## Web-Update
 
@@ -75,8 +89,8 @@ einem erfolgreichen Pull:
 )
 ```
 
-Ein fester Eintrag `E3DC_IMAGE_TAG` bleibt absichtlich fest. Für v5.4.1a
-lautet der Pin `E3DC_IMAGE_TAG=v5.4.1a`; ohne Pin folgt die Compose-Datei dem
+Ein fester Eintrag `E3DC_IMAGE_TAG` bleibt absichtlich fest. Für v5.4.1b
+lautet der Pin `E3DC_IMAGE_TAG=v5.4.1b`; ohne Pin folgt die Compose-Datei dem
 erst nach erfolgreicher Attestierungsprüfung gesetzten Stable-Tag `latest`.
 
 Der öffentliche Docker-Rückfallstand bleibt `v5.3.2b`. Dieser Stand ist nicht

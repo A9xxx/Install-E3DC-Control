@@ -115,7 +115,7 @@ $paths = getInstallPaths();
     <div class="container">
         <div class="d-flex justify-content-between align-items-center mb-4">
             <a href="index.php" class="nav-link-back"><i class="fas fa-arrow-left me-2"></i>Dashboard</a>
-            <span class="badge bg-success text-light">v5.4.1c Stable</span>
+            <span class="badge bg-success text-light">v5.4.1d Stable</span>
         </div>
         <h1 class="display-4 fw-bold">Hilfe & Support</h1>
         <p class="lead opacity-75">Häufige Fragen und Lösungen rund um E3DC-Control.</p>
@@ -134,7 +134,7 @@ $paths = getInstallPaths();
         <div class="col-12 faq-item" data-tags="docker image stable rollback update">
             <div class="card bg-card border-0 shadow-sm"><div class="card-body">
                 <h5 class="card-title"><span class="tag">Docker</span> Wie prüfe ich Image und Update?</h5>
-                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem geprüften Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.1c</code> in <code>.env</code> gesetzt.</p>
+                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem geprüften Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.1d</code> in <code>.env</code> gesetzt.</p>
                 <pre>(
   set -euo pipefail
   docker compose config --images
@@ -211,21 +211,20 @@ $paths = getInstallPaths();
             </div>
         </div>
 
-        <h4 class="mb-4 text-accent"><i class="fas fa-screwdriver-wrench me-2"></i>Stable 5.4.1c: Update- und Installationswartung</h4>
-        <div class="col-12 faq-item" data-tags="5.4.1c stable docker oci update backup ml lock erstinstallation bootstrap wetterladung open meteo">
+        <h4 class="mb-4 text-accent"><i class="fas fa-screwdriver-wrench me-2"></i>Stable 5.4.1d: Klima-, Update- und Vitals-Wartung</h4>
+        <div class="col-12 faq-item" data-tags="5.4.1d stable docker klima shelly update backup ml lock batterie vitals dcb int32">
             <div class="card bg-card border-0 shadow-sm">
                 <div class="card-body">
                     <h5 class="card-title">
-                        <span class="tag">5.4.1c</span>
-                        Was korrigiert das Wartungsrelease 5.4.1c?
+                        <span class="tag">5.4.1d</span>
+Was korrigiert das Stable-Release 5.4.1d?
                     </h5>
                     <ul>
-                        <li><strong>OCI-Verifier:</strong> Die exakt gebundene Releaseversion wird streng syntaktisch geprüft, ohne eine bei jedem Wartungsrelease manuell zu erweiternde Versionsliste.</li>
-                        <li><strong>Docker-Veröffentlichung:</strong> Das vorgelagerte Release-Gate lädt die vollständige Git-Historie, damit der parentlose Veröffentlichungs-Root auch nach weiteren Wartungsreleases sicher geprüft werden kann.</li>
-                        <li><strong>Web-Update:</strong> Exitcode und kanonischer Installer-Erfolgsmarker werden gemeinsam ausgewertet. Ein erfolgreicher Wechsel erscheint nicht mehr als unklarer Fehler.</li>
-                        <li><strong>ML-Backup:</strong> Sichere Altbestände der privaten Sperrdatei können ohne Änderung von Modell oder Manifest normalisiert werden; unsichere Pfade, Links oder belegte Locks bleiben gesperrt.</li>
-                        <li><strong>Erstinstallation:</strong> <code>e3dc-setup</code> erzeugt keine unvollständige Release-Bootstrap-Bindung mehr. Der strenge SHA-gebundene Releasepfad bleibt unverändert.</li>
-                        <li><strong>Geräteeinstellungen:</strong> Bei geführter E3DC-Control-Ladekurve sollte die E3/DC-Wetterladung aus sein. Open-Meteo und die konfigurierten Dachflächen bleiben davon unabhängig aktiv.</li>
+                        <li><strong>Klima im Docker:</strong> Der read-only Messworker läuft genau einmal und übernimmt Aktivierung, Deaktivierung sowie Shelly-Kanalwechsel im nächsten Abfragezyklus. Bei <code>Aus</code> erfolgen weder Shelly-Abfrage noch neue Verlaufseinträge.</li>
+                        <li><strong>ML-Backup:</strong> Der laufende Updater kann vor dem Backup ausschließlich einen eindeutig sicheren und unbelegten Alt-Lock auf den Installationsbenutzer und Modus <code>0600</code> normalisieren. Modell, Manifest und Lockinhalt bleiben unverändert.</li>
+                        <li><strong>Bereits blockierte Altstände:</strong> Updater bis einschließlich 5.4.1c benötigen bei der exakten Meldung <code>Unsicherer privater ML-Eintrag: .ml_model.lock</code> einmalig den dokumentierten Metadaten-Feldfix. Die Sperrdatei darf nicht gelöscht werden.</li>
+                        <li><strong>Batterie-Vitals:</strong> Ein bestätigter DCB-Packindex darf als <code>Uint16</code> oder <code>Int32</code> zurückkommen. Negative, nichtnumerische oder vom angeforderten Pack abweichende Werte bleiben gesperrt.</li>
+                        <li><strong>Releaseumfang:</strong> Speicher-, Wallbox-, Wärme- und Direktvermarktungsentscheidungen entsprechen unverändert 5.4.1c.</li>
                     </ul>
                 </div>
             </div>
@@ -612,6 +611,7 @@ WB1 hat Ladevorgang physisch abgebrochen (Versuch 1/3)!</pre>
                 </div>
                 <div class="faq-answer">
                     <p>Optionale Dienste wie <strong>Heizstab</strong>, <strong>Shelly Pro3EM</strong>, <strong>IDM/Luxtronik/Stiebel/Dimplex W&auml;rmepumpe</strong> oder <strong>Wallbox Manager</strong> werden im Docker nur einmalig beim Container-Start durch <code>entrypoint.sh</code> gestartet. Die Aktivierung erfolgt in zwei Schritten:</p>
+                    <p><strong>Ausnahme Klimaverbrauchsmessung ab 5.4.1d:</strong> Der read-only Worker l&auml;uft bereits und liest Aktivierung, Deaktivierung sowie den gew&auml;hlten Shelly-Kanal in jedem Zyklus neu. Daf&uuml;r ist kein Container-Neustart erforderlich. Eine aktive Klimasteuerung ist davon nicht umfasst.</p>
                     <ol>
                         <li><strong>Konfigurations-Editor:</strong> Im passenden Bereich die sichtbaren Schalter und Auswahlfelder setzen und speichern:
                             <ul>
@@ -628,7 +628,7 @@ WB1 hat Ladevorgang physisch abgebrochen (Versuch 1/3)!</pre>
                     </ol>
                     <p>Die internen Config-Keys sind nur noch f&uuml;r Diagnose und Support interessant. Im normalen Betrieb reicht die Frontend-Auswahl plus anschlie&szlig;ender Container-Neustart.</p>
                     <p>Nach Updates bitte nicht nur neu starten, sondern auch das Image ziehen: <code>docker compose pull && docker compose up -d --force-recreate</code>.</p>
-                    <p>Das gilt f&uuml;r <strong>alle</strong> optionalen Dienste im Docker &mdash; Wallbox Manager, Bluelink, HA-Manager etc.</p>
+                    <p>Das gilt f&uuml;r die &uuml;brigen optionalen Dienste im Docker &mdash; Wallbox Manager, Bluelink, HA-Manager etc.</p>
                 </div>
             </div>
         </div>
@@ -902,7 +902,7 @@ journalctl -u e3dc-live -n 80 --no-pager</pre>
                         <li>Über das Dashboard (Kachel Konfiguration -> "Update suchen").</li>
                         <li>Bei aktuellen Ständen direkt über den Menüpunkt <em>Update</em> im Installer.</li>
                     </ol>
-                    <p><strong>Einmalige Ausnahme für 5.3.2b:</strong> Den ersten Wechsel auf 5.4.1c ausschließlich über den Web-Update-Button oder per SSH mit <code>sudo /usr/bin/python3 installer_main.py --update-e3dc</code> starten. Der interaktive Menüpunkt ist für diesen Hybridwechsel nicht freigegeben, weil der 5.3.2b-Altprozess bereits zusätzliche Module geladen hat.</p>
+                    <p><strong>Einmalige Ausnahme für 5.3.2b:</strong> Den ersten Wechsel auf 5.4.1d ausschließlich über den Web-Update-Button oder per SSH mit <code>sudo /usr/bin/python3 installer_main.py --update-e3dc</code> starten. Der interaktive Menüpunkt ist für diesen Hybridwechsel nicht freigegeben, weil der 5.3.2b-Altprozess bereits zusätzliche Module geladen hat.</p>
                     <p>Verwenden Sie für den einmaligen Wechsel auf die bereinigte Historie keinen manuellen <code>git pull --ff-only</code>-Ablauf. Der Installer erstellt und prüft zuerst das externe Backup und validiert anschließend Zielstand, Dienste und Weboberfläche.</p>
                     Updates werden im Changelog oben rechts im Dashboard signalisiert.
                 </div>

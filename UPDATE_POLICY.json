@@ -1,9 +1,9 @@
 {
-  "version": "5.4.1c",
+  "version": "5.4.1d",
   "min_version": "4.0.0",
-  "stable_release": "v5.4.1c",
-  "release_date": "2026-07-24",
-  "description": "v5.4.1c - Zukunftssichere OCI-Releaseversionsprüfung",
+  "stable_release": "v5.4.1d",
+  "release_date": "2026-07-25",
+  "description": "v5.4.1d - Klima-, Update- und Batterie-Vitals-Wartung",
   "installer_requires": "python3",
   "sanitized_republication": false,
   "history_transition": {

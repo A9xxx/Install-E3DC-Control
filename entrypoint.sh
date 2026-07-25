@@ -258,6 +258,11 @@ fi
 # WebSocket Server (immer)
 nohup $PYTHON_EXEC e3dc_websocket.py > /var/www/html/logs/e3dc_websocket.log 2>&1 &
 
+# Klimaanlage Live (read-only)
+# Der Worker prüft Aktivierung und Konfiguration in jedem Zyklus fail-closed.
+echo "   -> Klimaanlagen-Monitor (read-only) aktiv."
+nohup $PYTHON_EXEC climate_live.py > /var/www/html/logs/climate_live.log 2>&1 &
+
 # Energy Manager (Lademanagement ODER Wärmepumpe)
 AUTO_MODE=$(get_v4_val "auto_mode")
 LUXTRONIK=$(get_v4_val "luxtronik")

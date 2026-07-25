@@ -6,6 +6,26 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.1d] – 2026-07-25
+
+### 🌡️ Klima
+
+- 🐛 **Docker-Messdienst:** Der read-only Klimamonitor startet im Container genau einmal und übernimmt Aktivierung, Deaktivierung sowie Kanalwechsel beim nächsten Abfragezyklus. Ein deaktivierter Klimaverbraucher fragt keinen Shelly ab und schreibt keine Verlaufshistorie.
+
+### 📦 Update und Backup
+
+- 🛡️ **ML-Sperrdatei:** Der laufende Updater kann vor dem verifizierten Backup ausschließlich einen eindeutig regulären, unverlinkten, größenbegrenzten und unbelegten Alt-Lock auf den gebundenen Installationsbenutzer und Modus `0600` normalisieren. Modell, Manifest und Lockinhalt bleiben unverändert; Symlinks, Hardlinks, fremde Eigentümer, Übergröße und belegte Locks brechen weiterhin hart ab.
+- 🔎 **Alt-Updater:** Stände bis einschließlich 5.4.1c prüfen das Backup noch mit ihrem alten Code. Wenn sie bereits an `.ml_model.lock` abbrechen, benötigen sie einmalig den dokumentierten Metadaten-Feldfix; die Datei darf nicht gelöscht werden.
+
+### 🔋 Batterie-Vitals
+
+- 🐛 **Packindex:** E3/DC-Systeme, die `BAT_DCB_INDEX` als signierten RSCP-`Int32` statt als `Uint16` zurückgeben, zeigen ihre einzelnen Batteriepacks wieder an. Nur nichtnegative Ganzzahlen im zulässigen Bereich und exakt passend zum angeforderten Pack werden akzeptiert.
+
+### 🧭 Releaseumfang
+
+- 🧹 **Browser-Cache:** Der Service-Worker verwendet die 5.4.1d-Kennung, damit alte statische Cache-Namensräume beim Releasewechsel eindeutig verworfen werden.
+- 🛡️ **Keine Regelungsänderung:** Speicher-, Wallbox-, Wärme- und Direktvermarktungsentscheidungen bleiben gegenüber 5.4.1c unverändert.
+
 ## [5.4.1c] – 2026-07-24
 
 ### 🐳 OCI-Verifikation

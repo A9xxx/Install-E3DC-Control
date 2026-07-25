@@ -1495,12 +1495,12 @@ def fetch_battery_vitals(host: str, port: int, portal_user: str,
                 if response_dcb_index_item is not None:
                     response_dcb_index = response_dcb_index_item.get('value')
                     if (
-                        response_dcb_index_item.get('type') != RscpType.Uint16
+                        response_dcb_index_item.get('type') not in (RscpType.Uint16, RscpType.Int32)
                         or type(response_dcb_index) is not int
                         or not 0 <= response_dcb_index <= 65535
                         or response_dcb_index != dcb_idx
                     ):
-                        # Ein falsch typisierter oder abweichender Antwortindex
+                        # Ein nicht belegter oder abweichender Antwortindex
                         # darf niemals unter dem angeforderten Packindex
                         # angezeigt werden.
                         continue

@@ -72,12 +72,15 @@ gebundene Benutzer-venv bereits vorhanden sein. Andernfalls bricht der
 Altprozess ab und stellt den Ausgangszustand wieder her. Abweichende oder
 mehrdeutige venv-Pfade brechen den Updatevorgang ebenfalls ab.
 
-## Einmalige ML-Lock-Reparatur für 5.4.0e und 5.4.1
+## Einmalige ML-Lock-Reparatur für Alt-Updater bis 5.4.1c
 
 Diese Reparatur ist ausschließlich für einen Updateabbruch mit der exakten
-Meldung `Unsicherer privater ML-Eintrag: .ml_model.lock` vorgesehen. Der alte
-Updater prüft das Backup, bevor er die neuen Releasebytes lädt, und kann diese
-Kante deshalb nicht selbst reparieren.
+Meldung `Unsicherer privater ML-Eintrag: .ml_model.lock` vorgesehen. Updater
+bis einschließlich 5.4.1c prüfen das Backup, bevor sie die neuen Releasebytes
+laden, und können diese Kante deshalb nicht selbst reparieren. Ab einem
+erfolgreich installierten 5.4.1d-Stand normalisiert der Updater ausschließlich
+einen eindeutig sicheren und unbelegten Alt-Lock selbst; alle anderen Fälle
+bleiben fail-closed.
 
 Der folgende Block muss in der SSH-Sitzung des normalen
 Installationsbenutzers ausgeführt werden, nicht aus einer direkten Root-Shell.
@@ -182,6 +185,25 @@ try:
             time.sleep(0.1)
 
     before = os.fstat(lock_fd)
+    try:
+        path_locked = os.stat(
+            lock_name,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        stop("ML-Sperrdatei wurde während der Sperrprüfung entfernt")
+
+    if (
+        (path_locked.st_dev, path_locked.st_ino)
+        != (before.st_dev, before.st_ino)
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+        or before.st_size > 64 * 1024
+        or before.st_uid not in {0, account.pw_uid}
+    ):
+        stop("ML-Sperrdatei ist nach der Sperrprüfung nicht sicher normalisierbar")
+
     os.fchown(lock_fd, account.pw_uid, store_info.st_gid)
     os.fchmod(lock_fd, 0o600)
     os.fsync(lock_fd)
@@ -303,7 +325,7 @@ Writer-/Aktor-Dienste gestoppt.
 
 ## Gezielter Rückfall
 
-`v5.4.1c` bietet den bereinigten Root `v5.3.2b` ausschließlich als
+`v5.4.1d` bietet den bereinigten Root `v5.3.2b` ausschließlich als
 Docker-Rückfall-Image an. Dieser Root gibt selbst keinen älteren öffentlichen
 Tag frei. Auf Bare Metal wird `v5.3.2b` nicht als Programm-Rückfall angeboten,
 weil der Altstand keinen zielgebundenen Release-Finalizer enthält. Freie

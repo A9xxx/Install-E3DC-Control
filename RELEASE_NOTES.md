@@ -1,85 +1,71 @@
-# E3DC-Control v5.4.1c
+# E3DC-Control v5.4.1d
 
-E3DC-Control 5.4.1c korrigiert ausschließlich den semantischen
-OCI-Release-Verifier. Die erwartete, bereits durch Workflow, Tag, `VERSION`,
-Commit und Tree gebundene Releaseversion wird nun streng syntaktisch geprüft,
-statt zusätzlich in einer bei jedem Release manuell zu erweiternden Liste zu
-stehen. Produktbytes und Regelung entsprechen unverändert 5.4.1a.
+E3DC-Control 5.4.1d ist ein eng begrenztes Wartungsrelease für
+Klimaverbrauchsmessung, Update/Backup und Batterie-Vitals. Speicher-,
+Wallbox-, Wärme- und Direktvermarktungsentscheidungen entsprechen unverändert
+5.4.1c.
 
-## Docker-Release
+Der Service-Worker trägt ebenfalls die 5.4.1d-Kennung. Browser verwerfen damit
+den alten statischen Cache-Namensraum beim Releasewechsel eindeutig; an der
+Frontend- oder DV-Logik wird dabei nichts geändert.
 
-- Der Topologieprüfer lädt weiterhin die vollständige Historie und bindet den
-  parentlosen Veröffentlichungs-Root.
-- Der OCI-Verifier akzeptiert die vom Workflow exakt gebundene 5.4.1c-Version
-  und weist leere, mehrteilige, großgeschriebene oder anderweitig unzulässige
-  Versionsformen weiterhin zurück.
-- Das Gate bleibt fail-closed: Commit, Tree, Version, Noreply-Identität,
-  vollständige Abstammung und Quellenmanifest müssen weiterhin exakt passen.
-- Der 5.4.1b-Lauf erzeugte einen vollständigen temporären Multiarch-Kandidaten
-  samt SBOM und Provenance, endete aber vor Stable-Tag-Promotion an der
-  veralteten Versionsliste.
+## Klima im Docker-Container
 
-## Änderungen aus 5.4.1a und 5.4.1b
+- Der read-only Worker `climate_live.py` startet im Container genau einmal.
+- Aktivierung, Deaktivierung und Shelly-Kanalwechsel werden in jedem
+  Abfragezyklus erneut aus der Konfiguration gelesen; dafür ist kein
+  Containerneustart erforderlich.
+- `climate_enable=0` bleibt fail-closed: keine Shelly-Abfrage, keine
+  Klimasteuerung und keine neue Verlaufshistorie.
+- Bestehende Klimahistorien werden beim Deaktivieren weder gelöscht noch
+  verändert.
 
-## Web-Update
+## ML-Lock und verifiziertes Backup
 
-- Der Web-Updater erhält neben dem Log einen strukturierten Exitcode und
-  Abschlussstatus.
-- Der kanonische Installer-Marker
-  `[OK] self-update auf <Commit-SHA> abgeschlossen.` bleibt als
-  Kompatibilitätsbeleg erhalten.
-- Ein laufender Prozess, ein Fehlertext oder ein von null verschiedener
-  Exitcode kann nicht als Erfolg erscheinen.
-- Nach Prozessende wartet die Oberfläche kurz auf die letzte Status- und
-  Logpublikation, statt vorschnell einen unklaren Fehler auszugeben.
+- Vor dem Backup prüft der Updater den privaten ML-Store weiterhin vollständig,
+  ohne ein Modell zu deserialisieren.
+- Ausschließlich ein regulärer, unverlinkter, höchstens 64 KiB großer,
+  aktuell unbelegter Alt-Lock mit gebundenem oder historischem Root-Eigentümer
+  darf auf Installationsbenutzer, Store-Gruppe und Modus `0600` normalisiert
+  werden.
+- Inode, Pfad, Größe und Lockzustand werden vor und nach der
+  Metadatenkorrektur erneut gebunden. Lockinhalt, Modell und Manifest bleiben
+  unverändert.
+- Symlinks, Hardlinks, fremde Eigentümer, Übergröße, unbekannte private
+  Einträge und belegte Locks brechen den Updatepfad weiterhin hart ab.
 
-## ML-Backup
+### Wichtig für bereits blockierte Alt-Updater
 
-- Eine neu erzeugte `.ml_model.lock` erhält unmittelbar den gebundenen
-  Installationsbenutzer und Modus `0600`.
-- Die Rechteprüfung kann ausschließlich einen regulären, unverlinkten,
-  größenbegrenzten und aktuell nicht belegten Alt-Lock normalisieren.
-- Symlinks, Sonderdateien, Hardlinks, fremde Eigentümer, Übergröße und ein
-  belegter Lock bleiben ohne Änderung gesperrt.
-- Modell- und Manifestbytes werden vor der Reparatur vollständig validiert,
-  aber weder deserialisiert noch verändert.
-- Ein bereits durch diesen Altbestand blockierter 5.4.0e-/5.4.1-Updater kann
-  den neuen Code nicht selbst erreichen, weil er sein Backup vorher prüft.
-  Dafür gilt einmalig die eng begrenzte SSH-Feldreparatur aus der
-  Update-Anleitung.
+Stände bis einschließlich 5.4.1c erstellen und prüfen das Backup noch mit
+ihrem bereits installierten Code, bevor sie 5.4.1d laden. Wenn ein solcher
+Updater mit
 
-## Frische Erstinstallation
+`Unsicherer privater ML-Eintrag: .ml_model.lock`
 
-- Der normale Einstieg `e3dc-setup` entfernt fremde oder unvollständige
-  Release-Bootstrap-Variablen.
-- Er übergibt ausschließlich den tatsächlichen Installationsbenutzer an den
-  privilegierten Installationsprozess.
-- Der echte Release-Bootstrap bleibt weiterhin an getrennten Runner- und
-  Zielbaum, annotierten Tag und vollständige Ziel-SHA gebunden.
-- Unvollständige, identische oder fremde Bootstrap-Bindungen bleiben
-  fail-closed.
+abbricht, ist deshalb einmalig der dokumentierte Metadaten-Feldfix aus
+`doc/Update.md` erforderlich. `.ml_model.lock`, Modell und Manifest dürfen
+nicht gelöscht oder umbenannt werden. Ab dem erfolgreich installierten
+5.4.1d-Stand kann der Updater einen eindeutig sicheren Alt-Lock selbst
+normalisieren.
 
-## Empfohlene E3/DC-Einstellungen
+## Batterie-Vitals
 
-- Die E3/DC-eigene Wetterladung sollte ausgeschaltet sein, wenn E3DC-Control
-  die Speicher-Ladekurve führt.
-- Open-Meteo und die Dachflächenprognose von E3DC-Control bleiben davon
-  unabhängig aktiv.
-- RSCP-Zugang, physische Notstromreserve sowie Netz-, Batterie- und
-  Wechselrichtergrenzen bleiben aktiv.
-- Pro Speicher beziehungsweise Wallbox darf nur ein Regler Hardwarebefehle
-  ausgeben.
-- E3/DC und Host benötigen eine gemeinsame korrekte Uhrzeit, Zeitzone und
-  NTP-Synchronisation.
+- Die Anfrage jedes DCB-Packs bleibt als `Uint16` indexiert.
+- Ein vom E3/DC zurückgegebener `BAT_DCB_INDEX` wird zusätzlich zum bisherigen
+  `Uint16` auch als RSCP-`Int32` akzeptiert.
+- Die Sicherheitsbindung bleibt unverändert streng: echter Ganzzahlwert,
+  Bereich `0…65535` und exakte Gleichheit mit dem angeforderten Packindex.
+- Negative, nichtnumerische, vertauschte oder anders typisierte Antworten
+  werden weiterhin verworfen und niemals unter einem falschen Pack angezeigt.
 
 ## Installation und Update
 
 Bare-Metal-Nutzer verwenden den Web- oder Konsolen-Updater. Ein bereits am
-ML-Lock gestoppter Altstand führt zuerst die ausdrücklich dokumentierte
-Feldreparatur aus und startet danach den normalen Updater erneut.
+ML-Lock gestoppter Altstand führt zuerst ausschließlich die dokumentierte
+Metadatenreparatur aus und startet danach den normalen Updater erneut.
 
-Docker-Nutzer prüfen das konfigurierte Image und recreaten ausschließlich nach
-einem erfolgreichen Pull:
+Docker-Nutzer prüfen das konfigurierte Image und recreaten erst nach einem
+erfolgreichen Pull:
 
 ```bash
 (
@@ -92,8 +78,8 @@ einem erfolgreichen Pull:
 )
 ```
 
-Ein fester Eintrag `E3DC_IMAGE_TAG` bleibt absichtlich fest. Für v5.4.1c
-lautet der Pin `E3DC_IMAGE_TAG=v5.4.1c`; ohne Pin folgt die Compose-Datei dem
+Ein fester Eintrag `E3DC_IMAGE_TAG` bleibt absichtlich fest. Für v5.4.1d
+lautet der Pin `E3DC_IMAGE_TAG=v5.4.1d`; ohne Pin folgt die Compose-Datei dem
 erst nach erfolgreicher Attestierungsprüfung gesetzten Stable-Tag `latest`.
 
 Der öffentliche Docker-Rückfallstand bleibt `v5.3.2b`. Dieser Stand ist nicht

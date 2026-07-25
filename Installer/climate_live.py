@@ -668,6 +668,8 @@ def update_daily_energy(status: dict[str, Any], baseline_file: Path = BASELINE_F
 
 
 def append_history(status: dict[str, Any], runtime_state: dict[str, Any], cfg: dict[str, Any], history_dir: Path = HISTORY_DIR) -> None:
+    if not cfg_bool(cfg, "climate_enable", False):
+        return
     if not cfg_bool(cfg, "climate_history_enable", True):
         return
     interval_s = _safe_int(cfg.get("climate_history_interval_s"), 60, min_value=15, max_value=3600)

@@ -7,7 +7,7 @@ on:
         description: "Exact approved release tag"
         required: true
         type: choice
-        options: [v5.3.2b, v5.4.0, v5.4.0a, v5.4.0b, v5.4.0c, v5.4.0d, v5.4.0e, v5.4.1, v5.4.1a, v5.4.1b, v5.4.1c]
+        options: [v5.3.2b, v5.4.0, v5.4.0a, v5.4.0b, v5.4.0c, v5.4.0d, v5.4.0e, v5.4.1, v5.4.1a, v5.4.1b, v5.4.1c, v5.4.1d]
       release_sha:
         description: "Approved 40-hex release commit"
         required: true
@@ -226,6 +226,31 @@ jobs:
             [ "$(git rev-parse HEAD~10)" = "$ROOT_SHA" ]
             [ "$(git rev-parse 'HEAD~10^{tree}')" = "$ROOT_TREE" ]
             [ "$(git rev-list --parents -n 1 "$ROOT_SHA" | awk '{print NF-1}')" -eq 0 ]
+          elif [ "$RELEASE_TAG" = "v5.4.1d" ]; then
+            [ "$(git rev-list --parents -n 1 HEAD | awk '{print NF-1}')" -eq 1 ]
+            [ "$(git rev-list --parents -n 1 HEAD^ | awk '{print NF-1}')" -eq 1 ]
+            [ "$(git rev-list --parents -n 1 HEAD^^ | awk '{print NF-1}')" -eq 1 ]
+            [ "$(git rev-list --parents -n 1 HEAD^^^ | awk '{print NF-1}')" -eq 1 ]
+            [ "$(git rev-list --parents -n 1 HEAD^^^^ | awk '{print NF-1}')" -eq 1 ]
+            [ "$(git rev-list --parents -n 1 HEAD~5 | awk '{print NF-1}')" -eq 1 ]
+            [ "$(git rev-list --parents -n 1 HEAD~6 | awk '{print NF-1}')" -eq 1 ]
+            [ "$(git rev-list --parents -n 1 HEAD~7 | awk '{print NF-1}')" -eq 1 ]
+            [ "$(git rev-list --parents -n 1 HEAD~8 | awk '{print NF-1}')" -eq 1 ]
+            [ "$(git rev-list --parents -n 1 HEAD~9 | awk '{print NF-1}')" -eq 1 ]
+            [ "$(git rev-list --parents -n 1 HEAD~10 | awk '{print NF-1}')" -eq 1 ]
+            [ "$(git rev-parse HEAD^)" = "80dbe96e2f708fd6150536600b28f377c8125927" ]
+            [ "$(git rev-parse HEAD^^)" = "c8881ae6469232a2a480daae8cd1c7f97be1d069" ]
+            [ "$(git rev-parse HEAD^^^)" = "d37ee0e5851ab56b8def2d0e63f97a807b300479" ]
+            [ "$(git rev-parse HEAD^^^^)" = "908464b640dfdae066e9022f56d994689df15eb3" ]
+            [ "$(git rev-parse HEAD~5)" = "f65fb584c7d01a721c41d863f59a140de49be8a1" ]
+            [ "$(git rev-parse HEAD~6)" = "2bad44d80ff24775d8f4e8ff0e99dd07aa516be0" ]
+            [ "$(git rev-parse HEAD~7)" = "a251ba9c346ec227c6ac4785945479fd25cb8839" ]
+            [ "$(git rev-parse HEAD~8)" = "6a1b24c7865b2bbc1c5d21d69b7c73553a0de78e" ]
+            [ "$(git rev-parse HEAD~9)" = "6e4660379c5fcc6849e6b76f49fc4bd727273aa5" ]
+            [ "$(git rev-parse HEAD~10)" = "59e5907d1b517cf04e60611ae6e7765c184b00f8" ]
+            [ "$(git rev-parse HEAD~11)" = "$ROOT_SHA" ]
+            [ "$(git rev-parse 'HEAD~11^{tree}')" = "$ROOT_TREE" ]
+            [ "$(git rev-list --parents -n 1 "$ROOT_SHA" | awk '{print NF-1}')" -eq 0 ]
           else
             exit 1
           fi
@@ -439,7 +464,7 @@ jobs:
           docker buildx imagetools create --tag "${image}:${version}" "${image}@${digest}"
           [ "$(docker buildx imagetools inspect "${image}:${RELEASE_TAG}" | awk '$1 == "Digest:" {print $2; exit}')" = "$digest" ]
           [ "$(docker buildx imagetools inspect "${image}:${version}" | awk '$1 == "Digest:" {print $2; exit}')" = "$digest" ]
-          if [ "$RELEASE_TAG" = "v5.4.1c" ]; then
+          if [ "$RELEASE_TAG" = "v5.4.1d" ]; then
             docker buildx imagetools create --tag "${image}:latest" "${image}@${digest}"
             [ "$(docker buildx imagetools inspect "${image}:latest" | awk '$1 == "Digest:" {print $2; exit}')" = "$digest" ]
           fi

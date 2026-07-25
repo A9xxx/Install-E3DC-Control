@@ -28,6 +28,7 @@ from .backup_integrity import (
     copy_persistent_sources,
     default_backup_root,
     finalize_backup,
+    normalize_private_ml_lock_metadata,
     restore_persistent_payload,
     secure_backup_tree,
     validate_private_ml_store,
@@ -45,6 +46,49 @@ SYSTEMD_UNIT_DIRS = (
     Path("/usr/lib/systemd/system"),
     Path("/lib/systemd/system"),
 )
+
+
+def _prepare_private_ml_store_for_backup(
+    model_root=PRIVATE_ML_ROOT,
+    *,
+    expected_uid=None,
+    expected_gid=None,
+):
+    """Normalisiert nur einen bereits als sicher reparierbar geprüften ML-Lock."""
+
+    if expected_uid is None or expected_gid is None:
+        install_uid, install_gid = get_user_ids()
+        expected_uid = install_uid if expected_uid is None else expected_uid
+        expected_gid = install_gid if expected_gid is None else expected_gid
+
+    preflight = validate_private_ml_store(
+        model_root,
+        expected_uid=int(expected_uid),
+        allow_missing=True,
+        allow_repairable_lock=True,
+    )
+    if preflight.get("repairable_lock"):
+        print("→ Normalisiere sicher gebundene ML-Sperrdatei vor dem Backup…")
+        result = normalize_private_ml_lock_metadata(
+            model_root,
+            expected_uid=int(expected_uid),
+            expected_gid=int(expected_gid),
+        )
+        if result.get("state") != "ready":
+            raise BackupIntegrityError(
+                "ML-Sperrdatei wurde vor dem Backup nicht eindeutig normalisiert"
+            )
+        backup_logger.info(
+            "Sicher gebundene ML-Sperrdatei vor dem Backup normalisiert "
+            "(Metadaten geaendert=%s).",
+            bool(result.get("changed")),
+        )
+
+    return validate_private_ml_store(
+        model_root,
+        expected_uid=int(expected_uid),
+        allow_missing=True,
+    )
 
 
 def _systemd_unit_paths():
@@ -229,7 +273,7 @@ def _backup_current_version_v2(install_path=None, preserve_backup_paths=None):
     try:
         # A legacy web Pickle is deliberately excluded above. A private model
         # is copied only after its non-executable manifest/hash contract passes.
-        validate_private_ml_store(PRIVATE_ML_ROOT, allow_missing=True)
+        _prepare_private_ml_store_for_backup(PRIVATE_ML_ROOT)
         backup_root = default_backup_root(active_install_path)
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
         backup_dir = backup_root / timestamp

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
 from typing import Any, Dict, Optional, Tuple
 
@@ -511,6 +512,18 @@ class BattCtrl:
             for value in (charge_w, discharge_w, discharge_start_w)
         ):
             return False
+        reconcile_time_s = time.time()
+        raw_readback_cycle_ts = snapshot.get("_ts")
+        readback_cycle_ts = (
+            float(raw_readback_cycle_ts)
+            if (
+                isinstance(raw_readback_cycle_ts, (int, float))
+                and not isinstance(raw_readback_cycle_ts, bool)
+                and math.isfinite(float(raw_readback_cycle_ts))
+                and float(raw_readback_cycle_ts) > 0.0
+            )
+            else reconcile_time_s
+        )
         readback = {
             "limits_used": limits_used,
             "max_charge_w": int(charge_w),
@@ -549,14 +562,14 @@ class BattCtrl:
                     "response_codes": response_codes,
                     "readback": readback,
                     "readback_source": "canonical_live",
-                    "readback_cycle_ts": snapshot.get("_ts"),
+                    "readback_cycle_ts": readback_cycle_ts,
                     "bounded_zero_w": bounded_zero_w,
                     "bounded_zero_equivalent": bool(
                         pending["limits_used"]
                         and int(pending["max_charge_w"]) == 0
                         and 0 < int(readback["max_charge_w"]) <= bounded_zero_w
                     ),
-                    "ts": int(time.time()),
+                    "ts": int(reconcile_time_s),
                 }
                 return True
             now_monotonic = time.monotonic()
@@ -569,9 +582,9 @@ class BattCtrl:
                     "requested": pending,
                     "readback": readback,
                     "readback_source": "canonical_live",
-                    "readback_cycle_ts": snapshot.get("_ts"),
+                    "readback_cycle_ts": readback_cycle_ts,
                     "bounded_zero_w": bounded_zero_w,
-                    "ts": int(time.time()),
+                    "ts": int(reconcile_time_s),
                 }
                 return False
             if self._settings_retry_after_monotonic <= 0.0:
@@ -584,10 +597,10 @@ class BattCtrl:
                 "requested": pending,
                 "readback": readback,
                 "readback_source": "canonical_live",
-                "readback_cycle_ts": snapshot.get("_ts"),
+                "readback_cycle_ts": readback_cycle_ts,
                 "bounded_zero_w": bounded_zero_w,
                 "pending_expired": True,
-                "ts": int(time.time()),
+                "ts": int(reconcile_time_s),
             }
             return False
         self._settings_limits_used = limits_used
@@ -605,8 +618,8 @@ class BattCtrl:
             "confirmed": True,
             "readback": readback,
             "readback_source": "canonical_live",
-            "readback_cycle_ts": snapshot.get("_ts"),
-            "ts": int(time.time()),
+            "readback_cycle_ts": readback_cycle_ts,
+            "ts": int(reconcile_time_s),
         }
         return True
 
@@ -634,8 +647,6 @@ class BattCtrl:
             now_monotonic = time.monotonic()
             if self._pending_target_matches(target, bounded_zero_w):
                 self._settings_suppressed += 1
-                if self._power_settings_diag.get("status") == "readback_mismatch":
-                    return False
                 if now_monotonic < self._settings_pending_deadline_monotonic:
                     pending_status = (
                         "pending_readback"
@@ -685,11 +696,26 @@ class BattCtrl:
             limits_used,
             bounded_zero_w,
         ):
+            # Ein gecachter Soll-/Readbackwert ist kein aktueller Beweis. Der
+            # Manager ruft vor jedem Ausgang reconcile_power_settings() auf;
+            # nur dessen frischer, typisierter Live-Readback darf einen
+            # unveränderten POWER_SETTINGS-Vertrag bestätigen.
+            if not self._settings_last_reconcile_fresh:
+                self._power_settings_diag = {
+                    **self._power_settings_diag,
+                    "status": "readback_stale",
+                    "confirmed": False,
+                    "requested": target,
+                    "ts": int(time.time()),
+                }
+                return False
             self._settings_suppressed += 1
             self._power_settings_diag = {
                 **self._power_settings_diag,
                 "status": "confirmed_unchanged",
                 "confirmed": True,
+                "requested": target,
+                "bounded_zero_w": bounded_zero_w,
                 "ts": int(time.time()),
             }
             return True

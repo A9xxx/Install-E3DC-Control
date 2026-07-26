@@ -45,6 +45,7 @@ RUN pip3 install --upgrade pip wheel setuptools && \
 
 # 4. Verzeichnisse und statische Konfiguration
 RUN mkdir -p /app/pi/Install /var/www/html/tmp /var/www/html/logs /var/www/html/data /var/www/html/ramdisk && \
+    install -d -o root -g root -m 0700 /var/lib/e3dc-control/forecast-evidence && \
     chown -R www-data:www-data /var/www/html
 
 # Pfad-Konfiguration für PHP (statisch, kennt die Container-Struktur)

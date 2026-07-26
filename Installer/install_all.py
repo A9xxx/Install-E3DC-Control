@@ -49,11 +49,16 @@ def restart_apache():
         return False
 
 
-def install_all_main(headless=False):
+def install_all_main(headless=False, *, bind_first_install_role=False):
     """Komplette Installation mit korrekter Reihenfolge."""
     # Muss ganz am Anfang laufen: frische Installationen mit nicht-pi-Usern
     # brauchen e3dc_v4.json/e3dc_paths.json, bevor PHP/Install-Center laden.
-    ensure_web_config(get_install_user())
+    if ensure_web_config(
+        get_install_user(),
+        bind_first_install_role=bind_first_install_role,
+    ) is False:
+        print("✗ Die V4-Startkonfiguration konnte nicht sicher angelegt werden.")
+        return False
     install_path = get_install_path()
 
     # Cache-Bereinigung vor allen Operationen
@@ -267,11 +272,15 @@ def install_all_main(headless=False):
                     run_command(f"sudo cp '{policy_file}' /var/www/html/UPDATE_POLICY.json")
             else:
                 print(f"  [!] Fehler beim Kopieren des Web-Portals: {res['stderr']}")
+                return False
         else:
             print(f"  [!] Web-Portal Verzeichnis (html/) nicht gefunden ab: {installer_dir}. Uebersprungen.")
-            
+            return False
+
         if not restart_apache():
             log_warning("install_all", "Apache-Neustart nach Webportal-Installation fehlgeschlagen.")
+            return False
+        return True
 
     if not safe_execute_task("SCHRITT 3/11: Webportal einrichten", install_webportal_and_restart_apache):
         failed_steps.append("Webportal")
@@ -295,9 +304,11 @@ def install_all_main(headless=False):
             except Exception as e:
                 log_error("install_all", f"Fehler beim Kopieren der Config: {e}", e)
                 print(f"✗ Fehler beim Kopieren: {e}")
-                create_e3dc_config(headless=headless) # Fallback
+                if create_e3dc_config(headless=headless) is False:
+                    return False
         else:
-            create_e3dc_config(headless=headless)
+            if create_e3dc_config(headless=headless) is False:
+                return False
             
         # Erstelle leere wallbox.txt nur im Legacy-Modus (wb_native_enable=0)
         # Im Native-Python-Modus wird wallbox.txt NICHT benötigt und darf von Python nicht beschrieben werden!
@@ -323,8 +334,10 @@ def install_all_main(headless=False):
                     print(f"  [OK] Wallbox-Datei erstellt (Legacy): {wallbox_file}")
                 except Exception as e:
                     print(f"  [!] Wallbox-Datei konnte nicht erstellt werden: {e}")
+                    return False
         else:
             print("  [OK] Native Wallbox-Regelung aktiv -- wallbox.txt wird nicht erstellt.")
+        return True
 
     if not safe_execute_task("SCHRITT 4/11: E3DC-Konfiguration erstellen", create_configs_task):
         failed_steps.append("Konfiguration")
@@ -383,10 +396,11 @@ def install_all_main(headless=False):
     if choice_epex != "n":
         if not safe_execute_task("EPEX Manager Service installieren", install_epex_service):
             failed_steps.append("EPEX Manager")
-        
+
         # In Zero-Touch mode we also install websocket
         from .utils import setup_websocket_service
-        safe_execute_task("Websocket Service installieren", setup_websocket_service)
+        if not safe_execute_task("Websocket Service installieren", setup_websocket_service):
+            failed_steps.append("Websocket")
     else:
         print("-> Uebersprungen.\n")
 
@@ -400,7 +414,11 @@ def install_all_main(headless=False):
     choice_wb = ("j" if wb_exists else "n") if headless else input("Native Wallbox Steuerung aktivieren? (j/n) [j]: ").strip().lower()
     if choice_wb != "n":
         from .install_native_wallbox import setup_wallbox_service
-        safe_execute_task("Wallbox Manager installieren", lambda: setup_wallbox_service(headless=headless))
+        if not safe_execute_task(
+            "Wallbox Manager installieren",
+            lambda: setup_wallbox_service(headless=headless),
+        ):
+            failed_steps.append("Wallbox Manager")
     else:
         print("-> Uebersprungen.\n")
 
@@ -419,12 +437,31 @@ def install_all_main(headless=False):
     print("=" * 60)
     try:
         print("\n→ Führe umfassende Prüfung und Einrichtung des Systems aus…\n")
-        run_permissions_wizard(headless=True)
-        log_task_completed("Finale Prüfung & Einrichtung", details="run_permissions_wizard(headless=True) ausgeführt.")
+        permissions_ok = run_permissions_wizard(headless=True)
+        if permissions_ok is False:
+            print("✗ Die finale Rechte- und Dienstprüfung meldet einen Fehler.\n")
+            failed_steps.append("Finale Prüfung")
+        else:
+            log_task_completed(
+                "Finale Prüfung & Einrichtung",
+                details="run_permissions_wizard(headless=True) erfolgreich ausgeführt.",
+            )
     except Exception as e:
         log_error("install_all", f"Fehler bei der finalen Prüfung: {e}", e)
         print(f"✗ Kritischer Fehler bei der finalen Prüfung und Einrichtung: {e}\n")
         failed_steps.append("Finale Prüfung")
+
+    # Der Abschluss darf erst erfolgreich sein, wenn der reale Produktzustand
+    # vollständig ist. Einzelne vorhandene Units oder Webdateien genügen nicht.
+    try:
+        from .update import classify_installation_state
+
+        final_state, final_detail = classify_installation_state()
+    except Exception as exc:
+        final_state, final_detail = "blocked", f"Endzustand nicht prüfbar: {exc}"
+    if final_state != "ready":
+        failed_steps.append("Installations-Endzustand")
+        print(f"✗ Installations-Endzustand ist nicht vollständig: {final_detail}\n")
 
     # =========================================================
     # Abschluss + Fehlersammlung
@@ -440,6 +477,13 @@ def install_all_main(headless=False):
     print("     → Öffne das Webportal und navigiere zu 'Service Management', um alle Dienste zu sehen.\n")
     print("  3. Dokumentation:")
     print("     → Weitere Infos findest du im Ordner 'Install/doc' (z.B. zu Watchdog, Venv).\n")
+
+    if failed_steps:
+        unique_failed_steps = list(dict.fromkeys(failed_steps))
+        print("✗ Installation nicht vollständig abgeschlossen.")
+        print("  Fehlgeschlagene oder unvollständige Schritte: " + ", ".join(unique_failed_steps))
+        return False
+    return True
 
 
 register_command("18", "Alles installieren - E3DC-Control Komplett-Setup (Empfohlen)", install_all_main, sort_order=10)

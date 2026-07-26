@@ -1,68 +1,182 @@
-# E3DC-Control v5.4.1d
+# E3DC-Control v5.4.2
 
-E3DC-Control 5.4.1d ist ein eng begrenztes Wartungsrelease für
-Klimaverbrauchsmessung, Update/Backup und Batterie-Vitals. Speicher-,
-Wallbox-, Wärme- und Direktvermarktungsentscheidungen entsprechen unverändert
-5.4.1c.
+E3DC-Control 5.4.2 ist ein Funktions- und Stabilitätsrelease für
+Speicherplanung, Direktvermarktung, Lastspitzenbegrenzung, Installation und
+PV-Prognosediagnose. Schutzgrenzen, Nutzer-`Aus`, Notstromreserve,
+Hardwarelimits, Datenfrische und die Ein-Entscheider-Regel bleiben vorrangig.
 
-Der Service-Worker trägt ebenfalls die 5.4.1d-Kennung. Browser verwerfen damit
-den alten statischen Cache-Namensraum beim Releasewechsel eindeutig; an der
-Frontend- oder DV-Logik wird dabei nichts geändert.
+Die neuen Funktionen **E3/DC-PV-Ladebegrenzung**, **Peak Shaving am
+Netzbezug**, **Netz-Nachladung des Lastspitzenpuffers** und
+**PV-Prognosediagnose** sind standardmäßig ausgeschaltet. Ein Update aktiviert
+sie nicht stillschweigend.
 
-## Klima im Docker-Container
+## Speicherplanung und Direktvermarktung
 
-- Der read-only Worker `climate_live.py` startet im Container genau einmal.
-- Aktivierung, Deaktivierung und Shelly-Kanalwechsel werden in jedem
-  Abfragezyklus erneut aus der Konfiguration gelesen; dafür ist kein
+- Der Direktvermarktungsplan deckt den Tag durchgehend mit festen
+  15-Minuten-Abschnitten ab. Dadurch ist auch zwischen aktiven Marktfenstern
+  eindeutig festgelegt, ob E3DC-Control eingreift oder die normale
+  Hausversorgung dem E3/DC überlässt.
+- **Speicherplatz halten** ist ein gebundener Ladeblock: Laden bleibt bis zum
+  Ende des betreffenden Abschnitts gesperrt, Entladen für Hausverbrauch bleibt
+  möglich. Ein bloß künftiges Verkaufsfenster erzeugt keinen allgemeinen HOLD.
+- Nach dem letzten geplanten PV-Speicherabschnitt folgt wieder
+  **Hausversorgung / AUTO**, sofern kein stärkerer Storage-Manager-Entscheider
+  wie Lastspitzenbegrenzung, Preis-Netzladen, Pre-Dump oder eine
+  Sicherheitsgrenze aktiv ist.
+- Verkaufsfenster werden nach wirtschaftlichem Wert und verfügbarer Energie
+  geplant. Notstromreserve, Leistungsgrenzen, Datenfrische und gültige
+  Plan-/Slotbindung bleiben harte Voraussetzungen.
+- Nicht freigegebene oder nicht ausführbare Kandidaten bleiben Diagnose. Sie
+  erzeugen keinen Speicherbefehl.
+- Angeforderte flüchtige Speichergrenzen müssen frisch und typisiert
+  zurückgelesen werden. Owner, Plan und Slot bleiben bis zur bestätigten
+  Wirkung gebunden.
+- Ein zusätzlicher lückenloser **DV-Planer-Shadow** bildet die fünf
+  Aktionsklassen Hausversorgung, PV-Speichern, Ladeblock, Netzladen und
+  wirtschaftlichen Verkauf als eigenen validierten Diagnosevertrag ab. Er
+  bleibt vollständig wirkungslos, verändert keine produktive Plan-/Slot-ID
+  und wird weder von Phase 5 noch vom Storage Manager als Aktorquelle gelesen.
+
+### Optionale AC-Speicherroute
+
+Für Anlagen mit zusätzlichem AC-Wechselrichter gibt es eine getrennte,
+standardmäßig ausgeschaltete Freigabe:
+
+- `Aus` plant weiterhin ausschließlich E3/DC-DC-PV als Speicherquelle.
+- `Nur notwendige Reserve sichern` und `Bei wirtschaftlichem Vorteil
+  freigeben` sind getrennte bewusste Nutzerentscheidungen.
+- E3/DC-DC bleibt vorrangig. Die AC-Route benötigt einen gültigen
+  Topologievertrag und eine belegte DC-Unterdeckung.
+- Die Freigabe erlaubt kein Netzladen. Fehlende oder veraltete Nachweise
+  sperren den Pfad.
+
+## Sanfte Ladebegrenzung auf E3/DC-PV
+
+Mit **Speicher → Laden an E3DC-PV koppeln** können Kurvenladung und
+DV-PV-Speichern auf die aktuell am E3/DC gemessene PV-Leistung begrenzt
+werden:
+
+- Der Storage-Simulator liefert weiterhin die fachliche Obergrenze.
+- Die wirksame Ladegrenze ist höchstens die frisch und gültig ermittelte
+  E3/DC-PV-Leistung. Leistung eines zusätzlichen AC-Wechselrichters erhöht
+  diesen Rahmen nicht.
+- E3/DC bleibt in AUTO und darf bei wechselnden Hauslasten jederzeit entladen.
+  Die Regelung erteilt keinen dauernden harten Ladeauftrag.
+- Sinkt die E3/DC-PV-Leistung, wird der flüchtige Laderahmen nachgeführt.
+  Fehlt der gültige PV-Split oder ist er veraltet, werden diese PV-basierten
+  Ladepfade sicher auf 0 W begrenzt.
+- Dynamische Grenzen werden nur über flüchtige EMS-Power-Settings gesetzt.
+  Dauerhafte Geräteeinstellungen werden nicht zyklisch verändert.
+
+Die Option ist auch für Anlagen ohne Direktvermarktung nutzbar, wenn ein
+zusätzlicher AC-Wechselrichter vorhanden ist. Sie ist ein DC-first-Rahmen und
+keine physikalische Garantie, dass im Gerät zu jedem Zeitpunkt ausschließlich
+DC-Leistung fließt. Preis- und ausdrücklich freigegebenes Netzladen besitzen
+eigene Verträge und werden durch diese Option nicht umgedeutet.
+
+## Wallbox-Ladeplanung bei wiederkehrenden Tarifen
+
+Feste Tarife, Octopus Heat und frei konfigurierte Spezialtarife besitzen ein
+vollständiges tägliches Tarifprofil. Ein manuelles Ladefenster wie
+`00:00–05:00` mit fünf Stunden Ladezeit kann deshalb bereits für die kommende
+Nacht erzeugt werden, auch wenn noch keine morgigen EPEX-Slots vorliegen.
+
+Der konfigurierte Tarifpreis bleibt dabei vom optional vorhandenen Marktpreis
+getrennt. Tibber, aWATTar und andere dynamische Tarife bleiben ohne
+veröffentlichte Zukunftspreise strikt gesperrt. Kann der private Planer keinen
+sicheren Kandidaten erzeugen, nennt die Weboberfläche einen validierten
+deutschen Grund und übernimmt weder Konfiguration noch Teilplan.
+
+## Peak Shaving am Netzbezug
+
+Die neue Lastspitzenbegrenzung bewertet den mittleren Netzbezug in festen
+Zähler-Viertelstunden:
+
+- Der gewünschte maximale 15-Minuten-Netzbezug, ein Sicherheitsabstand und eine
+  optionale Entladeobergrenze sind konfigurierbar.
+- Leistungs- und SoC-Hysterese, maximale Messlücke und Freigabe-Entprellung
+  verhindern instabile Grenzwechsel.
+- Ein eigener Speicherpuffer kann oberhalb der physischen Notstromreserve
+  reserviert werden. Die Notstromreserve selbst bleibt unverfügbar.
+- Beim Begrenzen und Halten arbeitet E3/DC weiter in AUTO. Der Storage Manager
+  setzt nur flüchtige Lade- oder Entladerahmen und fordert keine Einspeisung
+  ins Netz an.
+- Das Nachladen des Lastspitzenpuffers aus dem Netz ist eine getrennte
+  ausdrückliche Freigabe. Es bleibt innerhalb der laufenden Viertelstunden-,
+  Hausanschluss- und Hardwaregrenzen und nutzt dafür vorübergehend den
+  ausdrücklich angeforderten Netzlademodus; standardmäßig ist es aus.
+
+Bei fehlender oder unterbrochener Netzpunkthistorie bleibt die Regelung
+passiv. Aus einer unvollständigen Viertelstunde wird kein aggressiver
+Speicherauftrag abgeleitet.
+
+## PV-Prognosediagnose
+
+Die optionale Diagnose vergleicht vorhandene PV-Prognosen mit abgeschlossenen
+nativen E3/DC-DC-Historienslots:
+
+- Ein eigener niedrig priorisierter Diagnosedienst arbeitet getrennt von
+  Live-Daten, Prognoseerzeugung und Speicherregelung.
+- Bei `Aus` erfolgen weder E3/DC-Historienabfrage noch Datenbankschreibzugriff.
+- Ausgewertet werden ausschließlich typisierte, abgeschlossene
+  15-Minuten-Slots derselben Topologie-Revision. Fehlende Werte bleiben
+  unbekannt und werden nicht als Messnull behandelt.
+- Die Oberfläche zeigt verständliche Diagnosewerte:
+  **Trefferabweichung**, **Richtungsversatz**,
+  **energiegewichtete Gesamtabweichung** und **Vergleichsabdeckung**.
+- Bis mindestens 96 ertragsrelevante Slots aus mindestens sieben
+  Vergleichstagen vorliegen, bleiben die Ergebnisse als vorläufig
+  gekennzeichnet.
+- Es gibt keine automatische Modellauswahl, keine Konfigurationsänderung und
+  keine Rückwirkung auf Speicher- oder Verbraucherentscheidungen.
+- Der Konfigurationseditor verwaltet PV-Flächen, Wechselrichtergruppen und
+  Provider-Bindungen als versionierten Topologievertrag. Fehlende Messwerte
+  bleiben unbekannt; eine neue Topologie-Revision verhindert, dass ein alter
+  PV-Split auf eine geänderte Anlage übertragen wird.
+
+Die private SQLite-Datenbank liegt außerhalb des Webverzeichnisses unter
+`/var/lib/e3dc-control/forecast-evidence`. Sie besitzt Größen- und
+Aufbewahrungsgrenzen. Das Webportal erhält nur eine kleine sanitierte
+Zusammenfassung.
+
+## Installation, Update und Docker
+
+- Eine frische Installation wird nicht mehr wie eine bestehende Anlage ohne
+  HA-/Shadow-Rolle behandelt. Nur beim erstmaligen Erzeugen der Konfiguration
+  wird die Einzelanlagenrolle `off` vorbelegt.
+- Vorhandene Anlagen ohne gültige Rollenbindung werden nicht stillschweigend
+  umgedeutet. Widersprüchliche Bestände bleiben fail-closed; sicher erkennbare
+  unvollständige Erstinstallationen können über den vollständigen Installer
+  fortgesetzt werden.
+- Fehler bei Paketen, Konfiguration, Webportal, Rechten oder Diensten werden bis
+  zum Menü- und Prozess-Exitcode weitergegeben. Ein fehlgeschlagener Schritt
+  wird nicht mehr als erfolgreiche Installation angezeigt.
+- Ein aus 5.4.0a gestarteter Altprozess kann nach dem verifizierten Git-Wechsel
+  mit seinem bereits gecachten alten Backup-Validator fortfahren. Die neue
+  Rechteprüfung erkennt dessen Signatur, übergibt keine unbekannten Argumente
+  und führt in dieser Altgeneration keine Metadatenmutation aus. Unsichere
+  ML-Sperrdateien bleiben weiterhin ein harter Abbruch.
+- Der direkte Aufruf `--install-all` verwendet dieselbe Zustands- und
+  Rollenprüfung wie der interaktive Menüpunkt.
+- Der optionale Diagnosedienst gehört nicht zu den sieben
+  Install-Center-Pflichtdiensten. Bei Updates wird er nur erhalten und
+  gestartet, wenn er vorher installiert und in der eingefrorenen Konfiguration
+  aktiviert war.
+- Docker verwendet getrennte private Volumes für Lernmodell und
+  Prognosediagnose. Nach dem Ein- oder Ausschalten der Diagnose ist ein
   Containerneustart erforderlich.
-- `climate_enable=0` bleibt fail-closed: keine Shelly-Abfrage, keine
-  Klimasteuerung und keine neue Verlaufshistorie.
-- Bestehende Klimahistorien werden beim Deaktivieren weder gelöscht noch
-  verändert.
+- Der Docker-Rückfallstand ist zusätzlich zum Tag an seinen OCI-Index-Digest
+  gebunden. Vor `pull` und `up` muss Compose exakt das erwartete
+  Rückfall-Image auflösen.
 
-## ML-Lock und verifiziertes Backup
+### Hinweis für ältere Installationen
 
-- Vor dem Backup prüft der Updater den privaten ML-Store weiterhin vollständig,
-  ohne ein Modell zu deserialisieren.
-- Ausschließlich ein regulärer, unverlinkter, höchstens 64 KiB großer,
-  aktuell unbelegter Alt-Lock mit gebundenem oder historischem Root-Eigentümer
-  darf auf Installationsbenutzer, Store-Gruppe und Modus `0600` normalisiert
-  werden.
-- Inode, Pfad, Größe und Lockzustand werden vor und nach der
-  Metadatenkorrektur erneut gebunden. Lockinhalt, Modell und Manifest bleiben
-  unverändert.
-- Symlinks, Hardlinks, fremde Eigentümer, Übergröße, unbekannte private
-  Einträge und belegte Locks brechen den Updatepfad weiterhin hart ab.
-
-### Wichtig für bereits blockierte Alt-Updater
-
-Stände bis einschließlich 5.4.1c erstellen und prüfen das Backup noch mit
-ihrem bereits installierten Code, bevor sie 5.4.1d laden. Wenn ein solcher
-Updater mit
-
-`Unsicherer privater ML-Eintrag: .ml_model.lock`
-
-abbricht, ist deshalb einmalig der dokumentierte Metadaten-Feldfix aus
-`doc/Update.md` erforderlich. `.ml_model.lock`, Modell und Manifest dürfen
-nicht gelöscht oder umbenannt werden. Ab dem erfolgreich installierten
-5.4.1d-Stand kann der Updater einen eindeutig sicheren Alt-Lock selbst
-normalisieren.
-
-## Batterie-Vitals
-
-- Die Anfrage jedes DCB-Packs bleibt als `Uint16` indexiert.
-- Ein vom E3/DC zurückgegebener `BAT_DCB_INDEX` wird zusätzlich zum bisherigen
-  `Uint16` auch als RSCP-`Int32` akzeptiert.
-- Die Sicherheitsbindung bleibt unverändert streng: echter Ganzzahlwert,
-  Bereich `0…65535` und exakte Gleichheit mit dem angeforderten Packindex.
-- Negative, nichtnumerische, vertauschte oder anders typisierte Antworten
-  werden weiterhin verworfen und niemals unter einem falschen Pack angezeigt.
-
-## Installation und Update
-
-Bare-Metal-Nutzer verwenden den Web- oder Konsolen-Updater. Ein bereits am
-ML-Lock gestoppter Altstand führt zuerst ausschließlich die dokumentierte
-Metadatenreparatur aus und startet danach den normalen Updater erneut.
+Der dokumentierte erste Hybridwechsel aus 5.3.2b und die einmalige
+ML-Lock-Reparatur für Updater bis einschließlich 5.4.1c bleiben unverändert.
+5.4.2 ergänzt für bereits laufende 5.4.0a-Updater die danach benötigte
+Importcache-Kompatibilitätsbrücke. Diese historischen Übergangsschritte dürfen
+nicht durch einen manuellen `git pull` ersetzt werden. Details stehen in
+`doc/Update.md`.
 
 Docker-Nutzer prüfen das konfigurierte Image und recreaten erst nach einem
 erfolgreichen Pull:
@@ -78,10 +192,24 @@ erfolgreichen Pull:
 )
 ```
 
-Ein fester Eintrag `E3DC_IMAGE_TAG` bleibt absichtlich fest. Für v5.4.1d
-lautet der Pin `E3DC_IMAGE_TAG=v5.4.1d`; ohne Pin folgt die Compose-Datei dem
-erst nach erfolgreicher Attestierungsprüfung gesetzten Stable-Tag `latest`.
+Ein fester Eintrag `E3DC_IMAGE_TAG` bleibt absichtlich fest. Für v5.4.2 lautet
+der Pin `E3DC_IMAGE_TAG=v5.4.2`; ohne Pin folgt die Compose-Datei dem erst nach
+erfolgreicher Attestierungsprüfung gesetzten Stable-Tag `latest`.
 
 Der öffentliche Docker-Rückfallstand bleibt `v5.3.2b`. Dieser Stand ist nicht
 als Bare-Metal-Programm-Rückfall freigegeben; dort bleibt ein verifiziertes
 Datei-Backup der sichere Rückweg.
+
+## Oberfläche
+
+- Der Tarifbereich trennt Direktvermarktung, Preisfunktionen und
+  Lastspitzenbegrenzung in verständliche Abschnitte. Beschreibungen erklären
+  die Wirkung von `Ein` und `Aus` in Alltagssprache.
+- Bei zwei Wallboxen stehen die jeweiligen Einstellungen über den gesamten
+  Bereich in zwei Spalten; gemeinsame Werte liegen über beiden Spalten. Bei nur
+  einer Wallbox wird die volle Breite genutzt.
+- Die Speicheranzeige unterscheidet den wirksamen Vertrag
+  **Hausversorgung / AUTO**, **Speicherplatz halten**, **PV-Speichern** und
+  **Verkaufen**. Redundante HOLD-Angaben sind zusammengeführt.
+- Der Service-Worker verwendet einen neuen 5.4.2-Cache-Namensraum, damit alte
+  JavaScript- und CSS-Dateien nach dem Update eindeutig verworfen werden.

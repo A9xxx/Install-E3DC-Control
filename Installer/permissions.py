@@ -35,7 +35,7 @@ if __package__ in (None, ""):
         configured_optional_services,
         preinstalled_optional_service_expected,
     )
-    from Installer.backup_integrity import BackupIntegrityError, PRIVATE_ML_ROOT, _open_regular_file_nofollow, normalize_private_ml_lock_metadata, validate_private_ml_store
+    from Installer import backup_integrity as _backup_integrity
 else:
     from .core import CAT_ENV, register_command
     from .utils import run_command
@@ -48,7 +48,21 @@ else:
         configured_optional_services,
         preinstalled_optional_service_expected,
     )
-    from .backup_integrity import BackupIntegrityError, PRIVATE_ML_ROOT, _open_regular_file_nofollow, normalize_private_ml_lock_metadata, validate_private_ml_store
+    from . import backup_integrity as _backup_integrity
+
+BackupIntegrityError = _backup_integrity.BackupIntegrityError
+PRIVATE_ML_ROOT = _backup_integrity.PRIVATE_ML_ROOT
+_open_regular_file_nofollow = _backup_integrity._open_regular_file_nofollow
+validate_private_ml_store = _backup_integrity.validate_private_ml_store
+# Ein Self-Update aus älteren Releases kann dieses Modul nach dem Git-Wechsel
+# in demselben Python-Prozess laden, während ``backup_integrity`` noch aus der
+# alten Generation im Modulcache liegt. Die neue Reparaturfunktion ist deshalb
+# optional; ein Altvalidator bleibt strikt read-only und fail-closed.
+normalize_private_ml_lock_metadata = getattr(
+    _backup_integrity,
+    "normalize_private_ml_lock_metadata",
+    None,
+)
 
 INSTALL_USER = get_install_user()
 INSTALL_HOME = get_home_dir(INSTALL_USER)
@@ -71,9 +85,15 @@ WATCHDOG_UPDATE_PAUSE_FILE = "/var/www/html/ramdisk/watchdog.update_pause"
 WALLBOX_PLAN_JOB_ROOT = "/var/www/html/data/.wallbox_plan_jobs"
 HA_MANAGED_SERVICES = (
     "e3dc", "e3dc-live", "e3dc-storage-manager", "e3dc-storage-simulator",
-    "e3dc-epex-manager", "e3dc-weather-manager", "e3dc-wallbox-manager",
+    "e3dc-epex-manager", "e3dc-weather-manager", "e3dc-forecast-evidence", "e3dc-wallbox-manager",
     "energy_manager", "e3dc-idm-live", "e3dc-lux-live", "e3dc-stiebel-live", "e3dc-dimplex-live", "e3dc-heizstab", "e3dc-climate-live", "e3dc-climate-control",
     "e3dc-mqtt-hub", "e3dc-bluelink", "e3dc-matter-bridge", "e3dc-notifier", "e3dc-websocket", "e3dc-shadow-sync",
+)
+FORECAST_EVIDENCE_BASE = "/var/lib/e3dc-control"
+FORECAST_EVIDENCE_ROOT = f"{FORECAST_EVIDENCE_BASE}/forecast-evidence"
+FORECAST_EVIDENCE_PRIVATE_FILES = (
+    f"{FORECAST_EVIDENCE_ROOT}/pv_forecast_evidence.db",
+    f"{FORECAST_EVIDENCE_ROOT}/writer.lock",
 )
 
 
@@ -134,6 +154,39 @@ def _rollback_ml_directories(snapshots):
     return success
 
 
+def _validate_private_ml_store_for_permissions(expected_uid, expected_gid):
+    """Validiert den ML-Store auch mit einem gecachten Altvertrag strikt."""
+
+    validator_parameters = inspect.signature(validate_private_ml_store).parameters
+    repairable_lock_supported = "allow_repairable_lock" in validator_parameters
+    validator_kwargs = {
+        "expected_uid": expected_uid,
+        "allow_missing": False,
+    }
+    if repairable_lock_supported:
+        validator_kwargs["allow_repairable_lock"] = True
+    ml_preflight = validate_private_ml_store(
+        PRIVATE_ML_ROOT,
+        **validator_kwargs,
+    )
+    if ml_preflight.get("repairable_lock"):
+        if not callable(normalize_private_ml_lock_metadata):
+            raise BackupIntegrityError(
+                "ML-Sperrdatei benötigt eine Metadatenreparatur, "
+                "aber der geladene Altvertrag unterstützt sie nicht"
+            )
+        normalize_private_ml_lock_metadata(
+            PRIVATE_ML_ROOT,
+            expected_uid=expected_uid,
+            expected_gid=expected_gid,
+        )
+    validate_private_ml_store(
+        PRIVATE_ML_ROOT,
+        expected_uid=expected_uid,
+        allow_missing=False,
+    )
+
+
 def ensure_private_ml_model_store():
     """Repariert die privaten ML-Verzeichnisse und nur die bekannte Sperrdatei."""
 
@@ -152,6 +205,7 @@ def ensure_private_ml_model_store():
     except Exception as exc:
         perm_logger.error("Privater ML-Store konnte nicht vorbereitet werden: %s", exc)
         return False
+
 
     commands = (
         "sudo install -d -o root -g root -m 0711 -- {}".format(shlex.quote(base)),
@@ -176,19 +230,10 @@ def ensure_private_ml_model_store():
             or stat.S_IMODE(base_metadata.st_mode) != 0o711
         ):
             raise BackupIntegrityError("ML-Basisverzeichnis besitzt nicht root:root 0711")
-        ml_preflight = validate_private_ml_store(
-            PRIVATE_ML_ROOT,
-            expected_uid=account.pw_uid,
-            allow_missing=False,
-            allow_repairable_lock=True,
+        _validate_private_ml_store_for_permissions(
+            account.pw_uid,
+            account.pw_gid,
         )
-        if ml_preflight.get("repairable_lock"):
-            normalize_private_ml_lock_metadata(
-                PRIVATE_ML_ROOT,
-                expected_uid=account.pw_uid,
-                expected_gid=account.pw_gid,
-            )
-        validate_private_ml_store(PRIVATE_ML_ROOT, expected_uid=account.pw_uid, allow_missing=False)
         perm_logger.info("Privater ML-Store ist manifestgebunden und nicht webbeschreibbar.")
         return True
     except Exception as exc:
@@ -197,6 +242,95 @@ def ensure_private_ml_model_store():
             perm_logger.error("ML-Verzeichnisrollback unvollstaendig; ML bleibt gesperrt: %s", exc)
         else:
             perm_logger.error("ML-Verzeichnisvorbereitung zurueckgerollt: %s", exc)
+        return False
+
+
+def ensure_private_forecast_evidence_store():
+    """Bindet den Diagnosezustand an einen privaten Ein-Writer-Pfad."""
+
+    try:
+        account = pwd.getpwnam(INSTALL_USER)
+        if account.pw_name == "www-data":
+            raise BackupIntegrityError(
+                "Private Rohdaten der Prognosediagnose dürfen nicht dem Web-Benutzer gehören"
+            )
+        group_name = grp.getgrgid(account.pw_gid).gr_name
+        for ancestor in ("/var", "/var/lib"):
+            metadata = os.lstat(ancestor)
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                raise BackupIntegrityError(
+                    f"Unsichere Elternkomponente für Prognosediagnose: {ancestor}"
+                )
+        if os.path.lexists(FORECAST_EVIDENCE_BASE):
+            base_metadata = os.lstat(FORECAST_EVIDENCE_BASE)
+            if stat.S_ISLNK(base_metadata.st_mode) or not stat.S_ISDIR(base_metadata.st_mode):
+                raise BackupIntegrityError("Unsicheres E3DC-Zustandsverzeichnis")
+        if os.path.lexists(FORECAST_EVIDENCE_ROOT):
+            root_metadata = os.lstat(FORECAST_EVIDENCE_ROOT)
+            if stat.S_ISLNK(root_metadata.st_mode) or not stat.S_ISDIR(root_metadata.st_mode):
+                raise BackupIntegrityError("Unsicheres Prognosediagnose-Verzeichnis")
+    except Exception as exc:
+        perm_logger.error("Private Prognosediagnose konnte nicht geprüft werden: %s", exc)
+        return False
+
+    commands = (
+        "sudo install -d -o root -g root -m 0711 -- {}".format(
+            shlex.quote(FORECAST_EVIDENCE_BASE)
+        ),
+        "sudo install -d -o {} -g {} -m 0700 -- {}".format(
+            shlex.quote(account.pw_name),
+            shlex.quote(group_name),
+            shlex.quote(FORECAST_EVIDENCE_ROOT),
+        ),
+    )
+    try:
+        for command in commands:
+            result = run_command(command, timeout=20)
+            if not result.get("success"):
+                raise BackupIntegrityError(
+                    "Privates Prognosediagnose-Verzeichnis konnte nicht angelegt werden"
+                )
+        root_metadata = os.lstat(FORECAST_EVIDENCE_ROOT)
+        if (
+            stat.S_ISLNK(root_metadata.st_mode)
+            or not stat.S_ISDIR(root_metadata.st_mode)
+            or root_metadata.st_uid != account.pw_uid
+            or root_metadata.st_gid != account.pw_gid
+            or stat.S_IMODE(root_metadata.st_mode) != 0o700
+        ):
+            raise BackupIntegrityError(
+                "Prognosediagnose-Verzeichnis besitzt nicht Nutzergruppe 0700"
+            )
+        for path in FORECAST_EVIDENCE_PRIVATE_FILES:
+            if not os.path.lexists(path):
+                continue
+            metadata = os.lstat(path)
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+                raise BackupIntegrityError(
+                    f"Unsichere private Prognosediagnose-Datei: {path}"
+                )
+            result = run_command(
+                "sudo chown {}:{} -- {} && sudo chmod 0600 -- {}".format(
+                    shlex.quote(account.pw_name),
+                    shlex.quote(group_name),
+                    shlex.quote(path),
+                    shlex.quote(path),
+                ),
+                timeout=20,
+            )
+            if not result.get("success"):
+                raise BackupIntegrityError(
+                    f"Private Prognosediagnose-Datei konnte nicht gehärtet werden: {path}"
+                )
+        perm_logger.info(
+            "Private Prognosediagnose ist außerhalb des Webverzeichnisses gebunden."
+        )
+        return True
+    except Exception as exc:
+        perm_logger.error(
+            "Private Prognosediagnose konnte nicht vorbereitet werden: %s",
+            exc,
+        )
         return False
 
 # ANSI Colors
@@ -757,8 +891,10 @@ FILE_DEFINITIONS = [
     {"path": f"{INSTALLER_DIR}/storage_manager_legacy.py", "mode": "755", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": True},
     {"path": f"{INSTALLER_DIR}/storage_simulator.py", "mode": "755", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": True},
     {"path": f"{INSTALLER_DIR}/direct_marketing.py", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
+    {"path": f"{INSTALLER_DIR}/direct_marketing_dispatch_planner.py", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": f"{INSTALLER_DIR}/epex_manager.py", "mode": "755", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": True},
     {"path": f"{INSTALLER_DIR}/Forecast/pv_forecast_service.py", "mode": "755", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": True},
+    {"path": f"{INSTALLER_DIR}/forecast_evidence_sidecar.py", "mode": "755", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": True},
     {"path": f"{INSTALLER_DIR}/e3dc_websocket.py", "mode": "755", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": True},
     {"path": f"{INSTALLER_DIR}/sqlite_archiver.py", "mode": "755", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": True},
     {"path": f"{INSTALLER_DIR}/vital_stats.py", "mode": "755", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": True},
@@ -802,6 +938,7 @@ FILE_DEFINITIONS = [
     {"path": "/var/www/html/data/morning_boost_state.json", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": "/var/www/html/data/external_pv_topology.json", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": "/var/www/html/data/e3dc_stats.db", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
+    {"path": "/var/www/html/ramdisk/pv_forecast_diagnostic_summary.json", "mode": "644", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     # Wallbox-Session-Helferdateien: PHP/www-data und Python-Dienste lesen/schreiben gemeinsam.
     {"path": "/var/www/html/tmp/car_charge_session.json", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": "/var/www/html/tmp/car_charge_session_wb2.json", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
@@ -2649,6 +2786,20 @@ def _install_legacy_532b_service_contract():
         return False
 
     package_module = sys.modules.get("Installer")
+    # Dieser Binder repariert ausschließlich den veröffentlichten
+    # 5.3.2b-Ersthop. Andere Alt-Updater wie 5.4.0a besitzen bereits ihren
+    # eigenen eingefrorenen Releasevertrag und dürfen nicht erst nach dem
+    # Git-Wechsel gegen die 5.3.2b-Quellbindung geprüft werden.
+    source_version = str(
+        getattr(package_module, "__version__", "") or ""
+    ).strip()
+    if source_version == "5.4.0a":
+        return False
+    if source_version != "5.3.2b":
+        raise RuntimeError(
+            "Laufender Alt-Updater besitzt keine freigegebene Quellgeneration"
+        )
+
     service_expected = getattr(update_module, "_service_expected", None)
     validated_services = getattr(update_module, "_validated_restart_services", None)
     restart_services_function = getattr(update_module, "_restart_v4_services", None)
@@ -2701,7 +2852,7 @@ def _install_legacy_532b_service_contract():
         raise RuntimeError("Zielpolicy des 5.3.2b-Ersthops ist ungültig") from exc
     signature_ok = (
         getattr(update_module, "__name__", "") == "Installer.update"
-        and str(getattr(package_module, "__version__", "") or "") == "5.3.2b"
+        and source_version == "5.3.2b"
         and callable(service_expected)
         and callable(validated_services)
         and callable(restart_services_function)
@@ -2867,10 +3018,12 @@ def run_permissions_wizard(headless=False, release_quiesced=None):
     configured_missing_services = []
     release_ha_mode = "off"
     legacy_532b_contract_bound = False
+    runtime_config = {}
     if release_quiesced:
         try:
             legacy_532b_contract_bound = _install_legacy_532b_service_contract()
             release_config = _read_release_config_nofollow()
+            runtime_config = release_config
             release_ha_mode = str(release_config.get("ha_mode") or "off").strip().lower()
             configured_missing_services = _release_configured_missing_optional_services(release_config)
         except Exception as exc:
@@ -2899,7 +3052,34 @@ def run_permissions_wizard(headless=False, release_quiesced=None):
                 "vorinstallierte Unit: %s",
                 ", ".join(configured_missing_services),
             )
+    else:
+        try:
+            runtime_config = _read_release_config_nofollow()
+        except Exception as exc:
+            # Die Diagnose ist standardmäßig aus. Eine fehlende optionale
+            # Diagnosekonfiguration darf eine reguläre Installation deshalb
+            # nicht blockieren; der Sidecar bleibt fail-closed gestoppt.
+            perm_logger.warning(
+                "PV-Prognosediagnose-Konfiguration nicht sicher lesbar; "
+                "optional deaktiviert behandelt: %s",
+                exc,
+            )
+            runtime_config = {}
+    forecast_evidence_required = str(
+        runtime_config.get("forecast_diagnostics_enable", "0")
+    ).strip().lower() in {"1", "true", "yes", "on", "ein"}
     ml_store_ready = ensure_private_ml_model_store()
+    forecast_evidence_store_ready = ensure_private_forecast_evidence_store()
+    if not forecast_evidence_store_ready and not forecast_evidence_required:
+        print(
+            f"{YELLOW}[i]{RESET} Privater Prognosediagnose-Pfad ist nicht "
+            "vorbereitet; die ausgeschaltete optionale Diagnose bleibt gestoppt."
+        )
+        perm_logger.warning(
+            "Optionale PV-Prognosediagnose bleibt ohne privaten Zustandspfad "
+            "deaktiviert; Installation wird nicht blockiert."
+        )
+        forecast_evidence_store_ready = True
 
     # Als erstes: Bereinige root-eigene Dateien falls vorhanden
     cleanup_success = cleanup_root_owned_files()
@@ -2926,7 +3106,7 @@ def run_permissions_wizard(headless=False, release_quiesced=None):
     watchdog_refreshed = True if release_quiesced else refresh_watchdog_guard_script()
     web_program_hardened = harden_web_program_permissions()
 
-    has_issues = bool(issues) or bool(wp_issues) or bool(file_issues) or bool(sudo_issues) or bool(service_issues) or bool(legacy_issues) or not watchdog_refreshed or not web_program_hardened or not ml_store_ready
+    has_issues = bool(issues) or bool(wp_issues) or bool(file_issues) or bool(sudo_issues) or bool(service_issues) or bool(legacy_issues) or not watchdog_refreshed or not web_program_hardened or not ml_store_ready or not forecast_evidence_store_ready
     if not has_issues:
         if release_quiesced:
             print(f"\n{GREEN}✓{RESET} Service-neutrale Release-Berechtigungsprüfung bestanden.\n")
@@ -2950,7 +3130,7 @@ def run_permissions_wizard(headless=False, release_quiesced=None):
     
     print("→ Automatische Rechte-Korrektur...")
 
-    all_success = bool(watchdog_refreshed) and bool(ml_store_ready)
+    all_success = bool(watchdog_refreshed) and bool(ml_store_ready) and bool(forecast_evidence_store_ready)
     if issues:
         success = fix_permissions(issues)
         all_success = all_success and success

@@ -24,10 +24,24 @@ import datetime
 import logging
 
 try:
-    from .Wallbox.config import get_config, CONFIG_FILE, V4_CONFIG_FILE, RAMDISK_DIR, INSTALL_DIR
+    from .Wallbox.config import (
+        get_config,
+        CONFIG_FILE,
+        V4_CONFIG_FILE,
+        RAMDISK_DIR,
+        INSTALL_DIR,
+        _configured_billing_price_now as configured_billing_price_for_timestamp,
+    )
     from .config_secret_permissions import apply_config_secret_permissions
 except ImportError:  # Aufruf als Script-Modul direkt aus dem Installer-Verzeichnis
-    from Wallbox.config import get_config, CONFIG_FILE, V4_CONFIG_FILE, RAMDISK_DIR, INSTALL_DIR
+    from Wallbox.config import (
+        get_config,
+        CONFIG_FILE,
+        V4_CONFIG_FILE,
+        RAMDISK_DIR,
+        INSTALL_DIR,
+        _configured_billing_price_now as configured_billing_price_for_timestamp,
+    )
     from config_secret_permissions import apply_config_secret_permissions
 
 logger = logging.getLogger("WallboxManager.Planer")
@@ -62,6 +76,26 @@ _CANDIDATE_PLAN_FILES = (
     "native_wallbox_schedule.json",
 )
 _MAX_CANDIDATE_JSON_BYTES = 4 * 1024 * 1024
+
+_RECURRING_TARIFF_TYPES = frozenset({
+    "static",
+    "fix",
+    "fixed",
+    "flat",
+    "octopus_heat",
+    "special",
+    "spezial",
+    "special_tariff",
+})
+
+
+def _tariff_type(config):
+    return str((config or {}).get("stromtarif_typ", "static") or "static").strip().lower()
+
+
+def _uses_recurring_tariff_axis(config):
+    """True only for tariffs whose daily prices are fully defined by config."""
+    return _tariff_type(config) in _RECURRING_TARIFF_TYPES
 
 
 def _warn_missing_vehicle_soc(now=None):
@@ -617,15 +651,26 @@ def generate_native_charging_schedule(config, wb_id=None):
 
 
     # -----------------------------------------------------------------------
-    # EPEX-Daten laden
+    # Preisquellen laden. Wiederkehrende Tarife besitzen eine vollständige,
+    # lokal konfigurierte Tagesachse. Dynamische Tarife dürfen dagegen nur
+    # tatsächlich vorhandene Markt-/Abrechnungsslots verwenden.
     # -----------------------------------------------------------------------
+    recurring_tariff_axis = _uses_recurring_tariff_axis(config)
     epex_file = os.path.join(RAMDISK_DIR, "epex_daten.json")
-    if not os.path.exists(epex_file):
-        return []
-    try:
-        with open(epex_file, "r") as f:
-            epex_data = json.load(f)
-    except Exception:
+    epex_data = []
+    if os.path.exists(epex_file):
+        try:
+            with open(epex_file, "r") as f:
+                raw_epex_data = json.load(f)
+            if isinstance(raw_epex_data, list):
+                epex_data = raw_epex_data
+        except Exception:
+            epex_data = []
+    if not recurring_tariff_axis and not epex_data:
+        logger.warning(
+            "[Scheduler] WB%d: Dynamischer Tarif ohne gültige zukünftige Preisdaten.",
+            wb_id,
+        )
         return []
 
     # Leerstring-sicherer Parse: Wenn UI-Felder geleert wurden, steht ein '' in der Config.
@@ -792,39 +837,89 @@ def generate_native_charging_schedule(config, wb_id=None):
             pass
 
     # -----------------------------------------------------------------------
-    # Alle 15-min Slots im Ladefenster zusammenstellen
+    # Alle 15-min Slots im Ladefenster zusammenstellen. Der Marktpreis bleibt
+    # eine eigene optionale Evidenz und wird niemals durch einen Tarifpreis
+    # ersetzt. Für statische, Octopus-Heat- und Spezialtarife kann deshalb auch
+    # ein morgiges Fenster geplant werden, bevor neue EPEX-Slots vorliegen.
     # -----------------------------------------------------------------------
-    all_slots = []
+    market_prices_by_slot = {}
     for entry in epex_data:
-        e_start = int(entry["start_timestamp"] / 1000)
-        e_end   = int(entry["end_timestamp"]   / 1000)
-        priceRaw = entry.get("marketprice")
-        if priceRaw is None:
+        try:
+            e_start = int(float(entry["start_timestamp"]) / 1000)
+            e_end = int(float(entry["end_timestamp"]) / 1000)
+            price_raw = float(entry.get("marketprice"))
+        except Exception:
             continue
-        market_price_ct = (priceRaw / 10.0) * (1.0 + (awmwst / 100.0)) + awnebenkosten
+        market_price_ct = (price_raw / 10.0) * (1.0 + (awmwst / 100.0)) + awnebenkosten
 
         cur = e_start
         while cur < e_end:
             if von_ts <= cur < bis_ts:
                 slot_ts_q = (cur // 900) * 900
-                price_ct = tariff_prices.get(
-                    slot_ts_q,
-                    tariff_prices.get(slot_ts_q - 900,
-                    tariff_prices.get(slot_ts_q + 900, market_price_ct))
-                )
-                # set mode to 'manual' if smart_enable is false or no_time_limit is true
-                # 'manual' is interpreted by the frontend to render the yellow blocks
-                slot_mode = "manual" if (wb_sofort or wbhour >= 99) else "auto"
-                all_slots.append({
-                    "ts": cur,
-                    "price_ct": price_ct,
-                    "market_price_ct": market_price_ct,
-                    "mode": slot_mode
-                })
+                market_prices_by_slot[slot_ts_q] = market_price_ct
             cur += 900
 
+    # set mode to 'manual' if smart_enable is false or no_time_limit is true
+    # 'manual' is interpreted by the frontend to render the yellow blocks
+    slot_mode = "manual" if (wb_sofort or wbhour >= 99) else "auto"
+    all_slots = []
+    if recurring_tariff_axis:
+        first_slot_ts = ((von_ts + 899) // 900) * 900
+        for slot_ts in range(first_slot_ts, bis_ts, 900):
+            runtime_tariff_price = tariff_prices.get(slot_ts)
+            if runtime_tariff_price is None:
+                runtime_tariff_price = configured_billing_price_for_timestamp(
+                    config,
+                    now_ts=slot_ts,
+                )
+                price_source = "configured_tariff"
+            else:
+                price_source = "runtime_tariff"
+            try:
+                price_ct = float(runtime_tariff_price)
+            except Exception:
+                continue
+            if not math.isfinite(price_ct):
+                continue
+            market_price_ct = market_prices_by_slot.get(slot_ts)
+            all_slots.append({
+                "ts": slot_ts,
+                "price_ct": price_ct,
+                "market_price_ct": market_price_ct,
+                "price_source": price_source,
+                "mode": slot_mode,
+            })
+    else:
+        for slot_ts in sorted(market_prices_by_slot):
+            market_price_ct = market_prices_by_slot[slot_ts]
+            price_ct = tariff_prices.get(
+                slot_ts,
+                tariff_prices.get(
+                    slot_ts - 900,
+                    tariff_prices.get(slot_ts + 900, market_price_ct),
+                ),
+            )
+            try:
+                price_ct = float(price_ct)
+            except Exception:
+                continue
+            if not math.isfinite(price_ct):
+                continue
+            all_slots.append({
+                "ts": slot_ts,
+                "price_ct": price_ct,
+                "market_price_ct": market_price_ct,
+                "price_source": "runtime_tariff" if slot_ts in tariff_prices else "dynamic_market",
+                "mode": slot_mode,
+            })
+
     if not all_slots:
-        logger.warning(f"[Scheduler] WB{wb_id}: Keine EPEX-Slots im Fenster {wbvon}-{wbbis} gefunden.")
+        logger.warning(
+            "[Scheduler] WB%d: Keine gültigen Tarif-/Preisslots im Fenster %s-%s gefunden.",
+            wb_id,
+            wbvon,
+            wbbis,
+        )
         return []
 
     try:
@@ -1261,12 +1356,18 @@ def _validate_candidate_plan(path, wb_id=None):
         try:
             ts = int(entry["ts"])
             price = float(entry["price_ct"])
-            market_price = float(entry["market_price_ct"])
+            market_price_raw = entry["market_price_ct"]
+            market_price = None if market_price_raw is None else float(market_price_raw)
             entry_wb = int(entry["wb_id"])
         except Exception as exc:
             raise ValueError("candidate_plan_entry_incomplete") from exc
-        if not math.isfinite(price) or not math.isfinite(market_price):
+        if not math.isfinite(price) or (market_price is not None and not math.isfinite(market_price)):
             raise ValueError("candidate_plan_price_invalid")
+        if market_price is None and str(entry.get("price_source", "")) not in (
+            "configured_tariff",
+            "runtime_tariff",
+        ):
+            raise ValueError("candidate_plan_market_price_missing_without_tariff")
         if entry_wb not in (1, 2) or (wb_id is not None and entry_wb != int(wb_id)):
             raise ValueError("candidate_plan_wallbox_invalid")
         if str(entry.get("mode", "")) not in ("auto", "manual"):
@@ -1326,8 +1427,10 @@ def run_candidate_directory(candidate_dir):
                 if os.path.exists(path):
                     os.remove(path)
         elif operation == "plan":
-            if required:
+            if required and not _uses_recurring_tariff_axis(config):
                 epex_path = os.path.join(directory, "epex_daten.json")
+                if not os.path.exists(epex_path):
+                    raise ValueError("candidate_market_data_missing")
                 epex = _candidate_read_private_json(epex_path)
                 if not isinstance(epex, list) or not epex:
                     raise ValueError("candidate_market_data_missing")

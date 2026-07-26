@@ -148,6 +148,7 @@ def catalog_managed_services():
         "e3dc-heizstab.service",
         "e3dc-climate-live.service",
         "e3dc-climate-control.service",
+        "e3dc-forecast-evidence.service",
         "e3dc-bluelink.service",
         "e3dc-mqtt-hub.service",
         "e3dc-matter-bridge.service",

@@ -507,6 +507,7 @@ def install_docker_routine():
         "piguard",
         "e3dc", "energy_manager", "e3dc-lux-live", "e3dc-idm-live", "e3dc-stiebel-live", "e3dc-dimplex-live", "e3dc-ha",
         "e3dc-notifier", "e3dc-websocket", "e3dc-mqtt-hub", "e3dc-bluelink",
+        "e3dc-forecast-evidence",
         "apache2"
     ]
 
@@ -530,6 +531,7 @@ def install_docker_routine():
       - ./data:/var/www/html/data
       - ./logs:/var/www/html/logs
       - e3dc_ml:/var/lib/e3dc-control/ml
+      - e3dc_forecast_evidence:/var/lib/e3dc-control/forecast-evidence
     tmpfs:
       - /var/www/html/ramdisk:size=32M,uid=33,gid=33,mode=2775
     environment:
@@ -553,6 +555,7 @@ def install_docker_routine():
 
 volumes:
   e3dc_ml:
+  e3dc_forecast_evidence:
 """
 
     with open(os.path.join(docker_dir, "docker-compose.yml"), "w") as f:
@@ -713,6 +716,9 @@ volumes:
         print("Das nicht mehr gepflegte Watchtower-Profil bleibt wegen seines")
         print("weitreichenden Docker-Socket-Zugriffs standardmäßig aus.")
         print(f"Deine persistenen Daten liegen sicher in: {data_dir}")
+        print("Die optionale PV-Prognosediagnose startet im privaten Docker-Volume")
+        print("bewusst mit einer neuen Vergleichshistorie; Bare-Metal-Rohdaten")
+        print("werden nicht in den Container kopiert.")
 
         if not config_found:
             print("\n💡 WICHTIGER HINWEIS: Es wurde noch keine E3DC-Konfiguration gefunden!")

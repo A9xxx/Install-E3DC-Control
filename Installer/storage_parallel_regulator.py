@@ -2165,20 +2165,12 @@ class ParallelStorageRegulator:
                 curve_cap_release_below_since_ts = 0.0
                 curve_cap_hysteresis_hold_active = True
                 curve_cap_release_phase = "hysteresis_hold"
-        elif (
-            curve_cap_post_release_guard_initial
-            and not settings_release_confirmed
-        ):
-            # Eine fehlende/unklare Freigabequittung wird nicht optimistisch
-            # als AUTO interpretiert. Der letzte sichere 0-W-Rahmen wird
-            # erneut als begrenztes Ziel geführt.
-            if settings_bounded_zero_confirmed and curve_cap_release_below_active:
-                curve_cap_release_requested = True
-                curve_cap_release_phase = "await_release_readback"
-            else:
-                curve_cap_release_pending = True
-                curve_cap_release_confirmed_since_ts = 0.0
-                curve_cap_release_phase = "post_release_readback_unconfirmed"
+        # Nach einer bestätigten Freigabe gehört ein neuer begrenzter Readback
+        # dem nachfolgenden Storage-Owner, zum Beispiel dem Kurven-Auto-Hold.
+        # Der Post-Release-Guard darf daraus ohne neuen typisierten Druck keinen
+        # Abregelbesitz zurückgewinnen. Echter Grid-Druck tritt im nächsten
+        # Zweig sofort wieder ein; unbestätigter DC-Druck bleibt durch den
+        # Reentry-Guard oben bis zum Ablauf des Fensters gesperrt.
         elif curve_cap_hard_pressure_active:
             curve_cap_post_release_until_ts = 0.0
             curve_cap_release_phase = "hard_entry"

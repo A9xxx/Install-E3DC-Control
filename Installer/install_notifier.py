@@ -96,12 +96,15 @@ def migrate_telegram_tokens():
 
 
 
-def install_notifier(start_service=True):
+def install_notifier(start_service=True, migrate_legacy_config=True):
     print("\n=== Benachrichtigungs-Dienst einrichten ===")
     user = get_install_user()
     script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "notification_manager.py")
-    
-    migrate_telegram_tokens()
+
+    if migrate_legacy_config:
+        migrate_telegram_tokens()
+    else:
+        print("→ Betriebskonfiguration bleibt im Release-Fenster unverändert.")
     run_command(f"sudo chmod +x {script_path}")
     cleanup_old_crons(user)
     

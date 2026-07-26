@@ -299,8 +299,8 @@ def pip_install(pkg, venv_path=None, user=None):
             if result['success']:
                 print(f"✓ {pkg} im venv installiert.")
                 return True
-            else:
-                print(f"⚠ Fehler bei Installation im venv: {format_command_failure(result)}")
+            print(f"⚠ Fehler bei Installation im venv: {format_command_failure(result)}")
+            return False
         else:
             print(f"✓ {pkg} bereits im venv vorhanden.")
             return True
@@ -319,8 +319,8 @@ def pip_install(pkg, venv_path=None, user=None):
         if cmd_result['success']:
             print(f"✓ {pkg} global installiert.")
             return True
-        else:
-            print(f"⚠ {pkg} global möglicherweise nicht korrekt installiert.")
+        print(f"⚠ {pkg} global möglicherweise nicht korrekt installiert.")
+        return False
     else:
         print(f"✓ {pkg} bereits global vorhanden.")
     return True
@@ -538,12 +538,15 @@ def prepare_system_packages_for_snapshot(use_venv=True):
         print("  [i] V4 Native Mode - C++ Build-Pakete werden nicht installiert.")
 
     packages = get_required_system_packages(include_legacy_cpp=cpp_still_active)
-    install_apt_package_list(packages, log_label="Snapshot-Systempakete")
+    if not install_apt_package_transaction(packages, log_label="Snapshot-Systempakete"):
+        return False
 
     if use_venv:
-        setup_venv(show_header=False)
+        if setup_venv(show_header=False) is False:
+            return False
     else:
-        install_python_packages()
+        if install_python_packages() is False:
+            return False
 
     print("\n✓ Systempakete und Python-Abhängigkeiten vorbereitet.")
     print("  Du kannst jetzt einen Container-/VM-Snapshot erstellen und den Installer beenden.\n")
@@ -592,7 +595,8 @@ def setup_venv(show_header=False):
     venv_pip = get_venv_pip(install_user)
 
     # Nutze zentrale Installationsfunktion
-    install_python_packages()
+    if install_python_packages() is False:
+        return False
 
     if show_header:
         print("\n✓ Python-Umgebung eingerichtet.\n")
@@ -628,8 +632,15 @@ def install_python_packages():
     print(f"\n→ Installiere Python-Pakete im venv ({venv_name})…")
     system_logger.info(f"Installiere {len(PYTHON_PACKAGES)} Python-Pakete im venv.")
 
-    for pkg in PYTHON_PACKAGES:
-        pip_install(pkg, venv_path=venv_path, user=install_user)
+    failed = [
+        pkg
+        for pkg in PYTHON_PACKAGES
+        if pip_install(pkg, venv_path=venv_path, user=install_user) is False
+    ]
+    if failed:
+        print("✗ Python-Paketinstallation unvollständig: " + ", ".join(failed))
+        return False
+    return True
 
 
 def cleanup_legacy_python_packages(use_venv=True):
@@ -664,7 +675,8 @@ def install_system_packages(use_venv=True):
         print("  [i] V4 Native Mode - C++ Build-Pakete werden nicht installiert.")
 
     packages = get_required_system_packages(include_legacy_cpp=cpp_still_active)
-    install_apt_package_list(packages)
+    if not install_apt_package_transaction(packages):
+        return False
 
     cleanup_legacy_python_packages(use_venv)
 
@@ -703,9 +715,11 @@ def install_system_packages(use_venv=True):
 
     # Python Umgebung einrichten
     if use_venv:
-        setup_venv(show_header=False)
+        if setup_venv(show_header=False) is False:
+            return False
     else:
-        install_python_packages()
+        if install_python_packages() is False:
+            return False
 
     # WebSocket Service am Ende der Paket-Installation mit einrichten
     installer_dir = os.path.dirname(os.path.abspath(__file__))
@@ -719,6 +733,7 @@ def install_system_packages(use_venv=True):
     print("\n✓ Systempakete vollständig installiert.\n")
     system_logger.info("Installation der Pakete abgeschlossen.")
     log_task_completed("Systempakete installieren")
+    return True
 
 
 def setup_service_wrapper():
@@ -788,6 +803,11 @@ def _create_service_file(
     script_executor="python3",
     restart_sec=60,
     start_service=True,
+    enable_service=True,
+    restart_policy="always",
+    nice=None,
+    io_scheduling_class=None,
+    after_services=(),
 ):
     """Generische Helper Funktion um Python-Daemons als Systemd Service anzulegen."""
     print(f"\n=== {description} Service einrichten ===\n")
@@ -818,9 +838,21 @@ def _create_service_file(
         if configured_python and os.path.exists(configured_python):
             script_executor = configured_python
 
+    after_units = ["network.target"]
+    after_units.extend(
+        str(item).strip()
+        for item in (after_services or ())
+        if str(item).strip()
+    )
+    service_tuning = ""
+    if nice is not None:
+        service_tuning += f"Nice={int(nice)}\n"
+    if io_scheduling_class:
+        service_tuning += f"IOSchedulingClass={str(io_scheduling_class).strip()}\n"
+
     service_content = f"""[Unit]
 Description={description}
-After=network.target
+After={' '.join(after_units)}
 
 [Service]
 Type=simple
@@ -828,8 +860,9 @@ User={install_user}
 Group=www-data
 WorkingDirectory={working_dir}
 ExecStart={script_executor} {script_abs_path}
-Restart=always
+Restart={restart_policy}
 RestartSec={restart_sec}
+{service_tuning}
 
 [Install]
 WantedBy=multi-user.target
@@ -842,13 +875,18 @@ WantedBy=multi-user.target
         run_command(f"sudo mv {tmp_path} {service_path}")
         run_command(f"sudo chmod 644 {service_path}")
         run_command("sudo systemctl daemon-reload")
-        run_command(f"sudo systemctl enable {service_name}")
-        run_command(f"sudo systemctl reset-failed {service_name} 2>/dev/null || true")
-        if start_service:
-            run_command(f"sudo systemctl restart {service_name}")
-            print(f"✓ Service '{service_name}' installiert und gestartet.\n")
+        if enable_service:
+            run_command(f"sudo systemctl enable {service_name}")
+            run_command(f"sudo systemctl reset-failed {service_name} 2>/dev/null || true")
+            if start_service:
+                run_command(f"sudo systemctl restart {service_name}")
+                print(f"✓ Service '{service_name}' installiert und gestartet.\n")
+            else:
+                print(f"✓ Service '{service_name}' installiert und aktiviert; Start wird gesammelt ausgeführt.\n")
         else:
-            print(f"✓ Service '{service_name}' installiert und aktiviert; Start wird gesammelt ausgeführt.\n")
+            run_command(f"sudo systemctl disable {service_name} 2>/dev/null || true")
+            run_command(f"sudo systemctl stop {service_name} 2>/dev/null || true")
+            print(f"✓ Service '{service_name}' installiert und bleibt ausgeschaltet.\n")
         log_task_completed(f"Service {service_name} eingerichtet")
         return True
     except Exception as e:

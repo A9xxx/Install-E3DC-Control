@@ -1,6 +1,6 @@
 # V2H/V2G-Telemetrie (read-only)
 
-E3DC-Control erkennt negative Wallboxleistung als bidirektionalen Energiefluss und stellt diesen Zustand im Dashboard und über die lokale Telemetrie dar. Die Integration ist in v5.4.0 ausschließlich lesend: Sie startet oder stoppt keine Entladung, ändert keine Wallboxleistung, schaltet keine Phasen und betätigt weder CP noch ein Schütz.
+E3DC-Control erkennt negative Wallboxleistung als bidirektionalen Energiefluss und stellt diesen Zustand im Dashboard und über die lokale Telemetrie dar. Die Integration ist derzeit ausschließlich lesend: Sie startet oder stoppt keine Entladung, ändert keine Wallboxleistung, schaltet keine Phasen und betätigt weder CP noch ein Schütz.
 
 ## Anzeige und Grenzwerte
 

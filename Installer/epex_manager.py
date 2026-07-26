@@ -410,6 +410,51 @@ def load_v4_config():
 
     return config
 
+
+def _forecast_evidence_enabled_for_install(path=V4_CONFIG_FILE):
+    """Liest nur den optionalen Service-Schalter über einen nofollow-Vertrag."""
+
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            before = os.fstat(descriptor)
+            if not stat.S_ISREG(before.st_mode) or not 2 <= before.st_size <= 4 * 1024 * 1024:
+                raise ValueError("config_file_invalid")
+            chunks = []
+            remaining = before.st_size
+            while remaining > 0:
+                chunk = os.read(descriptor, min(64 * 1024, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            after = os.fstat(descriptor)
+            if (
+                remaining != 0
+                or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+                != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            ):
+                raise ValueError("config_file_changed")
+        finally:
+            os.close(descriptor)
+        payload = json.loads(b"".join(chunks).decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("config_root_invalid")
+    except Exception as exc:
+        logger.warning(
+            "PV-Prognosediagnose-Schalter nicht sicher lesbar; Dienst bleibt aus: %s",
+            exc,
+        )
+        return False
+    return str(payload.get("forecast_diagnostics_enable", "0")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+        "ein",
+    }
+
+
 def fetch_awattar_data():
     """Fetch data from Awattar (DE) Public API"""
     logger.info("Frage aWATTar API nach aktuellen Spot-Preisen...")
@@ -1450,31 +1495,57 @@ def install_epex_service(start_services=True):
     from .utils import _create_service_file, install_e3dc_live_service
 
     # 1. E3DC Live Daten Service (RSCP Python) - Basis für alle Kerndienste
-    print("\n[1/5] E3DC Live Daten Service...")
+    print("\n[1/6] E3DC Live Daten Service...")
     install_e3dc_live_service(start_service=start_services)
 
     # 2. EPEX Manager
-    print("\n[2/4] EPEX & Strompreis Manager...")
+    print("\n[2/6] EPEX & Strompreis Manager...")
     _create_service_file("e3dc-epex-manager", "E3DC EPEX Manager", "epex_manager.py", "python3", start_service=start_services)
 
     # 3. Wetter-/PV-Forecast Service
-    print("\n[3/4] Wetter & PV-Forecast Service...")
+    print("\n[3/6] Wetter & PV-Forecast Service...")
     forecast_path = os.path.join(os.path.dirname(__file__), "Forecast", "pv_forecast_service.py")
     if os.path.exists(forecast_path):
         _create_service_file("e3dc-weather-manager", "E3DC Wetter & PV Forecast", "Forecast/pv_forecast_service.py", "python3", start_service=start_services)
 
     # 4. Storage Simulator
-    print("\n[4/5] Storage Simulator...")
+    print("\n[4/6] Storage Simulator...")
     storage_path = os.path.join(os.path.dirname(__file__), "storage_simulator.py")
     if os.path.exists(storage_path):
         _create_service_file("e3dc-storage-simulator", "E3DC Storage Simulator", "storage_simulator.py", "python3", start_service=start_services)
 
     # 5. Storage Manager. Der aktuelle Regler ist kanonisch storage_manager.py;
     # der alte Regler bleibt nur als storage_manager_legacy.py im Repository.
-    print("\n[5/5] Storage Manager...")
+    print("\n[5/6] Storage Manager...")
     mgr_path = os.path.join(os.path.dirname(__file__), "storage_manager.py")
     if os.path.exists(mgr_path):
         _create_service_file("e3dc-storage-manager", "E3DC Storage Manager", "storage_manager.py", "python3", start_service=start_services)
+
+    # 6. Rein diagnostischer Prognose-Sidecar. Die Unit wird immer
+    # installiert, bleibt ohne ausdrückliche Nutzerfreigabe jedoch gestoppt.
+    print("\n[6/6] Optionale PV-Prognosediagnose...")
+    evidence_path = os.path.join(
+        os.path.dirname(__file__),
+        "forecast_evidence_sidecar.py",
+    )
+    if os.path.exists(evidence_path):
+        evidence_enabled = _forecast_evidence_enabled_for_install()
+        _create_service_file(
+            "e3dc-forecast-evidence",
+            "E3DC PV-Prognosediagnose (read-only)",
+            "forecast_evidence_sidecar.py",
+            "python3",
+            restart_sec=300,
+            start_service=bool(start_services and evidence_enabled),
+            enable_service=evidence_enabled,
+            restart_policy="on-failure",
+            nice=10,
+            io_scheduling_class="idle",
+            after_services=(
+                "e3dc-live.service",
+                "e3dc-weather-manager.service",
+            ),
+        )
 
     print("\n[OK] Alle Kern-Dienste installiert.")
 

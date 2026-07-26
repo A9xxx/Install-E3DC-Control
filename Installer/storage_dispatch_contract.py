@@ -31,7 +31,7 @@ PRICE_HORIZON_SCHEMA = "storage_dispatch_price_horizon_v2"
 DIRECT_MARKETING_PLAN_PROJECTION_SCHEMA = "direct_marketing_plan_projection_v1"
 TIMEZONE = "Europe/Berlin"
 SLOT_DURATION_S = 900
-ACTIVE_ACTIONS = {"PV_STORE", "GRID_CHARGE", "ECONOMIC_EXPORT", "HEADROOM_EXPORT", "HOUSE_SUPPLY"}
+ACTIVE_ACTIONS = {"PV_STORE", "GRID_CHARGE", "ECONOMIC_EXPORT", "HEADROOM_EXPORT", "HOUSE_SUPPLY", "CHARGE_BLOCK_WAIT"}
 
 _PLAN_SNAPSHOT_MAX_BYTES = 16 * 1024 * 1024
 _PLAN_SNAPSHOT_CACHE_LIMIT = 16
@@ -352,6 +352,11 @@ def _input_revisions(plan: Dict[str, Any], timeline: List[Dict[str, Any]]) -> Di
         "pv_p50_w",
         "pv_p90_w",
         "external_ac_pv_w",
+        "pv_forecast_fresh",
+        "forecast_fresh",
+        "pv_forecast_freshness_source",
+        "pv_store_forecast_fresh",
+        "pv_store_forecast_freshness_source",
     )
     topology_slot_material = any(
         str(row.get("pv_topology_status") or "") == "bound"
@@ -371,7 +376,23 @@ def _input_revisions(plan: Dict[str, Any], timeline: List[Dict[str, Any]]) -> Di
             "pv_resource_projection_reason",
             "pv_resource_contributions",
         )
-    load_keys = ("home_w", "wp_w", "climate_w", "wb_w", "wb2_w", "planned_load_w")
+    load_keys = (
+        "home_w",
+        "home_source",
+        "home_quality",
+        "wp_w",
+        "wp_source",
+        "wp_quality",
+        "climate_w",
+        "climate_source",
+        "climate_quality",
+        "wb_w",
+        "wb2_w",
+        "planned_load_w",
+        "load_p10_w",
+        "load_p50_w",
+        "load_p90_w",
+    )
     state_keys = ("soc", "charge_w", "target_charge_w", "surplus_w")
     hardware = {
         key: plan.get(key)
@@ -501,6 +522,81 @@ def _action_contract(
     return "HOLD", "LEGACY_SIMULATOR_HOLD", "Bestehender Simulator hält den Speicher.", 0.0
 
 
+def _projection_quality_usable(value: Any, *, not_applicable_ok: bool) -> bool:
+    normalized = str(value or "").strip().lower()
+    if not normalized:
+        return False
+    if not_applicable_ok and "not_applicable" in normalized:
+        return True
+    return not any(
+        marker in normalized
+        for marker in ("missing", "unresolved", "unknown", "invalid", "stale")
+    )
+
+
+def _load_projection_evidence(
+    row: Dict[str, Any],
+    load_p50_w: Optional[float],
+) -> Dict[str, Any]:
+    """Bindet Lastgültigkeit ohne eine nicht vorhandene Providerfrische zu erfinden."""
+
+    home_source = str(row.get("home_source") or "").strip()
+    home_valid = bool(
+        load_p50_w is not None
+        and home_source
+        and "unresolved" not in home_source.lower()
+        and _projection_quality_usable(
+            row.get("home_quality"),
+            not_applicable_ok=False,
+        )
+    )
+
+    def optional_component_valid(
+        power_key: str,
+        source_key: str,
+        quality_key: str,
+    ) -> bool:
+        power = _safe_float(row.get(power_key), None)
+        if power is None:
+            return False
+        quality = row.get(quality_key)
+        if abs(power) <= 0.001 and _projection_quality_usable(
+            quality,
+            not_applicable_ok=True,
+        ):
+            return True
+        source = str(row.get(source_key) or "").strip()
+        return bool(
+            source
+            and "unresolved" not in source.lower()
+            and _projection_quality_usable(
+                quality,
+                not_applicable_ok=False,
+            )
+        )
+
+    explicit_loads_valid = all(
+        _safe_float(row.get(key), None) is not None
+        for key in ("wb_w", "wb2_w", "planned_load_w")
+        if key in row
+    )
+    load_valid = bool(
+        home_valid
+        and optional_component_valid("wp_w", "wp_source", "wp_quality")
+        and optional_component_valid(
+            "climate_w",
+            "climate_source",
+            "climate_quality",
+        )
+        and explicit_loads_valid
+    )
+    return {
+        "load_valid": load_valid,
+        "load_validity_source": "component_projection_quality_v1",
+        "load_quality": "complete" if load_valid else "missing_or_invalid",
+    }
+
+
 def _build_slot(
     row: Dict[str, Any],
     previous_soc: Optional[float],
@@ -527,6 +623,7 @@ def _build_slot(
     load_p10_w = _safe_float(row.get("load_p10_w"), None)
     load_p50_w = _safe_float(row.get("load_p50_w"), total_load_w)
     load_p90_w = _safe_float(row.get("load_p90_w"), None)
+    load_evidence = _load_projection_evidence(row, load_p50_w)
     quantiles_available = all(
         value is not None
         for value in (pv_p10_w, pv_p90_w, load_p10_w, load_p90_w)
@@ -604,6 +701,24 @@ def _build_slot(
         "heat": {"p10": None, "p50": round(heat_w, 3), "p90": None},
         "wallbox": {"p10": None, "p50": round(wallbox_w, 3), "p90": None},
         "external_ac_pv": {"p10": None, "p50": _round_or_none(row.get("external_ac_pv_w"), 3), "p90": None},
+        "evidence": {
+            "pv_fresh": bool(
+                row.get(
+                    "pv_store_forecast_fresh",
+                    row.get(
+                        "pv_forecast_fresh",
+                        row.get("forecast_fresh"),
+                    ),
+                )
+                is True
+            ),
+            "pv_freshness_source": str(
+                row.get("pv_store_forecast_freshness_source")
+                or row.get("pv_forecast_freshness_source")
+                or "unconfirmed"
+            ),
+            **load_evidence,
+        },
     }
     if topology_bound:
         forecast_contract["e3dc_dc_pv"] = {
@@ -806,6 +921,17 @@ def _build_slot(
 
 def _plan_material(plan: Dict[str, Any]) -> Dict[str, Any]:
     material = {key: plan.get(key) for key in _PLAN_MATERIAL_KEYS}
+    source_planner = (
+        material.get("planner")
+        if isinstance(material.get("planner"), dict)
+        else {}
+    )
+    planner = copy.deepcopy(source_planner)
+    # Der neue DV-Planer ist in dieser Phase reine Diagnose. Seine Revision
+    # darf deshalb weder die produktive plan_id noch daraus abgeleitete
+    # slot_id-/Runtime-Generationen verändern.
+    planner.pop("dv_shadow_v1", None)
+    material["planner"] = planner
     slots = material.get("slots") if isinstance(material.get("slots"), list) else []
     material["slots"] = [
         {key: value for key, value in slot.items() if key != "slot_id"}
@@ -1070,6 +1196,10 @@ def _direct_marketing_policy_projection_for_slot(
             # entstehen; ein eingespielter Arbitragevertrag bleibt wirkungslos.
             "FORCE_EXPORT": ("ECONOMIC_EXPORT", {"eco_plus_export_candidate"}, "export_budget_w"),
             "FORCE_CHARGE_PV": ("PV_STORE", {"eco_plus_store_pv_candidate"}, "charge_budget_w"),
+            # Eine Ladesperre ist nur dann ein aktiver Hardwarevertrag, wenn
+            # die Policy sie als aktuellen, slotgebundenen Planentscheid
+            # veröffentlicht. HOLD und künftige Exportfenster genügen nicht.
+            "CHARGE_BLOCK_WAIT": ("CHARGE_BLOCK_WAIT", {"direct_marketing_charge_block_wait"}, None),
         }
         action_contract = action_map.get(target_state)
         if action_contract is None:
@@ -1078,8 +1208,16 @@ def _direct_marketing_policy_projection_for_slot(
         allowed_source_modes = {
             "ECONOMIC_EXPORT": {"eco_plus"},
             "PV_STORE": {"eco", "eco_plus"},
+            # Der Producer materialisiert den lückenlosen Warteslot-Vertrag
+            # derzeit ausschließlich für Eco+. Der Consumer darf diese
+            # Freigabe nicht vorsorglich auf weitere Strategien ausdehnen.
+            "CHARGE_BLOCK_WAIT": {"eco_plus"},
         }.get(plan_action, set())
-        action_budget_w = max(0.0, _safe_float(budget.get(budget_key), 0.0) or 0.0)
+        action_budget_w = (
+            max(0.0, _safe_float(budget.get(budget_key), 0.0) or 0.0)
+            if budget_key
+            else 0.0
+        )
         protected_reserve_wh = _safe_float(budget.get("protected_reserve_wh"), None)
         sellable_wh = _safe_float(budget.get("sellable_wh"), None)
         economics = decision.get("economics") if isinstance(decision.get("economics"), dict) else {}
@@ -1123,7 +1261,7 @@ def _direct_marketing_policy_projection_for_slot(
             and slot_end_ms <= execution_end_ms
             and plan_window_start_ms <= execution_start_ms
             and execution_end_ms <= plan_window_end_ms
-            and action_budget_w > 0.0
+            and (plan_action == "CHARGE_BLOCK_WAIT" or action_budget_w > 0.0)
             # Ein künftiger Verkauf darf den weichen Sollkurvenboden nur dann
             # überstimmen, wenn die vorgelagerte DV-Policy ihren harten
             # Haus-/Nacht-/Forecast-Reservevertrag explizit mitliefert.
@@ -1154,8 +1292,8 @@ def _direct_marketing_policy_projection_for_slot(
             parsed = _safe_float(value, None)
             if parsed is not None and parsed > 0.0:
                 power_limits.append(parsed)
-        planned_w = min(power_limits)
-        if planned_w <= 0.0:
+        planned_w = 0.0 if plan_action == "CHARGE_BLOCK_WAIT" else min(power_limits)
+        if planned_w <= 0.0 and plan_action != "CHARGE_BLOCK_WAIT":
             continue
         action_id = revision_hash({
             "action": plan_action,
@@ -1413,7 +1551,10 @@ def _materialize_direct_marketing_plan_projection(
         projection["direct_marketing_plan_battery_w"] = point["battery_w"]
         projection["direct_marketing_plan_grid_w"] = point["grid_w"]
         projection["direct_marketing_soc_projection_phase"] = point["phase"]
-        if isinstance(contract, dict) and point["planned_w"] > 0.0:
+        if isinstance(contract, dict) and (
+            point["planned_w"] > 0.0
+            or str(contract.get("action") or "").upper() == "CHARGE_BLOCK_WAIT"
+        ):
             plan_action = str(contract.get("action") or "").upper()
             window_start_ms = _safe_int(contract.get("window_start_ts_ms"), 0)
             window_end_ms = _safe_int(contract.get("window_end_ts_ms"), 0)
@@ -1628,6 +1769,53 @@ def build_canonical_dispatch_plan(legacy_plan: Dict[str, Any]) -> Dict[str, Any]
             ),
         },
     }
+    try:
+        try:
+            from .direct_marketing_dispatch_planner import (
+                build_direct_marketing_dispatch_shadow,
+                shadow_not_applicable as dv_shadow_not_applicable,
+                shadow_error as dv_shadow_error,
+                summarize_direct_marketing_dispatch_shadow,
+            )
+        except ImportError:
+            from direct_marketing_dispatch_planner import (  # type: ignore
+                build_direct_marketing_dispatch_shadow,
+                shadow_not_applicable as dv_shadow_not_applicable,
+                shadow_error as dv_shadow_error,
+                summarize_direct_marketing_dispatch_shadow,
+            )
+        try:
+            if _direct_marketing_not_applicable(direct):
+                dv_shadow = dv_shadow_not_applicable()
+            else:
+                dv_shadow_full = build_direct_marketing_dispatch_shadow(
+                    source,
+                    canonical,
+                )
+                dv_shadow = summarize_direct_marketing_dispatch_shadow(
+                    dv_shadow_full,
+                    generated_ms,
+                )
+        except Exception:
+            dv_shadow = dv_shadow_error("DV_SHADOW_INTERNAL_ERROR")
+    except Exception:
+        # Der neue Vertrag ist in dieser Phase rein diagnostisch. Selbst ein
+        # Importfehler darf den bestehenden Produktionsplan nicht verändern.
+        dv_shadow = {
+            "schema_version": "direct_marketing_dispatch_shadow_v1",
+            "algorithm": "explicit_dv_action_adapter_v1",
+            "shadow_only": True,
+            "commands_allowed": False,
+            "runtime_owner": "storage_manager",
+            "status": "SHADOW_ERROR",
+            "reason_code": "DV_SHADOW_IMPORT_ERROR",
+            "representation": "COMPACT_SUMMARY",
+            "full_payload_persisted": False,
+        }
+    # Der Namespace wird weder von Phase 5 noch vom Storage Manager gelesen.
+    # Seine drei eigenen Revisionen sind hashgebunden; die produktive
+    # plan_id/slot_id-Identität bleibt davon ausdrücklich unabhängig.
+    canonical["planner"]["dv_shadow_v1"] = dv_shadow
     try:
         try:
             from .storage_dispatch_optimizer import (
@@ -1979,6 +2167,8 @@ def _actual_action(payload: Dict[str, Any]) -> str:
         return "HEADROOM_EXPORT"
     if target == "HEADROOM_EXPORT":
         return "HEADROOM_EXPORT"
+    if target == "CHARGE_BLOCK_WAIT" or state == "direct_marketing_charge_block_wait":
+        return "CHARGE_BLOCK_WAIT"
     if target == "FORCE_EXPORT" or "direct_marketing" in state or "direct_marketing" in priority:
         return "ECONOMIC_EXPORT"
     mode_name = str(payload.get("mode_name") or "AUTO").upper()
@@ -1987,6 +2177,23 @@ def _actual_action(payload: Dict[str, Any]) -> str:
         return "GRID_CHARGE" if "grid" in state or "market" in priority else "PV_STORE"
     if mode_name in {"DISCHARGE", "DISCH"} and value_w > 0:
         return "HOUSE_SUPPLY"
+    auto_limit = (
+        payload.get("auto_limit")
+        if isinstance(payload.get("auto_limit"), dict)
+        else {}
+    )
+    if (
+        mode_name == "AUTO"
+        and auto_limit.get("enabled") is True
+        and auto_limit.get("release") is not True
+    ):
+        return (
+            "AUTO_CHARGE_BLOCK"
+            if _safe_int(auto_limit.get("max_charge_w"), -1) == 0
+            else "AUTO_CHARGE_LIMIT"
+        )
+    if state == "parallel_curve_charge":
+        return "CURVE_CHARGE"
     return "HOLD"
 
 
@@ -2005,7 +2212,7 @@ def _direct_marketing_runtime_plan_binding(
     action = str(candidate.get("action") or "").upper()
     selected_action = str(phase5.get("selected_action") or "").upper()
     runtime_claim = bool(
-        action in {"ECONOMIC_EXPORT", "PV_STORE", "GRID_CHARGE"}
+        action in {"ECONOMIC_EXPORT", "PV_STORE", "GRID_CHARGE", "CHARGE_BLOCK_WAIT"}
         and any(
             (
                 phase5.get("selected") is True and selected_action == action,
@@ -2028,10 +2235,12 @@ def _direct_marketing_runtime_plan_binding(
     expected_source_action = {
         "ECONOMIC_EXPORT": "eco_plus_export_candidate",
         "PV_STORE": "eco_plus_store_pv_candidate",
+        "CHARGE_BLOCK_WAIT": "direct_marketing_charge_block_wait",
     }.get(action)
     source_mode_valid = bool(
         (action == "ECONOMIC_EXPORT" and source_mode == "eco_plus")
         or (action == "PV_STORE" and source_mode in {"eco", "eco_plus"})
+        or (action == "CHARGE_BLOCK_WAIT" and source_mode == "eco_plus")
     )
     window_id = projection.get("direct_marketing_window_id")
     action_id = projection.get("direct_marketing_plan_action_id")
@@ -2056,7 +2265,7 @@ def _direct_marketing_runtime_plan_binding(
         and source_mode_valid
         and source_mode_matches_plan
         and planned_w is not None
-        and planned_w >= 300.0
+        and (planned_w >= 300.0 if action != "CHARGE_BLOCK_WAIT" else planned_w == 0.0)
         and isinstance(window_id, str)
         and bool(window_id.strip())
         and isinstance(action_id, str)
@@ -2153,13 +2362,25 @@ def build_runtime_overlay(
             "executable": False,
             "commands_allowed": False,
             "requested": False,
+            "attempted": False,
+            "acknowledged": False,
             "issued": False,
+            "confirmed": False,
             "hardware_effect": False,
             "selected_action": None,
             "selected_power_w": 0.0,
             "block_reason_code": direct_marketing_binding.get("reason_code"),
             "technical_block_reason_code": direct_marketing_binding.get("reason_code"),
         })
+        phase5["request_lifecycle"] = {
+            "requested": False,
+            "attempted": False,
+            "acknowledged": False,
+            "issued": False,
+            "confirmed": False,
+            "hardware_effect": False,
+            "confirmation": None,
+        }
         blockers = list(phase5.get("blockers") or [])
         if direct_marketing_binding.get("reason_code") not in blockers:
             blockers.insert(0, direct_marketing_binding.get("reason_code"))
@@ -2230,18 +2451,94 @@ def build_runtime_overlay(
     export_budget_w = value_w if commands_allowed and candidate_action in {"ECONOMIC_EXPORT", "HEADROOM_EXPORT"} else 0
     power_diag = payload.get("rscp_power_settings") if isinstance(payload.get("rscp_power_settings"), dict) else {}
     readback = power_diag.get("readback") if isinstance(power_diag.get("readback"), dict) else {}
-    if "acknowledged" in power_diag:
+    readback_ts_ms = _to_ts_ms(
+        power_diag.get("readback_cycle_ts") or power_diag.get("ts")
+    )
+    readback_age_ms = now_value - readback_ts_ms if readback_ts_ms > 0 else None
+    typed_readback = bool(
+        power_diag.get("schema") == "rscp_power_settings_v1"
+        and _safe_int(power_diag.get("contract_version"), 0) == 2
+        and isinstance(readback.get("limits_used"), bool)
+        and all(
+            isinstance(readback.get(key), int)
+            and not isinstance(readback.get(key), bool)
+            and readback.get(key) >= 0
+            for key in (
+                "max_charge_w",
+                "max_discharge_w",
+                "discharge_start_w",
+            )
+        )
+    )
+    readback_evidence_source = bool(
+        power_diag.get("readback_source") in {
+            "canonical_live",
+            "command_get_after_invalid_set_response",
+            "command_verification",
+        }
+        or power_diag.get("stage") in {"live_reconciliation", "target"}
+    )
+    readback_fresh = bool(
+        typed_readback
+        and readback_evidence_source
+        and readback_age_ms is not None
+        and -5_000 <= readback_age_ms <= 30_000
+    )
+    if explicit_phase5:
+        acknowledged = phase5.get("acknowledged")
+        historical_confirmation = bool(phase5.get("confirmed"))
+    elif "acknowledged" in power_diag:
         acknowledged = power_diag.get("acknowledged") is True
+        historical_confirmation = bool(power_diag.get("confirmed"))
     else:
         acknowledged = bool(power_diag.get("response_codes") is not None or power_diag.get("confirmed"))
-    confirmed = bool(power_diag.get("confirmed"))
+        historical_confirmation = bool(power_diag.get("confirmed"))
+    charge_block_lifecycle = bool(
+        explicit_phase5
+        and str(phase5.get("selected_action") or "").upper() in {
+            "DIRECT_MARKETING_CHARGE_BLOCK_WAIT",
+            "DIRECT_MARKETING_CHARGE_BLOCK_WAIT_SAFE_FALLBACK",
+        }
+    )
+    confirmed = bool(
+        historical_confirmation
+        and (readback_fresh if charge_block_lifecycle else True)
+    )
+    if charge_block_lifecycle and not readback_fresh:
+        phase5 = copy.deepcopy(phase5)
+        phase5["confirmed"] = False
+        phase5["hardware_effect"] = False
+        lifecycle = (
+            copy.deepcopy(phase5.get("request_lifecycle"))
+            if isinstance(phase5.get("request_lifecycle"), dict)
+            else {}
+        )
+        lifecycle.update({
+            "confirmed": False,
+            "hardware_effect": False,
+            "historical_confirmation": historical_confirmation,
+            "confirmation_fresh": False,
+        })
+        phase5["request_lifecycle"] = lifecycle
     requested = {
         "mode": mode_name,
         "mode_value": _safe_int(payload.get("mode"), 0),
         "power_w": value_w,
         "rscp_path": payload.get("rscp_command_path"),
         "issued_by": "storage_manager",
-        "issued": bool(phase5.get("requested")) if explicit_phase5 else bool(selected and executable),
+        "requested": bool(phase5.get("requested")) if explicit_phase5 else bool(selected and executable),
+        "attempted": bool(phase5.get("attempted")) if explicit_phase5 else bool(selected and executable),
+        "acknowledged": acknowledged,
+        "issued": bool(phase5.get("issued")) if explicit_phase5 else bool(selected and executable),
+        "confirmed": confirmed,
+        "historical_confirmation": historical_confirmation,
+        "hardware_effect": (
+            bool(phase5.get("hardware_effect") and confirmed)
+            if charge_block_lifecycle
+            else bool(phase5.get("hardware_effect"))
+            if explicit_phase5
+            else bool(selected and executable)
+        ),
         "dispatch_authorized": bool(selected and executable and commands_allowed),
     }
     return {
@@ -2279,7 +2576,11 @@ def build_runtime_overlay(
         "requested": requested,
         "ack": {
             "acknowledged": acknowledged,
-            "dispatch_acknowledged": bool(explicit_phase5 and phase5.get("requested") and acknowledged),
+            "dispatch_acknowledged": bool(
+                explicit_phase5
+                and phase5.get("acknowledged") is True
+                and phase5.get("issued") is True
+            ),
             "settings_acknowledged": acknowledged,
             "acknowledgement_status": power_diag.get("acknowledgement_status"),
             "scope": "POWER_SETTINGS_ONLY_NO_SET_POWER_ACK",
@@ -2288,17 +2589,17 @@ def build_runtime_overlay(
             "ts_ms": _to_ts_ms(power_diag.get("ts")) or None,
         },
         "readback": {
-            "confirmed": confirmed,
-            "fresh": bool(
-                power_diag.get("readback_source") in {
-                    "canonical_live",
-                    "command_get_after_invalid_set_response",
-                }
-                or power_diag.get("stage") == "live_reconciliation"
+            "confirmed": bool(power_diag.get("confirmed") and readback_fresh),
+            "historical_confirmation": bool(power_diag.get("confirmed")),
+            "fresh": readback_fresh,
+            "age_s": (
+                round(readback_age_ms / 1000.0, 3)
+                if readback_age_ms is not None
+                else None
             ),
             "status": power_diag.get("status"),
             "values": readback or None,
-            "ts_ms": _to_ts_ms(power_diag.get("readback_cycle_ts", power_diag.get("ts"))) or None,
+            "ts_ms": readback_ts_ms or None,
         },
         "physics": {
             "battery_power_w": _round_or_none(live.get("Battery_Power", payload.get("bat_w")), 3),

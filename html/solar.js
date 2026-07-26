@@ -1679,6 +1679,12 @@ function mobileStorageTime(ts) {
     return new Date(ms).toLocaleTimeString('de-DE', {hour: '2-digit', minute: '2-digit'});
 }
 
+function directMarketingTimestampMs(value) {
+    const raw = parseFloat(value);
+    if (!Number.isFinite(raw) || raw <= 0) return 0;
+    return raw > 100000000000 ? raw : raw * 1000;
+}
+
 function getDirectMarketingPlan(data) {
     if (data && data.direct_marketing && typeof data.direct_marketing === 'object') return data.direct_marketing;
     if (data && data.storage_plan_meta && data.storage_plan_meta.direct_marketing && typeof data.storage_plan_meta.direct_marketing === 'object') {
@@ -1804,24 +1810,130 @@ function isDirectMarketingVisible(data, plan, monitor) {
     if (data && data.direct_marketing_active === true) return true;
     if (monitor && monitor.enabled === true) return true;
     const mode = directMarketingNormalizeMode((monitor && monitor.mode) || (plan && plan.mode));
-    return ['safe', 'eco_plus', 'arbitrage'].includes(mode);
+    return ['safe', 'eco', 'eco_plus', 'arbitrage'].includes(mode);
 }
 
 function directMarketingModeLabel(mode) {
     const normalized = directMarketingNormalizeMode(mode);
     if (normalized === 'safe') return 'Safe';
+    if (normalized === 'eco') return 'Eco';
     if (normalized === 'eco_plus') return 'Eco+';
     if (normalized === 'arbitrage') return 'Arbitrage';
     return 'aus';
 }
 
+function directMarketingIsHoldAction(action) {
+    return [
+        'eco_plus_negative_headroom_hold',
+        'keep_headroom',
+        'arbitrage_keep_headroom',
+        'policy_headroom_hold',
+        'policy_charge_block_wait',
+        'direct_marketing_charge_block_wait',
+        'charge_block_wait'
+    ].includes(String(action || '').toLowerCase());
+}
+
+function directMarketingRuntimePhysicalAction(data = {}) {
+    const runtime = storageDispatchRuntimeForDisplay(data);
+    if (!runtime || String(runtime.owner || '').toLowerCase() !== 'storage_manager') return null;
+    const invariant = runtime.plan_runtime_selection_invariant;
+    const phase5 = runtime.phase5 && typeof runtime.phase5 === 'object' ? runtime.phase5 : {};
+    const requested = runtime.requested && typeof runtime.requested === 'object' ? runtime.requested : {};
+    if (
+        !invariant
+        || invariant.valid !== true
+        || phase5.schema_version !== 'storage_dispatch_phase5_v1'
+        || runtime.selected !== true
+        || runtime.executable !== true
+        || runtime.commands_allowed !== true
+        || requested.dispatch_authorized !== true
+        || requested.confirmed !== true
+        || requested.hardware_effect !== true
+    ) {
+        return null;
+    }
+
+    const actualAction = String(runtime.actual_manager_action || '').toUpperCase();
+    const phase5Action = String(phase5.selected_action || '').toUpperCase();
+    const candidateAction = String(runtime.candidate && runtime.candidate.action || '').toUpperCase();
+    const chargeBlockActions = new Set([
+        'CHARGE_BLOCK_WAIT',
+        'DIRECT_MARKETING_CHARGE_BLOCK_WAIT',
+        'DIRECT_MARKETING_CHARGE_BLOCK_WAIT_SAFE_FALLBACK'
+    ]);
+    if (
+        chargeBlockActions.has(actualAction)
+        && chargeBlockActions.has(phase5Action)
+        && candidateAction === 'CHARGE_BLOCK_WAIT'
+    ) {
+        const request = phase5.request && typeof phase5.request === 'object' ? phase5.request : {};
+        const target = request.target && typeof request.target === 'object' ? request.target : {};
+        const readback = runtime.readback && typeof runtime.readback === 'object' ? runtime.readback : {};
+        const readbackValues = readback.values && typeof readback.values === 'object' ? readback.values : {};
+        const translation = phase5.translation && typeof phase5.translation === 'object'
+            ? phase5.translation
+            : {};
+        const boundedReadback = request.bounded_zero_readback && typeof request.bounded_zero_readback === 'object'
+            ? request.bounded_zero_readback
+            : {};
+        const boundedZeroW = Math.max(
+            0,
+            parseFloat(
+                translation.bounded_zero_readback_max_w
+                ?? boundedReadback.accepted_readback_max_w
+                ?? 0
+            ) || 0
+        );
+        const requestedZeroCharge = target.limits_used === true
+            && parseFloat(target.max_charge_w) === 0;
+        const confirmedZeroCharge = readback.confirmed === true
+            && readback.fresh === true
+            && readbackValues.limits_used === true
+            && Number.isFinite(parseFloat(readbackValues.max_charge_w))
+            && parseFloat(readbackValues.max_charge_w) >= 0
+            && parseFloat(readbackValues.max_charge_w) <= boundedZeroW;
+        if (!requestedZeroCharge || !confirmedZeroCharge) return null;
+        const chargeBlock = phase5.charge_block_contract && typeof phase5.charge_block_contract === 'object'
+            ? phase5.charge_block_contract
+            : {};
+        const sourceWindow = chargeBlock.source_window && typeof chargeBlock.source_window === 'object'
+            ? chargeBlock.source_window
+            : {};
+        return {
+            action: 'charge_block_wait',
+            rawAction: phase5Action,
+            holdActive: true,
+            hardwareEffect: true,
+            startTs: parseFloat(sourceWindow.start_ts_ms || 0) || 0,
+            endTs: parseFloat(sourceWindow.end_ts_ms || 0) || 0
+        };
+    }
+
+    const displayActions = {
+        PV_STORE: 'eco_plus_store_pv_candidate',
+        ECONOMIC_EXPORT: 'eco_plus_export_candidate',
+        HEADROOM_EXPORT: 'policy_headroom_export'
+    };
+    const action = displayActions[actualAction] || '';
+    return action ? {
+        action,
+        rawAction: actualAction,
+        holdActive: false,
+        hardwareEffect: true,
+        startTs: 0,
+        endTs: 0
+    } : null;
+}
+
 function directMarketingActionLabel(action) {
     const normalized = String(action || '').toLowerCase();
     const labels = {
+        negative_price_market_window: 'Marktfenster ohne eigene Speicheraktion',
         keep_headroom: 'Speicherplatz freihalten',
         safe_house_supply: 'Haus versorgen',
         eco_plus_house_supply: 'Haus versorgen',
-        eco_plus_negative_headroom_hold: 'Speicherplatz freihalten',
+        eco_plus_negative_headroom_hold: 'Speicherplatz halten',
         eco_plus_store_pv_candidate: 'PV speichern',
         eco_plus_export_candidate: 'Verkaufskandidat',
         arbitrage_keep_headroom: 'Speicherplatz freihalten',
@@ -1829,6 +1941,9 @@ function directMarketingActionLabel(action) {
         arbitrage_export_candidate: 'Verkaufskandidat',
         policy_headroom_hold: 'Speicherplatz halten',
         policy_headroom_export: 'Speicherplatz schaffen',
+        policy_charge_block_wait: 'Speicherplatz halten',
+        direct_marketing_charge_block_wait: 'Speicherplatz halten',
+        charge_block_wait: 'Speicherplatz halten',
         policy_force_charge_pv: 'PV speichern',
         policy_force_export: 'Hochpreisverkauf',
         policy_hold: 'Energie halten',
@@ -2126,11 +2241,13 @@ function directMarketingWindowVisual(action, executionContract = null) {
     if (normalized === 'eco_plus_store_pv_candidate') {
         return {label: 'PV speichern', icon: 'fa-battery-half', color: '#f59e0b'};
     }
-    if (normalized === 'eco_plus_negative_headroom_hold') {
-        return {label: 'Speicherplatzreserve', icon: 'fa-battery-empty', color: '#f59e0b'};
-    }
     if (normalized === 'keep_headroom' || normalized === 'arbitrage_keep_headroom') {
         return {label: 'Speicherplatz freihalten', icon: 'fa-battery-half', color: '#f59e0b'};
+    }
+    if (directMarketingIsHoldAction(normalized)) {
+        return executionContract && executionContract.holdActive
+            ? {label: 'Speicherplatz halten', icon: 'fa-lock', color: '#f59e0b'}
+            : {label: 'Speicherplatzreserve', icon: 'fa-battery-empty', color: '#f59e0b'};
     }
     if (normalized === 'safe_house_supply' || normalized === 'eco_plus_house_supply') {
         return {label: 'Hausversorgung', icon: 'fa-home', color: '#a78bfa'};
@@ -2219,14 +2336,97 @@ function directMarketingWindowExecutionContract(windowEntry, monitor, plan) {
     const commandsAllowed = Boolean(decision && decision.commands_allowed === true);
     const isExport = action === 'eco_plus_export_candidate' || action === 'arbitrage_export_candidate';
     const isPvStore = action === 'eco_plus_store_pv_candidate';
-    const isHeadroom = action === 'eco_plus_negative_headroom_hold'
-        || action === 'keep_headroom'
-        || action === 'arbitrage_keep_headroom';
-    const active = selected && executable && commandsAllowed && (
-        (isExport && targetState === 'FORCE_EXPORT' && exportBudgetW > 0)
-        || (isPvStore && targetState === 'FORCE_CHARGE_PV' && chargeBudgetW > 0)
-        || (isHeadroom && targetState === 'HEADROOM_EXPORT' && exportBudgetW > 0)
+    const isHeadroom = directMarketingIsHoldAction(action);
+    const plannedHeadroomHold = selected && executable && commandsAllowed && isHeadroom && (
+        (targetState === 'HEADROOM_EXPORT' && storageBudget.headroom_hold_active === true)
+        || targetState === 'CHARGE_BLOCK_WAIT'
     );
+    const monitorTargetState = String(monitor.policy_target_state || '').toUpperCase();
+    const monitorAction = String(monitor.current_action || '').toLowerCase();
+    const monitorCurrentWindow = monitor.current_window && typeof monitor.current_window === 'object'
+        ? monitor.current_window
+        : {};
+    const monitorStart = parseFloat(monitorCurrentWindow.start_ts || 0) || 0;
+    const monitorEnd = parseFloat(monitorCurrentWindow.end_ts || 0) || 0;
+    const runtimeWindowMatches = Boolean(
+        windowEntry.current === true
+        || (
+            start > 0
+            && end > start
+            && monitorStart > 0
+            && monitorEnd > monitorStart
+            && start < monitorEnd
+            && monitorStart < end
+        )
+    );
+    const runtimeHoldAction = [
+        'policy_headroom_hold',
+        'policy_charge_block_wait',
+        'direct_marketing_charge_block_wait',
+        'charge_block_wait'
+    ].includes(monitorAction);
+    const runtimeHoldActive = Boolean(
+        monitor.active === true
+        && isHeadroom
+        && runtimeWindowMatches
+        && runtimeHoldAction
+        && (
+            (monitorTargetState === 'HEADROOM_EXPORT' && monitor.headroom_hold_active === true)
+            || monitorTargetState === 'CHARGE_BLOCK_WAIT'
+        )
+    );
+    const holdActive = plannedHeadroomHold || runtimeHoldActive;
+    const selectedPvStoreStarts = [];
+    if (plan.policy_decision && typeof plan.policy_decision === 'object') {
+        selectedPvStoreStarts.push(plan.policy_decision);
+    }
+    if (Array.isArray(plan.policy_timeline)) {
+        selectedPvStoreStarts.push(...plan.policy_timeline.filter(item => item && typeof item === 'object'));
+    }
+    const firstSelectedPvStoreTs = selectedPvStoreStarts
+        .filter(item => {
+            const selectedWindow = item.selected_window && typeof item.selected_window === 'object'
+                ? item.selected_window
+                : {};
+            return item.commands_allowed === true
+                && item.execution_window
+                && (
+                    String(item.dv_target_state || '').toUpperCase() === 'FORCE_CHARGE_PV'
+                    || String(selectedWindow.action || '').toLowerCase() === 'eco_plus_store_pv_candidate'
+                );
+        })
+        .map(item => {
+            const executionWindow = item.execution_window && typeof item.execution_window === 'object'
+                ? item.execution_window
+                : {};
+            const selectedWindow = item.selected_window && typeof item.selected_window === 'object'
+                ? item.selected_window
+                : {};
+            return parseFloat(
+                executionWindow.start_ts
+                || selectedWindow.start_ts
+                || item.start_ts
+                || 0
+            ) || 0;
+        })
+        .filter(value => {
+            if (value <= 0) return false;
+            const valueMs = value > 100000000000 ? value : value * 1000;
+            const holdStartMs = start > 100000000000 ? start : start * 1000;
+            return valueMs >= Math.max(Date.now() - 60000, holdStartMs);
+        })
+        .sort((left, right) => left - right)[0] || 0;
+    const effectiveUntilTs = Math.max(
+        0,
+        parseFloat(monitor.headroom_next_start_ts || 0) || firstSelectedPvStoreTs
+    );
+    const active = (
+        selected && executable && commandsAllowed && (
+            (isExport && targetState === 'FORCE_EXPORT' && exportBudgetW > 0)
+            || (isPvStore && targetState === 'FORCE_CHARGE_PV' && chargeBudgetW > 0)
+            || (isHeadroom && targetState === 'HEADROOM_EXPORT' && exportBudgetW > 0)
+        )
+    ) || holdActive;
     const candidateOnly = (isExport || isPvStore || isHeadroom) && !active;
     const blockReason = String(
         (decision && (decision.block_reason_code || decision.block_reason))
@@ -2242,6 +2442,9 @@ function directMarketingWindowExecutionContract(windowEntry, monitor, plan) {
         exportBudgetW,
         chargeBudgetW,
         active,
+        holdActive,
+        runtimeHoldActive,
+        effectiveUntilTs,
         candidateOnly,
         blockReason
     };
@@ -2444,16 +2647,460 @@ function collectDirectMarketingWindows(report, monitor, plan) {
     });
 }
 
+function directMarketingWindowBounds(item) {
+    const entry = item && item.windowEntry && typeof item.windowEntry === 'object'
+        ? item.windowEntry
+        : {};
+    const start = parseFloat(entry.start_ts || 0) || 0;
+    const end = parseFloat(entry.end_ts || 0) || 0;
+    return {start, end, valid: start > 0 && end > start};
+}
+
+function directMarketingWindowPriceSignature(item) {
+    const entry = item && item.windowEntry && typeof item.windowEntry === 'object'
+        ? item.windowEntry
+        : {};
+    const value = field => {
+        const parsed = parseFloat(entry[field]);
+        return Number.isFinite(parsed) ? parsed : null;
+    };
+    return JSON.stringify([
+        value('avg_billing_ct'),
+        value('avg_market_ct'),
+        value('avg_net_sell_ct'),
+        value('net_sell_ct')
+    ]);
+}
+
+function directMarketingNeutralHoldProjection(item) {
+    const entry = item && item.windowEntry && typeof item.windowEntry === 'object'
+        ? item.windowEntry
+        : {};
+    const action = String(entry.action || '').toLowerCase();
+    const reason = String(entry.reason || '').trim().toLowerCase();
+    return directMarketingIsHoldAction(action)
+        && (
+            ['policy_charge_block_wait', 'direct_marketing_charge_block_wait', 'charge_block_wait'].includes(action)
+            || reason === 'neutral dv wait slot'
+            || reason === 'headroom reservation hold'
+        );
+}
+
+function directMarketingMergeHoldItems(left, right, keepPreferredBounds = false) {
+    const score = item => {
+        const entry = item.windowEntry || {};
+        const bounds = directMarketingWindowBounds(item);
+        const priced = directMarketingWindowPriceSignature(item) !== '[null,null,null,null]';
+        return (priced ? 100 : 0)
+            + (String(entry.action || '').toLowerCase() === 'eco_plus_negative_headroom_hold' ? 20 : 0)
+            + (entry.current === true ? 10 : 0)
+            + (item.execution && item.execution.runtimeHoldActive ? 5 : 0)
+            + (bounds.valid ? Math.min(4, (bounds.end - bounds.start) / 900000) : 0);
+    };
+    const preferred = score(right) > score(left) ? right : left;
+    const secondary = preferred === left ? right : left;
+    const preferredBounds = directMarketingWindowBounds(preferred);
+    const leftBounds = directMarketingWindowBounds(left);
+    const rightBounds = directMarketingWindowBounds(right);
+    const entry = {
+        ...(secondary.windowEntry || {}),
+        ...(preferred.windowEntry || {})
+    };
+    if (
+        !keepPreferredBounds
+        && leftBounds.valid
+        && rightBounds.valid
+    ) {
+        entry.start_ts = Math.min(leftBounds.start, rightBounds.start);
+        entry.end_ts = Math.max(leftBounds.end, rightBounds.end);
+        entry.start_t = mobileStorageTime(entry.start_ts);
+        entry.end_t = mobileStorageTime(entry.end_ts);
+    } else if (preferredBounds.valid) {
+        entry.start_ts = preferredBounds.start;
+        entry.end_ts = preferredBounds.end;
+        entry.start_t = preferred.windowEntry.start_t || mobileStorageTime(entry.start_ts);
+        entry.end_t = preferred.windowEntry.end_t || mobileStorageTime(entry.end_ts);
+    }
+    entry.current = left.windowEntry.current === true || right.windowEntry.current === true;
+    entry._compacted_slot_count = Math.max(1, parseInt(left.windowEntry._compacted_slot_count || 1, 10))
+        + Math.max(1, parseInt(right.windowEntry._compacted_slot_count || 1, 10));
+    const leftExecution = left.execution || {};
+    const rightExecution = right.execution || {};
+    const blockReasons = [leftExecution.blockReason, rightExecution.blockReason]
+        .map(value => String(value || '').trim())
+        .filter(Boolean)
+        .filter((value, index, values) => values.indexOf(value) === index);
+    return {
+        windowEntry: entry,
+        execution: {
+            ...secondary.execution,
+            ...preferred.execution,
+            selected: leftExecution.selected === true || rightExecution.selected === true,
+            executable: leftExecution.executable === true || rightExecution.executable === true,
+            commandsAllowed: leftExecution.commandsAllowed === true || rightExecution.commandsAllowed === true,
+            active: leftExecution.active === true || rightExecution.active === true,
+            holdActive: leftExecution.holdActive === true || rightExecution.holdActive === true,
+            runtimeHoldActive: leftExecution.runtimeHoldActive === true || rightExecution.runtimeHoldActive === true,
+            candidateOnly: leftExecution.candidateOnly === true && rightExecution.candidateOnly === true,
+            effectiveUntilTs: Math.max(
+                parseFloat(leftExecution.effectiveUntilTs || 0) || 0,
+                parseFloat(rightExecution.effectiveUntilTs || 0) || 0
+            ),
+            blockReason: blockReasons.join('; ')
+        }
+    };
+}
+
+function directMarketingCompactHoldWindows(items) {
+    const ordered = Array.isArray(items) ? items.slice().sort((left, right) => {
+        const leftBounds = directMarketingWindowBounds(left);
+        const rightBounds = directMarketingWindowBounds(right);
+        return leftBounds.start - rightBounds.start || leftBounds.end - rightBounds.end;
+    }) : [];
+    const deduplicated = [];
+    ordered.forEach(item => {
+        if (!directMarketingIsHoldAction(item && item.windowEntry && item.windowEntry.action)) {
+            deduplicated.push(item);
+            return;
+        }
+        const itemBounds = directMarketingWindowBounds(item);
+        const matchIndex = deduplicated.findIndex(existing => {
+            if (!directMarketingIsHoldAction(existing && existing.windowEntry && existing.windowEntry.action)) return false;
+            const existingBounds = directMarketingWindowBounds(existing);
+            if (!itemBounds.valid || !existingBounds.valid) return false;
+            if (itemBounds.start >= existingBounds.end || existingBounds.start >= itemBounds.end) return false;
+            const samePrice = directMarketingWindowPriceSignature(item) === directMarketingWindowPriceSignature(existing);
+            const itemUnpriced = directMarketingWindowPriceSignature(item) === '[null,null,null,null]';
+            const existingUnpriced = directMarketingWindowPriceSignature(existing) === '[null,null,null,null]';
+            const exact = itemBounds.start === existingBounds.start && itemBounds.end === existingBounds.end;
+            const itemContained = itemBounds.start >= existingBounds.start && itemBounds.end <= existingBounds.end;
+            const existingContained = existingBounds.start >= itemBounds.start && existingBounds.end <= itemBounds.end;
+            return (exact && samePrice)
+                || (directMarketingNeutralHoldProjection(item) && itemContained && (itemUnpriced || samePrice))
+                || (directMarketingNeutralHoldProjection(existing) && existingContained && (existingUnpriced || samePrice));
+        });
+        if (matchIndex < 0) {
+            deduplicated.push(item);
+            return;
+        }
+        const existing = deduplicated[matchIndex];
+        const keepPreferredBounds = !(
+            directMarketingNeutralHoldProjection(existing)
+            && directMarketingNeutralHoldProjection(item)
+        );
+        deduplicated[matchIndex] = directMarketingMergeHoldItems(existing, item, keepPreferredBounds);
+    });
+
+    return deduplicated.reduce((result, item) => {
+        const previous = result[result.length - 1];
+        if (!previous || !directMarketingNeutralHoldProjection(previous) || !directMarketingNeutralHoldProjection(item)) {
+            result.push(item);
+            return result;
+        }
+        const previousBounds = directMarketingWindowBounds(previous);
+        const itemBounds = directMarketingWindowBounds(item);
+        const previousExecution = previous.execution || {};
+        const itemExecution = item.execution || {};
+        const sameContract = JSON.stringify([
+            directMarketingWindowPriceSignature(previous),
+            String(previous.windowEntry.reason || '').toLowerCase(),
+            previousExecution.active === true,
+            previousExecution.holdActive === true,
+            previousExecution.runtimeHoldActive === true,
+            previousExecution.candidateOnly === true,
+            previousExecution.commandsAllowed === true,
+            String(previousExecution.blockReason || '')
+        ]) === JSON.stringify([
+            directMarketingWindowPriceSignature(item),
+            String(item.windowEntry.reason || '').toLowerCase(),
+            itemExecution.active === true,
+            itemExecution.holdActive === true,
+            itemExecution.runtimeHoldActive === true,
+            itemExecution.candidateOnly === true,
+            itemExecution.commandsAllowed === true,
+            String(itemExecution.blockReason || '')
+        ]);
+        if (
+            previousBounds.valid
+            && itemBounds.valid
+            && Math.abs(itemBounds.start - previousBounds.end) <= 1000
+            && sameContract
+        ) {
+            result[result.length - 1] = directMarketingMergeHoldItems(previous, item);
+        } else {
+            result.push(item);
+        }
+        return result;
+    }, []);
+}
+
+function directMarketingPruneCoveredHoldDiagnostics(items, operational) {
+    const activeHolds = (Array.isArray(operational) ? operational : []).filter(item => (
+        directMarketingIsHoldAction(item && item.windowEntry && item.windowEntry.action)
+        && item.execution
+        && item.execution.holdActive === true
+        && item.execution.active === true
+    ));
+    return (Array.isArray(items) ? items : []).filter(item => {
+        if (!directMarketingIsHoldAction(item && item.windowEntry && item.windowEntry.action)) return true;
+        const bounds = directMarketingWindowBounds(item);
+        if (!bounds.valid) return true;
+        return !activeHolds.some(activeItem => {
+            const activeBounds = directMarketingWindowBounds(activeItem);
+            return activeBounds.valid
+                && activeBounds.start <= bounds.start
+                && bounds.end <= activeBounds.end;
+        });
+    });
+}
+
+function directMarketingActiveHoldDisplay(data) {
+    const plan = getDirectMarketingPlan(data);
+    const monitor = data && data.direct_marketing_monitor && typeof data.direct_marketing_monitor === 'object'
+        ? data.direct_marketing_monitor
+        : (data && data.storage_plan_meta && data.storage_plan_meta.direct_marketing_monitor
+            && typeof data.storage_plan_meta.direct_marketing_monitor === 'object'
+            ? data.storage_plan_meta.direct_marketing_monitor
+            : null);
+    const physicalAction = directMarketingRuntimePhysicalAction(data);
+    const physicalHoldActive = physicalAction && physicalAction.holdActive === true;
+    // Eine Planung oder Monitor-Projektion ist noch keine wirksame Speicherregelung.
+    // HOLD wird erst angezeigt, wenn der gebundene Storage-Manager-Ausgang samt
+    // frischem POWER_SETTINGS-Readback den Ladeblock bestätigt.
+    if (!physicalHoldActive) return null;
+    const mode = directMarketingModeLabel(
+        directMarketingNormalizeMode((monitor && monitor.mode) || (plan && plan.mode))
+    );
+    const untilTs = Math.max(
+        directMarketingTimestampMs(physicalAction && physicalAction.endTs)
+    );
+    const until = untilTs > 0 ? mobileStorageTime(untilTs) : '';
+    const status = `${until && until !== '--' ? 'Laden bis ' + until + ' Uhr gesperrt' : 'Laden gesperrt'} · Entladen erlaubt`;
+    return {
+        title: 'Speicherplatz halten',
+        target: '',
+        curve: status,
+        status,
+        badge: `Speicherregelung · DV ${mode} · bestätigt`,
+        source: 'confirmed_runtime'
+    };
+}
+
+function directMarketingPlannedHoldHint(data = {}) {
+    const plan = getDirectMarketingPlan(data);
+    const monitor = data && data.direct_marketing_monitor && typeof data.direct_marketing_monitor === 'object'
+        ? data.direct_marketing_monitor
+        : (data && data.storage_plan_meta && data.storage_plan_meta.direct_marketing_monitor
+            && typeof data.storage_plan_meta.direct_marketing_monitor === 'object'
+            ? data.storage_plan_meta.direct_marketing_monitor
+            : null);
+    if (!isDirectMarketingVisible(data, plan, monitor)) return '';
+    const monitorAction = String(monitor && monitor.current_action || '').toLowerCase();
+    const monitorTargetState = String(monitor && monitor.policy_target_state || '').toUpperCase();
+    const monitorPlansHold = Boolean(
+        monitor
+        && directMarketingIsHoldAction(monitorAction)
+        && (
+            monitorTargetState === 'CHARGE_BLOCK_WAIT'
+            || (monitorTargetState === 'HEADROOM_EXPORT' && monitor.headroom_hold_active === true)
+        )
+    );
+    const plannedWindow = collectDirectMarketingWindows(null, monitor, plan).some(windowEntry => (
+        windowEntry
+        && windowEntry.current === true
+        && directMarketingIsHoldAction(windowEntry.action)
+    ));
+    return monitorPlansHold || plannedWindow ? 'Geplant: Speicherplatz halten' : '';
+}
+
+function storageOperationalDisplay(data = {}) {
+    const confirmedHold = directMarketingActiveHoldDisplay(data);
+    if (confirmedHold) {
+        return {
+            state: 'hold',
+            label: confirmedHold.title,
+            detail: confirmedHold.status,
+            badge: confirmedHold.badge,
+            color: '#f59e0b',
+            active: true,
+            holdActive: true,
+            confirmed: true,
+            hideCurveDetails: true,
+            plannedHint: '',
+            source: confirmedHold.source
+        };
+    }
+
+    const stateRaw = String(data.storage_state || '').trim();
+    const state = stateRaw.toLowerCase();
+    const unconfirmedHoldStates = new Set([
+        'direct_marketing_phase5_pv_store_wait',
+        'direct_marketing_charge_block_wait',
+        'direct_marketing_eco_plus_headroom_hold'
+    ]);
+    const autoStates = new Set([
+        '',
+        'auto',
+        'normal',
+        'auto_night_release',
+        'parallel_evening_release',
+        'target_reached_auto',
+        ...unconfirmedHoldStates
+    ]);
+    const colors = {
+        auto: '#818cf8',
+        normal: '#818cf8',
+        auto_night_release: '#818cf8',
+        parallel_evening_release: '#818cf8',
+        target_reached_auto: '#818cf8',
+        charge: '#f59e0b',
+        discharge: '#10b981',
+        idle: '#6b7280',
+        price_override: '#06b6d4',
+        cheap_grid_charge: '#22c55e',
+        grid_charge: '#06b6d4',
+        morning_autonomy: '#38bdf8',
+        emergency_power: '#ef4444',
+        stopped: '#ef4444'
+    };
+    const plannedHint = directMarketingPlannedHoldHint(data);
+    return {
+        state: autoStates.has(state) ? 'auto' : state,
+        label: autoStates.has(state)
+            ? 'AUTO'
+            : storageStateDisplayLabel(stateRaw, data.storage_state_label),
+        detail: '',
+        badge: autoStates.has(state) ? 'E3/DC regelt frei' : '',
+        color: colors[state] || '#adb5bd',
+        active: !autoStates.has(state),
+        holdActive: false,
+        confirmed: false,
+        hideCurveDetails: false,
+        plannedHint,
+        source: stateRaw ? 'storage_state' : 'missing'
+    };
+}
+
 function directMarketingPriceText(windowEntry) {
     const billing = parseFloat(windowEntry && windowEntry.avg_billing_ct);
+    const netSell = parseFloat(
+        windowEntry && (windowEntry.avg_net_sell_ct ?? windowEntry.net_sell_ct)
+    );
     const market = parseFloat(windowEntry && windowEntry.avg_market_ct);
-    if (Number.isFinite(billing)) {
-        return 'Abrechnung ' + billing.toLocaleString('de-DE', {minimumFractionDigits: 2, maximumFractionDigits: 2}) + ' ct/kWh';
+    const format = value => value.toLocaleString(
+        'de-DE',
+        {minimumFractionDigits: 2, maximumFractionDigits: 2}
+    ) + ' ct/kWh';
+    const parts = [];
+    if (Number.isFinite(billing)) parts.push('Abrechnung ' + format(billing));
+    if (Number.isFinite(netSell)) parts.push('Verkauf netto ' + format(netSell));
+    if (!parts.length && Number.isFinite(market)) parts.push('Börse ' + format(market));
+    return parts.join(' · ');
+}
+
+function directMarketingPriceBreakdownHtml(windowEntry, economics) {
+    windowEntry = windowEntry && typeof windowEntry === 'object' ? windowEntry : {};
+    economics = economics && typeof economics === 'object' ? economics : {};
+    const isPvStore = String(windowEntry.action || '').toLowerCase() === 'eco_plus_store_pv_candidate';
+    const grossSell = parseFloat(windowEntry.avg_gross_sell_ct ?? windowEntry.gross_sell_ct);
+    const feeCost = parseFloat(windowEntry.avg_fee_cost_ct ?? windowEntry.fee_cost_ct);
+    const opportunity = isPvStore ? parseFloat(economics.pv_shift_opportunity_ct) : NaN;
+    const spread = isPvStore ? parseFloat(economics.pv_shift_spread_ct_per_kwh) : NaN;
+    const format = value => value.toLocaleString(
+        'de-DE',
+        {minimumFractionDigits: 2, maximumFractionDigits: 2}
+    ) + ' ct/kWh';
+    const parts = [];
+    if (Number.isFinite(grossSell)) parts.push('Marktpreis brutto ' + format(grossSell));
+    if (Number.isFinite(feeCost)) parts.push('Gebühren ' + format(feeCost));
+    if (Number.isFinite(opportunity)) parts.push('Plan-Opportunitätskosten ' + format(opportunity));
+    if (Number.isFinite(spread)) parts.push('PV-Verschiebespread ' + format(spread));
+    if (!parts.length) return '';
+    return `
+        <details class="small mt-1">
+            <summary class="text-muted" style="cursor:pointer;">Rechenweg</summary>
+            <span class="d-block text-muted mt-1">${directMarketingHtmlEscape(parts.join(' | '))}</span>
+        </details>
+    `;
+}
+
+function directMarketingAllocationSummaryHtml(allocation) {
+    allocation = allocation && typeof allocation === 'object' ? allocation : {};
+    if (allocation.evaluated !== true) return '';
+    const nonNegativeNumber = value => {
+        const parsed = parseFloat(value);
+        return Number.isFinite(parsed) ? Math.max(0, parsed) : null;
+    };
+    const nonNegativeInteger = value => {
+        const parsed = parseInt(value, 10);
+        return Number.isFinite(parsed) ? Math.max(0, parsed) : null;
+    };
+    const requestedWh = nonNegativeNumber(allocation.requested_stored_wh);
+    const selectedWh = nonNegativeNumber(allocation.selected_stored_wh);
+    const remainingWh = nonNegativeNumber(allocation.remaining_stored_wh);
+    const candidateSlots = nonNegativeInteger(allocation.candidate_slot_count);
+    const selectedSlots = nonNegativeInteger(allocation.selected_slot_count);
+    const marginal = allocation.marginal_slot && typeof allocation.marginal_slot === 'object'
+        ? allocation.marginal_slot
+        : {};
+    const sourceContract = allocation.source_contract && typeof allocation.source_contract === 'object'
+        ? allocation.source_contract
+        : {};
+    const marginalNetSell = parseFloat(marginal.net_sell_ct);
+    const summaryParts = [];
+    if (selectedWh !== null && requestedWh !== null && requestedWh > 0) {
+        summaryParts.push(
+            directMarketingKwhText(selectedWh / 1000)
+            + ' von '
+            + directMarketingKwhText(requestedWh / 1000)
+        );
+    } else if (selectedWh !== null) {
+        summaryParts.push(directMarketingKwhText(selectedWh / 1000));
+    } else if (requestedWh !== null && requestedWh > 0) {
+        summaryParts.push('Bedarf ' + directMarketingKwhText(requestedWh / 1000));
     }
-    if (Number.isFinite(market)) {
-        return 'Börse ' + market.toLocaleString('de-DE', {minimumFractionDigits: 2, maximumFractionDigits: 2}) + ' ct/kWh';
+    if (candidateSlots !== null && candidateSlots > 0 && selectedSlots !== null) {
+        summaryParts.push(selectedSlots + '/' + candidateSlots + ' Slots');
     }
-    return '';
+    if (Number.isFinite(marginalNetSell)) {
+        summaryParts.push(
+            'Grenzpreis Verkauf netto '
+            + marginalNetSell.toLocaleString(
+                'de-DE',
+                {minimumFractionDigits: 2, maximumFractionDigits: 2}
+            )
+            + ' ct/kWh'
+        );
+    }
+    if (!summaryParts.length) return '';
+    const detailParts = [
+        'Negativpreis-Schutz zuerst, innerhalb der Preisklasse Verkauf netto aufsteigend',
+        'Slotleistung = Minimum aus Batterielimit, PV-Prognose und Restbedarf'
+    ];
+    if (sourceContract.aux_ac_used === true) {
+        detailParts.push('Quelle E3DC-DC plus ausdrücklich freigegebener Zusatz-WR-AC');
+        const dcDeficitWh = nonNegativeNumber(sourceContract.dc_forecast_deficit_wh);
+        if (dcDeficitWh !== null && dcDeficitWh > 50) {
+            detailParts.push(
+                'nachgewiesene DC-Prognoseunterdeckung '
+                + directMarketingKwhText(dcDeficitWh / 1000)
+            );
+        }
+    } else {
+        detailParts.push('Quelle nur E3DC-DC');
+        if (sourceContract.aux_ac_user_release === true) {
+            detailParts.push('Zusatz-WR-AC aktuell nicht benötigt oder nicht belastbar freigegeben');
+        }
+    }
+    if (remainingWh !== null && remainingWh > 50) {
+        detailParts.push('noch ' + directMarketingKwhText(remainingWh / 1000) + ' offen');
+    }
+    return `
+        <details class="mt-1">
+            <summary class="text-info" style="cursor:pointer;">PV-Ladeallokation: ${directMarketingHtmlEscape(summaryParts.join(' · '))}</summary>
+            <span class="d-block text-muted mt-1">${directMarketingHtmlEscape(detailParts.join(' | '))}</span>
+        </details>
+    `;
 }
 
 function directMarketingWindowDurationH(windowEntry) {
@@ -2525,12 +3172,28 @@ function directMarketingWindowRowHtml(windowEntry, economics, executionContract 
     const start = windowEntry.start_t || mobileStorageTime(windowEntry.start_ts);
     const end = windowEntry.end_t || mobileStorageTime(windowEntry.end_ts);
     const action = directMarketingActionLabel(windowEntry.action);
+    const actionDetail = action === visual.label ? '' : action;
     const price = directMarketingPriceText(windowEntry);
     const energy = directMarketingEnergyText(windowEntry);
     const spread = directMarketingProfitText(directMarketingSpreadForAction(windowEntry.action, economics));
     const spreadLabel = directMarketingSpreadLabelForAction(windowEntry.action);
     const reason = directMarketingReasonLabel(windowEntry.reason);
     const budget = directMarketingSegmentBudgetText(windowEntry);
+    const effectiveUntil = executionContract.holdActive && executionContract.effectiveUntilTs
+        ? mobileStorageTime(executionContract.effectiveUntilTs)
+        : '';
+    const holdEffect = executionContract.holdActive
+        ? (
+            executionContract.runtimeHoldActive
+                ? `Laden gesperrt${effectiveUntil && effectiveUntil !== '--' ? ' bis ' + effectiveUntil + ' Uhr' : ''}; Entladen bleibt erlaubt`
+                : `Laden in diesem Planabschnitt gesperrt${effectiveUntil && effectiveUntil !== '--' ? ' bis ' + effectiveUntil + ' Uhr' : ''}; Entladen bleibt erlaubt`
+        )
+        : '';
+    const planInterval = executionContract.runtimeHoldActive
+        && start
+        && end
+        ? `Planabschnitt ${start}-${end}`
+        : '';
     const marginClass = String(windowEntry.margin_class || windowEntry.market_window_margin_class || '');
     const marginSummary = executionContract.marketOnly
         ? (marginClass === 'mixed'
@@ -2551,20 +3214,29 @@ function directMarketingWindowRowHtml(windowEntry, economics, executionContract 
             : '');
     const executionState = executionContract.marketOnly
         ? 'reines Marktfenster; PV_STORE und Exportfreigabe werden getrennt geplant'
+        : executionContract.holdActive
+        ? (executionContract.runtimeHoldActive ? 'Regelwirkung aktiv' : 'zur Ausführung eingeplant')
         : executionContract.active
         ? 'zur Ausführung freigegeben'
         : (executionContract.candidateOnly ? 'nicht freigegeben: ' + (executionContract.blockReason || 'keine ausführbare Planbindung') : '');
-    const detailParts = [price, energy, marginSummary, spread ? spreadLabel + ' ' + spread : '', reason, exportConstraint, budget, executionState].filter(Boolean);
+    const detailParts = [holdEffect, planInterval, price, energy, marginSummary, spread ? spreadLabel + ' ' + spread : '', reason, exportConstraint, budget, executionState].filter(Boolean);
+    const priceBreakdown = directMarketingPriceBreakdownHtml(windowEntry, economics);
     const titleParts = [
         visual.label + ': ' + (start || '--') + ' bis ' + (end || '--'),
-        action,
+        actionDetail,
         ...detailParts
     ].filter(Boolean);
-    const currentBadge = windowEntry.current === true
-        ? (executionContract.active
+    const currentBadge = windowEntry.current === true || executionContract.runtimeHoldActive
+        ? (executionContract.runtimeHoldActive
+            ? '<span class="badge bg-warning bg-opacity-10 text-warning border border-warning border-opacity-25">jetzt wirksam</span>'
+            : executionContract.active
             ? '<span class="badge bg-success bg-opacity-10 text-success border border-success border-opacity-25">aktuell und freigegeben</span>'
             : '<span class="badge bg-secondary bg-opacity-10 text-secondary border border-secondary border-opacity-25">aktuell, keine Ausführung</span>')
         : '';
+    const displayStart = executionContract.runtimeHoldActive ? 'jetzt' : start;
+    const displayEnd = executionContract.runtimeHoldActive && effectiveUntil && effectiveUntil !== '--'
+        ? effectiveUntil
+        : end;
 
     return `
         <div class="d-flex gap-2 align-items-start py-2 border-top border-secondary border-opacity-10" title="${directMarketingHtmlEscape(titleParts.join('\n'))}">
@@ -2574,11 +3246,12 @@ function directMarketingWindowRowHtml(windowEntry, economics, executionContract 
             <span class="flex-grow-1">
                 <span class="d-flex flex-wrap gap-2 align-items-center">
                     <span class="fw-bold" style="color:${visual.color};">${directMarketingHtmlEscape(visual.label)}</span>
-                    <span class="text-body">${directMarketingHtmlEscape((start || '--') + '-' + (end || '--'))}</span>
+                    <span class="text-body">${directMarketingHtmlEscape((displayStart || '--') + '-' + (displayEnd || '--'))}</span>
                     ${currentBadge}
-                    <span class="text-muted">${directMarketingHtmlEscape(action)}</span>
+                    ${actionDetail ? `<span class="text-muted">${directMarketingHtmlEscape(actionDetail)}</span>` : ''}
                 </span>
                 <span class="d-block text-muted">${directMarketingHtmlEscape(detailParts.join(' | ') || 'noch ohne Detailwerte')}</span>
+                ${priceBreakdown}
             </span>
         </div>
     `;
@@ -2628,7 +3301,8 @@ function renderDirectMarketingCurveSection(data = null) {
     const modeLabel = directMarketingModeLabel(modeRaw || (report && report.latest_summary && report.latest_summary.mode));
     const shadow = (monitor && (monitor.shadow === true || monitor.commands_allowed === false))
         || (plan && plan.flags && plan.flags.commands_allowed === false);
-    const active = monitor && monitor.active === true;
+    const physicalAction = directMarketingRuntimePhysicalAction(data);
+    const active = Boolean(physicalAction) || (monitor && monitor.active === true);
     const stateText = active ? 'aktiv'
         : (shadow ? 'Beobachtung, keine Befehle'
             : ((monitor && monitor.state === 'waiting') ? 'wartet auf Fenster' : 'beobachtet'));
@@ -2669,6 +3343,9 @@ function renderDirectMarketingCurveSection(data = null) {
     const marketValueSolarText = formatMarketValueSolarSummary(marketValueSolar, false);
     const marketValueSolarTitle = formatMarketValueSolarTitle(marketValueSolar);
     if (marketValueSolarText) reportParts.push(marketValueSolarText);
+    const allocationHtml = directMarketingAllocationSummaryHtml(
+        plan && plan.pv_store_allocation
+    );
 
     if (summaryEl) {
         summaryEl.innerHTML = `
@@ -2683,6 +3360,7 @@ function renderDirectMarketingCurveSection(data = null) {
             ${uniqueCandidates.length ? '<div class="mt-1 text-muted">Nicht ausgewählte Kandidaten: ' + directMarketingHtmlEscape(uniqueCandidates.join(', ')) + '</div>' : ''}
             ${uniqueDiagnostics.length ? '<div class="mt-1 text-info">Allokationshinweise: ' + directMarketingHtmlEscape(uniqueDiagnostics.join(', ')) + '</div>' : ''}
             ${reportParts.length ? '<div class="mt-1 text-muted" title="' + directMarketingHtmlEscape(marketValueSolarTitle) + '">Tagesfenster: ' + directMarketingHtmlEscape(reportParts.join(' | ')) + '</div>' : ''}
+            ${allocationHtml}
         `;
     }
 
@@ -2692,8 +3370,15 @@ function renderDirectMarketingCurveSection(data = null) {
             execution: directMarketingWindowExecutionContract(windowEntry, monitor, plan)
         }));
         const marketWindows = decorated.filter(item => item.execution.marketOnly);
-        const operational = decorated.filter(item => !item.execution.marketOnly && (!item.execution.candidateOnly || item.execution.active));
-        const diagnostic = decorated.filter(item => item.execution.candidateOnly && !item.execution.active);
+        const operational = directMarketingCompactHoldWindows(
+            decorated.filter(item => !item.execution.marketOnly && (!item.execution.candidateOnly || item.execution.active))
+        );
+        const diagnostic = directMarketingPruneCoveredHoldDiagnostics(
+            directMarketingCompactHoldWindows(
+                decorated.filter(item => item.execution.candidateOnly && !item.execution.active)
+            ),
+            operational
+        );
         const shown = operational.slice(0, 10);
         const hidden = operational.slice(10);
         if (!shown.length) {
@@ -2764,8 +3449,11 @@ function renderDirectMarketingDashboardStatus(data = null) {
     const modeRaw = directMarketingNormalizeMode((monitor && monitor.mode) || (plan && plan.mode));
     wrap.style.display = '';
     const flags = plan && plan.flags && typeof plan.flags === 'object' ? plan.flags : {};
-    const commandsAllowed = (monitor && monitor.commands_allowed === true) || flags.commands_allowed === true;
-    const active = monitor && monitor.active === true;
+    const physicalAction = directMarketingRuntimePhysicalAction(data);
+    const commandsAllowed = Boolean(physicalAction)
+        || (monitor && monitor.commands_allowed === true)
+        || flags.commands_allowed === true;
+    const active = Boolean(physicalAction) || (monitor && monitor.active === true);
     const shadow = (monitor && monitor.shadow === true) || (plan && plan.shadow === true) || !commandsAllowed;
     const modeLabel = directMarketingModeLabel(modeRaw || (report && report.latest_summary && report.latest_summary.mode));
     const controllableActions = new Set([
@@ -2796,7 +3484,12 @@ function renderDirectMarketingDashboardStatus(data = null) {
         plan && plan.windows,
         windows
     );
-    const action = String((monitor && monitor.current_action) || (nextWindow && nextWindow.action) || '');
+    const action = String(
+        (physicalAction && physicalAction.action)
+        || (monitor && monitor.current_action)
+        || (nextWindow && nextWindow.action)
+        || ''
+    );
     const salesWindow = directMarketingSalesWindowContract(monitor, plan);
     const blockers = Array.isArray(monitor && monitor.blocked_reasons)
         ? monitor.blocked_reasons.map(directMarketingBlockerLabel).filter(Boolean)
@@ -2808,21 +3501,25 @@ function renderDirectMarketingDashboardStatus(data = null) {
     const marginGateText = salesWindow.candidate
         ? directMarketingMarginGateText(monitor, plan, action)
         : '';
-    const power = nextWindow && (!salesWindow.candidate || salesWindow.active)
+    const power = !physicalAction && nextWindow && (!salesWindow.candidate || salesWindow.active)
         ? directMarketingEnergyText(nextWindow)
         : '';
     const pvSource = livePvSourceInfo(data);
     const externalPvText = pvSource.external > 20
         ? getFlowLabel('external_pv') + ' ' + mobileStoragePower(pvSource.external) + (pvSource.locked ? ' für Akku gesperrt' : '')
         : '';
-    const windowText = nextWindow && (!salesWindow.candidate || salesWindow.active)
+    const windowText = !physicalAction && nextWindow && (!salesWindow.candidate || salesWindow.active)
         ? directMarketingWindowText(nextWindow)
         : '';
-    const actionText = salesWindow.candidate && !salesWindow.active
+    const actionText = physicalAction
+        ? directMarketingActionLabel(physicalAction.action)
+        : salesWindow.candidate && !salesWindow.active
         ? 'keine Verkaufsfreigabe'
         : (salesWindow.active ? 'Verkaufsfenster' : (action ? directMarketingActionLabel(action) : ''));
-    const displayActive = salesWindow.candidate ? salesWindow.active : active;
-    const statusText = salesWindow.candidate
+    const displayActive = physicalAction ? true : (salesWindow.candidate ? salesWindow.active : active);
+    const statusText = physicalAction
+        ? 'aktiv'
+        : salesWindow.candidate
         ? (salesWindow.active ? 'aktiv' : 'wirtschaftlich gesperrt')
         : (active ? 'aktiv' : (shadow ? 'Beobachtung' : 'bereit'));
     const detailParts = [
@@ -3024,12 +3721,14 @@ function setMobileStorageText(id, text, visible = true) {
 function storageStateDisplayLabel(state, providedLabel = '') {
     const normalized = String(state || '').toLowerCase();
     const labels = {
-        direct_marketing_eco_plus_pv_store: 'DV Eco+ PV speichern',
-        direct_marketing_eco_plus_headroom_hold: 'DV Eco+ Speicherplatz halten',
-        direct_marketing_eco_plus_headroom_export: 'DV Eco+ Speicherplatz schaffen',
-        direct_marketing_eco_plus_export: 'DV Eco+ Einspeisung',
-        direct_marketing_arbitrage_grid_charge: 'DV Arbitrage Netzladen',
-        direct_marketing_arbitrage_export: 'DV Arbitrage Einspeisung'
+        direct_marketing_eco_plus_pv_store: 'PV speichern',
+        direct_marketing_phase5_pv_store_wait: 'Speicherplatz halten',
+        direct_marketing_charge_block_wait: 'Speicherplatz halten',
+        direct_marketing_eco_plus_headroom_hold: 'Speicherplatz halten',
+        direct_marketing_eco_plus_headroom_export: 'Speicherplatz schaffen',
+        direct_marketing_eco_plus_export: 'Hochpreisverkauf',
+        direct_marketing_arbitrage_grid_charge: 'Preisgesteuertes Netzladen',
+        direct_marketing_arbitrage_export: 'Hochpreisverkauf'
     };
     return labels[normalized] || providedLabel || String(state || 'Speicherregelung').replace(/_/g, ' ');
 }
@@ -3093,14 +3792,20 @@ function updateMobileStorageStrip(data) {
     const releaseText = curveMeta.curve_end_t
         ? curveMeta.curve_end_t + ' ' + mobileStoragePct(curveMeta.curve_end_soc || targetSoc, 0)
         : mobileStorageAnchorText(lastAnchor);
+    const storageDisplay = storageOperationalDisplay(data);
+    const directMarketingHold = storageDisplay.holdActive ? storageDisplay : null;
 
     strip.style.display = 'block';
-    strip.classList.toggle('storage-active', !!limitsActive || stateRaw.includes('charge') || stateRaw.includes('schutz'));
-    strip.classList.toggle('storage-free', eveningRelease || (!limitsActive && stateRaw.includes('auto')));
+    strip.classList.toggle('storage-active', storageDisplay.active || !!limitsActive || stateRaw.includes('charge') || stateRaw.includes('schutz'));
+    strip.classList.toggle('storage-free', storageDisplay.state === 'auto' || eveningRelease || (!limitsActive && stateRaw.includes('auto')));
 
-    setMobileStorageText('m-storage-mode-pill', limitsActive ? 'EMS aktiv' : 'EMS frei');
-    setMobileStorageText('m-storage-title', storageStateDisplayLabel(data.storage_state, data.storage_state_label));
-    if (eveningRelease) {
+    setMobileStorageText('m-storage-mode-pill', directMarketingHold
+        ? storageDisplay.badge
+        : (limitsActive ? 'EMS aktiv' : 'EMS frei'));
+    setMobileStorageText('m-storage-title', storageDisplay.label);
+    if (directMarketingHold) {
+        setMobileStorageText('m-storage-soll', '', false);
+    } else if (eveningRelease) {
         setMobileStorageText('m-storage-soll', 'Freilauf');
     } else if (activeTarget.mode === 'floor_catchup' || activeTarget.mode === 'ceiling_hold') {
         setMobileStorageText('m-storage-soll', 'Regelziel');
@@ -3110,7 +3815,9 @@ function updateMobileStorageStrip(data) {
         setMobileStorageText('m-storage-soll', 'Soll ' + mobileStoragePct(targetSoc, 0));
     }
 
-    if (eveningRelease) {
+    if (directMarketingHold) {
+        setMobileStorageText('m-storage-curve', storageDisplay.detail);
+    } else if (eveningRelease) {
         setMobileStorageText('m-storage-curve', 'Freilauf erreicht');
     } else if (activeTarget.mode === 'floor_catchup' || activeTarget.mode === 'ceiling_hold') {
         setMobileStorageText('m-storage-curve', activeTarget.label);
@@ -3129,7 +3836,7 @@ function updateMobileStorageStrip(data) {
         && chargeAcceptanceDiagnostic.active === true
         && chargeAcceptanceDiagnostic.control_effect === false
         && chargeAcceptanceDiagnostic.display_text === 'Ladeannahme begrenzt – Ursache unklar';
-    if (chargeAcceptanceActive) {
+    if (chargeAcceptanceActive && !directMarketingHold) {
         setMobileStorageText('m-storage-curve', chargeAcceptanceDiagnostic.display_text);
     }
     const requestParts = [];
@@ -3151,7 +3858,11 @@ function updateMobileStorageStrip(data) {
     } else if (ifcW !== null && ifcW > 0) {
         requestParts.push('Bedarf wartet ' + mobileStoragePower(ifcW));
     }
-    setMobileStorageText('m-storage-ifc', requestParts.join(' | '), requestParts.length > 0);
+    setMobileStorageText(
+        'm-storage-ifc',
+        directMarketingHold ? '' : requestParts.join(' | '),
+        !directMarketingHold && requestParts.length > 0
+    );
     const requestEl = document.getElementById('m-storage-ifc');
     if (requestEl) {
         const titleParts = [];
@@ -3184,23 +3895,28 @@ function updateMobileStorageStrip(data) {
         requestEl.title = titleParts.join('\n');
     }
 
-    if (limitsActive) {
+    if (directMarketingHold) {
+        setMobileStorageText('m-storage-ems', '', false);
+    } else if (limitsActive) {
         setMobileStorageText('m-storage-ems', 'EMS Lade ' + mobileStoragePower(emsCharge || 0) + ' | Entl. ' + mobileStoragePower(emsDischarge || 0));
     } else {
         setMobileStorageText('m-storage-ems', 'EMS frei');
     }
 
     const anchorWrap = document.getElementById('m-storage-anchors');
-    const showAnchors = !!(firstAnchor || lastAnchor || curveMeta.curve_end_t);
+    const showAnchors = !directMarketingHold && !!(firstAnchor || lastAnchor || curveMeta.curve_end_t);
     if (anchorWrap) anchorWrap.style.display = showAnchors ? '' : 'none';
     setMobileStorageText('m-storage-start', mobileStorageAnchorText(firstAnchor), showAnchors);
     setMobileStorageText('m-storage-now', mobileStoragePct(curveNow, 1), showAnchors && curveNow != null);
     setMobileStorageText('m-storage-release', releaseText, showAnchors);
 
     const reason = String(data.storage_reason || '').replace(/\s+/g, ' ').trim();
-    setMobileStorageText('m-storage-reason', reason || 'Noch kein Storage-Manager-Status vorhanden.');
+    const displayReason = directMarketingHold
+        ? storageDisplay.detail
+        : (storageDisplay.plannedHint || reason || 'Noch kein Storage-Manager-Status vorhanden.');
+    setMobileStorageText('m-storage-reason', displayReason);
     const reasonEl = document.getElementById('m-storage-reason');
-    if (reasonEl) reasonEl.title = reason || '';
+    if (reasonEl) reasonEl.title = directMarketingHold ? storageDisplay.badge : (reason || storageDisplay.plannedHint || '');
 }
 
 document.addEventListener('DOMContentLoaded', () => {
@@ -3889,6 +4605,26 @@ function updateStatsUI(data, mode) {
                 eegNote.innerText = '';
                 eegNote.style.display = 'none';
             }
+        }
+
+        const dvReport = (data.direct_marketing_daily_report && typeof data.direct_marketing_daily_report === 'object')
+            ? data.direct_marketing_daily_report
+            : (data.storage_plan_meta && data.storage_plan_meta.direct_marketing_daily_report && typeof data.storage_plan_meta.direct_marketing_daily_report === 'object'
+                ? data.storage_plan_meta.direct_marketing_daily_report
+                : null);
+        const dvRevenue = dvReport ? Number(dvReport.real_net_export_revenue_eur) : NaN;
+        const dvEnergy = dvReport ? Number(dvReport.real_export_kwh) : NaN;
+        const dvSaleRow = document.getElementById(prefix + 'stat-dv-battery-sale-row');
+        const dvSaleEl = document.getElementById(prefix + 'stat-dv-battery-sale');
+        const dvSaleNote = document.getElementById(prefix + 'stat-dv-battery-sale-note');
+        const dvSaleValid = Number.isFinite(dvRevenue) && Number.isFinite(dvEnergy) && dvEnergy > 0;
+        if (dvSaleRow) dvSaleRow.style.display = dvSaleValid ? '' : 'none';
+        if (dvSaleEl) dvSaleEl.innerText = dvSaleValid ? formatEuro(dvRevenue, true) : '—';
+        if (dvSaleNote) {
+            dvSaleNote.innerText = dvSaleValid
+                ? `${dvEnergy.toLocaleString('de-DE', {minimumFractionDigits: 1, maximumFractionDigits: 1})} kWh · Ø ${(dvRevenue * 100 / dvEnergy).toLocaleString('de-DE', {minimumFractionDigits: 2, maximumFractionDigits: 2})} ct/kWh · separat vom Endergebnis`
+                : '';
+            dvSaleNote.style.display = dvSaleValid ? '' : 'none';
         }
 
         const elAvg = document.getElementById(prefix + 'stat-avg-price');
@@ -4944,6 +5680,10 @@ function switchChartMode(mode, view = 'normal') {
             forecastSummaryBar.innerHTML = '';
         }
     }
+    const forecastDiagnosticCard = document.getElementById('pv-forecast-diagnostic-card');
+    if (forecastDiagnosticCard && mode !== 'forecast' && mode !== 'hybrid') {
+        forecastDiagnosticCard.hidden = true;
+    }
 
     if (mode === 'flow') {
         if(title) title.innerHTML = '<i class="fas fa-project-diagram me-2 text-info"></i>Live Energiefluss';
@@ -5364,6 +6104,87 @@ function updateForecastProjectionStatus(data) {
         status.style.color = '#dc3545';
     }
     status.hidden = false;
+}
+
+function updatePvForecastDiagnostics(data) {
+    const card = document.getElementById('pv-forecast-diagnostic-card');
+    if (!card) return;
+
+    const diagnostic = data && typeof data.pv_forecast_diagnostics === 'object'
+        ? data.pv_forecast_diagnostics
+        : null;
+    const status = diagnostic ? String(diagnostic.status || '') : '';
+    if (!diagnostic || status === 'aus') {
+        card.hidden = true;
+        return;
+    }
+
+    card.hidden = false;
+    const available = diagnostic.available === true;
+    const provisional = diagnostic.provisional === true;
+    const statusElement = document.getElementById('pv-forecast-diagnostic-status');
+    if (statusElement) {
+        statusElement.textContent = available
+            ? (provisional ? 'Lernphase' : 'Belastbar')
+            : 'Noch keine Auswertung';
+        statusElement.className = available
+            ? `badge ${provisional ? 'text-bg-warning' : 'text-bg-success'}`
+            : 'badge text-bg-secondary';
+    }
+
+    const metrics = diagnostic.metrics && typeof diagnostic.metrics === 'object'
+        ? diagnostic.metrics
+        : {};
+    const finiteMetric = key => {
+        if (metrics[key] === null || metrics[key] === undefined || metrics[key] === '') {
+            return null;
+        }
+        const value = Number(metrics[key]);
+        return Number.isFinite(value) ? value : null;
+    };
+    const setMetric = (id, value, unit, signed = false) => {
+        const element = document.getElementById(id);
+        if (!element) return;
+        if (value === null) {
+            element.textContent = '–';
+            return;
+        }
+        const prefix = signed && value > 0 ? '+' : '';
+        element.textContent = `${prefix}${value.toLocaleString('de-DE', {
+            minimumFractionDigits: 1,
+            maximumFractionDigits: 1
+        })}${unit}`;
+    };
+    setMetric(
+        'pv-forecast-diagnostic-hit',
+        finiteMetric('trefferabweichung_wh'),
+        ' Wh/15 min'
+    );
+    setMetric(
+        'pv-forecast-diagnostic-direction',
+        finiteMetric('richtungsversatz_wh'),
+        ' Wh/15 min',
+        true
+    );
+    setMetric(
+        'pv-forecast-diagnostic-energy',
+        finiteMetric('energiegewichtete_gesamtabweichung_pct'),
+        ' %'
+    );
+    setMetric(
+        'pv-forecast-diagnostic-coverage',
+        finiteMetric('vergleichsabdeckung_pct'),
+        ' %'
+    );
+
+    const comparedSlots = Math.max(0, Number(diagnostic.compared_slots) || 0);
+    const relevantDays = Math.max(0, Number(diagnostic.yield_relevant_days) || 0);
+    const sampleElement = document.getElementById('pv-forecast-diagnostic-sample');
+    if (sampleElement) {
+        sampleElement.textContent = comparedSlots > 0
+            ? `${comparedSlots.toLocaleString('de-DE')} verglichene 15-Minuten-Fenster · ${relevantDays.toLocaleString('de-DE')} Ertragstage`
+            : 'Noch keine vergleichbaren Fenster';
+    }
 }
 
 function normalizeElectricityPriceSeries(price) {
@@ -6144,6 +6965,7 @@ function loadJsForecastChart(file = '') {
         .then(r => r.json())
         .then(data => {
             updateForecastProjectionStatus(data);
+            updatePvForecastDiagnostics(data);
             if (data.error || !data.labels || data.labels.length === 0) return;
 
             // SoC kommt aus der physikalischen Batterie-Bilanz der Prognose.
@@ -6438,6 +7260,7 @@ function loadJsHybridChart(hours, file = null) {
     ]).then(([data, forecastData]) => {
         if (data.error) return;
         updateForecastProjectionStatus(forecastData);
+        updatePvForecastDiagnostics(forecastData);
         if (forecastData.error || !forecastData.labels) forecastData = { labels: [], pv: [], home: [], bat: [], grid: [], soc: [] };
 
         const isDarkMode = typeof DARK_MODE !== 'undefined' ? DARK_MODE : true;
@@ -6781,14 +7604,14 @@ function loadJsHybridChart(hours, file = null) {
             datasets,
             directMarketingMarketPrice,
             'y2',
-            'DV-Negativpreisfenster (Rohpreis)',
+            'DV Marktpreis (Verkauf)',
             {borderColor: '#0ea5e9', borderWidth: 3, order: 9}
         );
         const hasMarketWindowNetSell = pushElectricityPriceDataset(
             datasets,
             directMarketingMarketNetSell,
             'y2',
-            'Netto-Grenzerlös im Negativpreisfenster',
+            'DV Netto-Verkaufspreis',
             {borderColor: '#22c55e', borderWidth: 2.5, order: 8}
         );
         if (hasPriceAxis || hasMarketWindowPrice || hasMarketWindowNetSell) {

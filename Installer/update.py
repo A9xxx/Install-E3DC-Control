@@ -30,6 +30,7 @@ from .backup import backup_current_version, restore_verified_backup
 from .backup_integrity import _open_directory_nofollow, _open_regular_file_nofollow
 from .utils import run_command, cleanup_pycache
 from .installer_config import (
+    WEB_CONFIG_START_DEFAULTS,
     ensure_web_config,
     get_install_path,
     get_install_user,
@@ -325,6 +326,7 @@ CATALOG_FALLBACK_SERVICES = (
     'e3dc-heizstab',
     'e3dc-climate-live',
     'e3dc-climate-control',
+    'e3dc-forecast-evidence',
     'e3dc-ha',
     'e3dc-matter-bridge',
     'e3dc-bluelink',
@@ -435,6 +437,116 @@ def _current_ha_mode(config_path: str = HA_CONFIG_PATH) -> str:
     if mode not in VALID_HA_ROLES:
         raise RuntimeError(f"Ungueltige HA-/Shadow-Rolle: {mode!r}")
     return mode
+
+
+FIRST_INSTALL_METADATA_KEYS = frozenset({
+    "install_user",
+    "home_dir",
+    "install_path",
+    "venv_name",
+    "venv_path",
+})
+
+
+def classify_installation_state(config_path: str = HA_CONFIG_PATH) -> tuple[str, str]:
+    """Classify the local installation without guessing an existing role.
+
+    Only the exact, product-created default configuration without any E3DC
+    installation marker is a first installation. A complete legacy
+    installation needs the two Web entrypoints, every install-center core
+    service and a valid HA/Shadow role. Incomplete but safely bound states are
+    resumable; unreadable or unbound states remain blocked.
+    """
+
+    try:
+        installed_units = tuple(
+            unit
+            for unit in (*_catalog_units_strict(), "e3dc.service")
+            if _service_unit_exists(unit)
+        )
+    except Exception as exc:
+        return "blocked", f"E3DC-Dienstkatalog ist nicht sicher prüfbar: {exc}"
+    web_program_paths = (
+        "/var/www/html/index.php",
+        "/var/www/html/helpers.php",
+    )
+    present_web_files = tuple(path for path in web_program_paths if os.path.exists(path))
+    missing_web_files = tuple(path for path in web_program_paths if path not in present_web_files)
+    missing_core_units = tuple(
+        _unit_name(service)
+        for service in INSTALL_CENTER_CORE_SERVICES
+        if not _service_unit_exists(service)
+    )
+    has_installation_marker = bool(installed_units or present_web_files)
+    try:
+        config, _raw = _read_json_nofollow(config_path)
+    except FileNotFoundError:
+        if has_installation_marker:
+            return "blocked", "V4-Konfiguration fehlt, obwohl Installationsbestandteile vorhanden sind"
+        return "fresh", "keine V4-Konfiguration und keine Installationsbestandteile vorhanden"
+    except Exception as exc:
+        return "blocked", f"V4-Konfiguration ist nicht sicher lesbar: {exc}"
+
+    allowed_keys = set(FIRST_INSTALL_METADATA_KEYS) | set(WEB_CONFIG_START_DEFAULTS) | {"ha_mode"}
+    is_default_config = set(config).issubset(allowed_keys)
+    if is_default_config:
+        for key, default in WEB_CONFIG_START_DEFAULTS.items():
+            if config.get(key, default) != default:
+                is_default_config = False
+                break
+    default_role = str(config.get("ha_mode") or "").strip().lower()
+    if is_default_config and default_role not in {"", "off"}:
+        is_default_config = False
+
+    if not has_installation_marker and is_default_config:
+        return "fresh", "nur die unveränderte Startkonfiguration ist vorhanden"
+
+    role = str(config.get("ha_mode") or "").strip().lower()
+    if role not in VALID_HA_ROLES:
+        return "blocked", "bestehende Betriebskonfiguration enthält keine gültige HA-/Shadow-Rolle"
+
+    if not missing_web_files and not missing_core_units:
+        return "ready", "vollständige Installation mit gebundener HA-/Shadow-Rolle"
+
+    missing = [
+        *(f"Webdatei fehlt: {path}" for path in missing_web_files),
+        *(f"Kerndienst fehlt: {unit}" for unit in missing_core_units),
+    ]
+    return "partial", "unvollständige Installation: " + "; ".join(missing)
+
+
+def start_installation_or_update(*, allow_first_install: bool, headless: bool = False):
+    """Route menu and direct update entrypoints through one conservative gate."""
+
+    state, detail = classify_installation_state()
+    if state == "fresh":
+        if not allow_first_install:
+            print("[!] Erstinstallation erkannt; ein Release-Update wurde nicht gestartet.")
+            print("    Starte zuerst die vollständige Installation über das Konsolenmenü.")
+            return False
+        print("[i] Erstinstallation erkannt; starte das vollständige E3DC-Control-Setup.")
+        from .install_all import install_all_main
+        return install_all_main(
+            headless=headless,
+            bind_first_install_role=True,
+        )
+    if state == "partial":
+        if not allow_first_install:
+            print(f"[!] Unvollständige Installation erkannt: {detail}.")
+            print("    Setze die vollständige Installation über das Konsolenmenü fort.")
+            return False
+        print(f"[i] Unvollständige Installation erkannt: {detail}.")
+        print("    Die vollständige Installation wird sicher fortgesetzt.")
+        from .install_all import install_all_main
+        return install_all_main(headless=headless)
+    if state == "blocked":
+        print(f"[!] Installation / Update wurde nicht gestartet: {detail}.")
+        print("    Bitte zuerst die bestehende Installation über Systemreparatur prüfen.")
+        return False
+    if state == "ready":
+        return update_e3dc(headless=headless)
+    print(f"[!] Unbekannter Installationszustand: {state!r}.")
+    return False
 
 
 def _catalog_units_strict() -> tuple[str, ...]:
@@ -740,7 +852,10 @@ def _ensure_install_center_core_services() -> bool:
         from .install_notifier import install_notifier
         ok = _run_core_service_installer(
             "Zeitplanung und Langzeit-Archiv",
-            lambda: install_notifier(start_service=False),
+            lambda: install_notifier(
+                start_service=False,
+                migrate_legacy_config=False,
+            ),
         ) and ok
     except Exception as exc:
         print(f"  [!] Notifier-/Archivar-Installer konnte nicht geladen werden: {exc}")
@@ -2190,7 +2305,12 @@ def _assert_tree_no_symlinks(root: str) -> None:
                 raise RuntimeError(f"Symlink in Release-Baum nicht erlaubt: {path}")
 
 
-def _sync_release_web(repo_dir: str, policy: dict) -> None:
+def _sync_release_web(
+    repo_dir: str,
+    policy: dict,
+    *,
+    allow_config_bootstrap: bool = False,
+) -> None:
     html_src = os.path.join(repo_dir, "html")
     errors = _required_web_file_errors(html_src)
     if errors:
@@ -2221,8 +2341,14 @@ def _sync_release_web(repo_dir: str, policy: dict) -> None:
         result = _run_argv(["sudo", "install", "-m", "0644", source, os.path.join("/var/www/html", name)], timeout=15)
         if not result["success"]:
             raise RuntimeError(f"{name} konnte nicht in Webroot installiert werden")
-    if not repair_legacy_paths_file():
-        raise RuntimeError("Legacy-Pfadvertrag konnte nicht repariert werden")
+    if allow_config_bootstrap:
+        if not repair_legacy_paths_file():
+            raise RuntimeError("Legacy-Pfadvertrag konnte nicht repariert werden")
+    else:
+        print(
+            "  [OK] Bestehende Betriebskonfiguration und Legacy-Pfadspiegel "
+            "bleiben im Release-Fenster unverändert."
+        )
     if not policy.get("run_permissions", True):
         if _fix_webroot_permissions() is not True:
             raise RuntimeError("Webroot-Rechtehärtung fehlgeschlagen")
@@ -2345,7 +2471,11 @@ def finalize_release_from_target(
     if not delete_ok:
         raise RuntimeError("Stale-Delete-Positivliste verletzt: " + "; ".join(delete_errors))
 
-    _sync_release_web(target_root, policy)
+    _sync_release_web(
+        target_root,
+        policy,
+        allow_config_bootstrap=state.bootstrap_legacy_config,
+    )
     if policy.get("run_permissions", True):
         from .permissions import run_permissions_wizard
         if run_permissions_wizard(headless=True, release_quiesced=True) is False:
@@ -3252,7 +3382,7 @@ def run_initial_forecast(installer_dir: str | None = None):
 
 
 def update_menu():
-    update_e3dc()
+    return start_installation_or_update(allow_first_install=True)
 
 
 # Im Docker-Container kein Update-Menueintrag

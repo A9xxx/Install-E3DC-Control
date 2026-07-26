@@ -302,15 +302,20 @@ def main():
         if args.update_e3dc:
             print("→ Starte Update-Modul...")
             sys.stdout.flush()
-            from Installer.update import update_e3dc
-            update_ok = update_e3dc(headless=True)
+            from Installer.update import start_installation_or_update
+            update_ok = start_installation_or_update(
+                allow_first_install=False,
+                headless=True,
+            )
             
-            # Sicherstellen, dass e3dc_paths.json nach Update aktuell ist
-            config = load_config()
-            user = config.get("install_user")
-            if user:
-                logger = logging.getLogger("install")
-                ensure_web_config_safe(user, logger)
+            # Pfadmetadaten nur nach einem tatsächlichen Update synchronisieren.
+            # Ein blockierter Direktaufruf darf kein halbes Erstsystem erzeugen.
+            if update_ok is not False:
+                config = load_config()
+                user = config.get("install_user")
+                if user:
+                    logger = logging.getLogger("install")
+                    ensure_web_config_safe(user, logger)
                 
             sys.exit(0 if update_ok is not False else 1)
 
@@ -369,9 +374,12 @@ def main():
             UNATTENDED_MODE = True
             if not ensure_install_user():
                 sys.exit(1)
-            from Installer.install_all import install_all_main
-            install_all_main(headless=True)
-            sys.exit(0)
+            from Installer.update import start_installation_or_update
+            install_ok = start_installation_or_update(
+                allow_first_install=True,
+                headless=True,
+            )
+            sys.exit(0 if install_ok is not False else 1)
 
         check_for_installer_updates()
 

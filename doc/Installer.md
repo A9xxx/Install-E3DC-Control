@@ -1,6 +1,6 @@
 # E3DC-Control Installer
 
-Dokumentation Stand: 5.4.1d
+Dokumentation Stand: 5.4.2
 
 Der Installer verwaltet Bare-Metal-Installation, Update, Rechte, Dienste,
 Backup, Rollback und optionale Produktmodule. Er ermittelt Benutzer, Home,
@@ -28,7 +28,22 @@ bash "$E3DC_INSTALL_PATH/e3dc-setup" --update-e3dc
 Rechte und startet den Installer mit dem zur Installation gehörenden
 Interpreter. Ein manuelles `git pull` ersetzt diesen Weg nicht.
 
-Für den einmaligen Wechsel von 5.3.2b auf 5.4.1d gilt eine engere
+Seit 5.4.2 unterscheidet der Einstieg drei Zustände:
+
+- Eine **frische Installation** besitzt noch keine Anlagenbestandteile. Nur in
+  diesem Fall wird beim ersten Erzeugen der Konfiguration `ha_mode=off` als
+  Einzelanlage vorbelegt und das vollständige Setup gestartet.
+- Eine sicher erkennbare **unvollständige Installation** kann über
+  `Installation / Update` fortgesetzt werden.
+- Eine vorhandene, aber widersprüchliche Installation ohne gültige
+  HA-/Shadow-Rolle bleibt gesperrt. Sie wird nicht still als Einzelanlage
+  umgedeutet und muss zuerst über die Systemreparatur geprüft werden.
+
+Paket-, Konfigurations-, Webportal-, Rechte- und Dienstfehler werden bis zum
+Menü- und Prozess-Exitcode weitergegeben. Ein fehlgeschlagener Schritt wird
+nicht als erfolgreicher Abschluss angezeigt.
+
+Für den einmaligen Wechsel von 5.3.2b auf das aktuelle Stable-Release gilt eine engere
 Startbedingung: ausschließlich Web-Update oder der direkte
 `sudo /usr/bin/python3 installer_main.py --update-e3dc`-Aufruf aus
 [Update.md](Update.md). Der interaktive Menüpunkt lädt im 5.3.2b-Altprozess

@@ -36,6 +36,7 @@ for _path in (REPO_ROOT, SCRIPT_DIR):
 
 from rscp_client import RscpConnection, RscpTag, RscpType  # noqa: E402
 from storage_parallel_regulator import (  # noqa: E402
+    EMS_POWER_SETTINGS_NONZERO_MIN_W,
     MODE_AUTO,
     MODE_CHRG,
     MODE_DISCH,
@@ -55,6 +56,7 @@ from Wallbox.modes import (  # noqa: E402
 from Wallbox import phase_transition as wallbox_phase_transition_policy  # noqa: E402
 from runtime_logging import configure_service_logger  # noqa: E402
 from config_validator import write_config_validation  # noqa: E402
+from pv_forecast_topology import build_pv_forecast_topology  # noqa: E402
 from aux_inverter_contract import (  # noqa: E402
     effective_contract as aux_inverter_effective_contract,
     migrate_state_files as migrate_aux_inverter_state_files,
@@ -95,6 +97,10 @@ try:
     from Installer.Storage.common import mode_label, safe_float, safe_int  # noqa: E402
 except ModuleNotFoundError:
     from Storage.common import mode_label, safe_float, safe_int  # type: ignore  # noqa: E402
+try:
+    from Installer.Storage.peak_shaving import evaluate_peak_shaving  # noqa: E402
+except ModuleNotFoundError:
+    from Storage.peak_shaving import evaluate_peak_shaving  # type: ignore  # noqa: E402
 try:
     from Installer.Storage.charge_curve import (  # noqa: E402
         _plan_ts_s,
@@ -218,19 +224,26 @@ OBSERVE_RESERVE_RELEASE_AUTO_STATES = {
     "parallel_curve_charge_cap",
     "parallel_wb_auto",
 }
+POST_FINAL_PV_STORE_AUTO_RELEASE_STATES = {
+    "parallel_curve_auto_hold",
+    "parallel_curve_auto_no_surplus",
+    "parallel_curve_charge",
+    "parallel_curve_charge_cap",
+}
 STORAGE_OWNER_CONTRACT_VERSION = 1
 HARD_MODE_GUARD_CONTRACT_VERSION = 1
 AUTO_LIMIT_CONTRACT_VERSION = 5
 CURVE_CONTEXT_CONTRACT_VERSION = 1
-STORAGE_DECISION_PATH_CONTRACT_VERSION = 7
+STORAGE_DECISION_PATH_CONTRACT_VERSION = 8
 MARKET_PATH_CONTRACT_VERSION = 1
 DIRECT_MARKETING_PATH_CONTRACT_VERSION = 1
 DIRECT_MARKETING_POLICY_SCHEMA = "direct_marketing_policy_v1"
 DIRECT_MARKETING_POLICY_EXPORT_STATES = {"FORCE_EXPORT", "HEADROOM_EXPORT"}
-DIRECT_MARKETING_POLICY_CHARGE_STATES = {"FORCE_CHARGE_PV"}
+DIRECT_MARKETING_POLICY_CHARGE_STATES = {"FORCE_CHARGE_PV", "CHARGE_BLOCK_WAIT"}
 DIRECT_MARKETING_POLICY_PASSIVE_STATES = {"HOLD", "NORMAL"}
 DIRECT_MARKETING_POLICY_ACTIVE_STATES = DIRECT_MARKETING_POLICY_EXPORT_STATES | DIRECT_MARKETING_POLICY_CHARGE_STATES
 DIRECT_MARKETING_EXPORT_EXECUTION_SCHEMA = "direct_marketing_export_execution_v1"
+STORAGE_DC_FIRST_CHARGE_LIMIT_CONTRACT_VERSION = 1
 EP_RESERVE_VETO_SIGNATURE = "STORAGE_EP_RESERVE_VETO"
 PREDUMP_PATH_CONTRACT_VERSION = 1
 PROTECTION_PATH_CONTRACT_VERSION = 2
@@ -266,6 +279,7 @@ LIVE_F = os.path.join(RAMDISK, "live_data_py.json")
 PLAN_F = os.path.join(RAMDISK, "storage_plan.json")
 DISPATCH_RUNTIME_F = os.path.join(RAMDISK, "storage_dispatch_runtime.json")
 STATE_F = os.path.join(RAMDISK, "storage_manager_state.json")
+PEAK_SHAVING_STATE_F = os.path.join(RAMDISK, "peak_shaving_interval_state.json")
 WB_F = os.path.join(RAMDISK, "wb_pv_budget.json")
 WB_DIAGNOSTIC_F = os.path.join(RAMDISK, "wb_pv_budget_diagnostics.json")
 WB_INTENT_F = os.path.join(RAMDISK, "wallbox_storage_intent.json")
@@ -412,9 +426,17 @@ def charge_block_auto_limit(cfg: Dict[str, Any], max_discharge_w: int, reason: s
     return {
         "enabled": True,
         "release": False,
+        # Der RSCP-Sender übersetzt diesen Vertrag ausschließlich in
+        # POWER_SETTINGS mit POWER_LIMITS_USED=true. Ein Readback bis 300 W
+        # gilt dort als bestätigte Bounded-Zero-Äquivalenz, nicht als exakte
+        # wirtschaftliche 0-W-Messung.
+        "power_limits_used": True,
         "max_charge_w": 0,
         "max_discharge_w": max(0, int(max_discharge_w)),
         "discharge_start_w": 0,
+        "requested_charge_cap_w": 0,
+        "bounded_zero_readback_max_w": EMS_POWER_SETTINGS_NONZERO_MIN_W,
+        "readback_contract": "bounded_zero_not_exact_economic_zero",
         "heartbeat_s": auto_limit_heartbeat_s(cfg),
         "reason": reason,
     }
@@ -475,6 +497,8 @@ def storage_auto_limit_contract(
         or "direktvermarkt" in reason_l
     ):
         source_class = "direct_marketing"
+    elif state_l.startswith("peak_shaving_"):
+        source_class = "protection"
     elif state_l.startswith("market_") or any(token in reason_l for token in ("preis", "slot", "epex", "octopus")):
         source_class = "market"
     elif state_l.startswith("pre_discharge") or "pre-dump" in reason_l or "predump" in reason_l:
@@ -917,9 +941,11 @@ def storage_protection_path_contract(
             "live_plausibility_manual_override_kept",
         )
     )
+    peak_shaving_active = state_l.startswith("peak_shaving_")
     active = bool(
         state_l in ("parallel_no_data", "parallel_passthrough", "parallel_emergency_auto", "live_stale_auto")
         or priority_l == "safety"
+        or peak_shaving_active
         or headroom_active
         or state_l.startswith("hard_mode_guard")
         or state_l.startswith("live_plausibility")
@@ -940,7 +966,9 @@ def storage_protection_path_contract(
         )
         or (headroom_active and "abregel" in control_reason_l)
     )
-    if state_l in ("parallel_no_data", "parallel_passthrough") or "no data" in control_reason_l or "keine daten" in control_reason_l:
+    if peak_shaving_active:
+        protection_class = "peak_shaving"
+    elif state_l in ("parallel_no_data", "parallel_passthrough") or "no data" in control_reason_l or "keine daten" in control_reason_l:
         protection_class = "no_data"
     elif state_l.startswith("live_plausibility") or live_glitch or "plausibil" in control_reason_l or "glitch" in control_reason_l:
         protection_class = "live_plausibility"
@@ -1079,6 +1107,11 @@ def storage_budget_readiness_contract(
         balance_class = "export"
     else:
         balance_class = "balanced"
+    peak_shaving_context = (
+        payload.get("peak_shaving")
+        if isinstance(payload.get("peak_shaving"), dict)
+        else {}
+    )
     return {
         "contract_version": BUDGET_READINESS_CONTRACT_VERSION,
         "readiness_class": readiness_class,
@@ -1090,6 +1123,12 @@ def storage_budget_readiness_contract(
         "grid_import_w": grid_import_w,
         "budget_w": budget_w,
         "raw_iAVal_w": raw_iaval_w,
+        "peak_shaving": copy.deepcopy(peak_shaving_context),
+        "grid_import_headroom_w": (
+            max(0, safe_int(peak_shaving_context.get("grid_import_headroom_w"), 0))
+            if peak_shaving_context.get("grid_import_headroom_w") is not None
+            else None
+        ),
         "iAVal_w": iaval_w,
         "free_for_consumers_w": free_for_consumers_w,
         "storage_req_w": storage_req_w,
@@ -2219,6 +2258,8 @@ def _direct_marketing_policy_owns_storage_cycle(contract: Dict[str, Any]) -> boo
         return bool(charge_budget_w > 0 and export_budget_w == 0)
     if target_state == "FORCE_EXPORT":
         return bool(export_budget_w > 0 and charge_budget_w == 0)
+    if target_state == "CHARGE_BLOCK_WAIT":
+        return bool(charge_budget_w == 0 and export_budget_w == 0)
     return False
 
 
@@ -2238,9 +2279,12 @@ def _phase5_decision_only_hold_path_projection(payload: Dict[str, Any]) -> Dict[
     )
     translation = phase5.get("translation") if isinstance(phase5.get("translation"), dict) else {}
     claimed = bool(
-        str(phase5.get("selection_class") or "") == "decision_only_hold"
-        or str(intent.get("class") or "") == "decision_only_hold"
-        or decision_hold.get("active") is True
+        str(phase5.get("selected_action") or "").upper() == "HOLD"
+        and (
+            str(phase5.get("selection_class") or "") == "decision_only_hold"
+            or str(intent.get("class") or "") == "decision_only_hold"
+            or decision_hold.get("active") is True
+        )
     )
     if not claimed:
         return {
@@ -2490,6 +2534,35 @@ def _curve_release_is_direct_marketing_subcontract(
     )
 
 
+def _curve_charge_block_is_direct_marketing_subcontract(
+    payload: Dict[str, Any],
+    direct_marketing_contract: Dict[str, Any],
+    curve_contract: Dict[str, Any],
+    auto_contract: Dict[str, Any],
+    protection_contract: Dict[str, Any],
+) -> bool:
+    """Bindet eine bestehende 0-W-Kurvenladegrenze an DV-CHARGE_BLOCK_WAIT."""
+
+    return bool(
+        _direct_marketing_policy_owns_storage_cycle(direct_marketing_contract)
+        and str(
+            direct_marketing_contract.get("policy_target_state") or ""
+        ).upper() == "CHARGE_BLOCK_WAIT"
+        and protection_contract.get("active") is False
+        and curve_contract.get("in_curve_state") is True
+        and curve_contract.get("action_class") == "auto_limit_hold_zero_charge"
+        and safe_int(payload.get("mode"), MODE_AUTO) == MODE_AUTO
+        and auto_contract.get("active") is True
+        and auto_contract.get("enabled") is True
+        and auto_contract.get("release") is False
+        and auto_contract.get("command_class") == "limit"
+        and auto_contract.get("source_class") == "curve"
+        and safe_int(auto_contract.get("max_charge_w"), -1) == 0
+        and safe_int(auto_contract.get("max_discharge_w"), 0) > 0
+        and safe_int(auto_contract.get("discharge_start_w"), -1) == 0
+    )
+
+
 def storage_decision_path_contract(
     payload: Dict[str, Any],
     plan: Optional[Dict[str, Any]] = None,
@@ -2540,6 +2613,16 @@ def storage_decision_path_contract(
             protection_contract,
         )
     )
+    curve_is_direct_marketing_charge_block_subcontract = bool(
+        not effectless_phase5_hold
+        and _curve_charge_block_is_direct_marketing_subcontract(
+            payload,
+            direct_marketing_contract,
+            curve_contract,
+            auto_contract,
+            protection_contract,
+        )
+    )
     predump_is_protection_subcontract = bool(
         state_l == "wallbox_predump_floor_hold"
         and mode_value == MODE_AUTO
@@ -2578,7 +2661,11 @@ def storage_decision_path_contract(
     if (
         state_l.startswith("parallel_curve")
         or str(payload.get("priority") or "").lower() == "curve"
-    ) and not curve_is_headroom_protection_subcontract and not curve_is_direct_marketing_release_subcontract:
+    ) and not (
+        curve_is_headroom_protection_subcontract
+        or curve_is_direct_marketing_release_subcontract
+        or curve_is_direct_marketing_charge_block_subcontract
+    ):
         add_candidate("curve", "state_or_priority")
     if not candidates and mode_value != MODE_AUTO:
         add_candidate("storage_active", "active_rscp_mode")
@@ -2625,12 +2712,18 @@ def storage_decision_path_contract(
         subordinate_paths.append("curve:headroom_protection_subcontract")
     if curve_is_direct_marketing_release_subcontract:
         subordinate_paths.append("curve:direct_marketing_auto_release_subcontract")
+    if curve_is_direct_marketing_charge_block_subcontract:
+        subordinate_paths.append(
+            "curve:direct_marketing_charge_block_subcontract"
+        )
     if bool(auto_contract.get("active")):
         subordinate_paths.append("auto_limit:%s:%s" % (auto_source, auto_contract.get("command_class") or "unknown"))
         aligned_sources = {expected_auto_source, "auto_limit", "guard", "none"}
         if predump_is_protection_subcontract:
             aligned_sources.add("predump")
         if curve_is_direct_marketing_release_subcontract:
+            aligned_sources.add("curve")
+        if curve_is_direct_marketing_charge_block_subcontract:
             aligned_sources.add("curve")
         aligned_sources.discard(None)
         if expected_auto_source and auto_source not in aligned_sources:
@@ -2693,7 +2786,11 @@ def storage_decision_path_contract(
     if primary_path == "direct_marketing" and direct_marketing_policy_owns_cycle:
         effective_owner_control = "direct_marketing"
         effective_owner_contract = "MARKET_DIRECT"
-        effective_owner_binding = "selected_direct_marketing_policy"
+        effective_owner_binding = (
+            "selected_direct_marketing_charge_block_curve_subcontract"
+            if curve_is_direct_marketing_charge_block_subcontract
+            else "selected_direct_marketing_policy"
+        )
     if primary_path in ("direct_marketing", "market_price", "predump") and str(effective_owner_contract) == "E3DC_AUTONOM":
         veto_reasons.append("owner_contract_not_market_owned")
     if primary_path == "curve" and str(curve_contract.get("action_class")) == "active_discharge":
@@ -2722,6 +2819,9 @@ def storage_decision_path_contract(
         "subcontracts": subcontracts,
         "phase5_decision_only_hold_projection": phase5_hold_projection,
         "direct_marketing_effectless_no_action_projection": effectless_no_action_projection,
+        "direct_marketing_charge_block_curve_subcontract": (
+            curve_is_direct_marketing_charge_block_subcontract
+        ),
         "candidate_reasons": candidate_reasons,
         "path_conflict": bool(veto_reasons),
         "veto_required": bool(veto_reasons),
@@ -4391,7 +4491,9 @@ def storage_owner_contract(payload: Dict[str, Any]) -> Dict[str, Any]:
     )
     above_curve_unbounded_charge = above_curve_active_charge and not above_curve_soft_charge
     control_owner = "e3dc_auto"
-    if state_name.startswith("direct_marketing_"):
+    if state_name.startswith("peak_shaving_"):
+        control_owner = "peak_shaving"
+    elif state_name.startswith("direct_marketing_"):
         control_owner = "direct_marketing"
     elif state_name.startswith("market_"):
         control_owner = "market_economics"
@@ -4414,7 +4516,9 @@ def storage_owner_contract(payload: Dict[str, Any]) -> Dict[str, Any]:
         }.get(mode_value, "AUTO")
     ).upper()
     reason_text = str(payload.get("display_reason") or payload.get("reason") or payload.get("priority") or "").lower()
-    if state_name.startswith("direct_marketing_") or control_owner == "direct_marketing":
+    if state_name.startswith("peak_shaving_") or control_owner == "peak_shaving":
+        contract_owner = "PROTECTION"
+    elif state_name.startswith("direct_marketing_") or control_owner == "direct_marketing":
         contract_owner = "MARKET_DIRECT"
     elif state_name.startswith("market_") or control_owner == "market_economics":
         contract_owner = "MARKET_PRICE"
@@ -4615,6 +4719,9 @@ def build_decision_history_record_with_context(
         "direct_marketing_monitor": direct_monitor,
         "direct_marketing_export_execution": direct_export_execution,
         "rscp_power_settings": rscp_power_settings,
+        "peak_shaving": copy.deepcopy(payload.get("peak_shaving"))
+        if isinstance(payload.get("peak_shaving"), dict)
+        else None,
         "external_veto": copy.deepcopy(payload.get("smartcharge_external_veto"))
         if isinstance(payload.get("smartcharge_external_veto"), dict)
         else None,
@@ -5556,6 +5663,7 @@ HARD_DISCHARGE_OWNER_PREFIXES = (
     "direct_marketing_eco_plus_headroom_export",
 )
 HARD_GRID_OWNER_PREFIXES = (
+    "peak_shaving_recharge",
     "price_boost_grid",
     "storm_guard_grid",
     "market_grid_charge",
@@ -5602,6 +5710,32 @@ def hard_mode_justification_errors(live: Dict[str, Any], decision: Dict[str, Any
         grid_owner = protected and state.startswith(HARD_GRID_OWNER_PREFIXES)
         if not grid_owner:
             errors.append(f"GRID {val_w} W ohne geschützten Netzlade-Besitzer: {state or 'unbekannt'}")
+        if state.startswith("peak_shaving_recharge"):
+            interval_room = decision.get("peak_shaving_interval_room_w")
+            house_room = decision.get("peak_shaving_house_connection_room_w")
+            interval_room_valid = bool(
+                isinstance(interval_room, (int, float))
+                and not isinstance(interval_room, bool)
+                and math.isfinite(float(interval_room))
+            )
+            house_room_valid = bool(
+                isinstance(house_room, (int, float))
+                and not isinstance(house_room, bool)
+                and math.isfinite(float(house_room))
+            )
+            if decision.get("peak_shaving_grid_recharge_authorized") is not True:
+                errors.append("Peak-Shaving-Netzladen ohne ausdrückliche Nutzerfreigabe")
+            if decision.get("peak_shaving_history_complete") is not True:
+                errors.append(
+                    "Peak-Shaving-Netzladen ohne lückenlose Messhistorie "
+                    "seit Beginn der festen Viertelstunde"
+                )
+            if val_w < EMS_POWER_SETTINGS_NONZERO_MIN_W:
+                errors.append("Peak-Shaving-Netzladen unter flüchtiger Mindestleistung")
+            if not interval_room_valid or val_w > max(0, int(float(interval_room or 0))):
+                errors.append("Peak-Shaving-Netzladen überschreitet den Viertelstundenrahmen")
+            if not house_room_valid or val_w > max(0, int(float(house_room or 0))):
+                errors.append("Peak-Shaving-Netzladen überschreitet den Hausanschlussrahmen")
 
     if mode == MODE_IDLE:
         idle_owner = protected and state.startswith(HARD_IDLE_OWNER_PREFIXES)
@@ -6075,6 +6209,10 @@ def build_display(payload: Dict[str, Any]) -> Dict[str, str]:
         "storm_guard_grid_wait": "Unwetter-Schutz wartet",
         "price_boost_grid": "Preis-Netzladen",
         "price_boost_grid_wait": "Preisfenster wartet",
+        "peak_shaving_active": "Lastspitze begrenzen",
+        "peak_shaving_reserve_hold": "Lastspitzenpuffer halten",
+        "peak_shaving_recharge": "Lastspitzenpuffer nachladen",
+        "peak_shaving_release": "Lastspitzenregelung freigegeben",
         "market_grid_charge": "Markt-Netzladen",
         "market_grid_wait": "Markt-Netzladen wartet",
         "market_negative_absorb_grid": "Negativpreis-Aufnahme",
@@ -6082,6 +6220,7 @@ def build_display(payload: Dict[str, Any]) -> Dict[str, str]:
         "market_discharge_hold": "Markt-Entladesperre",
         "market_house_supply_release": "Markt-Hausversorgung frei",
         "direct_marketing_eco_plus_pv_store": "DV Eco+ PV speichern",
+        "direct_marketing_phase5_pv_store": "DV PV speichern",
         "direct_marketing_eco_plus_headroom_hold": "DV Eco+ Speicherplatz halten",
         "direct_marketing_eco_plus_headroom_export": "DV Eco+ Speicherplatz schaffen",
         "direct_marketing_eco_plus_export": "DV Eco+ Einspeisung",
@@ -6136,6 +6275,10 @@ def build_display(payload: Dict[str, Any]) -> Dict[str, str]:
         "storm_guard_grid_wait": "Storage Manager",
         "price_boost_grid": "Storage Manager",
         "price_boost_grid_wait": "Storage Manager",
+        "peak_shaving_active": "Storage Manager",
+        "peak_shaving_reserve_hold": "Storage Manager",
+        "peak_shaving_recharge": "Storage Manager",
+        "peak_shaving_release": "Storage Manager",
         "market_grid_charge": "Storage Manager",
         "market_grid_wait": "Storage Manager",
         "market_negative_absorb_grid": "Storage Manager",
@@ -6143,6 +6286,7 @@ def build_display(payload: Dict[str, Any]) -> Dict[str, str]:
         "market_discharge_hold": "Storage Manager",
         "market_house_supply_release": "Storage Manager",
         "direct_marketing_eco_plus_pv_store": "Storage Manager",
+        "direct_marketing_phase5_pv_store": "Storage Manager",
         "direct_marketing_eco_plus_headroom_hold": "Storage Manager",
         "direct_marketing_eco_plus_headroom_export": "Storage Manager",
         "direct_marketing_eco_plus_export": "Storage Manager",
@@ -6273,6 +6417,13 @@ def build_display(payload: Dict[str, Any]) -> Dict[str, str]:
             reason = raw_reason
         else:
             reason = "Neutraler Zustand: E3DC führt im AUTO-Freilauf; keine aktive Speicherbremse."
+    elif state.startswith("peak_shaving_"):
+        reason = str(payload.get("reason") or "")
+        if not reason:
+            reason = (
+                "Lastspitzenbegrenzung: E3/DC-AUTO bleibt aktiv; der Storage "
+                "Manager setzt nur den flüchtigen Lade- oder Entladerahmen."
+            )
     elif state.startswith("direct_marketing_"):
         dm_mode_raw = str(payload.get("direct_marketing_mode") or "")
         dm_mode = {"eco_plus": "Eco+", "arbitrage": "Arbitrage"}.get(dm_mode_raw, dm_mode_raw or "DV")
@@ -6307,7 +6458,10 @@ def build_display(payload: Dict[str, Any]) -> Dict[str, str]:
                 "zuerst wird die Hauslast gedeckt, nur der verbleibende Anteil fließt ins Netz. "
                 "Der berechnete Speicherplatzbedarf und alle Reserven begrenzen den Eingriff."
             )
-        elif state == "direct_marketing_eco_plus_pv_store":
+        elif state in {
+            "direct_marketing_eco_plus_pv_store",
+            "direct_marketing_phase5_pv_store",
+        }:
             charge_w = max(
                 0,
                 safe_int(
@@ -6318,11 +6472,33 @@ def build_display(payload: Dict[str, Any]) -> Dict[str, str]:
                     0,
                 ),
             )
-            reason = (
-                f"Direktvermarktung {dm_mode}: PV-Speichern im günstigen Preisfenster mit einem "
-                f"Laderahmen bis {charge_w} W. Ein hartes Negativpreislimit und die DC-only-Freigabe "
-                "werden getrennt ausgewertet; Netzbezug und Reserven bleiben geschützt."
-            )
+            pv_store_execution = str(payload.get("direct_marketing_pv_store_execution") or "")
+            if pv_store_execution == "auto_limit_dc_first_wait":
+                reason = (
+                    f"Direktvermarktung {dm_mode}: Das PV-Speicherfenster bleibt aktiv, "
+                    "aber aktuell fehlt die sichere E3DC-PV-Ladefreigabe. Laden ist auf 0 W "
+                    "begrenzt; E3DC-AUTO und Entladen bleiben frei."
+                )
+            elif pv_store_execution == "auto_limit_dc_first":
+                planner_w = max(
+                    0,
+                    safe_int(payload.get("storage_dc_first_charge_planner_limit_w"), 0),
+                )
+                e3dc_pv_w = max(
+                    0,
+                    safe_int(payload.get("storage_dc_first_charge_e3dc_pv_w"), 0),
+                )
+                reason = (
+                    f"Direktvermarktung {dm_mode}: PV-Speichern mit sanftem E3DC-PV-Laderahmen "
+                    f"{charge_w} W (Plan {planner_w} W, E3DC-PV {e3dc_pv_w} W). "
+                    "E3DC-AUTO und Entladen bleiben frei."
+                )
+            else:
+                reason = (
+                    f"Direktvermarktung {dm_mode}: PV-Speichern im günstigen Preisfenster mit einem "
+                    f"Laderahmen bis {charge_w} W. Ein hartes Negativpreislimit und die DC-only-Freigabe "
+                    "werden getrennt ausgewertet; Netzbezug und Reserven bleiben geschützt."
+                )
         elif state == "direct_marketing_arbitrage_grid_charge":
             reason = (
                 f"Direktvermarktung {dm_mode}: günstiges Arbitrage-Fenster aktiv, "
@@ -6577,16 +6753,27 @@ def grid_charge_room_w(cfg: Dict[str, Any], live: Dict[str, Any]) -> Optional[in
     reserve_amp = max(0.0, safe_float(cfg.get("grid_max_reserve_amp"), 2.0))
     max_import_w = max(0.0, (amps - reserve_amp) * 230.0 * 3.0)
     grid_w = max(0.0, safe_float(live.get("Grid_Power"), 0.0))
-    # E3DC live power is positive while charging. Remove the current charge
-    # request to estimate the base import before the next GRID command.
-    current_bat_charge_w = max(0.0, safe_float(live.get("Battery_Power"), 0.0))
-    base_import_w = max(0.0, grid_w - current_bat_charge_w)
+    # E3DC-Batterieleistung ist beim Laden positiv und beim Entladen negativ.
+    # Für einen neuen GRID-Rahmen muss beides aus dem gemessenen Netzpunkt
+    # herausgerechnet werden: laufendes Laden erhöht, laufendes Entladen senkt
+    # den aktuellen Netzbezug.
+    battery_w = safe_float(live.get("Battery_Power"), 0.0)
+    base_import_w = max(0.0, grid_w - battery_w)
     return int(max(0.0, max_import_w - base_import_w))
 
 
 def market_grid_charge_live_pv_guard(live: Dict[str, Any]) -> Dict[str, Any]:
     """Block normal market grid charging while live PV can charge locally."""
     live = live or {}
+    sample_valid = _contract_bool(
+        live.get("RSCP_Sample_Valid", live.get("live_sample_valid", True))
+    )
+    grid_valid = _contract_bool(live.get("Grid_Power_Valid", sample_valid))
+    decision_usable = _contract_bool(
+        live.get("Power_Decision_Usable", live.get("decision_usable", True))
+    )
+    frame_stale = bool(live.get("live_stale", False))
+    frame_usable = bool(sample_valid and grid_valid and decision_usable and not frame_stale)
     grid_w = safe_float(live.get("Grid_Power"), 0.0)
     pv_w = max(0.0, safe_float(live.get("PV_Power"), 0.0))
     home_w = max(0.0, safe_float(live.get("Home_Power"), 0.0))
@@ -6601,15 +6788,24 @@ def market_grid_charge_live_pv_guard(live: Dict[str, Any]) -> Dict[str, Any]:
         and pv_house_surplus_w >= battery_charge_guard_w
         and grid_w <= import_guard_w
     )
-    active = bool(export_active or pv_charging_active)
+    active = bool(frame_usable and (export_active or pv_charging_active))
     reason = ""
-    if export_active:
+    if frame_stale:
+        reason = "live_frame_stale"
+    elif not frame_usable:
+        reason = "live_frame_invalid"
+    elif export_active:
         reason = "grid_export"
     elif pv_charging_active:
         reason = "pv_battery_charge"
     return {
         "active": active,
         "reason": reason,
+        "frame_usable": frame_usable,
+        "sample_valid": sample_valid,
+        "grid_valid": grid_valid,
+        "decision_usable": decision_usable,
+        "frame_stale": frame_stale,
         "grid_w": round(grid_w, 0),
         "pv_w": round(pv_w, 0),
         "home_w": round(home_w, 0),
@@ -6624,24 +6820,31 @@ def market_grid_charge_live_pv_guard(live: Dict[str, Any]) -> Dict[str, Any]:
 def market_live_export_absorb_charge_w(
     cfg: Dict[str, Any],
     live: Dict[str, Any],
-    max_charge_w: int,
+    physical_max_charge_w: int,
 ) -> Dict[str, Any]:
-    """Charge just enough to absorb live export instead of shooting to max GRID."""
+    """Begrenzt AUTO-Laden auf frischen Export ohne Netzbezug."""
     live = live or {}
-    max_charge_w = max(0, safe_int(max_charge_w, 0))
+    physical_max_charge_w = max(0, safe_int(physical_max_charge_w, 0))
     grid_w = safe_float(live.get("Grid_Power"), 0.0)
-    battery_charge_w = max(0.0, safe_float(live.get("Battery_Power"), 0.0))
+    battery_power_w = safe_float(live.get("Battery_Power"), 0.0)
     margin_w = max(0.0, safe_float(cfg.get("market_live_export_absorb_margin_w"), 250.0))
-    raw_target_w = battery_charge_w - grid_w + margin_w
-    target_w = min(max_charge_w, max(0, int(round(raw_target_w))))
-    if 0 < target_w < 300:
-        target_w = min(max_charge_w, 300)
+    # Positiver Grid_Power ist Bezug, negativer Export. Die signierte
+    # Batterieleistung bildet auch den Übergang aus Entladung korrekt ab; die
+    # Marge bleibt als Exportpuffer gegen Messwertlatenz erhalten.
+    raw_no_import_cap_w = int(round(battery_power_w - grid_w))
+    no_import_cap_w = max(0, raw_no_import_cap_w)
+    safe_target_w = max(0, no_import_cap_w - int(round(margin_w)))
+    target_w = min(physical_max_charge_w, safe_target_w)
     return {
         "charge_w": target_w,
         "grid_w": round(grid_w, 0),
-        "battery_charge_w": round(battery_charge_w, 0),
+        "battery_power_w": round(battery_power_w, 0),
+        "battery_charge_w": round(max(0.0, battery_power_w), 0),
         "margin_w": round(margin_w, 0),
-        "raw_target_w": round(raw_target_w, 0),
+        "raw_no_import_cap_w": raw_no_import_cap_w,
+        "no_import_cap_w": no_import_cap_w,
+        "safe_target_w": safe_target_w,
+        "physical_max_charge_w": physical_max_charge_w,
     }
 
 
@@ -6649,25 +6852,81 @@ def direct_marketing_pv_source_breakdown(
     cfg: Dict[str, Any],
     live: Dict[str, Any],
 ) -> Dict[str, Any]:
-    del cfg
+    cfg = cfg or {}
     live = live or {}
-    total_pv_w = max(0, safe_int(live.get("PV_Power"), 0))
-    external_ac_w = max(0, safe_int(live.get("Ext_PV_Power"), 0))
-    if external_ac_w <= 0:
+    total_present = _live_numeric_present(live, "PV_Power")
+    total_pv_w = max(0, safe_int(live.get("PV_Power"), 0)) if total_present else None
+    external_present = _live_numeric_present(live, "Ext_PV_Power")
+    external_ac_w = (
+        max(0, safe_int(live.get("Ext_PV_Power"), 0))
+        if external_present
+        else None
+    )
+    external_source = str(live.get("Ext_PV_Power_Source") or "")
+    if external_ac_w is None:
         for key in ("External_PV_Power", "PV_External_Power", "Additional_PV_Power"):
-            value = safe_int(live.get(key), 0)
-            if value > 0:
-                external_ac_w = max(external_ac_w, value)
+            if not _live_numeric_present(live, key):
+                continue
+            value = max(0, safe_int(live.get(key), 0))
+            external_ac_w = value
+            external_present = True
+            external_source = key
+            break
+    if external_ac_w is None:
         for key in ("EMS_POWER_ADD", "Power_ADD", "ADD_POWER", "add_power"):
+            if not _live_numeric_present(live, key):
+                continue
             value = safe_int(live.get(key), 0)
             if value < 0:
-                external_ac_w = max(external_ac_w, abs(value))
-    e3dc_pv_w = max(0, total_pv_w - external_ac_w)
-    home_w = max(0, safe_int(live.get("Home_Power"), 0))
+                external_ac_w = abs(value)
+                external_present = True
+                external_source = key
+                break
+
+    topology_ready, topology = _direct_marketing_aux_ac_topology_ready(cfg)
+    external_configured = bool(
+        topology.get("external_ac_bound")
+        or safe_float(cfg.get("pv_external_ac_inverter_limit_w"), 0.0) > 0.0
+        or external_present
+    )
+    if not external_configured:
+        external_ac_w = 0
+        external_present = True
+        external_source = "not_configured"
+
+    sample_valid = live.get("RSCP_Sample_Valid") is True
+    external_strict_valid = bool(
+        external_present
+        and (
+            not external_configured
+            or live.get("Ext_PV_Power_Valid") is True
+        )
+        and sample_valid
+    )
+    home_present = _live_numeric_present(live, "Home_Power")
+    home_w = max(0, safe_int(live.get("Home_Power"), 0)) if home_present else None
     wallbox_w = max(0, int(abs(safe_float(live.get("Wallbox_Power"), 0.0))))
-    local_load_w = max(0, home_w + wallbox_w)
-    local_load_after_external_w = max(0, local_load_w - external_ac_w)
-    e3dc_dc_surplus_w = max(0, e3dc_pv_w - local_load_after_external_w)
+    measurement_complete = bool(
+        total_pv_w is not None
+        and external_ac_w is not None
+        and home_w is not None
+    )
+    strict_measurement_complete = bool(
+        measurement_complete
+        and external_strict_valid
+        and live.get("Home_Power_Valid") is True
+        and live.get("Power_Decision_Usable") is True
+    )
+    if measurement_complete:
+        e3dc_pv_w = max(0, int(total_pv_w) - int(external_ac_w))
+        local_load_w = max(0, int(home_w) + wallbox_w)
+        local_load_after_external_w = max(0, local_load_w - int(external_ac_w))
+        e3dc_dc_surplus_w = max(0, e3dc_pv_w - local_load_after_external_w)
+    else:
+        e3dc_pv_w = None
+        local_load_w = None
+        local_load_after_external_w = None
+        e3dc_dc_surplus_w = None
     return {
         "total_pv_w": total_pv_w,
         "e3dc_pv_w": e3dc_pv_w,
@@ -6677,8 +6936,354 @@ def direct_marketing_pv_source_breakdown(
         "local_load_w": local_load_w,
         "local_load_after_external_w": local_load_after_external_w,
         "e3dc_dc_surplus_w": e3dc_dc_surplus_w,
-        "source": "e3dc_plus_external_ac" if external_ac_w > 0 else "e3dc_only",
+        "source": (
+            "measurement_missing"
+            if not measurement_complete
+            else ("e3dc_plus_external_ac" if int(external_ac_w or 0) > 0 else "e3dc_only")
+        ),
+        "measurement_complete": measurement_complete,
+        "strict_measurement_complete": strict_measurement_complete,
+        "total_pv_valid": total_present,
+        "home_valid": home_present,
+        "external_ac_configured": external_configured,
+        "external_ac_valid": external_present,
+        "external_ac_strict_valid": external_strict_valid,
+        "external_ac_source": external_source or "missing",
+        "topology_ready": topology_ready,
+        "topology_status": topology.get("status"),
     }
+
+
+def storage_dc_first_live_source_contract(
+    cfg: Dict[str, Any],
+    live: Dict[str, Any],
+    now_s: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Bindet den sanften Laderahmen ausschließlich an einen frischen PV-Split."""
+
+    live = live or {}
+    now_value = time.time() if now_s is None else float(now_s)
+    max_age_s = max(
+        1.0,
+        min(30.0, safe_float(cfg.get("storage_live_stale_guard_s"), 10.0)),
+    )
+    live_ts = safe_float(live.get("_ts"), 0.0)
+    live_age_s = now_value - live_ts if live_ts > 0.0 else float("inf")
+    max_future_skew_s = 5.0
+    total_raw = live.get("PV_Power")
+    external_raw = live.get("Ext_PV_Power")
+    values_typed = bool(
+        isinstance(total_raw, (int, float))
+        and not isinstance(total_raw, bool)
+        and isinstance(external_raw, (int, float))
+        and not isinstance(external_raw, bool)
+        and math.isfinite(float(total_raw))
+        and math.isfinite(float(external_raw))
+    )
+    values_nonnegative = bool(
+        values_typed
+        and float(total_raw) >= 0.0
+        and float(external_raw) >= 0.0
+    )
+    total_pv_w = max(0, int(round(float(total_raw)))) if values_typed else 0
+    external_ac_pv_w = max(0, int(round(float(external_raw)))) if values_typed else 0
+    sample_valid = live.get("RSCP_Sample_Valid") is True
+    decision_usable = live.get("Power_Decision_Usable") is True
+    split_valid = live.get("Ext_PV_Power_Valid") is True
+    source_fresh = bool(
+        live_ts > 0.0
+        and -max_future_skew_s <= live_age_s <= max_age_s
+    )
+    source_valid = bool(
+        values_nonnegative
+        and sample_valid
+        and decision_usable
+        and split_valid
+        and source_fresh
+        and external_ac_pv_w <= total_pv_w
+    )
+    blocker = ""
+    if not values_typed:
+        blocker = "pv_split_untyped"
+    elif float(total_raw) < 0.0:
+        blocker = "pv_total_negative"
+    elif float(external_raw) < 0.0:
+        blocker = "external_pv_negative"
+    elif not sample_valid:
+        blocker = "rscp_sample_invalid"
+    elif not decision_usable:
+        blocker = "power_decision_unusable"
+    elif not split_valid:
+        blocker = "external_pv_split_invalid"
+    elif live_age_s < -max_future_skew_s:
+        blocker = "pv_split_future"
+    elif not source_fresh:
+        blocker = "pv_split_stale"
+    elif external_ac_pv_w > total_pv_w:
+        blocker = "external_pv_exceeds_total"
+    return {
+        "contract_version": STORAGE_DC_FIRST_CHARGE_LIMIT_CONTRACT_VERSION,
+        "valid": source_valid,
+        "blocker": blocker,
+        "live_ts": live_ts if live_ts > 0.0 else None,
+        "age_s": round(live_age_s, 3) if math.isfinite(live_age_s) else None,
+        "max_age_s": max_age_s,
+        "max_future_skew_s": max_future_skew_s,
+        "sample_valid": sample_valid,
+        "decision_usable": decision_usable,
+        "external_split_valid": split_valid,
+        "total_pv_w": total_pv_w,
+        "external_ac_pv_w": external_ac_pv_w,
+        "e3dc_pv_w": max(0, total_pv_w - external_ac_pv_w) if source_valid else 0,
+        "source": str(live.get("Ext_PV_Power_Source") or "unavailable"),
+    }
+
+
+def storage_dc_first_charge_candidate(decision: Dict[str, Any]) -> bool:
+    state = str((decision or {}).get("state") or "")
+    priority = str((decision or {}).get("priority") or "").strip().lower()
+    # Der Parallelregler erzeugt die Vollleistungsanforderung bewusst bereits
+    # als AUTO, noch bevor der allgemeine AUTO_LIMIT-Aufbau greift. Bei
+    # eingeschaltetem DC-first-Vertrag muss genau dieser reale Zustand daher
+    # auch ohne vorhandenes auto_limit in den E3DC-PV-Rahmen überführt werden.
+    if state == "parallel_curve_auto_charge":
+        return True
+    if state == "parallel_auto" and priority == "curve":
+        return not bool(
+            (decision or {}).get(
+                "direct_marketing_post_final_pv_store_auto_active"
+            )
+        )
+    if state in {"parallel_curve_charge", "parallel_curve_auto_hold"}:
+        auto_limit = decision.get("auto_limit") if isinstance(decision.get("auto_limit"), dict) else {}
+        return bool(auto_limit.get("enabled") and not auto_limit.get("release"))
+    return state in {
+        "direct_marketing_eco_plus_pv_store",
+        "direct_marketing_phase5_pv_store",
+    }
+
+
+def apply_storage_dc_first_charge_limit(
+    cfg: Dict[str, Any],
+    live: Dict[str, Any],
+    decision: Dict[str, Any],
+    max_charge_w: int,
+    max_discharge_w: int,
+    previous_state: Optional[Dict[str, Any]] = None,
+    now_s: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Setzt einen MAX_CHARGE_POWER-Rahmen; E3DC-AUTO und Entladung bleiben frei."""
+
+    if not cfg_bool(cfg, "storage_dc_first_charge_limit_enable", False):
+        return decision
+    if not storage_dc_first_charge_candidate(decision):
+        return decision
+
+    previous_state = previous_state or {}
+    result = dict(decision)
+    source = storage_dc_first_live_source_contract(cfg, live, now_s=now_s)
+    auto_limit = result.get("auto_limit") if isinstance(result.get("auto_limit"), dict) else {}
+    existing_auto_limit_active = bool(
+        auto_limit.get("enabled") and not auto_limit.get("release")
+    )
+    parallel_curve_auto = bool(
+        str(result.get("state") or "") == "parallel_auto"
+        and str(result.get("priority") or "").strip().lower() == "curve"
+    )
+    if existing_auto_limit_active:
+        planner_limit_w = max(0, safe_int(auto_limit.get("max_charge_w"), 0))
+        # Ein bereits gebundener 0-W-Vertrag ist autoritativ. Insbesondere darf
+        # der nachgelagerte DC-first-Rahmen ihn nicht über iFc wieder öffnen.
+        if planner_limit_w <= 0:
+            return decision
+    else:
+        planner_limit_w = 0
+    if parallel_curve_auto:
+        shadow_payload = (
+            result.get("shadow_payload")
+            if isinstance(result.get("shadow_payload"), dict)
+            else {}
+        )
+        shadow_inputs = (
+            shadow_payload.get("inputs")
+            if isinstance(shadow_payload.get("inputs"), dict)
+            else {}
+        )
+        ifc_limit_w = max(0, safe_int(shadow_inputs.get("iFc_w"), 0))
+        if existing_auto_limit_active:
+            planner_limit_w = min(
+                planner_limit_w,
+                ifc_limit_w,
+            )
+        else:
+            planner_limit_w = ifc_limit_w
+    elif existing_auto_limit_active:
+        planner_limit_w = max(0, safe_int(auto_limit.get("max_charge_w"), 0))
+    else:
+        planner_limit_w = max(
+            0,
+            safe_int(result.get("val"), 0),
+            safe_int(result.get("storage_req_w"), 0),
+        )
+    planner_limit_w = min(max(0, safe_int(max_charge_w, 0)), planner_limit_w)
+    target_limit_w = min(planner_limit_w, max(0, safe_int(source.get("e3dc_pv_w"), 0)))
+    if not source.get("valid") or target_limit_w < 300:
+        target_limit_w = 0
+
+    previous_active = bool(previous_state.get("storage_dc_first_charge_limit_active"))
+    previous_limit_w = (
+        max(0, safe_int(previous_state.get("storage_dc_first_charge_limit_w"), 0))
+        if previous_active
+        else 0
+    )
+    deadband_w = max(
+        100,
+        safe_int(cfg.get("storage_curve_charge_servo_deadband_w"), 250),
+    )
+    step_up_w = max(
+        500,
+        safe_int(cfg.get("storage_curve_charge_servo_step_up_w"), 250),
+    )
+    if target_limit_w <= previous_limit_w:
+        applied_limit_w = target_limit_w
+        ramp_phase = "fast_down" if target_limit_w < previous_limit_w else "hold"
+    elif previous_active and target_limit_w - previous_limit_w <= deadband_w:
+        applied_limit_w = previous_limit_w
+        ramp_phase = "deadband_hold"
+    else:
+        applied_limit_w = min(target_limit_w, previous_limit_w + step_up_w)
+        ramp_phase = "soft_up" if applied_limit_w < target_limit_w else "target"
+    if 0 < applied_limit_w < 300:
+        applied_limit_w = 0
+
+    if source.get("valid"):
+        reason = (
+            "E3DC-PV-Laderahmen: Plan %dW, E3DC-PV %dW, Grenze %dW; "
+            "E3DC-AUTO und Entladen bleiben frei"
+            % (
+                planner_limit_w,
+                safe_int(source.get("e3dc_pv_w"), 0),
+                applied_limit_w,
+            )
+        )
+    else:
+        reason = (
+            "E3DC-PV-Laderahmen: PV-Split nicht sicher nutzbar (%s); "
+            "Laden 0W, E3DC-AUTO und Entladen bleiben frei"
+            % str(source.get("blocker") or "unknown")
+        )
+
+    result["mode"] = MODE_AUTO
+    result["val"] = applied_limit_w
+    result["storage_req_w"] = applied_limit_w
+    result["auto_limit"] = charge_cap_auto_limit(
+        cfg,
+        applied_limit_w,
+        max(0, safe_int(max_discharge_w, 0)),
+        reason,
+    )
+    result["reason"] = (str(result.get("reason") or "") + "; " + reason)[:220]
+    result["storage_dc_first_charge_limit_enabled"] = True
+    result["storage_dc_first_charge_limit_active"] = True
+    result["storage_dc_first_charge_limit_contract_version"] = STORAGE_DC_FIRST_CHARGE_LIMIT_CONTRACT_VERSION
+    result["storage_dc_first_charge_limit_source_valid"] = bool(source.get("valid"))
+    result["storage_dc_first_charge_limit_blocker"] = str(source.get("blocker") or "")
+    result["storage_dc_first_charge_limit_source"] = source
+    result["storage_dc_first_charge_planner_limit_w"] = planner_limit_w
+    result["storage_dc_first_charge_e3dc_pv_w"] = max(0, safe_int(source.get("e3dc_pv_w"), 0))
+    result["storage_dc_first_charge_external_ac_pv_w"] = max(
+        0,
+        safe_int(source.get("external_ac_pv_w"), 0),
+    )
+    result["storage_dc_first_charge_target_w"] = target_limit_w
+    result["storage_dc_first_charge_limit_w"] = applied_limit_w
+    result["storage_dc_first_charge_previous_limit_w"] = previous_limit_w
+    result["storage_dc_first_charge_ramp_phase"] = ramp_phase
+    result["storage_dc_first_charge_deadband_w"] = deadband_w
+    result["storage_dc_first_charge_step_up_w"] = step_up_w
+    if str(result.get("state") or "").startswith("direct_marketing_"):
+        result["direct_marketing_pv_store_execution"] = "auto_limit_dc_first"
+        result["direct_marketing_pv_store_auto_limit_active"] = True
+        result["direct_marketing_pv_store_w"] = applied_limit_w
+    if isinstance(result.get("budget"), dict):
+        nested_budget = dict(result["budget"])
+        nested_budget["storage_charge_request_w"] = applied_limit_w
+        result["budget"] = nested_budget
+    return result
+
+
+def direct_marketing_dc_first_charge_wait_decision(
+    cfg: Dict[str, Any],
+    control: Dict[str, Any],
+    state: str,
+    max_discharge_w: int,
+    common: Optional[Dict[str, Any]] = None,
+    reason_prefix: str = "Direktvermarktung PV-Speichern",
+) -> Optional[Dict[str, Any]]:
+    """Hält einen geplanten PV-Slot ohne sichere E3DC-PV-Ladefreigabe gebunden."""
+
+    if not cfg_bool(cfg, "storage_dc_first_charge_limit_enable", False):
+        return None
+    blocker = str((control or {}).get("blocker") or "storage_dc_first_charge_wait")
+    if blocker == "storage_dc_first_source_invalid":
+        detail = "der frische E3DC-/Zusatz-PV-Split ist nicht sicher nutzbar"
+    elif blocker == "storage_dc_first_e3dc_pv_below_min":
+        detail = "die aktuelle E3DC-PV-Leistung liegt unter der Mindestladeleistung"
+    elif blocker == "storage_dc_first_target_reached":
+        detail = "das Ziel dieses Speicherfensters ist erreicht"
+    else:
+        detail = "es liegt aktuell keine sichere E3DC-PV-Ladefreigabe vor"
+    reason = (
+        "%s: %s; Ladegrenze 0W, E3DC-AUTO und Entladen bleiben frei"
+        % (reason_prefix, detail)
+    )
+    source = {
+        "contract_version": STORAGE_DC_FIRST_CHARGE_LIMIT_CONTRACT_VERSION,
+        "valid": bool((control or {}).get("storage_dc_first_source_valid")),
+        "blocker": str((control or {}).get("storage_dc_first_source_blocker") or blocker),
+        "e3dc_pv_w": max(0, safe_int((control or {}).get("storage_dc_first_e3dc_pv_w"), 0)),
+        "external_ac_pv_w": max(0, safe_int((control or {}).get("pv_external_ac_w"), 0)),
+        "total_pv_w": max(0, safe_int((control or {}).get("pv_total_w"), 0)),
+        "source": str((control or {}).get("pv_source") or "unavailable"),
+    }
+    result = {
+        "state": str(state or "direct_marketing_eco_plus_pv_store"),
+        "mode": MODE_AUTO,
+        "val": 0,
+        "reason": reason,
+        "storage_req_w": 0,
+        "budget_w": 0,
+        "auto_limit": charge_cap_auto_limit(
+            cfg,
+            0,
+            max(0, safe_int(max_discharge_w, 0)),
+            reason,
+        ),
+        "storage_dc_first_charge_limit_enabled": True,
+        "storage_dc_first_charge_limit_active": True,
+        "storage_dc_first_charge_limit_contract_version": STORAGE_DC_FIRST_CHARGE_LIMIT_CONTRACT_VERSION,
+        "storage_dc_first_charge_limit_source_valid": bool(source.get("valid")),
+        "storage_dc_first_charge_limit_blocker": blocker,
+        "storage_dc_first_charge_limit_source": source,
+        "storage_dc_first_charge_planner_limit_w": 0,
+        "storage_dc_first_charge_e3dc_pv_w": max(0, safe_int(source.get("e3dc_pv_w"), 0)),
+        "storage_dc_first_charge_external_ac_pv_w": max(
+            0,
+            safe_int(source.get("external_ac_pv_w"), 0),
+        ),
+        "storage_dc_first_charge_target_w": 0,
+        "storage_dc_first_charge_limit_w": 0,
+        "storage_dc_first_charge_previous_limit_w": 0,
+        "storage_dc_first_charge_ramp_phase": "wait",
+        "direct_marketing_pv_store_execution": "auto_limit_dc_first_wait",
+        "direct_marketing_pv_store_auto_limit_active": True,
+        "direct_marketing_pv_store_w": 0,
+        "direct_marketing_pv_store_control": dict(control or {}),
+        "direct_marketing_pv_store_blocker": blocker,
+    }
+    if isinstance(common, dict):
+        result.update(common)
+    return result
 
 
 def direct_marketing_external_derating_context(
@@ -6957,6 +7562,471 @@ def direct_marketing_window_export_constraint(window: Dict[str, Any]) -> Dict[st
     }
 
 
+_DIRECT_MARKETING_AUX_AC_MODES = {"off", "reserve_only", "economic"}
+_DIRECT_MARKETING_POSITIVE_MARGIN_EPSILON_CT = 1e-6
+
+
+def _direct_marketing_aux_ac_mode(
+    cfg: Dict[str, Any],
+    window: Optional[Dict[str, Any]] = None,
+    flags: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, str]:
+    """Fail-safe Modusleser mit konservativer Migration des früheren Bool-Schalters."""
+
+    cfg = cfg or {}
+    window = window if isinstance(window, dict) else {}
+    flags = flags if isinstance(flags, dict) else {}
+    if cfg_bool(cfg, "direct_marketing_pv_store_dc_only_enable", False):
+        return "off", "legacy_dc_only_veto"
+
+    for key in (
+        "direct_marketing_aux_inverter_ac_storage_mode",
+        "direct_marketing_pv_store_aux_ac_mode",
+    ):
+        if key not in cfg:
+            continue
+        raw = str(cfg.get(key) or "").strip().lower().replace("-", "_").replace(" ", "_")
+        aliases = {
+            "aus": "off",
+            "disabled": "off",
+            "reserve": "reserve_only",
+            "reserve_sichern": "reserve_only",
+            "wirtschaftlich": "economic",
+            "economical": "economic",
+        }
+        mode = aliases.get(raw, raw)
+        return (
+            mode if mode in _DIRECT_MARKETING_AUX_AC_MODES else "off",
+            key if mode in _DIRECT_MARKETING_AUX_AC_MODES else "%s_invalid" % key,
+        )
+
+    if "direct_marketing_aux_inverter_ac_storage_enable" in cfg:
+        if cfg_bool(cfg, "direct_marketing_aux_inverter_ac_storage_enable", False):
+            return "reserve_only", "legacy_bool_explicit_true"
+        return "off", "legacy_bool_explicit_false"
+
+    return "off", "default_off"
+
+
+def _direct_marketing_aux_ac_topology_ready(cfg: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
+    try:
+        topology = build_pv_forecast_topology(cfg or {})
+    except Exception as exc:
+        return False, {
+            "status": "exception",
+            "reason": type(exc).__name__,
+        }
+    ready = bool(
+        topology.get("status") == "bound"
+        and topology.get("e3dc_dc_bound")
+        and topology.get("external_ac_bound")
+        and topology.get("split_usable", True)
+    )
+    return ready, topology
+
+
+def _live_numeric_present(live: Dict[str, Any], key: str) -> bool:
+    if key not in live:
+        return False
+    raw = live.get(key)
+    if raw is None or isinstance(raw, bool) or str(raw).strip() == "":
+        return False
+    try:
+        return math.isfinite(float(str(raw).replace(",", ".")))
+    except Exception:
+        return False
+
+
+def _direct_marketing_live_ac_gate(
+    cfg: Dict[str, Any],
+    live: Dict[str, Any],
+    pv_sources: Dict[str, Any],
+    now_s: Optional[float],
+) -> Dict[str, Any]:
+    """Strenger Live-Nachweis; fehlende Werte bleiben Missing und sperren nur AC."""
+
+    live = live or {}
+    now_value = time.time() if now_s is None else float(now_s)
+    raw_ts = live.get("_ts")
+    timestamp_valid = bool(
+        isinstance(raw_ts, (int, float))
+        and not isinstance(raw_ts, bool)
+        and math.isfinite(float(raw_ts))
+        and float(raw_ts) > 0.0
+    )
+    max_age_s = max(
+        1.0,
+        min(30.0, safe_float(cfg.get("storage_live_stale_guard_s"), 10.0)),
+    )
+    age_s = now_value - float(raw_ts) if timestamp_valid else None
+    fresh = bool(
+        timestamp_valid
+        and age_s is not None
+        and -5.0 <= age_s <= max_age_s
+    )
+    sample_valid = live.get("RSCP_Sample_Valid") is True
+    decision_usable = live.get("Power_Decision_Usable") is True
+    grid_valid = live.get("Grid_Power_Valid") is True
+    home_valid = live.get("Home_Power_Valid") is True
+    external_valid = live.get("Ext_PV_Power_Valid") is True
+    pv_present = _live_numeric_present(live, "PV_Power")
+    grid_present = _live_numeric_present(live, "Grid_Power")
+    home_present = _live_numeric_present(live, "Home_Power")
+    external_present = _live_numeric_present(live, "Ext_PV_Power")
+    complete = bool(
+        fresh
+        and sample_valid
+        and decision_usable
+        and grid_valid
+        and home_valid
+        and external_valid
+        and pv_present
+        and grid_present
+        and home_present
+        and external_present
+        and pv_sources.get("strict_measurement_complete") is True
+    )
+    blockers = []
+    for condition, reason in (
+        (timestamp_valid, "live_timestamp_missing"),
+        (fresh, "live_sample_stale"),
+        (sample_valid, "rscp_sample_invalid"),
+        (decision_usable, "power_decision_unusable"),
+        (grid_valid and grid_present, "grid_power_invalid"),
+        (home_valid and home_present, "home_power_invalid"),
+        (external_valid and external_present, "external_ac_power_invalid"),
+        (pv_present, "pv_power_invalid"),
+    ):
+        if not condition:
+            blockers.append(reason)
+
+    grid_w = safe_float(live.get("Grid_Power"), 0.0) if grid_present else None
+    grid_ema_present = _live_numeric_present(live, "Grid_EMA_W")
+    grid_ema_w = safe_float(live.get("Grid_EMA_W"), 0.0) if grid_ema_present else grid_w
+    grid_import_w = (
+        max(0.0, grid_w or 0.0, grid_ema_w or 0.0)
+        if grid_w is not None
+        else None
+    )
+    import_guard_w = max(
+        0.0,
+        safe_float(
+            cfg.get("direct_marketing_aux_inverter_ac_grid_import_guard_w"),
+            0.0,
+        ),
+    )
+    no_grid_import = bool(
+        complete
+        and grid_import_w is not None
+        and grid_import_w <= import_guard_w
+    )
+    if complete and not no_grid_import:
+        blockers.append("grid_import_present")
+    return {
+        "complete": complete,
+        "fresh": fresh,
+        "timestamp_valid": timestamp_valid,
+        "age_s": round(age_s, 3) if age_s is not None else None,
+        "max_age_s": round(max_age_s, 3),
+        "sample_valid": sample_valid,
+        "decision_usable": decision_usable,
+        "grid_valid": grid_valid,
+        "home_valid": home_valid,
+        "external_ac_valid": external_valid,
+        "grid_import_w": round(grid_import_w, 1) if grid_import_w is not None else None,
+        "grid_import_guard_w": round(import_guard_w, 1),
+        "no_grid_import": no_grid_import,
+        "blockers": blockers,
+    }
+
+
+def direct_marketing_pv_store_source_contract(
+    cfg: Dict[str, Any],
+    window: Dict[str, Any],
+    flags: Dict[str, Any],
+    live: Optional[Dict[str, Any]] = None,
+    pv_sources: Optional[Dict[str, Any]] = None,
+    now_s: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Bindet Zusatz-WR-AC an Modus, Plan, Topologie, Forecast und Livephysik."""
+
+    cfg = cfg or {}
+    window = window if isinstance(window, dict) else {}
+    flags = flags if isinstance(flags, dict) else {}
+    mode, mode_source = _direct_marketing_aux_ac_mode(cfg, window, flags)
+    legacy_dc_veto = mode_source == "legacy_dc_only_veto"
+    aux_ac_user_release = mode != "off"
+    window_plan_mode = str(
+        window.get("pv_store_aux_ac_mode") or ""
+    ).strip().lower()
+    flags_plan_mode = str(
+        flags.get("pv_store_aux_ac_mode") or ""
+    ).strip().lower()
+    window_plan_mode_valid = window_plan_mode in _DIRECT_MARKETING_AUX_AC_MODES
+    flags_plan_mode_valid = flags_plan_mode in _DIRECT_MARKETING_AUX_AC_MODES
+    plan_mode_match = bool(
+        mode != "off"
+        and window_plan_mode_valid
+        and flags_plan_mode_valid
+        and window_plan_mode == mode
+        and flags_plan_mode == mode
+    )
+    aux_ac_topology_ready, pv_topology_contract = _direct_marketing_aux_ac_topology_ready(cfg)
+    plan_topology_revision = str(
+        window.get("pv_store_topology_revision") or ""
+    ).strip()
+    current_topology_revision = str(
+        pv_topology_contract.get("revision") or ""
+    ).strip()
+    topology_revision_match = bool(
+        plan_topology_revision
+        and current_topology_revision
+        and plan_topology_revision == current_topology_revision
+    )
+    aux_ac_plan_flag = _contract_bool(
+        flags.get("pv_store_aux_ac_storage_enable")
+    )
+    aux_ac_window_release = _contract_bool(
+        window.get("pv_store_aux_ac_storage_allowed")
+    )
+    dc_forecast_complete = _contract_bool(
+        window.get("pv_store_dc_forecast_complete")
+    )
+    forecast_fresh = _contract_bool(
+        window.get("pv_store_forecast_fresh")
+    )
+    forecast_freshness_source = str(
+        window.get("pv_store_forecast_freshness_source")
+        or "unconfirmed"
+    ).strip()
+    dc_forecast_deficit_wh = max(
+        0.0,
+        safe_float(window.get("pv_store_dc_forecast_deficit_wh"), 0.0),
+    )
+    dc_forecast_requested_wh = max(
+        0.0,
+        safe_float(window.get("pv_store_dc_forecast_requested_wh"), 0.0),
+    )
+    dc_forecast_selected_wh = max(
+        0.0,
+        safe_float(window.get("pv_store_dc_forecast_selected_wh"), 0.0),
+    )
+    dc_forecast_conservative_selected_wh = max(
+        0.0,
+        safe_float(
+            window.get("pv_store_dc_forecast_conservative_selected_wh"),
+            dc_forecast_selected_wh,
+        ),
+    )
+    plan_source_contract = str(
+        window.get("pv_store_source_contract") or ""
+    ).strip().upper()
+    deadband_wh = max(
+        0.0,
+        safe_float(
+            window.get("pv_store_aux_ac_deadband_wh"),
+            safe_float(flags.get("pv_store_aux_ac_deadband_wh"), 0.0),
+        ),
+    )
+    route_margin_ct = window.get("pv_store_aux_ac_route_margin_ct_per_kwh")
+    if route_margin_ct is None:
+        route_margin_ct = flags.get("pv_store_aux_ac_route_margin_ct_per_kwh")
+    route_margin_ct = (
+        safe_float(route_margin_ct, float("nan"))
+        if route_margin_ct is not None and str(route_margin_ct).strip() != ""
+        else None
+    )
+    dc_route_margin_ct = window.get("pv_store_dc_route_margin_ct_per_kwh")
+    if dc_route_margin_ct is None:
+        dc_route_margin_ct = flags.get("pv_store_dc_route_margin_ct_per_kwh")
+    dc_route_margin_ct = (
+        safe_float(dc_route_margin_ct, float("nan"))
+        if dc_route_margin_ct is not None and str(dc_route_margin_ct).strip() != ""
+        else None
+    )
+    min_route_margin_ct = max(
+        0.0,
+        safe_float(
+            window.get("pv_store_aux_ac_min_margin_ct_per_kwh"),
+            safe_float(flags.get("pv_store_aux_ac_min_margin_ct_per_kwh"), 0.0),
+        ),
+    )
+    economic_margin_ok = bool(
+        mode != "economic"
+        or (
+            route_margin_ct is not None
+            and math.isfinite(route_margin_ct)
+            and route_margin_ct > _DIRECT_MARKETING_POSITIVE_MARGIN_EPSILON_CT
+            and (
+                route_margin_ct + _DIRECT_MARKETING_POSITIVE_MARGIN_EPSILON_CT
+                >= min_route_margin_ct
+            )
+        )
+    )
+    pv_sources = (
+        pv_sources
+        if isinstance(pv_sources, dict)
+        else direct_marketing_pv_source_breakdown(cfg, live or {})
+    )
+    live_gate = _direct_marketing_live_ac_gate(
+        cfg,
+        live or {},
+        pv_sources,
+        now_s,
+    )
+
+    aux_ac_storage_allowed = bool(
+        aux_ac_user_release
+        and plan_mode_match
+        and aux_ac_topology_ready
+        and topology_revision_match
+        and aux_ac_plan_flag
+        and aux_ac_window_release
+        and dc_forecast_complete
+        and forecast_fresh
+        and dc_forecast_deficit_wh > deadband_wh
+        and economic_margin_ok
+        and live_gate["complete"]
+        and live_gate["no_grid_import"]
+        and plan_source_contract == "E3DC_DC_PLUS_AUX_AC_PV"
+    )
+    if legacy_dc_veto:
+        reason = "legacy_dc_only_veto"
+    elif mode == "off":
+        reason = "aux_ac_mode_off"
+    elif not aux_ac_user_release:
+        reason = "aux_ac_user_release_missing"
+    elif not plan_mode_match:
+        reason = "aux_ac_plan_mode_mismatch"
+    elif not aux_ac_topology_ready:
+        reason = "aux_ac_topology_unbound"
+    elif not topology_revision_match:
+        reason = (
+            "aux_ac_topology_revision_missing"
+            if not plan_topology_revision
+            else "aux_ac_topology_revision_mismatch"
+        )
+    elif not aux_ac_plan_flag:
+        reason = "aux_ac_plan_flag_missing"
+    elif not aux_ac_window_release or plan_source_contract != "E3DC_DC_PLUS_AUX_AC_PV":
+        reason = "aux_ac_window_release_missing"
+    elif not dc_forecast_complete:
+        reason = "dc_forecast_incomplete"
+    elif not forecast_fresh:
+        reason = "forecast_freshness_unconfirmed"
+    elif dc_forecast_deficit_wh <= deadband_wh:
+        reason = "dc_forecast_sufficient"
+    elif not economic_margin_ok:
+        reason = (
+            "economic_margin_not_positive"
+            if mode == "economic"
+            and (
+                route_margin_ct is None
+                or not math.isfinite(route_margin_ct)
+                or route_margin_ct <= _DIRECT_MARKETING_POSITIVE_MARGIN_EPSILON_CT
+            )
+            else "economic_margin_below_minimum"
+        )
+    elif not live_gate["complete"]:
+        reason = "live_ac_measurement_incomplete"
+    elif not live_gate["no_grid_import"]:
+        reason = "grid_import_present"
+    else:
+        reason = (
+            "aux_ac_released_for_protected_reserve_deficit"
+            if mode == "reserve_only"
+            else "aux_ac_released_for_positive_route_margin"
+        )
+    legacy_plan_metadata_missing = bool(
+        not plan_source_contract
+        and window.get("pv_store_dc_forecast_complete") is None
+        and window.get("pv_store_aux_ac_storage_allowed") is None
+    )
+    legacy_dc_only_evidence = bool(
+        legacy_dc_veto
+        and _contract_bool(flags.get("pv_store_dc_only_enable"))
+        and str(window.get("action") or "") in DIRECT_MARKETING_PV_STORE_ACTIONS
+        and str(window.get("storage_action") or "") == "pv_only_charge"
+    )
+    return {
+        "schema": "direct_marketing_pv_store_runtime_source_v1",
+        "source": (
+            "E3DC_DC_PLUS_AUX_AC_PV"
+            if aux_ac_storage_allowed
+            else "E3DC_DC"
+        ),
+        "mode": mode,
+        "mode_source": mode_source,
+        "window_plan_mode": window_plan_mode if window_plan_mode_valid else None,
+        "flags_plan_mode": flags_plan_mode if flags_plan_mode_valid else None,
+        "plan_mode_match": plan_mode_match,
+        "plan_mode_matches_config": plan_mode_match,
+        "dc_only": not aux_ac_storage_allowed,
+        "aux_ac_user_release": aux_ac_user_release,
+        "aux_ac_topology_ready": aux_ac_topology_ready,
+        "topology_status": pv_topology_contract.get("status"),
+        "topology_revision": current_topology_revision or None,
+        "plan_topology_revision": plan_topology_revision or None,
+        "current_topology_revision": current_topology_revision or None,
+        "topology_revision_match": topology_revision_match,
+        "aux_ac_plan_flag": aux_ac_plan_flag,
+        "aux_ac_window_release": aux_ac_window_release,
+        "aux_ac_storage_allowed": aux_ac_storage_allowed,
+        "dc_forecast_complete": dc_forecast_complete,
+        "forecast_fresh": forecast_fresh,
+        "forecast_freshness_source": forecast_freshness_source,
+        "dc_forecast_requested_wh": round(dc_forecast_requested_wh, 1),
+        "dc_forecast_selected_wh": round(dc_forecast_selected_wh, 1),
+        "dc_forecast_conservative_selected_wh": round(
+            dc_forecast_conservative_selected_wh,
+            1,
+        ),
+        "dc_forecast_deficit_wh": round(dc_forecast_deficit_wh, 1),
+        "deadband_wh": round(deadband_wh, 1),
+        "protected_target_soc_pct": window.get(
+            "pv_store_aux_ac_protected_target_soc_pct"
+        ),
+        "forecast_confidence_pct": window.get(
+            "pv_store_aux_ac_forecast_confidence_pct"
+        ),
+        "dc_charge_efficiency_pct": window.get(
+            "pv_store_dc_charge_efficiency_pct",
+            flags.get("pv_store_dc_charge_efficiency_pct"),
+        ),
+        "aux_ac_charge_efficiency_pct": window.get(
+            "pv_store_aux_ac_charge_efficiency_pct",
+            flags.get("pv_store_aux_ac_charge_efficiency_pct"),
+        ),
+        "discharge_efficiency_pct": window.get(
+            "pv_store_discharge_efficiency_pct",
+            flags.get("pv_store_discharge_efficiency_pct"),
+        ),
+        "aux_ac_route_margin_ct_per_kwh": (
+            round(route_margin_ct, 3)
+            if route_margin_ct is not None and math.isfinite(route_margin_ct)
+            else None
+        ),
+        "dc_route_margin_ct_per_kwh": (
+            round(dc_route_margin_ct, 3)
+            if dc_route_margin_ct is not None and math.isfinite(dc_route_margin_ct)
+            else None
+        ),
+        "aux_ac_min_margin_ct_per_kwh": round(min_route_margin_ct, 3),
+        "economic_margin_ok": economic_margin_ok,
+        "live_gate": live_gate,
+        "plan_source_contract": plan_source_contract or None,
+        "legacy_plan_metadata_missing": legacy_plan_metadata_missing,
+        "legacy_dc_only_evidence": legacy_dc_only_evidence,
+        "legacy_dc_only_migration": bool(
+            legacy_plan_metadata_missing
+            and legacy_dc_only_evidence
+            and not aux_ac_storage_allowed
+        ),
+        "grid_ac_allowed": False,
+        "reason": reason,
+    }
+
+
 def direct_marketing_pv_store_control_w(
     cfg: Dict[str, Any],
     live: Dict[str, Any],
@@ -6970,6 +8040,16 @@ def direct_marketing_pv_store_control_w(
         return {"blocked": True, "blocker": "pv_store_charge_power_below_min", "charge_w": 0}
 
     pv_sources = direct_marketing_pv_source_breakdown(cfg, live)
+    dc_first_limit_enabled = cfg_bool(cfg, "storage_dc_first_charge_limit_enable", False)
+    dc_first_source = storage_dc_first_live_source_contract(cfg, live, now_s=now_s)
+    source_contract = direct_marketing_pv_store_source_contract(
+        cfg,
+        window,
+        flags,
+        live=live,
+        pv_sources=pv_sources,
+        now_s=now_s,
+    )
     source_diag = {
         "pv_total_w": pv_sources["total_pv_w"],
         "pv_e3dc_w": pv_sources["e3dc_pv_w"],
@@ -6977,7 +8057,69 @@ def direct_marketing_pv_store_control_w(
         "pv_source": pv_sources["source"],
         "dc_surplus_w": pv_sources["e3dc_dc_surplus_w"],
         "local_load_after_external_w": pv_sources["local_load_after_external_w"],
+        "storage_dc_first_charge_limit_enabled": dc_first_limit_enabled,
+        "storage_dc_first_source_valid": bool(dc_first_source.get("valid")),
+        "storage_dc_first_source_blocker": str(dc_first_source.get("blocker") or ""),
+        "storage_dc_first_e3dc_pv_w": safe_int(dc_first_source.get("e3dc_pv_w"), 0),
+        "source_contract": source_contract,
+        "source_contract_reason": source_contract["reason"],
+        "aux_ac_user_release": source_contract["aux_ac_user_release"],
+        "aux_ac_topology_ready": source_contract["aux_ac_topology_ready"],
+        "aux_ac_plan_release": source_contract["aux_ac_window_release"],
+        "aux_ac_storage_allowed": source_contract["aux_ac_storage_allowed"],
+        "aux_ac_mode": source_contract["mode"],
+        "aux_ac_mode_source": source_contract["mode_source"],
+        "aux_ac_window_plan_mode": source_contract["window_plan_mode"],
+        "aux_ac_flags_plan_mode": source_contract["flags_plan_mode"],
+        "aux_ac_plan_mode_match": source_contract["plan_mode_match"],
+        "topology_revision_match": source_contract["topology_revision_match"],
+        "dc_forecast_complete": source_contract["dc_forecast_complete"],
+        "forecast_fresh": source_contract["forecast_fresh"],
+        "forecast_freshness_source": source_contract[
+            "forecast_freshness_source"
+        ],
+        "dc_forecast_requested_wh": source_contract[
+            "dc_forecast_requested_wh"
+        ],
+        "dc_forecast_selected_wh": source_contract[
+            "dc_forecast_selected_wh"
+        ],
+        "dc_forecast_conservative_selected_wh": source_contract[
+            "dc_forecast_conservative_selected_wh"
+        ],
+        "dc_forecast_deficit_wh": source_contract["dc_forecast_deficit_wh"],
+        "aux_ac_deadband_wh": source_contract["deadband_wh"],
+        "aux_ac_route_margin_ct_per_kwh": source_contract[
+            "aux_ac_route_margin_ct_per_kwh"
+        ],
+        "dc_route_margin_ct_per_kwh": source_contract[
+            "dc_route_margin_ct_per_kwh"
+        ],
+        "aux_ac_min_margin_ct_per_kwh": source_contract[
+            "aux_ac_min_margin_ct_per_kwh"
+        ],
+        "dc_charge_efficiency_pct": source_contract[
+            "dc_charge_efficiency_pct"
+        ],
+        "aux_ac_charge_efficiency_pct": source_contract[
+            "aux_ac_charge_efficiency_pct"
+        ],
+        "discharge_efficiency_pct": source_contract[
+            "discharge_efficiency_pct"
+        ],
+        "live_ac_gate": source_contract["live_gate"],
+        "legacy_dc_only_migration": source_contract[
+            "legacy_dc_only_migration"
+        ],
+        "grid_ac_allowed": False,
     }
+    if not dc_first_limit_enabled and not pv_sources.get("measurement_complete"):
+        return {
+            "blocked": True,
+            "blocker": "pv_store_source_measurement_missing",
+            "charge_w": 0,
+            **source_diag,
+        }
     grid_w = safe_float(live.get("Grid_Power"), 0.0)
     grid_ema_w = safe_float(live.get("Grid_EMA_W", grid_w), grid_w)
     grid_import_w = max(0, int(round(max(grid_w, grid_ema_w, 0.0))))
@@ -7032,13 +8174,17 @@ def direct_marketing_pv_store_control_w(
     home_w = pv_sources["home_w"]
     wallbox_w = pv_sources["wallbox_w"]
     current_battery_charge_w = max(0, safe_int(live.get("Battery_Power"), 0))
-    physical_surplus_w = max(0, pv_w - home_w - wallbox_w)
+    physical_surplus_w = (
+        0
+        if dc_first_limit_enabled
+        else max(0, pv_w - home_w - wallbox_w)
+    )
     estimated_offer_w = max(physical_surplus_w, grid_export_w + current_battery_charge_w)
     export_absorb_target_w = current_battery_charge_w + export_over_limit_w if export_limit_guard_active else current_battery_charge_w
     if export_limit_guard_active:
         estimated_offer_w = max(estimated_offer_w, export_absorb_target_w)
     pv_safe_cap_w = physical_surplus_w
-    dc_only = bool(flags.get("pv_store_dc_only_enable")) or cfg_bool(cfg, "direct_marketing_pv_store_dc_only_enable", False)
+    dc_only = bool(source_contract["dc_only"])
     external_ac_guard_w = max(
         0,
         safe_int(
@@ -7046,12 +8192,24 @@ def direct_marketing_pv_store_control_w(
             safe_int(cfg.get("direct_marketing_pv_store_external_ac_guard_w"), 100),
         ),
     )
-    if dc_only and pv_sources["external_ac_pv_w"] > external_ac_guard_w:
+    if dc_only and not dc_first_limit_enabled:
         pv_safe_cap_w = min(pv_safe_cap_w, pv_sources["e3dc_dc_surplus_w"])
         physical_surplus_w = min(physical_surplus_w, pv_sources["e3dc_dc_surplus_w"])
-    # The running battery charge may be the result of our previous command. For
-    # PV-only storage it is only an estimate, never permission to exceed PV.
-    offer_w = min(estimated_offer_w, pv_safe_cap_w)
+    if dc_first_limit_enabled:
+        # MAX_CHARGE_POWER ist nur ein Rahmen. Deshalb ist die volle, frisch
+        # gemessene E3DC-PV-Leistung die Obergrenze; Hauslast und Netzpunkt
+        # werden nicht als zweiter Regler in diesen Rahmen eingemischt.
+        pv_safe_cap_w = (
+            max(0, safe_int(dc_first_source.get("e3dc_pv_w"), 0))
+            if dc_first_source.get("valid")
+            else 0
+        )
+        estimated_offer_w = pv_safe_cap_w
+        offer_w = pv_safe_cap_w
+    else:
+        # The running battery charge may be the result of our previous command. For
+        # PV-only storage it is only an estimate, never permission to exceed PV.
+        offer_w = min(estimated_offer_w, pv_safe_cap_w)
     self_reference_limited = bool(estimated_offer_w > pv_safe_cap_w)
     unavoidable_export_w = max(0, export_absorb_target_w - offer_w) if export_limit_guard_active else 0
     export_limit_diag = {
@@ -7078,7 +8236,7 @@ def direct_marketing_pv_store_control_w(
         "external_derating_power_w": external_derating.get("derate_at_power_w"),
         "external_derating_percent": external_derating.get("derate_at_percent"),
     }
-    if grid_import_w > import_guard_w:
+    if not dc_first_limit_enabled and grid_import_w > import_guard_w:
         return {
             "blocked": True,
             "blocker": "pv_store_grid_import_guard",
@@ -7102,7 +8260,11 @@ def direct_marketing_pv_store_control_w(
     )
     if offer_w < max(300, min_surplus_w):
         blocker = "pv_store_surplus_below_min"
-        if dc_only and pv_sources["external_ac_pv_w"] > external_ac_guard_w:
+        if dc_first_limit_enabled and not dc_first_source.get("valid"):
+            blocker = "storage_dc_first_source_invalid"
+        elif dc_first_limit_enabled:
+            blocker = "storage_dc_first_e3dc_pv_below_min"
+        elif dc_only:
             blocker = "pv_store_dc_surplus_below_min"
         return {
             "blocked": True,
@@ -7135,11 +8297,20 @@ def direct_marketing_pv_store_control_w(
     if export_limit_guard_active:
         export_absorb_cap_w = min(max_charge_w, offer_w)
         charge_w = max(charge_w, min(export_absorb_cap_w, export_absorb_target_w))
-    charge_w = predump_round_budget_w(cfg, charge_w)
+    charge_w = min(
+        max_charge_w,
+        offer_w,
+        predump_round_budget_w(cfg, charge_w),
+    )
     if charge_w < max(300, min_surplus_w):
+        blocker = (
+            "pv_store_dc_surplus_below_min"
+            if dc_only
+            else "pv_store_charge_power_below_min"
+        )
         return {
             "blocked": True,
-            "blocker": "pv_store_charge_power_below_min",
+            "blocker": blocker,
             "charge_w": charge_w,
             "offer_w": offer_w,
             "physical_surplus_w": physical_surplus_w,
@@ -7365,6 +8536,8 @@ def direct_marketing_policy_action(target_state: str, mode: str = "") -> str:
     target = str(target_state or "").strip().upper()
     if target == "FORCE_CHARGE_PV":
         return "policy_force_charge_pv"
+    if target == "CHARGE_BLOCK_WAIT":
+        return "policy_charge_block_wait"
     if target == "HEADROOM_EXPORT":
         return "policy_headroom_export"
     if target == "FORCE_EXPORT":
@@ -7381,6 +8554,8 @@ def direct_marketing_policy_state(target_state: str, mode: str = "") -> str:
     strategy = str(mode or "").strip().lower()
     if target == "FORCE_CHARGE_PV":
         return "direct_marketing_eco_plus_pv_store"
+    if target == "CHARGE_BLOCK_WAIT":
+        return "direct_marketing_charge_block_wait"
     if target == "HEADROOM_EXPORT":
         return "direct_marketing_eco_plus_headroom_export"
     if target == "FORCE_EXPORT" and strategy == "arbitrage":
@@ -7417,6 +8592,12 @@ def direct_marketing_policy_window(policy_ctx: Dict[str, Any], now_s: float) -> 
         "pv_export_allowed",
         "export_constraint_enforcement",
         "export_constraint_execution_owner",
+        "pv_store_source_contract",
+        "pv_store_dc_only_enable",
+        "pv_store_aux_ac_storage_enable",
+        "pv_store_aux_ac_storage_allowed",
+        "pv_store_dc_forecast_complete",
+        "pv_store_dc_forecast_deficit_wh",
     ):
         if selected.get(key) is not None:
             window[key] = selected.get(key)
@@ -7585,6 +8766,7 @@ def direct_marketing_policy_executor_gate(
     executable_action = str(policy.get("executable_action") or "")
     expected_actions = {
         "FORCE_CHARGE_PV": {"eco_plus_store_pv_candidate"},
+        "CHARGE_BLOCK_WAIT": {"direct_marketing_charge_block_wait"},
         "FORCE_EXPORT": {"eco_plus_export_candidate"},
         "HEADROOM_EXPORT": {"eco_plus_negative_headroom_hold"},
     }.get(target_state, set())
@@ -7724,6 +8906,185 @@ def direct_marketing_future_pv_store_reservation(
     return result
 
 
+def direct_marketing_post_final_pv_store_auto_context(
+    plan: Dict[str, Any],
+    previous_state: Optional[Dict[str, Any]],
+    now_s: float,
+) -> Dict[str, Any]:
+    """Erkennt passive Hausversorgung nach einem abgeschlossenen PV_STORE.
+
+    Der Kontext selbst erzeugt keinen Speicherbefehl. Er erlaubt dem
+    nachgelagerten Kurvenregler lediglich, einen redundanten Lade-Hold in den
+    bereits vorhandenen AUTO-Freilauf zu überführen. Maßgeblich ist der aktuell
+    ausgewählte NORMAL-Vertrag; künftige Fenster dürfen keinen vorzeitigen
+    Lade-Hold auslösen. Aktive DV-, Lade- und Sperrentscheidungen bleiben davon
+    unberührt.
+    """
+    direct = direct_marketing_plan(plan or {})
+    previous_state = previous_state or {}
+    result: Dict[str, Any] = {
+        "active": False,
+        "reason": "direct_marketing_inactive",
+        "completed_pv_store_end_ts": 0,
+        "next_export_start_ts": 0,
+        "latched": False,
+    }
+    if (
+        not bool(direct.get("active"))
+        or bool(direct.get("shadow"))
+        or str(direct.get("mode") or "").strip().lower() != "eco_plus"
+    ):
+        return result
+
+    policy_ctx = direct_marketing_policy_context(direct)
+    policy = policy_ctx.get("policy") if isinstance(policy_ctx.get("policy"), dict) else {}
+    if (
+        not bool(policy_ctx.get("schema_valid"))
+        or bool(policy_ctx.get("blocked"))
+        or str(policy_ctx.get("target_state") or "") != "NORMAL"
+        or policy.get("commands_allowed") is not False
+    ):
+        result["reason"] = "current_policy_not_passive_normal"
+        return result
+
+    now_ms = int(float(now_s) * 1000.0)
+    policy_start = safe_int(policy.get("start_ts"), 0)
+    policy_end = safe_int(policy.get("end_ts"), 0)
+    if not (policy_start <= now_ms < policy_end):
+        result["reason"] = "current_policy_not_fresh"
+        return result
+
+    coverage = (
+        direct.get("charge_block_wait_plan")
+        if isinstance(direct.get("charge_block_wait_plan"), dict)
+        else {}
+    )
+    if (
+        coverage.get("schema") != "direct_marketing_charge_block_wait_plan_v1"
+        or not bool(coverage.get("complete"))
+        or not bool(coverage.get("contiguous_900s"))
+        or safe_int(coverage.get("action_gap_slot_count"), 0) != 0
+    ):
+        result["reason"] = "planned_slot_coverage_incomplete"
+        return result
+
+    timeline = [
+        item
+        for item in (direct.get("policy_timeline") or [])
+        if isinstance(item, dict)
+    ]
+    future_exports = []
+    future_store_starts = []
+    completed_policy_store_ends = []
+    for item in timeline:
+        start_ms = safe_int(item.get("start_ts"), 0)
+        end_ms = safe_int(item.get("end_ts"), 0)
+        target = str(item.get("dv_target_state") or "").strip().upper()
+        if end_ms <= now_ms:
+            if (
+                target == "FORCE_CHARGE_PV"
+                and item.get("commands_allowed") is True
+                and item.get("blocked") is False
+            ):
+                completed_policy_store_ends.append(end_ms)
+            continue
+        if (
+            target in DIRECT_MARKETING_POLICY_EXPORT_STATES
+            and item.get("commands_allowed") is True
+            and item.get("blocked") is False
+        ):
+            future_exports.append(start_ms)
+        elif (
+            target == "FORCE_CHARGE_PV"
+            and item.get("commands_allowed") is True
+            and item.get("blocked") is False
+        ):
+            future_store_starts.append(start_ms)
+    next_export_start = min(future_exports, default=0)
+    store_before_export = any(
+        start_ms > now_ms
+        and (
+            next_export_start <= 0
+            or start_ms <= next_export_start
+        )
+        for start_ms in future_store_starts
+    )
+    if store_before_export:
+        result.update({
+            "reason": "future_pv_store_slot_active",
+            "next_export_start_ts": next_export_start,
+        })
+        return result
+
+    completed_window_store_ends = []
+    for window in direct.get("windows") if isinstance(direct.get("windows"), list) else []:
+        if not isinstance(window, dict):
+            continue
+        if str(window.get("action") or "") not in DIRECT_MARKETING_PV_STORE_ACTIONS:
+            continue
+        end_ms = safe_int(window.get("end_ts"), 0)
+        if 0 < end_ms <= now_ms:
+            completed_window_store_ends.append(end_ms)
+
+    previous_target = str(previous_state.get("direct_marketing_policy_target_state") or "").strip().upper()
+    previous_action = str(previous_state.get("direct_marketing_action") or "")
+    previous_storage_state = str(previous_state.get("state") or "")
+    latched = bool(previous_state.get("direct_marketing_post_final_pv_store_auto_active"))
+    previous_store = bool(
+        previous_target == "FORCE_CHARGE_PV"
+        or previous_action == "policy_force_charge_pv"
+        or previous_action in DIRECT_MARKETING_PV_STORE_ACTIONS
+        or previous_storage_state == "direct_marketing_eco_plus_pv_store"
+    )
+    completed_store_ends = completed_policy_store_ends + completed_window_store_ends
+    completed_store_end = max(completed_store_ends, default=0)
+    if completed_store_end <= 0 and not latched and not previous_store:
+        result["reason"] = "completed_pv_store_missing"
+        return result
+    result.update({
+        "active": True,
+        "reason": "passive_house_supply_after_final_pv_store",
+        "completed_pv_store_end_ts": completed_store_end,
+        "next_export_start_ts": next_export_start,
+        "latched": bool(latched or previous_store),
+        "policy": policy,
+    })
+    return result
+
+
+def apply_post_final_pv_store_auto_release(
+    decision: Dict[str, Any],
+    *,
+    release_active: bool,
+    max_charge_w: int,
+    pv_after_fixed_w: int,
+) -> Tuple[Dict[str, Any], bool]:
+    """Gibt die normale Kurvenregelung nach dem letzten PV_STORE auf AUTO frei.
+
+    Die Funktion wird ausschließlich im ungeschützten Standard-Regelpfad
+    aufgerufen. Konkrete Storage-Manager-Entscheidungen wie Preis-/Winterladen,
+    aktive Sperren, Direktvermarktung, Reserve- und Sicherheitsvorgaben haben
+    den Pfad bereits vorher übernommen und behalten damit ihren Vorrang.
+    """
+    result = dict(decision or {})
+    original_state = str(result.get("state") or "")
+    if (
+        not bool(release_active)
+        or original_state not in POST_FINAL_PV_STORE_AUTO_RELEASE_STATES
+    ):
+        return result, False
+    result.update({
+        "direct_marketing_post_final_pv_store_original_state": original_state,
+        "state": "parallel_evening_release",
+        "mode": MODE_AUTO,
+        "val": max(0, safe_int(max_charge_w, 0)),
+        "priority": "default",
+        "storage_req_w": 0,
+        "budget_w": max(0, safe_int(pv_after_fixed_w, 0)),
+    })
+    return result, True
+
+
 def direct_marketing_curve_charge_reservation_cap(
     cfg: Dict[str, Any],
     plan: Dict[str, Any],
@@ -7777,6 +9138,114 @@ def direct_marketing_curve_charge_reservation_cap(
         "pv_charge_available_w": pv_charge_available_w,
         "opens_existing_hold": opens_existing_hold,
     }
+
+
+def apply_direct_marketing_parallel_auto_reservation_cap(
+    cfg: Dict[str, Any],
+    plan: Dict[str, Any],
+    decision: Dict[str, Any],
+    max_charge_w: int,
+    max_discharge_w: int,
+    pv_after_fixed_w: int,
+    grid_w: int,
+    now_s: float,
+) -> Dict[str, Any]:
+    """Bindet reservierten DV-Headroom vor dem allgemeinen DC-first-Rahmen."""
+
+    state = str((decision or {}).get("state") or "")
+    if not bool(
+        state in {
+            "parallel_auto",
+            "parallel_curve_auto_charge",
+            "parallel_curve_auto_hold",
+            "parallel_curve_auto_no_surplus",
+            "parallel_curve_charge",
+        }
+        and not (decision or {}).get("protected")
+        and not (decision or {}).get("direct_marketing_post_final_pv_store_auto_active")
+    ):
+        return decision
+
+    direct = direct_marketing_plan(plan or {})
+    policy_ctx = direct_marketing_policy_context(direct)
+    policy = (
+        policy_ctx.get("policy")
+        if isinstance(policy_ctx.get("policy"), dict)
+        else {}
+    )
+    now_ms = int(float(now_s) * 1000.0)
+    policy_start = safe_int(policy.get("start_ts"), 0)
+    policy_end = safe_int(policy.get("end_ts"), 0)
+    policy_bounds_current = bool(
+        min(policy_start, policy_end) >= 10_000_000_000
+        and policy_start <= now_ms < policy_end
+    )
+    canonical = validate_canonical_plan(plan or {}, now_ms)
+    canonical_plan_current = bool(
+        canonical.get("valid")
+        and safe_int(direct.get("valid_until_ts"), 0) > now_ms
+    )
+    if not bool(
+        direct.get("active")
+        and not direct.get("shadow")
+        and str(direct.get("mode") or "").strip().lower() == "eco_plus"
+        and policy_ctx.get("schema_valid")
+        and not policy_ctx.get("blocked")
+        and str(policy_ctx.get("target_state") or "") == "NORMAL"
+        and policy.get("commands_allowed") is False
+        and (policy_bounds_current or canonical_plan_current)
+    ):
+        return decision
+
+    existing_auto_limit = (
+        decision.get("auto_limit")
+        if isinstance(decision.get("auto_limit"), dict)
+        else {}
+    )
+    existing_auto_limit_active = bool(
+        existing_auto_limit.get("enabled")
+        and not existing_auto_limit.get("release")
+    )
+    result = dict(decision)
+    reservation = direct_marketing_future_pv_store_reservation(plan, now_s)
+    cap_w = 0
+    reason = "DV-Hausversorgung ohne aktives Ladefeld: Ladegrenze 0W"
+
+    result["mode"] = MODE_AUTO
+    result["val"] = cap_w
+    result["storage_req_w"] = 0
+    if existing_auto_limit_active:
+        bound_auto_limit = dict(existing_auto_limit)
+        bound_auto_limit["max_charge_w"] = cap_w
+        bound_auto_limit["reason"] = (
+            str(bound_auto_limit.get("reason") or "") + "; " + reason
+        )[:220]
+        result["auto_limit"] = bound_auto_limit
+    else:
+        result["auto_limit"] = (
+            charge_block_auto_limit(cfg, max_discharge_w, reason)
+            if cap_w <= 0
+            else charge_cap_auto_limit(cfg, cap_w, max_discharge_w, reason)
+        )
+    result["direct_marketing_future_pv_store_reservation"] = reservation
+    result["direct_marketing_future_pv_store_reservation_active"] = bool(
+        reservation.get("valid")
+    )
+    result["direct_marketing_passive_normal_reservation_cap_active"] = True
+    result["direct_marketing_future_pv_store_reservation_cap_w"] = cap_w
+    result["direct_marketing_future_pv_store_reservation_grid_import_w"] = max(
+        0,
+        safe_int(grid_w, 0),
+    )
+    result["direct_marketing_future_pv_store_reservation_import_guard_w"] = max(
+        0,
+        safe_int(
+            cfg.get("direct_marketing_pv_store_import_guard_w"),
+            80,
+        ),
+    )
+    result["reason"] = (str(result.get("reason") or "") + "; " + reason)[:220]
+    return result
 
 
 def direct_marketing_contract_errors(
@@ -8051,7 +9520,11 @@ def direct_marketing_pv_store_release_hold_w(
         return {"active": False, "age_s": round(age_s, 1), "min_s": round(min_hold_s, 1)}
 
     blocker = str(control.get("blocker") or "")
-    if blocker not in ("pv_store_surplus_below_min", "pv_store_charge_power_below_min"):
+    if blocker not in (
+        "pv_store_surplus_below_min",
+        "pv_store_dc_surplus_below_min",
+        "pv_store_charge_power_below_min",
+    ):
         return {"active": False, "blocker": blocker, "age_s": round(age_s, 1), "min_s": round(min_hold_s, 1)}
 
     import_guard_w = max(
@@ -8065,8 +9538,33 @@ def direct_marketing_pv_store_release_hold_w(
     if grid_import_w > import_guard_w:
         return {"active": False, "blocker": "pv_store_grid_import_guard", "grid_import_w": grid_import_w}
 
-    if bool(previous_state.get("direct_marketing_pv_store_dc_only")) and blocker == "pv_store_dc_surplus_below_min":
-        return {"active": False, "blocker": blocker}
+    if blocker == "pv_store_dc_surplus_below_min":
+        source_contract = (
+            control.get("source_contract")
+            if isinstance(control.get("source_contract"), dict)
+            else {}
+        )
+        external_ac_w = max(0, safe_int(control.get("pv_external_ac_w"), 0))
+        external_guard_w = max(
+            0,
+            safe_int(
+                control.get("external_ac_guard_w"),
+                safe_int(cfg.get("direct_marketing_pv_store_external_ac_guard_w"), 100),
+            ),
+        )
+        legacy_dc_hold = bool(
+            source_contract.get("legacy_dc_only_migration")
+            and source_contract.get("dc_only") is True
+            and source_contract.get("aux_ac_storage_allowed") is False
+            and source_contract.get("grid_ac_allowed") is False
+            and external_ac_w <= external_guard_w
+        )
+        if not legacy_dc_hold:
+            return {"active": False, "blocker": blocker}
+        # Der alte kanonische DC-Hold bleibt erhalten; die generische Signatur
+        # wahrt den bisherigen Diagnosevertrag. Diese Migration gibt niemals
+        # EXTERNAL_AC frei.
+        blocker = "pv_store_surplus_below_min"
 
     target_soc = safe_float(
         previous_state.get("direct_marketing_target_soc_pct"),
@@ -8403,6 +9901,11 @@ def direct_marketing_storage_decision(
 
     if target_state == "FORCE_CHARGE_PV":
         control_window = window
+        dc_first_limit_enabled = cfg_bool(
+            cfg,
+            "storage_dc_first_charge_limit_enable",
+            False,
+        )
         fallback_target_soc = safe_float(
             reserve.get("target_soc_pct"),
             safe_float(cfg.get("storage_target_soc"), 100.0),
@@ -8413,6 +9916,26 @@ def direct_marketing_storage_decision(
         target_soc = max(0.0, min(100.0, target_soc))
         target_hysteresis = max(0.2, safe_float(cfg.get("direct_marketing_target_hysteresis_pct"), 0.7))
         if safe_float(live.get("SOC"), 0.0) >= target_soc - target_hysteresis:
+            if dc_first_limit_enabled:
+                target_control = direct_marketing_pv_store_control_w(
+                    cfg,
+                    live,
+                    control_window,
+                    flags,
+                    max_charge_w,
+                    now_s,
+                )
+                target_control = dict(target_control)
+                target_control["blocked"] = True
+                target_control["blocker"] = "storage_dc_first_target_reached"
+                return True, direct_marketing_dc_first_charge_wait_decision(
+                    cfg,
+                    target_control,
+                    state,
+                    max_discharge_w,
+                    common,
+                    "Direktvermarktung Policy PV-Speichern",
+                )
             return True, None
         control = direct_marketing_pv_store_control_w(
             cfg,
@@ -8424,6 +9947,15 @@ def direct_marketing_storage_decision(
         )
         release_hold_ctx: Dict[str, Any] = {"active": False}
         if control.get("blocked"):
+            if dc_first_limit_enabled:
+                return True, direct_marketing_dc_first_charge_wait_decision(
+                    cfg,
+                    control,
+                    state,
+                    max_discharge_w,
+                    common,
+                    "Direktvermarktung Policy PV-Speichern",
+                )
             release_hold_ctx = direct_marketing_pv_store_release_hold_w(
                 cfg,
                 live,
@@ -8469,13 +10001,26 @@ def direct_marketing_storage_decision(
                 and safe_int(curve_catchup_ctx.get("charge_w"), 0) > requested_charge_w
             ):
                 requested_charge_w = safe_int(curve_catchup_ctx.get("charge_w"), requested_charge_w)
-        ramp_ctx = direct_marketing_pv_store_ramped_power_w(
-            cfg,
-            live,
-            previous_state,
-            requested_charge_w,
-            now_s,
-        )
+        if dc_first_limit_enabled:
+            ramp_ctx = {
+                "charge_w": requested_charge_w,
+                "ramp_limited": False,
+                "ramp_base_w": requested_charge_w,
+                "ramp_step_w": 0,
+                "resync_active": False,
+                "resync_reason": "",
+                "resync_gap_w": 0,
+                "resync_threshold_w": 0,
+                "observed_charge_w": max(0, safe_int(live.get("Battery_Power"), 0)),
+            }
+        else:
+            ramp_ctx = direct_marketing_pv_store_ramped_power_w(
+                cfg,
+                live,
+                previous_state,
+                requested_charge_w,
+                now_s,
+            )
         charge_w = safe_int(ramp_ctx.get("charge_w"), 0)
         ramp_limited = bool(ramp_ctx.get("ramp_limited"))
         export_limit_ramp_bypass = False
@@ -8489,13 +10034,27 @@ def direct_marketing_storage_decision(
         if bool(control.get("export_limit_guard_active")) and safe_int(control.get("export_over_limit_w"), 0) >= export_limit_bypass_threshold_w:
             absorb_w = safe_int(control.get("export_absorb_target_w"), 0)
             accelerated_w = min(requested_charge_w, max(charge_w, absorb_w))
-            accelerated_w = predump_round_budget_w(cfg, accelerated_w)
+            accelerated_w = min(
+                requested_charge_w,
+                predump_round_budget_w(cfg, accelerated_w),
+            )
             if accelerated_w > charge_w:
                 charge_w = accelerated_w
                 export_limit_ramp_bypass = True
                 ramp_limited = False
-
         if charge_w < 300:
+            if dc_first_limit_enabled:
+                wait_control = dict(control)
+                wait_control["blocked"] = True
+                wait_control["blocker"] = "storage_dc_first_charge_wait"
+                return True, direct_marketing_dc_first_charge_wait_decision(
+                    cfg,
+                    wait_control,
+                    state,
+                    max_discharge_w,
+                    common,
+                    "Direktvermarktung Policy PV-Speichern",
+                )
             return True, None
         execution_constraint = {
             "hard": bool(control.get("hard_export_limit_active")),
@@ -8626,6 +10185,11 @@ def direct_marketing_storage_decision(
             "direct_marketing_external_derating_power_w": control.get("external_derating_power_w", external_derating.get("derate_at_power_w")),
             "direct_marketing_external_derating_percent": control.get("external_derating_percent", external_derating.get("derate_at_percent")),
             "direct_marketing_pv_store_dc_only": bool(control.get("dc_only")),
+            "direct_marketing_pv_store_source_contract": control.get("source_contract"),
+            "direct_marketing_pv_store_source_contract_reason": control.get("source_contract_reason"),
+            "direct_marketing_pv_store_aux_ac_user_release": bool(control.get("aux_ac_user_release")),
+            "direct_marketing_pv_store_aux_ac_plan_release": bool(control.get("aux_ac_plan_release")),
+            "direct_marketing_pv_store_aux_ac_allowed": bool(control.get("aux_ac_storage_allowed")),
             "direct_marketing_pv_store_external_ac_guard_w": control.get("external_ac_guard_w"),
             "direct_marketing_pv_total_w": control.get("pv_total_w"),
             "direct_marketing_pv_e3dc_w": control.get("pv_e3dc_w"),
@@ -8825,6 +10389,11 @@ def direct_marketing_decision(
         return result
 
     if action in DIRECT_MARKETING_PV_STORE_ACTIONS:
+        dc_first_limit_enabled = cfg_bool(
+            cfg,
+            "storage_dc_first_charge_limit_enable",
+            False,
+        )
         fallback_target_soc = safe_float(
             reserve.get("target_soc_pct"),
             safe_float(cfg.get("storage_target_soc"), 100.0),
@@ -8841,10 +10410,39 @@ def direct_marketing_decision(
         target_soc = max(0.0, min(100.0, target_soc))
         hysteresis = max(0.2, safe_float(cfg.get("direct_marketing_target_hysteresis_pct"), 0.7))
         if soc >= target_soc - hysteresis:
+            if dc_first_limit_enabled:
+                target_control = direct_marketing_pv_store_control_w(
+                    cfg,
+                    live,
+                    window,
+                    flags,
+                    max_charge_w,
+                    now_s,
+                )
+                target_control = dict(target_control)
+                target_control["blocked"] = True
+                target_control["blocker"] = "storage_dc_first_target_reached"
+                return direct_marketing_dc_first_charge_wait_decision(
+                    cfg,
+                    target_control,
+                    state,
+                    max_discharge_w,
+                    common,
+                    "Direktvermarktung Eco+ PV-Speichern",
+                )
             return None
         control = direct_marketing_pv_store_control_w(cfg, live, window, flags, max_charge_w, now_s)
         release_hold_ctx: Dict[str, Any] = {"active": False}
         if control.get("blocked"):
+            if dc_first_limit_enabled:
+                return direct_marketing_dc_first_charge_wait_decision(
+                    cfg,
+                    control,
+                    state,
+                    max_discharge_w,
+                    common,
+                    "Direktvermarktung Eco+ PV-Speichern",
+                )
             release_hold_ctx = direct_marketing_pv_store_release_hold_w(
                 cfg,
                 live,
@@ -8882,13 +10480,26 @@ def direct_marketing_decision(
                 and safe_int(curve_catchup_ctx.get("charge_w"), 0) > requested_charge_w
             ):
                 requested_charge_w = safe_int(curve_catchup_ctx.get("charge_w"), requested_charge_w)
-        ramp_ctx = direct_marketing_pv_store_ramped_power_w(
-            cfg,
-            live,
-            previous_state,
-            requested_charge_w,
-            now_s,
-        )
+        if dc_first_limit_enabled:
+            ramp_ctx = {
+                "charge_w": requested_charge_w,
+                "ramp_limited": False,
+                "ramp_base_w": requested_charge_w,
+                "ramp_step_w": 0,
+                "resync_active": False,
+                "resync_reason": "",
+                "resync_gap_w": 0,
+                "resync_threshold_w": 0,
+                "observed_charge_w": max(0, safe_int(live.get("Battery_Power"), 0)),
+            }
+        else:
+            ramp_ctx = direct_marketing_pv_store_ramped_power_w(
+                cfg,
+                live,
+                previous_state,
+                requested_charge_w,
+                now_s,
+            )
         charge_w = safe_int(ramp_ctx.get("charge_w"), 0)
         ramp_limited = bool(ramp_ctx.get("ramp_limited"))
         ramp_base_w = safe_int(ramp_ctx.get("ramp_base_w"), 0)
@@ -8904,12 +10515,27 @@ def direct_marketing_decision(
         if bool(control.get("export_limit_guard_active")) and safe_int(control.get("export_over_limit_w"), 0) >= export_limit_bypass_threshold_w:
             absorb_w = safe_int(control.get("export_absorb_target_w"), 0)
             accelerated_w = min(requested_charge_w, max(charge_w, absorb_w))
-            accelerated_w = predump_round_budget_w(cfg, accelerated_w)
+            accelerated_w = min(
+                requested_charge_w,
+                predump_round_budget_w(cfg, accelerated_w),
+            )
             if accelerated_w > charge_w:
                 charge_w = accelerated_w
                 ramp_limited = charge_w < requested_charge_w
                 export_limit_ramp_bypass = True
         if charge_w < 300:
+            if dc_first_limit_enabled:
+                wait_control = dict(control)
+                wait_control["blocked"] = True
+                wait_control["blocker"] = "storage_dc_first_charge_wait"
+                return direct_marketing_dc_first_charge_wait_decision(
+                    cfg,
+                    wait_control,
+                    state,
+                    max_discharge_w,
+                    common,
+                    "Direktvermarktung Eco+ PV-Speichern",
+                )
             return None
         external_derating = direct_marketing_external_derating_context(live, cfg, now_s)
         execution_constraint = {
@@ -8945,10 +10571,16 @@ def direct_marketing_decision(
             reason += "; Nettoerlös %.2f ct/kWh" % safe_float(window.get("net_sell_ct"), 0.0)
         if target_soc_fallback_active:
             reason += "; Planfenster ohne Ziel-SoC, nutze Speicherziel %.1f%%" % target_soc
-        reason += (
-            "; Ziel %.1f%%, Netzimport-Wächter %dW"
-            % (target_soc, safe_int(control.get("import_guard_w"), 0))
-        )
+        if dc_first_limit_enabled:
+            reason += (
+                "; Ziel %.1f%%, Laderahmen folgt ausschließlich der frischen E3DC-PV-Leistung"
+                % target_soc
+            )
+        else:
+            reason += (
+                "; Ziel %.1f%%, Netzimport-Wächter %dW"
+                % (target_soc, safe_int(control.get("import_guard_w"), 0))
+            )
         if control.get("dc_only"):
             reason += "; DC-only %.0fW E3DC-Überschuss" % safe_float(control.get("dc_surplus_w"), 0.0)
         if pv_store_hold_ctx.get("active"):
@@ -9096,6 +10728,11 @@ def direct_marketing_decision(
             "direct_marketing_pv_store_resync_threshold_w": safe_int(ramp_ctx.get("resync_threshold_w"), 0),
             "direct_marketing_pv_store_observed_charge_w": safe_int(ramp_ctx.get("observed_charge_w"), 0),
             "direct_marketing_pv_store_dc_only": bool(control.get("dc_only")),
+            "direct_marketing_pv_store_source_contract": control.get("source_contract"),
+            "direct_marketing_pv_store_source_contract_reason": control.get("source_contract_reason"),
+            "direct_marketing_pv_store_aux_ac_user_release": bool(control.get("aux_ac_user_release")),
+            "direct_marketing_pv_store_aux_ac_plan_release": bool(control.get("aux_ac_plan_release")),
+            "direct_marketing_pv_store_aux_ac_allowed": bool(control.get("aux_ac_storage_allowed")),
             "direct_marketing_pv_store_external_ac_guard_w": control.get("external_ac_guard_w"),
             "direct_marketing_pv_total_w": control.get("pv_total_w"),
             "direct_marketing_pv_e3dc_w": control.get("pv_e3dc_w"),
@@ -9552,6 +11189,10 @@ def market_economics_decision(
                 previous_state,
             )
         live_pv_guard = market_grid_charge_live_pv_guard(live)
+        if not bool(live_pv_guard.get("frame_usable", True)):
+            # Aus einem ungültigen oder stale Netzframe entsteht kein neuer
+            # Marktbefehl; der äußere Plausibilitätsbesitzer hält sicher.
+            return None
         forecast_grid_need_wh = max(
             0.0,
             safe_float(forecast.get("grid_charge_need_wh"), 0.0),
@@ -9605,6 +11246,7 @@ def market_economics_decision(
             max_market_w = safe_int(cfg.get("cheap_grid_battery_max_w"), 0)
         if max_market_w > 0:
             charge_w = min(charge_w, max_market_w)
+        market_planned_charge_w = charge_w
         late_fill = forecast.get("late_fill") if isinstance(forecast.get("late_fill"), dict) else {}
         late_fill_start_ms = safe_int(late_fill.get("latest_start_ts"), 0)
         late_fill_planned_w = max(0, safe_int(late_fill.get("charge_power_w"), 0))
@@ -9620,10 +11262,31 @@ def market_economics_decision(
         early_export_absorb = bool(live_export_charge_override and late_fill_wait_active)
         export_absorb = {}
         if early_export_absorb:
-            export_absorb = market_live_export_absorb_charge_w(cfg, live, charge_w)
+            # Der Marktplan steuert künftige Netzenergie. Frischer PV-Export
+            # wird separat an der physischen Ladegrenze begrenzt, damit eine
+            # kleine spätere Planleistung keinen PV-Überschuss einspeist.
+            export_absorb = market_live_export_absorb_charge_w(cfg, live, max_charge_w)
+            export_absorb["market_planned_charge_w"] = market_planned_charge_w
             absorb_charge_w = max(0, safe_int(export_absorb.get("charge_w"), 0))
-            if absorb_charge_w > 0:
-                charge_w = min(charge_w, absorb_charge_w)
+            if safe_int(export_absorb.get("raw_no_import_cap_w"), 0) < 0:
+                result = market_economics_release_decision(
+                    cfg,
+                    live,
+                    market,
+                    contract,
+                    max_charge_w,
+                    max_discharge_w,
+                    previous_state,
+                )
+                if result is not None:
+                    result["market_live_pv_first"] = live_pv_guard
+                    result["market_live_pv_first_overridden"] = False
+                    result["market_live_export_absorb_active"] = False
+                    result["market_live_export_absorb_takeover_blocked"] = True
+                    result["market_live_export_absorb"] = export_absorb
+                    result.update(common)
+                return result
+            charge_w = absorb_charge_w
         if (
             late_fill_wait_active
             and not live_export_charge_override
@@ -9648,7 +11311,7 @@ def market_economics_decision(
             result.update(common)
             return result
         state = MARKET_ECONOMICS_STATES[action]
-        if charge_w < 300:
+        if charge_w < 300 and not early_export_absorb:
             reason = (
                 "Negativpreis-Aufnahme wartet"
                 if action == "negative_price_absorb"
@@ -9675,10 +11338,16 @@ def market_economics_decision(
         )
         if live_export_charge_override:
             if early_export_absorb:
-                reason = (
-                    "Marktpfad: gültiges günstiges Preisfenster mit prognostiziertem Defizit; "
-                    "vor dem spätesten Netzladestart wird Live-Netzexport begrenzt in den Speicher aufgenommen"
-                )
+                if charge_w > 0:
+                    reason = (
+                        "Marktpfad: gültiges günstiges Preisfenster mit prognostiziertem Defizit; "
+                        "vor dem spätesten Netzladestart wird Live-Netzexport begrenzt in den Speicher aufgenommen"
+                    )
+                else:
+                    reason = (
+                        "Marktpfad: gültiges günstiges Preisfenster mit prognostiziertem Defizit; "
+                        "konservative 0-W-Ladegrenze verhindert Netzbezug"
+                    )
             else:
                 reason = (
                     "Marktpfad: Netzladen ist im gültigen Preisfenster fällig; "
@@ -9774,6 +11443,11 @@ def _direct_marketing_public_window(window: Dict[str, Any], now_ms: int) -> Dict
         "pv_store_min_hold_s",
         "pv_store_ramp_step_w",
         "pv_store_dc_only_enable",
+        "pv_store_aux_ac_storage_enable",
+        "pv_store_aux_ac_storage_allowed",
+        "pv_store_source_contract",
+        "pv_store_dc_forecast_complete",
+        "pv_store_dc_forecast_deficit_wh",
         "pv_store_external_ac_guard_w",
         "pv_store_export_limit_guard_w",
         "pv_store_export_limit_ramp_bypass_w",
@@ -10201,6 +11875,13 @@ def direct_marketing_monitor(
         )
 
     reason_projection = _direct_marketing_reason_projection(sorted(blockers))
+    source_contract_diag = pv_store_diag_value(
+        "direct_marketing_pv_store_source_contract",
+        "source_contract",
+        {},
+    )
+    if not isinstance(source_contract_diag, dict):
+        source_contract_diag = {}
     return {
         "enabled": bool(cfg_enabled),
         "active": active_decision,
@@ -10277,8 +11958,86 @@ def direct_marketing_monitor(
             or owner_switch_ctx.get("next_state")
         ),
         "pv_store_dc_only": bool(
-            pv_store_diag_value("direct_marketing_pv_store_dc_only", "dc_only", False)
-            or flags.get("pv_store_dc_only_enable")
+            pv_store_diag_value(
+                "direct_marketing_pv_store_dc_only",
+                "dc_only",
+                (
+                    current_window.get("pv_store_dc_only_enable")
+                    if isinstance(current_window, dict)
+                    and current_window.get("pv_store_dc_only_enable") is not None
+                    else flags.get("pv_store_dc_only_enable", True)
+                ),
+            )
+        ),
+        "pv_store_source_contract": source_contract_diag,
+        "pv_store_source_contract_reason": pv_store_diag_value(
+            "direct_marketing_pv_store_source_contract_reason",
+            "source_contract_reason",
+        ),
+        "pv_store_aux_ac_user_release": bool(
+            pv_store_diag_value(
+                "direct_marketing_pv_store_aux_ac_user_release",
+                "aux_ac_user_release",
+                False,
+            )
+        ),
+        "pv_store_aux_ac_plan_release": bool(
+            pv_store_diag_value(
+                "direct_marketing_pv_store_aux_ac_plan_release",
+                "aux_ac_plan_release",
+                False,
+            )
+        ),
+        "pv_store_aux_ac_allowed": bool(
+            pv_store_diag_value(
+                "direct_marketing_pv_store_aux_ac_allowed",
+                "aux_ac_storage_allowed",
+                False,
+            )
+        ),
+        "pv_store_aux_ac_mode": source_contract_diag.get(
+            "mode",
+            flags.get("pv_store_aux_ac_mode", "off"),
+        ),
+        "pv_store_dc_forecast_complete": bool(
+            source_contract_diag.get("dc_forecast_complete")
+        ),
+        "pv_store_forecast_fresh": bool(
+            source_contract_diag.get("forecast_fresh")
+        ),
+        "pv_store_forecast_freshness_source": source_contract_diag.get(
+            "forecast_freshness_source"
+        ),
+        "pv_store_dc_forecast_requested_wh": source_contract_diag.get(
+            "dc_forecast_requested_wh"
+        ),
+        "pv_store_dc_forecast_selected_wh": source_contract_diag.get(
+            "dc_forecast_selected_wh"
+        ),
+        "pv_store_dc_forecast_conservative_selected_wh": source_contract_diag.get(
+            "dc_forecast_conservative_selected_wh"
+        ),
+        "pv_store_dc_forecast_deficit_wh": source_contract_diag.get(
+            "dc_forecast_deficit_wh"
+        ),
+        "pv_store_aux_ac_deadband_wh": source_contract_diag.get("deadband_wh"),
+        "pv_store_dc_charge_efficiency_pct": source_contract_diag.get(
+            "dc_charge_efficiency_pct"
+        ),
+        "pv_store_aux_ac_charge_efficiency_pct": source_contract_diag.get(
+            "aux_ac_charge_efficiency_pct"
+        ),
+        "pv_store_discharge_efficiency_pct": source_contract_diag.get(
+            "discharge_efficiency_pct"
+        ),
+        "pv_store_dc_route_margin_ct_per_kwh": source_contract_diag.get(
+            "dc_route_margin_ct_per_kwh"
+        ),
+        "pv_store_aux_ac_route_margin_ct_per_kwh": source_contract_diag.get(
+            "aux_ac_route_margin_ct_per_kwh"
+        ),
+        "pv_store_aux_ac_min_margin_ct_per_kwh": source_contract_diag.get(
+            "aux_ac_min_margin_ct_per_kwh"
         ),
         "pv_total_w": safe_int(pv_store_diag_value("direct_marketing_pv_total_w", "pv_total_w", 0), 0),
         "pv_e3dc_w": safe_int(pv_store_diag_value("direct_marketing_pv_e3dc_w", "pv_e3dc_w", 0), 0),
@@ -10292,7 +12051,39 @@ def direct_marketing_monitor(
         ),
         "pv_store_target_fallback_active": bool((decision or {}).get("direct_marketing_pv_store_target_fallback_active")),
         "pv_store_execution": str((decision or {}).get("direct_marketing_pv_store_execution") or ""),
+        "pv_store_blocker": str((decision or {}).get("direct_marketing_pv_store_blocker") or ""),
         "pv_store_auto_limit_active": bool((decision or {}).get("direct_marketing_pv_store_auto_limit_active")),
+        "storage_dc_first_charge_limit_enabled": bool(
+            (decision or {}).get("storage_dc_first_charge_limit_enabled")
+        ),
+        "storage_dc_first_charge_limit_active": bool(
+            (decision or {}).get("storage_dc_first_charge_limit_active")
+        ),
+        "storage_dc_first_charge_limit_source_valid": bool(
+            (decision or {}).get("storage_dc_first_charge_limit_source_valid")
+        ),
+        "storage_dc_first_charge_limit_blocker": str(
+            (decision or {}).get("storage_dc_first_charge_limit_blocker") or ""
+        ),
+        "storage_dc_first_charge_planner_limit_w": max(
+            0,
+            safe_int((decision or {}).get("storage_dc_first_charge_planner_limit_w"), 0),
+        ),
+        "storage_dc_first_charge_e3dc_pv_w": max(
+            0,
+            safe_int((decision or {}).get("storage_dc_first_charge_e3dc_pv_w"), 0),
+        ),
+        "storage_dc_first_charge_external_ac_pv_w": max(
+            0,
+            safe_int((decision or {}).get("storage_dc_first_charge_external_ac_pv_w"), 0),
+        ),
+        "storage_dc_first_charge_limit_w": max(
+            0,
+            safe_int((decision or {}).get("storage_dc_first_charge_limit_w"), 0),
+        ),
+        "storage_dc_first_charge_ramp_phase": str(
+            (decision or {}).get("storage_dc_first_charge_ramp_phase") or ""
+        ),
         "pv_store_external_export_owner": bool((decision or {}).get("direct_marketing_pv_store_external_export_owner")),
         "hard_export_owner_confirmed": hard_export_owner_confirmed,
         "export_execution": decision_export_execution,
@@ -10408,6 +12199,7 @@ def direct_marketing_monitor(
             "pv_store_min_hold_s": safe_int(flags.get("pv_store_min_hold_s"), 0),
             "pv_store_ramp_step_w": safe_int(flags.get("pv_store_ramp_step_w"), 0),
             "pv_store_dc_only_enable": bool(flags.get("pv_store_dc_only_enable")),
+            "pv_store_aux_ac_storage_enable": bool(flags.get("pv_store_aux_ac_storage_enable")),
             "pv_store_external_ac_guard_w": safe_int(flags.get("pv_store_external_ac_guard_w"), 0),
             "pv_store_export_limit_guard_w": safe_int(flags.get("pv_store_export_limit_guard_w"), 0),
             "pv_store_export_limit_ramp_bypass_w": safe_int(flags.get("pv_store_export_limit_ramp_bypass_w"), 0),
@@ -13533,6 +15325,7 @@ def protected_decision(
     manual_override: Dict[str, Any],
     now_s: float,
     previous_state: Optional[Dict[str, Any]] = None,
+    peak_shaving_evaluation: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     live = live_with_wallbox_native_balance(live, wb_native)
     max_charge_w = configured_charge_limit_w(cfg, live)
@@ -13553,6 +15346,21 @@ def protected_decision(
 
     reserve_hold = ep_reserve_floor_decision(cfg, live, max_charge_w, previous_state)
     if reserve_hold is not None:
+        peak_owner = (
+            peak_shaving_evaluation.get("decision")
+            if isinstance(peak_shaving_evaluation, dict)
+            and isinstance(peak_shaving_evaluation.get("decision"), dict)
+            else None
+        )
+        if (
+            peak_owner is not None
+            and str(peak_owner.get("peak_shaving_action_class") or "") == "grid_recharge"
+            and safe_int(peak_owner.get("mode"), MODE_AUTO) == MODE_GRID
+        ):
+            peak_owner = dict(peak_owner)
+            peak_owner["reserve_floor_charge_override"] = True
+            peak_owner["reserve_floor_charge_reason"] = reserve_hold.get("reason")
+            return peak_owner
         market_owner = market_economics_decision(
             cfg,
             live,
@@ -13583,13 +15391,10 @@ def protected_decision(
     if manual_decision is not None:
         return manual_decision
 
-    cheap = plan.get("cheap_grid_charge") or {}
     storm_grid = plan.get("storm_grid_charge") or {}
-    awattar_mode = safe_int(plan.get("awattar_mode"), 1)
     storm_grid_active = storm_grid_charge_active(plan, int(now_s * 1000.0))
-    cheap_grid_active = cheap_grid_charge_active(plan, int(now_s * 1000.0))
-    if storm_grid_active or (awattar_mode == 2 and cheap_grid_active):
-        grid_plan = storm_grid if storm_grid_active else cheap
+    if storm_grid_active:
+        grid_plan = storm_grid
         target_soc = safe_float(grid_plan.get("target_soc"), safe_float(plan.get("planning_target_soc"), 95.0))
         hysteresis = max(0.1, safe_float(grid_plan.get("hysteresis_pct"), 0.5))
         charge_w = max(300, min(max_charge_w, safe_int(grid_plan.get("charge_w"), max_charge_w)))
@@ -13598,29 +15403,63 @@ def protected_decision(
             charge_w = min(charge_w, room_w)
         if soc < target_soc - hysteresis:
             if charge_w < 300:
-                auto_reason = "Unwetter-Netzladen wartet" if storm_grid_active else "Preisfenster aktiv: Netzladen wartet, Speicherentladung gesperrt"
+                auto_reason = "Unwetter-Netzladen wartet"
                 return {
-                    "state": "storm_guard_grid_wait" if storm_grid_active else "price_boost_grid_wait",
+                    "state": "storm_guard_grid_wait",
                     "mode": MODE_AUTO,
                     "val": max_charge_w,
                     "priority": "safety",
-                    "reason": auto_reason + "; Hausanschluss-Limit laesst kein Speicher-Netzladen zu",
+                    "reason": auto_reason + "; Hausanschluss-Limit lässt kein Speicher-Netzladen zu",
                     "protected": True,
                     "storage_req_w": 0,
                     "budget_w": 0,
                     "auto_limit": discharge_block_auto_limit(cfg, max_charge_w, auto_reason),
                 }
             return {
-                "state": "storm_guard_grid" if storm_grid_active else "price_boost_grid",
+                "state": "storm_guard_grid",
                 "mode": MODE_GRID,
                 "val": charge_w,
-                "priority": "storm_guard" if storm_grid_active else "price",
-                "reason": grid_plan.get("reason") or ("Unwetterwarnung: Speicher aus Netz laden" if storm_grid_active else "Guenstiges Preisfenster: Speicher aus Netz laden"),
+                "priority": "storm_guard",
+                "reason": grid_plan.get("reason") or "Unwetterwarnung: Speicher aus Netz laden",
                 "protected": True,
                 "storage_req_w": charge_w,
                 "budget_w": 0,
             }
-        return None
+
+    cheap = plan.get("cheap_grid_charge") or {}
+    awattar_mode = safe_int(plan.get("awattar_mode"), 1)
+    cheap_grid_active = cheap_grid_charge_active(plan, int(now_s * 1000.0))
+    if awattar_mode == 2 and cheap_grid_active:
+        target_soc = safe_float(cheap.get("target_soc"), safe_float(plan.get("planning_target_soc"), 95.0))
+        hysteresis = max(0.1, safe_float(cheap.get("hysteresis_pct"), 0.5))
+        charge_w = max(300, min(max_charge_w, safe_int(cheap.get("charge_w"), max_charge_w)))
+        room_w = grid_charge_room_w(cfg, live)
+        if room_w is not None:
+            charge_w = min(charge_w, room_w)
+        if soc < target_soc - hysteresis:
+            if charge_w < 300:
+                auto_reason = "Preisfenster aktiv: Netzladen wartet, Speicherentladung gesperrt"
+                return {
+                    "state": "price_boost_grid_wait",
+                    "mode": MODE_AUTO,
+                    "val": max_charge_w,
+                    "priority": "price",
+                    "reason": auto_reason + "; Hausanschluss-Limit lässt kein Speicher-Netzladen zu",
+                    "protected": True,
+                    "storage_req_w": 0,
+                    "budget_w": 0,
+                    "auto_limit": discharge_block_auto_limit(cfg, max_charge_w, auto_reason),
+                }
+            return {
+                "state": "price_boost_grid",
+                "mode": MODE_GRID,
+                "val": charge_w,
+                "priority": "price",
+                "reason": cheap.get("reason") or "Günstiges Preisfenster: Speicher aus Netz laden",
+                "protected": True,
+                "storage_req_w": charge_w,
+                "budget_w": 0,
+            }
 
     direct_marketing_owner = direct_marketing_decision(
         cfg,
@@ -14298,6 +16137,169 @@ def legacy_headroom_execution_contract(
     }
 
 
+def apply_peak_shaving_secondary_candidate(
+    decision: Dict[str, Any],
+    evaluation: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Arbitriert nachrangige Peak-Shaving-Kandidaten ohne zweiten Ausgang."""
+
+    result = copy.deepcopy(decision if isinstance(decision, dict) else {})
+    evaluation = evaluation if isinstance(evaluation, dict) else {}
+    context = (
+        copy.deepcopy(evaluation.get("context"))
+        if isinstance(evaluation.get("context"), dict)
+        else {}
+    )
+    candidate = (
+        copy.deepcopy(evaluation.get("decision"))
+        if isinstance(evaluation.get("decision"), dict)
+        else None
+    )
+    result["peak_shaving"] = context
+    if candidate is None:
+        return result
+
+    action_class = str(candidate.get("peak_shaving_action_class") or "")
+    result["peak_shaving_candidate_action_class"] = action_class or None
+    current_state = str(result.get("state") or "")
+    current_mode = safe_int(result.get("mode"), MODE_AUTO)
+    current_priority = str(result.get("priority") or "").lower()
+
+    safety_or_manual = bool(
+        current_priority in {"safety", "storm_guard", "manual"}
+        or current_state.startswith((
+            "emergency_",
+            "ep_reserve_",
+            "hard_mode_guard",
+            "live_",
+            "manual_override",
+        ))
+    )
+    if safety_or_manual:
+        result["peak_shaving_candidate_suppressed_by"] = current_state or current_priority
+        return result
+
+    if action_class == "active_cap":
+        if current_state == "peak_shaving_active":
+            return result
+        current_auto = (
+            result.get("auto_limit")
+            if isinstance(result.get("auto_limit"), dict)
+            else {}
+        )
+        current_discharge_cap = (
+            max(0, safe_int(current_auto.get("max_discharge_w"), 0))
+            if "max_discharge_w" in current_auto
+            else None
+        )
+        passive_auto = bool(
+            current_mode == MODE_AUTO
+            and not bool(result.get("protected"))
+            and current_priority in {"", "default", "auto"}
+            and not (
+                current_auto.get("enabled")
+                and not current_auto.get("release")
+                and current_discharge_cap == 0
+            )
+        )
+        if not passive_auto:
+            result["peak_shaving_candidate_suppressed_by"] = (
+                current_state or "higher_priority"
+            )
+            return result
+
+        selected = candidate
+        selected["peak_shaving"] = context
+        selected["peak_shaving_suppressed_state"] = current_state or None
+        selected_auto = (
+            selected.get("auto_limit")
+            if isinstance(selected.get("auto_limit"), dict)
+            else {}
+        )
+        if current_auto.get("enabled") and not current_auto.get("release"):
+            if "max_charge_w" in current_auto:
+                selected_auto["max_charge_w"] = min(
+                    max(0, safe_int(selected_auto.get("max_charge_w"), 0)),
+                    max(0, safe_int(current_auto.get("max_charge_w"), 0)),
+                )
+            if current_discharge_cap is not None:
+                selected_auto["max_discharge_w"] = min(
+                    max(0, safe_int(selected_auto.get("max_discharge_w"), 0)),
+                    current_discharge_cap,
+                )
+            selected_auto["reason"] = (
+                str(selected_auto.get("reason") or "")
+                + "; bestehender Speicherrahmen bleibt vorrangig erhalten"
+            )[:220]
+            selected["auto_limit"] = selected_auto
+        return selected
+
+    if action_class == "reserve_hold":
+        # Konkretes Laden füllt den Puffer bereits. Alle anderen
+        # wirtschaftlichen Entladepfade dürfen den sauberen 30%-Boden nicht
+        # unterschreiten.
+        if current_mode in (MODE_CHRG, MODE_GRID):
+            result["peak_shaving_candidate_suppressed_by"] = current_state or mode_label(current_mode)
+            return result
+        selected = candidate
+        selected["peak_shaving"] = context
+        selected["peak_shaving_suppressed_state"] = current_state or None
+        current_auto = (
+            result.get("auto_limit")
+            if isinstance(result.get("auto_limit"), dict)
+            else {}
+        )
+        selected_auto = (
+            selected.get("auto_limit")
+            if isinstance(selected.get("auto_limit"), dict)
+            else {}
+        )
+        if (
+            current_mode == MODE_AUTO
+            and current_auto.get("enabled")
+            and not current_auto.get("release")
+        ):
+            selected_auto["max_charge_w"] = min(
+                max(0, safe_int(selected_auto.get("max_charge_w"), 0)),
+                max(0, safe_int(current_auto.get("max_charge_w"), 0)),
+            )
+            selected_auto["reason"] = (
+                str(selected_auto.get("reason") or "")
+                + "; bestehende Ladegrenze bleibt erhalten"
+            )[:220]
+            selected["auto_limit"] = selected_auto
+        return selected
+
+    passive_auto_states = {
+        "parallel_auto",
+        "parallel_evening_release",
+        "parallel_grid_relief_auto",
+        "parallel_curve_auto_no_surplus",
+    }
+    current_auto = (
+        result.get("auto_limit")
+        if isinstance(result.get("auto_limit"), dict)
+        else {}
+    )
+    passive_auto = bool(
+        current_mode == MODE_AUTO
+        and current_state in passive_auto_states
+        and not bool(result.get("protected"))
+        and not (
+            current_auto.get("enabled")
+            and not current_auto.get("release")
+        )
+    )
+    if action_class in {"grid_recharge", "release"} and passive_auto:
+        selected = candidate
+        selected["peak_shaving"] = context
+        selected["peak_shaving_suppressed_state"] = current_state or None
+        return selected
+
+    result["peak_shaving_candidate_suppressed_by"] = current_state or "concrete_plan"
+    return result
+
+
 def decide_next_cycle(
     cfg: Dict[str, Any],
     live: Dict[str, Any],
@@ -14412,6 +16414,59 @@ def decide_next_cycle(
     forecast_landing_margin_pct = 0.0
     sliding_horizon = {"active": False, "reason": ""}
     sliding_horizon_active = False
+    post_final_pv_store_auto = {
+        "active": False,
+        "reason": "normal_regulation_not_reached",
+    }
+    post_final_pv_store_auto_release = False
+
+    peak_shaving_sample_valid = bool(
+        not live_stale
+        and not live_sample_invalid
+        and not soc_unrealistic
+        and live_model.ts > 0.0
+        and bool(live_plausibility.get("grid_valid", True))
+    )
+    peak_pv_source_valid = bool(
+        _live_numeric_present(live_with_wallbox, "PV_Power")
+        and _live_numeric_present(live_with_wallbox, "Home_Power")
+        and live_with_wallbox.get("RSCP_Sample_Valid") is True
+        and live_with_wallbox.get("Power_Decision_Usable") is True
+        and live_with_wallbox.get("Home_Power_Valid") is True
+    )
+    try:
+        peak_shaving_evaluation = evaluate_peak_shaving(
+            cfg,
+            live_with_wallbox,
+            previous_state.get("peak_shaving")
+            if isinstance(previous_state.get("peak_shaving"), dict)
+            else {},
+            now_s=now_s,
+            ep_reserve_pct=ep_reserve_soc(cfg, live_with_wallbox),
+            max_charge_w=max_charge_w,
+            max_discharge_w=max_discharge_w,
+            sample_valid=peak_shaving_sample_valid,
+            pv_source_valid=peak_pv_source_valid,
+            heartbeat_s=auto_limit_heartbeat_s(cfg),
+            house_grid_charge_room_w=grid_charge_room_w(cfg, live_with_wallbox),
+        )
+    except Exception as exc:
+        # Diagnose bleibt passiv: Ein Auswertungsfehler darf nie Eigentümer
+        # eines Speicherbefehls werden.
+        peak_shaving_evaluation = {
+            "context": {
+                "schema": "peak_shaving_interval_v2",
+                "enabled": cfg_bool(cfg, "peak_shaving_enable", False),
+                "config_valid": False,
+                "history_status": "evaluation_error",
+                "coverage_complete": False,
+                "sample_valid": False,
+                "error": type(exc).__name__,
+                "updated_ts": round(now_s, 3),
+                "last_action": "observe",
+            },
+            "decision": None,
+        }
 
     protected = None if (live_stale or live_sample_invalid or soc_unrealistic) else protected_decision(
         cfg,
@@ -14422,6 +16477,7 @@ def decide_next_cycle(
         manual_override,
         now_s,
         previous_state,
+        peak_shaving_evaluation,
     )
     manual_invalid_sample_decision = None
     manual_override_mode = str(manual_override.get("mode", "") or "").lower()
@@ -14731,6 +16787,14 @@ def decide_next_cycle(
             now_s,
         )
         planned_load = current_planned_load_status(cfg, live_with_wallbox, plan, now_s)
+        post_final_pv_store_auto = direct_marketing_post_final_pv_store_auto_context(
+            plan,
+            previous_state,
+            now_s,
+        )
+        post_final_pv_store_auto_release = bool(
+            post_final_pv_store_auto.get("active")
+        )
         if bool(planned_load.get("active")) and bool(planned_load.get("confirmed")):
             if str(planned_load.get("mode") or "") == "price_support" and bool(planned_load.get("support_allowed")):
                 state_name = "planned_load_price_support"
@@ -14738,6 +16802,8 @@ def decide_next_cycle(
                 state_name = "planned_load_storage_hold"
         elif awattar_mode == 0 or price_hold:
             state_name = "price_plan_storage_hold"
+        elif post_final_pv_store_auto_release:
+            state_name = "evening_release"
         elif evening_release and not shortfall_pv_catchup_active:
             state_name = "evening_release"
         elif (
@@ -15025,6 +17091,20 @@ def decide_next_cycle(
             "planned_load_support_reason": planned_load.get("support_reason", ""),
             "planned_load_support": planned_load.get("support", {}),
             "planned_load_windows": planned_load.get("windows", []),
+            "direct_marketing_post_final_pv_store_auto_active": bool(
+                post_final_pv_store_auto_release
+            ),
+            "direct_marketing_post_final_pv_store_auto_reason": str(
+                post_final_pv_store_auto.get("reason") or ""
+            ),
+            "direct_marketing_post_final_pv_store_completed_end_ts": safe_int(
+                post_final_pv_store_auto.get("completed_pv_store_end_ts"),
+                0,
+            ),
+            "direct_marketing_post_final_pv_store_next_export_start_ts": safe_int(
+                post_final_pv_store_auto.get("next_export_start_ts"),
+                0,
+            ),
         }
         previous_parallel_state = str(
             previous_state.get("parallel_state")
@@ -15140,6 +17220,50 @@ def decide_next_cycle(
             "budget_w": budget_w,
             "shadow_payload": payload,
         }
+        if bool(post_final_pv_store_auto.get("active")):
+            passive_policy = post_final_pv_store_auto.get("policy")
+            decision, post_final_soft_hold_released = (
+                apply_post_final_pv_store_auto_release(
+                    decision,
+                    release_active=post_final_pv_store_auto_release,
+                    max_charge_w=max_charge_w,
+                    pv_after_fixed_w=pv_after_fixed_w,
+                )
+            )
+            if post_final_soft_hold_released:
+                mode = MODE_AUTO
+                val = max_charge_w
+                storage_req_w = 0
+                budget_w = max(0, pv_after_fixed_w)
+            decision["direct_marketing_policy_schema"] = DIRECT_MARKETING_POLICY_SCHEMA
+            decision["direct_marketing_policy_decision"] = (
+                passive_policy if isinstance(passive_policy, dict) else None
+            )
+            decision["direct_marketing_policy_target_state"] = "NORMAL"
+            decision["direct_marketing_action"] = "policy_normal"
+            decision["direct_marketing_post_final_pv_store_auto_active"] = bool(
+                post_final_pv_store_auto_release
+            )
+            decision["direct_marketing_post_final_pv_store_auto_reason"] = str(
+                post_final_pv_store_auto.get("reason") or ""
+            )
+            decision["direct_marketing_post_final_pv_store_completed_end_ts"] = safe_int(
+                post_final_pv_store_auto.get("completed_pv_store_end_ts"),
+                0,
+            )
+            decision["direct_marketing_post_final_pv_store_next_export_start_ts"] = safe_int(
+                post_final_pv_store_auto.get("next_export_start_ts"),
+                0,
+            )
+            if (
+                post_final_pv_store_auto_release
+                and str(decision.get("state") or "") == "parallel_evening_release"
+            ):
+                decision["reason"] = (
+                    "Hausversorgung: "
+                    "EMS-Grenzen frei, E3DC AUTO bis zur nächsten aktuell "
+                    "wirksamen Speicherentscheidung"
+                )
         shadow_inputs = payload.get("inputs") if isinstance(payload.get("inputs"), dict) else {}
         for key in (
             "headroom_discharge_active",
@@ -16111,6 +18235,29 @@ def decide_next_cycle(
         decision.setdefault("observe_wallbox_reserve_floor_soc", observe_reserve_release.get("floor_soc"))
         decision.setdefault("observe_wallbox_reserve_release_floor_soc", observe_reserve_release.get("release_floor_soc"))
         decision.setdefault("observe_wallbox_reserve_soc", observe_reserve_release.get("soc"))
+    decision = apply_peak_shaving_secondary_candidate(
+        decision,
+        peak_shaving_evaluation,
+    )
+    decision = apply_direct_marketing_parallel_auto_reservation_cap(
+        cfg,
+        plan,
+        decision,
+        max_charge_w,
+        max_discharge_w,
+        pv_after_fixed_w,
+        grid_w,
+        now_s,
+    )
+    decision = apply_storage_dc_first_charge_limit(
+        cfg,
+        live_with_wallbox,
+        decision,
+        max_charge_w,
+        max_discharge_w,
+        previous_state=previous_state,
+        now_s=now_s,
+    )
     decision = enforce_hard_mode_guard(
         cfg,
         live_with_wallbox,
@@ -16832,6 +18979,10 @@ def decide_next_cycle(
         "direct_marketing_future_pv_store_reservation": decision.get("direct_marketing_future_pv_store_reservation") if isinstance(decision.get("direct_marketing_future_pv_store_reservation"), dict) else None,
         "direct_marketing_future_pv_store_reservation_active": bool(decision.get("direct_marketing_future_pv_store_reservation_active")),
         "direct_marketing_future_pv_store_reservation_cap_w": safe_int(decision.get("direct_marketing_future_pv_store_reservation_cap_w"), 0),
+        "direct_marketing_post_final_pv_store_auto_active": bool(decision.get("direct_marketing_post_final_pv_store_auto_active")),
+        "direct_marketing_post_final_pv_store_auto_reason": decision.get("direct_marketing_post_final_pv_store_auto_reason"),
+        "direct_marketing_post_final_pv_store_completed_end_ts": safe_int(decision.get("direct_marketing_post_final_pv_store_completed_end_ts"), 0),
+        "direct_marketing_post_final_pv_store_next_export_start_ts": safe_int(decision.get("direct_marketing_post_final_pv_store_next_export_start_ts"), 0),
         "direct_marketing_mode": decision.get("direct_marketing_mode"),
         "direct_marketing_owner": decision.get("direct_marketing_owner"),
         "direct_marketing_contract_version": decision.get("direct_marketing_contract_version"),
@@ -16861,7 +19012,60 @@ def decide_next_cycle(
         "direct_marketing_pv_store_pv_safe_cap_w": safe_int(decision.get("direct_marketing_pv_store_pv_safe_cap_w"), 0),
         "direct_marketing_pv_store_self_reference_limited": bool(decision.get("direct_marketing_pv_store_self_reference_limited")),
         "direct_marketing_pv_store_execution": str(decision.get("direct_marketing_pv_store_execution") or ""),
+        "direct_marketing_pv_store_blocker": str(decision.get("direct_marketing_pv_store_blocker") or ""),
         "direct_marketing_pv_store_auto_limit_active": bool(decision.get("direct_marketing_pv_store_auto_limit_active")),
+        "storage_dc_first_charge_limit_enabled": bool(decision.get("storage_dc_first_charge_limit_enabled")),
+        "storage_dc_first_charge_limit_active": bool(decision.get("storage_dc_first_charge_limit_active")),
+        "storage_dc_first_charge_limit_contract_version": safe_int(
+            decision.get("storage_dc_first_charge_limit_contract_version"),
+            0,
+        ),
+        "storage_dc_first_charge_limit_source_valid": bool(
+            decision.get("storage_dc_first_charge_limit_source_valid")
+        ),
+        "storage_dc_first_charge_limit_blocker": str(
+            decision.get("storage_dc_first_charge_limit_blocker") or ""
+        ),
+        "storage_dc_first_charge_limit_source": (
+            decision.get("storage_dc_first_charge_limit_source")
+            if isinstance(decision.get("storage_dc_first_charge_limit_source"), dict)
+            else {}
+        ),
+        "storage_dc_first_charge_planner_limit_w": max(
+            0,
+            safe_int(decision.get("storage_dc_first_charge_planner_limit_w"), 0),
+        ),
+        "storage_dc_first_charge_e3dc_pv_w": max(
+            0,
+            safe_int(decision.get("storage_dc_first_charge_e3dc_pv_w"), 0),
+        ),
+        "storage_dc_first_charge_external_ac_pv_w": max(
+            0,
+            safe_int(decision.get("storage_dc_first_charge_external_ac_pv_w"), 0),
+        ),
+        "storage_dc_first_charge_target_w": max(
+            0,
+            safe_int(decision.get("storage_dc_first_charge_target_w"), 0),
+        ),
+        "storage_dc_first_charge_limit_w": max(
+            0,
+            safe_int(decision.get("storage_dc_first_charge_limit_w"), 0),
+        ),
+        "storage_dc_first_charge_previous_limit_w": max(
+            0,
+            safe_int(decision.get("storage_dc_first_charge_previous_limit_w"), 0),
+        ),
+        "storage_dc_first_charge_ramp_phase": str(
+            decision.get("storage_dc_first_charge_ramp_phase") or ""
+        ),
+        "storage_dc_first_charge_deadband_w": max(
+            0,
+            safe_int(decision.get("storage_dc_first_charge_deadband_w"), 0),
+        ),
+        "storage_dc_first_charge_step_up_w": max(
+            0,
+            safe_int(decision.get("storage_dc_first_charge_step_up_w"), 0),
+        ),
         "direct_marketing_pv_store_external_export_owner": bool(decision.get("direct_marketing_pv_store_external_export_owner")),
         "direct_marketing_hard_export_owner_confirmed": bool(decision.get("direct_marketing_hard_export_owner_confirmed")),
         "direct_marketing_export_execution": decision.get("direct_marketing_export_execution") if isinstance(decision.get("direct_marketing_export_execution"), dict) else {},
@@ -16921,6 +19125,11 @@ def decide_next_cycle(
         "direct_marketing_owner_switch_previous_state": decision.get("direct_marketing_owner_switch_previous_state"),
         "direct_marketing_owner_switch_next_state": decision.get("direct_marketing_owner_switch_next_state"),
         "direct_marketing_pv_store_dc_only": bool(decision.get("direct_marketing_pv_store_dc_only")),
+        "direct_marketing_pv_store_source_contract": decision.get("direct_marketing_pv_store_source_contract"),
+        "direct_marketing_pv_store_source_contract_reason": decision.get("direct_marketing_pv_store_source_contract_reason"),
+        "direct_marketing_pv_store_aux_ac_user_release": bool(decision.get("direct_marketing_pv_store_aux_ac_user_release")),
+        "direct_marketing_pv_store_aux_ac_plan_release": bool(decision.get("direct_marketing_pv_store_aux_ac_plan_release")),
+        "direct_marketing_pv_store_aux_ac_allowed": bool(decision.get("direct_marketing_pv_store_aux_ac_allowed")),
         "direct_marketing_pv_store_external_ac_guard_w": safe_int(decision.get("direct_marketing_pv_store_external_ac_guard_w"), 0),
         "direct_marketing_pv_total_w": safe_int(decision.get("direct_marketing_pv_total_w"), 0),
         "direct_marketing_pv_e3dc_w": safe_int(decision.get("direct_marketing_pv_e3dc_w"), 0),
@@ -17086,6 +19295,16 @@ def decide_next_cycle(
             "prio_reason": str(decision.get("priority") or "next"),
         },
     }
+    peak_budget_context = (
+        decision.get("peak_shaving")
+        if isinstance(decision.get("peak_shaving"), dict)
+        else {}
+    )
+    if peak_budget_context.get("enabled"):
+        budget["peak_shaving"] = copy.deepcopy(peak_budget_context)
+        budget["grid_import_headroom_w"] = peak_budget_context.get(
+            "grid_import_headroom_w"
+        )
     if phase_transition_allocations:
         budget["consumer_allocations"] = phase_transition_allocations
         budget["consumer_priority_order"] = ["wallbox", "heatpump", "heater"]
@@ -17223,6 +19442,32 @@ def decide_next_cycle(
         "wp_w": wp_w,
         "bat_w": bat_w,
         "ep_reserve_pct": ep_reserve_soc(cfg, live),
+        "peak_shaving": copy.deepcopy(peak_budget_context),
+        "peak_shaving_action_class": decision.get("peak_shaving_action_class"),
+        "peak_shaving_candidate_action_class": decision.get(
+            "peak_shaving_candidate_action_class"
+        ),
+        "peak_shaving_candidate_suppressed_by": decision.get(
+            "peak_shaving_candidate_suppressed_by"
+        ),
+        "peak_shaving_active": bool(decision.get("peak_shaving_active")),
+        "peak_shaving_target_w": max(
+            0,
+            safe_int(decision.get("peak_shaving_target_w"), 0),
+        ),
+        "peak_shaving_recharge_active": bool(
+            decision.get("peak_shaving_recharge_active")
+        ),
+        "peak_shaving_reserve_hold": bool(
+            decision.get("peak_shaving_reserve_hold")
+        ),
+        "peak_shaving_history_status": peak_budget_context.get(
+            "history_status"
+        ),
+        "peak_shaving_unavoidable_exceedance_w": max(
+            0,
+            safe_int(peak_budget_context.get("unavoidable_exceedance_w"), 0),
+        ),
         "wallbox_w": wallbox_w,
         "wallbox_power_source": wallbox_power_source,
         "wallbox_live_w": live_wallbox_w,
@@ -17536,6 +19781,10 @@ def decide_next_cycle(
         "direct_marketing_future_pv_store_reservation": decision.get("direct_marketing_future_pv_store_reservation") if isinstance(decision.get("direct_marketing_future_pv_store_reservation"), dict) else None,
         "direct_marketing_future_pv_store_reservation_active": bool(decision.get("direct_marketing_future_pv_store_reservation_active")),
         "direct_marketing_future_pv_store_reservation_cap_w": safe_int(decision.get("direct_marketing_future_pv_store_reservation_cap_w"), 0),
+        "direct_marketing_post_final_pv_store_auto_active": bool(decision.get("direct_marketing_post_final_pv_store_auto_active")),
+        "direct_marketing_post_final_pv_store_auto_reason": decision.get("direct_marketing_post_final_pv_store_auto_reason"),
+        "direct_marketing_post_final_pv_store_completed_end_ts": safe_int(decision.get("direct_marketing_post_final_pv_store_completed_end_ts"), 0),
+        "direct_marketing_post_final_pv_store_next_export_start_ts": safe_int(decision.get("direct_marketing_post_final_pv_store_next_export_start_ts"), 0),
         "direct_marketing_mode": decision.get("direct_marketing_mode"),
         "direct_marketing_owner": decision.get("direct_marketing_owner"),
         "direct_marketing_contract_version": decision.get("direct_marketing_contract_version"),
@@ -17565,7 +19814,60 @@ def decide_next_cycle(
         "direct_marketing_pv_store_pv_safe_cap_w": safe_int(decision.get("direct_marketing_pv_store_pv_safe_cap_w"), 0),
         "direct_marketing_pv_store_self_reference_limited": bool(decision.get("direct_marketing_pv_store_self_reference_limited")),
         "direct_marketing_pv_store_execution": str(decision.get("direct_marketing_pv_store_execution") or ""),
+        "direct_marketing_pv_store_blocker": str(decision.get("direct_marketing_pv_store_blocker") or ""),
         "direct_marketing_pv_store_auto_limit_active": bool(decision.get("direct_marketing_pv_store_auto_limit_active")),
+        "storage_dc_first_charge_limit_enabled": bool(decision.get("storage_dc_first_charge_limit_enabled")),
+        "storage_dc_first_charge_limit_active": bool(decision.get("storage_dc_first_charge_limit_active")),
+        "storage_dc_first_charge_limit_contract_version": safe_int(
+            decision.get("storage_dc_first_charge_limit_contract_version"),
+            0,
+        ),
+        "storage_dc_first_charge_limit_source_valid": bool(
+            decision.get("storage_dc_first_charge_limit_source_valid")
+        ),
+        "storage_dc_first_charge_limit_blocker": str(
+            decision.get("storage_dc_first_charge_limit_blocker") or ""
+        ),
+        "storage_dc_first_charge_limit_source": (
+            decision.get("storage_dc_first_charge_limit_source")
+            if isinstance(decision.get("storage_dc_first_charge_limit_source"), dict)
+            else {}
+        ),
+        "storage_dc_first_charge_planner_limit_w": max(
+            0,
+            safe_int(decision.get("storage_dc_first_charge_planner_limit_w"), 0),
+        ),
+        "storage_dc_first_charge_e3dc_pv_w": max(
+            0,
+            safe_int(decision.get("storage_dc_first_charge_e3dc_pv_w"), 0),
+        ),
+        "storage_dc_first_charge_external_ac_pv_w": max(
+            0,
+            safe_int(decision.get("storage_dc_first_charge_external_ac_pv_w"), 0),
+        ),
+        "storage_dc_first_charge_target_w": max(
+            0,
+            safe_int(decision.get("storage_dc_first_charge_target_w"), 0),
+        ),
+        "storage_dc_first_charge_limit_w": max(
+            0,
+            safe_int(decision.get("storage_dc_first_charge_limit_w"), 0),
+        ),
+        "storage_dc_first_charge_previous_limit_w": max(
+            0,
+            safe_int(decision.get("storage_dc_first_charge_previous_limit_w"), 0),
+        ),
+        "storage_dc_first_charge_ramp_phase": str(
+            decision.get("storage_dc_first_charge_ramp_phase") or ""
+        ),
+        "storage_dc_first_charge_deadband_w": max(
+            0,
+            safe_int(decision.get("storage_dc_first_charge_deadband_w"), 0),
+        ),
+        "storage_dc_first_charge_step_up_w": max(
+            0,
+            safe_int(decision.get("storage_dc_first_charge_step_up_w"), 0),
+        ),
         "direct_marketing_pv_store_external_export_owner": bool(decision.get("direct_marketing_pv_store_external_export_owner")),
         "direct_marketing_hard_export_owner_confirmed": bool(decision.get("direct_marketing_hard_export_owner_confirmed")),
         "direct_marketing_export_execution": decision.get("direct_marketing_export_execution") if isinstance(decision.get("direct_marketing_export_execution"), dict) else {},
@@ -17625,6 +19927,11 @@ def decide_next_cycle(
         "direct_marketing_owner_switch_previous_state": decision.get("direct_marketing_owner_switch_previous_state"),
         "direct_marketing_owner_switch_next_state": decision.get("direct_marketing_owner_switch_next_state"),
         "direct_marketing_pv_store_dc_only": bool(decision.get("direct_marketing_pv_store_dc_only")),
+        "direct_marketing_pv_store_source_contract": decision.get("direct_marketing_pv_store_source_contract"),
+        "direct_marketing_pv_store_source_contract_reason": decision.get("direct_marketing_pv_store_source_contract_reason"),
+        "direct_marketing_pv_store_aux_ac_user_release": bool(decision.get("direct_marketing_pv_store_aux_ac_user_release")),
+        "direct_marketing_pv_store_aux_ac_plan_release": bool(decision.get("direct_marketing_pv_store_aux_ac_plan_release")),
+        "direct_marketing_pv_store_aux_ac_allowed": bool(decision.get("direct_marketing_pv_store_aux_ac_allowed")),
         "direct_marketing_pv_store_external_ac_guard_w": safe_int(decision.get("direct_marketing_pv_store_external_ac_guard_w"), 0),
         "direct_marketing_pv_total_w": safe_int(decision.get("direct_marketing_pv_total_w"), 0),
         "direct_marketing_pv_e3dc_w": safe_int(decision.get("direct_marketing_pv_e3dc_w"), 0),
@@ -17915,6 +20222,31 @@ def write_state(payload: Dict[str, Any], plan: Dict[str, Any]) -> None:
         "pv_w": payload.get("pv_w", 0),
         "grid_w": payload.get("grid_w", 0),
         "bat_w": payload.get("bat_w", 0),
+        "peak_shaving": copy.deepcopy(payload.get("peak_shaving"))
+        if isinstance(payload.get("peak_shaving"), dict)
+        else None,
+        "peak_shaving_action_class": payload.get("peak_shaving_action_class"),
+        "peak_shaving_candidate_action_class": payload.get(
+            "peak_shaving_candidate_action_class"
+        ),
+        "peak_shaving_candidate_suppressed_by": payload.get(
+            "peak_shaving_candidate_suppressed_by"
+        ),
+        "peak_shaving_active": bool(payload.get("peak_shaving_active")),
+        "peak_shaving_target_w": payload.get("peak_shaving_target_w", 0),
+        "peak_shaving_recharge_active": bool(
+            payload.get("peak_shaving_recharge_active")
+        ),
+        "peak_shaving_reserve_hold": bool(
+            payload.get("peak_shaving_reserve_hold")
+        ),
+        "peak_shaving_history_status": payload.get(
+            "peak_shaving_history_status"
+        ),
+        "peak_shaving_unavoidable_exceedance_w": payload.get(
+            "peak_shaving_unavoidable_exceedance_w",
+            0,
+        ),
         "live_age_s": payload.get("live_age_s"),
         "live_stale": bool(payload.get("live_stale")),
         "soc_unrealistic": bool(payload.get("soc_unrealistic")),
@@ -17964,6 +20296,10 @@ def write_state(payload: Dict[str, Any], plan: Dict[str, Any]) -> None:
         "direct_marketing_future_pv_store_reservation": payload.get("direct_marketing_future_pv_store_reservation") if isinstance(payload.get("direct_marketing_future_pv_store_reservation"), dict) else None,
         "direct_marketing_future_pv_store_reservation_active": bool(payload.get("direct_marketing_future_pv_store_reservation_active")),
         "direct_marketing_future_pv_store_reservation_cap_w": payload.get("direct_marketing_future_pv_store_reservation_cap_w"),
+        "direct_marketing_post_final_pv_store_auto_active": bool(payload.get("direct_marketing_post_final_pv_store_auto_active")),
+        "direct_marketing_post_final_pv_store_auto_reason": payload.get("direct_marketing_post_final_pv_store_auto_reason"),
+        "direct_marketing_post_final_pv_store_completed_end_ts": payload.get("direct_marketing_post_final_pv_store_completed_end_ts"),
+        "direct_marketing_post_final_pv_store_next_export_start_ts": payload.get("direct_marketing_post_final_pv_store_next_export_start_ts"),
         "direct_marketing_mode": payload.get("direct_marketing_mode"),
         "direct_marketing_owner": payload.get("direct_marketing_owner"),
         "direct_marketing_contract_version": payload.get("direct_marketing_contract_version"),
@@ -17986,7 +20322,51 @@ def write_state(payload: Dict[str, Any], plan: Dict[str, Any]) -> None:
         "direct_marketing_pv_store_pv_safe_cap_w": payload.get("direct_marketing_pv_store_pv_safe_cap_w"),
         "direct_marketing_pv_store_self_reference_limited": payload.get("direct_marketing_pv_store_self_reference_limited"),
         "direct_marketing_pv_store_execution": payload.get("direct_marketing_pv_store_execution"),
+        "direct_marketing_pv_store_blocker": payload.get("direct_marketing_pv_store_blocker"),
         "direct_marketing_pv_store_auto_limit_active": payload.get("direct_marketing_pv_store_auto_limit_active"),
+        "storage_dc_first_charge_limit_enabled": bool(payload.get("storage_dc_first_charge_limit_enabled")),
+        "storage_dc_first_charge_limit_active": bool(payload.get("storage_dc_first_charge_limit_active")),
+        "storage_dc_first_charge_limit_contract_version": payload.get(
+            "storage_dc_first_charge_limit_contract_version"
+        ),
+        "storage_dc_first_charge_limit_source_valid": bool(
+            payload.get("storage_dc_first_charge_limit_source_valid")
+        ),
+        "storage_dc_first_charge_limit_blocker": payload.get(
+            "storage_dc_first_charge_limit_blocker"
+        ),
+        "storage_dc_first_charge_limit_source": (
+            payload.get("storage_dc_first_charge_limit_source")
+            if isinstance(payload.get("storage_dc_first_charge_limit_source"), dict)
+            else None
+        ),
+        "storage_dc_first_charge_planner_limit_w": payload.get(
+            "storage_dc_first_charge_planner_limit_w"
+        ),
+        "storage_dc_first_charge_e3dc_pv_w": payload.get(
+            "storage_dc_first_charge_e3dc_pv_w"
+        ),
+        "storage_dc_first_charge_external_ac_pv_w": payload.get(
+            "storage_dc_first_charge_external_ac_pv_w"
+        ),
+        "storage_dc_first_charge_target_w": payload.get(
+            "storage_dc_first_charge_target_w"
+        ),
+        "storage_dc_first_charge_limit_w": payload.get(
+            "storage_dc_first_charge_limit_w"
+        ),
+        "storage_dc_first_charge_previous_limit_w": payload.get(
+            "storage_dc_first_charge_previous_limit_w"
+        ),
+        "storage_dc_first_charge_ramp_phase": payload.get(
+            "storage_dc_first_charge_ramp_phase"
+        ),
+        "storage_dc_first_charge_deadband_w": payload.get(
+            "storage_dc_first_charge_deadband_w"
+        ),
+        "storage_dc_first_charge_step_up_w": payload.get(
+            "storage_dc_first_charge_step_up_w"
+        ),
         "direct_marketing_pv_store_external_export_owner": payload.get("direct_marketing_pv_store_external_export_owner"),
         "direct_marketing_hard_export_owner_confirmed": payload.get("direct_marketing_hard_export_owner_confirmed"),
         "direct_marketing_export_execution": payload.get("direct_marketing_export_execution"),
@@ -18046,6 +20426,12 @@ def write_state(payload: Dict[str, Any], plan: Dict[str, Any]) -> None:
         "direct_marketing_owner_switch_previous_state": payload.get("direct_marketing_owner_switch_previous_state"),
         "direct_marketing_owner_switch_next_state": payload.get("direct_marketing_owner_switch_next_state"),
         "direct_marketing_pv_store_dc_only": payload.get("direct_marketing_pv_store_dc_only"),
+        "direct_marketing_pv_store_source_contract": payload.get("direct_marketing_pv_store_source_contract"),
+        "direct_marketing_pv_store_runtime_recheck": payload.get("direct_marketing_pv_store_runtime_recheck"),
+        "direct_marketing_pv_store_source_contract_reason": payload.get("direct_marketing_pv_store_source_contract_reason"),
+        "direct_marketing_pv_store_aux_ac_user_release": payload.get("direct_marketing_pv_store_aux_ac_user_release"),
+        "direct_marketing_pv_store_aux_ac_plan_release": payload.get("direct_marketing_pv_store_aux_ac_plan_release"),
+        "direct_marketing_pv_store_aux_ac_allowed": payload.get("direct_marketing_pv_store_aux_ac_allowed"),
         "direct_marketing_pv_store_external_ac_guard_w": payload.get("direct_marketing_pv_store_external_ac_guard_w"),
         "direct_marketing_pv_total_w": payload.get("direct_marketing_pv_total_w"),
         "direct_marketing_pv_e3dc_w": payload.get("direct_marketing_pv_e3dc_w"),
@@ -18141,6 +20527,20 @@ def write_state(payload: Dict[str, Any], plan: Dict[str, Any]) -> None:
     atomic_write_on_change(STATE_F, state, indent=2)
 
 
+def write_peak_shaving_interval_state(payload: Dict[str, Any]) -> None:
+    """Persistiert nur den reinen Viertelstunden-Akkumulator in der Ramdisk."""
+
+    context = payload.get("peak_shaving")
+    if not isinstance(context, dict) or not context:
+        return
+    atomic_write_on_change(
+        PEAK_SHAVING_STATE_F,
+        context,
+        force_interval_s=5.0,
+        indent=2,
+    )
+
+
 _WB_BUDGET_CONTROL_KEYS = {
     "state", "storage_state", "budget_w", "raw_iAVal_w", "iAVal_w",
     "budget_amp_1ph", "budget_amp_3ph", "storage_charge_request_w", "storage_req_w",
@@ -18169,6 +20569,7 @@ _WB_BUDGET_CONTROL_KEYS = {
     "state_label", "display_reason", "reason", "control_owner", "control_owner_label",
     "wallbox_w", "wallbox_power_source", "auto_limit", "runtime_block_reason",
     "abregel_active", "abregel_source", "safe_start",
+    "peak_shaving", "grid_import_headroom_w",
 }
 
 _WB_BUDGET_ENERGY_SCORE_KEYS = {
@@ -18399,6 +20800,25 @@ _PHASE5_COMMAND_ACTIONS = frozenset({
     "HOUSE_SUPPLY",
     "ECONOMIC_EXPORT",
     "HEADROOM_EXPORT",
+    "DIRECT_MARKETING_CHARGE_BLOCK_WAIT",
+})
+_PHASE5_CHARGE_BLOCK_CONTINUATION_STATUSES = frozenset({
+    "pending_readback",
+    "pending_readback_missing",
+    "readback_mismatch",
+    "retry_backoff",
+    "readback_stale",
+    "connection_failed",
+    "set_response_invalid_readback_missing",
+    "set_response_invalid_readback_mismatch",
+})
+_PHASE5_CHARGE_BLOCK_RETRY_WINDOW_S = 30.0
+_PHASE5_PV_STORE_WAIT_STATE = "direct_marketing_phase5_pv_store_wait"
+_PHASE5_PV_STORE_WAIT_BLOCKERS = frozenset({
+    "pv_store_grid_import_guard",
+    "pv_store_surplus_below_min",
+    "pv_store_dc_surplus_below_min",
+    "pv_store_charge_power_below_min",
 })
 
 
@@ -18418,6 +20838,17 @@ def _phase5_command_intent_error(arbitration: Dict[str, Any]) -> Optional[str]:
             or arbitration.get("request") is not None
         )
         return "PHASE5_HOLD_EFFECT_CLAIM_INVALID" if effect_claimed else None
+    if action == "DIRECT_MARKETING_CHARGE_BLOCK_WAIT":
+        if not bool(
+            arbitration.get("selected")
+            and arbitration.get("executable")
+            and arbitration.get("commands_allowed")
+            and power_w == 0
+            and isinstance(arbitration.get("charge_block_contract"), dict)
+            and arbitration["charge_block_contract"].get("valid") is True
+        ):
+            return "PHASE5_CHARGE_BLOCK_WAIT_INTENT_INCOMPLETE"
+        return None
     if action == "GRID_CHARGE":
         return "PHASE5_GRID_CHARGE_NOT_RELEASED"
     if action not in _PHASE5_COMMAND_ACTIONS:
@@ -18430,6 +20861,934 @@ def _phase5_command_intent_error(arbitration: Dict[str, Any]) -> Optional[str]:
     ):
         return "PHASE5_COMMAND_INTENT_INCOMPLETE"
     return None
+
+
+def _phase5_charge_block_wait_contract(
+    plan: Dict[str, Any],
+    arbitration: Dict[str, Any],
+    now_s: float,
+) -> Dict[str, Any]:
+    """Bind a real one-sided charge block to the current canonical plan slot."""
+    result: Dict[str, Any] = {
+        "schema": "phase5_charge_block_wait_contract_v1",
+        "valid": False,
+        "reason": "not_applicable",
+        "source_window": None,
+    }
+    canonical_slot = (
+        arbitration.get("canonical_direct_marketing_slot")
+        if isinstance(arbitration.get("canonical_direct_marketing_slot"), dict)
+        else {}
+    )
+    direct = plan.get("direct_marketing") if isinstance(plan.get("direct_marketing"), dict) else {}
+    wait_plan = (
+        direct.get("charge_block_wait_plan")
+        if isinstance(direct.get("charge_block_wait_plan"), dict)
+        else {}
+    )
+    candidate = (
+        arbitration.get("candidate")
+        if isinstance(arbitration.get("candidate"), dict)
+        else {}
+    )
+    stability = (
+        arbitration.get("stability")
+        if isinstance(arbitration.get("stability"), dict)
+        else {}
+    )
+    canonical_action = str(canonical_slot.get("action") or "").upper()
+    planned_wait = bool(
+        canonical_slot.get("valid_selected_contract") is True
+        and canonical_action == "CHARGE_BLOCK_WAIT"
+    )
+    candidate_headroom_gate = (
+        candidate.get("headroom_gate")
+        if isinstance(candidate.get("headroom_gate"), dict)
+        else {}
+    )
+    candidate_action_horizon = (
+        candidate.get("action_horizon_contract")
+        if isinstance(candidate.get("action_horizon_contract"), dict)
+        else {}
+    )
+    headroom_transition_wait = bool(
+        str(candidate.get("action") or "").upper() == "HEADROOM_EXPORT"
+        and stability.get("reason_code") == "HEADROOM_CHARGE_BLOCK_LIVE_DIRECTION_REVERSAL"
+        and candidate_headroom_gate.get("allowed") is True
+        and candidate_action_horizon.get("complete") is True
+    )
+    if not bool(
+        arbitration.get("selected")
+        and str(arbitration.get("selected_action") or "").upper() == "CHARGE_BLOCK_WAIT"
+        and (planned_wait or headroom_transition_wait)
+    ):
+        result["reason"] = "current_slot_not_selected_charge_block_wait"
+        return result
+    canonical = validate_canonical_plan(plan, int(float(now_s) * 1000.0))
+    if not canonical.get("valid"):
+        result["reason"] = "canonical_plan_invalid"
+        return result
+    if not bool(
+        wait_plan.get("schema") == "direct_marketing_charge_block_wait_plan_v1"
+        and wait_plan.get("complete") is True
+        and wait_plan.get("contiguous_900s") is True
+        and safe_int(wait_plan.get("slot_duration_ms"), 0) == 900_000
+        and safe_int(wait_plan.get("slot_count"), 0) > 0
+        and safe_int(wait_plan.get("wait_slot_count"), 0) > 0
+        and safe_int(wait_plan.get("action_gap_slot_count"), -1) == 0
+        and (
+            safe_int(wait_plan.get("wait_slot_count"), 0)
+            + safe_int(wait_plan.get("existing_action_slot_count"), 0)
+            == safe_int(wait_plan.get("slot_count"), 0)
+        )
+        and str(wait_plan.get("reason") or "") == "ok"
+    ):
+        result["reason"] = "charge_block_wait_full_plan_incomplete"
+        return result
+    source_window = (
+        candidate_action_horizon
+        if headroom_transition_wait
+        else canonical_slot.get("action_horizon_contract")
+        if isinstance(canonical_slot.get("action_horizon_contract"), dict)
+        else {}
+    )
+    if not bool(source_window.get("complete")):
+        result["reason"] = "charge_block_wait_source_window_unbound"
+        return result
+    result.update({
+        "valid": True,
+        "reason": (
+            "headroom_transition_charge_block"
+            if headroom_transition_wait
+            else "current_canonical_charge_block_wait"
+        ),
+        "source_window": {
+            "slot_id": arbitration.get("slot_id"),
+            "start_ts_ms": source_window.get("slot_start_ts_ms"),
+            "end_ts_ms": source_window.get("slot_end_ts_ms"),
+            "action": "HEADROOM_EXPORT" if headroom_transition_wait else canonical_action,
+            "source_action": (
+                candidate.get("reason_code")
+                if headroom_transition_wait
+                else canonical_slot.get("source_action")
+            ),
+            "action_id": (
+                candidate.get("action_id")
+                if headroom_transition_wait
+                else canonical_slot.get("action_id")
+            ),
+            "segment_id": (
+                candidate.get("segment_id")
+                if headroom_transition_wait
+                else canonical_slot.get("segment_id")
+            ),
+            "transition": (
+                "HEADROOM_EXPORT_AFTER_CHARGE_BLOCK"
+                if headroom_transition_wait
+                else None
+            ),
+            "full_plan_contract": {
+                "slot_count": wait_plan.get("slot_count"),
+                "wait_slot_count": wait_plan.get("wait_slot_count"),
+                "existing_action_slot_count": wait_plan.get("existing_action_slot_count"),
+                "action_gap_slot_count": wait_plan.get("action_gap_slot_count"),
+                "contiguous_900s": wait_plan.get("contiguous_900s"),
+                "reason": wait_plan.get("reason"),
+            },
+        },
+    })
+    return result
+
+
+def _phase5_charge_block_wait_bootstrap_contract(
+    plan: Dict[str, Any],
+    legacy: Dict[str, Any],
+    arbitration: Dict[str, Any],
+    path_contract: Dict[str, Any],
+    now_s: float,
+) -> Dict[str, Any]:
+    """Bindet einen aktuellen DV-Warteslot unabhängig vom Shadow-Optimierer.
+
+    ``CHARGE_BLOCK_WAIT`` ist kein ökonomischer Lade- oder Entladebefehl,
+    sondern eine einseitige, flüchtige Ladesperre. Ein bereits kanonisch
+    ausgewählter Warteslot darf deshalb nicht auf E3DC-AUTO zurückfallen, nur
+    weil die zusätzliche Shadow-/Preis-/Terminalwertprüfung unvollständig ist.
+    Sicherheits-, Nutzer- und konkurrierende Hardwarepfade bleiben harte Vetos.
+    """
+
+    result: Dict[str, Any] = {
+        "schema": "phase5_charge_block_wait_bootstrap_v1",
+        "valid": False,
+        "reason": "not_applicable",
+        "suppressed_optimizer_blockers": [],
+    }
+    canonical = (
+        arbitration.get("canonical_direct_marketing_slot")
+        if isinstance(arbitration.get("canonical_direct_marketing_slot"), dict)
+        else {}
+    )
+    candidate = (
+        arbitration.get("candidate")
+        if isinstance(arbitration.get("candidate"), dict)
+        else {}
+    )
+    activation = (
+        arbitration.get("activation")
+        if isinstance(arbitration.get("activation"), dict)
+        else {}
+    )
+    live_contract = (
+        arbitration.get("live_contract")
+        if isinstance(arbitration.get("live_contract"), dict)
+        else {}
+    )
+    direct = (
+        plan.get("direct_marketing")
+        if isinstance(plan.get("direct_marketing"), dict)
+        else {}
+    )
+    policy = (
+        direct.get("policy_decision")
+        if isinstance(direct.get("policy_decision"), dict)
+        else {}
+    )
+    selected_policy = (
+        policy.get("selected_candidate")
+        if isinstance(policy.get("selected_candidate"), dict)
+        else policy.get("selected_window")
+        if isinstance(policy.get("selected_window"), dict)
+        else {}
+    )
+    wait_plan = (
+        direct.get("charge_block_wait_plan")
+        if isinstance(direct.get("charge_block_wait_plan"), dict)
+        else {}
+    )
+    horizon = (
+        canonical.get("action_horizon_contract")
+        if isinstance(canonical.get("action_horizon_contract"), dict)
+        else {}
+    )
+    now_ms = int(float(now_s) * 1000.0)
+
+    if not bool(
+        activation.get("field_active") is True
+        and canonical.get("valid_selected_contract") is True
+        and str(canonical.get("action") or "").upper() == "CHARGE_BLOCK_WAIT"
+        and str(canonical.get("source_action") or "")
+        == "direct_marketing_charge_block_wait"
+        and str(canonical.get("source_mode") or "").lower() == "eco_plus"
+        and safe_float(canonical.get("planned_w"), -1.0) == 0.0
+        and candidate.get("valid") is True
+        and str(candidate.get("action") or "").upper() == "CHARGE_BLOCK_WAIT"
+        and str(candidate.get("direction") or "").lower() == "hold"
+        and safe_float(candidate.get("power_w"), -1.0) == 0.0
+    ):
+        result["reason"] = "canonical_charge_block_wait_not_selected"
+        return result
+
+    canonical_plan = validate_canonical_plan(plan, now_ms)
+    if canonical_plan.get("valid") is not True:
+        result["reason"] = "canonical_plan_invalid"
+        return result
+    if live_contract.get("valid") is not True:
+        result["reason"] = "live_physics_invalid_or_stale"
+        return result
+    if not bool(
+        horizon.get("complete") is True
+        and str(horizon.get("action") or "").upper() == "CHARGE_BLOCK_WAIT"
+        and safe_int(horizon.get("slot_start_ts_ms"), 0)
+        <= now_ms
+        < safe_int(horizon.get("slot_end_ts_ms"), 0)
+    ):
+        result["reason"] = "current_charge_block_horizon_unbound"
+        return result
+    if not bool(
+        wait_plan.get("schema") == "direct_marketing_charge_block_wait_plan_v1"
+        and wait_plan.get("complete") is True
+        and wait_plan.get("contiguous_900s") is True
+        and safe_int(wait_plan.get("slot_duration_ms"), 0) == 900_000
+        and safe_int(wait_plan.get("slot_count"), 0) > 0
+        and safe_int(wait_plan.get("wait_slot_count"), 0) > 0
+        and safe_int(wait_plan.get("action_gap_slot_count"), -1) == 0
+        and (
+            safe_int(wait_plan.get("wait_slot_count"), 0)
+            + safe_int(wait_plan.get("existing_action_slot_count"), 0)
+            == safe_int(wait_plan.get("slot_count"), 0)
+        )
+        and str(wait_plan.get("reason") or "") == "ok"
+    ):
+        result["reason"] = "charge_block_wait_full_plan_incomplete"
+        return result
+
+    slot_start_ms = safe_int(horizon.get("slot_start_ts_ms"), 0)
+    slot_end_ms = safe_int(horizon.get("slot_end_ts_ms"), 0)
+    policy_start_ms = safe_int(policy.get("start_ts"), 0)
+    policy_end_ms = safe_int(policy.get("end_ts"), 0)
+    if 0 < policy_start_ms < 100_000_000_000:
+        policy_start_ms *= 1000
+    if 0 < policy_end_ms < 100_000_000_000:
+        policy_end_ms *= 1000
+    if not bool(
+        str(direct.get("mode") or "").lower() == "eco_plus"
+        and policy.get("blocked") is False
+        and policy.get("commands_allowed") is True
+        and str(policy.get("dv_target_state") or "").upper()
+        == "CHARGE_BLOCK_WAIT"
+        and str(policy.get("executable_action") or "")
+        == "direct_marketing_charge_block_wait"
+        and policy_start_ms == slot_start_ms
+        and policy_end_ms == slot_end_ms
+        and selected_policy.get("window_id") == canonical.get("window_id")
+        and str(selected_policy.get("action") or "")
+        == "direct_marketing_charge_block_wait"
+    ):
+        result["reason"] = "active_policy_charge_block_wait_unbound"
+        return result
+
+    active_paths = {
+        str(value)
+        for value in path_contract.get("active_paths") or []
+        if isinstance(value, str)
+    }
+    unsafe_paths = active_paths - {"direct_marketing", "curve", "e3dc_auto"}
+    path_veto_reasons = [
+        str(value)
+        for value in path_contract.get("veto_reasons") or []
+        if isinstance(value, str)
+    ]
+    unexpected_path_vetos = [
+        value
+        for value in path_veto_reasons
+        if value != "multiple_policy_candidates:curve"
+        and not value.startswith(
+            "auto_limit_source_mismatch:direct_marketing->"
+        )
+    ]
+    if bool(
+        unsafe_paths
+        or unexpected_path_vetos
+        or legacy.get("ems_budget_runtime_veto")
+        or legacy.get("manual_override_active")
+        or str(legacy.get("state") or "").lower().startswith("manual_override")
+        or legacy.get("abregel_active")
+        or legacy.get("curtailment_protection_active")
+        or legacy.get("ep_reserve_hold")
+        or legacy.get("ep_reserve_discharge_hold")
+    ):
+        result.update({
+            "reason": "legacy_safety_or_owner_veto",
+            "unsafe_paths": sorted(unsafe_paths),
+            "path_veto_reasons": path_veto_reasons,
+            "unexpected_path_vetos": unexpected_path_vetos,
+        })
+        return result
+
+    result.update({
+        "valid": True,
+        "reason": "canonical_charge_block_wait_requires_owner",
+        "plan_id": arbitration.get("plan_id"),
+        "slot_id": arbitration.get("slot_id"),
+        "window_id": canonical.get("window_id"),
+        "start_ts_ms": slot_start_ms,
+        "end_ts_ms": slot_end_ms,
+        "suppressed_optimizer_blockers": list(
+            arbitration.get("technical_blockers") or []
+        ),
+    })
+    return result
+
+
+def _phase5_power_settings_target(values: Any) -> Optional[Dict[str, Any]]:
+    """Normalisiert genau einen flüchtigen POWER_SETTINGS-Zielvertrag."""
+
+    if not isinstance(values, dict) or not isinstance(values.get("limits_used"), bool):
+        return None
+    result: Dict[str, Any] = {"limits_used": values["limits_used"]}
+    for key in ("max_charge_w", "max_discharge_w", "discharge_start_w"):
+        value = values.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            return None
+        result[key] = value
+    return result
+
+
+def _phase5_pv_store_wait_contract(
+    cfg: Dict[str, Any],
+    plan: Dict[str, Any],
+    arbitration: Dict[str, Any],
+    control: Dict[str, Any],
+    previous_state: Optional[Dict[str, Any]],
+    now_s: float,
+) -> Dict[str, Any]:
+    """Hält einen gültigen PV_STORE-Slot bei zu kleinem DC-Angebot in Phase 5.
+
+    Die Planentscheidung bleibt Eigentümer. Laden wird einseitig gesperrt,
+    Entladen bleibt innerhalb der bestehenden Grenze erlaubt. Erst ein
+    ausreichend großer DC-Abstand oberhalb der Einschaltgrenze und eine kurze
+    Mindesthaltezeit lösen die Sperre wieder.
+    """
+
+    result: Dict[str, Any] = {
+        "schema": "phase5_pv_store_wait_v1",
+        "valid": False,
+        "active": False,
+        "reason": "not_applicable",
+    }
+    direct = plan.get("direct_marketing") if isinstance(plan.get("direct_marketing"), dict) else {}
+    wait_plan = (
+        direct.get("charge_block_wait_plan")
+        if isinstance(direct.get("charge_block_wait_plan"), dict)
+        else {}
+    )
+    canonical = (
+        arbitration.get("canonical_direct_marketing_slot")
+        if isinstance(arbitration.get("canonical_direct_marketing_slot"), dict)
+        else {}
+    )
+    candidate = (
+        arbitration.get("candidate")
+        if isinstance(arbitration.get("candidate"), dict)
+        else {}
+    )
+    if not bool(
+        arbitration.get("selected")
+        and str(arbitration.get("selected_action") or "").upper() == "PV_STORE"
+        and not arbitration.get("technical_blockers")
+        and canonical.get("valid_selected_contract") is True
+        and str(canonical.get("action") or "").upper() == "PV_STORE"
+        and str(candidate.get("action") or "").upper() == "PV_STORE"
+        and str(direct.get("mode") or "").lower() == "eco_plus"
+        and wait_plan.get("schema") == "direct_marketing_charge_block_wait_plan_v1"
+        and wait_plan.get("complete") is True
+        and wait_plan.get("contiguous_900s") is True
+        and safe_int(wait_plan.get("slot_duration_ms"), 0) == 900_000
+        and safe_int(wait_plan.get("slot_count"), 0) > 0
+        and safe_int(wait_plan.get("action_gap_slot_count"), -1) == 0
+        and (
+            safe_int(wait_plan.get("wait_slot_count"), 0)
+            + safe_int(wait_plan.get("existing_action_slot_count"), 0)
+            == safe_int(wait_plan.get("slot_count"), 0)
+        )
+        and str(wait_plan.get("reason") or "") == "ok"
+    ):
+        result["reason"] = "canonical_pv_store_slot_not_bound"
+        return result
+
+    binding_identity = {
+        "plan_id": arbitration.get("plan_id"),
+        "slot_id": arbitration.get("slot_id"),
+        "window_id": candidate.get("window_id") or canonical.get("window_id"),
+        "action_id": candidate.get("action_id") or canonical.get("action_id"),
+        "segment_id": candidate.get("segment_id") or canonical.get("segment_id"),
+    }
+    if not all(
+        isinstance(value, str) and bool(value)
+        for value in binding_identity.values()
+    ):
+        result["reason"] = "pv_store_wait_identity_incomplete"
+        return result
+    continuity_identity = {
+        key: binding_identity[key]
+        for key in ("window_id", "action_id", "segment_id")
+    }
+
+    previous = previous_state if isinstance(previous_state, dict) else {}
+    previous_phase5 = (
+        previous.get("storage_dispatch_phase5")
+        if isinstance(previous.get("storage_dispatch_phase5"), dict)
+        else {}
+    )
+    previous_wait = (
+        previous_phase5.get("pv_store_wait")
+        if isinstance(previous_phase5.get("pv_store_wait"), dict)
+        else {}
+    )
+    same_identity = bool(
+        previous.get("state") == _PHASE5_PV_STORE_WAIT_STATE
+        and previous_wait.get("active") is True
+        and all(
+            previous_wait.get(key) == value
+            for key, value in continuity_identity.items()
+        )
+    )
+    started_ts = (
+        safe_float(previous_wait.get("started_ts"), now_s)
+        if same_identity
+        else float(now_s)
+    )
+    min_hold_s = max(
+        45.0,
+        safe_float(cfg.get("direct_marketing_owner_switch_hold_s"), 45.0),
+    )
+    min_surplus_w = max(
+        300,
+        safe_int(
+            control.get("min_surplus_w"),
+            safe_int(cfg.get("direct_marketing_pv_store_min_surplus_w"), 300),
+        ),
+    )
+    resume_deadband_w = max(
+        300,
+        safe_int(cfg.get("direct_marketing_netpoint_deadband_w"), 300),
+    )
+    resume_threshold_w = min_surplus_w + resume_deadband_w
+    offer_w = max(
+        0,
+        safe_int(control.get("offer_w"), 0),
+        safe_int(control.get("pv_safe_cap_w"), 0),
+        safe_int(control.get("charge_w"), 0),
+    )
+    blocker = str(control.get("blocker") or "")
+    live_wait = bool(control.get("blocked") and blocker in _PHASE5_PV_STORE_WAIT_BLOCKERS)
+    hysteresis_wait = bool(
+        same_identity
+        and not control.get("blocked")
+        and (
+            float(now_s) - started_ts < min_hold_s
+            or offer_w < resume_threshold_w
+        )
+    )
+    if control.get("blocked") and not live_wait:
+        result.update({
+            "reason": "pv_store_wait_source_not_safe",
+            "blocker": blocker or None,
+        })
+        return result
+    if not live_wait and not hysteresis_wait:
+        result.update({
+            "valid": True,
+            "reason": "pv_store_resume_ready",
+            "identity": binding_identity,
+            "offer_w": offer_w,
+            "resume_threshold_w": resume_threshold_w,
+            "started_ts": started_ts,
+            "min_hold_s": min_hold_s,
+        })
+        return result
+
+    result.update({
+        "valid": True,
+        "active": True,
+        "reason": (
+            "pv_store_live_offer_wait"
+            if live_wait
+            else "pv_store_resume_hysteresis"
+        ),
+        "blocker": blocker or None,
+        "started_ts": started_ts,
+        "age_s": max(0.0, float(now_s) - started_ts),
+        "min_hold_s": min_hold_s,
+        "offer_w": offer_w,
+        "min_surplus_w": min_surplus_w,
+        "resume_deadband_w": resume_deadband_w,
+        "resume_threshold_w": resume_threshold_w,
+        **binding_identity,
+    })
+    return result
+
+
+def _phase5_fresh_power_settings_target_confirmed(
+    power_settings: Dict[str, Any],
+    target: Dict[str, Any],
+    now_s: float,
+) -> bool:
+    """Prüft einen frischen, typisierten POWER_SETTINGS-Zielreadback."""
+
+    if not bool(
+        isinstance(power_settings, dict)
+        and power_settings.get("schema") == "rscp_power_settings_v1"
+        and safe_int(power_settings.get("contract_version"), 0) == 2
+        and power_settings.get("confirmed") is True
+        and str(power_settings.get("status") or "") in {
+            "confirmed",
+            "confirmed_bounded_zero",
+            "confirmed_nonoptimal",
+            "confirmed_unchanged",
+            "confirmed_from_get_ack_unknown",
+            "confirmed_from_live_readback",
+        }
+    ):
+        return False
+    readback = _phase5_power_settings_target(power_settings.get("readback"))
+    if readback is None or readback["limits_used"] is not target["limits_used"]:
+        return False
+    bounded_zero_w = max(
+        0,
+        safe_int(power_settings.get("bounded_zero_w"), EMS_POWER_SETTINGS_NONZERO_MIN_W),
+    )
+    charge_matches = readback["max_charge_w"] == target["max_charge_w"]
+    if target["limits_used"] and target["max_charge_w"] == 0:
+        charge_matches = 0 <= readback["max_charge_w"] <= bounded_zero_w
+    if not bool(
+        charge_matches
+        and readback["max_discharge_w"] == target["max_discharge_w"]
+        and readback["discharge_start_w"] == target["discharge_start_w"]
+    ):
+        return False
+    evidence_ts = safe_float(power_settings.get("readback_cycle_ts"), 0.0)
+    if evidence_ts > 100_000_000_000.0:
+        evidence_ts /= 1000.0
+    return bool(evidence_ts > 0.0 and -5.0 <= now_s - evidence_ts <= 30.0)
+
+
+def _phase5_charge_block_wait_continuation_contract(
+    arbitration: Dict[str, Any],
+    power_settings: Dict[str, Any],
+    previous_state: Optional[Dict[str, Any]],
+    now_s: float,
+) -> Dict[str, Any]:
+    """Hält einen bereits angeforderten Ladesperrvertrag owner-stabil.
+
+    Ein frischer Replan darf die Ladesperre nicht kurz auf AUTO freigeben.
+    Solange derselbe zeitlich gebundene Warteslot oder ein unmittelbar
+    anschließender Warteslot bestätigt ist, bleibt der bounded Retry erlaubt.
+    Bei unsicheren aktuellen Quellen wird dagegen nichts neu gesendet: Der
+    zuletzt gebundene Ausgang wird bis zu frischer Evidenz eingefroren.
+    Explizite Safety-/Nutzer-/Reserve-Vetos gewinnen weiterhin sofort.
+    """
+
+    result: Dict[str, Any] = {
+        "schema": "phase5_charge_block_wait_continuation_v1",
+        "valid": False,
+        "safe_fallback_latched": False,
+        "reason": "not_applicable",
+        "target": None,
+    }
+    previous = previous_state if isinstance(previous_state, dict) else {}
+    previous_phase5 = (
+        previous.get("storage_dispatch_phase5")
+        if isinstance(previous.get("storage_dispatch_phase5"), dict)
+        else {}
+    )
+    candidate = (
+        arbitration.get("candidate")
+        if isinstance(arbitration.get("candidate"), dict)
+        else {}
+    )
+    canonical = (
+        arbitration.get("canonical_direct_marketing_slot")
+        if isinstance(arbitration.get("canonical_direct_marketing_slot"), dict)
+        else {}
+    )
+    technical_blockers = set(str(code) for code in arbitration.get("technical_blockers") or [])
+    previous_request = (
+        previous_phase5.get("power_settings_after_request")
+        if isinstance(previous_phase5.get("power_settings_after_request"), dict)
+        else {}
+    )
+    target = _phase5_power_settings_target(previous_request.get("requested"))
+    if target is None:
+        target = _phase5_power_settings_target(previous_request.get("target"))
+    if target is None:
+        nested_request = (
+            previous_phase5.get("request")
+            if isinstance(previous_phase5.get("request"), dict)
+            else {}
+        )
+        target = _phase5_power_settings_target(nested_request.get("target"))
+    if target is None:
+        nested_request = (
+            previous_phase5.get("request")
+            if isinstance(previous_phase5.get("request"), dict)
+            else {}
+        )
+        nested_diag = (
+            (nested_request.get("bounded_zero_readback") or {}).get("power_settings")
+            if isinstance(nested_request.get("bounded_zero_readback"), dict)
+            else {}
+        )
+        target = _phase5_power_settings_target(
+            nested_diag.get("requested") if isinstance(nested_diag, dict) else None
+        )
+    if not bool(
+        target
+        and target["limits_used"] is True
+        and target["max_charge_w"] == 0
+        and target["max_discharge_w"] > 0
+        and target["discharge_start_w"] == 0
+    ):
+        result["reason"] = "previous_exact_target_missing"
+        return result
+
+    started_ts = safe_float(
+        previous_phase5.get("charge_block_request_started_ts"),
+        safe_float(previous.get("ts"), 0.0),
+    )
+    deadline_ts = safe_float(
+        previous_phase5.get("charge_block_request_deadline_ts"),
+        started_ts + _PHASE5_CHARGE_BLOCK_RETRY_WINDOW_S if started_ts > 0.0 else 0.0,
+    )
+    if started_ts <= 0.0 or deadline_ts <= started_ts:
+        result["reason"] = "bounded_retry_window_missing"
+        return result
+
+    previous_action = str(previous_phase5.get("selected_action") or "").upper()
+    if previous_action not in {
+        "DIRECT_MARKETING_CHARGE_BLOCK_WAIT",
+        "DIRECT_MARKETING_CHARGE_BLOCK_WAIT_SAFE_FALLBACK",
+    }:
+        result["reason"] = "previous_charge_block_owner_missing"
+        return result
+
+    field_active = bool(
+        arbitration.get("schema_version") == "storage_dispatch_phase5_v1"
+        and arbitration.get("activation", {}).get("field_active") is True
+    )
+    if not field_active:
+        result["reason"] = "current_field_activation_ended"
+        return result
+
+    hard_override_blockers = {
+        "EMS_BUDGET_RUNTIME_VETO",
+        "LEGACY_OWNER_PATH_CONFLICT",
+        "LEGACY_SAFETY_OR_MANUAL_OWNER_VETO",
+        "MANUAL_OR_USER_OVERRIDE",
+        "CURTAILMENT_PROTECTION_ACTIVE",
+        "EMERGENCY_RESERVE_VETO",
+        "LIVE_SOC_BELOW_HARD_FLOOR",
+        "RESERVE_OR_RISK_FLOOR_VETO",
+    }
+    active_hard_overrides = sorted(technical_blockers & hard_override_blockers)
+    if active_hard_overrides:
+        result.update({
+            "reason": "current_safety_or_user_override",
+            "hard_overrides": active_hard_overrides,
+        })
+        return result
+
+    previous_latch = (
+        previous_phase5.get("charge_block_safe_fallback")
+        if isinstance(previous_phase5.get("charge_block_safe_fallback"), dict)
+        else {}
+    )
+    latched = bool(previous_latch.get("active"))
+    exact_target_confirmed = _phase5_fresh_power_settings_target_confirmed(
+        power_settings,
+        target,
+        now_s,
+    )
+    if latched or now_s > deadline_ts:
+        if exact_target_confirmed and not technical_blockers:
+            result.update({
+                "reason": "current_contract_ready_after_fresh_target_confirmation",
+                "target": target,
+                "started_ts": started_ts,
+                "deadline_ts": deadline_ts,
+                "safe_fallback_recovered": True,
+            })
+            return result
+        result.update({
+            "safe_fallback_latched": True,
+            "reason": "bounded_retry_window_expired",
+            "target": target,
+            "started_ts": started_ts,
+            "deadline_ts": deadline_ts,
+        })
+        return result
+
+    # Ohne technischen Blocker ist der neue aktuelle Vertrag ausführbar. Dann
+    # darf der normale Phase-5-Pfad den nächsten geplanten Zustand übernehmen.
+    if not technical_blockers:
+        result["reason"] = "current_contract_ready"
+        return result
+
+    candidate_action = str(candidate.get("action") or "").upper()
+    canonical_action = str(canonical.get("action") or "").upper()
+    candidate_headroom_gate = (
+        candidate.get("headroom_gate")
+        if isinstance(candidate.get("headroom_gate"), dict)
+        else {}
+    )
+    candidate_action_horizon = (
+        candidate.get("action_horizon_contract")
+        if isinstance(candidate.get("action_horizon_contract"), dict)
+        else {}
+    )
+    same_charge_block_family = bool(
+        (
+            candidate_action == "CHARGE_BLOCK_WAIT"
+            and canonical.get("valid_selected_contract") is True
+            and canonical_action == "CHARGE_BLOCK_WAIT"
+        )
+        or (
+            candidate_action == "HEADROOM_EXPORT"
+            and candidate_headroom_gate.get("allowed") is True
+            and candidate_action_horizon.get("complete") is True
+        )
+    )
+    current_contract_retryable = bool(
+        arbitration.get("plan_resolution", {}).get("valid") is True
+        and candidate.get("valid") is True
+        and same_charge_block_family
+        and technical_blockers == {"POWER_SETTINGS_NOT_CONFIRMED_STABLE"}
+    )
+
+    previous_candidate = (
+        previous_phase5.get("candidate")
+        if isinstance(previous_phase5.get("candidate"), dict)
+        else {}
+    )
+    previous_horizon = (
+        previous_candidate.get("action_horizon_contract")
+        if isinstance(previous_candidate.get("action_horizon_contract"), dict)
+        else {}
+    )
+    previous_horizon_start = safe_int(previous_horizon.get("slot_start_ts_ms"), 0)
+    previous_horizon_end = safe_int(previous_horizon.get("slot_end_ts_ms"), 0)
+    current_horizon_start = safe_int(candidate_action_horizon.get("slot_start_ts_ms"), 0)
+    current_horizon_end = safe_int(candidate_action_horizon.get("slot_end_ts_ms"), 0)
+    generation_identity = bool(
+        previous_phase5.get("plan_id") == arbitration.get("plan_id")
+        and previous_phase5.get("slot_id") == arbitration.get("slot_id")
+    )
+    stable_window_identity = bool(
+        previous_candidate.get("window_id")
+        and previous_candidate.get("window_id") == candidate.get("window_id")
+        and previous_candidate.get("action_id")
+        and previous_candidate.get("action_id") == candidate.get("action_id")
+        and previous_candidate.get("segment_id")
+        and previous_candidate.get("segment_id") == candidate.get("segment_id")
+        and previous_horizon.get("complete") is True
+        and candidate_action_horizon.get("complete") is True
+        and previous_horizon_start == current_horizon_start
+        and previous_horizon_end == current_horizon_end
+    )
+    adjacent_wait_identity = bool(
+        str(previous_candidate.get("action") or "").upper()
+        in {"CHARGE_BLOCK_WAIT", "HEADROOM_EXPORT"}
+        and candidate_action in {"CHARGE_BLOCK_WAIT", "HEADROOM_EXPORT"}
+        and previous_horizon.get("complete") is True
+        and candidate_action_horizon.get("complete") is True
+        and previous_horizon_end > 0
+        and current_horizon_start > 0
+        and (
+            previous_horizon_start == current_horizon_start
+            and previous_horizon_end == current_horizon_end
+            or previous_horizon_end == current_horizon_start
+        )
+    )
+    identity_matches = bool(
+        current_contract_retryable
+        and (generation_identity or stable_window_identity or adjacent_wait_identity)
+    )
+
+    current_status = str(power_settings.get("status") or "")
+    current_target = _phase5_power_settings_target(power_settings.get("requested"))
+    target_conflict = bool(
+        current_status == "pending_target_conflict"
+        or (current_target is not None and current_target != target)
+    )
+    if identity_matches and not target_conflict:
+        if current_status not in _PHASE5_CHARGE_BLOCK_CONTINUATION_STATUSES:
+            result.update({
+                "safe_fallback_latched": True,
+                "reason": "power_settings_status_not_continuable_freeze_previous_output",
+                "target": target,
+                "started_ts": started_ts,
+                "deadline_ts": deadline_ts,
+            })
+            return result
+        result.update({
+            "valid": True,
+            "reason": (
+                "same_plan_slot_target_bounded_retry"
+                if generation_identity
+                else "continuous_charge_block_target_bounded_retry"
+            ),
+            "target": target,
+            "started_ts": started_ts,
+            "deadline_ts": deadline_ts,
+            "status": current_status,
+            "generation_changed": not generation_identity,
+            "stable_window_identity": stable_window_identity,
+            "adjacent_wait_identity": adjacent_wait_identity,
+        })
+        return result
+
+    # Ein Replan, eine stale Quelle oder ein noch widersprüchlicher Zielwert
+    # darf nie implizit auf den Legacy-/AUTO-Pfad freigeben. Solange kein
+    # explizites Safety-/Nutzer-Veto vorliegt, wird der zuletzt gebundene
+    # flüchtige Ausgang ohne neuen RSCP-Write eingefroren.
+    result.update({
+        "safe_fallback_latched": True,
+        "reason": (
+            "power_settings_target_conflict_freeze_previous_output"
+            if target_conflict
+            else "current_contract_uncertain_freeze_previous_output"
+        ),
+        "target": target,
+        "started_ts": started_ts,
+        "deadline_ts": deadline_ts,
+        "technical_blockers": sorted(technical_blockers),
+    })
+    return result
+
+
+def _phase5_charge_block_wait_safe_fallback(
+    legacy: Dict[str, Any],
+    arbitration: Dict[str, Any],
+    continuation: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Friert den Ausgang nach abgelaufenem Abgleich ohne AUTO-Release ein."""
+
+    result = copy.deepcopy(legacy)
+    diagnostic = copy.deepcopy(arbitration)
+    target = _phase5_power_settings_target(continuation.get("target")) or {}
+    result.update({
+        "state": "direct_marketing_charge_block_wait_safe_fallback",
+        "mode": MODE_AUTO,
+        "mode_name": mode_label(MODE_AUTO),
+        "val": 0,
+        "priority": "direct_marketing",
+        "protected": True,
+        "storage_req_w": 0,
+        "budget_w": 0,
+        "direct_marketing_active": False,
+        "direct_marketing_action": "DIRECT_MARKETING_CHARGE_BLOCK_WAIT_SAFE_FALLBACK",
+        "direct_marketing_target_state": "CHARGE_BLOCK_WAIT",
+        "suppress_rscp_output": True,
+        "auto_limit": {
+            "enabled": True,
+            "release": False,
+            "power_limits_used": True,
+            "max_charge_w": target.get("max_charge_w", 0),
+            "max_discharge_w": target.get("max_discharge_w", 0),
+            "discharge_start_w": target.get("discharge_start_w", 0),
+            "reason": "POWER_SETTINGS-Abgleich abgelaufen; Ausgang bis zu frischem Readback eingefroren.",
+        },
+        "reason": "DV-Ladesperre: Ausgang eingefroren, bis POWER_SETTINGS frisch bestätigt sind.",
+        "display_reason": "Ladesperre wartet auf bestätigte Wechselrichter-Rückmeldung.",
+    })
+    diagnostic.update({
+        "selected": True,
+        "executable": False,
+        "commands_allowed": False,
+        "selected_source": "canonical_phase5_charge_block_wait_safe_fallback",
+        "selected_action": "DIRECT_MARKETING_CHARGE_BLOCK_WAIT_SAFE_FALLBACK",
+        "selected_power_w": 0.0,
+        "requested": False,
+        "attempted": False,
+        "acknowledged": False,
+        "confirmed": False,
+        "issued": False,
+        "hardware_effect": False,
+        "request_attempted_by": None,
+        "request": None,
+        "power_settings_after_request": {
+            **copy.deepcopy(continuation),
+            "requested": copy.deepcopy(target),
+        },
+        "charge_block_request_started_ts": continuation.get("started_ts"),
+        "charge_block_request_deadline_ts": continuation.get("deadline_ts"),
+        "charge_block_safe_fallback": {
+            "active": True,
+            "reason": continuation.get("reason"),
+            "target": target,
+        },
+    })
+    result["storage_dispatch_phase5"] = diagnostic
+    return result
 
 
 def _phase5_economic_export_binding_valid(arbitration: Dict[str, Any]) -> bool:
@@ -18514,6 +21873,27 @@ def apply_storage_dispatch_phase5(
 
     now_value = time.time() if now_s is None else float(now_s)
     baseline = copy.deepcopy(legacy if isinstance(legacy, dict) else {})
+    baseline_state = str(baseline.get("state") or "")
+    if baseline_state in {
+        "peak_shaving_active",
+        "peak_shaving_reserve_hold",
+    }:
+        return _phase5_legacy_fallback(
+            baseline,
+            {
+                "schema_version": "storage_dispatch_phase5_v1",
+                "selected": False,
+                "executable": False,
+                "commands_allowed": False,
+                "selected_source": "legacy_fallback",
+                "selected_action": None,
+                "selected_power_w": 0.0,
+                "blockers": ["PHASE5_PEAK_SHAVING_OWNER_ACTIVE"],
+                "hardware_effect": False,
+            },
+            "PHASE5_PEAK_SHAVING_OWNER_ACTIVE",
+        )
+    path_contract: Dict[str, Any] = {}
     try:
         path_contract = storage_decision_path_contract(baseline, plan)
         arbitration = phase5_arbitration_contract(
@@ -18542,8 +21922,128 @@ def apply_storage_dispatch_phase5(
             "hardware_effect": False,
         }
         return _phase5_legacy_fallback(baseline, arbitration)
+    charge_block_bootstrap = _phase5_charge_block_wait_bootstrap_contract(
+        plan,
+        baseline,
+        arbitration,
+        path_contract,
+        now_value,
+    )
+    if not arbitration.get("selected") and charge_block_bootstrap.get("valid"):
+        arbitration = copy.deepcopy(arbitration)
+        arbitration.update({
+            "selected": True,
+            "executable": True,
+            "commands_allowed": True,
+            "selected_source": "canonical_phase5_charge_block_wait_bootstrap",
+            "selected_action": "CHARGE_BLOCK_WAIT",
+            "selected_power_w": 0.0,
+            "selected_since_ts": now_value,
+            "selection_class": "command_action",
+            "decision_available": True,
+            "block_reason_code": None,
+            "technical_block_reason_code": None,
+            "blockers": [],
+            "technical_blockers": [],
+            "charge_block_wait_bootstrap": charge_block_bootstrap,
+            "plan_resolution": {
+                **(
+                    arbitration.get("plan_resolution")
+                    if isinstance(arbitration.get("plan_resolution"), dict)
+                    else {}
+                ),
+                "valid": True,
+                "current_slot_available": True,
+                "block_reason_code": None,
+                "source": "canonical_direct_marketing_plan",
+            },
+            "shadow_selection": {
+                "would_select": True,
+                "action": "CHARGE_BLOCK_WAIT",
+                "power_w": 0.0,
+                "direction": "hold",
+                "selected_since_ts": now_value,
+                "hardware_effect": False,
+            },
+            "stability": {
+                **(
+                    arbitration.get("stability")
+                    if isinstance(arbitration.get("stability"), dict)
+                    else {}
+                ),
+                "active": True,
+                "reason_code": "CANONICAL_CHARGE_BLOCK_WAIT_BOOTSTRAP",
+            },
+        })
+    continuation = _phase5_charge_block_wait_continuation_contract(
+        arbitration,
+        power_settings if isinstance(power_settings, dict) else {},
+        previous_state,
+        now_value,
+    )
+    if continuation.get("safe_fallback_latched"):
+        return _phase5_charge_block_wait_safe_fallback(
+            baseline,
+            arbitration,
+            continuation,
+        )
+    if not arbitration.get("selected") and continuation.get("valid"):
+        arbitration = copy.deepcopy(arbitration)
+        blockers = [
+            code
+            for code in arbitration.get("blockers") or []
+            if code != "POWER_SETTINGS_NOT_CONFIRMED_STABLE"
+        ]
+        technical_blockers = [
+            code
+            for code in arbitration.get("technical_blockers") or []
+            if code != "POWER_SETTINGS_NOT_CONFIRMED_STABLE"
+        ]
+        arbitration.update({
+            "selected": True,
+            "executable": True,
+            "commands_allowed": True,
+            "selected_source": "canonical_phase5_charge_block_wait_continuation",
+            "selected_action": "CHARGE_BLOCK_WAIT",
+            "selected_power_w": 0.0,
+            "selection_class": "command_action",
+            "block_reason_code": None,
+            "technical_block_reason_code": None,
+            "blockers": blockers,
+            "technical_blockers": technical_blockers,
+            "power_settings_continuation": continuation,
+            "stability": {
+                **(
+                    arbitration.get("stability")
+                    if isinstance(arbitration.get("stability"), dict)
+                    else {}
+                ),
+                "active": True,
+                "reason_code": (
+                    "HEADROOM_CHARGE_BLOCK_LIVE_DIRECTION_REVERSAL"
+                    if str(
+                        (arbitration.get("candidate") or {}).get("action") or ""
+                    ).upper() == "HEADROOM_EXPORT"
+                    else "CHARGE_BLOCK_WAIT_POWER_SETTINGS_CONTINUATION"
+                ),
+            },
+        })
     if not arbitration.get("selected"):
         return _phase5_legacy_fallback(baseline, arbitration)
+
+    if str(arbitration.get("selected_action") or "").upper() == "CHARGE_BLOCK_WAIT":
+        charge_block = _phase5_charge_block_wait_contract(plan, arbitration, now_value)
+        if charge_block.get("valid"):
+            arbitration = copy.deepcopy(arbitration)
+            arbitration.update({
+                "selected_action": "DIRECT_MARKETING_CHARGE_BLOCK_WAIT",
+                "selected_power_w": 0.0,
+                "executable": True,
+                "commands_allowed": True,
+                "selection_class": "charge_block_wait_action",
+                "selected_source": "canonical_phase5_charge_block_wait",
+                "charge_block_contract": charge_block,
+            })
 
     intent_error = _phase5_command_intent_error(arbitration)
     if intent_error:
@@ -18563,33 +22063,245 @@ def apply_storage_dispatch_phase5(
         reason = "Kanonischer Phase-5-Dispatch: %s" % action
         translation: Dict[str, Any] = {"action": action, "requested_power_w": requested_w}
 
-        if action == "PV_STORE":
+        if action == "DIRECT_MARKETING_CHARGE_BLOCK_WAIT":
+            charge_block = arbitration.get("charge_block_contract") if isinstance(arbitration.get("charge_block_contract"), dict) else {}
+            continuation_target = _phase5_power_settings_target(
+                (arbitration.get("power_settings_continuation") or {}).get("target")
+                if isinstance(arbitration.get("power_settings_continuation"), dict)
+                else None
+            )
+            existing_auto = decision.get("auto_limit") if isinstance(decision.get("auto_limit"), dict) else {}
+            existing_discharge_cap = (
+                continuation_target["max_discharge_w"]
+                if continuation_target is not None
+                else max(0, safe_int(existing_auto.get("max_discharge_w"), max_discharge_w))
+                if bool(existing_auto.get("enabled")) and not bool(existing_auto.get("release"))
+                else max_discharge_w
+            )
+            discharge_cap_w = min(max_discharge_w, existing_discharge_cap)
+            reason = "Direktvermarktung: CHARGE_BLOCK_WAIT im kanonisch ausgewählten Planslot"
+            decision.update({
+                "state": "direct_marketing_charge_block_wait",
+                "mode": MODE_AUTO,
+                "val": 0,
+                "priority": "direct_marketing",
+                "protected": False,
+                "storage_req_w": 0,
+                "budget_w": 0,
+                "auto_limit": charge_block_auto_limit(cfg, discharge_cap_w, reason),
+                "direct_marketing_charge_block_wait": charge_block,
+            })
+            translation.update({
+                "translated_power_w": 0,
+                "power_settings_only": True,
+                "power_limits_used": True,
+                "max_charge_w": 0,
+                "max_discharge_w": discharge_cap_w,
+                "requested_charge_cap_w": 0,
+                "bounded_zero_readback_max_w": EMS_POWER_SETTINGS_NONZERO_MIN_W,
+                "readback_contract": "bounded_zero_not_exact_economic_zero",
+            })
+        elif action == "PV_STORE":
+            phase5_direct = direct_marketing_plan(plan)
+            phase5_window = direct_marketing_current_window(
+                phase5_direct,
+                now_value,
+            )
+            if (
+                not isinstance(phase5_window, dict)
+                or str(phase5_window.get("action") or "") not in DIRECT_MARKETING_PV_STORE_ACTIONS
+            ):
+                phase5_window = {}
+            else:
+                phase5_window = dict(phase5_window)
+            window_limit_w = safe_int(phase5_window.get("max_power_w"), 0)
+            phase5_window["max_power_w"] = (
+                min(requested_w, window_limit_w)
+                if window_limit_w > 0
+                else requested_w
+            )
+            phase5_flags = (
+                dict(phase5_direct.get("flags"))
+                if isinstance(phase5_direct.get("flags"), dict)
+                else {}
+            )
+            flags_limit_w = safe_int(phase5_flags.get("pv_store_max_w"), 0)
+            phase5_flags["pv_store_max_w"] = (
+                min(requested_w, flags_limit_w)
+                if flags_limit_w > 0
+                else requested_w
+            )
             control = direct_marketing_pv_store_control_w(
                 cfg,
                 live,
-                {"max_power_w": requested_w},
-                {"pv_store_max_w": requested_w},
+                phase5_window,
+                phase5_flags,
                 min(max_charge_w, requested_w),
                 now_value,
             )
             translation["pv_store_control"] = control
-            if control.get("blocked"):
-                return _phase5_legacy_fallback(baseline, arbitration, "PHASE5_PV_STORE_LIVE_GUARD")
             charge_w = min(requested_w, max_charge_w, max(0, safe_int(control.get("charge_w"), 0)))
-            if charge_w < 300:
-                return _phase5_legacy_fallback(baseline, arbitration, "PHASE5_PV_STORE_BELOW_MINIMUM")
-            decision.update({
-                "state": "direct_marketing_phase5_pv_store",
-                "mode": MODE_AUTO,
-                "val": charge_w,
-                "priority": "direct_marketing",
-                "protected": False,
-                "storage_req_w": charge_w,
-                "budget_w": charge_w,
-                "auto_limit": charge_cap_auto_limit(cfg, charge_w, max_discharge_w, reason),
-                "direct_marketing_pv_store_control": control,
-            })
-            translation["translated_power_w"] = charge_w
+            wait_control = dict(control)
+            if not control.get("blocked") and charge_w < 300:
+                wait_control.update({
+                    "blocked": True,
+                    "blocker": "pv_store_charge_power_below_min",
+                    "charge_w": charge_w,
+                })
+            pv_store_wait = _phase5_pv_store_wait_contract(
+                cfg,
+                plan,
+                arbitration,
+                wait_control,
+                previous_state,
+                now_value,
+            )
+            dc_first_limit_enabled = cfg_bool(
+                cfg,
+                "storage_dc_first_charge_limit_enable",
+                False,
+            )
+            pv_store_blocked = bool(control.get("blocked"))
+            pv_store_below_minimum = charge_w < 300
+            if dc_first_limit_enabled and (
+                pv_store_blocked or pv_store_below_minimum
+            ):
+                wait_control = dict(control)
+                wait_control["blocked"] = True
+                if not pv_store_blocked:
+                    wait_control["blocker"] = "storage_dc_first_charge_wait"
+                wait_decision = direct_marketing_dc_first_charge_wait_decision(
+                    cfg,
+                    wait_control,
+                    "direct_marketing_phase5_pv_store",
+                    max_discharge_w,
+                    reason_prefix="Kanonischer Phase-5-Dispatch PV-Speichern",
+                )
+                if not isinstance(wait_decision, dict):
+                    return _phase5_legacy_fallback(
+                        baseline,
+                        arbitration,
+                        "PHASE5_PV_STORE_WAIT_CONTRACT_MISSING",
+                    )
+                decision.update(wait_decision)
+                decision.update({
+                    "priority": "direct_marketing",
+                    "protected": False,
+                    "direct_marketing_pv_store_control": control,
+                })
+                reason = str(wait_decision.get("reason") or reason)
+                translation.update({
+                    "translated_power_w": 0,
+                    "dc_first_wait": True,
+                    "dc_first_wait_blocker": wait_control.get("blocker"),
+                    "pv_store_wait": pv_store_wait,
+                })
+            elif pv_store_wait.get("active"):
+                action = "DIRECT_MARKETING_CHARGE_BLOCK_WAIT"
+                arbitration = copy.deepcopy(arbitration)
+                arbitration.update({
+                    "selected": True,
+                    "executable": True,
+                    "commands_allowed": True,
+                    "selected_source": "canonical_phase5_pv_store_wait",
+                    "selected_action": action,
+                    "selected_power_w": 0.0,
+                    "selection_class": "pv_store_wait_action",
+                    "charge_block_contract": {
+                        "schema": "phase5_pv_store_wait_charge_block_v1",
+                        "valid": True,
+                        "reason": pv_store_wait.get("reason"),
+                        "source_window": {
+                            "slot_id": arbitration.get("slot_id"),
+                            "window_id": pv_store_wait.get("window_id"),
+                            "action_id": pv_store_wait.get("action_id"),
+                            "segment_id": pv_store_wait.get("segment_id"),
+                            "action": "PV_STORE",
+                        },
+                    },
+                    "pv_store_wait": pv_store_wait,
+                })
+                existing_auto = (
+                    decision.get("auto_limit")
+                    if isinstance(decision.get("auto_limit"), dict)
+                    else {}
+                )
+                existing_discharge_cap = (
+                    max(0, safe_int(existing_auto.get("max_discharge_w"), max_discharge_w))
+                    if bool(existing_auto.get("enabled"))
+                    and not bool(existing_auto.get("release"))
+                    else max_discharge_w
+                )
+                discharge_cap_w = min(max_discharge_w, existing_discharge_cap)
+                reason = (
+                    "Direktvermarktung: PV-Speicherfenster wartet stabil "
+                    "auf ausreichendes E3DC-DC-Angebot"
+                )
+                decision.update({
+                    "state": _PHASE5_PV_STORE_WAIT_STATE,
+                    "mode": MODE_AUTO,
+                    "val": 0,
+                    "priority": "direct_marketing",
+                    "protected": False,
+                    "storage_req_w": 0,
+                    "budget_w": 0,
+                    "auto_limit": charge_block_auto_limit(
+                        cfg,
+                        discharge_cap_w,
+                        reason,
+                    ),
+                    "direct_marketing_pv_store_control": control,
+                    "direct_marketing_pv_store_wait": pv_store_wait,
+                })
+                translation.update({
+                    "action": action,
+                    "translated_power_w": 0,
+                    "power_settings_only": True,
+                    "power_limits_used": True,
+                    "max_charge_w": 0,
+                    "max_discharge_w": discharge_cap_w,
+                    "requested_charge_cap_w": 0,
+                    "bounded_zero_readback_max_w": EMS_POWER_SETTINGS_NONZERO_MIN_W,
+                    "readback_contract": "bounded_zero_not_exact_economic_zero",
+                    "pv_store_wait": pv_store_wait,
+                })
+            elif control.get("blocked"):
+                return _phase5_legacy_fallback(
+                    baseline,
+                    arbitration,
+                    "PHASE5_PV_STORE_LIVE_GUARD",
+                )
+            elif charge_w < 300:
+                return _phase5_legacy_fallback(
+                    baseline,
+                    arbitration,
+                    "PHASE5_PV_STORE_BELOW_MINIMUM",
+                )
+            else:
+                decision.update({
+                    "state": "direct_marketing_phase5_pv_store",
+                    "mode": MODE_AUTO,
+                    "val": charge_w,
+                    "priority": "direct_marketing",
+                    "protected": False,
+                    "storage_req_w": charge_w,
+                    "budget_w": charge_w,
+                    "auto_limit": charge_cap_auto_limit(cfg, charge_w, max_discharge_w, reason),
+                    "direct_marketing_pv_store_control": control,
+                })
+                decision = apply_storage_dc_first_charge_limit(
+                    cfg,
+                    live,
+                    decision,
+                    max_charge_w,
+                    max_discharge_w,
+                    previous_state=previous_state,
+                    now_s=now_value,
+                )
+                translation["translated_power_w"] = max(
+                    0,
+                    safe_int(decision.get("val"), 0),
+                )
         elif action == "HOUSE_SUPPLY":
             local_deficit_w = direct_marketing_local_deficit_w(live)
             discharge_w = min(requested_w, max_discharge_w, max(0, int(local_deficit_w)))
@@ -18673,7 +22385,11 @@ def apply_storage_dispatch_phase5(
             "display_reason": reason,
             "direct_marketing_active": True,
             "direct_marketing_action": action,
-            "direct_marketing_target_state": action,
+            "direct_marketing_target_state": (
+                "CHARGE_BLOCK_WAIT"
+                if action == "DIRECT_MARKETING_CHARGE_BLOCK_WAIT"
+                else action
+            ),
             "storage_dispatch_selected_plan_id": arbitration.get("plan_id"),
             "storage_dispatch_selected_slot_id": arbitration.get("slot_id"),
         })
@@ -18687,7 +22403,11 @@ def apply_storage_dispatch_phase5(
         arbitration["translated_power_w"] = decision.get("val")
         arbitration["translated_state"] = decision.get("state")
         arbitration["execution_intent"] = {
-            "class": "authorized_command",
+            "class": (
+                "authorized_charge_block"
+                if action == "DIRECT_MARKETING_CHARGE_BLOCK_WAIT"
+                else "authorized_command"
+            ),
             "authorized": True,
             "action": action,
             "power_w": max(0, safe_int(decision.get("val"), 0)),
@@ -18717,6 +22437,233 @@ def _rscp_runtime_settings_complete(settings: Tuple[str, int, str, str, str]) ->
     )
 
 
+def recheck_direct_marketing_pv_store_before_send(
+    cfg: Dict[str, Any],
+    live: Dict[str, Any],
+    plan: Dict[str, Any],
+    payload: Dict[str, Any],
+    *,
+    now_s: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Wiederholt den vollständigen PV-Quellvertrag unmittelbar vor RSCP."""
+
+    state = str(payload.get("state") or "")
+    action = str(payload.get("direct_marketing_action") or "")
+    is_pv_store = bool(
+        payload.get("direct_marketing_active")
+        and (
+            action in DIRECT_MARKETING_PV_STORE_ACTIONS
+            or "pv_store" in state
+        )
+        and max(0, safe_int(payload.get("val"), 0)) >= 300
+    )
+    if not is_pv_store:
+        return {"evaluated": False, "reason": "not_pv_store"}
+
+    direct = direct_marketing_plan(plan)
+    window = direct_marketing_current_window(
+        direct,
+        time.time() if now_s is None else float(now_s),
+    )
+    if not isinstance(window, dict):
+        window = {}
+    flags = direct.get("flags") if isinstance(direct.get("flags"), dict) else {}
+    requested_w = max(0, safe_int(payload.get("val"), 0))
+    max_charge_w = min(
+        requested_w,
+        configured_charge_limit_w(
+            cfg,
+            live,
+            now_s=now_s,
+        ),
+    )
+    control = direct_marketing_pv_store_control_w(
+        cfg,
+        live,
+        window,
+        flags,
+        max_charge_w,
+        now_s,
+    )
+    dc_first_limit_enabled = cfg_bool(
+        cfg,
+        "storage_dc_first_charge_limit_enable",
+        False,
+    )
+    current_auto_limit = (
+        payload.get("auto_limit")
+        if isinstance(payload.get("auto_limit"), dict)
+        else {}
+    )
+    max_discharge_w = max(
+        0,
+        safe_int(
+            current_auto_limit.get("max_discharge_w"),
+            safe_int(payload.get("max_discharge_w"), 0),
+        ),
+    )
+    source_contract = (
+        control.get("source_contract")
+        if isinstance(control.get("source_contract"), dict)
+        else {}
+    )
+    legacy_hold_allowed = bool(
+        control.get("blocked")
+        and payload.get("direct_marketing_pv_store_release_hold_active")
+        and source_contract.get("legacy_dc_only_migration")
+        and source_contract.get("dc_only") is True
+        and source_contract.get("aux_ac_storage_allowed") is False
+        and source_contract.get("grid_ac_allowed") is False
+        and max(0, safe_int(control.get("grid_import_w"), 0))
+        <= max(0, safe_int(control.get("import_guard_w"), 0))
+        and max(0, safe_int(control.get("pv_external_ac_w"), 0))
+        <= max(0, safe_int(control.get("external_ac_guard_w"), 100))
+    )
+    if control.get("blocked") and not legacy_hold_allowed:
+        blocker = str(control.get("blocker") or "pv_store_runtime_guard")
+        if dc_first_limit_enabled:
+            wait_control = dict(control)
+            wait_control["blocked"] = True
+            wait_control["blocker"] = blocker
+            wait_decision = direct_marketing_dc_first_charge_wait_decision(
+                cfg,
+                wait_control,
+                state,
+                max_discharge_w,
+                reason_prefix="PV-Speicherladung unmittelbar vor RSCP",
+            )
+            if isinstance(wait_decision, dict):
+                payload.update(wait_decision)
+                payload["mode_name"] = mode_label(MODE_AUTO)
+                result = {
+                    "evaluated": True,
+                    "allowed": False,
+                    "blocker": blocker,
+                    "requested_w": requested_w,
+                    "final_w": 0,
+                    "control": control,
+                    "single_output_owner": "storage_manager",
+                    "grid_ac_allowed": False,
+                    "dc_first_wait": True,
+                }
+                payload["direct_marketing_pv_store_runtime_recheck"] = result
+                return result
+        payload.update({
+            "mode": MODE_AUTO,
+            "mode_name": mode_label(MODE_AUTO),
+            "val": 0,
+            "storage_req_w": 0,
+            "budget_w": 0,
+            "protected": False,
+            "state": "direct_marketing_pv_store_runtime_veto",
+            "reason": "PV-Speicherladung unmittelbar vor RSCP sicher gesperrt: %s" % blocker,
+            "display_reason": "PV-Speicherladung unmittelbar vor RSCP sicher gesperrt: %s" % blocker,
+            "auto_limit": {
+                "enabled": False,
+                "release": True,
+                "set_power_auto": False,
+                "reason": "direct_marketing_pv_store_runtime_veto",
+            },
+        })
+        result = {
+            "evaluated": True,
+            "allowed": False,
+            "blocker": blocker,
+            "requested_w": requested_w,
+            "final_w": 0,
+            "control": control,
+            "single_output_owner": "storage_manager",
+            "grid_ac_allowed": False,
+        }
+        payload["direct_marketing_pv_store_runtime_recheck"] = result
+        return result
+
+    final_w = requested_w
+    if not legacy_hold_allowed:
+        final_w = min(
+            requested_w,
+            max(0, safe_int(control.get("charge_w"), 0)),
+            max(0, safe_int(control.get("pv_safe_cap_w"), 0)),
+        )
+    if final_w < 300:
+        if dc_first_limit_enabled:
+            wait_control = dict(control)
+            wait_control.update({
+                "blocked": True,
+                "blocker": "storage_dc_first_charge_wait",
+                "charge_w": final_w,
+            })
+            wait_decision = direct_marketing_dc_first_charge_wait_decision(
+                cfg,
+                wait_control,
+                state,
+                max_discharge_w,
+                reason_prefix="PV-Speicherladung unmittelbar vor RSCP",
+            )
+            if isinstance(wait_decision, dict):
+                payload.update(wait_decision)
+                payload["mode_name"] = mode_label(MODE_AUTO)
+                result = {
+                    "evaluated": True,
+                    "allowed": False,
+                    "blocker": "storage_dc_first_charge_wait",
+                    "requested_w": requested_w,
+                    "final_w": 0,
+                    "control": control,
+                    "single_output_owner": "storage_manager",
+                    "grid_ac_allowed": False,
+                    "dc_first_wait": True,
+                }
+                payload["direct_marketing_pv_store_runtime_recheck"] = result
+                return result
+        payload.update({
+            "mode": MODE_AUTO,
+            "mode_name": mode_label(MODE_AUTO),
+            "val": 0,
+            "storage_req_w": 0,
+            "budget_w": 0,
+            "protected": False,
+            "state": "direct_marketing_pv_store_runtime_veto",
+            "reason": "PV-Speicherladung unmittelbar vor RSCP unter Mindestleistung gesperrt.",
+            "display_reason": "PV-Speicherladung unmittelbar vor RSCP unter Mindestleistung gesperrt.",
+            "auto_limit": {
+                "enabled": False,
+                "release": True,
+                "set_power_auto": False,
+                "reason": "direct_marketing_pv_store_runtime_below_minimum",
+            },
+        })
+        allowed = False
+        blocker = "pv_store_runtime_below_minimum"
+    else:
+        payload["val"] = final_w
+        payload["storage_req_w"] = final_w
+        payload["direct_marketing_pv_store_w"] = final_w
+        auto_limit = payload.get("auto_limit") if isinstance(payload.get("auto_limit"), dict) else {}
+        if auto_limit.get("enabled") and not auto_limit.get("release"):
+            payload["auto_limit"] = charge_cap_auto_limit(
+                cfg,
+                final_w,
+                safe_int(payload.get("max_discharge_w"), 0),
+                str(payload.get("reason") or "direct_marketing_pv_store_runtime_recheck"),
+            )
+        allowed = True
+        blocker = None
+    result = {
+        "evaluated": True,
+        "allowed": allowed,
+        "blocker": blocker,
+        "requested_w": requested_w,
+        "final_w": final_w if allowed else 0,
+        "legacy_dc_only_hold": legacy_hold_allowed,
+        "control": control,
+        "single_output_owner": "storage_manager",
+        "grid_ac_allowed": False,
+    }
+    payload["direct_marketing_pv_store_runtime_recheck"] = result
+    return result
+
+
 def execute_rscp_cycle(ctrl: BattCtrl, payload: Dict[str, Any]) -> Dict[str, Any]:
     """Bindet Live-Readback, Soll und Ausgang in genau einem Managerzyklus."""
     payload_auto_limit = payload.get("auto_limit") if isinstance(payload.get("auto_limit"), dict) else {}
@@ -18741,6 +22688,19 @@ def execute_rscp_cycle(ctrl: BattCtrl, payload: Dict[str, Any]) -> Dict[str, Any
             and payload.get("grid_power_valid", True)
         ),
     )
+    before_send = ctrl.power_settings_diagnostics()
+    before_set_requests = max(0, safe_int(before_send.get("set_requests"), 0))
+    if payload.get("suppress_rscp_output") is True:
+        payload["rscp_command_path"] = "suppressed_safe_fallback"
+        payload["rscp_request_transaction"] = {
+            "schema": "rscp_request_transaction_v1",
+            "send_called": False,
+            "set_request_delta": 0,
+            "wire_write_attempted": False,
+            "reason": "phase5_safe_fallback_no_output",
+        }
+        payload["rscp_power_settings"] = ctrl.power_settings_diagnostics()
+        return payload["rscp_power_settings"]
     ctrl.send(
         payload["mode"],
         payload["val"],
@@ -18751,7 +22711,106 @@ def execute_rscp_cycle(ctrl: BattCtrl, payload: Dict[str, Any]) -> Dict[str, Any
         auto_limit=payload_auto_limit,
     )
     payload["rscp_power_settings"] = ctrl.power_settings_diagnostics()
+    after_set_requests = max(
+        before_set_requests,
+        safe_int(payload["rscp_power_settings"].get("set_requests"), before_set_requests),
+    )
+    set_request_delta = max(0, after_set_requests - before_set_requests)
+    payload["rscp_request_transaction"] = {
+        "schema": "rscp_request_transaction_v1",
+        "send_called": True,
+        "set_request_delta": set_request_delta,
+        "wire_write_attempted": set_request_delta > 0,
+        "reason": "manager_single_output",
+    }
     return payload["rscp_power_settings"]
+
+
+def _phase5_charge_block_confirmation(
+    payload: Dict[str, Any],
+    target: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Beweist ACK und Wirkung nur für exakt denselben frischen Zielvertrag."""
+
+    diag = (
+        payload.get("rscp_power_settings")
+        if isinstance(payload.get("rscp_power_settings"), dict)
+        else {}
+    )
+    requested = _phase5_power_settings_target(diag.get("requested"))
+    readback = _phase5_power_settings_target(diag.get("readback"))
+    bounded_zero_w = max(
+        0,
+        safe_int(diag.get("bounded_zero_w"), EMS_POWER_SETTINGS_NONZERO_MIN_W),
+    )
+    target_match = requested == target
+    readback_match = bool(
+        readback
+        and readback["limits_used"] is True
+        and 0 <= readback["max_charge_w"] <= bounded_zero_w
+        and readback["max_discharge_w"] == target["max_discharge_w"]
+        and readback["discharge_start_w"] == target["discharge_start_w"]
+    )
+    evidence_ts = safe_float(diag.get("readback_cycle_ts"), 0.0)
+    if evidence_ts > 100_000_000_000.0:
+        evidence_ts /= 1000.0
+    reference_ts = safe_float(payload.get("ts"), time.time())
+    if reference_ts > 100_000_000_000.0:
+        reference_ts /= 1000.0
+    evidence_age_s = reference_ts - evidence_ts if evidence_ts > 0.0 else float("inf")
+    fresh = bool(-5.0 <= evidence_age_s <= 30.0)
+    status = str(diag.get("status") or "")
+    direct_status = status in {
+        "confirmed",
+        "confirmed_bounded_zero",
+        "confirmed_nonoptimal",
+        "confirmed_from_get_ack_unknown",
+    }
+    reconciled_status = status in {
+        "confirmed_from_live_readback",
+        "confirmed_unchanged",
+    }
+    same_cycle_proof = bool(
+        (direct_status and (payload.get("rscp_request_transaction") or {}).get("wire_write_attempted") is True)
+        or (reconciled_status and payload.get("rscp_power_settings_reconciled") is True)
+    )
+    response_codes = diag.get("response_codes")
+    positive_set_response = bool(
+        isinstance(response_codes, list)
+        and len(response_codes) >= 4
+        and all(
+            isinstance(code, int)
+            and not isinstance(code, bool)
+            and code in (0, 1)
+            for code in response_codes
+        )
+    )
+    acknowledged: Optional[bool]
+    if target_match and (diag.get("acknowledged") is True or positive_set_response):
+        acknowledged = True
+    elif target_match and diag.get("acknowledged") is None and status == "confirmed_from_get_ack_unknown":
+        acknowledged = None
+    else:
+        acknowledged = False
+    confirmed = bool(
+        diag.get("schema") == "rscp_power_settings_v1"
+        and safe_int(diag.get("contract_version"), 0) == 2
+        and diag.get("confirmed") is True
+        and target_match
+        and readback_match
+        and fresh
+        and same_cycle_proof
+    )
+    return {
+        "target_match": target_match,
+        "readback_match": readback_match,
+        "fresh": fresh,
+        "evidence_age_s": round(evidence_age_s, 3) if math.isfinite(evidence_age_s) else None,
+        "same_cycle_proof": same_cycle_proof,
+        "acknowledged": acknowledged,
+        "confirmed": confirmed,
+        "status": status or None,
+    }
 
 
 def finalize_storage_dispatch_phase5_request(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -18764,35 +22823,135 @@ def finalize_storage_dispatch_phase5_request(payload: Dict[str, Any]) -> Dict[st
     intent = phase5.get("execution_intent") if isinstance(phase5.get("execution_intent"), dict) else {}
     translation = phase5.get("translation") if isinstance(phase5.get("translation"), dict) else {}
     translated_power_w = max(0, safe_int(translation.get("translated_power_w"), phase5.get("translated_power_w", 0)))
+    charge_block = action == "DIRECT_MARKETING_CHARGE_BLOCK_WAIT"
     request_authorized = bool(
-        action in _PHASE5_COMMAND_ACTIONS
-        and phase5.get("selected")
+        (
+            action in _PHASE5_COMMAND_ACTIONS
+            and not charge_block
+            and translated_power_w >= 300
+            and intent.get("class") == "authorized_command"
+            and max(0, safe_int(payload.get("val"), 0)) >= 300
+        )
+        or (
+            charge_block
+            and phase5.get("selected")
+            and phase5.get("executable")
+            and phase5.get("commands_allowed")
+            and intent.get("class") == "authorized_charge_block"
+            and intent.get("authorized") is True
+            and str(intent.get("action") or "").upper() == action
+            and str(translation.get("action") or "").upper() == action
+            and safe_int(payload.get("mode"), MODE_AUTO) == MODE_AUTO
+            and bool((payload.get("auto_limit") or {}).get("enabled"))
+            and not bool((payload.get("auto_limit") or {}).get("release"))
+            and (payload.get("auto_limit") or {}).get("power_limits_used") is True
+            and safe_int((payload.get("auto_limit") or {}).get("max_charge_w"), -1) == 0
+        )
+    ) and bool(
+        phase5.get("selected")
         and phase5.get("executable")
         and phase5.get("commands_allowed")
         and intent.get("authorized") is True
-        and intent.get("class") == "authorized_command"
         and str(intent.get("action") or "").upper() == action
         and str(translation.get("action") or "").upper() == action
-        and translated_power_w >= 300
         and payload.get("direct_marketing_active") is True
         and str(payload.get("priority") or "").lower() == "direct_marketing"
-        and max(0, safe_int(payload.get("val"), 0)) >= 300
+    )
+    transaction = (
+        payload.get("rscp_request_transaction")
+        if isinstance(payload.get("rscp_request_transaction"), dict)
+        else {}
+    )
+    attempted = bool(
+        request_authorized
+        and (
+            (
+                charge_block
+                and transaction.get("wire_write_attempted") is True
+                and safe_int(transaction.get("set_request_delta"), 0) > 0
+            )
+            or not charge_block
+        )
+    )
+    target = None
+    confirmation = {
+        "acknowledged": False,
+        "confirmed": False,
+        "target_match": False,
+        "readback_match": False,
+        "same_cycle_proof": False,
+        "status": None,
+    }
+    if charge_block and request_authorized:
+        auto_limit = payload.get("auto_limit") if isinstance(payload.get("auto_limit"), dict) else {}
+        target = _phase5_power_settings_target({
+            "limits_used": True,
+            "max_charge_w": 0,
+            "max_discharge_w": max(0, safe_int(auto_limit.get("max_discharge_w"), 0)),
+            "discharge_start_w": max(0, safe_int(auto_limit.get("discharge_start_w"), 0)),
+        })
+        if target is not None:
+            confirmation = _phase5_charge_block_confirmation(payload, target)
+    acknowledged = confirmation.get("acknowledged") if charge_block else request_authorized
+    confirmed = bool(confirmation.get("confirmed")) if charge_block else request_authorized
+    issued = bool(
+        request_authorized
+        and (
+            (charge_block and (acknowledged is True or confirmed))
+            or not charge_block
+        )
     )
     phase5["requested"] = request_authorized
-    phase5["issued"] = request_authorized
-    phase5["request_attempted_by"] = "storage_manager" if request_authorized else None
-    phase5["hardware_effect"] = request_authorized
+    phase5["attempted"] = attempted
+    phase5["acknowledged"] = acknowledged if request_authorized else False
+    phase5["confirmed"] = confirmed if request_authorized else False
+    phase5["issued"] = issued
+    phase5["request_attempted_by"] = "storage_manager" if attempted else None
+    phase5["hardware_effect"] = confirmed if charge_block else request_authorized
+    phase5["request_lifecycle"] = {
+        "requested": request_authorized,
+        "attempted": attempted,
+        "acknowledged": phase5["acknowledged"],
+        "issued": issued,
+        "confirmed": phase5["confirmed"],
+        "hardware_effect": phase5["hardware_effect"],
+        "confirmation": confirmation if charge_block and request_authorized else None,
+    }
+    bounded_zero_readback = {
+        "requested_charge_cap_w": 0,
+        "accepted_readback_max_w": EMS_POWER_SETTINGS_NONZERO_MIN_W,
+        "contract": "bounded_zero_not_exact_economic_zero",
+        "power_settings": copy.deepcopy(payload.get("rscp_power_settings")),
+    } if charge_block and request_authorized else None
     phase5["request"] = {
         "mode": payload.get("mode_name"),
         "mode_value": payload.get("mode"),
         "power_w": payload.get("val"),
         "rscp_path": payload.get("rscp_command_path"),
+        "kind": "power_settings_charge_block_wait" if charge_block else "power_command",
+        "target": copy.deepcopy(target),
+        "bounded_zero_readback": bounded_zero_readback,
     } if request_authorized else None
     phase5["power_settings_after_request"] = (
         copy.deepcopy(payload.get("rscp_power_settings"))
         if request_authorized
         else None
     )
+    if charge_block and request_authorized:
+        continuation = (
+            phase5.get("power_settings_continuation")
+            if isinstance(phase5.get("power_settings_continuation"), dict)
+            else {}
+        )
+        started_ts = safe_float(
+            continuation.get("started_ts"),
+            safe_float(phase5.get("charge_block_request_started_ts"), safe_float(payload.get("ts"), time.time())),
+        )
+        phase5["charge_block_request_started_ts"] = started_ts
+        phase5["charge_block_request_deadline_ts"] = safe_float(
+            continuation.get("deadline_ts"),
+            started_ts + _PHASE5_CHARGE_BLOCK_RETRY_WINDOW_S,
+        )
     return phase5
 
 
@@ -18802,7 +22961,15 @@ def main() -> None:
     cfg_ts = time.time()
     rscp_settings = rscp_settings_from_cfg(cfg)
     ctrl: Optional[BattCtrl] = BattCtrl(*rscp_settings) if _rscp_runtime_settings_complete(rscp_settings) else None
-    previous_state: Dict[str, Any] = {}
+    persisted_peak_shaving = read_json_file(
+        PEAK_SHAVING_STATE_F,
+        max_age_s=2 * 60 * 60,
+    )
+    previous_state: Dict[str, Any] = (
+        {"peak_shaving": persisted_peak_shaving}
+        if isinstance(persisted_peak_shaving, dict)
+        else {}
+    )
     last_decision_log_sig: Optional[Tuple[Any, ...]] = None
     while not _stop:
         start = time.time()
@@ -18902,6 +23069,27 @@ def main() -> None:
             previous_state,
             now_s=start,
         )
+        recheck_direct_marketing_pv_store_before_send(
+            cfg,
+            live,
+            plan,
+            payload,
+            now_s=time.time(),
+        )
+        # Phase 5 und die unmittelbare Quellenprüfung liegen absichtlich vor
+        # dem einzigen RSCP-Ausgang. Die veröffentlichte Anzeige muss deshalb
+        # den finalen Hardwarevertrag und nicht die frühere Vorentscheidung
+        # beschreiben.
+        phase5_display = build_display(payload)
+        payload.update(phase5_display)
+        if isinstance(payload.get("budget"), dict):
+            payload["budget"].update({
+                "manager_title": phase5_display["manager_title"],
+                "control_owner": phase5_display.get("control_owner", ""),
+                "control_owner_label": phase5_display.get("control_owner_label", ""),
+                "state_label": phase5_display["state_label"],
+                "display_reason": phase5_display["display_reason"],
+            })
         payload_auto_limit = payload.get("auto_limit") if isinstance(payload.get("auto_limit"), dict) else {}
         if payload_auto_limit and payload_auto_limit.get("enabled"):
             cycle_s = max(1.0, min(3.0, safe_float(payload_auto_limit.get("heartbeat_s"), auto_limit_heartbeat_s(cfg))))
@@ -18952,6 +23140,7 @@ def main() -> None:
             payload["direct_marketing_aux_inverter_shelly"] = fallback_state
             log.debug("DV-Shelly-Zusatz-WR-Check konnte nicht ausgeführt werden: %s", exc)
         write_state(payload, plan)
+        write_peak_shaving_interval_state(payload)
         write_wb_budget(payload)
         decision_history_due = _history_event_write_due(payload, _decision_history_event_state, now_s=start)
         try:

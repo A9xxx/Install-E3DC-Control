@@ -28,6 +28,7 @@ DISABLED_MODE = "disabled"
 VALID_ACTIONS = {
     "HOLD",
     "PV_STORE",
+    "CHARGE_BLOCK_WAIT",
     "GRID_CHARGE",
     "HOUSE_SUPPLY",
     "ECONOMIC_EXPORT",
@@ -592,7 +593,51 @@ def _live_contract(live: Dict[str, Any], legacy: Dict[str, Any], now_ms: int) ->
     return {"valid": valid, "age_s": round(age_s, 3) if age_s is not None else None, **required}
 
 
-def _power_settings_contract(settings: Dict[str, Any]) -> Dict[str, Any]:
+def _typed_power_settings_values(values: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(values, dict) or not isinstance(values.get("limits_used"), bool):
+        return None
+    numeric = {}
+    for key in ("max_charge_w", "max_discharge_w", "discharge_start_w"):
+        value = values.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            return None
+        numeric[key] = value
+    return {"limits_used": values["limits_used"], **numeric}
+
+
+def _power_settings_values_match(
+    requested: Any,
+    readback: Any,
+    bounded_zero_w: Any,
+) -> bool:
+    target = _typed_power_settings_values(requested)
+    actual = _typed_power_settings_values(readback)
+    if target is None or actual is None or actual["limits_used"] is not target["limits_used"]:
+        return False
+    if target["limits_used"] is False:
+        return True
+    bounded = (
+        int(bounded_zero_w)
+        if isinstance(bounded_zero_w, int)
+        and not isinstance(bounded_zero_w, bool)
+        and bounded_zero_w >= 0
+        else 0
+    )
+    charge_matches = actual["max_charge_w"] == target["max_charge_w"]
+    if target["max_charge_w"] == 0 and bounded > 0:
+        charge_matches = 0 <= actual["max_charge_w"] <= bounded
+    return bool(
+        charge_matches
+        and actual["max_discharge_w"] == target["max_discharge_w"]
+        and actual["discharge_start_w"] == target["discharge_start_w"]
+    )
+
+
+def _power_settings_contract(
+    settings: Dict[str, Any],
+    *,
+    now_ms: Optional[int] = None,
+) -> Dict[str, Any]:
     settings = settings if isinstance(settings, dict) else {}
     status = str(settings.get("status") or "")
     retry_value = settings.get("retry_remaining_s")
@@ -613,90 +658,105 @@ def _power_settings_contract(settings: Dict[str, Any]) -> Dict[str, Any]:
         and retry_s == 0.0
         and pending_s == 0.0
     )
+    schema_valid = bool(
+        settings.get("schema") == POWER_SETTINGS_SCHEMA
+        and settings.get("contract_version") == POWER_SETTINGS_CONTRACT_VERSION
+    )
+    evidence_ts_ms = _int(
+        settings.get("readback_cycle_ts", settings.get("ts")),
+        0,
+    )
+    if 0 < evidence_ts_ms < 100_000_000_000:
+        evidence_ts_ms *= 1000
+    evidence_age_s = (
+        (int(now_ms) - evidence_ts_ms) / 1000.0
+        if now_ms is not None and evidence_ts_ms > 0
+        else None
+    )
+    evidence_fresh = bool(
+        evidence_ts_ms > 0
+        and (
+            evidence_age_s is None
+            or -5.0 <= evidence_age_s <= 30.0
+        )
+    )
+    readback = settings.get("readback")
+    requested = settings.get("requested")
+    readback_values_valid = _typed_power_settings_values(readback) is not None
+    target_values_match = _power_settings_values_match(
+        requested,
+        readback,
+        settings.get("bounded_zero_w"),
+    )
     live_readback_valid = True
     if status == POWER_SETTINGS_LIVE_READBACK_STATUS:
-        readback = settings.get("readback") if isinstance(settings.get("readback"), dict) else {}
         live_readback_valid = bool(
-            settings.get("schema") == POWER_SETTINGS_SCHEMA
-            and settings.get("contract_version") == POWER_SETTINGS_CONTRACT_VERSION
+            schema_valid
             and settings.get("stage") == "live_reconciliation"
             and settings.get("readback_source") == "canonical_live"
             and ("fresh" not in settings or settings.get("fresh") is True)
             and ("valid" not in settings or settings.get("valid") is True)
-            and isinstance(readback.get("limits_used"), bool)
-            and all(
-                isinstance(readback.get(key), int)
-                and not isinstance(readback.get(key), bool)
-                and readback.get(key) >= 0
-                for key in ("max_charge_w", "max_discharge_w", "discharge_start_w")
-            )
+            and readback_values_valid
+            and evidence_fresh
         )
     get_ack_unknown_valid = True
     if status == POWER_SETTINGS_GET_ACK_UNKNOWN_STATUS:
-        requested = settings.get("requested") if isinstance(settings.get("requested"), dict) else {}
-        readback = settings.get("readback") if isinstance(settings.get("readback"), dict) else {}
-        requested_limits_used = requested.get("limits_used")
-        readback_limits_used = readback.get("limits_used")
-        requested_values_valid = bool(
-            isinstance(requested_limits_used, bool)
-            and all(
-                isinstance(requested.get(key), int)
-                and not isinstance(requested.get(key), bool)
-                and requested.get(key) >= 0
-                for key in ("max_charge_w", "max_discharge_w", "discharge_start_w")
-            )
-        )
-        readback_values_valid = bool(
-            isinstance(readback_limits_used, bool)
-            and all(
-                isinstance(readback.get(key), int)
-                and not isinstance(readback.get(key), bool)
-                and readback.get(key) >= 0
-                for key in ("max_charge_w", "max_discharge_w", "discharge_start_w")
-            )
-        )
-        bounded_zero_w = settings.get("bounded_zero_w")
-        bounded_zero_valid = bool(
-            isinstance(bounded_zero_w, int)
-            and not isinstance(bounded_zero_w, bool)
-            and bounded_zero_w >= 0
-        )
-        values_match = False
-        if requested_values_valid and readback_values_valid and bounded_zero_valid:
-            if requested_limits_used is False and readback_limits_used is False:
-                values_match = True
-            elif requested_limits_used is True and readback_limits_used is True:
-                requested_charge_w = requested["max_charge_w"]
-                readback_charge_w = readback["max_charge_w"]
-                charge_matches = readback_charge_w == requested_charge_w
-                if requested_charge_w == 0 and bounded_zero_w > 0:
-                    charge_matches = 0 <= readback_charge_w <= bounded_zero_w
-                values_match = bool(
-                    charge_matches
-                    and readback["max_discharge_w"] == requested["max_discharge_w"]
-                    and readback["discharge_start_w"] == requested["discharge_start_w"]
-                )
         response_codes = settings.get("response_codes")
         set_response_unknown = bool(
             response_codes is None
             or (isinstance(response_codes, list) and len(response_codes) < 4)
         )
         get_ack_unknown_valid = bool(
-            settings.get("schema") == POWER_SETTINGS_SCHEMA
-            and settings.get("contract_version") == POWER_SETTINGS_CONTRACT_VERSION
+            schema_valid
             and settings.get("stage") == "target"
             and settings.get("readback_source") == "command_get_after_invalid_set_response"
             and settings.get("acknowledged") is None
             and settings.get("acknowledgement_status") == "unknown_invalid_set_response"
             and set_response_unknown
-            and values_match
+            and target_values_match
+            and evidence_fresh
+        )
+    direct_confirmed_status = status in {
+        "confirmed",
+        "confirmed_bounded_zero",
+        "confirmed_nonoptimal",
+    }
+    direct_confirmation_valid = True
+    if direct_confirmed_status:
+        response_codes = settings.get("response_codes")
+        direct_confirmation_valid = bool(
+            schema_valid
+            and settings.get("stage") == "target"
+            and isinstance(response_codes, list)
+            and len(response_codes) >= 4
+            and all(
+                isinstance(code, int)
+                and not isinstance(code, bool)
+                and code in (0, 1)
+                for code in response_codes
+            )
+            and target_values_match
+            and evidence_fresh
+        )
+    unchanged_valid = True
+    if status == "confirmed_unchanged":
+        unchanged_valid = bool(
+            schema_valid
+            and settings.get("readback_source") == "canonical_live"
+            and settings.get("readback_cycle_ts") is not None
+            and target_values_match
+            and evidence_fresh
         )
     valid = bool(
         settings.get("confirmed") is True
         and status in POWER_SETTINGS_CONFIRMED_STATUSES
         and timers_valid
+        and schema_valid
+        and evidence_fresh
         and live_readback_valid
         and get_ack_unknown_valid
+        and direct_confirmation_valid
+        and unchanged_valid
     )
     return {
         "valid": valid,
@@ -704,8 +764,16 @@ def _power_settings_contract(settings: Dict[str, Any]) -> Dict[str, Any]:
         "retry_remaining_s": retry_s,
         "pending_remaining_s": pending_s,
         "timers_valid": timers_valid,
+        "schema_valid": schema_valid,
+        "evidence_ts_ms": evidence_ts_ms or None,
+        "evidence_age_s": round(evidence_age_s, 3) if evidence_age_s is not None else None,
+        "evidence_fresh": evidence_fresh,
+        "readback_values_valid": readback_values_valid,
+        "target_values_match": target_values_match,
         "live_readback_valid": live_readback_valid,
         "get_ack_unknown_valid": get_ack_unknown_valid,
+        "direct_confirmation_valid": direct_confirmation_valid,
+        "unchanged_valid": unchanged_valid,
     }
 
 
@@ -803,22 +871,24 @@ def _canonical_direct_marketing_slot_contract(
     expected_source_action = {
         "ECONOMIC_EXPORT": "eco_plus_export_candidate",
         "PV_STORE": "eco_plus_store_pv_candidate",
+        "CHARGE_BLOCK_WAIT": "direct_marketing_charge_block_wait",
     }.get(action)
     source_mode_valid = bool(
         (action == "ECONOMIC_EXPORT" and source_mode == "eco_plus")
         or (action == "PV_STORE" and source_mode in {"eco", "eco_plus"})
+        or (action == "CHARGE_BLOCK_WAIT" and source_mode == "eco_plus")
     )
     selected_contract_valid = bool(
         candidate
         and selected
         and executable
         and commands_allowed
-        and action in {"ECONOMIC_EXPORT", "PV_STORE"}
+        and action in {"ECONOMIC_EXPORT", "PV_STORE", "CHARGE_BLOCK_WAIT"}
         and source_action == expected_source_action
         and source_mode_valid
         and source_mode_matches_plan
         and planned_w is not None
-        and planned_w >= 300.0
+        and (planned_w >= 300.0 if action != "CHARGE_BLOCK_WAIT" else planned_w == 0.0)
         and window_valid
         and isinstance(action_id, str)
         and bool(action_id)
@@ -925,7 +995,7 @@ def phase5_arbitration_contract(
         "valid": False, "action": None, "direction": "hold", "battery_w": 0.0, "power_w": 0.0,
     }
     live_contract = _live_contract(live, legacy, now_value)
-    settings_contract = _power_settings_contract(power_settings)
+    settings_contract = _power_settings_contract(power_settings, now_ms=now_value)
     price_horizon = shadow.get("price_horizon_contract") if isinstance(shadow.get("price_horizon_contract"), dict) else {}
     price_horizon_activation = _price_horizon_activation_contract(shadow)
     terminal = shadow.get("terminal_value") if isinstance(shadow.get("terminal_value"), dict) else {}
@@ -936,11 +1006,23 @@ def phase5_arbitration_contract(
     if direct_marketing_slot.get("valid_selected_contract"):
         plan_action = str(direct_marketing_slot.get("action") or "").upper()
         planned_w = float(direct_marketing_slot.get("planned_w") or 0.0)
-        battery_w = planned_w if plan_action == "PV_STORE" else -planned_w
+        battery_w = (
+            planned_w
+            if plan_action == "PV_STORE"
+            else 0.0
+            if plan_action == "CHARGE_BLOCK_WAIT"
+            else -planned_w
+        )
         candidate.update({
             "valid": True,
             "action": plan_action,
-            "direction": "charge" if plan_action == "PV_STORE" else "discharge",
+            "direction": (
+                "charge"
+                if plan_action == "PV_STORE"
+                else "hold"
+                if plan_action == "CHARGE_BLOCK_WAIT"
+                else "discharge"
+            ),
             "battery_w": round(battery_w, 3),
             "power_w": round(planned_w, 3),
             "direction_valid": True,
@@ -1018,6 +1100,17 @@ def phase5_arbitration_contract(
         and not direct_marketing_slot.get("valid_selected_contract")
         and not economic_hold.get("valid"),
         str(direct_marketing_slot.get("reason_code") or "CANONICAL_DIRECT_MARKETING_SLOT_NOT_SELECTED"),
+    )
+    _append(
+        blockers,
+        bool(current_plan_slot)
+        and str(direct_marketing_slot.get("action") or "").upper()
+        == "CHARGE_BLOCK_WAIT"
+        and not direct_marketing_slot.get("valid_selected_contract"),
+        str(
+            direct_marketing_slot.get("reason_code")
+            or "CANONICAL_DIRECT_MARKETING_CHARGE_BLOCK_WAIT_INCOMPLETE"
+        ),
     )
     _append(
         blockers,
@@ -1180,11 +1273,25 @@ def phase5_arbitration_contract(
         and current_direction != live_direction
         and abs(live_battery_w) >= direction_deadband_w
     ):
-        selected_action = "HOLD"
+        # Ein geplanter Headroom-Export darf bei noch laufender Ladung nicht
+        # auf den wirkungslosen HOLD-/Legacypfad zurückfallen. Zuerst wird die
+        # Ladung im selben kanonischen Slot einseitig gesperrt; erst nach
+        # physikalisch bestätigtem Stillstand übernimmt der Export.
+        selected_action = (
+            "CHARGE_BLOCK_WAIT"
+            if str(candidate.get("action") or "").upper() == "HEADROOM_EXPORT"
+            and current_direction == "discharge"
+            and live_direction == "charge"
+            else "HOLD"
+        )
         selected_power_w = 0.0
         stability.update({
             "active": True,
-            "reason_code": "STABILITY_HOLD_LIVE_DIRECTION_REVERSAL",
+            "reason_code": (
+                "HEADROOM_CHARGE_BLOCK_LIVE_DIRECTION_REVERSAL"
+                if selected_action == "CHARGE_BLOCK_WAIT"
+                else "STABILITY_HOLD_LIVE_DIRECTION_REVERSAL"
+            ),
             "live_battery_w": round(live_battery_w, 3),
             "deadband_w": direction_deadband_w,
         })

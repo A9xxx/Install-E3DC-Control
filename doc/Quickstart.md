@@ -43,7 +43,7 @@ Für eine Erstinstallation oder ein Update ist die empfohlene Option **"1 Instal
 2.  Der Installer richtet Pakete, Dienste, Webdateien, Rechte und den Web-Wizard ein.
 3.  Folgen Sie den Anweisungen auf dem Bildschirm.
 
-**Einmalige Ausnahme für Version 5.3.2b:** Der erste Wechsel auf 5.4.1d
+**Einmalige Ausnahme für Version 5.3.2b:** Der erste Wechsel auf das aktuelle Stable-Release
 erfolgt über den Web-Update-Button oder direkt mit
 `sudo /usr/bin/python3 installer_main.py --update-e3dc`. Der interaktive
 Menüpunkt darf für genau diesen ersten Hybridwechsel nicht verwendet werden,
@@ -131,10 +131,16 @@ services:
     volumes:
       - ./data:/var/www/html/data
       - ./logs:/var/www/html/logs
+      - e3dc_ml:/var/lib/e3dc-control/ml
+      - e3dc_forecast_evidence:/var/lib/e3dc-control/forecast-evidence
     tmpfs:
       - /var/www/html/ramdisk:size=32M,uid=33,gid=33,mode=2775
     environment:
       - TZ=Europe/Berlin
+
+volumes:
+  e3dc_ml:
+  e3dc_forecast_evidence:
 ```
 4. **Starten:**
 ```bash
@@ -168,7 +174,7 @@ bewusster Opt-in erfolgt mit
 `docker compose --profile auto-update up -d watchtower`; standardmäßig bleibt
 der oben gezeigte manuelle Updateweg aktiv.
 
-**Docker-Rückfall von v5.4.1d auf den veröffentlichten Docker-Rollback-Root:**
+**Docker-Rückfall von v5.4.2 auf den veröffentlichten Docker-Rollback-Root:**
 ```bash
 (
   set -euo pipefail
@@ -195,6 +201,12 @@ erst von den Diensten neu erzeugt. Wenn `ml_predictor.py --predict`
 Modell-Volume `/var/lib/e3dc-control/ml`; das ist kein Fehler der
 `uid=33,gid=33`-Ramdisk-Konfiguration. Eine alte Datei
 `/var/www/html/data/ml_model.pkl` wird aus Sicherheitsgründen nicht geladen.
+
+Die optionale PV-Prognosediagnose nutzt ein davon getrenntes privates Volume
+unter `/var/lib/e3dc-control/forecast-evidence`. Sie bleibt ohne
+`forecast_diagnostics_enable=1` vollständig aus. Nach einer Änderung dieses
+Schalters muss der Container neu gestartet werden; bei `Aus` liest der
+Diagnosedienst weder E3/DC-Historie noch legt er eine Datenbank an.
 
 Bei einem normalen Container-Stopp/Rebuild legt E3DC-Control einen kleinen
 Warmstart-Cache unter `data/docker_ramdisk_cache/` an. Dieser Cache enthält
@@ -228,7 +240,7 @@ Nach der Installation können Sie den Installer über `bash "$E3DC_INSTALL_PATH/
 - **E3DC-Control installieren oder aktualisieren:**
   - Option `1` (Installation / Update)
   - Hält Anwendung, Webdateien, Dienste und Rechte auf dem aktuellen Stand.
-  - Ausnahme: Für den einmaligen Wechsel von 5.3.2b auf 5.4.1d den
+  - Ausnahme: Für den einmaligen Wechsel von 5.3.2b auf das aktuelle Stable-Release den
     Web-Update-Button oder den direkten `--update-e3dc`-Aufruf aus
     [Update.md](Update.md) verwenden, nicht den interaktiven Menüpunkt.
 

@@ -59,6 +59,10 @@ services:
       - ./data:/var/www/html/data
       # Persistente Logs ausserhalb des Containers
       - ./logs:/var/www/html/logs
+      # Privates lokales Lernmodell
+      - e3dc_ml:/var/lib/e3dc-control/ml
+      # Private Rohdaten der PV-Prognosediagnose; standardmäßig bleibt sie aus
+      - e3dc_forecast_evidence:/var/lib/e3dc-control/forecast-evidence
     tmpfs:
       # Schont die SD-Karte extrem, indem temporäre Dateien direkt in den RAM des Hosts geschrieben werden
       - /var/www/html/ramdisk:size=32M,uid=33,gid=33,mode=2775
@@ -68,6 +72,10 @@ services:
       # - E3DC_WEB_PORT=8085
       # Optional: Apache nur auf eine bestimmte Host-IP binden:
       # - E3DC_WEB_BIND=192.0.2.20
+
+volumes:
+  e3dc_ml:
+  e3dc_forecast_evidence:
 ```
 *(Hinweis: `network_mode: "host"` ist sinnvoll, damit die nativen Python-Dienste das E3DC Hauskraftwerk und lokale MQTT-/Wallbox-Geraete direkt erreichen und der Webserver ohne Port-Mapping erreichbar ist).*
 
@@ -109,7 +117,7 @@ Fertiges GitHub-Image aktualisieren:
 
 Ohne `E3DC_IMAGE_TAG` folgt diese Compose-Datei dem geprüften Stable-Tag
 `latest`. Ein fester Tag bleibt bei `pull` absichtlich unverändert. Für einen
-bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.1d` in der Datei `.env`
+bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.2` in der Datei `.env`
 gesetzt. `docker compose config --images` zeigt vorab das tatsächlich gewählte
 Image.
 
@@ -137,7 +145,7 @@ Versionswahl.
 
 Gezielte Rückfallversion:
 
-Den Stable-Container `v5.4.1d` auf den veröffentlichten Rollback-Root
+Den Stable-Container `v5.4.2` auf den veröffentlichten Rollback-Root
 `v5.3.2b` zurücksetzen:
 
 ```bash
@@ -145,9 +153,13 @@ Den Stable-Container `v5.4.1d` auf den veröffentlichten Rollback-Root
   set -euo pipefail
   TAG=v5.3.2b
   cd "$E3DC_DOCKER_PATH"
-  sudo docker run --rm -v e3dc-docker_e3dc_data:/data -v "$PWD":/backup alpine \
-    sh -lc 'tar czf "/backup/e3dc-data-$(date +%Y%m%d-%H%M%S).tgz" -C /data .'
-  sudo env E3DC_IMAGE_TAG="$TAG" docker compose config --images
+  EXPECTED_IMAGE="ghcr.io/a9xxx/install-e3dc-control:$TAG"
+  BACKUP_FILE="$PWD/e3dc-data-$(date +%Y%m%d-%H%M%S).tgz"
+  sudo docker compose exec -T e3dc-control \
+    tar czf - -C /var/www/html/data . > "$BACKUP_FILE"
+  test -s "$BACKUP_FILE"
+  RESOLVED_IMAGE="$(sudo env E3DC_IMAGE_TAG="$TAG" docker compose config --images e3dc-control)"
+  [ "$RESOLVED_IMAGE" = "$EXPECTED_IMAGE" ]
   sudo env E3DC_IMAGE_TAG="$TAG" docker compose pull e3dc-control
   sudo env E3DC_IMAGE_TAG="$TAG" docker compose up -d --force-recreate e3dc-control
   sudo docker compose ps
@@ -189,11 +201,11 @@ Installationen bleibt das fertige GitHub-Image der bequemere Weg. Ein lokaler
 Build ist für Plattformen oder Anpassungen gedacht, die nicht vom fertigen
 Image abgedeckt werden.
 
-In der Ausgabe von `docker compose config` ist `volume: {}` bei
-`e3dc_data`/`e3dc_logs` normal: Das sind benannte Docker-Volumes, deren echter
-Hostpfad von Docker verwaltet wird. Den Pfad siehst du bei Bedarf mit
-`docker volume inspect e3dc-docker_e3dc_data` bzw. dem tatsaechlichen
-Compose-Projektnamen.
+In der Ausgabe von `docker compose config` ist `volume: {}` bei benannten
+Volumes normal. Docker verwaltet deren echten Hostpfad. Das gilt insbesondere
+für `e3dc_ml` und `e3dc_forecast_evidence`; beide privaten Datenklassen bleiben
+dadurch vom Webverzeichnis getrennt. Den Pfad siehst du bei Bedarf mit
+`docker volume inspect <Compose-Projekt>_e3dc_forecast_evidence`.
 
 Pruefen, ob der neue Entrypoint aktiv ist:
 
@@ -439,14 +451,29 @@ wichtige Warmstartdaten aus der Ramdisk nach
 `/var/www/html/data/docker_ramdisk_cache/` und spielt sie beim naechsten Start
 wieder ein. Gesichert werden nur unkritische Prognose-, Preis- und
 Verlaufsdaten, keine Steuerflags und keine Live-Schaltzustaende. Dadurch bleibt
-das Dashboard nach einem Rebuild schneller plausibel, waehrend die Dienste die
-Daten anschliessend frisch nachrechnen.
+das Dashboard nach einem Rebuild schneller plausibel, während die Dienste die
+Daten anschließend frisch nachrechnen.
 
 Wichtig ist das persistente, separate Modell-Volume unter `/var/lib/e3dc-control/ml`.
 Wenn `ml_predictor.py --predict` meldet `Kein Modell gefunden`, liegt das nicht
 an `uid=33,gid=33` der Ramdisk, sondern daran, dass noch kein Modell trainiert
 wurde oder das separate Modell-Volume nicht korrekt eingebunden ist. Ein altes
 Web-Pickle unter `/var/www/html/data` wird nicht geladen oder übernommen.
+
+Die PV-Prognosediagnose ist davon getrennt und standardmäßig ausgeschaltet.
+Erst `forecast_diagnostics_enable=1` startet beim Containerstart den
+niedrig priorisierten, rein lesenden Diagnosedienst. Seine Rohdatenbank liegt mit
+0700-Verzeichnisrechten im separaten Volume
+`/var/lib/e3dc-control/forecast-evidence`; das Webportal erhält nur eine kleine,
+sanitierte Zusammenfassung in der Ramdisk. Nach dem Ein- oder Ausschalten ist
+ein Containerneustart erforderlich. Bei `Aus` erfolgen weder
+E3/DC-Historienabfrage noch Datenbankschreibzugriff.
+
+Beim Wechsel zwischen Bare Metal und Docker wird diese private
+Diagnosedatenbank bewusst nicht kopiert. Die Auswertung beginnt im jeweiligen
+Laufzeitmodell mit einer neuen Vergleichshistorie; die Regelung ist davon nicht
+betroffen. Das alte benannte Docker-Volume wird bei `docker compose down` ohne
+`--volumes` nicht gelöscht.
 
 Pruefung im Container:
 ```bash

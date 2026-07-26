@@ -340,6 +340,23 @@ nohup $PYTHON_EXEC epex_manager.py > /proc/1/fd/1 2>&1 &
 echo "   -> PV Forecast & Weather Manager aktiv."
 nohup $PYTHON_EXEC Forecast/pv_forecast_service.py > /proc/1/fd/1 2>&1 &
 
+# Rein diagnostische PV-Prognosediagnose. Ohne ausdrückliche Aktivierung wird
+# weder ein Prozess gestartet noch E3/DC-Historie gelesen oder eine DB erzeugt.
+FORECAST_DIAGNOSTICS="$(get_v4_val "forecast_diagnostics_enable" | tr '[:upper:]' '[:lower:]')"
+if [ "$FORECAST_DIAGNOSTICS" = "1" ] \
+    || [ "$FORECAST_DIAGNOSTICS" = "true" ] \
+    || [ "$FORECAST_DIAGNOSTICS" = "yes" ] \
+    || [ "$FORECAST_DIAGNOSTICS" = "on" ] \
+    || [ "$FORECAST_DIAGNOSTICS" = "ein" ]; then
+    FORECAST_EVIDENCE_DIR="/var/lib/e3dc-control/forecast-evidence"
+    install -d -o root -g root -m 0700 "$FORECAST_EVIDENCE_DIR"
+    echo "   -> PV-Prognosediagnose (read-only, niedrige Priorität) aktiv."
+    nohup nice -n 10 ionice -c 3 "$PYTHON_EXEC" forecast_evidence_sidecar.py \
+        > /proc/1/fd/1 2>&1 &
+else
+    echo "   -> PV-Prognosediagnose ausgeschaltet (keine Historienabfrage/DB)."
+fi
+
 # Storage Simulator (Neu in V4)
 echo "   -> Storage Simulator aktiv."
 nohup $PYTHON_EXEC storage_simulator.py > /proc/1/fd/1 2>&1 &

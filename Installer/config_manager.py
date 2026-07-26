@@ -67,7 +67,11 @@ V4_BLOCK_PV = {
     'solcast_api_slot_fc1', 'solcast_api_slot_fc2', 'solcast_api_slot_fc3', 'solcast_api_slot_fc4',
     'pv_forecast_coupling_fc1', 'pv_forecast_coupling_fc2',
     'pv_forecast_coupling_fc3', 'pv_forecast_coupling_fc4',
+    # Versionierter V4-JSON-Vertrag: Gruppen, Flächen und Providerbindungen.
+    # Legacy forecast*/FC-Felder bleiben parallel lesbar und werden nicht ersetzt.
+    'pv_forecast_topology_config',
     'pv_e3dc_dc_inverter_limit_w', 'pv_external_ac_inverter_limit_w',
+    'forecast_diagnostics_enable',
     'ml_home_cap_kw',   # Max. Hausverbrauch im ML-Training (kW) – verhindert WB-Artefakte
 }
 
@@ -78,6 +82,13 @@ V4_BLOCK_TARIFF = {
     'stromtarif_typ', 'tariff_provider', 'tibber_api_token', 'tibber_home_id',
     'entsoe_api_token',
     'grid_friendly_mode',
+    # Abrechnungsfeste 15-Minuten-Bezugsbegrenzung; Storage Manager bleibt Owner.
+    'peak_shaving_enable', 'peak_shaving_grid_import_limit_w',
+    'peak_shaving_reserve_soc_pct', 'peak_shaving_max_discharge_w',
+    'peak_shaving_grid_recharge_enable', 'peak_shaving_recharge_max_w',
+    'peak_shaving_control_margin_w', 'peak_shaving_hysteresis_w',
+    'peak_shaving_soc_hysteresis_pct', 'peak_shaving_max_sample_gap_s',
+    'peak_shaving_release_debounce_s',
     # Negativpreis-Boost/Kompatibilität: bisherige Preisfenster erkennen, Verbraucher optional freigeben.
     'cheap_grid_boost_enable', 'cheap_grid_price_limit_ct',
     'cheap_grid_min_duration_min',
@@ -123,6 +134,16 @@ V4_BLOCK_TARIFF = {
     'direct_marketing_pv_store_max_w', 'direct_marketing_pv_store_min_surplus_w',
     'direct_marketing_pv_store_import_guard_w', 'direct_marketing_pv_store_min_hold_s',
     'direct_marketing_pv_store_ramp_step_w', 'direct_marketing_pv_store_dc_only_enable',
+    'direct_marketing_aux_inverter_ac_storage_enable',
+    'direct_marketing_aux_inverter_ac_storage_mode', 'direct_marketing_pv_store_aux_ac_mode',
+    'direct_marketing_aux_inverter_ac_forecast_confidence_pct',
+    'direct_marketing_aux_inverter_ac_deadband_wh',
+    'direct_marketing_aux_inverter_ac_min_margin_ct_per_kwh',
+    'direct_marketing_aux_inverter_ac_protected_target_soc_pct',
+    'direct_marketing_aux_inverter_ac_grid_import_guard_w',
+    'direct_marketing_pv_store_dc_charge_efficiency_pct',
+    'direct_marketing_pv_store_aux_ac_charge_efficiency_pct',
+    'direct_marketing_pv_store_discharge_efficiency_pct',
     'direct_marketing_pv_store_external_ac_guard_w',
     'direct_marketing_pv_store_export_limit_guard_w', 'direct_marketing_pv_store_export_limit_ramp_bypass_w',
     'direct_marketing_price_max_age_s',
@@ -163,6 +184,7 @@ V4_BLOCK_STORAGE = {
     'storage_dispatch_runtime_budget_ms',
     'einspeiselimit',            # Einspeise-Limit W (für PV-Derating)
     'storage_curve_target_mode', 'storage_curve_sliding_horizon_enable',
+    'storage_dc_first_charge_limit_enable',
     'storage_curve_charge_servo_mode', 'storage_curve_charge_servo_min_w',
     'storage_curve_charge_servo_deadband_w', 'storage_curve_charge_servo_step_up_w',
     'storage_curve_charge_servo_step_down_w', 'storage_curve_charge_servo_max_age_s',

@@ -48,6 +48,7 @@ ALLOWED_SERVICES=(
     "e3dc-heizstab.service"
     "e3dc-climate-live.service"
     "e3dc-climate-control.service"
+    "e3dc-forecast-evidence.service"
     "e3dc-notifier.service"
     "e3dc-mqtt-hub.service"
     "e3dc-websocket.service"

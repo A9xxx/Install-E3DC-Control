@@ -17,6 +17,12 @@ import json
 import os
 import pwd
 import re
+
+try:
+    import resource as _resource
+except ImportError:  # pragma: no cover - Windows-Testlauf, Produktivbetrieb ist Linux.
+    _resource = None
+
 import shutil
 import sqlite3
 import stat
@@ -59,6 +65,7 @@ ML_MODEL_SCHEMA_VERSION = 1
 ML_MODEL_FORMAT = "e3dc-sklearn-pickle"
 ML_MODEL_MAX_BYTES = 128 * 1024 * 1024
 _ML_MODEL_FILE_RE = re.compile(r"ml_model-([0-9a-f]{64})\.pkl\Z")
+MAX_CLEANUP_TREE_DEPTH = 512
 
 
 class BackupIntegrityError(RuntimeError):
@@ -1779,12 +1786,124 @@ def _open_or_create_exact_directory(path: Path) -> Dict[str, object]:
         raise
 
 
+def _current_open_descriptor_count() -> int:
+    """Liest den absoluten Linux-FD-Bestand ohne ein neues Dauer-Handle."""
+
+    try:
+        return len(os.listdir("/proc/self/fd"))
+    except OSError as exc:
+        raise BackupIntegrityError(
+            "Restore-Dateideskriptorbestand kann nicht sicher ermittelt werden"
+        ) from exc
+
+
+def _cleanup_tree_descriptor_peak(candidate: Dict[str, object]) -> int:
+    """Belegt read-only die zusätzlich nötige FD-Tiefe eines Cleanup-Baums."""
+
+    root = _lexical_absolute(str(candidate["path"]))
+    root_metadata = os.lstat(str(root))
+    if (
+        stat.S_ISLNK(root_metadata.st_mode)
+        or not stat.S_ISDIR(root_metadata.st_mode)
+        or (root_metadata.st_dev, root_metadata.st_ino)
+        != (candidate["dev"], candidate["ino"])
+    ):
+        raise BackupIntegrityError(
+            "Post-Backup-Verzeichnis driftete vor FD-Budgetierung: {}".format(root)
+        )
+
+    peak = 2
+
+    def walk_error(exc: OSError) -> None:
+        raise BackupIntegrityError(
+            "Cleanup-Baum kann nicht vollständig gelesen werden: {}".format(root)
+        ) from exc
+
+    for directory, dirnames, filenames in os.walk(
+        str(root),
+        topdown=True,
+        followlinks=False,
+        onerror=walk_error,
+    ):
+        directory_path = Path(directory)
+        relative_depth = len(directory_path.relative_to(root).parts)
+        if relative_depth > MAX_CLEANUP_TREE_DEPTH:
+            raise BackupIntegrityError(
+                "Cleanup-Baum ist tiefer als {} Ebenen: {}".format(
+                    MAX_CLEANUP_TREE_DEPTH,
+                    root,
+                )
+            )
+        peak = max(peak, relative_depth + 2)
+        for name in dirnames:
+            metadata = os.lstat(str(directory_path / name))
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                raise BackupIntegrityError(
+                    "Unsicheres Verzeichnis im Cleanup-Baum: {}".format(
+                        directory_path / name
+                    )
+                )
+        for name in filenames:
+            metadata = os.lstat(str(directory_path / name))
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+                raise BackupIntegrityError(
+                    "Unsichere Datei im Cleanup-Baum: {}".format(
+                        directory_path / name
+                    )
+                )
+    return peak
+
+
+def _reserve_restore_descriptor_budget(required: int):
+    """Hebt das weiche Linux-FD-Limit vor der atomaren Batch-Stagingphase an."""
+
+    if _resource is None or not hasattr(_resource, "RLIMIT_NOFILE"):
+        raise BackupIntegrityError(
+            "Restore-Dateideskriptorprüfung benötigt Linux-RLIMIT_NOFILE"
+        )
+    requested = max(32, int(required))
+    previous = _resource.getrlimit(_resource.RLIMIT_NOFILE)
+    soft, hard = previous
+    if soft == _resource.RLIM_INFINITY or soft >= requested:
+        return previous
+    if hard != _resource.RLIM_INFINITY and requested > hard:
+        raise BackupIntegrityError(
+            "Restore benötigt mindestens {} Dateideskriptoren; Hard-Limit ist {}".format(
+                requested, hard
+            )
+        )
+    try:
+        _resource.setrlimit(_resource.RLIMIT_NOFILE, (requested, hard))
+    except (OSError, ValueError) as exc:
+        raise BackupIntegrityError(
+            "Restore-Dateideskriptorbudget konnte nicht reserviert werden"
+        ) from exc
+    return previous
+
+
+def _restore_descriptor_budget(previous) -> None:
+    if _resource is None or previous is None:
+        return
+    try:
+        _resource.setrlimit(_resource.RLIMIT_NOFILE, previous)
+    except (OSError, ValueError):
+        # Nach geschlossenen Restore-FDs ist ein höheres Soft-Limit sicherer als
+        # ein nachträglich fehlgeschlagener, bereits committed Restore.
+        try:
+            print(
+                "[!] Restore-Dateideskriptorbudget konnte nicht auf den Ausgangswert "
+                "zurückgesetzt werden."
+            )
+        except (OSError, ValueError):
+            pass
+
+
 def _directory_tree_digest(descriptor: int) -> str:
     """Hash a tree through held descriptors; reject every non-file/non-directory entry."""
 
     digest = hashlib.sha256()
 
-    def walk(current: int, prefix: str) -> None:
+    def walk(current: int, prefix: str, depth: int) -> None:
         metadata = os.fstat(current)
         digest.update("D\0{}\0{}\0{}\0{}\n".format(
             prefix, stat.S_IMODE(metadata.st_mode), metadata.st_uid, metadata.st_gid
@@ -1795,12 +1914,18 @@ def _directory_tree_digest(descriptor: int) -> str:
             if stat.S_ISLNK(child.st_mode):
                 raise BackupIntegrityError("Symlink in Cleanup-Verzeichnis: {}".format(relative))
             if stat.S_ISDIR(child.st_mode):
+                if depth >= MAX_CLEANUP_TREE_DEPTH:
+                    raise BackupIntegrityError(
+                        "Cleanup-Baum ist tiefer als {} Ebenen".format(
+                            MAX_CLEANUP_TREE_DEPTH
+                        )
+                    )
                 child_descriptor = os.open(name, os.O_RDONLY | _DIRECTORY | _NOFOLLOW, dir_fd=current)
                 try:
                     opened = os.fstat(child_descriptor)
                     if (opened.st_dev, opened.st_ino) != (child.st_dev, child.st_ino):
                         raise BackupIntegrityError("Cleanup-Verzeichnis wurde ausgetauscht: {}".format(relative))
-                    walk(child_descriptor, relative)
+                    walk(child_descriptor, relative, depth + 1)
                 finally:
                     os.close(child_descriptor)
             elif stat.S_ISREG(child.st_mode):
@@ -1828,11 +1953,24 @@ def _directory_tree_digest(descriptor: int) -> str:
             else:
                 raise BackupIntegrityError("Unerlaubter Eintrag in Cleanup-Verzeichnis: {}".format(relative))
 
-    walk(descriptor, "")
+    walk(descriptor, "", 0)
     return digest.hexdigest()
 
 
-def _remove_directory_tree_at(parent_descriptor: int, name: str, expected_dev: int, expected_ino: int) -> None:
+def _remove_directory_tree_at(
+    parent_descriptor: int,
+    name: str,
+    expected_dev: int,
+    expected_ino: int,
+    *,
+    _depth: int = 0,
+) -> None:
+    if _depth > MAX_CLEANUP_TREE_DEPTH:
+        raise BackupIntegrityError(
+            "Cleanup-Baum ist tiefer als {} Ebenen".format(
+                MAX_CLEANUP_TREE_DEPTH
+            )
+        )
     descriptor = os.open(name, os.O_RDONLY | _DIRECTORY | _NOFOLLOW, dir_fd=parent_descriptor)
     try:
         opened = os.fstat(descriptor)
@@ -1843,7 +1981,13 @@ def _remove_directory_tree_at(parent_descriptor: int, name: str, expected_dev: i
             if stat.S_ISLNK(metadata.st_mode):
                 raise BackupIntegrityError("Symlink in Cleanup-Quarantaene: {}".format(child))
             if stat.S_ISDIR(metadata.st_mode):
-                _remove_directory_tree_at(descriptor, child, metadata.st_dev, metadata.st_ino)
+                _remove_directory_tree_at(
+                    descriptor,
+                    child,
+                    metadata.st_dev,
+                    metadata.st_ino,
+                    _depth=_depth + 1,
+                )
             elif stat.S_ISREG(metadata.st_mode):
                 os.unlink(child, dir_fd=descriptor)
             else:
@@ -1865,13 +2009,33 @@ def restore_persistent_payload(
     rollback_replace_func=os.replace,
     before_commit=None,
 ) -> int:
-    """Restore the complete mapped and source surface as one fd-bound transaction."""
+    """Restore one fd-bound transaction in the isolated single-thread updater."""
 
     backup = _assert_no_symlink_components(backup_dir)
     manifest = verify_backup(backup, expected_kind=SYSTEM_BACKUP_KIND)
     roots = [_lexical_absolute(path) for path in allowed_roots]
     files = [_lexical_absolute(path) for path in allowed_files]
     cleanup_candidates, cleanup_directories = _exact_cleanup_candidates(manifest, roots, files)
+    directory_entries = _manifest_directory_entries(manifest, roots, files)
+    restorable_files = sum(
+        1
+        for entry in manifest.get("files", [])  # type: ignore[union-attr]
+        if isinstance(entry, dict) and entry.get("restore_path")
+    )
+    persistent_descriptors = (
+        2 * len(directory_entries)
+        + restorable_files
+        + len(cleanup_candidates)
+        + 2 * len(cleanup_directories)
+    )
+    for candidate in cleanup_directories:
+        _cleanup_tree_descriptor_peak(candidate)
+    descriptor_budget = (
+        _current_open_descriptor_count()
+        + persistent_descriptors
+        + MAX_CLEANUP_TREE_DEPTH
+        + 32
+    )
     directory_items: List[Dict[str, object]] = []
     staged: List[Dict[str, object]] = []
     cleanup_items: List[Dict[str, object]] = []
@@ -1879,9 +2043,13 @@ def restore_persistent_payload(
     applied: List[Dict[str, object]] = []
     cleanup_applied: List[Dict[str, object]] = []
     committed = False
+    previous_descriptor_limit = None
 
     try:
-        for expected in _manifest_directory_entries(manifest, roots, files):
+        previous_descriptor_limit = _reserve_restore_descriptor_budget(
+            descriptor_budget
+        )
+        for expected in directory_entries:
             directory = _open_or_create_exact_directory(Path(str(expected["path"])))
             directory.update({
                 "expected_mode": int(expected["mode"]),
@@ -2462,56 +2630,62 @@ def restore_persistent_payload(
             )
         return len(applied)
     finally:
-        for item in staged:
-            parent_descriptor = int(item["parent_fd"])
-            new_name = item.get("new_name")
-            if new_name:
-                try:
-                    os.unlink(str(new_name), dir_fd=parent_descriptor)
-                except OSError:
-                    pass
-            if committed and item.get("old_name"):
-                try:
-                    os.unlink(str(item["old_name"]), dir_fd=parent_descriptor)
-                except OSError:
-                    pass
-            if committed and item.get("superseded_old_name"):
-                try:
-                    os.unlink(str(item["superseded_old_name"]), dir_fd=parent_descriptor)
-                except OSError:
-                    pass
-            os.close(parent_descriptor)
-        for item in cleanup_items:
-            parent_descriptor = int(item["parent_fd"])
-            if committed and item.get("old_name"):
-                try:
-                    os.unlink(str(item["old_name"]), dir_fd=parent_descriptor)
-                except OSError:
-                    pass
-            os.close(parent_descriptor)
-        for item in cleanup_directory_items:
-            parent_descriptor = int(item["parent_fd"])
-            if committed and item.get("old_name"):
-                try:
-                    _remove_directory_tree_at(
-                        parent_descriptor,
-                        str(item["old_name"]),
-                        int(item["dev"]),
-                        int(item["ino"]),
-                    )
-                except (FileNotFoundError, OSError, BackupIntegrityError):
-                    pass
-            os.close(int(item["fd"]))
-            os.close(parent_descriptor)
-        for item in reversed(directory_items):
-            try:
+        try:
+            for item in staged:
+                parent_descriptor = int(item["parent_fd"])
+                new_name = item.get("new_name")
+                if new_name:
+                    try:
+                        os.unlink(str(new_name), dir_fd=parent_descriptor)
+                    except OSError:
+                        pass
+                if committed and item.get("old_name"):
+                    try:
+                        os.unlink(str(item["old_name"]), dir_fd=parent_descriptor)
+                    except OSError:
+                        pass
+                if committed and item.get("superseded_old_name"):
+                    try:
+                        os.unlink(str(item["superseded_old_name"]), dir_fd=parent_descriptor)
+                    except OSError:
+                        pass
+                os.close(parent_descriptor)
+            for item in cleanup_items:
+                parent_descriptor = int(item["parent_fd"])
+                if committed and item.get("old_name"):
+                    try:
+                        os.unlink(str(item["old_name"]), dir_fd=parent_descriptor)
+                    except OSError:
+                        pass
+                os.close(parent_descriptor)
+            for item in cleanup_directory_items:
+                parent_descriptor = int(item["parent_fd"])
+                if committed and item.get("old_name"):
+                    try:
+                        _remove_directory_tree_at(
+                            parent_descriptor,
+                            str(item["old_name"]),
+                            int(item["dev"]),
+                            int(item["ino"]),
+                        )
+                    except (FileNotFoundError, OSError, BackupIntegrityError):
+                        pass
                 os.close(int(item["fd"]))
-            except OSError:
-                pass
-            if not committed and item.get("created") and not item.get("removed"):
+                os.close(parent_descriptor)
+            for item in reversed(directory_items):
                 try:
-                    os.rmdir(Path(str(item["path"])).name, dir_fd=int(item["parent_fd"]))
+                    os.close(int(item["fd"]))
                 except OSError:
                     pass
-            os.close(int(item["parent_fd"]))
+                if not committed and item.get("created") and not item.get("removed"):
+                    try:
+                        os.rmdir(
+                            Path(str(item["path"])).name,
+                            dir_fd=int(item["parent_fd"]),
+                        )
+                    except OSError:
+                        pass
+                os.close(int(item["parent_fd"]))
+        finally:
+            _restore_descriptor_budget(previous_descriptor_limit)
 

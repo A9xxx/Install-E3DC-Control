@@ -702,6 +702,157 @@ function forecastSlotPowerKw($slot) {
     return array_sum($modelValues) / count($modelValues);
 }
 
+function pvForecastDiagnosticsEnabled($conf) {
+    $value = strtolower(trim((string)($conf['forecast_diagnostics_enable'] ?? '0')));
+    return in_array($value, ['1', 'true', 'yes', 'on', 'ein'], true);
+}
+
+function loadPvForecastDiagnosticEvidence($currentTopologyRevision, $diagnosticsEnabled) {
+    $metricLabels = [
+        'trefferabweichung_wh' => 'Trefferabweichung',
+        'richtungsversatz_wh' => 'Richtungsversatz',
+        'energiegewichtete_gesamtabweichung_pct' => 'Energiegewichtete Gesamtabweichung',
+        'vergleichsabdeckung_pct' => 'Vergleichsabdeckung',
+    ];
+    $fallback = [
+        'schema_version' => 'pv_forecast_diagnostic_summary_v2',
+        'status' => 'nicht_verfügbar',
+        'available' => false,
+        'provisional' => true,
+        'operation_mode' => 'read_only_diagnostic',
+        'control_effect' => false,
+        'configuration_writes' => false,
+        'automatic_model_selection' => false,
+        'metrics' => array_fill_keys(array_keys($metricLabels), null),
+        'labels' => $metricLabels,
+    ];
+    if ($diagnosticsEnabled !== true) {
+        return array_merge($fallback, [
+            'status' => 'aus',
+            'reason' => 'vom_nutzer_ausgeschaltet',
+            'provisional' => false,
+        ]);
+    }
+    $summaryPath = '/var/www/html/ramdisk/pv_forecast_diagnostic_summary.json';
+    $maxBytes = 65536;
+    $maxSummaryAgeSeconds = 36 * 3600;
+    $expectedRevision = is_string($currentTopologyRevision)
+        ? trim($currentTopologyRevision)
+        : '';
+    if (
+        !preg_match('/^sha256:[0-9a-f]{64}$/', $expectedRevision)
+        || !file_exists($summaryPath)
+        || is_link($summaryPath)
+        || !is_file($summaryPath)
+        || !is_readable($summaryPath)
+    ) {
+        return $fallback;
+    }
+
+    $before = @lstat($summaryPath);
+    if (
+        !is_array($before)
+        || (($before['mode'] ?? 0) & 0170000) !== 0100000
+        || (int)($before['size'] ?? 0) < 2
+        || (int)($before['size'] ?? 0) > $maxBytes
+    ) {
+        return $fallback;
+    }
+
+    $handle = null;
+    try {
+        $handle = @fopen($summaryPath, 'rb');
+        if (!is_resource($handle)) {
+            return $fallback;
+        }
+        $opened = @fstat($handle);
+        if (
+            !is_array($opened)
+            || (int)($opened['dev'] ?? -1) !== (int)($before['dev'] ?? -2)
+            || (int)($opened['ino'] ?? -1) !== (int)($before['ino'] ?? -2)
+            || (($opened['mode'] ?? 0) & 0170000) !== 0100000
+            || (int)($opened['size'] ?? 0) > $maxBytes
+        ) {
+            return $fallback;
+        }
+        $payloadJson = stream_get_contents($handle, $maxBytes + 1);
+        if (
+            !is_string($payloadJson)
+            || $payloadJson === ''
+            || strlen($payloadJson) > $maxBytes
+        ) {
+            return $fallback;
+        }
+        $payload = json_decode($payloadJson, true, 32);
+        if (
+            !is_array($payload)
+            || ($payload['schema_version'] ?? '') !== 'pv_forecast_diagnostic_summary_v2'
+            || ($payload['operation_mode'] ?? '') !== 'read_only_diagnostic'
+            || ($payload['control_effect'] ?? null) !== false
+            || ($payload['configuration_writes'] ?? null) !== false
+            || ($payload['automatic_model_selection'] ?? null) !== false
+            || ($payload['topology_revision'] ?? '') !== $expectedRevision
+            || !is_array($payload['metrics'] ?? null)
+        ) {
+            return $fallback;
+        }
+
+        $metrics = [];
+        foreach ($metricLabels as $key => $_label) {
+            $value = $payload['metrics'][$key] ?? null;
+            if ($value !== null && (!is_numeric($value) || !is_finite((float)$value))) {
+                return $fallback;
+            }
+            $metrics[$key] = $value === null ? null : round((float)$value, 3);
+        }
+        $nonnegativeIntegers = [];
+        foreach ([
+            'calculated_at_utc_s',
+            'evaluation_window_days',
+            'evaluation_delay_minutes',
+            'minimum_relevant_slots',
+            'minimum_relevant_days',
+            'eligible_forecast_slots',
+            'compared_slots',
+            'yield_relevant_slots',
+            'yield_relevant_days',
+        ] as $key) {
+            $value = $payload[$key] ?? 0;
+            if (!is_numeric($value) || (int)$value < 0) {
+                return $fallback;
+            }
+            $nonnegativeIntegers[$key] = (int)$value;
+        }
+        $calculatedAt = $nonnegativeIntegers['calculated_at_utc_s'] ?? 0;
+        if (
+            $calculatedAt <= 0
+            || $calculatedAt > (time() + 300)
+            || (time() - $calculatedAt) > $maxSummaryAgeSeconds
+        ) {
+            return array_merge($fallback, ['reason' => 'zusammenfassung_veraltet']);
+        }
+        return array_merge($fallback, $nonnegativeIntegers, [
+            'topology_revision' => $expectedRevision,
+            'status' => substr((string)($payload['status'] ?? 'nicht_verfügbar'), 0, 32),
+            'available' => ($payload['available'] ?? null) === true,
+            'reason' => substr((string)($payload['reason'] ?? ''), 0, 80),
+            'provisional' => ($payload['provisional'] ?? null) === true,
+            'provisional_reasons' => array_slice(array_values(array_filter(
+                $payload['provisional_reasons'] ?? [],
+                'is_string'
+            )), 0, 8),
+            'metrics' => $metrics,
+            'labels' => $metricLabels,
+        ]);
+    } catch (Throwable $ignored) {
+        return $fallback;
+    } finally {
+        if (is_resource($handle)) {
+            fclose($handle);
+        }
+    }
+}
+
 function clampDisplaySoc($value) {
     return max(0.0, min(100.0, (float)$value));
 }
@@ -1690,4 +1841,17 @@ if (isset($storagePlanParsed) && $storagePlanParsed) {
 }
 
 $data['daily_summary'] = $dailySums;
+$currentTopologyRevisions = array_values(array_unique(array_filter(
+    $data['pv_topology_revision'] ?? [],
+    static function ($value) {
+        return is_string($value) && preg_match('/^sha256:[0-9a-f]{64}$/', $value);
+    }
+)));
+$currentTopologyRevision = count($currentTopologyRevisions) === 1
+    ? $currentTopologyRevisions[0]
+    : null;
+$data['pv_forecast_diagnostics'] = loadPvForecastDiagnosticEvidence(
+    $currentTopologyRevision,
+    pvForecastDiagnosticsEnabled($conf)
+);
 echo json_encode($data);

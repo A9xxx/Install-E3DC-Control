@@ -81,6 +81,8 @@ def optional_service_configured(service: str, config: Mapping[str, object]) -> b
         return _enabled(config, "climate_enable") and _has_address(config, "climate_meter_ip")
     if name == "e3dc-climate-control":
         return _enabled(config, "climate_control_enable")
+    if name == "e3dc-forecast-evidence":
+        return _enabled(config, "forecast_diagnostics_enable")
     if name == "e3dc-matter-bridge":
         return _enabled(config, "matter_bridge")
     if name == "e3dc-bluelink":
@@ -130,6 +132,7 @@ def configured_optional_services(config: Mapping[str, object]) -> tuple[str, ...
         "e3dc-heizstab",
         "e3dc-climate-live",
         "e3dc-climate-control",
+        "e3dc-forecast-evidence",
         "e3dc-matter-bridge",
         "e3dc-bluelink",
         "e3dc-mqtt-hub",

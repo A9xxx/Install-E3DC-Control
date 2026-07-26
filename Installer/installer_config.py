@@ -23,16 +23,22 @@ WEB_CONFIG_START_DEFAULTS = {
     "frontend_variant": "classic",
     "frontend_detail_mode": "normal",
     "config_secret_protection_mode": "standard",
+    "forecast_diagnostics_enable": "0",
 }
 
 
-def apply_web_config_start_defaults(data):
+def apply_web_config_start_defaults(data, *, first_install=False):
     """Fill first-start defaults that must exist before the Web-UI is saved."""
     result = dict(data or {})
     for key, default in WEB_CONFIG_START_DEFAULTS.items():
         value = result.get(key)
         if key not in result or value is None or value == "":
             result[key] = default
+    # Die Rolle darf ausschließlich beim erstmaligen Erzeugen der V4-Datei
+    # vorbelegt werden. Bestehende Anlagen ohne Rollenbindung bleiben bewusst
+    # fail-closed und werden nicht still als Einzelanlage umgedeutet.
+    if first_install and not str(result.get("ha_mode") or "").strip():
+        result["ha_mode"] = "off"
     return result
 
 def get_default_install_user():
@@ -284,7 +290,7 @@ def _write_json_with_web_permissions(path, data, user):
             pass
 
 
-def ensure_web_config(install_user=None):
+def ensure_web_config(install_user=None, *, bind_first_install_role=False):
     """Write V4 web config so PHP can resolve paths and handle tariffs."""
     logger = logging.getLogger("install")
     user = install_user or get_install_user()
@@ -300,6 +306,7 @@ def ensure_web_config(install_user=None):
             pass
 
     try:
+        first_install = not os.path.exists(WEB_CONFIG_FILE) or bind_first_install_role
         old_data = {}
         existing_user = None
         if os.path.exists(WEB_CONFIG_FILE):
@@ -322,11 +329,19 @@ def ensure_web_config(install_user=None):
         if installer_data.get("venv_name"):
             data["venv_name"] = installer_data["venv_name"]
             data["venv_path"] = installer_data.get("venv_path") or os.path.join(data["home_dir"], installer_data["venv_name"])
-        data = apply_web_config_start_defaults(data)
+        data = apply_web_config_start_defaults(data, first_install=first_install)
 
         needs_write = not os.path.exists(WEB_CONFIG_FILE) or existing_user != user
         if not needs_write:
-            for key in ("install_user", "home_dir", "install_path", "venv_name", "venv_path", *WEB_CONFIG_START_DEFAULTS.keys()):
+            for key in (
+                "install_user",
+                "home_dir",
+                "install_path",
+                "venv_name",
+                "venv_path",
+                "ha_mode",
+                *WEB_CONFIG_START_DEFAULTS.keys(),
+            ):
                 if old_data.get(key) != data.get(key):
                     needs_write = True
                     break

@@ -418,6 +418,7 @@ class RscpTag:
     DB_BAT_POWER_OUT                            = 0x06800003
     DB_CONSUMPTION                              = 0x06800007
     DB_DC_POWER                                 = 0x06800004
+    DB_GRAPH_INDEX                              = 0x06800001
     DB_GRID_POWER_IN                            = 0x06800005
     DB_GRID_POWER_OUT                           = 0x06800006
     DB_HISTORY_DATA_DAY                         = 0x06800100
@@ -428,6 +429,7 @@ class RscpTag:
     DB_REQ_HISTORY_TIME_SPAN                    = 0x06000103
     DB_REQ_HISTORY_TIME_START                   = 0x06000101
     DB_SUM_CONTAINER                            = 0x06800010
+    DB_VALUE_CONTAINER                          = 0x06800020
     EMS_AUTARKY                                 = 0x01800006
     EMS_BATTERY_BEFORE_CAR_MODE                 = 0x01800079
     EMS_BATTERY_TO_CAR_MODE                     = 0x01800077

@@ -1656,6 +1656,22 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                     </div>
                     <div id="diagramDetails" class="px-3 pb-2 text-info small fw-bold" style="display:none;"></div>
                     <div id="forecast-kwh-summary" class="forecast-summary px-3 pb-2 text-info small fw-bold" style="display:none;"></div>
+                    <div id="pv-forecast-diagnostic-card" class="mx-3 mb-2 rounded border border-secondary-subtle bg-body-tertiary px-3 py-2 small" hidden>
+                        <div class="d-flex flex-wrap align-items-center justify-content-between gap-2">
+                            <span class="fw-bold"><i class="fas fa-chart-bar text-info me-1"></i>PV-Prognosediagnose</span>
+                            <span id="pv-forecast-diagnostic-status" class="badge text-bg-secondary">Noch keine Auswertung</span>
+                        </div>
+                        <div class="d-flex flex-wrap gap-2 gap-lg-3 mt-1 text-body">
+                            <span title="Typischer absoluter Unterschied je verglichenem 15-Minuten-Fenster">Trefferabweichung: <strong id="pv-forecast-diagnostic-hit">–</strong></span>
+                            <span title="Positiv bedeutet im Mittel mehr, negativ weniger Ertrag als vorhergesagt">Richtungsversatz: <strong id="pv-forecast-diagnostic-direction">–</strong></span>
+                            <span title="Gesamtabweichung, gewichtet nach der tatsächlich erzeugten Energie">Energieabweichung: <strong id="pv-forecast-diagnostic-energy">–</strong></span>
+                            <span title="Anteil der archivierten Prognosefenster mit gültigem Messwert">Abdeckung: <strong id="pv-forecast-diagnostic-coverage">–</strong></span>
+                        </div>
+                        <div class="d-flex flex-wrap justify-content-between gap-2 mt-1 text-muted">
+                            <span id="pv-forecast-diagnostic-sample">Noch keine vergleichbaren Fenster</span>
+                            <span>Nur Diagnose – ändert keine Regelung und wählt kein Modell aus.</span>
+                        </div>
+                    </div>
                     <div class="card-body p-0 chart-container position-relative">
                         <!-- Live JS Chart Overlay -->
                         <div id="liveChartContainer" class="w-100 h-100 position-absolute top-0 start-0 p-3" style="background-color: var(--bs-card-bg); z-index: 10;">
@@ -1855,6 +1871,8 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                                         <div class="d-flex justify-content-between small mb-2 fw-info"><span>Summe der Ersparnis:</span> <span id="stat-save-total" class="text-info fw-bold">0.00 €</span></div>
                                         <div id="stat-eeg-row" class="d-flex justify-content-between small mb-1" style="display:none;"><span>EEG-Einspeisevergütung:</span> <span id="stat-eeg-total" class="text-success fw-bold">--</span></div>
                                         <div id="stat-eeg-note" class="small text-muted mb-2" style="display:none; font-size: 0.7rem;"></div>
+                                        <div id="stat-dv-battery-sale-row" class="d-flex justify-content-between small mb-1" style="display:none;" title="Separater Ist-Erlös aus dem Direktvermarktungs-Tagesreport; nicht in das Endergebnis eingerechnet."><span class="text-muted">DV-Batterieverkauf netto:</span> <span id="stat-dv-battery-sale" class="text-success fw-bold">—</span></div>
+                                        <div id="stat-dv-battery-sale-note" class="small text-muted mb-2" style="display:none; font-size: 0.7rem;"></div>
                                         <hr class="my-2 border-secondary opacity-25">
                                         <div class="small fw-bold text-muted mb-2 text-uppercase" style="font-size: 0.7rem;">Aufschlüsselung (Kosten / Ersparnis)</div>
                                         <div class="d-flex justify-content-between small mb-2"><span>🏠 Haus:</span> <span><span id="stat-cost-home" class="fw-bold">0.00 €</span> / <span id="stat-save-home" class="text-info fw-bold">0.00 €</span></span></div>
@@ -2707,6 +2725,9 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                 const storSollSocEl = document.getElementById('wb-stor-soll-soc');
                 const storIfcEl = document.getElementById('wb-stor-ifc');
                 const storCurveEl = document.getElementById('wb-stor-curve');
+                const storageOperational = typeof storageOperationalDisplay === 'function'
+                    ? storageOperationalDisplay(data)
+                    : null;
                 const storageForecastBadge = document.getElementById('storage-forecast-badge');
                 const storagePlanMeta = window._storagePlanMeta || {};
                 const storageCurveMeta = storagePlanMeta.target_curve_meta || {};
@@ -2756,36 +2777,24 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                     }
                 }
                 if (storStateEl) {
-                    const stRaw = data.storage_state || '--';
-                    const st = String(stRaw).toLowerCase();
-                    const eveningReleaseActive = st === 'parallel_evening_release';
-                    const stLabels = {auto:'AUTO',auto_night_release:'AUTO',charge:'LADEN',discharge:'ENTLADEN',
-                        survived:'SURVIVAL',idle:'IDLE',price_override:'PREIS',
-                        cheap_grid_charge:'PREIS-LADEN',grid_charge:'NETZ-LADEN',
-                        morning_autonomy:'ERHOLUNG',emergency_power:'NOTSTROM',
-                        direct_marketing_eco_plus_pv_store:'DV Eco+ PV speichern',
-                        direct_marketing_eco_plus_headroom_hold:'DV Eco+ Speicherplatz halten',
-                        direct_marketing_eco_plus_headroom_export:'DV Eco+ Speicherplatz schaffen',
-                        direct_marketing_eco_plus_export:'DV Eco+ Einspeisung',
-                        direct_marketing_arbitrage_grid_charge:'DV Arbitrage Netzladen',
-                        direct_marketing_arbitrage_export:'DV Arbitrage Einspeisung',
-                        tl_auto_quiet:'Auto-Ruhe',tl_auto_release:'Auto-Freigabe',tl_curve_auto_relief:'KURVEN-AUTO',ifc_grid_hold:'NETZPUNKT-HALT',
-                        tl_brake:'KURVEN-BREMSE',tl_brake_wb_relief_guard:'WB-KURVENENTLASTUNG',tl_autodump:'KURVEN-ENTLADUNG',
-                        parallel_evening_release:'Freilauf',
-                        tl_idle_grid_guard:'KURVEN-WAECHTER',target_reached_auto:'ZIEL-AUTO',
-                        stopped:'STOP',unknown:'??'};
-                    const stColors = {auto:'#818cf8',auto_night_release:'#818cf8',charge:'#f59e0b',discharge:'#10b981',
-                        price_override:'#06b6d4',cheap_grid_charge:'#22c55e',grid_charge:'#06b6d4',
-                        morning_autonomy:'#38bdf8',emergency_power:'#ef4444',
-                        tl_auto_quiet:'#818cf8',tl_auto_release:'#818cf8',tl_curve_auto_relief:'#38bdf8',ifc_grid_hold:'#94a3b8',
-                        tl_brake:'#6b7280',tl_brake_wb_relief_guard:'#22c55e',tl_autodump:'#f97316',tl_idle_grid_guard:'#38bdf8',
-                        parallel_evening_release:'#818cf8',
-                        target_reached_auto:'#818cf8',
-                        idle:'#6b7280',stopped:'#ef4444'};
-                    storStateEl.textContent = stLabels[st] || data.storage_state_label || String(stRaw).replace(/_/g, ' ').toUpperCase();
-                    storStateEl.style.color = stColors[st] || '#adb5bd';
+                    if (storageOperational) {
+                        storStateEl.textContent = storageOperational.label;
+                        storStateEl.style.color = storageOperational.color;
+                        setStableLiveTitle(
+                            storStateEl,
+                            storageOperational.holdActive
+                                ? storageOperational.badge
+                                : (storageOperational.plannedHint || '')
+                        );
+                    } else {
+                        storStateEl.textContent = data.storage_state_label || data.storage_state || '--';
+                        storStateEl.style.color = '#adb5bd';
+                    }
                 }
-                if (storReasonEl && weatherReserveActive) {
+                if (storReasonEl && storageOperational && storageOperational.holdActive) {
+                    storReasonEl.textContent = storageOperational.detail;
+                    storReasonEl.title = storageOperational.badge;
+                } else if (storReasonEl && weatherReserveActive) {
                     storReasonEl.textContent = weatherReserveText;
                     storReasonEl.title = storagePlanMeta.weather_reserve_reason || storageCurveMeta.weather_reserve_reason || weatherReserveText;
                 } else if (storReasonEl && data.cheap_grid_boost_active && data.cheap_grid_charge && data.cheap_grid_charge.active) {
@@ -3022,6 +3031,24 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                         storCurveEl.textContent = 'Kurve: --';
                         storCurveEl.title = '';
                     }
+                }
+                if (storageOperational && storageOperational.holdActive) {
+                    [storSollSocEl, storIfcEl, storCurveEl].forEach(el => {
+                        if (el) el.style.display = 'none';
+                    });
+                    if (storReasonEl) {
+                        storReasonEl.textContent = storageOperational.detail;
+                        storReasonEl.title = storageOperational.badge;
+                    }
+                } else if (
+                    storReasonEl
+                    && storageOperational
+                    && storageOperational.plannedHint
+                    && !weatherReserveActive
+                    && !data.cheap_grid_boost_active
+                ) {
+                    storReasonEl.textContent = storageOperational.plannedHint;
+                    storReasonEl.title = 'Planung ohne bestätigte Gerätewirkung';
                 }
                 // Budget-Badge
                 const budgetBadge = document.getElementById('wb-budget-badge');

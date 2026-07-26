@@ -7,7 +7,7 @@ on:
         description: "Exact approved release tag"
         required: true
         type: choice
-        options: [v5.3.2b, v5.4.0, v5.4.0a, v5.4.0b, v5.4.0c, v5.4.0d, v5.4.0e, v5.4.1, v5.4.1a, v5.4.1b, v5.4.1c, v5.4.1d]
+        options: [v5.3.2b, v5.4.0, v5.4.0a, v5.4.0b, v5.4.0c, v5.4.0d, v5.4.0e, v5.4.1, v5.4.1a, v5.4.1b, v5.4.1c, v5.4.1d, v5.4.2]
       release_sha:
         description: "Approved 40-hex release commit"
         required: true
@@ -40,6 +40,8 @@ concurrency:
 env:
   REGISTRY: ghcr.io
   DOCKER_BUILD_RECORD_UPLOAD: "false"
+  ROLLBACK_ROOT_IMAGE: ghcr.io/a9xxx/install-e3dc-control:v5.3.2b
+  ROLLBACK_ROOT_INDEX_DIGEST: sha256:da1a42846004249dc45d9848e91af9ea10b1c40a51c9f88fa2e2fec0de2fc35a
 
 jobs:
   validate:
@@ -81,6 +83,42 @@ jobs:
           [ "$(git rev-parse HEAD)" = "$RELEASE_SHA" ]
           [ "$(git rev-parse HEAD^{tree})" = "$RELEASE_TREE" ]
           [ "$(tr -d '[:space:]' < VERSION)" = "${RELEASE_TAG#v}" ]
+          python3 - <<'PY'
+          import ast
+          import json
+          import os
+          from pathlib import Path
+
+          tag = os.environ["RELEASE_TAG"]
+          version = tag.removeprefix("v")
+          policy = json.loads(Path("UPDATE_POLICY.json").read_text(encoding="utf-8"))
+          assert policy.get("version") == version, "UPDATE_POLICY.version passt nicht zum Release-Tag"
+          assert policy.get("stable_release") == tag, "UPDATE_POLICY.stable_release passt nicht zum Release-Tag"
+          module = ast.parse(Path("Installer/__init__.py").read_text(encoding="utf-8"))
+          installer_versions = [
+              ast.literal_eval(node.value)
+              for node in module.body
+              if isinstance(node, ast.Assign)
+              and any(
+                  isinstance(target, ast.Name) and target.id == "__version__"
+                  for target in node.targets
+              )
+          ]
+          assert installer_versions == [version], "Installer.__version__ passt nicht zum Release-Tag"
+          if tag == "v5.4.2":
+              matches = [
+                  item
+                  for item in policy.get("rollback_releases", [])
+                  if isinstance(item, dict)
+                  and item.get("docker_supported") is True
+                  and item.get("docker_image") == os.environ["ROLLBACK_ROOT_IMAGE"]
+              ]
+              assert len(matches) == 1, "v5.4.2 muss genau den gebundenen Docker-Rollback-Root enthalten"
+              assert (
+                  matches[0].get("docker_index_digest")
+                  == os.environ["ROLLBACK_ROOT_INDEX_DIGEST"]
+              ), "Rollback-OCI-Digest weicht ab"
+          PY
           [ "$(git show -s --format='%an|%ae|%cn|%ce' HEAD)" = "A9x|169547159+A9xxx@users.noreply.github.com|A9x|169547159+A9xxx@users.noreply.github.com" ]
           if [ "$RELEASE_TAG" = "v5.3.2b" ]; then
             [ "$RELEASE_SHA" = "$ROOT_SHA" ]
@@ -251,6 +289,33 @@ jobs:
             [ "$(git rev-parse HEAD~11)" = "$ROOT_SHA" ]
             [ "$(git rev-parse 'HEAD~11^{tree}')" = "$ROOT_TREE" ]
             [ "$(git rev-list --parents -n 1 "$ROOT_SHA" | awk '{print NF-1}')" -eq 0 ]
+          elif [ "$RELEASE_TAG" = "v5.4.2" ]; then
+            [ "$(git rev-list --parents -n 1 HEAD | awk '{print NF-1}')" -eq 1 ]
+            [ "$(git rev-list --parents -n 1 HEAD^ | awk '{print NF-1}')" -eq 1 ]
+            [ "$(git rev-list --parents -n 1 HEAD^^ | awk '{print NF-1}')" -eq 1 ]
+            [ "$(git rev-list --parents -n 1 HEAD^^^ | awk '{print NF-1}')" -eq 1 ]
+            [ "$(git rev-list --parents -n 1 HEAD^^^^ | awk '{print NF-1}')" -eq 1 ]
+            [ "$(git rev-list --parents -n 1 HEAD~5 | awk '{print NF-1}')" -eq 1 ]
+            [ "$(git rev-list --parents -n 1 HEAD~6 | awk '{print NF-1}')" -eq 1 ]
+            [ "$(git rev-list --parents -n 1 HEAD~7 | awk '{print NF-1}')" -eq 1 ]
+            [ "$(git rev-list --parents -n 1 HEAD~8 | awk '{print NF-1}')" -eq 1 ]
+            [ "$(git rev-list --parents -n 1 HEAD~9 | awk '{print NF-1}')" -eq 1 ]
+            [ "$(git rev-list --parents -n 1 HEAD~10 | awk '{print NF-1}')" -eq 1 ]
+            [ "$(git rev-list --parents -n 1 HEAD~11 | awk '{print NF-1}')" -eq 1 ]
+            [ "$(git rev-parse HEAD^)" = "a77b4cf7ad4fb48826e537eafee4c974bf252623" ]
+            [ "$(git rev-parse HEAD^^)" = "80dbe96e2f708fd6150536600b28f377c8125927" ]
+            [ "$(git rev-parse HEAD^^^)" = "c8881ae6469232a2a480daae8cd1c7f97be1d069" ]
+            [ "$(git rev-parse HEAD^^^^)" = "d37ee0e5851ab56b8def2d0e63f97a807b300479" ]
+            [ "$(git rev-parse HEAD~5)" = "908464b640dfdae066e9022f56d994689df15eb3" ]
+            [ "$(git rev-parse HEAD~6)" = "f65fb584c7d01a721c41d863f59a140de49be8a1" ]
+            [ "$(git rev-parse HEAD~7)" = "2bad44d80ff24775d8f4e8ff0e99dd07aa516be0" ]
+            [ "$(git rev-parse HEAD~8)" = "a251ba9c346ec227c6ac4785945479fd25cb8839" ]
+            [ "$(git rev-parse HEAD~9)" = "6a1b24c7865b2bbc1c5d21d69b7c73553a0de78e" ]
+            [ "$(git rev-parse HEAD~10)" = "6e4660379c5fcc6849e6b76f49fc4bd727273aa5" ]
+            [ "$(git rev-parse HEAD~11)" = "59e5907d1b517cf04e60611ae6e7765c184b00f8" ]
+            [ "$(git rev-parse HEAD~12)" = "$ROOT_SHA" ]
+            [ "$(git rev-parse 'HEAD~12^{tree}')" = "$ROOT_TREE" ]
+            [ "$(git rev-list --parents -n 1 "$ROOT_SHA" | awk '{print NF-1}')" -eq 0 ]
           else
             exit 1
           fi
@@ -301,12 +366,25 @@ jobs:
         working-directory: release
         run: |
           set -euo pipefail
-          mapfile -t rollback_images < <(python3 -c 'import json; policy=json.load(open("UPDATE_POLICY.json", encoding="utf-8")); print("\n".join(str(item.get("docker_image") or "").strip() for item in policy.get("rollback_releases", []) if isinstance(item, dict) and item.get("docker_supported") is True))')
-          [ "${#rollback_images[@]}" -gt 0 ]
-          for image in "${rollback_images[@]}"; do
+          mapfile -t rollback_bindings < <(python3 -c 'import json; policy=json.load(open("UPDATE_POLICY.json", encoding="utf-8")); print("\n".join(str(item.get("docker_image") or "").strip()+"\t"+str(item.get("docker_index_digest") or "").strip() for item in policy.get("rollback_releases", []) if isinstance(item, dict) and item.get("docker_supported") is True))')
+          [ "${#rollback_bindings[@]}" -gt 0 ]
+          tmpdir="$(mktemp -d)"
+          trap 'rm -rf "$tmpdir"' EXIT
+          n=0
+          for binding in "${rollback_bindings[@]}"; do
+            IFS=$'\t' read -r image expected_digest <<<"$binding"
             [[ "$image" =~ ^ghcr\.io/a9xxx/install-e3dc-control:v[0-9A-Za-z._-]+$ ]]
-            raw="$(docker buildx imagetools inspect --raw "$image")"
-            python3 -c 'import json, sys; data=json.load(sys.stdin); found={str(item.get("platform", {}).get("os"))+"/"+str(item.get("platform", {}).get("architecture")) for item in data.get("manifests", [])}; required={"linux/amd64", "linux/arm64"}; missing=sorted(required-found); assert not missing, "fehlende Plattformen: "+", ".join(missing)' <<<"$raw"
+            if [ -z "$expected_digest" ]; then
+              [ "$image" = "$ROLLBACK_ROOT_IMAGE" ]
+              expected_digest="$ROLLBACK_ROOT_INDEX_DIGEST"
+            fi
+            [[ "$expected_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+            raw_file="$tmpdir/index-$n.json"
+            docker buildx imagetools inspect --raw "$image" > "$raw_file"
+            actual_digest="sha256:$(sha256sum "$raw_file" | awk '{print $1}')"
+            [ "$actual_digest" = "$expected_digest" ]
+            python3 -c 'import json,sys; data=json.load(sys.stdin); assert data.get("mediaType") in {"application/vnd.oci.image.index.v1+json","application/vnd.docker.distribution.manifest.list.v2+json"}; found={str(item.get("platform",{}).get("os"))+"/"+str(item.get("platform",{}).get("architecture")) for item in data.get("manifests",[])}; missing=sorted({"linux/amd64","linux/arm64"}-found); assert not missing, "fehlende Plattformen: "+", ".join(missing)' < "$raw_file"
+            n=$((n + 1))
           done
       - uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
@@ -396,12 +474,25 @@ jobs:
         working-directory: release
         run: |
           set -euo pipefail
-          mapfile -t rollback_images < <(python3 -c 'import json; policy=json.load(open("UPDATE_POLICY.json", encoding="utf-8")); print("\n".join(str(item.get("docker_image") or "").strip() for item in policy.get("rollback_releases", []) if isinstance(item, dict) and item.get("docker_supported") is True))')
-          [ "${#rollback_images[@]}" -gt 0 ]
-          for image in "${rollback_images[@]}"; do
+          mapfile -t rollback_bindings < <(python3 -c 'import json; policy=json.load(open("UPDATE_POLICY.json", encoding="utf-8")); print("\n".join(str(item.get("docker_image") or "").strip()+"\t"+str(item.get("docker_index_digest") or "").strip() for item in policy.get("rollback_releases", []) if isinstance(item, dict) and item.get("docker_supported") is True))')
+          [ "${#rollback_bindings[@]}" -gt 0 ]
+          tmpdir="$(mktemp -d)"
+          trap 'rm -rf "$tmpdir"' EXIT
+          n=0
+          for binding in "${rollback_bindings[@]}"; do
+            IFS=$'\t' read -r image expected_digest <<<"$binding"
             [[ "$image" =~ ^ghcr\.io/a9xxx/install-e3dc-control:v[0-9A-Za-z._-]+$ ]]
-            raw="$(docker buildx imagetools inspect --raw "$image")"
-            python3 -c 'import json, sys; data=json.load(sys.stdin); found={str(item.get("platform", {}).get("os"))+"/"+str(item.get("platform", {}).get("architecture")) for item in data.get("manifests", [])}; required={"linux/amd64", "linux/arm64"}; missing=sorted(required-found); assert not missing, "fehlende Plattformen: "+", ".join(missing)' <<<"$raw"
+            if [ -z "$expected_digest" ]; then
+              [ "$image" = "$ROLLBACK_ROOT_IMAGE" ]
+              expected_digest="$ROLLBACK_ROOT_INDEX_DIGEST"
+            fi
+            [[ "$expected_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+            raw_file="$tmpdir/index-$n.json"
+            docker buildx imagetools inspect --raw "$image" > "$raw_file"
+            actual_digest="sha256:$(sha256sum "$raw_file" | awk '{print $1}')"
+            [ "$actual_digest" = "$expected_digest" ]
+            python3 -c 'import json,sys; data=json.load(sys.stdin); assert data.get("mediaType") in {"application/vnd.oci.image.index.v1+json","application/vnd.docker.distribution.manifest.list.v2+json"}; found={str(item.get("platform",{}).get("os"))+"/"+str(item.get("platform",{}).get("architecture")) for item in data.get("manifests",[])}; missing=sorted({"linux/amd64","linux/arm64"}-found); assert not missing, "fehlende Plattformen: "+", ".join(missing)' < "$raw_file"
+            n=$((n + 1))
           done
       - uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
@@ -464,7 +555,7 @@ jobs:
           docker buildx imagetools create --tag "${image}:${version}" "${image}@${digest}"
           [ "$(docker buildx imagetools inspect "${image}:${RELEASE_TAG}" | awk '$1 == "Digest:" {print $2; exit}')" = "$digest" ]
           [ "$(docker buildx imagetools inspect "${image}:${version}" | awk '$1 == "Digest:" {print $2; exit}')" = "$digest" ]
-          if [ "$RELEASE_TAG" = "v5.4.1d" ]; then
+          if [ "$RELEASE_TAG" = "v5.4.2" ]; then
             docker buildx imagetools create --tag "${image}:latest" "${image}@${digest}"
             [ "$(docker buildx imagetools inspect "${image}:latest" | awk '$1 == "Digest:" {print $2; exit}')" = "$digest" ]
           fi

@@ -19,12 +19,25 @@ import math
 import time
 from datetime import datetime
 
+try:
+    from .pv_forecast_topology import (
+        build_pv_forecast_topology,
+        has_explicit_topology_config,
+    )
+except ImportError:
+    from pv_forecast_topology import (
+        build_pv_forecast_topology,
+        has_explicit_topology_config,
+    )
+
 
 SLOT_MS = 15 * 60 * 1000
 OWNER_CONTRACT_VERSION = 1
 POLICY_SCHEMA = "direct_marketing_policy_v1"
 VALID_MODES = {"safe", "eco", "eco_plus", "arbitrage"}
 VALID_PROFIT_PROFILES = {"standard", "aggressive", "expert"}
+AUX_AC_STORAGE_MODES = {"off", "reserve_only", "economic"}
+AUX_AC_POSITIVE_MARGIN_EPSILON_CT = 1e-6
 MODE_PROFILES = {
     "safe": {"low_score_min": 75.0, "high_score_max": 25.0, "economic_basis": "house_supply"},
     "eco": {"low_score_min": 70.0, "high_score_max": 30.0, "economic_basis": "pv_shift"},
@@ -114,6 +127,167 @@ def _configured_optional_float(config, key):
     return safe_float(raw, 0.0)
 
 
+def _normalize_aux_ac_storage_mode(config):
+    """Liest den neuen AC-Modus fail-safe und migriert nur explizite Altfreigaben.
+
+    Der frühere Bool-Schalter war eine Nutzerfreigabe, enthielt aber keine
+    wirtschaftliche Aussage. ``true`` wird deshalb ausschließlich auf den
+    konservativen Modus ``reserve_only`` abgebildet. Fehlende, leere oder
+    unbekannte Werte bleiben ``off``.
+    """
+
+    config = config or {}
+    canonical_keys = (
+        "direct_marketing_aux_inverter_ac_storage_mode",
+        "direct_marketing_pv_store_aux_ac_mode",
+    )
+    for key in canonical_keys:
+        if key not in config:
+            continue
+        raw = str(config.get(key) or "").strip().lower().replace("-", "_").replace(" ", "_")
+        aliases = {
+            "aus": "off",
+            "disabled": "off",
+            "reserve": "reserve_only",
+            "reserve_sichern": "reserve_only",
+            "reserve_only": "reserve_only",
+            "wirtschaftlich": "economic",
+            "economical": "economic",
+            "economic": "economic",
+        }
+        mode = aliases.get(raw, raw)
+        return (
+            mode if mode in AUX_AC_STORAGE_MODES else "off",
+            key if mode in AUX_AC_STORAGE_MODES else "%s_invalid" % key,
+        )
+
+    legacy_key = "direct_marketing_aux_inverter_ac_storage_enable"
+    if legacy_key in config and cfg_bool(config.get(legacy_key), False):
+        return "reserve_only", "legacy_bool_explicit_true"
+    return "off", "default_off"
+
+
+def _pv_store_route_efficiencies(config):
+    """Getrennte Lade- und Entladewirkungsgrade für DC- und Zusatz-AC-Routen."""
+
+    config = config or {}
+    dc_charge_pct = _clamp(
+        safe_float(config.get("direct_marketing_pv_store_dc_charge_efficiency_pct"), 96.0),
+        50.0,
+        100.0,
+    )
+    aux_ac_charge_pct = _clamp(
+        safe_float(config.get("direct_marketing_pv_store_aux_ac_charge_efficiency_pct"), 90.0),
+        50.0,
+        100.0,
+    )
+    discharge_pct = _clamp(
+        safe_float(config.get("direct_marketing_pv_store_discharge_efficiency_pct"), 95.0),
+        50.0,
+        100.0,
+    )
+    return {
+        "dc_charge_pct": dc_charge_pct,
+        "aux_ac_charge_pct": aux_ac_charge_pct,
+        "discharge_pct": discharge_pct,
+        "dc_charge": dc_charge_pct / 100.0,
+        "aux_ac_charge": aux_ac_charge_pct / 100.0,
+        "discharge": discharge_pct / 100.0,
+        "dc_route_pct": dc_charge_pct * discharge_pct / 100.0,
+        "aux_ac_route_pct": aux_ac_charge_pct * discharge_pct / 100.0,
+    }
+
+
+def _optional_contract_bool(value):
+    if value is None or str(value).strip() == "":
+        return None
+    return cfg_bool(value, False)
+
+
+def _slot_numeric_present(slot, keys):
+    for key in keys:
+        if key not in (slot or {}):
+            continue
+        value = slot.get(key)
+        if value is None or isinstance(value, bool) or str(value).strip() == "":
+            continue
+        try:
+            if math.isfinite(float(str(value).replace(",", "."))):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _slot_source_split_contract(slot):
+    """Defensiver Adapter für alte und neue Topologie-/Forecast-Slotverträge."""
+
+    slot = slot or {}
+    topology_status = str(
+        slot.get("pv_topology_status")
+        or slot.get("pv_source_split_status")
+        or slot.get("generator_group_projection_status")
+        or ""
+    ).strip().lower()
+    topology_quality = str(
+        slot.get("pv_topology_quality")
+        or slot.get("pv_source_split_quality")
+        or ""
+    ).strip().lower()
+    projection_status = str(
+        slot.get("pv_resource_projection_status")
+        or slot.get("provider_projection_status")
+        or slot.get("generator_group_provider_status")
+        or ""
+    ).strip().lower()
+    topology_revision = str(
+        slot.get("pv_topology_revision")
+        or slot.get("pv_source_split_revision")
+        or slot.get("topology_revision")
+        or ""
+    ).strip()
+    complete = bool(
+        topology_status in {"bound", "complete"}
+        and topology_quality in {"complete", "bound"}
+        and projection_status in {"complete", "bound"}
+        and _slot_numeric_present(slot, ("e3dc_dc_pv_w",))
+        and _slot_numeric_present(slot, ("external_ac_pv_w",))
+    )
+
+    freshness = None
+    for key in (
+        "pv_forecast_fresh",
+        "forecast_fresh",
+        "pv_source_split_fresh",
+        "provider_forecast_fresh",
+    ):
+        if key in slot:
+            freshness = _optional_contract_bool(slot.get(key))
+            break
+    producer_freshness_source = ""
+    for key in (
+        "pv_forecast_freshness_source",
+        "forecast_freshness_source",
+        "pv_source_split_freshness_source",
+    ):
+        if key in slot and str(slot.get(key) or "").strip():
+            producer_freshness_source = str(slot.get(key)).strip()
+            break
+    freshness_source = (
+        producer_freshness_source
+        or ("explicit_slot_flag" if freshness is not None else "unconfirmed")
+    )
+    return {
+        "status": topology_status or "missing",
+        "quality": topology_quality or "missing",
+        "projection_status": projection_status or "missing",
+        "revision": topology_revision or None,
+        "complete": complete,
+        "fresh": bool(freshness is True),
+        "freshness_source": freshness_source,
+    }
+
+
 def _numeric_token(value):
     text = str(value or "").strip().replace(",", ".")
     keep = []
@@ -149,22 +323,53 @@ def _parse_eeg_tariff_tiers(raw):
 
 
 def _configured_pv_capacity_kwp(config):
+    config = config or {}
+    if has_explicit_topology_config(config):
+        topology = build_pv_forecast_topology(config)
+        if (
+            topology.get("contract_mode") != "explicit_generator_groups"
+            or topology.get("status") != "bound"
+        ):
+            return None
+        resources = [
+            item
+            for item in topology.get("resources", [])
+            if isinstance(item, dict)
+        ]
+        capacities = []
+        for item in resources:
+            kwp = safe_float(item.get("kwp"), float("nan"))
+            if (
+                not math.isfinite(kwp)
+                or kwp <= 0.0
+                or safe_int(item.get("surface_count"), 0) <= 0
+                or str(item.get("coupling") or "") not in {"E3DC_DC", "EXTERNAL_AC"}
+            ):
+                return None
+            capacities.append(kwp)
+        return sum(capacities) if capacities else None
+
     total = 0.0
+    configured = False
     for key in ("forecast1", "forecast2", "forecast3", "forecast4", "forecast5"):
-        raw = str((config or {}).get(key) or "").strip()
+        raw = str(config.get(key) or "").strip()
         if not raw:
             continue
+        configured = True
         parts = [part.strip() for part in raw.split("/")]
         if len(parts) < 3:
-            continue
+            return None
         kwp = _numeric_token(parts[2])
-        if kwp is not None and kwp > 0:
-            total += kwp
-    return total
+        if kwp is None or kwp <= 0:
+            return None
+        total += kwp
+    return total if configured and total > 0.0 else None
 
 
 def _weighted_eeg_rate_ct(tiers, capacity_kwp):
     if not tiers:
+        return None
+    if capacity_kwp is None:
         return None
     if capacity_kwp <= 0.0:
         return min(rate for _, rate in tiers)
@@ -362,17 +567,76 @@ def _slot_power_present(slot, keys):
     return False
 
 
-def _slot_forecast_power(slot):
+def _external_ac_source_configured(config):
+    """True, wenn die Konfiguration einen externen AC-PV-Pfad erkennen lässt."""
+
+    config = config or {}
+    if safe_float(config.get("pv_external_ac_inverter_limit_w"), 0.0) > 0.0:
+        return True
+    aux_ac_mode, _mode_source = _normalize_aux_ac_storage_mode(config)
+    if aux_ac_mode != "off":
+        return True
+    try:
+        topology = build_pv_forecast_topology(config)
+    except Exception:
+        topology = {}
+    if any(
+        str(item.get("coupling") or "").strip().upper() == "EXTERNAL_AC"
+        for item in topology.get("resources", [])
+        if isinstance(item, dict)
+    ):
+        return True
+    if cfg_bool(config.get("direct_marketing_aux_inverter_ac_storage_enable"), False):
+        return True
+    if str(config.get("direct_marketing_aux_inverter_shelly_override") or "").strip().lower() == "central":
+        return True
+    if str(config.get("direct_marketing_aux_inverter_shelly_ip") or "").strip():
+        return True
+    nested = config.get("direct_marketing_aux_inverter_shelly")
+    if isinstance(nested, dict):
+        if str(nested.get("override") or "").strip().lower() == "central":
+            return True
+        if str(nested.get("ip") or "").strip():
+            return True
+    return any(
+        str(config.get(key) or "").strip().upper().replace("-", "_") == "EXTERNAL_AC"
+        for key in (
+            "pv_forecast_coupling_fc1",
+            "pv_forecast_coupling_fc2",
+            "pv_forecast_coupling_fc3",
+            "pv_forecast_coupling_fc4",
+        )
+    )
+
+
+def _slot_forecast_power(slot, assume_total_pv_is_e3dc_dc=False):
+    source_split = _slot_source_split_contract(slot)
     pv_w = _slot_power(slot, ("pv_w", "pv", "PV_Power"))
-    e3dc_pv_w = _slot_power(slot, ("e3dc_pv_w", "pv_dc_w", "E3DC_PV_Power"))
-    external_pv_w = _slot_power(slot, ("external_pv_w", "ext_pv_w", "Ext_PV_Power"))
-    has_e3dc_pv_forecast = _slot_power_present(slot, ("e3dc_pv_w", "pv_dc_w", "E3DC_PV_Power"))
+    e3dc_keys = ("e3dc_dc_pv_w", "e3dc_pv_w", "pv_dc_w", "E3DC_PV_Power")
+    external_keys = ("external_ac_pv_w", "external_pv_w", "ext_pv_w", "Ext_PV_Power")
+    e3dc_pv_w = _slot_power(slot, e3dc_keys)
+    external_pv_w = _slot_power(slot, external_keys)
+    has_e3dc_pv_forecast = _slot_power_present(slot, e3dc_keys)
+    if has_e3dc_pv_forecast:
+        e3dc_pv_forecast_source = (
+            "bound_pv_topology"
+            if _slot_power_present(slot, ("e3dc_dc_pv_w",))
+            else "explicit_e3dc_pv_forecast"
+        )
+    elif assume_total_pv_is_e3dc_dc and _slot_power_present(slot, ("pv_w", "pv", "PV_Power")):
+        e3dc_pv_w = pv_w
+        has_e3dc_pv_forecast = True
+        e3dc_pv_forecast_source = "total_pv_without_external_ac_configuration"
+    else:
+        e3dc_pv_forecast_source = "missing"
     home_w = _slot_power(slot, ("home_w", "home", "Home_Power", "load_w"))
     wp_w = _slot_power(slot, ("wp_w", "heatpump_w", "WP_Power"))
     heater_w = _slot_power(slot, ("heater_w", "heizstab_w", "Heizstab_Power"))
     wallbox_w = _slot_power(slot, ("wallbox_w", "Wallbox_Power", "wb_w"))
     has_power = bool(
         _slot_power_present(slot, ("pv_w", "pv", "PV_Power", "surplus_w", "surplus"))
+        or _slot_power_present(slot, e3dc_keys)
+        or _slot_power_present(slot, external_keys)
         or _slot_power_present(slot, ("home_w", "home", "Home_Power", "load_w"))
         or _slot_power_present(slot, ("wp_w", "heatpump_w", "WP_Power"))
         or _slot_power_present(slot, ("heater_w", "heizstab_w", "Heizstab_Power"))
@@ -383,12 +647,14 @@ def _slot_forecast_power(slot):
     else:
         surplus_w = pv_w - home_w - wp_w - heater_w - wallbox_w
     controlled_load_w = home_w + wp_w + heater_w + wallbox_w
-    dc_surplus_w = max(0.0, e3dc_pv_w - controlled_load_w) if has_e3dc_pv_forecast else 0.0
+    local_load_after_external_w = max(0.0, controlled_load_w - external_pv_w)
+    dc_surplus_w = max(0.0, e3dc_pv_w - local_load_after_external_w) if has_e3dc_pv_forecast else 0.0
     return {
         "pv_w": pv_w,
         "e3dc_pv_w": e3dc_pv_w,
         "external_pv_w": external_pv_w,
         "has_e3dc_pv_forecast": has_e3dc_pv_forecast,
+        "e3dc_pv_forecast_source": e3dc_pv_forecast_source,
         "home_w": home_w,
         "wp_w": wp_w,
         "heater_w": heater_w,
@@ -397,6 +663,13 @@ def _slot_forecast_power(slot):
         "forecast_dc_surplus_w": dc_surplus_w,
         "forecast_deficit_w": max(0.0, -surplus_w),
         "has_power_forecast": has_power,
+        "pv_topology_status": source_split["status"],
+        "pv_topology_quality": source_split["quality"],
+        "pv_resource_projection_status": source_split["projection_status"],
+        "pv_topology_revision": source_split["revision"],
+        "pv_store_source_split_complete": source_split["complete"],
+        "pv_store_forecast_fresh": source_split["fresh"],
+        "pv_store_forecast_freshness_source": source_split["freshness_source"],
     }
 
 
@@ -474,11 +747,19 @@ def _settlement_accounting(config):
     config = config or {}
     capacity_override = _configured_optional_float(config, "direct_marketing_installed_kwp")
     forecast_capacity_kwp = _configured_pv_capacity_kwp(config)
-    installed_kwp = max(
-        0.0,
-        safe_float(capacity_override, forecast_capacity_kwp)
+    installed_capacity_value = (
+        capacity_override
         if capacity_override is not None and capacity_override > 0.0
-        else forecast_capacity_kwp,
+        else forecast_capacity_kwp
+    )
+    installed_capacity_known = bool(
+        installed_capacity_value is not None
+        and safe_float(installed_capacity_value, 0.0) > 0.0
+    )
+    installed_kwp = (
+        max(0.0, safe_float(installed_capacity_value, 0.0))
+        if installed_capacity_known
+        else 0.0
     )
     monthly_fee_net = max(0.0, safe_float(config.get("direct_marketing_monthly_fee_eur"), 0.0))
     balancing_estimate_per_kwp = max(
@@ -512,7 +793,20 @@ def _settlement_accounting(config):
             "input_vat_recoverable": sample["input_vat_recoverable"],
             "cost_multiplier": round(vat_multiplier, 6),
         },
-        "installed_capacity_kwp": round(installed_kwp, 3),
+        "installed_capacity_kwp": (
+            round(installed_kwp, 3)
+            if installed_capacity_known
+            else None
+        ),
+        "installed_capacity_source": (
+            "manual_override"
+            if capacity_override is not None and capacity_override > 0.0
+            else (
+                "forecast_topology"
+                if forecast_capacity_kwp is not None
+                else "missing_or_invalid"
+            )
+        ),
         "monthly_service_fee": {
             "net_eur": round(monthly_fee_net, 2),
             "effective_eur": round(monthly_fee_net * vat_multiplier, 2),
@@ -1324,6 +1618,11 @@ def _build_policy_decision_legacy(
             decision["block_reason"] = "Negative price observed, but PV storage control is not released"
             decision["blocked"] = False
             return decision
+        if negative_window is None:
+            decision["dv_target_state"] = "HOLD"
+            decision["block_reason"] = "Negative price observed, but no physically allocated PV storage slot is executable"
+            decision["blocked"] = False
+            return decision
         charge_headroom_wh = max(
             0.0,
             safe_float(capacity_wh, 0.0) - safe_float(reserve_policy.get("current_storage_wh"), 0.0),
@@ -1333,12 +1632,12 @@ def _build_policy_decision_legacy(
             decision["block_reason"] = "Negative price hard: storage charge headroom exhausted"
             decision["blocked"] = False
             return decision
-        charge_w = max(0.0, safe_float(flags.get("pv_store_max_w"), 0.0))
-        if charge_w <= 0.0:
-            charge_w = max(0.0, safe_float(config.get("maximumladeleistung"), 0.0))
-        if current_slot.get("has_power_forecast"):
-            surplus_w = max(0.0, safe_float(current_slot.get("forecast_surplus_w"), 0.0))
-            charge_w = min(charge_w, surplus_w) if charge_w > 0.0 and surplus_w > 0.0 else charge_w
+        charge_w = max(0.0, safe_float(negative_window.get("max_power_w"), 0.0))
+        if charge_w < 300.0:
+            decision["dv_target_state"] = "HOLD"
+            decision["block_reason"] = "Negative price observed, but allocated PV storage power is below dispatch minimum"
+            decision["blocked"] = False
+            return decision
         decision.update({
             "commands_allowed": True,
             "dv_target_state": "FORCE_CHARGE_PV",
@@ -1365,6 +1664,12 @@ def _build_policy_decision_legacy(
                 "reason": "negative_price",
                 "start_ts": (negative_window or {}).get("start_ts", current_slot.get("ts")),
                 "end_ts": (negative_window or {}).get("end_ts", current_slot.get("end_ts")),
+                "pv_store_source_contract": (negative_window or {}).get("pv_store_source_contract"),
+                "pv_store_dc_only_enable": (negative_window or {}).get("pv_store_dc_only_enable"),
+                "pv_store_aux_ac_storage_enable": (negative_window or {}).get("pv_store_aux_ac_storage_enable"),
+                "pv_store_aux_ac_storage_allowed": (negative_window or {}).get("pv_store_aux_ac_storage_allowed"),
+                "pv_store_dc_forecast_complete": (negative_window or {}).get("pv_store_dc_forecast_complete"),
+                "pv_store_dc_forecast_deficit_wh": (negative_window or {}).get("pv_store_dc_forecast_deficit_wh"),
                 **export_constraint,
             },
         })
@@ -1532,6 +1837,12 @@ def _build_policy_decision_legacy(
                 "hard_export_limit_w": pv_store_window.get("hard_export_limit_w") if hard_export_limit else None,
                 "export_constraint_scope": str(pv_store_window.get("export_constraint_scope") or "storage_priority"),
                 "pv_export_allowed": pv_export_allowed,
+                "pv_store_source_contract": pv_store_window.get("pv_store_source_contract"),
+                "pv_store_dc_only_enable": pv_store_window.get("pv_store_dc_only_enable"),
+                "pv_store_aux_ac_storage_enable": pv_store_window.get("pv_store_aux_ac_storage_enable"),
+                "pv_store_aux_ac_storage_allowed": pv_store_window.get("pv_store_aux_ac_storage_allowed"),
+                "pv_store_dc_forecast_complete": pv_store_window.get("pv_store_dc_forecast_complete"),
+                "pv_store_dc_forecast_deficit_wh": pv_store_window.get("pv_store_dc_forecast_deficit_wh"),
             },
         })
         return decision
@@ -1625,17 +1936,25 @@ def _build_policy_decision_legacy(
         })
         return decision
 
-    hold_window = _policy_current_window(windows, now_ms, {"eco_house_supply", "eco_plus_house_supply", "safe_house_supply"})
-    if hold_window:
+    house_supply_window = _policy_current_window(
+        windows,
+        now_ms,
+        {"eco_house_supply", "eco_plus_house_supply", "safe_house_supply"},
+    )
+    if house_supply_window:
         decision.update({
-            "dv_target_state": "HOLD",
-            "block_reason": "Hold: Mid-Price Zone",
+            # Hausversorgung ist ein vollständig geplanter, aber passiver
+            # Abschnitt. Die Direktvermarktung gibt den Speicher frei; der
+            # normale Storage Manager beziehungsweise E3/DC-AUTO entscheidet.
+            "commands_allowed": False,
+            "dv_target_state": "NORMAL",
+            "block_reason": "Hausversorgung: Speicherregelung bleibt im normalen AUTO-Pfad",
             "blocked": False,
             "selected_window": {
-                "action": hold_window.get("action"),
-                "reason": hold_window.get("reason"),
-                "start_ts": hold_window.get("start_ts"),
-                "end_ts": hold_window.get("end_ts"),
+                "action": house_supply_window.get("action"),
+                "reason": house_supply_window.get("reason"),
+                "start_ts": house_supply_window.get("start_ts"),
+                "end_ts": house_supply_window.get("end_ts"),
             },
         })
         return decision
@@ -1645,8 +1964,9 @@ def _build_policy_decision_legacy(
         decision["blocked"] = True
     else:
         decision.update({
-            "dv_target_state": "HOLD",
-            "block_reason": "Hold: future opportunity value exceeds current window",
+            "commands_allowed": False,
+            "dv_target_state": "NORMAL",
+            "block_reason": "Hausversorgung: bis zum nächsten aktiven Planfenster AUTO",
             "blocked": False,
         })
     return decision
@@ -1756,7 +2076,7 @@ def _enrich_policy_candidate_contract(decision, windows, now_ms):
     target_state = str(result.get("dv_target_state") or "").strip().upper()
     budget = result.get("storage_budget") if isinstance(result.get("storage_budget"), dict) else {}
     execution_required = bool(
-        target_state in {"FORCE_EXPORT", "FORCE_CHARGE_PV", "HEADROOM_EXPORT"}
+        target_state in {"FORCE_EXPORT", "FORCE_CHARGE_PV", "HEADROOM_EXPORT", "CHARGE_BLOCK_WAIT"}
         and result.get("commands_allowed")
         and not result.get("blocked")
         and selected_action
@@ -1778,7 +2098,7 @@ def _enrich_policy_candidate_contract(decision, windows, now_ms):
         executable = executable and safe_float(budget.get("export_budget_w"), 0.0) > 0.0
     elif target_state == "FORCE_CHARGE_PV":
         executable = executable and safe_float(budget.get("charge_budget_w"), 0.0) > 0.0
-    elif target_state != "HEADROOM_EXPORT":
+    elif target_state not in {"HEADROOM_EXPORT", "CHARGE_BLOCK_WAIT"}:
         executable = False
     result["executable_action"] = selected_action if executable else None
     return result
@@ -2066,6 +2386,237 @@ def _build_policy_timeline(
     return timeline
 
 
+def _build_charge_block_wait_policy_slots(
+    policy_timeline,
+    annotated,
+    flags,
+    mode,
+    now_ms,
+):
+    """Materialisiert nur explizite Headroom-Warteslots.
+
+    Der Producer prüft den lückenlosen 15-Minuten-Plan semantisch. Neutrale
+    NORMAL-/HOLD-Abschnitte bleiben passive Hausversorgung und erzeugen keinen
+    Speicherbefehl. Nur ein bereits typisierter Headroom-Hold vor einem
+    konkreten Aufnahmefenster wird als CHARGE_BLOCK_WAIT materialisiert.
+    Bestehende PV- und Exportentscheidungen bleiben eigene typisierte Slots.
+    """
+
+    report = {
+        "schema": "direct_marketing_charge_block_wait_plan_v1",
+        "complete": False,
+        "slot_duration_ms": SLOT_MS,
+        "slot_count": 0,
+        "contiguous_900s": False,
+        "wait_slot_count": 0,
+        "neutral_slot_count": 0,
+        "synthesized_neutral_slot_count": 0,
+        "existing_action_slot_count": 0,
+        "action_gap_slot_count": 0,
+        "reason": "not_applicable",
+    }
+    if mode != "eco_plus" or not cfg_bool(flags.get("commands_allowed"), False):
+        report["reason"] = "strategy_not_released"
+        return [], [], report
+    if not cfg_bool(flags.get("pv_store_enable"), False):
+        # Ohne freigegebene PV-Speicherstrategie gibt es kein gebundenes
+        # späteres Aufnahmefenster. Ein ganztägiger Ladeblock würde die
+        # Nutzer-Aus-Semantik verletzen und könnte die normale PV-Ladung
+        # unnötig verhindern.
+        report["reason"] = "pv_store_strategy_disabled"
+        return [], [], report
+
+    slots = sorted(
+        (
+            {
+                "start_ts": safe_int(item.get("ts"), 0),
+                "end_ts": safe_int(item.get("end_ts"), 0),
+            }
+            for item in (annotated or [])
+            if isinstance(item, dict)
+        ),
+        key=lambda item: item["start_ts"],
+    )
+    slots = [
+        item for item in slots
+        if item["start_ts"] > 0
+        and item["end_ts"] - item["start_ts"] == SLOT_MS
+        and item["end_ts"] > now_ms
+    ]
+    if not slots:
+        report["reason"] = "planned_900s_slots_missing"
+        return [], [], report
+    contiguous = all(
+        right["start_ts"] == left["end_ts"]
+        for left, right in zip(slots, slots[1:])
+    )
+    report.update({
+        "slot_count": len(slots),
+        "contiguous_900s": contiguous,
+    })
+    if not contiguous:
+        report["reason"] = "planned_900s_slots_not_contiguous"
+        return [], [], report
+
+    decisions = [item for item in (policy_timeline or []) if isinstance(item, dict)]
+
+    def decisions_for_slot(slot):
+        return [
+            item for item in decisions
+            if safe_int(item.get("start_ts"), 0) <= slot["start_ts"]
+            and slot["end_ts"] <= safe_int(item.get("end_ts"), 0)
+        ]
+
+    slot_decisions = [(slot, decisions_for_slot(slot)) for slot in slots]
+    waits = []
+    synthesized_neutral_slots = []
+    neutral_slots = 0
+    existing_action_slots = 0
+    action_gaps = 0
+    for slot, matches in slot_decisions:
+        if len(matches) > 1:
+            # Eine überlappende Policy-Auswahl wäre eine zweite implizite
+            # Entscheiderkante. Sie bleibt ein sichtbarer Safety-Gap.
+            action_gaps += 1
+            continue
+        decision = matches[0] if matches else None
+        if not isinstance(decision, dict):
+            # Ein vorhandener, vollständig validierter 900-s-Inputslot ohne
+            # gerichtete Policy-Aktion ist semantisch Hausversorgung/AUTO.
+            # Er ist keine Lücke und rechtfertigt keinen Hardware-Intent.
+            neutral = _policy_empty_decision("", {}, flags)
+            neutral.update({
+                "commands_allowed": False,
+                "dv_target_state": "NORMAL",
+                "blocked": False,
+                "block_reason": "Hausversorgung: Speicherregelung bleibt im normalen AUTO-Pfad",
+                "start_ts": slot["start_ts"],
+                "end_ts": slot["end_ts"],
+                "source_action": "eco_plus_house_supply",
+                "source_reason": "neutral_dv_slot",
+                "executable_action": None,
+                "execution_window": None,
+                "selected_window": {
+                    "action": "eco_plus_house_supply",
+                    "reason": "neutral_dv_slot",
+                    "start_ts": slot["start_ts"],
+                    "end_ts": slot["end_ts"],
+                },
+            })
+            synthesized_neutral_slots.append(neutral)
+            neutral_slots += 1
+            continue
+        target = str(decision.get("dv_target_state") or "").upper()
+        storage_budget = (
+            decision.get("storage_budget")
+            if isinstance(decision.get("storage_budget"), dict)
+            else {}
+        )
+        headroom_hold = bool(
+            target == "HEADROOM_EXPORT"
+            and (
+                storage_budget.get("headroom_hold_active") is True
+                or safe_float(storage_budget.get("export_budget_w"), 0.0) < 300.0
+            )
+        )
+        if target in {"FORCE_EXPORT", "FORCE_CHARGE_PV", "HEADROOM_EXPORT"} and not headroom_hold:
+            selected = (
+                decision.get("selected_window")
+                if isinstance(decision.get("selected_window"), dict)
+                else {}
+            )
+            execution = (
+                decision.get("execution_window")
+                if isinstance(decision.get("execution_window"), dict)
+                else {}
+            )
+            selected_action = str(selected.get("action") or "")
+            execution_start = safe_int(execution.get("start_ts"), 0)
+            execution_end = safe_int(execution.get("end_ts"), 0)
+            execution_valid = bool(
+                execution.get("contract_version") == 1
+                and execution.get("action") == selected_action
+                and str(decision.get("source_action") or "") == selected_action
+                and str(decision.get("executable_action") or "") == selected_action
+                and execution_start <= slot["start_ts"] < slot["end_ts"] <= execution_end
+            )
+            if (
+                decision.get("commands_allowed") is True
+                and decision.get("blocked") is False
+                and execution_valid
+            ):
+                existing_action_slots += 1
+                continue
+            action_gaps += 1
+            continue
+        if (
+            target not in {"HOLD", "NORMAL"}
+            and not headroom_hold
+        ) or decision.get("blocked") is True:
+            action_gaps += 1
+            continue
+        if target in {"HOLD", "NORMAL"} and not headroom_hold:
+            neutral_slots += 1
+            continue
+        window_id = "charge-block-wait:%d" % slot["start_ts"]
+        selected_window = {
+            "action": "direct_marketing_charge_block_wait",
+            "reason": "headroom_reservation_hold",
+            "start_ts": slot["start_ts"],
+            "end_ts": slot["end_ts"],
+            "window_id": window_id,
+        }
+        wait = dict(decision)
+        wait.update({
+            "commands_allowed": True,
+            "dv_target_state": "CHARGE_BLOCK_WAIT",
+            "storage_budget": {
+                **(
+                    decision.get("storage_budget")
+                    if isinstance(decision.get("storage_budget"), dict)
+                    else {}
+                ),
+                "export_budget_w": 0,
+                "charge_budget_w": 0,
+            },
+            "blocked": False,
+            "block_reason": (
+                "Typisierter Headroom-Halteslot mit Ladesperre"
+            ),
+            "selected_window": selected_window,
+            "source_action": "direct_marketing_charge_block_wait",
+            "executable_action": "direct_marketing_charge_block_wait",
+            "execution_window": {
+                "contract_version": 1,
+                "action": "direct_marketing_charge_block_wait",
+                "start_ts": slot["start_ts"],
+                "end_ts": slot["end_ts"],
+                "plan_window_start_ts": slot["start_ts"],
+                "plan_window_end_ts": slot["end_ts"],
+                "origin_start_ts": slot["start_ts"],
+                "window_id": window_id,
+                "source": "active_plan_window",
+            },
+        })
+        waits.append(wait)
+
+    report.update({
+        "complete": (
+            action_gaps == 0
+            and len(slots) == len(waits) + neutral_slots + existing_action_slots
+        ),
+        "wait_slot_count": len(waits),
+        "neutral_slot_count": neutral_slots,
+        "synthesized_neutral_slot_count": len(synthesized_neutral_slots),
+        "existing_action_slot_count": existing_action_slots,
+        "action_gap_slot_count": action_gaps,
+        "reason": "ok" if action_gaps == 0 else "typed_action_coverage_incomplete",
+    })
+    if not report["complete"]:
+        return [], [], report
+    return waits, synthesized_neutral_slots, report
+
+
 def _base_plan(mode, reason, now_ms, blocked_reasons=None, economics=None, reserve=None, flags=None):
     plan_flags = flags or {}
     plan_flags.setdefault("commands_allowed", False)
@@ -2095,6 +2646,10 @@ def _base_plan(mode, reason, now_ms, blocked_reasons=None, economics=None, reser
         "blocked_reasons": list(blocked_reasons or []),
         "policy_decision": policy_decision,
         "policy_timeline": [],
+        "pv_store_allocation": _empty_pv_store_allocation_diagnostic(
+            plan_flags,
+            reason,
+        ),
         "future_pv_store_reservation": {
             "schema": "direct_marketing_future_pv_store_reservation_v1",
             "active": False,
@@ -2258,6 +2813,7 @@ def _new_slot_action(slot, action, reason, extra=None):
         "e3dc_pv_w",
         "external_pv_w",
         "has_e3dc_pv_forecast",
+        "e3dc_pv_forecast_source",
         "home_w",
         "wp_w",
         "heater_w",
@@ -2266,6 +2822,13 @@ def _new_slot_action(slot, action, reason, extra=None):
         "forecast_dc_surplus_w",
         "forecast_deficit_w",
         "has_power_forecast",
+        "pv_topology_status",
+        "pv_topology_quality",
+        "pv_resource_projection_status",
+        "pv_topology_revision",
+        "pv_store_source_split_complete",
+        "pv_store_forecast_fresh",
+        "pv_store_forecast_freshness_source",
         "is_export_plateau",
         "export_plateau_id",
         "export_plateau_origin_start_ts",
@@ -2357,19 +2920,7 @@ def _entry_recharge_wh(entry, flags, efficiency):
 
 
 def _pv_store_entry_stored_wh(entry, flags, efficiency):
-    if entry.get("action") != "eco_plus_store_pv_candidate":
-        return 0.0
-    duration_h = _entry_duration_h(entry)
-    if duration_h <= 0.0:
-        return 0.0
-    max_power_w = max(
-        0.0,
-        safe_float(entry.get("max_power_w"), safe_float(flags.get("pv_store_max_w"), 0.0)),
-    )
-    if entry.get("has_power_forecast"):
-        forecast_surplus_w = max(0.0, safe_float(entry.get("forecast_surplus_w"), 0.0))
-        max_power_w = min(max_power_w, forecast_surplus_w) if max_power_w > 0.0 else forecast_surplus_w
-    return max(0.0, max_power_w * duration_h * max(0.01, efficiency))
+    return _pv_store_slot_physical_limit(entry, flags, efficiency)["available_stored_wh"]
 
 
 def _entry_export_wh(entry):
@@ -2383,25 +2934,329 @@ def _pv_store_priority_key(entry):
     start_ts = safe_float(entry.get("start_ts"), 0.0)
     net_sell = safe_float(entry.get("net_sell_ct"), safe_float(entry.get("avg_market_ct"), 0.0))
     if reason == "negative_price":
-        return (0, start_ts)
-    if reason == "threshold_below_eeg":
-        return (1, net_sell, start_ts)
-    return (2, net_sell, start_ts)
+        priority_class = 0
+    elif reason == "threshold_below_eeg":
+        priority_class = 1
+    else:
+        priority_class = 2
+    return (priority_class, net_sell, start_ts)
 
 
-def _apply_pv_store_energy_budget(entries, reserve, capacity_wh, flags, efficiency, current_soc):
+def _empty_pv_store_allocation_diagnostic(flags=None, reason="not_evaluated"):
+    flags = flags or {}
+    aux_ac_mode = str(flags.get("pv_store_aux_ac_mode") or "off")
+    if aux_ac_mode not in AUX_AC_STORAGE_MODES:
+        aux_ac_mode = "off"
+    aux_ac_user_release = aux_ac_mode != "off"
+    return {
+        "schema": "direct_marketing_pv_store_allocation_v1",
+        "active": False,
+        "evaluated": False,
+        "reason": str(reason),
+        "priority_basis": "negative_hard_then_price_class_net_sell_ct_ascending_start_ts",
+        "energy_domain": "battery_stored_wh",
+        "forecast_required": True,
+        "dc_only": True,
+        "candidate_slot_count": 0,
+        "selected_slot_count": 0,
+        "storage_headroom_wh": 0.0,
+        "requested_stored_wh": 0.0,
+        "selected_stored_wh": 0.0,
+        "remaining_stored_wh": 0.0,
+        "marginal_slot": None,
+        "segments": [],
+        "source_contract": {
+            "schema": "direct_marketing_pv_store_source_contract_v1",
+            "default_source": "E3DC_DC",
+            "allowed_sources": ["E3DC_DC"],
+            "mode": aux_ac_mode,
+            "mode_source": str(flags.get("pv_store_aux_ac_mode_source") or "default_off"),
+            "aux_ac_user_release": aux_ac_user_release,
+            "dc_forecast_complete": False,
+            "forecast_fresh": False,
+            "forecast_freshness_source": "unconfirmed",
+            "topology_revision": None,
+            "dc_requested_wh": 0.0,
+            "dc_selected_wh": 0.0,
+            "dc_conservative_selected_wh": 0.0,
+            "dc_forecast_deficit_wh": 0.0,
+            "dc_forecast_sources": [],
+            "deadband_wh": 0.0,
+            "protected_target_soc_pct": None,
+            "forecast_confidence_pct": None,
+            "dc_charge_efficiency_pct": safe_float(
+                flags.get("pv_store_dc_charge_efficiency_pct"),
+                96.0,
+            ),
+            "aux_ac_charge_efficiency_pct": safe_float(
+                flags.get("pv_store_aux_ac_charge_efficiency_pct"),
+                90.0,
+            ),
+            "discharge_efficiency_pct": safe_float(
+                flags.get("pv_store_discharge_efficiency_pct"),
+                95.0,
+            ),
+            "aux_ac_route_margin_ct_per_kwh": None,
+            "dc_route_margin_ct_per_kwh": None,
+            "aux_ac_min_margin_ct_per_kwh": safe_float(
+                flags.get("pv_store_aux_ac_min_margin_ct_per_kwh"),
+                0.0,
+            ),
+            "aux_ac_used": False,
+            "aux_ac_selected_wh": 0.0,
+            "grid_ac_allowed": False,
+            "reason": str(reason),
+        },
+    }
+
+
+def _pv_store_slot_physical_limit(entry, flags, efficiency):
+    duration_h = _entry_duration_h(entry)
+    battery_limit_w = max(
+        0.0,
+        safe_float(entry.get("max_power_w"), safe_float(flags.get("pv_store_max_w"), 0.0)),
+    )
+    dc_only = bool(cfg_bool(flags.get("pv_store_dc_only_enable"), False))
+    forecast_source = "forecast_dc_surplus_w" if dc_only else "forecast_surplus_w"
+    forecast_valid = bool(cfg_bool(entry.get("has_power_forecast"), False))
+    if dc_only:
+        forecast_valid = bool(
+            forecast_valid
+            and cfg_bool(entry.get("has_e3dc_pv_forecast"), False)
+        )
+    total_surplus_w = (
+        max(0.0, safe_float(entry.get("forecast_surplus_w"), 0.0))
+        if forecast_valid
+        else 0.0
+    )
+    dc_surplus_w = (
+        max(0.0, safe_float(entry.get("forecast_dc_surplus_w"), 0.0))
+        if forecast_valid and cfg_bool(entry.get("has_e3dc_pv_forecast"), False)
+        else 0.0
+    )
+    aux_ac_economic_allowed = cfg_bool(
+        entry.get("pv_store_aux_ac_economic_allowed"),
+        True,
+    )
+    if dc_only or not aux_ac_economic_allowed:
+        forecast_surplus_w = dc_surplus_w
+    else:
+        forecast_surplus_w = total_surplus_w
+    physical_power_w = min(battery_limit_w, forecast_surplus_w)
+    dc_input_power_w = min(physical_power_w, dc_surplus_w)
+    aux_ac_input_power_w = max(0.0, physical_power_w - dc_input_power_w)
+    fallback_efficiency = _clamp(safe_float(efficiency, 0.0), 0.01, 1.0)
+    dc_efficiency = _clamp(
+        safe_float(flags.get("pv_store_dc_charge_efficiency_pct"), fallback_efficiency * 100.0) / 100.0,
+        0.01,
+        1.0,
+    )
+    aux_ac_efficiency = _clamp(
+        safe_float(flags.get("pv_store_aux_ac_charge_efficiency_pct"), fallback_efficiency * 100.0) / 100.0,
+        0.01,
+        1.0,
+    )
+    forecast_available_wh = max(0.0, forecast_surplus_w * duration_h)
+    input_wh = max(0.0, physical_power_w * duration_h)
+    dc_stored_wh = dc_input_power_w * duration_h * dc_efficiency
+    aux_ac_stored_wh = aux_ac_input_power_w * duration_h * aux_ac_efficiency
+    stored_wh = dc_stored_wh + aux_ac_stored_wh
+    return {
+        "duration_h": duration_h,
+        "forecast_valid": forecast_valid,
+        "forecast_source": forecast_source,
+        "forecast_surplus_w": forecast_surplus_w,
+        "battery_limit_w": battery_limit_w,
+        "physical_power_w": physical_power_w,
+        "forecast_available_wh": forecast_available_wh,
+        "available_input_wh": input_wh,
+        "available_stored_wh": max(0.0, stored_wh),
+        "dc_input_power_w": dc_input_power_w,
+        "aux_ac_input_power_w": aux_ac_input_power_w,
+        "available_dc_stored_wh": max(0.0, dc_stored_wh),
+        "available_aux_ac_stored_wh": max(0.0, aux_ac_stored_wh),
+        "dc_charge_efficiency": dc_efficiency,
+        "aux_ac_charge_efficiency": aux_ac_efficiency,
+        "source_split_complete": bool(entry.get("pv_store_source_split_complete") is True),
+        "topology_revision": (
+            str(entry.get("pv_topology_revision")).strip()
+            if entry.get("pv_topology_revision") is not None
+            and str(entry.get("pv_topology_revision")).strip()
+            else None
+        ),
+        "forecast_fresh": bool(entry.get("pv_store_forecast_fresh") is True),
+        "forecast_freshness_source": str(
+            entry.get("pv_store_forecast_freshness_source") or "unconfirmed"
+        ),
+    }
+
+
+def _pv_store_dispatch_for_stored_wh(physical, desired_stored_wh):
+    """Rechnet gespeicherte Energie stückweise DC-zuerst in Eingangsleistung um."""
+
+    duration_h = max(0.000001, safe_float(physical.get("duration_h"), 0.0))
+    remaining_wh = max(0.0, safe_float(desired_stored_wh, 0.0))
+    dc_available_wh = max(0.0, safe_float(physical.get("available_dc_stored_wh"), 0.0))
+    aux_available_wh = max(0.0, safe_float(physical.get("available_aux_ac_stored_wh"), 0.0))
+    dc_selected_wh = min(remaining_wh, dc_available_wh)
+    remaining_wh = max(0.0, remaining_wh - dc_selected_wh)
+    aux_selected_wh = min(remaining_wh, aux_available_wh)
+    dc_efficiency = _clamp(safe_float(physical.get("dc_charge_efficiency"), 0.0), 0.01, 1.0)
+    aux_efficiency = _clamp(safe_float(physical.get("aux_ac_charge_efficiency"), 0.0), 0.01, 1.0)
+    dc_power_w = dc_selected_wh / (duration_h * dc_efficiency)
+    aux_power_w = aux_selected_wh / (duration_h * aux_efficiency)
+    return {
+        "stored_wh": dc_selected_wh + aux_selected_wh,
+        "dc_stored_wh": dc_selected_wh,
+        "aux_ac_stored_wh": aux_selected_wh,
+        "power_w": dc_power_w + aux_power_w,
+        "dc_power_w": dc_power_w,
+        "aux_ac_power_w": aux_power_w,
+    }
+
+
+def _pv_store_slot_diagnostic(entry, physical, rank, selected_wh=0.0, selected_power_w=0, limit_reason=""):
+    market_ct = safe_float(entry.get("market_ct"), float("nan"))
+    net_sell_ct = safe_float(entry.get("net_sell_ct"), float("nan"))
+    return {
+        "start_ts": int(safe_float(entry.get("start_ts"), 0.0)),
+        "end_ts": int(safe_float(entry.get("end_ts"), 0.0)),
+        "rank": int(rank),
+        "reason": entry.get("reason"),
+        "market_ct": round(market_ct, 3) if math.isfinite(market_ct) else None,
+        "net_sell_ct": round(net_sell_ct, 3) if math.isfinite(net_sell_ct) else None,
+        "forecast_valid": bool(physical["forecast_valid"]),
+        "forecast_source": physical["forecast_source"],
+        "forecast_provenance": entry.get("e3dc_pv_forecast_source"),
+        "forecast_available_wh": round(physical["forecast_available_wh"], 1),
+        "battery_limit_w": round(physical["battery_limit_w"], 1),
+        "physical_power_w": round(physical["physical_power_w"], 1),
+        "available_stored_wh": round(physical["available_stored_wh"], 1),
+        "available_dc_stored_wh": round(physical["available_dc_stored_wh"], 1),
+        "available_aux_ac_stored_wh": round(physical["available_aux_ac_stored_wh"], 1),
+        "selected_stored_wh": round(max(0.0, selected_wh), 1),
+        "selected_power_w": max(0, safe_int(selected_power_w, 0)),
+        "source_split_complete": bool(physical["source_split_complete"]),
+        "topology_revision": physical["topology_revision"],
+        "forecast_fresh": bool(physical["forecast_fresh"]),
+        "forecast_freshness_source": physical["forecast_freshness_source"],
+        "dc_charge_efficiency_pct": round(physical["dc_charge_efficiency"] * 100.0, 2),
+        "aux_ac_charge_efficiency_pct": round(physical["aux_ac_charge_efficiency"] * 100.0, 2),
+        "aux_ac_route_margin_ct_per_kwh": entry.get("pv_store_aux_ac_route_margin_ct_per_kwh"),
+        "dc_route_margin_ct_per_kwh": entry.get("pv_store_dc_route_margin_ct_per_kwh"),
+        "aux_ac_economic_allowed": entry.get("pv_store_aux_ac_economic_allowed"),
+        "limit_reason": str(limit_reason),
+    }
+
+
+def _finalize_pv_store_allocation_diagnostic(diagnostic, entries):
+    if not isinstance(diagnostic, dict):
+        return _empty_pv_store_allocation_diagnostic(reason="diagnostic_missing")
+    selected_entries = {
+        (
+            int(safe_float(entry.get("start_ts"), 0.0)),
+            int(safe_float(entry.get("end_ts"), 0.0)),
+        ): entry
+        for entry in (entries or [])
+        if isinstance(entry, dict) and entry.get("action") == "eco_plus_store_pv_candidate"
+    }
+    selected_slots = []
+    total_selected_wh = 0.0
+    for segment in diagnostic.get("segments", []):
+        segment_selected_wh = 0.0
+        segment_selected_count = 0
+        segment_marginal = None
+        for slot in segment.get("slots", []):
+            key = (
+                int(safe_float(slot.get("start_ts"), 0.0)),
+                int(safe_float(slot.get("end_ts"), 0.0)),
+            )
+            selected_entry = selected_entries.get(key)
+            previously_selected_wh = max(0.0, safe_float(slot.get("selected_stored_wh"), 0.0))
+            selected_wh = (
+                max(0.0, safe_float(selected_entry.get("pv_store_budget_slot_selected_wh"), 0.0))
+                if selected_entry is not None
+                else 0.0
+            )
+            selected_power_w = (
+                max(0, safe_int(selected_entry.get("max_power_w"), 0))
+                if selected_entry is not None
+                else 0
+            )
+            slot["selected_stored_wh"] = round(selected_wh, 1)
+            slot["selected_power_w"] = selected_power_w
+            if selected_entry is None and previously_selected_wh > 0.0:
+                slot["limit_reason"] = "removed_after_reprioritization"
+            if selected_wh > 0.0:
+                segment_selected_wh += selected_wh
+                segment_selected_count += 1
+                segment_marginal = slot
+                selected_slots.append(slot)
+        if segment_marginal is not None:
+            segment["marginal_slot"] = {
+                "start_ts": segment_marginal["start_ts"],
+                "end_ts": segment_marginal["end_ts"],
+                "rank": segment_marginal["rank"],
+                "market_ct": segment_marginal["market_ct"],
+                "net_sell_ct": segment_marginal["net_sell_ct"],
+                "selected_stored_wh": segment_marginal["selected_stored_wh"],
+                "selected_power_w": segment_marginal["selected_power_w"],
+            }
+        else:
+            segment["marginal_slot"] = None
+        segment["selected_slot_count"] = segment_selected_count
+        segment["selected_stored_wh"] = round(segment_selected_wh, 1)
+        segment["remaining_stored_wh"] = round(
+            max(0.0, safe_float(segment.get("requested_stored_wh"), 0.0) - segment_selected_wh),
+            1,
+        )
+        total_selected_wh += segment_selected_wh
+
+    marginal_slot = max(
+        selected_slots,
+        key=_pv_store_priority_key,
+        default=None,
+    )
+    diagnostic["selected_slot_count"] = len(selected_slots)
+    diagnostic["selected_stored_wh"] = round(total_selected_wh, 1)
+    diagnostic["remaining_stored_wh"] = round(
+        max(0.0, safe_float(diagnostic.get("requested_stored_wh"), 0.0) - total_selected_wh),
+        1,
+    )
+    diagnostic["marginal_slot"] = (
+        {
+            "start_ts": marginal_slot["start_ts"],
+            "end_ts": marginal_slot["end_ts"],
+            "rank": marginal_slot["rank"],
+            "market_ct": marginal_slot["market_ct"],
+            "net_sell_ct": marginal_slot["net_sell_ct"],
+            "selected_stored_wh": marginal_slot["selected_stored_wh"],
+            "selected_power_w": marginal_slot["selected_power_w"],
+        }
+        if marginal_slot is not None
+        else None
+    )
+    diagnostic["evaluated"] = diagnostic.get("candidate_slot_count", 0) > 0
+    diagnostic["active"] = total_selected_wh > 0.0
+    diagnostic["reason"] = "allocated" if total_selected_wh > 0.0 else "no_executable_slot"
+    return diagnostic
+
+
+def _apply_pv_store_energy_budget_for_source(entries, reserve, capacity_wh, flags, efficiency, current_soc):
     if not entries or not flags.get("pv_store_enable"):
-        return entries, 0
+        reason = "no_entries" if not entries else "pv_store_disabled"
+        return entries, 0, _empty_pv_store_allocation_diagnostic(flags, reason)
 
     cap_wh = max(0.0, safe_float(capacity_wh, 0.0))
     if cap_wh <= 0.0:
-        return entries, 0
+        return entries, 0, _empty_pv_store_allocation_diagnostic(flags, "storage_capacity_invalid")
 
     adjusted = [dict(entry) for entry in entries]
     ordered_indices = sorted(range(len(adjusted)), key=lambda idx: safe_float(adjusted[idx].get("start_ts"), 0.0))
     current_need_wh = 0.0
     cluster = []
     changed = 0
+    diagnostic = _empty_pv_store_allocation_diagnostic(flags)
 
     def target_need_from_cluster(cluster_indices, fallback_soc):
         targets = []
@@ -2425,10 +3280,47 @@ def _apply_pv_store_energy_budget(entries, reserve, capacity_wh, flags, efficien
         fallback_soc = safe_float(reserve.get("target_soc_pct"), 100.0)
         if fallback_soc <= 0.0:
             fallback_soc = 100.0
-        budget_need_wh = max(current_need_wh, target_need_from_cluster(cluster_indices, fallback_soc))
+        target_headroom_wh = target_need_from_cluster(cluster_indices, fallback_soc)
+        carry_need_wh = current_need_wh
+        budget_need_wh = min(
+            cap_wh,
+            max(carry_need_wh, target_headroom_wh),
+        )
+        ordered_cluster = sorted(
+            cluster_indices,
+            key=lambda item: _pv_store_priority_key(adjusted[item]),
+        )
+        segment = {
+            "sequence": len(diagnostic["segments"]) + 1,
+            "storage_headroom_wh": round(target_headroom_wh, 1),
+            "carry_need_wh": round(carry_need_wh, 1),
+            "requested_stored_wh": round(budget_need_wh, 1),
+            "selected_stored_wh": 0.0,
+            "remaining_stored_wh": round(budget_need_wh, 1),
+            "selected_slot_count": 0,
+            "marginal_slot": None,
+            "slots": [],
+        }
+        diagnostic["segments"].append(segment)
+        diagnostic["candidate_slot_count"] += len(ordered_cluster)
+        diagnostic["storage_headroom_wh"] = round(
+            safe_float(diagnostic.get("storage_headroom_wh"), 0.0) + target_headroom_wh,
+            1,
+        )
+        diagnostic["requested_stored_wh"] = round(
+            safe_float(diagnostic.get("requested_stored_wh"), 0.0) + budget_need_wh,
+            1,
+        )
         if budget_need_wh <= 50.0:
-            for idx in cluster_indices:
+            for rank, idx in enumerate(ordered_cluster, start=1):
                 if adjusted[idx].get("action") == "eco_plus_store_pv_candidate":
+                    physical = _pv_store_slot_physical_limit(adjusted[idx], flags, efficiency)
+                    segment["slots"].append(_pv_store_slot_diagnostic(
+                        adjusted[idx],
+                        physical,
+                        rank,
+                        limit_reason="storage_need_satisfied",
+                    ))
                     adjusted[idx]["_remove_pv_store_budget"] = True
                     adjusted[idx]["pv_store_budget_limited"] = True
                     adjusted[idx]["pv_store_budget_need_wh"] = round(budget_need_wh, 0)
@@ -2439,18 +3331,79 @@ def _apply_pv_store_energy_budget(entries, reserve, capacity_wh, flags, efficien
         remaining_wh = budget_need_wh
         selected_wh = 0.0
         selected = {}
-        for idx in sorted(cluster_indices, key=lambda item: _pv_store_priority_key(adjusted[item])):
-            stored_wh = _pv_store_entry_stored_wh(adjusted[idx], flags, efficiency)
-            if stored_wh <= 50.0 or remaining_wh <= 50.0:
-                continue
-            take_wh = min(stored_wh, remaining_wh)
-            selected[idx] = (take_wh, stored_wh)
-            selected_wh += take_wh
-            remaining_wh -= take_wh
+        min_dispatch_w = max(300.0, safe_float(flags.get("pv_store_min_surplus_w"), 300.0))
+        for rank, idx in enumerate(ordered_cluster, start=1):
+            entry = adjusted[idx]
+            physical = _pv_store_slot_physical_limit(entry, flags, efficiency)
+            available_wh = physical["available_stored_wh"]
+            take_wh = 0.0
+            dispatch_w = 0
+            if not physical["forecast_valid"]:
+                limit_reason = "forecast_missing"
+            elif physical["battery_limit_w"] <= 0.0:
+                limit_reason = "battery_power_unavailable"
+            elif physical["forecast_surplus_w"] <= 0.0:
+                limit_reason = "forecast_surplus_unavailable"
+            elif available_wh <= 50.0:
+                limit_reason = "physical_energy_too_small"
+            elif remaining_wh <= 50.0:
+                limit_reason = "storage_need_satisfied"
+            else:
+                desired_wh = min(available_wh, remaining_wh)
+                dispatch = _pv_store_dispatch_for_stored_wh(physical, desired_wh)
+                desired_w = dispatch["power_w"]
+                if desired_w + 0.000001 < min_dispatch_w:
+                    limit_reason = "below_min_dispatch"
+                else:
+                    dispatch_w = int(math.floor(min(physical["physical_power_w"], desired_w) + 0.000001))
+                    if dispatch_w < int(math.ceil(min_dispatch_w)):
+                        limit_reason = "below_min_dispatch"
+                        dispatch_w = 0
+                    else:
+                        actual_dc_power_w = min(
+                            float(dispatch_w),
+                            safe_float(physical.get("dc_input_power_w"), 0.0),
+                        )
+                        actual_aux_power_w = max(0.0, float(dispatch_w) - actual_dc_power_w)
+                        take_wh = min(
+                            available_wh,
+                            remaining_wh,
+                            physical["duration_h"]
+                            * (
+                                actual_dc_power_w * physical["dc_charge_efficiency"]
+                                + actual_aux_power_w * physical["aux_ac_charge_efficiency"]
+                            ),
+                        )
+                        if take_wh <= 50.0:
+                            take_wh = 0.0
+                            dispatch_w = 0
+                            limit_reason = "physical_energy_too_small"
+                        elif take_wh + 0.1 < available_wh:
+                            limit_reason = "remaining_need"
+                        elif physical["battery_limit_w"] + 0.1 < physical["forecast_surplus_w"]:
+                            limit_reason = "battery_power"
+                        else:
+                            limit_reason = "forecast_surplus"
+            if take_wh > 0.0:
+                selected[idx] = (take_wh, available_wh, dispatch_w)
+                selected_wh += take_wh
+                remaining_wh = max(0.0, remaining_wh - take_wh)
+            segment["slots"].append(_pv_store_slot_diagnostic(
+                entry,
+                physical,
+                rank,
+                selected_wh=take_wh,
+                selected_power_w=dispatch_w,
+                limit_reason=limit_reason,
+            ))
 
         for idx in cluster_indices:
             entry = adjusted[idx]
-            take_wh, stored_wh = selected.get(idx, (0.0, _pv_store_entry_stored_wh(entry, flags, efficiency)))
+            physical = _pv_store_slot_physical_limit(entry, flags, efficiency)
+            take_wh, stored_wh, dispatch_w = selected.get(
+                idx,
+                (0.0, physical["available_stored_wh"], 0),
+            )
             if take_wh <= 50.0:
                 entry["_remove_pv_store_budget"] = True
                 entry["pv_store_budget_limited"] = True
@@ -2461,18 +3414,16 @@ def _apply_pv_store_energy_budget(entries, reserve, capacity_wh, flags, efficien
             entry["pv_store_budget_need_wh"] = round(budget_need_wh, 0)
             entry["pv_store_budget_selected_wh"] = round(selected_wh, 0)
             entry["pv_store_budget_priority"] = "negative_hard" if entry.get("reason") == "negative_price" else "cheapest_soft"
-            if take_wh + 1.0 < stored_wh:
-                duration_h = _entry_duration_h(entry)
-                capped_w = 0
-                if duration_h > 0.0:
-                    capped_w = int(round(take_wh / (duration_h * max(0.01, efficiency))))
-                if capped_w < 300:
-                    entry["_remove_pv_store_budget"] = True
-                else:
-                    entry["max_power_w"] = capped_w
+            entry["pv_store_budget_slot_available_wh"] = round(stored_wh, 1)
+            entry["pv_store_budget_slot_selected_wh"] = round(take_wh, 1)
+            original_power_w = max(0, safe_int(entry.get("max_power_w"), 0))
+            entry["max_power_w"] = dispatch_w
+            if dispatch_w != original_power_w or take_wh + 0.1 < stored_wh:
                 entry["pv_store_budget_limited"] = True
                 changed += 1
         current_need_wh = max(0.0, budget_need_wh - selected_wh)
+        segment["selected_stored_wh"] = round(selected_wh, 1)
+        segment["remaining_stored_wh"] = round(current_need_wh, 1)
 
     for idx in ordered_indices:
         action = adjusted[idx].get("action")
@@ -2485,15 +3436,857 @@ def _apply_pv_store_energy_budget(entries, reserve, capacity_wh, flags, efficien
 
     flush_cluster()
 
-    if not changed:
-        return entries, 0
     filtered = [
         {key: value for key, value in entry.items() if key != "_remove_pv_store_budget"}
         for entry in adjusted
         if not entry.get("_remove_pv_store_budget")
     ]
     filtered.sort(key=lambda item: safe_float(item.get("start_ts"), 0.0))
-    return filtered, changed
+    diagnostic = _finalize_pv_store_allocation_diagnostic(diagnostic, filtered)
+    if not changed:
+        return filtered, 0, diagnostic
+    return filtered, changed, diagnostic
+
+
+def _pv_store_allocation_slots(diagnostic):
+    return [
+        slot
+        for segment in (diagnostic or {}).get("segments", [])
+        if isinstance(segment, dict)
+        for slot in segment.get("slots", [])
+        if isinstance(slot, dict)
+    ]
+
+
+def _pv_store_aux_ac_deadband_wh(flags, capacity_wh, entries):
+    slot_durations_h = [
+        _entry_duration_h(entry)
+        for entry in (entries or [])
+        if isinstance(entry, dict)
+        and entry.get("action") == "eco_plus_store_pv_candidate"
+        and _entry_duration_h(entry) > 0.0
+    ]
+    slot_duration_h = min(slot_durations_h) if slot_durations_h else SLOT_MS / 3600000.0
+    min_charge_w = max(
+        300.0,
+        safe_float((flags or {}).get("pv_store_min_surplus_w"), 300.0),
+    )
+    configured_wh = max(
+        0.0,
+        safe_float((flags or {}).get("pv_store_aux_ac_deadband_wh"), 0.0),
+    )
+    return max(
+        500.0,
+        max(0.0, safe_float(capacity_wh, 0.0)) * 0.02,
+        min_charge_w * slot_duration_h,
+        configured_wh,
+    )
+
+
+def _pv_store_aux_ac_economic_context(entry, flags):
+    high_net_sell_ct = safe_float(
+        (flags or {}).get("pv_store_aux_ac_best_high_net_sell_ct"),
+        float("nan"),
+    )
+    opportunity_ct = safe_float(
+        entry.get("net_sell_ct"),
+        safe_float(entry.get("market_ct"), float("nan")),
+    )
+    dc_route_efficiency = _clamp(
+        safe_float((flags or {}).get("pv_store_dc_route_efficiency_pct"), 0.0) / 100.0,
+        0.01,
+        1.0,
+    )
+    aux_ac_route_efficiency = _clamp(
+        safe_float((flags or {}).get("pv_store_aux_ac_route_efficiency_pct"), 0.0) / 100.0,
+        0.01,
+        1.0,
+    )
+    degradation_ct = max(
+        0.0,
+        safe_float((flags or {}).get("pv_store_aux_ac_degradation_ct_per_kwh"), 0.0),
+    )
+    safety_margin_ct = safe_float(
+        (flags or {}).get("pv_store_aux_ac_safety_margin_ct_per_kwh"),
+        0.0,
+    )
+    min_margin_ct = max(
+        0.0,
+        safe_float((flags or {}).get("pv_store_aux_ac_min_margin_ct_per_kwh"), 0.0),
+    )
+    if not math.isfinite(high_net_sell_ct) or not math.isfinite(opportunity_ct):
+        return {
+            "valid": False,
+            "allowed": False,
+            "dc_margin_ct_per_kwh": None,
+            "margin_ct_per_kwh": None,
+            "min_margin_ct_per_kwh": round(min_margin_ct, 3),
+            "reason": "economic_price_missing",
+        }
+    dc_delivered_revenue_ct = high_net_sell_ct * dc_route_efficiency
+    aux_ac_delivered_revenue_ct = high_net_sell_ct * aux_ac_route_efficiency
+    dc_margin_ct = dc_delivered_revenue_ct - opportunity_ct - degradation_ct - safety_margin_ct
+    margin_ct = aux_ac_delivered_revenue_ct - opportunity_ct - degradation_ct - safety_margin_ct
+    positive_margin = margin_ct > AUX_AC_POSITIVE_MARGIN_EPSILON_CT
+    minimum_reached = margin_ct + AUX_AC_POSITIVE_MARGIN_EPSILON_CT >= min_margin_ct
+    allowed = bool(positive_margin and minimum_reached)
+    return {
+        "valid": True,
+        "allowed": allowed,
+        "dc_margin_ct_per_kwh": round(dc_margin_ct, 3),
+        "margin_ct_per_kwh": round(margin_ct, 3),
+        "min_margin_ct_per_kwh": round(min_margin_ct, 3),
+        "high_net_sell_ct_per_kwh": round(high_net_sell_ct, 3),
+        "opportunity_ct_per_kwh": round(opportunity_ct, 3),
+        "dc_delivered_revenue_ct_per_kwh": round(dc_delivered_revenue_ct, 3),
+        "aux_ac_delivered_revenue_ct_per_kwh": round(aux_ac_delivered_revenue_ct, 3),
+        "dc_route_efficiency_pct": round(dc_route_efficiency * 100.0, 2),
+        "aux_ac_route_efficiency_pct": round(aux_ac_route_efficiency * 100.0, 2),
+        "degradation_ct_per_kwh": round(degradation_ct, 3),
+        "safety_margin_ct_per_kwh": round(safety_margin_ct, 3),
+        "reason": (
+            "economic_margin_positive"
+            if allowed
+            else (
+                "economic_margin_not_positive"
+                if not positive_margin
+                else "economic_margin_below_minimum"
+            )
+        ),
+    }
+
+
+def _merge_dc_and_aux_ac_entries(dc_entries, routed_entries):
+    """Bewahrt den vollständigen DC-Plan und ergänzt nur belegte AC-Anteile."""
+
+    def slot_key(entry):
+        return (
+            int(safe_float(entry.get("start_ts"), 0.0)),
+            int(safe_float(entry.get("end_ts"), 0.0)),
+            str(entry.get("action") or ""),
+        )
+
+    merged = {slot_key(entry): dict(entry) for entry in (dc_entries or [])}
+    for routed in routed_entries or []:
+        key = slot_key(routed)
+        current = merged.get(key)
+        if current is None:
+            merged[key] = dict(routed)
+            continue
+        if routed.get("action") != "eco_plus_store_pv_candidate":
+            continue
+        current_selected_wh = max(
+            0.0,
+            safe_float(current.get("pv_store_budget_slot_selected_wh"), 0.0),
+        )
+        routed_selected_wh = max(
+            0.0,
+            safe_float(routed.get("pv_store_budget_slot_selected_wh"), 0.0),
+        )
+        if routed_selected_wh <= 0.0:
+            continue
+        combined = dict(current)
+        combined["max_power_w"] = (
+            max(0, safe_int(current.get("max_power_w"), 0))
+            + max(0, safe_int(routed.get("max_power_w"), 0))
+        )
+        combined["pv_store_budget_slot_selected_wh"] = round(
+            current_selected_wh + routed_selected_wh,
+            1,
+        )
+        combined["pv_store_budget_slot_available_wh"] = round(
+            max(0.0, safe_float(current.get("pv_store_budget_slot_available_wh"), 0.0))
+            + max(0.0, safe_float(routed.get("pv_store_budget_slot_available_wh"), 0.0)),
+            1,
+        )
+        combined["pv_store_budget_selected_wh"] = round(
+            max(0.0, safe_float(current.get("pv_store_budget_selected_wh"), 0.0))
+            + max(0.0, safe_float(routed.get("pv_store_budget_selected_wh"), 0.0)),
+            1,
+        )
+        for field in (
+            "pv_store_source_contract",
+            "pv_store_dc_only_enable",
+            "pv_store_aux_ac_storage_allowed",
+            "pv_store_aux_ac_mode",
+            "pv_store_aux_ac_mode_source",
+            "pv_store_dc_forecast_complete",
+            "pv_store_forecast_fresh",
+            "pv_store_forecast_freshness_source",
+            "pv_store_topology_revision",
+            "pv_store_dc_forecast_requested_wh",
+            "pv_store_dc_forecast_selected_wh",
+            "pv_store_dc_forecast_conservative_selected_wh",
+            "pv_store_aux_ac_deadband_wh",
+            "pv_store_aux_ac_protected_target_soc_pct",
+            "pv_store_aux_ac_forecast_confidence_pct",
+            "pv_store_dc_charge_efficiency_pct",
+            "pv_store_aux_ac_charge_efficiency_pct",
+            "pv_store_discharge_efficiency_pct",
+            "pv_store_dc_route_margin_ct_per_kwh",
+            "pv_store_aux_ac_route_margin_ct_per_kwh",
+            "pv_store_aux_ac_min_margin_ct_per_kwh",
+            "pv_store_dc_forecast_deficit_wh",
+        ):
+            if field in routed:
+                combined[field] = routed.get(field)
+        combined["target_soc_pct"] = routed.get(
+            "target_soc_pct",
+            current.get("target_soc_pct"),
+        )
+        merged[key] = combined
+    ordered = sorted(merged.values(), key=lambda item: safe_float(item.get("start_ts"), 0.0))
+    cluster = []
+
+    def finalize_cluster():
+        if not cluster:
+            return
+        selected_wh = round(
+            sum(
+                max(0.0, safe_float(ordered[index].get("pv_store_budget_slot_selected_wh"), 0.0))
+                for index in cluster
+            ),
+            1,
+        )
+        for index in cluster:
+            ordered[index]["pv_store_budget_selected_wh"] = selected_wh
+        cluster.clear()
+
+    for index, entry in enumerate(ordered):
+        action = str(entry.get("action") or "")
+        if action == "eco_plus_store_pv_candidate":
+            cluster.append(index)
+        elif action in {"eco_plus_export_candidate", "arbitrage_export_candidate"}:
+            finalize_cluster()
+    finalize_cluster()
+    return ordered
+
+
+def _pv_store_source_contract(
+    *,
+    mode="off",
+    mode_source="default_off",
+    aux_ac_user_release,
+    dc_forecast_complete,
+    forecast_fresh=False,
+    forecast_freshness_source="unconfirmed",
+    topology_revision=None,
+    dc_requested_wh,
+    dc_selected_wh,
+    dc_conservative_selected_wh=None,
+    dc_forecast_deficit_wh,
+    dc_forecast_sources=None,
+    deadband_wh=0.0,
+    protected_target_soc_pct=None,
+    forecast_confidence_pct=None,
+    dc_charge_efficiency_pct=None,
+    aux_ac_charge_efficiency_pct=None,
+    discharge_efficiency_pct=None,
+    dc_route_margin_ct_per_kwh=None,
+    aux_ac_route_margin_ct_per_kwh=None,
+    aux_ac_min_margin_ct_per_kwh=0.0,
+    aux_ac_used=False,
+    aux_ac_selected_wh=0.0,
+    reason,
+):
+    allowed_sources = ["E3DC_DC"]
+    if aux_ac_used:
+        allowed_sources.append("AUX_AC_PV")
+    return {
+        "schema": "direct_marketing_pv_store_source_contract_v1",
+        "default_source": "E3DC_DC",
+        "allowed_sources": allowed_sources,
+        "mode": str(mode if mode in AUX_AC_STORAGE_MODES else "off"),
+        "mode_source": str(mode_source or "default_off"),
+        "aux_ac_user_release": bool(aux_ac_user_release),
+        "dc_forecast_complete": bool(dc_forecast_complete),
+        "forecast_fresh": bool(forecast_fresh),
+        "forecast_freshness_source": str(
+            forecast_freshness_source or "unconfirmed"
+        ),
+        "topology_revision": (
+            str(topology_revision).strip()
+            if topology_revision is not None and str(topology_revision).strip()
+            else None
+        ),
+        "dc_requested_wh": round(max(0.0, dc_requested_wh), 1),
+        "dc_selected_wh": round(max(0.0, dc_selected_wh), 1),
+        "dc_conservative_selected_wh": round(
+            max(
+                0.0,
+                dc_selected_wh
+                if dc_conservative_selected_wh is None
+                else dc_conservative_selected_wh,
+            ),
+            1,
+        ),
+        "dc_forecast_deficit_wh": round(max(0.0, dc_forecast_deficit_wh), 1),
+        "dc_forecast_sources": sorted({
+            str(source)
+            for source in (dc_forecast_sources or [])
+            if source is not None and str(source).strip()
+        }),
+        "deadband_wh": round(max(0.0, deadband_wh), 1),
+        "protected_target_soc_pct": (
+            round(_clamp(safe_float(protected_target_soc_pct, 0.0), 0.0, 100.0), 2)
+            if protected_target_soc_pct is not None
+            else None
+        ),
+        "forecast_confidence_pct": (
+            round(_clamp(safe_float(forecast_confidence_pct, 0.0), 0.0, 100.0), 2)
+            if forecast_confidence_pct is not None
+            else None
+        ),
+        "dc_charge_efficiency_pct": (
+            round(safe_float(dc_charge_efficiency_pct, 0.0), 2)
+            if dc_charge_efficiency_pct is not None
+            else None
+        ),
+        "aux_ac_charge_efficiency_pct": (
+            round(safe_float(aux_ac_charge_efficiency_pct, 0.0), 2)
+            if aux_ac_charge_efficiency_pct is not None
+            else None
+        ),
+        "discharge_efficiency_pct": (
+            round(safe_float(discharge_efficiency_pct, 0.0), 2)
+            if discharge_efficiency_pct is not None
+            else None
+        ),
+        "dc_route_margin_ct_per_kwh": (
+            round(safe_float(dc_route_margin_ct_per_kwh, 0.0), 3)
+            if dc_route_margin_ct_per_kwh is not None
+            else None
+        ),
+        "aux_ac_route_margin_ct_per_kwh": (
+            round(safe_float(aux_ac_route_margin_ct_per_kwh, 0.0), 3)
+            if aux_ac_route_margin_ct_per_kwh is not None
+            else None
+        ),
+        "aux_ac_min_margin_ct_per_kwh": round(
+            max(0.0, safe_float(aux_ac_min_margin_ct_per_kwh, 0.0)),
+            3,
+        ),
+        "aux_ac_used": bool(aux_ac_used),
+        "aux_ac_selected_wh": round(max(0.0, aux_ac_selected_wh), 1),
+        "grid_ac_allowed": False,
+        "reason": str(reason),
+    }
+
+
+def _decorate_pv_store_source_entries(
+    entries,
+    *,
+    source_contract,
+    aux_ac_selected_wh_by_slot=None,
+):
+    aux_ac_selected_wh_by_slot = aux_ac_selected_wh_by_slot or {}
+    result = []
+    for raw in entries or []:
+        entry = dict(raw)
+        if entry.get("action") == "eco_plus_store_pv_candidate":
+            slot_key = (
+                int(safe_float(entry.get("start_ts"), 0.0)),
+                int(safe_float(entry.get("end_ts"), 0.0)),
+            )
+            slot_aux_ac_wh = max(
+                0.0,
+                safe_float(aux_ac_selected_wh_by_slot.get(slot_key), 0.0),
+            )
+            slot_aux_ac_allowed = bool(
+                source_contract.get("aux_ac_used")
+                and slot_aux_ac_wh > 50.0
+            )
+            entry["pv_store_source_contract"] = (
+                "E3DC_DC_PLUS_AUX_AC_PV"
+                if slot_aux_ac_allowed
+                else "E3DC_DC"
+            )
+            entry["pv_store_dc_only_enable"] = not slot_aux_ac_allowed
+            entry["pv_store_aux_ac_storage_allowed"] = slot_aux_ac_allowed
+            entry["pv_store_aux_ac_mode"] = source_contract.get("mode")
+            entry["pv_store_aux_ac_mode_source"] = source_contract.get("mode_source")
+            entry["pv_store_dc_forecast_complete"] = bool(
+                source_contract.get("dc_forecast_complete")
+            )
+            entry["pv_store_forecast_fresh"] = bool(
+                source_contract.get("forecast_fresh")
+            )
+            entry["pv_store_forecast_freshness_source"] = source_contract.get(
+                "forecast_freshness_source"
+            )
+            entry["pv_store_topology_revision"] = source_contract.get(
+                "topology_revision"
+            )
+            entry["pv_store_dc_forecast_requested_wh"] = source_contract.get(
+                "dc_requested_wh"
+            )
+            entry["pv_store_dc_forecast_selected_wh"] = source_contract.get(
+                "dc_selected_wh"
+            )
+            entry["pv_store_dc_forecast_conservative_selected_wh"] = source_contract.get(
+                "dc_conservative_selected_wh"
+            )
+            entry["pv_store_aux_ac_deadband_wh"] = source_contract.get("deadband_wh")
+            entry["pv_store_aux_ac_protected_target_soc_pct"] = source_contract.get(
+                "protected_target_soc_pct"
+            )
+            entry["pv_store_aux_ac_forecast_confidence_pct"] = source_contract.get(
+                "forecast_confidence_pct"
+            )
+            entry["pv_store_dc_charge_efficiency_pct"] = source_contract.get(
+                "dc_charge_efficiency_pct"
+            )
+            entry["pv_store_aux_ac_charge_efficiency_pct"] = source_contract.get(
+                "aux_ac_charge_efficiency_pct"
+            )
+            entry["pv_store_discharge_efficiency_pct"] = source_contract.get(
+                "discharge_efficiency_pct"
+            )
+            entry["pv_store_dc_route_margin_ct_per_kwh"] = source_contract.get(
+                "dc_route_margin_ct_per_kwh"
+            )
+            entry["pv_store_aux_ac_route_margin_ct_per_kwh"] = source_contract.get(
+                "aux_ac_route_margin_ct_per_kwh"
+            )
+            entry["pv_store_aux_ac_min_margin_ct_per_kwh"] = source_contract.get(
+                "aux_ac_min_margin_ct_per_kwh"
+            )
+            entry["pv_store_dc_forecast_deficit_wh"] = round(
+                (
+                    slot_aux_ac_wh
+                    if slot_aux_ac_allowed
+                    else 0.0
+                ),
+                1,
+            )
+        result.append(entry)
+    return result
+
+
+def _apply_pv_store_energy_budget(entries, reserve, capacity_wh, flags, efficiency, current_soc):
+    """Allokiert E3DC-DC zuerst und ergänzt Zusatz-AC nur über den Modusvertrag."""
+
+    flags = dict(flags or {})
+    aux_ac_mode = str(flags.get("pv_store_aux_ac_mode") or "off")
+    if aux_ac_mode not in AUX_AC_STORAGE_MODES:
+        aux_ac_mode = "off"
+    mode_source = str(flags.get("pv_store_aux_ac_mode_source") or "default_off")
+    aux_ac_user_release = aux_ac_mode != "off"
+    dc_flags = dict(flags or {})
+    dc_flags["pv_store_dc_only_enable"] = True
+    dc_entries, dc_changed, dc_diagnostic = _apply_pv_store_energy_budget_for_source(
+        entries,
+        reserve,
+        capacity_wh,
+        dc_flags,
+        efficiency,
+        current_soc,
+    )
+    dc_slots = _pv_store_allocation_slots(dc_diagnostic)
+    dc_forecast_sources = sorted({
+        str(slot.get("forecast_provenance"))
+        for slot in dc_slots
+        if slot.get("forecast_provenance")
+    })
+    dc_topology_revisions = {
+        str(slot.get("topology_revision")).strip()
+        for slot in dc_slots
+        if slot.get("topology_revision") is not None
+        and str(slot.get("topology_revision")).strip()
+    }
+    plan_topology_revision = (
+        next(iter(dc_topology_revisions))
+        if len(dc_topology_revisions) == 1
+        else None
+    )
+    dc_forecast_freshness_sources = {
+        str(slot.get("forecast_freshness_source")).strip()
+        for slot in dc_slots
+        if slot.get("forecast_freshness_source") is not None
+        and str(slot.get("forecast_freshness_source")).strip()
+    }
+    forecast_freshness_source = (
+        next(iter(dc_forecast_freshness_sources))
+        if len(dc_forecast_freshness_sources) == 1
+        else (
+            "mixed"
+            if dc_forecast_freshness_sources
+            else "unconfirmed"
+        )
+    )
+    dc_forecast_complete = bool(
+        dc_slots
+        and all(slot.get("forecast_valid") is True for slot in dc_slots)
+        and len(dc_slots) == safe_int(dc_diagnostic.get("candidate_slot_count"), 0)
+        and all(slot.get("source_split_complete") is True for slot in dc_slots)
+        and plan_topology_revision is not None
+        and all(
+            str(slot.get("topology_revision") or "").strip()
+            == plan_topology_revision
+            for slot in dc_slots
+        )
+    )
+    forecast_fresh = bool(
+        dc_slots
+        and len(dc_slots) == safe_int(dc_diagnostic.get("candidate_slot_count"), 0)
+        and all(slot.get("forecast_fresh") is True for slot in dc_slots)
+    )
+    dc_requested_wh = max(
+        0.0,
+        safe_float(dc_diagnostic.get("requested_stored_wh"), 0.0),
+    )
+    dc_selected_wh = max(
+        0.0,
+        safe_float(dc_diagnostic.get("selected_stored_wh"), 0.0),
+    )
+    cap_wh = max(0.0, safe_float(capacity_wh, 0.0))
+    confidence_pct = _clamp(
+        safe_float(flags.get("pv_store_aux_ac_forecast_confidence_pct"), 80.0),
+        0.0,
+        100.0,
+    )
+    protected_target_soc_pct = _clamp(
+        safe_float(
+            flags.get("pv_store_aux_ac_protected_target_soc_pct"),
+            safe_float(reserve.get("effective_min_soc_pct"), 0.0),
+        ),
+        0.0,
+        100.0,
+    )
+    protected_need_wh = max(
+        0.0,
+        (
+            protected_target_soc_pct
+            - _clamp(safe_float(current_soc, 0.0), 0.0, 100.0)
+        )
+        / 100.0
+        * cap_wh,
+    )
+    if aux_ac_mode == "reserve_only":
+        route_requested_wh = min(dc_requested_wh, protected_need_wh)
+        dc_conservative_selected_wh = dc_selected_wh * confidence_pct / 100.0
+    else:
+        route_requested_wh = dc_requested_wh
+        dc_conservative_selected_wh = dc_selected_wh
+    dc_deficit_wh = max(0.0, route_requested_wh - dc_conservative_selected_wh)
+    deadband_wh = _pv_store_aux_ac_deadband_wh(flags, capacity_wh, entries)
+    route_efficiency_fields = {
+        "dc_charge_efficiency_pct": safe_float(
+            flags.get("pv_store_dc_charge_efficiency_pct"),
+            96.0,
+        ),
+        "aux_ac_charge_efficiency_pct": safe_float(
+            flags.get("pv_store_aux_ac_charge_efficiency_pct"),
+            90.0,
+        ),
+        "discharge_efficiency_pct": safe_float(
+            flags.get("pv_store_discharge_efficiency_pct"),
+            95.0,
+        ),
+        "aux_ac_min_margin_ct_per_kwh": safe_float(
+            flags.get("pv_store_aux_ac_min_margin_ct_per_kwh"),
+            0.0,
+        ),
+    }
+
+    if aux_ac_mode == "off":
+        reason = "e3dc_dc_only_default"
+    elif not cfg_bool(flags.get("pv_store_aux_ac_topology_ready"), False):
+        reason = "source_topology_unbound"
+    elif not dc_forecast_complete:
+        reason = "dc_forecast_incomplete"
+    elif not forecast_fresh:
+        reason = "forecast_freshness_unconfirmed"
+    elif dc_deficit_wh <= deadband_wh:
+        reason = "dc_forecast_sufficient"
+    else:
+        reason = "dc_forecast_deficit_proven"
+    dc_contract = _pv_store_source_contract(
+        mode=aux_ac_mode,
+        mode_source=mode_source,
+        aux_ac_user_release=aux_ac_user_release,
+        dc_forecast_complete=dc_forecast_complete,
+        forecast_fresh=forecast_fresh,
+        forecast_freshness_source=forecast_freshness_source,
+        topology_revision=plan_topology_revision,
+        dc_requested_wh=route_requested_wh,
+        dc_selected_wh=dc_selected_wh,
+        dc_conservative_selected_wh=dc_conservative_selected_wh,
+        dc_forecast_deficit_wh=dc_deficit_wh,
+        dc_forecast_sources=dc_forecast_sources,
+        deadband_wh=deadband_wh,
+        protected_target_soc_pct=protected_target_soc_pct,
+        forecast_confidence_pct=confidence_pct,
+        **route_efficiency_fields,
+        reason=reason,
+    )
+    dc_diagnostic["dc_only"] = True
+    dc_diagnostic["source_contract"] = dc_contract
+    dc_entries = _decorate_pv_store_source_entries(
+        dc_entries,
+        source_contract=dc_contract,
+    )
+    if (
+        not aux_ac_user_release
+        or not cfg_bool(flags.get("pv_store_aux_ac_topology_ready"), False)
+        or not dc_forecast_complete
+        or not forecast_fresh
+        or dc_deficit_wh <= deadband_wh
+    ):
+        return dc_entries, dc_changed, dc_diagnostic
+
+    dc_power_by_slot = {
+        (
+            int(safe_float(entry.get("start_ts"), 0.0)),
+            int(safe_float(entry.get("end_ts"), 0.0)),
+        ): max(0.0, safe_float(entry.get("max_power_w"), 0.0))
+        for entry in dc_entries
+        if entry.get("action") == "eco_plus_store_pv_candidate"
+    }
+    original_target_by_slot = {}
+    routed_entries = []
+    residual_target_soc_pct = _clamp(
+        _clamp(safe_float(current_soc, 0.0), 0.0, 100.0)
+        + (dc_deficit_wh / cap_wh * 100.0 if cap_wh > 0.0 else 0.0),
+        0.0,
+        100.0,
+    )
+    for raw_entry in entries:
+        if raw_entry.get("action") != "eco_plus_store_pv_candidate":
+            continue
+        entry = dict(raw_entry)
+        slot_key = (
+            int(safe_float(entry.get("start_ts"), 0.0)),
+            int(safe_float(entry.get("end_ts"), 0.0)),
+        )
+        original_target_by_slot[slot_key] = entry.get("target_soc_pct")
+        original_dc_w = max(0.0, safe_float(entry.get("forecast_dc_surplus_w"), 0.0))
+        original_total_w = max(0.0, safe_float(entry.get("forecast_surplus_w"), 0.0))
+        external_surplus_w = max(0.0, original_total_w - original_dc_w)
+        slot_battery_limit_w = max(
+            0.0,
+            safe_float(
+                entry.get("max_power_w"),
+                safe_float(flags.get("pv_store_max_w"), 0.0),
+            ),
+        )
+        if slot_battery_limit_w <= 0.0:
+            slot_battery_limit_w = max(
+                0.0,
+                safe_float(flags.get("pv_store_max_w"), 0.0),
+            )
+        entry["max_power_w"] = max(
+            0.0,
+            slot_battery_limit_w - safe_float(dc_power_by_slot.get(slot_key), 0.0),
+        )
+        entry["forecast_dc_surplus_w"] = 0.0
+        entry["forecast_surplus_w"] = external_surplus_w
+        entry["target_soc_pct"] = residual_target_soc_pct
+        routed_entries.append(entry)
+
+    best_route_margin_ct = None
+    best_dc_route_margin_ct = None
+    if aux_ac_mode == "reserve_only":
+        for entry in routed_entries:
+            entry["pv_store_aux_ac_economic_allowed"] = True
+    else:
+        any_economic_slot = False
+        for entry in routed_entries:
+            economic = _pv_store_aux_ac_economic_context(entry, flags)
+            entry["pv_store_aux_ac_economic_allowed"] = bool(economic["allowed"])
+            entry["pv_store_dc_route_margin_ct_per_kwh"] = economic[
+                "dc_margin_ct_per_kwh"
+            ]
+            entry["pv_store_aux_ac_route_margin_ct_per_kwh"] = economic["margin_ct_per_kwh"]
+            entry["pv_store_aux_ac_economic_reason"] = economic["reason"]
+            if economic["dc_margin_ct_per_kwh"] is not None:
+                best_dc_route_margin_ct = (
+                    economic["dc_margin_ct_per_kwh"]
+                    if best_dc_route_margin_ct is None
+                    else max(best_dc_route_margin_ct, economic["dc_margin_ct_per_kwh"])
+                )
+            if economic["margin_ct_per_kwh"] is not None:
+                best_route_margin_ct = (
+                    economic["margin_ct_per_kwh"]
+                    if best_route_margin_ct is None
+                    else max(best_route_margin_ct, economic["margin_ct_per_kwh"])
+                )
+            any_economic_slot = bool(any_economic_slot or economic["allowed"])
+        if not any_economic_slot:
+            dc_contract["reason"] = "economic_margin_below_minimum"
+            dc_contract["dc_route_margin_ct_per_kwh"] = best_dc_route_margin_ct
+            dc_contract["aux_ac_route_margin_ct_per_kwh"] = best_route_margin_ct
+            dc_diagnostic["source_contract"] = dc_contract
+            return dc_entries, dc_changed, dc_diagnostic
+
+    total_flags = dict(flags or {})
+    total_flags["pv_store_dc_only_enable"] = False
+    total_entries, total_changed, total_diagnostic = _apply_pv_store_energy_budget_for_source(
+        routed_entries,
+        reserve,
+        capacity_wh,
+        total_flags,
+        efficiency,
+        current_soc,
+    )
+    aux_ac_selected_wh_by_slot = {}
+    for entry in total_entries:
+        if entry.get("action") != "eco_plus_store_pv_candidate":
+            continue
+        slot_key = (
+            int(safe_float(entry.get("start_ts"), 0.0)),
+            int(safe_float(entry.get("end_ts"), 0.0)),
+        )
+        selected_wh = max(
+            0.0,
+            safe_float(entry.get("pv_store_budget_slot_selected_wh"), 0.0),
+        )
+        slot_aux_ac_wh = selected_wh
+        if slot_aux_ac_wh > 0.0:
+            aux_ac_selected_wh_by_slot[slot_key] = slot_aux_ac_wh
+        entry["target_soc_pct"] = (
+            protected_target_soc_pct
+            if aux_ac_mode == "reserve_only"
+            else original_target_by_slot.get(slot_key, entry.get("target_soc_pct"))
+        )
+    aux_ac_selected_wh = sum(aux_ac_selected_wh_by_slot.values())
+    if aux_ac_selected_wh <= deadband_wh:
+        dc_contract["reason"] = "aux_ac_residual_within_deadband"
+        dc_contract["aux_ac_route_margin_ct_per_kwh"] = best_route_margin_ct
+        dc_diagnostic["source_contract"] = dc_contract
+        return dc_entries, dc_changed, dc_diagnostic
+
+    total_contract = _pv_store_source_contract(
+        mode=aux_ac_mode,
+        mode_source=mode_source,
+        aux_ac_user_release=True,
+        dc_forecast_complete=True,
+        forecast_fresh=True,
+        forecast_freshness_source=forecast_freshness_source,
+        topology_revision=plan_topology_revision,
+        dc_requested_wh=route_requested_wh,
+        dc_selected_wh=dc_selected_wh,
+        dc_conservative_selected_wh=dc_conservative_selected_wh,
+        dc_forecast_deficit_wh=dc_deficit_wh,
+        dc_forecast_sources=dc_forecast_sources,
+        deadband_wh=deadband_wh,
+        protected_target_soc_pct=protected_target_soc_pct,
+        forecast_confidence_pct=confidence_pct,
+        dc_route_margin_ct_per_kwh=best_dc_route_margin_ct,
+        aux_ac_route_margin_ct_per_kwh=best_route_margin_ct,
+        **route_efficiency_fields,
+        aux_ac_used=True,
+        aux_ac_selected_wh=aux_ac_selected_wh,
+        reason=(
+            "aux_ac_released_for_protected_reserve_deficit"
+            if aux_ac_mode == "reserve_only"
+            else "aux_ac_released_for_positive_route_margin"
+        ),
+    )
+    aux_ac_diagnostic = total_diagnostic
+    total_diagnostic = dict(dc_diagnostic)
+    total_diagnostic["dc_only"] = False
+    total_diagnostic["source_contract"] = total_contract
+    total_diagnostic["aux_ac_allocation"] = aux_ac_diagnostic
+    total_diagnostic["aux_ac_selected_wh"] = round(aux_ac_selected_wh, 1)
+    total_entries = _decorate_pv_store_source_entries(
+        total_entries,
+        source_contract=total_contract,
+        aux_ac_selected_wh_by_slot=aux_ac_selected_wh_by_slot,
+    )
+    merged_entries = _merge_dc_and_aux_ac_entries(dc_entries, total_entries)
+    selected_entries = [
+        entry
+        for entry in merged_entries
+        if entry.get("action") == "eco_plus_store_pv_candidate"
+        and safe_float(entry.get("pv_store_budget_slot_selected_wh"), 0.0) > 0.0
+    ]
+    source_accounted_selected_wh = round(
+        sum(
+            max(
+                0.0,
+                safe_float(entry.get("pv_store_budget_slot_selected_wh"), 0.0),
+            )
+            for entry in selected_entries
+        ),
+        1,
+    )
+    total_diagnostic["source_accounted_selected_wh"] = source_accounted_selected_wh
+    total_diagnostic["selected_stored_wh"] = source_accounted_selected_wh
+    total_diagnostic["remaining_stored_wh"] = round(
+        max(
+            0.0,
+            safe_float(total_diagnostic.get("requested_stored_wh"), 0.0)
+            - source_accounted_selected_wh,
+        ),
+        1,
+    )
+    total_diagnostic["selected_slot_count"] = len(selected_entries)
+    marginal_entry = max(selected_entries, key=_pv_store_priority_key, default=None)
+    if marginal_entry is not None:
+        priority_order = sorted(
+            (
+                entry
+                for entry in merged_entries
+                if entry.get("action") == "eco_plus_store_pv_candidate"
+            ),
+            key=_pv_store_priority_key,
+        )
+        rank_by_slot = {
+            (
+                int(safe_float(entry.get("start_ts"), 0.0)),
+                int(safe_float(entry.get("end_ts"), 0.0)),
+            ): rank
+            for rank, entry in enumerate(priority_order, start=1)
+        }
+        marginal_key = (
+            int(safe_float(marginal_entry.get("start_ts"), 0.0)),
+            int(safe_float(marginal_entry.get("end_ts"), 0.0)),
+        )
+        marginal_market_ct = safe_float(
+            marginal_entry.get("market_ct"),
+            float("nan"),
+        )
+        marginal_net_sell_ct = safe_float(
+            marginal_entry.get("net_sell_ct"),
+            float("nan"),
+        )
+        total_diagnostic["marginal_slot"] = {
+            "start_ts": marginal_key[0],
+            "end_ts": marginal_key[1],
+            "rank": rank_by_slot.get(marginal_key),
+            "market_ct": (
+                round(marginal_market_ct, 3)
+                if math.isfinite(marginal_market_ct)
+                else None
+            ),
+            "net_sell_ct": (
+                round(marginal_net_sell_ct, 3)
+                if math.isfinite(marginal_net_sell_ct)
+                else None
+            ),
+            "selected_stored_wh": round(
+                max(
+                    0.0,
+                    safe_float(
+                        marginal_entry.get("pv_store_budget_slot_selected_wh"),
+                        0.0,
+                    ),
+                ),
+                1,
+            ),
+            "selected_power_w": max(
+                0,
+                safe_int(marginal_entry.get("max_power_w"), 0),
+            ),
+        }
+    total_diagnostic["active"] = source_accounted_selected_wh > 0.0
+    total_diagnostic["reason"] = (
+        "allocated"
+        if source_accounted_selected_wh > 0.0
+        else "no_executable_slot"
+    )
+    return merged_entries, dc_changed + total_changed, total_diagnostic
 
 
 def _build_future_pv_store_reservation(
@@ -2689,6 +4482,147 @@ def _build_future_pv_store_reservation(
         "no_grid_charge": True,
         "consumer_budgets_untouched": True,
     })
+    return result
+
+
+def _future_export_credit_from_selected_pv_store(
+    entries,
+    reserve,
+    capacity_wh,
+    current_soc,
+    annotated,
+    now_ms,
+    candidate_start_timestamps,
+    efficiency,
+):
+    """Berechnet einen rein planerischen Exportkredit aus *ausgewählten* PV-Slots.
+
+    Der Kredit darf ausschließlich einen späteren Verkaufskandidaten sichtbar
+    machen. Er hebt weder die Notstromreserve noch irgendein Laufzeitveto auf.
+    Fehlende Hauslast-Prognose zwischen jetzt und dem Kandidaten führt bewusst
+    zu keinem Kredit.
+    """
+    result = {
+        "schema": "direct_marketing_future_export_credit_v1",
+        "reason": "no_selected_future_pv_store",
+        "data_quality": "not_evaluated",
+        "credits": {},
+    }
+    cap_wh = max(0.0, safe_float(capacity_wh, 0.0))
+    now_ms = safe_float(now_ms, 0.0)
+    reserve_wh = max(
+        0.0,
+        _clamp(safe_float(reserve.get("effective_min_soc_pct"), 0.0), 0.0, 100.0)
+        / 100.0
+        * cap_wh,
+    )
+    if cap_wh <= 0.0 or now_ms <= 0.0:
+        result.update({"reason": "storage_values_invalid", "data_quality": "invalid"})
+        return result
+
+    roundtrip_efficiency = _clamp(safe_float(efficiency, 0.0), 0.01, 1.0)
+    selected_charge_events = []
+    for entry in entries or []:
+        if not isinstance(entry, dict) or entry.get("action") != "eco_plus_store_pv_candidate":
+            continue
+        start_ts = safe_float(entry.get("start_ts"), 0.0)
+        end_ts = safe_float(entry.get("end_ts"), start_ts)
+        selected_wh = max(0.0, safe_float(entry.get("pv_store_budget_slot_selected_wh"), 0.0))
+        if start_ts < now_ms or end_ts <= start_ts or selected_wh <= 50.0:
+            continue
+        # Der Allokator arbeitet mit gespeicherter Energie. Für den späteren
+        # Export rechnen wir zusätzlich nur den konservativen Planwirkungsgrad
+        # an, niemals die größere physische Slot-Obergrenze.
+        plan_limited_wh = max(0.0, safe_float(entry.get("max_power_w"), 0.0)) * _entry_duration_h(entry) * roundtrip_efficiency
+        credited_wh = min(selected_wh, plan_limited_wh)
+        if credited_wh > 50.0:
+            selected_charge_events.append((end_ts, credited_wh))
+    if not selected_charge_events:
+        result.update({"data_quality": "ok"})
+        return result
+
+    forecast_slots = sorted(
+        (dict(slot) for slot in (annotated or []) if isinstance(slot, dict)),
+        key=lambda slot: safe_float(slot.get("ts"), 0.0),
+    )
+    if not forecast_slots:
+        result.update({"reason": "house_forecast_missing", "data_quality": "invalid"})
+        return result
+
+    result["data_quality"] = "ok"
+    for raw_target_ts in sorted(set(candidate_start_timestamps or [])):
+        target_ts = safe_float(raw_target_ts, 0.0)
+        key = str(int(target_ts))
+        credit = {
+            "candidate_start_ts": int(target_ts) if target_ts > 0.0 else None,
+            "eligible": False,
+            "reason": "candidate_not_future",
+            "credit_wh": 0.0,
+            "reserve_wh": round(reserve_wh, 1),
+            "house_forecast_complete": False,
+            "selected_pv_store_wh": 0.0,
+        }
+        if target_ts <= now_ms:
+            result["credits"][key] = credit
+            continue
+
+        storage_wh = _clamp(safe_float(current_soc, 0.0), 0.0, 100.0) / 100.0 * cap_wh
+        event_index = 0
+        cursor_ts = now_ms
+        selected_wh = 0.0
+        forecast_complete = True
+        for slot in forecast_slots:
+            slot_start = safe_float(slot.get("ts"), 0.0)
+            slot_end = safe_float(slot.get("end_ts"), slot_start + SLOT_MS)
+            if slot_end <= cursor_ts:
+                continue
+            if slot_start > cursor_ts + 1.0:
+                forecast_complete = False
+                break
+            interval_end = min(slot_end, target_ts)
+            if interval_end <= cursor_ts:
+                continue
+            if not cfg_bool(slot.get("has_power_forecast"), False):
+                forecast_complete = False
+                break
+
+            # Zuerst wird die PV-Ladung kapazitätsbegrenzt gutgeschrieben,
+            # danach die Hauslast abgezogen. Das ist bei unbekannter Reihenfolge
+            # innerhalb des Viertelstunden-Slots die konservativere Reihenfolge.
+            while event_index < len(selected_charge_events) and selected_charge_events[event_index][0] <= interval_end:
+                event_end_ts, event_wh = selected_charge_events[event_index]
+                if event_end_ts > cursor_ts:
+                    storage_wh = min(cap_wh, storage_wh + event_wh)
+                    selected_wh += event_wh
+                event_index += 1
+            overlap_h = max(0.0, interval_end - cursor_ts) / 3600000.0
+            storage_wh = max(
+                0.0,
+                storage_wh - max(0.0, safe_float(slot.get("forecast_deficit_w"), 0.0)) * overlap_h,
+            )
+            cursor_ts = interval_end
+            if cursor_ts >= target_ts:
+                break
+
+        if cursor_ts + 1.0 < target_ts:
+            forecast_complete = False
+        credit.update({
+            "house_forecast_complete": bool(forecast_complete),
+            "selected_pv_store_wh": round(selected_wh, 1),
+        })
+        if not forecast_complete:
+            credit["reason"] = "house_forecast_incomplete"
+        else:
+            available_wh = max(0.0, storage_wh - reserve_wh)
+            credit["credit_wh"] = round(available_wh, 1)
+            credit["eligible"] = available_wh > 50.0
+            credit["reason"] = "selected_pv_store_before_export" if available_wh > 50.0 else "reserve_remains_protected"
+        result["credits"][key] = credit
+
+    if any(item.get("eligible") for item in result["credits"].values()):
+        result["reason"] = "selected_pv_store_credit_available"
+    else:
+        result["reason"] = "selected_pv_store_credit_unavailable"
     return result
 
 
@@ -3133,6 +5067,18 @@ def _group_windows(entries):
             and current.get("pv_store_budget_need_wh") == entry.get("pv_store_budget_need_wh")
             and current.get("pv_store_budget_selected_wh") == entry.get("pv_store_budget_selected_wh")
             and current.get("pv_store_budget_priority") == entry.get("pv_store_budget_priority")
+            and current.get("pv_store_source_contract") == entry.get("pv_store_source_contract")
+            and current.get("pv_store_aux_ac_storage_allowed") == entry.get("pv_store_aux_ac_storage_allowed")
+            and current.get("pv_store_aux_ac_mode") == entry.get("pv_store_aux_ac_mode")
+            and current.get("pv_store_dc_forecast_complete") == entry.get("pv_store_dc_forecast_complete")
+            and current.get("pv_store_forecast_fresh") == entry.get("pv_store_forecast_fresh")
+            and current.get("pv_store_forecast_freshness_source") == entry.get("pv_store_forecast_freshness_source")
+            and current.get("pv_store_topology_revision") == entry.get("pv_store_topology_revision")
+            and current.get("pv_store_dc_forecast_requested_wh") == entry.get("pv_store_dc_forecast_requested_wh")
+            and current.get("pv_store_dc_forecast_selected_wh") == entry.get("pv_store_dc_forecast_selected_wh")
+            and current.get("pv_store_dc_forecast_conservative_selected_wh") == entry.get("pv_store_dc_forecast_conservative_selected_wh")
+            and current.get("pv_store_dc_route_margin_ct_per_kwh") == entry.get("pv_store_dc_route_margin_ct_per_kwh")
+            and current.get("pv_store_aux_ac_route_margin_ct_per_kwh") == entry.get("pv_store_aux_ac_route_margin_ct_per_kwh")
             and current.get("negative_headroom_next_start_ts") == entry.get("negative_headroom_next_start_ts")
             and current.get("negative_headroom_required_pct") == entry.get("negative_headroom_required_pct")
             and current.get("pv_store_headroom_next_reason") == entry.get("pv_store_headroom_next_reason")
@@ -3198,6 +5144,27 @@ def _group_windows(entries):
                 "pv_store_budget_need_wh",
                 "pv_store_budget_selected_wh",
                 "pv_store_budget_priority",
+                "pv_store_source_contract",
+                "pv_store_aux_ac_storage_allowed",
+                "pv_store_aux_ac_mode",
+                "pv_store_aux_ac_mode_source",
+                "pv_store_dc_forecast_complete",
+                "pv_store_forecast_fresh",
+                "pv_store_forecast_freshness_source",
+                "pv_store_topology_revision",
+                "pv_store_dc_forecast_requested_wh",
+                "pv_store_dc_forecast_selected_wh",
+                "pv_store_dc_forecast_conservative_selected_wh",
+                "pv_store_dc_forecast_deficit_wh",
+                "pv_store_aux_ac_deadband_wh",
+                "pv_store_aux_ac_protected_target_soc_pct",
+                "pv_store_aux_ac_forecast_confidence_pct",
+                "pv_store_dc_charge_efficiency_pct",
+                "pv_store_aux_ac_charge_efficiency_pct",
+                "pv_store_discharge_efficiency_pct",
+                "pv_store_dc_route_margin_ct_per_kwh",
+                "pv_store_aux_ac_route_margin_ct_per_kwh",
+                "pv_store_aux_ac_min_margin_ct_per_kwh",
                 "storage_action",
                 "pv_store_price_class",
                 "pv_store_soft_threshold",
@@ -3209,6 +5176,7 @@ def _group_windows(entries):
                 "pv_store_min_hold_s",
                 "pv_store_ramp_step_w",
                 "pv_store_dc_only_enable",
+                "pv_store_aux_ac_storage_enable",
                 "pv_store_external_ac_guard_w",
                 "pv_store_export_limit_guard_w",
                 "pv_store_export_limit_ramp_bypass_w",
@@ -3274,6 +5242,24 @@ def _group_windows(entries):
         current["slot_count"] += 1
         if entry.get("energy_limited"):
             current["energy_limited"] = True
+        if current.get("pv_store_aux_ac_storage_allowed"):
+            current["pv_store_dc_forecast_deficit_wh"] = round(
+                max(
+                    0.0,
+                    safe_float(
+                        current.get("pv_store_dc_forecast_deficit_wh"),
+                        0.0,
+                    ),
+                )
+                + max(
+                    0.0,
+                    safe_float(
+                        entry.get("pv_store_dc_forecast_deficit_wh"),
+                        0.0,
+                    ),
+                ),
+                1,
+            )
         current["_market"].append(entry["market_ct"])
         current["_billing"].append(entry["billing_ct"])
         current["_score"].append(entry["score"])
@@ -3356,6 +5342,26 @@ def build_direct_marketing_shadow_plan(
     mode = _normalize_mode(config.get("direct_marketing_mode", "safe"))
     profile = _mode_profile(mode)
     pv_store_threshold = _pv_store_threshold_state(config)
+    legacy_dc_only_veto = cfg_bool(
+        config.get("direct_marketing_pv_store_dc_only_enable"),
+        False,
+    )
+    aux_ac_mode, aux_ac_mode_source = _normalize_aux_ac_storage_mode(config)
+    if legacy_dc_only_veto:
+        aux_ac_mode = "off"
+        aux_ac_mode_source = "legacy_dc_only_veto"
+    route_efficiencies = _pv_store_route_efficiencies(config)
+    pv_topology_contract = build_pv_forecast_topology(config)
+    aux_ac_topology_ready = bool(
+        pv_topology_contract.get("status") == "bound"
+        and pv_topology_contract.get("e3dc_dc_bound")
+        and pv_topology_contract.get("external_ac_bound")
+    )
+    aux_ac_storage_enable = bool(
+        aux_ac_mode != "off"
+        and not legacy_dc_only_veto
+        and aux_ac_topology_ready
+    )
     flags = {
         "export_enable": cfg_bool(config.get("direct_marketing_export_enable"), False),
         "grid_charge_enable": cfg_bool(config.get("direct_marketing_grid_charge_enable"), False),
@@ -3374,7 +5380,46 @@ def build_direct_marketing_shadow_plan(
         "pv_store_import_guard_w": max(0.0, safe_float(config.get("direct_marketing_pv_store_import_guard_w"), 80.0)),
         "pv_store_min_hold_s": max(0.0, safe_float(config.get("direct_marketing_pv_store_min_hold_s"), 600.0)),
         "pv_store_ramp_step_w": max(100.0, safe_float(config.get("direct_marketing_pv_store_ramp_step_w"), 300.0)),
-        "pv_store_dc_only_enable": cfg_bool(config.get("direct_marketing_pv_store_dc_only_enable"), False),
+        "pv_store_dc_only_enable": True,
+        "pv_store_aux_ac_mode": aux_ac_mode,
+        "pv_store_aux_ac_mode_source": aux_ac_mode_source,
+        "pv_store_aux_ac_storage_enable": aux_ac_storage_enable,
+        "pv_store_aux_ac_topology_ready": aux_ac_topology_ready,
+        "pv_store_aux_ac_forecast_confidence_pct": _clamp(
+            safe_float(
+                config.get("direct_marketing_aux_inverter_ac_forecast_confidence_pct"),
+                80.0,
+            ),
+            0.0,
+            100.0,
+        ),
+        "pv_store_aux_ac_deadband_wh": max(
+            0.0,
+            safe_float(
+                config.get("direct_marketing_aux_inverter_ac_deadband_wh"),
+                0.0,
+            ),
+        ),
+        "pv_store_aux_ac_min_margin_ct_per_kwh": max(
+            0.0,
+            safe_float(
+                config.get("direct_marketing_aux_inverter_ac_min_margin_ct_per_kwh"),
+                safe_float(config.get("direct_marketing_min_profit_ct_per_kwh"), 0.0),
+            ),
+        ),
+        "pv_store_dc_charge_efficiency_pct": route_efficiencies["dc_charge_pct"],
+        "pv_store_aux_ac_charge_efficiency_pct": route_efficiencies["aux_ac_charge_pct"],
+        "pv_store_discharge_efficiency_pct": route_efficiencies["discharge_pct"],
+        "pv_store_dc_route_efficiency_pct": route_efficiencies["dc_route_pct"],
+        "pv_store_aux_ac_route_efficiency_pct": route_efficiencies["aux_ac_route_pct"],
+        "pv_store_aux_ac_degradation_ct_per_kwh": max(
+            0.0,
+            safe_float(config.get("direct_marketing_degradation_ct_per_kwh"), 4.0),
+        ),
+        "pv_store_aux_ac_safety_margin_ct_per_kwh": safe_float(
+            config.get("direct_marketing_safety_margin_ct_per_kwh"),
+            0.0,
+        ),
         "pv_store_external_ac_guard_w": max(0.0, safe_float(config.get("direct_marketing_pv_store_external_ac_guard_w"), 100.0)),
         "pv_store_export_limit_guard_w": max(0.0, safe_float(config.get("direct_marketing_pv_store_export_limit_guard_w"), 100.0)),
         "pv_store_export_limit_ramp_bypass_w": max(0.0, safe_float(config.get("direct_marketing_pv_store_export_limit_ramp_bypass_w"), 300.0)),
@@ -3434,6 +5479,21 @@ def build_direct_marketing_shadow_plan(
     current_soc = safe_float(current_soc, 0.0) if flags["live_soc_valid"] else 0.0
 
     reserve = _reserve_state(config, mode, current_soc, capacity_wh, target_soc or current_soc)
+    protected_target_raw = _configured_optional_float(
+        config,
+        "direct_marketing_aux_inverter_ac_protected_target_soc_pct",
+    )
+    if protected_target_raw is None:
+        protected_target_raw = max(
+            safe_float(reserve.get("effective_min_soc_pct"), 0.0),
+            safe_float(reserve.get("home_reserve_soc_pct"), 0.0),
+            safe_float(reserve.get("night_reserve_soc_pct"), 0.0),
+        )
+    flags["pv_store_aux_ac_protected_target_soc_pct"] = _clamp(
+        protected_target_raw,
+        0.0,
+        100.0,
+    )
 
     raw_slots = []
     price_quality_blockers = []
@@ -3499,7 +5559,10 @@ def build_direct_marketing_shadow_plan(
         is_threshold_low = bool(threshold_ct is not None and net_sell_ct <= safe_float(threshold_ct, 0.0))
         is_threshold_soft = bool(is_threshold_low and not is_negative)
         is_score_pv_store = bool(is_score_low and not threshold_configured)
-        forecast_power = _slot_forecast_power(slot)
+        forecast_power = _slot_forecast_power(
+            slot,
+            assume_total_pv_is_e3dc_dc=not _external_ac_source_configured(config),
+        )
         annotated.append({
             "ts": _slot_ts(slot),
             "end_ts": _slot_end_ts(slot),
@@ -3527,6 +5590,9 @@ def build_direct_marketing_shadow_plan(
         previous_market_windows=previous_market_windows,
     )
     economics = _economic_state(config, annotated)
+    flags["pv_store_aux_ac_best_high_net_sell_ct"] = economics.get(
+        "best_high_net_sell_ct"
+    )
     blocked_reasons = list(current_price_quality_blockers)
     if (
         settlement_accounting["variable_fee"]["percent"] > 0.0
@@ -3566,6 +5632,7 @@ def build_direct_marketing_shadow_plan(
         blocked_reasons.append("reserve_floor_reached")
 
     entries = []
+    export_slots = []
     soc_ceiling = round(_clamp(100.0 - safe_float(config.get("direct_marketing_keep_headroom_pct"), 20.0), 0.0, 100.0), 1)
     target_soc_limit = round(_clamp(safe_float(target_soc, 100.0), 0.0, 100.0), 1)
     if target_soc_limit <= 0.1:
@@ -3633,6 +5700,7 @@ def build_direct_marketing_shadow_plan(
                     "pv_store_min_hold_s": int(flags["pv_store_min_hold_s"]),
                     "pv_store_ramp_step_w": int(flags["pv_store_ramp_step_w"]),
                     "pv_store_dc_only_enable": bool(flags["pv_store_dc_only_enable"]),
+                    "pv_store_aux_ac_storage_enable": bool(flags["pv_store_aux_ac_storage_enable"]),
                     "pv_store_external_ac_guard_w": int(flags["pv_store_external_ac_guard_w"]),
                     "pv_store_export_limit_guard_w": int(flags["pv_store_export_limit_guard_w"]),
                     "pv_store_export_limit_ramp_bypass_w": int(flags["pv_store_export_limit_ramp_bypass_w"]),
@@ -3661,9 +5729,56 @@ def build_direct_marketing_shadow_plan(
                 }
                 entries.append(_new_slot_action(slot, "keep_headroom", low_reason, extra))
 
-        if not slot.get("is_export_plateau", slot["is_high"]):
-            continue
-        if reserve.get("available_export_soc_pct", 0.0) <= 1.0:
+        if slot.get("is_export_plateau", slot["is_high"]):
+            export_slots.append(slot)
+
+    # Ein späterer Verkauf darf bei aktueller Reserve nur dann überhaupt als
+    # Kandidat auftauchen, wenn vorher bereits eine physisch begrenzte
+    # PV-Speicherung ausgewählt wurde. Diese Vorallokation ist reine Planung;
+    # die reguläre Allokation und der harte Runtime-Reservewächter bleiben
+    # unverändert nachgelagert.
+    efficiency = safe_float(config.get("direct_marketing_roundtrip_efficiency_pct"), 85.0) / 100.0
+    future_export_credit = {
+        "schema": "direct_marketing_future_export_credit_v1",
+        "reason": "current_export_energy_available",
+        "data_quality": "not_needed",
+        "credits": {},
+    }
+    reserve_limited = reserve.get("available_export_soc_pct", 0.0) <= 1.0
+    if (
+        reserve_limited
+        and mode == "eco_plus"
+        and flags["export_enable"]
+        and flags["max_export_w"] > 0.0
+        and export_slots
+    ):
+        pv_store_entries = [
+            dict(entry)
+            for entry in entries
+            if entry.get("action") == "eco_plus_store_pv_candidate"
+        ]
+        planned_pv_entries, _planned_limited, _planned_allocation = _apply_pv_store_energy_budget(
+            pv_store_entries,
+            reserve,
+            capacity_wh,
+            flags,
+            efficiency,
+            current_soc,
+        )
+        future_export_credit = _future_export_credit_from_selected_pv_store(
+            planned_pv_entries,
+            reserve,
+            capacity_wh,
+            current_soc,
+            annotated,
+            now_ms,
+            [safe_float(slot.get("ts"), 0.0) for slot in export_slots],
+            efficiency,
+        )
+
+    for slot in export_slots:
+        planned_credit = future_export_credit.get("credits", {}).get(str(int(safe_float(slot.get("ts"), 0.0))), {})
+        if reserve_limited and not cfg_bool(planned_credit.get("eligible"), False):
             continue
 
         if mode == "safe":
@@ -3690,6 +5805,12 @@ def build_direct_marketing_shadow_plan(
                         "max_power_w": int(flags["max_export_w"]),
                         "economic_basis": "pv_shift",
                         "reserve_floor_soc_pct": reserve.get("effective_min_soc_pct"),
+                        "future_pv_store_credit_required": bool(reserve_limited),
+                        "future_pv_store_credit_wh": (
+                            safe_float(planned_credit.get("credit_wh"), 0.0)
+                            if reserve_limited
+                            else 0.0
+                        ),
                     },
                 ))
             else:
@@ -3721,7 +5842,6 @@ def build_direct_marketing_shadow_plan(
         blocked_reasons.append("pv_store_headroom_prioritized")
         blocked_reasons.append("negative_price_headroom_prioritized")
 
-    efficiency = safe_float(config.get("direct_marketing_roundtrip_efficiency_pct"), 85.0) / 100.0
     entries, prioritized_limited = _prioritize_export_entries(
         entries,
         reserve,
@@ -3730,7 +5850,7 @@ def build_direct_marketing_shadow_plan(
         efficiency,
         annotated=annotated,
     )
-    entries, pv_store_budget_limited = _apply_pv_store_energy_budget(
+    entries, pv_store_budget_limited, pv_store_allocation = _apply_pv_store_energy_budget(
         entries,
         reserve,
         capacity_wh,
@@ -3749,7 +5869,7 @@ def build_direct_marketing_shadow_plan(
             annotated=annotated,
         )
         prioritized_limited += reprioritized_limited
-        entries, second_budget_limited = _apply_pv_store_energy_budget(
+        entries, second_budget_limited, second_pv_store_allocation = _apply_pv_store_energy_budget(
             entries,
             reserve,
             capacity_wh,
@@ -3757,23 +5877,16 @@ def build_direct_marketing_shadow_plan(
             efficiency,
             current_soc,
         )
+        pv_store_allocation = second_pv_store_allocation
         if second_budget_limited > 0:
             pv_store_budget_limited += second_budget_limited
+    pv_store_allocation = _finalize_pv_store_allocation_diagnostic(
+        pv_store_allocation,
+        entries,
+    )
     if prioritized_limited > 0:
         blocked_reasons.append("export_energy_prioritized")
 
-    future_pv_store_reservation = _build_future_pv_store_reservation(
-        config,
-        entries,
-        reserve,
-        annotated,
-        capacity_wh,
-        current_soc,
-        now_ms,
-        flags,
-        mode,
-        efficiency,
-    )
     windows = _group_windows(entries)
     if not windows and not blocked_reasons:
         blocked_reasons.append("no_candidate_windows")
@@ -3805,6 +5918,18 @@ def build_direct_marketing_shadow_plan(
     if not flags.get("settlement_fee_basis_valid", True):
         flags["commands_allowed"] = False
 
+    future_pv_store_reservation = _build_future_pv_store_reservation(
+        config,
+        entries,
+        reserve,
+        annotated,
+        capacity_wh,
+        current_soc,
+        now_ms,
+        flags,
+        mode,
+        efficiency,
+    )
     valid_until_ts = min((w["end_ts"] for w in windows), default=now_ms + SLOT_MS)
     policy_timeline = _build_policy_timeline(
         config,
@@ -3822,13 +5947,68 @@ def build_direct_marketing_shadow_plan(
         forecast_timeline=raw_slots,
         previous_policy_decision=previous_policy_decision,
     )
+    (
+        charge_block_wait_slots,
+        neutral_policy_slots,
+        charge_block_wait_plan,
+    ) = _build_charge_block_wait_policy_slots(
+        policy_timeline,
+        annotated,
+        flags,
+        mode,
+        now_ms,
+    )
+    if neutral_policy_slots:
+        policy_timeline.extend(neutral_policy_slots)
+    if charge_block_wait_slots:
+        windows.extend(
+            dict(item["selected_window"])
+            for item in charge_block_wait_slots
+            if isinstance(item.get("selected_window"), dict)
+        )
+        # Der veröffentlichte DV-Plan ist selbsttragend. Neue Warteslots werden
+        # deshalb bereits im Producer vollständig an ihr einziges aktives
+        # Zeitfenster gebunden; Test- und Runtime-Consumer dürfen den Vertrag
+        # später weder ergänzen noch stillschweigend verändern.
+        enriched_charge_block_wait_slots = []
+        for item in charge_block_wait_slots:
+            start_ts = safe_int(item.get("start_ts"), now_ms)
+            end_ts = safe_int(item.get("end_ts"), start_ts + SLOT_MS)
+            probe_ms = max(now_ms, start_ts)
+            if end_ts > probe_ms:
+                probe_ms = min(end_ts - 1, probe_ms)
+            enriched_charge_block_wait_slots.append(
+                _enrich_policy_candidate_contract(item, windows, probe_ms)
+            )
+        policy_timeline.extend(enriched_charge_block_wait_slots)
+        # Das erneuerte Zeitfenster ist enger als ein neutraler Ursprungsslot
+        # und muss deshalb bei gleichem Now-Zeitpunkt vor ihm gewählt werden.
+        valid_until_ts = min((w["end_ts"] for w in windows), default=now_ms + SLOT_MS)
+    policy_timeline.sort(
+        key=lambda item: (
+            safe_int(item.get("start_ts"), 0),
+            0 if str(item.get("dv_target_state") or "").upper() == "CHARGE_BLOCK_WAIT" else 1,
+            safe_int(item.get("end_ts"), 0),
+        )
+    )
     policy_decision = next(
         (
             item for item in policy_timeline
-            if safe_float(item.get("start_ts"), 0.0) <= now_ms < safe_float(item.get("end_ts"), 0.0)
+            if (
+                str(item.get("dv_target_state") or "").upper() == "CHARGE_BLOCK_WAIT"
+                and safe_float(item.get("start_ts"), 0.0) <= now_ms < safe_float(item.get("end_ts"), 0.0)
+            )
         ),
         None,
     )
+    if policy_decision is None:
+        policy_decision = next(
+            (
+                item for item in policy_timeline
+                if safe_float(item.get("start_ts"), 0.0) <= now_ms < safe_float(item.get("end_ts"), 0.0)
+            ),
+            None,
+        )
     if policy_decision is None:
         policy_decision = _build_policy_decision(
             config,
@@ -3844,6 +6024,12 @@ def build_direct_marketing_shadow_plan(
             blocked_reasons,
             previous_policy_decision=previous_policy_decision,
         )
+    policy_end_ts = safe_int(
+        policy_decision.get("end_ts") if isinstance(policy_decision, dict) else 0,
+        0,
+    )
+    if policy_end_ts > now_ms:
+        valid_until_ts = min(valid_until_ts, policy_end_ts)
 
     planned_export_wh = sum(
         max(0.0, safe_float(window.get("max_power_w"), 0.0)) * _entry_duration_h(window)
@@ -3899,5 +6085,8 @@ def build_direct_marketing_shadow_plan(
         },
         "policy_decision": policy_decision,
         "policy_timeline": policy_timeline,
+        "charge_block_wait_plan": charge_block_wait_plan,
+        "pv_store_allocation": pv_store_allocation,
+        "future_export_credit": future_export_credit,
         "future_pv_store_reservation": future_pv_store_reservation,
     }

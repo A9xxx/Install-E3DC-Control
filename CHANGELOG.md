@@ -6,6 +6,50 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.2] – 2026-07-27
+
+### 🔋 Speicher und Direktvermarktung
+
+- ⚙️ **Lückenloser Tagesplan:** Die Direktvermarktung plant den Tag durchgehend in festen 15-Minuten-Abschnitten. Aktive Speicherfenster, Ladepausen, Verkaufsfenster und passive Hausversorgungszeiten besitzen damit eine eindeutige Semantik; ein bloß künftiges Verkaufsfenster hält den Speicher nicht mehr unnötig fest.
+- 🧭 **Saubere Übergänge:** Ein gebundener Abschnitt „Speicherplatz halten“ sperrt ausschließlich das Laden und lässt die Entladung für Hausverbrauch offen. Nach dem letzten PV-Speicherabschnitt geht die Anlage wieder in den passiven E3/DC-AUTO-Betrieb, solange kein stärkerer Storage-Manager-Entscheider wirkt.
+- 💶 **Verkaufsfenster:** Wirtschaftlich freigegebene Entladeabschnitte werden nach Wert, verfügbarer Energie, Anlagen- und Notstromreserve geplant. Nicht freigegebene Kandidaten bleiben reine Diagnose und erhalten keinen Hardwareausgang.
+- 🌞 **E3/DC-PV-Laderahmen:** Die neue, standardmäßig ausgeschaltete Option begrenzt Kurvenladung und DV-PV-Speichern sanft auf die frisch ermittelte E3/DC-PV-Leistung. E3/DC bleibt dabei in AUTO, Entladen bleibt offen und Leistung eines zusätzlichen AC-Wechselrichters erhöht den Laderahmen nicht. Fehlt ein gültiger PV-Split, werden diese PV-basierten Ladepfade sicher auf 0 W begrenzt. Preis- und ausdrücklich freigegebenes Netzladen bleiben eigenständige Verträge.
+- 🔀 **Optionale AC-Speicherroute:** Anlagen mit zusätzlichem AC-Wechselrichter können dessen Energie getrennt für „Reserve sichern“ oder „wirtschaftlich“ freigeben. Standard bleibt `Aus`; E3/DC-DC hat Vorrang, Netzladen wird dadurch nicht freigegeben und unvollständige Topologie- oder DC-Unterdeckungsdaten sperren den Pfad.
+- 🛡️ **Befehlsvertrag:** Temporäre `POWER_SETTINGS` bleiben an Owner, Plan, Slot, Datenfrische und typisierten Readback gebunden. Dynamische Speichergrenzen werden ausschließlich flüchtig gesetzt; dauerhafte Geräteeinstellungen werden nicht zyklisch verändert.
+- 🔎 **DV-Planer-Shadow:** Ein neuer wirkungsloser Architektur-Shadow bildet jeden 15-Minuten-Slot ausschließlich als Hausversorgung, PV-Speichern, Ladeblock, ausdrücklich freigegebenes Netzladen oder wirtschaftlichen Verkauf ab. Er prüft Planbindung, Datenfrische, Topologie, Netzpunkt, Notstromreserve und verkäufliche Energie, verändert aber weder produktive Plan-/Slot-Identitäten noch den einzigen Hardwareausgang des Storage Managers.
+
+### 📉 Lastspitzenbegrenzung
+
+- ✨ **Peak Shaving am Netzbezug:** Eine neue, standardmäßig ausgeschaltete Regelung begrenzt den mittleren Netzbezug in festen Zähler-Viertelstunden. Sicherheitsabstand, Leistungs- und SoC-Hysterese, Messlückenprüfung sowie Freigabe-Entprellung verhindern ein Flattern der Speichergrenzen.
+- 🔋 **Geschützter Puffer:** Die konfigurierbare Speicherschwelle bleibt oberhalb der physischen Notstromreserve. Beim Begrenzen und Halten arbeitet E3/DC weiter in AUTO; der Storage Manager setzt nur flüchtige Lade- oder Entladerahmen und fordert keine Netzeinspeisung an.
+- 🔌 **Netz-Nachladung nur mit Freigabe:** Ein Nachladen des Lastspitzenpuffers aus dem Netz ist separat opt-in, an eine lückenlose aktuelle Viertelstunde sowie Hausanschluss- und Leistungsgrenzen gebunden. Standardmäßig bleibt Netzladen aus.
+
+### 🔌 Wallbox-Ladeplanung
+
+- 🕒 **Wiederkehrende Tarife:** Feste Tarife, Octopus Heat und Spezialtarife können ein morgiges 15-Minuten-Ladefenster bereits aus ihrem konfigurierten Tagesprofil planen, auch wenn für morgen noch keine EPEX-Slots vorliegen. Tarifpreis und optionaler Marktpreis bleiben getrennte Felder; dynamische Tarife planen ohne veröffentlichte Zukunftspreise weiterhin nicht.
+- 🧭 **Verständliche Fehler:** Schlägt die private Kandidatenplanung fehl, zeigt die Weboberfläche einen validierten deutschen Grund statt nur des Prozesscodes. Ungültige oder freie Prozessausgabe wird nicht in die Oberfläche übernommen.
+
+### 📊 PV-Prognosediagnose
+
+- 🔎 **Historienvergleich:** Die optionale Diagnose vergleicht archivierte E3/DC-DC-Prognosen mit abgeschlossenen nativen 15-Minuten-Historienslots. Trefferabweichung, Richtungsversatz, energiegewichtete Gesamtabweichung und Vergleichsabdeckung bleiben reine Diagnosewerte.
+- 🔐 **Strikte Trennung:** Der niedrig priorisierte Diagnosedienst ist standardmäßig aus, besitzt weder einen Steuerpfad noch einen Pfad zum Zurückschreiben der Konfiguration und wirkt weder auf Prognoseauswahl noch Speicherregelung zurück. Bei `Aus` erfolgen keine Historienabfrage und kein Datenbankschreibzugriff.
+- 🗄️ **Private Ablage:** Rohdaten liegen außerhalb des Webverzeichnisses in einer größen- und altersbegrenzten SQLite-Datenbank. Das Webportal erhält ausschließlich eine kleine sanitierte Zusammenfassung; Docker verwendet dafür ein separates persistentes Volume.
+- 🗺️ **Versionierte PV-Topologie:** Der Konfigurationseditor verwaltet beliebig viele PV-Flächen, Wechselrichtergruppen und Provider-Bindungen als einen geprüften Vertrag. Fehlende Messwerte bleiben unbekannt statt zu einer Messnull zu werden; eine neue Topologie-Revision verhindert die Wiederverwendung eines veralteten PV-Splits.
+
+### 📦 Installation, Docker und Oberfläche
+
+- 🐛 **Frische Erstinstallation:** Der Installer unterscheidet eine wirklich neue, eine sicher fortsetzbare unvollständige und eine widersprüchliche bestehende Installation. Nur beim erstmaligen Erzeugen der Konfiguration wird die Einzelanlagenrolle vorbelegt; vorhandene Anlagen ohne gültige HA-/Shadow-Bindung bleiben fail-closed.
+- 🛡️ **Ehrlicher Abschlussstatus:** Fehlgeschlagene Paket-, Konfigurations-, Webportal-, Rechte- oder Dienstschritte werden bis zum Menü- und Prozess-Exitcode weitergereicht. Eine unvollständige Installation wird nicht mehr als erfolgreich abgeschlossen gemeldet.
+- 🧭 **Gleicher sicherer Installationsweg:** Der direkte Aufruf `--install-all` verwendet dieselbe Zustands- und Rollenprüfung wie der interaktive Menüpunkt. Frische, fortsetzbare und widersprüchliche Bestände werden damit unabhängig vom Einstieg gleich behandelt.
+- 🔐 **Unveränderte Nutzerkonfiguration:** Beim gebundenen Release-Wechsel bleiben sowohl die Pfad-/Default-Normalisierung als auch die alte Telegram-Migration außerhalb des eingefrorenen Release-Fensters. Eine bestehende Betriebskonfiguration und ihr Legacy-Pfadspiegel werden dadurch nicht still ergänzt; eine echte Erstinstallation darf die benötigten Startwerte weiterhin erzeugen.
+- 🛡️ **Große Wiederherstellungen:** Der transaktionale Rücklauf reserviert sein prozesslokales Dateideskriptorbudget vor der ersten Änderung und stellt das vorherige Soft-Limit anschließend wieder her. Auch umfangreiche Installationsbäume bleiben damit atomar rückrollbar, ohne Systemlimits dauerhaft zu verändern.
+- 🐛 **Altprozess-Kompatibilität:** Ein von 5.4.0a gestarteter Web-/Konsolen-Updater kann nach dem verifizierten Baumwechsel mit seinem bereits geladenen alten Backup-Modul fortfahren. Die Rechteprüfung erkennt dessen ältere Validator-Signatur, bleibt strikt read-only und fail-closed und verlangt keine Funktion aus einer noch nicht neu gestarteten Python-Generation.
+- 🐳 **Optionale Diagnose im Container:** Modell und Prognosediagnose besitzen getrennte private Volumes. Der Diagnosedienst startet nur bei ausdrücklicher Aktivierung; ein Containerneustart übernimmt die Änderung.
+- 🔒 **Gebundener Docker-Rückfall:** Der veröffentlichte Rückfallstand ist zusätzlich zum Tag an seinen unveränderlichen OCI-Index-Digest gebunden. Die angezeigte Rückfallkette prüft vor `pull` und `up`, dass Compose exakt dieses Image auflöst.
+- 🖥️ **Verständlichere Konfiguration:** Der Tarifbereich gruppiert Direktvermarktung, Preisfunktionen und Lastspitzenbegrenzung klarer und beschreibt Schalter in Alltagssprache. Bei zwei Wallboxen stehen die individuellen Einstellungen durchgehend nebeneinander; bei einer Wallbox wird die verfügbare Breite genutzt.
+- 🧭 **Passende Statusanzeige:** Das Dashboard unterscheidet passive Hausversorgung, Speicherplatz halten, PV-Speichern und Verkauf anhand des tatsächlich wirksamen Vertrags. Redundante HOLD-Felder sind zusammengeführt.
+- 🧹 **Browser-Cache:** Der Service-Worker verwendet die 5.4.2-Kennung, damit alte statische Frontenddateien beim Releasewechsel eindeutig verworfen werden.
+
 ## [5.4.1d] – 2026-07-25
 
 ### 🌡️ Klima

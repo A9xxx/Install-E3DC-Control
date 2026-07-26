@@ -24,7 +24,16 @@ def safe_execute_task(task_name, task_function, *args, **kwargs):
         
         # Führe Task aus
         result = task_function(*args, **kwargs)
-        
+
+        # Produktpfade signalisieren erwartete Abbrüche mit False. Das ist kein
+        # Erfolg und darf weder als erledigt geloggt noch so angezeigt werden.
+        # None bleibt für die historischen Menü-Handler kompatibel erfolgreich.
+        if result is False:
+            error_msg = "Aktion meldete keinen erfolgreichen Abschluss."
+            log_error(module_name=task_name, error_msg=error_msg)
+            print(f"\n✗ {task_name} fehlgeschlagen.\n")
+            return False
+
         # Log Erfolg
         log_task_completed(task_name)
         print(f"✓ {task_name} abgeschlossen.\n")

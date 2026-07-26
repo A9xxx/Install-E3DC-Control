@@ -45,6 +45,7 @@
 !/.gitignore
 !/CHANGELOG.md
 !/Dockerfile
+!/Installer/Forecast/pv_forecast_evidence.py
 !/Installer/Forecast/pv_forecast_service.py
 !/Installer/Heat/__init__.py
 !/Installer/Heat/forecast.py
@@ -52,6 +53,7 @@
 !/Installer/Storage/__init__.py
 !/Installer/Storage/charge_curve.py
 !/Installer/Storage/common.py
+!/Installer/Storage/peak_shaving.py
 !/Installer/Storage/predump.py
 !/Installer/Storage/rscp_commands.py
 !/Installer/Wallbox/__init__.py
@@ -106,7 +108,10 @@
 !/Installer/dimplex/__init__.py
 !/Installer/dimplex/dimplex_live.py
 !/Installer/direct_marketing.py
+!/Installer/direct_marketing_dispatch_planner.py
+!/Installer/e3dc_history_slots.py
 !/Installer/e3dc_live.py
+!/Installer/forecast_evidence_sidecar.py
 !/Installer/external_pv_topology.py
 !/Installer/e3dc_mqtt_hub.py
 !/Installer/e3dc_websocket.py

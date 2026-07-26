@@ -1118,6 +1118,8 @@ if (in_array($seite, $protectedPages) && !isWebAuthenticated()) {
                     <div class="d-flex justify-content-between small mb-2"><span class="text-muted">Summe der Ersparnis:</span> <span id="m-stat-save-total" class="text-info fw-bold">0.00 €</span></div>
                     <div id="m-stat-eeg-row" class="d-flex justify-content-between small mb-1" style="display:none;"><span class="text-muted">EEG-Einspeisevergütung:</span> <span id="m-stat-eeg-total" class="text-success fw-bold">--</span></div>
                     <div id="m-stat-eeg-note" class="small text-muted mb-2" style="display:none; font-size: 0.7rem;"></div>
+                    <div id="m-stat-dv-battery-sale-row" class="d-flex justify-content-between small mb-1" style="display:none;" title="Separater Ist-Erlös aus dem Direktvermarktungs-Tagesreport; nicht in das Endergebnis eingerechnet."><span class="text-muted">DV-Batterieverkauf netto:</span> <span id="m-stat-dv-battery-sale" class="text-success fw-bold">—</span></div>
+                    <div id="m-stat-dv-battery-sale-note" class="small text-muted mb-2" style="display:none; font-size: 0.7rem;"></div>
 
                     <div class="row g-2 mb-2">
                         <div class="col-6">
@@ -1225,6 +1227,22 @@ if (in_array($seite, $protectedPages) && !isWebAuthenticated()) {
             </div>
         </div>
         <div id="forecast-kwh-summary" class="text-center text-info small fw-bold mb-2" style="display:none; letter-spacing: 0.02em;"></div>
+        <div id="pv-forecast-diagnostic-card" class="dashboard-card px-3 py-2 mb-2 small" hidden>
+            <div class="d-flex flex-wrap align-items-center justify-content-between gap-2">
+                <span class="fw-bold"><i class="fas fa-chart-bar text-info me-1"></i>PV-Prognosediagnose</span>
+                <span id="pv-forecast-diagnostic-status" class="badge text-bg-secondary">Noch keine Auswertung</span>
+            </div>
+            <div class="d-grid gap-1 mt-2 text-body">
+                <span title="Typischer absoluter Unterschied je verglichenem 15-Minuten-Fenster">Trefferabweichung: <strong id="pv-forecast-diagnostic-hit">–</strong></span>
+                <span title="Positiv bedeutet im Mittel mehr, negativ weniger Ertrag als vorhergesagt">Richtungsversatz: <strong id="pv-forecast-diagnostic-direction">–</strong></span>
+                <span title="Gesamtabweichung, gewichtet nach der tatsächlich erzeugten Energie">Energieabweichung: <strong id="pv-forecast-diagnostic-energy">–</strong></span>
+                <span title="Anteil der archivierten Prognosefenster mit gültigem Messwert">Abdeckung: <strong id="pv-forecast-diagnostic-coverage">–</strong></span>
+            </div>
+            <div class="mt-2 text-muted">
+                <div id="pv-forecast-diagnostic-sample">Noch keine vergleichbaren Fenster</div>
+                <div>Nur Diagnose – ändert keine Regelung und wählt kein Modell aus.</div>
+            </div>
+        </div>
         <div class="dashboard-card" style="height: calc(100vh - 180px); min-height: 400px; display: flex; flex-direction: column; position: relative;">
             <div style="flex: 1; border-radius: 20px; overflow: hidden; position: relative;">
                 <!-- Live JS Chart Overlay -->

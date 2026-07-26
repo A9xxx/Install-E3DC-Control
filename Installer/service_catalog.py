@@ -40,6 +40,7 @@ OBSERVE_LOAD_MODULES = {
     "climate_live",
     "climate_control",
     "shadow",
+    "forecast_evidence",
 }
 
 
@@ -132,6 +133,29 @@ MODULES: dict[str, ServiceModule] = {
         alive_max_age_s=7200,
         config_keys=("forecast1",),
         optional=False,
+        actions=READ_ACTIONS + SERVICE_ACTIONS,
+    ),
+    "forecast_evidence": ServiceModule(
+        key="forecast_evidence",
+        display_name="PV-Prognosediagnose",
+        group=CORE,
+        description=(
+            "Vergleicht Prognose und abgeschlossene E3/DC-DC-Historienslots "
+            "rein diagnostisch."
+        ),
+        service="e3dc-forecast-evidence",
+        script="forecast_evidence_sidecar.py",
+        alive_file="/var/www/html/ramdisk/pv_forecast_diagnostic_summary.json",
+        alive_max_age_s=3600,
+        config_keys=("forecast_diagnostics_enable",),
+        required_config_keys=(),
+        dependencies=("live", "weather"),
+        install_notes=(
+            "Standardmäßig ausgeschaltet; besitzt keinen Steuer- oder Konfigurationspfad.",
+            "Die Rohdaten bleiben privat außerhalb des Webverzeichnisses.",
+        ),
+        optional=True,
+        load_profile=LOAD_OBSERVE,
         actions=READ_ACTIONS + SERVICE_ACTIONS,
     ),
     "storage_simulator": ServiceModule(

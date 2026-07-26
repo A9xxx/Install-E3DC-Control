@@ -1,6 +1,6 @@
 # Speicher-Ladesteuerung - Systemablauf
 
-> **Stand:** v5.4.1d, gegen den veröffentlichten Betriebsvertrag geprüft am 2026-07-25
+> **Stand:** v5.4.2, gegen den Release-Betriebsvertrag geprüft am 2026-07-26
 >
 > **Dateien:** `Installer/storage_simulator.py`,
 > `Installer/storage_manager.py`, `Installer/storage_parallel_regulator.py`
@@ -46,6 +46,8 @@ Die Planung erzeugt:
 - adaptiven Headroom mit freiem Speicherplatz, Reserve max, Quelle und
   Abregeldruck,
 - Pre-Dump-Fenster und Pre-Dump-Energie,
+- einen durchgehenden Direktvermarktungs-Tagesplan aus festen
+  15-Minuten-Abschnitten, sofern Direktvermarktung aktiv ist,
 - `can_reach_target` und Diagnosewerte.
 
 Vergangene und aktive Anker werden eingefroren. Zukünftige Anker dürfen sich
@@ -54,16 +56,20 @@ SoC nach oben gezogen werden.
 
 ## 2. Regelung
 
-Der Manager läuft eng getaktet und bündelt alle Wächter:
+Der Manager läuft eng getaktet und bündelt alle Wächter. Notstrom, manuelle
+Batteriekommandos, Datenvalidität und Hardwaregrenzen besitzen immer Vorrang.
+Danach konkurrieren ausschließlich typisierte Kandidaten um denselben
+Storage-Owner:
 
-1. Notstrom, manuelle Batteriekommandos und Sicherheitsgrenzen.
-2. Preis-/Unwetter-Netzladen mit expliziter Freigabe.
-3. Adaptiver Headroom als Kurven- und Reserveband.
-4. Pre-Dump vor Kurvenstart inklusive Verbraucherbudget und Netz-Fallback.
-5. Abregelschutz und, falls freigegeben, kurze Headroom-Entladung nach
-   Kurvenstart.
-6. Normale Ladekurve und Wallbox-/Wärmebudget.
-7. Freilauf/AUTO-Freigabe.
+- Preis-/Unwetter-Netzladen mit expliziter Freigabe,
+- gebundene Direktvermarktungs-Slots,
+- Lastspitzenbegrenzung für die aktuelle Zähler-Viertelstunde,
+- adaptiver Headroom, Pre-Dump und Abregelschutz,
+- normale Ladekurve sowie Wallbox-/Wärmebudget,
+- passiver Freilauf/AUTO.
+
+Vor jedem Hardwareausgang werden Owner, Plan, Slot, Quellenfrische,
+Notstromreserve und aktueller `POWER_SETTINGS`-Vertrag erneut geprüft.
 
 Im normalen PV-Betrieb bleibt der E3DC möglichst in `AUTO`. E3DC-Control setzt
 dann nur EMS-Power-Settings:
@@ -108,6 +114,27 @@ Adaptive Headroom-Werte werden dabei nicht als direkter Entladeauftrag gelesen:
 
 Im Dashboard wird daraus `frei / Reserve max`. Ein Pre-Dump-Auftrag entsteht
 erst, wenn `predump_dump_wh` beziehungsweise `Pre-Dump-Bedarf` größer null ist.
+
+### 3.1 Optionale E3/DC-PV-Ladebegrenzung
+
+`storage_dc_first_charge_limit_enable = 1` begrenzt Kurvenladung und
+DV-PV-Speichern zusätzlich auf die frisch ermittelte E3/DC-PV-Leistung:
+
+```text
+wirksame Ladegrenze =
+  min(Storage-Simulator-Obergrenze, frische E3/DC-PV-Leistung)
+```
+
+Die E3/DC-PV-Leistung wird aus dem gültigen, topologiegebundenen Split zwischen
+gesamter PV und zusätzlicher AC-PV ermittelt. Ein externer AC-Wechselrichter
+erhöht diesen Laderahmen nicht. Fehlt der frische Split, bleiben diese
+PV-basierten Ladepfade mit 0 W fail-closed.
+
+Der Manager setzt dafür ausschließlich einen flüchtigen `MAX_CHARGE_POWER`-
+Rahmen. E3/DC bleibt in AUTO und die Entladung für wechselnden Hausverbrauch
+bleibt offen. Die Funktion ist deshalb DC-first, aber keine physikalische
+Garantie für einen ausschließlich internen DC/DC-Energiepfad. Preis- und
+ausdrücklich freigegebenes Netzladen besitzen eigenständige Verträge.
 
 ## 4. Verbraucherbudget
 
@@ -180,18 +207,61 @@ Preislogik ist bewusst getrennt:
   Wärmepumpe oder ein großer Verbraucher regelrelevant sein soll, muss seine
   Leistung eingebunden oder geplant sein.
 
-## 9. Ausgabedateien
+## 9. Direktvermarktungs-Tagesplan
+
+Bei aktiver Direktvermarktung besitzt jeder 15-Minuten-Abschnitt des Tages eine
+Planbedeutung:
+
+- **PV-Speichern** erlaubt ausschließlich den zum Slotvertrag passenden
+  Ladepfad.
+- **Speicherplatz halten** setzt einen Ladeblock mit 0 W; Entladen für
+  Hausverbrauch bleibt offen.
+- **Verkaufen** darf nur mit wirtschaftlicher Freigabe, verfügbarer Energie,
+  gültigem Netzpunktvertrag und SoC oberhalb der Notstromreserve wirken.
+- **Hausversorgung / NORMAL** ist ein passiver AUTO-Abschnitt ohne
+  Speicherbremse.
+
+Nach dem letzten PV-Speicherabschnitt bleibt ein künftiges Verkaufsfenster
+allein kein Grund, den Speicher zu halten. Andere Storage-Manager-Entscheider
+wie Pre-Dump, Preis-Netzladen oder Lastspitzenbegrenzung können weiterhin
+Vorrang erhalten. Ein nicht freigegebener Kandidat bleibt Diagnose und erzeugt
+keinen RSCP-Ausgang.
+
+## 10. Peak Shaving am Netzbezug
+
+`peak_shaving_enable = 1` schützt den mittleren Netzbezug in festen
+Zähler-Viertelstunden. Der reine Policy-Baustein integriert nur frische,
+lückenlose Netzpunktmessungen und liefert einen Kandidaten an den zentralen
+Storage Manager.
+
+- Beim Begrenzen und Halten bleibt E3/DC in AUTO; die Regelung setzt nur einen
+  flüchtigen Lade- oder Entladerahmen und fordert keine Netzeinspeisung an.
+- Sicherheitsabstand, Leistungshysterese, SoC-Hysterese und
+  Freigabe-Entprellung verhindern Flattern.
+- Der Lastspitzenpuffer liegt oberhalb der physischen Notstromreserve.
+- Bei einer zu großen Messlücke bleibt der Pfad passiv und beginnt erst an einer
+  neuen festen Viertelstundengrenze.
+- Netz-Nachladung des Puffers benötigt
+  `peak_shaving_grid_recharge_enable = 1`, verwendet vorübergehend den
+  angeforderten Netzlademodus und bleibt zusätzlich an lückenlose Historie,
+  Viertelstundenraum, Hausanschluss und Hardwarelimit gebunden.
+
+`peak_shaving_enable = 0` ist neutral und erhält keine Regelhoheit.
+
+## 11. Ausgabedateien
 
 | Datei | Inhalt |
 |---|---|
 | `storage_plan.json` | Plan, Zielkurve, Headroom, Pre-Dump, Prognosewerte |
 | `storage_manager_state.json` | aktueller Speicherzustand, Auftrag, Diagnosewerte |
+| `peak_shaving_interval_state.json` | aktueller Viertelstundenstand, Messabdeckung und Lastspitzenkandidat |
+| `direct_marketing_daily_report.json` | zusammengefasster Direktvermarktungs-Tagesplan und Ausführungsstatus |
 | `predump_consumer_plan.json` | Pre-Dump-Verbraucherbudget |
 | `energy_decision_latest.json` | Wärmepumpen-/Heizstabentscheidung |
 | `wallbox_native.json` | Wallboxstatus, Budget, Modus, Messwerte |
 | `storage_decisions*.jsonl.gz` | komprimierte Entscheidungsdiagnose |
 
-## 10. Diagnosefragen
+## 12. Diagnosefragen
 
 Bei Auffälligkeiten zuerst diese Reihenfolge prüfen:
 
@@ -202,3 +272,7 @@ Bei Auffälligkeiten zuerst diese Reihenfolge prüfen:
 5. Reagiert der E3DC sichtbar auf gesetzte EMS-Grenzen oder lädt er autonom?
 6. Ist `Headroom-Reserve max` nur ein Diagnoseband, oder gibt es wirklich
    `Pre-Dump-Bedarf` beziehungsweise `parallel_headroom_discharge`?
+7. Ist ein Direktvermarktungsabschnitt aktiv und freigegeben oder nur ein
+   künftiger beziehungsweise diagnostischer Kandidat?
+8. Ist die Lastspitzen-Viertelstunde lückenlos belegt und liegt der Puffer
+   oberhalb der Notstromreserve?

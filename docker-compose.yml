@@ -2,7 +2,7 @@ services:
   e3dc-control:
     # Ohne E3DC_IMAGE_TAG folgt die Installation dem geprüften Stable-Tag
     # "latest". Ein fester Pin oder Rückfall wird bewusst in .env gesetzt,
-    # zum Beispiel: E3DC_IMAGE_TAG=v5.4.1d
+    # zum Beispiel: E3DC_IMAGE_TAG=v5.4.2
     image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"
 
     # ZUM SELBST BAUEN: Obige Zeile auskommentieren und stattdessen:
@@ -23,6 +23,9 @@ services:
 
       # Privater, anlagenspezifischer ML-Modellstore (nicht webschreibbar)
       - e3dc_ml:/var/lib/e3dc-control/ml
+
+      # Private Rohdaten der PV-Prognosediagnose (nur bei Aktivierung genutzt)
+      - e3dc_forecast_evidence:/var/lib/e3dc-control/forecast-evidence
 
     tmpfs:
       # RAM-Disk für Live-Daten (pv_forecast.json, live_data_py.json, ...)
@@ -55,3 +58,4 @@ volumes:
   e3dc_data:
   e3dc_logs:
   e3dc_ml:
+  e3dc_forecast_evidence:

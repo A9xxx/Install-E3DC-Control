@@ -4047,6 +4047,19 @@ class StorageSimulator:
         slot["pv_resource_projection_reason"] = str(
             forecast_slot.get("pv_resource_projection_reason") or reason
         )
+        if "pv_forecast_fresh" in forecast_slot or "forecast_fresh" in forecast_slot:
+            fresh_value = (
+                forecast_slot.get("pv_forecast_fresh")
+                if "pv_forecast_fresh" in forecast_slot
+                else forecast_slot.get("forecast_fresh")
+            )
+            slot["pv_forecast_fresh"] = fresh_value is True
+            slot["forecast_fresh"] = fresh_value is True
+        if "pv_forecast_freshness_source" in forecast_slot:
+            slot["pv_forecast_freshness_source"] = str(
+                forecast_slot.get("pv_forecast_freshness_source")
+                or "model_provenance_unknown"
+            )
         slot["e3dc_dc_pv_w"] = dc_w if status == "bound" else None
         slot["external_ac_pv_w"] = external_w if status == "bound" else None
         slot["pv_resource_contributions"] = (

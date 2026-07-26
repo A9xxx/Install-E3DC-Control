@@ -34,6 +34,49 @@ function e3dcWbTxResult($success, $code, $message, array $extra = []) {
     ], $extra);
 }
 
+function e3dcWbTxPlannerFailureMessage($resultPath) {
+    if (!is_string($resultPath) || $resultPath === '' || is_link($resultPath) || !is_file($resultPath)) {
+        return null;
+    }
+    $size = @filesize($resultPath);
+    if ($size === false || $size < 2 || $size > 65536) {
+        return null;
+    }
+    $raw = @file_get_contents($resultPath);
+    $result = $raw === false ? null : json_decode($raw, true);
+    if (!is_array($result)
+        || ($result['schema'] ?? '') !== E3DC_WB_TX_RESULT_SCHEMA
+        || !array_key_exists('success', $result)
+        || !empty($result['success'])
+        || !is_string($result['error'] ?? null)) {
+        return null;
+    }
+    $error = trim((string)$result['error']);
+    if ($error === '' || strlen($error) > 256 || !preg_match('/^[a-z0-9_]+$/', $error)) {
+        return null;
+    }
+
+    if ($error === 'candidate_market_data_missing') {
+        return 'Für den dynamischen Tarif fehlen gültige zukünftige Preisdaten. Die Ladeplanung wurde nicht gespeichert.';
+    }
+    if (preg_match('/^candidate_required_plan_empty_wb([12])$/', $error, $match)) {
+        return 'Für Wallbox ' . $match[1] . ' stehen im gewählten Ladefenster nicht genügend gültige Tarif- oder Preisslots bereit. Die Ladeplanung wurde nicht gespeichert.';
+    }
+    if (str_starts_with($error, 'candidate_config_invalid_')
+        || str_starts_with($error, 'candidate_required_plan_')
+        || $error === 'candidate_required_plan_mismatch') {
+        return 'Die eingegebenen Ladeplanwerte sind ungültig oder widersprüchlich. Die Ladeplanung wurde nicht gespeichert.';
+    }
+    if (str_starts_with($error, 'candidate_plan_')
+        || str_starts_with($error, 'candidate_combined_plan_')) {
+        return 'Der erzeugte Ladeplan hat die Sicherheitsprüfung nicht bestanden. Die Ladeplanung wurde nicht gespeichert.';
+    }
+    if (str_starts_with($error, 'candidate_')) {
+        return 'Der Wallbox-Planer konnte aus den Eingaben keinen sicheren Ladeplan erzeugen. Es wurde nichts gespeichert.';
+    }
+    return null;
+}
+
 function e3dcWbTxIsTest(array $options) {
     return PHP_SAPI === 'cli' && !empty($options['test_mode']);
 }
@@ -579,7 +622,10 @@ function e3dcWallboxPlanTransaction(array $updates, array $options = []) {
         );
         if (empty($planner['success'])) {
             $detail = !empty($planner['timed_out']) ? 'Timeout' : ((int)($planner['signal'] ?? 0) > 0 ? 'Signal ' . (int)$planner['signal'] : 'rc=' . (int)($planner['exit_code'] ?? 1));
-            return e3dcWbTxResult(false, 'planner_failed', 'Planner-Kandidat fehlgeschlagen (' . $detail . ').', [
+            $safePlannerMessage = e3dcWbTxPlannerFailureMessage($jobDir . '/planner_result.json');
+            $message = $safePlannerMessage
+                ?? ('Der Wallbox-Planer wurde ohne gültige Fehlerdiagnose beendet (' . $detail . '). Es wurde nichts gespeichert.');
+            return e3dcWbTxResult(false, 'planner_failed', $message, [
                 'planner' => $planner, 'transaction_id' => $txId,
             ]);
         }

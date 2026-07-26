@@ -35,9 +35,17 @@ try:
 except Exception:  # pragma: no cover - direct script execution fallback
     from aux_inverter_contract import effective_contract as _aux_inverter_contract  # type: ignore
 try:
-    from .pv_forecast_topology import build_pv_forecast_topology
+    from .pv_forecast_topology import (
+        build_pv_forecast_topology,
+        has_explicit_topology_config,
+        legacy_provider_resource_duplicate_keys,
+    )
 except Exception:  # pragma: no cover - direct script execution fallback
-    from pv_forecast_topology import build_pv_forecast_topology  # type: ignore
+    from pv_forecast_topology import (  # type: ignore
+        build_pv_forecast_topology,
+        has_explicit_topology_config,
+        legacy_provider_resource_duplicate_keys,
+    )
 
 
 RAMDISK = "/var/www/html/ramdisk"
@@ -58,6 +66,21 @@ def safe_float(value: Any, default: float = 0.0) -> float:
         return float(default)
 
 
+def _configured_finite_number(
+    cfg: Dict[str, Any],
+    key: str,
+    default: float,
+) -> Tuple[float, bool]:
+    raw = cfg.get(key, default)
+    try:
+        if isinstance(raw, str):
+            raw = raw.strip().replace(",", ".")
+        value = float(raw)
+    except (TypeError, ValueError):
+        return float(default), False
+    return value, math.isfinite(value)
+
+
 def _has_user_value(cfg: Dict[str, Any], key: str) -> bool:
     if key not in cfg:
         return False
@@ -67,6 +90,39 @@ def _has_user_value(cfg: Dict[str, Any], key: str) -> bool:
 
 def _is_enabled(cfg: Dict[str, Any], key: str) -> bool:
     return str(cfg.get(key, "0")).strip().lower() in {"1", "true", "yes", "on", "ein"}
+
+
+def _direct_marketing_aux_ac_mode(cfg: Dict[str, Any]) -> Tuple[str, str]:
+    """Normalisiert die aktuelle Nutzerfreigabe ohne Plan- oder Runtime-Fallback."""
+
+    aliases = {
+        "aus": "off",
+        "disabled": "off",
+        "reserve": "reserve_only",
+        "reserve_sichern": "reserve_only",
+        "reserve_only": "reserve_only",
+        "wirtschaftlich": "economic",
+        "economical": "economic",
+        "economic": "economic",
+    }
+    for key in (
+        "direct_marketing_aux_inverter_ac_storage_mode",
+        "direct_marketing_pv_store_aux_ac_mode",
+    ):
+        if key not in cfg:
+            continue
+        raw = str(cfg.get(key) or "").strip().lower().replace("-", "_").replace(" ", "_")
+        mode = aliases.get(raw, raw)
+        if mode in {"off", "reserve_only", "economic"}:
+            return mode, key
+        return "off", f"{key}_invalid"
+    if _is_enabled(cfg, "direct_marketing_aux_inverter_ac_storage_enable"):
+        return "reserve_only", "legacy_bool_explicit_true"
+    return "off", (
+        "legacy_bool_explicit_false"
+        if "direct_marketing_aux_inverter_ac_storage_enable" in cfg
+        else "default_off"
+    )
 
 
 def _first_live_value(live: Dict[str, Any], keys: Iterable[str]) -> Tuple[Optional[float], Optional[str]]:
@@ -245,6 +301,11 @@ def validate_solcast_config(cfg: Optional[Dict[str, Any]]) -> Dict[str, Dict[str
         2: bool(str(cfg.get("solcast_api_key_2") or "").strip()),
     }
     legacy_secondary_slot = 2 if key_available[2] else 1
+    duplicate_labels = (
+        set()
+        if has_explicit_topology_config(cfg)
+        else set(legacy_provider_resource_duplicate_keys(cfg))
+    )
     result: Dict[str, Dict[str, Any]] = {}
     for label, resource_key, mapping_key, legacy_slot in (
         ("FC1", "solcast_resource_id", "solcast_api_slot_fc1", 1),
@@ -262,6 +323,12 @@ def validate_solcast_config(cfg: Optional[Dict[str, Any]]) -> Dict[str, Dict[str
         if not resource_configured:
             severity = "info"
             message = f"{label} ist nicht konfiguriert."
+        elif label in duplicate_labels:
+            severity = "warning"
+            message = (
+                f"{label}: Resource ID ist mehrfach gebunden; "
+                "M3 bleibt vollständig gesperrt."
+            )
         elif not valid_slot:
             severity = "warning"
             message = f"{label}: Accountslot muss 1 oder 2 sein; M3 bleibt gesperrt."
@@ -289,6 +356,67 @@ def validate_pv_forecast_topology_config(cfg: Optional[Dict[str, Any]]) -> Dict[
     cfg = {str(k).lower(): v for k, v in (cfg or {}).items()}
     contract = build_pv_forecast_topology(cfg)
     result: Dict[str, Dict[str, Any]] = {}
+    diagnostics_raw = str(cfg.get("forecast_diagnostics_enable", "0")).strip().lower()
+    diagnostics_valid = diagnostics_raw in {
+        "",
+        "0",
+        "1",
+        "false",
+        "true",
+        "off",
+        "on",
+        "no",
+        "yes",
+        "nein",
+        "ein",
+    }
+    diagnostics_enabled = diagnostics_raw in {"1", "true", "on", "yes", "ein"}
+    result["forecast_diagnostics_enable"] = _entry(
+        key="forecast_diagnostics_enable",
+        label="PV-Prognosediagnose",
+        unit="-",
+        configured=diagnostics_raw if _has_user_value(cfg, "forecast_diagnostics_enable") else None,
+        live_value=None,
+        live_key=None,
+        effective=diagnostics_enabled if diagnostics_valid else False,
+        source="user" if _has_user_value(cfg, "forecast_diagnostics_enable") else "default",
+        severity="info" if diagnostics_valid else "warning",
+        message=(
+            "Rein diagnostische Auswertung; keine automatische Regelungs- oder Modellwirkung."
+            if diagnostics_enabled
+            else "Diagnose ist ausgeschaltet und erzeugt keine Hintergrundlast."
+            if diagnostics_valid
+            else "Ungültiger Schalterwert; Diagnose bleibt ausgeschaltet."
+        ),
+    )
+    explicit_contract = contract.get("contract_mode") == "explicit_generator_groups"
+    if explicit_contract:
+        group_count = int(contract.get("resource_count") or 0)
+        binding_count = len(contract.get("provider_bindings") or [])
+        topology_ok = contract.get("status") == "bound"
+        provider_status = str(contract.get("provider_status") or "")
+        provider_ok = provider_status in {"bound", "disabled_no_bindings"}
+        result["pv_forecast_topology_config"] = _entry(
+            key="pv_forecast_topology_config",
+            label="PV-Prognose-Topologie",
+            unit="-",
+            configured=group_count if _has_user_value(cfg, "pv_forecast_topology_config") else None,
+            live_value=None,
+            live_key=None,
+            effective={"generator_groups": group_count, "provider_resources": binding_count},
+            source="user",
+            severity="ok" if topology_ok and provider_ok else "warning",
+            message=(
+                (
+                    f"Lokale Topologie enthält {group_count} Generatorgruppe(n); "
+                    f"Providerbindung bleibt gesperrt ({contract.get('provider_reason')})."
+                )
+                if topology_ok and not provider_ok
+                else f"Schema enthält {group_count} Generatorgruppe(n) und {binding_count} Providerressource(n)."
+                if topology_ok
+                else f"Topologievertrag ist nicht vollständig bindbar ({contract.get('reason')}); Quellsplit bleibt gesperrt."
+            ),
+        )
     by_key = {
         str(item.get("coupling_key")): item
         for item in contract.get("resources", [])
@@ -306,6 +434,13 @@ def validate_pv_forecast_topology_config(cfg: Optional[Dict[str, Any]]) -> Dict[
             severity = "info"
             message = f"{_label} ist nicht als Forecastressource konfiguriert."
             effective = None
+        elif not item.get("has_geometry"):
+            severity = "warning"
+            effective = None
+            message = (
+                f"{_label} besitzt keine lokale Geometrie; "
+                "M1/M2-Quellsplit bleibt gesperrt."
+            )
         elif item.get("coupling") in {"E3DC_DC", "EXTERNAL_AC"}:
             severity = "ok"
             effective = item.get("coupling")
@@ -519,6 +654,69 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         source=reserve_source,
         severity=reserve_severity,
         message=reserve_message,
+    )
+
+    dc_first_enabled = _is_enabled(cfg, "storage_dc_first_charge_limit_enable")
+    dc_first_total_raw = live.get("PV_Power")
+    dc_first_external_raw = live.get("Ext_PV_Power")
+    dc_first_values_typed = bool(
+        isinstance(dc_first_total_raw, (int, float))
+        and not isinstance(dc_first_total_raw, bool)
+        and isinstance(dc_first_external_raw, (int, float))
+        and not isinstance(dc_first_external_raw, bool)
+        and math.isfinite(float(dc_first_total_raw))
+        and math.isfinite(float(dc_first_external_raw))
+    )
+    dc_first_values_nonnegative = bool(
+        dc_first_values_typed
+        and float(dc_first_total_raw) >= 0.0
+        and float(dc_first_external_raw) >= 0.0
+    )
+    dc_first_total_pv_w = (
+        max(0.0, float(dc_first_total_raw)) if dc_first_values_typed else 0.0
+    )
+    dc_first_external_pv_w = (
+        max(0.0, float(dc_first_external_raw)) if dc_first_values_typed else 0.0
+    )
+    dc_first_e3dc_pv_w = max(0.0, dc_first_total_pv_w - dc_first_external_pv_w)
+    dc_first_live_ts = safe_float(live.get("_ts"), 0.0)
+    dc_first_live_age_s = float(now) - dc_first_live_ts if dc_first_live_ts > 0.0 else float("inf")
+    dc_first_max_age_s = max(1.0, min(30.0, safe_float(cfg.get("storage_live_stale_guard_s"), 10.0)))
+    dc_first_max_future_skew_s = 5.0
+    dc_first_source_valid = bool(
+        dc_first_values_nonnegative
+        and live.get("RSCP_Sample_Valid") is True
+        and live.get("Power_Decision_Usable") is True
+        and live.get("Ext_PV_Power_Valid") is True
+        and dc_first_live_ts > 0.0
+        and -dc_first_max_future_skew_s <= dc_first_live_age_s <= dc_first_max_age_s
+        and dc_first_external_pv_w <= dc_first_total_pv_w
+    )
+    dc_first_severity = "info"
+    dc_first_message = "Aus: Die bestehende Speicher-Ladeführung bleibt unverändert."
+    if dc_first_enabled and dc_first_source_valid:
+        dc_first_severity = "ok"
+        dc_first_message = (
+            "Aktiv: Kurvenladung und DV-PV-Speichern werden auf die frische E3DC-PV-Leistung begrenzt; "
+            "Entladen bleibt offen."
+        )
+    elif dc_first_enabled:
+        dc_first_severity = "warning"
+        dc_first_message = (
+            "Aktiv, aber der frische E3DC-/Zusatz-PV-Split fehlt. "
+            "Kurvenladung und DV-PV-Speichern bleiben deshalb sicher auf 0 W begrenzt."
+        )
+    storage["storage_dc_first_charge_limit_enable"] = _entry(
+        key="storage_dc_first_charge_limit_enable",
+        label="Laden an E3DC-PV koppeln",
+        unit="",
+        configured=dc_first_enabled,
+        live_value=dc_first_e3dc_pv_w if dc_first_source_valid else None,
+        live_key="PV_Power-Ext_PV_Power" if dc_first_source_valid else None,
+        effective=dc_first_enabled,
+        source="user" if _has_user_value(cfg, "storage_dc_first_charge_limit_enable") else "default",
+        severity=dc_first_severity,
+        message=dc_first_message,
     )
 
     grid_amps = safe_float(cfg.get("grid_max_amps"), 63.0)
@@ -1045,6 +1243,241 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     market_autarky_low_soc = safe_float(cfg.get("market_autarky_low_soc_pct"), 20.0)
     market_autarky_buffer_wh = safe_float(cfg.get("market_autarky_horizon_buffer_wh"), 500.0)
     octopus_bad_order = tariff == "octopus_heat" and not (cheap < basis < uht)
+    peak_enabled = _is_enabled(cfg, "peak_shaving_enable")
+    peak_grid_recharge_enabled = _is_enabled(
+        cfg,
+        "peak_shaving_grid_recharge_enable",
+    )
+    peak_values = {
+        "peak_shaving_grid_import_limit_w": _configured_finite_number(
+            cfg,
+            "peak_shaving_grid_import_limit_w",
+            10_000.0,
+        ),
+        "peak_shaving_reserve_soc_pct": _configured_finite_number(
+            cfg,
+            "peak_shaving_reserve_soc_pct",
+            30.0,
+        ),
+        "peak_shaving_max_discharge_w": _configured_finite_number(
+            cfg,
+            "peak_shaving_max_discharge_w",
+            0.0,
+        ),
+        "peak_shaving_recharge_max_w": _configured_finite_number(
+            cfg,
+            "peak_shaving_recharge_max_w",
+            0.0,
+        ),
+        "peak_shaving_control_margin_w": _configured_finite_number(
+            cfg,
+            "peak_shaving_control_margin_w",
+            300.0,
+        ),
+        "peak_shaving_hysteresis_w": _configured_finite_number(
+            cfg,
+            "peak_shaving_hysteresis_w",
+            600.0,
+        ),
+        "peak_shaving_soc_hysteresis_pct": _configured_finite_number(
+            cfg,
+            "peak_shaving_soc_hysteresis_pct",
+            1.0,
+        ),
+        "peak_shaving_max_sample_gap_s": _configured_finite_number(
+            cfg,
+            "peak_shaving_max_sample_gap_s",
+            10.0,
+        ),
+        "peak_shaving_release_debounce_s": _configured_finite_number(
+            cfg,
+            "peak_shaving_release_debounce_s",
+            20.0,
+        ),
+    }
+    peak_limit_w = peak_values["peak_shaving_grid_import_limit_w"][0]
+    peak_reserve_soc = peak_values["peak_shaving_reserve_soc_pct"][0]
+    peak_validation = {
+        "peak_shaving_grid_import_limit_w": (
+            peak_values["peak_shaving_grid_import_limit_w"][1]
+            and peak_limit_w >= 1000.0
+        ),
+        "peak_shaving_reserve_soc_pct": (
+            peak_values["peak_shaving_reserve_soc_pct"][1]
+            and peak_reserve_soc > reserve_effective
+            and peak_reserve_soc <= 100.0
+        ),
+        "peak_shaving_max_discharge_w": (
+            peak_values["peak_shaving_max_discharge_w"][1]
+            and peak_values["peak_shaving_max_discharge_w"][0] >= 0.0
+        ),
+        "peak_shaving_recharge_max_w": (
+            peak_values["peak_shaving_recharge_max_w"][1]
+            and peak_values["peak_shaving_recharge_max_w"][0] >= 0.0
+        ),
+        "peak_shaving_control_margin_w": (
+            peak_values["peak_shaving_control_margin_w"][1]
+            and 0.0 <= peak_values["peak_shaving_control_margin_w"][0]
+            <= max(0.0, peak_limit_w - 300.0)
+        ),
+        "peak_shaving_hysteresis_w": (
+            peak_values["peak_shaving_hysteresis_w"][1]
+            and peak_values["peak_shaving_hysteresis_w"][0] > 300.0
+        ),
+        "peak_shaving_soc_hysteresis_pct": (
+            peak_values["peak_shaving_soc_hysteresis_pct"][1]
+            and 0.1
+            <= peak_values["peak_shaving_soc_hysteresis_pct"][0]
+            <= 5.0
+        ),
+        "peak_shaving_max_sample_gap_s": (
+            peak_values["peak_shaving_max_sample_gap_s"][1]
+            and 2.0 <= peak_values["peak_shaving_max_sample_gap_s"][0] <= 60.0
+        ),
+        "peak_shaving_release_debounce_s": (
+            peak_values["peak_shaving_release_debounce_s"][1]
+            and 5.0
+            <= peak_values["peak_shaving_release_debounce_s"][0]
+            <= 120.0
+        ),
+    }
+    peak_messages = {
+        "peak_shaving_grid_import_limit_w": (
+            "Die 15-Minuten-Grenze muss mindestens 1.000 W betragen."
+        ),
+        "peak_shaving_reserve_soc_pct": (
+            "Die Lastspitzen-Schwelle muss über der wirksamen "
+            f"Notstromreserve von {reserve_effective:.1f} % liegen und darf "
+            "100 % nicht überschreiten."
+        ),
+        "peak_shaving_max_discharge_w": (
+            "Die Entladeobergrenze muss mindestens 0 W betragen."
+        ),
+        "peak_shaving_recharge_max_w": (
+            "Die Netz-Nachladegrenze muss mindestens 0 W betragen."
+        ),
+        "peak_shaving_control_margin_w": (
+            "Der Sicherheitsabstand muss mindestens 0 W betragen und "
+            "mindestens 300 W Regelraum unter der Bezugsgrenze lassen."
+        ),
+        "peak_shaving_hysteresis_w": (
+            "Die Leistungshysterese muss strikt größer als die kleinste "
+            "300-W-Leistungsgrenze sein; empfohlen sind mindestens 600 W."
+        ),
+        "peak_shaving_soc_hysteresis_pct": (
+            "Die SoC-Hysterese muss zwischen 0,1 und 5,0 Prozentpunkten liegen."
+        ),
+        "peak_shaving_max_sample_gap_s": (
+            "Die größte Messlücke muss zwischen 2 und 60 Sekunden liegen."
+        ),
+        "peak_shaving_release_debounce_s": (
+            "Die Freigabe-Entprellung muss zwischen 5 und 120 Sekunden liegen."
+        ),
+    }
+    peak_labels = {
+        "peak_shaving_grid_import_limit_w": ("15-Minuten-Netzbezugsgrenze", "W"),
+        "peak_shaving_reserve_soc_pct": ("Lastspitzen-Speicherschwelle", "%"),
+        "peak_shaving_max_discharge_w": ("Lastspitzen max. Entladung", "W"),
+        "peak_shaving_recharge_max_w": ("Lastspitzen max. Netz-Nachladung", "W"),
+        "peak_shaving_control_margin_w": ("Lastspitzen-Sicherheitsabstand", "W"),
+        "peak_shaving_hysteresis_w": ("Lastspitzen-Leistungshysterese", "W"),
+        "peak_shaving_soc_hysteresis_pct": ("Lastspitzen-SoC-Hysterese", "%"),
+        "peak_shaving_max_sample_gap_s": ("Lastspitzen max. Messlücke", "s"),
+        "peak_shaving_release_debounce_s": ("Lastspitzen Freigabe-Entprellung", "s"),
+    }
+    peak_contract_valid = all(
+        valid
+        for key, valid in peak_validation.items()
+        if key != "peak_shaving_recharge_max_w"
+        or peak_grid_recharge_enabled
+    )
+    for key, (value, typed) in peak_values.items():
+        valid = bool(peak_validation.get(key))
+        relevant = bool(
+            peak_enabled
+            and (
+                key != "peak_shaving_recharge_max_w"
+                or peak_grid_recharge_enabled
+            )
+        )
+        label, unit = peak_labels[key]
+        price[key] = _entry(
+            key=key,
+            label=label,
+            unit=unit,
+            configured=value if _has_user_value(cfg, key) and typed else None,
+            live_value=None,
+            live_key=None,
+            effective=value if typed else None,
+            source="user" if _has_user_value(cfg, key) else "default",
+            severity="warning" if relevant and not valid else "ok",
+            message=(
+                peak_messages[key]
+                if relevant and not valid
+                else (
+                    "Wert ist plausibel; die Regelung greift nur ein, wenn "
+                    "der Netzbezug seit Beginn der aktuellen festen "
+                    "Viertelstunde lückenlos belegt ist."
+                    if peak_enabled
+                    else "Lastspitzenbegrenzung ist aus; der Wert wirkt nicht."
+                )
+            ),
+        )
+    price["peak_shaving_enable"] = _entry(
+        key="peak_shaving_enable",
+        label="Lastspitzenbegrenzung",
+        unit="-",
+        configured=cfg.get("peak_shaving_enable")
+        if _has_user_value(cfg, "peak_shaving_enable")
+        else None,
+        live_value=None,
+        live_key=None,
+        effective=peak_enabled,
+        source="user"
+        if _has_user_value(cfg, "peak_shaving_enable")
+        else "default",
+        severity=(
+            "warning"
+            if peak_enabled and not peak_contract_valid
+            else "ok"
+        ),
+        message=(
+            "Konfiguration ungültig: Die Regelung bleibt passiv und übernimmt "
+            "keine Speicherentscheidung."
+            if peak_enabled and not peak_contract_valid
+            else (
+                "Aktiv: Der Speicher begrenzt den 15-Minuten-Netzbezug nur "
+                "mit E3/DC-AUTO und flüchtiger Entladeobergrenze; er fordert "
+                "weder Entladung noch Einspeisung an."
+                if peak_enabled
+                else "Aus: keine Regelhoheit und keine Speicherwirkung."
+            )
+        ),
+    )
+    usable_peak_pct = max(0.0, peak_reserve_soc - reserve_effective)
+    price["peak_shaving_reserve_contract"] = _entry(
+        key="peak_shaving_reserve_contract",
+        label="Nutzbarer Lastspitzenpuffer",
+        unit="%",
+        configured=peak_reserve_soc if peak_values["peak_shaving_reserve_soc_pct"][1] else None,
+        live_value=reserve_effective,
+        live_key=reserve_live_key,
+        effective=usable_peak_pct,
+        source="user_minus_physical_reserve",
+        severity=(
+            "warning"
+            if peak_enabled
+            and not peak_validation["peak_shaving_reserve_soc_pct"]
+            else "ok"
+        ),
+        message=(
+            f"Von der eingestellten {peak_reserve_soc:.1f}-%-Schwelle bis zur "
+            f"wirksamen Notstromreserve von {reserve_effective:.1f} % sind "
+            f"{usable_peak_pct:.1f} Prozentpunkte ausschließlich als "
+            "Lastspitzenpuffer reserviert. Bei einer echten Lastspitze darf "
+            "dieser Puffer bis zur physischen Reserve genutzt werden."
+        ),
+    )
     price["strompreis_cheap"] = _entry(
         key="strompreis_cheap",
         label="Günstigpreis",
@@ -1472,7 +1905,60 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     dm_pv_store_import_guard_w = safe_float(cfg.get("direct_marketing_pv_store_import_guard_w"), 80.0)
     dm_pv_store_min_hold_s = safe_float(cfg.get("direct_marketing_pv_store_min_hold_s"), 600.0)
     dm_pv_store_ramp_step_w = safe_float(cfg.get("direct_marketing_pv_store_ramp_step_w"), 300.0)
-    dm_pv_store_dc_only = _is_enabled(cfg, "direct_marketing_pv_store_dc_only_enable")
+    dm_pv_store_legacy_dc_only_veto = _is_enabled(
+        cfg,
+        "direct_marketing_pv_store_dc_only_enable",
+    )
+    dm_aux_ac_mode, dm_aux_ac_mode_source = _direct_marketing_aux_ac_mode(cfg)
+    dm_aux_ac_storage_requested = dm_aux_ac_mode != "off"
+    dm_aux_ac_forecast_confidence_pct = safe_float(
+        cfg.get("direct_marketing_aux_inverter_ac_forecast_confidence_pct"),
+        80.0,
+    )
+    dm_aux_ac_deadband_wh = safe_float(
+        cfg.get("direct_marketing_aux_inverter_ac_deadband_wh"),
+        0.0,
+    )
+    dm_aux_ac_min_margin_ct = safe_float(
+        cfg.get("direct_marketing_aux_inverter_ac_min_margin_ct_per_kwh"),
+        dm_min_profit,
+    )
+    dm_aux_ac_protected_target_raw = (
+        safe_float(
+            cfg.get("direct_marketing_aux_inverter_ac_protected_target_soc_pct"),
+            float("nan"),
+        )
+        if _has_user_value(cfg, "direct_marketing_aux_inverter_ac_protected_target_soc_pct")
+        else None
+    )
+    dm_aux_ac_grid_import_guard_w = safe_float(
+        cfg.get("direct_marketing_aux_inverter_ac_grid_import_guard_w"),
+        0.0,
+    )
+    dm_pv_store_dc_charge_efficiency_pct = safe_float(
+        cfg.get("direct_marketing_pv_store_dc_charge_efficiency_pct"),
+        96.0,
+    )
+    dm_pv_store_aux_ac_charge_efficiency_pct = safe_float(
+        cfg.get("direct_marketing_pv_store_aux_ac_charge_efficiency_pct"),
+        90.0,
+    )
+    dm_pv_store_discharge_efficiency_pct = safe_float(
+        cfg.get("direct_marketing_pv_store_discharge_efficiency_pct"),
+        95.0,
+    )
+    dm_pv_topology_contract = build_pv_forecast_topology(cfg)
+    dm_aux_ac_topology_ready = bool(
+        dm_pv_topology_contract.get("status") == "bound"
+        and dm_pv_topology_contract.get("e3dc_dc_bound")
+        and dm_pv_topology_contract.get("external_ac_bound")
+    )
+    dm_aux_ac_storage_enable = bool(
+        dm_aux_ac_storage_requested
+        and not dm_pv_store_legacy_dc_only_veto
+        and dm_aux_ac_topology_ready
+    )
+    dm_pv_store_dc_only = not dm_aux_ac_storage_enable
     dm_pv_store_external_ac_guard_w = safe_float(cfg.get("direct_marketing_pv_store_external_ac_guard_w"), 100.0)
     dm_pv_store_export_limit_guard_w = safe_float(cfg.get("direct_marketing_pv_store_export_limit_guard_w"), 100.0)
     dm_pv_store_export_limit_ramp_bypass_w = safe_float(cfg.get("direct_marketing_pv_store_export_limit_ramp_bypass_w"), 300.0)
@@ -1764,18 +2250,90 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     )
     price["direct_marketing_pv_store_dc_only_enable"] = _entry(
         key="direct_marketing_pv_store_dc_only_enable",
-        label="DV-PV-Speichern nur E3DC-DC",
+        label="DV-PV-Speichern E3DC-DC-Standard",
         unit="-",
         configured=cfg.get("direct_marketing_pv_store_dc_only_enable") if _has_user_value(cfg, "direct_marketing_pv_store_dc_only_enable") else None,
         live_value=None,
         live_key=None,
         effective=dm_pv_store_dc_only,
-        source="user" if _has_user_value(cfg, "direct_marketing_pv_store_dc_only_enable") else "default",
+        source="derived",
         severity="ok",
         message=(
-            "Externe AC-Zusatzwechselrichter werden beim DV-PV-Speichern nicht als Batterie-Ladequelle genutzt."
+            "E3DC-DC ist die einzige freigegebene PV-Speicherquelle."
             if dm_pv_store_dc_only else
-            "Externe AC-PV darf den allgemeinen PV-Überschuss für DV-PV-Speichern mitbestimmen."
+            "Zusatz-WR-AC darf nur in planseitig nachgewiesenen DC-Prognoselücken ergänzen."
+        ),
+    )
+    aux_ac_validation_warning = bool(
+        dm_aux_ac_mode_source.endswith("_invalid")
+        or (
+            dm_aux_ac_storage_requested
+            and (dm_pv_store_legacy_dc_only_veto or not dm_aux_ac_topology_ready)
+        )
+    )
+    configured_aux_ac_mode = (
+        cfg.get("direct_marketing_aux_inverter_ac_storage_mode")
+        if _has_user_value(cfg, "direct_marketing_aux_inverter_ac_storage_mode")
+        else (
+            cfg.get("direct_marketing_pv_store_aux_ac_mode")
+            if _has_user_value(cfg, "direct_marketing_pv_store_aux_ac_mode")
+            else None
+        )
+    )
+    price["direct_marketing_aux_inverter_ac_storage_mode"] = _entry(
+        key="direct_marketing_aux_inverter_ac_storage_mode",
+        label="DV-Zusatz-WR-AC-Speichermodus",
+        unit="-",
+        configured=configured_aux_ac_mode,
+        live_value=None,
+        live_key=None,
+        effective=dm_aux_ac_mode,
+        source=dm_aux_ac_mode_source,
+        severity="warning" if aux_ac_validation_warning else "ok",
+        message=(
+            "Unbekannter AC-Speichermodus; sicherer Standard ist Aus."
+            if dm_aux_ac_mode_source.endswith("_invalid")
+            else (
+                "Die AC-Freigabe wird vom gesetzten Legacy-DC-Veto überstimmt."
+                if dm_aux_ac_storage_requested and dm_pv_store_legacy_dc_only_veto
+                else (
+                    "Der Modus bleibt fail-closed, bis E3DC-DC und EXTERNAL_AC vollständig gebunden sind."
+                    if dm_aux_ac_storage_requested and not dm_aux_ac_topology_ready
+                    else (
+                        "Reserve sichern: E3DC-DC zuerst; Zusatz-WR-AC nur bei frischer, vollständiger Prognose, belegtem DC-Defizit und ohne Netzbezug."
+                        if dm_aux_ac_mode == "reserve_only"
+                        else (
+                            "Wirtschaftlich: wie Reserve sichern, zusätzlich nur bei positiver Routenmarge nach Wirkungsgrad und Kosten."
+                            if dm_aux_ac_mode == "economic"
+                            else "Aus: Zusatz-WR-AC ist keine Speicherquelle; E3DC-DC bleibt Standard."
+                        )
+                    )
+                )
+            )
+        ),
+    )
+    price["direct_marketing_aux_inverter_ac_storage_enable"] = _entry(
+        key="direct_marketing_aux_inverter_ac_storage_enable",
+        label="DV-Zusatz-WR-AC Altfreigabe",
+        unit="-",
+        configured=(
+            cfg.get("direct_marketing_aux_inverter_ac_storage_enable")
+            if _has_user_value(cfg, "direct_marketing_aux_inverter_ac_storage_enable")
+            else None
+        ),
+        live_value=None,
+        live_key=None,
+        effective=dm_aux_ac_storage_enable,
+        source=dm_aux_ac_mode_source,
+        severity="warning" if aux_ac_validation_warning else "ok",
+        message=(
+            "Explizites Legacy-Ein wird konservativ als Reserve sichern gelesen; die neue Moduswahl hat Vorrang."
+            if dm_aux_ac_mode_source == "legacy_bool_explicit_true"
+            else (
+                "Die Legacy-Freigabe wird vom gesetzten DC-Veto überstimmt."
+                if dm_aux_ac_storage_requested and dm_pv_store_legacy_dc_only_veto
+                else "Nur Kompatibilitätsanzeige; die kanonische Moduswahl erteilt oder entzieht die Freigabe."
+            )
         ),
     )
     market_value_source_ok = dm_market_value_solar_source in {"netztransparenz_hochrechnung_solar"}
@@ -1984,6 +2542,46 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         ),
     )
 
+    protected_target_valid = bool(
+        dm_aux_ac_protected_target_raw is None
+        or (
+            math.isfinite(dm_aux_ac_protected_target_raw)
+            and 0.0 <= dm_aux_ac_protected_target_raw <= 100.0
+        )
+    )
+    price["direct_marketing_aux_inverter_ac_protected_target_soc_pct"] = _entry(
+        key="direct_marketing_aux_inverter_ac_protected_target_soc_pct",
+        label="DV-AC geschütztes SoC-Ziel",
+        unit="%",
+        configured=(
+            cfg.get("direct_marketing_aux_inverter_ac_protected_target_soc_pct")
+            if _has_user_value(cfg, "direct_marketing_aux_inverter_ac_protected_target_soc_pct")
+            else None
+        ),
+        live_value=None,
+        live_key=None,
+        effective=(
+            round(dm_aux_ac_protected_target_raw, 2)
+            if dm_aux_ac_protected_target_raw is not None
+            and math.isfinite(dm_aux_ac_protected_target_raw)
+            else None
+        ),
+        source=(
+            "user"
+            if dm_aux_ac_protected_target_raw is not None
+            else "reserve_contract_auto"
+        ),
+        severity="ok" if protected_target_valid else "warning",
+        message=(
+            "Leer bedeutet automatisch: wirksame Notstrom-/Haus-/Nachtreserve."
+            if dm_aux_ac_protected_target_raw is None
+            else (
+                "Geschütztes SoC-Ziel ist plausibel."
+                if protected_target_valid
+                else "Geschütztes SoC-Ziel muss zwischen 0 und 100 Prozent liegen."
+            )
+        ),
+    )
     dm_numeric_checks = (
         ("direct_marketing_fee_ct_per_kwh", "DV-Gebühr fix", dm_fee_ct, "ct/kWh", 0.0, None),
         ("direct_marketing_fee_pct", "DV-Gebühr variabel", dm_fee_pct, "%", 0.0, 100.0),
@@ -2018,6 +2616,13 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         ("direct_marketing_pv_store_import_guard_w", "DV-PV-Importwächter", dm_pv_store_import_guard_w, "W", 0.0, None),
         ("direct_marketing_pv_store_min_hold_s", "DV-PV-Mindesthaltezeit", dm_pv_store_min_hold_s, "s", 0.0, 3600.0),
         ("direct_marketing_pv_store_ramp_step_w", "DV-PV-Laderampe", dm_pv_store_ramp_step_w, "W/Zyklus", 100.0, 5000.0),
+        ("direct_marketing_aux_inverter_ac_forecast_confidence_pct", "DV-AC-Prognosevertrauen", dm_aux_ac_forecast_confidence_pct, "%", 10.0, 100.0),
+        ("direct_marketing_aux_inverter_ac_deadband_wh", "DV-AC-Energietotband", dm_aux_ac_deadband_wh, "Wh", 0.0, None),
+        ("direct_marketing_aux_inverter_ac_min_margin_ct_per_kwh", "DV-AC-Mindestmarge", dm_aux_ac_min_margin_ct, "ct/kWh", 0.0, None),
+        ("direct_marketing_aux_inverter_ac_grid_import_guard_w", "DV-AC-Netzbezugsgrenze", dm_aux_ac_grid_import_guard_w, "W", 0.0, 300.0),
+        ("direct_marketing_pv_store_dc_charge_efficiency_pct", "DV-DC-Ladewirkungsgrad", dm_pv_store_dc_charge_efficiency_pct, "%", 50.0, 100.0),
+        ("direct_marketing_pv_store_aux_ac_charge_efficiency_pct", "DV-AC-Ladewirkungsgrad", dm_pv_store_aux_ac_charge_efficiency_pct, "%", 50.0, 100.0),
+        ("direct_marketing_pv_store_discharge_efficiency_pct", "DV-Entladewirkungsgrad", dm_pv_store_discharge_efficiency_pct, "%", 50.0, 100.0),
         ("direct_marketing_pv_store_external_ac_guard_w", "DV-PV-AC-Zusatz-Wächter", dm_pv_store_external_ac_guard_w, "W", 0.0, None),
         ("direct_marketing_pv_store_export_limit_guard_w", "DV-PV-Exportlimit-Toleranz", dm_pv_store_export_limit_guard_w, "W", 0.0, None),
         ("direct_marketing_pv_store_export_limit_ramp_bypass_w", "DV-PV-Exportlimit-Rampenbypass", dm_pv_store_export_limit_ramp_bypass_w, "W", 0.0, 5000.0),
@@ -2068,6 +2673,19 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
             elif key == "direct_marketing_pv_store_ramp_step_w" and dm_pv_store_enabled and value > 3000.0:
                 severity = "warning"
                 message = "Sehr große Laderampen können die DV-PV-Ladeleistung trotz Preisfenster sprunghaft machen."
+            elif key == "direct_marketing_aux_inverter_ac_deadband_wh" and value == 0.0:
+                message = "0 bedeutet Automatik: mindestens 500 Wh, 2 Prozent Kapazität und eine Mindestleistungs-Slotenergie."
+            elif key == "direct_marketing_aux_inverter_ac_min_margin_ct_per_kwh" and value == 0.0:
+                message = "0 bedeutet: nur strikt positive Routenmarge; eine höhere Nutzergrenze bleibt zusätzlich bindend."
+            elif key == "direct_marketing_aux_inverter_ac_grid_import_guard_w" and value > 0.0:
+                severity = "warning"
+                message = "Eine positive Grenze toleriert messbaren Netzbezug; 0 W hält Zusatz-WR-AC strikt PV-only."
+            elif (
+                key == "direct_marketing_pv_store_aux_ac_charge_efficiency_pct"
+                and value >= dm_pv_store_dc_charge_efficiency_pct
+            ):
+                severity = "warning"
+                message = "Der AC-Ladewirkungsgrad sollte technisch unter dem direkten DC-Ladewirkungsgrad liegen."
             elif key == "direct_marketing_pv_store_export_limit_guard_w" and dm_pv_store_enabled and value > 500.0:
                 severity = "warning"
                 message = "Hohe Exportlimit-Toleranz kann bei Negativpreisfenstern unnötigen Restexport zulassen."
@@ -2115,9 +2733,9 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         source="user" if dm_arbitrage_requested else "default",
         severity="warning" if dm_arbitrage_requested else "ok",
         message=(
-            "Arbitrage ist in 5.4.0 nicht freigegeben; vorhandene Altwerte bleiben erhalten, aber wirkungslos."
+            "Arbitrage ist derzeit nicht freigegeben; vorhandene Altwerte bleiben erhalten, aber wirkungslos."
             if dm_arbitrage_requested
-            else "Arbitrage ist in 5.4.0 nicht freigegeben."
+            else "Arbitrage ist derzeit nicht freigegeben."
         ),
     )
     price["direct_marketing_export_enable"] = _entry(

@@ -2794,10 +2794,12 @@ function e3dcDockerReleaseCommandText($tag) {
     return implode("\n", [
         'TAG=' . $tag,
         'cd "${E3DC_DOCKER_PATH:?E3DC_DOCKER_PATH auf den Compose-Pfad setzen}"',
+        'EXPECTED_IMAGE="ghcr.io/a9xxx/install-e3dc-control:$TAG"',
         'BACKUP="e3dc-data-$(date +%Y%m%d-%H%M%S).tgz"',
         'sudo docker compose exec -T e3dc-control tar czf - -C /var/www/html/data . > "$BACKUP"',
         'test -s "$BACKUP"',
-        'sudo env E3DC_IMAGE_TAG="$TAG" docker compose config --images',
+        'RESOLVED_IMAGE="$(sudo env E3DC_IMAGE_TAG="$TAG" docker compose config --images e3dc-control)"',
+        '[ "$RESOLVED_IMAGE" = "$EXPECTED_IMAGE" ]',
         'sudo env E3DC_IMAGE_TAG="$TAG" docker compose pull e3dc-control',
         'sudo env E3DC_IMAGE_TAG="$TAG" docker compose up -d --force-recreate e3dc-control',
         'sudo docker compose ps',

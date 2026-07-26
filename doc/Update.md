@@ -243,8 +243,12 @@ PY
 ```
 
 Nach einer `OK`-Meldung kann der normale Web- oder Konsolen-Updater erneut
-gestartet werden. Bei `ABBRUCH` nichts löschen und insbesondere
-`.ml_model.lock`, Modell und Manifest nicht manuell entfernen.
+gestartet werden, sobald der angebotene Zielstand mindestens **5.4.2** ist.
+Dieser Stand enthält zusätzlich die Kompatibilitätsbrücke für den bereits vor
+dem Git-Wechsel geladenen Backup-Validator aus 5.4.0a. Bei einem älteren
+angebotenen Zielstand denselben Webupdate-Versuch nicht wiederholen. Bei
+`ABBRUCH` nichts löschen und insbesondere `.ml_model.lock`, Modell und
+Manifest nicht manuell entfernen.
 
 In einer Docker-Installation führen weder Weboberfläche noch Konsole einen
 Release-Wechsel im laufenden Container aus. Sie zeigen stattdessen die drei
@@ -325,7 +329,7 @@ Writer-/Aktor-Dienste gestoppt.
 
 ## Gezielter Rückfall
 
-`v5.4.1d` bietet den bereinigten Root `v5.3.2b` ausschließlich als
+`v5.4.2` bietet den bereinigten Root `v5.3.2b` ausschließlich als
 Docker-Rückfall-Image an. Dieser Root gibt selbst keinen älteren öffentlichen
 Tag frei. Auf Bare Metal wird `v5.3.2b` nicht als Programm-Rückfall angeboten,
 weil der Altstand keinen zielgebundenen Release-Finalizer enthält. Freie

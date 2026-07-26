@@ -156,6 +156,7 @@ def uninstall_service():
         "e3dc-mqtt-hub",
         "e3dc-bluelink",
         "e3dc-weather-manager",
+        "e3dc-forecast-evidence",
         "e3dc-storage-simulator",
         "e3dc-epex-manager",
         "e3dc-wallbox-manager",
@@ -287,7 +288,12 @@ def uninstall_full():
         print("  ✓ Webverzeichnis geleert (Daten/Backups wurden behalten!)")
     else:
         run_command("sudo rm -rf /var/www/html/*", timeout=20)
+        run_command(
+            "sudo rm -rf /var/lib/e3dc-control/forecast-evidence",
+            timeout=20,
+        )
         print("  ✓ Webverzeichnis vollständig geleert")
+        print("  ✓ Private Rohdaten der PV-Prognosediagnose gelöscht")
 
     uninstall_diagramm()
     uninstall_venv()

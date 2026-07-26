@@ -156,7 +156,7 @@ Aktiver Owner:
 
 ### Netzstrom-Arbitrage
 
-Netzstrom-Arbitrage ist in 5.4.0 nicht freigegeben. Die Preisrechnung darf
+Netzstrom-Arbitrage ist derzeit nicht freigegeben. Die Preisrechnung darf
 weiterhin mögliche Kauf-/Verkaufsfenster diagnostisch bewerten, erzeugt daraus
 aber weder einen ausführbaren Owner noch einen Speicherbefehl. Ein möglicher
 Netzladeslot erscheint ausschließlich als Diagnosekandidat
@@ -165,7 +165,7 @@ niemals allein zu `selected`, `requested`, `issued` oder Hardwarewirkung führen
 
 Die früheren Konfigurationsfelder `direct_marketing_arbitrage_enable` und
 `direct_marketing_arbitrage_experimental_enable` bleiben beim Einlesen und
-Speichern erhalten, sind in 5.4.0 jedoch wirkungslos. Für die freigegebene
+Speichern erhalten, sind derzeit jedoch wirkungslos. Für die freigegebene
 Direktvermarktung stehen Safe, Eco und Eco+ zur Verfügung.
 
 ## Kein Verkauf bei Billigpreis
@@ -510,8 +510,8 @@ Architekturregel für E3DC-Control:
 | `direct_marketing_roundtrip_efficiency_pct` | % | Speicherwirkungsgrad für Laden plus Entladen. |
 | `direct_marketing_safety_margin_ct_per_kwh` | ct/kWh | Sicherheitsaufschlag gegen Preis-, Prognose- und Messfehler. |
 | `direct_marketing_export_enable` | 0/1 | Erlaubt aktive Batterieeinspeisung im Direktvermarktungszweig. |
-| `direct_marketing_grid_charge_enable` | 0/1 | Für 5.4.0 ohne Hardwarewirkung; Netzstrom-Arbitrage ist nicht freigegeben. |
-| `direct_marketing_arbitrage_enable` / `direct_marketing_arbitrage_experimental_enable` | 0/1 | Kompatible Altwerte; werden erhalten, bleiben in 5.4.0 aber wirkungslos. |
+| `direct_marketing_grid_charge_enable` | 0/1 | Derzeit ohne Hardwarewirkung; Netzstrom-Arbitrage ist nicht freigegeben. |
+| `direct_marketing_arbitrage_enable` / `direct_marketing_arbitrage_experimental_enable` | 0/1 | Kompatible Altwerte; werden erhalten, bleiben derzeit aber wirkungslos. |
 | `direct_marketing_pv_store_enable` | 0/1 | Erlaubt Eco+, PV-Überschuss in niedrigen Nettoerlösfenstern aktiv zu speichern. Standard `1`, aber ohne Hauptschalter wirkungslos. |
 | `direct_marketing_pv_store_threshold_ct` | ct/kWh | Optionale Nettoerlös-Schwelle für PV-Speichern. Leer = EEG-/Tarifwert, wenn berechenbar, sonst EcoScore. |
 | `direct_marketing_pv_store_max_w` | W | Maximale PV-Speicherladeleistung. `0` bedeutet System-Ladelimit und realen PV-Überschuss nutzen. |
@@ -708,7 +708,7 @@ grid_margin_pct = grid_spread_ct
                 * 100
 ```
 
-Die Kennzahlen bleiben Diagnosewerte. Sie können in 5.4.0 keine
+Die Kennzahlen bleiben Diagnosewerte. Sie können derzeit keine
 Netzlade- oder Arbitrage-Exportfreigabe erzeugen.
 
 ### Reserve, Zyklen und Fensterpriorität

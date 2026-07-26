@@ -1,12 +1,12 @@
 # E3DC-Control Web-Portal & Installer
 
-Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.4.1d</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
+Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.4.2</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
 
 ![E3DC-Control Dashboard](html/app-icon-512.png)
 
 ## Aktuelle Version und Update
 
-Die aktuelle stabile Version ist **5.4.1d**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur geprüften Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
+Die aktuelle stabile Version ist **5.4.2**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur geprüften Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
 
 > [!WARNING]
 > **⚠️ Achtung: Nutzung auf eigenes Risiko!**
@@ -20,7 +20,7 @@ Die aktuelle stabile Version ist **5.4.1d**. Hinweise zum Web-, Konsolen- und Do
 
 > **Bedienansichten:** Config-Editor und Wallbox-Seite unterscheiden zwischen einfacher Ansicht für Einrichtung und täglichen Betrieb sowie erweiterter Ansicht für alle Detailparameter. Die Logik und Abgrenzung sind in [doc/Frontend_Ansichten.md](doc/Frontend_Ansichten.md) dokumentiert.
 
-> **Neu in 5.4.1d Stable:** Der read-only Klimamonitor läuft nun auch im Docker-Container und übernimmt seine Aktivierung dynamisch. Der Updater normalisiert ausschließlich einen sicher gebundenen, unbelegten ML-Alt-Lock vor dem Backup. Batterie-Vitals akzeptiert den bestätigten Packindex zusätzlich als RSCP-`Int32`, ohne die Indexbindung zu lockern. Speicher-, Wallbox-, Wärme- und Direktvermarktungsregelung bleiben unverändert.
+> **Neu in 5.4.2 Stable:** Die Direktvermarktung plant den ganzen Tag in eindeutigen 15-Minuten-Abschnitten und kehrt nach dem letzten PV-Speicherfenster in die normale Hausversorgung zurück. Ein zusätzlicher wirkungsloser DV-Planer-Shadow prüft alle Abschnitte gegen Planbindung, Datenfrische, Topologie, Netzpunkt und Reserve, ohne die laufende Regelung oder deren Identitäten zu verändern. Kurvenladung und DV-PV-Speichern können optional sanft auf die frische E3/DC-PV-Leistung begrenzt werden, während Entladen in AUTO offen bleibt; eine zusätzliche AC-Speicherroute ist getrennt und standardmäßig ausgeschaltet. Eine neue, ebenfalls ausgeschaltete Lastspitzenbegrenzung schützt feste Zähler-Viertelstunden mit Hysterese und Reservevertrag. Die PV-Prognosediagnose vergleicht abgeschlossene E3/DC-DC-Historienslots rein diagnostisch, speichert Rohdaten privat und verwendet eine versionierte Topologie aus PV-Flächen, Wechselrichtergruppen und Provider-Bindungen. Frische Installationen, der sichere Altprozess-Übergang aus 5.4.0a, Fehlerweitergabe und die verständliche Tarif-, HOLD- und Zwei-Wallbox-Darstellung wurden zugleich korrigiert.
 
 > **Neu in 5.4.1c Stable:** Der OCI-Verifier prüft die bereits exakt gebundene Releaseversion mit einer strengen Versionssyntax statt einer bei jedem Release manuell zu erweiternden Liste. Der vollständige Historien- und Rootvertrag aus 5.4.1b bleibt unverändert aktiv.
 
@@ -53,10 +53,14 @@ Die aktuelle stabile Version ist **5.4.1d**. Hinweise zum Web-, Konsolen- und Do
 * **Multi-EV Support (Flotten-Management):** Das System unterstützt mehrere Fahrzeuge per Bluelink, MQTT, openWB-SoC oder manueller Vorlage. Auf der Wallbox-Seite werden Fahrzeuge direkt pro Wallbox zugeordnet, damit Akku, Ziel-SoC und Ladeleistung auch bei Wallboxen ohne Fahrzeugerkennung eindeutig passen.
 * **Dynamische Ladezeit-Berechnung:** Das Dashboard (und das Backend) berechnet durchgängig anhand der aktuellen Ladeleistung vollautomatisch die geschätzte Restdauer bis zum Erreichen von 100% sowie zum Ziel-SoC.
 * **Universal-Wallbox Integration:** Nativer, entkoppelter Python Wallbox Manager mit Dual-WB Support für E3DC, openWB/openWB Pro und go-e. openWB Pro wird direkt über `connect.php` als Aktuator geführt, normale openWB-Software bleibt sauber in Primary-/Secondary-Rollen getrennt. Die sichtbaren Modi sind `Aus`, `PV-Kurve ruhig`, `Grundladung stabil`, `PV + Akku bis Untergrenze`, `Sofort bis Preislimit` und `Akku bis Abfahrt`; geplantes Netzladen greift in allen aktiven Modi und bleibt bei `Aus` gesperrt, spontane Marktfreigaben für Wallbox-Netzladen benötigen dagegen `Sofort bis Preislimit`. Im Beobachten-Modus kann der Storage Manager optional nur den Hausspeicher bis zur Untergrenze führen, ohne Wallbox-Befehle zu senden.
-* **V2H/V2G-Vorbereitung (read-only):** Bidirektionale Wallboxleistung und gemeldete Fähigkeitsdaten werden erkannt und angezeigt. Eine aktive V2H-/V2G-Steuerung oder SoC-Abschaltung ist in 5.4.0 noch nicht freigegeben. Details: [V2H/V2G-Status](doc/V2x_Dokumentation.md).
+* **V2H/V2G-Vorbereitung (read-only):** Bidirektionale Wallboxleistung und gemeldete Fähigkeitsdaten werden erkannt und angezeigt. Eine aktive V2H-/V2G-Steuerung oder SoC-Abschaltung ist derzeit nicht freigegeben. Details: [V2H/V2G-Status](doc/V2x_Dokumentation.md).
 * **Intelligenter SoC- und Reichweiten-Sync:** Verzichtest du auf eine direkte Fahrzeuganbindung, kann der **SoC des Fahrzeugs am Dashboard manuell übermittelt werden**. Das System rechnet (interpoliert) ab dann vollautomatisch im Hintergrund die eingeladene Energie ein. Bei openWB-SoC berechnet E3DC-Control die Restreichweite aus Akku-Kapazität und hinterlegtem Verbrauch, damit openWB und Dashboard vergleichbare km-Werte zeigen.
 * **Universal Wärmepumpen-Integration:** Native Anbindung für **Luxtronik** (WebSocket), **IDM-Wärmepumpen** (Modbus-TCP) und **Stiebel Eltron ISG/WPM** (read-only Live-Daten). IDM kann mit PV-Überschuss und konfigurierbarer Leistungsobergrenze ruhig als Grundlast laufen; Stiebel liefert Livewerte und nutzt optional einen externen Shelly-Leistungsmesser für die elektrische Live-Leistung in Dashboard/R5. SG-Ready per WLAN-Shelly bleibt als robuste Freigabe für andere Marken verfügbar. Details: [Stiebel-Eltron-ISG-Dokumentation](doc/Stiebel_Eltron_ISG.md).
 * **Storage Simulator & adaptive Ladekurve:** Die Anlage plant vollautomatisch voraus. Wetterprognosen, saisonaler Nachtverbrauch, EPEX/Eco-Score und optionales Mittagsziel erzeugen eine geglättete Soll-SoC-Kurve. Der Storage Manager führt die Kurve weich über `iFc`, Kontroll-SoC und gedämpften Aufholbedarf; [Pre-Dump](doc/Pre_Dump.md) schafft vor Kurvenstart Platz gegen Abregelung. Die Abregelreserve hält an passenden Hochleistungs-/Cloud-Edge-Tagen Speicherplatz für PV-Spitzen frei, ohne echten Netz-/WR-Abregeldruck zu blockieren. Der optionale [Unwetterwächter](doc/Unwetterwaechter.md) kann DWD-Warnungen als Kurvenanker oder Nachtreserve berücksichtigen; Speicher-Netzladen und Speicher-Halten im normalen Marktpfad bleiben getrennte, standardmäßig ausgeschaltete Opt-ins und werden beim Ausführen erneut gegen die aktuelle Freigabe geprüft. Zusätzlich blockiert `PV-autark zuerst` den normalen Marktpfad, wenn Speicher plus erwartete PV den restlichen Horizont decken; fällt der SOC unter die Low-SOC-Schwelle, darf ein bewusst freigegebener Speicherpfad wieder wirtschaftlich prüfen. Live-PV und Netzexport haben beim normalen Markt-Netzladen Ausführungsvorrang: dann wartet der Marktpfad in AUTO, statt GRID vorzuziehen.
+* **E3/DC-PV-Ladebegrenzung:** Kurvenladung und DV-PV-Speichern können optional auf die frisch ermittelte E3/DC-PV-Leistung begrenzt werden. E3/DC bleibt dabei in AUTO, die Hausversorgung darf jederzeit entladen und zusätzliche AC-PV erhöht den flüchtigen Laderahmen nicht. Bei fehlendem gültigem PV-Split werden diese PV-basierten Ladepfade sicher auf 0 W begrenzt; Preis- und ausdrücklich freigegebenes Netzladen bleiben eigenständig.
+* **Optionale AC-Speicherroute:** Energie eines zusätzlichen AC-Wechselrichters kann getrennt für Reserve oder wirtschaftliches Speichern freigegeben werden. Standard ist `Aus`; E3/DC-DC bleibt vorrangig, Netzladen wird nicht freigegeben und fehlende Topologie- oder Unterdeckungsnachweise sperren den Pfad.
+* **Peak Shaving am Netzbezug:** Die optionale Lastspitzenbegrenzung schützt feste Zähler-Viertelstunden mit Sicherheitsabstand, Leistungs- und SoC-Hysterese, Messlückenkontrolle und einem Speicherpuffer oberhalb der Notstromreserve. Eine Netz-Nachladung dieses Puffers benötigt eine eigene ausdrückliche Freigabe.
+* **PV-Prognosediagnose:** Ein standardmäßig ausgeschalteter, rein lesender Diagnosedienst kann E3/DC-DC-Prognosen mit abgeschlossenen nativen 15-Minuten-Historienslots vergleichen. Die Werte bleiben Diagnose, wirken weder auf Modelle noch Regelung zurück und liegen privat außerhalb des Webverzeichnisses. PV-Flächen, Wechselrichtergruppen und Provider-Bindungen werden als versionierter Topologievertrag verwaltet. Details: [PV-Prognose](doc/PV_Prognose_Berechnung.md).
 * **Geplante Lastfenster:** Große, nicht direkt steuerbare Verbraucher können als enges Zeitfenster mit statischer Leistung hinterlegt werden. Der Simulator berücksichtigt die Last in der Prognose, der Manager schützt den Speicher aber erst, wenn die Last im Fenster plausibel sichtbar ist. Details: [Geplante Lastfenster](doc/Geplante_Lastfenster.md).
 
 ### 🚀 Maximale Performance & SD-Karten-Schutz
@@ -276,7 +280,11 @@ Neue Installationen werden über den Web-Wizard bzw. den Config-Editor in `data/
 docker compose up -d
 ```
 
-Das Docker-Image enthält den Anwendungscode. Das geklonte Repository liefert die `docker-compose.yml`; Konfiguration und Historie liegen dauerhaft im Docker-Volume bzw. Datenverzeichnis.
+Das Docker-Image enthält den Anwendungscode. Das geklonte Repository liefert
+die `docker-compose.yml`; Konfiguration und Historie liegen dauerhaft im
+Docker-Volume bzw. Datenverzeichnis. Private Lernmodelle und die nur bei
+ausdrücklicher Freigabe erzeugte PV-Prognosediagnose besitzen jeweils ein
+eigenes, nicht als Webverzeichnis eingebundenes Volume.
 
 ### Updates einspielen
 ```bash
@@ -293,7 +301,7 @@ Das Docker-Image enthält den Anwendungscode. Das geklonte Repository liefert di
 > `ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}`. Ohne Eintrag
 > folgt sie dem geprüften Stable-Tag `latest`. Ein fester Versions-Tag wechselt
 > bei `pull` absichtlich nicht; für einen bewussten Pin wird
-> `E3DC_IMAGE_TAG=v5.4.1d` in `.env` gesetzt. `config --images` zeigt vor dem
+> `E3DC_IMAGE_TAG=v5.4.2` in `.env` gesetzt. `config --images` zeigt vor dem
 > Pull das tatsächlich gewählte Image.
 >
 > Ein fehlgeschlagener `pull` ist ein harter Abbruch. Danach darf weder ein
@@ -320,7 +328,8 @@ deaktiviert.
 
 > **Wichtig bei zusätzlichen Code-Volumes:** Ein lokales Verzeichnis unter
 > `/app/pi/Install` überschreibt den Release-Code aus dem Docker-Image. Für den
-> regulären Betrieb werden deshalb nur `data`, `logs` und die Ramdisk dauerhaft
+> regulären Betrieb werden deshalb nur `data`, `logs`, die Ramdisk sowie die
+> getrennten privaten Volumes für ML-Modell und optionale Prognosediagnose
 > eingebunden.
 
 ---

@@ -115,7 +115,7 @@ $paths = getInstallPaths();
     <div class="container">
         <div class="d-flex justify-content-between align-items-center mb-4">
             <a href="index.php" class="nav-link-back"><i class="fas fa-arrow-left me-2"></i>Dashboard</a>
-            <span class="badge bg-success text-light">v5.4.1d Stable</span>
+            <span class="badge bg-success text-light">v5.4.2 Stable</span>
         </div>
         <h1 class="display-4 fw-bold">Hilfe & Support</h1>
         <p class="lead opacity-75">Häufige Fragen und Lösungen rund um E3DC-Control.</p>
@@ -134,7 +134,7 @@ $paths = getInstallPaths();
         <div class="col-12 faq-item" data-tags="docker image stable rollback update">
             <div class="card bg-card border-0 shadow-sm"><div class="card-body">
                 <h5 class="card-title"><span class="tag">Docker</span> Wie prüfe ich Image und Update?</h5>
-                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem geprüften Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.1d</code> in <code>.env</code> gesetzt.</p>
+                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem geprüften Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.2</code> in <code>.env</code> gesetzt.</p>
                 <pre>(
   set -euo pipefail
   docker compose config --images
@@ -207,6 +207,27 @@ $paths = getInstallPaths();
                         <li>Nach der Freigabe im Account den RESTful API Security Token erzeugen.</li>
                         <li>Im Config-Editor unter <em>Tarif</em> den ENTSO-E-Token als Fallback-Token eintragen und mit <em>ENTSO-E testen</em> prüfen.</li>
                     </ol>
+                </div>
+            </div>
+        </div>
+
+        <h4 class="mb-4 text-accent"><i class="fas fa-battery-three-quarters me-2"></i>Stable 5.4.2: Speicherplanung und Diagnose</h4>
+        <div class="col-12 faq-item" data-tags="5.4.2 stable direktvermarktung hold auto e3dc pv ladebegrenzung peak shaving prognose diagnose installation wallbox">
+            <div class="card bg-card border-0 shadow-sm">
+                <div class="card-body">
+                    <h5 class="card-title">
+                        <span class="tag">5.4.2</span>
+                        Was bringt das Stable-Release 5.4.2?
+                    </h5>
+                    <ul>
+                        <li><strong>Direktvermarktung:</strong> Der Tag ist lückenlos in 15-Minuten-Abschnitte geplant. Ein gebundener Abschnitt <em>Speicherplatz halten</em> sperrt Laden und lässt Hausversorgung aus dem Speicher zu. Nach dem letzten PV-Speicherfenster folgt wieder normaler E3/DC-AUTO-Betrieb, sofern kein stärkerer Speicherentscheider wirkt.</li>
+                        <li><strong>DV-Planer-Shadow:</strong> Ein zusätzlicher wirkungsloser Diagnosevertrag prüft die fünf eindeutigen Speicheraktionen gegen Planbindung, Datenfrische, Topologie, Netzpunkt und Reserve. Er verändert weder die laufende Regelung noch Plan-/Slot-Identitäten.</li>
+                        <li><strong>E3/DC-PV-Ladebegrenzung:</strong> Geplante Speicherladung kann sanft auf die frische E3/DC-PV-Leistung begrenzt werden. Entladen bleibt in AUTO offen; Leistung eines zusätzlichen AC-Wechselrichters erhöht den Rahmen nicht.</li>
+                        <li><strong>Peak Shaving:</strong> Die neue Lastspitzenbegrenzung schützt feste Zähler-Viertelstunden mit Sicherheitsabstand, Hysterese, Messlückenprüfung und einem Speicherpuffer oberhalb der Notstromreserve. Sie ist standardmäßig aus.</li>
+                        <li><strong>PV-Prognosediagnose:</strong> Ein optionaler read-only Dienst vergleicht Prognose und abgeschlossene E3/DC-DC-Historie. Rohdaten bleiben privat; es gibt keine Rückwirkung auf Prognosemodell oder Regelung.</li>
+                        <li><strong>Installation:</strong> Frische, unvollständige und widersprüchliche Installationen werden getrennt behandelt. Fehler werden bis zum Exitcode weitergegeben und nicht mehr als erfolgreicher Abschluss angezeigt. Ein aus 5.4.0a gestarteter Altprozess kann nach dem verifizierten Baumwechsel mit seinem gecachten Backup-Validator sicher fortfahren.</li>
+                        <li><strong>Oberfläche:</strong> Tarifoptionen, Speicherzustand und Zwei-Wallbox-Konfiguration sind klarer gruppiert und in verständlicher Sprache beschrieben.</li>
+                    </ul>
                 </div>
             </div>
         </div>
@@ -670,7 +691,9 @@ WB1 hat Ladevorgang physisch abgebrochen (Versuch 1/3)!</pre>
                 <div class="faq-answer">
                     <p>Die Datei <code>e3dc.wallbox.txt</code> ist für die V4-Steuerung über das Web-UI nicht mehr relevant. Sie bleibt nur als Legacy-/Migrationsdatei erhalten. Neue Ladeplanung und Wallbox-Modi liegen in <code>data/e3dc_v4.json</code> und in den Ramdisk-Planungsdateien.</p>
                     <p><strong>Wie funktioniert es stattdessen?</strong><br>
-                    Alle wichtigen Daten für die Ladefenster werden in der <code>e3dc.wallbox.out</code> im E3DC-Control-Ordner gespeichert. Diese Datei wird innerhalb von ca. 5 Sekunden befüllt, sobald Sie in der Weboberfläche Ladezeiten (z.B. via <code>wbhour</code> und <code>wbstart</code>) eingeben und speichern. Die Startzeit (<code>wbstart</code>) muss in der Zukunft liegen, damit das Ladefenster in der Zeitleiste der Grafik korrekt angezeigt wird.</p>
+                    Nach dem Speichern erzeugt der private Planer die Datei <code>native_wallbox_schedule_wb1.json</code> beziehungsweise <code>native_wallbox_schedule_wb2.json</code>. Die ausgewählten 15-Minuten-Abschnitte erscheinen auf der Seite <strong>Wallbox</strong> im Ladeplan und in der Zeitleiste. Bei <strong>Auto</strong> wählt der Planer innerhalb des vorgegebenen Zeitraums die günstigsten Abschnitte; die sichtbaren gelben Planblöcke sind die tatsächlich ausgewählten Ladezeiten.</p>
+                    <p><strong>Warum kann ein morgiges Fenster fehlen?</strong><br>
+                    Feste Tarife, Octopus Heat und Spezialtarife werden aus ihrem täglich wiederkehrenden Tarifprofil geplant und benötigen dafür keine morgigen EPEX-Slots. Dynamische Tarife wie Tibber oder aWATTar bleiben dagegen gesperrt, bis die zukünftigen Preise veröffentlicht wurden. Eine fehlgeschlagene Kandidatenplanung verändert weder Konfiguration noch bestehenden Ladeplan.</p>
                 </div>
             </div>
         </div>
@@ -902,7 +925,7 @@ journalctl -u e3dc-live -n 80 --no-pager</pre>
                         <li>Über das Dashboard (Kachel Konfiguration -> "Update suchen").</li>
                         <li>Bei aktuellen Ständen direkt über den Menüpunkt <em>Update</em> im Installer.</li>
                     </ol>
-                    <p><strong>Einmalige Ausnahme für 5.3.2b:</strong> Den ersten Wechsel auf 5.4.1d ausschließlich über den Web-Update-Button oder per SSH mit <code>sudo /usr/bin/python3 installer_main.py --update-e3dc</code> starten. Der interaktive Menüpunkt ist für diesen Hybridwechsel nicht freigegeben, weil der 5.3.2b-Altprozess bereits zusätzliche Module geladen hat.</p>
+                    <p><strong>Einmalige Ausnahme für 5.3.2b:</strong> Den ersten Wechsel auf das aktuelle Stable-Release ausschließlich über den Web-Update-Button oder per SSH mit <code>sudo /usr/bin/python3 installer_main.py --update-e3dc</code> starten. Der interaktive Menüpunkt ist für diesen Hybridwechsel nicht freigegeben, weil der 5.3.2b-Altprozess bereits zusätzliche Module geladen hat.</p>
                     <p>Verwenden Sie für den einmaligen Wechsel auf die bereinigte Historie keinen manuellen <code>git pull --ff-only</code>-Ablauf. Der Installer erstellt und prüft zuerst das externe Backup und validiert anschließend Zielstand, Dienste und Weboberfläche.</p>
                     Updates werden im Changelog oben rechts im Dashboard signalisiert.
                 </div>
@@ -1225,19 +1248,87 @@ journalctl -u e3dc-live -n 80 --no-pager</pre>
             </div>
         </div>
 
-        <!-- Peak Shaving -->
-        <div class="col-12 faq-item" data-tags="peak shaving abregelung einspeise limit netzeinspeise pv grenze kuppe ersparnis">
+        <!-- E3/DC-PV-Ladebegrenzung -->
+        <div class="col-12 faq-item" data-tags="e3dc pv ladebegrenzung dcdc dc first zusatzwechselrichter auto max charge power speicher">
             <div class="faq-card">
                 <div class="faq-question">
                     <div>
-                        <span class="tag">Peak Shaving</span>
-                        Was ist Peak-Shaving und was zeigt die grüne Fläche im Diagramm?
+                        <span class="tag">Speicher</span>
+                        Was bewirkt „Laden an E3DC-PV koppeln“?
                     </div>
                     <i class="fas fa-chevron-down"></i>
                 </div>
                 <div class="faq-answer">
-                    <p>Peak-Shaving begrenzt die Einspeisung ins Stromnetz auf den konfigurierten <strong>Netzeinspeise-Limit</strong> (Wechselrichter-Maximum minus Hausverbrauch). Im Verlaufs- und Hybrid-Diagramm zeigt die <strong>grüne Kuppe</strong> die so "gerettete" Energie: PV-Überschuss, der ohne Begrenzung verloren gegangen wäre, aber durch den Batteriespeicher puffert wurde.</p>
+                    <p>Die Option gibt dem E3/DC für Kurvenladung und DV-PV-Speichern einen sanften, flüchtigen Laderahmen: Die vom Storage-Simulator geplante Ladeleistung bleibt die Obergrenze, wird aber zusätzlich auf die aktuelle E3/DC-PV-Leistung begrenzt. Leistung eines zusätzlichen AC-Wechselrichters erhöht diesen Rahmen nicht.</p>
+                    <ul>
+                        <li>E3/DC bleibt in <strong>AUTO</strong>; Entladen für wechselnden Hausverbrauch bleibt jederzeit möglich.</li>
+                        <li>Sinkt die E3/DC-PV-Leistung, wird die Ladegrenze nachgeführt.</li>
+                        <li>Fehlt ein frischer, gültiger PV-Split, werden diese PV-basierten Ladepfade sicher auf 0 W begrenzt.</li>
+                        <li>Die Funktion setzt ausschließlich flüchtige EMS-Grenzen und verändert keine dauerhaften Geräteeinstellungen.</li>
+                    </ul>
+                    <p>Das ist ein DC-first-Rahmen, aber keine physikalische Garantie, dass im E3/DC zu jedem Zeitpunkt ausschließlich DC-Leistung in die Batterie fließt. Preis- und ausdrücklich freigegebenes Netzladen bleiben eigenständige Verträge.</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Peak Shaving am Netzbezug -->
+        <div class="col-12 faq-item" data-tags="peak shaving lastspitze netzbezug viertelstunde puffer reserve hysterese netz nachladen">
+            <div class="faq-card">
+                <div class="faq-question">
+                    <div>
+                        <span class="tag">Lastspitzen</span>
+                        Wie funktioniert Peak Shaving am Netzbezug?
+                    </div>
+                    <i class="fas fa-chevron-down"></i>
+                </div>
+                <div class="faq-answer">
+                    <p>Peak Shaving begrenzt den mittleren Netzbezug in einer festen Zähler-Viertelstunde. Beim Begrenzen und Halten bleibt E3/DC in AUTO; der Storage Manager setzt nur den flüchtigen Lade- oder Entladerahmen, der zum Schutz der eingestellten Grenze erforderlich ist. Die Funktion fordert keine Netzeinspeisung an.</p>
+                    <ul>
+                        <li>Der Speicherpuffer muss oberhalb der wirksamen Notstromreserve liegen.</li>
+                        <li>Sicherheitsabstand, Leistungs- und SoC-Hysterese sowie Freigabe-Entprellung verhindern Flattern.</li>
+                        <li>Bei einer zu großen Messlücke bleibt die Regelung passiv und beginnt erst mit einer neuen vollständigen Viertelstunde.</li>
+                        <li>Netz-Nachladung des Puffers ist ein eigener, standardmäßig ausgeschalteter Opt-in, verwendet vorübergehend den angeforderten Netzlademodus und bleibt an Viertelstunden- und Hausanschlussgrenze gebunden.</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+
+        <!-- PV-Prognosediagnose -->
+        <div class="col-12 faq-item" data-tags="pv prognose diagnose e3dc historie 15 minuten trefferabweichung richtungsversatz vergleichsabdeckung">
+            <div class="faq-card">
+                <div class="faq-question">
+                    <div>
+                        <span class="tag">Prognose</span>
+                        Was macht die optionale PV-Prognosediagnose?
+                    </div>
+                    <i class="fas fa-chevron-down"></i>
+                </div>
+                <div class="faq-answer">
+                    <p>Ein eigener niedrig priorisierter Dienst vergleicht gespeicherte E3/DC-DC-Prognosen mit abgeschlossenen nativen 15-Minuten-Historienslots. Er zeigt Trefferabweichung, Richtungsversatz, energiegewichtete Gesamtabweichung und Vergleichsabdeckung.</p>
+                    <ul>
+                        <li>Die Funktion ist standardmäßig <strong>aus</strong>. Dann erfolgen weder Historienabfrage noch Datenbankschreibzugriff.</li>
+                        <li>Rohdaten liegen privat außerhalb des Webverzeichnisses; das Dashboard erhält nur eine kleine sanitierte Zusammenfassung.</li>
+                        <li>Vor mindestens 96 ertragsrelevanten Slots aus sieben Vergleichstagen bleiben Werte als vorläufig gekennzeichnet.</li>
+                        <li>Die Diagnose ändert weder Prognosemodell noch Konfiguration oder Speicherregelung.</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+
+        <!-- PV-Einspeisebegrenzung -->
+        <div class="col-12 faq-item" data-tags="pv einspeisebegrenzung abregelung einspeise limit netzeinspeise grenze kuppe ersparnis">
+            <div class="faq-card">
+                <div class="faq-question">
+                    <div>
+                        <span class="tag">PV-Einspeisebegrenzung</span>
+                        Was zeigt die grüne Fläche im Diagramm?
+                    </div>
+                    <i class="fas fa-chevron-down"></i>
+                </div>
+                <div class="faq-answer">
+                    <p>Die PV-Einspeisebegrenzung hält die Einspeisung unter dem konfigurierten <strong>Netzeinspeiselimit</strong>. Im Verlaufs- und Hybrid-Diagramm zeigt die <strong>grüne Kuppe</strong> den PV-Überschuss, der ohne Speicherpufferung abgeregelt worden wäre.</p>
                     <p>Das Overlay ist ab v3.8.8.2 standardmäßig aktiv. Die rote gestrichelte Linie zeigt die dynamische Grenze (reagiert auf Hausverbrauch in Echtzeit).</p>
+                    <p>Diese Darstellung ist nicht das neue <strong>Peak Shaving am Netzbezug</strong>. Dort begrenzt der Speicher teure Viertelstunden-Bezugsspitzen aus dem Stromnetz.</p>
                 </div>
             </div>
         </div>

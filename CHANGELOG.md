@@ -6,6 +6,20 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.2b] – 2026-07-27
+
+### 📦 Updater-Kompatibilität
+
+- 🐛 **Direkter Alt-Updater-Übergang:** Ein bereits vor dem Zielwechsel gestarteter Updater kann den neuen Finalizer in dem eng gebundenen Kompatibilitätsfall noch aus dem Produktpfad erreichen. Installationswurzel, Ziel-Commit, Version, Tag und Finalizer-Dateien werden vor jeder privilegierten Fortsetzung erneut geprüft.
+- 🔐 **Versiegelte Weitergabe:** Der Finalizer wird anschließend einmalig aus einem privaten, root-eigenen und schreibgeschützten Snapshot ausgeführt. Nur ein eindeutiger SHA-/Tag-Erfolgsmarker gilt als Erfolg; der Snapshot wird danach entfernt.
+- 🧹 **Erfolg bleibt eindeutig:** Schlägt ausschließlich die abschließende Snapshot-Bereinigung nach einem bereits erfolgreichen Finalizerlauf fehl, bleibt der gebundene Erfolg erhalten und löst keinen falschen Rollback aus. Die Bereinigungsabweichung bleibt sichtbar protokolliert.
+- 🛡️ **Keine aufgeweichten Schutzgrenzen:** Symlink-, Hardlink-, Eigentümer-, Modus-, Byte-, Commit-, Versions- oder Bootstrap-Abweichungen bleiben harte Abbruchgründe.
+
+### 📦 Releaseumfang
+
+- 🧹 **Browser-Cache:** Der Service-Worker verwendet die 5.4.2b-Kennung.
+- 🛡️ **Keine Regelungsänderung:** Speicher-, Direktvermarktungs-, Wallbox-, Wärme-, Prognose- und Hardwareverträge entsprechen unverändert 5.4.2a.
+
 ## [5.4.2a] – 2026-07-27
 
 ### 🔋 Speicher-Ladefreigabe

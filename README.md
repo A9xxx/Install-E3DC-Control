@@ -1,12 +1,12 @@
 # E3DC-Control Web-Portal & Installer
 
-Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.4.2a</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
+Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.4.2b</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
 
 ![E3DC-Control Dashboard](html/app-icon-512.png)
 
 ## Aktuelle Version und Update
 
-Die aktuelle stabile Version ist **5.4.2a**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur geprüften Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
+Die aktuelle stabile Version ist **5.4.2b**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur geprüften Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
 
 > [!WARNING]
 > **⚠️ Achtung: Nutzung auf eigenes Risiko!**
@@ -19,6 +19,8 @@ Die aktuelle stabile Version ist **5.4.2a**. Hinweise zum Web-, Konsolen- und Do
 > **Config-Schutz:** Standardinstallationen speichern `data/e3dc_v4.json` und lokale Config-Backups mit `660` für Install-User und `www-data`, damit WebUI und Dienste weiter automatisch starten, die Datei aber nicht mehr weltlesbar ist. Der normale Config-Download ist redigiert; der Raw-Download enthält Zugangsdaten und wird nur angeboten, wenn eine Web-PIN gesetzt ist. Der Kompatibilitätsmodus (`664`) ist nur für eigene externe Leser gedacht.
 
 > **Bedienansichten:** Config-Editor und Wallbox-Seite unterscheiden zwischen einfacher Ansicht für Einrichtung und täglichen Betrieb sowie erweiterter Ansicht für alle Detailparameter. Die Logik und Abgrenzung sind in [doc/Frontend_Ansichten.md](doc/Frontend_Ansichten.md) dokumentiert.
+
+> **Neu in 5.4.2b Stable:** Bereits vor dem Zielwechsel gestartete Alt-Updater können den verifizierten Finalizer über eine eng gebundene Kompatibilitätsbrücke abschließen. Ziel-Commit, Version, Tag, Produktpfad und Finalizer-Dateien werden erneut byte- und metadatengenau geprüft; die privilegierte Fortsetzung läuft nur aus einem privaten, root-eigenen Prüfsnapshot. Eine reine Bereinigungsabweichung nach erfolgreichem Abschluss löst keinen falschen Rollback mehr aus. Die EMS-Regelung entspricht unverändert 5.4.2a.
 
 > **Neu in 5.4.2a Stable:** Ein `EMS_USER_CHARGE_LIMIT`-Readback aus frischen, validen `POWER_SETTINGS` gilt nur bei ausdrücklich konfigurierter `maximumladeleistung` und einer strikt unter 50 W liegenden Abweichung zu `EMS_MAX_CHARGE_POWER` als reflektierter flüchtiger Laderahmen; andernfalls bleibt die USER-Grenze wirksam. Bei Kurvenrückstand öffnet der Storage Manager den Laderahmen in `AUTO` nur bei positiver, frischer E3/DC-only-Evidenz bis `MAX_CHARGE_POWER`; unbekannte oder veraltete Zuordnung bleibt fail-closed, zusätzliche AC-PV weiterhin sanft und DC-first begrenzt. Der Hotfix erteilt keine Netzladefreigabe. Das lokale Heizstab-`PV-AUTO AUS` ist hart und gehalten, ein separat freigegebener Pro3EM-Wärmepumpenpfad bleibt davon unabhängig; das globale `AUTO AUS` stoppt beide. Außerdem blockiert ein aus 5.4.0a weiterlaufender alter Service-Helper den Releasewechsel nicht mehr an der standardmäßig ausgeschalteten Prognosediagnose. Der privilegierte Finalizer startet ausschließlich aus einem separaten root-eigenen, schreibgeschützten Snapshot des freigegebenen Commits; Byte-, Modus-, Eigentümer-, Hardlink- und Symlink-Abweichungen bleiben fail-closed. Der Snapshot liefert nur den geprüften Code; Logs, systemd-Units, Notifier-Rechte, Web-Wrapper und Sudoers-Einträge werden ausschließlich gegen den gebundenen Produktpfad erzeugt.
 
@@ -303,7 +305,7 @@ eigenes, nicht als Webverzeichnis eingebundenes Volume.
 > `ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}`. Ohne Eintrag
 > folgt sie dem geprüften Stable-Tag `latest`. Ein fester Versions-Tag wechselt
 > bei `pull` absichtlich nicht; für einen bewussten Pin wird
-> `E3DC_IMAGE_TAG=v5.4.2a` in `.env` gesetzt. `config --images` zeigt vor dem
+> `E3DC_IMAGE_TAG=v5.4.2b` in `.env` gesetzt. `config --images` zeigt vor dem
 > Pull das tatsächlich gewählte Image.
 >
 > Ein fehlgeschlagener `pull` ist ein harter Abbruch. Danach darf weder ein

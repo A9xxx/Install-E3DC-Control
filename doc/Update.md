@@ -5,13 +5,14 @@ Updates werden ausschließlich über den Installer ausgeführt. Ein manuelles
 Release-Historie ungeeignet, weil alter und neuer Git-Stand nicht miteinander
 verwandt sein müssen.
 
-Der aktuelle Stable-Stand ist `v5.4.2a`. Der Hotfix korrigiert die
-Speicher-Ladefreigabe und eine Altprozess-Kante bei der Installation des
-standardmäßig ausgeschalteten Prognosediagnose-Sidecars. Der versiegelte
-Finalizer bezieht seinen Code aus einem schreibgeschützten Prüfsnapshot,
-erzeugt Logs, systemd-Units, Wrapper, Sudoers-Einträge und Rechte aber
-ausschließlich gegen den gebundenen Produktpfad. Backup- und Rollbackvertrag
-entsprechen unverändert `v5.4.2`.
+Der aktuelle Stable-Stand ist `v5.4.2b`. Der Hotfix korrigiert den Übergang
+eines bereits vor dem Zielwechsel gestarteten Alt-Updaters. Er bindet
+Installationswurzel, Ziel-Commit, Version, Tag und Finalizer-Dateien erneut und
+setzt die privilegierte Ausführung ausschließlich aus einem privaten,
+root-eigenen und schreibgeschützten Prüfsnapshot fort. Eine reine
+Bereinigungsabweichung nach erfolgreichem Finalizerlauf löst keinen falschen
+Rollback aus. Backup-, EMS- und Rückfallvertrag entsprechen unverändert
+`v5.4.2a`.
 
 Die Konsolenbeispiele verwenden den zuvor geprüften absoluten Produktpfad:
 
@@ -354,7 +355,7 @@ Writer-/Aktor-Dienste gestoppt.
 
 ## Gezielter Rückfall
 
-`v5.4.2a` übernimmt unverändert den in `v5.4.2` veröffentlichten
+`v5.4.2b` übernimmt unverändert den in `v5.4.2` veröffentlichten
 Rückfallvertrag.
 
 `v5.4.2` bietet den bereinigten Root `v5.3.2b` ausschließlich als

@@ -1,9 +1,9 @@
 {
-  "version": "5.4.2a",
+  "version": "5.4.2b",
   "min_version": "4.0.0",
-  "stable_release": "v5.4.2a",
+  "stable_release": "v5.4.2b",
   "release_date": "2026-07-27",
-  "description": "v5.4.2a - Speicher-Ladefreigabe und Alt-Updater-Kompatibilität",
+  "description": "v5.4.2b - Versiegelter Übergang für laufende Alt-Updater",
   "installer_requires": "python3",
   "sanitized_republication": false,
   "history_transition": {

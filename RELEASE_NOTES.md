@@ -1,3 +1,32 @@
+# E3DC-Control v5.4.2b
+
+E3DC-Control 5.4.2b ist ein eng begrenzter Kompatibilitäts-Hotfix für
+Updateprozesse, die bereits vor dem Wechsel auf den neuen Zielstand gestartet
+wurden.
+
+- Erreicht ein solcher Prozess den neuen Finalizer noch direkt über den
+  Produktpfad, werden Installationswurzel, Ziel-Commit, Version, Release-Tag
+  und alle benötigten Finalizer-Dateien erneut gegen den freigegebenen Commit
+  gebunden.
+- Die privilegierte Fortsetzung startet ausschließlich aus einem privaten,
+  root-eigenen und schreibgeschützten Ausführungssnapshot. Erfolg wird nur mit
+  genau einem passenden SHA-/Tag-Marker akzeptiert.
+- Eine reine Bereinigungsabweichung nach bereits erfolgreichem Finalizerlauf
+  bleibt sichtbar, verdrängt aber nicht den gebundenen Erfolg und löst keinen
+  falschen Rollback aus.
+- Symlinks, Hardlinks, fremde Eigentümer, gruppen- oder weltbeschreibbare
+  Dateien, Byte-, Commit-, Versions- und Kontextabweichungen bleiben harte
+  Abbruchgründe.
+- Der normale versiegelte Updatepfad bleibt unverändert. Speicher-,
+  Direktvermarktungs-, Wallbox-, Wärme-, Prognose- und Hardwaresteuerung
+  entsprechen 5.4.2a.
+
+Bare-Metal-Nutzer verwenden weiterhin den normalen Web- oder
+Konsolen-Updater. Docker-Nutzer verwenden das veröffentlichte GHCR-Image; der
+öffentliche Docker-Rückfallstand bleibt v5.3.2b.
+
+---
+
 # E3DC-Control v5.4.2a
 
 E3DC-Control 5.4.2a ist ein eng begrenzter Hotfix für die

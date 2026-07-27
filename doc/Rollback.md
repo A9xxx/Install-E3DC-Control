@@ -14,7 +14,7 @@ test -f "$E3DC_INSTALL_PATH/e3dc-setup"
 
 ## Programmstand zurücksetzen
 
-Der aktuelle Stable-Stand `v5.4.2a` übernimmt denselben gebundenen
+Der aktuelle Stable-Stand `v5.4.2b` übernimmt denselben gebundenen
 Rückfallvertrag wie `v5.4.2`.
 
 `v5.4.2` bietet den öffentlichen Rollback-Root `v5.3.2b` ausschließlich als

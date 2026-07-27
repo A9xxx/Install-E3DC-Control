@@ -1,12 +1,12 @@
 # E3DC-Control Web-Portal & Installer
 
-Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.4.2b</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
+Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.4.2c</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
 
 ![E3DC-Control Dashboard](html/app-icon-512.png)
 
 ## Aktuelle Version und Update
 
-Die aktuelle stabile Version ist **5.4.2b**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur geprüften Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
+Die aktuelle stabile Version ist **5.4.2c**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur geprüften Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
 
 > [!WARNING]
 > **⚠️ Achtung: Nutzung auf eigenes Risiko!**
@@ -19,6 +19,8 @@ Die aktuelle stabile Version ist **5.4.2b**. Hinweise zum Web-, Konsolen- und Do
 > **Config-Schutz:** Standardinstallationen speichern `data/e3dc_v4.json` und lokale Config-Backups mit `660` für Install-User und `www-data`, damit WebUI und Dienste weiter automatisch starten, die Datei aber nicht mehr weltlesbar ist. Der normale Config-Download ist redigiert; der Raw-Download enthält Zugangsdaten und wird nur angeboten, wenn eine Web-PIN gesetzt ist. Der Kompatibilitätsmodus (`664`) ist nur für eigene externe Leser gedacht.
 
 > **Bedienansichten:** Config-Editor und Wallbox-Seite unterscheiden zwischen einfacher Ansicht für Einrichtung und täglichen Betrieb sowie erweiterter Ansicht für alle Detailparameter. Die Logik und Abgrenzung sind in [doc/Frontend_Ansichten.md](doc/Frontend_Ansichten.md) dokumentiert.
+
+> **Neu in 5.4.2c Stable:** Ein gültiger Modus-5-Netzladeslot der Wallbox wird nach bestandenen harten Schutzprüfungen nicht mehr durch den rein wirtschaftlichen Pre-Dump-Floor auf 0 A gesetzt. Der Speicher bleibt dabei gegen eine Finanzierung der Fahrzeugladung geschützt; Nutzer-`Aus`, manuelle Sperren, Notstromreserve, Hardwarelimits und Datenfrische bleiben vorrangig. Octopus-Heat-Festfenster werden unabhängig vom Eco-Modus über eine gemeinsame lokale Tarifzeitachse abgebildet, benötigen aber weiterhin jede aktuelle Nutzerfreigabe und schließen bei veralteten oder unpassenden Plänen fail-closed. Die Docker-Dokumentation trennt den GHCR-Normalweg vom lokalen Entwickler-Selbstbau und erklärt die vier Volume- und Backupverträge.
 
 > **Neu in 5.4.2b Stable:** Bereits vor dem Zielwechsel gestartete Alt-Updater können den verifizierten Finalizer über eine eng gebundene Kompatibilitätsbrücke abschließen. Ziel-Commit, Version, Tag, Produktpfad und Finalizer-Dateien werden erneut byte- und metadatengenau geprüft; die privilegierte Fortsetzung läuft nur aus einem privaten, root-eigenen Prüfsnapshot. Eine reine Bereinigungsabweichung nach erfolgreichem Abschluss löst keinen falschen Rollback mehr aus. Die EMS-Regelung entspricht unverändert 5.4.2a.
 
@@ -236,7 +238,9 @@ Erweiterungen & Smart Home
 ## 🐳 Installation (Via Docker)
 E3DC-Control kann alternativ komplett isoliert über Docker betrieben werden. Das Image unterstützt native ARM- (Raspberry Pi) sowie AMD64-Architekturen (Intel NUC, Synology, QNAP).
 
-**Voraussetzung:** Docker und Git müssen installiert sein.
+**Voraussetzung:** Docker muss installiert sein. Git wird im folgenden
+Komfortweg nur benötigt, um die mitgelieferte `docker-compose.yml` zu beziehen;
+der Anwendungscode stammt im Normalbetrieb aus dem veröffentlichten GHCR-Image.
 
 ### Schritt 1: Docker installieren
 ```bash
@@ -263,34 +267,78 @@ sudo usermod -aG docker "$USER"
 ```
 Danach einmal ab- und wieder anmelden, damit die Docker-Gruppenrechte aktiv werden.
 
-### Schritt 2: Repository klonen
+### Schritt 2: Compose-Datei aus dem Repository beziehen
 ```bash
 export E3DC_DOCKER_PATH="/absoluter/pfad/zur/docker-installation"
 git clone https://github.com/A9xxx/Install-E3DC-Control.git "$E3DC_DOCKER_PATH"
 cd "$E3DC_DOCKER_PATH"
 ```
 
-### Schritt 3: Datenverzeichnis vorbereiten
-```bash
-mkdir -p data
-# Optional: alte e3dc.config.txt nur für die Erstmigration ablegen:
-cp /dein/pfad/e3dc.config.txt data/   # optional
-```
+Der Checkout liefert hier nur die Compose-Datei und die Dokumentation. Der
+folgende Normalstart baut **kein** lokales Image.
 
-Neue Installationen werden über den Web-Wizard bzw. den Config-Editor in `data/e3dc_v4.json` eingerichtet.
-
-### Schritt 4: Container starten
+### Schritt 3: Container aus dem GHCR-Image starten
 ```bash
 docker compose up -d
 ```
 
-Das Docker-Image enthält den Anwendungscode. Das geklonte Repository liefert
-die `docker-compose.yml`; Konfiguration und Historie liegen dauerhaft im
-Docker-Volume bzw. Datenverzeichnis. Private Lernmodelle und die nur bei
-ausdrücklicher Freigabe erzeugte PV-Prognosediagnose besitzen jeweils ein
-eigenes, nicht als Webverzeichnis eingebundenes Volume.
+Die mitgelieferte Compose-Datei verwendet
+`ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}` und legt vier
+benannte Volumes an. Neue Installationen werden über den Web-Wizard bzw. den
+Config-Editor eingerichtet.
 
-### Updates einspielen
+| Bereich | Zweck | Backup |
+|---|---|---|
+| `e3dc_data` | Konfiguration, SQLite-Historie, Betriebszustand und sichere Warmstartdaten | immer sichern |
+| `e3dc_logs` | Laufzeitprotokolle und neu aufbaubare Auswertungsreihen | optional |
+| `e3dc_ml` | root-privates, anlagenspezifisches Lernmodell außerhalb des Webroots | empfohlen; sonst ist ein neues Training nötig |
+| `e3dc_forecast_evidence` | optionale, root-private Prognosediagnose mit rollierender Aufbewahrung bis zu 90 Tagen | optional; Verlust setzt nur die Diagnosehistorie zurück |
+
+Die Ramdisk bleibt absichtlich flüchtig und gehört nicht ins Backup. ML-Modell
+und Prognosediagnose werden wegen ihres abweichenden Rechte- und
+Sicherheitsvertrags nicht in die webschreibbaren Daten- oder Log-Volumes
+verschoben. Weitere Details, einschließlich Migration und Bind-Mount-Variante,
+stehen in der [Docker-Dokumentation](doc/Docker_Dokumentation.md).
+
+### Optionaler lokaler Selbstbau für Entwickler
+
+Docker Compose benötigt kein Registry-Image. Ein im lokalen Docker-Daemon
+gebautes Image kann direkt verwendet werden, wenn der Compose-Image-Name exakt
+dem lokalen Tag entspricht. Der vollständige Checkout ist dabei der
+Build-Kontext:
+
+```bash
+cd "$E3DC_DOCKER_PATH"
+docker build --pull -t e3dc-control:local .
+```
+
+Für den lokalen Start wird zusätzlich eine `docker-compose.local.yml` angelegt:
+
+```yaml
+services:
+  e3dc-control:
+    image: "e3dc-control:local"
+    pull_policy: never
+```
+
+```bash
+docker compose \
+  -f docker-compose.yml \
+  -f docker-compose.local.yml \
+  config --images
+docker compose \
+  -f docker-compose.yml \
+  -f docker-compose.local.yml \
+  up -d --force-recreate e3dc-control
+```
+
+`config --images` muss `e3dc-control:local` ausgeben.
+`pull_policy: never` verhindert, dass Compose für diesen lokalen Tag eine
+Registry kontaktiert. Der normale GHCR-Weg und dessen Updatebefehle bleiben
+davon getrennt. Ein privates Registry-Image verwendet stattdessen dessen
+vollständigen Namen, beispielsweise `registry.example/username/e3dc-control:tag`.
+
+### GHCR-Updates einspielen
 ```bash
 (
   set -euo pipefail
@@ -305,7 +353,7 @@ eigenes, nicht als Webverzeichnis eingebundenes Volume.
 > `ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}`. Ohne Eintrag
 > folgt sie dem geprüften Stable-Tag `latest`. Ein fester Versions-Tag wechselt
 > bei `pull` absichtlich nicht; für einen bewussten Pin wird
-> `E3DC_IMAGE_TAG=v5.4.2b` in `.env` gesetzt. `config --images` zeigt vor dem
+> `E3DC_IMAGE_TAG=v5.4.2c` in `.env` gesetzt. `config --images` zeigt vor dem
 > Pull das tatsächlich gewählte Image.
 >
 > Ein fehlgeschlagener `pull` ist ein harter Abbruch. Danach darf weder ein

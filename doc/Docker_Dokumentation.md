@@ -2,7 +2,7 @@
 
 Veröffentlichte Images entstehen ausschließlich aus einem versionierten stabilen Release-Tag. `latest` verweist damit auf die zuletzt veröffentlichte stabile Version.
 
-Der aktuelle Stable-Stand ist `v5.4.2b`. `latest` wird für diesen Hotfix erst
+Der aktuelle Stable-Stand ist `v5.4.2c`. `latest` wird für diesen Hotfix erst
 nach erfolgreicher Digest-, SBOM-, Provenance- und Attestierungsprüfung gesetzt.
 
 E3DC-Control kann isoliert über **Docker** betrieben werden. Der Container kapselt die Anwendung; persistente Betriebsdaten liegen in den dafür vorgesehenen Volumes. Der Multi-Architektur-Support (`arm64`, `amd64`) deckt die vorgesehenen Plattformen ab.
@@ -102,11 +102,19 @@ beiden privaten Bereiche benannte Volumes. Beide Layouts bilden denselben
 fachlichen Vertrag ab. Die Ramdisk ist absichtlich flüchtig und gehört nicht
 ins Backup.
 
+Die aktuellen Dateien `pv_forecast.json` und `ml_prediction.json` sind
+flüchtige Rechenergebnisse in der Ramdisk und werden neu erzeugt. Das Volume
+`e3dc_forecast_evidence` enthält dagegen nicht die laufende Prognose, sondern
+das optionale Diagnosearchiv mit einer rollierenden Aufbewahrung bis zu 90
+Tagen.
+
 `e3dc_ml` darf nicht einfach unter das heutige Web-`data` verschoben werden:
-Der Datenbaum gehört dem Webbenutzer, während das geladene Modell und die
-privaten Prognosebelege aus Sicherheitsgründen root-privat bleiben. Eine
-spätere Zusammenlegung privater Volumes benötigt deshalb eine verifizierte
-Datenmigration samt Rechteprüfung und Rückfallweg.
+Der Datenbaum gehört dem Webbenutzer, während das verifizierte, serialisierte
+Modell und die privaten Prognosebelege aus Sicherheitsgründen root-privat
+bleiben. Eine Reduktion auf nur `data` und `logs` würde unterschiedliche
+Eigentümer-, Sicherheits-, Aufbewahrungs- und Backupverträge vermischen und
+wird deshalb nicht unterstützt. Eine spätere Zusammenlegung privater Volumes
+benötigt eine verifizierte Datenmigration samt Rechteprüfung und Rückfallweg.
 
 **Synology / NAS mit belegtem Port 80:**
 Wenn der Host Port 80 selbst abfaengt oder auf die NAS-GUI umleitet, kannst du
@@ -146,7 +154,7 @@ Fertiges GitHub-Image aktualisieren:
 
 Ohne `E3DC_IMAGE_TAG` folgt diese Compose-Datei dem geprüften Stable-Tag
 `latest`. Ein fester Tag bleibt bei `pull` absichtlich unverändert. Für einen
-bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.2b` in der Datei `.env`
+bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.2c` in der Datei `.env`
 gesetzt. `docker compose config --images` zeigt vorab das tatsächlich gewählte
 Image.
 
@@ -174,7 +182,7 @@ Versionswahl.
 
 Gezielte Rückfallversion:
 
-Den Stable-Container `v5.4.2b` auf den veröffentlichten Rollback-Root
+Den Stable-Container `v5.4.2c` auf den veröffentlichten Rollback-Root
 `v5.3.2b` zurücksetzen:
 
 ```bash
@@ -216,33 +224,52 @@ vorgesehene Weg. Ein lokaler Build benötigt den **vollständigen
 Repository-Checkout**, weil `Dockerfile`, `entrypoint.sh` und der Quellbaum im
 Build-Kontext liegen müssen.
 
-Direkt im Repository-Checkout kann dessen mitgelieferte Compose-Datei verwendet
-werden:
+Docker Compose ist nicht auf Images aus einer Registry beschränkt. Es kann ein
+lokal gebautes Image direkt aus dem Docker-Daemon verwenden. Entscheidend ist,
+dass der unter `image:` eingetragene Name exakt dem lokalen Tag entspricht.
+Die normale Release-Compose bleibt dabei unverändert auf GHCR gebunden; der
+lokale Image-Name wird über eine kleine Override-Datei gesetzt.
 
 ```bash
 export E3DC_REPO_PATH="/absoluter/pfad/zum/repository-checkout"
+git clone https://github.com/A9xxx/Install-E3DC-Control.git "$E3DC_REPO_PATH"
 cd "$E3DC_REPO_PATH"
-# In docker-compose.yml die image-Zeile auskommentieren und build: . aktivieren.
-sudo docker compose build --no-cache e3dc-control
-sudo docker compose up -d --force-recreate e3dc-control
+sudo docker build --pull -t e3dc-control:local .
 ```
 
-Bleibt die Compose-Datei dagegen im separaten Installationsordner, muss sie den
-Repository-Checkout ausdrücklich als Build-Kontext binden:
+Lege daneben eine Datei `docker-compose.local.yml` an:
 
 ```yaml
 services:
   e3dc-control:
-    # image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"
-    build:
-      context: /absoluter/pfad/zum/repository-checkout
-      dockerfile: Dockerfile
+    image: "e3dc-control:local"
+    pull_policy: never
 ```
 
-Ein bloßes `build: .` im zuvor angelegten, ansonsten leeren
-`$E3DC_DOCKER_PATH` ist unvollständig und wird nicht unterstützt. Steht nur
-`image: ghcr.io/...` in der Compose-Datei, nutzt Docker das vorhandene oder
-gepullte veröffentlichte Image.
+Anschließend wird die normale Compose-Datei mit diesem lokalen Override
+gestartet:
+
+```bash
+sudo docker compose \
+  -f docker-compose.yml \
+  -f docker-compose.local.yml \
+  config --images
+sudo docker compose \
+  -f docker-compose.yml \
+  -f docker-compose.local.yml \
+  up -d --force-recreate e3dc-control
+```
+
+`config --images` muss `e3dc-control:local` ausgeben.
+`pull_policy: never` verhindert für diesen Entwicklerweg jeden Registry-Pull
+und meldet einen Fehler, wenn das lokale Image fehlt. Soll das selbst gebaute
+Image auf weiteren Hosts laufen, erhält es stattdessen einen vollständigen
+privaten Registry-Namen, wird dorthin gepusht und unter demselben Namen in
+`image:` eingetragen.
+
+Ein bloßes `build: .` in einem ansonsten leeren Installationsordner ist
+weiterhin unvollständig und wird nicht unterstützt. Der vollständige
+Repository-Checkout muss der Build-Kontext sein.
 
 Nach einem bewussten lokalen Build ist die Ausgabe von
 `docker inspect e3dc-control --format

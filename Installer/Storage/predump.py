@@ -18,9 +18,9 @@ except ModuleNotFoundError:
     from storage_parallel_regulator import MODE_AUTO  # type: ignore
 
 try:
-    from Installer.Wallbox.modes import MODE_OFF, normalize_wb_mode
+    from Installer.Wallbox.modes import MODE_OFF, MODE_PRICE, normalize_wb_mode
 except ModuleNotFoundError:
-    from Wallbox.modes import MODE_OFF, normalize_wb_mode  # type: ignore
+    from Wallbox.modes import MODE_OFF, MODE_PRICE, normalize_wb_mode  # type: ignore
 
 
 def cfg_bool(cfg: Dict[str, Any], key: str, default: bool = False) -> bool:
@@ -275,6 +275,49 @@ def augment_predump_consumer_live(live: Dict[str, Any], energy_decision: Dict[st
     return augment_consumer_live(live, energy_decision, {})
 
 
+def explicit_mode5_grid_slot_active(
+    wb_intent: Dict[str, Any],
+    *,
+    intent_fresh: bool,
+    wb_mode: int,
+    now_s: float,
+) -> bool:
+    """Bindet ausschließlich den kanonischen, expliziten Modus-5-Netzladeslot."""
+    intent_ts = safe_float(wb_intent.get("ts"), 0.0)
+    if intent_ts > 100_000_000_000.0:
+        intent_ts /= 1000.0
+    intent_age_s = now_s - intent_ts if intent_ts > 0.0 else float("inf")
+    request = str(wb_intent.get("battery_request", "") or "").strip().lower()
+    reason = str(wb_intent.get("reason") or "").strip()
+    vehicle_present = bool(
+        wb_intent.get("active")
+        and (
+            wb_intent.get("car_active")
+            or wb_intent.get("connected")
+            or wb_intent.get("plugged")
+        )
+    )
+    charge_permission = bool(
+        wb_intent.get("charging_active")
+        or wb_intent.get("start_requested")
+        or safe_int(wb_intent.get("cap_amp", wb_intent.get("set_amp")), 0) > 0
+    )
+    return bool(
+        intent_fresh
+        and 0.0 <= intent_age_s <= 90.0
+        and wb_mode == MODE_PRICE
+        and wb_intent.get("scheduled_slot_active")
+        and wb_intent.get("price_opt_active")
+        and wb_intent.get("price_plan_storage_protect")
+        and request == "hold_discharge"
+        and reason == "slot_grid_storage_protection"
+        and vehicle_present
+        and charge_permission
+        and not wb_intent.get("manual_pause")
+        and not wb_intent.get("bev_full_blocked")
+    )
+
+
 def predump_wallbox_floor_hold_decision(
     cfg: Dict[str, Any],
     live: Dict[str, Any],
@@ -341,6 +384,111 @@ def predump_wallbox_floor_hold_decision(
     if not (wallbox_w > 250.0 or intent_present or native_present):
         return None
 
+    intent_w = (
+        abs(safe_float(wb_intent.get("wb_power_w"), 0.0))
+        if intent_fresh
+        else 0.0
+    )
+    native_total_w = abs(safe_float(wb_native.get("total_power_w"), 0.0))
+    for detail in details if isinstance(details, list) else []:
+        if isinstance(detail, dict):
+            native_total_w = max(
+                native_total_w,
+                abs(safe_float(detail.get("power_w"), 0.0)),
+            )
+    observed_wallbox_w = max(wallbox_w, intent_w, native_total_w)
+
+    # Ein gültiger, expliziter Modus-5-Netzladeslot besitzt nach den bereits
+    # vorgelagerten Hard-Safety-Gates die Wallbox. Der Pre-Dump-Floor darf
+    # diesen rein wirtschaftlichen Slot nicht auf 0 A stoppen. Gleichzeitig
+    # darf der anschließende Pre-Dump-Verbraucherpfad die Wallbox nicht aus dem
+    # Speicher speisen. Daher bindet dieser eigene AUTO-Limit-Entscheid die
+    # Speicherentladung ausschließlich an das Haus-/WP-Defizit.
+    if explicit_mode5_grid_slot_active(
+        wb_intent,
+        intent_fresh=intent_fresh,
+        wb_mode=wb_mode,
+        now_s=now_s,
+    ):
+        house_wp_cap_w = house_heatpump_discharge_cap_w(
+            live,
+            observed_wallbox_w,
+            max_discharge_w,
+        )
+        house_wp_cap_w = smooth_house_heatpump_discharge_cap_w(
+            cfg,
+            house_wp_cap_w,
+            previous_state,
+        )
+        reason = (
+            "Geplanter Modus-5-Netzladeslot am Pre-Dump-Floor %.1f%% "
+            "(SoC %.1f%%): Wallbox bleibt freigegeben und nutzt Netz; "
+            "Speicherentladung bleibt auf Haus/WP-Defizit bis %dW begrenzt"
+        ) % (floor_soc, soc, house_wp_cap_w)
+        return {
+            "state": "wallbox_grid_slot_storage_hold",
+            "mode": MODE_AUTO,
+            "val": max_charge_w,
+            "priority": "safety",
+            "reason": reason,
+            "protected": True,
+            "storage_req_w": 0,
+            "budget_w": 0,
+            "force_wallbox_stop": False,
+            "predump_floor_hold": False,
+            "predump_wallbox_excluded": True,
+            "wallbox_storage_protection": True,
+            "scheduled_grid_charge": True,
+            "house_heatpump_discharge_cap_w": house_wp_cap_w,
+            "wallbox_power_w": int(round(observed_wallbox_w)),
+            "auto_limit": discharge_cap_auto_limit(
+                cfg,
+                max_charge_w,
+                house_wp_cap_w,
+                reason,
+            ),
+        }
+
+    canonical_predump = predump_request_from_plan(
+        cfg,
+        live,
+        plan,
+        now_s,
+        max_discharge_w,
+        previous_state,
+    )
+    canonical_wallbox_bound = bool(
+        canonical_predump.get("active")
+        and predump_allow_flags(cfg, canonical_predump).get("wallbox")
+    )
+    previous_state = previous_state or {}
+    previous_ts = safe_float(previous_state.get("ts"), 0.0)
+    if previous_ts > 100_000_000_000.0:
+        previous_ts /= 1000.0
+    previous_age_s = now_s - previous_ts if previous_ts > 0.0 else float("inf")
+    previous_allow = (
+        previous_state.get("predump_allow")
+        if isinstance(previous_state.get("predump_allow"), dict)
+        else {}
+    )
+    previous_devices = {
+        device.strip()
+        for device in str(previous_state.get("predump_consumer_devices") or "").split(",")
+        if device.strip()
+    }
+    previous_wallbox_bound = bool(
+        str(previous_state.get("state") or "") in (
+            "pre_discharge_wait",
+            "pre_discharge_consumer_auto",
+        )
+        and bool(previous_state.get("predump_active"))
+        and bool(previous_allow.get("wallbox"))
+        and "wallbox" in previous_devices
+        and 0.0 <= previous_age_s <= 90.0
+    )
+    if not (canonical_wallbox_bound or previous_wallbox_bound):
+        return None
+
     request = str(wb_intent.get("battery_request", "") or "").strip().lower()
     intent_reason = str(wb_intent.get("reason") or "").strip()
     protected_wallbox_grid_charge = bool(
@@ -359,12 +507,6 @@ def predump_wallbox_floor_hold_decision(
         "Wallbox wird gestoppt, Hausversorgung bleibt freigegeben"
     ) % (floor_soc, soc)
     if protected_wallbox_grid_charge:
-        intent_w = abs(safe_float(wb_intent.get("wb_power_w"), 0.0))
-        native_total_w = abs(safe_float(wb_native.get("total_power_w"), 0.0))
-        for detail in details if isinstance(details, list) else []:
-            if isinstance(detail, dict):
-                native_total_w = max(native_total_w, abs(safe_float(detail.get("power_w"), 0.0)))
-        observed_wallbox_w = max(wallbox_w, intent_w, native_total_w)
         house_wp_cap_w = house_heatpump_discharge_cap_w(live, observed_wallbox_w, max_discharge_w)
         house_wp_cap_w = smooth_house_heatpump_discharge_cap_w(cfg, house_wp_cap_w, previous_state)
         reason = (

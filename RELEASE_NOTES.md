@@ -1,3 +1,52 @@
+# E3DC-Control v5.4.2c
+
+E3DC-Control 5.4.2c ist ein Hotfix für die Priorität ausdrücklich geplanter
+Wallbox-Netzladeslots, die festen Octopus-Heat-Tariffenster und die
+Docker-Dokumentation.
+
+## Wallbox und Speicherschutz
+
+- Ein frischer, ausdrücklich gültiger Modus-5-Netzladeslot wird nach
+  bestandenen harten Schutzprüfungen nicht mehr durch den rein wirtschaftlichen
+  Pre-Dump-Floor auf 0 A gesetzt.
+- Der Speicher bleibt dabei im geschützten AUTO-Rahmen. Die Fahrzeugladung
+  wird nicht aus der Batterie finanziert; eine zulässige Speicherentladung
+  berücksichtigt nur den nicht durch PV gedeckten Haus- und
+  Wärmepumpenbedarf.
+- Nutzer-`Aus`, manuelle und Abort-Sperren, Notstromreserve, Hardware- und
+  Netzlimits, Datenvalidität sowie fehlende oder veraltete Slots bleiben
+  unverändert vorrangig. Ohne gültigen Slot bleibt der wirtschaftliche
+  Pre-Dump-Stopp wirksam.
+
+## Octopus Heat
+
+- Die festen Niedrigtariffenster 02:00–06:00 und 12:00–16:00 werden über eine
+  gemeinsame lokale Tarifzeitachse in `Europe/Berlin` abgebildet und benötigen
+  den netzdienlichen Eco-Modus nicht.
+- Aktuelle Wärmepumpen-, Billigstrom- und Verbraucherfreigaben bleiben
+  zwingend. Fehlerhafte, veraltete oder nach einem Tarifwechsel unpassende
+  Planartefakte schließen fail-closed.
+- Die lokale Tarifachse bleibt vom optionalen Marktpreis getrennt und erzeugt
+  keinen erfundenen Börsenpreis.
+
+## Docker
+
+- Das veröffentlichte GHCR-Image bleibt der normale Installationsweg.
+- Ein lokaler Entwickler-Selbstbau benötigt einen vollständigen Checkout und
+  kann ohne Registry über `e3dc-control:local` und einen Compose-Override mit
+  `pull_policy: never` gestartet werden.
+- Daten, Logs, root-private ML-Modelle und optionale Prognosebelege behalten
+  getrennte Rechte-, Aufbewahrungs- und Backupverträge. Es erfolgt keine
+  automatische Volume-Migration.
+
+Der in 5.4.2b korrigierte, versiegelte Alt-Updater-Übergang bleibt
+unverändert. Bare-Metal-Nutzer verwenden den normalen Web- oder
+Konsolen-Updater. Docker-Nutzer verwenden nach der veröffentlichten
+Digest-Prüfung das GHCR-Image `v5.4.2c`; der öffentliche
+Docker-Rückfallstand bleibt `v5.3.2b`.
+
+---
+
 # E3DC-Control v5.4.2b
 
 E3DC-Control 5.4.2b ist ein eng begrenzter Kompatibilitäts-Hotfix für

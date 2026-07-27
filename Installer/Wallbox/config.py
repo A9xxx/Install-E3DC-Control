@@ -8,7 +8,6 @@ import sys
 import json
 import time
 import logging
-import re
 from logging.handlers import RotatingFileHandler
 
 # Sicherstellen dass das Installer-Verzeichnis im Pfad liegt (fuer rscp_client etc.)
@@ -31,6 +30,16 @@ try:
     from json_cache import atomic_write_on_change, file_signature, read_json_cached
 except ModuleNotFoundError:
     from Installer.json_cache import atomic_write_on_change, file_signature, read_json_cached
+try:
+    from tariff_schedule import (
+        configured_billing_price_for_timestamp,
+        parse_special_tariff_schedule,
+    )
+except ModuleNotFoundError:
+    from Installer.tariff_schedule import (
+        configured_billing_price_for_timestamp,
+        parse_special_tariff_schedule,
+    )
 from Installer.utils import get_paths
 
 # ---------------------------------------------------------------------------
@@ -151,63 +160,13 @@ def _safe_float(val, default):
 
 
 def _parse_special_tariff_schedule(raw):
-    """Return sorted (minute_of_day, price_ct) pairs from a simple user tariff."""
-    text = str(raw or "").strip()
-    if not text:
-        return []
-
-    entries = {}
-    pattern = re.compile(r'(?<!\d)([0-2]?\d)(?:[:.](\d{1,2}))?\s+(-?\d+(?:[,.]\d+)?)')
-    for match in pattern.finditer(text):
-        try:
-            hour = int(match.group(1))
-            minute = int(match.group(2) or 0)
-            price = float(match.group(3).replace(",", "."))
-        except (TypeError, ValueError):
-            continue
-        if hour < 0 or hour > 23 or minute < 0 or minute > 59:
-            continue
-        entries[hour * 60 + minute] = price
-
-    return sorted(entries.items(), key=lambda item: item[0])
+    """Kompatibilitätswrapper für die neutrale Tarifauflösung."""
+    return parse_special_tariff_schedule(raw)
 
 
 def _configured_billing_price_now(config, now_ts=None):
-    """Return a config-backed current ct/kWh price for non-dynamic tariffs."""
-    tariff = str(config.get("stromtarif_typ", "static") or "static").strip().lower()
-    if tariff not in ("static", "fix", "fixed", "flat", "octopus_heat", "special", "spezial", "special_tariff"):
-        return None
-
-    basis = _safe_float(config.get("strompreis_basis", 25.0), 25.0)
-    if tariff in ("static", "fix", "fixed", "flat"):
-        return basis
-
-    try:
-        from datetime import datetime
-        now_dt = datetime.fromtimestamp(float(now_ts if now_ts is not None else time.time()))
-    except Exception:
-        return basis
-
-    if tariff == "octopus_heat":
-        cheap = _safe_float(config.get("strompreis_cheap", basis), basis)
-        uht = _safe_float(config.get("strompreis_uht", basis), basis)
-        hour = now_dt.hour
-        if (2 <= hour < 6) or (12 <= hour < 16):
-            return cheap
-        if 18 <= hour < 21:
-            return uht
-        return basis
-
-    schedule = _parse_special_tariff_schedule(config.get("strompreis_spezial", ""))
-    if not schedule:
-        return basis
-    minute_of_day = now_dt.hour * 60 + now_dt.minute
-    active_price = schedule[-1][1]
-    for start_minute, price in schedule:
-        if minute_of_day < start_minute:
-            break
-        active_price = price
-    return active_price
+    """Kompatibilitätswrapper für die neutrale Tarifauflösung."""
+    return configured_billing_price_for_timestamp(config, now_ts=now_ts)
 
 
 def _load_config_uncached():

@@ -190,6 +190,7 @@
 !/Installer/system.py
 !/Installer/systemd/20-e3dc-control-limits.conf
 !/Installer/task_executor.py
+!/Installer/tariff_schedule.py
 !/Installer/transition_context.py
 !/Installer/transition_systemd.py
 !/Installer/uninstall.py

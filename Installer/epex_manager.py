@@ -25,6 +25,24 @@ try:
     from Installer.utils import get_paths as _get_paths
 except ImportError:  # pragma: no cover - package-less compatibility
     from utils import get_paths as _get_paths
+try:
+    from Installer.tariff_schedule import (
+        configured_billing_price_for_timestamp,
+        parse_special_tariff_schedule as _parse_special_tariff_schedule,
+        recurring_tariff_slots,
+        special_tariff_price_for_datetime,
+        TARIFF_TIMEZONE_NAME,
+        tariff_type as configured_tariff_type,
+    )
+except ImportError:  # pragma: no cover - package-less compatibility
+    from tariff_schedule import (
+        configured_billing_price_for_timestamp,
+        parse_special_tariff_schedule as _parse_special_tariff_schedule,
+        recurring_tariff_slots,
+        special_tariff_price_for_datetime,
+        TARIFF_TIMEZONE_NAME,
+        tariff_type as configured_tariff_type,
+    )
 _p = _get_paths()
 try:
     from runtime_logging import configure_service_logger
@@ -49,6 +67,8 @@ ENTSOE_API_ENDPOINTS = (
     "https://external-api.tp.entsoe.eu/api",
 )
 ENTSOE_DE_LU_DOMAIN = "10Y1001A1001A82H"
+PRICE_BOOST_PUBLISH_INTERVAL_S = 30 * 60
+PRICE_BOOST_PLAN_MAX_AGE_S = PRICE_BOOST_PUBLISH_INTERVAL_S + 15 * 60
 
 # Logger setup
 LOG_DIR = "/var/www/html/logs"
@@ -98,39 +118,12 @@ def update_market_value_solar_monitor(config, price_data):
     return None
 
 def parse_special_tariff_schedule(raw):
-    """Return sorted (minute_of_day, price_ct) pairs from a simple user tariff."""
-    text = str(raw or "").strip()
-    if not text:
-        return []
-
-    entries = {}
-    pattern = re.compile(r'(?<!\d)([0-2]?\d)(?:[:.](\d{1,2}))?\s+(-?\d+(?:[,.]\d+)?)')
-    for match in pattern.finditer(text):
-        try:
-            hour = int(match.group(1))
-            minute = int(match.group(2) or 0)
-            price = float(match.group(3).replace(",", "."))
-        except (TypeError, ValueError):
-            continue
-        if hour < 0 or hour > 23 or minute < 0 or minute > 59:
-            continue
-        entries[hour * 60 + minute] = price
-
-    return sorted(entries.items(), key=lambda item: item[0])
+    """Kompatibilitätswrapper für die neutrale Tarifauflösung."""
+    return _parse_special_tariff_schedule(raw)
 
 def special_tariff_price_for_dt(raw, dt, default_price):
-    """Resolve the active ct/kWh price for dt from a daily special tariff."""
-    schedule = parse_special_tariff_schedule(raw)
-    if not schedule:
-        return default_price
-
-    minute_of_day = dt.hour * 60 + dt.minute
-    active_price = schedule[-1][1]
-    for start_minute, price in schedule:
-        if minute_of_day < start_minute:
-            break
-        active_price = price
-    return active_price
+    """Kompatibilitätswrapper für die neutrale Tarifauflösung."""
+    return special_tariff_price_for_datetime(raw, dt, default_price)
 
 def write_json_atomic(path, payload, indent=None):
     temp_file = path + ".tmp"
@@ -198,8 +191,10 @@ def disabled_market_plan(config, reason, now_ms=None):
     """Erstellt bei ungültigen Eingangsdaten den einzig zulässigen Marktvertrag."""
     tariff = str((config or {}).get("stromtarif_typ", "static")).strip().lower()
     supported = tariff in ("tibber", "awattar", "dynamic", "epex", "octopus_heat")
+    generated_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
     return {
-        "ts": int(time.time() * 1000) if now_ms is None else int(now_ms),
+        "ts": generated_ms,
+        "valid_until_ts_ms": generated_ms,
         "enabled": False,
         "supported": supported,
         "unsupported_reason": "" if supported else "Preis-Boost ist nur für EPEX-/Börsentarife und Octopus Heat",
@@ -245,6 +240,8 @@ def publish_market_state(config, data, safety_gate=None, cache_write=True, sourc
     if not context_valid:
         return False, [], publish_disabled_market_state(config, context_reason), context_reason
     if not price_data_has_future_slots(data, min_horizon_s=900):
+        if configured_tariff_type(config) == "octopus_heat":
+            return publish_configured_tariff_state(config, safety_gate=safety_gate)
         reason = "price_data_missing_or_stale"
         return False, [], publish_disabled_market_state(config, reason), reason
 
@@ -279,6 +276,48 @@ def publish_market_state(config, data, safety_gate=None, cache_write=True, sourc
         update_market_value_solar_monitor(config, data)
     except Exception:
         publish_disabled_market_state(config, "market_publish_error")
+        raise
+    return True, scores, boost_plan, ""
+
+
+def publish_configured_tariff_state(config, safety_gate=None):
+    """Veröffentlicht die lokale Octopus-Heat-Tarifachse ohne Börsenpreis."""
+    context_valid, context_reason = _evaluate_market_safety_gate(config, safety_gate)
+    if not context_valid:
+        return False, [], publish_disabled_market_state(config, context_reason), context_reason
+    if configured_tariff_type(config) != "octopus_heat":
+        reason = "configured_tariff_axis_unavailable"
+        return False, [], publish_disabled_market_state(config, reason), reason
+
+    now_ms = int(time.time() * 1000)
+    tariff_slots = recurring_tariff_slots(config, now_ms=now_ms)
+    scores = generate_configured_tariff_score(tariff_slots)
+    if not scores:
+        reason = "configured_tariff_axis_empty"
+        return False, [], publish_disabled_market_state(config, reason), reason
+    boost_plan = generate_price_boost_plan([], scores, config)
+
+    write_json_atomic(PRICE_BOOST_PLAN_FILE, disabled_market_plan(config, "publishing"), indent=2)
+    try:
+        # Ohne externe Quelle existiert bewusst kein Marktpreisvertrag.
+        write_json_atomic(EPEX_OUTPUT_FILE, [], indent=2)
+        write_json_atomic(ECO_SCORE_FILE, scores, indent=2)
+        boost_plan = dict(boost_plan)
+        boost_plan["context_valid"] = True
+        boost_plan["release_valid"] = True
+        boost_plan["source_status"] = "configured_tariff"
+        boost_plan["consumer_releases"] = {
+            consumer: bool(
+                boost_plan.get("enabled")
+                and boost_plan.get("active")
+                and (boost_plan.get("allow") or {}).get(consumer, False)
+            )
+            for consumer in MARKET_CONSUMERS
+        }
+        write_json_atomic(PRICE_BOOST_PLAN_FILE, boost_plan, indent=2)
+        update_market_value_solar_monitor(config, [])
+    except Exception:
+        publish_disabled_market_state(config, "configured_tariff_publish_error")
         raise
     return True, scores, boost_plan, ""
 
@@ -378,6 +417,13 @@ def recover_or_disable_market(config, safety_gate=None):
             return True
     elif restore_cached_prices(config, safety_gate=safety_gate):
         return True
+    if configured_tariff_type(config) == "octopus_heat":
+        published, _scores, _plan, _reason = publish_configured_tariff_state(
+            config,
+            safety_gate=safety_gate,
+        )
+        if published:
+            return True
     context_valid, context_reason = _evaluate_market_safety_gate(config, safety_gate)
     reason = "provider_and_cache_unavailable" if context_valid else context_reason
     publish_disabled_market_state(config, reason)
@@ -1080,18 +1126,12 @@ def generate_eco_score(price_data, config):
 
     stromtarif_typ = str(config.get("stromtarif_typ", "static")).strip().lower()
     strompreis_basis = safe_float(config.get("strompreis_basis", 25.0), 25.0)
-    strompreis_cheap = safe_float(config.get("strompreis_cheap", 18.0), 18.0)
-    strompreis_uht = safe_float(config.get("strompreis_uht", 32.0), 32.0)
-    strompreis_spezial = config.get("strompreis_spezial", "")
     grid_friendly_mode = str(config.get("grid_friendly_mode", "1")).lower() in ["1", "true"]
 
     eco_scores = []
-    from datetime import datetime
 
     for d in future_prices:
         ts = int(d["start_timestamp"] / 1000)
-        dt = datetime.fromtimestamp(ts)
-        hour = dt.hour
 
         # 1. Pure Eco Score (Wann ist der Netz-Strom dreckig / sauber?)
         pure_eco_score = 100.0 - (((d["marketprice"] - min_p) / span) * 100.0)
@@ -1109,20 +1149,11 @@ def generate_eco_score(price_data, config):
             vat = safe_float(config.get("awmwst", 19), 19.0) / 100.0
             billing_price = (d["marketprice"] / 10.0) * (1.0 + vat) + taxes
 
-        elif stromtarif_typ == "octopus_heat":
-            if (2 <= hour < 6) or (12 <= hour < 16):
-                billing_price = strompreis_cheap # Low Tarif (LT)
-            elif (18 <= hour < 21):
-                billing_price = strompreis_uht # Ultra High Tarif (UHT)
-            else:
-                billing_price = strompreis_basis # High Tarif (HT)
-
-        elif stromtarif_typ in ("special", "spezial", "special_tariff"):
-            billing_price = special_tariff_price_for_dt(strompreis_spezial, dt, strompreis_basis)
-
         else:
-            # Static Tarif
-            billing_price = strompreis_basis
+            # Vollständig konfigurierte Tarife verwenden dieselbe neutrale
+            # Tagesachse wie Wallbox- und Heat-Planung.
+            configured_price = configured_billing_price_for_timestamp(config, now_ts=ts)
+            billing_price = strompreis_basis if configured_price is None else configured_price
 
         # 3. Eco-Score fuer netzdienliche Regelung
         # Kein Cheap-Score: Netzdienlichkeit kommt aus dem Marktpreis,
@@ -1166,6 +1197,33 @@ def generate_eco_score(price_data, config):
         eco_scores.append(score_entry)
 
     return eco_scores
+
+
+def generate_configured_tariff_score(tariff_slots):
+    """Erzeugt eine neutrale Preisprojektion ohne erfundenen Markt-Eco-Score."""
+    scores = []
+    for slot in tariff_slots or []:
+        try:
+            start_ms = int(slot.get("start_timestamp", 0))
+            end_ms = int(slot.get("end_timestamp", start_ms + 900000))
+            billing_price = float(slot.get("billing_price_ct"))
+        except (TypeError, ValueError):
+            continue
+        if start_ms <= 0 or end_ms <= start_ms:
+            continue
+        scores.append({
+            "start_timestamp": start_ms,
+            "end_timestamp": end_ms,
+            "market_price": None,
+            "billing_price": round(billing_price, 2),
+            "price_source": "configured_tariff",
+            "price_resolution_min": slot.get("price_resolution_min", 15),
+            "source_resolution_min": slot.get("source_resolution_min", 15),
+            "pure_eco_score": None,
+            "optimization_score": 50.0,
+        })
+    return scores
+
 
 def generate_price_boost_plan(price_data, eco_scores, config):
     """
@@ -1212,18 +1270,50 @@ def generate_price_boost_plan(price_data, eco_scores, config):
         except Exception:
             continue
 
-    slots = []
+    market_intervals = []
     for raw in price_data or []:
+        try:
+            interval_start = int(raw.get("start_timestamp", 0))
+            interval_end = int(raw.get("end_timestamp", interval_start + 900000))
+            market_value = float(raw.get("marketprice"))
+        except (TypeError, ValueError):
+            continue
+        if interval_start > 0 and interval_end > interval_start:
+            market_intervals.append((interval_start, interval_end, market_value))
+
+    if stromtarif_typ == "octopus_heat":
+        plan_slots = recurring_tariff_slots(config, now_ms=now_ms)
+    else:
+        plan_slots = list(price_data or [])
+
+    slots = []
+    for raw in plan_slots:
         try:
             st = int(raw.get("start_timestamp", 0))
             en = int(raw.get("end_timestamp", st + 900000))
-            market_price = float(raw.get("marketprice", 0.0))
             score = score_by_ts.get(st, {})
-            billing_price = float(score.get("billing_price", market_price / 10.0))
-        except Exception:
+        except (TypeError, ValueError):
             continue
 
         if st < now_ms - 3600000 or st > now_ms + 48 * 3600000:
+            continue
+
+        market_price = None
+        for interval_start, interval_end, market_value in market_intervals:
+            if interval_start <= st < interval_end:
+                market_price = market_value
+                break
+
+        billing_raw = score.get("billing_price")
+        if billing_raw is None:
+            billing_raw = raw.get("billing_price_ct")
+        if billing_raw is None and stromtarif_typ == "octopus_heat":
+            billing_raw = configured_billing_price_for_timestamp(config, now_ts=st / 1000.0)
+        if billing_raw is None and market_price is not None:
+            billing_raw = market_price / 10.0
+        try:
+            billing_price = float(billing_raw)
+        except (TypeError, ValueError):
             continue
 
         cheap_slot = False
@@ -1236,8 +1326,9 @@ def generate_price_boost_plan(price_data, eco_scores, config):
         slots.append({
             "start_timestamp": st,
             "end_timestamp": en,
-            "market_price": round(market_price, 2),
+            "market_price": None if market_price is None else round(market_price, 2),
             "billing_price": round(billing_price, 2),
+            "price_source": str(raw.get("price_source") or score.get("price_source") or ""),
             "cheap": bool(cheap_slot),
         })
 
@@ -1266,7 +1357,7 @@ def generate_price_boost_plan(price_data, eco_scores, config):
         if duration_ms < min_duration_ms:
             continue
         prices = [s["billing_price"] for s in win["slots"]]
-        market_prices = [s["market_price"] for s in win["slots"]]
+        market_prices = [s["market_price"] for s in win["slots"] if s["market_price"] is not None]
         clean_windows.append({
             "start_timestamp": win["start_timestamp"],
             "end_timestamp": win["end_timestamp"],
@@ -1274,7 +1365,7 @@ def generate_price_boost_plan(price_data, eco_scores, config):
             "slot_count": len(win["slots"]),
             "min_billing_price": round(min(prices), 2),
             "avg_billing_price": round(sum(prices) / len(prices), 2),
-            "min_market_price": round(min(market_prices), 2),
+            "min_market_price": round(min(market_prices), 2) if market_prices else None,
         })
 
     active_window = None
@@ -1285,9 +1376,13 @@ def generate_price_boost_plan(price_data, eco_scores, config):
 
     return {
         "ts": now_ms,
+        "valid_until_ts_ms": now_ms + PRICE_BOOST_PLAN_MAX_AGE_S * 1000,
+        "publish_interval_s": PRICE_BOOST_PUBLISH_INTERVAL_S,
         "enabled": enabled,
         "supported": supported_tariff,
         "unsupported_reason": "" if supported_tariff else "Preis-Boost ist nur für EPEX-/Börsentarife und Octopus Heat",
+        "tariff_axis": "configured_recurring" if stromtarif_typ == "octopus_heat" else "market",
+        "timezone": TARIFF_TIMEZONE_NAME if stromtarif_typ == "octopus_heat" else None,
         "active": active_window is not None,
         "price_limit_ct": price_limit_ct,
         "min_duration_min": min_duration_min,
@@ -1445,7 +1540,7 @@ def run():
                 # 1. Speichere Rohdaten (für C++ Engine & Wallbox Kompatibilität)
                 if not published:
                     logger.error("Marktfreigabe sicher deaktiviert: %s", publish_reason)
-                    time.sleep(1800)
+                    time.sleep(PRICE_BOOST_PUBLISH_INTERVAL_S)
                     continue
                 logger.info(f"Spot-Preise gesichert ({len(data)} Einträge).")
 
@@ -1472,7 +1567,10 @@ def run():
 
             else:
                 if recover_or_disable_market(config):
-                    logger.warning("Konnte Spot-Preise nicht live laden; Ramdisk aus EPEX-Cache wiederhergestellt.")
+                    logger.warning(
+                        "Konnte Spot-Preise nicht live laden; Ramdisk aus EPEX-Cache wiederhergestellt "
+                        "oder lokale Tarifachse veröffentlicht."
+                    )
                 else:
                     # recover_or_disable_market hat bereits einen gesperrten Zustand publiziert.
                     logger.error("Konnte Spot-Preise von keinem Provider laden! Nächster Versuch in 5 Minuten.")
@@ -1486,7 +1584,7 @@ def run():
 
         # Aktualisiere stündlich (oder falls unglücklich gestartet, alle 30 min probieren, um keine Sprünge zu verpassen)
         # Die Strombörse wird täglich um 14:00 für den nächsten Tag veröffentlicht. Wir polen einfach alle 30 Mins.
-        time.sleep(1800)
+        time.sleep(PRICE_BOOST_PUBLISH_INTERVAL_S)
 
 if __name__ == "__main__":
     run()

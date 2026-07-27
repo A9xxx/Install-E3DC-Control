@@ -1,9 +1,9 @@
 {
-  "version": "5.4.2b",
+  "version": "5.4.2c",
   "min_version": "4.0.0",
-  "stable_release": "v5.4.2b",
+  "stable_release": "v5.4.2c",
   "release_date": "2026-07-27",
-  "description": "v5.4.2b - Versiegelter Übergang für laufende Alt-Updater",
+  "description": "v5.4.2c - Wallbox-Netzladeslots, Octopus Heat und Docker-Dokumentation",
   "installer_requires": "python3",
   "sanitized_republication": false,
   "history_transition": {

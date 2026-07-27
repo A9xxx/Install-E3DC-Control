@@ -46,6 +46,17 @@ except ModuleNotFoundError:
     from Heat import policy as heat_policy
     from heat_actuator_safety import default_heat_actuator_gate
 
+try:
+    from tariff_schedule import (
+        TARIFF_TIMEZONE_NAME,
+        tariff_type as configured_tariff_type,
+    )
+except ModuleNotFoundError:
+    from Installer.tariff_schedule import (
+        TARIFF_TIMEZONE_NAME,
+        tariff_type as configured_tariff_type,
+    )
+
 logger = logging.getLogger("EnergyManager")
 _SESSION_WRITE_WARNED = set()
 
@@ -1335,6 +1346,13 @@ FORCE_FLAG_FILE = "/var/www/html/ramdisk/force_bluelink.flag"
 V4_CONFIG_PATH = "/var/www/html/data/e3dc_v4.json"
 STORAGE_PLAN_PATH = "/var/www/html/ramdisk/storage_plan.json"
 PRICE_BOOST_PLAN_PATH = "/var/www/html/ramdisk/price_boost_plan.json"
+PRICE_BOOST_PLAN_MAX_AGE_S = 45 * 60
+PRICE_BOOST_CONSUMER_CONFIG = {
+    "battery": ("cheap_grid_battery_enable", True),
+    "wallbox": ("cheap_grid_wallbox_enable", False),
+    "heatpump": ("cheap_grid_heatpump_enable", False),
+    "heater": ("cheap_grid_heater_enable", False),
+}
 PREDUMP_PLAN_PATH = "/var/www/html/ramdisk/predump_consumer_plan.json"
 ENERGY_DECISION_LATEST_PATH = "/var/www/html/ramdisk/energy_decision_latest.json"
 EMS_DECISION_LATEST_PATH = default_surface_path("/var/www/html/ramdisk")
@@ -3264,46 +3282,122 @@ def get_v4_eco_score():
         logger.error(f"Fehler beim Lesen der V4 Eco-Score JSON: {e}")
     return None, None
 
+
+def _config_flag(value, default=False):
+    if value is None or str(value).strip() == "":
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def current_price_boost_consumer_allowed(config, device):
+    """Aktuelle Nutzerfreigaben sind ein hartes Veto gegen alte Pläne."""
+    if not isinstance(config, dict):
+        return False
+    if not _config_flag(config.get("cheap_grid_boost_enable"), False):
+        return False
+    consumer_contract = PRICE_BOOST_CONSUMER_CONFIG.get(str(device or "").strip().lower())
+    if consumer_contract is None:
+        return False
+    config_key, default = consumer_contract
+    return _config_flag(config.get(config_key), default)
+
+
+def _price_boost_plan_allows_device(plan, device):
+    """Lässt nur einen expliziten booleschen Verbraucher-Vertrag passieren."""
+    if not isinstance(plan, dict):
+        return False
+    allow = plan.get("allow")
+    if not isinstance(allow, dict):
+        return False
+    return allow.get(str(device or "").strip().lower()) is True
+
+
+def _read_price_boost_context(device):
+    """Liest aktuelle Freigabe und exakt dazugehörige Plan-Dateievidenz."""
+    try:
+        with open(V4_CONFIG_PATH, "r", encoding="utf-8") as handle:
+            config = json.load(handle)
+        if not current_price_boost_consumer_allowed(config, device):
+            return None, None
+
+        now_s = time.time()
+        with open(PRICE_BOOST_PLAN_PATH, "r", encoding="utf-8") as handle:
+            metadata = os.fstat(handle.fileno())
+            plan = json.load(handle)
+        if str((plan or {}).get("tariff_axis") or "") == "configured_recurring":
+            if configured_tariff_type(config) != "octopus_heat":
+                return None, None
+            file_age_s = now_s - float(metadata.st_mtime)
+            if file_age_s < 0.0 or file_age_s > PRICE_BOOST_PLAN_MAX_AGE_S:
+                return None, None
+        return plan, int(now_s * 1000)
+    except Exception:
+        return None, None
+
+
+def active_price_boost_window(plan, now_ms=None):
+    """Wertet nur frische konfigurierte Tariffenster an der Slotgrenze aus."""
+    if not isinstance(plan, dict) or not plan.get("enabled"):
+        return None
+    if plan.get("context_valid", True) is False or plan.get("release_valid", True) is False:
+        return None
+
+    now_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    recurring_axis = str(plan.get("tariff_axis") or "") == "configured_recurring"
+    if recurring_axis:
+        try:
+            generated_ms = int(plan.get("ts", 0) or 0)
+            valid_until_ms = int(plan.get("valid_until_ts_ms", 0) or 0)
+        except (TypeError, ValueError):
+            return None
+        if (
+            str(plan.get("timezone") or "") != TARIFF_TIMEZONE_NAME
+            or generated_ms <= 0
+            or now_ms < generated_ms
+            or now_ms - generated_ms > PRICE_BOOST_PLAN_MAX_AGE_S * 1000
+            or valid_until_ms < now_ms
+            or valid_until_ms > generated_ms + PRICE_BOOST_PLAN_MAX_AGE_S * 1000
+        ):
+            return None
+        candidates = plan.get("windows") if isinstance(plan.get("windows"), list) else []
+    else:
+        if not plan.get("active"):
+            return None
+        candidates = [plan.get("active_window") or {}]
+
+    for raw_window in candidates:
+        if not isinstance(raw_window, dict):
+            continue
+        try:
+            start_ms = int(raw_window.get("start_timestamp", 0) or 0)
+            end_ms = int(raw_window.get("end_timestamp", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if start_ms > 0 and start_ms <= now_ms < end_ms:
+            return raw_window
+    return None
+
+
 def price_boost_allows(device):
     """Zentraler EPEX-Preisboost: Geraete nur einschalten, wenn explizit erlaubt."""
-    try:
-        if os.path.exists(V4_CONFIG_PATH):
-            with open(V4_CONFIG_PATH, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-            if str(cfg.get("cheap_grid_boost_enable", 0)).strip().lower() not in ("1", "true", "yes", "on"):
-                return False
-        if not os.path.exists(PRICE_BOOST_PLAN_PATH):
-            return False
-        with open(PRICE_BOOST_PLAN_PATH, "r", encoding="utf-8") as f:
-            plan = json.load(f)
-        win = plan.get("active_window") or {}
-        now_ms = int(time.time() * 1000)
-        start_ms = int(win.get("start_timestamp", 0) or 0)
-        end_ms = int(win.get("end_timestamp", 0) or 0)
-        return bool(plan.get("enabled") and plan.get("active")
-                    and start_ms <= now_ms < end_ms
-                    and plan.get("allow", {}).get(device, False))
-    except Exception:
-        return False
+    plan, now_ms = _read_price_boost_context(device)
+    return bool(
+        active_price_boost_window(plan, now_ms=now_ms) is not None
+        and _price_boost_plan_allows_device(plan, device)
+    ) if isinstance(plan, dict) else False
 
 def price_boost_window_end_ts(device):
     """Return active cheap-grid window end timestamp in seconds for diagnostics/guards."""
+    plan, now_ms = _read_price_boost_context(device)
+    if not isinstance(plan, dict):
+        return None
     try:
-        if not os.path.exists(PRICE_BOOST_PLAN_PATH):
+        win = active_price_boost_window(plan, now_ms=now_ms)
+        if win is None or not _price_boost_plan_allows_device(plan, device):
             return None
-        with open(PRICE_BOOST_PLAN_PATH, "r", encoding="utf-8") as f:
-            plan = json.load(f)
-        win = plan.get("active_window") or {}
-        now_ms = int(time.time() * 1000)
-        start_ms = int(win.get("start_timestamp", 0) or 0)
         end_ms = int(win.get("end_timestamp", 0) or 0)
-        if not (
-            plan.get("enabled")
-            and plan.get("active")
-            and start_ms <= now_ms < end_ms
-            and plan.get("allow", {}).get(device, False)
-        ):
-            return None
         return end_ms / 1000.0 if end_ms > 0 else None
     except Exception:
         return None

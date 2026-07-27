@@ -6,6 +6,26 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.2c] – 2026-07-27
+
+### 🔌 Wallbox-Netzladeslot
+
+- 🐛 **Wirtschaftlicher Floor blockiert keinen gültigen Slot:** Ein frischer, ausdrücklich gültiger Modus-5-Netzladeslot wird nach bestandenen harten Schutzprüfungen nicht mehr durch `price_plan_storage_protect` beziehungsweise den Pre-Dump-Floor auf 0 A gesetzt.
+- 🛡️ **Speicher finanziert das Fahrzeug nicht:** Der Slot hält den Speicher in einem geschützten AUTO-Rahmen. Batterieentladung bleibt auf den nicht durch PV gedeckten Haus- und Wärmepumpenbedarf begrenzt; Wallboxleistung wird nicht als Speicherbedarf eingerechnet.
+- 🔐 **Harte Vorränge unverändert:** Nutzer-`Aus`, manuelle und Abort-Sperren, Notstromreserve, Hardware- und Netzlimits, Datenvalidität sowie fehlende oder veraltete Slots bleiben fail-closed. Ohne gültigen Slot bleibt der bisherige Pre-Dump-Stopp wirksam.
+
+### ♨️ Octopus Heat
+
+- 🕒 **Feste Niedrigtariffenster ohne Eco-Zwang:** Die Zeitfenster 02:00–06:00 und 12:00–16:00 werden über eine gemeinsame lokale Tarifzeitachse in `Europe/Berlin` materialisiert und funktionieren unabhängig vom netzdienlichen Eco-Modus.
+- 🧭 **Einheitlicher Tarifvertrag:** Wallbox-, EPEX- und Wärmepumpenpfad verwenden dieselbe neutrale Auflösung für wiederkehrende Tarife, ohne einen lokalen Tarif als Börsenpreis umzudeuten.
+- 🛡️ **Aktuelle Freigaben bleiben Pflicht:** Wärmepumpen-Automatik, Billigstrom- und Verbraucherfreigabe werden im aktuellen Zyklus erneut geprüft. Fehlerhafte, veraltete oder nach einem Tarifwechsel unpassende Planartefakte schließen sofort fail-closed.
+
+### 🐳 Docker und Release
+
+- 📖 **GHCR und Selbstbau getrennt:** Das veröffentlichte GHCR-Image bleibt der Normalweg. Ein lokaler Entwickler-Build verwendet einen vollständigen Checkout, den lokalen Tag `e3dc-control:local` und einen Compose-Override mit `pull_policy: never`; eine Registry ist dafür nicht erforderlich.
+- 🗄️ **Volume-Verträge erklärt:** Daten, Logs, root-private ML-Modelle und optionale Prognosebelege behalten getrennte Rechte-, Aufbewahrungs- und Backupverträge. Es findet keine stille Volume-Migration statt.
+- 🧹 **Browser-Cache:** Der Service-Worker verwendet die 5.4.2c-Kennung.
+
 ## [5.4.2b] – 2026-07-27
 
 ### 📦 Updater-Kompatibilität

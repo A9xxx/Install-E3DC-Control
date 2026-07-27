@@ -115,7 +115,7 @@ $paths = getInstallPaths();
     <div class="container">
         <div class="d-flex justify-content-between align-items-center mb-4">
             <a href="index.php" class="nav-link-back"><i class="fas fa-arrow-left me-2"></i>Dashboard</a>
-            <span class="badge bg-success text-light">v5.4.2b Stable</span>
+            <span class="badge bg-success text-light">v5.4.2c Stable</span>
         </div>
         <h1 class="display-4 fw-bold">Hilfe & Support</h1>
         <p class="lead opacity-75">Häufige Fragen und Lösungen rund um E3DC-Control.</p>
@@ -134,7 +134,7 @@ $paths = getInstallPaths();
         <div class="col-12 faq-item" data-tags="docker image stable rollback update">
             <div class="card bg-card border-0 shadow-sm"><div class="card-body">
                 <h5 class="card-title"><span class="tag">Docker</span> Wie prüfe ich Image und Update?</h5>
-                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem geprüften Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.2b</code> in <code>.env</code> gesetzt.</p>
+                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem geprüften Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.2c</code> in <code>.env</code> gesetzt.</p>
                 <pre>(
   set -euo pipefail
   docker compose config --images
@@ -207,6 +207,24 @@ $paths = getInstallPaths();
                         <li>Nach der Freigabe im Account den RESTful API Security Token erzeugen.</li>
                         <li>Im Config-Editor unter <em>Tarif</em> den ENTSO-E-Token als Fallback-Token eintragen und mit <em>ENTSO-E testen</em> prüfen.</li>
                     </ol>
+                </div>
+            </div>
+        </div>
+
+        <h4 class="mb-4 text-accent"><i class="fas fa-screwdriver-wrench me-2"></i>Stable-Hotfix 5.4.2c: Wallbox, Octopus Heat und Docker</h4>
+        <div class="col-12 faq-item" data-tags="5.4.2c stable hotfix wallbox modus 5 netzladen predump octopus heat eco docker">
+            <div class="card bg-card border-0 shadow-sm">
+                <div class="card-body">
+                    <h5 class="card-title">
+                        <span class="tag">5.4.2c</span>
+                        Was korrigiert das Stable-Release 5.4.2c?
+                    </h5>
+                    <ul>
+                        <li><strong>Wallbox-Netzladeslot:</strong> Ein frischer, ausdrücklich gültiger Modus-5-Netzladeslot fällt nach bestandenen harten Schutzprüfungen nicht mehr durch den rein wirtschaftlichen Pre-Dump-Floor auf 0 A.</li>
+                        <li><strong>Speicher bleibt geschützt:</strong> Der Slot erzwingt keine Batterieentladung für das Fahrzeug. Nutzer-<code>Aus</code>, manuelle Sperren, Notstromreserve, Hardwarelimits und Datenfrische bleiben vorrangig.</li>
+                        <li><strong>Octopus Heat:</strong> Die festen Niedrigtariffenster werden unabhängig vom Eco-Modus über eine lokale Tarifzeitachse abgebildet. Die Wärmepumpe benötigt weiterhin jede aktuelle Freigabe; veraltete oder unpassende Pläne schließen fail-closed.</li>
+                        <li><strong>Docker:</strong> Dokumentation und Compose-Hinweise unterscheiden den GHCR-Normalweg vom lokalen Entwickler-Selbstbau und erklären die getrennten Daten-, Log-, ML- und Prognosebeleg-Volumes.</li>
+                    </ul>
                 </div>
             </div>
         </div>

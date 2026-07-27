@@ -5,14 +5,14 @@ Updates werden ausschließlich über den Installer ausgeführt. Ein manuelles
 Release-Historie ungeeignet, weil alter und neuer Git-Stand nicht miteinander
 verwandt sein müssen.
 
-Der aktuelle Stable-Stand ist `v5.4.2b`. Der Hotfix korrigiert den Übergang
-eines bereits vor dem Zielwechsel gestarteten Alt-Updaters. Er bindet
-Installationswurzel, Ziel-Commit, Version, Tag und Finalizer-Dateien erneut und
-setzt die privilegierte Ausführung ausschließlich aus einem privaten,
-root-eigenen und schreibgeschützten Prüfsnapshot fort. Eine reine
-Bereinigungsabweichung nach erfolgreichem Finalizerlauf löst keinen falschen
-Rollback aus. Backup-, EMS- und Rückfallvertrag entsprechen unverändert
-`v5.4.2a`.
+Der aktuelle Stable-Stand ist `v5.4.2c`. Der Hotfix korrigiert die Priorität
+eines ausdrücklich gültigen Modus-5-Wallbox-Netzladeslots gegenüber dem rein
+wirtschaftlichen Pre-Dump-Floor und ergänzt für Octopus Heat eine lokale
+wiederkehrende Tarifzeitachse, die unabhängig vom Eco-Modus bleibt. Harte
+Nutzer-, Reserve-, Hardware- und Datenfrische-Sperren bleiben vorrangig.
+Außerdem trennt die Docker-Dokumentation den GHCR-Normalweg eindeutig vom
+lokalen Entwickler-Selbstbau. Der in `v5.4.2b` korrigierte, versiegelte
+Alt-Updater-Übergang bleibt unverändert erhalten.
 
 Die Konsolenbeispiele verwenden den zuvor geprüften absoluten Produktpfad:
 

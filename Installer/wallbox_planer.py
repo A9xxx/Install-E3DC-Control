@@ -33,6 +33,10 @@ try:
         _configured_billing_price_now as configured_billing_price_for_timestamp,
     )
     from .config_secret_permissions import apply_config_secret_permissions
+    from .tariff_schedule import (
+        tariff_type as configured_tariff_type,
+        uses_recurring_tariff_axis,
+    )
 except ImportError:  # Aufruf als Script-Modul direkt aus dem Installer-Verzeichnis
     from Wallbox.config import (
         get_config,
@@ -43,6 +47,10 @@ except ImportError:  # Aufruf als Script-Modul direkt aus dem Installer-Verzeich
         _configured_billing_price_now as configured_billing_price_for_timestamp,
     )
     from config_secret_permissions import apply_config_secret_permissions
+    from tariff_schedule import (
+        tariff_type as configured_tariff_type,
+        uses_recurring_tariff_axis,
+    )
 
 logger = logging.getLogger("WallboxManager.Planer")
 
@@ -77,25 +85,13 @@ _CANDIDATE_PLAN_FILES = (
 )
 _MAX_CANDIDATE_JSON_BYTES = 4 * 1024 * 1024
 
-_RECURRING_TARIFF_TYPES = frozenset({
-    "static",
-    "fix",
-    "fixed",
-    "flat",
-    "octopus_heat",
-    "special",
-    "spezial",
-    "special_tariff",
-})
-
-
 def _tariff_type(config):
-    return str((config or {}).get("stromtarif_typ", "static") or "static").strip().lower()
+    return configured_tariff_type(config)
 
 
 def _uses_recurring_tariff_axis(config):
     """True only for tariffs whose daily prices are fully defined by config."""
-    return _tariff_type(config) in _RECURRING_TARIFF_TYPES
+    return uses_recurring_tariff_axis(config)
 
 
 def _warn_missing_vehicle_soc(now=None):

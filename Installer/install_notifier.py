@@ -99,7 +99,7 @@ def migrate_telegram_tokens():
 def install_notifier(start_service=True, migrate_legacy_config=True):
     print("\n=== Benachrichtigungs-Dienst einrichten ===")
     user = get_install_user()
-    script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "notification_manager.py")
+    script_path = os.path.join(get_install_path(), "Installer", "notification_manager.py")
 
     if migrate_legacy_config:
         migrate_telegram_tokens()

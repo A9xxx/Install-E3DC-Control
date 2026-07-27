@@ -1,6 +1,6 @@
 # Speicher-Ladesteuerung - Systemablauf
 
-> **Stand:** v5.4.2, gegen den Release-Betriebsvertrag geprüft am 2026-07-26
+> **Stand:** v5.4.2a, gegen den Release-Betriebsvertrag geprüft am 2026-07-27
 >
 > **Dateien:** `Installer/storage_simulator.py`,
 > `Installer/storage_manager.py`, `Installer/storage_parallel_regulator.py`
@@ -135,6 +135,28 @@ Rahmen. E3/DC bleibt in AUTO und die Entladung für wechselnden Hausverbrauch
 bleibt offen. Die Funktion ist deshalb DC-first, aber keine physikalische
 Garantie für einen ausschließlich internen DC/DC-Energiepfad. Preis- und
 ausdrücklich freigegebenes Netzladen besitzen eigenständige Verträge.
+
+### 3.2 Ladefreigabe bei Kurvenrückstand
+
+Seit 5.4.2a gilt ein `EMS_USER_CHARGE_LIMIT`-Readback aus frischen, validen
+`POWER_SETTINGS` nur dann als reflektierter flüchtiger Laderahmen, wenn
+`maximumladeleistung` ausdrücklich konfiguriert ist und
+`EMS_USER_CHARGE_LIMIT` sowie `EMS_MAX_CHARGE_POWER` strikt weniger als 50 W
+voneinander abweichen. Fehlt eine dieser Bedingungen oder ist ein Wert
+veraltet, invalid beziehungsweise abweichend, bleibt `EMS_USER_CHARGE_LIMIT`
+als USER-Grenze wirksam.
+
+Liegt der Speicher hinter der Ladekurve, öffnet der Manager den Laderahmen in
+`AUTO` nur bei positiver, frischer E3/DC-only-Evidenz bis
+`MAX_CHARGE_POWER`. Eine unbekannte oder veraltete Pfadzuordnung genügt dafür
+nicht und bleibt fail-closed. Das ist kein aktiver Ladeauftrag:
+
+- Entladen für den Hausverbrauch bleibt offen.
+- Bei belegter zusätzlicher AC-PV wird der Laderahmen weiterhin sanft
+  nachgeführt und DC-first auf die frisch belegte interne E3/DC-PV-Leistung
+  begrenzt.
+- Der Pfad erteilt keine Netzladefreigabe und fordert weder `GRID` noch einen
+  anderen aktiven Ladebefehl an.
 
 ## 4. Verbraucherbudget
 

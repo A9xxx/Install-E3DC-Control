@@ -13,6 +13,8 @@ import urllib.request
 import hashlib
 import pwd
 import stat
+import tarfile
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -118,6 +120,14 @@ TARGET_FINALIZER_RELATIVE_FILES = (
     "Installer/release_finalize.py",
     "Installer/update.py",
 )
+TARGET_EXECUTION_SNAPSHOT_ROOT_FILES = (
+    "VERSION",
+    "installer_main.py",
+)
+TARGET_EXECUTION_SNAPSHOT_PARENT = "/run"
+TARGET_EXECUTION_SNAPSHOT_MAX_FILES = 4096
+TARGET_EXECUTION_SNAPSHOT_MAX_FILE_BYTES = 8 * 1024 * 1024
+TARGET_EXECUTION_SNAPSHOT_MAX_TOTAL_BYTES = 128 * 1024 * 1024
 
 
 def _is_docker_environment() -> bool:
@@ -2405,6 +2415,7 @@ def _verify_bound_target_state(
 def finalize_release_from_target(
     *,
     repo_dir: str,
+    execution_root: str,
     target_commit: str,
     target_tag: str,
     expected_role: str,
@@ -2416,12 +2427,18 @@ def finalize_release_from_target(
     expected_venv_path: str,
     headless: bool = True,
 ) -> None:
-    """Finalisiert einen Reset ausschließlich aus den geladenen Target-Dateien."""
+    """Finalisiert einen Reset ausschließlich aus dem versiegelten Commit-Snapshot."""
 
     target_root = _validate_bootstrap_install_path(repo_dir)
+    snapshot_root = _validate_bootstrap_install_path(execution_root)
     loaded_root = os.path.dirname(INSTALLER_DIR)
-    if os.path.realpath(loaded_root) != target_root or os.path.realpath(INSTALL_PATH) != target_root:
-        raise RuntimeError("Target-Finalizer wurde nicht aus dem gebundenen Zielbaum geladen")
+    if (
+        os.path.realpath(loaded_root) != snapshot_root
+        or os.path.realpath(INSTALL_PATH) != target_root
+        or os.path.realpath(os.environ.get("E3DC_BOOTSTRAP_ROOT", "")) != target_root
+        or os.path.realpath(os.environ.get("E3DC_BOOTSTRAP_RUNNER_ROOT", "")) != snapshot_root
+    ):
+        raise RuntimeError("Target-Finalizer wurde nicht aus dem versiegelten Ausführungssnapshot geladen")
     commit = _validate_full_commit(target_commit)
     tag = _normalize_release_tag(target_tag)
     role = str(expected_role or "").strip().lower()
@@ -2527,6 +2544,320 @@ def finalize_release_from_target(
     run_initial_forecast(os.path.join(target_root, "Installer"))
 
 
+def _target_execution_archive_entries(
+    *,
+    repo_dir: str,
+    target_commit: str,
+    install_user: str,
+) -> dict[str, tuple[bytes, int]]:
+    """Liest den vollständigen ausführbaren Installer-Baum direkt aus dem Commit."""
+
+    commit = _validate_full_commit(target_commit)
+    try:
+        completed = subprocess.run(
+            [
+                "sudo", "-H", "-u", str(install_user),
+                "git", "-c", "tar.umask=0022", "-C", str(repo_dir),
+                "archive", "--format=tar", commit, "--",
+                *TARGET_EXECUTION_SNAPSHOT_ROOT_FILES,
+                "Installer",
+            ],
+            capture_output=True,
+            text=False,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("Target-Ausführungssnapshot konnte nicht aus Git gelesen werden") from exc
+    if completed.returncode != 0:
+        detail = (completed.stderr or b"").decode("utf-8", errors="replace").strip()
+        raise RuntimeError("Target-Ausführungssnapshot fehlt im freigegebenen Commit: " + detail[-500:])
+    archive = bytes(completed.stdout or b"")
+    if not archive or len(archive) > TARGET_EXECUTION_SNAPSHOT_MAX_TOTAL_BYTES + (16 * 1024 * 1024):
+        raise RuntimeError("Target-Ausführungssnapshot besitzt eine unzulässige Archivgröße")
+
+    entries: dict[str, tuple[bytes, int]] = {}
+    total = 0
+    try:
+        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as bundle:
+            for member in bundle.getmembers():
+                relative_path = str(member.name or "").rstrip("/")
+                if not relative_path:
+                    continue
+                if (
+                    relative_path.startswith("/")
+                    or "\\" in relative_path
+                    or any(part in {"", ".", ".."} for part in Path(relative_path).parts)
+                    or not (
+                        relative_path in TARGET_EXECUTION_SNAPSHOT_ROOT_FILES
+                        or relative_path == "Installer"
+                        or relative_path.startswith("Installer/")
+                    )
+                ):
+                    raise RuntimeError("Target-Ausführungssnapshot enthält einen unzulässigen Pfad")
+                if member.isdir():
+                    continue
+                if not member.isfile() or member.islnk() or member.issym():
+                    raise RuntimeError(
+                        f"Target-Ausführungssnapshot enthält keinen regulären Blob: {relative_path}"
+                    )
+                if relative_path in entries:
+                    raise RuntimeError("Target-Ausführungssnapshot enthält einen doppelten Pfad")
+                mode = stat.S_IMODE(member.mode)
+                if mode not in {0o644, 0o755}:
+                    raise RuntimeError(
+                        f"Target-Ausführungssnapshot besitzt einen unzulässigen Git-Modus: {relative_path}"
+                    )
+                if member.size < 0 or member.size > TARGET_EXECUTION_SNAPSHOT_MAX_FILE_BYTES:
+                    raise RuntimeError(
+                        f"Target-Ausführungssnapshot besitzt eine unzulässige Dateigröße: {relative_path}"
+                    )
+                source = bundle.extractfile(member)
+                if source is None:
+                    raise RuntimeError(
+                        f"Target-Ausführungssnapshot konnte einen Blob nicht lesen: {relative_path}"
+                    )
+                payload = source.read(TARGET_EXECUTION_SNAPSHOT_MAX_FILE_BYTES + 1)
+                if len(payload) != member.size:
+                    raise RuntimeError(
+                        f"Target-Ausführungssnapshot besitzt eine driftende Blobgröße: {relative_path}"
+                    )
+                total += len(payload)
+                if (
+                    len(entries) >= TARGET_EXECUTION_SNAPSHOT_MAX_FILES
+                    or total > TARGET_EXECUTION_SNAPSHOT_MAX_TOTAL_BYTES
+                ):
+                    raise RuntimeError("Target-Ausführungssnapshot überschreitet die feste Größenbindung")
+                entries[relative_path] = (
+                    payload,
+                    0o555 if mode & 0o111 else 0o444,
+                )
+    except (tarfile.TarError, OSError) as exc:
+        raise RuntimeError("Target-Ausführungssnapshot besitzt kein gültiges Git-Archiv") from exc
+
+    required = set(TARGET_EXECUTION_SNAPSHOT_ROOT_FILES) | set(TARGET_FINALIZER_RELATIVE_FILES)
+    if not required.issubset(entries):
+        missing = ", ".join(sorted(required.difference(entries)))
+        raise RuntimeError("Target-Ausführungssnapshot ist unvollständig: " + missing)
+    return entries
+
+
+def _snapshot_file_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _verify_target_execution_snapshot(
+    snapshot_root: str,
+    entries: dict[str, tuple[bytes, int]],
+    *,
+    owner_uid: int,
+    owner_gid: int,
+) -> None:
+    """Bindet einen geschlossenen, nicht beschreibbaren Snapshot bytegenau."""
+
+    root = os.path.abspath(snapshot_root)
+    if os.path.realpath(root) != root:
+        raise RuntimeError("Target-Ausführungssnapshot darf kein Symlinkpfad sein")
+    parent_descriptor = _open_directory_nofollow(Path(root).parent)
+    try:
+        parent = os.fstat(parent_descriptor)
+        if (
+            not stat.S_ISDIR(parent.st_mode)
+            or parent.st_uid not in {0, owner_uid}
+            or parent.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            raise RuntimeError("Elternverzeichnis des Target-Ausführungssnapshots ist nicht vertrauenswürdig")
+    finally:
+        os.close(parent_descriptor)
+
+    expected_directories = {""}
+    for relative_path in entries:
+        parts = Path(relative_path).parts
+        for length in range(1, len(parts)):
+            expected_directories.add(Path(*parts[:length]).as_posix())
+
+    actual_directories = {""}
+    actual_files = set()
+    for directory, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
+        directory_path = Path(directory)
+        directory_relative = (
+            "" if directory_path == Path(root)
+            else directory_path.relative_to(root).as_posix()
+        )
+        metadata = os.lstat(directory)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != owner_uid
+            or metadata.st_gid != owner_gid
+            or stat.S_IMODE(metadata.st_mode) != 0o555
+        ):
+            raise RuntimeError(
+                f"Target-Ausführungssnapshot besitzt ein beschreibbares oder fremdes Verzeichnis: "
+                f"{directory_relative or '.'}"
+            )
+        actual_directories.add(directory_relative)
+        for name in list(dirnames):
+            candidate = directory_path / name
+            candidate_metadata = os.lstat(candidate)
+            if stat.S_ISLNK(candidate_metadata.st_mode) or not stat.S_ISDIR(candidate_metadata.st_mode):
+                raise RuntimeError("Target-Ausführungssnapshot enthält eine Symlink-/Nichtverzeichniskomponente")
+        for name in filenames:
+            candidate = directory_path / name
+            candidate_metadata = os.lstat(candidate)
+            if stat.S_ISLNK(candidate_metadata.st_mode) or not stat.S_ISREG(candidate_metadata.st_mode):
+                raise RuntimeError("Target-Ausführungssnapshot enthält eine nicht reguläre Datei")
+            actual_files.add(candidate.relative_to(root).as_posix())
+
+    if actual_directories != expected_directories or actual_files != set(entries):
+        raise RuntimeError("Target-Ausführungssnapshot besitzt nicht den exakt gebundenen Dateibaum")
+
+    for relative_path, (expected, expected_mode) in entries.items():
+        target = os.path.join(root, relative_path)
+        descriptor, before = _open_regular_file_nofollow(target)
+        try:
+            if (
+                before.st_nlink != 1
+                or before.st_uid != owner_uid
+                or before.st_gid != owner_gid
+                or stat.S_IMODE(before.st_mode) != expected_mode
+                or before.st_mode & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH)
+                or before.st_size != len(expected)
+            ):
+                raise RuntimeError(
+                    "Target-Ausführungssnapshot besitzt unzulässige Dateimetadaten: "
+                    + _target_metadata_detail(relative_path, before)
+                )
+            identity = _snapshot_file_identity(before)
+            actual = _read_descriptor_bytes(descriptor, len(expected))
+            after = os.fstat(descriptor)
+            if _snapshot_file_identity(after) != identity:
+                raise RuntimeError(
+                    f"Target-Ausführungssnapshot driftete während der Bindung: {relative_path}"
+                )
+            if actual != expected:
+                raise RuntimeError(
+                    f"Target-Ausführungssnapshot weicht bytegenau vom Commit ab: {relative_path}"
+                )
+        finally:
+            os.close(descriptor)
+
+
+def _create_target_execution_snapshot(
+    entries: dict[str, tuple[bytes, int]],
+    *,
+    snapshot_parent: str = TARGET_EXECUTION_SNAPSHOT_PARENT,
+) -> str:
+    """Erzeugt den Root-Finalizer-Baum zunächst privat und versiegelt ihn dann."""
+
+    owner_uid = os.geteuid()
+    owner_gid = os.getegid()
+    parent_descriptor = _open_directory_nofollow(snapshot_parent)
+    try:
+        parent = os.fstat(parent_descriptor)
+        if (
+            not stat.S_ISDIR(parent.st_mode)
+            or parent.st_uid not in {0, owner_uid}
+            or parent.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            raise RuntimeError("Snapshot-Elternverzeichnis ist nicht vertrauenswürdig")
+    finally:
+        os.close(parent_descriptor)
+
+    snapshot_root = tempfile.mkdtemp(
+        prefix=".e3dc-release-finalizer-",
+        dir=os.path.abspath(snapshot_parent),
+    )
+    directories = {Path(snapshot_root)}
+    try:
+        root_metadata = os.lstat(snapshot_root)
+        if (
+            not stat.S_ISDIR(root_metadata.st_mode)
+            or root_metadata.st_uid != owner_uid
+            or root_metadata.st_gid != owner_gid
+            or stat.S_IMODE(root_metadata.st_mode) != 0o700
+        ):
+            raise RuntimeError("Target-Ausführungssnapshot wurde nicht privat erzeugt")
+
+        for relative_path, (payload, final_mode) in sorted(entries.items()):
+            if final_mode not in {0o444, 0o555}:
+                raise RuntimeError("Target-Ausführungssnapshot enthält einen beschreibbaren Zielmodus")
+            target = Path(snapshot_root, relative_path)
+            target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            current = target.parent
+            while current != Path(snapshot_root):
+                directories.add(current)
+                current = current.parent
+            descriptor = os.open(
+                target,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            try:
+                view = memoryview(payload)
+                written = 0
+                while written < len(view):
+                    count = os.write(descriptor, view[written:])
+                    if count <= 0:
+                        raise RuntimeError("Target-Ausführungssnapshot konnte einen Blob nicht vollständig schreiben")
+                    written += count
+                os.fsync(descriptor)
+                os.fchmod(descriptor, final_mode)
+                sealed = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(sealed.st_mode)
+                    or sealed.st_nlink != 1
+                    or sealed.st_uid != owner_uid
+                    or sealed.st_gid != owner_gid
+                    or stat.S_IMODE(sealed.st_mode) != final_mode
+                    or sealed.st_size != len(payload)
+                ):
+                    raise RuntimeError("Target-Ausführungssnapshot konnte eine Datei nicht versiegeln")
+            finally:
+                os.close(descriptor)
+
+        for directory in sorted(directories, key=lambda item: len(item.parts), reverse=True):
+            os.chmod(directory, 0o555)
+        _verify_target_execution_snapshot(
+            snapshot_root,
+            entries,
+            owner_uid=owner_uid,
+            owner_gid=owner_gid,
+        )
+        return snapshot_root
+    except Exception:
+        _remove_target_execution_snapshot(snapshot_root)
+        raise
+
+
+def _remove_target_execution_snapshot(snapshot_root: str) -> None:
+    """Entfernt ausschließlich den selbst erzeugten, regulären Snapshotbaum."""
+
+    root = os.path.abspath(snapshot_root)
+    try:
+        metadata = os.lstat(root)
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise RuntimeError("Target-Ausführungssnapshot ist vor der Bereinigung kein Verzeichnis")
+    for directory, dirnames, _filenames in os.walk(root, topdown=True, followlinks=False):
+        for name in dirnames:
+            candidate = os.path.join(directory, name)
+            if stat.S_ISLNK(os.lstat(candidate).st_mode):
+                raise RuntimeError("Target-Ausführungssnapshot enthält vor der Bereinigung einen Symlink")
+        os.chmod(directory, 0o700)
+    shutil.rmtree(root)
+
+
 def _invoke_target_finalizer(
     *,
     repo_dir: str,
@@ -2547,25 +2878,11 @@ def _invoke_target_finalizer(
         )
         for relative_path in TARGET_FINALIZER_RELATIVE_FILES
     }
-    finalizer = os.path.join(repo_dir, "Installer", "release_finalize.py")
-    python = str(sys.executable or "")
-    if not os.path.isabs(python) or not os.access(python, os.X_OK):
-        raise RuntimeError("Python-Interpreter des Archiv-Runners ist nicht eindeutig ausführbar")
-
-    environment = dict(os.environ)
-    for name in (
-        "E3DC_BOOTSTRAP_ROOT",
-        "E3DC_BOOTSTRAP_RUNNER_ROOT",
-        "E3DC_BOOTSTRAP_USER",
-        "E3DC_BOOTSTRAP_VENV",
-        "PYTHONHOME",
-        "PYTHONPATH",
-    ):
-        environment.pop(name, None)
-    environment["E3DC_INSTALL_ROOT"] = repo_dir
-    environment["PYTHONNOUSERSITE"] = "1"
-    environment["LC_ALL"] = "C.UTF-8"
-    environment["LANG"] = "C.UTF-8"
+    snapshot_entries = _target_execution_archive_entries(
+        repo_dir=repo_dir,
+        target_commit=target_commit,
+        install_user=install_user,
+    )
 
     for relative_path, expected_identity in bound_target_files.items():
         current = os.lstat(os.path.join(repo_dir, relative_path))
@@ -2581,24 +2898,61 @@ def _invoke_target_finalizer(
         venv_path = str(package_transaction.venv_path or "")
         if not os.path.isabs(venv_path):
             raise RuntimeError("Paket-Preimage besitzt keinen absoluten venv-Pfad")
-    result = _run_argv(
-        [
-            python,
-            finalizer,
-            "--install-path", repo_dir,
-            "--expected-release-sha", target_commit,
-            "--expected-release-tag", target_tag,
-            "--expected-ha-role", state.ha_role,
-            "--expected-config-state", config_state,
-            "--expected-config-sha256", state.config_sha256,
-            "--expected-units-sha256", _transition_units_sha256(state.preinstalled_units),
-            "--expected-legacy-activity", state.legacy_e3dc_activity,
-            "--expected-venv-state", venv_state,
-            "--expected-venv-path", venv_path,
-        ],
-        timeout=900,
-        env=environment,
-    )
+
+    snapshot_root = _create_target_execution_snapshot(snapshot_entries)
+    finalizer = os.path.join(snapshot_root, "Installer", "release_finalize.py")
+    python = str(sys.executable or "")
+    if not os.path.isabs(python) or not os.access(python, os.X_OK):
+        _remove_target_execution_snapshot(snapshot_root)
+        raise RuntimeError("Python-Interpreter des Archiv-Runners ist nicht eindeutig ausführbar")
+
+    environment = dict(os.environ)
+    for name in (
+        "E3DC_BOOTSTRAP_ROOT",
+        "E3DC_BOOTSTRAP_RUNNER_ROOT",
+        "E3DC_BOOTSTRAP_USER",
+        "E3DC_BOOTSTRAP_VENV",
+        "PYTHONHOME",
+        "PYTHONPATH",
+    ):
+        environment.pop(name, None)
+    environment["E3DC_BOOTSTRAP_ROOT"] = repo_dir
+    environment["E3DC_BOOTSTRAP_RUNNER_ROOT"] = snapshot_root
+    environment["E3DC_INSTALL_ROOT"] = repo_dir
+    environment["PYTHONNOUSERSITE"] = "1"
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    environment["LC_ALL"] = "C.UTF-8"
+    environment["LANG"] = "C.UTF-8"
+    try:
+        _verify_target_execution_snapshot(
+            snapshot_root,
+            snapshot_entries,
+            owner_uid=os.geteuid(),
+            owner_gid=os.getegid(),
+        )
+        result = _run_argv(
+            [
+                python,
+                finalizer,
+                "--install-path", repo_dir,
+                "--expected-release-sha", target_commit,
+                "--expected-release-tag", target_tag,
+                "--expected-ha-role", state.ha_role,
+                "--expected-config-state", config_state,
+                "--expected-config-sha256", state.config_sha256,
+                "--expected-units-sha256", _transition_units_sha256(state.preinstalled_units),
+                "--expected-legacy-activity", state.legacy_e3dc_activity,
+                "--expected-venv-state", venv_state,
+                "--expected-venv-path", venv_path,
+            ],
+            timeout=900,
+            env=environment,
+        )
+    finally:
+        try:
+            _remove_target_execution_snapshot(snapshot_root)
+        except Exception as exc:
+            update_logger.warning("Target-Ausführungssnapshot konnte nicht bereinigt werden: %s", exc)
     marker = f"{TARGET_FINALIZER_SUCCESS} {target_commit} {target_tag}"
     lines = [line.strip() for line in result.get("stdout", "").splitlines()]
     if not result.get("success") or lines.count(marker) != 1:
@@ -2608,17 +2962,30 @@ def _invoke_target_finalizer(
         )
 
 
-def _file_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
+def _file_identity(metadata: os.stat_result) -> tuple[int, ...]:
     return (
         metadata.st_dev,
         metadata.st_ino,
         metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_uid,
+        metadata.st_gid,
         metadata.st_size,
         metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
     )
 
 
-def _read_bound_regular_file(path: str, maximum: int = 1024 * 1024) -> tuple[bytes, tuple[int, int, int, int, int]]:
+def _target_metadata_detail(relative_path: str, metadata: os.stat_result) -> str:
+    """Formatiert nur supportrelevante, nicht private Dateimetadaten."""
+    return (
+        f"{relative_path} "
+        f"(uid={metadata.st_uid}, gid={metadata.st_gid}, "
+        f"mode={stat.S_IMODE(metadata.st_mode):04o}, nlink={metadata.st_nlink})"
+    )
+
+
+def _read_bound_regular_file(path: str, maximum: int = 1024 * 1024) -> tuple[bytes, tuple[int, ...]]:
     descriptor, before = _open_regular_file_nofollow(path)
     try:
         if before.st_nlink != 1 or before.st_size < 1 or before.st_size > maximum:
@@ -2772,9 +3139,15 @@ def _normalize_target_finalizer_files(
         descriptor, before = _open_regular_file_nofollow(target)
         try:
             if before.st_nlink != 1:
-                raise RuntimeError("Target-Datei besitzt mehrere Hardlinks")
+                raise RuntimeError(
+                    "Target-Datei besitzt mehrere Hardlinks: "
+                    + _target_metadata_detail(relative_path, before)
+                )
             if before.st_uid not in (0, account.pw_uid):
-                raise RuntimeError("Target-Datei besitzt einen nicht vertrauenswürdigen Eigentümer")
+                raise RuntimeError(
+                    "Target-Datei besitzt einen nicht vertrauenswürdigen Eigentümer: "
+                    + _target_metadata_detail(relative_path, before)
+                )
             if before.st_size != len(expected):
                 raise RuntimeError("Target-Dateigröße stimmt nicht mit dem freigegebenen Commit überein")
             if _read_descriptor_bytes(descriptor, len(expected)) != expected:
@@ -2802,7 +3175,9 @@ def _normalize_target_finalizer_files(
             os.close(descriptor)
         current_path = os.lstat(target)
         if (
-            current_path.st_dev != before.st_dev
+            not stat.S_ISREG(current_path.st_mode)
+            or current_path.st_nlink != 1
+            or current_path.st_dev != before.st_dev
             or current_path.st_ino != before.st_ino
             or current_path.st_uid != account.pw_uid
             or current_path.st_gid != account.pw_gid
@@ -2817,7 +3192,7 @@ def _bind_target_file_to_commit(
     target_commit: str,
     relative_path: str,
     install_user: str,
-) -> tuple[int, int, int, int, int]:
+) -> tuple[int, ...]:
     target = os.path.join(os.path.abspath(repo_dir), relative_path)
     payload, identity = _read_bound_regular_file(target)
     metadata = os.lstat(target)
@@ -2826,7 +3201,10 @@ def _bind_target_file_to_commit(
     except KeyError as exc:
         raise RuntimeError("Installationsbenutzer für Target-Bindung fehlt") from exc
     if metadata.st_uid not in (0, account.pw_uid) or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-        raise RuntimeError("Target-Datei besitzt keine vertrauenswürdigen Eigentümer-/Schreibrechte")
+        raise RuntimeError(
+            "Target-Datei besitzt keine vertrauenswürdigen Eigentümer-/Schreibrechte: "
+            + _target_metadata_detail(relative_path, metadata)
+        )
     expected = _read_commit_blob(
         repo_dir,
         target_commit,

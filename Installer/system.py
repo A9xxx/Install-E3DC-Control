@@ -233,7 +233,7 @@ def install_system_packages(use_venv=True):
         install_python_packages()
 
     # WebSocket Service am Ende der Paket-Installation mit einrichten
-    installer_dir = os.path.dirname(os.path.abspath(__file__))
+    installer_dir = os.path.join(get_install_path(), "Installer")
     ws_script = os.path.join(installer_dir, "e3dc_websocket.py")
     if os.path.exists(ws_script):
         setup_websocket_service()
@@ -271,7 +271,7 @@ def setup_websocket_service(start_service=True):
     print("→ Richte e3dc-websocket Service ein...")
     install_user = get_install_user()
     install_path = get_install_path()
-    installer_dir = os.path.dirname(os.path.abspath(__file__))
+    installer_dir = os.path.join(install_path, "Installer")
 
     service_content = f"""[Unit]
 Description=E3DC WebSocket Server fuer fluessige Dashboard Animationen

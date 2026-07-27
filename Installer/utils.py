@@ -140,9 +140,10 @@ def setup_logging():
     if _logging_initialized:
         return
 
-    # Logfile im Ordner Logs oberhalb von Installer
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    log_dir = os.path.join(os.path.dirname(script_dir), "logs")
+    # Bei einem Release-Bootstrap läuft dieses Modul aus einem versiegelten
+    # Ausführungssnapshot. Installationslogs gehören dennoch ausschließlich
+    # in den explizit gebundenen Produktbaum.
+    log_dir = os.path.join(get_install_path(), "logs")
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, "install.log")
 
@@ -722,7 +723,7 @@ def install_system_packages(use_venv=True):
             return False
 
     # WebSocket Service am Ende der Paket-Installation mit einrichten
-    installer_dir = os.path.dirname(os.path.abspath(__file__))
+    installer_dir = os.path.join(get_install_path(), "Installer")
     ws_script = os.path.join(installer_dir, "e3dc_websocket.py")
     if os.path.exists(ws_script):
         setup_websocket_service()
@@ -763,7 +764,7 @@ def setup_websocket_service():
     print("→ Richte e3dc-websocket Service ein...")
     install_user = get_install_user()
     install_path = get_install_path()
-    installer_dir = os.path.dirname(os.path.abspath(__file__))
+    installer_dir = os.path.join(get_install_path(), "Installer")
 
     service_content = f"""[Unit]
 Description=E3DC WebSocket Server fuer fluessige Dashboard Animationen
@@ -816,8 +817,9 @@ def _create_service_file(
     install_user = get_install_user()
     service_path = f"/etc/systemd/system/{service_name}.service"
 
-    # 100% bombensichere Pfad-Ermittlung durch __file__ (Ort dieses Skripts)!
-    installer_dir = os.path.dirname(os.path.abspath(__file__))
+    # Der Code kann aus einem versiegelten Release-Snapshot importiert sein.
+    # Units dürfen ausschließlich auf den gebundenen Produktbaum zeigen.
+    installer_dir = os.path.join(get_install_path(), "Installer")
 
     script_abs_path = os.path.normpath(os.path.join(installer_dir, python_script_rel_path))
     working_dir = os.path.dirname(script_abs_path)
@@ -908,7 +910,7 @@ def install_e3dc_live_service(start_service=True):
     install_user = get_install_user()
     service_path = "/etc/systemd/system/e3dc-live.service"
 
-    installer_dir = os.path.dirname(os.path.abspath(__file__))
+    installer_dir = os.path.join(get_install_path(), "Installer")
     script_path = os.path.join(installer_dir, "e3dc_live.py")
 
     if not os.path.exists(script_path):

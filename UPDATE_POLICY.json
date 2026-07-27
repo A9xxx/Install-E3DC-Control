@@ -1,9 +1,9 @@
 {
-  "version": "5.4.2",
+  "version": "5.4.2a",
   "min_version": "4.0.0",
-  "stable_release": "v5.4.2",
+  "stable_release": "v5.4.2a",
   "release_date": "2026-07-27",
-  "description": "v5.4.2 - Speicherplanung, Lastspitzenbegrenzung und Prognosediagnose",
+  "description": "v5.4.2a - Speicher-Ladefreigabe und Alt-Updater-Kompatibilität",
   "installer_requires": "python3",
   "sanitized_republication": false,
   "history_transition": {

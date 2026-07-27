@@ -208,10 +208,10 @@ def load_config():
         "hs_min_change_w":      "100",
         # Shelly Pro3EM WP-Integration (wp_type=3)
         "shelly_3em_ip":        "0.0.0.0",
-        "shelly_3em_relay_id":  "0",
+        "shelly_3em_relay_id":  "-1",
         "shelly_3em_wp_min_w":  "1000",
         "shelly_3em_wp_max_w":  "3000",
-        "shelly_3em_enable":    "1",
+        "shelly_3em_enable":    "0",
         "wp_min_runtime_min":    "30",
         "wp_restart_block_min":  "20",
         "heat_policy_runtime_enable": "0",
@@ -1069,24 +1069,31 @@ def control_cycle(cfg, live, hs_state, safety_gate=None):
     sh_ip         = str(cfg.get("shelly_heiz_ip", "0.0.0.0")).strip()
     sh_nominal_w  = cfg_float(cfg, "shelly_heiz_w", 1500, min_value=0)
     s3_ip         = str(cfg.get("shelly_3em_ip", "0.0.0.0")).strip()
-    s3_relay      = cfg_int(cfg, "shelly_3em_relay_id", "0")
-    s3_enable     = str(cfg.get("shelly_3em_enable", "1")).strip().lower() in ("1", "true", "yes", "on")
+    s3_relay      = cfg_int(cfg, "shelly_3em_relay_id", "-1")
+    s3_enable     = str(cfg.get("shelly_3em_enable", "0")).strip().lower() in ("1", "true", "yes", "on")
     s3_min_w      = cfg_float(cfg, "shelly_3em_wp_min_w", "1000", min_value=0)
     s3_max_w      = cfg_float(cfg, "shelly_3em_wp_max_w", "3000", min_value=0)
     s3_min_runtime_s = cfg_float(cfg, "wp_min_runtime_min", 30, min_value=0) * 60.0
     s3_restart_block_s = cfg_float(cfg, "wp_restart_block_min", 20, min_value=0) * 60.0
     wp_type       = str(cfg.get("wp_type", "0")).strip()
+    heater_module_enabled = wp_type == "2" or cfg_bool(cfg, "heizstab", False)
     has_s3em      = wp_type == "3" and s3_ip not in ("", "0.0.0.0")
+    s3_relay_auto_mode = global_auto and s3_enable and s3_relay >= 0
 
-    has_hs  = hs_ip not in ("", "0.0.0.0")
-    has_sh  = sh_ip not in ("", "0.0.0.0")
+    hs_configured = hs_ip not in ("", "0.0.0.0")
+    sh_configured = sh_ip not in ("", "0.0.0.0")
+    has_hs  = heater_module_enabled and hs_configured
+    has_sh  = heater_module_enabled and sh_configured
     is_elwa = hs_type == "mypv_elwa"
     elwa_status_code = None
 
     # Anti-Oszillation: beruecksichtige laufende Heizstab-Last in Surplus-Berechnung.
-    current_hs_w = hs_state.get('current_w', 0)
+    # Ein im vorherigen Zyklus laufender Heizstab darf nach heizstab=0 nicht
+    # als vermeintlich frei werdender Überschuss eine separate WP starten.
+    current_hs_w = hs_state.get('current_w', 0) if heater_module_enabled and auto_mode else 0
     netpoint_surplus_w = calc_netpoint_surplus(live, current_hs_power_w=current_hs_w, cfg=cfg)
     surplus_w = calc_surplus(live, current_hs_power_w=current_hs_w, cfg=cfg)
+    s3_surplus_w = surplus_w
     predump_heater_budget_w = read_predump_heater_budget(cfg)
     raw_market_heater_budget_w, market_heater_ctx = market_heater_budget(
         cfg,
@@ -1122,6 +1129,9 @@ def control_cycle(cfg, live, hs_state, safety_gate=None):
         "wp_is_running":    False,
         "wp_relay_on":      False,
         "wp_takt_protect_active": False,
+        "wp_relay_auto_mode": s3_relay_auto_mode,
+        "wp_surplus_w":     round(s3_surplus_w),
+        "heizstab_enabled": heater_module_enabled,
         "hs_auto_mode":     auto_mode,
         "hs_global_auto":   global_auto,
         "hs_manual_override": None,
@@ -1208,6 +1218,58 @@ def control_cycle(cfg, live, hs_state, safety_gate=None):
         status["wp_nominal_w"] = round(s3_max_w)
         update_shelly_3em_measurement(status, s3_ip, s3_min_w)
 
+    if not heater_module_enabled:
+        status["hs_mode"] = "disabled"
+        status["hs_reason"] = "Heizstab/BWWP deaktiviert"
+        release_ok = True
+        release_needed = not bool(hs_state.get("heater_module_off_confirmed", False))
+        if release_needed and hs_configured:
+            if not MODBUS_OK or not elwa_modbus_available:
+                release_ok = False
+            elif is_elwa:
+                release_ok = _invoke_actuator(
+                    elwa_set_power,
+                    hs_ip,
+                    hs_port,
+                    0,
+                    safety_gate=safety_gate,
+                ) and release_ok
+            else:
+                release_ok = _invoke_actuator(
+                    heizstab_set_power,
+                    hs_ip,
+                    hs_port,
+                    0,
+                    safety_gate=safety_gate,
+                ) and release_ok
+        if release_needed and sh_configured:
+            release_ok = _invoke_actuator(
+                shelly_set_state,
+                sh_ip,
+                False,
+                safety_gate=safety_gate,
+            ) and release_ok
+        if release_ok:
+            status["Heizstab_Power"] = 0
+            status["hs_actual_w"] = 0
+            status["hs_target_w"] = 0
+            status["hs_requested_w"] = 0
+            status["hs_active"] = False
+            status["shelly_heiz_on"] = False
+            hs_state["is_on"] = False
+            hs_state["current_w"] = 0
+            hs_state["heater_module_off_confirmed"] = True
+        else:
+            status["success"] = False
+            status["hs_reason"] = "Heizstab/BWWP AUS nicht sicher bestätigt"
+            hs_state["heater_module_off_confirmed"] = False
+        # Pro3EM-Messung und eine separat freigegebene WP-Relaissteuerung
+        # bleiben unabhängig vom ausgeschalteten Zusatz-Heizstab erhalten.
+        if not has_s3em:
+            return _with_actuator_safety_status(status, safety_gate)
+    else:
+        hs_state["heater_module_off_confirmed"] = False
+
     if is_elwa and has_hs and not elwa_modbus_available and not has_sh:
         # ELWA ist das einzige Verbraucher-Modul und Modbus ist gerade offline.
         # Keine weiteren 0W-/Sollwert-Schreibversuche bis zum Backoff-Ende.
@@ -1281,7 +1343,7 @@ def control_cycle(cfg, live, hs_state, safety_gate=None):
     status["market_plan_negative_price"] = bool(market_heater_ctx.get("negative_price"))
     status["surplus_w"] = round(surplus_w)
 
-    manual_override = read_manual_override()
+    manual_override = read_manual_override() if heater_module_enabled else None
     if manual_override:
         manual_mode = str(manual_override.get("mode", "")).strip().lower()
         status["hs_manual_override"] = manual_mode
@@ -1363,19 +1425,6 @@ def control_cycle(cfg, live, hs_state, safety_gate=None):
                 release_ok = shelly_off_ok and release_ok
                 if shelly_off_ok:
                     status["shelly_heiz_on"] = False
-            if has_s3em and s3_enable and s3_relay >= 0:
-                # Ein Kontextverlust darf eine bereits laufende Wärmepumpe nie stoppen.
-                s3_off_ok = _invoke_actuator(
-                    shelly_3em_set_relay,
-                    s3_ip,
-                    s3_relay,
-                    False,
-                    safety_gate=safety_gate,
-                )
-                release_ok = s3_off_ok and release_ok
-                if s3_off_ok:
-                    hs_state["s3em_on"] = False
-                    status["wp_relay_on"] = False
             if release_ok:
                 status["Heizstab_Power"] = 0
                 status["hs_actual_w"] = 0
@@ -1389,48 +1438,100 @@ def control_cycle(cfg, live, hs_state, safety_gate=None):
                 status["hs_reason"] = "Manuell AUS fehlgeschlagen: Safe-Readback nicht bestätigt"
             return _with_actuator_safety_status(status, safety_gate)
 
-    if not auto_mode:
-        # Explizit stoppen - nicht im alten Zustand belassen!
-        status["hs_reason"] = "Globale Automatik deaktiviert - Geraete auf Idle" if not global_auto else "Auto-Modus deaktiviert - Heizstab gestoppt"
+    if auto_mode:
+        hs_state["heater_auto_off_confirmed"] = False
+    else:
+        # Der lokale Heizstab-Schalter stoppt ausschließlich Heizstab/BWWP.
+        # Eine separat freigegebene Pro3EM-WP bleibt davon unabhängig.
+        status["hs_reason"] = (
+            "Globale Automatik deaktiviert - Geräte auf Idle"
+            if not global_auto
+            else "Auto-Modus deaktiviert - Heizstab gestoppt"
+        )
+        heater_drifted_on = bool(
+            float(status.get("hs_actual_w", 0) or 0) > 0
+            or float(status.get("hs_target_w", 0) or 0) > 0
+            or status.get("shelly_heiz_on")
+            or hs_state.get("is_on")
+            or float(hs_state.get("current_w", 0) or 0) > 0
+        )
+        if heater_drifted_on:
+            hs_state["heater_auto_off_confirmed"] = False
+        release_needed = not bool(hs_state.get("heater_auto_off_confirmed", False))
         release_ok = True
-        if has_hs and MODBUS_OK and elwa_modbus_available:
-            if is_elwa:
-                heater_off_ok = _invoke_actuator(elwa_set_power, hs_ip, hs_port, 0, safety_gate=safety_gate)
+        if release_needed and has_hs:
+            if not MODBUS_OK or not elwa_modbus_available:
+                release_ok = False
+            elif is_elwa:
+                release_ok = _invoke_actuator(
+                    elwa_set_power,
+                    hs_ip,
+                    hs_port,
+                    0,
+                    safety_gate=safety_gate,
+                ) and release_ok
             else:
-                heater_off_ok = _invoke_actuator(heizstab_set_power, hs_ip, hs_port, 0, safety_gate=safety_gate)
-            release_ok = heater_off_ok and release_ok
-            if heater_off_ok:
-                status["Heizstab_Power"] = 0
-                status["hs_actual_w"] = 0
-                status["hs_target_w"] = 0
-                status["hs_active"] = False
-                hs_state['is_on'] = False
-                hs_state['current_w'] = 0
-                print(f"  -> Heizstab 0W gesetzt (Auto-Modus AUS)")
-        if has_sh and status.get("shelly_heiz_on"):
-            shelly_off_ok = _invoke_actuator(shelly_set_state, sh_ip, False, safety_gate=safety_gate)
-            release_ok = shelly_off_ok and release_ok
-            if shelly_off_ok:
-                status["shelly_heiz_on"] = False
-                print(f"  -> Shelly AUS gesetzt (Auto-Modus AUS)")
-        if has_s3em and s3_enable and s3_relay >= 0:
-            s3_off_ok = _invoke_actuator(
-                shelly_3em_set_relay,
-                s3_ip,
-                s3_relay,
+                release_ok = _invoke_actuator(
+                    heizstab_set_power,
+                    hs_ip,
+                    hs_port,
+                    0,
+                    safety_gate=safety_gate,
+                ) and release_ok
+        if release_needed and has_sh:
+            release_ok = _invoke_actuator(
+                shelly_set_state,
+                sh_ip,
                 False,
                 safety_gate=safety_gate,
-            )
-            release_ok = s3_off_ok and release_ok
-            if s3_off_ok:
-                hs_state["s3em_on"] = False
-                status["wp_relay_on"] = False
-                print(f"  -> Shelly Pro3EM Relais {s3_relay} AUS gesetzt (Auto-Modus AUS)")
-        elif has_s3em and not (has_hs or has_sh):
-            status["hs_reason"] = "WP nur Messung - keine Relaissteuerung"
-        if not release_ok:
+            ) and release_ok
+        if release_ok:
+            status["Heizstab_Power"] = 0
+            status["hs_actual_w"] = 0
+            status["hs_target_w"] = 0
+            status["hs_requested_w"] = 0
+            status["hs_active"] = False
+            status["shelly_heiz_on"] = False
+            hs_state["is_on"] = False
+            hs_state["current_w"] = 0
+            hs_state["heater_auto_off_confirmed"] = True
+            if release_needed and (has_hs or has_sh):
+                print("  -> Heizstab/BWWP AUS gesetzt und bestätigt")
+        else:
             status["success"] = False
             status["hs_reason"] = "Auto AUS fehlgeschlagen: Safe-Readback nicht bestätigt"
+            hs_state["heater_auto_off_confirmed"] = False
+
+        if not global_auto and has_s3em and s3_enable and s3_relay >= 0:
+            s3_release_needed = bool(
+                hs_state.get("s3em_on")
+                or not hs_state.get("s3em_auto_off_confirmed", False)
+            )
+            s3_release_ok = True
+            if s3_release_needed:
+                s3_release_ok = _invoke_actuator(
+                    shelly_3em_set_relay,
+                    s3_ip,
+                    s3_relay,
+                    False,
+                    safety_gate=safety_gate,
+                )
+            if s3_release_ok:
+                hs_state["s3em_on"] = False
+                hs_state["s3em_auto_off_confirmed"] = True
+                status["wp_relay_on"] = False
+            else:
+                status["success"] = False
+                status["hs_reason"] = "Globale Automatik AUS: WP-Relais nicht sicher bestätigt"
+                hs_state["s3em_auto_off_confirmed"] = False
+        elif s3_relay_auto_mode:
+            hs_state["s3em_auto_off_confirmed"] = False
+
+        # Nutzer-Aus bleibt für den Heizstab ein hartes Veto. Nur die explizit
+        # freigegebene Pro3EM-WP darf bei lokalem hs_auto_mode=0 weiterlaufen.
+        if not (has_s3em and s3_relay_auto_mode):
+            if has_s3em and not s3_enable:
+                status["hs_reason"] = "WP nur Messung - keine Relaissteuerung"
             return _with_actuator_safety_status(status, safety_gate)
 
     # --- PV-Ueberschuss-Regelung mit Hysterese ---
@@ -1440,6 +1541,8 @@ def control_cycle(cfg, live, hs_state, safety_gate=None):
         should_run = (soc_ok and surplus_w > threshold_off_w) or ((not soc_ok) and surplus_w >= threshold_on_w)
     else:
         should_run = surplus_w >= threshold_on_w
+    if not auto_mode:
+        should_run = False
     if heat_policy_runtime_enabled and heat_policy_decision.target_state == heat_policy.TARGET_BLOCKED:
         should_run = False
 
@@ -1534,7 +1637,9 @@ def control_cycle(cfg, live, hs_state, safety_gate=None):
                 status["hs_reason"] = "Shelly EIN nicht bestätigt"
 
     else:
-        if heat_policy_runtime_enabled and heat_policy_decision.target_state == heat_policy.TARGET_BLOCKED:
+        if not auto_mode:
+            pass
+        elif heat_policy_runtime_enabled and heat_policy_decision.target_state == heat_policy.TARGET_BLOCKED:
             status["hs_reason"] = heat_policy_decision.block_reason
             status["hs_mode"] = "blocked"
         elif heat_policy_runtime_enabled and raw_market_heater_budget_w > 0 and market_heater_budget_w <= 0:
@@ -1546,7 +1651,7 @@ def control_cycle(cfg, live, hs_state, safety_gate=None):
             status["hs_reason"] = f"PV-Ueberschuss zu gering ({surplus_w:.0f}W < {threshold_off_w:.0f}W Ausschalt-Schwelle)"
 
         aux_release_ok = True
-        if has_hs and MODBUS_OK and elwa_modbus_available:
+        if auto_mode and has_hs and MODBUS_OK and elwa_modbus_available:
             heater_off_ok = True
             if is_elwa:
                 if is_currently_on or float(hs_state.get('current_w', 0) or 0) > 0:
@@ -1572,7 +1677,7 @@ def control_cycle(cfg, live, hs_state, safety_gate=None):
                 status["hs_reason"] = "Heizstab AUS fehlgeschlagen: Register-Readback nicht bestätigt"
                 aux_release_ok = False
 
-        if has_sh and status.get("shelly_heiz_on"):
+        if auto_mode and has_sh and status.get("shelly_heiz_on"):
             shelly_off_ok = _invoke_actuator(shelly_set_state, sh_ip, False, safety_gate=safety_gate)
             if shelly_off_ok:
                 status["shelly_heiz_on"] = False
@@ -1588,7 +1693,7 @@ def control_cycle(cfg, live, hs_state, safety_gate=None):
     # ══ SHELLY PRO3EM WÄRMEPUMPE (wp_type=3) ══
     if has_s3em:
         # Relais-Steuerung (nur wenn s3_enable=1 und relay_id >= 0)
-        if s3_enable and auto_mode and s3_relay >= 0:
+        if s3_relay_auto_mode:
             # WP hat Mindestleistung: Einschalten nur bei genügend Überschuss
             wp_is_on = status.get("wp_is_running", False) or hs_state.get("s3em_on", False)
             wallbox_transition = wallbox_phase_transition_active()
@@ -1598,7 +1703,7 @@ def control_cycle(cfg, live, hs_state, safety_gate=None):
             should_wp = shelly_wp_relay_should_run(
                 wp_is_on=wp_is_on,
                 soc_ok=soc_ok,
-                surplus_w=surplus_w,
+                surplus_w=s3_surplus_w,
                 threshold_on_w=threshold_on_w,
                 threshold_off_w=threshold_off_w,
                 wp_min_w=s3_min_w,
@@ -1627,7 +1732,7 @@ def control_cycle(cfg, live, hs_state, safety_gate=None):
                     status["wp_restart_block_remaining_s"] = round(restart_left_s)
                     status["hs_reason"] = (
                         f"WP Wiedereinschaltsperre aktiv: noch {restart_left_s/60:.1f} Min "
-                        f"(Überschuss {surplus_w:.0f}W)"
+                        f"(Überschuss {s3_surplus_w:.0f}W)"
                     )
                     print(f"  [3EM] WP Relais bleibt AUS (Wiedereinschaltsperre {restart_left_s/60:.1f} Min)")
                     return _with_actuator_safety_status(status, safety_gate)
@@ -1638,7 +1743,7 @@ def control_cycle(cfg, live, hs_state, safety_gate=None):
                     status["wp_relay_on"] = True
                     status["wp_takt_protect_active"] = False
                     status["wp_min_runtime_remaining_s"] = round(s3_min_runtime_s)
-                    status["hs_reason"] = (f"WP EIN: Ueberschuss {surplus_w:.0f}W >= "
+                    status["hs_reason"] = (f"WP EIN: Ueberschuss {s3_surplus_w:.0f}W >= "
                                            f"{s3_min_w:.0f}W Min-WP (SOC {soc:.0f}%)")
                     print(f"  [3EM] -> WP Relais {s3_relay} EINgeschaltet")
                 else:
@@ -1653,7 +1758,7 @@ def control_cycle(cfg, live, hs_state, safety_gate=None):
                     status["wp_min_runtime_remaining_s"] = round(runtime_left_s)
                     status["hs_reason"] = (
                         f"WP Mindestlaufzeit aktiv: noch {runtime_left_s/60:.1f} Min "
-                        f"(Überschuss {surplus_w:.0f}W < {threshold_off_w:.0f}W)"
+                        f"(Überschuss {s3_surplus_w:.0f}W < {threshold_off_w:.0f}W)"
                     )
                     print(f"  [3EM] WP Relais bleibt EIN (Mindestlaufzeit {runtime_left_s/60:.1f} Min)")
                     return _with_actuator_safety_status(status, safety_gate)
@@ -1665,7 +1770,7 @@ def control_cycle(cfg, live, hs_state, safety_gate=None):
                     status["wp_takt_protect_active"] = False
                     status["wp_restart_block_remaining_s"] = round(s3_restart_block_s)
                     reason_off = (f"SOC zu niedrig ({soc:.0f}% < {min_soc}%)" if not soc_ok
-                                  else f"Ueberschuss zu gering ({surplus_w:.0f}W < {threshold_off_w:.0f}W)")
+                                  else f"Ueberschuss zu gering ({s3_surplus_w:.0f}W < {threshold_off_w:.0f}W)")
                     status["hs_reason"] = f"WP AUS: {reason_off}"
                     print(f"  [3EM] -> WP Relais {s3_relay} AUSgeschaltet ({reason_off})")
                 else:

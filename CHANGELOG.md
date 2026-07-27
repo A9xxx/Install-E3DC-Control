@@ -6,6 +6,34 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.2a] – 2026-07-27
+
+### 🔋 Speicher-Ladefreigabe
+
+- 🐛 **Keine Selbst-Rückkopplung:** Ein `EMS_USER_CHARGE_LIMIT`-Readback aus frischen, validen `POWER_SETTINGS` gilt nur dann als reflektierter flüchtiger Laderahmen, wenn `maximumladeleistung` ausdrücklich konfiguriert ist und `EMS_USER_CHARGE_LIMIT` sowie `EMS_MAX_CHARGE_POWER` strikt weniger als 50 W voneinander abweichen. Bei fehlenden, veralteten, invaliden oder abweichenden Werten bleibt die USER-Grenze wirksam.
+- 🌞 **Kurvenrückstand mit belegtem E3/DC-Pfad:** Liegt der Speicher hinter seiner Ladekurve, öffnet der Manager den Laderahmen in `AUTO` nur bei positiver, frischer E3/DC-only-Evidenz bis `MAX_CHARGE_POWER`. Unbekannte oder veraltete Pfadzuordnung bleibt fail-closed; die Entladung für den Hausverbrauch bleibt offen.
+- 🧭 **Externe AC-PV bleibt DC-first:** Bei belegter zusätzlicher AC-PV wird der Laderahmen nicht voll geöffnet, sondern weiterhin sanft nachgeführt und auf die frisch belegte interne E3/DC-PV-Leistung begrenzt. Zusätzliche AC-PV wird nicht als E3/DC-DC-Leistung umgedeutet.
+- 🛡️ **Keine Netzladefreigabe:** Die Korrektur fordert weder `GRID` noch einen aktiven Ladebefehl an. Preis-, Lastspitzen- und andere ausdrücklich freigegebene Netzladepfade behalten ihre getrennten Verträge; Nutzer-`Aus`, Notstromreserve und Hardwarelimits bleiben vorrangig.
+
+### 📦 Alt-Updater
+
+- 🐛 **Alte Service-Helfer:** Ein bereits aus 5.4.0a laufender Updateprozess kann nach dem verifizierten Baumwechsel noch die frühere Service-Helper-Signatur im Speicher tragen. Ist die optionale PV-Prognosediagnose ausgeschaltet, wird nur deren Sidecar kontrolliert übersprungen; die Installation der Kerndienste wird dadurch nicht mehr abgebrochen.
+- 🛡️ **Explizite Diagnose bleibt fail-closed:** War die Prognosediagnose ausdrücklich aktiviert, erzeugt ein alter Helper keine Unit mit unvollständigem Enable-, Restart- oder Prioritätsvertrag. Der Updater bricht dann mit einem präzisen Hinweis ab und stellt den verifizierten Ausgangszustand wieder her.
+- 🔐 **Versiegelter Root-Finalizer:** Nach dem bytegenauen Zielwechsel erzeugt der Updater aus dem freigegebenen Commit einen separaten root-eigenen, schreibgeschützten Ausführungssnapshot. Nur daraus startet der privilegierte Finalizer; Byte-, Modus-, Eigentümer-, Hardlink-, Symlink- und Komponentenabweichungen brechen fail-closed ab.
+- 🧭 **Prüfcode und Produktpfad getrennt:** Der Snapshot bestimmt ausschließlich die Herkunft des privilegierten Codes. Installationslogs, systemd-Units, Notifier-Rechte, Web-Wrapper und Sudoers-Einträge werden ausschließlich gegen den doppelt gebundenen Produktpfad erzeugt; kein installierter Dienst verweist nach dem Löschen des Snapshots ins Leere.
+
+### 🔥 Heizstab und Shelly Pro3EM
+
+- 🛡️ **Lokales PV-AUTO AUS ist hart und gehalten:** Nach dem bestätigten 0-W-/AUS-Übergang bleibt der Heizstab aus. PV-Überschuss, Pre-Dump und Marktfreigaben können ihn weder im selben noch in einem unveränderten Folgezyklus erneut einschalten.
+- 🛡️ **Hauptschalter schlägt alte Endpunkte:** Bei `heizstab=0` werden noch konfigurierte Heizstab-/Shelly-Aktoren einmal sicher auf 0 W/AUS freigegeben. Automatik, Marktpfad und manueller Vollgasauftrag bleiben danach wirkungslos; ein ausdrücklich als Wärmepumpentyp gewählter Heizstabbetrieb bleibt kompatibel.
+- 🔎 **Pro3EM bleibt eigenständig:** Fehlen bei einer Alt- oder Teilkonfiguration die Relaisfreigaben, verwendet der Laufzeitpfad dieselben sicheren Defaults wie die Oberfläche: Relais-ID `-1` und Steuerung aus. Ein separat freigegebener Pro3EM-Wärmepumpenpfad bleibt vom lokalen Heizstab-`PV-AUTO AUS` unabhängig; das globale `AUTO AUS` stoppt und hält beide Pfade.
+
+### 📦 Releaseumfang
+
+- 🧹 **Browser-Cache:** Der Service-Worker verwendet die 5.4.2a-Kennung, damit alte statische Frontenddateien beim Hotfix eindeutig verworfen werden.
+- 🐳 **Docker-Dokumentation:** Das veröffentlichte GHCR-Image ist als Normalweg klargestellt. Ein lokaler Selbstbau benötigt einen vollständigen Repository-Checkout als Build-Kontext; Zweck, Rechteklasse, Aufbewahrung und Backupstufe von Daten-, Log-, ML- und Prognosebeleg-Volumes sind getrennt dokumentiert. Die Volume-Topologie selbst bleibt unverändert.
+- 🛡️ **Eng begrenzter Hotfix:** Direktvermarktung, Lastspitzenbegrenzung, Wallbox und die fachliche Prognosediagnose entsprechen unverändert 5.4.2. Der Wärmepfad ändert ausschließlich die beschriebenen Nutzer-Aus- und sicheren Default-Kanten.
+
 ## [5.4.2] – 2026-07-27
 
 ### 🔋 Speicher und Direktvermarktung

@@ -70,9 +70,13 @@ try:
     INSTALL_GROUP = grp.getgrgid(pwd.getpwnam(INSTALL_USER).pw_gid).gr_name
 except (KeyError, OSError):
     INSTALL_GROUP = INSTALL_USER
-INSTALL_PATH = get_install_path()
-INSTALLER_DIR = os.path.dirname(os.path.abspath(__file__))
-INSTALL_ROOT = os.path.dirname(INSTALLER_DIR) # .../Install
+INSTALL_PATH = os.path.abspath(get_install_path())
+# In einem Release-Bootstrap wird dieses Modul aus einem versiegelten
+# Ausführungssnapshot importiert. ``__file__`` bezeichnet dann ausschließlich
+# den unveränderlichen Code-Root; alle Rechteprüfungen und Korrekturen müssen
+# weiterhin auf den explizit gebundenen Produktbaum zeigen.
+INSTALL_ROOT = INSTALL_PATH
+INSTALLER_DIR = os.path.join(INSTALL_ROOT, "Installer")
 CONFIG_SECRET_FILE_MODE = config_secret_file_mode_text()
 CONFIG_SECRET_DIR_MODE = config_secret_dir_mode_text()
 
@@ -440,9 +444,7 @@ def _strip_utf8_bom(path):
 
 def setup_permissions_logging():
     """Initialisiert Logging für Berechtigungen über logging_manager."""
-    import os
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    log_dir = os.path.join(os.path.dirname(script_dir), "logs")
+    log_dir = os.path.join(INSTALL_ROOT, "logs")
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, "permissions.log")
     perm_logger = get_or_create_logger("permissions", log_file)

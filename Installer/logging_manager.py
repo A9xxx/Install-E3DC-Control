@@ -65,7 +65,11 @@ def get_or_create_logger(name, log_file=None):
 
 def setup_installation_loggers():
     """Initialisiert alle spezialisierten Logger für Installation."""
-    log_dir = os.path.join(os.path.dirname(__file__), "..", "logs")
+    # Ein Release-Finalizer kann aus einem read-only Snapshot importiert sein.
+    # Persistente Logs werden immer im gebundenen Produktbaum geführt.
+    from .installer_config import get_install_path
+
+    log_dir = os.path.join(get_install_path(), "logs")
     os.makedirs(log_dir, exist_ok=True)
     
     # Setze Ownership des log_dir auf Install-User

@@ -2868,15 +2868,16 @@ def _fresh_rscp_charge_limits_w(
 
     ``EMS_USER_CHARGE_LIMIT`` und ``EMS_BAT_CHARGE_LIMIT`` sind Obergrenzen.
     Sie dürfen einen konfigurierten Sollwert deshalb nur absenken, niemals
-    anheben. Temporäre ``EMS_POWER_SETTINGS``-Readbacks werden hier bewusst
-    nicht verwendet, damit eine vorherige dynamische Begrenzung nicht als
-    neue Hardwarefähigkeit festgeschrieben wird.
+    anheben. Bei aktiven ``EMS_POWER_SETTINGS`` kann E3/DC den flüchtigen
+    Lade-Cap jedoch auch in ``EMS_USER_CHARGE_LIMIT`` spiegeln. Nur wenn
+    frischer USER- und MAX_CHARGE-Readback innerhalb des etablierten
+    50-W-Fensters übereinstimmen und eine explizite Konfigurationsgrenze
+    existiert, wird dieser rückgekoppelte Wert verworfen. Jede abweichende
+    USER-Grenze sowie die typisierte Batteriegrenze bleiben wirksam.
     """
 
     if (
-        live.get("ems_power_settings_read") is not True
-        or live.get("ems_power_settings_valid") is not True
-        or live.get("RSCP_Sample_Valid") is not True
+        live.get("RSCP_Sample_Valid") is not True
         or live.get("Power_Decision_Usable") is not True
     ):
         return []
@@ -2897,8 +2898,29 @@ def _fresh_rscp_charge_limits_w(
     if not math.isfinite(age_s) or age_s < -5.0 or age_s > max_age_s:
         return []
 
+    configured_charge_limit_w = _configured_power_limit_w(
+        cfg,
+        "maximumladeleistung",
+    )
+    user_charge_limit_w = live.get("user_charge_limit_w")
+    ems_max_charge_power_w = live.get("ems_max_charge_power_w")
+    user_limit_reflects_dynamic_cap = bool(
+        configured_charge_limit_w >= 300
+        and live.get("ems_power_settings_read") is True
+        and live.get("ems_power_settings_valid") is True
+        and live.get("power_limits_active") is True
+        and isinstance(user_charge_limit_w, int)
+        and not isinstance(user_charge_limit_w, bool)
+        and user_charge_limit_w >= 300
+        and isinstance(ems_max_charge_power_w, int)
+        and not isinstance(ems_max_charge_power_w, bool)
+        and ems_max_charge_power_w >= 0
+        and abs(user_charge_limit_w - ems_max_charge_power_w) < 50
+    )
     limits: List[int] = []
     for key in ("user_charge_limit_w", "bat_charge_limit_w"):
+        if user_limit_reflects_dynamic_cap and key == "user_charge_limit_w":
+            continue
         value = live.get(key)
         if (
             isinstance(value, int)
@@ -6954,6 +6976,219 @@ def direct_marketing_pv_source_breakdown(
     }
 
 
+def storage_charge_path_contract(
+    cfg: Dict[str, Any],
+    live: Dict[str, Any],
+    *,
+    now_s: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Klassifiziert nur die für den Laderahmen relevante PV-Topologie."""
+
+    cfg = cfg or {}
+    live = live or {}
+    try:
+        _ready, topology = _direct_marketing_aux_ac_topology_ready(cfg)
+    except Exception:
+        topology = {}
+
+    configured_external_limit_w = max(
+        0,
+        safe_int(cfg.get("pv_external_ac_inverter_limit_w"), 0),
+    )
+    configured_e3dc_dc_limit_w = max(
+        0,
+        safe_int(cfg.get("pv_e3dc_dc_inverter_limit_w"), 0),
+    )
+    topology_status = str(topology.get("status") or "")
+    e3dc_only_topology_bound = bool(
+        topology_status == "bound"
+        and topology.get("split_usable") is True
+        and topology.get("e3dc_dc_bound") is True
+        and topology.get("external_ac_bound") is not True
+    )
+
+    now_value = time.time() if now_s is None else float(now_s)
+    max_age_s = max(
+        1.0,
+        min(30.0, safe_float(cfg.get("storage_live_stale_guard_s"), 10.0)),
+    )
+    raw_ts = live.get("_ts")
+    timestamp_valid = bool(
+        isinstance(raw_ts, (int, float))
+        and not isinstance(raw_ts, bool)
+        and math.isfinite(float(raw_ts))
+        and float(raw_ts) > 0.0
+    )
+    live_age_s = now_value - float(raw_ts) if timestamp_valid else None
+    external_split_raw = live.get("Ext_PV_Power")
+    external_split_typed = bool(
+        isinstance(external_split_raw, (int, float))
+        and not isinstance(external_split_raw, bool)
+        and math.isfinite(float(external_split_raw))
+        and float(external_split_raw) >= 0.0
+    )
+    external_split_fresh = bool(
+        timestamp_valid
+        and live_age_s is not None
+        and -5.0 <= live_age_s <= max_age_s
+    )
+    external_split_valid = bool(
+        external_split_typed
+        and external_split_fresh
+        and live.get("RSCP_Sample_Valid") is True
+        and live.get("Power_Decision_Usable") is True
+        and live.get("Ext_PV_Power_Valid") is True
+    )
+    external_split_w = (
+        max(0, int(round(float(external_split_raw))))
+        if external_split_typed
+        else None
+    )
+
+    observed_external_w = 0
+    observed_external_source = ""
+    for key in (
+        "Ext_PV_Power",
+        "External_PV_Power",
+        "PV_External_Power",
+        "Additional_PV_Power",
+    ):
+        if not _live_numeric_present(live, key):
+            continue
+        value = max(0, safe_int(live.get(key), 0))
+        if key == "Ext_PV_Power":
+            if not external_split_valid:
+                continue
+            observed_external_source = key
+            if value <= 100:
+                continue
+        elif value <= 100:
+            continue
+        observed_external_w = value
+        observed_external_source = key
+        break
+    if observed_external_w <= 0:
+        for key in ("EMS_POWER_ADD", "Power_ADD", "ADD_POWER", "add_power"):
+            if not _live_numeric_present(live, key):
+                continue
+            value = safe_int(live.get(key), 0)
+            if value >= -100:
+                continue
+            observed_external_w = abs(value)
+            observed_external_source = key
+            break
+
+    external_ac_configured = bool(
+        topology.get("external_ac_bound")
+        or configured_external_limit_w > 0
+        or cfg_bool(cfg, "storage_dc_first_charge_limit_enable", False)
+    )
+    external_ac_observed = bool(observed_external_w > 100)
+    positive_e3dc_path_evidence = bool(
+        e3dc_only_topology_bound
+        or configured_e3dc_dc_limit_w > 0
+        or external_split_valid
+    )
+    single_e3dc_path = bool(
+        not external_ac_configured
+        and not external_ac_observed
+        and positive_e3dc_path_evidence
+    )
+    if external_ac_configured:
+        source = "configured_external_ac"
+    elif external_ac_observed:
+        source = "observed_external_ac"
+    elif e3dc_only_topology_bound:
+        source = "bound_e3dc_only"
+    elif configured_e3dc_dc_limit_w > 0:
+        source = "configured_e3dc_dc_limit"
+    elif external_split_valid:
+        source = "fresh_ext_pv_zero_or_noise"
+    else:
+        source = "unknown_fail_closed"
+    return {
+        "single_e3dc_path": single_e3dc_path,
+        "positive_e3dc_path_evidence": positive_e3dc_path_evidence,
+        "e3dc_only_topology_bound": e3dc_only_topology_bound,
+        "configured_e3dc_dc_limit_w": configured_e3dc_dc_limit_w,
+        "external_ac_configured": external_ac_configured,
+        "external_ac_observed": external_ac_observed,
+        "external_ac_observed_w": observed_external_w,
+        "external_ac_source": observed_external_source,
+        "external_split_typed": external_split_typed,
+        "external_split_fresh": external_split_fresh,
+        "external_split_valid": external_split_valid,
+        "external_split_w": external_split_w,
+        "external_split_age_s": (
+            round(float(live_age_s), 3)
+            if live_age_s is not None and math.isfinite(float(live_age_s))
+            else None
+        ),
+        "configured_external_limit_w": configured_external_limit_w,
+        "topology_status": topology_status,
+        "source": source,
+    }
+
+
+def single_e3dc_curve_full_cap_context(
+    cfg: Dict[str, Any],
+    live: Dict[str, Any],
+    previous_state: Dict[str, Any],
+    shadow_inputs: Dict[str, Any],
+    *,
+    auto_state: str,
+    max_charge_w: int,
+    now_s: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Öffnet bei deutlichem Rückstand den E3/DC-Rahmen ohne DC/DC-Servo."""
+
+    max_charge_w = max(0, safe_int(max_charge_w, 0))
+    curve_gap_pct = max(0.0, safe_float(shadow_inputs.get("curve_gap_pct"), 0.0))
+    enter_gap_pct = max(
+        0.2,
+        safe_float(
+            cfg.get("storage_single_e3dc_full_cap_enter_gap_pct"),
+            safe_float(
+                cfg.get("storage_parallel_curve_tolerance_pct"),
+                safe_float(cfg.get("tl_tolerance_pct"), 3.0),
+            ),
+        ),
+    )
+    release_gap_pct = max(
+        0.0,
+        min(
+            enter_gap_pct - 0.1,
+            safe_float(
+                cfg.get("storage_single_e3dc_full_cap_release_gap_pct"),
+                enter_gap_pct * 0.5,
+            ),
+        ),
+    )
+    path = storage_charge_path_contract(cfg, live, now_s=now_s)
+    previous_active = bool(
+        (previous_state or {}).get("single_e3dc_curve_full_cap_active")
+    )
+    enter = bool(curve_gap_pct >= enter_gap_pct)
+    keep = bool(previous_active and curve_gap_pct > release_gap_pct)
+    active = bool(
+        auto_state == "parallel_curve_charge"
+        and max_charge_w >= 300
+        and path.get("single_e3dc_path")
+        and (enter or keep)
+    )
+    return {
+        "active": active,
+        "enter": enter,
+        "keep": keep,
+        "previous_active": previous_active,
+        "curve_gap_pct": round(curve_gap_pct, 3),
+        "enter_gap_pct": round(enter_gap_pct, 3),
+        "release_gap_pct": round(release_gap_pct, 3),
+        "max_charge_w": max_charge_w,
+        "path": path,
+    }
+
+
 def storage_dc_first_live_source_contract(
     cfg: Dict[str, Any],
     live: Dict[str, Any],
@@ -7054,7 +7289,11 @@ def storage_dc_first_charge_candidate(decision: Dict[str, Any]) -> bool:
                 "direct_marketing_post_final_pv_store_auto_active"
             )
         )
-    if state in {"parallel_curve_charge", "parallel_curve_auto_hold"}:
+    if state in {
+        "parallel_curve_charge",
+        "parallel_curve_charge_cap",
+        "parallel_curve_auto_hold",
+    }:
         auto_limit = decision.get("auto_limit") if isinstance(decision.get("auto_limit"), dict) else {}
         return bool(auto_limit.get("enabled") and not auto_limit.get("release"))
     return state in {
@@ -17865,6 +18104,54 @@ def decide_next_cycle(
                             f"(vorher {safe_int(smoothing.get('previous_limit_w'), 0)}W, "
                             f"E3DC lädt {safe_int(smoothing.get('actual_charge_w'), 0)}W)"
                         )
+                single_e3dc_full_cap = single_e3dc_curve_full_cap_context(
+                    cfg,
+                    live_with_wallbox,
+                    previous_state,
+                    shadow_inputs,
+                    auto_state=auto_state,
+                    max_charge_w=max_charge_w,
+                    now_s=now_s,
+                )
+                decision["single_e3dc_curve_full_cap_active"] = bool(
+                    single_e3dc_full_cap.get("active")
+                )
+                decision["single_e3dc_curve_full_cap_enter"] = bool(
+                    single_e3dc_full_cap.get("enter")
+                )
+                decision["single_e3dc_curve_full_cap_keep"] = bool(
+                    single_e3dc_full_cap.get("keep")
+                )
+                decision["single_e3dc_curve_full_cap_enter_gap_pct"] = (
+                    single_e3dc_full_cap.get("enter_gap_pct")
+                )
+                decision["single_e3dc_curve_full_cap_release_gap_pct"] = (
+                    single_e3dc_full_cap.get("release_gap_pct")
+                )
+                decision["storage_charge_path_contract"] = (
+                    single_e3dc_full_cap.get("path")
+                    if isinstance(single_e3dc_full_cap.get("path"), dict)
+                    else {}
+                )
+                if bool(single_e3dc_full_cap.get("active")):
+                    planner_limit_w = max(
+                        0,
+                        auto_storage_req_w,
+                        i_fc_w,
+                        safe_int(decision.get("val"), 0),
+                    )
+                    auto_limit_charge_w = max_charge_w
+                    decision["val"] = max_charge_w
+                    decision["single_e3dc_curve_full_cap_planner_w"] = min(
+                        max_charge_w,
+                        planner_limit_w,
+                    )
+                    decision["curve_frame_lift_active"] = False
+                    auto_limit_reason = (
+                        "Einzelner E3/DC-Pfad und deutlicher Kurvenrückstand: "
+                        f"stabiler {max_charge_w}W-Ladedeckel in AUTO; "
+                        "E3/DC regelt die tatsächliche DC/DC-Leistung"
+                    )
             elif auto_state == "parallel_curve_charge_cap":
                 release_requested = bool(
                     shadow_inputs.get("curve_cap_release_requested")
@@ -18494,6 +18781,26 @@ def decide_next_cycle(
         "curve_charge_servo_step_up_w": max(0, safe_int(decision.get("curve_charge_servo_step_up_w"), 0)),
         "curve_charge_servo_step_down_w": max(0, safe_int(decision.get("curve_charge_servo_step_down_w"), 0)),
         "curve_charge_servo_max_age_s": max(0, safe_int(decision.get("curve_charge_servo_max_age_s"), 0)),
+        "single_e3dc_curve_full_cap_active": bool(decision.get("single_e3dc_curve_full_cap_active")),
+        "single_e3dc_curve_full_cap_enter": bool(decision.get("single_e3dc_curve_full_cap_enter")),
+        "single_e3dc_curve_full_cap_keep": bool(decision.get("single_e3dc_curve_full_cap_keep")),
+        "single_e3dc_curve_full_cap_planner_w": max(
+            0,
+            safe_int(decision.get("single_e3dc_curve_full_cap_planner_w"), 0),
+        ),
+        "single_e3dc_curve_full_cap_enter_gap_pct": safe_float(
+            decision.get("single_e3dc_curve_full_cap_enter_gap_pct"),
+            0.0,
+        ),
+        "single_e3dc_curve_full_cap_release_gap_pct": safe_float(
+            decision.get("single_e3dc_curve_full_cap_release_gap_pct"),
+            0.0,
+        ),
+        "storage_charge_path_contract": (
+            decision.get("storage_charge_path_contract")
+            if isinstance(decision.get("storage_charge_path_contract"), dict)
+            else {}
+        ),
         "curve_frame_measured_trim_phase": curve_frame_measured_trim_phase,
         "curve_frame_measured_trim_offset_w": curve_frame_measured_trim_offset_w,
         "curve_frame_measured_trim_anchor_ts": curve_frame_measured_trim_anchor_ts,
@@ -18952,6 +19259,26 @@ def decide_next_cycle(
         "curve_frame_lift_max_boost_w": curve_frame_lift_max_boost_w,
         "curve_frame_lift_reason": curve_frame_lift_reason,
         "curve_frame_lift_gap_pct": curve_frame_lift_gap_pct,
+        "single_e3dc_curve_full_cap_active": bool(decision.get("single_e3dc_curve_full_cap_active")),
+        "single_e3dc_curve_full_cap_enter": bool(decision.get("single_e3dc_curve_full_cap_enter")),
+        "single_e3dc_curve_full_cap_keep": bool(decision.get("single_e3dc_curve_full_cap_keep")),
+        "single_e3dc_curve_full_cap_planner_w": max(
+            0,
+            safe_int(decision.get("single_e3dc_curve_full_cap_planner_w"), 0),
+        ),
+        "single_e3dc_curve_full_cap_enter_gap_pct": safe_float(
+            decision.get("single_e3dc_curve_full_cap_enter_gap_pct"),
+            0.0,
+        ),
+        "single_e3dc_curve_full_cap_release_gap_pct": safe_float(
+            decision.get("single_e3dc_curve_full_cap_release_gap_pct"),
+            0.0,
+        ),
+        "storage_charge_path_contract": (
+            decision.get("storage_charge_path_contract")
+            if isinstance(decision.get("storage_charge_path_contract"), dict)
+            else {}
+        ),
         "curve_frame_measured_trim_phase": curve_frame_measured_trim_phase,
         "curve_frame_measured_trim_offset_w": curve_frame_measured_trim_offset_w,
         "curve_frame_measured_trim_anchor_ts": curve_frame_measured_trim_anchor_ts,
@@ -19560,6 +19887,26 @@ def decide_next_cycle(
         "iFc_w": i_fc_w,
         "iMinLade_w": i_min_lade_w,
         "storage_charge_request_w": storage_charge_request_w,
+        "single_e3dc_curve_full_cap_active": bool(decision.get("single_e3dc_curve_full_cap_active")),
+        "single_e3dc_curve_full_cap_enter": bool(decision.get("single_e3dc_curve_full_cap_enter")),
+        "single_e3dc_curve_full_cap_keep": bool(decision.get("single_e3dc_curve_full_cap_keep")),
+        "single_e3dc_curve_full_cap_planner_w": max(
+            0,
+            safe_int(decision.get("single_e3dc_curve_full_cap_planner_w"), 0),
+        ),
+        "single_e3dc_curve_full_cap_enter_gap_pct": safe_float(
+            decision.get("single_e3dc_curve_full_cap_enter_gap_pct"),
+            0.0,
+        ),
+        "single_e3dc_curve_full_cap_release_gap_pct": safe_float(
+            decision.get("single_e3dc_curve_full_cap_release_gap_pct"),
+            0.0,
+        ),
+        "storage_charge_path_contract": (
+            decision.get("storage_charge_path_contract")
+            if isinstance(decision.get("storage_charge_path_contract"), dict)
+            else {}
+        ),
         "curve_auto_hold_continuation_active": bool(decision.get("curve_auto_hold_continuation_active")),
         "curve_auto_hold_continuation_w": max(0, safe_int(decision.get("curve_auto_hold_continuation_w"), 0)),
         "curve_auto_hold_continuation_previous_w": max(

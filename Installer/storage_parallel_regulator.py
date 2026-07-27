@@ -1722,10 +1722,15 @@ class ParallelStorageRegulator:
         price_export_w = max(0, -grid_ema_w, pv_w - fixed_load_w - int(wallbox_w))
         curve_export_w = max(0, -grid_ema_w)
         curve_safe_charge_w = max(0, int(curve_export_w) - max(150, self.grid_limit_w))
-        if previous_parallel_state == "parallel_curve_charge" and bat_w > 300 and grid_ema_w <= self.grid_limit_w:
-            # Reale Batterieladung ohne Netzbezug ist nur Haltehilfe fuer eine
-            # bereits aktive CHRG-Phase. AUTO selbst ist kein Grund, neu in
-            # CHRG zu springen.
+        if (
+            previous_parallel_state in ("parallel_curve_charge", "parallel_curve_charge_cap")
+            and bat_w > 300
+            and grid_ema_w <= self.grid_limit_w
+        ):
+            # Reale Batterieladung ohne Netzbezug ist nur Haltehilfe für eine
+            # bereits aktive Kurven-/Abregelphase. Zusammen mit der weiterhin
+            # vorhandenen Einspeisung bildet sie den stabilen PV-Laderahmen;
+            # AUTO selbst ist kein Grund, neu in CHRG zu springen.
             curve_safe_charge_w = max(
                 curve_safe_charge_w,
                 max(0, int(bat_w) + max(0, -grid_ema_w) - max(150, self.grid_limit_w)),
@@ -2267,6 +2272,35 @@ class ParallelStorageRegulator:
         elif curve_cap_relevant and curve_cap_neutral_keep:
             neutral_keep_w = previous_curve_cap_w
             curve_cap_target_w = min(self.max_charge_w, neutral_keep_w)
+            curve_cap_keep_active = True
+            curve_cap_active = True
+        curve_cap_below_curve_catchup_w = 0
+        curve_cap_below_curve_catchup_active = bool(
+            curve_cap_active
+            and curve_cap_hard_pressure_active
+            and not curve_cap_release_pending
+            and not curve_cap_release_requested
+            and curve_cap_grid_contract_valid
+            and not curve_cap_real_grid_import_active
+            and curve_gap_pct is not None
+            and curve_gap_pct >= self.curve_tolerance_pct
+            and pv_w > 250
+            and curve_safe_charge_w >= self.curve_charge_enter_w
+        )
+        if curve_cap_below_curve_catchup_active:
+            # Abregel-/WR-Druck darf einen belegten Kurvenrückstand nicht auf
+            # seinen kleinen Pflichtanteil reduzieren. Der zusätzlich geöffnete
+            # Rahmen stammt ausschließlich aus bereits gemessener, sicherer
+            # PV-Einspeisung; Entladung bleibt im nachfolgenden AUTO-Vertrag
+            # offen und Netzladen wird nicht freigegeben.
+            curve_cap_below_curve_catchup_w = min(
+                self.max_charge_w,
+                curve_safe_charge_w,
+            )
+            curve_cap_target_w = min(
+                self.max_charge_w,
+                max(curve_cap_target_w, curve_cap_below_curve_catchup_w),
+            )
             curve_cap_keep_active = True
             curve_cap_active = True
         curve_cap_post_release_guard_active = bool(
@@ -2939,6 +2973,8 @@ class ParallelStorageRegulator:
             "curve_soft_charge_factor": round(curve_soft_factor, 3),
             "curve_soft_charge_limit_w": curve_soft_charge_limit_w,
             "curve_cap_target_w": curve_cap_target_w,
+            "curve_cap_below_curve_catchup_active": curve_cap_below_curve_catchup_active,
+            "curve_cap_below_curve_catchup_w": curve_cap_below_curve_catchup_w,
             "curve_cap_active": curve_cap_active,
             "curve_cap_keep_active": curve_cap_keep_active,
             "curve_cap_neutral_keep": curve_cap_neutral_keep,
@@ -3199,11 +3235,17 @@ class ParallelStorageRegulator:
             )
         elif curve_cap_active:
             self.price_house_discharge_w = 0
+            curve_cap_reason = (
+                "SOC unterhalb Kurve; sichere PV-Einspeisung hebt den "
+                "Abregelrahmen bis zum Kurvenbedarf an"
+                if curve_cap_below_curve_catchup_active
+                else "SOC oberhalb Kurve; Batterieladung auf die benötigte Rampenleistung begrenzen"
+            )
             decision = choose(
                 "parallel_curve_charge_cap",
                 MODE_CHRG,
                 curve_cap_target_w,
-                "SOC oberhalb Kurve; Batterieladung auf die benoetigte Rampenleistung begrenzen",
+                curve_cap_reason,
                 "curve",
             )
         elif headroom_discharge_active:
@@ -3989,6 +4031,8 @@ class ParallelStorageRegulator:
                 "curve_soft_charge_factor": round(curve_soft_factor, 3),
                 "curve_soft_charge_limit_w": curve_soft_charge_limit_w,
                 "curve_cap_target_w": curve_cap_target_w,
+                "curve_cap_below_curve_catchup_active": curve_cap_below_curve_catchup_active,
+                "curve_cap_below_curve_catchup_w": curve_cap_below_curve_catchup_w,
                 "curve_cap_active": curve_cap_active,
                 "curve_cap_keep_active": curve_cap_keep_active,
                 "curve_cap_neutral_keep": curve_cap_neutral_keep,

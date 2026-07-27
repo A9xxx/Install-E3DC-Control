@@ -5,6 +5,7 @@ import sys
 import time
 import json
 import logging
+import inspect
 import re
 import stat
 import urllib.parse
@@ -1490,9 +1491,66 @@ def run():
 if __name__ == "__main__":
     run()
 
+
+def _install_forecast_evidence_service_compat(
+    create_service_file,
+    *,
+    evidence_enabled,
+    start_services,
+):
+    """Installiert den optionalen Sidecar nur mit vollständig passendem Helper.
+
+    Bei Release-Wechseln aus älteren Python-Prozessen kann ``Installer.utils``
+    noch die frühere, schmalere Helper-Signatur tragen. Der rein diagnostische
+    Sidecar darf dann weder den Gesamtwechsel blockieren noch mit impliziten
+    Enable-/Restart-Defaults angelegt werden.
+    """
+
+    optional_kwargs = {
+        "enable_service": bool(evidence_enabled),
+        "restart_policy": "on-failure",
+        "nice": 10,
+        "io_scheduling_class": "idle",
+        "after_services": (
+            "e3dc-live.service",
+            "e3dc-weather-manager.service",
+        ),
+    }
+    try:
+        parameters = inspect.signature(create_service_file).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    missing = sorted(key for key in optional_kwargs if key not in parameters)
+    if missing:
+        if evidence_enabled:
+            print(
+                "  [!] Alter Service-Helper kann die ausdrücklich aktivierte "
+                "PV-Prognosediagnose nicht sicher abbilden "
+                f"(fehlender Vertrag: {', '.join(missing)})."
+            )
+            return False
+        print(
+            "  [i] Alter Service-Helper im Release-Übergang erkannt; "
+            "optionale PV-Prognosediagnose wird sicher übersprungen "
+            f"(fehlender Vertrag: {', '.join(missing)})."
+        )
+        return True
+
+    result = create_service_file(
+        "e3dc-forecast-evidence",
+        "E3DC PV-Prognosediagnose (read-only)",
+        "forecast_evidence_sidecar.py",
+        "python3",
+        restart_sec=300,
+        start_service=bool(start_services and evidence_enabled),
+        **optional_kwargs,
+    )
+    return result is not False
+
 def install_epex_service(start_services=True):
     print("Installiere E3DC-Control Kern-Manager Services...")
     from .utils import _create_service_file, install_e3dc_live_service
+    installer_dir = os.path.join(INSTALL_DIR, "Installer")
 
     # 1. E3DC Live Daten Service (RSCP Python) - Basis für alle Kerndienste
     print("\n[1/6] E3DC Live Daten Service...")
@@ -1504,20 +1562,20 @@ def install_epex_service(start_services=True):
 
     # 3. Wetter-/PV-Forecast Service
     print("\n[3/6] Wetter & PV-Forecast Service...")
-    forecast_path = os.path.join(os.path.dirname(__file__), "Forecast", "pv_forecast_service.py")
+    forecast_path = os.path.join(installer_dir, "Forecast", "pv_forecast_service.py")
     if os.path.exists(forecast_path):
         _create_service_file("e3dc-weather-manager", "E3DC Wetter & PV Forecast", "Forecast/pv_forecast_service.py", "python3", start_service=start_services)
 
     # 4. Storage Simulator
     print("\n[4/6] Storage Simulator...")
-    storage_path = os.path.join(os.path.dirname(__file__), "storage_simulator.py")
+    storage_path = os.path.join(installer_dir, "storage_simulator.py")
     if os.path.exists(storage_path):
         _create_service_file("e3dc-storage-simulator", "E3DC Storage Simulator", "storage_simulator.py", "python3", start_service=start_services)
 
     # 5. Storage Manager. Der aktuelle Regler ist kanonisch storage_manager.py;
     # der alte Regler bleibt nur als storage_manager_legacy.py im Repository.
     print("\n[5/6] Storage Manager...")
-    mgr_path = os.path.join(os.path.dirname(__file__), "storage_manager.py")
+    mgr_path = os.path.join(installer_dir, "storage_manager.py")
     if os.path.exists(mgr_path):
         _create_service_file("e3dc-storage-manager", "E3DC Storage Manager", "storage_manager.py", "python3", start_service=start_services)
 
@@ -1525,27 +1583,19 @@ def install_epex_service(start_services=True):
     # installiert, bleibt ohne ausdrückliche Nutzerfreigabe jedoch gestoppt.
     print("\n[6/6] Optionale PV-Prognosediagnose...")
     evidence_path = os.path.join(
-        os.path.dirname(__file__),
+        installer_dir,
         "forecast_evidence_sidecar.py",
     )
     if os.path.exists(evidence_path):
         evidence_enabled = _forecast_evidence_enabled_for_install()
-        _create_service_file(
-            "e3dc-forecast-evidence",
-            "E3DC PV-Prognosediagnose (read-only)",
-            "forecast_evidence_sidecar.py",
-            "python3",
-            restart_sec=300,
-            start_service=bool(start_services and evidence_enabled),
-            enable_service=evidence_enabled,
-            restart_policy="on-failure",
-            nice=10,
-            io_scheduling_class="idle",
-            after_services=(
-                "e3dc-live.service",
-                "e3dc-weather-manager.service",
-            ),
-        )
+        if not _install_forecast_evidence_service_compat(
+            _create_service_file,
+            evidence_enabled=evidence_enabled,
+            start_services=start_services,
+        ):
+            raise RuntimeError(
+                "Optionale PV-Prognosediagnose konnte nicht sicher installiert werden"
+            )
 
     print("\n[OK] Alle Kern-Dienste installiert.")
 

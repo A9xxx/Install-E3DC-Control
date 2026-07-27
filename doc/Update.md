@@ -5,6 +5,14 @@ Updates werden ausschließlich über den Installer ausgeführt. Ein manuelles
 Release-Historie ungeeignet, weil alter und neuer Git-Stand nicht miteinander
 verwandt sein müssen.
 
+Der aktuelle Stable-Stand ist `v5.4.2a`. Der Hotfix korrigiert die
+Speicher-Ladefreigabe und eine Altprozess-Kante bei der Installation des
+standardmäßig ausgeschalteten Prognosediagnose-Sidecars. Der versiegelte
+Finalizer bezieht seinen Code aus einem schreibgeschützten Prüfsnapshot,
+erzeugt Logs, systemd-Units, Wrapper, Sudoers-Einträge und Rechte aber
+ausschließlich gegen den gebundenen Produktpfad. Backup- und Rollbackvertrag
+entsprechen unverändert `v5.4.2`.
+
 Die Konsolenbeispiele verwenden den zuvor geprüften absoluten Produktpfad:
 
 ```bash
@@ -250,6 +258,22 @@ angebotenen Zielstand denselben Webupdate-Versuch nicht wiederholen. Bei
 `ABBRUCH` nichts löschen und insbesondere `.ml_model.lock`, Modell und
 Manifest nicht manuell entfernen.
 
+Scheitert ein bereits separat gestarteter **v5.4.0b-Bootstrap** mit
+`Target-Datei besitzt keine vertrauenswürdigen Eigentümer-/Schreibrechte`,
+darf derselbe alte Zwischenrunner nicht erneut verwendet und der
+Installationsbaum nicht pauschal rekursiv umgeschrieben werden. Nach
+verifizierter Wiederherstellung wird stattdessen der `e3dc-bootstrap` aus dem
+aktuellen Release-Archiv direkt mit dessen veröffentlichtem Tag und
+40-stelliger Commit-SHA gestartet. Der aktuelle Runner bindet den Zielbaum
+bytegenau an diesen Commit und startet den privilegierten Finalizer
+ausschließlich aus einem separaten root-eigenen, schreibgeschützten
+Ausführungssnapshot. Fremde Eigentümer, schreibbare Komponenten, Hardlinks,
+Symlinks und Inhaltsabweichungen bleiben harte Abbruchgründe; ein erneuter
+Fehler nennt den relativen Pfad sowie UID, GID, Modus und Linkzahl. Der
+Snapshot ist dabei ausschließlich die geprüfte Codeherkunft. Alle operativen
+Pfade für Logs, Dienste, Rechte, Web-Wrapper und Sudoers werden gegen die
+gebundene Produktinstallation aufgelöst.
+
 In einer Docker-Installation führen weder Weboberfläche noch Konsole einen
 Release-Wechsel im laufenden Container aus. Sie zeigen stattdessen die drei
 Host-Befehle aus dem Abschnitt [Docker-Update](#docker-update).
@@ -296,7 +320,8 @@ Reihenfolge aus:
    beziehungsweise die Rollback-Policy binden;
 4. `UPDATE_POLICY.json` direkt aus dem verifizierten Commit-Objekt lesen;
 5. den Installationsbaum auf genau diesen SHA setzen und `HEAD` erneut prüfen;
-6. einen eigenen Target-Finalizer aus dem verifizierten Zielbaum gegen
+6. einen eigenen Target-Finalizer aus einem separaten root-eigenen,
+   schreibgeschützten Ausführungssnapshot des verifizierten Zielcommits gegen
    Ziel-SHA, Ziel-Tag und gebundene Ausgangsdaten prüfen und starten;
 7. Webdateien synchronisieren und veraltete Pfade nur über feste Positivlisten
    entfernen;
@@ -328,6 +353,9 @@ erneut. Ist diese Wiederherstellung nicht vollständig beweisbar, bleiben die
 Writer-/Aktor-Dienste gestoppt.
 
 ## Gezielter Rückfall
+
+`v5.4.2a` übernimmt unverändert den in `v5.4.2` veröffentlichten
+Rückfallvertrag.
 
 `v5.4.2` bietet den bereinigten Root `v5.3.2b` ausschließlich als
 Docker-Rückfall-Image an. Dieser Root gibt selbst keinen älteren öffentlichen

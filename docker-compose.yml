@@ -2,10 +2,12 @@ services:
   e3dc-control:
     # Ohne E3DC_IMAGE_TAG folgt die Installation dem geprüften Stable-Tag
     # "latest". Ein fester Pin oder Rückfall wird bewusst in .env gesetzt,
-    # zum Beispiel: E3DC_IMAGE_TAG=v5.4.2
+    # zum Beispiel: E3DC_IMAGE_TAG=v5.4.2a
     image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"
 
-    # ZUM SELBST BAUEN: Obige Zeile auskommentieren und stattdessen:
+    # NUR IM VOLLSTÄNDIGEN REPOSITORY-CHECKOUT SELBST BAUEN:
+    # Dockerfile, entrypoint.sh und der Quellbaum müssen im Build-Kontext liegen.
+    # Dann obige image-Zeile auskommentieren und stattdessen:
     # build: .
 
     container_name: e3dc-control

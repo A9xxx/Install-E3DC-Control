@@ -1,3 +1,84 @@
+# E3DC-Control v5.4.2a
+
+E3DC-Control 5.4.2a ist ein eng begrenzter Hotfix für die
+Speicher-Ladefreigabe und den Releasewechsel aus alten, bereits laufenden
+Updater-Prozessen sowie für harte Heizstab-`Aus`-Kanten.
+Direktvermarktung, Lastspitzenbegrenzung, Wallbox und die fachliche
+Prognosediagnose entsprechen unverändert 5.4.2.
+
+## Speicher-Ladefreigabe
+
+- Ein `EMS_USER_CHARGE_LIMIT`-Readback aus frischen, validen
+  `POWER_SETTINGS` wird nur dann als reflektierter flüchtiger Laderahmen
+  behandelt, wenn `maximumladeleistung` ausdrücklich konfiguriert ist und
+  `EMS_USER_CHARGE_LIMIT` sowie
+  `EMS_MAX_CHARGE_POWER` strikt weniger als 50 W voneinander abweichen.
+  Andernfalls bleibt die USER-Grenze wirksam.
+- Liegt der Speicher hinter seiner Ladekurve, öffnet der Manager den Laderahmen
+  in `AUTO` nur bei positiver, frischer E3/DC-only-Evidenz bis
+  `MAX_CHARGE_POWER`. Unbekannte oder veraltete Pfadzuordnung bleibt
+  fail-closed.
+- Die Entladung für wechselnden Hausverbrauch bleibt offen. Eine aktivierte
+  E3/DC-PV-Ladebegrenzung führt den Rahmen bei zusätzlicher AC-PV weiterhin
+  sanft und DC-first auf die frisch belegte interne PV-Leistung nach.
+- Der Hotfix erteilt keine Netzladefreigabe, fordert weder `GRID` noch einen
+  aktiven Ladebefehl an und verändert keine getrennt freigegebenen
+  Preis-/Lastspitzen-Netzladeverträge.
+- Nutzer-`Aus`, Notstromreserve, Hardwarelimits, Datenfrische und die
+  Ein-Entscheider-Regel bleiben vorrangig.
+
+## Kompatibilität alter Updateprozesse
+
+- Ein aus 5.4.0a gestarteter Updateprozess kann nach dem verifizierten
+  Baumwechsel noch die alte Signatur des Service-Helfers im Speicher tragen.
+- Ist die optionale PV-Prognosediagnose ausgeschaltet, wird ausschließlich
+  deren Sidecar kontrolliert übersprungen. Die Kerndienste werden weiter über
+  ihren vollständigen Vertrag installiert.
+- Ist die Diagnose ausdrücklich aktiviert, bleibt der Übergang fail-closed:
+  Eine unvollständig definierte Unit wird nicht erzeugt und der transaktionale
+  Updater stellt den verifizierten Ausgangszustand wieder her.
+- Der privilegierte Finalizer startet ausschließlich aus einem separaten
+  root-eigenen, schreibgeschützten Ausführungssnapshot des freigegebenen
+  Zielcommits. Byte-, Modus-, Eigentümer-, Hardlink-, Symlink- und
+  Komponentenabweichungen bleiben harte Abbruchgründe; Metadatenfehler nennen
+  jetzt Datei, UID, GID, Modus und Linkzahl.
+- Der Ausführungssnapshot dient ausschließlich als geprüfte Codeherkunft.
+  Installationslogs, systemd-Units, Notifier-Rechte, Web-Wrapper und
+  Sudoers-Einträge werden gegen den zuvor doppelt gebundenen Produktpfad
+  erzeugt. Nach dem Entfernen des Snapshots bleibt deshalb kein installierter
+  Dienst- oder Hilfspfad auf dessen temporären Ort gebunden.
+
+## Heizstab und Shelly Pro3EM
+
+- Das lokale `PV-AUTO AUS` hält den Heizstab nach dem bestätigten 0-W-/AUS-
+  Übergang aus. PV-Überschuss, Pre-Dump und Marktfreigaben können im selben
+  oder in einem unveränderten Folgezyklus keine positive Leistung mehr
+  anfordern.
+- Der Hauptschalter `heizstab=0` sperrt auch alte konfigurierte Endpunkte und
+  einen manuellen Vollgasauftrag. Ein zuvor erreichbarer Aktor wird einmal
+  sicher auf 0 W beziehungsweise AUS freigegeben.
+- Fehlende Shelly-Pro3EM-Steuerfelder verwenden den sicheren Laufzeitstandard:
+  Relais-ID `-1`, Relaissteuerung aus. Ein separat freigegebener
+  Pro3EM-Wärmepumpenpfad bleibt vom lokalen Heizstab-`PV-AUTO AUS` unabhängig;
+  das globale `AUTO AUS` stoppt und hält beide Pfade.
+
+## Installation und Update
+
+Bare-Metal-Nutzer verwenden den normalen Web- oder Konsolen-Updater.
+Docker-Nutzer prüfen vor dem Pull das aufgelöste Image und verwenden für einen
+bewussten Pin `E3DC_IMAGE_TAG=v5.4.2a`; ohne Pin folgt die Compose-Datei dem
+erst nach erfolgreicher Attestierungsprüfung gesetzten Stable-Tag `latest`.
+Der öffentliche Docker-Rückfallstand bleibt `v5.3.2b`.
+
+Das veröffentlichte GHCR-Image ist der normale Docker-Installationsweg. Ein
+lokaler Selbstbau benötigt einen vollständigen Repository-Checkout als
+Build-Kontext; `build: .` in einem ansonsten leeren Installationsordner reicht
+nicht aus. Daten-, Log-, ML- und Prognosebeleg-Volumes behalten in diesem
+Hotfix ihre getrennten Rechte-, Aufbewahrungs- und Backupverträge. Es findet
+keine stille Volume-Migration statt.
+
+---
+
 # E3DC-Control v5.4.2
 
 E3DC-Control 5.4.2 ist ein Funktions- und Stabilitätsrelease für

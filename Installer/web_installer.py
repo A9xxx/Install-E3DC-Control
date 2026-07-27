@@ -39,6 +39,7 @@ try:
         apply_config_secret_permissions,
     )
     from .service_catalog import READ_ACTIONS, SERVICE_ACTIONS, get_module, iter_modules
+    from .installer_config import get_install_path
 except ImportError:  # pragma: no cover - direct script execution fallback
     from backup_retention import WEB_INSTALLER_BACKUP_KEEP_COUNT, prune_backup_dir
     from backup_integrity import (
@@ -52,6 +53,13 @@ except ImportError:  # pragma: no cover - direct script execution fallback
         apply_config_secret_permissions,
     )
     from service_catalog import READ_ACTIONS, SERVICE_ACTIONS, get_module, iter_modules
+    # installer_config besitzt absichtlich Paketimporte. Beim direkten
+    # Skriptaufruf wird deshalb nur für diesen Import der Produktroot als
+    # Paketwurzel ergänzt; alle übrigen Legacy-Fallbacks bleiben unverändert.
+    package_root = str(Path(__file__).resolve().parent.parent)
+    if package_root not in sys.path:
+        sys.path.insert(0, package_root)
+    from Installer.installer_config import get_install_path
 
 
 RAMDISK_DIR = Path("/var/www/html/ramdisk")
@@ -135,8 +143,12 @@ ACTION_ALIASES = {
     "disable_service": "disable",
 }
 
-INSTALLER_DIR = Path(__file__).resolve().parent
-INSTALL_ROOT = INSTALLER_DIR.parent
+# Der Web-Installer kann während eines commitgebundenen Release-Wechsels aus
+# einem getrennten Ausführungssnapshot importiert werden. Wrapper, Backups,
+# sudoers und Produktprüfungen müssen stets den explizit gebundenen
+# Installationsbaum verwenden.
+INSTALL_ROOT = Path(get_install_path()).resolve()
+INSTALLER_DIR = INSTALL_ROOT / "Installer"
 WEB_ROOT = Path("/var/www/html")
 
 READ_ONLY_ACTIONS = {

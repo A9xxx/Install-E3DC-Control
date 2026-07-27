@@ -2,6 +2,9 @@
 
 Veröffentlichte Images entstehen ausschließlich aus einem versionierten stabilen Release-Tag. `latest` verweist damit auf die zuletzt veröffentlichte stabile Version.
 
+Der aktuelle Stable-Stand ist `v5.4.2a`. `latest` wird für diesen Hotfix erst
+nach erfolgreicher Digest-, SBOM-, Provenance- und Attestierungsprüfung gesetzt.
+
 E3DC-Control kann isoliert über **Docker** betrieben werden. Der Container kapselt die Anwendung; persistente Betriebsdaten liegen in den dafür vorgesehenen Volumes. Der Multi-Architektur-Support (`arm64`, `amd64`) deckt die vorgesehenen Plattformen ab.
 
 ---
@@ -35,7 +38,10 @@ sudo usermod -aG docker $USER
 *(Melde dich danach einmal ab und wieder an, damit die Gruppenrechte aktiv werden)*
 
 ### Schritt 2: Verzeichnis vorbereiten
-Erstelle einen Ordner fuer E3DC-Control. Die dauerhafte Konfiguration und Historie liegen im Unterordner `data`; der Anwendungscode kommt aus dem Docker-Image.
+Erstelle einen Ordner für E3DC-Control. Die dauerhafte Konfiguration und
+Historie liegen im Unterordner `data`; der Anwendungscode kommt im Normalfall
+aus dem veröffentlichten GHCR-Image. Ein Repository-Checkout ist dafür nicht
+erforderlich.
 ```bash
 export E3DC_DOCKER_PATH="/absoluter/pfad/zur/docker-installation"
 mkdir -p "$E3DC_DOCKER_PATH"
@@ -77,7 +83,30 @@ volumes:
   e3dc_ml:
   e3dc_forecast_evidence:
 ```
-*(Hinweis: `network_mode: "host"` ist sinnvoll, damit die nativen Python-Dienste das E3DC Hauskraftwerk und lokale MQTT-/Wallbox-Geraete direkt erreichen und der Webserver ohne Port-Mapping erreichbar ist).*
+*(Hinweis: `network_mode: "host"` ist sinnvoll, damit die nativen Python-Dienste das E3DC Hauskraftwerk und lokale MQTT-/Wallbox-Geräte direkt erreichen und der Webserver ohne Port-Mapping erreichbar ist).*
+
+Die vier persistenten Bereiche sind absichtlich nach Datenklasse und
+Rechtevertrag getrennt:
+
+| Bereich | Inhalt und Lebensdauer | Backup |
+|---|---|---|
+| `data` | Konfiguration, SQLite-Historie, Betriebszustand und sichere Docker-Warmstartdaten | immer sichern |
+| `logs` | Laufzeitprotokolle sowie neu aufbaubare adaptive Auswertungsreihen | optional; Löschen setzt Support- und Auswertungshistorie zurück |
+| `e3dc_ml` | root-privates lokales Lernmodell außerhalb des Webroots | empfohlen; ohne Backup ist ein neues Training aus der Historie nötig |
+| `e3dc_forecast_evidence` | optionale, root-private Prognosebelege mit rollierender Aufbewahrung bis zu 90 Tagen | optional; Verlust beeinflusst die Regelung nicht, setzt aber die Diagnosehistorie zurück |
+
+Die Compose-Datei im vollständigen Repository verwendet für alle vier Bereiche
+benannte Volumes. Das obige Beispiel und der automatische Docker-Umstieg
+verwenden für `data` und `logs` besser sichtbare Bind-Mounts sowie für die
+beiden privaten Bereiche benannte Volumes. Beide Layouts bilden denselben
+fachlichen Vertrag ab. Die Ramdisk ist absichtlich flüchtig und gehört nicht
+ins Backup.
+
+`e3dc_ml` darf nicht einfach unter das heutige Web-`data` verschoben werden:
+Der Datenbaum gehört dem Webbenutzer, während das geladene Modell und die
+privaten Prognosebelege aus Sicherheitsgründen root-privat bleiben. Eine
+spätere Zusammenlegung privater Volumes benötigt deshalb eine verifizierte
+Datenmigration samt Rechteprüfung und Rückfallweg.
 
 **Synology / NAS mit belegtem Port 80:**
 Wenn der Host Port 80 selbst abfaengt oder auf die NAS-GUI umleitet, kannst du
@@ -117,7 +146,7 @@ Fertiges GitHub-Image aktualisieren:
 
 Ohne `E3DC_IMAGE_TAG` folgt diese Compose-Datei dem geprüften Stable-Tag
 `latest`. Ein fester Tag bleibt bei `pull` absichtlich unverändert. Für einen
-bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.2` in der Datei `.env`
+bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.2a` in der Datei `.env`
 gesetzt. `docker compose config --images` zeigt vorab das tatsächlich gewählte
 Image.
 
@@ -145,7 +174,7 @@ Versionswahl.
 
 Gezielte Rückfallversion:
 
-Den Stable-Container `v5.4.2` auf den veröffentlichten Rollback-Root
+Den Stable-Container `v5.4.2a` auf den veröffentlichten Rollback-Root
 `v5.3.2b` zurücksetzen:
 
 ```bash
@@ -180,23 +209,45 @@ Der Stand `v5.3.2b` ist selbst der Rollback-Root und verweist auf kein älteres
 öffentliches Image. Die Befehle sind daher für den Rückfall von einem späteren
 Stable-Image auf diesen Stand vorgesehen.
 
-Lokales Image aus dem frisch geklonten Repository wirklich neu bauen:
+### Optionaler Entwickler-Selbstbau
+
+Für normale Installationen bleibt das veröffentlichte GHCR-Image der
+vorgesehene Weg. Ein lokaler Build benötigt den **vollständigen
+Repository-Checkout**, weil `Dockerfile`, `entrypoint.sh` und der Quellbaum im
+Build-Kontext liegen müssen.
+
+Direkt im Repository-Checkout kann dessen mitgelieferte Compose-Datei verwendet
+werden:
 
 ```bash
-cd "$E3DC_DOCKER_PATH"
+export E3DC_REPO_PATH="/absoluter/pfad/zum/repository-checkout"
+cd "$E3DC_REPO_PATH"
+# In docker-compose.yml die image-Zeile auskommentieren und build: . aktivieren.
 sudo docker compose build --no-cache e3dc-control
 sudo docker compose up -d --force-recreate e3dc-control
 ```
 
-Das lokale Neubauen funktioniert nur, wenn in der `docker-compose.yml` fuer den
-Dienst `e3dc-control` auch `build: .` aktiv ist. Steht dort nur `image: ...`,
-nutzt Docker das vorhandene oder gepullte Image.
+Bleibt die Compose-Datei dagegen im separaten Installationsordner, muss sie den
+Repository-Checkout ausdrücklich als Build-Kontext binden:
 
-Wenn du bewusst lokal aus dem geklonten Repository bauen willst, muss in der
-Compose-Datei `image: ghcr.io/...` auskommentiert und `build: .` aktiviert
-sein. Danach ist die Ausgabe von `docker inspect e3dc-control --format
-'Image={{.Image}} Created={{.Created}}'` ein guter Plausibilitaetscheck: Das
-`Created`-Datum muss zum gerade ausgefuehrten Build passen. Fuer normale
+```yaml
+services:
+  e3dc-control:
+    # image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"
+    build:
+      context: /absoluter/pfad/zum/repository-checkout
+      dockerfile: Dockerfile
+```
+
+Ein bloßes `build: .` im zuvor angelegten, ansonsten leeren
+`$E3DC_DOCKER_PATH` ist unvollständig und wird nicht unterstützt. Steht nur
+`image: ghcr.io/...` in der Compose-Datei, nutzt Docker das vorhandene oder
+gepullte veröffentlichte Image.
+
+Nach einem bewussten lokalen Build ist die Ausgabe von
+`docker inspect e3dc-control --format
+'Image={{.Image}} Created={{.Created}}'` ein guter Plausibilitätscheck: Das
+`Created`-Datum muss zum gerade ausgeführten Build passen. Für normale
 Installationen bleibt das fertige GitHub-Image der bequemere Weg. Ein lokaler
 Build ist für Plattformen oder Anpassungen gedacht, die nicht vom fertigen
 Image abgedeckt werden.

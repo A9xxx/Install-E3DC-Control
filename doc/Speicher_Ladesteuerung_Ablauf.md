@@ -1,6 +1,10 @@
 # Speicher-Ladesteuerung - Systemablauf
 
-> **Stand:** v5.4.2c, gegen den Release-Betriebsvertrag geprüft am 2026-07-27
+> **Stand:** v5.4.2d, gegen den Release-Betriebsvertrag geprüft am 2026-07-28
+>
+> **Hinweis:** 5.4.2d ändert ausschließlich den Update- und
+> Wiederherstellungspfad. Speicherentscheidungen und Hardwareausgänge
+> entsprechen unverändert 5.4.2c.
 >
 > **Dateien:** `Installer/storage_simulator.py`,
 > `Installer/storage_manager.py`, `Installer/storage_parallel_regulator.py`

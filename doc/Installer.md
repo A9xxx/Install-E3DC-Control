@@ -1,10 +1,16 @@
 # E3DC-Control Installer
 
-Dokumentation Stand: 5.4.2c
+Dokumentation Stand: 5.4.2d
 
 Der Installer verwaltet Bare-Metal-Installation, Update, Rechte, Dienste,
 Backup, Rollback und optionale Produktmodule. Er ermittelt Benutzer, Home,
 Installationspfad und Python-Umgebung aus dem geprüften Installationskontext.
+
+Seit 5.4.2d bewertet der Updatepfad den Wiederanlauf erforderlicher Dienste
+anhand des belegten systemd-Endzustands. Nicht installierte optionale Units
+brechen den verifizierten Maskenrücklauf nicht allein wegen einer abweichenden
+systemd-Textausgabe ab. Echte Start-, Masken- oder
+Wiederherstellungsabweichungen bleiben harte, fail-closed Abbruchgründe.
 
 ## Portabler Einstieg
 

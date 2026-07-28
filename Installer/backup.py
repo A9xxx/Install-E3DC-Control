@@ -37,7 +37,7 @@ from .backup_integrity import (
 )
 from .installer_config import get_install_path, get_user_ids, get_www_data_gid, load_config
 from .logging_manager import get_or_create_logger, log_task_completed, log_error, log_warning
-from .service_catalog import allowed_services
+from .service_catalog import allowed_services, get_module_by_service
 
 INSTALL_PATH = get_install_path()
 backup_logger = get_or_create_logger("backup")
@@ -523,12 +523,20 @@ def _reload_and_verify_systemd_mask_states(states):
             "systemd daemon-reload nach Maskenrestore fehlgeschlagen: "
             + (reload_result.stderr or reload_result.stdout or "unbekannter Fehler").strip()
         )
-    allowed = {
+    allowed = frozenset({
         "enabled", "enabled-runtime", "disabled", "static", "indirect",
         "generated", "transient", "alias", "linked", "linked-runtime",
         "not-found", "masked", "masked-runtime",
-    }
+    })
+
     for path in sorted(states):
+        disk_state = _systemd_path_state(path)
+        expected_masked = bool(states[path])
+        if expected_masked != (disk_state == "masked"):
+            raise BackupIntegrityError(
+                f"Systemd-Maskenzustand weicht auf Platte ab "
+                f"({disk_state!r}): {path}"
+            )
         result = subprocess.run(
             ["systemctl", "is-enabled", path.name],
             capture_output=True,
@@ -536,14 +544,73 @@ def _reload_and_verify_systemd_mask_states(states):
             timeout=10,
             check=False,
         )
-        value = (result.stdout or result.stderr or "").strip().splitlines()
-        status = value[0].strip().lower() if value else ""
+        status = next((
+            line.strip().lower()
+            for stream in (result.stdout, result.stderr)
+            for line in str(stream or "").splitlines()
+            if line.strip().lower() in allowed
+        ), "")
+        show_result = None
+        if not status:
+            show_result = subprocess.run(
+                [
+                    "systemctl", "show", path.name,
+                    "--property=LoadState", "--property=UnitFileState",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            fields = dict(
+                line.split("=", 1)
+                for line in str(show_result.stdout or "").splitlines()
+                if "=" in line
+            )
+            unit_file_state = fields.get("UnitFileState", "").strip().lower()
+            try:
+                module = get_module_by_service(path.name)
+            except Exception:
+                module = None
+            optional_missing = (
+                not expected_masked
+                and disk_state == "missing"
+                and module is not None
+                and module.optional
+            )
+            if show_result.returncode == 0 and unit_file_state in allowed:
+                status = unit_file_state
+            elif (
+                show_result.returncode == 0
+                and optional_missing
+                and fields.get("LoadState", "").strip().lower() == "not-found"
+                and unit_file_state in {"", "not-found"}
+            ):
+                status = "not-found"
         if status not in allowed:
-            raise BackupIntegrityError(f"Systemd-Maskenzustand ist nicht lesbar: {path}")
+            detail = (
+                f"is-enabled: stdout={str(result.stdout or '')!r}, "
+                f"stderr={str(result.stderr or '')!r}, rc={result.returncode!r}"
+            )
+            if show_result is not None:
+                detail += (
+                    f"; show: stdout={str(show_result.stdout or '')!r}, "
+                    f"stderr={str(show_result.stderr or '')!r}, "
+                    f"rc={show_result.returncode!r}"
+                )
+            raise BackupIntegrityError(
+                f"Systemd-Maskenzustand ist nicht lesbar: {path}; {detail}"
+            )
         is_masked = status in {"masked", "masked-runtime"}
-        if states[path] != is_masked:
+        if expected_masked != is_masked:
             raise BackupIntegrityError(
                 f"Systemd meldet unerwarteten Maskenzustand {status!r}: {path}"
+            )
+        disk_state_after = _systemd_path_state(path)
+        if disk_state_after != disk_state:
+            raise BackupIntegrityError(
+                f"Systemd-Maskenzustand driftete während der Prüfung "
+                f"({disk_state!r} -> {disk_state_after!r}): {path}"
             )
 
 

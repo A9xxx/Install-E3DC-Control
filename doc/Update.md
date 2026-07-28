@@ -5,14 +5,12 @@ Updates werden ausschließlich über den Installer ausgeführt. Ein manuelles
 Release-Historie ungeeignet, weil alter und neuer Git-Stand nicht miteinander
 verwandt sein müssen.
 
-Der aktuelle Stable-Stand ist `v5.4.2c`. Der Hotfix korrigiert die Priorität
-eines ausdrücklich gültigen Modus-5-Wallbox-Netzladeslots gegenüber dem rein
-wirtschaftlichen Pre-Dump-Floor und ergänzt für Octopus Heat eine lokale
-wiederkehrende Tarifzeitachse, die unabhängig vom Eco-Modus bleibt. Harte
-Nutzer-, Reserve-, Hardware- und Datenfrische-Sperren bleiben vorrangig.
-Außerdem trennt die Docker-Dokumentation den GHCR-Normalweg eindeutig vom
-lokalen Entwickler-Selbstbau. Der in `v5.4.2b` korrigierte, versiegelte
-Alt-Updater-Übergang bleibt unverändert erhalten.
+Der aktuelle Stable-Stand ist `v5.4.2d`. Der Hotfix bewertet den Wiederanlauf
+erforderlicher Dienste anhand des belegten systemd-Endzustands statt allein
+anhand eines Zwischen-Rückgabecodes. Eine nicht installierte optionale Unit
+wird beim verifizierten Maskenrücklauf als legitimer fehlender Zustand
+behandelt. Echte Start-, Masken- oder Wiederherstellungsabweichungen bleiben
+fail-closed; die EMS-Regelung entspricht unverändert 5.4.2c.
 
 Die Konsolenbeispiele verwenden den zuvor geprüften absoluten Produktpfad:
 
@@ -355,7 +353,7 @@ Writer-/Aktor-Dienste gestoppt.
 
 ## Gezielter Rückfall
 
-`v5.4.2b` übernimmt unverändert den in `v5.4.2` veröffentlichten
+`v5.4.2d` übernimmt unverändert den in `v5.4.2` veröffentlichten
 Rückfallvertrag.
 
 `v5.4.2` bietet den bereinigten Root `v5.3.2b` ausschließlich als

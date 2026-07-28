@@ -410,6 +410,35 @@ def _service_unit_exists(service: str) -> bool:
     return any(os.path.exists(os.path.join(unit_dir, unit)) for unit_dir in SYSTEMD_UNIT_DIRS)
 
 
+SYSTEMD_KNOWN_UNIT_FILE_STATES = {
+    "enabled", "enabled-runtime", "disabled", "static", "indirect",
+    "generated", "transient", "alias", "linked", "linked-runtime",
+    "masked", "masked-runtime", "not-found",
+}
+
+
+def _systemd_state_from_result(result: dict, allowed_states) -> str:
+    """Extrahiert ausschließlich einen kanonischen systemd-Zustandswert."""
+
+    allowed = set(allowed_states)
+    for stream in ("stdout", "stderr"):
+        for line in str(result.get(stream) or "").splitlines():
+            value = line.strip().lower()
+            if value in allowed:
+                return value
+    return ""
+
+
+def _command_result_diagnostic(result: dict) -> str:
+    """Bewahrt stdout, stderr und Returncode für eine konkrete Fehleranalyse."""
+
+    return (
+        f"stdout={str(result.get('stdout') or '')!r}, "
+        f"stderr={str(result.get('stderr') or '')!r}, "
+        f"rc={result.get('returncode')!r}"
+    )
+
+
 def _read_json_nofollow(path: str) -> tuple[dict, bytes]:
     """Read one bounded regular JSON file without accepting symlink components."""
     candidate = os.path.abspath(str(path))
@@ -2054,10 +2083,41 @@ def _restart_v4_services(
             run_command(f'sudo systemctl reset-failed {srv} 2>/dev/null || true', timeout=10)
             enable = run_command(f'sudo systemctl enable {srv}', timeout=15)
             res = run_command(f'sudo systemctl restart {srv}', timeout=15)
-            status = '[OK]' if enable['success'] and res['success'] else '[!] FEHLER'
-            print(f'  {status} {srv}')
-            if not enable['success'] or not res['success']:
-                errors.append(f'{srv} konnte nicht aktiviert/gestartet werden')
+            enabled_probe = run_command(f'systemctl is-enabled {srv}', timeout=10)
+            enabled_state = _systemd_state_from_result(
+                enabled_probe,
+                SYSTEMD_KNOWN_UNIT_FILE_STATES,
+            )
+            active_probe = run_command(f'systemctl is-active {srv}', timeout=10)
+            active_state = _systemd_state_from_result(
+                active_probe,
+                {"active", "inactive", "failed", "activating", "deactivating", "reloading"},
+            )
+            # Release-Dienste müssen nach einem Update rebootfest aktiviert
+            # sein. Runtime-, static-, linked- oder generated-Zustände reichen
+            # trotz aktuell aktivem Prozess nicht als Persistenzbeweis.
+            enabled_ok = enabled_state == "enabled"
+            active_ok = active_state == "active"
+            print(f"  {'[OK]' if enabled_ok and active_ok else '[!] FEHLER'} {srv}")
+            command_notes = []
+            if not enable["success"]:
+                command_notes.append("enable " + _command_result_diagnostic(enable))
+            if not res["success"]:
+                command_notes.append("restart " + _command_result_diagnostic(res))
+            if command_notes:
+                print(
+                    f"  [HINWEIS] {srv}: " + "; ".join(command_notes)
+                    + f"; Endzustand={enabled_state or 'unlesbar'}/{active_state or 'unlesbar'}"
+                )
+            if not enabled_ok or not active_ok:
+                errors.append(
+                    f"{srv} besitzt keinen sicheren Start-Endzustand "
+                    f"({enabled_state or 'unlesbar'}/{active_state or 'unlesbar'}); "
+                    f"enable {_command_result_diagnostic(enable)}; "
+                    f"restart {_command_result_diagnostic(res)}; "
+                    f"is-enabled {_command_result_diagnostic(enabled_probe)}; "
+                    f"is-active {_command_result_diagnostic(active_probe)}"
+                )
     if errors:
         for error in errors:
             print(f"  [!] {error}")

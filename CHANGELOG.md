@@ -6,6 +6,23 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.2d] – 2026-07-28
+
+### 📦 Dienst-Wiederanlauf
+
+- 🐛 **Endzustand statt Zwischen-Rückgabecode:** Der Updater bewertet einen erforderlichen Dienst nach `enable` und `restart` anhand des nachweisbaren systemd-Endzustands. Ein zwischenzeitlicher Rückgabecode allein verwirft keinen tatsächlich aktivierten und laufenden Dienst mehr.
+- 🔎 **Präzise Fehlerursache:** Bleibt ein erforderlicher Dienst deaktiviert oder inaktiv, enthält das Updateprotokoll den konkreten Enable-, Restart- und Endzustand. Echte Startfehler brechen den Releasewechsel weiterhin fail-closed ab.
+
+### 🔐 Verifizierter Maskenrücklauf
+
+- 🐛 **Optionale fehlende Units:** Eine auf dem Zielsystem nicht installierte optionale systemd-Unit wird beim Maskenrücklauf als legitimer fehlender Zustand behandelt und löst nicht mehr allein durch eine abweichende systemd-Textausgabe einen unbeweisbaren Rollback aus.
+- 🛡️ **Maskenschutz bleibt strikt:** Reguläre Unit-Dateien, kanonische `/dev/null`-Masken, unerwartete Links und unlesbare Zustände bleiben getrennt geprüft. Reale Masken- oder Wiederherstellungsabweichungen halten Writer und Aktoren weiterhin sicher gestoppt.
+
+### 📦 Releaseumfang
+
+- 🧹 **Browser-Cache:** Der Service-Worker verwendet die 5.4.2d-Kennung.
+- 🛡️ **Keine EMS-Änderung:** Speicher-, Direktvermarktungs-, Wallbox-, Wärme-, Prognose- und Hardwareverträge entsprechen unverändert 5.4.2c.
+
 ## [5.4.2c] – 2026-07-27
 
 ### 🔌 Wallbox-Netzladeslot

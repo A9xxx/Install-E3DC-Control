@@ -1,9 +1,9 @@
 {
-  "version": "5.4.2c",
+  "version": "5.4.2d",
   "min_version": "4.0.0",
-  "stable_release": "v5.4.2c",
-  "release_date": "2026-07-27",
-  "description": "v5.4.2c - Wallbox-Netzladeslots, Octopus Heat und Docker-Dokumentation",
+  "stable_release": "v5.4.2d",
+  "release_date": "2026-07-28",
+  "description": "v5.4.2d - Dienst-Endzustand und robuster systemd-Maskenrücklauf",
   "installer_requires": "python3",
   "sanitized_republication": false,
   "history_transition": {

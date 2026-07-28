@@ -14,8 +14,14 @@ test -f "$E3DC_INSTALL_PATH/e3dc-setup"
 
 ## Programmstand zurücksetzen
 
-Der aktuelle Stable-Stand `v5.4.2c` übernimmt denselben gebundenen
+Der aktuelle Stable-Stand `v5.4.2d` übernimmt denselben gebundenen
 Rückfallvertrag wie `v5.4.2`.
+
+Beim Rücklauf wird der tatsächliche Dateisystemzustand einer Unit weiterhin
+streng gegen reguläre Unit-Datei, kanonische `/dev/null`-Maske, unerwarteten
+Link oder fehlenden optionalen Zustand geprüft. Eine nicht installierte
+optionale Unit darf den Rücklauf nicht allein wegen einer abweichenden
+systemd-Textausgabe verwerfen; echte Maskenabweichungen bleiben blockierend.
 
 `v5.4.2` bietet den öffentlichen Rollback-Root `v5.3.2b` ausschließlich als
 Docker-Image an. Dieser Root enthält keinen älteren öffentlichen Tag. Auf Bare

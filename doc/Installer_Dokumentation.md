@@ -1,6 +1,6 @@
 # Betrieb des E3DC-Control Installers
 
-Dokumentation Stand: 5.4.2c
+Dokumentation Stand: 5.4.2d
 
 Der Installer ist der freigegebene Einstieg für Installation, Update,
 Reparatur, Backup, Rollback und Deinstallation. Die vollständige Bedienung ist
@@ -28,7 +28,12 @@ bash "$E3DC_INSTALL_PATH/e3dc-setup" --fix-permissions
 - Writer-/Aktor-Dienste werden vor einem Programmbaumwechsel nachweislich gestoppt.
 - Ziel-Tag und vollständiger Ziel-SHA müssen zusammenpassen.
 - Webdateien werden nur über geprüfte Positiv- und Löschlisten synchronisiert.
-- Dienste starten erst nach erfolgreicher Migration, Rollenprüfung und lokaler HTTP-Prüfung.
+- Dienste starten erst nach erfolgreicher Migration und Rollenprüfung; ihr
+  Enable-/Aktiv-Endzustand wird getrennt von den Zwischen-Rückgabecodes
+  verifiziert.
+- Fehlende optionale Units sind beim Maskenrücklauf ein legitimer Zustand;
+  echte Unit-, Masken- oder Wiederherstellungsabweichungen bleiben blockierend.
+- Die lokale HTTP-Prüfung bleibt Bestandteil des erfolgreichen Abschlusses.
 - Bei unvollständigem Rollback bleiben Writer gestoppt.
 - Nur eine echte Erstinstallation erhält beim erstmaligen Erzeugen der
   Konfiguration die Einzelanlagenrolle `off`. Bestehende Konfigurationen ohne

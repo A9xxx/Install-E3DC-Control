@@ -1,3 +1,37 @@
+# E3DC-Control v5.4.2d
+
+E3DC-Control 5.4.2d ist ein eng begrenzter Hotfix für den verifizierten
+Dienst-Wiederanlauf und den systemd-Maskenrücklauf des Bare-Metal-Updaters.
+
+## Dienst-Wiederanlauf
+
+- Nach `systemctl enable` und `systemctl restart` bewertet der Updater den
+  nachweisbaren Endzustand eines erforderlichen Dienstes. Ein
+  Zwischen-Rückgabecode allein gilt nicht mehr als Fehlschlag, wenn die Unit
+  am Ende korrekt aktiviert und aktiv ist.
+- Bleibt eine erforderliche Unit deaktiviert oder inaktiv, protokolliert der
+  Updater Enable-, Restart- und Endzustand und bricht weiterhin fail-closed
+  ab.
+
+## Verifizierter Maskenrücklauf
+
+- Eine nicht installierte optionale systemd-Unit wird als legitimer fehlender
+  Zustand normalisiert. Eine abweichende textuelle Ausgabe von systemd kann
+  deshalb nicht mehr allein einen ansonsten beweisbaren Rücklauf verwerfen.
+- Der Schutz wird nicht gelockert: reguläre Unit-Dateien, exakte
+  `/dev/null`-Masken, unerwartete Links und unlesbare Zustände bleiben
+  getrennt geprüft. Echte Masken- oder Wiederherstellungsabweichungen lassen
+  Writer und Aktoren weiterhin sicher gestoppt.
+
+Dieser Hotfix ändert keine EMS-Regelung. Speicher, Direktvermarktung,
+Wallboxen, Wärme, Prognose und Hardwareausgänge entsprechen unverändert
+5.4.2c. Bare-Metal-Nutzer verwenden den normalen Web- oder Konsolen-Updater.
+Docker-Nutzer verwenden nach erfolgreicher Digest-, SBOM-, Provenance- und
+Attestierungsprüfung das GHCR-Image `v5.4.2d`; der öffentliche
+Docker-Rückfallstand bleibt `v5.3.2b`.
+
+---
+
 # E3DC-Control v5.4.2c
 
 E3DC-Control 5.4.2c ist ein Hotfix für die Priorität ausdrücklich geplanter

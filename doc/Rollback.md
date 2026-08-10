@@ -14,8 +14,7 @@ test -f "$E3DC_INSTALL_PATH/e3dc-setup"
 
 ## Programmstand zurücksetzen
 
-Der aktuelle Stable-Stand `v5.4.2d` übernimmt denselben gebundenen
-Rückfallvertrag wie `v5.4.2`.
+Der aktuelle Stable-Stand `v5.4.3` führt den gebundenen Rückfallvertrag fort.
 
 Beim Rücklauf wird der tatsächliche Dateisystemzustand einer Unit weiterhin
 streng gegen reguläre Unit-Datei, kanonische `/dev/null`-Maske, unerwarteten
@@ -41,7 +40,7 @@ auf den Altstand ist kein unterstützter Rückweg. Der Legacy-Dienst
 bash "$E3DC_INSTALL_PATH/e3dc-setup"
 ```
 
-Wähle **`13) System-Backup erstellen / verwalten`** und den gewünschten
+Wähle im sichtbaren Hauptmenü **`6) Backup erstellen / verwalten`** und den gewünschten
 Sicherungspunkt. Backups ohne gültiges Manifest und Manifest-Digest werden
 nicht angeboten. Vor dem Überschreiben wird ein neues Sicherheits-Backup
 erstellt; der ausgewählte Sicherungspunkt ist dabei von der Retention

@@ -1,3 +1,161 @@
+# E3DC-Control v5.4.3
+
+E3DC-Control 5.4.3 bündelt Verbesserungen für Installation, Docker,
+Speicher- und Direktvermarktungssteuerung, Wallboxen, Wärmeverbraucher und die
+Darstellung im Dashboard. Fehlende, veraltete oder widersprüchliche Daten
+führen weiterhin zu einem sicheren Zustand und nicht zu einer zusätzlichen
+Leistungsfreigabe.
+
+## Installation und Update
+
+- Eine frische Installation auf Raspberry Pi OS Bookworm führt Paket-,
+  Apache-, Konfigurations-, RAM-Disk-, Web- und Dienstschritte in einer festen
+  Reihenfolge aus. Ein Fehler beendet die Installation verständlich; ein
+  vorhandener funktionierender Zustand bleibt erhalten beziehungsweise wird
+  bei einem Abbruch wiederhergestellt.
+- Der Updater bindet den freigegebenen Zielstand vor Backup und Dienststopp
+  eindeutig an Version, Herkunft und Anlagenrolle. Fortschritt und
+  Lebenszeichen bleiben auch auf langsameren Raspberry Pis sichtbar.
+- Ist dieselbe Version bereits vollständig installiert, bleibt ein normales
+  Update ohne Unterbrechung wirkungslos. Eine Reparatur oder Neuinstallation
+  derselben Version muss ausdrücklich bestätigt werden.
+- Der bisherige allgemeine Web-/sudo-Pfad für administrative Produktänderungen
+  entfällt. Installation, Reparatur und Rückfall werden über den geschützten
+  Konsolenweg ausgeführt; die Weboberfläche kann den laufenden Vorgang weiter
+  anzeigen.
+- Beim ersten Wechsel aus 5.4.2d gilt einmalig noch die Zeitgrenze des dort
+  gestarteten Updaters. Danach greift der neue, phasenbezogene Updatevertrag.
+
+## Docker
+
+- Docker-Installation und -Update werden eindeutig als Aktionen auf dem
+  Docker-Host behandelt. Der Host-Helfer prüft Architektur, Anlagenrolle,
+  vorhandene Instanzen und konkurrierende Dienste vor einer Änderung.
+- Ein neues Image wird vollständig gestartet und anhand der tatsächlich
+  gewählten Dienste geprüft. Bei einem fehlerhaften Kandidaten wird dieser
+  wieder gestoppt.
+- Unveränderte offizielle Compose-Dateien aus 5.4.2 bis 5.4.2d und die
+  bekannte Installer-Variante werden sicher auf den neuen Compose-Vertrag
+  übernommen. `.env` und vorhandene Daten-, Log-, ML- und Forecast-Speicherorte
+  bleiben erhalten. Angepasste oder mehrdeutige Installationen werden zur
+  manuellen Prüfung angehalten statt automatisch überschrieben.
+- Unterstützt werden 64-Bit-ARM und AMD64. 32-Bit-ARM wird vor dem Download
+  verständlich abgelehnt; Dateien sind auch für rootless Containerlaufzeiten
+  mit gültigen Besitzern vorbereitet.
+- Die Compose-Vorgabe begrenzt und rotiert die Docker-Engine-Logs.
+  Automatische Watchtower-Updates bleiben eine bewusste Zusatzoption.
+
+## Speicher und Direktvermarktung
+
+- Marktpreisabhängiges Netzladen wird nur bei einer vollständigen, frischen
+  Gesamtunterdeckung geplant. Energiemenge, Leistung und Startzeit richten
+  sich nach dem belegten Bedarf.
+- Speicherreserve, Sollkurve, Hausversorgung und Verbraucherbudgets bleiben
+  getrennt. Fehlende oder abweichende E3/DC-Rückmeldungen öffnen keinen
+  zusätzlichen Lade- oder Entladerahmen.
+- Storage Manager, Direktvermarktung, Wallboxführung und externe E3/DC-Regler
+  verwenden einen gemeinsamen Ownervertrag. Spätere Nebenpfade können eine
+  stärkere oder bereits bestätigte Speicherentscheidung nicht verdrängen.
+- Bei aktiver Direktvermarktung öffnet nur ein aktuell gültiger und vollständig
+  gebundener Abschnitt „PV speichern“ die Speicherladung. Andere Abschnitte
+  halten den Laderahmen geschlossen, ohne die geschützte Hausversorgung aus
+  dem Speicher zu erzwingen.
+- Ein Preis von genau 0 ct/kWh gilt nicht als Negativpreis. Rohbörsenpreis,
+  Abrechnungspreis und erwarteter Nettoerlös werden getrennt bewertet und
+  angezeigt.
+- Schaltzustände eines angebundenen Zusatzwechselrichters werden vor und nach
+  einem Befehl zurückgelesen. Unbestätigte Zustände bleiben sichtbar; eine
+  Gegenschaltsperre schützt das Relais vor Flattern.
+- Plan, freigegebene Aktion und tatsächliche Wirkung werden getrennt
+  dargestellt. Das Dashboard zeigt den finalen Speicherzustand und dessen
+  tatsächlichen Ausführungseigentümer aus einer gemeinsamen Quelle.
+
+## Wallbox und openWB
+
+- Eine neue Stecksession wird auch während Pause, „Aus“ oder Wartephasen
+  erkannt. Der erste Start erfolgt mit dem vorgesehenen Ladestrom; Wake-up-
+  Versuche folgen erst nach einer erfolglosen Antwortfrist.
+- Eine kurze 0-W-Rückmeldung beendet eine openWB-Ladung nicht mehr. Ein
+  Ladeende muss innerhalb derselben Stecksession durch mehrere frische
+  Rückmeldungen bestätigt werden.
+- Bei der openWB Pro beginnen Warte- und Schutzzeiten erst nach einem
+  tatsächlich ausgeführten Phasenbefehl. Die Schutzzeit verhindert nur einen
+  weiteren Phasenwechsel und nicht den bestätigten Wiederanlauf.
+- Eine frische, zur aktuellen Stecksession passende openWB-Gesamtreichweite
+  hat Vorrang. Eine berechnete Profilreichweite dient nur noch als Rückfall,
+  wenn kein verlässlicher openWB-Wert vorliegt.
+- Genau ein Wallbox Manager besitzt den Hardwareausgang. Deaktivierte
+  Ladepunkte, alte Cachewerte und frühere Web-Stellwege können keine
+  zusätzliche Wallbox oder einen konkurrierenden Befehl erzeugen.
+- Leistung wird als gemeinsames Wattbudget verteilt und anhand der bestätigten
+  Phasenzahl je Wallbox übersetzt. Gerätegrenzen, Hausanschluss,
+  Mindestleistung, Lastspitzenbegrenzung und Nutzerpriorität bleiben
+  vorrangig.
+
+## Wärme
+
+- Wallboxen, Wärmepumpe und Heizstab erhalten getrennte Teilbudgets aus einem
+  gemeinsamen Leistungsrahmen. Die eingestellte Verbraucherpriorität
+  entscheidet; ungenutzte Leistung wird im nächsten Zyklus wieder
+  freigegeben.
+- Der Luxtronik-Anlauf berücksichtigt Pumpenvorlauf und Verdichterstart in
+  einem festen Anlauffenster. Danach wird nur noch die tatsächlich gemessene
+  Leistungsaufnahme reserviert.
+- Der Shelly-Pro3EM-Pfad bindet Messung, Relaiszustand und Aktor-Owner an
+  frische Rückmeldungen. Fehlende, veraltete oder konkurrierende Daten lösen
+  keinen neuen Start aus.
+- Mindestlaufzeiten, Startwächter und andere Schutzzeiten bleiben über
+  Dienstneustarts und Änderungen der Systemuhr erhalten.
+- Stiebel-Eltron-Zustände werden anhand der dokumentierten Statusbits
+  ausgewertet. Betriebsmodus 5 allein erscheint nicht mehr als aktive
+  Warmwasserbereitung; veraltete oder fremde Daten werden nicht als aktuelle
+  Anlage angezeigt.
+- Ein gültiges Toshiba-Sitzungstoken wird ausschließlich im Arbeitsspeicher
+  wiederverwendet. Neue Anmeldungen und Wiederholungen bei Ratenbegrenzung
+  erfolgen kontrolliert, ohne das Token dauerhaft zu speichern.
+
+## Dashboard und Prognose
+
+- Bei aktiver Direktvermarktung zeigt das Dashboard nur den DV-Fahrplan; ohne
+  Direktvermarktung nur die Standardprognose. Auch im Ladekurvenfenster
+  erscheint ausschließlich die zum Betriebsmodus passende Kurve.
+- Der aktuelle Batterie-SoC wird als eigener, frischer Messpunkt dargestellt
+  und verändert keine geplante Ladekurve. Fehlt ein verlässlicher Messwert,
+  bleibt der Punkt leer.
+- Plan-, DV- und Diagnosedaten werden je Anfrage einmal verarbeitet. Weniger
+  Achsenmarken, sichtbare Tageswechsel und vollständige Datumsangaben machen
+  mehrtägige Diagramme übersichtlicher.
+- Die SoC-Historie blockiert den ersten Diagrammaufbau nicht mehr. Verspätete
+  Antworten oder ein Moduswechsel können keine ältere Kurve oder Anzeige über
+  einen neueren Zustand legen.
+- Nach PWA-Standby, Seitenrückkehr oder erneuter Netzwerkverbindung wird eine
+  alte Liveabfrage ersetzt. Teilweise WebSocket-Daten löschen keine weiterhin
+  gültigen Plan- und Zielkurven.
+- Gebündelte Liveabfragen, wiederverwendete Planstände und begrenzte
+  Historienzugriffe reduzieren unnötige Rechen-, PHP- und Datenträgerlast.
+
+## Sicherheit und Rückfall
+
+- Vor einem Update wird der tatsächliche Dienstzustand gebunden. Bei einem
+  Abbruch wird genau dieser Zustand wiederhergestellt; ohne vollständigen
+  Rollen-, Dienst- und Gesundheitsnachweis bleiben Writer und Aktoren sicher
+  gestoppt.
+- Pro Domäne bleibt genau ein fachlicher Entscheider und ein Hardwareausgang
+  wirksam. Doppelprozesse, fremde Startpfade sowie unlesbare oder
+  widersprüchliche Zustände werden vor der Ansteuerung blockiert.
+- Bare-Metal- und Docker-Dienste starten nur mit einer echten flüchtigen
+  RAM-Disk. Ein falscher Mount oder ein Rückfall auf das Root-Dateisystem
+  stoppt die betroffenen Produktdienste, während Reparaturwege erreichbar
+  bleiben.
+- Prognose-, Shadow- und Wärme-Diagnosen bleiben ohne Hardwarewirkung.
+  Unvollständige Evidenz wird sichtbar gekennzeichnet und kann keine
+  Speicher-, Wallbox- oder Wärmefreigabe erzeugen.
+- Schreibzugriffe auf SD-Karte und SSD werden durch gebündelte Status-,
+  Historien- und Datenbankaktualisierungen reduziert. Sicherheitsrelevante
+  Übergänge bleiben dennoch unmittelbar nachvollziehbar.
+
+---
+
 # E3DC-Control v5.4.2d
 
 E3DC-Control 5.4.2d ist ein eng begrenzter Hotfix für den verifizierten
@@ -371,8 +529,13 @@ Importcache-Kompatibilitätsbrücke. Diese historischen Übergangsschritte dürf
 nicht durch einen manuellen `git pull` ersetzt werden. Details stehen in
 `doc/Update.md`.
 
-Docker-Nutzer prüfen das konfigurierte Image und recreaten erst nach einem
-erfolgreichen Pull:
+> **Historischer Hinweis für 5.4.2:** Der folgende Befehlsblock dokumentiert
+> den damaligen Ablauf und ist nicht für aktuelle Installationen oder Updates
+> bestimmt. Aktuelle Stände verwenden den sicheren Host-Helfer aus dem
+> [Docker-Updateweg](doc/Docker_Dokumentation.md#3-updates-und-optionaler-watchtower).
+
+Docker-Nutzer prüften damals das konfigurierte Image und erzeugten den Container
+erst nach einem erfolgreichen Pull neu:
 
 ```bash
 (

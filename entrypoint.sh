@@ -33,6 +33,33 @@ daily_peaks.json
 live_history.txt
 "
 
+require_exact_ramdisk_tmpfs() {
+    local mounted_target=""
+    if [ ! -x /usr/bin/findmnt ]; then
+        echo "-> FEHLER: /usr/bin/findmnt fehlt; E3DC-Dienste bleiben gestoppt."
+        return 1
+    fi
+    mounted_target="$(
+        /usr/bin/findmnt \
+            --kernel \
+            --first-only \
+            --mountpoint "$RAMDISK_DIR" \
+            --types tmpfs \
+            --noheadings \
+            --output TARGET \
+            2>/dev/null
+    )" || mounted_target=""
+    if [ "$mounted_target" != "$RAMDISK_DIR" ]; then
+        echo "-> FEHLER: $RAMDISK_DIR ist nicht exakt als tmpfs gemountet."
+        echo "   E3DC-Dienste und Apache werden zum Schutz vor persistenten Ersatzschreibzugriffen nicht gestartet."
+        return 1
+    fi
+}
+
+# Docker besitzt kein systemd-Drop-in. Deshalb gilt dieselbe Sperre hier vor
+# Apache, PHP und jedem Python-/Node-Dienst.
+require_exact_ramdisk_tmpfs
+
 configure_apache_web_port() {
     local web_port="${E3DC_WEB_PORT:-80}"
     local web_bind="${E3DC_WEB_BIND:-}"
@@ -78,7 +105,7 @@ EOF
     fi
     echo "   -> Apache Listen-Konfiguration:"
     grep -R '^[[:space:]]*Listen[[:space:]]' /etc/apache2/ports.conf /etc/apache2/conf-enabled /etc/apache2/sites-enabled 2>/dev/null || true
-    apache2ctl -t || true
+    apache2ctl -t
 }
 
 restore_ramdisk_cache() {
@@ -113,41 +140,80 @@ save_ramdisk_cache() {
 }
 
 shutdown_container() {
-    echo "-> Stop-Signal empfangen: sichere Ramdisk-Warmstartdaten..."
+    local exit_status="${1:-0}"
+    local pids=""
+    trap - TERM INT
+    echo "-> Container wird beendet: sichere Ramdisk-Warmstartdaten..."
     save_ramdisk_cache || true
     pids="$(jobs -pr)"
     if [ -n "$pids" ]; then
         kill $pids 2>/dev/null || true
         wait $pids 2>/dev/null || true
     fi
-    exit 0
+    exit "$exit_status"
 }
-trap shutdown_container TERM INT
+
+handle_stop_signal() {
+    shutdown_container 0
+}
+
+trap handle_stop_signal TERM INT
 
 # Web-Interface aus dem gemounteten Repo in den Apache-Webroot synken.
 # Der Code liegt via Volume unter /app/pi/Install/html/, Apache liest aus /var/www/html/.
 echo "-> Synke Web-Interface (html/ -> /var/www/html/)..."
+WWW_DATA_GID="$(id -g www-data)"
+if [ -L /var/www/html ] || [ ! -d /var/www/html ]; then
+    echo "-> FEHLER: /var/www/html ist kein eindeutiges Verzeichnis."
+    exit 1
+fi
+# Der Elternname des RAM-Disk-Mountpoints muss schon vor jeder Root-Kopie
+# unveränderlich sein. Nur die getrennten Laufzeitunterordner werden später
+# für www-data schreibbar gemacht.
+chown root:www-data /var/www/html
+chmod 0755 /var/www/html
+UNSAFE_WEB_ENTRY="$(
+    find -P /var/www/html -xdev \
+        \( -type l -o \( ! -type d -a ! -type f \) \) \
+        -print -quit
+)"
+if [ -n "$UNSAFE_WEB_ENTRY" ]; then
+    echo "-> FEHLER: Unsicherer bestehender Webroot-Eintrag: $UNSAFE_WEB_ENTRY"
+    exit 1
+fi
 if [ -d "/app/pi/Install/html" ]; then
+    UNSAFE_WEB_SOURCE="$(
+        find -P /app/pi/Install/html -xdev \
+            \( -type l -o \( ! -type d -a ! -type f \) \) \
+            -print -quit
+    )"
+    if [ -n "$UNSAFE_WEB_SOURCE" ]; then
+        echo "-> FEHLER: Unsicherer Web-Quellbaum: $UNSAFE_WEB_SOURCE"
+        exit 1
+    fi
     if [ ! -d "/app/pi/Install/html/app" ]; then
         rm -rf /var/www/html/app
     fi
     cp -r /app/pi/Install/html/. /var/www/html/
-    chown -R www-data:www-data /var/www/html/
+    for web_kind in d f; do
+        if [ "$web_kind" = "d" ]; then
+            web_mode=0755
+        else
+            web_mode=0644
+        fi
+        find -P /var/www/html -xdev \
+            \( -path /var/www/html/data -o -path /var/www/html/logs \
+               -o -path /var/www/html/ramdisk -o -path /var/www/html/tmp \) \
+            -prune -o -type "$web_kind" \
+            -exec chown root:www-data -- {} + \
+            -exec chmod "$web_mode" -- {} +
+    done
     echo "   -> Web-Interface aktualisiert."
 else
     echo "   -> WARNUNG: /app/pi/Install/html nicht gefunden! Repo korrekt gemountet?"
 fi
 
-# Matter-Abhängigkeiten einmalig im Container installieren.
 MATTER_DIR="/app/pi/Install/Installer/matter"
-if [ -f "$MATTER_DIR/package.json" ] && [ ! -f "$MATTER_DIR/package-lock.json" ]; then
-    echo "-> FEHLER: Matter-Lockdatei fehlt; Start wird abgebrochen."
-    exit 1
-fi
-if [ -f "$MATTER_DIR/package-lock.json" ] && [ ! -d "$MATTER_DIR/node_modules" ]; then
-    echo "-> Installiere Matter-Abhängigkeiten..."
-    cd "$MATTER_DIR" && npm ci --omit=dev --ignore-scripts && cd /app/pi/Install
-fi
 
 # Rechte des persistenten Daten-Ordners korrigieren
 mkdir -p /var/www/html/data/matter-storage
@@ -155,6 +221,9 @@ chown -R www-data:www-data /var/www/html/data
 chmod 2775 /var/www/html/data
 find /var/www/html/data/matter-storage -type d -exec chmod 700 {} \;
 find /var/www/html/data/matter-storage -type f -exec chmod 600 {} \;
+mkdir -p /var/www/html/tmp
+chown -R www-data:www-data /var/www/html/tmp
+chmod 2775 /var/www/html/tmp
 
 # Config Management: Die Config lebt jetzt PERSISTENT im data-Ordner!
 V4_CONFIG="/var/www/html/data/e3dc_v4.json"
@@ -192,21 +261,60 @@ chown -R www-data:www-data "$RAMDISK_DIR"
 chmod 2775 "$RAMDISK_DIR"
 restore_ramdisk_cache
 
+# Root-kontrollierter Einzelschreiber-Namespace (nicht in der www-data-Ramdisk).
+LOCK_NAMESPACE_ROOT="/run/e3dc-control"
+LOCK_DIRECTORY="$LOCK_NAMESPACE_ROOT/locks"
+STORAGE_MANAGER_LOCK="$LOCK_DIRECTORY/storage_manager.owner.lock"
+WALLBOX_MANAGER_LOCK="$LOCK_DIRECTORY/wallbox_manager.owner.lock"
+ENERGY_MANAGER_LOCK="$LOCK_DIRECTORY/energy_manager.owner.lock"
+HEIZSTAB_MANAGER_LOCK="$LOCK_DIRECTORY/heizstab_manager.owner.lock"
+HEAT_ACTUATOR_ENDPOINTS_LOCK="$LOCK_DIRECTORY/heat_actuator_endpoints.lock"
+
+for lock_dir in "$LOCK_NAMESPACE_ROOT" "$LOCK_DIRECTORY"; do
+    if [ -L "$lock_dir" ] || { [ -e "$lock_dir" ] && [ ! -d "$lock_dir" ]; }; then
+        echo "-> FEHLER: Unsicherer Manager-Locknamespace: $lock_dir"
+        exit 1
+    fi
+    install -d -o root -g root -m 0755 -- "$lock_dir"
+    if [ "$(stat -c '%u:%g:%a' -- "$lock_dir")" != "0:0:755" ]; then
+        echo "-> FEHLER: Manager-Lockverzeichnis ist nicht root:root 0755: $lock_dir"
+        exit 1
+    fi
+done
+
+for lock_file in \
+    "$STORAGE_MANAGER_LOCK" \
+    "$WALLBOX_MANAGER_LOCK" \
+    "$ENERGY_MANAGER_LOCK" \
+    "$HEIZSTAB_MANAGER_LOCK" \
+    "$HEAT_ACTUATOR_ENDPOINTS_LOCK"; do
+    if [ -L "$lock_file" ] || { [ -e "$lock_file" ] && [ ! -f "$lock_file" ]; }; then
+        echo "-> FEHLER: Unsichere Manager-Lockdatei: $lock_file"
+        exit 1
+    fi
+    if [ ! -e "$lock_file" ]; then
+        install -o root -g www-data -m 0660 /dev/null "$lock_file"
+    fi
+    if [ "$(stat -c '%h' -- "$lock_file")" != "1" ]; then
+        echo "-> FEHLER: Manager-Lockdatei besitzt nicht genau einen Hardlink: $lock_file"
+        exit 1
+    fi
+    chown root:www-data -- "$lock_file"
+    chmod 0660 -- "$lock_file"
+    if [ "$(stat -c '%u:%g:%a' -- "$lock_file")" != "0:${WWW_DATA_GID}:660" ]; then
+        echo "-> FEHLER: Manager-Lockdatei ist nicht root:www-data 0660: $lock_file"
+        exit 1
+    fi
+done
+
 # Logs-Ordner: www-data + Python-Prozesse muessen schreiben duerfen
 mkdir -p /var/www/html/logs
 chown -R www-data:www-data /var/www/html/logs
 chmod -R 775 /var/www/html/logs
-
-echo "-> Starte Apache Webserver..."
-configure_apache_web_port
-service apache2 start
-
-echo "-> Starte D-Bus und Avahi für Matter mDNS..."
-service dbus start >/dev/null 2>&1 || true
-service avahi-daemon start >/dev/null 2>&1 || true
-
-echo "-> Starte Python Hintergrunddienste..."
-cd /app/pi/Install/Installer
+if [ "$(stat -c '%u:%g:%a' -- /var/www/html)" != "0:${WWW_DATA_GID}:755" ]; then
+    echo "-> FEHLER: Webroot schützt den RAM-Disk-Namensraum nicht dauerhaft."
+    exit 1
+fi
 
 # Nutze das sichere VENV aus dem Container
 PYTHON_EXEC="/opt/venv/bin/python3"
@@ -214,14 +322,223 @@ PYTHON_EXEC="/opt/venv/bin/python3"
 # Führe V4-Migration aus, falls alte e3dc.config.txt existiert und Keys in e3dc_v4.json fehlen
 echo "-> Prüfe und migriere alte Konfiguration..."
 cd /app/pi/Install
-$PYTHON_EXEC -c "from Installer.config_manager import run_config_wizard; run_config_wizard()"
-cd /app/pi/Install/Installer
+if ! "$PYTHON_EXEC" - "$V4_CONFIG" <<'PY'
+import json
+import sys
 
-# Helper-Funktion zum Lesen aus V4 JSON
-# $1 = key (z.B. wb_native_enable)
-get_v4_val() {
-    $PYTHON_EXEC -c "import sys, json; c=json.load(open('$V4_CONFIG')) if open('$V4_CONFIG').read().strip() else {}; print(c.get('$1', ''))" 2>/dev/null
+from Installer.config_manager import _save_v4, run_config_wizard
+from Installer.installer_config import apply_web_config_start_defaults
+from Installer.ha_writer_admission import project_instance_role_anchor
+
+
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as config_file:
+        config = json.load(config_file)
+except Exception as exc:
+    print(f"V4-Konfiguration ist vor der Migration nicht lesbar: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+
+if not isinstance(config, dict):
+    print("e3dc_v4.json muss ein JSON-Objekt enthalten.", file=sys.stderr)
+    raise SystemExit(1)
+if config == {}:
+    first_install_config = apply_web_config_start_defaults(
+        config,
+        first_install=True,
+    )
+    if first_install_config.get("ha_mode") != "off" or not _save_v4(
+        first_install_config
+    ):
+        print("Docker-Erstkonfiguration konnte nicht atomar gebunden werden.", file=sys.stderr)
+        raise SystemExit(1)
+
+if run_config_wizard() is not True:
+    print("run_config_wizard hat keinen erfolgreichen Abschluss gemeldet.", file=sys.stderr)
+    raise SystemExit(1)
+
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as config_file:
+        config = json.load(config_file)
+except Exception as exc:
+    print(f"V4-Konfiguration ist nach der Migration nicht lesbar: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+
+if not isinstance(config, dict):
+    print("e3dc_v4.json muss nach der Migration ein JSON-Objekt enthalten.", file=sys.stderr)
+    raise SystemExit(1)
+if config.get("ha_mode") != "off":
+    print(
+        "Docker ist ausschließlich mit ha_mode=off zulässig; "
+        "HA- und Shadow-Betrieb bleiben Bare-Metal-Funktionen.",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+if project_instance_role_anchor("off") is not True:
+    print(
+        "Der persistente Docker-Instanzrollenanker ist nicht create-once auf ha_mode=off gebunden.",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+PY
+then
+    echo "-> FEHLER: Konfigurationsmigration oder Docker-Standalone-Guard fehlgeschlagen."
+    exit 1
+fi
+
+if [ ! -x /usr/local/bin/e3dc-docker-logrotate ] \
+    || [ ! -f /etc/logrotate.d/e3dc-control ] \
+    || [ -L /etc/logrotate.d/e3dc-control ] \
+    || [ "$(stat -c '%u:%g:%a:%h' -- /etc/logrotate.d/e3dc-control)" != "0:0:644:1" ]; then
+    echo "-> FEHLER: Docker-Logrotate besitzt keinen sicheren Image-Vertrag."
+    exit 1
+fi
+LOGROTATE_HEALTH="$LOCK_NAMESPACE_ROOT/docker_logrotate_health.json"
+if [ -L "$LOGROTATE_HEALTH" ] || { [ -e "$LOGROTATE_HEALTH" ] && [ ! -f "$LOGROTATE_HEALTH" ]; }; then
+    echo "-> FEHLER: Unsicherer alter Docker-Logrotate-Healthpfad."
+    exit 1
+fi
+if [ -e "$LOGROTATE_HEALTH" ] \
+    && [ "$(stat -c '%u:%g:%a:%h' -- "$LOGROTATE_HEALTH")" != "0:0:444:1" ]; then
+    echo "-> FEHLER: Alter Docker-Logrotate-Healthnachweis verletzt den Root-Vertrag."
+    exit 1
+fi
+rm -f -- "$LOGROTATE_HEALTH"
+echo "-> Starte fail-closed Logrotation für persistente Produktlogs..."
+nohup "$PYTHON_EXEC" -I -B /usr/local/bin/e3dc-docker-logrotate > /proc/1/fd/1 2>&1 &
+LOGROTATE_PID=$!
+LOGROTATE_READY=0
+for _logrotate_wait in $(seq 1 15); do
+    if ! kill -0 "$LOGROTATE_PID" 2>/dev/null; then
+        echo "-> FEHLER: Docker-Logrotate endete vor dem ersten Erfolgsnachweis."
+        wait "$LOGROTATE_PID" || true
+        exit 1
+    fi
+    if [ -f "$LOGROTATE_HEALTH" ] \
+        && [ ! -L "$LOGROTATE_HEALTH" ] \
+        && [ "$(stat -c '%u:%g:%a:%h' -- "$LOGROTATE_HEALTH")" = "0:0:444:1" ]; then
+        LOGROTATE_READY=1
+        break
+    fi
+    sleep 1
+done
+if [ "$LOGROTATE_READY" -ne 1 ]; then
+    echo "-> FEHLER: Docker-Logrotate lieferte keinen sicheren ersten Erfolgsnachweis."
+    exit 1
+fi
+
+echo "-> Starte Apache Webserver als überwachten Vordergrundprozess..."
+configure_apache_web_port
+apache2ctl -D FOREGROUND > /proc/1/fd/1 2>&1 &
+APACHE_PID=$!
+
+echo "-> Starte Python Hintergrunddienste..."
+
+# Die V4-Konfiguration wird exakt einmal gelesen. Derselbe kanonische Vertrag
+# entscheidet damit für systemd und Docker, welche Zusatzdienste gewollt sind.
+# Import-, JSON- und Vertragsfehler stoppen den Container vor dem ersten
+# optionalen Prozess; eine Shell-Nachbildung der Aktivierungslogik gibt es nicht.
+if ! OPTIONAL_SERVICE_PROJECTION="$(
+    "$PYTHON_EXEC" - "$V4_CONFIG" <<'PY'
+import json
+import sys
+
+SUPPORTED_DOCKER_OPTIONALS = (
+    "e3dc-wallbox-manager",
+    "energy_manager",
+    "e3dc-lux-live",
+    "e3dc-idm-live",
+    "e3dc-stiebel-live",
+    "e3dc-dimplex-live",
+    "e3dc-heizstab",
+    "e3dc-climate-live",
+    "e3dc-climate-control",
+    "e3dc-forecast-evidence",
+    "e3dc-matter-bridge",
+    "e3dc-bluelink",
+    "e3dc-mqtt-hub",
+)
+
+try:
+    from Installer.optional_service_contract import configured_optional_services
+
+    config_path = sys.argv[1]
+    with open(config_path, "r", encoding="utf-8") as config_file:
+        config = json.load(config_file)
+    if not isinstance(config, dict):
+        raise ValueError("e3dc_v4.json muss ein JSON-Objekt enthalten")
+
+    configured = configured_optional_services(config)
+    unsupported = tuple(
+        service for service in configured if service not in SUPPORTED_DOCKER_OPTIONALS
+    )
+    if unsupported:
+        raise ValueError(
+            "Docker-Startabbildung fehlt für: " + ", ".join(unsupported)
+        )
+    if len(configured) != len(set(configured)):
+        raise ValueError("Optionale Dienste dürfen nicht doppelt projiziert werden")
+
+    for service in configured:
+        print(service)
+except Exception as exc:
+    print(f"Optionale Dienstprojektion fehlgeschlagen: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+)"; then
+    echo "-> FEHLER: Optionale Docker-Dienste konnten nicht fail-closed projiziert werden."
+    exit 1
+fi
+
+optional_service_selected() {
+    local requested_service="$1"
+    local configured_service=""
+    while IFS= read -r configured_service; do
+        if [ "$configured_service" = "$requested_service" ]; then
+            return 0
+        fi
+    done <<EOF
+$OPTIONAL_SERVICE_PROJECTION
+EOF
+    return 1
 }
+
+# Der Healthcheck prüft exakt den bei diesem Boot kanonisch projizierten
+# Zusatzdienstsatz. Spätere Konfigurationsänderungen werden erst mit dem
+# dokumentierten Container-Neustart wirksam und erzeugen keinen Parallelvertrag.
+DOCKER_HEALTH_OPTIONALS="/run/e3dc-control/docker_health_optional_services"
+DOCKER_HEALTH_OPTIONALS_TMP="${DOCKER_HEALTH_OPTIONALS}.tmp.$$"
+if [ -L "$DOCKER_HEALTH_OPTIONALS" ] \
+    || { [ -e "$DOCKER_HEALTH_OPTIONALS" ] && [ ! -f "$DOCKER_HEALTH_OPTIONALS" ]; }; then
+    echo "-> FEHLER: Unsichere Docker-Health-Projektion: $DOCKER_HEALTH_OPTIONALS"
+    exit 1
+fi
+rm -f -- "$DOCKER_HEALTH_OPTIONALS_TMP"
+(
+    umask 077
+    printf '%s\n' "$OPTIONAL_SERVICE_PROJECTION" > "$DOCKER_HEALTH_OPTIONALS_TMP"
+)
+chown root:root -- "$DOCKER_HEALTH_OPTIONALS_TMP"
+chmod 0444 -- "$DOCKER_HEALTH_OPTIONALS_TMP"
+mv -f -- "$DOCKER_HEALTH_OPTIONALS_TMP" "$DOCKER_HEALTH_OPTIONALS"
+if [ "$(stat -c '%u:%g:%a:%h' -- "$DOCKER_HEALTH_OPTIONALS")" != "0:0:444:1" ]; then
+    echo "-> FEHLER: Docker-Health-Projektion besitzt keinen sicheren Endvertrag."
+    exit 1
+fi
+
+if optional_service_selected "e3dc-matter-bridge"; then
+    if [ ! -f "$MATTER_DIR/package.json" ] \
+        || [ ! -f "$MATTER_DIR/package-lock.json" ]; then
+        echo "-> FEHLER: Matter Bridge ist aktiviert, aber Paket- oder Lockdatei fehlt."
+        exit 1
+    fi
+    if [ ! -d "$MATTER_DIR/node_modules" ]; then
+        echo "-> Installiere Matter-Abhängigkeiten..."
+        cd "$MATTER_DIR"
+        npm ci --omit=dev --ignore-scripts
+    fi
+fi
+
+cd /app/pi/Install/Installer
 
 # E3DC Live RSCP Client ZUERST starten -- liefert live_data_py.json fuer storage_simulator.
 # Ohne diesen Schritt wuerde storage_simulator mit SOC=0% starten -> Discharge-Sperre!
@@ -233,7 +550,7 @@ sleep 10
 
 # === INITIALER SOFORT-FORECAST (VOR Simulator-Start!) ===
 echo "-> Initialer PV-Forecast (--once, vor Daemon-Start)..."
-if $PYTHON_EXEC Forecast/pv_forecast_service.py --once >> /var/www/html/logs/weather_manager.log 2>&1; then
+if $PYTHON_EXEC Forecast/pv_forecast_service.py --once >> /proc/1/fd/1 2>&1; then
     SLOTS=$(python3 -c "import json; d=json.load(open('/var/www/html/ramdisk/pv_forecast.json')); print(len(d))" 2>/dev/null || echo '?')
     echo "   -> pv_forecast.json erstellt (${SLOTS} Slots)."
 else
@@ -258,74 +575,68 @@ fi
 # WebSocket Server (immer)
 nohup $PYTHON_EXEC e3dc_websocket.py > /var/www/html/logs/e3dc_websocket.log 2>&1 &
 
-# Klimaanlage Live (read-only)
-# Der Worker prüft Aktivierung und Konfiguration in jedem Zyklus fail-closed.
-echo "   -> Klimaanlagen-Monitor (read-only) aktiv."
-nohup $PYTHON_EXEC climate_live.py > /var/www/html/logs/climate_live.log 2>&1 &
-
-# Energy Manager (Lademanagement ODER Wärmepumpe)
-AUTO_MODE=$(get_v4_val "auto_mode")
-LUXTRONIK=$(get_v4_val "luxtronik")
-IDM_IP=$(get_v4_val "idm_ip")
-STIEBEL_ISG_IP=$(get_v4_val "stiebel_isg_ip")
-WP_TYPE=$(get_v4_val "wp_type")
-SHELLY_SG_IP=$(get_v4_val "shelly_sg_ip")
-SHELLY_PAUSE_IP=$(get_v4_val "shelly_pause_ip")
-HAS_SHELLY_SGREADY=0
-if { [ -n "$SHELLY_SG_IP" ] && [ "$SHELLY_SG_IP" != "0.0.0.0" ]; } || { [ -n "$SHELLY_PAUSE_IP" ] && [ "$SHELLY_PAUSE_IP" != "0.0.0.0" ]; }; then
-    HAS_SHELLY_SGREADY=1
+# Klimaanlage Live (read-only, nur bei kanonischer Aktivierung)
+if optional_service_selected "e3dc-climate-live"; then
+    echo "   -> Klimaanlagen-Monitor (read-only) aktiv."
+    nohup $PYTHON_EXEC climate_live.py > /var/www/html/logs/climate_live.log 2>&1 &
 fi
 
-if [ "$AUTO_MODE" = "1" ] || [ "$LUXTRONIK" = "1" ] || [ -n "$IDM_IP" ] || [ "$HAS_SHELLY_SGREADY" = "1" ]; then
+# Klimaanlagen-Regelstatus (read-only, nur bei expliziter Aktivierung)
+if optional_service_selected "e3dc-climate-control"; then
+    echo "   -> Klimaanlagen-Regelstatus (read-only) aktiv."
+    nohup $PYTHON_EXEC climate_control.py > /var/www/html/logs/climate_control.log 2>&1 &
+fi
+
+# Energy Manager (nur bei kanonisch vollständig konfigurierter Wärmekopplung)
+if optional_service_selected "energy_manager"; then
     echo "   -> Energy Manager aktiv."
     nohup $PYTHON_EXEC luxtronik/energy_manager.py > /proc/1/fd/1 2>&1 &
 fi
 
 # Luxtronik Live-Daten (NUR wenn Wärmepumpe explizit aktiviert)
-if [ "$LUXTRONIK" = "1" ] && [ "$WP_TYPE" = "0" ]; then
+if optional_service_selected "e3dc-lux-live"; then
     echo "   -> Luxtronik WebSocket-Client aktiv."
     nohup $PYTHON_EXEC luxtronik/lux_live.py > /var/www/html/logs/lux_live.log 2>&1 &
 fi
 
 # IDM Live-Daten (NUR wenn IDM-IP konfiguriert)
-if [ "$WP_TYPE" = "1" ] && [ -n "$IDM_IP" ]; then
+if optional_service_selected "e3dc-idm-live"; then
     echo "   -> IDM Modbus-Client aktiv."
     nohup $PYTHON_EXEC idm/idm_live.py > /var/www/html/logs/idm_live.log 2>&1 &
 fi
 
 # Stiebel ISG Live-Daten (read-only)
-if [ "$WP_TYPE" = "4" ] && [ -n "$STIEBEL_ISG_IP" ] && [ "$STIEBEL_ISG_IP" != "0.0.0.0" ]; then
+if optional_service_selected "e3dc-stiebel-live"; then
     echo "   -> Stiebel ISG Live aktiv."
     nohup $PYTHON_EXEC stiebel/stiebel_live.py > /var/www/html/logs/stiebel_live.log 2>&1 &
 fi
 
-# Heizstab Manager (wp_type=2: Modbus Heizstab/Shelly, wp_type=3: Shelly Pro3EM WP-Messung)
-if [ "$WP_TYPE" = "2" ] || [ "$WP_TYPE" = "3" ]; then
-    if [ "$WP_TYPE" = "3" ]; then
-        echo "   -> Heizstab Manager (Shelly Pro3EM WP-Integration) aktiv."
-    else
-        echo "   -> Heizstab Manager (Shelly Heizstab/Modbus) aktiv."
-    fi
+# Dimplex WPM Live-Daten (read-only, nur bei vollständiger expliziter Freigabe)
+if optional_service_selected "e3dc-dimplex-live"; then
+    echo "   -> Dimplex WPM Live aktiv."
+    nohup $PYTHON_EXEC dimplex/dimplex_live.py > /var/www/html/logs/dimplex_live.log 2>&1 &
+fi
+
+# Heizstab Manager (nur bei kanonisch vollständiger Konfiguration)
+if optional_service_selected "e3dc-heizstab"; then
+    echo "   -> Heizstab Manager aktiv."
     nohup $PYTHON_EXEC heizstab_manager.py > /var/www/html/logs/heizstab_manager.log 2>&1 &
 fi
 
 # Native Wallbox Manager (Python PID-Regler für Go-e etc.)
-WB_NATIVE=$(get_v4_val "wb_native_enable")
-if [ "$WB_NATIVE" = "1" ] || [ "$WB_NATIVE" = "true" ]; then
+if optional_service_selected "e3dc-wallbox-manager"; then
     echo "   -> Native Wallbox Manager aktiv."
     nohup $PYTHON_EXEC wallbox_manager.py > /proc/1/fd/1 2>&1 &
 fi
 
 # MQTT Hub (wenn in config konfiguriert)
-MQTT_IP=$(get_v4_val "mqtt_hub_ip")
-if [ -n "$MQTT_IP" ]; then
+if optional_service_selected "e3dc-mqtt-hub"; then
     echo "   -> MQTT Hub aktiv."
     nohup $PYTHON_EXEC e3dc_mqtt_hub.py > /proc/1/fd/1 2>&1 &
 fi
 
 # Bluelink (wenn konfiguriert)
-BLUELINK=$(get_v4_val "bluelink_refresh_token")
-if [ -n "$BLUELINK" ]; then
+if optional_service_selected "e3dc-bluelink"; then
     echo "   -> Bluelink Client aktiv."
     nohup $PYTHON_EXEC bluelink_client.py > /var/www/html/logs/bluelink_client.log 2>&1 &
 fi
@@ -342,12 +653,7 @@ nohup $PYTHON_EXEC Forecast/pv_forecast_service.py > /proc/1/fd/1 2>&1 &
 
 # Rein diagnostische PV-Prognosediagnose. Ohne ausdrückliche Aktivierung wird
 # weder ein Prozess gestartet noch E3/DC-Historie gelesen oder eine DB erzeugt.
-FORECAST_DIAGNOSTICS="$(get_v4_val "forecast_diagnostics_enable" | tr '[:upper:]' '[:lower:]')"
-if [ "$FORECAST_DIAGNOSTICS" = "1" ] \
-    || [ "$FORECAST_DIAGNOSTICS" = "true" ] \
-    || [ "$FORECAST_DIAGNOSTICS" = "yes" ] \
-    || [ "$FORECAST_DIAGNOSTICS" = "on" ] \
-    || [ "$FORECAST_DIAGNOSTICS" = "ein" ]; then
+if optional_service_selected "e3dc-forecast-evidence"; then
     FORECAST_EVIDENCE_DIR="/var/lib/e3dc-control/forecast-evidence"
     install -d -o root -g root -m 0700 "$FORECAST_EVIDENCE_DIR"
     echo "   -> PV-Prognosediagnose (read-only, niedrige Priorität) aktiv."
@@ -378,20 +684,28 @@ echo "   -> Notification & Schedule Manager aktiv."
 nohup $PYTHON_EXEC notification_manager.py > /var/www/html/logs/notification_manager.log 2>&1 &
 
 # Matter Bridge (optional, read-only Statusendpunkte)
-MATTER=$(get_v4_val "matter_bridge")
-if [ "$MATTER" = "1" ] || [ "$MATTER" = "true" ]; then
-    if [ -d "$MATTER_DIR/node_modules" ]; then
-        echo "   -> Matter Bridge aktiv."
-        nohup runuser -u www-data -- sh -c "cd '$MATTER_DIR' && exec npm run start" \
-            > /var/www/html/logs/matter_bridge.log 2>&1 &
-    else
-        echo "   -> Matter Bridge kann ohne installierte NPM-Abhängigkeiten nicht starten."
-    fi
+if optional_service_selected "e3dc-matter-bridge"; then
+    echo "-> Starte D-Bus und Avahi für Matter mDNS..."
+    service dbus start >/dev/null 2>&1 || true
+    service avahi-daemon start >/dev/null 2>&1 || true
+    echo "   -> Matter Bridge aktiv."
+    nohup runuser -u www-data -- sh -c "cd '$MATTER_DIR' && exec npm run start" \
+        > /var/www/html/logs/matter_bridge.log 2>&1 &
 fi
 
 echo "-> Alle Dienste gestartet. Container laeuft."
 
-# Hauptprozess: warte auf alle Hintergrund-Prozesse.
-# (Das C++ E3DC-Control Binary wird nicht mehr benoetigt - alle Funktionen
-# sind in den Python-Diensten implementiert.)
-wait
+# PID 1 beendet den Container beim ersten unerwartet beendeten Kindprozess.
+# Das umfasst den Apache-Vordergrundprozess und alle Python-/Node-Worker. Auch
+# ein sauberer Kind-Exit ist hier ein Fehler, weil diese Dienste dauerhaft
+# laufen müssen; Docker kann den vollständigen Dienstsatz danach neu starten.
+if wait -n; then
+    child_status=1
+else
+    child_status=$?
+    if [ "$child_status" -eq 0 ]; then
+        child_status=1
+    fi
+fi
+echo "-> FEHLER: Ein überwachter Containerdienst wurde beendet (Status $child_status)."
+shutdown_container "$child_status"

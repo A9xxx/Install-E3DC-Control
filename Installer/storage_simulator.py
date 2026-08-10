@@ -3,9 +3,14 @@
 
 import os
 import json
+import copy
+import hashlib
 import time
 import math
 import logging
+import queue
+import stat
+import threading
 from datetime import datetime, timedelta
 
 try:
@@ -19,9 +24,19 @@ except Exception:
     from direct_marketing import build_direct_marketing_shadow_plan
 
 try:
-    from .storage_dispatch_contract import build_canonical_dispatch_plan
+    from .storage_dispatch_contract import (
+        build_canonical_dispatch_plan,
+        build_storage_plan_action_projection_artifact,
+        FORECAST_SHORTFALL_AUX_AC_RELEASED,
+        revision_hash,
+    )
 except Exception:
-    from storage_dispatch_contract import build_canonical_dispatch_plan
+    from storage_dispatch_contract import (
+        build_canonical_dispatch_plan,
+        build_storage_plan_action_projection_artifact,
+        FORECAST_SHORTFALL_AUX_AC_RELEASED,
+        revision_hash,
+    )
 
 try:
     from .pv_forecast_topology import (
@@ -37,9 +52,15 @@ except Exception:
     )
 
 try:
-    from .market_economics import build_market_economics_plan
+    from .market_economics import (
+        HORIZON_MS as MARKET_HORIZON_MS,
+        build_market_economics_plan,
+    )
 except Exception:
-    from market_economics import build_market_economics_plan
+    from market_economics import (
+        HORIZON_MS as MARKET_HORIZON_MS,
+        build_market_economics_plan,
+    )
 
 try:
     from .reserve import effective_ep_reserve_pct
@@ -82,10 +103,86 @@ WEATHER_FORECAST_FILE = os.path.join(RAMDISK_DIR, "weather_forecast.json")
 LIVE_HISTORY_FILE = os.path.join(RAMDISK_DIR, "live_history.txt")
 MANUAL_ANCHOR_FILE = os.path.join(RAMDISK_DIR, "manual_bat_anchor.json")
 OUTPUT_FILE = os.path.join(RAMDISK_DIR, "storage_plan.json")
+ACTION_PROJECTION_FILE = os.path.join(
+    RAMDISK_DIR,
+    "storage_plan_action_projection.json",
+)
 DIRECT_MARKETING_REPORT_FILE = os.path.join(RAMDISK_DIR, "direct_marketing_daily_report.json")
 WB_INTENT_FILE = os.path.join(RAMDISK_DIR, "wallbox_storage_intent.json")
 HISTORY_DIR = "/var/www/html/data/history_backups"
 EMERGENCY_CURVE_FILE = os.path.join(RAMDISK_DIR, "storage_emergency_curve.json")
+
+
+def _stable_json_object(path, max_bytes=2 * 1024 * 1024):
+    """Liest genau eine reguläre, unveränderte JSON-Dateigeneration."""
+
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_size <= 0
+            or before.st_size > int(max_bytes)
+        ):
+            return None, None
+        source = bytearray()
+        while len(source) <= int(max_bytes):
+            chunk = os.read(
+                descriptor,
+                min(256 * 1024, int(max_bytes) - len(source) + 1),
+            )
+            if not chunk:
+                break
+            source.extend(chunk)
+        after = os.fstat(descriptor)
+        generation = (
+            int(before.st_dev),
+            int(before.st_ino),
+            int(before.st_size),
+            int(before.st_mtime_ns),
+            int(before.st_ctime_ns),
+        )
+        after_generation = (
+            int(after.st_dev),
+            int(after.st_ino),
+            int(after.st_size),
+            int(after.st_mtime_ns),
+            int(after.st_ctime_ns),
+        )
+        if (
+            len(source) > int(max_bytes)
+            or len(source) != int(after.st_size)
+            or generation != after_generation
+        ):
+            return None, None
+        current = os.stat(path, follow_symlinks=False)
+        current_generation = (
+            int(current.st_dev),
+            int(current.st_ino),
+            int(current.st_size),
+            int(current.st_mtime_ns),
+            int(current.st_ctime_ns),
+        )
+        if not stat.S_ISREG(current.st_mode) or current_generation != generation:
+            return None, None
+        payload = json.loads(source.decode("utf-8-sig"))
+        if not isinstance(payload, dict):
+            return None, None
+        return payload, {
+            "generation": generation,
+            "mtime": float(before.st_mtime),
+        }
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        return None, None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def direct_marketing_runtime_config(config, daily_report, today=None):
@@ -125,6 +222,243 @@ logger = configure_service_logger(
     quiet_interval_s=900.0,
 )
 
+_DV_SHADOW_HISTORY_QUEUE_CAPACITY = 32
+_DV_SHADOW_HISTORY_QUEUE = queue.Queue(
+    maxsize=_DV_SHADOW_HISTORY_QUEUE_CAPACITY
+)
+_DV_SHADOW_HISTORY_WORKER_LOCK = threading.Lock()
+_DV_SHADOW_HISTORY_WORKER = None
+_DV_SHADOW_HISTORY_STATUS_LOCK = threading.Lock()
+_DV_SHADOW_HISTORY_STATUS = {
+    "accepted_total": 0,
+    "processed_total": 0,
+    "dropped_total": 0,
+    "write_failures_total": 0,
+    "worker_start_failures_total": 0,
+    "last_drop_at_ms": 0,
+    "last_dropped_snapshot_at_ms": 0,
+    "last_write_failure_at_ms": 0,
+    "last_worker_start_failure_at_ms": 0,
+}
+
+
+def _dv_shadow_history_job_capture_ms(job):
+    if not isinstance(job, dict):
+        return 0
+    try:
+        value = int(job.get("captured_at_ms") or 0)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, value)
+
+
+def _record_dv_shadow_history_event(event, job=None):
+    """Aktualisiert nur speicherinterne Diagnosezähler."""
+
+    now_ms = int(time.time() * 1000)
+    with _DV_SHADOW_HISTORY_STATUS_LOCK:
+        if event == "accepted":
+            _DV_SHADOW_HISTORY_STATUS["accepted_total"] += 1
+        elif event == "processed":
+            _DV_SHADOW_HISTORY_STATUS["processed_total"] += 1
+        elif event == "dropped":
+            _DV_SHADOW_HISTORY_STATUS["dropped_total"] += 1
+            _DV_SHADOW_HISTORY_STATUS["last_drop_at_ms"] = now_ms
+            _DV_SHADOW_HISTORY_STATUS[
+                "last_dropped_snapshot_at_ms"
+            ] = _dv_shadow_history_job_capture_ms(job)
+        elif event == "write_failure":
+            _DV_SHADOW_HISTORY_STATUS["write_failures_total"] += 1
+            _DV_SHADOW_HISTORY_STATUS["last_write_failure_at_ms"] = now_ms
+        elif event == "worker_start_failure":
+            _DV_SHADOW_HISTORY_STATUS["worker_start_failures_total"] += 1
+            _DV_SHADOW_HISTORY_STATUS[
+                "last_worker_start_failure_at_ms"
+            ] = now_ms
+
+
+def _dv_shadow_history_queue_status():
+    """Liefert einen wirkungsfreien, datensparsamen Queue-Status."""
+
+    with _DV_SHADOW_HISTORY_STATUS_LOCK:
+        status = dict(_DV_SHADOW_HISTORY_STATUS)
+    worker = _DV_SHADOW_HISTORY_WORKER
+    status.update(
+        {
+            "schema_version": "dv_shadow_history_queue_status_v1",
+            "capacity": max(
+                0,
+                int(
+                    getattr(
+                        _DV_SHADOW_HISTORY_QUEUE,
+                        "maxsize",
+                        _DV_SHADOW_HISTORY_QUEUE_CAPACITY,
+                    )
+                    or 0
+                ),
+            ),
+            "queue_depth": max(
+                0,
+                int(_DV_SHADOW_HISTORY_QUEUE.qsize()),
+            ),
+            "worker_alive": bool(
+                worker is not None and worker.is_alive()
+            ),
+            "control_effect": False,
+        }
+    )
+    evidence_complete = (
+        status["dropped_total"] == 0
+        and status["write_failures_total"] == 0
+        and status["worker_start_failures_total"] == 0
+    )
+    status["evidence_complete"] = evidence_complete
+    status["status"] = "COMPLETE" if evidence_complete else "EVIDENCE_LIMIT"
+    return status
+
+
+def _prepare_dv_shadow_history_job(plan):
+    """Entfernt den Vollpayload und erzeugt einen wirkungsfreien Archivauftrag.
+
+    Dieser Schritt führt keinerlei Datei-I/O aus. Damit kann der produktive
+    Plan zuerst atomar veröffentlicht werden; die Diagnosearchivierung läuft
+    anschließend unabhängig in einer begrenzten Hintergrundwarteschlange.
+    """
+
+    if not isinstance(plan, dict):
+        return None
+    shadow = plan.pop("_dv_shadow_history_payload", None)
+    planner = plan.get("planner") if isinstance(plan.get("planner"), dict) else {}
+    summary = (
+        planner.get("dv_shadow_v1")
+        if isinstance(planner.get("dv_shadow_v1"), dict)
+        else None
+    )
+    if not isinstance(shadow, dict) or not isinstance(summary, dict):
+        return None
+
+    job = {
+        "shadow": shadow,
+        "captured_at_ms": plan.get("generated_at_ts_ms"),
+        "productive_context": {
+            "plan_id": plan.get("plan_id"),
+            "valid_from_ts_ms": plan.get("valid_from_ts_ms"),
+            "valid_until_ts_ms": plan.get("valid_until_ts_ms"),
+        },
+    }
+
+    summary.pop("summary_id", None)
+    summary["full_payload_persisted"] = None
+    summary["history"] = {
+        "schema_version": "dv_shadow_history_v1",
+        "status": "ASYNC_AFTER_PLAN_PUBLISH",
+        "snapshot_id": None,
+        "change_kind": None,
+        "queue": _dv_shadow_history_queue_status(),
+        "control_effect": False,
+    }
+    summary["summary_id"] = revision_hash(summary)
+    return job
+
+
+def _write_dv_shadow_history_job(job):
+    """Schreibt genau einen vorbereiteten Auftrag im Diagnose-Worker."""
+
+    try:
+        try:
+            from .dv_shadow_history import append_shadow_history
+        except Exception:
+            from dv_shadow_history import append_shadow_history
+        history_result = append_shadow_history(
+            job["shadow"],
+            captured_at_ms=job.get("captured_at_ms"),
+            productive_context=job.get("productive_context"),
+            archive_queue_status=job.get("archive_queue_status"),
+        )
+        logger.debug(
+            "DV-Shadow-Historie verarbeitet: status=%s change=%s",
+            (
+                "APPENDED"
+                if history_result.get("inserted") is True
+                else history_result.get("reason", "UNCHANGED")
+            ),
+            history_result.get("change_kind"),
+        )
+        return True
+    except Exception as exc:
+        logger.warning(
+            "DV-Shadow-Historie nicht geschrieben; produktiver Plan bleibt "
+            "unverändert (%s).",
+            type(exc).__name__,
+        )
+        return False
+
+
+def _dv_shadow_history_worker():
+    """Verarbeitet seriell die begrenzte diagnostische Warteschlange."""
+
+    while True:
+        job = _DV_SHADOW_HISTORY_QUEUE.get()
+        try:
+            write_ok = _write_dv_shadow_history_job(job)
+            _record_dv_shadow_history_event("processed", job)
+            if not write_ok:
+                _record_dv_shadow_history_event("write_failure", job)
+        finally:
+            _DV_SHADOW_HISTORY_QUEUE.task_done()
+
+
+def _ensure_dv_shadow_history_worker():
+    """Startet den einzigen daemonisierten Diagnose-Worker genau einmal."""
+
+    global _DV_SHADOW_HISTORY_WORKER
+    with _DV_SHADOW_HISTORY_WORKER_LOCK:
+        worker = _DV_SHADOW_HISTORY_WORKER
+        if worker is not None and worker.is_alive():
+            return True
+        try:
+            worker = threading.Thread(
+                target=_dv_shadow_history_worker,
+                name="dv-shadow-history",
+                daemon=True,
+            )
+            worker.start()
+        except Exception as exc:
+            _record_dv_shadow_history_event("worker_start_failure")
+            logger.warning(
+                "DV-Shadow-Historienworker nicht gestartet; produktiver Plan "
+                "bleibt unverändert (%s).",
+                type(exc).__name__,
+            )
+            return False
+        _DV_SHADOW_HISTORY_WORKER = worker
+        return True
+
+
+def _enqueue_dv_shadow_history(job):
+    """Plant Diagnose-I/O nach Planpublikation ein, ohne darauf zu warten."""
+
+    if not isinstance(job, dict) or not _ensure_dv_shadow_history_worker():
+        return False
+    queued_job = dict(job)
+    queued_job["archive_queue_status"] = _dv_shadow_history_queue_status()
+    try:
+        _DV_SHADOW_HISTORY_QUEUE.put_nowait(queued_job)
+        _record_dv_shadow_history_event("accepted", job)
+        return True
+    except queue.Full:
+        _record_dv_shadow_history_event("dropped", job)
+        status = _dv_shadow_history_queue_status()
+        logger.warning(
+            "DV_SHADOW_HISTORY_QUEUE_OVERFLOW EVIDENCE_LIMIT: Snapshot wird "
+            "nicht archiviert (depth=%s capacity=%s dropped_total=%s); "
+            "produktiver Plan bleibt unverändert.",
+            status["queue_depth"],
+            status["capacity"],
+            status["dropped_total"],
+        )
+        return False
+
 
 def _configure_process_timezone():
     """Keep scheduler timestamps aligned with the Berlin-time PHP/frontend views."""
@@ -158,6 +492,97 @@ def _slot_net_surplus_w(slot):
         - float(slot.get("climate_w", 0) or 0)
         - _slot_planned_load_w(slot)
     )
+
+
+def _slot_storage_chargeable_forecast_contract(
+    slot,
+    dc_only=False,
+    expected_topology_revision=None,
+):
+    """Bindet prognostizierten Speicherüberschuss an die erlaubte PV-Quelle."""
+
+    slot = slot if isinstance(slot, dict) else {}
+    total_surplus_w = max(0.0, _slot_net_surplus_w(slot))
+    if not dc_only:
+        return {
+            "complete": True,
+            "reason": "total_pv_legacy_scope",
+            "source_scope": "TOTAL_PV",
+            "chargeable_surplus_w": total_surplus_w,
+            "total_surplus_w": total_surplus_w,
+            "e3dc_dc_pv_w": None,
+            "external_ac_pv_w": None,
+            "forecast_fresh": slot.get("forecast_fresh") is True,
+        }
+
+    dc_raw = slot.get("e3dc_dc_pv_w")
+    external_raw = slot.get("external_ac_pv_w")
+    values_typed = bool(
+        isinstance(dc_raw, (int, float))
+        and not isinstance(dc_raw, bool)
+        and isinstance(external_raw, (int, float))
+        and not isinstance(external_raw, bool)
+        and math.isfinite(float(dc_raw))
+        and math.isfinite(float(external_raw))
+    )
+    topology_bound = bool(
+        str(slot.get("pv_topology_status") or "") == "bound"
+        and str(slot.get("pv_resource_projection_status") or "") == "complete"
+    )
+    slot_topology_revision = str(
+        slot.get("pv_topology_revision") or ""
+    )
+    expected_revision = str(expected_topology_revision or "")
+    topology_revision_match = bool(
+        slot_topology_revision
+        and (
+            not expected_revision
+            or slot_topology_revision == expected_revision
+        )
+    )
+    forecast_fresh = bool(
+        slot.get("forecast_fresh") is True
+        or slot.get("pv_forecast_fresh") is True
+    )
+    complete = bool(
+        values_typed
+        and float(dc_raw) >= 0.0
+        and float(external_raw) >= 0.0
+        and topology_bound
+        and topology_revision_match
+        and forecast_fresh
+    )
+    if not values_typed:
+        reason = "pv_source_split_untyped"
+    elif float(dc_raw) < 0.0 or float(external_raw) < 0.0:
+        reason = "pv_source_split_negative"
+    elif not topology_bound:
+        reason = "pv_topology_unbound"
+    elif not topology_revision_match:
+        reason = "pv_topology_revision_mismatch"
+    elif not forecast_fresh:
+        reason = "pv_forecast_stale"
+    else:
+        reason = "e3dc_dc_only_complete"
+    e3dc_dc_pv_w = max(0.0, float(dc_raw)) if values_typed else 0.0
+    external_ac_pv_w = max(0.0, float(external_raw)) if values_typed else 0.0
+    return {
+        "complete": complete,
+        "reason": reason,
+        "source_scope": "E3DC_DC_ONLY",
+        # Der Laderahmen darf weder den realen Gesamtüberschuss noch die
+        # prognostizierte interne DC-Erzeugung überschreiten.
+        "chargeable_surplus_w": (
+            min(total_surplus_w, e3dc_dc_pv_w) if complete else 0.0
+        ),
+        "total_surplus_w": total_surplus_w,
+        "e3dc_dc_pv_w": e3dc_dc_pv_w if values_typed else None,
+        "external_ac_pv_w": external_ac_pv_w if values_typed else None,
+        "forecast_fresh": forecast_fresh,
+        "topology_revision": slot_topology_revision or None,
+        "expected_topology_revision": expected_revision or None,
+        "topology_revision_match": topology_revision_match,
+    }
 
 
 def historical_curve_start_soc(start_soc, first_anchor_soc):
@@ -2153,6 +2578,7 @@ class StorageSimulator:
 
     def __init__(self):
         self.v4_config = self._load_v4_config()
+        self.last_plan_valid_until_ts_ms = 0
 
         # Batteriegroesse aus V4 Config (Fallback wenn RSCP keinen Wert liefert)
         self.capacity_kwh = self._safe_float(self.v4_config.get('speichergroesse', '10.0'), 10.0)
@@ -2390,18 +2816,17 @@ class StorageSimulator:
             return None
 
     def _read_weather_alerts(self):
-        if not os.path.exists(WEATHER_ALERTS_FILE):
+        payload, metadata = _stable_json_object(WEATHER_ALERTS_FILE)
+        if not isinstance(payload, dict) or not isinstance(metadata, dict):
+            logger.warning(
+                "Unwetterwächter: weather_alerts.json nicht stabil oder nicht lesbar"
+            )
             return None
-        try:
-            with open(WEATHER_ALERTS_FILE, "r", encoding="utf-8-sig") as f:
-                payload = json.load(f)
-            if not isinstance(payload, dict):
-                return None
-            payload["_age_s"] = max(0.0, time.time() - os.path.getmtime(WEATHER_ALERTS_FILE))
-            return payload
-        except Exception as exc:
-            logger.warning("Unwetterwächter: weather_alerts.json nicht lesbar: %s" % exc)
-            return None
+        payload["_age_s"] = max(
+            0.0,
+            time.time() - float(metadata.get("mtime") or 0.0),
+        )
+        return payload
 
     def _storm_guard_event(self, now_ms):
         mode = self._storm_guard_mode_from_config()
@@ -3703,6 +4128,9 @@ class StorageSimulator:
                 "end_timestamp": int(ts_end.timestamp() * 1000),
                 "predicted_kwh": round(max(0.0, pv_w) / 1000.0, 4),
                 "fallback": "sun_history_quarter",
+                "pv_forecast_fresh": False,
+                "forecast_fresh": False,
+                "pv_forecast_freshness_source": "emergency_curve_unverified",
             })
             ts = ts_end
 
@@ -4020,6 +4448,60 @@ class StorageSimulator:
             return _empty("Fehler: %s" % e)
 
     @staticmethod
+    def _copy_forecast_quantile_axis(target, source, axis):
+        """Reicht nur explizite, bereits in Watt typisierte Quantile durch."""
+
+        if not isinstance(target, dict) or not isinstance(source, dict):
+            return
+        fields = (
+            "p10_w",
+            "p50_w",
+            "p90_w",
+            "quantile_convention",
+            "quantile_source",
+            "quantile_revision",
+            "quantile_fresh",
+            "quantile_generated_ts_ms",
+            "quantile_lead_time_bucket",
+            "quantile_lead_time_min_minutes",
+            "quantile_lead_time_max_minutes",
+            "quantile_calibration_status",
+            "quantile_calibration_method",
+            "quantile_calibration_revision",
+            "quantile_calibration_sample_count",
+            "quantile_calibration_day_count",
+            "quantile_calibration_window_start_ts_ms",
+            "quantile_calibration_window_end_ts_ms",
+            "quantile_decision_use_allowed",
+        )
+        for suffix in fields:
+            key = f"{axis}_{suffix}"
+            if key in source:
+                target[key] = source.get(key)
+
+    @staticmethod
+    def _copy_slot_bound_forecast_evidence(
+        target,
+        source,
+        key,
+        slot_start_ts_ms,
+        slot_end_ts_ms,
+    ):
+        """Kopiert vorhandene Forecast-Evidenz nur für denselben exakten Slot."""
+
+        if not isinstance(target, dict) or not isinstance(source, dict):
+            return False
+        if key not in source:
+            return False
+        if (
+            source.get("start_timestamp") != slot_start_ts_ms
+            or source.get("end_timestamp") != slot_end_ts_ms
+        ):
+            return False
+        target[key] = copy.deepcopy(source[key])
+        return True
+
+    @staticmethod
     def _bind_forecast_slot_topology(slot, forecast_slot):
         """Materialisiert Split oder typisierte Missingness für jeden PV-Slot."""
 
@@ -4068,6 +4550,16 @@ class StorageSimulator:
             else []
         )
         slot["pv_external_ac_capped_w"] = forecast_slot.get("pv_external_ac_capped_w", 0.0)
+        StorageSimulator._copy_forecast_quantile_axis(
+            slot,
+            forecast_slot,
+            "e3dc_dc_pv",
+        )
+        StorageSimulator._copy_forecast_quantile_axis(
+            slot,
+            forecast_slot,
+            "external_ac_pv",
+        )
 
     def generate_plan(self):
         # Update Hardware-Params vor jedem Lauf
@@ -4108,7 +4600,11 @@ class StorageSimulator:
         forecast_meta = {
             "forecast_source": "pv_forecast",
             "forecast_trust": "forecast",
-            "forecast_confidence": 1.0,
+            # Ein vorhandener Punktforecast ist keine kalibrierte
+            # Eintrittswahrscheinlichkeit. Fehlende Kalibrierung bleibt
+            # typisierte Missingness statt erfundener 100-%-Sicherheit.
+            "forecast_confidence": None,
+            "forecast_confidence_status": "evidence_limit",
             "emergency_curve_active": False,
             "pv_topology": pv_source_meta.get("pv_topology")
             if isinstance(pv_source_meta.get("pv_topology"), dict)
@@ -4390,6 +4886,8 @@ class StorageSimulator:
                 "optimization_score": None, "pure_eco_score": None,
                 "price_available": False, "price_fresh": False,
                 "price_stale": True, "price_status": "source_interval_missing",
+                "pv_forecast_fresh": False, "forecast_fresh": False,
+                "pv_forecast_freshness_source": "source_interval_missing",
                 "eco_score_available": False,
                 "grid_dump_w": 0,
                 "predump_candidate_w": 0,
@@ -4423,6 +4921,29 @@ class StorageSimulator:
             for p in pv_tl:
                 if ts >= p["start_timestamp"] and ts < p["end_timestamp"]:
                     slot["pv_w"] = p.get("predicted_kwh", 0) * 1000.0
+                    _pv_fresh = (
+                        p.get("pv_forecast_fresh")
+                        if "pv_forecast_fresh" in p
+                        else p.get("forecast_fresh")
+                    )
+                    slot["pv_forecast_fresh"] = _pv_fresh is True
+                    slot["forecast_fresh"] = _pv_fresh is True
+                    slot["pv_forecast_freshness_source"] = str(
+                        p.get("pv_forecast_freshness_source")
+                        or "model_provenance_missing"
+                    )
+                    self._copy_slot_bound_forecast_evidence(
+                        slot,
+                        p,
+                        "pv_zero_evidence",
+                        ts,
+                        ts + slot_ms,
+                    )
+                    self._copy_forecast_quantile_axis(
+                        slot,
+                        p,
+                        "pv",
+                    )
                     if self.pv_topology_contract.get("split_usable") or any(
                         key in p
                         for key in (
@@ -4448,6 +4969,11 @@ class StorageSimulator:
                     slot["wp_quality"] = m.get("wp_quality", "unknown")
                     slot["climate_source"] = m.get("climate_source", "not_applicable")
                     slot["climate_quality"] = m.get("climate_quality", "not_applicable")
+                    self._copy_forecast_quantile_axis(
+                        slot,
+                        m,
+                        "load",
+                    )
                     ml_matched = True
                     _ml_direct_slots += 1
                     break
@@ -4497,10 +5023,17 @@ class StorageSimulator:
             for e in epex_tl:
                 if ts >= e["start_timestamp"] and ts < e["end_timestamp"]:
                     slot["marketprice"] = float(e.get("marketprice", 0.0))
-                    slot["price_available"] = True
-                    slot["price_fresh"] = True
-                    slot["price_stale"] = False
-                    slot["price_status"] = "source_interval_match"
+                    _price_stale = e.get("price_stale") is True
+                    _price_available = e.get("price_available", True) is True
+                    _price_fresh = e.get("price_fresh", not _price_stale) is True
+                    slot["price_available"] = bool(_price_available)
+                    slot["price_fresh"] = bool(_price_fresh and not _price_stale)
+                    slot["price_stale"] = bool(_price_stale or not _price_fresh)
+                    slot["price_status"] = (
+                        "source_interval_match"
+                        if slot["price_available"] and slot["price_fresh"]
+                        else "source_interval_invalid"
+                    )
                     for key in (
                         "price_source",
                         "tariff_provider",
@@ -4511,6 +5044,8 @@ class StorageSimulator:
                         "direct_marketing_price_source",
                         "direct_marketing_price_resolution_min",
                         "direct_marketing_source_resolution_min",
+                        "direct_marketing_price_revision",
+                        "direct_marketing_price_revision_source",
                         "direct_marketing_price_available",
                     ):
                         if key in e:
@@ -4521,6 +5056,17 @@ class StorageSimulator:
             for score in eco_tl:
                 if ts >= score["start_timestamp"] and ts < score["end_timestamp"]:
                     slot["eco_score_available"] = True
+                    _score_stale = score.get("price_stale") is True
+                    _score_available = score.get("price_available", True) is True
+                    _score_fresh = score.get("price_fresh", not _score_stale) is True
+                    slot["price_available"] = bool(_score_available)
+                    slot["price_fresh"] = bool(_score_fresh and not _score_stale)
+                    slot["price_stale"] = bool(_score_stale or not _score_fresh)
+                    slot["price_status"] = (
+                        "billing_interval_match"
+                        if slot["price_available"] and slot["price_fresh"]
+                        else "billing_interval_invalid"
+                    )
                     billing_price = score.get("billing_price")
                     if billing_price is not None:
                         slot["billing_price_ct"] = float(billing_price)
@@ -6958,35 +7504,129 @@ class StorageSimulator:
             if reach_day_start_ms <= slot["ts"] < reach_day_end_ms:
                 max_soc_today = max(max_soc_today, slot.get("soc", 0))
 
-        # BUGFIX: can_reach_target darf NICHT auf max_soc_today der gedrosselten Simulation basieren!
-        # Die Simulation drosselt das Laden bewusst (Ladeverzoegerungs-Algorithmus fuer Punktlandung),
-        # was bei grossen PV-Anlagen (z.B. 14.7kWp mit 94kWh/Tag) dazu fuehrt dass die simulierte
-        # max_soc nur 86% erreicht - obwohl der reale Surplus >50 kWh betraegt.
-        # Korrekte Pruefung: Ist der verfuegbare Tages-Surplus physikalisch ausreichend?
-        today_chargeable_surplus_wh = sum(
-            max(0, s["surplus_w"]) * 0.25 for s in timeline
-            if reach_day_start_ms <= s["ts"] < reach_day_end_ms and s.get("surplus_w", 0) > 0
+        # Die Erreichbarkeit darf nur noch Energie zählen, die innerhalb des
+        # verbleibenden Slots und der erlaubten PV-Quellen tatsächlich in den
+        # Speicher gelangen kann. Bei aktivem DC-first-Vertrag bleibt externe
+        # AC-PV vollständig aus der Reichweitenbehauptung.
+        _target_reach_now_ts = int(time.time())
+        _target_reach_now_ms = float(_target_reach_now_ts) * 1000.0
+        _target_reach_dc_only = self._cfg_bool(
+            self.v4_config.get("storage_dc_first_charge_limit_enable"),
+            False,
         )
+        _target_reach_slot_contracts = []
+        _target_reach_missing_reasons = set()
+        today_chargeable_surplus_wh = 0.0
+        today_total_surplus_wh = 0.0
+        for _reach_slot in timeline:
+            _slot_start_ms = float(_reach_slot.get("ts", 0.0) or 0.0)
+            if not (reach_day_start_ms <= _slot_start_ms < reach_day_end_ms):
+                continue
+            _slot_end_ms = min(reach_day_end_ms, _slot_start_ms + 900000.0)
+            _remaining_h = max(
+                0.0,
+                (_slot_end_ms - max(_target_reach_now_ms, _slot_start_ms))
+                / 3600000.0,
+            )
+            if _remaining_h <= 0.0:
+                continue
+            _source_contract = _slot_storage_chargeable_forecast_contract(
+                _reach_slot,
+                dc_only=_target_reach_dc_only,
+                expected_topology_revision=(
+                    self.pv_topology_contract.get("revision")
+                    if _target_reach_dc_only
+                    else None
+                ),
+            )
+            _target_reach_slot_contracts.append(_source_contract)
+            if not _source_contract.get("complete"):
+                _target_reach_missing_reasons.add(
+                    str(_source_contract.get("reason") or "source_evidence_incomplete")
+                )
+            _slot_total_surplus_w = max(
+                0.0,
+                float(_source_contract.get("total_surplus_w", 0.0) or 0.0),
+            )
+            _slot_chargeable_w = min(
+                float(self.max_charge_w),
+                max(
+                    0.0,
+                    float(
+                        _source_contract.get("chargeable_surplus_w", 0.0)
+                        or 0.0
+                    ),
+                ),
+            )
+            today_total_surplus_wh += _slot_total_surplus_w * _remaining_h
+            today_chargeable_surplus_wh += _slot_chargeable_w * _remaining_h
+        _target_reach_source_evidence_complete = bool(
+            _target_reach_slot_contracts
+            and all(
+                contract.get("complete") is True
+                for contract in _target_reach_slot_contracts
+            )
+        )
+        if not _target_reach_dc_only:
+            _target_reach_source_evidence_complete = True
         # Energiebedarf vom Kurvenstart bis Ziel-SoC. Nach Sonnenuntergang kann
         # die Sollkurve bereits fuer morgen gebaut sein; dann waere der aktuelle
         # Abend-SoC als Ausgangspunkt fachlich falsch und wuerde Pre-Dump/Planung
         # blockieren.
-        reach_start_soc = float(locals().get('morning_soc_tl', current_soc) if target_timeline else current_soc)
+        # Für die verbleibende Tagesreichweite ist der aktuelle reale SoC der
+        # Ausgangspunkt. Ein Morgenanker würde bereits geladene Energie
+        # nochmals als Restbedarf zählen und die Reichweite verfälschen.
+        reach_start_soc = float(current_soc)
         required_wh_for_target = self.capacity_wh * max(0.0, (self.target_soc - reach_start_soc)) / 100.0
         # Erreichbar wenn Surplus >= Bedarf (mit 10% Sicherheitsmarge fuer Verluste).
         # Die Diagnose trennt die Gruende bewusst: Bei bereits erreichtem Ziel darf
         # kein irrefuehrender Rest-Surplus-Vergleich geloggt werden.
         physical_needed_wh = required_wh_for_target * 1.1
-        can_reach_target_physical = today_chargeable_surplus_wh >= physical_needed_wh
+        can_reach_target_physical = bool(
+            _target_reach_source_evidence_complete
+            and today_chargeable_surplus_wh >= physical_needed_wh
+        )
         target_already_reached = current_soc >= (self.target_soc - 0.2)
         # Auch die simulierte SoC-Kurve einbeziehen (als zweites Kriterium).
         # Hier gilt das echte Tagesziel; die 95%-Toleranz gehoert nicht in die
         # Erreichbarkeits-Aussage, sonst sieht ein 86%-Tag bei 90% Ziel "erreichbar" aus.
         can_reach_target_sim = (max_soc_today >= (self.target_soc - 0.2))
-        # Entweder physikalisch machbar ODER Simulation/Real-SoC zeigt es - beide Wege sind gueltig.
-        can_reach_target = can_reach_target_physical or can_reach_target_sim
+        # Die Gesamtsimulation darf bei DC-first keinen externen AC-Anteil als
+        # Ladeerreichbarkeit zurückschmuggeln. Ohne DC-first bleibt der
+        # historische Simulationsweg aus Kompatibilitätsgründen erhalten.
+        can_reach_target_point = bool(
+            target_already_reached
+            or can_reach_target_physical
+            or (not _target_reach_dc_only and can_reach_target_sim)
+        )
+        # Der aktuelle Produktivforecast ist eine Punktprognose. Er enthält
+        # weder eine kalibrierte quellenbezogene PV-Untergrenze noch eine
+        # zukünftige, SoC-/Taper-gebundene Batterieannahme. Er darf daher
+        # weder einen Ladeaufschub noch die neue AC-Ausnahme autorisieren.
+        _target_reach_conservative_quantile_bound = False
+        _target_reach_charge_acceptance_bound = False
+        _target_reach_latest_start_bound = False
+        _target_reach_decision_evidence_complete = False
+        _target_reach_decision_use_allowed = False
+        can_reach_target = bool(
+            target_already_reached
+            or (
+                not _target_reach_dc_only
+                and can_reach_target_point
+            )
+        )
 
-        if not can_reach_target:
+        if (
+            _target_reach_dc_only
+            and not _target_reach_decision_use_allowed
+            and not target_already_reached
+        ):
+            logger.info(
+                "Prognose EVIDENCE_LIMIT: DC-Punktprognose ist "
+                "quellengetrennt, aber nicht quantil-, Taper- und "
+                "Akzeptanz-gebunden. Kein Ladeaufschub."
+            )
+        elif not can_reach_target:
             logger.info(
                 f"Prognose: Ziel-SoC {self.target_soc:.0f}%% nicht erreichbar "
                 f"(max_sim {max_soc_today:.1f}%%, Rest-Surplus {today_chargeable_surplus_wh:.0f}Wh "
@@ -7014,19 +7654,56 @@ class StorageSimulator:
         effective_target_soc = float(self.target_soc)
         if can_reach_target:
             max_reachable_soc = round(float(self.target_soc), 1)
+        elif (
+            _target_reach_dc_only
+            and _target_reach_decision_evidence_complete
+            and self.capacity_wh > 0.0
+        ):
+            source_limited_soc = reach_start_soc + (
+                today_chargeable_surplus_wh
+                / 1.1
+                / self.capacity_wh
+                * 100.0
+            )
+            max_reachable_soc = round(
+                max(
+                    float(current_soc),
+                    min(float(self.target_soc), float(source_limited_soc)),
+                ),
+                1,
+            )
+        elif _target_reach_dc_only:
+            # Ohne vollständigen Entscheidungsvertrag wird aus der
+            # Punktprognose kein erreichbarer Zukunfts-SoC behauptet.
+            max_reachable_soc = round(float(current_soc), 1)
         else:
             max_reachable_soc = round(max(float(current_soc), min(float(self.target_soc), float(max_soc_today))), 1)
-        _target_reach_now_ts = int(time.time())
-        target_reach_state = "reachable" if can_reach_target else "unreachable_auto"
-        target_reach_mode = "curve_servo" if can_reach_target else "e3dc_auto"
-        target_reach_reason = (
-            "Tagesziel erreichbar: Zielkurve aktiv. Die Prognose wird bei jedem Planlauf neu geprüft."
-            if can_reach_target
-            else (
-                "Tagesziel aktuell nicht erreichbar: E3DC AUTO. Der E3DC nutzt realen PV-Überschuss "
-                "autonom; Entladung bleibt geschützt. Die Prognose wird bei jedem Planlauf neu geprüft."
+        if target_already_reached:
+            target_reach_state = "reachable"
+        elif _target_reach_dc_only and not _target_reach_decision_use_allowed:
+            target_reach_state = "evidence_limit"
+        else:
+            target_reach_state = (
+                "reachable" if can_reach_target else "unreachable_auto"
             )
-        )
+        target_reach_mode = "curve_servo" if can_reach_target else "e3dc_auto"
+        if target_reach_state == "reachable":
+            target_reach_reason = (
+                "Tagesziel erreichbar: Zielkurve aktiv. Die Prognose wird bei "
+                "jedem Planlauf neu geprüft."
+            )
+        elif target_reach_state == "evidence_limit":
+            target_reach_reason = (
+                "EVIDENCE_LIMIT: Der quellengetrennten Punktprognose fehlen "
+                "kalibrierte Untergrenze, Taper-/Batterieannahme und gebundener "
+                "spätester Ladestart. Kein Prognose-Aufschub und keine "
+                "AC-Freigabe."
+            )
+        else:
+            target_reach_reason = (
+                "Tagesziel belastbar nicht erreichbar: E3DC AUTO. Der E3DC "
+                "nutzt realen PV-Überschuss autonom; Entladung bleibt geschützt."
+            )
         _previous_target_reach_state = ""
         _previous_target_reach_last_change_ts = 0
         try:
@@ -7050,12 +7727,50 @@ class StorageSimulator:
             target_reach_last_change_ts = _previous_target_reach_last_change_ts
         else:
             target_reach_last_change_ts = _target_reach_now_ts
+        target_reach_chargeability_contract = {
+            "schema": "storage_forecast_chargeability_v1",
+            "status": "evidence_limit",
+            "plan_id": None,
+            "decision_use_allowed": False,
+            "wait_allowed": False,
+            "aux_ac_allowed": False,
+            "wait_coverage_proven": False,
+            "dc_shortfall_risk_bounded": False,
+            "evaluated_ts": _target_reach_now_ts,
+            "valid_until_ts": _target_reach_now_ts + 1200,
+            "source_scope": (
+                "E3DC_DC_ONLY" if _target_reach_dc_only else "TOTAL_PV"
+            ),
+            "topology_revision": (
+                self.pv_topology_contract.get("revision")
+                if _target_reach_dc_only
+                else None
+            ),
+            "forecast_fresh": bool(
+                _target_reach_slot_contracts
+                and all(
+                    contract.get("forecast_fresh") is True
+                    for contract in _target_reach_slot_contracts
+                )
+            ),
+            "forecast_revision": None,
+            "calibration_revision": None,
+            "conservative_quantile_bound": False,
+            "charge_acceptance_bound": False,
+            "latest_start_bound": False,
+            "shortfall_proven": False,
+            "blockers": [
+                "source_specific_calibrated_lower_quantile_missing",
+                "future_battery_acceptance_and_taper_missing",
+                "latest_charge_start_not_evidence_bound",
+            ],
+        }
         target_reach_contract = {
             "target_reach_state": target_reach_state,
             "target_reach_mode": target_reach_mode,
             "target_reach_reason": target_reach_reason,
             "target_reach_recheck_active": True,
-            "target_reach_policy": "diagnostic_status_from_can_reach_target_v1",
+            "target_reach_policy": "source_separated_chargeable_surplus_v2",
             "target_reach_control_owner": "storage_manager_can_reach_target",
             "target_reach_status_only": True,
             "target_reach_changed": bool(
@@ -7065,14 +7780,69 @@ class StorageSimulator:
             "target_reach_last_change_ts": target_reach_last_change_ts,
             "target_reach_stable_s": max(0, _target_reach_now_ts - target_reach_last_change_ts),
             "target_reach_can_reach_target": bool(can_reach_target),
+            "target_reach_point_can_reach_target": bool(
+                can_reach_target_point
+            ),
+            "target_reach_decision_evidence_complete": bool(
+                _target_reach_decision_evidence_complete
+            ),
+            "target_reach_conservative_quantile_bound": bool(
+                _target_reach_conservative_quantile_bound
+            ),
+            "target_reach_charge_acceptance_bound": bool(
+                _target_reach_charge_acceptance_bound
+            ),
+            "target_reach_latest_start_bound": bool(
+                _target_reach_latest_start_bound
+            ),
+            "target_reach_decision_use_allowed": bool(
+                _target_reach_decision_use_allowed
+            ),
+            "target_reach_wait_coverage_proven": False,
+            "target_reach_dc_shortfall_risk_bounded": False,
+            "target_reach_wait_allowed": False,
+            "target_reach_aux_ac_allowed": False,
+            "target_reach_shortfall_proven": bool(
+                _target_reach_decision_use_allowed
+                and not can_reach_target
+            ),
+            "target_reach_chargeability_contract": (
+                target_reach_chargeability_contract
+            ),
+            "target_reach_evaluated_ts": _target_reach_now_ts,
+            "target_reach_source_scope": (
+                "E3DC_DC_ONLY" if _target_reach_dc_only else "TOTAL_PV"
+            ),
+            "target_reach_source_evidence_complete": bool(
+                _target_reach_source_evidence_complete
+            ),
+            "target_reach_source_evidence_reasons": sorted(
+                _target_reach_missing_reasons
+            ),
+            "target_reach_forecast_fresh": bool(
+                _target_reach_slot_contracts
+                and all(
+                    contract.get("forecast_fresh") is True
+                    for contract in _target_reach_slot_contracts
+                )
+            ),
+            "target_reach_topology_revision": (
+                self.pv_topology_contract.get("revision")
+                if _target_reach_dc_only
+                else None
+            ),
             "target_reach_surplus_wh": round(float(today_chargeable_surplus_wh), 0),
+            "target_reach_total_surplus_wh": round(float(today_total_surplus_wh), 0),
             "target_reach_required_wh": round(float(physical_needed_wh), 0),
             "target_reach_margin_wh": round(float(today_chargeable_surplus_wh - physical_needed_wh), 0),
             "target_reach_sim_max_soc_pct": round(float(max_soc_today), 1),
             "target_reach_max_reachable_soc": max_reachable_soc,
         }
         target_curve_meta.update(target_reach_contract)
-        if not can_reach_target and target_timeline:
+        if (
+            target_reach_state == "unreachable_auto"
+            and target_timeline
+        ):
             if max_reachable_soc < float(self.target_soc) - 0.2:
                 target_curve_meta["effective_target_soc"] = float(self.target_soc)
                 target_curve_meta["max_reachable_soc"] = max_reachable_soc
@@ -7454,14 +8224,20 @@ class StorageSimulator:
                 _market_economics_config["market_reserve_floor_source"] = "live_ep_reserve"
         except Exception:
             pass
+        _market_now_ms = int(time.time() * 1000)
+        _market_required_horizon_end_ms = min(
+            int(end_ms),
+            _market_now_ms + MARKET_HORIZON_MS,
+        )
         market_plan = build_market_economics_plan(
             _market_economics_config,
             timeline,
             current_soc,
             self.capacity_wh,
             self.target_soc,
-            now_ms=time.time() * 1000,
+            now_ms=_market_now_ms,
             target_timeline=target_timeline,
+            required_energy_horizon_end_ts_ms=_market_required_horizon_end_ms,
         )
         if storm_grid_charge.get("active"):
             awattar_mode = 2
@@ -7489,6 +8265,8 @@ class StorageSimulator:
         # Verhindert Race-Condition: storage_manager koennte waehrend des Schreibens
         # ein leeres/korruptes JSON lesen -> target_timeline nicht gefunden.
         _tmp_file = OUTPUT_FILE + '.tmp'
+        _action_projection_tmp_file = ACTION_PROJECTION_FILE + '.tmp'
+        _action_projection_ready = False
         with open(_tmp_file, 'w', encoding='utf-8') as f:
             ladestart_ts  = None
             ladestart_soc = None
@@ -7540,7 +8318,7 @@ class StorageSimulator:
             except Exception as _e:
                 logger.warning(f'Ladestart-Anker Berechnung fehlgeschlagen: {_e}')
 
-            # --- 6b. Anker in target_timeline sicherstellen ---
+	            # --- 6b. Anker in target_timeline sicherstellen ---
             # Damit das Frontend die Kurve ab Ladestart (z.B. 07:00) zeichnet
             if ladestart_ts and ladestart_soc is not None and not locals().get('morning_anchor_delayed', False):
                 if not target_timeline or target_timeline[0]['ts'] > ladestart_ts:
@@ -7553,6 +8331,51 @@ class StorageSimulator:
                             target_timeline[0]["soc"] = float(ladestart_soc)
                     except Exception:
                         pass
+
+            _heat_wp_type = int(self._safe_float(self.v4_config.get("wp_type", -1), -1))
+            _heat_enabled = self._cfg_bool(self.v4_config.get("luxtronik"), False)
+            _heat_has_shelly = any(
+                str(self.v4_config.get(key, "") or "").strip() not in ("", "0.0.0.0")
+                for key in ("shelly_sg_ip", "shelly_pause_ip")
+            )
+            _heat_separate_targets = _heat_enabled and _heat_wp_type in (0, 1)
+            _heat_combined_target = _heat_enabled and (
+                _heat_wp_type == 5 or _heat_has_shelly
+            )
+            _heat_controllable = bool(
+                _heat_separate_targets or _heat_combined_target
+            )
+            _heat_price_boost_config = {
+                "price_boost_enable": self.v4_config.get("price_boost_enable", 0),
+                "heat_price_boost_scope": self.v4_config.get("heat_price_boost_scope", "both"),
+                "heat_price_boost_windows": self.v4_config.get("heat_price_boost_windows", ""),
+                "price_limit": self.v4_config.get("price_limit"),
+                "price_hard_limit": self.v4_config.get("price_hard_limit"),
+                "price_pause_limit": self.v4_config.get("price_pause_limit"),
+                "price_min_duration": self.v4_config.get("price_min_duration"),
+                "stromtarif_typ": self.v4_config.get("stromtarif_typ"),
+                "auto_mode": self.v4_config.get("auto_mode", 1),
+                "heat_policy_runtime_enable": self.v4_config.get("heat_policy_runtime_enable", 0),
+                "wp_min_runtime_min": self.v4_config.get("wp_min_runtime_min", 30),
+                "wp_restart_block_min": self.v4_config.get("wp_restart_block_min", 20),
+                "wp_type": _heat_wp_type,
+                "heatpump_configured": bool(_heat_enabled),
+                "heatpump_controllable": _heat_controllable,
+                "heatpump_driver_class": (
+                    "separate_targets"
+                    if _heat_separate_targets
+                    else "combined_sg_ready"
+                    if _heat_combined_target
+                    else "unavailable"
+                ),
+                "heatpump_allowed_scopes": (
+                    ["heating", "dhw", "both"]
+                    if _heat_separate_targets
+                    else ["both"]
+                    if _heat_combined_target
+                    else []
+                ),
+            }
 
             _storage_plan_payload = {
                 "ts":              now.isoformat(),
@@ -7587,6 +8410,60 @@ class StorageSimulator:
                     "deadline_ts": selected_predump_end_ts or adaptive_headroom.get("curtailment_first_pressure_ts", 0),
                     "observed_pressure": adaptive_headroom.get("observed_pressure", {}),
                 },
+                "forecast_shortfall_aux_ac_config": {
+                    "schema_version": (
+                        "storage_forecast_shortfall_aux_ac_config_v1"
+                    ),
+                    "enabled": bool(
+                        FORECAST_SHORTFALL_AUX_AC_RELEASED
+                        and forecast_only_curve
+                        and self._cfg_bool(
+                            self.v4_config.get(
+                                "storage_forecast_shortfall_aux_ac_charge_enable"
+                            ),
+                            False,
+                        )
+                    ),
+                    "dc_first_enabled": self._cfg_bool(
+                        self.v4_config.get(
+                            "storage_dc_first_charge_limit_enable"
+                        ),
+                        False,
+                    ),
+                    "forecast_only_target_active": bool(
+                        forecast_only_curve
+                    ),
+                    "target_soc_pct": 100.0,
+                    "deadline_ts_ms": ladeende_ts_export,
+                    "battery_capacity_wh": self.capacity_wh,
+                    "max_charge_power_w": self.max_charge_w,
+                    # Keine implizite Risikowahl: Bis ein expliziter,
+                    # gemeinsam festgelegter Schwellenwert vorhanden ist,
+                    # bleibt der Action-Erzeuger fail-closed.
+                    "risk_threshold_pct": self.v4_config.get(
+                        "storage_forecast_shortfall_risk_threshold_pct"
+                    ),
+                    "max_forecast_age_s": self.v4_config.get(
+                        "storage_forecast_shortfall_max_age_s",
+                        1200,
+                    ),
+                    "shortfall_deadband_wh": self.v4_config.get(
+                        "storage_forecast_shortfall_deadband_wh",
+                        100,
+                    ),
+                },
+                "forecast_shortfall_joint_horizon_evidence": (
+                    pv_source_meta.get(
+                        "storage_forecast_joint_horizon_evidence"
+                    )
+                    if isinstance(
+                        pv_source_meta.get(
+                            "storage_forecast_joint_horizon_evidence"
+                        ),
+                        dict,
+                    )
+                    else {}
+                ),
                 "physical_reserve_soc": round(float(_ep_reserve_floor_soc), 2),
                 "current_soc":      round(float(current_soc), 3),
                 "target_soc":      round(config_target_soc, 1),
@@ -7694,7 +8571,26 @@ class StorageSimulator:
                 "target_reach_last_change_ts": target_reach_contract.get("target_reach_last_change_ts"),
                 "target_reach_stable_s": target_reach_contract.get("target_reach_stable_s"),
                 "target_reach_can_reach_target": target_reach_contract.get("target_reach_can_reach_target"),
+                "target_reach_point_can_reach_target": target_reach_contract.get("target_reach_point_can_reach_target"),
+                "target_reach_decision_evidence_complete": target_reach_contract.get("target_reach_decision_evidence_complete"),
+                "target_reach_conservative_quantile_bound": target_reach_contract.get("target_reach_conservative_quantile_bound"),
+                "target_reach_charge_acceptance_bound": target_reach_contract.get("target_reach_charge_acceptance_bound"),
+                "target_reach_latest_start_bound": target_reach_contract.get("target_reach_latest_start_bound"),
+                "target_reach_decision_use_allowed": target_reach_contract.get("target_reach_decision_use_allowed"),
+                "target_reach_wait_coverage_proven": target_reach_contract.get("target_reach_wait_coverage_proven"),
+                "target_reach_dc_shortfall_risk_bounded": target_reach_contract.get("target_reach_dc_shortfall_risk_bounded"),
+                "target_reach_wait_allowed": target_reach_contract.get("target_reach_wait_allowed"),
+                "target_reach_aux_ac_allowed": target_reach_contract.get("target_reach_aux_ac_allowed"),
+                "target_reach_shortfall_proven": target_reach_contract.get("target_reach_shortfall_proven"),
+                "target_reach_chargeability_contract": target_reach_contract.get("target_reach_chargeability_contract"),
+                "target_reach_evaluated_ts": target_reach_contract.get("target_reach_evaluated_ts"),
+                "target_reach_source_scope": target_reach_contract.get("target_reach_source_scope"),
+                "target_reach_source_evidence_complete": target_reach_contract.get("target_reach_source_evidence_complete"),
+                "target_reach_source_evidence_reasons": target_reach_contract.get("target_reach_source_evidence_reasons"),
+                "target_reach_forecast_fresh": target_reach_contract.get("target_reach_forecast_fresh"),
+                "target_reach_topology_revision": target_reach_contract.get("target_reach_topology_revision"),
                 "target_reach_surplus_wh": target_reach_contract.get("target_reach_surplus_wh"),
+                "target_reach_total_surplus_wh": target_reach_contract.get("target_reach_total_surplus_wh"),
                 "target_reach_required_wh": target_reach_contract.get("target_reach_required_wh"),
                 "target_reach_margin_wh": target_reach_contract.get("target_reach_margin_wh"),
                 "target_reach_sim_max_soc_pct": target_reach_contract.get("target_reach_sim_max_soc_pct"),
@@ -7717,10 +8613,15 @@ class StorageSimulator:
                 "storm_grid_charge": storm_grid_charge,
                 "planned_loads": planned_load_meta,
                 "consumption_forecast": consumption_forecast_meta,
-                "forecast_source": forecast_meta.get("forecast_source", "pv_forecast"),
-                "forecast_trust": forecast_meta.get("forecast_trust", "forecast"),
-                "forecast_confidence": forecast_meta.get("forecast_confidence", 1.0),
-                "emergency_curve_active": bool(forecast_meta.get("emergency_curve_active", False)),
+	                "forecast_source": forecast_meta.get("forecast_source", "pv_forecast"),
+	                "forecast_trust": forecast_meta.get("forecast_trust", "forecast"),
+	                "forecast_confidence": forecast_meta.get("forecast_confidence"),
+	                "forecast_confidence_status": forecast_meta.get(
+	                    "forecast_confidence_status",
+	                    "evidence_limit",
+	                ),
+                "heat_price_boost_config": _heat_price_boost_config,
+	                "emergency_curve_active": bool(forecast_meta.get("emergency_curve_active", False)),
                 "emergency_curve_reason": forecast_meta.get("emergency_curve_reason", ""),
                 "timeline":        timeline,
                 "target_timeline": target_timeline,
@@ -7731,8 +8632,14 @@ class StorageSimulator:
                 "target_curve_meta": target_curve_meta,
             }
             _dispatch_started = time.perf_counter()
-            _storage_plan_payload = build_canonical_dispatch_plan(_storage_plan_payload)
+            _storage_plan_payload = build_canonical_dispatch_plan(
+                _storage_plan_payload,
+                capture_dv_shadow_history=True,
+            )
             _dispatch_runtime_ms = round((time.perf_counter() - _dispatch_started) * 1000.0, 3)
+            _dv_shadow_history_job = _prepare_dv_shadow_history_job(
+                _storage_plan_payload
+            )
             _shadow_runtime = _storage_plan_payload.get("shadow_dispatch")
             if isinstance(_shadow_runtime, dict):
                 # runtime_ms ist im Planhash bewusst ausgeschlossen. So bleibt
@@ -7740,27 +8647,199 @@ class StorageSimulator:
                 # für Shadow-/Phase-5-Gates sichtbar.
                 _shadow_runtime["runtime_ms"] = _dispatch_runtime_ms
                 _shadow_runtime["runtime_measurement"] = "storage_simulator_perf_counter"
-            f.write(json.dumps(
+            _storage_plan_json = json.dumps(
                 _storage_plan_payload,
                 ensure_ascii=False,
                 separators=(",", ":"),
-            ))
+            )
+            _storage_plan_bytes = _storage_plan_json.encode("utf-8")
+            try:
+                _action_projection_payload = (
+                    build_storage_plan_action_projection_artifact(
+                        _storage_plan_payload,
+                        raw_plan_sha256=(
+                            "sha256:"
+                            + hashlib.sha256(_storage_plan_bytes).hexdigest()
+                        ),
+                        raw_plan_size=len(_storage_plan_bytes),
+                    )
+                )
+                with open(
+                    _action_projection_tmp_file,
+                    "w",
+                    encoding="utf-8",
+                ) as projection_file:
+                    projection_file.write(json.dumps(
+                        _action_projection_payload,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ))
+                _action_projection_ready = True
+            except Exception as exc:
+                try:
+                    os.unlink(_action_projection_tmp_file)
+                except OSError:
+                    pass
+                logger.warning(
+                    "Action-Projektionsartefakt nicht erzeugt; Web-Fallback "
+                    "bleibt fail-closed (%s).",
+                    type(exc).__name__,
+                )
+            f.write(_storage_plan_json)
         os.replace(_tmp_file, OUTPUT_FILE)  # Atomar: kein Leser sieht korruptes JSON
         try: os.chmod(OUTPUT_FILE, 0o664)
         except: pass
+        if _action_projection_ready:
+            try:
+                # Erst der Plan, danach sein exakter Rohbyte-Seal. Ein Leser
+                # zwischen beiden Renames sieht höchstens ein Mismatch und
+                # bleibt dadurch ohne Action-only-Rückfall.
+                os.replace(
+                    _action_projection_tmp_file,
+                    ACTION_PROJECTION_FILE,
+                )
+                os.chmod(ACTION_PROJECTION_FILE, 0o664)
+            except Exception as exc:
+                try:
+                    os.unlink(_action_projection_tmp_file)
+                except OSError:
+                    pass
+                logger.warning(
+                    "Action-Projektionsartefakt nicht veröffentlicht; "
+                    "Web-Fallback bleibt fail-closed (%s).",
+                    type(exc).__name__,
+                )
+        self.last_plan_valid_until_ts_ms = int(
+            _storage_plan_payload.get("valid_until_ts_ms") or 0
+        )
+        _enqueue_dv_shadow_history(_dv_shadow_history_job)
 
         logger.info(f"[OK] V4 Speicher-Plan generiert und in {OUTPUT_FILE} gespeichert.")
+        return True
 
 import time
 
+def _storage_plan_input_file_signature(path):
+    try:
+        info = os.stat(path, follow_symlinks=False)
+    except OSError:
+        return (path, "missing")
+
+    if path == WEATHER_ALERTS_FILE:
+        payload, metadata = _stable_json_object(path)
+        if isinstance(payload, dict) and isinstance(metadata, dict):
+            alerts = []
+            for alert in payload.get("alerts") or []:
+                if not isinstance(alert, dict):
+                    continue
+                alerts.append({
+                    "level": alert.get("level", payload.get("highest_level", 0)),
+                    "thunderstorm": alert.get("thunderstorm"),
+                    "event": alert.get("event"),
+                    "headline": alert.get("headline"),
+                    "description": alert.get("description"),
+                    "start": alert.get("start_ts", alert.get("start")),
+                    "end": alert.get("end_ts", alert.get("end")),
+                })
+            alerts.sort(
+                key=lambda item: json.dumps(
+                    item,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+            risk = payload.get("risk") if isinstance(payload.get("risk"), dict) else {}
+            age_s = max(
+                0.0,
+                time.time() - float(metadata.get("mtime") or 0.0),
+            )
+            semantic_payload = {
+                "freshness": "stale" if age_s > 6 * 3600 else "fresh",
+                "active": payload.get("active"),
+                "thunderstorm_active": payload.get("thunderstorm_active"),
+                "highest_level": payload.get("highest_level"),
+                "title": payload.get("title"),
+                "summary": payload.get("summary"),
+                "alerts": alerts,
+                "risk": {
+                    "active": risk.get("active"),
+                    "level": risk.get("level"),
+                    "time": risk.get("ts", risk.get("time")),
+                    "reason": risk.get("reason"),
+                },
+            }
+            return (
+                path,
+                "weather_alerts_semantic_v2",
+                revision_hash(semantic_payload),
+            )
+        return (
+            path,
+            "weather_alerts_invalid",
+            int(info.st_dev),
+            int(info.st_ino),
+            int(info.st_size),
+            int(info.st_mtime_ns),
+            int(info.st_ctime_ns),
+        )
+
+    return (
+        path,
+        int(info.st_dev),
+        int(info.st_ino),
+        int(info.st_size),
+        int(info.st_mtime_ns),
+        int(info.st_ctime_ns),
+    )
+
+
 def _storage_plan_input_signature():
-    signature = []
-    for path in SIM_REPLAN_INPUT_FILES:
+    return tuple(
+        _storage_plan_input_file_signature(path)
+        for path in SIM_REPLAN_INPUT_FILES
+    )
+
+
+def _generate_plan_bound_to_inputs(sim):
+    """Erzeugt einen Plan und verliert keine Änderung während des Planlaufs."""
+
+    last_input_signature = _storage_plan_input_signature()
+    for attempt in range(2):
+        input_signature_before = _storage_plan_input_signature()
         try:
-            signature.append((path, os.path.getmtime(path) if os.path.exists(path) else 0.0))
-        except Exception:
-            signature.append((path, 0.0))
-    return tuple(signature)
+            sim.generate_plan()
+        except Exception as exc:
+            logger.error(f"Unerwarteter Fehler im Storage Simulator Loop: {exc}")
+        input_signature_after = _storage_plan_input_signature()
+        last_input_signature = input_signature_after
+        if input_signature_after == input_signature_before:
+            return last_input_signature
+        if attempt == 0:
+            logger.info(
+                "Storage-Plan Eingangsdaten änderten sich während des Planlaufs "
+                "- führe genau einen gebundenen Nachlauf aus."
+            )
+            continue
+        # Bei dauerhaft churnenden Quellen verhindert der kurze Pollpfad eine
+        # ungebremste Replan-Schleife. Die Vor-Signatur sorgt dafür, dass die
+        # letzte Änderung beim nächsten Poll sicher erneut auffällt.
+        logger.warning(
+            "Storage-Plan Eingangsdaten änderten sich auch im Nachlauf; "
+            "erneute Prüfung im kurzen Eingangspoll."
+        )
+        return input_signature_before
+    return last_input_signature
+
+
+def _storage_plan_requires_immediate_replan(sim, now_s=None):
+    """Verhindert eine abgelaufene Erstgeneration über einer Slotgrenze."""
+
+    now_ms = int((time.time() if now_s is None else float(now_s)) * 1000.0)
+    valid_until_ms = int(
+        getattr(sim, "last_plan_valid_until_ts_ms", 0) or 0
+    )
+    return bool(valid_until_ms > 0 and now_ms >= valid_until_ms)
 
 
 def run_service():
@@ -7768,11 +8847,14 @@ def run_service():
     sim = StorageSimulator()
     last_input_signature = _storage_plan_input_signature()
     while True:
-        try:
-            sim.generate_plan()
-            last_input_signature = _storage_plan_input_signature()
-        except Exception as e:
-            logger.error(f"Unerwarteter Fehler im Storage Simulator Loop: {e}")
+        last_input_signature = _generate_plan_bound_to_inputs(sim)
+
+        if _storage_plan_requires_immediate_replan(sim):
+            logger.warning(
+                "Erzeugter Storage-Plan überschritt während der Berechnung "
+                "seine Slotgrenze; plane unmittelbar für den aktuellen Slot neu."
+            )
+            continue
 
         # Die Simulation baut auf der PV Prognose auf. Alle 15 Minuten updaten reicht völlig aus.
         # Config-/Forecast-Aenderungen sollen aber zeitnah sichtbar werden, ohne dass Nutzer
@@ -7783,12 +8865,12 @@ def run_service():
         now_s = time.time()
         deadline = (int(now_s // SIM_INTERVAL_S) + 1) * SIM_INTERVAL_S + 0.05
         while time.time() < deadline:
-            time.sleep(min(SIM_INPUT_POLL_S, max(0.2, deadline - time.time())))
             current_signature = _storage_plan_input_signature()
             if current_signature != last_input_signature:
-                logger.info("Storage-Plan Eingangsdaten geaendert - plane zeitnah neu.")
+                logger.info("Storage-Plan Eingangsdaten geändert - plane zeitnah neu.")
                 last_input_signature = current_signature
                 break
+            time.sleep(min(SIM_INPUT_POLL_S, max(0.2, deadline - time.time())))
 
 if __name__ == "__main__":
     run_service()

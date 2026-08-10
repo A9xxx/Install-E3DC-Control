@@ -17,6 +17,17 @@ import math
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
+try:
+    from .direct_marketing_actions import (
+        direct_marketing_export_gate_contract_valid,
+        direct_marketing_typed_int_equals,
+    )
+except ImportError:
+    from direct_marketing_actions import (  # type: ignore
+        direct_marketing_export_gate_contract_valid,
+        direct_marketing_typed_int_equals,
+    )
+
 
 SHADOW_SCHEMA = "storage_dispatch_shadow_v1"
 ALGORITHM = "discrete_dynamic_programming_v1"
@@ -31,6 +42,19 @@ ACTION_HORIZON_SCHEMA = "storage_dispatch_action_horizon_v1"
 
 class ShadowInputError(ValueError):
     """Ein Pflichtinput erlaubt keinen belastbaren Shadowplan."""
+
+    def __init__(
+        self,
+        reason_code: str,
+        diagnostic: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self.reason_code = str(reason_code or "SHADOW_INPUT_ERROR")
+        self.diagnostic = (
+            copy.deepcopy(diagnostic)
+            if isinstance(diagnostic, dict)
+            else None
+        )
+        super().__init__(self.reason_code)
 
 
 def _sf(value: Any, default: Optional[float] = 0.0) -> Optional[float]:
@@ -103,16 +127,58 @@ def _parameters(plan: Dict[str, Any], capacity_wh: float) -> Dict[str, Any]:
         0.0,
         _sf(cfg.get("degradation_ct_per_kwh", economics.get("battery_cost_ct_per_kwh")), 4.0) or 4.0,
     )
-    max_charge_w = max(300.0, _sf(plan.get("max_charge_w"), 0.0) or 0.0)
-    max_discharge_w = max(300.0, _sf(plan.get("max_discharge_w"), max_charge_w) or max_charge_w)
+    max_charge_w = max(0.0, _sf(plan.get("max_charge_w"), 0.0) or 0.0)
+    max_discharge_w = max(
+        0.0,
+        _sf(plan.get("max_discharge_w"), max_charge_w) or 0.0,
+    )
     configured_export_w = _sf(plan.get("export_limit_w"), 0.0) or 0.0
     direct_export_w = _sf(flags.get("max_export_w"), 0.0) or 0.0
     export_limit_w = configured_export_w if configured_export_w > 0.0 else direct_export_w
     if export_limit_w <= 0.0:
         export_limit_w = max(20_000.0, max_discharge_w)
     step_default = max(100.0, min(500.0, round((capacity_wh / 140.0) / 50.0) * 50.0))
+    requested_step_wh = max(
+        50.0,
+        _sf(cfg.get("state_step_wh"), step_default) or step_default,
+    )
+    charge_step_cap_wh = (
+        max_charge_w * SLOT_HOURS * math.sqrt(roundtrip)
+        if max_charge_w > 0.0
+        else None
+    )
+    discharge_step_cap_wh = (
+        max_discharge_w * SLOT_HOURS / max(0.01, math.sqrt(roundtrip))
+        if max_discharge_w > 0.0
+        else None
+    )
+    positive_step_caps = [
+        value
+        for value in (charge_step_cap_wh, discharge_step_cap_wh)
+        if value is not None and value >= 50.0
+    ]
+    state_step_wh = requested_step_wh
+    if positive_step_caps:
+        physical_step_cap_wh = min(positive_step_caps)
+        rounded_cap_wh = max(
+            50.0,
+            math.floor((physical_step_cap_wh + 1.0e-6) / 50.0) * 50.0,
+        )
+        state_step_wh = min(requested_step_wh, rounded_cap_wh)
     return {
-        "state_step_wh": max(50.0, _sf(cfg.get("state_step_wh"), step_default) or step_default),
+        "state_step_wh": state_step_wh,
+        "state_step_requested_wh": requested_step_wh,
+        "state_step_charge_cap_wh": (
+            round(charge_step_cap_wh, 6)
+            if charge_step_cap_wh is not None
+            else None
+        ),
+        "state_step_discharge_cap_wh": (
+            round(discharge_step_cap_wh, 6)
+            if discharge_step_cap_wh is not None
+            else None
+        ),
+        "state_step_limited_by_slot_power": state_step_wh < requested_step_wh,
         "roundtrip_efficiency_pct": round(roundtrip * 100.0, 3),
         "charge_efficiency": math.sqrt(roundtrip),
         "discharge_efficiency": math.sqrt(roundtrip),
@@ -158,33 +224,79 @@ def _slot_forecast(slot: Dict[str, Any]) -> Dict[str, Any]:
     pv = forecast.get("pv") if isinstance(forecast.get("pv"), dict) else {}
     load = forecast.get("load") if isinstance(forecast.get("load"), dict) else {}
     projection = slot.get("projection") if isinstance(slot.get("projection"), dict) else {}
-    pv50 = _sf(pv.get("p50"), _sf(projection.get("pv_w"), 0.0)) or 0.0
-    load50 = _sf(load.get("p50"), None)
-    if load50 is None:
-        load50 = sum(
+    pv_point = _sf(
+        pv.get("point"),
+        _sf(projection.get("pv_w"), 0.0),
+    ) or 0.0
+    load_point = _sf(load.get("point"), None)
+    if load_point is None:
+        load_point = sum(
             _sf(projection.get(key), 0.0) or 0.0
             for key in ("home_w", "heat_w", "wallbox_w")
         )
     pv10 = _sf(pv.get("p10"), None)
+    pv50 = _sf(pv.get("p50"), None)
     pv90 = _sf(pv.get("p90"), None)
     load10 = _sf(load.get("p10"), None)
+    load50 = _sf(load.get("p50"), None)
     load90 = _sf(load.get("p90"), None)
-    quantiles = all(value is not None for value in (pv10, pv90, load10, load90))
+    quantile_contract = (
+        forecast.get("quantile_contract")
+        if isinstance(forecast.get("quantile_contract"), dict)
+        else {}
+    )
+    pv_contract = (
+        quantile_contract.get("pv")
+        if isinstance(quantile_contract.get("pv"), dict)
+        else {}
+    )
+    load_contract = (
+        quantile_contract.get("load")
+        if isinstance(quantile_contract.get("load"), dict)
+        else {}
+    )
+    quantiles = bool(
+        quantile_contract.get("status") == "complete"
+        and quantile_contract.get("canonical_convention")
+        == "cdf_non_exceedance"
+        and all(
+            contract.get("status") == "complete"
+            and contract.get("canonical_convention")
+            == "cdf_non_exceedance"
+            and isinstance(contract.get("source"), str)
+            and bool(contract.get("source"))
+            and isinstance(contract.get("revision"), str)
+            and bool(contract.get("revision"))
+            and contract.get("fresh") is True
+            and contract.get("order_valid") is True
+            for contract in (pv_contract, load_contract)
+        )
+        and all(
+            value is not None and value >= 0.0
+            for value in (pv10, pv50, pv90, load10, load50, load90)
+        )
+        and float(pv10) <= float(pv50) <= float(pv90)
+        and float(load10) <= float(load50) <= float(load90)
+    )
     if quantiles:
         scenarios = [
             ("conservative", float(pv10), float(load90), 0.20),
-            ("p50", pv50, float(load50), 0.60),
+            ("p50", float(pv50), float(load50), 0.60),
             ("favorable", float(pv90), float(load10), 0.20),
         ]
     else:
-        scenarios = [("p50_only", pv50, float(load50), 1.0)]
+        scenarios = [
+            ("deterministic_point", pv_point, float(load_point), 1.0)
+        ]
     return {
         "pv_p10": pv10,
         "pv_p50": pv50,
         "pv_p90": pv90,
+        "pv_point": pv_point,
         "load_p10": load10,
-        "load_p50": float(load50),
+        "load_p50": load50,
         "load_p90": load90,
+        "load_point": float(load_point),
         "quantiles_available": quantiles,
         "scenarios": scenarios,
     }
@@ -282,10 +394,11 @@ def _risk_floors(slots: Sequence[Dict[str, Any]], capacity_wh: float, params: Di
         if isinstance(slot.get("soc_pct"), dict)
         and _sf(slot["soc_pct"].get("notstrom_floor"), None) is not None
     )
-    p50_only_slots = sum(
+    point_forecast_slots = sum(
         1
         for slot in slots
-        if slot.get("forecast_scenario_contract") == "legacy_p50_only_no_quantile_invention"
+        if slot.get("forecast_scenario_contract")
+        == "deterministic_point_without_quantile_claim"
     )
     floors: List[float] = []
     max_extra = capacity_wh * params["economic_reserve_max_pct"] / 100.0
@@ -312,29 +425,29 @@ def _risk_floors(slots: Sequence[Dict[str, Any]], capacity_wh: float, params: Di
                 deficit_wh += max(0.0, -surplus_w) * SLOT_HOURS / max(0.01, params["discharge_efficiency"])
         floors.append(min(capacity_wh, base_floor + min(max_extra, deficit_wh)))
     if quantile_slots == len(slots):
-        scenario_contract = "explicit_p10_p50_p90"
+        scenario_contract = "explicit_cdf_p10_p50_p90"
         method = "p10_pv_p90_load_until_credible_recharge_v1"
-    elif quantile_slots == 0 and p50_only_slots == len(slots):
-        scenario_contract = "p50_only_with_published_risk_floor_no_quantile_invention"
-        method = "published_risk_floor_plus_p50_only_visible_scenario_v1"
+    elif quantile_slots == 0 and point_forecast_slots == len(slots):
+        scenario_contract = (
+            "deterministic_point_with_published_risk_floor_"
+            "without_quantile_claim"
+        )
+        method = (
+            "published_risk_floor_plus_deterministic_point_"
+            "visible_scenario_v1"
+        )
     else:
         scenario_contract = "mixed_or_incomplete_forecast_scenarios"
         method = "mixed_forecast_contract_fail_closed"
     field_activation_input_complete = bool(
         physical_floor_slots == len(slots)
-        and (
-            quantile_slots == len(slots)
-            or (
-                p50_only_slots == len(slots)
-                and published_risk_floor_slots == len(slots)
-            )
-        )
+        and quantile_slots == len(slots)
     )
     return floors, {
         "method": method,
         "scenario_contract": scenario_contract,
         "quantile_slots": quantile_slots,
-        "p50_only_slots": p50_only_slots,
+        "point_forecast_slots": point_forecast_slots,
         "published_risk_floor_slots": published_risk_floor_slots,
         "physical_floor_slots": physical_floor_slots,
         "slots": len(slots),
@@ -576,9 +689,38 @@ def _transition(
         "avoided_curtailment_wh": expected_avoided_curtailment_wh,
         "battery_export_wh": battery_export_wh,
         "scenario_rows": scenario_rows,
-        "forecast_contract": "p10_p50_p90" if forecast["quantiles_available"] else "p50_only_visible_fallback",
+        "forecast_contract": (
+            "explicit_cdf_p10_p50_p90"
+            if forecast["quantiles_available"]
+            else "deterministic_point_without_quantile_claim"
+        ),
         "prices": price,
     }
+
+
+def _hold_immediate_from_transition(
+    transition: Dict[str, Any],
+    params: Dict[str, Any],
+) -> float:
+    """Rekonstruiert HOLD ohne einen zweiten Übergang auszuwerten."""
+
+    scenario_rows = [
+        row
+        for row in transition.get("scenario_rows") or []
+        if isinstance(row, dict)
+    ]
+    if not scenario_rows:
+        raise ShadowInputError("HOLD_COUNTERFACTUAL_SCENARIOS_MISSING")
+    expected_baseline_net_ct = float(transition["baseline_net_ct"])
+    worst_baseline_net_ct = min(
+        float(row["baseline_net_ct"])
+        for row in scenario_rows
+    )
+    hold_risk_margin_ct = params["risk_aversion"] * max(
+        0.0,
+        expected_baseline_net_ct - worst_baseline_net_ct,
+    )
+    return expected_baseline_net_ct - hold_risk_margin_ct
 
 
 def _terminal_salvage(slots: Sequence[Dict[str, Any]], states: Sequence[float], params: Dict[str, Any]) -> Tuple[List[List[float]], Dict[str, Any]]:
@@ -615,9 +757,51 @@ def _solve_backward(
     minimum_deadline_index: Optional[int] = None,
     minimum_deadline_energy_wh: Optional[float] = None,
     keep_choices: bool = True,
-) -> Tuple[List[List[float]], List[Dict[Tuple[int, int], Tuple[int, int, Dict[str, Any]]]]]:
+) -> Tuple[List[List[float]], List[Dict[Tuple[int, int], Tuple[int, int, Optional[float]]]]]:
     future = copy.deepcopy(terminal_values)
-    choices: List[Dict[Tuple[int, int], Tuple[int, int, Dict[str, Any]]]] = [dict() for _ in slots]
+    choices: List[Dict[Tuple[int, int], Tuple[int, int, Optional[float]]]] = [
+        dict() for _ in slots
+    ]
+    mode_count = len(MODES)
+    hold_mode_index = MODES.index(0)
+    score_epsilon = 1.0e-9
+
+    # Physikalische Reichweite und Degradationsklasse hängen nur vom
+    # Ausgangszustand ab, nicht vom betrachteten Slot. Die bisherige Schleife
+    # berechnete deshalb dieselben Bisect-Grenzen und Klassen für jeden der bis
+    # zu 192 Slots erneut. Die vorbereiteten Indizes verändern weder das
+    # Zustandsraster noch die inklusive +/-1-Wh-Toleranz.
+    discharge_span_wh = (
+        params["max_discharge_w"]
+        * SLOT_HOURS
+        / max(0.01, params["discharge_efficiency"])
+    )
+    charge_span_wh = (
+        params["max_charge_w"]
+        * SLOT_HOURS
+        * params["charge_efficiency"]
+    )
+    reachable_ranges: List[Tuple[int, int]] = []
+    degradation_rates: List[float] = []
+    for energy in states:
+        reachable_ranges.append((
+            bisect.bisect_left(states, energy - discharge_span_wh - 1.0),
+            bisect.bisect_right(states, energy + charge_span_wh + 1.0),
+        ))
+        degradation_rates.append(
+            _marginal_degradation_ct_per_kwh(energy, capacity_wh, params)
+        )
+
+    # Ein Übergangsscore hängt innerhalb dieses DP-Aufrufs ausschließlich von
+    # Slotprognose/-preis, Energiedelta und Degradationsklasse ab. Identische
+    # numerische Slots dürfen daher dieselben unveränderlichen Tupel verwenden.
+    # Plan-, Slot- und Action-Identitäten bleiben außerhalb dieses rein
+    # numerischen Kerns vollständig und werden weiterhin separat gebildet.
+    transition_caches: Dict[
+        Tuple[Any, ...],
+        Dict[Tuple[float, float], Optional[Tuple[int, float, float]]],
+    ] = {}
+    cache_miss = object()
     for slot_index in range(len(slots) - 1, -1, -1):
         slot = slots[slot_index]
         slot_forecast = _slot_forecast(slot)
@@ -625,48 +809,59 @@ def _solve_backward(
         current_values = [[NEG_INF for _mode in MODES] for _state in states]
         floor = floors[slot_index]
         ceiling = ceilings[slot_index]
-        transition_cache: Dict[Tuple[float, float], Optional[Tuple[int, float, float]]] = {}
-        for state_index, energy in enumerate(states):
+        first_next_state = bisect.bisect_left(states, floor - 1.0)
+        after_current_state = bisect.bisect_right(states, ceiling + 1.0)
+        after_next_state = after_current_state
+        if deadline_index == slot_index and deadline_max_energy_wh is not None:
+            after_next_state = min(
+                after_next_state,
+                bisect.bisect_right(states, deadline_max_energy_wh + 1.0),
+            )
+        if (
+            minimum_deadline_index == slot_index
+            and minimum_deadline_energy_wh is not None
+        ):
+            first_next_state = max(
+                first_next_state,
+                bisect.bisect_left(states, minimum_deadline_energy_wh - 1.0),
+            )
+
+        transition_signature = (
+            tuple(
+                (str(name), float(pv_w), float(load_w), float(weight))
+                for name, pv_w, load_w, weight in slot_forecast["scenarios"]
+            ),
+            slot_price.get("buy"),
+            slot_price.get("net_sell"),
+        )
+        transition_cache = transition_caches.setdefault(
+            transition_signature,
+            {},
+        )
+        for state_index in range(after_current_state):
+            energy = states[state_index]
             # Der Startwert eines Slots wurde am Ende des vorherigen Slots
             # gegen dessen Floor geprüft. Ein jetzt ansteigender Risikofloor
             # muss innerhalb dieses Slots physisch erreichbar werden dürfen;
             # sonst würde ein Istwert unter einer neuen Kurve rechnerisch
             # verschwinden oder den gesamten Plan fälschlich infeasible machen.
-            if energy > ceiling + 1.0:
-                continue
             # Für jeden Zielmodus genügt dessen bestes Ziel. Umschaltkosten
             # hängen nur von Quell- und Zielmodus ab; ein innerhalb desselben
             # Zielmodus schlechterer Übergang kann deshalb für keinen der drei
             # Vorgängermodi gewinnen. Das erhält Score und Tie-Breaking exakt,
             # vermeidet aber die dreifache Vollauswertung aller Zielzustände.
-            best_by_mode: List[Optional[Tuple[int, int, float, float, Tuple[float, int]]]] = [
-                None,
-                None,
-                None,
-            ]
-            degradation_rate = _marginal_degradation_ct_per_kwh(energy, capacity_wh, params)
-            minimum_reachable = energy - params["max_discharge_w"] * SLOT_HOURS / max(
-                0.01, params["discharge_efficiency"]
-            )
-            maximum_reachable = energy + params["max_charge_w"] * SLOT_HOURS * params["charge_efficiency"]
-            first_reachable = bisect.bisect_left(states, minimum_reachable - 1.0)
-            after_reachable = bisect.bisect_right(states, maximum_reachable + 1.0)
+            best_next_indices = [-1] * mode_count
+            best_scores = [NEG_INF] * mode_count
+            best_negative_abs_w = [NEG_INF] * mode_count
+            degradation_rate = degradation_rates[state_index]
+            physical_first, physical_after = reachable_ranges[state_index]
+            first_reachable = max(physical_first, first_next_state)
+            after_reachable = min(physical_after, after_next_state)
             for next_index in range(first_reachable, after_reachable):
                 next_energy = states[next_index]
-                if next_energy < floor - 1.0 or next_energy > ceiling + 1.0:
-                    continue
-                if deadline_index == slot_index and deadline_max_energy_wh is not None and next_energy > deadline_max_energy_wh + 1.0:
-                    continue
-                if (
-                    minimum_deadline_index == slot_index
-                    and minimum_deadline_energy_wh is not None
-                    and next_energy < minimum_deadline_energy_wh - 1.0
-                ):
-                    continue
                 cache_key = (next_energy - energy, degradation_rate)
-                if cache_key in transition_cache:
-                    transition_score = transition_cache[cache_key]
-                else:
+                transition_score = transition_cache.get(cache_key, cache_miss)
+                if transition_score is cache_miss:
                     transition_score = _transition_score(
                         energy,
                         next_energy,
@@ -686,27 +881,31 @@ def _solve_backward(
                 if continuation <= NEG_INF / 2:
                     continue
                 base_score = float(immediate_net_ct) + continuation
-                within_mode_tie = (-abs(float(battery_w)), -next_index)
-                existing = best_by_mode[mode_index]
-                if existing is None or base_score > existing[2] + 1.0e-9 or (
-                    abs(base_score - existing[2]) <= 1.0e-9
-                    and within_mode_tie > existing[4]
+                negative_abs_w = -abs(float(battery_w))
+                existing_next = best_next_indices[mode_index]
+                existing_score = best_scores[mode_index]
+                if existing_next < 0 or base_score > existing_score + score_epsilon or (
+                    abs(base_score - existing_score) <= score_epsilon
+                    and (negative_abs_w, -next_index)
+                    > (best_negative_abs_w[mode_index], -existing_next)
                 ):
-                    best_by_mode[mode_index] = (
-                        next_index,
-                        mode_index,
-                        base_score,
-                        float(battery_w),
-                        within_mode_tie,
-                    )
+                    best_next_indices[mode_index] = next_index
+                    best_scores[mode_index] = base_score
+                    best_negative_abs_w[mode_index] = negative_abs_w
+            hold_next = best_next_indices[hold_mode_index]
+            hold_score = (
+                float(best_scores[hold_mode_index])
+                if hold_next >= 0
+                else None
+            )
             for previous_mode_index, previous_mode in enumerate(MODES):
                 best_score = NEG_INF
                 best_choice = None
-                for option in best_by_mode:
-                    if option is None:
+                for mode_index, mode in enumerate(MODES):
+                    next_index = best_next_indices[mode_index]
+                    if next_index < 0:
                         continue
-                    next_index, mode_index, base_score, battery_w, within_mode_tie = option
-                    mode = MODES[mode_index]
+                    base_score = best_scores[mode_index]
                     direction_switch_cost = (
                         params["switching_cost_ct"]
                         if previous_mode != 0 and mode != 0 and mode != previous_mode
@@ -716,20 +915,151 @@ def _solve_backward(
                     tie = (
                         int(mode == previous_mode),
                         int(mode == 0),
-                        within_mode_tie[0],
-                        within_mode_tie[1],
+                        best_negative_abs_w[mode_index],
+                        -next_index,
                     )
-                    if best_choice is None or score > best_score + 1.0e-9 or (
-                        abs(score - best_score) <= 1.0e-9 and tie > best_choice[3]
+                    if best_choice is None or score > best_score + score_epsilon or (
+                        abs(score - best_score) <= score_epsilon
+                        and tie > best_choice[2]
                     ):
                         best_score = score
-                        best_choice = (next_index, mode_index, None, tie)
+                        best_choice = (
+                            next_index,
+                            mode_index,
+                            tie,
+                        )
                 if best_choice is not None:
                     current_values[state_index][previous_mode_index] = best_score
                     if keep_choices:
-                        choices[slot_index][(state_index, previous_mode_index)] = best_choice[:3]
+                        score_margin_vs_hold = (
+                            float(best_score) - hold_score
+                            if best_choice[1] != MODES.index(0)
+                            and hold_score is not None
+                            else None
+                        )
+                        choices[slot_index][(state_index, previous_mode_index)] = (
+                            best_choice[0],
+                            best_choice[1],
+                            score_margin_vs_hold,
+                        )
         future = current_values
     return future, choices
+
+
+def _forward_infeasibility_diagnostic(
+    slots: Sequence[Dict[str, Any]],
+    states: Sequence[float],
+    floors: Sequence[float],
+    ceilings: Sequence[float],
+    params: Dict[str, Any],
+    capacity_wh: float,
+    initial_index: int,
+) -> Dict[str, Any]:
+    """Lokalisiert den ersten physikalisch unerreichbaren Shadow-Slot.
+
+    Diese Zusatzprüfung läuft ausschließlich nach einem gescheiterten DP-Lauf.
+    Sie verändert weder Floors noch Kandidaten und erzeugt keine Ersatzwerte.
+    """
+
+    reachable = {int(initial_index)}
+    last_reachable = sorted(reachable)
+    for slot_index, slot in enumerate(slots):
+        forecast = _slot_forecast(slot)
+        price = _slot_price(slot)
+        next_reachable = set()
+        for state_index in reachable:
+            energy = states[state_index]
+            if energy > ceilings[slot_index] + 1.0:
+                continue
+            minimum_reachable = energy - params["max_discharge_w"] * SLOT_HOURS / max(
+                0.01,
+                params["discharge_efficiency"],
+            )
+            maximum_reachable = (
+                energy
+                + params["max_charge_w"]
+                * SLOT_HOURS
+                * params["charge_efficiency"]
+            )
+            first_index = bisect.bisect_left(states, minimum_reachable - 1.0)
+            after_index = bisect.bisect_right(states, maximum_reachable + 1.0)
+            for next_index in range(first_index, after_index):
+                next_energy = states[next_index]
+                if (
+                    next_energy < floors[slot_index] - 1.0
+                    or next_energy > ceilings[slot_index] + 1.0
+                ):
+                    continue
+                if _transition_score(
+                    energy,
+                    next_energy,
+                    0,
+                    params,
+                    capacity_wh,
+                    forecast,
+                    price,
+                ) is not None:
+                    next_reachable.add(next_index)
+        if not next_reachable:
+            before_values = [states[index] for index in sorted(reachable)]
+            return {
+                "schema_version": "storage_dispatch_infeasibility_v1",
+                "first_infeasible_slot_index": slot_index,
+                "first_infeasible_slot_start_ts_ms": int(
+                    _sf(slot.get("start_ts_ms"), 0.0) or 0.0
+                ),
+                "first_infeasible_slot_end_ts_ms": int(
+                    _sf(slot.get("end_ts_ms"), 0.0) or 0.0
+                ),
+                "reachable_state_count_before": len(before_values),
+                "reachable_energy_min_wh_before": (
+                    round(min(before_values), 3) if before_values else None
+                ),
+                "reachable_energy_max_wh_before": (
+                    round(max(before_values), 3) if before_values else None
+                ),
+                "required_floor_wh": round(float(floors[slot_index]), 3),
+                "allowed_ceiling_wh": round(float(ceilings[slot_index]), 3),
+                "state_step_wh": round(float(params["state_step_wh"]), 3),
+                "max_charge_w": round(float(params["max_charge_w"]), 3),
+                "max_discharge_w": round(float(params["max_discharge_w"]), 3),
+                "grid_import_limit_w": round(
+                    float(params["grid_import_limit_w"]),
+                    3,
+                ),
+                "price_status": price.get("status"),
+                "price_fresh": price.get("fresh"),
+                "forecast_contract": (
+                    "explicit_cdf_p10_p50_p90"
+                    if forecast["quantiles_available"]
+                    else "deterministic_point_without_quantile_claim"
+                ),
+                "analysis_scope": (
+                    "DECISION_HORIZON_FORWARD_REACHABILITY_"
+                    "NO_TERMINAL_CONTINUATION"
+                ),
+                "diagnostic_effect": "READ_ONLY_NO_CONSTRAINT_RELAXATION",
+            }
+        last_reachable = sorted(next_reachable)
+        reachable = next_reachable
+    final_values = [states[index] for index in last_reachable]
+    return {
+        "schema_version": "storage_dispatch_infeasibility_v1",
+        "first_infeasible_slot_index": None,
+        "forward_path_complete": True,
+        "final_reachable_state_count": len(final_values),
+        "final_reachable_energy_min_wh": (
+            round(min(final_values), 3) if final_values else None
+        ),
+        "final_reachable_energy_max_wh": (
+            round(max(final_values), 3) if final_values else None
+        ),
+        "analysis_scope": (
+            "DECISION_HORIZON_FORWARD_REACHABILITY_"
+            "NO_TERMINAL_CONTINUATION"
+        ),
+        "diagnostic_effect": "READ_ONLY_NO_CONSTRAINT_RELAXATION",
+    }
 
 
 def _closest_state_index(states: Sequence[float], energy_wh: float, floor_wh: float, ceiling_wh: float) -> int:
@@ -746,7 +1076,7 @@ def _closest_state_index(states: Sequence[float], energy_wh: float, floor_wh: fl
 def _trace_path(
     slots: Sequence[Dict[str, Any]],
     states: Sequence[float],
-    choices: Sequence[Dict[Tuple[int, int], Tuple[int, int, Dict[str, Any]]]],
+    choices: Sequence[Dict[Tuple[int, int], Tuple[int, int, Optional[float]]]],
     initial_index: int,
     params: Dict[str, Any],
     capacity_wh: float,
@@ -760,7 +1090,7 @@ def _trace_path(
         choice = choices[slot_index].get((state_index, mode_index))
         if choice is None:
             raise ShadowInputError("DP_PATH_INFEASIBLE")
-        next_index, next_mode_index, _unused = choice
+        next_index, next_mode_index, score_margin_vs_hold = choice
         transition = _transition(
             slot,
             states[state_index],
@@ -771,6 +1101,17 @@ def _trace_path(
         )
         if not isinstance(transition, dict):
             raise ShadowInputError("DP_PATH_TRANSITION_INVALID")
+        hold_immediate_net_ct = (
+            _hold_immediate_from_transition(transition, params)
+            if score_margin_vs_hold is not None
+            else None
+        )
+        immediate_delta_vs_hold = (
+            float(transition["immediate_net_ct"])
+            - hold_immediate_net_ct
+            if hold_immediate_net_ct is not None
+            else None
+        )
         for scenario in transition["scenario_rows"]:
             scenario_totals[scenario["name"]] = scenario_totals.get(scenario["name"], 0.0) + float(scenario["net_before_internal_cost_ct"])
         rows.append({
@@ -778,11 +1119,28 @@ def _trace_path(
             "energy_start_wh": states[state_index],
             "energy_end_wh": states[next_index],
             "transition": transition,
+            "choice_diagnostic": {
+                "hold_available": score_margin_vs_hold is not None,
+                "score_margin_vs_hold_ct": score_margin_vs_hold,
+                "immediate_delta_vs_hold_ct": immediate_delta_vs_hold,
+                "continuation_uplift_vs_hold_ct": (
+                    score_margin_vs_hold - immediate_delta_vs_hold
+                    if score_margin_vs_hold is not None
+                    and immediate_delta_vs_hold is not None
+                    else None
+                ),
+            },
         })
         state_index = next_index
         mode_index = next_mode_index
         energies.append(states[state_index])
-    return {"rows": rows, "energies": energies, "scenario_totals_ct": scenario_totals}
+    return {
+        "rows": rows,
+        "energies": energies,
+        "scenario_totals_ct": scenario_totals,
+        "final_state_index": state_index,
+        "final_mode_index": mode_index,
+    }
 
 
 def _deadline_index(slots: Sequence[Dict[str, Any]], deadline_ms: int) -> Optional[int]:
@@ -888,11 +1246,15 @@ def _curve_target_contract(
         if (price := _slot_price(slot)["net_sell"]) is not None
     ]
     conservative_surplus_wh = 0.0
-    p50_surplus_wh = 0.0
+    point_surplus_wh = 0.0
     quantile_slots = 0
     for slot in considered[1:]:
         forecast = _slot_forecast(slot)
-        p50_surplus_wh += max(0.0, float(forecast["pv_p50"]) - float(forecast["load_p50"])) * SLOT_HOURS
+        point_surplus_wh += max(
+            0.0,
+            float(forecast["pv_point"])
+            - float(forecast["load_point"]),
+        ) * SLOT_HOURS
         if forecast["quantiles_available"]:
             quantile_slots += 1
             conservative_surplus_wh += max(
@@ -916,11 +1278,16 @@ def _curve_target_contract(
         "current_net_sell_ct_kwh": _slot_price(slots[0])["net_sell"],
         "later_min_net_sell_ct_kwh": round(min(later_prices), 6) if later_prices else None,
         "later_conservative_pv_surplus_wh": round(conservative_surplus_wh, 3),
-        "later_p50_pv_surplus_wh": round(p50_surplus_wh, 3),
+        "later_point_pv_surplus_wh": round(point_surplus_wh, 3),
+        "later_p50_pv_surplus_wh": (
+            round(point_surplus_wh, 3)
+            if considered[1:] and quantile_slots == len(considered[1:])
+            else None
+        ),
         "forecast_contract": (
             "P10_PV_MINUS_P90_LOAD"
             if considered[1:] and quantile_slots == len(considered[1:])
-            else "P50_VISIBLE_FALLBACK_QUANTILES_INCOMPLETE"
+            else "DETERMINISTIC_POINT_WITHOUT_QUANTILE_CLAIM"
         ),
         "legacy_first_slot": {
             "owner": "legacy_curve_projection",
@@ -1042,7 +1409,10 @@ def _action_horizon_contract(
         )
         selected_action = str(selected.get("action") or "")
         if not (
-            execution.get("contract_version") == 1
+            direct_marketing_typed_int_equals(
+                execution.get("contract_version"),
+                1,
+            )
             and window_source == "active_plan_window"
             and selected_action
             and str(execution.get("action") or "") == selected_action
@@ -1079,6 +1449,30 @@ def _action_horizon_contract(
     }
 
 
+def _economic_export_start_gate(
+    decision: Optional[Dict[str, Any]],
+    economics: Dict[str, Any],
+) -> Tuple[Optional[Dict[str, Any]], bool]:
+    """Validiert den einmaligen DV-Startvertrag ohne neuen Entscheidungsbesitz."""
+
+    if not direct_marketing_export_gate_contract_valid(
+        decision,
+        economics,
+        # Eine SUSPENDED-Lineage darf hier ausschließlich als belegter,
+        # wirkungsloser Policy-HOLD diagnostiziert werden. Die spätere
+        # POLICY_NOT_EXECUTABLE-Kante verhindert jede Exportfreigabe.
+        allowed_lineage_statuses={"ACTIVE", "SUSPENDED"},
+    ):
+        return None, False
+    gate = decision["export_window_start_gate"]
+    continuation = bool(
+        decision.get("continuation_active") is True
+        and decision.get("continuation_reason_code")
+        == "WINDOW_START_GATES_ALREADY_SATISFIED"
+    )
+    return copy.deepcopy(gate), continuation
+
+
 def _economic_export_profit_gate(
     plan: Dict[str, Any],
     slot: Dict[str, Any],
@@ -1088,6 +1482,11 @@ def _economic_export_profit_gate(
     """Verwendet die bereits berechnete DV-Kostenzerlegung, ohne sie neu abzuziehen."""
 
     decision = policy_decision
+    profile = str(
+        decision.get("profit_profile")
+        if isinstance(decision, dict)
+        else "standard"
+    ).strip().lower() or "standard"
     economics = decision.get("economics") if isinstance(decision, dict) and isinstance(decision.get("economics"), dict) else {}
     budget = decision.get("storage_budget") if isinstance(decision, dict) and isinstance(decision.get("storage_budget"), dict) else {}
     required_values = {
@@ -1096,6 +1495,10 @@ def _economic_export_profit_gate(
         "expected_profit_eur": _sf(economics.get("expected_profit_eur"), None),
         "min_window_profit_eur": _sf(economics.get("min_window_profit_eur"), None),
     }
+    start_gate, start_gate_continuation = _economic_export_start_gate(
+        decision,
+        economics,
+    )
     missing = [key for key, value in required_values.items() if value is None]
     missing.extend(
         key
@@ -1111,10 +1514,27 @@ def _economic_export_profit_gate(
     if decision is None or missing:
         blockers.append("ECONOMIC_EXPORT_PROFIT_CONTRACT_MISSING_OR_INVALID")
     else:
-        if float(required_values["margin_ct_kwh"]) + 0.000001 < float(required_values["user_min_margin_ct"]):
+        if start_gate is None:
+            blockers.append(
+                "ECONOMIC_EXPORT_START_GATE_OR_LINEAGE_MISSING_OR_INVALID"
+            )
+        # Ausschließlich Diagnose einer bereits vom Policy Owner abgelehnten
+        # Standard-Kante; diese Werte erzeugen keine zweite Freigabe.
+        if (
+            profile == "standard"
+            and float(required_values["margin_ct_kwh"]) + 0.000001
+            < float(required_values["user_min_margin_ct"])
+        ):
             blockers.append("ECONOMIC_EXPORT_MARGIN_BELOW_USER_MINIMUM")
-        if float(required_values["expected_profit_eur"]) + 0.000001 < float(required_values["min_window_profit_eur"]):
-            blockers.append("ECONOMIC_EXPORT_WINDOW_PROFIT_BELOW_USER_MINIMUM")
+        if (
+            profile == "standard"
+            and float(required_values["expected_profit_eur"]) + 0.000001
+            < float(required_values["min_window_profit_eur"])
+            and not start_gate_continuation
+        ):
+            blockers.append(
+                "ECONOMIC_EXPORT_WINDOW_PROFIT_BELOW_USER_MINIMUM"
+            )
         if (
             decision.get("commands_allowed") is not True
             or bool(decision.get("blocked"))
@@ -1130,6 +1550,13 @@ def _economic_export_profit_gate(
         "user_min_margin_ct": required_values["user_min_margin_ct"],
         "expected_profit_eur": required_values["expected_profit_eur"],
         "min_window_profit_eur": required_values["min_window_profit_eur"],
+        "export_window_start_gate": start_gate,
+        "export_window_gate_lineage": (
+            copy.deepcopy(decision.get("export_window_gate_lineage"))
+            if start_gate is not None and isinstance(decision, dict)
+            else None
+        ),
+        "window_start_gate_continuation_active": start_gate_continuation,
         "policy_commands_allowed": bool(decision and decision.get("commands_allowed") is True),
         "policy_export_budget_w": round(max(0.0, _sf(budget.get("export_budget_w"), 0.0) or 0.0), 3),
         "action_horizon_contract": copy.deepcopy(action_horizon),
@@ -1163,7 +1590,14 @@ def _path_headroom_credit(
 def _action_for_row(row: Dict[str, Any], economic_row: Optional[Dict[str, Any]], forced_headroom: bool) -> Tuple[str, str]:
     transition = row["transition"]
     battery_w = float(transition["battery_w"])
-    scenario = next((item for item in transition["scenario_rows"] if item["name"] in {"p50", "p50_only"}), transition["scenario_rows"][0])
+    scenario = next(
+        (
+            item
+            for item in transition["scenario_rows"]
+            if item["name"] in {"p50", "deterministic_point"}
+        ),
+        transition["scenario_rows"][0],
+    )
     if battery_w > 50.0:
         return ("PV_STORE", "SHADOW_PV_STORE") if scenario["grid_import_w"] <= 50.0 else ("GRID_CHARGE", "SHADOW_GRID_CHARGE")
     if battery_w < -50.0:
@@ -1298,12 +1732,19 @@ def optimize_shadow_dispatch(plan: Dict[str, Any], slots: Sequence[Dict[str, Any
         decision_ceilings[0],
     )
     initial_energy_wh = states[initial_index]
-    maximum_slot_state_gain_wh = params["max_charge_w"] * SLOT_HOURS * params["charge_efficiency"]
+    state_step_wh = max(1.0, float(params["state_step_wh"]))
+    physical_slot_state_gain_wh = (
+        params["max_charge_w"]
+        * SLOT_HOURS
+        * params["charge_efficiency"]
+    )
+    maximum_slot_state_gain_wh = math.floor(
+        (physical_slot_state_gain_wh + 1.0e-6) / state_step_wh
+    ) * state_step_wh
     reachability_clamped_slots = 0
     for index, floor_wh in enumerate(list(decision_floors)):
         hard_floor_wh = _hard_floor_wh(decision_slots[index], capacity_wh)
         reachable_wh = min(capacity_wh, initial_energy_wh + (index + 1) * maximum_slot_state_gain_wh)
-        state_step_wh = max(1.0, float(params["state_step_wh"]))
         reachable_wh = math.floor((reachable_wh + 1.0) / state_step_wh) * state_step_wh
         reachable_floor_wh = max(hard_floor_wh, min(float(floor_wh), reachable_wh))
         if reachable_floor_wh < float(floor_wh) - 1.0:
@@ -1311,6 +1752,10 @@ def optimize_shadow_dispatch(plan: Dict[str, Any], slots: Sequence[Dict[str, Any
         decision_floors[index] = reachable_floor_wh
     reserve_contract["reachability_policy"] = "RISK_FLOOR_CLAMPED_TO_PHYSICAL_CHARGE_REACHABILITY_HARD_FLOOR_UNCHANGED"
     reserve_contract["reachability_clamped_slots"] = reachability_clamped_slots
+    reserve_contract["lattice_charge_gain_per_slot_wh"] = round(
+        maximum_slot_state_gain_wh,
+        3,
+    )
     curve_target = _curve_target_contract(
         plan,
         decision_slots,
@@ -1355,7 +1800,17 @@ def optimize_shadow_dispatch(plan: Dict[str, Any], slots: Sequence[Dict[str, Any
         minimum_deadline_energy_wh=curve_minimum_energy_wh,
     )
     if economic_values[initial_index][MODES.index(0)] <= NEG_INF / 2:
-        raise ShadowInputError("ECONOMIC_DP_INFEASIBLE")
+        diagnostic = _forward_infeasibility_diagnostic(
+            decision_slots,
+            states,
+            decision_floors,
+            decision_ceilings,
+            params,
+            capacity_wh,
+            initial_index,
+        )
+        diagnostic["failure_class"] = "ECONOMIC_BACKWARD_DP_NO_INITIAL_VALUE"
+        raise ShadowInputError("ECONOMIC_DP_INFEASIBLE", diagnostic)
     economic_path = _trace_path(
         decision_slots,
         states,
@@ -1470,6 +1925,49 @@ def optimize_shadow_dispatch(plan: Dict[str, Any], slots: Sequence[Dict[str, Any
                 - max(0.0, curve_minimum_energy_wh - energy_end),
             )
         net_value = float(transition["immediate_net_ct"]) - opportunity_cost
+        choice_diagnostic = (
+            row.get("choice_diagnostic")
+            if isinstance(row.get("choice_diagnostic"), dict)
+            else {}
+        )
+        negative_incremental_explanation = None
+        incremental_net_ct = float(transition["incremental_net_ct"])
+        if action != "HOLD" and incremental_net_ct < -1.0e-9:
+            hold_available = choice_diagnostic.get("hold_available") is True
+            risk_floor_gap_before_wh = max(0.0, decision_floors[index] - energy_start)
+            if forced_headroom:
+                explanation_reason = "PHYSICAL_HEADROOM_CONSTRAINT_WITH_EXPLICIT_OPPORTUNITY_COST"
+            elif not hold_available and risk_floor_gap_before_wh > 1.0:
+                explanation_reason = "CURRENT_RISK_FLOOR_REQUIRES_ENERGY_INCREASE"
+            elif not hold_available:
+                explanation_reason = "FUTURE_CANONICAL_CONSTRAINT_MAKES_HOLD_PATH_INFEASIBLE"
+            else:
+                explanation_reason = "DP_SUFFIX_VALUE_OUTWEIGHS_IMMEDIATE_LOSS"
+            negative_incremental_explanation = {
+                "status": "EXPLAINED_BY_GLOBAL_OBJECTIVE_OR_CANONICAL_CONSTRAINT",
+                "reason_code": explanation_reason,
+                "immediate_incremental_value_ct": round(incremental_net_ct, 6),
+                "hold_counterfactual_available": hold_available,
+                "dp_score_margin_vs_hold_ct": (
+                    round(float(choice_diagnostic["score_margin_vs_hold_ct"]), 6)
+                    if choice_diagnostic.get("score_margin_vs_hold_ct") is not None
+                    else None
+                ),
+                "immediate_delta_vs_hold_ct": (
+                    round(float(choice_diagnostic["immediate_delta_vs_hold_ct"]), 6)
+                    if choice_diagnostic.get("immediate_delta_vs_hold_ct") is not None
+                    else None
+                ),
+                "continuation_uplift_vs_hold_ct": (
+                    round(float(choice_diagnostic["continuation_uplift_vs_hold_ct"]), 6)
+                    if choice_diagnostic.get("continuation_uplift_vs_hold_ct") is not None
+                    else None
+                ),
+                "risk_floor_gap_before_wh": round(risk_floor_gap_before_wh, 3),
+                "continuation_scope": "REMAINING_DECISION_HORIZON_PLUS_TERMINAL_TAIL",
+                "later_economic_export_slots": 0,
+                "later_house_supply_slots": 0,
+            }
         total_net_ct += net_value
         total_baseline_net_ct += float(transition["baseline_net_ct"])
         total_incremental_net_ct += float(transition["incremental_net_ct"])
@@ -1478,11 +1976,11 @@ def optimize_shadow_dispatch(plan: Dict[str, Any], slots: Sequence[Dict[str, Any
         total_avoided_curtailment_wh += float(transition["avoided_curtailment_wh"])
         slot = row["slot"]
         projection = slot.get("projection") if isinstance(slot.get("projection"), dict) else {}
-        p50_scenario = next(
+        reference_scenario = next(
             (
                 scenario
                 for scenario in transition["scenario_rows"]
-                if scenario["name"] in {"p50", "p50_only"}
+                if scenario["name"] in {"p50", "deterministic_point"}
             ),
             transition["scenario_rows"][0],
         )
@@ -1601,6 +2099,7 @@ def optimize_shadow_dispatch(plan: Dict[str, Any], slots: Sequence[Dict[str, Any
                 "baseline_net_value": round(float(transition["baseline_net_ct"]), 6),
                 "incremental_net_value": round(float(transition["incremental_net_ct"]), 6),
             },
+            "negative_incremental_explanation": negative_incremental_explanation,
             "scenario_contract": transition["forecast_contract"],
             "scenarios": transition["scenario_rows"],
             "baseline_delta": {
@@ -1629,7 +2128,18 @@ def optimize_shadow_dispatch(plan: Dict[str, Any], slots: Sequence[Dict[str, Any
                 "marginal": {
                     "current_net_sell_ct_kwh": transition["prices"]["net_sell"],
                     "later_min_net_sell_ct_kwh_before_target": curve_target.get("later_min_net_sell_ct_kwh"),
-                    "pv_surplus_export_w_p50": round(float(p50_scenario["grid_export_w"]), 3),
+                    "pv_surplus_export_w_point": round(
+                        float(reference_scenario["grid_export_w"]),
+                        3,
+                    ),
+                    "pv_surplus_export_w_p50": (
+                        round(
+                            float(reference_scenario["grid_export_w"]),
+                            3,
+                        )
+                        if reference_scenario.get("name") == "p50"
+                        else None
+                    ),
                     "efficiency_loss_cost_ct": round(float(transition["efficiency_loss_cost_ct"]), 6),
                     "degradation_cost_ct": round(float(transition["degradation_cost_ct"]), 6),
                     "risk_margin_ct": round(float(transition["risk_margin_ct"]), 6),
@@ -1642,6 +2152,38 @@ def optimize_shadow_dispatch(plan: Dict[str, Any], slots: Sequence[Dict[str, Any
             "ramp_delta_w": round(float(transition["battery_w"]) - previous_power_w, 3),
         })
         previous_power_w = float(transition["battery_w"])
+
+    later_economic_export_slots = 0
+    later_house_supply_slots = 0
+    later_unselected_modeled_action_count = 0
+    later_unselected_reason_types: set[str] = set()
+    for item in reversed(rows):
+        explanation = item.get("negative_incremental_explanation")
+        if isinstance(explanation, dict):
+            explanation["later_economic_export_slots"] = later_economic_export_slots
+            explanation["later_house_supply_slots"] = later_house_supply_slots
+            explanation["later_unselected_modeled_action_count"] = (
+                later_unselected_modeled_action_count
+            )
+            explanation["later_unselected_reason_types"] = sorted(
+                later_unselected_reason_types
+            )
+            if (
+                explanation.get("reason_code")
+                == "DP_SUFFIX_VALUE_OUTWEIGHS_IMMEDIATE_LOSS"
+                and later_unselected_modeled_action_count
+            ):
+                explanation["status"] = "EVIDENCE_LIMIT_UNSELECTED_MODELED_ACTIONS"
+                explanation["reason_code"] = "MODEL_SUFFIX_DEPENDS_ON_UNSELECTED_ACTIONS"
+        if item.get("planned_action") == "ECONOMIC_EXPORT":
+            later_economic_export_slots += 1
+        if item.get("planned_action") == "HOUSE_SUPPLY":
+            later_house_supply_slots += 1
+        if item.get("candidate") is True and item.get("selected") is not True:
+            later_unselected_modeled_action_count += 1
+            later_unselected_reason_types.add(
+                str(item.get("block_reason_code") or "UNSPECIFIED_ACTION_CONTRACT")
+            )
 
     scenario_totals = selected_path["scenario_totals_ct"]
     terminal_energy_values = []
@@ -1659,6 +2201,213 @@ def optimize_shadow_dispatch(plan: Dict[str, Any], slots: Sequence[Dict[str, Any
     finite_terminal_values = [value for value in terminal_energy_values if value is not None]
     if not finite_terminal_values:
         raise ShadowInputError("TERMINAL_VALUE_INFEASIBLE")
+
+    selected_immediate_objective_ct = sum(
+        float(path_row["transition"]["immediate_net_ct"])
+        for path_row in selected_path["rows"]
+    )
+    selected_final_state_index = int(selected_path["final_state_index"])
+    selected_final_mode_index = int(selected_path["final_mode_index"])
+    selected_terminal_continuation_ct = float(
+        terminal_values[selected_final_state_index][selected_final_mode_index]
+    )
+    selected_objective_identity_residual_ct = (
+        selected_objective_ct
+        - selected_immediate_objective_ct
+        - selected_terminal_continuation_ct
+    )
+    baseline_hold_immediate_ct = sum(
+        _hold_immediate_from_transition(path_row["transition"], params)
+        for path_row in selected_path["rows"]
+    )
+    baseline_hold_blockers: List[str] = []
+    for index, slot in enumerate(decision_slots):
+        slot_forecast = _slot_forecast(slot)
+        if (
+            params["grid_import_limit_w"] > 0.0
+            and any(
+                max(0.0, float(load_w) - float(pv_w))
+                > params["grid_import_limit_w"] + 1.0
+                for _name, pv_w, load_w, _weight
+                in slot_forecast["scenarios"]
+            )
+        ):
+            baseline_hold_blockers.append(
+                "GRID_IMPORT_LIMIT_AT_SLOT_%d" % index
+            )
+        if initial_energy_wh < decision_floors[index] - 1.0:
+            baseline_hold_blockers.append("RISK_FLOOR_AT_SLOT_%d" % index)
+        if initial_energy_wh > decision_ceilings[index] + 1.0:
+            baseline_hold_blockers.append("ENERGY_CEILING_AT_SLOT_%d" % index)
+        if (
+            deadline_index == index
+            and constraint_target_wh is not None
+            and initial_energy_wh > constraint_target_wh + 1.0
+        ):
+            baseline_hold_blockers.append("HEADROOM_DEADLINE_AT_SLOT_%d" % index)
+        if (
+            curve_deadline_index == index
+            and curve_minimum_energy_wh is not None
+            and initial_energy_wh < curve_minimum_energy_wh - 1.0
+        ):
+            baseline_hold_blockers.append("CURVE_MINIMUM_DEADLINE_AT_SLOT_%d" % index)
+    baseline_terminal_value = terminal_values[initial_index][MODES.index(0)]
+    baseline_terminal_defined = baseline_terminal_value > NEG_INF / 2
+    if not baseline_terminal_defined:
+        baseline_hold_blockers.append("TERMINAL_CONTINUATION_UNDEFINED")
+    baseline_hold_defined = bool(baseline_terminal_defined)
+    baseline_hold_feasible = bool(
+        baseline_hold_defined and not baseline_hold_blockers
+    )
+    baseline_hold_total_ct = (
+        baseline_hold_immediate_ct + float(baseline_terminal_value)
+        if baseline_hold_defined
+        else None
+    )
+    incremental_vs_hold_counterfactual_ct = (
+        selected_objective_ct - baseline_hold_total_ct
+        if baseline_hold_total_ct is not None
+        else None
+    )
+    model_incremental_objective_ct = (
+        incremental_vs_hold_counterfactual_ct
+        if baseline_hold_feasible
+        else None
+    )
+    modeled_action_rows = [
+        item for item in rows
+        if item.get("candidate") is True
+    ]
+    unselected_modeled_action_rows = [
+        item for item in modeled_action_rows
+        if item.get("selected") is not True
+    ]
+    unselected_reason_types = sorted({
+        str(item.get("block_reason_code") or "UNSPECIFIED_ACTION_CONTRACT")
+        for item in unselected_modeled_action_rows
+    })
+    unselected_action_types = sorted({
+        str(item.get("planned_action") or "UNKNOWN")
+        for item in unselected_modeled_action_rows
+    })
+    decision_path_action_contract_complete = not unselected_modeled_action_rows
+    terminal_tail_action_contract_verified = False
+    if unselected_modeled_action_rows:
+        objective_realizability_status = "EVIDENCE_LIMIT_UNSELECTED_MODELED_ACTIONS"
+    elif tail_slots:
+        objective_realizability_status = "MODEL_ONLY_TERMINAL_TAIL_ACTION_CONTRACT_NOT_VERIFIED"
+    else:
+        objective_realizability_status = "MODEL_ONLY_TERMINAL_SALVAGE_NOT_RUNTIME_AUTHORIZED"
+    if not baseline_hold_defined:
+        objective_comparison_status = "BASELINE_TERMINAL_OR_TRANSITION_UNDEFINED"
+    elif not baseline_hold_feasible:
+        objective_comparison_status = "COUNTERFACTUAL_ONLY_BASELINE_VIOLATES_CANONICAL_CONSTRAINTS"
+    elif unselected_modeled_action_rows:
+        objective_comparison_status = "EVIDENCE_LIMIT_UNSELECTED_MODELED_ACTIONS"
+    else:
+        objective_comparison_status = (
+            "MODEL_ONLY_FEASIBLE_STATIC_DECISION_HORIZON_HOLD_BASELINE"
+        )
+    baseline_blocker_types = sorted({
+        blocker.split("_AT_SLOT_", 1)[0]
+        for blocker in baseline_hold_blockers
+    })
+
+    objective_accounting = {
+        "schema_version": "storage_dispatch_objective_accounting_v1",
+        "shadow": {
+            "immediate_value_ct": round(selected_immediate_objective_ct, 6),
+            "terminal_continuation_value_ct": round(
+                selected_terminal_continuation_ct,
+                6,
+            ),
+            "total_objective_value_ct": round(selected_objective_ct, 6),
+            "identity": "DIRECT_TERMINAL_LOOKUP_PLUS_IMMEDIATE_EQUALS_DP_OBJECTIVE",
+            "identity_residual_ct": round(selected_objective_identity_residual_ct, 9),
+            "headroom_opportunity_cost_diagnostic_ct": round(
+                sum(
+                    float(item["economics_ct"]["opportunity_cost"])
+                    for item in rows
+                ),
+                6,
+            ),
+            "headroom_opportunity_cost_additional_objective_subtraction": False,
+        },
+        "baseline": {
+            "kind": "STATIC_HOLD_DURING_DECISION_HORIZON_WITH_SAME_TERMINAL_VALUE_MODEL",
+            "decision_horizon_battery_dispatch": "HOLD",
+            "terminal_tail_scope": "MODEL_CONTINUATION",
+            "productive_legacy_plan_comparison": False,
+            "defined": baseline_hold_defined,
+            "feasible_under_canonical_constraints": baseline_hold_feasible,
+            "immediate_value_ct": (
+                round(baseline_hold_immediate_ct, 6)
+                if baseline_hold_defined
+                else None
+            ),
+            "terminal_continuation_value_ct": (
+                round(float(baseline_terminal_value), 6)
+                if baseline_terminal_defined
+                else None
+            ),
+            "total_objective_value_ct": (
+                round(baseline_hold_total_ct, 6)
+                if baseline_hold_total_ct is not None
+                else None
+            ),
+            "constraint_blocker_count": len(set(baseline_hold_blockers)),
+            "constraint_blocker_types": baseline_blocker_types,
+            "first_constraint_blocker": (
+                baseline_hold_blockers[0]
+                if baseline_hold_blockers
+                else None
+            ),
+        },
+        "comparison": {
+            "status": objective_comparison_status,
+            "incremental_objective_value_ct": None,
+            "model_incremental_objective_value_ct": (
+                round(model_incremental_objective_ct, 6)
+                if model_incremental_objective_ct is not None
+                else None
+            ),
+            "incremental_vs_hold_counterfactual_ct": (
+                round(incremental_vs_hold_counterfactual_ct, 6)
+                if incremental_vs_hold_counterfactual_ct is not None
+                else None
+            ),
+            "claim_scope": "MODEL_ONLY_NO_PRODUCTIVE_OR_EXECUTABLE_SUPERIORITY_CLAIM",
+        },
+        "objective_realizability": {
+            "status": objective_realizability_status,
+            "decision_path_modeled_action_count": len(modeled_action_rows),
+            "decision_path_selected_action_count": (
+                len(modeled_action_rows) - len(unselected_modeled_action_rows)
+            ),
+            "decision_path_unselected_action_count": len(unselected_modeled_action_rows),
+            "decision_path_unselected_action_types": unselected_action_types,
+            "decision_path_unselected_reason_types": unselected_reason_types,
+            "decision_path_action_contract_complete": decision_path_action_contract_complete,
+            "terminal_tail_action_contract_verified": terminal_tail_action_contract_verified,
+            "terminal_value_scope": (
+                "DP_CONTINUATION_MODEL_WITHOUT_RUNTIME_PROFIT_OR_EXECUTION_GATE_PROOF"
+                if tail_slots
+                else "CONSERVATIVE_SALVAGE_MODEL_NOT_RUNTIME_AUTHORIZED"
+            ),
+        },
+        "target_value_contract": {
+            "legacy_curve_target_monetized": False,
+            "legacy_curve_target_value_ct": None,
+            "legacy_curve_role": "OBSERVATION_BASELINE_ONLY",
+            "canonical_risk_floor_role": "LEXICOGRAPHIC_CONSTRAINT_NOT_MONETIZED",
+            "headroom_role": (
+                "LEXICOGRAPHIC_CONSTRAINT_WITH_OPPORTUNITY_COST_DIAGNOSTIC"
+                if constraint_target_wh is not None
+                else "NOT_BINDING"
+            ),
+        },
+    }
+
     curve_selected_energy_wh = None
     if curve_deadline_index is not None:
         curve_selected_energy_wh = float(selected_path["rows"][curve_deadline_index]["energy_end_wh"])
@@ -1744,6 +2493,7 @@ def optimize_shadow_dispatch(plan: Dict[str, Any], slots: Sequence[Dict[str, Any
         },
         "reserve_contract": reserve_contract,
         "curve_target_contract": curve_target_result,
+        "objective_accounting": objective_accounting,
         "headroom_summary": {
             "required_wh": round(float(headroom["required_wh"]), 3),
             "raw_required_wh": round(float(headroom["raw_required_wh"]), 3),
@@ -1774,6 +2524,17 @@ def optimize_shadow_dispatch(plan: Dict[str, Any], slots: Sequence[Dict[str, Any
             "net_value_ct_excluding_terminal": round(total_net_ct, 6),
             "baseline_net_value_ct": round(total_baseline_net_ct, 6),
             "incremental_net_value_ct_excluding_terminal": round(total_incremental_net_ct, 6),
+            "accounting_contract": {
+                "net_value_ct_excluding_terminal_scope": "LEGACY_SLOT_DIAGNOSTIC",
+                "net_value_ct_excluding_terminal_is_dp_objective": False,
+                "net_value_ct_excluding_terminal_formula": (
+                    "SUM(IMMEDIATE_NET_CT_MINUS_HEADROOM_OPPORTUNITY_COST_DIAGNOSTIC_CT)"
+                ),
+                "includes_additional_headroom_opportunity_cost_subtraction": True,
+                "canonical_dp_objective_path": (
+                    "objective_accounting.shadow.total_objective_value_ct"
+                ),
+            },
             "battery_throughput_wh": round(total_throughput_wh, 3),
             "equivalent_full_cycles": round(total_throughput_wh / max(1.0, 2.0 * capacity_wh), 6),
             "expected_curtailment_wh": round(total_curtailment_wh, 3),
@@ -1792,7 +2553,11 @@ def optimize_shadow_dispatch(plan: Dict[str, Any], slots: Sequence[Dict[str, Any
     return result
 
 
-def shadow_fallback(reason_code: str, runtime_ms: float = 0.0) -> Dict[str, Any]:
+def shadow_fallback(
+    reason_code: str,
+    runtime_ms: float = 0.0,
+    diagnostic: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """Sichtbarer Fallback ohne Kandidat, Budget oder Ausführungswirkung."""
 
     result = {
@@ -1815,6 +2580,8 @@ def shadow_fallback(reason_code: str, runtime_ms: float = 0.0) -> Dict[str, Any]
         "fallback": True,
         "fallback_reason_code": str(reason_code or "SHADOW_UNKNOWN_ERROR"),
     }
+    if isinstance(diagnostic, dict):
+        result["infeasibility_diagnostic"] = copy.deepcopy(diagnostic)
     result["shadow_plan_id"] = _hash(_deterministic_result_material(result))
     return result
 

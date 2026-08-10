@@ -5,12 +5,15 @@ Updates werden ausschließlich über den Installer ausgeführt. Ein manuelles
 Release-Historie ungeeignet, weil alter und neuer Git-Stand nicht miteinander
 verwandt sein müssen.
 
-Der aktuelle Stable-Stand ist `v5.4.2d`. Der Hotfix bewertet den Wiederanlauf
-erforderlicher Dienste anhand des belegten systemd-Endzustands statt allein
-anhand eines Zwischen-Rückgabecodes. Eine nicht installierte optionale Unit
-wird beim verifizierten Maskenrücklauf als legitimer fehlender Zustand
-behandelt. Echte Start-, Masken- oder Wiederherstellungsabweichungen bleiben
-fail-closed; die EMS-Regelung entspricht unverändert 5.4.2c.
+Der aktuelle Stable-Stand ist `v5.4.3`. Der Ziel-Updater bindet den
+freigegebenen Zielstand vor Backup und Dienststopp eindeutig an Version,
+Herkunft und Anlagenrolle. Fortschritt und Lebenszeichen bleiben auf
+langsameren Raspberry Pis sichtbar. Eine bereits vollständig installierte
+Version bleibt beim normalen Update ohne Unterbrechung unverändert; eine
+Reparatur oder Neuinstallation derselben Version muss ausdrücklich bestätigt
+werden. Der allgemeine privilegierte Web-/sudo-Pfad für Produktänderungen ist
+deaktiviert, administrative Installation, Reparatur und Rückfall erfolgen über
+den geschützten Konsolenweg.
 
 Die Konsolenbeispiele verwenden den zuvor geprüften absoluten Produktpfad:
 
@@ -28,6 +31,68 @@ steht derselbe Installer-Pfad zur Verfügung:
 bash "$E3DC_INSTALL_PATH/e3dc-setup" --check
 bash "$E3DC_INSTALL_PATH/e3dc-setup" --update-e3dc
 ```
+
+Ab dem Release mit Ziel-Updater-Handoff lädt die laufende Version zunächst
+ausschließlich die Git-Objekte des freigegebenen Zielstands. Sie bindet
+Repository-Origin, volle Commit-SHA, annotierten Stable-Tag,
+VERSION-/Policy-Zuordnung und die vorhandene Anlagenrolle. Danach startet sie
+noch vor Backup und Dienststopp einen bytegenau versiegelten Ziel-Updater auf
+demselben Dateisystem. Erst dieser Ziel-Updater interpretiert seine eigenen
+Dienst-, Paket-, Lösch- und Wiederanlaufverträge und besitzt die vollständige
+Transaktion einschließlich Backup, Aktorruhe, Finalisierung und
+Wiederherstellung.
+
+Dieser verifizierte Fetch ist die einzige beabsichtigte vorgelagerte
+`.git`-Mutation: Er ergänzt Zielobjekte und den gebundenen Remote-Ref, verändert
+aber weder Produktdateien noch globale oder repo-lokale Git-Konfiguration. Alle
+anschließenden Git-Leseprüfungen laufen mit `GIT_OPTIONAL_LOCKS=0`, damit auch
+Index-/Stat-Cache nicht beiläufig aktualisiert werden.
+
+Der äußere Handoff besitzt kein hartes Zeitlimit für die Gesamttransaktion.
+Eine wichtige Übergangsgrenze bleibt technisch unvermeidbar: Beim ersten
+Sprung von einer Version ohne diesen Vertrag läuft zunächst noch deren alter
+Updater. Insbesondere der in `v5.4.2d` veröffentlichte Außenprozess behält für
+diesen ersten Sprung sein 900-Sekunden-Limit; Zielcode kann einen bereits
+gestarteten Altprozess nicht rückwirkend ersetzen. Nach erfolgreicher
+Installation des neuen Vertrags verwenden alle folgenden Updates den
+Ziel-Updater-Handoff.
+
+Ist der exakt gebundene Release-Stand bereits installiert und stimmt seine
+kanonische Webprojektion überein, endet ein normales Update ohne Backup und
+ohne Dienstunterbrechung mit „Du bist auf dem neuesten Stand“. Dabei werden
+keine Produkt- oder Webdateien, kein Dienstzustand und keine globale oder
+repo-lokale Git-Konfiguration verändert. Die Git-Prüfung verwendet
+ausschließlich pro Aufruf gebundene Optionen. Ungetrackte private Laufzeit-
+und Diagnosedateien lösen dabei keinen Reparaturalarm aus.
+
+Weicht dagegen eine getrackte Produktdatei oder eine kanonische Webdatei vom
+veröffentlichten Stand ab, meldet das normale Update `REPAIR_REQUIRED` und
+verändert weder Produkt- oder Webdateien noch Dienstzustände. Die aktuelle
+Version kann dann ausschließlich nach ausdrücklicher Bestätigung in der
+Weboberfläche oder auf der Konsole erneut installiert werden:
+
+```bash
+bash "$E3DC_INSTALL_PATH/e3dc-setup" --reinstall-current
+```
+
+Diese Neuinstallation ist ein vollständiger Releasewechsel derselben
+veröffentlichten SHA: verifiziertes Backup, Aktorruhe, Release-Synchronisation,
+Dienst- und Gesundheitsgates sowie ein beweisbarer Rückweg bleiben erhalten.
+`--update-e3dc`, `--reinstall-current` und ein gezielter Release-Tag dürfen
+nicht kombiniert werden.
+
+Der versiegelte Release-Finalizer meldet seine Phasen und während langer
+Arbeit alle 30 Sekunden einen Heartbeat. Für langsame Raspberry Pis gilt ein
+hartes Gesamtzeitlimit von 30 Minuten ausschließlich für diese mutierende
+Finalizer-Phase. Backup und verifizierte Wiederherstellung liegen außerhalb
+dieses Zeitlimits. Wird es überschritten oder bleibt ein notwendiger Dienst
+trotz begrenztem Konvergenzfenster nicht beweisbar
+`loaded/enabled/active`, bricht die Finalizer-Phase ab und der Ziel-Updater
+versucht die verifizierte Wiederherstellung des Ausgangszustands. Nur wenn
+deren Dienst-, Rollen- und Gesundheitsnachweis vollständig gelingt, werden die
+Writer wieder freigegeben; andernfalls bleiben sie fail-closed gestoppt. Das
+Zeitlimit wird nicht durch stilles Weiterwarten oder ein schwächeres
+Gesundheitsgate umgangen.
 
 Wenn `--check` eine fehlende Web-/sudo-Freigabe meldet:
 
@@ -48,8 +113,8 @@ test -f "$E3DC_INSTALL_PATH/installer_main.py"
 test -x "$HOME/.venv_e3dc/bin/python3"
 cd "$E3DC_INSTALL_PATH"
 sudo /usr/bin/python3 installer_main.py --fix-permissions
-sudo /usr/bin/python3 installer_main.py --check
-sudo /usr/bin/python3 installer_main.py --update-e3dc
+sudo /usr/bin/python3 -I -B -u installer_main.py --check
+sudo /usr/bin/python3 -I -B -u installer_main.py --update-e3dc
 cat VERSION
 systemctl --failed --no-pager
 ```
@@ -368,12 +433,17 @@ Wiederherstellung eines verifizierten Datei-Backups der sichere Rückweg.
 ```bash
 (
   set -euo pipefail
-  export E3DC_DOCKER_PATH="/absoluter/pfad/zur/docker-installation"
-  cd "$E3DC_DOCKER_PATH"
-  docker compose config --images
-  docker compose pull e3dc-control
-  docker compose up -d --force-recreate e3dc-control
-  docker compose ps
+  cd "${E3DC_DOCKER_PATH:-$HOME/e3dc-docker}"
+  if [ -f ./docker_compose_update.py ]; then
+    E3DC_DOCKER_HELPER=./docker_compose_update.py
+  elif [ -f ./Installer/docker_compose_update.py ]; then
+    E3DC_DOCKER_HELPER=./Installer/docker_compose_update.py
+  else
+    echo "docker_compose_update.py fehlt; aktuellen Release-Verwaltungsbaum bereitstellen." >&2
+    exit 2
+  fi
+  sudo python3 "$E3DC_DOCKER_HELPER" --compose-dir . --sudo
+  sudo docker compose logs --tail=80 e3dc-control
 )
 ```
 
@@ -386,14 +456,19 @@ Der optionale Watchtower-Dienst startet nicht zusammen mit der
 Standardanwendung. Das Upstream-Projekt wird nicht mehr gepflegt und sein
 Docker-Socket-Zugriff ermöglicht weitreichende Kontrolle über den Docker-Host.
 Der Dienst bleibt nur für bestehende Installationen im Compose-Profil
-`auto-update`. Der bewusste Opt-in lautet:
+`auto-update`. Der bewusste Opt-in benötigt zusätzlich das standardmäßig
+deaktivierte Containerlabel:
 
 ```bash
+printf '%s\n' 'E3DC_WATCHTOWER_ENABLE=true' >> .env
+sudo python3 ./Installer/docker_compose_update.py --compose-dir . --sudo
 docker compose --profile auto-update up -d watchtower
 ```
 
-Watchtower berücksichtigt dabei durch den Enable-Label-Filter ausschließlich
-den E3DC-Control-Container. Ein bereits aus einer älteren Compose-Datei
+Erst mit `E3DC_WATCHTOWER_ENABLE=true` berücksichtigt Watchtower durch den
+Enable-Label-Filter den E3DC-Control-Container. Ohne diesen Wert bleibt auch
+ein versehentlich gestartetes Profil für den Hauptcontainer wirkungslos. Ein
+bereits aus einer älteren Compose-Datei
 laufender Watchtower kann mit
 `docker compose --profile auto-update stop watchtower` und anschließend
 `docker compose --profile auto-update rm -f watchtower` entfernt werden.

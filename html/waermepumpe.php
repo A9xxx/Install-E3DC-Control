@@ -6,6 +6,10 @@ if (!isset($base_path) || !isset($paths)) {
     $paths = getInstallPaths();
     $base_path = rtrim($paths['install_path'], '/') . '/';
 }
+requireWebAuth(false);
+if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
+    e3dcRequireCsrfToken(false);
+}
 
 // Versuche zuerst, die Ramdisk-Datei zu lesen (viel schneller!)
 // ... Pfade laden wie gehabt ...
@@ -33,6 +37,10 @@ $stiebelRamdiskFile = '/var/www/html/ramdisk/stiebel_isg.json';
 $dimplexRamdiskFile = '/var/www/html/ramdisk/dimplex_wpm.json';
 $liveJsonFile = '/var/www/html/ramdisk/waermepumpe.json';
 $json = null;
+$stiebelLiveStatus = 'not_applicable';
+$stiebelLiveAgeS = null;
+$stiebelLiveSource = '';
+$stiebelLiveError = '';
 
 // Konfigurations-Pfad (im Installationsverzeichnis)
 $isDocker = file_exists('/.dockerenv');
@@ -60,19 +68,27 @@ if ($isDocker) {
 }
 
 if ($wpType == 4) {
-    if (file_exists($stiebelRamdiskFile)) {
-        $json = json_decode(file_get_contents($stiebelRamdiskFile), true);
-    } elseif (file_exists($liveJsonFile)) {
-        $candidateJson = json_decode(file_get_contents($liveJsonFile), true);
-        $candidateData = is_array($candidateJson) ? ($candidateJson['data'] ?? $candidateJson) : [];
-        $candidateSource = strtolower((string)(
-            ($candidateJson['source'] ?? '')
-            . ' ' . ($candidateData['Quelle'] ?? '')
-            . ' ' . ($candidateData['Hersteller'] ?? '')
-        ));
-        if (strpos($candidateSource, 'stiebel') !== false) {
-            $json = $candidateJson;
-        }
+    $stiebelSelection = e3dcSelectFreshManufacturerPayload(
+        [$stiebelRamdiskFile, $liveJsonFile],
+        'Stiebel',
+        150
+    );
+    $stiebelLiveStatus = (string)$stiebelSelection['status'];
+    $stiebelLiveAgeS = $stiebelSelection['age_s'];
+    $stiebelLiveSource = (string)$stiebelSelection['source'];
+    $stiebelLiveError = (string)$stiebelSelection['error'];
+    if ($stiebelLiveStatus === 'live') {
+        $json = $stiebelSelection['payload'];
+    } else {
+        $json = [
+            'success' => false,
+            'error' => $stiebelLiveError,
+            'data' => [],
+            'status' => [],
+            'source' => 'stiebel_live_guard',
+            'live_status' => $stiebelLiveStatus,
+            'live_age_s' => $stiebelLiveAgeS,
+        ];
     }
 } elseif ($wpType == 1 && file_exists($liveJsonFile)) {
     $json = json_decode(file_get_contents($liveJsonFile), true);
@@ -114,17 +130,6 @@ if ($wpType == 4) {
 } elseif (file_exists($liveJsonFile)) {
     // Falls der Energy Manager (noch) nicht läuft, nehmen wir die Rohdaten vom Live-Dienst
     $json = json_decode(file_get_contents($liveJsonFile), true);
-}
-
-// FALLBACK NUR NUTZEN, WENN DER DIENST AUSGESCHALTET IST
-if (!$json && !$isServiceRunning && $wpType == 0) {
-    $python = getPythonInterpreter();
-    $script = $luxInstallDir . 'get_luxtronik.py';
-    if ($luxInstallDir !== '' && is_file($script)) {
-        $cmd = escapeshellarg($python) . " " . escapeshellarg($script);
-        $output = shell_exec($cmd);
-        $json = json_decode($output, true);
-    }
 }
 
 // Falls immer noch kein JSON da ist, ein leeres Objekt erstellen
@@ -444,8 +449,8 @@ if ($success) {
         $stats['el_start'] = $current_el;
     }
 
-    // Immer speichern, damit wm_start und el_start erhalten bleiben
-    file_put_contents($statsFile, json_encode($stats));
+    // Der Renderpfad bleibt read-only. Persistente Tagesstatistik wird vom
+    // zuständigen Hintergrunddienst gepflegt, nicht durch einen Seitenabruf.
 }
 
 $p_min_disp = ($stats['p_min'] !== null) ? number_format($stats['p_min'], 1, ',', '.') : '--';
@@ -492,7 +497,6 @@ if ($wpType == 4) {
 // el_start beim ersten Aufruf des Tages setzen (wm_start wird oben gespeichert)
 if ($elek_heute > 0 && ($stats['el_start'] === null || $stats['el_start'] == 0)) {
     $stats['el_start'] = $elek_heute;
-    file_put_contents($statsFile, json_encode($stats));
 }
 
 $tagesWaerme = ($stats['wm_start'] > 0 && $waerme_heute >= $stats['wm_start']) ? ($waerme_heute - $stats['wm_start']) : 0;
@@ -530,9 +534,7 @@ if ($isHeaterPage) {
         $tmpManual = @json_decode(@file_get_contents($hsManualFile), true);
         if (is_array($tmpManual)) {
             $expires = (int)($tmpManual['expires_ts'] ?? 0);
-            if ($expires > 0 && time() > $expires) {
-                @unlink($hsManualFile);
-            } else {
+            if ($expires <= 0 || time() <= $expires) {
                 $hsManualOverride = $tmpManual;
             }
         }
@@ -632,6 +634,8 @@ if ($isChargingOnly) {
                     <?php if($autoMode == 0): ?>
                         <span class="badge bg-secondary ms-1">Automatik Aus</span>
                     <?php endif; ?>
+                <?php elseif($wpType == 4 && $stiebelLiveStatus === 'stale'): ?>
+                    <span class="badge bg-warning text-dark" style="cursor:pointer;" onclick="showDiagnoseLog('wp_raw')" title="Stiebel-Livedaten sind älter als 150 Sekunden">Veraltet</span>
                 <?php else: ?>
                     <span class="badge bg-danger" style="cursor:pointer;" onclick="showDiagnoseLog('wp_raw')" title="Rohdaten anzeigen">Fehler</span>
                 <?php endif; ?>
@@ -849,6 +853,7 @@ if ($isChargingOnly) {
                 <!-- Steuerung -->
                 <div class="d-flex gap-2 mb-2">
                     <form method="post" class="flex-grow-1">
+                        <?= e3dcCsrfInput() ?>
                         <?php if ($hsAutoConf == 1): ?>
                             <button type="submit" name="toggle_hs_auto" value="0" class="btn btn-outline-success btn-sm w-100 fw-bold">
                                 <i class="fas fa-check-circle me-1"></i> PV-AUTO AN
@@ -860,6 +865,7 @@ if ($isChargingOnly) {
                         <?php endif; ?>
                     </form>
                     <form method="post" class="flex-grow-1">
+                        <?= e3dcCsrfInput() ?>
                         <?php if ($manualFullActive): ?>
                             <button type="submit" name="hs_manual_auto" value="1" class="btn btn-outline-info btn-sm w-100 fw-bold">
                                 <i class="fas fa-rotate-left me-1"></i> Vollgas aus / Auto
@@ -884,9 +890,19 @@ if ($isChargingOnly) {
                 <?= $manualBoostMessage ?>
             <?php endif; ?>
             <?php if (!$success): ?>
-                <div class="alert alert-info d-flex align-items-center small py-2">
-                    <i class="fas fa-spinner fa-spin me-2"></i> <strong>Wärmepumpe wird abgefragt...</strong>
-                </div>
+                <?php if ($wpType == 4): ?>
+                    <div class="alert <?= $stiebelLiveStatus === 'stale' ? 'alert-warning' : 'alert-danger' ?> d-flex align-items-center small py-2">
+                        <i class="fas fa-exclamation-triangle me-2"></i>
+                        <div>
+                            <strong><?= $stiebelLiveStatus === 'stale' ? 'Stiebel-Livedaten veraltet' : 'Stiebel-Livedaten nicht verfügbar' ?></strong>
+                            <div><?= htmlspecialchars((string)($error ?: 'Kein erfolgreicher Stiebel-Abruf innerhalb der letzten 150 Sekunden.')) ?></div>
+                        </div>
+                    </div>
+                <?php else: ?>
+                    <div class="alert alert-info d-flex align-items-center small py-2">
+                        <i class="fas fa-spinner fa-spin me-2"></i> <strong>Wärmepumpe wird abgefragt...</strong>
+                    </div>
+                <?php endif; ?>
             <?php endif; ?>
 
             <?php if ($success): ?>
@@ -1335,7 +1351,7 @@ if ($isChargingOnly) {
             <span class="small text-muted"><i class="fas fa-robot me-1"></i> <?= htmlspecialchars($displayServiceLabel) ?>: <span class="badge <?= $displayServiceRunning ? 'bg-success' : 'bg-danger' ?>"><?= strtoupper($displayServiceStatus) ?></span></span>
             <div class="d-flex gap-2">
                 <a href="<?= getContextPageUrl('config', ['expand' => 'luxtronik']) ?>#group-luxtronik" class="btn btn-sm btn-outline-secondary"><i class="fas fa-cog"></i></a>
-                <form method="post"><button type="submit" name="restart_manager" class="btn btn-sm btn-outline-info"><i class="fas fa-sync-alt"></i></button></form>
+                <form method="post"><?= e3dcCsrfInput() ?><button type="submit" name="restart_manager" class="btn btn-sm btn-outline-info"><i class="fas fa-sync-alt"></i></button></form>
             </div>
         </div>
     </div>

@@ -43,6 +43,12 @@ CYCLE_S   = 5
 MODE_AUTO = 0; MODE_IDLE = 1; MODE_DISCH = 2; MODE_CHRG = 3; MODE_GRID = 4
 
 _stop = False
+
+LEGACY_RUNTIME_BLOCKED_EXIT_CODE = 78
+LEGACY_RUNTIME_BLOCKED_REASON = (
+    "storage_manager_legacy.py ist nur noch eine Referenz und kein "
+    "zulässiger EMS_REQ_SET_POWER-Writer"
+)
 def _sig(s,_):
     global _stop; _stop=True; log.info('Signal %d - beende.' % s)
 signal.signal(signal.SIGTERM, _sig)
@@ -694,6 +700,12 @@ class BattCtrl:
         self._c=None
 
 def main():
+    # Der produktive Hardwareausgang gehört ausschließlich dem kanonischen
+    # storage_manager.py. Der historische Regler bleibt als Referenz im
+    # Produktbaum, darf aber weder per alter Unit noch manuell anlaufen.
+    log.critical(LEGACY_RUNTIME_BLOCKED_REASON)
+    return LEGACY_RUNTIME_BLOCKED_EXIT_CODE
+
     log.info('=== E3DC Storage Manager gestartet ===')
     cfg=load_cfg()
     host=str(cfg.get('server_ip','') or '').strip()
@@ -4893,4 +4905,4 @@ def main():
     log.info('E3DC Storage Manager beendet.')
 
 if __name__=='__main__':
-    main()
+    raise SystemExit(main())

@@ -5,6 +5,19 @@ if (session_status() === PHP_SESSION_NONE) {
 require_once __DIR__ . '/helpers.php';
 require_once __DIR__ . '/eeg_tariff_tables.php';
 
+$configEditorRequestMethod = strtoupper((string)($_SERVER['REQUEST_METHOD'] ?? 'GET'));
+if ($configEditorRequestMethod === 'POST') {
+    $configEditorAction = (string)($_POST['config_action'] ?? '');
+    $configEditorPostIsAjax =
+        isset($_POST['quick_toggle_key'])
+        || in_array($configEditorAction, ['test_tibber_api', 'test_entsoe_api'], true)
+        || strtolower((string)($_SERVER['HTTP_X_REQUESTED_WITH'] ?? '')) === 'xmlhttprequest';
+    requireWebAuth($configEditorPostIsAjax);
+    e3dcRequireCsrfToken($configEditorPostIsAjax);
+} else {
+    requireWebAuth(false);
+}
+
 function e3dc_config_editor_wallbox_toggle_checked(array $config, $key) {
     $missingDefaults = ['wb1_e3dc_wbchar6_compat_enable' => '1', 'wb2_e3dc_wbchar6_compat_enable' => '1'];
     $value = array_key_exists($key, $config) ? ($config[$key]['value'] ?? '0') : ($missingDefaults[$key] ?? '0');
@@ -173,6 +186,38 @@ function e3dc_config_editor_normalize_pv_topology($raw, &$error = '') {
     return $decoded;
 }
 
+function e3dc_config_editor_pv_topology_ui_state($configData) {
+    $state = [
+        'has_explicit' => false,
+        'stored_valid' => true,
+        'raw' => [],
+    ];
+    if (!is_array($configData) || !array_key_exists('pv_forecast_topology_config', $configData)) {
+        return $state;
+    }
+    $value = $configData['pv_forecast_topology_config'];
+    // Exakt wie der Python-Laufzeitvertrag: Ein alter leerer String bedeutet
+    // "kein expliziter Vertrag" und darf die Legacy-Vorbelegung nicht sperren.
+    if (is_string($value) && trim($value) === '') {
+        return $state;
+    }
+    $state['has_explicit'] = true;
+    $validationError = '';
+    $normalized = e3dc_config_editor_normalize_pv_topology(
+        $value,
+        $validationError
+    );
+    if ($normalized === null) {
+        $state['stored_valid'] = false;
+    } else {
+        // Gültige, historisch doppelt serialisierte JSON-Strings werden für
+        // die Oberfläche verlustfrei normalisiert und erst beim nächsten
+        // bewussten Speichern als strukturierter Vertrag geschrieben.
+        $state['raw'] = $normalized;
+    }
+    return $state;
+}
+
 $paths = getInstallPaths();
 $install_user = $paths['install_user'];
 $install_path = rtrim($paths['install_path'], '/') . '/';
@@ -187,14 +232,8 @@ $v4_config_file_path = '/var/www/html/data/e3dc_v4.json';
 // Berechtigungsprüfung für V4
 clearstatcache(true, $v4_config_file_path);
 $is_writable = is_writable($v4_config_file_path);
-// Prüfe ob Data-Dir existiert für V4
-if (!file_exists(dirname($v4_config_file_path))) {
-    @mkdir(dirname($v4_config_file_path), 0775, true);
-    if (function_exists('posix_getpwnam')) @chown(dirname($v4_config_file_path), posix_getpwnam($install_user)['uid']);
-    if (function_exists('posix_getgrnam')) @chgrp(dirname($v4_config_file_path), posix_getgrnam('www-data')['gid']);
-}
 $message = '';
-if (!$is_writable && $_SERVER['REQUEST_METHOD'] === 'POST') {
+if (!$is_writable && $configEditorRequestMethod === 'POST') {
     $perms = @file_exists($v4_config_file_path) ? substr(sprintf('%o', fileperms($v4_config_file_path)), -4) : 'NE';
     $message = "<div class='alert alert-danger py-2 border-0 mb-3 mx-2'>⚠ Fehler: Keine Schreibrechte auf <code>$v4_config_file_path</code> (Perms: $perms). Bitte am Pi im Installer Punkt 2 (Rechte prüfen) ausführen!</div>";
 }
@@ -220,6 +259,7 @@ $defaults = [
     "storage_curve_target_mode" => "anchored",
     "storage_curve_sliding_horizon_enable" => "0",
     "storage_dc_first_charge_limit_enable" => "0",
+    "storage_forecast_shortfall_aux_ac_charge_enable" => "0",
     "storage_curve_charge_servo_mode" => "dynamic",
     "storage_curve_charge_servo_min_w" => "300",
     "storage_curve_charge_servo_deadband_w" => "250",
@@ -336,6 +376,7 @@ $defaults = [
     "direct_marketing_negative_headroom_min_window_min" => "30", "direct_marketing_negative_headroom_min_surplus_wh" => "1000",
     "direct_marketing_negative_headroom_buffer_pct" => "3.0",
     "direct_marketing_low_price_headroom_enable" => "1",
+    "direct_marketing_passive_normal_zero_charge_enable" => "0",
     "direct_marketing_low_price_no_export" => "1", "direct_marketing_keep_headroom_pct" => "20.0",
     "direct_marketing_negative_price_charge_target_soc_pct" => "80.0",
     "direct_marketing_low_price_curtail_enable" => "0", "direct_marketing_low_price_curtail_limit_w" => "0",
@@ -368,7 +409,8 @@ $defaults = [
     // V4 Smart Home / Energy Manager
     "luxtronik" => "0", "wp_type" => "-1", "wp_source_type" => "auto", "luxtronik_ip" => "0.0.0.0", "idm_ip" => "0.0.0.0", "idm_port" => "502", "idm_e_total" => "0", "idm_cooling_boost_min_at" => "23.0", "idm_pv_surplus_enable" => "1", "idm_pv_surplus_max_kw" => "2.0", "idm_pv_surplus_min_kw" => "0.8", "idm_pv_surplus_ramp_kw" => "0.2", "idm_pv_surplus_deadband_kw" => "0.1", "idm_pv_surplus_heartbeat_s" => "60", "idm_pv_surplus_min_write_interval_s" => "10", "shelly_sg_ip" => "", "shelly_pause_ip" => "", "auto_mode" => "1", "grid_start_limit" => "-3500", "pv_boost_delay" => "30",
     "stop_delay_minutes" => "10", "wp_min_runtime_min" => "30", "wp_restart_block_min" => "20", "min_soc" => "80", "heizgrenze_temp" => "10.0", "wws" => "50.0", "www" => "48.0", "hz" => "32.0", "khl" => "16.0",
-    "price_boost_enable" => "0", "price_limit" => "20.0", "price_hard_limit" => "-99.0", "price_pause_limit" => "35.0", "price_min_duration" => "60",
+    "price_boost_enable" => "0", "heat_price_boost_scope" => "both", "heat_price_boost_windows" => "",
+    "price_limit" => "20.0", "price_hard_limit" => "-99.0", "price_pause_limit" => "35.0", "price_min_duration" => "60",
     "price_max_daily" => "180", "manual_boost_max_duration" => "180", "manual_boost_min_soc" => "25", "wq_min_temp" => "1.0",
     "rl_source" => "internal", "pv_pause_enable" => "0", "pv_pause_soc" => "80", "pv_pause_watt" => "3000.0", "luxtronik_pause_setpoint_c" => "20.0",
     "pv_pause_timeout_minutes" => "120", "pv_pause_min_at" => "0.0", "pv_pause_max_temp_drop" => "4.0", "morning_boost_enable" => "0", "morning_boost_prio" => "wallbox",
@@ -436,7 +478,7 @@ $defaults = [
     "wb_ip" => "", "wb_topic" => "", "wb_user" => "", "wb_pass" => "", "wb2_ip" => "", "wb2_topic" => "", "wb2_user" => "", "wb2_pass" => "",
     "mqtt_ha_inbound_enable" => "1", "mqtt_ha_inbound_history_enable" => "1",
     "ha_mode" => "off", "ha_peer_ip" => "", "ha_fail_timeout" => "15", "ha_sync_interval" => "60", "ha_auto_recover" => "1", "ha_auto_failover" => "1",
-    "shadow_master_url" => "", "shadow_master_ip" => "", "shadow_sync_interval_s" => "5", "shadow_fetch_timeout_s" => "2.5", "shadow_snapshot_max_age_s" => "30"
+    "shadow_master_url" => "", "shadow_master_ip" => "", "shadow_sync_interval_s" => "5", "shadow_fetch_timeout_s" => "2.5", "shadow_snapshot_max_age_s" => "30", "shadow_snapshot_token" => ""
 ];
 
 $tooltips = [
@@ -475,7 +517,8 @@ $tooltips = [
     "einspeiselimit"         => "Einspeisebegrenzung in kW (z.B. 7.0). Der Abregelschutz nutzt diesen Wert als Ziel-Netzpunkt, sofern er unter dem per RSCP gemeldeten E3DC-Derating liegt.",
     "storage_curve_target_mode" => "Zielkurven-Modus. Ankerkurve nutzt Morgen-Puffer, Zwischenziele und Tagesziel wie bisher. Prognose auf 100% berechnet die Speicher-Zielkurve allein aus PV- und Verbrauchsprognose bis 100% am Freilauf; Schutzpfade, Pre-Dump und Abregelreserve bleiben aktiv.",
     "storage_curve_sliding_horizon_enable" => "Optionaler erweiterter Modus: erlaubt dem 100%-Prognosepfad, die Ladung über einen gleitenden Prognosehorizont zu entspannen, wenn Vertrauen, Zielerreichbarkeit und Abregeldruck sicher sind. Nur bei Zielkurven-Modus 'Prognose auf 100%' aktivierbar.",
-    "storage_dc_first_charge_limit_enable" => "Begrenzt Kurvenladung und DV-PV-Speichern auf die aktuell am E3DC gemessene PV-Leistung. Der E3DC bleibt dabei in AUTO und darf jederzeit entladen; PV-Leistung eines Zusatzwechselrichters wird nicht als Laderahmen verwendet. Fehlt ein frischer, gültiger PV-Split, werden diese PV-basierten Ladepfade sicher auf 0 W begrenzt. Preis- und ausdrücklich freigegebenes Netzladen bleiben eigenständig.",
+    "storage_dc_first_charge_limit_enable" => "Begrenzt Kurvenladung und DV-PV-Speichern auf die aktuell am E3DC gemessene DC-gekoppelte PV-Leistung. Der E3DC bleibt dabei in AUTO und darf jederzeit entladen; PV-Leistung eines Zusatzwechselrichters wird standardmäßig nicht als Laderahmen verwendet. Fehlt ein frischer, gültiger PV-Split, werden diese PV-basierten Ladepfade sicher auf 0 W begrenzt. Preis- und ausdrücklich freigegebenes Netzladen bleiben eigenständig.",
+    "storage_forecast_shortfall_aux_ac_charge_enable" => "Nicht freigegebene Option innerhalb der E3DC-DC-Kopplung für die Prognose-100-Ladekurve. Getrennte PV- und Lastquantile dürfen nicht verrechnet werden, weil daraus ohne Abhängigkeitsmodell kein Quantil des Speicherüberschusses entsteht. Ein freigegebener Joint-Horizon-Produzent und eine fachlich beschlossene Risikoschwelle fehlen; die Option ist deshalb nicht auswählbar und bleibt EVIDENCE_LIMIT. E3DC_DC_ONLY bleibt wirksam. Fehlende oder schlechte Daten sowie Netzbezug sperren immer. Die Direktvermarktung besitzt dafür einen getrennten Zusatzwechselrichter-Pfad.",
     "storage_curve_charge_servo_mode" => "Ladeführung für laufende Kurvenladung. Dynamisch reagiert wie bisher direkt auf die aktuelle Zielkurve. Ruhig / Kurven-Servo hält eine bereits aktive Kurvenladung mit gedämpften Schritten, solange PV und Netzpunkt sicher sind; Schutzpfade bleiben vorrangig.",
     "storage_target_soc"     => "Tagesziel in %. Das ist der gewünschte Speicherstand zum Freilauf/Sonnenuntergang. Wenn das Ziel laut Prognose nicht mehr erreichbar ist, gibt V4 den E3DC autonom frei, statt die Kurve zu jagen.",
     "storage_morning_soc"    => "Morgen-Puffer in %. Das ist die Startreserve, die morgens vorhanden sein soll. Liegt der Speicher darunter, darf der E3DC autonom laden. Der Wert ist kein Pre-Dump-Ziel und kein Netzladeauftrag.",
@@ -575,7 +618,7 @@ $tooltips = [
     "pv_external_ac_inverter_limit_w" => "AC-Nennleistung bzw. wirksames Ausgangslimit aller als EXTERNAL_AC zugeordneten Zusatzwechselrichter in Watt. Kein anlagenspezifischer Standard.",
     "pv_e3dc_dc_inverter_limit_w" => "Optionales E3DC-DC-/Wechselrichterlimit in Watt, nur als Fallback wenn kein frischer PVI_DC_MAX_POWER-Readback verfügbar ist.",
     "pv_forecast_topology_config" => "Versionierter Vertrag für beliebig viele Generatorgruppen, physische PV-Flächen und Solcast-Providerbindungen. Ungültige oder unvollständige Topologien bleiben bewusst nicht bindbar.",
-    "forecast_diagnostics_enable" => "Schaltet ausschließlich die lokale, read-only PV-Prognosediagnose ein. Sie vergleicht vorhandene Prognosen mit vorhandenen Messwerten, ändert aber weder Regelentscheidungen noch Modelle oder Konfigurationswerte.",
+    "forecast_diagnostics_enable" => "Schaltet ausschließlich die lokale, read-only PV-Prognosediagnose ein. Sie vergleicht die E3/DC-DC-Punktprognose insgesamt und nach Erfassungs-Vorlauf mit gültigen Messwerten, behauptet kein P50 und ändert weder Regelentscheidungen noch Modelle oder Konfigurationswerte.",
     "ml_home_cap_kw"         => "ML-Training: Maximaler Hausverbrauch in kW der als Trainingswert akzeptiert wird. Verhindert dass Messspitzen (Wallbox, Sensor-Glitch) das ML-Modell verzerren. Standard: 6.0 kW (deckt Induktionskochfeld + Backofen ab). Bei reinem Standby-Haushalt: 2.0 kW.",
 
     // Tarife
@@ -589,7 +632,7 @@ $tooltips = [
     "tibber_api_token"       => "Tibber API-Token für direkte Tarifpreise. Wird nur lokal in der Konfiguration gespeichert und nicht in Diagnose/Statusdateien ausgegeben.",
     "tibber_home_id"         => "Optionale Tibber Home-ID. Leer lassen, wenn das erste Tibber-Zuhause mit Preisinfo verwendet werden soll.",
     "entsoe_api_token"       => "ENTSO-E Transparency Platform RESTful API Security Token. Wird für den 15-Minuten-Fallback nach SMARD genutzt und nicht in Diagnose/Statusdateien ausgegeben.",
-    "peak_shaving_enable" => "Begrenzt den durchschnittlichen Netzbezug in festen Zähler-Viertelstunden. Aus bleibt vollständig neutral. Aktiv bleibt E3/DC in AUTO; die Regelung setzt nur eine flüchtige Entladeobergrenze und fordert weder Entladung noch Einspeisung an.",
+    "peak_shaving_enable" => "Begrenzt den durchschnittlichen Netzbezug in festen Zähler-Viertelstunden. Aus bleibt vollständig neutral. Aktiv bleibt E3/DC in AUTO; zusätzlich begrenzt die zentrale Wallbox-Policy flexible Ladeleistung auf den belegten Restspielraum des aktuellen Intervalls.",
     "peak_shaving_grid_import_limit_w" => "Maximal gewünschter durchschnittlicher Netzbezug je fester Viertelstunde in Watt. Beispiel: 10000 entspricht 10 kW.",
     "peak_shaving_reserve_soc_pct" => "Absolute SoC-Schwelle für den Lastspitzenpuffer. Unterhalb dieses Werts dürfen normale Optimierungen nicht entladen; bei einer echten Lastspitze darf der Puffer bis zur physischen Notstromreserve genutzt werden.",
     "peak_shaving_max_discharge_w" => "Optionales Leistungsmaximum nur für die Lastspitzenbegrenzung. 0 verwendet das wirksame Batterie-/Wechselrichterlimit.",
@@ -610,9 +653,9 @@ $tooltips = [
     "cheap_grid_min_duration_min" => "Mindestdauer eines günstigen Fensters in Minuten. Kurze Einzelspitzen werden ignoriert, damit keine Taktung entsteht.",
     "cheap_grid_battery_enable" => "Erlaubt Speicher-Netzladen im Negativpreis-/Legacy-Boost. Der normale Prognose-Marktpfad nutzt dafür getrennte, standardmäßig ausgeschaltete Speicherfreigaben.",
     "cheap_grid_wallbox_enable" => "Erlaubt Wallbox-Laden im Negativpreis-/Legacy-Boost. Standard aus, damit kein Auto ungeplant Netzstrom zieht.",
-    "cheap_grid_heatpump_enable" => "Erlaubt Wärmepumpen-Boost im Negativpreis-/Legacy-Boost. Standard aus, Nutzer muss die WP bewusst freigeben.",
+    "cheap_grid_heatpump_enable" => "Separate Wärmepumpen-Freigabe ausschließlich für echte Negativpreise. Standard aus; die allgemeine Preisverschiebung bleibt davon getrennt.",
     "cheap_grid_heater_enable" => "Erlaubt Heizstab/Heizer im Negativpreis-/Legacy-Boost. Standard aus.",
-    "heat_policy_runtime_enable" => "Aus: Wärmepumpe und Heizstab verwenden weiterhin die bisherige Regelung. Ein: Die gemeinsame Planung darf Wärmefreigaben begrenzen; bei fehlenden oder veralteten Daten bleibt die sichere bisherige Regelung zuständig.",
+    "heat_policy_runtime_enable" => "Aus: Wärmepumpe und Heizstab verwenden weiterhin die bisherige Regelung. Ein: Die gemeinsame Planung darf Wärmefreigaben begrenzen; bei fehlenden oder veralteten Daten bleibt die sichere bisherige Regelung zuständig. Dieser Schalter allein aktiviert keinen Wärmepumpen-Preis-Boost.",
     "ems_budget_runtime_enable" => "Aus: Speicher, Wallbox und Wärme verwenden weiterhin ihre bisherigen Regeln. Ein: Nur eine gültige und bestätigte Gesamtplanung darf zusätzliche Leistung verteilen; fehlen aktuelle Daten, wird nichts zusätzlich freigegeben.",
     "heat_heater_grid_boost_enable" => "Erlaubt der zentralen Wärme-Policy, Heizstab-Netzboost überhaupt zu prüfen. Ohne Runtime-Schalter bleibt das nur Diagnose.",
     "heat_heater_grid_boost_ack" => "Bewusste Bestätigung: Heizstab hat COP=1. Netzboost ist nur bei Negativpreis, echtem Prognose-Defizit oder ausdrücklichem Betreiberwunsch sinnvoll.",
@@ -676,8 +719,8 @@ $tooltips = [
     "direct_marketing_pv_store_ramp_step_w" => "Maximaler Hochlauf pro Storage-Manager-Zyklus beim DV-PV-Speichern. Runterregeln bleibt sofort möglich, damit kein Netzbezug entsteht.",
     "direct_marketing_pv_store_dc_only_enable" => "Legacy-Sicherheitsveto: Ein gesetzter Wert erzwingt E3DC-DC und überstimmt auch die neue positive AC-Freigabe. Fehlend oder 0 gibt Zusatz-WR-AC nicht frei.",
     "direct_marketing_aux_inverter_ac_storage_enable" => "Legacy-Freigabe für den externen AC-Zusatzwechselrichter. Neue Konfigurationen verwenden stattdessen die AC-Speicherroute.",
-    "direct_marketing_aux_inverter_ac_storage_mode" => "AC-Speicherquelle des Zusatz-WR: Aus (Standard), nur Notstromreserve sichern oder wirtschaftlich. E3DC-DC bleibt immer vorrangig; Netz-AC wird hierdurch nicht freigegeben.",
-    "direct_marketing_aux_inverter_ac_forecast_confidence_pct" => "Mindestvertrauen der frischen PV-Prognose für eine Zusatz-WR-AC-Ladung. Standard 80 Prozent.",
+    "direct_marketing_aux_inverter_ac_storage_mode" => "Die Auswahl speichert die gewünschte AC-Speicherroute des Zusatz-WR. Wirksam bleibt derzeit Aus beziehungsweise E3DC_DC_ONLY: Es fehlen noch der Produzent einer historisch kalibrierten gemeinsamen Horizontverteilung und die fachlich beschlossene Risikoschwelle. Netz-AC wird hierdurch nie freigegeben.",
+    "direct_marketing_aux_inverter_ac_forecast_confidence_pct" => "Historischer Punktprognosewert für die Diagnose. Er besitzt keine Steuerwirkung, ist kein kalibriertes Quantil und ersetzt weder die gemeinsame Horizontverteilung noch deren fachlich beschlossene Risikoschwelle.",
     "direct_marketing_aux_inverter_ac_deadband_wh" => "AC-Defizit-Totbereich in Wh. 0 bzw. leer nutzt die Backend-Automatik und verhindert Kleinstzyklen.",
     "direct_marketing_pv_store_dc_charge_efficiency_pct" => "Wirkungsgrad der E3DC-DC-Laderoute für Wirtschaftlichkeits- und Defizitberechnung. Standard 96 Prozent.",
     "direct_marketing_pv_store_aux_ac_charge_efficiency_pct" => "Wirkungsgrad der ausdrücklich freigegebenen Zusatz-WR-AC-Laderoute. Standard 90 Prozent.",
@@ -703,6 +746,7 @@ $tooltips = [
     "direct_marketing_negative_headroom_min_surplus_wh" => "Mindest-Prognoseüberschuss im kommenden Preisfenster. Darunter wird vorher nicht aktiv Speicherplatz freigehalten.",
     "direct_marketing_negative_headroom_buffer_pct" => "Zusätzlicher SoC-Puffer auf den berechneten Speicherplatzbedarf vor Preisfenstern.",
     "direct_marketing_low_price_headroom_enable" => "Hält auch vor günstigen PV-Speicherfenstern Speicherplatz frei. Das verhindert Laden kurz vor einem wirtschaftlich besseren Speicherfenster.",
+    "direct_marketing_passive_normal_zero_charge_enable" => "Anlagenspezifische Pilotfreigabe: Begrenzt die Speicherladung in einem eindeutig an den aktuellen kanonischen Slot gebundenen passiven Eco+-Hausversorgungsabschnitt auf 0 W. Entladen in E3/DC-AUTO bleibt möglich. Standard aus; ohne vollständige Action-, Timeline- und Slotbindung wirkungslos.",
     "direct_marketing_low_price_no_export" => "Sperrt Verkauf in günstigen Preisfenstern. Verkauf soll nur in teuren Fenstern stattfinden.",
     "direct_marketing_keep_headroom_pct" => "Speicherplatz, der bei niedrigen oder negativen Preisen für PV und flexible Lasten frei bleiben soll.",
     "direct_marketing_negative_price_charge_target_soc_pct" => "Optionales Ziel für billige/negative Ladefenster. Wird nur mit aktivem Arbitrage-Owner und allen Freigaben genutzt.",
@@ -817,12 +861,14 @@ $tooltips = [
     "manual_boost_max_duration" => "Max. Dauer des manuellen Boosts in Minuten bevor er automatisch stoppt.",
 
     // Preis-Boost
-    "price_boost_enable"     => "Aktiviert preisbasierten WP-Boost (günstiger Strom = WP läuft). Benötigt dynamischen Stromtarif.",
-    "price_limit"            => "Unter diesem Preis (ct/kWh) startet der WP-Boost. z.B. 20.0 ct.",
-    "price_hard_limit"       => "Unter diesem Preis (ct/kWh) wird der Boost per Zwang fortgesetzt, auch ohne PV. -99 = deaktiviert.",
-    "price_pause_limit"      => "Über diesem Preis (ct/kWh) pausiert der Boost zwingend (Hochpreis-Schutz).",
-    "price_min_duration"     => "Mindest-Boost-Dauer in Minuten (z.B. 60 = mindestens 1h am Stück heizen).",
-    "price_max_daily"        => "Maximale Boost-Zeit pro Tag in Minuten (Schutz vor überhitzung durch zu lange Laufzeiten).",
+    "price_boost_enable"     => "Fordert eine preisbasierte Wärmeverschiebung als Candidate/Shadow an. Ohne vollständige Wärme-/PV-Evidenz und gebundenen heat_intent_v1-Aktivierungsvertrag bleibt sie effektiv aus.",
+    "heat_price_boost_scope" => "Wärmeziel für den Candidate: Heizung, Warmwasser oder beides. Ungültige Werte sperren die Preisverschiebung fail-closed.",
+    "heat_price_boost_windows" => "Optionale lokale Zeitfenster im Format HH:MM-HH:MM, eines pro Zeile. Leer bedeutet ganztägige Candidate-Auswertung; ungültige Einträge sperren fail-closed.",
+    "price_limit"            => "Unter diesem Preis darf ein Wärme-Candidate entstehen. Ohne vollständige Evidenz und Aktivierungsvertrag startet dadurch keine Wärmepumpe.",
+    "price_hard_limit"       => "Historische Sehr-günstig-Schwelle des Candidates. -99 deaktiviert sie; auch ein Unterschreiten ist keine eigenständige Aktorfreigabe.",
+    "price_pause_limit"      => "Über diesem Preis wird der Wärme-Candidate verworfen (Hochpreis-Schutz).",
+    "price_min_duration"     => "Geforderte Mindestdauer eines Wärme-Candidates in Minuten. Der Wert allein löst keinen Start aus.",
+    "price_max_daily"        => "Maximale Candidate-Zeit pro Tag in Minuten; begrenzt eine spätere, separat freizugebende Aktivierung.",
 
     // PV-Pause
     "pv_pause_enable"        => "Quell-Erholung: pausiert die Wärmepumpe kurz vor einer erwarteten PV-Kante, damit sich die Wärmequelle erholen kann.",
@@ -953,8 +999,9 @@ $tooltips = [
     "mqtt_ha_inbound_history_enable" => "Nutzt frische MQTT-Eingangsdaten für Frontend, Live-History und Verbrauchsprognose. WP, Heizstab und externe Wallboxen werden aus dem reinen Hausverbrauch herausgerechnet.",
 
     // HA Cluster
-    "shadow_master_url"      => "HTTP-Basisadresse der aktiven E3DC-Control-Instanz, z.B. http://192.0.2.10. Leer nutzt die Partner-IP.",
+    "shadow_master_url"      => "HTTP-Basisadresse der aktiven E3DC-Control-Instanz, z.B. http://192.168.1.10. Leer nutzt die Partner-IP.",
     "shadow_master_ip"       => "Fallback-IP des aktiven Masters, wenn keine Shadow-URL gesetzt ist.",
+    "shadow_snapshot_token"  => "Gemeinsames Peer-Geheimnis aus exakt 64 Hex-Zeichen. Auf Master und Shadow identisch setzen; es wird weder projiziert noch protokolliert.",
     "shadow_sync_interval_s" => "Sekunden zwischen zwei Shadow-Snapshots.",
     "shadow_fetch_timeout_s" => "HTTP-Timeout je Master-Datei in Sekunden.",
     "shadow_snapshot_max_age_s" => "Maximales Snapshot-Alter, bevor Shadow-Auswertungen als stale gelten.",
@@ -977,7 +1024,7 @@ $tooltips = [
     "climate_min_power_w"    => "Leistungsschwelle, ab der die Klimaanlage als aktiv gilt. Das ist nur Diagnose und kein Schaltwert.",
     "climate_poll_s"         => "Leseintervall des Klima-Messdienstes in Sekunden.",
     "climate_history_enable" => "Speichert eine eigene Klima-Historie unter data/climate_history, damit Prognose und Auswertung später nicht aus dem Hausverbrauch raten müssen.",
-    "climate_history_interval_s" => "Schreibintervall für die Klima-Historie in Sekunden.",
+    "climate_history_interval_s" => "Erfassungsintervall der Klima-Historie in Sekunden. Die Messpunkte werden im RAM gesammelt und spätestens alle fünf Minuten gebündelt in die Tagesdatei geschrieben.",
     "climate_forecast_enable" => "Aktiviert die Klima-Verbrauchsprognose aus gemessener Klima-Historie und Wetter-/Außentemperatur. Das wirkt nur auf Planung und Anzeige, nicht auf Schaltbefehle.",
     "climate_control_enable" => "Aktiviert den Klima-Statusdienst. Toshiba wird nur read-only gelesen; es werden keine Toshiba-Kommandos gesendet.",
     "climate_control_provider" => "Steueranbieter. Für Toshiba-WLAN-Empfänger ist aktuell die Cloud-Schnittstelle als Lesepfad vorgesehen.",
@@ -1023,13 +1070,13 @@ function readConfig($file_path) {
 
 $config = readConfig($v4_config_file_path);
 unset($config['stop']);
-$pv_topology_raw_ui = [];
-if (is_file($v4_config_file_path)) {
-    $pv_topology_file_data = json_decode((string)@file_get_contents($v4_config_file_path), true);
-    if (is_array($pv_topology_file_data) && is_array($pv_topology_file_data['pv_forecast_topology_config'] ?? null)) {
-        $pv_topology_raw_ui = $pv_topology_file_data['pv_forecast_topology_config'];
-    }
-}
+$pv_topology_file_data = is_file($v4_config_file_path)
+    ? json_decode((string)@file_get_contents($v4_config_file_path), true)
+    : null;
+$pv_topology_ui_state = e3dc_config_editor_pv_topology_ui_state($pv_topology_file_data);
+$pv_topology_raw_ui = $pv_topology_ui_state['raw'];
+$pv_topology_has_explicit_ui = $pv_topology_ui_state['has_explicit'];
+$pv_topology_stored_valid_ui = $pv_topology_ui_state['stored_valid'];
 $pv_topology_json_ui = json_encode(
     $pv_topology_raw_ui,
     JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES
@@ -1394,48 +1441,6 @@ function e3dc_configured_service_auto_installs($data) {
     return $wanted;
 }
 
-function e3dc_find_installer_wrapper_for_config_auto_install() {
-    $candidates = [];
-    if (function_exists('getInstallPaths')) {
-        $paths = getInstallPaths();
-        if (!empty($paths['install_path'])) {
-            $candidates[] = rtrim((string)$paths['install_path'], '/') . '/Installer/installer_wrapper.sh';
-        }
-    }
-    if (!empty($GLOBALS['install_path'])) {
-        $candidates[] = rtrim((string)$GLOBALS['install_path'], '/') . '/Installer/installer_wrapper.sh';
-    }
-    foreach ([
-        '/app/pi/Install/Installer/installer_wrapper.sh',
-    ] as $candidate) {
-        $candidates[] = $candidate;
-    }
-    foreach (array_unique($candidates) as $candidate) {
-        if (is_file($candidate)) return $candidate;
-    }
-    return '';
-}
-
-function e3dc_config_auto_install_summary($output) {
-    $text = trim((string)$output);
-    $jsonStart = strpos($text, '{');
-    if ($jsonStart !== false) {
-        $decoded = json_decode(substr($text, $jsonStart), true);
-        if (is_array($decoded)) {
-            foreach (['message', 'error'] as $key) {
-                if (!empty($decoded[$key])) return trim((string)$decoded[$key]);
-            }
-            if (!empty($decoded['blocked_reasons']) && is_array($decoded['blocked_reasons'])) {
-                return implode('; ', array_map('strval', $decoded['blocked_reasons']));
-            }
-        }
-    }
-    $text = preg_replace('/\s+/', ' ', $text);
-    if ($text === '') return 'keine Ausgabe vom Installer';
-    if (strlen($text) > 220) return substr($text, 0, 220) . '...';
-    return $text;
-}
-
 function e3dc_config_auto_install_action_label($action) {
     $labels = [
         'install_module' => 'installieren',
@@ -1454,46 +1459,27 @@ function e3dc_run_config_auto_install_job($module, $label, $action = 'install_mo
     if (!in_array($action, $allowedActions, true)) {
         return ['ok' => false, 'module' => $module, 'label' => $label, 'action' => $action, 'message' => 'ungültige Auto-Install-Aktion'];
     }
+    if ((string)$module === 'forecast_evidence') {
+        $activation = e3dcActivateForecastEvidenceService();
+        return [
+            'ok' => !empty($activation['success']),
+            'module' => $module,
+            'label' => $label,
+            'action' => $action,
+            'message' => (string)($activation['message'] ?? 'Aktivierung der PV-Prognosediagnose fehlgeschlagen.'),
+            'forecast_evidence_activation' => $activation,
+        ];
+    }
     if (e3dc_config_auto_install_is_docker()) {
         return ['ok' => false, 'module' => $module, 'label' => $label, 'action' => $action, 'message' => 'Docker-Installation: keine sudo-/systemd-Installation aus der Config. Config speichern und Container neu starten, damit entrypoint.sh die Dienste startet.'];
     }
-    $wrapper = e3dc_find_installer_wrapper_for_config_auto_install();
-    if ($wrapper === '') {
-        return ['ok' => false, 'module' => $module, 'label' => $label, 'action' => $action, 'message' => 'installer_wrapper.sh nicht gefunden'];
-    }
-    $sudoBin = trim((string)@shell_exec('command -v sudo 2>/dev/null'));
-    if ($sudoBin === '') {
-        return ['ok' => false, 'module' => $module, 'label' => $label, 'action' => $action, 'message' => 'sudo ist auf diesem System nicht verfügbar. Bei Docker bitte Config speichern und Container neu starten; bei Bare-Metal die Installationszentrale/Rechte prüfen.'];
-    }
-    $ramdisk = '/var/www/html/ramdisk';
-    if (!is_dir($ramdisk)) @mkdir($ramdisk, 0775, true);
-    $jobFile = $ramdisk . '/web_install_jobs.json';
-    $job = [
-        'action' => $action,
-        'module' => $module,
-        'source' => 'config_auto_install',
-        'created_at' => date('c'),
-    ];
-    $json = json_encode($job, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
-    if ($json === false || @file_put_contents($jobFile, $json) === false) {
-        return ['ok' => false, 'module' => $module, 'label' => $label, 'action' => $action, 'message' => 'Jobdatei konnte nicht geschrieben werden'];
-    }
-    @chmod($jobFile, 0666);
-    $cmd = escapeshellarg($sudoBin) . ' -n ' . escapeshellarg($wrapper) . ' run_write_job 2>&1';
-    $output = @shell_exec($cmd);
-    $summary = e3dc_config_auto_install_summary($output);
-    $decoded = null;
-    $jsonStart = strpos((string)$output, '{');
-    if ($jsonStart !== false) {
-        $candidate = json_decode(substr((string)$output, $jsonStart), true);
-        if (is_array($candidate)) $decoded = $candidate;
-    }
     return [
-        'ok' => is_array($decoded) ? !empty($decoded['success']) : false,
+        'ok' => false,
         'module' => $module,
         'label' => $label,
         'action' => $action,
-        'message' => $summary,
+        'privileged_installer_web_enabled' => false,
+        'message' => 'Konfiguration wurde gespeichert. Die automatische privilegierte Dienständerung ist bis zu einem eigenen engen Launcher deaktiviert; bitte den Dienst administrativ installieren, aktivieren oder neu starten.',
     ];
 }
 
@@ -2156,7 +2142,7 @@ if (in_array(($_GET['config_action'] ?? ''), ['download', 'download_redacted'], 
 }
 
 /* --- POST-LOGIK --- */
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+if ($configEditorRequestMethod === 'POST') {
     if (($_POST['config_action'] ?? '') === 'test_tibber_api') {
         requireWebAuth(false);
         header('Content-Type: application/json; charset=utf-8');
@@ -2307,6 +2293,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         if ($new_wp_type === '2') {
             $guard_warnings = [];
+        }
+
+        if (array_key_exists('shadow_snapshot_token', $posted_values)) {
+            $shadowTokenPosted = trim((string)$posted_values['shadow_snapshot_token']);
+            if ($shadowTokenPosted === '') {
+                // Passwortfeld bleibt absichtlich leer und überschreibt ein
+                // vorhandenes Peer-Geheimnis nicht.
+                unset($posted_values['shadow_snapshot_token']);
+            } elseif (preg_match('/\A[0-9a-fA-F]{64}\z/D', $shadowTokenPosted) !== 1) {
+                unset($posted_values['shadow_snapshot_token']);
+                $config_validation_failed = true;
+                $guard_warnings[] = 'Shadow Snapshot Token nicht gespeichert: erforderlich sind exakt 64 Hex-Zeichen.';
+            } else {
+                $posted_values['shadow_snapshot_token'] = strtolower($shadowTokenPosted);
+            }
         }
 
         foreach (['shadow_sync_interval_s', 'shadow_fetch_timeout_s', 'shadow_snapshot_max_age_s'] as $shadowDefaultKey) {
@@ -2476,6 +2477,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         // Ohne bewusste Änderung bleibt eine vorhandene Array-Konfiguration unverändert.
         unset($posted_values['pv_forecast_topology_config']);
 
+        // Noch nicht freigegeben: Weder UI noch manipulierte POST-Daten dürfen
+        // eine spätere Runtime- oder Plan-Action vorbereiten.
+        $posted_values['storage_forecast_shortfall_aux_ac_charge_enable'] = '0';
+
         foreach ($posted_values as $key => $value) {
             if (is_array($value) || is_object($value)) {
                 continue;
@@ -2588,8 +2593,38 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $message = "<div class='alert alert-success py-2 border-0 mb-3 mx-2 animate__animated animate__fadeIn'>✓ Konfiguration erfolgreich gespeichert.$extra</div>";
             $config = readConfig($v4_config_file_path);
             unset($config['stop']);
+            $pv_topology_ui_state = e3dc_config_editor_pv_topology_ui_state($v4_data);
+            $pv_topology_has_explicit_ui = $pv_topology_ui_state['has_explicit'];
+            $pv_topology_stored_valid_ui = $pv_topology_ui_state['stored_valid'];
+            $pv_topology_raw_ui = $pv_topology_ui_state['raw'];
+            $pv_topology_json_ui = json_encode(
+                $pv_topology_raw_ui,
+                JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES
+            ) ?: '{}';
         } else {
-            $message = "<div class='alert alert-danger py-2 border-0 mb-3 mx-2 animate__animated animate__shakeX'>⚠ Fehler beim Speichern der Konfiguration! (Rechte prüfen)</div>";
+            $failure_details = [];
+            if ($config_load_failed) {
+                $failure_details[] = 'Die vorhandene e3dc_v4.json ist nicht lesbar oder enthält kein gültiges JSON.';
+            }
+            if ($config_validation_failed) {
+                $failure_details = array_merge($failure_details, $guard_warnings);
+            }
+            if (!$config_load_failed && !$config_validation_failed) {
+                clearstatcache(true, $v4_config_file_path);
+                if (!is_writable($v4_config_file_path)) {
+                    $perms = @file_exists($v4_config_file_path)
+                        ? substr(sprintf('%o', fileperms($v4_config_file_path)), -4)
+                        : 'nicht vorhanden';
+                    $failure_details[] = 'Keine Schreibrechte auf e3dc_v4.json (Modus: ' . $perms . ').';
+                } else {
+                    $failure_details[] = 'Die validierte Konfiguration konnte nicht vollständig geschrieben oder bestätigt werden.';
+                }
+            }
+            $failure_details = array_values(array_unique(array_filter(array_map('strval', $failure_details))));
+            $failure_html = $failure_details
+                ? '<div class="small mt-1">' . implode('<br>', array_map('htmlspecialchars', $failure_details)) . '</div>'
+                : '';
+            $message = "<div class='alert alert-danger py-2 border-0 mb-3 mx-2 animate__animated animate__shakeX'>⚠ Konfiguration nicht gespeichert.$failure_html</div>";
         }
     }
 }
@@ -2617,7 +2652,6 @@ $groups = [
         "ww_timer_enable", "wwvon", "wwbis", "ww_normal", "ww_eco", "ww_circ_von", "ww_circ_bis", "ww_circ_on", "ww_circ_off", "ww_circ_boost",
         "wq_min_temp", "rl_source", "manual_boost_min_soc", "manual_boost_max_duration",
         "auto_mode", "grid_start_limit", "pv_boost_delay", "stop_delay_minutes", "wp_min_runtime_min", "wp_restart_block_min",
-        "price_boost_enable", "price_limit", "price_hard_limit", "price_pause_limit", "price_min_duration", "price_max_daily",
         "consumer_priority_order", "consumer_priority_wp_runon_s",
         "pv_pause_enable", "pv_pause_soc", "pv_pause_watt", "pv_pause_timeout_minutes", "pv_pause_min_at", "pv_pause_max_temp_drop", "luxtronik_pause_setpoint_c",
         "matter_bridge"
@@ -2641,7 +2675,9 @@ $groups = [
     "Speicher & Konfiguration" => [
         "speichergroesse", "maximumladeleistung", "maximaleentladeleistung", "einspeiselimit", "ep_reserve_pct",
         "storage_curve_target_mode", "storage_curve_sliding_horizon_enable",
-        "storage_dc_first_charge_limit_enable", "storage_curve_charge_servo_mode",
+        "storage_dc_first_charge_limit_enable",
+        "storage_forecast_shortfall_aux_ac_charge_enable",
+        "storage_curve_charge_servo_mode",
         "storage_target_soc", "storage_morning_soc", "storage_morning_hour", "storage_predump_min_soc",
         "predump_enable", "storage_headroom_discharge_enable",
         "storage_headroom_discharge_daily_limit_pct", "storage_headroom_discharge_cooldown_min",
@@ -2691,6 +2727,8 @@ $groups = [
         "cheap_grid_battery_enable", "cheap_grid_wallbox_enable", "cheap_grid_heatpump_enable", "cheap_grid_heater_enable",
         "cheap_grid_battery_max_soc", "cheap_grid_battery_max_w", "cheap_grid_pv_buffer_pct", "cheap_grid_soc_hysteresis_pct",
         "heat_policy_runtime_enable", "ems_budget_runtime_enable",
+        "price_boost_enable", "heat_price_boost_scope", "heat_price_boost_windows",
+        "price_limit", "price_hard_limit", "price_pause_limit", "price_min_duration", "price_max_daily",
         "heat_heater_grid_boost_enable", "heat_heater_grid_boost_ack", "heat_heater_grid_boost_requires_deficit",
         "heat_heater_grid_boost_price_limit_ct", "heat_heater_grid_boost_max_w",
         "heat_heater_min_temp_c", "heat_heater_max_temp_c", "heat_wp_daily_kwh",
@@ -2726,7 +2764,8 @@ $groups = [
         "direct_marketing_morning_export_target_soc_pct", "direct_marketing_negative_price_no_export",
         "direct_marketing_negative_headroom_enable", "direct_marketing_negative_headroom_lookahead_min",
         "direct_marketing_negative_headroom_min_window_min", "direct_marketing_negative_headroom_min_surplus_wh",
-        "direct_marketing_negative_headroom_buffer_pct", "direct_marketing_low_price_headroom_enable", "direct_marketing_low_price_no_export",
+        "direct_marketing_negative_headroom_buffer_pct", "direct_marketing_low_price_headroom_enable",
+        "direct_marketing_passive_normal_zero_charge_enable", "direct_marketing_low_price_no_export",
         "direct_marketing_keep_headroom_pct", "direct_marketing_negative_price_charge_target_soc_pct",
         "direct_marketing_low_price_curtail_enable", "direct_marketing_low_price_curtail_limit_w",
         "direct_marketing_market_value_solar_enable", "direct_marketing_market_value_solar_source",
@@ -2753,7 +2792,7 @@ $groups = [
     ],
     "HA Master/Slave Cluster" => [
         "ha_mode", "ha_peer_ip", "ha_fail_timeout", "ha_sync_interval", "ha_auto_recover", "ha_auto_failover",
-        "shadow_master_url", "shadow_master_ip", "shadow_sync_interval_s", "shadow_fetch_timeout_s", "shadow_snapshot_max_age_s"
+        "shadow_master_url", "shadow_master_ip", "shadow_snapshot_token", "shadow_sync_interval_s", "shadow_fetch_timeout_s", "shadow_snapshot_max_age_s"
     ],
     "E3DC System-Verbindung" => [
         "server_ip", "server_port", "e3dc_user", "e3dc_password", "aes_password", "wurzelzaehler", "wurzelzaehler_invertiert",
@@ -2767,6 +2806,7 @@ $groups = [
     "Sonstiges" => []
 ];
 $frontendHiddenKeys = [
+    "direct_marketing_e3dc_export_execution_owner",
     "storage_absorb_pct", "storage_release_pct", "storage_hysteresis_cycles",
     "netz_laden_enable", "grid_discharge_enable", "netz_laden_price_limit", "netz_entladen_price_limit",
     "storage_ems_charge_quirk",
@@ -3821,6 +3861,7 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
     </div>
 
     <form method="POST" id="configEditorForm">
+        <?= e3dcCsrfInput() ?>
         <input type="hidden" name="save_all" value="1">
         <input type="hidden" name="config_auto_install_confirmed" id="configAutoInstallConfirmed" value="0">
         <?php
@@ -4235,7 +4276,7 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
         $allGroupKeys = array_map('strtolower', array_merge($frontendHiddenKeys, ...array_values($groups)));
 
         // Render-Funktion für eine Gruppe
-        $renderGroup = function($title, $keys) use ($config, $defaults, $tooltipMap, $eba_groups, $configValidationMarker, $peakEffectiveReservePct, $peakEffectiveStorageKwh, $peakReserveSourceLabel, $v4_config_file_path, $install_path, $configInstallCenterUrl, $pv_topology_raw_ui, $pv_topology_json_ui) {
+        $renderGroup = function($title, $keys) use ($config, $defaults, $tooltipMap, $eba_groups, $configValidationMarker, $peakEffectiveReservePct, $peakEffectiveStorageKwh, $peakReserveSourceLabel, $v4_config_file_path, $install_path, $configInstallCenterUrl, $pv_topology_raw_ui, $pv_topology_json_ui, $pv_topology_has_explicit_ui, $pv_topology_stored_valid_ui) {
             $items = [];
             $groupSearchText = htmlspecialchars(strtolower($title . ' ' . implode(' ', (array)$keys)));
 
@@ -4305,7 +4346,12 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
                 ][$wp_type_val] ?? 'Keine Wärmepumpe';
                 $showWpSourceControls = $isLuxEnabled && in_array($wp_type_val, ['0','1'], true);
                 $showShellySgControls = $isLuxEnabled && in_array($wp_type_val, ['-1','0'], true);
-                $showWpBoostControls = $isLuxEnabled && $autoModeEnabled && in_array($wp_type_val, ['-1','0','1'], true);
+                $shellySgConfigured = !in_array(strtolower(trim((string)$val('shelly_sg_ip'))), ['', '0', '0.0.0.0'], true);
+                $wpPriceBoostSeparateTargets = in_array($wp_type_val, ['0', '1'], true);
+                $wpPriceBoostControllable = $wpPriceBoostSeparateTargets
+                    || $wp_type_val === '5'
+                    || $shellySgConfigured;
+                $showWpBoostControls = $isLuxEnabled && $autoModeEnabled && $wpPriceBoostControllable;
 
                 $groupTitle = ($isLuxEnabled || $isClimateEnabled) ? "Smart Home & Verbrauchsprognose" : "Smart Home Monitoring (aus)";
         ?>
@@ -5154,40 +5200,6 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
                     <strong>Speicher-Entladung:</strong> Morgen-Boost und die frühere Verbrauchsoptimierung sind im Energy Manager abgelöst.
                     Pre-Dump, Ladekurve und Wetterreaktion werden jetzt zentral durch Storage Manager und Storage Simulator geregelt.
                 </div>
-
-                <?php if ($showWpBoostControls): ?>
-                <h6 class="text-muted small fw-bold mt-4 mb-2 border-bottom pb-1">Strompreis-Boost (aWATTar/Tibber)</h6>
-                <div class="form-check form-switch mb-2 config-item border-0 p-0 ps-5">
-                    <input type="hidden" name="values[price_boost_enable]" value="0">
-                    <input class="form-check-input" type="checkbox" name="values[price_boost_enable]" value="1" id="conf_pb" <?= $isTrue('price_boost_enable') ? 'checked' : '' ?> style="transform: scale(1.2); margin-left: -2.5em;">
-                    <label class="form-check-label ms-2 config-label" for="conf_pb" data-tooltip="<?= htmlspecialchars($tooltipMap['price_boost_enable'] ?? '') ?>">Strompreis-Boost aktivieren</label>
-                </div>
-                <div class="row g-2 mb-2">
-                    <div class="col-4 col-md-2">
-                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['price_limit'] ?? '') ?>">Preis-Limit (ct)</label>
-                        <input type="number" step="0.1" name="values[price_limit]" class="form-control config-input" value="<?= $val('price_limit') ?>">
-                        <?= $configValidationMarker('price_limit') ?>
-                    </div>
-                    <div class="col-4 col-md-2">
-                        <label class="config-label text-success" data-tooltip="<?= htmlspecialchars($tooltipMap['price_hard_limit'] ?? '') ?>">Zwangs-Limit (ct)</label>
-                        <input type="number" step="0.1" name="values[price_hard_limit]" class="form-control config-input" value="<?= $val('price_hard_limit') ?>">
-                        <?= $configValidationMarker('price_hard_limit') ?>
-                    </div>
-                    <div class="col-4 col-md-2">
-                        <label class="config-label text-danger" data-tooltip="<?= htmlspecialchars($tooltipMap['price_pause_limit'] ?? '') ?>">Sperr-Limit (ct)</label>
-                        <input type="number" step="0.1" name="values[price_pause_limit]" class="form-control config-input" value="<?= $val('price_pause_limit') ?>" placeholder="<?= $defaults['price_pause_limit'] ?>">
-                        <?= $configValidationMarker('price_pause_limit') ?>
-                    </div>
-                    <div class="col-6 col-md-3">
-                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['price_min_duration'] ?? '') ?>">Min. Dauer (Min)</label>
-                        <input type="number" name="values[price_min_duration]" class="form-control config-input" value="<?= $val('price_min_duration') ?>">
-                    </div>
-                    <div class="col-6 col-md-3">
-                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['price_max_daily'] ?? '') ?>">Max. pro Tag (Min)</label>
-                        <input type="number" name="values[price_max_daily]" class="form-control config-input" value="<?= $val('price_max_daily') ?>">
-                    </div>
-                </div>
-                <?php endif; ?>
 
                 <h6 class="text-muted small fw-bold mt-4 mb-2 border-bottom pb-1">Manuelle Steuerung & Schutz</h6>
                 <div class="row g-2 mb-2">
@@ -6079,11 +6091,15 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
                                 <div class="row g-2">
                                     <div class="col-12 col-lg-6">
                                         <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['shadow_master_url'] ?? '') ?>">Shadow Master URL</label>
-                                        <input type="text" name="values[shadow_master_url]" class="form-control config-input" value="<?= $val('shadow_master_url') ?>" placeholder="http://192.0.2.10">
+                                        <input type="text" name="values[shadow_master_url]" class="form-control config-input" value="<?= $val('shadow_master_url') ?>" placeholder="http://192.168.1.10">
+                                    </div>
+                                    <div class="col-12 col-lg-6">
+                                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['shadow_snapshot_token'] ?? '') ?>">Shadow Snapshot Token</label>
+                                        <input type="password" name="values[shadow_snapshot_token]" class="form-control config-input" value="" autocomplete="new-password" spellcheck="false" placeholder="<?= trim((string)$val('shadow_snapshot_token')) !== '' ? 'gesetzt – leer lassen = unverändert' : '64 Hex-Zeichen' ?>">
                                     </div>
                                     <div class="col-12 col-md-6 col-lg-3">
                                         <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['shadow_master_ip'] ?? '') ?>">Shadow Master IP</label>
-                                        <input type="text" name="values[shadow_master_ip]" class="form-control config-input" value="<?= $val('shadow_master_ip') ?>" placeholder="192.0.2.10">
+                                        <input type="text" name="values[shadow_master_ip]" class="form-control config-input" value="<?= $val('shadow_master_ip') ?>" placeholder="192.168.1.10">
                                     </div>
                                     <div class="col-12 col-md-6 col-lg-3">
                                         <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['shadow_snapshot_max_age_s'] ?? '') ?>">Snapshot-Alter (s)</label>
@@ -6161,10 +6177,24 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
                 $showDynamicPriceSettings = $showEpexSettings || $showTibberSettings;
                 $showEntsoeSettings = $showTibberSettings || ($showEpexSettings && in_array($val('tariff_provider'), ['smard', 'entsoe'], true));
                 $showMarketSettings = $showDynamicPriceSettings || $showOctopusPrices || $showSpecialPrices;
-                $showCheapGridBoost = $showDynamicPriceSettings || $showOctopusPrices;
+                $showCheapGridBoost = $showDynamicPriceSettings;
+                $priceBoostWpType = trim((string)($config['wp_type']['value'] ?? ($defaults['wp_type'] ?? '-1')));
+                $priceBoostShellySgConfigured = !in_array(
+                    strtolower(trim((string)($config['shelly_sg_ip']['value'] ?? ''))),
+                    ['', '0', '0.0.0.0'],
+                    true
+                );
+                $wpPriceBoostSeparateTargets = in_array($priceBoostWpType, ['0', '1'], true);
+                $showWpBoostControls = $isTrue('luxtronik')
+                    && $isTrue('auto_mode')
+                    && (
+                        $wpPriceBoostSeparateTargets
+                        || $priceBoostWpType === '5'
+                        || $priceBoostShellySgConfigured
+                    );
                 $acStorageModeStored = strtolower(trim((string)($config['direct_marketing_aux_inverter_ac_storage_mode']['value'] ?? '')));
                 $acStorageModeLegacy = $isTrue('direct_marketing_aux_inverter_ac_storage_enable');
-                $acStorageModeUi = in_array($acStorageModeStored, ['off', 'reserve_only', 'economic'], true)
+                $acStorageModeUi = in_array($acStorageModeStored, ['off', 'reserve_only', 'house_supply', 'economic'], true)
                     ? $acStorageModeStored
                     : ($acStorageModeLegacy ? 'reserve_only' : 'off');
         ?>
@@ -6329,6 +6359,12 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
                                 <?= $configValidationMarker('peak_shaving_max_discharge_w') ?>
                             </div>
                             <div class="col-12">
+                                <div class="alert alert-info border-info-subtle py-2 mb-0 small" id="peak_shaving_wallbox_note">
+                                    <strong>Wallboxen werden mitgeführt:</strong>
+                                    Die gemeinsame Wallboxleistung erhält nur den Restspielraum, der nach Grundlast und bisherigem Netzbezug in der laufenden Zähler-Viertelstunde verbleibt. PV-Überschuss wird dabei nicht als Lastspitze behandelt. Reicht der Spielraum nicht, wird zuerst die flexible Wallboxleistung begrenzt; die harte Hausanschlussgrenze gilt zusätzlich. Bei fehlender lückenloser Messhistorie wird kein Viertelstunden-Spielraum erfunden.
+                                </div>
+                            </div>
+                            <div class="col-12">
                                 <div class="alert alert-info border-info-subtle py-2 mb-0 small" id="peak_shaving_reserve_summary"
                                      data-ep-reserve-pct="<?= htmlspecialchars((string)($peakEffectiveReservePct ?? $val('ep_reserve_pct'))) ?>"
                                      data-ep-reserve-source="<?= htmlspecialchars($peakReserveSourceLabel) ?>"
@@ -6426,10 +6462,12 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
                                 <?= $configValidationMarker('market_safety_correction_ct_per_kwh') ?>
                             </div>
                             <div>
-                                <div class="form-check form-switch">
-                                    <input type="hidden" name="values[market_autarky_first_enable]" value="0">
-                                    <input class="form-check-input" type="checkbox" name="values[market_autarky_first_enable]" value="1" id="conf_market_autarky_first_enable" <?= $isTrue('market_autarky_first_enable') ? 'checked' : '' ?>>
-                                    <label class="form-check-label config-label" for="conf_market_autarky_first_enable" data-tooltip="<?= htmlspecialchars($tooltipMap['market_autarky_first_enable'] ?? '') ?>">PV-autark zuerst</label>
+                                <div class="d-flex align-items-start gap-2">
+                                    <i class="fas fa-shield-halved text-success mt-1"></i>
+                                    <div>
+                                        <div class="config-label fw-bold" data-tooltip="<?= htmlspecialchars($tooltipMap['market_autarky_first_enable'] ?? '') ?>">PV-autark zuerst</div>
+                                        <div class="small text-muted">Feste Schutzinvariante: Bei ausreichender Speicher-/PV-Deckung bleibt der normale Marktpfad blockiert.</div>
+                                    </div>
                                 </div>
                                 <?= $configValidationMarker('market_autarky_first_enable') ?>
                             </div>
@@ -6515,7 +6553,7 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
                             <div class="col-lg-4">
                                 <div class="p-2 rounded-3 border border-info-subtle h-100" data-market-heatpump-route>
                                     <div class="small fw-bold text-info"><i class="fas fa-fire-flame-simple me-1"></i>Wärmepumpe</div>
-                                    <div class="small text-muted">Separater Negativpreis-Boost mit Taktschutz; kein normaler Marktpfad.</div>
+                                    <div class="small text-muted">Preis-Boost, Wärmeziel und Zeitfenster werden zentral im Wärmepumpenbereich festgelegt.</div>
                                 </div>
                             </div>
                         </div>
@@ -6611,7 +6649,6 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
                                 <?php foreach ([
                                     'cheap_grid_battery_enable' => ['Speicher', 'fa-battery-half'],
                                     'cheap_grid_wallbox_enable' => ['Wallbox', 'fa-charging-station'],
-                                    'cheap_grid_heatpump_enable' => ['Wärmepumpe', 'fa-fire-flame-simple'],
                                     'cheap_grid_heater_enable' => ['Heizstab', 'fa-temperature-high'],
                                 ] as $ck => $meta): ?>
                                 <div class="form-check form-switch">
@@ -6648,7 +6685,7 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
                             <div class="d-flex flex-wrap align-items-start justify-content-between gap-2 p-3 rounded-3 border border-info-subtle" style="background: rgba(14,165,233,0.08);">
                                 <div>
                                     <div class="fw-bold text-info"><i class="fas fa-route me-2"></i>Wärme in die Gesamtplanung einbeziehen</div>
-                                    <div class="small text-muted mt-1">Aus: Wärmepumpe und Heizstab laufen nach der bisherigen sicheren Regelung. Ein: Die gemeinsame Planung darf Wärme-Starts und einen ausdrücklich freigegebenen Heizstab-Netzboost begrenzen.</div>
+                                    <div class="small text-muted mt-1">Aus: Wärmepumpe und Heizstab laufen nach der bisherigen sicheren Regelung. Ein: Die gemeinsame Planung darf Wärme-Starts und einen ausdrücklich freigegebenen Heizstab-Netzboost begrenzen. Dieser Schalter allein aktiviert keine Wärmepumpen-Preisverschiebung.</div>
                                 </div>
                                 <div class="form-check form-switch m-0">
                                     <input type="hidden" name="values[heat_policy_runtime_enable]" value="0">
@@ -6657,6 +6694,106 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
                                 </div>
                             </div>
                         </div>
+
+                        <?php if ($showWpBoostControls): ?>
+                        <div class="col-12">
+                            <div class="p-3 rounded-3 border border-info-subtle" id="heat_price_boost_controls" style="background: rgba(14,165,233,0.05);">
+                                <div class="d-flex flex-wrap align-items-start justify-content-between gap-3">
+                                    <div class="flex-grow-1">
+                                        <div class="fw-bold text-info"><i class="fas fa-clock-rotate-left me-2"></i>Wärmepumpen-Preisverschiebung</div>
+                                        <div class="small text-muted mt-1">
+                                            Candidate/Shadow: Günstige Wärmefenster werden nur bewertet. Eine Wirkung setzt eine gültige Wärme-/PV-Prognose, vollständige Horizont-Evidenz und einen gebundenen <code>heat_intent_v1</code>-Aktivierungsvertrag voraus; bis dahin bleibt die Auswahl effektiv aus.
+                                        </div>
+                                    </div>
+                                    <div class="form-check form-switch m-0">
+                                        <input type="hidden" name="values[price_boost_enable]" value="0">
+                                        <input class="form-check-input" type="checkbox" name="values[price_boost_enable]" value="1" id="conf_price_boost_enable" <?= $isTrue('price_boost_enable') ? 'checked' : '' ?>>
+                                        <label class="form-check-label ms-2 config-label" for="conf_price_boost_enable" data-tooltip="<?= htmlspecialchars($tooltipMap['price_boost_enable'] ?? '') ?>">als Candidate anfordern</label>
+                                        <?= $configValidationMarker('price_boost_enable') ?>
+                                    </div>
+                                </div>
+
+                                <div class="row g-3 mt-1">
+                                    <div class="col-md-3">
+                                        <label class="config-label" for="conf_heat_price_boost_scope" data-tooltip="<?= htmlspecialchars($tooltipMap['heat_price_boost_scope'] ?? '') ?>">Wärmeziel</label>
+                                        <select class="form-select config-input" name="values[heat_price_boost_scope]" id="conf_heat_price_boost_scope">
+                                            <option value="both" <?= $val('heat_price_boost_scope') === 'both' ? 'selected' : '' ?>>Heizung und Warmwasser</option>
+                                            <?php if ($wpPriceBoostSeparateTargets): ?>
+                                            <option value="heating" <?= $val('heat_price_boost_scope') === 'heating' ? 'selected' : '' ?>>Nur Heizung</option>
+                                            <option value="dhw" <?= $val('heat_price_boost_scope') === 'dhw' ? 'selected' : '' ?>>Nur Warmwasser</option>
+                                            <?php endif; ?>
+                                        </select>
+                                        <?= $configValidationMarker('heat_price_boost_scope') ?>
+                                    </div>
+                                    <div class="col-md-5">
+                                        <label class="config-label" for="conf_heat_price_boost_windows" data-tooltip="<?= htmlspecialchars($tooltipMap['heat_price_boost_windows'] ?? '') ?>">Erlaubte Zeitfenster</label>
+                                        <textarea class="form-control config-input" name="values[heat_price_boost_windows]" id="conf_heat_price_boost_windows" rows="2" placeholder="02:00-06:00&#10;12:00-16:00"><?= $val('heat_price_boost_windows') ?></textarea>
+                                        <div class="form-text">Leer bedeutet ganztägige Shadow-Auswertung; je Zeile <code>HH:MM-HH:MM</code>.</div>
+                                        <?= $configValidationMarker('heat_price_boost_windows') ?>
+                                    </div>
+                                    <div class="col-md-4">
+                                        <div class="p-2 rounded-3 border border-danger-subtle h-100">
+                                            <div class="small fw-bold text-danger"><i class="fas fa-plug-circle-bolt me-1"></i>Negativpreis-Sonderpfad – getrennte Freigabe</div>
+                                            <div class="form-check form-switch mt-2">
+                                                <input type="hidden" name="values[cheap_grid_heatpump_enable]" value="0">
+                                                <input class="form-check-input" type="checkbox" name="values[cheap_grid_heatpump_enable]" value="1" id="conf_cheap_grid_heatpump_enable" <?= $isTrue('cheap_grid_heatpump_enable') ? 'checked' : '' ?>>
+                                                <label class="form-check-label config-label" for="conf_cheap_grid_heatpump_enable" data-tooltip="<?= htmlspecialchars($tooltipMap['cheap_grid_heatpump_enable'] ?? '') ?>">Wärmepumpe bei echtem Negativpreis prüfen</label>
+                                            </div>
+                                            <div class="small text-muted mt-1">Nur echte Börsenpreistarife liefern belastbare Negativpreis-Slots. Diese Freigabe öffnet keinen allgemeinen Günstigpreis-Pfad.</div>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <div class="row g-3 mt-1">
+                                    <div class="col-6 col-md-2">
+                                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['price_limit'] ?? '') ?>">Preis-Limit</label>
+                                        <div class="input-group">
+                                            <input type="number" step="0.1" name="values[price_limit]" class="form-control config-input" value="<?= $val('price_limit') ?>">
+                                            <span class="input-group-text bg-body-tertiary">ct/kWh</span>
+                                        </div>
+                                        <?= $configValidationMarker('price_limit') ?>
+                                    </div>
+                                    <div class="col-6 col-md-2">
+                                        <label class="config-label text-success" data-tooltip="<?= htmlspecialchars($tooltipMap['price_hard_limit'] ?? '') ?>">Sehr günstig</label>
+                                        <div class="input-group">
+                                            <input type="number" step="0.1" name="values[price_hard_limit]" class="form-control config-input" value="<?= $val('price_hard_limit') ?>">
+                                            <span class="input-group-text bg-body-tertiary">ct/kWh</span>
+                                        </div>
+                                        <?= $configValidationMarker('price_hard_limit') ?>
+                                    </div>
+                                    <div class="col-6 col-md-2">
+                                        <label class="config-label text-danger" data-tooltip="<?= htmlspecialchars($tooltipMap['price_pause_limit'] ?? '') ?>">Sperr-Limit</label>
+                                        <div class="input-group">
+                                            <input type="number" step="0.1" name="values[price_pause_limit]" class="form-control config-input" value="<?= $val('price_pause_limit') ?>" placeholder="<?= $defaults['price_pause_limit'] ?>">
+                                            <span class="input-group-text bg-body-tertiary">ct/kWh</span>
+                                        </div>
+                                        <?= $configValidationMarker('price_pause_limit') ?>
+                                    </div>
+                                    <div class="col-6 col-md-3">
+                                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['price_min_duration'] ?? '') ?>">Mindestdauer</label>
+                                        <div class="input-group">
+                                            <input type="number" min="0" name="values[price_min_duration]" class="form-control config-input" value="<?= $val('price_min_duration') ?>">
+                                            <span class="input-group-text bg-body-tertiary">min</span>
+                                        </div>
+                                    </div>
+                                    <div class="col-6 col-md-3">
+                                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['price_max_daily'] ?? '') ?>">Tagesmaximum</label>
+                                        <div class="input-group">
+                                            <input type="number" min="0" name="values[price_max_daily]" class="form-control config-input" value="<?= $val('price_max_daily') ?>">
+                                            <span class="input-group-text bg-body-tertiary">min</span>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        <?php else: ?>
+                        <div class="col-12">
+                            <div class="alert alert-secondary border-secondary-subtle mb-0">
+                                <div class="fw-bold"><i class="fas fa-eye me-2"></i>Wärmepumpen-Preisverschiebung nicht steuerbar</div>
+                                <div class="small mt-1">Für die gewählte Anlagenart ist kein passender Wärmeaktor gebunden. Die Tarifdaten bleiben sichtbar, erzeugen aber keinen Wärme-Candidate und keinen Aktorbefehl.</div>
+                            </div>
+                        </div>
+                        <?php endif; ?>
 
                         <div class="col-12">
                             <div class="alert alert-warning border-warning-subtle mb-0">
@@ -7282,13 +7419,14 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
                             <div class="d-flex flex-wrap align-items-start justify-content-between gap-2">
                                 <div>
                                     <div class="fw-bold text-success"><i class="fas fa-solar-panel me-2"></i>Speichern aus einem AC-Zusatzwechselrichter</div>
-                                    <div class="small text-muted mt-1">E3DC-DC-PV bleibt die bevorzugte Ladequelle. Eine AC-Route wird nur mit dieser eigenen Freigabe und einem belegten Energiebedarf genutzt; Netzladen wird dadurch nicht erlaubt.</div>
+                                    <div class="small text-muted mt-1">E3DC-DC-PV bleibt die einzige wirksame Ladequelle. Die gewünschte Zusatz-AC-Route kann bereits gespeichert werden, bleibt aber EVIDENCE_LIMIT, bis eine kalibrierte gemeinsame Horizontverteilung erzeugt wird und die Risikoschwelle fachlich beschlossen ist. So bleibt auch eine eigene oder hohe Einspeisevergütung unangetastet; Netzladen wird dadurch nie erlaubt.</div>
                                 </div>
                                 <div style="min-width: min(100%, 19rem);">
                                     <label class="config-label" for="conf_direct_marketing_aux_inverter_ac_storage_mode" data-tooltip="<?= htmlspecialchars($tooltipMap['direct_marketing_aux_inverter_ac_storage_mode'] ?? '') ?>">AC-Speicherroute</label>
                                     <select class="form-select config-input" name="values[direct_marketing_aux_inverter_ac_storage_mode]" id="conf_direct_marketing_aux_inverter_ac_storage_mode">
                                         <option value="off" <?= $acStorageModeUi === 'off' ? 'selected' : '' ?>>Aus – nur E3DC-DC-PV einplanen</option>
-                                        <option value="reserve_only" <?= $acStorageModeUi === 'reserve_only' ? 'selected' : '' ?>>Nur notwendige Reserve sichern</option>
+                                        <option value="reserve_only" <?= $acStorageModeUi === 'reserve_only' ? 'selected' : '' ?>>Nur konfigurierte Reserve sichern</option>
+                                        <option value="house_supply" <?= $acStorageModeUi === 'house_supply' ? 'selected' : '' ?>>Reserve und prognostizierte Hausversorgung sichern</option>
                                         <option value="economic" <?= $acStorageModeUi === 'economic' ? 'selected' : '' ?>>Bei wirtschaftlichem Vorteil freigeben</option>
                                     </select>
                                     <?= $configValidationMarker('direct_marketing_aux_inverter_ac_storage_mode') ?>
@@ -7298,11 +7436,12 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
                                 <summary class="small fw-bold text-success">Technische Grenzen der AC-Route</summary>
                                 <div class="row g-3 mt-1">
                                     <div class="col-md-4">
-                                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['direct_marketing_aux_inverter_ac_forecast_confidence_pct'] ?? '') ?>">Mindest-Prognosevertrauen</label>
+                                        <label class="config-label" for="conf_direct_marketing_aux_inverter_ac_forecast_confidence_pct" data-tooltip="<?= htmlspecialchars($tooltipMap['direct_marketing_aux_inverter_ac_forecast_confidence_pct'] ?? '') ?>">Legacy-Punktwert <span class="badge text-bg-secondary">nur Diagnose</span></label>
                                         <div class="input-group">
-                                            <input type="number" min="0" max="100" step="1" name="values[direct_marketing_aux_inverter_ac_forecast_confidence_pct]" class="form-control config-input" value="<?= $val('direct_marketing_aux_inverter_ac_forecast_confidence_pct') ?>">
+                                            <input type="number" min="0" max="100" step="1" name="values[direct_marketing_aux_inverter_ac_forecast_confidence_pct]" id="conf_direct_marketing_aux_inverter_ac_forecast_confidence_pct" class="form-control config-input bg-body-tertiary" value="<?= $val('direct_marketing_aux_inverter_ac_forecast_confidence_pct') ?>" readonly aria-readonly="true" aria-describedby="conf_direct_marketing_aux_inverter_ac_forecast_confidence_note">
                                             <span class="input-group-text bg-body-tertiary">%</span>
                                         </div>
+                                        <div id="conf_direct_marketing_aux_inverter_ac_forecast_confidence_note" class="text-muted mt-1" style="font-size:0.72rem;">Keine Steuerwirkung: Dieser Punktwert ist weder ein Quantil noch die Risikoschwelle.</div>
                                         <?= $configValidationMarker('direct_marketing_aux_inverter_ac_forecast_confidence_pct') ?>
                                     </div>
                                     <div class="col-md-4">
@@ -7508,6 +7647,7 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
                                 'direct_marketing_negative_price_no_export' => ['Kein Verkauf bei Negativpreis', 'fa-ban', 'text-success', 'eco eco_plus'],
                                 'direct_marketing_negative_headroom_enable' => ['Headroom vor Negativpreis', 'fa-battery-empty', 'text-success', 'eco eco_plus'],
                                 'direct_marketing_low_price_headroom_enable' => ['Headroom vor Billigpreis', 'fa-battery-empty', 'text-success', 'eco eco_plus'],
+                                'direct_marketing_passive_normal_zero_charge_enable' => ['Gebundene Hausversorgung: Laden 0 W', 'fa-link', 'text-warning', 'eco_plus'],
                                 'direct_marketing_low_price_no_export' => ['Kein Verkauf bei Billigpreis', 'fa-circle-dollar-to-slot', 'text-success', 'eco eco_plus'],
                             ] as $dk => $meta): ?>
                             <div class="form-check form-switch" data-dv-mode="<?= htmlspecialchars($meta[3]) ?>">
@@ -7873,7 +8013,14 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
                     const reg = await navigator.serviceWorker.register('sw.js?v=' + Date.now());
 
                     renderConfigStatus(status, '3/6 Lade E3DC Zertifikat (VAPID)...', '', 'fas fa-spinner fa-spin');
-                    const res = await fetch('webpush_api.php?action=get_vapid');
+                    const res = await fetch('webpush_api.php?action=get_vapid', {
+                        method: 'POST',
+                        credentials: 'same-origin',
+                        headers: {
+                            'X-Requested-With': 'XMLHttpRequest',
+                            'X-CSRF-Token': <?= json_encode(e3dcCsrfToken()) ?>
+                        }
+                    });
                     const vapidData = await res.json();
 
                     if (vapidData.error) {
@@ -7902,7 +8049,12 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
 
                     const saveRes = await fetch('webpush_api.php?action=subscribe', {
                         method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
+                        credentials: 'same-origin',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'X-Requested-With': 'XMLHttpRequest',
+                            'X-CSRF-Token': <?= json_encode(e3dcCsrfToken()) ?>
+                        },
                         body: JSON.stringify(subData)
                     });
 
@@ -7959,7 +8111,14 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
                 const status = document.getElementById('push-status');
                 renderConfigStatus(status, 'Sende Testnachricht...', '', 'fas fa-spinner fa-spin');
                 try {
-                    const res = await fetch('webpush_api.php?action=test_push');
+                    const res = await fetch('webpush_api.php?action=test_push', {
+                        method: 'POST',
+                        credentials: 'same-origin',
+                        headers: {
+                            'X-Requested-With': 'XMLHttpRequest',
+                            'X-CSRF-Token': <?= json_encode(e3dcCsrfToken()) ?>
+                        }
+                    });
                     const json = await res.json();
                     if(json.success) {
                         renderConfigStatus(status, 'Testnachricht erfolgreich versendet! (' + String(json.count ?? 0) + ' Geräte)', 'text-success', 'fas fa-check');
@@ -8692,11 +8851,31 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
                                     <label class="form-check-label config-label fw-bold text-success"
                                            for="conf_storage_dc_first_charge_limit_enable"
                                            data-tooltip="<?= htmlspecialchars($tooltipMap['storage_dc_first_charge_limit_enable'] ?? '') ?>">
-                                        <i class="fas fa-solar-panel me-1"></i>Laden an E3DC-PV koppeln
+                                        <i class="fas fa-solar-panel me-1"></i>Speicherladung auf E3DC-DC begrenzen
                                     </label>
                                 </div>
                                 <div class="text-muted" style="font-size:0.72rem;">
-                                    Geplante Speicherladung erhält nur einen sanften Laderahmen bis zur aktuellen E3DC-PV-Leistung. Entladen bleibt offen; ein Zusatzwechselrichter erhöht diesen Rahmen nicht.
+                                    Geplante Kurvenladung und DV-PV-Speichern erhalten nur einen sanften Laderahmen aus der aktuellen E3DC-DC-PV. Entladen bleibt offen; Zusatz-AC ist standardmäßig ausgeschlossen.
+                                </div>
+                                <div class="form-check form-switch mt-2 mb-1" data-storage-aux-ac-option>
+                                    <input type="hidden" name="values[storage_forecast_shortfall_aux_ac_charge_enable]" value="0">
+                                    <input class="form-check-input config-input" type="checkbox"
+                                           name="values[storage_forecast_shortfall_aux_ac_charge_enable]"
+                                           value="1"
+                                           id="conf_storage_forecast_shortfall_aux_ac_charge_enable"
+                                           data-storage-aux-ac-toggle
+                                           disabled aria-disabled="true">
+                                    <label class="form-check-label config-label fw-bold text-warning"
+                                           for="conf_storage_forecast_shortfall_aux_ac_charge_enable"
+                                           data-tooltip="<?= htmlspecialchars($tooltipMap['storage_forecast_shortfall_aux_ac_charge_enable'] ?? '') ?>">
+                                        <i class="fas fa-plug-circle-bolt me-1"></i>Nicht freigegeben: Zusatz-AC bei probabilistisch belegtem DC-Defizit
+                                    </label>
+                                </div>
+                                <div class="text-muted" data-storage-aux-ac-hint style="font-size:0.72rem;">
+                                    Nur für die Prognose-100-Ladekurve: Getrennte PV- und Lastquantile dürfen nicht verrechnet werden. Erforderlich ist eine historisch kalibrierte gemeinsame Horizontverteilung der tatsächlich im Speicher ankommenden E3DC-DC-Energie einschließlich Last, zeitlicher Abhängigkeit und Ladeannahme. Schlechte oder fehlende Daten zählen nicht als Minderertrag; Netzbezug bleibt gesperrt. Die DV-Zusatzwechselrichter-Auswahl bleibt getrennt.
+                                </div>
+                                <div class="small text-warning mt-1" data-storage-aux-ac-evidence-note>
+                                    Die Option ist nicht auswählbar. Bis ein Joint-Horizon-Produzent vorhanden und die Risikoschwelle fachlich beschlossen ist, bleibt sie EVIDENCE_LIMIT; wirksam bleibt E3DC_DC_ONLY.
                                 </div>
                             </div>
                         </div>
@@ -9446,7 +9625,8 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
                             </label>
                         </div>
                         <div class="small text-body-secondary mt-2">
-                            Aus ist der Standard. Ein liest ausschließlich bereits vorhandene Prognosen und Messwerte aus und bewertet deren Abweichung.
+                            Aus ist der Standard. <strong>Ein</strong> liest ausschließlich bereits vorhandene E3/DC-DC-Punktprognosen und Messwerte aus und bewertet deren Abweichung insgesamt sowie nach Erfassungs-Vorlauf.
+                            Die Punktprognose wird dabei nicht als P50 ausgegeben; Quellen ohne eigenes gültiges Forecast-/Ist-Paar bleiben sichtbar unbewertet.
                             Die Diagnose ändert keine Speicherregelung, wählt kein Modell aus und schreibt keine erlernten Werte in Deine Konfiguration.
                         </div>
                         <details class="mt-2">
@@ -9604,7 +9784,7 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
                                     <input type="text" name="values[solcast_resource_id]" class="form-control config-input"
                                         value="<?= htmlspecialchars($config['solcast_resource_id']['value'] ?? '') ?>"
                                         placeholder="Resource ID Ausrichtung 1" style="font-size:0.78rem; font-family:monospace;">
-                                    <select name="values[solcast_api_slot_fc1]" class="form-select config-input solcast-account-select" data-solcast-site="FC1">
+                                    <select name="values[solcast_api_slot_fc1]" class="form-select config-input solcast-account-select" data-solcast-site="FC1" data-effective-account="<?= (int)$solcastFc1Mapping['effective'] ?>">
                                         <option value="" <?= $solcastFc1Slot === '' ? 'selected' : '' ?>>Legacy → Konto 1</option>
                                         <option value="1" <?= $solcastFc1Slot === '1' ? 'selected' : '' ?>>Konto 1</option>
                                         <option value="2" <?= $solcastFc1Slot === '2' ? 'selected' : '' ?>>Konto 2</option>
@@ -9621,7 +9801,7 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
                                     <input type="text" name="values[solcast_resource_id_2]" class="form-control config-input"
                                         value="<?= htmlspecialchars($config['solcast_resource_id_2']['value'] ?? '') ?>"
                                         placeholder="Resource ID Ausrichtung 2" style="font-size:0.78rem; font-family:monospace;">
-                                    <select name="values[solcast_api_slot_fc2]" class="form-select config-input solcast-account-select" data-solcast-site="FC2">
+                                    <select name="values[solcast_api_slot_fc2]" class="form-select config-input solcast-account-select" data-solcast-site="FC2" data-effective-account="<?= (int)$solcastFc2Mapping['effective'] ?>">
                                         <option value="" <?= $solcastFc2Slot === '' ? 'selected' : '' ?>>Legacy → Konto <?= $solcastLegacySecondarySlot ?></option>
                                         <option value="1" <?= $solcastFc2Slot === '1' ? 'selected' : '' ?>>Konto 1</option>
                                         <option value="2" <?= $solcastFc2Slot === '2' ? 'selected' : '' ?>>Konto 2</option>
@@ -9638,7 +9818,7 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
                                     <input type="text" name="values[solcast_resource_id_3]" class="form-control config-input"
                                         value="<?= htmlspecialchars($config['solcast_resource_id_3']['value'] ?? '') ?>"
                                         placeholder="Resource ID Ausrichtung 3" style="font-size:0.78rem; font-family:monospace;">
-                                    <select name="values[solcast_api_slot_fc3]" class="form-select config-input solcast-account-select" data-solcast-site="FC3">
+                                    <select name="values[solcast_api_slot_fc3]" class="form-select config-input solcast-account-select" data-solcast-site="FC3" data-effective-account="<?= (int)$solcastFc3Mapping['effective'] ?>">
                                         <option value="" <?= $solcastFc3Slot === '' ? 'selected' : '' ?>>Legacy → Konto <?= $solcastLegacySecondarySlot ?></option>
                                         <option value="1" <?= $solcastFc3Slot === '1' ? 'selected' : '' ?>>Konto 1</option>
                                         <option value="2" <?= $solcastFc3Slot === '2' ? 'selected' : '' ?>>Konto 2</option>
@@ -9655,7 +9835,7 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
                                     <input type="text" name="values[solcast_resource_id_4]" class="form-control config-input"
                                         value="<?= htmlspecialchars($config['solcast_resource_id_4']['value'] ?? '') ?>"
                                         placeholder="Resource ID Ausrichtung 4" style="font-size:0.78rem; font-family:monospace;">
-                                    <select name="values[solcast_api_slot_fc4]" class="form-select config-input solcast-account-select" data-solcast-site="FC4">
+                                    <select name="values[solcast_api_slot_fc4]" class="form-select config-input solcast-account-select" data-solcast-site="FC4" data-effective-account="<?= (int)$solcastFc4Mapping['effective'] ?>">
                                         <option value="" <?= $solcastFc4Slot === '' ? 'selected' : '' ?>>Legacy → Konto <?= $solcastLegacySecondarySlot ?></option>
                                         <option value="1" <?= $solcastFc4Slot === '1' ? 'selected' : '' ?>>Konto 1</option>
                                         <option value="2" <?= $solcastFc4Slot === '2' ? 'selected' : '' ?>>Konto 2</option>
@@ -9693,8 +9873,8 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
                             </div>
                         </div>
                         <div class="mt-4 p-3 rounded-3 border border-info-subtle" id="pv-topology-editor" style="background:rgba(14,165,233,0.06);">
-                            <input type="hidden" name="pv_topology_ui_dirty" id="pv-topology-ui-dirty" value="0">
-                            <input type="hidden" name="values[pv_forecast_topology_config]" id="pv-topology-json-input" value="<?= htmlspecialchars($pv_topology_json_ui, ENT_QUOTES, 'UTF-8') ?>">
+                            <input type="hidden" name="pv_topology_ui_dirty" id="pv-topology-ui-dirty" value="0" data-config-always-submit>
+                            <input type="hidden" name="values[pv_forecast_topology_config]" id="pv-topology-json-input" value="<?= htmlspecialchars($pv_topology_json_ui, ENT_QUOTES, 'UTF-8') ?>" data-config-always-submit>
                             <div class="d-flex flex-wrap align-items-start justify-content-between gap-2 mb-2">
                                 <div>
                                     <div class="fw-bold text-info"><i class="fas fa-diagram-project me-2"></i>PV-Flächen und Wechselrichtergruppen</div>
@@ -9721,6 +9901,8 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
                         </div>
                         <script>
                         window.E3DC_PV_TOPOLOGY_INITIAL = <?= json_encode($pv_topology_raw_ui, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?: '{}' ?>;
+                        window.E3DC_PV_TOPOLOGY_HAS_EXPLICIT = <?= $pv_topology_has_explicit_ui ? 'true' : 'false' ?>;
+                        window.E3DC_PV_TOPOLOGY_STORED_VALID = <?= $pv_topology_stored_valid_ui ? 'true' : 'false' ?>;
                         </script>
                         <div class="text-muted mt-2" style="font-size:0.68rem; line-height:1.45;">
                             Jede Resource muss zum gewählten Solcast-Konto gehören. Konto 2 ist optional; fehlt dessen Schlüssel,
@@ -9883,6 +10065,8 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
                     setTimeout(() => { if(r) r.textContent = ''; }, 7000);
                 }
 
+                let pvTopologyLegacyAutofillActive = false;
+
                 function pvTopologyEscape(value) {
                     return String(value ?? '').replace(/[&<>"']/g, char => ({
                         '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;'
@@ -9933,10 +10117,11 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
                         };
                         const groupId = bindingEl.querySelector('[data-pv-binding-group]')?.value || '';
                         const allocationsRaw = bindingEl.querySelector('[data-pv-allocations]')?.value.trim() || '';
+                        if (groupId) {
+                            binding.generator_group_id = groupId;
+                        }
                         if (allocationsRaw) {
                             try { binding.allocations = JSON.parse(allocationsRaw); } catch (_) { binding.allocations = allocationsRaw; }
-                        } else {
-                            binding.generator_group_id = groupId;
                         }
                         model.provider_resources.push(binding);
                     });
@@ -9971,6 +10156,13 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
                         if (!resource || resources.has(resource)) errors.push('Jede Solcast-Resource darf nur einmal vorkommen.');
                         resources.add(resource);
                         if (!['1', '2'].includes(String(binding.account_slot))) errors.push('Solcast-Konto muss 1 oder 2 sein.');
+                        const directGroup = String(binding.generator_group_id || '');
+                        const hasAllocations = Array.isArray(binding.allocations)
+                            ? binding.allocations.length > 0
+                            : typeof binding.allocations === 'string' && binding.allocations.trim() !== '';
+                        if (directGroup && hasAllocations) {
+                            errors.push('Pro Solcast-Zuordnung ist entweder eine Zielgruppe oder eine Allokation zulässig.');
+                        }
                         if (Array.isArray(binding.allocations)) {
                             const sum = binding.allocations.reduce((acc, item) => acc + Number(item.share || 0), 0);
                             if (!binding.allocations.length || Math.abs(sum - 1) > 0.0001) errors.push('Allokationen müssen zusammen 1,0 ergeben.');
@@ -9979,7 +10171,7 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
                             });
                         } else if (typeof binding.allocations === 'string') {
                             errors.push('Allokationen sind kein gültiges JSON.');
-                        } else if (!groupIds.has(String(binding.generator_group_id || ''))) {
+                        } else if (!groupIds.has(directGroup)) {
                             errors.push('Jede Providerbindung braucht eine gültige Zielgruppe.');
                         }
                     });
@@ -10011,8 +10203,13 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
                 }
 
                 function pvTopologyBindingHtml(binding, groups, bindingIndex) {
-                    const options = groups.map(group => `<option value="${pvTopologyEscape(group.id)}" ${group.id === binding.generator_group_id ? 'selected' : ''}>${pvTopologyEscape(group.id)}</option>`).join('');
-                    const allocations = Array.isArray(binding.allocations) ? JSON.stringify(binding.allocations) : '';
+                    const hasAllocations = Array.isArray(binding.allocations) && binding.allocations.length > 0;
+                    // Einen bereits gespeicherten Rohkonflikt nicht still
+                    // "heilen": Zielgruppe und Allokationen bleiben sichtbar,
+                    // bis der Nutzer eine der beiden Varianten entfernt.
+                    const directGroup = String(binding.generator_group_id || '');
+                    const options = groups.map(group => `<option value="${pvTopologyEscape(group.id)}" ${group.id === directGroup ? 'selected' : ''}>${pvTopologyEscape(group.id)}</option>`).join('');
+                    const allocations = hasAllocations ? JSON.stringify(binding.allocations) : '';
                     return `<section class="p-2 rounded border border-warning-subtle" data-pv-binding>
                         <div class="row g-2 align-items-end">
                             <div class="col-12 col-md-2"><label class="small text-muted">Binding-ID</label><input class="form-control form-control-sm" data-pv-binding-id value="${pvTopologyEscape(binding.id || 'binding-' + (bindingIndex + 1))}" readonly></div>
@@ -10020,7 +10217,7 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
                             <div class="col-6 col-md-2"><label class="small text-muted">Konto</label><select class="form-select form-select-sm" data-pv-account><option value="1" ${String(binding.account_slot) !== '2' ? 'selected' : ''}>Konto 1</option><option value="2" ${String(binding.account_slot) === '2' ? 'selected' : ''}>Konto 2</option></select></div>
                             <div class="col-6 col-md-3"><label class="small text-muted">Zielgruppe</label><select class="form-select form-select-sm" data-pv-binding-group><option value="">Allokationen verwenden</option>${options}</select></div>
                             <div class="col-12 col-md-2"><button type="button" class="btn btn-sm btn-outline-danger" data-pv-remove-binding>Entfernen</button></div>
-                            <div class="col-12"><label class="small text-muted">Oder Allokationen als JSON (Anteile zusammen 1,0)</label><textarea class="form-control form-control-sm" data-pv-allocations rows="2" placeholder='[{"generator_group_id":"group-1","share":1.0}]'>${pvTopologyEscape(allocations)}</textarea></div>
+                            <div class="col-12"><label class="small text-muted">Oder Allokationen als JSON (Anteile zusammen 1,0; Zielgruppe muss leer sein)</label><textarea class="form-control form-control-sm" data-pv-allocations rows="2" placeholder='[{"generator_group_id":"group-1","share":1.0}]'>${pvTopologyEscape(allocations)}</textarea></div>
                         </div></section>`;
                 }
 
@@ -10049,6 +10246,33 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
                 }
 
                 function pvTopologyPrepareForSubmit() {
+                    if (pvTopologyLegacyAutofillActive) {
+                        const proposal = pvTopologyLegacyProposal();
+                        const proposalErrors = [
+                            ...(proposal.errors || []),
+                            ...pvTopologyValidate(proposal.model)
+                        ];
+                        if (proposal.model.generator_groups.length > 0 && proposalErrors.length === 0) {
+                            // Direkt vor dem Absenden aus den aktuell aktiven
+                            // Legacy-Feldern neu erzeugen. Dadurch können weder
+                            // Assistentenänderungen noch ein geänderter Konto-2-
+                            // Schlüssel einen beim Seitenladen erzeugten Stand
+                            // veralten lassen.
+                            pvTopologyRender(proposal.model, true);
+                        } else {
+                            const dirtyInput = document.getElementById('pv-topology-ui-dirty');
+                            if (dirtyInput) dirtyInput.value = '0';
+                            const status = document.getElementById('pv-topology-status');
+                            if (status && proposalErrors.length > 0) {
+                                status.className = 'small mb-2 text-warning';
+                                status.textContent = 'Bestehende Flächen konnten nicht vollständig übernommen werden: ' + [...new Set(proposalErrors)].join(' ');
+                            }
+                            // Eine unvollständige automatische Migration darf
+                            // das Speichern anderer Konfigurationswerte nicht
+                            // blockieren und wird nicht teilweise persistiert.
+                            return true;
+                        }
+                    }
                     const dirty = document.getElementById('pv-topology-ui-dirty')?.value === '1';
                     if (!dirty) return true;
                     const model = pvTopologyModelFromDom();
@@ -10062,70 +10286,207 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
 
                 function pvTopologyLegacyProposal() {
                     const model = {schema_version:'pv_forecast_topology_config_v1', generator_groups:[], provider_resources:[]};
+                    const errors = [];
+                    const entries = [];
                     for (let index = 1; index <= 4; index += 1) {
-                        const forecast = document.querySelector(`[name="values[forecast${index}]"]`)?.value.trim() || '';
+                        const forecastSelector = `[name="values[forecast${index}]"]`;
+                        const forecastInputs = typeof document.querySelectorAll === 'function'
+                            ? Array.from(document.querySelectorAll(forecastSelector))
+                            : [];
+                        const forecastInput = forecastInputs.find(input => !input.disabled)
+                            || forecastInputs[0]
+                            || document.querySelector(forecastSelector);
+                        const forecast = forecastInput?.value.trim() || '';
                         const resourceKey = index === 1 ? 'solcast_resource_id' : 'solcast_resource_id_' + index;
                         const resource = document.querySelector(`[name="values[${resourceKey}]"]`)?.value.trim() || '';
-                        const coupling = document.querySelector(`[name="values[pv_forecast_coupling_fc${index}]"]`)?.value || '';
-                        const parts = forecast.split('/').map(Number);
-                        if (parts.length === 3 && parts.every(Number.isFinite) && parts[2] > 0 && coupling) {
-                            const group = {id:'group-' + index, coupling, surfaces:[{id:'surface-' + index, tilt:parts[0], azimuth:parts[1], kwp:parts[2]}]};
-                            model.generator_groups.push(group);
-                            if (resource) model.provider_resources.push({id:'binding-' + index, provider:'solcast', resource_id:resource, account_slot:document.querySelector(`[name="values[solcast_api_slot_fc${index}]"]`)?.value || '1', generator_group_id:group.id});
+                        const coupling = document.querySelector(`[name="values[pv_forecast_coupling_fc${index}]"]`)?.value.trim().toUpperCase() || '';
+                        const accountSelect = document.querySelector(`[name="values[solcast_api_slot_fc${index}]"]`);
+                        const account2KeyInput = document.querySelector('[name="values[solcast_api_key_2]"]');
+                        const legacyAccount = index === 1
+                            ? '1'
+                            : (
+                                account2KeyInput
+                                    ? (account2KeyInput.value.trim() ? '2' : '1')
+                                    : (accountSelect?.dataset.effectiveAccount || '1')
+                            );
+                        const account = accountSelect?.value || legacyAccount;
+                        const configured = Boolean(forecast || resource || coupling);
+                        if (!configured) continue;
+                        const parts = forecast.split('/').map(value => Number(String(value).trim().replace(',', '.')));
+                        const geometryValid = Boolean(
+                            forecastInput
+                            && parts.length === 3
+                            && parts.every(Number.isFinite)
+                            && parts[0] >= 0
+                            && parts[0] <= 90
+                            && parts[1] >= -180
+                            && parts[1] <= 180
+                            && parts[2] > 0
+                        );
+                        if (!geometryValid) {
+                            errors.push(`FC${index}: Geometrie fehlt oder ist ungültig.`);
                         }
+                        if (!['E3DC_DC', 'EXTERNAL_AC'].includes(coupling)) {
+                            errors.push(`FC${index}: physische Kopplung fehlt.`);
+                        }
+                        if (resource && !['1', '2'].includes(String(account))) {
+                            errors.push(`FC${index}: Solcast-Konto ist nicht eindeutig.`);
+                        }
+                        if (!geometryValid || !['E3DC_DC', 'EXTERNAL_AC'].includes(coupling)) {
+                            continue;
+                        }
+                        entries.push({
+                            index,
+                            coupling,
+                            surface: {id:'surface-' + index, tilt:parts[0], azimuth:parts[1], kwp:parts[2]},
+                            resource,
+                            account_slot: String(account)
+                        });
                     }
-                    return model;
+                    entries.forEach(entry => {
+                        const groupId = 'group-' + entry.index;
+                        model.generator_groups.push({
+                            id: groupId,
+                            coupling: entry.coupling,
+                            surfaces: [entry.surface]
+                        });
+                        if (!entry.resource) return;
+                        model.provider_resources.push({
+                            id:'binding-' + entry.index,
+                            provider:'solcast',
+                            resource_id:entry.resource,
+                            account_slot:entry.account_slot,
+                            generator_group_id:groupId
+                        });
+                    });
+                    return {model, errors: [...new Set(errors)]};
                 }
 
                 document.addEventListener('DOMContentLoaded', () => {
                     const editor = document.getElementById('pv-topology-editor');
                     if (!editor) return;
+                    pvTopologyLegacyAutofillActive = window.E3DC_PV_TOPOLOGY_HAS_EXPLICIT !== true;
                     let initial = window.E3DC_PV_TOPOLOGY_INITIAL;
                     if (!initial || typeof initial !== 'object' || !Array.isArray(initial.generator_groups)) {
                         initial = {schema_version:'pv_forecast_topology_config_v1', generator_groups:[], provider_resources:[]};
                     }
-                    pvTopologyRender(initial, false);
-                    editor.addEventListener('input', () => { pvTopologyMarkDirty(); pvTopologyRenderSummary(pvTopologyModelFromDom()); });
-                    editor.addEventListener('change', () => { pvTopologyMarkDirty(); pvTopologyRenderSummary(pvTopologyModelFromDom()); });
+                    let automaticProposal = null;
+                    if (
+                        window.E3DC_PV_TOPOLOGY_HAS_EXPLICIT !== true
+                        && initial.generator_groups.length === 0
+                    ) {
+                        const proposal = pvTopologyLegacyProposal();
+                        const proposalErrors = [
+                            ...(proposal.errors || []),
+                            ...pvTopologyValidate(proposal.model)
+                        ];
+                        if (proposal.model.generator_groups.length > 0 && proposalErrors.length === 0) {
+                            initial = proposal.model;
+                            automaticProposal = proposal;
+                        } else if (proposalErrors.length > 0) {
+                            automaticProposal = {model: proposal.model, errors: [...new Set(proposalErrors)]};
+                        }
+                    }
+                    pvTopologyRender(initial, automaticProposal !== null && automaticProposal.errors.length === 0);
+                    if (
+                        window.E3DC_PV_TOPOLOGY_HAS_EXPLICIT === true
+                        && window.E3DC_PV_TOPOLOGY_STORED_VALID !== true
+                    ) {
+                        const status = document.getElementById('pv-topology-status');
+                        const summary = document.getElementById('pv-topology-summary');
+                        if (status) {
+                            status.className = 'small mb-2 text-warning';
+                            status.textContent = 'Der gespeicherte PV-Topologievertrag ist ungültig und wird nicht automatisch ersetzt.';
+                        }
+                        if (summary) {
+                            summary.textContent = 'Nicht speicherbar: Der gespeicherte PV-Topologievertrag ist kein gültiges Objekt.';
+                        }
+                    } else if (automaticProposal) {
+                        const status = document.getElementById('pv-topology-status');
+                        if (automaticProposal.errors.length === 0) {
+                            if (status) status.textContent = 'Bestehende vollständige Flächen- und vorhandene Solcast-Zuordnung wurde automatisch vorbefüllt und wird beim Speichern übernommen.';
+                        } else if (status) {
+                            status.className = 'small mb-2 text-warning';
+                            status.textContent = 'Bestehende Flächen konnten nicht vollständig übernommen werden: ' + automaticProposal.errors.join(' ');
+                        }
+                    }
+                    editor.addEventListener('input', event => {
+                        pvTopologyLegacyAutofillActive = false;
+                        const allocations = event.target.closest('[data-pv-allocations]');
+                        if (allocations && allocations.value.trim()) {
+                            const target = allocations.closest('[data-pv-binding]')?.querySelector('[data-pv-binding-group]');
+                            if (target) target.value = '';
+                        }
+                        pvTopologyMarkDirty();
+                        pvTopologyRenderSummary(pvTopologyModelFromDom());
+                    });
+                    editor.addEventListener('change', event => {
+                        pvTopologyLegacyAutofillActive = false;
+                        const target = event.target.closest('[data-pv-binding-group]');
+                        if (target && target.value) {
+                            const allocations = target.closest('[data-pv-binding]')?.querySelector('[data-pv-allocations]');
+                            if (allocations) allocations.value = '';
+                        }
+                        pvTopologyMarkDirty();
+                        pvTopologyRenderSummary(pvTopologyModelFromDom());
+                    });
                     editor.addEventListener('click', event => {
                         const model = pvTopologyModelFromDom();
                         const groupIds = new Set(model.generator_groups.map(group => group.id));
                         if (event.target.closest('#pv-topology-add-group')) {
+                            pvTopologyLegacyAutofillActive = false;
                             const groupId = pvTopologyNewId('group', groupIds);
                             const surfaceIds = new Set(model.generator_groups.flatMap(group => (group.surfaces || []).map(surface => surface.id)));
                             model.generator_groups.push({id:groupId, coupling:'E3DC_DC', surfaces:[{id:pvTopologyNewId('surface', surfaceIds), tilt:35, azimuth:0, kwp:1}]});
                         } else if (event.target.closest('#pv-topology-add-binding')) {
+                            pvTopologyLegacyAutofillActive = false;
                             const ids = new Set(model.provider_resources.map(binding => binding.id));
                             model.provider_resources.push({id:pvTopologyNewId('binding', ids), provider:'solcast', resource_id:'', account_slot:'1', generator_group_id:model.generator_groups[0]?.id || ''});
                         } else if (event.target.closest('#pv-topology-legacy-proposal')) {
-                            pvTopologyRender(pvTopologyLegacyProposal(), true);
+                            const proposal = pvTopologyLegacyProposal();
+                            const proposalErrors = [
+                                ...(proposal.errors || []),
+                                ...pvTopologyValidate(proposal.model)
+                            ];
+                            if (proposal.model.generator_groups.length === 0 || proposalErrors.length > 0) {
+                                const status = document.getElementById('pv-topology-status');
+                                if (status) {
+                                    status.className = 'small mb-2 text-warning';
+                                    status.textContent = 'Bestehende Flächen konnten nicht vollständig übernommen werden: ' + [...new Set(proposalErrors)].join(' ');
+                                }
+                                return;
+                            }
+                            pvTopologyLegacyAutofillActive = true;
+                            pvTopologyRender(proposal.model, true);
                             return;
                         } else if (event.target.closest('#pv-topology-clear')) {
+                            pvTopologyLegacyAutofillActive = false;
                             pvTopologyRender({schema_version:'pv_forecast_topology_config_v1', generator_groups:[], provider_resources:[]}, true);
                             return;
                         } else if (event.target.closest('[data-pv-add-surface]')) {
+                            pvTopologyLegacyAutofillActive = false;
                             const groupIndex = [...document.querySelectorAll('[data-pv-group]')].indexOf(event.target.closest('[data-pv-group]'));
                             const ids = new Set(model.generator_groups.flatMap(group => (group.surfaces || []).map(surface => surface.id)));
                             if (groupIndex >= 0) model.generator_groups[groupIndex].surfaces.push({id:pvTopologyNewId('surface', ids), tilt:35, azimuth:0, kwp:1});
                         } else if (event.target.closest('[data-pv-remove-surface]')) {
+                            pvTopologyLegacyAutofillActive = false;
                             const groupEl = event.target.closest('[data-pv-group]');
                             const surfaceEl = event.target.closest('[data-pv-surface]');
                             const groupIndex = [...document.querySelectorAll('[data-pv-group]')].indexOf(groupEl);
                             const surfaceIndex = [...groupEl.querySelectorAll('[data-pv-surface]')].indexOf(surfaceEl);
                             if (groupIndex >= 0 && surfaceIndex >= 0) model.generator_groups[groupIndex].surfaces.splice(surfaceIndex, 1);
                         } else if (event.target.closest('[data-pv-remove-group]')) {
+                            pvTopologyLegacyAutofillActive = false;
                             const groupIndex = [...document.querySelectorAll('[data-pv-group]')].indexOf(event.target.closest('[data-pv-group]'));
                             if (groupIndex >= 0) model.generator_groups.splice(groupIndex, 1);
                         } else if (event.target.closest('[data-pv-remove-binding]')) {
+                            pvTopologyLegacyAutofillActive = false;
                             const bindingIndex = [...document.querySelectorAll('[data-pv-binding]')].indexOf(event.target.closest('[data-pv-binding]'));
                             if (bindingIndex >= 0) model.provider_resources.splice(bindingIndex, 1);
                         } else {
                             return;
                         }
                         pvTopologyRender(model, true);
-                    });
-                    document.getElementById('configEditorForm')?.addEventListener('submit', event => {
-                        if (!pvTopologyPrepareForSubmit()) event.preventDefault();
                     });
                 });
                 </script>
@@ -10463,6 +10824,7 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
     <div class="modal-dialog modal-dialog-centered">
         <div class="modal-content bg-body-secondary text-body border-secondary">
             <form method="POST" enctype="multipart/form-data">
+                <?= e3dcCsrfInput() ?>
                 <input type="hidden" name="config_action" value="upload_config">
                 <div class="modal-header border-secondary">
                     <h5 class="modal-title"><i class="fas fa-upload me-2 text-info"></i>Konfiguration importieren</h5>
@@ -10491,6 +10853,7 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
     <div class="modal-dialog modal-dialog-centered">
         <div class="modal-content bg-body-secondary text-body border-secondary">
             <form method="POST">
+                <?= e3dcCsrfInput() ?>
                 <div class="modal-header border-secondary">
                     <h5 class="modal-title"><i class="fas fa-history me-2 text-info"></i>Konfigurations-Rollback</h5>
                     <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
@@ -10699,6 +11062,7 @@ function showConfigAutoInstallModal(modules, submitWithInstall, submitWithoutIns
 }
 
 function submitConfigEditorForm(form, nativeSubmit) {
+    if (typeof pvTopologyPrepareForSubmit === 'function' && !pvTopologyPrepareForSubmit()) return;
     if (activeConfigEditorView() !== 'simple' && !validatePlannedLoadWindows(form)) return;
     const confirmInput = document.getElementById('configAutoInstallConfirmed');
     const submitNative = () => {
@@ -10754,7 +11118,7 @@ function updateTariffEditorFields(tariffType) {
     setDisplay('opt_tibber_api', isTibber ? 'flex' : 'none');
     setDisplay('opt_awattar_settings', isEpex ? 'flex' : 'none');
     setDisplay('opt_market_economics', (isDynamicPrice || isOctopus || isSpecial) ? 'flex' : 'none');
-    setDisplay('opt_cheap_grid_boost', (isDynamicPrice || isOctopus) ? 'block' : 'none');
+    setDisplay('opt_cheap_grid_boost', isDynamicPrice ? 'block' : 'none');
     if (provider) {
         if (isTibber) {
             provider.value = 'tibber';
@@ -10918,6 +11282,7 @@ async function testTibberApi(button) {
     try {
         const body = new FormData();
         body.set('config_action', 'test_tibber_api');
+        body.set('csrf_token', <?= json_encode(e3dcCsrfToken()) ?>);
         body.set('values[tibber_api_token]', token);
         body.set('values[tibber_home_id]', homeId);
         const response = await fetch('config_editor.php', {
@@ -10953,6 +11318,7 @@ async function testEntsoeApi(button) {
     try {
         const body = new FormData();
         body.set('config_action', 'test_entsoe_api');
+        body.set('csrf_token', <?= json_encode(e3dcCsrfToken()) ?>);
         body.set('values[entsoe_api_token]', token);
         const response = await fetch('config_editor.php', {
             method: 'POST',
@@ -11002,7 +11368,9 @@ function setConfigEditorView(view) {
         el.disabled = nextView !== 'simple';
     });
     document.querySelectorAll('#configAdvancedView [name]').forEach(el => {
-        el.disabled = nextView !== 'advanced';
+        el.disabled = el.matches('[data-config-always-submit]')
+            ? false
+            : nextView !== 'advanced';
     });
     document.querySelectorAll('[data-config-view-button]').forEach(btn => {
         const active = btn.getAttribute('data-config-view-button') === nextView;
@@ -11012,6 +11380,9 @@ function setConfigEditorView(view) {
     try {
         localStorage.setItem('e3dc.configEditorView', nextView);
     } catch (_e) {}
+    if (typeof updateStorageAuxAcToggle === 'function') {
+        updateStorageAuxAcToggle();
+    }
 }
 
 function openAdvancedConfigGroup(groupId, focusId) {
@@ -11136,7 +11507,7 @@ function initClimateToggle() {
 
 // SessionStorage bewahrt offene Reiter nach dem Speichern und Neuladen.
 document.addEventListener('DOMContentLoaded', () => {
-    const isPostRequest = <?= ($_SERVER['REQUEST_METHOD'] === 'POST') ? 'true' : 'false' ?>;
+    const isPostRequest = <?= ($configEditorRequestMethod === 'POST') ? 'true' : 'false' ?>;
 
     initConfigFloatingTooltips();
     initPlannedLoadWindowUi();
@@ -11478,7 +11849,8 @@ const DIRECT_MARKETING_PREVIEW_KEYS = [
     'direct_marketing_negative_price_no_export',
     'direct_marketing_negative_headroom_enable', 'direct_marketing_negative_headroom_lookahead_min',
     'direct_marketing_negative_headroom_min_window_min', 'direct_marketing_negative_headroom_min_surplus_wh',
-    'direct_marketing_negative_headroom_buffer_pct', 'direct_marketing_low_price_headroom_enable', 'direct_marketing_low_price_no_export',
+    'direct_marketing_negative_headroom_buffer_pct', 'direct_marketing_low_price_headroom_enable',
+    'direct_marketing_passive_normal_zero_charge_enable', 'direct_marketing_low_price_no_export',
     'direct_marketing_keep_headroom_pct', 'direct_marketing_negative_price_charge_target_soc_pct',
     'direct_marketing_low_price_curtail_enable', 'direct_marketing_low_price_curtail_limit_w',
     'direct_marketing_eeg_enable', 'direct_marketing_eeg_commissioning_date',
@@ -11719,6 +12091,29 @@ function initStorageCurveSlidingHorizonToggle() {
     updateStorageCurveSlidingHorizonToggle();
 }
 
+function updateStorageAuxAcToggle() {
+    const auxAcToggle = document.querySelector('[data-storage-aux-ac-toggle]');
+    const option = document.querySelector('[data-storage-aux-ac-option]');
+    const hint = document.querySelector('[data-storage-aux-ac-hint]');
+    if (!auxAcToggle) return;
+    auxAcToggle.disabled = true;
+    auxAcToggle.checked = false;
+    auxAcToggle.setAttribute('aria-disabled', 'true');
+    if (option) option.classList.add('opacity-75');
+    if (hint) {
+        hint.textContent = 'Nicht freigegeben: Getrennte PV- und Lastquantile dürfen nicht verrechnet werden. Erst ein freigegebener Joint-Horizon-Produzent und eine fachlich beschlossene Risikoschwelle könnten einen versiegelten Plan-/Slot-/Action-Nachweis ermöglichen. Bis dahin bleibt E3DC_DC_ONLY wirksam; fehlende oder schlechte Daten sowie Netzbezug sperren immer.';
+    }
+}
+
+function initStorageAuxAcToggle() {
+    const dcOnlyToggle = document.getElementById('conf_storage_dc_first_charge_limit_enable');
+    const auxAcToggle = document.querySelector('[data-storage-aux-ac-toggle]');
+    if (!dcOnlyToggle || !auxAcToggle) return;
+    dcOnlyToggle.addEventListener('input', updateStorageAuxAcToggle);
+    dcOnlyToggle.addEventListener('change', updateStorageAuxAcToggle);
+    updateStorageAuxAcToggle();
+}
+
 function storageCurvePreviewOptionalNumber(value) {
     if (value === null || value === undefined || value === '') return null;
     const parsed = Number(String(value).trim().replace(',', '.'));
@@ -11764,8 +12159,7 @@ function updateMarketPathPreview() {
     const degradation = Math.max(0, storageCurvePreviewNumber('market_degradation_ct_per_kwh', directDegradation));
     const safety = storageCurvePreviewClamp(storageCurvePreviewNumber('market_safety_correction_ct_per_kwh', 0), -10, 50);
     const margin = Math.max(0, storageCurvePreviewNumber('market_min_margin_pct', 10));
-    const autarkyToggle = document.querySelector('[name="values[market_autarky_first_enable]"][type="checkbox"]');
-    const autarkyFirst = autarkyToggle ? autarkyToggle.checked : true;
+    const autarkyFirst = true;
     const autarkyLowSoc = storageCurvePreviewClamp(storageCurvePreviewNumber('market_autarky_low_soc_pct', 20), 0, 100);
     const autarkyBufferWh = Math.max(0, storageCurvePreviewNumber('market_autarky_horizon_buffer_wh', 500));
     const safetyPrefix = safety > 0 ? '+ ' : (safety < 0 ? '- ' : '± ');
@@ -13684,6 +14078,7 @@ function initStorageCurveConfigPreview() {
 
 document.addEventListener('DOMContentLoaded', initStorageCurveConfigPreview);
 document.addEventListener('DOMContentLoaded', initStorageCurveSlidingHorizonToggle);
+document.addEventListener('DOMContentLoaded', initStorageAuxAcToggle);
 document.addEventListener('DOMContentLoaded', initDirectMarketingEegRateUi);
 document.addEventListener('DOMContentLoaded', initMarketPathPreview);
 
@@ -13703,6 +14098,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 const body = new URLSearchParams();
                 body.set('quick_toggle_key', key);
                 body.set('quick_toggle_value', toggle.checked ? '1' : '0');
+                body.set('csrf_token', <?= json_encode(e3dcCsrfToken()) ?>);
                 const response = await fetch('config_editor.php', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/x-www-form-urlencoded'},

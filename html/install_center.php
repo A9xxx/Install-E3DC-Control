@@ -76,7 +76,7 @@ function runInstallerAction($action, $module = null) {
 }
 
 function runInstallerJob($action, $module = null, $viaWrapper = false) {
-    global $python, $web_installer, $installer_wrapper;
+    global $python, $web_installer;
     $allowed = [
         'catalog',
         'installer_status',
@@ -101,6 +101,15 @@ function runInstallerJob($action, $module = null, $viaWrapper = false) {
     if ($module !== null && $module !== '' && !preg_match('/^[a-z0-9_]+$/', $module)) {
         return ['success' => false, 'error' => 'Ungültiger Modul-Key'];
     }
+    if ($viaWrapper) {
+        return [
+            'success' => false,
+            'write_blocked' => true,
+            'privileged_installer_web_enabled' => false,
+            'error' => 'Privilegierte Installer-Webjobs sind aus Sicherheitsgründen deaktiviert.',
+            'message' => 'Read-only Prüfungen laufen ohne sudo. Installation, Rechte-Reparatur, Update und Rückfall benötigen bis zu einem eigenen engen Launcher eine administrative Konsole.',
+        ];
+    }
     if (!file_exists($web_installer)) {
         return ['success' => false, 'error' => 'web_installer.py nicht gefunden'];
     }
@@ -119,61 +128,19 @@ function runInstallerJob($action, $module = null, $viaWrapper = false) {
         return ['success' => false, 'error' => 'Jobdatei konnte nicht geschrieben werden'];
     }
     @chmod($job_file, 0666);
-    if ($viaWrapper) {
-        if (!file_exists($installer_wrapper)) {
-            return ['success' => false, 'error' => 'installer_wrapper.sh nicht gefunden'];
-        }
-        $cmd = 'sudo -n ' . escapeshellarg($installer_wrapper) . ' run_job 2>&1';
-    } else {
-        $cmd = escapeshellarg($python) . ' ' . escapeshellarg($web_installer) . ' --job-file 2>&1';
-    }
+    $cmd = escapeshellarg($python) . ' ' . escapeshellarg($web_installer) . ' --job-file 2>&1';
     $out = shell_exec($cmd);
     $json = json_decode($out ?: '', true);
     if (is_array($json)) return $json;
     return [
         'success' => false,
         'error' => trim($out ?: 'Keine Antwort vom Web-Installer-Job'),
-        'via_wrapper' => $viaWrapper,
-        'message' => $viaWrapper
-            ? 'Wrapper-Auftrag konnte nicht ausgeführt werden. Bitte Freigabeprüfung und Sudoers prüfen.'
-            : 'Direkter Web-Installer-Job konnte nicht ausgeführt werden.'
-    ];
-}
-
-function runLegacyPermissionRepairFallback($previousResult = null) {
-    global $install_path;
-    $script = rtrim($install_path, '/') . '/installer_main.py';
-    if (!file_exists($script)) {
-        return [
-            'success' => false,
-            'legacy_fallback' => true,
-            'message' => 'Legacy-Rechte-Reparatur nicht möglich: installer_main.py wurde nicht gefunden.',
-            'previous_result' => $previousResult
-        ];
-    }
-    $cmd = 'sudo -n /usr/bin/python3 ' . escapeshellarg($script) . ' --fix-permissions 2>&1';
-    $lines = [];
-    $code = 1;
-    @exec($cmd, $lines, $code);
-    $readiness = runInstallerAction('write_readiness');
-    $hardBlockers = is_array($readiness) ? (int)($readiness['hard_blocker_count'] ?? 0) : 0;
-    $readinessOk = is_array($readiness) && (($readiness['success'] ?? false) !== false) && $hardBlockers === 0;
-    $success = ($code === 0) && $readinessOk;
-    return [
-        'success' => $success,
-        'legacy_fallback' => true,
-        'message' => $success
-            ? 'Rechte-Reparatur via vorhandener installer_main.py --fix-permissions Freigabe abgeschlossen.'
-            : 'Wrapper-Reparatur und Altpfad konnten die Rechte nicht vollständig reparieren.',
-        'previous_result' => $previousResult,
-        'legacy_returncode' => $code,
-        'legacy_output_tail' => array_slice($lines, -30),
-        'readiness' => $readiness
+        'via_wrapper' => false,
+        'message' => 'Direkter read-only Web-Installer-Job konnte nicht ausgeführt werden.'
     ];
 }
 
 function runInstallerWriteJob($action, $module = null) {
-    global $installer_wrapper;
     $allowed = ['repair_permissions', 'install_module', 'remove_module'];
     if (!in_array($action, $allowed, true)) {
         return [
@@ -205,43 +172,15 @@ function runInstallerWriteJob($action, $module = null) {
             ];
         }
     }
-    if (!file_exists($installer_wrapper)) {
-        if ($action === 'repair_permissions') {
-            return runLegacyPermissionRepairFallback([
-                'success' => false,
-                'error' => 'installer_wrapper.sh nicht gefunden'
-            ]);
-        }
-        return ['success' => false, 'error' => 'installer_wrapper.sh nicht gefunden'];
-    }
-    $ramdisk = '/var/www/html/ramdisk';
-    if (!is_dir($ramdisk) && !@mkdir($ramdisk, 0775, true)) {
-        return ['success' => false, 'error' => 'Ramdisk-Verzeichnis konnte nicht angelegt werden'];
-    }
-    $job = [
+    return [
+        'success' => false,
+        'write_blocked' => true,
+        'privileged_installer_web_enabled' => false,
         'action' => $action,
         'module' => ($module !== null && $module !== '') ? $module : null,
-        'source' => 'install_center_write',
-        'created_at' => date('c')
+        'error' => 'Privilegierte Installer-Webjobs sind aus Sicherheitsgründen deaktiviert.',
+        'message' => 'Der alte gemeinsame Ramdisk-/sudo-Pfad wird nicht mehr verwendet. Bitte diese administrative Änderung bis zu einem eigenen engen Launcher per Konsole ausführen.',
     ];
-    $job_file = $ramdisk . '/web_install_jobs.json';
-    if (@file_put_contents($job_file, json_encode($job, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE)) === false) {
-        return ['success' => false, 'error' => 'Jobdatei konnte nicht geschrieben werden'];
-    }
-    @chmod($job_file, 0666);
-    $cmd = 'sudo -n ' . escapeshellarg($installer_wrapper) . ' run_write_job 2>&1';
-    $out = shell_exec($cmd);
-    $json = json_decode($out ?: '', true);
-    if (is_array($json)) return $json;
-    $result = [
-        'success' => false,
-        'error' => trim($out ?: 'Keine Antwort vom schreibenden Web-Installer-Job'),
-        'message' => 'Schreibauftrag des Wrappers konnte nicht ausgeführt werden. Bitte Freigabeprüfung und Sudoers prüfen.'
-    ];
-    if ($action === 'repair_permissions') {
-        return runLegacyPermissionRepairFallback($result);
-    }
-    return $result;
 }
 
 function installCenterConfigField($key, $label, $type = 'text', $options = [], $help = '', $secret = false, $placeholder = '') {
@@ -445,7 +384,7 @@ function installCenterModuleConfigFields($moduleKey) {
             installCenterConfigField('climate_min_power_w', 'Aktiv ab W', 'number', [], '', false, '50'),
             installCenterConfigField('climate_poll_s', 'Leseintervall (s)', 'number', [], '', false, '15'),
             installCenterConfigField('climate_history_enable', 'History speichern', 'select', $bool),
-            installCenterConfigField('climate_history_interval_s', 'History-Intervall (s)', 'number', [], '', false, '60'),
+            installCenterConfigField('climate_history_interval_s', 'Erfassungsintervall (s)', 'number', [], '', false, '60'),
             installCenterConfigField('climate_forecast_enable', 'Klima-Prognose', 'select', $bool, 'Aus gemessener Klima-Historie und Wetter-/Außentemperatur; keine Schaltbefehle.'),
         ],
         'climate_control' => [
@@ -481,9 +420,10 @@ function installCenterModuleConfigFields($moduleKey) {
         ],
         'shadow' => [
             installCenterConfigField('ha_mode', 'Cluster-Rolle', 'select', $haModes),
-            installCenterConfigField('shadow_master_url', 'Shadow Master URL', 'text', [], '', false, 'http://192.0.2.10'),
-            installCenterConfigField('shadow_master_ip', 'Shadow Master IP', 'text', [], 'Fallback, wenn keine URL gesetzt ist.', false, '192.0.2.10'),
-            installCenterConfigField('ha_peer_ip', 'Partner-IP Fallback', 'text', [], 'Wird genutzt, wenn keine Shadow Master URL/IP gesetzt ist.', false, '192.0.2.11'),
+            installCenterConfigField('shadow_master_url', 'Shadow Master URL', 'text', [], '', false, 'http://192.168.1.10'),
+            installCenterConfigField('shadow_snapshot_token', 'Shadow Snapshot Token', 'password', [], 'Exakt 64 Hex-Zeichen; auf Master und Shadow identisch. Leer lassen = unverändert.', true, '64 Hex-Zeichen'),
+            installCenterConfigField('shadow_master_ip', 'Shadow Master IP', 'text', [], 'Fallback, wenn keine URL gesetzt ist.', false, '192.168.1.10'),
+            installCenterConfigField('ha_peer_ip', 'Partner-IP Fallback', 'text', [], 'Wird genutzt, wenn keine Shadow Master URL/IP gesetzt ist.', false, '192.168.1.11'),
             installCenterConfigField('shadow_sync_interval_s', 'Shadow Takt (s)', 'number', [], '', false, '5'),
             installCenterConfigField('shadow_fetch_timeout_s', 'HTTP Timeout (s)', 'number', [], '', false, '2.5'),
             installCenterConfigField('shadow_snapshot_max_age_s', 'Max. Snapshot-Alter (s)', 'number', [], '', false, '30'),
@@ -740,8 +680,20 @@ function installCenterSaveModuleConfig($moduleKey, $postedValues) {
         if (!empty($field['secret']) && trim((string)$raw) === '') {
             continue;
         }
+        if (
+            $key === 'shadow_snapshot_token'
+            && preg_match('/\A[0-9a-fA-F]{64}\z/D', trim((string)$raw)) !== 1
+        ) {
+            return [
+                'success' => false,
+                'error' => 'Shadow Snapshot Token muss aus exakt 64 Hex-Zeichen bestehen.',
+            ];
+        }
         if (array_key_exists($key, $shadowDefaults) && trim((string)$raw) === '') {
             $raw = $shadowDefaults[$key];
+        }
+        if ($key === 'shadow_snapshot_token') {
+            $raw = strtolower(trim((string)$raw));
         }
         $updates[$key] = installCenterNormalizeConfigValue($field, $raw);
     }
@@ -988,12 +940,41 @@ function installCenterParseGlitchTs($row) {
     return 0.0;
 }
 
+function installCenterGlitchPathMayContainRecent($path, $cutoff) {
+    if ((float)$cutoff <= 0) return true;
+    $base = basename((string)$path);
+    if (!preg_match('/^live_plausibility_glitches_(\d{8})\.jsonl(?:\.gz)?$/', $base, $m)) {
+        return true;
+    }
+    $timezone = new DateTimeZone(date_default_timezone_get());
+    $dayStart = DateTimeImmutable::createFromFormat('!Ymd', (string)$m[1], $timezone);
+    if (!$dayStart) return true;
+    $dayEnd = $dayStart->modify('+1 day')->getTimestamp();
+    return $dayEnd > (float)$cutoff;
+}
+
 function installCenterGlitchReasons($row) {
     $current = (isset($row['current']) && is_array($row['current'])) ? $row['current'] : [];
-    $reasons = $current['reasons'] ?? ($row['reasons'] ?? []);
+    $aggregation = (isset($row['aggregation']) && is_array($row['aggregation'])) ? $row['aggregation'] : [];
+    $signature = (isset($aggregation['signature']) && is_array($aggregation['signature'])) ? $aggregation['signature'] : [];
+    $reasons = array_key_exists('reasons', $signature)
+        ? $signature['reasons']
+        : ($current['reasons'] ?? ($row['reasons'] ?? []));
     if (is_string($reasons)) return [$reasons];
     if (!is_array($reasons)) return [];
     return array_values(array_map('strval', $reasons));
+}
+
+function installCenterGlitchEventKind($row) {
+    $aggregation = (isset($row['aggregation']) && is_array($row['aggregation'])) ? $row['aggregation'] : [];
+    $kind = trim((string)($aggregation['event_kind'] ?? 'legacy_sample'));
+    return $kind !== '' ? $kind : 'legacy_sample';
+}
+
+function installCenterGlitchSampleCount($row) {
+    $aggregation = (isset($row['aggregation']) && is_array($row['aggregation'])) ? $row['aggregation'] : [];
+    if (!array_key_exists('sample_count', $aggregation)) return 1;
+    return max(0, (int)$aggregation['sample_count']);
 }
 
 function installCenterReadGlitchRows($maxAgeHours = 48) {
@@ -1008,6 +989,10 @@ function installCenterReadGlitchRows($maxAgeHours = 48) {
         glob('/var/www/html/logs/live_plausibility_glitches_*.jsonl') ?: [],
         glob('/var/www/html/logs/live_plausibility_glitches_*.jsonl.gz') ?: []
     );
+    $paths = array_values(array_filter(
+        $paths,
+        fn($path) => installCenterGlitchPathMayContainRecent($path, $cutoff)
+    ));
     sort($paths, SORT_NATURAL);
     foreach ($paths as $path) {
         $reader = null;
@@ -1039,11 +1024,20 @@ function installCenterGlitchCompactEvent($item) {
     $row = is_array($item['row'] ?? null) ? $item['row'] : [];
     $current = (isset($row['current']) && is_array($row['current'])) ? $row['current'] : [];
     $previous = (isset($row['previous_valid']) && is_array($row['previous_valid'])) ? $row['previous_valid'] : [];
+    $aggregation = (isset($row['aggregation']) && is_array($row['aggregation'])) ? $row['aggregation'] : [];
     $ts = (float)($item['ts'] ?? 0);
     return [
         'time' => $ts > 0 ? date('c', (int)$ts) : null,
         'age_h' => $ts > 0 ? round((time() - $ts) / 3600.0, 3) : null,
         'file' => (string)($item['file'] ?? ''),
+        'event_kind' => installCenterGlitchEventKind($row),
+        'sample_count' => installCenterGlitchSampleCount($row),
+        'window_start' => isset($aggregation['window_start_ts']) && is_numeric($aggregation['window_start_ts'])
+            ? date('c', (int)$aggregation['window_start_ts'])
+            : null,
+        'window_end' => isset($aggregation['window_end_ts']) && is_numeric($aggregation['window_end_ts'])
+            ? date('c', (int)$aggregation['window_end_ts'])
+            : null,
         'reasons' => installCenterGlitchReasons($row),
         'grid_w' => $current['grid_w'] ?? null,
         'grid_pm_sum_w' => $current['grid_pm_sum_w'] ?? null,
@@ -1122,22 +1116,55 @@ function installCenterGlitchTopCounts($counts, $limit = 12) {
     return array_slice($counts, 0, max(1, (int)$limit), true);
 }
 
-function installCenterGlitchAddCount(&$counts, $key) {
+function installCenterGlitchAddCount(&$counts, $key, $weight = 1) {
+    $weight = max(0, (int)$weight);
+    if ($weight <= 0) return;
     $key = (string)$key;
     if ($key === '') $key = 'unknown';
-    $counts[$key] = ($counts[$key] ?? 0) + 1;
+    $counts[$key] = ($counts[$key] ?? 0) + $weight;
 }
 
 function installCenterGlitchSituationEvent($item) {
     $row = is_array($item['row'] ?? null) ? $item['row'] : [];
     $current = (isset($row['current']) && is_array($row['current'])) ? $row['current'] : [];
     $previous = (isset($row['previous_valid']) && is_array($row['previous_valid'])) ? $row['previous_valid'] : [];
+    $aggregation = (isset($row['aggregation']) && is_array($row['aggregation'])) ? $row['aggregation'] : [];
     $ts = (float)($item['ts'] ?? 0);
+    $eventKind = installCenterGlitchEventKind($row);
+    $sampleCount = installCenterGlitchSampleCount($row);
+    $maxSampleGapS = isset($aggregation['max_sample_gap_s']) && is_numeric($aggregation['max_sample_gap_s'])
+        ? max(0.0, (float)$aggregation['max_sample_gap_s'])
+        : null;
+    $windowStartTs = isset($aggregation['window_start_ts']) && is_numeric($aggregation['window_start_ts'])
+        ? (float)$aggregation['window_start_ts']
+        : $ts;
+    $windowEndTs = isset($aggregation['window_end_ts']) && is_numeric($aggregation['window_end_ts'])
+        ? (float)$aggregation['window_end_ts']
+        : $ts;
+    if ($windowEndTs < $windowStartTs) $windowEndTs = $windowStartTs;
+    $windowContiguous = (
+        $sampleCount <= 1
+        || ($maxSampleGapS !== null && $maxSampleGapS <= 300.0)
+    );
+    if (!$windowContiguous) {
+        // Historische v2-Sätze ohne Abstandsmetadaten und echte Messlücken
+        // dürfen nicht als lückenloser UI-Burst über das ganze Fenster gelten.
+        $windowStartTs = $ts;
+        $windowEndTs = $ts;
+    }
     return [
         'ts' => $ts,
         'time' => $ts > 0 ? date('c', (int)$ts) : null,
         'hour' => $ts > 0 ? date('H', (int)$ts) : null,
         'file' => (string)($item['file'] ?? ''),
+        'event_kind' => $eventKind,
+        'sample_count' => $sampleCount,
+        'max_sample_gap_s' => $maxSampleGapS,
+        'window_contiguous' => $windowContiguous,
+        'window_start_ts' => $windowStartTs,
+        'window_end_ts' => $windowEndTs,
+        'is_recovery' => $eventKind === 'recovered',
+        'is_close' => in_array($eventKind, ['transition_end', 'shutdown_close'], true),
         'reason_key' => installCenterGlitchReasonKey($row),
         'reasons' => installCenterGlitchReasons($row),
         'errors' => array_slice(is_array($current['errors'] ?? null) ? $current['errors'] : [], 0, 4),
@@ -1172,15 +1199,32 @@ function installCenterGlitchSituationEvent($item) {
 
 function installCenterGlitchNumericStats($events, $key) {
     $values = [];
+    $sampleCount = 0;
     foreach ($events as $event) {
+        $weight = max(0, (int)($event['sample_count'] ?? 1));
+        if ($weight <= 0) continue;
         $num = installCenterGlitchFloat($event[$key] ?? null);
-        if ($num !== null) $values[] = $num;
+        if ($num !== null) {
+            $values[] = $num;
+            $sampleCount += $weight;
+        }
     }
     sort($values, SORT_NUMERIC);
     $count = count($values);
-    if ($count === 0) return ['count' => 0];
+    if ($count === 0) {
+        return [
+            'count' => 0,
+            'sample_count' => 0,
+            'basis' => 'persisted_window_snapshots_unweighted',
+        ];
+    }
     return [
         'count' => $count,
+        'sample_count' => $sampleCount,
+        // Die v2-Datei kennt exakte Samplegewichte, aber keine numerischen
+        // Zwischenwerte. Quantile bleiben deshalb ehrlich ungewichtete
+        // Fenster-Snapshots und werden nicht als 3-Sekunden-Verteilung ausgegeben.
+        'basis' => 'persisted_window_snapshots_unweighted',
         'min' => round($values[0], 1),
         'p50' => round($values[(int)floor(($count - 1) * 0.5)], 1),
         'p90' => round($values[(int)floor(($count - 1) * 0.9)], 1),
@@ -1189,41 +1233,75 @@ function installCenterGlitchNumericStats($events, $key) {
 }
 
 function installCenterGlitchBurstSummary($events) {
-    if (!$events) return ['gap_s' => 300, 'count' => 0, 'largest' => []];
-    usort($events, fn($a, $b) => ((float)($a['ts'] ?? 0) <=> (float)($b['ts'] ?? 0)));
+    $events = array_values(array_filter(
+        $events,
+        fn($event) => max(0, (int)($event['sample_count'] ?? 1)) > 0
+    ));
+    if (!$events) {
+        return [
+            'gap_s' => 300,
+            'method' => 'aggregation_windows',
+            'count' => 0,
+            'largest' => [],
+        ];
+    }
+    usort($events, function ($a, $b) {
+        $startCmp = ((float)($a['window_start_ts'] ?? $a['ts'] ?? 0))
+            <=> ((float)($b['window_start_ts'] ?? $b['ts'] ?? 0));
+        if ($startCmp !== 0) return $startCmp;
+        return ((float)($a['window_end_ts'] ?? $a['ts'] ?? 0))
+            <=> ((float)($b['window_end_ts'] ?? $b['ts'] ?? 0));
+    });
     $bursts = [];
     $current = [];
-    $lastTs = 0.0;
+    $currentEndTs = 0.0;
     foreach ($events as $event) {
-        $ts = (float)($event['ts'] ?? 0);
-        if (!$current || ($ts - $lastTs) <= 300.0) {
+        $startTs = (float)($event['window_start_ts'] ?? $event['ts'] ?? 0);
+        $endTs = max($startTs, (float)($event['window_end_ts'] ?? $event['ts'] ?? 0));
+        if (!$current || ($startTs - $currentEndTs) <= 300.0) {
             $current[] = $event;
+            $currentEndTs = max($currentEndTs, $endTs);
         } else {
             $bursts[] = $current;
             $current = [$event];
+            $currentEndTs = $endTs;
         }
-        $lastTs = $ts;
     }
     if ($current) $bursts[] = $current;
     $largest = [];
     foreach ($bursts as $burst) {
         $first = $burst[0];
-        $last = $burst[count($burst) - 1];
         $reasonCounts = [];
         $wallboxCounts = [];
         $gridCounts = [];
         $pvCounts = [];
+        $eventKindCounts = [];
+        $sampleCount = 0;
+        $snapshotEventCount = 0;
+        $startTs = (float)($first['window_start_ts'] ?? $first['ts'] ?? 0);
+        $endTs = $startTs;
         foreach ($burst as $event) {
-            installCenterGlitchAddCount($reasonCounts, $event['reason_key'] ?? 'unknown');
-            installCenterGlitchAddCount($wallboxCounts, $event['wallbox_state'] ?? 'unknown');
-            installCenterGlitchAddCount($gridCounts, $event['grid_state'] ?? 'unknown');
-            installCenterGlitchAddCount($pvCounts, $event['pv_bucket'] ?? 'unknown');
+            $weight = max(0, (int)($event['sample_count'] ?? 1));
+            $sampleCount += $weight;
+            $snapshotWeight = $weight > 0 ? 1 : 0;
+            $snapshotEventCount += $snapshotWeight;
+            $startTs = min($startTs, (float)($event['window_start_ts'] ?? $event['ts'] ?? 0));
+            $endTs = max($endTs, (float)($event['window_end_ts'] ?? $event['ts'] ?? 0));
+            installCenterGlitchAddCount($reasonCounts, $event['reason_key'] ?? 'unknown', $weight);
+            installCenterGlitchAddCount($wallboxCounts, $event['wallbox_state'] ?? 'unknown', $snapshotWeight);
+            installCenterGlitchAddCount($gridCounts, $event['grid_state'] ?? 'unknown', $snapshotWeight);
+            installCenterGlitchAddCount($pvCounts, $event['pv_bucket'] ?? 'unknown', $snapshotWeight);
+            installCenterGlitchAddCount($eventKindCounts, $event['event_kind'] ?? 'legacy_sample');
         }
         $largest[] = [
-            'count' => count($burst),
-            'start' => $first['time'] ?? null,
-            'end' => $last['time'] ?? null,
-            'duration_min' => round(((float)($last['ts'] ?? 0) - (float)($first['ts'] ?? 0)) / 60.0, 1),
+            'count' => $sampleCount,
+            'observation_count' => $sampleCount,
+            'snapshot_event_count' => $snapshotEventCount,
+            'persisted_event_count' => count($burst),
+            'start' => $startTs > 0 ? date('c', (int)$startTs) : null,
+            'end' => $endTs > 0 ? date('c', (int)$endTs) : null,
+            'duration_min' => round(max(0.0, $endTs - $startTs) / 60.0, 1),
+            'event_kind_counts' => installCenterGlitchTopCounts($eventKindCounts, 8),
             'reason_counts' => installCenterGlitchTopCounts($reasonCounts, 5),
             'wallbox_counts' => installCenterGlitchTopCounts($wallboxCounts, 5),
             'grid_counts' => installCenterGlitchTopCounts($gridCounts, 5),
@@ -1233,6 +1311,7 @@ function installCenterGlitchBurstSummary($events) {
     usort($largest, fn($a, $b) => ((int)($b['count'] ?? 0) <=> (int)($a['count'] ?? 0)));
     return [
         'gap_s' => 300,
+        'method' => 'aggregation_windows',
         'count' => count($bursts),
         'largest' => array_slice($largest, 0, 8),
     ];
@@ -1257,19 +1336,34 @@ function installCenterGlitchSituationWindowSummary($events, $hours) {
         'by_snapshot_source' => [],
         'by_grid_pm_source' => [],
         'top_situations' => [],
+        'event_kind_counts' => [],
     ];
+    $observationCount = 0;
+    $snapshotEventCount = 0;
+    $recoveryEventCount = 0;
+    $closeEventCount = 0;
     foreach ($rows as $event) {
-        installCenterGlitchAddCount($counts['reason_counts'], $event['reason_key'] ?? 'unknown');
-        installCenterGlitchAddCount($counts['by_hour'], $event['hour'] ?? 'unknown');
-        installCenterGlitchAddCount($counts['by_wallbox_state'], $event['wallbox_state'] ?? 'unknown');
-        installCenterGlitchAddCount($counts['by_grid_state'], $event['grid_state'] ?? 'unknown');
-        installCenterGlitchAddCount($counts['by_battery_state'], $event['battery_state'] ?? 'unknown');
-        installCenterGlitchAddCount($counts['by_pv_bucket'], $event['pv_bucket'] ?? 'unknown');
-        installCenterGlitchAddCount($counts['by_home_bucket'], $event['home_bucket'] ?? 'unknown');
-        installCenterGlitchAddCount($counts['by_delta_abs_bucket'], $event['grid_pm_delta_abs_bucket'] ?? 'unknown');
-        installCenterGlitchAddCount($counts['by_delta_sign'], $event['grid_pm_delta_sign'] ?? 'unknown');
-        installCenterGlitchAddCount($counts['by_snapshot_source'], $event['snapshot_source'] ?? 'unknown');
-        installCenterGlitchAddCount($counts['by_grid_pm_source'], $event['grid_pm_source'] ?? 'unknown');
+        $weight = max(0, (int)($event['sample_count'] ?? 1));
+        $observationCount += $weight;
+        // Gründe gehören zur stabilen Aggregationssignatur und dürfen mit der
+        // exakten Samplezahl gewichtet werden. Alle Leistungs-/Situationswerte
+        // sind dagegen nur der eine persistierte Snapshot des Fensters.
+        $snapshotWeight = $weight > 0 ? 1 : 0;
+        $snapshotEventCount += $snapshotWeight;
+        if (!empty($event['is_recovery'])) $recoveryEventCount++;
+        if (!empty($event['is_close'])) $closeEventCount++;
+        installCenterGlitchAddCount($counts['event_kind_counts'], $event['event_kind'] ?? 'legacy_sample');
+        installCenterGlitchAddCount($counts['reason_counts'], $event['reason_key'] ?? 'unknown', $weight);
+        installCenterGlitchAddCount($counts['by_hour'], $event['hour'] ?? 'unknown', $snapshotWeight);
+        installCenterGlitchAddCount($counts['by_wallbox_state'], $event['wallbox_state'] ?? 'unknown', $snapshotWeight);
+        installCenterGlitchAddCount($counts['by_grid_state'], $event['grid_state'] ?? 'unknown', $snapshotWeight);
+        installCenterGlitchAddCount($counts['by_battery_state'], $event['battery_state'] ?? 'unknown', $snapshotWeight);
+        installCenterGlitchAddCount($counts['by_pv_bucket'], $event['pv_bucket'] ?? 'unknown', $snapshotWeight);
+        installCenterGlitchAddCount($counts['by_home_bucket'], $event['home_bucket'] ?? 'unknown', $snapshotWeight);
+        installCenterGlitchAddCount($counts['by_delta_abs_bucket'], $event['grid_pm_delta_abs_bucket'] ?? 'unknown', $snapshotWeight);
+        installCenterGlitchAddCount($counts['by_delta_sign'], $event['grid_pm_delta_sign'] ?? 'unknown', $snapshotWeight);
+        installCenterGlitchAddCount($counts['by_snapshot_source'], $event['snapshot_source'] ?? 'unknown', $snapshotWeight);
+        installCenterGlitchAddCount($counts['by_grid_pm_source'], $event['grid_pm_source'] ?? 'unknown', $snapshotWeight);
         $combo = implode(' | ', [
             $event['reason_key'] ?? 'unknown',
             $event['wallbox_state'] ?? 'unknown',
@@ -1277,13 +1371,20 @@ function installCenterGlitchSituationWindowSummary($events, $hours) {
             $event['pv_bucket'] ?? 'unknown',
             $event['battery_state'] ?? 'unknown',
         ]);
-        installCenterGlitchAddCount($counts['top_situations'], $combo);
+        installCenterGlitchAddCount($counts['top_situations'], $combo, $snapshotWeight);
     }
     return [
-        'count' => count($rows),
-        'per_hour' => round(count($rows) / max(1, (int)$hours), 3),
+        'count' => $observationCount,
+        'observation_count' => $observationCount,
+        'snapshot_event_count' => $snapshotEventCount,
+        'context_count_basis' => 'persisted_snapshots_unweighted',
+        'persisted_event_count' => count($rows),
+        'recovery_event_count' => $recoveryEventCount,
+        'close_event_count' => $closeEventCount,
+        'per_hour' => round($observationCount / max(1, (int)$hours), 3),
         'first' => $rows ? ($rows[0]['time'] ?? null) : null,
         'last' => $rows ? ($rows[count($rows) - 1]['time'] ?? null) : null,
+        'event_kind_counts' => installCenterGlitchTopCounts($counts['event_kind_counts'], 8),
         'reason_counts' => installCenterGlitchTopCounts($counts['reason_counts']),
         'by_hour' => installCenterGlitchTopCounts($counts['by_hour'], 24),
         'by_wallbox_state' => installCenterGlitchTopCounts($counts['by_wallbox_state']),
@@ -1312,16 +1413,32 @@ function installCenterGlitchWindowSummary($events, $hours) {
     $rows = array_values(array_filter($events, fn($item) => (float)($item['ts'] ?? 0) >= $cutoff));
     $reasons = [];
     $files = [];
+    $eventKinds = [];
+    $observationCount = 0;
+    $recoveryEventCount = 0;
+    $closeEventCount = 0;
     foreach ($rows as $item) {
+        $row = is_array($item['row'] ?? null) ? $item['row'] : [];
+        $weight = installCenterGlitchSampleCount($row);
+        $eventKind = installCenterGlitchEventKind($row);
+        $observationCount += $weight;
+        if ($eventKind === 'recovered') $recoveryEventCount++;
+        if (in_array($eventKind, ['transition_end', 'shutdown_close'], true)) $closeEventCount++;
+        installCenterGlitchAddCount($eventKinds, $eventKind);
         $files[(string)($item['file'] ?? '')] = true;
-        foreach (installCenterGlitchReasons($item['row'] ?? []) as $reason) {
-            $reasons[$reason] = ($reasons[$reason] ?? 0) + 1;
+        foreach (installCenterGlitchReasons($row) as $reason) {
+            $reasons[$reason] = ($reasons[$reason] ?? 0) + $weight;
         }
     }
     $last = $rows ? (float)$rows[count($rows) - 1]['ts'] : 0.0;
     return [
-        'count' => count($rows),
-        'per_hour' => round(count($rows) / max(1, (int)$hours), 3),
+        'count' => $observationCount,
+        'observation_count' => $observationCount,
+        'persisted_event_count' => count($rows),
+        'recovery_event_count' => $recoveryEventCount,
+        'close_event_count' => $closeEventCount,
+        'event_kind_counts' => installCenterGlitchTopCounts($eventKinds, 8),
+        'per_hour' => round($observationCount / max(1, (int)$hours), 3),
         'first' => $rows ? date('c', (int)$rows[0]['ts']) : null,
         'last' => $last > 0 ? date('c', (int)$last) : null,
         'last_age_h' => $last > 0 ? round((time() - $last) / 3600.0, 3) : null,
@@ -3584,8 +3701,8 @@ if (isset($_GET['action']) && $_GET['action'] === 'repair_permissions_dry_run') 
         <button class="btn btn-outline-warning rounded-pill" onclick="runGlobalJob('repair_permissions_dry_run', true)">
             <i class="fas fa-user-shield me-1"></i> Wrapper-Test
         </button>
-        <button class="btn btn-outline-danger rounded-pill" onclick="runGlobalWriteJob('repair_permissions')">
-            <i class="fas fa-lock-open me-1"></i> Rechte jetzt reparieren
+        <button class="btn btn-outline-danger rounded-pill" disabled title="Privilegierte Installer-Webjobs sind deaktiviert">
+            <i class="fas fa-lock me-1"></i> Rechte-Reparatur nur administrativ
         </button>
         <button class="btn btn-outline-secondary rounded-pill" onclick="runGlobalAction('write_readiness')">
             <i class="fas fa-user-shield me-1"></i> Freigabe prüfen
@@ -3596,8 +3713,8 @@ if (isset($_GET['action']) && $_GET['action'] === 'repair_permissions_dry_run') 
         <button class="btn btn-outline-secondary rounded-pill" onclick="runGlobalJob('write_permission_plan')">
             <i class="fas fa-clipboard-list me-1"></i> Freigabe-Job
         </button>
-        <button class="btn btn-outline-secondary rounded-pill" onclick="runGlobalJob('write_permission_plan', true)">
-            <i class="fas fa-user-shield me-1"></i> Freigabe via Wrapper
+        <button class="btn btn-outline-secondary rounded-pill" disabled title="Privilegierte Installer-Webjobs sind deaktiviert">
+            <i class="fas fa-lock me-1"></i> Wrapper-Webzugang gesperrt
         </button>
         <button class="btn btn-outline-info rounded-pill" onclick="runGlobalAction('backup_plan')">
             <i class="fas fa-box-archive me-1"></i> Backup-Plan
@@ -3617,12 +3734,38 @@ if (isset($_GET['action']) && $_GET['action'] === 'repair_permissions_dry_run') 
         <button class="btn btn-outline-primary rounded-pill" onclick="runGlobalAction('job_status')">
             <i class="fas fa-clipboard-list me-1"></i> Job-Status
         </button>
-        <span class="text-secondary small">Prüfaktionen lesen nur. Die Rechte-Reparatur kann alte Installationen auch über die vorhandene <code>installer_main.py --fix-permissions</code>-Freigabe bootstrappen.</span>
+        <span class="text-secondary small">Prüfaktionen lesen nur. Installation, Rechte-Reparatur, Update und Rückfall bleiben im Web bis zu einem eigenen engen Launcher gesperrt und benötigen eine administrative Konsole.</span>
     </div>
 
     <div id="installerStatus" class="installer-status skeleton">
         <div class="text-secondary">Lade Installer-Status...</div>
     </div>
+
+    <!-- PV-Prognosediagnose (Verschoben von der Hauptseite) -->
+    <section id="pvForecastDiagnosticBox" class="installer-status mb-4" aria-labelledby="pvForecastDiagnosticTitle">
+        <div class="d-flex justify-content-between align-items-center mb-2">
+            <div id="pvForecastDiagnosticTitle" class="fw-bold"><i class="fas fa-chart-line text-info me-2"></i>PV-Prognosediagnose &amp; Treffergenauigkeit</div>
+            <span id="pv-forecast-diagnostic-status" class="badge text-bg-secondary">Noch keine Auswertung</span>
+        </div>
+        <div id="pv-forecast-diagnostic-card" class="rounded border border-secondary-subtle bg-body-tertiary px-3 py-2 small">
+            <div class="d-flex flex-wrap gap-2 gap-lg-3 text-body">
+                <span title="Typischer absoluter Unterschied je verglichenem 15-Minuten-Fenster">Trefferabweichung: <strong id="pv-forecast-diagnostic-hit">–</strong></span>
+                <span title="Positiv bedeutet im Mittel mehr, negativ weniger Ertrag als vorhergesagt">Richtungsversatz: <strong id="pv-forecast-diagnostic-direction">–</strong></span>
+                <span title="Gesamtabweichung, gewichtet nach der tatsächlich erzeugten Energie">Energieabweichung: <strong id="pv-forecast-diagnostic-energy">–</strong></span>
+                <span title="Anteil der archivierten Prognosefenster mit gültigem Messwert">Abdeckung: <strong id="pv-forecast-diagnostic-coverage">–</strong></span>
+            </div>
+            <div class="d-flex flex-wrap justify-content-between gap-2 mt-2 text-muted">
+                <span id="pv-forecast-diagnostic-sample">Noch keine vergleichbaren Fenster</span>
+                <span>Nur Diagnose – ändert keine Regelung und wählt kein Modell aus.</span>
+            </div>
+            <div id="pv-forecast-diagnostic-contract" class="mt-1 text-warning">
+                Punktprognose – kein belegtes P50.
+            </div>
+            <div id="pv-forecast-diagnostic-horizons" class="mt-1 text-muted">
+                Erfassungs-Vorlauf: noch keine revisionsgebundenen Stichproben.
+            </div>
+        </div>
+    </section>
 
     <section id="ruleCalmAnalysisBox" class="installer-status" aria-labelledby="ruleCalmAnalysisTitle">
         <div>
@@ -3756,6 +3899,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'repair_permissions_dry_run') 
 
 <script>
 const installCenterCsrfToken = <?= json_encode(installCenterCsrfToken(), JSON_UNESCAPED_UNICODE) ?>;
+const serviceControlCsrfToken = <?= json_encode(e3dcCsrfToken(), JSON_UNESCAPED_UNICODE) ?>;
 const groupLabels = {
     core: ['Kernsystem', 'fa-microchip'],
     consumers: ['Verbraucher', 'fa-plug-circle-bolt'],
@@ -3819,9 +3963,26 @@ function statusText(module, serviceInfo, diagnosis) {
     const cfg = diag.config || {};
     const active = Boolean(service.active || (diag.systemd && diag.systemd.active));
     const installed = Boolean(service.exists || (diag.systemd && diag.systemd.exists));
+    const enabledRaw = String(service.enabled_raw || (diag.systemd && diag.systemd.enabled_raw) || '').trim();
+    const enabledKnown = typeof service.enabled_known === 'boolean'
+        ? service.enabled_known
+        : ['enabled', 'disabled'].includes(enabledRaw);
+    const enabled = enabledKnown
+        && enabledRaw === 'enabled'
+        && Boolean(service.enabled || (diag.systemd && diag.systemd.enabled));
     const fresh = Boolean(alive.fresh || (!module.alive_file && active));
     const cfgOk = cfg.ok !== false;
-    return {active, installed, fresh, cfgOk, age: alive.age_s, raw: service.raw_status || (diag.systemd && diag.systemd.raw) || 'unbekannt'};
+    return {
+        active,
+        installed,
+        enabled,
+        enabledKnown,
+        enabledRaw,
+        fresh,
+        cfgOk,
+        age: alive.age_s,
+        raw: service.raw_status || (diag.systemd && diag.systemd.raw) || 'unbekannt'
+    };
 }
 
 function renderModuleReadiness(installBlock) {
@@ -4304,6 +4465,12 @@ function renderModuleNextAction(module, installBlock) {
 
 function renderModuleQuickServiceAction(unit, state, isCore, canService) {
     if (!canService || !state.installed) return '';
+    if (unit === 'e3dc-forecast-evidence.service') {
+        if (state.active && state.enabledKnown && state.enabledRaw === 'enabled') {
+            return `<button class="btn btn-sm btn-outline-primary" disabled><i class="fas fa-circle-check me-1"></i>Dauerhaft aktiv</button>`;
+        }
+        return `<button class="btn btn-sm btn-success" title="Aktiviert den Autostart und startet die rein diagnostische Unit als feste Transaktion" onclick="controlService('${esc(unit)}','activate_forecast_evidence')"><i class="fas fa-toggle-on me-1"></i>Aktivieren &amp; starten</button>`;
+    }
     if (state.active) {
         return `<button class="btn btn-sm btn-outline-info" onclick="controlService('${esc(unit)}','restart')"><i class="fas fa-rotate me-1"></i>Neustart</button>`;
     }
@@ -4321,26 +4488,33 @@ function renderModule(module, serviceInfo, diagnosis, installBlock = null) {
     const config = diagnosis && diagnosis.config ? diagnosis.config : {};
     const unit = serviceKey(module.service_unit);
     const isCore = module.group === 'core' && module.optional === false;
+    const isForecastEvidenceUnit = unit === 'e3dc-forecast-evidence.service';
     const canService = module.actions && module.actions.some(a => ['start','stop','restart','enable','disable'].includes(a));
-    const startDisabled = isCore
+    const startDisabled = isForecastEvidenceUnit
+        ? 'disabled title="Bitte ausschließlich Aktivieren & starten verwenden"'
+        : (isCore
         ? 'disabled title="Kernmodule werden hier nur diagnostiziert oder neu gestartet"'
         : (!canService
             ? 'disabled title="Dienststeuerung für dieses Modul nicht vorgesehen"'
             : (!state.installed
                 ? 'disabled title="Dienst fehlt noch: erst Installations-Check oder Job-Test ausführen"'
-                : (state.active ? 'disabled title="Dienst läuft bereits"' : '')));
-    const restartDisabled = !canService
+                : (state.active ? 'disabled title="Dienst läuft bereits"' : ''))));
+    const restartDisabled = isForecastEvidenceUnit
+        ? 'disabled title="Die Prognosediagnose wird nur über den gebundenen Aktivierungspfad geändert"'
+        : (!canService
         ? 'disabled title="Dienststeuerung für dieses Modul nicht vorgesehen"'
         : (!state.installed
             ? 'disabled title="Dienst fehlt noch: erst Installations-Check oder Job-Test ausführen"'
-            : (isCore ? '' : (state.active ? '' : 'disabled title="Dienst ist inaktiv: bitte Start verwenden"')));
-    const stopDisabled = isCore
+            : (isCore ? '' : (state.active ? '' : 'disabled title="Dienst ist inaktiv: bitte Start verwenden"'))));
+    const stopDisabled = isForecastEvidenceUnit
+        ? 'disabled title="Die Prognosediagnose wird nur über den gebundenen Aktivierungspfad geändert"'
+        : (isCore
         ? 'disabled title="Kernmodule werden hier nicht gestoppt"'
         : (!canService
             ? 'disabled title="Dienststeuerung für dieses Modul nicht vorgesehen"'
             : (!state.installed
                 ? 'disabled title="Dienst fehlt noch: Stop ist nicht nötig"'
-                : (state.active ? '' : 'disabled title="Dienst läuft nicht"')));
+                : (state.active ? '' : 'disabled title="Dienst läuft nicht"'))));
     const hasConfigBlocker = moduleHasConfigBlocker(installBlock);
     const configLink = renderConfigButton(module, config, 'btn btn-sm btn-outline-info', 'Modul-Config');
     const quickServiceAction = renderModuleQuickServiceAction(unit, state, isCore, canService);
@@ -4645,7 +4819,7 @@ function renderRuleCalmAnalysis(data) {
             <div class="result-tile"><strong>Auffälligkeiten</strong>${violations.length ? `<span class="warn">${esc(violations.length)} Muster</span>` : '<span class="ok">keine</span>'}</div>
         </div>
         <div class="result-tile mt-2"><strong>Einordnung</strong>${esc(meaning)}<div class="text-secondary mt-1">${esc(data.privacy_note || 'Read-only Diagnose ohne Hardwarezugriff.')}</div></div>
-        ${evidenceLimit ? `<div class="result-tile warn mt-2"><strong>${legacy ? 'Historischer Schema-Vertrag' : 'Fehlende Domänen'}</strong>${legacy ? 'Public v2 ohne Vollständigkeitsnachweis' : esc(missingServices.map(ruleCalmServiceLabel).join(', '))}<div class="text-secondary mt-1">Diese Auswertung erlaubt keine vollständige Grün-Aussage.</div></div>` : ''}
+        ${evidenceLimit ? `<div class="result-tile warn mt-2"><strong>${legacy ? 'Historischer Schema-Vertrag' : 'Fehlende Domänen'}</strong>${legacy ? 'Public v2 ohne Vollständigkeitsnachweis' : esc(missingServices.map(ruleCalmServiceLabel).join(', '))}<div class="text-secondary mt-1">Diese Auswertung erlaubt keine vollständige Grün-Aussage (z. B. wenn für einen Dienst im geprüften Zeitfenster seit dem Neustart noch keine Befehls- oder Entscheidungsänderung vorlag).</div></div>` : ''}
         <div class="mt-2"><strong>Prüfbereiche</strong><ul class="result-list">${checkRows || '<li>Keine Prüfbereiche gefunden.</li>'}</ul></div>
         <div class="mt-2"><strong>Auffälligkeiten mit Zeitpunkt</strong>${renderRuleCalmViolations(violations)}</div>
         <div class="mt-2"><strong>Zeitachse</strong>${renderRuleCalmTimeline(data)}</div>
@@ -4882,7 +5056,7 @@ function renderWriteGatePreview(data) {
     }
     const checks = data.checks || [];
     const hardBlockers = data.hard_blocker_count || 0;
-    const ready = Boolean(data.ready_for_manual_enable);
+    const ready = Boolean(data.privileged_installer_web_enabled && data.ready_for_manual_enable);
     const rows = checks.map(item => {
         const ok = Boolean(item.ok);
         const hard = Boolean(item.hard);
@@ -4965,7 +5139,7 @@ async function confirmModuleInstall(moduleKey, displayName) {
                 <ul class="result-list">
                     <li><i class="fas fa-check-circle ok me-1"></i>Nur optionale Module aus dem Service-Katalog.</li>
                     <li><i class="fas fa-check-circle ok me-1"></i>Nur hinterlegte Unit und hinterlegtes Script.</li>
-                    <li><i class="fas fa-check-circle ok me-1"></i>Ausführung nur über installer_wrapper.sh run_write_job.</li>
+                    <li><i class="fas fa-lock text-warning me-1"></i>Der frühere gemeinsame installer_wrapper-/Ramdisk-Pfad ist deaktiviert.</li>
                     <li><i class="fas fa-check-circle ok me-1"></i>Core-Dienste und alter C++ Dienst bleiben gesperrt.</li>
                 </ul>
             </div>
@@ -4974,7 +5148,7 @@ async function confirmModuleInstall(moduleKey, displayName) {
             </div>
             <div class="mt-3 d-flex flex-wrap gap-2">
                 <button class="btn btn-sm btn-outline-primary" onclick="runModuleJob('${esc(moduleKey)}','install_module_dry_run')"><i class="fas fa-clipboard-check me-1"></i>Erst Job-Test</button>
-                <button id="confirmInstallButton" class="btn btn-sm btn-success" disabled title="Freigabe-Check wird noch gelesen" onclick="runModuleWriteJob('${esc(moduleKey)}','install_module')"><i class="fas fa-lock-open me-1"></i>Echte Installation starten</button>
+                <button id="confirmInstallButton" class="btn btn-sm btn-success" disabled title="Nur über eine administrative Konsole verfügbar"><i class="fas fa-lock me-1"></i>Webinstallation gesperrt</button>
             </div>
         `
     );
@@ -4984,11 +5158,11 @@ async function confirmModuleInstall(moduleKey, displayName) {
         if (box) box.innerHTML = renderWriteGatePreview(data);
         const installButton = document.getElementById('confirmInstallButton');
         if (installButton) {
-            const ready = Boolean(data && data.ready_for_manual_enable);
+            const ready = Boolean(data && data.privileged_installer_web_enabled && data.ready_for_manual_enable);
             installButton.disabled = !ready;
             installButton.title = ready
-                ? 'Startet die echte Installation über den Installer-Wrapper'
-                : 'Noch gesperrt: zuerst harte Blocker im Freigabe-Check beheben';
+                ? 'Startet über einen aktionsgebundenen sicheren Launcher'
+                : 'Privilegierte Webinstallation ist bis zu einem eigenen engen Launcher gesperrt';
         }
     } catch (err) {
         const box = document.getElementById('writeGatePreview');
@@ -5289,7 +5463,7 @@ function renderWriteRepairResult(data) {
     }).join('');
     const rollbackRows = rollback.map(step => `<li>${esc(step)}</li>`).join('');
     const hardBlockers = readiness.hard_blocker_count || 0;
-    const writePath = data.legacy_fallback ? 'Legacy-Fallback' : 'Wrapper';
+    const writePath = data.privileged_installer_web_enabled ? 'enger Launcher' : 'gesperrt';
     return `
         <div class="result-title"><i class="fas ${data.success ? 'fa-circle-check ok' : 'fa-triangle-exclamation warn'}"></i>Rechte-Reparatur</div>
         <div class="text-secondary small">${esc(data.message || 'Schreibender Wrapper-Job abgeschlossen.')}</div>
@@ -5308,7 +5482,7 @@ function renderWriteRepairResult(data) {
 function renderReadinessResult(data) {
     const checks = data.checks || [];
     const hardBlockers = data.hard_blocker_count || 0;
-    const ready = Boolean(data.ready_for_manual_enable);
+    const ready = Boolean(data.privileged_installer_web_enabled && data.ready_for_manual_enable);
     const rows = checks.map(item => {
         const ok = Boolean(item.ok);
         const label = item.label || item.path || 'Check';
@@ -5699,87 +5873,25 @@ async function runGlobalJob(action, viaWrapper = false) {
 }
 
 async function runGlobalWriteJob(action) {
-    const labels = {
-        repair_permissions: 'Rechte-Reparatur'
-    };
-    if (action !== 'repair_permissions') {
-        document.getElementById('actionLog').innerHTML = '<div class="bad">Diese Schreibaktion ist noch nicht freigegeben.</div>';
-        return;
-    }
-    const ok = window.confirm(`${labels[action] || action} wirklich über den Installer-Wrapper ausführen?\n\nEs werden keine Konfigurationen oder Historien geändert. Betroffen sind nur Webroot-/Ramdisk-Rechte und die sudoers-Wrapper-Freigabe.`);
-    if (!ok) return;
-    const log = document.getElementById('actionLog');
-    log.innerHTML = '<div class="text-warning">Starte schreibenden Wrapper-Job...</div>';
+    const blockedMessage = 'Privilegierte Installer-Webjobs sind deaktiviert. Bitte Rechte-Reparatur, Installation, Update oder Rückfall bis zu einem eigenen engen Launcher über eine administrative Konsole ausführen.';
+    document.getElementById('actionLog').innerHTML = `<div class="bad">${esc(blockedMessage)}</div>`;
     showJobModal(
-        '<i class="fas fa-lock-open text-warning me-2"></i>Schreibender Job läuft',
+        '<i class="fas fa-lock text-warning me-2"></i>Webaktion gesperrt',
         `${esc(actionLabel(action))}`,
-        '<div class="job-progress-box"><i class="fas fa-spinner fa-spin warn me-1"></i>Job wird über den Installer-Wrapper freigegeben...</div>'
+        `<div class="job-progress-box">${esc(blockedMessage)}</div>`
     );
-    if (jobModalRefreshTimer) window.clearInterval(jobModalRefreshTimer);
-    jobModalRefreshTimer = window.setInterval(updateJobModalFromStatus, 2500);
-    const form = new FormData();
-    form.append('job_action', action);
-    form.append('csrf_token', installCenterCsrfToken);
-    try {
-        const res = await fetch('install_center.php?action=run_wrapper_write_job', {method: 'POST', body: form});
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = await res.json();
-        log.innerHTML = renderActionResult(data, action);
-        await refreshInstallerStatusOnly();
-        await updateJobModalFromStatus();
-    } catch (err) {
-        log.innerHTML = `<div class="bad">Schreibender Job fehlgeschlagen: ${esc(err.message || err)}</div>`;
-        document.getElementById('jobModalBody').innerHTML = `<div class="bad">Schreibender Job fehlgeschlagen: ${esc(err.message || err)}</div>`;
-    } finally {
-        if (jobModalRefreshTimer) {
-            window.clearInterval(jobModalRefreshTimer);
-            jobModalRefreshTimer = null;
-        }
-    }
+    return;
 }
 
 async function runModuleWriteJob(moduleKey, action) {
-    if (!['install_module', 'remove_module'].includes(action)) {
-        document.getElementById('actionLog').innerHTML = '<div class="bad">Diese Modul-Schreibaktion ist nicht freigegeben.</div>';
-        return;
-    }
-    const confirmText = action === 'remove_module'
-        ? `Optionales Modul ${moduleKey} wirklich rückbauen?\n\nEs werden nur systemd-Startziel und Autostart entfernt. Config, Historie, Logs und Script bleiben erhalten. Core-Module sind serverseitig gesperrt.`
-        : `Modul ${moduleKey} wirklich installieren?\n\nNur optionale Module aus dem Katalog sind erlaubt. Es wird eine systemd-Unit geschrieben/aktualisiert, daemon-reload ausgeführt, Autostart aktiviert und der Dienst gestartet. Config und Historie werden nicht geändert.`;
-    const ok = window.confirm(confirmText);
-    if (!ok) return;
-    const log = document.getElementById('actionLog');
-    log.innerHTML = '<div class="text-warning">Starte schreibenden Modul-Job...</div>';
+    const blockedMessage = 'Privilegierte Modulinstallationen und -rückbauten sind im Web deaktiviert. Bitte die administrative Konsole verwenden.';
+    document.getElementById('actionLog').innerHTML = `<div class="bad">${esc(blockedMessage)}</div>`;
     showJobModal(
-        action === 'remove_module'
-            ? '<i class="fas fa-box-archive text-warning me-2"></i>Modul-Rückbau läuft'
-            : '<i class="fas fa-lock-open text-success me-2"></i>Modulinstallation läuft',
+        '<i class="fas fa-lock text-warning me-2"></i>Webaktion gesperrt',
         `${esc(moduleKey)}`,
-        '<div class="job-progress-box"><i class="fas fa-spinner fa-spin warn me-1"></i>Job wird über den Installer-Wrapper freigegeben...</div>'
+        `<div class="job-progress-box">${esc(blockedMessage)}</div>`
     );
-    if (jobModalRefreshTimer) window.clearInterval(jobModalRefreshTimer);
-    jobModalRefreshTimer = window.setInterval(updateJobModalFromStatus, 2500);
-    const form = new FormData();
-    form.append('job_action', action);
-    form.append('module', moduleKey);
-    form.append('csrf_token', installCenterCsrfToken);
-    try {
-        const res = await fetch('install_center.php?action=run_wrapper_write_job', {method: 'POST', body: form});
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = await res.json();
-        log.innerHTML = renderActionResult(data, action);
-        await refreshInstallerStatusOnly();
-        await updateJobModalFromStatus();
-        await loadInstallCenter();
-    } catch (err) {
-        log.innerHTML = `<div class="bad">Modul-Schreibjob fehlgeschlagen: ${esc(err.message || err)}</div>`;
-        document.getElementById('jobModalBody').innerHTML = `<div class="bad">Modul-Schreibjob fehlgeschlagen: ${esc(err.message || err)}</div>`;
-    } finally {
-        if (jobModalRefreshTimer) {
-            window.clearInterval(jobModalRefreshTimer);
-            jobModalRefreshTimer = null;
-        }
-    }
+    return;
 }
 
 async function refreshInstallerStatusOnly() {
@@ -5854,15 +5966,29 @@ async function loadInstallCenter() {
 }
 
 async function controlService(service, action) {
-    const labels = {start: 'starten', stop: 'stoppen', restart: 'neu starten'};
+    const labels = {
+        start: 'starten',
+        stop: 'stoppen',
+        restart: 'neu starten',
+        activate_forecast_evidence: 'dauerhaft aktivieren und starten'
+    };
     if (!confirm(`Dienst ${service} wirklich ${labels[action] || action}?`)) return;
     const log = document.getElementById('actionLog');
     log.textContent = `Sende ${action} für ${service}...`;
     const body = new FormData();
     body.append('service', service);
     body.append('action', action);
+    body.append('csrf_token', serviceControlCsrfToken);
     try {
-        const res = await fetch('service_control.php', {method: 'POST', body});
+        const res = await fetch('service_control.php', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: {
+                'X-Requested-With': 'XMLHttpRequest',
+                'X-CSRF-Token': serviceControlCsrfToken
+            },
+            body
+        });
         const data = await res.json();
         log.innerHTML = renderServiceControlResult(data, service, action);
         await loadInstallCenter();
@@ -5871,9 +5997,25 @@ async function controlService(service, action) {
     }
 }
 
+async function loadInstallCenterPvForecastDiagnostics() {
+    try {
+        const response = await fetch('get_forecast_data.php?t=' + Date.now());
+        if (response.ok) {
+            const data = await response.json();
+            if (typeof updatePvForecastDiagnostics === 'function') {
+                updatePvForecastDiagnostics(data);
+            }
+        }
+    } catch (e) {
+        console.warn('Prognosediagnose konnte in der Installationszentrale nicht geladen werden:', e);
+    }
+}
+
 document.addEventListener('DOMContentLoaded', () => {
     loadInstallCenter();
+    loadInstallCenterPvForecastDiagnostics();
     window.setInterval(refreshInstallerStatusOnly, 12000);
+    window.setInterval(loadInstallCenterPvForecastDiagnostics, 15000);
 });
 </script>
 </body>

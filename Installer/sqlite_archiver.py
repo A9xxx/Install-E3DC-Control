@@ -4,6 +4,7 @@
 import json
 import sqlite3
 import os
+import stat
 import datetime
 import sys
 from pathlib import Path
@@ -22,6 +23,51 @@ DB_PATH = os.path.join(DB_DIR, "e3dc_stats.db")
 JSON_PATH = "/var/www/html/ramdisk/daily_stats.json"
 HISTORY_PATH = "/var/www/html/ramdisk/live_history.txt"
 HISTORY_BACKUP_DIR = "/var/www/html/data/history_backups"
+
+DAILY_STATS_MIGRATION_COLUMNS = (
+    'cost_total', 'cost_home', 'cost_bat', 'cost_wb', 'cost_wp',
+    'wb2_consumption', 'cost_wb2', 'climate_consumption', 'cost_climate',
+    'pv_balance_rest', 'bat_balance_rest', 'balance_unknown_rest',
+    'saved_u', 'saved_td', 'saved_wb', 'pv_e3dc', 'pv_external',
+    'pv_source_rest', 'pv_grid', 'bat_grid',
+)
+
+
+def _ensure_mode_if_needed(path, desired_mode):
+    """Ändert Dateirechte nur, wenn der bestehende Modus wirklich abweicht."""
+    try:
+        current_mode = stat.S_IMODE(os.stat(path).st_mode)
+        if current_mode != int(desired_mode):
+            os.chmod(path, int(desired_mode))
+            return True
+    except OSError:
+        return False
+    return False
+
+
+def _upsert_changed(cursor, table, key_column, columns, values):
+    """UPSERT ohne SQLite-Schreibvorgang bei identischem Zeileninhalt."""
+    identifiers = (table, key_column, *columns)
+    if not all(str(value).replace('_', '').isalnum() for value in identifiers):
+        raise ValueError("Ungültiger SQLite-Bezeichner")
+    update_columns = tuple(column for column in columns if column != key_column)
+    placeholders = ', '.join('?' for _ in columns)
+    assignments = ', '.join(
+        f"{column}=excluded.{column}" for column in update_columns
+    )
+    changed_where = ' OR '.join(
+        f"{table}.{column} IS NOT excluded.{column}" for column in update_columns
+    )
+    cursor.execute(
+        f"""
+        INSERT INTO {table} ({', '.join(columns)})
+        VALUES ({placeholders})
+        ON CONFLICT({key_column}) DO UPDATE SET {assignments}
+        WHERE {changed_where}
+        """,
+        tuple(values),
+    )
+    return cursor.rowcount > 0
 
 def export_backed_pv_total(pv_yield, grid_out, bat_out, exact_counter_present=False, source=""):
     pv = max(0.0, float(pv_yield or 0.0))
@@ -73,12 +119,13 @@ def init_db():
         )
     ''')
 
-    # Automatische Migration: Neue Spalten hinzufügen
-    for col in ['cost_total', 'cost_home', 'cost_bat', 'cost_wb', 'cost_wp', 'wb2_consumption', 'cost_wb2', 'climate_consumption', 'cost_climate', 'pv_balance_rest', 'bat_balance_rest', 'balance_unknown_rest', 'saved_u', 'saved_td', 'saved_wb', 'pv_e3dc', 'pv_external', 'pv_source_rest', 'pv_grid', 'bat_grid']:
-        try:
+    # Automatische Migration nur für tatsächlich fehlende Spalten.
+    existing_columns = {
+        str(row[1]) for row in cursor.execute("PRAGMA table_info(daily_stats)")
+    }
+    for col in DAILY_STATS_MIGRATION_COLUMNS:
+        if col not in existing_columns:
             cursor.execute(f"ALTER TABLE daily_stats ADD COLUMN {col} REAL DEFAULT 0")
-        except sqlite3.OperationalError:
-            pass # Spalte existiert bereits, alles gut!
 
     # Tabelle für Machine Learning Trainingsdaten (15-Minuten Raster aus Ertrag.X.txt)
     cursor.execute('''
@@ -97,15 +144,15 @@ def init_db():
     conn.commit()
     return conn
 
-def archive_today():
+def archive_today(conn=None):
     if not os.path.exists(JSON_PATH):
-        return
+        return 0
 
     try:
         with open(JSON_PATH, 'r') as f:
             data = json.load(f)
     except Exception:
-        return
+        return 0
 
     stats = data.get('stats', {})
     costs = data.get('costs', {})
@@ -235,25 +282,42 @@ def archive_today():
 
     # Sanity check: Nur speichern, wenn E3DC heute wirklich Werte geliefert hat
     if pv_yield == 0 and home_consumption == 0:
-        return
+        return 0
 
-    conn = init_db()
-    cursor = conn.cursor()
-    # INSERT OR REPLACE sorgt dafür, dass die Zeile für heute stündlich überschrieben/geupdatet wird
-    cursor.execute('''
-        INSERT OR REPLACE INTO daily_stats
-        (date, pv_yield, home_consumption, grid_in, grid_out, bat_in, bat_out, wb_consumption, wb2_consumption, wp_consumption, climate_consumption, autarky, self_con, cost_total, cost_home, cost_bat, cost_wb, cost_wb2, cost_wp, cost_climate, pv_balance_rest, bat_balance_rest, balance_unknown_rest, saved_u, saved_td, saved_wb, pv_e3dc, pv_external, pv_source_rest, pv_grid, bat_grid)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (today, pv_yield, home_consumption, grid_in, grid_out, bat_in, bat_out, wb_consumption, wb2_consumption, wp_consumption, climate_consumption, autarky, self_con, cost_total, cost_home, cost_bat, cost_wb, cost_wb2, cost_wp, cost_climate, pv_balance_rest, bat_balance_rest, balance_unknown_rest, saved_u, saved_td, saved_wb, pv_e3dc, pv_external, pv_source_rest, pv_grid, bat_grid))
-    conn.commit()
-    conn.close()
+    owns_connection = conn is None
+    db_conn = init_db() if owns_connection else conn
+    columns = (
+        'date', 'pv_yield', 'home_consumption', 'grid_in', 'grid_out',
+        'bat_in', 'bat_out', 'wb_consumption', 'wb2_consumption',
+        'wp_consumption', 'climate_consumption', 'autarky', 'self_con',
+        'cost_total', 'cost_home', 'cost_bat', 'cost_wb', 'cost_wb2',
+        'cost_wp', 'cost_climate', 'pv_balance_rest', 'bat_balance_rest',
+        'balance_unknown_rest', 'saved_u', 'saved_td', 'saved_wb',
+        'pv_e3dc', 'pv_external', 'pv_source_rest', 'pv_grid', 'bat_grid',
+    )
+    values = (
+        today, pv_yield, home_consumption, grid_in, grid_out, bat_in, bat_out,
+        wb_consumption, wb2_consumption, wp_consumption, climate_consumption,
+        autarky, self_con, cost_total, cost_home, cost_bat, cost_wb, cost_wb2,
+        cost_wp, cost_climate, pv_balance_rest, bat_balance_rest,
+        balance_unknown_rest, saved_u, saved_td, saved_wb, pv_e3dc,
+        pv_external, pv_source_rest, pv_grid, bat_grid,
+    )
+    changed = _upsert_changed(
+        db_conn.cursor(),
+        'daily_stats',
+        'date',
+        columns,
+        values,
+    )
+    if owns_connection:
+        db_conn.commit()
+        db_conn.close()
 
-    # Rechte setzen, damit PHP/Webserver die DB später lesen können
-    try:
-        os.chmod(DB_PATH, 0o664)
-        os.chmod(DB_DIR, 0o775)
-    except:
-        pass
+    # Rechte für PHP/Webserver, aber ohne stündlich identische chmod-Aufrufe.
+    _ensure_mode_if_needed(DB_PATH, 0o664)
+    _ensure_mode_if_needed(DB_DIR, 0o775)
+    return int(changed)
 
 def _float_value(value, default=0.0):
     try:
@@ -610,7 +674,7 @@ def _integrated_energy_from_history(rows):
         last = row
     return totals
 
-def repair_recent_daily_stats(days=2, today=None):
+def repair_recent_daily_stats(days=2, today=None, conn=None):
     """Repair recent SQLite day rows from exact counters in live_history/backups.
 
     This catches stale rows written before the current longterm calculation was
@@ -618,8 +682,9 @@ def repair_recent_daily_stats(days=2, today=None):
     still available.
     """
     today = today or datetime.date.today()
-    conn = init_db()
-    cursor = conn.cursor()
+    owns_connection = conn is None
+    db_conn = init_db() if owns_connection else conn
+    cursor = db_conn.cursor()
     repaired = 0
     for offset in range(max(1, int(days))):
         day = today - datetime.timedelta(days=offset)
@@ -710,8 +775,9 @@ def repair_recent_daily_stats(days=2, today=None):
         )
         repaired += 1
         print(f"  [FIX] daily_stats {day_s}: Hausverbrauch {old_home:.2f} -> {home:.2f} kWh aus History/RSCP korrigiert.")
-    conn.commit()
-    conn.close()
+    if owns_connection:
+        db_conn.commit()
+        db_conn.close()
     return repaired
 
 def repair_wallbox_exact_counter_rollout_once(days=30, today=None):
@@ -724,7 +790,7 @@ def repair_wallbox_exact_counter_rollout_once(days=30, today=None):
         os.makedirs(DB_DIR, exist_ok=True)
         with open(marker, "w", encoding="utf-8") as f:
             f.write(datetime.datetime.now().isoformat() + f"\nrepaired={repaired}\n")
-        os.chmod(marker, 0o664)
+        _ensure_mode_if_needed(marker, 0o664)
     except Exception as exc:
         print(f"  [WARN] Wallbox-Zähler-Reparaturmarker konnte nicht geschrieben werden: {exc}")
     return repaired
@@ -753,28 +819,58 @@ def import_ertrag_file(filepath, file_date, cursor):
 
                     record_id = f"{file_date.isoformat()}_{time_gmt:.2f}"
 
-                    cursor.execute('''
-                        INSERT OR REPLACE INTO ml_training_data
-                        (id, date, time_gmt, pv_prog_pct, pv_real_pct, home_kwh_cum, wp_kwh_cum, temp_c, grid_kwh_cum)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ''', (record_id, file_date.isoformat(), time_gmt, pv_prog_pct, pv_real_pct, home_kwh_cum, wp_kwh_cum, temp_c, grid_kwh_cum))
-                    count += 1
+                    columns = (
+                        'id', 'date', 'time_gmt', 'pv_prog_pct', 'pv_real_pct',
+                        'home_kwh_cum', 'wp_kwh_cum', 'temp_c', 'grid_kwh_cum',
+                    )
+                    values = (
+                        record_id, file_date.isoformat(), time_gmt, pv_prog_pct,
+                        pv_real_pct, home_kwh_cum, wp_kwh_cum, temp_c,
+                        grid_kwh_cum,
+                    )
+                    if _upsert_changed(
+                        cursor,
+                        'ml_training_data',
+                        'id',
+                        columns,
+                        values,
+                    ):
+                        count += 1
                 except ValueError: pass
     except Exception: pass
     return count
 
-def archive_ml_data():
+def archive_ml_data(conn=None):
     """Liest die Ertrag.X.txt Datei des heutigen Tages."""
     today = datetime.date.today()
     ertrag_file = os.path.join(get_install_path(), f"Ertrag.{today.day}.txt")
 
-    if not os.path.exists(ertrag_file): return
+    if not os.path.exists(ertrag_file):
+        return 0
 
+    owns_connection = conn is None
+    db_conn = init_db() if owns_connection else conn
+    changed = import_ertrag_file(ertrag_file, today, db_conn.cursor())
+    if owns_connection:
+        db_conn.commit()
+        db_conn.close()
+    return changed
+
+
+def run_hourly_archive():
+    """Bündelt reguläre Stundenwerte in einer gemeinsamen SQLite-Transaktion."""
+    repair_wallbox_exact_counter_rollout_once(days=30)
     conn = init_db()
-    cursor = conn.cursor()
-    import_ertrag_file(ertrag_file, today, cursor)
-    conn.commit()
-    conn.close()
+    try:
+        archive_today(conn=conn)
+        repair_recent_daily_stats(days=2, conn=conn)
+        archive_ml_data(conn=conn)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 def backfill_ml_data():
     """Liest ALLE vergangenen Ertrag.X.txt Dateien für das ML-Training ein."""
@@ -813,7 +909,4 @@ if __name__ == "__main__":
         print("Starte Historien-Import (Backfill) für Machine Learning...")
         backfill_ml_data()
     else:
-        archive_today()
-        repair_wallbox_exact_counter_rollout_once(days=30)
-        repair_recent_daily_stats(days=2)
-        archive_ml_data()
+        run_hourly_archive()

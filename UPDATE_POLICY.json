@@ -1,9 +1,9 @@
 {
-  "version": "5.4.2d",
+  "version": "5.4.3",
   "min_version": "4.0.0",
-  "stable_release": "v5.4.2d",
-  "release_date": "2026-07-28",
-  "description": "v5.4.2d - Dienst-Endzustand und robuster systemd-Maskenrücklauf",
+  "stable_release": "v5.4.3",
+  "release_date": "2026-08-10",
+  "description": "v5.4.3 - Sichere Installation, Docker-Updates, EMS-Steuerung und Prognoseanzeige",
   "installer_requires": "python3",
   "sanitized_republication": false,
   "history_transition": {

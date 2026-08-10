@@ -21,11 +21,13 @@ try:
         append_summary_if_due,
         archive_forecast_snapshot,
         enforce_retention,
+        extract_forecast_issue_contract,
         initialize_database,
         publish_summary_json,
         single_writer_lock,
         store_history_observations,
         unavailable_summary,
+        unavailable_summary_with_retained_continuity,
     )
     from e3dc_history_slots import HISTORY_DEFAULT_SLOT_COUNT, read_recent_closed_slots
     from rscp_client import RscpConnection
@@ -38,11 +40,13 @@ except ImportError:  # pragma: no cover - Paketimport
         append_summary_if_due,
         archive_forecast_snapshot,
         enforce_retention,
+        extract_forecast_issue_contract,
         initialize_database,
         publish_summary_json,
         single_writer_lock,
         store_history_observations,
         unavailable_summary,
+        unavailable_summary_with_retained_continuity,
     )
     from Installer.e3dc_history_slots import (
         HISTORY_DEFAULT_SLOT_COUNT,
@@ -63,6 +67,18 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
+
+
+def _typed_reason(exc: BaseException, fallback: str) -> str:
+    text = str(exc or "").strip()
+    if text and len(text) <= 80 and all(
+        character.isalnum() or character in {"_", "-"}
+        for character in text
+    ):
+        return text
+    if isinstance(exc, FileNotFoundError):
+        return f"{fallback}_missing"
+    return fallback
 
 
 def _bounded_json_file(path: str, *, max_bytes: int) -> tuple[Any, os.stat_result]:
@@ -100,10 +116,13 @@ def load_current_forecast(
     path: str = FORECAST_PATH,
     *,
     now_utc_s: int | None = None,
-) -> tuple[list[dict[str, Any]], str]:
+) -> tuple[list[dict[str, Any]], str, int, dict[str, Any] | None]:
     value, file_stat = _bounded_json_file(path, max_bytes=MAX_FORECAST_BYTES)
     now_s = int(time.time() if now_utc_s is None else now_utc_s)
-    if now_s - int(file_stat.st_mtime) > MAX_FORECAST_AGE_S:
+    published_at_utc_s = int(file_stat.st_mtime)
+    if published_at_utc_s > now_s + 300:
+        raise ValueError("forecast_timestamp_in_future")
+    if now_s - published_at_utc_s > MAX_FORECAST_AGE_S:
         raise ValueError("forecast_stale")
     if not isinstance(value, list) or not value:
         raise ValueError("forecast_root_invalid")
@@ -119,7 +138,8 @@ def load_current_forecast(
     revision = next(iter(revisions))
     if not revision.startswith("sha256:") or len(revision) != 71:
         raise ValueError("forecast_topology_revision_invalid")
-    return slots, revision
+    issue_contract = extract_forecast_issue_contract(slots)
+    return slots, revision, published_at_utc_s, issue_contract
 
 
 def diagnostics_enabled(config: dict[str, Any]) -> bool:
@@ -171,28 +191,52 @@ def run_cycle(
     now_utc_s: int | None = None,
 ) -> dict[str, Any]:
     now_s = int(time.time() if now_utc_s is None else now_utc_s)
-    config = load_runtime_config(config_path)
+    try:
+        config = load_runtime_config(config_path)
+    except Exception as exc:
+        reason = _typed_reason(exc, "runtime_config_unavailable")
+        payload = unavailable_summary(None, reason, now_utc_s=now_s)
+        publish_summary_json(payload, summary_path=summary_path)
+        return {"status": "unavailable", "reason": reason, "control_effect": False}
     if not diagnostics_enabled(config):
         return {"status": "disabled", "control_effect": False}
 
     try:
-        forecast_slots, revision = load_current_forecast(
+        (
+            forecast_slots,
+            revision,
+            published_at_utc_s,
+            forecast_issue_contract,
+        ) = load_current_forecast(
             forecast_path,
             now_utc_s=now_s,
         )
     except Exception as exc:
-        payload = unavailable_summary(None, str(exc), now_utc_s=now_s)
+        reason = _typed_reason(exc, "forecast_source_unavailable")
+        payload = unavailable_summary(None, reason, now_utc_s=now_s)
         publish_summary_json(payload, summary_path=summary_path)
-        return {"status": "unavailable", "reason": str(exc), "control_effect": False}
+        return {"status": "unavailable", "reason": reason, "control_effect": False}
+    if forecast_issue_contract is None:
+        reason = "producer_issue_contract_missing"
+        payload = unavailable_summary_with_retained_continuity(
+            revision,
+            reason,
+            now_utc_s=now_s,
+            database_path=database_path,
+        )
+        publish_summary_json(payload, summary_path=summary_path)
+        return {"status": "unavailable", "reason": reason, "control_effect": False}
 
     history_status = "stored"
-    with single_writer_lock(lock_path):
-        try:
+    try:
+        with single_writer_lock(lock_path):
             initialize_database(database_path)
             enforce_retention(now_utc_s=now_s, database_path=database_path)
             archive_result = archive_forecast_snapshot(
                 forecast_slots,
-                issued_at_utc_s=now_s,
+                forecast_issue_contract=forecast_issue_contract,
+                published_at_utc_s=published_at_utc_s,
+                captured_at_utc_s=now_s,
                 database_path=database_path,
             )
             try:
@@ -212,10 +256,16 @@ def run_cycle(
                 now_utc_s=now_s,
                 database_path=database_path,
             )
-        except EvidenceLimitError:
-            raise
-        except Exception:
-            raise
+    except Exception as exc:
+        reason = _typed_reason(exc, "evidence_writer_failed")
+        payload = unavailable_summary(revision, reason, now_utc_s=now_s)
+        publish_summary_json(payload, summary_path=summary_path)
+        return {
+            "status": "unavailable",
+            "reason": reason,
+            "topology_revision": revision,
+            "control_effect": False,
+        }
 
     publish_summary_json(summary, summary_path=summary_path)
     return {

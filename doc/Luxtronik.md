@@ -91,6 +91,12 @@ Das Skript läuft als Systemd-Service (`energy_manager`) im Hintergrund.
     *   Wird Strom aus dem Netz bezogen (> 50W) oder die Batterie entladen?
     *   -> Ein Timer startet. Nach 10 Minuten Defizit wird der **Boost AUS** geschaltet (Reset auf Normalwerte).
 
+Der vollständige Minutenverlauf bleibt als begrenzter Live-Puffer in der
+RAM-Disk. Das persistente Luxtronik-Betriebsarchiv schreibt höchstens eine
+kompakte Stützstelle je fünf Minuten und bewahrt diese Tagesdateien sieben Tage
+auf. Es ist damit ein kurzzeitiges Betriebsarchiv, kein Langzeit- oder
+Sicherungsarchiv.
+
 ### Das Web-Interface (`waermepumpe.php`)
 Die PHP-Datei visualisiert die Daten:
 *   **Live-Werte:** Temperaturen (Vorlauf, Rücklauf, WW, Außen), Leistung, COP (Wirkungsgrad).

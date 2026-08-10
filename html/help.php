@@ -115,7 +115,7 @@ $paths = getInstallPaths();
     <div class="container">
         <div class="d-flex justify-content-between align-items-center mb-4">
             <a href="index.php" class="nav-link-back"><i class="fas fa-arrow-left me-2"></i>Dashboard</a>
-            <span class="badge bg-success text-light">v5.4.2d Stable</span>
+            <span class="badge bg-success text-light">v5.4.3 Stable</span>
         </div>
         <h1 class="display-4 fw-bold">Hilfe & Support</h1>
         <p class="lead opacity-75">Häufige Fragen und Lösungen rund um E3DC-Control.</p>
@@ -134,16 +134,21 @@ $paths = getInstallPaths();
         <div class="col-12 faq-item" data-tags="docker image stable rollback update">
             <div class="card bg-card border-0 shadow-sm"><div class="card-body">
                 <h5 class="card-title"><span class="tag">Docker</span> Wie prüfe ich Image und Update?</h5>
-                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem geprüften Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.2d</code> in <code>.env</code> gesetzt.</p>
-                <pre>(
-  set -euo pipefail
-  docker compose config --images
-  docker compose pull e3dc-control
-  docker compose up -d --force-recreate e3dc-control
-  docker inspect e3dc-control --format '{{.Config.Image}} {{.State.Status}}'
-  docker exec e3dc-control cat /app/pi/Install/VERSION
-)</pre>
-                <p>Der nicht mehr gepflegte Watchtower ist wegen seines weitreichenden Docker-Socket-Zugriffs kein Standardstart. Der bewusste Opt-in lautet <code>docker compose --profile auto-update up -d watchtower</code>; ohne diesen Befehl bleibt der manuelle Updateweg aktiv.</p>
+                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem geprüften Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.3</code> in <code>.env</code> gesetzt.</p>
+                <pre>cd "${E3DC_DOCKER_PATH:-$HOME/e3dc-docker}"
+if [ -f ./docker_compose_update.py ]; then
+  E3DC_DOCKER_HELPER=./docker_compose_update.py
+elif [ -f ./Installer/docker_compose_update.py ]; then
+  E3DC_DOCKER_HELPER=./Installer/docker_compose_update.py
+else
+  echo "docker_compose_update.py fehlt; aktuellen Release-Verwaltungsbaum bereitstellen." >&2
+  exit 2
+fi
+sudo python3 "$E3DC_DOCKER_HELPER" --compose-dir . --sudo
+sudo docker compose logs --tail=80 e3dc-control</pre>
+                <p>Der Host-Helfer zieht das gewählte GHCR-Image ausdrücklich, bindet seine SHA-256-ID und OCI-Version vor dem Start, wartet auf den imagegebundenen Healthcheck und verlangt zwei identische Laufzeit-Snapshots. Scheitert Start, Warten, Snapshot oder Versionsabgleich, stoppt er den Kandidaten und bestätigt dessen Stillstand.</p>
+                <p>Der nicht mehr gepflegte Watchtower ist wegen seines weitreichenden Docker-Socket-Zugriffs kein Standardstart. Für den bewussten Opt-in muss in <code>.env</code> zusätzlich <code>E3DC_WATCHTOWER_ENABLE=true</code> gesetzt und danach das Profil <code>auto-update</code> gestartet werden. Ohne das Label-Opt-in bleibt auch ein versehentlich gestarteter Watchtower wirkungslos.</p>
+                <p><strong>HA-Abgrenzung:</strong> Docker ist nur mit exakt <code>ha_mode=off</code> freigegeben. HA-Master/-Slave und Shadow bleiben Bare-Metal-Betriebsarten. Der Container projiziert den persistenten Instanzrollenanker create-once auf <code>off</code> und stoppt vor jedem Hardware-Writer, wenn Konfiguration und Anker nicht exakt passen. Beim ersten Wechsel einer nativen Installation verhindert ausschließlich der Installer-Menüpunkt <strong>31</strong> die Doppelsteuerung durch kontrolliertes Stoppen und Deaktivieren aller Host-Dienste. Zusätzlich werden manuelle Hardware-Writer und Legacy-Screens über zwei stabile <code>/proc</code>-Snapshots erkannt und blockieren die Migration; der Installer beendet sie nicht. Ein vorhandener E3DC-Container, eine vorhandene Compose-Datei oder bereits verwaltete E3DC-Docker-Daten stoppen diesen Migrationsweg vor der ersten Änderung; bestehende Docker-Installationen nutzen den Compose-Updateweg.</p>
                 <p>Der Docker-Rückfall erfolgt ausschließlich auf ein in der Update-Policy mit <code>docker_supported</code> freigegebenes Image. <code>v5.3.2b</code> ist nicht als Bare-Metal-Programm-Rückfall freigegeben.</p>
             </div></div>
         </div>
@@ -207,6 +212,27 @@ $paths = getInstallPaths();
                         <li>Nach der Freigabe im Account den RESTful API Security Token erzeugen.</li>
                         <li>Im Config-Editor unter <em>Tarif</em> den ENTSO-E-Token als Fallback-Token eintragen und mit <em>ENTSO-E testen</em> prüfen.</li>
                     </ol>
+                </div>
+            </div>
+        </div>
+
+        <h4 class="mb-4 text-accent"><i class="fas fa-layer-group me-2"></i>Stable 5.4.3: Installation, Regelung und Übersicht</h4>
+        <div class="col-12 faq-item" data-tags="5.4.3 stable bookworm docker speicher direktvermarktung wallbox openwb waermepumpe heizstab prognose ladekurve soc sicherheit rollback">
+            <div class="card bg-card border-0 shadow-sm">
+                <div class="card-body">
+                    <h5 class="card-title">
+                        <span class="tag">5.4.3</span>
+                        Was bringt das Stable-Release 5.4.3?
+                    </h5>
+                    <ul>
+                        <li><strong>Installation und Update:</strong> Eine frische Bookworm-Installation läuft in einer festen, geprüften Reihenfolge. Fehler werden verständlich gemeldet und ein vorhandener funktionierender Zustand wird nicht durch eine unvollständige Installation ersetzt.</li>
+                        <li><strong>Docker:</strong> Installation und Update werden auf dem Docker-Host ausgeführt. Architektur, vorhandene Instanzen und die tatsächlich gestarteten Dienste werden geprüft; ein fehlerhafter neuer Container wird wieder gestoppt.</li>
+                        <li><strong>Speicher und Direktvermarktung:</strong> Netzladen benötigt eine belegte Gesamtunterdeckung. DV-Plan, tatsächliche Wirkung und Ausführungseigentümer bleiben getrennt, damit keine konkurrierenden Speicherbefehle entstehen.</li>
+                        <li><strong>Wallbox und openWB:</strong> Neue Stecksessions, Reichweite, Startantwort und Ladeende werden zuverlässiger erkannt. Ein kurzer 0-W-Wert beendet die Ladung nicht, und die Phasenwechselsperre blockiert nur einen weiteren Wechsel.</li>
+                        <li><strong>Wärmepumpe und Heizstab:</strong> Wallbox, Wärmepumpe und Heizstab teilen den verfügbaren Leistungsrahmen nach der eingestellten Priorität. Nicht genutzte Startleistung wird wieder freigegeben, ohne Schutzzeiten oder Mindestlaufzeiten zu umgehen.</li>
+                        <li><strong>Prognose und Ladekurve:</strong> Mit Direktvermarktung erscheint nur die DV-Prognose, sonst nur die Standardprognose. Der aktuelle SoC wird als eigener frischer Messpunkt gezeigt; die Diagramme laden schneller und besitzen einen übersichtlicheren Zeitstrahl.</li>
+                        <li><strong>Sicherheit und Rückfall:</strong> Fehlende, veraltete oder widersprüchliche Daten bleiben ohne neue Hardwarefreigabe. Update und Rückfall prüfen Dienste, Rollen und Gesundheit vollständig; Diagnose- und Shadow-Funktionen bleiben ohne Steuerwirkung.</li>
+                    </ul>
                 </div>
             </div>
         </div>
@@ -300,9 +326,30 @@ $paths = getInstallPaths();
                         <li><strong>DV-Planer-Shadow:</strong> Ein zusätzlicher wirkungsloser Diagnosevertrag prüft die fünf eindeutigen Speicheraktionen gegen Planbindung, Datenfrische, Topologie, Netzpunkt und Reserve. Er verändert weder die laufende Regelung noch Plan-/Slot-Identitäten.</li>
                         <li><strong>E3/DC-PV-Ladebegrenzung:</strong> Geplante Speicherladung kann sanft auf die frische E3/DC-PV-Leistung begrenzt werden. Entladen bleibt in AUTO offen; Leistung eines zusätzlichen AC-Wechselrichters erhöht den Rahmen nicht.</li>
                         <li><strong>Peak Shaving:</strong> Die neue Lastspitzenbegrenzung schützt feste Zähler-Viertelstunden mit Sicherheitsabstand, Hysterese, Messlückenprüfung und einem Speicherpuffer oberhalb der Notstromreserve. Sie ist standardmäßig aus.</li>
-                        <li><strong>PV-Prognosediagnose:</strong> Ein optionaler read-only Dienst vergleicht Prognose und abgeschlossene E3/DC-DC-Historie. Rohdaten bleiben privat; es gibt keine Rückwirkung auf Prognosemodell oder Regelung.</li>
+                        <li><strong>PV-Prognosediagnose:</strong> Ein optionaler read-only Dienst vergleicht die sichtbare E3/DC-DC-Punktprognose nach Erfassungs-Vorlauf mit abgeschlossener Historie. Rohdaten bleiben privat; ein P50 wird nicht behauptet und es gibt keine Rückwirkung auf Prognosemodell oder Regelung.</li>
                         <li><strong>Installation:</strong> Frische, unvollständige und widersprüchliche Installationen werden getrennt behandelt. Fehler werden bis zum Exitcode weitergegeben und nicht mehr als erfolgreicher Abschluss angezeigt. Ein aus 5.4.0a gestarteter Altprozess kann nach dem verifizierten Baumwechsel mit seinem gecachten Backup-Validator sicher fortfahren.</li>
                         <li><strong>Oberfläche:</strong> Tarifoptionen, Speicherzustand und Zwei-Wallbox-Konfiguration sind klarer gruppiert und in verständlicher Sprache beschrieben.</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+
+        <div class="col-12 faq-item" data-tags="diagnose shadow waerme intent prognose quantil keine regelwirkung">
+            <div class="faq-card">
+                <div class="faq-question">
+                    <div>
+                        <span class="tag">Diagnose</span>
+                        Was bedeutet der Wärme-Intent im Shadow?
+                    </div>
+                    <i class="fas fa-chevron-down"></i>
+                </div>
+                <div class="faq-answer">
+                    <p>Der Wärme-Intent ist ein lokaler, revisionsgebundener Diagnosevertrag. Er vergleicht einen möglichen Wärmebedarf mit konservativer PV-Deckung und zeigt, ob Plan, Zeitslot und Prognoseevidenz vollständig zusammenpassen.</p>
+                    <ul>
+                        <li><strong>Keine Hardwarewirkung:</strong> Der Vertrag ist immer <code>shadow_only</code>, erlaubt keine Befehle und kann weder Wärmepumpe noch Heizstab ansteuern.</li>
+                        <li><strong>Keine automatische Freigabe:</strong> Auch ein vollständig belegter Intent wählt keinen aktiven Regler aus und ändert keine Konfiguration.</li>
+                        <li><strong>Quantile statt Scheinsicherheit:</strong> Eine bloße Punktprognose beziehungsweise ein einzelner Medianwert reicht für eine konservative Wärmeentscheidung nicht aus.</li>
+                        <li><strong>Hochpreis bleibt Shadow:</strong> Allgemeine teure Preisfenster dürfen ohne eigenen ausdrücklichen Aktivierungsvertrag keine Wärmepumpenpause und keinen Warmwasserabbruch auslösen.</li>
                     </ul>
                 </div>
             </div>
@@ -317,7 +364,7 @@ $paths = getInstallPaths();
 Was korrigiert das Stable-Release 5.4.1d?
                     </h5>
                     <ul>
-                        <li><strong>Klima im Docker:</strong> Der read-only Messworker läuft genau einmal und übernimmt Aktivierung, Deaktivierung sowie Shelly-Kanalwechsel im nächsten Abfragezyklus. Bei <code>Aus</code> erfolgen weder Shelly-Abfrage noch neue Verlaufseinträge.</li>
+                        <li><strong>Klima im Docker:</strong> Ein beim Containerstart aktivierter read-only Messworker übernimmt Deaktivierung und Shelly-Kanalwechsel im nächsten Abfragezyklus. Für die erstmalige Aktivierung aus <code>Aus</code> ist wie bei anderen optionalen Docker-Diensten ein Container-Neustart erforderlich.</li>
                         <li><strong>ML-Backup:</strong> Der laufende Updater kann vor dem Backup ausschließlich einen eindeutig sicheren und unbelegten Alt-Lock auf den Installationsbenutzer und Modus <code>0600</code> normalisieren. Modell, Manifest und Lockinhalt bleiben unverändert.</li>
                         <li><strong>Bereits blockierte Altstände:</strong> Updater bis einschließlich 5.4.1c benötigen bei der exakten Meldung <code>Unsicherer privater ML-Eintrag: .ml_model.lock</code> einmalig den dokumentierten Metadaten-Feldfix. Die Sperrdatei darf nicht gelöscht werden.</li>
                         <li><strong>Batterie-Vitals:</strong> Ein bestätigter DCB-Packindex darf als <code>Uint16</code> oder <code>Int32</code> zurückkommen. Negative, nichtnumerische oder vom angeforderten Pack abweichende Werte bleiben gesperrt.</li>
@@ -641,7 +688,17 @@ Was korrigiert das Stable-Release 5.4.1d?
                     <p>Wenn Sie E3DC-Control als <strong>Docker-Container</strong> betreiben, werden Hintergrunddienste wie der Native Wallbox Manager oder Smart-Home-Hubs aus Container-Architektur-Gründen immer <strong>nur einmalig beim Booten</strong> des Containers durch die <code>entrypoint.sh</code> gestartet.</p>
                     <p>Wenn Sie das Feature also gerade ganz frisch im Konfigurations-Editor nachträglich <strong>eingeschaltet</strong> und gespeichert haben, läuft der verantwortliche Python-Hintergrundprozess aktuell schlichtweg noch nicht!</p>
                     <div class="alert alert-warning mb-0 mt-3 border-0">
-                        <strong>🔌 Lösung (Dauert 5 Sekunden):</strong> Starten Sie den gesamten Docker-Container einmal kurz neu (z. B. via Portainer -> Restart oder per SSH mit <code>docker compose restart</code>). Beim Hochfahren liest der Container nun Ihre neue Konfiguration und startet das Ladeprogramm dauerhaft mit!
+                        <strong>🔌 Lösung:</strong> Erzeuge den gesamten Docker-Container neu und warte auf den imagegebundenen Healthcheck. Beim Hochfahren liest der Container Deine neue Konfiguration und startet das Ladeprogramm dauerhaft mit.
+                        <pre>cd "${E3DC_DOCKER_PATH:-$HOME/e3dc-docker}"
+if [ -f ./docker_compose_update.py ]; then
+  E3DC_DOCKER_HELPER=./docker_compose_update.py
+elif [ -f ./Installer/docker_compose_update.py ]; then
+  E3DC_DOCKER_HELPER=./Installer/docker_compose_update.py
+else
+  echo "docker_compose_update.py fehlt; aktuellen Release-Verwaltungsbaum bereitstellen." >&2
+  exit 2
+fi
+sudo python3 "$E3DC_DOCKER_HELPER" --compose-dir . --sudo --recreate-current</pre>
                     </div>
                 </div>
             </div>
@@ -708,7 +765,7 @@ WB1 hat Ladevorgang physisch abgebrochen (Versuch 1/3)!</pre>
                 </div>
                 <div class="faq-answer">
                     <p>Optionale Dienste wie <strong>Heizstab</strong>, <strong>Shelly Pro3EM</strong>, <strong>IDM/Luxtronik/Stiebel/Dimplex W&auml;rmepumpe</strong> oder <strong>Wallbox Manager</strong> werden im Docker nur einmalig beim Container-Start durch <code>entrypoint.sh</code> gestartet. Die Aktivierung erfolgt in zwei Schritten:</p>
-                    <p><strong>Ausnahme Klimaverbrauchsmessung ab 5.4.1d:</strong> Der read-only Worker l&auml;uft bereits und liest Aktivierung, Deaktivierung sowie den gew&auml;hlten Shelly-Kanal in jedem Zyklus neu. Daf&uuml;r ist kein Container-Neustart erforderlich. Eine aktive Klimasteuerung ist davon nicht umfasst.</p>
+                    <p><strong>Klimaverbrauchsmessung:</strong> Ein bereits gestarteter read-only Worker &uuml;bernimmt Deaktivierung und Shelly-Kanalwechsel im n&auml;chsten Zyklus. Wird die Klimamessung aus <code>Aus</code> erstmals aktiviert, ist auch daf&uuml;r ein Container-Neustart erforderlich. Eine aktive Klimasteuerung ist davon nicht umfasst.</p>
                     <ol>
                         <li><strong>Konfigurations-Editor:</strong> Im passenden Bereich die sichtbaren Schalter und Auswahlfelder setzen und speichern:
                             <ul>
@@ -718,14 +775,33 @@ WB1 hat Ladevorgang physisch abgebrochen (Versuch 1/3)!</pre>
                                 <li><strong>Heizstab / Shelly:</strong> die sichtbaren Shelly-/Heizstab-Felder im Frontend ausfüllen, nicht die internen Roh-Keys suchen.</li>
                             </ul>
                         </li>
-                        <li><strong>Container neustarten</strong> (liest beim n&auml;chsten Boot die neue Konfiguration):
-                            <pre>docker compose restart</pre>
-                            Oder in Portainer: Container ausw&auml;hlen &rarr; "Restart".
+                        <li><strong>Container neu erzeugen</strong> (liest beim n&auml;chsten Boot die neue Konfiguration und wartet auf den Healthcheck):
+                            <pre>cd "${E3DC_DOCKER_PATH:-$HOME/e3dc-docker}"
+if [ -f ./docker_compose_update.py ]; then
+  E3DC_DOCKER_HELPER=./docker_compose_update.py
+elif [ -f ./Installer/docker_compose_update.py ]; then
+  E3DC_DOCKER_HELPER=./Installer/docker_compose_update.py
+else
+  echo "docker_compose_update.py fehlt; aktuellen Release-Verwaltungsbaum bereitstellen." >&2
+  exit 2
+fi
+sudo python3 "$E3DC_DOCKER_HELPER" --compose-dir . --sudo --recreate-current</pre>
                         </li>
                     </ol>
                     <p>Die internen Config-Keys sind nur noch f&uuml;r Diagnose und Support interessant. Im normalen Betrieb reicht die Frontend-Auswahl plus anschlie&szlig;ender Container-Neustart.</p>
-                    <p>Nach Updates bitte nicht nur neu starten, sondern auch das Image ziehen: <code>docker compose pull && docker compose up -d --force-recreate</code>.</p>
-                    <p>Das gilt f&uuml;r die &uuml;brigen optionalen Dienste im Docker &mdash; Wallbox Manager, Bluelink, HA-Manager etc.</p>
+                    <p>Nach Updates übernimmt der Host-Helfer die aufgelöste Image-Auswahl, den expliziten Pull sowie den gebundenen Start- und Rückfallvertrag:</p>
+                    <pre>cd "${E3DC_DOCKER_PATH:-$HOME/e3dc-docker}"
+if [ -f ./docker_compose_update.py ]; then
+  E3DC_DOCKER_HELPER=./docker_compose_update.py
+elif [ -f ./Installer/docker_compose_update.py ]; then
+  E3DC_DOCKER_HELPER=./Installer/docker_compose_update.py
+else
+  echo "docker_compose_update.py fehlt; aktuellen Release-Verwaltungsbaum bereitstellen." >&2
+  exit 2
+fi
+sudo python3 "$E3DC_DOCKER_HELPER" --compose-dir . --sudo
+sudo docker compose logs --tail=80 e3dc-control</pre>
+                    <p>Das gilt auch f&uuml;r die &uuml;brigen im Container-Startskript angebundenen optionalen Dienste, etwa Wallbox Manager und Bluelink.</p>
                 </div>
             </div>
         </div>
@@ -1001,7 +1077,20 @@ journalctl -u e3dc-live -n 80 --no-pager</pre>
                         <li>Über das Dashboard (Kachel Konfiguration -> "Update suchen").</li>
                         <li>Bei aktuellen Ständen direkt über den Menüpunkt <em>Update</em> im Installer.</li>
                     </ol>
-                    <p><strong>Einmalige Ausnahme für 5.3.2b:</strong> Den ersten Wechsel auf das aktuelle Stable-Release ausschließlich über den Web-Update-Button oder per SSH mit <code>sudo /usr/bin/python3 installer_main.py --update-e3dc</code> starten. Der interaktive Menüpunkt ist für diesen Hybridwechsel nicht freigegeben, weil der 5.3.2b-Altprozess bereits zusätzliche Module geladen hat.</p>
+                    <p>Neuere Releases übergeben den Wechsel noch vor Backup und Dienststopp an einen bytegenau versiegelten Updater des Ziel-Releases. Erst dieser interpretiert seine eigenen Dienst-, Paket- und Wiederanlaufverträge und besitzt Backup sowie Rückweg. Beim ersten Sprung von einer älteren Version ohne diesen Vertrag gelten technisch noch deren bisherige Zeitgrenzen; ab dem anschließend installierten Stand laufen weitere Updates vollständig über den Ziel-Updater.</p>
+                    <p>Ist der exakt veröffentlichte Stand bereits vollständig installiert, endet ein normales Update ohne Backup und ohne Dienstunterbrechung. Dabei werden keine Produkt- oder Webdateien und kein Dienstzustand verändert; die für die Zielprüfung erforderlichen Git-Metadaten dürfen aktualisiert werden. Eine bewusst gewünschte Reparatur oder Neuinstallation derselben Version muss in der Weboberfläche ausdrücklich bestätigt oder per Konsole mit <code>bash "$E3DC_INSTALL_PATH/e3dc-setup" --reinstall-current</code> gestartet werden.</p>
+                    <p>Der Release-Finalizer zeigt seine Phasen und alle 30 Sekunden ein Lebenszeichen. Erst nach 30 Minuten Finalizerlauf wird hart abgebrochen; danach versucht der Installer die verifizierte Wiederherstellung des Ausgangszustands. Nur bei vollständigem Dienst-, Rollen- und Gesundheitsnachweis werden die Writer wieder freigegeben, andernfalls bleiben sie fail-closed gestoppt. Backup und Wiederherstellung selbst liegen außerhalb dieses Zeitlimits.</p>
+                    <p><strong>Einmalige Ausnahme für 5.3.2b:</strong> Den ersten Wechsel auf das aktuelle Stable-Release ausschließlich über den Web-Update-Button oder über die folgende vollständige SSH-Kette starten. Der interaktive Menüpunkt ist für diesen Hybridwechsel nicht freigegeben, weil der 5.3.2b-Altprozess bereits zusätzliche Module geladen hat.</p>
+                    <pre>export E3DC_INSTALL_PATH="$HOME/Install"
+test -f "$E3DC_INSTALL_PATH/installer_main.py"
+test -x "$HOME/.venv_e3dc/bin/python3"
+cd "$E3DC_INSTALL_PATH"
+sudo /usr/bin/python3 installer_main.py --fix-permissions
+sudo /usr/bin/python3 -I -B -u installer_main.py --check
+sudo /usr/bin/python3 -I -B -u installer_main.py --update-e3dc
+cat VERSION
+systemctl --failed --no-pager</pre>
+                    <p>Liegt E3DC-Control nicht unter <code>$HOME/Install</code>, wird nur die erste Zeile an den tatsächlichen absoluten Installationspfad angepasst. Schlägt eine der beiden <code>test</code>-Zeilen fehl, dort stoppen.</p>
                     <p>Verwenden Sie für den einmaligen Wechsel auf die bereinigte Historie keinen manuellen <code>git pull --ff-only</code>-Ablauf. Der Installer erstellt und prüft zuerst das externe Backup und validiert anschließend Zielstand, Dienste und Weboberfläche.</p>
                     Updates werden im Changelog oben rechts im Dashboard signalisiert.
                 </div>
@@ -1380,11 +1469,14 @@ journalctl -u e3dc-live -n 80 --no-pager</pre>
                     <i class="fas fa-chevron-down"></i>
                 </div>
                 <div class="faq-answer">
-                    <p>Ein eigener niedrig priorisierter Dienst vergleicht gespeicherte E3/DC-DC-Prognosen mit abgeschlossenen nativen 15-Minuten-Historienslots. Er zeigt Trefferabweichung, Richtungsversatz, energiegewichtete Gesamtabweichung und Vergleichsabdeckung.</p>
+                    <p>Ein eigener niedrig priorisierter Dienst vergleicht gespeicherte E3/DC-DC-Prognosen mit abgeschlossenen nativen 15-Minuten-Historienslots. Er zeigt Trefferabweichung, Richtungsversatz, energiegewichtete Gesamtabweichung und Vergleichsabdeckung sowohl insgesamt als auch getrennt nach dem Erfassungs-Vorlauf.</p>
                     <ul>
                         <li>Die Funktion ist standardmäßig <strong>aus</strong>. Dann erfolgen weder Historienabfrage noch Datenbankschreibzugriff.</li>
                         <li>Rohdaten liegen privat außerhalb des Webverzeichnisses; das Dashboard erhält nur eine kleine sanitierte Zusammenfassung.</li>
-                        <li>Vor mindestens 96 ertragsrelevanten Slots aus sieben Vergleichstagen bleiben Werte als vorläufig gekennzeichnet.</li>
+                        <li>Vor mindestens 96 ertragsrelevanten Slots aus sieben Vergleichstagen und ohne vollständige Forecast-/Ist-Abdeckung bleiben Werte als vorläufig gekennzeichnet.</li>
+                        <li>Der aktuelle Wert ist eine deterministische Punktprognose. Er gilt nicht automatisch als P50; echte Quantile benötigen ein ausdrücklich gebundenes Quantilniveau und die Konvention <code>cdf</code> oder <code>exceedance</code>.</li>
+                        <li>Nur E3/DC-DC-PV besitzt derzeit ein gültiges Forecast-/Ist-Paar. Zusatzwechselrichter, Haus, Wärme und Wallbox bleiben ohne eigene validierte Ist-Historie <code>EVIDENCE_LIMIT</code>.</li>
+                        <li>Abregelung, Wechselrichter-Clipping und externe Abschaltung sind noch nicht als eigener Qualitätsfilter gebunden. Die Werte bleiben sichtbar diagnostisch, dürfen aber keine verfügbare PV-Leistung oder Regelungsfreigabe beweisen.</li>
                         <li>Die Diagnose ändert weder Prognosemodell noch Konfiguration oder Speicherregelung.</li>
                     </ul>
                 </div>

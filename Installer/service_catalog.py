@@ -128,7 +128,7 @@ MODULES: dict[str, ServiceModule] = {
         description="Holt PV-Prognosen und erzeugt ML-/Ensemble-Vorhersagen.",
         service="e3dc-weather-manager",
         script="Forecast/pv_forecast_service.py",
-        log_file="/var/www/html/logs/weather_manager.log",
+        log_file="/var/www/html/logs/pv_forecast.log",
         alive_file="/var/www/html/ramdisk/pv_forecast.json",
         alive_max_age_s=7200,
         config_keys=("forecast1",),
@@ -418,6 +418,7 @@ MODULES: dict[str, ServiceModule] = {
         config_keys=(
             "ha_mode", "ha_peer_ip", "shadow_master_url", "shadow_master_ip",
             "shadow_sync_interval_s", "shadow_fetch_timeout_s", "shadow_snapshot_max_age_s",
+            "shadow_snapshot_token",
         ),
         optional=True,
         actions=READ_ACTIONS + SERVICE_ACTIONS,

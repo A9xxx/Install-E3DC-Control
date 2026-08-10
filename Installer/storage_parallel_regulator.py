@@ -1378,6 +1378,8 @@ class ParallelStorageRegulator:
         previous_val: int,
         previous_age_s: float,
         grid_ema_w: int,
+        forecast_curve_below_floor: bool,
+        wb_owner_evidence_active: bool,
         trace: List[Dict[str, Any]],
     ) -> ParallelDecision:
         if not previous_state or previous_state == decision.state:
@@ -1401,6 +1403,11 @@ class ParallelStorageRegulator:
             and decision.state != "parallel_wb_auto"
             and grid_ema_w >= self.wb_auto_grid_abort_w
         )
+        wb_auto_owner_evidence_missing_override = bool(
+            previous_state == "parallel_wb_auto"
+            and decision.state != "parallel_wb_auto"
+            and not wb_owner_evidence_active
+        )
         curve_limit_override = bool(
             previous_state == "parallel_auto"
             and decision.state == "parallel_curve_charge"
@@ -1419,14 +1426,26 @@ class ParallelStorageRegulator:
             decision.priority == "curve_pressure"
             and decision.state == "parallel_curve_charge"
         )
+        forecast_curve_floor_override = bool(
+            forecast_curve_below_floor
+            and decision.state in {
+                "parallel_auto",
+                "parallel_curve_auto_no_surplus",
+                "parallel_curve_charge",
+            }
+            and decision.priority
+            in {"default", "curve", "forecast_shortfall"}
+        )
         hard_override = bool(
             decision.priority in STORAGE_HARD_OVERRIDE_PRIORITIES
             or decision.state in STORAGE_HARD_OVERRIDE_STATES
             or strong_grid_override
             or wb_auto_grid_abort_override
+            or wb_auto_owner_evidence_missing_override
             or curve_limit_override
             or curve_auto_limit_reassert
             or pre_curve_ifc_override
+            or forecast_curve_floor_override
         )
         allow = set(rule.get("allow") or ())
         min_hold_s = max(0, _safe_int(rule.get("min_hold_s"), 0))
@@ -1606,6 +1625,33 @@ class ParallelStorageRegulator:
         curve_soc = adaptive_curve.get("curve_soc")
         adaptive_curve_active = bool(adaptive_curve.get("active"))
         adaptive_curve_relation = str(adaptive_curve.get("relation") or "")
+        adaptive_curve_below_floor = bool(
+            adaptive_curve_relation == "below_floor"
+        )
+        target_curve_meta = (
+            plan.get("target_curve_meta")
+            if isinstance(plan.get("target_curve_meta"), dict)
+            else {}
+        )
+        forecast_only_target_active = bool(
+            target_curve_meta.get("forecast_only_target_active")
+            or str(
+                target_curve_meta.get("target_mode") or ""
+            )
+            .strip()
+            .lower()
+            in {
+                "forecast_100",
+                "forecast_only_100",
+                "forecast_only",
+                "prognose_100",
+                "prognose",
+            }
+        )
+        forecast_curve_below_floor = bool(
+            adaptive_curve_below_floor
+            and forecast_only_target_active
+        )
         adaptive_floor_soc = adaptive_curve.get("floor_soc")
         adaptive_ceiling_soc = adaptive_curve.get("ceiling_soc")
         target_curve_soc = _current_curve_soc(plan, now_s * 1000.0, allow_before_start=pv_w > 250)
@@ -1692,6 +1738,7 @@ class ParallelStorageRegulator:
         pre_curve_hold_active = bool(
             first_curve_ts is not None
             and first_curve_soc is not None
+            and not forecast_curve_below_floor
             and now_s * 1000.0 < float(first_curve_ts)
             and pv_w > 250
             and soc >= float(first_curve_soc) - pre_curve_hold_margin_pct
@@ -1709,12 +1756,7 @@ class ParallelStorageRegulator:
                 active_state.get("Wallbox_Home_Includes", False),
             )
         )
-        home_rule_w = max(
-            0,
-            int(home_w - wallbox_w)
-            if wallbox_home_includes and wallbox_w > 250
-            else int(home_w),
-        )
+        home_rule_w = max(0, int(home_w))
         fixed_load_w = home_rule_w + wp_w
         pv_after_fixed_w = max(0, pv_w - fixed_load_w)
         house_deficit_w = max(0, fixed_load_w - pv_w)
@@ -2349,19 +2391,33 @@ class ParallelStorageRegulator:
             and not wb_intent.get("charging_active")
             and _safe_float(wb_intent.get("wb_power_w"), 0.0) <= 250.0
         )
+        wb_intent_cap_amp = _safe_int(
+            wb_intent.get("cap_amp", wb_intent.get("set_amp")),
+            0,
+        )
+        wb_intent_physical_charge_active = bool(
+            wb_intent.get("charging_active")
+            or _safe_float(wb_intent.get("wb_power_w"), 0.0) > 250
+        )
+        wb_intent_authorized_start_active = bool(
+            not wb_intent_bev_full_blocked
+            and wb_intent.get("start_requested")
+            and wb_intent.get("start_request_authorized")
+            and str(wb_intent.get("start_request_contract_version") or "")
+            == "wallbox_start_v1"
+            and wb_intent_cap_amp > 0
+            and (
+                wb_intent.get("active")
+                or wb_intent.get("car_active")
+                or wb_intent.get("connected")
+                or wb_intent.get("plugged")
+            )
+        )
         wb_intent_active = bool(
             wb_intent_fresh
             and (
-                wb_intent.get("charging_active")
-                or _safe_float(wb_intent.get("wb_power_w"), 0.0) > 250
-                or (
-                    not wb_intent_bev_full_blocked
-                    and (
-                        _safe_int(wb_intent.get("cap_amp", wb_intent.get("set_amp")), 0) > 0
-                        or wb_intent.get("start_requested")
-                        or str(wb_intent.get("battery_request", "none")) in ("allow_discharge", "hold_discharge")
-                    )
-                )
+                wb_intent_physical_charge_active
+                or wb_intent_authorized_start_active
             )
         )
         if wallbox_ngna:
@@ -2496,11 +2552,38 @@ class ParallelStorageRegulator:
             or wb_intent.get("autonomous_wallbox")
         )
         wb_real_owner_active = bool(wb_internal_owner_allowed and wallbox_rule_w >= wb_owner_real_min_w)
+        # Der historische Anti-Flatter-Hold ist keine aktuelle Owner-Evidenz.
+        # Maßgeblich bleiben reale Leistung oder ein frischer, autorisierter
+        # Intent desselben internen Wallboxpfads.
+        wb_current_owner_evidence_active = bool(
+            wb_real_owner_active
+            or (wb_internal_owner_allowed and wb_intent_active)
+        )
         shortfall_pv_catchup_active = bool(_truthy(active_state.get("shortfall_pv_catchup_active")))
         forecast_curve_landing_hold_active = bool(
             _truthy(active_state.get("forecast_curve_landing_hold_active"))
         )
-        sliding_horizon_active = bool(_truthy(active_state.get("sliding_horizon_active")))
+        sliding_horizon_raw_active = bool(
+            _truthy(active_state.get("sliding_horizon_active"))
+        )
+        sliding_horizon_candidate_active = bool(
+            _truthy(
+                active_state.get(
+                    "sliding_horizon_candidate_active",
+                    sliding_horizon_raw_active,
+                )
+            )
+        )
+        sliding_horizon_corridor_veto = bool(
+            _truthy(active_state.get("sliding_horizon_corridor_veto"))
+            or (
+                sliding_horizon_raw_active
+                and adaptive_curve_relation in ("below_floor", "no_curve")
+            )
+        )
+        sliding_horizon_active = bool(
+            sliding_horizon_raw_active and not sliding_horizon_corridor_veto
+        )
         sliding_horizon_reason = str(active_state.get("sliding_horizon_reason") or "")
         sliding_horizon_confidence = max(
             0.0,
@@ -2562,6 +2645,7 @@ class ParallelStorageRegulator:
         )
         curve_settle_hold_active = bool(
             previous_parallel_state == "parallel_curve_auto_hold"
+            and not forecast_curve_below_floor
             and curve_gap_pct is not None
             and curve_gap_pct <= self.curve_auto_hold_release_below_pct
             and (
@@ -2587,7 +2671,8 @@ class ParallelStorageRegulator:
             and not curve_ifc_export_catchup_active
         )
         curve_near_idle_hold = bool(
-            curve_gap_pct is not None
+            not forecast_curve_below_floor
+            and curve_gap_pct is not None
             and curve_gap_pct <= self.curve_auto_hold_release_below_pct
             and i_fc_w < self.curve_charge_enter_w
             and pv_w > 250
@@ -2596,6 +2681,7 @@ class ParallelStorageRegulator:
         )
         curve_edge_export_keep_active = bool(
             previous_parallel_state in ("parallel_curve_auto_hold", "parallel_curve_auto_no_surplus")
+            and not forecast_curve_below_floor
             and (curve_gap_pct is None or curve_gap_pct <= self.curve_auto_hold_release_below_pct)
             and i_fc_w < self.curve_charge_enter_w
             and pv_w > 250
@@ -2645,7 +2731,10 @@ class ParallelStorageRegulator:
                 curve_edge_soft_charge_w = 0
         price_house_discharge_keep = bool(
             previous_parallel_state == "parallel_price_house_discharge"
-            and house_deficit_w >= self.price_house_discharge_keep_w
+            and (
+                house_deficit_w >= self.price_house_discharge_keep_w
+                or previous_parallel_val > 0
+            )
             and soc > reserve_soc
         )
         night_floor_keep = bool(
@@ -2845,6 +2934,8 @@ class ParallelStorageRegulator:
             "forecast_floor_target_gap_pct": round(forecast_floor_target_gap_pct, 3),
             "forecast_landing_margin_pct": round(forecast_landing_margin_pct, 3),
             "sliding_horizon_active": sliding_horizon_active,
+            "sliding_horizon_candidate_active": sliding_horizon_candidate_active,
+            "sliding_horizon_corridor_veto": sliding_horizon_corridor_veto,
             "sliding_horizon_reason": sliding_horizon_reason,
             "sliding_horizon_confidence": round(sliding_horizon_confidence, 4),
             "sliding_horizon_min_confidence": round(sliding_horizon_min_confidence, 4),
@@ -2945,6 +3036,8 @@ class ParallelStorageRegulator:
             "wb_auto_grid_abort_w": self.wb_auto_grid_abort_w,
             "wb_active_enter": wb_active_enter,
             "wb_intent_active": wb_intent_active,
+            "wb_intent_physical_charge_active": wb_intent_physical_charge_active,
+            "wb_intent_authorized_start_active": wb_intent_authorized_start_active,
             "wb_intent_car_present": wb_intent_car_present,
             "wb_intent_bev_full_blocked": wb_intent_bev_full_blocked,
             "wb_budget_signal_active": wb_budget_signal_active,
@@ -3187,24 +3280,13 @@ class ParallelStorageRegulator:
                 (house_deficit_w >= self.price_house_discharge_enter_w or price_house_discharge_keep)
                 and soc > reserve_soc
             ):
-                target_house_w = min(self.max_discharge_w, int(house_deficit_w + 150))
-                if self.price_house_discharge_w <= 0:
-                    self.price_house_discharge_w = min(target_house_w, self.price_house_discharge_step_up_w)
-                elif target_house_w > self.price_house_discharge_w:
-                    self.price_house_discharge_w = min(
-                        target_house_w,
-                        self.price_house_discharge_w + self.price_house_discharge_step_up_w,
-                    )
-                else:
-                    self.price_house_discharge_w = max(
-                        target_house_w,
-                        self.price_house_discharge_w - self.price_house_discharge_step_down_w,
-                    )
+                target_house_w = min(1500, max(200, int(fixed_load_w + 30)))
+                self.price_house_discharge_w = target_house_w
                 decision = choose(
                     "parallel_price_house_discharge",
                     MODE_AUTO,
                     int(self.price_house_discharge_w),
-                    "Preis-/Slotfenster: Auto darf Netz nutzen, Haus/WP wird per E3DC-AUTO begrenzt aus Akku gestuetzt",
+                    "Preis-/Slotfenster: Auto darf Netz nutzen, Haus/WP/Klima wird per E3DC-AUTO begrenzt aus Akku gestuetzt",
                     "price",
                 )
             else:
@@ -3212,16 +3294,17 @@ class ParallelStorageRegulator:
                 decision = choose(
                     "parallel_price_hold",
                     MODE_AUTO,
-                    self.max_charge_w,
+                    0,
                     "Preis-/Slotfenster: Speicherentladung per EMS-Limit sperren, Auto nutzt Netz",
                     "price",
                 )
         elif active_state_name == "price_plan_house_discharge":
+            target_house_w = min(self.max_discharge_w, max(self.price_house_discharge_enter_w, int(house_deficit_w + 150)))
             decision = choose(
                 "parallel_price_house_discharge",
                 MODE_AUTO,
-                max(active_val, min(self.max_discharge_w, max(300, home_w))),
-                "Teures Preisfenster: Haus per E3DC-AUTO begrenzt aus Speicher stuetzen",
+                max(active_val, target_house_w),
+                "Teures Preisfenster: Haus/WP/Klima per E3DC-AUTO begrenzt aus Speicher stuetzen",
                 "price",
             )
         elif active_state_name == "evening_release" and not curve_cap_hard_pressure_active and not shortfall_pv_catchup_active:
@@ -3380,7 +3463,7 @@ class ParallelStorageRegulator:
                 curve_hold_reason,
                 "curve",
             )
-        elif wb_auto_enter or wb_auto_keep:
+        elif (wb_auto_enter or wb_auto_keep) and wb_real_owner_active:
             self.price_house_discharge_w = 0
             decision = choose(
                 "parallel_wb_auto",
@@ -3659,6 +3742,11 @@ class ParallelStorageRegulator:
         auto_hold_break = bool(
             decision.priority in STORAGE_HARD_OVERRIDE_PRIORITIES
             or decision.priority == "curve_pressure"
+            or (
+                forecast_curve_below_floor
+                and decision.priority
+                in {"curve", "forecast_shortfall"}
+            )
             or decision.state == "parallel_curve_charge_cap"
             or (
                 decision.state == "parallel_curve_charge"
@@ -3696,6 +3784,7 @@ class ParallelStorageRegulator:
         )
         curve_charge_release_stabilize_active = bool(
             self.curve_charge_release_stabilize_s > 0
+            and not forecast_curve_below_floor
             and previous_parallel_state == "parallel_curve_charge"
             and decision.state == "parallel_auto"
             and decision.priority == "default"
@@ -3729,6 +3818,7 @@ class ParallelStorageRegulator:
 
         curve_charge_soc_step_hold_active = bool(
             not curve_charge_release_stabilize_active
+            and not forecast_curve_below_floor
             and self.curve_charge_soc_step_hold_s > 0
             and previous_parallel_state == "parallel_curve_charge"
             and decision.state == "parallel_auto"
@@ -3772,6 +3862,7 @@ class ParallelStorageRegulator:
 
         curve_auto_hold_release_stabilize_active = bool(
             previous_parallel_state == "parallel_curve_auto_hold"
+            and not forecast_curve_below_floor
             and decision.state == "parallel_auto"
             and decision.priority == "default"
             and previous_parallel_age_s < 600
@@ -3806,6 +3897,8 @@ class ParallelStorageRegulator:
             previous_val=previous_parallel_val,
             previous_age_s=previous_parallel_age_s,
             grid_ema_w=grid_ema_w,
+            forecast_curve_below_floor=forecast_curve_below_floor,
+            wb_owner_evidence_active=wb_current_owner_evidence_active,
             trace=trace,
         )
 
@@ -3867,6 +3960,8 @@ class ParallelStorageRegulator:
                 "forecast_floor_target_gap_pct": round(forecast_floor_target_gap_pct, 3),
                 "forecast_landing_margin_pct": round(forecast_landing_margin_pct, 3),
                 "sliding_horizon_active": sliding_horizon_active,
+                "sliding_horizon_candidate_active": sliding_horizon_candidate_active,
+                "sliding_horizon_corridor_veto": sliding_horizon_corridor_veto,
                 "sliding_horizon_reason": sliding_horizon_reason,
                 "sliding_horizon_confidence": round(sliding_horizon_confidence, 4),
                 "sliding_horizon_min_confidence": round(sliding_horizon_min_confidence, 4),
@@ -3953,6 +4048,8 @@ class ParallelStorageRegulator:
                 "wb_active": bool(wb_active),
                 "wb_active_enter": wb_active_enter,
                 "wb_intent_active": wb_intent_active,
+                "wb_intent_physical_charge_active": wb_intent_physical_charge_active,
+                "wb_intent_authorized_start_active": wb_intent_authorized_start_active,
                 "wb_intent_car_present": wb_intent_car_present,
                 "wb_intent_bev_full_blocked": wb_intent_bev_full_blocked,
                 "wb_budget_signal_active": wb_budget_signal_active,
@@ -4017,6 +4114,22 @@ class ParallelStorageRegulator:
                 "curve_charge_servo_step_up_w": self.curve_charge_servo_step_up_w,
                 "curve_charge_servo_step_down_w": self.curve_charge_servo_step_down_w,
                 "curve_charge_servo_max_age_s": self.curve_charge_servo_max_age_s,
+                "steady_curve_guidance_enabled": bool(
+                    active_state.get("steady_curve_guidance_enabled")
+                ),
+                "steady_curve_approach_active": bool(
+                    active_state.get("steady_curve_approach_active")
+                ),
+                "steady_curve_approach_margin_pct": round(
+                    max(
+                        0.0,
+                        _safe_float(
+                            active_state.get("steady_curve_approach_margin_pct"),
+                            0.0,
+                        ),
+                    ),
+                    3,
+                ),
                 "first_curve_ts": int(first_curve_ts) if first_curve_ts else 0,
                 "first_curve_soc": None if first_curve_soc is None else round(first_curve_soc, 2),
                 "pre_curve_hold_raw_active": pre_curve_hold_raw_active,

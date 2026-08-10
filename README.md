@@ -1,12 +1,12 @@
 # E3DC-Control Web-Portal & Installer
 
-Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.4.2d</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
+Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.4.3</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
 
 ![E3DC-Control Dashboard](html/app-icon-512.png)
 
 ## Aktuelle Version und Update
 
-Die aktuelle stabile Version ist **5.4.2d**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur geprüften Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
+Die aktuelle stabile Version ist **5.4.3**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur geprüften Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
 
 > [!WARNING]
 > **⚠️ Achtung: Nutzung auf eigenes Risiko!**
@@ -19,6 +19,8 @@ Die aktuelle stabile Version ist **5.4.2d**. Hinweise zum Web-, Konsolen- und Do
 > **Config-Schutz:** Standardinstallationen speichern `data/e3dc_v4.json` und lokale Config-Backups mit `660` für Install-User und `www-data`, damit WebUI und Dienste weiter automatisch starten, die Datei aber nicht mehr weltlesbar ist. Der normale Config-Download ist redigiert; der Raw-Download enthält Zugangsdaten und wird nur angeboten, wenn eine Web-PIN gesetzt ist. Der Kompatibilitätsmodus (`664`) ist nur für eigene externe Leser gedacht.
 
 > **Bedienansichten:** Config-Editor und Wallbox-Seite unterscheiden zwischen einfacher Ansicht für Einrichtung und täglichen Betrieb sowie erweiterter Ansicht für alle Detailparameter. Die Logik und Abgrenzung sind in [doc/Frontend_Ansichten.md](doc/Frontend_Ansichten.md) dokumentiert.
+
+> **Neu in 5.4.3 Stable:** 5.4.3 verbessert die frische Bookworm-Installation, trennt Docker-Host-Aktionen klar vom Container und sichert Update sowie Rückfall stärker gegen unvollständige Zustände ab. Speicher, Direktvermarktung, Wallbox, Wärmepumpe und Heizstab teilen verfügbare Leistung über eindeutige Owner und die eingestellte Verbraucherpriorität, während fehlende oder widersprüchliche Rückmeldungen keine zusätzliche Freigabe erzeugen. openWB-Stecksession, Reichweite, Ladeende und Phasenwechsel werden zuverlässiger ausgewertet. Im Dashboard erscheint nur noch die zum Betriebsmodus passende Prognose und Ladekurve; ein frischer aktueller SoC wird getrennt dargestellt, und die mehrtägigen Diagramme laden schneller und bleiben übersichtlicher.
 
 > **Neu in 5.4.2d Stable:** Der Bare-Metal-Updater bewertet den Wiederanlauf erforderlicher Dienste anhand des belegten systemd-Endzustands statt allein anhand eines Zwischen-Rückgabecodes. Nicht installierte optionale Units werden beim verifizierten Maskenrücklauf als legitimer fehlender Zustand behandelt. Echte Start-, Masken- oder Wiederherstellungsfehler bleiben fail-closed; Writer und Aktoren bleiben dann sicher gestoppt. Die EMS-Regelung entspricht unverändert 5.4.2c.
 
@@ -62,7 +64,7 @@ Die aktuelle stabile Version ist **5.4.2d**. Hinweise zum Web-, Konsolen- und Do
 * **Dynamische Ladezeit-Berechnung:** Das Dashboard (und das Backend) berechnet durchgängig anhand der aktuellen Ladeleistung vollautomatisch die geschätzte Restdauer bis zum Erreichen von 100% sowie zum Ziel-SoC.
 * **Universal-Wallbox Integration:** Nativer, entkoppelter Python Wallbox Manager mit Dual-WB Support für E3DC, openWB/openWB Pro und go-e. openWB Pro wird direkt über `connect.php` als Aktuator geführt, normale openWB-Software bleibt sauber in Primary-/Secondary-Rollen getrennt. Die sichtbaren Modi sind `Aus`, `PV-Kurve ruhig`, `Grundladung stabil`, `PV + Akku bis Untergrenze`, `Sofort bis Preislimit` und `Akku bis Abfahrt`; geplantes Netzladen greift in allen aktiven Modi und bleibt bei `Aus` gesperrt, spontane Marktfreigaben für Wallbox-Netzladen benötigen dagegen `Sofort bis Preislimit`. Im Beobachten-Modus kann der Storage Manager optional nur den Hausspeicher bis zur Untergrenze führen, ohne Wallbox-Befehle zu senden.
 * **V2H/V2G-Vorbereitung (read-only):** Bidirektionale Wallboxleistung und gemeldete Fähigkeitsdaten werden erkannt und angezeigt. Eine aktive V2H-/V2G-Steuerung oder SoC-Abschaltung ist derzeit nicht freigegeben. Details: [V2H/V2G-Status](doc/V2x_Dokumentation.md).
-* **Intelligenter SoC- und Reichweiten-Sync:** Verzichtest du auf eine direkte Fahrzeuganbindung, kann der **SoC des Fahrzeugs am Dashboard manuell übermittelt werden**. Das System rechnet (interpoliert) ab dann vollautomatisch im Hintergrund die eingeladene Energie ein. Bei openWB-SoC berechnet E3DC-Control die Restreichweite aus Akku-Kapazität und hinterlegtem Verbrauch, damit openWB und Dashboard vergleichbare km-Werte zeigen.
+* **Intelligenter SoC- und Reichweiten-Sync:** Verzichtest du auf eine direkte Fahrzeuganbindung, kann der **SoC des Fahrzeugs am Dashboard manuell übermittelt werden**. Das System rechnet (interpoliert) ab dann vollautomatisch im Hintergrund die eingeladene Energie ein. Eine aktuell von openWB gemeldete Gesamtreichweite hat Vorrang; nur wenn dieser Wert fehlt, veraltet oder nicht zur aktuellen Fahrzeugidentität passt, berechnet E3DC-Control die Restreichweite aus Akku-Kapazität und hinterlegtem Verbrauch.
 * **Universal Wärmepumpen-Integration:** Native Anbindung für **Luxtronik** (WebSocket), **IDM-Wärmepumpen** (Modbus-TCP) und **Stiebel Eltron ISG/WPM** (read-only Live-Daten). IDM kann mit PV-Überschuss und konfigurierbarer Leistungsobergrenze ruhig als Grundlast laufen; Stiebel liefert Livewerte und nutzt optional einen externen Shelly-Leistungsmesser für die elektrische Live-Leistung in Dashboard/R5. SG-Ready per WLAN-Shelly bleibt als robuste Freigabe für andere Marken verfügbar. Details: [Stiebel-Eltron-ISG-Dokumentation](doc/Stiebel_Eltron_ISG.md).
 * **Storage Simulator & adaptive Ladekurve:** Die Anlage plant vollautomatisch voraus. Wetterprognosen, saisonaler Nachtverbrauch, EPEX/Eco-Score und optionales Mittagsziel erzeugen eine geglättete Soll-SoC-Kurve. Der Storage Manager führt die Kurve weich über `iFc`, Kontroll-SoC und gedämpften Aufholbedarf; [Pre-Dump](doc/Pre_Dump.md) schafft vor Kurvenstart Platz gegen Abregelung. Die Abregelreserve hält an passenden Hochleistungs-/Cloud-Edge-Tagen Speicherplatz für PV-Spitzen frei, ohne echten Netz-/WR-Abregeldruck zu blockieren. Der optionale [Unwetterwächter](doc/Unwetterwaechter.md) kann DWD-Warnungen als Kurvenanker oder Nachtreserve berücksichtigen; Speicher-Netzladen und Speicher-Halten im normalen Marktpfad bleiben getrennte, standardmäßig ausgeschaltete Opt-ins und werden beim Ausführen erneut gegen die aktuelle Freigabe geprüft. Zusätzlich blockiert `PV-autark zuerst` den normalen Marktpfad, wenn Speicher plus erwartete PV den restlichen Horizont decken; fällt der SOC unter die Low-SOC-Schwelle, darf ein bewusst freigegebener Speicherpfad wieder wirtschaftlich prüfen. Live-PV und Netzexport haben beim normalen Markt-Netzladen Ausführungsvorrang: dann wartet der Marktpfad in AUTO, statt GRID vorzuziehen.
 * **E3/DC-PV-Ladebegrenzung:** Kurvenladung und DV-PV-Speichern können optional auf die frisch ermittelte E3/DC-PV-Leistung begrenzt werden. E3/DC bleibt dabei in AUTO, die Hausversorgung darf jederzeit entladen und zusätzliche AC-PV erhöht den flüchtigen Laderahmen nicht. Bei fehlendem gültigem PV-Split werden diese PV-basierten Ladepfade sicher auf 0 W begrenzt; Preis- und ausdrücklich freigegebenes Netzladen bleiben eigenständig.
@@ -72,8 +74,10 @@ Die aktuelle stabile Version ist **5.4.2d**. Hinweise zum Web-, Konsolen- und Do
 * **Geplante Lastfenster:** Große, nicht direkt steuerbare Verbraucher können als enges Zeitfenster mit statischer Leistung hinterlegt werden. Der Simulator berücksichtigt die Last in der Prognose, der Manager schützt den Speicher aber erst, wenn die Last im Fenster plausibel sichtbar ist. Details: [Geplante Lastfenster](doc/Geplante_Lastfenster.md).
 
 ### 🚀 Maximale Performance & SD-Karten-Schutz
-* **RAM-Disk Caching:** Konfigurationen, Strompreise, Live-Werte und Log-Daten werden intelligent im Arbeitsspeicher gehalten. Dies schont die SD-Karte des Raspberry Pi massiv und reduziert die CPU-Last.
+* **RAM-Disk für hochfrequente Laufzeitdaten:** Live-Werte und häufig wechselnde Energie-, Fahrzeug- und Wallboxzustände werden im Arbeitsspeicher gehalten. Dauerhafte Wiederanlaufstände entstehen nur bei fachlichen Änderungen, sicherheitsrelevanten Übergängen und zusätzlich höchstens alle zwei Minuten; das senkt die Schreibzugriffe auf SD-Karten deutlich. Bare-Metal-Dienste und Docker starten nur mit einem exakt gemounteten `tmpfs`; Diagnose und Reparatur beschreibt der [RAM-Disk-Betriebsvertrag](doc/RAM-Disk_Betrieb.md).
 * **Native Python Live-API:** Der RSCP-Live-Dienst schreibt atomare JSON-Werte direkt in die RAM-Disk. Ungültige Werte wie `NaN` werden abgefangen, damit Dashboard, Historie und MQTT-Hub stabil weiterlaufen.
+* **Ein Live-Snapshot für interne Verbraucher:** WebSocket, MQTT, Matter und Watchdog lesen den validierten RAM-Zustand direkt, statt fortlaufend Apache und PHP mit vollständigen Liveabfragen zu beschäftigen.
+* **Begrenzte Persistenz:** Maschinenlesbare Formate ersetzen keine Aufbewahrungsgrenze. Produktlogs, Historien und Docker-Engine-Logs werden deshalb getrennt rotiert beziehungsweise begrenzt; Backups und fachliche Langzeitdaten werden nicht still gelöscht.
 * **Klassisches und modernes Frontend:** Beide Dashboard-Layouts bleiben produktiv auswählbar und unterstützen die Detailstufen kompakt, normal und detailreich.
 * **Frontend-Optimierung:** Statische Assets (JavaScript) werden automatisch komprimiert (minifiziert) und mit Cache-Busting-Mechanismen ausgeliefert, um die Ladezeiten des Dashboards zu minimieren.
 
@@ -86,7 +90,7 @@ Die aktuelle stabile Version ist **5.4.2d**. Hinweise zum Web-, Konsolen- und Do
 ### 🛡️ System-Stabilität & Watchdog
 * **High Availability Cluster (HA):** Unterstützung für einen zweiten Raspberry Pi als Ausfall-Backup (Aktiv/Passiv) mit überwachten Heartbeats, Konfigurationsabgleich und kontrolliertem Rollenwechsel. Umschaltzeit und Wiederanlauf hängen von Installation und Dienstzustand ab.
   * **Langzeit-Sync:** Die gesamte Ladehistorie und SQLite-Datenbank wird in Echtzeit redundant auf dem Slave gespiegelt.
-* **Shadow-Vergleichs-/Testinstanz:** Eine optionale zweite Instanz liest Betriebs-Snapshots der aktiven Anlage und berechnet lokale Vergleichsentscheidungen. Sie erhält keine Anlagenzugangsdaten, sendet keine Hardwarebefehle und übernimmt niemals per Failover. Details: [Shadow-System](doc/Shadow_System_Konzept.md).
+* **Shadow-Vergleichs-/Testinstanz:** Eine optionale zweite Instanz liest über einen eigenen Peer-Token ausschließlich positiv typisierte Betriebsprojektionen der aktiven Anlage und berechnet lokale Vergleichsentscheidungen. Fehlende, veraltete oder unvollständige Pflichtdaten halten die betroffene Auswertung pausiert. Sie erhält keine Anlagenzugangsdaten, sendet keine Hardwarebefehle und übernimmt niemals per Failover. Details: [Shadow-System](doc/Shadow_System_Konzept.md).
 * **Systemd-Dienste:** Alle Kernmodule (`e3dc-live`, Storage Manager, Storage Simulator, Wallbox Manager, MQTT-Hub und optionale Verbraucher) laufen als robuste Hintergrunddienste mit Auto-Restart-Fähigkeit.
 * **Piguard Watchdog:** Überwacht das Netzwerk, den SD-Karten-Speicher und Dateihänger. Startet bei Bedarf einzelne Dienste (oder den Raspberry Pi) intelligent neu.
 * **Telegram-Benachrichtigungen:** Erhalte tägliche Statusberichte (Uptime, Temperatur), Tagesstatistiken zur Energieverteilung sowie einen detaillierten Wochenrückblick direkt auf dein Smartphone. Komfortabel über das Web-UI ohne lästige Cronjobs konfigurierbar.
@@ -136,6 +140,12 @@ Die folgenden Werte sind Richtwerte für einen stabilen Dauerbetrieb:
 | **Speicherplatz** | 8 GB freier Speicher | 16 GB oder mehr |
 
 > **Hinweis zu Speicherplatz und RAM-Disk:** Eine normale Installation kann inklusive Paketen, Webdateien, Python-Umgebung, Logs, Diagnose- und Backupdaten bereits mehr als 4 GB belegen. Unter 8 GB freiem Speicher wird der Betrieb schnell eng. Werden temporäre Daten und Logfiles in einer RAM-Disk gehalten, schont das SD-Karten und SSDs, belegt aber direkt physischen Arbeitsspeicher. Für RAM-Disk, Docker, ML-Prognose oder größere Diagnosepakete sind 2 GB RAM dringend empfohlen.
+>
+> **Docker benötigt ein 64-Bit-System:** Die veröffentlichten Images unterstützen
+> ausschließlich `linux/arm64` und `linux/amd64`. `armhf` beziehungsweise
+> `linux/arm/v7` wird nicht angeboten. Die Angabe „Raspberry Pi 3“ in der
+> Minimalspalte beschreibt daher nur den klassischen Betrieb; für Docker sind
+> ein 64-Bit-Betriebssystem und mindestens 2 GB RAM empfohlen.
 
 ### Betrieb in virtuellen Umgebungen
 
@@ -187,20 +197,25 @@ Danach die Installation als dieser Benutzer starten. Der Installer fragt bei Bed
 ### Schritt 1: System vorbereiten & Klonen
 ```bash
 sudo apt update && sudo apt install -y git
-export E3DC_INSTALL_PATH="/absoluter/pfad/zur/installation"
+export E3DC_INSTALL_PATH="$HOME/Install"
 git clone https://github.com/A9xxx/Install-E3DC-Control.git "$E3DC_INSTALL_PATH"
 ```
 
 ### Schritt 2: Installer starten
-Wechsle in das neue Verzeichnis, korrigiere eventuelle Windows-Dateiendungen und starte das Setup-Skript:
+Wechsle in das neue Verzeichnis und starte das Setup-Skript. Es hebt nur die
+Schritte mit Systemrechten selbst über `sudo` an; der Checkout bleibt im Besitz
+deines normalen Benutzers:
 ```bash
 cd "$E3DC_INSTALL_PATH"
-sudo python3 fix_bom.py
-bash "$E3DC_INSTALL_PATH/e3dc-setup"
+bash ./e3dc-setup
 ```
 
+`fix_bom.py` ist bei einem normalen Git-Clone nicht erforderlich. Nur wenn der
+Quellbaum zuvor über Windows kopiert und dabei tatsächlich beschädigt wurde,
+kannst du ihn als normaler Benutzer einmal mit `python3 fix_bom.py` prüfen.
+
 ### Schritt 3: Installation / Update starten
-Wähle im interaktiven Menü für eine Ersteinrichtung die Option **"1 Installation / Update"**. Der Installer richtet die benötigten Pakete, Dienste, Webdateien, Rechte und den Web-Wizard ein. Falls du aus älteren Anleitungen die Nummer `11` kennst: Diese Eingabe wird aus Kompatibilitätsgründen ebenfalls akzeptiert.
+Wähle im interaktiven Menü für eine Ersteinrichtung die Option **"1 Installation / Update"**. Der Installer richtet die benötigten Pakete, Dienste, Webdateien, Rechte und die sichere Grundkonfiguration ein. Falls du aus älteren Anleitungen die Nummer `11` kennst: Diese Eingabe wird aus Kompatibilitätsgründen ebenfalls akzeptiert.
 
 Das Konsolenmenü ist bewusst klein gehalten:
 
@@ -224,7 +239,6 @@ Das Expertenmenü ist in 10er-Blöcke sortiert:
 ```text
 Kernsystem & Update
   14) Rollback (Datei-Backup)
-  15) Watchdog & Telegram konfigurieren
 Umgebung & Python
   21) Python venv neu aufbauen (Reparatur)
   22) Python venv Namen ändern
@@ -238,7 +252,17 @@ Erweiterungen & Smart Home
 ---
 
 ## 🐳 Installation (Via Docker)
-E3DC-Control kann alternativ komplett isoliert über Docker betrieben werden. Das Image unterstützt native ARM- (Raspberry Pi) sowie AMD64-Architekturen (Intel NUC, Synology, QNAP).
+E3DC-Control kann alternativ komplett isoliert über Docker betrieben werden.
+Das Image unterstützt ausschließlich 64-Bit-ARM (`linux/arm64`, Raspberry Pi)
+und 64-Bit-x86 (`linux/amd64`, Intel/AMD, Synology, QNAP). Ein 32-Bit-
+Raspberry-Pi-OS (`armhf`/`arm/v7`) kann dieses Image nicht laden.
+
+> **Docker läuft ausschließlich als Standalone-System mit `ha_mode=off`.**
+> HA-Master/-Slave und die read-only Shadow-Instanz bleiben Bare-Metal-
+> Betriebsarten. Beim Wechsel einer laufenden nativen Installation verwende
+> Menüpunkt **31**, damit Supervisoren und Host-Dienste vor dem Containerstart
+> kontrolliert gestoppt und deaktiviert werden; starte nicht parallel manuell
+> einen Container.
 
 **Voraussetzung:** Docker muss installiert sein. Git wird im folgenden
 Komfortweg nur benötigt, um die mitgelieferte `docker-compose.yml` zu beziehen;
@@ -246,8 +270,22 @@ der Anwendungscode stammt im Normalbetrieb aus dem veröffentlichten GHCR-Image.
 
 ### Schritt 1: Docker installieren
 ```bash
+DOCKER_ARCH="$(dpkg --print-architecture)"
+case "$DOCKER_ARCH" in
+  arm64|amd64) ;;
+  *) echo "Nicht unterstützte Docker-Architektur: $DOCKER_ARCH (benötigt: arm64 oder amd64)" >&2; exit 1 ;;
+esac
+if ! command -v docker >/dev/null 2>&1; then
+  test ! -S /run/docker.sock
+  if sudo test -e /var/lib/docker; then
+    test -z "$(sudo find -P /var/lib/docker -mindepth 1 -maxdepth 1 -print -quit)" || {
+      echo "Unbekannter Bestand unter /var/lib/docker; Docker-Installation abgebrochen." >&2
+      exit 1
+    }
+  fi
+fi
 sudo apt-get update
-sudo apt-get install -y ca-certificates curl
+sudo apt-get install -y ca-certificates curl git
 sudo install -m 0755 -d /etc/apt/keyrings
 . /etc/os-release
 DOCKER_REPO=debian
@@ -265,13 +303,33 @@ printf 'Types: deb\nURIs: https://download.docker.com/linux/%s\nSuites: %s\nComp
   sudo tee /etc/apt/sources.list.d/docker.sources > /dev/null
 sudo apt-get update
 sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+# Der Paketlauf kann den Daemon bereits gestartet haben. Fremde Container und
+# Volumes bleiben unberührt; nur bestehender E3DC-Control-Bestand blockiert die
+# frische Installation und gehört in den dokumentierten Updateweg.
+E3DC_CONTAINER_CONFLICTS="$(
+  sudo docker container ls -a \
+    --format '{{.Names}}|{{.Image}}|{{.Label "com.docker.compose.service"}}' |
+  awk -F '|' '$1 == "e3dc-control" || $2 ~ /(^|\/)(install-)?e3dc-control([:@]|$)/ || $3 == "e3dc-control" {print $1 " (" $2 ")"}'
+)"
+test -z "$E3DC_CONTAINER_CONFLICTS" || {
+  echo "E3DC-Control-Container besteht bereits: $E3DC_CONTAINER_CONFLICTS" >&2
+  exit 1
+}
+E3DC_VOLUME_CONFLICTS="$(
+  sudo docker volume ls --format '{{.Name}}' |
+  awk '$0 ~ /(^|_)(e3dc_data|e3dc_logs|e3dc_ml|e3dc_forecast_evidence|e3dc_instance_role)$/'
+)"
+test -z "$E3DC_VOLUME_CONFLICTS" || {
+  echo "Verwalteter E3DC-Docker-Datenbestand besteht bereits: $E3DC_VOLUME_CONFLICTS" >&2
+  exit 1
+}
 sudo usermod -aG docker "$USER"
 ```
 Danach einmal ab- und wieder anmelden, damit die Docker-Gruppenrechte aktiv werden.
 
 ### Schritt 2: Compose-Datei aus dem Repository beziehen
 ```bash
-export E3DC_DOCKER_PATH="/absoluter/pfad/zur/docker-installation"
+export E3DC_DOCKER_PATH="$HOME/e3dc-docker"
 git clone https://github.com/A9xxx/Install-E3DC-Control.git "$E3DC_DOCKER_PATH"
 cd "$E3DC_DOCKER_PATH"
 ```
@@ -281,13 +339,33 @@ folgende Normalstart baut **kein** lokales Image.
 
 ### Schritt 3: Container aus dem GHCR-Image starten
 ```bash
-docker compose up -d
+sudo python3 ./Installer/docker_compose_update.py --compose-dir . --sudo
+sudo docker compose logs --tail=80 e3dc-control
 ```
 
 Die mitgelieferte Compose-Datei verwendet
-`ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}` und legt vier
-benannte Volumes an. Neue Installationen werden über den Web-Wizard bzw. den
-Config-Editor eingerichtet.
+`ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}` und legt fünf
+benannte Volumes an. Neue Installationen werden über den Config-Editor
+eingerichtet. Fehlt bei einer Bestandsanlage die V4-Konfiguration, bleibt die
+Weboberfläche fail-closed; stelle dann zuerst ein geprüftes Backup administrativ
+wieder her.
+
+Docker ist ausschließlich als eigenständige Instanz mit exakt `ha_mode=off`
+freigegeben. Der Container projiziert dafür einen persistenten
+Instanzrollenanker create-once auf `off`; HA- und Shadow-Betrieb starten dort
+keinen Hardware-Writer. Beim Installer-Wechsel aus Bare Metal blockieren neben
+systemd-Diensten auch manuell gestartete Hardware-Writer und Legacy-Screens aus
+zwei stabilen `/proc`-Snapshots. Sie werden nicht automatisch beendet. Ein bei
+der Erstmigration neu erzeugter Docker-Zielbaum wird nach jedem Fehlversuch erst
+nach bestätigt gestopptem Kandidaten wieder entfernt beziehungsweise in seinen
+vorher leeren Zustand versetzt.
+
+Der Host-Helfer führt vor dem Start ausdrücklich `pull` aus und bindet das
+gezogene Image an seine sha256-ID und OCI-Version. Danach prüft er den
+Image-Healthcheck, die gestartete `VERSION` und zwei identische Folgesnapshots.
+Scheitern Start, Wartephase, Identität, Version oder ein Snapshot, stoppt er den
+Kandidaten und bestätigt dessen Stillstand; ein lokales Altimage gilt nie als
+erfolgreiche Neuinstallation.
 
 | Bereich | Zweck | Backup |
 |---|---|---|
@@ -295,11 +373,15 @@ Config-Editor eingerichtet.
 | `e3dc_logs` | Laufzeitprotokolle und neu aufbaubare Auswertungsreihen | optional |
 | `e3dc_ml` | root-privates, anlagenspezifisches Lernmodell außerhalb des Webroots | empfohlen; sonst ist ein neues Training nötig |
 | `e3dc_forecast_evidence` | optionale, root-private Prognosediagnose mit rollierender Aufbewahrung bis zu 90 Tagen | optional; Verlust setzt nur die Diagnosehistorie zurück |
+| `e3dc_instance_role` | root-privater create-once-Anker für exakt `ha_mode=off` | auf demselben Docker-Host erhalten; nicht zwischen Hosts kopieren |
 
 Die Ramdisk bleibt absichtlich flüchtig und gehört nicht ins Backup. ML-Modell
 und Prognosediagnose werden wegen ihres abweichenden Rechte- und
 Sicherheitsvertrags nicht in die webschreibbaren Daten- oder Log-Volumes
-verschoben. Weitere Details, einschließlich Migration und Bind-Mount-Variante,
+verschoben. Persistente Produkt- und Apache-Logs werden im Container regelmäßig
+mit festen Größen- und Aufbewahrungsgrenzen rotiert; der Healthcheck bindet den
+Logrotate-Prozess und seinen frischen Ergebnisnachweis ein. Weitere Details,
+einschließlich Migration und Bind-Mount-Variante,
 stehen in der [Docker-Dokumentation](doc/Docker_Dokumentation.md).
 
 ### Optionaler lokaler Selbstbau für Entwickler
@@ -324,14 +406,51 @@ services:
 ```
 
 ```bash
-docker compose \
-  -f docker-compose.yml \
-  -f docker-compose.local.yml \
-  config --images
-docker compose \
-  -f docker-compose.yml \
-  -f docker-compose.local.yml \
-  up -d --force-recreate e3dc-control
+(
+  set -euo pipefail
+  E3DC_LOCAL_CANDIDATE_MAY_EXIST=0
+  stop_local_candidate() {
+    [ "$E3DC_LOCAL_CANDIDATE_MAY_EXIST" = 1 ] || return 0
+    docker compose \
+      -f docker-compose.yml \
+      -f docker-compose.local.yml \
+      stop --timeout 30 e3dc-control || true
+    STOPPED_SNAPSHOT_1="$(docker compose \
+      -f docker-compose.yml \
+      -f docker-compose.local.yml \
+      ps -q --status running e3dc-control)" || return 70
+    sleep 1
+    STOPPED_SNAPSHOT_2="$(docker compose \
+      -f docker-compose.yml \
+      -f docker-compose.local.yml \
+      ps -q --status running e3dc-control)" || return 70
+    [ -z "$STOPPED_SNAPSHOT_1" ] && [ -z "$STOPPED_SNAPSHOT_2" ] || return 70
+  }
+  trap 'rc=$?; if ! stop_local_candidate; then exit 70; fi; exit "$rc"' ERR
+  docker compose \
+    -f docker-compose.yml \
+    -f docker-compose.local.yml \
+    config --images e3dc-control
+  E3DC_LOCAL_CANDIDATE_MAY_EXIST=1
+  docker compose \
+    -f docker-compose.yml \
+    -f docker-compose.local.yml \
+    up -d --force-recreate --wait --wait-timeout 300 e3dc-control
+  docker_health_snapshot() {
+    docker inspect e3dc-control --format '{{.Id}} {{.Image}} {{.RestartCount}} {{.State.StartedAt}} {{.State.Status}} {{.State.Health.Status}}'
+  }
+  HEALTH_SNAPSHOT_1="$(docker_health_snapshot)"
+  sleep 2
+  HEALTH_SNAPSHOT_2="$(docker_health_snapshot)"
+  test "$HEALTH_SNAPSHOT_1" = "$HEALTH_SNAPSHOT_2"
+  case "$HEALTH_SNAPSHOT_2" in
+    *" running healthy") ;;
+    *) echo "Container ist nicht stabil gesund: $HEALTH_SNAPSHOT_2" >&2; exit 1 ;;
+  esac
+  printf '%s\n' "$HEALTH_SNAPSHOT_2"
+  E3DC_LOCAL_CANDIDATE_MAY_EXIST=0
+  trap - ERR
+)
 ```
 
 `config --images` muss `e3dc-control:local` ausgeben.
@@ -342,39 +461,58 @@ vollständigen Namen, beispielsweise `registry.example/username/e3dc-control:tag
 
 ### GHCR-Updates einspielen
 ```bash
-(
-  set -euo pipefail
-  docker compose config --images
-  docker compose pull e3dc-control
-  docker compose up -d --force-recreate e3dc-control
-  docker inspect e3dc-control --format '{{.Config.Image}} {{.State.Status}}'
-  docker exec e3dc-control cat /app/pi/Install/VERSION
-)
+cd "${E3DC_DOCKER_PATH:-$HOME/e3dc-docker}"
+if [ -f ./docker_compose_update.py ]; then
+  E3DC_DOCKER_HELPER=./docker_compose_update.py
+elif [ -f ./Installer/docker_compose_update.py ]; then
+  E3DC_DOCKER_HELPER=./Installer/docker_compose_update.py
+else
+  echo "docker_compose_update.py fehlt; aktuellen Release-Verwaltungsbaum bereitstellen." >&2
+  exit 2
+fi
+sudo python3 "$E3DC_DOCKER_HELPER" --compose-dir . --sudo
+sudo docker compose logs --tail=80 e3dc-control
 ```
 > Die mitgelieferte Compose-Datei verwendet
 > `ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}`. Ohne Eintrag
 > folgt sie dem geprüften Stable-Tag `latest`. Ein fester Versions-Tag wechselt
 > bei `pull` absichtlich nicht; für einen bewussten Pin wird
-> `E3DC_IMAGE_TAG=v5.4.2d` in `.env` gesetzt. `config --images` zeigt vor dem
+> `E3DC_IMAGE_TAG=v5.4.3` in `.env` gesetzt. `config --images` zeigt vor dem
 > Pull das tatsächlich gewählte Image.
 >
-> Ein fehlgeschlagener `pull` ist ein harter Abbruch. Danach darf weder ein
-> vorhandenes Altimage als erfolgreiches Update gemeldet noch dessen Container
-> als neue Version ausgegeben werden. Erst die übereinstimmende Image-Referenz,
-> der laufende Container und die `VERSION` im Container bestätigen den Wechsel.
+> Ein fehlgeschlagener `pull` ist ein harter Abbruch. Nach begonnenem
+> Kandidatenstart stoppt der Helfer bei jedem Fehler den Kandidaten und prüft
+> dessen Stillstand. Erst gezogene Image-ID, OCI-Version, gestartete `VERSION`
+> und zwei identische gesunde Snapshots bestätigen den Wechsel.
+
+Fehlt der Host-Helfer in einer älteren Docker-Installation, lege daneben einen
+frischen Checkout des veröffentlichten `main` als Verwaltungsbaum an und rufe
+dessen `Installer/docker_compose_update.py` mit `--compose-dir` für das
+bestehende `e3dc-docker`-Verzeichnis auf. Der Helfer migriert ausschließlich
+unveränderte offizielle Compose-Dateien aus 5.4.2 bis 5.4.2d sowie die bekannte
+Installer-Bind-Mount-Variante atomar, also ganz oder gar nicht. `.env` und die
+vorhandenen Daten-, Log-, ML- und Forecast-Quellen bleiben unverändert. Einen
+alten Watchtower stoppt und prüft er vor Migration und Pull; er bleibt danach
+aus und darf nur über den unten beschriebenen ausdrücklichen Opt-in wieder
+aktiviert werden. Ältere, angepasste, per Override ergänzte oder mehrdeutige
+Compose-Stände bleiben unverändert gesperrt und benötigen eine manuelle Prüfung.
 
 Automatische Updates über Watchtower sind bewusst kein Standardstart. Das
 Upstream-Projekt wird nicht mehr gepflegt; zudem benötigt der Dienst für
 Container-Updates weitreichenden Zugriff auf den Docker-Socket des Hosts. Er
 bleibt nur für bestehende Installationen im Compose-Profil `auto-update`.
-Wer diese Risiken bewusst akzeptiert, aktiviert ausschließlich E3DC-Control
-für Watchtower:
+Das Enable-Label ist mit `${E3DC_WATCHTOWER_ENABLE:-false}` ebenfalls
+standardmäßig falsch. Wer diese Risiken bewusst akzeptiert, setzt zuerst in
+`.env` exakt `E3DC_WATCHTOWER_ENABLE=true`, projiziert den Hauptcontainer mit
+dem sicheren Host-Helfer neu und startet danach Watchtower:
 
 ```bash
+printf '%s\n' 'E3DC_WATCHTOWER_ENABLE=true' >> .env
+sudo python3 ./Installer/docker_compose_update.py --compose-dir . --sudo
 docker compose --profile auto-update up -d watchtower
 ```
 
-Ohne diesen ausdrücklichen Opt-in startet `docker compose up -d` nur
+Ohne diesen ausdrücklichen Opt-in startet `docker compose up -d --wait --wait-timeout 300 e3dc-control` nur
 E3DC-Control. Ein bereits aus einer älteren Compose-Datei laufender
 Watchtower wird einmalig mit
 `docker compose --profile auto-update stop watchtower && docker compose --profile auto-update rm -f watchtower`

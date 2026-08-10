@@ -29,6 +29,175 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return float(default)
 
 
+CURRENT_OUTPUT_HOLD_ACTIONS = frozenset({
+    "HOLD_MIN_CHARGE",
+    "HOLD_GRID_WINDOW",
+    "HOLD_MULTI_ZERO",
+    "HOLD_OPENWB_ZERO",
+    "HOLD_NATIVE_RUNNING_CHARGE",
+    "HOLD_NATIVE_CURRENT_DOWN",
+    "HOLD_CONTROLLABLE_EXPORT_CLOUD",
+    "HOLD_NATIVE_NO_STOP_WAIT",
+    "HOLD_NATIVE_START_GRACE",
+    "HOLD_NATIVE_START_CAP",
+    "HOLD_WBMINSOC_FLOOR",
+    "HOLD_OPENWB_FINISH_CONFIRM",
+})
+
+CURRENT_OUTPUT_EXACT_MINIMUM_HOLD_ACTIONS = frozenset({
+    "HOLD_OPENWB_ZERO",
+    "HOLD_NATIVE_CURRENT_DOWN",
+    "HOLD_NATIVE_NO_STOP_WAIT",
+    "HOLD_NATIVE_START_GRACE",
+    "HOLD_NATIVE_START_CAP",
+    "HOLD_WBMINSOC_FLOOR",
+})
+
+CURRENT_OUTPUT_NO_INCREASE_HOLD_ACTIONS = frozenset({
+    "HOLD_MIN_CHARGE",
+    "HOLD_GRID_WINDOW",
+    "HOLD_MULTI_ZERO",
+    "HOLD_NATIVE_RUNNING_CHARGE",
+    "HOLD_CONTROLLABLE_EXPORT_CLOUD",
+    "HOLD_OPENWB_FINISH_CONFIRM",
+})
+
+
+FINAL_STOP_AUTHORITY_SCHEMA = "wallbox_stop_authority_v1"
+
+
+def final_stop_authority_contract() -> Dict[str, Any]:
+    """Bindet einen finalen STOP typisiert an die native Abort-Kante.
+
+    Ob die Kante wirklich gesendet werden darf, bleibt zusätzlich an einen
+    frischen, realen Ladebeleg im hardwarenahen E3DC-Guard gebunden.
+    """
+
+    return {
+        "schema_version": FINAL_STOP_AUTHORITY_SCHEMA,
+        "action": "STOP",
+        "stop_type": "hard_stop",
+        "native_abort_authorized": True,
+        "requires_verified_active_charge": True,
+    }
+
+
+def current_output_hold_target_amp(
+    action: Any,
+    *,
+    hold_amp: Any = 0,
+    target_amp: Any = 0,
+    current_amp: Any = 0,
+    current_set_amp: Any = 0,
+    min_amp: Any = 6,
+    max_amp: Any = 32,
+    authorized_target_amp: Any = 0,
+) -> float:
+    """Liefert nur für bekannte Halteklassen einen positiven Stromdeckel.
+
+    Mindeststrom-Holds dürfen exakt den physikalischen Mindeststrom halten.
+    Alle übrigen Holds dürfen einen bereits angebotenen Strom nur beibehalten
+    oder absenken. Keine Halteklasse darf einen fehlenden per-WB-Zielstrom
+    ersetzen oder über ihn hinaus erhöhen.
+    """
+
+    name = str(action or "")
+    minimum = max(0.0, _safe_float(min_amp, 6.0))
+    maximum = min(
+        max(0.0, _safe_float(max_amp, 0.0)),
+        max(0.0, _safe_float(authorized_target_amp, 0.0)),
+    )
+    if name not in CURRENT_OUTPUT_HOLD_ACTIONS or maximum < minimum:
+        return 0.0
+    if name in CURRENT_OUTPUT_EXACT_MINIMUM_HOLD_ACTIONS:
+        return float(minimum)
+    if name not in CURRENT_OUTPUT_NO_INCREASE_HOLD_ACTIONS:
+        return 0.0
+
+    existing = max(
+        0.0,
+        _safe_float(current_amp, 0.0),
+        _safe_float(current_set_amp, 0.0),
+    )
+    requested = max(
+        0.0,
+        _safe_float(hold_amp, 0.0),
+        _safe_float(target_amp, 0.0),
+    )
+    applied = min(existing, requested, maximum)
+    return float(applied if applied >= minimum else 0.0)
+
+
+def hold_current_enforcement_contract(
+    action: Any,
+    *,
+    authorized_amp: Any,
+    reported_amp: Any = None,
+    current_amp: Any = 0,
+    current_set_amp: Any = 0,
+    min_amp: Any = 6,
+) -> Dict[str, Any]:
+    """Entscheidet, ob ein Hold den Hardwarestrom aktiv absenken muss.
+
+    Ein Hold darf eine laufende Ladung zeitlich bewahren, aber niemals ein
+    älteres höheres Stromangebot gegen einen inzwischen kleineren
+    Zyklusvertrag stehen lassen. Unterhalb des physikalischen Mindeststroms
+    wird der Hold zu einem typisierten Stopp; ein höheres bekanntes Angebot
+    wird im selben Zyklus auf den autorisierten Wert abgesenkt. Ein Hold
+    erhöht den Strom niemals.
+    """
+
+    name = str(action or "")
+    minimum = max(0.0, _safe_float(min_amp, 6.0))
+    target = max(0.0, _safe_float(authorized_amp, 0.0))
+    reported_known = reported_amp is not None
+    # Ein frischer Hardware-Readback ist die maßgebliche Ist-Evidenz. Ein
+    # älterer Manager-Sollwert darf insbesondere ein physisches 4-A-Angebot
+    # nicht in einen vermeintlichen 16→6-A-Absenkfall umdeuten und dadurch den
+    # Strom tatsächlich erhöhen. Nur ohne frischen Readback bleibt der höchste
+    # bekannte Managerwert der konservative Absenkbeleg.
+    observed = (
+        max(0.0, _safe_float(reported_amp, 0.0))
+        if reported_known
+        else max(
+            0.0,
+            _safe_float(current_amp, 0.0),
+            _safe_float(current_set_amp, 0.0),
+        )
+    )
+    result = {
+        "schema_version": "wallbox_hold_current_enforcement_v1",
+        "hold_action": name,
+        "authorized_amp": float(target),
+        "observed_offer_amp": float(observed),
+        "reported_offer_known": bool(reported_known),
+        "action": "none",
+        "reason": "not_a_current_hold",
+    }
+    if name not in CURRENT_OUTPUT_HOLD_ACTIONS:
+        return result
+    if target < minimum:
+        result.update({
+            "action": "stop",
+            "target_amp": 0.0,
+            "reason": "hold_target_below_minimum",
+        })
+        return result
+    if observed > target + 1e-6:
+        result.update({
+            "action": "set_current",
+            "target_amp": float(target),
+            "reason": "existing_offer_exceeds_hold_cap",
+        })
+        return result
+    result.update({
+        "action": "hold",
+        "target_amp": float(target),
+        "reason": "existing_offer_within_hold_cap",
+    })
+    return result
+
+
 def _format_price_ct(value: Any) -> str:
     try:
         number = float(value)
@@ -519,6 +688,215 @@ def compact_vehicle_identifier(value: Any) -> str:
     return "".join(ch for ch in str(value or "").lower() if ch.isalnum())
 
 
+VEHICLE_PROFILE_ID_KEYS = (
+    "id",
+    "profile_id",
+    "cloud_vehicle_id",
+    "vehicle_id",
+    "vehicle_mac",
+    "mac",
+    "rfid",
+    "rfid_tag",
+)
+
+
+def confirmed_session_vehicle_identity(
+    status: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Liefere ausschließlich eine belastbar sitzungsgebundene Fahrzeug-ID.
+
+    Fahrzeugname, SoC-Profil, Cloud-SoC und die statische ``wbX_car_id``-
+    Zuordnung sind keine Identität der aktuellen Stecksession. Ein Treiber darf
+    eine aktuelle ID/RFID mit ``stable_vehicle_identity_current`` bestätigen.
+    Für eine explizite UI-Zuordnung steht ein fail-closed Hook bereit: Schlüssel
+    und Stecksession müssen bestätigt sein und exakt zusammenpassen.
+    """
+
+    st = status if isinstance(status, dict) else {}
+    live_key = compact_vehicle_identifier(
+        st.get("vehicle_id")
+        or st.get("rfid_tag")
+        or st.get("car_id")
+    )
+    if st.get("stable_vehicle_identity_current") is True and live_key:
+        return {
+            "confirmed": True,
+            "key": live_key,
+            "source": "stable_vehicle_identity_current",
+            "session_bound": True,
+        }
+
+    explicit_key = compact_vehicle_identifier(
+        st.get("session_vehicle_identity_key")
+        or st.get("session_vehicle_id")
+    )
+    binding_id = str(
+        st.get("session_vehicle_identity_plug_session_id")
+        or st.get("session_vehicle_identity_session_id")
+        or ""
+    ).strip()
+    plug_session_id = str(st.get("plug_session_id") or "").strip()
+    if (
+        st.get("session_vehicle_identity_confirmed") is True
+        and explicit_key
+        and binding_id
+        and plug_session_id
+        and binding_id == plug_session_id
+    ):
+        return {
+            "confirmed": True,
+            "key": explicit_key,
+            "source": "confirmed_session_binding",
+            "session_bound": True,
+        }
+
+    return {
+        "confirmed": False,
+        "key": "",
+        "source": "vehicle_identity_unconfirmed",
+        "session_bound": False,
+    }
+
+
+def _vehicle_profile_for_identity(
+    profiles: Optional[Iterable[Dict[str, Any]]],
+    identity_key: Any,
+) -> Optional[Dict[str, Any]]:
+    compact_identity = compact_vehicle_identifier(identity_key)
+    if not compact_identity:
+        return None
+    matches = []
+    for profile in profiles or []:
+        if not isinstance(profile, dict):
+            continue
+        aliases = {
+            compact_vehicle_identifier(profile.get(key))
+            for key in VEHICLE_PROFILE_ID_KEYS
+            if str(profile.get(key) or "").strip()
+        }
+        if compact_identity in aliases:
+            matches.append(profile)
+    return matches[0] if len(matches) == 1 else None
+
+
+def vehicle_phase_capability_from_profiles(
+    profiles: Optional[Iterable[Dict[str, Any]]],
+    status: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Belegt Fahrzeugphasen nur aus der aktuellen, eindeutigen Stecksession.
+
+    Ladepunktwerte und aus einer Gesamtleistung abgeleitete Phasen bleiben
+    Planungsannahmen. Für eine vorgelagerte Wattzuteilung ist ausschließlich
+    ein explizites Phasenfeld eines eindeutig zur bestätigten Stecksession
+    passenden Fahrzeugprofils autoritativ.
+    """
+
+    identity = confirmed_session_vehicle_identity(status)
+    result = {
+        "contract": "vehicle_phase_capability_v1",
+        "active": False,
+        "identity_confirmed": bool(identity.get("confirmed", False)),
+        "identity_source": str(identity.get("source") or ""),
+        "session_bound": bool(identity.get("session_bound", False)),
+        "profile_match": False,
+        "phase_count": 0,
+        "phase_source": "none",
+        "reason": "vehicle_identity_unconfirmed",
+    }
+    if not identity.get("confirmed", False):
+        return result
+
+    profile = _vehicle_profile_for_identity(profiles, identity.get("key"))
+    if not profile:
+        result["reason"] = "confirmed_vehicle_profile_not_unique"
+        return result
+    result["profile_match"] = True
+
+    for key in (
+        "max_phases",
+        "phases",
+        "ac_phases",
+        "charge_phases",
+        "charging_phases",
+    ):
+        phases = valid_phase_count(profile.get(key), 0)
+        if phases:
+            result.update({
+                "active": True,
+                "phase_count": int(phases),
+                "phase_source": key,
+                "reason": "confirmed_session_vehicle_phase_profile",
+            })
+            return result
+
+    result["reason"] = "confirmed_vehicle_explicit_phase_missing"
+    return result
+
+
+def vehicle_current_capability_from_profiles(
+    profiles: Optional[Iterable[Dict[str, Any]]],
+    status: Optional[Dict[str, Any]] = None,
+    *,
+    phase_count: Any = 0,
+) -> Dict[str, Any]:
+    """Liefere den phasenabhängigen OBC-Stromdeckel der aktuellen Session.
+
+    Nur ein eindeutig getroffenes Profil mit ausdrücklich bestätigten
+    Stromgrenzen ist autoritativ. Alte Gesamtleistungs-/``max_phases``-Felder
+    bleiben Planungsinformationen und werden hier bewusst nicht in Ampere
+    umgerechnet.
+    """
+
+    phases = valid_phase_count(phase_count, 0)
+    identity = confirmed_session_vehicle_identity(status)
+    result = {
+        "contract": "vehicle_phase_current_cap_v1",
+        "active": False,
+        "identity_confirmed": bool(identity.get("confirmed", False)),
+        "identity_source": str(identity.get("source") or ""),
+        "profile_match": False,
+        "limits_confirmed": False,
+        "phase_count": int(phases),
+        "cap_amp": None,
+        "cap_source": "none",
+        "reason": "vehicle_identity_unconfirmed",
+    }
+    if not identity.get("confirmed", False):
+        return result
+    if phases not in (1, 2, 3):
+        result["reason"] = "effective_phase_unknown"
+        return result
+
+    profile = _vehicle_profile_for_identity(profiles, identity.get("key"))
+    if not profile:
+        result["reason"] = "confirmed_vehicle_profile_not_unique"
+        return result
+    result["profile_match"] = True
+
+    limits_confirmed = profile.get("obc_current_limits_confirmed") is True
+    result["limits_confirmed"] = limits_confirmed
+    if not limits_confirmed:
+        result["reason"] = "vehicle_current_limits_unconfirmed"
+        return result
+
+    field = "obc_max_current_%dp_a" % phases
+    try:
+        cap_amp = float(str(profile.get(field, "")).replace(",", "."))
+    except (TypeError, ValueError):
+        cap_amp = 0.0
+    if not math.isfinite(cap_amp) or cap_amp < 6.0:
+        result["reason"] = "phase_current_limit_missing"
+        return result
+
+    result.update({
+        "active": True,
+        "cap_amp": float(cap_amp),
+        "cap_source": field,
+        "reason": "confirmed_session_vehicle_phase_cap",
+    })
+    return result
+
+
 def valid_phase_count(value: Any, default: int = 0) -> int:
     try:
         phases = int(float(value))
@@ -608,6 +986,16 @@ def charge_observation_contract(
     st = status or {}
     now = _safe_float(now_ts, 0.0)
     threshold_w = max(50.0, _safe_float(min_power_w, 500.0))
+    status_valid = bool(
+        isinstance(status, dict)
+        and status
+        and status.get("driver_status_valid") is not False
+        and status.get("driver_status_stale") is not True
+        and status.get("driver_status_plausible") is not False
+        and status.get("driver_status_glitch") is not True
+        and status.get("valid") is not False
+        and status.get("stale") is not True
+    )
     connected = status_connected(st)
     rscp_error = bool(st.get("rscp_error_active", False))
     enabled = st.get("enabled")
@@ -678,7 +1066,11 @@ def charge_observation_contract(
     power_w = 0.0
     phantom_power_w = 0.0
 
-    if rscp_error:
+    if not status_valid:
+        truth = "unknown"
+        confidence = "unknown"
+        source = str(st.get("driver_status_reason") or "driver_status_unknown")
+    elif rscp_error:
         truth = "unknown"
         confidence = "unknown"
         source = "rscp_error"
@@ -733,6 +1125,7 @@ def charge_observation_contract(
         "energy_source": str(sample.get("source") or ""),
         "energy_sample": sample,
         "rscp_error": bool(rscp_error),
+        "status_valid": bool(status_valid),
     }
 
 
@@ -789,6 +1182,7 @@ def transient_hold_contract(
     phase_wait_active: bool = False,
     start_hold_active: bool = False,
     native_start_grace_active: bool = False,
+    vehicle_finished_drop_pending: bool = False,
     priority_forced_stop: bool = False,
     mode_off: bool = False,
     budget_timeout: bool = False,
@@ -852,7 +1246,17 @@ def transient_hold_contract(
         and connected
         and (start_hold_active or native_start_grace_active)
     )
-    active = bool(phase_transition_active or start_transition_active)
+    vehicle_finished_drop_active = bool(
+        not hard_abort
+        and connected
+        and vehicle_finished_drop_pending
+        and active_or_offered
+    )
+    active = bool(
+        phase_transition_active
+        or start_transition_active
+        or vehicle_finished_drop_active
+    )
 
     reason = "inactive"
     if hard_abort:
@@ -865,6 +1269,8 @@ def transient_hold_contract(
         reason = "start_hold"
     elif native_start_grace_active:
         reason = "native_start_grace"
+    elif vehicle_finished_drop_active:
+        reason = "vehicle_finished_drop_confirmation"
 
     return {
         "schema_version": "wallbox_transient_hold_v1",
@@ -875,6 +1281,9 @@ def transient_hold_contract(
         "phase_transition_offer_active": bool(phase_transition_active and active_or_offered),
         "start_hold_active": bool(start_hold_active and not hard_abort and connected),
         "native_start_grace_active": bool(native_start_grace_active and not hard_abort and connected),
+        "vehicle_finished_drop_pending_active": bool(
+            vehicle_finished_drop_active
+        ),
         "recent_phase_command": bool(recent_phase_command),
         "phase_wait_active": bool(phase_wait_active),
         "phase_status_unsettled": bool(phase_status_unsettled),
@@ -958,6 +1367,8 @@ def charge_end_latch_contract(
     manager_stop_active: bool = False,
     grace_active: bool = False,
     target_soc_reached: bool = False,
+    target_reached_reason: str = "",
+    external_restart_confirmed: bool = False,
     now_ts: Any = 0,
 ) -> Dict[str, Any]:
     """Entscheidet, ob ein beendeter Ladevorgang verriegelt oder freigegeben wird.
@@ -975,12 +1386,23 @@ def charge_end_latch_contract(
     if charge_contract is None:
         charge_contract = charge_observation_contract(st, now_ts=now)
     truth = str(charge_contract.get("truth") or "not_charging")
+    status_valid = bool(charge_contract.get("status_valid", truth != "unknown"))
     connected = bool(charge_contract.get("connected", status_connected(st)))
     rscp_error = bool(charge_contract.get("rscp_error", st.get("rscp_error_active", False)))
     real_charging = bool(charge_contract.get("is_charging", False) or truth == "charging")
     prev_latched = bool(previous_latched)
     prev_reason = str(previous_reason or "")
     release_exception = str(user_release_exception or "").strip()
+    target_reason = str(target_reached_reason or "").strip()
+    terminal_reasons = frozenset({
+        "vehicle_charge_ended",
+        "start_rejected",
+        "target_soc_reached",
+        "target_kwh_reached",
+        "battery_departure_target_reached",
+    })
+    terminal_latch = bool(prev_latched and prev_reason in terminal_reasons)
+    protected_latch = bool(prev_latched and not terminal_latch)
 
     action = "hold" if prev_latched else "none"
     latched = prev_latched
@@ -1008,29 +1430,60 @@ def charge_end_latch_contract(
             "grace_active": bool(grace_active),
             "rscp_error": bool(rscp_error),
             "target_soc_reached": bool(target_soc_reached),
+            "target_reached_reason": target_reason,
+            "status_valid": bool(status_valid),
+            "external_restart_confirmed": bool(external_restart_confirmed),
             "ts": float(now),
         }
 
-    if release_exception:
+    if release_exception and (not prev_latched or terminal_latch):
         return clear(release_exception, "user_or_config_release")
-    if vehicle_changed:
-        return clear("vehicle_changed", "vehicle_session_changed")
-    if mode_off and prev_latched:
-        return clear("mode_off", "wallbox_mode_off")
-    if real_charging:
-        if prev_latched:
-            return clear("vehicle_self_restart", "verified_charge_seen_after_latch")
-        action = "observe"
-        reason = "charging"
-        latched = False
-        start_blocked = False
-    elif disconnected_release and prev_latched and not rscp_error:
-        return clear("unplugged", "vehicle_disconnected")
-    elif rscp_error:
+    if not status_valid or rscp_error or truth == "unknown":
         action = "hold_unknown" if prev_latched else "observe_unknown"
-        reason = prev_reason or "rscp_error_unknown"
+        reason = prev_reason or "driver_status_unknown"
         latched = prev_latched
         start_blocked = prev_latched
+    elif protected_latch:
+        # Recovery-/Safety-Latches dürfen weder eine Ziel-/Profiländerung
+        # noch Fahrzeugwechsel, Modus-Aus oder reale Leistung aufheben. Ihre
+        # Freigabe gehört ausschließlich zum jeweiligen Schutzvertrag.
+        action = "hold_protected"
+        reason = prev_reason or "protected_charge_end_hold"
+        latched = True
+        start_blocked = True
+    elif target_reason:
+        action = (
+            "hold"
+            if prev_latched and prev_reason == target_reason
+            else "latch"
+        )
+        latched = True
+        start_blocked = True
+        reason = target_reason
+    elif real_charging:
+        if (
+            prev_latched
+            and prev_reason == "vehicle_charge_ended"
+            and external_restart_confirmed
+        ):
+            return clear("vehicle_self_restart", "verified_charge_seen_after_latch")
+        if prev_latched:
+            action = "hold"
+            reason = prev_reason or "vehicle_charge_ended"
+            latched = True
+            start_blocked = True
+        else:
+            action = "observe"
+            reason = "charging"
+            latched = False
+            start_blocked = False
+    elif disconnected_release and terminal_latch and not rscp_error:
+        return clear("unplugged", "vehicle_disconnected")
+    elif mode_off and prev_latched:
+        action = "hold"
+        reason = prev_reason or "wallbox_mode_off"
+        latched = True
+        start_blocked = True
     elif manager_stop_active:
         action = "hold" if prev_latched else "ignore"
         reason = prev_reason or "manager_stop_active"
@@ -1081,7 +1534,123 @@ def charge_end_latch_contract(
         "grace_active": bool(grace_active),
         "rscp_error": bool(rscp_error),
         "target_soc_reached": bool(target_soc_reached),
+        "target_reached_reason": target_reason,
+        "status_valid": bool(status_valid),
+        "external_restart_confirmed": bool(external_restart_confirmed),
         "ts": float(now),
+    }
+
+
+def vehicle_finished_candidate_step(
+    previous: Optional[Dict[str, Any]],
+    status: Optional[Dict[str, Any]],
+    *,
+    session_key: str,
+    had_confirmed_charge: bool,
+    offered_amp: Any,
+    min_amp: Any = 6,
+    manager_stop_active: bool = False,
+    phase_transition_active: bool = False,
+    start_verifying: bool = False,
+    observe_only: bool = False,
+    external_controller: bool = False,
+    now_ts: Any = 0,
+    min_frames: Any = 3,
+    min_duration_s: Any = 45.0,
+) -> Dict[str, Any]:
+    """Entprellt ein mögliches Fahrzeug-Ladeende ohne Hardwareausgang.
+
+    Der Kandidat ist absichtlich nur RAM-Zustand. Erst der aufrufende Manager
+    darf ihn nach Prüfung des aktuellen Wattbudgets terminalisieren und
+    anschließend crashfest persistieren. Manager-Stopps, Phasenwechsel,
+    Fremd-Owner und unbekannte Treiberframes sind niemals Fahrzeug-Ladeenden.
+    """
+
+    st = status or {}
+    now = _safe_float(now_ts, 0.0)
+    required_frames = max(2, int(_safe_float(min_frames, 3)))
+    required_s = max(10.0, _safe_float(min_duration_s, 45.0))
+    minimum_amp = max(1.0, _safe_float(min_amp, 6.0))
+    offered = max(0.0, _safe_float(offered_amp, 0.0))
+    session = str(session_key or "").strip()
+    charge_contract = (
+        st.get("charge_contract")
+        if isinstance(st.get("charge_contract"), dict)
+        else charge_observation_contract(st, now_ts=now)
+    )
+    truth = str(charge_contract.get("truth") or "unknown")
+    fresh = bool(charge_contract.get("status_valid", truth != "unknown"))
+    connected = bool(charge_contract.get("connected", status_connected(st)))
+    sample_ts = _safe_float(st.get("driver_status_last_sample_ts"), now)
+    candidate = dict(previous) if isinstance(previous, dict) else {}
+
+    blocker = ""
+    if not fresh or truth == "unknown":
+        blocker = "driver_status_unknown"
+    elif not connected:
+        blocker = "vehicle_not_connected"
+    elif external_controller:
+        blocker = "external_controller_owner"
+    elif observe_only:
+        blocker = "observe_only"
+    elif manager_stop_active:
+        blocker = "manager_stop_active"
+    elif phase_transition_active:
+        blocker = "phase_transition_active"
+    elif start_verifying:
+        blocker = "start_verification_active"
+    elif not had_confirmed_charge:
+        blocker = "confirmed_charge_missing"
+    elif offered < minimum_amp:
+        blocker = "minimum_offer_missing"
+    elif not session:
+        blocker = "session_key_missing"
+    elif truth == "charging":
+        blocker = "charging"
+    elif truth != "not_charging":
+        blocker = "charge_truth_unknown"
+
+    if blocker:
+        return {
+            "contract": "wallbox_vehicle_finished_candidate_v1",
+            "action": "hold_unknown" if blocker == "driver_status_unknown" else "reset",
+            "confirmed": False,
+            "blocker": blocker,
+            "candidate": {},
+            "frames": 0,
+            "elapsed_s": 0.0,
+            "session_key": session,
+            "ts": now,
+        }
+
+    same_candidate = bool(
+        candidate.get("session_key") == session
+        and _safe_float(candidate.get("first_ts"), 0.0) > 0.0
+    )
+    if not same_candidate:
+        candidate = {
+            "session_key": session,
+            "first_ts": now,
+            "last_sample_ts": sample_ts,
+            "frames": 1,
+        }
+    elif sample_ts > _safe_float(candidate.get("last_sample_ts"), 0.0):
+        candidate["last_sample_ts"] = sample_ts
+        candidate["frames"] = max(1, int(candidate.get("frames", 1) or 1)) + 1
+
+    elapsed_s = max(0.0, now - _safe_float(candidate.get("first_ts"), now))
+    frames = max(1, int(candidate.get("frames", 1) or 1))
+    confirmed = bool(frames >= required_frames and elapsed_s >= required_s)
+    return {
+        "contract": "wallbox_vehicle_finished_candidate_v1",
+        "action": "confirmed" if confirmed else "candidate",
+        "confirmed": confirmed,
+        "blocker": "",
+        "candidate": candidate,
+        "frames": frames,
+        "elapsed_s": elapsed_s,
+        "session_key": session,
+        "ts": now,
     }
 
 
@@ -1158,6 +1727,7 @@ def phase_observation_contract(
     phase_switch_phases: int = 0,
     phase_target: int = 0,
     phase_capability: Optional[Dict[str, Any]] = None,
+    vehicle_phase_capability: Optional[Dict[str, Any]] = None,
     charger_class_name: str = "",
     driver_variant: str = "",
 ) -> Dict[str, Any]:
@@ -1166,6 +1736,11 @@ def phase_observation_contract(
     st = status or {}
     cd = c_data or {}
     cap = phase_capability if isinstance(phase_capability, dict) else {}
+    vehicle_cap = (
+        vehicle_phase_capability
+        if isinstance(vehicle_phase_capability, dict)
+        else {}
+    )
     detected = valid_phase_count(detected_phases, 1) or 1
     target = valid_phase_count(phase_target, valid_phase_count(st.get("phases_target"), 0))
     in_use = valid_phase_count(st.get("phases_in_use"), 0)
@@ -1250,6 +1825,15 @@ def phase_observation_contract(
         basis = "detected"
 
     effective = max(1, min(3, int(effective or 1)))
+    vehicle_profile_phase_bound = bool(
+        vehicle_cap.get("contract") == "vehicle_phase_capability_v1"
+        and vehicle_cap.get("active") is True
+        and vehicle_cap.get("identity_confirmed") is True
+        and vehicle_cap.get("session_bound") is True
+        and vehicle_cap.get("profile_match") is True
+        and valid_phase_count(vehicle_cap.get("phase_count"), 0)
+        == vehicle_phases
+    )
 
     return {
         "actual_phases": int(actual_phases),
@@ -1262,6 +1846,13 @@ def phase_observation_contract(
         "cap_phases": int(cap_phases),
         "cable_phases": int(cable_phases),
         "vehicle_max_phases": int(vehicle_phases),
+        "vehicle_profile_phase_bound": vehicle_profile_phase_bound,
+        "vehicle_profile_phase_source": str(
+            vehicle_cap.get("phase_source") or "none"
+        ),
+        "vehicle_identity_source": str(
+            vehicle_cap.get("identity_source") or ""
+        ),
         "wallbox_phases": int(wallbox_phases),
         "measured_phases": int(measured_phases),
         "phase_power_verified": bool(st.get("phase_power_verified", False)),
@@ -1280,11 +1871,11 @@ def vehicle_max_ac_phases_from_profiles(
     profiles: Optional[Iterable[Dict[str, Any]]] = None,
     status: Optional[Dict[str, Any]] = None,
 ) -> int:
-    """Liefert konfigurierte oder abgeleitete AC-Phasen des aktiven Fahrzeugs.
+    """Liefert die Planungsphasen eines bestätigten aktiven Fahrzeugs.
 
     Der Aufrufer übergibt ``profiles``, damit diese Hilfe rein bleibt. Eine
-    aktuelle openWB-Pro-Identität hat Vorrang vor einer statischen
-    Wallbox-Zuordnung.
+    statische Wallbox-Zuordnung oder ein SoC-/Cloud-Profil darf die aktuelle
+    Stecksession nicht identifizieren.
     """
 
     cfg = config or {}
@@ -1293,36 +1884,11 @@ def vehicle_max_ac_phases_from_profiles(
         cid = int(charger_id or 1)
     except (TypeError, ValueError):
         cid = 1
-    profile_list = list(profiles or [])
-
-    def find_profile(candidates: Iterable[Any]) -> Optional[Dict[str, Any]]:
-        compact_candidates = {
-            compact_vehicle_identifier(v)
-            for v in candidates
-            if str(v or "").strip()
-        }
-        if not compact_candidates:
-            return None
-        for profile in profile_list:
-            if not isinstance(profile, dict):
-                continue
-            for key in (
-                "id",
-                "profile_id",
-                "cloud_vehicle_id",
-                "vehicle_id",
-                "vehicle_mac",
-                "mac",
-                "rfid",
-                "rfid_tag",
-            ):
-                if compact_vehicle_identifier(profile.get(key)) in compact_candidates:
-                    return profile
-        return None
-
-    profile = find_profile([st.get("car_id"), st.get("vehicle_id"), st.get("rfid_tag")])
-    if not profile:
-        profile = find_profile([cfg.get(f"wb{cid}_car_id")])
+    identity = confirmed_session_vehicle_identity(st)
+    profile = _vehicle_profile_for_identity(
+        profiles,
+        identity.get("key") if identity.get("confirmed", False) else "",
+    )
     if profile:
         for key in ("max_phases", "phases", "ac_phases", "charge_phases", "charging_phases"):
             phases = valid_phase_count(profile.get(key), 0)
@@ -1368,12 +1934,13 @@ def vehicle_max_ac_power_kw_from_profiles(
     profiles: Optional[Iterable[Dict[str, Any]]] = None,
     status: Optional[Dict[str, Any]] = None,
 ) -> float:
-    """Liefere die belastbare AC-OBC-Grenze des aktiven Fahrzeugs.
+    """Liefere die AC-Leistungsannahme für die Fahrzeugplanung.
 
-    Eine in der Ladeplanung angenommene Leistung ist keine Hardwaregrenze.
-    Deshalb werden nur explizite OBC-Felder oder das live/statisch gebundene
-    Fahrzeugprofil ausgewertet. Die Live-Identität der openWB Pro hat Vorrang
-    vor der statischen Ladepunktzuordnung.
+    Eine in der Ladeplanung angenommene Leistung ist keine Strom-Hardwaregrenze.
+    Profilwerte werden nur für ein bestätigt sitzungsgebundenes Fahrzeug
+    ausgewertet. Explizite Ladepunktwerte bleiben als Planungsinformation
+    kompatibel, werden aber nicht durch den Hardwareausgang in Ampere
+    umgerechnet.
     """
 
     cfg = config or {}
@@ -1391,36 +1958,11 @@ def vehicle_max_ac_power_kw_from_profiles(
         if explicit_kw > 0.0:
             return explicit_kw
 
-    profile_list = list(profiles or [])
-
-    def find_profile(candidates: Iterable[Any]) -> Optional[Dict[str, Any]]:
-        compact_candidates = {
-            compact_vehicle_identifier(value)
-            for value in candidates
-            if str(value or "").strip()
-        }
-        if not compact_candidates:
-            return None
-        for profile in profile_list:
-            if not isinstance(profile, dict):
-                continue
-            for key in (
-                "id",
-                "profile_id",
-                "cloud_vehicle_id",
-                "vehicle_id",
-                "vehicle_mac",
-                "mac",
-                "rfid",
-                "rfid_tag",
-            ):
-                if compact_vehicle_identifier(profile.get(key)) in compact_candidates:
-                    return profile
-        return None
-
-    profile = find_profile([st.get("car_id"), st.get("vehicle_id"), st.get("rfid_tag")])
-    if not profile:
-        profile = find_profile([cfg.get(f"wb{cid}_car_id")])
+    identity = confirmed_session_vehicle_identity(st)
+    profile = _vehicle_profile_for_identity(
+        profiles,
+        identity.get("key") if identity.get("confirmed", False) else "",
+    )
     if not profile:
         return 0.0
 
@@ -1545,6 +2087,7 @@ def wallbox_executable_budget(
         "one_phase_ready": bool(one_phase_ready),
         "can_start_or_hold": bool(can_start_or_hold),
         "real_charging": bool(real_charging),
+        "grid_unlocked": bool(grid_unlocked),
         "reason": reason,
     }
 
@@ -1565,7 +2108,11 @@ def budget_to_target_current(
 
     ``allowed_w`` ist die gesamte Leistung, welche die Wallbox beziehen darf,
     kein Aufschlag auf ihre aktuelle Last. Der Aufrufer berücksichtigt die
-    aktuell gemessene Wallbox-Leistung beim Aufbau dieses Budgets.
+    aktuell gemessene Wallbox-Leistung beim Aufbau dieses Budgets. Für die
+    harte Übersetzung in ein Stromangebot zählt stets die nominal mögliche
+    Leistung von 230 V je aktiver Phase. Eine aktuell geringere Abnahme des
+    Fahrzeugs bleibt Diagnose und darf das Stromangebot nicht über das
+    Leistungsbudget hinaus öffnen.
     """
 
     budget_w = max(0.0, _safe_float(allowed_w, 0.0))
@@ -1575,10 +2122,12 @@ def budget_to_target_current(
     step_amp = _current_step(current_step_amp, 1.0)
     nominal_w_per_amp = float(230 * phases)
     measured_w_per_amp = _safe_float(watts_per_amp, 0.0)
-    if measured_w_per_amp > 0.0:
-        w_per_amp = max(nominal_w_per_amp * 0.55, min(nominal_w_per_amp * 1.10, measured_w_per_amp))
-    else:
-        w_per_amp = nominal_w_per_amp
+    measured_w_per_amp = (
+        measured_w_per_amp
+        if math.isfinite(measured_w_per_amp) and measured_w_per_amp > 0.0
+        else 0.0
+    )
+    w_per_amp = nominal_w_per_amp
     min_power_w = float(min_amp_int * w_per_amp)
 
     if budget_w >= min_power_w:
@@ -1590,11 +2139,15 @@ def budget_to_target_current(
         )
         target_amp = _amp_value(target_amp, step_amp)
         if measured_w_per_amp > 0.0:
-            reason = "Budget %.0f W -> %s A bei %d Phase(n), %.0f W/A gemessen." % (
+            reason = (
+                "Budget %.0f W -> %s A bei %d Phase(n), nominal %.0f W/A; "
+                "gemessene Abnahme %.0f W/A bleibt Diagnose."
+            ) % (
                 budget_w,
                 target_amp,
                 phases,
-                w_per_amp,
+                nominal_w_per_amp,
+                measured_w_per_amp,
             )
         else:
             reason = "Budget %.0f W -> %s A bei %d Phase(n)." % (budget_w, target_amp, phases)
@@ -1633,6 +2186,120 @@ def budget_to_target_current(
         "limiting_reason": reason,
         "watts_per_amp": round(float(w_per_amp), 1),
         "watts_per_amp_measured": bool(measured_w_per_amp > 0.0),
+        "measured_watts_per_amp": round(float(measured_w_per_amp), 1),
+        "budget_basis": "nominal_offer",
+        "target_power_w": int(round(float(target_amp) * nominal_w_per_amp)),
+    }
+
+
+def physical_current_phase_count(
+    physical_budget: Optional[Dict[str, Any]],
+    *,
+    allocation_target_phases: Any = 0,
+    detected_phases: Any = 1,
+) -> int:
+    """Bindet die Stromübersetzung an die bereits ausführbare Wattzuteilung.
+
+    Bei einem stehenden, umschaltbaren Ladepunkt kann die zentrale Zuteilung
+    einen einphasigen Start freigeben, obwohl der alte Geräte-Sollwert noch 3p
+    meldet. Genau in diesem geprüften Fall darf eine spätere physikalische
+    Projektion die 1p-Zuteilung nicht erneut auf 3p und damit auf 0 A
+    verteuern. In allen anderen Fällen bleibt die höhere Phasenzahl
+    konservativ maßgeblich.
+    """
+
+    budget = physical_budget if isinstance(physical_budget, dict) else {}
+    policy_phases = valid_phase_count(
+        budget.get("phases"),
+        valid_phase_count(detected_phases, 1),
+    ) or 1
+    allocation_phases = valid_phase_count(allocation_target_phases, 0)
+    if (
+        budget.get("switch_to_1p_ready") is True
+        and allocation_phases == 1
+    ):
+        return 1
+    return max(1, min(3, max(policy_phases, allocation_phases)))
+
+
+def physical_start_diagnostic_projection(
+    physical_budget: Optional[Dict[str, Any]],
+    *,
+    allocation_target_phases: Any = 0,
+    connected: bool = False,
+    charger_class_name: str = "",
+    phase_capable: bool = False,
+) -> Dict[str, Any]:
+    """Projiziert die ausführbare Startphysik getrennt vom Hardwareziel.
+
+    Ein stehender openWB-Pro-Ladepunkt darf zentral einen einphasigen Start
+    erhalten, obwohl ``connect.php`` noch das letzte 3p-Geräteziel meldet. Der
+    konservative Hardware-/Transitionsvertrag bleibt unverändert; nur die
+    Diagnose benennt die bereits gebundene Startprojektion und ihre echte
+    Mindestleistung.
+    """
+
+    budget = physical_budget if isinstance(physical_budget, dict) else {}
+    control_phases = valid_phase_count(budget.get("phases"), 1) or 1
+    diagnostic_phases = control_phases
+    source = "physical_control_contract"
+    allocation_phases = valid_phase_count(allocation_target_phases, 0)
+    phase_contract = (
+        budget.get("phase_contract")
+        if isinstance(budget.get("phase_contract"), dict)
+        else {}
+    )
+    can_switch = bool(
+        phase_capable
+        or phase_contract.get("can_switch_phases", False)
+    )
+    real_charging = bool(budget.get("real_charging", False))
+    if (
+        connected
+        and not real_charging
+        and str(charger_class_name or phase_contract.get("charger_class") or "")
+        == "OpenWBProCharger"
+        and can_switch
+        and allocation_phases == 1
+    ):
+        diagnostic_phases = 1
+        source = "cycle_allocation_1p_start"
+
+    allowed_w = max(0.0, _safe_float(budget.get("allowed_w"), 0.0))
+    min_amp = max(1, int(round(_safe_float(budget.get("min_amp"), 6))))
+    min_power_w = float(min_amp * 230 * diagnostic_phases)
+    grid_unlocked = bool(budget.get("grid_unlocked", False))
+    budget_ready = bool(grid_unlocked or allowed_w >= min_power_w)
+    if grid_unlocked and allowed_w < min_power_w:
+        reason = (
+            "Netz-/Preisfenster gibt den %dp-Start frei; Mindestleistung %.0f W ist erlaubt."
+            % (diagnostic_phases, min_power_w)
+        )
+    elif budget_ready:
+        reason = "Budget %.0f W deckt Start-Mindestleistung %.0f W (%dp)." % (
+            allowed_w,
+            min_power_w,
+            diagnostic_phases,
+        )
+    else:
+        reason = "Budget %.0f W < Start-Mindestleistung %.0f W (%dp)." % (
+            allowed_w,
+            min_power_w,
+            diagnostic_phases,
+        )
+
+    return {
+        "schema_version": "wallbox_physical_start_diagnostic_v1",
+        "source": source,
+        "control_phases": int(control_phases),
+        "allocation_target_phases": int(allocation_phases),
+        "phases": int(diagnostic_phases),
+        "min_amp": int(min_amp),
+        "min_power_w": int(round(min_power_w)),
+        "allowed_w": int(round(allowed_w)),
+        "budget_ready": bool(budget_ready),
+        "real_charging": bool(real_charging),
+        "reason": reason,
     }
 
 
@@ -2214,6 +2881,7 @@ def start_stop_hold_action(
     e3dc_native_toggle: bool,
     native_start_grace_active: bool,
     is_charging_memory: bool,
+    effective_budget_w: float = 0.0,
     openwb_zero_export_hold_allowed: bool = True,
     openwb_phase_transition_grace_active: bool = False,
     transient_contract: Optional[Dict[str, Any]] = None,
@@ -2296,11 +2964,119 @@ def start_stop_hold_action(
         not zero_budget_active or zero_budget_hold_allowed
     )
 
-    # Ein harter gemeinsamer Gate-Stopp darf von einem inkonsistenten positiven
-    # Upstream-Cap nicht wieder geöffnet werden. Die übrigen Schutzpfade werden
-    # wie bisher bereits vor diesem Aufruf auf cap=0 normalisiert.
-    if zero_budget_hard_stop:
+    # Ein freigegebener gemeinsamer Gate-Stopp und der native Akkuentladungs-
+    # Schutz stehen vor sämtlichen Haltepfaden. Auch ein inkonsistenter positiver
+    # Upstream-Cap darf diese Stop-Autorität nicht wieder öffnen.
+    zero_budget_stop_requested = bool(
+        zero_budget_hard_stop
+        or zero_budget_stop_allowed
+        or native_battery_drain_zero_budget_active
+    )
+    if zero_budget_stop_requested:
         cap = 0.0
+
+        native_real_charge = bool(hw_charging and hw_power > 500.0)
+        if e3dc_native_toggle:
+            stop_edge_due = bool(
+                (native_real_charge and not stop_already_sent)
+                or stop_retry_due
+            )
+        else:
+            stop_edge_due = bool(
+                is_charging_memory
+                or hw_charging
+                or hw_power > 500.0
+                or not stop_already_sent
+                or stop_retry_due
+            )
+        if zero_budget_hard_stop:
+            stop_reason = "zero_budget_hard_stop"
+        elif native_battery_drain_zero_budget_active:
+            stop_reason = "native_battery_drain_zero_budget"
+        else:
+            stop_reason = "zero_budget_stop_allowed"
+        return {
+            "action": "STOP",
+            "target_amp": 0.0,
+            "hold_amp": 0.0,
+            "is_new_start": False,
+            "min_charge_hold_active": False,
+            "multi_zero_budget_hold": False,
+            "openwb_zero_budget_hold": False,
+            "native_running_charge_hold": False,
+            "native_current_down_hold": False,
+            "native_mode_no_stop_wait": False,
+            "native_start_grace_active": False,
+            "native_battery_drain_zero_budget_active": bool(
+                native_battery_drain_zero_budget_active
+            ),
+            "native_verified_pv_sink_hold_active": False,
+            "openwb_phase_transition_grace_active": False,
+            "openwb_phase_transition_offer_active": False,
+            "transient_hold_active": False,
+            "transient_offer_active": False,
+            "transient_hold_reason": "",
+            "zero_budget_contract_valid": bool(zero_budget_valid),
+            "zero_budget_contract_active": bool(zero_budget_active),
+            "zero_budget_hold_allowed": False,
+            "zero_budget_stop_allowed": bool(zero_budget_stop_allowed),
+            "zero_budget_hard_stop": bool(zero_budget_hard_stop),
+            "zero_budget_age_s": float(zero_budget_age),
+            "zero_budget_deficit_wh": float(zero_budget_deficit_wh),
+            "zero_budget_contract_source": str(
+                zero_budget.get("source", "legacy_timer") or "legacy_timer"
+            ),
+            "need_stop_toggle": bool(stop_edge_due),
+            "reason": stop_reason,
+        }
+
+    vehicle_finished_drop_pending = bool(
+        openwb_pro
+        and transient.get("vehicle_finished_drop_pending_active", False)
+    )
+    pending_offer_amp = max(current, set_amp)
+    if (
+        vehicle_finished_drop_pending
+        and cap >= 6.0
+        and pending_offer_amp >= 6.0
+    ):
+        pending_target_amp = min(cap, pending_offer_amp)
+        return {
+            "action": "HOLD_OPENWB_FINISH_CONFIRM",
+            "target_amp": float(pending_target_amp),
+            "hold_amp": float(pending_target_amp),
+            "is_new_start": False,
+            "min_charge_hold_active": False,
+            "multi_zero_budget_hold": False,
+            "openwb_zero_budget_hold": False,
+            "native_mode_no_stop_wait": False,
+            "native_start_grace_active": bool(native_start_grace_active),
+            "native_battery_drain_zero_budget_active": False,
+            "native_verified_pv_sink_hold_active": False,
+            "openwb_phase_transition_grace_active": bool(
+                openwb_phase_transition_grace_active
+            ),
+            "openwb_phase_transition_offer_active": bool(
+                transient.get("phase_transition_offer_active", False)
+            ),
+            "transient_hold_active": True,
+            "transient_offer_active": True,
+            "transient_hold_reason": "vehicle_finished_drop_confirmation",
+            "vehicle_finished_drop_pending": True,
+            "need_stop_toggle": False,
+            "zero_budget_contract_valid": bool(zero_budget_valid),
+            "zero_budget_contract_active": bool(zero_budget_active),
+            "zero_budget_hold_allowed": bool(zero_budget_hold_allowed),
+            "zero_budget_stop_allowed": bool(zero_budget_stop_allowed),
+            "zero_budget_hard_stop": bool(zero_budget_hard_stop),
+            "zero_budget_age_s": float(zero_budget_age),
+            "zero_budget_deficit_wh": float(zero_budget_deficit_wh),
+            "zero_budget_contract_source": str(
+                zero_budget.get("source", "legacy_timer")
+                or "legacy_timer"
+            ),
+            "reason": "vehicle_finished_drop_confirmation",
+        }
 
     if cap > 0:
         return {
@@ -2594,7 +3370,10 @@ def start_stop_hold_action(
         and not local_grid_allowed
     )
     if e3dc_native_toggle:
-        need_stop_toggle = bool((hw_charging and hw_power > 500.0) or stop_retry_due)
+        need_stop_toggle = bool(
+            (hw_charging and hw_power > 500.0 and not stop_already_sent)
+            or stop_retry_due
+        )
     else:
         need_stop_toggle = bool(
             is_charging_memory
@@ -2686,7 +3465,7 @@ def start_stop_hold_action(
         "zero_budget_deficit_wh": float(zero_budget_deficit_wh),
         "zero_budget_contract_source": str(zero_budget.get("source", "legacy_timer") or "legacy_timer"),
         "need_stop_toggle": bool(need_stop_toggle),
-        "reason": action.lower(),
+        "reason": "zero_budget_stop" if action == "STOP" else action.lower(),
     }
 
 
@@ -2700,6 +3479,9 @@ def start_stop_effective_action_contract(
     detected_phases: Any = 1,
     low_power_one_phase_required_for_wb: bool = False,
     physical_budget: Optional[Dict[str, Any]] = None,
+    authorized_target_amp: Any = 0,
+    min_amp: Any = 6,
+    native_stop_edge_due: bool = False,
 ) -> Dict[str, Any]:
     """Wendet nachgelagerte Start-/Stopp-Policy-Korrekturen ohne Hardwarezugriff an."""
 
@@ -2707,18 +3489,50 @@ def start_stop_effective_action_contract(
     action = str(decision.get("action", "NOOP") or "NOOP")
     effective_action = action
     decision_changed = False
+    minimum = max(1.0, _safe_float(min_amp, 6.0))
+    authorized = max(0.0, _safe_float(authorized_target_amp, 0.0))
     floor_min_reached = bool(
         _safe_int(current_amp, 0) <= 6
         and _safe_int(current_set_amp, 0) <= 6
         and max(1, valid_phase_count(detected_phases, 1)) <= 1
     )
 
-    if (
+    floor_battery_guard = bool(
         floor_pv_only_guard_for_wb
         and controlled_floor_battery_guard_active
-        and effective_action == "HOLD_NATIVE_RUNNING_CHARGE"
-    ):
-        effective_action = "STOP" if floor_min_reached else "HOLD_NATIVE_CURRENT_DOWN"
+    )
+    if floor_battery_guard and effective_action == "HOLD_NATIVE_RUNNING_CHARGE":
+        effective_action = "HOLD_NATIVE_CURRENT_DOWN"
+
+    if effective_action == "HOLD_NATIVE_CURRENT_DOWN":
+        if authorized < minimum:
+            effective_action = "STOP"
+            decision.update({
+                "action": "STOP",
+                "target_amp": 0.0,
+                "hold_amp": 0.0,
+                "need_stop_toggle": bool(native_stop_edge_due),
+                "native_current_down_hold": False,
+                "native_running_charge_hold": False,
+                "reason": (
+                    "wbminsoc_floor_zero_authority_stop"
+                    if floor_battery_guard
+                    else "native_current_down_zero_authority_stop"
+                ),
+            })
+            decision_changed = True
+        else:
+            hold_amp = min(minimum, authorized)
+            decision.update({
+                "action": "HOLD_NATIVE_CURRENT_DOWN",
+                "target_amp": float(hold_amp),
+                "hold_amp": float(hold_amp),
+                "need_stop_toggle": False,
+                "native_current_down_hold": True,
+                "native_running_charge_hold": False,
+                "reason": "native_current_down_hold",
+            })
+            decision_changed = True
 
     physical = physical_budget if isinstance(physical_budget, dict) else {}
     openwb_zero_budget_hold = bool(decision.get("openwb_zero_budget_hold", False))
@@ -2735,6 +3549,13 @@ def start_stop_effective_action_contract(
         decision["reason"] = "low_power_requires_1p"
         decision_changed = True
 
+    if effective_action == "STOP":
+        decision["stop_authority"] = final_stop_authority_contract()
+    else:
+        # Eine von einem früheren Kandidaten mitgebrachte Autorität darf nie
+        # eine nachgelagert finalisierte Halte-/Startentscheidung überleben.
+        decision.pop("stop_authority", None)
+
     return {
         "action": effective_action,
         "decision": decision,
@@ -2743,6 +3564,7 @@ def start_stop_effective_action_contract(
         "openwb_zero_budget_hold": bool(openwb_zero_budget_hold),
         "floor_pv_only_guard_active": bool(floor_pv_only_guard_for_wb and controlled_floor_battery_guard_active),
         "floor_pv_only_min_reached": bool(floor_min_reached),
+        "authorized_target_amp": float(authorized),
         "low_power_one_phase_stop": bool(low_power_one_phase_stop),
     }
 
@@ -2847,20 +3669,24 @@ def phase_switch_recommendation(
             "remaining_s": 0,
         }
 
-    known_3p_recovery_possible = bool(
-        openwb_pro
-        and mode > 0
-        and public_mode > 0
-        and not hw_charging
-        and cap > 0
-        and phase_3p_supported
-        and not vehicle_1p_only
-        and not vehicle_phase_unknown
-        and switch_phases in (0, 1)
-        and target != 3
-        and not phase_block_active
-    )
-    if not hold_elapsed and not known_3p_recovery_possible:
+    if not hold_elapsed:
+        openwb_pro_running_on_current_target_allowed = bool(
+            openwb_pro
+            and charger_connected
+            and mode > 0
+            and public_mode > 0
+            and hw_charging
+            and target in (1, 3)
+            and switch_phases == target
+        )
+        if openwb_pro_running_on_current_target_allowed:
+            return {
+                "action": "KEEP_PHASES",
+                "target_phases": 0,
+                "reason": "phase_change_cooldown_current_allowed",
+                "wait_s": int(round(hold_s)),
+                "remaining_s": int(round(max(0.0, hold_s - last_age))),
+            }
         openwb_pro_start_on_current_target_allowed = bool(
             openwb_pro
             and charger_connected
@@ -3005,6 +3831,24 @@ def phase_switch_recommendation(
         "wait_s": 0,
         "remaining_s": 0,
     }
+
+
+def phase_start_1p_dispatch_required(
+    *,
+    action: Any,
+    reason: Any,
+    effective_current_amp: Any,
+) -> bool:
+    """Übersetzt die bereits geprüfte 1p-Policy ohne zweite Fachprüfung."""
+
+    return bool(
+        str(action or "") == "SWITCH_1P"
+        and str(reason or "") in (
+            "start_1p",
+            "openwb_pro_cold_start_1p",
+        )
+        and _safe_float(effective_current_amp, 0.0) >= 6.0
+    )
 
 
 def minimum_current_import_action(
@@ -3231,13 +4075,33 @@ def _grid_allowed_for_id(grid_allowed_charger_ids: Any, wb_id: int) -> bool:
 
 
 def _status_running_for_allocation(status: Optional[Dict[str, Any]]) -> bool:
-    st = status or {}
+    if not isinstance(status, dict):
+        return False
+    st = status
     try:
+        if (
+            st.get("driver_status_valid") is False
+            or st.get("driver_status_stale") is True
+            or st.get("driver_status_glitch") is True
+            or st.get("stale") is True
+        ):
+            return False
+        charge_contract = st.get("charge_contract")
+        if (
+            isinstance(charge_contract, dict)
+            and charge_contract.get("counts_as_real_charge") is True
+        ):
+            return True
+        if st.get("charge_counts_as_real") is True:
+            return True
         if bool(st.get("charge_state", False) or st.get("charging", False)):
             return True
-        if abs(_safe_float(st.get("real_power_w", st.get("power_w", st.get("power", 0))), 0.0)) > 500.0:
-            return True
-        if abs(_safe_float(st.get("amp", st.get("offered_current", 0)), 0.0)) >= 5.5:
+        power_w = max(
+            abs(float(st.get("real_power_w", 0) or 0)),
+            abs(float(st.get("phase_power_sum_w", 0) or 0)),
+            abs(float(st.get("power_w", st.get("power", 0)) or 0)),
+        )
+        if power_w > 250.0:
             return True
     except Exception:
         return False
@@ -3387,6 +4251,7 @@ def build_wallbox_decision_payload(
     phase_action = str(phase.get("action", "KEEP_PHASES") or "KEEP_PHASES")
     current_reason = str(current.get("limiting_reason", "") or "")
     start_reason = str(start_stop.get("reason", start_action.lower()) or "")
+    stop_authority = _decision_map(start_stop.get("stop_authority"))
     phase_reason = str(phase.get("reason", "stable") or "stable")
     target_amp = max(0.0, _safe_float(start_stop.get("target_amp", current.get("target_amp", cap_amp)), 0.0))
     hold_amp = max(0.0, _safe_float(start_stop.get("hold_amp", 0), 0.0))
@@ -3421,6 +4286,7 @@ def build_wallbox_decision_payload(
                 "hold_amp": hold_amp,
                 "is_new_start": bool(start_stop.get("is_new_start", False)),
                 "reason": start_reason,
+                "stop_authority": dict(stop_authority),
             },
             "phase": {
                 "action": phase_action,
@@ -3467,8 +4333,10 @@ def driver_command_from_decision_payload(payload: Optional[Dict[str, Any]]) -> D
     decisions = _decision_map(data.get("decisions"))
     driver = _decision_map(data.get("driver"))
     inputs = _decision_map(data.get("inputs"))
+    current = _decision_map(decisions.get("current"))
     start_stop = _decision_map(decisions.get("start_stop"))
     phase = _decision_map(decisions.get("phase"))
+    stop_authority = _decision_map(start_stop.get("stop_authority"))
 
     start_action = str(start_stop.get("action", "NOOP") or "NOOP")
     phase_action = str(phase.get("action", "KEEP_PHASES") or "KEEP_PHASES")
@@ -3476,6 +4344,20 @@ def driver_command_from_decision_payload(payload: Optional[Dict[str, Any]]) -> D
     target_amp = max(0.0, _safe_float(start_stop.get("target_amp", inputs.get("cap_amp", 0)), 0.0))
     hold_amp = max(0.0, _safe_float(start_stop.get("hold_amp", 0), 0.0))
     current_set_amp = max(0.0, _safe_float(inputs.get("current_set_amp", 0), 0.0))
+    effective_current_amp = max(0.0, _safe_float(current.get("target_amp", 0), 0.0))
+    hold_target_amp = current_output_hold_target_amp(
+        start_action,
+        hold_amp=hold_amp,
+        target_amp=target_amp,
+        current_amp=inputs.get("current_amp", 0),
+        current_set_amp=current_set_amp,
+        min_amp=6,
+        max_amp=effective_current_amp,
+        authorized_target_amp=effective_current_amp,
+    )
+    authorized_start_amp = 0.0
+    if target_amp >= 6.0 and effective_current_amp >= 6.0:
+        authorized_start_amp = min(target_amp, effective_current_amp)
 
     kind = "noop"
     amp = 0
@@ -3491,6 +4373,10 @@ def driver_command_from_decision_payload(payload: Optional[Dict[str, Any]]) -> D
     elif start_action == "SUPPRESS_NATIVE_STOP":
         kind = "noop"
         reason = reason or "suppress_native_stop"
+    elif start_action.startswith("HOLD_") and start_action not in CURRENT_OUTPUT_HOLD_ACTIONS:
+        kind = "noop"
+        amp = 0
+        reason = "unknown_hold_action"
     elif phase_action in ("SWITCH_1P", "SWITCH_3P") and phase_target in (1, 3):
         kind = "set_phases"
         target_phases = phase_target
@@ -3500,30 +4386,49 @@ def driver_command_from_decision_payload(payload: Optional[Dict[str, Any]]) -> D
         # Auf den vorhandenen Phasen folgt die Wallbox weiter der Stromkurve;
         # nur der spätere Schütz-/phasetarget-Befehl wartet.
         hw_charging = bool(inputs.get("hw_charging", False))
-        if hw_charging and start_action in ("START", "SET_CURRENT") and target_amp > 0:
+        if (
+            hw_charging
+            and start_action in ("START", "SET_CURRENT")
+            and authorized_start_amp >= 6.0
+        ):
             kind = "set_current"
-            amp = target_amp
-            reason = "phase_hysteresis_hold_current"
-        elif hw_charging and start_action.startswith("HOLD_") and max(
-            hold_amp, target_amp, current_set_amp
-        ) > 0:
+            amp = authorized_start_amp
+            reason = (
+                "current_target_clamped"
+                if target_amp > effective_current_amp + 1e-6
+                else "phase_hysteresis_hold_current"
+            )
+        elif hw_charging and start_action in CURRENT_OUTPUT_HOLD_ACTIONS and hold_target_amp >= 6.0:
             kind = "hold_current"
-            amp = max(hold_amp, target_amp, current_set_amp)
+            amp = hold_target_amp
             reason = "phase_hysteresis_hold_current"
         else:
             kind = "wait"
             target_phases = phase_target
             reason = str(phase.get("reason", "phase_wait") or "phase_wait")
-    elif start_action.startswith("HOLD_"):
-        kind = "hold_current" if max(hold_amp, target_amp, current_set_amp) > 0 else "hold_state"
-        amp = max(hold_amp, target_amp, current_set_amp)
+    elif start_action in CURRENT_OUTPUT_HOLD_ACTIONS:
+        kind = "hold_current" if hold_target_amp >= 6.0 else "hold_state"
+        amp = hold_target_amp
         reason = reason or start_action.lower()
     elif start_action in ("START", "SET_CURRENT"):
-        amp = target_amp
-        kind = "set_current" if amp > 0 else "noop"
-        reason = reason or start_action.lower()
+        if target_amp < 6.0 or effective_current_amp < 6.0:
+            amp = 0
+            kind = "noop"
+            reason = (
+                "current_target_mismatch"
+                if target_amp >= 6.0 and effective_current_amp < 6.0
+                else "current_target_below_minimum"
+            )
+        else:
+            amp = authorized_start_amp
+            kind = "set_current"
+            reason = (
+                "current_target_clamped"
+                if target_amp > effective_current_amp + 1e-6
+                else (reason or start_action.lower())
+            )
 
-    return {
+    command = {
         "schema_version": "wallbox_driver_command_v1",
         "kind": kind,
         "amp": float(amp),
@@ -3531,6 +4436,9 @@ def driver_command_from_decision_payload(payload: Optional[Dict[str, Any]]) -> D
         "reason": reason,
         "source": "decision_payload",
     }
+    if kind == "stop" and stop_authority:
+        command["stop_authority"] = dict(stop_authority)
+    return command
 
 
 CONTACTOR_PROTECTION_REASON_MARKERS = (

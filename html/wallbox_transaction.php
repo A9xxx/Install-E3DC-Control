@@ -517,7 +517,12 @@ function e3dcWallboxPlanTransaction(array $updates, array $options = []) {
         $abortPath = $ramdisk . '/native_schedule_aborted.flag';
         $emergencyPath = $ramdisk . '/wallbox_emergency_stop.flag';
         $cachePath = $context['cache_path'];
-        $targets = [$context['config_path'], $cachePath, ...array_values($planTargets)];
+        // Der Konfigurationscache ist ein abgeleiteter tmpfs-Spiegel und wird
+        // von jedem regulären Lesezugriff bei Bedarf neu erzeugt. Er ist weder
+        // kanonischer Transaktionszustand noch eine zulässige Parallelitäts-
+        // autorität; andernfalls kann ein gleichzeitiger Dashboardabruf jeden
+        // legitimen Wallbox-Save als concurrent_change verwerfen.
+        $targets = [$context['config_path'], ...array_values($planTargets)];
         if ($savedCarsRequested) $targets[] = $savedCarsPath;
 
         if ($abortAction !== 'preserve') $targets[] = $abortPath;
@@ -691,7 +696,6 @@ function e3dcWallboxPlanTransaction(array $updates, array $options = []) {
             ];
         }
         $desired[] = [$context['config_path'], $candidateBytes, $snapshots[$context['config_path']]['mode']];
-        $desired[] = [$cachePath, null, 0600];
         if ($abortAction === 'remove') $desired[] = [$abortPath, null, 0600];
         if ($abortAction === 'create') $desired[] = [$abortPath, gmdate('c') . "\n", !empty($snapshots[$abortPath]['exists']) ? $snapshots[$abortPath]['mode'] : 0644];
         if ($requestTarget !== null && $requestKind !== null) {
@@ -720,6 +724,13 @@ function e3dcWallboxPlanTransaction(array $updates, array $options = []) {
                 throw new RuntimeException('Commit fehlgeschlagen: ' . basename($path));
             }
             $mutated[] = $path;
+        }
+        // Nach dem kanonischen Commit wird die reine Cacheprojektion nur
+        // best-effort verworfen. Ein paralleler Leser darf sie davor oder
+        // danach neu aufbauen; loadE3dcConfig() bindet sie an die aktuelle
+        // Konfigurationsgeneration und liest die Quelle ohnehin erneut.
+        if (is_file($cachePath) && !is_link($cachePath)) {
+            @unlink($cachePath);
         }
         // Alte C++-Artefakte sind keine kanonische Wahrheit. Ihre Bereinigung
         // läuft bewusst erst nach dem bestätigten V4/Plan/Flag-Commit und kann

@@ -340,6 +340,10 @@ class ShadowWallboxSimulator:
         if not wallbox_online or not wallbox_configured or not regulation_enabled:
             if not wallbox_online:
                 reason = "driver_offline_fallback"
+                # Ein Offline-Intervall ist keine stabile 3p-Budgetevidenz.
+                # Nach Recovery beginnt ausschließlich die kurze fachliche
+                # Haltefrist neu; ein Hardwareausgang entsteht hier nicht.
+                state.phase_up_since = 0.0
             elif not wallbox_configured:
                 reason = "wallbox_observe_only"
             else:

@@ -18,7 +18,7 @@ LABEL org.opencontainers.image.title="E3DC-Control" \
 
 # 1. Systempakete (Laufzeitumgebung - ändert sich selten)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git curl jq util-linux \
+    git curl jq util-linux logrotate \
     apache2 php libapache2-mod-php php-curl php-sqlite3 php-mbstring \
     python3 python3-pip python3-venv python3-dev unzip python3-sklearn python3-numpy \
     ca-certificates pkg-config libffi-dev \
@@ -29,12 +29,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm avah
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # 2. Apache PHP + Reverse Proxy für WebSockets
+COPY --chown=root:root --chmod=0644 Installer/apache/e3dc-control-security.conf /etc/apache2/conf-available/e3dc-control-security.conf
+COPY --chown=root:root --chmod=0644 Installer/apache/e3dc-control-access-log.conf /etc/apache2/conf-available/e3dc-control-access-log.conf
 RUN PHP_APACHE_MOD="$(php -r 'echo "php".PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')" && \
     (a2dismod mpm_event >/dev/null 2>&1 || true) && \
     (a2dismod mpm_worker >/dev/null 2>&1 || true) && \
     a2enmod mpm_prefork "$PHP_APACHE_MOD" proxy proxy_wstunnel && \
+    a2enconf e3dc-control-security && \
     echo "ServerName localhost" >> /etc/apache2/apache2.conf && \
-    sed -i 's|</VirtualHost>|    ProxyPass "/ws" "ws://127.0.0.1:8765/"\n</VirtualHost>|' /etc/apache2/sites-available/000-default.conf
+    sed -i 's|^[[:space:]]*CustomLog ${APACHE_LOG_DIR}/access.log combined$|    # E3DC-Control: erfolgreiche Live-POSTs nicht persistent protokollieren\n    IncludeOptional /etc/apache2/conf-available/e3dc-control-access-log.conf|' /etc/apache2/sites-available/000-default.conf && \
+    sed -i 's|</VirtualHost>|    ProxyPass "/ws" "ws://127.0.0.1:8765/"\n</VirtualHost>|' /etc/apache2/sites-available/000-default.conf && \
+    test "$(grep -Fc 'IncludeOptional /etc/apache2/conf-available/e3dc-control-access-log.conf' /etc/apache2/sites-available/000-default.conf)" = "1" && \
+    test "$(grep -Fc 'CustomLog ${APACHE_LOG_DIR}/access.log combined' /etc/apache2/sites-available/000-default.conf)" = "0" && \
+    apache2ctl configtest
 
 # 3. Python VENV mit allen Abhängigkeiten
 RUN python3 -m venv --system-site-packages /opt/venv
@@ -45,6 +52,7 @@ RUN pip3 install --upgrade pip wheel setuptools && \
 
 # 4. Verzeichnisse und statische Konfiguration
 RUN mkdir -p /app/pi/Install /var/www/html/tmp /var/www/html/logs /var/www/html/data /var/www/html/ramdisk && \
+    install -d -o root -g root -m 0755 /etc/e3dc-control && \
     install -d -o root -g root -m 0700 /var/lib/e3dc-control/forecast-evidence && \
     chown -R www-data:www-data /var/www/html
 
@@ -57,6 +65,9 @@ RUN echo '{"install_user": "root", "home_dir": "/app", "install_path": "/app/pi/
 # sobald dort Projektcode liegt. Mit Dev-Volume gewinnt der Host-Code, sonst
 # gewinnt der im Image enthaltene Release-Code.
 COPY entrypoint.sh /usr/local/bin/
+COPY --chown=root:root --chmod=0555 Installer/docker_healthcheck.py /usr/local/bin/e3dc-docker-healthcheck
+COPY --chown=root:root --chmod=0555 Installer/docker_logrotate_manager.py /usr/local/bin/e3dc-docker-logrotate
+COPY --chown=root:root --chmod=0644 Installer/docker-logrotate.conf /etc/logrotate.d/e3dc-control
 RUN chmod +x /usr/local/bin/entrypoint.sh && \
     ln -sf /usr/local/bin/entrypoint.sh /app/entrypoint.sh
 
@@ -64,11 +75,38 @@ RUN chmod +x /usr/local/bin/entrypoint.sh && \
 # Entwicklungsumgebungen dürfen /app/pi/Install weiterhin per Volume überlagern.
 COPY . /app/pi/Install/
 RUN test -f /app/pi/Install/Installer/matter/package-lock.json && \
+    test -f /app/pi/Install/Installer/apache/e3dc-control-security.conf && \
+    test -f /app/pi/Install/Installer/apache/e3dc-control-access-log.conf && \
+    test -f /app/pi/Install/Installer/Storage/process_singleton.py && \
+    test -f /app/pi/Install/Installer/Wallbox/process_singleton.py && \
+    test -f /app/pi/Install/Installer/Wallbox/start_hold.py && \
+    test -f /app/pi/Install/Installer/control_time.py && \
+    test -f /app/pi/Install/Installer/direct_marketing_actions.py && \
+    test -f /app/pi/Install/Installer/docker_healthcheck.py && \
+    test -f /app/pi/Install/Installer/ha_writer_admission.py && \
+    test -f /app/pi/Install/Installer/secure_file_transaction.py && \
+    test -f /app/pi/Install/Installer/storage_owner_paths.py && \
+    test -f /app/pi/Install/Installer/docker_compose_update.py && \
+    test -f /app/pi/Install/Installer/docker_logrotate_manager.py && \
+    test -f /app/pi/Install/Installer/docker-logrotate.conf && \
+    chown root:root /app/pi/Install /app/pi/Install/Installer /app/pi/Install/Installer/apache /app/pi/Install/Installer/apache/e3dc-control-security.conf /app/pi/Install/Installer/apache/e3dc-control-access-log.conf && \
+    chmod 0755 /app/pi/Install /app/pi/Install/Installer /app/pi/Install/Installer/apache && \
+    chmod 0644 /app/pi/Install/Installer/apache/e3dc-control-security.conf /app/pi/Install/Installer/apache/e3dc-control-access-log.conf && \
+    test "$(stat -c '%u:%g:%a' /app/pi/Install)" = "0:0:755" && \
+    test "$(stat -c '%u:%g:%a' /app/pi/Install/Installer)" = "0:0:755" && \
+    test "$(stat -c '%u:%g:%a' /app/pi/Install/Installer/apache)" = "0:0:755" && \
+    test "$(stat -c '%u:%g:%a' /app/pi/Install/Installer/apache/e3dc-control-security.conf)" = "0:0:644" && \
+    test "$(stat -c '%u:%g:%a' /app/pi/Install/Installer/apache/e3dc-control-access-log.conf)" = "0:0:644" && \
     cd /app/pi/Install/Installer/matter && \
     npm ci --omit=dev --ignore-scripts && \
+    chown -R root:root /app/pi/Install/Installer/matter/node_modules && \
+    test -z "$(find /app/pi/Install/Installer/matter/node_modules \( ! -uid 0 -o ! -gid 0 \) -print -quit)" && \
     chmod +x /app/pi/Install/entrypoint.sh && \
     find /app/pi/Install/Installer -name "*.py" -exec chmod 755 {} \;
 
 WORKDIR /app/pi/Install
+
+HEALTHCHECK --interval=5s --timeout=5s --start-period=120s --retries=36 \
+    CMD ["/opt/venv/bin/python3", "-I", "-B", "/usr/local/bin/e3dc-docker-healthcheck"]
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

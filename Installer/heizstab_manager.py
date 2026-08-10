@@ -54,6 +54,7 @@ myPV AC ELWA-E Modbus Register (heizstab_type = mypv_elwa):
 import os
 import sys
 import json
+import math
 import time
 import urllib.request
 import urllib.error
@@ -62,9 +63,23 @@ _INSTALLER_DIR = os.path.dirname(os.path.abspath(__file__))
 _INSTALL_ROOT = os.path.dirname(_INSTALLER_DIR)
 
 try:
-    from consumer_priority import CONSUMER_MIN_W
+    from consumer_priority import (
+        CONSUMER_MIN_W,
+        validate_consumer_budget_contract,
+        validate_consumer_command_allocations,
+    )
 except Exception:
-    CONSUMER_MIN_W = {"heater": 500}
+    CONSUMER_MIN_W = {"heatpump": 1500, "heater": 500}
+    def validate_consumer_budget_contract(_contract):
+        return {"valid": False, "reason_code": "consumer_budget_validator_unavailable"}
+
+    def validate_consumer_command_allocations(_contract):
+        return {"valid": False, "reason_code": "consumer_budget_validator_unavailable"}
+
+try:
+    from Installer.storage_dispatch_contract import revision_hash
+except ModuleNotFoundError:
+    from storage_dispatch_contract import revision_hash  # type: ignore
 
 try:
     from market_economics import current_market_consumer_release
@@ -129,6 +144,29 @@ STARTUP_DELAY      = 30   # Sekunden warten nach (Re-)Start bevor erster Modbus-
 CONN_ERR_BACKOFF   = 60   # Sekunden Pause nach Connection refused
 HS_HYSTERESIS_W    = 500  # Deadband: Abschalten erst wenn Ueberschuss < min - 500W
 SHELLY_TIMEOUT     = 3    # HTTP Timeout
+HEATER_READBACK_MAX_AGE_S = 45.0
+HEATER_CONSUMER_BUDGET_MAX_AGE_S = 20.0
+_CONSUMER_BUDGET_KEYS = ("heatpump", "wallbox", "heater")
+_CONSUMER_BUDGET_IDENTITY_SCHEMA = "storage_consumer_budget_identity_v1"
+_CONSUMER_BUDGET_IDENTITY_NOT_APPLICABLE = "not_applicable"
+_CONSUMER_BUDGET_IDENTITY_KEYS = frozenset({
+    "schema_version",
+    "decision_generation",
+    "decision_ts",
+    "decision_owner",
+    "decision_effect",
+    "decision_state",
+    "decision_mode",
+    "decision_value_w",
+    "decision_protected",
+    "authorized_wallbox_budget_w",
+    "authorized_heatpump_budget_w",
+    "authorized_heater_budget_w",
+    "binding_status",
+    "plan_id",
+    "slot_id",
+    "action_id",
+})
 
 
 _HEATER_ACTUATOR_GATE = None
@@ -173,6 +211,7 @@ def _invoke_actuator(func, *args, safety_gate=None):
 
 
 def _with_actuator_safety_status(status, safety_gate=None):
+    _finalize_heater_measurement_projection(status)
     gate = safety_gate or _HEATER_ACTUATOR_GATE
     authorization = getattr(gate, "last_authorization", None) if gate is not None else None
     status["actor_writes_blocked"] = bool(
@@ -550,18 +589,28 @@ def shelly_3em_read(ip):
         url = f"http://{ip}/rpc/EM.GetStatus?id=0"
         with urllib.request.urlopen(url, timeout=SHELLY_TIMEOUT) as r:
             d = json.loads(r.read().decode())
+        if not isinstance(d, dict):
+            return None
+
+        def measured(field, digits):
+            value = _strict_finite_number(d.get(field))
+            return round(value, digits) if value is not None else None
+
+        total_w = measured("total_act_power", 1)
+        if total_w is None:
+            return None
         return {
-            "phase_a_w":  round(float(d.get("a_act_power", 0)), 1),
-            "phase_b_w":  round(float(d.get("b_act_power", 0)), 1),
-            "phase_c_w":  round(float(d.get("c_act_power", 0)), 1),
-            "total_w":    round(float(d.get("total_act_power", 0)), 1),
-            "phase_a_v":  round(float(d.get("a_voltage", 0)), 1),
-            "phase_b_v":  round(float(d.get("b_voltage", 0)), 1),
-            "phase_c_v":  round(float(d.get("c_voltage", 0)), 1),
-            "phase_a_a":  round(float(d.get("a_current", 0)), 3),
-            "phase_b_a":  round(float(d.get("b_current", 0)), 3),
-            "phase_c_a":  round(float(d.get("c_current", 0)), 3),
-            "freq_hz":    round(float(d.get("a_freq", 50)), 2),
+            "phase_a_w": measured("a_act_power", 1),
+            "phase_b_w": measured("b_act_power", 1),
+            "phase_c_w": measured("c_act_power", 1),
+            "total_w": total_w,
+            "phase_a_v": measured("a_voltage", 1),
+            "phase_b_v": measured("b_voltage", 1),
+            "phase_c_v": measured("c_voltage", 1),
+            "phase_a_a": measured("a_current", 3),
+            "phase_b_a": measured("b_current", 3),
+            "phase_c_a": measured("c_current", 3),
+            "freq_hz": measured("a_freq", 2),
         }
     except Exception as e:
         print(f"  [!] Shelly Pro3EM {ip} Lesefehler: {e}")
@@ -574,9 +623,12 @@ def shelly_3em_get_relay(ip, relay_id):
         url = f"http://{ip}/rpc/Switch.GetStatus?id={int(relay_id)}"
         with urllib.request.urlopen(url, timeout=SHELLY_TIMEOUT) as response:
             data = json.loads(response.read().decode())
-        if not isinstance(data, dict) or "output" not in data:
+        if (
+            not isinstance(data, dict)
+            or type(data.get("output")) is not bool
+        ):
             return None
-        return bool(data.get("output"))
+        return data["output"]
     except Exception:
         return None
 
@@ -623,26 +675,450 @@ def shelly_3em_set_relay(ip, relay_id, on: bool, safety_gate=None):
         return False
 
 
-def update_shelly_3em_measurement(status, s3_ip, s3_min_w):
-    s3_data = shelly_3em_read(s3_ip)
-    if s3_data:
-        status["wp_power_w"] = s3_data["total_w"]
-        status["wp_phase_a_w"] = s3_data["phase_a_w"]
-        status["wp_phase_b_w"] = s3_data["phase_b_w"]
-        status["wp_phase_c_w"] = s3_data["phase_c_w"]
-        status["wp_phase_a_v"] = s3_data["phase_a_v"]
-        status["wp_phase_b_v"] = s3_data["phase_b_v"]
-        status["wp_phase_c_v"] = s3_data["phase_c_v"]
-        status["wp_freq_hz"] = s3_data["freq_hz"]
-        status["shelly_3em_ip"] = s3_ip
-        wp_is_running = s3_data["total_w"] >= (s3_min_w * 0.3)
-        status["wp_is_running"] = wp_is_running
-        print(f"  [3EM] WP={s3_data['total_w']:.0f}W "
-              f"(A:{s3_data['phase_a_w']:.0f}W B:{s3_data['phase_b_w']:.0f}W C:{s3_data['phase_c_w']:.0f}W) "
-              f"{'[LAEUFT]' if wp_is_running else '[STAND]'}")
+def _strict_finite_number(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    parsed = float(value)
+    return parsed if math.isfinite(parsed) else None
+
+
+def _heater_power_sample(value, observed_ts, now_ts, max_age_s):
+    """Validiert genau einen physischen Leistungs-Readback ohne 0-W-Imputation."""
+    power_w = _strict_finite_number(value)
+    source_ts = _strict_finite_number(observed_ts)
+    fresh = bool(
+        source_ts is not None
+        and source_ts > 0.0
+        and 0.0 <= now_ts - source_ts <= max_age_s
+    )
+    valid = bool(power_w is not None and power_w >= 0.0 and fresh)
+    if power_w is None or power_w < 0.0:
+        reason = "power_missing_or_invalid"
+    elif source_ts is None or source_ts <= 0.0:
+        reason = "timestamp_missing_or_invalid"
+    elif now_ts - source_ts < 0.0:
+        reason = "timestamp_future"
+    elif not fresh:
+        reason = "readback_stale"
     else:
-        status["wp_power_w"] = 0
-        status["wp_is_running"] = False
+        reason = "ok"
+    return {
+        "valid": valid,
+        "source_fresh": fresh,
+        "power_w": int(round(power_w)) if valid else None,
+        "source_ts": float(source_ts) if source_ts is not None else None,
+        "reason": reason,
+    }
+
+
+def update_heater_power_measurement(
+    status,
+    *,
+    modbus_configured,
+    modbus_power_w=None,
+    modbus_observed_ts=None,
+    modbus_source="modbus_actual_power",
+    shelly_configured,
+    shelly_state=None,
+    shelly_observed_ts=None,
+    now_ts=None,
+    max_age_s=HEATER_READBACK_MAX_AGE_S,
+):
+    """Bindet die gemeinsame Heizstab-Istleistung an echte Provider-Readbacks.
+
+    Bei zwei konfigurierten, physisch unabhängigen Verbrauchern wird nur dann
+    summiert, wenn beide Readbacks gültig und frisch sind. Fehlt einer, bleibt
+    die gemeinsame Istleistung unbekannt; dadurch kann kein Budget doppelt als
+    frei behandelt werden.
+    """
+    current_ts = time.time() if now_ts is None else float(now_ts)
+    evidence_max_age_s = max(1.0, float(max_age_s))
+    topology = (
+        "modbus+shelly"
+        if modbus_configured and shelly_configured
+        else "modbus"
+        if modbus_configured
+        else "shelly"
+        if shelly_configured
+        else "none"
+    )
+    provider_measurements = {}
+
+    if modbus_configured:
+        provider_measurements["modbus"] = _heater_power_sample(
+            modbus_power_w,
+            modbus_observed_ts,
+            current_ts,
+            evidence_max_age_s,
+        )
+        provider_measurements["modbus"]["source"] = str(modbus_source)
+
+    if shelly_configured:
+        shelly_on = (
+            shelly_state.get("on")
+            if isinstance(shelly_state, dict)
+            and type(shelly_state.get("on")) is bool
+            else None
+        )
+        shelly_power_w = (
+            shelly_state.get("power_w")
+            if isinstance(shelly_state, dict)
+            else None
+        )
+        shelly_sample = _heater_power_sample(
+            shelly_power_w,
+            shelly_observed_ts,
+            current_ts,
+            evidence_max_age_s,
+        )
+        if shelly_on is None:
+            shelly_sample["valid"] = False
+            shelly_sample["reason"] = "relay_state_missing_or_invalid"
+        shelly_sample["source"] = "shelly_switch_power"
+        shelly_sample["relay_on"] = shelly_on
+        provider_measurements["shelly"] = shelly_sample
+        status["shelly_heiz_on"] = shelly_on
+        status["shelly_heiz_w"] = (
+            shelly_sample["power_w"] if shelly_sample["valid"] else None
+        )
+
+    measurement_required = bool(modbus_configured or shelly_configured)
+    measurement_valid = bool(
+        measurement_required
+        and provider_measurements
+        and all(
+            sample.get("valid") is True
+            for sample in provider_measurements.values()
+        )
+    )
+    actual_w = (
+        sum(int(sample["power_w"]) for sample in provider_measurements.values())
+        if measurement_valid
+        else None
+    )
+    source_ts = (
+        min(float(sample["source_ts"]) for sample in provider_measurements.values())
+        if measurement_valid
+        else None
+    )
+    source = (
+        "+".join(
+            str(sample["source"])
+            for sample in provider_measurements.values()
+        )
+        if measurement_valid
+        else ""
+    )
+    reasons = [
+        f"{provider}:{sample.get('reason', 'invalid')}"
+        for provider, sample in provider_measurements.items()
+        if sample.get("valid") is not True
+    ]
+
+    status["hs_measurement_required"] = measurement_required
+    status["hs_measurement_valid"] = measurement_valid
+    status["hs_measurement_ts"] = source_ts
+    status["hs_measurement_source"] = source
+    status["hs_measurement_topology"] = topology
+    status["hs_measurement_reason"] = (
+        "ok" if measurement_valid else ",".join(reasons) or "not_configured"
+    )
+    status["hs_provider_measurements"] = provider_measurements
+    status["source_fresh"] = measurement_valid
+    status["hs_source_fresh"] = measurement_valid
+    status["Heizstab_Power"] = actual_w
+    status["hs_actual_w"] = actual_w
+    status["hs_active"] = bool(actual_w > 0) if actual_w is not None else None
+    if measurement_required and not measurement_valid:
+        # `success` bleibt aus Kompatibilitätsgründen der aggregierte
+        # Statusvertrag; `process_success` unterscheidet davon den intakten Loop.
+        status["success"] = False
+        status["budget_start_ready"] = False
+        status["budget_start_request_w"] = 0
+    return measurement_valid
+
+
+def _finalize_heater_measurement_projection(status):
+    """Verhindert, dass Sollwerte später als physische Istleistung erscheinen."""
+    if not isinstance(status, dict) or not status.get("hs_measurement_required"):
+        return status
+    valid = bool(
+        status.get("hs_measurement_valid") is True
+        and status.get("source_fresh") is True
+    )
+    measurements = (
+        status.get("hs_provider_measurements")
+        if isinstance(status.get("hs_provider_measurements"), dict)
+        else {}
+    )
+    actual_w = (
+        sum(int(sample["power_w"]) for sample in measurements.values())
+        if valid
+        and measurements
+        and all(
+            isinstance(sample, dict)
+            and sample.get("valid") is True
+            and type(sample.get("power_w")) is int
+            for sample in measurements.values()
+        )
+        else None
+    )
+    if actual_w is None:
+        valid = False
+    status["hs_measurement_valid"] = valid
+    status["source_fresh"] = valid
+    status["hs_source_fresh"] = valid
+    status["Heizstab_Power"] = actual_w if valid else None
+    status["hs_actual_w"] = actual_w if valid else None
+    status["hs_active"] = bool(actual_w > 0) if valid else None
+    if not valid:
+        status["success"] = False
+        status["budget_start_ready"] = False
+        status["budget_start_request_w"] = 0
+    return status
+
+
+def update_shelly_3em_measurement(status, s3_ip, s3_min_w, now_ts=None):
+    """Projiziert eine Pro3EM-Messung ohne 0-W-Imputation.
+
+    Das Pro3EM misst die gesamte Wärmepumpe. Es beweist deshalb eine frische
+    Leistungsannahme, aber keinen separaten Verdichterzustand. Ein kleiner
+    Pumpenvorlauf bleibt so von einer echten Annahme unterscheidbar.
+    """
+    measured_ts = time.time() if now_ts is None else float(now_ts)
+    status["wp_evidence_schema"] = "shelly_3em_heatpump_evidence_v1"
+    status["wp_evidence_provider"] = "shelly_3em"
+    status["wp_evidence_valid"] = False
+    status["wp_evidence_ts"] = None
+    status["wp_measurement_source"] = "shelly_3em_rpc"
+    status["wp_power_known"] = False
+    status["wp_power_w"] = None
+    status["wp_start_progress_observed"] = False
+    status["wp_acceptance_stage"] = "measurement_unavailable"
+    status["wp_accepting_power"] = False
+    status["wp_compressor_observation_valid"] = False
+    status["wp_compressor_running"] = False
+    status["wp_is_running"] = False
+
+    s3_data = shelly_3em_read(s3_ip)
+    if not isinstance(s3_data, dict):
+        return False
+    total_w = _strict_finite_number(s3_data.get("total_w"))
+    if total_w is None or total_w < 0.0:
+        return False
+
+    actual_w = int(round(total_w))
+    accepting_power = bool(actual_w >= max(1, int(math.ceil(s3_min_w))))
+    start_progress = bool(0 < actual_w < max(1, int(math.ceil(s3_min_w))))
+    status["wp_evidence_valid"] = True
+    status["wp_evidence_ts"] = measured_ts
+    status["wp_power_known"] = True
+    status["wp_power_w"] = actual_w
+    status["wp_start_progress_observed"] = start_progress
+    status["wp_acceptance_stage"] = (
+        "configured_load_floor_reached"
+        if accepting_power
+        else ("pump_prelude_or_standby" if start_progress else "no_power")
+    )
+    status["wp_accepting_power"] = accepting_power
+    status["wp_is_running"] = accepting_power
+    phase_a_w = _strict_finite_number(s3_data.get("phase_a_w"))
+    phase_b_w = _strict_finite_number(s3_data.get("phase_b_w"))
+    phase_c_w = _strict_finite_number(s3_data.get("phase_c_w"))
+    status["wp_phase_a_w"] = phase_a_w
+    status["wp_phase_b_w"] = phase_b_w
+    status["wp_phase_c_w"] = phase_c_w
+    status["wp_phase_a_v"] = _strict_finite_number(s3_data.get("phase_a_v"))
+    status["wp_phase_b_v"] = _strict_finite_number(s3_data.get("phase_b_v"))
+    status["wp_phase_c_v"] = _strict_finite_number(s3_data.get("phase_c_v"))
+    status["wp_freq_hz"] = _strict_finite_number(s3_data.get("freq_hz"))
+    status["shelly_3em_ip"] = s3_ip
+    print(f"  [3EM] WP={actual_w:.0f}W "
+          f"(A:{float(phase_a_w or 0):.0f}W "
+          f"B:{float(phase_b_w or 0):.0f}W "
+          f"C:{float(phase_c_w or 0):.0f}W) "
+          f"{'[LASTANNAHME]' if accepting_power else '[STAND/PUMPENVORLAUF]'}")
+    return True
+
+
+def update_shelly_3em_relay_evidence(
+    status,
+    relay_state,
+    *,
+    now_ts=None,
+    source="shelly_3em_switch_get_status",
+):
+    """Bindet ausschließlich einen echten Switch-Readback als Relaiszustand."""
+    read_ts = time.time() if now_ts is None else float(now_ts)
+    valid = type(relay_state) is bool
+    status["wp_relay_readback_valid"] = valid
+    status["wp_relay_readback_on"] = relay_state if valid else None
+    status["wp_relay_readback_ts"] = read_ts if valid else None
+    status["wp_relay_readback_source"] = str(source) if valid else ""
+    status["wp_budget_signal_readback_ts"] = read_ts if valid else None
+    status["wp_budget_signal_readback_source"] = str(source) if valid else ""
+    status["wp_budget_signal_active_confirmed"] = bool(
+        valid and relay_state is True
+    )
+    status["wp_budget_withdrawal_confirmed"] = bool(
+        valid and relay_state is False
+    )
+    status["wp_budget_withdrawal_ts"] = (
+        read_ts if valid and relay_state is False else None
+    )
+    status["wp_budget_withdrawal_source"] = (
+        str(source) if valid and relay_state is False else ""
+    )
+    if valid:
+        status["wp_relay_on"] = bool(relay_state)
+    return valid
+
+
+def reconcile_shelly_3em_relay_state(
+    status,
+    hs_state,
+    relay_state,
+    *,
+    now_ts=None,
+):
+    """Synchronisiert Prozesszustand konservativ aus frischem Hardware-Readback.
+
+    Ist das Relais beim Prozessstart bereits EIN, ist sein echtes Einschaltalter
+    unbekannt. Dann beginnt genau für diesen Prozesszustand eine neue lokale
+    Mindestlaufzeit, statt das Relais sofort oder doppelt zu schalten.
+    """
+    if type(relay_state) is not bool:
+        status["wp_relay_state_reconciled"] = False
+        status["wp_relay_runtime_evidence"] = "readback_unavailable"
+        return False
+
+    observed_ts = time.time() if now_ts is None else float(now_ts)
+    prior_known = type(hs_state.get("s3em_on")) is bool
+    prior_on = bool(hs_state.get("s3em_on", False))
+    changed = bool(not prior_known or prior_on != relay_state)
+    status["wp_relay_state_reconciled"] = changed
+
+    if relay_state:
+        if not prior_known or not prior_on:
+            hs_state["s3em_last_on_ts"] = observed_ts
+            hs_state["s3em_restart_rearm_count"] = 1
+            status["wp_relay_runtime_evidence"] = (
+                "restart_conservative_min_runtime_rearm"
+                if not prior_known
+                else "external_on_readback_rearm"
+            )
+        else:
+            status["wp_relay_runtime_evidence"] = "confirmed_on_readback"
+        hs_state["s3em_on"] = True
+        hs_state["s3em_auto_off_confirmed"] = False
+    else:
+        if not prior_known:
+            # Der physische AUS-Zustand ist belegt, sein Alter nach einem
+            # Prozessneustart aber nicht. Deshalb beginnt die lokale
+            # Wiedereinschaltsperre konservativ neu.
+            hs_state["s3em_last_off_ts"] = observed_ts
+            hs_state["s3em_restart_rearm_count"] = 1
+            status["wp_relay_runtime_evidence"] = (
+                "restart_conservative_restart_block_rearm"
+            )
+        elif prior_on:
+            hs_state["s3em_last_off_ts"] = observed_ts
+            status["wp_relay_runtime_evidence"] = "external_off_readback"
+        else:
+            status["wp_relay_runtime_evidence"] = "confirmed_off_readback"
+        hs_state["s3em_on"] = False
+        if prior_known:
+            hs_state["s3em_restart_rearm_count"] = 0
+    return True
+
+
+def heat_actuator_context_readiness(safety_gate=None):
+    """Prüft den Aktorkontext read-only, ohne eine Writer-Lease zu erwerben."""
+    try:
+        gate = safety_gate or _heater_actuator_gate()
+        verdict = gate.context_validator()
+        return bool(getattr(verdict, "valid", False)), str(
+            getattr(verdict, "reason", "context_invalid")
+        )
+    except Exception as exc:
+        return False, f"context_error:{type(exc).__name__}"
+
+
+def update_shelly_3em_provider_contract(
+    status,
+    hs_state,
+    *,
+    global_auto,
+    s3_enable,
+    s3_relay,
+    s3_min_w,
+    s3_max_w,
+    soc_ok,
+    restart_left_s,
+    wallbox_transition,
+    actuator_context_valid,
+    actuator_context_reason,
+    authorized_budget_w,
+):
+    """Publiziert den typisierten Pro3EM-Start- und Readbackvertrag."""
+    start_floor_w = max(
+        int(CONSUMER_MIN_W.get("heatpump", 1500)),
+        int(math.ceil(max(0.0, float(s3_min_w)))),
+    )
+    max_w = int(math.ceil(max(0.0, float(s3_max_w))))
+    config_valid = bool(s3_min_w > 0 and max_w >= start_floor_w)
+    command_eligible = bool(
+        global_auto
+        and s3_enable
+        and s3_relay >= 0
+        and config_valid
+        and actuator_context_valid
+    )
+    relay_valid = status.get("wp_relay_readback_valid") is True
+    relay_on = status.get("wp_relay_readback_on") is True
+    blockers = []
+    if not global_auto:
+        blockers.append("heatpump_auto_off")
+    if not s3_enable:
+        blockers.append("shelly_3em_relay_control_disabled")
+    if s3_relay < 0:
+        blockers.append("shelly_3em_relay_id_invalid")
+    if not config_valid:
+        blockers.append("shelly_3em_power_contract_invalid")
+    if status.get("wp_evidence_valid") is not True:
+        blockers.append("shelly_3em_power_evidence_invalid")
+    if not relay_valid:
+        blockers.append("shelly_3em_relay_readback_invalid")
+    elif relay_on:
+        blockers.append("shelly_3em_relay_already_on")
+    if status.get("wp_accepting_power") is True:
+        blockers.append("heatpump_already_accepting_power")
+    if not soc_ok:
+        blockers.append("heatpump_soc_protection")
+    if restart_left_s > 0.0:
+        blockers.append("heatpump_restart_block")
+    if wallbox_transition:
+        blockers.append("wallbox_phase_transition_active")
+    if not actuator_context_valid:
+        blockers.append(
+            "heatpump_actuator_context_invalid:"
+            + str(actuator_context_reason or "unknown")
+        )
+
+    start_ready = not blockers
+    status["wp_budget_actuator_owner"] = "heizstab_manager:shelly_3em_relay"
+    status["wp_budget_signal_semantics"] = "start_recommendation_not_acceptance"
+    # Bis 120 s reale Luxtronik-Anlaufzeit plus 30 s Diagnose-/Zyklusreserve.
+    status["wp_budget_startup_grace_s"] = 150
+    status["wp_budget_command_eligible"] = command_eligible
+    status["wp_budget_start_floor_w"] = start_floor_w
+    status["wp_budget_device_max_w"] = max_w
+    status["wp_budget_authorized_w"] = max(0, int(authorized_budget_w or 0))
+    status["wp_budget_offered"] = status["wp_budget_authorized_w"] > 0
+    status["wp_budget_start_ready"] = start_ready
+    status["wp_budget_start_request_w"] = max_w if start_ready else 0
+    status["wp_budget_start_blockers"] = blockers
+    return status
 
 
 def shelly_get_state(ip):
@@ -656,17 +1132,20 @@ def shelly_get_state(ip):
         url = f"http://{ip}/relay/0"
         with urllib.request.urlopen(url, timeout=SHELLY_TIMEOUT) as r:
             relay = json.loads(r.read().decode())
-        if not isinstance(relay, dict) or "ison" not in relay:
+        if (
+            not isinstance(relay, dict)
+            or type(relay.get("ison")) is not bool
+        ):
             raise ValueError("Gen1 relay response has no ison field")
-        is_on = bool(relay["ison"])
+        is_on = relay["ison"]
 
         # Leistung (meter)
-        power = 0.0
+        power = None
         try:
             url2 = f"http://{ip}/meter/0"
             with urllib.request.urlopen(url2, timeout=SHELLY_TIMEOUT) as r2:
                 meter = json.loads(r2.read().decode())
-            power = float(meter.get("power", 0))
+            power = _strict_finite_number(meter.get("power"))
         except Exception:
             pass
         return {"on": is_on, "power_w": power, "gen": 1}
@@ -678,11 +1157,14 @@ def shelly_get_state(ip):
         url = f"http://{ip}/rpc/Switch.GetStatus?id=0"
         with urllib.request.urlopen(url, timeout=SHELLY_TIMEOUT) as r:
             data = json.loads(r.read().decode())
-        if not isinstance(data, dict) or "output" not in data:
+        if (
+            not isinstance(data, dict)
+            or type(data.get("output")) is not bool
+        ):
             return None
         return {
-            "on":      bool(data["output"]),
-            "power_w": float(data.get("apower", 0)),
+            "on":      data["output"],
+            "power_w": _strict_finite_number(data.get("apower")),
             "gen":     2,
         }
     except Exception as e:
@@ -764,41 +1246,247 @@ def calc_netpoint_surplus(live, current_hs_power_w=0, cfg=None):
         return 0
 
 
-def calc_surplus(live, current_hs_power_w=0, cfg=None):
-    """
-    Berechnet verfuegbaren PV-Ueberschuss fuer den Heizstab.
-    Primaer: WB-/Verbraucherbudget aus wb_pv_budget.json.
-    Fallback: Netz-Einspeisung + aktuell verbrauchte Heizstab-Leistung.
+def _strict_consumer_budget_map(value):
+    if not isinstance(value, dict) or set(value) != set(_CONSUMER_BUDGET_KEYS):
+        return None
+    if any(type(value[key]) is not int or value[key] < 0 for key in _CONSUMER_BUDGET_KEYS):
+        return None
+    return {key: value[key] for key in _CONSUMER_BUDGET_KEYS}
 
-    Wichtig: Der Heizstab darf unterhalb seiner SOC-Schwelle nicht aus Akku/Netz
-    nachlaufen. Echte Einspeisung am Netzpunkt darf er aber wie eine Wallbox nutzen.
-    """
-    grid_surplus_w = calc_netpoint_surplus(live, current_hs_power_w=current_hs_power_w, cfg=cfg)
 
+def _consumer_budget_sha256_id(value):
+    return bool(
+        isinstance(value, str)
+        and len(value) == 71
+        and value.startswith("sha256:")
+        and all(char in "0123456789abcdef" for char in value[7:])
+    )
+
+
+def _heater_consumer_budget_envelope_contract(
+    budget,
+    *,
+    consumer=None,
+    now_ts=None,
+    file_age_s=None,
+):
+    """Liest einen Heizverbraucheranteil nur aus dem vollständigen v2-Vertrag.
+
+    Die Dateizeit ist lediglich eine zusätzliche Transportprüfung. Freigaben
+    bleiben an den producerseitigen Zeitstempel, die versiegelte Identity und
+    den vollständigen Payload-Hash gebunden; ein berührtes oder teilweise
+    manipuliertes Ramdisk-JSON kann damit keine Heizleistung freigeben.
+    """
+
+    result = {
+        "valid": False,
+        "reason": "consumer_budget_missing",
+        "allocation_w": 0,
+    }
+    consumer_key = str(consumer or "").strip().lower()
+    if consumer_key and consumer_key not in ("heatpump", "heater"):
+        return {**result, "reason": "consumer_budget_consumer_invalid"}
+    data = budget if isinstance(budget, dict) else {}
+    if data.get("schema_version") != "wb_pv_budget_control_v2":
+        return {**result, "reason": "consumer_budget_schema_invalid"}
+    now_value = time.time() if now_ts is None else now_ts
+    if (
+        isinstance(now_value, bool)
+        or not isinstance(now_value, (int, float))
+        or not math.isfinite(float(now_value))
+    ):
+        return {**result, "reason": "consumer_budget_now_invalid"}
+    source_ts = data.get("ts")
+    if type(source_ts) is not int or source_ts <= 0:
+        return {**result, "reason": "consumer_budget_timestamp_invalid"}
+    age_s = float(now_value) - float(source_ts)
+    if age_s < 0.0:
+        return {**result, "reason": "consumer_budget_timestamp_future"}
+    if age_s > HEATER_CONSUMER_BUDGET_MAX_AGE_S:
+        return {**result, "reason": "consumer_budget_timestamp_stale"}
+    if file_age_s is not None:
+        if (
+            isinstance(file_age_s, bool)
+            or not isinstance(file_age_s, (int, float))
+            or not math.isfinite(float(file_age_s))
+            or float(file_age_s) < 0.0
+            or float(file_age_s) > HEATER_CONSUMER_BUDGET_MAX_AGE_S
+        ):
+            return {**result, "reason": "consumer_budget_file_age_invalid"}
+
+    validation = validate_consumer_budget_contract(
+        data.get("consumer_budget_contract")
+    )
+    command_validation = validate_consumer_command_allocations(
+        data.get("consumer_budget_contract")
+    )
+    if validation.get("valid") is not True:
+        return {**result, "reason": "consumer_budget_contract_invalid"}
+    if command_validation.get("valid") is not True:
+        return {**result, "reason": "consumer_budget_command_invalid"}
+    accounting = _strict_consumer_budget_map(validation.get("allocations"))
+    allocations = _strict_consumer_budget_map(command_validation.get("allocations"))
+    if accounting is None or allocations is None:
+        return {**result, "reason": "consumer_budget_allocations_invalid"}
+    energy_score = data.get("energy_score") if isinstance(data.get("energy_score"), dict) else {}
+    if type(data.get("consumer_total_budget_w")) is not int or data.get(
+        "consumer_total_budget_w"
+    ) != validation.get("total_budget_w"):
+        return {**result, "reason": "consumer_budget_total_mismatch"}
+    for container in (data, energy_score):
+        if _strict_consumer_budget_map(container.get("consumer_allocations")) != allocations:
+            return {**result, "reason": "consumer_budget_command_scope_mismatch"}
+        if _strict_consumer_budget_map(container.get("consumer_accounting_allocations")) != accounting:
+            return {**result, "reason": "consumer_budget_accounting_scope_mismatch"}
+
+    identity = data.get("producer_identity")
+    if not isinstance(identity, dict) or frozenset(identity) != _CONSUMER_BUDGET_IDENTITY_KEYS:
+        return {**result, "reason": "consumer_budget_identity_keys_invalid"}
+    if identity.get("schema_version") != _CONSUMER_BUDGET_IDENTITY_SCHEMA:
+        return {**result, "reason": "consumer_budget_identity_schema_invalid"}
+    if identity.get("decision_ts") != source_ts:
+        return {**result, "reason": "consumer_budget_identity_timestamp_invalid"}
+    if (
+        identity.get("decision_owner") != "storage_manager"
+        or identity.get("decision_effect") != "flexible_consumer_power_budget"
+        or not isinstance(identity.get("decision_state"), str)
+        or not str(identity.get("decision_state")).strip()
+        or type(identity.get("decision_mode")) is not int
+        or type(identity.get("decision_value_w")) is not int
+        or identity.get("decision_value_w") < 0
+        or type(identity.get("decision_protected")) is not bool
+    ):
+        return {**result, "reason": "consumer_budget_identity_contract_invalid"}
+    for key, allocation_key in (
+        ("authorized_wallbox_budget_w", "wallbox"),
+        ("authorized_heatpump_budget_w", "heatpump"),
+        ("authorized_heater_budget_w", "heater"),
+    ):
+        if type(identity.get(key)) is not int or identity.get(key) != allocations[allocation_key]:
+            return {**result, "reason": "consumer_budget_identity_allocation_mismatch"}
+    if type(data.get("budget_w")) is not int or data.get("budget_w") != allocations["wallbox"]:
+        return {**result, "reason": "consumer_budget_wallbox_scope_mismatch"}
+    binding_values = tuple(identity.get(key) for key in ("plan_id", "slot_id", "action_id"))
+    if identity.get("binding_status") == "bound":
+        binding_valid = all(_consumer_budget_sha256_id(value) for value in binding_values)
+    elif identity.get("binding_status") == _CONSUMER_BUDGET_IDENTITY_NOT_APPLICABLE:
+        binding_valid = all(value == _CONSUMER_BUDGET_IDENTITY_NOT_APPLICABLE for value in binding_values)
+    else:
+        binding_valid = False
+    if not binding_valid:
+        return {**result, "reason": "consumer_budget_plan_binding_invalid"}
+    generation = identity.get("decision_generation")
+    if not _consumer_budget_sha256_id(generation):
+        return {**result, "reason": "consumer_budget_generation_invalid"}
+    if generation != revision_hash({key: value for key, value in identity.items() if key != "decision_generation"}):
+        return {**result, "reason": "consumer_budget_generation_mismatch"}
+    revision = data.get("budget_revision")
+    if not _consumer_budget_sha256_id(revision):
+        return {**result, "reason": "consumer_budget_revision_invalid"}
+    if revision != revision_hash({key: value for key, value in data.items() if key != "budget_revision"}):
+        return {**result, "reason": "consumer_budget_revision_mismatch"}
+    return {
+        "valid": True,
+        "reason": "consumer_budget_fresh_bound",
+        "allocations": dict(allocations),
+        "allocation_w": allocations[consumer_key] if consumer_key else None,
+        "budget_revision": revision,
+    }
+
+
+def _read_consumer_budget_envelope_snapshot(*, now_ts=None):
+    """Liest und validiert beide Heizanteile aus genau einer Dateigeneration.
+
+    ``wb_pv_budget.json`` wird atomar ersetzt. Ändert sich der Dateiknoten
+    während des Lesens, wird nicht auf einen zweiten Stand nachgelesen,
+    sondern der gesamte Heizzyklus bleibt fail-closed. So können Heizstab und
+    Shelly-3EM-Wärmepumpe niemals Anteile unterschiedlicher Revisionen sehen.
+    """
+
+    result = {
+        "valid": False,
+        "reason": "consumer_budget_snapshot_missing",
+        "allocations": {key: 0 for key in _CONSUMER_BUDGET_KEYS},
+        "budget_revision": None,
+    }
+    now_value = time.time() if now_ts is None else now_ts
     try:
-        if os.path.exists(WB_BUDGET_FILE) and (time.time() - os.path.getmtime(WB_BUDGET_FILE)) < 20:
-            with open(WB_BUDGET_FILE, "r", encoding="utf-8") as f:
-                budget = json.load(f)
-            es = budget.get("energy_score", {}) if isinstance(budget, dict) else {}
-            allocations = budget.get("consumer_allocations") or es.get("consumer_allocations")
-            if isinstance(allocations, dict) and "heater" in allocations:
-                heater_budget_w = max(0, int(float(allocations.get("heater", 0) or 0)))
-                if heater_budget_w >= int(CONSUMER_MIN_W.get("heater", 500)):
-                    return max(0, heater_budget_w + int(float(current_hs_power_w or 0)))
-                return 0
-            flw = int(es.get("free_for_limbs_w", budget.get("budget_w", -1)))
-            if flw >= 0:
-                budget_surplus_w = max(0, flw + int(float(current_hs_power_w or 0)))
-                return max(grid_surplus_w, budget_surplus_w)
-    except Exception:
-        pass
+        before = os.stat(WB_BUDGET_FILE)
+        with open(WB_BUDGET_FILE, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        after = os.stat(WB_BUDGET_FILE)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return result
+    before_generation = (before.st_ino, before.st_size, before.st_mtime_ns)
+    after_generation = (after.st_ino, after.st_size, after.st_mtime_ns)
+    if before_generation != after_generation:
+        return {**result, "reason": "consumer_budget_snapshot_changed_during_read"}
+    envelope = _heater_consumer_budget_envelope_contract(
+        payload,
+        now_ts=now_value,
+        file_age_s=float(now_value) - float(before.st_mtime),
+    )
+    if envelope.get("valid") is not True:
+        return {**result, "reason": str(envelope.get("reason") or "consumer_budget_snapshot_invalid")}
+    allocations = _strict_consumer_budget_map(envelope.get("allocations"))
+    if allocations is None:
+        return {**result, "reason": "consumer_budget_snapshot_allocations_invalid"}
+    return {
+        "valid": True,
+        "reason": "consumer_budget_snapshot_fresh_bound",
+        "allocations": allocations,
+        "budget_revision": envelope.get("budget_revision"),
+        "wallbox_phase_transition_active": payload.get(
+            "wallbox_phase_transition_active"
+        ) is True,
+        "wallbox_phase_transition_until_ts": payload.get(
+            "wallbox_phase_transition_until_ts",
+            0,
+        ),
+    }
 
-    return grid_surplus_w
 
+def calc_surplus(live, current_hs_power_w=0, cfg=None, *, consumer="heater"):
+    """
+    Liest genau einen absoluten Anteil des gemeinsamen Verbraucherbudgets.
 
-def wallbox_phase_transition_active(now_ts=None, max_age_s=30.0):
+    Heizstab und Pro3EM-Wärmepumpe sind getrennte Verbraucher. Weder eine
+    Netzmessung noch der jeweils andere Teilrahmen darf hier ein zweites Budget
+    erzeugen.
+    """
+    consumer_key = str(consumer or "").strip().lower()
+    if consumer_key not in ("heatpump", "heater"):
+        return 0
+    snapshot = _read_consumer_budget_envelope_snapshot(now_ts=time.time())
+    if snapshot.get("valid") is not True:
+        return 0
+    allocations = _strict_consumer_budget_map(snapshot.get("allocations"))
+    if allocations is None:
+        return 0
+    # Der zentrale Vertrag hat Startminima und laufende, gegebenenfalls
+    # darunter modulierende Istlasten bereits typisiert. Ein zweiter lokaler
+    # Min-Filter würde eine gültige 1-kW-Run-on-Allokation verfälschen.
+    return max(0, allocations[consumer_key])
+
+def wallbox_phase_transition_active(
+    now_ts=None,
+    max_age_s=30.0,
+    budget_snapshot=None,
+):
     """Liefert nur bei einer frischen, explizit aktiven Wallboxtransition True."""
     now_value = time.time() if now_ts is None else float(now_ts)
+    snapshot = budget_snapshot if isinstance(budget_snapshot, dict) else None
+    if snapshot is not None:
+        if snapshot.get("valid") is not True:
+            return False
+        active = snapshot.get("wallbox_phase_transition_active") is True
+        expires_raw = snapshot.get("wallbox_phase_transition_until_ts", 0)
+        if isinstance(expires_raw, bool) or not isinstance(expires_raw, (int, float)):
+            return False
+        expires_ts = float(expires_raw)
+        if not math.isfinite(expires_ts):
+            return False
+        return bool(active and (expires_ts <= 0.0 or now_value <= expires_ts))
     try:
         if not os.path.exists(WB_BUDGET_FILE):
             return False
@@ -833,9 +1521,12 @@ def shelly_wp_relay_should_run(
     wp_min_w,
     wallbox_transition,
 ):
-    """Preserve a running WP through wallbox transitions; block new starts."""
+    """Erhält laufende Teilallokationen exakt und blockiert Unterflurstarts."""
     if wp_is_on:
-        return bool(soc_ok and (wallbox_transition or surplus_w >= threshold_off_w))
+        # Der zentrale Vertrag hat die laufende Last und ihre Hysterese bereits
+        # bewertet. Jede positive gültige Teilallokation bleibt wirksam; ein
+        # zweiter lokaler Mindestfilter würde sie verfälschen.
+        return bool(soc_ok and (wallbox_transition or surplus_w > 0))
     return bool(
         not wallbox_transition
         and soc_ok
@@ -1009,6 +1700,11 @@ def build_heater_policy_decision(
         price_pain_limit_ct=price_block_limit_ct,
         battery_empty=bool(battery_empty),
         price_block_started_ts=price_block_started_ts if price_block_started_ts and price_block_started_ts > 0 else None,
+        # Beim Heizstab ist der bestehende Preisblock weiterhin Teil des
+        # ausdrücklich separat durch `heat_policy_runtime_enable`
+        # aktivierten Aktorpfads. Die Hardwarewirkung wird im Regelzyklus
+        # zusätzlich an genau diesen Schalter gebunden.
+        price_block_control_authorized=True,
         forecast_need_kwh=forecast_result.need_kwh,
         forecast_deficit_kwh=deficit_kwh,
         forecast_valid=bool(forecast_result.valid and not forecast_result.stale),
@@ -1087,13 +1783,22 @@ def control_cycle(cfg, live, hs_state, safety_gate=None):
     is_elwa = hs_type == "mypv_elwa"
     elwa_status_code = None
 
-    # Anti-Oszillation: beruecksichtige laufende Heizstab-Last in Surplus-Berechnung.
+    # Der Netzpunkt bleibt Diagnose. Die produktive Leistung kommt ausschließlich
+    # aus der versiegelten Command-Allokation des zentralen Verbraucherbudgets.
     # Ein im vorherigen Zyklus laufender Heizstab darf nach heizstab=0 nicht
     # als vermeintlich frei werdender Überschuss eine separate WP starten.
     current_hs_w = hs_state.get('current_w', 0) if heater_module_enabled and auto_mode else 0
     netpoint_surplus_w = calc_netpoint_surplus(live, current_hs_power_w=current_hs_w, cfg=cfg)
-    surplus_w = calc_surplus(live, current_hs_power_w=current_hs_w, cfg=cfg)
-    s3_surplus_w = surplus_w
+    consumer_budget_snapshot = _read_consumer_budget_envelope_snapshot(
+        now_ts=time.time()
+    )
+    consumer_allocations = _strict_consumer_budget_map(
+        consumer_budget_snapshot.get("allocations")
+    )
+    if consumer_budget_snapshot.get("valid") is not True or consumer_allocations is None:
+        consumer_allocations = {key: 0 for key in _CONSUMER_BUDGET_KEYS}
+    surplus_w = consumer_allocations["heater"]
+    s3_surplus_w = consumer_allocations["heatpump"] if has_s3em else 0
     predump_heater_budget_w = read_predump_heater_budget(cfg)
     raw_market_heater_budget_w, market_heater_ctx = market_heater_budget(
         cfg,
@@ -1103,13 +1808,9 @@ def control_cycle(cfg, live, hs_state, safety_gate=None):
         sh_nominal_w,
     )
     market_heater_budget_w = 0
-    if predump_heater_budget_w > surplus_w:
-        surplus_w = predump_heater_budget_w
     soc       = live["soc"]
     pv_w      = live["pv_w"]
     soc_ok = soc >= min_soc
-    if not soc_ok and predump_heater_budget_w <= 0 and market_heater_budget_w <= 0:
-        surplus_w = netpoint_surplus_w
 
     # Hysterese-Schwellen: Einschalten >= min_surplus, Ausschalten < (min_surplus - deadband)
     is_currently_on     = hs_state.get('is_on', False)
@@ -1117,15 +1818,17 @@ def control_cycle(cfg, live, hs_state, safety_gate=None):
     threshold_off_w     = max(0, min_surplus_w - HS_HYSTERESIS_W)
 
     status = {
-        "Heizstab_Power":   0,
-        "hs_actual_w":       0,
+        "Heizstab_Power":   None,
+        "hs_actual_w":       None,
         "hs_target_w":       0,
         "hs_requested_w":    0,
-        "hs_active":         False,
+        "hs_active":         None,
+        "budget_start_ready": False,
+        "budget_start_request_w": 0,
         "heizstab_type":    hs_type,
-        "shelly_heiz_on":   False,
-        "shelly_heiz_w":    0.0,
-        "wp_power_w":       0,
+        "shelly_heiz_on":   None,
+        "shelly_heiz_w":    None,
+        "wp_power_w":       None,
         "wp_is_running":    False,
         "wp_relay_on":      False,
         "wp_takt_protect_active": False,
@@ -1137,8 +1840,10 @@ def control_cycle(cfg, live, hs_state, safety_gate=None):
         "hs_manual_override": None,
         "hs_mode":          "manual" if not auto_mode else "pv_auto",
         "hs_reason":        "Auto-Modus deaktiviert",
-        "predump_heater_active": predump_heater_budget_w > 0,
+        "predump_heater_active": predump_heater_budget_w > 0 and surplus_w > 0,
+        "predump_heater_requested_w": round(predump_heater_budget_w),
         "market_heater_active": market_heater_budget_w > 0,
+        "market_heater_requested_w": round(raw_market_heater_budget_w),
         "market_plan_action": market_heater_ctx.get("action"),
         "market_plan_reason": market_heater_ctx.get("reason"),
         "market_plan_negative_price": bool(market_heater_ctx.get("negative_price")),
@@ -1147,8 +1852,58 @@ def control_cycle(cfg, live, hs_state, safety_gate=None):
         "pv_w":             round(pv_w),
         "soc":              soc,
         "live_source":      live.get("source", "none"),
+        "process_success":  True,
         "success":          True,
+        "hs_measurement_required": False,
+        "hs_measurement_valid": False,
+        "hs_measurement_ts": None,
+        "hs_measurement_source": "",
+        "hs_measurement_topology": "none",
+        "hs_measurement_reason": "not_configured",
+        "hs_provider_measurements": {},
+        "source_fresh": False,
+        "hs_source_fresh": False,
+        "consumer_budget_valid": bool(consumer_budget_snapshot.get("valid") is True),
+        "consumer_budget_reason": str(consumer_budget_snapshot.get("reason") or ""),
+        "consumer_budget_revision": consumer_budget_snapshot.get("budget_revision"),
+        "consumer_budget_allocations": dict(consumer_allocations),
     }
+    s3_wallbox_transition = False
+    s3_actuator_context_valid = False
+    s3_actuator_context_reason = "heatpump_not_configured"
+
+    def refresh_shelly_3em_provider(now_ts=None):
+        """Aktualisiert den Providervertrag aus dem bereits gelesenen Zustand."""
+        if not has_s3em:
+            return 0.0
+        current_ts = time.time() if now_ts is None else float(now_ts)
+        last_off_ts = float(hs_state.get("s3em_last_off_ts", 0) or 0)
+        restart_left_s = (
+            max(0.0, s3_restart_block_s - (current_ts - last_off_ts))
+            if last_off_ts > 0
+            else 0.0
+        )
+        update_shelly_3em_provider_contract(
+            status,
+            hs_state,
+            global_auto=global_auto,
+            s3_enable=s3_enable,
+            s3_relay=s3_relay,
+            s3_min_w=s3_min_w,
+            s3_max_w=s3_max_w,
+            soc_ok=soc_ok,
+            restart_left_s=restart_left_s,
+            wallbox_transition=s3_wallbox_transition,
+            actuator_context_valid=s3_actuator_context_valid,
+            actuator_context_reason=s3_actuator_context_reason,
+            authorized_budget_w=s3_surplus_w,
+        )
+        if restart_left_s > 0:
+            status["wp_restart_block_remaining_s"] = round(restart_left_s)
+        else:
+            status.pop("wp_restart_block_remaining_s", None)
+        return restart_left_s
+
     elwa_modbus_available = True
     if is_elwa:
         _backoff_until = float(hs_state.get("elwa_backoff_until", 0) or 0)
@@ -1160,19 +1915,24 @@ def control_cycle(cfg, live, hs_state, safety_gate=None):
             status["elwa_status"] = "Offline / Modbus nicht erreichbar"
             status["hs_reason"] = f"ELWA Modbus nicht erreichbar - neuer Versuch in {_retry_s}s"
 
+    modbus_power_w = None
+    modbus_observed_ts = None
+    modbus_source = "elwa_status_derived_power" if is_elwa else "modbus_register_1014"
+    sh_state = None
+    sh_observed_ts = None
+
     # --- Heizstab Status auslesen ---
     if has_hs and MODBUS_OK and elwa_modbus_available:
         if is_elwa:
             # myPV AC ELWA-E: Timeout einmalig setzen + Status-Block lesen
             _invoke_actuator(elwa_ensure_timeout, hs_ip, hs_port, safety_gate=safety_gate)
             elwa_data = elwa_read_status(hs_ip, hs_port)
+            modbus_observed_ts = time.time()
             if elwa_data:
                 hs_state["elwa_fail_count"] = 0
                 hs_state["elwa_backoff_until"] = 0
-                status["Heizstab_Power"]    = elwa_data["actual_w"]
-                status["hs_actual_w"]       = elwa_data["actual_w"]
+                modbus_power_w              = elwa_data["actual_w"]
                 status["hs_target_w"]       = elwa_data["setpoint_w"]
-                status["hs_active"]         = elwa_data["actual_w"] > 0
                 status["elwa_setpoint_w"]   = elwa_data["setpoint_w"]
                 status["elwa_water_temp_c"] = elwa_data["water_temp_c"]
                 status["elwa_target_temp_c"]= elwa_data["target_temp_c"]
@@ -1199,24 +1959,75 @@ def control_cycle(cfg, live, hs_state, safety_gate=None):
         else:
             # Generic: Register 1014 = Istleistung
             ist = heizstab_read_power(hs_ip, hs_port)
+            modbus_observed_ts = time.time()
             if ist is not None:
-                status["Heizstab_Power"] = ist
-                status["hs_actual_w"] = ist
+                modbus_power_w = ist
                 status["hs_target_w"] = ist
-                status["hs_active"] = ist > 0
                 print(f"  Heizstab Istleistung: {ist}W")
 
     # --- Shelly Istleistung auslesen ---
     if has_sh:
         sh_state = shelly_get_state(sh_ip)
+        sh_observed_ts = time.time()
         if sh_state:
-            status["shelly_heiz_on"] = sh_state["on"]
-            status["shelly_heiz_w"]  = sh_state["power_w"]
-            print(f"  Shelly: {'EIN' if sh_state['on'] else 'AUS'} / {sh_state['power_w']:.0f}W")
+            sh_power_text = (
+                f"{sh_state['power_w']:.0f}W"
+                if _strict_finite_number(sh_state.get("power_w")) is not None
+                else "Istleistung unbekannt"
+            )
+            print(f"  Shelly: {'EIN' if sh_state['on'] else 'AUS'} / {sh_power_text}")
+
+    update_heater_power_measurement(
+        status,
+        modbus_configured=has_hs,
+        modbus_power_w=modbus_power_w,
+        modbus_observed_ts=modbus_observed_ts,
+        modbus_source=modbus_source,
+        shelly_configured=has_sh,
+        shelly_state=sh_state,
+        shelly_observed_ts=sh_observed_ts,
+        max_age_s=cfg_float(
+            cfg,
+            "consumer_acceptance_evidence_max_age_s",
+            HEATER_READBACK_MAX_AGE_S,
+            min_value=1,
+        ),
+    )
 
     if has_s3em:
         status["wp_nominal_w"] = round(s3_max_w)
-        update_shelly_3em_measurement(status, s3_ip, s3_min_w)
+        s3_observed_ts = time.time()
+        update_shelly_3em_measurement(
+            status,
+            s3_ip,
+            s3_min_w,
+            now_ts=s3_observed_ts,
+        )
+        s3_relay_state = (
+            shelly_3em_get_relay(s3_ip, s3_relay)
+            if s3_relay >= 0
+            else None
+        )
+        update_shelly_3em_relay_evidence(
+            status,
+            s3_relay_state,
+            now_ts=s3_observed_ts,
+        )
+        reconcile_shelly_3em_relay_state(
+            status,
+            hs_state,
+            s3_relay_state,
+            now_ts=s3_observed_ts,
+        )
+        s3_wallbox_transition = wallbox_phase_transition_active(
+            now_ts=s3_observed_ts,
+            budget_snapshot=consumer_budget_snapshot,
+        )
+        (
+            s3_actuator_context_valid,
+            s3_actuator_context_reason,
+        ) = heat_actuator_context_readiness(safety_gate)
+        refresh_shelly_3em_provider(s3_observed_ts)
 
     if not heater_module_enabled:
         status["hs_mode"] = "disabled"
@@ -1311,20 +2122,17 @@ def control_cycle(cfg, live, hs_state, safety_gate=None):
         and heat_policy_decision.target_state == heat_policy.TARGET_BOOST
         and heat_policy_decision.owner == "heater_grid_boost"
     ):
-        market_heater_budget_w = min(raw_market_heater_budget_w, heat_policy_decision.available_budget_w)
-        if market_heater_budget_w > surplus_w:
-            surplus_w = market_heater_budget_w
+        market_heater_budget_w = min(
+            surplus_w,
+            raw_market_heater_budget_w,
+            heat_policy_decision.available_budget_w,
+        )
     elif heat_policy_runtime_enabled and raw_market_heater_budget_w > 0:
         market_heater_ctx = dict(market_heater_ctx)
         market_heater_ctx["allowed"] = False
         market_heater_ctx["reason"] = heat_policy_decision.block_reason
     elif raw_market_heater_budget_w > 0:
-        market_heater_budget_w = raw_market_heater_budget_w
-        if market_heater_budget_w > surplus_w:
-            surplus_w = market_heater_budget_w
-
-    if not soc_ok and predump_heater_budget_w <= 0 and market_heater_budget_w <= 0:
-        surplus_w = netpoint_surplus_w
+        market_heater_budget_w = min(surplus_w, raw_market_heater_budget_w)
 
     heat_policy_export = heat_policy_decision.as_dict()
     heat_policy_export.update({
@@ -1333,6 +2141,7 @@ def control_cycle(cfg, live, hs_state, safety_gate=None):
         "domain": "heater",
         "hal_output": True,
         "runtime_enabled": bool(heat_policy_runtime_enabled),
+        "price_block_control_authorized": True,
         "forecast_input": heat_forecast_result.as_dict(),
         "raw_market_budget_w": int(raw_market_heater_budget_w),
     })
@@ -1503,9 +2312,16 @@ def control_cycle(cfg, live, hs_state, safety_gate=None):
             hs_state["heater_auto_off_confirmed"] = False
 
         if not global_auto and has_s3em and s3_enable and s3_relay >= 0:
+            s3_confirmed_off = bool(
+                status.get("wp_relay_readback_valid") is True
+                and status.get("wp_relay_readback_on") is False
+            )
             s3_release_needed = bool(
-                hs_state.get("s3em_on")
-                or not hs_state.get("s3em_auto_off_confirmed", False)
+                not s3_confirmed_off
+                and (
+                    hs_state.get("s3em_on")
+                    or not hs_state.get("s3em_auto_off_confirmed", False)
+                )
             )
             s3_release_ok = True
             if s3_release_needed:
@@ -1520,10 +2336,23 @@ def control_cycle(cfg, live, hs_state, safety_gate=None):
                 hs_state["s3em_on"] = False
                 hs_state["s3em_auto_off_confirmed"] = True
                 status["wp_relay_on"] = False
+                if s3_release_needed:
+                    s3_release_ts = time.time()
+                    hs_state["s3em_last_off_ts"] = s3_release_ts
+                    update_shelly_3em_relay_evidence(
+                        status,
+                        False,
+                        now_ts=s3_release_ts,
+                        source="shelly_3em_switch_set_confirmed_readback",
+                    )
+                    status["wp_relay_runtime_evidence"] = (
+                        "commanded_off_confirmed_readback"
+                    )
             else:
                 status["success"] = False
                 status["hs_reason"] = "Globale Automatik AUS: WP-Relais nicht sicher bestätigt"
                 hs_state["s3em_auto_off_confirmed"] = False
+            refresh_shelly_3em_provider()
         elif s3_relay_auto_mode:
             hs_state["s3em_auto_off_confirmed"] = False
 
@@ -1544,6 +2373,15 @@ def control_cycle(cfg, live, hs_state, safety_gate=None):
     if not auto_mode:
         should_run = False
     if heat_policy_runtime_enabled and heat_policy_decision.target_state == heat_policy.TARGET_BLOCKED:
+        should_run = False
+    measurement_blocked = bool(
+        status.get("hs_measurement_required") is True
+        and (
+            status.get("hs_measurement_valid") is not True
+            or status.get("source_fresh") is not True
+        )
+    )
+    if measurement_blocked:
         should_run = False
 
     hyst_info = f"(Hyst: Ein>={threshold_on_w:.0f}W, Aus<{threshold_off_w:.0f}W, akt={'EIN' if is_currently_on else 'AUS'})"
@@ -1575,10 +2413,10 @@ def control_cycle(cfg, live, hs_state, safety_gate=None):
             status["hs_reason"] = f"Pre-Dump-Freigabe {surplus_w/1000:.1f}kW (SOC {soc:.0f}%)"
             status["hs_mode"] = "pre_dump"
         elif not soc_ok:
-            status["hs_reason"] = f"Netzpunkt-Ueberschuss {surplus_w/1000:.1f}kW trotz SOC-Schutz (SOC {soc:.0f}%)"
+            status["hs_reason"] = f"Zentralbudget {surplus_w/1000:.1f}kW trotz SOC-Schutz (SOC {soc:.0f}%)"
             status["hs_mode"] = "grid_follow"
         else:
-            status["hs_reason"] = f"Netzpunkt-Regelung {surplus_w/1000:.1f}kW (SOC {soc:.0f}%)"
+            status["hs_reason"] = f"Zentralbudget {surplus_w/1000:.1f}kW (SOC {soc:.0f}%)"
 
         if has_hs and MODBUS_OK and elwa_modbus_available:
             if is_elwa:
@@ -1610,6 +2448,7 @@ def control_cycle(cfg, live, hs_state, safety_gate=None):
             else:
                 ok = _invoke_actuator(heizstab_set_power, hs_ip, hs_port, target_w, safety_gate=safety_gate)
                 if ok:
+                    status["hs_requested_w"] = target_w
                     status["Heizstab_Power"] = target_w
                     status["hs_actual_w"] = target_w
                     status["hs_target_w"] = target_w
@@ -1639,6 +2478,11 @@ def control_cycle(cfg, live, hs_state, safety_gate=None):
     else:
         if not auto_mode:
             pass
+        elif measurement_blocked:
+            status["hs_reason"] = (
+                "Heizstab-Istwert unbekannt/ungültig; Start bleibt fail-closed"
+            )
+            status["hs_mode"] = "measurement_blocked"
         elif heat_policy_runtime_enabled and heat_policy_decision.target_state == heat_policy.TARGET_BLOCKED:
             status["hs_reason"] = heat_policy_decision.block_reason
             status["hs_mode"] = "blocked"
@@ -1694,9 +2538,18 @@ def control_cycle(cfg, live, hs_state, safety_gate=None):
     if has_s3em:
         # Relais-Steuerung (nur wenn s3_enable=1 und relay_id >= 0)
         if s3_relay_auto_mode:
-            # WP hat Mindestleistung: Einschalten nur bei genügend Überschuss
-            wp_is_on = status.get("wp_is_running", False) or hs_state.get("s3em_on", False)
-            wallbox_transition = wallbox_phase_transition_active()
+            relay_readback_valid = status.get("wp_relay_readback_valid") is True
+            relay_readback_on = status.get("wp_relay_readback_on") is True
+            managed_relay_on = bool(
+                relay_readback_on or hs_state.get("s3em_on", False)
+            )
+            wp_is_on = bool(
+                managed_relay_on or status.get("wp_accepting_power") is True
+            )
+            start_floor_w = max(
+                int(CONSUMER_MIN_W.get("heatpump", 1500)),
+                int(math.ceil(s3_min_w)),
+            )
             # Ein Wallbox-Phasen-/Stromübergang darf das gemeinsame Budget reservieren,
             # aber einen bereits laufenden Verdichter nie stoppen. Der unabhängige
             # SoC-Schutz bleibt unverändert.
@@ -1706,8 +2559,8 @@ def control_cycle(cfg, live, hs_state, safety_gate=None):
                 surplus_w=s3_surplus_w,
                 threshold_on_w=threshold_on_w,
                 threshold_off_w=threshold_off_w,
-                wp_min_w=s3_min_w,
-                wallbox_transition=wallbox_transition,
+                wp_min_w=start_floor_w,
+                wallbox_transition=s3_wallbox_transition,
             )
 
             now_ts = time.time()
@@ -1719,13 +2572,22 @@ def control_cycle(cfg, live, hs_state, safety_gate=None):
             # halten wir bis zur Mindestlaufzeit, damit das WP-Relais nicht taktet.
             relay_emergency_stop = not soc_ok
 
-            if wallbox_transition and wp_is_on and not relay_emergency_stop:
-                status["wp_relay_on"] = True
+            if s3_wallbox_transition and wp_is_on and not relay_emergency_stop:
+                status["wp_relay_on"] = bool(managed_relay_on)
                 status["wp_takt_protect_active"] = True
                 status["hs_reason"] = "WP läuft weiter: Wallbox-Übergang darf sie nicht stoppen"
+                refresh_shelly_3em_provider(now_ts)
                 return _with_actuator_safety_status(status, safety_gate)
 
-            if should_wp and not hs_state.get("s3em_on", False):
+            if should_wp and not wp_is_on:
+                if not relay_readback_valid:
+                    status["success"] = False
+                    status["wp_relay_on"] = bool(hs_state.get("s3em_on", False))
+                    status["hs_reason"] = (
+                        "WP EIN gesperrt: frischer Relais-Readback fehlt"
+                    )
+                    refresh_shelly_3em_provider(now_ts)
+                    return _with_actuator_safety_status(status, safety_gate)
                 if restart_left_s > 0:
                     status["wp_relay_on"] = False
                     status["wp_takt_protect_active"] = True
@@ -1735,22 +2597,49 @@ def control_cycle(cfg, live, hs_state, safety_gate=None):
                         f"(Überschuss {s3_surplus_w:.0f}W)"
                     )
                     print(f"  [3EM] WP Relais bleibt AUS (Wiedereinschaltsperre {restart_left_s/60:.1f} Min)")
+                    refresh_shelly_3em_provider(now_ts)
                     return _with_actuator_safety_status(status, safety_gate)
-                ok = _invoke_actuator(shelly_3em_set_relay, s3_ip, s3_relay, True, safety_gate=safety_gate)
+                if status.get("wp_budget_start_ready") is not True:
+                    status["success"] = False
+                    status["wp_relay_on"] = False
+                    status["hs_reason"] = (
+                        "WP EIN gesperrt: Provider-Readiness nicht vollständig"
+                    )
+                    refresh_shelly_3em_provider(now_ts)
+                    return _with_actuator_safety_status(status, safety_gate)
+                ok = _invoke_actuator(
+                    shelly_3em_set_relay,
+                    s3_ip,
+                    s3_relay,
+                    True,
+                    safety_gate=safety_gate,
+                )
                 if ok:
                     hs_state["s3em_on"] = True
                     hs_state["s3em_last_on_ts"] = now_ts
+                    hs_state["s3em_auto_off_confirmed"] = False
+                    update_shelly_3em_relay_evidence(
+                        status,
+                        True,
+                        now_ts=now_ts,
+                        source="shelly_3em_switch_set_confirmed_readback",
+                    )
+                    status["wp_relay_runtime_evidence"] = (
+                        "commanded_on_confirmed_readback"
+                    )
                     status["wp_relay_on"] = True
                     status["wp_takt_protect_active"] = False
                     status["wp_min_runtime_remaining_s"] = round(s3_min_runtime_s)
-                    status["hs_reason"] = (f"WP EIN: Ueberschuss {s3_surplus_w:.0f}W >= "
-                                           f"{s3_min_w:.0f}W Min-WP (SOC {soc:.0f}%)")
+                    status["hs_reason"] = (
+                        f"WP EIN: Budget {s3_surplus_w:.0f}W >= "
+                        f"{start_floor_w:.0f}W Startminimum (SOC {soc:.0f}%)"
+                    )
                     print(f"  [3EM] -> WP Relais {s3_relay} EINgeschaltet")
                 else:
                     status["success"] = False
-                    status["wp_relay_on"] = bool(hs_state.get("s3em_on", False))
+                    status["wp_relay_on"] = bool(managed_relay_on)
                     status["hs_reason"] = "WP EIN blockiert oder Readback nicht bestätigt"
-            elif not should_wp and hs_state.get("s3em_on", False):
+            elif not should_wp and managed_relay_on:
                 if runtime_left_s > 0 and not relay_emergency_stop:
                     hs_state["s3em_on"] = True
                     status["wp_relay_on"] = True
@@ -1758,19 +2647,35 @@ def control_cycle(cfg, live, hs_state, safety_gate=None):
                     status["wp_min_runtime_remaining_s"] = round(runtime_left_s)
                     status["hs_reason"] = (
                         f"WP Mindestlaufzeit aktiv: noch {runtime_left_s/60:.1f} Min "
-                        f"(Überschuss {s3_surplus_w:.0f}W < {threshold_off_w:.0f}W)"
+                        f"(zugewiesenes Budget {s3_surplus_w:.0f}W)"
                     )
                     print(f"  [3EM] WP Relais bleibt EIN (Mindestlaufzeit {runtime_left_s/60:.1f} Min)")
+                    refresh_shelly_3em_provider(now_ts)
                     return _with_actuator_safety_status(status, safety_gate)
-                ok = _invoke_actuator(shelly_3em_set_relay, s3_ip, s3_relay, False, safety_gate=safety_gate)
+                ok = _invoke_actuator(
+                    shelly_3em_set_relay,
+                    s3_ip,
+                    s3_relay,
+                    False,
+                    safety_gate=safety_gate,
+                )
                 if ok:
                     hs_state["s3em_on"] = False
                     hs_state["s3em_last_off_ts"] = now_ts
+                    update_shelly_3em_relay_evidence(
+                        status,
+                        False,
+                        now_ts=now_ts,
+                        source="shelly_3em_switch_set_confirmed_readback",
+                    )
+                    status["wp_relay_runtime_evidence"] = (
+                        "commanded_off_confirmed_readback"
+                    )
                     status["wp_relay_on"] = False
                     status["wp_takt_protect_active"] = False
                     status["wp_restart_block_remaining_s"] = round(s3_restart_block_s)
                     reason_off = (f"SOC zu niedrig ({soc:.0f}% < {min_soc}%)" if not soc_ok
-                                  else f"Ueberschuss zu gering ({s3_surplus_w:.0f}W < {threshold_off_w:.0f}W)")
+                                  else f"kein zugewiesenes WP-Budget ({s3_surplus_w:.0f}W)")
                     status["hs_reason"] = f"WP AUS: {reason_off}"
                     print(f"  [3EM] -> WP Relais {s3_relay} AUSgeschaltet ({reason_off})")
                 else:
@@ -1781,20 +2686,38 @@ def control_cycle(cfg, live, hs_state, safety_gate=None):
                         "laufender Zustand wird nicht verändert"
                     )
             else:
-                status["wp_relay_on"] = hs_state.get("s3em_on", False)
+                status["wp_relay_on"] = bool(managed_relay_on)
                 status["wp_takt_protect_active"] = False
-                if status["wp_relay_on"] and wallbox_transition:
+                if status["wp_relay_on"] and s3_wallbox_transition:
                     status["hs_reason"] = "WP läuft weiter: Wallbox-Übergang darf sie nicht stoppen"
                 if status["wp_relay_on"] and runtime_left_s > 0:
                     status["wp_min_runtime_remaining_s"] = round(runtime_left_s)
                 elif (not status["wp_relay_on"]) and restart_left_s > 0:
                     status["wp_restart_block_remaining_s"] = round(restart_left_s)
+            refresh_shelly_3em_provider(now_ts)
         else:
             status["wp_relay_on"] = bool(hs_state.get("s3em_on", False))
             status["wp_takt_protect_active"] = False
             if (not s3_enable or s3_relay < 0) and not (has_hs or has_sh):
                 status["hs_reason"] = "WP nur Messung - keine Relaissteuerung"
+            refresh_shelly_3em_provider()
 
+    heater_acceptance_ready = bool(
+        auto_mode
+        and heater_module_enabled
+        and (has_hs or has_sh)
+        and status.get("success") is True
+        and status.get("hs_measurement_valid") is True
+        and status.get("source_fresh") is True
+        and not bool(status.get("actor_writes_blocked"))
+        and (not is_elwa or elwa_can_accept_power(elwa_status_code))
+    )
+    status["budget_start_ready"] = heater_acceptance_ready
+    status["budget_start_request_w"] = (
+        int(max(hs_max_w if has_hs else 0, sh_nominal_w if has_sh else 0))
+        if heater_acceptance_ready
+        else 0
+    )
     return _with_actuator_safety_status(status, safety_gate)
 
 
@@ -1841,11 +2764,27 @@ def main():
     if not (has_aux_heater or has_s3em_wp or legacy_wp_type_2):
         print("[!] Kein Heizstab/Shelly/BWWP-Zusatzverbraucher konfiguriert.")
         print("    wp_type bleibt Luxtronik/IDM. Fuer Heizstab/BWWP heizstab=1 und IP setzen.")
-        save_to_ramdisk({"success": False, "error": "Kein Heizstab/Shelly konfiguriert", "Heizstab_Power": 0})
+        save_to_ramdisk({
+            "success": False,
+            "process_success": False,
+            "error": "Kein Heizstab/Shelly konfiguriert",
+            "Heizstab_Power": None,
+            "hs_actual_w": None,
+            "hs_measurement_valid": False,
+            "source_fresh": False,
+        })
         return
     if wp_type == "3" and s3_ip in ("", "0.0.0.0") and not has_aux_heater:
         print("[!] wp_type=3 aber shelly_3em_ip nicht konfiguriert.")
-        save_to_ramdisk({"success": False, "error": "wp_type=3: shelly_3em_ip fehlt", "Heizstab_Power": 0})
+        save_to_ramdisk({
+            "success": False,
+            "process_success": False,
+            "error": "wp_type=3: shelly_3em_ip fehlt",
+            "Heizstab_Power": None,
+            "hs_actual_w": None,
+            "hs_measurement_valid": False,
+            "source_fresh": False,
+        })
         return
 
     # Derselbe Endpunkt darf nicht gleichzeitig Luxtronik und Heizstab sein.
@@ -1900,8 +2839,12 @@ def main():
                 print(f"  [!] Shelly Stop-Fehler: {e}")
         save_to_ramdisk({
             "success": False,
+            "process_success": False,
             "error": "Dienst beendet" if release_ok else "Dienst beendet; Safe-Release unvollständig",
-            "Heizstab_Power": 0 if release_ok else None,
+            "Heizstab_Power": None,
+            "hs_actual_w": None,
+            "hs_measurement_valid": False,
+            "source_fresh": False,
             "safe_release_confirmed": bool(release_ok),
         })
     _signal.signal(_signal.SIGTERM, _handle_stop)
@@ -1939,8 +2882,15 @@ def main():
             conn_err_count += 1
             wait = min(CONN_ERR_BACKOFF * conn_err_count, 300)
             print(f"[!] Connection refused (#{conn_err_count}) - warte {wait}s")
-            save_to_ramdisk({"success": False, "error": f"Connection refused (#{conn_err_count})",
-                             "Heizstab_Power": 0})
+            save_to_ramdisk({
+                "success": False,
+                "process_success": False,
+                "error": f"Connection refused (#{conn_err_count})",
+                "Heizstab_Power": None,
+                "hs_actual_w": None,
+                "hs_measurement_valid": False,
+                "source_fresh": False,
+            })
             hs_state['is_on'] = False
             hs_state['current_w'] = 0
             for _ in range(wait):
@@ -1951,7 +2901,15 @@ def main():
 
         except Exception as e:
             print(f"[!] Fehler im Loop: {e}")
-            save_to_ramdisk({"success": False, "error": str(e), "Heizstab_Power": 0})
+            save_to_ramdisk({
+                "success": False,
+                "process_success": False,
+                "error": str(e),
+                "Heizstab_Power": None,
+                "hs_actual_w": None,
+                "hs_measurement_valid": False,
+                "source_fresh": False,
+            })
 
         time.sleep(POLL_INTERVAL)
 

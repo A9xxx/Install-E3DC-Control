@@ -4,10 +4,12 @@
 import asyncio
 import websockets
 import json
-import urllib.request
-import time
 import logging
-import os
+
+try:
+    from live_snapshot import read_runtime_live_snapshot
+except ImportError:  # pragma: no cover - Paketimport
+    from Installer.live_snapshot import read_runtime_live_snapshot
 
 logging.basicConfig(level=logging.WARNING, format="%(asctime)s - %(message)s")
 
@@ -21,9 +23,23 @@ async def fetch_and_broadcast():
     while True:
         try:
             if CLIENTS:  # Nur abfragen, wenn auch jemand zuschaut (spart Ressourcen!)
-                req = urllib.request.Request("http://127.0.0.1/get_live_json.php")
-                with urllib.request.urlopen(req, timeout=2) as response:
-                    new_data = response.read().decode('utf-8')
+                snapshot = await asyncio.to_thread(
+                    read_runtime_live_snapshot,
+                    live_max_age_s=15.0,
+                    wallbox_max_age_s=30.0,
+                    web_snapshot_max_age_s=180.0,
+                    require_control_valid=True,
+                    include_web_projection=True,
+                )
+                if not snapshot:
+                    LAST_DATA = ""
+                else:
+                    new_data = json.dumps(
+                        snapshot,
+                        ensure_ascii=False,
+                        allow_nan=False,
+                        separators=(",", ":"),
+                    )
 
                     # Nur senden, wenn sich die Daten geändert haben (Reduziert Traffic)
                     if new_data != LAST_DATA:
@@ -31,9 +47,9 @@ async def fetch_and_broadcast():
                         # An alle verbundenen Clients senden
                         for ws in list(CLIENTS):
                             try: await ws.send(new_data)
-                            except: pass
-        except Exception as e:
-            pass # PHP Server evtl. kurzzeitig nicht erreichbar
+                            except Exception: pass
+        except Exception:
+            LAST_DATA = ""
 
         await asyncio.sleep(1) # Taktung für flüssige Animationen
 
@@ -47,7 +63,7 @@ async def handler(websocket, *args, **kwargs):
 
     try: await websocket.wait_closed()
     finally:
-        CLIENTS.remove(websocket)
+        CLIENTS.discard(websocket)
         logging.info(f"Client getrennt: {client_ip} (Gesamt: {len(CLIENTS)})")
 
 async def main():

@@ -3,10 +3,26 @@
 
 import os
 import sys
-import subprocess
 import logging
 import pwd
+import shlex
 import argparse  # NEU: Für Argumenten-Parsing (Headless/PWA Support)
+
+
+def _reject_privileged_web_invocation():
+    """Sperrt alte, zu breite sudoers-Einstiege aus dem Webserverkontext."""
+    sudo_user = str(os.environ.get("SUDO_USER") or "").strip()
+    if os.geteuid() == 0 and sudo_user == "www-data":
+        print(
+            "✗ Sicherheitssperre: installer_main.py darf nicht privilegiert "
+            "aus dem Webserverkontext gestartet werden.",
+            file=sys.stderr,
+        )
+        raise SystemExit(126)
+
+
+# Dieses Gate muss vor allen produktiven Installer-Importen laufen.
+_reject_privileged_web_invocation()
 
 # Basis-Pfade
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -16,11 +32,17 @@ INSTALLER_DIR = os.path.join(SCRIPT_DIR, "Installer")
 if INSTALLER_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
-# Importiere das BOM-Fix-Skript
-try:
-    from fix_bom import main as fix_bom_main
-except ImportError:
-    fix_bom_main = None
+# Produktimporte werden erst nach dem frühen Docker-CLI-Router gebunden. So
+# bleibt der zwingende Host-/Compose-Vertrag auch bei einem unvollständigen
+# Container-Pythonbestand erreichbar.
+CONFIG_FILE = None
+get_install_user = None
+load_config = None
+ensure_web_config = None
+get_home_dir = None
+require_bound_venv_runtime = None
+resolve_venv_target = None
+setup_logging = None
 
 # Globale Variable für den Headless-Modus
 # V4: Web-UI Zero Touch übernimmt die Konfiguration, Console ist immer Unattended
@@ -32,6 +54,18 @@ def _is_docker_environment():
         return True
     marker = str(os.environ.get('E3DC_CONTAINER_MODE') or '').strip().lower()
     return marker in {'1', 'true', 'yes', 'docker'}
+
+
+def _print_docker_host_update_contract(*, image_tag=""):
+    """Zeigt ausschließlich den kanonischen, hostseitigen Compose-Updater."""
+    print("    EXTERNAL_ACTION_REQUIRED: Auf dem Docker-Host in das vorhandene")
+    print("    e3dc-docker-/Compose-Verzeichnis wechseln.")
+    print("    Fehlt dort docker_compose_update.py, muss der freigegebene Helper")
+    print("    zuerst über den dokumentierten Host-Installationsweg projiziert werden.")
+    command = "python3 ./docker_compose_update.py --compose-dir . --sudo"
+    if image_tag:
+        command += f" --image-tag {shlex.quote(str(image_tag))}"
+    print(f"    Danach ausführen: {command}")
 
 # Standard-Ausgabe auf UTF-8 erzwingen (verhindert UnicodeEncodeError z.B. bei sudo ohne Locale)
 # und Pufferung für Non-TTY Umgebungen (Web-Interface) anpassen
@@ -51,29 +85,10 @@ print(f"→ Installer-Skript gestartet (PID: {os.getpid()})")
 print(f"→ Arbeitsverzeichnis: {os.getcwd()}")
 sys.stdout.flush()
 
-# Importe mit Fehlerbehandlung, damit Abstürze im Log landen
-try:
-    from Installer.installer_config import (
-        CONFIG_FILE,
-        get_default_install_user,
-        load_config,
-        save_config,
-        ensure_web_config,
-        get_home_dir,
-        get_user_ids,
-        get_www_data_gid,
-        set_config_file_permissions,
-        get_install_path
-    )
-    from Installer.utils import setup_logging
-except ImportError as e:
-    print(f"CRITICAL ERROR: Import fehlgeschlagen: {e}")
-    sys.exit(1)
-
 def check_python_version():
-    """Prüft ob Python 3.7+ vorhanden ist."""
-    if sys.version_info < (3, 7):
-        print("✗ Fehler: Python 3.7+ erforderlich!")
+    """Prüft den seit V5 dokumentierten Python-3.10-Mindestvertrag."""
+    if sys.version_info < (3, 10):
+        print("✗ Fehler: Python 3.10+ erforderlich!")
         print(f" Deine Version: {sys.version}")
         sys.exit(1)
 
@@ -85,103 +100,67 @@ def check_root_privileges():
         sys.exit(1)
 
 def ensure_install_user():
-    """Stellt sicher, dass ein valider Installationsbenutzer konfiguriert ist, ohne unnötig nachzufragen."""
+    """Bindet den Benutzer nur prozesslokal; persistiert wird erst nach Bestätigung."""
     logger = logging.getLogger("install")
-    config = load_config()
-    saved_user = config.get("install_user")
-
-    # 1. Prüfen, ob ein valider Benutzer bereits gespeichert ist
-    if saved_user:
-        try:
-            user_info = pwd.getpwnam(saved_user)
-            home_dir = user_info.pw_dir
-            
-            # Benutzer ist valide, also verwenden
-            print(f"→ Aktueller Installationsbenutzer: {saved_user} ({home_dir})")
-            logger.info(f"Aktueller Installationsbenutzer: {saved_user} ({home_dir})")
-            
-            # Sicherstellen, dass die Konfiguration vollständig ist und speichern
-            if not config.get("install_user_confirmed") or config.get("home_dir") != home_dir:
-                config["install_user"] = saved_user
-                config["home_dir"] = home_dir
-                config["install_user_confirmed"] = True
-                save_config(config)
-                logger.info("Benutzerkonfiguration verifiziert und gespeichert.")
-
-            verify_config_file_access(saved_user)
-            ensure_web_config_safe(saved_user, logger)
-            return True
-        except KeyError:
-            # Gespeicherter Benutzer ist ungültig, also neu fragen
-            print(f"⚠ Gespeicherter Benutzer '{saved_user}' ist ungültig. Bitte neu konfigurieren.")
-            logger.warning(f"Gespeicherter Benutzer '{saved_user}' ist ungültig.")
-            # Fall through to ask for a new user
-
-    # 2. Wenn kein valider Benutzer gespeichert ist, neu fragen
-    print("\n=== Installer Benutzer festlegen ===")
-    
-    default_user = get_default_install_user()
-
-    if UNATTENDED_MODE:
-        install_user = default_user
-        print(f"Automatischer Modus aktiv. Setze Benutzer auf: {install_user}")
-    else:
-        user_input = input(f"Installationsbenutzer [{default_user}]: ").strip()
-        install_user = user_input or default_user
-
-    try:
-        user_info = pwd.getpwnam(install_user)
-        home_dir = user_info.pw_dir
-    except KeyError:
-        print(f"✗ Benutzer '{install_user}' existiert nicht.")
-        logger.error(f"Installationsbenutzer existiert nicht: {install_user}")
+    bootstrap_user = str(
+        os.environ.get("E3DC_BOOTSTRAP_USER")
+        or os.environ.get("SUDO_USER")
+        or ""
+    ).strip()
+    if bootstrap_user in {"", "root", "www-data"}:
+        print("✗ Ein normaler, durch den Aufruf gebundener Installationsbenutzer fehlt.")
+        logger.error("Kein zulässiger Installationsbenutzer gebunden")
         return False
-
-    config["install_user"] = install_user
-    config["home_dir"] = home_dir
-    config["install_user_confirmed"] = True
-    save_config(config)
-    verify_config_file_access(install_user)
-    ensure_web_config_safe(install_user, logger)
+    os.environ["E3DC_BOOTSTRAP_USER"] = bootstrap_user
+    try:
+        install_user = get_install_user()
+        user_info = pwd.getpwnam(install_user)
+    except (KeyError, RuntimeError) as exc:
+        print(f"✗ Installationsbenutzer konnte nicht sicher gebunden werden: {exc}")
+        logger.error("Installationsbenutzer konnte nicht sicher gebunden werden: %s", exc)
+        return False
+    try:
+        home_dir = get_home_dir(install_user)
+    except RuntimeError as exc:
+        print(f"✗ Home-Verzeichnis von '{install_user}' ist nicht eindeutig: {exc}")
+        logger.error("Home-Verzeichnis ist nicht vertrauenswürdig: %s", exc)
+        return False
+    if home_dir != str(user_info.pw_dir or "").strip():
+        print(f"✗ Home-Verzeichnis von '{install_user}' ist nicht eindeutig.")
+        logger.error("Home-Verzeichnis ist nicht vertrauenswürdig: %s", home_dir)
+        return False
+    print(f"→ Installationsbenutzer vorgeprüft: {install_user} ({home_dir})")
+    logger.info(
+        "Installationsbenutzer prozesslokal gebunden: %s (%s)",
+        install_user,
+        home_dir,
+    )
     return True
 
 def ensure_web_config_safe(user, logger):
     """Hilfsfunktion zum sicheren Setzen der web config."""
     print("→ Prüfe e3dc_paths.json (Aktualisierung nur bei Bedarf)")
     logger.info("Prüfe e3dc_paths.json (Aktualisierung nur bei Bedarf)")
-    if not ensure_web_config(user):
+    try:
+        venv_name, venv_path = resolve_venv_target(user)
+        require_bound_venv_runtime(
+            install_user=user,
+            venv_path=venv_path,
+        )
+    except Exception as exc:
+        print(f"⚠ Gebundenes Benutzer-venv fehlt: {exc}")
+        logger.warning("Gebundenes Benutzer-venv fehlt (user=%s): %s", user, exc)
+        return False
+    if not ensure_web_config(
+        user,
+        explicit_venv_name=venv_name,
+        explicit_venv_path=venv_path,
+        require_bound_venv=True,
+    ):
         print("⚠ Konnte e3dc_paths.json nicht prüfen/aktualisieren.")
         logger.warning("Konnte e3dc_paths.json nicht prüfen/aktualisieren (user=%s)", user)
-
-def verify_config_file_access(install_user):
-    """Prüft Besitzrechte der installer_config.json und korrigiert bei Bedarf."""
-    logger = logging.getLogger("install")
-    try:
-        expected_uid, _ = get_user_ids(install_user)
-        expected_gid = get_www_data_gid()
-        if not os.path.exists(CONFIG_FILE):
-            return
-
-        file_stat = os.stat(CONFIG_FILE)
-        owner_ok = file_stat.st_uid == expected_uid
-        group_ok = file_stat.st_gid == expected_gid
-        
-        # NEU: Prüft zusätzlich, ob Gruppe (www-data) Lese/Schreibrechte hat
-        readable_by_owner = bool(file_stat.st_mode & 0o400)
-        readable_by_group = bool(file_stat.st_mode & 0o040)
-
-        if owner_ok and group_ok and readable_by_owner and readable_by_group:
-            logger.info("Config-Zugriff OK: %s gehört %s:www-data und ist lesbar.", CONFIG_FILE, install_user)
-            return
-
-        logger.warning("Config-Zugriff nicht ideal. Korrigiere Rechte…")
-        fixed = set_config_file_permissions(install_user)
-        if fixed:
-            logger.info("Config-Rechte erfolgreich korrigiert für Benutzer '%s'.", install_user)
-        else:
-            logger.warning("Config-Rechte konnten nicht korrigiert werden für Benutzer '%s'.", install_user)
-    except Exception as e:
-        logger.warning("Config-Zugriffsprüfung fehlgeschlagen: %s", e)
+        return False
+    return True
 
 def check_for_installer_updates():
     """(Obsolet: Update-Check passiert nun via Web-UI oder Menüpunkt 11)"""
@@ -224,11 +203,18 @@ def check_duplicate_installations():
 def main():
     """Haupteinstiegspunkt."""
     global UNATTENDED_MODE
+    global CONFIG_FILE, get_install_user, load_config, ensure_web_config, get_home_dir
+    global require_bound_venv_runtime, resolve_venv_target, setup_logging
     
     # NEU: Argumenten-Parser für Headless / Web-Trigger
     parser = argparse.ArgumentParser(description="E3DC-Control Installer")
     parser.add_argument("--unattended", action="store_true", help="Ohne Benutzereingaben ausführen (für PHP/Cron)")
     parser.add_argument("--update-e3dc", action="store_true", help="E3DC-Control aktualisieren (headless)")
+    parser.add_argument(
+        "--reinstall-current",
+        action="store_true",
+        help="Die aktuell veröffentlichte Version ausdrücklich neu installieren",
+    )
     parser.add_argument("--install-release-tag", default="", help="Gezielt einen validierten Release-Tag installieren")
     parser.add_argument(
         "--bootstrap-install-path",
@@ -260,62 +246,113 @@ def main():
     )
     if any(bootstrap_values) and not args.install_release_tag:
         parser.error("Bootstrap-Optionen sind nur zusammen mit --install-release-tag zulässig")
+    selected_release_actions = sum(
+        bool(value)
+        for value in (
+            args.update_e3dc,
+            args.reinstall_current,
+            args.install_release_tag,
+        )
+    )
+    if selected_release_actions > 1:
+        parser.error(
+            "--update-e3dc, --reinstall-current und --install-release-tag "
+            "dürfen nicht kombiniert werden"
+        )
 
-    if (args.update_e3dc or args.install_release_tag) and _is_docker_environment():
-        print("[i] Docker-Installation erkannt: Im Container wird kein Release-Wechsel ausgeführt.")
-        print("    Bitte auf dem Docker-Host im Verzeichnis Deiner vorhandenen Compose-Konfiguration ausführen:")
-        print("    docker compose config --images")
-        print("    docker compose pull e3dc-control")
-        print("    docker compose up -d --force-recreate e3dc-control")
-        print("    Hinweis: Ein fest eingetragener Versions-Tag bleibt fest. Für automatische Stable-Updates")
-        print("    muss die Compose-Datei latest bzw. ${E3DC_IMAGE_TAG:-latest} verwenden.")
-        sys.exit(0)
+    docker_environment = _is_docker_environment()
+    docker_release_action = bool(
+        args.update_e3dc
+        or args.reinstall_current
+        or args.install_release_tag
+    )
+    if docker_environment and docker_release_action:
+        print("✗ Docker-Installation erkannt: Im Container ist kein Release-Wechsel zulässig.")
+        _print_docker_host_update_contract(image_tag=args.install_release_tag)
+        sys.exit(2)
+
+    docker_native_mutations = tuple(
+        option
+        for option, selected in (
+            ("--install-all", args.install_all),
+            ("--fix-permissions", args.fix_permissions),
+            ("--prepare-system-packages", args.prepare_system_packages),
+        )
+        if selected
+    )
+    if docker_environment and docker_native_mutations:
+        print(
+            "✗ Docker-Installation erkannt: Native Bare-Metal-Aktionen sind "
+            "im Container hart gesperrt."
+        )
+        print("    Abgelehnte Aktion(en): " + ", ".join(docker_native_mutations))
+        print("    EXTERNAL_ACTION_REQUIRED: Installation und Hostpakete werden nur")
+        print("    auf dem Docker-Host über den dokumentierten Compose-Weg verwaltet.")
+        sys.exit(2)
+
+    check_python_version()
+    check_root_privileges()
 
     try:
-        # Führe den BOM-Fixer aus, um Dateikodierungsprobleme zu beheben
-        if fix_bom_main and not args.bootstrap_install_path:
-            print("→ Prüfe Dateikodierungen (BOM)...")
-            sys.stdout.flush()
-            fix_bom_main()
-            print("✓ BOM-Prüfung abgeschlossen.")
-            sys.stdout.flush()
-        elif not fix_bom_main:
-            print("⚠ Warnung: BOM-Fixer-Skript (fix_bom.py) nicht gefunden.")
-            sys.stdout.flush()
-        else:
-            print("→ Release-Bootstrap: BOM-Prüfung bleibt bis nach dem verifizierten Backup ausgesetzt.")
-            sys.stdout.flush()
+        from Installer.installer_config import (
+            CONFIG_FILE,
+            ensure_web_config,
+            get_home_dir,
+            get_install_user,
+            load_config,
+        )
+        from Installer.utils import (
+            require_bound_venv_runtime,
+            resolve_venv_target,
+            setup_logging,
+        )
+    except ImportError as exc:
+        print(f"CRITICAL ERROR: Import fehlgeschlagen: {exc}")
+        sys.exit(1)
 
+    try:
+        if args.check:
+            print("OK: installer_main.py ist per sudo ausführbar.")
+            sys.exit(0)
+
+        # Produktdateien werden beim Start niemals mehr als root durch einen
+        # pfadbasierten BOM-Scanner umgeschrieben. Ein seltener manueller
+        # Encoding-Reparaturfall bleibt gemäß README eine separate Aktion des
+        # Installationsbenutzers.
         setup_logging()
-        check_python_version()
-        check_root_privileges()
-        
         print(f"→ Installer-Pfad: {SCRIPT_DIR}")
         print(f"→ Konfiguration:  {CONFIG_FILE}")
         sys.stdout.flush()
 
-        if args.check:
-            print("OK: installer_main.py ist per sudo ausfuehrbar.")
-            sys.exit(0)
-
         # Direktes Update wenn angefordert
-        if args.update_e3dc:
-            print("→ Starte Update-Modul...")
+        if args.update_e3dc or args.reinstall_current:
+            print(
+                "→ Starte ausdrückliche Neuinstallation..."
+                if args.reinstall_current
+                else "→ Starte Update-Modul..."
+            )
             sys.stdout.flush()
-            from Installer.update import start_installation_or_update
+            from Installer.update import (
+                UPDATE_ALREADY_CURRENT,
+                start_installation_or_update,
+            )
             update_ok = start_installation_or_update(
                 allow_first_install=False,
                 headless=True,
+                reinstall_current=args.reinstall_current,
             )
             
             # Pfadmetadaten nur nach einem tatsächlichen Update synchronisieren.
             # Ein blockierter Direktaufruf darf kein halbes Erstsystem erzeugen.
-            if update_ok is not False:
-                config = load_config()
-                user = config.get("install_user")
-                if user:
+            if update_ok not in (False, UPDATE_ALREADY_CURRENT):
+                try:
+                    user = get_install_user()
                     logger = logging.getLogger("install")
-                    ensure_web_config_safe(user, logger)
+                    if ensure_web_config_safe(user, logger) is not True:
+                        update_ok = False
+                except Exception as metadata_exc:
+                    print(f"✗ Lokale Rollenbindung nach Update fehlgeschlagen: {metadata_exc}")
+                    update_ok = False
                 
             sys.exit(0 if update_ok is not False else 1)
 
@@ -334,12 +371,15 @@ def main():
 
             # Im Archiv-Bootstrap darf nach dem Reset ausschließlich der
             # SHA-gebundene Target-Finalizer Zielcode ausführen.
-            if not args.bootstrap_install_path:
-                config = load_config()
-                user = config.get("install_user")
-                if user:
+            if update_ok is not False and not args.bootstrap_install_path:
+                try:
+                    user = get_install_user()
                     logger = logging.getLogger("install")
-                    ensure_web_config_safe(user, logger)
+                    if ensure_web_config_safe(user, logger) is not True:
+                        update_ok = False
+                except Exception as metadata_exc:
+                    print(f"✗ Lokale Rollenbindung nach Releasewechsel fehlgeschlagen: {metadata_exc}")
+                    update_ok = False
 
             sys.exit(0 if update_ok is not False else 1)
 
@@ -388,49 +428,25 @@ def main():
 
         check_duplicate_installations()
 
-        # VENV Status Check
-        install_path = get_install_path()
-        config = load_config()
-        home_dir = get_home_dir(config.get("install_user"))
-        venv_name = config.get("venv_name", ".venv_e3dc")
-        
-        venv_path = ""
-        if venv_name:
-            # Prüfe Home-Verzeichnis (Standard) und Install-Verzeichnis (Legacy)
-            if os.path.exists(os.path.join(home_dir, venv_name)):
-                venv_path = os.path.join(home_dir, venv_name)
-            elif os.path.exists(os.path.join(install_path, venv_name)):
-                venv_path = os.path.join(install_path, venv_name)
-        
+        # VENV-Status: Pfadmetadaten werden ausschließlich nach einem
+        # vollständigen Laufzeitvertrag projiziert. System-Python ist kein
+        # zulässiger Produktfallback.
+        install_user = get_install_user()
         GREEN = '\033[92m'
         YELLOW = '\033[93m'
         RESET = '\033[0m'
-        if venv_name and venv_path:
+        try:
+            venv_name, venv_path = resolve_venv_target(install_user)
+            require_bound_venv_runtime(
+                install_user=install_user,
+                venv_path=venv_path,
+            )
             print(f"{GREEN}✓ Python venv aktiv: {venv_path}{RESET}")
-            # Update e3dc_paths.json für PHP
-            try:
-                paths_file = "/var/www/html/e3dc_paths.json"
-                if not os.path.exists(paths_file):
-                    ensure_web_config(config.get("install_user"))
-
-                if os.path.exists(paths_file):
-                    import json
-                    with open(paths_file, 'r') as f: d = json.load(f)
-                    d['venv_name'] = venv_name
-                    d['venv_path'] = venv_path
-                    with open(paths_file, 'w') as f: json.dump(d, f, indent=2)
-                    
-                    # Rechte korrigieren
-                    try:
-                        uid, _ = get_user_ids(config.get("install_user"))
-                        gid = get_www_data_gid()
-                        os.chown(paths_file, uid, gid)
-                        os.chmod(paths_file, 0o664)
-                    except: pass
-            except Exception as e:
-                print(f"⚠ Fehler beim Aktualisieren von e3dc_paths.json: {e}")
-        else:
-            print(f"{YELLOW}ℹ️  Kein Python venv gefunden (System-Python wird genutzt){RESET}")
+        except Exception as exc:
+            print(
+                f"{YELLOW}ℹ️  Noch kein vertrauensgebundenes Python-venv: "
+                f"{exc}. Die Komplettinstallation muss es zuerst einrichten.{RESET}"
+            )
 
         # Wenn im Unattended Mode, beenden wir das Script nach den Grund-Checks und Updates
         # Da das interaktive Menü in der Konsole hier keinen Sinn macht
@@ -446,7 +462,8 @@ def main():
             print(f" Prüfe ob das Verzeichnis '{INSTALLER_DIR}' existiert.")
             sys.exit(1)
 
-        run_main_menu()
+        menu_ok = run_main_menu()
+        sys.exit(0 if menu_ok is not False else 1)
 
     except KeyboardInterrupt:
         print("\n\n✗ Vorgang abgebrochen.")

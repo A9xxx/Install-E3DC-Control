@@ -53,9 +53,47 @@ if [[ ! -x "$SYSTEM_PYTHON" ]]; then
     exit 2
 fi
 
-PYTHON_EXEC=$(
-    cd -- "$SCRIPT_DIR"
-    "$SYSTEM_PYTHON" - "$SCRIPT_DIR" <<'PY'
+RELEASE_ENTRY=0
+if [[ $# -eq 0 ]]; then
+    # Das interaktive Menü enthält den produktiven Updatepunkt und startet
+    # deshalb ebenfalls ohne benutzerbeschreibbares venv.
+    RELEASE_ENTRY=1
+else
+    for argument in "$@"; do
+        case "$argument" in
+            --update-e3dc|--reinstall-current|--install-release-tag)
+                RELEASE_ENTRY=1
+                ;;
+        esac
+    done
+fi
+
+PYTHON_FLAGS=()
+if [[ $RELEASE_ENTRY -eq 1 ]]; then
+    if [[ ! -f /.dockerenv ]]; then
+        RESOLVED_SYSTEM_PYTHON=$(readlink -f -- "$SYSTEM_PYTHON")
+        if [[ ! "$RESOLVED_SYSTEM_PYTHON" =~ ^/usr/bin/python3([.][0-9]+)*$ ]] \
+            || [[ ! -x "$RESOLVED_SYSTEM_PYTHON" ]]; then
+            echo "Setup abgebrochen: System-Python besitzt kein freigegebenes Ziel." >&2
+            exit 2
+        fi
+        read -r PY_OWNER PY_MODE < <(stat -Lc '%u %a' -- "$RESOLVED_SYSTEM_PYTHON")
+        read -r PY_PARENT_OWNER PY_PARENT_MODE < <(stat -Lc '%u %a' -- /usr/bin)
+        if [[ "$PY_OWNER" != "0" || "$PY_PARENT_OWNER" != "0" ]] \
+            || (( (8#$PY_MODE & 0022) != 0 )) \
+            || (( (8#$PY_PARENT_MODE & 0022) != 0 )); then
+            echo "Setup abgebrochen: System-Python ist nicht root-kontrolliert." >&2
+            exit 2
+        fi
+        PYTHON_EXEC=$RESOLVED_SYSTEM_PYTHON
+    else
+        PYTHON_EXEC=$SYSTEM_PYTHON
+    fi
+    PYTHON_FLAGS=(-I -B -u)
+else
+    PYTHON_EXEC=$(
+        cd -- "$SCRIPT_DIR"
+        "$SYSTEM_PYTHON" -I -B -u - "$SCRIPT_DIR" <<'PY'
 import os
 import sys
 
@@ -74,7 +112,8 @@ if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
 else:
     print(sys.executable)
 PY
-)
+    )
+fi
 
 if [[ -z "$PYTHON_EXEC" || ! -x "$PYTHON_EXEC" ]]; then
     echo "Setup abgebrochen: Der Installationsinterpreter ist nicht validierbar." >&2
@@ -82,4 +121,4 @@ if [[ -z "$PYTHON_EXEC" || ! -x "$PYTHON_EXEC" ]]; then
 fi
 
 cd -- "$SCRIPT_DIR"
-exec "$PYTHON_EXEC" "$SCRIPT_DIR/installer_main.py" "$@"
+exec "$PYTHON_EXEC" "${PYTHON_FLAGS[@]}" "$SCRIPT_DIR/installer_main.py" "$@"

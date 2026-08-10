@@ -3,11 +3,60 @@
 import os
 import sys
 
-def main():
+
+def _reject_privileged_web_invocation() -> None:
+    """Sperrt alte direkte sudoers-Freigaben für den Kompatibilitäts-Updater."""
+    sudo_user = str(os.environ.get("SUDO_USER") or "").strip()
+    if os.geteuid() == 0 and sudo_user == "www-data":
+        print(
+            "Sicherheitssperre: self_update.py darf nicht privilegiert "
+            "aus dem Webserverkontext gestartet werden.",
+            file=sys.stderr,
+        )
+        raise SystemExit(126)
+
+
+_reject_privileged_web_invocation()
+
+SYSTEM_PYTHON = "/usr/bin/python3"
+
+
+def _ensure_isolated_system_python() -> None:
+    """Route release changes through the fixed, isolated system interpreter."""
+    current = os.path.realpath(sys.executable)
+    expected = os.path.realpath(SYSTEM_PYTHON)
+    isolated = bool(getattr(sys.flags, "isolated", 0))
+    no_bytecode = bool(getattr(sys.flags, "dont_write_bytecode", 0))
+    unbuffered = bool(os.environ.get("PYTHONUNBUFFERED")) or bool(
+        getattr(sys.stdout, "write_through", False)
+    )
+    if current == expected and isolated and no_bytecode and unbuffered:
+        return
+    if os.geteuid() != 0:
+        raise PermissionError(
+            "Der Kompatibilitäts-Updater muss als root über den geprüften "
+            "Installer-Wrapper gestartet werden."
+        )
+    os.execv(
+        SYSTEM_PYTHON,
+        [
+            SYSTEM_PYTHON,
+            "-I",
+            "-B",
+            "-u",
+            os.path.abspath(__file__),
+            *sys.argv[1:],
+        ],
+    )
+
+
+def main() -> int:
     silent = "--silent" in sys.argv
     is_check = "--check" in sys.argv
     is_fix_permissions = "--fix-permissions" in sys.argv
-    
+    if not is_check and not is_fix_permissions:
+        _ensure_isolated_system_python()
+
     if not silent and not is_check and not is_fix_permissions:
         print("="*60)
         print(" 🚀 WILLKOMMEN BEIM V4 UPGRADE 🚀")
@@ -26,25 +75,33 @@ def main():
             missing = check_for_updates(repo_root)
             if missing == 0:
                 print("System ist aktuell.")
+                return 0
             elif missing is None:
-                print("Fehler bei der Update-Pruefung.")
+                print("Fehler bei der Update-Prüfung.")
+                return 1
             else:
-                print(f"{missing} Commits verfuegbar.")
+                print(f"{missing} Commits verfügbar.")
+                return 0
         elif is_fix_permissions:
             from Installer.permissions import run_permissions_wizard
             ok = run_permissions_wizard(headless=True)
-            sys.exit(0 if ok is not False else 1)
+            return 0 if ok is not False else 1
         else:
             if not silent:
                 print("Starte den V4 Upgrade & Update Prozess via installer_main.py...\n")
                 sys.stdout.flush()
-            from Installer.update import update_e3dc
-            update_e3dc(headless=True)
+            from Installer.update import start_installation_or_update
+            result = start_installation_or_update(
+                allow_first_install=False,
+                headless=True,
+            )
+            return 0 if result is not False else 1
     except Exception as e:
-        print(f"Fehler beim Ausfuehren von self_update.py: {e}")
+        print(f"Fehler beim Ausführen von self_update.py: {e}")
         if not silent:
-            print("\nBitte starten Sie den Installer manuell:")
+            print("\nBitte starte den Installer manuell:")
             print("  python3 installer_main.py")
+        return 1
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

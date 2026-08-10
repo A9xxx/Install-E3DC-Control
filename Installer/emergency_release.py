@@ -3,11 +3,12 @@
 """Einmaliges Notfall-Stillsetzen des Speicherschreibers.
 
 Dieses Programm sendet bewusst keinen RSCP-, Wallbox-, Wärmepumpen-, Phasen-
-oder CP-Befehl. Es fordert systemd auf, den Speicherschreiber anzuhalten, damit
-dessen eigener SIGTERM-Handler die normale flüchtige Freigabe ausführen kann.
-Wenn diese Freigabe oder das Prozessende nicht bestätigt werden kann, bleibt
-der Vorfall verriegelt und das Programm endet ungleich null. Es gibt weder
-einen rohen Hardware-Fallback noch einen Wiederholungsversuch.
+oder CP-Befehl. Es fordert systemd auf, den Speicherschreiber anzuhalten. Dessen
+SIGTERM-Pfad beendet ausschließlich den Prozessbesitz und lässt den zuletzt
+bestätigten flüchtigen POWER_SETTINGS-Rahmen unverändert. Wenn Prozessende und
+Besitzfreigabe nicht bestätigt werden können, bleibt der Vorfall verriegelt und
+das Programm endet ungleich null. Es gibt weder einen rohen Hardware-Fallback
+noch einen Wiederholungsversuch.
 """
 
 from __future__ import annotations

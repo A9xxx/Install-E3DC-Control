@@ -246,9 +246,51 @@ class EnergyPolicyInput:
     grid_import_budget_down_active: bool
     grid_import_w: float
     native_sun_capable: bool
+    authorized_wallbox_budget_w: float = 32.0 * 230.0 * 3.0
     direct_marketing_active: bool = False
     direct_marketing_policy_target_state: Optional[str] = None
     openwb_pro_curve_direct_start_min_w: float = 6.0 * 230.0
+    peak_shaving_enabled: bool = False
+    peak_shaving_budget_valid: bool = False
+    peak_shaving_allowed_remaining_import_w: Optional[float] = None
+    peak_shaving_base_import_w: Optional[float] = None
+
+
+def peak_shaving_wallbox_power_cap(
+    *,
+    enabled: bool,
+    budget_valid: bool,
+    allowed_remaining_import_w: Any,
+    base_import_w: Any,
+    wallbox_actual_w: Any,
+) -> Dict[str, Any]:
+    """Begrenzt flexible Wallboxlast auf den verbleibenden 15-Minuten-Rahmen."""
+
+    result = {
+        "active": False,
+        "budget_valid": bool(budget_valid),
+        "cap_w": None,
+        "non_wallbox_base_import_w": None,
+        "reason": "disabled" if not enabled else "evidence_limit",
+    }
+    if not enabled or not budget_valid:
+        return result
+    if allowed_remaining_import_w is None or base_import_w is None:
+        return result
+
+    allowed_import_w = max(0.0, _safe_float(allowed_remaining_import_w, 0.0))
+    current_wallbox_w = max(0.0, _safe_float(wallbox_actual_w, 0.0))
+    non_wallbox_base_import_w = (
+        _safe_float(base_import_w, 0.0) - current_wallbox_w
+    )
+    cap_w = max(0.0, allowed_import_w - non_wallbox_base_import_w)
+    result.update({
+        "active": True,
+        "cap_w": float(cap_w),
+        "non_wallbox_base_import_w": float(non_wallbox_base_import_w),
+        "reason": "remaining_interval_import_budget",
+    })
+    return result
 
 
 def decide_energy_policy(ctx: EnergyPolicyInput) -> Dict[str, Any]:
@@ -300,6 +342,12 @@ def decide_energy_policy(ctx: EnergyPolicyInput) -> Dict[str, Any]:
         else:
             budget_w = free_w * fz
             allowed_w = min(wb_actual + budget_w, phys_surplus)
+
+        if free_w > 0.0:
+            direct_pv_surplus_w = min(max(0.0, wb_actual + free_w), max(0.0, phys_surplus))
+            if direct_pv_surplus_w > 0.0:
+                allowed_w = max(allowed_w, direct_pv_surplus_w)
+                display_wb_budget_curve_w = max(display_wb_budget_curve_w, direct_pv_surplus_w)
 
         if mode == 4:
             allowed_w = max(0.0, wb_actual + _safe_float(ctx.eba_iaval_w, 0.0))
@@ -675,8 +723,40 @@ def decide_energy_policy(ctx: EnergyPolicyInput) -> Dict[str, Any]:
         if allowed_w < 6.0 * 230.0 * phases:
             allowed_w = 0.0
 
+    peak_shaving_wallbox = peak_shaving_wallbox_power_cap(
+        enabled=bool(ctx.peak_shaving_enabled),
+        budget_valid=bool(ctx.peak_shaving_budget_valid),
+        allowed_remaining_import_w=ctx.peak_shaving_allowed_remaining_import_w,
+        base_import_w=ctx.peak_shaving_base_import_w,
+        wallbox_actual_w=wb_actual,
+    )
+    peak_shaving_wallbox_limited = False
+    peak_shaving_wallbox_minimum_blocked = False
+    peak_shaving_wallbox_minimum_power_w = 6.0 * 230.0 * phases
+    if peak_shaving_wallbox.get("active"):
+        peak_cap_w = max(
+            0.0,
+            _safe_float(peak_shaving_wallbox.get("cap_w"), 0.0),
+        )
+        peak_shaving_wallbox_limited = bool(allowed_w > peak_cap_w + 1.0)
+        allowed_w = min(allowed_w, peak_cap_w)
+        peak_shaving_wallbox_minimum_blocked = bool(
+            allowed_w > 0.0
+            and allowed_w < peak_shaving_wallbox_minimum_power_w
+        )
+        if peak_shaving_wallbox_minimum_blocked:
+            allowed_w = 0.0
+
+    pre_auth_cap = max(0.0, float(allowed_w))
+    auth_budget = max(0.0, _safe_float(getattr(ctx, "authorized_wallbox_budget_w", 32.0 * 230.0 * 3.0), 32.0 * 230.0 * 3.0))
+    final_allowed = min(pre_auth_cap, auth_budget)
+    auth_budget_limited = bool(final_allowed < pre_auth_cap)
+
     return {
-        "allowed_w": max(0.0, float(allowed_w)),
+        "allowed_w": final_allowed,
+        "pre_authorized_cap_allowed_w": pre_auth_cap,
+        "authorized_wallbox_budget_w": auth_budget,
+        "authorized_wallbox_budget_limited": auth_budget_limited,
         "display_wb_budget_curve_w": max(0.0, float(display_wb_budget_curve_w)),
         "native_mode9_batt_start": bool(native_mode9_batt_start),
         "mode5_pv_surplus_active": bool(mode5_pv_surplus_active),
@@ -687,7 +767,10 @@ def decide_energy_policy(ctx: EnergyPolicyInput) -> Dict[str, Any]:
         "curve_wb_relief_active": bool(curve_wb_relief_active),
         "forecast_auto_relief_active": bool(forecast_auto_relief_active),
         "openwb_pro_curve_direct_active": bool(openwb_pro_curve_direct_active),
-        "openwb_pro_curve_direct_w": max(0.0, float(openwb_pro_curve_direct_w)),
+        "openwb_pro_curve_direct_w": min(
+            final_allowed,
+            max(0.0, float(openwb_pro_curve_direct_w)),
+        ),
         "openwb_pro_curve_direct_pv_start_ready": bool(openwb_pro_curve_direct_pv_start_ready),
         "openwb_pro_curve_direct_real_pv_w": max(0.0, float(openwb_pro_curve_direct_real_pv_w)),
         "openwb_pro_curve_direct_candidate_w": max(
@@ -705,6 +788,23 @@ def decide_energy_policy(ctx: EnergyPolicyInput) -> Dict[str, Any]:
         "openwb_pro_curve_direct_storage_soft_release": bool(openwb_pro_curve_direct_storage_soft_release),
         "openwb_pro_curve_direct_direct_marketing_block": bool(dm_blocks_direct),
         "grid_import_budget_clamp_active": bool(grid_import_budget_clamp_active),
+        "peak_shaving_wallbox_budget_active": bool(
+            peak_shaving_wallbox.get("active")
+        ),
+        "peak_shaving_wallbox_limited": bool(peak_shaving_wallbox_limited),
+        "peak_shaving_wallbox_minimum_blocked": bool(
+            peak_shaving_wallbox_minimum_blocked
+        ),
+        "peak_shaving_wallbox_minimum_power_w": float(
+            peak_shaving_wallbox_minimum_power_w
+        ),
+        "peak_shaving_wallbox_cap_w": peak_shaving_wallbox.get("cap_w"),
+        "peak_shaving_wallbox_non_wb_base_import_w": peak_shaving_wallbox.get(
+            "non_wallbox_base_import_w"
+        ),
+        "peak_shaving_wallbox_reason": str(
+            peak_shaving_wallbox.get("reason") or ""
+        ),
         "storage_curve_overcharge_relief_active": bool(storage_curve_overcharge_relief_active),
         "storage_curve_overcharge_relief_w": max(0.0, float(storage_curve_overcharge_relief_w)),
     }

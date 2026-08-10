@@ -250,6 +250,7 @@ def get_transition_context(
     explicit_install_path: str | None = None,
     explicit_install_user: str | None = None,
     explicit_home_dir: str | None = None,
+    explicit_venv_path: str | None = None,
     require_trusted: bool = False,
 ) -> TransitionContext:
     """Löst einen exakten einmaligen Übergangskontext ohne Altbestandsannahmen auf."""
@@ -322,10 +323,11 @@ def get_transition_context(
         if container and (str(root) != "/app/pi/Install" or home_dir != "/app"):
             raise TransitionContextError("Container-Kontext entspricht nicht dem Image-Vertrag")
 
-        venv_values = _unique_nonempty(data.get("venv_path") for _, data in metadata)
-        explicit_venv = str(os.environ.get("E3DC_BOOTSTRAP_VENV") or "").strip()
-        if explicit_venv:
-            venv_values = _unique_nonempty((explicit_venv, *venv_values))
+        metadata_venvs = _unique_nonempty(data.get("venv_path") for _, data in metadata)
+        bootstrap_venv = str(os.environ.get("E3DC_BOOTSTRAP_VENV") or "").strip()
+        venv_values = _unique_nonempty(
+            (explicit_venv_path, bootstrap_venv, *metadata_venvs)
+        )
         if len(venv_values) > 1:
             raise TransitionContextError("Venv-Metadaten sind widersprüchlich")
         venv_path = ""
@@ -338,7 +340,11 @@ def get_transition_context(
             venv_path = str(venv)
             venv_python = str(python)
 
-        source = "explicit" if root_values or bootstrap_user else "secure-metadata"
+        source = (
+            "explicit"
+            if root_values or bootstrap_user or explicit_venv_path
+            else "secure-metadata"
+        )
         return TransitionContext(
             str(root), install_user, home_dir, venv_path, venv_python, True, source, container, ""
         )

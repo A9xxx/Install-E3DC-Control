@@ -8,7 +8,7 @@ import json
 import os
 import time
 
-from decision_history import write_history_record
+from decision_history import HISTORY_NORMAL_HEARTBEAT_S, write_history_record
 from ems_decision_diagnostics import build_wallbox_decision_records, write_decision_surface_records
 
 
@@ -17,6 +17,142 @@ def _safe_float(value, default=0.0):
         return float(value)
     except (TypeError, ValueError):
         return float(default)
+
+
+def _mapping_subset(value, keys):
+    source = value if isinstance(value, dict) else {}
+    return {key: source.get(key) for key in keys if key in source}
+
+
+def _blocked_gate_event(name, value):
+    gate = value if isinstance(value, dict) else {}
+    blocked = bool(
+        gate.get("blocked") is True
+        or gate.get("hard_block") is True
+        or gate.get("veto") is True
+        or gate.get("valid") is False
+        or gate.get("allowed") is False
+        or gate.get("execute") is False
+    )
+    if not blocked:
+        return None
+    event = {"gate": name, "blocked": True}
+    event.update(
+        _mapping_subset(
+            gate,
+            (
+                "reason",
+                "blocker",
+                "code",
+                "state",
+                "source",
+            ),
+        )
+    )
+    return event
+
+
+def wallbox_critical_events(wallboxes, *, budget_stale=False, budget_timeout=False):
+    """Verdichtet ausschließlich sofort zu sichernde Wallbox-Kanten.
+
+    Strom- und Leistungsziele gehören bewusst nicht in diese Signatur. Ein
+    neuer Hardware-Receipt, Stop, Phasenwechsel, Veto oder Datenfehler bleibt
+    dagegen auch dann sofort erhalten, wenn der normale Archivheartbeat erst
+    später fällig wäre.
+    """
+
+    events = [{
+        "scope": "budget",
+        "stale": bool(budget_stale),
+        "timeout": bool(budget_timeout),
+    }]
+    for raw in wallboxes or []:
+        if not isinstance(raw, dict):
+            continue
+        event = {"scope": "wallbox", "id": raw.get("id")}
+        for key in (
+            "plug",
+            "connected",
+            "charging",
+            "manager_stop_pending",
+            "driver_status_valid",
+            "driver_status_stale",
+            "driver_status_glitch",
+            "rscp_error_active",
+            "command_blocked",
+            "last_command_ok",
+            "phase_actual_phases",
+            "physical_phases",
+            "phases_in_use",
+            "e3dc_session_stop_active",
+            "openwb_pro_session_stop_active",
+            "openwb_secondary_session_stop_active",
+            "goe_session_stop_active",
+            "fault_state",
+        ):
+            if key in raw:
+                event[key] = raw.get(key)
+        if raw.get("manager_stop_pending"):
+            event["manager_stop_reason"] = raw.get("manager_stop_reason")
+        if raw.get("driver_status_stale") or raw.get("driver_status_glitch"):
+            event["driver_status_reason"] = raw.get("driver_status_reason")
+
+        receipt = raw.get("last_executed_command")
+        if isinstance(receipt, dict):
+            # Das Zyklustoken bindet einen echten neuen Hardware-Receipt. Der
+            # restliche Receipt-Inhalt bleibt im vollständigen Datensatz. Für
+            # die Persistenzkante zählt allein die Identität; eine erneute
+            # Projektion desselben Receipts darf keinen SD-Schreibzyklus
+            # erzeugen.
+            cycle_token = receipt.get("cycle_token")
+            if cycle_token not in (None, ""):
+                event["receipt_token"] = str(cycle_token)
+            else:
+                # Rückwärtskompatibler Fallback für ältere Treiber ohne Token.
+                event["receipt"] = _mapping_subset(
+                    receipt,
+                    (
+                        "method",
+                        "amp",
+                        "force_state",
+                        "forced_zero",
+                        "target_phases",
+                    ),
+                )
+
+        payload = raw.get("decision_payload")
+        payload = payload if isinstance(payload, dict) else {}
+        # START/STOP, Strom- und Phasenabsichten sind noch keine physische
+        # Hardwarekante. Diese wird eindeutig über Receipt, Ladezustand und
+        # Ist-Phasen gebunden. Dadurch erzeugen START→SET_CURRENT und
+        # SET_CURRENT↔NOOP bei demselben Receipt keine Doppelspur im Archiv.
+        payload_inputs = payload.get("inputs") if isinstance(payload.get("inputs"), dict) else {}
+        if payload_inputs.get("priority_forced_stop"):
+            event["priority_forced_stop"] = True
+        if payload_inputs.get("budget_timeout"):
+            event["budget_timeout"] = True
+
+        blocked_gates = []
+        for gate_name in (
+            "command_guard",
+            "e3dc_edge_guard",
+            "charger_controller_output_gate",
+            "effective_current_output_gate",
+            "vehicle_current_output_gate",
+            "multi_allocation_output_gate",
+            "peak_shaving_output_gate",
+            "openwb_pro_one_phase_output_gate",
+        ):
+            blocked = _blocked_gate_event(gate_name, raw.get(gate_name))
+            if blocked is not None:
+                blocked_gates.append(blocked)
+        if blocked_gates:
+            event["vetoes"] = blocked_gates
+        events.append(event)
+    return sorted(
+        events,
+        key=lambda item: (str(item.get("scope") or ""), str(item.get("id") or "")),
+    )
 
 
 class WallboxDiagnostics:
@@ -99,16 +235,26 @@ class WallboxDiagnostics:
                     "decision.scheduled_slot_active",
                     "decision.price_boost_active",
                     "decision.predump_wallbox_active",
-                    "inputs.cap_amp",
-                    "inputs.set_amp",
-                    "inputs.budget_stale",
-                    "inputs.budget_timeout",
                     "storage_context.storage_state",
                     "storage_context.curve_wb_relief_active",
                     "storage_context.forecast_auto_relief_active",
                     "storage_context.curve_forecast_wallbox_stop_active",
                 ),
-                default_interval_s=60,
+                critical_signature_paths=(
+                    "decision.critical_events",
+                ),
+                summary_paths=(
+                    "inputs.grid_w",
+                    "inputs.bat_w",
+                    "inputs.budget_raw_w",
+                    "inputs.effective_budget_w",
+                    "inputs.allowed_w",
+                    "inputs.cap_amp",
+                    "inputs.set_amp",
+                ),
+                summary_state_path="decision.state",
+                default_interval_s=HISTORY_NORMAL_HEARTBEAT_S,
+                minimum_interval_s=HISTORY_NORMAL_HEARTBEAT_S,
                 default_max_bytes=8 * 1024 * 1024,
                 default_retention_days=2,
                 logger=self.logger,
@@ -119,6 +265,9 @@ class WallboxDiagnostics:
     def write_snapshot(self, ui_state, config, context=None):
         state = ui_state if isinstance(ui_state, dict) else {}
         context = context if isinstance(context, dict) else {}
+        budget_stale = bool(context.get("budget_stale", False))
+        budget_timeout = bool(context.get("budget_timeout", False))
+        wallboxes = state.get("wb_details", [])
         record = {
             "ts": int(time.time()),
             "time": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -134,6 +283,11 @@ class WallboxDiagnostics:
                 "price_boost_active": bool(state.get("price_boost_active", False)),
                 "predump_wallbox_active": bool(state.get("predump_wallbox_active", False)),
                 "predump_wallbox_gate_open": bool(state.get("predump_wallbox_gate_open", False)),
+                "critical_events": wallbox_critical_events(
+                    wallboxes,
+                    budget_stale=budget_stale,
+                    budget_timeout=budget_timeout,
+                ),
             },
             "inputs": {
                 "grid_w": int(round(_safe_float(state.get("grid_w_raw"), 0.0))),
@@ -144,10 +298,10 @@ class WallboxDiagnostics:
                 "cap_amp": round(_safe_float(state.get("cap_amp"), 0.0), 3),
                 "set_amp": round(_safe_float(state.get("set_amp"), 0.0), 3),
                 "detected_phases": int(round(_safe_float(state.get("detected_phases"), 0.0))),
-                "budget_stale": bool(context.get("budget_stale", False)),
-                "budget_timeout": bool(context.get("budget_timeout", False)),
+                "budget_stale": budget_stale,
+                "budget_timeout": budget_timeout,
             },
-            "wallboxes": state.get("wb_details", []),
+            "wallboxes": wallboxes,
             "storage_context": {
                 "storage_state": context.get("storage_state"),
                 "wbminsoc_gate_open": bool(state.get("wbminsoc_gate_open", False)),

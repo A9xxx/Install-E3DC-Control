@@ -16,12 +16,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
-import json
+import ipaddress
 import os
 from pathlib import Path
 import stat
-import tempfile
-import time
 from typing import Callable, Dict, Optional
 
 
@@ -137,108 +135,233 @@ class InMemoryLeaseBackend:
         return True
 
 
-class FileOwnerLeaseBackend:
-    """Nicht blockierende, benutzerübergreifende Lease mit Kernel-Lock.
+class DenyLeaseBackend:
+    """Fail-closed-Standard für Aufrufer ohne vorerzeugten Kernel-Lock."""
 
-    Die Lease-Datei enthält nur Diagnosedaten und wird bewusst geteilt, damit
-    ein neu konfigurierter Dienstnutzer nach Freigabe des alten Writers denselben
-    Inode öffnen kann. Exklusivität hängt nie vom Dateiinhalt ab: Das flock
-    eines aktiven Owners kann kein anderer Prozess übernehmen.
-    """
+    def acquire(self, _key: str, _owner: str) -> bool:
+        return False
 
-    def __init__(self, directory: Optional[str] = None):
-        self.directory = Path(
-            directory
-            or os.path.join(tempfile.gettempdir(), "e3dc-control-heat-actuator-leases-v1")
-        )
-        self._held: Dict[str, tuple] = {}
+    def release(self, _key: str, _owner: str) -> bool:
+        return False
 
-    def _prepare_directory(self) -> bool:
-        try:
-            self.directory.mkdir(mode=0o1777, parents=False, exist_ok=True)
-            st = self.directory.lstat()
-            if not stat.S_ISDIR(st.st_mode) or self.directory.is_symlink():
-                return False
-            # Ein gemeinsames Sticky-Verzeichnis gibt allen Installationsnutzern
-            # dieselbe Kollisionsdomäne und verhindert zugleich den Austausch
-            # der Lease-Datei eines anderen Nutzers.
-            if (st.st_mode & 0o1000) == 0 or (st.st_mode & 0o002) == 0:
-                try:
-                    os.chmod(self.directory, 0o1777)
-                    st = self.directory.lstat()
-                except OSError:
-                    return False
-            return bool((st.st_mode & 0o1000) and (st.st_mode & 0o002))
-        except OSError:
-            return False
+
+class FileOwnerLeaseBackend(DenyLeaseBackend):
+    """Entfernte /tmp-Kompatibilitätsoberfläche; jede Freigabe bleibt gesperrt."""
+
+    def __init__(self, *_args, **_kwargs):
+        pass
+
+
+DEFAULT_FILE_LEASE_BACKEND = DenyLeaseBackend()
+
+
+class PrecreatedFileLeaseBackend:
+    """Dienst- und Endpunktlocks auf root-vorerzeugten festen Inodes."""
+
+    def __init__(self, path: str, endpoint_path: str):
+        self.path = os.path.abspath(path)
+        self.endpoint_path = os.path.abspath(endpoint_path)
+        self._service_held: Optional[tuple[int, str]] = None
+        self._endpoint_descriptor: Optional[int] = None
+        self._endpoint_locks: Dict[str, tuple[int, str]] = {}
 
     @staticmethod
-    def _filename(key: str) -> str:
-        return hashlib.sha256(key.encode("utf-8", errors="strict")).hexdigest() + ".lease"
+    def _canonical_endpoint_key(key: str) -> str:
+        value = str(key or "").strip().lower()
+        for prefix in (
+            "transport:modbus-tcp:",
+            "transport:luxtronik-shi:",
+        ):
+            if value.startswith(prefix):
+                endpoint = value[len(prefix):]
+                host, separator, port_text = endpoint.rpartition(":")
+                try:
+                    port = int(port_text) if separator else 0
+                    host = str(ipaddress.ip_address(host))
+                except (ValueError, TypeError):
+                    return "transport:unknown"
+                if not 1 <= port <= 65535:
+                    return "transport:unknown"
+                return f"transport:tcp:{host}:{port}"
+        shelly_prefix = "transport:http-shelly:"
+        if value.startswith(shelly_prefix):
+            endpoint = value[len(shelly_prefix):]
+            host, separator, relay_text = endpoint.partition(":switch:")
+            try:
+                host = str(ipaddress.ip_address(host))
+                relay = int(relay_text) if separator else -1
+            except (ValueError, TypeError):
+                return "transport:unknown"
+            if relay < 0:
+                return "transport:unknown"
+            return f"transport:http-shelly:{host}:switch:{relay}"
+        # Unbekannte Transportformen teilen bewusst einen Sperrbereich. Das
+        # kann Verfügbarkeit kosten, aber niemals Doppelsteuerung erlauben.
+        return "transport:unknown"
+
+    @classmethod
+    def _lock_offset(cls, key: str) -> int:
+        canonical = cls._canonical_endpoint_key(key)
+        digest = hashlib.sha256(canonical.encode("utf-8", errors="strict")).digest()
+        # Ein Hashzusammenstoß blockiert höchstens zwei verschiedene Endpunkte;
+        # er kann niemals zwei Schreiber für denselben Endpunkt freigeben.
+        return int.from_bytes(digest[:8], "big") & ((1 << 63) - 1)
+
+    @staticmethod
+    def _open_precreated(path: str) -> int:
+        import grp
+
+        namespace = Path("/run/e3dc-control")
+        directory = namespace / "locks"
+        for candidate in (namespace, directory):
+            info = candidate.lstat()
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or candidate.is_symlink()
+                or info.st_uid != 0
+                or info.st_gid != 0
+                or stat.S_IMODE(info.st_mode) != 0o755
+            ):
+                raise OSError("unsicherer Wärme-Locknamespace")
+        if path != str(directory / os.path.basename(path)):
+            raise OSError("Wärme-Lock liegt außerhalb des gebundenen Namespace")
+        descriptor = os.open(
+            path,
+            os.O_RDWR
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        opened = os.fstat(descriptor)
+        named = os.lstat(path)
+        expected_gid = int(grp.getgrnam("www-data").gr_gid)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or opened.st_uid != 0
+            or opened.st_gid != expected_gid
+            or stat.S_IMODE(opened.st_mode) != 0o660
+            or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)
+        ):
+            os.close(descriptor)
+            raise OSError("unsicherer Wärme-Lockinode")
+        return descriptor
 
     def acquire(self, key: str, owner: str) -> bool:
-        held = self._held.get(key)
+        held = self._endpoint_locks.get(key)
         if held is not None:
             return held[1] == owner
-        if os.name != "posix" or not self._prepare_directory():
-            return False
         try:
             import fcntl
 
-            path = self.directory / self._filename(key)
-            flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-            fd = os.open(path, flags, 0o666)
-            st = os.fstat(fd)
-            euid = os.geteuid()
-            if st.st_uid == euid and stat.S_IMODE(st.st_mode) != 0o666:
-                os.fchmod(fd, 0o666)
-                st = os.fstat(fd)
-            if (
-                not stat.S_ISREG(st.st_mode)
-                or st.st_nlink != 1
-                or stat.S_IMODE(st.st_mode) != 0o666
-            ):
-                os.close(fd)
+            if self._service_held is None:
+                service_descriptor = self._open_precreated(self.path)
+                try:
+                    fcntl.flock(
+                        service_descriptor,
+                        fcntl.LOCK_EX | fcntl.LOCK_NB,
+                    )
+                except Exception:
+                    os.close(service_descriptor)
+                    raise
+                self._service_held = (service_descriptor, owner)
+            elif self._service_held[1] != owner:
                 return False
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            payload = json.dumps(
-                {"owner": owner, "pid": os.getpid(), "acquired_ts": int(time.time())},
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-            os.ftruncate(fd, 0)
-            os.write(fd, payload)
-            os.fsync(fd)
-            self._held[key] = (fd, owner, str(path))
+
+            if self._endpoint_descriptor is None:
+                self._endpoint_descriptor = self._open_precreated(self.endpoint_path)
+            offset = self._lock_offset(key)
+            fcntl.lockf(
+                self._endpoint_descriptor,
+                fcntl.LOCK_EX | fcntl.LOCK_NB,
+                1,
+                offset,
+                os.SEEK_SET,
+            )
+            self._endpoint_locks[key] = (offset, owner)
             return True
-        except (OSError, ImportError, BlockingIOError):
-            try:
-                if "fd" in locals():
-                    os.close(fd)
-            except OSError:
-                pass
+        except (BlockingIOError, ImportError, KeyError, OSError):
             return False
 
     def release(self, key: str, owner: str) -> bool:
-        held = self._held.get(key)
+        held = self._endpoint_locks.get(key)
         if held is None or held[1] != owner:
             return False
-        fd = held[0]
         try:
             import fcntl
 
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        except (OSError, ImportError):
-            pass
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-        del self._held[key]
+            if self._endpoint_descriptor is None:
+                return False
+            fcntl.lockf(
+                self._endpoint_descriptor,
+                fcntl.LOCK_UN,
+                1,
+                held[0],
+                os.SEEK_SET,
+            )
+        except (ImportError, OSError):
+            return False
+        del self._endpoint_locks[key]
         return True
 
 
-DEFAULT_FILE_LEASE_BACKEND = FileOwnerLeaseBackend()
+class PrecreatedEndpointLeaseBackend:
+    """Hält nur den gemeinsamen physischen Endpunktlock.
+
+    Aufrufer dürfen diesen Backend-Typ ausschließlich verwenden, wenn ihr
+    eigener Prozess-Singleton bereits vor jedem Hardwareaufbau belegt ist.
+    """
+
+    def __init__(self, endpoint_path: str):
+        self.endpoint_path = os.path.abspath(endpoint_path)
+        self._endpoint_descriptor: Optional[int] = None
+        self._endpoint_locks: Dict[str, tuple[int, str]] = {}
+
+    def acquire(self, key: str, owner: str) -> bool:
+        canonical = PrecreatedFileLeaseBackend._canonical_endpoint_key(key)
+        held = self._endpoint_locks.get(canonical)
+        if held is not None:
+            return held[1] == owner
+        try:
+            import fcntl
+
+            if self._endpoint_descriptor is None:
+                self._endpoint_descriptor = PrecreatedFileLeaseBackend._open_precreated(
+                    self.endpoint_path
+                )
+            offset = PrecreatedFileLeaseBackend._lock_offset(canonical)
+            fcntl.lockf(
+                self._endpoint_descriptor,
+                fcntl.LOCK_EX | fcntl.LOCK_NB,
+                1,
+                offset,
+                os.SEEK_SET,
+            )
+            self._endpoint_locks[canonical] = (offset, owner)
+            return True
+        except (BlockingIOError, ImportError, KeyError, OSError):
+            return False
+
+    def release(self, key: str, owner: str) -> bool:
+        canonical = PrecreatedFileLeaseBackend._canonical_endpoint_key(key)
+        held = self._endpoint_locks.get(canonical)
+        if held is None or held[1] != owner:
+            return False
+        try:
+            import fcntl
+
+            if self._endpoint_descriptor is None:
+                return False
+            fcntl.lockf(
+                self._endpoint_descriptor,
+                fcntl.LOCK_UN,
+                1,
+                held[0],
+                os.SEEK_SET,
+            )
+        except (ImportError, OSError):
+            return False
+        del self._endpoint_locks[canonical]
+        return True
 
 
 class HeatActuatorSafetyGate:
@@ -250,10 +373,12 @@ class HeatActuatorSafetyGate:
         *,
         owner: str,
         lease_backend=None,
+        authority_validator: Optional[Callable[[], object]] = None,
     ):
         self.context_validator = context_validator
         self.owner = str(owner)
         self.lease_backend = lease_backend or DEFAULT_FILE_LEASE_BACKEND
+        self.authority_validator = authority_validator
         self.last_authorization: Optional[Authorization] = None
 
     def authorize(
@@ -264,6 +389,28 @@ class HeatActuatorSafetyGate:
         allow_release_on_invalid: bool = False,
         preserve_existing: bool = False,
     ) -> Authorization:
+        if self.authority_validator is not None:
+            try:
+                authority = _normalise_verdict(self.authority_validator())
+            except Exception as exc:
+                authority = ContextVerdict(
+                    False,
+                    f"authority_validator_error:{type(exc).__name__}",
+                )
+            if not authority.valid:
+                # HA-/Shadow-Autorität ist härter als ein lokaler
+                # Release-Ausgang. Auch ein vermeintlich sicheres AUS darf
+                # nicht von einer nicht autorisierten Instanz stammen.
+                result = Authorization(
+                    False,
+                    False,
+                    False,
+                    f"{action}:authority_blocked:{authority.reason}",
+                    bool(preserve_existing),
+                )
+                self.last_authorization = result
+                return result
+
         try:
             context = _normalise_verdict(self.context_validator())
         except Exception as exc:
@@ -302,9 +449,40 @@ class HeatActuatorSafetyGate:
         return result
 
 
+_PRODUCTION_LEASE_BACKENDS: Dict[str, PrecreatedFileLeaseBackend] = {}
+
+
 def default_heat_actuator_gate(module_file: str, expected_relative_path: str, service: str):
     module_id = os.path.realpath(module_file)
+    lock_names = {
+        "energy_manager": "energy_manager.owner.lock",
+        "heizstab_manager": "heizstab_manager.owner.lock",
+    }
+    lock_name = lock_names.get(str(service))
+    if not lock_name:
+        raise ValueError("Wärme-Aktorgate besitzt keinen kanonischen Service-Lock")
+    lease_backend = _PRODUCTION_LEASE_BACKENDS.get(str(service))
+    if lease_backend is None:
+        lease_backend = PrecreatedFileLeaseBackend(
+            os.path.join("/run/e3dc-control/locks", lock_name),
+            os.path.join("/run/e3dc-control/locks", "heat_actuator_endpoints.lock"),
+        )
+        _PRODUCTION_LEASE_BACKENDS[str(service)] = lease_backend
+
+    def _ha_authority_verdict():
+        try:
+            from Installer.ha_writer_admission import evaluate_writer_admission
+        except ModuleNotFoundError:
+            from ha_writer_admission import evaluate_writer_admission  # type: ignore
+        result = evaluate_writer_admission()
+        return ContextVerdict(
+            result.get("allowed") is True,
+            str(result.get("reason") or "ha_writer_admission_blocked"),
+        )
+
     return HeatActuatorSafetyGate(
         NarrowRuntimeContext(module_file, expected_relative_path),
         owner=f"{service}:{os.getpid()}:{module_id}",
+        lease_backend=lease_backend,
+        authority_validator=_ha_authority_verdict,
     )

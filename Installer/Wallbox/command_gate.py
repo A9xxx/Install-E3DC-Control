@@ -12,6 +12,7 @@ import json
 import os
 import time
 from typing import Any, Callable, Dict, Iterator, Optional
+from urllib.parse import parse_qs
 
 
 AUDIT_LOG = os.path.join("/var/www/html/logs", "wallbox_command_audit.log")
@@ -21,12 +22,262 @@ BLOCKED_REPEAT_AUDIT_S = 300.0
 _LAST_ALLOWED_AUDIT: Dict[str, float] = {}
 _LAST_BLOCKED_AUDIT: Dict[str, float] = {}
 
+_STORAGE_HARD_BLOCK_ATTR = "_storage_power_budget_hard_block"
+_STORAGE_HARD_BLOCK_REASON_ATTR = "_storage_power_budget_hard_block_reason"
+_USER_OFF_RELEASE_TYPE = "user_off_handoff"
+
 
 def _safe_int(value: Any, default: int = 0) -> int:
     try:
         return int(float(value))
     except (TypeError, ValueError):
         return int(default)
+
+
+def set_storage_power_budget_hard_block(
+    charger: Any,
+    active: bool,
+    *,
+    reason: str = "storage_power_budget_readback_blocked",
+) -> None:
+    """Bindet das Storage-Wattbudget-Veto direkt an den Wallboxtreiber."""
+    if charger is None:
+        return
+    blocked = bool(active)
+    setattr(charger, _STORAGE_HARD_BLOCK_ATTR, blocked)
+    setattr(
+        charger,
+        _STORAGE_HARD_BLOCK_REASON_ATTR,
+        str(reason or "storage_power_budget_readback_blocked") if blocked else "",
+    )
+    if blocked:
+        _silence_stale_charge_output(charger)
+
+
+def _silence_stale_charge_output(charger: Any) -> None:
+    """Verhindert, dass ein alter E3DC-Sollstrom nach dem Veto wieder anläuft."""
+    if hasattr(charger, "_control_generation"):
+        charger._control_generation = int(charger._control_generation or 0) + 1
+    if hasattr(charger, "external_suspended"):
+        charger.external_suspended = True
+    if hasattr(charger, "last_amp"):
+        charger.last_amp = None
+    if hasattr(charger, "last_force_state"):
+        charger.last_force_state = None
+
+
+def _number_is_zero(value: Any) -> bool:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return False
+    return number == number and abs(number) <= 1e-9
+
+
+_EMERGENCY_STOP_ACTIONS = frozenset({
+    "e3dc_emergency_stop",
+    "e3dc_multi_emergency_stop",
+})
+_EMERGENCY_STOP_NESTED_ACTIONS = frozenset({
+    "e3dc_set_extern",
+    "e3dc_set_extern_wire",
+    "e3dc_multi_send_command",
+})
+
+
+def _typed_emergency_stop_payload(payload: Any) -> bool:
+    """Erkennt ausschließlich den flüchtigen E3/DC-Stop 0 A/Abort=1."""
+
+    if not isinstance(payload, dict):
+        return False
+    if not _number_is_zero(payload.get("target_amp")):
+        return False
+    try:
+        force_state = float(payload.get("force_state"))
+    except (TypeError, ValueError):
+        return False
+    return force_state == 1.0 and payload.get("heartbeat") is not True
+
+
+def _is_typed_emergency_output(charger: Any, action: str, payload: Any) -> bool:
+    name = str(action or "").strip().lower()
+    if name in _EMERGENCY_STOP_ACTIONS and _typed_emergency_stop_payload(payload):
+        return True
+    scoped = int(
+        getattr(charger, "_command_gate_emergency_scope_depth", 0) or 0
+    ) > 0
+    if not scoped:
+        return False
+    if name in _EMERGENCY_STOP_NESTED_ACTIONS:
+        return _typed_emergency_stop_payload(payload)
+
+    data = payload if isinstance(payload, dict) else {}
+    try:
+        force_state = float(data.get("force_state"))
+    except (TypeError, ValueError):
+        force_state = None
+    if name in {
+        "goe_set_amp_and_state",
+        "goe_set_amp_and_state_wire",
+        "dummy_set_amp_and_state",
+        "openwb_set_amp_and_state",
+        "openwb_pro_set_amp_and_state",
+    }:
+        return force_state == 1.0
+    if name == "openwb_set_direct_current":
+        return _number_is_zero(data.get("target_amp"))
+    if name.startswith("openwb_http_post"):
+        try:
+            values = parse_qs(
+                str(data.get("post_data") or ""),
+                keep_blank_values=True,
+            )
+        except (TypeError, ValueError):
+            return False
+        return bool(
+            set(values) == {"set_chargemode", "chargepoint_nr"}
+            and values.get("set_chargemode") == ["stop"]
+        )
+    if name.startswith("openwb_http_v1_post"):
+        topic = str(data.get("topic") or "").strip().lower()
+        return bool(
+            topic.endswith("/data/set_current")
+            and _number_is_zero(data.get("message"))
+        )
+    if name.startswith("openwb_modbus_write"):
+        connector = max(1, _safe_int(getattr(charger, "modbus_connector", 1), 1))
+        expected = 10171 + (connector - 1) * 100 + _safe_int(
+            getattr(charger, "modbus_offset", 0), 0
+        )
+        return bool(
+            _safe_int(data.get("address"), -1) == expected
+            and _number_is_zero(data.get("value"))
+        )
+    if name.startswith("openwb_pro_post_control"):
+        return bool(
+            set(data) == {"ampere"}
+            and _number_is_zero(data.get("ampere"))
+        )
+    return False
+
+
+@contextlib.contextmanager
+def emergency_stop_scope(charger: Any) -> Iterator[None]:
+    """Bindet die verschachtelten SET_EXTERN-Rahmen an genau einen NOT-AUS-Aufruf."""
+
+    if charger is None:
+        yield
+        return
+    previous = int(getattr(charger, "_command_gate_emergency_scope_depth", 0) or 0)
+    charger._command_gate_emergency_scope_depth = previous + 1
+    try:
+        yield
+    finally:
+        charger._command_gate_emergency_scope_depth = previous
+
+
+def emergency_stop_scope_active(charger: Any) -> bool:
+    """Meldet ausschließlich den aktuell gebundenen NOT-AUS-Aufruf."""
+
+    return bool(
+        charger is not None
+        and int(
+            getattr(charger, "_command_gate_emergency_scope_depth", 0) or 0
+        ) > 0
+    )
+
+
+def _storage_hard_block_allows_output(
+    *,
+    charger: Any,
+    action: str,
+    payload: Any,
+    default_release: bool,
+    release_type: str,
+) -> bool:
+    """Erlaubt unter Storage-Veto ausschließlich sicher typisierte Ausgänge."""
+
+    name = str(action or "").strip().lower()
+    data = payload if isinstance(payload, dict) else {}
+    user_off_handoff = bool(
+        default_release and release_type == _USER_OFF_RELEASE_TYPE
+    )
+
+    if _is_typed_emergency_output(charger, name, data):
+        return True
+    try:
+        force_state = float(data.get("force_state"))
+    except (TypeError, ValueError):
+        force_state = None
+
+    e3dc_current_actions = {
+        "e3dc_set_amp_sonnenmodus",
+        "e3dc_set_amp_and_state",
+        "e3dc_set_extern",
+        "e3dc_set_extern_wire",
+        "e3dc_multi_set_amp_sonnenmodus",
+        "e3dc_multi_set_amp_and_state",
+        "e3dc_multi_send_command",
+    }
+    if name in e3dc_current_actions:
+        if data.get("heartbeat") is True:
+            return False
+        stop_requested = bool(
+            force_state == 1.0 or _number_is_zero(data.get("target_amp"))
+        )
+        return bool(
+            stop_requested
+            and getattr(charger, "real_charging", None) is True
+        )
+
+    absolute_current_actions = {
+        "goe_set_amp_and_state",
+        "goe_set_amp_and_state_wire",
+        "dummy_set_amp_and_state",
+        "openwb_set_amp_and_state",
+        "openwb_set_direct_current",
+        "openwb_pro_set_amp_and_state",
+    }
+    if name in absolute_current_actions:
+        if force_state == 1.0:
+            return True
+        if name.startswith(("openwb_", "openwb_pro_")):
+            return _number_is_zero(data.get("target_amp"))
+        return bool(user_off_handoff and force_state == 0.0)
+    if user_off_handoff and name in {
+        "dummy_release_to_default",
+        "openwb_set_pv_mode",
+    }:
+        return True
+    if name.startswith("openwb_http_post"):
+        try:
+            values = parse_qs(str(data.get("post_data") or ""), keep_blank_values=True)
+        except (TypeError, ValueError):
+            return False
+        if set(values) != {"set_chargemode", "chargepoint_nr"}:
+            return False
+        mode = values.get("set_chargemode")
+        return bool(mode == ["stop"] or (user_off_handoff and mode == ["pv"]))
+    if name.startswith("openwb_http_v1_post"):
+        topic = str(data.get("topic") or "").strip().lower()
+        return topic.endswith("/data/set_current") and _number_is_zero(data.get("message"))
+    if name.startswith("openwb_modbus_write"):
+        connector = max(1, _safe_int(getattr(charger, "modbus_connector", 1), 1))
+        expected = 10171 + (connector - 1) * 100 + _safe_int(
+            getattr(charger, "modbus_offset", 0), 0
+        )
+        return bool(
+            _safe_int(data.get("address"), -1) == expected
+            and _number_is_zero(data.get("value"))
+        )
+    if name == "openwb_pro_set_heartbeat":
+        return data.get("enabled") is False
+    if name.startswith("openwb_pro_post_control"):
+        if set(data) == {"ampere"}:
+            return _number_is_zero(data.get("ampere"))
+        if set(data) == {"heartbeatenabled"}:
+            return str(data.get("heartbeatenabled") or "").lower() in {"0", "false", "off"}
+    return False
 
 
 def _compact_payload(payload: Any) -> Any:
@@ -66,6 +317,10 @@ def audit_event(charger: Any, *, action: str, decision: str, reason: str = "", p
         "driver": ctx.get("driver") or charger.__class__.__name__,
         "mode": ctx.get("mode"),
         "native_enabled": ctx.get("native_enabled"),
+        "storage_power_budget_hard_block": bool(
+            getattr(charger, _STORAGE_HARD_BLOCK_ATTR, False)
+            or ctx.get("storage_power_budget_hard_block") is True
+        ),
         "owner": owner or ctx.get("owner") or "wallbox_manager",
         "action": str(action or ""),
         "decision": str(decision or ""),
@@ -166,11 +421,41 @@ def _normalize_runtime_validation(value: Any) -> Dict[str, Any]:
 def _validate_runtime_context(charger: Any, ctx: Dict[str, Any], owner: str) -> Dict[str, Any]:
     """Prüft Kontext und Owner unmittelbar vor einem ausgehenden Schreibzug erneut."""
     if not bool(ctx.get("runtime_validation_required", False)):
-        return {"valid": True, "reason": "legacy_local_gate"}
+        return {
+            "valid": True,
+            "reason": "legacy_local_gate",
+            "authority_confirmed": False,
+        }
+
+    # Die Anlagenrollen-/HA-Autorität muss vor allen kurzlebigen lokalen
+    # Owner-/TTL-Prüfungen ausgewertet werden. Andernfalls könnte ein Ablauf
+    # der 30-s-Lease den harten Shadow-/HA-Block im Emergency-Zweig verdecken.
+    validator = ctx.get("runtime_validator")
+    if not callable(validator):
+        return {
+            "valid": False,
+            "reason": "runtime_validator_missing",
+            "authority_confirmed": False,
+            "hard_authority_block": True,
+        }
+    try:
+        runtime = _normalize_runtime_validation(validator())
+    except Exception:
+        return {
+            "valid": False,
+            "reason": "runtime_validator_exception",
+            "authority_confirmed": False,
+            "hard_authority_block": True,
+        }
+    if runtime.get("hard_authority_block") is True:
+        runtime["valid"] = False
+        runtime["authority_confirmed"] = False
+        return runtime
 
     expected_owner = str(ctx.get("owner") or "")
     if not expected_owner or expected_owner != str(owner or ""):
-        return {"valid": False, "reason": "owner_mismatch"}
+        runtime.update({"valid": False, "reason": "owner_mismatch"})
+        return runtime
 
     lease_expires = ctx.get("owner_lease_expires_ts")
     try:
@@ -178,15 +463,9 @@ def _validate_runtime_context(charger: Any, ctx: Dict[str, Any], owner: str) -> 
     except (TypeError, ValueError):
         lease_valid = False
     if not lease_valid or ctx.get("owner_lease_token") is None:
-        return {"valid": False, "reason": "owner_lease_expired_or_missing"}
-
-    validator = ctx.get("runtime_validator")
-    if not callable(validator):
-        return {"valid": False, "reason": "runtime_validator_missing"}
-    try:
-        return _normalize_runtime_validation(validator())
-    except Exception:
-        return {"valid": False, "reason": "runtime_validator_exception"}
+        runtime.update({"valid": False, "reason": "owner_lease_expired_or_missing"})
+        return runtime
+    return runtime
 
 
 def _perform_safe_handoff(charger: Any, ctx: Dict[str, Any], reason: str) -> Dict[str, Any]:
@@ -267,13 +546,21 @@ def default_release_scope(charger: Any, *, reason: str = "mode0_user_switch") ->
         return
     prev_allowed = bool(getattr(charger, "_command_gate_default_release", False))
     prev_reason = getattr(charger, "_command_gate_release_reason", "")
+    prev_release_type = getattr(charger, "_command_gate_release_type", "")
+    release_reason = str(reason or "mode0_user_switch")
     charger._command_gate_default_release = True
-    charger._command_gate_release_reason = str(reason or "mode0_user_switch")
+    charger._command_gate_release_reason = release_reason
+    charger._command_gate_release_type = (
+        _USER_OFF_RELEASE_TYPE
+        if release_reason == "mode0_user_switch"
+        else "other_default_release"
+    )
     try:
         yield
     finally:
         charger._command_gate_default_release = prev_allowed
         charger._command_gate_release_reason = prev_reason
+        charger._command_gate_release_type = prev_release_type
 
 
 def allow_command(
@@ -291,6 +578,65 @@ def allow_command(
     produktive Manager setzt in jedem Zyklus einen vollständigen Kontext.
     """
     ctx = getattr(charger, "_command_gate_context", None)
+    emergency_output = bool(
+        str(owner or "") == "wallbox_manager"
+        and _is_typed_emergency_output(charger, action, payload)
+    )
+    if emergency_output:
+        runtime_reason = "missing_or_invalid_command_context"
+        runtime_valid = False
+        runtime = {"valid": False, "reason": runtime_reason}
+        if isinstance(ctx, dict) and ctx:
+            runtime = _validate_runtime_context(charger, ctx, owner)
+            runtime_valid = bool(runtime.get("valid", False))
+            runtime_reason = str(
+                runtime.get("reason")
+                or ("runtime_valid" if runtime_valid else "runtime_context_invalid")
+            )
+        if (
+            runtime.get("hard_authority_block") is True
+            or runtime.get("authority_confirmed") is not True
+        ):
+            return _block_invalid_runtime(
+                charger,
+                ctx if isinstance(ctx, dict) else {},
+                action=action,
+                payload=payload,
+                owner=owner,
+                reason=(
+                    runtime_reason
+                    if runtime.get("hard_authority_block") is True
+                    else "runtime_authority_unconfirmed"
+                ),
+            )
+        storage_blocked = getattr(charger, _STORAGE_HARD_BLOCK_ATTR, False) is True
+        charger._command_gate_runtime_status = {
+            "valid": runtime_valid,
+            "reason": runtime_reason,
+            "action": str(action or ""),
+            "emergency_override": True,
+            "ts": time.time(),
+        }
+        charger._command_gate_storage_status = {
+            "active": storage_blocked,
+            "allowed": True,
+            "reason": str(
+                getattr(charger, _STORAGE_HARD_BLOCK_REASON_ATTR, "")
+                or "typed_emergency_stop"
+            ),
+            "action": str(action or ""),
+            "ts": time.time(),
+        }
+        if audit_allowed:
+            audit_event(
+                charger,
+                action=action,
+                decision="emergency_allowed",
+                reason="typed_emergency_stop:%s" % runtime_reason,
+                payload=payload,
+                owner=owner,
+            )
+        return True
     if not isinstance(ctx, dict) or not ctx:
         audit_event(
             charger,
@@ -329,6 +675,7 @@ def allow_command(
     observe_only = bool(ctx.get("observe_only", False))
     default_release = is_default_release_allowed(charger)
     release_reason = getattr(charger, "_command_gate_release_reason", reason or "")
+    release_type = str(getattr(charger, "_command_gate_release_type", "") or "")
 
     if observe_only and not default_release:
         audit_event(
@@ -347,6 +694,40 @@ def allow_command(
             action=action,
             decision="blocked",
             reason=reason or "ngna_observe_only",
+            payload=payload,
+            owner=owner,
+        )
+        return False
+
+    storage_blocked = getattr(charger, _STORAGE_HARD_BLOCK_ATTR, False) is True
+    storage_reason = str(
+        getattr(charger, _STORAGE_HARD_BLOCK_REASON_ATTR, "")
+        or "storage_power_budget_readback_blocked"
+    )
+    storage_output_allowed = bool(
+        not storage_blocked
+        or _storage_hard_block_allows_output(
+            charger=charger,
+            action=action,
+            payload=payload,
+            default_release=default_release,
+            release_type=release_type,
+        )
+    )
+    charger._command_gate_storage_status = {
+        "active": storage_blocked,
+        "allowed": storage_output_allowed,
+        "reason": storage_reason,
+        "action": str(action or ""),
+        "ts": time.time(),
+    }
+    if not storage_output_allowed:
+        _silence_stale_charge_output(charger)
+        audit_event(
+            charger,
+            action=action,
+            decision="blocked",
+            reason=storage_reason,
             payload=payload,
             owner=owner,
         )

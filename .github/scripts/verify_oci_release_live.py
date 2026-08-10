@@ -7,6 +7,8 @@ import json
 import re
 import subprocess
 import sys
+import tarfile
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "Tools"))
@@ -28,6 +30,90 @@ def run(*args: str) -> str:
 
 def first_json(command: list[str]):
     return json.loads(run(*command))
+
+
+def _portable_owner_errors(
+    members,
+    platform: str,
+    *,
+    maximum_uid_gid: int = 65535,
+    maximum_details: int = 12,
+) -> list[str]:
+    """Lehnt Rootfs-Eigentümer außerhalb des portablen 16-Bit-Bereichs ab."""
+
+    violations: list[tuple[str, int, int]] = []
+    for member in members:
+        uid = int(member.uid)
+        gid = int(member.gid)
+        if 0 <= uid <= maximum_uid_gid and 0 <= gid <= maximum_uid_gid:
+            continue
+        path = str(member.name).replace("\n", "?").replace("\r", "?")[:160]
+        violations.append((path, uid, gid))
+
+    errors = [
+        f"Rootfs UID/GID {platform}: {path} uid={uid} gid={gid}"
+        for path, uid, gid in violations[:maximum_details]
+    ]
+    hidden = len(violations) - len(errors)
+    if hidden > 0:
+        errors.append(f"Rootfs UID/GID {platform}: {hidden} weitere Einträge")
+    return errors
+
+
+def _runtime_layer_owner_errors(image_reference: str, platform: str) -> list[str]:
+    """Prüft jedes gespeicherte Image-Layer ohne Container-Ausführung."""
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="e3dc-oci-layer-check-") as temp_dir:
+            archive_path = Path(temp_dir) / "image.tar"
+            run(
+                "docker",
+                "image",
+                "save",
+                "--output",
+                str(archive_path),
+                image_reference,
+            )
+            with tarfile.open(archive_path, mode="r:*") as image_archive:
+                manifest_stream = image_archive.extractfile("manifest.json")
+                if manifest_stream is None:
+                    raise ValueError("manifest.json ist keine reguläre Datei")
+                with manifest_stream:
+                    manifest = json.load(manifest_stream)
+                if not isinstance(manifest, list) or len(manifest) != 1:
+                    raise ValueError("manifest.json muss genau ein Image enthalten")
+                layers = manifest[0].get("Layers") if isinstance(manifest[0], dict) else None
+                if (
+                    not isinstance(layers, list)
+                    or not layers
+                    or any(not isinstance(layer, str) or not layer for layer in layers)
+                    or len(layers) != len(set(layers))
+                ):
+                    raise ValueError("manifest.json enthält keine eindeutige Layer-Liste")
+
+                errors: list[str] = []
+                for index, layer_name in enumerate(layers, start=1):
+                    layer_stream = image_archive.extractfile(layer_name)
+                    if layer_stream is None:
+                        raise ValueError(f"Layer {index} ist keine reguläre Datei")
+                    with layer_stream, tarfile.open(fileobj=layer_stream, mode="r:*") as layer:
+                        errors.extend(
+                            _portable_owner_errors(
+                                layer,
+                                f"{platform} layer {index}/{len(layers)}",
+                            )
+                        )
+                return errors
+    except (
+        json.JSONDecodeError,
+        KeyError,
+        OSError,
+        RuntimeError,
+        tarfile.TarError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        return [f"Image layer owner check {platform}: {exc}"]
 
 
 def _sbom_count(value) -> int:
@@ -153,6 +239,9 @@ def main(argv: list[str]) -> int:
         except (RuntimeError, json.JSONDecodeError) as exc:
             collection_errors.append(f"runtime inspect {name}: {exc}")
             continue
+        collection_errors.extend(
+            _runtime_layer_owner_errors(f"{image}@{digest}", name)
+        )
         runtimes.append({"platform": name, "digest": digest, "labels": labels})
         runtime_by_digest[digest] = name
 

@@ -69,7 +69,7 @@ def manual_soc_vehicle_identity(
     ramdisk_dir=None,
     now_ts=None,
 ):
-    """Return the current manager's fresh per-wallbox identity fallback."""
+    """Liefere SoC-/Profilmetadaten, niemals eine Stecksession-Bestätigung."""
 
     try:
         cid = int(charger_id or 1)
@@ -108,31 +108,28 @@ def session_vehicle_key_from_status(
     ramdisk_dir=None,
     now_ts=None,
 ):
-    """Return the existing live-first, manual-fallback vehicle session key."""
+    """Liefere nur den bestätigten Schlüssel der aktuellen Stecksession.
 
-    st = status or {}
-    live_key = compact_vehicle_identifier(
-        st.get("car_id")
-        or st.get("vehicle_id")
-        or st.get("rfid_tag")
+    Die alten Manual-/SoC-Parameter bleiben vorerst Teil der kompatiblen
+    Aufruffläche, werden aber absichtlich nicht mehr als Identitätsbeweis
+    verwendet.
+    """
+
+    _ = (
+        charger_id,
+        manual_identity,
+        manual_identity_loader,
+        ramdisk_dir,
+        now_ts,
     )
-    if live_key:
-        return live_key
-    identity = manual_identity
-    if identity is None:
-        if callable(manual_identity_loader):
-            identity = manual_identity_loader(charger_id)
-        else:
-            identity = manual_soc_vehicle_identity(
-                charger_id,
-                ramdisk_dir=ramdisk_dir,
-                now_ts=now_ts,
-            )
-    return compact_vehicle_identifier(
-        identity.get("car_id")
-        or identity.get("vehicle_id")
-        or identity.get("rfid_tag")
-    )
+    identity = wallbox_decision.confirmed_session_vehicle_identity(status)
+    return str(identity.get("key") or "")
+
+
+def confirmed_session_vehicle_identity(status=None):
+    """Delegiere den reinen Sitzungsidentitätsvertrag."""
+
+    return wallbox_decision.confirmed_session_vehicle_identity(status)
 
 
 def vehicle_max_ac_phases(config, charger_id, status=None, profiles=None):
@@ -147,6 +144,16 @@ def vehicle_max_ac_phases(config, charger_id, status=None, profiles=None):
     )
 
 
+def vehicle_phase_capability(status=None, profiles=None):
+    """Liefere den expliziten, sitzungsgebundenen Fahrzeug-Phasenbeleg."""
+
+    profile_list = load_saved_car_profiles() if profiles is None else profiles
+    return wallbox_decision.vehicle_phase_capability_from_profiles(
+        profile_list,
+        status,
+    )
+
+
 def vehicle_max_ac_power_kw(config, charger_id, status=None, profiles=None):
     """Liefere nur eine profil- oder OBC-gebundene AC-Leistungsgrenze."""
 
@@ -156,6 +163,23 @@ def vehicle_max_ac_power_kw(config, charger_id, status=None, profiles=None):
         charger_id,
         profile_list,
         status,
+    )
+
+
+def vehicle_current_capability(
+    charger_id,
+    phase_count,
+    status=None,
+    profiles=None,
+):
+    """Liefere den bestätigten phasenabhängigen Fahrzeug-Stromdeckel."""
+
+    _ = charger_id
+    profile_list = load_saved_car_profiles() if profiles is None else profiles
+    return wallbox_decision.vehicle_current_capability_from_profiles(
+        profile_list,
+        status,
+        phase_count=phase_count,
     )
 
 
@@ -191,8 +215,50 @@ class VehicleManager:
         charger_class="",
         write_status=None,
     ):
-        """Wende den bisherigen Tracker-Patch 1:1 auf den WB-Status an."""
+        """Wende den Tracker-Patch an, ohne aktuelle Treiber-Reichweiten zu verdrängen."""
 
+        explicit_total_range = wallbox_soc_tracker.current_explicit_openwb_total_range(
+            status,
+        )
+        explicit_charged_range = wallbox_soc_tracker.current_explicit_openwb_charged_range(
+            status,
+        )
+        # Eine verworfene explizite Reichweite darf auch dann nicht sichtbar
+        # bleiben, wenn ohne Profil kein rechnerischer Fallback möglich ist.
+        reported_total_source = str(status.get("car_range_source") or "").strip().lower()
+        invalid_total_range = bool(
+            status.get("car_range_valid") is True
+            and reported_total_source in wallbox_soc_tracker.OPENWB_EXPLICIT_TOTAL_RANGE_SOURCES
+            and explicit_total_range is None
+        )
+        if invalid_total_range:
+            status.update({
+                "car_range": 0.0,
+                "range_km": 0.0,
+                "car_range_source": "",
+                "car_range_valid": False,
+                "car_range_observed_ts": 0,
+                "car_range_source_ts": None,
+                "car_range_source_ts_explicit": False,
+                "car_range_vehicle_key": "",
+            })
+        reported_charged_source = str(status.get("car_charged_range_source") or "").strip().lower()
+        invalid_charged_range = bool(
+            status.get("car_charged_range_valid") is True
+            and reported_charged_source in wallbox_soc_tracker.OPENWB_EXPLICIT_CHARGED_RANGE_SOURCES
+            and explicit_charged_range is None
+        )
+        if invalid_charged_range:
+            status.update({
+                "car_charged_range": 0.0,
+                "charged_range_km": 0.0,
+                "car_charged_range_source": "",
+                "car_charged_range_valid": False,
+                "car_charged_range_observed_ts": 0,
+                "car_charged_range_source_ts": None,
+                "car_charged_range_source_ts_explicit": False,
+                "car_charged_range_vehicle_key": "",
+            })
         soc_info = self.update(
             wb_id,
             config,
@@ -200,6 +266,11 @@ class VehicleManager:
             charger_class=charger_class,
         )
         if not soc_info:
+            if (invalid_total_range or invalid_charged_range) and write_status is not None:
+                try:
+                    write_status()
+                except Exception:
+                    pass
             return soc_info
         status["car_soc"] = soc_info.get("soc", status.get("car_soc", 0))
         status["car_soc_source"] = soc_info.get(
@@ -213,28 +284,85 @@ class VehicleManager:
         status["car_soc_rule_confirmed"] = bool(
             soc_info.get("soc_rule_confirmed", False)
         )
-        status["car_id"] = soc_info.get("car_id", status.get("car_id"))
-        status["vehicle_id"] = soc_info.get(
-            "vehicle_id",
-            status.get("vehicle_id"),
+        # Profil-/Cloud-/SoC-Zuordnung bleibt ein eigener Diagnosebereich.
+        # Sie darf die vom Treiber gelieferte aktuelle Stecksession-ID nicht
+        # ersetzen und damit keinen OBC-Hardcap aktivieren.
+        status["car_soc_profile_id"] = soc_info.get(
+            "profile_id",
+            soc_info.get("car_id", ""),
+        )
+        status["car_soc_vehicle_id"] = soc_info.get("vehicle_id", "")
+        status["car_soc_profile_bound"] = bool(
+            soc_info.get("soc_profile_bound", False)
+        )
+        status["car_soc_identity_scope"] = str(
+            soc_info.get("identity_scope", "soc_profile_only") or "soc_profile_only"
         )
         status["car_name"] = soc_info.get("name", status.get("car_name", ""))
         status["car_capacity_kwh"] = soc_info.get(
             "capacity",
             status.get("car_capacity_kwh", 0.0),
         )
-        if float(soc_info.get("range_km") or 0.0) > 0.0:
-            status["car_range"] = float(soc_info.get("range_km") or 0.0)
+        candidate_range = float(soc_info.get("range_km") or 0.0)
+        candidate_range_source = str(soc_info.get("range_source") or "wallbox_estimated_consumption")
+        if explicit_total_range:
+            range_info = explicit_total_range
+        elif candidate_range > 0.0:
+            range_info = {
+                "range_km": candidate_range,
+                "range_source": candidate_range_source,
+                "range_observed_ts": soc_info.get("range_observed_ts", 0),
+                "range_source_ts": soc_info.get("range_source_ts"),
+                "range_source_ts_explicit": bool(
+                    soc_info.get("range_source_ts_explicit", False)
+                ),
+                "range_vehicle_key": soc_info.get("range_vehicle_key", ""),
+                "range_explicit": bool(soc_info.get("range_explicit", False)),
+            }
+        else:
+            range_info = None
+        if range_info:
+            status["car_range"] = float(range_info["range_km"])
             status["range_km"] = status["car_range"]
-            status["car_range_source"] = soc_info.get(
-                "range_source",
-                "wallbox_estimated_consumption",
+            status["car_range_source"] = str(range_info["range_source"])
+            status["car_range_valid"] = bool(range_info.get("range_explicit", False))
+            status["car_range_observed_ts"] = int(range_info.get("range_observed_ts") or 0)
+            status["car_range_source_ts"] = range_info.get("range_source_ts")
+            status["car_range_source_ts_explicit"] = bool(
+                range_info.get("range_source_ts_explicit", False)
             )
-        if float(soc_info.get("charged_range_km") or 0.0) > 0.0:
-            status["car_charged_range"] = float(
-                soc_info.get("charged_range_km") or 0.0
-            )
+            status["car_range_vehicle_key"] = str(range_info.get("range_vehicle_key") or "")
+
+        candidate_charged_present = "charged_range_km" in soc_info
+        candidate_charged = float(soc_info.get("charged_range_km") or 0.0)
+        candidate_charged_source = str(soc_info.get("charged_range_source") or "wallbox_estimated_consumption")
+        if explicit_charged_range:
+            charged_info = explicit_charged_range
+        elif candidate_charged_present and candidate_charged >= 0.0:
+            charged_info = {
+                "range_km": candidate_charged,
+                "range_source": candidate_charged_source,
+                "range_observed_ts": soc_info.get("charged_range_observed_ts", 0),
+                "range_source_ts": soc_info.get("charged_range_source_ts"),
+                "range_source_ts_explicit": bool(
+                    soc_info.get("charged_range_source_ts_explicit", False)
+                ),
+                "range_vehicle_key": soc_info.get("charged_range_vehicle_key", ""),
+                "range_explicit": bool(soc_info.get("charged_range_explicit", False)),
+            }
+        else:
+            charged_info = None
+        if charged_info:
+            status["car_charged_range"] = float(charged_info["range_km"])
             status["charged_range_km"] = status["car_charged_range"]
+            status["car_charged_range_source"] = str(charged_info["range_source"])
+            status["car_charged_range_valid"] = bool(charged_info.get("range_explicit", False))
+            status["car_charged_range_observed_ts"] = int(charged_info.get("range_observed_ts") or 0)
+            status["car_charged_range_source_ts"] = charged_info.get("range_source_ts")
+            status["car_charged_range_source_ts_explicit"] = bool(
+                charged_info.get("range_source_ts_explicit", False)
+            )
+            status["car_charged_range_vehicle_key"] = str(charged_info.get("range_vehicle_key") or "")
         if float(soc_info.get("consumption_kwh_100km") or 0.0) > 0.0:
             status["car_consumption_kwh_100km"] = float(
                 soc_info.get("consumption_kwh_100km") or 0.0
@@ -307,10 +435,35 @@ class VehicleManager:
         )
 
     @staticmethod
+    def vehicle_phase_capability(status=None, profiles=None):
+        return vehicle_phase_capability(
+            status=status,
+            profiles=profiles,
+        )
+
+    @staticmethod
+    def confirmed_session_vehicle_identity(status=None):
+        return confirmed_session_vehicle_identity(status)
+
+    @staticmethod
     def vehicle_max_ac_power_kw(config, charger_id, status=None, profiles=None):
         return vehicle_max_ac_power_kw(
             config,
             charger_id,
+            status=status,
+            profiles=profiles,
+        )
+
+    @staticmethod
+    def vehicle_current_capability(
+        charger_id,
+        phase_count,
+        status=None,
+        profiles=None,
+    ):
+        return vehicle_current_capability(
+            charger_id,
+            phase_count,
             status=status,
             profiles=profiles,
         )
@@ -320,10 +473,13 @@ __all__ = [
     "VehicleManager",
     "VehicleSocTracker",
     "compact_vehicle_identifier",
+    "confirmed_session_vehicle_identity",
     "load_saved_car_profiles",
     "manual_soc_vehicle_identity",
     "resolve_vehicle_profile",
     "session_vehicle_key_from_status",
+    "vehicle_current_capability",
+    "vehicle_phase_capability",
     "vehicle_max_ac_phases",
     "vehicle_max_ac_power_kw",
 ]

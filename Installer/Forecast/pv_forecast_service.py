@@ -233,6 +233,18 @@ PV_BIAS_MIN_CONFIRMATIONS = 1
 PV_BIAS_SCHEMA3_GUARD_WINDOW_DAYS = 14
 PV_BIAS_SCHEMA3_VISIBLE_OVERSHOOT = 0.97
 PV_BIAS_SCHEMA3_GUARD_MARGIN = 1.06
+FORECAST_ISSUE_SCHEMA = "pv_forecast_issue_v1"
+FORECAST_SOURCE_COMPOSITION_SCHEMA = "pv_forecast_source_composition_v1"
+FORECAST_VALUE_STAGE = "displayed_postprocessed"
+FORECAST_DISTRIBUTION_TYPE = "deterministic_point"
+FORECAST_PRODUCER_TIME_BASIS = "producer_output_generation_utc_v1"
+PV_ZERO_EVIDENCE_SCHEMA = "pv_zero_evidence_v1"
+PV_ZERO_EVIDENCE_REASON = "ASTRONOMICAL_NIGHT"
+PV_ZERO_SOLAR_WINDOW_SCHEMA = "pv_forecast_solar_window_v1"
+# Die bestehende Sonnenfensterformel arbeitet in lokaler Standardzeit. Der
+# konservative Abstand deckt Sommerzeit, Gleichung der Zeit, Refraktion und
+# Rundung ab; Grenzslots bleiben bewusst ohne Nacht-Null-Beleg.
+PV_ZERO_SOLAR_GUARD_S = 90 * 60
 
 logger = logging.getLogger("EnsemblePVForecaster")
 
@@ -626,6 +638,247 @@ def _slot_kw(slot, *keys):
     return 0.0
 
 
+def _canonical_json_bytes(value):
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _sha256_revision(value):
+    return "sha256:" + hashlib.sha256(_canonical_json_bytes(value)).hexdigest()
+
+
+def _source_file_revision(path):
+    """Bindet die Forecast-Methode an den tatsächlich laufenden Quelltext."""
+
+    try:
+        with open(path, "rb") as handle:
+            return "sha256:" + hashlib.sha256(handle.read()).hexdigest()
+    except (OSError, ValueError):
+        return None
+
+
+FORECAST_METHOD_REVISION = _source_file_revision(__file__)
+
+
+def _atomic_write_json(path, payload):
+    """Publiziert JSON im Zielverzeichnis atomar und erhält den Dateimodus."""
+
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    if os.path.lexists(path) and os.path.islink(path):
+        raise OSError("forecast_target_symlink")
+    try:
+        target_mode = os.stat(path, follow_symlinks=False).st_mode & 0o777
+    except FileNotFoundError:
+        target_mode = 0o644
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        indent=2,
+        allow_nan=False,
+    ).encode("utf-8")
+    descriptor, temporary_path = tempfile.mkstemp(
+        prefix=".pv_forecast.",
+        suffix=".tmp",
+        dir=directory,
+    )
+    try:
+        os.fchmod(descriptor, target_mode)
+        with os.fdopen(descriptor, "wb", closefd=True) as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+        os.chmod(path, target_mode, follow_symlinks=False)
+    finally:
+        if os.path.exists(temporary_path):
+            os.unlink(temporary_path)
+
+
+def _forecast_target_slot_material(slots):
+    material = []
+    for slot in slots or []:
+        try:
+            start_ms = int(slot.get("start_timestamp"))
+            end_ms = int(slot.get("end_timestamp"))
+        except (TypeError, ValueError):
+            continue
+        material.append({
+            "slot_start_utc_s": int(round(start_ms / 1000.0)),
+            "slot_end_utc_s": int(round(end_ms / 1000.0)),
+        })
+    material.sort(key=lambda item: (item["slot_start_utc_s"], item["slot_end_utc_s"]))
+    return material
+
+
+def _forecast_source_composition(
+    *,
+    models,
+    resource_models,
+    model_freshness,
+    configured,
+):
+    providers = {
+        "m1": "forecast_solar",
+        "m2": "open_meteo_icon_ecmwf_ensemble",
+        "m3": "solcast",
+    }
+    sources = []
+    for model_id in ("m1", "m2", "m3"):
+        model_values = dict((models or {}).get(model_id) or {})
+        resource_values = dict((resource_models or {}).get(model_id) or {})
+        freshness = dict((model_freshness or {}).get(model_id) or {})
+        sources.append({
+            "model_id": model_id,
+            "provider": providers[model_id],
+            "configured": bool((configured or {}).get(model_id)),
+            "available": bool(model_values),
+            "fresh": freshness.get("fresh") is True,
+            "freshness_source": str(
+                freshness.get("source") or "model_provenance_unknown"
+            )[:96],
+            "model_input_revision": _sha256_revision(model_values),
+            "resource_input_revision": _sha256_revision(resource_values),
+        })
+    return {
+        "schema_version": FORECAST_SOURCE_COMPOSITION_SCHEMA,
+        "sources": sources,
+    }
+
+
+def build_forecast_issue_contract(
+    slots,
+    *,
+    issued_at_utc_s,
+    models,
+    resource_models,
+    model_freshness,
+    configured,
+):
+    """Erzeugt den unveränderlichen Producer-Vertrag der sichtbaren Ausgabe.
+
+    Unbekannte Revisionen bleiben ausdrücklich ``None`` mit
+    ``EVIDENCE_LIMIT``. Weder ein Punktwert noch die Dateizeit wird dabei als
+    Quantil beziehungsweise Producer-Ausgabezeit umgedeutet.
+    """
+
+    issued_at = int(issued_at_utc_s or 0)
+    target_slots = _forecast_target_slot_material(slots)
+    topology_revisions = {
+        str(slot.get("pv_topology_revision") or "").strip()
+        for slot in (slots or [])
+        if str(slot.get("pv_topology_status") or "") == "bound"
+    }
+    topology_revisions.discard("")
+    all_slots_bound = bool(slots) and all(
+        str(slot.get("pv_topology_status") or "") == "bound"
+        for slot in slots
+    )
+    topology_revision = (
+        next(iter(topology_revisions))
+        if all_slots_bound and len(topology_revisions) == 1
+        else None
+    )
+    source_composition = _forecast_source_composition(
+        models=models,
+        resource_models=resource_models,
+        model_freshness=model_freshness,
+        configured=configured,
+    )
+    source_composition_revision = _sha256_revision(source_composition)
+    # Die Anbieter liefern hier keine belastbar ausgewiesene externe
+    # Modell-/Ensemble-Version. Der Hash der Eingabedaten bleibt deshalb
+    # ausschließlich in source_composition/model_input_revision gebunden und
+    # wird nicht zur Modellrevision umgedeutet.
+    model_revision = None
+    method_revision = FORECAST_METHOD_REVISION
+    postprocessing_revision = _sha256_revision({
+        "schema_version": "pv_forecast_postprocessed_payload_v1",
+        "value_stage": FORECAST_VALUE_STAGE,
+        "slots": slots,
+    }) if slots else None
+    target_slots_revision = _sha256_revision(target_slots) if target_slots else None
+
+    producer_time_status = "complete" if issued_at > 0 else "EVIDENCE_LIMIT"
+    topology_status = (
+        "complete"
+        if isinstance(topology_revision, str)
+        and topology_revision.startswith("sha256:")
+        and len(topology_revision) == 71
+        else "EVIDENCE_LIMIT"
+    )
+    model_status = "EVIDENCE_LIMIT"
+    method_status = "complete" if method_revision else "EVIDENCE_LIMIT"
+    postprocessing_status = (
+        "complete" if postprocessing_revision else "EVIDENCE_LIMIT"
+    )
+    source_status = (
+        "complete" if source_composition_revision else "EVIDENCE_LIMIT"
+    )
+    target_status = "complete" if target_slots_revision else "EVIDENCE_LIMIT"
+    status = (
+        "complete"
+        if all(
+            item == "complete"
+            for item in (
+                producer_time_status,
+                topology_status,
+                model_status,
+                method_status,
+                postprocessing_status,
+                source_status,
+                target_status,
+            )
+        )
+        else "EVIDENCE_LIMIT"
+    )
+    material = {
+        "schema_version": FORECAST_ISSUE_SCHEMA,
+        "status": status,
+        "producer": "pv_forecast_service",
+        "producer_issued_at_utc_s": issued_at if issued_at > 0 else None,
+        "producer_issue_time_basis": FORECAST_PRODUCER_TIME_BASIS,
+        "producer_issue_time_status": producer_time_status,
+        "model_revision": model_revision,
+        "model_revision_status": model_status,
+        "method_revision": method_revision,
+        "method_revision_status": method_status,
+        "postprocessing_revision": postprocessing_revision,
+        "postprocessing_revision_status": postprocessing_status,
+        "topology_revision": topology_revision,
+        "topology_revision_status": topology_status,
+        "source_composition": source_composition,
+        "source_composition_revision": source_composition_revision,
+        "source_composition_status": source_status,
+        "value_stage": FORECAST_VALUE_STAGE,
+        "distribution_type": FORECAST_DISTRIBUTION_TYPE,
+        "declared_quantile": None,
+        "quantile_convention": None,
+        "target_slot_count": len(target_slots),
+        "target_slot_start_utc_s": (
+            target_slots[0]["slot_start_utc_s"] if target_slots else None
+        ),
+        "target_slot_end_utc_s": (
+            target_slots[-1]["slot_end_utc_s"] if target_slots else None
+        ),
+        "target_slots_revision": target_slots_revision,
+        "target_slots_status": target_status,
+        "control_effect": False,
+        "configuration_writes": False,
+        "automatic_model_selection": False,
+        "decision_use_allowed": False,
+    }
+    return {
+        **material,
+        "issue_id": _sha256_revision(material),
+    }
+
+
 def _slots_energy_kwh(slots, field="predicted_kwh"):
     total = 0.0
     for slot in slots or []:
@@ -700,6 +953,48 @@ class EnsemblePVForecaster:
         # Favorisiere v4_config für Standortdaten
         self.lat = float(self.v4_config.get('hoehe', self.config.get('hoehe', 48.6)))
         self.lon = float(self.v4_config.get('laenge', self.config.get('laenge', 13.4)))
+        def configured_coordinate_present(source, key):
+            return bool(
+                key in source
+                and source.get(key) is not None
+                and str(source.get(key)).strip()
+            )
+        location_explicit = bool(
+            configured_coordinate_present(self.v4_config, "hoehe")
+            or configured_coordinate_present(self.config, "hoehe")
+        ) and bool(
+            configured_coordinate_present(self.v4_config, "laenge")
+            or configured_coordinate_present(self.config, "laenge")
+        )
+        self._solar_location_valid = bool(
+            location_explicit
+            and math.isfinite(self.lat)
+            and math.isfinite(self.lon)
+            and -66.0 <= self.lat <= 66.0
+            and -180.0 <= self.lon <= 180.0
+        )
+        self._solar_site_revision = (
+            _sha256_revision({
+                "schema_version": "pv_forecast_site_location_v1",
+                "latitude_deg": round(self.lat, 8),
+                "longitude_deg": round(self.lon, 8),
+            })
+            if self._solar_location_valid
+            else None
+        )
+        self._solar_astronomy_revision = (
+            _sha256_revision({
+                "schema_version": PV_ZERO_SOLAR_WINDOW_SCHEMA,
+                "formula": "declination_hour_angle_local_standard_time_v1",
+                "day_of_year_denominator": 364.0,
+                "timezone_center_longitude_deg": 15.0,
+                "solar_guard_s": PV_ZERO_SOLAR_GUARD_S,
+                "method_revision": FORECAST_METHOD_REVISION,
+                "site_revision": self._solar_site_revision,
+            })
+            if self._solar_location_valid and FORECAST_METHOD_REVISION
+            else None
+        )
 
         # Provider-unabhängige lokale Geometrie.  Explizite Generatorgruppen
         # lösen FC1..3 als Datenmodell ab; die alte Syntax bleibt Lesefallback.
@@ -942,19 +1237,36 @@ class EnsemblePVForecaster:
         )
         self.solcast_ttl_s = self._solcast_dynamic_ttl_s()
 
-    def _solar_window_hours(self, day_date):
+    def _strict_solar_window_hours(self, day_date):
+        """Liefert das Producer-Sonnenfenster ohne Default-/Fehlerfallback."""
+
+        if not self._solar_location_valid:
+            return None
         try:
             doy = day_date.timetuple().tm_yday
             decl = math.radians(23.45 * math.sin(2.0 * math.pi * (doy - 81) / 364.0))
-            lat_r = math.radians(max(-66.0, min(66.0, float(self.lat))))
+            lat_r = math.radians(float(self.lat))
             cos_ha = -math.tan(lat_r) * math.tan(decl)
             cos_ha = max(-0.999, min(0.999, cos_ha))
             ha_h = math.degrees(math.acos(cos_ha)) / 15.0
             timezone_center_lon = 15.0
             solar_noon = 12.0 - ((float(self.lon) - timezone_center_lon) / 15.0)
-            return max(3.0, solar_noon - ha_h), solar_noon, min(22.5, solar_noon + ha_h)
+            window = (
+                max(3.0, solar_noon - ha_h),
+                solar_noon,
+                min(22.5, solar_noon + ha_h),
+            )
+            if not all(math.isfinite(float(value)) for value in window):
+                return None
+            if not window[0] < window[1] < window[2]:
+                return None
+            return window
         except Exception:
-            return 6.0, 12.5, 19.0
+            return None
+
+    def _solar_window_hours(self, day_date):
+        window = self._strict_solar_window_hours(day_date)
+        return window if window is not None else (6.0, 12.5, 19.0)
 
     def _pv_daylight_factor(self, slot_dt):
         sunrise, _solar_noon, sunset = self._solar_window_hours(slot_dt.date())
@@ -963,6 +1275,124 @@ class EnsemblePVForecaster:
             return 0.0
         progress = (hour - sunrise) / max(0.1, sunset - sunrise)
         return max(0.0, math.sin(math.pi * progress))
+
+    def _pv_night_zero_evidence(self, slot, topology_slot):
+        """Belegt ausschließlich eine vollständig dunkle, echte Nullprojektion."""
+
+        if not (
+            self._solar_location_valid
+            and isinstance(self._solar_site_revision, str)
+            and self._solar_site_revision.startswith("sha256:")
+            and isinstance(self._solar_astronomy_revision, str)
+            and self._solar_astronomy_revision.startswith("sha256:")
+            and isinstance(FORECAST_METHOD_REVISION, str)
+            and FORECAST_METHOD_REVISION.startswith("sha256:")
+            and isinstance(slot, dict)
+            and isinstance(topology_slot, dict)
+        ):
+            return None
+        try:
+            start_ms = int(slot.get("start_timestamp"))
+            end_ms = int(slot.get("end_timestamp"))
+        except (TypeError, ValueError):
+            return None
+        if not (
+            end_ms - start_ms == 900_000
+            and start_ms % 900_000 == 0
+            and end_ms % 900_000 == 0
+        ):
+            return None
+        midpoint_ms = start_ms + 450_000
+        probe_ms = (start_ms, midpoint_ms, end_ms - 1)
+        guard_h = PV_ZERO_SOLAR_GUARD_S / 3600.0
+        for timestamp_ms in probe_ms:
+            local_dt = datetime.fromtimestamp(timestamp_ms / 1000.0)
+            window = self._strict_solar_window_hours(local_dt.date())
+            if window is None:
+                return None
+            sunrise, _solar_noon, sunset = window
+            local_hour = (
+                local_dt.hour
+                + local_dt.minute / 60.0
+                + local_dt.second / 3600.0
+                + local_dt.microsecond / 3_600_000_000.0
+            )
+            if not (
+                local_hour <= sunrise - guard_h
+                or local_hour >= sunset + guard_h
+            ):
+                return None
+        midpoint_dt = datetime.fromtimestamp(midpoint_ms / 1000.0)
+        if self._pv_daylight_factor(midpoint_dt) != 0.0:
+            return None
+
+        def exact_zero(value):
+            if isinstance(value, bool) or value is None:
+                return False
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                return False
+            return math.isfinite(number) and number == 0.0
+
+        resources = topology_slot.get("resources")
+        if not isinstance(resources, list) or not resources:
+            return None
+        resource_keys = []
+        resource_total_w = 0.0
+        for resource in resources:
+            if not isinstance(resource, dict):
+                return None
+            resource_key = str(resource.get("resource_key") or "").strip()
+            if not resource_key or resource_key in resource_keys:
+                return None
+            if not exact_zero(resource.get("forecast_w")):
+                return None
+            resource_keys.append(resource_key)
+            resource_total_w += float(resource["forecast_w"])
+
+        topology_revision = str(
+            topology_slot.get("topology_revision") or ""
+        )
+        if not (
+            str(topology_slot.get("status") or "") == "bound"
+            and topology_slot.get("split_usable") is True
+            and str(topology_slot.get("resource_projection_status") or "")
+            == "complete"
+            and topology_revision.startswith("sha256:")
+            and exact_zero(slot.get("predicted_kwh"))
+            and exact_zero(topology_slot.get("total_pv_w"))
+            and exact_zero(topology_slot.get("e3dc_dc_pv_w"))
+            and exact_zero(topology_slot.get("external_ac_pv_w"))
+            and exact_zero(topology_slot.get("external_ac_capped_w"))
+            and resource_total_w == 0.0
+        ):
+            return None
+
+        material = {
+            "schema_version": PV_ZERO_EVIDENCE_SCHEMA,
+            "status": "COMPLETE",
+            "reason": PV_ZERO_EVIDENCE_REASON,
+            "slot_start_ts_ms": start_ms,
+            "slot_end_ts_ms": end_ms,
+            "slot_midpoint_ts_ms": midpoint_ms,
+            "full_slot_night": True,
+            "daylight_factor_midpoint": 0.0,
+            "solar_guard_s": PV_ZERO_SOLAR_GUARD_S,
+            "method_revision": FORECAST_METHOD_REVISION,
+            "site_revision": self._solar_site_revision,
+            "astronomy_revision": self._solar_astronomy_revision,
+            "topology_revision": topology_revision,
+            "pv_total_w": 0.0,
+            "e3dc_dc_pv_w": 0.0,
+            "external_ac_pv_w": 0.0,
+            "resource_count": len(resource_keys),
+            "resource_total_w": 0.0,
+        }
+        return {
+            **material,
+            "evidence_revision": _sha256_revision(material),
+        }
 
     def _solcast_calls_per_day(self, key, default):
         raw = self.v4_config.get(key, self.config.get(key, default))
@@ -1462,18 +1892,38 @@ class EnsemblePVForecaster:
         return conf
 
     def _write_weather_alerts(self, payload):
+        tmp_path = None
         try:
             payload["fetched_at"] = datetime.now().isoformat(timespec='seconds')
             payload["lat"] = round(float(self.lat), 6)
             payload["lon"] = round(float(self.lon), 6)
-            with open(WEATHER_ALERTS_OUTPUT, 'w') as f:
-                json.dump(payload, f, indent=2)
+            directory = os.path.dirname(WEATHER_ALERTS_OUTPUT) or "."
+            fd, tmp_path = tempfile.mkstemp(
+                prefix="weather_alerts.",
+                suffix=".tmp",
+                dir=directory,
+            )
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+                f.write("\n")
+            try:
+                os.chmod(tmp_path, 0o664)
+            except OSError:
+                pass
+            os.replace(tmp_path, WEATHER_ALERTS_OUTPUT)
+            tmp_path = None
             logger.info(
                 "Wetterwarnungen gespeichert: active=%s alerts=%s risk=%s"
                 % (payload.get("active"), len(payload.get("alerts") or []), (payload.get("risk") or {}).get("level"))
             )
         except Exception as e:
             logger.warning(f"Wetterwarnungen konnten nicht gespeichert werden: {e}")
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
 
     def _parse_cap_datetime(self, value):
         if not value:
@@ -2072,7 +2522,13 @@ class EnsemblePVForecaster:
         if successful_fetches == len(self.solcast_configured_sites):
             self._record_model_resource_data("m3", parsed_resource_total)
             self.solcast_status = self._solcast_status("complete_fresh", successful=successful_fetches)
-            logger.info(f"Model 3 (Solcast): {successful_fetches}/{len(self.solcast_sites)} Site(s) vollständig summiert.")
+            logger.info(
+                f"Model 3 (Solcast): {successful_fetches}/{len(self.solcast_sites)} "
+                "Site(s) vollständig summiert.",
+                # Auch eine schnelle Erholung nach HTTP 429/Providerfehler
+                # muss trotz ruhiger Normalprotokollierung sichtbar bleiben.
+                extra={"e3dc_no_throttle": True},
+            )
             return parsed_model_total
         self.solcast_status = self._solcast_status(
             "incomplete_refresh",
@@ -2537,6 +2993,12 @@ class EnsemblePVForecaster:
                 if topology_slot.get("status") == "bound"
                 else "missing_or_incoherent_resource_projection"
             )
+            night_zero_evidence = self._pv_night_zero_evidence(
+                slot,
+                topology_slot,
+            )
+            if night_zero_evidence is not None:
+                slot["pv_zero_evidence"] = night_zero_evidence
             status_key = str(topology_slot.get("status") or "unknown")
             topology_status_counts[status_key] = topology_status_counts.get(status_key, 0) + 1
             topology_slots.append(slot)
@@ -2570,6 +3032,42 @@ class EnsemblePVForecaster:
             )
             return
 
+        typed_forecast = []
+        for slot in ensemble_forecast:
+            slot = dict(slot)
+            slot["forecast_value_stage"] = FORECAST_VALUE_STAGE
+            slot["forecast_distribution_type"] = FORECAST_DISTRIBUTION_TYPE
+            slot["forecast_quantile_level"] = None
+            slot["forecast_quantile_convention"] = None
+            typed_forecast.append(slot)
+        ensemble_forecast = typed_forecast
+        producer_issued_at_utc_s = int(time.time())
+        forecast_issue_contract = build_forecast_issue_contract(
+            ensemble_forecast,
+            issued_at_utc_s=producer_issued_at_utc_s,
+            models={"m1": m1, "m2": m2, "m3": m3},
+            resource_models=resource_models,
+            model_freshness=model_freshness,
+            configured={
+                "m1": use_forecastsolar,
+                "m2": use_openmeteo,
+                "m3": bool(self.solcast_configured_sites),
+            },
+        )
+        issue_id = forecast_issue_contract["issue_id"]
+        ensemble_forecast = [
+            {
+                **slot,
+                "forecast_issue_id": issue_id,
+                **(
+                    {"forecast_issue_contract": forecast_issue_contract}
+                    if index == 0
+                    else {}
+                ),
+            }
+            for index, slot in enumerate(ensemble_forecast)
+        ]
+
         # Speichern in die Ramdisk (nur bei echten Daten)
         try:
             fetched_at = datetime.now().isoformat(timespec='seconds')  # datetime = Klasse
@@ -2579,8 +3077,7 @@ class EnsemblePVForecaster:
                 "models_ok": {"m1": len(m1) > 0, "m2": len(m2) > 0, "m3": len(m3) > 0},
             }
             # Rueckwaertskompatibel: Als flache Liste speichern (wie bisher gelesen)
-            with open(FORECAST_OUTPUT, 'w') as f:
-                json.dump(ensemble_forecast, f, indent=2)
+            _atomic_write_json(FORECAST_OUTPUT, ensemble_forecast)
             # Zusaetzlich Metadaten in separate Datei (fuer Dashboard/Debug)
             meta_path = FORECAST_OUTPUT.replace('.json', '_meta.json')
             # Lade aktuellen Bias-Status fuer Meta-Ausgabe
@@ -2596,6 +3093,7 @@ class EnsemblePVForecaster:
                            "pv_topology_slot_status_counts": topology_status_counts,
                            "calibration": bias_info,
                            "daily_caps": daily_caps,
+                           "forecast_issue_contract": forecast_issue_contract,
                            "forecast_totals": {
                                "schema": "slot_kw_times_0_25h",
                                "full_days": full_day_forecast_totals,
@@ -3610,6 +4108,11 @@ logger = configure_service_logger(
     log_path=_log_file,
     max_bytes=2 * 1024 * 1024,
     backup_count=3,
+    # Das begrenzte Dateilog ist die kanonische persistente Senke. Eine
+    # parallele stderr-/Journal-Kopie würde jeden Provider- und Modellhinweis
+    # doppelt auf den Datenträger schreiben. Ungefangene Prozessfehler bleiben
+    # unabhängig davon über systemd sichtbar.
+    stream=False,
     quiet_interval_s=1800.0,
 )
 

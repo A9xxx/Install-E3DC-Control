@@ -6,6 +6,7 @@ import time
 import json
 import logging
 import inspect
+import hashlib
 import re
 import stat
 import urllib.parse
@@ -31,6 +32,7 @@ try:
         parse_special_tariff_schedule as _parse_special_tariff_schedule,
         recurring_tariff_slots,
         special_tariff_price_for_datetime,
+        supports_spot_market_prices,
         TARIFF_TIMEZONE_NAME,
         tariff_type as configured_tariff_type,
     )
@@ -40,6 +42,7 @@ except ImportError:  # pragma: no cover - package-less compatibility
         parse_special_tariff_schedule as _parse_special_tariff_schedule,
         recurring_tariff_slots,
         special_tariff_price_for_datetime,
+        supports_spot_market_prices,
         TARIFF_TIMEZONE_NAME,
         tariff_type as configured_tariff_type,
     )
@@ -54,7 +57,6 @@ RAMDISK_DIR  = _p['ramdisk_dir']
 DATA_DIR     = _p['data_dir']
 V4_CONFIG_FILE = os.path.join(DATA_DIR, 'e3dc_v4.json')
 
-os.makedirs(RAMDISK_DIR, exist_ok=True)
 EPEX_OUTPUT_FILE = os.path.join(RAMDISK_DIR, "epex_daten.json")
 ECO_SCORE_FILE   = os.path.join(RAMDISK_DIR, "eco_score.json")
 PRICE_BOOST_PLAN_FILE = os.path.join(RAMDISK_DIR, "price_boost_plan.json")
@@ -70,33 +72,55 @@ ENTSOE_DE_LU_DOMAIN = "10Y1001A1001A82H"
 PRICE_BOOST_PUBLISH_INTERVAL_S = 30 * 60
 PRICE_BOOST_PLAN_MAX_AGE_S = PRICE_BOOST_PUBLISH_INTERVAL_S + 15 * 60
 
-# Logger setup
-LOG_DIR = "/var/www/html/logs"
-if not os.path.exists(LOG_DIR):
-    LOG_DIR = os.path.join(INSTALL_DIR, "logs")
-if not os.path.exists(LOG_DIR):
-    LOG_DIR = RAMDISK_DIR
+# Importieren des Installers darf weder Ramdisk-Verzeichnisse noch Logdateien
+# erzeugen. Die Laufzeit initialisiert beides erst im tatsächlichen Dienstprozess.
+logger = logging.getLogger("EpexManager")
+_runtime_initialized = False
+_market_value_solar_loaded = False
+update_market_value_solar_report = None
 
-logger = configure_service_logger(
-    "EpexManager",
-    log_path=os.path.join(LOG_DIR, "epex_manager.log"),
-    max_bytes=2 * 1024 * 1024,
-    backup_count=3,
-    quiet_interval_s=900.0,
-)
 
-try:
-    from market_value_solar import update_market_value_solar_report
-except Exception as _market_value_solar_import_error:
-    update_market_value_solar_report = None
-    logger.warning("Marktwert-Solar-Monitor nicht geladen: %s", _market_value_solar_import_error)
+def _initialize_runtime():
+    global logger, _runtime_initialized
+    if _runtime_initialized:
+        return
+    os.makedirs(RAMDISK_DIR, exist_ok=True)
+    log_dir = "/var/www/html/logs"
+    if not os.path.exists(log_dir):
+        log_dir = os.path.join(INSTALL_DIR, "logs")
+    if not os.path.exists(log_dir):
+        log_dir = RAMDISK_DIR
+    logger = configure_service_logger(
+        "EpexManager",
+        log_path=os.path.join(log_dir, "epex_manager.log"),
+        max_bytes=2 * 1024 * 1024,
+        backup_count=3,
+        quiet_interval_s=900.0,
+    )
+    _runtime_initialized = True
+
+
+def _load_market_value_solar_report():
+    global _market_value_solar_loaded, update_market_value_solar_report
+    if _market_value_solar_loaded:
+        return update_market_value_solar_report
+    _market_value_solar_loaded = True
+    try:
+        from market_value_solar import update_market_value_solar_report as reporter
+
+        update_market_value_solar_report = reporter
+    except Exception as exc:
+        logger.warning("Marktwert-Solar-Monitor nicht geladen: %s", exc)
+        update_market_value_solar_report = None
+    return update_market_value_solar_report
 
 def update_market_value_solar_monitor(config, price_data):
     """Update the read-only Marktwert-Solar diagnostics file."""
-    if update_market_value_solar_report is None:
+    reporter = _load_market_value_solar_report()
+    if reporter is None:
         return None
     try:
-        report = update_market_value_solar_report(
+        report = reporter(
             config,
             price_data,
             MARKET_VALUE_SOLAR_FILE,
@@ -189,15 +213,14 @@ def _evaluate_market_safety_gate(config, safety_gate=None):
 
 def disabled_market_plan(config, reason, now_ms=None):
     """Erstellt bei ungültigen Eingangsdaten den einzig zulässigen Marktvertrag."""
-    tariff = str((config or {}).get("stromtarif_typ", "static")).strip().lower()
-    supported = tariff in ("tibber", "awattar", "dynamic", "epex", "octopus_heat")
+    supported = supports_spot_market_prices(config)
     generated_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
     return {
         "ts": generated_ms,
         "valid_until_ts_ms": generated_ms,
         "enabled": False,
         "supported": supported,
-        "unsupported_reason": "" if supported else "Preis-Boost ist nur für EPEX-/Börsentarife und Octopus Heat",
+        "unsupported_reason": "" if supported else "Negativpreis-Boost ist nur für echte Börsenpreistarife verfügbar",
         "active": False,
         "context_valid": False,
         "release_valid": False,
@@ -738,6 +761,7 @@ def _parse_entsoe_day_ahead_xml(raw):
             continue
         currency = _entsoe_desc_text(time_series, "currency_Unit.name") or "EUR"
         unit = _entsoe_desc_text(time_series, "price_Measure_Unit.name") or "MWH"
+        curve_type = (_entsoe_desc_text(time_series, "curveType") or "").strip().upper()
         for period in time_series.iter():
             if _entsoe_xml_name(period.tag) != "Period":
                 continue
@@ -750,6 +774,7 @@ def _parse_entsoe_day_ahead_xml(raw):
                 continue
             try:
                 period_start = _entsoe_parse_time(_entsoe_child_text(interval, "start"))
+                period_end = _entsoe_parse_time(_entsoe_child_text(interval, "end"))
             except Exception:
                 continue
             resolution = _entsoe_parse_resolution(_entsoe_child_text(period, "resolution"))
@@ -757,6 +782,7 @@ def _parse_entsoe_day_ahead_xml(raw):
                 continue
             resolution_ms = int(round(resolution.total_seconds() * 1000))
             resolution_min = int(round(resolution.total_seconds() / 60.0))
+            point_values = []
             for point in list(period):
                 if _entsoe_xml_name(point.tag) != "Point":
                     continue
@@ -767,20 +793,42 @@ def _parse_entsoe_day_ahead_xml(raw):
                 price = _entsoe_point_price(point)
                 if position <= 0 or price is None:
                     continue
-                start = period_start + ((position - 1) * resolution)
-                start_ms = int(start.timestamp() * 1000)
-                # ENTSO-E can return overlapping TimeSeries; later entries match SMARD's visible revision.
-                merged[start_ms] = {
-                    "start_timestamp": start_ms,
-                    "end_timestamp": start_ms + resolution_ms,
-                    "marketprice": price,
-                    "price_source": "entsoe",
-                    "tariff_provider": "entsoe",
-                    "currency": currency,
-                    "unit": "Eur/MWh" if unit.upper() == "MWH" else unit,
-                    "source_resolution_min": resolution_min,
-                    "price_resolution_min": resolution_min,
-                }
+                point_values.append((position, price))
+
+            point_values.sort(key=lambda item: item[0])
+            period_slots = int(
+                max(0.0, (period_end - period_start).total_seconds())
+                // resolution.total_seconds()
+            )
+            for index, (position, price) in enumerate(point_values):
+                # A03 ist eine ENTSO-E-Blockkurve: Ein Punkt gilt bis zum
+                # nächsten Positionspunkt. Ohne diese Expansion entstehen an
+                # ausgelassenen Positionen Inseln aus der älteren TimeSeries.
+                if curve_type == "A03":
+                    next_position = (
+                        point_values[index + 1][0]
+                        if index + 1 < len(point_values)
+                        else period_slots + 1
+                    )
+                    end_position = min(period_slots + 1, max(position + 1, next_position))
+                else:
+                    end_position = position + 1
+                for expanded_position in range(position, end_position):
+                    start = period_start + ((expanded_position - 1) * resolution)
+                    start_ms = int(start.timestamp() * 1000)
+                    # ENTSO-E kann überlappende TimeSeries liefern; die spätere
+                    # Revision ersetzt den vollständigen Block positionsgenau.
+                    merged[start_ms] = {
+                        "start_timestamp": start_ms,
+                        "end_timestamp": start_ms + resolution_ms,
+                        "marketprice": price,
+                        "price_source": "entsoe",
+                        "tariff_provider": "entsoe",
+                        "currency": currency,
+                        "unit": "Eur/MWh" if unit.upper() == "MWH" else unit,
+                        "source_resolution_min": resolution_min,
+                        "price_resolution_min": resolution_min,
+                    }
 
     return [merged[key] for key in sorted(merged)]
 
@@ -952,6 +1000,31 @@ def apply_direct_marketing_market_overlay(price_data, market_data, config=None):
     if not market_slots:
         return price_data
 
+    # Das Providerformat enthält nicht zwingend eine externe Revisions-ID.
+    # Für die DV-Verschiebungsentscheidung binden wir deshalb keine erfundene
+    # Providerrevision, sondern einen lokalen Inhaltsnachweis über exakt die
+    # Rohslots, die dieses Overlay verwendet. Jede Preis-, Quellen-, Raster-
+    # oder Horizontänderung erzeugt eine andere Revision.
+    revision_material = [
+        {
+            "start_timestamp": int(item["start_timestamp"]),
+            "end_timestamp": int(item["end_timestamp"]),
+            "marketprice": round(float(item["marketprice"]), 6),
+            "price_source": str(item.get("price_source") or ""),
+            "price_resolution_min": int(item.get("price_resolution_min") or 0),
+            "source_resolution_min": int(item.get("source_resolution_min") or 0),
+        }
+        for item in market_slots
+    ]
+    market_revision = "sha256:" + hashlib.sha256(
+        json.dumps(
+            revision_material,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
     matched = 0
     min_ct = None
     max_ct = None
@@ -975,6 +1048,10 @@ def apply_direct_marketing_market_overlay(price_data, market_data, config=None):
         slot["direct_marketing_price_source"] = market["price_source"]
         slot["direct_marketing_price_resolution_min"] = market["price_resolution_min"]
         slot["direct_marketing_source_resolution_min"] = market["source_resolution_min"]
+        slot["direct_marketing_price_revision"] = market_revision
+        slot["direct_marketing_price_revision_source"] = (
+            "local_market_overlay_content_v1"
+        )
         slot["direct_marketing_price_available"] = True
         matched += 1
         min_ct = market_ct if min_ct is None else min(min_ct, market_ct)
@@ -1193,6 +1270,10 @@ def generate_eco_score(price_data, config):
             score_entry["direct_marketing_price_source"] = d.get("direct_marketing_price_source") or ""
             score_entry["direct_marketing_price_resolution_min"] = d.get("direct_marketing_price_resolution_min")
             score_entry["direct_marketing_source_resolution_min"] = d.get("direct_marketing_source_resolution_min")
+            score_entry["direct_marketing_price_revision"] = d.get("direct_marketing_price_revision")
+            score_entry["direct_marketing_price_revision_source"] = d.get(
+                "direct_marketing_price_revision_source"
+            )
             score_entry["direct_marketing_price_available"] = bool(d.get("direct_marketing_price_available", True))
         eco_scores.append(score_entry)
 
@@ -1228,8 +1309,8 @@ def generate_configured_tariff_score(tariff_slots):
 def generate_price_boost_plan(price_data, eco_scores, config):
     """
     Berechnet günstige Preisfenster für explizit freigegebene Verbraucher.
-    Bei EPEX/dynamischen Tarifen kommen sie aus dem Marktpreis, bei Octopus Heat
-    aus den bekannten LT-Zeitfenstern der Billing-Preislogik.
+    Die Freigabe ist ausschließlich für echte Börsenpreisslots zulässig.
+    Wiederkehrende Tarifzeiten wie Octopus Heat sind kein Negativpreisvertrag.
     """
     def safe_float(val, default_val):
         try:
@@ -1249,19 +1330,11 @@ def generate_price_boost_plan(price_data, eco_scores, config):
         return str(val).strip().lower() in ("1", "true", "yes", "on")
 
     stromtarif_typ = str(config.get("stromtarif_typ", "static")).strip().lower()
-    supported_tariff = stromtarif_typ in ("tibber", "awattar", "dynamic", "epex", "octopus_heat")
+    supported_tariff = supports_spot_market_prices(config)
     enabled = supported_tariff and safe_bool(config.get("cheap_grid_boost_enable", 0), False)
     price_limit_ct = safe_float(config.get("cheap_grid_price_limit_ct", 0.0), 0.0)
     min_duration_min = int(safe_float(config.get("cheap_grid_min_duration_min", 15), 15))
     now_ms = int(time.time() * 1000)
-    octopus_lt_price = safe_float(config.get("strompreis_cheap", 0.0), 0.0)
-    octopus_basis_price = safe_float(config.get("strompreis_basis", 0.0), 0.0)
-    octopus_auto_lt = (
-        stromtarif_typ == "octopus_heat"
-        and price_limit_ct <= 0.0
-        and octopus_lt_price > 0.0
-        and (octopus_basis_price <= 0.0 or octopus_lt_price < octopus_basis_price)
-    )
 
     score_by_ts = {}
     for score in eco_scores or []:
@@ -1318,10 +1391,11 @@ def generate_price_boost_plan(price_data, eco_scores, config):
 
         cheap_slot = False
         if enabled:
-            if price_limit_ct > 0.0:
-                cheap_slot = billing_price <= price_limit_ct
-            elif octopus_auto_lt:
-                cheap_slot = billing_price <= octopus_lt_price + 0.01
+            # Der Sonderpfad ist kein allgemeines Günstigpreisfenster. 0
+            # bedeutet strikt negativer Abrechnungspreis; ein negativerer
+            # Nutzerwert darf die Freigabe weiter verschärfen.
+            effective_negative_limit = min(0.0, price_limit_ct)
+            cheap_slot = billing_price < 0.0 and billing_price <= effective_negative_limit
 
         slots.append({
             "start_timestamp": st,
@@ -1380,7 +1454,7 @@ def generate_price_boost_plan(price_data, eco_scores, config):
         "publish_interval_s": PRICE_BOOST_PUBLISH_INTERVAL_S,
         "enabled": enabled,
         "supported": supported_tariff,
-        "unsupported_reason": "" if supported_tariff else "Preis-Boost ist nur für EPEX-/Börsentarife und Octopus Heat",
+        "unsupported_reason": "" if supported_tariff else "Negativpreis-Boost ist nur für echte Börsenpreistarife verfügbar",
         "tariff_axis": "configured_recurring" if stromtarif_typ == "octopus_heat" else "market",
         "timezone": TARIFF_TIMEZONE_NAME if stromtarif_typ == "octopus_heat" else None,
         "active": active_window is not None,
@@ -1403,6 +1477,7 @@ def generate_price_boost_plan(price_data, eco_scores, config):
     }
 
 def run():
+    _initialize_runtime()
     logger.info("Starte EPEX Manager (V4)...")
 
     while True:
@@ -1595,6 +1670,8 @@ def _install_forecast_evidence_service_compat(
     *,
     evidence_enabled,
     start_services,
+    defer_activation=False,
+    bundle_snapshot=None,
 ):
     """Installiert den optionalen Sidecar nur mit vollständig passendem Helper.
 
@@ -1613,6 +1690,8 @@ def _install_forecast_evidence_service_compat(
             "e3dc-live.service",
             "e3dc-weather-manager.service",
         ),
+        "defer_activation": bool(defer_activation),
+        "bundle_snapshot": bundle_snapshot,
     }
     try:
         parameters = inspect.signature(create_service_file).parameters
@@ -1620,19 +1699,14 @@ def _install_forecast_evidence_service_compat(
         parameters = {}
     missing = sorted(key for key in optional_kwargs if key not in parameters)
     if missing:
-        if evidence_enabled:
-            print(
-                "  [!] Alter Service-Helper kann die ausdrücklich aktivierte "
-                "PV-Prognosediagnose nicht sicher abbilden "
-                f"(fehlender Vertrag: {', '.join(missing)})."
-            )
-            return False
+        if not evidence_enabled:
+            return True
         print(
-            "  [i] Alter Service-Helper im Release-Übergang erkannt; "
-            "optionale PV-Prognosediagnose wird sicher übersprungen "
+            "  [!] Alter Service-Helper kann das transaktionale Dienstbundle "
+            "nicht sicher abbilden "
             f"(fehlender Vertrag: {', '.join(missing)})."
         )
-        return True
+        return False
 
     result = create_service_file(
         "e3dc-forecast-evidence",
@@ -1643,61 +1717,232 @@ def _install_forecast_evidence_service_compat(
         start_service=bool(start_services and evidence_enabled),
         **optional_kwargs,
     )
-    return result is not False
+    return result is True
 
-def install_epex_service(start_services=True):
+def install_epex_service(start_services=True, include_websocket=False):
     print("Installiere E3DC-Control Kern-Manager Services...")
-    from .utils import _create_service_file, install_e3dc_live_service
+    from .utils import (
+        _create_service_file,
+        activate_systemd_service_bundle,
+        capture_systemd_service_bundle,
+        install_e3dc_live_service,
+        rollback_systemd_service_bundle,
+        setup_websocket_service,
+    )
     installer_dir = os.path.join(INSTALL_DIR, "Installer")
 
-    # 1. E3DC Live Daten Service (RSCP Python) - Basis für alle Kerndienste
-    print("\n[1/6] E3DC Live Daten Service...")
-    install_e3dc_live_service(start_service=start_services)
+    required_scripts = [
+        ("E3DC Live Daten Service", "e3dc_live.py"),
+        ("EPEX & Strompreis Manager", "epex_manager.py"),
+        ("Wetter & PV-Forecast Service", "Forecast/pv_forecast_service.py"),
+        ("Storage Simulator", "storage_simulator.py"),
+        ("Storage Manager", "storage_manager.py"),
+    ]
+    if include_websocket:
+        required_scripts.append(("WebSocket Service", "e3dc_websocket.py"))
+    missing_scripts = [
+        (label, os.path.join(installer_dir, relative_path))
+        for label, relative_path in required_scripts
+        if not os.path.isfile(os.path.join(installer_dir, relative_path))
+    ]
+    if missing_scripts:
+        for label, path in missing_scripts:
+            print(f"  [!] Pflichtskript für {label} fehlt: {path}")
+        return False
 
-    # 2. EPEX Manager
-    print("\n[2/6] EPEX & Strompreis Manager...")
-    _create_service_file("e3dc-epex-manager", "E3DC EPEX Manager", "epex_manager.py", "python3", start_service=start_services)
-
-    # 3. Wetter-/PV-Forecast Service
-    print("\n[3/6] Wetter & PV-Forecast Service...")
-    forecast_path = os.path.join(installer_dir, "Forecast", "pv_forecast_service.py")
-    if os.path.exists(forecast_path):
-        _create_service_file("e3dc-weather-manager", "E3DC Wetter & PV Forecast", "Forecast/pv_forecast_service.py", "python3", start_service=start_services)
-
-    # 4. Storage Simulator
-    print("\n[4/6] Storage Simulator...")
-    storage_path = os.path.join(installer_dir, "storage_simulator.py")
-    if os.path.exists(storage_path):
-        _create_service_file("e3dc-storage-simulator", "E3DC Storage Simulator", "storage_simulator.py", "python3", start_service=start_services)
-
-    # 5. Storage Manager. Der aktuelle Regler ist kanonisch storage_manager.py;
-    # der alte Regler bleibt nur als storage_manager_legacy.py im Repository.
-    print("\n[5/6] Storage Manager...")
-    mgr_path = os.path.join(installer_dir, "storage_manager.py")
-    if os.path.exists(mgr_path):
-        _create_service_file("e3dc-storage-manager", "E3DC Storage Manager", "storage_manager.py", "python3", start_service=start_services)
-
-    # 6. Rein diagnostischer Prognose-Sidecar. Die Unit wird immer
-    # installiert, bleibt ohne ausdrückliche Nutzerfreigabe jedoch gestoppt.
-    print("\n[6/6] Optionale PV-Prognosediagnose...")
     evidence_path = os.path.join(
         installer_dir,
         "forecast_evidence_sidecar.py",
     )
-    if os.path.exists(evidence_path):
-        evidence_enabled = _forecast_evidence_enabled_for_install()
-        if not _install_forecast_evidence_service_compat(
-            _create_service_file,
-            evidence_enabled=evidence_enabled,
-            start_services=start_services,
-        ):
-            raise RuntimeError(
-                "Optionale PV-Prognosediagnose konnte nicht sicher installiert werden"
+    evidence_present = os.path.isfile(evidence_path)
+    evidence_enabled = (
+        _forecast_evidence_enabled_for_install() if evidence_present else False
+    )
+
+    service_names = [
+        "e3dc-live",
+        "e3dc-epex-manager",
+        "e3dc-weather-manager",
+        "e3dc-storage-simulator",
+        "e3dc-storage-manager",
+    ]
+    if evidence_present:
+        service_names.append("e3dc-forecast-evidence")
+    if include_websocket:
+        service_names.append("e3dc-websocket")
+
+    try:
+        service_snapshot = capture_systemd_service_bundle(service_names)
+    except Exception as exc:
+        print(f"  [!] Bestehender Kerndienstzustand ist nicht sicher gebunden: {exc}")
+        return False
+
+    def _require_prepared(result, label, service_name):
+        if result is not True:
+            raise RuntimeError(f"{label} konnte nicht transaktional vorbereitet werden")
+
+    try:
+        total_steps = 7 if include_websocket else 6
+
+        # 1. E3DC Live Daten Service (RSCP Python) - Basis für alle Kerndienste
+        print(f"\n[1/{total_steps}] E3DC Live Daten Service...")
+        _require_prepared(
+            install_e3dc_live_service(
+                start_service=False,
+                defer_activation=True,
+                bundle_snapshot=service_snapshot,
+            ),
+            "E3DC Live Daten Service",
+            "e3dc-live",
+        )
+
+        # 2. EPEX Manager
+        print(f"\n[2/{total_steps}] EPEX & Strompreis Manager...")
+        _require_prepared(
+            _create_service_file(
+                "e3dc-epex-manager",
+                "E3DC EPEX Manager",
+                "epex_manager.py",
+                "python3",
+                start_service=False,
+                defer_activation=True,
+                bundle_snapshot=service_snapshot,
+            ),
+            "EPEX & Strompreis Manager",
+            "e3dc-epex-manager",
+        )
+
+        # 3. Wetter-/PV-Forecast Service
+        print(f"\n[3/{total_steps}] Wetter & PV-Forecast Service...")
+        _require_prepared(
+            _create_service_file(
+                "e3dc-weather-manager",
+                "E3DC Wetter & PV Forecast",
+                "Forecast/pv_forecast_service.py",
+                "python3",
+                start_service=False,
+                defer_activation=True,
+                bundle_snapshot=service_snapshot,
+            ),
+            "Wetter & PV-Forecast Service",
+            "e3dc-weather-manager",
+        )
+
+        # 4. Storage Simulator
+        print(f"\n[4/{total_steps}] Storage Simulator...")
+        _require_prepared(
+            _create_service_file(
+                "e3dc-storage-simulator",
+                "E3DC Storage Simulator",
+                "storage_simulator.py",
+                "python3",
+                start_service=False,
+                defer_activation=True,
+                bundle_snapshot=service_snapshot,
+            ),
+            "Storage Simulator",
+            "e3dc-storage-simulator",
+        )
+
+        # 5. Storage Manager. Der aktuelle Regler ist kanonisch storage_manager.py;
+        # der alte Regler bleibt nur als storage_manager_legacy.py im Repository.
+        print(f"\n[5/{total_steps}] Storage Manager...")
+        _require_prepared(
+            _create_service_file(
+                "e3dc-storage-manager",
+                "E3DC Storage Manager",
+                "storage_manager.py",
+                "python3",
+                restart_sec=5,
+                start_service=False,
+                after_services=("e3dc-live.service",),
+                start_limit_interval_sec=300,
+                start_limit_burst=3,
+                defer_activation=True,
+                bundle_snapshot=service_snapshot,
+            ),
+            "Storage Manager",
+            "e3dc-storage-manager",
+        )
+
+        # 6. Rein diagnostischer Prognose-Sidecar. Die Unit wird immer
+        # installiert, bleibt ohne ausdrückliche Nutzerfreigabe jedoch gestoppt.
+        print(f"\n[6/{total_steps}] Optionale PV-Prognosediagnose...")
+        if evidence_present:
+            _require_prepared(
+                _install_forecast_evidence_service_compat(
+                    _create_service_file,
+                    evidence_enabled=evidence_enabled,
+                    start_services=False,
+                    defer_activation=True,
+                    bundle_snapshot=service_snapshot,
+                ),
+                "Optionale PV-Prognosediagnose",
+                "e3dc-forecast-evidence",
             )
 
-    print("\n[OK] Alle Kern-Dienste installiert.")
+        if include_websocket:
+            print(f"\n[7/{total_steps}] WebSocket Service...")
+            _require_prepared(
+                setup_websocket_service(
+                    start_service=False,
+                    defer_activation=True,
+                    bundle_snapshot=service_snapshot,
+                ),
+                "WebSocket Service",
+                "e3dc-websocket",
+            )
+
+        enabled_services = [
+            "e3dc-live",
+            "e3dc-epex-manager",
+            "e3dc-weather-manager",
+            "e3dc-storage-simulator",
+            "e3dc-storage-manager",
+        ]
+        # Der einzige RSCP-Hardwarewriter im Kernbundle startet erst, nachdem
+        # alle rein lesenden/diagnostischen Pflichtdienste bestätigt laufen.
+        start_order = [
+            "e3dc-live",
+            "e3dc-epex-manager",
+            "e3dc-weather-manager",
+            "e3dc-storage-simulator",
+        ]
+        if evidence_present and evidence_enabled:
+            enabled_services.append("e3dc-forecast-evidence")
+            start_order.append("e3dc-forecast-evidence")
+        if include_websocket:
+            enabled_services.append("e3dc-websocket")
+            start_order.append("e3dc-websocket")
+        start_order.append("e3dc-storage-manager")
+
+        if activate_systemd_service_bundle(
+            service_snapshot,
+            enabled_units=enabled_services,
+            start_order=start_order,
+            start_services=bool(start_services),
+        ) is not True:
+            raise RuntimeError("Kerndienstbundle konnte nicht vollständig aktiviert werden")
+    except Exception as exc:
+        print(f"  [!] Kerndienstbundle fehlgeschlagen: {exc}")
+        if rollback_systemd_service_bundle(service_snapshot) is True:
+            print("  [i] Vorheriger Unit-, Enablement- und Aktivzustand wiederhergestellt.")
+        else:
+            print("  [!] Rollback nicht vollständig bestätigt; alle Bundle-Dienste bleiben gestoppt.")
+        return False
+
+    print("\n[OK] Alle Kern-Dienste gemeinsam installiert und bestätigt.")
+    return True
+
 
 # Registriere die Installation der Manager global, damit core.py sie beim Start laden kann.
 if __name__ != "__main__":
     from .core import register_command
-    register_command("400", "Kern-Dienste & Manager installieren", install_epex_service, sort_order=400, category="Kernsystem & Update")
+
+    register_command(
+        "400",
+        "Kern-Dienste & Manager installieren",
+        install_epex_service,
+        sort_order=400,
+        category="Kernsystem & Update",
+    )

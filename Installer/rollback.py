@@ -85,21 +85,68 @@ def _boot_gate() -> bool:
         return False
 
 
-def _restore_safety_backup(safety_backup: str, state) -> bool:
+def _bind_current_restore_helpers():
+    """Bindet aktuelle Migrations- und Gate-Funktionen vor dem Datei-Restore."""
+    from .permissions import run_permissions_wizard
+    from .update import (
+        _run_argv,
+        _verify_transition_state,
+        migrate_storage_manager_next_override,
+    )
+
+    return {
+        "migrate_storage_override": (
+            lambda migrate=migrate_storage_manager_next_override:
+            migrate(reload_systemd=False)
+        ),
+        "run_argv": _run_argv,
+        "run_permissions": run_permissions_wizard,
+        "verify_transition_state": _verify_transition_state,
+    }
+
+
+def _post_restore_storage_writer_gate(helpers) -> bool:
+    """Migriert restaurierte Storage-Overrides vor dem strikten Writer-Gate."""
+    try:
+        if helpers["migrate_storage_override"]() is not True:
+            rollback_logger.error(
+                "Storage-Override-Migration nach Restore ist fehlgeschlagen."
+            )
+            return False
+        reload_result = helpers["run_argv"](
+            ["sudo", "systemctl", "daemon-reload"],
+            timeout=20,
+        )
+        if not isinstance(reload_result, dict) or not reload_result.get("success"):
+            rollback_logger.error(
+                "systemd daemon-reload nach Storage-Override-Migration ist fehlgeschlagen."
+            )
+            return False
+        if helpers["run_permissions"](headless=True) is not True:
+            rollback_logger.error(
+                "Storage-Single-Writer-/Berechtigungs-Gate nach Restore ist fehlgeschlagen."
+            )
+            return False
+        return True
+    except Exception as exc:
+        rollback_logger.error(
+            f"Storage-Restore-Gate konnte nicht sicher abgeschlossen werden: {exc}"
+        )
+        return False
+
+
+def _restore_safety_backup(safety_backup: str, state, *, restore_helpers=None) -> bool:
     """Best-effort automatic reversal of a failed selected-backup restore."""
     try:
+        helpers = restore_helpers or _bind_current_restore_helpers()
         hard_stop_e3dc()
         restore_verified_backup(safety_backup, install_path=INSTALL_PATH)
-        from .permissions import run_permissions_wizard
-        from .update import _run_argv, _secure_repo_permissions, _verify_transition_state
-
-        if run_permissions_wizard(headless=True) is False:
+        if not _post_restore_storage_writer_gate(helpers):
             return False
-        _secure_repo_permissions(INSTALL_PATH, get_install_user())
-        reload_result = _run_argv(["sudo", "systemctl", "daemon-reload"], timeout=20)
-        if not reload_result["success"]:
-            return False
-        _verify_transition_state(state)
+        # Das verifizierte Sicherheitsbackup besitzt bereits seinen eigenen
+        # Datei-, Owner- und Modusvertrag. Der aktuelle Git-Index kann zu
+        # diesem älteren Backup gehören und darf ihn nicht neu interpretieren.
+        helpers["verify_transition_state"](state)
         return start_e3dc(state) and _boot_gate()
     except Exception as exc:
         rollback_logger.error(f"Sicherheitsbackup konnte nicht wiederhergestellt werden: {exc}")
@@ -118,8 +165,9 @@ def rollback(backup_dir, *, confirmed: bool = False) -> bool:
             return True
 
     try:
-        from .update import _capture_transition_state, _secure_repo_permissions, _verify_transition_state
+        from .update import _capture_transition_state
 
+        restore_helpers = _bind_current_restore_helpers()
         state = _capture_transition_state()
     except Exception as exc:
         print(f"[!] HA-/Shadow-Preflight fehlgeschlagen: {exc}")
@@ -146,18 +194,12 @@ def rollback(backup_dir, *, confirmed: bool = False) -> bool:
     try:
         if not restore_backup(backup_dir, install_path=INSTALL_PATH, confirmed=True):
             raise RuntimeError("Manifest-Restore fehlgeschlagen")
-        from .permissions import run_permissions_wizard
-        from .update import _run_argv, migrate_storage_manager_next_override
-
-        if run_permissions_wizard(headless=True) is False:
-            raise RuntimeError("Berechtigungs-Gate fehlgeschlagen")
-        _secure_repo_permissions(INSTALL_PATH, get_install_user())
-        reload_result = _run_argv(["sudo", "systemctl", "daemon-reload"], timeout=20)
-        if not reload_result["success"]:
-            raise RuntimeError("systemd daemon-reload nach Restore fehlgeschlagen")
-        if not migrate_storage_manager_next_override():
-            raise RuntimeError("Storage-Migration fehlgeschlagen")
-        _verify_transition_state(state)
+        # restore_backup hat Bytes und Metadaten bereits gegen das ausgewählte
+        # Manifest gebunden. Ein möglicherweise neuerer Git-Index ist für
+        # diesen expliziten Datei-Rückfall keine Autorität.
+        if not _post_restore_storage_writer_gate(restore_helpers):
+            raise RuntimeError("Storage-Migrations-/Berechtigungs-Gate fehlgeschlagen")
+        restore_helpers["verify_transition_state"](state)
         if not start_e3dc(state):
             raise RuntimeError("Dienst-/HTTP-/HA-Gate fehlgeschlagen")
         if not _boot_gate():
@@ -166,7 +208,11 @@ def rollback(backup_dir, *, confirmed: bool = False) -> bool:
     except Exception as exc:
         print(f"[!] Backup-Rollback fehlgeschlagen: {exc}")
         rollback_logger.error(f"Backup-Rollback fehlgeschlagen: {exc}")
-        if _restore_safety_backup(safety_backup, state):
+        if _restore_safety_backup(
+            safety_backup,
+            state,
+            restore_helpers=restore_helpers,
+        ):
             print("[OK] Ausgangszustand aus Sicherheits-Backup wiederhergestellt.")
         else:
             print("[!] Ausgangszustand nicht beweisbar; Writer bleiben gestoppt.")
@@ -250,4 +296,3 @@ def rollback_commit_menu():
 if not os.path.exists("/.dockerenv"):
     register_command("14", "Rollback (Datei-Backup)", rollback_menu, sort_order=14)
     register_command("12", "Rollback auf freigegebenes Stable-Release", rollback_commit_menu, sort_order=12)
-

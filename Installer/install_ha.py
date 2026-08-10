@@ -1,9 +1,11 @@
 import os
 import subprocess
 import time
-import getpass
 import sys
 import ipaddress
+import json
+import pwd
+import grp
 
 # Standard-Ausgabe auf UTF-8 erzwingen
 try:
@@ -15,11 +17,21 @@ except Exception:
     pass
 
 from .core import register_command
-from .utils import run_command, replace_in_file
-from .installer_config import get_install_path, get_install_user, load_config
+from .utils import _create_service_file
+from .installer_config import get_install_user
+from .secure_file_transaction import (
+    atomic_write_bound_file,
+    restore_bound_file,
+    snapshot_bound_file,
+)
+from .ha_writer_admission import (
+    instance_role_anchor_matches,
+    project_instance_role_anchor,
+    transition_instance_role_anchor,
+)
 from .logging_manager import get_or_create_logger, log_task_completed, log_error
 
-INSTALL_PATH = get_install_path()
+V4_CONFIG_PATH = "/var/www/html/data/e3dc_v4.json"
 ha_logger = get_or_create_logger("ha_installer")
 
 def validate_peer_ip(peer_ip):
@@ -42,12 +54,27 @@ def setup_ssh_keys(user, peer_ip):
     print("Raspberry Pis ohne Passwort miteinander kommunizieren können.")
     
     # 1. Prüfen ob lokaler Key existiert
-    home_dir = os.path.expanduser(f"~{user}")
+    try:
+        account = pwd.getpwnam(user)
+    except KeyError:
+        print("✗ Installationsbenutzer existiert nicht.")
+        return False
+    home_dir = account.pw_dir
     key_path = os.path.join(home_dir, ".ssh", "id_ed25519")
     
     if not os.path.exists(key_path):
         print("Erstelle neuen SSH-Schlüssel...")
-        run_command(f"sudo -u {user} ssh-keygen -t ed25519 -N '' -f {key_path}")
+        created = subprocess.run(
+            ["sudo", "-u", user, "ssh-keygen", "-t", "ed25519", "-N", "", "-f", key_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if created.returncode != 0:
+            print("✗ SSH-Schlüssel konnte nicht erzeugt werden.")
+            return False
     else:
         print("Lokaler SSH-Schlüssel existiert bereits.")
 
@@ -98,54 +125,119 @@ def setup_ssh_keys(user, peer_ip):
 
 def setup_ha_service():
     print("\n--- Richte High Availability Service ein ---")
-    # Dieser Service ruft später ha_manager.py auf (welches wir in Schritt 3 erstellen)
-    service_name = "e3dc-ha.service"
-    script_path = os.path.join(os.path.dirname(__file__), "ha_manager.py")
-    
-    # Python venv Pfad ermitteln
-    python_exec = "/usr/bin/python3"
-    cfg = load_config()
-    venv_name = cfg.get("venv_name", ".venv_e3dc")
-    if venv_name:
-        user = get_install_user()
-        home = os.path.expanduser(f"~{user}")
-        venv_python = os.path.join(home, venv_name, "bin", "python3")
-        if os.path.exists(venv_python):
-            python_exec = venv_python
-            
-    service_content = f"""[Unit]
-Description=E3DC-Control High Availability Manager
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=root
-ExecStart={python_exec} -u {script_path}
-Restart=always
-RestartSec=10
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=e3dc-ha
-
-[Install]
-WantedBy=multi-user.target
-"""
     try:
-        with open("/tmp/e3dc-ha.service", "w") as f:
-            f.write(service_content)
-            
-        run_command("sudo mv /tmp/e3dc-ha.service /etc/systemd/system/")
-        run_command("sudo chmod 644 /etc/systemd/system/e3dc-ha.service")
-        run_command("sudo systemctl daemon-reload")
-        run_command("sudo systemctl enable e3dc-ha.service")
-        run_command("sudo systemctl restart e3dc-ha.service")
-        
-        print("✓ Service e3dc-ha.service registriert, aktiviert und gestartet.")
-        return True
+        return _create_service_file(
+            "e3dc-ha",
+            "E3DC-Control High Availability Manager",
+            "ha_manager.py",
+            restart_sec=10,
+            start_service=True,
+            enable_service=True,
+            restart_policy="always",
+            require_venv=True,
+            after_services=("network-online.target",),
+            wants_services=("network-online.target",),
+            syslog_identifier="e3dc-ha",
+            service_user="root",
+            service_group="root",
+        ) is True
     except Exception as e:
         print(f"Fehler beim Erstellen des Services: {e}")
         return False
+
+
+def _commit_ha_role(role, peer_ip):
+    """Bindet V4-Konfiguration, Rollenanker und HA-Unit als eine Transaktion."""
+
+    if os.geteuid() != 0:
+        raise PermissionError("HA-Rollenwechsel muss als root ausgeführt werden")
+    install_user = get_install_user()
+    user_uid = pwd.getpwnam(install_user).pw_uid
+    www_data_gid = grp.getgrnam("www-data").gr_gid
+    previous = snapshot_bound_file(
+        V4_CONFIG_PATH,
+        expected_uid=user_uid,
+        expected_gid=www_data_gid,
+        max_bytes=4 * 1024 * 1024,
+    )
+    try:
+        current = json.loads(bytes(previous["payload"]).decode("utf-8-sig"))
+    except (TypeError, UnicodeError, ValueError) as exc:
+        raise RuntimeError("V4-Konfiguration ist nicht eindeutig lesbar") from exc
+    if not isinstance(current, dict):
+        raise RuntimeError("V4-Konfiguration ist kein JSON-Objekt")
+
+    old_mode = str(current.get("ha_mode") or "off").strip().lower()
+    if old_mode not in {"off", "master", "slave", "shadow"}:
+        raise RuntimeError("Bestehende HA-Rolle ist ungültig")
+    old_peer = validate_peer_ip(current.get("ha_peer_ip")) if old_mode in {"master", "slave"} else ""
+    if old_mode in {"master", "slave"} and not old_peer:
+        raise RuntimeError("Bestehende HA-Rolle besitzt keine gültige Peer-IP")
+
+    # Fehlende Altanker dürfen bei diesem expliziten root-Dialog einmalig aus
+    # dem gebundenen Preimage migriert werden. Ein vorhandener Mismatch bleibt
+    # ein harter Blocker und wird niemals still überschrieben.
+    if not instance_role_anchor_matches(old_mode, peer_ip=old_peer):
+        if project_instance_role_anchor(old_mode, peer_ip=old_peer) is not True:
+            raise RuntimeError("Bestehender Instanzrollen-Anker widerspricht der Konfiguration")
+
+    updated = dict(current)
+    updated.update(
+        {
+            "ha_mode": role,
+            "ha_peer_ip": peer_ip,
+            "ha_fail_timeout": "15",
+            "ha_sync_interval": "60",
+            "ha_auto_recover": "1",
+            "ha_auto_failover": "1",
+        }
+    )
+    payload = (json.dumps(updated, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    committed = None
+    role_changed = old_mode != role or old_peer != peer_ip
+    anchor_committed = False
+    try:
+        committed = atomic_write_bound_file(
+            V4_CONFIG_PATH,
+            payload,
+            uid=int(previous["uid"]),
+            gid=int(previous["gid"]),
+            mode=int(previous["mode"]),
+            expected_snapshot=previous,
+            max_existing_bytes=4 * 1024 * 1024,
+        )
+        if role_changed:
+            anchor_committed = transition_instance_role_anchor(
+                role,
+                peer_ip=peer_ip,
+                expected_mode=old_mode,
+                expected_peer_ip=old_peer,
+            ) is True
+            if not anchor_committed:
+                raise RuntimeError("Instanzrollen-Anker konnte nicht gebunden gewechselt werden")
+        if setup_ha_service() is not True:
+            raise RuntimeError("HA-Dienst konnte nicht transaktional installiert werden")
+        return True
+    except Exception:
+        anchor_rollback_ok = True
+        if anchor_committed:
+            anchor_rollback_ok = transition_instance_role_anchor(
+                old_mode,
+                peer_ip=old_peer,
+                expected_mode=role,
+                expected_peer_ip=peer_ip,
+            ) is True
+        config_rollback_ok = True
+        if committed is not None:
+            try:
+                restore_bound_file(previous, expected_current=committed)
+            except Exception:
+                config_rollback_ok = False
+        if not anchor_rollback_ok or not config_rollback_ok:
+            raise RuntimeError(
+                "HA-Rollenwechsel fehlgeschlagen; Rückfall blieb unvollständig und alle Writer bleiben gesperrt"
+            )
+        raise
 
 def install_ha():
     print("\n" + "="*60)
@@ -169,23 +261,21 @@ def install_ha():
     
     if not peer_ip:
         print("Setup abgebrochen: ungültige Peer-IP.")
-        return
+        return False
 
     if not setup_ssh_keys(user, peer_ip):
         print("\nSetup abgebrochen, da die SSH-Verbindung nicht hergestellt werden konnte.")
-        return
+        return False
 
-    print("\n→ Speichere Cluster-Konfiguration in e3dc.config.txt...")
-    config_path = os.path.join(INSTALL_PATH, "e3dc.config.txt")
-    replace_in_file(config_path, "ha_mode", f"ha_mode = {role}")
-    replace_in_file(config_path, "ha_peer_ip", f"ha_peer_ip = {peer_ip}")
-    replace_in_file(config_path, "ha_fail_timeout", "ha_fail_timeout = 15")
-    replace_in_file(config_path, "ha_sync_interval", "ha_sync_interval = 60")
-    replace_in_file(config_path, "ha_auto_recover", "ha_auto_recover = 1")
-    replace_in_file(config_path, "ha_auto_failover", "ha_auto_failover = 1")
-    print("✓ Konfiguration erfolgreich gespeichert.")
-
-    setup_ha_service()
+    print("\n→ Binde Cluster-Rolle, V4-Konfiguration und HA-Dienst...")
+    try:
+        if _commit_ha_role(role, peer_ip) is not True:
+            return False
+    except Exception as exc:
+        print(f"✗ HA-Transaktion fehlgeschlagen: {exc}")
+        log_error("HA Setup", f"HA-Transaktion fehlgeschlagen: {exc}", exc)
+        return False
+    print("✓ HA-Rolle und Dienst sind transaktional bestätigt.")
     
     print("\n" + "="*60)
     print("✓ High Availability Setup abgeschlossen!")
@@ -199,5 +289,6 @@ def install_ha():
     print("="*60 + "\n")
     
     log_task_completed("High Availability Setup")
+    return True
 
 register_command("49", "High Availability (Cluster)", install_ha, sort_order=49)

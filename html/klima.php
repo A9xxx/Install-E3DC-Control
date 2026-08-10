@@ -92,6 +92,7 @@ function e3dcClimateReasonLabel($reason) {
         'toshiba_cloud_config_incomplete' => 'Cloud-Zugangsdaten unvollständig',
         'toshiba_cloud_readonly' => 'Toshiba Cloud wird read-only ausgelesen',
         'toshiba_cloud_read_failed' => 'Toshiba Cloud konnte nicht gelesen werden',
+        'toshiba_cloud_rate_limited' => 'Toshiba Cloud wartet nach Ratenbegrenzung',
         'toshiba_adapter_not_implemented' => 'Toshiba-Adapter vorbereitet, noch ohne Kommandos',
     ];
     $reason = (string)$reason;
@@ -160,6 +161,13 @@ $cloudLastRead = (string)($climateControl['cloud_last_read_iso'] ?? '');
 $cloudDuration = e3dcClimateFloat($climateControl['cloud_duration_s'] ?? null);
 $cloudDurationLabel = $cloudDuration === null ? '--' : number_format($cloudDuration, 2, ',', '.') . ' s';
 $cloudError = (string)($climateControl['cloud_error'] ?? '');
+$cloudRateLimited = cfgBool($climateControl['cloud_rate_limited'] ?? false, false);
+$cloudHttpStatus = isset($climateControl['cloud_http_status']) ? (int)$climateControl['cloud_http_status'] : 0;
+$cloudRetryAt = (string)($climateControl['cloud_retry_at_iso'] ?? '');
+$cloudRetryInS = isset($climateControl['cloud_retry_in_s']) ? max(0, (int)$climateControl['cloud_retry_in_s']) : 0;
+$cloudRetryLabel = $cloudRetryAt !== ''
+    ? $cloudRetryAt . ($cloudRetryInS > 0 ? ' (' . (string)ceil($cloudRetryInS / 60) . ' min)' : '')
+    : '--';
 $cloudDevices = [];
 if (isset($climateControl['devices']) && is_array($climateControl['devices'])) {
     foreach ($climateControl['devices'] as $device) {
@@ -228,6 +236,10 @@ if (isset($climateControl['devices']) && is_array($climateControl['devices'])) {
                         <?= e3dcClimateInfoRow('Config-Zuordnung', e3dcClimateEsc(empty($deviceIds) ? 'automatisch' : ($configuredDeviceCount . ' von ' . count($deviceIds) . ' erkannt'))) ?>
                         <?= e3dcClimateInfoRow('Letzter Lesezugriff', e3dcClimateEsc($cloudLastRead !== '' ? $cloudLastRead : '--')) ?>
                         <?= e3dcClimateInfoRow('Lesedauer', e3dcClimateEsc($cloudDurationLabel)) ?>
+                        <?php if ($cloudRateLimited): ?>
+                            <?= e3dcClimateInfoRow('HTTP-Status', e3dcClimateEsc($cloudHttpStatus > 0 ? (string)$cloudHttpStatus : '429')) ?>
+                            <?= e3dcClimateInfoRow('Nächster Cloudversuch', e3dcClimateEsc($cloudRetryLabel)) ?>
+                        <?php endif; ?>
                         <?= e3dcClimateInfoRow('Kommandos erlaubt', e3dcClimateEsc(e3dcClimateBoolText($climateControl['commands_allowed'] ?? false))) ?>
                         <?= e3dcClimateInfoRow('Status', e3dcClimateEsc(e3dcClimateReasonLabel($reason))) ?>
                         <?= e3dcClimateInfoRow('Dienst', e3dcClimateEsc($controlServiceStatus)) ?>

@@ -9,6 +9,11 @@ from copy import deepcopy
 import math
 import uuid
 
+try:
+    from Installer import control_time
+except ModuleNotFoundError:  # Native Ausführung mit Installer im sys.path
+    import control_time  # type: ignore
+
 
 ACTIVE_STAGES = frozenset({
     "await_budget", "ramp_to_zero", "zero_settle", "set_phase",
@@ -22,6 +27,9 @@ CONFIRM_FRAMES = 3
 CONFIRM_S = 10.0
 DISCONNECT_CONFIRM_S = 60.0
 STATE_KEY = "_wallbox_phase_transition_reservation"
+LEASE_TIMEBASE_KEY = "lease_timebase"
+DISCONNECT_TIMEBASE_KEY = "disconnect_timebase"
+STABLE_TIMEBASE_KEY = "stable_timebase"
 
 
 def _float(value, default=0.0):
@@ -46,6 +54,52 @@ def _explicit_inactive(value):
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return math.isfinite(float(value)) and float(value) == 0.0
     return False
+
+
+def _guard_begin(duration_s, clock_sample, role):
+    if not isinstance(clock_sample, dict):
+        return None
+    guard = control_time.begin_guard(
+        max(0.0, _float(duration_s, 0.0)),
+        clock_sample,
+        minimum_s=0.0,
+    )
+    guard["guard_role"] = str(role)
+    return guard
+
+
+def _guard_step(previous, duration_s, clock_sample, role):
+    if not isinstance(clock_sample, dict):
+        return None
+    if isinstance(previous, dict):
+        if (
+            previous.get("schema_version") == control_time.GUARD_SCHEMA
+            and previous.get("active") is False
+            and _float(previous.get("remaining_s"), -1.0) <= 0.0
+            and previous.get("valid") is True
+            and previous.get("fail_closed") is not True
+        ):
+            guard = dict(previous)
+            guard.update({
+                "active": False,
+                "remaining_s": 0.0,
+                "sample": dict(clock_sample),
+                "rearmed": False,
+                "reason": "guard_elapsed",
+            })
+        else:
+            guard = control_time.evaluate_guard(
+                previous,
+                clock_sample,
+                minimum_s=0.0,
+            )
+    else:
+        guard = _guard_begin(duration_s, clock_sample, role)
+        guard["fail_closed"] = True
+        guard["rearmed"] = True
+        guard["reason"] = "phase_transition_timebase_incomplete"
+    guard["guard_role"] = str(role)
+    return guard
 
 
 def normalize_current_step(value, default=1.0):
@@ -118,7 +172,7 @@ def begin_reservation(
     now_ts=0.0, lease_s=DEFAULT_LEASE_S, cooldown_s=DEFAULT_COOLDOWN_S,
     owner="wallbox_manager", source="phase_command",
     reason_code="phase_transition", safety_reserve_w=None, max_power_w=0.0,
-    transition_id=None,
+    transition_id=None, clock_sample=None,
 ):
     data = state if isinstance(state, dict) else {}
     target = _int(target_phases, 0)
@@ -137,6 +191,12 @@ def begin_reservation(
         max_power_w=max_power_w,
     )
     rid = str(transition_id or "wb%d-%s" % (max(0, _int(wb_id, 0)), uuid.uuid4().hex[:12]))
+    lease_duration_s = max(120.0, _float(lease_s, DEFAULT_LEASE_S))
+    lease_guard = _guard_begin(
+        lease_duration_s,
+        clock_sample,
+        "reservation_lease",
+    )
     reservation = {
         "schema_version": "wallbox_phase_transition_v2",
         "reservation_id": rid,
@@ -160,8 +220,8 @@ def begin_reservation(
         "stage": "await_budget",
         "active": True,
         "started_ts": now,
-        "lease_until_ts": now + max(120.0, _float(lease_s, DEFAULT_LEASE_S)),
-        "expires_ts": now + max(120.0, _float(lease_s, DEFAULT_LEASE_S)),
+        "lease_until_ts": now + lease_duration_s,
+        "expires_ts": now + lease_duration_s,
         "cooldown_until_ts": now + max(DEFAULT_COOLDOWN_S, _float(cooldown_s, DEFAULT_COOLDOWN_S)),
         "committed_ts": 0.0,
         "confirmed_ts": 0.0,
@@ -172,11 +232,13 @@ def begin_reservation(
         "last_valid_readback_ts": 0.0,
         "blocker": "await_storage_grant",
     }
+    if lease_guard is not None:
+        reservation[LEASE_TIMEBASE_KEY] = lease_guard
     data[STATE_KEY] = reservation
     return deepcopy(reservation)
 
 
-def apply_grant(state, grant, *, now_ts=0.0):
+def apply_grant(state, grant, *, now_ts=0.0, clock_sample=None):
     data = state if isinstance(state, dict) else {}
     current = data.get(STATE_KEY)
     reservation = dict(current) if isinstance(current, dict) else {}
@@ -190,8 +252,60 @@ def apply_grant(state, grant, *, now_ts=0.0):
     state_name = str(answer.get("grant_state") or "waiting")
     lease = _float(answer.get("lease_until_ts"), 0.0)
     if lease > 0.0:
-        reservation["lease_until_ts"] = lease
-        reservation["expires_ts"] = lease
+        current_lease = _float(
+            reservation.get("lease_until_ts", reservation.get("expires_ts")),
+            0.0,
+        )
+        current_guard = reservation.get(LEASE_TIMEBASE_KEY)
+        incoming_revision = str(answer.get("lease_revision") or "")
+        current_revision = str(reservation.get("lease_revision") or "")
+        incoming_duration_s = _float(answer.get("lease_duration_s"), 0.0)
+        same_lease = abs(lease - current_lease) <= 1e-6
+        explicit_revision = bool(
+            incoming_revision
+            and incoming_revision != current_revision
+            and incoming_duration_s > 0.0
+        )
+        if not isinstance(current_guard, dict):
+            reservation["lease_until_ts"] = lease
+            reservation["expires_ts"] = lease
+        elif same_lease:
+            reservation["lease_projection_reused"] = True
+        elif explicit_revision:
+            reservation["lease_until_ts"] = lease
+            reservation["expires_ts"] = lease
+            reservation["lease_revision"] = incoming_revision
+        else:
+            # Zyklisch neu projizierte Wallclock-Leases dürfen den bereits
+            # laufenden monotonic Vertrag weder verlängern noch verkürzen.
+            reservation["lease_projection_ignored"] = True
+        if (
+            isinstance(clock_sample, dict)
+            and (
+                not isinstance(current_guard, dict)
+                or explicit_revision
+            )
+        ):
+            duration_s = (
+                incoming_duration_s
+                if explicit_revision
+                else max(
+                    120.0,
+                    lease - _float(reservation.get("started_ts"), 0.0),
+                )
+            )
+            lease_guard = _guard_begin(
+                duration_s,
+                clock_sample,
+                "reservation_lease",
+            )
+            if not isinstance(current_guard, dict):
+                lease_guard.update({
+                    "fail_closed": True,
+                    "rearmed": True,
+                    "reason": "legacy_lease_migrated",
+                })
+            reservation[LEASE_TIMEBASE_KEY] = lease_guard
     reservation["granted_w"] = granted
     reservation["grant_state"] = state_name
     reservation["blocker"] = str(answer.get("blocker") or answer.get("reason_code") or "")
@@ -252,7 +366,61 @@ def set_stage(state, stage, *, now_ts=0.0, reason_code=None, deadline_ts=None):
     return deepcopy(reservation)
 
 
-def update_reservation(state, *, status=None, now_ts=0.0, connected=None):
+def reservation_lease_contract(reservation, *, now_ts=0.0, clock_sample=None):
+    """Wertet die Lease autoritativ monotonic oder explizit als Legacy aus."""
+
+    item = reservation if isinstance(reservation, dict) else {}
+    now = _float(now_ts, 0.0)
+    lease = _float(item.get("lease_until_ts", item.get("expires_ts")), 0.0)
+    raw_guard = item.get(LEASE_TIMEBASE_KEY)
+    guard = None
+    source = "legacy_wallclock"
+    if isinstance(raw_guard, dict):
+        source = "monotonic_guard"
+        if isinstance(clock_sample, dict):
+            guard = _guard_step(
+                raw_guard,
+                max(120.0, lease - _float(item.get("started_ts"), 0.0)),
+                clock_sample,
+                "reservation_lease",
+            )
+        else:
+            guard = dict(raw_guard)
+            guard.update({
+                "active": True,
+                "fail_closed": True,
+                "reason": "phase_transition_current_timebase_missing",
+            })
+    expired = bool(
+        item
+        and (
+            guard.get("active") is False
+            if isinstance(guard, dict)
+            else lease > 0.0 and now >= lease
+        )
+    )
+    return {
+        "contract": "wallbox_phase_reservation_lease_v1",
+        "expired": expired,
+        "active": bool(item and not expired),
+        "timebase_unbound": bool(
+            isinstance(guard, dict) and guard.get("fail_closed") is True
+        ),
+        "source": source,
+        "guard": guard,
+        "lease_until_ts": lease,
+        "wall_ts": now,
+    }
+
+
+def update_reservation(
+    state,
+    *,
+    status=None,
+    now_ts=0.0,
+    connected=None,
+    clock_sample=None,
+):
     data = state if isinstance(state, dict) else {}
     current = data.get(STATE_KEY)
     reservation = dict(current) if isinstance(current, dict) else {}
@@ -261,19 +429,106 @@ def update_reservation(state, *, status=None, now_ts=0.0, connected=None):
         return inactive_reservation("not_active")
 
     lease = _float(reservation.get("lease_until_ts", reservation.get("expires_ts")), 0.0)
-    if lease > 0.0 and now >= lease:
-        reservation.update({"active": False, "stage": "recovery_hold", "grant_state": "expired", "blocker": "lease_expired"})
+    lease_duration_s = max(
+        120.0,
+        lease - _float(reservation.get("started_ts"), 0.0),
+    )
+    lease_guard = None
+    if isinstance(clock_sample, dict):
+        lease_guard = _guard_step(
+            reservation.get(LEASE_TIMEBASE_KEY),
+            lease_duration_s,
+            clock_sample,
+            "reservation_lease",
+        )
+        reservation[LEASE_TIMEBASE_KEY] = lease_guard
+    elif isinstance(reservation.get(LEASE_TIMEBASE_KEY), dict):
+        # Ein gebundener Vertrag darf bei fehlender aktueller Zeitprobe nie auf
+        # die Wallclock zurückfallen.
+        lease_guard = dict(reservation[LEASE_TIMEBASE_KEY])
+        lease_guard.update({
+            "active": True,
+            "fail_closed": True,
+            "reason": "phase_transition_current_timebase_missing",
+        })
+        reservation[LEASE_TIMEBASE_KEY] = lease_guard
+
+    lease_elapsed = bool(
+        lease_guard.get("active") is False
+        if isinstance(lease_guard, dict)
+        else lease > 0.0 and now >= lease
+    )
+    timebase_uncertain = bool(
+        isinstance(lease_guard, dict)
+        and lease_guard.get("fail_closed") is True
+    )
+    output_bound = bool(
+        _int(reservation.get("committed_w"), 0) > 0
+        or _float(reservation.get("committed_ts"), 0.0) > 0.0
+        or str(reservation.get("stage") or "")
+        in ("request_output", "phase_switch", "cooldown", "confirming")
+    )
+    if timebase_uncertain and output_bound:
+        reservation.update({
+            "active": True,
+            "stage": "recovery_hold",
+            "blocker": "phase_transition_timebase_unbound",
+        })
+        if _int(reservation.get("committed_w"), 0) > 0:
+            reservation["grant_state"] = "committed"
+        data[STATE_KEY] = reservation
+        return public_reservation(reservation, now)
+    if lease_elapsed:
+        max_recovery_s = max(600.0, _float(reservation.get("cooldown_until_ts", 0.0) - lease, 600.0))
+        recovery_expired = bool(lease > 0.0 and now >= lease + max_recovery_s)
+        if output_bound and not recovery_expired:
+            reservation.update({
+                "active": True,
+                "stage": "recovery_hold",
+                "blocker": "lease_elapsed_output_bound",
+            })
+            if _int(reservation.get("committed_w"), 0) > 0:
+                reservation["grant_state"] = "committed"
+        else:
+            reservation.update({
+                "active": False,
+                "stage": "recovery_hold",
+                "grant_state": "expired",
+                "blocker": "lease_expired",
+            })
         data[STATE_KEY] = reservation
         return public_reservation(reservation, now)
 
     if connected is False:
         since = _float(reservation.get("disconnected_since_ts"), 0.0)
+        disconnect_guard = reservation.get(DISCONNECT_TIMEBASE_KEY)
+        if isinstance(clock_sample, dict):
+            if not isinstance(disconnect_guard, dict):
+                disconnect_guard = _guard_begin(
+                    DISCONNECT_CONFIRM_S,
+                    clock_sample,
+                    "disconnect_confirm",
+                )
+            else:
+                disconnect_guard = _guard_step(
+                    disconnect_guard,
+                    DISCONNECT_CONFIRM_S,
+                    clock_sample,
+                    "disconnect_confirm",
+                )
+            reservation[DISCONNECT_TIMEBASE_KEY] = disconnect_guard
         if since <= 0.0:
             reservation["disconnected_since_ts"] = now
-        elif now - since >= DISCONNECT_CONFIRM_S and str(reservation.get("stage")) == "await_budget":
+        disconnect_confirmed = bool(
+            disconnect_guard.get("active") is False
+            if isinstance(disconnect_guard, dict)
+            else since > 0.0 and now - since >= DISCONNECT_CONFIRM_S
+        )
+        if disconnect_confirmed and str(reservation.get("stage")) == "await_budget":
             reservation.update({"active": False, "stage": "aborted", "grant_state": "rejected", "blocker": "vehicle_disconnected"})
     elif connected is True:
         reservation["disconnected_since_ts"] = 0.0
+        reservation.pop(DISCONNECT_TIMEBASE_KEY, None)
 
     st = status if isinstance(status, dict) else {}
     valid = bool(st) and st.get("driver_status_valid") is not False and st.get("driver_status_stale") is not True
@@ -290,9 +545,30 @@ def update_reservation(state, *, status=None, now_ts=0.0, connected=None):
         reservation["valid_frames"] = _int(reservation.get("valid_frames"), 0) + 1
         if _float(reservation.get("stable_since_ts"), 0.0) <= 0.0:
             reservation["stable_since_ts"] = now
+        stable_guard = reservation.get(STABLE_TIMEBASE_KEY)
+        if isinstance(clock_sample, dict):
+            if not isinstance(stable_guard, dict):
+                stable_guard = _guard_begin(
+                    CONFIRM_S,
+                    clock_sample,
+                    "target_stable_confirm",
+                )
+            else:
+                stable_guard = _guard_step(
+                    stable_guard,
+                    CONFIRM_S,
+                    clock_sample,
+                    "target_stable_confirm",
+                )
+            reservation[STABLE_TIMEBASE_KEY] = stable_guard
+        stable_confirmed = bool(
+            stable_guard.get("active") is False
+            if isinstance(stable_guard, dict)
+            else now - _float(reservation.get("stable_since_ts"), now) >= CONFIRM_S
+        )
         if (
             _int(reservation.get("valid_frames"), 0) >= CONFIRM_FRAMES
-            and now - _float(reservation.get("stable_since_ts"), now) >= CONFIRM_S
+            and stable_confirmed
         ):
             reservation.update({
                 "active": False, "stage": "completed", "grant_state": "expired",
@@ -301,6 +577,7 @@ def update_reservation(state, *, status=None, now_ts=0.0, connected=None):
     elif valid:
         reservation["valid_frames"] = 0
         reservation["stable_since_ts"] = 0.0
+        reservation.pop(STABLE_TIMEBASE_KEY, None)
 
     data[STATE_KEY] = reservation
     return public_reservation(reservation, now)
@@ -411,6 +688,103 @@ def output_evidence_binding_contract(
     }
 
 
+def preoutput_supersession_evidence_contract(
+    reservation,
+    *,
+    sequence=None,
+    output_intent=None,
+    output_ack=None,
+    recovery_hold=None,
+    restart_authorized=None,
+    wakeup_active=False,
+):
+    """Belegt eine noch vollständig ausgangslose ``await_budget``-Generation."""
+
+    item = reservation if isinstance(reservation, dict) else {}
+    binding = output_evidence_binding_contract(
+        item,
+        sequence=sequence,
+        output_intent=output_intent,
+        output_ack=output_ack,
+        recovery_hold=recovery_hold,
+        restart_authorized=restart_authorized,
+    )
+    reservation_id = str(
+        item.get("transition_id") or item.get("reservation_id") or ""
+    )
+    target = _int(item.get("target_phases"), 0)
+    no_output_binding = not any((
+        binding.get("sequence_bound") is True,
+        binding.get("output_intent_bound") is True,
+        binding.get("output_ack_bound") is True,
+        binding.get("recovery_hold_bound") is True,
+        binding.get("restart_authorized_bound") is True,
+        bool(wakeup_active),
+    ))
+    eligible = bool(
+        item.get("active") is True
+        and str(item.get("stage") or "") == "await_budget"
+        and reservation_id
+        and target in (1, 3)
+        and max(0, _int(item.get("committed_w"), 0)) == 0
+        and _float(item.get("committed_ts"), 0.0) <= 0.0
+        and max(0, _int(item.get("valid_frames"), 0)) == 0
+        and no_output_binding
+    )
+    return {
+        "schema_version": "wallbox_phase_preoutput_supersession_v1",
+        "eligible": eligible,
+        "reservation_id": reservation_id,
+        "target_phases": target,
+        "committed_w": max(0, _int(item.get("committed_w"), 0)),
+        "committed_ts": max(0.0, _float(item.get("committed_ts"), 0.0)),
+        "valid_frames": max(0, _int(item.get("valid_frames"), 0)),
+        "sequence_bound": bool(binding.get("sequence_bound")),
+        "output_intent_bound": bool(binding.get("output_intent_bound")),
+        "output_ack_bound": bool(binding.get("output_ack_bound")),
+        "recovery_hold_bound": bool(binding.get("recovery_hold_bound")),
+        "restart_authorized_bound": bool(binding.get("restart_authorized_bound")),
+        "wakeup_active": bool(wakeup_active),
+    }
+
+
+def preoutput_supersession_evidence_is_bound(reservation):
+    """Validiert die über die Prozessgrenze transportierte Preoutput-Evidenz."""
+
+    item = reservation if isinstance(reservation, dict) else {}
+    proof = item.get("preoutput_supersession_evidence")
+    proof = proof if isinstance(proof, dict) else {}
+    reservation_id = str(
+        item.get("transition_id") or item.get("reservation_id") or ""
+    )
+    return bool(
+        proof.get("schema_version") == "wallbox_phase_preoutput_supersession_v1"
+        and proof.get("eligible") is True
+        and reservation_id
+        and item.get("active") is True
+        and str(item.get("stage") or "") == "await_budget"
+        and str(proof.get("reservation_id") or "") == reservation_id
+        and _int(proof.get("target_phases"), 0) == _int(item.get("target_phases"), 0)
+        and max(0, _int(item.get("committed_w"), 0)) == 0
+        and _float(item.get("committed_ts"), 0.0) <= 0.0
+        and max(0, _int(item.get("valid_frames"), 0)) == 0
+        and max(0, _int(proof.get("committed_w"), 0)) == 0
+        and _float(proof.get("committed_ts"), 0.0) <= 0.0
+        and max(0, _int(proof.get("valid_frames"), 0)) == 0
+        and not any(
+            proof.get(key) is True
+            for key in (
+                "sequence_bound",
+                "output_intent_bound",
+                "output_ack_bound",
+                "recovery_hold_bound",
+                "restart_authorized_bound",
+                "wakeup_active",
+            )
+        )
+    )
+
+
 def expiration_resolution_contract(
     reservation,
     *,
@@ -422,6 +796,7 @@ def expiration_resolution_contract(
     recovery_hold=None,
     restart_authorized=None,
     wakeup_active=False,
+    clock_sample=None,
 ):
     """Klassifiziert, ob eine abgelaufene Reservierung ohne I/O entfernt werden kann.
 
@@ -436,7 +811,34 @@ def expiration_resolution_contract(
     st = status if isinstance(status, dict) else {}
     now = _float(now_ts, 0.0)
     lease = _float(item.get("lease_until_ts", item.get("expires_ts")), 0.0)
-    lease_expired = bool(item and lease > 0.0 and now >= lease)
+    raw_lease_guard = item.get(LEASE_TIMEBASE_KEY)
+    lease_guard = None
+    if isinstance(raw_lease_guard, dict) and isinstance(clock_sample, dict):
+        lease_guard = _guard_step(
+            raw_lease_guard,
+            max(120.0, lease - _float(item.get("started_ts"), 0.0)),
+            clock_sample,
+            "reservation_lease",
+        )
+    elif isinstance(raw_lease_guard, dict):
+        lease_guard = dict(raw_lease_guard)
+        lease_guard.update({
+            "active": True,
+            "fail_closed": True,
+            "reason": "phase_transition_current_timebase_missing",
+        })
+    lease_timebase_unbound = bool(
+        isinstance(lease_guard, dict)
+        and lease_guard.get("fail_closed") is True
+    )
+    lease_expired = bool(
+        item
+        and (
+            lease_guard.get("active") is False
+            if isinstance(lease_guard, dict)
+            else lease > 0.0 and now >= lease
+        )
+    )
     status_valid = bool(
         st
         and st.get("driver_status_valid") is True
@@ -456,9 +858,13 @@ def expiration_resolution_contract(
             _float(st.get("evse_current"), 0.0),
         ) <= 0.0
     )
+    # ``granted_w`` bestätigt nur die Wattzuteilung des Storage Managers und
+    # ist ausdrücklich noch kein Geräteausgang. Erst ein Commit, bestätigte
+    # Leistungsframes oder gebundene Output-Evidenz machen die Generation
+    # hardwarewirksam. Andernfalls würde ein nie ausgeführter Grant nach
+    # Lease-Ablauf dauerhaft als aktive Transition hängen bleiben.
     uncommitted = bool(
-        max(0, _int(item.get("granted_w"), 0)) == 0
-        and max(0, _int(item.get("committed_w"), 0)) == 0
+        max(0, _int(item.get("committed_w"), 0)) == 0
         and _float(item.get("committed_ts"), 0.0) <= 0.0
         and _int(item.get("valid_frames"), 0) == 0
     )
@@ -521,7 +927,11 @@ def expiration_resolution_contract(
         action = "none"
         reason = "not_active"
     elif not lease_expired:
-        reason = "lease_not_expired"
+        reason = (
+            "phase_transition_timebase_unbound"
+            if lease_timebase_unbound
+            else "lease_not_expired"
+        )
     elif not uncommitted:
         reason = "expired_output_committed"
     elif not status_valid:
@@ -542,6 +952,8 @@ def expiration_resolution_contract(
         "reason": reason,
         "terminal": action == "terminalize",
         "lease_expired": lease_expired,
+        "lease_timebase_unbound": lease_timebase_unbound,
+        "lease_timebase": lease_guard,
         "uncommitted": uncommitted,
         "status_valid": status_valid,
         "cp_inactive": cp_inactive,
@@ -594,19 +1006,61 @@ def public_reservation(reservation, now_ts=0.0):
     if not item:
         return inactive_reservation()
     lease = _float(item.get("lease_until_ts", item.get("expires_ts")), 0.0)
-    stage_deadline = _float(item.get("stage_deadline_ts"), lease)
-    item["remaining_s"] = max(0.0, lease - _float(now_ts, 0.0)) if lease > 0.0 else 0.0
+    lease_guard = item.get(LEASE_TIMEBASE_KEY)
+    if isinstance(lease_guard, dict):
+        item["remaining_s"] = max(
+            0.0,
+            _float(lease_guard.get("remaining_s"), 0.0),
+        )
+    else:
+        item["remaining_s"] = max(0.0, lease - _float(now_ts, 0.0)) if lease > 0.0 else 0.0
     item["reserved_w"] = max(0, _int(item.get("requested_w", item.get("reserved_w")), 0)) if item.get("active") else 0
     return deepcopy(item)
 
 
-def rehydrate_reservation(raw, *, now_ts=0.0):
+def rehydrate_reservation(raw, *, now_ts=0.0, clock_sample=None):
     item = dict(raw) if isinstance(raw, dict) else {}
     if not item:
         return {}
     now = _float(now_ts, 0.0)
     lease = _float(item.get("lease_until_ts", item.get("expires_ts")), 0.0)
     cooldown = _float(item.get("cooldown_until_ts"), 0.0)
+    raw_guard = item.get(LEASE_TIMEBASE_KEY)
+    if isinstance(raw_guard, dict):
+        lease_contract = reservation_lease_contract(
+            item,
+            now_ts=now,
+            clock_sample=clock_sample,
+        )
+        guard = lease_contract.get("guard")
+        if isinstance(guard, dict):
+            item[LEASE_TIMEBASE_KEY] = guard
+        if lease_contract.get("expired") is True and cooldown <= now:
+            return {}
+        item["active"] = True
+        item["stage"] = "recovery_hold"
+        item["blocker"] = (
+            "manager_restart_timebase_recovery"
+            if lease_contract.get("timebase_unbound")
+            else "manager_restart_recovery"
+        )
+        return item
+    if isinstance(clock_sample, dict) and item.get("active"):
+        duration_s = max(120.0, lease - _float(item.get("started_ts"), 0.0))
+        guard = _guard_begin(
+            duration_s,
+            clock_sample,
+            "reservation_lease",
+        )
+        guard.update({
+            "fail_closed": True,
+            "rearmed": True,
+            "reason": "legacy_lease_rehydrated",
+        })
+        item[LEASE_TIMEBASE_KEY] = guard
+        item["stage"] = "recovery_hold"
+        item["blocker"] = "manager_restart_timebase_recovery"
+        return item
     if lease <= now and cooldown <= now:
         return {}
     if item.get("active") and lease > now:
@@ -701,6 +1155,14 @@ def status_dimensions(reservation, *, charge_truth="unknown", inhibit_owner="non
     lease = _float(item.get("lease_until_ts", item.get("expires_ts")), 0.0)
     stage_deadline = _float(item.get("stage_deadline_ts"), lease)
     cooldown_until = _float(item.get("cooldown_until_ts"), 0.0)
+    lease_guard = item.get(LEASE_TIMEBASE_KEY)
+    transition_remaining_s = (
+        max(0.0, _float(lease_guard.get("remaining_s"), 0.0))
+        if isinstance(lease_guard, dict)
+        else max(0.0, stage_deadline - now)
+        if stage_deadline > 0.0 and item.get("active")
+        else 0.0
+    )
     return {
         "transition_state": {
             "active": bool(item.get("active")),
@@ -708,7 +1170,7 @@ def status_dimensions(reservation, *, charge_truth="unknown", inhibit_owner="non
             "transition_id": str(item.get("transition_id") or item.get("reservation_id") or ""),
             "target_phases": _int(item.get("target_phases"), 0),
             "deadline_ts": stage_deadline,
-            "remaining_s": max(0.0, stage_deadline - now) if stage_deadline > 0.0 and item.get("active") else 0.0,
+            "remaining_s": transition_remaining_s,
             "reason_code": str(item.get("reason_code") or ""),
         },
         "phase_cooldown": {
@@ -760,9 +1222,11 @@ def explicit_inhibit_owner(evidence, *, status_valid=True):
 
 
 __all__ = [
-    "ACTIVE_STAGES", "TERMINAL_STAGES", "STATE_KEY", "aggregate_reservations",
+    "ACTIVE_STAGES", "TERMINAL_STAGES", "STATE_KEY", "LEASE_TIMEBASE_KEY",
+    "DISCONNECT_TIMEBASE_KEY", "STABLE_TIMEBASE_KEY", "aggregate_reservations",
     "apply_grant", "arbitrate_grants", "begin_reservation", "grant_is_sufficient",
     "expiration_resolution_contract", "mark_committed", "planned_reservation_power_w", "public_reservation",
-    "rehydrate_reservation", "set_stage", "status_dimensions", "update_reservation",
+    "preoutput_supersession_evidence_contract", "preoutput_supersession_evidence_is_bound",
+    "rehydrate_reservation", "reservation_lease_contract", "set_stage", "status_dimensions", "update_reservation",
     "normalize_charge_truth", "explicit_inhibit_owner",
 ]

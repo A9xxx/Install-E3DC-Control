@@ -34,6 +34,9 @@ class ChargerController:
         "cp_interrupt",
         "release_to_e3dc",
         "release_to_default",
+        # Kanonischer, garantiert ausgangsloser Plannervertrag. Er wird im
+        # Manager vor allen Hardware-/Budgetgates als NOOP abgeschlossen.
+        "observe_only",
     })
 
     @staticmethod

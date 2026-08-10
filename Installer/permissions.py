@@ -12,6 +12,7 @@ import stat
 import inspect
 import hashlib
 import types
+import re
 
 # Standard-Ausgabe auf UTF-8 erzwingen
 try:
@@ -35,6 +36,7 @@ if __package__ in (None, ""):
         configured_optional_services,
         preinstalled_optional_service_expected,
     )
+    from Installer.ramdisk_guard import probe_ramdisk_tmpfs
     from Installer import backup_integrity as _backup_integrity
 else:
     from .core import CAT_ENV, register_command
@@ -48,6 +50,7 @@ else:
         configured_optional_services,
         preinstalled_optional_service_expected,
     )
+    from .ramdisk_guard import probe_ramdisk_tmpfs
     from . import backup_integrity as _backup_integrity
 
 BackupIntegrityError = _backup_integrity.BackupIntegrityError
@@ -83,6 +86,13 @@ CONFIG_SECRET_DIR_MODE = config_secret_dir_mode_text()
 LEGACY_E3DC_SERVICE = "e3dc"
 NATIVE_LIVE_SERVICE = "e3dc-live"
 LEGACY_SCREEN_NAMES = ("e3dc", "E3DC")
+STORAGE_MANAGER_SERVICE = "e3dc-storage-manager"
+STORAGE_MANAGER_CANONICAL_SCRIPT = "storage_manager.py"
+STORAGE_MANAGER_LEGACY_SCRIPT = "storage_manager_legacy.py"
+STORAGE_MANAGER_LEGACY_SCRIPTS = (
+    "storage_manager_next.py",
+    STORAGE_MANAGER_LEGACY_SCRIPT,
+)
 PI_GUARD_PATH = "/usr/local/bin/pi_guard.sh"
 PIGUARD_SERVICE = "/etc/systemd/system/piguard.service"
 WATCHDOG_UPDATE_PAUSE_FILE = "/var/www/html/ramdisk/watchdog.update_pause"
@@ -379,6 +389,160 @@ def _systemd_unit_exists(service_name):
         or os.path.exists(f"/lib/systemd/system/{unit}")
         or os.path.exists(f"/usr/lib/systemd/system/{unit}")
     )
+
+
+def _parse_systemd_show_properties(raw):
+    properties = {}
+    for line in str(raw or "").splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key.strip():
+            properties[key.strip()] = value.strip()
+    return properties
+
+
+def _storage_writer_process_snapshot(proc_root="/proc"):
+    """Liest nur exakte Python-Skriptnamen aus dem aktuellen /proc-Snapshot."""
+    canonical_pids = []
+    legacy_pids = []
+    errors = []
+    try:
+        entries = list(os.scandir(proc_root))
+    except OSError as exc:
+        return {
+            "complete": False,
+            "canonical_pids": [],
+            "legacy_pids": [],
+            "errors": [str(exc)],
+        }
+
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == os.getpid():
+            continue
+        try:
+            with open(
+                os.path.join(proc_root, entry.name, "cmdline"),
+                "rb",
+            ) as handle:
+                payload = handle.read(64 * 1024 + 1)
+        except FileNotFoundError:
+            # Ein zwischen Auflistung und Lesen beendeter Prozess ist kein
+            # fortbestehender Writer und deshalb kein unvollständiger Befund.
+            continue
+        except OSError as exc:
+            errors.append(f"pid={pid}: {exc}")
+            continue
+        if len(payload) > 64 * 1024:
+            errors.append(f"pid={pid}: cmdline_unplausibly_large")
+            continue
+        names = {
+            os.path.basename(token.decode("utf-8", errors="replace"))
+            for token in payload.split(b"\0")
+            if token
+        }
+        if STORAGE_MANAGER_CANONICAL_SCRIPT in names:
+            canonical_pids.append(pid)
+        if any(script_name in names for script_name in STORAGE_MANAGER_LEGACY_SCRIPTS):
+            legacy_pids.append(pid)
+
+    return {
+        "complete": not errors,
+        "canonical_pids": sorted(set(canonical_pids)),
+        "legacy_pids": sorted(set(legacy_pids)),
+        "errors": errors[:8],
+    }
+
+
+def storage_manager_writer_contract(
+    *,
+    command_runner=None,
+    proc_root="/proc",
+    unit_exists=None,
+    require_canonical_unit=True,
+):
+    """Bindet den einzigen zulässigen Storage-Writer an Unit und MainPID."""
+    runner = command_runner or run_command
+    unit_present = (
+        _systemd_unit_exists(STORAGE_MANAGER_SERVICE)
+        if unit_exists is None
+        else bool(unit_exists)
+    )
+    blockers = []
+    properties = {}
+
+    if unit_present:
+        result = runner(
+            "systemctl show -p LoadState -p ActiveState -p MainPID -p ExecStart "
+            f"{STORAGE_MANAGER_SERVICE}.service"
+        )
+        if not result.get("success"):
+            blockers.append("effective_unit_contract_unreadable")
+        else:
+            properties = _parse_systemd_show_properties(result.get("stdout"))
+            exec_start = properties.get("ExecStart", "")
+            canonical_path = os.path.realpath(
+                os.path.join(INSTALLER_DIR, STORAGE_MANAGER_CANONICAL_SCRIPT)
+            )
+            canonical_bound = bool(
+                re.search(
+                    re.escape(canonical_path) + r'(?=$|[\s;\}\]\"])',
+                    exec_start,
+                )
+            )
+            if properties.get("LoadState") != "loaded":
+                blockers.append("storage_unit_not_loaded")
+            if require_canonical_unit and any(
+                script_name in exec_start
+                for script_name in STORAGE_MANAGER_LEGACY_SCRIPTS
+            ):
+                blockers.append("legacy_execstart")
+            if require_canonical_unit and not canonical_bound:
+                blockers.append("effective_execstart_not_canonical")
+
+    processes = _storage_writer_process_snapshot(proc_root)
+    canonical_pids = list(processes.get("canonical_pids") or [])
+    legacy_pids = list(processes.get("legacy_pids") or [])
+    if not processes.get("complete"):
+        blockers.append("storage_process_snapshot_incomplete")
+    if legacy_pids:
+        blockers.append("legacy_storage_process_running")
+    if len(canonical_pids) > 1:
+        blockers.append("multiple_native_storage_processes")
+    if not unit_present and canonical_pids:
+        blockers.append("native_storage_process_without_unit")
+
+    active_state = properties.get("ActiveState", "")
+    try:
+        main_pid = int(properties.get("MainPID") or 0)
+    except (TypeError, ValueError):
+        main_pid = 0
+    if unit_present and active_state == "active":
+        if main_pid <= 1 or canonical_pids != [main_pid]:
+            blockers.append("active_unit_mainpid_not_only_native_writer")
+    elif unit_present and active_state in {
+        "activating",
+        "deactivating",
+        "reloading",
+    }:
+        blockers.append("storage_unit_state_transitional")
+    elif canonical_pids:
+        blockers.append("native_storage_process_outside_active_unit")
+
+    blockers = list(dict.fromkeys(blockers))
+    return {
+        "schema_version": "storage_manager_writer_contract_v1",
+        "ok": not blockers,
+        "status": "canonical_single_writer" if not blockers else "blocked",
+        "unit_present": bool(unit_present),
+        "unit_active_state": active_state or None,
+        "unit_main_pid": main_pid or None,
+        "canonical_process_pids": canonical_pids,
+        "legacy_process_pids": legacy_pids,
+        "process_snapshot_complete": bool(processes.get("complete")),
+        "blockers": blockers,
+    }
 
 
 def _is_v4_native_mode():
@@ -724,12 +888,16 @@ def check_webportal_permissions(include_service_checks=True):
 
     issues = []
     wp_path = "/var/www/html"
-    if not os.path.exists(wp_path):
+    if not os.path.lexists(wp_path):
         print(f"{RED}✗{RESET} {wp_path} existiert nicht – Webportal nicht installiert")
         issues.append("wp_missing")
         return issues
     try:
-        st = os.stat(wp_path)
+        st = os.lstat(wp_path)
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+            print(f"{RED}✗{RESET} {wp_path} ist kein eindeutiges Verzeichnis")
+            issues.append("wp_unsafe")
+            return issues
         owner = pwd.getpwuid(st.st_uid).pw_name
         group = grp.getgrgid(st.st_gid).gr_name
         mode = oct(st.st_mode)[-3:]
@@ -745,18 +913,21 @@ def check_webportal_permissions(include_service_checks=True):
             perm_logger.error(f"{wp_path} fehlt Execute-Bit fuer www-data: mode={mode}")
             issues.append("wp_mode")   # löst fix_webportal_permissions → chmod 775 aus
 
-        if owner != INSTALL_USER or group != "www-data":
-            details = format_wp_issue(owner, group, mode, INSTALL_USER, "www-data", "775")
+        # Der Webroot schützt insbesondere den persistenten Namen des
+        # RAM-Disk-Mountpoints. Schreibbar sind nur die ausdrücklich
+        # vorgesehenen Unterverzeichnisse, niemals deren Elternverzeichnis.
+        if owner != "root" or group != "www-data":
+            details = format_wp_issue(owner, group, mode, "root", "www-data", "755")
             print(f"{RED}✗{RESET} {wp_path} Problem: {details}")
             issues.append("wp_owner")
         else:
-            print(f"{GREEN}✓{RESET} {wp_path} gehört {INSTALL_USER}:www-data")
-        if mode != "775":
+            print(f"{GREEN}✓{RESET} {wp_path} gehört root:www-data")
+        if mode != "755":
             if "wp_mode" not in issues:   # nicht doppelt melden
-                print(f"{RED}✗{RESET} {wp_path} hat Rechte {mode} statt 775")
+                print(f"{RED}✗{RESET} {wp_path} hat Rechte {mode} statt 755")
                 issues.append("wp_mode")
         else:
-            print(f"{GREEN}✓{RESET} {wp_path} hat korrekte Rechte (775)")
+            print(f"{GREEN}✓{RESET} {wp_path} hat korrekte Rechte (755)")
         # Sub-Ordner prüfen
         subfolders = [
             (f"{wp_path}/tmp", "775"),
@@ -768,11 +939,17 @@ def check_webportal_permissions(include_service_checks=True):
             (f"{wp_path}/data/matter-storage", "700")
         ]
         for folder_path, expected_mode in subfolders:
-            if not os.path.exists(folder_path):
+            if not os.path.lexists(folder_path):
                 print(f"{RED}✗{RESET} {folder_path} existiert nicht")
                 issues.append(f"{os.path.basename(folder_path)}_missing")
             else:
-                st_sub = os.stat(folder_path)
+                st_sub = os.lstat(folder_path)
+                if stat.S_ISLNK(st_sub.st_mode) or not stat.S_ISDIR(st_sub.st_mode):
+                    print(
+                        f"{RED}✗{RESET} {folder_path} ist kein eindeutiges Verzeichnis"
+                    )
+                    issues.append(f"{os.path.basename(folder_path)}_unsafe")
+                    continue
                 # Mode-Erkennung: 4 Stellen für S-Bit (z.B. 2775), sonst 3
                 if len(expected_mode) == 4:
                     mode_sub = oct(st_sub.st_mode)[-4:]
@@ -810,19 +987,17 @@ def check_webportal_permissions(include_service_checks=True):
                     else:
                         print(f"{GREEN}✓{RESET} {folder_path} ist für www-data schreibbar")
 
-                # NEUER CHECK: Ramdisk als tmpfs gemountet? (kritisch fuer e3dc-live)
-                # Das Verzeichnis kann existieren ohne als RAM-Mount eingehangen zu sein!
-                # In Docker-Umgebungen wird tmpfs anders gemountet -> ueberspringen.
+                # Die RAM-Disk muss exakt am kanonischen Ziel als tmpfs gebunden
+                # sein. Eine globale ``mount``-Textsuche darf weder einen
+                # fremden tmpfs-Mount noch einen Bind-Mount am Ziel akzeptieren.
+                # In Docker-Umgebungen wird tmpfs über Compose bereitgestellt.
                 _is_docker_env = os.path.exists('/.dockerenv')
                 if os.path.basename(folder_path) == "ramdisk" and not _is_docker_env:
                     try:
-                        mount_res = run_command("mount")
-                        mount_out = mount_res.get('stdout', '') + mount_res.get('stderr', '')
-                        ramdisk_mounted = (
-                            f"tmpfs on {folder_path}" in mount_out or
-                            (folder_path in mount_out and "tmpfs" in mount_out)
+                        ramdisk_probe = probe_ramdisk_tmpfs(
+                            ramdisk_path=folder_path,
                         )
-                        if ramdisk_mounted:
+                        if ramdisk_probe.get("ok"):
                             print(f"{GREEN}[OK]{RESET} {folder_path} ist als tmpfs (RAM) eingehangen")
                         else:
                             print(f"{RED}[!]{RESET} {folder_path} existiert aber ist KEIN tmpfs-Mount!")
@@ -890,7 +1065,7 @@ FILE_DEFINITIONS = [
     {"path": f"{INSTALL_PATH}/e3dc.strompreise.txt", "mode": "640", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": f"{INSTALLER_DIR}/wallbox_manager.py", "mode": "755", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": True},
     {"path": f"{INSTALLER_DIR}/storage_manager.py", "mode": "755", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": True},
-    {"path": f"{INSTALLER_DIR}/storage_manager_legacy.py", "mode": "755", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": True},
+    {"path": f"{INSTALLER_DIR}/storage_manager_legacy.py", "mode": "644", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": f"{INSTALLER_DIR}/storage_simulator.py", "mode": "755", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": True},
     {"path": f"{INSTALLER_DIR}/direct_marketing.py", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": f"{INSTALLER_DIR}/direct_marketing_dispatch_planner.py", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
@@ -922,6 +1097,7 @@ FILE_DEFINITIONS = [
     {"path": "/var/www/html/vitals.php", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": "/var/www/html/langzeit.php", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": "/var/www/html/get_live_json.php", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": False, "executable": False},
+    {"path": "/var/www/html/get_shadow_snapshot.php", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": False, "executable": False},
     {"path": "/var/www/html/config_editor.php", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": False, "executable": False},
     {"path": "/var/www/html/backup_history.php", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": "/var/www/html/send_weekly_telegram.php", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
@@ -959,7 +1135,7 @@ FILE_DEFINITIONS = [
     {"path": f"{INSTALLER_DIR}/stiebel/stiebel_live.py", "mode": "755", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": True},
     {"path": f"{INSTALLER_DIR}/dimplex/dimplex_live.py", "mode": "755", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": True},
     {"path": "/var/www/html/ramdisk/waermepumpe.json", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
-    {"path": f"{INSTALLER_DIR}/luxtronik/set_manual_boost.py", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
+    {"path": f"{INSTALLER_DIR}/luxtronik/set_manual_boost.py", "mode": "644", "owner": INSTALL_USER, "group": INSTALL_GROUP, "optional": True, "executable": False},
     {"path": "/var/www/html/ramdisk/luxtronik.json", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": "/var/www/html/ramdisk/stiebel_isg.json", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": "/var/www/html/ramdisk/dimplex_wpm.json", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
@@ -1015,6 +1191,20 @@ FILE_DEFINITIONS = [
 ]
 
 
+_WEB_WRITABLE_TOP = frozenset({"data", "logs", "ramdisk", "tmp"})
+_WEB_PRIVATE_RUNTIME_FILES = frozenset(
+    {
+        "live_history.txt",
+        "e3dc_paths.json",
+        "e3dc.config.txt",
+        "e3dc.strompreise.txt",
+        "e3dc.wallbox.txt",
+        "e3dc.wallbox.out",
+    }
+)
+_WEB_PRIVATE_RUNTIME_DIRECTORIES = frozenset({"history_backups"})
+
+
 # Program and Git files may be world-readable/executable where required, but
 # are writable only by the installation user. Shared operational files remain
 # under /var/www with their explicit www-data contract.
@@ -1047,47 +1237,200 @@ for _definition in FILE_DEFINITIONS:
     if _inside_web:
         _relative_web = os.path.relpath(_definition_path, _web_root)
         _top_web = _relative_web.split(os.sep, 1)[0]
-        if _top_web not in {"data", "logs", "ramdisk", "tmp"}:
+        if _top_web not in _WEB_WRITABLE_TOP:
             _definition["group"] = "www-data"
-            _definition["mode"] = "755" if _definition.get("executable") else "644"
+            if _top_web in _WEB_PRIVATE_RUNTIME_FILES:
+                _definition["mode"] = "640"
+            elif _top_web in _WEB_PRIVATE_RUNTIME_DIRECTORIES:
+                _definition["mode"] = "750"
+            else:
+                _definition["mode"] = "755" if _definition.get("executable") else "644"
 
 
 def harden_web_program_permissions(web_root="/var/www/html", install_user=None, web_group="www-data"):
-    """Make the served program tree web-readable but never web-writable."""
+    """Hält den Web-Programmbaum lesbar, aber für den Webprozess unveränderlich."""
 
     root = os.path.abspath(str(web_root))
     account_name = str(install_user or INSTALL_USER)
-    writable_top = {"data", "logs", "ramdisk", "tmp"}
+    writable_top = _WEB_WRITABLE_TOP
+    root_descriptor = -1
     try:
         account = pwd.getpwnam(account_name)
         group = grp.getgrnam(str(web_group))
         root_info = os.lstat(root)
         if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
             raise RuntimeError("Web-Programmroot ist kein sicheres Verzeichnis")
-        os.chown(root, account.pw_uid, group.gr_gid)
-        os.chmod(root, 0o755)
-        for directory, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
-            relative = os.path.relpath(directory, root)
-            if relative == ".":
-                dirnames[:] = [name for name in dirnames if name not in writable_top]
-            for name in dirnames:
-                path = os.path.join(directory, name)
-                metadata = os.lstat(path)
-                if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-                    raise RuntimeError("Unsicherer Eintrag im Web-Programmbaum")
-                os.chown(path, account.pw_uid, group.gr_gid)
-                os.chmod(path, 0o755)
-            for name in filenames:
-                path = os.path.join(directory, name)
-                metadata = os.lstat(path)
-                if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        directory = getattr(os, "O_DIRECTORY", 0)
+        if not nofollow or not directory:
+            raise RuntimeError("Sicheres Webroot-Öffnen ist nicht verfügbar")
+        root_descriptor = os.open(
+            root,
+            os.O_RDONLY
+            | nofollow
+            | directory
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        opened_root = os.fstat(root_descriptor)
+        if (
+            not stat.S_ISDIR(opened_root.st_mode)
+            or (opened_root.st_dev, opened_root.st_ino)
+            != (root_info.st_dev, root_info.st_ino)
+        ):
+            raise RuntimeError("Web-Programmroot wechselte beim Öffnen")
+        # Root kontrolliert den dauerhaften Mountpoint-Namensraum. Apache darf
+        # ihn lesen und betreten, aber weder ramdisk noch andere Programmnamen
+        # austauschen. Schreibflächen liegen ausschließlich darunter.
+        os.fchown(root_descriptor, 0, group.gr_gid)
+        os.fchmod(root_descriptor, 0o755)
+        secured_root = os.fstat(root_descriptor)
+        named_root = os.lstat(root)
+        if (
+            not stat.S_ISDIR(named_root.st_mode)
+            or stat.S_ISLNK(named_root.st_mode)
+            or (secured_root.st_dev, secured_root.st_ino)
+            != (named_root.st_dev, named_root.st_ino)
+            or secured_root.st_uid != 0
+            or secured_root.st_gid != group.gr_gid
+            or stat.S_IMODE(secured_root.st_mode) != 0o755
+        ):
+            raise RuntimeError("Webroot-Owner- oder Namensvertrag ist nicht wirksam")
+        root_device = secured_root.st_dev
+
+        def _entry_metadata(parent_fd, name):
+            return os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+
+        def _open_program_directory(parent_fd, name):
+            named_before = _entry_metadata(parent_fd, name)
+            if (
+                stat.S_ISLNK(named_before.st_mode)
+                or not stat.S_ISDIR(named_before.st_mode)
+                or named_before.st_dev != root_device
+            ):
+                raise RuntimeError("Unsicheres Verzeichnis im Web-Programmbaum")
+            child_fd = os.open(
+                name,
+                os.O_RDONLY | nofollow | directory | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=parent_fd,
+            )
+            opened = os.fstat(child_fd)
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or (opened.st_dev, opened.st_ino)
+                != (named_before.st_dev, named_before.st_ino)
+            ):
+                os.close(child_fd)
+                raise RuntimeError("Web-Programmverzeichnis wechselte beim Öffnen")
+            return child_fd
+
+        def _secure_directory_tree(parent_fd, *, top_level=False, private=False):
+            # Eltern werden zuerst schreibgeschützt. Damit kann der laufende
+            # Webprozess die darunter anschließend fd-relativ bearbeiteten
+            # Namen nicht mehr zwischen Prüfung und fchown/fchmod austauschen.
+            for name in sorted(os.listdir(parent_fd)):
+                if top_level and name in writable_top:
+                    continue
+                metadata = _entry_metadata(parent_fd, name)
+                if stat.S_ISDIR(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode):
+                    child_private = bool(
+                        private
+                        or (top_level and name in _WEB_PRIVATE_RUNTIME_DIRECTORIES)
+                    )
+                    directory_mode = 0o750 if child_private else 0o755
+                    child_fd = _open_program_directory(parent_fd, name)
+                    try:
+                        os.fchown(child_fd, account.pw_uid, group.gr_gid)
+                        os.fchmod(child_fd, directory_mode)
+                        changed = os.fstat(child_fd)
+                        named_after = _entry_metadata(parent_fd, name)
+                        if (
+                            (changed.st_dev, changed.st_ino)
+                            != (named_after.st_dev, named_after.st_ino)
+                            or changed.st_uid != account.pw_uid
+                            or changed.st_gid != group.gr_gid
+                            or stat.S_IMODE(changed.st_mode) != directory_mode
+                        ):
+                            raise RuntimeError("Web-Programmverzeichnis blieb nicht gebunden")
+                        _secure_directory_tree(
+                            child_fd,
+                            top_level=False,
+                            private=child_private,
+                        )
+                    finally:
+                        os.close(child_fd)
+                elif not stat.S_ISREG(metadata.st_mode):
+                    raise RuntimeError("Special- oder Symlinkeintrag im Web-Programmbaum")
+
+        def _secure_file_tree(parent_fd, *, top_level=False, private=False):
+            for name in sorted(os.listdir(parent_fd)):
+                if top_level and name in writable_top:
+                    continue
+                metadata = _entry_metadata(parent_fd, name)
+                if stat.S_ISDIR(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode):
+                    child_private = bool(
+                        private
+                        or (top_level and name in _WEB_PRIVATE_RUNTIME_DIRECTORIES)
+                    )
+                    child_fd = _open_program_directory(parent_fd, name)
+                    try:
+                        _secure_file_tree(
+                            child_fd,
+                            top_level=False,
+                            private=child_private,
+                        )
+                    finally:
+                        os.close(child_fd)
+                    continue
+                if (
+                    stat.S_ISLNK(metadata.st_mode)
+                    or not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_nlink != 1
+                    or metadata.st_dev != root_device
+                ):
                     raise RuntimeError("Unsichere Datei im Web-Programmbaum")
-                os.chown(path, account.pw_uid, group.gr_gid)
-                os.chmod(path, 0o644)
+                file_fd = os.open(
+                    name,
+                    os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0),
+                    dir_fd=parent_fd,
+                )
+                try:
+                    opened = os.fstat(file_fd)
+                    if (
+                        not stat.S_ISREG(opened.st_mode)
+                        or opened.st_nlink != 1
+                        or (opened.st_dev, opened.st_ino)
+                        != (metadata.st_dev, metadata.st_ino)
+                    ):
+                        raise RuntimeError("Web-Programmdatei wechselte beim Öffnen")
+                    file_private = bool(
+                        private
+                        or (top_level and name in _WEB_PRIVATE_RUNTIME_FILES)
+                    )
+                    file_mode = 0o640 if file_private else 0o644
+                    os.fchown(file_fd, account.pw_uid, group.gr_gid)
+                    os.fchmod(file_fd, file_mode)
+                    changed = os.fstat(file_fd)
+                    named_after = _entry_metadata(parent_fd, name)
+                    if (
+                        (changed.st_dev, changed.st_ino)
+                        != (named_after.st_dev, named_after.st_ino)
+                        or changed.st_uid != account.pw_uid
+                        or changed.st_gid != group.gr_gid
+                        or stat.S_IMODE(changed.st_mode) != file_mode
+                    ):
+                        raise RuntimeError("Web-Programmdatei blieb nicht gebunden")
+                finally:
+                    os.close(file_fd)
+
+        _secure_directory_tree(root_descriptor, top_level=True)
+        _secure_file_tree(root_descriptor, top_level=True)
         return True
     except Exception as exc:
         perm_logger.error("Web-Programmrechte konnten nicht gehaertet werden: %s", exc)
         return False
+    finally:
+        if root_descriptor >= 0:
+            os.close(root_descriptor)
 
 def check_file_permissions():
     """Prüft Dateien, die PHP schreiben muss (config/wallbox) und Python-Dateien."""
@@ -1314,6 +1657,12 @@ def fix_webportal_permissions(issues):
     wallbox_plan_jobs = WALLBOX_PLAN_JOB_ROOT
     v4_json_path = f"{wp_path}/data/e3dc_v4.json"
     config_backup_dir = f"{wp_path}/data/config_backups"
+    if "wp_unsafe" in issues:
+        print(
+            f"{RED}✗{RESET} Unsicherer Webroot wird nicht automatisch "
+            "dereferenziert oder repariert."
+        )
+        return False
     for matter_issue in sorted(_private_matter_storage_issues(matter_storage)):
         issue_key = f"matter-storage_{matter_issue}"
         if issue_key not in issues:
@@ -1322,6 +1671,25 @@ def fix_webportal_permissions(issues):
         issue_key = f"wallbox-plan-jobs_{planner_issue}"
         if issue_key not in issues:
             issues.append(issue_key)
+    unsafe_web_directories = sorted(
+        issue
+        for issue in issues
+        if issue in {
+            "wp_unsafe",
+            "tmp_unsafe",
+            "ramdisk_unsafe",
+            "history_backups_unsafe",
+            "luxtronik_archive_unsafe",
+            "logs_unsafe",
+            "data_unsafe",
+        }
+    )
+    if unsafe_web_directories:
+        print(
+            f"{RED}✗{RESET} Unsichere Webverzeichnis-Namen werden nicht "
+            "automatisch dereferenziert: " + ", ".join(unsafe_web_directories)
+        )
+        return False
     if not _ensure_install_user_www_data_group():
         success = False
     if "apache_php_module" in issues:
@@ -1350,43 +1718,16 @@ def fix_webportal_permissions(issues):
             print(f"{GREEN}✓{RESET} {wp_path} erstellt")
         else:
             success = False
-    if "wp_owner" in issues:
-        print(f"  → Setze Besitzer rekursiv: {wp_path} -> {INSTALL_USER}:www-data")
-        result = run_command(
-            f"sudo find -P {wp_path} -xdev "
-            f"\\( -path {matter_storage} -o -path {wallbox_plan_jobs} "
-            f"-o -path {v4_json_path} -o -path {config_backup_dir} \\) -prune -o "
-            f"\\( -type d -o -type f \\) -exec chown {INSTALL_USER}:www-data {{}} +"
-        )
-        if result['success']:
-            print(f"{GREEN}✓{RESET} {wp_path}: Besitzer auf {INSTALL_USER}:www-data gesetzt")
+    if "wp_owner" in issues or "wp_mode" in issues:
+        print("  → Härte Webroot und Programminhalte fd-relativ und ohne Symlink-Folgen")
+        if harden_web_program_permissions(
+            web_root=wp_path,
+            install_user=INSTALL_USER,
+            web_group="www-data",
+        ):
+            print(f"{GREEN}✓{RESET} Webroot und Programminhalte sicher gehärtet")
         else:
-            success = False
-    if "wp_mode" in issues:
-        print(f"  → Setze Verzeichnisrechte rekursiv: {wp_path} -> 775")
-        result_dirs = run_command(
-            f"sudo find -P {wp_path} -xdev "
-            f"\\( -path {matter_storage} -o -path {wallbox_plan_jobs} "
-            f"-o -path {v4_json_path} -o -path {config_backup_dir} \\) -prune -o "
-            f"-type d -exec chmod 775 {{}} +"
-        )
-        if result_dirs['success']:
-            print(f"{GREEN}✓{RESET} {wp_path}: Verzeichnisrechte auf 775 gesetzt")
-        else:
-            print(f"{RED}✗{RESET} {wp_path}: Fehler beim Setzen der Verzeichnisrechte.")
-            success = False
-
-        print(f"  → Setze Dateirechte rekursiv: {wp_path} -> 664")
-        result_files = run_command(
-            f"sudo find -P {wp_path} -xdev "
-            f"\\( -path {matter_storage} -o -path {wallbox_plan_jobs} "
-            f"-o -path {v4_json_path} -o -path {config_backup_dir} \\) -prune -o "
-            f"-type f -exec chmod 664 {{}} +"
-        )
-        if result_files['success']:
-            print(f"{GREEN}✓{RESET} {wp_path}: Dateirechte auf 664 gesetzt")
-        else:
-            print(f"{RED}✗{RESET} {wp_path}: Fehler beim Setzen der Dateirechte.")
+            print(f"{RED}✗{RESET} Webroot-Härtung fehlgeschlagen")
             success = False
     if "tmp_missing" in issues:
         print(f"  → Erstelle tmp-Verzeichnis: {wp_path}/tmp")
@@ -1409,37 +1750,18 @@ def fix_webportal_permissions(issues):
             print(f"{GREEN}✓{RESET} tmp-Besitzer korrigiert")
         else:
             success = False
-    if "ramdisk_missing" in issues:
-        print(f"  → Erstelle RAM-Disk-Verzeichnis: {wp_path}/ramdisk")
-        result = run_command(f"sudo mkdir -p {wp_path}/ramdisk")
-        if result['success']:
-            print(f"{GREEN}✓{RESET} ramdisk-Ordner erstellt")
-        else:
-            success = False
-    if "ramdisk_owner" in issues:
-        print(f"  → Setze RAM-Disk Besitzer rekursiv: {wp_path}/ramdisk -> {INSTALL_USER}:www-data")
-        result = run_command(f"sudo chown -R {INSTALL_USER}:www-data {wp_path}/ramdisk")
-        if result['success']:
-            print(f"{GREEN}✓{RESET} ramdisk-Besitzer korrigiert")
-        else:
-            success = False
-    if "ramdisk_missing" in issues or "ramdisk_mode" in issues:
-        print(f"  -> Setze RAM-Disk-Rechte: {wp_path}/ramdisk -> 2775 + {INSTALL_USER}:www-data")
-        run_command(f"sudo chown {INSTALL_USER}:www-data {wp_path}/ramdisk")
-        result = run_command(f"sudo chmod 2775 {wp_path}/ramdisk")
-        if result['success']:
-            # Dynamische Rechte-Korrektur fuer alle Cache-Dateien in der RAM-Disk
-            run_command(f"sudo find {wp_path}/ramdisk -type f -exec chmod 664 {{}} +")
-            run_command(f"sudo find {wp_path}/ramdisk -type f -exec chown {INSTALL_USER}:www-data {{}} +")
-            run_command(f"sudo chmod 664 {wp_path}/ramdisk/value_filter.json")
-            print(f"{GREEN}[OK]{RESET} ramdisk-Rechte korrigiert")
-        else:
-            success = False
-    if "ramdisk_not_mounted" in issues:
-        print(f"  -> RAM-Disk ist kein tmpfs-Mount! Richte automatisch ein...")
+    ramdisk_issues = {
+        "ramdisk_missing",
+        "ramdisk_unsafe",
+        "ramdisk_owner",
+        "ramdisk_mode",
+        "ramdisk_not_mounted",
+    }
+    if ramdisk_issues.intersection(issues):
+        print("  -> RAM-Disk-Vertrag ist unvollständig; richte ihn transaktional ein...")
         try:
             from .ramdisk import setup_ramdisk
-            if setup_ramdisk():
+            if setup_ramdisk() is True:
                 print(f"{GREEN}[OK]{RESET} RAM-Disk automatisch eingerichtet (fstab + mount + Rechte).")
             else:
                 print(f"{RED}[!]{RESET} Automatisches RAM-Disk Setup fehlgeschlagen oder abgebrochen.")
@@ -1637,6 +1959,17 @@ def fix_webportal_permissions(issues):
             print(f"{RED}✗{RESET} Fehler beim Starten von Apache.")
             success = False
 
+    if not harden_web_program_permissions(
+        web_root=wp_path,
+        install_user=INSTALL_USER,
+        web_group="www-data",
+    ):
+        print(
+            f"{RED}✗{RESET} Webroot/Programmbaum konnten nicht auf den "
+            "root-kontrollierten Endzustand gehärtet werden."
+        )
+        success = False
+
     return success
 
 
@@ -1702,68 +2035,42 @@ def cleanup_root_owned_files():
     print("\n■ Prüfe auf root-eigene Dateien…\n")
     
     paths_to_check = [
-        (INSTALL_PATH, f"{INSTALL_USER}:{INSTALL_USER}"),
-        (INSTALL_ROOT, f"{INSTALL_USER}:www-data"),
-        ("/var/www/html", f"{INSTALL_USER}:www-data")
+        (INSTALL_PATH, f"{INSTALL_USER}:{INSTALL_USER}", False),
+        (INSTALL_ROOT, f"{INSTALL_USER}:www-data", False),
+        # Der Webroot selbst bleibt absichtlich root:www-data 0755 und schützt
+        # den Namen des RAM-Disk-Mountpoints. Nur darunter liegende alte
+        # root-Dateien werden dem Installationsnutzer zurückgegeben.
+        ("/var/www/html", f"{INSTALL_USER}:www-data", True),
     ]
 
     try:
-        for base_dir, correct_owner in paths_to_check:
+        for base_dir, correct_owner, preserve_root in paths_to_check:
             if not os.path.exists(base_dir): continue
+            if preserve_root:
+                # Den aktiven Webbaum nie mit einem pathbasierten
+                # find/chown-Lauf anfassen. Der fd-relative Hardener schützt
+                # zuerst die Eltern und ändert anschließend nur gebundene
+                # Inodes; die vier Laufzeitwurzeln bleiben separat verwaltet.
+                if not harden_web_program_permissions(
+                    web_root=base_dir,
+                    install_user=INSTALL_USER,
+                    web_group="www-data",
+                ):
+                    return False
+                continue
             # Schnellere, systemnahe Bereinigung (ignoriert .git und .venv)
-            cmd = f"sudo find '{base_dir}' -path '*/.git*' -prune -o -path '*/.venv*' -prune -o -user root -exec chown {correct_owner} {{}} +"
-            run_command(cmd)
+            min_depth = " -mindepth 1" if preserve_root else ""
+            cmd = f"sudo find '{base_dir}' -xdev{min_depth} -path '*/.git*' -prune -o -path '*/.venv*' -prune -o -user root -exec chown {correct_owner} {{}} +"
+            result = run_command(cmd)
+            if not isinstance(result, dict) or not result.get("success"):
+                return False
     except Exception as e:
         print(f"{RED}✗{RESET} Fehler beim Scannen: {e}")
         return False
-    
+
     print(f"{GREEN}✓{RESET} Root-eigene Dateien bereinigt\n")
     return True
 
-
-def cleanup_legacy_grabber():
-    """Stoppt und entfernt den alten e3dc-grabber Service und zugehörige Reste."""
-    has_cleaned = False
-    service_path = "/etc/systemd/system/e3dc-grabber.service"
-    
-    if os.path.exists(service_path):
-        print("\n■ Bereinige veralteten Live-Grabber…\n")
-        run_command("sudo systemctl stop e3dc-grabber")
-        run_command("sudo systemctl disable e3dc-grabber")
-        run_command(f"sudo rm -f {service_path}")
-        run_command("sudo systemctl daemon-reload")
-        print(f"  {GREEN}✓{RESET} Service 'e3dc-grabber' entfernt")
-        has_cleaned = True
-    
-    res_screen = run_command(f"sudo -u {INSTALL_USER} screen -ls")
-    if res_screen['success'] and "live-grabber" in res_screen['stdout']:
-        if not has_cleaned: print("\n■ Bereinige veralteten Live-Grabber…\n"); has_cleaned = True
-        run_command(f"sudo -u {INSTALL_USER} screen -S live-grabber -X quit")
-        print(f"  {GREEN}✓{RESET} Screen-Session beendet")
-        
-    run_command("sudo pkill -f get_live.sh")
-
-    grabber_script = os.path.join(INSTALL_HOME, "get_live.sh")
-    if os.path.exists(grabber_script):
-        if not has_cleaned: print("\n■ Bereinige veralteten Live-Grabber…\n"); has_cleaned = True
-        run_command(f"sudo rm -f {grabber_script}")
-        print(f"  {GREEN}✓{RESET} Skript 'get_live.sh' gelöscht")
-        
-    res = run_command(f"sudo crontab -u {INSTALL_USER} -l")
-    if res['success'] and "get_live.sh" in res['stdout']:
-        if not has_cleaned: print("\n■ Bereinige veralteten Live-Grabber…\n"); has_cleaned = True
-        lines = res['stdout'].splitlines()
-        new_lines = [l for l in lines if "get_live.sh" not in l and "live-grabber" not in l]
-        if len(lines) != len(new_lines):
-            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', delete=False) as tmp:
-                tmp.write("\n".join(new_lines) + "\n")
-                tmp_path = tmp.name
-            run_command(f"sudo crontab -u {INSTALL_USER} {tmp_path}")
-            os.unlink(tmp_path)
-            print(f"  {GREEN}✓{RESET} Alte Cronjobs bereinigt")
-            
-    if has_cleaned:
-        perm_logger.info("Veralteter Live-Grabber erfolgreich entfernt.")
 
 def cleanup_stale_v4_processes():
     """Beendet alte Einzelstarts und doppelte Daemons ausserhalb von systemd."""
@@ -1809,7 +2116,7 @@ def cleanup_stale_v4_processes():
 
     service_scripts = {
         "e3dc-storage-simulator": ["storage_simulator.py"],
-        "e3dc-storage-manager": ["storage_manager.py", "storage_manager_legacy.py"],
+        "e3dc-storage-manager": ["storage_manager.py"],
         "e3dc-live": ["e3dc_live.py"],
         "e3dc-epex-manager": ["epex_manager.py"],
         "e3dc-wallbox-manager": ["wallbox_manager.py"],
@@ -1855,7 +2162,6 @@ def cleanup_legacy_plots():
         "/var/www/html/archiv_diagramm.html",
         "/var/www/html/diagramm_mobile.html",
         "/var/www/html/live_diagramm.html",
-        "/var/www/html/style.css",
         os.path.join(INSTALL_PATH, "diagram_config.json"),
         "/var/www/html/tmp/plot_soc_done",
         "/var/www/html/tmp/plot_soc_done_archiv",
@@ -1883,20 +2189,6 @@ def cleanup_legacy_plots():
                 os.remove(p)
                 has_cleaned = True
             except: pass
-            
-    # Cronjobs bereinigen (nur noch plot_soc_changes.py entfernen)
-    res = run_command(f"sudo crontab -u {INSTALL_USER} -l")
-    if res['success'] and "plot_soc_changes.py" in res['stdout']:
-        if not has_cleaned: print("\n■ Bereinige veraltete Plot-Skripte…\n"); has_cleaned = True
-        lines = res['stdout'].splitlines()
-        new_lines = [l for l in lines if "plot_soc_changes.py" not in l]
-        if len(lines) != len(new_lines):
-            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', delete=False) as tmp:
-                tmp.write("\n".join(new_lines) + "\n")
-                tmp_path = tmp.name
-            run_command(f"sudo crontab -u {INSTALL_USER} {tmp_path}")
-            os.unlink(tmp_path)
-            print(f"  {GREEN}✓{RESET} Alte Plot-Cronjobs bereinigt")
             
     if has_cleaned:
         print(f"  {GREEN}✓{RESET} Veraltete Python-Plot-Skripte und HTML-Caches entfernt")
@@ -1954,30 +2246,39 @@ def fix_file_permissions(issues):
     return success
 
 def cleanup_legacy_cronjobs():
-    """Entfernt alte Cronjobs, da das Scheduling nun der e3dc-notifier übernimmt."""
-    print("\n■ Bereinige veraltete Cronjobs (Wechsel zu Schedule Manager)…\n")
+    """Prüft alte Cronjobs; die Notifier-Transaktion entfernt sie später."""
+    print("\n■ Prüfe veraltete Cronjobs (Bereinigung folgt transaktional)…\n")
     users_to_check = [INSTALL_USER, "root", "www-data"]
-    has_cleaned = False
+    markers = (
+        "get_live_json.php",
+        "sqlite_archiver.py",
+        "diagram_helpers.py",
+        "boot_notify.sh",
+        "send_daily_telegram.php",
+        "send_status_telegram.php",
+        "send_weekly_telegram.php",
+        "backup_history.php",
+        "plot_soc_changes.py",
+    )
+    found = []
     for u in users_to_check:
         res = run_command(f"sudo crontab -u {u} -l")
         if res['success']:
             lines = res['stdout'].splitlines()
-            # Behalte nur Zeilen, die NICHT unsere alten Cronjobs sind
-            new_lines = [l for l in lines if "get_live_json.php" not in l and "sqlite_archiver.py" not in l and "diagram_helpers.py" not in l and "boot_notify.sh" not in l and "send_daily_telegram.php" not in l and "send_status_telegram.php" not in l and "send_weekly_telegram.php" not in l and "backup_history.php" not in l]
-            if len(lines) != len(new_lines):
-                if not new_lines:
-                    run_command(f"sudo crontab -u {u} -r")
-                else:
-                    with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', delete=False) as tmp:
-                        tmp.write("\n".join(new_lines) + "\n")
-                        tmp_path = tmp.name
-                    run_command(f"sudo crontab -u {u} {tmp_path}")
-                    os.unlink(tmp_path)
-                print(f"  {GREEN}✓{RESET} Alte Cronjobs für Benutzer '{u}' gelöscht")
-                has_cleaned = True
-                
-    if has_cleaned:
-        perm_logger.info("Veraltete Cronjobs entfernt.")
+            if any(any(marker in line for marker in markers) for line in lines):
+                found.append(u)
+            continue
+        message = str(res.get("stderr") or "").strip().lower()
+        if res.get("returncode") == 1 and f"no crontab for {u}".lower() in message:
+            continue
+        print(f"  {RED}✗{RESET} Crontab für '{u}' ist nicht eindeutig lesbar")
+        return False
+
+    if found:
+        print(
+            f"  {YELLOW}[i]{RESET} Alte Einträge bei {', '.join(found)} bleiben "
+            "bis zur persistenten Notifier-Transaktion unverändert."
+        )
     else:
         print(f"  {GREEN}✓{RESET} Keine alten Cronjobs gefunden")
     return True
@@ -3004,6 +3305,21 @@ def run_permissions_wizard(headless=False, release_quiesced=None):
         release_quiesced = _release_quiesced_from_current_process()
     else:
         release_quiesced = bool(release_quiesced)
+
+    writer_contract = storage_manager_writer_contract(
+        require_canonical_unit=not release_quiesced,
+    )
+    if not writer_contract.get("ok"):
+        blockers = ", ".join(writer_contract.get("blockers") or ["unbekannt"])
+        print(
+            f"{RED}[!]{RESET} Storage-Single-Writer-Preflight blockiert: "
+            f"{blockers}"
+        )
+        perm_logger.error(
+            "Storage-Single-Writer-Preflight blockiert: %s",
+            blockers,
+        )
+        return False
     
     # Die Release-Transaktion hat die Betriebskonfiguration bereits eingefroren.
     # Eine Migration in diesem Fenster würde den Rückfallvertrag des alten wie
@@ -3070,6 +3386,21 @@ def run_permissions_wizard(headless=False, release_quiesced=None):
     forecast_evidence_required = str(
         runtime_config.get("forecast_diagnostics_enable", "0")
     ).strip().lower() in {"1", "true", "yes", "on", "ein"}
+    if __package__ in (None, ""):
+        from Installer.apache_security import ensure_apache_runtime_path_protection
+    else:
+        from .apache_security import ensure_apache_runtime_path_protection
+    apache_runtime_protected = ensure_apache_runtime_path_protection(
+        run_command,
+        reload_apache=not release_quiesced,
+        allow_mutation=not release_quiesced,
+    )
+    if not apache_runtime_protected:
+        print(
+            f"{RED}[!]{RESET} Apache schützt Daten-, Log-, Ramdisk- und "
+            "Temp-Pfade nicht sicher vor direktem HTTP-Zugriff."
+        )
+        perm_logger.error("Apache-Laufzeitpfadschutz fehlt oder konnte nicht aktiviert werden.")
     ml_store_ready = ensure_private_ml_model_store()
     forecast_evidence_store_ready = ensure_private_forecast_evidence_store()
     if not forecast_evidence_store_ready and not forecast_evidence_required:
@@ -3089,17 +3420,37 @@ def run_permissions_wizard(headless=False, release_quiesced=None):
         print("⚠ Warnung: Cleanup von root-Dateien hatte Fehler")
         log_warning("permissions", "Cleanup von root-Dateien hatte Fehler")
 
-    # NEU: Alten Grabber endgültig entfernen
-    if not release_quiesced:
-        cleanup_legacy_grabber()
-        cleanup_stale_v4_processes()
     cleanup_legacy_plots()
     
-    # Alle alten Cronjobs aus dem System löschen
-    cleanup_legacy_cronjobs()
+    # Nur lesen: Erst die persistente Notifier-/Watchdog-Transaktion darf
+    # Cron-Vorzustände verändern und bei Stromausfall wiederherstellen.
+    if cleanup_legacy_cronjobs() is not True:
+        return False
 
     issues = check_permissions()
     wp_issues = check_webportal_permissions(include_service_checks=not release_quiesced)
+    ramdisk_issue_keys = {
+        "ramdisk_missing",
+        "ramdisk_unsafe",
+        "ramdisk_owner",
+        "ramdisk_mode",
+        "ramdisk_not_mounted",
+    }
+    if not release_quiesced and not ramdisk_issue_keys.intersection(wp_issues):
+        # Nur ein bereits exakt bestätigter tmpfs-Vertrag darf die obsolete
+        # Unit unabhängig entfernen. Muss die RAM-Disk erst repariert werden,
+        # übernimmt setup_ramdisk() Prestate, Commit und Rollback gemeinsam.
+        from .ramdisk import remove_legacy_grabber_unit_transactionally
+
+        if remove_legacy_grabber_unit_transactionally() is not True:
+            print(
+                f"{RED}[!]{RESET} Veralteter Live-Grabber konnte nicht "
+                "transaktional entfernt werden."
+            )
+            perm_logger.error(
+                "Legacy-Grabber-Unit konnte nicht transaktional entfernt werden."
+            )
+            return False
     file_issues = check_file_permissions()
     sudo_issues = check_wrapper_integrity() + check_sudoers_permissions()
     service_issues = [] if release_quiesced else check_services()
@@ -3108,7 +3459,7 @@ def run_permissions_wizard(headless=False, release_quiesced=None):
     watchdog_refreshed = True if release_quiesced else refresh_watchdog_guard_script()
     web_program_hardened = harden_web_program_permissions()
 
-    has_issues = bool(issues) or bool(wp_issues) or bool(file_issues) or bool(sudo_issues) or bool(service_issues) or bool(legacy_issues) or not watchdog_refreshed or not web_program_hardened or not ml_store_ready or not forecast_evidence_store_ready
+    has_issues = bool(issues) or bool(wp_issues) or bool(file_issues) or bool(sudo_issues) or bool(service_issues) or bool(legacy_issues) or not watchdog_refreshed or not web_program_hardened or not apache_runtime_protected or not ml_store_ready or not forecast_evidence_store_ready
     if not has_issues:
         if release_quiesced:
             print(f"\n{GREEN}✓{RESET} Service-neutrale Release-Berechtigungsprüfung bestanden.\n")
@@ -3132,7 +3483,7 @@ def run_permissions_wizard(headless=False, release_quiesced=None):
     
     print("→ Automatische Rechte-Korrektur...")
 
-    all_success = bool(watchdog_refreshed) and bool(ml_store_ready) and bool(forecast_evidence_store_ready)
+    all_success = bool(watchdog_refreshed) and bool(apache_runtime_protected) and bool(ml_store_ready) and bool(forecast_evidence_store_ready)
     if issues:
         success = fix_permissions(issues)
         all_success = all_success and success

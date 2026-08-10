@@ -2,17 +2,23 @@ services:
   e3dc-control:
     # Ohne E3DC_IMAGE_TAG folgt die Installation dem geprüften Stable-Tag
     # "latest". Ein fester Pin oder Rückfall wird bewusst in .env gesetzt,
-    # zum Beispiel: E3DC_IMAGE_TAG=v5.4.2d
+    # zum Beispiel: E3DC_IMAGE_TAG=v5.4.3
     image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"
 
     # Lokaler Entwickler-Selbstbau mit getrenntem Compose-Override:
     # siehe doc/Docker_Dokumentation.md#optionaler-entwickler-selbstbau.
 
     container_name: e3dc-control
+    hostname: e3dc-control
     restart: unless-stopped
     network_mode: host
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     labels:
-      - com.centurylinklabs.watchtower.enable=true
+      - com.centurylinklabs.watchtower.enable=${E3DC_WATCHTOWER_ENABLE:-false}
 
     volumes:
       # PERSISTENTE DATEN (Konfiguration, SQLite, Backups)
@@ -26,6 +32,9 @@ services:
 
       # Private Rohdaten der PV-Prognosediagnose (nur bei Aktivierung genutzt)
       - e3dc_forecast_evidence:/var/lib/e3dc-control/forecast-evidence
+
+      # Root-privater create-once-Anker: Docker bleibt dauerhaft Standalone.
+      - e3dc_instance_role:/etc/e3dc-control
 
     tmpfs:
       # RAM-Disk für Live-Daten (pv_forecast.json, live_data_py.json, ...)
@@ -43,6 +52,11 @@ services:
     image: containrrr/watchtower
     container_name: watchtower
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
     profiles:
       - auto-update
     volumes:
@@ -59,3 +73,4 @@ volumes:
   e3dc_logs:
   e3dc_ml:
   e3dc_forecast_evidence:
+  e3dc_instance_role:

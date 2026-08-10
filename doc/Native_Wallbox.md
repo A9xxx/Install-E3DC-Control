@@ -319,11 +319,17 @@ getrennt ausgewiesen.
 
 Im Docker startet der Wallbox-Manager mit dem Container. Wenn
 Wallbox-Funktionen nachträglich aktiviert oder deaktiviert werden, den Container
-neu starten:
+mit dem vorhandenen Image neu erstellen und vollständig prüfen:
 
 ```bash
-docker compose up -d --force-recreate
+cd "${E3DC_DOCKER_PATH:-$HOME/e3dc-docker}"
+sudo python3 ./Installer/docker_compose_update.py \
+  --compose-dir . --sudo --recreate-current
+sudo docker compose logs --tail=80 e3dc-control
 ```
+
+Für ein Image-Update wird derselbe Host-Helfer ohne `--recreate-current`
+aufgerufen. Er zieht und bindet dann zuerst das neue Image.
 
 ## Troubleshooting
 

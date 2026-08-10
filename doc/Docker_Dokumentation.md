@@ -2,20 +2,61 @@
 
 Veröffentlichte Images entstehen ausschließlich aus einem versionierten stabilen Release-Tag. `latest` verweist damit auf die zuletzt veröffentlichte stabile Version.
 
-Der aktuelle Stable-Stand ist `v5.4.2d`. `latest` wird für diesen Hotfix erst
-nach erfolgreicher Digest-, SBOM-, Provenance- und Attestierungsprüfung gesetzt.
+Der aktuelle Stable-Stand ist `v5.4.3`. Die Tags `latest`, `v5.4.3` und
+`5.4.3` müssen auf denselben geprüften Multi-Arch-Digest verweisen.
 
-E3DC-Control kann isoliert über **Docker** betrieben werden. Der Container kapselt die Anwendung; persistente Betriebsdaten liegen in den dafür vorgesehenen Volumes. Der Multi-Architektur-Support (`arm64`, `amd64`) deckt die vorgesehenen Plattformen ab.
+E3DC-Control kann isoliert über **Docker** betrieben werden. Der Container kapselt die Anwendung; persistente Betriebsdaten liegen in den dafür vorgesehenen Volumes. Der Multi-Architektur-Support (`arm64`, `amd64`) deckt die vorgesehenen Plattformen ab. Docker benötigt dabei zwingend ein 64-Bit-Betriebssystem; `armhf`, `arm/v7` und andere 32-Bit-Installationen können das veröffentlichte Image nicht starten.
+
+Docker ist ausschließlich für eine eigenständige Instanz mit exakt
+`ha_mode=off` freigegeben. HA-Master/-Slave und die read-only Shadow-Instanz
+bleiben Bare-Metal-Betriebsarten; der Container bricht bei einer abweichenden
+Konfiguration vor dem ersten Hardware-Writer ab. Beim ersten Start wird ein
+persistenter Instanzrollenanker create-once auf exakt `off` projiziert; ein
+späterer Widerspruch zwischen Anker und Konfiguration ist ebenfalls ein harter
+Startabbruch. Für den Wechsel einer bereits
+laufenden nativen Installation ist im Installer Menüpunkt **31 „Zu Docker
+wechseln“** vorgesehen: Er stoppt zuerst Supervisoren und historische Dienste,
+deaktiviert alle Produkt-Units und verlangt zwei stabile inaktive systemd- und
+`/proc`-Snapshots. Manuell gestartete Hardware-Writer und Legacy-Screens
+blockieren die Migration; der Installer beendet sie bewusst nicht. Erst danach
+startet Compose. Menüpunkt 31 ist ausschließlich die erste
+Bare-Metal-zu-Docker-Migration: Ein vorhandener E3DC-Container, eine vorhandene
+Compose-Datei oder bereits verwaltete E3DC-Docker-Daten stoppen den Assistenten
+vor der ersten Änderung. Ein bei diesem Erstversuch neu erzeugter Ziel- und
+Compose-Baum wird bei einem Fehler nach verifiziertem Kandidatenstillstand auf
+den zuvor fehlenden beziehungsweise leeren Zustand zurückgesetzt, sodass der
+Assistent sauber wiederholt werden kann. Bestehende Docker-Installationen werden nur über den
+unten dokumentierten Compose-Updateweg gepflegt. Die folgende manuelle Einrichtung ist für einen
+frischen oder bereits ausschließlich containerisierten Host gedacht. Sie darf
+nicht parallel zu einer nativen E3DC-Control-Installation gestartet werden.
 
 ---
 
 ## 1. Voraussetzungen & Einrichtung
 
 ### Schritt 1: Docker installieren
-Falls Docker noch nicht auf deinem Raspberry Pi, NUC oder Ubuntu-System installiert ist, richte das offizielle Docker-APT-Repository mit eigenem Keyring ein:
+Prüfe zuerst die Paketarchitektur. Nur `amd64` und `arm64` sind freigegeben:
+
 ```bash
+case "$(dpkg --print-architecture)" in
+  amd64|arm64) ;;
+  *) echo "E3DC-Control Docker benötigt ein 64-Bit-System mit amd64 oder arm64." >&2; exit 1 ;;
+esac
+```
+
+Auf einem Raspberry Pi mit `armhf` oder `arm/v7` installierst du zuerst Raspberry Pi OS Bookworm 64-Bit neu. Falls Docker noch nicht auf deinem Raspberry Pi, NUC oder Ubuntu-System installiert ist, richte anschließend das offizielle Docker-APT-Repository mit eigenem Keyring ein:
+```bash
+if ! command -v docker >/dev/null 2>&1; then
+  test ! -S /run/docker.sock
+  if sudo test -e /var/lib/docker; then
+    test -z "$(sudo find -P /var/lib/docker -mindepth 1 -maxdepth 1 -print -quit)" || {
+      echo "Unbekannter Bestand unter /var/lib/docker; Installation abgebrochen." >&2
+      exit 1
+    }
+  fi
+fi
 sudo apt-get update
-sudo apt-get install -y ca-certificates curl
+sudo apt-get install -y ca-certificates curl git
 sudo install -m 0755 -d /etc/apt/keyrings
 . /etc/os-release
 DOCKER_REPO=debian
@@ -33,74 +74,82 @@ printf 'Types: deb\nURIs: https://download.docker.com/linux/%s\nSuites: %s\nComp
   sudo tee /etc/apt/sources.list.d/docker.sources > /dev/null
 sudo apt-get update
 sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-sudo usermod -aG docker $USER
+# Die Paketinstallation kann den Daemon bereits gestartet haben. Fremde
+# Container und Volumes bleiben unberührt; nur bestehender E3DC-Control-Bestand
+# blockiert die frische Installation und gehört in den Updateweg.
+E3DC_CONTAINER_CONFLICTS="$(
+  sudo docker container ls -a \
+    --format '{{.Names}}|{{.Image}}|{{.Label "com.docker.compose.service"}}' |
+  awk -F '|' '$1 == "e3dc-control" || $2 ~ /(^|\/)(install-)?e3dc-control([:@]|$)/ || $3 == "e3dc-control" {print $1 " (" $2 ")"}'
+)"
+test -z "$E3DC_CONTAINER_CONFLICTS" || {
+  echo "E3DC-Control-Container besteht bereits: $E3DC_CONTAINER_CONFLICTS" >&2
+  exit 1
+}
+E3DC_VOLUME_CONFLICTS="$(
+  sudo docker volume ls --format '{{.Name}}' |
+  awk '$0 ~ /(^|_)(e3dc_data|e3dc_logs|e3dc_ml|e3dc_forecast_evidence|e3dc_instance_role)$/'
+)"
+test -z "$E3DC_VOLUME_CONFLICTS" || {
+  echo "Verwalteter E3DC-Docker-Datenbestand besteht bereits: $E3DC_VOLUME_CONFLICTS" >&2
+  exit 1
+}
+sudo usermod -aG docker "$USER"
 ```
 *(Melde dich danach einmal ab und wieder an, damit die Gruppenrechte aktiv werden)*
 
 ### Schritt 2: Verzeichnis vorbereiten
-Erstelle einen Ordner für E3DC-Control. Die dauerhafte Konfiguration und
-Historie liegen im Unterordner `data`; der Anwendungscode kommt im Normalfall
-aus dem veröffentlichten GHCR-Image. Ein Repository-Checkout ist dafür nicht
-erforderlich.
+Der Repository-Checkout liefert die kanonische Compose-Datei und den
+fail-closed Host-Updater. Der Anwendungscode selbst kommt im Normalfall
+weiterhin aus dem veröffentlichten GHCR-Image.
 ```bash
 export E3DC_DOCKER_PATH="/absoluter/pfad/zur/docker-installation"
-mkdir -p "$E3DC_DOCKER_PATH"
+git clone https://github.com/A9xxx/Install-E3DC-Control.git "$E3DC_DOCKER_PATH"
 cd "$E3DC_DOCKER_PATH"
-mkdir -p data logs
+test -f ./docker-compose.yml
+test -f ./Installer/docker_compose_update.py
 ```
-Neue Systeme werden im Browser-Wizard bzw. im Config-Editor eingerichtet und speichern nach `data/e3dc_v4.json`. Eine vorhandene `e3dc.config.txt` kannst du optional nach `data/` kopieren; sie wird beim Start als Legacy-Quelle in die aktuelle Konfiguration migriert.
+Neue Systeme werden im Config-Editor eingerichtet. Fehlt bei einer
+Bestandsanlage die V4-Konfiguration, bleibt die Weboberfläche fail-closed;
+stelle dann zuerst ein geprüftes Backup administrativ wieder her.
 
-### Schritt 3: Die `docker-compose.yml`
-Erstelle in `$E3DC_DOCKER_PATH` eine Datei namens `docker-compose.yml` und kopiere folgenden Inhalt hinein:
+### Schritt 3: Mitgelieferte `docker-compose.yml` verwenden
 
-```yaml
-services:
-  e3dc-control:
-    image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"
-    container_name: e3dc-control
-    restart: unless-stopped
-    network_mode: "host"
-    volumes:
-      # Sichert Konfiguration, SQLite und Historie dauerhaft auf deiner Festplatte
-      - ./data:/var/www/html/data
-      # Persistente Logs ausserhalb des Containers
-      - ./logs:/var/www/html/logs
-      # Privates lokales Lernmodell
-      - e3dc_ml:/var/lib/e3dc-control/ml
-      # Private Rohdaten der PV-Prognosediagnose; standardmäßig bleibt sie aus
-      - e3dc_forecast_evidence:/var/lib/e3dc-control/forecast-evidence
-    tmpfs:
-      # Schont die SD-Karte extrem, indem temporäre Dateien direkt in den RAM des Hosts geschrieben werden
-      - /var/www/html/ramdisk:size=32M,uid=33,gid=33,mode=2775
-    environment:
-      - TZ=Europe/Berlin
-      # Optional fuer Synology/NAS, wenn Port 80 vom Host belegt oder umgeleitet wird:
-      # - E3DC_WEB_PORT=8085
-      # Optional: Apache nur auf eine bestimmte Host-IP binden:
-      # - E3DC_WEB_BIND=192.0.2.20
+Die geklonte `docker-compose.yml` ist der kanonische Installationsweg. Lege sie
+nicht noch einmal von Hand an und überschreibe sie nicht mit einem abweichenden
+Beispiel. Prüfe vor dem ersten Start nur das aufgelöste Image:
 
-volumes:
-  e3dc_ml:
-  e3dc_forecast_evidence:
+```bash
+sudo docker compose config --images e3dc-control
 ```
-*(Hinweis: `network_mode: "host"` ist sinnvoll, damit die nativen Python-Dienste das E3DC Hauskraftwerk und lokale MQTT-/Wallbox-Geräte direkt erreichen und der Webserver ohne Port-Mapping erreichbar ist).*
 
-Die vier persistenten Bereiche sind absichtlich nach Datenklasse und
+Ohne bewussten Pin muss genau
+`ghcr.io/a9xxx/install-e3dc-control:latest` erscheinen. `network_mode: host`
+ermöglicht den Zugriff auf das E3/DC-Hauskraftwerk und lokale
+MQTT-/Wallbox-Geräte, ohne ein separates Port-Mapping anzulegen.
+
+Das Docker-Engine-Log des Hauptcontainers ist damit auf drei Dateien zu je
+10 MiB begrenzt. Diese Grenze gilt zusätzlich zu den getrennt persistierten
+Produktlogs im Volume `e3dc_logs`. Im Image läuft dafür ein eigener, vom Healthcheck
+überwachter Logrotate-Taktgeber: Er rotiert Produkt- und Apache-Logs ab 10 MiB,
+hält sieben Generationen und beendet den Container bei einem Rotationsfehler
+ungleich null. Fachliche Historien und Backups gehören nicht zu dieser Rotation.
+
+Die fünf persistenten Bereiche sind absichtlich nach Datenklasse und
 Rechtevertrag getrennt:
 
 | Bereich | Inhalt und Lebensdauer | Backup |
 |---|---|---|
-| `data` | Konfiguration, SQLite-Historie, Betriebszustand und sichere Docker-Warmstartdaten | immer sichern |
-| `logs` | Laufzeitprotokolle sowie neu aufbaubare adaptive Auswertungsreihen | optional; Löschen setzt Support- und Auswertungshistorie zurück |
+| `e3dc_data` | Konfiguration, SQLite-Historie, Betriebszustand und sichere Docker-Warmstartdaten | immer sichern |
+| `e3dc_logs` | Laufzeitprotokolle sowie neu aufbaubare adaptive Auswertungsreihen | optional; Löschen setzt Support- und Auswertungshistorie zurück |
 | `e3dc_ml` | root-privates lokales Lernmodell außerhalb des Webroots | empfohlen; ohne Backup ist ein neues Training aus der Historie nötig |
 | `e3dc_forecast_evidence` | optionale, root-private Prognosebelege mit rollierender Aufbewahrung bis zu 90 Tagen | optional; Verlust beeinflusst die Regelung nicht, setzt aber die Diagnosehistorie zurück |
+| `e3dc_instance_role` | root-privater create-once-Anker für exakt `ha_mode=off`; überlebt Container-Recreates | auf demselben Docker-Host erhalten; nicht als Rollenanker auf einen anderen Host kopieren |
 
-Die Compose-Datei im vollständigen Repository verwendet für alle vier Bereiche
-benannte Volumes. Das obige Beispiel und der automatische Docker-Umstieg
-verwenden für `data` und `logs` besser sichtbare Bind-Mounts sowie für die
-beiden privaten Bereiche benannte Volumes. Beide Layouts bilden denselben
-fachlichen Vertrag ab. Die Ramdisk ist absichtlich flüchtig und gehört nicht
-ins Backup.
+Die mitgelieferte Compose-Datei verwendet für alle fünf Bereiche benannte
+Volumes. Ein abweichendes Bind-Mount-Layout ist kein Teil des manuellen
+Quickstarts und darf die ausgelieferte Compose-Datei nicht ungeprüft ersetzen.
+Die Ramdisk ist absichtlich flüchtig und gehört nicht ins Backup.
 
 Die aktuellen Dateien `pv_forecast.json` und `ml_prediction.json` sind
 flüchtige Rechenergebnisse in der Ramdisk und werden neu erzeugt. Das Volume
@@ -111,7 +160,7 @@ Tagen.
 `e3dc_ml` darf nicht einfach unter das heutige Web-`data` verschoben werden:
 Der Datenbaum gehört dem Webbenutzer, während das verifizierte, serialisierte
 Modell und die privaten Prognosebelege aus Sicherheitsgründen root-privat
-bleiben. Eine Reduktion auf nur `data` und `logs` würde unterschiedliche
+bleiben. Eine Reduktion auf nur `e3dc_data` und `e3dc_logs` würde unterschiedliche
 Eigentümer-, Sicherheits-, Aufbewahrungs- und Backupverträge vermischen und
 wird deshalb nicht unterstützt. Eine spätere Zusammenlegung privater Volumes
 benötigt eine verifizierte Datenmigration samt Rechteprüfung und Rückfallweg.
@@ -135,7 +184,7 @@ weiterleiten. `E3DC_WEB_BIND` erwartet eine IP-Adresse der gewuenschten
 Schnittstelle, keinen Interface-Namen wie `eth0`.
 
 **Wichtig bei bestehenden Images:**
-`docker compose up -d` baut ein vorhandenes Image nicht automatisch neu und
+`docker compose up -d --wait --wait-timeout 300 e3dc-control` baut ein vorhandenes Image nicht automatisch neu und
 zieht auch nicht zwingend die neueste Version. Wenn `E3DC_WEB_PORT` im Container
 sichtbar ist, Apache aber trotzdem weiter auf `0.0.0.0:80` hoert, laeuft sehr
 wahrscheinlich noch ein altes Image oder ein alter Container.
@@ -143,18 +192,32 @@ wahrscheinlich noch ein altes Image oder ein alter Container.
 Fertiges GitHub-Image aktualisieren:
 
 ```bash
-(
-  set -euo pipefail
-  cd "$E3DC_DOCKER_PATH"
-  sudo docker compose config --images
-  sudo docker compose pull e3dc-control
-  sudo docker compose up -d --force-recreate e3dc-control
-)
+cd "$E3DC_DOCKER_PATH"
+sudo python3 ./Installer/docker_compose_update.py --compose-dir . --sudo
+sudo docker compose logs --tail=80 e3dc-control
 ```
+
+Der Helfer zieht ausdrücklich das von Compose projizierte Image, bindet dessen
+sha256-ID und OCI-Version vor dem Start und vergleicht damit die laufende
+`VERSION`. Start-, Warte-, Health-, Snapshot- oder Versionsfehler führen immer
+zu einem bestätigten Stopp des Kandidaten.
+
+Fehlt `docker_compose_update.py` in einer älteren Docker-Installation, verwende
+einen separaten frischen Checkout des veröffentlichten `main` als
+Verwaltungsbaum. Starte daraus `Installer/docker_compose_update.py` und übergib
+mit `--compose-dir` den absoluten Pfad des bestehenden
+`e3dc-docker`-Verzeichnisses. Der Helfer migriert ausschließlich unveränderte
+offizielle Compose-Dateien aus 5.4.2 bis 5.4.2d sowie die bekannte
+Installer-Bind-Mount-Variante atomar, also ganz oder gar nicht. `.env` und die
+vorhandenen Daten-, Log-, ML- und Forecast-Quellen bleiben unverändert. Einen
+alten Watchtower stoppt und prüft er vor Migration und Pull; er bleibt danach
+aus und darf nur per ausdrücklichem Opt-in wieder aktiviert werden. Ältere,
+angepasste, per Override ergänzte oder mehrdeutige Compose-Stände bleiben
+unverändert gesperrt und benötigen eine manuelle Prüfung.
 
 Ohne `E3DC_IMAGE_TAG` folgt diese Compose-Datei dem geprüften Stable-Tag
 `latest`. Ein fester Tag bleibt bei `pull` absichtlich unverändert. Für einen
-bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.2d` in der Datei `.env`
+bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.3` in der Datei `.env`
 gesetzt. `docker compose config --images` zeigt vorab das tatsächlich gewählte
 Image.
 
@@ -172,17 +235,16 @@ tatsächlich aufgelöste Image-Adresse:
 
 ```bash
 cp -a docker-compose.yml docker-compose.yml.before-image-variable
-sudo docker compose config --images
+sudo docker compose config --images e3dc-control
 ```
 
-Erst wenn dort der gewünschte Tag erscheint, folgen `pull` und
-`up -d --force-recreate`. Ein eventuell bereits vorhandener Eintrag
+Erst wenn dort der gewünschte Tag erscheint, folgt der Host-Helfer. Ein eventuell bereits vorhandener Eintrag
 `E3DC_IMAGE_TAG=...` in `.env` bleibt dabei die maßgebliche bewusste
 Versionswahl.
 
 Gezielte Rückfallversion:
 
-Den Stable-Container `v5.4.2d` auf den veröffentlichten Rollback-Root
+Den Stable-Container `v5.4.3` auf den veröffentlichten Rollback-Root
 `v5.3.2b` zurücksetzen:
 
 ```bash
@@ -190,17 +252,14 @@ Den Stable-Container `v5.4.2d` auf den veröffentlichten Rollback-Root
   set -euo pipefail
   TAG=v5.3.2b
   cd "$E3DC_DOCKER_PATH"
-  EXPECTED_IMAGE="ghcr.io/a9xxx/install-e3dc-control:$TAG"
   BACKUP_FILE="$PWD/e3dc-data-$(date +%Y%m%d-%H%M%S).tgz"
   sudo docker compose exec -T e3dc-control \
     tar czf - -C /var/www/html/data . > "$BACKUP_FILE"
   test -s "$BACKUP_FILE"
-  RESOLVED_IMAGE="$(sudo env E3DC_IMAGE_TAG="$TAG" docker compose config --images e3dc-control)"
-  [ "$RESOLVED_IMAGE" = "$EXPECTED_IMAGE" ]
-  sudo env E3DC_IMAGE_TAG="$TAG" docker compose pull e3dc-control
-  sudo env E3DC_IMAGE_TAG="$TAG" docker compose up -d --force-recreate e3dc-control
-  sudo docker compose ps
-  sudo docker logs --tail=80 e3dc-control
+  sudo python3 ./Installer/docker_compose_update.py \
+    --compose-dir . --sudo --image-tag "$TAG" \
+    --legacy-no-healthcheck-version 5.3.2b
+  sudo docker compose logs --tail=80 e3dc-control
 )
 ```
 
@@ -208,6 +267,11 @@ Der Rückfall ist bewusst ein Host-Befehl: Der E3DC-Control-Container soll nicht
 den Docker-Daemon des Hosts steuern. Die Weboberfläche kann deshalb die
 passenden Befehle für den gewählten Tag anzeigen, aber sie führt sie im
 Docker-Betrieb nicht selbst aus.
+
+Der fest gebundene historische Rückfall-Root `v5.3.2b` enthält noch keinen
+imagegebundenen Healthcheck. Nur für genau diesen Tag belegt der Rückfall daher
+zwei identische laufende Container-Snapshots statt `healthy`. Ein aktuelles oder
+künftiges Image ohne Healthcheck bleibt dagegen ein harter Fehler.
 
 Für einen dauerhaft festgehaltenen Tag wird derselbe Wert zusätzlich als
 `E3DC_IMAGE_TAG=v5.3.2b` in einer vorhandenen `.env` ergänzt, ohne andere dort
@@ -250,14 +314,51 @@ Anschließend wird die normale Compose-Datei mit diesem lokalen Override
 gestartet:
 
 ```bash
-sudo docker compose \
-  -f docker-compose.yml \
-  -f docker-compose.local.yml \
-  config --images
-sudo docker compose \
-  -f docker-compose.yml \
-  -f docker-compose.local.yml \
-  up -d --force-recreate e3dc-control
+(
+  set -euo pipefail
+  E3DC_LOCAL_CANDIDATE_MAY_EXIST=0
+  stop_local_candidate() {
+    [ "$E3DC_LOCAL_CANDIDATE_MAY_EXIST" = 1 ] || return 0
+    sudo docker compose \
+      -f docker-compose.yml \
+      -f docker-compose.local.yml \
+      stop --timeout 30 e3dc-control || true
+    STOPPED_SNAPSHOT_1="$(sudo docker compose \
+      -f docker-compose.yml \
+      -f docker-compose.local.yml \
+      ps -q --status running e3dc-control)" || return 70
+    sleep 1
+    STOPPED_SNAPSHOT_2="$(sudo docker compose \
+      -f docker-compose.yml \
+      -f docker-compose.local.yml \
+      ps -q --status running e3dc-control)" || return 70
+    [ -z "$STOPPED_SNAPSHOT_1" ] && [ -z "$STOPPED_SNAPSHOT_2" ] || return 70
+  }
+  trap 'rc=$?; if ! stop_local_candidate; then exit 70; fi; exit "$rc"' ERR
+  sudo docker compose \
+    -f docker-compose.yml \
+    -f docker-compose.local.yml \
+    config --images e3dc-control
+  E3DC_LOCAL_CANDIDATE_MAY_EXIST=1
+  sudo docker compose \
+    -f docker-compose.yml \
+    -f docker-compose.local.yml \
+    up -d --force-recreate --wait --wait-timeout 300 e3dc-control
+  docker_health_snapshot() {
+    sudo docker inspect e3dc-control --format '{{.Id}} {{.Image}} {{.RestartCount}} {{.State.StartedAt}} {{.State.Status}} {{.State.Health.Status}}'
+  }
+  HEALTH_SNAPSHOT_1="$(docker_health_snapshot)"
+  sleep 2
+  HEALTH_SNAPSHOT_2="$(docker_health_snapshot)"
+  test "$HEALTH_SNAPSHOT_1" = "$HEALTH_SNAPSHOT_2"
+  case "$HEALTH_SNAPSHOT_2" in
+    *" running healthy") ;;
+    *) echo "Container ist nicht stabil gesund: $HEALTH_SNAPSHOT_2" >&2; exit 1 ;;
+  esac
+  printf '%s\n' "$HEALTH_SNAPSHOT_2"
+  E3DC_LOCAL_CANDIDATE_MAY_EXIST=0
+  trap - ERR
+)
 ```
 
 `config --images` muss `e3dc-control:local` ausgeben.
@@ -281,8 +382,8 @@ Image abgedeckt werden.
 
 In der Ausgabe von `docker compose config` ist `volume: {}` bei benannten
 Volumes normal. Docker verwaltet deren echten Hostpfad. Das gilt insbesondere
-für `e3dc_ml` und `e3dc_forecast_evidence`; beide privaten Datenklassen bleiben
-dadurch vom Webverzeichnis getrennt. Den Pfad siehst du bei Bedarf mit
+für `e3dc_ml`, `e3dc_forecast_evidence` und `e3dc_instance_role`; diese
+root-privaten Datenklassen bleiben dadurch vom Webverzeichnis getrennt. Den Pfad siehst du bei Bedarf mit
 `docker volume inspect <Compose-Projekt>_e3dc_forecast_evidence`.
 
 Pruefen, ob der neue Entrypoint aktiv ist:
@@ -309,7 +410,8 @@ ist der Webserver repariert und der naechste Schritt ist RSCP: Konfiguration
 speichern, Container neu starten und dann Port/Anmeldung pruefen.
 
 ```bash
-sudo docker compose restart e3dc-control
+sudo python3 ./Installer/docker_compose_update.py \
+  --compose-dir . --sudo --recreate-current
 sudo docker exec e3dc-control sh -lc '
 python3 - <<PY
 import json, socket
@@ -337,9 +439,16 @@ Port, z.B. `Listen 8085`.
 ### Schritt 4: Starten
 Starte den Container im Hintergrund:
 ```bash
-sudo docker compose up -d
+sudo python3 ./Installer/docker_compose_update.py --compose-dir . --sudo
+sudo docker compose logs --tail=80 e3dc-control
 ```
-Das System lädt nun das fertige Image aus dem Internet herunter, richtet den Webserver, die RAM-Disk und alle Python-Skripte vollautomatisch ein. Du erreichst dein Dashboard sofort über die IP-Adresse deines Raspberry Pi im Browser.
+Das System lädt nun das fertige Image aus dem Internet herunter, richtet den
+Webserver, die RAM-Disk und die Python-Dienste ein. Bei einer frischen leeren
+JSON-Konfiguration materialisiert der Konfigurationsassistent zuerst den
+Standalone-Wert `ha_mode=off`. Meldet der Assistent keinen Erfolg oder bleibt
+danach ein anderer HA-Modus stehen, startet kein Hardware-Writer und der
+Container endet mit Fehler. Nach erfolgreichem Start erreichst du das Dashboard
+über die IP-Adresse des Hosts.
 
 ---
 
@@ -351,32 +460,41 @@ Wenn E3DC-Control in Docker läuft, verhält es sich intern etwas anders als bei
 * **Web-Updates deaktiviert:** Da ein Container „immutable" (unveränderlich) ist, ist der „Update"-Knopf im Web-Dashboard deaktiviert. Klickst du darauf, informiert dich das System, dass Updates über Docker bezogen werden müssen.
 * **Kein Systemd:** Befehle wie `systemctl restart e3dc` funktionieren im Container nicht. Wenn du den Dienst neu starten möchtest, startest du einfach den gesamten Container neu (siehe unten). Logs der Python-Dienste findest du unter `/var/www/html/logs/`.
 * **Auto-Start:** Du benötigst keine Watchdogs oder Crontab-Einträge mehr, damit E3DC nach einem Stromausfall hochfährt. Der Parameter `restart: unless-stopped` in der `docker-compose.yml` sorgt dafür, dass Docker das System immer am Leben hält.
+* **Fail-fast-Supervision:** PID 1 überwacht Apache als echten Vordergrundprozess sowie alle gestarteten Python-/Node-Worker. Endet einer dieser Dauerprozesse nach der Readiness, beendet sich der Container ungleich null; die Docker-Restart-Policy startet anschließend den vollständigen, konsistenten Dienstsatz neu.
+* **Web-Neustart:** Der Web-Endpunkt erzeugt ausschließlich ein inhaltlich und per Inode gebundenes Neustartflag. Der Notifier konsumiert genau dieses Flag und beendet sich ungleich null; `wait -n` in PID 1 beendet daraufhin den vollständigen Dienstsatz. Es gibt keinen wirkungslosen Prozessnamen- oder `systemctl`-Neustart im Container.
+* **Imagegebundener Healthcheck:** Das Image prüft Apache, alle Pflichtprozesse und exakt die beim Boot aus der Konfiguration projizierten Zusatzdienste. Es liest dafür nur den PID-Namensraum, die root-gebundene Boot-Projektion und die Apache-Konfiguration; RSCP, Geräte und Aktoren werden nicht angesprochen. Die Hostbefehle verlangen anschließend zwei identische Snapshots derselben Container-, Image- und Startgeneration mit unverändert grünem Healthstatus.
 
 ### Aktive Hintergrunddienste im Container
 
-Folgende Python-Dienste starten automatisch über die `entrypoint.sh`. Alle Logs liegen unter `/var/www/html/logs/`:
+Folgende Python-Dienste startet die `entrypoint.sh`. Persistente Dienstlogs liegen unter `/var/www/html/logs/`; Einträge mit „Docker-Engine-Log“ erscheinen in `docker compose logs`:
 
 | Dienst | Startbedingung | Log-Datei |
 |--------|----------------|-----------|
 | `e3dc_websocket.py` | Immer | `e3dc_websocket.log` |
-| `energy_manager.py` | Automatik/Verbrauchslogging im Frontend aktiv | `energy_manager.log` |
-| `lux_live.py` | Wärmepumpen Typ: Luxtronik | `lux_live.log` |
-| `idm_live.py` | Wärmepumpen Typ: IDM und IDM-IP gesetzt | `idm_live.log` |
-| `stiebel/stiebel_live.py` | Wärmepumpen Typ: Stiebel Eltron ISG / WPM und ISG-IP gesetzt | `stiebel_live.log` |
-| `heizstab_manager.py` | Heizstab/Shelly als Waermequelle konfiguriert | `heizstab_manager.log` |
-| `wallbox_manager.py` | `wb_native_enable=1` | `wallbox_manager.log` |
-| `e3dc_mqtt_hub.py` | `mqtt_hub_ip=...` | `e3dc_mqtt_hub.log` |
-| `bluelink_client.py` | `bluelink_refresh_token=...` | `bluelink_client.log` |
-| `epex_manager.py` | Immer | `epex_manager.log` |
-| `Forecast/pv_forecast_service.py` | Immer | `weather_manager.log` |
-| `storage_simulator.py` | Immer | `storage_simulator.log` |
-| `e3dc_live.py` | Immer | `e3dc_live.log` |
+| `energy_manager.py` | Wärmeintegration aktiviert und gültige Wärmequelle oder SG-Ready-Shelly konfiguriert | Docker-Engine-Log |
+| `lux_live.py` | Wärmeintegration aktiviert, Typ Luxtronik und gültige Luxtronik-IP | `lux_live.log` |
+| `idm_live.py` | Wärmeintegration aktiviert, Typ IDM und gültige IDM-IP | `idm_live.log` |
+| `stiebel/stiebel_live.py` | Wärmeintegration aktiviert, Typ Stiebel Eltron ISG/WPM und gültige ISG-IP | `stiebel_live.log` |
+| `dimplex/dimplex_live.py` | `luxtronik` aktiviert, `wp_type=5` und gültige `dimplex_ip` | `dimplex_live.log` |
+| `climate_live.py` | Klimamessung aktiviert und gültige Zähler-IP | `climate_live.log` |
+| `climate_control.py` | `climate_control_enable` explizit aktiviert | `climate_control.log` |
+| `heizstab_manager.py` | Heizstab/Shelly als Wärmequelle konfiguriert | `heizstab_manager.log` |
+| `wallbox_manager.py` | Native Wallbox aktiviert, Legacy-Wallbox aus und `wbmode=0` | Docker-Engine-Log |
+| `e3dc_mqtt_hub.py` | Externer MQTT-Broker oder mindestens ein MQTT-Eingangstopic konfiguriert | Docker-Engine-Log |
+| `bluelink_client.py` | Bluelink-Refresh-Token oder VIN konfiguriert | `bluelink_client.log` |
+| `matter/matter_bridge.js` | Matter Bridge explizit aktiviert und Paket-/Lockdatei vorhanden | `matter_bridge.log` |
+| `epex_manager.py` | Immer | Docker-Engine-Log |
+| `Forecast/pv_forecast_service.py` | Immer | Docker-Engine-Log |
+| `forecast_evidence_sidecar.py` | `forecast_diagnostics_enable` explizit aktiviert | Docker-Engine-Log |
+| `storage_simulator.py` | Immer | Docker-Engine-Log |
+| `storage_manager.py` | Immer | Docker-Engine-Log |
+| `e3dc_live.py` | Immer | Docker-Engine-Log |
 | `notification_manager.py` | Immer | `notification_manager.log` |
 
-Fuer Stiebel Eltron ISG/WPM reicht im Docker-Betrieb nach dem Update auf ein
+Für Stiebel Eltron ISG/WPM reicht im Docker-Betrieb nach dem Update auf ein
 Image ab `5.0.4g`: Im Config-Editor unter **Smart Home &
 Verbrauchsprognose** den Schalter **WP-/Verbrauchslogging aktivieren**
-einschalten, bei **Wärmepumpen Typ** **Stiebel Eltron ISG / WPM** waehlen,
+einschalten, bei **Wärmepumpen Typ** **Stiebel Eltron ISG / WPM** wählen,
 die **ISG IP-Adresse** eintragen und den Container neu starten. Der
 Live-Treiber ist read-only; ein optionaler Shelly-Leistungsmesser wird
 ebenfalls nur gelesen und schaltet kein Relais. Der Dienst startet automatisch
@@ -394,7 +512,7 @@ E3DC-Control-Konfiguration ein MQTT-Broker eingetragen ist.
 
 Vorgehen:
 
-1. Im Config-Editor den Bereich **Smart Home MQTT-Hub** oeffnen.
+1. Im Config-Editor den Bereich **Smart Home MQTT-Hub** öffnen.
 2. Broker-IP/Host (`mqtt_hub_ip`) und bei Bedarf Port, Benutzer, Passwort und
    Topics eintragen.
 3. Konfiguration speichern.
@@ -402,7 +520,8 @@ Vorgehen:
 
 ```bash
 cd "$E3DC_DOCKER_PATH"
-sudo docker compose restart e3dc-control
+sudo python3 ./Installer/docker_compose_update.py \
+  --compose-dir . --sudo --recreate-current
 ```
 
 Beim naechsten Start meldet der Container im Log:
@@ -429,44 +548,44 @@ uebernimmt nicht automatisch alle MQTT-Werte aus dem Broker.
 
 Der sichere Standardweg bleibt bewusst auf dem Docker-Host:
 ```bash
-(
-  set -euo pipefail
-  cd "$E3DC_DOCKER_PATH"
-  sudo docker compose config --images
-  sudo docker compose pull e3dc-control
-  sudo docker compose up -d --force-recreate e3dc-control
-  sudo docker inspect e3dc-control --format '{{.Config.Image}} {{.State.Status}}'
-  sudo docker exec e3dc-control cat /app/pi/Install/VERSION
-)
+cd "$E3DC_DOCKER_PATH"
+sudo python3 ./Installer/docker_compose_update.py --compose-dir . --sudo
+sudo docker compose logs --tail=80 e3dc-control
 ```
-`docker compose pull` aktualisiert Python/PHP-Code, Container-Startskript und
-Systempakete nur innerhalb des von `config --images` angezeigten Tags.
-`--force-recreate` stellt sicher, dass der Container wirklich aus dem neuen
-Image startet.
+Der Helfer aktualisiert Python/PHP-Code, Container-Startskript und Systempakete
+nur innerhalb des von Compose projizierten Tags. Er bindet das gezogene Image
+vor dem Start an sha256-ID und OCI-Version. `--wait` akzeptiert den Kandidaten
+erst nach dem imagegebundenen Healthcheck; zwei identische Snapshots binden
+zusätzlich Container-ID, Image-ID, Restart-Zähler, Startzeit, Dienstsatz und
+Laufzeit-`VERSION`.
 
 Schlägt `pull` fehl, ist der Updateversuch beendet. Ein bereits vorhandenes
 Altimage darf danach weder automatisch neu gestartet noch als aktualisierte
-Version gemeldet werden. Die Image-Referenz aus `config --images`, der
-laufende Containerstatus und die `VERSION` im Container müssen gemeinsam
-zum erwarteten Release passen.
+Version gemeldet werden. Nach einem begonnenen Kandidatenstart führt jeder
+Fehler zum verifizierten Stopp; bleibt dieser Stopp unbestätigt, meldet der
+Helfer einen gesonderten Sicherheitsfehler.
 
-Für den Rückfall eines späteren Stable-Images wird `E3DC_IMAGE_TAG` einmalig
-vor die drei Compose-Befehle gesetzt oder für einen dauerhaften Pin in `.env`
-eingetragen. Die `docker-compose.yml` selbst muss dafür nicht verändert werden.
-Der einzige vorgesehene öffentliche Rollback-Root ist
-`ghcr.io/a9xxx/install-e3dc-control:v5.3.2b`; dieser Stand selbst verweist auf
-kein älteres Image. Danach dieselben Pull-/Up-Befehle ausführen. Das
-funktioniert nur für tatsächlich veröffentlichte, verifizierte GHCR-Images.
+Für einen Rückfall wird ausschließlich der Host-Helfer aus dem Abschnitt
+„Gezielte Rückfallversion“ verwendet. Er erhält den freigegebenen Tag über
+`--image-tag`, bindet Image und Laufzeit und bestätigt bei einem Fehler den
+Stillstand des Kandidaten. Der einzige vorgesehene öffentliche Rollback-Root
+ist `ghcr.io/a9xxx/install-e3dc-control:v5.3.2b`; dieser Stand selbst verweist
+auf kein älteres Image. Ein dauerhafter Pin in `.env` wird erst nach dem
+verifizierten Rückfall gesetzt. Rohe Pull-/Up-Befehle ersetzen den Helfer nicht.
 
-Watchtower ist nur noch ein ausdrückliches Opt-in. Das Upstream-Projekt wird
+Watchtower ist nur noch ein ausdrückliches Opt-in. Das Enable-Label steht mit
+`${E3DC_WATCHTOWER_ENABLE:-false}` ebenfalls standardmäßig auf `false`. Das Upstream-Projekt wird
 nicht mehr gepflegt. Der Dienst liegt für bestehende Installationen im
 Compose-Profil `auto-update` und startet bei einem normalen
-`docker compose up -d` nicht. Sein notwendiger Zugriff auf
+`docker compose up -d --wait --wait-timeout 300 e3dc-control` nicht. Sein notwendiger Zugriff auf
 `/var/run/docker.sock` gibt dem Container weitreichende Kontrolle über den
 Docker-Host. Wer diese Risiken bewusst akzeptiert, aktiviert das Profil:
 
 ```bash
 cd "$E3DC_DOCKER_PATH"
+printf '%s\n' 'E3DC_WATCHTOWER_ENABLE=true' >> .env
+sudo python3 ./Installer/docker_compose_update.py \
+  --compose-dir . --sudo --recreate-current
 sudo docker compose --profile auto-update up -d watchtower
 ```
 
@@ -499,7 +618,8 @@ sudo docker exec e3dc-control tail -f /var/www/html/logs/e3dc_live.log
 **E3DC-Control komplett neu starten (inkl. Webserver und Diensten):**
 ```bash
 cd "$E3DC_DOCKER_PATH"
-sudo docker compose restart
+sudo python3 ./Installer/docker_compose_update.py \
+  --compose-dir . --sudo --recreate-current
 ```
 
 **ML-Prognose fehlt (`ml_prediction.json` nicht vorhanden):**

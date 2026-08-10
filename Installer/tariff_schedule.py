@@ -23,6 +23,22 @@ RECURRING_TARIFF_TYPES = frozenset({
     "spezial",
     "special_tariff",
 })
+SPOT_MARKET_TARIFF_TYPES = frozenset({
+    "awattar",
+    "dynamic",
+    "epex",
+    "tibber",
+})
+STATIC_TARIFF_TYPES = frozenset({
+    "static",
+    "fix",
+    "fixed",
+    "flat",
+})
+HEAT_PRICE_BOOST_TARIFF_TYPES = frozenset(
+    set(SPOT_MARKET_TARIFF_TYPES)
+    | {"octopus_heat", "special", "spezial", "special_tariff"}
+)
 TARIFF_TIMEZONE_NAME = "Europe/Berlin"
 TARIFF_TIMEZONE = ZoneInfo(TARIFF_TIMEZONE_NAME)
 
@@ -45,6 +61,21 @@ def tariff_type(config):
 def uses_recurring_tariff_axis(config):
     """True, wenn die vollständige Tagespreisachse lokal definiert ist."""
     return tariff_type(config) in RECURRING_TARIFF_TYPES
+
+
+def supports_spot_market_prices(config):
+    """True nur für Tarife mit echten Börsenpreis-Slots.
+
+    Lokale Zeitfenster wie Octopus Heat und frei konfigurierte Sondertarife
+    können günstige Preise abbilden, liefern aber keinen belastbaren
+    Negativpreisvertrag.
+    """
+    return tariff_type(config) in SPOT_MARKET_TARIFF_TYPES
+
+
+def supports_heat_price_boost(config):
+    """True für alle zeitvariablen Tarife, nicht für statische Arbeitspreise."""
+    return tariff_type(config) in HEAT_PRICE_BOOST_TARIFF_TYPES
 
 
 def parse_special_tariff_schedule(raw):

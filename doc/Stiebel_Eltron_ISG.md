@@ -131,19 +131,15 @@ erstellt werden, weil die Startlogik nur beim Containerstart ausgewertet wird.
 Fertiges Image aktualisieren:
 
 ```bash
-export E3DC_DOCKER_PATH="/absoluter/pfad/zur/docker-installation"
-cd "$E3DC_DOCKER_PATH"
-sudo docker compose pull e3dc-control
-sudo docker compose up -d --force-recreate e3dc-control
+cd "${E3DC_DOCKER_PATH:-$HOME/e3dc-docker}"
+sudo python3 ./Installer/docker_compose_update.py --compose-dir . --sudo
+sudo docker compose logs --tail=80 e3dc-control
 ```
 
-Lokales Image aus einem frisch gezogenen Repository neu bauen:
-
-```bash
-cd "$E3DC_DOCKER_PATH"
-sudo docker compose build --no-cache e3dc-control
-sudo docker compose up -d --force-recreate e3dc-control
-```
+Für einen lokalen Entwickler-Build gelten der getrennte
+`docker-compose.local.yml`-Vertrag und `pull_policy: never` aus der
+[Docker-Dokumentation](Docker_Dokumentation.md). Der normale GHCR-Weg baut
+kein lokales Image.
 
 Prüfen:
 
@@ -378,7 +374,11 @@ Der Container wertet die Startbedingungen nur beim Start aus. Nach einer
 Config-Änderung:
 
 ```bash
-sudo docker compose restart e3dc-control
+cd "${E3DC_DOCKER_PATH:-$HOME/e3dc-docker}"
+sudo python3 ./Installer/docker_compose_update.py \
+  --compose-dir . --sudo --recreate-current
 ```
 
-Wenn der Code selbst neu ist, vorher Image ziehen oder lokal neu bauen.
+Wenn der Code selbst neu ist, den Host-Helfer ohne `--recreate-current`
+aufrufen; dadurch wird das gewählte GHCR-Image vor dem Start ausdrücklich
+gezogen und geprüft.

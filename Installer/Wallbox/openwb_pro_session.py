@@ -10,7 +10,17 @@ import math
 
 from typing import Any, Dict, Optional
 
-from .decision import status_connected, status_real_charging, status_real_power
+try:
+    from Installer import control_time
+except ModuleNotFoundError:  # Native Ausführung mit Installer im sys.path
+    import control_time  # type: ignore
+
+from .decision import (
+    status_charge_truth,
+    status_connected,
+    status_real_charging,
+    status_real_power,
+)
 
 
 STATE_IDLE = "idle"
@@ -26,7 +36,75 @@ CONTRACT_NAME = "openwb_pro_connect_php_level_state"
 RELEASABLE_ZERO_ANCHOR_REASONS = frozenset({
     "openwb_pro_curve_direct_zero",
     "openwb_pro_curve_direct_main_zero",
+    # Beide Gründe sind vorübergehende Policy-Ergebnisse. Ein später wieder
+    # positives, ausführbares Budget derselben Stecksession muss den Start
+    # erneut erlauben; Nutzer-Aus und Safety-Gates werden separat geprüft.
+    "storage_charge_reserve",
+    "zero_budget_stop",
+    # Beide Stopps sind gruppenweite, vorübergehende Zuteilungsentscheidungen.
+    # Sobald derselben Stecksession wieder ein frisches ausführbares Budget
+    # gehört und alle Safety-Gates frei sind, dürfen sie keinen dauerhaften
+    # 0-A-Anker hinterlassen.
+    "min_current_import_integral",
+    "priority_secondary_waiting",
+    # Dieser Stop schützt ausschließlich den Hausakku unter wbminSoC. Sobald
+    # dieselbe zentrale Policy wieder ein positives, ausführbares PV-Budget
+    # für dieselbe Stecksession bindet, darf er den nächsten Start nicht als
+    # dauerhaften Nutzer-/Safety-Stop behandeln.
+    "wbminsoc_floor_pause",
+    # Die Pre-Dump-Startqualifizierung ist eine vorübergehende Policy-Kante.
+    # Ein frisches positives Budget derselben Stecksession darf den dadurch
+    # gesetzten Nullanker wieder lösen; Nutzer-Aus und Safety-Vetos bleiben
+    # davon unberührt.
+    "predump_wallbox_gate",
+    # Der Manager setzt diesen Anker, wenn sein aktueller Sollstrom unter die
+    # physische Mindestleistung fällt. Das ist kein Nutzer-Aus und kein
+    # Hardwarefehler: Ein frisches positives Budget darf ihn ausschließlich
+    # in derselben Stecksession und hinter allen übrigen Safety-Gates lösen.
+    "hold_target_below_minimum",
 })
+
+PHASE_STAGE_TIMEBASE_KEY = "stage_timebase"
+
+
+def _phase_stage_timer(
+    stage: str,
+    duration_s: float,
+    previous: Any,
+    current_sample: Any,
+) -> Optional[Dict[str, Any]]:
+    """Fortschreibung einer kurzen Sequenzdauer nur über monotonic Zeit."""
+
+    if not isinstance(current_sample, dict):
+        return None
+    expected_existing = previous is not None
+    old = previous if isinstance(previous, dict) else {}
+    if old.get("phase_stage") == stage:
+        timer = control_time.evaluate_guard(
+            old,
+            current_sample,
+            minimum_s=0.0,
+        )
+    else:
+        timer = control_time.begin_guard(
+            duration_s,
+            current_sample,
+            minimum_s=0.0,
+        )
+        if expected_existing:
+            timer["fail_closed"] = True
+            timer["rearmed"] = True
+            timer["reason"] = "phase_stage_timebase_incomplete"
+    timer["phase_stage"] = str(stage)
+    return timer
+
+# Jeder temporär freigebbare Nullanker gehört exakt zu der Stecksession, in der
+# er gesetzt wurde. Ohne beidseitig vorhandene und identische Session-ID bleibt
+# auch bei positivem Folgebudget fail-closed; das gilt ausdrücklich ebenso für
+# Direktkurven- und wbminSoC-Stopps.
+SESSION_BOUND_RELEASABLE_ZERO_ANCHOR_REASONS = (
+    RELEASABLE_ZERO_ANCHOR_REASONS
+)
 
 _STATE_LABELS = {
     STATE_IDLE: ("Idle", "secondary"),
@@ -430,6 +508,29 @@ def _start_session_reset_barriers(
         and (reservation_lease <= 0.0 or reservation_lease > now_value)
     )
 
+    # Eine reine Vorab-Reservation ohne irgendeinen Phasen-/Hardwareausgang
+    # gehört noch zur alten Stecksession. Sie darf eine durch mindestens drei
+    # frische physische Disconnect-Frames belegte neue Session nicht selbst
+    # blockieren. Sobald eine Sequenz, ein Ausgangsbeleg oder Recovery-Zustand
+    # existiert, bleibt die Rotation dagegen unverändert fail-closed.
+    preoutput_phase_disconnect_override = bool(
+        reservation_active
+        and reservation_stage == "await_budget"
+        and _safe_int(reservation.get("committed_w"), 0) == 0
+        and _safe_float(reservation.get("committed_ts"), 0.0) <= 0.0
+        and _safe_int(reservation.get("valid_frames"), 0) == 0
+        and not any(
+            isinstance(data.get(key), dict) and bool(data.get(key))
+            for key in (
+                "_openwb_pro_phase_sequence",
+                "_openwb_pro_phase_output_intent",
+                "_openwb_pro_phase_output_ack",
+                "_openwb_pro_phase_recovery_hold",
+                "_openwb_pro_phase_restart_authorized",
+            )
+        )
+    )
+
     sequence = data.get("_openwb_pro_phase_sequence")
     sequence = sequence if isinstance(sequence, dict) else {}
     sequence_stage = str(sequence.get("stage") or "")
@@ -462,6 +563,20 @@ def _start_session_reset_barriers(
         _safe_float(data.get("_openwb_pro_start_wakeup_cp_ts"), 0.0),
         _safe_float(data.get("_openwb_last_cp_start_ts"), 0.0),
     )
+    wakeup_receipt = data.get("_openwb_pro_start_wakeup_receipt")
+    wakeup_receipt = (
+        wakeup_receipt if isinstance(wakeup_receipt, dict) else {}
+    )
+    if (
+        str(wakeup_receipt.get("schema") or "")
+        == "openwb_pro_start_wakeup_receipt_v1"
+        and str(wakeup_receipt.get("plug_session_id") or "")
+        == str(data.get("_openwb_pro_plug_session_id") or "")
+    ):
+        recent_cp_ts = max(
+            recent_cp_ts,
+            _safe_float(wakeup_receipt.get("last_sent_ts"), 0.0),
+        )
     cp_aftermath_until = (
         recent_cp_ts + start_cp_duration + 30.0 if recent_cp_ts > 0.0 else 0.0
     )
@@ -475,6 +590,9 @@ def _start_session_reset_barriers(
         "wakeup_active": wakeup_active,
         "phase_active": phase_active,
         "reservation_active": reservation_active,
+        "preoutput_phase_disconnect_override": (
+            preoutput_phase_disconnect_override
+        ),
         "sequence_active": sequence_active,
         "phase_until": phase_until,
         "sequence_deadline": sequence_deadline,
@@ -655,18 +773,31 @@ def start_disconnect_reset_guard(
         disconnect_evidence_uncontested
         and _explicit_disconnected_physical_idle(st)
     )
-    eligible = bool(
+    physical_disconnect_candidate = bool(
         status_fresh
         and explicitly_disconnected
         and disconnect_evidence_uncontested
         and physical_idle
         and barriers["cp_inactive"]
-        and not barriers["phase_active"]
+        and (
+            not barriers["phase_active"]
+            or barriers["preoutput_phase_disconnect_override"]
+        )
+    )
+    eligible = bool(
+        physical_disconnect_candidate
         and not barriers["wakeup_active"]
     )
     return {
         "contract": "openwb_pro_disconnect_reset_guard_v2",
         "eligible": eligible,
+        # Ein einzelner Disconnect-Frame im CP-Nachlauf darf die Session nie
+        # rotieren. Eine echte physische Trennung muss aber schon während des
+        # konservativen 30-s-Nachlaufs gesammelt werden dürfen; sonst bleibt
+        # ein 20-s-Ab-/Anstecken unsichtbar und übernimmt alte Startbelege.
+        # Die Rotation folgt erst nach mindestens drei Frames und der
+        # konfigurierten realen Absteckdauer am frischen Reconnect.
+        "candidate_eligible": physical_disconnect_candidate,
         "status_fresh": status_fresh,
         "connection_state": connection_state,
         "explicitly_disconnected": explicitly_disconnected,
@@ -702,7 +833,7 @@ def start_disconnect_candidate_step(
     )
     existing = data.get("_openwb_pro_disconnect_candidate")
     candidate = dict(existing) if isinstance(existing, dict) else {}
-    if guard.get("eligible", False):
+    if guard.get("candidate_eligible", guard.get("eligible", False)):
         sample_ts = max(
             _safe_float((status or {}).get("driver_status_last_sample_ts"), 0.0),
             _safe_float((status or {}).get("driver_status_last_ok_ts"), 0.0),
@@ -712,6 +843,13 @@ def start_disconnect_candidate_step(
         if not candidate:
             candidate = {"since_ts": sample_ts, "frames": 0, "last_sample_ts": 0.0}
         previous_sample_ts = _safe_float(candidate.get("last_sample_ts"), 0.0)
+        if previous_sample_ts > 0.0 and sample_ts < previous_sample_ts:
+            candidate = {
+                "since_ts": sample_ts,
+                "frames": 0,
+                "last_sample_ts": 0.0,
+            }
+            previous_sample_ts = 0.0
         if sample_ts > previous_sample_ts:
             candidate["frames"] = max(0, _safe_int(candidate.get("frames"), 0)) + 1
             candidate["last_ts"] = sample_ts
@@ -721,7 +859,8 @@ def start_disconnect_candidate_step(
     confirmed = bool(
         candidate
         and int(candidate.get("frames", 0) or 0) >= 3
-        and now_value - _safe_float(candidate.get("since_ts"), now_value)
+        and _safe_float(candidate.get("last_sample_ts"), 0.0)
+        - _safe_float(candidate.get("since_ts"), 0.0)
         >= _safe_float(guard.get("required_s"), 120.0)
     )
     return {
@@ -791,12 +930,17 @@ def start_reconnect_confirmation_contract(
         and status_fresh
         and connection_state is True
         and barriers["cp_inactive"]
-        and not barriers["phase_active"]
-        and not barriers["wakeup_active"]
+        and (
+            not barriers["phase_active"]
+            or barriers["preoutput_phase_disconnect_override"]
+        )
     )
     return {
         "contract": "openwb_pro_reconnect_confirmation_v1",
         "confirmed": confirmed,
+        "physical_replug_overrides_cp_aftermath": bool(
+            confirmed and barriers["wakeup_active"]
+        ),
         "candidate_ready": candidate_ready,
         "candidate_frames": frames,
         "candidate_age_s": candidate_age_s,
@@ -813,6 +957,108 @@ def start_reconnect_confirmation_contract(
             and connection_state is True
         ),
         **barriers,
+    }
+
+
+def connected_session_meter_reset_contract(
+    previous_status: Optional[Dict[str, Any]] = None,
+    status: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Bestätigt eine neue Stecksession trotz verpasster Disconnect-Frames.
+
+    Die Sitzung wird nur aus zwei frischen, explizit verbundenen
+    connect.php-Samples abgeleitet. Der Sitzungszähler muss deutlich auf null
+    zurückfallen, während der kumulative Energiezähler monoton bleibt. Damit
+    sind Rundung, fehlende Werte, Stale-Fallbacks und ein Geräte-/Zählerreset
+    ausdrücklich keine gültige Reconnect-Evidenz.
+    """
+
+    previous = previous_status if isinstance(previous_status, dict) else {}
+    current = status if isinstance(status, dict) else {}
+    previous_sample_ts = max(
+        _safe_float(previous.get("driver_status_last_sample_ts"), 0.0),
+        _safe_float(previous.get("driver_status_last_ok_ts"), 0.0),
+    )
+    current_sample_ts = max(
+        _safe_float(current.get("driver_status_last_sample_ts"), 0.0),
+        _safe_float(current.get("driver_status_last_ok_ts"), 0.0),
+    )
+    previous_session_kwh = _safe_float(
+        previous.get("session_kwh"),
+        float("nan"),
+    )
+    current_session_kwh = _safe_float(
+        current.get("session_kwh"),
+        float("nan"),
+    )
+    previous_total_wh = _safe_float(
+        previous.get("imported_total_wh"),
+        float("nan"),
+    )
+    current_total_wh = _safe_float(
+        current.get("imported_total_wh"),
+        float("nan"),
+    )
+    previous_api = str(previous.get("api_surface") or "")
+    current_api = str(current.get("api_surface") or "")
+    previous_driver_instance = str(
+        previous.get("driver_instance_token") or ""
+    )
+    current_driver_instance = str(
+        current.get("driver_instance_token") or ""
+    )
+    checks = {
+        "previous_fresh": _fresh_valid_status(previous),
+        "current_fresh": _fresh_valid_status(current),
+        "previous_connected": _fresh_connection_state(previous) is True,
+        "current_connected": _fresh_connection_state(current) is True,
+        "sample_time_advanced": bool(
+            previous_sample_ts > 0.0
+            and current_sample_ts > previous_sample_ts
+        ),
+        "same_openwb_pro_surface": bool(
+            previous_api == "openwb_pro_connect_php"
+            and current_api == previous_api
+        ),
+        "same_driver_instance": bool(
+            previous_driver_instance
+            and current_driver_instance == previous_driver_instance
+        ),
+        "cp_inactive": current.get("cp_interrupt_isactive") in (False, 0),
+        "current_idle": bool(
+            not status_real_charging(current)
+            and status_real_power(current) <= 50.0
+        ),
+        "session_values_finite": bool(
+            math.isfinite(previous_session_kwh)
+            and math.isfinite(current_session_kwh)
+        ),
+        "previous_session_positive": bool(previous_session_kwh >= 0.05),
+        "current_session_reset": bool(0.0 <= current_session_kwh <= 0.02),
+        "session_drop_significant": bool(
+            previous_session_kwh - current_session_kwh >= 0.05
+        ),
+        "total_values_finite": bool(
+            math.isfinite(previous_total_wh)
+            and math.isfinite(current_total_wh)
+        ),
+        "total_meter_monotonic": bool(
+            current_total_wh + 1.0 >= previous_total_wh
+        ),
+    }
+    blockers = [name for name, passed in checks.items() if not passed]
+    return {
+        "contract": "openwb_pro_connected_session_meter_reset_v1",
+        "confirmed": not blockers,
+        "checks": checks,
+        "blockers": blockers,
+        "previous_sample_ts": previous_sample_ts,
+        "current_sample_ts": current_sample_ts,
+        "previous_session_kwh": previous_session_kwh,
+        "current_session_kwh": current_session_kwh,
+        "previous_total_wh": previous_total_wh,
+        "current_total_wh": current_total_wh,
+        "driver_instance_token": current_driver_instance,
     }
 
 
@@ -1042,10 +1288,24 @@ def _phase_status_power_w(status: Optional[Dict[str, Any]]) -> float:
 
 def _phase_status_count(status: Optional[Dict[str, Any]]) -> int:
     st = status if isinstance(status, dict) else {}
-    for key in ("phase_actual_phases", "phases_actual", "phases_in_use"):
+    for key in ("phase_actual_phases", "phases_actual"):
         phases = _valid_phase_count(st.get(key), 0)
         if phases:
             return phases
+    if (
+        ("phase_actual_phases" in st or "phases_actual" in st)
+        and _phase_status_power_w(st) <= 100.0
+        and not bool(st.get("charging") or st.get("charge_state"))
+    ):
+        # connect.php hält ``phases_in_use`` im Stillstand als letzte vom
+        # Fahrzeug verwendete Phasenzahl fest, während ``phases_actual=0`` den
+        # gegenwärtig stromlosen Zustand meldet. Für die Bestätigung eines
+        # frisch gelesenen Phasenziels ist dieser historische Wert deshalb
+        # nicht autoritativ; erst bei realer Ladung wird er wieder Istbeleg.
+        return 0
+    phases_in_use = _valid_phase_count(st.get("phases_in_use"), 0)
+    if phases_in_use:
+        return phases_in_use
     pha = _safe_int(st.get("pha"), 0)
     return 3 if pha == 56 else (1 if pha in (8, 16, 32) else 0)
 
@@ -1098,6 +1358,23 @@ def _phase_readback_confirmed(status: Optional[Dict[str, Any]], target: int) -> 
     )
 
 
+def _post_wire_readback_confirmed(
+    status: Optional[Dict[str, Any]],
+    target: int,
+    wire_receipt_ts: Any,
+) -> bool:
+    """Akzeptiert nur einen echten frischen GET nach dem Phasen-POST."""
+
+    st = status if isinstance(status, dict) else {}
+    wire_ts = _safe_float(wire_receipt_ts, 0.0)
+    readback_ts = _safe_float(st.get("driver_status_last_ok_ts"), 0.0)
+    if readback_ts > 100_000_000_000.0:
+        readback_ts /= 1000.0
+    if wire_ts <= 0.0 or readback_ts <= wire_ts:
+        return False
+    return _phase_readback_confirmed(st, target)
+
+
 def phase_zero_readback_confirmed(status: Optional[Dict[str, Any]]) -> bool:
     """Öffentliches Recovery-Prädikat für einen frischen, physisch ruhigen 0-A-Zustand."""
 
@@ -1124,6 +1401,7 @@ def phase_sequence_step_contract(
     config: Optional[Dict[str, Any]] = None,
     reason: str = "phase_switch",
     cp_payload: Optional[Dict[str, Any]] = None,
+    clock_sample: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Liefert den nächsten sicheren Schritt der openWB-Pro-Phasensequenz.
 
@@ -1147,6 +1425,9 @@ def phase_sequence_step_contract(
     seq = sequence if isinstance(sequence, dict) else {}
     st = status if isinstance(status, dict) else {}
     cfg = config if isinstance(config, dict) else {}
+    phase_clock_sample = (
+        dict(clock_sample) if isinstance(clock_sample, dict) else None
+    )
     phase_cooldown_seconds = max(30.0, _safe_float(hold_s, 480.0))
     zero_settle_seconds = phase_zero_settle_s(cfg)
     target_settle_seconds = max(zero_settle_seconds, phase_min_settle_s(cfg))
@@ -1164,6 +1445,7 @@ def phase_sequence_step_contract(
         "zero_settle_s": float(zero_settle_seconds),
         "target_settle_s": float(target_settle_seconds),
         "reason": str(reason or "phase_switch"),
+        "monotonic_timebase_active": bool(phase_clock_sample),
     }
     if target not in (1, 3):
         base["reason"] = "invalid_phase_target"
@@ -1207,6 +1489,14 @@ def phase_sequence_step_contract(
             "cp_sent_ts": 0.0,
             "current_allowed_after": 0.0,
         }
+        stage_timer = _phase_stage_timer(
+            "zero_wait",
+            zero_settle_seconds,
+            None,
+            phase_clock_sample,
+        )
+        if stage_timer is not None:
+            next_sequence[PHASE_STAGE_TIMEBASE_KEY] = stage_timer
         return {
             **base,
             "action": "send_zero",
@@ -1242,7 +1532,27 @@ def phase_sequence_step_contract(
                 "reason": "phasetarget_connection_stale_or_unknown",
             }
         zero_until = _safe_float(seq.get("zero_until"), now_value + zero_settle_seconds)
-        if now_value < zero_until:
+        stage_timer = _phase_stage_timer(
+            "zero_wait",
+            zero_settle_seconds,
+            seq.get(PHASE_STAGE_TIMEBASE_KEY, {}),
+            phase_clock_sample,
+        )
+        if stage_timer is not None:
+            if stage_timer.get("active"):
+                return {
+                    **base,
+                    "action": "wait_zero",
+                    "stage": "zero_wait",
+                    "sequence_patch": {
+                        PHASE_STAGE_TIMEBASE_KEY: stage_timer,
+                    },
+                    "reason": str(
+                        stage_timer.get("reason")
+                        or "zero_wait_monotonic"
+                    ),
+                }
+        elif now_value < zero_until:
             return {**base, "action": "wait_zero", "stage": "zero_wait"}
         if not _zero_readback_confirmed(st):
             return {
@@ -1250,6 +1560,11 @@ def phase_sequence_step_contract(
                 "action": "wait_zero_readback",
                 "stage": "zero_wait",
                 "reason": "zero_readback_not_fresh_or_not_zero",
+                "sequence_patch": (
+                    {PHASE_STAGE_TIMEBASE_KEY: stage_timer}
+                    if stage_timer is not None
+                    else {}
+                ),
             }
         return {
             **base,
@@ -1263,16 +1578,29 @@ def phase_sequence_step_contract(
             },
             "sequence_patch": {
                 "stage": "restart_delay",
-                "phase_sent_ts": now_value,
-                "phase_settle_s": target_settle_seconds,
-                "phase_change_block_until": now_value + phase_cooldown_seconds,
-                "current_allowed_after": (
-                    now_value + target_settle_seconds + restart_seconds
+                **(
+                    {PHASE_STAGE_TIMEBASE_KEY: stage_timer}
+                    if stage_timer is not None
+                    else {}
                 ),
+                # Vor dem Treiber-I/O sind dies nur Dauerparameter. Die
+                # wirksamen Zeitanker werden erst aus dem erfolgreichen
+                # Wire-Receipt gebildet und anschließend persistiert.
+                "phase_proposal_ts": now_value,
+                "phase_sent_ts": 0.0,
+                "wire_receipt_ts": 0.0,
+                "phase_settle_s": target_settle_seconds,
+                "phase_change_block_until": 0.0,
+                "current_allowed_after": 0.0,
             },
             "command": {
                 "method": "set_phases",
                 "phases": target,
+                # Diese Kante besitzt bereits einen persistierten Intent und
+                # braucht deshalb zwingend einen neuen Wire-Beleg. Ein alter
+                # identischer Soll-Readback oder Treiber-Dedup darf sie nicht
+                # in einen unbehebbaren Recovery-Hold verwandeln.
+                "_require_wire_receipt": True,
                 "reason": "openwb_pro_phase_target",
                 "_openwb_pro_sequence_internal": True,
             },
@@ -1291,6 +1619,12 @@ def phase_sequence_step_contract(
             }
         phase_sent_ts = _safe_float(seq.get("phase_sent_ts"), now_value)
         settle_s = target_settle_seconds
+        stage_timer = _phase_stage_timer(
+            "restart_delay",
+            settle_s + restart_seconds,
+            None,
+            phase_clock_sample,
+        )
         return {
             **base,
             "action": "adopt_phase_settle",
@@ -1304,6 +1638,11 @@ def phase_sequence_step_contract(
                     phase_sent_ts + phase_cooldown_seconds,
                 ),
                 "current_allowed_after": phase_sent_ts + settle_s + restart_seconds,
+                **(
+                    {PHASE_STAGE_TIMEBASE_KEY: stage_timer}
+                    if stage_timer is not None
+                    else {}
+                ),
             },
             "command": None,
             "reason": "legacy_phase_state_adopted_without_extra_cp",
@@ -1311,6 +1650,71 @@ def phase_sequence_step_contract(
 
     if stage == "restart_delay":
         phase_sent_ts = _safe_float(seq.get("phase_sent_ts"), now_value)
+        if "wire_receipt_ts" not in seq:
+            # Vor diesem Vertrag persistierte Sequenzen besitzen nur den
+            # damaligen Vorschlagszeitpunkt. Er darf nicht rückwirkend als
+            # erfolgreicher POST-Beleg gelten. Ein danach frisch gelesener,
+            # verbundener und physisch ruhiger Zielzustand wird stattdessen
+            # selbst zum konservativen Settle-Anker.
+            readback_ts = _safe_float(st.get("driver_status_last_ok_ts"), 0.0)
+            if readback_ts > 100_000_000_000.0:
+                readback_ts /= 1000.0
+            legacy_readback_confirmed = bool(
+                readback_ts > max(0.0, phase_sent_ts)
+                and _fresh_connection_state(st) is True
+                and _zero_readback_confirmed(st)
+                and _phase_readback_confirmed(st, target)
+                and st.get("cp_interrupt_isactive") in (False, 0)
+            )
+            if not legacy_readback_confirmed:
+                return {
+                    **base,
+                    "action": "wait_post_wire_readback",
+                    "stage": "restart_delay",
+                    "reason": "legacy_phase_sequence_requires_fresh_idle_target_readback",
+                }
+            stage_timer = _phase_stage_timer(
+                "restart_delay",
+                target_settle_seconds + restart_seconds,
+                None,
+                phase_clock_sample,
+            )
+            return {
+                **base,
+                "action": "adopt_phase_settle",
+                "stage": "restart_delay",
+                "sequence_patch": {
+                    "stage": "restart_delay",
+                    "phase_sent_ts": readback_ts,
+                    "wire_receipt_ts": readback_ts,
+                    "phase_settle_s": target_settle_seconds,
+                    "phase_change_block_until": max(
+                        _safe_float(seq.get("phase_change_block_until"), 0.0),
+                        readback_ts + phase_cooldown_seconds,
+                    ),
+                    "current_allowed_after": (
+                        readback_ts + target_settle_seconds + restart_seconds
+                    ),
+                    **(
+                        {PHASE_STAGE_TIMEBASE_KEY: stage_timer}
+                        if stage_timer is not None
+                        else {}
+                    ),
+                },
+                "command": None,
+                "reason": "legacy_restart_delay_reanchored_from_fresh_readback",
+            }
+        wire_receipt_ts = _safe_float(
+            seq.get("wire_receipt_ts"),
+            phase_sent_ts,
+        )
+        if "wire_receipt_ts" in seq and wire_receipt_ts <= 0.0:
+            return {
+                **base,
+                "action": "wait_wire_receipt",
+                "stage": "restart_delay",
+                "reason": "phase_wire_receipt_missing",
+            }
         # openWB besitzt mit ``phasetarget`` die CP-/Umschaltpause. Die lange
         # 480-s-Frist schützt ausschließlich vor einem *weiteren*
         # Phasenwechsel; sie darf die Stromfreigabe nach bestätigtem Ziel nicht
@@ -1318,12 +1722,36 @@ def phase_sequence_step_contract(
         # auf den kurzen, bounded Ziel-Settle-Vertrag normalisiert.
         phase_settle_seconds = target_settle_seconds
         allowed_after = phase_sent_ts + phase_settle_seconds + restart_seconds
-        if now_value < allowed_after:
+        stage_timer = _phase_stage_timer(
+            "restart_delay",
+            phase_settle_seconds + restart_seconds,
+            seq.get(PHASE_STAGE_TIMEBASE_KEY, {}),
+            phase_clock_sample,
+        )
+        if (
+            stage_timer is not None
+            and stage_timer.get("active")
+        ) or (
+            stage_timer is None
+            and now_value < allowed_after
+        ):
             return {
                 **base,
                 "action": "wait_restart",
                 "stage": "restart_delay",
-                "sequence_patch": {"current_allowed_after": allowed_after},
+                "sequence_patch": {
+                    "current_allowed_after": allowed_after,
+                    **(
+                        {PHASE_STAGE_TIMEBASE_KEY: stage_timer}
+                        if stage_timer is not None
+                        else {}
+                    ),
+                },
+                "reason": (
+                    str(stage_timer.get("reason") or "restart_delay_monotonic")
+                    if stage_timer is not None
+                    else str(base.get("reason") or "phase_switch")
+                ),
             }
         if not _fresh_valid_status(st):
             return {
@@ -1331,6 +1759,21 @@ def phase_sequence_step_contract(
                 "action": "wait_fresh_readback",
                 "stage": "restart_delay",
                 "reason": "phase_release_status_stale_or_unknown",
+            }
+        if (
+            "wire_receipt_ts" in seq
+            and wire_receipt_ts > 0.0
+            and not _post_wire_readback_confirmed(
+                st,
+                target,
+                wire_receipt_ts,
+            )
+        ):
+            return {
+                **base,
+                "action": "wait_post_wire_readback",
+                "stage": "restart_delay",
+                "reason": "target_phase_readback_not_after_wire_receipt",
             }
         if bool(st.get("cp_interrupt_isactive", True)):
             return {
@@ -1676,6 +2119,8 @@ def vehicle_finished_drop_contract(
     recent_manager_start_retry: bool = False,
     phase_transition_active: bool = False,
     openwb_pro_phase_transition_active: bool = False,
+    required_drop_s: Any = 45,
+    required_drop_frames: Any = 3,
     now_ts: Any = 0,
 ) -> Dict[str, Any]:
     """Classify an openWB Pro power drop before the central charge-end latch.
@@ -1683,7 +2128,9 @@ def vehicle_finished_drop_contract(
     This contract does not decide or send a stop.  It only says whether the
     live drop is a safe candidate for ``charge_end_latch_contract``.  Manager
     stops, phase pauses, wake-up retries and unconfirmed start attempts remain
-    visible blockers instead of being mistaken for a finished vehicle.
+    visible blockers instead of being mistaken for a finished vehicle. Ein
+    einzelner Nullleistungs-Frame reicht ausdrücklich nicht: Das Ladeende muss
+    über mehrere frische Gerätestatus und eine Mindestdauer bestätigt sein.
     """
 
     st = status if isinstance(status, dict) else {}
@@ -1693,6 +2140,8 @@ def vehicle_finished_drop_contract(
     current_amp = max(0.0, _safe_float(current_set_amp, 0.0))
     time_since_start = max(0.0, _safe_float(time_since_start_s, 0.0))
     grace_s = max(0.0, _safe_float(startup_grace_s, 90.0))
+    confirm_s = max(15.0, _safe_float(required_drop_s, 45.0))
+    confirm_frames = max(2, _safe_int(required_drop_frames, 3))
     connected = status_connected(st)
     real_power_w = max(
         status_real_power(st),
@@ -1709,18 +2158,50 @@ def vehicle_finished_drop_contract(
         _safe_float(st.get("offered_current_raw", 0), 0.0),
         _safe_float(st.get("evse_current", 0), 0.0),
     )
+    plug_session_id = str(
+        data.get("_openwb_pro_plug_session_id") or ""
+    )
+    previous = data.get("_openwb_pro_vehicle_finished_candidate")
+    previous = dict(previous) if isinstance(previous, dict) else {}
+    previous_session_id = str(previous.get("plug_session_id") or "")
+    pending_same_session = bool(
+        previous
+        and previous_session_id
+        and previous_session_id == plug_session_id
+        and _safe_int(previous.get("frames"), 0) > 0
+        and previous.get("confirmed") is not True
+    )
+    manager_session_active = bool(
+        is_manager_charging or pending_same_session
+    )
+    sample_ts = max(
+        _safe_float(st.get("driver_status_last_sample_ts"), 0.0),
+        _safe_float(st.get("driver_status_last_ok_ts"), 0.0),
+    )
+    charge_truth = status_charge_truth(st)
+    status_fresh = bool(
+        _fresh_valid_status(st)
+        and charge_truth == "not_charging"
+        and sample_ts > 0.0
+        and now_value >= sample_ts - 2.0
+        and now_value - sample_ts <= 30.0
+    )
 
     blockers = []
-    if not bool(is_manager_charging):
+    if not manager_session_active:
         blockers.append("manager_not_in_charge_session")
     if not connected:
         blockers.append("vehicle_not_connected")
+    if not plug_session_id:
+        blockers.append("plug_session_missing")
+    if not status_fresh:
+        blockers.append("status_not_fresh")
     if real_charging:
         blockers.append("real_charge_still_active")
     if time_since_start <= grace_s:
         blockers.append("startup_grace_active")
-    if current_amp <= 0:
-        blockers.append("no_manager_current_offer")
+    if current_amp < min_current:
+        blockers.append("no_minimum_manager_current_offer")
     if bool(observe_only):
         blockers.append("observe_only")
     if bool(openwb_mode9_monitor):
@@ -1740,11 +2221,49 @@ def vehicle_finished_drop_contract(
     if not confirmed:
         blockers.append("no_confirmed_real_charge")
 
-    allow = bool(not blockers)
-    action = "candidate" if allow else "ignore"
-    reason = "vehicle_finished_candidate" if allow else blockers[0]
+    candidate: Dict[str, Any] = {}
+    drop_age_s = 0.0
+    drop_frames = 0
+    drop_confirmed = False
+    if not blockers:
+        since_ts = _safe_float(previous.get("since_ts"), 0.0)
+        last_sample_ts = _safe_float(previous.get("last_sample_ts"), 0.0)
+        drop_frames = max(0, _safe_int(previous.get("frames"), 0))
+        if (
+            since_ts <= 0.0
+            or sample_ts < last_sample_ts
+            or previous_session_id != plug_session_id
+        ):
+            since_ts = sample_ts
+            last_sample_ts = 0.0
+            drop_frames = 0
+        if sample_ts > last_sample_ts + 1e-6:
+            drop_frames += 1
+            last_sample_ts = sample_ts
+        drop_age_s = max(0.0, now_value - since_ts)
+        drop_confirmed = bool(
+            drop_frames >= confirm_frames
+            and drop_age_s >= confirm_s
+        )
+        candidate = {
+            "since_ts": float(since_ts),
+            "last_sample_ts": float(last_sample_ts),
+            "frames": int(drop_frames),
+            "confirmed": bool(drop_confirmed),
+            "plug_session_id": plug_session_id,
+        }
+        if not drop_confirmed:
+            blockers.append("drop_confirmation_pending")
+
+    allow = bool(drop_confirmed and not blockers)
+    action = "candidate" if allow else ("wait" if candidate else "ignore")
+    reason = (
+        "vehicle_finished_candidate"
+        if allow
+        else ("drop_confirmation_pending" if candidate else blockers[0])
+    )
     return {
-        "contract": "openwb_pro_vehicle_finished_drop_v1",
+        "contract": "openwb_pro_vehicle_finished_drop_v2",
         "action": action,
         "allow_new_latch": bool(allow),
         "reason": reason,
@@ -1752,13 +2271,29 @@ def vehicle_finished_drop_contract(
         "connected": bool(connected),
         "real_charging": bool(real_charging),
         "real_power_w": float(real_power_w if real_charging else 0.0),
-        "manager_charging": bool(is_manager_charging),
+        "manager_charging": bool(manager_session_active),
+        "manager_session_continued_from_candidate": bool(
+            pending_same_session and not is_manager_charging
+        ),
         "current_set_amp": float(current_amp),
         "hardware_amp": float(hardware_amp),
+        "status_fresh": bool(status_fresh),
+        "charge_truth": str(charge_truth),
+        "plug_session_id": plug_session_id,
         "min_amp": float(min_current),
         "time_since_start_s": float(time_since_start),
         "startup_grace_s": float(grace_s),
         "had_confirmed_charge": bool(confirmed),
+        "drop_confirmed": bool(drop_confirmed),
+        "drop_age_s": float(drop_age_s),
+        "drop_frames": int(drop_frames),
+        "required_drop_s": float(confirm_s),
+        "required_drop_frames": int(confirm_frames),
+        "remaining_drop_s": max(0.0, float(confirm_s - drop_age_s)),
+        "candidate": candidate,
+        "state_patch": {
+            "_openwb_pro_vehicle_finished_candidate": candidate or None,
+        },
         "ts": float(now_value),
     }
 
@@ -1781,6 +2316,18 @@ def apply_vehicle_finished_drop_to_status(
     )
     status["openwb_pro_vehicle_finished_time_since_start_s"] = float(
         contract.get("time_since_start_s", 0.0) or 0.0
+    )
+    status["openwb_pro_vehicle_finished_drop_confirmed"] = bool(
+        contract.get("drop_confirmed", False)
+    )
+    status["openwb_pro_vehicle_finished_drop_age_s"] = float(
+        contract.get("drop_age_s", 0.0) or 0.0
+    )
+    status["openwb_pro_vehicle_finished_drop_frames"] = int(
+        contract.get("drop_frames", 0) or 0
+    )
+    status["openwb_pro_vehicle_finished_remaining_s"] = float(
+        contract.get("remaining_drop_s", 0.0) or 0.0
     )
     return status
 
@@ -1828,11 +2375,14 @@ def temporary_ems_stop_contract(
         _safe_float(data.get("_last_manager_stop_request_ts", 0.0), 0.0) > 0.0
         or _safe_float(data.get("_last_manager_zero_anchor_ts", 0.0), 0.0) > 0.0
     )
+    # ``current_set_amp`` und ``cap_amp`` sind die neue fachliche Anforderung,
+    # nicht der physische Nachweis, dass ein zuvor gesendeter Stopp noch wirkt.
+    # Nach bestätigten 0 A / 0 W ist der Stopp abgeschlossen und ein frisches
+    # positives Budget darf wieder starten. Andernfalls hält gerade das neue
+    # Angebot den alten Stopp-Latch endlos aktiv.
     stop_has_effect = bool(
         real_charging
         or real_power_w > 50.0
-        or current_amp >= min_current
-        or cap >= min_current
         or hw_amp >= min_current
     )
 
@@ -1921,6 +2471,7 @@ def manager_zero_anchor_release_contract(
     cap_amp: Any = 0,
     min_amp: Any = 6,
     budget_ready: bool = False,
+    fresh_budget_authorized: bool = False,
     mode_off: bool = False,
     priority_forced_stop: bool = False,
     ended_latched: bool = False,
@@ -1937,8 +2488,8 @@ def manager_zero_anchor_release_contract(
 
     Der alte Nullanker darf nicht selbst zur Bedingung werden, die den zum
     Verlassen nötigen positiven Befehl sperrt. Dieser Vertrag erkennt daher nur
-    die beiden Nullgründe der Direktkurve. Nutzer-Aus, Ladeende, Notfall,
-    Priorität, Phase/CP und Stale-Data-Sperren bleiben maßgeblich.
+    ausdrücklich freigegebene temporäre Policy-Gründe. Nutzer-Aus, Ladeende,
+    Notfall, Priorität, Phase/CP und Stale-Data-Sperren bleiben maßgeblich.
     """
 
     st = status if isinstance(status, dict) else {}
@@ -1978,6 +2529,14 @@ def manager_zero_anchor_release_contract(
         or ""
     )
     plug_session_id = str(data.get("_openwb_pro_plug_session_id") or "")
+    session_bound_reason = bool(
+        anchor_reason in SESSION_BOUND_RELEASABLE_ZERO_ANCHOR_REASONS
+    )
+    plug_session_matches = bool(
+        anchor_plug_session_id
+        and plug_session_id
+        and anchor_plug_session_id == plug_session_id
+    )
     soft_until = _safe_float(data.get("_openwb_start_reject_soft_until"), 0.0)
     soft_reject_due = bool(
         allow_soft_start_reject
@@ -1988,9 +2547,28 @@ def manager_zero_anchor_release_contract(
         and soft_until > 0.0
         and now_value >= soft_until
     )
-    regular_anchor = bool(
-        anchor_class == "temporary_policy_zero"
+    legacy_releasable_anchor = bool(
+        typed_anchor_valid
         and anchor_reason in RELEASABLE_ZERO_ANCHOR_REASONS
+        and anchor_class == "hard_stop"
+        and anchor_plug_session_id
+        and anchor_plug_session_id == plug_session_id
+        and (
+            not anchor_vehicle_key
+            or anchor_vehicle_key == session_vehicle_key
+        )
+    )
+    legacy_floor_anchor = bool(
+        legacy_releasable_anchor
+        and anchor_reason == "wbminsoc_floor_pause"
+    )
+    regular_anchor = bool(
+        anchor_reason in RELEASABLE_ZERO_ANCHOR_REASONS
+        and (
+            anchor_class == "temporary_policy_zero"
+            or legacy_releasable_anchor
+        )
+        and (not session_bound_reason or plug_session_matches)
     )
     anchor_releasable = bool(
         typed_anchor_valid and (regular_anchor or soft_reject_due)
@@ -2011,6 +2589,10 @@ def manager_zero_anchor_release_contract(
         blockers.append("typed_zero_anchor_required")
     if not anchor_releasable:
         blockers.append("zero_anchor_reason_not_releasable")
+    if session_bound_reason and not anchor_plug_session_id:
+        blockers.append("anchor_plug_session_id_required")
+    if session_bound_reason and not plug_session_id:
+        blockers.append("current_plug_session_id_required")
     if anchor_vehicle_key and anchor_vehicle_key != session_vehicle_key:
         blockers.append("session_vehicle_key_mismatch")
     if anchor_plug_session_id and anchor_plug_session_id != plug_session_id:
@@ -2023,6 +2605,8 @@ def manager_zero_anchor_release_contract(
         blockers.append("cp_not_explicitly_inactive")
     if cap < min_current or not bool(budget_ready):
         blockers.append("positive_executable_budget_required")
+    if not bool(fresh_budget_authorized):
+        blockers.append("fresh_budget_authorization_required")
     if mode_off:
         blockers.append("mode_off")
     if priority_forced_stop:
@@ -2054,6 +2638,8 @@ def manager_zero_anchor_release_contract(
         "legacy_anchor_reason": legacy_anchor_reason,
         "typed_anchor_valid": typed_anchor_valid,
         "anchor_class": anchor_class,
+        "legacy_releasable_anchor": legacy_releasable_anchor,
+        "legacy_floor_anchor": legacy_floor_anchor,
         "soft_reject_due": bool(soft_reject_due),
         "anchor_vehicle_key": anchor_vehicle_key,
         "session_vehicle_key": session_vehicle_key,
@@ -2065,6 +2651,7 @@ def manager_zero_anchor_release_contract(
         "cap_amp": float(cap),
         "min_amp": float(min_current),
         "budget_ready": bool(budget_ready),
+        "fresh_budget_authorized": bool(fresh_budget_authorized),
         "phase_transition_active": bool(phase_transition_active),
         "phase_recovery_ambiguous": bool(phase_recovery_ambiguous),
         "state_patch": (
@@ -2280,6 +2867,17 @@ def start_liveness_contract(
     st = status if isinstance(status, dict) else {}
     now_value = _safe_float(now_ts, 0.0)
     timeout = max(30.0, _safe_float(timeout_s, 180.0))
+    plug_session_id = str(
+        data.get("_openwb_pro_plug_session_id") or ""
+    )
+    timer_plug_session_id = str(
+        data.get("_openwb_pro_unserved_plug_session_id") or ""
+    )
+    status_fresh = _fresh_valid_status(st)
+    timer_session_matches = bool(
+        plug_session_id
+        and timer_plug_session_id == plug_session_id
+    )
     phase_sequence = data.get("_openwb_pro_phase_sequence")
     phase_sequence_active = bool(
         isinstance(phase_sequence, dict)
@@ -2302,27 +2900,70 @@ def start_liveness_contract(
         or wakeup_wait_active
     )
     start_scope = bool(
-        sess.get("connected", False)
+        plug_session_id
+        and status_fresh
+        and sess.get("connected", False)
         and sess.get("start_requested", False)
         and sess.get("budget_ready", False)
         and not sess.get("real_charging", False)
     )
-    eligible = bool(start_scope and not expected_wait)
-    previous_since = _safe_float(data.get("_openwb_pro_unserved_since"), 0.0)
-    pause_since = _safe_float(data.get("_openwb_pro_unserved_pause_since"), 0.0)
-    paused_total = max(0.0, _safe_float(data.get("_openwb_pro_unserved_paused_s"), 0.0))
+    issued_session_id = str(
+        data.get("_openwb_pro_start_current_session_id") or ""
+    )
+    issued_ts = _safe_float(
+        data.get("_openwb_pro_start_current_issued_ts"),
+        0.0,
+    )
+    receipt_bound = bool(
+        plug_session_id
+        and issued_session_id == plug_session_id
+        and issued_ts > 0.0
+        and issued_ts <= now_value + 5.0
+    )
+    # Eine bloße fachliche Startbereitschaft ist noch keine reale
+    # Fahrzeug-Antwortfrist. Erst der erfolgreiche positive Treiber-Receipt
+    # derselben Stecksession darf den Timer scharf schalten.
+    eligible = bool(start_scope and receipt_bound and not expected_wait)
+    previous_since = (
+        _safe_float(data.get("_openwb_pro_unserved_since"), 0.0)
+        if timer_session_matches
+        else 0.0
+    )
+    pause_since = (
+        _safe_float(data.get("_openwb_pro_unserved_pause_since"), 0.0)
+        if timer_session_matches
+        else 0.0
+    )
+    paused_total = (
+        max(
+            0.0,
+            _safe_float(data.get("_openwb_pro_unserved_paused_s"), 0.0),
+        )
+        if timer_session_matches
+        else 0.0
+    )
     state_patch: Dict[str, Any] = {}
-    if start_scope and expected_wait:
-        since = previous_since if previous_since > 0.0 else now_value
+    receipt_reanchors_timer = bool(
+        receipt_bound
+        and previous_since > 0.0
+        and previous_since < issued_ts
+    )
+    if receipt_reanchors_timer:
+        previous_since = issued_ts
+        pause_since = 0.0
+        paused_total = 0.0
+    if start_scope and expected_wait and receipt_bound:
+        since = max(previous_since, issued_ts)
         if pause_since <= 0.0:
             pause_since = now_value
         state_patch = {
             "_openwb_pro_unserved_since": since,
             "_openwb_pro_unserved_pause_since": pause_since,
             "_openwb_pro_unserved_paused_s": paused_total,
+            "_openwb_pro_unserved_plug_session_id": plug_session_id,
         }
     elif eligible:
-        since = previous_since if previous_since > 0.0 else now_value
+        since = max(previous_since, issued_ts)
         if pause_since > 0.0:
             paused_total += max(0.0, now_value - pause_since)
         pause_since = 0.0
@@ -2330,6 +2971,7 @@ def start_liveness_contract(
             "_openwb_pro_unserved_since": since,
             "_openwb_pro_unserved_pause_since": 0.0,
             "_openwb_pro_unserved_paused_s": paused_total,
+            "_openwb_pro_unserved_plug_session_id": plug_session_id,
         }
     else:
         since = 0.0
@@ -2339,25 +2981,33 @@ def start_liveness_contract(
             "_openwb_pro_unserved_since": 0.0,
             "_openwb_pro_unserved_pause_since": 0.0,
             "_openwb_pro_unserved_paused_s": 0.0,
+            "_openwb_pro_unserved_plug_session_id": None,
         }
     age_s = (
         max(0.0, now_value - since - paused_total)
         if eligible and since > 0.0
         else 0.0
     )
-    last_command = data.get("_last_executed_command")
-    issued_positive = bool(
-        isinstance(last_command, dict)
-        and _safe_float(last_command.get("amp"), 0.0) >= 6.0
-        and _safe_float(last_command.get("ts"), 0.0) >= since
-    )
-    offered_amp = max(
-        _safe_float(st.get("amp"), 0.0),
-        _safe_float(st.get("offered_current_raw"), 0.0),
-        _safe_float(st.get("evse_current"), 0.0),
+    issued_positive = bool(receipt_bound and since > 0.0)
+    offered_amp = (
+        max(
+            _safe_float(st.get("amp"), 0.0),
+            _safe_float(st.get("offered_current_raw"), 0.0),
+            _safe_float(st.get("evse_current"), 0.0),
+        )
+        if status_fresh
+        else 0.0
     )
     alert = bool(eligible and age_s >= timeout)
-    if not eligible:
+    awaiting_receipt = bool(
+        start_scope
+        and not expected_wait
+        and not receipt_bound
+    )
+    if awaiting_receipt:
+        state = "waiting"
+        code = "START_PENDING_RECEIPT"
+    elif not eligible:
         state = "inactive"
         code = ""
     elif not alert:
@@ -2376,7 +3026,7 @@ def start_liveness_contract(
         state = "failed"
         code = "START_FAILED_NO_CHARGE_CONFIRMATION"
     return {
-        "contract": "openwb_pro_start_liveness_v1",
+        "contract": "openwb_pro_start_liveness_v2",
         "state": state,
         "code": code,
         "eligible": eligible,
@@ -2395,7 +3045,22 @@ def start_liveness_contract(
         "age_s": float(age_s),
         "timeout_s": float(timeout),
         "issued_positive": issued_positive,
+        "issued_ts": float(issued_ts),
+        "receipt_bound": receipt_bound,
+        "receipt_reanchors_timer": receipt_reanchors_timer,
+        "awaiting_receipt": awaiting_receipt,
+        "issued_plug_session_id": issued_session_id,
         "offered_amp": float(offered_amp),
+        "plug_session_id": plug_session_id,
+        "timer_plug_session_id": (
+            plug_session_id if start_scope else ""
+        ),
+        "timer_session_reset": bool(
+            timer_plug_session_id
+            and timer_plug_session_id != plug_session_id
+        ),
+        "session_bound": bool(plug_session_id),
+        "status_fresh": bool(status_fresh),
         "ts": float(now_value),
     }
 

@@ -1,14 +1,335 @@
 <?php
 // get_live_json.php
 require_once 'helpers.php';
-requireWebAuth(true);
-header('Content-Type: application/json');
-header('Cache-Control: no-cache, no-store, must-revalidate');
-header('Pragma: no-cache');
-header('Expires: 0');
+
+function liveCloseSessionLock() {
+    if (session_status() === PHP_SESSION_ACTIVE) {
+        @session_write_close();
+    }
+}
+
+function liveJsonSuccessfulSnapshotBody($body) {
+    if (!is_string($body) || $body === '') return null;
+    $decoded = @json_decode($body, true);
+    if (
+        !is_array($decoded)
+        || array_key_exists('error', $decoded)
+        || (array_key_exists('success', $decoded) && $decoded['success'] === false)
+    ) {
+        return null;
+    }
+    return $decoded;
+}
+
+function liveJsonReadCachedBody($path, $maxAgeS) {
+    if (is_link($path)) return null;
+    clearstatcache(true, $path);
+    $meta = @lstat($path);
+    if (
+        !is_array($meta)
+        || (((int)($meta['mode'] ?? 0)) & 0170000) !== 0100000
+        || (int)($meta['nlink'] ?? 0) !== 1
+        || (int)($meta['size'] ?? 0) <= 0
+        || (int)($meta['size'] ?? 0) > 16 * 1024 * 1024
+        || !is_readable($path)
+    ) {
+        return null;
+    }
+    $age = microtime(true) - (float)($meta['mtime'] ?? 0);
+    if ($age < 0.0 || $age > max(0.0, (float)$maxAgeS)) return null;
+    $body = e3dcReadRegularFileBound($path, 16 * 1024 * 1024);
+    clearstatcache(true, $path);
+    $after = @lstat($path);
+    if (
+        !is_array($after)
+        || (int)($after['dev'] ?? -1) !== (int)($meta['dev'] ?? -2)
+        || (int)($after['ino'] ?? -1) !== (int)($meta['ino'] ?? -2)
+        || (int)($after['size'] ?? -1) !== (int)($meta['size'] ?? -2)
+        || (int)($after['mtime'] ?? -1) !== (int)($meta['mtime'] ?? -2)
+        || (int)($after['ctime'] ?? -1) !== (int)($meta['ctime'] ?? -2)
+    ) {
+        return null;
+    }
+    if (liveJsonSuccessfulSnapshotBody($body) === null) return null;
+    return ['body' => $body, 'age_s' => $age];
+}
+
+function liveJsonWriteRuntimeFileAtomic($path, $body) {
+    $dir = dirname((string)$path);
+    if (!is_dir($dir) || !is_string($body)) return false;
+    $tmp = @tempnam($dir, '.get_live_json_');
+    if ($tmp === false) return false;
+    $ok = @file_put_contents($tmp, $body, LOCK_EX) !== false;
+    if ($ok) {
+        @chmod($tmp, 0664);
+        $ok = @rename($tmp, $path);
+    }
+    @unlink($tmp);
+    if ($ok) @chmod($path, 0664);
+    return $ok;
+}
+
+function liveJsonOpenBoundLockFile($path) {
+    if (is_link($path)) return false;
+    $handle = @fopen($path, 'c');
+    if ($handle === false) {
+        $handle = @fopen($path, 'r');
+    }
+    if ($handle === false) return false;
+    @chmod($path, 0664);
+    clearstatcache(true, $path);
+    $opened = @fstat($handle);
+    $bound = @lstat($path);
+    if (
+        !is_array($opened)
+        || !is_array($bound)
+        || (((int)($opened['mode'] ?? 0)) & 0170000) !== 0100000
+        || (((int)($bound['mode'] ?? 0)) & 0170000) !== 0100000
+        || (int)($opened['nlink'] ?? 0) !== 1
+        || (int)($bound['nlink'] ?? 0) !== 1
+        || (int)($opened['dev'] ?? -1) !== (int)($bound['dev'] ?? -2)
+        || (int)($opened['ino'] ?? -1) !== (int)($bound['ino'] ?? -2)
+    ) {
+        @fclose($handle);
+        return false;
+    }
+    return $handle;
+}
+
+function liveJsonTryExclusiveLock($handle, $waitMs) {
+    if (!is_resource($handle)) return false;
+    $deadline = microtime(true) + max(0.0, (float)$waitMs) / 1000.0;
+    do {
+        if (@flock($handle, LOCK_EX | LOCK_NB)) return true;
+        if (microtime(true) >= $deadline) break;
+        usleep(25000);
+    } while (true);
+    return false;
+}
+
+function liveJsonReleaseLock($handle, $owned = true) {
+    if (!is_resource($handle)) return;
+    if ($owned) @flock($handle, LOCK_UN);
+    @fclose($handle);
+}
+
+function liveJsonEmitError($status, $error) {
+    http_response_code((int)$status);
+    echo json_encode([
+        'success' => false,
+        'error' => (string)$error,
+    ], JSON_UNESCAPED_SLASHES);
+}
+
+$liveJsonIsCli = (PHP_SAPI === 'cli');
+$liveJsonCliHistoryRequested = false;
+$liveJsonCliHistoryLockHandle = null;
+$liveJsonCliHistoryLockOwned = false;
+$liveJsonCliThrottleFile = '/var/www/html/ramdisk/get_live_json_history_sample.ts';
+
+if ($liveJsonIsCli) {
+    $cliArgs = isset($argv) && is_array($argv) ? array_slice($argv, 1) : [];
+    $liveJsonCliHistoryRequested = ($cliArgs === ['--history-sample']);
+    if (!$liveJsonCliHistoryRequested) {
+        if (defined('STDERR')) {
+            @fwrite(STDERR, "Nur --history-sample ist als CLI-Vertrag zulässig.\n");
+        }
+        exit(64);
+    }
+    liveCloseSessionLock();
+    $liveJsonCliHistoryLockHandle = liveJsonOpenBoundLockFile(
+        '/var/www/html/ramdisk/get_live_json_history_sample.lock'
+    );
+    if (!is_resource($liveJsonCliHistoryLockHandle)) {
+        exit(75);
+    }
+    $liveJsonCliHistoryLockOwned = @flock(
+        $liveJsonCliHistoryLockHandle,
+        LOCK_EX | LOCK_NB
+    );
+    if (!$liveJsonCliHistoryLockOwned) {
+        liveJsonReleaseLock($liveJsonCliHistoryLockHandle, false);
+        exit(0);
+    }
+    $lastHistoryRaw = e3dcReadRegularFileBound($liveJsonCliThrottleFile, 128);
+    $lastHistorySample = is_string($lastHistoryRaw) && is_numeric(trim($lastHistoryRaw))
+        ? (float)trim($lastHistoryRaw)
+        : 0.0;
+    $lastHistorySampleAge = microtime(true) - $lastHistorySample;
+    if (
+        $lastHistorySample > 0.0
+        && $lastHistorySampleAge >= 0.0
+        && $lastHistorySampleAge < 58.0
+    ) {
+        liveJsonReleaseLock($liveJsonCliHistoryLockHandle, true);
+        exit(0);
+    }
+} else {
+    requireWebAuth(true);
+    header('Content-Type: application/json');
+    header('Cache-Control: no-cache, no-store, must-revalidate');
+    header('Pragma: no-cache');
+    header('Expires: 0');
+}
+
+if (
+    !$liveJsonIsCli
+    && ($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'GET'
+    && isset($_GET['wallbox_native_snapshot'])
+    && (string)$_GET['wallbox_native_snapshot'] === '1'
+) {
+    liveCloseSessionLock();
+    $snapshotPath = '/var/www/html/ramdisk/wallbox_native.json';
+    if (
+        is_link($snapshotPath)
+        || !is_file($snapshotPath)
+        || !is_readable($snapshotPath)
+        || (int)@filesize($snapshotPath) > 1024 * 1024
+    ) {
+        http_response_code(404);
+        echo json_encode(['success' => false, 'error' => 'wallbox_snapshot_unavailable']);
+        exit;
+    }
+    $snapshotRaw = @file_get_contents($snapshotPath);
+    $snapshot = is_string($snapshotRaw) ? json_decode($snapshotRaw, true) : null;
+    if (!is_array($snapshot)) {
+        http_response_code(503);
+        echo json_encode(['success' => false, 'error' => 'wallbox_snapshot_invalid']);
+        exit;
+    }
+    echo json_encode($snapshot, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+// Die Ladekurve benötigt aus der Live-Historie ausschließlich Zeit und SoC.
+// Dieser eng begrenzte Lesepfad antwortet vor dem vollständigen Live-Snapshot:
+// keine Geräteabfragen, keine Historienpflege und kein unnötig großer Transfer.
+if (
+    !$liveJsonIsCli
+    && ($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'GET'
+    && isset($_GET['storage_curve_history'])
+    && (string)$_GET['storage_curve_history'] === '1'
+) {
+    liveCloseSessionLock();
+    $dayStartMsRaw = $_GET['day_start_ms'] ?? null;
+    if (!is_numeric($dayStartMsRaw)) {
+        http_response_code(400);
+        echo json_encode([
+            'success' => false,
+            'error' => 'invalid_day_start',
+            'points' => [],
+        ], JSON_UNESCAPED_SLASHES);
+        exit;
+    }
+
+    $dayStartMs = (int)round((float)$dayStartMsRaw);
+    $dayStartS = (int)floor($dayStartMs / 1000);
+    // Der nächste lokale Kalendertag kann bei einer Zeitumstellung 23 oder
+    // 25 Stunden entfernt liegen. Ein starres 24-h-Fenster würde dabei
+    // Historienpunkte des falschen Tages ein- oder ausschließen.
+    $dayEndS = strtotime('+1 day', $dayStartS);
+    if ($dayEndS === false || $dayEndS <= $dayStartS) {
+        http_response_code(400);
+        echo json_encode([
+            'success' => false,
+            'error' => 'invalid_day_range',
+            'points' => [],
+        ], JSON_UNESCAPED_SLASHES);
+        exit;
+    }
+    $nowS = time();
+    if ($dayStartS <= 0 || $dayStartS < ($nowS - 7 * 86400) || $dayStartS > ($nowS + 2 * 86400)) {
+        http_response_code(400);
+        echo json_encode([
+            'success' => false,
+            'error' => 'day_start_out_of_range',
+            'points' => [],
+        ], JSON_UNESCAPED_SLASHES);
+        exit;
+    }
+
+    $historyFile = '/var/www/html/ramdisk/live_history.txt';
+    $points = [];
+    $scannedLines = 0;
+    if (is_readable($historyFile)) {
+        $history = new SplFileObject($historyFile, 'r');
+        while (!$history->eof() && $scannedLines < 10000) {
+            $line = trim((string)$history->fgets());
+            $scannedLines++;
+            if ($line === '') continue;
+            $sample = json_decode($line, true);
+            if (!is_array($sample) || !isset($sample['ts']) || !isset($sample['soc']) || !is_numeric($sample['soc'])) {
+                continue;
+            }
+            $sampleTs = strtotime((string)$sample['ts']);
+            if ($sampleTs === false || $sampleTs < $dayStartS || $sampleTs >= $dayEndS) {
+                continue;
+            }
+            $soc = (float)$sample['soc'];
+            if (!is_finite($soc) || $soc < 0.0 || $soc > 100.0) {
+                continue;
+            }
+            $points[] = [
+                'ts' => $sampleTs * 1000,
+                'soc' => round($soc, 2),
+            ];
+        }
+    }
+
+    header('X-E3DC-History-Samples: ' . count($points));
+    echo json_encode([
+        'success' => true,
+        'day_start_ms' => $dayStartS * 1000,
+        'points' => $points,
+    ], JSON_UNESCAPED_SLASHES);
+    exit;
+}
+
+// API-/Widget-Kompatibilität erhält ausschließlich den bereits erzeugten,
+// vollständigen Web-Snapshot. Dieser Pfad führt keinerlei Geräteabfrage oder
+// Pflege aus. Ein fehlender oder veralteter Vollsnapshot bleibt explizit
+// unavailable; das rohe live_data_py-Schema ist kein kompatibler Ersatz.
+if (
+    !$liveJsonIsCli
+    && ($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'GET'
+    && (
+        (isset($_GET['read_only_snapshot']) && (string)$_GET['read_only_snapshot'] === '1')
+        || isset($_GET['t'])
+        || isset($_GET['cache_bust'])
+        || empty($_GET)
+    )
+) {
+    liveCloseSessionLock();
+    $readOnlySnapshot = liveJsonReadCachedBody(
+        '/var/www/html/ramdisk/get_live_json_snapshot.json',
+        15.0
+    );
+    if (!is_array($readOnlySnapshot)) {
+        liveJsonEmitError(503, 'read_only_snapshot_unavailable');
+        exit;
+    }
+    header('X-E3DC-Live-Cache: READ_ONLY');
+    header('X-E3DC-Live-Cache-Age: ' . number_format(
+        (float)$readOnlySnapshot['age_s'],
+        3,
+        '.',
+        ''
+    ));
+    echo $readOnlySnapshot['body'];
+    exit;
+}
+
+// Der vollständige Live-Sampler pflegt Caches, Historien und
+// Wallbox-Sitzungszustände. Er ist daher kein sicherer GET-Endpunkt.
+// Ausschließlich die oben gebundenen, eng begrenzten Lesepfade bleiben read-only.
+if (!$liveJsonIsCli) {
+    e3dcRequirePostMutation(true);
+    liveCloseSessionLock();
+}
 
 function liveJsonShortCacheAllowed() {
-    if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'GET') return false;
+    if (PHP_SAPI === 'cli') return true;
+    if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'POST') return false;
     if (isset($_GET['cache']) && (string)$_GET['cache'] === '0') return false;
     $ignored = ['t' => true, '_' => true, 'cache_bust' => true];
     foreach ($_GET as $key => $_value) {
@@ -20,29 +341,126 @@ function liveJsonShortCacheAllowed() {
 $liveJsonShortCacheEnabled = liveJsonShortCacheAllowed();
 $liveJsonShortCacheFile = '/var/www/html/ramdisk/get_live_json_snapshot.json';
 $liveJsonShortCacheTtlS = 1.0;
-if ($liveJsonShortCacheEnabled && is_readable($liveJsonShortCacheFile)) {
-    $cacheAge = microtime(true) - (float)@filemtime($liveJsonShortCacheFile);
-    if ($cacheAge >= 0.0 && $cacheAge <= $liveJsonShortCacheTtlS) {
-        $cachedBody = @file_get_contents($liveJsonShortCacheFile);
-        if (is_string($cachedBody) && $cachedBody !== '' && json_decode($cachedBody, true) !== null) {
-            header('X-E3DC-Live-Cache: HIT');
-            echo $cachedBody;
+
+if ($liveJsonShortCacheEnabled) {
+    $cached = liveJsonReadCachedBody($liveJsonShortCacheFile, $liveJsonShortCacheTtlS);
+    if (is_array($cached)) {
+        if (!$liveJsonIsCli) header('X-E3DC-Live-Cache: HIT');
+        echo $cached['body'];
+        if ($liveJsonCliHistoryLockOwned) {
+            liveJsonReleaseLock($liveJsonCliHistoryLockHandle, true);
+        }
+        exit;
+    }
+}
+
+$liveJsonLockHandle = liveJsonOpenBoundLockFile(
+    '/var/www/html/ramdisk/get_live_json_snapshot.lock'
+);
+$liveJsonLockOwned = false;
+if (!is_resource($liveJsonLockHandle)) {
+    if ($liveJsonCliHistoryLockOwned) {
+        liveJsonReleaseLock($liveJsonCliHistoryLockHandle, true);
+    }
+    if ($liveJsonIsCli) exit(75);
+    liveJsonEmitError(503, 'live_snapshot_lock_unavailable');
+    exit;
+}
+
+$liveJsonLockOwned = @flock($liveJsonLockHandle, LOCK_EX | LOCK_NB);
+if (!$liveJsonLockOwned) {
+    if ($liveJsonIsCli) {
+        liveJsonReleaseLock($liveJsonLockHandle, false);
+        liveJsonReleaseLock($liveJsonCliHistoryLockHandle, true);
+        exit(0);
+    }
+    if ($liveJsonShortCacheEnabled) {
+        $stale = liveJsonReadCachedBody($liveJsonShortCacheFile, 15.0);
+        if (is_array($stale)) {
+            liveJsonReleaseLock($liveJsonLockHandle, false);
+            header('X-E3DC-Live-Cache: STALE_BUSY');
+            header('X-E3DC-Live-Cache-Age: ' . number_format(
+                (float)$stale['age_s'],
+                3,
+                '.',
+                ''
+            ));
+            echo $stale['body'];
             exit;
         }
     }
+    $liveJsonLockOwned = liveJsonTryExclusiveLock($liveJsonLockHandle, 750);
 }
+
+if (!$liveJsonLockOwned) {
+    liveJsonReleaseLock($liveJsonLockHandle, false);
+    if ($liveJsonShortCacheEnabled) {
+        $stale = liveJsonReadCachedBody($liveJsonShortCacheFile, 15.0);
+        if (is_array($stale)) {
+            header('X-E3DC-Live-Cache: STALE_AFTER_WAIT');
+            echo $stale['body'];
+            exit;
+        }
+    }
+    liveJsonEmitError(503, 'live_snapshot_busy');
+    exit;
+}
+
 if ($liveJsonShortCacheEnabled) {
-    ob_start();
-    register_shutdown_function(function () use ($liveJsonShortCacheFile) {
+    // Ein anderer Worker kann den Snapshot während unserer kurzen Wartezeit
+    // bereits fertiggestellt haben.
+    $cached = liveJsonReadCachedBody($liveJsonShortCacheFile, $liveJsonShortCacheTtlS);
+    if (is_array($cached)) {
+        liveJsonReleaseLock($liveJsonLockHandle, true);
+        if (!$liveJsonIsCli) header('X-E3DC-Live-Cache: HIT_AFTER_WAIT');
+        echo $cached['body'];
+        if ($liveJsonCliHistoryLockOwned) {
+            liveJsonReleaseLock($liveJsonCliHistoryLockHandle, true);
+        }
+        exit;
+    }
+}
+
+if ($liveJsonCliHistoryRequested) {
+    $historyThrottleWritten = liveJsonWriteRuntimeFileAtomic(
+        $liveJsonCliThrottleFile,
+        sprintf('%.6f', microtime(true))
+    );
+    if (!$historyThrottleWritten) {
+        liveJsonReleaseLock($liveJsonLockHandle, true);
+        liveJsonReleaseLock($liveJsonCliHistoryLockHandle, true);
+        exit(75);
+    }
+}
+
+ob_start();
+register_shutdown_function(function () use (
+        $liveJsonShortCacheEnabled,
+        $liveJsonShortCacheFile,
+        $liveJsonLockHandle,
+        $liveJsonLockOwned,
+        $liveJsonCliHistoryLockHandle,
+        $liveJsonCliHistoryLockOwned
+    ) {
         $body = ob_get_contents();
-        if (!is_string($body) || $body === '' || json_decode($body, true) === null) return;
-        $tmp = $liveJsonShortCacheFile . '.tmp';
-        if (@file_put_contents($tmp, $body, LOCK_EX) !== false) {
-            @rename($tmp, $liveJsonShortCacheFile);
-            @chmod($liveJsonShortCacheFile, 0664);
+        $status = (int)http_response_code();
+        if ($status <= 0) $status = 200;
+        if (
+            $liveJsonShortCacheEnabled
+            && $status >= 200
+            && $status < 300
+            && liveJsonSuccessfulSnapshotBody($body) !== null
+        ) {
+            liveJsonWriteRuntimeFileAtomic($liveJsonShortCacheFile, $body);
+        }
+        liveJsonReleaseLock($liveJsonLockHandle, $liveJsonLockOwned);
+        if ($liveJsonCliHistoryLockOwned) {
+            liveJsonReleaseLock(
+                $liveJsonCliHistoryLockHandle,
+                true
+            );
         }
     });
-}
 
 function liveOptionalFloatValue($value, $precision = 2) {
     if ($value === null || $value === '' || !is_numeric($value)) return null;
@@ -284,21 +702,71 @@ function liveStiebelInterpolatedWpDayKwh($historyLines, $data) {
     return round(max($rawCounter, $anchorCounter + $integrated), 3);
 }
 
-function pickOpenwbTotalRangeKm($openwbData) {
-    if (!is_array($openwbData)) return 0.0;
+function openwbTotalRangeContract($openwbData, $nowTs = null) {
+    if (!is_array($openwbData)) return null;
 
+    $now = is_numeric($nowTs) ? (float)$nowTs : (float)time();
     $source = strtolower(trim((string)($openwbData['car_range_source'] ?? '')));
-    if (in_array($source, ['total', 'vehicle', 'remaining', 'mqtt_total', 'http_total', 'openwb_pro_estimated', 'wallbox_estimated_consumption'], true)) {
-        $range = (float)($openwbData['car_range'] ?? 0);
-        if ($range > 0) return $range;
+    $range = $openwbData['car_range'] ?? null;
+    if (!in_array($source, ['http_total', 'mqtt_total'], true)
+        || ($openwbData['car_range_valid'] ?? false) !== true
+        || !is_numeric($range)
+        || (float)$range <= 0.0) {
+        return null;
     }
 
-    foreach (['car_range_total', 'total_range_km', 'vehicle_range_km', 'vehicle_range', 'range_km', 'remaining_range_km', 'remaining_range', 'range'] as $key) {
-        if (isset($openwbData[$key]) && is_numeric($openwbData[$key]) && (float)$openwbData[$key] > 0) {
-            return (float)$openwbData[$key];
+    $observedTs = $openwbData['car_range_observed_ts'] ?? null;
+    if (!is_numeric($observedTs)) return null;
+    $observedTs = (float)$observedTs;
+    $observedAge = $now - $observedTs;
+    if ($observedTs <= 0.0 || $observedAge < -5.0 || $observedAge > 120.0) {
+        return null;
+    }
+
+    $sourceTsExplicit = ($openwbData['car_range_source_ts_explicit'] ?? false) === true;
+    $sourceTs = $openwbData['car_range_source_ts'] ?? null;
+    if ($sourceTsExplicit) {
+        if (!is_numeric($sourceTs)) return null;
+        $sourceTs = (float)$sourceTs;
+        $sourceAge = $now - $sourceTs;
+        if ($sourceTs <= 0.0 || $sourceAge < -5.0 || $sourceAge > 8 * 3600.0) {
+            return null;
+        }
+    } else {
+        // Ältere openWB-Versionen besitzen keine eigene Quellenzeit. Sie
+        // bleiben ausschließlich über die frische lokale Beobachtung gültig.
+        $sourceTs = $observedTs;
+    }
+
+    $vehicleKey = trim((string)($openwbData['car_range_vehicle_key'] ?? ''));
+    if ($vehicleKey !== '') {
+        if (($openwbData['stable_vehicle_identity_current'] ?? false) !== true) {
+            return null;
+        }
+        $currentVehicleKeys = [];
+        foreach (['vehicle_id', 'rfid_tag', 'car_id'] as $key) {
+            $value = trim((string)($openwbData[$key] ?? ''));
+            if ($value !== '') $currentVehicleKeys[] = $value;
+        }
+        if (!$currentVehicleKeys || !in_array($vehicleKey, $currentVehicleKeys, true)) {
+            return null;
         }
     }
-    return 0.0;
+
+    return [
+        'range_km' => (float)$range,
+        'car_range_source' => $source,
+        'car_range_valid' => true,
+        'car_range_observed_ts' => (int)$observedTs,
+        'car_range_source_ts' => (int)$sourceTs,
+        'car_range_source_ts_explicit' => $sourceTsExplicit,
+        'car_range_vehicle_key' => $vehicleKey,
+    ];
+}
+
+function pickOpenwbTotalRangeKm($openwbData) {
+    $contract = openwbTotalRangeContract($openwbData);
+    return is_array($contract) ? (float)$contract['range_km'] : 0.0;
 }
 
 function liveWallboxApparentKva($wallboxData) {
@@ -1167,6 +1635,49 @@ function liveBoolValue($value, $default = false) {
     return $default;
 }
 
+function liveNativeWallboxStatusContract($detail) {
+    if (!is_array($detail)) {
+        return ['declared' => false, 'valid' => null, 'source' => '', 'reason' => ''];
+    }
+    $declared = array_key_exists('wb_status_valid', $detail)
+        || array_key_exists('wb_status_source', $detail)
+        || array_key_exists('wb_status_reason', $detail)
+        || array_key_exists('car_connected_rscp', $detail);
+    if (!$declared) {
+        return ['declared' => false, 'valid' => null, 'source' => '', 'reason' => ''];
+    }
+    $valid = (($detail['wb_status_valid'] ?? null) === true)
+        && (!array_key_exists('driver_status_valid', $detail)
+            || (($detail['driver_status_valid'] ?? null) === true))
+        && empty($detail['driver_status_stale'])
+        && empty($detail['driver_status_degraded'])
+        && empty($detail['driver_status_glitch'])
+        && (($detail['driver_status_plausible'] ?? null) !== false)
+        && (($detail['valid'] ?? null) !== false)
+        && empty($detail['stale']);
+    $reason = trim((string)($detail['wb_status_reason'] ?? ''));
+    if (!$valid) {
+        foreach (['driver_status_glitch_reason', 'driver_status_reason', 'wb_status_reason'] as $reasonKey) {
+            $candidate = trim((string)($detail[$reasonKey] ?? ''));
+            if ($candidate !== '' && !in_array(strtolower($candidate), ['ok', 'fresh'], true)) {
+                $reason = $candidate;
+                break;
+            }
+        }
+        if ($reason === '' || in_array(strtolower($reason), ['ok', 'fresh'], true)) {
+            $reason = 'native_status_not_fresh';
+        }
+    } elseif ($reason === '') {
+        $reason = 'fresh';
+    }
+    return [
+        'declared' => true,
+        'valid' => $valid,
+        'source' => (string)($detail['wb_status_source'] ?? 'native_status_contract'),
+        'reason' => $reason,
+    ];
+}
+
 function liveSetExactCounter(&$data, $key, $value, $source, $priority = 0) {
     if ($value === null || !is_numeric($value)) return;
     $val = round((float)$value, 3);
@@ -1185,30 +1696,129 @@ function liveSetExactCounter(&$data, $key, $value, $source, $priority = 0) {
 }
 
 function liveWallboxClosedSessionsTodayKwh($csvFile, $wallboxNo) {
-    if (!is_readable($csvFile)) return 0.0;
-    $today = date('Y-m-d');
     $target = (string)((int)$wallboxNo);
-    $sum = 0.0;
-    $lines = @file($csvFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
-    if (!is_array($lines)) return 0.0;
-    foreach ($lines as $line) {
-        if (stripos($line, 'Timestamp;') === 0) continue;
-        $parts = explode(';', (string)$line);
-        if (count($parts) < 5) continue;
-        $timestamp = trim($parts[0]);
-        $endTs = trim($parts[2]);
-        $kwh = str_replace(',', '.', trim($parts[3]));
-        $wb = trim($parts[4]);
-        if ($wb !== $target || !is_numeric($kwh)) continue;
-        if (strpos($timestamp, $today) !== 0 && strpos($endTs, $today) !== 0) continue;
-        $sum += max(0.0, (float)$kwh);
+    $aggregate = e3dcWallboxSessionCsvAggregate($csvFile);
+    $today = is_array($aggregate['today_kwh'] ?? null)
+        ? $aggregate['today_kwh']
+        : [];
+    return round(max(0.0, (float)($today[$target] ?? 0.0)), 3);
+}
+
+function liveCarChargeSessionSnapshot($wallboxNo) {
+    static $requestMemo = [];
+
+    $wallbox = max(1, (int)$wallboxNo);
+    if (array_key_exists($wallbox, $requestMemo)) {
+        return $requestMemo[$wallbox];
     }
-    return round($sum, 3);
+    $liveName = $wallbox === 1
+        ? 'car_charge_session.json'
+        : 'car_charge_session_wb' . $wallbox . '.json';
+    $candidates = [
+        [
+            'source' => 'ramdisk',
+            'path' => '/var/www/html/ramdisk/' . $liveName,
+            'max_age_s' => 300.0,
+        ],
+        [
+            'source' => 'checkpoint',
+            'path' => '/var/www/html/data/car_charge_session_checkpoint_wb' . $wallbox . '.json',
+            'max_age_s' => 36 * 3600.0,
+        ],
+        [
+            'source' => 'legacy',
+            'path' => '/var/www/html/tmp/' . $liveName,
+            'max_age_s' => 36 * 3600.0,
+        ],
+    ];
+    foreach ($candidates as $candidate) {
+        $path = e3dcFirstFreshRegularFile(
+            [$candidate['path']],
+            $candidate['max_age_s']
+        );
+        if (!is_string($path)) continue;
+        $raw = e3dcReadRegularFileBound($path, 1024 * 1024);
+        $payload = is_string($raw) ? @json_decode($raw, true) : null;
+        if (is_array($payload)) {
+            $requestMemo[$wallbox] = [
+                'data' => $payload,
+                'source' => $candidate['source'],
+            ];
+            return $requestMemo[$wallbox];
+        }
+    }
+    $requestMemo[$wallbox] = ['data' => [], 'source' => 'none'];
+    return $requestMemo[$wallbox];
+}
+
+function explicitVehicleRangeContract($vehicle, $nowTs = null) {
+    if (!is_array($vehicle)) return null;
+
+    $now = is_numeric($nowTs) ? (float)$nowTs : (float)time();
+    $source = strtolower(trim((string)($vehicle['car_range_source'] ?? '')));
+    $range = $vehicle['range_km'] ?? null;
+    if (!in_array($source, ['http_total', 'mqtt_total'], true)
+        || ($vehicle['car_range_valid'] ?? false) !== true
+        || !is_numeric($range)
+        || (float)$range <= 0.0) {
+        return null;
+    }
+
+    $observedTs = $vehicle['car_range_observed_ts'] ?? null;
+    if (!is_numeric($observedTs)) return null;
+    $observedTs = (float)$observedTs;
+    $observedAge = $now - $observedTs;
+    if ($observedTs <= 0.0 || $observedAge < -5.0 || $observedAge > 120.0) {
+        return null;
+    }
+
+    $sourceTsExplicit = ($vehicle['car_range_source_ts_explicit'] ?? false) === true;
+    $sourceTs = $vehicle['car_range_source_ts'] ?? null;
+    if ($sourceTsExplicit) {
+        if (!is_numeric($sourceTs)) return null;
+        $sourceTs = (float)$sourceTs;
+        $sourceAge = $now - $sourceTs;
+        if ($sourceTs <= 0.0 || $sourceAge < -5.0 || $sourceAge > 8 * 3600.0) {
+            return null;
+        }
+    } else {
+        $sourceTs = $observedTs;
+    }
+
+    $vehicleKey = trim((string)($vehicle['car_range_vehicle_key'] ?? ''));
+    if ($vehicleKey !== '') {
+        if (($vehicle['stable_vehicle_identity_current'] ?? false) !== true) {
+            return null;
+        }
+        $currentVehicleKeys = [];
+        foreach (['vehicle_id', 'rfid_tag', 'car_id'] as $key) {
+            $value = trim((string)($vehicle[$key] ?? ''));
+            if ($value !== '') $currentVehicleKeys[] = $value;
+        }
+        if (!$currentVehicleKeys || !in_array($vehicleKey, $currentVehicleKeys, true)) {
+            return null;
+        }
+    }
+
+    return [
+        'range_km' => (float)$range,
+        'car_range_source' => $source,
+        'car_range_valid' => true,
+        'car_range_observed_ts' => (int)$observedTs,
+        'car_range_source_ts' => (int)$sourceTs,
+        'car_range_source_ts_explicit' => $sourceTsExplicit,
+        'car_range_vehicle_key' => $vehicleKey,
+    ];
 }
 
 function mergeVehicleRecords($base, $incoming) {
     $merged = is_array($base) ? $base : [];
     $incoming = is_array($incoming) ? $incoming : [];
+    // SoC und Gesamtreichweite besitzen absichtlich getrennte Quellen.
+    // Ein neuer Cloud-SoC ohne Reichweite darf eine frische, identitätsgebundene
+    // openWB-Gesamtreichweite nicht aus dem Fahrzeugdatensatz löschen.
+    $baseRange = explicitVehicleRangeContract($merged);
+    $incomingRange = explicitVehicleRangeContract($incoming);
 
     foreach (['capacity', 'capacity_kwh', 'power', 'charge_power', 'charge_power_kw', 'target_soc', 'max_soc', 'max_soc_si'] as $key) {
         if (!vehicleValuePresent($merged[$key] ?? null) && vehicleValuePresent($incoming[$key] ?? null)) {
@@ -1267,10 +1877,13 @@ function mergeVehicleRecords($base, $incoming) {
         && (!vehicleValuePresent($merged['wb_slot'] ?? null) || $incomingPlugged || !$basePlugged)) {
         $merged['wb_slot'] = $incoming['wb_slot'];
     }
-    foreach (['rfid_tag', 'vehicle_id', 'cloud_vehicle_id', 'profile_id'] as $key) {
+    foreach (['rfid_tag', 'vehicle_id', 'car_id', 'cloud_vehicle_id', 'profile_id'] as $key) {
         if (vehicleValuePresent($incoming[$key] ?? null) && !vehicleValuePresent($merged[$key] ?? null)) {
             $merged[$key] = $incoming[$key];
         }
+    }
+    if (($incoming['stable_vehicle_identity_current'] ?? false) === true) {
+        $merged['stable_vehicle_identity_current'] = true;
     }
 
     if (empty($merged['name']) && !empty($incoming['name'])) {
@@ -1278,6 +1891,34 @@ function mergeVehicleRecords($base, $incoming) {
     }
     if (empty($merged['id']) && !empty($incoming['id'])) {
         $merged['id'] = $incoming['id'];
+    }
+
+    $selectedRange = null;
+    if (is_array($baseRange) && is_array($incomingRange)) {
+        $selectedRange = (int)$incomingRange['car_range_observed_ts']
+            >= (int)$baseRange['car_range_observed_ts']
+            ? $incomingRange
+            : $baseRange;
+    } elseif (is_array($incomingRange)) {
+        $selectedRange = $incomingRange;
+    } elseif (is_array($baseRange)) {
+        $selectedRange = $baseRange;
+    }
+    if (is_array($selectedRange)) {
+        foreach ($selectedRange as $key => $value) {
+            $merged[$key] = $value;
+        }
+    } else {
+        foreach ([
+            'car_range_source',
+            'car_range_valid',
+            'car_range_observed_ts',
+            'car_range_source_ts',
+            'car_range_source_ts_explicit',
+            'car_range_vehicle_key',
+        ] as $key) {
+            unset($merged[$key]);
+        }
     }
 
     return $merged;
@@ -1360,6 +2001,11 @@ $data = [
     'heatpump_budget_w' => null,
     'wp_ww_temp' => null,
     'wp_mode' => null,
+    'wp_live_status' => 'not_configured',
+    'wp_live_fresh' => false,
+    'wp_live_age_s' => null,
+    'wp_live_source' => '',
+    'wp_live_error' => '',
     'wp_rl_source' => 'internal', // Default
     'wp_rl_temp' => null,
     'wp_rl_soll' => null,
@@ -1440,17 +2086,779 @@ $data = [
     'notstrom_reserve' => 0
 ];
 
+$directNativeWbStatusInvalid = false;
+
 $paths = getInstallPaths();
 
 // Config laden via helpers.php Funktion
 $confData = loadE3dcConfig();
-$auxInverterCfg = $confData['config'] ?? [];
+$wallboxConfig = $confData['config'] ?? [];
+$wbConfigured = hasWallbox1Config($wallboxConfig);
+$wb2Configured = hasWallbox2Config($wallboxConfig);
+$auxInverterCfg = $wallboxConfig;
 $directMarketingConfigured = in_array(
     strtolower(trim((string)($auxInverterCfg['direct_marketing_enable'] ?? '0'))),
     ['1', 'true', 'yes', 'on'],
     true
 );
 $data['direct_marketing_enabled'] = $directMarketingConfigured;
+
+function liveTrajectoryCanonicalize($value) {
+    if (!is_array($value)) return $value;
+    $keys = array_keys($value);
+    $isList = count($value) === 0 || $keys === range(0, count($value) - 1);
+    if ($isList) return array_map('liveTrajectoryCanonicalize', $value);
+    ksort($value, SORT_STRING);
+    foreach ($value as $key => $item) $value[$key] = liveTrajectoryCanonicalize($item);
+    return $value;
+}
+
+function liveTrajectoryCanonicalJson($value) {
+    return json_encode(
+        liveTrajectoryCanonicalize($value),
+        JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRESERVE_ZERO_FRACTION
+    );
+}
+
+
+function livePlanCanonicalizePreservingObjects($value) {
+    if (is_object($value)) {
+        $items = get_object_vars($value);
+        ksort($items, SORT_STRING);
+        $result = new stdClass();
+        foreach ($items as $key => $item) {
+            $result->{$key} = livePlanCanonicalizePreservingObjects($item);
+        }
+        return $result;
+    }
+    if (is_array($value)) {
+        return array_map('livePlanCanonicalizePreservingObjects', $value);
+    }
+    return $value;
+}
+
+function livePlanCanonicalJsonPreservingObjects($value) {
+    return json_encode(
+        livePlanCanonicalizePreservingObjects($value),
+        JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRESERVE_ZERO_FRACTION
+    );
+}
+
+function liveReadStoragePlanActionProjectionArtifact($path, $maxBytes = 524288) {
+    if (!is_string($path) || $path === '' || !is_file($path) || !is_readable($path)) return null;
+    $size = @filesize($path);
+    if (!is_int($size) || $size < 2 || $size > (int)$maxBytes) return null;
+    $raw = @file_get_contents($path);
+    if (!is_string($raw) || strlen($raw) !== $size) return null;
+    $decoded = @json_decode($raw, true);
+    $object = @json_decode($raw);
+    if (!is_array($decoded) || !is_object($object)) return null;
+    return ['data' => $decoded, 'object' => $object, 'raw_json' => $raw];
+}
+
+function liveDirectMarketingActionBindingValid($plan, $projection, $action, $plannedW, $slotStart, $slotEnd, $validFrom, $horizonEnd) {
+    $bindings = [
+        'ECONOMIC_EXPORT' => ['source_action' => 'eco_plus_export_candidate', 'modes' => ['eco_plus']],
+        'PV_STORE' => ['source_action' => 'eco_plus_store_pv_candidate', 'modes' => ['eco', 'eco_plus']],
+        'CHARGE_BLOCK_WAIT' => ['source_action' => 'direct_marketing_charge_block_wait', 'modes' => ['eco_plus']],
+    ];
+    $binding = $bindings[$action] ?? null;
+    $direct = is_array($plan['direct_marketing'] ?? null) ? $plan['direct_marketing'] : [];
+    $flags = is_array($direct['flags'] ?? null) ? $direct['flags'] : [];
+    $decisionHorizon = is_array($plan['shadow_dispatch']['decision_horizon'] ?? null)
+        ? $plan['shadow_dispatch']['decision_horizon'] : [];
+    $sourceAction = trim((string)($projection['direct_marketing_plan_source_action'] ?? ''));
+    $sourceMode = strtolower(str_replace(['-', ' '], '_', trim((string)($projection['direct_marketing_plan_source_mode'] ?? ''))));
+    if ($sourceMode === 'eco+' || $sourceMode === 'ecoplus') $sourceMode = 'eco_plus';
+    $planMode = strtolower(str_replace(['-', ' '], '_', trim((string)($direct['mode'] ?? ''))));
+    if ($planMode === 'eco+' || $planMode === 'ecoplus') $planMode = 'eco_plus';
+    $actionId = (string)($projection['direct_marketing_plan_action_id'] ?? '');
+    $actionLineageId = (string)($projection['direct_marketing_plan_action_lineage_id'] ?? '');
+    $windowId = trim((string)($projection['direct_marketing_window_id'] ?? ''));
+    $windowStart = (int)($projection['direct_marketing_window_start_ts_ms'] ?? 0);
+    $windowEnd = (int)($projection['direct_marketing_window_end_ts_ms'] ?? 0);
+    $segmentId = trim((string)($projection['direct_marketing_plan_segment_id'] ?? ''));
+    $horizon = is_array($projection['direct_marketing_action_horizon_contract'] ?? null)
+        ? $projection['direct_marketing_action_horizon_contract'] : [];
+    $roles = is_array($projection['direct_marketing_action_roles'] ?? null)
+        ? $projection['direct_marketing_action_roles'] : [];
+    if (!is_array($binding)
+        || ($direct['active'] ?? null) !== true
+        || ($direct['shadow'] ?? null) !== false
+        || ($flags['commands_allowed'] ?? null) !== true
+        || $sourceAction !== $binding['source_action']
+        || !in_array($sourceMode, $binding['modes'], true)
+        || $planMode !== $sourceMode
+        || ($projection['direct_marketing_plan_source_action_execution_released'] ?? null) !== true
+        || preg_match('/^sha256:[0-9a-f]{64}$/', $actionId) !== 1
+        || !hash_equals($actionId, $actionLineageId)
+        || $windowId === '' || $segmentId === ''
+        || $windowStart <= 0 || $windowEnd <= $windowStart
+        || !is_numeric($projection['direct_marketing_requested_w'] ?? null)
+        || abs((float)$projection['direct_marketing_requested_w'] - (float)$plannedW) > 0.01
+        || ($projection['direct_marketing_candidate'] ?? null) !== true
+        || ($projection['direct_marketing_candidate_action'] ?? '') !== $action
+        || ($projection['direct_marketing_candidate_only'] ?? null) !== false
+        || ($projection['direct_marketing_plan_selected_action'] ?? '') !== $action
+        || ($projection['direct_marketing_plan_executable_action'] ?? '') !== $action
+        || ($projection['direct_marketing_effective_action'] ?? null) !== null
+        || ($projection['direct_marketing_block_reason'] ?? null) !== null) {
+        return false;
+    }
+    if (($horizon['schema_version'] ?? '') !== 'storage_dispatch_action_horizon_v1'
+        || ($horizon['action'] ?? '') !== $action
+        || ($horizon['complete'] ?? null) !== true
+        || ($horizon['block_reason_code'] ?? null) !== null
+        || ($horizon['window_source'] ?? '') !== 'canonical_direct_marketing_plan_projection'
+        || (int)($horizon['slot_start_ts_ms'] ?? 0) !== $slotStart
+        || (int)($horizon['slot_end_ts_ms'] ?? 0) !== $slotEnd
+        || (int)($horizon['window_start_ts_ms'] ?? 0) !== $windowStart
+        || (int)($horizon['window_end_ts_ms'] ?? 0) !== $windowEnd
+        || (int)($decisionHorizon['start_ts_ms'] ?? 0) !== $validFrom
+        || (int)($decisionHorizon['end_ts_ms'] ?? 0) < $windowEnd
+        || (int)($decisionHorizon['end_ts_ms'] ?? 0) > $horizonEnd
+        || (int)($horizon['bound_horizon_start_ts_ms'] ?? 0) !== (int)($decisionHorizon['start_ts_ms'] ?? 0)
+        || (int)($horizon['bound_horizon_end_ts_ms'] ?? 0) !== (int)($decisionHorizon['end_ts_ms'] ?? 0)) {
+        return false;
+    }
+    if (($roles['schema_version'] ?? '') !== 'direct_marketing_action_roles_v1'
+        || ($roles['status'] ?? '') !== 'CONSISTENT'
+        || ($roles['candidate_action'] ?? '') !== $action
+        || ($roles['candidate_only'] ?? null) !== false
+        || ($roles['plan_selected_action'] ?? '') !== $action
+        || ($roles['plan_executable_action'] ?? '') !== $action
+        || ($roles['effective_action'] ?? null) !== null
+        || ($roles['runtime_effect_claim_allowed'] ?? null) !== false
+        || (int)($roles['slot_start_ts_ms'] ?? 0) !== $slotStart
+        || (int)($roles['slot_end_ts_ms'] ?? 0) !== $slotEnd) {
+        return false;
+    }
+    $matches = [];
+    foreach (($direct['windows'] ?? []) as $window) {
+        if (!is_array($window)
+            || (string)($window['action'] ?? '') !== $sourceAction
+            || (int)($window['start_ts'] ?? 0) !== $windowStart
+            || (int)($window['end_ts'] ?? 0) !== $windowEnd) {
+            continue;
+        }
+        $sourceWindowId = trim((string)(
+            $action === 'ECONOMIC_EXPORT'
+                ? ($window['export_plateau_id'] ?? $window['window_id'] ?? '')
+                : ($window['window_id'] ?? '')
+        ));
+        $projectedSourceWindowId = trim((string)(
+            $action === 'ECONOMIC_EXPORT'
+                ? ($projection['direct_marketing_export_plateau_id'] ?? '')
+                : $windowId
+        ));
+        if ($sourceWindowId === '' || $sourceWindowId !== $projectedSourceWindowId) continue;
+        if (liveTrajectoryCanonicalJson($window['export_segment_id'] ?? null)
+            !== liveTrajectoryCanonicalJson($projection['direct_marketing_export_segment_id'] ?? null)) {
+            continue;
+        }
+        if ($action === 'PV_STORE'
+            && ($window['pv_store_source_contract'] ?? null)
+                !== ($projection['direct_marketing_plan_pv_store_source_contract'] ?? null)) {
+            continue;
+        }
+        $matches[] = $window;
+    }
+    if (count($matches) !== 1) return false;
+    $sourceWindow = $matches[0];
+    $maxPower = $sourceWindow['max_power_w'] ?? null;
+    if ($action !== 'CHARGE_BLOCK_WAIT'
+        && (!is_numeric($maxPower) || (float)$maxPower + 0.01 < (float)$plannedW)) {
+        return false;
+    }
+    $sourceSegment = $sourceWindow['export_segment_id'] ?? null;
+    if (!$sourceSegment) $sourceSegment = $sourceWindow['segment_id'] ?? null;
+    $expectedSegmentId = $sourceSegment ? (string)$sourceSegment : $actionId;
+    if ($segmentId !== $expectedSegmentId) return false;
+
+    $identityMaterial = [
+        'action' => $action,
+        'window_id' => $windowId,
+        'window_start_ts_ms' => $windowStart,
+        'window_end_ts_ms' => $windowEnd,
+    ];
+    $exportGate = is_array($projection['direct_marketing_economic_export_gate'] ?? null)
+        ? $projection['direct_marketing_economic_export_gate'] : null;
+    if ($action !== 'ECONOMIC_EXPORT') {
+        if ($exportGate !== null
+            || ($projection['direct_marketing_gate_lineage_id'] ?? null) !== null
+            || ($projection['direct_marketing_gate_generation'] ?? null) !== null
+            || ($projection['direct_marketing_gate_generation_id'] ?? null) !== null) {
+            return false;
+        }
+        $pvContract = $projection['direct_marketing_plan_pv_store_source_contract'] ?? null;
+        if ($action === 'PV_STORE' && !in_array($pvContract, ['E3DC_DC', 'E3DC_DC_PLUS_AUX_AC_PV'], true)) {
+            return false;
+        }
+        if ($action !== 'PV_STORE' && $pvContract !== null) return false;
+    } else {
+        if (!is_array($exportGate)
+            || ($exportGate['allowed'] ?? null) !== true
+            || !is_array($exportGate['blockers'] ?? null)
+            || count($exportGate['blockers']) !== 0
+            || ($exportGate['block_reason_code'] ?? null) !== null
+            || ($exportGate['policy_commands_allowed'] ?? null) !== true
+            || ($exportGate['accounting_contract'] ?? '') !== 'DIRECT_MARKETING_POLICY_ECONOMICS_REUSED_NO_DOUBLE_DEDUCTION'
+            || !is_numeric($exportGate['policy_export_budget_w'] ?? null)
+            || (float)$exportGate['policy_export_budget_w'] + 0.01 < (float)$plannedW) {
+            return false;
+        }
+        foreach (['margin_ct_kwh', 'user_min_margin_ct', 'expected_profit_eur', 'min_window_profit_eur'] as $key) {
+            if (!isset($exportGate[$key]) || !is_numeric($exportGate[$key])
+                || !is_finite((float)$exportGate[$key])) return false;
+        }
+        if ((float)$exportGate['margin_ct_kwh'] + 0.000001 < (float)$exportGate['user_min_margin_ct']
+            || (float)$exportGate['expected_profit_eur'] + 0.000001 < (float)$exportGate['min_window_profit_eur']) {
+            return false;
+        }
+        $startGate = is_array($exportGate['export_window_start_gate'] ?? null)
+            ? $exportGate['export_window_start_gate'] : [];
+        $business = is_array($startGate['business_binding'] ?? null)
+            ? $startGate['business_binding'] : [];
+        $businessRevision = (string)($business['business_contract_sha256'] ?? '');
+        $businessMaterial = $business;
+        unset($businessMaterial['business_contract_sha256']);
+        $businessEncoded = liveTrajectoryCanonicalJson($businessMaterial);
+        $expectedBusinessRevision = is_string($businessEncoded)
+            ? 'sha256:' . hash('sha256', $businessEncoded) : '';
+        if (($startGate['schema'] ?? '') !== 'export_window_start_gate_v1'
+            || ($startGate['passed'] ?? null) !== true
+            || !in_array((string)($startGate['profile'] ?? ''), ['standard', 'aggressive', 'expert'], true)
+            || ($startGate['action'] ?? '') !== $sourceAction
+            || ($startGate['window_id'] ?? '') !== $windowId
+            || ($startGate['business_window_id'] ?? '') !== $windowId
+            || (int)($startGate['origin_start_ts'] ?? 0) !== $windowStart
+            || (int)($startGate['end_ts'] ?? 0) !== $windowEnd
+            || ($startGate['accounting_contract'] ?? '') !== 'START_ONLY_NO_REMAINING_WINDOW_REAPPLICATION'
+            || ($business['schema'] ?? '') !== 'direct_marketing_export_business_binding_v1'
+            || ($business['action'] ?? '') !== $sourceAction
+            || (int)($business['origin_start_ts'] ?? 0) !== $windowStart
+            || (int)($business['end_ts'] ?? 0) !== $windowEnd
+            || preg_match('/^sha256:[0-9a-f]{64}$/', $businessRevision) !== 1
+            || !hash_equals($businessRevision, $expectedBusinessRevision)
+            || ($startGate['business_contract_sha256'] ?? null) !== $businessRevision
+            || $windowId !== 'export-business:' . substr($businessRevision, 7, 24)) {
+            return false;
+        }
+        $lineage = is_array($exportGate['export_window_gate_lineage'] ?? null)
+            ? $exportGate['export_window_gate_lineage'] : [];
+        $gateEncoded = liveTrajectoryCanonicalJson($startGate);
+        $gateSha = is_string($gateEncoded) ? 'sha256:' . hash('sha256', $gateEncoded) : '';
+        $lineageMaterial = [
+            'schema' => 'export_window_gate_lineage_v1',
+            'gate_sha256' => $gateSha,
+            'action' => $sourceAction,
+            'window_id' => $windowId,
+            'origin_start_ts' => $windowStart,
+            'end_ts' => $windowEnd,
+        ];
+        $lineageEncoded = liveTrajectoryCanonicalJson($lineageMaterial);
+        $expectedLineageId = is_string($lineageEncoded)
+            ? 'sha256:' . hash('sha256', $lineageEncoded) : '';
+        $generation = $lineage['current_generation'] ?? null;
+        if (!is_int($generation) || $generation < 1) return false;
+        $generationEncoded = liveTrajectoryCanonicalJson([
+            'gate_lineage_id' => $expectedLineageId,
+            'generation' => $generation,
+        ]);
+        $expectedGenerationId = is_string($generationEncoded)
+            ? 'sha256:' . hash('sha256', $generationEncoded) : '';
+        $expectedPreviousId = null;
+        if ($generation > 1) {
+            $previousEncoded = liveTrajectoryCanonicalJson([
+                'gate_lineage_id' => $expectedLineageId,
+                'generation' => $generation - 1,
+            ]);
+            $expectedPreviousId = is_string($previousEncoded)
+                ? 'sha256:' . hash('sha256', $previousEncoded) : '';
+        }
+        $reasons = $lineage['transition_reason_codes'] ?? null;
+        $sortedReasons = is_array($reasons) ? array_values(array_unique($reasons)) : [];
+        sort($sortedReasons, SORT_STRING);
+        if (($lineage['schema'] ?? '') !== 'export_window_gate_lineage_v1'
+            || ($lineage['status'] ?? '') !== 'ACTIVE'
+            || ($lineage['effect_contract'] ?? '') !== 'STATUS_ONLY_NO_EXECUTION_AUTHORITY'
+            || ($lineage['gate_sha256'] ?? '') !== $gateSha
+            || ($lineage['gate_lineage_id'] ?? '') !== $expectedLineageId
+            || ($lineage['current_generation_id'] ?? '') !== $expectedGenerationId
+            || ($lineage['previous_generation_id'] ?? null) !== $expectedPreviousId
+            || ($lineage['action'] ?? '') !== $sourceAction
+            || ($lineage['window_id'] ?? '') !== $windowId
+            || (int)($lineage['origin_start_ts'] ?? 0) !== $windowStart
+            || (int)($lineage['end_ts'] ?? 0) !== $windowEnd
+            || !is_array($reasons) || count($reasons) === 0 || $reasons !== $sortedReasons
+            || ($projection['direct_marketing_gate_lineage_id'] ?? null) !== $expectedLineageId
+            || ($projection['direct_marketing_gate_generation'] ?? null) !== $generation
+            || ($projection['direct_marketing_gate_generation_id'] ?? null) !== $expectedGenerationId
+            || liveTrajectoryCanonicalJson($exportGate['action_horizon_contract'] ?? null)
+                !== liveTrajectoryCanonicalJson($horizon)) {
+            return false;
+        }
+        $identityMaterial['gate_lineage_id'] = $expectedLineageId;
+        $identityMaterial['gate_generation'] = $generation;
+        $identityMaterial['gate_generation_id'] = $expectedGenerationId;
+    }
+    $identityEncoded = liveTrajectoryCanonicalJson($identityMaterial);
+    $expectedActionId = is_string($identityEncoded)
+        ? 'sha256:' . hash('sha256', $identityEncoded) : '';
+    return $expectedActionId !== '' && hash_equals($expectedActionId, $actionId);
+}
+
+
+function liveTrajectoryValidationReason($plan, $source, $canonicalPlan) {
+    $planId = is_array($plan) ? (string)($plan['plan_id'] ?? '') : '';
+    if (!$canonicalPlan || preg_match('/^sha256:[0-9a-f]{64}$/', $planId) !== 1) {
+        return 'DIRECT_MARKETING_CANONICAL_PLAN_INVALID';
+    }
+    if (!is_array($source)) return 'DIRECT_MARKETING_TRAJECTORY_MISSING';
+    if (($source['schema_version'] ?? '') !== 'direct_marketing_trajectory_v1') return 'DIRECT_MARKETING_TRAJECTORY_SCHEMA_INVALID';
+    if (($source['active'] ?? null) !== true || ($source['complete'] ?? null) !== true) {
+        return $source['reason_code'] ?? $source['status'] ?? 'DIRECT_MARKETING_TRAJECTORY_INCOMPLETE';
+    }
+    if (($source['plan_id'] ?? null) !== $planId) return 'DIRECT_MARKETING_TRAJECTORY_PLAN_MISMATCH';
+    if (!is_array($source['meta'] ?? null) || !is_array($source['slots'] ?? null) || count($source['slots']) === 0) {
+        return 'DIRECT_MARKETING_TRAJECTORY_STRUCTURE_INCOMPLETE';
+    }
+    if (liveTrajectoryCanonicalJson($source['input_revisions'] ?? null)
+        !== liveTrajectoryCanonicalJson($plan['input_revisions'] ?? null)) {
+        return 'DIRECT_MARKETING_TRAJECTORY_INPUT_REVISION_MISMATCH';
+    }
+    $revision = (string)($source['trajectory_revision'] ?? '');
+    $material = $source;
+    unset($material['trajectory_revision']);
+    $encoded = liveTrajectoryCanonicalJson($material);
+    $calculated = is_string($encoded) ? 'sha256:' . hash('sha256', $encoded) : '';
+    if (preg_match('/^sha256:[0-9a-f]{64}$/', $revision) !== 1
+        || $calculated === '' || !hash_equals($revision, $calculated)) {
+        return 'DIRECT_MARKETING_TRAJECTORY_REVISION_MISMATCH';
+    }
+    $durationMs = (int)round(((float)($source['slot_duration_s'] ?? 0)) * 1000.0);
+    $validFromMs = (int)($source['valid_from_ts_ms'] ?? 0);
+    $horizonEndMs = (int)($source['horizon_end_ts_ms'] ?? 0);
+    if ($durationMs <= 0 || $validFromMs <= 0 || $horizonEndMs <= $validFromMs) {
+        return 'DIRECT_MARKETING_TRAJECTORY_HORIZON_INVALID';
+    }
+    $planSlots = array_values(array_filter($plan['slots'], function($slot) use ($validFromMs) {
+        return is_array($slot) && (int)($slot['start_ts_ms'] ?? 0) >= $validFromMs;
+    }));
+    if (count($planSlots) !== count($source['slots'])) return 'DIRECT_MARKETING_TRAJECTORY_SLOT_COUNT_MISMATCH';
+    $capacityWh = (float)($source['meta']['capacity_wh'] ?? 0);
+    $chargeEfficiency = (float)($source['meta']['efficiencies']['charge'] ?? 0);
+    $dischargeEfficiency = (float)($source['meta']['efficiencies']['discharge'] ?? 0);
+    if (!is_finite($capacityWh) || $capacityWh <= 0.0
+        || !is_finite($chargeEfficiency) || $chargeEfficiency <= 0.0
+        || !is_finite($dischargeEfficiency) || $dischargeEfficiency <= 0.0) {
+        return 'DIRECT_MARKETING_TRAJECTORY_PHYSICS_META_INVALID';
+    }
+    $previousEnd = null;
+    $previousSocEnd = null;
+    foreach ($source['slots'] as $index => $slot) {
+        $planSlot = $planSlots[$index] ?? null;
+        if (!is_array($slot) || !is_array($planSlot)) return 'DIRECT_MARKETING_TRAJECTORY_SLOT_INVALID';
+        $start = (int)($slot['start_ts_ms'] ?? 0);
+        $end = (int)($slot['end_ts_ms'] ?? 0);
+        if (($slot['slot_id'] ?? null) !== ($planSlot['slot_id'] ?? null)
+            || $start !== (int)($planSlot['start_ts_ms'] ?? 0)
+            || $end !== (int)($planSlot['end_ts_ms'] ?? 0)
+            || $end - $start !== $durationMs
+            || ($previousEnd !== null && $start !== $previousEnd)) {
+            return 'DIRECT_MARKETING_TRAJECTORY_SLOT_BINDING_MISMATCH';
+        }
+        foreach (['soc_start_pct', 'soc_end_pct', 'battery_w', 'grid_w', 'residual_before_storage_w', 'residual_after_storage_w'] as $key) {
+            if (!isset($slot[$key]) || !is_numeric($slot[$key]) || !is_finite((float)$slot[$key])) {
+                return 'DIRECT_MARKETING_TRAJECTORY_SLOT_VALUE_INVALID';
+            }
+        }
+        if ((float)$slot['soc_start_pct'] < 0.0 || (float)$slot['soc_start_pct'] > 100.0
+            || (float)$slot['soc_end_pct'] < 0.0 || (float)$slot['soc_end_pct'] > 100.0) {
+            return 'DIRECT_MARKETING_TRAJECTORY_SOC_OUT_OF_RANGE';
+        }
+        if ($previousSocEnd !== null && abs((float)$slot['soc_start_pct'] - $previousSocEnd) > 0.0015) {
+            return 'DIRECT_MARKETING_TRAJECTORY_SOC_CONTINUITY_INVALID';
+        }
+        $pv = is_array($slot['pv_w'] ?? null) ? $slot['pv_w'] : [];
+        $loads = is_array($slot['loads_w'] ?? null) ? $slot['loads_w'] : [];
+        foreach (['total'] as $key) if (!isset($pv[$key]) || !is_numeric($pv[$key])) return 'DIRECT_MARKETING_TRAJECTORY_BALANCE_INPUT_INVALID';
+        foreach (['house', 'heat', 'wallbox', 'total'] as $key) if (!isset($loads[$key]) || !is_numeric($loads[$key])) return 'DIRECT_MARKETING_TRAJECTORY_BALANCE_INPUT_INVALID';
+        $loadsTotal = (float)$loads['house'] + (float)$loads['heat'] + (float)$loads['wallbox'];
+        $expectedGrid = (float)$loads['total'] + (float)$slot['battery_w'] - (float)$pv['total'];
+        $expectedResidualBefore = (float)$pv['total'] - (float)$loads['total'];
+        $expectedResidualAfter = $expectedResidualBefore - (float)$slot['battery_w'];
+        if (abs($loadsTotal - (float)$loads['total']) > 0.01
+            || abs($expectedGrid - (float)$slot['grid_w']) > 0.01
+            || abs($expectedResidualBefore - (float)$slot['residual_before_storage_w']) > 0.01
+            || abs($expectedResidualAfter - (float)$slot['residual_after_storage_w']) > 0.01
+            || abs($expectedResidualAfter + (float)$slot['grid_w']) > 0.01) {
+            return 'DIRECT_MARKETING_TRAJECTORY_BALANCE_INVALID';
+        }
+        $slotHours = ($end - $start) / 3600000.0;
+        $batteryW = (float)$slot['battery_w'];
+        $socDelta = $batteryW >= 0.0
+            ? $batteryW * $slotHours * $chargeEfficiency / $capacityWh * 100.0
+            : $batteryW * $slotHours / $dischargeEfficiency / $capacityWh * 100.0;
+        if (abs(((float)$slot['soc_start_pct'] + $socDelta) - (float)$slot['soc_end_pct']) > 0.01) {
+            return 'DIRECT_MARKETING_TRAJECTORY_SOC_PHYSICS_INVALID';
+        }
+        $selection = is_array($slot['selection'] ?? null) ? $slot['selection'] : [];
+        $action = strtoupper((string)($slot['action'] ?? ''));
+        $projection = is_array($planSlot['projection'] ?? null) ? $planSlot['projection'] : [];
+        $selectedAction = in_array($action, ['PV_STORE', 'ECONOMIC_EXPORT', 'CHARGE_BLOCK_WAIT'], true);
+        $delegation = is_array($slot['delegation'] ?? null) ? $slot['delegation'] : null;
+        $delegatedPvStore = $action === 'PV_STORE'
+            && is_array($delegation)
+            && ($selection['selected'] ?? null) === false
+            && ($delegation['schema_version'] ?? '') === 'direct_marketing_future_pv_store_delegation_v1'
+            && ($delegation['active'] ?? null) === true
+            && ($delegation['commands_allowed'] ?? null) === true
+            && ($delegation['action'] ?? null) === 'PV_STORE'
+            && ($delegation['pv_store_source_contract'] ?? null) === 'E3DC_DC'
+            && ($delegation['no_grid_charge'] ?? null) === true
+            && (int)($delegation['valid_until_ts_ms'] ?? 0) >= $end
+            && is_numeric($delegation['max_curve_charge_w'] ?? null)
+            && (float)$delegation['max_curve_charge_w'] > 0.0;
+        if (($selection['selected'] ?? null) === true && $delegation !== null) {
+            return 'DIRECT_MARKETING_TRAJECTORY_ACTION_ROLE_AMBIGUOUS';
+        }
+        if ($selectedAction && !$delegatedPvStore) {
+            if (($selection['selected'] ?? null) !== true
+                || ($selection['executable'] ?? null) !== true
+                || ($selection['commands_allowed'] ?? null) !== true
+                || preg_match('/^sha256:[0-9a-f]{64}$/', (string)($selection['action_id'] ?? '')) !== 1) {
+                return 'DIRECT_MARKETING_TRAJECTORY_ACTION_NOT_EXECUTABLE';
+            }
+            $bindingPairs = [
+                'action_id' => 'direct_marketing_plan_action_id',
+                'window_id' => 'direct_marketing_window_id',
+                'segment_id' => 'direct_marketing_plan_segment_id',
+                'source_action' => 'direct_marketing_plan_source_action',
+                'source_mode' => 'direct_marketing_plan_source_mode',
+                'pv_store_source_contract' => 'direct_marketing_plan_pv_store_source_contract',
+            ];
+            if (($projection['direct_marketing_selected'] ?? null) !== true
+                || ($projection['direct_marketing_plan_executable'] ?? null) !== true
+                || ($projection['direct_marketing_plan_commands_allowed'] ?? null) !== true
+                || strtoupper((string)($projection['direct_marketing_plan_action'] ?? '')) !== $action) {
+                return 'DIRECT_MARKETING_TRAJECTORY_PLAN_ACTION_MISMATCH';
+            }
+            foreach ($bindingPairs as $selectionKey => $projectionKey) {
+                if (($selection[$selectionKey] ?? null) !== ($projection[$projectionKey] ?? null)) {
+                    return 'DIRECT_MARKETING_TRAJECTORY_ACTION_IDENTITY_MISMATCH';
+                }
+            }
+        } elseif ($action !== 'PASSIVE_NORMAL' && !$delegatedPvStore) {
+            return 'DIRECT_MARKETING_TRAJECTORY_ACTION_INVALID';
+        } elseif ($action === 'PASSIVE_NORMAL') {
+            $passiveBinding = is_array($slot['passive_binding'] ?? null) ? $slot['passive_binding'] : null;
+            if (($selection['selected'] ?? null) !== false || $delegation !== null
+                || !is_array($passiveBinding)
+                || ($passiveBinding['schema'] ?? null) !== 'direct_marketing_passive_normal_binding_v1'
+                || liveTrajectoryCanonicalJson($passiveBinding)
+                    !== liveTrajectoryCanonicalJson($projection['direct_marketing_passive_normal_binding_v1'] ?? null)) {
+                return 'DIRECT_MARKETING_TRAJECTORY_PASSIVE_ROLE_INVALID';
+            }
+        }
+        if ($action === 'PV_STORE') {
+            $dcOnly = $delegatedPvStore || (($selection['pv_store_source_contract'] ?? null) === 'E3DC_DC');
+            if ((float)$slot['battery_w'] < -0.01
+                || (float)$slot['battery_w'] > (float)$slot['residual_before_storage_w'] + 0.01
+                || ($dcOnly && (!isset($pv['e3dc_dc']) || !is_numeric($pv['e3dc_dc'])
+                    || (float)$slot['battery_w'] > (float)$pv['e3dc_dc'] + 0.01))) {
+                return 'DIRECT_MARKETING_TRAJECTORY_PV_STORE_PHYSICS_INVALID';
+            }
+            $pvStoreCap = $delegatedPvStore
+                ? (float)$delegation['max_curve_charge_w']
+                : (float)($selection['requested_w'] ?? 0.0);
+            if ($pvStoreCap <= 0.0 || (float)$slot['battery_w'] > $pvStoreCap + 0.01) {
+                return 'DIRECT_MARKETING_TRAJECTORY_PV_STORE_CAP_INVALID';
+            }
+        }
+        if ($action === 'ECONOMIC_EXPORT') {
+            $requestedW = (float)($selection['requested_w'] ?? 0.0);
+            if ($requestedW <= 0.0 || (float)$slot['battery_w'] > 0.01
+                || abs((float)$slot['battery_w']) > $requestedW + 0.01) {
+                return 'DIRECT_MARKETING_TRAJECTORY_EXPORT_PHYSICS_INVALID';
+            }
+        }
+        if ($action === 'CHARGE_BLOCK_WAIT' && (float)$slot['battery_w'] > 0.01) {
+            return 'DIRECT_MARKETING_TRAJECTORY_CHARGE_BLOCK_PHYSICS_INVALID';
+        }
+        $previousEnd = $end;
+        $previousSocEnd = (float)$slot['soc_end_pct'];
+    }
+    if ($previousEnd !== $horizonEndMs) return 'DIRECT_MARKETING_TRAJECTORY_HORIZON_MISMATCH';
+    return null;
+}
+
+function liveDirectMarketingTrajectoryForDisplay($plan, $enabled, $canonicalPlan) {
+    if (!$enabled) {
+        return [
+            'schema_version' => 'direct_marketing_trajectory_v1',
+            'active' => false,
+            'complete' => false,
+            'status' => 'INACTIVE',
+            'reason_code' => 'DIRECT_MARKETING_DISABLED',
+            'plan_id' => is_array($plan) ? ($plan['plan_id'] ?? null) : null,
+            'meta' => null,
+            'slots' => [],
+        ];
+    }
+    $planId = is_array($plan) ? (string)($plan['plan_id'] ?? '') : '';
+    $source = is_array($plan) && is_array($plan['direct_marketing_trajectory'] ?? null)
+        ? $plan['direct_marketing_trajectory']
+        : null;
+    $reason = liveTrajectoryValidationReason($plan, $source, $canonicalPlan);
+    if ($reason === null) {
+        return $source;
+    }
+    $sourceStatus = is_array($source) ? (string)($source['status'] ?? '') : '';
+    $projectIncompleteStatus = in_array(
+        $sourceStatus,
+        ['TRAJECTORY_AXIS_EVIDENCE_LIMIT', 'PASSIVE_POLICY_BINDING_MISSING'],
+        true
+    ) && $reason === $sourceStatus;
+    return [
+        'schema_version' => 'direct_marketing_trajectory_v1',
+        'active' => true,
+        'complete' => false,
+        'status' => $projectIncompleteStatus ? $sourceStatus : 'EVIDENCE_LIMIT',
+        'reason_code' => $projectIncompleteStatus ? $sourceStatus : $reason,
+        'plan_id' => $planId !== '' ? $planId : null,
+        'trajectory_revision' => $source['trajectory_revision'] ?? null,
+        'input_revisions' => $source['input_revisions'] ?? null,
+        'meta' => is_array($source['meta'] ?? null) ? $source['meta'] : null,
+        'slots' => [],
+    ];
+}
+
+function liveDirectMarketingSelectedActionFallbackForDisplay($plan, $enabled, $canonicalPlan, $planRawJson = null, $artifactSnapshot = null) {
+    $planId = is_array($plan) ? (string)($plan['plan_id'] ?? '') : '';
+    $limited = function($reason) use ($enabled, $planId) {
+        return [
+            'schema_version' => 'direct_marketing_selected_action_fallback_v1',
+            'active' => $enabled === true,
+            'complete' => false,
+            'status' => $enabled ? 'EVIDENCE_LIMIT' : 'INACTIVE',
+            'reason_code' => $enabled ? $reason : 'DIRECT_MARKETING_DISABLED',
+            'plan_id' => $planId !== '' ? $planId : null,
+            'input_revisions' => null,
+            'valid_from_ts_ms' => null,
+            'horizon_end_ts_ms' => null,
+            'slot_duration_s' => null,
+            'projection_revision' => null,
+            'slots' => [],
+        ];
+    };
+    if (!$enabled) return $limited('DIRECT_MARKETING_DISABLED');
+    if (!$canonicalPlan || preg_match('/^sha256:[0-9a-f]{64}$/', $planId) !== 1 || !is_array($plan['slots'] ?? null)) return $limited('DIRECT_MARKETING_CANONICAL_PLAN_INVALID');
+    if (!is_string($planRawJson) || $planRawJson === '' || !is_array($artifactSnapshot)) return $limited('DIRECT_MARKETING_ACTION_PROJECTION_ARTIFACT_MISSING');
+    $artifact = is_array($artifactSnapshot['data'] ?? null) ? $artifactSnapshot['data'] : null;
+    $artifactObject = is_object($artifactSnapshot['object'] ?? null) ? $artifactSnapshot['object'] : null;
+    if (!is_array($artifact) || !is_object($artifactObject)) return $limited('DIRECT_MARKETING_ACTION_PROJECTION_ARTIFACT_INVALID');
+    $rootKeys = array_keys($artifact);
+    sort($rootKeys, SORT_STRING);
+    if ($rootKeys !== ['artifact_revision', 'candidate_effect_allowed', 'consumer_scope', 'control_effect', 'hardware_effect_claim_allowed', 'plan_binding', 'projection', 'projection_revision', 'reason_code', 'runtime_effect_claim_allowed', 'schema_version', 'status']) return $limited('DIRECT_MARKETING_ACTION_PROJECTION_ARTIFACT_INVALID');
+    $artifactRevision = (string)($artifact['artifact_revision'] ?? '');
+    $artifactMaterial = clone $artifactObject;
+    unset($artifactMaterial->artifact_revision);
+    $artifactEncoded = livePlanCanonicalJsonPreservingObjects($artifactMaterial);
+    $artifactCalculated = is_string($artifactEncoded) ? 'sha256:' . hash('sha256', $artifactEncoded) : '';
+    if (($artifact['schema_version'] ?? '') !== 'storage_plan_action_projection_v1'
+        || ($artifact['consumer_scope'] ?? '') !== 'web_projection'
+        || ($artifact['control_effect'] ?? null) !== false
+        || ($artifact['runtime_effect_claim_allowed'] ?? null) !== false
+        || ($artifact['hardware_effect_claim_allowed'] ?? null) !== false
+        || ($artifact['candidate_effect_allowed'] ?? null) !== false
+        || preg_match('/^sha256:[0-9a-f]{64}$/', $artifactRevision) !== 1
+        || !hash_equals($artifactRevision, $artifactCalculated)) return $limited('DIRECT_MARKETING_ACTION_PROJECTION_ARTIFACT_INVALID');
+    $binding = is_array($artifact['plan_binding'] ?? null) ? $artifact['plan_binding'] : null;
+    $projection = is_array($artifact['projection'] ?? null) ? $artifact['projection'] : null;
+    $projectionObject = is_object($artifactObject->projection ?? null) ? $artifactObject->projection : null;
+    if (!is_array($binding) || !is_array($projection) || !is_object($projectionObject)) return $limited('DIRECT_MARKETING_ACTION_PROJECTION_ARTIFACT_INVALID');
+    $bindingKeys = array_keys($binding);
+    sort($bindingKeys, SORT_STRING);
+    if ($bindingKeys !== ['action_axis_revision', 'generated_at_ts_ms', 'horizon_end_ts_ms', 'input_revisions_revision', 'plan_id', 'plan_material_revision', 'plan_schema_version', 'projection_revision', 'raw_plan_sha256', 'raw_plan_size', 'slot_axis_revision', 'slot_duration_s', 'trajectory_revision', 'valid_from_ts_ms', 'valid_until_ts_ms']) return $limited('DIRECT_MARKETING_ACTION_PROJECTION_BINDING_INVALID');
+    $projectionKeys = array_keys($projection);
+    sort($projectionKeys, SORT_STRING);
+    if ($projectionKeys !== ['action_axis_revision', 'active', 'candidate_effect_allowed', 'complete', 'consumer_scope', 'control_effect', 'generated_at_ts_ms', 'hardware_effect_claim_allowed', 'horizon_end_ts_ms', 'input_revisions', 'input_revisions_revision', 'plan_id', 'plan_material_revision', 'projection_revision', 'reason_code', 'runtime_effect_claim_allowed', 'schema_version', 'slot_axis_revision', 'slot_duration_s', 'slots', 'status', 'trajectory_revision', 'valid_from_ts_ms', 'valid_until_ts_ms']) return $limited('DIRECT_MARKETING_ACTION_PROJECTION_BINDING_INVALID');
+    $projectionRevision = (string)($projection['projection_revision'] ?? '');
+    $projectionMaterial = clone $projectionObject;
+    unset($projectionMaterial->projection_revision);
+    $projectionEncoded = livePlanCanonicalJsonPreservingObjects($projectionMaterial);
+    $projectionCalculated = is_string($projectionEncoded) ? 'sha256:' . hash('sha256', $projectionEncoded) : '';
+    if (preg_match('/^sha256:[0-9a-f]{64}$/', $projectionRevision) !== 1
+        || !hash_equals($projectionRevision, $projectionCalculated)
+        || ($artifact['projection_revision'] ?? null) !== $projectionRevision
+        || ($binding['projection_revision'] ?? null) !== $projectionRevision
+        || ($artifact['status'] ?? null) !== ($projection['status'] ?? null)
+        || ($artifact['reason_code'] ?? null) !== ($projection['reason_code'] ?? null)) return $limited('DIRECT_MARKETING_ACTION_PROJECTION_REVISION_INVALID');
+    $planArtifactRevision = 'sha256:' . hash('sha256', $planRawJson);
+    $inputRevisions = is_array($plan['input_revisions'] ?? null) ? $plan['input_revisions'] : null;
+    $inputRevisionEncoded = liveTrajectoryCanonicalJson($inputRevisions);
+    $inputRevisionsRevision = is_string($inputRevisionEncoded) ? 'sha256:' . hash('sha256', $inputRevisionEncoded) : '';
+    if (($binding['plan_schema_version'] ?? null) !== ($plan['schema_version'] ?? null)
+        || ($binding['plan_id'] ?? null) !== $planId
+        || ($binding['plan_material_revision'] ?? null) !== $planId
+        || ($binding['raw_plan_sha256'] ?? null) !== $planArtifactRevision
+        || (int)($binding['raw_plan_size'] ?? -1) !== strlen($planRawJson)
+        || (int)($binding['generated_at_ts_ms'] ?? 0) !== (int)($plan['generated_at_ts_ms'] ?? 0)
+        || (int)($binding['valid_from_ts_ms'] ?? 0) !== (int)($plan['valid_from_ts_ms'] ?? 0)
+        || (int)($binding['valid_until_ts_ms'] ?? 0) !== (int)($plan['valid_until_ts_ms'] ?? 0)
+        || (int)($binding['horizon_end_ts_ms'] ?? 0) !== (int)($plan['horizon_end_ts_ms'] ?? 0)
+        || (int)($binding['slot_duration_s'] ?? 0) !== (int)($plan['slot_duration_s'] ?? 0)
+        || ($binding['input_revisions_revision'] ?? null) !== $inputRevisionsRevision) return $limited('DIRECT_MARKETING_ACTION_PROJECTION_PLAN_BINDING_INVALID');
+    $trajectory = is_array($plan['direct_marketing_trajectory'] ?? null) ? $plan['direct_marketing_trajectory'] : null;
+    $trajectoryMaterial = is_array($trajectory) ? $trajectory : [];
+    $trajectoryRevision = (string)($trajectoryMaterial['trajectory_revision'] ?? '');
+    unset($trajectoryMaterial['trajectory_revision']);
+    $trajectoryEncoded = liveTrajectoryCanonicalJson($trajectoryMaterial);
+    $trajectoryCalculated = is_string($trajectoryEncoded) ? 'sha256:' . hash('sha256', $trajectoryEncoded) : '';
+    $trajectoryStatus = (string)($trajectory['status'] ?? '');
+    $trajectoryMeta = is_array($trajectory['meta'] ?? null) ? $trajectory['meta'] : null;
+    $passivePolicyBindingMetaValid = $trajectoryStatus !== 'PASSIVE_POLICY_BINDING_MISSING'
+        || (is_array($trajectoryMeta)
+            && ($trajectoryMeta['candidate_effect'] ?? null) === false
+            && ($trajectoryMeta['shadow_effect'] ?? null) === false
+            && ($trajectoryMeta['runtime_authorization_separate'] ?? null) === true);
+    if (!is_array($trajectory) || ($trajectory['schema_version'] ?? '') !== 'direct_marketing_trajectory_v1' || ($trajectory['active'] ?? null) !== true || ($trajectory['complete'] ?? null) !== false || !in_array($trajectoryStatus, ['TRAJECTORY_AXIS_EVIDENCE_LIMIT', 'PASSIVE_POLICY_BINDING_MISSING'], true) || !$passivePolicyBindingMetaValid || ($trajectory['reason_code'] ?? null) !== null || !is_array($trajectory['slots'] ?? null) || count($trajectory['slots']) !== 0 || ($trajectory['plan_id'] ?? null) !== $planId || preg_match('/^sha256:[0-9a-f]{64}$/', $trajectoryRevision) !== 1 || !hash_equals($trajectoryRevision, $trajectoryCalculated) || (int)($trajectory['generated_at_ts_ms'] ?? 0) !== (int)($plan['generated_at_ts_ms'] ?? 0) || (int)($trajectory['valid_from_ts_ms'] ?? 0) !== (int)($plan['valid_from_ts_ms'] ?? 0) || (int)($trajectory['horizon_end_ts_ms'] ?? 0) !== (int)($plan['horizon_end_ts_ms'] ?? 0) || (int)($trajectory['slot_duration_s'] ?? 0) !== (int)($plan['slot_duration_s'] ?? 0) || liveTrajectoryCanonicalJson($trajectory['input_revisions'] ?? null) !== liveTrajectoryCanonicalJson($plan['input_revisions'] ?? null) || ($binding['trajectory_revision'] ?? null) !== $trajectoryRevision) return $limited('DIRECT_MARKETING_ACTION_PROJECTION_TRAJECTORY_NOT_AXIS_LIMITED');
+    $durationS = (int)($plan['slot_duration_s'] ?? 0);
+    $durationMs = $durationS * 1000;
+    $validFromMs = (int)($plan['valid_from_ts_ms'] ?? 0);
+    $horizonEndMs = (int)($plan['horizon_end_ts_ms'] ?? 0);
+    if (($projection['schema_version'] ?? '') !== 'direct_marketing_selected_action_fallback_v1'
+        || ($projection['active'] ?? null) !== true
+        || ($projection['complete'] ?? null) !== true
+        || ($projection['status'] ?? '') !== 'COMPLETE'
+        || ($projection['consumer_scope'] ?? '') !== 'web_projection'
+        || ($projection['control_effect'] ?? null) !== false
+        || ($projection['runtime_effect_claim_allowed'] ?? null) !== false
+        || ($projection['hardware_effect_claim_allowed'] ?? null) !== false
+        || ($projection['candidate_effect_allowed'] ?? null) !== false
+        || ($projection['reason_code'] ?? null) !== null
+        || ($projection['plan_id'] ?? null) !== $planId
+        || ($projection['plan_material_revision'] ?? null) !== $planId
+        || (int)($projection['generated_at_ts_ms'] ?? 0) !== (int)($plan['generated_at_ts_ms'] ?? 0)
+        || (int)($projection['valid_from_ts_ms'] ?? 0) !== $validFromMs
+        || (int)($projection['valid_until_ts_ms'] ?? 0) !== (int)($plan['valid_until_ts_ms'] ?? 0)
+        || (int)($projection['horizon_end_ts_ms'] ?? 0) !== $horizonEndMs
+        || (int)($projection['slot_duration_s'] ?? 0) !== $durationS
+        || liveTrajectoryCanonicalJson($projection['input_revisions'] ?? null) !== liveTrajectoryCanonicalJson($inputRevisions)
+        || ($projection['input_revisions_revision'] ?? null) !== $inputRevisionsRevision
+        || ($projection['trajectory_revision'] ?? null) !== $trajectoryRevision
+        || ($binding['slot_axis_revision'] ?? null) !== ($projection['slot_axis_revision'] ?? null)
+        || ($binding['action_axis_revision'] ?? null) !== ($projection['action_axis_revision'] ?? null)
+        || !is_array($projection['slots'] ?? null)
+        || $durationS <= 0 || $validFromMs <= 0 || $horizonEndMs <= $validFromMs) return $limited('DIRECT_MARKETING_ACTION_PROJECTION_BINDING_INVALID');
+    $sourceSlots = [];
+    foreach (($plan['slots'] ?? []) as $sourceSlot) {
+        if (!is_array($sourceSlot)) return $limited('DIRECT_MARKETING_ACTION_PROJECTION_SLOT_INVALID');
+        if ((int)($sourceSlot['end_ts_ms'] ?? 0) > $validFromMs) $sourceSlots[] = $sourceSlot;
+    }
+    if (count($sourceSlots) !== count($projection['slots'])) return $limited('DIRECT_MARKETING_ACTION_PROJECTION_SLOT_BINDING_INVALID');
+    $slotAxis = [];
+    $actionAxis = [];
+    $slotKeysExpected = ['action', 'action_horizon_revision', 'action_id', 'action_lineage_id', 'action_roles_revision', 'commands_allowed', 'economic_export_gate_revision', 'end_ts_ms', 'executable', 'gate_generation', 'gate_generation_id', 'gate_lineage_id', 'planned_w', 'pv_store_source_contract', 'segment_id', 'selected', 'slot_id', 'source_action', 'source_mode', 'source_projection_revision', 'source_window_revision', 'start_ts_ms', 'window_end_ts_ms', 'window_id', 'window_start_ts_ms'];
+    $revisionFor = function($value) {
+        $encoded = liveTrajectoryCanonicalJson($value);
+        return is_string($encoded) ? 'sha256:' . hash('sha256', $encoded) : null;
+    };
+    $normalizeMode = function($value) {
+        $mode = strtolower(str_replace(['-', ' '], '_', trim((string)$value)));
+        return in_array($mode, ['eco+', 'ecoplus'], true) ? 'eco_plus' : $mode;
+    };
+    $toTsMs = function($value) {
+        if (!is_numeric($value)) return 0;
+        $number = (float)$value;
+        if (!is_finite($number) || $number <= 0.0) return 0;
+        if ($number < 100000000000.0) $number *= 1000.0;
+        return (int)round($number);
+    };
+    $directPlan = is_array($plan['direct_marketing'] ?? null) ? $plan['direct_marketing'] : [];
+    $previousEnd = null;
+    foreach ($projection['slots'] as $index => $slot) {
+        if (!is_array($slot) || !isset($sourceSlots[$index])) return $limited('DIRECT_MARKETING_ACTION_PROJECTION_SLOT_INVALID');
+        $slotKeys = array_keys($slot);
+        sort($slotKeys, SORT_STRING);
+        if ($slotKeys !== $slotKeysExpected) return $limited('DIRECT_MARKETING_ACTION_PROJECTION_SLOT_INVALID');
+        $sourceSlot = $sourceSlots[$index];
+        $slotId = (string)($slot['slot_id'] ?? '');
+        $start = (int)($slot['start_ts_ms'] ?? 0);
+        $end = (int)($slot['end_ts_ms'] ?? 0);
+        $expectedSlotId = 'sha256:' . hash('sha256', liveTrajectoryCanonicalJson(['plan_id' => $planId, 'start_ts_ms' => $start, 'end_ts_ms' => $end]));
+        if (!hash_equals($expectedSlotId, $slotId) || $end - $start !== $durationMs || ($previousEnd === null && $start !== $validFromMs) || ($previousEnd !== null && $start !== $previousEnd) || (string)($sourceSlot['slot_id'] ?? '') !== $slotId || (int)($sourceSlot['start_ts_ms'] ?? 0) !== $start || (int)($sourceSlot['end_ts_ms'] ?? 0) !== $end) return $limited('DIRECT_MARKETING_ACTION_PROJECTION_SLOT_BINDING_INVALID');
+        $sourceProjection = is_array($sourceSlot['projection'] ?? null) ? $sourceSlot['projection'] : [];
+        $sourceSelected = ($sourceProjection['direct_marketing_selected'] ?? null) === true;
+        $sourceExecutable = ($sourceProjection['direct_marketing_plan_executable'] ?? null) === true;
+        $sourceCommands = ($sourceProjection['direct_marketing_plan_commands_allowed'] ?? null) === true;
+        $sidecarSelected = ($slot['selected'] ?? null) === true;
+        if (($slot['executable'] ?? null) !== $sidecarSelected || ($slot['commands_allowed'] ?? null) !== $sidecarSelected || $sourceSelected !== $sidecarSelected || $sourceExecutable !== $sidecarSelected || $sourceCommands !== $sidecarSelected) return $limited('DIRECT_MARKETING_ACTION_PROJECTION_ROLE_INCOMPLETE');
+        if ($sidecarSelected) {
+            $action = strtoupper(trim((string)($slot['action'] ?? '')));
+            $plannedW = $slot['planned_w'] ?? null;
+            $positivePowerAction = in_array($action, ['PV_STORE', 'ECONOMIC_EXPORT'], true);
+            $zeroPowerAction = $action === 'CHARGE_BLOCK_WAIT';
+            $mapping = [
+                'action_id' => 'direct_marketing_plan_action_id', 'action_lineage_id' => 'direct_marketing_plan_action_lineage_id',
+                'window_id' => 'direct_marketing_window_id', 'window_start_ts_ms' => 'direct_marketing_window_start_ts_ms',
+                'window_end_ts_ms' => 'direct_marketing_window_end_ts_ms', 'segment_id' => 'direct_marketing_plan_segment_id',
+                'source_action' => 'direct_marketing_plan_source_action', 'pv_store_source_contract' => 'direct_marketing_plan_pv_store_source_contract',
+                'gate_lineage_id' => 'direct_marketing_gate_lineage_id', 'gate_generation' => 'direct_marketing_gate_generation',
+                'gate_generation_id' => 'direct_marketing_gate_generation_id',
+            ];
+            if ((!$positivePowerAction && !$zeroPowerAction) || !is_numeric($plannedW) || !is_finite((float)$plannedW) || ($positivePowerAction && (float)$plannedW <= 0.0) || ($zeroPowerAction && abs((float)$plannedW) > 0.01) || ($sourceProjection['direct_marketing_plan_action'] ?? null) !== $action || abs(round((float)($sourceProjection['direct_marketing_planned_w'] ?? -1), 3) - (float)$plannedW) > 0.001) return $limited('DIRECT_MARKETING_ACTION_PROJECTION_ACTION_BINDING_INVALID');
+            foreach ($mapping as $sidecarKey => $sourceKey) {
+                if (($slot[$sidecarKey] ?? null) !== ($sourceProjection[$sourceKey] ?? null)) return $limited('DIRECT_MARKETING_ACTION_PROJECTION_ACTION_BINDING_INVALID');
+            }
+            $sourceWindows = [];
+            foreach (($directPlan['windows'] ?? []) as $sourceWindow) {
+                if (!is_array($sourceWindow)
+                    || (string)($sourceWindow['action'] ?? '') !== (string)($slot['source_action'] ?? '')
+                    || $toTsMs($sourceWindow['start_ts'] ?? null) !== (int)($slot['window_start_ts_ms'] ?? 0)
+                    || $toTsMs($sourceWindow['end_ts'] ?? null) !== (int)($slot['window_end_ts_ms'] ?? 0)) continue;
+                $sourceWindowId = trim((string)(
+                    $action === 'ECONOMIC_EXPORT'
+                        ? ($sourceWindow['export_plateau_id'] ?? '')
+                        : ($sourceWindow['window_id'] ?? '')
+                ));
+                $projectedWindowId = trim((string)(
+                    $action === 'ECONOMIC_EXPORT'
+                        ? ($sourceProjection['direct_marketing_export_plateau_id'] ?? '')
+                        : ($slot['window_id'] ?? '')
+                ));
+                if ($sourceWindowId === '' || $sourceWindowId !== $projectedWindowId
+                    || ($sourceWindow['export_segment_id'] ?? null) !== ($sourceProjection['direct_marketing_export_segment_id'] ?? null)
+                    || ($action === 'PV_STORE' && ($sourceWindow['pv_store_source_contract'] ?? null) !== ($slot['pv_store_source_contract'] ?? null))) continue;
+                $sourceWindows[] = $sourceWindow;
+            }
+            if ($normalizeMode($slot['source_mode'] ?? null) !== $normalizeMode($sourceProjection['direct_marketing_plan_source_mode'] ?? null)
+                || ($slot['source_projection_revision'] ?? null) !== $revisionFor($sourceProjection)
+                || ($slot['action_horizon_revision'] ?? null) !== $revisionFor($sourceProjection['direct_marketing_action_horizon_contract'] ?? null)
+                || ($slot['action_roles_revision'] ?? null) !== $revisionFor($sourceProjection['direct_marketing_action_roles'] ?? null)
+                || ($slot['economic_export_gate_revision'] ?? null) !== (is_array($sourceProjection['direct_marketing_economic_export_gate'] ?? null) ? $revisionFor($sourceProjection['direct_marketing_economic_export_gate']) : null)
+                || count($sourceWindows) !== 1
+                || ($slot['source_window_revision'] ?? null) !== $revisionFor($sourceWindows[0])) return $limited('DIRECT_MARKETING_ACTION_PROJECTION_ACTION_BINDING_INVALID');
+            $actionAxis[] = array_intersect_key($slot, array_flip(['slot_id', 'action', 'planned_w', 'action_id', 'action_lineage_id', 'window_id', 'window_start_ts_ms', 'window_end_ts_ms', 'segment_id', 'source_action', 'source_mode', 'pv_store_source_contract', 'gate_lineage_id', 'gate_generation', 'gate_generation_id', 'source_window_revision', 'source_projection_revision', 'action_horizon_revision', 'action_roles_revision', 'economic_export_gate_revision']));
+        } else {
+            foreach (['action', 'planned_w', 'action_id', 'action_lineage_id', 'window_id', 'window_start_ts_ms', 'window_end_ts_ms', 'segment_id', 'source_action', 'source_mode', 'pv_store_source_contract', 'gate_lineage_id', 'gate_generation', 'gate_generation_id', 'source_window_revision', 'source_projection_revision', 'action_horizon_revision', 'action_roles_revision', 'economic_export_gate_revision'] as $key) {
+                if (($slot[$key] ?? null) !== null) return $limited('DIRECT_MARKETING_ACTION_PROJECTION_PASSIVE_SLOT_INVALID');
+            }
+        }
+        $slotAxis[] = ['slot_id' => $slotId, 'start_ts_ms' => $start, 'end_ts_ms' => $end];
+        $previousEnd = $end;
+    }
+    if ($previousEnd !== $horizonEndMs || ($projection['slot_axis_revision'] ?? null) !== $revisionFor($slotAxis) || ($projection['action_axis_revision'] ?? null) !== $revisionFor($actionAxis)) return $limited('DIRECT_MARKETING_ACTION_PROJECTION_AXIS_INVALID');
+    return $projection;
+}
+
+$data['direct_marketing_trajectory'] = liveDirectMarketingTrajectoryForDisplay(
+    null,
+    $directMarketingConfigured,
+    false
+);
+$data['direct_marketing_selected_action_fallback'] = liveDirectMarketingSelectedActionFallbackForDisplay(null, $directMarketingConfigured, false);
 $auxInverterAddress = trim((string)($auxInverterCfg['direct_marketing_aux_inverter_shelly_ip'] ?? ''));
 $externalPvTopology = readExternalPvTopologyEvidence();
 $data['pv_external_control_available'] = cfgHasAddress($auxInverterAddress);
@@ -1634,11 +3042,13 @@ $validData = false; // Flag für gültige Daten
 // ---------------------------------------------------------------------------
 $PY_LIVE_FILE = '/var/www/html/ramdisk/live_data_py.json';
 $SHADOW_LIVE_DATA_FILE = '/var/www/html/ramdisk/shadow_master_live_data_py.json';
-$SHADOW_LIVE_JSON_FILE = '/var/www/html/ramdisk/shadow_master_live_json.json';
 $SHADOW_STATUS_FILE = '/var/www/html/ramdisk/shadow_sync_status.json';
 $liveSourceFile = $PY_LIVE_FILE;
 $liveSourceLabel = 'live_data_py';
 $liveData = null;
+$shadowProjectionAllowed = !$isShadowMode;
+$shadowStorageProjectionAllowed = !$isShadowMode;
+$shadowWallboxBudgetProjectionAllowed = !$isShadowMode;
 
 $data['_py_source'] = true;
 $data['live_source'] = $liveSourceLabel;
@@ -1652,6 +3062,8 @@ if ($isShadowMode) {
     $data['shadow_master_url'] = null;
     $data['shadow_snapshot_age_s'] = null;
     $data['shadow_snapshot_max_age_s'] = null;
+    $shadowStatus = null;
+    $shadowMaxAgeS = 30.0;
 
     clearstatcache(true, $SHADOW_STATUS_FILE);
     if (file_exists($SHADOW_STATUS_FILE)) {
@@ -1662,39 +3074,85 @@ if ($isShadowMode) {
             $data['shadow_master_url'] = $shadowStatus['master_url'] ?? null;
             $data['shadow_snapshot_age_s'] = $shadowStatus['snapshot_age_s'] ?? null;
             $data['shadow_snapshot_max_age_s'] = $shadowStatus['snapshot_max_age_s'] ?? null;
+            if (
+                isset($shadowStatus['snapshot_max_age_s'])
+                && is_numeric($shadowStatus['snapshot_max_age_s'])
+            ) {
+                $shadowMaxAgeS = max(5.0, min(3600.0, (float)$shadowStatus['snapshot_max_age_s']));
+            }
+            $shadowStatusTs = isset($shadowStatus['ts']) && is_numeric($shadowStatus['ts'])
+                ? (float)$shadowStatus['ts']
+                : 0.0;
+            $shadowStatusAgeS = time() - $shadowStatusTs;
+            $shadowLiveTarget = $shadowStatus['targets']['live_data'] ?? null;
+            $shadowProjectionAllowed = in_array(
+                (string)($shadowStatus['status'] ?? ''),
+                ['OK', 'WARN'],
+                true
+            )
+                && $shadowStatusTs > 0
+                && $shadowStatusAgeS >= -60.0
+                && $shadowStatusAgeS <= $shadowMaxAgeS
+                && is_array($shadowLiveTarget)
+                && ($shadowLiveTarget['ok'] ?? false) === true
+                && ($shadowLiveTarget['fresh'] ?? false) === true;
+            $shadowStorageTarget = $shadowStatus['targets']['storage_state'] ?? null;
+            $shadowStorageProjectionAllowed = $shadowProjectionAllowed
+                && is_array($shadowStorageTarget)
+                && ($shadowStorageTarget['ok'] ?? false) === true
+                && ($shadowStorageTarget['fresh'] ?? false) === true;
+            $shadowWallboxBudgetTarget = $shadowStatus['targets']['wb_budget'] ?? null;
+            $shadowWallboxBudgetProjectionAllowed = $shadowProjectionAllowed
+                && is_array($shadowWallboxBudgetTarget)
+                && ($shadowWallboxBudgetTarget['ok'] ?? false) === true
+                && ($shadowWallboxBudgetTarget['fresh'] ?? false) === true;
         }
     }
 
-    clearstatcache(true, $SHADOW_LIVE_DATA_FILE);
-    if (file_exists($SHADOW_LIVE_DATA_FILE)) {
+    if (!$shadowProjectionAllowed) {
+        $shadowReason = (string)($data['shadow_sync_reason'] ?? '');
+        $data['shadow_live_source'] = (
+            str_contains($shadowReason, 'stale')
+            || str_contains($shadowReason, 'timestamp')
+        ) ? 'stale_preimage' : 'blocked_preimage';
+    } else {
+        clearstatcache(true, $SHADOW_LIVE_DATA_FILE);
+    }
+    if ($shadowProjectionAllowed && file_exists($SHADOW_LIVE_DATA_FILE)) {
         $shadowLiveData = @json_decode(file_get_contents($SHADOW_LIVE_DATA_FILE), true);
-        if (is_array($shadowLiveData) && (isset($shadowLiveData['PV_Power']) || isset($shadowLiveData['pv']))) {
+        $shadowPayloadTs = is_array($shadowLiveData)
+            && array_key_exists('_ts', $shadowLiveData)
+            && is_numeric($shadowLiveData['_ts'])
+            ? (float)$shadowLiveData['_ts']
+            : 0.0;
+        if ($shadowPayloadTs > 10000000000.0) {
+            $shadowPayloadTs /= 1000.0;
+        }
+        $shadowPayloadAgeS = time() - $shadowPayloadTs;
+        if (
+            is_array($shadowLiveData)
+            && $shadowPayloadTs > 946684800.0
+            && $shadowPayloadAgeS >= -60.0
+            && $shadowPayloadAgeS <= $shadowMaxAgeS
+            && isset($shadowLiveData['PV_Power'])
+        ) {
             $liveData = $shadowLiveData;
             $liveSourceFile = $SHADOW_LIVE_DATA_FILE;
             $liveSourceLabel = 'shadow_master_live_data_py';
             $data['shadow_live_source'] = $liveSourceLabel;
+        } else {
+            $shadowProjectionAllowed = false;
+            $shadowStorageProjectionAllowed = false;
+            $shadowWallboxBudgetProjectionAllowed = false;
+            $data['shadow_live_source'] = 'stale_preimage';
         }
     }
-
     if (!is_array($liveData)) {
-        clearstatcache(true, $SHADOW_LIVE_JSON_FILE);
-        if (file_exists($SHADOW_LIVE_JSON_FILE)) {
-            $shadowLiveJson = @json_decode(file_get_contents($SHADOW_LIVE_JSON_FILE), true);
-            if (is_array($shadowLiveJson) && (isset($shadowLiveJson['PV_Power']) || isset($shadowLiveJson['pv']))) {
-                $liveData = $shadowLiveJson;
-                $liveData['PV_Power'] = $shadowLiveJson['PV_Power'] ?? $shadowLiveJson['pv'] ?? 0;
-                $liveData['Battery_Power'] = $shadowLiveJson['Battery_Power'] ?? $shadowLiveJson['bat'] ?? 0;
-                $liveData['Grid_Power'] = $shadowLiveJson['Grid_Power'] ?? $shadowLiveJson['grid'] ?? 0;
-                $liveData['Home_Power'] = $shadowLiveJson['Home_Power'] ?? $shadowLiveJson['home_raw'] ?? $shadowLiveJson['home'] ?? 0;
-                $liveData['SOC'] = $shadowLiveJson['SOC'] ?? $shadowLiveJson['soc'] ?? 0;
-                $liveData['Wallbox_Power'] = $shadowLiveJson['Wallbox_Power'] ?? $shadowLiveJson['wb'] ?? 0;
-                $liveData['WP_Power'] = $shadowLiveJson['WP_Power'] ?? $shadowLiveJson['wp'] ?? 0;
-                $liveData['Heizstab_Power'] = $shadowLiveJson['Heizstab_Power'] ?? $shadowLiveJson['hs_power'] ?? 0;
-                $liveData['Notstrom_Status'] = $shadowLiveJson['Notstrom_Status'] ?? $shadowLiveJson['notstrom_status'] ?? 0;
-                $liveSourceFile = $SHADOW_LIVE_JSON_FILE;
-                $liveSourceLabel = 'shadow_master_live_json';
-                $data['shadow_live_source'] = $liveSourceLabel;
-            }
+        $shadowProjectionAllowed = false;
+        $shadowStorageProjectionAllowed = false;
+        $shadowWallboxBudgetProjectionAllowed = false;
+        if ($data['shadow_live_source'] === 'missing') {
+            $data['shadow_live_source'] = 'missing_preimage';
         }
     }
 } else {
@@ -2000,7 +3458,11 @@ if (is_array($liveData) && isset($liveData['PV_Power'])) {
         $data['pv_external_source'] = $externalPowerValid
             ? (string)($liveData['Ext_PV_Power_Source'] ?? 'e3dc_add_power')
             : ($externalPowerReported ? 'invalid' : 'not_reported');
-        $data['bat']     = $process('bat', $raw_bat);
+        // Der Python-RSCP-Writer veröffentlicht den gesamten Live-Frame atomar.
+        // Ein echter Batterieübergang auf 0 W darf deshalb nicht mit einem
+        // früheren Lade-/Entladewert vermischt werden: Sonst widersprechen sich
+        // Batterie, Netzpunkt und Summenbilanz im selben Energiefluss-Frame.
+        $data['bat']     = $raw_bat;
         $data['home_raw']= $process('home', $raw_home);
         $data['home_rscp_raw'] = $raw_home_rscp;
         $data['home_balance'] = is_numeric($calcHome) ? (int)round($calcHome) : null;
@@ -2065,7 +3527,22 @@ if (is_array($liveData) && isset($liveData['PV_Power'])) {
                 $data['wb_soc_source']      = $wbSocSource;
                 $data['wb_soc_source_ts']   = (int)($openwbData['car_soc_source_ts'] ?? ($openwbData['car_soc_raw_ts'] ?? ($openwbData['ts'] ?? 0)));
                 $data['wb_soc_rule_confirmed'] = $wbSocConfirmed;
-                $data['wb_range']           = ($wbSocConfirmed && $wbSocValue > 0) ? pickOpenwbTotalRangeKm($openwbData) : 0.0;
+                $wbRangeContract = openwbTotalRangeContract($openwbData);
+                $data['wb_range'] = is_array($wbRangeContract)
+                    ? (float)$wbRangeContract['range_km']
+                    : 0.0;
+                foreach ([
+                    'car_range_source' => 'wb_range_source',
+                    'car_range_valid' => 'wb_range_valid',
+                    'car_range_observed_ts' => 'wb_range_observed_ts',
+                    'car_range_source_ts' => 'wb_range_source_ts',
+                    'car_range_source_ts_explicit' => 'wb_range_source_ts_explicit',
+                    'car_range_vehicle_key' => 'wb_range_vehicle_key',
+                ] as $contractKey => $dataKey) {
+                    $data[$dataKey] = is_array($wbRangeContract)
+                        ? $wbRangeContract[$contractKey]
+                        : null;
+                }
                 $data['wb_charged_range']   = ($wbSocConfirmed && $wbSocValue > 0) ? (float)($openwbData['car_charged_range'] ?? $openwbData['range_charged'] ?? 0) : 0.0;
                 $data['wb_plug']            = liveBoolValue($openwbData['plug_state'] ?? false);
                 $data['wb_locked']          = liveBoolValue(
@@ -2167,8 +3644,11 @@ if (is_array($liveData) && isset($liveData['PV_Power'])) {
 
         // --- Native Wallbox Fallback (E3DC Native etc.): Status aus wb_live_session.json (geschrieben vom wallbox_manager per RSCP) ---
         $wbNativeEnable = in_array(strtolower(trim($confData['config']['wb_native_enable'] ?? '0')), ['1', 'true']);
-        $wbLiveSessionFile = '/var/www/html/logs/wb_live_session.json';
-        if ($wbNativeType !== 'openwb' && $wbNativeType !== 'openwb_pro' && $wbNativeEnable && file_exists($wbLiveSessionFile) && (time() - filemtime($wbLiveSessionFile) < 15)) {
+        $wbLiveSessionFile = e3dcFirstFreshRegularFile([
+            '/var/www/html/ramdisk/wb_live_session.json',
+            '/var/www/html/logs/wb_live_session.json',
+        ], 15.0);
+        if ($wbConfigured && $wbNativeType !== 'openwb' && $wbNativeType !== 'openwb_pro' && $wbNativeEnable && is_string($wbLiveSessionFile)) {
             $wbLiveSession = @json_decode(file_get_contents($wbLiveSessionFile), true);
             if (is_array($wbLiveSession)) {
                 $carConnected = (bool)($wbLiveSession['car_connected'] ?? false);
@@ -2340,6 +3820,9 @@ if (is_array($liveData) && isset($liveData['PV_Power'])) {
         // und strukturell validiert wurde. Stecker, Verriegelung und Laden sind
         // getrennte Statusbits und dürfen nicht miteinander ODER-verknüpft werden.
         $nativeAlgValid = (($liveData['wb_status_valid'] ?? null) === true);
+        if (array_key_exists('wb_status_valid', $liveData)) {
+            $directNativeWbStatusInvalid = !$nativeAlgValid;
+        }
         $data['wb_status_valid'] = $nativeAlgValid;
         $data['wb_status_source'] = (string)($liveData['wb_status_source'] ?? 'rscp_wb_extern_data_alg');
         $data['wb_status_reason'] = (string)($liveData['wb_status_reason'] ?? 'missing');
@@ -2404,19 +3887,39 @@ if (!empty($shellyWpIp) && $shellyWpIp !== '0.0.0.0') {
 // den bereits korrekt gesetzten $data['wp'] Wert mit 0!
 $luxFile = '/var/www/html/ramdisk/luxtronik.json';
 $idmFile = '/var/www/html/ramdisk/waermepumpe.json';
+$stiebelFile = '/var/www/html/ramdisk/stiebel_isg.json';
 
 // Nimm die Datei, die frischer ist und existiert
 $luxTime = file_exists($luxFile) ? filemtime($luxFile) : 0;
 $idmTime = file_exists($idmFile) ? filemtime($idmFile) : 0;
 
 $wpSourceFile = '';
+$wpSourceJson = null;
 $isIdm = false;
 $heatManagerSource = null;
 
 if ($wpConfigured && $wpTypeCfg !== 3) {
-    // Stiebel und Dimplex schreiben den normalisierten Vertrag nach waermepumpe.json.
-    // Alte luxtronik.json-Dateien duerfen diese Livewerte nicht ueberdecken.
-    if ($wpTypeCfg === 4 || $wpTypeCfg === 5) {
+    if ($wpTypeCfg === 4) {
+        // Stiebel darf nur aus einem frischen, erfolgreichen und eindeutig
+        // herstellergebundenen Vertrag stammen. Alte Luxtronik-Reste sind
+        // für wp_type=4 niemals ein gültiger Fallback.
+        $stiebelSelection = e3dcSelectFreshManufacturerPayload(
+            [$stiebelFile, $idmFile],
+            'Stiebel',
+            150
+        );
+        $data['wp_live_status'] = (string)$stiebelSelection['status'];
+        $data['wp_live_fresh'] = ($stiebelSelection['status'] === 'live');
+        $data['wp_live_age_s'] = $stiebelSelection['age_s'];
+        $data['wp_live_source'] = (string)$stiebelSelection['source'];
+        $data['wp_live_error'] = (string)$stiebelSelection['error'];
+        if ($stiebelSelection['status'] === 'live') {
+            $wpSourceFile = (string)$stiebelSelection['path'];
+            $wpSourceJson = $stiebelSelection['payload'];
+            $isIdm = false;
+        }
+    // Dimplex schreibt den normalisierten Vertrag nach waermepumpe.json.
+    } elseif ($wpTypeCfg === 5) {
         if ($idmTime > 0) {
             $wpSourceFile = $idmFile;
             $isIdm = false;
@@ -2447,8 +3950,14 @@ if ($wpConfigured && $wpTypeCfg !== 3) {
     }
 }
 
-if ($wpSourceFile !== '' && (time() - filemtime($wpSourceFile) < 150)) { // jünger als 2.5 Minuten
-    $wpJson = @json_decode(file_get_contents($wpSourceFile), true);
+$wpSourceIsFresh = $wpSourceFile !== '' && (
+    is_array($wpSourceJson)
+    || (file_exists($wpSourceFile) && (time() - filemtime($wpSourceFile) < 150))
+);
+if ($wpSourceIsFresh) {
+    $wpJson = is_array($wpSourceJson)
+        ? $wpSourceJson
+        : @json_decode(file_get_contents($wpSourceFile), true);
     if ($wpJson) {
         $heatManagerSource = $wpJson;
         if ($isIdm) {
@@ -2707,8 +4216,6 @@ if ($wpSourceFile !== '' && (time() - filemtime($wpSourceFile) < 150)) { // jün
             $stiebelDhwRequested = ($wpTypeCfg === 4) && (
                 ((int)$wpVal(['stiebel_dhw_requested', 'DHW_Request'], 0) > 0)
                 || ((int)($luxStatus['DHW_Request'] ?? 0) > 0)
-                || ((int)$wpVal(['stiebel_operating_mode'], -1) === 5)
-                || ((int)($luxStatus['Operating_Mode'] ?? -1) === 5)
             );
             $stiebelPassiveCooling = $stiebelCoolingRequested && !$compressorOn;
             $wpPowerNow = max(
@@ -2983,18 +4490,24 @@ $wb2Ip = $confData['config']['wb2_ip'] ?? '';
 // $data['wb'] wurde bereits oben aus liveData (Nativ) befüllt, wir initialisieren es hier nur, falls es noch fehlt
 if (!isset($data['wb'])) $data['wb'] = 0;
 $data['wb2'] = 0;
+$data['wb_configured'] = $wbConfigured;
+$data['wb2_configured'] = $wb2Configured;
 $data['is_external_wb'] = false;
 $data['is_external_wb2'] = false;
 $configWbType = normalizeWallboxTypeConfig($confData['config']['wb_native_type'] ?? '');
 $configWb2Type = normalizeWallboxTypeConfig($confData['config']['wb_native_type2'] ?? '');
 $data['wb_native_type'] = $configWbType;
 $data['wb2_native_type'] = $configWb2Type;
+$nativeWb1StatusContract = ['declared' => false, 'valid' => null, 'source' => '', 'reason' => ''];
+$nativeWb2StatusContract = ['declared' => false, 'valid' => null, 'source' => '', 'reason' => ''];
+$nativeWb1StatusInvalid = false;
+$nativeWb2StatusInvalid = false;
 $data['wb_manual_pause'] = in_array(strtolower(trim((string)($confData['config']['wb1_manual_pause'] ?? '0'))), ['1', 'true', 'yes', 'on'], true);
 $data['wb2_manual_pause'] = in_array(strtolower(trim((string)($confData['config']['wb2_manual_pause'] ?? '0'))), ['1', 'true', 'yes', 'on'], true);
-if ($configWbType !== '' && $configWbType !== 'none' && strpos($configWbType, 'e3dc') !== 0) {
+if ($wbConfigured && $configWbType !== '' && $configWbType !== 'none' && strpos($configWbType, 'e3dc') !== 0) {
     $data['is_external_wb'] = true;
 }
-if ($configWb2Type !== '' && $configWb2Type !== 'none' && strpos($configWb2Type, 'e3dc') !== 0) {
+if ($wb2Configured && $configWb2Type !== '' && $configWb2Type !== 'none' && strpos($configWb2Type, 'e3dc') !== 0) {
     $data['is_external_wb2'] = true;
 }
 
@@ -3005,24 +4518,36 @@ $data['wp_type'] = (string)$wpTypeCfg;
 $wbNativeEnable = isset($confData['config']['wb_native_enable']) && in_array(strtolower(trim($confData['config']['wb_native_enable'])), ['1', 'true']);
 $wbNativeFile = '/var/www/html/ramdisk/wallbox_native.json';
 
-if ($wbNativeEnable && file_exists($wbNativeFile)) {
+if ($wbNativeEnable && ($wbConfigured || $wb2Configured) && file_exists($wbNativeFile)) {
     $nativeWb = @json_decode(file_get_contents($wbNativeFile), true);
     if ($nativeWb && (time() - ($nativeWb['ts'] ?? 0) < 60)) {
         $nativeTotalPower = (float)($nativeWb['total_power_w'] ?? 0);
         $nativeDetails = (isset($nativeWb['wb_details']) && is_array($nativeWb['wb_details'])) ? $nativeWb['wb_details'] : [];
-        $data['wb_details'] = $nativeDetails;
+        $data['wb_details'] = array_values(array_filter(
+            $nativeDetails,
+            static function($detail) use ($wbConfigured, $wb2Configured) {
+                if (!is_array($detail)) return false;
+                $detailId = (int)($detail['id'] ?? 0);
+                if ($detailId === 1) return $wbConfigured;
+                if ($detailId === 2) return $wb2Configured;
+                return false;
+            }
+        ));
         $nativeWb1 = null;
         $nativeWb2 = null;
         foreach ($nativeDetails as $wbDetail) {
-            if ((int)($wbDetail['id'] ?? 0) === 1) $nativeWb1 = $wbDetail;
-            if ((int)($wbDetail['id'] ?? 0) === 2) $nativeWb2 = $wbDetail;
+            if ($wbConfigured && (int)($wbDetail['id'] ?? 0) === 1) $nativeWb1 = $wbDetail;
+            if ($wb2Configured && (int)($wbDetail['id'] ?? 0) === 2) $nativeWb2 = $wbDetail;
         }
-        $nativeWbCount = count($nativeDetails);
+        $nativeWbCount = count($data['wb_details']);
         $nativeHasMultiSlots = $nativeWbCount > 1;
         if (!$nativeHasMultiSlots && preg_match('/Multi\s*\((\d+)/i', (string)($nativeWb['wb_type'] ?? ''), $multiMatch)) {
             $nativeHasMultiSlots = ((int)$multiMatch[1]) > 1;
         }
         if ($nativeWb1 !== null) {
+            $nativeWb1StatusContract = liveNativeWallboxStatusContract($nativeWb1);
+            $nativeWb1StatusInvalid = !empty($nativeWb1StatusContract['declared'])
+                && (($nativeWb1StatusContract['valid'] ?? null) !== true);
             $data['wb'] = (float)($nativeWb1['power_w'] ?? 0);
             $data['wb_p1'] = (float)($nativeWb1['phase_power_l1_w'] ?? 0);
             $data['wb_p2'] = (float)($nativeWb1['phase_power_l2_w'] ?? 0);
@@ -3033,23 +4558,36 @@ if ($wbNativeEnable && file_exists($wbNativeFile)) {
             $data['wb_cap_amp'] = (float)($nativeWb1['cap_amp'] ?? $nativeWb1['target_amp'] ?? 0);
             $data['wb_status_amp'] = (float)($nativeWb1['status_amp'] ?? $nativeWb1['amp'] ?? 0);
             liveApplyWallboxFineAmpFields($data, 'wb', $nativeWb1, $data['wb_set_amp']);
-            $data['wb_plug'] = array_key_exists('plug', $nativeWb1) ? (bool)$nativeWb1['plug'] : null;
-            $data['wb_locked'] = array_key_exists('plug_locked', $nativeWb1) ? (bool)$nativeWb1['plug_locked'] : null;
-            $data['wb_charging'] = array_key_exists('charging', $nativeWb1) ? (bool)$nativeWb1['charging'] : null;
-            $data['wb_status_valid'] = !empty($nativeWb1['wb_status_valid']);
-            $data['wb_status_source'] = (string)($nativeWb1['wb_status_source'] ?? 'native_driver');
-            $data['wb_status_reason'] = (string)($nativeWb1['wb_status_reason'] ?? 'unknown');
+            if (!empty($nativeWb1StatusContract['declared'])) {
+                $data['wb_status_valid'] = (($nativeWb1StatusContract['valid'] ?? null) === true);
+                $data['wb_status_source'] = (string)$nativeWb1StatusContract['source'];
+                $data['wb_status_reason'] = (string)$nativeWb1StatusContract['reason'];
+            }
+            if ($nativeWb1StatusInvalid) {
+                $data['wb_plug'] = false;
+                $data['wb_locked'] = false;
+                $data['wb_charging'] = false;
+            } else {
+                $data['wb_plug'] = array_key_exists('plug', $nativeWb1) ? (bool)$nativeWb1['plug'] : null;
+                $data['wb_locked'] = array_key_exists('plug_locked', $nativeWb1)
+                    ? (bool)$nativeWb1['plug_locked']
+                    : ($data['wb_locked'] ?? $data['wb_plug']);
+                $data['wb_charging'] = array_key_exists('charging', $nativeWb1) ? (bool)$nativeWb1['charging'] : null;
+            }
             if (array_key_exists('manual_pause', $nativeWb1)) {
                 $data['wb_runtime_manual_pause'] = !empty($nativeWb1['manual_pause']);
             }
             $data['wb_state_text'] = (string)($nativeWb1['state'] ?? '');
             $data['wb_state_reason'] = (string)($nativeWb1['state_reason'] ?? '');
-        } elseif ($nativeWbCount <= 1 && !$nativeHasMultiSlots) {
+        } elseif ($wbConfigured && !$wb2Configured && $nativeWbCount <= 1 && !$nativeHasMultiSlots) {
             $data['wb'] = $nativeTotalPower;
-        } else {
+        } elseif ($wbConfigured) {
             $data['wb'] = 0;
         }
         if ($nativeWb2 !== null) {
+            $nativeWb2StatusContract = liveNativeWallboxStatusContract($nativeWb2);
+            $nativeWb2StatusInvalid = !empty($nativeWb2StatusContract['declared'])
+                && (($nativeWb2StatusContract['valid'] ?? null) !== true);
             $detailWb2Power = (float)($nativeWb2['power_w'] ?? 0);
             if ($detailWb2Power >= 0) {
                 $data['wb2'] = $detailWb2Power;
@@ -3063,8 +4601,22 @@ if ($wbNativeEnable && file_exists($wbNativeFile)) {
             $data['wb2_cap_amp'] = (float)($nativeWb2['cap_amp'] ?? $nativeWb2['target_amp'] ?? 0);
             $data['wb2_status_amp'] = (float)($nativeWb2['status_amp'] ?? $nativeWb2['amp'] ?? 0);
             liveApplyWallboxFineAmpFields($data, 'wb2', $nativeWb2, $data['wb2_set_amp']);
-            $data['wb2_locked'] = !empty($nativeWb2['plug']) || (($nativeWb2['state'] ?? '') !== 'Idle');
-            $data['wb2_charging'] = !empty($nativeWb2['charging']) || (($nativeWb2['state'] ?? '') === 'Lade');
+            if (!empty($nativeWb2StatusContract['declared'])) {
+                $data['wb2_status_valid'] = (($nativeWb2StatusContract['valid'] ?? null) === true);
+                $data['wb2_status_source'] = (string)$nativeWb2StatusContract['source'];
+                $data['wb2_status_reason'] = (string)$nativeWb2StatusContract['reason'];
+            }
+            if ($nativeWb2StatusInvalid) {
+                $data['wb2_plug'] = false;
+                $data['wb2_locked'] = false;
+                $data['wb2_charging'] = false;
+            } else {
+                $data['wb2_plug'] = array_key_exists('plug', $nativeWb2) ? (bool)$nativeWb2['plug'] : null;
+                $data['wb2_locked'] = array_key_exists('plug_locked', $nativeWb2)
+                    ? (bool)$nativeWb2['plug_locked']
+                    : (!empty($nativeWb2['plug']) || (($nativeWb2['state'] ?? '') !== 'Idle'));
+                $data['wb2_charging'] = !empty($nativeWb2['charging']) || (($nativeWb2['state'] ?? '') === 'Lade');
+            }
             if (array_key_exists('manual_pause', $nativeWb2)) {
                 $data['wb2_runtime_manual_pause'] = !empty($nativeWb2['manual_pause']);
             }
@@ -3102,16 +4654,90 @@ if ($wbNativeEnable && file_exists($wbNativeFile)) {
                 $data[$wbKey] = $nativeWb[$wbKey];
             }
         }
-        $nativeConnected = (bool)($nativeWb['connected'] ?? false);
-        $nativeCharging = (bool)($nativeWb['charging_active'] ?? false);
-        $nativePhases = (int)($nativeWb['detected_phases'] ?? 0);
-        $data['connected'] = $nativeConnected;
-        $data['charging_active'] = $nativeCharging;
-        if ($nativeWbCount <= 1 && !$nativeHasMultiSlots) {
-            $data['wb_plug'] = $nativeConnected;
-            $data['wb_charging'] = $nativeCharging || ((float)$data['wb'] > 500);
+        if (
+            $wbConfigured
+            && !$wb2Configured
+            && empty($data['is_external_wb'])
+            && empty($nativeWb1StatusContract['declared'])
+            && $nativeWbCount <= 1
+            && !$nativeHasMultiSlots
+        ) {
+            $nativeTopStatusContract = liveNativeWallboxStatusContract($nativeWb);
+            if (!empty($nativeTopStatusContract['declared'])) {
+                $nativeWb1StatusContract = $nativeTopStatusContract;
+                $nativeWb1StatusInvalid = (($nativeTopStatusContract['valid'] ?? null) !== true);
+                $data['wb_status_valid'] = !$nativeWb1StatusInvalid;
+                $data['wb_status_source'] = (string)$nativeTopStatusContract['source'];
+                $data['wb_status_reason'] = (string)$nativeTopStatusContract['reason'];
+                if ($nativeWb1StatusInvalid) {
+                    $data['wb_plug'] = false;
+                    $data['wb_locked'] = false;
+                    $data['wb_charging'] = false;
+                }
+            }
         }
-        if ($nativePhases > 0) {
+        $nativeMultiContract = $nativeWb['wb_multi_contract'] ?? null;
+        unset($data['wb_multi_contract']);
+        if (is_array($nativeMultiContract)) {
+            $nativePowerLedger = $nativeMultiContract['power_ledger'] ?? null;
+            if (
+                is_array($nativePowerLedger)
+                && ($nativePowerLedger['schema_version'] ?? null) === 'wallbox_group_power_ledger_v1'
+            ) {
+                $sanitizedPowerLedger = [
+                    'schema_version' => 'wallbox_group_power_ledger_v1',
+                ];
+                $powerLedgerValid = true;
+                foreach ([
+                    'gross_group_budget_w',
+                    'unmanaged_reserved_w',
+                    'managed_budget_w',
+                ] as $ledgerKey) {
+                    $ledgerValue = $nativePowerLedger[$ledgerKey] ?? null;
+                    if (
+                        !is_numeric($ledgerValue)
+                        || !is_finite((float)$ledgerValue)
+                        || (float)$ledgerValue < 0.0
+                    ) {
+                        $powerLedgerValid = false;
+                        break;
+                    }
+                    $sanitizedPowerLedger[$ledgerKey] = (float)$ledgerValue;
+                }
+                if ($powerLedgerValid) {
+                    $data['wb_multi_contract'] = [
+                        'power_ledger' => $sanitizedPowerLedger,
+                    ];
+                }
+            }
+        }
+        $nativeStatusDetailsDeclared = !empty($nativeWb1StatusContract['declared'])
+            || !empty($nativeWb2StatusContract['declared']);
+        if ($nativeStatusDetailsDeclared) {
+            $nativeConnected = (bool)(
+                (!$nativeWb1StatusInvalid && (!empty($data['wb_plug']) || !empty($data['wb_locked'])))
+                || (!$nativeWb2StatusInvalid && (!empty($data['wb2_plug']) || !empty($data['wb2_locked'])))
+            );
+            $nativeCharging = (bool)(
+                (!$nativeWb1StatusInvalid && !empty($data['wb_charging']))
+                || (!$nativeWb2StatusInvalid && !empty($data['wb2_charging']))
+            );
+        } else {
+            $nativeConnected = (bool)($nativeWb['connected'] ?? false);
+            $nativeCharging = (bool)($nativeWb['charging_active'] ?? false);
+        }
+        $nativePhases = (int)($nativeWb['detected_phases'] ?? 0);
+        if ($wbConfigured) {
+            $data['connected'] = $nativeConnected;
+            $data['charging_active'] = $nativeCharging;
+        }
+        if ($wbConfigured && !$wb2Configured && $nativeWbCount <= 1 && !$nativeHasMultiSlots) {
+            $data['wb_plug'] = $nativeWb1StatusInvalid ? false : $nativeConnected;
+            $data['wb_charging'] = $nativeWb1StatusInvalid
+                ? false
+                : ($nativeCharging || ((float)$data['wb'] > 500));
+        }
+        if ($wbConfigured && $nativePhases > 0) {
             $data['detected_phases'] = $nativePhases;
             $data['wb_phases'] = $nativePhases;
         }
@@ -3131,7 +4757,7 @@ if ($wbNativeEnable && file_exists($wbNativeFile)) {
             $data['wb2_source'] = $data['wb2_source'] ?? 'e3dc_multi_native';
             liveResolveE3dcMultiHomeRelation($data, 'wb2');
         }
-        if (strpos($configWbType, 'e3dc') !== 0 && $configWbType !== '' && $configWbType !== 'none') {
+        if ($wbConfigured && strpos($configWbType, 'e3dc') !== 0 && $configWbType !== '' && $configWbType !== 'none') {
             $data['is_external_wb'] = true; // Fremd-WB (openWB, go-e, etc.) -> WB aus Home abziehen
         }
         // E3DC Single: false. E3DC Multi Connect: nur bei echter separater WB-Leistung external-like,
@@ -3139,14 +4765,14 @@ if ($wbNativeEnable && file_exists($wbNativeFile)) {
         if (isset($nativeWb['wb_details']) && is_array($nativeWb['wb_details'])) {
              // Extrahiere absolute Zählerstände von (Fremd-)Wallboxen, falls Python diese liefert
              foreach ($nativeWb['wb_details'] as $wbDetail) {
-                 if ($wbDetail['id'] == 1 && isset($wbDetail['total_kwh'])) {
+                 if ($wbConfigured && $wbDetail['id'] == 1 && isset($wbDetail['total_kwh'])) {
                      $data['python_wb1_total_kwh'] = $wbDetail['total_kwh'];
                      liveSetExactCounter($data, 'e_wb', $wbDetail['total_kwh'], 'wallbox_native_detail', 70);
                  }
-	                if ($wbDetail['id'] == 1 && isset($wbDetail['session_kwh'])) {
+	                if ($wbConfigured && $wbDetail['id'] == 1 && isset($wbDetail['session_kwh'])) {
                      $data['python_wb1_session_kwh'] = $wbDetail['session_kwh'];
                  }
-                 if ($wbDetail['id'] == 2 && isset($wbDetail['total_kwh'])) {
+                 if ($wb2Configured && $wbDetail['id'] == 2 && isset($wbDetail['total_kwh'])) {
                      $data['python_wb2_total_kwh'] = $wbDetail['total_kwh'];
                      liveSetExactCounter($data, 'e_wb2', $wbDetail['total_kwh'], 'wallbox_native_detail', 70);
                  }
@@ -3155,13 +4781,13 @@ if ($wbNativeEnable && file_exists($wbNativeFile)) {
     }
 }
 
-if (!empty($shellyWbIp) && $shellyWbIp !== '0.0.0.0') {
+if ($wbConfigured && !empty($shellyWbIp) && $shellyWbIp !== '0.0.0.0') {
     $p = fetchShellyPower($shellyWbIp);
     if ($p !== false) {
         $data['wb'] = $p;
         $data['is_external_wb'] = true;
     }
-} elseif (!empty($wbIp) && $wbIp !== '0.0.0.0') {
+} elseif ($wbConfigured && !empty($wbIp) && $wbIp !== '0.0.0.0') {
     $extWbFile = '/var/www/html/ramdisk/external_wb.json';
     if (file_exists($extWbFile)) {
         $extData = @json_decode(file_get_contents($extWbFile), true);
@@ -3257,7 +4883,22 @@ if (($wb2NativeType === 'openwb' || $wb2NativeType === 'openwb_pro')
         $data['wb2_soc_source'] = $wb2SocSource;
         $data['wb2_soc_source_ts'] = (int)($openwbData2['car_soc_source_ts'] ?? ($openwbData2['car_soc_raw_ts'] ?? ($openwbData2['ts'] ?? 0)));
         $data['wb2_soc_rule_confirmed'] = $wb2SocConfirmed;
-        $data['wb2_range'] = ($wb2SocConfirmed && $wb2SocValue > 0) ? pickOpenwbTotalRangeKm($openwbData2) : 0.0;
+        $wb2RangeContract = openwbTotalRangeContract($openwbData2);
+        $data['wb2_range'] = is_array($wb2RangeContract)
+            ? (float)$wb2RangeContract['range_km']
+            : 0.0;
+        foreach ([
+            'car_range_source' => 'wb2_range_source',
+            'car_range_valid' => 'wb2_range_valid',
+            'car_range_observed_ts' => 'wb2_range_observed_ts',
+            'car_range_source_ts' => 'wb2_range_source_ts',
+            'car_range_source_ts_explicit' => 'wb2_range_source_ts_explicit',
+            'car_range_vehicle_key' => 'wb2_range_vehicle_key',
+        ] as $contractKey => $dataKey) {
+            $data[$dataKey] = is_array($wb2RangeContract)
+                ? $wb2RangeContract[$contractKey]
+                : null;
+        }
         $data['wb2_charged_range'] = ($wb2SocConfirmed && $wb2SocValue > 0) ? (float)($openwbData2['car_charged_range'] ?? $openwbData2['range_charged'] ?? 0) : 0.0;
         $data['wb2_charge_profile_name'] = trim((string)($openwbData2['charge_template_name'] ?? ''));
         $data['wb2_charge_profile_source'] = $data['wb2_charge_profile_name'] !== '' ? 'openwb_charge_template' : '';
@@ -3305,13 +4946,13 @@ if (($wb2NativeType === 'openwb' || $wb2NativeType === 'openwb_pro')
         liveSetExactCounter($data, 'e_wb2', $data['wb2_daily_kwh'], $wb2Daily['source'], 90);
     }
 }
-if (!empty($shellyWb2Ip) && $shellyWb2Ip !== '0.0.0.0') {
+if ($wb2Configured && !empty($shellyWb2Ip) && $shellyWb2Ip !== '0.0.0.0') {
     $p = fetchShellyPower($shellyWb2Ip);
     if ($p !== false) {
         $data['wb2'] = $p;
         $data['is_external_wb2'] = true;
     }
-} elseif (!empty($wb2Ip) && $wb2Ip !== '0.0.0.0') {
+} elseif ($wb2Configured && !empty($wb2Ip) && $wb2Ip !== '0.0.0.0') {
     $extWbFile = '/var/www/html/ramdisk/external_wb.json';
     if (file_exists($extWbFile)) {
         $extData = @json_decode(file_get_contents($extWbFile), true);
@@ -3330,8 +4971,11 @@ if (!empty($shellyWb2Ip) && $shellyWb2Ip !== '0.0.0.0') {
     }
 }
 
+$wb1UsesExternalStatus = !empty($data['is_external_wb']);
+
 // WB2-Anzeige-Hysterese: openWB/openWB Pro liefert gelegentlich kurze 0W- oder
 // stale-Luecken. Ohne Hold springt der bereinigte Hausverbrauch um die WB-Leistung.
+if ($wb2Configured) {
 $wb2DisplayCacheFile = '/var/www/html/ramdisk/wb2_display_power_cache.json';
 $wb2DisplayCache = file_exists($wb2DisplayCacheFile)
     ? (@json_decode(file_get_contents($wb2DisplayCacheFile), true) ?: [])
@@ -3385,10 +5029,12 @@ if ($wb2DisplayNow > 50) {
         $data['wb2_plug'] = true;
     }
 }
+}
 
 // Anzeige-Hysterese für alle WB-Quellen: Beim Ampere-Setzen liefern E3DC/openWB
 // kurz 0W oder gar keinen Messwert. Wichtig: Dieser Hold muss NACH allen WB-Quellen
 // sitzen, sonst kann wallbox_native.json den gehaltenen Wert wieder mit 0W ueberschreiben.
+if ($wbConfigured) {
 $wbDisplayCacheFile = '/var/www/html/ramdisk/wb_display_power_cache.json';
 $wbDisplayCache = file_exists($wbDisplayCacheFile)
     ? (@json_decode(file_get_contents($wbDisplayCacheFile), true) ?: [])
@@ -3458,6 +5104,9 @@ if ($wbDisplayNow > 50) {
         if (empty($data['wb_source'])) $data['wb_source'] = $wbDisplayCache['source'] ?? 'external_mqtt';
     }
 }
+}
+
+e3dcApplyWallboxPresenceProjection($data, $wbConfigured, $wb2Configured);
 
 // Native E3DC-Wallbox: Phasen werden nicht von openWB geliefert, sondern aus den
 // echten L1/L2/L3-Leistungen abgeleitet. Das ueberschreibt auch alte/stale UI-Werte.
@@ -3524,6 +5173,42 @@ if (isset($data['wb2_plug']) || isset($data['wb2_charging'])) {
     $data['wb2_locked'] = !empty($data['wb2_plug']) || !empty($data['wb2_charging']) || abs($data['wb2']) > 50;
 } elseif (!isset($data['wb2_locked']) || $data['wb2_locked'] === null || $data['is_external_wb2']) {
     $data['wb2_locked'] = (abs($data['wb2']) > 50);
+}
+
+// Ein frisches wallbox_native.json belegt nur die Dateifrische. Sobald der
+// darin deklarierte E3DC-Statusvertrag ungültig ist, dürfen Anzeige-Holds und
+// Leistungsfallbacks keine alte Stecker-/Verriegelungskante wiederbeleben.
+$nativeWb1StatusInvalid = $nativeWb1StatusInvalid || (
+    $wbConfigured
+    && !$wb1UsesExternalStatus
+    && empty($nativeWb1StatusContract['declared'])
+    && $directNativeWbStatusInvalid
+);
+if ($nativeWb1StatusInvalid) {
+    $data['wb_plug'] = false;
+    $data['wb_locked'] = false;
+    $data['wb_charging'] = false;
+    if ((int)($data['active_wb_id'] ?? 0) === 1) {
+        unset($data['active_wb_id'], $data['active_wb_phases']);
+    }
+}
+if ($nativeWb2StatusInvalid) {
+    $data['wb2_plug'] = false;
+    $data['wb2_locked'] = false;
+    $data['wb2_charging'] = false;
+    if ((int)($data['active_wb_id'] ?? 0) === 2) {
+        unset($data['active_wb_id'], $data['active_wb_phases']);
+    }
+}
+if ($nativeWb1StatusInvalid || $nativeWb2StatusInvalid) {
+    $data['connected'] = (bool)(
+        ($wbConfigured && !$nativeWb1StatusInvalid && (!empty($data['wb_plug']) || !empty($data['wb_locked'])))
+        || ($wb2Configured && !$nativeWb2StatusInvalid && (!empty($data['wb2_plug']) || !empty($data['wb2_locked'])))
+    );
+    $data['charging_active'] = (bool)(
+        ($wbConfigured && !$nativeWb1StatusInvalid && !empty($data['wb_charging']))
+        || ($wb2Configured && !$nativeWb2StatusInvalid && !empty($data['wb2_charging']))
+    );
 }
 
 // --- FAIL-SAFE: Verbrauchsanteile (WB/WP) aus dem Hausverbrauch abziehen ---
@@ -3608,6 +5293,11 @@ if (isset($data['python_wb1_total_kwh'])) {
     $nativeWbSession = null;
 }
 
+// Vor Session-Integratoren und Statistikschreibpfaden gilt bereits derselbe
+// fail-closed Präsenzvertrag wie am JSON-Ausgang. Ein deaktivierter Slot darf
+// weder aus Legacy-/Sessionwerten wiederauferstehen noch Zähler fortschreiben.
+e3dcApplyWallboxPresenceProjection($data, $wbConfigured, $wb2Configured);
+
 if ($validData && !$isStandby) {
     $nowTs = time();
     $currentWbPower = (float)$data['wb'];
@@ -3616,6 +5306,7 @@ if ($validData && !$isStandby) {
     $isLocked2 = (bool)($data['wb2_locked'] ?? false);
 
     // --- Wallbox 1 Tracking ---
+    if ($wbConfigured) {
     $wbLockFile = '/var/www/html/tmp/wb_session.lock';
     if (!is_dir(dirname($wbLockFile))) { @mkdir(dirname($wbLockFile), 0775, true); }
     $wbFp = @fopen($wbLockFile, 'c+');
@@ -3715,8 +5406,12 @@ if ($validData && !$isStandby) {
             liveSetExactCounter($data, 'e_wb', $nativeDailyKwh, 'native_session_integrated', 80);
         }
     }
+    } else {
+        $data['wb_session_kwh'] = 0.0;
+    }
 
     // --- Wallbox 2 Tracking ---
+    if ($wb2Configured) {
     $wb2LockFile = '/var/www/html/tmp/wb2_session.lock';
     $wb2Fp = @fopen($wb2LockFile, 'c+');
     if ($wb2Fp && @flock($wb2Fp, LOCK_EX | LOCK_NB)) {
@@ -3758,15 +5453,21 @@ if ($validData && !$isStandby) {
         }
     }
     $data['wb2_session_kwh'] = round($wb2SessionKwh, 2);
+    } else {
+        $data['wb2_session_kwh'] = 0.0;
+    }
 
-} elseif (file_exists($wbStateFile)) {
+} elseif ($wbConfigured && file_exists($wbStateFile)) {
     // Fallback falls validData false
     $parsed = @json_decode(file_get_contents($wbStateFile), true);
     $data['wb_session_kwh'] = round($parsed['kwh'] ?? 0, 2);
-    if (file_exists($wb2StateFile)) {
+    if ($wb2Configured && file_exists($wb2StateFile)) {
         $parsed2 = @json_decode(file_get_contents($wb2StateFile), true);
         $data['wb2_session_kwh'] = round($parsed2['kwh'] ?? 0, 2);
     }
+} elseif ($wb2Configured && file_exists($wb2StateFile)) {
+    $parsed2 = @json_decode(file_get_contents($wb2StateFile), true);
+    $data['wb2_session_kwh'] = round($parsed2['kwh'] ?? 0, 2);
 }
 
 // --- MQTT/HA Eingangs-Telemetrie: kontrollierte Smart-Home-Bruecke ---
@@ -3846,8 +5547,8 @@ if ($mqttHaInboundEnabled && file_exists($mqttHaInboundFile) && (time() - filemt
             }
         }
 
-        $applyHaWallbox = function($haWb, $wbNo) use (&$data, &$mqttHaAppliedConsumer, $sourceFresh, $getHaValue, $haBool) {
-            if (!$haWb || !$sourceFresh($haWb)) return;
+        $applyHaWallbox = function($haWb, $wbNo, $configured) use (&$data, &$mqttHaAppliedConsumer, $sourceFresh, $getHaValue, $haBool) {
+            if (!$configured || !$haWb || !$sourceFresh($haWb)) return;
             $prefix = ($wbNo === 2) ? 'wb2' : 'wb';
             $haVal = $getHaValue($haWb, 'power_w');
             if ($haVal !== null && is_numeric($haVal)) {
@@ -3879,10 +5580,14 @@ if ($mqttHaInboundEnabled && file_exists($mqttHaInboundFile) && (time() - filemt
             $haWb1 = $sources['wallbox'];
         }
         $haWb2 = (isset($sources['wallbox2']) && is_array($sources['wallbox2'])) ? $sources['wallbox2'] : [];
-        $applyHaWallbox($haWb1, 1);
-        $applyHaWallbox($haWb2, 2);
+        $applyHaWallbox($haWb1, 1, $wbConfigured);
+        $applyHaWallbox($haWb2, 2, $wb2Configured);
     }
 }
+
+// MQTT/HA- und Migrationspfade dürfen vor Home-, History- und Peak-Bildung
+// ebenfalls keinen ausdrücklich deaktivierten Slot projizieren.
+e3dcApplyWallboxPresenceProjection($data, $wbConfigured, $wb2Configured);
 
 if ($mqttHaAppliedConsumer) {
     $cleanHome = (float)($data['home_raw'] ?? $data['home'] ?? 0);
@@ -3992,9 +5697,9 @@ if ($validData && $historySampleValid && (time() - $lastWrite) >= 60 && !$isStan
         'wb_p1' => $data['wb_p1'],
         'wb_p2' => $data['wb_p2'],
         'wb_p3' => $data['wb_p3'],
-        'wb2_p1' => $data['wb2_p1'],
-        'wb2_p2' => $data['wb2_p2'],
-        'wb2_p3' => $data['wb2_p3'],
+        'wb2_p1' => $data['wb2_p1'] ?? 0,
+        'wb2_p2' => $data['wb2_p2'] ?? 0,
+        'wb2_p3' => $data['wb2_p3'] ?? 0,
         'grid_p1' => $data['grid_p1'],
         'grid_p2' => $data['grid_p2'],
         'grid_p3' => $data['grid_p3'],
@@ -4309,7 +6014,13 @@ if ($owbActiveVehicle && ($owbWbSoc > 0 || $owbDisplayName !== '')) {
         'profile_id'      => $owbMatchedSavedId,
         'name'            => $displayName,
         'soc'             => $displaySoc,
-        'range_km'        => $displaySoc !== null && $owbWbRange > 0 ? $owbWbRange : null,
+        'range_km'        => $owbWbRange > 0 ? $owbWbRange : null,
+        'car_range_source' => $data['wb_range_source'] ?? '',
+        'car_range_valid' => ($data['wb_range_valid'] ?? false) === true,
+        'car_range_observed_ts' => $data['wb_range_observed_ts'] ?? null,
+        'car_range_source_ts' => $data['wb_range_source_ts'] ?? null,
+        'car_range_source_ts_explicit' => ($data['wb_range_source_ts_explicit'] ?? false) === true,
+        'car_range_vehicle_key' => $data['wb_range_vehicle_key'] ?? '',
         'capacity_kwh'    => $owbCapKwh > 0 ? $owbCapKwh : null,
         'consumption_kwh_100km' => $owbConsumptionKwh100 > 0 ? $owbConsumptionKwh100 : null,
         'is_plugged_in'   => $owbWbPlug,
@@ -4317,7 +6028,10 @@ if ($owbActiveVehicle && ($owbWbSoc > 0 || $owbDisplayName !== '')) {
         'soc_source'      => !empty($data['wb_soc_source']) ? $data['wb_soc_source'] : 'ccs_wallbox',
         'soc_rule_confirmed' => $displaySoc !== null && !empty($data['wb_soc_rule_confirmed']),
         'wb_slot'         => 1,
+        'car_id'          => $owbStableIdentityCurrent ? ($data['wb_car_id'] ?? ($owbCarId ?? null)) : null,
+        'rfid_tag'        => $owbStableIdentityCurrent ? ($data['wb_rfid_tag'] ?? null) : null,
         'vehicle_id'      => $owbStableIdentityCurrent ? ($data['wb_vehicle_id'] ?? ($owbVehicleId ?? null)) : null,
+        'stable_vehicle_identity_current' => $owbStableIdentityCurrent,
         'is_manual'       => false,
         'is_interpolated' => strpos((string)($data['wb_soc_source'] ?? ''), 'estimated') !== false,
         'last_updated_at' => (int)($data['wb_soc_source_ts'] ?? time())
@@ -4357,7 +6071,13 @@ if ($owb2ActiveVehicle && ($owb2WbSoc > 0 || $owb2DisplayName !== '' || !empty($
         'profile_id'      => $owb2MatchedSavedId,
         'name'            => $owb2DisplayName !== '' ? $owb2DisplayName : ($owb2CarName ?: 'openWB Pro'),
         'soc'             => $wb2DisplaySoc,
-        'range_km'        => $wb2DisplaySoc !== null && !empty($data['wb2_range']) ? (float)$data['wb2_range'] : null,
+        'range_km'        => !empty($data['wb2_range']) ? (float)$data['wb2_range'] : null,
+        'car_range_source' => $data['wb2_range_source'] ?? '',
+        'car_range_valid' => ($data['wb2_range_valid'] ?? false) === true,
+        'car_range_observed_ts' => $data['wb2_range_observed_ts'] ?? null,
+        'car_range_source_ts' => $data['wb2_range_source_ts'] ?? null,
+        'car_range_source_ts_explicit' => ($data['wb2_range_source_ts_explicit'] ?? false) === true,
+        'car_range_vehicle_key' => $data['wb2_range_vehicle_key'] ?? '',
         'capacity_kwh'    => $owb2CapKwh > 0 ? $owb2CapKwh : null,
         'consumption_kwh_100km' => $owb2ConsumptionKwh100 > 0 ? $owb2ConsumptionKwh100 : null,
         'is_plugged_in'   => !empty($data['wb2_plug']),
@@ -4365,8 +6085,10 @@ if ($owb2ActiveVehicle && ($owb2WbSoc > 0 || $owb2DisplayName !== '' || !empty($
         'soc_source'      => !empty($data['wb2_soc_source']) ? $data['wb2_soc_source'] : 'ccs_wallbox_wb2',
         'soc_rule_confirmed' => $wb2DisplaySoc !== null && !empty($data['wb2_soc_rule_confirmed']),
         'wb_slot'         => 2,
+        'car_id'          => $owb2StableIdentityCurrent ? ($data['wb2_car_id'] ?? ($owb2CarId ?? null)) : null,
         'rfid_tag'        => $owb2StableIdentityCurrent ? ($data['wb2_rfid_tag'] ?? null) : null,
         'vehicle_id'      => $owb2StableIdentityCurrent ? ($data['wb2_vehicle_id'] ?? null) : null,
+        'stable_vehicle_identity_current' => $owb2StableIdentityCurrent,
         'is_manual'       => false,
         'is_interpolated' => strpos((string)($data['wb2_soc_source'] ?? ''), 'estimated') !== false,
         'last_updated_at' => (int)($data['wb2_soc_source_ts'] ?? time())
@@ -4446,15 +6168,18 @@ $data['has_bluelink'] = !empty($c['bluelink_refresh_token']);
 
 
 // --- NEU: Virtuelle Lade-Sessions (Interpolation & Restzeit) einmischen für Dual-WB ---
+$carChargeSessions = [
+    1 => liveCarChargeSessionSnapshot(1),
+    2 => liveCarChargeSessionSnapshot(2),
+];
 $sessions = [
-    ['file' => '/var/www/html/tmp/car_charge_session.json', 'wb' => 'wb'],
-    ['file' => '/var/www/html/tmp/car_charge_session_wb2.json', 'wb' => 'wb2']
+    ['data' => $carChargeSessions[1]['data'], 'wb' => 'wb'],
+    ['data' => $carChargeSessions[2]['data'], 'wb' => 'wb2'],
 ];
 
 foreach ($sessions as $sIndex => $sConf) {
-    if (file_exists($sConf['file'])) {
-        $sessData = @json_decode(file_get_contents($sConf['file']), true);
-        if ($sessData) {
+    $sessData = is_array($sConf['data'] ?? null) ? $sConf['data'] : [];
+    if ($sessData) {
             $vSoc = $sessData['current_virtual_soc'] ?? null;
             $tTar = $sessData['time_to_target_mins'] ?? null;
             $carId = $sessData['car_id'] ?? null;
@@ -4555,7 +6280,6 @@ foreach ($sessions as $sIndex => $sConf) {
                     ];
                 }
             }
-        }
     }
 }
 
@@ -4568,7 +6292,9 @@ if (isset($data['vehicles']) && is_array($data['vehicles'])) {
     }
     unset($veh);
 
-    $sessData = @json_decode(@file_get_contents('/var/www/html/tmp/car_charge_session.json'), true);
+    $sessData = is_array($carChargeSessions[1]['data'] ?? null)
+        ? $carChargeSessions[1]['data']
+        : [];
     foreach ($data['vehicles'] as &$veh) {
         if (isset($veh['soc']) && empty($veh['range_km'])) {
             // Prioritaet: 1. capacity_kwh aus Fahrzeug (openWB connected_vehicle/info)
@@ -4804,12 +6530,18 @@ if ($validData) {
 $storageDisplayDayStart = null;
 $storageDisplayDayEnd = null;
 $storageDisplayDayLabel = 'Heute';
+$storageAuthoritativeSnapshotLoaded = false;
 $storStateFile = $isShadowMode
     ? '/var/www/html/ramdisk/shadow_master_storage_manager_state.json'
     : '/var/www/html/ramdisk/storage_manager_state.json';
-if (file_exists($storStateFile) && (time() - filemtime($storStateFile) < 120)) {
+if (
+    (!$isShadowMode || $shadowStorageProjectionAllowed)
+    && file_exists($storStateFile)
+    && (time() - filemtime($storStateFile) < 120)
+) {
     $storState = @json_decode(file_get_contents($storStateFile), true);
     if ($storState) {
+        $storageAuthoritativeSnapshotLoaded = !empty($storState['state']);
         // Ladekurve-Meilensteine (von Python SOC-Trajektorie berechnet)
         if (!empty($storState['ladekurve'])) {
             $data['ladekurve'] = $storState['ladekurve'];
@@ -5001,13 +6733,21 @@ if (file_exists($marketValueSolarFile) && (time() - filemtime($marketValueSolarF
 $wbBudgetFile = $isShadowMode
     ? '/var/www/html/ramdisk/shadow_master_wb_pv_budget.json'
     : '/var/www/html/ramdisk/wb_pv_budget.json';
-if (file_exists($wbBudgetFile) && (time() - filemtime($wbBudgetFile) < 30)) {
+if (
+    (!$isShadowMode || $shadowWallboxBudgetProjectionAllowed)
+    && file_exists($wbBudgetFile)
+    && (time() - filemtime($wbBudgetFile) < 30)
+) {
     $wbBudget = @json_decode(file_get_contents($wbBudgetFile), true);
     if ($wbBudget) {
         $wbBudgetDiagnosticFile = $isShadowMode
-            ? '/var/www/html/ramdisk/shadow_master_wb_pv_budget_diagnostics.json'
+            ? null
             : '/var/www/html/ramdisk/wb_pv_budget_diagnostics.json';
-        if (file_exists($wbBudgetDiagnosticFile) && (time() - filemtime($wbBudgetDiagnosticFile) < 180)) {
+        if (
+            is_string($wbBudgetDiagnosticFile)
+            && file_exists($wbBudgetDiagnosticFile)
+            && (time() - filemtime($wbBudgetDiagnosticFile) < 180)
+        ) {
             $wbBudgetDiagnostic = @json_decode(file_get_contents($wbBudgetDiagnosticFile), true);
             if (is_array($wbBudgetDiagnostic)) {
                 // Die frische Kontrollfläche gewinnt bei gleichnamigen Feldern.
@@ -5020,16 +6760,24 @@ if (file_exists($wbBudgetFile) && (time() - filemtime($wbBudgetFile) < 30)) {
         $data['wb_budget_amp_1ph'] = (int)($wbBudget['budget_amp_1ph'] ?? 0);
         $data['wb_budget_amp_3ph'] = (int)($wbBudget['budget_amp_3ph'] ?? 0);
         $data['wb_budget_state']   = in_array($rawBudgetState, $signalStates, true) ? $rawBudgetState : 'run';
-        $data['wb_budget_storage_state'] = $rawBudgetState;
-        $data['storage_state']     = $wbBudget['storage_state'] ?? 'unknown';
-        $data['storage_manager_title'] = $wbBudget['manager_title'] ?? ($data['storage_manager_title'] ?? '');
-        $data['storage_state_label'] = $wbBudget['state_label'] ?? ($data['storage_state_label'] ?? '');
-        $data['storage_control_owner'] = $wbBudget['control_owner'] ?? ($data['storage_control_owner'] ?? '');
-        $data['storage_control_owner_label'] = $wbBudget['control_owner_label'] ?? ($data['storage_control_owner_label'] ?? '');
-        $data['wb_budget_reason']  = $wbBudget['reason'] ?? '';
-        if (!empty($wbBudget['display_reason'])) {
-            $data['storage_reason'] = $wbBudget['display_reason'];
+        $data['wb_budget_storage_state'] = $wbBudget['storage_state'] ?? 'unknown';
+        // Speicherzustand und Owner stammen aus genau einer autoritativen
+        // Oberfläche. Das Verbraucherbudget wird nach dem State-Snapshot
+        // geschrieben und kann in einem benachbarten Zyklus liegen. Würde es
+        // diese Felder erneut überschreiben, könnte die UI zwischen E3DC/AUTO
+        // und Storage Manager/DV springen, obwohl kein Owner gewechselt hat.
+        // Nur wenn der State-Snapshot fehlt, dient das Budget als Fallback.
+        if (!$storageAuthoritativeSnapshotLoaded) {
+            $data['storage_state'] = $wbBudget['storage_state'] ?? 'unknown';
+            $data['storage_manager_title'] = $wbBudget['manager_title'] ?? ($data['storage_manager_title'] ?? '');
+            $data['storage_state_label'] = $wbBudget['state_label'] ?? ($data['storage_state_label'] ?? '');
+            $data['storage_control_owner'] = $wbBudget['control_owner'] ?? ($data['storage_control_owner'] ?? '');
+            $data['storage_control_owner_label'] = $wbBudget['control_owner_label'] ?? ($data['storage_control_owner_label'] ?? '');
+            if (!empty($wbBudget['display_reason'])) {
+                $data['storage_reason'] = $wbBudget['display_reason'];
+            }
         }
+        $data['wb_budget_reason']  = $wbBudget['reason'] ?? '';
         $es = $wbBudget['energy_score'] ?? [];
         $data['free_for_limbs_w']   = (int)($es['free_for_limbs_w'] ?? 0);
         $data['free_for_limbs_raw_w'] = (int)($es['free_for_limbs_raw_w'] ?? $data['free_for_limbs_w']);
@@ -5158,8 +6906,11 @@ if (file_exists($wbBudgetFile) && (time() - filemtime($wbBudgetFile) < 30)) {
 // Batterie-, SoC-, Direktvermarktungs- oder Marktentscheidung.
 $storagePlanFile = '/var/www/html/ramdisk/storage_plan.json';
 if (file_exists($storagePlanFile) && (time() - filemtime($storagePlanFile) < 900)) {
-    $storPlan = @json_decode(file_get_contents($storagePlanFile), true);
+    $storPlanRawJson = @file_get_contents($storagePlanFile);
+    $storPlan = is_string($storPlanRawJson) ? @json_decode($storPlanRawJson, true) : null;
     if ($storPlan) {
+        $storageActionProjectionFile = '/var/www/html/ramdisk/storage_plan_action_projection.json';
+        $storageActionProjectionArtifact = liveReadStoragePlanActionProjectionArtifact($storageActionProjectionFile);
         $storageDispatchRuntimeFile = '/var/www/html/ramdisk/storage_dispatch_runtime.json';
         $storageDispatchRuntime = is_readable($storageDispatchRuntimeFile)
             ? @json_decode(file_get_contents($storageDispatchRuntimeFile), true)
@@ -5208,6 +6959,64 @@ if (file_exists($storagePlanFile) && (time() - filemtime($storagePlanFile) < 900
             && preg_match('/^sha256:[0-9a-f]{64}$/', (string)($storPlan['plan_id'] ?? '')) === 1
             && isset($storPlan['slots'])
             && is_array($storPlan['slots']);
+        $data['direct_marketing_trajectory'] = liveDirectMarketingTrajectoryForDisplay(
+            $storPlan,
+            $directMarketingConfigured,
+            $canonicalPlan
+        );
+        $data['direct_marketing_selected_action_fallback'] = liveDirectMarketingSelectedActionFallbackForDisplay(
+            $storPlan,
+            $directMarketingConfigured,
+            $canonicalPlan,
+            $storPlanRawJson,
+            $storageActionProjectionArtifact
+        );
+        // Reine, plan-ID-gebundene Forecastprojektion für den Wärme-Owner.
+        // PHP trifft hier weder eine Preis- noch eine Wärmeentscheidung. P50-
+        // Werte bleiben Diagnose; eine aktive Freigabe braucht später einen
+        // separat validierten konservativen Intent- und Budgetvertrag.
+        $heatPriceBoostSlots = [];
+        if ($canonicalPlan) {
+            foreach ($storPlan['slots'] as $slot) {
+                if (!is_array($slot)) continue;
+                $slotForecast = is_array($slot['forecast_w'] ?? null) ? $slot['forecast_w'] : [];
+                $slotEvidence = is_array($slotForecast['evidence'] ?? null) ? $slotForecast['evidence'] : [];
+                $slotProjection = is_array($slot['projection'] ?? null) ? $slot['projection'] : [];
+                $heatPriceBoostSlots[] = [
+                    'start_ts_ms' => $slot['start_ts_ms'] ?? null,
+                    'end_ts_ms' => $slot['end_ts_ms'] ?? null,
+                    'slot_id' => $slot['slot_id'] ?? null,
+                    'pv_p10_w' => $slotForecast['pv']['p10'] ?? null,
+                    'pv_p50_w' => $slotForecast['pv']['p50'] ?? null,
+                    'pv_p90_w' => $slotForecast['pv']['p90'] ?? null,
+                    'load_p10_w' => $slotForecast['load']['p10'] ?? null,
+                    'load_p50_w' => $slotForecast['load']['p50'] ?? null,
+                    'load_p90_w' => $slotForecast['load']['p90'] ?? null,
+                    'house_p50_w' => $slotForecast['house']['p50'] ?? null,
+                    'heat_p50_w' => $slotForecast['heat']['p50'] ?? null,
+                    'wallbox_p50_w' => $slotForecast['wallbox']['p50'] ?? null,
+                    'external_ac_pv_p50_w' => $slotForecast['external_ac_pv']['p50'] ?? null,
+                    'home_source' => $slotProjection['home_source'] ?? null,
+                    'home_quality' => $slotProjection['home_quality'] ?? null,
+                    'climate_source' => $slotProjection['climate_source'] ?? null,
+                    'climate_quality' => $slotProjection['climate_quality'] ?? null,
+                    'pv_forecast_fresh' => ($slotEvidence['pv_fresh'] ?? null) === true,
+                    'forecast_fresh' => ($slotEvidence['pv_fresh'] ?? null) === true
+                        && ($slotEvidence['load_valid'] ?? null) === true,
+                    'load_valid' => ($slotEvidence['load_valid'] ?? null) === true,
+                ];
+            }
+        }
+        $data['heat_price_boost_forecast'] = [
+            'schema_version' => 'heat_price_boost_forecast_v1',
+            'status' => $canonicalPlan ? 'canonical_projection' : 'storage_plan_not_canonical',
+            'shadow_only' => true,
+            'commands_allowed' => false,
+            'plan_id' => $canonicalPlan ? ($storPlan['plan_id'] ?? null) : null,
+            'input_revisions' => $canonicalPlan ? ($storPlan['input_revisions'] ?? null) : null,
+            'candidate' => $canonicalPlan ? ($storPlan['heat_intent_candidate'] ?? null) : null,
+            'slots' => $heatPriceBoostSlots,
+        ];
         $dispatchSlots = $canonicalPlan ? $storPlan['slots'] : ($storPlan['timeline'] ?? []);
         foreach ($dispatchSlots as $slot) {
             if (!is_array($slot)) continue;
@@ -5243,39 +7052,50 @@ if (file_exists($storagePlanFile) && (time() - filemtime($storagePlanFile) < 900
             if ($targetSoc !== null) $targetCurve[] = ['ts' => $tsMs, 'soc' => round($targetSoc, 1)];
             if ($reserveFloor !== null) $socMinCurve[] = ['ts' => $tsMs, 'soc' => round($reserveFloor, 1)];
             if ($ceiling !== null) $socCeilingCurve[] = ['ts' => $tsMs, 'soc' => round($ceiling, 1)];
+            $projectionPlanAction = strtoupper((string)($projection['direct_marketing_plan_action'] ?? ''));
+            $projectionPlanSelected = $directMarketingConfigured
+                && !empty($projection['direct_marketing_selected'])
+                && !empty($projection['direct_marketing_plan_executable'])
+                && !empty($projection['direct_marketing_plan_commands_allowed']);
+            $projectionPvStoreSelected = $projectionPlanSelected
+                && $projectionPlanAction === 'PV_STORE';
+            $projectionEconomicExportSelected = $projectionPlanSelected
+                && $projectionPlanAction === 'ECONOMIC_EXPORT';
             $simCurve[] = [
                 'ts' => $tsMs,
                 'plan_id' => $canonicalPlan ? ($storPlan['plan_id'] ?? null) : null,
                 'slot_id' => $canonicalPlan ? ($slot['slot_id'] ?? null) : null,
                 'soc' => $soc !== null ? round($soc, 1) : null,
                 'pv_w' => (int)round((float)($projection['pv_w'] ?? 0)),
-                'direct_marketing_export_w' => $directMarketingConfigured
-                    && !empty($projection['direct_marketing_selected'])
-                    && !empty($projection['direct_marketing_executable'])
-                    && !empty($projection['direct_marketing_commands_allowed'])
+                'direct_marketing_slot_projection_w' => $canonicalPlan
+                    && isset($projection['battery_w'])
+                    && is_numeric($projection['battery_w'])
+                    ? (int)round((float)$projection['battery_w'])
+                    : null,
+                'direct_marketing_slot_projection_wh' => $canonicalPlan
+                    && isset($slot['planned_wh']['charge'])
+                    && is_numeric($slot['planned_wh']['charge'])
+                    ? round((float)$slot['planned_wh']['charge'], 3)
+                    : null,
+                'direct_marketing_export_w' => $projectionEconomicExportSelected
                     ? (int)round(max(0.0, (float)($projection['direct_marketing_export_w'] ?? 0)))
                     : 0,
-                'direct_marketing_planned_w' => $directMarketingConfigured
-                    && !empty($projection['direct_marketing_selected'])
-                    && !empty($projection['direct_marketing_plan_executable'])
-                    && !empty($projection['direct_marketing_plan_commands_allowed'])
+                'direct_marketing_planned_w' => $projectionPlanSelected
                     ? (int)round(max(0.0, (float)($projection['direct_marketing_planned_w'] ?? 0)))
                     : 0,
-                'direct_marketing_charge_w' => $directMarketingConfigured
-                    && !empty($projection['direct_marketing_selected'])
-                    && !empty($projection['direct_marketing_executable'])
-                    && !empty($projection['direct_marketing_commands_allowed'])
-                    ? (int)round(max(0.0, (float)($projection['direct_marketing_charge_w'] ?? 0)))
+                'direct_marketing_charge_w' => $projectionPvStoreSelected
+                    ? (int)round(max(
+                        0.0,
+                        (float)($projection['direct_marketing_charge_w'] ?? 0),
+                        (float)($projection['direct_marketing_planned_w'] ?? 0)
+                    ))
                     : 0,
                 'direct_marketing_soc' => $directMarketingConfigured
                     && isset($projection['direct_marketing_soc_pct'])
                     && is_numeric($projection['direct_marketing_soc_pct'])
                     ? round((float)$projection['direct_marketing_soc_pct'], 1)
                     : null,
-                'direct_marketing_action' => $directMarketingConfigured
-                    && !empty($projection['direct_marketing_selected'])
-                    && !empty($projection['direct_marketing_plan_executable'])
-                    && !empty($projection['direct_marketing_plan_commands_allowed'])
+                'direct_marketing_action' => $projectionPlanSelected
                     ? ($projection['direct_marketing_plan_action'] ?? null)
                     : null,
                 'direct_marketing_window_id' => $directMarketingConfigured
@@ -5819,5 +7639,9 @@ if (!isset($data['house_battery_soc']) || !is_array($data['house_battery_soc']))
         'domain' => 'house_battery',
     ];
 }
+
+// Session-/Legacypfade laufen für Bestandsmigration weiter, dürfen aber am
+// Ausgang keinen ausdrücklich deaktivierten Wallbox-Slot wieder projizieren.
+e3dcApplyWallboxPresenceProjection($data, $wbConfigured, $wb2Configured);
 
 echo json_encode($data);

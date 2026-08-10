@@ -42,11 +42,13 @@ WPM_OPERATING_MODE_TEXT = {
     5: "Warmwasserbetrieb",
 }
 
-WPM_STATUS_HEATING = 1 << 3
-WPM_STATUS_DHW = 1 << 4
-WPM_STATUS_COMPRESSOR = 1 << 5
-WPM_STATUS_SUMMER = 1 << 6
-WPM_STATUS_COOLING = 1 << 7
+# Register 2501 ist laut Stiebel-Dokumentation bitcodiert: B4 Heizen,
+# B5 Warmwasser, B6 Verdichter, B7 Sommerbetrieb und B8 Kühlbetrieb.
+WPM_STATUS_HEATING = 1 << 4
+WPM_STATUS_DHW = 1 << 5
+WPM_STATUS_COMPRESSOR = 1 << 6
+WPM_STATUS_SUMMER = 1 << 7
+WPM_STATUS_COOLING = 1 << 8
 
 _stop = False
 _web_opener: urllib.request.OpenerDirector | None = None
@@ -619,7 +621,6 @@ def normalise_payload(payload: dict[str, Any], cfg: dict[str, Any]) -> dict[str,
     )
     dhw_requested = bool(
         status_dhw
-        or operating_mode == 5
         or safe_int(state.get("dhw_pump"), 0) == 1
         or (
             compressor_on

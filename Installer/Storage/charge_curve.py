@@ -259,6 +259,7 @@ def sliding_forecast_horizon_context(
     headroom_reserve_active: bool,
     hard_anchor: Dict[str, Any],
     previous_state: Optional[Dict[str, Any]] = None,
+    curve_relation: str = "",
 ) -> Dict[str, Any]:
     """Relax Forecast-100 curve following when future PV can still cover the target."""
 
@@ -304,7 +305,109 @@ def sliding_forecast_horizon_context(
         safe_float(plan.get("forecast_confidence_pct"), -1.0) / 100.0,
         safe_float(meta.get("forecast_confidence_pct"), -1.0) / 100.0,
     )
-    forecast_confidence = 1.0 if forecast_confidence_raw < 0.0 else max(0.0, min(1.0, forecast_confidence_raw))
+    forecast_confidence_available = forecast_confidence_raw >= 0.0
+    forecast_confidence = (
+        max(0.0, min(1.0, forecast_confidence_raw))
+        if forecast_confidence_available
+        else 0.0
+    )
+    chargeability = (
+        plan.get("target_reach_chargeability_contract")
+        if isinstance(
+            plan.get("target_reach_chargeability_contract"),
+            dict,
+        )
+        else {}
+    )
+
+    def contract_ts_s(value: Any) -> float:
+        parsed = safe_float(value, 0.0)
+        return parsed / 1000.0 if parsed > 100_000_000_000.0 else parsed
+
+    evidence_evaluated_s = contract_ts_s(
+        chargeability.get("evaluated_ts")
+    )
+    evidence_valid_until_s = contract_ts_s(
+        chargeability.get("valid_until_ts")
+    )
+    evidence_topology_revision = str(
+        chargeability.get("topology_revision") or ""
+    )
+    evidence_plan_id = str(chargeability.get("plan_id") or "")
+    current_plan_id = str(
+        plan.get("plan_id")
+        or plan.get("canonical_plan_id")
+        or ""
+    )
+    evidence_forecast_revision = str(
+        chargeability.get("forecast_revision") or ""
+    )
+    evidence_calibration_revision = str(
+        chargeability.get("calibration_revision") or ""
+    )
+    evidence_max_age_s = max(
+        60.0,
+        min(
+            3600.0,
+            safe_float(
+                cfg.get(
+                    "storage_curve_sliding_horizon_evidence_max_age_s"
+                ),
+                1200.0,
+            ),
+        ),
+    )
+    evidence_age_s = (
+        now_s - evidence_evaluated_s
+        if evidence_evaluated_s > 0.0
+        else None
+    )
+    evidence_ttl_s = (
+        evidence_valid_until_s - evidence_evaluated_s
+        if (
+            evidence_valid_until_s > 0.0
+            and evidence_evaluated_s > 0.0
+        )
+        else None
+    )
+    plan_topology_revision = str(
+        plan.get("target_reach_topology_revision") or ""
+    )
+    decision_evidence_complete = bool(
+        chargeability.get("schema")
+        == "storage_forecast_chargeability_v1"
+        and chargeability.get("status") == "complete"
+        and chargeability.get("decision_use_allowed") is True
+        and chargeability.get("wait_allowed") is True
+        and chargeability.get("wait_coverage_proven") is True
+        and chargeability.get("source_scope") == "E3DC_DC_ONLY"
+        and chargeability.get("forecast_fresh") is True
+        and chargeability.get("conservative_quantile_bound") is True
+        and chargeability.get("charge_acceptance_bound") is True
+        and chargeability.get("latest_start_bound") is True
+        and evidence_evaluated_s > 0.0
+        and evidence_evaluated_s <= now_s + 5.0
+        and evidence_age_s is not None
+        and evidence_age_s <= evidence_max_age_s
+        and evidence_valid_until_s > now_s
+        and evidence_ttl_s is not None
+        and 0.0 < evidence_ttl_s <= evidence_max_age_s
+        and evidence_plan_id
+        and evidence_plan_id == current_plan_id
+        and evidence_forecast_revision
+        and evidence_calibration_revision
+        and evidence_topology_revision
+        and evidence_topology_revision == plan_topology_revision
+        and plan.get("target_reach_source_scope") == "E3DC_DC_ONLY"
+        and plan.get("target_reach_decision_evidence_complete") is True
+        and plan.get("target_reach_conservative_quantile_bound") is True
+        and plan.get("target_reach_charge_acceptance_bound") is True
+        and plan.get("target_reach_latest_start_bound") is True
+        and plan.get("target_reach_decision_use_allowed") is True
+        and plan.get("target_reach_wait_coverage_proven") is True
+        and plan.get("target_reach_wait_allowed") is True
+    )
+    normalized_curve_relation = str(curve_relation or "").strip().lower()
     if effective_target_soc > min_soc:
         soc_factor = max(0.0, min(1.0, (curve_control_soc - min_soc) / (effective_target_soc - min_soc)))
     else:
@@ -336,6 +439,40 @@ def sliding_forecast_horizon_context(
             "soc_factor": round(soc_factor, 4),
             "horizon_factor": round(horizon_factor, 4),
             "forecast_confidence": round(forecast_confidence, 4),
+            "forecast_confidence_available": forecast_confidence_available,
+            "decision_evidence_complete": decision_evidence_complete,
+            "chargeability_schema": chargeability.get("schema"),
+            "chargeability_status": chargeability.get("status"),
+            "chargeability_valid_until_ts": (
+                evidence_valid_until_s
+                if evidence_valid_until_s > 0.0
+                else None
+            ),
+            "chargeability_age_s": (
+                round(evidence_age_s, 3)
+                if evidence_age_s is not None
+                else None
+            ),
+            "chargeability_ttl_s": (
+                round(evidence_ttl_s, 3)
+                if evidence_ttl_s is not None
+                else None
+            ),
+            "chargeability_max_age_s": round(
+                evidence_max_age_s,
+                3,
+            ),
+            "chargeability_topology_revision": (
+                evidence_topology_revision or None
+            ),
+            "chargeability_plan_id": evidence_plan_id or None,
+            "chargeability_forecast_revision": (
+                evidence_forecast_revision or None
+            ),
+            "chargeability_calibration_revision": (
+                evidence_calibration_revision or None
+            ),
+            "curve_relation": normalized_curve_relation or None,
             "target_gap_pct": round(target_gap_pct, 3),
             "latest_charge_start_ts": latest_charge_start_s,
             "minutes_until_latest_charge": minutes_until_latest,
@@ -352,6 +489,22 @@ def sliding_forecast_horizon_context(
         return blocked("disabled")
     if not forecast_only_target_active:
         return blocked("not_forecast_100")
+    if not decision_evidence_complete:
+        return blocked("forecast_chargeability_evidence_limit")
+    if normalized_curve_relation not in {"inside_band"}:
+        return blocked(
+            "curve_corridor_below_floor"
+            if normalized_curve_relation in {"below_floor", "no_curve"}
+            else "curve_corridor_not_inside_band",
+            candidate_active=bool(
+                decision_evidence_complete
+                and can_reach_target
+                and forecast_only_target_active
+            ),
+            corridor_veto=bool(
+                normalized_curve_relation in {"below_floor", "no_curve"}
+            ),
+        )
     if not can_reach_target:
         return blocked("target_not_reachable")
     if effective_target_soc <= 0.0:
@@ -404,6 +557,11 @@ def sliding_forecast_horizon_context(
                 "soc_factor": round(soc_factor, 4),
                 "horizon_factor": round(horizon_factor, 4),
                 "forecast_confidence": round(forecast_confidence, 4),
+                "forecast_confidence_available": (
+                    forecast_confidence_available
+                ),
+                "decision_evidence_complete": decision_evidence_complete,
+                "curve_relation": normalized_curve_relation,
                 "target_gap_pct": round(target_gap_pct, 3),
                 "latest_charge_start_ts": latest_charge_start_s,
                 "minutes_until_latest_charge": minutes_until_latest,
@@ -431,6 +589,9 @@ def sliding_forecast_horizon_context(
         "soc_factor": round(soc_factor, 4),
         "horizon_factor": round(horizon_factor, 4),
         "forecast_confidence": round(forecast_confidence, 4),
+        "forecast_confidence_available": forecast_confidence_available,
+        "decision_evidence_complete": decision_evidence_complete,
+        "curve_relation": normalized_curve_relation,
         "target_gap_pct": round(target_gap_pct, 3),
         "latest_charge_start_ts": latest_charge_start_s,
         "minutes_until_latest_charge": minutes_until_latest,

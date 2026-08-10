@@ -26,6 +26,9 @@ import io
 import logging
 import tempfile
 import math
+import gzip
+import hashlib
+import signal
 
 LIVE_DATA_PATH = "/var/www/html/ramdisk/live_data_py.json"
 LIVE_LAST_VALID_PATH = "/var/www/html/ramdisk/live_data_last_valid.json"
@@ -36,6 +39,13 @@ LIVE_PLAUSIBILITY_LOG_DIR = "/var/www/html/logs"
 LIVE_PLAUSIBILITY_LOG_PREFIX = "live_plausibility_glitches"
 LIVE_PLAUSIBILITY_LOG_MAX_RECORDS = 480
 LIVE_PLAUSIBILITY_LOG_MAX_BYTES = 1024 * 1024
+LIVE_PLAUSIBILITY_LOG_TARGET_BYTES = 512 * 1024
+LIVE_PLAUSIBILITY_LOG_HEARTBEAT_S = 15 * 60.0
+LIVE_PLAUSIBILITY_LOG_MAINTENANCE_RETRY_S = 5 * 60.0
+# Das Install Center benötigt höchstens 48 Stunden. 30 volle Tage bewahren
+# zusätzlich ausreichend Feldhistorie, ohne die Zahl täglich gescannter
+# Diagnosedateien unbegrenzt wachsen zu lassen.
+LIVE_PLAUSIBILITY_LOG_RETENTION_DAYS = 30
 LIVE_LAST_VALID_HEARTBEAT_S = 30.0
 LIVE_GRID_POWER_FILTER_ALPHA = 0.03
 PM_AUTO_PROBE_LAST_INDEX = 7
@@ -48,6 +58,8 @@ POWER_DECISION_SIGNALS = (
 )
 _LIVE_LAST_VALID_MEMORY = {}
 _LIVE_LAST_VALID_WRITE_TS = {}
+_LIVE_PLAUSIBILITY_EVENT_MEMORY = {}
+_LIVE_PLAUSIBILITY_MAINTENANCE_DAY_BY_DIR = {}
 
 # rscp_client.py liegt im selben Verzeichnis
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1408,22 +1420,29 @@ def get_system_info(conn):
 
 class KwhRetterState:
     FILE_PATH = "/var/www/html/data/kwh_retter.json"
-    def __init__(self):
+
+    def __init__(self, file_path=None, heartbeat_s=120.0, monotonic_fn=None, date_fn=None):
         self.total_derating_wsec = 0.0
         self.total_inverter_wsec = 0.0
         self.today_derating_wsec = 0.0
         self.today_inverter_wsec = 0.0
         import datetime
-        self.current_date = datetime.datetime.now().strftime("%Y-%m-%d")
+        self.file_path = str(file_path or self.FILE_PATH)
+        self.heartbeat_s = max(60.0, min(300.0, float(heartbeat_s or 120.0)))
+        self._monotonic = monotonic_fn or time.monotonic
+        self._date = date_fn or (lambda: datetime.datetime.now().strftime("%Y-%m-%d"))
+        self.current_date = self._date()
         self.start_date = self.current_date
-        self.last_ts = 0
+        self.last_ts = 0.0
+        self.last_persist_ts = self._monotonic()
+        self._dirty = False
         self.load()
 
     def load(self):
         import os, json
-        if os.path.exists(self.FILE_PATH):
+        if os.path.exists(self.file_path):
             try:
-                with open(self.FILE_PATH, 'r') as f:
+                with open(self.file_path, 'r') as f:
                     d = json.load(f)
                     self.total_derating_wsec = d.get('total_derating_wsec', 0.0)
                     self.total_inverter_wsec = d.get('total_inverter_wsec', 0.0)
@@ -1435,8 +1454,11 @@ class KwhRetterState:
 
     def save(self):
         import os, json
-        tmp = self.FILE_PATH + ".tmp"
+        tmp = f"{self.file_path}.tmp.{os.getpid()}"
         try:
+            parent = os.path.dirname(self.file_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
             with open(tmp, 'w') as f:
                 json.dump({
                     "total_derating_wsec": self.total_derating_wsec,
@@ -1446,9 +1468,28 @@ class KwhRetterState:
                     "current_date": self.current_date,
                     "start_date": self.start_date
                 }, f)
-            os.replace(tmp, self.FILE_PATH)
-            os.chmod(self.FILE_PATH, 0o664)
-        except: pass
+            os.replace(tmp, self.file_path)
+            try:
+                os.chmod(self.file_path, 0o664)
+            except OSError:
+                pass
+            self.last_persist_ts = self._monotonic()
+            self._dirty = False
+            return True
+        except Exception:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+            return False
+
+    def flush(self):
+        """Schreibt ausschließlich noch nicht gesicherte Zählerfortschritte."""
+
+        if not self._dirty:
+            return False
+        return self.save()
 
     @staticmethod
     def split_saved_power(pv_power, derate_limit_w, inverter_limit_w):
@@ -1486,35 +1527,45 @@ class KwhRetterState:
         return derating_w, inverter_w
 
     def add_sample(self, pv_power, derate_limit_w, inverter_limit_w):
-        import time, datetime
-        now_ts = time.monotonic()
+        now_ts = self._monotonic()
+        today = self._date()
+        date_changed = today != self.current_date
+        if date_changed:
+            self.today_derating_wsec = 0.0
+            self.today_inverter_wsec = 0.0
+            self.current_date = today
+            self._dirty = True
+
         if self.last_ts == 0:
             self.last_ts = now_ts
+            if date_changed:
+                self.save()
             return
 
         dt_sec = now_ts - self.last_ts
         self.last_ts = now_ts
         if dt_sec > 300 or dt_sec <= 0:
+            if date_changed:
+                self.save()
             return
 
-        today = datetime.datetime.now().strftime("%Y-%m-%d")
-        if today != self.current_date:
-            self.today_derating_wsec = 0.0
-            self.today_inverter_wsec = 0.0
-            self.current_date = today
-
-        changed = False
         derating_w, inverter_w = self.split_saved_power(pv_power, derate_limit_w, inverter_limit_w)
         if derating_w > 0:
             self.today_derating_wsec += derating_w * dt_sec
             self.total_derating_wsec += derating_w * dt_sec
-            changed = True
+            self._dirty = True
         if inverter_w > 0:
             self.today_inverter_wsec += inverter_w * dt_sec
             self.total_inverter_wsec += inverter_w * dt_sec
-            changed = True
+            self._dirty = True
 
-        if changed or dt_sec > 60: # periodisch speichern
+        if date_changed or (
+            self._dirty
+            and (
+                now_ts < self.last_persist_ts
+                or now_ts - self.last_persist_ts >= self.heartbeat_s
+            )
+        ):
             self.save()
 
     def get_stats(self):
@@ -2206,16 +2257,445 @@ def _daily_plausibility_log_path(now_s=None, log_dir=LIVE_PLAUSIBILITY_LOG_DIR):
     return os.path.join(log_dir, f"{LIVE_PLAUSIBILITY_LOG_PREFIX}_{day}.jsonl")
 
 
-def _trim_jsonl_tail(path, max_records=LIVE_PLAUSIBILITY_LOG_MAX_RECORDS):
+def _trim_jsonl_tail(
+    path,
+    max_records=LIVE_PLAUSIBILITY_LOG_MAX_RECORDS,
+    max_bytes=LIVE_PLAUSIBILITY_LOG_MAX_BYTES,
+    target_bytes=LIVE_PLAUSIBILITY_LOG_TARGET_BYTES,
+):
+    """Kompaktiert selten und mit ausreichend Abstand zur nächsten Grenze."""
     try:
+        current_size = os.path.getsize(path)
+        if current_size <= max_bytes:
+            return False
         with open(path, "r", encoding="utf-8") as handle:
-            lines = handle.readlines()
-        if len(lines) <= max_records:
-            return
-        with open(path, "w", encoding="utf-8") as handle:
-            handle.writelines(lines[-max_records:])
+            lines = [line for line in handle.readlines() if line.strip()]
+        keep = lines[-max(1, int(max_records)):]
+        target = max(1024, min(int(target_bytes), int(max_bytes)))
+        size = sum(len(line.encode("utf-8")) for line in keep)
+        while len(keep) > 1 and size > target:
+            remove_count = max(1, len(keep) // 10)
+            removed = keep[:remove_count]
+            keep = keep[remove_count:]
+            size -= sum(len(line.encode("utf-8")) for line in removed)
+        directory = os.path.dirname(path)
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=os.path.basename(path) + ".",
+            suffix=".compact",
+            dir=directory,
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.writelines(keep)
+            os.replace(tmp_path, path)
+            os.chmod(path, 0o664)
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        return True
     except Exception:
-        return
+        return False
+
+
+def _plausibility_event_signature(frame):
+    return (
+        bool(frame.get("valid")),
+        bool(frame.get("diagnostic_only")),
+        tuple(sorted(str(item) for item in (frame.get("reasons") or []))),
+        tuple(
+            sorted(
+                str(item)
+                for item in (frame.get("effective_reasons") or [])
+            )
+        ),
+    )
+
+
+def _plausibility_signature_payload(signature):
+    return {
+        "valid": bool(signature[0]),
+        "diagnostic_only": bool(signature[1]),
+        "reasons": list(signature[2]),
+        "effective_reasons": list(signature[3]),
+    }
+
+
+def _fsync_directory(path):
+    """Macht vorherige Rename-/Unlink-Operationen auf Linux dauerhaft."""
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_fd = None
+    try:
+        directory_fd = os.open(path, flags)
+        os.fsync(directory_fd)
+    except OSError:
+        # Windows-Testläufe erlauben kein fsync auf Verzeichnissen. Auf dem
+        # produktiven Linux-Pfad muss ein Fehler dagegen die Transaktion
+        # abbrechen, bevor die einzige Rohkopie gelöscht wird.
+        if os.name != "nt":
+            raise
+    finally:
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+
+def _closed_plausibility_log_paths(log_dir, current_log_path):
+    current_name = os.path.basename(current_log_path)
+    prefix = f"{LIVE_PLAUSIBILITY_LOG_PREFIX}_"
+    try:
+        names = sorted(os.listdir(log_dir))
+    except OSError:
+        return None
+    return [
+        os.path.join(log_dir, name)
+        for name in names
+        if (
+            name != current_name
+            and name.startswith(prefix)
+            and name.endswith(".jsonl")
+        )
+    ]
+
+
+def _cleanup_old_plausibility_gzip_logs(
+    log_dir,
+    *,
+    now_s=None,
+    retention_days=LIVE_PLAUSIBILITY_LOG_RETENTION_DAYS,
+):
+    """Löscht nur abgeschlossene Gzip-Tageslogs außerhalb der Feldretention."""
+
+    now_s = time.time() if now_s is None else float(now_s)
+    current_day = time.strftime("%Y%m%d", time.localtime(now_s))
+    current_day_start = time.mktime(time.strptime(current_day, "%Y%m%d"))
+    cutoff_day_start = current_day_start - max(2, int(retention_days)) * 86400
+    prefix = f"{LIVE_PLAUSIBILITY_LOG_PREFIX}_"
+    suffix = ".jsonl.gz"
+    removed = []
+    try:
+        names = sorted(os.listdir(log_dir))
+    except OSError:
+        return removed
+    for name in names:
+        if not name.startswith(prefix) or not name.endswith(suffix):
+            continue
+        day_text = name[len(prefix):-len(suffix)]
+        if len(day_text) != 8 or not day_text.isdigit():
+            continue
+        try:
+            day_start = time.mktime(time.strptime(day_text, "%Y%m%d"))
+        except (OverflowError, ValueError):
+            continue
+        if day_start >= cutoff_day_start:
+            continue
+        path = os.path.join(log_dir, name)
+        try:
+            path_stat = os.lstat(path)
+            if not os.path.isfile(path) or os.path.islink(path):
+                continue
+            os.unlink(path)
+            removed.append(path)
+        except OSError:
+            continue
+    if removed:
+        _fsync_directory(log_dir)
+    return removed
+
+
+def _compress_closed_plausibility_logs(log_dir, current_log_path):
+    """Komprimiert abgeschlossene Tageslogs hashgeprüft und stromausfallsicher."""
+
+    compressed = []
+    source_paths = _closed_plausibility_log_paths(log_dir, current_log_path)
+    if source_paths is None:
+        return compressed
+    for source_path in source_paths:
+        target_path = source_path + ".gz"
+        if os.path.lexists(target_path):
+            continue
+        try:
+            source_stat = os.lstat(source_path)
+            if not os.path.isfile(source_path) or os.path.islink(source_path):
+                continue
+            fd, temp_path = tempfile.mkstemp(
+                prefix=os.path.basename(target_path) + ".",
+                suffix=".tmp",
+                dir=log_dir,
+            )
+            uncompressed_bytes = 0
+            source_hash = hashlib.sha256()
+            try:
+                with open(source_path, "rb") as source, os.fdopen(
+                    fd,
+                    "wb",
+                ) as raw_target:
+                    source_fd_stat = os.fstat(source.fileno())
+                    if (
+                        source_fd_stat.st_dev,
+                        source_fd_stat.st_ino,
+                    ) != (
+                        source_stat.st_dev,
+                        source_stat.st_ino,
+                    ):
+                        raise OSError("Tageslog wurde vor der Kompression ausgetauscht")
+                    with gzip.GzipFile(
+                        fileobj=raw_target,
+                        mode="wb",
+                        compresslevel=6,
+                        filename="",
+                    ) as target:
+                        for block in iter(lambda: source.read(64 * 1024), b""):
+                            target.write(block)
+                            source_hash.update(block)
+                            uncompressed_bytes += len(block)
+                    raw_target.flush()
+                    try:
+                        os.fchmod(raw_target.fileno(), 0o664)
+                    except OSError:
+                        pass
+                    os.fsync(raw_target.fileno())
+                verified_bytes = 0
+                verified_hash = hashlib.sha256()
+                with gzip.open(temp_path, "rb") as check:
+                    for block in iter(lambda: check.read(64 * 1024), b""):
+                        verified_hash.update(block)
+                        verified_bytes += len(block)
+                if (
+                    verified_bytes != uncompressed_bytes
+                    or verified_hash.digest() != source_hash.digest()
+                ):
+                    raise OSError("Kompressionsprüfung meldet abweichende Nutzdaten")
+                current_stat = os.lstat(source_path)
+                if (
+                    current_stat.st_dev,
+                    current_stat.st_ino,
+                    current_stat.st_size,
+                    current_stat.st_mtime_ns,
+                ) != (
+                    source_stat.st_dev,
+                    source_stat.st_ino,
+                    source_stat.st_size,
+                    source_stat.st_mtime_ns,
+                ):
+                    raise OSError("Tageslog änderte sich während der Kompression")
+                os.replace(temp_path, target_path)
+                # Erst wenn Zieldatei und Verzeichniseintrag dauerhaft sind,
+                # darf die einzige unkomprimierte Kopie entfernt werden.
+                _fsync_directory(log_dir)
+                os.unlink(source_path)
+                _fsync_directory(log_dir)
+                compressed.append(target_path)
+            finally:
+                if os.path.exists(temp_path):
+                    os.unlink(temp_path)
+        except Exception:
+            continue
+    return compressed
+
+
+def _maybe_compress_closed_plausibility_logs(log_path, now_s=None):
+    log_dir = os.path.dirname(log_path)
+    current_name = os.path.basename(log_path)
+    now_s = time.time() if now_s is None else float(now_s)
+    maintenance_day = time.strftime(
+        "%Y-%m-%d",
+        time.localtime(now_s),
+    )
+    maintenance = _LIVE_PLAUSIBILITY_MAINTENANCE_DAY_BY_DIR.get(log_dir)
+    if isinstance(maintenance, str):
+        maintenance = {
+            "day": maintenance,
+            "current_name": current_name,
+            "last_attempt_ts": 0.0,
+            "complete": True,
+        }
+    if (
+        isinstance(maintenance, dict)
+        and maintenance.get("day") == maintenance_day
+        and maintenance.get("current_name") == current_name
+    ):
+        if maintenance.get("complete"):
+            return []
+        if (
+            now_s - float(maintenance.get("last_attempt_ts") or 0.0)
+            < LIVE_PLAUSIBILITY_LOG_MAINTENANCE_RETRY_S
+        ):
+            return []
+    result = _compress_closed_plausibility_logs(log_dir, log_path)
+    remaining = _closed_plausibility_log_paths(log_dir, log_path)
+    complete = remaining == []
+    _LIVE_PLAUSIBILITY_MAINTENANCE_DAY_BY_DIR[log_dir] = {
+        "day": maintenance_day,
+        "current_name": current_name,
+        "last_attempt_ts": now_s,
+        "complete": complete,
+    }
+    _cleanup_old_plausibility_gzip_logs(log_dir, now_s=now_s)
+    return result
+
+
+def _append_plausibility_event(log_path, event, *, maintain=True):
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    if maintain:
+        _maybe_compress_closed_plausibility_logs(
+            log_path,
+            now_s=float(event.get("ts") or time.time()),
+        )
+    existed = os.path.exists(log_path)
+    with open(log_path, "a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                sanitize_for_json(event),
+                ensure_ascii=False,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            + "\n"
+        )
+    if not existed:
+        try:
+            os.chmod(log_path, 0o664)
+        except Exception:
+            pass
+    _trim_jsonl_tail(log_path)
+
+
+def _new_plausibility_event_state(signature, log_path, now_s, frame):
+    return {
+        "signature": signature,
+        "log_path": log_path,
+        "first_seen_ts": now_s,
+        "last_seen_ts": now_s,
+        "total_sample_count": 1,
+        "pending_first_ts": now_s,
+        "pending_sample_count": 1,
+        "pending_last_ts": now_s,
+        "pending_max_gap_s": 0.0,
+        "last_persist_ts": 0.0,
+        "last_frame": frame,
+    }
+
+
+def _plausibility_event_aggregation(state, now_s, event_kind):
+    pending_sample_count = max(
+        0,
+        int(state.get("pending_sample_count") or 0),
+    )
+    last_seen_ts = float(state.get("last_seen_ts") or now_s)
+    window_start_ts = (
+        float(state.get("pending_first_ts"))
+        if pending_sample_count > 0 and state.get("pending_first_ts")
+        else last_seen_ts
+    )
+    window_end_ts = (
+        last_seen_ts
+        if event_kind in ("transition_end", "shutdown_close", "recovered")
+        else float(now_s)
+    )
+    return {
+        "event_kind": event_kind,
+        "signature": _plausibility_signature_payload(state["signature"]),
+        "first_seen_ts": int(state["first_seen_ts"]),
+        "window_start_ts": int(window_start_ts),
+        "window_end_ts": int(window_end_ts),
+        "sample_count": pending_sample_count,
+        "max_sample_gap_s": round(
+            max(0.0, float(state.get("pending_max_gap_s") or 0.0)),
+            3,
+        ),
+        "total_sample_count": max(
+            1,
+            int(state.get("total_sample_count") or 0),
+        ),
+    }
+
+
+def _previous_valid_plausibility_frame(last_valid_path):
+    previous_valid = _LIVE_LAST_VALID_MEMORY.get(last_valid_path)
+    if not isinstance(previous_valid, dict):
+        previous_valid = _read_json_file(last_valid_path)
+    return previous_valid if isinstance(previous_valid, dict) else None
+
+
+def _build_plausibility_state_event(
+    state,
+    *,
+    event_kind,
+    now_s,
+    current_frame,
+    previous_valid,
+):
+    return {
+        "ts": int(now_s),
+        "iso_ts": time.strftime(
+            "%Y-%m-%dT%H:%M:%S%z",
+            time.localtime(now_s),
+        ),
+        "schema_version": "live_plausibility_glitch_v2",
+        "current": current_frame,
+        "previous_valid": previous_valid,
+        "aggregation": {
+            **_plausibility_event_aggregation(
+                state,
+                now_s,
+                event_kind,
+            ),
+            "last_seen_ts": int(state.get("last_seen_ts") or now_s),
+        },
+    }
+
+
+def _close_plausibility_event_state(
+    last_valid_path,
+    state,
+    *,
+    event_kind,
+    now_s,
+    maintain=True,
+    log_path=None,
+    current_frame=None,
+):
+    if not isinstance(state, dict):
+        return None
+    target_path = log_path or state.get("log_path")
+    if not target_path:
+        return None
+    event = _build_plausibility_state_event(
+        state,
+        event_kind=event_kind,
+        now_s=now_s,
+        current_frame=(
+            current_frame
+            if isinstance(current_frame, dict)
+            else state.get("last_frame")
+        ),
+        previous_valid=_previous_valid_plausibility_frame(last_valid_path),
+    )
+    _append_plausibility_event(target_path, event, maintain=maintain)
+    state["last_persist_ts"] = now_s
+    state["pending_first_ts"] = 0.0
+    state["pending_sample_count"] = 0
+    state["pending_last_ts"] = 0.0
+    state["pending_max_gap_s"] = 0.0
+    return event
+
+
+def flush_live_plausibility_event_states(now_s=None):
+    """Schließt aktive Diagnosefenster bei einem sauberen Prozessende."""
+
+    now_s = time.time() if now_s is None else float(now_s)
+    closed = []
+    for last_valid_path, state in list(_LIVE_PLAUSIBILITY_EVENT_MEMORY.items()):
+        event = _close_plausibility_event_state(
+            last_valid_path,
+            state,
+            event_kind="shutdown_close",
+            now_s=now_s,
+        )
+        if event is not None:
+            closed.append(event)
+            _LIVE_PLAUSIBILITY_EVENT_MEMORY.pop(last_valid_path, None)
+    return closed
 
 
 def record_live_plausibility_state(
@@ -2236,39 +2716,132 @@ def record_live_plausibility_state(
     if frame.get("valid") and not reasons:
         _LIVE_LAST_VALID_MEMORY[last_valid_path] = frame
         last_write_ts = float(_LIVE_LAST_VALID_WRITE_TS.get(last_valid_path, 0.0) or 0.0)
+        last_valid_action = "last_valid_cached"
         if last_write_ts <= 0.0 or now_s - last_write_ts >= LIVE_LAST_VALID_HEARTBEAT_S:
             _atomic_write_json(last_valid_path, frame)
             _LIVE_LAST_VALID_WRITE_TS[last_valid_path] = now_s
-            return {"action": "last_valid_updated", "frame": frame}
-        return {"action": "last_valid_cached", "frame": frame}
+            last_valid_action = "last_valid_updated"
+
+        previous_state = _LIVE_PLAUSIBILITY_EVENT_MEMORY.get(
+            last_valid_path,
+        )
+        if isinstance(previous_state, dict):
+            recovery_path = log_path or _daily_plausibility_log_path(now_s)
+            event = _build_plausibility_state_event(
+                previous_state,
+                event_kind="recovered",
+                now_s=now_s,
+                current_frame=frame,
+                previous_valid=frame,
+            )
+            _append_plausibility_event(recovery_path, event)
+            _LIVE_PLAUSIBILITY_EVENT_MEMORY.pop(last_valid_path, None)
+            return {
+                "action": "plausibility_recovery_recorded",
+                "path": recovery_path,
+                "event": event,
+            }
+        return {"action": last_valid_action, "frame": frame}
 
     if not reasons:
         return None
     log_path = log_path or _daily_plausibility_log_path(now_s)
-    previous_valid = _LIVE_LAST_VALID_MEMORY.get(last_valid_path)
-    if not isinstance(previous_valid, dict):
-        previous_valid = _read_json_file(last_valid_path)
-    event = {
-        "ts": int(now_s),
-        "iso_ts": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now_s)),
-        "schema_version": "live_plausibility_glitch_v1",
-        "current": frame,
-        "previous_valid": previous_valid if isinstance(previous_valid, dict) else None,
-    }
-    os.makedirs(os.path.dirname(log_path), exist_ok=True)
-    with open(log_path, "a", encoding="utf-8") as handle:
-        handle.write(json.dumps(sanitize_for_json(event), ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n")
-    try:
-        os.chmod(log_path, 0o664)
-    except Exception:
-        pass
-    try:
-        if os.path.getsize(log_path) > LIVE_PLAUSIBILITY_LOG_MAX_BYTES:
-            _trim_jsonl_tail(log_path)
-    except Exception:
-        pass
+    signature = _plausibility_event_signature(frame)
+    state = _LIVE_PLAUSIBILITY_EVENT_MEMORY.get(last_valid_path)
+    changed = (
+        not isinstance(state, dict)
+        or state.get("signature") != signature
+        or state.get("log_path") != log_path
+    )
+    previous_close = None
+    if changed:
+        if isinstance(state, dict):
+            old_log_path = state.get("log_path")
+            previous_close = _close_plausibility_event_state(
+                last_valid_path,
+                state,
+                event_kind="transition_end",
+                now_s=now_s,
+                # Beim Tageswechsel muss zuerst der alte Zustand geschlossen
+                # werden. Die anschließende Transition in den neuen Tagespfad
+                # übernimmt dann Kompression und Retention.
+                maintain=old_log_path == log_path,
+            )
+        state = _new_plausibility_event_state(
+            signature,
+            log_path,
+            now_s,
+            frame,
+        )
+        _LIVE_PLAUSIBILITY_EVENT_MEMORY[last_valid_path] = state
+        event_kind = "transition"
+    else:
+        previous_last_seen_ts = float(state.get("last_seen_ts") or now_s)
+        state["last_seen_ts"] = now_s
+        state["last_frame"] = frame
+        state["total_sample_count"] = (
+            int(state.get("total_sample_count") or 0) + 1
+        )
+        pending_before = int(state.get("pending_sample_count") or 0)
+        if pending_before <= 0:
+            state["pending_first_ts"] = now_s
+            state["pending_max_gap_s"] = 0.0
+        else:
+            pending_last_ts = float(
+                state.get("pending_last_ts")
+                or previous_last_seen_ts
+            )
+            state["pending_max_gap_s"] = max(
+                float(state.get("pending_max_gap_s") or 0.0),
+                max(0.0, now_s - pending_last_ts),
+            )
+        state["pending_last_ts"] = now_s
+        state["pending_sample_count"] = (
+            pending_before + 1
+        )
+        if (
+            float(state.get("last_persist_ts") or 0.0) > 0.0
+            and
+            now_s - float(state.get("last_persist_ts") or 0.0)
+            < LIVE_PLAUSIBILITY_LOG_HEARTBEAT_S
+        ):
+            action = (
+                "diagnostic_glitch_cached"
+                if frame.get("valid")
+                else "glitch_cached"
+            )
+            return {
+                "action": action,
+                "path": log_path,
+                "frame": frame,
+                "pending_sample_count": int(
+                    state.get("pending_sample_count") or 0
+                ),
+            }
+        event_kind = (
+            "heartbeat"
+            if float(state.get("last_persist_ts") or 0.0) > 0.0
+            else "transition"
+        )
+
+    event = _build_plausibility_state_event(
+        state,
+        event_kind=event_kind,
+        now_s=now_s,
+        current_frame=frame,
+        previous_valid=_previous_valid_plausibility_frame(last_valid_path),
+    )
+    _append_plausibility_event(log_path, event)
+    state["last_persist_ts"] = now_s
+    state["pending_first_ts"] = 0.0
+    state["pending_sample_count"] = 0
+    state["pending_last_ts"] = 0.0
+    state["pending_max_gap_s"] = 0.0
     action = "diagnostic_glitch_recorded" if frame.get("valid") else "glitch_recorded"
-    return {"action": action, "path": log_path, "event": event}
+    result = {"action": action, "path": log_path, "event": event}
+    if previous_close is not None:
+        result["previous_close"] = previous_close
+    return result
 
 # ---------------------------------------------------------------------------
 # Haupt-Schleife (Daemon + Einzel-Test)
@@ -2297,6 +2870,8 @@ def run_test(host, port, user, pw, aes_pw, cfg, loops=1, interval=3, write=False
     while True:
         run += 1
         if loops > 0 and run > loops:
+            flush_live_plausibility_event_states()
+            kwh_retter.flush()
             if persistent_session is not None:
                 persistent_session.close()
             break
@@ -2592,5 +3167,29 @@ if __name__ == "__main__":
             print(f"[!] Fix: sudo chown -R pi:www-data {_rdir} && sudo chmod -R 775 {_rdir}")
     print()
 
-    run_test(host, port, user, pw, aes_pw, cfg,
-             loops=args.loops, interval=args.interval, write=args.write)
+    def _request_clean_shutdown(_signum, _frame):
+        raise KeyboardInterrupt
+
+    previous_sigterm_handler = signal.signal(
+        signal.SIGTERM,
+        _request_clean_shutdown,
+    )
+    try:
+        run_test(
+            host,
+            port,
+            user,
+            pw,
+            aes_pw,
+            cfg,
+            loops=args.loops,
+            interval=args.interval,
+            write=args.write,
+        )
+    except KeyboardInterrupt:
+        print("\n[i] E3DC-Live-Dienst wird sauber beendet.")
+    finally:
+        try:
+            flush_live_plausibility_event_states()
+        finally:
+            signal.signal(signal.SIGTERM, previous_sigterm_handler)

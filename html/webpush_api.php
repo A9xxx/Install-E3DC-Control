@@ -4,7 +4,11 @@ header('Content-Type: application/json');
 require_once 'helpers.php';
 
 $action = $_GET['action'] ?? $_POST['action'] ?? '';
-requireWebAuth(true);
+if (in_array($action, ['get_vapid', 'subscribe', 'test_push'], true)) {
+    e3dcRequirePostMutation(true);
+} else {
+    requireWebAuth(true);
+}
 $paths = getInstallPaths();
 // $configFile entfernt: generate_vapid.py liest V4 JSON selbst
 

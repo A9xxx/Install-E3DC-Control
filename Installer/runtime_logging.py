@@ -58,7 +58,10 @@ def configure_service_logger(
         except OSError as exc:
             # Ein defektes Logverzeichnis darf keinen Regeldienst blockieren.
             file_error = exc
-    if stream:
+    # Ein ausdrücklich einzelnes Dateilog darf im Normalbetrieb keine zweite
+    # Journal-Senke öffnen. Scheitert aber bereits das Dateilog, bleibt stderr
+    # als klar sichtbarer, nicht stiller Notpfad erhalten.
+    if stream or not logger.handlers:
         stream_handler = logging.StreamHandler()
         stream_handler.setFormatter(formatter)
         logger.addHandler(stream_handler)

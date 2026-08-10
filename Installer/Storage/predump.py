@@ -1512,7 +1512,16 @@ def predump_wallbox_minimum_power_w(
     wb_intent: Dict[str, Any],
     wb_native: Optional[Dict[str, Any]],
 ) -> Dict[str, int]:
-    """Return the physical wallbox minimum, so Pre-Dump avoids unusable trickle budgets."""
+    """Ermittelt die Mindestleistung ohne Rückkopplung alter Phasenziele.
+
+    Eine stehende openWB Pro kann mit dem vom zentralen Verteiler gewählten
+    Phasenintent starten (normalerweise 1p). Ihr geräteseitiges
+    ``phases_target`` kann noch 3p aus einer früheren Sitzung enthalten und
+    ist deshalb kein gültiges Leerlaufminimum. Sobald physisches Laden
+    bestätigt ist, gelten gemessene beziehungsweise aktive Phasen. Ein
+    gebundener Phasenwechsel bleibt konservativ und reserviert mindestens das
+    zugesagte Zielminimum.
+    """
     wb_native = wb_native or {}
     min_amp = max(6, min(32, safe_int(cfg.get("wbminladestrom", cfg.get("wb_min_amp")), 6)))
 
@@ -1520,48 +1529,171 @@ def predump_wallbox_minimum_power_w(
         phases = safe_int(value, 0)
         return phases if phases in (1, 2, 3) else 0
 
-    fallback_phases = (
-        valid_phases(wb_intent.get("detected_phases"))
-        or valid_phases(wb_intent.get("phases_target"))
-        or valid_phases(wb_intent.get("phases_in_use"))
-        or valid_phases(wb_intent.get("phases_actual"))
-        or valid_phases(wb_native.get("detected_phases"))
-        or valid_phases(wb_native.get("phases_target"))
-        or valid_phases(wb_native.get("phases_in_use"))
-        or valid_phases(wb_native.get("phases_actual"))
-    )
-    if not fallback_phases:
-        fallback_phases = 1 if cfg_bool(cfg, "wb_phase_1p_allowed", True) else 3
+    def active_transition_phases() -> int:
+        if not bool(wb_intent.get("phase_transition_active")):
+            return 0
+        targets: List[int] = []
+        ambiguous_active_reservation = False
+        reservations = wb_intent.get("phase_transition_reservations")
+        for item in reservations if isinstance(reservations, list) else []:
+            if not isinstance(item, dict) or item.get("active") is not True:
+                continue
+            requested_w = safe_int(item.get("requested_w", item.get("reserved_w")), 0)
+            target = valid_phases(item.get("target_phases"))
+            if requested_w <= 0 or not target:
+                # Eine aktive Recovery-/Transition ohne gebundene Leistung
+                # beziehungsweise ohne eindeutiges Phasenziel ist kein
+                # belastbarer 1p-Startintent. Bis zur Auflösung reserviert der
+                # Pre-Dump deshalb konservativ das 3p-Minimum.
+                ambiguous_active_reservation = True
+                continue
+            targets.append(target)
+        if ambiguous_active_reservation:
+            return 3
+        if targets:
+            return max(targets)
+        if safe_int(wb_intent.get("phase_transition_reserved_w"), 0) > 0:
+            target = valid_phases(wb_intent.get("phase_transition_target_phases"))
+            return target or 3
+        # Auch ein aktiver Legacy-/Recovery-Vertrag mit requested_w=0 bleibt
+        # mehrdeutig. Ein Rückfall auf den normalen 1p-Leerlaufwert würde die
+        # physikalisch mögliche 3p-Wiederaufnahme unterreservieren.
+        return 3
 
-    best_phases = fallback_phases
+    def start_hold_phases(wb_id: int = 0) -> int:
+        requests = wb_intent.get("start_hold_requests")
+        phases: List[int] = []
+        for item in requests if isinstance(requests, list) else []:
+            if not isinstance(item, dict):
+                continue
+            item_wb_id = safe_int(item.get("wb_id"), 0)
+            if wb_id > 0 and item_wb_id > 0 and item_wb_id != wb_id:
+                continue
+            if not (
+                item.get("active") is True
+                and item.get("connected") is True
+                and item.get("status_fresh") is True
+                and item.get("enabled") is True
+                and not item.get("blocked")
+            ):
+                continue
+            target = valid_phases(item.get("target_phases"))
+            if target:
+                phases.append(target)
+        return max(phases, default=0)
+
+    def detail_real_power_w(detail: Dict[str, Any]) -> float:
+        return max(
+            abs(safe_float(detail.get("power_w"), 0.0)),
+            abs(safe_float(detail.get("phase_power_sum_w"), 0.0)),
+            abs(safe_float(detail.get("meter_power_w"), 0.0)),
+            abs(safe_float(detail.get("charge_power_w"), 0.0)),
+        )
+
+    def detail_is_openwb_pro(detail: Dict[str, Any]) -> bool:
+        driver_variant = str(detail.get("driver_variant") or "").strip().lower()
+        session_contract = detail.get("openwb_pro_contract")
+        decision_payload = (
+            detail.get("decision_payload")
+            if isinstance(detail.get("decision_payload"), dict)
+            else {}
+        )
+        decision_driver = (
+            decision_payload.get("driver")
+            if isinstance(decision_payload.get("driver"), dict)
+            else {}
+        )
+        return bool(
+            "openwb_pro" in driver_variant
+            or isinstance(session_contract, dict)
+            or "openwb_pro" in str(session_contract or "").strip().lower()
+            or str(detail.get("openwb_pro_runtime_path") or "").strip()
+            or decision_driver.get("openwb_pro") is True
+            or "openwb_pro" in str(detail.get("phase_switch_source") or "").strip().lower()
+            or "openwb_pro" in str(detail.get("api_surface") or "").strip().lower()
+        )
+
+    transition_phases = active_transition_phases()
+    canonical_start_phases = (
+        start_hold_phases()
+        or valid_phases(wb_intent.get("detected_phases"))
+        or valid_phases(wb_native.get("detected_phases"))
+    )
+    if not canonical_start_phases:
+        canonical_start_phases = 1 if cfg_bool(cfg, "wb_phase_1p_allowed", True) else 3
+
+    best_phases = transition_phases or canonical_start_phases
     best_amp = min_amp
+    active_detail_seen = False
     details = wb_native.get("wb_details") or []
     if isinstance(details, list):
         for detail in details:
             if not isinstance(detail, dict):
                 continue
+            real_power_w = detail_real_power_w(detail)
+            real_charging = bool(detail.get("charging") or real_power_w > 250.0)
             active = bool(
                 detail.get("plug")
-                or detail.get("charging")
+                or detail.get("connected")
+                or real_charging
                 or safe_int(detail.get("amp"), 0) > 0
                 or safe_int(detail.get("current_set_amp"), 0) > 0
-                or abs(safe_float(detail.get("power_w"), 0.0)) > 250.0
             )
             if not active:
                 continue
-            detail_phases = (
-                valid_phases(detail.get("phases_target"))
-                or valid_phases(detail.get("phases_in_use"))
+            observed_phases = (
+                valid_phases(detail.get("phases_in_use"))
+                or valid_phases(detail.get("phase_actual_phases"))
                 or valid_phases(detail.get("phases_actual"))
-                or fallback_phases
+                or valid_phases(
+                    (detail.get("phase_contract") or {}).get("actual_phases")
+                    if isinstance(detail.get("phase_contract"), dict)
+                    else 0
+                )
             )
+            if real_charging:
+                # Eine laufende Wallbox wird aus physischer Phasenevidenz
+                # bepreist. Bei 1->3 ist das zugesagte 3p-Ziel bis zum neuen
+                # Rücklesewert die konservative Untergrenze.
+                detail_phases = max(observed_phases, transition_phases)
+                if not detail_phases:
+                    detail_phases = (
+                        valid_phases(detail.get("phases_target"))
+                        or canonical_start_phases
+                    )
+            elif transition_phases:
+                detail_phases = transition_phases
+            elif detail_is_openwb_pro(detail):
+                # Das rohe beziehungsweise alte phases_target einer stehenden
+                # Pro darf nicht in den Speicherpfad zurückwirken. Der
+                # sitzungsgebundene Startauftrag oder die Phasenerkennung des
+                # Verteilers besitzt das Startminimum.
+                detail_phases = (
+                    start_hold_phases(safe_int(detail.get("id", detail.get("wb_id")), 0))
+                    or canonical_start_phases
+                )
+            else:
+                # Nicht umschaltbare beziehungsweise native Wallboxen behalten
+                # ihre explizite Leerlaufanforderung; eine stille 1p-Annahme
+                # würde zu wenig Leistung reservieren.
+                detail_phases = (
+                    observed_phases
+                    or valid_phases(detail.get("phases_target"))
+                    or valid_phases(detail.get("phase_wallbox_phases"))
+                    or canonical_start_phases
+                )
             detail_min_amp = max(
                 min_amp,
                 safe_int(detail.get("min_amp", detail.get("min_current", min_amp)), min_amp),
             )
-            if detail_min_amp * detail_phases > best_amp * best_phases:
-                best_amp = max(6, min(32, detail_min_amp))
+            detail_min_amp = max(6, min(32, detail_min_amp))
+            if (
+                not active_detail_seen
+                or detail_min_amp * detail_phases > best_amp * best_phases
+            ):
+                best_amp = detail_min_amp
                 best_phases = detail_phases
+            active_detail_seen = True
 
     return {
         "power_w": int(best_amp * 230 * max(1, best_phases)),
@@ -1690,7 +1822,11 @@ def predump_consumer_status(
                 break
         if wb_mode != MODE_OFF and (intent_connected or native_connected):
             devices.append("wallbox")
-            wallbox_minimum = predump_wallbox_minimum_power_w(cfg, wb_intent, wb_native)
+            wallbox_minimum = predump_wallbox_minimum_power_w(
+                cfg,
+                wb_intent if intent_fresh else {},
+                wb_native,
+            )
 
     # Heatpump/heater managers read predump_consumer_plan.json and can start
     # from an allow signal. If they fail to take load, the wait timer falls back

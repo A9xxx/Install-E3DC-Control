@@ -351,13 +351,9 @@ def _sanitize_native_wb_power(state_dict):
             connected_any = connected_any or bool(detail.get("plug", False))
             charging = bool(detail.get("charging", False))
             power_w = abs(float(detail.get("power_w", 0.0) or 0.0))
-            if bool(detail.get("manager_stop_pending", False)):
-                detail["power_w"] = 0
-                detail["charging"] = False
-                detail["charge_power_w"] = 0
-                charging = False
-                power_w = 0.0
-                continue
+            # Ein gesendeter Stop ist noch kein physischer Stillstand. Bis ein
+            # frischer Readback 0 W bestätigt, bleibt die gemessene Last Teil
+            # des Wallbox- und damit auch des Speicherbudgets.
             phase_data_present = any(k in detail for k in (
                 "phase_power_l1_w",
                 "phase_power_l2_w",

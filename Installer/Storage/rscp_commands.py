@@ -41,11 +41,12 @@ except ModuleNotFoundError:
 
 ACTIVE_REFRESH_MODES = {MODE_DISCH, MODE_CHRG, MODE_GRID}
 ACTIVE_RELEASE_MODES = {MODE_IDLE, MODE_DISCH, MODE_CHRG, MODE_GRID}
-RSCP_COMMAND_CONTRACT_VERSION = 2
+RSCP_COMMAND_CONTRACT_VERSION = 3
 RSCP_POWER_SETTINGS_CONTRACT_VERSION = 2
 RSCP_POWER_SETTINGS_RETRY_S = 10.0
 RSCP_POWER_SETTINGS_READBACK_GRACE_S = 10.0
 RSCP_POWER_SETTINGS_TOLERANCE_W = 50
+RSCP_SEND_RECEIPT_CONTRACT_VERSION = 1
 
 log = logging.getLogger("StorageManager")
 
@@ -91,6 +92,8 @@ class BattCtrl:
         self._settings_set_requests = 0
         self._settings_get_requests = 0
         self._settings_suppressed = 0
+        self._last_power_settings_wire_receipt: Dict[str, Any] = {}
+        self._last_set_power_receipt: Dict[str, Any] = {}
         self._power_settings_diag: Dict[str, Any] = {
             "schema": "rscp_power_settings_v1",
             "contract_version": RSCP_POWER_SETTINGS_CONTRACT_VERSION,
@@ -283,6 +286,16 @@ class BattCtrl:
             "max_discharge_w": discharge_w,
             "discharge_start_w": discharge_start_w,
         }
+        self._last_power_settings_wire_receipt = {
+            "kind": "power_settings",
+            "target": dict(requested),
+            "attempted": True,
+            "issued": False,
+            "acknowledged": None,
+            "confirmed": False,
+            "retained": False,
+            "reason": "request_started",
+        }
         self._settings_set_requests += 1
         response = self._c.request([{
             "tag": RscpTag.EMS_REQ_SET_POWER_SETTINGS,
@@ -294,7 +307,18 @@ class BattCtrl:
                 limits_used,
             ),
         }])
+        self._last_power_settings_wire_receipt.update({
+            "issued": True,
+            "response_returned": True,
+            "issued_at": time.time(),
+            "reason": "request_returned",
+        })
         response_codes = self._power_settings_response_codes(response)
+        self._last_power_settings_wire_receipt["acknowledged"] = (
+            True
+            if isinstance(response_codes, list) and len(response_codes) >= 4
+            else None
+        )
         if response_codes is None or len(response_codes) < 4:
             # Manche E3DC-Generationen übernehmen eine sichere Begrenzung,
             # liefern aber keine für diesen Vertrag auswertbare SET-Antwort.
@@ -327,6 +351,10 @@ class BattCtrl:
                     "bounded_zero_w": max(0, int(bounded_zero_w)),
                     "ts": int(time.time()),
                 }
+                self._last_power_settings_wire_receipt.update({
+                    "confirmed": True,
+                    "reason": "confirmed_from_get_ack_unknown",
+                })
                 return True
             self._power_settings_diag = {
                 "schema": "rscp_power_settings_v1",
@@ -415,6 +443,10 @@ class BattCtrl:
             "bounded_zero_equivalent": bounded_zero_equivalent,
             "ts": int(time.time()),
         }
+        self._last_power_settings_wire_receipt.update({
+            "confirmed": True,
+            "reason": self._power_settings_diag["status"],
+        })
         return True
 
     def power_settings_diagnostics(self) -> Dict[str, Any]:
@@ -514,16 +546,19 @@ class BattCtrl:
             return False
         reconcile_time_s = time.time()
         raw_readback_cycle_ts = snapshot.get("_ts")
-        readback_cycle_ts = (
-            float(raw_readback_cycle_ts)
-            if (
-                isinstance(raw_readback_cycle_ts, (int, float))
-                and not isinstance(raw_readback_cycle_ts, bool)
-                and math.isfinite(float(raw_readback_cycle_ts))
-                and float(raw_readback_cycle_ts) > 0.0
-            )
-            else reconcile_time_s
-        )
+        if (
+            not isinstance(raw_readback_cycle_ts, (int, float))
+            or isinstance(raw_readback_cycle_ts, bool)
+            or not math.isfinite(float(raw_readback_cycle_ts))
+            or float(raw_readback_cycle_ts) <= 0.0
+        ):
+            return False
+        readback_cycle_ts = float(raw_readback_cycle_ts)
+        if readback_cycle_ts > 100_000_000_000.0:
+            readback_cycle_ts /= 1000.0
+        readback_age_s = reconcile_time_s - readback_cycle_ts
+        if not math.isfinite(readback_age_s) or not 0.0 <= readback_age_s <= 5.0:
+            return False
         readback = {
             "limits_used": limits_used,
             "max_charge_w": int(charge_w),
@@ -782,20 +817,48 @@ class BattCtrl:
             self.close()
             return False
 
-    def set_max_charge_power(self, val: int, force: bool = False) -> None:
+    def set_max_charge_power(self, val: int, force: bool = False) -> Dict[str, Any]:
         val = int(val)
+        receipt: Dict[str, Any] = {
+            "kind": "max_charge_power",
+            "target_w": val,
+            "attempted": False,
+            "issued": False,
+            "acknowledged": None,
+            "confirmed": False,
+            "retained": False,
+            "reason": "not_attempted",
+        }
         if not self._c and not self._conn():
-            return
-        if not force and abs(val - self._charge_cap) < 50:
-            return
+            receipt["reason"] = "connection_failed"
+            return receipt
+        if not force and self._charge_cap >= 0 and abs(val - self._charge_cap) < 50:
+            receipt.update({
+                "retained": True,
+                "reason": "same_target_cache_only",
+            })
+            return receipt
         actual = max(50, val) if 0 < val < 200 else val
+        receipt.update({
+            "attempted": True,
+            "actual_target_w": actual,
+            "reason": "request_started",
+        })
         try:
             self._c.request([{"tag": RscpTag.EMS_REQ_SET_MAX_CHARGE_POWER, "type": RscpType.Int32, "value": actual}])
             self._charge_cap = val
+            receipt.update({
+                "issued": True,
+                "response_returned": True,
+                "issued_at": time.time(),
+                "reason": "request_returned_ack_unknown",
+            })
             log.info("RSCP MAX_CHARGE_POWER: %dW (Echt: %dW)", val, actual)
         except Exception as exc:
             log.error("RSCP set_max_charge: %s", exc)
             self._c = None
+            receipt["reason"] = "request_failed"
+        return receipt
 
     def set_max_discharge_power(self, val: int, force: bool = False) -> None:
         val = int(val)
@@ -811,26 +874,90 @@ class BattCtrl:
             log.error("RSCP set_max_discharge: %s", exc)
             self._c = None
 
-    def set_power_auto(self, value_w: int = 0, force: bool = False, reason: str = "") -> bool:
+    def _send_set_power_receipt(
+        self,
+        mode: int,
+        value_w: int,
+        *,
+        force: bool,
+        reason: str = "",
+    ) -> Dict[str, Any]:
+        mode = int(mode)
         value_w = max(0, int(value_w or 0))
-        if not force and self._mode == MODE_AUTO and abs(value_w - self._val) < 50:
-            return True
+        same_command = mode == self._mode and abs(value_w - self._val) < 50
+        previous = (
+            dict(self._last_set_power_receipt)
+            if (
+                self._last_set_power_receipt.get("issued") is True
+                and safe_int(self._last_set_power_receipt.get("mode"), -1) == mode
+                and abs(safe_int(self._last_set_power_receipt.get("value_w"), -1) - value_w) < 50
+            )
+            else {}
+        )
+        receipt: Dict[str, Any] = {
+            "kind": "set_power",
+            "mode": mode,
+            "mode_name": mode_label(mode),
+            "value_w": value_w,
+            "attempted": False,
+            "issued": False,
+            "acknowledged": None,
+            "confirmed": False,
+            "retained": False,
+            "prior_same_target_issued_at": previous.get("issued_at"),
+            "reason": "not_attempted",
+        }
+        if not force and same_command:
+            receipt.update({
+                "retained": bool(previous),
+                "reason": (
+                    "same_command_retained"
+                    if previous
+                    else "same_command_cache_without_receipt"
+                ),
+            })
+            return receipt
         if not self._c and not self._conn():
-            return False
+            receipt["reason"] = "connection_failed"
+            return receipt
+        receipt.update({
+            "attempted": True,
+            "reason": "request_started",
+        })
         try:
             self._c.request([{"tag": RscpTag.EMS_REQ_SET_POWER, "type": RscpType.Container, "value": [
-                {"tag": RscpTag.EMS_REQ_SET_POWER_MODE, "type": RscpType.UChar8, "value": MODE_AUTO},
+                {"tag": RscpTag.EMS_REQ_SET_POWER_MODE, "type": RscpType.UChar8, "value": mode},
                 {"tag": RscpTag.EMS_REQ_SET_POWER_VALUE, "type": RscpType.Int32, "value": value_w},
             ]}])
-            self._mode = MODE_AUTO
+            issued_at = time.time()
+            self._mode = mode
             self._val = value_w
+            receipt.update({
+                "issued": True,
+                "response_returned": True,
+                "issued_at": issued_at,
+                "reason": "request_returned_ack_unknown",
+            })
+            self._last_set_power_receipt = dict(receipt)
             suffix = f" ({reason})" if reason else ""
-            log.info("RSCP SET: AUTO(%d) %dW%s", MODE_AUTO, value_w, suffix)
-            return True
+            if same_command and force:
+                log.debug("RSCP REFRESH: %s(%d) %dW%s", mode_label(mode), mode, value_w, suffix)
+            else:
+                log.info("RSCP SET: %s(%d) %dW%s", mode_label(mode), mode, value_w, suffix)
         except Exception as exc:
-            log.error("RSCP release auto: %s", exc)
+            log.error("RSCP send: %s", exc)
             self._c = None
-            return False
+            receipt["reason"] = "request_failed"
+        return receipt
+
+    def set_power_auto(self, value_w: int = 0, force: bool = False, reason: str = "") -> bool:
+        receipt = self._send_set_power_receipt(
+            MODE_AUTO,
+            value_w,
+            force=force,
+            reason=reason,
+        )
+        return bool(receipt.get("issued") or receipt.get("retained"))
 
     def send(
         self,
@@ -839,7 +966,7 @@ class BattCtrl:
         force: bool = False,
         discharge_cap_w: Optional[int] = None,
         auto_limit: Optional[Dict[str, Any]] = None,
-    ) -> None:
+    ) -> Dict[str, Any]:
         mode = int(mode)
         val = max(0, int(val))
         def _auto_limit_int(key: str, default: int) -> int:
@@ -856,6 +983,55 @@ class BattCtrl:
             auto_discharge_cap_w=self._auto_discharge_cap,
         )
 
+        receipt: Dict[str, Any] = {
+            "schema": "rscp_send_receipt_v1",
+            "contract_version": RSCP_SEND_RECEIPT_CONTRACT_VERSION,
+            "path": command_contract.get("path"),
+            "target": {"mode": mode, "value_w": val},
+            "attempted": False,
+            "issued": False,
+            "acknowledged": None,
+            "confirmed": False,
+            "retained": False,
+            "partial": False,
+            "output_complete": False,
+            "substeps": {},
+            "reason": "not_attempted",
+        }
+
+        def _record_primary(step: Dict[str, Any]) -> None:
+            receipt["attempted"] = bool(step.get("attempted"))
+            receipt["issued"] = bool(step.get("issued"))
+            receipt["acknowledged"] = step.get("acknowledged")
+            receipt["confirmed"] = bool(step.get("confirmed"))
+            receipt["retained"] = bool(step.get("retained"))
+            receipt["reason"] = step.get("reason") or "not_attempted"
+
+        def _power_settings_step(confirmed: bool) -> Dict[str, Any]:
+            diag = self.power_settings_diagnostics()
+            wire = dict(self._last_power_settings_wire_receipt)
+            attempted = bool(wire.get("attempted"))
+            step = {
+                "kind": "power_settings",
+                "target": dict(diag.get("requested") or wire.get("target") or {}),
+                "attempted": attempted,
+                "issued": bool(wire.get("issued")) if attempted else False,
+                "acknowledged": wire.get("acknowledged") if attempted else None,
+                "confirmed": bool(confirmed and diag.get("confirmed") is True),
+                "retained": bool(not attempted and confirmed and diag.get("confirmed") is True),
+                "status": diag.get("status"),
+                "reason": (
+                    str(diag.get("status") or "confirmed")
+                    if confirmed
+                    else str(diag.get("status") or wire.get("reason") or "unconfirmed")
+                ),
+            }
+            if wire.get("issued_at") is not None:
+                step["issued_at"] = wire.get("issued_at")
+            return step
+
+        self._last_power_settings_wire_receipt = {}
+
         if command_contract.get("auto_limit_release"):
             auto_discharge_cap = max(
                 300,
@@ -866,27 +1042,33 @@ class BattCtrl:
                 _auto_limit_int("max_charge_w", int(auto_discharge_cap or val or 0)),
                 auto_discharge_cap,
             )
-            if not self.set_power_limit_settings(
+            confirmed = self.set_power_limit_settings(
                 auto_charge_cap,
                 auto_discharge_cap,
                 _auto_limit_int("discharge_start_w", 0),
                 limits_used=False,
                 force=False,
-            ):
-                return
+            )
+            step = _power_settings_step(confirmed)
+            receipt["substeps"]["power_settings"] = step
+            _record_primary(step)
+            if not confirmed:
+                receipt["partial"] = bool(step.get("attempted") or step.get("issued"))
+                return receipt
             # AUTO-Freilauf entsteht bei E3DC durch das Ende aktiver
             # SET_POWER-Refreshes. AUTO mit 0 W wäre dagegen ein echter
             # Nullleistungsbefehl und würde Laden sowie Entladen sperren.
             self._mode = MODE_AUTO
             self._val = auto_discharge_cap
-            return
+            receipt["output_complete"] = True
+            return receipt
         elif command_contract.get("auto_limit_enabled"):
             auto_discharge_cap = max(0, _auto_limit_int(
                 "max_discharge_w",
                 int(discharge_cap_w or self._auto_discharge_cap or 0),
             ))
             auto_charge_cap = max(0, _auto_limit_int("max_charge_w", 0))
-            if not self.set_power_limit_settings(
+            confirmed = self.set_power_limit_settings(
                 auto_charge_cap,
                 auto_discharge_cap,
                 _auto_limit_int("discharge_start_w", 0),
@@ -895,57 +1077,85 @@ class BattCtrl:
                 bounded_zero_w=(
                     EMS_POWER_SETTINGS_NONZERO_MIN_W if auto_charge_cap == 0 else 0
                 ),
-            ):
-                return
+            )
+            step = _power_settings_step(confirmed)
+            receipt["substeps"]["power_settings"] = step
+            _record_primary(step)
+            if not confirmed:
+                receipt["partial"] = bool(step.get("attempted") or step.get("issued"))
+                return receipt
             should_set_power_auto = bool(command_contract.get("set_power_auto"))
             if should_set_power_auto:
-                if not self.set_power_auto(0, force=True, reason="aktive Vorgabe vor EMS-Grenze gestoppt"):
-                    return
+                transition = self._send_set_power_receipt(
+                    MODE_AUTO,
+                    0,
+                    force=True,
+                    reason="aktive Vorgabe vor EMS-Grenze gestoppt",
+                )
+                receipt["substeps"]["set_power_auto"] = transition
+                receipt["attempted"] = bool(receipt["attempted"] or transition.get("attempted"))
+                if not bool(transition.get("issued") or transition.get("retained")):
+                    receipt["partial"] = True
+                    receipt["reason"] = "power_settings_confirmed_auto_transition_failed"
+                    return receipt
             self._mode = MODE_AUTO
             self._val = max(300, int(discharge_cap_w or self._auto_discharge_cap or val or auto_charge_cap or 0))
-            return
+            receipt["output_complete"] = True
+            return receipt
         elif mode == MODE_AUTO:
             auto_discharge_cap = max(
                 300,
                 int(discharge_cap_w or self._auto_discharge_cap or val or 0),
             )
             auto_charge_cap = max(300, int(val or 0), auto_discharge_cap)
-            if not self.set_power_limit_settings(
+            confirmed = self.set_power_limit_settings(
                 auto_charge_cap,
                 auto_discharge_cap,
                 0,
                 limits_used=False,
                 force=False,
-            ):
-                return
+            )
+            step = _power_settings_step(confirmed)
+            receipt["substeps"]["power_settings"] = step
+            _record_primary(step)
+            if not confirmed:
+                receipt["partial"] = bool(step.get("attempted") or step.get("issued"))
+                return receipt
             self._mode = MODE_AUTO
             self._val = auto_discharge_cap
-            return
+            receipt["output_complete"] = True
+            return receipt
         elif mode == MODE_DISCH:
-            self.set_max_charge_power(0)
+            receipt["substeps"]["max_charge_power"] = self.set_max_charge_power(0)
         elif mode in (MODE_CHRG, MODE_GRID):
-            self.set_max_charge_power(val)
-        if not self._c and not self._conn():
-            return
-        same_command = mode == self._mode and abs(val - self._val) < 50
-        if not force and same_command:
-            return
-        try:
-            self._c.request([{"tag": RscpTag.EMS_REQ_SET_POWER, "type": RscpType.Container, "value": [
-                {"tag": RscpTag.EMS_REQ_SET_POWER_MODE, "type": RscpType.UChar8, "value": mode},
-                {"tag": RscpTag.EMS_REQ_SET_POWER_VALUE, "type": RscpType.Int32, "value": val},
-            ]}])
-            self._mode = mode
-            self._val = val
-            if same_command and force:
-                log.debug("RSCP REFRESH: %s(%d) %dW", mode_label(mode), mode, val)
-            else:
-                log.info("RSCP SET: %s(%d) %dW", mode_label(mode), mode, val)
-        except Exception as exc:
-            log.error("RSCP send: %s", exc)
-            self._c = None
+            receipt["substeps"]["max_charge_power"] = self.set_max_charge_power(val)
+        set_power = self._send_set_power_receipt(mode, val, force=force)
+        receipt["substeps"]["set_power"] = set_power
+        _record_primary(set_power)
+        auxiliary = receipt["substeps"].get("max_charge_power")
+        auxiliary_progress = bool(
+            isinstance(auxiliary, dict)
+            and (auxiliary.get("attempted") or auxiliary.get("issued") or auxiliary.get("retained"))
+        )
+        auxiliary_complete = bool(
+            not isinstance(auxiliary, dict)
+            or auxiliary.get("issued")
+            or auxiliary.get("retained")
+        )
+        receipt["output_complete"] = bool(
+            (set_power.get("issued") or set_power.get("retained"))
+            and auxiliary_complete
+        )
+        receipt["attempted"] = bool(receipt["attempted"] or (auxiliary or {}).get("attempted"))
+        receipt["partial"] = bool(
+            not receipt["output_complete"]
+            and (receipt["attempted"] or receipt["issued"] or auxiliary_progress)
+        )
+        return receipt
 
-    def release(self) -> None:
+    def release_power_limits_explicit(self) -> None:
+        """Gibt POWER_SETTINGS ausdrücklich frei; kein Prozess-Cleanup."""
+
         self.send(
             MODE_AUTO,
             self._auto_discharge_cap,
@@ -960,6 +1170,17 @@ class BattCtrl:
                 "discharge_start_w": 0,
             },
         )
+
+    def close_for_handover(self) -> None:
+        """Schließt nur die RSCP-Sitzung und lässt flüchtige Limits unangetastet.
+
+        ``rscp_client.py`` definiert die verwendeten GET-/SET-Tags, aber keine
+        Haltedauer über Geräte- oder Hostneustarts. Deshalb wird hier weder
+        AUTO noch ``POWER_LIMITS_USED=false`` geschrieben. Der Nachfolger muss
+        den kanonischen GET-Readback vor seinem ersten Schreibintent bestätigen.
+        """
+
+        self.close()
 
     def close(self) -> None:
         if self._c:
@@ -986,10 +1207,17 @@ def rscp_command_contract(
     auto = auto_limit if isinstance(auto_limit, dict) else {}
     auto_release = bool(auto.get("release"))
     limit_refresh = bool(auto.get("enabled"))
-    auto_enabled = limit_refresh and not auto_release
     release_active_mode = current_mode_i in ACTIVE_RELEASE_MODES
     active_refresh = mode_i in ACTIVE_REFRESH_MODES
+    auto_enabled = limit_refresh and not auto_release and not active_refresh
     set_power_auto_requested = bool(auto.get("set_power_auto"))
+    set_power_execution_owner = str(
+        auto.get("set_power_execution_owner") or ""
+    ).strip()
+    external_owner_suppression = bool(
+        auto.get("suppress_set_power_auto")
+        and set_power_execution_owner == "external_e3dc_luox"
+    )
     should_set_power_auto = False
     set_power_auto_suppressed = False
     release_strategy = "none"
@@ -1002,10 +1230,16 @@ def rscp_command_contract(
         path = "auto_limit_enabled"
         # Eine aktive DISCH/CHRG/GRID-Vorgabe muss vor einer schützenden
         # EMS-Grenze gezielt auf 0 W gestoppt werden. Das ist kein AUTO-Freilauf.
-        should_set_power_auto = bool(
-            release_active_mode
-            or (set_power_auto_requested and current_mode_i != MODE_AUTO)
-        )
+        if external_owner_suppression:
+            release_strategy = "stop_set_power_refresh_external_owner"
+            set_power_auto_suppressed = bool(
+                release_active_mode or set_power_auto_requested
+            )
+        else:
+            should_set_power_auto = bool(
+                release_active_mode
+                or (set_power_auto_requested and current_mode_i != MODE_AUTO)
+            )
     elif mode_i == MODE_AUTO:
         path = "auto_release"
         release_strategy = "stop_set_power_refresh"
@@ -1027,6 +1261,8 @@ def rscp_command_contract(
         "set_power_auto_requested": set_power_auto_requested,
         "set_power_auto": should_set_power_auto,
         "set_power_auto_suppressed": set_power_auto_suppressed,
+        "set_power_execution_owner": set_power_execution_owner or None,
+        "external_owner_suppression": external_owner_suppression,
         "force_recommended": bool(active_refresh or limit_refresh),
         "discharge_cap_w": max(0, safe_int(discharge_cap_w, 0)) if discharge_cap_w is not None else None,
         "auto_discharge_cap_w": max(0, safe_int(auto_discharge_cap_w, 0)),

@@ -13,7 +13,9 @@ sind.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import math
 import os
 import signal
 import ssl
@@ -22,7 +24,9 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -35,6 +39,8 @@ TOSHIBA_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
+TOSHIBA_FALLBACK_BACKOFF_S = (300, 600, 1200, 2400, 3600)
+TOSHIBA_MAX_RETRY_AFTER_S = 7 * 24 * 3600
 
 RUNNING = True
 
@@ -212,6 +218,137 @@ def current_schedule(cfg: dict[str, Any], now_ts: float | None = None) -> dict[s
     }
 
 
+class ToshibaHttpError(RuntimeError):
+    def __init__(self, status: int, path: str, retry_after_s: int | None = None):
+        self.status = int(status)
+        self.path = str(path)
+        self.retry_after_s = retry_after_s
+        super().__init__(f"HTTP {self.status} bei {self.path}")
+
+
+def _parse_retry_after_seconds(value: Any, now_ts: float | None = None) -> int | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    if raw.isdigit():
+        return min(TOSHIBA_MAX_RETRY_AFTER_S, max(1, int(raw)))
+    try:
+        retry_at = parsedate_to_datetime(raw)
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        now = float(now_ts if now_ts is not None else time.time())
+        return min(TOSHIBA_MAX_RETRY_AFTER_S, max(1, int(math.ceil(retry_at.timestamp() - now))))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+@dataclass
+class ToshibaCloudSession:
+    access_token: str = field(default="", repr=False)
+    token_type: str = field(default="", repr=False)
+    consumer_id: str = field(default="", repr=False)
+    account_signature: str = field(default="", repr=False)
+    rate_limit_until_ts: float = 0.0
+    rate_limit_started_ts: float = 0.0
+    rate_limit_failures: int = 0
+    rate_limit_backoff_s: int = 0
+    rate_limit_http_status: int | None = None
+
+    def clear_auth(self) -> None:
+        self.access_token = ""
+        self.token_type = ""
+        self.consumer_id = ""
+        self.account_signature = ""
+
+    def has_auth(self, account_signature: str) -> bool:
+        return bool(
+            self.account_signature == account_signature
+            and self.access_token
+            and self.token_type
+            and self.consumer_id
+        )
+
+    def set_auth(self, login: dict[str, Any], account_signature: str) -> None:
+        access_token = str(login.get("access_token") or "")
+        token_type = str(login.get("token_type") or "")
+        consumer_id = str(login.get("consumerId") or "")
+        if not access_token or not token_type or not consumer_id:
+            raise RuntimeError("Toshiba Login ohne Token oder Consumer-ID")
+        self.access_token = access_token
+        self.token_type = token_type
+        self.consumer_id = consumer_id
+        self.account_signature = account_signature
+
+    def in_rate_limit(self, now_ts: float) -> bool:
+        return self.rate_limit_until_ts > float(now_ts)
+
+    def mark_rate_limited(self, now_ts: float, retry_after_s: int | None) -> None:
+        failure_index = min(self.rate_limit_failures, len(TOSHIBA_FALLBACK_BACKOFF_S) - 1)
+        backoff_s = retry_after_s if retry_after_s is not None else TOSHIBA_FALLBACK_BACKOFF_S[failure_index]
+        self.rate_limit_failures = min(self.rate_limit_failures + 1, len(TOSHIBA_FALLBACK_BACKOFF_S))
+        self.rate_limit_started_ts = float(now_ts)
+        self.rate_limit_backoff_s = max(1, min(TOSHIBA_MAX_RETRY_AFTER_S, int(backoff_s)))
+        self.rate_limit_until_ts = self.rate_limit_started_ts + self.rate_limit_backoff_s
+        self.rate_limit_http_status = 429
+
+    def clear_rate_limit(self) -> None:
+        self.rate_limit_until_ts = 0.0
+        self.rate_limit_started_ts = 0.0
+        self.rate_limit_failures = 0
+        self.rate_limit_backoff_s = 0
+        self.rate_limit_http_status = None
+
+    def restore_rate_limit(self, previous_status: dict[str, Any], now_ts: float) -> None:
+        if not isinstance(previous_status, dict):
+            return
+        http_status = _safe_int(
+            previous_status.get("cloud_http_status"),
+            0,
+            min_value=0,
+            max_value=999,
+        )
+        retry_at = _safe_float(previous_status.get("cloud_retry_at_ts"), 0.0)
+        now = float(now_ts)
+        if http_status != 429 or retry_at <= now:
+            return
+        failures = _safe_int(
+            previous_status.get("cloud_rate_limit_failures"),
+            0,
+            min_value=0,
+            max_value=len(TOSHIBA_FALLBACK_BACKOFF_S),
+        )
+        started_at = min(
+            now,
+            max(0.0, _safe_float(previous_status.get("cloud_rate_limit_started_ts"), 0.0)),
+        )
+        backoff_s = _safe_int(
+            previous_status.get("cloud_backoff_s"),
+            0,
+            min_value=0,
+            max_value=TOSHIBA_MAX_RETRY_AFTER_S,
+        )
+        self.rate_limit_failures = failures
+        self.rate_limit_started_ts = started_at
+        self.rate_limit_backoff_s = backoff_s
+        self.rate_limit_http_status = 429
+        self.rate_limit_until_ts = min(retry_at, now + TOSHIBA_MAX_RETRY_AFTER_S)
+
+    def public_backoff_fields(self, now_ts: float) -> dict[str, Any]:
+        limited = self.in_rate_limit(now_ts)
+        retry_at = int(math.ceil(self.rate_limit_until_ts)) if limited else None
+        retry_in_s = max(0, int(math.ceil(self.rate_limit_until_ts - float(now_ts)))) if limited else 0
+        return {
+            "rate_limited": limited,
+            "http_status": self.rate_limit_http_status,
+            "rate_limit_started_ts": int(self.rate_limit_started_ts) if self.rate_limit_started_ts > 0 else None,
+            "retry_at_ts": retry_at,
+            "retry_at_iso": datetime.fromtimestamp(retry_at).isoformat(timespec="seconds") if retry_at is not None else "",
+            "retry_in_s": retry_in_s,
+            "backoff_s": self.rate_limit_backoff_s,
+            "rate_limit_failures": self.rate_limit_failures,
+        }
+
+
 def _toshiba_api_request(
     path: str,
     *,
@@ -238,7 +375,12 @@ def _toshiba_api_request(
         with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
             raw_payload = response.read()
     except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"HTTP {exc.code} bei {path}") from exc
+        retry_after = exc.headers.get("Retry-After") if exc.headers is not None else None
+        raise ToshibaHttpError(
+            int(exc.code),
+            path,
+            _parse_retry_after_seconds(retry_after),
+        ) from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f"Netzwerkfehler bei {path}: {exc.reason}") from exc
 
@@ -253,6 +395,12 @@ def _toshiba_api_request(
         return decoded.get("ResObj")
     status = decoded.get("StatusCode", "unknown")
     message = decoded.get("Message", "unknown error")
+    try:
+        http_like_status = int(status)
+    except (TypeError, ValueError):
+        http_like_status = 0
+    if http_like_status in {401, 429}:
+        raise ToshibaHttpError(http_like_status, path)
     raise RuntimeError(f"Toshiba API-Fehler bei {path}: {status}: {message}")
 
 
@@ -318,29 +466,96 @@ def _toshiba_device_summary(device: dict[str, Any], state_obj: dict[str, Any] | 
     return summary
 
 
-def read_toshiba_cloud_status(cfg: dict[str, Any], now_ts: float | None = None) -> dict[str, Any]:
+def read_toshiba_cloud_status(
+    cfg: dict[str, Any],
+    now_ts: float | None = None,
+    *,
+    session: ToshibaCloudSession | None = None,
+) -> dict[str, Any]:
     started = time.time()
     now = float(now_ts if now_ts is not None else started)
     username = cfg_text(cfg, "climate_toshiba_username")
     password = cfg_text(cfg, "climate_toshiba_password")
+    cloud_session = session if session is not None else ToshibaCloudSession()
+    account_signature = hashlib.sha256(f"{username}\0{password}".encode("utf-8")).hexdigest()
+    request_performed = False
+    login_performed = False
+    session_reused = False
+    reauthenticated = False
+
+    def response_duration() -> float:
+        return round(max(0.0, time.time() - started), 3)
+
     try:
         if not username or not password:
             raise RuntimeError("Toshiba-Zugangsdaten fehlen")
 
-        login = _toshiba_api_request("/api/Consumer/Login", post={"Username": username, "Password": password})
-        if not isinstance(login, dict):
-            raise RuntimeError("Toshiba Login ohne gültiges Objekt")
-        token = str(login.get("access_token") or "")
-        token_type = str(login.get("token_type") or "")
-        consumer_id = str(login.get("consumerId") or "")
-        if not token or not token_type or not consumer_id:
-            raise RuntimeError("Toshiba Login ohne Token oder Consumer-ID")
+        if cloud_session.in_rate_limit(now):
+            backoff = cloud_session.public_backoff_fields(now)
+            retry_at_iso = str(backoff.get("retry_at_iso") or "")
+            attempt_ts = cloud_session.rate_limit_started_ts or now
+            return {
+                "success": False,
+                "ts": int(attempt_ts),
+                "ts_iso": datetime.fromtimestamp(attempt_ts).isoformat(timespec="seconds"),
+                "duration_s": response_duration(),
+                "error": f"Toshiba Cloud ratenbegrenzt bis {retry_at_iso}",
+                "request_performed": False,
+                "login_performed": False,
+                "session_reused": False,
+                "reauthenticated": False,
+                **backoff,
+            }
 
-        mapping = _toshiba_api_request(
+        if cloud_session.account_signature and cloud_session.account_signature != account_signature:
+            cloud_session.clear_auth()
+
+        def login() -> None:
+            nonlocal request_performed, login_performed
+            request_performed = True
+            login_result = _toshiba_api_request(
+                "/api/Consumer/Login",
+                post={"Username": username, "Password": password},
+            )
+            if not isinstance(login_result, dict):
+                raise RuntimeError("Toshiba Login ohne gültiges Objekt")
+            cloud_session.set_auth(login_result, account_signature)
+            login_performed = True
+
+        session_reused = cloud_session.has_auth(account_signature)
+        if not session_reused:
+            cloud_session.clear_auth()
+            login()
+
+        reauth_used = False
+
+        def authorized_request(path: str, get_factory: Callable[[ToshibaCloudSession], dict[str, str]]) -> Any:
+            nonlocal request_performed, login_performed, reauthenticated, reauth_used
+
+            def perform() -> Any:
+                nonlocal request_performed
+                request_performed = True
+                return _toshiba_api_request(
+                    path,
+                    get=get_factory(cloud_session),
+                    token_type=cloud_session.token_type,
+                    token=cloud_session.access_token,
+                )
+
+            try:
+                return perform()
+            except ToshibaHttpError as exc:
+                if exc.status != 401 or reauth_used:
+                    raise
+                reauth_used = True
+                reauthenticated = True
+                cloud_session.clear_auth()
+                login()
+                return perform()
+
+        mapping = authorized_request(
             "/api/AC/GetConsumerACMapping",
-            get={"consumerId": consumer_id},
-            token_type=token_type,
-            token=token,
+            lambda current: {"consumerId": current.consumer_id},
         )
         devices: list[dict[str, Any]] = []
         for group in mapping if isinstance(mapping, list) else []:
@@ -354,32 +569,67 @@ def read_toshiba_cloud_status(cfg: dict[str, Any], now_ts: float | None = None) 
                 ac_id = str(item.get("Id") or "")
                 if ac_id:
                     try:
-                        state_candidate = _toshiba_api_request(
+                        state_candidate = authorized_request(
                             "/api/AC/GetCurrentACState",
-                            get={"consumerId": consumer_id, "ACId": ac_id},
-                            token_type=token_type,
-                            token=token,
+                            lambda current, current_ac_id=ac_id: {
+                                "consumerId": current.consumer_id,
+                                "ACId": current_ac_id,
+                            },
                         )
                         state_obj = state_candidate if isinstance(state_candidate, dict) else None
+                    except ToshibaHttpError as exc:
+                        if exc.status in {401, 429}:
+                            raise
+                        state_obj = {"state_error": str(exc)}
                     except Exception as exc:
                         state_obj = {"state_error": str(exc)}
                 devices.append(_toshiba_device_summary(item, state_obj))
 
+        cloud_session.clear_rate_limit()
         return {
             "success": True,
             "ts": int(now),
             "ts_iso": datetime.fromtimestamp(now).isoformat(timespec="seconds"),
-            "duration_s": round(time.time() - started, 3),
+            "duration_s": response_duration(),
             "device_count": len(devices),
             "devices": devices,
+            "request_performed": request_performed,
+            "login_performed": login_performed,
+            "session_reused": session_reused,
+            "reauthenticated": reauthenticated,
+            **cloud_session.public_backoff_fields(now),
+        }
+    except ToshibaHttpError as exc:
+        if exc.status == 429:
+            cloud_session.mark_rate_limited(now, exc.retry_after_s)
+        elif exc.status == 401:
+            cloud_session.clear_auth()
+        backoff = cloud_session.public_backoff_fields(now)
+        return {
+            "success": False,
+            "ts": int(now),
+            "ts_iso": datetime.fromtimestamp(now).isoformat(timespec="seconds"),
+            "duration_s": response_duration(),
+            "error": str(exc),
+            "request_performed": request_performed,
+            "login_performed": login_performed,
+            "session_reused": session_reused,
+            "reauthenticated": reauthenticated,
+            **backoff,
+            "http_status": exc.status,
         }
     except Exception as exc:
         return {
             "success": False,
             "ts": int(now),
             "ts_iso": datetime.fromtimestamp(now).isoformat(timespec="seconds"),
-            "duration_s": round(time.time() - started, 3),
+            "duration_s": response_duration(),
             "error": str(exc),
+            "request_performed": request_performed,
+            "login_performed": login_performed,
+            "session_reused": session_reused,
+            "reauthenticated": reauthenticated,
+            **cloud_session.public_backoff_fields(now),
         }
 
 
@@ -459,6 +709,7 @@ def build_control_status(
     *,
     read_cloud: bool = False,
     cloud_reader: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    cloud_session: ToshibaCloudSession | None = None,
 ) -> dict[str, Any]:
     now = float(now_ts if now_ts is not None else time.time())
     climate_load = climate_load if isinstance(climate_load, dict) else {}
@@ -495,11 +746,26 @@ def build_control_status(
     cloud_duration_s: float | None = None
     cloud_read_ts: int | None = None
     cloud_read_iso = ""
+    cloud_rate_limited = False
+    cloud_http_status: int | None = None
+    cloud_retry_at_ts: int | None = None
+    cloud_retry_at_iso = ""
+    cloud_retry_in_s = 0
+    cloud_backoff_s = 0
+    cloud_rate_limit_started_ts: int | None = None
+    cloud_rate_limit_failures = 0
+    cloud_request_performed = False
+    cloud_login_performed = False
+    cloud_session_reused = False
+    cloud_reauthenticated = False
     should_read_cloud = bool(read_cloud and enabled and provider == "toshiba_cloud" and cloud_enabled and has_account)
     if should_read_cloud:
-        reader = cloud_reader or read_toshiba_cloud_status
         try:
-            cloud_status = reader(cfg)
+            cloud_status = cloud_reader(cfg) if cloud_reader is not None else read_toshiba_cloud_status(
+                cfg,
+                now_ts=now,
+                session=cloud_session,
+            )
         except Exception as exc:
             cloud_status = {"success": False, "error": str(exc), "ts": int(now), "duration_s": 0.0}
         cloud_connected = bool(cloud_status.get("success"))
@@ -507,9 +773,28 @@ def build_control_status(
         cloud_duration_s = _safe_float(cloud_status.get("duration_s"), 0.0)
         cloud_read_ts = _safe_int(cloud_status.get("ts"), int(now), min_value=0)
         cloud_read_iso = str(cloud_status.get("ts_iso") or datetime.fromtimestamp(cloud_read_ts).isoformat(timespec="seconds"))
+        cloud_rate_limited = bool(cloud_status.get("rate_limited"))
+        cloud_http_status = _safe_int(cloud_status.get("http_status"), 0, min_value=0, max_value=999) or None
+        cloud_retry_at_ts = _safe_int(cloud_status.get("retry_at_ts"), 0, min_value=0) or None
+        cloud_retry_at_iso = str(cloud_status.get("retry_at_iso") or "")
+        cloud_retry_in_s = _safe_int(cloud_status.get("retry_in_s"), 0, min_value=0, max_value=TOSHIBA_MAX_RETRY_AFTER_S)
+        cloud_backoff_s = _safe_int(cloud_status.get("backoff_s"), 0, min_value=0, max_value=TOSHIBA_MAX_RETRY_AFTER_S)
+        cloud_rate_limit_started_ts = _safe_int(cloud_status.get("rate_limit_started_ts"), 0, min_value=0) or None
+        cloud_rate_limit_failures = _safe_int(
+            cloud_status.get("rate_limit_failures"),
+            0,
+            min_value=0,
+            max_value=len(TOSHIBA_FALLBACK_BACKOFF_S),
+        )
+        cloud_request_performed = bool(cloud_status.get("request_performed"))
+        cloud_login_performed = bool(cloud_status.get("login_performed"))
+        cloud_session_reused = bool(cloud_status.get("session_reused"))
+        cloud_reauthenticated = bool(cloud_status.get("reauthenticated"))
         devices = _clean_cloud_devices(cloud_status.get("devices"))
         if cloud_connected:
             reason = "mode_off" if mode == "off" else "toshiba_cloud_readonly"
+        elif cloud_rate_limited:
+            reason = "toshiba_cloud_rate_limited"
         else:
             reason = "toshiba_cloud_read_failed"
     configured_device_count, unmatched_device_ids = _annotate_configured_devices(devices, device_ids)
@@ -540,6 +825,18 @@ def build_control_status(
         "cloud_duration_s": round(cloud_duration_s, 3) if cloud_duration_s is not None else None,
         "cloud_last_read_ts": cloud_read_ts,
         "cloud_last_read_iso": cloud_read_iso,
+        "cloud_rate_limited": cloud_rate_limited,
+        "cloud_http_status": cloud_http_status,
+        "cloud_rate_limit_started_ts": cloud_rate_limit_started_ts,
+        "cloud_retry_at_ts": cloud_retry_at_ts,
+        "cloud_retry_at_iso": cloud_retry_at_iso,
+        "cloud_retry_in_s": cloud_retry_in_s,
+        "cloud_backoff_s": cloud_backoff_s,
+        "cloud_rate_limit_failures": cloud_rate_limit_failures,
+        "cloud_request_performed": cloud_request_performed,
+        "cloud_login_performed": cloud_login_performed,
+        "cloud_session_reused": cloud_session_reused,
+        "cloud_reauthenticated": cloud_reauthenticated,
         "cloud_device_count": len(devices),
         "credentials_configured": has_account,
         "device_ids_configured": has_device,
@@ -583,9 +880,28 @@ def _signal_handler(signum, frame):  # noqa: ARG001
     RUNNING = False
 
 
-def run_once(config_path: Path, climate_path: Path, output_path: Path) -> dict[str, Any]:
+def _restored_cloud_session(output_path: Path, now_ts: float | None = None) -> ToshibaCloudSession:
+    now = float(now_ts if now_ts is not None else time.time())
+    session = ToshibaCloudSession()
+    session.restore_rate_limit(read_json(output_path), now)
+    return session
+
+
+def run_once(
+    config_path: Path,
+    climate_path: Path,
+    output_path: Path,
+    *,
+    cloud_session: ToshibaCloudSession | None = None,
+) -> dict[str, Any]:
     cfg = load_config(config_path)
-    status = build_control_status(cfg, read_json(climate_path), read_cloud=True)
+    session = cloud_session if cloud_session is not None else _restored_cloud_session(output_path)
+    status = build_control_status(
+        cfg,
+        read_json(climate_path),
+        read_cloud=True,
+        cloud_session=session,
+    )
     atomic_write_json(output_path, status)
     return status
 
@@ -604,14 +920,20 @@ def main(argv: list[str] | None = None) -> int:
 
     signal.signal(signal.SIGTERM, _signal_handler)
     signal.signal(signal.SIGINT, _signal_handler)
+    cloud_session = _restored_cloud_session(output_path)
 
     if args.once:
-        run_once(config_path, climate_path, output_path)
+        run_once(config_path, climate_path, output_path, cloud_session=cloud_session)
         return 0
 
     while RUNNING:
         cfg = load_config(config_path)
-        status = build_control_status(cfg, read_json(climate_path), read_cloud=True)
+        status = build_control_status(
+            cfg,
+            read_json(climate_path),
+            read_cloud=True,
+            cloud_session=cloud_session,
+        )
         atomic_write_json(output_path, status)
         poll_s = _safe_int(cfg.get("climate_control_poll_s"), 60, min_value=15, max_value=900)
         deadline = time.time() + poll_s

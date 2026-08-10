@@ -669,6 +669,21 @@ def _runtime_document_validation_errors(role: str, document: Dict[str, Any]) -> 
         _sent, valid = _strict_time_alias(document, ("last_send_ts",), required=False)
         if not valid:
             errors.append(role + "_send_time_invalid")
+        if document.get("confirmation_status") == "unconfirmed":
+            _attempted, valid = _strict_time_alias(
+                document,
+                ("last_command_attempt_ts",),
+                required=True,
+            )
+            if not valid:
+                errors.append(role + "_command_attempt_time_invalid")
+            _commanded, valid = _strict_bool_alias(
+                document,
+                ("last_commanded_relay_on",),
+                required=True,
+            )
+            if not valid:
+                errors.append(role + "_commanded_relay_state_invalid")
         return errors
     _desired, valid = _strict_bool_alias(document, ("desired_wr_on", "desired_on", "wr_on"), required=True)
     if not valid:

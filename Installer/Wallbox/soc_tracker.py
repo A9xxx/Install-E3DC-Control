@@ -11,6 +11,7 @@ openWB Pro keeps its own CCS/import counter estimator in the driver. Those
 values are treated as authoritative and are not overwritten here.
 """
 import json
+import math
 import os
 import re
 import time
@@ -20,6 +21,23 @@ from .config import RAMDISK_DIR, logger
 
 SAVED_CARS_FILE = "/var/www/html/data/saved_cars.json"
 TMP_DIR = "/var/www/html/tmp"
+TRACKER_CHECKPOINT_ACTIVE_HEARTBEAT_S = 120.0
+TRACKER_CHECKPOINT_IDLE_HEARTBEAT_S = 900.0
+TRACKER_CHECKPOINT_SEMANTIC_KEYS = (
+    "vehicle_key",
+    "car_id",
+    "vehicle_id",
+    "anchor_soc",
+    "anchor_sample_ts",
+    "anchor_source",
+    "anchor_meter_wh",
+    "meter_source",
+    "connected",
+    "charging",
+    "plug_session_id",
+    "session_closed",
+    "estimate_expired",
+)
 
 ESTIMATED_PREFIX = "wallbox_estimated"
 OPENWB_PRO_SOURCES = ("openwb_pro_raw", "openwb_pro_estimated")
@@ -42,6 +60,10 @@ CONFIRMED_VEHICLE_SOC_KEYWORDS = ("mqtt", "bluelink", "wallbox", "openwb", "vehi
 UNCONFIRMED_SOC_SOURCES = ("simple_view_start_soc", "config_start_soc")
 OPENWB_PRO_STATUS_MAX_AGE_S = 60
 OPENWB_PRO_VEHICLE_SOC_MAX_AGE_S = 8 * 3600
+OPENWB_EXPLICIT_TOTAL_RANGE_SOURCES = frozenset(("http_total", "mqtt_total"))
+OPENWB_EXPLICIT_CHARGED_RANGE_SOURCES = frozenset(("http_charged", "mqtt_charged"))
+OPENWB_EXPLICIT_RANGE_MAX_AGE_S = 120.0
+OPENWB_EXPLICIT_RANGE_SOURCE_MAX_AGE_S = OPENWB_PRO_VEHICLE_SOC_MAX_AGE_S
 
 
 def _compact_id(value):
@@ -91,6 +113,155 @@ def _timestamp(value, default=0.0):
         return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
     except Exception:
         return default
+
+
+def _status_has_connected_vehicle(status):
+    if not isinstance(status, dict):
+        return False
+    if bool(status.get("plug_state") or status.get("locked") or status.get("charging") or status.get("charge_state")):
+        return True
+    try:
+        return int(status.get("car", 1) or 1) >= 2
+    except (TypeError, ValueError):
+        return False
+
+
+def _current_explicit_openwb_range(
+    status,
+    *,
+    value_keys,
+    source_key,
+    valid_key,
+    observed_ts_key,
+    source_ts_key,
+    source_ts_explicit_key,
+    vehicle_key_key,
+    allowed_sources,
+    now_ts=None,
+):
+    """Liefere nur eine frisch beobachtete, sitzungsplausible openWB-Reichweite."""
+
+    if not isinstance(status, dict) or not _status_has_connected_vehicle(status):
+        return None
+    if status.get("driver_status_valid") is False or bool(status.get("driver_status_stale", False)):
+        return None
+    if status.get(valid_key) is not True:
+        return None
+
+    source = str(status.get(source_key) or "").strip().lower()
+    if source not in allowed_sources:
+        return None
+    value = None
+    for key in value_keys:
+        if key not in status:
+            continue
+        candidate = _safe_float(status.get(key), -1.0)
+        if candidate >= 0.0:
+            value = candidate
+            break
+    if value is None:
+        return None
+
+    now = time.time() if now_ts is None else float(now_ts)
+    observed_ts = _timestamp(status.get(observed_ts_key), 0.0)
+    age_s = now - observed_ts
+    if (
+        not math.isfinite(now)
+        or not math.isfinite(observed_ts)
+        or observed_ts <= 0.0
+        or age_s < -5.0
+        or age_s > OPENWB_EXPLICIT_RANGE_MAX_AGE_S
+    ):
+        return None
+
+    # Die HTTP-Beobachtung beweist nur, wann E3DC-Control denselben Wert erneut
+    # gelesen hat. Liefert openWB eine eigene Quellenzeit, muss auch diese frisch
+    # sein; wiederholtes Polling darf einen alten Fahrzeugwert nie verjüngen.
+    # Alte openWB-Versionen ohne Quellenzeit bleiben über die frische lokale
+    # Beobachtung kompatibel.
+    source_ts_raw = status.get(source_ts_key)
+    # Nur der vom Treiber ausdrücklich gesetzte Marker beweist, dass das Feld
+    # eine eigene openWB-Quellenzeit enthält. Ältere Statusstände konnten dort
+    # noch eine SoC-Zeit ohne diese Semantik führen; sie bleiben allein über
+    # die maximal 120 Sekunden alte lokale Reichweitenbeobachtung gültig.
+    source_ts_explicit = status.get(source_ts_explicit_key) is True
+    if not source_ts_explicit:
+        source_ts = observed_ts
+    else:
+        if source_ts_raw is None or (
+            isinstance(source_ts_raw, str)
+            and source_ts_raw.strip().lower() in ("", "null")
+        ):
+            return None
+        source_ts = _timestamp(source_ts_raw, 0.0)
+        source_age_s = now - source_ts
+        if (
+            not math.isfinite(source_ts)
+            or source_ts <= 0.0
+            or source_age_s < -5.0
+            or source_age_s > OPENWB_EXPLICIT_RANGE_SOURCE_MAX_AGE_S
+        ):
+            return None
+
+    bound_vehicle_key = _compact_id(status.get(vehicle_key_key))
+    if bound_vehicle_key:
+        if not bool(status.get("stable_vehicle_identity_current", False)):
+            return None
+        current_keys = {
+            key
+            for key in (
+                _compact_id(status.get("vehicle_id")),
+                _compact_id(status.get("rfid_tag")),
+                _compact_id(status.get("car_id")),
+            )
+            if key
+        }
+        if not current_keys or bound_vehicle_key not in current_keys:
+            return None
+
+    return {
+        "range_km": value,
+        "range_source": source,
+        "range_observed_ts": int(observed_ts),
+        "range_source_ts": int(source_ts),
+        "range_source_ts_explicit": source_ts_explicit,
+        "range_vehicle_key": str(status.get(vehicle_key_key) or ""),
+        "range_explicit": True,
+    }
+
+
+def current_explicit_openwb_total_range(status, now_ts=None):
+    """Aktuelle openWB-Gesamtreichweite; Profilrechnungen sind hier nie autoritativ."""
+
+    return _current_explicit_openwb_range(
+        status,
+        value_keys=("car_range", "range_km"),
+        source_key="car_range_source",
+        valid_key="car_range_valid",
+        observed_ts_key="car_range_observed_ts",
+        source_ts_key="car_range_source_ts",
+        source_ts_explicit_key="car_range_source_ts_explicit",
+        vehicle_key_key="car_range_vehicle_key",
+        allowed_sources=OPENWB_EXPLICIT_TOTAL_RANGE_SOURCES,
+        now_ts=now_ts,
+    )
+
+
+def current_explicit_openwb_charged_range(status, now_ts=None):
+    """Aktuelle geladene Reichweite als eigener, niemals totaler Wert."""
+
+    return _current_explicit_openwb_range(
+        status,
+        value_keys=("car_charged_range", "charged_range_km"),
+        source_key="car_charged_range_source",
+        valid_key="car_charged_range_valid",
+        observed_ts_key="car_charged_range_observed_ts",
+        source_ts_key="car_charged_range_source_ts",
+        source_ts_explicit_key="car_charged_range_source_ts_explicit",
+        vehicle_key_key="car_charged_range_vehicle_key",
+        allowed_sources=OPENWB_EXPLICIT_CHARGED_RANGE_SOURCES,
+        now_ts=now_ts,
+    )
 
 
 def _read_json(path, default=None):
@@ -242,7 +413,7 @@ def _openwb_pro_same_session_sample(
 ):
     """Binde eine bestätigte Pro-Schätzung an dieselbe Stecksession."""
 
-    data = _read_json(_manual_soc_path(wb_id), None)
+    data = _read_manual_soc(wb_id, None)
     if not isinstance(data, dict):
         return None
     source = str(data.get("source") or "").strip()
@@ -565,24 +736,102 @@ def _manual_soc_path(wb_id):
     return os.path.join(RAMDISK_DIR, f"manual_soc_wb{int(wb_id)}.json")
 
 
+def _legacy_manual_soc_path(wb_id):
+    if int(wb_id) != 1:
+        return ""
+    return os.path.join(TMP_DIR, "manual_soc.json")
+
+
+def _read_manual_soc(wb_id, default=None):
+    data = _read_json(_manual_soc_path(wb_id), None)
+    if isinstance(data, dict):
+        return data
+    legacy_path = _legacy_manual_soc_path(wb_id)
+    if legacy_path:
+        legacy = _read_json(legacy_path, None)
+        if isinstance(legacy, dict):
+            return legacy
+    return default
+
+
 def _tracker_state_path(wb_id):
     return os.path.join(RAMDISK_DIR, f"vehicle_soc_tracker_wb{int(wb_id)}.json")
+
+
+def _tracker_checkpoint_path(wb_id):
+    data_dir = os.path.dirname(SAVED_CARS_FILE) or "/var/www/html/data"
+    return os.path.join(data_dir, f"vehicle_soc_tracker_checkpoint_wb{int(wb_id)}.json")
+
+
+def _persist_tracker_checkpoint(wb_id, state, runtime_state, *, now_ts=None, force=False):
+    current_ts = time.time() if now_ts is None else float(now_ts)
+    connected = bool((state or {}).get("connected", False))
+    charging = bool((state or {}).get("charging", False))
+    session_closed = bool((state or {}).get("session_closed", False))
+    heartbeat_s = (
+        TRACKER_CHECKPOINT_ACTIVE_HEARTBEAT_S
+        if connected and charging
+        else TRACKER_CHECKPOINT_IDLE_HEARTBEAT_S
+        if connected and not session_closed
+        else None
+    )
+    signature = json.dumps(
+        {
+            key: (state or {}).get(key)
+            for key in TRACKER_CHECKPOINT_SEMANTIC_KEYS
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    last_write_ts = float(runtime_state.get("last_write_ts", 0.0) or 0.0)
+    elapsed_s = current_ts - last_write_ts
+    if not (
+        force
+        or signature != runtime_state.get("signature")
+        or last_write_ts <= 0.0
+        or elapsed_s < 0.0
+        or (heartbeat_s is not None and elapsed_s >= heartbeat_s)
+    ):
+        return False
+    checkpoint = dict(state or {})
+    checkpoint["schema_version"] = "vehicle_soc_tracker_checkpoint_v1"
+    checkpoint["checkpoint_ts"] = current_ts
+    if not _write_json_atomic(_tracker_checkpoint_path(wb_id), checkpoint):
+        return False
+    runtime_state["signature"] = signature
+    runtime_state["last_write_ts"] = current_ts
+    return True
 
 
 class VehicleSocTracker:
     def __init__(self):
         self._states = {}
+        self._checkpoint_runtime = {}
 
     def _load_state(self, wb_id):
         key = int(wb_id)
         if key not in self._states:
-            self._states[key] = _read_json(_tracker_state_path(key), {}) or {}
+            state = _read_json(_tracker_state_path(key), None)
+            if not isinstance(state, dict):
+                state = _read_json(_tracker_checkpoint_path(key), {})
+            if not isinstance(state, dict):
+                state = {}
+            state.pop("schema_version", None)
+            state.pop("checkpoint_ts", None)
+            self._states[key] = state
         return self._states[key]
 
     def _save_state(self, wb_id, state):
         key = int(wb_id)
         self._states[key] = dict(state or {})
         _write_json_atomic(_tracker_state_path(key), self._states[key])
+        _persist_tracker_checkpoint(
+            key,
+            self._states[key],
+            self._checkpoint_runtime.setdefault(key, {}),
+        )
 
     def _session_anchor_expired(self, state, now, meter_wh):
         source = str((state or {}).get("anchor_source") or "").strip()
@@ -631,8 +880,7 @@ class VehicleSocTracker:
         })
 
     def _manual_sample(self, wb_id, selected_id):
-        path = _manual_soc_path(wb_id)
-        data = _read_json(path, None)
+        data = _read_manual_soc(wb_id, None)
         if not isinstance(data, dict):
             return None
         source = str(data.get("source") or "manual_start_soc").strip()
@@ -935,6 +1183,10 @@ class VehicleSocTracker:
             "is_interpolated": delivered_wh > 20.0,
             "profile_id": state.get("profile_id") or "",
             "soc_profile_bound": bool(state.get("soc_profile_bound", False)),
+            # Diese Zuordnung dient ausschließlich SoC/Anzeige/Planung. Sie
+            # beweist weder die aktuelle Stecksession noch eine OBC-Grenze.
+            "identity_scope": "soc_profile_only",
+            "stable_vehicle_identity_current": False,
             "plug_session_id": state.get("plug_session_id") or "",
             "session_kwh": round(
                 meter_wh / 1000.0
@@ -953,26 +1205,41 @@ class VehicleSocTracker:
                 _safe_float(state.get("anchor_meter_wh"), 0.0) / 1000.0,
                 3,
             )
+        explicit_total_range = current_explicit_openwb_total_range(status, now_ts=now)
+        explicit_charged_range = current_explicit_openwb_charged_range(status, now_ts=now)
         if consumption > 0:
             result["consumption_kwh_100km"] = consumption
+        if explicit_total_range:
+            result.update(explicit_total_range)
+        elif consumption > 0:
             result["range_km"] = round((capacity * estimated_soc / 100.0) / consumption * 100.0, 0)
             result["range_source"] = "wallbox_estimated_consumption"
+            result["range_explicit"] = False
+        if explicit_charged_range:
+            result["charged_range_km"] = explicit_charged_range["range_km"]
+            result["charged_range_source"] = explicit_charged_range["range_source"]
+            result["charged_range_observed_ts"] = explicit_charged_range["range_observed_ts"]
+            result["charged_range_source_ts"] = explicit_charged_range["range_source_ts"]
+            result["charged_range_source_ts_explicit"] = explicit_charged_range[
+                "range_source_ts_explicit"
+            ]
+            result["charged_range_vehicle_key"] = explicit_charged_range["range_vehicle_key"]
+            result["charged_range_explicit"] = True
+        elif consumption > 0:
             result["charged_range_km"] = round(max(0.0, (delivered_wh / 1000.0) * efficiency / consumption * 100.0), 1)
+            result["charged_range_source"] = "wallbox_estimated_consumption"
+            result["charged_range_explicit"] = False
         self._write_manual_soc(wb_id, result)
         return result
 
     def _write_manual_soc(self, wb_id, payload):
         path = _manual_soc_path(wb_id)
         _write_json_atomic(path, payload)
-        if int(wb_id) == 1:
-            legacy = os.path.join(TMP_DIR, "manual_soc.json")
-            _write_json_atomic(legacy, payload)
 
     def _invalidate_profile_fallback(self, wb_id, connected, reason):
         """Sperre eine nicht mehr belastbar gebundene Pro-/Profil-Schätzung."""
 
-        path = _manual_soc_path(wb_id)
-        data = _read_json(path, None)
+        data = _read_manual_soc(wb_id, None)
         if not isinstance(data, dict):
             return
         source = str(data.get("source") or "").strip()
@@ -994,8 +1261,7 @@ class VehicleSocTracker:
         self._write_manual_soc(wb_id, data)
 
     def _mark_manual_unplugged(self, wb_id, state):
-        path = _manual_soc_path(wb_id)
-        data = _read_json(path, None)
+        data = _read_manual_soc(wb_id, None)
         if not isinstance(data, dict):
             return
         source = str(data.get("source") or "")

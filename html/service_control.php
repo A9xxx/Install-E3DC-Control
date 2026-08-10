@@ -1,8 +1,16 @@
 <?php
 require_once __DIR__ . '/helpers.php';
 sendNoCacheHeaders();
-requireWebAuth(true);
 header('Content-Type: application/json; charset=utf-8');
+
+$action = (string)($_GET['action'] ?? $_POST['action'] ?? '');
+$serviceMutationActions = ['start', 'stop', 'restart', 'enable', 'disable', 'activate_forecast_evidence'];
+$isServiceMutation = in_array($action, $serviceMutationActions, true);
+if ($isServiceMutation) {
+    e3dcRequirePostMutation(true);
+} else {
+    requireWebAuth(true);
+}
 
 $paths = getInstallPaths();
 if (empty($paths['valid'])) {
@@ -11,7 +19,7 @@ if (empty($paths['valid'])) {
     exit;
 }
 $install_path = rtrim($paths['install_path'], '/');
-// Wrapper liegt im Installer-Ordner des konfigurierten Installationspfads.
+// Privilegierte Dienstaktionen laufen ausschließlich über den root-eigenen Launcher.
 $wrapper_path = e3dcFindServiceWrapper();
 
 function loadServiceCatalogForControl($install_path) {
@@ -100,8 +108,9 @@ unset($fallback_info);
 $catalog_control = loadServiceCatalogForControl($install_path);
 $allowed_services = !empty($catalog_control['services']) ? $catalog_control['services'] : $fallback_allowed_services;
 
-$action = isset($_GET['action']) ? $_GET['action'] : (isset($_POST['action']) ? $_POST['action'] : '');
-$service = isset($_GET['service']) ? $_GET['service'] : (isset($_POST['service']) ? $_POST['service'] : '');
+$service = $isServiceMutation
+    ? (string)($_POST['service'] ?? '')
+    : (string)($_GET['service'] ?? $_POST['service'] ?? '');
 
 // Sichert ab, ob der Wrapper existiert
 $wrapper_path = ($wrapper_path && file_exists($wrapper_path)) ? $wrapper_path : '';
@@ -146,17 +155,21 @@ if ($action === 'status_all') {
     foreach ($allowed_services as $srv => $info) {
         $raw_status = 'unknown';
         $active = $failed = $enabled = $exists = false;
+        $enabled_known = false;
+        $enabled_raw = 'unknown';
 
         if (!$is_docker) {
             // Bare-Metal: Erst systemctl versuchen
-            $active_output  = trim((string)shell_exec("systemctl is-active "  . escapeshellarg($srv) . " 2>/dev/null"));
-            $enabled_output = trim((string)shell_exec("systemctl is-enabled " . escapeshellarg($srv) . " 2>/dev/null"));
+            $active_output = e3dcSystemdServiceProperty('is-active', $srv);
+            $enabled_output = e3dcSystemdServiceProperty('is-enabled', $srv);
             // Service-Datei direkt prüfen: stabiler als systemctl show für www-data (kein D-Bus nötig)
             $exists  = serviceUnitExistsForControl($srv);
 
             $active  = ($active_output  === 'active');
             $failed  = ($active_output  === 'failed');
             $enabled = ($enabled_output === 'enabled' || $enabled_output === 'static');
+            $enabled_known = in_array($enabled_output, ['enabled', 'disabled', 'static'], true);
+            $enabled_raw = $enabled_output !== '' ? $enabled_output : 'unknown';
             $raw_status = $active_output ?: 'unknown';
 
             // Fallback: Wenn systemctl leere Ausgabe liefert (www-data kein D-Bus Zugriff),
@@ -166,7 +179,6 @@ if ($action === 'status_all') {
                 $max_age = $docker_alive_files[$srv][1];
                 if (file_exists($fpath) && (time() - filemtime($fpath)) < $max_age) {
                     $active     = true;
-                    $enabled    = true;
                     $exists     = true;  // Dienst produziert Output -> existiert definitiv
                     $raw_status = 'active (file-check)';
                 } elseif (file_exists($fpath)) {
@@ -190,6 +202,8 @@ if ($action === 'status_all') {
             $exists  = $active;
             $failed  = false;
             $enabled = $active;
+            $enabled_known = false;
+            $enabled_raw = $active ? 'container-active' : 'container-inactive';
             $raw_status = $active ? 'active (docker)' : 'inactive (docker)';
         }
 
@@ -202,6 +216,8 @@ if ($action === 'status_all') {
             'active'     => $active,
             'failed'     => $failed,
             'enabled'    => $enabled,
+            'enabled_known' => $enabled_known,
+            'enabled_raw' => $enabled_raw,
             'raw_status' => $raw_status,
             'is_docker'  => $is_docker,
         ];
@@ -211,7 +227,7 @@ if ($action === 'status_all') {
 }
 
 
-if (in_array($action, ['start', 'stop', 'restart', 'enable', 'disable'])) {
+if ($isServiceMutation) {
     if (!isset($allowed_services[$service])) {
         echo json_encode(["success" => false, "error" => "Unerlaubter Dienst"]);
         exit;
@@ -231,6 +247,33 @@ if (in_array($action, ['start', 'stop', 'restart', 'enable', 'disable'])) {
         exit;
     }
 
+    if ($action === 'activate_forecast_evidence') {
+        if ($service !== 'e3dc-forecast-evidence.service') {
+            http_response_code(400);
+            echo json_encode([
+                "success" => false,
+                "error_code" => "forecast_evidence_target_rejected",
+                "error" => "Diese gebundene Aktion ist ausschließlich für die PV-Prognosediagnose zulässig.",
+                "service" => $service,
+            ]);
+            exit;
+        }
+        echo json_encode(e3dcActivateForecastEvidenceService(), JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+
+    if ($service === 'e3dc-forecast-evidence.service') {
+        http_response_code(409);
+        echo json_encode([
+            "success" => false,
+            "error_code" => "forecast_evidence_transaction_required",
+            "error" => "Die PV-Prognosediagnose darf nur über ihre gebundene Aktivierungstransaktion geändert werden.",
+            "message" => "Bitte ausschließlich die Aktion „Aktivieren & starten“ verwenden; generische Einzelaktionen bleiben für diesen Dienst gesperrt.",
+            "service" => $service,
+        ]);
+        exit;
+    }
+
     // Docker-Erkennung (gleiche Logik wie oben)
     $is_docker_action = file_exists('/.dockerenv');
 
@@ -240,7 +283,7 @@ if (in_array($action, ['start', 'stop', 'restart', 'enable', 'disable'])) {
         $docker_service_map = [
             "e3dc-live.service"              => ["e3dc_live.py --write --loops 0 --interval 3", "e3dc_live.log"],
             "e3dc-epex-manager.service"      => ["epex_manager.py",                             "epex_manager.log"],
-            "e3dc-weather-manager.service"   => ["Forecast/pv_forecast_service.py",             "weather_manager.log"],
+            "e3dc-weather-manager.service"   => ["Forecast/pv_forecast_service.py",             "pv_forecast.log"],
             "e3dc-storage-simulator.service" => ["storage_simulator.py",                        "storage_simulator.log"],
             "e3dc-storage-manager.service"   => ["storage_manager.py",                          "storage_manager.log"],
             "e3dc-websocket.service"         => ["e3dc_websocket.py",                           "e3dc_websocket.log"],
@@ -342,7 +385,7 @@ if (in_array($action, ['start', 'stop', 'restart', 'enable', 'disable'])) {
     }
 
     if (!$is_docker_action && serviceUnitExistsForControl($service)) {
-        $current_active = trim((string)shell_exec("systemctl is-active " . escapeshellarg($service) . " 2>/dev/null")) === 'active';
+        $current_active = e3dcSystemdServiceProperty('is-active', $service) === 'active';
         if ($action === 'start' && $current_active) {
             echo json_encode([
                 "success" => true,
@@ -350,7 +393,7 @@ if (in_array($action, ['start', 'stop', 'restart', 'enable', 'disable'])) {
                 "message" => "Dienst läuft bereits. Start ist nicht nötig.",
                 "service" => $service,
                 "status" => "active",
-                "enabled" => trim((string)shell_exec("systemctl is-enabled " . escapeshellarg($service) . " 2>/dev/null")) === 'enabled',
+                "enabled" => e3dcSystemdServiceProperty('is-enabled', $service) === 'enabled',
             ]);
             exit;
         }
@@ -361,7 +404,7 @@ if (in_array($action, ['start', 'stop', 'restart', 'enable', 'disable'])) {
                 "message" => "Dienst ist bereits gestoppt. Stop ist nicht nötig.",
                 "service" => $service,
                 "status" => "inactive",
-                "enabled" => trim((string)shell_exec("systemctl is-enabled " . escapeshellarg($service) . " 2>/dev/null")) === 'enabled',
+                "enabled" => e3dcSystemdServiceProperty('is-enabled', $service) === 'enabled',
             ]);
             exit;
         }
@@ -373,22 +416,27 @@ if (in_array($action, ['start', 'stop', 'restart', 'enable', 'disable'])) {
         echo json_encode(['success' => false, 'error' => 'Service-Wrapper im Installationspfad nicht gefunden.']);
         exit;
     }
-    $cmd = "sudo " . escapeshellarg($wrapper_path) . " " . escapeshellarg($action) . " " . escapeshellarg($service) . " 2>&1";
-    $output = shell_exec($cmd);
+    $wrapper_result = e3dcRunServiceWrapperAction($action, [$service]);
+    $output = (string)($wrapper_result['output'] ?? '');
+    if (!empty($wrapper_result['errors'])) {
+        $output = trim($output . "\n" . implode("\n", $wrapper_result['errors']));
+    }
 
     // Nach Ausführung Status direkt prüfen
-    $active_output  = trim((string)shell_exec("systemctl is-active "  . escapeshellarg($service)));
-    $enabled_output = trim((string)shell_exec("systemctl is-enabled " . escapeshellarg($service) . " 2>/dev/null"));
+    $active_output = e3dcSystemdServiceProperty('is-active', $service);
+    $enabled_output = e3dcSystemdServiceProperty('is-enabled', $service);
 
-    $action_success = true;
+    $action_success = !empty($wrapper_result['success']);
     if (in_array($action, ['start', 'restart'], true)) {
-        $action_success = ($active_output === 'active');
+        $action_success = $action_success && ($active_output === 'active');
     } elseif ($action === 'stop') {
-        $action_success = ($active_output !== 'active');
+        $action_success = $action_success && ($active_output !== 'active');
     } elseif ($action === 'enable') {
-        $action_success = ($enabled_output === 'enabled' || $enabled_output === 'static');
+        $action_success = $action_success
+            && ($enabled_output === 'enabled' || $enabled_output === 'static');
     } elseif ($action === 'disable') {
-        $action_success = !($enabled_output === 'enabled' || $enabled_output === 'static');
+        $action_success = $action_success
+            && !($enabled_output === 'enabled' || $enabled_output === 'static');
     }
 
     echo json_encode([

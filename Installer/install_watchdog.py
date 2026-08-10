@@ -5,6 +5,7 @@ import hashlib
 import ipaddress
 import json
 import os
+import pwd
 import re
 import secrets
 import shlex
@@ -17,7 +18,7 @@ from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
 from .core import register_command
-from .install_notifier import install_notifier
+from .install_notifier import begin_watchdog_child, notifier_install_transaction
 from .transition_context import TransitionContext, TransitionContextError, get_transition_context
 from .transition_systemd import (
     CommandResult,
@@ -410,7 +411,7 @@ watchdog_update_active() {{
             fi
         fi
     done
-    if pgrep -f "[i]nstaller_main.py --update-e3dc|[i]nstaller_wrapper.sh update_e3dc|[s]elf_update.py --silent|[I]nstaller/update.py" >/dev/null 2>&1; then
+    if pgrep -f "[i]nstaller_main.py (--update-e3dc|--reinstall-current)|[i]nstaller_wrapper.sh (update_e3dc|reinstall_current)|[s]elf_update.py --silent|[I]nstaller/update.py|[r]elease_finalize.py" >/dev/null 2>&1; then
         return 0
     fi
     return 1
@@ -659,24 +660,18 @@ while true; do
 
   # --- CHECK 7: E3DC LIVE-STAGNATION (Zukunftssicher & Freeze-Schutz) ---
   if [ "$is_standby_slave" = false ]; then
-      live_json=$(curl -s --max-time 3 http://localhost/get_live_json.php 2>/dev/null)
-      if [ -n "$live_json" ]; then
-          home_pw=$(echo "$live_json" | grep -o '\"home_raw\":[ ]*[-0-9]*' | cut -d':' -f2 | tr -d ' ')
-          pv_pw=$(echo "$live_json" | grep -o '\"pv\":[ ]*[-0-9]*' | cut -d':' -f2 | tr -d ' ')
-          grid_pw=$(echo "$live_json" | grep -o '\"grid\":[ ]*[-0-9]*' | cut -d':' -f2 | tr -d ' ')
-          if [ -n "$home_pw" ] && [ -n "$pv_pw" ] && [ -n "$grid_pw" ]; then
-              current_hash="${{home_pw}}_${{pv_pw}}_${{grid_pw}}"
-              if [ "$LAST_LIVE_HASH" == "$current_hash" ]; then
-                  ((live_stale_fail++))
-                  if [ $live_stale_fail -eq 12 ] && [ "$warned_live_stale" = false ]; then
-                      /usr/local/bin/boot_notify.sh "⚠️ E3DC Werte eingefroren (>2 Min identische Wattzahlen). Restart Service in 1 Min."
-                      warned_live_stale=true
-                  fi
-              else
-                  live_stale_fail=0
-                  warned_live_stale=false
-                  LAST_LIVE_HASH="$current_hash"
+      current_hash=$("$VENV_PY" "$INSTALL_DIR/Installer/live_snapshot.py" --watchdog-hash 2>/dev/null)
+      if [ -n "$current_hash" ]; then
+          if [ "$LAST_LIVE_HASH" == "$current_hash" ]; then
+              ((live_stale_fail++))
+              if [ $live_stale_fail -eq 12 ] && [ "$warned_live_stale" = false ]; then
+                  /usr/local/bin/boot_notify.sh "⚠️ E3DC Werte eingefroren (>2 Min identische Wattzahlen). Restart Service in 1 Min."
+                  warned_live_stale=true
               fi
+          else
+              live_stale_fail=0
+              warned_live_stale=false
+              LAST_LIVE_HASH="$current_hash"
           fi
       fi
   fi
@@ -917,34 +912,108 @@ class WatchdogBundleInstaller:
             if os.path.lexists(current) and stat.S_ISLNK(os.lstat(current).st_mode):
                 raise WatchdogTransitionError("Autoritätspfad enthält einen Symlink")
 
+    @staticmethod
+    def _directory_flags() -> int:
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        directory = getattr(os, "O_DIRECTORY", 0)
+        if not nofollow or not directory:
+            raise WatchdogTransitionError(
+                "Watchdog-Journal benötigt O_NOFOLLOW und O_DIRECTORY"
+            )
+        return os.O_RDONLY | nofollow | directory | getattr(os, "O_CLOEXEC", 0)
+
     def _ensure_private_root(self) -> None:
-        self._assert_no_symlink_components(self.journal_root)
-        if self.journal_root.exists() or self.journal_root.is_symlink():
-            info = os.lstat(self.journal_root)
-            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-                raise WatchdogTransitionError("Watchdog-Journal ist kein echtes Verzeichnis")
-            if info.st_uid != os.geteuid():
-                raise WatchdogTransitionError("Watchdog-Journal besitzt einen fremden Eigentümer")
-        else:
-            self.journal_root.mkdir(parents=True, mode=0o700)
-        os.chmod(self.journal_root, 0o700)
-        if stat.S_IMODE(os.lstat(self.journal_root).st_mode) != 0o700:
-            raise WatchdogTransitionError("Watchdog-Journal ist nicht privat")
+        if os.geteuid() != 0:
+            raise WatchdogTransitionError("Watchdog-Journal benötigt Root-Rechte")
+        flags = self._directory_flags()
+        descriptor = os.open("/", flags)
+        current = Path("/")
+        try:
+            components = self.journal_root.parts[1:]
+            for index, component in enumerate(components):
+                final = index == len(components) - 1
+                created = False
+                try:
+                    next_descriptor = os.open(component, flags, dir_fd=descriptor)
+                except FileNotFoundError:
+                    os.mkdir(component, 0o700 if final else 0o755, dir_fd=descriptor)
+                    os.fsync(descriptor)
+                    next_descriptor = os.open(component, flags, dir_fd=descriptor)
+                    created = True
+                metadata = os.fstat(next_descriptor)
+                current /= component
+                if (
+                    not stat.S_ISDIR(metadata.st_mode)
+                    or metadata.st_uid != 0
+                    or stat.S_IMODE(metadata.st_mode) & 0o022
+                ):
+                    os.close(next_descriptor)
+                    raise WatchdogTransitionError(
+                        f"Watchdog-Journal-Elternpfad ist nicht root-kontrolliert: {current}"
+                    )
+                if final:
+                    os.fchown(next_descriptor, 0, 0)
+                    os.fchmod(next_descriptor, 0o700)
+                    os.fsync(next_descriptor)
+                    rebound = os.fstat(next_descriptor)
+                    if (
+                        rebound.st_uid != 0
+                        or rebound.st_gid != 0
+                        or stat.S_IMODE(rebound.st_mode) != 0o700
+                    ):
+                        os.close(next_descriptor)
+                        raise WatchdogTransitionError(
+                            "Watchdog-Journalroot ist nicht root:root 0700"
+                        )
+                elif created:
+                    os.fchown(next_descriptor, 0, 0)
+                    os.fchmod(next_descriptor, 0o755)
+                    os.fsync(next_descriptor)
+                if created:
+                    os.fsync(descriptor)
+                os.close(descriptor)
+                descriptor = next_descriptor
+        finally:
+            os.close(descriptor)
+        info = os.lstat(self.journal_root)
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != 0
+            or info.st_gid != 0
+            or stat.S_IMODE(info.st_mode) != 0o700
+        ):
+            raise WatchdogTransitionError("Watchdog-Journal ist nicht root:root 0700")
 
     @contextmanager
     def _locked(self):
         self._ensure_private_root()
-        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        if not nofollow:
+            raise WatchdogTransitionError("Watchdog-Lock benötigt O_NOFOLLOW")
+        flags = os.O_RDWR | os.O_CREAT | nofollow | getattr(os, "O_CLOEXEC", 0)
+        lock_existed = os.path.lexists(self.lock_path)
         fd = os.open(self.lock_path, flags, 0o600)
         try:
-            info = os.fstat(fd)
+            initial = os.fstat(fd)
             if (
-                not stat.S_ISREG(info.st_mode)
-                or info.st_nlink != 1
-                or info.st_uid != os.geteuid()
-                or stat.S_IMODE(info.st_mode) != 0o600
+                not stat.S_ISREG(initial.st_mode)
+                or initial.st_nlink != 1
             ):
                 raise WatchdogTransitionError("Watchdog-Prozesslock ist nicht privat")
+            if not lock_existed:
+                os.fchown(fd, 0, 0)
+                os.fchmod(fd, 0o600)
+                os.fsync(fd)
+                self._fsync_dir(self.journal_root)
+            info = os.fstat(fd)
+            if (
+                info.st_nlink != 1
+                or info.st_uid != 0
+                or info.st_gid != 0
+                or stat.S_IMODE(info.st_mode) != 0o600
+            ):
+                raise WatchdogTransitionError("Watchdog-Prozesslock ist nicht root-privat")
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:
@@ -985,7 +1054,10 @@ class WatchdogBundleInstaller:
     def _read_regular(path: Path, *, single_link: bool = True) -> tuple[bytes, os.stat_result]:
         if path.is_symlink():
             raise WatchdogTransitionError("Watchdog-Datei ist ein Symlink")
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        if not nofollow:
+            raise WatchdogTransitionError("Watchdog-Dateizugriff benötigt O_NOFOLLOW")
+        flags = os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0)
         fd = os.open(path, flags)
         try:
             before = os.fstat(fd)
@@ -998,9 +1070,16 @@ class WatchdogBundleInstaller:
                     break
                 chunks.append(chunk)
             after = os.fstat(fd)
+            named_after = os.lstat(path)
             identity_before = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
             identity_after = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
-            if identity_before != identity_after:
+            identity_named = (
+                named_after.st_dev,
+                named_after.st_ino,
+                named_after.st_size,
+                named_after.st_mtime_ns,
+            )
+            if identity_before != identity_after or identity_after != identity_named:
                 raise WatchdogTransitionError("Watchdog-Datei wurde während des Lesens verändert")
             return b"".join(chunks), after
         finally:
@@ -1100,8 +1179,15 @@ class WatchdogBundleInstaller:
             raise WatchdogTransitionError("Watchdog-Ziel ist nicht absolut")
         self._assert_no_symlink_components(target.parent)
         parent_info = os.lstat(target.parent)
-        if stat.S_ISLNK(parent_info.st_mode) or not stat.S_ISDIR(parent_info.st_mode):
-            raise WatchdogTransitionError("Watchdog-Zielverzeichnis ist nicht echt")
+        if (
+            stat.S_ISLNK(parent_info.st_mode)
+            or not stat.S_ISDIR(parent_info.st_mode)
+            or parent_info.st_uid != os.geteuid()
+            or stat.S_IMODE(parent_info.st_mode) & 0o022
+        ):
+            raise WatchdogTransitionError(
+                "Watchdog-Zielverzeichnis ist nicht exklusiv root-kontrolliert"
+            )
         if target.exists() or target.is_symlink():
             info = os.lstat(target)
             if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
@@ -1109,7 +1195,7 @@ class WatchdogBundleInstaller:
 
     @staticmethod
     def _fsync_dir(path: Path) -> None:
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        fd = os.open(path, WatchdogBundleInstaller._directory_flags())
         try:
             os.fsync(fd)
         finally:
@@ -1127,7 +1213,16 @@ class WatchdogBundleInstaller:
     ) -> None:
         self._validate_target(target)
         temp = target.parent / f".{target.name}.e3dc-{secrets.token_hex(8)}"
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        if not nofollow:
+            raise WatchdogTransitionError("Watchdog-Dateischreiben benötigt O_NOFOLLOW")
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | nofollow
+            | getattr(os, "O_CLOEXEC", 0)
+        )
         fd = os.open(temp, flags, 0o600)
         try:
             view = memoryview(payload)
@@ -1137,14 +1232,14 @@ class WatchdogBundleInstaller:
             os.fsync(fd)
             os.fchmod(fd, mode)
             os.fchown(fd, uid, gid)
+            if mtime_ns is not None:
+                os.utime(fd, ns=(mtime_ns, mtime_ns))
             os.fsync(fd)
         finally:
             os.close(fd)
         try:
             self._validate_target(target)
             os.replace(temp, target)
-            if mtime_ns is not None:
-                os.utime(target, ns=(mtime_ns, mtime_ns), follow_symlinks=False)
             self._fsync_dir(target.parent)
         finally:
             try:
@@ -1158,8 +1253,8 @@ class WatchdogBundleInstaller:
             tx_dir / "journal.json",
             payload,
             mode=0o600,
-            uid=os.geteuid(),
-            gid=os.getegid(),
+            uid=0,
+            gid=0,
         )
 
     def _advance(self, tx_dir: Path, record: dict[str, object], phase: str) -> None:
@@ -1172,14 +1267,38 @@ class WatchdogBundleInstaller:
         self,
         bundle: WatchdogBundle,
         context: TransitionContext,
+        *,
+        child_correlation_id: str | None = None,
     ) -> tuple[str, Path, dict[str, object]]:
+        correlation = str(child_correlation_id or "")
+        if correlation and not re.fullmatch(r"[0-9a-f]{32}", correlation):
+            raise WatchdogTransitionError("Watchdog-Korrelation ist ungültig")
+        if correlation:
+            matches = []
+            for existing_dir in sorted(self.journal_root.glob("tx-*")):
+                if existing_dir.is_symlink() or not existing_dir.is_dir():
+                    raise WatchdogTransitionError("Unsicherer Eintrag im Watchdog-Journal")
+                existing = self._read_journal(existing_dir)
+                if str(existing.get("child_correlation_id") or "") == correlation:
+                    matches.append(str(existing.get("transaction_id") or ""))
+            if matches:
+                raise WatchdogTransitionError(
+                    "Watchdog-Korrelation wurde bereits durch eine Kindtransaktion belegt"
+                )
         transaction_id = f"{int(datetime.now(timezone.utc).timestamp())}-{secrets.token_hex(8)}"
         tx_dir = self.journal_root / f"tx-{transaction_id}"
-        tx_dir.mkdir(mode=0o700)
-        os.chmod(tx_dir, 0o700)
+        staging_dir = self.journal_root / (
+            f".prepare-{transaction_id}-{secrets.token_hex(8)}"
+        )
+        staging_dir.mkdir(mode=0o700)
+        os.chown(staging_dir, 0, 0)
+        os.chmod(staging_dir, 0o700)
+        self._fsync_dir(self.journal_root)
+        self._fsync_dir(staging_dir)
         record: dict[str, object] = {
             "schema": WATCHDOG_BUNDLE_SCHEMA,
             "transaction_id": transaction_id,
+            "child_correlation_id": correlation or None,
             "bundle_sha256": bundle.bundle_sha256,
             "interpreter_path": context.venv_python,
             "interpreter_sha256": bundle.interpreter_sha256,
@@ -1219,12 +1338,20 @@ class WatchdogBundleInstaller:
                 },
             },
         }
-        self._write_journal(tx_dir, record)
+        self._write_journal(staging_dir, record)
+        if os.path.lexists(tx_dir):
+            raise WatchdogTransitionError("Watchdog-Transaktions-ID ist nicht eindeutig")
+        os.rename(staging_dir, tx_dir)
+        self._fsync_dir(self.journal_root)
         return transaction_id, tx_dir, record
 
     def _stage_bundle(self, tx_dir: Path, bundle: WatchdogBundle) -> dict[str, Path]:
         candidate_dir = tx_dir / "candidates"
         candidate_dir.mkdir(mode=0o700)
+        os.chown(candidate_dir, 0, 0)
+        os.chmod(candidate_dir, 0o700)
+        self._fsync_dir(tx_dir)
+        self._fsync_dir(candidate_dir)
         candidates = {
             "notify": candidate_dir / "boot_notify.sh",
             "guard": candidate_dir / "pi_guard.sh",
@@ -1232,13 +1359,13 @@ class WatchdogBundleInstaller:
             "manifest": candidate_dir / "watchdog-bundle.sha256",
         }
         for name, payload, mode in (
-            ("notify", bundle.notify, 0o700),
-            ("guard", bundle.guard, 0o700),
+            ("notify", bundle.notify, 0o600),
+            ("guard", bundle.guard, 0o600),
             ("service", bundle.service.encode("utf-8"), 0o600),
             ("manifest", bundle.manifest, 0o600),
         ):
             self._atomic_write(
-                candidates[name], payload, mode=mode, uid=os.geteuid(), gid=os.getegid()
+                candidates[name], payload, mode=mode, uid=0, gid=0
             )
         self._run(["/usr/bin/bash", "-n", str(candidates["notify"])])
         self._run(["/usr/bin/bash", "-n", str(candidates["guard"])])
@@ -1251,14 +1378,19 @@ class WatchdogBundleInstaller:
             return _FileSnapshot(str(target), False, None, None, None, None, None, None)
         payload, info = self._read_regular(target)
         snapshot_dir = tx_dir / "snapshots"
-        snapshot_dir.mkdir(mode=0o700, exist_ok=True)
+        if not snapshot_dir.exists():
+            snapshot_dir.mkdir(mode=0o700)
+            os.chown(snapshot_dir, 0, 0)
+            os.chmod(snapshot_dir, 0o700)
+            self._fsync_dir(tx_dir)
+            self._fsync_dir(snapshot_dir)
         backup_name = f"file-{index:02d}.bin"
         self._atomic_write(
             snapshot_dir / backup_name,
             payload,
             mode=0o600,
-            uid=os.geteuid(),
-            gid=os.getegid(),
+            uid=0,
+            gid=0,
         )
         return _FileSnapshot(
             str(target),
@@ -1281,7 +1413,13 @@ class WatchdogBundleInstaller:
             return
         if snapshot.backup_file is None:
             raise WatchdogTransitionError("Watchdog-Snapshot besitzt keine Sicherung")
-        payload, _info = self._read_regular(tx_dir / snapshot.backup_file)
+        payload, backup_info = self._read_regular(tx_dir / snapshot.backup_file)
+        if (
+            backup_info.st_uid != 0
+            or backup_info.st_gid != 0
+            or stat.S_IMODE(backup_info.st_mode) != 0o600
+        ):
+            raise WatchdogTransitionError("Watchdog-Snapshot ist nicht root-privat")
         if _sha256(payload) != snapshot.sha256:
             raise WatchdogTransitionError("Watchdog-Snapshot-Prüfsumme stimmt nicht")
         self._atomic_write(
@@ -1427,8 +1565,8 @@ class WatchdogBundleInstaller:
             self.recovery_status_path,
             (json.dumps(status, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8"),
             mode=0o600,
-            uid=os.geteuid(),
-            gid=os.getegid(),
+            uid=0,
+            gid=0,
         )
 
     def _read_journal(self, tx_dir: Path) -> dict[str, object]:
@@ -1436,14 +1574,16 @@ class WatchdogBundleInstaller:
         if (
             stat.S_ISLNK(info.st_mode)
             or not stat.S_ISDIR(info.st_mode)
-            or info.st_uid != os.geteuid()
+            or info.st_uid != 0
+            or info.st_gid != 0
             or stat.S_IMODE(info.st_mode) != 0o700
         ):
             raise WatchdogTransitionError("Watchdog-Transaktionsverzeichnis ist unsicher")
         journal = tx_dir / "journal.json"
         payload, journal_info = self._read_regular(journal)
         if (
-            journal_info.st_uid != os.geteuid()
+            journal_info.st_uid != 0
+            or journal_info.st_gid != 0
             or stat.S_IMODE(journal_info.st_mode) != 0o600
         ):
             raise WatchdogTransitionError("Watchdog-Journaldatei ist nicht privat")
@@ -1454,9 +1594,19 @@ class WatchdogBundleInstaller:
         if (
             not isinstance(record, dict)
             or record.get("schema") != WATCHDOG_BUNDLE_SCHEMA
-            or not str(record.get("transaction_id", ""))
+            or not re.fullmatch(
+                r"[0-9]+-[0-9a-f]{16}",
+                str(record.get("transaction_id") or ""),
+            )
+            or tx_dir.name != f"tx-{record.get('transaction_id')}"
         ):
             raise WatchdogTransitionError("Watchdog-Journal besitzt ein unbekanntes Schema")
+        correlation = record.get("child_correlation_id")
+        if correlation is not None and (
+            not isinstance(correlation, str)
+            or not re.fullmatch(r"[0-9a-f]{32}", correlation)
+        ):
+            raise WatchdogTransitionError("Watchdog-Journal besitzt eine ungültige Korrelation")
         return record
 
     def _pending_transactions(self) -> list[tuple[Path, dict[str, object]]]:
@@ -1510,6 +1660,15 @@ class WatchdogBundleInstaller:
         recovered: list[str] = []
         for tx_dir, record in self._pending_transactions():
             transaction_id = str(record["transaction_id"])
+            if record.get("state") == "recovery_required":
+                previous_errors = record.get("rollback_errors")
+                errors = (
+                    list(map(str, previous_errors))
+                    if isinstance(previous_errors, (list, tuple)) and previous_errors
+                    else ["sticky_recovery_required"]
+                )
+                self._mark_recovery_required(tx_dir, record, errors)
+                raise WatchdogRecoveryRequired(transaction_id)
             if self._record_live_complete(record) and self._query_active() == "active":
                 record["state"] = "committed"
                 record["recovered"] = True
@@ -1532,6 +1691,71 @@ class WatchdogBundleInstaller:
         with self._locked():
             self.systemd.recover_incomplete()
             return self._recover_incomplete_locked()
+
+    def correlation_status(self, child_correlation_id: str) -> dict[str, object]:
+        """Belegt genau einen korrelierten, live wirksamen Kindcommit."""
+
+        correlation = str(child_correlation_id or "")
+        if not re.fullmatch(r"[0-9a-f]{32}", correlation):
+            raise WatchdogTransitionError("Watchdog-Korrelation ist ungültig")
+        with self._locked():
+            self.systemd.recover_incomplete()
+            self._recover_incomplete_locked()
+            return self._correlation_status_locked(correlation)
+
+    def _correlation_status_locked(self, correlation: str) -> dict[str, object]:
+        matches: list[tuple[Path, dict[str, object]]] = []
+        for tx_dir in sorted(self.journal_root.glob("tx-*")):
+            if tx_dir.is_symlink() or not tx_dir.is_dir():
+                raise WatchdogTransitionError("Unsicherer Eintrag im Watchdog-Journal")
+            record = self._read_journal(tx_dir)
+            if str(record.get("child_correlation_id") or "") == correlation:
+                matches.append((tx_dir, record))
+        if len(matches) > 1:
+            return {
+                "status": "ambiguous",
+                "child_correlation_id": correlation,
+                "match_count": len(matches),
+            }
+        if not matches:
+            return {
+                "status": "missing",
+                "child_correlation_id": correlation,
+                "match_count": 0,
+            }
+        _tx_dir, record = matches[0]
+        state = str(record.get("state") or "")
+        phase = str(record.get("phase") or "")
+        if (
+            state == "committed"
+            and phase in {"commit_complete", "recovered_commit"}
+            and self._record_live_complete(record)
+            and self._query_active() == "active"
+        ):
+            return {
+                "status": "committed",
+                "child_correlation_id": correlation,
+                "match_count": 1,
+                "transaction_id": str(record.get("transaction_id") or ""),
+                "bundle_sha256": str(record.get("bundle_sha256") or ""),
+                "phase": phase,
+                "recovered": bool(record.get("recovered")),
+            }
+        if state == "recovery_required":
+            status = "recovery_required"
+        elif state == "rolled_back":
+            status = "rolled_back"
+        elif state in {"preparing", "in_progress"}:
+            status = "incomplete"
+        else:
+            status = "drifted"
+        return {
+            "status": status,
+            "child_correlation_id": correlation,
+            "match_count": 1,
+            "transaction_id": str(record.get("transaction_id") or ""),
+            "phase": phase,
+        }
 
     def _rollback(
         self,
@@ -1574,12 +1798,18 @@ class WatchdogBundleInstaller:
         context: TransitionContext,
         router_ips: str,
         monitor_file: str = "",
+        *,
+        child_correlation_id: str | None = None,
     ) -> str:
         bundle = self.render_bundle(context, router_ips, monitor_file)
         with self._locked():
             self.systemd.recover_incomplete()
             self._recover_incomplete_locked()
-            transaction_id, tx_dir, record = self._new_transaction(bundle, context)
+            transaction_id, tx_dir, record = self._new_transaction(
+                bundle,
+                context,
+                child_correlation_id=child_correlation_id,
+            )
             systemd_called = False
             try:
                 self._phase("preflight_complete", record)
@@ -1653,13 +1883,32 @@ class WatchdogBundleInstaller:
                 raise WatchdogTransitionRolledBack(transaction_id) from exc
 
 
+def watchdog_correlation_status(child_correlation_id: str) -> dict[str, object]:
+    """Produktionspfad für die äußere Notifier↔Watchdog-Recovery."""
+
+    return WatchdogBundleInstaller().correlation_status(child_correlation_id)
+
+
+@contextmanager
+def watchdog_correlation_guard(child_correlation_id: str):
+    """Hält den Watchdog-Lock über äußere Entscheidung und Zustandsübergang."""
+
+    correlation = str(child_correlation_id or "")
+    if not re.fullmatch(r"[0-9a-f]{32}", correlation):
+        raise WatchdogTransitionError("Watchdog-Korrelation ist ungültig")
+    installer = WatchdogBundleInstaller()
+    with installer._locked():
+        installer.systemd.recover_incomplete()
+        installer._recover_incomplete_locked()
+        yield installer._correlation_status_locked(correlation)
+
+
 def _restore_r1_watchdog_auxiliaries(
     context: TransitionContext,
     *,
-    notifier_installer=None,
     runner: CommandRunner | None = None,
 ) -> list[str]:
-    """Stellt R1-Notifier, Logzugriff und Legacy-Dateibereinigung getrennt wieder her.
+    """Stellt Logzugriff und Legacy-Dateibereinigung nach dem Commit wieder her.
 
     Dies läuft bewusst erst nach dem Commit der SHA-gebundenen Watchdog-Transaktion.
     Es nimmt an dieser Transaktion weder teil noch schwächt es sie. Jeder
@@ -1668,12 +1917,7 @@ def _restore_r1_watchdog_auxiliaries(
     """
 
     warnings: list[str] = []
-    notifier_action = notifier_installer or install_notifier
     command_runner = runner or _default_command_runner
-    try:
-        notifier_action()
-    except Exception as exc:
-        warnings.append(f"Notifier:{type(exc).__name__}")
 
     try:
         result = command_runner(
@@ -1732,12 +1976,41 @@ def install_watchdog_bundle(
     monitor_file: str = "",
     *,
     install_auxiliaries: bool = False,
+    explicit_install_path: str | None = None,
+    explicit_install_user: str | None = None,
+    explicit_home_dir: str | None = None,
+    explicit_venv_path: str | None = None,
 ) -> str:
     """Löst den einmaligen Transitionskontext auf und installiert genau ein Paket."""
-    context = get_transition_context(require_trusted=True)
-    bundle_sha = WatchdogBundleInstaller().install(context, router_ips, monitor_file)
+    context = get_transition_context(
+        explicit_install_path=explicit_install_path,
+        explicit_install_user=explicit_install_user,
+        explicit_home_dir=explicit_home_dir,
+        explicit_venv_path=explicit_venv_path,
+        require_trusted=True,
+    )
     if install_auxiliaries:
-        for warning in _restore_r1_watchdog_auxiliaries(context):
+        # Der Notifier bleibt bis zum bestätigten Watchdog-Commit in derselben
+        # gesperrten Außentransaktion. Rollt der Watchdog intern zurück, wird
+        # deshalb auch der Notifier samt Config/Cron/Unit-Vorzustand restauriert.
+        print("\n=== Benachrichtigungs-Dienst einrichten ===")
+        with notifier_install_transaction(
+            start_service=True,
+            migrate_legacy_config=True,
+            watchdog_required=True,
+        ) as notifier_transaction:
+            child_correlation_id = begin_watchdog_child(notifier_transaction)
+            bundle_sha = WatchdogBundleInstaller().install(
+                context,
+                router_ips,
+                monitor_file,
+                child_correlation_id=child_correlation_id,
+            )
+    else:
+        bundle_sha = WatchdogBundleInstaller().install(context, router_ips, monitor_file)
+    if install_auxiliaries:
+        warnings = _restore_r1_watchdog_auxiliaries(context)
+        for warning in warnings:
             print(f"Watchdog-Nachlauf: {warning}")
     return bundle_sha
 
@@ -1768,10 +2041,45 @@ def configure_hardware_watchdog() -> bool:
     return True
 
 
+def _resolve_watchdog_menu_context() -> TransitionContext:
+    """Bindet den registrierten Menüpfad an Wrapper-Nutzer, Root, Home und venv."""
+
+    product_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    install_user = str(os.environ.get("E3DC_BOOTSTRAP_USER") or "").strip()
+    if not install_user or install_user in {"root", "www-data"}:
+        raise TransitionContextError(
+            "Der Watchdog-Menüpfad benötigt den durch e3dc-setup gebundenen Nutzer"
+        )
+    try:
+        account = pwd.getpwnam(install_user)
+    except KeyError as exc:
+        raise TransitionContextError("Installationsbenutzer existiert nicht") from exc
+
+    from .utils import require_bound_venv_runtime, resolve_venv_target
+
+    _venv_name, venv_path = resolve_venv_target(install_user)
+    require_bound_venv_runtime(
+        install_user=install_user,
+        venv_path=venv_path,
+    )
+    return get_transition_context(
+        explicit_install_path=product_root,
+        explicit_install_user=install_user,
+        explicit_home_dir=account.pw_dir,
+        explicit_venv_path=venv_path,
+        require_trusted=True,
+    )
+
+
 def setup_watchdog_menu():
     if os.geteuid() != 0:
         print("❌ Fehler: Dieses Skript muss als root ausgeführt werden.")
-        return
+        return False
+    try:
+        context = _resolve_watchdog_menu_context()
+    except Exception as exc:
+        print(f"Watchdog-Installation sicher abgebrochen: {exc}")
+        return False
     print("\n=== PV-Wächter & Telegram Setup ===")
     current = get_current_config()
     is_installed = os.path.exists(NOTIFY_PATH)
@@ -1785,24 +2093,40 @@ def setup_watchdog_menu():
         print("3. Abbrechen")
         choice = input("Auswahl: ").strip()
         if choice == "3":
-            return
+            return True
     else:
         choice = "1"
     if choice not in {"1", "2"}:
-        return
+        print("Ungültige Auswahl.")
+        return False
     prompt = "Router-IP(s) für Watchdog" if choice == "1" else "Neue Router-IP(s)"
     router_ip = input(f"{prompt} [{current['ROUTER_IP']}]: ").strip() or current["ROUTER_IP"]
     try:
         router_ip = validate_router_ips(router_ip)
-        bundle_sha = install_watchdog_bundle(router_ip, "", install_auxiliaries=True)
+        bundle_sha = install_watchdog_bundle(
+            router_ip,
+            "",
+            install_auxiliaries=True,
+            explicit_install_path=context.install_path,
+            explicit_install_user=context.install_user,
+            explicit_home_dir=context.home_dir,
+            explicit_venv_path=context.venv_path,
+        )
     except Exception as exc:
         print(f"Watchdog-Installation sicher abgebrochen: {exc}")
-        return
+        return False
     print(f"✓ Watchdog-Bundle installiert ({bundle_sha[:12]}).")
     print("Hardware-Watchdog system.conf wurde nicht verändert.")
+    return True
 
 
-def install_watchdog_silent():
+def install_watchdog_silent(
+    *,
+    explicit_install_path: str | None = None,
+    explicit_install_user: str | None = None,
+    explicit_home_dir: str | None = None,
+    explicit_venv_path: str | None = None,
+):
     """Installiert das komplette Bundle; ohne Gateway bleibt alles unverändert."""
     print("\n=== Watchdog-Installation (Automatisch) ===")
     router_ip = detect_default_gateway()
@@ -1810,7 +2134,15 @@ def install_watchdog_silent():
         print("Watchdog nicht installiert: kein gültiges Standard-Gateway erkannt.")
         return False
     try:
-        bundle_sha = install_watchdog_bundle(router_ip, "", install_auxiliaries=True)
+        bundle_sha = install_watchdog_bundle(
+            router_ip,
+            "",
+            install_auxiliaries=True,
+            explicit_install_path=explicit_install_path,
+            explicit_install_user=explicit_install_user,
+            explicit_home_dir=explicit_home_dir,
+            explicit_venv_path=explicit_venv_path,
+        )
     except Exception as exc:
         print(f"Watchdog-Installation sicher abgebrochen: {exc}")
         return False

@@ -10,15 +10,23 @@ Installation, Rechte, Web-Synchronisation sowie Dienststart finalisieren.
 from __future__ import annotations
 
 import argparse
+import fcntl
+import hashlib
 import io
+import inspect
 import os
+import queue
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
+import time
+from collections import Counter, deque
 from pathlib import Path
 
 
@@ -35,6 +43,520 @@ _SNAPSHOT_MAX_TOTAL_BYTES = 128 * 1024 * 1024
 _COMPAT_SNAPSHOT_PARENT = Path("/run")
 _COMPAT_SNAPSHOT_PREFIX = ".e3dc-release-finalizer-compat-"
 _FINALIZER_SUCCESS = "E3DC_RELEASE_TARGET_FINALIZER_OK"
+_TARGET_UPDATER_SUCCESS = "E3DC_RELEASE_TARGET_UPDATER_OK"
+_TARGET_UPDATER_NOOP = "E3DC_RELEASE_TARGET_UPDATER_NOOP"
+_FINALIZER_TIMEOUT_S = 30 * 60
+_FINALIZER_HEARTBEAT_S = 30
+_FINALIZER_TERMINATE_GRACE_S = 10
+_FINALIZER_DIAGNOSTIC_LINES = 512
+_UPDATE_LOCK_PATH = Path("/run/lock/e3dc-control/update.lock")
+_UPDATE_LOCK_ENV = "E3DC_UPDATE_LOCK_FD"
+
+
+class _DeferredParentSignal(BaseException):
+    """Signalisiert einen Nutzerabbruch erst nach sicherem Kindprozessende."""
+
+    def __init__(self, signum: int):
+        self.signum = int(signum)
+        super().__init__(f"Elternprozess erhielt Signal {self.signum}")
+
+
+class _TerminalSignalGuard:
+    """Blockiert Folgesignale, bis ein mutierender Kindprozess beendet ist."""
+
+    def __init__(self):
+        self.requested_signum: int | None = None
+        self._previous_handlers: dict[int, object] = {}
+        self._previous_mask = None
+        self._installed = False
+        self._armed = False
+
+    def install(self) -> None:
+        if (
+            os.name != "posix"
+            or threading.current_thread() is not threading.main_thread()
+        ):
+            return
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            self._previous_handlers[signum] = signal.getsignal(signum)
+            signal.signal(signum, self._handle)
+        self._installed = True
+
+    def _handle(self, signum, _frame) -> None:
+        if self.requested_signum is not None:
+            return
+        self.requested_signum = int(signum)
+        if self._armed and hasattr(signal, "pthread_sigmask"):
+            self._previous_mask = signal.pthread_sigmask(
+                signal.SIG_BLOCK,
+                {signal.SIGINT, signal.SIGTERM},
+            )
+
+    def arm(self) -> None:
+        """Blockiert Folgesignale erst, nachdem das Kind sicher gestartet ist."""
+
+        self._armed = True
+        if (
+            self.requested_signum is not None
+            and self._previous_mask is None
+            and hasattr(signal, "pthread_sigmask")
+        ):
+            self._previous_mask = signal.pthread_sigmask(
+                signal.SIG_BLOCK,
+                {signal.SIGINT, signal.SIGTERM},
+            )
+
+    def raise_if_requested(self) -> None:
+        if self.requested_signum is not None:
+            raise _DeferredParentSignal(self.requested_signum)
+
+    def restore(self) -> None:
+        if not self._installed:
+            return
+        self._installed = False
+        for signum, previous in self._previous_handlers.items():
+            signal.signal(signum, previous)
+        if self._previous_mask is not None:
+            signal.pthread_sigmask(signal.SIG_SETMASK, self._previous_mask)
+
+
+class _FailSafeProcessStream:
+    """Lässt einen abgerissenen Parent-Pipe niemals den Recoverypfad abbrechen."""
+
+    def __init__(self, stream):
+        self._stream = stream
+        self._fallback = None
+
+    def _fallback_stream(self):
+        if self._fallback is None:
+            descriptor = os.open(
+                "/dev/null",
+                os.O_WRONLY | getattr(os, "O_CLOEXEC", 0),
+            )
+            self._fallback = os.fdopen(
+                descriptor,
+                "w",
+                encoding="utf-8",
+                buffering=1,
+            )
+        self._stream = self._fallback
+        return self._fallback
+
+    def write(self, value):
+        try:
+            return self._stream.write(value)
+        except (BrokenPipeError, OSError, ValueError):
+            return self._fallback_stream().write(value)
+
+    def flush(self):
+        try:
+            return self._stream.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            return self._fallback_stream().flush()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+def _install_fail_safe_process_streams() -> None:
+    if not isinstance(sys.stdout, _FailSafeProcessStream):
+        sys.stdout = _FailSafeProcessStream(sys.stdout)
+    if not isinstance(sys.stderr, _FailSafeProcessStream):
+        sys.stderr = _FailSafeProcessStream(sys.stderr)
+
+
+def _assert_root_controlled_directory_chain(path: Path) -> None:
+    """Bindet jede kanonische Interpreter-Verzeichniskomponente an Root."""
+
+    directory = Path(path)
+    if not directory.is_absolute() or directory.resolve(strict=True) != directory:
+        raise RuntimeError("Systempfad enthält eine nicht kanonische Verzeichniskomponente")
+    current = Path(directory.anchor)
+    for component in directory.parts[1:]:
+        current /= component
+        metadata = current.lstat()
+        if (
+            current.is_symlink()
+            or not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != 0
+            or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            raise RuntimeError(
+                f"Systempfad besitzt eine unsichere Verzeichniskomponente: {current}"
+            )
+
+
+def _trusted_system_python() -> str:
+    """Verwendet für Root-Snapshots nie den aufrufenden Benutzer-venv."""
+
+    candidate = Path("/usr/bin/python3")
+    try:
+        _assert_root_controlled_directory_chain(candidate.parent)
+        link_info = candidate.lstat()
+        target = candidate.resolve(strict=True)
+        _assert_root_controlled_directory_chain(target.parent)
+        target_info = target.stat()
+    except OSError as exc:
+        raise RuntimeError("Fester System-Python ist nicht verfügbar") from exc
+    if not (stat.S_ISLNK(link_info.st_mode) or stat.S_ISREG(link_info.st_mode)):
+        raise RuntimeError("System-Python-Pfad ist weder Link noch reguläre Datei")
+    if link_info.st_uid != 0:
+        raise RuntimeError("System-Python-Pfad besitzt unsichere Metadaten")
+    if (
+        stat.S_ISREG(link_info.st_mode)
+        and link_info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        raise RuntimeError("System-Python-Datei ist gruppen- oder weltbeschreibbar")
+    if target.parent != Path("/usr/bin"):
+        raise RuntimeError("System-Python-Ziel liegt nicht im festen Systempfad")
+    if (
+        not stat.S_ISREG(target_info.st_mode)
+        or target_info.st_uid != 0
+        or target_info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        or not target_info.st_mode & 0o111
+    ):
+        raise RuntimeError("System-Python-Ziel besitzt unsichere Metadaten")
+    descriptor = os.open(
+        str(target),
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0),
+    )
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_mode,
+            opened.st_uid,
+            opened.st_gid,
+        ) != (
+            target_info.st_dev,
+            target_info.st_ino,
+            target_info.st_mode,
+            target_info.st_uid,
+            target_info.st_gid,
+        ):
+            raise RuntimeError("System-Python-Ziel driftete während der Bindung")
+    finally:
+        os.close(descriptor)
+    return str(target)
+
+
+def _assert_update_lock_directory(path: Path) -> None:
+    """Bindet den privaten Lock-Unterbaum samt Sticky-Systemroot."""
+
+    directory = Path(path)
+    if not directory.is_absolute() or directory.resolve(strict=True) != directory:
+        raise RuntimeError("Update-Lock-Verzeichnis ist nicht kanonisch")
+    current = Path(directory.anchor)
+    for component in directory.parts[1:]:
+        current /= component
+        metadata = current.lstat()
+        shared_root = current == Path("/run/lock")
+        shared_safe = (
+            shared_root
+            and metadata.st_uid == 0
+            and metadata.st_gid == 0
+            and bool(metadata.st_mode & stat.S_ISVTX)
+        )
+        if (
+            current.is_symlink()
+            or not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != 0
+            or (
+                not shared_safe
+                and metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            )
+        ):
+            raise RuntimeError(
+                f"Update-Lock-Pfad besitzt eine unsichere Komponente: {current}"
+            )
+
+
+def _open_update_lock_directory(*, create: bool) -> int:
+    shared_root = Path("/run/lock")
+    metadata = shared_root.lstat()
+    if (
+        shared_root.is_symlink()
+        or not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or (
+            metadata.st_mode & stat.S_IWOTH
+            and not metadata.st_mode & stat.S_ISVTX
+        )
+    ):
+        raise RuntimeError("Systemweites Lock-Verzeichnis ist nicht vertrauenswürdig")
+    shared_fd = os.open(
+        str(shared_root),
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        if create:
+            try:
+                os.mkdir("e3dc-control", 0o700, dir_fd=shared_fd)
+            except FileExistsError:
+                pass
+        private_fd = os.open(
+            "e3dc-control",
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=shared_fd,
+        )
+    finally:
+        os.close(shared_fd)
+    private = os.fstat(private_fd)
+    if (
+        not stat.S_ISDIR(private.st_mode)
+        or private.st_uid != 0
+        or private.st_gid != 0
+        or stat.S_IMODE(private.st_mode) != 0o700
+    ):
+        os.close(private_fd)
+        raise RuntimeError("Privates Update-Lock-Verzeichnis besitzt unsichere Metadaten")
+    return private_fd
+
+
+def _validate_update_lock_fd(descriptor: int) -> int:
+    fd = int(descriptor)
+    if fd < 3:
+        raise RuntimeError("Update-Lock-FD ist unzulässig")
+    _assert_update_lock_directory(_UPDATE_LOCK_PATH.parent)
+    path_metadata = _UPDATE_LOCK_PATH.lstat()
+    fd_metadata = os.fstat(fd)
+    if (
+        _UPDATE_LOCK_PATH.is_symlink()
+        or not stat.S_ISREG(path_metadata.st_mode)
+        or path_metadata.st_nlink != 1
+        or path_metadata.st_uid != 0
+        or path_metadata.st_gid != 0
+        or stat.S_IMODE(path_metadata.st_mode) != 0o600
+        or (path_metadata.st_dev, path_metadata.st_ino)
+        != (fd_metadata.st_dev, fd_metadata.st_ino)
+        or not stat.S_ISREG(fd_metadata.st_mode)
+        or fd_metadata.st_nlink != 1
+        or fd_metadata.st_uid != 0
+        or fd_metadata.st_gid != 0
+        or stat.S_IMODE(fd_metadata.st_mode) != 0o600
+    ):
+        raise RuntimeError("Update-Lock besitzt unsichere Datei- oder FD-Metadaten")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        raise RuntimeError(
+            "Ein anderer E3DC-Control-Releasewechsel läuft bereits"
+        ) from exc
+    return fd
+
+
+def _acquire_or_inherit_update_lock(*, allow_create: bool) -> tuple[int, bool]:
+    inherited = str(os.environ.get(_UPDATE_LOCK_ENV) or "").strip()
+    if inherited:
+        if not inherited.isdecimal():
+            raise RuntimeError("Geerbter Update-Lock-FD ist ungültig")
+        return _validate_update_lock_fd(int(inherited)), False
+    if not allow_create:
+        raise RuntimeError("Versiegelter Finalizer besitzt keinen geerbten Transaktionslock")
+    if os.geteuid() != 0:
+        raise RuntimeError("Release-Finalizer benötigt Root für den Update-Lock")
+    directory_fd = _open_update_lock_directory(create=True)
+    try:
+        descriptor = os.open(
+            _UPDATE_LOCK_PATH.name,
+            os.O_RDWR
+            | os.O_CREAT
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=directory_fd,
+        )
+    finally:
+        os.close(directory_fd)
+    try:
+        return _validate_update_lock_fd(descriptor), True
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _required_update_lock_fd() -> int:
+    inherited = str(os.environ.get(_UPDATE_LOCK_ENV) or "").strip()
+    if not inherited or not inherited.isdecimal():
+        raise RuntimeError("Finalizer besitzt keinen geerbten Transaktionslock")
+    return _validate_update_lock_fd(int(inherited))
+
+
+def _run_compat_finalizer(command, *, environment, pass_fds=()) -> dict:
+    """Streamt den mutierenden Alt-Updater-Bridgeprozess mit hartem Zeitlimit."""
+
+    signal_guard = _TerminalSignalGuard()
+    signal_guard.install()
+    try:
+        process = subprocess.Popen(
+            [str(item) for item in command],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            env=environment,
+            start_new_session=os.name == "posix",
+            pass_fds=tuple(int(item) for item in pass_fds),
+        )
+    except OSError as exc:
+        signal_guard.restore()
+        return {
+            "returncode": -1,
+            "output": "",
+            "line_counts": {},
+            "timed_out": False,
+            "error": str(exc),
+        }
+    except BaseException:
+        signal_guard.restore()
+        raise
+    signal_guard.arm()
+
+    events: queue.Queue[str | None] = queue.Queue()
+    tail = deque(maxlen=_FINALIZER_DIAGNOSTIC_LINES)
+    line_counts: Counter[str] = Counter()
+
+    def _drain() -> None:
+        try:
+            for line in iter(process.stdout.readline, ""):
+                events.put(line)
+        finally:
+            events.put(None)
+            process.stdout.close()
+
+    reader = threading.Thread(target=_drain, daemon=True)
+    reader.start()
+    started = time.monotonic()
+    last_heartbeat = started
+    stream_done = False
+    timed_out = False
+    termination_started = 0.0
+    force_sent = False
+
+    def _stop_process_tree(*, force: bool) -> None:
+        try:
+            if os.name == "posix":
+                os.killpg(
+                    process.pid,
+                    signal.SIGKILL if force else signal.SIGTERM,
+                )
+            elif process.poll() is not None:
+                return
+            elif force:
+                process.kill()
+            else:
+                process.terminate()
+        except ProcessLookupError:
+            pass
+        except OSError:
+            if process.poll() is None:
+                try:
+                    process.kill() if force else process.terminate()
+                except ProcessLookupError:
+                    pass
+
+    try:
+        while not stream_done or process.poll() is None:
+            signal_guard.raise_if_requested()
+            now = time.monotonic()
+            if not timed_out and now - started >= _FINALIZER_TIMEOUT_S:
+                timed_out = True
+                termination_started = now
+                _stop_process_tree(force=False)
+                print(
+                    f"[!] Kompatibilitäts-Finalizer überschreitet "
+                    f"{_FINALIZER_TIMEOUT_S} Sekunden; Recovery wird vorbereitet.",
+                    flush=True,
+                )
+            elif (
+                timed_out
+                and not force_sent
+                and now - termination_started >= _FINALIZER_TERMINATE_GRACE_S
+            ):
+                _stop_process_tree(force=True)
+                force_sent = True
+            try:
+                line = events.get(timeout=0.2)
+            except queue.Empty:
+                line = ""
+            if line is None:
+                stream_done = True
+            elif line:
+                tail.append(line)
+                line_counts[line.strip()] += 1
+                sys.stdout.write(line)
+                sys.stdout.flush()
+            now = time.monotonic()
+            if (
+                not timed_out
+                and process.poll() is None
+                and now - last_heartbeat >= _FINALIZER_HEARTBEAT_S
+            ):
+                print(
+                    f"[i] Kompatibilitäts-Finalizer läuft weiter "
+                    f"({int(now - started)} Sekunden seit Start).",
+                    flush=True,
+                )
+                last_heartbeat = now
+    except BaseException:
+        # Auch bei abgebrochenem Ausgabeweg bleibt der Snapshot bestehen und
+        # der Kindprozess unter demselben Lock, bis sein mutierender Lauf
+        # eindeutig beendet ist. Das reguläre Finalizer-Zeitlimit gilt weiter.
+        try:
+            while not stream_done or process.poll() is None:
+                now = time.monotonic()
+                if not timed_out and now - started >= _FINALIZER_TIMEOUT_S:
+                    timed_out = True
+                    termination_started = now
+                    _stop_process_tree(force=False)
+                elif (
+                    timed_out
+                    and not force_sent
+                    and now - termination_started >= _FINALIZER_TERMINATE_GRACE_S
+                ):
+                    _stop_process_tree(force=True)
+                    force_sent = True
+                try:
+                    line = events.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                if line is None:
+                    stream_done = True
+                elif line:
+                    tail.append(line)
+                    line_counts[line.strip()] += 1
+            process.wait()
+            reader.join(timeout=1)
+        finally:
+            signal_guard.restore()
+        raise
+    returncode = process.wait()
+    reader.join(timeout=1)
+    try:
+        signal_guard.raise_if_requested()
+        return {
+            "returncode": returncode,
+            "output": "".join(tail),
+            "line_counts": dict(line_counts),
+            "timed_out": timed_out,
+            "error": (
+                f"Zeitlimit von {_FINALIZER_TIMEOUT_S} Sekunden überschritten"
+                if timed_out
+                else ""
+            ),
+        }
+    finally:
+        signal_guard.restore()
 
 
 def _regular_nofollow(path: Path, label: str) -> Path:
@@ -312,6 +834,32 @@ def _trusted_snapshot_parent(parent: Path) -> Path:
     return parent
 
 
+def _trusted_same_filesystem_snapshot_parent(product_root: Path) -> Path:
+    """Findet oberhalb des Produkts einen root-kontrollierten Ort auf demselben FS."""
+
+    root = Path(os.path.abspath(product_root)).resolve(strict=True)
+    product_device = root.lstat().st_dev
+    candidate = root.parent
+    while True:
+        metadata = candidate.lstat()
+        if (
+            not candidate.is_symlink()
+            and stat.S_ISDIR(metadata.st_mode)
+            and metadata.st_dev == product_device
+            and metadata.st_uid == os.geteuid()
+            and metadata.st_gid == os.getegid()
+            and not metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            and candidate.resolve(strict=True) == candidate
+        ):
+            return _trusted_snapshot_parent(candidate)
+        if candidate.parent == candidate:
+            break
+        candidate = candidate.parent
+    raise RuntimeError(
+        "Kein root-kontrollierter Snapshot-Ort auf dem Produkt-Dateisystem verfügbar"
+    )
+
+
 def _remove_compat_execution_snapshot(snapshot_root: Path, parent: Path) -> None:
     root = Path(os.path.abspath(snapshot_root))
     bound_parent = Path(os.path.abspath(parent))
@@ -345,6 +893,73 @@ def _remove_compat_execution_snapshot(snapshot_root: Path, parent: Path) -> None
                 raise RuntimeError("Kompatibilitäts-Snapshot enthält vor der Bereinigung eine Fremddatei")
         os.chmod(directory_path, 0o700)
     shutil.rmtree(root)
+
+
+def _cleanup_stale_compat_snapshots(parent: Path) -> int:
+    """Bereinigt unter exklusivem Lock ausschließlich sichere Compat-Reste."""
+
+    _required_update_lock_fd()
+    bound_parent = _trusted_snapshot_parent(parent)
+    stale_roots = []
+    with os.scandir(bound_parent) as entries:
+        for entry in entries:
+            if not entry.name.startswith(_COMPAT_SNAPSHOT_PREFIX):
+                continue
+            metadata = entry.stat(follow_symlinks=False)
+            if (
+                entry.is_symlink()
+                or not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or metadata.st_gid != os.getegid()
+                or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            ):
+                raise RuntimeError(
+                    f"Kompatibilitäts-Snapshotrest ist unsicher: {entry.name}"
+                )
+            root = Path(os.path.abspath(entry.path))
+            if root.parent != bound_parent:
+                raise RuntimeError("Kompatibilitäts-Snapshotrest verlässt den Elternpfad")
+            for directory, dirnames, filenames in os.walk(
+                root,
+                topdown=True,
+                followlinks=False,
+            ):
+                directory_metadata = os.lstat(directory)
+                if (
+                    stat.S_ISLNK(directory_metadata.st_mode)
+                    or not stat.S_ISDIR(directory_metadata.st_mode)
+                    or directory_metadata.st_uid != os.geteuid()
+                    or directory_metadata.st_gid != os.getegid()
+                    or directory_metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                ):
+                    raise RuntimeError(
+                        f"Kompatibilitäts-Snapshotrest ist nicht gebunden: {entry.name}"
+                    )
+                for name in dirnames:
+                    child = Path(directory, name)
+                    child_metadata = child.lstat()
+                    if child.is_symlink() or not stat.S_ISDIR(child_metadata.st_mode):
+                        raise RuntimeError(
+                            f"Kompatibilitäts-Snapshotrest enthält Fremdpfad: {entry.name}"
+                        )
+                for name in filenames:
+                    child = Path(directory, name)
+                    child_metadata = child.lstat()
+                    if (
+                        child.is_symlink()
+                        or not stat.S_ISREG(child_metadata.st_mode)
+                        or child_metadata.st_nlink != 1
+                        or child_metadata.st_uid != os.geteuid()
+                        or child_metadata.st_gid != os.getegid()
+                        or child_metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                    ):
+                        raise RuntimeError(
+                            f"Kompatibilitäts-Snapshotrest enthält unsichere Datei: {entry.name}"
+                        )
+            stale_roots.append(root)
+    for stale_root in stale_roots:
+        _remove_compat_execution_snapshot(stale_root, bound_parent)
+    return len(stale_roots)
 
 
 def _create_compat_execution_snapshot(
@@ -431,6 +1046,8 @@ def _bind_execution_snapshot(
     snapshot_root: Path,
     product_root: Path,
     expected_commit: str,
+    *,
+    require_product_target_files: bool = True,
 ) -> None:
     expected = _commit_execution_entries(product_root, expected_commit)
     expected_directories = {""}
@@ -485,12 +1102,152 @@ def _bind_execution_snapshot(
         if _read_regular_nofollow(target, maximum=_SNAPSHOT_MAX_FILE_BYTES) != payload:
             raise RuntimeError(f"Ausführungssnapshot weicht vom Ziel-Commit ab: {relative_path}")
 
-    for relative_path in _FINALIZER_FILES:
-        if _read_regular_nofollow(product_root / relative_path) != expected[relative_path][0]:
-            raise RuntimeError(f"Target-Modul weicht vom freigegebenen Commit ab: {relative_path}")
+    if require_product_target_files:
+        for relative_path in _FINALIZER_FILES:
+            if _read_regular_nofollow(product_root / relative_path) != expected[relative_path][0]:
+                raise RuntimeError(f"Target-Modul weicht vom freigegebenen Commit ab: {relative_path}")
+
+
+def _bind_compat_bridge_snapshot(
+    snapshot_root: Path,
+    expected_sha256: str,
+) -> None:
+    """Bindet den bewusst minimalen Transport-Runner byte- und modusgenau."""
+
+    expected_digest = str(expected_sha256 or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_digest):
+        raise RuntimeError(
+            "Kompatibilitäts-Runner besitzt keine gültige SHA-256-Bindung"
+        )
+    root = Path(os.path.abspath(snapshot_root))
+    if root.resolve(strict=True) != root:
+        raise RuntimeError(
+            "Kompatibilitäts-Runner besitzt keinen kanonischen Snapshotpfad"
+        )
+
+    actual_directories = set()
+    actual_files = set()
+    for directory, dirnames, filenames in os.walk(
+        root,
+        topdown=True,
+        followlinks=False,
+    ):
+        directory_path = Path(directory)
+        relative_directory = (
+            ""
+            if directory_path == root
+            else directory_path.relative_to(root).as_posix()
+        )
+        metadata = directory_path.lstat()
+        if (
+            directory_path.is_symlink()
+            or not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_gid != os.getegid()
+            or stat.S_IMODE(metadata.st_mode) != 0o555
+        ):
+            raise RuntimeError(
+                "Kompatibilitäts-Runner besitzt ein fremdes oder "
+                "beschreibbares Verzeichnis"
+            )
+        actual_directories.add(relative_directory)
+        for name in list(dirnames):
+            child = directory_path / name
+            child_metadata = child.lstat()
+            if child.is_symlink() or not stat.S_ISDIR(child_metadata.st_mode):
+                raise RuntimeError(
+                    "Kompatibilitäts-Runner enthält eine "
+                    "Symlink-/Nichtverzeichniskomponente"
+                )
+        for name in filenames:
+            child = directory_path / name
+            child_metadata = child.lstat()
+            if child.is_symlink() or not stat.S_ISREG(child_metadata.st_mode):
+                raise RuntimeError(
+                    "Kompatibilitäts-Runner enthält eine nicht reguläre Datei"
+                )
+            actual_files.add(child.relative_to(root).as_posix())
+
+    relative_path = "Installer/release_finalize.py"
+    if (
+        actual_directories != {"", "Installer"}
+        or actual_files != {relative_path}
+    ):
+        raise RuntimeError(
+            "Kompatibilitäts-Runner besitzt nicht den exakt minimalen Dateibaum"
+        )
+    target = root / relative_path
+    metadata = target.lstat()
+    if (
+        metadata.st_nlink != 1
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_gid != os.getegid()
+        or stat.S_IMODE(metadata.st_mode) != 0o444
+        or metadata.st_mode & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        raise RuntimeError(
+            "Kompatibilitäts-Runner besitzt unzulässige Dateimetadaten"
+        )
+    payload = _read_regular_nofollow(
+        target,
+        maximum=_SNAPSHOT_MAX_FILE_BYTES,
+    )
+    if hashlib.sha256(payload).hexdigest() != expected_digest:
+        raise RuntimeError(
+            "Kompatibilitäts-Runner weicht von seiner SHA-256-Bindung ab"
+        )
+    script = _regular_nofollow(
+        Path(os.path.abspath(__file__)),
+        "Kompatibilitäts-Runner",
+    )
+    if (
+        script != target
+        or _file_identity(script.lstat()) != _file_identity(metadata)
+    ):
+        raise RuntimeError(
+            "Ausgeführter Kompatibilitäts-Runner ist nicht der gebundene Blob"
+        )
 
 
 def _parse_args() -> argparse.Namespace:
+    if "--compat-target-updater-handoff" in sys.argv[1:]:
+        parser = argparse.ArgumentParser(
+            description="E3DC-Control Ziel-Updater-Kompatibilitäts-Handoff"
+        )
+        parser.add_argument(
+            "--compat-target-updater-handoff",
+            action="store_true",
+            required=True,
+        )
+        parser.add_argument("--target-execution-root", required=True)
+        parser.add_argument("--compat-bridge-sha256", required=True)
+        parser.add_argument("--install-path", required=True)
+        parser.add_argument("--expected-release-sha", required=True)
+        parser.add_argument("--expected-release-tag", required=True)
+        parser.add_argument("--requested-release-tag", default="")
+        parser.add_argument("--reinstall-current", action="store_true")
+        parser.add_argument(
+            "--expected-ha-role",
+            required=True,
+            choices=("off", "master", "slave", "shadow"),
+        )
+        return parser.parse_args()
+
+    if "--target-updater-handoff" in sys.argv[1:]:
+        parser = argparse.ArgumentParser(description="E3DC-Control Ziel-Updater-Handoff")
+        parser.add_argument("--target-updater-handoff", action="store_true", required=True)
+        parser.add_argument("--install-path", required=True)
+        parser.add_argument("--expected-release-sha", required=True)
+        parser.add_argument("--expected-release-tag", required=True)
+        parser.add_argument("--requested-release-tag", default="")
+        parser.add_argument("--reinstall-current", action="store_true")
+        parser.add_argument(
+            "--expected-ha-role",
+            required=True,
+            choices=("off", "master", "slave", "shadow"),
+        )
+        return parser.parse_args()
+
     parser = argparse.ArgumentParser(description="E3DC-Control Release-Finalizer")
     parser.add_argument("--install-path", required=True)
     parser.add_argument("--expected-release-sha", required=True)
@@ -509,20 +1266,252 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _run_target_updater_handoff(root: Path, args: argparse.Namespace) -> int:
+    """Startet die Transaktion aus dem versiegelten Updater des Ziel-Commits."""
+
+    execution_root = _bound_execution_root(root)
+    if execution_root.lstat().st_dev != root.lstat().st_dev:
+        raise RuntimeError("Ziel-Updater liegt nicht auf dem Produkt-Dateisystem")
+    _bind_execution_snapshot(
+        execution_root,
+        root,
+        args.expected_release_sha,
+        require_product_target_files=False,
+    )
+
+    root_text = str(root)
+    execution_text = str(execution_root)
+    sys.path[:] = [
+        execution_text,
+        *[
+            item
+            for item in sys.path
+            if item
+            and os.path.realpath(item) not in {
+                os.path.realpath(root_text),
+                os.path.realpath(str(execution_root / "Installer")),
+                os.path.realpath(execution_text),
+            }
+        ],
+    ]
+    from Installer.update import (  # pylint: disable=import-outside-toplevel
+        TARGET_UPDATER_NOOP,
+        TARGET_UPDATER_SUCCESS,
+        UPDATE_ALREADY_CURRENT,
+        execute_verified_target_update,
+    )
+
+    update_module = sys.modules.get("Installer.update")
+    if (
+        update_module is None
+        or Path(os.path.abspath(str(getattr(update_module, "__file__", "")))).parent.parent
+        != execution_root
+        or TARGET_UPDATER_SUCCESS != _TARGET_UPDATER_SUCCESS
+        or TARGET_UPDATER_NOOP != _TARGET_UPDATER_NOOP
+    ):
+        raise RuntimeError("Installer.update wurde nicht aus dem gebundenen Ziel-Updater geladen")
+
+    updated = execute_verified_target_update(
+        repo_dir=root_text,
+        target_commit=args.expected_release_sha,
+        target_tag=args.expected_release_tag,
+        requested_target_tag=args.requested_release_tag or None,
+        expected_role=args.expected_ha_role,
+        reinstall_current=bool(args.reinstall_current),
+    )
+    if updated is not True and updated != UPDATE_ALREADY_CURRENT:
+        raise RuntimeError("Ziel-Updater hat die Release-Transaktion nicht bestätigt")
+
+    # Nach der Transaktion muss auch der Produktbaum exakt den Commit besitzen,
+    # während der ursprüngliche Updater-Snapshot unverändert geblieben ist.
+    _bind_execution_snapshot(
+        execution_root,
+        root,
+        args.expected_release_sha,
+        require_product_target_files=True,
+    )
+    outcome_marker = (
+        TARGET_UPDATER_NOOP
+        if updated == UPDATE_ALREADY_CURRENT
+        else TARGET_UPDATER_SUCCESS
+    )
+    print(
+        f"{outcome_marker} "
+        f"{args.expected_release_sha} {args.expected_release_tag}"
+    )
+    return 0
+
+
+def _run_compat_target_updater_handoff(
+    root: Path,
+    args: argparse.Namespace,
+) -> int:
+    """Betritt nur den veröffentlichten Alt-Updater aus dem Ziel-Snapshot."""
+
+    bridge_root = _bound_execution_root(root)
+    target_root = Path(os.path.abspath(args.target_execution_root))
+    if (
+        target_root.resolve(strict=True) != target_root
+        or target_root in {root, bridge_root}
+        or bridge_root == root
+        or target_root.lstat().st_dev != root.lstat().st_dev
+        or bridge_root.lstat().st_dev != root.lstat().st_dev
+    ):
+        raise RuntimeError(
+            "Ziel- und Kompatibilitäts-Snapshot sind nicht getrennt an "
+            "das Produkt-Dateisystem gebunden"
+        )
+    if (
+        os.path.realpath(os.environ.get("E3DC_BOOTSTRAP_ROOT", "")) != str(root)
+        or os.path.realpath(
+            os.environ.get("E3DC_BOOTSTRAP_RUNNER_ROOT", "")
+        ) != str(bridge_root)
+        or os.path.realpath(os.environ.get("E3DC_INSTALL_ROOT", "")) != str(root)
+    ):
+        raise RuntimeError(
+            "Kompatibilitäts-Handoff besitzt keinen eindeutigen Bootstrap-Kontext"
+        )
+    requested_tag = str(args.requested_release_tag or "").strip()
+    if requested_tag and requested_tag != args.expected_release_tag:
+        raise RuntimeError(
+            "Angeforderter und gebundener Ziel-Release-Tag widersprechen sich"
+        )
+    if requested_tag and bool(args.reinstall_current):
+        raise RuntimeError(
+            "Rollback und Neuinstallation dürfen nicht vermischt werden"
+        )
+
+    _bind_compat_bridge_snapshot(
+        bridge_root,
+        args.compat_bridge_sha256,
+    )
+    _bind_execution_snapshot(
+        target_root,
+        root,
+        args.expected_release_sha,
+        require_product_target_files=False,
+    )
+    # Der Transport-Runner hat sich bis hier selbst gebunden. Für den Import
+    # des veröffentlichten Zielcodes muss dessen eigener dualer
+    # Bootstrap-Vertrag gelten: Produkt bleibt das Ziel, der ausgeführte
+    # Release-Root ist jetzt aber der vollständige Ziel-Snapshot. Diese
+    # Prozessumgebung endet zusammen mit dem einmaligen Bridgeprozess.
+    os.environ["E3DC_BOOTSTRAP_ROOT"] = str(root)
+    os.environ["E3DC_BOOTSTRAP_RUNNER_ROOT"] = str(target_root)
+    os.environ["E3DC_INSTALL_ROOT"] = str(root)
+    if any(
+        name == "Installer" or name.startswith("Installer.")
+        for name in sys.modules
+    ):
+        raise RuntimeError(
+            "Kompatibilitäts-Handoff besitzt bereits geladene Produktmodule"
+        )
+
+    root_text = str(root)
+    target_text = str(target_root)
+    bridge_text = str(bridge_root)
+    excluded = {
+        os.path.realpath(root_text),
+        os.path.realpath(str(root / "Installer")),
+        os.path.realpath(target_text),
+        os.path.realpath(str(target_root / "Installer")),
+        os.path.realpath(bridge_text),
+        os.path.realpath(str(bridge_root / "Installer")),
+    }
+    sys.path[:] = [
+        target_text,
+        *[
+            item
+            for item in sys.path
+            if item and os.path.realpath(item) not in excluded
+        ],
+    ]
+
+    from Installer import update as target_update  # pylint: disable=import-outside-toplevel
+
+    package_module = sys.modules.get("Installer")
+    update_module = sys.modules.get("Installer.update")
+    if (
+        package_module is None
+        or update_module is None
+        or Path(
+            os.path.abspath(str(getattr(package_module, "__file__", "")))
+        ).parent.parent
+        != target_root
+        or Path(
+            os.path.abspath(str(getattr(update_module, "__file__", "")))
+        ).parent.parent
+        != target_root
+    ):
+        raise RuntimeError(
+            "Alt-Updater wurde nicht vollständig aus dem Ziel-Snapshot geladen"
+        )
+    required_parameters = {
+        "headless",
+        "target_ref",
+        "target_install_path",
+        "expected_release_sha",
+        "expected_ha_role",
+    }
+    if not required_parameters.issubset(
+        inspect.signature(target_update.update_e3dc).parameters
+    ):
+        raise RuntimeError(
+            "Alt-Updater besitzt nicht den gebundenen Bootstrap-Vertrag"
+        )
+
+    updated = target_update.update_e3dc(
+        headless=True,
+        target_ref=args.expected_release_tag,
+        target_install_path=root_text,
+        expected_release_sha=args.expected_release_sha,
+        expected_ha_role=args.expected_ha_role,
+    )
+    os.environ["E3DC_BOOTSTRAP_RUNNER_ROOT"] = str(bridge_root)
+    if updated is not True:
+        raise RuntimeError(
+            "Alt-Updater hat die Release-Transaktion nicht bestätigt"
+        )
+
+    # Der alte Zielcode besitzt noch keinen nativen Handoff. Nach seiner
+    # abgeschlossenen Transaktion müssen daher der Ziel-Snapshot, der
+    # Produktbaum und der reine Transport-Runner jeweils erneut exakt binden.
+    _bind_execution_snapshot(
+        target_root,
+        root,
+        args.expected_release_sha,
+        require_product_target_files=True,
+    )
+    _bind_compat_bridge_snapshot(
+        bridge_root,
+        args.compat_bridge_sha256,
+    )
+    print(
+        f"{_TARGET_UPDATER_SUCCESS} "
+        f"{args.expected_release_sha} {args.expected_release_tag}"
+    )
+    return 0
+
+
 def _run_legacy_product_bridge(
     root: Path,
     args: argparse.Namespace,
 ) -> int:
+    lock_fd = _required_update_lock_fd()
     entries = _bind_legacy_product_invocation(root, args)
+    snapshot_parent = _trusted_same_filesystem_snapshot_parent(root)
+    _cleanup_stale_compat_snapshots(snapshot_parent)
     snapshot_root = _create_compat_execution_snapshot(
         entries,
         root,
         args.expected_release_sha,
+        snapshot_parent=snapshot_parent,
     )
-    python = str(sys.executable or "")
-    if not os.path.isabs(python) or not os.access(python, os.X_OK):
-        _remove_compat_execution_snapshot(snapshot_root, _COMPAT_SNAPSHOT_PARENT)
-        raise RuntimeError("Python-Interpreter des Target-Finalizers ist nicht eindeutig ausführbar")
+    try:
+        python = _trusted_system_python()
+    except Exception:
+        _remove_compat_execution_snapshot(snapshot_root, snapshot_parent)
+        raise
 
     environment = dict(os.environ)
     for name in (
@@ -539,12 +1528,17 @@ def _run_legacy_product_bridge(
     environment["E3DC_INSTALL_ROOT"] = str(root)
     environment["PYTHONNOUSERSITE"] = "1"
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    environment["PYTHONUNBUFFERED"] = "1"
     environment["LC_ALL"] = "C.UTF-8"
     environment["LANG"] = "C.UTF-8"
+    environment[_UPDATE_LOCK_ENV] = str(lock_fd)
 
     finalizer = snapshot_root / "Installer" / "release_finalize.py"
     command = [
         python,
+        "-I",
+        "-B",
+        "-u",
         str(finalizer),
         "--install-path",
         str(root),
@@ -568,21 +1562,14 @@ def _run_legacy_product_bridge(
         args.expected_venv_path,
     ]
     try:
-        result = subprocess.run(
+        result = _run_compat_finalizer(
             command,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=900,
-            env=environment,
-            check=False,
+            environment=environment,
+            pass_fds=(lock_fd,),
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise RuntimeError("Kompatibilitäts-Snapshot konnte den Finalizer nicht ausführen") from exc
     finally:
         try:
-            _remove_compat_execution_snapshot(snapshot_root, _COMPAT_SNAPSHOT_PARENT)
+            _remove_compat_execution_snapshot(snapshot_root, snapshot_parent)
         except Exception as exc:
             sys.stderr.write(
                 "WARNUNG: Kompatibilitäts-Snapshot konnte nach dem "
@@ -593,29 +1580,38 @@ def _run_legacy_product_bridge(
         f"{_FINALIZER_SUCCESS} "
         f"{args.expected_release_sha} {args.expected_release_tag}"
     )
-    lines = [line.strip() for line in str(result.stdout or "").splitlines()]
-    if result.returncode != 0 or lines.count(marker) != 1:
+    marker_count = int((result.get("line_counts") or {}).get(marker, 0))
+    if (
+        result.get("returncode") != 0
+        or bool(result.get("timed_out"))
+        or marker_count != 1
+    ):
         detail = "\n".join(
             part.strip()
-            for part in (str(result.stdout or ""), str(result.stderr or ""))
+            for part in (
+                str(result.get("output") or ""),
+                str(result.get("error") or ""),
+            )
             if part.strip()
         )
         raise RuntimeError(
             "Kompatibilitäts-Snapshot meldete keinen eindeutigen Erfolg: "
             + detail[-4000:]
         )
-    if result.stderr:
-        sys.stderr.write(result.stderr)
-    sys.stdout.write(result.stdout)
     return 0
 
 
-def main() -> int:
-    args = _parse_args()
-    if os.geteuid() != 0:
-        raise RuntimeError("Release-Finalizer muss mit Root-Rechten laufen")
-    root = _bound_product_root(args.install_path)
-    script = _regular_nofollow(Path(os.path.abspath(__file__)), "Target-Finalizer")
+def _main_with_update_lock(
+    root: Path,
+    args: argparse.Namespace,
+    script: Path,
+) -> int:
+    """Führt genau einen bereits kernelgebundenen Finalizerpfad aus."""
+
+    if getattr(args, "compat_target_updater_handoff", False):
+        return _run_compat_target_updater_handoff(root, args)
+    if getattr(args, "target_updater_handoff", False):
+        return _run_target_updater_handoff(root, args)
     if script.parent.parent == root:
         return _run_legacy_product_bridge(root, args)
     execution_root = _bound_execution_root(root)
@@ -672,6 +1668,65 @@ def main() -> int:
         f"{args.expected_release_sha} {args.expected_release_tag}"
     )
     return 0
+
+
+def main() -> int:
+    _install_fail_safe_process_streams()
+    args = _parse_args()
+    if os.geteuid() != 0:
+        raise RuntimeError("Release-Finalizer muss mit Root-Rechten laufen")
+    root = _bound_product_root(args.install_path)
+    script = _regular_nofollow(
+        Path(os.path.abspath(__file__)),
+        "Target-Finalizer",
+    )
+    target_handoff_entry = bool(
+        getattr(args, "target_updater_handoff", False)
+    )
+    compat_handoff_entry = bool(
+        getattr(args, "compat_target_updater_handoff", False)
+    )
+    legacy_product_entry = (
+        not target_handoff_entry
+        and not compat_handoff_entry
+        and script.parent.parent == root
+    )
+    legacy_target_snapshot_entry = (
+        not target_handoff_entry
+        and not compat_handoff_entry
+        and script.parent.parent != root
+    )
+    if legacy_target_snapshot_entry:
+        # Veröffentlichte Updater vor dem globalen Lock übergeben keinen FD.
+        # Nur ihr flagloser, bereits commit- und produktgebundener
+        # Target-Finalizer darf den Lock selbst anlegen. Nach dem Lock bindet
+        # _main_with_update_lock denselben Snapshot erneut und schließt TOCTOU.
+        execution_root = _bound_execution_root(root)
+        _bind_execution_snapshot(
+            execution_root,
+            root,
+            args.expected_release_sha,
+            require_product_target_files=True,
+        )
+    lock_fd, lock_owned = _acquire_or_inherit_update_lock(
+        allow_create=(
+            legacy_product_entry
+            or legacy_target_snapshot_entry
+        ),
+    )
+    previous_lock_env = os.environ.get(_UPDATE_LOCK_ENV)
+    os.environ[_UPDATE_LOCK_ENV] = str(lock_fd)
+    try:
+        return _main_with_update_lock(root, args, script)
+    finally:
+        if previous_lock_env is None:
+            os.environ.pop(_UPDATE_LOCK_ENV, None)
+        else:
+            os.environ[_UPDATE_LOCK_ENV] = previous_lock_env
+        if lock_owned:
+            # Auf der mit Kindern geteilten offenen Dateibeschreibung nur den
+            # Owner-FD schließen. Der Lock endet erst mit dem letzten FD.
+            os.close(lock_fd)
 
 
 if __name__ == "__main__":

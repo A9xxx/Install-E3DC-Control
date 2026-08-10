@@ -18,17 +18,32 @@ class CommandExecutor:
         self.logger = logger
 
     @staticmethod
-    def stop_command(charger, *, hard_stop_allowed=False, reason="stop"):
+    def stop_command(
+        charger,
+        *,
+        hard_stop_allowed=False,
+        stop_authority=None,
+        reason="stop",
+    ):
+        authority = dict(stop_authority) if isinstance(stop_authority, dict) else {}
         if hasattr(charger, "set_amp_sonnenmodus"):
-            return {"kind": "stop", "method": "set_amp_sonnenmodus", "amp": 6,
-                    "force_state": 1 if hard_stop_allowed else None, "reason": reason}
+            return {
+                "kind": "stop",
+                "method": "set_amp_sonnenmodus",
+                "amp": 6,
+                "force_state": 1 if hard_stop_allowed else None,
+                "stop_authority": authority,
+                "reason": reason,
+            }
         if hasattr(charger, "set_amp_and_state"):
             return {"kind": "stop", "method": "set_amp_and_state", "amp": 0,
-                    "force_state": 1, "reason": reason}
+                    "force_state": 1, "stop_authority": authority, "reason": reason}
         if hasattr(charger, "set_direct_current"):
-            return {"kind": "stop", "method": "set_direct_current", "amp": 0, "reason": reason}
+            return {"kind": "stop", "method": "set_direct_current", "amp": 0,
+                    "stop_authority": authority, "reason": reason}
         if hasattr(charger, "release_to_e3dc"):
-            return {"kind": "stop", "method": "release_to_e3dc", "max_amp": 6, "reason": reason}
+            return {"kind": "stop", "method": "release_to_e3dc", "max_amp": 6,
+                    "stop_authority": authority, "reason": reason}
         return {}
 
     def execute(self, charger, command, *, c_id=None):
@@ -61,7 +76,14 @@ class CommandExecutor:
             if method == "set_pv_mode":
                 return bool(charger.set_pv_mode())
             if method == "set_phases":
-                return bool(charger.set_phases(cmd_int("phases", cmd_int("target_phases", 0))))
+                phases = cmd_int("phases", cmd_int("target_phases", 0))
+                if cmd.get("_require_wire_receipt") is True:
+                    # Dieses private Flag entsteht ausschließlich im
+                    # openWB-Pro-Sequenzvertrag. Signatur- oder Treiberfehler
+                    # müssen fail-closed bleiben; ein Fallback könnte denselben
+                    # Phasenbefehl nach bereits erfolgtem POST doppelt senden.
+                    return bool(charger.set_phases(phases, require_wire_receipt=True))
+                return bool(charger.set_phases(phases))
             if method == "emergency_stop":
                 return bool(charger.emergency_stop())
             if method == "trigger_cp_interrupt":

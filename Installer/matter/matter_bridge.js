@@ -3,12 +3,155 @@ import { OnOffPluginUnitDevice, DimmableLightDevice } from "@project-chip/matter
 import { BridgedDeviceBasicInformationCluster, ClusterServer } from "@project-chip/matter-node.js/cluster";
 import fs from "fs";
 import path from "path";
-import http from "http";
 import { spawn, execSync } from "child_process";
 import { StorageManager, StorageBackendDisk } from "@project-chip/matter-node.js/storage";
 import { loadOrCreateCommissioningCredentials } from "./commissioning_credentials.js";
 
 const PAIRING_FILE = "/var/www/html/ramdisk/matter_pairing.json";
+const LIVE_DATA_FILE = "/var/www/html/ramdisk/live_data_py.json";
+const WALLBOX_DATA_FILE = "/var/www/html/ramdisk/wallbox_native.json";
+const MAX_LIVE_BYTES = 4 * 1024 * 1024;
+
+function generation(stats) {
+    return [
+        stats.dev,
+        stats.ino,
+        stats.size,
+        stats.mtimeNs,
+        stats.ctimeNs,
+    ];
+}
+
+function sameGeneration(left, right) {
+    const leftGeneration = generation(left);
+    const rightGeneration = generation(right);
+    return leftGeneration.every((value, index) => value === rightGeneration[index]);
+}
+
+function freshEnough(stats, maxAgeMs) {
+    const nowNs = BigInt(Date.now()) * 1000000n;
+    const ageNs = nowNs > stats.mtimeNs ? nowNs - stats.mtimeNs : 0n;
+    return ageNs <= BigInt(maxAgeMs) * 1000000n;
+}
+
+function readBoundJsonObject(file, maxAgeMs, maxBytes = MAX_LIVE_BYTES) {
+    let descriptor;
+    try {
+        const initial = fs.lstatSync(file, { bigint: true });
+        if (
+            !initial.isFile()
+            || initial.nlink !== 1n
+            || initial.size <= 1n
+            || initial.size > BigInt(maxBytes)
+            || !freshEnough(initial, maxAgeMs)
+        ) {
+            return null;
+        }
+        descriptor = fs.openSync(
+            file,
+            fs.constants.O_RDONLY
+            | (fs.constants.O_CLOEXEC ?? 0)
+            | (fs.constants.O_NOFOLLOW ?? 0),
+        );
+        const before = fs.fstatSync(descriptor, { bigint: true });
+        if (
+            !before.isFile()
+            || before.nlink !== 1n
+            || before.size <= 1n
+            || before.size > BigInt(maxBytes)
+            || !freshEnough(before, maxAgeMs)
+            || !sameGeneration(initial, before)
+        ) {
+            return null;
+        }
+        const source = fs.readFileSync(descriptor);
+        const after = fs.fstatSync(descriptor, { bigint: true });
+        const current = fs.lstatSync(file, { bigint: true });
+        if (
+            BigInt(source.length) !== after.size
+            || !sameGeneration(before, after)
+            || !sameGeneration(after, current)
+            || !current.isFile()
+            || current.nlink !== 1n
+        ) {
+            return null;
+        }
+        const parsed = JSON.parse(source.toString("utf-8").replace(/^\uFEFF/, ""));
+        return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+            ? parsed
+            : null;
+    } catch (_) {
+        return null;
+    } finally {
+        if (descriptor !== undefined) {
+            try { fs.closeSync(descriptor); } catch (_) {}
+        }
+    }
+}
+
+function finiteNumber(source, keys) {
+    for (const key of keys) {
+        if (!(key in source) || source[key] === null || source[key] === "") continue;
+        const value = Number(source[key]);
+        if (Number.isFinite(value)) return value;
+    }
+    return null;
+}
+
+function readMatterLiveSnapshot() {
+    const live = readBoundJsonObject(LIVE_DATA_FILE, 15000);
+    if (!live) return null;
+    const pv = finiteNumber(live, ["PV_Power", "pv"]);
+    const grid = finiteNumber(live, ["Grid_Power", "grid"]);
+    const battery = finiteNumber(live, ["Battery_Power", "bat"]);
+    const home = finiteNumber(live, ["Home_Power", "home_raw", "home"]);
+    const soc = finiteNumber(live, ["SOC", "soc"]);
+    if (
+        [pv, grid, battery, home, soc].some(value => value === null)
+        || live.RSCP_Sample_Valid !== true
+        || live.Grid_Power_Valid !== true
+    ) {
+        return null;
+    }
+
+    let wallbox = Math.max(
+        0,
+        finiteNumber(live, ["Wallbox_Power", "wb"]) ?? 0,
+    );
+    const companion = readBoundJsonObject(WALLBOX_DATA_FILE, 30000);
+    if (companion) {
+        const detailPower = new Map();
+        const details = Array.isArray(companion.wb_details)
+            ? companion.wb_details
+            : [];
+        for (const detail of details) {
+            if (!detail || typeof detail !== "object") continue;
+            const id = Number(detail.id);
+            if (id !== 1 && id !== 2) continue;
+            const power = finiteNumber(
+                detail,
+                ["charge_power_w", "power_w", "real_power_w"],
+            );
+            if (power !== null) {
+                detailPower.set(
+                    id,
+                    Math.max(detailPower.get(id) ?? 0, Math.max(0, power)),
+                );
+            }
+        }
+        const companionTotal = finiteNumber(
+            companion,
+            ["total_power_w", "power_w"],
+        );
+        const projectedTotal = [...detailPower.values()]
+            .reduce((sum, value) => sum + value, 0);
+        wallbox = Math.max(
+            wallbox,
+            Math.max(0, companionTotal ?? projectedTotal),
+        );
+    }
+    return { pv, grid, bat: battery, home_raw: home, soc, wb: wallbox };
+}
 
 function writePairingData(data) {
     const tmp = `${PAIRING_FILE}.${process.pid}.tmp`;
@@ -161,30 +304,23 @@ async function main() {
     // LIVE POLLING — Alle 5 Sekunden E3DC Daten holen & Schalter updaten
     // =====================================================================
     setInterval(() => {
-        http.get('http://127.0.0.1/get_live_json.php', (res) => {
-            let body = '';
-            res.on('data', chunk => body += chunk);
-            res.on('end', () => {
-                try {
-                    const data = JSON.parse(body);
-                    if (!commissioningServer.isCommissioned()) return;
+        if (!commissioningServer.isCommissioned()) return;
+        const data = readMatterLiveSnapshot();
+        if (!data) {
+            wallboxDevice.setOnOff(false);
+            pvDevice.setOnOff(false);
+            gridDevice.setOnOff(false);
+            return;
+        }
 
-                    const wb   = parseFloat(data.wb)   || 0;
-                    const pv   = parseFloat(data.pv)   || 0;
-                    const grid = parseFloat(data.grid) || 0;
+        // Wallbox lädt wenn >50W
+        wallboxDevice.setOnOff(data.wb > 50);
 
-                    // Wallbox lädt wenn >50W
-                    wallboxDevice.setOnOff(wb > 50);
+        // PV produziert wenn >500W
+        pvDevice.setOnOff(data.pv > 500);
 
-                    // PV produziert wenn >500W
-                    pvDevice.setOnOff(pv > 500);
-
-                    // Einspeisung ins Netz wenn >500W Überschuss
-                    gridDevice.setOnOff(grid < -500);
-
-                } catch(e) { /* Polling-Fehler ignorieren */ }
-            });
-        }).on('error', () => {});
+        // Einspeisung ins Netz wenn >500W Überschuss
+        gridDevice.setOnOff(data.grid < -500);
     }, 5000);
 
     process.on('SIGINT', () => { stopAvahiProxy(); process.exit(0); });

@@ -30,6 +30,7 @@ require_once 'logic.php';
 // Luxtronik Global Toggle Handler
 if (isset($_POST['save_lux_global'])) {
     requireWebAuth(false);
+    e3dcRequireCsrfToken(false);
     $paths = getInstallPaths();
     $val = isset($_POST['lux_active']) ? '1' : '0';
 
@@ -52,7 +53,7 @@ if (isset($_POST['save_lux_global'])) {
             shell_exec("nohup " . escapeshellarg($python) . " " . escapeshellarg($script) . " > /var/www/html/logs/energy_manager.log 2>&1 &");
         }
     } else {
-        shell_exec("sudo systemctl restart energy_manager > /dev/null 2>&1 &");
+        e3dcRunServiceWrapperAction('restart', ['energy_manager']);
     }
     header("Location: mobile.php?seite=config");
     exit;
@@ -850,9 +851,15 @@ if (in_array($seite, $protectedPages) && !isWebAuthenticated()) {
     <?php if ($seite == 'live'): ?>
     <div class="d-flex justify-content-end align-items-center mb-3 px-1">
         <div class="d-flex align-items-center gap-2">
-            <?php $confData = loadE3dcConfig(); if (!empty($confData['config']['web_pin'])): ?>
+                <?php $confData = loadE3dcConfig(); if (!empty($confData['config']['web_pin'])): ?>
                 <?php if (isWebAuthenticated()): ?>
-                    <a href="?action=web_logout" class="text-secondary" title="Sperren"><i class="fas fa-unlock text-success"></i></a>
+                    <form method="post" class="d-inline">
+                        <?= e3dcCsrfInput() ?>
+                        <input type="hidden" name="action" value="web_logout">
+                        <button type="submit" class="btn btn-link text-secondary border-0 p-0 align-baseline" title="Sperren" aria-label="Sperren">
+                            <i class="fas fa-unlock text-success"></i>
+                        </button>
+                    </form>
                 <?php else: ?>
                     <a href="?seite=lock" class="text-secondary" title="Entsperren"><i class="fas fa-lock text-warning"></i></a>
                 <?php endif; ?>
@@ -1235,6 +1242,8 @@ if (in_array($seite, $protectedPages) && !isWebAuthenticated()) {
             <div class="d-grid gap-1 mt-2 text-body">
                 <span title="Typischer absoluter Unterschied je verglichenem 15-Minuten-Fenster">Trefferabweichung: <strong id="pv-forecast-diagnostic-hit">–</strong></span>
                 <span title="Positiv bedeutet im Mittel mehr, negativ weniger Ertrag als vorhergesagt">Richtungsversatz: <strong id="pv-forecast-diagnostic-direction">–</strong></span>
+                <span title="Quadratische Fehlerwurzel; gewichtet größere Prognosefehler stärker">RMSE: <strong id="pv-forecast-diagnostic-rmse">–</strong></span>
+                <span title="Positiv ist besser als der zuletzt vor Ausgabe bekannte Ertrag desselben UTC-Zeitfensters am Vortag">Skill gegen Tagespersistenz: <strong id="pv-forecast-diagnostic-skill">–</strong></span>
                 <span title="Gesamtabweichung, gewichtet nach der tatsächlich erzeugten Energie">Energieabweichung: <strong id="pv-forecast-diagnostic-energy">–</strong></span>
                 <span title="Anteil der archivierten Prognosefenster mit gültigem Messwert">Abdeckung: <strong id="pv-forecast-diagnostic-coverage">–</strong></span>
             </div>
@@ -1242,13 +1251,26 @@ if (in_array($seite, $protectedPages) && !isWebAuthenticated()) {
                 <div id="pv-forecast-diagnostic-sample">Noch keine vergleichbaren Fenster</div>
                 <div>Nur Diagnose – ändert keine Regelung und wählt kein Modell aus.</div>
             </div>
+            <div id="pv-forecast-diagnostic-contract" class="mt-1 text-warning">
+                Punktprognose – kein belegtes P50.
+            </div>
+            <div id="pv-forecast-diagnostic-horizons" class="mt-1 text-muted">
+                Erfassungs-Vorlauf: noch keine revisionsgebundenen Stichproben.
+            </div>
         </div>
         <div class="dashboard-card" style="height: calc(100vh - 180px); min-height: 400px; display: flex; flex-direction: column; position: relative;">
-            <div style="flex: 1; border-radius: 20px; overflow: hidden; position: relative;">
+            <div id="primaryChartSurface" style="flex: 1; border-radius: 20px; overflow: hidden; position: relative;">
                 <!-- Live JS Chart Overlay -->
                 <div id="liveChartContainer" class="w-100 h-100 position-absolute top-0 start-0 p-2" style="background-color: var(--bg-card); z-index: 10;">
                     <canvas id="liveChartCanvas"></canvas>
                 </div>
+            </div>
+            <div id="directMarketingForecastSurface" class="p-2" style="display:none; height:250px;">
+                <div class="d-flex flex-wrap align-items-center gap-2 small mb-2">
+                    <span class="fw-bold" style="color:#8b5cf6;">Direktvermarktung – ausgewählter Fahrplan</span>
+                    <span id="directMarketingForecastState" class="text-muted"></span>
+                </div>
+                <div class="position-relative" style="height:210px;"><canvas id="directMarketingForecastChart"></canvas></div>
             </div>
             <div class="text-center mt-2 small text-muted" id="forecastStatus"></div>
         </div>
@@ -1283,11 +1305,18 @@ if (in_array($seite, $protectedPages) && !isWebAuthenticated()) {
             </div>
 
             <div class="dashboard-card" style="height: calc(100vh - 230px); min-height: 450px; display: flex; flex-direction: column; position: relative;">
-                <div style="flex: 1; border-radius: 20px; overflow: hidden; position: relative;">
+                <div id="primaryChartSurface" style="flex: 1; border-radius: 20px; overflow: hidden; position: relative;">
                     <!-- Live JS Chart Overlay -->
                     <div id="liveChartContainer" class="w-100 h-100 position-absolute top-0 start-0 p-2" style="background-color: var(--bg-card); z-index: 10;">
                         <canvas id="liveChartCanvas"></canvas>
                     </div>
+                </div>
+                <div id="directMarketingForecastSurface" class="p-2" style="display:none; height:250px;">
+                    <div class="d-flex flex-wrap align-items-center gap-2 small mb-2">
+                        <span class="fw-bold" style="color:#8b5cf6;">Direktvermarktung – ausgewählter Fahrplan</span>
+                        <span id="directMarketingForecastState" class="text-muted"></span>
+                    </div>
+                    <div class="position-relative" style="height:210px;"><canvas id="directMarketingForecastChart"></canvas></div>
                 </div>
                 <div class="text-center mt-2 small text-muted" id="diagramStatus">Live</div>
             </div>
@@ -1307,6 +1336,7 @@ if (in_array($seite, $protectedPages) && !isWebAuthenticated()) {
                     <?php unset($_SESSION['login_error_message']); ?>
                 <?php endif; ?>
                 <form method="post" action="">
+                    <?= e3dcCsrfInput() ?>
                     <input type="hidden" name="action" value="web_login">
                     <div class="mb-4">
                         <input type="password" name="pin" class="form-control form-control-lg text-center fw-bold bg-body-secondary text-body border-secondary" placeholder="****" autofocus required style="letter-spacing: 0.5em;">
@@ -1361,6 +1391,7 @@ if (in_array($seite, $protectedPages) && !isWebAuthenticated()) {
                     <div class="small text-muted">WP & intelligentes Laden</div>
                 </div>
                 <form method="post">
+                    <?= e3dcCsrfInput() ?>
                     <input type="hidden" name="save_lux_global" value="1">
                     <div class="form-check form-switch m-0">
                         <input class="form-check-input" type="checkbox" name="lux_active" value="1" <?= $luxtronikEnabled ? 'checked' : '' ?> onchange="this.form.submit()" style="transform: scale(1.3);">
@@ -1407,6 +1438,7 @@ if (in_array($seite, $protectedPages) && !isWebAuthenticated()) {
       </div>
       <div class="modal-body p-3">
         <div class="d-flex flex-wrap gap-3 mb-3 small" id="sc-meta-row">
+          <span class="text-muted">Aktueller SoC: <span id="sc-current-soc" class="fw-bold text-success">--%</span></span>
           <span class="text-muted">Tagesziel: <span id="sc-target-soc" class="fw-bold text-info">--%</span></span>
           <span class="text-muted">Regelziel: <span id="sc-active-target" class="fw-bold text-success">--</span></span>
           <span class="text-muted">Morgen-Puffer: <span id="sc-morning-target" class="fw-bold text-success">--%</span></span>
@@ -1417,8 +1449,23 @@ if (in_array($seite, $protectedPages) && !isWebAuthenticated()) {
           <span id="sc-qratio-wrap" class="text-muted">Kurvenform: <span id="sc-qratio" class="fw-bold">--</span> <i class="fas fa-info-circle" title="Hohe Werte bedeuten: Die Kurve wartet länger auf den eingestellten Freilauf-SoC. Kleine Werte laden früher und direkter."></i></span>
           <span class="text-muted ms-auto">Plan vom: <span id="sc-plan-ts" class="fw-bold">--</span></span>
         </div>
-        <div style="position:relative; height:260px;">
-          <canvas id="storageCurveChart"></canvas>
+        <div id="sc-standard-chart-wrap">
+          <div class="small mb-2">
+            <span class="fw-bold text-info">Anlagenregelung – Standard-Ladekurve</span>
+            <span class="text-muted ms-2">SoC aus PV, Haus und planbaren Lasten; ohne Direktvermarktungswirkung.</span>
+          </div>
+          <div style="position:relative; height:260px;">
+            <canvas id="storageCurveChart"></canvas>
+          </div>
+        </div>
+        <div id="sc-direct-marketing-chart-wrap" class="mt-3" style="display:none;">
+          <div class="d-flex flex-wrap align-items-center gap-2 mb-2 small">
+            <span class="fw-bold" style="color:#8b5cf6;"><i class="fas fa-chart-line me-1"></i>Direktvermarktung – ausgewählter Fahrplan</span>
+            <span id="sc-direct-marketing-chart-state" class="text-muted"></span>
+          </div>
+          <div style="position:relative; height:260px;">
+            <canvas id="directMarketingTrajectoryChart"></canvas>
+          </div>
         </div>
         <div id="sc-direct-marketing-section" class="mt-3 p-2 rounded" style="display:none; background:var(--bs-body-bg); border:1px solid rgba(var(--bs-success-rgb),0.22);">
           <div class="small fw-bold text-success mb-2"><i class="fas fa-coins me-1"></i>Direktvermarktung</div>
@@ -1437,7 +1484,7 @@ if (in_array($seite, $protectedPages) && !isWebAuthenticated()) {
 
 <script src="assets/vendor/jquery/jquery-3.6.0.min.js"></script>
 <script src="assets/vendor/bootstrap/js/bootstrap.bundle.min.js"></script>
-    <script src="<?= getAssetUrl('solar.min.js') ?>" defer></script>
+    <script src="<?= getAssetUrl('solar.js') ?>" defer></script>
 <script>
 const PV_MAX = <?= $pvMax ?>; const WP_MAX = <?= $wpMax ?>; const BAT_MAX = <?= $maxBatPower ?>; const BAT_CAPACITY = <?= $batteryCapacity ?>; const AVGS = <?= json_encode($avgs) ?>;
 const PRICE_HISTORY = <?= json_encode($priceHistory) ?>;
@@ -1466,7 +1513,10 @@ function toggleForecast(el) {
     // Speichern
     fetch('mobile.php', {
         method: 'POST',
-        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'X-CSRF-Token': String(window.E3DC_CSRF_TOKEN || '')
+        },
         body: 'action=save_setting&key=show_forecast&value=' + (SHOW_FORECAST ? '1' : '0')
     });
     updateDashboard();
@@ -1484,7 +1534,10 @@ function toggleDarkMode(el) {
     // Speichern
     fetch('mobile.php', {
         method: 'POST',
-        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'X-CSRF-Token': String(window.E3DC_CSRF_TOKEN || '')
+        },
         body: 'action=save_setting&key=darkmode&value=' + (DARK_MODE ? '1' : '0')
     });
 
@@ -1511,42 +1564,112 @@ function toggleDarkMode(el) {
 }
 
 
+let mobileLiveFetchPromise = null;
+let mobileLiveFetchController = null;
+let mobileLiveRequestGeneration = 0;
+const mobileLiveFetchTimeoutMs = 10000;
+
+function invalidateMobileLiveFetch() {
+    mobileLiveRequestGeneration += 1;
+    if (mobileLiveFetchController) mobileLiveFetchController.abort();
+    mobileLiveFetchController = null;
+    mobileLiveFetchPromise = null;
+}
+
 function updateDashboard() {
+    if (typeof e3dcLiveAuthBlocked === 'function' && e3dcLiveAuthBlocked()) return Promise.resolve(null);
     const wsFresh = window.liveWs
         && window.liveWs.readyState === WebSocket.OPEN
         && window.liveWsLastMessageTs
         && (Date.now() - window.liveWsLastMessageTs) < 5000;
-    if (wsFresh) return;
-    if (document.getElementById('m-flow-wrapper') == null) return;
+    if (wsFresh) return Promise.resolve(null);
+    if (document.getElementById('m-flow-wrapper') == null) return Promise.resolve(null);
+    if (mobileLiveFetchPromise) return mobileLiveFetchPromise;
 
-    fetch('get_live_json.php?t=' + Date.now()).then(r => r.json()).then(data => {
+    const requestGeneration = ++mobileLiveRequestGeneration;
+    const controller = typeof AbortController === 'function' ? new AbortController() : null;
+    mobileLiveFetchController = controller;
+    let timeoutId = null;
+    const timeoutPromise = new Promise((_resolve, reject) => {
+        timeoutId = setTimeout(() => {
+            if (controller) controller.abort();
+            const error = new Error('Live-Anfrage überschritt das Zeitlimit');
+            error.name = 'AbortError';
+            reject(error);
+        }, mobileLiveFetchTimeoutMs);
+    });
+    const requestPromise = e3dcFetchLiveJson(
+        'get_live_json.php?t=' + Date.now(),
+        controller ? {signal: controller.signal} : {}
+    ).then(res => {
+        if (typeof e3dcReadLiveJsonResponse === 'function') return e3dcReadLiveJsonResponse(res);
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        return res.json();
+    });
+    const trackedPromise = Promise.race([requestPromise, timeoutPromise]).then(data => {
+        if (requestGeneration !== mobileLiveRequestGeneration) return;
+        if (typeof e3dcClearLiveAuthRecovery === 'function') e3dcClearLiveAuthRecovery();
         if (data) processMobileData(data);
     }).catch(err => {
+        if (requestGeneration !== mobileLiveRequestGeneration) return;
+        if (err && err.name === 'AbortError') return;
+        if (typeof e3dcHandleLiveAuthFailure === 'function' && e3dcHandleLiveAuthFailure(err)) return;
         console.error("Fetch Live JSON Error:", err);
         const statusBadge = document.getElementById('connection-status');
         if (statusBadge) {
             statusBadge.className = 'badge rounded-pill bg-danger text-body';
             statusBadge.innerText = 'Offline';
         }
+    }).finally(() => {
+        if (timeoutId !== null) clearTimeout(timeoutId);
+        if (mobileLiveFetchPromise === trackedPromise) mobileLiveFetchPromise = null;
+        if (mobileLiveFetchController === controller) mobileLiveFetchController = null;
     });
+    mobileLiveFetchPromise = trackedPromise;
+    return trackedPromise;
 }
 
 let mobileLivePollTimer = null;
+let mobileLivePollGeneration = 0;
 let mobileLiveTransportStarted = false;
+let mobileLiveLastResumeMs = 0;
+const mobileWebSocketEnabled = false;
 function mobileLivePollDelayMs() {
     return document.hidden ? 10000 : 2000;
 }
 function scheduleMobileLivePoll(immediate = false) {
+    const generation = ++mobileLivePollGeneration;
     if (mobileLivePollTimer) clearTimeout(mobileLivePollTimer);
-    if (immediate) updateDashboard();
-    mobileLivePollTimer = setTimeout(function tickMobileLivePoll() {
-        updateDashboard();
+    function tickMobileLivePoll() {
+        Promise.resolve(updateDashboard()).finally(() => {
+            if (generation !== mobileLivePollGeneration) return;
+            mobileLivePollTimer = setTimeout(tickMobileLivePoll, mobileLivePollDelayMs());
+        });
+    }
+    if (immediate) {
+        tickMobileLivePoll();
+    } else {
         mobileLivePollTimer = setTimeout(tickMobileLivePoll, mobileLivePollDelayMs());
-    }, mobileLivePollDelayMs());
+    }
+}
+function resumeMobileLiveTransport() {
+    if (document.hidden) return false;
+    if (!mobileLiveTransportStarted) return startMobileLiveTransportOnce();
+    const now = Date.now();
+    if ((now - mobileLiveLastResumeMs) < 500) return true;
+    mobileLiveLastResumeMs = now;
+    invalidateMobileLiveFetch();
+    scheduleMobileLivePoll(true);
+    return true;
 }
 document.addEventListener('visibilitychange', function() {
-    if (mobileLiveTransportStarted) scheduleMobileLivePoll(!document.hidden);
+    if (!mobileLiveTransportStarted) return;
+    if (document.hidden) scheduleMobileLivePoll(false);
+    else resumeMobileLiveTransport();
 });
+window.addEventListener('pageshow', resumeMobileLiveTransport);
+window.addEventListener('focus', resumeMobileLiveTransport);
+window.addEventListener('online', resumeMobileLiveTransport);
 
 function initWebSocket() {
     const protocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
@@ -1585,7 +1708,11 @@ function startMobileLiveTransportOnce() {
     if (mobileLiveTransportStarted) return true;
     if (typeof window.processMobileData !== 'function') return false;
     mobileLiveTransportStarted = true;
-    initWebSocket();
+    mobileLiveLastResumeMs = Date.now();
+    // Der native WebSocket-Producer bleibt bis zu einem vollständigen
+    // Web-Auth-Vertrag für Handshake und Reconnect deaktiviert. Bis dahin
+    // läuft genau ein gebündelter, authentifizierter Pollingpfad.
+    if (mobileWebSocketEnabled) initWebSocket();
     scheduleMobileLivePoll(true);
     return true;
 }

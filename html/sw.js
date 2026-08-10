@@ -1,4 +1,4 @@
-const CACHE_NAME = 'e3dc-control-v5-4-2d-static';
+const CACHE_NAME = 'e3dc-control-v5-4-3-static';
 const ASSETS = [
   'assets/vendor/bootstrap/css/bootstrap.min.css',
   'assets/vendor/fontawesome/css/all.min.css',
@@ -98,11 +98,21 @@ self.addEventListener('notificationclick', event => {
   event.notification.close();
 
   if (event.action) {
-    const actionUrl = '/webhook.php?action=' + encodeURIComponent(event.action);
+    // Push-Schaltflächen öffnen nur die geschützte Bedienoberfläche.
+    // Der Service Worker darf ohne interaktiven CSRF-Nachweis keine
+    // Hardware-, Konfigurations- oder Updateaktion auslösen.
+    const targetUrl = event.notification.data ? event.notification.data.url : '/';
     event.waitUntil(
-      fetch(actionUrl).then(response => response.json()).then(result => {
-        console.log("Action triggered:", result);
-      }).catch(e => console.error("Action error:", e))
+      clients.matchAll({ type: 'window', includeUncontrolled: true }).then(clientList => {
+        for (const client of clientList) {
+          if (client.url.includes(targetUrl) && 'focus' in client) {
+            return client.focus();
+          }
+        }
+        if (clients.openWindow) {
+          return clients.openWindow(targetUrl);
+        }
+      })
     );
     return;
   }

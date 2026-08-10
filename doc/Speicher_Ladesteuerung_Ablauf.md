@@ -1,6 +1,13 @@
 # Speicher-Ladesteuerung - Systemablauf
 
-> **Stand:** v5.4.2d, gegen den Release-Betriebsvertrag geprüft am 2026-07-28
+> **Stand:** v5.4.3, gegen den Release-Betriebsvertrag geprüft am 2026-08-10
+>
+> **Neu in 5.4.3:** Speicherreserve, Sollkurve, Direktvermarktung und
+> Verbraucherbudgets bleiben getrennt. Ein gemeinsamer Ownervertrag bindet die
+> finale Speicherentscheidung bis zum Hardwareausgang; fehlende, veraltete
+> oder widersprüchliche Rückmeldungen öffnen keinen zusätzlichen Lade- oder
+> Entladerahmen. Plan, freigegebene Aktion und tatsächliche Wirkung werden
+> getrennt dargestellt.
 >
 > **Hinweis:** 5.4.2d ändert ausschließlich den Update- und
 > Wiederherstellungspfad. Speicherentscheidungen und Hardwareausgänge

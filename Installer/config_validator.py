@@ -35,6 +35,20 @@ try:
 except Exception:  # pragma: no cover - direct script execution fallback
     from aux_inverter_contract import effective_contract as _aux_inverter_contract  # type: ignore
 try:
+    from .tariff_schedule import (
+        supports_heat_price_boost,
+        supports_spot_market_prices,
+    )
+except Exception:  # pragma: no cover - direct script execution fallback
+    from tariff_schedule import (  # type: ignore
+        supports_heat_price_boost,
+        supports_spot_market_prices,
+    )
+try:
+    from .Heat.price_boost import parse_allowed_windows as _parse_heat_price_boost_windows
+except Exception:  # pragma: no cover - direct script execution fallback
+    from Heat.price_boost import parse_allowed_windows as _parse_heat_price_boost_windows  # type: ignore
+try:
     from .pv_forecast_topology import (
         build_pv_forecast_topology,
         has_explicit_topology_config,
@@ -101,6 +115,9 @@ def _direct_marketing_aux_ac_mode(cfg: Dict[str, Any]) -> Tuple[str, str]:
         "reserve": "reserve_only",
         "reserve_sichern": "reserve_only",
         "reserve_only": "reserve_only",
+        "hausversorgung": "house_supply",
+        "hausversorgung_sichern": "house_supply",
+        "house_supply": "house_supply",
         "wirtschaftlich": "economic",
         "economical": "economic",
         "economic": "economic",
@@ -113,7 +130,7 @@ def _direct_marketing_aux_ac_mode(cfg: Dict[str, Any]) -> Tuple[str, str]:
             continue
         raw = str(cfg.get(key) or "").strip().lower().replace("-", "_").replace(" ", "_")
         mode = aliases.get(raw, raw)
-        if mode in {"off", "reserve_only", "economic"}:
+        if mode in {"off", "reserve_only", "house_supply", "economic"}:
             return mode, key
         return "off", f"{key}_invalid"
     if _is_enabled(cfg, "direct_marketing_aux_inverter_ac_storage_enable"):
@@ -718,6 +735,57 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         severity=dc_first_severity,
         message=dc_first_message,
     )
+    shortfall_aux_ac_enabled = _is_enabled(
+        cfg,
+        "storage_forecast_shortfall_aux_ac_charge_enable",
+    )
+    if not shortfall_aux_ac_enabled:
+        shortfall_aux_ac_severity = "info"
+        shortfall_aux_ac_message = (
+            "Nicht freigegeben und aus: Zusatz-AC bleibt auch bei einem "
+            "Prognosedefizit vom Speicher-Laderahmen ausgeschlossen."
+        )
+    else:
+        shortfall_aux_ac_severity = "warning"
+        shortfall_aux_ac_message = (
+            "Konfiguration erkannt, aber nicht freigegeben (EVIDENCE_LIMIT): "
+            "Getrennte PV- und "
+            "Lastquantile dürfen nicht zu einem vermeintlichen Quantil des "
+            "Speicherüberschusses verrechnet werden. Erst eine historisch "
+            "kalibrierte gemeinsame Horizontverteilung der tatsächlich im "
+            "Speicher ankommenden E3DC-DC-Energie und eine fachlich beschlossene "
+            "Risikoschwelle dürfen einen versiegelten Plan-/Slot-/Action-Nachweis "
+            "freigeben. Beides wird derzeit nicht erzeugt; E3DC_DC_ONLY bleibt "
+            "wirksam. Fehlende oder schlechte Daten sind keine Freigabe, "
+            "Netzbezug bleibt gesperrt. Die DV-Zusatzwechselrichter-Auswahl "
+            "bleibt davon getrennt."
+        )
+    storage["storage_forecast_shortfall_aux_ac_charge_enable"] = _entry(
+        key="storage_forecast_shortfall_aux_ac_charge_enable",
+        label=(
+            "Prognose 100%: Zusatz-AC bei belegtem "
+            "Prognoseminderertrag (nicht freigegeben)"
+        ),
+        unit="",
+        configured=shortfall_aux_ac_enabled,
+        live_value=None,
+        live_key=None,
+        effective=False,
+        source=(
+            "evidence_limit"
+            if shortfall_aux_ac_enabled
+            else (
+                "user"
+                if _has_user_value(
+                    cfg,
+                    "storage_forecast_shortfall_aux_ac_charge_enable",
+                )
+                else "default"
+            )
+        ),
+        severity=shortfall_aux_ac_severity,
+        message=shortfall_aux_ac_message,
+    )
 
     grid_amps = safe_float(cfg.get("grid_max_amps"), 63.0)
     grid_severity = "ok"
@@ -1226,7 +1294,38 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     price_hard = safe_float(cfg.get("price_hard_limit"), -99.0)
     cheap_grid_limit = safe_float(cfg.get("cheap_grid_price_limit_ct"), 0.0)
     cheap_grid_enabled = _is_enabled(cfg, "cheap_grid_boost_enable")
-    cheap_grid_supported = tariff in {"tibber", "awattar", "dynamic", "epex", "octopus_heat"}
+    cheap_grid_supported = supports_spot_market_prices(cfg)
+    heat_price_boost_requested = _is_enabled(cfg, "price_boost_enable")
+    heat_price_scope_aliases = {
+        "heat": "heating",
+        "heizen": "heating",
+        "heizung": "heating",
+        "heating": "heating",
+        "warmwasser": "dhw",
+        "ww": "dhw",
+        "dhw": "dhw",
+        "beide": "both",
+        "both": "both",
+    }
+    heat_price_scope_raw = str(
+        cfg.get("heat_price_boost_scope", "both") or "both"
+    ).strip().lower()
+    heat_price_scope_valid = heat_price_scope_raw in heat_price_scope_aliases
+    heat_price_scope = heat_price_scope_aliases.get(heat_price_scope_raw)
+    heat_price_windows_raw = str(
+        cfg.get("heat_price_boost_windows", "") or ""
+    ).strip()
+    heat_price_windows, heat_price_invalid_windows = (
+        _parse_heat_price_boost_windows(heat_price_windows_raw)
+    )
+    heat_price_windows_valid = bool(
+        not heat_price_invalid_windows
+        and (
+            not heat_price_windows_raw
+            or heat_price_windows
+        )
+    )
+    heat_price_tariff_allowed = supports_heat_price_boost(cfg)
     market_min_margin = safe_float(
         cfg.get("market_min_margin_pct"),
         safe_float(cfg.get("direct_marketing_min_margin_pct"), 10.0),
@@ -1235,11 +1334,10 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         cfg.get("market_safety_correction_ct_per_kwh"),
         safe_float(cfg.get("direct_marketing_safety_margin_ct_per_kwh"), 0.0),
     )
-    market_autarky_first = (
-        _is_enabled(cfg, "market_autarky_first_enable")
-        if _has_user_value(cfg, "market_autarky_first_enable")
-        else True
-    )
+    # Der normale Marktpfad darf ausreichende Speicher-/PV-Deckung nicht per
+    # Nutzerschalter übergehen. market_economics.py behandelt dies bereits als
+    # feste Schutzinvariante; der historische Schlüssel bleibt wirkungslos.
+    market_autarky_first = True
     market_autarky_low_soc = safe_float(cfg.get("market_autarky_low_soc_pct"), 20.0)
     market_autarky_buffer_wh = safe_float(cfg.get("market_autarky_horizon_buffer_wh"), 500.0)
     octopus_bad_order = tariff == "octopus_heat" and not (cheap < basis < uht)
@@ -1521,6 +1619,117 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         ),
     )
     price_order_warning = price_limit > price_pause
+    price["price_boost_enable"] = _entry(
+        key="price_boost_enable",
+        label="Wärmepumpen-Preisverschiebung",
+        unit="-",
+        configured=(
+            cfg.get("price_boost_enable")
+            if _has_user_value(cfg, "price_boost_enable")
+            else None
+        ),
+        live_value=None,
+        live_key=None,
+        effective=False,
+        source=(
+            "evidence_limit"
+            if heat_price_boost_requested
+            else (
+                "user"
+                if _has_user_value(cfg, "price_boost_enable")
+                else "default"
+            )
+        ),
+        severity="warning" if heat_price_boost_requested else "ok",
+        message=(
+            "Aus: Es wird kein allgemeiner Wärmepumpen-Preis-Boost angefordert."
+            if not heat_price_boost_requested
+            else (
+                "EVIDENCE_LIMIT: Der Scope ist ungültig; der Candidate bleibt "
+                "fail-closed und effektiv aus."
+                if not heat_price_scope_valid
+                else (
+                    "EVIDENCE_LIMIT: Mindestens ein Zeitfenster ist ungültig; "
+                    "der Candidate bleibt fail-closed und effektiv aus."
+                    if not heat_price_windows_valid
+                    else (
+                        "EVIDENCE_LIMIT: Der gewählte Tarif stellt keine "
+                        "belastbare Preisverschiebung für Wärme bereit."
+                        if not heat_price_tariff_allowed
+                        else (
+                            "Candidate/Shadow: Die Auswahl wird nur diagnostiziert. "
+                            "Ohne vollständige Wärme-/PV-Evidenz und einen gebundenen "
+                            "heat_intent_v1-Aktivierungsvertrag bleibt der Preis-Boost "
+                            "effektiv aus; heat_policy_runtime_enable allein aktiviert "
+                            "ihn nicht."
+                        )
+                    )
+                )
+            )
+        ),
+    )
+    price["heat_price_boost_scope"] = _entry(
+        key="heat_price_boost_scope",
+        label="Wärmepumpen-Preisverschiebung Ziel",
+        unit="-",
+        configured=(
+            cfg.get("heat_price_boost_scope")
+            if _has_user_value(cfg, "heat_price_boost_scope")
+            else None
+        ),
+        live_value=None,
+        live_key=None,
+        effective=heat_price_scope if heat_price_scope_valid else None,
+        source=(
+            "user"
+            if _has_user_value(cfg, "heat_price_boost_scope")
+            else "default"
+        ),
+        severity=(
+            "warning"
+            if heat_price_boost_requested and not heat_price_scope_valid
+            else "ok"
+        ),
+        message=(
+            "Ungültiger Scope: Die Preisverschiebung bleibt fail-closed."
+            if not heat_price_scope_valid
+            else (
+                "Zielauswahl ist plausibel; sie erzeugt ohne vollständigen "
+                "Intent-Vertrag keinen Aktorbefehl."
+            )
+        ),
+    )
+    price["heat_price_boost_windows"] = _entry(
+        key="heat_price_boost_windows",
+        label="Wärmepumpen-Preisverschiebung Zeitfenster",
+        unit="-",
+        configured=(
+            cfg.get("heat_price_boost_windows")
+            if _has_user_value(cfg, "heat_price_boost_windows")
+            else None
+        ),
+        live_value=None,
+        live_key=None,
+        effective=heat_price_windows_raw if heat_price_windows_valid else None,
+        source=(
+            "user"
+            if _has_user_value(cfg, "heat_price_boost_windows")
+            else "default"
+        ),
+        severity=(
+            "warning"
+            if heat_price_boost_requested and not heat_price_windows_valid
+            else "ok"
+        ),
+        message=(
+            "Ungültige Zeitfenster: Die Preisverschiebung bleibt fail-closed."
+            if not heat_price_windows_valid
+            else (
+                "Leer bedeutet ganztägiger Candidate; gültige Zeitfenster "
+                "begrenzen nur die Shadow-Auswertung."
+            )
+        ),
+    )
     for key, label, value in (
         ("price_limit", "Boost-Preislimit", price_limit),
         ("price_pause_limit", "Sperr-Preislimit", price_pause),
@@ -1529,7 +1738,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         enabled = key != "cheap_grid_price_limit_ct" or cheap_grid_enabled
         severity = "ok"
         message = "Preislimit ist plausibel."
-        if enabled and value < 0.0:
+        if key != "cheap_grid_price_limit_ct" and enabled and value < 0.0:
             severity = "warning"
             message = "Preislimit sollte nicht negativ sein."
         elif key in {"price_limit", "price_pause_limit"} and price_order_warning:
@@ -1537,12 +1746,12 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
             message = "Das Boost-Preislimit liegt über dem Sperr-Preislimit; bitte die Reihenfolge prüfen."
         elif key == "cheap_grid_price_limit_ct" and cheap_grid_enabled and not cheap_grid_supported:
             severity = "warning"
-            message = "Preis-Boost ist nur für dynamische EPEX-/Börsentarife und Octopus Heat gedacht."
-        elif key == "cheap_grid_price_limit_ct" and enabled and value <= 0.0 and tariff == "octopus_heat":
-            message = "Octopus Heat nutzt LT-Fenster automatisch; Preislimit ist optional."
-        elif key == "cheap_grid_price_limit_ct" and enabled and value <= 0.0:
+            message = "Negativpreis-Freigaben sind nur bei echten Börsenpreistarifen wirksam."
+        elif key == "cheap_grid_price_limit_ct" and enabled and value > 0.0:
             severity = "warning"
-            message = "Speicher-Netzladen ist aktiv, aber kein positives Preislimit gesetzt."
+            message = "Positive Werte öffnen keinen Günstigpreis-Pfad; der Sonderpfad bleibt strikt auf negative Abrechnungspreise begrenzt."
+        elif key == "cheap_grid_price_limit_ct" and enabled:
+            message = "0 ct/kWh bedeutet: nur bei tatsächlich negativem Abrechnungspreis; ein negativer Wert verschärft die Grenze."
         price[key] = _entry(
             key=key,
             label=label,
@@ -1622,12 +1831,12 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         live_value=None,
         live_key=None,
         effective=market_autarky_first,
-        source="user" if _has_user_value(cfg, "market_autarky_first_enable") else "default",
-        severity="ok" if market_autarky_first else "warning",
+        source="system_invariant",
+        severity="ok",
         message=(
-            "Normales Markt-Netzladen und Speicher-Halten werden bei ausreichender Horizontprognose blockiert."
-            if market_autarky_first
-            else "PV-autark zuerst ist ausgeschaltet; der normale Marktpfad darf gute Preisfenster aggressiver vorziehen."
+            "Schutzinvariante: Normales Markt-Netzladen und Speicher-Halten "
+            "werden bei ausreichender Horizontprognose blockiert. Ein "
+            "historischer Konfigurationswert kann diesen Schutz nicht abschalten."
         ),
     )
 
@@ -1721,9 +1930,10 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         source="user" if _has_user_value(cfg, "heat_policy_runtime_enable") else "default",
         severity="warning" if heat_policy_runtime else "ok",
         message=(
-            "Pilot aktiv: zentrale Wärme-Policy darf WP-Starts und Heizstab-Netzboost begrenzen."
+            "Pilot aktiv: zentrale Wärme-Policy darf WP-Starts und Heizstab-Netzboost begrenzen. "
+            "Dieser Schalter allein aktiviert keinen Wärmepumpen-Preis-Boost."
             if heat_policy_runtime
-            else "Shadow-Betrieb: zentrale Wärme-Policy schreibt Diagnose, bestehende Logik bleibt führend."
+            else "Shadow-Betrieb: zentrale Wärme-Policy schreibt Diagnose, bestehende Logik bleibt führend; der Wärmepumpen-Preis-Boost bleibt effektiv aus."
         ),
     )
     price["ems_budget_runtime_enable"] = _entry(
@@ -1953,12 +2163,13 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         and dm_pv_topology_contract.get("e3dc_dc_bound")
         and dm_pv_topology_contract.get("external_ac_bound")
     )
-    dm_aux_ac_storage_enable = bool(
-        dm_aux_ac_storage_requested
-        and not dm_pv_store_legacy_dc_only_veto
-        and dm_aux_ac_topology_ready
-    )
-    dm_pv_store_dc_only = not dm_aux_ac_storage_enable
+    # Die Moduswahl ist nur eine gespeicherte Nutzerabsicht. Der produktive
+    # Forecastpfad erzeugt noch keine kalibrierte gemeinsame Horizontverteilung,
+    # und für deren Risikoentscheidung ist noch keine Schwelle beschlossen.
+    # Deshalb darf die Konfigurationsprojektion weder eine AC-Wirksamkeit noch
+    # einen OK-Status behaupten; der Backendvertrag bleibt separat fail-closed.
+    dm_aux_ac_storage_enable = False
+    dm_pv_store_dc_only = True
     dm_pv_store_external_ac_guard_w = safe_float(cfg.get("direct_marketing_pv_store_external_ac_guard_w"), 100.0)
     dm_pv_store_export_limit_guard_w = safe_float(cfg.get("direct_marketing_pv_store_export_limit_guard_w"), 100.0)
     dm_pv_store_export_limit_ramp_bypass_w = safe_float(cfg.get("direct_marketing_pv_store_export_limit_ramp_bypass_w"), 300.0)
@@ -2256,20 +2467,24 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         live_value=None,
         live_key=None,
         effective=dm_pv_store_dc_only,
-        source="derived",
-        severity="ok",
+        source=(
+            "evidence_limit"
+            if dm_aux_ac_storage_requested
+            else "derived"
+        ),
+        severity="warning" if dm_aux_ac_storage_requested else "ok",
         message=(
-            "E3DC-DC ist die einzige freigegebene PV-Speicherquelle."
-            if dm_pv_store_dc_only else
-            "Zusatz-WR-AC darf nur in planseitig nachgewiesenen DC-Prognoselücken ergänzen."
+            "Wirksam bleibt E3DC_DC_ONLY: Die gewählte Zusatz-AC-Route ist "
+            "EVIDENCE_LIMIT, bis eine kalibrierte gemeinsame "
+            "Horizontverteilung erzeugt wird und die Risikoschwelle fachlich "
+            "beschlossen ist."
+            if dm_aux_ac_storage_requested
+            else "E3DC-DC ist die einzige freigegebene PV-Speicherquelle."
         ),
     )
     aux_ac_validation_warning = bool(
         dm_aux_ac_mode_source.endswith("_invalid")
-        or (
-            dm_aux_ac_storage_requested
-            and (dm_pv_store_legacy_dc_only_veto or not dm_aux_ac_topology_ready)
-        )
+        or dm_aux_ac_storage_requested
     )
     configured_aux_ac_mode = (
         cfg.get("direct_marketing_aux_inverter_ac_storage_mode")
@@ -2287,9 +2502,17 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         configured=configured_aux_ac_mode,
         live_value=None,
         live_key=None,
-        effective=dm_aux_ac_mode,
-        source=dm_aux_ac_mode_source,
-        severity="warning" if aux_ac_validation_warning else "ok",
+        effective="off",
+        source=(
+            "evidence_limit"
+            if dm_aux_ac_storage_requested
+            else dm_aux_ac_mode_source
+        ),
+        severity=(
+            "warning"
+            if aux_ac_validation_warning
+            else "info"
+        ),
         message=(
             "Unbekannter AC-Speichermodus; sicherer Standard ist Aus."
             if dm_aux_ac_mode_source.endswith("_invalid")
@@ -2297,16 +2520,20 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
                 "Die AC-Freigabe wird vom gesetzten Legacy-DC-Veto überstimmt."
                 if dm_aux_ac_storage_requested and dm_pv_store_legacy_dc_only_veto
                 else (
-                    "Der Modus bleibt fail-closed, bis E3DC-DC und EXTERNAL_AC vollständig gebunden sind."
+                    "Auswahl gespeichert, wirksam bleibt E3DC_DC_ONLY: Zusätzlich "
+                    "zur vollständigen E3DC-DC-/EXTERNAL-AC-Topologie fehlen der "
+                    "Produzent einer historisch kalibrierten gemeinsamen "
+                    "Horizontverteilung und die fachlich beschlossene "
+                    "Risikoschwelle. Die Route bleibt EVIDENCE_LIMIT."
                     if dm_aux_ac_storage_requested and not dm_aux_ac_topology_ready
                     else (
-                        "Reserve sichern: E3DC-DC zuerst; Zusatz-WR-AC nur bei frischer, vollständiger Prognose, belegtem DC-Defizit und ohne Netzbezug."
-                        if dm_aux_ac_mode == "reserve_only"
-                        else (
-                            "Wirtschaftlich: wie Reserve sichern, zusätzlich nur bei positiver Routenmarge nach Wirkungsgrad und Kosten."
-                            if dm_aux_ac_mode == "economic"
-                            else "Aus: Zusatz-WR-AC ist keine Speicherquelle; E3DC-DC bleibt Standard."
-                        )
+                        "Auswahl gespeichert, aber nicht wirksam: Ohne Produzent "
+                        "einer historisch kalibrierten gemeinsamen "
+                        "Horizontverteilung und ohne fachlich beschlossene "
+                        "Risikoschwelle bleibt die Zusatz-AC-Route EVIDENCE_LIMIT; "
+                        "E3DC_DC_ONLY ist der steuernde Standard."
+                        if dm_aux_ac_storage_requested
+                        else "Aus: Zusatz-WR-AC ist keine Speicherquelle; E3DC-DC bleibt Standard."
                     )
                 )
             )
@@ -2324,15 +2551,30 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         live_value=None,
         live_key=None,
         effective=dm_aux_ac_storage_enable,
-        source=dm_aux_ac_mode_source,
-        severity="warning" if aux_ac_validation_warning else "ok",
+        source=(
+            "evidence_limit"
+            if dm_aux_ac_storage_requested
+            else dm_aux_ac_mode_source
+        ),
+        severity=(
+            "warning"
+            if aux_ac_validation_warning
+            else "info"
+        ),
         message=(
-            "Explizites Legacy-Ein wird konservativ als Reserve sichern gelesen; die neue Moduswahl hat Vorrang."
+            "Explizites Legacy-Ein wird als gespeicherte Auswahl gelesen, bleibt "
+            "aber bis zum gemeinsamen Horizontnachweis und zur beschlossenen "
+            "Risikoschwelle EVIDENCE_LIMIT."
             if dm_aux_ac_mode_source == "legacy_bool_explicit_true"
             else (
                 "Die Legacy-Freigabe wird vom gesetzten DC-Veto überstimmt."
                 if dm_aux_ac_storage_requested and dm_pv_store_legacy_dc_only_veto
-                else "Nur Kompatibilitätsanzeige; die kanonische Moduswahl erteilt oder entzieht die Freigabe."
+                else (
+                    "Nur Kompatibilitätsanzeige; die kanonische Moduswahl ist "
+                    "gespeichert, erteilt derzeit aber keine AC-Freigabe."
+                    if dm_aux_ac_storage_requested
+                    else "Nur Kompatibilitätsanzeige; Zusatz-AC ist aus."
+                )
             )
         ),
     )
@@ -2616,7 +2858,6 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         ("direct_marketing_pv_store_import_guard_w", "DV-PV-Importwächter", dm_pv_store_import_guard_w, "W", 0.0, None),
         ("direct_marketing_pv_store_min_hold_s", "DV-PV-Mindesthaltezeit", dm_pv_store_min_hold_s, "s", 0.0, 3600.0),
         ("direct_marketing_pv_store_ramp_step_w", "DV-PV-Laderampe", dm_pv_store_ramp_step_w, "W/Zyklus", 100.0, 5000.0),
-        ("direct_marketing_aux_inverter_ac_forecast_confidence_pct", "DV-AC-Prognosevertrauen", dm_aux_ac_forecast_confidence_pct, "%", 10.0, 100.0),
         ("direct_marketing_aux_inverter_ac_deadband_wh", "DV-AC-Energietotband", dm_aux_ac_deadband_wh, "Wh", 0.0, None),
         ("direct_marketing_aux_inverter_ac_min_margin_ct_per_kwh", "DV-AC-Mindestmarge", dm_aux_ac_min_margin_ct, "ct/kWh", 0.0, None),
         ("direct_marketing_aux_inverter_ac_grid_import_guard_w", "DV-AC-Netzbezugsgrenze", dm_aux_ac_grid_import_guard_w, "W", 0.0, 300.0),
@@ -2715,6 +2956,48 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
             severity=severity,
             message=message,
         )
+
+    dm_point_confidence_valid = bool(
+        0.0 <= dm_aux_ac_forecast_confidence_pct <= 100.0
+    )
+    price["direct_marketing_aux_inverter_ac_forecast_confidence_pct"] = _entry(
+        key="direct_marketing_aux_inverter_ac_forecast_confidence_pct",
+        label="DV-AC-Punktprognosewert (nur Diagnose)",
+        unit="%",
+        configured=(
+            dm_aux_ac_forecast_confidence_pct
+            if _has_user_value(
+                cfg,
+                "direct_marketing_aux_inverter_ac_forecast_confidence_pct",
+            )
+            else None
+        ),
+        live_value=None,
+        live_key=None,
+        effective=None,
+        source="diagnostic_only",
+        severity=(
+            "warning"
+            if dm_aux_ac_storage_requested or not dm_point_confidence_valid
+            else "info"
+        ),
+        message=(
+            "Der gespeicherte Punktwert ist ungültig, besitzt aber ohnehin "
+            "keine Steuerwirkung."
+            if not dm_point_confidence_valid
+            else (
+                "Nur Diagnose, keine Steuerwirkung: Der gespeicherte Punktwert "
+                "ist weder ein kalibriertes Quantil noch die Risikoschwelle für "
+                "eine Zusatz-AC-Freigabe. Die Route bleibt EVIDENCE_LIMIT."
+                if dm_aux_ac_storage_requested
+                else (
+                    "Nur Diagnose, keine Steuerwirkung: Der gespeicherte "
+                    "Punktwert ist weder ein kalibriertes Quantil noch eine "
+                    "Risikoschwelle."
+                )
+            )
+        ),
+    )
 
     price["direct_marketing_arbitrage_enable"] = _entry(
         key="direct_marketing_arbitrage_enable",

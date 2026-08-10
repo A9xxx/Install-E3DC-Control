@@ -4,7 +4,6 @@ import json
 import os
 import re
 import logging
-import urllib.request
 import math
 import socket
 from logging.handlers import RotatingFileHandler
@@ -18,6 +17,10 @@ try:
     from json_cache import read_json_cached as _read_json_cached
 except ImportError:  # pragma: no cover - Paketimport
     from Installer.json_cache import read_json_cached as _read_json_cached
+try:
+    from live_snapshot import read_runtime_live_snapshot
+except ImportError:  # pragma: no cover - Paketimport
+    from Installer.live_snapshot import read_runtime_live_snapshot
 
 # Pfade
 LOG_DIR = "/var/www/html/logs"
@@ -26,7 +29,6 @@ CONFIG_CACHE = "/var/www/html/ramdisk/e3dc_config_cache.json"
 VEHICLES_JSON_FILE = "/var/www/html/ramdisk/vehicles.json"
 STORAGE_STATE_FILE = "/var/www/html/ramdisk/storage_manager_state.json"
 WB_BUDGET_FILE = "/var/www/html/ramdisk/wb_pv_budget.json"
-WALLBOX_NATIVE_FILE = "/var/www/html/ramdisk/wallbox_native.json"
 HEIZSTAB_DATA_FILE = "/var/www/html/ramdisk/heizstab_data.json"
 HA_INBOUND_FILE = "/var/www/html/ramdisk/mqtt_ha_inbound.json"
 EXTERNAL_WB_FILE = "/var/www/html/ramdisk/external_wb.json"
@@ -34,6 +36,7 @@ PRICE_BOOST_PLAN_FILE = "/var/www/html/ramdisk/price_boost_plan.json"
 PREDUMP_CONSUMER_PLAN_FILE = "/var/www/html/ramdisk/predump_consumer_plan.json"
 AVAILABILITY_TOPIC_SUFFIX = "status/availability"
 INBOUND_MAX_AGE_S = 180
+MAIN_CONNECTION_GENERATION = 0
 
 def setup_logging():
     os.makedirs(LOG_DIR, exist_ok=True)
@@ -211,6 +214,13 @@ def first_value(data, keys, default=None):
 
 def first_number(data, keys, default=0.0):
     return as_float(first_value(data, keys, default), default)
+
+
+def any_true(data, keys):
+    if not isinstance(data, dict):
+        return False
+    return any(as_bool(data.get(key)) for key in keys if key in data)
+
 
 def publish_json(client, topic, payload, retain=False):
     if not _mqtt_context_valid(refresh=True):
@@ -421,6 +431,21 @@ def handle_inbound_telemetry(base_topic, topic, payload, enabled=True):
     update_inbound_telemetry(device, key, payload, topic)
     return True
 
+def mqtt_home_power_w(live):
+    """Wählt nur einen belegten bereinigten Hauswert vor dem Rohwert."""
+    binding = live.get("home_projection_binding")
+    if isinstance(binding, dict) and binding.get("valid") is True:
+        return first_number(
+            live,
+            ("home", "home_raw", "Home_Power", "Hausverbrauch", "P_Home"),
+            0,
+        )
+    return first_number(
+        live,
+        ("home_raw", "Home_Power", "Hausverbrauch", "P_Home", "home"),
+        0,
+    )
+
 def build_ha_state(live, cfg=None):
     if not _mqtt_context_valid(refresh=True):
         _write_disabled_mqtt_state()
@@ -442,7 +467,6 @@ def build_ha_state(live, cfg=None):
     cfg = cfg or {}
     storage_state = read_json_file(STORAGE_STATE_FILE, max_age_s=900)
     wb_budget = read_json_file(WB_BUDGET_FILE, max_age_s=180)
-    wallbox_native = read_json_file(WALLBOX_NATIVE_FILE, max_age_s=180)
     heizstab = read_json_file(HEIZSTAB_DATA_FILE, max_age_s=180)
     inbound_enabled = as_bool(cfg.get("mqtt_ha_inbound_enable", "1"))
     inbound = read_json_file(HA_INBOUND_FILE, max_age_s=INBOUND_MAX_AGE_S) if inbound_enabled else {}
@@ -466,7 +490,7 @@ def build_ha_state(live, cfg=None):
     grid_w = first_number(live, ("grid", "Grid_Power", "P_Grid", "Netz_Power"), 0)
     bat_w = first_number(live, ("bat", "Battery_Power", "P_Battery", "Bat_Power"), 0)
     soc = first_number(live, ("soc", "SOC", "Battery_SOC", "bat_soc"), 0)
-    home_w = first_number(live, ("home_raw", "home", "Home_Power", "Hausverbrauch", "P_Home"), 0)
+    home_w = mqtt_home_power_w(live)
     wb1_w = first_number(live, ("wb", "Wallbox_Power", "Wb_Power", "WB_Power"), 0)
     wb2_w = first_number(live, ("wb2", "Wallbox2_Power", "Wb2_Power", "WB2_Power"), 0)
     wb1_w = max(wb1_w, first_number(inbound_wb1, ("power_w",), 0))
@@ -529,13 +553,28 @@ def build_ha_state(live, cfg=None):
     )
 
     wallbox_plugged = (
-        as_bool(first_value(wallbox_native, ("plug_state", "car_connected"), False))
-        or as_bool(first_value(live, ("wb_plug_state", "wb2_plug_state"), False))
+        any_true(
+            live,
+            (
+                "wb_locked",
+                "wb2_locked",
+                "wb_plug_state",
+                "wb2_plug_state",
+            ),
+        )
         or as_bool(first_value(inbound_wb1, ("plugged",), False))
         or as_bool(first_value(inbound_wb2, ("plugged",), False))
     )
     wallbox_charging = (
-        as_bool(first_value(wallbox_native, ("charge_state", "charging"), False))
+        any_true(
+            live,
+            (
+                "wb_charging",
+                "wb2_charging",
+                "wb_charge_state",
+                "wb2_charge_state",
+            ),
+        )
         or as_bool(first_value(inbound_wb1, ("charging",), False))
         or as_bool(first_value(inbound_wb2, ("charging",), False))
         or wallbox_w > 100
@@ -545,6 +584,8 @@ def build_ha_state(live, cfg=None):
     state = {
         "ts": int(time.time()),
         "source": "e3dc_mqtt_hub",
+        "available": True,
+        "context_valid": True,
         "pv_w": as_int(pv_w),
         "grid_w": as_int(grid_w),
         "grid_export_w": as_int(grid_export_w),
@@ -724,10 +765,12 @@ def send_ha_discovery(client, base_topic):
         publish_json(client, topic, payload, retain=True)
 
 def on_connect(client, userdata, flags, reason_code, properties=None):
+    global MAIN_CONNECTION_GENERATION
     if not _mqtt_context_valid(refresh=True):
         _write_disabled_mqtt_state()
         return
     if mqtt_reason_success(reason_code):
+        MAIN_CONNECTION_GENERATION += 1
         logger.info("MQTT verbunden. Abonniere Fahrzeug- und HA/ioBroker-Topics...")
         base_topic = str(userdata.get('base_topic', 'e3dc') or 'e3dc').strip().strip('/') or 'e3dc'
         # Hört auf alle Fahrzeuge nach dem Muster: e3dc/vehicle/<NAME>/<ATTRIBUT>
@@ -949,7 +992,12 @@ def main():
         try:
             mqtt_client.connect(broker_ip, broker_port, 60)
             mqtt_client.loop_start()
-            publish_raw(mqtt_client, f"{base_topic}/{AVAILABILITY_TOPIC_SUFFIX}", "online", retain=True)
+            publish_raw(
+                mqtt_client,
+                f"{base_topic}/{AVAILABILITY_TOPIC_SUFFIX}",
+                "offline",
+                retain=True,
+            )
             send_ha_discovery(mqtt_client, base_topic)
             return mqtt_client
         except Exception as e:
@@ -1009,6 +1057,8 @@ def main():
     last_data = ""
     last_ha_state = ""
     last_individual = {}
+    live_source_available = None
+    observed_connection_generation = -1
     while True:
         if not _mqtt_context_valid(refresh=True):
             _write_disabled_mqtt_state()
@@ -1027,16 +1077,63 @@ def main():
         if has_main_broker and client is None and time.time() >= next_main_retry:
             client = connect_main_mqtt_client()
             next_main_retry = time.time() + 60 if client is None else 0
+            if client is not None:
+                live_source_available = None
+                observed_connection_generation = -1
+                last_data = ""
+                last_ha_state = ""
+                last_individual = {}
         if client:
             try:
-                req = urllib.request.Request("http://127.0.0.1/get_live_json.php")
-                with urllib.request.urlopen(req, timeout=2) as response:
-                    new_data = response.read().decode('utf-8')
+                if observed_connection_generation != MAIN_CONNECTION_GENERATION:
+                    observed_connection_generation = MAIN_CONNECTION_GENERATION
+                    live_source_available = None
+                    last_data = ""
+                    last_ha_state = ""
+                    last_individual = {}
+                live_json = read_runtime_live_snapshot(
+                    live_max_age_s=15.0,
+                    wallbox_max_age_s=30.0,
+                    web_snapshot_max_age_s=180.0,
+                    require_control_valid=True,
+                    include_web_projection=True,
+                )
+                if not live_json:
+                    if live_source_available is not False:
+                        publish_raw(
+                            client,
+                            f"{base_topic}/{AVAILABILITY_TOPIC_SUFFIX}",
+                            "offline",
+                            retain=True,
+                        )
+                    live_source_available = False
+                    last_data = ""
+                else:
+                    if live_source_available is not True:
+                        publish_raw(
+                            client,
+                            f"{base_topic}/{AVAILABILITY_TOPIC_SUFFIX}",
+                            "online",
+                            retain=True,
+                        )
+                        last_data = ""
+                    live_source_available = True
+                    new_data = json.dumps(
+                        live_json,
+                        ensure_ascii=False,
+                        allow_nan=False,
+                        separators=(",", ":"),
+                    )
                     if new_data != last_data:
                         publish_raw(client, f"{base_topic}/live", new_data, retain=False)
-                        live_json = json.loads(new_data)
                         ha_state = build_ha_state(live_json, cfg)
-                        ha_state_json = json.dumps(ha_state, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                        ha_state_json = json.dumps(
+                            ha_state,
+                            ensure_ascii=False,
+                            allow_nan=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
                         if ha_state_json != last_ha_state:
                             publish_json(client, f"{base_topic}/ha/state", ha_state, retain=True)
                             last_ha_state = ha_state_json
@@ -1049,6 +1146,18 @@ def main():
                                     last_individual[key] = value
                         last_data = new_data
             except Exception as e:
+                if live_source_available is not False:
+                    try:
+                        publish_raw(
+                            client,
+                            f"{base_topic}/{AVAILABILITY_TOPIC_SUFFIX}",
+                            "offline",
+                            retain=True,
+                        )
+                    except Exception:
+                        pass
+                live_source_available = False
+                last_data = ""
                 logger.debug(f"MQTT Live-Publish pausiert: {e}")
         time.sleep(2)
 

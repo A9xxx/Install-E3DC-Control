@@ -26,6 +26,30 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+
+def _reject_privileged_web_invocation() -> None:
+    """Sperrt alte direkte sudoers-Freigaben vor produktiven Imports."""
+    sudo_user = str(os.environ.get("SUDO_USER") or "").strip()
+    if os.geteuid() == 0 and sudo_user == "www-data":
+        print(
+            json.dumps(
+                {
+                    "success": False,
+                    "write_blocked": True,
+                    "message": (
+                        "Sicherheitssperre: web_installer.py darf nicht "
+                        "privilegiert aus dem Webserverkontext gestartet werden."
+                    ),
+                },
+                ensure_ascii=False,
+            ),
+            file=sys.stderr,
+        )
+        raise SystemExit(126)
+
+
+_reject_privileged_web_invocation()
+
 try:
     from .backup_retention import WEB_INSTALLER_BACKUP_KEEP_COUNT, prune_backup_dir
     from .backup_integrity import (
@@ -40,6 +64,7 @@ try:
     )
     from .service_catalog import READ_ACTIONS, SERVICE_ACTIONS, get_module, iter_modules
     from .installer_config import get_install_path
+    from .utils import MANAGER_LOCK_TMPFILES_CONFIG, ensure_manager_lock_namespace
 except ImportError:  # pragma: no cover - direct script execution fallback
     from backup_retention import WEB_INSTALLER_BACKUP_KEEP_COUNT, prune_backup_dir
     from backup_integrity import (
@@ -60,6 +85,7 @@ except ImportError:  # pragma: no cover - direct script execution fallback
     if package_root not in sys.path:
         sys.path.insert(0, package_root)
     from Installer.installer_config import get_install_path
+    from Installer.utils import MANAGER_LOCK_TMPFILES_CONFIG, ensure_manager_lock_namespace
 
 
 RAMDISK_DIR = Path("/var/www/html/ramdisk")
@@ -204,7 +230,40 @@ WRITE_ACTION_NAMES = sorted(
     }
 )
 
-SERVICE_WRAPPER = INSTALLER_DIR / "service_wrapper.sh"
+SERVICE_WRAPPER_SOURCE = INSTALLER_DIR / "service_wrapper.sh"
+SERVICE_WRAPPER = Path("/usr/local/sbin/e3dc-service-control")
+SERVICE_WRAPPER_ACTIONS = (
+    "start",
+    "stop",
+    "restart",
+    "status",
+    "enable",
+    "disable",
+)
+SERVICE_WRAPPER_UNITS = (
+    "e3dc-live.service",
+    "energy_manager.service",
+    "e3dc-wallbox-manager.service",
+    "e3dc-epex-manager.service",
+    "e3dc-weather-manager.service",
+    "e3dc-storage-simulator.service",
+    "e3dc-storage-manager.service",
+    "e3dc-ha.service",
+    "e3dc-matter-bridge.service",
+    "e3dc-bluelink.service",
+    "e3dc-lux-live.service",
+    "e3dc-idm-live.service",
+    "e3dc-stiebel-live.service",
+    "e3dc-dimplex-live.service",
+    "e3dc-heizstab.service",
+    "e3dc-climate-live.service",
+    "e3dc-climate-control.service",
+    "e3dc-forecast-evidence.service",
+    "e3dc-notifier.service",
+    "e3dc-mqtt-hub.service",
+    "e3dc-websocket.service",
+    "e3dc-shadow-sync.service",
+)
 INSTALLER_WRAPPER = INSTALLER_DIR / "installer_wrapper.sh"
 WRAPPER_RELATIVE_PATHS = (
     "Installer/service_wrapper.sh",
@@ -634,6 +693,118 @@ def _atomic_write_sudoers(
     finally:
         os.close(descriptor)
         tmp_path.unlink(missing_ok=True)
+
+
+def _atomic_write_service_launcher(
+    payload: bytes,
+    preimage: dict[str, Any] | None = None,
+) -> None:
+    """Installiert den einzigen Web-sudo-Aktor root-eigen und race-frei."""
+
+    path = SERVICE_WRAPPER
+    parent = path.parent
+    for ancestor in (parent.parent, parent):
+        try:
+            ancestor_meta = os.lstat(ancestor)
+        except OSError as exc:
+            raise RuntimeError(
+                f"Service-Launcher-Elternpfad ist nicht prüfbar: {ancestor}"
+            ) from exc
+        if (
+            stat.S_ISLNK(ancestor_meta.st_mode)
+            or not stat.S_ISDIR(ancestor_meta.st_mode)
+            or ancestor_meta.st_uid != 0
+            or ancestor_meta.st_gid != 0
+            or ancestor_meta.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            raise RuntimeError(
+                f"Service-Launcher-Elternpfad ist nicht root-kontrolliert: {ancestor}"
+            )
+    if (
+        not payload.startswith(b"#!/bin/bash\n")
+        or b"\r" in payload
+        or len(payload) > 64 * 1024
+    ):
+        raise RuntimeError("Service-Launcher-Quelle ist nicht zulässig")
+
+    descriptor, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.txn-",
+        dir=str(parent),
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        offset = 0
+        while offset < len(payload):
+            offset += os.write(descriptor, payload[offset:])
+        os.fchown(descriptor, 0, 0)
+        os.fchmod(descriptor, 0o755)
+        os.fsync(descriptor)
+        if preimage is not None:
+            _assert_preimage_unchanged(preimage)
+        os.replace(tmp_path, path)
+        if preimage is not None:
+            _bind_transaction_output(preimage)
+        directory_fd = os.open(
+            str(parent),
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        os.close(descriptor)
+        tmp_path.unlink(missing_ok=True)
+
+
+def service_launcher_integrity_preview() -> dict[str, Any]:
+    """Prüft Quelle aus Git-HEAD und installierten root-eigenen Launcher."""
+
+    try:
+        head, canonical = _git_head_wrapper_bytes(INSTALL_ROOT)
+        payload = canonical["Installer/service_wrapper.sh"]
+    except Exception as exc:
+        return {
+            "success": False,
+            "path": str(SERVICE_WRAPPER),
+            "status": "head_error",
+            "error": str(exc),
+        }
+    item = _classify_wrapper(SERVICE_WRAPPER, payload)
+    parent_checks = []
+    for parent in (SERVICE_WRAPPER.parent.parent, SERVICE_WRAPPER.parent):
+        try:
+            metadata = os.lstat(parent)
+            ok = (
+                stat.S_ISDIR(metadata.st_mode)
+                and not stat.S_ISLNK(metadata.st_mode)
+                and metadata.st_uid == 0
+                and metadata.st_gid == 0
+                and not metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            )
+        except OSError:
+            ok = False
+        parent_checks.append({"path": str(parent), "ok": ok})
+    owner_ok = (
+        item.get("uid") == 0
+        and item.get("gid") == 0
+        and item.get("status") == "ok"
+    )
+    parents_ok = all(check["ok"] for check in parent_checks)
+    success = owner_ok and parents_ok
+    return {
+        "success": success,
+        "path": str(SERVICE_WRAPPER),
+        "source": str(SERVICE_WRAPPER_SOURCE),
+        "head": head,
+        "status": (
+            "ok"
+            if success
+            else ("unsafe_parent" if not parents_ok else item.get("status", "invalid"))
+        ),
+        "item": item,
+        "parent_checks": parent_checks,
+    }
 
 
 def _restore_preimages(preimages: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1077,8 +1248,12 @@ def validate_bound_preimage_snapshot(
 
 def desired_sudoers_lines() -> list[str]:
     return [
-        f"www-data ALL=(root) NOPASSWD: {SERVICE_WRAPPER}",
-        f"www-data ALL=(root) NOPASSWD: {INSTALLER_WRAPPER}",
+        (
+            f"www-data ALL=(root) NOPASSWD: "
+            f"{SERVICE_WRAPPER} {action} {unit}"
+        )
+        for action in SERVICE_WRAPPER_ACTIONS
+        for unit in SERVICE_WRAPPER_UNITS
     ]
 
 
@@ -1192,9 +1367,9 @@ def sudoers_file_findings() -> dict[str, Any]:
     external_direct_web_lines: list[dict[str, Any]] = []
     legacy_lines: list[dict[str, Any]] = []
     try:
-        candidates = sorted(SUDOERS_DIR.glob("*"))
+        candidates = [Path("/etc/sudoers"), *sorted(SUDOERS_DIR.glob("*"))]
     except Exception:
-        candidates = []
+        candidates = [Path("/etc/sudoers")]
 
     for path in candidates:
         if not path.is_file():
@@ -1767,7 +1942,7 @@ def installer_status() -> dict[str, Any]:
 
 
 def update_check() -> dict[str, Any]:
-    """Check Git updates through the sudo-approved installer wrapper path."""
+    """Prüft origin/main ohne Fetch, Ref-Schreibzugriff oder Privilegwechsel."""
     repo_dir = INSTALL_ROOT.resolve()
     if not (repo_dir / ".git").is_dir():
         return {
@@ -1777,46 +1952,131 @@ def update_check() -> dict[str, Any]:
             "error": "Git-Repository nicht gefunden.",
         }
 
-    user = install_user()
-    run_cmd(["sudo", "-H", "-u", user, "git", "config", "--global", "--add", "safe.directory", str(repo_dir)], timeout=5)
+    git_prefix = [
+        "/usr/bin/env",
+        "GIT_OPTIONAL_LOCKS=0",
+        "GIT_CONFIG_NOSYSTEM=1",
+        "/usr/bin/git",
+        "-c",
+        f"safe.directory={repo_dir}",
+        "-c",
+        "core.fileMode=false",
+        "-c",
+        "protocol.ext.allow=never",
+        "-c",
+        "protocol.file.allow=never",
+        "-C",
+        str(repo_dir),
+    ]
 
-    fetch = run_cmd(["sudo", "-H", "-u", user, "git", "-C", str(repo_dir), "fetch", "origin"], timeout=20)
-    if not fetch.get("ok"):
+    # ls-remote liest den Ziel-Ref direkt, ohne origin/main oder sonstige
+    # lokale Refs zu aktualisieren. Die Prüfung bleibt damit auch im
+    # Webserverkontext vollständig mutationsfrei.
+    remote = run_cmd(
+        [
+            *git_prefix,
+            "ls-remote",
+            "--exit-code",
+            "origin",
+            "refs/heads/main",
+        ],
+        timeout=20,
+    )
+    if not remote.get("ok"):
         return {
             "success": False,
             "missing": 0,
             "repo": str(repo_dir),
-            "error": "\n".join(part for part in [fetch.get("stdout", ""), fetch.get("stderr", "")] if part),
+            "upstream": "refs/heads/main",
+            "error": "\n".join(
+                part
+                for part in [remote.get("stdout", ""), remote.get("stderr", "")]
+                if part
+            ),
         }
 
-    upstream = run_cmd(
-        ["sudo", "-H", "-u", user, "git", "-C", str(repo_dir), "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+    remote_lines = [
+        line.strip()
+        for line in str(remote.get("stdout") or "").splitlines()
+        if line.strip()
+    ]
+    remote_match = (
+        re.fullmatch(r"([0-9a-fA-F]{40})\s+refs/heads/main", remote_lines[0])
+        if len(remote_lines) == 1
+        else None
+    )
+    if remote_match is None:
+        return {
+            "success": False,
+            "missing": 0,
+            "repo": str(repo_dir),
+            "upstream": "refs/heads/main",
+            "error": "origin/main lieferte keine eindeutig gebundene Commit-SHA.",
+        }
+    target_sha = remote_match.group(1).lower()
+
+    def resolve_full_commit(ref: str) -> tuple[str, str]:
+        resolved = run_cmd(
+            [
+                *git_prefix,
+                "rev-parse",
+                "--verify",
+                f"{ref}^{{commit}}",
+            ],
+            timeout=5,
+        )
+        value = resolved.get("stdout", "").strip().lower()
+        if not resolved.get("ok") or re.fullmatch(r"[0-9a-f]{40}", value) is None:
+            diagnostic = "\n".join(
+                part
+                for part in [
+                    resolved.get("stdout", ""),
+                    resolved.get("stderr", ""),
+                ]
+                if part
+            ).strip()
+            return "", diagnostic or f"{ref} ist keine volle Commit-SHA."
+        return value, ""
+
+    head_sha, head_error = resolve_full_commit("HEAD")
+    if not head_sha:
+        return {
+            "success": False,
+            "missing": 0,
+            "same_release": False,
+            "head_sha": head_sha,
+            "target_sha": target_sha,
+            "repo": str(repo_dir),
+            "upstream": "refs/heads/main",
+            "error": f"HEAD: {head_error}",
+        }
+
+    same_release = head_sha == target_sha
+    missing = 0 if same_release else 1
+    count_exact = same_release
+    target_local = run_cmd(
+        [*git_prefix, "cat-file", "-e", f"{target_sha}^{{commit}}"],
         timeout=5,
     )
-    target = upstream.get("stdout", "").strip() if upstream.get("ok") else ""
-    if not target:
-        target = "origin/main"
-
-    count = run_cmd(["sudo", "-H", "-u", user, "git", "-C", str(repo_dir), "rev-list", "--count", f"HEAD..{target}"], timeout=5)
-    if not count.get("ok"):
-        return {
-            "success": False,
-            "missing": 0,
-            "repo": str(repo_dir),
-            "upstream": target,
-            "error": "\n".join(part for part in [count.get("stdout", ""), count.get("stderr", "")] if part),
-        }
-
-    try:
-        missing = int(count.get("stdout", "0").strip())
-    except ValueError:
-        missing = 0
+    if target_local.get("ok"):
+        count = run_cmd(
+            [*git_prefix, "rev-list", "--count", f"HEAD..{target_sha}"],
+            timeout=5,
+        )
+        raw_count = str(count.get("stdout") or "").strip()
+        if count.get("ok") and raw_count.isdecimal():
+            missing = int(raw_count)
+            count_exact = True
 
     return {
         "success": True,
         "missing": missing,
+        "missing_exact": count_exact,
+        "same_release": same_release,
+        "head_sha": head_sha,
+        "target_sha": target_sha,
         "repo": str(repo_dir),
-        "upstream": target,
+        "upstream": "refs/heads/main",
     }
 
 
@@ -1848,6 +2108,67 @@ def file_check(path: Path, label: str, executable: bool = False, hard: bool = Tr
     }
 
 
+def desired_sudoers_command_specs() -> set[str]:
+    """Liefert den exakten wirksamen NOPASSWD-Kommandosatz."""
+
+    return {
+        " ".join(line.split("NOPASSWD:", 1)[1].split())
+        for line in desired_sudoers_lines()
+    }
+
+
+def parse_effective_www_data_sudoers(listing_text: str) -> dict[str, Any]:
+    """Parst ausschließlich explizite `(root) NOPASSWD:`-Einträge."""
+
+    specs: list[str] = []
+    ambiguous_lines: list[str] = []
+    continuation = False
+    for raw_line in str(listing_text or "").splitlines():
+        stripped = raw_line.strip()
+        match = re.fullmatch(
+            r"\(([^)]*)\)\s+NOPASSWD:\s*(.*)",
+            stripped,
+        )
+        if match:
+            runas = " ".join(match.group(1).split())
+            if runas != "root":
+                ambiguous_lines.append(stripped)
+                continuation = False
+                continue
+            payload = match.group(2)
+            continuation = True
+        elif continuation and raw_line[:1].isspace() and stripped:
+            if stripped.startswith(("(", "Matching ", "User ", "Sudoers ")):
+                continuation = False
+                continue
+            payload = stripped
+        else:
+            continuation = False
+            if "NOPASSWD:" in stripped:
+                ambiguous_lines.append(stripped)
+            continue
+
+        for item in payload.split(","):
+            normalized = " ".join(item.split())
+            if normalized:
+                specs.append(normalized)
+            else:
+                ambiguous_lines.append(stripped)
+
+    effective_specs = sorted(set(specs))
+    desired_specs = desired_sudoers_command_specs()
+    return {
+        "effective_specs": effective_specs,
+        "missing_effective_specs": sorted(
+            desired_specs.difference(effective_specs)
+        ),
+        "unexpected_effective_specs": sorted(
+            set(effective_specs).difference(desired_specs)
+        ),
+        "ambiguous_lines": list(dict.fromkeys(ambiguous_lines)),
+    }
+
+
 def sudoers_context() -> dict[str, Any]:
     sudoers_chunks = []
     sudoers_sources = []
@@ -1858,16 +2179,45 @@ def sudoers_context() -> dict[str, Any]:
     except Exception:
         pass
 
-    sudoers_listing = run_cmd(["sudo", "-n", "-l"], timeout=5)
-    www_data_listing = run_cmd(["sudo", "-u", "www-data", "sudo", "-n", "-l"], timeout=5)
-    for listing in (sudoers_listing, www_data_listing):
-        if listing.get("ok"):
-            sudoers_chunks.append(listing.get("stdout", ""))
-            sudoers_chunks.append(listing.get("stderr", ""))
-            sudoers_sources.append("sudo-list")
+    www_data_listing = run_cmd(
+        ["/usr/bin/sudo", "-n", "-l", "-U", "www-data"],
+        timeout=5,
+    )
+    effective_output = (
+        str(www_data_listing.get("stdout") or "")
+        + "\n"
+        + str(www_data_listing.get("stderr") or "")
+    )
+    effective = parse_effective_www_data_sudoers(effective_output)
+    listing_ok = www_data_listing.get("ok") is True
+    effective_contract_proven = bool(
+        listing_ok
+        and not effective["missing_effective_specs"]
+        and not effective["unexpected_effective_specs"]
+        and not effective["ambiguous_lines"]
+    )
+    effective_status = (
+        "effective_sudoers_exact"
+        if effective_contract_proven
+        else "effective_sudoers_unproven"
+        if not listing_ok or effective["ambiguous_lines"]
+        else "effective_sudoers_mismatch"
+    )
 
     sudoers_text = "\n".join(sudoers_chunks)
-    sudoers_source = "+".join(dict.fromkeys(sudoers_sources)) if sudoers_sources else "sudo-list-unavailable"
+    sudoers_source = (
+        "+".join(dict.fromkeys(sudoers_sources))
+        if sudoers_sources
+        else "sudoers_file_unavailable"
+    )
+    effective_www_data_lines = [
+        f"(root) NOPASSWD: {spec}"
+        for spec in effective["effective_specs"]
+    ]
+    effective_direct_web_lines = [
+        f"(root) NOPASSWD: {spec}"
+        for spec in effective["unexpected_effective_specs"]
+    ] + list(effective["ambiguous_lines"])
 
     active_lines = [
         line.strip()
@@ -1919,6 +2269,16 @@ def sudoers_context() -> dict[str, Any]:
         "direct_systemctl_lines": managed_systemctl_lines,
         "external_systemctl_lines": external_systemctl_lines,
         "legacy_lines": legacy_lines,
+        "effective_www_data_lines": effective_www_data_lines,
+        "effective_direct_web_lines": effective_direct_web_lines,
+        "effective_listing_ok": listing_ok,
+        "effective_listing": www_data_listing,
+        "effective_status": effective_status,
+        "effective_specs": effective["effective_specs"],
+        "missing_effective_specs": effective["missing_effective_specs"],
+        "unexpected_effective_specs": effective["unexpected_effective_specs"],
+        "effective_ambiguous_lines": effective["ambiguous_lines"],
+        "effective_contract_proven": effective_contract_proven,
         "file_findings": file_findings,
     }
 
@@ -1928,15 +2288,33 @@ def write_readiness(ignore_active_lock: bool = False) -> dict[str, Any]:
     sudoers_text = sudoers["text"]
     sudoers_source = sudoers["source"]
 
-    service_wrapper = file_check(SERVICE_WRAPPER, "Service-Wrapper", executable=True)
+    service_launcher = service_launcher_integrity_preview()
+    service_wrapper = {
+        "label": "Root-eigener Service-Launcher",
+        "path": str(SERVICE_WRAPPER),
+        "ok": bool(service_launcher.get("success")),
+        "hard": True,
+        "status": service_launcher.get("status", "unbekannt"),
+        "issue": (
+            None
+            if service_launcher.get("success")
+            else "Service-Launcher fehlt oder ist nicht root-eigen an Git-HEAD gebunden"
+        ),
+        "details": service_launcher,
+    }
     installer_wrapper = file_check(INSTALLER_WRAPPER, "Installer-Wrapper", executable=True)
     wrapper_integrity = wrapper_integrity_preview()
     wrapper_integrity_ok = bool(wrapper_integrity.get("success")) and not wrapper_integrity.get("repair_needed")
     sudoers_exists = SUDOERS_FILE.exists()
-    sudoers_has_service = str(SERVICE_WRAPPER) in sudoers_text
+    sudoers_has_service = all(
+        line in sudoers_text for line in desired_sudoers_lines()
+    )
     sudoers_has_installer = str(INSTALLER_WRAPPER) in sudoers_text
     sudoers_direct_systemctl = bool(sudoers["direct_systemctl_lines"])
-    sudoers_direct_web_commands = bool(sudoers["file_findings"]["direct_web_lines"])
+    sudoers_direct_web_commands = bool(
+        sudoers["file_findings"]["direct_web_lines"]
+        or sudoers["effective_direct_web_lines"]
+    )
     external_systemctl_lines = sudoers["external_systemctl_lines"]
     legacy_service_allowed = bool(sudoers["legacy_lines"])
     catalog_legacy = any((module.service_unit or "") == "e3dc.service" for module in iter_modules())
@@ -1981,10 +2359,32 @@ def write_readiness(ignore_active_lock: bool = False) -> dict[str, Any]:
             "issue": None if sudoers_has_service else "Service-Wrapper ist noch nicht in sudoers eingetragen",
         },
         {
-            "label": "sudoers: Installer-Wrapper erlaubt",
-            "ok": sudoers_has_installer,
+            "label": "sudoers: effektive www-data-Rechte exakt gebunden",
+            "ok": sudoers["effective_contract_proven"],
             "hard": True,
-            "issue": None if sudoers_has_installer else "Installer-Wrapper ist noch nicht in sudoers eingetragen",
+            "status": sudoers["effective_status"],
+            "issue": (
+                None
+                if sudoers["effective_contract_proven"]
+                else "effective_sudoers_unproven"
+                if sudoers["effective_status"] == "effective_sudoers_unproven"
+                else "Wirksame www-data-Rechte weichen vom festen Wrappervertrag ab"
+            ),
+            "details": {
+                "missing": sudoers["missing_effective_specs"],
+                "unexpected": sudoers["unexpected_effective_specs"],
+                "ambiguous": sudoers["effective_ambiguous_lines"],
+            },
+        },
+        {
+            "label": "sudoers: kein privilegierter Installer-Webzugang",
+            "ok": not sudoers_has_installer,
+            "hard": True,
+            "issue": (
+                "Die alte, zu breite www-data-Freigabe für installer_wrapper.sh muss entfernt werden"
+                if sudoers_has_installer
+                else None
+            ),
         },
         {
             "label": "keine freien systemctl-Kommandos",
@@ -2008,8 +2408,15 @@ def write_readiness(ignore_active_lock: bool = False) -> dict[str, Any]:
             "label": "keine direkten www-data-Kommandos",
             "ok": not sudoers_direct_web_commands,
             "hard": True,
-            "issue": "sudoers.d enthält alte direkte www-data-Freigaben außerhalb der Wrapper" if sudoers_direct_web_commands else None,
-            "details": sudoers["file_findings"]["direct_web_lines"],
+            "issue": (
+                "sudoers enthält direkte www-data-Freigaben außerhalb des engen Service-Wrappers"
+                if sudoers_direct_web_commands
+                else None
+            ),
+            "details": {
+                "files": sudoers["file_findings"]["direct_web_lines"],
+                "effective": sudoers["effective_direct_web_lines"],
+            },
         },
         {
             "label": "alter C++ Dienst bleibt gesperrt",
@@ -2027,33 +2434,30 @@ def write_readiness(ignore_active_lock: bool = False) -> dict[str, Any]:
         },
     ]
     hard_blockers = [item for item in checks if item.get("hard") and not item.get("ok")]
-    ready_for_enable = not hard_blockers and not is_docker()
+    service_wrapper_ready = not hard_blockers and not is_docker()
     return {
         "success": True,
         "write_actions_enabled": WRITE_ACTIONS_ENABLED,
-        "ready_for_manual_enable": ready_for_enable,
-        "can_write_now": WRITE_ACTIONS_ENABLED and ready_for_enable,
+        "privileged_installer_web_enabled": False,
+        "service_wrapper_ready": service_wrapper_ready,
+        "ready_for_manual_enable": False,
+        "can_write_now": False,
         "summary": (
-            "Schreibaktionen bleiben gesperrt. Die Sicherheitsvoraussetzungen wirken vorbereitet."
-            if ready_for_enable and not WRITE_ACTIONS_ENABLED
-            else "Freigabe-Check abgeschlossen."
+            "Privilegierte Installer-Webaktionen bleiben fail-closed gesperrt. "
+            "Bereits installierte Dienste verwenden ausschließlich den engeren Service-Wrapper."
         ),
         "checks": checks,
         "hard_blocker_count": len(hard_blockers),
         "hard_blockers": hard_blockers,
-        "allowed_write_actions": WRITE_ACTION_NAMES,
+        "allowed_write_actions": [],
         "release_steps": [
-            "Wrapper und sudoers auf dem Zielsystem prüfen",
-            "Job-Test für mindestens ein optionales Modul erfolgreich ausführen",
-            "Schreibmodus nur bewusst und zeitlich begrenzt freischalten",
-            "Erste echte Installation nur auf einem Testsystem mit Backup ausführen",
-            "Nach jedem Schreibjob Alive-Datei, Log und Dienststatus prüfen",
+            "Alte installer_wrapper.sh- und direkte installer_main.py-Freigaben aus sudoers entfernen",
+            "Service-Wrapper und seine feste Aktions-/Unit-Allowlist getrennt prüfen",
+            "Für spätere Webinstallationen einen root-kontrollierten, aktionsgebundenen Launcher entwickeln",
+            "Aufträge ausschließlich race-frei, einmalig und mit privilegierter Neuvalidierung übernehmen",
+            "Bis dahin Installation, Rechte-Reparatur, Update und Rückfall nur administrativ ausführen",
         ],
-        "next_step": (
-            "Echte Jobs erst nach bewusster Freigabe über Wrapper und Testplan aktivieren."
-            if ready_for_enable
-            else "Zuerst die harten Blocker beheben, danach erneut prüfen."
-        ),
+        "next_step": "Privilegierte Installer-Webjobs bleiben bis zu einem eigenen sicheren Launcher deaktiviert.",
     }
 
 
@@ -2062,6 +2466,11 @@ def write_permission_plan() -> dict[str, Any]:
     sudoers = sudoers_context()
     desired_sudoers = desired_sudoers_lines()
     checks = write_readiness()
+    wrapper_preview = wrapper_integrity_preview()
+    wrapper_repair_needed = bool(
+        wrapper_preview.get("success")
+        and wrapper_preview.get("repair_needed")
+    )
     repairable_items = sudoers["file_findings"]["repairable_lines"]
     remove_lines = list(dict.fromkeys(
         str(item.get("line") or "")
@@ -2073,6 +2482,7 @@ def write_permission_plan() -> dict[str, Any]:
         remove_lines
         or missing_lines
         or not SUDOERS_FILE.exists()
+        or wrapper_repair_needed
     )
     file_preview = sudoers_file_preview()
 
@@ -2084,6 +2494,8 @@ def write_permission_plan() -> dict[str, Any]:
         "sudoers_file": str(SUDOERS_FILE),
         "sudoers_source": sudoers["source"],
         "would_change": would_change,
+        "wrapper_repair_needed": wrapper_repair_needed,
+        "wrapper_integrity": wrapper_preview,
         "current": {
             "active_lines": sudoers["active_lines"],
             "direct_systemctl_lines": sudoers["direct_systemctl_lines"],
@@ -2095,15 +2507,15 @@ def write_permission_plan() -> dict[str, Any]:
             "allowed_lines": desired_sudoers,
             "missing_lines": missing_lines,
             "service_wrapper": str(SERVICE_WRAPPER),
-            "installer_wrapper": str(INSTALLER_WRAPPER),
+            "installer_wrapper_admin_only": str(INSTALLER_WRAPPER),
         },
         "file_preview": file_preview,
         "planned_steps": [
             "Bestehende sudoers-Datei sichern, bevor sie ersetzt wird.",
             "Nur E3DC-eigene direkte systemctl-/WebUI-Freigaben entfernen; fremde Fragmente bleiben byte- und metadatengleich.",
-            "Nur die zwei erlaubten Wrapper-Zeilen für service_wrapper.sh und installer_wrapper.sh setzen.",
+            "Nur die enge Service-Wrapper-Zeile für www-data setzen; installer_wrapper.sh bleibt administrativ.",
             "sudoers-Syntax mit visudo -cf prüfen.",
-            "Freigabe-Check erneut ausführen und erst danach Schreibmodus zeitlich begrenzt testen.",
+            "Freigabe-Check erneut ausführen; privilegierte Installer-Webjobs bleiben gesperrt.",
         ],
         "rollback_plan": [
             "Backup der sudoers-Datei wiederherstellen.",
@@ -2118,9 +2530,10 @@ def write_permission_plan() -> dict[str, Any]:
         "safety_rules": [
             "Keine freien Shell-Kommandos aus PHP.",
             "Keine direkten E3DC-systemctl-Freigaben für www-data.",
+            "Keine privilegierte installer_wrapper.sh- oder installer_main.py-Freigabe für www-data.",
             "Fremde sudoers-Fragmente werden ausschließlich gemeldet und niemals vom E3DC-Installer verändert.",
             "Der alte C++ Dienst e3dc.service bleibt kein erlaubtes WebUI-Startziel.",
-            "Echte Reparatur erst nach erfolgreichem Job-Test auf einem Testsystem.",
+            "Installer-Mutationen nur administrativ, bis ein eigener enger Web-Launcher vollständig geprüft ist.",
         ],
         "readiness": checks,
     }
@@ -2912,6 +3325,12 @@ def render_systemd_unit(module: Any, script_path: Path) -> str:
     workdir = safe_working_directory(module)
     user = install_user()
     output_directives = systemd_output_directives(module, log_path)
+    manager_lock_prestart = (
+        "ExecStartPre=+/usr/bin/systemd-tmpfiles --create "
+        f"{MANAGER_LOCK_TMPFILES_CONFIG}\n"
+        if str(getattr(module, "key", "")) in {"heatpump", "heizstab"}
+        else ""
+    )
     if module_runner_label(module) == "npm":
         return f"""[Unit]
 Description=E3DC-Control {module.display_name}
@@ -2943,7 +3362,7 @@ Type=simple
 User={user}
 Group=www-data
 WorkingDirectory={workdir}
-ExecStart={python_executable()} -u {script_path}
+{manager_lock_prestart}ExecStart={python_executable()} -u {script_path}
 Restart=always
 RestartSec=10
 {output_directives}
@@ -3254,6 +3673,16 @@ def install_module(module_key: str | None = None) -> dict[str, Any]:
     if script_path is None or not script_path.exists():
         raise RuntimeError(f"Script fehlt: {module.script}")
 
+    if module.key in {"heatpump", "heizstab"} and ensure_manager_lock_namespace() is not True:
+        return {
+            "success": False,
+            "module": module.public_dict(),
+            "message": (
+                "Installation abgebrochen: Der root-kontrollierte "
+                "Wärme-Owner-Lockraum konnte nicht sicher eingerichtet werden."
+            ),
+        }
+
     target = Path("/etc/systemd/system") / module.service_unit
     unit_content = render_systemd_unit(module, script_path)
     backup_snapshot = create_backup_snapshot("install_module", module.key)
@@ -3468,12 +3897,15 @@ def repair_permissions(*, repair_runtime: bool = False) -> dict[str, Any]:
     steps: list[dict[str, Any]] = []
     findings: dict[str, Any] = {}
     wrapper_preimages: list[dict[str, Any]] = []
+    launcher_preimages: list[dict[str, Any]] = []
     sudoers_preimages: list[dict[str, Any]] = []
     validation_tmp_path: Path | None = None
     mutation_started = False
 
     def rollback_permissions() -> dict[str, Any]:
-        rollback = _restore_preimages([*wrapper_preimages, *sudoers_preimages])
+        rollback = _restore_preimages(
+            [*wrapper_preimages, *launcher_preimages, *sudoers_preimages]
+        )
         syntax = run_cmd(["visudo", "-cf", "/etc/sudoers"], timeout=10)
         rollback["visudo"] = syntax
         rollback["success"] = bool(rollback.get("success")) and bool(syntax.get("ok"))
@@ -3491,6 +3923,7 @@ def repair_permissions(*, repair_runtime: bool = False) -> dict[str, Any]:
                 _capture_file_preimage(Path(str(item.get("path") or "")))
                 for item in wrapper_preview.get("items", [])
             ]
+            launcher_preimages = [_capture_file_preimage(SERVICE_WRAPPER)]
             sudoers_paths = {SUDOERS_FILE}
             sudoers_paths.update(
                 Path(str(item.get("file") or ""))
@@ -3509,9 +3942,14 @@ def repair_permissions(*, repair_runtime: bool = False) -> dict[str, Any]:
                 "readiness": readiness,
             }
 
-        all_preimages = [*wrapper_preimages, *sudoers_preimages]
+        all_preimages = [
+            *wrapper_preimages,
+            *launcher_preimages,
+            *sudoers_preimages,
+        ]
         category_by_path = {
             **{str(item["path"]): "wrapper" for item in wrapper_preimages},
+            **{str(item["path"]): "service_launcher" for item in launcher_preimages},
             **{str(item["path"]): "sudoers" for item in sudoers_preimages},
         }
         backup_snapshot = create_bound_preimage_snapshot(
@@ -3611,6 +4049,34 @@ def repair_permissions(*, repair_runtime: bool = False) -> dict[str, Any]:
                 "readiness": readiness,
                 "rollback": rollback,
             }
+
+        rebound_head, rebound_canonical = _git_head_wrapper_bytes(INSTALL_ROOT)
+        if rebound_head != wrapper_endgate.get("head"):
+            rollback = rollback_permissions()
+            return {
+                "success": False,
+                "message": "Rechte-Reparatur abgebrochen: HEAD driftete vor dem Launcher-Commit.",
+                "steps": steps,
+                "rollback": rollback,
+            }
+        launcher_preimage = launcher_preimages[0]
+        _atomic_write_service_launcher(
+            rebound_canonical["Installer/service_wrapper.sh"],
+            launcher_preimage,
+        )
+        installed_launcher = service_launcher_integrity_preview()
+        steps.append({
+            "step": "install_root_service_launcher",
+            "ok": bool(installed_launcher.get("success")),
+            "path": str(SERVICE_WRAPPER),
+        })
+        if (
+            not installed_launcher.get("success")
+            or installed_launcher.get("head") != rebound_head
+        ):
+            raise RuntimeError(
+                "Root-eigener Service-Launcher bestand das Endgate nicht"
+            )
 
         sudoers_by_path = {str(item["path"]): item for item in sudoers_preimages}
         target_preimage = sudoers_by_path[str(SUDOERS_FILE)]
@@ -3864,13 +4330,14 @@ def execute_job(job: dict[str, Any]) -> dict[str, Any]:
         return {
             "success": True,
             "write_actions_enabled": WRITE_ACTIONS_ENABLED,
-            "summary": "Dry-Run: Wrapper-/sudoers-Reparatur würde die commitgebundenen Wrapper und sudoers prüfen.",
+            "summary": "Dry-Run: Die Reparatur würde Wrapper prüfen und zu breite Web-sudoers-Freigaben entfernen.",
             "would_change": bool(plan.get("would_change")),
             "planned_steps": [
-                "Commitgebundene Wrapper für service_wrapper.sh und installer_wrapper.sh prüfen",
-                "Direkte systemctl-Freigaben aus der WebUI-sudoers entfernen",
+                "Commitgebundene Wrapper für administrative Nutzung prüfen",
+                "Installer-Wrapper, installer_main.py und direkte systemctl-Freigaben für www-data entfernen",
+                "Nur den festen Service-Wrapper für erlaubte Dienstaktionen behalten",
                 "Ziel-sudoers mit visudo prüfen, bevor sie aktiv wird",
-                "Keine Änderung ohne explizite Freischaltung und separaten Reparatur-Job",
+                "Privilegierte Installer-Webjobs weiterhin nicht freischalten",
             ],
             "permissions": permissions_check(),
             "sudoers_plan": plan,

@@ -151,10 +151,12 @@ V4_BLOCK_TARIFF = {
     'direct_marketing_min_grid_export_w', 'direct_marketing_max_grid_charge_w', 'direct_marketing_max_cycles_per_day',
     'direct_marketing_home_reserve_soc_pct', 'direct_marketing_night_reserve_soc_pct',
     'direct_marketing_morning_export_target_soc_pct', 'direct_marketing_negative_price_no_export',
+    'direct_marketing_e3dc_export_execution_owner',
     'direct_marketing_negative_headroom_enable', 'direct_marketing_negative_headroom_lookahead_min',
     'direct_marketing_negative_headroom_min_window_min', 'direct_marketing_negative_headroom_min_surplus_wh',
     'direct_marketing_negative_headroom_buffer_pct',
     'direct_marketing_low_price_headroom_enable',
+    'direct_marketing_passive_normal_zero_charge_enable',
     'direct_marketing_low_price_no_export', 'direct_marketing_keep_headroom_pct',
     'direct_marketing_negative_price_charge_target_soc_pct',
     'direct_marketing_low_price_curtail_enable', 'direct_marketing_low_price_curtail_limit_w',
@@ -185,6 +187,7 @@ V4_BLOCK_STORAGE = {
     'einspeiselimit',            # Einspeise-Limit W (für PV-Derating)
     'storage_curve_target_mode', 'storage_curve_sliding_horizon_enable',
     'storage_dc_first_charge_limit_enable',
+    'storage_forecast_shortfall_aux_ac_charge_enable',
     'storage_curve_charge_servo_mode', 'storage_curve_charge_servo_min_w',
     'storage_curve_charge_servo_deadband_w', 'storage_curve_charge_servo_step_up_w',
     'storage_curve_charge_servo_step_down_w', 'storage_curve_charge_servo_max_age_s',
@@ -270,7 +273,8 @@ V4_BLOCK_STORAGE = {
 # --- Block 5: Preis-/KI-Logik ---
 V4_BLOCK_INTELLIGENCE = {
     'super_intelligence_enable', 'super_intelligence_deadline',
-    'price_boost_enable', 'price_limit', 'price_hard_limit',
+    'price_boost_enable', 'heat_price_boost_scope',
+    'heat_price_boost_windows', 'price_limit', 'price_hard_limit',
     'price_pause_limit', 'price_min_duration', 'price_max_daily',
     'morning_boost_enable', 'morning_boost_prio', 'morning_boost_wb_power',
     'morning_boost_deadline', 'morning_boost_target_soc',
@@ -465,6 +469,7 @@ V4_BLOCK_HA = {
     'ha_fail_timeout', 'ha_auto_recover', 'ha_auto_failover',
     'shadow_master_url', 'shadow_master_ip', 'shadow_sync_interval_s',
     'shadow_fetch_timeout_s', 'shadow_snapshot_max_age_s',
+    'shadow_snapshot_token',
     'mqtt_hub_ip', 'mqtt_hub_port', 'mqtt_hub_user', 'mqtt_hub_pass',
     'mqtt_hub_topic',
     'mqtt_hub_sub_soc_topic', 'mqtt_hub_sub_soc_name',

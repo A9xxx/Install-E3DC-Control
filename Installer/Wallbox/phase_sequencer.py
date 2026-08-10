@@ -33,6 +33,8 @@ _SEQUENCE_STATE_KEYS = (
     "_openwb_cp_start_sent",
     "_openwb_last_cp_start_ts",
     "_last_phase_switch_ts",
+    "_openwb_pro_phase_change_guard",
+    "_openwb_pro_phase_cooldown_remaining_s",
     "_wallbox_phase_transition_reservation",
     "_openwb_pro_phase_output_intent",
     "_openwb_pro_phase_output_ack",
@@ -108,6 +110,7 @@ def begin_phase_transition_reservation(
     effective_w_per_amp: Any = None,
     lease_s: Any = None,
     transition_id: Any = None,
+    clock_sample: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Erstellt den allgemeinen Auftrag, bevor ein Gerätebefehl gesendet wird."""
 
@@ -117,16 +120,38 @@ def begin_phase_transition_reservation(
     if target not in (1, 3):
         return {}
     now_value = _safe_float(now_ts, 0.0) if started_ts is None else _safe_float(started_ts, now_ts)
-    current = max(
-        _safe_float(restart_amp, 0.0),
-        _safe_float(data.get("current_set_amp"), 0.0),
-        _safe_float(st.get("offered_current_raw"), 0.0),
-        _safe_float(st.get("evse_current"), 0.0),
-        _safe_float(st.get("amp"), 0.0),
-        float(_MIN_CHARGE_CURRENT_A),
+    observed_before_w = _status_power_w(st)
+    real_charge_confirmed = bool(
+        observed_before_w > 500.0
+        or st.get("charging") is True
+        or st.get("charge_state") is True
     )
-    current = min(max(float(_MIN_CHARGE_CURRENT_A), current), max(float(_MIN_CHARGE_CURRENT_A), _safe_float(charger_max_amp, 32.0)))
+    # Eine nur softwareseitig angebotene Stromstärke ist bei einem noch
+    # stromlosen Fahrzeug keine reale Wiederanlauflast. Würden wir sie für
+    # die 1p->3p-Reservierung übernehmen, könnte ein früheres 11-A-Angebot
+    # 7,7 kW verlangen, obwohl für den sicheren 3p-Start nur 6 A nötig sind.
+    # Der Storage Manager verweigert dann den überhöhten Grant und derselbe
+    # Phasenvertrag unterdrückt gleichzeitig den möglichen 1p-/3p-Start.
+    # Erst bestätigte Fahrzeugleistung darf deshalb oberhalb des normativen
+    # Mindeststroms reserviert werden; die weitere Rampe folgt dem Budget.
+    current = (
+        max(
+            _safe_float(restart_amp, 0.0),
+            _safe_float(data.get("current_set_amp"), 0.0),
+            _safe_float(st.get("offered_current_raw"), 0.0),
+            _safe_float(st.get("evse_current"), 0.0),
+            _safe_float(st.get("amp"), 0.0),
+            float(_MIN_CHARGE_CURRENT_A),
+        )
+        if real_charge_confirmed
+        else float(_MIN_CHARGE_CURRENT_A)
+    )
     actual_phases = _safe_int(from_phases, 0) or _status_phase_count(st)
+    # ``restart_amp`` ist wie der spätere openWB-Befehl ein Strom je Phase.
+    # Eine Umrechnung mit dem Verhältnis alter/neuer Phasen würde deshalb bei
+    # 1p->3p weniger Leistung reservieren, als der bestätigte Wiederanlauf
+    # tatsächlich ausgibt. Die Phasenzahl gehört ausschließlich in W/A.
+    current = min(max(float(_MIN_CHARGE_CURRENT_A), current), max(float(_MIN_CHARGE_CURRENT_A), _safe_float(charger_max_amp, 32.0)))
     step = (
         _safe_float(current_step_amp, 0.0)
         or _safe_float(st.get("current_step_amp"), 0.0)
@@ -149,7 +174,7 @@ def begin_phase_transition_reservation(
         restart_amp=current,
         current_step_amp=step,
         effective_w_per_amp=w_per_amp,
-        observed_before_w=_status_power_w(st),
+        observed_before_w=observed_before_w,
         now_ts=now_value,
         lease_s=duration_s,
         owner="wallbox_manager",
@@ -157,6 +182,7 @@ def begin_phase_transition_reservation(
         reason_code=reason,
         max_power_w=max(float(_MIN_CHARGE_CURRENT_A), _safe_float(charger_max_amp, 32.0)) * w_per_amp,
         transition_id=transition_id,
+        clock_sample=clock_sample,
     )
 
 
@@ -166,6 +192,7 @@ def phase_transition_reservation(
     status: Optional[Dict[str, Any]] = None,
     now_ts: Any = 0,
     connected: Optional[bool] = None,
+    clock_sample: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Aktualisiert und veröffentlicht die allgemeine Reservierung je Wallbox."""
 
@@ -174,6 +201,7 @@ def phase_transition_reservation(
         status=status,
         now_ts=now_ts,
         connected=connected,
+        clock_sample=clock_sample,
     )
 
 
@@ -193,6 +221,7 @@ class PhaseSwitchSequencer:
         self._pending_charger_max_amp: Any = 32
         self._pending_status: Dict[str, Any] = {}
         self._pending_restart_delay_s: float = 0.0
+        self._pending_clock_sample: Optional[Dict[str, Any]] = None
 
     def propose(
         self,
@@ -207,6 +236,7 @@ class PhaseSwitchSequencer:
         hold_s: Any = None,
         restart_delay_s: Any = None,
         charger_max_amp: Any = 32,
+        clock_sample: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Schlage den nächsten Schritt ohne Treiber-I/O vor.
 
@@ -245,6 +275,7 @@ class PhaseSwitchSequencer:
             config=cfg,
             reason=reason,
             cp_payload=effective_cp_payload,
+            clock_sample=clock_sample,
         )
         self._state["_openwb_pro_phase_sequence_contract"] = deepcopy(contract)
         self._pending = deepcopy(contract)
@@ -254,6 +285,9 @@ class PhaseSwitchSequencer:
         self._pending_restart_delay_s = max(
             0.0,
             _safe_float(effective_restart_delay_s, 0.0),
+        )
+        self._pending_clock_sample = (
+            deepcopy(clock_sample) if isinstance(clock_sample, dict) else None
         )
         return contract
 
@@ -322,7 +356,12 @@ class PhaseSwitchSequencer:
                 deadline_ts=sequence.get("zero_until", 0.0),
             )
 
-        elif action == "wait_zero":
+        elif action in ("wait_zero", "wait_zero_readback"):
+            sequence = self._active_sequence()
+            patch = contract.get("sequence_patch")
+            if isinstance(patch, dict):
+                sequence.update(deepcopy(patch))
+                self._state["_openwb_pro_phase_sequence"] = sequence
             self._state["_openwb_pro_phase_sequence_stage"] = "zero_wait"
             phase_transition.set_stage(
                 self._state,
@@ -333,6 +372,27 @@ class PhaseSwitchSequencer:
         elif action == "send_phase" and success:
             sequence = self._active_sequence()
             patch = contract.get("sequence_patch")
+            wire_receipt_ts = (
+                _safe_float(patch.get("wire_receipt_ts"), 0.0)
+                if isinstance(patch, dict)
+                else 0.0
+            )
+            phase_sent_ts = (
+                _safe_float(patch.get("phase_sent_ts"), 0.0)
+                if isinstance(patch, dict)
+                else 0.0
+            )
+            # Ein erfolgreicher Treiber-Rückgabewert allein ist kein
+            # Phasenwechselbeleg. Die Fassade darf den Zustand nur mit dem vom
+            # Manager nach dem echten POST gebundenen Wire-Receipt fortsetzen.
+            if wire_receipt_ts <= 0.0 or phase_sent_ts != wire_receipt_ts:
+                self._pending = None
+                self._pending_config = {}
+                self._pending_charger_max_amp = 32
+                self._pending_status = {}
+                self._pending_restart_delay_s = 0.0
+                self._pending_clock_sample = None
+                return self.snapshot()
             if isinstance(patch, dict):
                 sequence.update(deepcopy(patch))
             self._state["_openwb_pro_phase_sequence"] = sequence
@@ -375,6 +435,25 @@ class PhaseSwitchSequencer:
                 sequence.update(deepcopy(patch))
             self._state["_openwb_pro_phase_sequence"] = sequence
             phase_sent_ts = _safe_float(sequence.get("phase_sent_ts"), 0.0)
+            phase_wait_config = dict(cfg)
+            phase_wait_patch = contract.get("phase_wait_config")
+            if isinstance(phase_wait_patch, dict):
+                phase_wait_config.update(phase_wait_patch)
+            openwb_pro_session.mark_phase_wait(
+                self._state,
+                target,
+                current_amp=sequence.get("hold_amp", 0),
+                now_ts=phase_sent_ts,
+                config=phase_wait_config,
+                charger_max_amp=max_amp,
+            )
+            self._state["_openwb_pro_phase_change_block_until"] = max(
+                _safe_float(
+                    self._state.get("_openwb_pro_phase_change_block_until"),
+                    0.0,
+                ),
+                _safe_float(sequence.get("phase_change_block_until"), 0.0),
+            )
             current_allowed_after = _safe_float(
                 sequence.get("current_allowed_after"),
                 phase_sent_ts + openwb_pro_session.phase_wait_s(cfg),
@@ -385,6 +464,7 @@ class PhaseSwitchSequencer:
             self._state[
                 "_openwb_pro_phase_sequence_current_allowed_after"
             ] = current_allowed_after
+            self._state["_last_phase_switch_ts"] = phase_sent_ts
             self._state["current_set_amp"] = 0
             phase_transition.set_stage(
                 self._state,
@@ -425,6 +505,11 @@ class PhaseSwitchSequencer:
             )
 
         elif action == "wait_restart":
+            sequence = self._active_sequence()
+            patch = contract.get("sequence_patch")
+            if isinstance(patch, dict):
+                sequence.update(deepcopy(patch))
+                self._state["_openwb_pro_phase_sequence"] = sequence
             self._state["_openwb_pro_phase_sequence_stage"] = "restart_delay"
             phase_transition.set_stage(
                 self._state,
@@ -452,6 +537,7 @@ class PhaseSwitchSequencer:
         self._pending_charger_max_amp = 32
         self._pending_status = {}
         self._pending_restart_delay_s = 0.0
+        self._pending_clock_sample = None
         return self.snapshot()
 
     def transition_reservation(
@@ -460,6 +546,7 @@ class PhaseSwitchSequencer:
         status: Optional[Dict[str, Any]] = None,
         now_ts: Any = 0,
         connected: Optional[bool] = None,
+        clock_sample: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Liefere die temporäre Leistungsreservierung während des Wechsels.
 
@@ -473,6 +560,7 @@ class PhaseSwitchSequencer:
             status=status,
             now_ts=now_ts,
             connected=connected,
+            clock_sample=clock_sample,
         )
 
     def reset(self, *, clear_phase_wait: bool = False) -> Dict[str, Any]:
@@ -503,6 +591,7 @@ class PhaseSwitchSequencer:
         self._pending_charger_max_amp = 32
         self._pending_status = {}
         self._pending_restart_delay_s = 0.0
+        self._pending_clock_sample = None
         return self.snapshot()
 
     def snapshot(self) -> Dict[str, Any]:
@@ -541,6 +630,7 @@ class PhaseSwitchSequencer:
             charger_max_amp=charger_max_amp,
             source="openwb_pro_phase_sequence",
             reason=str(sequence.get("reason") or "phase_transition"),
+            clock_sample=self._pending_clock_sample,
         )
 
 

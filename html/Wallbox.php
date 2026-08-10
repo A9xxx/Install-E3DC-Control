@@ -6,11 +6,16 @@
 // Pfade und Config-Datei-Pfad VOR der POST-Logik definieren
 require_once __DIR__ . '/helpers.php';
 require_once __DIR__ . '/wallbox_transaction.php';
+$wallboxRequestIsAjax =
+    (isset($_GET['ajax']) && $_GET['ajax'] == '1')
+    || (isset($_SERVER['HTTP_X_REQUESTED_WITH']) && strtolower($_SERVER['HTTP_X_REQUESTED_WITH']) === 'xmlhttprequest');
 $wallboxAuthIsAjax =
     (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST')
-    || (isset($_GET['ajax']) && $_GET['ajax'] == '1')
-    || (isset($_SERVER['HTTP_X_REQUESTED_WITH']) && strtolower($_SERVER['HTTP_X_REQUESTED_WITH']) === 'xmlhttprequest');
+    || $wallboxRequestIsAjax;
 requireWebAuth($wallboxAuthIsAjax);
+if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
+    e3dcRequireCsrfToken($wallboxRequestIsAjax);
+}
 
 $paths = getInstallPaths();
 $install_user = !empty($paths['valid']) ? (string)$paths['install_user'] : '';
@@ -2255,27 +2260,12 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 $message = errorMessage('Schreibfehler', 'config.txt konnte nicht geschrieben werden.');
             }
         } else {
-            // ALTMODUS: e3dc.wallbox.txt schreiben (nur wenn kein nativer Modus aktiv ist!)
-            $oldUmask = umask(0002);
-            $writeResult = @file_put_contents($wallbox_file, $neueDauerInt . PHP_EOL, LOCK_EX);
-            umask($oldUmask);
-
-            if ($writeResult !== false) {
-                if (file_exists($abort_flag)) @unlink($abort_flag);
-                if ($quickAction === 'start_now') {
-                    $message = successMessage('&#9889; Sofortladen (Max) gestartet.');
-                } elseif ($quickAction === 'clear_times') {
-                    $message = successMessage('&#9209; Laden gestoppt.');
-                } else {
-                    $message = successMessage('&#10003; Wallbox-Ladedauer gespeichert.');
-                }
-
-                if (false) {
-                    $message = errorMessage('Einstellung gespeichert, Neuberechnung blockiert', getInstallContextDiagnostic() ?: 'Der validierte Wallbox-Planer ist nicht verfügbar.');
-                }
-            } else {
-                $message = errorMessage('Schreibfehler', 'Datei konnte nicht geschrieben werden.');
-            }
+            // LEGACY-WALLBOX-STEUERUNG STILLGELEGT: Dieser Webpfad schreibt
+            // niemals e3dc.wallbox.txt und meldet keinen ausgeführten Aktorbefehl.
+            $message = errorMessage(
+                'Alter Wallbox-Steuerpfad stillgelegt',
+                'Die direkte Steuerung über e3dc.wallbox.txt wird nicht mehr unterstützt. Aktiviere die native Wallbox-Steuerung; es wurde kein Start-/Stop-Befehl gesendet.'
+            );
         }
     }
 }
@@ -2514,39 +2504,20 @@ $wbvonDisplayHour = ($currentWbvonMinutes !== false) ? (string)floor($currentWbv
 $wbbisMinutes = parseTimeToMinutes($wallboxConfig['wbbis']);
 $wbbisDisplayHour = ($wbbisMinutes !== false) ? (string)floor($wbbisMinutes / 60) : preg_replace('/[^0-9]/', '', (string)$wallboxConfig['wbbis']);
 
-// Wallbox Sessions laden (CSV) für die Historie
-$wbSessionFile = '/var/www/html/data/wb_sessions.csv';
-$wbSessions = [];
-$totalHistoryKwh = 0;
-$totalHistorySeconds = 0;
-
-if (!file_exists($wbSessionFile) && file_exists('/var/www/html/tmp/wb_sessions.csv')) {
-    $wbSessionFile = '/var/www/html/tmp/wb_sessions.csv';
-}
-
-if (file_exists($wbSessionFile)) {
-    $sessionLines = file($wbSessionFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
-    // Header überspringen, rückwärts lesen (neueste zuerst)
-    if ($sessionLines !== false) {
-        for ($i = count($sessionLines) - 1; $i > 0; $i--) {
-            $parts = explode(';', $sessionLines[$i]);
-            if (count($parts) >= 4) {
-                $tsStart = strtotime($parts[1]);
-                $tsEnd = strtotime($parts[2]);
-                $kwh = (float)$parts[3];
-                if ($tsStart && $tsEnd) {
-                    $wbSessions[] = [
-                        'tsStart' => $tsStart,
-                        'tsEnd' => $tsEnd,
-                        'kwh' => $kwh
-                    ];
-                    $totalHistoryKwh += $kwh;
-                    $totalHistorySeconds += ($tsEnd - $tsStart);
-                }
-            }
-        }
-    }
-}
+// Die CSV wächst dauerhaft. Nur bei einer neuen Dateigeneration wird sie
+// streamend aggregiert; die UI hält höchstens die 500 neuesten Sitzungen.
+$wbSessionFile = e3dcFirstWallboxSessionHistoryFile([
+    '/var/www/html/data/wb_sessions.csv',
+    '/var/www/html/tmp/wb_sessions.csv',
+]);
+$wbSessionAggregate = is_string($wbSessionFile)
+    ? e3dcWallboxSessionCsvAggregate($wbSessionFile)
+    : e3dcWallboxSessionEmptyAggregate(date('Y-m-d'));
+$wbSessions = is_array($wbSessionAggregate['sessions'] ?? null)
+    ? $wbSessionAggregate['sessions']
+    : [];
+$totalHistoryKwh = max(0.0, (float)($wbSessionAggregate['total_kwh'] ?? 0.0));
+$totalHistorySeconds = max(0, (int)($wbSessionAggregate['total_seconds'] ?? 0));
 $totalHistoryHours = floor($totalHistorySeconds / 3600);
 $totalHistoryMinutes = round(($totalHistorySeconds % 3600) / 60);
 
@@ -2565,15 +2536,15 @@ if (file_exists($dbPath)) {
         }
     } catch (Exception $e) {}
 }
-// Lade Live-Wallbox-Status falls JS läuft
-// Der Manager schreibt nach /logs/, Rückfall auf /ramdisk/ (älteres Format)
-$wb_live_session = '/var/www/html/logs/wb_live_session.json';
-if (!file_exists($wb_live_session)) {
-    $wb_live_session = '/var/www/html/ramdisk/wb_live_session.json';
-}
+// Laufzeitstatus kommt aus tmpfs. Eine alte persistente Datei darf nur als
+// frischer Legacy-Rückfall dienen und den aktuellen RAM-Status nie übersteuern.
+$wb_live_session = e3dcFirstFreshRegularFile([
+    '/var/www/html/ramdisk/wb_live_session.json',
+    '/var/www/html/logs/wb_live_session.json',
+], 15.0);
 $wb_live_data = null;
-if (file_exists($wb_live_session)) {
-    $wb_live_data = json_decode(file_get_contents($wb_live_session), true);
+if (is_string($wb_live_session)) {
+    $wb_live_data = json_decode((string)@file_get_contents($wb_live_session), true);
 }
 
 // Wallbox-Manager-Protokolle lesen
@@ -2791,6 +2762,7 @@ if ($hasWb2) {
         <div class="d-flex align-items-center justify-content-end gap-2 flex-wrap">
             <?php foreach ($openWbProUpdateTargets as $updateTarget): ?>
                 <form method="post" class="m-0 p-0 text-end" onsubmit='return confirm(<?= htmlspecialchars(json_encode('Firmware-Update für ' . $updateTarget['label'] . ' jetzt anstoßen? Die Wallbox kann währenddessen neu starten.', JSON_UNESCAPED_UNICODE), ENT_QUOTES) ?>);'>
+                    <?= e3dcCsrfInput() ?>
                     <input type="hidden" name="openwb_pro_update_wb" value="<?= (int)$updateTarget['wb'] ?>">
                     <button type="submit" class="btn btn-sm btn-outline-warning shadow-sm rounded-pill px-3" title="Firmware-Update der openWB Pro über connect.php starten">
                         <i class="fas fa-cloud-upload-alt fw-bold"></i><span class="d-none d-sm-inline ms-2">Pro-Update<?= count($openWbProUpdateTargets) > 1 ? ' WB' . (int)$updateTarget['wb'] : '' ?></span>
@@ -2798,6 +2770,7 @@ if ($hasWb2) {
                 </form>
             <?php endforeach; ?>
             <form method="post" class="m-0 p-0 text-end">
+                <?= e3dcCsrfInput() ?>
                 <button type="submit" name="restart_manager" value="1" class="btn btn-sm btn-outline-info shadow-sm rounded-pill px-3" title="Python Wallbox-Manager neu starten">
                     <i class="fas fa-sync-alt fw-bold"></i><span class="d-none d-sm-inline ms-2">Dienst Neustarten</span>
                 </button>
@@ -2926,6 +2899,7 @@ if ($hasWb2) {
                       data-simple-plan-active="<?= !empty($simplePanel['plan_active']) ? '1' : '0' ?>"
                       data-simple-native-mode="<?= htmlspecialchars((string)$simplePanel['native_mode']) ?>"
                       onsubmit="return confirmSimpleWallboxSubmit(this);">
+                    <?= e3dcCsrfInput() ?>
                     <input type="hidden" name="save_simple_wallbox" value="1">
                     <input type="hidden" name="simple_wb_id" value="<?= (int)$simpleWb ?>">
                     <input type="hidden" name="simple_house_reserve" data-simple-house-reserve-submit value="<?= htmlspecialchars($simpleHouseReserve) ?>">
@@ -3860,6 +3834,7 @@ if ($hasWb2) {
                 </div>
             </div>
             <form action="<?= htmlspecialchars($formAction) ?>" method="post" class="mb-3">
+                <?= e3dcCsrfInput() ?>
                 <button type="submit" name="recreate_plan" value="1"
                         class="btn btn-success w-100 rounded-pill fw-bold py-2 shadow-sm">
                     <i class="fas fa-play-circle me-2"></i> Automatik starten (neuen Plan erstellen)
@@ -3877,6 +3852,7 @@ if ($hasWb2) {
                     <form action="<?= htmlspecialchars($formAction) ?>" method="post"
                           onsubmit="return confirm('Netz-Ladeplan l&ouml;schen? PV-Laden l&auml;uft weiter.');"
                           title="Nur Netz-Ladeplanung stoppen &ndash; Wallbox bleibt aktiv">
+                        <?= e3dcCsrfInput() ?>
                         <button type="submit" name="abort_charging"
                                 class="btn btn-outline-warning w-100 rounded-pill fw-bold py-2 shadow-sm"
                                 id="btn-abort-charging">
@@ -3888,6 +3864,7 @@ if ($hasWb2) {
                     <form action="<?= htmlspecialchars($formAction) ?>" method="post"
                           onsubmit="return confirm('&#9888; NOT-AUS: Wallbox wird GESPERRT. Kein Laden bis zur manuellen Freigabe. Wirklich?');"
                           title="Physische Sperre &ndash; kein Laden mehr m&ouml;glich">
+                        <?= e3dcCsrfInput() ?>
                         <button type="submit" name="abort_all_charging"
                                 class="btn btn-danger w-100 rounded-pill fw-bold py-2 shadow-sm"
                                 id="btn-not-aus">
@@ -3911,6 +3888,7 @@ if ($hasWb2) {
                     <h6 class="card-title text-warning fw-bold mb-3"><i class="fas fa-bolt me-2"></i>Direktsteuerung (Sofort)</h6>
 
                     <form action="<?= htmlspecialchars($formAction) ?>" method="post">
+                        <?= e3dcCsrfInput() ?>
                         <div class="mb-3">
                             <label class="form-label text-muted small fw-bold d-flex justify-content-between mb-1">
                                 <span>Ladedauer (Stunden)</span>
@@ -3953,6 +3931,7 @@ if ($hasWb2) {
                     <h6 class="card-title text-info fw-bold mb-3"><i class="fas fa-clock me-2"></i>Automatik Steuerung</h6>
 
                     <form action="<?= htmlspecialchars($formAction) ?>" method="post">
+                        <?= e3dcCsrfInput() ?>
                         <div class="mb-3">
                             <label for="Wbhour" class="form-label text-muted small fw-bold d-flex justify-content-between mb-1">
                                 <span>Ladedauer (Wbhour)</span>
@@ -4032,6 +4011,7 @@ if ($hasWb2) {
             </div>
 
             <form action="<?= htmlspecialchars($formAction) ?>" method="post" id="vehicleAssignmentForm" onsubmit="return false;">
+                <?= e3dcCsrfInput() ?>
                 <div class="row g-2 mb-3">
                     <div class="col-12 col-md-4 col-xl-3">
                         <label class="form-label text-muted small fw-bold mb-1" title="Reserve im Hausspeicher für die Wallbox-Regelung. Unterhalb dieses SoC wird die Wallbox je nach Modus gehalten oder gesperrt.">Reserve im Hausspeicher</label>
@@ -4208,6 +4188,7 @@ if ($hasWb2) {
                 </div>
             <?php endif; ?>
             <form action="<?= htmlspecialchars($formAction) ?>" method="post" id="smartChargingForm">
+                <?= e3dcCsrfInput() ?>
                 <?php
                 $wallboxPriceLimit = (float)str_replace(',', '.', (string)($wallboxConfig['dvcarlimit'] ?? '0.0'));
                 ?>
@@ -4453,6 +4434,7 @@ if ($hasWb2) {
                     }
                 ?>
                 <form action="<?= htmlspecialchars($formAction) ?>" method="post" class="p-3 mb-3 rounded-3 border border-warning border-opacity-25" style="background: rgba(255, 193, 7, 0.06);">
+                    <?= e3dcCsrfInput() ?>
                     <input type="hidden" name="save_custom_car" value="1">
                     <input type="hidden" name="custom_car_assign_wb" value="<?= $detWb ?>">
                     <input type="hidden" name="custom_car_current_soc" value="<?= htmlspecialchars((string)$detSoc) ?>">
@@ -4553,6 +4535,7 @@ if ($hasWb2) {
                     <p class="small text-muted mb-3">Speichere eigene Fahrzeuge ohne Cloud-Anbindung als feste Vorlage für die Dropdowns ab.</p>
 
                     <form action="<?= htmlspecialchars($formAction) ?>" method="post" class="mb-4">
+                        <?= e3dcCsrfInput() ?>
                         <input type="hidden" name="custom_car_cloud_vehicle_name" value="" data-cloud-name-hidden="manual">
                         <div class="row g-2 mb-3">
                             <div class="col-12 col-md-4">
@@ -4643,6 +4626,7 @@ if ($hasWb2) {
                                     <td class="border-secondary-subtle"><code class="small"><?= htmlspecialchars($car['vehicle_id'] ?? '') ?></code></td>
                                     <td class="text-end pe-3 border-secondary-subtle">
                                         <form action="<?= htmlspecialchars($formAction) ?>" method="post" style="display:inline;">
+                                            <?= e3dcCsrfInput() ?>
                                             <input type="hidden" name="delete_custom_car" value="<?= htmlspecialchars($car['id']) ?>">
                                             <button type="submit" class="btn btn-outline-danger btn-sm rounded-circle py-0 px-2" data-bs-toggle="tooltip" title="Löschen"><i class="fas fa-trash-alt" style="font-size: 0.7rem;"></i></button>
                                         </form>
@@ -4665,6 +4649,7 @@ if ($hasWb2) {
                     <p class="small text-muted mb-3">Verbinde dein Fahrzeug (Hyundai / Kia Bluelink), um den Echtzeit-Ladezustand (SoC) und Batterie-Infos automatisch abzurufen.</p>
 
                     <form action="<?= htmlspecialchars($formAction) ?>" method="post">
+                        <?= e3dcCsrfInput() ?>
                         <div class="row g-3 mb-3">
                             <div class="col-12">
                                 <label class="form-label text-muted small fw-bold mb-1">Token (Refresh Token)</label>
@@ -4817,6 +4802,40 @@ if ($hasWb2) {
 
 <script>
 const WALLBOX_AJAX_ENDPOINT = 'Wallbox.php';
+const WALLBOX_CSRF_TOKEN = <?= json_encode(e3dcCsrfToken()) ?>;
+
+function wallboxPost(formData) {
+    if (!(formData instanceof FormData)) {
+        return Promise.reject(new Error('Ungültige Wallbox-Anfrage.'));
+    }
+    if (!formData.has('csrf_token')) {
+        formData.append('csrf_token', WALLBOX_CSRF_TOKEN);
+    }
+    return fetch(WALLBOX_AJAX_ENDPOINT, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {
+            'X-Requested-With': 'XMLHttpRequest',
+            'X-CSRF-Token': WALLBOX_CSRF_TOKEN
+        },
+        body: formData
+    });
+}
+
+function wallboxFetchLiveJson() {
+    const body = new URLSearchParams();
+    body.set('csrf_token', WALLBOX_CSRF_TOKEN);
+    return fetch('get_live_json.php', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'X-Requested-With': 'XMLHttpRequest',
+            'X-CSRF-Token': WALLBOX_CSRF_TOKEN
+        },
+        body
+    });
+}
 
 function initWallboxViewToggle() {
     const panels = {
@@ -5243,10 +5262,7 @@ function initSimpleWallboxTargetControls() {
         formData.append('simple_house_reserve', globalReserveValue(true));
         formData.append('simple_price_limit', globalPriceValue());
         setModeState(form, 'Speichert...', 'warning');
-        fetch(WALLBOX_AJAX_ENDPOINT, {
-            method: 'POST',
-            body: formData
-        }).then(res => {
+        wallboxPost(formData).then(res => {
             if (!res.ok) throw new Error('Speichern fehlgeschlagen');
             return res.text();
         }).then(text => {
@@ -5274,10 +5290,7 @@ function initSimpleWallboxTargetControls() {
             formData.append('save_simple_wallbox_limits_ajax', '1');
             formData.append('simple_house_reserve', globalReserveValue(true));
             formData.append('simple_price_limit', globalPriceValue());
-            fetch(WALLBOX_AJAX_ENDPOINT, {
-                method: 'POST',
-                body: formData
-            }).then(res => {
+            wallboxPost(formData).then(res => {
             if (!res.ok) throw new Error('Speichern fehlgeschlagen');
             setGlobalStatus('Gespeichert', 'success');
             if (window.e3dcSimpleWallboxSync) window.e3dcSimpleWallboxSync.globalsFromSimple();
@@ -5377,74 +5390,110 @@ function confirmSimpleWallboxSubmit(form) {
 
 var initialPlanHash = "<?= $currentPlanHash ?>";
 const WALLBOX_HIDDEN_POLL_INTERVAL_MS = 10000;
-const WALLBOX_LIVE_STATUS_INTERVAL_MS = 2000;
-const WALLBOX_LIVE_DATA_INTERVAL_MS = 4000;
-let wallboxLiveStatusPollTimer = null;
-let wallboxLiveDataPollTimer = null;
+const WALLBOX_LIVE_FALLBACK_INTERVAL_MS = 4000;
+const WALLBOX_GLOBAL_LIVE_GRACE_MS = 6000;
+let wallboxLiveFallbackTimer = null;
+let wallboxLiveFallbackPromise = null;
+let wallboxLastGlobalLiveMs = 0;
+let wallboxLiveFallbackGeneration = 0;
 
-function wallboxPollInterval(activeIntervalMs) {
-    return document.hidden ? WALLBOX_HIDDEN_POLL_INTERVAL_MS : activeIntervalMs;
+function wallboxPollInterval() {
+    return document.hidden ? WALLBOX_HIDDEN_POLL_INTERVAL_MS : WALLBOX_LIVE_FALLBACK_INTERVAL_MS;
 }
 
-function scheduleWallboxLiveStatusPoll(runNow = false) {
-    if (wallboxLiveStatusPollTimer) clearInterval(wallboxLiveStatusPollTimer);
-    if (runNow) updateWallboxLiveStatus();
-    wallboxLiveStatusPollTimer = setInterval(updateWallboxLiveStatus, wallboxPollInterval(WALLBOX_LIVE_STATUS_INTERVAL_MS));
+function wallboxPlanChanged(data) {
+    if (data && data.wb_plan_hash && initialPlanHash && data.wb_plan_hash !== initialPlanHash) {
+        location.reload();
+        return true;
+    }
+    return false;
 }
 
-function scheduleWallboxLiveDataPoll(runNow = false) {
-    if (wallboxLiveDataPollTimer) clearInterval(wallboxLiveDataPollTimer);
-    if (runNow) updateUIFromLiveData();
-    wallboxLiveDataPollTimer = setInterval(updateUIFromLiveData, wallboxPollInterval(WALLBOX_LIVE_DATA_INTERVAL_MS));
+function consumeWallboxLiveData(data, source = 'global') {
+    if (!data || typeof data !== 'object') return;
+    if (source === 'global') wallboxLastGlobalLiveMs = Date.now();
+    if (wallboxPlanChanged(data)) return;
+    updateWallboxLiveStatus(data);
+    updateUIFromLiveData(data);
 }
 
-function scheduleWallboxVisibilityPolling(runNow = false) {
-    scheduleWallboxLiveStatusPoll(runNow);
-    scheduleWallboxLiveDataPoll(runNow);
+function wallboxFetchFallbackIfNeeded() {
+    if (Date.now() - wallboxLastGlobalLiveMs < WALLBOX_GLOBAL_LIVE_GRACE_MS) {
+        return Promise.resolve(null);
+    }
+    if (wallboxLiveFallbackPromise) return wallboxLiveFallbackPromise;
+
+    wallboxLiveFallbackPromise = wallboxFetchLiveJson()
+        .then(response => {
+            if (!response.ok) throw new Error('Live-Snapshot HTTP ' + response.status);
+            return response.json();
+        })
+        .then(data => {
+            consumeWallboxLiveData(data, 'fallback');
+            return data;
+        })
+        .catch(err => {
+            console.error('Fehler beim Wallbox-Live-Fallback:', err);
+            return null;
+        })
+        .finally(() => {
+            wallboxLiveFallbackPromise = null;
+        });
+    return wallboxLiveFallbackPromise;
 }
 
-document.addEventListener('visibilitychange', function() {
-    scheduleWallboxVisibilityPolling(!document.hidden);
+function scheduleWallboxLiveFallback(runNow = false) {
+    wallboxLiveFallbackGeneration += 1;
+    const generation = wallboxLiveFallbackGeneration;
+    if (wallboxLiveFallbackTimer) {
+        clearTimeout(wallboxLiveFallbackTimer);
+        wallboxLiveFallbackTimer = null;
+    }
+
+    const run = () => {
+        if (generation !== wallboxLiveFallbackGeneration) return;
+        wallboxFetchFallbackIfNeeded().finally(() => {
+            if (generation !== wallboxLiveFallbackGeneration) return;
+            wallboxLiveFallbackTimer = setTimeout(run, wallboxPollInterval());
+        });
+    };
+
+    if (runNow) {
+        run();
+    } else {
+        wallboxLiveFallbackTimer = setTimeout(run, wallboxPollInterval());
+    }
+}
+
+function updateWallboxLiveStatus(data) {
+    const statusCard = document.getElementById('wb-live-status');
+    const valDisplay = document.getElementById('live-wb-val');
+    const pulse = document.getElementById('status-pulse');
+    const wbPower = parseFloat(data && data.wb) || 0;
+
+    if (wbPower > 10) { // Schwelle von 10 W, um Rauschen zu vermeiden
+        if (statusCard) statusCard.style.display = 'block';
+        if (pulse) pulse.classList.add('pulse-active');
+        if (valDisplay) {
+            if (wbPower >= 1000) {
+                valDisplay.innerText = (wbPower / 1000).toLocaleString('de-DE', {minimumFractionDigits: 2, maximumFractionDigits: 2}) + ' kW';
+            } else {
+                valDisplay.innerText = Math.round(wbPower) + ' W';
+            }
+        }
+    } else {
+        if (statusCard) statusCard.style.display = 'none';
+        if (pulse) pulse.classList.remove('pulse-active');
+    }
+}
+
+window.addEventListener('e3dc:live-data', function(event) {
+    consumeWallboxLiveData(event && event.detail, 'global');
 });
 
-function updateWallboxLiveStatus() {
-    fetch('get_live_json.php')
-        .then(response => response.json())
-        .then(data => {
-            // Prüfen ob sich der Ladeplan geändert hat
-            if (data.wb_plan_hash && initialPlanHash && data.wb_plan_hash !== initialPlanHash) {
-                location.reload();
-                return;
-            }
-
-            const statusCard = document.getElementById('wb-live-status');
-            const valDisplay = document.getElementById('live-wb-val');
-            const pulse     = document.getElementById('status-pulse');
-
-            const wbPower = parseFloat(data.wb) || 0;
-
-            if (wbPower > 10) { // Schwelle von 10W um Rauschen zu vermeiden
-                if (statusCard) statusCard.style.display = 'block';
-                if (pulse) pulse.classList.add('pulse-active');
-
-                // Formatierung der Watt-Zahl
-                if (valDisplay) {
-                    if (wbPower >= 1000) {
-                        valDisplay.innerText = (wbPower / 1000).toLocaleString('de-DE', {minimumFractionDigits: 2, maximumFractionDigits: 2}) + ' kW';
-                    } else {
-                        valDisplay.innerText = Math.round(wbPower) + ' W';
-                    }
-                }
-            } else {
-                if (statusCard) statusCard.style.display = 'none';
-                if (pulse) pulse.classList.remove('pulse-active');
-            }
-        })
-        .catch(err => console.error('Fehler beim Abruf des Wallbox-Status:', err));
-}
-
-// Aktiv schnell aktualisieren, im Hintergrund schonender pollen.
-scheduleWallboxLiveStatusPoll(true);
+document.addEventListener('visibilitychange', function() {
+    scheduleWallboxLiveFallback(!document.hidden);
+});
 
 // NEU: Skript für die Auswahl der Ladekosten-Anzeige
 (function() {
@@ -5526,22 +5575,14 @@ const wallboxSavedVehicleOptions = <?= json_encode($vehicleSelectBrowserOptions,
 const wb1CarSaved = <?= json_encode(canonicalWallboxVehicleSelection($wallboxConfig['wb1_car_id'] ?: '__none', $saved_cars)) ?>;
 const wb2CarSaved = <?= json_encode(canonicalWallboxVehicleSelection($wallboxConfig['wb2_car_id'] ?: '__none', $saved_cars)) ?>;
 
-function updateUIFromLiveData() {
-    fetch('get_live_json.php')
-        .then(response => response.json())
-        .then(data => {
-            if (data.wb_plan_hash && initialPlanHash && data.wb_plan_hash !== initialPlanHash) {
-                location.reload();
-                return;
-            }
-
-            // --- Fahrzeuge in Dropdowns befüllen ---
-            if (data.vehicles && Array.isArray(data.vehicles)) {
-                availableVehicles = data.vehicles;
-                updateCarSelectors(data);
-            }
-            syncWallboxPauseFromLiveData(data);
-        });
+function updateUIFromLiveData(data) {
+    if (!data || typeof data !== 'object') return;
+    // --- Fahrzeuge in Dropdowns befüllen ---
+    if (data.vehicles && Array.isArray(data.vehicles)) {
+        availableVehicles = data.vehicles;
+        updateCarSelectors(data);
+    }
+    syncWallboxPauseFromLiveData(data);
 }
 
 function wallboxPauseValue(value) {
@@ -5719,10 +5760,7 @@ function saveVehicleAssignment(wbIdx = null, options = {}) {
     });
 
     if (!options.silent) setVehicleAssignmentStatus('Speichert...', 'warning');
-    return fetch(WALLBOX_AJAX_ENDPOINT, {
-        method: 'POST',
-        body: formData
-    }).then(async res => {
+    return wallboxPost(formData).then(async res => {
         let payload = null;
         try { payload = await res.json(); } catch (_) { payload = null; }
         if (!res.ok || !payload || payload.ok !== true) {
@@ -5812,10 +5850,7 @@ function setManualSoC(wbIdx) {
     formData.append('manual_car_name', carName);
     formData.append('manual_car_capacity', capacity);
 
-    saveVehicleAssignment(wbIdx, {silent: true}).catch(() => {}).then(() => fetch(WALLBOX_AJAX_ENDPOINT, {
-        method: 'POST',
-        body: formData
-    })).then(res => res.text()).then(() => {
+    saveVehicleAssignment(wbIdx, {silent: true}).catch(() => {}).then(() => wallboxPost(formData)).then(res => res.text()).then(() => {
         alert(`✓ Manueller SoC für Wallbox ${wbIdx} gesetzt.`);
         window.location.reload();
     }).catch(err => alert('Fehler beim Speichern: ' + err));
@@ -5859,10 +5894,7 @@ function saveWallboxManualPause(wbIdx, paused) {
     formData.append('wb_id', wbIdx);
     formData.append('manual_pause', paused ? '1' : '0');
     setWallboxPauseUi(wbIdx, paused, true);
-    return fetch(WALLBOX_AJAX_ENDPOINT, {
-        method: 'POST',
-        body: formData
-    }).then(res => {
+    return wallboxPost(formData).then(res => {
         if (!res.ok) throw new Error('Network error');
         return res.json();
     }).then(data => {
@@ -5915,10 +5947,7 @@ function toggleWbMode(wbIdx) {
         formData.append('wb_battery_departure_window_h', departureWindow.value || '3');
     }
 
-    fetch(WALLBOX_AJAX_ENDPOINT, {
-        method: 'POST',
-        body: formData
-    }).then(res => {
+    wallboxPost(formData).then(res => {
         if (!res.ok) throw new Error('Network error');
         return res.text();
     }).then(data => {
@@ -5945,10 +5974,7 @@ function saveWbBatteryDeparture(wbIdx) {
     formData.append('wb_battery_departure_time', departureInput ? (departureInput.value || '06:30') : '06:30');
     formData.append('wb_battery_departure_window_h', departureWindow ? (departureWindow.value || '3') : '3');
 
-    fetch(WALLBOX_AJAX_ENDPOINT, {
-        method: 'POST',
-        body: formData
-    }).then(res => {
+    wallboxPost(formData).then(res => {
         if (!res.ok) throw new Error('Network error');
         return res.text();
     }).then(() => {
@@ -5982,10 +6008,7 @@ function saveWbPriority(mode) {
     radios.forEach(radio => radio.disabled = true);
     setWbPriorityStatus('Speichert...', 'warning');
 
-    fetch(WALLBOX_AJAX_ENDPOINT, {
-        method: 'POST',
-        body: formData
-    }).then(res => {
+    wallboxPost(formData).then(res => {
         if (!res.ok) throw new Error('Network error');
         return res.text();
     }).then(() => {
@@ -6007,10 +6030,7 @@ function saveWbName(wbIdx, newName) {
     formData.append('wb_id', wbIdx);
     formData.append('wb_name', newName);
 
-    fetch(WALLBOX_AJAX_ENDPOINT, {
-        method: 'POST',
-        body: formData
-    }).catch(err => alert('Fehler beim Speichern des Namens!'));
+    wallboxPost(formData).catch(err => alert('Fehler beim Speichern des Namens!'));
 }
 
 function syncPriceLimitGuard() {
@@ -6044,11 +6064,13 @@ function syncPriceLimitGuard() {
     guard.className = cls;
 }
 
-scheduleWallboxLiveDataPoll(false);
+scheduleWallboxLiveFallback(false);
 document.addEventListener('DOMContentLoaded', function() {
     initWallboxViewToggle();
     initSimpleWallboxTargetControls();
-    updateUIFromLiveData();
+    if (window.E3DC_LAST_LIVE_DATA && wallboxLastGlobalLiveMs === 0) {
+        consumeWallboxLiveData(window.E3DC_LAST_LIVE_DATA, 'global');
+    }
     updateWbModeHelp(1);
     updateWbModeHelp(2);
     syncPriceLimitGuard();

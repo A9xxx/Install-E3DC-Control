@@ -1,48 +1,39 @@
-import os
-import json
 from .core import CAT_ENV, register_command
-from .installer_config import save_config, load_config
+from .installer_config import get_venv_name
 from .utils import setup_venv
 
 def change_venv_name():
-    """Ändert den Namen des Python Virtual Environments."""
+    """Wechselt erst nach vollständig validierter Zielumgebung atomar das venv."""
     print("\n=== Python venv Namen ändern ===\n")
-    
-    config = load_config()
-    current_name = config.get("venv_name", ".venv_e3dc")
-    
+
+    try:
+        current_name = get_venv_name()
+    except Exception as exc:
+        print(f"✗ Aktuelle venv-Bindung ist nicht vertrauenswürdig: {exc}")
+        return False
+
     print(f"Aktueller Name: {current_name}")
-    new_name = input(f"Neuen Namen eingeben (Enter für '.venv_e3dc'): ").strip()
-    
+    new_name = input(f"Neuen Namen eingeben [{current_name}]: ").strip()
     if not new_name:
-        new_name = ".venv_e3dc"
-    
+        new_name = current_name
+
     if new_name == current_name:
         print("→ Name ist unverändert.\n")
-        return
+        return True
 
-    # 1. In installer_config.json speichern
-    config["venv_name"] = new_name
-    save_config(config)
-    print(f"✓ Konfiguration gespeichert: {new_name}")
+    if setup_venv(
+        show_header=True,
+        requested_venv_name=new_name,
+    ) is not True:
+        print(
+            "✗ Das neue venv wurde nicht vollständig bestätigt; "
+            "die bisherige Metadatenbindung bleibt erhalten."
+        )
+        return False
 
-    # 2. In e3dc_paths.json aktualisieren (für PHP)
-    try:
-        paths_file = "/var/www/html/e3dc_paths.json"
-        if os.path.exists(paths_file):
-            with open(paths_file, 'r') as f:
-                d = json.load(f)
-            d['venv_name'] = new_name
-            with open(paths_file, 'w') as f:
-                json.dump(d, f, indent=2)
-            print("✓ e3dc_paths.json aktualisiert")
-    except Exception as e:
-        print(f"⚠ Fehler beim Aktualisieren von e3dc_paths.json: {e}")
-
-    # 3. Setup ausführen?
-    if input("\nSoll das neue venv jetzt erstellt werden? (j/n) [j]: ").strip().lower() != 'n':
-        setup_venv(show_header=True)
-        print(f"\nHinweis: Der alte Ordner '{current_name}' wurde nicht gelöscht.")
-        print(f"Du kannst ihn manuell löschen, wenn alles läuft.")
+    print(f"\n✓ venv-Bindung atomar auf '{new_name}' umgestellt.")
+    print(f"Hinweis: Der alte Ordner '{current_name}' wurde nicht gelöscht.")
+    print("Du kannst ihn nach einer separaten Prüfung manuell entfernen.")
+    return True
 
 register_command("22", "Python venv Namen ändern", change_venv_name, sort_order=22, category=CAT_ENV)

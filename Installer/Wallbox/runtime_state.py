@@ -5,6 +5,7 @@ between cycles.  This module makes that state explicit so the main loop does
 not need to attach ad-hoc attributes to ``run()``.
 """
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Tuple
 
@@ -22,6 +23,11 @@ class WallboxRuntimeState:
 
     budget_stale_logged: bool = False
     budget_timeout_logged: bool = False
+    last_bound_wallbox_budget_w: float = 0.0
+    last_bound_wallbox_budget_ts: float = 0.0
+    last_bound_wallbox_budget_revision: str = ""
+    last_bound_wallbox_budget_generation: str = ""
+    transient_invalid_budget_logged: bool = False
     grid_import_budget_since: float = 0.0
     grid_import_budget_active: bool = False
     min_current_import_wh: Dict[int, float] = field(default_factory=dict)
@@ -35,6 +41,7 @@ class WallboxRuntimeState:
     predump_wb_grid_since: float = 0.0
     predump_wb_pause_hold_until: float = 0.0
     predump_wb_was_active: bool = False
+    predump_wb_signal_missing_since: float = 0.0
 
     curve_forecast_wb_block_active: bool = False
     curve_forecast_wb_release_since: float = 0.0
@@ -76,6 +83,136 @@ class WallboxRuntimeState:
             return 0.0, log_kind
         self.reset_budget_log_flags()
         return float(free_for_limbs_w or 0.0), None
+
+    def bind_transient_invalid_budget_continuation(
+        self,
+        contract: Dict[str, Any],
+        *,
+        live_sample_invalid: bool,
+        transport_invalid: bool = False,
+        continuation_evidence: bool,
+        hard_blocked: bool,
+        detected_phases: float,
+        now_ts: float,
+        producer_revision: str = "",
+        producer_generation: str = "",
+        hold_s: float = 10.0,
+        min_amp: float = 6.0,
+    ) -> Tuple[Dict[str, Any], Optional[str]]:
+        """Hält einen laufenden Ladepunkt über einen kurzen Eingangsaussetzer.
+
+        Gespeichert wird nur ein bereits validierter, frischer Storage-Vertrag.
+        Ein echtes frisches 0-W-Budget verwirft den Merker sofort. Während eines
+        ungültigen Live-Bilds oder einer kurz unvollständigen Transportrevision
+        entsteht ausdrücklich kein neues Leistungsbudget. Stattdessen darf
+        ausschließlich der bereits bestehende EVSE-Ausgang derselben Wallbox
+        kurz unverändert bleiben. Der Vertrag öffnet weder einen neuen Start
+        noch eine Erhöhung oder Phasenänderung. Ein frischer, gültiger
+        0-W-Vertrag bleibt davon ausdrücklich unberührt.
+        """
+
+        result = dict(contract) if isinstance(contract, dict) else {}
+        now = float(now_ts or 0.0)
+        try:
+            phases = float(max(1, min(3, int(round(float(detected_phases or 1.0))))))
+        except (TypeError, ValueError):
+            phases = 1.0
+        try:
+            minimum_amp = max(6.0, float(min_amp or 6.0))
+        except (TypeError, ValueError):
+            minimum_amp = 6.0
+        try:
+            hold_limit_s = min(15.0, max(0.0, float(hold_s or 0.0)))
+        except (TypeError, ValueError):
+            hold_limit_s = 0.0
+
+        if hard_blocked:
+            self.last_bound_wallbox_budget_w = 0.0
+            self.last_bound_wallbox_budget_ts = 0.0
+            self.last_bound_wallbox_budget_revision = ""
+            self.last_bound_wallbox_budget_generation = ""
+            self.transient_invalid_budget_logged = False
+            return result, None
+
+        transient_invalid = bool(live_sample_invalid or transport_invalid)
+        if not transient_invalid:
+            self.transient_invalid_budget_logged = False
+            if (
+                result.get("valid") is True
+                and result.get("continuation_only") is not True
+            ):
+                try:
+                    available_w = float(result.get("available_w", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    available_w = 0.0
+                revision = str(producer_revision or "")
+                generation = str(producer_generation or "")
+                revision_valid = bool(
+                    revision.startswith("sha256:")
+                    and len(revision) == 71
+                    and all(
+                        character in "0123456789abcdef"
+                        for character in revision[7:]
+                    )
+                )
+                if (
+                    math.isfinite(available_w)
+                    and available_w > 0.0
+                    and revision_valid
+                ):
+                    self.last_bound_wallbox_budget_w = available_w
+                    self.last_bound_wallbox_budget_ts = now
+                    self.last_bound_wallbox_budget_revision = revision
+                    self.last_bound_wallbox_budget_generation = generation
+                else:
+                    self.last_bound_wallbox_budget_w = 0.0
+                    self.last_bound_wallbox_budget_ts = 0.0
+                    self.last_bound_wallbox_budget_revision = ""
+                    self.last_bound_wallbox_budget_generation = ""
+            return result, None
+
+        age_s = now - float(self.last_bound_wallbox_budget_ts or 0.0)
+        minimum_w = minimum_amp * 230.0
+        stored_w = float(self.last_bound_wallbox_budget_w or 0.0)
+        hold_allowed = bool(
+            continuation_evidence
+            and hold_limit_s > 0.0
+            and math.isfinite(now)
+            and math.isfinite(age_s)
+            and 0.0 <= age_s <= hold_limit_s
+            and math.isfinite(stored_w)
+            and stored_w >= minimum_w
+            and self.last_bound_wallbox_budget_revision
+        )
+        if not hold_allowed:
+            return result, None
+
+        result.update({
+            "valid": False,
+            "continuation_only": False,
+            "output_hold_only": True,
+            "available_w": 0.0,
+            "owner": "storage_manager",
+            "source": "transient_invalid_last_bound_continuation",
+            "reason": (
+                "budget_transport_invalid_running_6a_hold"
+                if transport_invalid
+                else "live_sample_invalid_running_6a_hold"
+            ),
+            "last_bound_budget_w": stored_w,
+            "last_bound_budget_age_s": age_s,
+            "last_bound_budget_revision": self.last_bound_wallbox_budget_revision,
+            "last_bound_decision_generation": (
+                self.last_bound_wallbox_budget_generation
+            ),
+            "hold_limit_s": hold_limit_s,
+            "new_output_authorized": False,
+        })
+        log_kind = None
+        if not self.transient_invalid_budget_logged:
+            self.transient_invalid_budget_logged = True
+            log_kind = "transient_invalid_continuation"
+        return result, log_kind
 
     def hysteresis_gate(self, name: str, value: float, start_at: float, stop_at: float, default_open: bool = False) -> bool:
         key = str(name)
@@ -266,10 +403,28 @@ class WallboxRuntimeState:
         pause_s: float = 180.0,
         bootstrap_ready: bool = False,
         bootstrap_power_w: float = 0.0,
+        signal_grace_s: float = 10.0,
     ) -> Tuple[bool, bool, bool]:
         """Update the pre-dump wallbox gate without changing its semantics."""
 
         predump_active = bool(predump_active)
+        # Ein einzelnes unvollständiges Producer-Frame darf eine laufende,
+        # bereits qualifizierte Pre-Dump-Ladung nicht in die 180-s-Pause und
+        # anschließend in eine neue 20-s-Startqualifizierung schicken. Harte
+        # Stopps werden außerhalb dieses Gates typisiert ausgewertet; diese
+        # kurze Grace hält ausschließlich den vorhandenen Gate-Zustand.
+        if predump_active:
+            self.predump_wb_signal_missing_since = 0.0
+        elif self.predump_wb_was_active and has_candidate:
+            if not self.predump_wb_signal_missing_since:
+                self.predump_wb_signal_missing_since = now_ts
+            if (
+                now_ts - self.predump_wb_signal_missing_since
+                < max(0.0, float(signal_grace_s or 0.0))
+            ):
+                predump_active = True
+        else:
+            self.predump_wb_signal_missing_since = 0.0
         if predump_active and self.predump_wb_pause_hold_until > now_ts:
             predump_active = False
 
@@ -337,4 +492,6 @@ class WallboxRuntimeState:
         if exited and has_candidate:
             self.predump_wb_pause_hold_until = now_ts + max(0.0, float(pause_s or 0.0))
         self.predump_wb_was_active = bool(predump_active)
+        if not predump_active:
+            self.predump_wb_signal_missing_since = 0.0
         return bool(predump_active), bool(gate_open), bool(exited)

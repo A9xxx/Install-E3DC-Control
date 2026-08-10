@@ -118,7 +118,8 @@ def auto_discover_modules():
         "core", "__init__", "e3dc_mqtt_hub", "e3dc_websocket",
         "bluelink_client", "sqlite_archiver", "notification_manager", "ha_manager",
         "ml_predictor", "generate_vapid", "wallbox_manager", "energy_manager", "idm_live",
-        "heizstab_manager", "climate_live", "climate_control", "stiebel", "e3dc_live", "storage_manager", "storage_simulator",
+        "heizstab_manager", "climate_live", "climate_control", "stiebel", "e3dc_live",
+        "storage_manager", "storage_manager_legacy", "storage_simulator", "epex_manager",
 
         # Obsolete Installer Module verbannen (Echte Dateinamen!):
         "install_all", "config_wizard", "create_config", "strompreis_wizard",
@@ -211,11 +212,12 @@ def _expert_commands(commands):
 
 
 def _run_command(cmd, restart_callback=None):
-    safe_menu_action(cmd.key, cmd.label, cmd.func)
-    if restart_callback and cmd.key in ("11", "12"):
+    success = safe_menu_action(cmd.key, cmd.label, cmd.func)
+    if success is not False and restart_callback and cmd.key in ("11", "12"):
         print("→ Neuladen des Menüs…\n")
         restart_callback()
     input("Drücke ENTER um fortzufahren...")
+    return success is not False
 
 
 def run_main_menu(restart_callback=None):
@@ -229,6 +231,7 @@ def run_main_menu(restart_callback=None):
     commands_by_key = _commands_by_key(commands)
     expert_commands = _expert_commands(commands)
     current_view = "main"
+    failed_action = False
 
     while True:
         if current_view == "main":
@@ -250,7 +253,8 @@ def run_main_menu(restart_callback=None):
 
             target = commands_by_key.get(target_key or "")
             if target:
-                _run_command(target, restart_callback)
+                if not _run_command(target, restart_callback):
+                    failed_action = True
             else:
                 print("✗ Ungültige Auswahl.\n")
 
@@ -266,9 +270,11 @@ def run_main_menu(restart_callback=None):
             matched = [c for c in expert_commands if c.key == choice]
 
             if matched:
-                _run_command(matched[0], restart_callback)
+                if not _run_command(matched[0], restart_callback):
+                    failed_action = True
             else:
                 print("✗ Ungültige Auswahl.\n")
 
     # Wenn die Haupt-Schleife beendet wurde (mit 'q'), zeige die Zusammenfassung
     print_installation_summary()
+    return not failed_action

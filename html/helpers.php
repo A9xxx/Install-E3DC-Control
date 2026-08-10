@@ -3,7 +3,9 @@
  * helpers.php - Zentrale Utility-Funktionen für E3DC-Control Web-Interface
  */
 
-if (session_status() === PHP_SESSION_NONE) { session_start(); }
+if (PHP_SAPI !== 'cli' && session_status() === PHP_SESSION_NONE) {
+    session_start();
+}
 
 date_default_timezone_set('Europe/Berlin');
 
@@ -49,7 +51,7 @@ function getAssetUrl($filePath) {
     if (strpos($filePath, '.js') !== false && strpos($filePath, '.min.js') === false) {
         $minFilePath = str_replace('.js', '.min.js', $filePath);
         $fullMinPath = __DIR__ . '/' . ltrim($minFilePath, '/');
-        if (file_exists($fullMinPath)) {
+        if (file_exists($fullMinPath) && file_exists($fullPath) && filemtime($fullMinPath) >= filemtime($fullPath)) {
             $filePath = $minFilePath;
             $fullPath = $fullMinPath;
         }
@@ -236,49 +238,27 @@ function e3dcWebAuthClearFailures($clientKey = null) {
 }
 
 /**
- * Behandelt CORS-Header und Preflight OPTIONS-Anfragen für die neue
- * entkoppelte App und Widgets. CORS wird nur gewährt, wenn der anfragende
- * Client über einen korrekten API-Token (entspricht web_pin) autorisiert ist,
- * oder wenn keine web_pin im System konfiguriert ist.
+ * Sperrt Browserzugriffe fremder Origins fail-closed.
+ *
+ * Die Web-PIN ist weder eine Origin-Allowlist noch ein eigenständiger
+ * Capability-Token. Insbesondere darf eine leere optionale Web-PIN niemals
+ * dazu führen, dass eine beliebige Website Dashboard, Sitzung oder CSRF-Token
+ * lesen kann. Eine künftige externe Browser-App braucht einen getrennten,
+ * explizit konfigurierten Origin- und Tokenvertrag.
  */
 function handleCORSAndExternalAuth() {
-    $conf = loadE3dcConfig();
-    $pin = $conf['config']['web_pin'] ?? '';
-
-    // Anfragende Origin ermitteln
     $origin = $_SERVER['HTTP_ORIGIN'] ?? '';
-
     if (!empty($origin)) {
-        $tokenValid = false;
-        if ($pin === '') {
-            $tokenValid = true;
-        } else {
-            // Token aus Header extrahieren (Bearer-Token oder Custom-Header für Widgets)
-            $authHeader = $_SERVER['HTTP_AUTHORIZATION'] ?? $_SERVER['REDIRECT_HTTP_AUTHORIZATION'] ?? '';
-            $token = '';
-            if (preg_match('/Bearer\s+(.*)$/i', $authHeader, $matches)) {
-                $token = trim($matches[1]);
-            } elseif (isset($_SERVER['HTTP_X_API_PIN'])) {
-                $token = trim($_SERVER['HTTP_X_API_PIN']);
-            }
-
-            if ($token !== '' && e3dcWebAuthHashEquals($pin, $token)) {
-                $tokenValid = true;
-            }
-        }
-
-        // CORS-Header nur senden, wenn die Anfrage legitimiert ist
-        if ($tokenValid) {
-            header("Access-Control-Allow-Origin: $origin");
-            header("Access-Control-Allow-Headers: Authorization, X-API-PIN, Content-Type");
-            header("Access-Control-Allow-Methods: GET, POST, OPTIONS");
-            header("Access-Control-Allow-Credentials: true");
-        }
+        header('Vary: Origin');
     }
-
-    // CORS Preflight OPTIONS-Anfrage sofort beantworten
     if (($_SERVER['REQUEST_METHOD'] ?? '') === 'OPTIONS') {
-        exit(0);
+        http_response_code(403);
+        header('Content-Type: application/json; charset=utf-8');
+        echo json_encode([
+            'success' => false,
+            'error' => 'Cross-Origin-Browserzugriff ist nicht freigegeben.',
+        ]);
+        exit;
     }
 }
 
@@ -288,10 +268,19 @@ handleCORSAndExternalAuth();
 handleDiagnoseAck();
 
 function isWebAuthenticated() {
+    $conf = loadE3dcConfig();
+    if (
+        !is_array($conf)
+        || !empty($conf['error'])
+        || !isset($conf['config'])
+        || !is_array($conf['config'])
+    ) {
+        return false;
+    }
+
     // 1. Session-basierte Anmeldung (normaler Browser)
     if (isset($_SESSION['web_authenticated']) && $_SESSION['web_authenticated'] === true) return true;
 
-    $conf = loadE3dcConfig();
     $pin = $conf['config']['web_pin'] ?? '';
     if ($pin === '') return true; // Kein PIN gesetzt -> Jeder ist authentifiziert
 
@@ -353,8 +342,30 @@ function e3dcRequireCsrfToken($isAjax = true) {
     }
 }
 
+function e3dcRequirePostMutation($isAjax = true) {
+    if (strtoupper((string)($_SERVER['REQUEST_METHOD'] ?? 'GET')) !== 'POST') {
+        http_response_code(405);
+        header('Allow: POST');
+        if ($isAjax || (isset($_SERVER['HTTP_X_REQUESTED_WITH']) && strtolower($_SERVER['HTTP_X_REQUESTED_WITH']) === 'xmlhttprequest')) {
+            header('Content-Type: application/json; charset=utf-8');
+            echo json_encode([
+                'success' => false,
+                'ok' => false,
+                'error' => 'Methode nicht erlaubt',
+                'message' => 'Diese Aktion ist ausschließlich per POST erlaubt.',
+            ]);
+        } else {
+            echo 'Fehler: Diese Aktion ist ausschließlich per POST erlaubt.';
+        }
+        exit;
+    }
+    requireWebAuth($isAjax);
+    e3dcRequireCsrfToken($isAjax);
+}
+
 function handleWebLogin() {
     if (isset($_POST['action']) && $_POST['action'] === 'web_login') {
+        e3dcRequireCsrfToken(false);
         $conf = loadE3dcConfig();
         $pin = $conf['config']['web_pin'] ?? '';
         $clientKey = e3dcWebAuthClientKey();
@@ -363,6 +374,7 @@ function handleWebLogin() {
             $_SESSION['login_error'] = true;
             $_SESSION['login_error_message'] = 'Zu viele falsche PIN-Versuche. Bitte warte ' . ceil($lockRemaining / 60) . ' Minuten.';
         } elseif ($pin !== '' && isset($_POST['pin']) && e3dcWebAuthHashEquals($pin, $_POST['pin'])) {
+            session_regenerate_id(true);
             $_SESSION['web_authenticated'] = true;
             unset($_SESSION['login_error']);
             unset($_SESSION['login_error_message']);
@@ -379,8 +391,10 @@ function handleWebLogin() {
         header('Location: ' . ($_SERVER['HTTP_REFERER'] ?? getContextPageUrl('dashboard')));
         exit;
     }
-    if (isset($_GET['action']) && $_GET['action'] === 'web_logout') {
+    if (isset($_POST['action']) && $_POST['action'] === 'web_logout') {
+        e3dcRequirePostMutation(false);
         unset($_SESSION['web_authenticated']);
+        session_regenerate_id(true);
         header('Location: ' . getContextPageUrl('dashboard'));
         exit;
     }
@@ -388,7 +402,7 @@ function handleWebLogin() {
 
 function handleDiagnoseAck() {
     if (isset($_GET['action']) && $_GET['action'] === 'ack_diagnose') {
-        requireWebAuth(true);
+        e3dcRequirePostMutation(true);
         $ackState = ['time' => time(), 'sizes' => []];
         $logFiles = [
             'energy_manager' => '/var/www/html/logs/energy_manager.log',
@@ -438,7 +452,7 @@ function handleHAManagerLog() {
  */
 function handleForceSocUpdate() {
     if (isset($_GET['action']) && $_GET['action'] === 'force_soc') {
-        requireWebAuth(true);
+        e3dcRequirePostMutation(true);
         header('Content-Type: application/json');
         $flagFile = '/var/www/html/ramdisk/force_bluelink.flag';
 
@@ -1913,29 +1927,472 @@ function requirePostParams($required = []) {
 // ==================== KONFIGURATION ====================
 
 /**
+ * Liest eine reguläre Datei descriptor- und identitätsgebunden.
+ *
+ * Damit darf ein Symlink- oder Rename-Rennen weder Authentifizierung noch
+ * Konfigurationsentscheidungen auf eine andere Datei umlenken.
+ */
+function e3dcReadRegularFileBound($path, $maxBytes = 1048576) {
+    if (!is_string($path) || $path === '' || is_link($path)) return null;
+    $pathStat = @lstat($path);
+    if (!is_array($pathStat)) return null;
+    $mode = (int)($pathStat['mode'] ?? 0);
+    $size = (int)($pathStat['size'] ?? -1);
+    if (($mode & 0170000) !== 0100000 || $size < 0 || $size > (int)$maxBytes) {
+        return null;
+    }
+    $handle = @fopen($path, 'rb');
+    if ($handle === false) return null;
+    try {
+        $opened = @fstat($handle);
+        if (
+            !is_array($opened)
+            || (int)($opened['dev'] ?? -1) !== (int)($pathStat['dev'] ?? -2)
+            || (int)($opened['ino'] ?? -1) !== (int)($pathStat['ino'] ?? -2)
+            || (int)($opened['nlink'] ?? 0) !== 1
+            || (int)($opened['size'] ?? -1) !== $size
+        ) {
+            return null;
+        }
+        $raw = @stream_get_contents($handle, (int)$maxBytes + 1);
+        $after = @fstat($handle);
+        $pathAfter = @lstat($path);
+        if (
+            !is_string($raw)
+            || strlen($raw) !== $size
+            || !is_array($after)
+            || !is_array($pathAfter)
+            || (int)($after['dev'] ?? -1) !== (int)($opened['dev'] ?? -2)
+            || (int)($after['ino'] ?? -1) !== (int)($opened['ino'] ?? -2)
+            || (int)($after['nlink'] ?? 0) !== 1
+            || (int)($after['size'] ?? -1) !== $size
+            || (int)($after['mtime'] ?? -1) !== (int)($opened['mtime'] ?? -2)
+            || (int)($after['ctime'] ?? -1) !== (int)($opened['ctime'] ?? -2)
+            || ((int)($pathAfter['mode'] ?? 0) & 0170000) !== 0100000
+            || (int)($pathAfter['dev'] ?? -1) !== (int)($opened['dev'] ?? -2)
+            || (int)($pathAfter['ino'] ?? -1) !== (int)($opened['ino'] ?? -2)
+            || (int)($pathAfter['nlink'] ?? 0) !== 1
+            || (int)($pathAfter['size'] ?? -1) !== $size
+            || (int)($pathAfter['mtime'] ?? -1) !== (int)($opened['mtime'] ?? -2)
+            || (int)($pathAfter['ctime'] ?? -1) !== (int)($opened['ctime'] ?? -2)
+        ) {
+            return null;
+        }
+        return $raw;
+    } finally {
+        @fclose($handle);
+    }
+}
+
+function e3dcConfigRequestMemoGeneration($path) {
+    clearstatcache(true, $path);
+    $meta = @lstat($path);
+    $epoch = (int)($GLOBALS['e3dc_config_request_memo_epoch'] ?? 0);
+    if (!is_array($meta)) {
+        return 'missing:' . $epoch;
+    }
+    return implode(':', [
+        $epoch,
+        (int)($meta['dev'] ?? -1),
+        (int)($meta['ino'] ?? -1),
+        (int)($meta['size'] ?? -1),
+        (int)($meta['mtime'] ?? -1),
+        (int)($meta['ctime'] ?? -1),
+    ]);
+}
+
+function e3dcInvalidateConfigRequestMemo() {
+    $GLOBALS['e3dc_config_request_memo_epoch'] =
+        (int)($GLOBALS['e3dc_config_request_memo_epoch'] ?? 0) + 1;
+}
+
+function e3dcFirstFreshRegularFile($paths, $maxAgeS) {
+    $now = microtime(true);
+    $maxAge = max(0.0, (float)$maxAgeS);
+    foreach ((array)$paths as $path) {
+        $path = (string)$path;
+        if ($path === '' || is_link($path)) continue;
+        clearstatcache(true, $path);
+        $meta = @lstat($path);
+        if (
+            !is_array($meta)
+            || (((int)($meta['mode'] ?? 0)) & 0170000) !== 0100000
+            || (int)($meta['nlink'] ?? 0) !== 1
+            || !is_readable($path)
+        ) {
+            continue;
+        }
+        $mtime = (float)($meta['mtime'] ?? 0);
+        $age = $now - $mtime;
+        if ($mtime > 0.0 && $age >= 0.0 && $age <= $maxAge) {
+            return $path;
+        }
+    }
+    return null;
+}
+
+function e3dcWallboxSessionSourceGeneration($path) {
+    $path = (string)$path;
+    if ($path === '' || is_link($path)) return null;
+    clearstatcache(true, $path);
+    $meta = @lstat($path);
+    if (
+        !is_array($meta)
+        || (((int)($meta['mode'] ?? 0)) & 0170000) !== 0100000
+        || (int)($meta['nlink'] ?? 0) !== 1
+        || (int)($meta['size'] ?? -1) < 0
+        || !is_readable($path)
+    ) {
+        return null;
+    }
+    return [
+        'key' => implode(':', [
+            (int)($meta['dev'] ?? -1),
+            (int)($meta['ino'] ?? -1),
+            (int)($meta['size'] ?? -1),
+            (int)($meta['mtime'] ?? -1),
+            (int)($meta['ctime'] ?? -1),
+        ]),
+        'dev' => (int)($meta['dev'] ?? -1),
+        'ino' => (int)($meta['ino'] ?? -1),
+        'size' => (int)($meta['size'] ?? -1),
+        'mtime' => (int)($meta['mtime'] ?? -1),
+        'ctime' => (int)($meta['ctime'] ?? -1),
+    ];
+}
+
+function e3dcFirstWallboxSessionHistoryFile($paths) {
+    foreach ((array)$paths as $path) {
+        if (is_array(e3dcWallboxSessionSourceGeneration($path))) {
+            return (string)$path;
+        }
+    }
+    return null;
+}
+
+function e3dcWallboxSessionEmptyAggregate($day) {
+    return [
+        'schema' => 1,
+        'day' => (string)$day,
+        'source_key' => '',
+        'generation_key' => '',
+        'total_kwh' => 0.0,
+        'total_seconds' => 0,
+        'session_count' => 0,
+        'today_kwh' => ['1' => 0.0, '2' => 0.0],
+        'recent_limit' => 500,
+        'sessions' => [],
+    ];
+}
+
+function e3dcWallboxSessionAggregateCacheValue($cacheFile, $sourceKey, $generationKey, $day) {
+    $raw = e3dcReadRegularFileBound($cacheFile, 4 * 1024 * 1024);
+    if (!is_string($raw)) return null;
+    $cached = @json_decode($raw, true);
+    if (
+        !is_array($cached)
+        || (int)($cached['schema'] ?? 0) !== 1
+        || !isset($cached['source_key'], $cached['generation_key'], $cached['day'])
+        || !hash_equals((string)$sourceKey, (string)$cached['source_key'])
+        || !hash_equals((string)$generationKey, (string)$cached['generation_key'])
+        || (string)$cached['day'] !== (string)$day
+        || !is_numeric($cached['total_kwh'] ?? null)
+        || !is_numeric($cached['total_seconds'] ?? null)
+        || !is_numeric($cached['session_count'] ?? null)
+        || (int)($cached['recent_limit'] ?? 0) !== 500
+        || !isset($cached['today_kwh'])
+        || !is_array($cached['today_kwh'])
+        || !is_numeric($cached['today_kwh']['1'] ?? null)
+        || !is_numeric($cached['today_kwh']['2'] ?? null)
+        || !isset($cached['sessions'])
+        || !is_array($cached['sessions'])
+        || count($cached['sessions']) > 500
+        || (float)$cached['total_kwh'] < 0.0
+        || (int)$cached['total_seconds'] < 0
+        || (int)$cached['session_count'] < count($cached['sessions'])
+    ) {
+        return null;
+    }
+    foreach ($cached['sessions'] as $session) {
+        if (
+            !is_array($session)
+            || !is_numeric($session['tsStart'] ?? null)
+            || !is_numeric($session['tsEnd'] ?? null)
+            || !is_numeric($session['kwh'] ?? null)
+            || (int)$session['tsEnd'] < (int)$session['tsStart']
+            || (float)$session['kwh'] < 0.0
+        ) {
+            return null;
+        }
+    }
+    return $cached;
+}
+
+function e3dcBuildWallboxSessionAggregate($path, $sourceKey, $generation, $day) {
+    if (!is_array($generation)) return null;
+    $handle = @fopen($path, 'rb');
+    if ($handle === false) return null;
+    $opened = @fstat($handle);
+    clearstatcache(true, $path);
+    $bound = @lstat($path);
+    if (
+        !is_array($opened)
+        || !is_array($bound)
+        || (((int)($opened['mode'] ?? 0)) & 0170000) !== 0100000
+        || (((int)($bound['mode'] ?? 0)) & 0170000) !== 0100000
+        || (int)($opened['nlink'] ?? 0) !== 1
+        || (int)($bound['nlink'] ?? 0) !== 1
+        || (int)($opened['dev'] ?? -1) !== (int)$generation['dev']
+        || (int)($opened['ino'] ?? -1) !== (int)$generation['ino']
+        || (int)($opened['size'] ?? -1) !== (int)$generation['size']
+        || (int)($bound['dev'] ?? -1) !== (int)$generation['dev']
+        || (int)($bound['ino'] ?? -1) !== (int)$generation['ino']
+    ) {
+        @fclose($handle);
+        return null;
+    }
+
+    $totalKwh = 0.0;
+    $totalSeconds = 0;
+    $sessionCount = 0;
+    $todayKwh = ['1' => 0.0, '2' => 0.0];
+    $ring = [];
+    $ringLimit = 500;
+
+    while (($parts = @fgetcsv($handle, 1048576, ';', '"', '')) !== false) {
+        if (!is_array($parts) || count($parts) < 5) continue;
+        $marker = ltrim(trim((string)$parts[0]), "\xEF\xBB\xBF");
+        if (strcasecmp($marker, 'Timestamp') === 0) continue;
+
+        $startRaw = trim((string)$parts[1]);
+        $endRaw = trim((string)$parts[2]);
+        $kwhRaw = str_replace(',', '.', trim((string)$parts[3]));
+        $wallbox = trim((string)$parts[4]);
+        if (!is_numeric($kwhRaw)) continue;
+        $kwh = max(0.0, (float)$kwhRaw);
+
+        if (
+            isset($todayKwh[$wallbox])
+            && (strpos($marker, $day) === 0 || strpos($endRaw, $day) === 0)
+        ) {
+            $todayKwh[$wallbox] += $kwh;
+        }
+
+        $tsStart = strtotime($startRaw);
+        $tsEnd = strtotime($endRaw);
+        if ($tsStart === false || $tsEnd === false || $tsEnd < $tsStart) continue;
+
+        $totalKwh += $kwh;
+        $totalSeconds += $tsEnd - $tsStart;
+        $ring[$sessionCount % $ringLimit] = [
+            'tsStart' => $tsStart,
+            'tsEnd' => $tsEnd,
+            'kwh' => $kwh,
+        ];
+        $sessionCount++;
+    }
+
+    $after = @fstat($handle);
+    @fclose($handle);
+    $pathAfter = e3dcWallboxSessionSourceGeneration($path);
+    if (
+        !is_array($after)
+        || !is_array($pathAfter)
+        || (string)$pathAfter['key'] !== (string)$generation['key']
+        || (int)($after['dev'] ?? -1) !== (int)$generation['dev']
+        || (int)($after['ino'] ?? -1) !== (int)$generation['ino']
+        || (int)($after['size'] ?? -1) !== (int)$generation['size']
+        || (int)($after['mtime'] ?? -1) !== (int)$generation['mtime']
+        || (int)($after['ctime'] ?? -1) !== (int)$generation['ctime']
+    ) {
+        return null;
+    }
+
+    $recentCount = min($sessionCount, $ringLimit);
+    $chronological = [];
+    $startIndex = $sessionCount > $ringLimit ? $sessionCount % $ringLimit : 0;
+    for ($offset = 0; $offset < $recentCount; $offset++) {
+        $index = ($startIndex + $offset) % $ringLimit;
+        if (isset($ring[$index])) $chronological[] = $ring[$index];
+    }
+
+    return [
+        'schema' => 1,
+        'day' => (string)$day,
+        'source_key' => (string)$sourceKey,
+        'generation_key' => (string)$generation['key'],
+        'total_kwh' => $totalKwh,
+        'total_seconds' => $totalSeconds,
+        'session_count' => $sessionCount,
+        'today_kwh' => [
+            '1' => round($todayKwh['1'], 3),
+            '2' => round($todayKwh['2'], 3),
+        ],
+        'recent_limit' => $ringLimit,
+        'sessions' => array_reverse($chronological),
+    ];
+}
+
+function e3dcWriteWallboxSessionAggregateCache($cacheFile, $aggregate) {
+    $dir = dirname((string)$cacheFile);
+    if (!is_dir($dir) || !is_array($aggregate)) return false;
+    $body = @json_encode($aggregate, JSON_UNESCAPED_SLASHES);
+    if (!is_string($body)) return false;
+    $tmp = @tempnam($dir, '.wb_sessions_aggregate_');
+    if ($tmp === false) return false;
+    $ok = @file_put_contents($tmp, $body, LOCK_EX) !== false;
+    if ($ok) {
+        @chmod($tmp, 0664);
+        $ok = @rename($tmp, $cacheFile);
+    }
+    @unlink($tmp);
+    return $ok;
+}
+
+function e3dcWallboxSessionCsvAggregate(
+    $path,
+    $cacheFile = '/var/www/html/ramdisk/wb_sessions_aggregate.json'
+) {
+    static $requestMemo = [];
+
+    $day = date('Y-m-d');
+    $empty = e3dcWallboxSessionEmptyAggregate($day);
+    $generation = e3dcWallboxSessionSourceGeneration($path);
+    if (!is_array($generation)) return $empty;
+    $sourceKey = hash('sha256', (string)$path);
+    $memoKey = $sourceKey . ':' . $generation['key'] . ':' . $day;
+    if (isset($requestMemo[$memoKey]) && is_array($requestMemo[$memoKey])) {
+        return $requestMemo[$memoKey];
+    }
+
+    $cached = e3dcWallboxSessionAggregateCacheValue(
+        $cacheFile,
+        $sourceKey,
+        $generation['key'],
+        $day
+    );
+    if (is_array($cached)) {
+        $requestMemo = [$memoKey => $cached];
+        return $cached;
+    }
+
+    $lockPath = $cacheFile . '.lock';
+    $lockHandle = is_link($lockPath) ? false : @fopen($lockPath, 'c');
+    if ($lockHandle === false && !is_link($lockPath)) {
+        $lockHandle = @fopen($lockPath, 'r');
+    }
+    if (is_resource($lockHandle)) {
+        clearstatcache(true, $lockPath);
+        $openedLock = @fstat($lockHandle);
+        $boundLock = @lstat($lockPath);
+        if (
+            !is_array($openedLock)
+            || !is_array($boundLock)
+            || (((int)($openedLock['mode'] ?? 0)) & 0170000) !== 0100000
+            || (((int)($boundLock['mode'] ?? 0)) & 0170000) !== 0100000
+            || (int)($openedLock['nlink'] ?? 0) !== 1
+            || (int)($boundLock['nlink'] ?? 0) !== 1
+            || (int)($openedLock['dev'] ?? -1) !== (int)($boundLock['dev'] ?? -2)
+            || (int)($openedLock['ino'] ?? -1) !== (int)($boundLock['ino'] ?? -2)
+        ) {
+            @fclose($lockHandle);
+            $lockHandle = false;
+        }
+    }
+    $lockOwned = false;
+    if (is_resource($lockHandle)) {
+        @chmod($lockPath, 0664);
+        $deadline = microtime(true) + 0.5;
+        do {
+            if (@flock($lockHandle, LOCK_EX | LOCK_NB)) {
+                $lockOwned = true;
+                break;
+            }
+            usleep(25000);
+        } while (microtime(true) < $deadline);
+    }
+
+    if ($lockOwned) {
+        // Ein anderer Prozess kann den exakt gebundenen Cache während unserer
+        // begrenzten Wartezeit bereits erzeugt haben.
+        $cached = e3dcWallboxSessionAggregateCacheValue(
+            $cacheFile,
+            $sourceKey,
+            $generation['key'],
+            $day
+        );
+        if (is_array($cached)) {
+            @flock($lockHandle, LOCK_UN);
+            @fclose($lockHandle);
+            $requestMemo = [$memoKey => $cached];
+            return $cached;
+        }
+    }
+
+    $aggregate = e3dcBuildWallboxSessionAggregate(
+        $path,
+        $sourceKey,
+        $generation,
+        $day
+    );
+    if (!is_array($aggregate)) {
+        if ($lockOwned) @flock($lockHandle, LOCK_UN);
+        if (is_resource($lockHandle)) @fclose($lockHandle);
+        return $empty;
+    }
+    if ($lockOwned) {
+        e3dcWriteWallboxSessionAggregateCache($cacheFile, $aggregate);
+        @flock($lockHandle, LOCK_UN);
+    }
+    if (is_resource($lockHandle)) @fclose($lockHandle);
+    $requestMemo = [$memoKey => $aggregate];
+    return $aggregate;
+}
+
+/**
  * Lädt die E3DC-Konfiguration aus e3dc_v4.json (Single Source of Truth).
  * e3dc.config.txt wird nicht mehr gelesen.
  */
 function loadE3dcConfig($basePath = null) {
+    static $requestMemo = [];
+
     $v4Path = '/var/www/html/data/e3dc_v4.json';
+    $memoGeneration = e3dcConfigRequestMemoGeneration($v4Path);
+    if (isset($requestMemo[$memoGeneration]) && is_array($requestMemo[$memoGeneration])) {
+        return $requestMemo[$memoGeneration];
+    }
+
+    // Pro Request wird ausschließlich die aktuelle Dateigeneration gehalten.
+    // Ein erfolgreicher Schreibpfad erhöht zusätzlich den lokalen Memo-Epoch.
+    $requestMemo = [];
     $cacheFile = '/var/www/html/ramdisk/e3dc_config_cache.json';
 
-    if (!file_exists($v4Path)) {
-        return ['error' => errorMessage('Konfiguration fehlt', 'e3dc_v4.json nicht gefunden unter ' . $v4Path), 'config' => []];
+    $v4Raw = e3dcReadRegularFileBound($v4Path, 1048576);
+    if (!is_string($v4Raw)) {
+        $result = ['error' => errorMessage('Konfiguration fehlt', 'e3dc_v4.json nicht gefunden unter ' . $v4Path), 'config' => []];
+        $requestMemo[$memoGeneration] = $result;
+        return $result;
+    }
+    if (strlen($v4Raw) < 2) {
+        $result = ['error' => errorMessage('Konfigurationsfehler', 'e3dc_v4.json besitzt keine zulässige Größe.'), 'config' => []];
+        $requestMemo[$memoGeneration] = $result;
+        return $result;
     }
 
-    // RAM-Disk Cache (basierend auf V4 mtime)
-    $v4_mtime = filemtime($v4Path);
-    if (file_exists($cacheFile)) {
-        $cache = @json_decode(file_get_contents($cacheFile), true);
-        if ($cache && isset($cache['mtime']) && $cache['mtime'] === (string)$v4_mtime) {
-            return ['error' => null, 'config' => $cache['config']];
-        }
+    // Der Cache ist ein Laufzeitspiegel für andere Module, aber keine
+    // Authentifizierungsautorität. Deshalb wird die gebundene Quelldatei bei
+    // jedem PHP-Aufruf erneut geparst.
+    $v4_mtime = @filemtime($v4Path);
+    if ($v4_mtime === false) {
+        $result = ['error' => errorMessage('Konfigurationsfehler', 'e3dc_v4.json kann nicht sicher geprüft werden.'), 'config' => []];
+        $requestMemo[$memoGeneration] = $result;
+        return $result;
     }
-
-    $v4Data = @json_decode(file_get_contents($v4Path), true);
+    $v4Data = @json_decode($v4Raw, true);
     if (!is_array($v4Data)) {
-        return ['error' => errorMessage('Konfigurationsfehler', 'e3dc_v4.json ist kein gültiges JSON.'), 'config' => []];
+        $result = ['error' => errorMessage('Konfigurationsfehler', 'e3dc_v4.json ist kein gültiges JSON.'), 'config' => []];
+        $requestMemo[$memoGeneration] = $result;
+        return $result;
     }
 
     $config = [];
@@ -1945,11 +2402,20 @@ function loadE3dcConfig($basePath = null) {
         }
     }
 
-    // Im RAM zwischenspeichern
-    @file_put_contents($cacheFile, json_encode(['mtime' => (string)$v4_mtime, 'config' => $config]));
-    @chmod($cacheFile, 0664);
+    // Der Spiegel liegt in tmpfs und wird nur bei einer echten Änderung
+    // erneuert. Er bleibt reine Projektion und niemals Auth-Autorität.
+    $cacheBody = json_encode(['mtime' => (string)$v4_mtime, 'config' => $config]);
+    if (is_string($cacheBody) && @file_get_contents($cacheFile) !== $cacheBody) {
+        @file_put_contents($cacheFile, $cacheBody, LOCK_EX);
+        @chmod($cacheFile, 0664);
+    }
 
-    return ['error' => null, 'config' => $config];
+    $result = ['error' => null, 'config' => $config];
+    $stableGeneration = e3dcConfigRequestMemoGeneration($v4Path);
+    if ($stableGeneration === $memoGeneration) {
+        $requestMemo[$memoGeneration] = $result;
+    }
+    return $result;
 }
 
 function e3dcConfigSecretProtectionModeFromData($data) {
@@ -2008,7 +2474,12 @@ function e3dcWriteJsonAtomic($path, $json) {
     $dir = dirname($path);
     if (!is_dir($dir)) return false;
     $fileMode = e3dcJsonAtomicFileMode($path, $json);
-    if (e3dcWriteJsonPreservingOwner($path, $json, $fileMode)) return true;
+    if (e3dcWriteJsonPreservingOwner($path, $json, $fileMode)) {
+        if (basename((string)$path) === 'e3dc_v4.json') {
+            e3dcInvalidateConfigRequestMemo();
+        }
+        return true;
+    }
     $tmpFile = tempnam($dir, '.e3dc_v4_');
     if ($tmpFile === false) return false;
     $ok = @file_put_contents($tmpFile, $json . "\n", LOCK_EX) !== false;
@@ -2023,6 +2494,9 @@ function e3dcWriteJsonAtomic($path, $json) {
     }
     @chgrp($path, 'www-data');
     @chmod($path, $fileMode);
+    if (basename((string)$path) === 'e3dc_v4.json') {
+        e3dcInvalidateConfigRequestMemo();
+    }
     return true;
 }
 
@@ -2338,6 +2812,9 @@ function saveEnergyFlowUiPatchLocked($layout, $nodes, $colorPatch, $labelPatch, 
         @chgrp($v4Path, 'www-data');
         @chmod($v4Path, e3dcConfigSecretFileModeFromData($decoded ?? []));
         if (file_exists($cacheFile)) @unlink($cacheFile);
+        if (basename((string)$v4Path) === 'e3dc_v4.json') {
+            e3dcInvalidateConfigRequestMemo();
+        }
     }
     return $result;
 }
@@ -2355,8 +2832,7 @@ function handleEnergyFlowLayout() {
     }
     if ($payload === null) return;
 
-    requireWebAuth(true);
-    e3dcRequireCsrfToken(true);
+    e3dcRequirePostMutation(true);
     header('Content-Type: application/json; charset=utf-8');
 
     $layout = strtolower(trim((string)($payload['layout'] ?? '')));
@@ -2526,16 +3002,18 @@ function isConfiguredWallboxTypeConfig($type) {
 function hasWallbox1Config($cfg) {
     if (!is_array($cfg)) return false;
 
+    // Ein vorhandener Typ-Key ist die aktuelle, ausdrückliche Nutzerwahl.
+    // Restaurierte Legacy-IP-/Topic-Werte dürfen "none" nicht überstimmen.
+    if (array_key_exists('wb_native_type', $cfg)) {
+        return isConfiguredWallboxTypeConfig($cfg['wb_native_type']);
+    }
+
     if (cfgHasAddress($cfg['wb_topic'] ?? '')
         || cfgHasAddress($cfg['wb_ip'] ?? '')
         || cfgHasAddress($cfg['shelly_wb_ip'] ?? '')
         || cfgHasAddress($cfg['wb1_topic'] ?? '')
         || cfgHasAddress($cfg['wb1_topic_prefix'] ?? '')) {
         return true;
-    }
-
-    if (array_key_exists('wb_native_type', $cfg)) {
-        return isConfiguredWallboxTypeConfig($cfg['wb_native_type']);
     }
 
     if (cfgHasAddress($cfg['wb_native_ip'] ?? '')) {
@@ -2558,6 +3036,12 @@ function hasWallbox1Config($cfg) {
 function hasWallbox2Config($cfg) {
     if (!is_array($cfg)) return false;
 
+    // Ein leerer oder abgeschalteter aktueller Typ bedeutet ausdrücklich:
+    // keine zweite Wallbox, auch wenn alte Adresswerte noch vorhanden sind.
+    if (array_key_exists('wb_native_type2', $cfg)) {
+        return isConfiguredWallboxTypeConfig($cfg['wb_native_type2']);
+    }
+
     if (cfgHasAddress($cfg['wb2_topic'] ?? '')
         || cfgHasAddress($cfg['wb2_ip'] ?? '')
         || cfgHasAddress($cfg['shelly_wb2_ip'] ?? '')
@@ -2565,11 +3049,32 @@ function hasWallbox2Config($cfg) {
         return true;
     }
 
-    if (array_key_exists('wb_native_type2', $cfg)) {
-        return isConfiguredWallboxTypeConfig($cfg['wb_native_type2']);
+    if (cfgHasAddress($cfg['wb_native_ip2'] ?? '')) {
+        return true;
     }
 
-    return cfgHasAddress($cfg['wb_native_ip2'] ?? '');
+    // Bei aktivem nativen Multi-Wallbox Manager in der Ramdisk
+    if (is_file('/var/www/html/ramdisk/wallbox_native.json')) {
+        $raw = @file_get_contents('/var/www/html/ramdisk/wallbox_native.json');
+        if ($raw) {
+            $nw = @json_decode($raw, true);
+            if (is_array($nw)) {
+                if (isset($nw['wb_multi_contract']['slots']) && is_array($nw['wb_multi_contract']['slots']) && count($nw['wb_multi_contract']['slots']) > 1) {
+                    return true;
+                }
+                if (isset($nw['wb_details']) && is_array($nw['wb_details'])) {
+                    foreach ($nw['wb_details'] as $det) {
+                        if (is_array($det) && (int)($det['id'] ?? 0) === 2) return true;
+                    }
+                }
+                if (preg_match('/Multi\s*\((\d+)/i', (string)($nw['wb_type'] ?? ''), $m) && (int)$m[1] > 1) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    return false;
 }
 
 function hasAnyWallboxConfig($cfg) {
@@ -2579,6 +3084,105 @@ function hasAnyWallboxConfig($cfg) {
 function hasNativeWallboxStatusConfig($cfg) {
     if (!is_array($cfg)) return false;
     return cfgBool($cfg['wb_native_enable'] ?? null, false) && hasAnyWallboxConfig($cfg);
+}
+
+/**
+ * Entfernt Live-/Cachewerte für ausdrücklich nicht konfigurierte Wallboxen.
+ * Das Konfigurationsflag ist der Vertrag; alte Ramdisk-, Session- oder
+ * Zählerwerte dürfen einen deaktivierten Slot nicht wieder sichtbar machen.
+ */
+function e3dcApplyWallboxPresenceProjection(&$data, $wb1Configured, $wb2Configured) {
+    if (!is_array($data)) $data = [];
+    $wb1Configured = (bool)$wb1Configured;
+    $wb2Configured = (bool)$wb2Configured;
+
+    // Falls ein nativer Multi-Wallbox Vertrag aktiv ist, wird WB2 nie gekappt
+    if (isset($data['wb_multi_contract']['slots']) && is_array($data['wb_multi_contract']['slots']) && count($data['wb_multi_contract']['slots']) > 1) {
+        $wb2Configured = true;
+    }
+
+    if (isset($data['wb_details']) && is_array($data['wb_details'])) {
+        $data['wb_details'] = array_values(array_filter(
+            $data['wb_details'],
+            static function($detail) use ($wb1Configured, $wb2Configured) {
+                if (!is_array($detail)) return false;
+                $id = (int)($detail['id'] ?? 0);
+                if ($id === 1) return $wb1Configured;
+                if ($id === 2) return $wb2Configured;
+                return true;
+            }
+        ));
+    }
+
+    if (!$wb1Configured) {
+        $wb1Keys = [
+            'wb', 'wb_p1', 'wb_p2', 'wb_p3', 'wb_kva', 'wb_power_factor',
+            'wb_set_amp', 'wb_cap_amp', 'wb_status_amp',
+            'wb_offered_current_raw', 'wb_current_step_amp',
+            'wb_fractional_current_supported', 'wb_plug', 'wb_locked',
+            'wb_charging', 'wb_status_valid', 'wb_status_source',
+            'wb_status_reason', 'wb_runtime_manual_pause', 'wb_state_text',
+            'wb_state_reason', 'wb_source', 'wb_home_relation',
+            'wb_home_correction_source', 'wb_suppressed_power_w',
+            'wb_session_kwh', 'wb_daily_kwh', 'wb_daily_raw_kwh',
+            'wb_daily_base_kwh', 'wb_display_held', 'wb_chargemode',
+            'wb_chargepoint_name', 'wb_fault_text', 'wb_phases',
+            'wb_phases_actual', 'wb_phases_target', 'wb_can_switch_phases',
+            'wb_phase_switch_capability', 'wb_phase_switch_source',
+            'wb_api_surface', 'wb_control_status', 'wb_control_label',
+            'wb_control_detail', 'wb_control_level', 'wb_last_command_ok',
+            'wb_last_command_amp', 'wb_last_heartbeat_ok',
+            'wb_configured_role', 'wb_detected_role', 'wb_effective_role',
+            'wb_role_mismatch', 'wb_command_failure_count',
+            'wb_command_failure_limit', 'wb_command_blocked', 'wb_evse_a',
+            'wb_cp_id', 'wb_native_ip', 'wb_soc', 'wb_soc_source',
+            'wb_soc_source_ts', 'wb_soc_rule_confirmed', 'wb_range',
+            'wb_charged_range', 'wb_charge_profile_name',
+            'wb_charge_profile_source', 'wb_car_name', 'wb_car_id',
+            'wb_vehicle_id', 'wb_rfid_tag', 'wb_rfid_timestamp',
+            'wb_live_car_name', 'wb_live_car_id', 'wb_live_vehicle_id',
+            'wb_live_rfid_tag', 'wb_vehicle_identity_current',
+            'wb_stable_vehicle_identity_current', 'wb_display_car_name',
+            'wb_display_car_source', 'wb_pro_serial', 'wb_pro_temp_c',
+            'python_wb1_total_kwh', 'python_wb1_session_kwh',
+            'e_wb', 'e_wb_source', 'e_wb_source_priority',
+        ];
+        foreach ($wb1Keys as $key) unset($data[$key]);
+        $data['wb'] = 0.0;
+        $data['wb_configured'] = false;
+        $data['is_external_wb'] = false;
+        $data['connected'] = false;
+        $data['charging_active'] = false;
+        $data['detected_phases'] = 0;
+    }
+
+    if (!$wb2Configured) {
+        foreach (array_keys($data) as $key) {
+            if (
+                $key === 'wb2'
+                || (
+                    strpos($key, 'wb2_') === 0
+                    && !in_array($key, ['wb2_configured', 'wb2_native_type', 'wb2_manual_pause'], true)
+                )
+                || strpos($key, 'python_wb2_') === 0
+                || $key === 'e_wb2'
+                || strpos($key, 'e_wb2_') === 0
+            ) {
+                unset($data[$key]);
+            }
+        }
+        $data['wb2'] = 0.0;
+        $data['wb2_configured'] = false;
+        $data['is_external_wb2'] = false;
+    }
+
+    $activeWallboxId = (int)($data['active_wb_id'] ?? 0);
+    if (
+        ($activeWallboxId === 1 && !$wb1Configured)
+        || ($activeWallboxId === 2 && !$wb2Configured)
+    ) {
+        unset($data['active_wb_id'], $data['active_wb_phases']);
+    }
 }
 
 function getHeatpumpTypeConfig($cfg) {
@@ -2614,6 +3218,210 @@ function isHeatpumpEnabledConfig($cfg) {
             || (!array_key_exists('luxtronik', $cfg) && cfgHasAddress($cfg['dimplex_ip'] ?? ''));
     }
     return false;
+}
+
+/**
+ * Wandelt den Zeitstempel eines Live-Vertrags in Unix-Sekunden um.
+ * Unterstützt Unix-Sekunden, Unix-Millisekunden und ISO-Datumsangaben.
+ */
+function e3dcParsePayloadTimestamp($value) {
+    if ($value === null || $value === '') return null;
+
+    if (is_numeric($value)) {
+        $numeric = (float)$value;
+        if (!is_finite($numeric)) return null;
+        if (abs($numeric) >= 100000000000.0) {
+            $numeric /= 1000.0;
+        }
+        $timestamp = (int)floor($numeric);
+        return $timestamp > 0 ? $timestamp : null;
+    }
+
+    if (!is_string($value)) return null;
+    $text = trim($value);
+    if ($text === '') return null;
+    $timestamp = strtotime($text);
+    return ($timestamp !== false && $timestamp > 0) ? (int)$timestamp : null;
+}
+
+/**
+ * Wählt den jüngsten frischen, erfolgreichen Live-Vertrag des erwarteten
+ * Herstellers. Datei- und Payload-Alter müssen beide passen; dadurch macht
+ * ein frisch kopierter alter Vertrag keine veralteten Messwerte wieder gültig.
+ */
+function e3dcSelectFreshManufacturerPayload(
+    $candidateFiles,
+    $expectedManufacturer,
+    $maxAgeSeconds = 150,
+    $nowTs = null,
+    $maxFutureSkewSeconds = 30
+) {
+    $result = [
+        'status' => 'missing',
+        'payload' => null,
+        'path' => '',
+        'source' => '',
+        'age_s' => null,
+        'error' => 'Keine Kandidatendatei vorhanden',
+    ];
+    if (!is_array($candidateFiles)) {
+        $result['status'] = 'error';
+        $result['error'] = 'Kandidatendateien müssen als Liste übergeben werden';
+        return $result;
+    }
+
+    $manufacturerNeedle = strtolower(trim((string)$expectedManufacturer));
+    if ($manufacturerNeedle === '') {
+        $result['status'] = 'error';
+        $result['error'] = 'Erwarteter Hersteller fehlt';
+        return $result;
+    }
+
+    $now = ($nowTs === null) ? time() : (int)$nowTs;
+    if ($now <= 0) $now = time();
+    $maxAge = max(1, (int)$maxAgeSeconds);
+    $maxFutureSkew = max(0, (int)$maxFutureSkewSeconds);
+    $valid = [];
+    $failures = [];
+
+    foreach ($candidateFiles as $candidateFile) {
+        if (!is_string($candidateFile) || trim($candidateFile) === '' || !is_file($candidateFile)) {
+            continue;
+        }
+
+        $path = $candidateFile;
+        $name = basename($path);
+        $mtime = @filemtime($path);
+        if ($mtime === false || (int)$mtime <= 0) {
+            $failures[] = [
+                'status' => 'error',
+                'payload' => null,
+                'path' => $path,
+                'source' => '',
+                'age_s' => null,
+                'error' => $name . ': Änderungszeit konnte nicht gelesen werden',
+                '_sort_age_s' => PHP_INT_MAX,
+                '_mtime' => 0,
+            ];
+            continue;
+        }
+
+        $mtime = (int)$mtime;
+        $fileAge = max(0, $now - $mtime);
+        $raw = @file_get_contents($path);
+        $payload = ($raw === false || trim($raw) === '') ? null : @json_decode($raw, true);
+        if (!is_array($payload)) {
+            $failures[] = [
+                'status' => 'error',
+                'payload' => null,
+                'path' => $path,
+                'source' => '',
+                'age_s' => null,
+                'error' => $name . ' enthält kein gültiges JSON',
+                '_sort_age_s' => $fileAge,
+                '_mtime' => $mtime,
+            ];
+            continue;
+        }
+
+        $payloadTimestamp = e3dcParsePayloadTimestamp($payload['ts'] ?? null);
+        if ($payloadTimestamp === null) {
+            $failures[] = [
+                'status' => 'error',
+                'payload' => null,
+                'path' => $path,
+                'source' => '',
+                'age_s' => null,
+                'error' => $name . ': Payload-Zeitstempel fehlt oder ist ungültig',
+                '_sort_age_s' => $fileAge,
+                '_mtime' => $mtime,
+            ];
+            continue;
+        }
+
+        $payloadAge = max(0, $now - $payloadTimestamp);
+        $effectiveAge = max($fileAge, $payloadAge);
+        $payloadData = (isset($payload['data']) && is_array($payload['data']))
+            ? $payload['data']
+            : $payload;
+        $sourceParts = [
+            trim((string)($payload['source'] ?? '')),
+            trim((string)($payloadData['Quelle'] ?? '')),
+            trim((string)($payloadData['Hersteller'] ?? '')),
+        ];
+        $sourceLabel = '';
+        foreach ($sourceParts as $sourcePart) {
+            if ($sourcePart !== '') {
+                $sourceLabel = $sourcePart;
+                break;
+            }
+        }
+        $sourceIdentity = strtolower(trim(implode(' ', $sourceParts)));
+        $candidate = [
+            'status' => 'live',
+            'payload' => $payload,
+            'path' => $path,
+            'source' => $sourceLabel,
+            'age_s' => $effectiveAge,
+            'error' => '',
+            '_sort_age_s' => $effectiveAge,
+            '_mtime' => $mtime,
+        ];
+
+        if ($mtime > ($now + $maxFutureSkew) || $payloadTimestamp > ($now + $maxFutureSkew)) {
+            $candidate['status'] = 'future';
+            $candidate['payload'] = null;
+            $candidate['error'] = $name . ': Zeitstempel liegt unplausibel in der Zukunft';
+            $failures[] = $candidate;
+            continue;
+        }
+        if (($payload['success'] ?? null) !== true) {
+            $candidate['status'] = 'error';
+            $candidate['payload'] = null;
+            $payloadError = trim((string)($payload['error'] ?? ''));
+            $candidate['error'] = $name . ': ' . ($payloadError !== ''
+                ? $payloadError
+                : 'Live-Dienst meldet keinen erfolgreichen Abruf');
+            $failures[] = $candidate;
+            continue;
+        }
+        if ($sourceIdentity === '' || strpos($sourceIdentity, $manufacturerNeedle) === false) {
+            $candidate['status'] = 'invalid_source';
+            $candidate['payload'] = null;
+            $candidate['error'] = $name . ' ist keine bestätigte ' . $expectedManufacturer . '-Quelle';
+            $failures[] = $candidate;
+            continue;
+        }
+        if ($effectiveAge > $maxAge) {
+            $candidate['status'] = 'stale';
+            $candidate['payload'] = null;
+            $candidate['error'] = $name . ' ist wirksam ' . $effectiveAge . ' s alt';
+            $failures[] = $candidate;
+            continue;
+        }
+
+        $valid[] = $candidate;
+    }
+
+    $sortNewest = static function($left, $right) {
+        $ageOrder = ((int)$left['_sort_age_s']) <=> ((int)$right['_sort_age_s']);
+        if ($ageOrder !== 0) return $ageOrder;
+        return ((int)$right['_mtime']) <=> ((int)$left['_mtime']);
+    };
+    $stripInternal = static function($candidate) {
+        unset($candidate['_sort_age_s'], $candidate['_mtime']);
+        return $candidate;
+    };
+
+    if ($valid) {
+        usort($valid, $sortNewest);
+        return $stripInternal($valid[0]);
+    }
+    if ($failures) {
+        usort($failures, $sortNewest);
+        return $stripInternal($failures[0]);
+    }
+    return $result;
 }
 
 function hasFreshMqttHeatpumpInbound($cfg = null, $maxAgeSeconds = 180) {
@@ -2776,9 +3584,19 @@ function e3dcReadUpdatePolicy() {
 
 function e3dcDockerHostUpdateCommandText() {
     return implode("\n", [
-        'docker compose config --images',
-        'docker compose pull e3dc-control',
-        'docker compose up -d --force-recreate e3dc-control',
+        '(',
+        '  set -euo pipefail',
+        '  if [ -f ./docker_compose_update.py ]; then',
+        '    E3DC_DOCKER_HELPER=./docker_compose_update.py',
+        '  elif [ -f ./Installer/docker_compose_update.py ]; then',
+        '    E3DC_DOCKER_HELPER=./Installer/docker_compose_update.py',
+        '  else',
+        '    echo "docker_compose_update.py fehlt; zuerst den aktuellen Release-Verwaltungsbaum bereitstellen." >&2',
+        '    exit 2',
+        '  fi',
+        '  sudo python3 "$E3DC_DOCKER_HELPER" --compose-dir . --sudo',
+        '  sudo docker compose logs --tail=80 e3dc-control',
+        ')',
     ]);
 }
 
@@ -2792,18 +3610,23 @@ function e3dcDockerReleaseCommandText($tag) {
     $tag = e3dcNormalizeReleaseTag($tag);
     if (!$tag) return '';
     return implode("\n", [
+        '(',
+        'set -euo pipefail',
         'TAG=' . $tag,
         'cd "${E3DC_DOCKER_PATH:?E3DC_DOCKER_PATH auf den Compose-Pfad setzen}"',
-        'EXPECTED_IMAGE="ghcr.io/a9xxx/install-e3dc-control:$TAG"',
         'BACKUP="e3dc-data-$(date +%Y%m%d-%H%M%S).tgz"',
         'sudo docker compose exec -T e3dc-control tar czf - -C /var/www/html/data . > "$BACKUP"',
         'test -s "$BACKUP"',
-        'RESOLVED_IMAGE="$(sudo env E3DC_IMAGE_TAG="$TAG" docker compose config --images e3dc-control)"',
-        '[ "$RESOLVED_IMAGE" = "$EXPECTED_IMAGE" ]',
-        'sudo env E3DC_IMAGE_TAG="$TAG" docker compose pull e3dc-control',
-        'sudo env E3DC_IMAGE_TAG="$TAG" docker compose up -d --force-recreate e3dc-control',
-        'sudo docker compose ps',
-        'sudo docker logs --tail=80 e3dc-control',
+        'if [ -f ./docker_compose_update.py ]; then E3DC_DOCKER_HELPER=./docker_compose_update.py;',
+        'elif [ -f ./Installer/docker_compose_update.py ]; then E3DC_DOCKER_HELPER=./Installer/docker_compose_update.py;',
+        'else echo "docker_compose_update.py fehlt; aktuellen Release-Verwaltungsbaum bereitstellen." >&2; exit 2; fi',
+        'HELPER_ARGS=(--compose-dir . --sudo --image-tag "$TAG")',
+        'if [ "$TAG" = "v5.3.2b" ]; then',
+        '  HELPER_ARGS+=(--legacy-no-healthcheck-version 5.3.2b)',
+        'fi',
+        'sudo python3 "$E3DC_DOCKER_HELPER" "${HELPER_ARGS[@]}"',
+        'sudo docker compose logs --tail=80 e3dc-control',
+        ')',
         '# Für einen dauerhaften Pin E3DC_IMAGE_TAG=' . $tag . ' in einer vorhandenen .env ergänzen.',
     ]);
 }
@@ -2889,18 +3712,48 @@ function e3dcFindInstallerMainAndWrapper() {
     return null;
 }
 
+/**
+ * Der frühere gemeinsame sudo-Einstieg für Installer, Update, Reparatur und
+ * Rückfall ist zu breit. Er bleibt deaktiviert, bis ein eigener
+ * root-kontrollierter und aktionsgebundener Web-Launcher verfügbar ist.
+ */
+function e3dcPrivilegedInstallerWebActionsEnabled() {
+    return false;
+}
+
+function e3dcPrivilegedInstallerWebBlockMessage($operation) {
+    $label = trim((string)$operation);
+    if ($label === '') $label = 'Diese Aktion';
+    return $label . ' ist im Web aus Sicherheitsgründen deaktiviert. '
+         . 'Bitte bis zu einem eigenen engen Launcher eine administrative Konsole verwenden.';
+}
+
 function e3dcResolveGitObjectId($repoDir, $objectSpec) {
     $repoDir = (string)$repoDir;
     $objectSpec = (string)$objectSpec;
     if ($repoDir === '' || $objectSpec === '') return null;
-    $cmd = 'git -c ' . escapeshellarg('safe.directory=' . $repoDir)
-         . ' -C ' . escapeshellarg($repoDir)
-         . ' rev-parse --verify ' . escapeshellarg($objectSpec) . ' 2>/dev/null';
-    $lines = [];
-    $code = 1;
-    exec($cmd, $lines, $code);
-    $value = strtolower(trim(implode("\n", $lines)));
-    return ($code === 0 && preg_match('/^[0-9a-f]{40}$/', $value)) ? $value : null;
+    $git = '/usr/bin/git';
+    if (!is_file($git) || !is_executable($git)) return null;
+    $process = e3dcRunArgvProcess(
+        [
+            $git,
+            '-c',
+            'safe.directory=' . $repoDir,
+            '-C',
+            $repoDir,
+            'rev-parse',
+            '--verify',
+            $objectSpec,
+        ],
+        10.0,
+        ['max_output_bytes' => 4096]
+    );
+    $value = strtolower(trim((string)($process['stdout'] ?? '')));
+    return (!empty($process['success'])
+        && (int)($process['exit_code'] ?? 1) === 0
+        && preg_match('/^[0-9a-f]{40}$/', $value))
+        ? $value
+        : null;
 }
 
 function e3dcInspectInstallerWrapper($wrapper) {
@@ -2927,6 +3780,13 @@ function e3dcInspectInstallerWrapper($wrapper) {
     }
     $result['nlink'] = (int)($metadata['nlink'] ?? 0);
     $result['mode'] = (int)($metadata['mode'] ?? 0);
+    $result['dev'] = (int)($metadata['dev'] ?? -1);
+    $result['ino'] = (int)($metadata['ino'] ?? -1);
+    $result['uid'] = (int)($metadata['uid'] ?? -1);
+    $result['gid'] = (int)($metadata['gid'] ?? -1);
+    $result['size'] = (int)($metadata['size'] ?? -1);
+    $result['mtime'] = (int)($metadata['mtime'] ?? -1);
+    $result['ctime'] = (int)($metadata['ctime'] ?? -1);
     if (($result['mode'] & 0170000) !== 0100000) {
         $result['status'] = 'not_regular';
         $result['repairable'] = false;
@@ -2967,10 +3827,24 @@ function e3dcInspectInstallerWrapper($wrapper) {
     $openedAfter = @fstat($handle);
     @fclose($handle);
     if (!is_array($openedBefore) || !is_array($openedAfter)
+        || ($metadata['dev'] ?? null) !== ($openedBefore['dev'] ?? null)
+        || ($metadata['ino'] ?? null) !== ($openedBefore['ino'] ?? null)
+        || ($metadata['mode'] ?? null) !== ($openedBefore['mode'] ?? null)
+        || ($metadata['nlink'] ?? null) !== ($openedBefore['nlink'] ?? null)
+        || ($metadata['uid'] ?? null) !== ($openedBefore['uid'] ?? null)
+        || ($metadata['gid'] ?? null) !== ($openedBefore['gid'] ?? null)
+        || ($metadata['size'] ?? null) !== ($openedBefore['size'] ?? null)
+        || ($metadata['mtime'] ?? null) !== ($openedBefore['mtime'] ?? null)
+        || ($metadata['ctime'] ?? null) !== ($openedBefore['ctime'] ?? null)
+        || (($openedBefore['mode'] ?? 0) & 0170000) !== 0100000
         || ($openedBefore['dev'] ?? null) !== ($openedAfter['dev'] ?? null)
         || ($openedBefore['ino'] ?? null) !== ($openedAfter['ino'] ?? null)
+        || ($openedBefore['mode'] ?? null) !== ($openedAfter['mode'] ?? null)
+        || ($openedBefore['uid'] ?? null) !== ($openedAfter['uid'] ?? null)
+        || ($openedBefore['gid'] ?? null) !== ($openedAfter['gid'] ?? null)
         || ($openedBefore['size'] ?? null) !== ($openedAfter['size'] ?? null)
         || ($openedBefore['mtime'] ?? null) !== ($openedAfter['mtime'] ?? null)
+        || ($openedBefore['ctime'] ?? null) !== ($openedAfter['ctime'] ?? null)
         || (int)($openedBefore['nlink'] ?? 0) !== 1) {
         $result['status'] = 'read_drift';
         $result['repairable'] = false;
@@ -3007,6 +3881,113 @@ function e3dcInspectInstallerWrapper($wrapper) {
     $result['ok'] = true;
     $result['status'] = 'ok';
     $result['repairable'] = false;
+    return $result;
+}
+
+function e3dcInspectServiceWrapper($wrapper) {
+    $wrapper = (string)$wrapper;
+    $result = [
+        'ok' => false,
+        'path' => $wrapper,
+        'status' => 'missing',
+    ];
+    if ($wrapper === '' || is_link($wrapper)) {
+        if ($wrapper !== '' && is_link($wrapper)) $result['status'] = 'symlink';
+        return $result;
+    }
+
+    $paths = getInstallPaths();
+    if (empty($paths['valid']) || empty($paths['install_path']) || empty($paths['install_user'])) {
+        $result['status'] = 'install_context_unbound';
+        return $result;
+    }
+    $repoDir = rtrim((string)$paths['install_path'], '/');
+    $installerDir = $repoDir . '/Installer';
+    $expected = '/usr/local/sbin/e3dc-service-control';
+    if ($wrapper !== $expected
+        || realpath($repoDir) !== $repoDir
+        || realpath($installerDir) !== $installerDir
+        || realpath($wrapper) !== $wrapper
+        || is_link($repoDir)
+        || is_link($installerDir)) {
+        $result['status'] = 'unbound_path';
+        return $result;
+    }
+
+    if (!function_exists('posix_getpwnam') || !function_exists('posix_getgrnam')) {
+        $result['status'] = 'identity_unavailable';
+        return $result;
+    }
+    foreach (['/usr/local', '/usr/local/sbin'] as $directory) {
+        $directoryMeta = @lstat($directory);
+        if (!is_array($directoryMeta)
+            || (($directoryMeta['mode'] ?? 0) & 0170000) !== 0040000
+            || (int)($directoryMeta['uid'] ?? -1) !== 0
+            || (int)($directoryMeta['gid'] ?? -1) !== 0
+            || (((int)($directoryMeta['mode'] ?? 0)) & 0022) !== 0) {
+            $result['status'] = 'unsafe_path_permissions';
+            return $result;
+        }
+    }
+
+    clearstatcache(true, $wrapper);
+    $metadata = @lstat($wrapper);
+    if (!is_array($metadata)
+        || (($metadata['mode'] ?? 0) & 0170000) !== 0100000
+        || (int)($metadata['nlink'] ?? 0) !== 1) {
+        $result['status'] = 'unsafe_file_type';
+        return $result;
+    }
+    if ((int)($metadata['uid'] ?? -1) !== 0
+        || (int)($metadata['gid'] ?? -1) !== 0
+        || (((int)($metadata['mode'] ?? 0)) & 0777) !== 0755) {
+        $result['status'] = 'unsafe_file_permissions';
+        return $result;
+    }
+
+    $head = e3dcResolveGitObjectId($repoDir, 'HEAD^{commit}');
+    $blob = $head ? e3dcResolveGitObjectId($repoDir, $head . ':Installer/service_wrapper.sh') : null;
+    if ($head === null || $blob === null) {
+        $result['status'] = 'head_unbound';
+        return $result;
+    }
+
+    $handle = @fopen($wrapper, 'rb');
+    if ($handle === false) {
+        $result['status'] = 'not_readable';
+        return $result;
+    }
+    $openedBefore = @fstat($handle);
+    $actual = (string)@stream_get_contents($handle);
+    $openedAfter = @fstat($handle);
+    @fclose($handle);
+    $pathAfter = @lstat($wrapper);
+    foreach (['dev', 'ino', 'mode', 'nlink', 'uid', 'gid', 'size', 'mtime', 'ctime'] as $key) {
+        if (!is_array($openedBefore)
+            || !is_array($openedAfter)
+            || !is_array($pathAfter)
+            || ($metadata[$key] ?? null) !== ($openedBefore[$key] ?? null)
+            || ($openedBefore[$key] ?? null) !== ($openedAfter[$key] ?? null)
+            || ($openedAfter[$key] ?? null) !== ($pathAfter[$key] ?? null)) {
+            $result['status'] = 'read_drift';
+            return $result;
+        }
+    }
+
+    $actualBlob = sha1('blob ' . strlen($actual) . "\0" . $actual);
+    if (!hash_equals($blob, $actualBlob)
+        || substr($actual, 0, 12) !== "#!/bin/bash\n"
+        || strpos($actual, "\r") !== false) {
+        $result['status'] = 'content_drift';
+        return $result;
+    }
+
+    $result['ok'] = true;
+    $result['status'] = 'ok';
+    $result['head'] = $head;
+    $result['actual_sha256'] = hash('sha256', $actual);
+    $result['dev'] = (int)$metadata['dev'];
+    $result['ino'] = (int)$metadata['ino'];
     return $result;
 }
 
@@ -3067,15 +4048,15 @@ function handleReleaseRollback() {
     }
 
     if (isset($_GET['action']) && $_GET['action'] === 'run_release_rollback') {
-        requireWebAuth(true);
         header('Cache-Control: no-cache, no-store, must-revalidate');
         header('Content-Type: application/json');
 
-        $mode = $_GET['mode'] ?? 'start';
+        $mode = (string)($_GET['mode'] ?? $_POST['mode'] ?? '');
         $logFile = '/var/www/html/logs/release_rollback.log';
         $pidFile = '/var/www/html/tmp/release_rollback.pid';
 
         if ($mode === 'poll') {
+            requireWebAuth(true);
             $log = file_exists($logFile) ? (string)@file_get_contents($logFile) : 'Status: Warte auf Start...';
             $running = false;
             if (file_exists($pidFile)) {
@@ -3088,9 +4069,22 @@ function handleReleaseRollback() {
             echo json_encode(['running' => $running, 'log' => $log], $flags);
             exit;
         }
+        if ($mode !== 'start') {
+            http_response_code(400);
+            echo json_encode(['status' => 'error', 'message' => 'Ungültiger Rückfallmodus.']);
+            exit;
+        }
+        e3dcRequirePostMutation(true);
+        if (!e3dcPrivilegedInstallerWebActionsEnabled()) {
+            echo json_encode([
+                'status' => 'error',
+                'message' => e3dcPrivilegedInstallerWebBlockMessage('Release-Rückfall'),
+            ]);
+            exit;
+        }
 
-        $tag = e3dcNormalizeReleaseTag($_GET['tag'] ?? '');
-        $confirm = isset($_GET['confirm']) && $_GET['confirm'] === '1';
+        $tag = e3dcNormalizeReleaseTag($_POST['tag'] ?? '');
+        $confirm = isset($_POST['confirm']) && $_POST['confirm'] === '1';
         $options = e3dcBuildReleaseRollbackOptions();
         $allowed = false;
         foreach ($options['releases'] as $release) {
@@ -3146,8 +4140,8 @@ function handleReleaseRollback() {
         }
         $attempts[] = [
             'label' => 'installer_main.py direkt',
-            'preflight' => 'sudo -n /usr/bin/python3 ' . escapeshellarg($install['installer_main']) . ' --check',
-            'run' => 'sudo -n /usr/bin/python3 ' . escapeshellarg($install['installer_main']) . ' --install-release-tag ' . escapeshellarg($tag),
+            'preflight' => 'sudo -n /usr/bin/python3 -I -B -u ' . escapeshellarg($install['installer_main']) . ' --check',
+            'run' => 'sudo -n /usr/bin/python3 -I -B -u ' . escapeshellarg($install['installer_main']) . ' --install-release-tag ' . escapeshellarg($tag),
         ];
 
         $cmd = '';
@@ -3188,6 +4182,7 @@ function handleReleaseRollback() {
  */
 function handleUpdatePreparation() {
     if (isset($_GET['action']) && $_GET['action'] === 'prepare_update') {
+        e3dcRequirePostMutation(true);
         header('Content-Type: application/json');
         if (e3dcIsDockerEnvironment()) {
             echo json_encode([
@@ -3198,8 +4193,8 @@ function handleUpdatePreparation() {
             ]);
             exit;
         }
-        $force = isset($_GET['force']) && $_GET['force'] === 'true';
-        $discard = isset($_GET['discard']) && $_GET['discard'] === 'true';
+        $force = isset($_POST['force']) && $_POST['force'] === 'true';
+        $discard = isset($_POST['discard']) && $_POST['discard'] === 'true';
         $flagFile = '/var/www/html/ramdisk/e3dc_update_flags.json';
         file_put_contents($flagFile, json_encode(['force' => $force, 'discard' => $discard]));
         @chmod($flagFile, 0666);
@@ -3224,17 +4219,31 @@ function runInstallerWrapperUpdateCheck($repoDir) {
     }
 
     $wrapperOut = [];
-    $wrapperCmd = "timeout 25s sudo -n " . escapeshellarg($wrapper) . " update_check 2>&1";
+    $wrapperCmd = "timeout 25s " . escapeshellarg($wrapper) . " update_check 2>&1";
     exec($wrapperCmd, $wrapperOut, $wrapperRet);
     $wrapperText = trim(implode("\n", $wrapperOut));
     $jsonStart = strpos($wrapperText, '{');
     $decoded = $jsonStart === false ? null : json_decode(substr($wrapperText, $jsonStart), true);
     if ($wrapperRet === 0 && is_array($decoded) && array_key_exists('success', $decoded)) {
+        $headSha = strtolower(trim((string)($decoded['head_sha'] ?? '')));
+        $targetSha = strtolower(trim((string)($decoded['target_sha'] ?? '')));
+        $hasExactShaEvidence = (
+            preg_match('/^[0-9a-f]{40}$/', $headSha) === 1
+            && preg_match('/^[0-9a-f]{40}$/', $targetSha) === 1
+        );
+        $sameRelease = (
+            $hasExactShaEvidence
+            && ($decoded['same_release'] ?? null) === true
+            && hash_equals($headSha, $targetSha)
+        );
         return [
             'ok' => true,
             'result' => [
                 'success' => (bool)($decoded['success'] ?? false),
                 'missing' => (int)($decoded['missing'] ?? 0),
+                'same_release' => $sameRelease,
+                'head_sha' => $headSha,
+                'target_sha' => $targetSha,
                 'repo' => (string)($decoded['repo'] ?? $repoDir),
                 'upstream' => (string)($decoded['upstream'] ?? ''),
             ] + (
@@ -3261,6 +4270,7 @@ function runInstallerWrapperUpdateCheck($repoDir) {
  */
 function handleUpdateCheck() {
     if (isset($_GET['action']) && $_GET['action'] === 'check_update') {
+        e3dcRequirePostMutation(true);
         // Keine Browser-/Proxy-Caches: Update-Zahlen müssen live sein.
         header('Cache-Control: no-cache, no-store, must-revalidate');
         header('Pragma: no-cache');
@@ -3341,6 +4351,7 @@ function handleUpdateCheck() {
  */
 function handleSelfUpdateCheck() {
     if (isset($_GET['action']) && $_GET['action'] === 'check_self_update') {
+        e3dcRequirePostMutation(true);
         header('Cache-Control: no-cache, no-store, must-revalidate');
         header('Content-Type: application/json');
 
@@ -3373,9 +4384,8 @@ function handleSelfUpdateCheck() {
 
         $missing = 0;
 
-        // Git-Prüfung läuft auch für die Self-Update-Anzeige über den
-        // Installer-Wrapper. Direkte www-data->git-Sudo-Freigaben sind im
-        // Wrapper-only-Zielzustand nicht erlaubt.
+        // Git-Prüfung läuft unprivilegiert über die read-only Wrapper-Aktion.
+        // Dafür ist weder eine sudoers-Freigabe noch Root-Code erforderlich.
         if (is_dir($installDir . '/.git')) {
             $wrapperCheck = runInstallerWrapperUpdateCheck($installDir);
             if ($wrapperCheck['ok']) {
@@ -3400,13 +4410,34 @@ function handleSelfUpdateCheck() {
             // Fallback: Wenn kein Git, prüfen wir über Python Skript (Release-API Methode)
             $script = $installDir . '/Installer/self_update.py';
             if (file_exists($script)) {
-                $cmd = "sudo -n /usr/bin/python3 " . escapeshellarg($script) . " --silent --check 2>&1";
+                $cmd = "/usr/bin/python3 " . escapeshellarg($script) . " --silent --check 2>&1";
                 exec($cmd, $out, $ret);
                 $output = implode("\n", $out);
+                if ($ret !== 0) {
+                    $res = [
+                        'success' => false,
+                        'missing' => 0,
+                        'error' => 'Unprivilegierte Update-Prüfung fehlgeschlagen: ' . trim($output),
+                    ];
+                    file_put_contents($cacheFile, json_encode($res));
+                    @chmod($cacheFile, 0666);
+                    echo json_encode($res);
+                    exit;
+                }
                 // Wenn die API NICHT sagt "ist aktuell" und auch kein Netzwerkfehler vorliegt, setzen wir 1 Update als fällig an
                 if (strpos($output, 'aktuell') === false && strpos($output, 'Netzwerkfehler') === false && strpos($output, 'Fehler') === false) {
                     $missing = 1;
                 }
+            } else {
+                $res = [
+                    'success' => false,
+                    'missing' => 0,
+                    'error' => 'Unprivilegierte Update-Prüfung ist nicht verfügbar: self_update.py fehlt.',
+                ];
+                file_put_contents($cacheFile, json_encode($res));
+                @chmod($cacheFile, 0666);
+                echo json_encode($res);
+                exit;
             }
         }
 
@@ -3423,7 +4454,8 @@ function handleSelfUpdateCheck() {
  */
 function e3dcSelfUpdateLogHasCanonicalSuccess($log) {
     return preg_match(
-        '/(?:^|\R)\[OK\]\s+self-update auf [0-9a-f]{40} abgeschlossen\.\s*(?:\R|$)/i',
+        '/(?:^|\R)\[OK\]\s+(?:self-update auf [0-9a-f]{40} abgeschlossen\.|'
+        . 'Du bist auf dem neuesten Stand: [0-9a-f]{40}\.)\s*(?:\R|$)/i',
         (string)$log
     ) === 1;
 }
@@ -3432,6 +4464,7 @@ function e3dcSelfUpdateLogHasTerminalFailure($log) {
     return preg_match(
         '/traceback|exception|critical|fatal|permission denied|'
         . '\[!\]\s+self-update fehlgeschlagen|self-update fehlgeschlagen:|'
+        . 'REPAIR_REQUIRED|'
         . 'web-update kann nicht starten|konnte update-prozess nicht starten/i',
         (string)$log
     ) === 1;
@@ -3510,7 +4543,7 @@ function handleRunSelfUpdate() {
     }
 
     if (isset($_GET['action']) && $_GET['action'] === 'run_self_update') {
-        requireWebAuth(true);
+        e3dcRequirePostMutation(true);
         header('Content-Type: application/json');
 
         if (e3dcIsDockerEnvironment()) {
@@ -3522,7 +4555,24 @@ function handleRunSelfUpdate() {
             ]);
             exit;
         }
-
+        $reinstallRaw = isset($_POST['reinstall']) ? (string)$_POST['reinstall'] : '0';
+        if (!in_array($reinstallRaw, ['0', '1'], true)) {
+            echo json_encode([
+                'success' => false,
+                'message' => 'Ungültige Neuinstallationsabsicht.',
+            ]);
+            exit;
+        }
+        $reinstallCurrent = ($reinstallRaw === '1');
+        if (!e3dcPrivilegedInstallerWebActionsEnabled()) {
+            echo json_encode([
+                'success' => false,
+                'message' => e3dcPrivilegedInstallerWebBlockMessage(
+                    $reinstallCurrent ? 'Neuinstallation' : 'Self-Update'
+                ),
+            ]);
+            exit;
+        }
         $paths = getInstallPaths();
         if (empty($paths['valid'])) {
             echo json_encode(['success' => false, 'message' => $paths['error'] ?? 'Installationskontext fehlt.']);
@@ -3574,19 +4624,21 @@ function handleRunSelfUpdate() {
         // besitzen. Beide Pfade werden non-interaktiv getestet.
         $installerWrapper = $baseDir . '/Installer/installer_wrapper.sh';
         $wrapperInspection = e3dcInspectInstallerWrapper($installerWrapper);
+        $wrapperAction = $reinstallCurrent ? 'reinstall_current' : 'update_e3dc';
+        $directAction = $reinstallCurrent ? ' --reinstall-current' : ' --update-e3dc';
         $sudoAttempts = [];
         if (basename($script) === 'installer_main.py' && !empty($wrapperInspection['ok'])) {
             $sudoAttempts[] = [
                 'label' => 'installer_wrapper.sh',
                 'preflight' => "sudo -n " . escapeshellarg($installerWrapper) . " check",
-                'run' => "sudo -n " . escapeshellarg($installerWrapper) . " update_e3dc",
+                'run' => "sudo -n " . escapeshellarg($installerWrapper) . " " . $wrapperAction,
             ];
         }
-        $legacyRunArgs = (basename($script) === 'installer_main.py') ? " --update-e3dc" : " --silent";
+        $legacyRunArgs = (basename($script) === 'installer_main.py') ? $directAction : " --silent";
         $sudoAttempts[] = [
             'label' => 'installer_main.py direkt',
-            'preflight' => "sudo -n /usr/bin/python3 " . escapeshellarg($script) . " --check",
-            'run' => "sudo -n /usr/bin/python3 " . escapeshellarg($script) . $legacyRunArgs,
+            'preflight' => "sudo -n /usr/bin/python3 -I -B -u " . escapeshellarg($script) . " --check",
+            'run' => "sudo -n /usr/bin/python3 -I -B -u " . escapeshellarg($script) . $legacyRunArgs,
         ];
 
         $selectedRunCmd = null;
@@ -3603,7 +4655,9 @@ function handleRunSelfUpdate() {
             $preflightOut[] = implode("\n", $attemptOut);
         }
         if ($selectedRunCmd === null) {
-            $consoleCmd = "cd " . escapeshellarg($baseDir) . " && sudo python3 installer_main.py --update-e3dc";
+            $consoleCmd = "cd " . escapeshellarg($baseDir)
+                . " && sudo /usr/bin/python3 -I -B -u installer_main.py"
+                . $directAction;
             $msg = e3dcInstallerPrivilegeFailureMessage('Web-Update', $baseDir, $wrapperInspection, $preflightOut);
             if (!empty($wrapperInspection['ok']) || !empty($wrapperInspection['repairable'])) {
                 $msg .= "\n" . $consoleCmd;
@@ -3637,28 +4691,39 @@ function handleRunSelfUpdate() {
 /**
  * Führt den Neustart des E3DC-Services aus.
  */
-function e3dcSystemdServiceStatus($service) {
+function e3dcSystemdServiceProperty($property, $service) {
+    $property = trim((string)$property);
     $service = trim((string)$service);
-    if ($service === '' || !preg_match('/^[A-Za-z0-9_.@-]+$/', $service)) {
-        return 'unknown';
+    if (!in_array($property, ['is-active', 'is-enabled'], true)
+        || $service === ''
+        || !preg_match('/^[A-Za-z0-9_.@-]+$/', $service)) {
+        return '';
     }
-    $out = [];
-    $ret = 1;
-    exec('systemctl is-active ' . escapeshellarg($service) . ' 2>/dev/null', $out, $ret);
-    $status = trim(implode("\n", $out));
-    if ($status !== '') {
-        return $status;
+    if (!str_ends_with($service, '.service')) {
+        $service .= '.service';
     }
-    return $ret === 0 ? 'active' : 'inactive';
+    $systemctl = '/usr/bin/systemctl';
+    if (!is_file($systemctl) || !is_executable($systemctl)) {
+        return '';
+    }
+    $process = e3dcRunArgvProcess(
+        [$systemctl, $property, '--', $service],
+        10.0,
+        ['max_output_bytes' => 8192]
+    );
+    return trim((string)($process['stdout'] ?? ''));
+}
+
+function e3dcSystemdServiceStatus($service) {
+    $status = e3dcSystemdServiceProperty('is-active', $service);
+    return $status !== '' ? $status : 'unknown';
 }
 
 function e3dcFindServiceWrapper() {
-    $paths = getInstallPaths();
-    if (empty($paths['valid'])) return null;
-    $installPath = rtrim($paths['install_path'], '/');
-    $wrapperCandidates = [$installPath . '/Installer/service_wrapper.sh'];
+    $wrapperCandidates = ['/usr/local/sbin/e3dc-service-control'];
     foreach ($wrapperCandidates as $candidate) {
-        if ($candidate && file_exists($candidate)) {
+        $inspection = e3dcInspectServiceWrapper($candidate);
+        if (!empty($inspection['ok'])) {
             return $candidate;
         }
     }
@@ -3686,18 +4751,13 @@ function e3dcRunServiceWrapperAction($action, array $services) {
         ];
     }
 
-    $sudo = null;
-    foreach (['/usr/bin/sudo', '/bin/sudo'] as $candidate) {
-        if (is_file($candidate) && is_executable($candidate)) {
-            $sudo = $candidate;
-            break;
-        }
-    }
-    if ($sudo === null) {
+    $sudo = '/usr/bin/sudo';
+    if (!is_file($sudo) || !is_executable($sudo)) {
         return [
             'success' => false,
             'changed' => [],
             'ignored' => [],
+            'output' => '',
             'errors' => ['sudo ist für den Service-Wrapper nicht verfügbar.'],
         ];
     }
@@ -3705,11 +4765,15 @@ function e3dcRunServiceWrapperAction($action, array $services) {
     $changed = [];
     $ignored = [];
     $errors = [];
+    $output = [];
     foreach ($services as $service) {
         $service = trim((string)$service);
         if ($service === '' || !preg_match('/^[A-Za-z0-9_.@-]+$/', $service)) {
-            $errors[] = 'Unzulaessiger Dienstname: ' . $service;
+            $errors[] = 'Unzulässiger Dienstname: ' . $service;
             continue;
+        }
+        if (!str_ends_with($service, '.service')) {
+            $service .= '.service';
         }
         $process = e3dcRunArgvProcess(
             [$sudo, '-n', $serviceWrapper, $action, $service],
@@ -3718,6 +4782,9 @@ function e3dcRunServiceWrapperAction($action, array $services) {
         );
         $code = (int)($process['exit_code'] ?? 1);
         $text = trim((string)($process['stdout'] ?? '') . "\n" . (string)($process['stderr'] ?? ''));
+        if ($text !== '') {
+            $output[] = $service . ': ' . $text;
+        }
         $isMissing = preg_match('/not found|not loaded|could not be found|does not exist|nicht gefunden|ist nicht geladen|Unit .* not found/i', $text);
         if (!empty($process['success']) && $code === 0) {
             $changed[] = $service;
@@ -3735,14 +4802,503 @@ function e3dcRunServiceWrapperAction($action, array $services) {
         'success' => empty($errors),
         'changed' => $changed,
         'ignored' => $ignored,
+        'output' => implode("\n", $output),
         'errors' => $errors,
     ];
+}
+
+/**
+ * Prüft ausschließlich, ob die fest gebundene Prognosediagnose-Unit vorhanden ist.
+ */
+function e3dcForecastEvidenceUnitExists() {
+    $unit = 'e3dc-forecast-evidence.service';
+    foreach (['/etc/systemd/system', '/lib/systemd/system', '/usr/lib/systemd/system'] as $base) {
+        if (is_file($base . '/' . $unit)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * Liefert den beweisbaren persistenten und aktuellen Zustand der Prognosediagnose.
+ *
+ * Andere systemd-Zustände als enabled/disabled und active/inactive werden nicht
+ * geschätzt. Insbesondere masked, failed, activating oder leere Antworten führen
+ * zu einem geschlossenen Vertrag.
+ */
+function e3dcForecastEvidenceServiceState() {
+    $unit = 'e3dc-forecast-evidence.service';
+    $exists = e3dcForecastEvidenceUnitExists();
+    $activeRaw = e3dcSystemdServiceProperty('is-active', $unit);
+    $enabledRaw = e3dcSystemdServiceProperty('is-enabled', $unit);
+    $activeValid = in_array($activeRaw, ['active', 'inactive'], true);
+    $enabledValid = in_array($enabledRaw, ['enabled', 'disabled'], true);
+    return [
+        'unit' => $unit,
+        'exists' => $exists,
+        'valid' => $exists && $activeValid && $enabledValid,
+        'active' => $activeRaw === 'active',
+        'enabled' => $enabledRaw === 'enabled',
+        'active_raw' => $activeRaw !== '' ? $activeRaw : 'unknown',
+        'enabled_raw' => $enabledRaw !== '' ? $enabledRaw : 'unknown',
+    ];
+}
+
+function e3dcForecastEvidenceStateIsProven($state) {
+    return is_array($state)
+        && ($state['exists'] ?? null) === true
+        && ($state['valid'] ?? null) === true
+        && array_key_exists('active', $state)
+        && is_bool($state['active'])
+        && array_key_exists('enabled', $state)
+        && is_bool($state['enabled']);
+}
+
+/**
+ * Führt genau eine der vier für den festen Dienst nötigen Zustandsänderungen aus
+ * und beweist den erwarteten Nachzustand. Die Callbacks dienen nur der testbaren
+ * Transaktionslogik; das öffentliche Eintrittstor bindet immer dieselbe Unit.
+ */
+function e3dcForecastEvidenceApplyVerifiedAction(
+    $action,
+    callable $readState,
+    callable $applyAction,
+    $stabilityCheck = null
+) {
+    $expectations = [
+        'enable' => ['enabled', true],
+        'disable' => ['enabled', false],
+        'start' => ['active', true],
+        'stop' => ['active', false],
+    ];
+    if (!isset($expectations[$action])) {
+        return [
+            'ok' => false,
+            'action' => (string)$action,
+            'wrapper_success' => false,
+            'state_proven' => false,
+            'verified' => false,
+            'state_after' => [],
+            'errors' => ['Unzulässige Prognosediagnose-Dienstaktion.'],
+        ];
+    }
+
+    try {
+        $wrapper = $applyAction($action);
+    } catch (Throwable $exc) {
+        $wrapper = [
+            'success' => false,
+            'errors' => ['Ausnahme bei Dienstaktion: ' . $exc->getMessage()],
+        ];
+    }
+    if (!is_array($wrapper)) {
+        $wrapper = ['success' => false, 'errors' => ['Ungültige Wrapper-Antwort.']];
+    }
+
+    try {
+        $after = $readState();
+    } catch (Throwable $exc) {
+        $after = [
+            'exists' => false,
+            'valid' => false,
+            'active' => false,
+            'enabled' => false,
+            'active_raw' => 'unknown',
+            'enabled_raw' => 'unknown',
+        ];
+    }
+    $stateProven = e3dcForecastEvidenceStateIsProven($after);
+    [$expectedKey, $expectedValue] = $expectations[$action];
+    $verified = $stateProven && ($after[$expectedKey] === $expectedValue);
+    $wrapperReportedSuccess = ($wrapper['success'] ?? null) === true;
+    $changed = array_values(array_map('strval', (array)($wrapper['changed'] ?? [])));
+    $changedProven = in_array('e3dc-forecast-evidence.service', $changed, true);
+    $stability = null;
+    if ($action === 'start'
+        && $wrapperReportedSuccess
+        && $changedProven
+        && $verified
+        && is_callable($stabilityCheck)
+    ) {
+        try {
+            $stability = $stabilityCheck();
+        } catch (Throwable $exc) {
+            $stability = [
+                'success' => false,
+                'state' => [],
+                'observations' => [],
+                'error' => $exc->getMessage(),
+            ];
+        }
+        if (!is_array($stability)) {
+            $stability = ['success' => false, 'state' => [], 'observations' => []];
+        }
+        $stableState = is_array($stability['state'] ?? null) ? $stability['state'] : [];
+        $after = $stableState;
+        $stateProven = e3dcForecastEvidenceStateIsProven($after);
+        $verified = ($stability['success'] ?? null) === true
+            && $stateProven
+            && $after['active'] === true;
+    }
+    $wrapperSuccess = $wrapperReportedSuccess && $changedProven;
+    return [
+        'ok' => $wrapperSuccess && $verified,
+        'action' => $action,
+        'wrapper_success' => $wrapperSuccess,
+        'wrapper_reported_success' => $wrapperReportedSuccess,
+        'changed_proven' => $changedProven,
+        'state_proven' => $stateProven,
+        'verified' => $verified,
+        'state_after' => is_array($after) ? $after : [],
+        'stability' => $stability,
+        'output' => (string)($wrapper['output'] ?? ''),
+        'errors' => array_values(array_map('strval', (array)($wrapper['errors'] ?? []))),
+    ];
+}
+
+/**
+ * Beweist nach einem Start über mehrere Beobachtungen, dass die Unit nicht nur
+ * kurz aktiv wird und anschließend in den Restart-Backoff fällt.
+ */
+function e3dcForecastEvidenceConfirmStableActiveState() {
+    $observations = [];
+    $last = [];
+    for ($index = 0; $index < 4; $index++) {
+        if ($index > 0) {
+            usleep(1000000);
+        }
+        $last = e3dcForecastEvidenceServiceState();
+        $observations[] = $last;
+        if (!e3dcForecastEvidenceStateIsProven($last) || $last['active'] !== true) {
+            return [
+                'success' => false,
+                'state' => $last,
+                'observations' => $observations,
+            ];
+        }
+    }
+    return [
+        'success' => true,
+        'state' => $last,
+        'observations' => $observations,
+    ];
+}
+
+/**
+ * Aktiviert und startet die Prognosediagnose transaktional.
+ *
+ * Scheitert ein Schritt oder seine Nachprüfung, wird der exakt bewiesene
+ * enabled/active-Vorzustand wiederhergestellt. Kann der Zustand nicht bewiesen
+ * werden, bleibt die Funktion fail-closed.
+ */
+function e3dcForecastEvidenceActivationTransaction(
+    callable $readState,
+    callable $applyAction,
+    $stabilityCheck = null
+) {
+    $safeRead = function () use ($readState) {
+        try {
+            $state = $readState();
+            return is_array($state) ? $state : [];
+        } catch (Throwable $exc) {
+            return [];
+        }
+    };
+
+    $before = $safeRead();
+    $result = [
+        'success' => false,
+        'noop' => false,
+        'message' => '',
+        'error_code' => '',
+        'state_before' => $before,
+        'steps' => [],
+        'state_after' => $before,
+        'rollback' => [
+            'attempted' => false,
+            'success' => false,
+            'steps' => [],
+        ],
+    ];
+    if (!e3dcForecastEvidenceStateIsProven($before)) {
+        $result['error_code'] = 'forecast_evidence_state_unproven';
+        $result['message'] = 'Der Zustand der PV-Prognosediagnose ist nicht eindeutig beweisbar; es wurde nichts geändert.';
+        return $result;
+    }
+
+    if ($before['enabled'] === true && $before['active'] === true) {
+        $result['success'] = true;
+        $result['noop'] = true;
+        $result['message'] = 'Die PV-Prognosediagnose ist bereits dauerhaft aktiviert und läuft.';
+        $result['rollback']['success'] = true;
+        return $result;
+    }
+
+    $current = $before;
+    $failedStep = null;
+    if ($current['enabled'] !== true) {
+        $step = e3dcForecastEvidenceApplyVerifiedAction(
+            'enable',
+            $readState,
+            $applyAction,
+            $stabilityCheck
+        );
+        $result['steps'][] = $step;
+        $current = $step['state_after'];
+        if (empty($step['ok'])) {
+            $failedStep = $step;
+        }
+    }
+    if ($failedStep === null && ($current['active'] ?? null) !== true) {
+        $step = e3dcForecastEvidenceApplyVerifiedAction(
+            'start',
+            $readState,
+            $applyAction,
+            $stabilityCheck
+        );
+        $result['steps'][] = $step;
+        $current = $step['state_after'];
+        if (empty($step['ok'])) {
+            $failedStep = $step;
+        }
+    }
+
+    if ($failedStep === null
+        && e3dcForecastEvidenceStateIsProven($current)
+        && $current['enabled'] === true
+        && $current['active'] === true
+    ) {
+        $result['success'] = true;
+        $result['message'] = 'Die PV-Prognosediagnose wurde dauerhaft aktiviert und gestartet.';
+        $result['state_after'] = $current;
+        $result['rollback']['success'] = true;
+        return $result;
+    }
+
+    if ($failedStep === null) {
+        $failedStep = [
+            'action' => 'verify',
+            'wrapper_success' => true,
+            'state_proven' => e3dcForecastEvidenceStateIsProven($current),
+            'verified' => false,
+            'state_after' => $current,
+            'errors' => ['Der Zielzustand enabled und active wurde nicht erreicht.'],
+        ];
+    }
+    $result['error_code'] = !empty($failedStep['wrapper_success'])
+        ? 'forecast_evidence_activation_verification_failed'
+        : 'forecast_evidence_activation_step_failed';
+    $result['failure'] = $failedStep;
+    $result['rollback']['attempted'] = true;
+
+    $rollbackState = $safeRead();
+    $rollbackActiveRaw = (string)($rollbackState['active_raw'] ?? 'unknown');
+    $activeStatesRequiringStop = ['active', 'failed', 'activating', 'deactivating', 'reloading'];
+    $needsStop = false;
+    if (($before['active_raw'] ?? '') === 'inactive') {
+        $needsStop = in_array($rollbackActiveRaw, $activeStatesRequiringStop, true);
+    } elseif (($before['active_raw'] ?? '') === 'active') {
+        $needsStop = in_array(
+            $rollbackActiveRaw,
+            ['failed', 'activating', 'deactivating', 'reloading'],
+            true
+        );
+    }
+    if ($needsStop) {
+        $rollbackStep = e3dcForecastEvidenceApplyVerifiedAction(
+            'stop',
+            $readState,
+            $applyAction,
+            $stabilityCheck
+        );
+        $result['rollback']['steps'][] = $rollbackStep;
+        $rollbackState = $rollbackStep['state_after'];
+    }
+
+    $rollbackEnabledRaw = (string)($rollbackState['enabled_raw'] ?? 'unknown');
+    if (in_array($rollbackEnabledRaw, ['enabled', 'disabled'], true)
+        && $rollbackEnabledRaw !== ($before['enabled_raw'] ?? '')
+    ) {
+        $rollbackAction = ($before['enabled_raw'] ?? '') === 'enabled'
+            ? 'enable'
+            : 'disable';
+        $rollbackStep = e3dcForecastEvidenceApplyVerifiedAction(
+            $rollbackAction,
+            $readState,
+            $applyAction,
+            $stabilityCheck
+        );
+        $result['rollback']['steps'][] = $rollbackStep;
+        $rollbackState = $rollbackStep['state_after'];
+    }
+
+    $rollbackActiveRaw = (string)($rollbackState['active_raw'] ?? 'unknown');
+    if (($before['active_raw'] ?? '') === 'active' && $rollbackActiveRaw === 'inactive') {
+        $rollbackStep = e3dcForecastEvidenceApplyVerifiedAction(
+            'start',
+            $readState,
+            $applyAction,
+            $stabilityCheck
+        );
+        $result['rollback']['steps'][] = $rollbackStep;
+        $rollbackState = $rollbackStep['state_after'];
+    }
+
+    $finalState = $safeRead();
+    $rollbackOk = e3dcForecastEvidenceStateIsProven($finalState)
+        && ($finalState['enabled_raw'] ?? '') === ($before['enabled_raw'] ?? '')
+        && ($finalState['active_raw'] ?? '') === ($before['active_raw'] ?? '');
+    $result['rollback']['success'] = $rollbackOk;
+    $result['state_after'] = $finalState;
+    if ($rollbackOk) {
+        $result['message'] = 'Die Aktivierung ist fehlgeschlagen; der vorherige Dienstzustand wurde wiederhergestellt.';
+    } else {
+        $result['error_code'] = 'forecast_evidence_rollback_failed';
+        $result['message'] = 'Die Aktivierung und die Wiederherstellung des vorherigen Dienstzustands sind fehlgeschlagen. Bitte den Dienst administrativ prüfen.';
+    }
+    return $result;
+}
+
+/**
+ * Enges öffentliches Eintrittstor: kein freier Dienstname, keine freie Aktion.
+ */
+function e3dcActivateForecastEvidenceService() {
+    $unit = 'e3dc-forecast-evidence.service';
+    $baseFailure = function ($code, $message) use ($unit) {
+        return [
+            'success' => false,
+            'noop' => false,
+            'service' => $unit,
+            'error_code' => $code,
+            'error' => $message,
+            'message' => $message,
+            'status' => 'unknown',
+            'active' => false,
+            'enabled' => false,
+            'enabled_known' => false,
+            'state_before' => [],
+            'steps' => [],
+            'state_after' => [],
+            'rollback' => ['attempted' => false, 'success' => false, 'steps' => []],
+        ];
+    };
+
+    if (e3dcIsDockerEnvironment()) {
+        return $baseFailure(
+            'forecast_evidence_docker_blocked',
+            'Im Docker-Betrieb wird die Prognosediagnose ausschließlich über den Containerstart aktiviert.'
+        );
+    }
+    if (!e3dcForecastEvidenceUnitExists()) {
+        return $baseFailure(
+            'unit_missing',
+            'Die Service-Datei der PV-Prognosediagnose fehlt; es wurde nichts installiert oder geändert.'
+        );
+    }
+    if (!e3dcFindServiceWrapper()) {
+        return $baseFailure(
+            'service_wrapper_unavailable',
+            'Der geprüfte Service-Wrapper ist nicht verfügbar; es wurde nichts geändert.'
+        );
+    }
+
+    $lockPath = '/var/www/html/ramdisk/.forecast_evidence_activation.lock';
+    $lock = @fopen($lockPath, 'c');
+    $lockStat = is_resource($lock) ? @fstat($lock) : false;
+    $lockPathStat = @lstat($lockPath);
+    $lockIsRegular = is_array($lockStat)
+        && (($lockStat['mode'] & 0170000) === 0100000)
+        && (int)($lockStat['nlink'] ?? 0) === 1;
+    $lockPathMatches = is_array($lockStat)
+        && is_array($lockPathStat)
+        && (int)($lockStat['dev'] ?? -1) === (int)($lockPathStat['dev'] ?? -2)
+        && (int)($lockStat['ino'] ?? -1) === (int)($lockPathStat['ino'] ?? -2);
+    if ($lock === false || !$lockIsRegular || !$lockPathMatches) {
+        if (is_resource($lock)) {
+            @fclose($lock);
+        }
+        return $baseFailure(
+            'forecast_evidence_activation_lock_invalid',
+            'Die feste Sperrdatei der PV-Prognosediagnose ist nicht sicher verwendbar; es wurde nichts geändert.'
+        );
+    }
+    if (!@flock($lock, LOCK_EX | LOCK_NB)) {
+        @fclose($lock);
+        return $baseFailure(
+            'forecast_evidence_activation_locked',
+            'Eine andere Aktivierung der PV-Prognosediagnose läuft bereits.'
+        );
+    }
+
+    try {
+        $result = e3dcForecastEvidenceActivationTransaction(
+            function () {
+                return e3dcForecastEvidenceServiceState();
+            },
+            function ($action) use ($unit) {
+                return e3dcRunServiceWrapperAction($action, [$unit]);
+            },
+            function () {
+                return e3dcForecastEvidenceConfirmStableActiveState();
+            }
+        );
+    } finally {
+        @flock($lock, LOCK_UN);
+        @fclose($lock);
+    }
+
+    $result['service'] = $unit;
+    $after = is_array($result['state_after'] ?? null) ? $result['state_after'] : [];
+    $result['status'] = (string)($after['active_raw'] ?? 'unknown');
+    $result['active'] = ($after['active'] ?? null) === true;
+    $result['enabled'] = ($after['enabled'] ?? null) === true;
+    $result['enabled_known'] = in_array(
+        (string)($after['enabled_raw'] ?? ''),
+        ['enabled', 'disabled'],
+        true
+    );
+    if (empty($result['success'])) {
+        $result['error'] = (string)($result['message'] ?? 'Aktivierung fehlgeschlagen.');
+    }
+    $output = [];
+    foreach (array_merge(
+        (array)($result['steps'] ?? []),
+        (array)($result['rollback']['steps'] ?? [])
+    ) as $step) {
+        $text = trim((string)($step['output'] ?? ''));
+        if ($text !== '') {
+            $output[] = (string)($step['action'] ?? 'Aktion') . ': ' . $text;
+        }
+    }
+    $result['output'] = implode("\n", $output);
+    return $result;
 }
 
 function handleServiceRestart() {
     if (isset($_GET['action']) && $_GET['action'] === 'restart_service') {
         requireWebAuth(true);
         header('Content-Type: application/json');
+        if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'POST') {
+            http_response_code(405);
+            echo json_encode(['success' => false, 'message' => 'Dienstneustart ist nur per POST erlaubt.']);
+            exit;
+        }
+        e3dcRequireCsrfToken(true);
+
+        $serviceWrapper = null;
+        if (!file_exists('/.dockerenv')) {
+            // Vor jeder Zustandsänderung an Release-Root, Owner, Mode, Inode
+            // und Git-HEAD binden.
+            $serviceWrapper = e3dcFindServiceWrapper();
+            if (!$serviceWrapper) {
+                echo json_encode([
+                    'success' => false,
+                    'message' => 'Service-Wrapper nicht gefunden. Bitte Rechte-Reparatur ausführen.'
+                ]);
+                exit;
+            }
+        }
 
         // RAM-Disk Variablen und Speicher-Flags vor Neustart löschen (Notfall-Reset)
         $flags = [
@@ -3755,21 +5311,161 @@ function handleServiceRestart() {
         foreach($flags as $f) { if (file_exists($f)) @unlink($f); }
 
         if (file_exists('/.dockerenv')) {
-            file_put_contents('/var/www/html/ramdisk/restart_container.flag', '1');
-            @chmod('/var/www/html/ramdisk/restart_container.flag', 0666);
-            echo json_encode(['success' => true, 'message' => 'Docker-Container wird im Hintergrund neu gestartet.']);
-        } else {
-            // service_wrapper.sh wird ausschließlich über den validierten Release-Root aufgelöst.
-            $serviceWrapper = e3dcFindServiceWrapper();
-
-            if (!$serviceWrapper) {
+            $restartFlag = '/var/www/html/ramdisk/restart_container.flag';
+            $existingFlag = @lstat($restartFlag);
+            if ($existingFlag !== false) {
+                $existingType = ((int)$existingFlag['mode']) & 0170000;
+                $existingSafe = (
+                    $existingType !== 0100000
+                    ? false
+                    : (
+                        (int)($existingFlag['nlink'] ?? 0) === 1
+                        && (int)($existingFlag['size'] ?? -1) === 2
+                        && ((((int)$existingFlag['mode']) & 0777) === 0660)
+                    )
+                );
+                $existingPayload = false;
+                $openedExisting = false;
+                if ($existingSafe) {
+                    $existingHandle = @fopen($restartFlag, 'rb');
+                    if (is_resource($existingHandle)) {
+                        $existingPayload = @fread($existingHandle, 3);
+                        $openedExisting = @fstat($existingHandle);
+                        @fclose($existingHandle);
+                    }
+                    @clearstatcache(true, $restartFlag);
+                    $existingAfterRead = @lstat($restartFlag);
+                    $existingSafe = (
+                        $existingPayload === "1\n"
+                        && is_array($openedExisting)
+                        && is_array($existingAfterRead)
+                        && (int)($openedExisting['dev'] ?? -1) === (int)($existingFlag['dev'] ?? -2)
+                        && (int)($openedExisting['ino'] ?? -1) === (int)($existingFlag['ino'] ?? -2)
+                        && (int)($existingAfterRead['dev'] ?? -1) === (int)($existingFlag['dev'] ?? -2)
+                        && (int)($existingAfterRead['ino'] ?? -1) === (int)($existingFlag['ino'] ?? -2)
+                        && (int)($existingAfterRead['nlink'] ?? 0) === 1
+                        && (int)($existingAfterRead['size'] ?? -1) === 2
+                    );
+                }
+                if (!$existingSafe) {
+                    echo json_encode([
+                        'success' => false,
+                        'message' => 'Unsicheres Docker-Neustartflag erkannt; Neustart wurde nicht angefordert.'
+                    ]);
+                    exit;
+                }
                 echo json_encode([
-                    'success' => false,
-                    'message' => 'Service-Wrapper nicht gefunden. Bitte Rechte-Reparatur ausfuehren.'
+                    'success' => true,
+                    'message' => 'Docker-Neustart ist bereits sicher angefordert.'
                 ]);
                 exit;
             }
 
+            $previousUmask = @umask(0007);
+            $restartHandle = @fopen($restartFlag, 'x+b');
+            if (is_int($previousUmask)) {
+                @umask($previousUmask);
+            }
+            $restartOk = is_resource($restartHandle);
+            $restartAlreadyQueued = false;
+            $createdFlagIdentity = null;
+            if ($restartOk) {
+                $restartOk = (@fwrite($restartHandle, "1\n") === 2);
+                $restartOk = (@fflush($restartHandle) && $restartOk);
+                $openedFlag = @fstat($restartHandle);
+                if (is_array($openedFlag)) {
+                    $createdFlagIdentity = [
+                        'dev' => (int)($openedFlag['dev'] ?? -1),
+                        'ino' => (int)($openedFlag['ino'] ?? -1),
+                    ];
+                }
+                $restartOk = (
+                    $restartOk
+                    && is_array($openedFlag)
+                    && ((((int)$openedFlag['mode']) & 0170000) === 0100000)
+                    && ((int)($openedFlag['nlink'] ?? 0) === 1)
+                    && ((((int)$openedFlag['mode']) & 0777) === 0660)
+                );
+                @fclose($restartHandle);
+            } else {
+                // Zwei gleichzeitige POSTs dürfen ein bereits sicher erzeugtes
+                // Flag nicht gegenseitig entfernen.
+                $racedFlag = @lstat($restartFlag);
+                $restartAlreadyQueued = (
+                    is_array($racedFlag)
+                    && ((((int)$racedFlag['mode']) & 0170000) === 0100000)
+                    && ((int)($racedFlag['nlink'] ?? 0) === 1)
+                    && ((int)($racedFlag['size'] ?? -1) === 2)
+                    && ((((int)$racedFlag['mode']) & 0777) === 0660)
+                );
+            }
+            @clearstatcache(true, $restartFlag);
+            $finalFlag = @lstat($restartFlag);
+            $finalPayload = false;
+            $openedFinalFlag = false;
+            $namedFinalFlag = false;
+            if (is_array($finalFlag)) {
+                $finalHandle = @fopen($restartFlag, 'rb');
+                if (is_resource($finalHandle)) {
+                    $finalPayload = @fread($finalHandle, 3);
+                    $openedFinalFlag = @fstat($finalHandle);
+                    @fclose($finalHandle);
+                }
+                @clearstatcache(true, $restartFlag);
+                $namedFinalFlag = @lstat($restartFlag);
+            }
+            $finalContentStable = (
+                $finalPayload === "1\n"
+                && is_array($openedFinalFlag)
+                && is_array($namedFinalFlag)
+                && (int)($openedFinalFlag['dev'] ?? -1) === (int)($finalFlag['dev'] ?? -2)
+                && (int)($openedFinalFlag['ino'] ?? -1) === (int)($finalFlag['ino'] ?? -2)
+                && (int)($namedFinalFlag['dev'] ?? -1) === (int)($finalFlag['dev'] ?? -2)
+                && (int)($namedFinalFlag['ino'] ?? -1) === (int)($finalFlag['ino'] ?? -2)
+                && (int)($namedFinalFlag['nlink'] ?? 0) === 1
+                && (int)($namedFinalFlag['size'] ?? -1) === 2
+            );
+            $finalIdentityMatches = (
+                $restartAlreadyQueued
+                || (
+                    is_array($createdFlagIdentity)
+                    && is_array($finalFlag)
+                    && (int)($finalFlag['dev'] ?? -1) === $createdFlagIdentity['dev']
+                    && (int)($finalFlag['ino'] ?? -1) === $createdFlagIdentity['ino']
+                )
+            );
+            $restartOk = (
+                ($restartOk || $restartAlreadyQueued)
+                && $finalIdentityMatches
+                && $finalContentStable
+                && is_array($finalFlag)
+                && ((((int)$finalFlag['mode']) & 0170000) === 0100000)
+                && ((int)($finalFlag['nlink'] ?? 0) === 1)
+                && ((int)($finalFlag['size'] ?? -1) === 2)
+                && ((((int)$finalFlag['mode']) & 0777) === 0660)
+            );
+            if (!$restartOk) {
+                // Nur den von diesem Request erzeugten, unveränderten Inode
+                // entfernen. Ein paralleler Request darf nie gelöscht werden.
+                if (is_array($createdFlagIdentity) && is_array($namedFinalFlag)) {
+                    if (
+                        (int)($namedFinalFlag['dev'] ?? -1) === $createdFlagIdentity['dev']
+                        && (int)($namedFinalFlag['ino'] ?? -1) === $createdFlagIdentity['ino']
+                    ) {
+                        @unlink($restartFlag);
+                    }
+                }
+                echo json_encode([
+                    'success' => false,
+                    'message' => 'Docker-Neustartflag konnte nicht sicher geschrieben werden.'
+                ]);
+                exit;
+            }
+            echo json_encode([
+                'success' => true,
+                'message' => 'Docker-Container wird über den überwachten PID-1-Dienstsatz neu gestartet.'
+            ]);
+        } else {
             $services = [
                 'e3dc-live',
                 'energy_manager',
@@ -3783,24 +5479,10 @@ function handleServiceRestart() {
                 'e3dc-weather-manager'
             ];
 
-            $restarted = [];
-            $ignored = [];
-            $errors = [];
-            foreach ($services as $service) {
-                $cmd = 'sudo -n ' . escapeshellarg($serviceWrapper) . ' restart ' . escapeshellarg($service) . ' 2>&1';
-                $lines = [];
-                $code = 1;
-                exec($cmd, $lines, $code);
-                $text = trim(implode("\n", $lines));
-                $isMissing = preg_match('/not found|not loaded|could not be found|does not exist|nicht gefunden|ist nicht geladen/i', $text);
-                if ($code === 0) {
-                    $restarted[] = $service;
-                } elseif ($isMissing) {
-                    $ignored[] = $service;
-                } else {
-                    $errors[] = $service . ': ' . ($text !== '' ? $text : 'unbekannter Fehler');
-                }
-            }
+            $restartResult = e3dcRunServiceWrapperAction('restart', $services);
+            $restarted = $restartResult['changed'] ?? [];
+            $ignored = $restartResult['ignored'] ?? [];
+            $errors = $restartResult['errors'] ?? [];
 
             if (!$errors) {
                 echo json_encode([
@@ -3823,8 +5505,15 @@ function handleServiceRestart() {
  */
 function handleFixPermissions() {
     if (isset($_GET['action']) && $_GET['action'] === 'fix_permissions') {
-        requireWebAuth(true);
+        e3dcRequirePostMutation(true);
         header('Content-Type: application/json');
+        if (!e3dcPrivilegedInstallerWebActionsEnabled()) {
+            echo json_encode([
+                'success' => false,
+                'message' => e3dcPrivilegedInstallerWebBlockMessage('Rechte-Reparatur'),
+            ]);
+            exit;
+        }
 
         $paths = getInstallPaths();
         if (empty($paths['valid'])) {
@@ -4361,7 +6050,14 @@ function renderDiagnoseModal($dialogClass = 'modal-lg modal-dialog-scrollable') 
     }
     function loadDiagnoseLog() { const t = document.getElementById("diagnoseLogSelect").value; const c = document.getElementById("diagnose-log-content"); c.innerText = "Lade Protokoll..."; fetch("?action=get_system_log&log=" + t).then(r => r.text()).then(txt => c.innerText = txt).catch(() => c.innerText = "Fehler beim Laden."); }
     function ackDiagnose() {
-        fetch("?action=ack_diagnose&t=" + Date.now()).then(r => r.json()).then(d => {
+        fetch("?action=ack_diagnose&t=" + Date.now(), {
+            method: "POST",
+            credentials: "same-origin",
+            headers: {
+                "X-Requested-With": "XMLHttpRequest",
+                "X-CSRF-Token": String(window.E3DC_CSRF_TOKEN || "")
+            }
+        }).then(r => r.json()).then(d => {
             if (d.success) {
                 window.currentDiagnoseErrors = []; updateDiagnoseDropdown();
                 document.querySelectorAll(".btn-diagnose").forEach(b => { if (b.dataset.origClass) b.className = b.dataset.origClass; });
@@ -4551,12 +6247,17 @@ function getArchivedDebugFiles($basePath) {
 function handleSaveSetting() {
     if (isset($_POST['action']) && $_POST['action'] === 'save_setting') {
         requireWebAuth(true);
+        e3dcRequireCsrfToken(true);
         if (!isset($_POST['key'], $_POST['value'])) exit;
 
         $key = trim($_POST['key']);
         $val = trim($_POST['value']);
 
-        if (!preg_match('/^[a-z0-9_]+$/i', $key)) { http_response_code(400); exit; }
+        if (!in_array($key, ['darkmode', 'show_forecast'], true) || !in_array($val, ['0', '1'], true)) {
+            http_response_code(400);
+            echo 'error';
+            exit;
+        }
 
         if (saveE3dcConfigValue($key, $val)) echo "ok";
         else { http_response_code(500); echo "error"; }
@@ -4605,19 +6306,35 @@ function handleDirectMarketingDashboardAction() {
  */
 function handleRunUpdate() {
     if (isset($_GET['action']) && $_GET['action'] === 'run_update') {
-        requireWebAuth(true);
         // Caching verhindern (Wichtig für Cloudflare/Browser)
         header('Cache-Control: no-cache, no-store, must-revalidate');
         header('Pragma: no-cache');
         header('Expires: 0');
         header('Content-Type: application/json');
-        $mode = $_GET['mode'] ?? 'start';
+        $mode = (string)($_GET['mode'] ?? $_POST['mode'] ?? '');
+        if ($mode === 'poll') {
+            requireWebAuth(true);
+        } elseif ($mode === 'start') {
+            e3dcRequirePostMutation(true);
+        } else {
+            http_response_code(400);
+            echo json_encode(['status' => 'error', 'running' => false, 'message' => 'Ungültiger Update-Modus.']);
+            exit;
+        }
         if (e3dcIsDockerEnvironment()) {
             echo json_encode([
                 'status' => 'docker',
                 'running' => false,
                 'message' => e3dcDockerHostUpdateMessage(),
                 'commands' => e3dcDockerHostUpdateCommandText(),
+            ]);
+            exit;
+        }
+        if ($mode === 'start' && !e3dcPrivilegedInstallerWebActionsEnabled()) {
+            echo json_encode([
+                'status' => 'error',
+                'running' => false,
+                'message' => e3dcPrivilegedInstallerWebBlockMessage('Web-Update'),
             ]);
             exit;
         }
@@ -4684,8 +6401,8 @@ function handleRunUpdate() {
             }
             $attempts[] = [
                 'label' => 'installer_main.py direkt',
-                'preflight' => 'sudo -n /usr/bin/python3 ' . escapeshellarg($installer_main) . ' --check',
-                'run' => 'sudo -n /usr/bin/python3 ' . escapeshellarg($installer_main) . ' --update-e3dc',
+                'preflight' => 'sudo -n /usr/bin/python3 -I -B -u ' . escapeshellarg($installer_main) . ' --check',
+                'run' => 'sudo -n /usr/bin/python3 -I -B -u ' . escapeshellarg($installer_main) . ' --update-e3dc',
             ];
             $cmd = '';
             $sudoErrors = [];
@@ -4784,6 +6501,7 @@ function handleRunUpdate() {
  */
 function handleDailyStats() {
     if (isset($_GET['action']) && $_GET['action'] === 'get_daily_stats') {
+        requireWebAuth(true);
         header('Content-Type: application/json');
         $file = $_GET['file'] ?? '';
         if ($file === 'today' || empty($file)) {

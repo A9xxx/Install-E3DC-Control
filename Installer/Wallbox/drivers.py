@@ -449,7 +449,7 @@ class GoECharger(WallboxDriver):
             action="goe_set_amp_and_state",
             payload={"target_amp": target_amp, "force_state": force_state},
         ):
-            return True
+            return False
         amp = max(6, min(32, int(target_amp or 6)))
         params = f"amp={amp}"
         if force_state is not None:
@@ -513,7 +513,7 @@ class DummyCharger(WallboxDriver):
             action="dummy_set_amp_and_state",
             payload={"target_amp": target_amp, "force_state": force_state},
         ):
-            return True
+            return False
         self.state['amp'] = target_amp
         if force_state is not None:
             self.state['frc']      = force_state
@@ -527,7 +527,7 @@ class DummyCharger(WallboxDriver):
             action="dummy_release_to_default",
             payload={"max_amp": max_amp},
         ):
-            return True
+            return False
         self.state['amp'] = max_amp
         self.state['frc'] = 0
         self.state['charging'] = False
@@ -622,6 +622,9 @@ class OpenWBCharger(WallboxDriver):
             'min_current':       0.0,
             'pv_charging_min_current': 0.0,
             'instant_charging_current': 0.0,
+            'primary_start_stage': '',
+            'primary_start_target_amp': None,
+            'primary_start_current_sent_ts': 0.0,
             'instant_charging_limit': '',
             'instant_charging_soc': 0.0,
             'session_kwh':       0.0,
@@ -639,7 +642,18 @@ class OpenWBCharger(WallboxDriver):
             'car_consumption_kwh_100km': 0.0,
             'car_range':         0.0,
             'car_range_source':  '',
+            'car_range_valid':   False,
+            'car_range_observed_ts': 0,
+            'car_range_source_ts': None,
+            'car_range_source_ts_explicit': False,
+            'car_range_vehicle_key': '',
             'car_charged_range': 0.0,
+            'car_charged_range_source': '',
+            'car_charged_range_valid': False,
+            'car_charged_range_observed_ts': 0,
+            'car_charged_range_source_ts': None,
+            'car_charged_range_source_ts_explicit': False,
+            'car_charged_range_vehicle_key': '',
         }
 
         # CP-ID aus Topic-Prefix extrahieren
@@ -748,6 +762,9 @@ class OpenWBCharger(WallboxDriver):
         self.topic_prefix    = cfg_prefix or self.native_prefix
         self._last_command_key = None
         self._last_command_ts = 0.0
+        self._primary_pending_current_amp = None
+        self._primary_pending_current_sent_ts = 0.0
+        self._primary_pending_current_timeout_s = 30.0
 
         logger.info(f"[WB{self.wb_id}] openWB 2.x HTTP SimpleAPI: IP={self.ip}, CP={self.cp_id if self.cp_id != '' else 'AUTO'}")
         logger.info(f"[WB{self.wb_id}]   Status-GET   : get_chargepoint_all={self.cp_id if self.cp_id != '' else 'auto'}")
@@ -828,6 +845,95 @@ class OpenWBCharger(WallboxDriver):
             headers["Authorization"] = f"Basic {token}"
         return headers
 
+    def _current_range_vehicle_key(self):
+        if not bool(self.state.get("stable_vehicle_identity_current", False)):
+            return ""
+        return str(
+            self.state.get("vehicle_id")
+            or self.state.get("rfid_tag")
+            or self.state.get("car_id")
+            or ""
+        ).strip()
+
+    def _set_total_range(self, value, source, *, observed_ts=None, source_ts=None, vehicle_key=""):
+        value = self._float_value(value, 0.0)
+        if value <= 0.0:
+            self._clear_total_range(source=source)
+            return False
+        now_ts = time.time() if observed_ts is None else float(observed_ts)
+        source_timestamp_missing = source_ts is None or (
+            isinstance(source_ts, str)
+            and source_ts.strip().lower() in ("", "null")
+        )
+        source_timestamp = None if source_timestamp_missing else source_ts
+        self.state.update({
+            "car_range": value,
+            "car_range_source": str(source or ""),
+            "car_range_valid": True,
+            "car_range_observed_ts": int(now_ts),
+            "car_range_source_ts": source_timestamp,
+            "car_range_source_ts_explicit": not source_timestamp_missing,
+            "car_range_vehicle_key": str(vehicle_key or "").strip(),
+        })
+        return True
+
+    def _clear_total_range(self, source=None):
+        if source and str(self.state.get("car_range_source") or "") != str(source):
+            return
+        self.state.update({
+            "car_range": 0.0,
+            "car_range_source": "",
+            "car_range_valid": False,
+            "car_range_observed_ts": 0,
+            "car_range_source_ts": None,
+            "car_range_source_ts_explicit": False,
+            "car_range_vehicle_key": "",
+        })
+
+    def _set_charged_range(self, value, source, *, observed_ts=None, source_ts=None, vehicle_key=""):
+        value = self._float_value(value, -1.0)
+        if value < 0.0:
+            self._clear_charged_range(source=source)
+            return False
+        now_ts = time.time() if observed_ts is None else float(observed_ts)
+        source_timestamp_missing = source_ts is None or (
+            isinstance(source_ts, str)
+            and source_ts.strip().lower() in ("", "null")
+        )
+        source_timestamp = None if source_timestamp_missing else source_ts
+        self.state.update({
+            "car_charged_range": value,
+            "car_charged_range_source": str(source or ""),
+            "car_charged_range_valid": True,
+            "car_charged_range_observed_ts": int(now_ts),
+            "car_charged_range_source_ts": source_timestamp,
+            "car_charged_range_source_ts_explicit": not source_timestamp_missing,
+            "car_charged_range_vehicle_key": str(vehicle_key or "").strip(),
+        })
+        return True
+
+    def _clear_charged_range(self, source=None):
+        if source and str(self.state.get("car_charged_range_source") or "") != str(source):
+            return
+        self.state.update({
+            "car_charged_range": 0.0,
+            "car_charged_range_source": "",
+            "car_charged_range_valid": False,
+            "car_charged_range_observed_ts": 0,
+            "car_charged_range_source_ts": None,
+            "car_charged_range_source_ts_explicit": False,
+            "car_charged_range_vehicle_key": "",
+        })
+
+    @classmethod
+    def _extract_total_range(cls, payload):
+        """Lese ausschließlich die openWB-Gesamtreichweite, nie range_charged."""
+
+        if not isinstance(payload, dict) or "range" not in payload:
+            return 0.0, False
+        value = cls._float_value(payload.get("range"), 0.0)
+        return value, True
+
     def on_connect(self, client, userdata, flags, reason_code, properties=None):
         rc = reason_code if isinstance(reason_code, int) else (0 if str(reason_code) == 'Success' else 1)
         if rc == 0:
@@ -884,16 +990,31 @@ class OpenWBCharger(WallboxDriver):
                     soc_data  = json.loads(payload_str)
                     car_soc   = float(soc_data.get("soc", 0))
                     if car_soc > 0:
-                        self.state['car_soc'] = car_soc
-                        charged_range = float(soc_data.get("range_charged", 0) or 0)
-                        if charged_range > 0:
-                            self.state['car_charged_range'] = charged_range
-                        range_val = float(soc_data.get("range", 0) or 0)
-                        if range_val > 0:
-                            self.state['car_range'] = range_val
-                            self.state['car_range_source'] = 'mqtt_total'
+                        observed_ts = time.time()
                         openwb_ts = soc_data.get("timestamp", None)
-                        soc_ts    = int(openwb_ts) if openwb_ts else int(time.time())
+                        soc_ts = self._float_value(openwb_ts, observed_ts)
+                        if soc_ts > 100000000000.0:
+                            soc_ts /= 1000.0
+                        soc_ts = int(soc_ts)
+                        vehicle_key = self._current_range_vehicle_key()
+                        self.state['car_soc'] = car_soc
+                        if "range_charged" in soc_data:
+                            self._set_charged_range(
+                                soc_data.get("range_charged"),
+                                "mqtt_charged",
+                                observed_ts=observed_ts,
+                                source_ts=openwb_ts,
+                                vehicle_key=vehicle_key,
+                            )
+                        range_val, range_present = self._extract_total_range(soc_data)
+                        if range_present:
+                            self._set_total_range(
+                                range_val,
+                                "mqtt_total",
+                                observed_ts=observed_ts,
+                                source_ts=openwb_ts,
+                                vehicle_key=vehicle_key,
+                            )
                         is_plugged = self.state.get('plug_state', False)
                         soc_age_h  = (time.time() - soc_ts) / 3600.0
 
@@ -912,8 +1033,14 @@ class OpenWBCharger(WallboxDriver):
                 try:
                     range_val = float(payload_str)
                     if range_val > 0:
-                        self.state['car_range'] = range_val
-                        self.state['car_range_source'] = 'mqtt_total'
+                        observed_ts = time.time()
+                        self._set_total_range(
+                            range_val,
+                            "mqtt_total",
+                            observed_ts=observed_ts,
+                            source_ts=None,
+                            vehicle_key=self._current_range_vehicle_key(),
+                        )
                         last_range = self.state.get('_last_logged_range', -1)
                         if abs(range_val - last_range) >= 10.0:
                             logger.info(f"[WB{self.wb_id}] Auto-Range aus openWB: {int(range_val)} km")
@@ -969,6 +1096,8 @@ class OpenWBCharger(WallboxDriver):
                     logger.info(f"[WB{self.wb_id}] Auto eingesteckt! Session-Zaehler gestartet.")
                 elif not val:
                     self.state['_session_start_wh'] = None
+                    self._clear_total_range()
+                    self._clear_charged_range()
                 return
 
             if topic == f"{self.native_prefix}/charge_state":
@@ -1198,6 +1327,11 @@ class OpenWBCharger(WallboxDriver):
         if mode not in ("instant", "pv", "stop"):
             logger.warning(f"[WB{self.wb_id}] openWB Primary: ungueltiger Modus {mode!r}")
             return False
+        if mode in ("pv", "stop"):
+            # Eine neue Nutzer-/Policyentscheidung widerruft einen eventuell
+            # vorbereiteten Sofortladestart bereits vor dem Modusschreiben.
+            # Ein späterer Zyklus darf den alten Start sonst nicht nachholen.
+            self._clear_primary_start_transition()
         post_data = urllib.parse.urlencode({
             "set_chargemode": mode,
             "chargepoint_nr": self._openwb_chargepoint_nr(),
@@ -1247,6 +1381,34 @@ class OpenWBCharger(WallboxDriver):
             )
         return ok
 
+    def _clear_primary_start_transition(self):
+        self._primary_pending_current_amp = None
+        self._primary_pending_current_sent_ts = 0.0
+        self.state["primary_start_stage"] = ""
+        self.state["primary_start_target_amp"] = None
+        self.state["primary_start_current_sent_ts"] = 0.0
+
+    def _primary_current_readback_confirmed(self, target_amp) -> bool:
+        """Bestätigt den vorbereiteten Primary-Strom nur aus frischem Status."""
+
+        try:
+            target = float(target_amp)
+            reported = float(self.state.get("instant_charging_current"))
+            readback_ts = float(self.state.get("driver_status_last_ok_ts") or 0.0)
+        except (TypeError, ValueError):
+            return False
+        sent_ts = float(self._primary_pending_current_sent_ts or 0.0)
+        if (
+            sent_ts <= 0.0
+            or readback_ts <= sent_ts
+            or self.state.get("driver_status_valid") is not True
+            or bool(self.state.get("driver_status_stale", False))
+            or bool(self.state.get("driver_status_degraded", False))
+        ):
+            return False
+        tolerance = max(0.05, float(self.current_step_amp or 1.0) / 2.0)
+        return math.isfinite(reported) and abs(reported - target) <= tolerance
+
     def _primary_set_chargecurrent(self, target_amp) -> bool:
         """Setzt den Sofortlade-Strom für openWB Primary."""
         import urllib.parse
@@ -1286,16 +1448,67 @@ class OpenWBCharger(WallboxDriver):
         return ok
 
     def _primary_set_instant_current(self, target_amp) -> bool:
-        """Aktiver openWB-Primary-Eingriff: Sofortladen mit Stromvorgabe."""
+        """Bereitet Strom vor und aktiviert Sofortladen erst nach Readback."""
         raw = float(target_amp or 0)
         if raw < 0.5:
+            self._clear_primary_start_transition()
             return self._primary_set_chargemode("stop")
-        amp = max(6.0, min(32.0, raw))
+        amp = _quantize_current_amp(
+            max(6.0, min(32.0, raw)),
+            step=self.current_step_amp,
+        )
+        pending_amp = self._primary_pending_current_amp
+        if pending_amp is not None and abs(float(pending_amp) - amp) <= 1e-6:
+            if self._primary_current_readback_confirmed(amp):
+                mode_ok = self._primary_set_chargemode("instant")
+                if mode_ok:
+                    self._clear_primary_start_transition()
+                    self.state["chargemode_str"] = "instant"
+                return bool(mode_ok)
+
+            age_s = max(
+                0.0,
+                time.time() - float(self._primary_pending_current_sent_ts or 0.0),
+            )
+            if age_s < self._primary_pending_current_timeout_s:
+                self.state["primary_start_stage"] = "await_current_readback"
+                self._set_control_state(
+                    "primary_current_readback_pending",
+                    "Warte auf Strombestätigung",
+                    f"openWB Primary muss {amp:g} A erst frisch zurückmelden; "
+                    "Sofortladen bleibt bis dahin aus.",
+                    "info",
+                    amp=amp,
+                    ok=None,
+                    count_failure=False,
+                )
+                return False
+
+        # Neues Ziel oder abgelaufener Readback: nur den Stromwert schreiben.
+        # Der Moduswechsel ist eine getrennte Transaktion in einem späteren
+        # Managerzyklus und darf nie auf einem alten openWB-Stromwert starten.
+        self._clear_primary_start_transition()
         current_ok = self._primary_set_chargecurrent(amp)
-        mode_ok = self._primary_set_chargemode("instant")
-        if current_ok and mode_ok:
-            self.state["chargemode_str"] = "instant"
-        return bool(current_ok and mode_ok)
+        if current_ok:
+            sent_ts = time.time()
+            self._primary_pending_current_amp = amp
+            self._primary_pending_current_sent_ts = sent_ts
+            self.state["primary_start_stage"] = "await_current_readback"
+            self.state["primary_start_target_amp"] = amp
+            self.state["primary_start_current_sent_ts"] = sent_ts
+            self._set_control_state(
+                "primary_current_readback_pending",
+                "Warte auf Strombestätigung",
+                f"openWB Primary hat {amp:g} A angenommen; Sofortladen folgt "
+                "erst nach einem frischen passenden Readback.",
+                "info",
+                amp=amp,
+                ok=True,
+                count_failure=False,
+            )
+        else:
+            self._clear_primary_start_transition()
+        return bool(current_ok)
 
     def _http_v1_post(self, topic: str, message=None):
         """Schreibt/liest openWB HTTP-API V1 Topics (Port 8443)."""
@@ -1482,6 +1695,11 @@ class OpenWBCharger(WallboxDriver):
 
     def _secondary_heartbeat(self):
         """Haelt openWB im Secondary-Pfad wach, ohne Lademodus umzuschalten."""
+        if self.modbus_enabled:
+            # Der konfigurierte Transport ist eine Owner-Entscheidung. Nach
+            # einem unklaren HTTP-Ergebnis darf derselbe Heartbeat nicht über
+            # einen zweiten Transport erneut ausgelöst werden.
+            return self._modbus_secondary_heartbeat()
         now_ts = time.time()
         payload = {
             "heartbeat": int(now_ts),
@@ -1492,11 +1710,6 @@ class OpenWBCharger(WallboxDriver):
             self.state["last_heartbeat_ok"] = True
             self.state["last_heartbeat_ts"] = now_ts
             return True
-        if self.modbus_enabled:
-            logger.info(f"[WB{self.wb_id}] openWB HTTP-V1-Heartbeat nicht verfuegbar, nutze Modbus als Rueckfall.")
-            ok = self._modbus_secondary_heartbeat()
-            self.state["last_heartbeat_ok"] = bool(ok)
-            return ok
         self.state["last_heartbeat_ok"] = False
         return False
 
@@ -1590,66 +1803,60 @@ class OpenWBCharger(WallboxDriver):
         self.state["last_command_ts"] = int(time.time())
         self.state["current_step_amp"] = self.current_step_amp
         self.state["fractional_current_supported"] = self.current_step_amp < 1.0
-        hb_ok = self._secondary_heartbeat()
-        result = self._http_v1_post(
-            f"openWB/set/internal_chargepoint/{self.api_duo_num}/data/set_current",
-            amp_payload,
-        )
-        ok = bool(result and result.get("status") == "success")
+        result = None
+        transport = "modbus" if self.modbus_enabled else "http_v1"
+        if self.modbus_enabled:
+            try:
+                ok = self._modbus_write_register(10171, int(round(amp * 100)))
+            except Exception as e:
+                logger.warning(
+                    f"[WB{self.wb_id}] openWB Modbus-Strom {amp_text}A fehlgeschlagen: {e}"
+                )
+                ok = False
+        else:
+            result = self._http_v1_post(
+                f"openWB/set/internal_chargepoint/{self.api_duo_num}/data/set_current",
+                amp_payload,
+            )
+            ok = bool(result and result.get("status") == "success")
         if ok:
             self.state["amp"] = int(round(amp))
             self.state["evse_current"] = amp
             self.state["chargemode_str"] = "secondary_current"
-            self.state["api_surface"] = "openwb_secondary_set_current_heartbeat"
+            self.state["api_surface"] = (
+                "openwb_secondary_modbus"
+                if self.modbus_enabled
+                else "openwb_secondary_set_current_heartbeat"
+            )
             if amp <= 0:
                 self.state["charging"] = False
             self._set_control_state(
                 "set_current_accepted",
                 "Sollstrom übernommen",
-                f"openWB Secondary hat {amp_text} A per HTTP V1 angenommen; Heartbeat {'ok' if hb_ok else 'nicht bestätigt'}.",
+                f"openWB Secondary hat {amp_text} A per "
+                f"{'Modbus' if self.modbus_enabled else 'HTTP V1'} angenommen; "
+                "der Heartbeat bleibt eine getrennte Managertransaktion.",
                 "success",
                 amp=amp,
                 ok=True,
             )
-            logger.debug(f"[WB{self.wb_id}] openWB Secondary HTTP-V1: {amp_text}A (heartbeat={hb_ok})")
+            logger.debug(
+                f"[WB{self.wb_id}] openWB Secondary {transport}: {amp_text}A"
+            )
             return True
-
-        if self.modbus_enabled:
-            logger.info(f"[WB{self.wb_id}] openWB HTTP-V1-set_current fehlgeschlagen, versuche Modbus Secondary.")
-            hb_ok = hb_ok or self._modbus_secondary_heartbeat()
-            try:
-                ok = self._modbus_write_register(10171, int(round(amp * 100)))
-            except Exception as e:
-                logger.warning(f"[WB{self.wb_id}] openWB Modbus-Strom {amp_text}A fehlgeschlagen: {e}")
-                ok = False
-            if ok:
-                self.state["amp"] = int(round(amp))
-                self.state["evse_current"] = amp
-                self.state["chargemode_str"] = "secondary_current"
-                self.state["api_surface"] = "openwb_secondary_modbus"
-                if amp <= 0:
-                    self.state["charging"] = False
-                self._set_control_state(
-                    "set_current_accepted",
-                    "Sollstrom übernommen",
-                    f"openWB Secondary hat {amp_text} A per Modbus angenommen; Heartbeat {'ok' if hb_ok else 'nicht bestätigt'}.",
-                    "success",
-                    amp=amp,
-                    ok=True,
-                )
-                logger.debug(f"[WB{self.wb_id}] openWB Modbus Secondary: {amp_text}A (heartbeat={hb_ok})")
-                return True
         self._set_control_state(
             "set_current_failed",
             "Sollstrom nicht angenommen",
-            f"openWB Secondary hat {amp_text} A nicht bestätigt; Heartbeat {'ok' if hb_ok else 'nicht bestätigt'}. E3DC-Control nutzt die gemessene Wallboxleistung nur als Last.",
+            f"openWB Secondary hat {amp_text} A über {transport} nicht bestätigt. "
+            "Kein zweiter Transport wird nach einem mehrdeutigen Ergebnis versucht; "
+            "E3DC-Control nutzt die gemessene Wallboxleistung nur als Last.",
             "warning",
             amp=amp,
             ok=False,
         )
         logger.warning(
             f"[WB{self.wb_id}] openWB Secondary set_current={amp_text}A fehlgeschlagen: "
-            f"current={result}, heartbeat={hb_ok}"
+            f"transport={transport}, result={result}"
         )
         return False
 
@@ -1914,16 +2121,41 @@ class OpenWBCharger(WallboxDriver):
                 car_soc_source_ts,
                 source=car_soc_source,
             )
-        charged_range = self._float_value(cp_data.get("range_charged"), 0.0)
-        if charged_range > 0:
-            self.state["car_charged_range"] = charged_range
-        car_range = self._float_value(
-            cp_data.get("range", cp_data.get("vehicle_range", cp_data.get("remaining_range"))),
-            0.0
+        range_observed_ts = time.time()
+        range_source_ts = cp_data.get("soc_timestamp")
+        if range_source_ts in (None, "", "null"):
+            range_source_ts = None
+        range_vehicle_key = (
+            str(live_vehicle_id or live_rfid_tag or "").strip()
+            if stable_vehicle_identity_current
+            else ""
         )
-        if car_range > 0:
-            self.state["car_range"] = car_range
-            self.state["car_range_source"] = "http_total"
+        if effective_plug_state and "range_charged" in cp_data:
+            self._set_charged_range(
+                cp_data.get("range_charged"),
+                "http_charged",
+                observed_ts=range_observed_ts,
+                source_ts=range_source_ts,
+                vehicle_key=range_vehicle_key,
+            )
+        elif not effective_plug_state:
+            self._clear_charged_range()
+        else:
+            self._clear_charged_range(source="http_charged")
+
+        car_range, car_range_present = self._extract_total_range(cp_data)
+        if effective_plug_state and car_range_present and car_range > 0.0:
+            self._set_total_range(
+                car_range,
+                "http_total",
+                observed_ts=range_observed_ts,
+                source_ts=range_source_ts,
+                vehicle_key=range_vehicle_key,
+            )
+        elif not effective_plug_state:
+            self._clear_total_range()
+        else:
+            self._clear_total_range(source="http_total")
 
         self.state.update({
             "plug_state": effective_plug_state,
@@ -1999,7 +2231,7 @@ class OpenWBCharger(WallboxDriver):
         payload = {
             'plug_state':        self.state['plug_state'],
             'plug_state_raw':    bool(self.state.get('plug_state_raw', self.state['plug_state'])),
-            'locked':            bool(self.state.get('locked', self.state['plug_state'])),
+            'locked':            bool(self.state.get('locked', False)),
             'charge_state':      self.state['charge_state'],
             'power_w':           round(self.state['real_power_w'], 1),
             'phase_power_l1_w':  round(self.state.get('phase_power_l1_w', 0.0), 1),
@@ -2067,8 +2299,19 @@ class OpenWBCharger(WallboxDriver):
             'car_range':         self.state.get('car_range', 0),
             'range_km':          self.state.get('car_range', 0),
             'car_range_source':  self.state.get('car_range_source', ''),
+            'car_range_valid':   bool(self.state.get('car_range_valid', False)),
+            'car_range_observed_ts': self.state.get('car_range_observed_ts', 0),
+            'car_range_source_ts': self.state.get('car_range_source_ts'),
+            'car_range_source_ts_explicit': bool(self.state.get('car_range_source_ts_explicit', False)),
+            'car_range_vehicle_key': self.state.get('car_range_vehicle_key', ''),
             'car_charged_range': self.state.get('car_charged_range', 0),
             'charged_range_km':  self.state.get('car_charged_range', 0),
+            'car_charged_range_source': self.state.get('car_charged_range_source', ''),
+            'car_charged_range_valid': bool(self.state.get('car_charged_range_valid', False)),
+            'car_charged_range_observed_ts': self.state.get('car_charged_range_observed_ts', 0),
+            'car_charged_range_source_ts': self.state.get('car_charged_range_source_ts'),
+            'car_charged_range_source_ts_explicit': bool(self.state.get('car_charged_range_source_ts_explicit', False)),
+            'car_charged_range_vehicle_key': self.state.get('car_charged_range_vehicle_key', ''),
             # Fahrzeug-Identitaet (aus connected_vehicle/info)
             'car_name':          self.state.get('car_name', ''),
             'car_id':            self.state.get('car_id', None),
@@ -2121,7 +2364,8 @@ class OpenWBCharger(WallboxDriver):
     def set_amp_and_state(self, target_amp, force_state=None):
         """Steuert openWB 2.x je nach Konfigurationsrolle.
 
-        Standard: Secondary-Sollstrom + Heartbeat.
+        Standard: Secondary-Sollstrom; der Manager sendet den Heartbeat in
+        einem getrennten freien Ausgangszyklus.
         openWB Primary Opt-in: PV/Sofort/Stop per simpleAPI, openWB regelt den
         Ladepunkt weiter selbst.
         """
@@ -2130,7 +2374,7 @@ class OpenWBCharger(WallboxDriver):
             action="openwb_set_amp_and_state",
             payload={"target_amp": target_amp, "force_state": force_state},
         ):
-            return True
+            return False
         if self._commands_temporarily_blocked():
             return False
         try:
@@ -2151,7 +2395,7 @@ class OpenWBCharger(WallboxDriver):
             action="openwb_set_pv_mode",
             payload={"cp_id": self.cp_id},
         ):
-            return True
+            return False
         if self._commands_temporarily_blocked():
             return False
         if self.primary_mode_enabled:
@@ -2189,7 +2433,7 @@ class OpenWBCharger(WallboxDriver):
             action="openwb_set_direct_current",
             payload={"target_amp": target_amp},
         ):
-            return True
+            return False
         if self._commands_temporarily_blocked():
             return False
         if self.primary_mode_enabled:
@@ -2203,7 +2447,7 @@ class OpenWBCharger(WallboxDriver):
             action="openwb_set_phases",
             payload={"phases": phases},
         ):
-            return True
+            return False
         logger.warning(
             f"[WB{self.wb_id}] Phasenumschaltung ignoriert: normale openWB "
             f"wird nur über Sollstrom und Heartbeat geführt."
@@ -2291,6 +2535,11 @@ class E3DCCharger(WallboxDriver):
         self.real_charging = False
         self.sonnenmodus = False  # True = E3DC steuert autonom (Mode=1), False = Python-Kontrolle (Mode=2)
         self.last_stop_toggle_ts = 0.0
+        self._wbchar6_output_seq = 0
+        self._wbchar6_last_wire_receipt = {}
+        self._wbchar6_dispatch_seq = 0
+        self._wbchar6_last_dispatch_outcome = {}
+        self._native_status_sample_seq = 0
         self._last_alg_flags = 0
         self._wbchar6_readback_ts = 0.0
         self._wbchar6_last_plugged = None
@@ -2522,6 +2771,14 @@ class E3DCCharger(WallboxDriver):
             'phase_power_l3_w': 0.0,
             'phase_power_sum_w': 0.0,
             'phase_power_verified': False,
+            'phase_power_sample_valid': False,
+            'native_fixed_phases': 0,
+            'native_fixed_phases_valid': False,
+            'native_fixed_phases_source': '',
+            'native_status_sample_seq': int(
+                getattr(self, '_native_status_sample_seq', 0) or 0
+            ),
+            'native_status_sample_ts': 0.0,
             'phases_in_use': 0,
             'phases_actual': 0,
             'phases_target': 0,
@@ -2547,18 +2804,127 @@ class E3DCCharger(WallboxDriver):
         status.update(self._rscp_diag_status())
         return status
 
+    def _finalize_native_status_sample(
+        self,
+        status,
+        *,
+        phase_values,
+        fixed_phases,
+    ):
+        """Versiegelt PM-Werte und feste Phase nur aus derselben RSCP-Probe."""
+
+        sanitized = self._sanitize_measurement_status(status)
+        sanitized = sanitized if isinstance(sanitized, dict) else {}
+        raw_values = (
+            tuple(phase_values)
+            if isinstance(phase_values, (tuple, list))
+            else ()
+        )
+        raw_complete = bool(
+            len(raw_values) == 3
+            and all(
+                type(value) in (int, float)
+                and math.isfinite(float(value))
+                and abs(float(value)) <= MAX_PHASE_POWER_W
+                for value in raw_values
+            )
+        )
+        sanitized_values = tuple(
+            sanitized.get(key)
+            for key in (
+                'phase_power_l1_w',
+                'phase_power_l2_w',
+                'phase_power_l3_w',
+            )
+        )
+        sanitized_complete = bool(
+            len(sanitized_values) == 3
+            and all(
+                type(value) in (int, float)
+                and math.isfinite(float(value))
+                and abs(float(value)) <= MAX_PHASE_POWER_W
+                for value in sanitized_values
+            )
+        )
+        try:
+            fixed_value = int(fixed_phases)
+        except (TypeError, ValueError, OverflowError):
+            fixed_value = 0
+        sample_fresh = bool(
+            sanitized.get('wb_status_valid') is True
+            and sanitized.get('driver_status_glitch') is False
+            and sanitized.get('driver_status_plausible') is not False
+            and sanitized.get('rscp_error_active') is False
+            and sanitized.get('driver_status_stale') is not True
+            and sanitized.get('driver_status_degraded') is not True
+        )
+        sample_valid = bool(
+            raw_complete
+            and sanitized_complete
+            and fixed_value in (1, 3)
+            and sample_fresh
+        )
+        sample_ts = time.time()
+        with self.lock:
+            self._native_status_sample_seq = int(
+                getattr(self, '_native_status_sample_seq', 0) or 0
+            ) + 1
+            sample_seq = self._native_status_sample_seq
+
+        sanitized.update({
+            'phase_power_sample_valid': sample_valid,
+            'native_fixed_phases': fixed_value if sample_valid else 0,
+            'native_fixed_phases_valid': sample_valid,
+            'native_fixed_phases_source': (
+                'rscp_wb_number_phases_same_response'
+                if sample_valid
+                else ''
+            ),
+            'native_status_sample_seq': int(sample_seq),
+            'native_status_sample_ts': float(sample_ts),
+            'driver_status_valid': bool(sample_fresh),
+            'driver_status_stale': False,
+            'driver_status_degraded': not bool(sample_fresh),
+            'driver_status_age_s': 0.0,
+            'driver_status_reason': (
+                'fresh'
+                if sample_fresh
+                else str(
+                    sanitized.get('driver_status_glitch_reason')
+                    or sanitized.get('wb_status_reason')
+                    or sanitized.get('rscp_last_error')
+                    or 'native_status_not_fresh'
+                )
+            ),
+            'driver_status_last_sample_ts': float(sample_ts),
+            'driver_status_last_ok_ts': (
+                float(sample_ts)
+                if sample_fresh
+                else 0.0
+            ),
+            'driver_status_source': 'rscp_same_response',
+        })
+        return sanitized
+
     def _heartbeat_loop(self):
         # E3DC requires a continuous heartbeat every <3 seconds to stay in external control mode
         while True:
             time.sleep(2.0)
-            if self.external_suspended:
-                continue
-            if hasattr(self, 'last_amp') and hasattr(self, 'last_force_state'):
-                if self.last_amp is not None:
-                    # Heartbeat MUSS force_state=None senden.
-                    # sendet man dauerhaft last_force_state=1, feuert man im 2s Takt Toggle=1 ab,
-                    # wodurch die Wallbox im Ping-Pong an und aus schaltet (Tick-Tack Bug)!
-                    self._send_command_internal(self.last_amp, None, is_heartbeat=True)
+            # Read, Lease-Prüfung und Wire bleiben unter derselben reentranten
+            # Sperre wie STOP/Aus/Nullautorität. So kann kein zuvor gelesener
+            # positiver Sollstrom nach einer neueren Stop-Revozierung noch als
+            # verspäteter Heartbeat auf die Wallbox gelangen.
+            with self.lock:
+                if self.external_suspended or self.last_amp is None:
+                    continue
+                heartbeat_amp = self.last_amp
+                # Heartbeat MUSS force_state=None senden. Ein persistiertes
+                # Toggle würde die Wallbox im 2-s-Takt ein-/ausschalten.
+                self._send_command_internal(
+                    heartbeat_amp,
+                    None,
+                    is_heartbeat=True,
+                )
 
     def _ensure_connected(self):
         if not (
@@ -2655,20 +3021,46 @@ class E3DCCharger(WallboxDriver):
                 'api_surface': '',
             }
             p1 = p2 = p3 = 0.0
+            phase_probe_values = ()
+            fixed_phase_probe = 0
 
             for item in response:
                 if item['tag'] == RscpTag.WB_DATA:
                     sub_list = item.get('value', [])
+                    container_phase_values = {}
+                    container_fixed_phases = 0
                     for sub in sub_list:
                         if sub['tag'] == RscpTag.WB_PM_POWER_L1 and sub.get('value') is not None:
-                            p1 = float(sub['value'])
+                            value = sub.get('value')
+                            if (
+                                type(value) in (int, float)
+                                and math.isfinite(float(value))
+                                and abs(float(value)) <= MAX_PHASE_POWER_W
+                            ):
+                                p1 = float(value)
+                                container_phase_values['l1'] = p1
                         elif sub['tag'] == RscpTag.WB_PM_POWER_L2 and sub.get('value') is not None:
-                            p2 = float(sub['value'])
+                            value = sub.get('value')
+                            if (
+                                type(value) in (int, float)
+                                and math.isfinite(float(value))
+                                and abs(float(value)) <= MAX_PHASE_POWER_W
+                            ):
+                                p2 = float(value)
+                                container_phase_values['l2'] = p2
                         elif sub['tag'] == RscpTag.WB_PM_POWER_L3 and sub.get('value') is not None:
-                            p3 = float(sub['value'])
+                            value = sub.get('value')
+                            if (
+                                type(value) in (int, float)
+                                and math.isfinite(float(value))
+                                and abs(float(value)) <= MAX_PHASE_POWER_W
+                            ):
+                                p3 = float(value)
+                                container_phase_values['l3'] = p3
                         elif sub['tag'] == RscpTag.WB_NUMBER_PHASES and sub.get('value') is not None:
                             number_phases, valid = validate_mirror_read_item(sub, 'WB_NUMBER_PHASES')
                             if valid and number_phases in (1, 3):
+                                container_fixed_phases = int(number_phases)
                                 status['number_phases'] = number_phases
                                 status['connected_phases'] = number_phases
                                 status['phases_actual'] = number_phases
@@ -2689,6 +3081,18 @@ class E3DCCharger(WallboxDriver):
                             self.real_charging = bool(decoded['charging']) if decoded['valid'] else False
                             if decoded['plugged'] is True:
                                 status['car'] = 2
+
+                    if (
+                        not phase_probe_values
+                        and container_fixed_phases in (1, 3)
+                        and set(container_phase_values) == {'l1', 'l2', 'l3'}
+                    ):
+                        phase_probe_values = (
+                            container_phase_values['l1'],
+                            container_phase_values['l2'],
+                            container_phase_values['l3'],
+                        )
+                        fixed_phase_probe = container_fixed_phases
 
                     # Session-Daten aus dem zweiten WB_DATA Container lesen
                     for sub in sub_list:
@@ -2733,7 +3137,11 @@ class E3DCCharger(WallboxDriver):
             self._set_control_backend(status_valid=bool(status.get('wb_status_valid')))
             status.update(self._backend_contract_fields())
             status.update(self._rscp_diag_status())
-            return self._sanitize_measurement_status(status)
+            return self._finalize_native_status_sample(
+                status,
+                phase_values=phase_probe_values,
+                fixed_phases=fixed_phase_probe,
+            )
         except Exception as e:
             self._record_rscp_error("status", e)
             logger.error(f"[WB{self.wb_id}] getData Fehler: {e}")
@@ -2754,13 +3162,24 @@ class E3DCCharger(WallboxDriver):
             payload={"target_amp": target_amp, "force_state": force_state, "heartbeat": bool(is_heartbeat)},
             audit_allowed=not bool(is_heartbeat),
         ):
-            return True
+            return False
         if self.control_backend == E3DC_BACKEND_STATUS_ONLY and force_state != 1:
             self._record_rscp_error("set_extern", "status-only backend blocks normal command")
             return False
         with self.lock:
+            self._wbchar6_dispatch_seq += 1
+            dispatch_seq = int(self._wbchar6_dispatch_seq)
+            self._wbchar6_last_dispatch_outcome = {
+                'contract': 'e3dc_wbchar6_dispatch_outcome_v1',
+                'seq': dispatch_seq,
+                'state': 'not_attempted',
+                'ts': time.time(),
+                'target_amp': int(target_amp),
+                'force_state': force_state,
+                'heartbeat': bool(is_heartbeat),
+            }
             if self.external_suspended:
-                return True
+                return False
             if not self._ensure_connected():
                 return False
             from rscp_client import RscpTag, RscpType
@@ -2787,10 +3206,8 @@ class E3DCCharger(WallboxDriver):
                 # Zustand ist ein erzwungener Stop erlaubt, danach erst wieder
                 # wenn der Status/die Leistung wirklich weiter Laden zeigt.
                 amp = 6
-                now = time.time()
-                if self.real_charging:
+                if self.real_charging and not is_heartbeat:
                     abort_flag = 1
-                    self.last_stop_toggle_ts = now
                 elif force_state == 1 and not is_heartbeat:
                     logger.debug(f"[WB{self.wb_id}] Stop-Toggle unterdrueckt: Wallbox meldet keine aktive Ladung.")
             elif target_amp > 0:
@@ -2831,8 +3248,37 @@ class E3DCCharger(WallboxDriver):
                 ):
                     return False
                 if self.external_suspended:
-                    return True
+                    return False
+                self._wbchar6_last_dispatch_outcome.update({
+                    'state': 'attempted_ambiguous',
+                    'wire_attempt_ts': time.time(),
+                })
                 self.conn.request(req_frame)
+                receipt_ts = time.time()
+                self._wbchar6_output_seq += 1
+                self._wbchar6_last_wire_receipt = {
+                    'contract': 'e3dc_wbchar6_wire_receipt_v1',
+                    'seq': int(self._wbchar6_output_seq),
+                    'ts': receipt_ts,
+                    'requested_amp': int(target_amp),
+                    'wire_amp': int(amp),
+                    'mode': int(mode),
+                    'post_guard_force_state': force_state,
+                    'abort_flag': int(abort_flag),
+                    'heartbeat': bool(is_heartbeat),
+                    'stop_edge_issued': bool(
+                        abort_flag == 1
+                        and force_state == 1
+                        and not is_heartbeat
+                    ),
+                }
+                self._wbchar6_last_dispatch_outcome.update({
+                    'state': 'confirmed',
+                    'wire_receipt_seq': int(self._wbchar6_output_seq),
+                    'wire_receipt_ts': receipt_ts,
+                })
+                if self._wbchar6_last_wire_receipt['stop_edge_issued']:
+                    self.last_stop_toggle_ts = receipt_ts
                 if abort_flag == 1 and force_state == 2:
                     self._mark_wbchar6_start_toggle_sent()
                 self._record_rscp_ok("set_extern")
@@ -2911,10 +3357,10 @@ class E3DCCharger(WallboxDriver):
             payload={"target_amp": target_amp, "force_state": force_state},
             audit_allowed=False,
         ):
-            return True
+            return False
         with self.lock:
             if request_generation != self._control_generation:
-                return True
+                return False
             self.external_suspended = False
             self.sonnenmodus = True
             self.last_amp = target_amp
@@ -2945,15 +3391,17 @@ class E3DCCharger(WallboxDriver):
             action="e3dc_emergency_stop",
             payload={"target_amp": 0, "force_state": 1},
         ):
-            return True
+            return False
         logger.warning(f"[WB{self.wb_id}] emergency_stop(): Unterbreche Sonnenmodus, erzwinge Mode=2 STOP.")
         with self.lock:
+            if self.real_charging is not True:
+                return False
             self.external_suspended = False
             self.sonnenmodus = False       # Sonnenmodus beenden - Python übernimmt
-            self.real_charging = True      # Erzwinge Toggle auf Stop (auch wenn Zustand unbekannt)
             self.last_amp = 6              # Minimaler Amp für Heartbeat
             self.last_force_state = 1      # Heartbeat hält STOP dauerhaft!
-            self._send_command_internal(0, 1, is_heartbeat=False)  # Sofortiger Stop-Toggle an E3DC
+            with command_gate.emergency_stop_scope(self):
+                return bool(self._send_command_internal(0, 1, is_heartbeat=False))
 
     def set_amp_and_state(self, target_amp, force_state=None):
         request_generation = self._control_generation
@@ -2963,10 +3411,10 @@ class E3DCCharger(WallboxDriver):
             payload={"target_amp": target_amp, "force_state": force_state},
             audit_allowed=False,
         ):
-            return True
+            return False
         with self.lock:
             if request_generation != self._control_generation:
-                return True
+                return False
             self.external_suspended = False
             self.last_amp = target_amp
             self.last_force_state = force_state # Heartbeat soll den aktuellen Status uebernehmen (None für PV, 2 für Zwang)
@@ -3402,7 +3850,7 @@ class E3DCMultiConnectCharger(E3DCCharger):
             payload={"mode": mode, "amp": amp, "toggle": bool(toggle)},
             audit_allowed=False,
         ):
-            return True
+            return False
         from rscp_client import RscpTag, RscpType
         mode = 1 if int(mode) == 1 else 2
         amp = int(max(6, min(32, amp or 6)))
@@ -3440,10 +3888,10 @@ class E3DCMultiConnectCharger(E3DCCharger):
             payload={"target_amp": target_amp, "force_state": force_state, "heartbeat": bool(is_heartbeat)},
             audit_allowed=False,
         ):
-            return True
+            return False
         with self.lock:
             if self.external_suspended:
-                return True
+                return False
             backend = self.control_backend
             if backend == E3DC_BACKEND_WBCHAR6:
                 return super()._send_command_internal(target_amp, force_state, is_heartbeat=is_heartbeat)
@@ -3527,16 +3975,71 @@ class E3DCMultiConnectCharger(E3DCCharger):
         p1 = p2 = p3 = 0.0
         alg = None
         param_current = None
+        phase_probe_values = ()
+        fixed_phase_probe = 0
+
+        for item in response:
+            if item.get('tag') != RscpTag.WB_DATA:
+                continue
+            container_phase_values = {}
+            container_fixed_phases = 0
+            for sub in item.get('value', []) or []:
+                tag = sub.get('tag')
+                value = sub.get('value')
+                phase_key = {
+                    RscpTag.WB_PM_POWER_L1: 'l1',
+                    RscpTag.WB_PM_POWER_L2: 'l2',
+                    RscpTag.WB_PM_POWER_L3: 'l3',
+                }.get(tag)
+                if phase_key is not None and (
+                    type(value) in (int, float)
+                    and math.isfinite(float(value))
+                    and abs(float(value)) <= MAX_PHASE_POWER_W
+                ):
+                    container_phase_values[phase_key] = float(value)
+                elif tag == RscpTag.WB_NUMBER_PHASES and value is not None:
+                    number_phases, valid = validate_mirror_read_item(
+                        sub,
+                        'WB_NUMBER_PHASES',
+                    )
+                    if valid and number_phases in (1, 3):
+                        container_fixed_phases = int(number_phases)
+            if (
+                not phase_probe_values
+                and container_fixed_phases in (1, 3)
+                and set(container_phase_values) == {'l1', 'l2', 'l3'}
+            ):
+                phase_probe_values = (
+                    container_phase_values['l1'],
+                    container_phase_values['l2'],
+                    container_phase_values['l3'],
+                )
+                fixed_phase_probe = container_fixed_phases
 
         for sub in self._iter_wb_items(response):
             tag = sub.get('tag')
             val = sub.get('value')
             if tag == RscpTag.WB_PM_POWER_L1 and val is not None:
-                p1 = float(val)
+                if (
+                    type(val) in (int, float)
+                    and math.isfinite(float(val))
+                    and abs(float(val)) <= MAX_PHASE_POWER_W
+                ):
+                    p1 = float(val)
             elif tag == RscpTag.WB_PM_POWER_L2 and val is not None:
-                p2 = float(val)
+                if (
+                    type(val) in (int, float)
+                    and math.isfinite(float(val))
+                    and abs(float(val)) <= MAX_PHASE_POWER_W
+                ):
+                    p2 = float(val)
             elif tag == RscpTag.WB_PM_POWER_L3 and val is not None:
-                p3 = float(val)
+                if (
+                    type(val) in (int, float)
+                    and math.isfinite(float(val))
+                    and abs(float(val)) <= MAX_PHASE_POWER_W
+                ):
+                    p3 = float(val)
             elif tag == RscpTag.WB_DEVICE_NAME:
                 value, valid = validate_mirror_read_item(sub, 'WB_DEVICE_NAME')
                 if valid:
@@ -3685,8 +4188,13 @@ class E3DCMultiConnectCharger(E3DCCharger):
             readback_ts=time.time() if transition_complete else 0.0,
         )
         status.update(self._backend_contract_fields())
+        status.update(self._rscp_diag_status())
         self.real_charging = bool(status['charging'])
-        return self._sanitize_measurement_status(status)
+        return self._finalize_native_status_sample(
+            status,
+            phase_values=phase_probe_values,
+            fixed_phases=fixed_phase_probe,
+        )
 
     def release_to_e3dc(self, max_amp=32):
         with self.lock:
@@ -3738,10 +4246,10 @@ class E3DCMultiConnectCharger(E3DCCharger):
             action="e3dc_multi_set_amp_sonnenmodus",
             payload={"target_amp": target_amp, "force_state": force_state},
         ):
-            return True
+            return False
         with self.lock:
             if request_generation != self._control_generation:
-                return True
+                return False
             self.external_suspended = False
             self.sonnenmodus = False
             return self._send_command_internal(target_amp, force_state, is_heartbeat=False)
@@ -3763,13 +4271,16 @@ class E3DCMultiConnectCharger(E3DCCharger):
             action="e3dc_multi_emergency_stop",
             payload={"target_amp": 0, "force_state": 1},
         ):
-            return True
+            return False
         logger.warning(f"[WB{self.wb_id}] Multi Connect emergency_stop(): Abort aktiv")
         with self.lock:
+            if self.real_charging is not True:
+                return False
             self.external_suspended = False
             self.last_amp = 0
             self.last_force_state = 1
-            self._send_command_internal(0, 1, is_heartbeat=False)
+            with command_gate.emergency_stop_scope(self):
+                return bool(self._send_command_internal(0, 1, is_heartbeat=False))
 
     def set_amp_and_state(self, target_amp, force_state=None):
         """Mischbetrieb: PV+Speicher/Netz je nach Manager-Modus."""
@@ -3779,10 +4290,10 @@ class E3DCMultiConnectCharger(E3DCCharger):
             action="e3dc_multi_set_amp_and_state",
             payload={"target_amp": target_amp, "force_state": force_state},
         ):
-            return True
+            return False
         with self.lock:
             if request_generation != self._control_generation:
-                return True
+                return False
             self.external_suspended = False
             self.sonnenmodus = False
             return self._send_command_internal(target_amp, force_state, is_heartbeat=False)
@@ -3812,7 +4323,21 @@ class OpenWBProCharger(WallboxDriver):
         self._last_phase_ts = 0.0
         self._heartbeat_enabled_assumed = False
         self._last_heartbeat_enable_ts = 0.0
+        # ``heartbeatenabled`` und ``ampere`` sind zwei getrennte mutierende
+        # connect.php-Aufrufe. Der Treiber merkt deshalb nach einer
+        # Heartbeat-Aktivierung nur den noch ausstehenden Sollstrom. Der
+        # Manager darf ihn frühestens in einem späteren, erneut autorisierten
+        # Zyklus senden.
+        self._heartbeat_pending_current_amp = None
+        self._heartbeat_pending_current_since_ts = 0.0
+        self._heartbeat_prepare_generation = 0
+        self._driver_instance_token = "%d:%d:%d" % (
+            os.getpid(),
+            self.wb_id,
+            time.time_ns(),
+        )
         self.state = {
+            "driver_instance_token": self._driver_instance_token,
             "car": 1,
             "amp": 0,
             "pha": 0,
@@ -4374,6 +4899,7 @@ class OpenWBProCharger(WallboxDriver):
             "imported_total_wh": round(self.state["imported_total_wh"], 0),
             "chargemode": self.state["chargemode_str"],
             "session_kwh": round(self.state["session_kwh"], 3),
+            "driver_instance_token": self._driver_instance_token,
             "cp_id": "pro",
             "wb_id": self.wb_id,
             "ts": int(time.time()),
@@ -4726,7 +5252,7 @@ class OpenWBProCharger(WallboxDriver):
         logger.error(f"[WB{self.wb_id}] openWB Pro Status nicht lesbar (/connect.php, /api/secc)")
         return None
 
-    def set_amp_and_state(self, target_amp, force_state=None):
+    def set_amp_and_state(self, target_amp, force_state=None, *args, **kwargs):
         if not command_gate.allow_command(
             self,
             action="openwb_pro_set_amp_and_state",
@@ -4742,19 +5268,43 @@ class OpenWBProCharger(WallboxDriver):
             raw_amp = 0.0
         if force_state == 1 or raw_amp < 0.5:
             amp = 0.0
+            # STOP/0 widerruft eine vorbereitete positive Stromausgabe bereits
+            # vor dem Wire-Versuch. Auch ein fehlgeschlagener STOP darf keinen
+            # alten positiven Strom in einem späteren Zyklus wiederbeleben.
+            self._clear_heartbeat_pending_current()
         else:
             amp = _quantize_current_amp(raw_amp, step=self.current_step_amp)
         now = time.time()
         control_key = ("ampere", amp)
         is_keepalive = self._last_control_key == control_key
         repeat_after_s = 5.0 if amp >= 6.0 else 20.0
-        if is_keepalive and now - self._last_control_ts < repeat_after_s:
+        emergency_zero = bool(
+            amp == 0.0
+            and force_state == 1
+            and command_gate.emergency_stop_scope_active(self)
+        )
+        if (
+            is_keepalive
+            and now - self._last_control_ts < repeat_after_s
+            and not emergency_zero
+        ):
             logger.debug(f"[WB{self.wb_id}] openWB Pro Sollstrom gedrosselt: {amp:.1f}A")
-            return True
+            # Kein POST, also auch kein neuer Ausgangsbeleg. Der Manager darf
+            # den alten Gerätezustand nur aus frischem Readback übernehmen.
+            return False
 
-        heartbeat_ok = True
         if amp >= 6.0:
-            heartbeat_ok = self._ensure_heartbeat_enabled(now)
+            heartbeat_was_fresh = bool(
+                self._heartbeat_enabled_assumed
+                and now - self._last_heartbeat_enable_ts < 300.0
+            )
+            if not self._ensure_heartbeat_enabled(now, prepare_current_amp=amp):
+                return False
+            if not heartbeat_was_fresh:
+                # Erfolgreiche Heartbeat-Aktivierung ist nur eine vorbereitende
+                # Hardwarekante. ``ampere`` folgt bewusst nicht im selben
+                # Aufruf/Managerzyklus.
+                return False
 
         # Match openWB's openWB-Pro module: set_current writes only ampere.
         # Start verification, wakeup and CP retries are manager policy and
@@ -4770,19 +5320,20 @@ class OpenWBProCharger(WallboxDriver):
             self.state["frc"] = 2 if amp >= 6 else 0
             self._last_control_key = control_key
             self._last_control_ts = now
+            self._clear_heartbeat_pending_current()
             if is_keepalive and amp >= 6.0:
                 logger.debug(f"[WB{self.wb_id}] openWB Pro Keepalive: {amp:.1f}A")
             else:
                 logger.info(f"[WB{self.wb_id}] openWB Pro Sollstrom: {amp:.1f}A")
-        return bool(ok and heartbeat_ok)
+        return bool(ok)
 
-    def set_phases(self, phases):
+    def set_phases(self, phases, require_wire_receipt=False, *args, **kwargs):
         if not command_gate.allow_command(
             self,
             action="openwb_pro_set_phases",
             payload={"phases": phases},
         ):
-            return True
+            return False
         phases = 1 if int(phases) == 1 else 3
         now = time.time()
         phase_key = ("phase", phases)
@@ -4797,7 +5348,7 @@ class OpenWBProCharger(WallboxDriver):
             and self.state.get("driver_status_degraded") is not True
             and reported_target == phases
         )
-        if fresh_target_readback:
+        if fresh_target_readback and not bool(require_wire_receipt):
             # Ein frisches identisches Ziel ist bereits vom Gerät angenommen.
             # Besonders nach einem Manager-Neustart darf ein laufender
             # Pro-eigener CP-/Phasenwechsel nicht durch denselben POST erneut
@@ -4811,10 +5362,14 @@ class OpenWBProCharger(WallboxDriver):
                     f"[WB{self.wb_id}] openWB Pro Phasenziel bereits frisch bestätigt: "
                     f"{phases}p, kein erneuter Wire-POST"
                 )
-            return True
-        if self._last_phase_key == phase_key and now - self._last_phase_ts < 20.0:
+            return False
+        if (
+            not bool(require_wire_receipt)
+            and self._last_phase_key == phase_key
+            and now - self._last_phase_ts < 20.0
+        ):
             logger.debug(f"[WB{self.wb_id}] openWB Pro Phasenziel gedrosselt: {phases}p")
-            return True
+            return False
         # Laut openWB-Pro-Standalone-API ist phasetarget der offizielle
         # Schalter. Die Pro uebernimmt die Pause/Signalisierung zum Fahrzeug
         # selbst; ein manueller CP-Interrupt waere hier doppelt.
@@ -4823,8 +5378,10 @@ class OpenWBProCharger(WallboxDriver):
             self._last_phase_key = phase_key
             self._last_phase_ts = now
             self._last_control_key = None
-            self.state["phases_target"] = phases
-            self.state["pha"] = 56 if phases == 3 else 8
+            # Der erfolgreiche POST ist nur ein Wire-Beleg. phases_target,
+            # pha und Istphasen dürfen ausschließlich ein späterer echter
+            # connect.php-GET aktualisieren.
+            self._last_commanded_phase_target = phases
             logger.info(f"[WB{self.wb_id}] openWB Pro Phasenziel: {phases}p")
         return ok
 
@@ -4834,18 +5391,35 @@ class OpenWBProCharger(WallboxDriver):
             action="openwb_pro_set_heartbeat",
             payload={"enabled": bool(enabled)},
         ):
-            return True
+            return False
         ok = self._post_control({"heartbeatenabled": "1" if enabled else "0"})
         if ok:
             self._heartbeat_enabled_assumed = bool(enabled)
             self._last_heartbeat_enable_ts = float(now) if enabled and now is not None else (time.time() if enabled else 0.0)
         return ok
 
-    def _ensure_heartbeat_enabled(self, now=None):
+    def _clear_heartbeat_pending_current(self):
+        """Widerruft eine vorbereitete Stromausgabe ohne Gerätezugriff."""
+
+        self._heartbeat_pending_current_amp = None
+        self._heartbeat_pending_current_since_ts = 0.0
+
+    def _ensure_heartbeat_enabled(self, now=None, prepare_current_amp=None):
         now = time.time() if now is None else float(now)
         if self._heartbeat_enabled_assumed and now - self._last_heartbeat_enable_ts < 300.0:
             return True
-        return self.set_heartbeat(True, now=now)
+        ok = self.set_heartbeat(True, now=now)
+        if not ok:
+            self._clear_heartbeat_pending_current()
+            return False
+        if prepare_current_amp is not None:
+            self._heartbeat_pending_current_amp = _quantize_current_amp(
+                prepare_current_amp,
+                step=self.current_step_amp,
+            )
+            self._heartbeat_pending_current_since_ts = now
+            self._heartbeat_prepare_generation += 1
+        return True
 
     def trigger_cp_interrupt(self, duration=None, version=None):
         if not command_gate.allow_command(
@@ -4853,7 +5427,7 @@ class OpenWBProCharger(WallboxDriver):
             action="openwb_pro_cp_interrupt",
             payload={"duration": duration, "version": version},
         ):
-            return True
+            return False
         payload = {"cp_interrupt": "true"}
         if duration is not None:
             try:
@@ -4870,13 +5444,14 @@ class OpenWBProCharger(WallboxDriver):
 
     def release_to_default(self, max_amp=32):
         """openWB Pro Standalone sicher freigeben, ohne blind 32A anzubieten."""
-        ok_heartbeat = self.set_heartbeat(True)
         ok_stop = self.set_amp_and_state(0, force_state=1)
         logger.info(
             f"[WB{self.wb_id}] openWB Pro Default-Freigabe: Standalone sicher gestoppt "
-            f"(heartbeat={ok_heartbeat}, stop={ok_stop})"
+            f"(stop={ok_stop})"
         )
-        return ok_heartbeat or ok_stop
+        # Ein fehlgeschlagener 0-A-Wirebeleg darf weder durch einen separaten
+        # Heartbeat kaschiert noch als erfolgreiche Freigabe gelatcht werden.
+        return bool(ok_stop)
 
 
 # ===========================================================================

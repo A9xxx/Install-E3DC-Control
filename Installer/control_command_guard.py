@@ -376,6 +376,66 @@ def _recent_restart_violation(
     }
 
 
+def commit_wallbox_command_decision(
+    decision: Dict[str, Any],
+    *,
+    status_path: Optional[str] = None,
+    history_path: Optional[str] = None,
+    start_stop_gap_s: int = 180,
+    phase_gap_s: int = 300,
+) -> Dict[str, Any]:
+    """Persistiere eine bereits bewertete Entscheidung erst nach Ausgangsbeleg."""
+
+    record = decision if isinstance(decision, dict) else {}
+    if not record:
+        return {}
+    status_file = status_path or _default_status_path()
+    history_file = history_path or _default_history_path()
+    now_value = _safe_float(record.get("ts"), time.time())
+    status = _read_json(status_file)
+    actors = status.get("actors") if isinstance(status.get("actors"), dict) else {}
+    actor = str(record.get("actor") or _wallbox_actor(record.get("wb_id", 0)))
+    actor_state = actors.get(actor) if isinstance(actors.get(actor), dict) else {}
+    event_max_age_s = max(1.0, float(start_stop_gap_s), float(phase_gap_s))
+    events = _trim_events(
+        actor_state.get("events") or [],
+        now_ts=now_value,
+        max_age_s=event_max_age_s,
+    )
+    action = str(record.get("action") or "NOOP").upper()
+    allowed = record.get("allowed") is True
+    candidate = record.get("candidate_event")
+    if allowed:
+        if isinstance(candidate, dict):
+            events = _trim_events(
+                events + [candidate],
+                now_ts=now_value,
+                max_age_s=event_max_age_s,
+            )
+        if action in {"START", "CURRENT"}:
+            actor_state["active"] = True
+        elif action == "STOP":
+            actor_state["active"] = False
+        if action in {"1P", "3P"}:
+            actor_state["phase"] = 3 if action == "3P" else 1
+    else:
+        actor_state["last_blocked"] = record
+
+    actor_state["events"] = events
+    actor_state["last_decision"] = record
+    actor_state["last_ts"] = round(now_value, 3)
+    actors[actor] = actor_state
+    status.update({
+        "ts": round(now_value, 3),
+        "service": "control_command_guard",
+        "status": "OK" if allowed else "WARN",
+        "last_decision": record,
+        "actors": actors,
+    })
+    _write_json_atomic(status_file, status)
+    _append_jsonl(history_file, record)
+    return record
+
 def evaluate_wallbox_command(
     command: Dict[str, Any],
     *,
@@ -387,6 +447,7 @@ def evaluate_wallbox_command(
     history_path: Optional[str] = None,
     start_stop_gap_s: int = 180,
     phase_gap_s: int = 300,
+    commit: bool = True,
 ) -> Dict[str, Any]:
     """Return whether a wallbox command may be sent to the real driver."""
 
@@ -464,33 +525,12 @@ def evaluate_wallbox_command(
         "violations": check.get("violations") or [],
     }
 
-    if allowed:
-        if candidate is not None:
-            events = _trim_events(
-                events + [candidate],
-                now_ts=now_value,
-                max_age_s=event_max_age_s,
-            )
-        if action in {"START", "CURRENT"}:
-            actor_state["active"] = True
-        elif action == "STOP":
-            actor_state["active"] = False
-        if action in {"1P", "3P"}:
-            actor_state["phase"] = 3 if action == "3P" else 1
-    else:
-        actor_state["last_blocked"] = decision
-
-    actor_state["events"] = events
-    actor_state["last_decision"] = decision
-    actor_state["last_ts"] = round(now_value, 3)
-    actors[actor] = actor_state
-    status.update({
-        "ts": round(now_value, 3),
-        "service": "control_command_guard",
-        "status": "OK" if allowed else "WARN",
-        "last_decision": decision,
-        "actors": actors,
-    })
-    _write_json_atomic(status_file, status)
-    _append_jsonl(history_file, decision)
-    return decision
+    if not commit:
+        return decision
+    return commit_wallbox_command_decision(
+        decision,
+        status_path=status_file,
+        history_path=history_file,
+        start_stop_gap_s=start_stop_gap_s,
+        phase_gap_s=phase_gap_s,
+    )

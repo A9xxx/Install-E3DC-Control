@@ -98,6 +98,7 @@ class HeatPolicyInput:
     battery_empty: bool = False
     price_block_started_ts: Optional[float] = None
     price_block_max_s: float = PRICE_BLOCK_MAX_S
+    price_block_control_authorized: bool = False
 
     forecast_deficit_kwh: float = 0.0
     forecast_valid: bool = True
@@ -239,7 +240,11 @@ def _price_block_reason(ctx: HeatPolicyInput) -> str:
 
 
 def _price_block_active(ctx: HeatPolicyInput) -> bool:
-    if not (ctx.expensive_price_window_active and ctx.battery_empty):
+    if not (
+        ctx.price_block_control_authorized
+        and ctx.expensive_price_window_active
+        and ctx.battery_empty
+    ):
         return False
     if _thermal_protection_required(ctx):
         return False
@@ -367,11 +372,22 @@ def decide_heat_policy(ctx: HeatPolicyInput) -> HeatPolicyDecision:
 
     ww_runtime_remaining_s = ww_cycle_min_runtime_remaining_s(ctx)
     if ctx.ww_cycle_running or ww_runtime_remaining_s > 0.0:
+        # Eine normale Preispräferenz darf einen bereits begonnenen
+        # Verdichter-/Warmwasserzyklus nicht vor seiner elektromechanischen
+        # Mindestlaufzeit abbrechen. Harte Nutzer-/Hersteller-/Quellenvetos
+        # wurden oberhalb dieses Blocks bereits ausgewertet.
+        if ww_runtime_remaining_s > 0.0:
+            return _protected_decision(ctx, "WW Cycle Hold Until 30min Minimum", "ww_cycle")
         price_pain = (
-            ctx.price_quality_valid
+            ctx.price_block_control_authorized
+            and ctx.price_quality_valid
             and ctx.current_price_ct is not None
             and _safe_float(ctx.current_price_ct, 0.0) > _safe_float(ctx.price_pain_limit_ct, 45.0)
             and not ctx.low_price_window_active
+            # Fehlt nach einem Restart der Startzeitanker, ist die abgelaufene
+            # Mindestzeit nicht belegt. Dann bleibt der laufende Zyklus
+            # konservativ geschützt.
+            and _safe_float(ctx.ww_cycle_started_ts, 0.0) > 0.0
         )
         if price_pain:
             return _decision(
@@ -382,8 +398,6 @@ def decide_heat_policy(ctx: HeatPolicyInput) -> HeatPolicyDecision:
                 "WW Cycle Stopped by Price Pain",
                 "ww_price_pain",
             )
-        if ww_runtime_remaining_s > 0.0:
-            return _protected_decision(ctx, "WW Cycle Hold Until 30min Minimum", "ww_cycle")
         return _protected_decision(ctx, "WW Cycle Hold Until Done", "ww_cycle")
 
     if _price_block_active(ctx):

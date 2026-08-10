@@ -28,6 +28,10 @@ except ImportError:  # pragma: no cover - HA owner leases require POSIX flock
 
 from config_secret_permissions import config_secret_dir_mode_text, config_secret_file_mode, config_secret_file_mode_text
 from quiet_logging import install_quiet_info_filter
+try:
+    from Installer.ha_writer_admission import instance_role_anchor_matches
+except ImportError:
+    from ha_writer_admission import instance_role_anchor_matches
 
 PATHS_FILE = "/var/www/html/e3dc_paths.json"
 _paths_warning_logged = False
@@ -95,9 +99,13 @@ if p_data.get('install_path'):
 CONFIG_PATH = "/var/www/html/data/e3dc_v4.json"
 LOG_DIR = "/var/www/html/logs"
 NOTIFY_SCRIPT = "/usr/local/bin/boot_notify.sh"
-HA_LEASE_DIR = "/var/www/html/data/.ha_runtime"
+# Der HA-Owner ist Hardwareautorität und darf deshalb nicht unter einem vom
+# Webdienst umbenennbaren Verzeichnis leben. Der HA-Dienst läuft als root;
+# Storage/Wallbox lesen den festen Beleg über ihre www-data-Gruppe.
+HA_LEASE_DIR = "/run/e3dc-control/ha"
 HA_LEASE_FILE = os.path.join(HA_LEASE_DIR, "owner_lease.json")
 HA_LEASE_LOCK_FILE = os.path.join(HA_LEASE_DIR, "owner_lease.lock")
+HA_ROLE_FILE = os.path.join(HA_LEASE_DIR, "instance_role.json")
 HA_LEASE_TTL_S = 180.0
 
 LEGACY_E3DC_SERVICE = "e3dc.service"
@@ -216,15 +224,23 @@ logger = setup_logging()
 
 def _ensure_private_runtime_dir(path):
     try:
-        os.makedirs(path, mode=0o700, exist_ok=True)
-        info = os.lstat(path)
+        if os.geteuid() != 0:
+            return False
+        namespace_root = os.path.dirname(path)
+        for directory in (namespace_root, path):
+            os.makedirs(directory, mode=0o755, exist_ok=True)
+            info = os.lstat(directory)
+            if (
+                stat.S_ISLNK(info.st_mode)
+                or not stat.S_ISDIR(info.st_mode)
+                or info.st_uid != 0
+                or info.st_gid != 0
+                or stat.S_IMODE(info.st_mode) != 0o755
+            ):
+                return False
     except OSError:
         return False
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-        return False
-    if stat.S_IMODE(info.st_mode) & 0o077:
-        return False
-    return info.st_uid == os.geteuid() or os.geteuid() == 0
+    return True
 
 
 def _read_private_json(path, max_bytes=65536):
@@ -236,9 +252,15 @@ def _read_private_json(path, max_bytes=65536):
     fd = os.open(path, flags)
     try:
         info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        www_data_gid = grp.getgrnam("www-data").gr_gid
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or info.st_uid != 0
+            or info.st_gid != www_data_gid
+        ):
             raise OSError("owner lease is not a single regular file")
-        if stat.S_IMODE(info.st_mode) & 0o077:
+        if stat.S_IMODE(info.st_mode) != 0o640:
             raise OSError("owner lease permissions are not private")
         if info.st_size > max_bytes:
             raise OSError("owner lease is too large")
@@ -268,8 +290,13 @@ def _write_private_json(path, payload):
         flags |= os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
-    fd = os.open(temp_path, flags, 0o600)
+    fd = os.open(temp_path, flags, 0o640)
     try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise OSError("owner lease is not a single regular file")
+        os.fchown(fd, 0, grp.getgrnam("www-data").gr_gid)
+        os.fchmod(fd, 0o640)
         raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
         offset = 0
         while offset < len(raw):
@@ -279,13 +306,50 @@ def _write_private_json(path, payload):
         os.close(fd)
     try:
         os.replace(temp_path, path)
-        os.chmod(path, 0o600)
+        directory_fd = os.open(
+            directory,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     finally:
         try:
             if os.path.lexists(temp_path):
                 os.unlink(temp_path)
         except OSError:
             pass
+
+
+def _write_role_anchor(mode, peer_ip=""):
+    """Projiziert nur die bereits privilegiert bestätigte Rolle zur Laufzeit."""
+
+    normalized_mode = str(mode or "").strip().lower()
+    if normalized_mode not in ("off", "master", "slave", "shadow"):
+        raise ValueError("ungültige HA-/Shadow-Rolle")
+    normalized_peer = validate_peer_ip(peer_ip) if normalized_mode in ("master", "slave") else ""
+    if normalized_mode in ("master", "slave") and not normalized_peer:
+        raise ValueError("HA-Rolle ohne gültigen Peer")
+    if not instance_role_anchor_matches(
+        normalized_mode,
+        peer_ip=normalized_peer,
+    ):
+        raise OSError("persistenter Instanzrollen-Anker stimmt nicht überein")
+    _write_private_json(
+        HA_ROLE_FILE,
+        {
+            "schema": 1,
+            "node_id": socket.gethostname(),
+            "mode": normalized_mode,
+            "peer_ip": normalized_peer,
+            "written_at": time.time(),
+        },
+    )
+    return True
 
 
 class OwnerLease:
@@ -324,15 +388,27 @@ class OwnerLease:
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         try:
-            fd = os.open(self.lock_path, flags, 0o600)
+            fd = os.open(self.lock_path, flags, 0o640)
             info = os.fstat(fd)
             if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
                 raise OSError("owner lock is not a single regular file")
-            if stat.S_IMODE(info.st_mode) & 0o077:
+            os.fchown(fd, 0, grp.getgrnam("www-data").gr_gid)
+            os.fchmod(fd, 0o640)
+            info = os.fstat(fd)
+            if (
+                info.st_uid != 0
+                or info.st_gid != grp.getgrnam("www-data").gr_gid
+                or stat.S_IMODE(info.st_mode) != 0o640
+            ):
                 raise OSError("owner lock permissions are not private")
             lock_file = os.fdopen(fd, "r+", encoding="utf-8")
             fd = -1
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock_file.seek(0)
+            lock_file.truncate(0)
+            lock_file.write(self.owner_id + "\n")
+            lock_file.flush()
+            os.fsync(lock_file.fileno())
         except (OSError, BlockingIOError) as exc:
             try:
                 if "lock_file" in locals():
@@ -1219,27 +1295,44 @@ def main_loop():
         auto_recover = config.get("ha_auto_recover", "1") in ["1", "true"]
         auto_failover = config.get("ha_auto_failover", "1") in ["1", "true"]
 
+        try:
+            _write_role_anchor(mode, peer_ip or raw_peer_ip)
+        except Exception as exc:
+            manage_services("stop", owner_lease=owner_lease)
+            write_status(
+                mode or "invalid",
+                "role_anchor_blocked",
+                False,
+                last_sync,
+                owner_lease=owner_lease,
+                safety_reason="role_anchor_failed:%s" % type(exc).__name__,
+            )
+            time.sleep(60)
+            continue
+
         if mode not in ("off", "master", "slave", "shadow"):
-            if owner_lease.held:
-                manage_services("stop", owner_lease=owner_lease)
+            manage_services("stop", owner_lease=owner_lease)
             write_status(mode, "config_error_invalid_mode", False, last_sync, safety_reason="invalid_mode")
             time.sleep(60)
             continue
-        if mode == "off" or not raw_peer_ip:
+        if mode == "off":
             if owner_lease.held:
                 manage_services("stop", owner_lease=owner_lease)
             write_status("off", "inactive", False, owner_lease=owner_lease)
             time.sleep(60)
             continue
         if mode == "shadow":
-            if owner_lease.held:
-                manage_services("stop", owner_lease=owner_lease)
+            manage_services("stop", owner_lease=owner_lease)
             write_status("shadow", "observe_only", False, last_sync, safety_reason="shadow_has_no_writer_lease")
             time.sleep(60)
             continue
+        if not raw_peer_ip:
+            manage_services("stop", owner_lease=owner_lease)
+            write_status(mode, "config_error_missing_peer", False, last_sync, safety_reason="missing_peer")
+            time.sleep(60)
+            continue
         if not peer_ip:
-            if owner_lease.held:
-                manage_services("stop", owner_lease=owner_lease)
+            manage_services("stop", owner_lease=owner_lease)
             write_status(mode, "config_error_invalid_peer", False, last_sync, safety_reason="invalid_peer")
             time.sleep(60)
             continue
@@ -1252,8 +1345,7 @@ def main_loop():
                 time.sleep(60)
                 continue
         if peer_points_to_self(peer_ip):
-            if owner_lease.held:
-                manage_services("stop", owner_lease=owner_lease)
+            manage_services("stop", owner_lease=owner_lease)
             write_status(mode, "config_error_self_peer", False, last_sync, safety_reason="self_peer")
             time.sleep(60)
             continue

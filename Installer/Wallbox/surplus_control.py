@@ -55,6 +55,9 @@ def surplus_control_step(
         or transition_active or cp_active or heatpump_starting or not marginal_actor
     )
 
+    if current < minimum and grant_target >= minimum:
+        blocked_up = bool(not data_valid or not marginal_actor or transition_active or cp_active or heatpump_starting)
+
     raw_target = min(grant_target, current)
     send_amp = current
     direction = "hold"
@@ -77,12 +80,17 @@ def surplus_control_step(
         next_ts = _float(now_ts, 0.0)
     elif grid < lower and grant_target > current + step * 0.5:
         raw_target = min(grant_target, current + max(0.0, (target_grid - grid) / w_per_amp))
+        if current < minimum and grant_target >= minimum:
+            raw_target = grant_target
         if blocked_up:
             send_amp = current
             direction = "hold"
             reason = "non_marginal_actor_hold" if not marginal_actor else "up_frozen"
         else:
-            up_limit = max(step, _float(max_up_step_a, 1.0))
+            if current < minimum and grant_target >= minimum:
+                up_limit = max(minimum, grant_target)
+            else:
+                up_limit = max(step, _float(max_up_step_a, 1.0))
             send_amp = _quantize_down(min(raw_target, current + up_limit), step)
             direction = "up" if send_amp > current + step * 0.5 else "hold"
             reason = "surplus_coarse_up" if raw_target - current > 2.0 * step else "surplus_fine_trim"

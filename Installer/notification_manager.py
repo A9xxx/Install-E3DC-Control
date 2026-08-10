@@ -3,6 +3,7 @@ import time
 import subprocess
 import os
 import json
+import stat
 from datetime import datetime
 
 V4_CONFIG = '/var/www/html/data/e3dc_v4.json'
@@ -70,6 +71,61 @@ def normalize_time(t_str):
         return f"{h:02d}:{m:02d}"
     except:
         return t_str
+
+
+def _consume_docker_restart_flag(path):
+    """Konsumiert genau das reguläre, inhaltlich gebundene Neustartflag."""
+    before = os.lstat(path)
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+        or before.st_size != 2
+        or stat.S_IMODE(before.st_mode) != 0o660
+    ):
+        raise RuntimeError("Neustartflag verletzt Typ-, Link- oder Größenvertrag")
+
+    open_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise RuntimeError("O_NOFOLLOW ist für den Neustartflag-Vertrag nicht verfügbar")
+    descriptor = os.open(path, open_flags | nofollow)
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or opened.st_size != 2
+            or stat.S_IMODE(opened.st_mode) != 0o660
+            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+        ):
+            raise RuntimeError("Neustartflag driftete beim sicheren Öffnen")
+        payload = os.read(descriptor, 3)
+        after_read = os.fstat(descriptor)
+        at_path = os.lstat(path)
+        if (
+            payload != b"1\n"
+            or (after_read.st_dev, after_read.st_ino, after_read.st_size)
+            != (opened.st_dev, opened.st_ino, opened.st_size)
+            or (at_path.st_dev, at_path.st_ino, at_path.st_size)
+            != (opened.st_dev, opened.st_ino, opened.st_size)
+            or at_path.st_nlink != 1
+            or not stat.S_ISREG(at_path.st_mode)
+            or stat.S_IMODE(at_path.st_mode) != 0o660
+        ):
+            raise RuntimeError("Neustartflag-Inhalt oder Inode ist nicht stabil gebunden")
+    finally:
+        os.close(descriptor)
+
+    final = os.lstat(path)
+    if (
+        (final.st_dev, final.st_ino, final.st_size)
+        != (before.st_dev, before.st_ino, before.st_size)
+        or final.st_nlink != 1
+        or not stat.S_ISREG(final.st_mode)
+        or stat.S_IMODE(final.st_mode) != 0o660
+    ):
+        raise RuntimeError("Neustartflag driftete vor dem Konsum")
+    os.unlink(path)
 
 def is_true(val):
     return str(val).lower() in ['1', 'true', 'on']
@@ -152,16 +208,35 @@ def main():
         # 7. Live History Writer (Jede Minute, ersetzt Cron)
         history_id = f"{c_date}_{c_time}"
         if last_run.get('history') != history_id and not is_standby:
-            safe_execute(["/usr/bin/php", "/var/www/html/get_live_json.php"], silent=True)
+            safe_execute(
+                [
+                    "/usr/bin/php",
+                    "/var/www/html/get_live_json.php",
+                    "--history-sample",
+                ],
+                silent=True,
+            )
             last_run['history'] = history_id
 
-        # 8. Docker Restart Signal pruefen
+        # 8. Docker-Neustartsignal: Das Entfernen bestätigt genau einen Konsum.
+        # Der ungleiche Exit wird von PID 1 über wait -n erkannt und beendet den
+        # vollständigen Dienstsatz; restart: unless-stopped startet ihn neu.
         restart_flag = "/var/www/html/ramdisk/restart_container.flag"
-        if os.path.exists(restart_flag):
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Restart-Flag erkannt. Beende C++ Kern fuer Container-Neustart...", flush=True)
-            try: os.remove(restart_flag)
-            except: pass
-            os.system("pkill -f E3DC-Control")
+        if os.environ.get("E3DC_CONTAINER_MODE") == "1" and os.path.lexists(restart_flag):
+            try:
+                _consume_docker_restart_flag(restart_flag)
+            except Exception as exc:
+                print(
+                    f"[{datetime.now().strftime('%H:%M:%S')}] Neustartflag konnte nicht sicher konsumiert werden: {exc}",
+                    flush=True,
+                )
+                raise SystemExit(74)
+            print(
+                f"[{datetime.now().strftime('%H:%M:%S')}] Neustartflag konsumiert. "
+                "Notifier beendet sich für den vollständigen Container-Neustart.",
+                flush=True,
+            )
+            raise SystemExit(75)
 
         time.sleep(10) # 10s Taktung für minütliche Präzision
 

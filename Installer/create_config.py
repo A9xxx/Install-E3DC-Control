@@ -1,13 +1,174 @@
+import hashlib
+import io
 import os
-import shutil
+import pwd
 
 from .core import register_command
-from .installer_config import get_install_path, get_home_dir, get_user_ids, get_www_data_gid, get_install_user
+from .installer_config import (
+    get_home_dir,
+    get_install_path,
+    get_user_ids,
+    get_www_data_gid,
+)
 from .logging_manager import get_or_create_logger, log_task_completed, log_error, log_warning
+from .secure_file_transaction import (
+    atomic_write_bound_file,
+    exclusive_transaction_lock,
+    read_bound_regular_file,
+    restore_bound_file,
+    snapshot_bound_file,
+    snapshots_match,
+)
 
-INSTALL_PATH = get_install_path()
-CONFIG_FILE = os.path.join(INSTALL_PATH, "e3dc.config.txt")
 config_logger = get_or_create_logger("config")
+_MAX_CONFIG_BYTES = 4 * 1024 * 1024
+_CONFIG_LOCK = "e3dc-product-config.lock"
+
+
+def _resolve_config_authority(*, install_path=None, install_user=None):
+    """Bindet Wizard und Ziel an Benutzer, passwd-Home und laufenden Release-Root."""
+
+    bootstrap_user = str(os.environ.get("E3DC_BOOTSTRAP_USER") or "").strip()
+    user = str(install_user or bootstrap_user).strip()
+    if not user or user in {"root", "www-data"}:
+        raise RuntimeError("Ein normaler Installationsbenutzer ist nicht gebunden")
+    if bootstrap_user and bootstrap_user != user:
+        raise RuntimeError(
+            "Expliziter Installationsbenutzer widerspricht dem Bootstrap-Nutzer"
+        )
+    try:
+        account = pwd.getpwnam(user)
+    except KeyError as exc:
+        raise RuntimeError("Der gebundene Installationsbenutzer existiert nicht") from exc
+
+    home_dir = get_home_dir(user)
+    if home_dir != str(account.pw_dir or "").strip():
+        raise RuntimeError("Das passwd-Home des Installationsbenutzers ist nicht eindeutig")
+
+    module_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    requested_root = str(install_path or get_install_path(user) or "").strip()
+    if (
+        not os.path.isabs(requested_root)
+        or os.path.abspath(requested_root) != requested_root
+        or os.path.realpath(requested_root) != requested_root
+        or requested_root != module_root
+        or os.path.realpath(module_root) != module_root
+    ):
+        raise RuntimeError(
+            "Konfigurationsziel entspricht nicht dem laufenden Produktroot"
+        )
+
+    uid, _ = get_user_ids(user)
+    gid = get_www_data_gid()
+    return {
+        "install_user": user,
+        "home_dir": home_dir,
+        "install_path": requested_root,
+        "config_path": os.path.join(requested_root, "e3dc.config.txt"),
+        "uid": int(uid),
+        "gid": int(gid),
+    }
+
+
+def _project_config_payload(payload, authority, *, source_snapshot=None):
+    """Projiziert exakt diese Bytes mit Readback und semantischem Rollback."""
+
+    if not isinstance(payload, bytes) or len(payload) > _MAX_CONFIG_BYTES:
+        raise RuntimeError("Konfigurationsbytes liegen außerhalb des Größenvertrags")
+    target = str(authority["config_path"])
+    uid = int(authority["uid"])
+    gid = int(authority["gid"])
+    payload_sha = hashlib.sha256(payload).hexdigest()
+
+    with exclusive_transaction_lock(_CONFIG_LOCK):
+        if (
+            source_snapshot is not None
+            and str(source_snapshot.get("path") or "") == target
+        ):
+            preimage = source_snapshot
+        else:
+            preimage = snapshot_bound_file(
+                target,
+                allow_missing=True,
+                max_bytes=_MAX_CONFIG_BYTES,
+            )
+        committed = None
+        try:
+            committed = atomic_write_bound_file(
+                target,
+                payload,
+                uid=uid,
+                gid=gid,
+                mode=0o640,
+                expected_snapshot=preimage,
+                max_existing_bytes=_MAX_CONFIG_BYTES,
+            )
+            readback = read_bound_regular_file(
+                target,
+                expected_uid=uid,
+                expected_gid=gid,
+                max_bytes=_MAX_CONFIG_BYTES,
+            )
+            if (
+                not snapshots_match(readback, committed, exact_metadata=True)
+                or readback.get("sha256") != payload_sha
+                or readback.get("payload") != payload
+                or readback.get("mode") != 0o640
+            ):
+                raise RuntimeError("Konfigurations-Readback weicht vom Commit ab")
+            return readback
+        except Exception as exc:
+            try:
+                current = snapshot_bound_file(
+                    target,
+                    allow_missing=True,
+                    max_bytes=_MAX_CONFIG_BYTES,
+                )
+            except Exception:
+                raise RuntimeError(
+                    "Konfigurationsrollback ist wegen nicht bindbarem Zieldrift gesperrt"
+                ) from exc
+
+            if snapshots_match(current, preimage, exact_metadata=True):
+                raise
+            ours = bool(
+                current.get("exists")
+                and current.get("kind") == "regular"
+                and current.get("sha256") == payload_sha
+                and current.get("uid") == uid
+                and current.get("gid") == gid
+                and current.get("mode") == 0o640
+            )
+            if committed is not None and snapshots_match(
+                current,
+                committed,
+                exact_metadata=False,
+            ):
+                ours = True
+            if not ours:
+                raise RuntimeError(
+                    "Konfigurationsrollback ist wegen Fremddrift gesperrt"
+                ) from exc
+
+            restored = restore_bound_file(
+                preimage,
+                expected_current=current,
+                max_bytes=_MAX_CONFIG_BYTES,
+            )
+            if preimage.get("exists"):
+                rollback_ok = bool(
+                    restored.get("exists")
+                    and restored.get("kind") == "regular"
+                    and restored.get("sha256") == preimage.get("sha256")
+                    and restored.get("uid") == preimage.get("uid")
+                    and restored.get("gid") == preimage.get("gid")
+                    and restored.get("mode") == preimage.get("mode")
+                )
+            else:
+                rollback_ok = not restored.get("exists")
+            if not rollback_ok:
+                raise RuntimeError("Konfigurationsrollback blieb unvollständig") from exc
+            raise
 
 
 def ask(prompt, default=None, headless=False):
@@ -24,43 +185,63 @@ def write_param(f, key, value, enabled=True):
     f.write(f"{prefix}{key} = {value}\n")
 
 
-def copy_existing_config():
+def copy_existing_config(*, install_path=None, install_user=None):
     """Kopiert eine vorhandene e3dc.config.txt in den Zielordner."""
     print("\n--- Vorhandene Konfiguration kopieren ---\n")
     config_logger.info("Versuche, eine vorhandene Konfiguration zu kopieren.")
 
-    default_source = os.path.join(get_home_dir(get_install_user()), "Install", "e3dc.config.txt")
-    source_path = ask("Pfad zur vorhandenen e3dc.config.txt", default_source)
-
-    if not os.path.exists(source_path):
-        print(f"✗ Datei nicht gefunden: {source_path}")
-        log_warning("create_config", f"Zu kopierende Konfigurationsdatei nicht gefunden: {source_path}")
+    try:
+        authority = _resolve_config_authority(
+            install_path=install_path,
+            install_user=install_user,
+        )
+    except Exception as exc:
+        print(f"✗ Konfigurationskontext ist nicht vertrauenswürdig: {exc}")
+        log_error("create_config", "Konfigurationskontext konnte nicht gebunden werden", exc)
         return False
 
-    if not os.path.isfile(source_path):
-        print(f"✗ Kein gültiger Dateipfad: {source_path}")
-        log_warning("create_config", f"Ungültiger Pfad für Konfigurationsdatei angegeben: {source_path}")
+    default_source = os.path.join(
+        authority["home_dir"],
+        "Install",
+        "e3dc.config.txt",
+    )
+    source_path = ask("Pfad zur vorhandenen e3dc.config.txt", default_source)
+    source_path = str(source_path or "").strip()
+    if (
+        not os.path.isabs(source_path)
+        or os.path.normpath(source_path) != source_path
+    ):
+        print(f"✗ Der Quellpfad muss absolut und kanonisch sein: {source_path}")
+        log_warning(
+            "create_config",
+            f"Nicht kanonischer Quellpfad für Konfigurationsdatei: {source_path}",
+        )
         return False
 
     try:
-        # Zielverzeichnis erstellen falls nicht vorhanden
-        os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
-
-        # Datei kopieren
-        shutil.copy2(source_path, CONFIG_FILE)
-        print(f"✓ Datei kopiert: {source_path} → {CONFIG_FILE}")
-        config_logger.info(f"Konfigurationsdatei kopiert von {source_path} nach {CONFIG_FILE}")
-
-        # Berechtigungen setzen
-        try:
-            uid, _ = get_user_ids()
-            os.chown(CONFIG_FILE, uid, get_www_data_gid())
-            os.chmod(CONFIG_FILE, 0o664)  # rw-rw-r--
-            print(f"✓ Berechtigungen gesetzt (664, Besitzer: UID {uid})")
-            config_logger.info(f"Berechtigungen für {CONFIG_FILE} gesetzt.")
-        except Exception as e:
-            print(f"⚠ Warnung: Berechtigungen konnten nicht vollständig gesetzt werden: {e}")
-            log_warning("create_config", f"Berechtigungen für kopierte Konfigurationsdatei konnten nicht gesetzt werden: {e}")
+        source_snapshot = read_bound_regular_file(
+            source_path,
+            expected_uid=authority["uid"],
+            max_bytes=_MAX_CONFIG_BYTES,
+        )
+        if int(source_snapshot.get("mode") or 0) & 0o022:
+            raise RuntimeError(
+                "Konfigurationsquelle ist gruppen- oder weltbeschreibbar"
+            )
+        _project_config_payload(
+            source_snapshot["payload"],
+            authority,
+            source_snapshot=source_snapshot,
+        )
+        print(
+            f"✓ Datei sicher projiziert: {source_path} → "
+            f"{authority['config_path']}"
+        )
+        config_logger.info(
+            "Konfigurationsdatei sicher projiziert von %s nach %s",
+            source_path,
+            authority["config_path"],
+        )
 
         print(f"\n✓ Konfiguration erfolgreich kopiert und installiert!\n")
         log_task_completed("Konfiguration erstellen", details="Vorhandene Konfiguration kopiert")
@@ -72,17 +253,30 @@ def copy_existing_config():
         return False
 
 
-def create_e3dc_config(headless=False):
+def create_e3dc_config(headless=False, *, install_path=None, install_user=None):
     """Kompletter Config-Wizard mit allen Parametern und Defaults."""
     print("\n=== E3DC-Konfiguration erstellen ===\n")
     config_logger.info("Starte Konfigurations-Wizard.")
+
+    try:
+        authority = _resolve_config_authority(
+            install_path=install_path,
+            install_user=install_user,
+        )
+    except Exception as exc:
+        print(f"✗ Konfigurationskontext ist nicht vertrauenswürdig: {exc}")
+        log_error("create_config", "Konfigurationskontext konnte nicht gebunden werden", exc)
+        return False
 
     # Prüfen ob vorhandene Config kopiert werden soll
     copy_existing = ask("Möchtest du eine vorhandene e3dc.config.txt kopieren? (j/n)", "n", headless)
 
     if copy_existing and copy_existing.lower() == "j":
-        if copy_existing_config():
-            return  # Erfolgreich kopiert, Wizard beenden
+        if copy_existing_config(
+            install_path=authority["install_path"],
+            install_user=authority["install_user"],
+        ):
+            return True
         else:
             print("\nFortfahren mit manuellem Wizard...\n")
             config_logger.warning("Kopieren der Konfiguration fehlgeschlagen, fahre mit manuellem Wizard fort.")
@@ -274,128 +468,172 @@ def create_e3dc_config(headless=False):
     # =========================================================
     # DATEI SCHREIBEN
     # =========================================================
-    write_e3dc_config(cfg)
-    print(f"\n✓ Konfiguration gespeichert unter {CONFIG_FILE}\n")
+    if write_e3dc_config(
+        cfg,
+        install_path=authority["install_path"],
+        install_user=authority["install_user"],
+    ) is not True:
+        return False
+    print(f"\n✓ Konfiguration gespeichert unter {authority['config_path']}\n")
     log_task_completed("Konfiguration erstellen", details="Manuell über Wizard erstellt")
+    return True
 
 
-def write_e3dc_config(cfg):
-    """Schreibt die Konfigurationsdatei."""
+def write_e3dc_config(cfg, *, install_path=None, install_user=None):
+    """Rendert im Speicher und projiziert die Konfiguration transaktional."""
+
     try:
-        os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+        authority = _resolve_config_authority(
+            install_path=install_path,
+            install_user=install_user,
+        )
+        with io.StringIO() as f:
+            # Grunddaten
+            write_param(f, "server_ip", cfg["server_ip"])
+            write_param(f, "server_port", cfg["server_port"])
+            write_param(f, "e3dc_user", cfg["user"])
+            write_param(f, "e3dc_password", cfg["password"])
+            write_param(f, "aes_password", cfg["aes"])
 
-        # Umask setzen für korrekte File-Berechtigungen
-        old_umask = os.umask(0o002)
-        try:
-            with open(CONFIG_FILE, "w") as f:
-                # Grunddaten
-                write_param(f, "server_ip", cfg["server_ip"])
-                write_param(f, "server_port", cfg["server_port"])
-                write_param(f, "e3dc_user", cfg["user"])
-                write_param(f, "e3dc_password", cfg["password"])
-                write_param(f, "aes_password", cfg["aes"])
+            f.write("\n# Leistungs- und Speicherparameter\n")
+            write_param(f, "wrleistung", cfg["wrleistung"])
+            write_param(f, "speichergroesse", cfg["speichergroesse"])
+            write_param(f, "speicherEV", cfg["speicherEV"])
+            write_param(f, "speicherETA", cfg["speicherETA"])
+            write_param(f, "einspeiselimit", cfg["einspeiselimit"])
+            write_param(f, "unload", cfg["unload"])
+            write_param(f, "ladeschwelle", cfg["ladeschwelle"])
+            write_param(f, "ladeende", cfg["ladeende"])
+            write_param(f, "ladeende2", cfg["ladeende2"])
+            write_param(f, "Ladeende2rampe", cfg["Ladeende2rampe"])
+            write_param(f, "maximumLadeleistung", cfg["maximumLadeleistung"])
+            write_param(f, "powerfaktor", cfg["powerfaktor"])
+            write_param(f, "rb", cfg["rb"])
+            write_param(f, "re", cfg["re"])
+            write_param(f, "le", cfg["le"])
 
-                f.write("\n# Leistungs- und Speicherparameter\n")
-                write_param(f, "wrleistung", cfg["wrleistung"])
-                write_param(f, "speichergroesse", cfg["speichergroesse"])
-                write_param(f, "speicherEV", cfg["speicherEV"])
-                write_param(f, "speicherETA", cfg["speicherETA"])
-                write_param(f, "einspeiselimit", cfg["einspeiselimit"])
-                write_param(f, "unload", cfg["unload"])
-                write_param(f, "ladeschwelle", cfg["ladeschwelle"])
-                write_param(f, "ladeende", cfg["ladeende"])
-                write_param(f, "ladeende2", cfg["ladeende2"])
-                write_param(f, "Ladeende2rampe", cfg["Ladeende2rampe"])
-                write_param(f, "maximumLadeleistung", cfg["maximumLadeleistung"])
-                write_param(f, "powerfaktor", cfg["powerfaktor"])
-                write_param(f, "rb", cfg["rb"])
-                write_param(f, "re", cfg["re"])
-                write_param(f, "le", cfg["le"])
+            is_wb_configured = False
+            try:
+                is_wb_configured = int(cfg.get("wallbox", -1)) >= 0
+            except (ValueError, TypeError):
+                pass
 
-                is_wb_configured = False
-                try:
-                    is_wb_configured = int(cfg.get("wallbox", -1)) >= 0
-                except (ValueError, TypeError):
-                    pass
+            # Wallbox
+            f.write("\n# Wallbox Parameter\n")
+            write_param(f, "wallbox", cfg["wallbox"])
+            write_param(f, "wbmode", cfg.get("wbmode", ""), is_wb_configured)
+            write_param(f, "wbminlade", cfg.get("wbminlade", ""), is_wb_configured)
+            write_param(f, "wbminSoC", cfg.get("wbminSoC", ""), is_wb_configured)
+            write_param(f, "wbmaxladestrom", cfg.get("wbmaxladestrom", ""), is_wb_configured)
+            write_param(f, "wbminladestrom", cfg.get("wbminladestrom", ""), is_wb_configured)
+            write_param(f, "wbhour", cfg.get("wbhour", ""), is_wb_configured)
+            write_param(f, "Wbvon", cfg.get("Wbvon", ""), is_wb_configured)
+            write_param(f, "Wbbis", cfg.get("Wbbis", ""), is_wb_configured)
 
-                # Wallbox
-                f.write("\n# Wallbox Parameter\n")
-                write_param(f, "wallbox", cfg["wallbox"])
-                write_param(f, "wbmode", cfg.get("wbmode", ""), is_wb_configured)
-                write_param(f, "wbminlade", cfg.get("wbminlade", ""), is_wb_configured)
-                write_param(f, "wbminSoC", cfg.get("wbminSoC", ""), is_wb_configured)
-                write_param(f, "wbmaxladestrom", cfg.get("wbmaxladestrom", ""), is_wb_configured)
-                write_param(f, "wbminladestrom", cfg.get("wbminladestrom", ""), is_wb_configured)
-                write_param(f, "wbhour", cfg.get("wbhour", ""), is_wb_configured)
-                write_param(f, "Wbvon", cfg.get("Wbvon", ""), is_wb_configured)
-                write_param(f, "Wbbis", cfg.get("Wbbis", ""), is_wb_configured)
+            # Wärmepumpe
+            f.write("\n# Wärmepumpe Parameter\n")
+            write_param(f, "WP", str(cfg["WP"]).lower())
+            write_param(f, "shellyem_ip", cfg.get("shellyem_ip", ""), cfg["WP"])
+            write_param(f, "WPHeizlast", cfg.get("WPHeizlast", ""), cfg["WP"])
+            write_param(f, "WPHeizgrenze", cfg.get("WPHeizgrenze", ""), cfg["WP"])
+            write_param(f, "WPLeistung", cfg.get("WPLeistung", ""), cfg["WP"])
+            write_param(f, "WPMin", cfg.get("WPMin", ""), cfg["WP"])
+            write_param(f, "WPMax", cfg.get("WPMax", ""), cfg["WP"])
 
-                # Wärmepumpe
-                f.write("\n# Wärmepumpe Parameter\n")
-                write_param(f, "WP", str(cfg["WP"]).lower())
-                write_param(f, "shellyem_ip", cfg.get("shellyem_ip", ""), cfg["WP"])
-                write_param(f, "WPHeizlast", cfg.get("WPHeizlast", ""), cfg["WP"])
-                write_param(f, "WPHeizgrenze", cfg.get("WPHeizgrenze", ""), cfg["WP"])
-                write_param(f, "WPLeistung", cfg.get("WPLeistung", ""), cfg["WP"])
-                write_param(f, "WPMin", cfg.get("WPMin", ""), cfg["WP"])
-                write_param(f, "WPMax", cfg.get("WPMax", ""), cfg["WP"])
+            write_param(f, "heizstab", cfg.get("heizstab", "0"))
+            write_param(
+                f,
+                "heizstab_ip",
+                cfg.get("heizstab_ip", ""),
+                cfg.get("heizstab", "0") == "1",
+            )
 
-                write_param(f, "heizstab", cfg.get("heizstab", "0"))
-                write_param(f, "heizstab_ip", cfg.get("heizstab_ip", ""), cfg.get("heizstab", "0") == "1")
+            # Direktvermarktung
+            f.write("\n# Direktvermarktung\n")
+            write_param(f, "dv", cfg.get("dv", "0"))
+            write_param(
+                f,
+                "dvwbkwh",
+                cfg.get("dvwbkwh", "30"),
+                cfg.get("dv", "0") == "1",
+            )
+            write_param(
+                f,
+                "dvmp",
+                cfg.get("dvmp", "60"),
+                cfg.get("dv", "0") == "1",
+            )
 
-                # Direktvermarktung
-                f.write("\n# Direktvermarktung\n")
-                write_param(f, "dv", cfg.get("dv", "0"))
-                write_param(f, "dvwbkwh", cfg.get("dvwbkwh", "30"), cfg.get("dv", "0") == "1")
-                write_param(f, "dvmp", cfg.get("dvmp", "60"), cfg.get("dv", "0") == "1")
+            # Awattar
+            f.write("\n# Awattar Parameter\n")
+            write_param(f, "awattar", str(cfg["awattar"]).lower())
+            write_param(f, "awmwst", cfg.get("awmwst", ""), cfg["awattar"])
+            write_param(f, "awnebenkosten", cfg.get("awnebenkosten", ""), cfg["awattar"])
+            write_param(f, "awaufschlag", cfg.get("awaufschlag", ""), cfg["awattar"])
+            write_param(f, "awland", cfg.get("awland", ""), cfg["awattar"])
+            write_param(f, "awreserve", cfg.get("awreserve", ""), cfg["awattar"])
 
-                # Awattar
-                f.write("\n# Awattar Parameter\n")
-                write_param(f, "awattar", str(cfg["awattar"]).lower())
-                write_param(f, "awmwst", cfg.get("awmwst", ""), cfg["awattar"])
-                write_param(f, "awnebenkosten", cfg.get("awnebenkosten", ""), cfg["awattar"])
-                write_param(f, "awaufschlag", cfg.get("awaufschlag", ""), cfg["awattar"])
-                write_param(f, "awland", cfg.get("awland", ""), cfg["awattar"])
-                write_param(f, "awreserve", cfg.get("awreserve", ""), cfg["awattar"])
+            # Telegram
+            f.write("\n# Telegram Benachrichtigungen\n")
+            write_param(f, "telegram_token", cfg.get("telegram_token", ""))
+            write_param(f, "telegram_chat_id", cfg.get("telegram_chat_id", ""))
+            write_param(
+                f,
+                "telegram_stats_enable",
+                cfg.get("telegram_stats_enable", "0"),
+            )
+            write_param(
+                f,
+                "telegram_weekly_enable",
+                cfg.get("telegram_weekly_enable", "1"),
+            )
 
-                # Telegram
-                f.write("\n# Telegram Benachrichtigungen\n")
-                write_param(f, "telegram_token", cfg.get("telegram_token", ""))
-                write_param(f, "telegram_chat_id", cfg.get("telegram_chat_id", ""))
-                write_param(f, "telegram_stats_enable", cfg.get("telegram_stats_enable", "0"))
-                write_param(f, "telegram_weekly_enable", cfg.get("telegram_weekly_enable", "1"))
+            # OpenMeteo + Forecast
+            f.write("\n# OpenMeteo & Forecast Parameter\n")
+            write_param(f, "openmeteo", str(cfg["openmeteo"]).lower())
+            write_param(f, "hoehe", cfg.get("hoehe", ""), cfg["openmeteo"])
+            write_param(f, "laenge", cfg.get("laenge", ""), cfg["openmeteo"])
+            write_param(f, "forecast1", cfg.get("forecast1", ""), cfg["openmeteo"])
+            write_param(
+                f,
+                "forecast2",
+                cfg.get("forecast2", ""),
+                cfg.get("forecast2_enabled", False),
+            )
+            write_param(
+                f,
+                "forecast3",
+                cfg.get("forecast3", ""),
+                cfg.get("forecast3_enabled", False),
+            )
+            write_param(f, "ForecastSoc", cfg.get("ForecastSoc", ""), cfg["openmeteo"])
+            write_param(
+                f,
+                "ForecastConsumption",
+                cfg.get("ForecastConsumption", ""),
+                cfg["openmeteo"],
+            )
+            write_param(
+                f,
+                "ForecastReserve",
+                cfg.get("ForecastReserve", ""),
+                cfg["openmeteo"],
+            )
+            payload = f.getvalue().encode("utf-8")
 
-                # OpenMeteo + Forecast
-                f.write("\n# OpenMeteo & Forecast Parameter\n")
-                write_param(f, "openmeteo", str(cfg["openmeteo"]).lower())
-                write_param(f, "hoehe", cfg.get("hoehe", ""), cfg["openmeteo"])
-                write_param(f, "laenge", cfg.get("laenge", ""), cfg["openmeteo"])
-                write_param(f, "forecast1", cfg.get("forecast1", ""), cfg["openmeteo"])
-                write_param(f, "forecast2", cfg.get("forecast2", ""), cfg.get("forecast2_enabled", False))
-                write_param(f, "forecast3", cfg.get("forecast3", ""), cfg.get("forecast3_enabled", False))
-                write_param(f, "ForecastSoc", cfg.get("ForecastSoc", ""), cfg["openmeteo"])
-                write_param(f, "ForecastConsumption", cfg.get("ForecastConsumption", ""), cfg["openmeteo"])
-                write_param(f, "ForecastReserve", cfg.get("ForecastReserve", ""), cfg["openmeteo"])
-        finally:
-            os.umask(old_umask)
-
-        config_logger.info(f"Konfigurationsdatei erfolgreich geschrieben: {CONFIG_FILE}")
-
-        # Setze korrekten Owner und Berechtigungen
-        try:
-            uid, _ = get_user_ids()
-            os.chown(CONFIG_FILE, uid, get_www_data_gid())
-            os.chmod(CONFIG_FILE, 0o664)      # rw-rw-r-- damit PHP schreiben kann
-            config_logger.info(f"Berechtigungen für {CONFIG_FILE} gesetzt.")
-        except Exception as e:
-            print(f"⚠ Warnung: Berechtigungen konnten nicht vollständig gesetzt werden: {e}")
-            log_warning("create_config", f"Berechtigungen für {CONFIG_FILE} konnten nicht gesetzt werden: {e}")
-            pass
-
+        _project_config_payload(payload, authority)
+        config_logger.info(
+            "Konfigurationsdatei sicher geschrieben: %s",
+            authority["config_path"],
+        )
         return True
     except Exception as e:
         print(f"✗ Fehler beim Schreiben der Konfiguration: {e}")
-        log_error("create_config", f"Fehler beim Schreiben der Konfigurationsdatei: {e}", e)
+        log_error(
+            "create_config",
+            f"Fehler beim Schreiben der Konfigurationsdatei: {e}",
+            e,
+        )
         return False
 
 

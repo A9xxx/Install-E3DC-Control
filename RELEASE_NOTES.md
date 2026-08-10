@@ -1,3 +1,21 @@
+# E3DC-Control v5.4.3c
+
+E3DC-Control 5.4.3c behebt den letzten reproduzierten Abbruch der
+Bare-Metal-Installation im Notifier-Dienstvertrag.
+
+## Notifier-Transaktion
+
+- Das temporäre systemd-Start-Drop-in des Notifier-Installers wird jetzt mit
+  demselben gebundenen Unit-Snapshotformat wie die übrigen Drop-ins geprüft.
+- Der eigene Schutzblock wird dadurch nicht länger als fremder Drift gewertet.
+- Installation, Dienststart und ein notwendiger Rückfall bleiben weiterhin
+  eindeutig, transaktional und fail-closed.
+
+Dieser Hotfix enthält außerdem 5.4.3a und 5.4.3b und ändert keine
+EMS-Regelung.
+
+---
+
 # E3DC-Control v5.4.3b
 
 E3DC-Control 5.4.3b ergänzt den Bare-Metal-Updatehotfix um den

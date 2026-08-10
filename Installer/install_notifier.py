@@ -2328,7 +2328,7 @@ def _install_notifier_start_block(transaction: _NotifierTransaction) -> None:
 
 
 def _blocked_service_snapshot(transaction: _NotifierTransaction) -> dict[str, object]:
-    from .utils import _systemd_show_contract
+    from .utils import _read_bound_unit_preimage, _systemd_show_contract
 
     original = transaction.service_original_snapshot or transaction.service_snapshot
     snapshot = copy.deepcopy(original)
@@ -2338,8 +2338,13 @@ def _blocked_service_snapshot(transaction: _NotifierTransaction) -> dict[str, ob
         Mapping,
     ):
         raise NotifierRecoveryRequired("Notifier-Service-Vorzustand ist nicht gebunden")
+    if not _file_matches_snapshot(transaction.start_block_postimage):
+        raise NotifierRecoveryRequired("Notifier-Startblock driftete vor dem Dienstsnapshot")
+    bound_start_block = _read_bound_unit_preimage(transaction.start_block_path)
+    if bound_start_block is None:
+        raise NotifierRecoveryRequired("Notifier-Startblock fehlt im Dienstsnapshot")
     pre_dropins = dict(unit.get("pre_dropins") or {})
-    pre_dropins[transaction.start_block_path] = transaction.start_block_postimage
+    pre_dropins[transaction.start_block_path] = bound_start_block
     unit["pre_dropins"] = pre_dropins
     state = _systemd_show_contract(NOTIFIER_UNIT)
     for key, value in state.items():

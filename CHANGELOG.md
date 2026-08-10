@@ -6,6 +6,12 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.3c] – 2026-08-10
+
+### 🔔 Notifier-Transaktion
+
+- **Eigener Startblock wird korrekt versiegelt:** Der Notifier-Installer bindet sein vorübergehendes systemd-Start-Drop-in mit demselben Unit-Snapshotvertrag wie alle übrigen Drop-ins. Dadurch wird der eigene Schutzblock nicht mehr fälschlich als fremder Drift bewertet; Installation, Commit und eindeutiger Rückfall bleiben fail-closed.
+
 ## [5.4.3b] – 2026-08-10
 
 ### 🔐 Debian-Lockroot

@@ -30,6 +30,22 @@ class SecureFileTransactionError(RuntimeError):
     """Ein Datei- oder Namensvertrag konnte nicht eindeutig bewiesen werden."""
 
 
+def _lock_root_is_trusted(metadata: os.stat_result) -> bool:
+    """Akzeptiert den root-eigenen Sticky-Lockroot üblicher Linux-Systeme."""
+
+    mode = stat.S_IMODE(metadata.st_mode)
+    sticky_shared_root = (
+        metadata.st_uid == 0
+        and metadata.st_gid == 0
+        and bool(mode & stat.S_ISVTX)
+    )
+    return bool(
+        metadata.st_uid == 0
+        and not (mode & stat.S_IWOTH and not sticky_shared_root)
+        and not (mode & stat.S_IWGRP and metadata.st_gid != 0)
+    )
+
+
 def _normalise_absolute(path: str | os.PathLike[str]) -> str:
     value = os.fspath(path)
     if not value or "\x00" in value or not os.path.isabs(value):
@@ -1476,12 +1492,7 @@ def exclusive_transaction_lock(name: str):
     descriptor = -1
     try:
         root_info = os.fstat(root_descriptor)
-        root_mode = stat.S_IMODE(root_info.st_mode)
-        if (
-            root_info.st_uid != 0
-            or root_mode & stat.S_IWOTH
-            or (root_mode & stat.S_IWGRP and root_info.st_gid != 0)
-        ):
+        if not _lock_root_is_trusted(root_info):
             raise SecureFileTransactionError("/run/lock ist nicht root-kontrolliert")
         descriptor = os.open(
             normalised,

@@ -6,6 +6,12 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.3b] – 2026-08-10
+
+### 🔐 Debian-Lockroot
+
+- **Standardkonformer `/run/lock`-Vertrag:** Der root-eigene, mit Sticky-Bit geschützte Debian-Lockroot `1777` wird als sicherer gemeinsamer Namensraum akzeptiert. Transaktionsdateien bleiben regulär, root-eigen, einfach verlinkt, `0600`, nofollow-gebunden und exklusiv gesperrt; ein weltbeschreibbarer Lockroot ohne Sticky-Bit bleibt fail-closed.
+
 ## [5.4.3a] – 2026-08-10
 
 ### 🔐 Bare-Metal-Update

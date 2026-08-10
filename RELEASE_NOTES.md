@@ -1,3 +1,21 @@
+# E3DC-Control v5.4.3b
+
+E3DC-Control 5.4.3b ergänzt den Bare-Metal-Updatehotfix um den
+standardkonformen Debian-Lockroot.
+
+## Debian-Lockroot
+
+- Ein root-eigenes `/run/lock` mit Modus `1777` und gesetztem Sticky-Bit wird
+  als sicherer gemeinsamer Lock-Namensraum akzeptiert.
+- Die eigentliche Transaktionsdatei bleibt root-eigen, `0600`, regulär,
+  einfach verlinkt, nofollow-gebunden und exklusiv gesperrt.
+- Ein weltbeschreibbares `/run/lock` ohne Sticky-Bit bleibt fail-closed.
+
+Dieser Hotfix enthält außerdem die Benutzerübergabe aus 5.4.3a und ändert
+keine EMS-Regelung.
+
+---
+
 # E3DC-Control v5.4.3a
 
 E3DC-Control 5.4.3a ist ein eng begrenzter Hotfix für den versiegelten

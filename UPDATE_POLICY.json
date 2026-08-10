@@ -1,9 +1,9 @@
 {
-  "version": "5.4.3a",
+  "version": "5.4.3b",
   "min_version": "4.0.0",
-  "stable_release": "v5.4.3a",
+  "stable_release": "v5.4.3b",
   "release_date": "2026-08-10",
-  "description": "v5.4.3a - Hotfix für den versiegelten Bare-Metal-Updateübergang",
+  "description": "v5.4.3b - Hotfix für den Debian-Transaktions-Lockroot",
   "installer_requires": "python3",
   "sanitized_republication": false,
   "history_transition": {

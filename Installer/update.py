@@ -5513,6 +5513,7 @@ def _invoke_verified_target_updater(
             environment.pop(name, None)
         environment["E3DC_BOOTSTRAP_ROOT"] = repo_dir
         environment["E3DC_BOOTSTRAP_RUNNER_ROOT"] = runner_root
+        environment["E3DC_BOOTSTRAP_USER"] = install_user
         environment["E3DC_INSTALL_ROOT"] = repo_dir
         environment["PYTHONNOUSERSITE"] = "1"
         environment["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -5682,6 +5683,7 @@ def _invoke_target_finalizer(
         environment.pop(name, None)
     environment["E3DC_BOOTSTRAP_ROOT"] = repo_dir
     environment["E3DC_BOOTSTRAP_RUNNER_ROOT"] = snapshot_root
+    environment["E3DC_BOOTSTRAP_USER"] = install_user
     environment["E3DC_INSTALL_ROOT"] = repo_dir
     environment["PYTHONNOUSERSITE"] = "1"
     environment["PYTHONDONTWRITEBYTECODE"] = "1"

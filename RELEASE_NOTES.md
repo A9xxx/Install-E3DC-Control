@@ -1,3 +1,24 @@
+# E3DC-Control v5.4.3a
+
+E3DC-Control 5.4.3a ist ein eng begrenzter Hotfix für den versiegelten
+Bare-Metal-Updateübergang von 5.4.3.
+
+## Bare-Metal-Update
+
+- Der bereits lokal geprüfte Installationsbenutzer wird jetzt über beide
+  versiegelten Prozesswechsel an den Ziel-Updater und den Target-Finalizer
+  weitergegeben.
+- Dadurch kann der Finalizer die lokale Installer-Rolle bestätigen, obwohl
+  `installer_config.json` als lokale Betriebsdatei bewusst nicht im
+  unveränderlichen Commit-Snapshot enthalten ist.
+- Ziel-Commit, Stable-Tag, HA-Rolle, Backup, Aktorruhe, Dienste und
+  Gesundheitsprüfungen bleiben unverändert fail-closed gebunden.
+
+Dieser Hotfix ändert keine EMS-, Speicher-, Wallbox-, Wärme- oder
+Direktvermarktungsregelung.
+
+---
+
 # E3DC-Control v5.4.3
 
 E3DC-Control 5.4.3 bündelt Verbesserungen für Installation, Docker,

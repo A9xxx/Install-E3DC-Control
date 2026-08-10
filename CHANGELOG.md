@@ -6,6 +6,13 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.3a] – 2026-08-10
+
+### 🔐 Bare-Metal-Update
+
+- **Installationsrolle bleibt über beide versiegelten Prozesswechsel gebunden:** Der bereits lokal geprüfte Installationsbenutzer wird sowohl an den Ziel-Updater als auch an den nachgelagerten Target-Finalizer weitergegeben. Dadurch kann eine bestehende Bare-Metal-Installation den veröffentlichten Zielstand vollständig sichern, projizieren und prüfen, obwohl die lokale `installer_config.json` bewusst nicht Teil des unveränderlichen Ausführungssnapshots ist.
+- **Keine Lockerung der Schutzprüfungen:** Nutzerkonto, lokale Rollenmetadaten, Ziel-Commit, Stable-Tag, HA-Rolle, Backup, Aktorruhe, Dienstzustand und HTTP-Gesundheit bleiben unverändert zwingend. Eine fehlende oder widersprüchliche lokale Benutzerbindung wird weiterhin vor einer Produktprojektion abgewiesen.
+
 ## [5.4.3] – 2026-08-10
 
 ### 📦 Update, Reparatur und langsame Systeme

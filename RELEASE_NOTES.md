@@ -1,3 +1,21 @@
+# E3DC-Control v5.4.3d
+
+E3DC-Control 5.4.3d behebt den Containerstart nach dem Update auf 5.4.3.
+
+## Docker-Start
+
+- Der Production-Container bindet seine eigene Root-Installationsrolle nur bei
+  aktivem Docker-Modus und dem exakten Produktpfad `/app/pi/Install`.
+- Die Sicherung und Migration der V4-Konfiguration läuft dadurch wieder durch.
+- Bare-Metal-Installationen erhalten keine zusätzliche Root-Freigabe.
+- Vor der OCI-Beförderung wird der gebaute Kandidat künftig real gestartet und
+  muss die Konfigurationsmigration mit einer echten tmpfs-RAM-Disk verlassen.
+
+Wer wegen Watchtower bereits zurück auf 5.4.2d gewechselt hat, kann diesen Pin
+bis zur erfolgreich veröffentlichten Version 5.4.3d beibehalten.
+
+---
+
 # E3DC-Control v5.4.3c
 
 E3DC-Control 5.4.3c behebt den letzten reproduzierten Abbruch der

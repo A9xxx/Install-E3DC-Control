@@ -7,7 +7,7 @@ on:
         description: "Exact approved release tag"
         required: true
         type: choice
-        options: [v5.3.2b, v5.4.0, v5.4.0a, v5.4.0b, v5.4.0c, v5.4.0d, v5.4.0e, v5.4.1, v5.4.1a, v5.4.1b, v5.4.1c, v5.4.1d, v5.4.2, v5.4.2a, v5.4.2b, v5.4.2c, v5.4.2d, v5.4.3]
+        options: [v5.3.2b, v5.4.0, v5.4.0a, v5.4.0b, v5.4.0c, v5.4.0d, v5.4.0e, v5.4.1, v5.4.1a, v5.4.1b, v5.4.1c, v5.4.1d, v5.4.2, v5.4.2a, v5.4.2b, v5.4.2c, v5.4.2d, v5.4.3, v5.4.3d]
       release_sha:
         description: "Approved 40-hex release commit"
         required: true
@@ -105,7 +105,7 @@ jobs:
               )
           ]
           assert installer_versions == [version], "Installer.__version__ passt nicht zum Release-Tag"
-          if tag in {"v5.4.2", "v5.4.2a", "v5.4.2b", "v5.4.2c", "v5.4.2d", "v5.4.3"}:
+          if tag in {"v5.4.2", "v5.4.2a", "v5.4.2b", "v5.4.2c", "v5.4.2d", "v5.4.3", "v5.4.3d"}:
               matches = [
                   item
                   for item in policy.get("rollback_releases", [])
@@ -416,6 +416,12 @@ jobs:
             [ "$(git rev-parse HEAD~17)" = "$ROOT_SHA" ]
             [ "$(git rev-parse 'HEAD~17^{tree}')" = "$ROOT_TREE" ]
             [ "$(git rev-list --parents -n 1 "$ROOT_SHA" | awk '{print NF-1}')" -eq 0 ]
+          elif [ "$RELEASE_TAG" = "v5.4.3d" ]; then
+            [ "$(git rev-list --parents -n 1 HEAD | awk '{print NF-1}')" -eq 1 ]
+            [ "$(git rev-parse HEAD^)" = "8d49b79a50ab230bb4494b92565f8e6dbe4fb873" ]
+            [ "$(git rev-parse HEAD~21)" = "$ROOT_SHA" ]
+            [ "$(git rev-parse 'HEAD~21^{tree}')" = "$ROOT_TREE" ]
+            [ "$(git rev-list --parents -n 1 "$ROOT_SHA" | awk '{print NF-1}')" -eq 0 ]
           else
             exit 1
           fi
@@ -518,6 +524,47 @@ jobs:
             E3DC_SOURCE_MANIFEST=${{ inputs.source_manifest_sha256 }}
           sbom: true
           provenance: mode=max
+      - name: Smoke-test real container startup
+        shell: bash
+        env:
+          CANDIDATE_DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE: ${{ needs.validate.outputs.image }}
+        run: |
+          set -euo pipefail
+          [[ "$CANDIDATE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          reference="${IMAGE}@${CANDIDATE_DIGEST}"
+          name="e3dc-release-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          log_file="$(mktemp)"
+          cleanup() {
+            docker logs "$name" > "$log_file" 2>&1 || true
+            docker rm -f "$name" >/dev/null 2>&1 || true
+            if [ "${1:-0}" != "0" ]; then
+              sed -n '1,240p' "$log_file" >&2
+            fi
+            rm -f "$log_file"
+          }
+          trap 'cleanup $?' EXIT
+          docker pull --platform linux/amd64 "$reference"
+          docker run -d --name "$name" \
+            --platform linux/amd64 \
+            --tmpfs /var/www/html/ramdisk:uid=33,gid=33,mode=2775,size=32m \
+            "$reference" >/dev/null
+          ready=0
+          for _ in $(seq 1 60); do
+            docker logs "$name" > "$log_file" 2>&1 || true
+            if grep -Fq 'run_config_wizard hat keinen erfolgreichen Abschluss gemeldet.' "$log_file" \
+              || grep -Fq 'FEHLER: Konfigurationsmigration oder Docker-Standalone-Guard fehlgeschlagen.' "$log_file"; then
+              exit 1
+            fi
+            if grep -Fq -- '-> Starte fail-closed Logrotation für persistente Produktlogs...' "$log_file"; then
+              ready=1
+              break
+            fi
+            [ "$(docker inspect --format '{{.State.Running}}' "$name")" = true ]
+            sleep 1
+          done
+          [ "$ready" = 1 ]
+          [ "$(docker inspect --format '{{.State.Running}}' "$name")" = true ]
       - name: Verify candidate before any stable tag exists
         id: verified
         shell: bash

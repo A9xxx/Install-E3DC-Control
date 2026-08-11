@@ -6,6 +6,13 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.3d] – 2026-08-11
+
+### 🐳 Docker-Start
+
+- **Containerrolle wieder eindeutig gebunden:** Der Production-Container erhält einen eigenen Installationsnutzervertrag für Root innerhalb des exakt gebundenen Docker-Produktpfads. Dadurch kann die V4-Konfiguration wieder gesichert und migriert werden; der strenge Bare-Metal-Rollenvertrag bleibt unverändert.
+- **Echter Starttest vor der Veröffentlichung:** Die OCI-Releasepipeline startet den gebauten AMD64-Kandidaten künftig mit echter RAM-Disk und verlangt, dass er die Konfigurationsmigration erfolgreich verlässt. Ein Image, das nur statisch korrekt gebaut wurde, aber beim Entrypoint scheitert, wird nicht mehr auf `latest` befördert.
+
 ## [5.4.3c] – 2026-08-10
 
 ### 🔔 Notifier-Transaktion

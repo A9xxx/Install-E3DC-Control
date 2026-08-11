@@ -1,9 +1,9 @@
 {
-  "version": "5.4.3c",
+  "version": "5.4.3d",
   "min_version": "4.0.0",
-  "stable_release": "v5.4.3c",
+  "stable_release": "v5.4.3d",
   "release_date": "2026-08-10",
-  "description": "v5.4.3c - Hotfix für den Notifier-Transaktionssnapshot",
+  "description": "v5.4.3d - Hotfix für die Docker-Installationsrolle",
   "installer_requires": "python3",
   "sanitized_republication": false,
   "history_transition": {

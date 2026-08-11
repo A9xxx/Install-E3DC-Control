@@ -166,6 +166,21 @@ def _bound_local_role_metadata():
 def get_install_user():
     """Löst die lokale Rolle ohne Rückautorisierung aus Web-Metadaten auf."""
 
+    container_mode = str(os.environ.get("E3DC_CONTAINER_MODE") or "").strip().lower()
+    container_user = str(
+        os.environ.get("E3DC_CONTAINER_INSTALL_USER") or ""
+    ).strip()
+    if container_mode in {"1", "true", "yes"}:
+        module_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if (
+            container_user != "root"
+            or os.geteuid() != 0
+            or module_root != "/app/pi/Install"
+        ):
+            raise RuntimeError("Docker-Installationsrolle ist nicht exakt gebunden")
+        _validated_strict_product_root(module_root, "Docker-Produktpfad")
+        return container_user
+
     bootstrap_user = str(os.environ.get("E3DC_BOOTSTRAP_USER") or "").strip()
     if bootstrap_user:
         if bootstrap_user in {"root", "www-data"}:

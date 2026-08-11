@@ -6,6 +6,19 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.3e] – 2026-08-11
+
+### 🔐 Bootstrap und Update-Rückweg
+
+- **Installationsnutzer bleibt eindeutig gebunden:** Der offizielle Bootstrap reicht den bestätigten lokalen Installationsnutzer ausdrücklich durch den privilegierten Prozesswechsel. Der versiegelte Ziel-Updater muss die Rolle dadurch nicht aus einer fehlenden lokalen Konfigurationsdatei erraten.
+- **Fehlender Einzelknoten-Rollenanker wird eng migriert:** Nur ein explizit an Stable-Tag, Commit-SHA und Rolle `off` gebundener Bootstrap ohne HA-Peer darf einen fehlenden Rollenanker erzeugen. Die Mutation erfolgt erst nach Nutzerfreigabe, verifiziertem Backup und Aktorruhe; HA- und Shadow-Rollen bleiben ohne passenden Anker gesperrt.
+- **Rückweg akzeptiert legitime fehlende Units:** Eine intern freigegebene, nicht maskierte Kompatibilitäts-Unit darf als `not-found` bestätigt werden. Erwartete Masken, fremde Pfade und widersprüchliche systemd-Zustände bleiben fail-closed.
+- **Restriktive Unit-Rechte bleiben erhalten:** Vertrauenswürdige root-eigene systemd-Dateien mit `0600`, `0640` oder `0644` können transaktional aktualisiert werden. Der Rückfall stellt ihren ursprünglichen Modus byte- und metadatentreu wieder her; Gruppen- oder Weltschreibrechte bleiben unzulässig.
+
+### 🐳 Docker-Veröffentlichung
+
+- **Stable-Tag `latest` wird wieder fortgeschrieben:** Nach vollständig grünem Build-, Start-, Digest-, SBOM- und Provenance-Gate befördert die Releasepipeline `v5.4.3e` wieder auf den allgemeinen Stable-Tag `latest`.
+
 ## [5.4.3d] – 2026-08-11
 
 ### 🐳 Docker-Start

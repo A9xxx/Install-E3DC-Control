@@ -1,3 +1,36 @@
+# E3DC-Control v5.4.3e
+
+E3DC-Control 5.4.3e repariert den offiziellen Bare-Metal-Bootstrap und den
+verifizierten Update-Rückweg. Speicher-, Wallbox-, Wärme- und
+Direktvermarktungsregelung bleiben unverändert.
+
+## Bootstrap und Rollenbindung
+
+- `e3dc-bootstrap` bindet einen normalen lokalen Installationsnutzer und reicht
+  ihn auch beim Wechsel über `sudo` ausdrücklich an den Ziel-Updater weiter.
+- Fehlt auf einem ausdrücklich mit Tag, Commit-SHA und Rolle `off` gebundenen
+  Einzelknoten der persistente Rollenanker, wird er erst nach Nutzerfreigabe,
+  verifiziertem Backup und bestätigter Aktorruhe einmalig erzeugt.
+- HA- und Shadow-Rollen werden nicht aus einer Web-Konfiguration geraten. Sie
+  benötigen weiterhin einen bereits passenden, root-geschützten Rollenanker.
+
+## Wiederherstellung
+
+- Eine auf der internen Positivliste gebundene, nicht installierte
+  Kompatibilitäts-Unit darf beim Rückweg als `not-found` bestätigt werden. Ein
+  erwarteter Maskenzustand oder eine fremde Unit wird dadurch nicht geöffnet.
+- Root-eigene, reguläre systemd-Units mit Modus `0600`, `0640` oder `0644`
+  können sicher gelesen und aktualisiert werden. Ein Rollback stellt den
+  ursprünglichen Modus exakt wieder her; schreibbare oder verlinkte Dateien
+  bleiben gesperrt.
+
+## Docker-Veröffentlichung
+
+- Der aktuelle Stable-Kandidat wird nach erfolgreichem Build, Starttest,
+  Digest-, SBOM- und Provenance-Nachweis wieder auf `latest` befördert.
+
+---
+
 # E3DC-Control v5.4.3d
 
 E3DC-Control 5.4.3d behebt den Containerstart nach dem Update auf 5.4.3.

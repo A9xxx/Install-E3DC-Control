@@ -115,7 +115,7 @@ $paths = getInstallPaths();
     <div class="container">
         <div class="d-flex justify-content-between align-items-center mb-4">
             <a href="index.php" class="nav-link-back"><i class="fas fa-arrow-left me-2"></i>Dashboard</a>
-            <span class="badge bg-success text-light">v5.4.3d Stable</span>
+            <span class="badge bg-success text-light">v5.4.3e Stable</span>
         </div>
         <h1 class="display-4 fw-bold">Hilfe & Support</h1>
         <p class="lead opacity-75">Häufige Fragen und Lösungen rund um E3DC-Control.</p>
@@ -134,7 +134,7 @@ $paths = getInstallPaths();
         <div class="col-12 faq-item" data-tags="docker image stable rollback update">
             <div class="card bg-card border-0 shadow-sm"><div class="card-body">
                 <h5 class="card-title"><span class="tag">Docker</span> Wie prüfe ich Image und Update?</h5>
-                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem geprüften Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.3d</code> in <code>.env</code> gesetzt.</p>
+                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem geprüften Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.3e</code> in <code>.env</code> gesetzt.</p>
                 <pre>cd "${E3DC_DOCKER_PATH:-$HOME/e3dc-docker}"
 if [ -f ./docker_compose_update.py ]; then
   E3DC_DOCKER_HELPER=./docker_compose_update.py
@@ -216,16 +216,17 @@ sudo docker compose logs --tail=80 e3dc-control</pre>
             </div>
         </div>
 
-        <h4 class="mb-4 text-accent"><i class="fas fa-layer-group me-2"></i>Stable 5.4.3d: Docker- und Bare-Metal-Update</h4>
-        <div class="col-12 faq-item" data-tags="5.4.3d stable update docker bare-metal installer sicherheit">
+        <h4 class="mb-4 text-accent"><i class="fas fa-layer-group me-2"></i>Stable 5.4.3e: Bootstrap, Docker und Bare-Metal-Update</h4>
+        <div class="col-12 faq-item" data-tags="5.4.3e stable update bootstrap docker bare-metal installer sicherheit">
             <div class="card bg-card border-0 shadow-sm">
                 <div class="card-body">
                     <h5 class="card-title">
-                        <span class="tag">5.4.3d</span>
-                        Was bringt das Stable-Release 5.4.3d?
+                        <span class="tag">5.4.3e</span>
+                        Was bringt das Stable-Release 5.4.3e?
                     </h5>
                     <ul>
-                        <li><strong>Hotfix 5.4.3d:</strong> Der Production-Container bindet seine Root-Installationsrolle eindeutig an Docker-Modus und Produktpfad. Dadurch laufen V4-Backup und -Migration wieder; Bare-Metal erhält keine zusätzliche Root-Freigabe. Die OCI-Pipeline startet den Kandidaten künftig real bis hinter die Konfigurationsmigration.</li>
+                        <li><strong>Hotfix 5.4.3e:</strong> Der offizielle Bootstrap reicht den bestätigten lokalen Installationsnutzer durch privilegierte Prozesswechsel. Ein fehlender Einzelknoten-Rollenanker darf nur beim explizit SHA- und rollengebundenen Bootstrap nach Backup und Aktorruhe entstehen. Update-Rückwege akzeptieren legitime fehlende Kompatibilitäts-Units sowie sichere root-eigene Unit-Modi, ohne Masken- oder Fremddateischutz zu lockern.</li>
+                        <li><strong>Docker:</strong> Der aktuelle Stable-Kandidat wird erst nach realem Containerstart, Digest-, SBOM- und Provenance-Prüfung auf <code>latest</code> befördert.</li>
                         <li><strong>Installation und Update:</strong> Eine frische Bookworm-Installation läuft in einer festen, geprüften Reihenfolge. Fehler werden verständlich gemeldet und ein vorhandener funktionierender Zustand wird nicht durch eine unvollständige Installation ersetzt.</li>
                         <li><strong>Docker:</strong> Installation und Update werden auf dem Docker-Host ausgeführt. Architektur, vorhandene Instanzen und die tatsächlich gestarteten Dienste werden geprüft; ein fehlerhafter neuer Container wird wieder gestoppt.</li>
                         <li><strong>Speicher und Direktvermarktung:</strong> Netzladen benötigt eine belegte Gesamtunterdeckung. DV-Plan, tatsächliche Wirkung und Ausführungseigentümer bleiben getrennt, damit keine konkurrierenden Speicherbefehle entstehen.</li>

@@ -2004,7 +2004,7 @@ def _read_bound_unit_preimage(path):
         or info.st_nlink != 1
         or info.st_uid != 0
         or info.st_gid != 0
-        or stat.S_IMODE(info.st_mode) != 0o644
+        or stat.S_IMODE(info.st_mode) not in {0o600, 0o640, 0o644}
         or info.st_size > 256 * 1024
     ):
         raise RuntimeError(f"Unsichere bestehende systemd-Unit: {path}")
@@ -2220,7 +2220,9 @@ def _restore_bound_unit_file(unit_state):
             handle.write(preimage["bytes"])
             local_tmp = handle.name
         stage = run_command(
-            "sudo install -o root -g root -m 0644 -- "
+            "sudo install -o root -g root -m "
+            + format(int(preimage["mode"]), "04o")
+            + " -- "
             + shlex.quote(local_tmp)
             + " "
             + shlex.quote(sibling),

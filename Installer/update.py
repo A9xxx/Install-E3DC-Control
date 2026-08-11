@@ -1546,6 +1546,63 @@ def _capture_transition_state(
     )
 
 
+def _explicit_bootstrap_role_anchor_needed(
+    state: TransitionState,
+    *,
+    target_install_path: str | None,
+) -> bool:
+    """Prüft rein, ob der explizite Einzelknoten-Bootstrap einen Anker braucht."""
+
+    if not target_install_path:
+        return False
+    from .ha_writer_admission import (
+        INSTANCE_ROLE_ANCHOR_PATH,
+        instance_role_anchor_matches,
+    )
+
+    configured_peer = str(state.config.get("ha_peer_ip") or "").strip()
+    peer_ip = configured_peer if state.ha_role in {"master", "slave"} else ""
+    if instance_role_anchor_matches(state.ha_role, peer_ip=peer_ip) is True:
+        return False
+    if state.ha_role != "off" or configured_peer:
+        raise RuntimeError(
+            "Ein fehlender Rollenanker darf automatisch nur für einen "
+            "explizit gebundenen Einzelknoten ohne HA-Peer erzeugt werden"
+        )
+    if os.path.lexists(INSTANCE_ROLE_ANCHOR_PATH):
+        raise RuntimeError(
+            "Vorhandener Instanzrollen-Anker widerspricht dem expliziten Bootstrap"
+        )
+    return True
+
+
+def _bind_explicit_bootstrap_role_anchor(
+    state: TransitionState,
+    *,
+    target_install_path: str | None,
+) -> bool:
+    """Erzeugt den zuvor rein geprüften Anker erst im gesicherten Mutationsblock."""
+
+    if not _explicit_bootstrap_role_anchor_needed(
+        state,
+        target_install_path=target_install_path,
+    ):
+        return False
+    from .ha_writer_admission import (
+        instance_role_anchor_matches,
+        project_instance_role_anchor,
+    )
+
+    peer_ip = ""
+    if project_instance_role_anchor(state.ha_role, peer_ip=peer_ip) is not True:
+        raise RuntimeError(
+            "Explizit gebundener Instanzrollen-Anker konnte nicht erstellt werden"
+        )
+    if instance_role_anchor_matches(state.ha_role, peer_ip=peer_ip) is not True:
+        raise RuntimeError("Instanzrollen-Anker ist nach dem Bootstrap nicht bestätigt")
+    return True
+
+
 def _verify_transition_state(state: TransitionState, *, expect_legacy_config_missing: bool = False) -> None:
     if expect_legacy_config_missing:
         if not state.bootstrap_legacy_config:
@@ -6683,6 +6740,10 @@ def _execute_update_transaction(
             expected_role=expected_ha_role,
             allow_missing_config=bool(target_install_path and bootstrap_without_git),
         )
+        role_anchor_needed = _explicit_bootstrap_role_anchor_needed(
+            state,
+            target_install_path=target_install_path,
+        )
         inventory = _capture_install_inventory(repo_dir)
         recovery_inventory = _capture_recovery_surface(state)
     except Exception as exc:
@@ -6696,6 +6757,8 @@ def _execute_update_transaction(
     print(f"    Repository       : {repo_dir}")
     print(f"    Ausgangs-SHA     : {old_commit or 'ZIP/V3'}")
     print(f"    Eingefrorene Rolle: {state.ha_role}")
+    if role_anchor_needed:
+        print("    Rollenanker      : fehlt; wird nach Backup und Aktorruhe einmalig erstellt")
     if target_tag:
         print(f"    Ziel-Release     : {target_tag}")
     if expected_sha:
@@ -6733,13 +6796,28 @@ def _execute_update_transaction(
             _enforce_fail_closed_after_recovery_failure()
         return False
 
-    install_user = get_install_user()
+    install_user = None
     git_created = False
     mutated = False
+    role_anchor_created = False
     target_commit = None
     package_transaction = None
     packages_mutated = False
     try:
+        install_user = get_install_user()
+        if role_anchor_needed:
+            # Ab hier besitzt jede Mutation ein verifiziertes Backup und eine
+            # bestätigte Aktorruhe. Auch der einmalige Rollenanker fällt damit
+            # bei jedem Folgefehler unter den vollständigen Rückweg.
+            mutated = True
+            role_anchor_created = _bind_explicit_bootstrap_role_anchor(
+                state,
+                target_install_path=target_install_path,
+            )
+            if role_anchor_created is not True:
+                raise RuntimeError(
+                    "Fehlender Instanzrollen-Anker wurde nicht eindeutig gebunden"
+                )
         cleanup_pycache(repo_dir)
         if bootstrap_without_git:
             init = _run_argv(

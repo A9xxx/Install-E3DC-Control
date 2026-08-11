@@ -1,9 +1,9 @@
 {
-  "version": "5.4.3d",
+  "version": "5.4.3e",
   "min_version": "4.0.0",
-  "stable_release": "v5.4.3d",
-  "release_date": "2026-08-10",
-  "description": "v5.4.3d - Hotfix für die Docker-Installationsrolle",
+  "stable_release": "v5.4.3e",
+  "release_date": "2026-08-11",
+  "description": "v5.4.3e - Reparatur für Bootstrap und Update-Rückweg",
   "installer_requires": "python3",
   "sanitized_republication": false,
   "history_transition": {

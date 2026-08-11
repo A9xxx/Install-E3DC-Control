@@ -44,9 +44,26 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 }
 
 if [ "$(id -u)" -eq 0 ]; then
+    INSTALL_USER=${E3DC_BOOTSTRAP_USER:-${SUDO_USER:-}}
+else
+    INSTALL_USER=$(id -un)
+fi
+case "$INSTALL_USER" in
+    ""|root|www-data|*[!A-Za-z0-9_.-]*)
+        echo "Ein normaler Installationsbenutzer ist nicht eindeutig gebunden." >&2
+        exit 2
+        ;;
+esac
+id -u "$INSTALL_USER" >/dev/null 2>&1 || {
+    echo "Der gebundene Installationsbenutzer existiert nicht." >&2
+    exit 2
+}
+
+if [ "$(id -u)" -eq 0 ]; then
     exec env \
         E3DC_BOOTSTRAP_ROOT="$TARGET" \
         E3DC_BOOTSTRAP_RUNNER_ROOT="$SCRIPT_DIR" \
+        E3DC_BOOTSTRAP_USER="$INSTALL_USER" \
         "$PYTHON" "$SCRIPT_DIR/installer_main.py" \
         --unattended \
         --install-release-tag "$TAG" \
@@ -58,6 +75,7 @@ fi
 exec sudo -- env \
     E3DC_BOOTSTRAP_ROOT="$TARGET" \
     E3DC_BOOTSTRAP_RUNNER_ROOT="$SCRIPT_DIR" \
+    E3DC_BOOTSTRAP_USER="$INSTALL_USER" \
     "$PYTHON" "$SCRIPT_DIR/installer_main.py" \
     --unattended \
     --install-release-tag "$TAG" \

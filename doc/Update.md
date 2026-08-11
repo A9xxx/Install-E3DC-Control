@@ -5,7 +5,7 @@ Updates werden ausschließlich über den Installer ausgeführt. Ein manuelles
 Release-Historie ungeeignet, weil alter und neuer Git-Stand nicht miteinander
 verwandt sein müssen.
 
-Der aktuelle Stable-Stand ist `v5.4.3d`. Der Ziel-Updater bindet den
+Der aktuelle Stable-Stand ist `v5.4.3e`. Der Ziel-Updater bindet den
 freigegebenen Zielstand vor Backup und Dienststopp eindeutig an Version,
 Herkunft und Anlagenrolle. Fortschritt und Lebenszeichen bleiben auf
 langsameren Raspberry Pis sichtbar. Eine bereits vollständig installierte
@@ -31,6 +31,34 @@ steht derselbe Installer-Pfad zur Verfügung:
 bash "$E3DC_INSTALL_PATH/e3dc-setup" --check
 bash "$E3DC_INSTALL_PATH/e3dc-setup" --update-e3dc
 ```
+
+### Reparatur eines alten Bootstrap-Übergangs
+
+Bricht ein älterer Updater bereits vor Backup und Dienststopp mit
+`Installationsbenutzer ist nicht lokal gebunden` ab, kann dieser laufende
+Altprozess nicht durch den Zielstand repariert werden. Für einen normalen
+Einzelknoten mit `ha_mode=off` steht deshalb der aktuelle offizielle Bootstrap
+zur Verfügung. Tag und vollständige Commit-SHA müssen von derselben
+veröffentlichten GitHub-Release-Seite übernommen werden:
+
+```bash
+export E3DC_INSTALL_PATH="/absoluter/pfad/zur/installation"
+export E3DC_RELEASE_TAG="v5.4.3e"
+export E3DC_RELEASE_SHA="<40-stellige Commit-SHA des veröffentlichten Tags>"
+E3DC_BOOTSTRAP_DIR="$(mktemp -d)"
+curl -fL "https://github.com/A9xxx/Install-E3DC-Control/archive/refs/tags/${E3DC_RELEASE_TAG}.tar.gz" \
+  -o "$E3DC_BOOTSTRAP_DIR/release.tar.gz"
+tar -xzf "$E3DC_BOOTSTRAP_DIR/release.tar.gz" -C "$E3DC_BOOTSTRAP_DIR"
+bash "$E3DC_BOOTSTRAP_DIR/Install-E3DC-Control-${E3DC_RELEASE_TAG#v}/e3dc-bootstrap" \
+  "$E3DC_INSTALL_PATH" "$E3DC_RELEASE_TAG" "$E3DC_RELEASE_SHA" off
+```
+
+Der Bootstrap prüft den normalen lokalen Installationsnutzer, Stable-Tag,
+Commit-SHA, Zielpfad und Rolle erneut. Ein fehlender Einzelknoten-Rollenanker
+wird erst nach verifiziertem Backup und bestätigter Aktorruhe einmalig
+erzeugt. Für `master`, `slave` oder `shadow` wird kein Rollenanker aus der
+Web-Konfiguration abgeleitet; dort muss der vorhandene root-geschützte Anker
+bereits exakt passen. Bei einem Fehler bleibt der verifizierte Rückweg Pflicht.
 
 Ab dem Release mit Ziel-Updater-Handoff lädt die laufende Version zunächst
 ausschließlich die Git-Objekte des freigegebenen Zielstands. Sie bindet

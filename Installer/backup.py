@@ -37,7 +37,7 @@ from .backup_integrity import (
 )
 from .installer_config import get_install_path, get_user_ids, get_www_data_gid, load_config
 from .logging_manager import get_or_create_logger, log_task_completed, log_error, log_warning
-from .service_catalog import allowed_services, get_module_by_service
+from .service_catalog import allowed_services
 
 INSTALL_PATH = get_install_path()
 backup_logger = get_or_create_logger("backup")
@@ -568,15 +568,15 @@ def _reload_and_verify_systemd_mask_states(states):
                 if "=" in line
             )
             unit_file_state = fields.get("UnitFileState", "").strip().lower()
-            try:
-                module = get_module_by_service(path.name)
-            except Exception:
-                module = None
+            # ``states`` ist zuvor bereits exakt an die interne, feste
+            # systemd-Positivliste gebunden. Fehlt eine dieser Units auf
+            # Platte und soll sie ausdrücklich nicht maskiert sein, ist
+            # ``not-found`` deshalb ein gültiger Zustand – auch für
+            # katalogisierte Legacy-/Kompatibilitätsnamen wie e3dc.service.
+            # Eine beliebige fremde Unit kann diesen Zweig nicht erreichen.
             optional_missing = (
                 not expected_masked
                 and disk_state == "missing"
-                and module is not None
-                and module.optional
             )
             if show_result.returncode == 0 and unit_file_state in allowed:
                 status = unit_file_state

@@ -1,12 +1,12 @@
 # E3DC-Control Web-Portal & Installer
 
-Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.4.3e</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
+Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.4.3f</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
 
 ![E3DC-Control Dashboard](html/app-icon-512.png)
 
 ## Aktuelle Version und Update
 
-Die aktuelle stabile Version ist **5.4.3e**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur geprüften Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
+Die aktuelle stabile Version ist **5.4.3f**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur geprüften Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
 
 > [!WARNING]
 > **⚠️ Achtung: Nutzung auf eigenes Risiko!**
@@ -20,7 +20,7 @@ Die aktuelle stabile Version ist **5.4.3e**. Hinweise zum Web-, Konsolen- und Do
 
 > **Bedienansichten:** Config-Editor und Wallbox-Seite unterscheiden zwischen einfacher Ansicht für Einrichtung und täglichen Betrieb sowie erweiterter Ansicht für alle Detailparameter. Die Logik und Abgrenzung sind in [doc/Frontend_Ansichten.md](doc/Frontend_Ansichten.md) dokumentiert.
 
-> **Neu in 5.4.3e Stable:** Der offizielle Bootstrap übergibt den lokal bestätigten Installationsnutzer nun auch durch privilegierte Prozesswechsel. Ein fehlender Rollenanker darf ausschließlich beim explizit SHA- und rollengebundenen Einzelknoten-Bootstrap nach Backup und Aktorruhe erzeugt werden. Update-Rückwege akzeptieren fehlende freigegebene Kompatibilitäts-Units und vertrauenswürdige root-eigene Unit-Modi `0600`, `0640` oder `0644`, ohne Masken- oder Fremddateischutz zu lockern. Die EMS-Regelung bleibt unverändert.
+> **Neu in 5.4.3f Stable:** Ältere Benutzer-venvs mit historischen Gruppenrechten werden vor dem Paketupdate eng gebunden und auf sichere Schreibrechte migriert. Bare-Metal-Updates ersetzen eine fehlerhafte Logrotate-Konfiguration atomar und parsergeprüft. Frische Bookworm-Installationen prüfen den Apache-Laufzeitpfad erst nach Veröffentlichung des Webbaums. openWB-Pro verwirft beim Wechsel auf `Aus / autonom` nur alte Startversuchs-Evidenz; Schutzlatches bleiben bestehen. Die Direktvermarktung trennt Tagesbudgets am lokalen Markttag und archiviert Auswahl, Anforderung, Ausgabe und Hardwarewirkung getrennt.
 
 > **Neu in 5.4.2d Stable:** Der Bare-Metal-Updater bewertet den Wiederanlauf erforderlicher Dienste anhand des belegten systemd-Endzustands statt allein anhand eines Zwischen-Rückgabecodes. Nicht installierte optionale Units werden beim verifizierten Maskenrücklauf als legitimer fehlender Zustand behandelt. Echte Start-, Masken- oder Wiederherstellungsfehler bleiben fail-closed; Writer und Aktoren bleiben dann sicher gestoppt. Die EMS-Regelung entspricht unverändert 5.4.2c.
 
@@ -477,7 +477,7 @@ sudo docker compose logs --tail=80 e3dc-control
 > `ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}`. Ohne Eintrag
 > folgt sie dem geprüften Stable-Tag `latest`. Ein fester Versions-Tag wechselt
 > bei `pull` absichtlich nicht; für einen bewussten Pin wird
-> `E3DC_IMAGE_TAG=v5.4.3e` in `.env` gesetzt. `config --images` zeigt vor dem
+> `E3DC_IMAGE_TAG=v5.4.3f` in `.env` gesetzt. `config --images` zeigt vor dem
 > Pull das tatsächlich gewählte Image.
 >
 > Ein fehlgeschlagener `pull` ist ein harter Abbruch. Nach begonnenem

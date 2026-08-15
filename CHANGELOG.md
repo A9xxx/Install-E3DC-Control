@@ -6,6 +6,20 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.3f] – 2026-08-15
+
+### 🧰 Installation und Update
+
+- **Bestehende Python-Umgebungen werden eng repariert:** Der Releasewechsel entfernt an einem eindeutig gebundenen Benutzer-venv ausschließlich Schreibrechte für Gruppe und Andere. Eigentümer, Pfad, Inodes, Links und ACLs werden vor der Änderung geprüft; anschließend muss der vollständige venv-Vertrag erneut gelten. Damit können ältere Installationen mit historischen `0775`-/`0664`-Rechten wieder sicher aktualisiert werden.
+- **Logrotate-Konfiguration wird atomar korrigiert:** Bare-Metal-Updates projizieren die mitgelieferte Konfiguration als reines LF-UTF-8 nach `/etc/logrotate.d/e3dc-control`. Der echte Systemparser prüft Stagingdatei und Endstand; bei einem Fehler wird das gebundene Preimage wiederhergestellt.
+- **Frische Bookworm-Webroots blockieren die Paketphase nicht mehr:** Der HTTP-Nachweis der geschützten Apache-Laufzeitpfade erfolgt erst nach der atomaren Veröffentlichung des Webbaums. Paket-, Modul- und Apache-Konfiguration bleiben zuvor weiterhin zwingend.
+
+### 🚗 Wallbox und Speicherplanung
+
+- **Ein neuer Automatikstart verwendet keine alte Startablehnung:** Beim bewussten Wechsel auf `Aus / autonom` wird ausschließlich die Evidenz des vorherigen openWB-Pro-Startversuchs verworfen und persistiert. Stecksession, Ladeende-Latch, Manager-Nullanker und Phasenreservation bleiben unverändert geschützt.
+- **DV-Tagesbudget bleibt am lokalen Markttag:** Geplante Speicherverkäufe werden je `Europe/Berlin`-Kalendertag begrenzt. Ein Preisplateau über Mitternacht wird an der Tagesgrenze getrennt, sodass weder der Verbrauch des alten Tages den neuen Tag sperrt noch das neue Tagesbudget rückwirkend doppelt verwendet wird.
+- **DV-Ausführung wird belegbar archiviert:** Die kompakte Speicherhistorie hält `selected`, `requested`, `issued` und `hardware_effect` als getrennte, typisierte Ausführungsstufen fest. Fehlende Evidenz bleibt unbekannt und wird nicht als negative Ausführung ausgelegt.
+
 ## [5.4.3e] – 2026-08-11
 
 ### 🔐 Bootstrap und Update-Rückweg

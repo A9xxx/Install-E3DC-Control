@@ -1,12 +1,12 @@
 # E3DC-Control Installer
 
-Dokumentation Stand: 5.4.3
+Dokumentation Stand: 5.4.3f
 
 Der Installer verwaltet Bare-Metal-Installation, Update, Rechte, Dienste,
 Backup, Rollback und optionale Produktmodule. Er ermittelt Benutzer, Home,
 Installationspfad und Python-Umgebung aus dem geprüften Installationskontext.
 
-Mit 5.4.3 führt eine frische Bookworm-Installation Paket-, Apache-,
+Mit 5.4.3f führt eine frische Bookworm-Installation Paket-, Apache-,
 Konfigurations-, RAM-Disk-, Webportal- und Dienstschritte in einer festen
 Reihenfolge aus. Ein Fehler beendet die Installation mit einer verständlichen
 Meldung und stoppt alle nachfolgenden Pflichtschritte. Ein bereits vorhandener

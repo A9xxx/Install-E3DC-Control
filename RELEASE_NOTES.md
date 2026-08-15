@@ -1,3 +1,39 @@
+# E3DC-Control v5.4.3f
+
+E3DC-Control 5.4.3f ist ein Wartungsrelease für Bare-Metal-Update,
+Erstinstallation, openWB-Pro und Direktvermarktung. Die harten Nutzer-,
+Hardware-, Reserve- und Datenfrischegrenzen bleiben unverändert vorrangig.
+
+## Installation und Update
+
+- Ein eindeutig gebundenes bestehendes Benutzer-venv kann historische
+  Gruppen-Schreibrechte sicher verlieren. Eigentümer, Inodes, Links und ACLs
+  werden vor der Änderung geprüft; danach muss der venv-Vertrag erneut gelten.
+- Die Bare-Metal-Logrotate-Datei wird als reines LF-UTF-8 atomar ersetzt und
+  vor sowie nach der Projektion mit dem echten Systemparser geprüft. Ein
+  fehlerhafter Endstand stellt das gebundene Preimage wieder her.
+- Eine frische Bookworm-Installation prüft die Apache-Laufzeitpfade erst nach
+  der atomaren Veröffentlichung des Webbaums. Die vorherigen Paket-, Modul-
+  und Apache-Gates bleiben zwingend.
+
+## Wallbox und Direktvermarktung
+
+- Beim Wechsel auf `Aus / autonom` wird nur die alte Evidenz eines
+  openWB-Pro-Startversuchs verworfen. Stecksession, Ladeende-Latch,
+  Manager-Nullanker und Phasenreservation bleiben erhalten.
+- Das DV-Exportbudget wird je lokalem `Europe/Berlin`-Kalendertag geführt;
+  Preisplateaus über Mitternacht werden an der Tagesgrenze getrennt.
+- Die Speicherhistorie archiviert Auswahl, Anforderung, Ausgabe und
+  Hardwarewirkung einer DV-Aktion getrennt. Fehlende Evidenz bleibt unbekannt.
+
+## Docker-Veröffentlichung
+
+- Der gebaute Multi-Arch-Kandidat wird real gestartet und erst nach Digest-,
+  SBOM- und Provenance-Nachweis auf `v5.4.3f`, `5.4.3f` und `latest`
+  befördert.
+
+---
+
 # E3DC-Control v5.4.3e
 
 E3DC-Control 5.4.3e repariert den offiziellen Bare-Metal-Bootstrap und den

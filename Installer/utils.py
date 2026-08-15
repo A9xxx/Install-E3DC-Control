@@ -1379,11 +1379,11 @@ def install_system_packages(use_venv=True):
             "Apache-Neustart nach Laufzeitpfadschutz fehlgeschlagen: "
             + format_command_failure(apache_restart)
         )
-    from .apache_security import apache_runtime_paths_protected
-    if not apache_runtime_paths_protected():
-        raise RuntimeError(
-            "Apache-Laufzeitpfadschutz ist nach dem Neustart nicht wirksam"
-        )
+    # Bei einer Erstinstallation existiert der Produkt-Webbaum zu diesem
+    # Zeitpunkt absichtlich noch nicht. HTTP-HEAD liefert für seine späteren
+    # Runtimepfade daher 404 und kann die konfigurierte 403-Sperre noch nicht
+    # belegen. Der echte Laufzeit-Endtest bleibt im atomaren Webportal-Schritt,
+    # nachdem exakt dieser Baum publiziert und Apache neu gestartet wurde.
     # ------------------------------------------------------------------
 
     # Python Umgebung einrichten

@@ -19,6 +19,7 @@ import json
 import math
 import time
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 try:
     from .pv_forecast_topology import (
@@ -81,6 +82,7 @@ EXPORT_WINDOW_GATE_LINEAGE_EFFECT_CONTRACT = (
 )
 VALID_MODES = {"safe", "eco", "eco_plus", "arbitrage"}
 VALID_PROFIT_PROFILES = {"standard", "aggressive", "expert"}
+MARKET_TIMEZONE = ZoneInfo("Europe/Berlin")
 AUX_AC_STORAGE_MODES = {
     "off",
     "reserve_only",
@@ -898,6 +900,21 @@ def _format_t(ts):
     try:
         return datetime.fromtimestamp(float(ts) / 1000.0).strftime("%H:%M")
     except Exception:
+        return ""
+
+
+def _market_day_key(ts_ms):
+    """Liefert den lokalen ENTSO-E-/EPEX-Abrechnungstag eines Slots."""
+
+    try:
+        value = float(ts_ms)
+        if not math.isfinite(value) or value <= 0.0:
+            return ""
+        return datetime.fromtimestamp(
+            value / 1000.0,
+            tz=MARKET_TIMEZONE,
+        ).date().isoformat()
+    except (OverflowError, OSError, TypeError, ValueError):
         return ""
 
 
@@ -6162,7 +6179,22 @@ def _prioritize_export_entries(entries, reserve, capacity_wh, flags, efficiency,
     daily_limit_candidates = [value for value in (max_cycle_wh, configured_daily_wh) if value > 0.0]
     daily_limit_wh = min(daily_limit_candidates) if daily_limit_candidates else 0.0
     daily_used_wh = max(0.0, safe_float(flags.get("daily_export_used_wh"), 0.0))
-    global_remaining_wh = max(0.0, daily_limit_wh - daily_used_wh) if daily_limit_wh > 0.0 else None
+    accounting_day = str(flags.get("daily_export_accounting_day") or "")
+    daily_remaining_wh_by_key = {}
+    daily_selected_wh_by_key = {}
+
+    def daily_remaining(day_key):
+        if daily_limit_wh <= 0.0:
+            return None
+        if not day_key:
+            return 0.0
+        if day_key not in daily_remaining_wh_by_key:
+            already_used_wh = daily_used_wh if day_key == accounting_day else 0.0
+            daily_remaining_wh_by_key[day_key] = max(
+                0.0,
+                daily_limit_wh - already_used_wh,
+            )
+        return daily_remaining_wh_by_key[day_key]
     load_reserve_enabled = cfg_bool(flags.get("export_segment_load_reserve_enable"), True)
     ordered_indices = sorted(range(len(entries)), key=lambda idx: safe_float(entries[idx].get("start_ts"), 0.0))
     adjusted = [dict(entry) for entry in entries]
@@ -6180,7 +6212,7 @@ def _prioritize_export_entries(entries, reserve, capacity_wh, flags, efficiency,
     limited = 0
 
     def apply_segment(export_indices, end_ts, next_recharge):
-        nonlocal limited, global_remaining_wh
+        nonlocal limited
         if end_ts < segment_start_ts:
             end_ts = segment_start_ts
         load_reserve_wh, used_load_forecast = _forecast_deficit_wh(
@@ -6191,8 +6223,6 @@ def _prioritize_export_entries(entries, reserve, capacity_wh, flags, efficiency,
         )
         raw_budget_wh = min(segment_budget_wh, export_capacity_wh)
         export_budget_wh = max(0.0, raw_budget_wh - load_reserve_wh)
-        if global_remaining_wh is not None:
-            export_budget_wh = min(export_budget_wh, max(0.0, global_remaining_wh))
 
         candidates = []
         for idx in export_indices:
@@ -6209,6 +6239,7 @@ def _prioritize_export_entries(entries, reserve, capacity_wh, flags, efficiency,
                 "duration_h": duration_h,
                 "net_sell_ct": safe_float(entry.get("net_sell_ct"), safe_float(entry.get("market_ct"), 0.0)),
                 "start_ts": safe_float(entry.get("start_ts"), 0.0),
+                "market_day": _market_day_key(entry.get("start_ts")),
                 "plateau_id": str(entry.get("export_plateau_id") or "slot:%d" % idx),
             })
 
@@ -6229,15 +6260,45 @@ def _prioritize_export_entries(entries, reserve, capacity_wh, flags, efficiency,
         for plateau in ordered_plateaus:
             if remaining_wh <= 50.0:
                 break
-            plateau_capacity_wh = sum(item["energy_wh"] for item in plateau)
-            plateau_budget_wh = min(plateau_capacity_wh, remaining_wh)
-            plateau_selected = _uniform_plateau_allocation(plateau, plateau_budget_wh)
-            selected.update(plateau_selected)
-            remaining_wh = max(0.0, remaining_wh - sum(plateau_selected.values()))
+            plateau_days = {item.get("market_day") for item in plateau}
+            if len(plateau_days) != 1:
+                # Ein Preisplateau darf niemals zwei Abrechnungstage zu einer
+                # gemeinsamen Tagesgrenze verschmelzen.
+                plateau_parts = [
+                    [item for item in plateau if item.get("market_day") == day]
+                    for day in sorted(plateau_days)
+                ]
+            else:
+                plateau_parts = [plateau]
+            for plateau_part in plateau_parts:
+                if remaining_wh <= 50.0:
+                    break
+                day_key = str(plateau_part[0].get("market_day") or "")
+                day_remaining_wh = daily_remaining(day_key)
+                if day_remaining_wh is not None and day_remaining_wh <= 50.0:
+                    continue
+                plateau_capacity_wh = sum(item["energy_wh"] for item in plateau_part)
+                plateau_budget_wh = min(plateau_capacity_wh, remaining_wh)
+                if day_remaining_wh is not None:
+                    plateau_budget_wh = min(plateau_budget_wh, day_remaining_wh)
+                plateau_selected = _uniform_plateau_allocation(
+                    plateau_part,
+                    plateau_budget_wh,
+                )
+                selected.update(plateau_selected)
+                selected_part_wh = sum(plateau_selected.values())
+                remaining_wh = max(0.0, remaining_wh - selected_part_wh)
+                daily_selected_wh_by_key[day_key] = (
+                    daily_selected_wh_by_key.get(day_key, 0.0)
+                    + selected_part_wh
+                )
+                if day_remaining_wh is not None:
+                    daily_remaining_wh_by_key[day_key] = max(
+                        0.0,
+                        day_remaining_wh - selected_part_wh,
+                    )
 
         selected_wh = sum(selected.values())
-        if global_remaining_wh is not None:
-            global_remaining_wh = max(0.0, global_remaining_wh - selected_wh)
 
         next_recharge_ts = int(next_recharge.get("start_ts")) if isinstance(next_recharge, dict) else None
         next_recharge_action = next_recharge.get("action") if isinstance(next_recharge, dict) else None
@@ -6251,12 +6312,6 @@ def _prioritize_export_entries(entries, reserve, capacity_wh, flags, efficiency,
             "export_segment_load_reserve_wh": round(load_reserve_wh, 0),
             "export_segment_load_forecast_used": bool(used_load_forecast),
             "export_segment_selected_wh": round(selected_wh, 0),
-            "daily_export_limit_wh": round(daily_limit_wh, 0),
-            "daily_export_used_wh": round(daily_used_wh, 0),
-            "daily_export_remaining_wh": round(
-                max(0.0, (global_remaining_wh if global_remaining_wh is not None else export_capacity_wh)),
-                0,
-            ),
         }
         if next_recharge_ts is not None:
             segment_meta["export_segment_next_recharge_ts"] = next_recharge_ts
@@ -6265,11 +6320,35 @@ def _prioritize_export_entries(entries, reserve, capacity_wh, flags, efficiency,
         segment_limited = 0
         for idx in export_indices:
             entry = entries[idx]
+            entry_day = _market_day_key(entry.get("start_ts"))
+            entry_daily_remaining = daily_remaining(entry_day)
+            entry_daily_meta = {
+                "daily_export_accounting_day": entry_day or None,
+                "daily_export_limit_wh": round(daily_limit_wh, 0),
+                "daily_export_used_wh": round(
+                    daily_used_wh if entry_day == accounting_day else 0.0,
+                    0,
+                ),
+                "daily_export_planned_wh": round(
+                    daily_selected_wh_by_key.get(entry_day, 0.0),
+                    0,
+                ),
+                "daily_export_remaining_wh": round(
+                    max(
+                        0.0,
+                        entry_daily_remaining
+                        if entry_daily_remaining is not None
+                        else export_capacity_wh,
+                    ),
+                    0,
+                ),
+            }
             chosen_wh = selected.get(idx, 0.0)
             duration_h = _entry_duration_h(entry)
             if chosen_wh <= 50.0 or duration_h <= 0.0:
                 next_entry = dict(entry)
                 next_entry.update(segment_meta)
+                next_entry.update(entry_daily_meta)
                 next_entry.update({
                     "action": "eco_plus_house_supply",
                     "reason": "reserve_for_higher_profit",
@@ -6282,6 +6361,7 @@ def _prioritize_export_entries(entries, reserve, capacity_wh, flags, efficiency,
             original_w = max(0.0, safe_float(entry.get("max_power_w"), 0.0))
             next_entry = dict(entry)
             next_entry.update(segment_meta)
+            next_entry.update(entry_daily_meta)
             next_entry["max_power_w"] = int(round(min(original_w, chosen_wh / duration_h)))
             next_entry["plateau_dispatch_power_w"] = next_entry["max_power_w"]
             next_entry["plateau_dispatch_uniform"] = True
@@ -6311,6 +6391,30 @@ def _prioritize_export_entries(entries, reserve, capacity_wh, flags, efficiency,
             pending_exports.append(idx)
 
     apply_segment(pending_exports, horizon_end_ts, None)
+    for idx, entry in enumerate(entries):
+        if entry.get("action") not in export_actions:
+            continue
+        entry_day = _market_day_key(entry.get("start_ts"))
+        final_remaining_wh = daily_remaining(entry_day)
+        adjusted[idx]["daily_export_accounting_day"] = entry_day or None
+        adjusted[idx]["daily_export_limit_wh"] = round(daily_limit_wh, 0)
+        adjusted[idx]["daily_export_used_wh"] = round(
+            daily_used_wh if entry_day == accounting_day else 0.0,
+            0,
+        )
+        adjusted[idx]["daily_export_planned_wh"] = round(
+            daily_selected_wh_by_key.get(entry_day, 0.0),
+            0,
+        )
+        adjusted[idx]["daily_export_remaining_wh"] = round(
+            max(
+                0.0,
+                final_remaining_wh
+                if final_remaining_wh is not None
+                else export_capacity_wh,
+            ),
+            0,
+        )
     return adjusted, limited
 
 
@@ -7309,6 +7413,8 @@ def _group_windows(entries):
             and current.get("pv_store_raw_market_price_ct_kwh") == entry.get("pv_store_raw_market_price_ct_kwh")
             and current.get("pv_store_market_price_revision_sha256") == entry.get("pv_store_market_price_revision_sha256")
             and current.get("pv_store_marginal_contract") == entry.get("pv_store_marginal_contract")
+            and current.get("daily_export_accounting_day") == entry.get("daily_export_accounting_day")
+            and current.get("daily_export_planned_wh") == entry.get("daily_export_planned_wh")
             and (
                 current.get("action") not in {"eco_plus_export_candidate", "arbitrage_export_candidate"}
                 or current.get("export_plateau_id") == entry.get("export_plateau_id")
@@ -7454,7 +7560,9 @@ def _group_windows(entries):
                 "plateau_dispatch_power_w",
                 "plateau_dispatch_uniform",
                 "daily_export_limit_wh",
+                "daily_export_accounting_day",
                 "daily_export_used_wh",
+                "daily_export_planned_wh",
                 "daily_export_remaining_wh",
                 "market_window_id",
                 "market_window_start_ts",
@@ -8104,6 +8212,7 @@ def build_direct_marketing_shadow_plan(
             0.0,
             safe_float(config.get("_runtime_direct_marketing_daily_export_used_wh"), 0.0),
         ),
+        "daily_export_accounting_day": _market_day_key(now_ms),
         "preferred_export_plateau_min": max(
             15.0,
             safe_float(config.get("direct_marketing_preferred_export_plateau_min"), 60.0),

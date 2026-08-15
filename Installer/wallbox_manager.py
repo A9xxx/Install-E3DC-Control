@@ -12049,6 +12049,48 @@ _OPENWB_PRO_START_SESSION_KEYS = (
 )
 
 
+_WALLBOX_START_REJECT_EPISODE_KEYS = (
+    "_openwb_pro_start_current_issued_ts",
+    "_openwb_pro_start_current_session_id",
+    "_openwb_pro_start_wakeup_receipt",
+    "_openwb_pro_start_wakeup_count",
+    "_openwb_pro_start_wakeup_allowed_after",
+    "_openwb_pro_start_wakeup_pending",
+    "_openwb_pro_start_phase_target",
+    "_openwb_pro_unserved_since",
+    "_openwb_pro_unserved_pause_since",
+    "_openwb_pro_unserved_paused_s",
+    "_openwb_pro_start_hold_until",
+    "_openwb_pro_start_hold_amp",
+    "_openwb_start_reject_anchor_ts",
+    "_openwb_start_reject_soft_until",
+    "_phase_up_budget_since",
+    "_openwb_cp_start_sent",
+    "_openwb_last_cp_start_ts",
+    "_openwb_start_retry_count",
+    "_last_start_rejected_hold",
+    "_openwb_pro_start_cp_persistence_blocked",
+    "last_start_ts",
+)
+
+
+def _reset_wallbox_start_reject_episode(c_data):
+    """Verwirf nur die Startversuchs-Evidenz beim Übergang auf Aus/autonom.
+
+    Eine spätere Startablehnung darf nicht auf einem Strom-/Wake-up-Beleg aus
+    einer früheren Manager-Episode beruhen. Stecksession, Fahrzeug-Latch,
+    Manager-Nullanker und Phasenreservation bleiben deshalb ausdrücklich
+    erhalten.
+    """
+
+    if not isinstance(c_data, dict):
+        return False
+    changed = any(key in c_data for key in _WALLBOX_START_REJECT_EPISODE_KEYS)
+    for key in _WALLBOX_START_REJECT_EPISODE_KEYS:
+        c_data.pop(key, None)
+    return bool(changed)
+
+
 def _clear_openwb_pro_start_session(
     c_data,
     *,
@@ -22636,10 +22678,23 @@ def run():
                     # Keine automatischen Wallbox-Schreibbefehle. Nur eine bewusst
                     # angeforderte Default-Freigabe aus der WebUI darf einmalig senden.
                     if effective_wb_mode == 0:
+                        _mode0_start_episode_changed = False
                         for cd in chargers:
+                            _mode0_start_episode_changed = bool(
+                                _reset_wallbox_start_reject_episode(cd)
+                                or _mode0_start_episode_changed
+                            )
                             _mode0_max_amp = _charger_max_amp(config, cd.get("id", 1), wb_global_max_amp)
                             if _consume_mode0_default_release_request(cd.get("id", 1)):
                                 _release_wallbox_to_default_once(cd, _mode0_max_amp, reason="mode0_user_switch")
+                        if (
+                            _mode0_start_episode_changed
+                            and not _save_wallbox_phase_state(chargers)
+                        ):
+                            logger.error(
+                                "Wallbox-Startversuch beim Wechsel auf Aus/autonom "
+                                "nicht persistierbar; aktueller Prozess bleibt passiv."
+                            )
                         ui_state["wb_details"] = _build_wallbox_detail_list(
                             chargers,
                             valid_chargers_status,
@@ -23950,6 +24005,18 @@ def run():
                             continue
                         if c_mode == 0:
                             charger = c_data["charger"]
+                            _mode0_start_episode_changed = (
+                                _reset_wallbox_start_reject_episode(c_data)
+                            )
+                            if (
+                                _mode0_start_episode_changed
+                                and not _save_wallbox_phase_state(chargers)
+                            ):
+                                logger.error(
+                                    "WB%d Startversuch beim Wechsel auf Aus/autonom "
+                                    "nicht persistierbar; aktueller Prozess bleibt passiv.",
+                                    c_id,
+                                )
                             if _consume_mode0_default_release_request(c_id):
                                 _release_wallbox_to_default_once(c_data, charger_max_amp, reason="mode0_user_switch")
                             c_data["current_set_amp"] = 0

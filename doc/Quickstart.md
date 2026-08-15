@@ -2,9 +2,9 @@
 
 Diese Anleitung fasst die schnellsten Schritte zusammen, um E3DC-Control auf einem frischen Raspberry Pi OS (oder ähnlichem Debian-System) zu installieren.
 
-Aktueller Stable-Stand: `v5.4.3`.
+Aktueller Stable-Stand: `v5.4.3f`.
 
-5.4.3 verbessert die frische Bookworm-Installation, trennt Docker-Aktionen
+5.4.3f verbessert die frische Bookworm-Installation, trennt Docker-Aktionen
 klar vom Container und sichert Update sowie Rückfall gegen unvollständige
 Zustände ab. Speicher, Wallbox und Wärmeverbraucher teilen Leistung nach der
 eingestellten Priorität. Im Dashboard erscheint nur die zum Betriebsmodus
@@ -218,7 +218,7 @@ Ohne das Label bleibt auch ein versehentlich gestarteter Watchtower für den
 Hauptcontainer wirkungslos. Der oben gezeigte manuelle Host-Helfer bleibt der
 empfohlene Updateweg.
 
-**Docker-Rückfall von v5.4.3 auf den veröffentlichten Docker-Rollback-Root:**
+**Docker-Rückfall von v5.4.3f auf den veröffentlichten Docker-Rollback-Root:**
 ```bash
 (
   set -euo pipefail

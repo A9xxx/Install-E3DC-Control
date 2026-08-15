@@ -6024,6 +6024,57 @@ def build_decision_history_record(payload: Dict[str, Any], plan: Dict[str, Any])
     return build_decision_history_record_with_context(payload, plan, None)
 
 
+def _direct_marketing_execution_history_contract(
+    payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Archiviert nur die vier belegbaren DV-Ausführungsstufen.
+
+    Fehlende typisierte Felder bleiben ``None``. Dadurch wird ein alter oder
+    unvollständiger Datensatz nicht nachträglich als ``False`` ausgelegt.
+    """
+
+    source = payload if isinstance(payload, dict) else {}
+    phase5 = (
+        source.get("storage_dispatch_phase5")
+        if isinstance(source.get("storage_dispatch_phase5"), dict)
+        else {}
+    )
+
+    def typed_bool(key: str) -> Optional[bool]:
+        value = phase5.get(key)
+        return value if value is True or value is False else None
+
+    return {
+        "schema_version": "direct_marketing_execution_history_v1",
+        "evidence_present": bool(phase5),
+        "action": phase5.get("selected_action") if phase5 else None,
+        "plan_id": phase5.get("plan_id") if phase5 else None,
+        "slot_id": phase5.get("slot_id") if phase5 else None,
+        "selected": typed_bool("selected"),
+        "requested": typed_bool("requested"),
+        "issued": typed_bool("issued"),
+        "hardware_effect": typed_bool("hardware_effect"),
+    }
+
+
+def _direct_marketing_execution_event_signature(
+    payload: Dict[str, Any],
+) -> Tuple[Any, ...]:
+    evidence = _direct_marketing_execution_history_contract(payload)
+    return tuple(
+        evidence.get(key)
+        for key in (
+            "action",
+            "plan_id",
+            "slot_id",
+            "selected",
+            "requested",
+            "issued",
+            "hardware_effect",
+        )
+    )
+
+
 def build_decision_history_record_with_context(
     payload: Dict[str, Any],
     plan: Dict[str, Any],
@@ -6088,6 +6139,9 @@ def build_decision_history_record_with_context(
         if payload_export_execution.get("schema") == DIRECT_MARKETING_EXPORT_EXECUTION_SCHEMA
         else monitor_export_execution
     )
+    direct_execution_history = _direct_marketing_execution_history_contract(
+        payload
+    )
     rscp_power_settings = (
         payload.get("rscp_power_settings")
         if isinstance(payload.get("rscp_power_settings"), dict)
@@ -6125,6 +6179,7 @@ def build_decision_history_record_with_context(
         # diagnostics and must not turn a missing field into a false claim.
         "direct_marketing_monitor": direct_monitor,
         "direct_marketing_export_execution": direct_export_execution,
+        "direct_marketing_execution": direct_execution_history,
         "rscp_power_settings": rscp_power_settings,
         "peak_shaving": copy.deepcopy(payload.get("peak_shaving"))
         if isinstance(payload.get("peak_shaving"), dict)
@@ -6604,6 +6659,9 @@ def _history_event_write_due(
     val_w = safe_int((payload or {}).get("val"), 0)
     rscp_event = _rscp_power_settings_event_signature(payload)
     critical_event = _storage_history_critical_event_signature(payload)
+    direct_marketing_execution_event = (
+        _direct_marketing_execution_event_signature(payload)
+    )
     if "last_ts" not in state:
         return True
     if state.get("mode") != mode_value:
@@ -6613,6 +6671,11 @@ def _history_event_write_due(
     if state.get("rscp_power_settings_event") != rscp_event:
         return True
     if state.get("critical_event") != critical_event:
+        return True
+    if (
+        state.get("direct_marketing_execution_event")
+        != direct_marketing_execution_event
+    ):
         return True
     heartbeat_base = (
         safe_float(persisted_ts, 0.0)
@@ -6628,6 +6691,9 @@ def _remember_history_event_write(payload: Dict[str, Any], state: Dict[str, Any]
     state["val"] = safe_int((payload or {}).get("val"), 0)
     state["rscp_power_settings_event"] = _rscp_power_settings_event_signature(payload)
     state["critical_event"] = _storage_history_critical_event_signature(payload)
+    state["direct_marketing_execution_event"] = (
+        _direct_marketing_execution_event_signature(payload)
+    )
 
 
 def _rscp_power_settings_event_signature(payload: Dict[str, Any]) -> Tuple[Any, ...]:

@@ -1,9 +1,9 @@
 {
-  "version": "5.4.3e",
+  "version": "5.4.3f",
   "min_version": "4.0.0",
-  "stable_release": "v5.4.3e",
-  "release_date": "2026-08-11",
-  "description": "v5.4.3e - Reparatur für Bootstrap und Update-Rückweg",
+  "stable_release": "v5.4.3f",
+  "release_date": "2026-08-15",
+  "description": "v5.4.3f - Wartungsrelease für Update, Erstinstallation, Wallbox und Direktvermarktung",
   "installer_requires": "python3",
   "sanitized_republication": false,
   "history_transition": {

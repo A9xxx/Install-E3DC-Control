@@ -38,7 +38,12 @@ except Exception:
 from .core import register_command
 from .backup import backup_current_version, restore_verified_backup
 from .backup_integrity import _open_directory_nofollow, _open_regular_file_nofollow
-from .utils import cleanup_pycache, ensure_manager_lock_namespace, run_command
+from .utils import (
+    cleanup_pycache,
+    ensure_manager_lock_namespace,
+    require_bound_venv_runtime,
+    run_command,
+)
 from .installer_config import (
     WEB_CONFIG_START_DEFAULTS,
     ensure_web_config,
@@ -49,6 +54,7 @@ from .installer_config import (
 )
 from .transition_context import (
     venv_directory_chain_is_trusted,
+    venv_has_extended_acl,
     venv_metadata_is_trusted,
 )
 from .logging_manager import get_or_create_logger, log_task_completed, log_error, log_warning
@@ -92,7 +98,10 @@ ROOT_RECOVERY_FILE_CONTRACTS = (
         0o644,
         64 * 1024,
     ),
+    ("/etc/logrotate.d/e3dc-control", 0o644, 64 * 1024),
 )
+LOGROTATE_CONFIG_PATH = "/etc/logrotate.d/e3dc-control"
+LOGROTATE_SOURCE_RELATIVE_PATH = "Installer/logrotate/e3dc-control"
 
 # Stale paths may only be removed when both the release policy and this code
 # explicitly name the exact absolute target. Directories need a separate list.
@@ -3071,6 +3080,117 @@ def _create_release_venv(install_user: str, expected_path: str) -> str:
     return venv_python
 
 
+def _harden_existing_release_venv(
+    install_user: str,
+    expected_path: str,
+) -> None:
+    """Migriert ausschließlich ein eindeutig gebundenes Bestands-venv auf 0755/0644-Sicherheit.
+
+    Historische Installationen verwendeten teilweise die private Benutzergruppe
+    mit 0775/0664. Das war für den damaligen Betrieb ausreichend, widerspricht
+    aber dem heutigen Interpreter-Vertrag. Die Migration entfernt nur
+    Schreibrechte für Gruppe und Andere; Eigentümer, Lese-/Ausführungsbits und
+    Symlinkziele bleiben unverändert.
+    """
+
+    try:
+        account = pwd.getpwnam(str(install_user))
+    except KeyError as exc:
+        raise RuntimeError("Installationsbenutzer für venv-Rechtemigration fehlt") from exc
+
+    raw_home = Path(account.pw_dir)
+    raw_target = Path(str(expected_path or ""))
+    if (
+        not raw_home.is_absolute()
+        or raw_home.is_symlink()
+        or not raw_target.is_absolute()
+        or raw_target.is_symlink()
+    ):
+        raise RuntimeError("venv-Rechtemigration besitzt keinen kanonischen Ausgangspfad")
+    home = raw_home.resolve(strict=True)
+    target = raw_target.resolve(strict=True)
+    if home != raw_home or target != raw_target or target.parent != home:
+        raise RuntimeError("venv-Rechtemigration verlässt das gebundene Benutzer-Home")
+    configured = Path(get_venv_path(str(install_user))).resolve(strict=True)
+    if configured != target:
+        raise RuntimeError("venv-Rechtemigration weicht vom konfigurierten venv ab")
+
+    allowed_link_names = {"bin/python", "bin/python3"}
+    entries: list[tuple[Path, os.stat_result]] = []
+    for directory, dirnames, filenames in os.walk(
+        target,
+        topdown=True,
+        followlinks=False,
+    ):
+        directory_path = Path(directory)
+        names = [".", *sorted(dirnames), *sorted(filenames)]
+        for name in names:
+            path = directory_path if name == "." else directory_path / name
+            try:
+                metadata = path.lstat()
+            except OSError as exc:
+                raise RuntimeError("venv-Rechtemigration konnte einen Pfad nicht binden") from exc
+            relative = path.relative_to(target).as_posix() if path != target else "."
+            if stat.S_ISLNK(metadata.st_mode):
+                if (
+                    metadata.st_uid not in (0, account.pw_uid)
+                    or venv_has_extended_acl(path)
+                    or not (
+                        relative in allowed_link_names
+                        or re.fullmatch(r"bin/python3\.\d+", relative)
+                    )
+                ):
+                    raise RuntimeError(
+                        f"venv-Rechtemigration verweigert einen fremden Link: {relative}"
+                    )
+                continue
+            if not (stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode)):
+                raise RuntimeError(
+                    f"venv-Rechtemigration verweigert einen Sonderpfad: {relative}"
+                )
+            if venv_has_extended_acl(path):
+                raise RuntimeError(
+                    f"venv-Rechtemigration verweigert erweiterte ACLs: {relative}"
+                )
+            if metadata.st_uid != account.pw_uid:
+                raise RuntimeError(
+                    f"venv-Rechtemigration verweigert einen fremden Eigentümer: {relative}"
+                )
+            if stat.S_ISREG(metadata.st_mode) and metadata.st_nlink != 1:
+                raise RuntimeError(
+                    f"venv-Rechtemigration verweigert eine mehrfach verlinkte Datei: {relative}"
+                )
+            entries.append((path, metadata))
+
+    for path, before in entries:
+        requested_mode = stat.S_IMODE(before.st_mode) & ~0o022
+        if requested_mode == stat.S_IMODE(before.st_mode):
+            continue
+        current = path.lstat()
+        if (
+            current.st_dev != before.st_dev
+            or current.st_ino != before.st_ino
+            or current.st_uid != before.st_uid
+            or current.st_gid != before.st_gid
+            or stat.S_IFMT(current.st_mode) != stat.S_IFMT(before.st_mode)
+        ):
+            raise RuntimeError("venv-Pfad driftete vor der Rechtemigration")
+        os.chmod(path, requested_mode, follow_symlinks=False)
+        after = path.lstat()
+        if (
+            after.st_dev != before.st_dev
+            or after.st_ino != before.st_ino
+            or after.st_uid != before.st_uid
+            or after.st_gid != before.st_gid
+            or stat.S_IMODE(after.st_mode) != requested_mode
+        ):
+            raise RuntimeError(
+                "venv-Rechtemigration konnte einen Modus nicht verifizieren: "
+                f"{path.relative_to(target)} erwartet={requested_mode:04o} "
+                f"gefunden={stat.S_IMODE(after.st_mode):04o}"
+            )
+
+
 def _apply_verified_package_policy(
     policy: dict,
     install_user: str,
@@ -3088,8 +3208,14 @@ def _apply_verified_package_policy(
         if not result["success"]:
             raise RuntimeError("apt-Installation fehlgeschlagen: " + result["stderr"].strip())
     if pip_packages:
+        process_bound_venv_path = bool(expected_venv_path)
         if expected_venv_state not in {"present", "missing"}:
             raise RuntimeError("Erwarteter venv-Ausgangszustand ist ungültig")
+        if expected_venv_state == "present" and process_bound_venv_path:
+            _harden_existing_release_venv(
+                install_user,
+                expected_venv_path,
+            )
         venv_python = _find_venv_python(install_user)
         if expected_venv_state == "missing":
             if venv_python:
@@ -3129,6 +3255,11 @@ def _apply_verified_package_policy(
             raise RuntimeError(
                 f"venv-pip-Installation fehlgeschlagen (Pakete: {package_names}): "
                 + result["stderr"].strip()
+            )
+        if process_bound_venv_path:
+            require_bound_venv_runtime(
+                install_user=install_user,
+                venv_path=actual_venv_path,
             )
 
 
@@ -4142,6 +4273,127 @@ def _restore_root_managed_preimages(
         )
 
 
+def _validate_logrotate_config(path: str) -> None:
+    """Parst eine gebundene Logrotate-Datei mit dem echten Systemparser."""
+
+    binary = "/usr/sbin/logrotate"
+    metadata = os.lstat(binary)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        or not metadata.st_mode & 0o111
+    ):
+        raise RuntimeError("Logrotate-Systemparser ist nicht vertrauenswürdig")
+    result = _run_argv(
+        [binary, "-d", "-s", "/dev/null", path],
+        timeout=30,
+    )
+    if not result["success"]:
+        detail = (result.get("stderr") or result.get("stdout") or "").strip()
+        raise RuntimeError("Logrotate-Konfiguration ist ungültig: " + detail[-1000:])
+
+
+def _project_bare_metal_logrotate_config(
+    *,
+    repo_dir: str,
+    target_commit: str,
+    install_user: str,
+) -> None:
+    """Projiziert die LF-Konfiguration am letzten Release-Gate atomar nach /etc."""
+
+    payload = _read_commit_blob(
+        repo_dir,
+        target_commit,
+        LOGROTATE_SOURCE_RELATIVE_PATH,
+        install_user,
+    )
+    mode = _read_commit_file_mode(
+        repo_dir,
+        target_commit,
+        LOGROTATE_SOURCE_RELATIVE_PATH,
+        install_user,
+    )
+    if (
+        mode not in {0o644, 0o755}
+        or not payload
+        or len(payload) > 64 * 1024
+        or b"\r" in payload
+        or not payload.endswith(b"\n")
+    ):
+        raise RuntimeError("Logrotate-Release-Blob besitzt keinen reinen LF-Vertrag")
+    try:
+        payload.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise RuntimeError("Logrotate-Release-Blob ist nicht UTF-8") from exc
+
+    preimage = _capture_bound_managed_file_preimage(
+        LOGROTATE_CONFIG_PATH,
+        expected_mode=0o644,
+        maximum_bytes=64 * 1024,
+    )
+    parent_descriptor = _open_root_managed_parent(LOGROTATE_CONFIG_PATH)
+    parent = os.path.dirname(LOGROTATE_CONFIG_PATH)
+    name = os.path.basename(LOGROTATE_CONFIG_PATH)
+    staged_path = ""
+    replaced = False
+    try:
+        descriptor, staged_path = tempfile.mkstemp(
+            prefix=f".{name}.e3dc-release-",
+            dir=parent,
+        )
+        try:
+            offset = 0
+            while offset < len(payload):
+                offset += os.write(descriptor, payload[offset:])
+            os.fchown(descriptor, 0, 0)
+            os.fchmod(descriptor, 0o644)
+            os.fsync(descriptor)
+            staged = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(staged.st_mode)
+                or staged.st_nlink != 1
+                or staged.st_uid != 0
+                or staged.st_gid != 0
+                or stat.S_IMODE(staged.st_mode) != 0o644
+                or staged.st_size != len(payload)
+            ):
+                raise RuntimeError("Logrotate-Stagingdatei besitzt keine gebundenen Metadaten")
+        finally:
+            os.close(descriptor)
+
+        _validate_logrotate_config(staged_path)
+        os.replace(
+            os.path.basename(staged_path),
+            name,
+            src_dir_fd=parent_descriptor,
+            dst_dir_fd=parent_descriptor,
+        )
+        staged_path = ""
+        replaced = True
+        os.fsync(parent_descriptor)
+        _validate_logrotate_config(LOGROTATE_CONFIG_PATH)
+        projected = _capture_bound_managed_file_preimage(
+            LOGROTATE_CONFIG_PATH,
+            expected_mode=0o644,
+            maximum_bytes=64 * 1024,
+        )
+        if not projected.existed or projected.payload != payload:
+            raise RuntimeError("Logrotate-Endgate stimmt nicht mit dem Release-Blob überein")
+    except Exception:
+        if replaced:
+            _restore_bound_managed_file_preimage(
+                preimage,
+                expected_mode=0o644,
+                maximum_bytes=64 * 1024,
+            )
+        raise
+    finally:
+        os.close(parent_descriptor)
+        if staged_path and os.path.lexists(staged_path):
+            os.unlink(staged_path)
+
+
 def _capture_apache_security_preimage() -> ApacheSecurityPreimage:
     available_path = APACHE_SECURITY_CONF_AVAILABLE
     enabled_path = APACHE_SECURITY_CONF_ENABLED
@@ -4798,6 +5050,11 @@ def finalize_release_from_target(
             raise RuntimeError("Betriebskonfiguration driftete während des Target-Finalizers")
     _announce_finalizer_phase(7, phase_total, "Initiale lokale Prognose aktualisieren")
     run_initial_forecast(os.path.join(target_root, "Installer"))
+    _project_bare_metal_logrotate_config(
+        repo_dir=target_root,
+        target_commit=commit,
+        install_user=install_user,
+    )
 
 
 def _target_execution_archive_entries(

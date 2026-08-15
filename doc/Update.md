@@ -5,7 +5,7 @@ Updates werden ausschließlich über den Installer ausgeführt. Ein manuelles
 Release-Historie ungeeignet, weil alter und neuer Git-Stand nicht miteinander
 verwandt sein müssen.
 
-Der aktuelle Stable-Stand ist `v5.4.3e`. Der Ziel-Updater bindet den
+Der aktuelle Stable-Stand ist `v5.4.3f`. Der Ziel-Updater bindet den
 freigegebenen Zielstand vor Backup und Dienststopp eindeutig an Version,
 Herkunft und Anlagenrolle. Fortschritt und Lebenszeichen bleiben auf
 langsameren Raspberry Pis sichtbar. Eine bereits vollständig installierte
@@ -43,7 +43,7 @@ veröffentlichten GitHub-Release-Seite übernommen werden:
 
 ```bash
 export E3DC_INSTALL_PATH="/absoluter/pfad/zur/installation"
-export E3DC_RELEASE_TAG="v5.4.3e"
+export E3DC_RELEASE_TAG="v5.4.3f"
 export E3DC_RELEASE_SHA="<40-stellige Commit-SHA des veröffentlichten Tags>"
 E3DC_BOOTSTRAP_DIR="$(mktemp -d)"
 curl -fL "https://github.com/A9xxx/Install-E3DC-Control/archive/refs/tags/${E3DC_RELEASE_TAG}.tar.gz" \

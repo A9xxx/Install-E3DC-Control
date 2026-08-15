@@ -5,15 +5,16 @@ Updates werden ausschließlich über den Installer ausgeführt. Ein manuelles
 Release-Historie ungeeignet, weil alter und neuer Git-Stand nicht miteinander
 verwandt sein müssen.
 
-Der aktuelle Stable-Stand ist `v5.4.3f`. Der Ziel-Updater bindet den
+Der aktuelle Stable-Stand ist `v5.4.3g`. Der Ziel-Updater bindet den
 freigegebenen Zielstand vor Backup und Dienststopp eindeutig an Version,
 Herkunft und Anlagenrolle. Fortschritt und Lebenszeichen bleiben auf
 langsameren Raspberry Pis sichtbar. Eine bereits vollständig installierte
 Version bleibt beim normalen Update ohne Unterbrechung unverändert; eine
 Reparatur oder Neuinstallation derselben Version muss ausdrücklich bestätigt
-werden. Der allgemeine privilegierte Web-/sudo-Pfad für Produktänderungen ist
-deaktiviert, administrative Installation, Reparatur und Rückfall erfolgen über
-den geschützten Konsolenweg.
+werden. Das Dashboard darf ausschließlich das reguläre Update über einen
+argumentlosen, root-eigenen Systemjob starten. Freie Installer-Aktionen,
+Pfade, Release-Tags, Reparaturen, Neuinstallationen und Rückfälle bleiben im
+Web gesperrt und erfolgen über den geschützten Konsolenweg.
 
 Die Konsolenbeispiele verwenden den zuvor geprüften absoluten Produktpfad:
 
@@ -24,13 +25,22 @@ test -f "$E3DC_INSTALL_PATH/e3dc-setup"
 
 ## Normales Update
 
-Der bevorzugte Weg ist der Update-Button der Weboberfläche. Auf der Konsole
-steht derselbe Installer-Pfad zur Verfügung:
+Der bevorzugte Weg ist der Update-Button der Weboberfläche. Er bindet den
+unveränderten veröffentlichten Ausgangsstand an dessen Remote-Tag und startet
+den Installer aus einem versiegelten Snapshot. Auf der Konsole steht derselbe
+reguläre Installer-Pfad zur Verfügung:
 
 ```bash
 bash "$E3DC_INSTALL_PATH/e3dc-setup" --check
 bash "$E3DC_INSTALL_PATH/e3dc-setup" --update-e3dc
 ```
+
+**Einmaliger Übergang auf 5.4.3g:** Installationen bis einschließlich 5.4.3f
+besitzen den neuen root-eigenen Web-Launcher noch nicht. Dieser erste Wechsel
+muss deshalb über den oben gezeigten administrativen Konsolenweg erfolgen.
+Erst die erfolgreiche Installation von 5.4.3g richtet den engen Launcher und
+seine argumentlose sudoers-Freigabe ein; alle folgenden normalen Updates
+können wieder aus dem Dashboard gestartet werden.
 
 ### Reparatur eines alten Bootstrap-Übergangs
 
@@ -43,7 +53,7 @@ veröffentlichten GitHub-Release-Seite übernommen werden:
 
 ```bash
 export E3DC_INSTALL_PATH="/absoluter/pfad/zur/installation"
-export E3DC_RELEASE_TAG="v5.4.3f"
+export E3DC_RELEASE_TAG="v5.4.3g"
 export E3DC_RELEASE_SHA="<40-stellige Commit-SHA des veröffentlichten Tags>"
 E3DC_BOOTSTRAP_DIR="$(mktemp -d)"
 curl -fL "https://github.com/A9xxx/Install-E3DC-Control/archive/refs/tags/${E3DC_RELEASE_TAG}.tar.gz" \
@@ -81,9 +91,15 @@ Eine wichtige Übergangsgrenze bleibt technisch unvermeidbar: Beim ersten
 Sprung von einer Version ohne diesen Vertrag läuft zunächst noch deren alter
 Updater. Insbesondere der in `v5.4.2d` veröffentlichte Außenprozess behält für
 diesen ersten Sprung sein 900-Sekunden-Limit; Zielcode kann einen bereits
-gestarteten Altprozess nicht rückwirkend ersetzen. Nach erfolgreicher
-Installation des neuen Vertrags verwenden alle folgenden Updates den
-Ziel-Updater-Handoff.
+gestarteten Altprozess nicht rückwirkend ersetzen. Die Kompatibilitätsbrücke
+begrenzt deshalb ihren gesamten lokalen Handoff auf zwölf Minuten. Ist dieses
+Budget schon vor dem Mutationsstart erschöpft, startet sie keinen Zielprozess;
+andernfalls beendet sie ihn spätestens an dieser Grenze als ganze Prozessgruppe,
+erzwingt dies nach zehn weiteren Sekunden und meldet den Fehler erst nach dem
+nachgewiesenen Prozessende an den Altprozess. Dessen Wiederherstellung kann
+dadurch nicht parallel zu einem weiterlaufenden Ziel-Finalizer arbeiten. Nach
+erfolgreicher Installation des neuen Vertrags verwenden alle folgenden Updates
+den Ziel-Updater-Handoff.
 
 Ist der exakt gebundene Release-Stand bereits installiert und stimmt seine
 kanonische Webprojektion überein, endet ein normales Update ohne Backup und
@@ -96,8 +112,8 @@ und Diagnosedateien lösen dabei keinen Reparaturalarm aus.
 Weicht dagegen eine getrackte Produktdatei oder eine kanonische Webdatei vom
 veröffentlichten Stand ab, meldet das normale Update `REPAIR_REQUIRED` und
 verändert weder Produkt- oder Webdateien noch Dienstzustände. Die aktuelle
-Version kann dann ausschließlich nach ausdrücklicher Bestätigung in der
-Weboberfläche oder auf der Konsole erneut installiert werden:
+Version kann dann ausschließlich nach ausdrücklicher Bestätigung auf der
+administrativen Konsole erneut installiert werden:
 
 ```bash
 bash "$E3DC_INSTALL_PATH/e3dc-setup" --reinstall-current
@@ -147,9 +163,9 @@ cat VERSION
 systemctl --failed --no-pager
 ```
 
-Für den einmaligen Wechsel aus 5.3.2b sind ausschließlich der
-Web-Update-Button oder der oben gezeigte direkte Aufruf mit
-`--update-e3dc` freigegeben. Der interaktive Installer-Menüpunkt lädt im
+Für den einmaligen Wechsel aus 5.3.2b ist ausschließlich der oben gezeigte
+direkte Konsolenaufruf mit `--update-e3dc` freigegeben. Der Web-Launcher ist
+in diesem Altstand noch nicht vorhanden. Der interaktive Installer-Menüpunkt lädt im
 Altprozess bereits vor dem Git-Wechsel zusätzliche Module und darf für diesen
 Hybridübergang nicht verwendet werden.
 

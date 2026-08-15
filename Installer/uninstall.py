@@ -480,6 +480,7 @@ def uninstall_diagramm():
         ("/etc/sudoers.d/010_e3dc_web_update", "Sudoers (update)"),
         ("/etc/sudoers.d/020_e3dc_services", "Sudoers (Service-Launcher)"),
         ("/usr/local/sbin/e3dc-service-control", "root-eigener Service-Launcher"),
+        ("/usr/local/sbin/e3dc-web-update-launcher", "root-eigener Web-Update-Launcher"),
     ]
     for path, label in managed_privilege_files:
         if os.path.lexists(path):

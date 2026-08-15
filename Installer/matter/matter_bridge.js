@@ -1,6 +1,7 @@
-import { MatterServer, CommissioningServer } from "@project-chip/matter-node.js";
-import { OnOffPluginUnitDevice, DimmableLightDevice } from "@project-chip/matter-node.js/device";
-import { BridgedDeviceBasicInformationCluster, ClusterServer } from "@project-chip/matter-node.js/cluster";
+import "@project-chip/matter-node.js";
+import { MatterServer, CommissioningServer } from "@project-chip/matter.js";
+import { OnOffPluginUnitDevice } from "@project-chip/matter.js/device";
+import { BridgedDeviceBasicInformationCluster, ClusterServer } from "@project-chip/matter.js/cluster";
 import fs from "fs";
 import path from "path";
 import { spawn, execSync } from "child_process";

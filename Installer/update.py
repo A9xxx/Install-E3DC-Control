@@ -59,6 +59,11 @@ from .transition_context import (
 )
 from .logging_manager import get_or_create_logger, log_task_completed, log_error, log_warning
 from .config_secret_permissions import config_secret_dir_mode_text, config_secret_file_mode_text
+from .git_commit_reader import (
+    isolated_git_command,
+    read_commit_entries,
+    run_isolated_remote_git,
+)
 try:
     from .service_catalog import allowed_services, get_module_by_service
     from .optional_service_contract import preinstalled_optional_service_expected
@@ -73,6 +78,7 @@ update_logger  = get_or_create_logger('update')
 
 # Self-Update: Unser Repo (Native Python + PHP)
 SELFUPDATE_REPO = 'https://github.com/A9xxx/Install-E3DC-Control.git'
+SELFUPDATE_ALLOWED_ORIGINS = frozenset((SELFUPDATE_REPO, SELFUPDATE_REPO.removesuffix('.git')))
 WATCHDOG_PAUSE_FILE = '/var/www/html/ramdisk/watchdog.update_pause'
 WATCHDOG_GRACE_FILE = '/var/www/html/ramdisk/watchdog.update_grace'
 WATCHDOG_POST_UPDATE_GRACE_S = 300
@@ -91,6 +97,7 @@ APACHE_SECURITY_CONF_ENABLED = (
 )
 ROOT_RECOVERY_FILE_CONTRACTS = (
     ("/usr/local/sbin/e3dc-service-control", 0o755, 64 * 1024),
+    ("/usr/local/sbin/e3dc-web-update-launcher", 0o755, 64 * 1024),
     ("/etc/sudoers.d/020_e3dc_services", 0o440, 256 * 1024),
     ("/etc/apache2/sites-available/000-default.conf", 0o644, 256 * 1024),
     (
@@ -150,6 +157,7 @@ TARGET_UPDATER_SUCCESS = "E3DC_RELEASE_TARGET_UPDATER_OK"
 TARGET_UPDATER_NOOP = "E3DC_RELEASE_TARGET_UPDATER_NOOP"
 TARGET_FINALIZER_RELATIVE_FILES = (
     "Installer/__init__.py",
+    "Installer/git_commit_reader.py",
     "Installer/optional_service_contract.py",
     "Installer/release_finalize.py",
     "Installer/update.py",
@@ -747,22 +755,7 @@ def _combined_process_diagnostics(result: dict, maximum: int = 4000) -> str:
 
 def _git_argv(repo_dir: str, install_user: str, *args: str, timeout: int = 30) -> dict:
     return _run_argv(
-        [
-            "sudo",
-            "-H",
-            "-u",
-            str(install_user),
-            "/usr/bin/env",
-            "GIT_OPTIONAL_LOCKS=0",
-            "git",
-            "-c",
-            f"safe.directory={repo_dir}",
-            "-c",
-            "core.fileMode=false",
-            "-C",
-            str(repo_dir),
-            *args,
-        ],
+        isolated_git_command(repo_dir, *args, run_as_user=install_user),
         timeout=timeout,
     )
 
@@ -2088,6 +2081,65 @@ def _resolve_git_commit(repo_dir: str, ref: str, install_user: str) -> str | Non
         return None
 
 
+def _require_bound_origin(repo_dir: str, install_user: str) -> None:
+    """Akzeptiert ausschließlich einen lokalen, include-freien origin-Rohwert."""
+
+    result = _git_argv(
+        repo_dir,
+        install_user,
+        "config",
+        "--local",
+        "--no-includes",
+        "--get-all",
+        "remote.origin.url",
+        timeout=10,
+    )
+    values = [line.strip() for line in result["stdout"].splitlines() if line.strip()]
+    if (
+        not result["success"]
+        or len(values) != 1
+        or values[0] not in SELFUPDATE_ALLOWED_ORIGINS
+    ):
+        raise RuntimeError("Git-Origin weicht vom fest freigegebenen Release-Repository ab")
+
+
+def _official_remote_refs(*refs: str) -> dict[str, str]:
+    """Bindet veröffentlichte Refs außerhalb des nutzerbeschreibbaren Repos."""
+
+    patterns = tuple(str(ref or "").strip() for ref in refs)
+    if not patterns or any(
+        not re.fullmatch(r"refs/(?:heads|tags)/[A-Za-z0-9._/-]+(?:\^\{\})?", ref)
+        or ".." in ref
+        for ref in patterns
+    ):
+        raise RuntimeError("Remote-Ref ist nicht kanonisch")
+    completed = run_isolated_remote_git(
+        SELFUPDATE_REPO,
+        "ls-remote",
+        "--exit-code",
+        SELFUPDATE_REPO,
+        *patterns,
+        timeout=60,
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError("Offizieller Release-Ref konnte nicht gebunden werden: " + detail[-500:])
+    result: dict[str, str] = {}
+    for raw_line in bytes(completed.stdout or b"").splitlines():
+        try:
+            raw_sha, raw_ref = raw_line.split(b"\t", 1)
+            sha = _validate_full_commit(raw_sha.decode("ascii"))
+            ref = raw_ref.decode("ascii")
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise RuntimeError("Offizieller Release-Ref besitzt kein eindeutiges Format") from exc
+        if ref not in patterns or ref in result:
+            raise RuntimeError("Offizieller Release-Ref ist mehrdeutig")
+        result[ref] = sha
+    if set(result) != set(patterns):
+        raise RuntimeError("Offizieller Release-Ref ist unvollständig")
+    return result
+
+
 def _delete_approved_stale_paths(
     paths,
     *,
@@ -3132,12 +3184,29 @@ def _harden_existing_release_venv(
                 raise RuntimeError("venv-Rechtemigration konnte einen Pfad nicht binden") from exc
             relative = path.relative_to(target).as_posix() if path != target else "."
             if stat.S_ISLNK(metadata.st_mode):
+                link_target = ""
+                link_target_ok = False
+                if relative == "lib64":
+                    try:
+                        link_target = os.readlink(path)
+                        resolved_link = (path.parent / link_target).resolve(strict=True)
+                        resolved_metadata = resolved_link.lstat()
+                        link_target_ok = bool(
+                            link_target == "lib"
+                            and resolved_link == target / "lib"
+                            and stat.S_ISDIR(resolved_metadata.st_mode)
+                            and resolved_metadata.st_uid == account.pw_uid
+                            and not venv_has_extended_acl(resolved_link)
+                        )
+                    except (OSError, RuntimeError):
+                        link_target_ok = False
                 if (
                     metadata.st_uid not in (0, account.pw_uid)
                     or venv_has_extended_acl(path)
                     or not (
                         relative in allowed_link_names
                         or re.fullmatch(r"bin/python3\.\d+", relative)
+                        or link_target_ok
                     )
                 ):
                     raise RuntimeError(
@@ -3496,8 +3565,11 @@ def get_current_commit(repo_dir: str) -> str | None:
 def get_repo_url(repo_dir: str) -> str | None:
     """Liest die Remote-URL aus der Git-Config aus."""
     install_user = get_install_user()
-    result = _git_argv(repo_dir, install_user, "remote", "get-url", "origin", timeout=5)
-    return result['stdout'].strip() if result['success'] else None
+    try:
+        _require_bound_origin(repo_dir, install_user)
+    except RuntimeError:
+        return None
+    return SELFUPDATE_REPO
 
 
 def check_for_updates(repo_dir: str) -> int | None:
@@ -3506,9 +3578,27 @@ def check_for_updates(repo_dir: str) -> int | None:
     Gibt die Anzahl fehlender Commits zurueck, None bei Fehler.
     """
     install_user = get_install_user()
-    fetch = _git_argv(repo_dir, install_user, "fetch", "origin", timeout=20)
+    try:
+        _require_bound_origin(repo_dir, install_user)
+        official = _official_remote_refs("refs/heads/main")["refs/heads/main"]
+    except RuntimeError as exc:
+        log_warning('update', f'GitHub-main konnte nicht gebunden werden: {exc}')
+        return None
+    fetch = _git_argv(
+        repo_dir,
+        install_user,
+        "fetch",
+        "--no-tags",
+        SELFUPDATE_REPO,
+        "+refs/heads/main:refs/remotes/origin/main",
+        timeout=120,
+    )
     if not fetch['success']:
         log_warning('update', f'git fetch fehlgeschlagen: {fetch["stderr"]}')
+        return None
+    fetched = _resolve_git_commit(repo_dir, "refs/remotes/origin/main", install_user)
+    if not fetched or not _exact_commit_matches(fetched, official):
+        log_warning('update', 'Gefetchtes origin/main weicht vom isoliert gebundenen GitHub-Ref ab')
         return None
 
     count = _git_argv(repo_dir, install_user, "rev-list", "--count", "HEAD..origin/main", timeout=5)
@@ -4683,36 +4773,65 @@ def _restore_recovery_surface(inventory: RecoverySurfaceInventory, state: Transi
 
 def _read_commit_text(repo_dir: str, commit: str, path: str, install_user: str) -> str:
     verified = _validate_full_commit(commit)
-    result = _git_argv(repo_dir, install_user, "show", f"{verified}:{path}", timeout=15)
-    if not result["success"]:
-        raise RuntimeError(f"{path} fehlt im verifizierten Ziel-Commit")
-    return result["stdout"]
+    raw = _read_commit_blob(
+        repo_dir,
+        verified,
+        path,
+        install_user,
+        maximum=1024 * 1024,
+    )
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise RuntimeError(f"{path} ist im verifizierten Ziel-Commit kein UTF-8") from exc
 
 
 def _fetch_target_commit(repo_dir: str, install_user: str, target_tag: str | None) -> str:
+    _require_bound_origin(repo_dir, install_user)
     if target_tag:
         storage_ref = f"refs/tags/{target_tag}"
+        peeled_ref = storage_ref + "^{}"
+        official = _official_remote_refs(storage_ref, peeled_ref)
         refspec = f"+{storage_ref}:{storage_ref}"
-        result = _git_argv(repo_dir, install_user, "fetch", "--no-tags", "origin", refspec, timeout=120)
-        if not result["success"]:
-            raise RuntimeError("Release-Tag-Fetch fehlgeschlagen: " + result["stderr"].strip())
-        object_type = _git_argv(repo_dir, install_user, "cat-file", "-t", storage_ref, timeout=15)
-        if not object_type["success"] or object_type["stdout"].strip() != "tag":
-            raise RuntimeError(f"Release-Tag {target_tag} ist nicht annotiert")
-        commit = _resolve_git_commit(repo_dir, storage_ref, install_user)
-    else:
         result = _git_argv(
             repo_dir,
             install_user,
             "fetch",
             "--no-tags",
-            "origin",
+            SELFUPDATE_REPO,
+            refspec,
+            timeout=120,
+        )
+        if not result["success"]:
+            raise RuntimeError("Release-Tag-Fetch fehlgeschlagen: " + result["stderr"].strip())
+        object_type = _git_argv(repo_dir, install_user, "cat-file", "-t", storage_ref, timeout=15)
+        if not object_type["success"] or object_type["stdout"].strip() != "tag":
+            raise RuntimeError(f"Release-Tag {target_tag} ist nicht annotiert")
+        tag_object = _git_argv(repo_dir, install_user, "rev-parse", "--verify", storage_ref + "^{tag}", timeout=15)
+        if (
+            not tag_object["success"]
+            or not _exact_commit_matches(tag_object["stdout"].strip(), official[storage_ref])
+        ):
+            raise RuntimeError(f"Release-Tag {target_tag} weicht vom offiziellen Tagobjekt ab")
+        commit = _resolve_git_commit(repo_dir, storage_ref, install_user)
+        if not commit or not _exact_commit_matches(commit, official[peeled_ref]):
+            raise RuntimeError(f"Release-Tag {target_tag} weicht vom offiziellen Zielcommit ab")
+    else:
+        official = _official_remote_refs("refs/heads/main")["refs/heads/main"]
+        result = _git_argv(
+            repo_dir,
+            install_user,
+            "fetch",
+            "--no-tags",
+            SELFUPDATE_REPO,
             "+refs/heads/main:refs/remotes/origin/main",
             timeout=120,
         )
         if not result["success"]:
             raise RuntimeError("git fetch origin/main fehlgeschlagen: " + result["stderr"].strip())
         commit = _resolve_git_commit(repo_dir, "refs/remotes/origin/main", install_user)
+        if not commit or not _exact_commit_matches(commit, official):
+            raise RuntimeError("Gefetchtes origin/main weicht vom offiziellen GitHub-Ref ab")
     if not commit:
         raise RuntimeError("Exakter Ziel-Commit konnte nicht aufgeloest werden")
     return commit
@@ -4736,33 +4855,15 @@ def _validate_target_release(
         )
     if target_tag and stable != target_tag:
         raise RuntimeError(f"Ziel-Tag {target_tag} ist nicht Stable des Ziel-Commits ({stable})")
+    if policy.get("run_permissions") is not True:
+        raise RuntimeError(
+            "Verifizierte Ziel-Policy muss die gebundene Berechtigungs- und "
+            "Root-Launcher-Aktualisierung aktivieren"
+        )
     # Auch der bereits explizit angeforderte Tag wird im Zielprozess erneut
     # direkt von origin geladen und als annotiertes Tag auf exakt denselben
     # Commit gebunden. Die Vorprüfung des Alt-Updaters ist kein Ersatz dafür.
-    storage_ref = f"refs/tags/{stable}"
-    refspec = f"+{storage_ref}:{storage_ref}"
-    fetched = _git_argv(
-        repo_dir,
-        install_user,
-        "fetch",
-        "--no-tags",
-        "origin",
-        refspec,
-        timeout=120,
-    )
-    if not fetched["success"]:
-        raise RuntimeError("Stable-Tag des Ziel-Commits konnte nicht geladen werden")
-    object_type = _git_argv(
-        repo_dir,
-        install_user,
-        "cat-file",
-        "-t",
-        storage_ref,
-        timeout=15,
-    )
-    if not object_type["success"] or object_type["stdout"].strip() != "tag":
-        raise RuntimeError("Stable-Tag des Ziel-Commits ist nicht annotiert")
-    stable_commit = _resolve_git_commit(repo_dir, storage_ref, install_user)
+    stable_commit = _fetch_target_commit(repo_dir, install_user, stable)
     if not stable_commit or not _exact_commit_matches(stable_commit, target_commit):
         raise RuntimeError(
             "Stable-Tag der Ziel-Policy verweist nicht exakt auf den Ziel-Commit"
@@ -4905,6 +5006,7 @@ def finalize_release_from_target(
     expected_venv_state: str,
     expected_venv_path: str,
     headless: bool = True,
+    privileged_preimages=None,
 ) -> None:
     """Finalisiert einen Reset ausschließlich aus dem versiegelten Commit-Snapshot."""
 
@@ -4982,8 +5084,21 @@ def finalize_release_from_target(
     )
     if policy.get("run_permissions", True):
         from .permissions import run_permissions_wizard
-        if run_permissions_wizard(headless=True, release_quiesced=True) is False:
-            raise RuntimeError("Berechtigungsreparatur fehlgeschlagen")
+        expected_commit_env = "E3DC_RELEASE_EXPECTED_COMMIT"
+        previous_expected_commit = os.environ.get(expected_commit_env)
+        os.environ[expected_commit_env] = commit
+        try:
+            if run_permissions_wizard(
+                headless=True,
+                release_quiesced=True,
+                bound_privileged_preimages=privileged_preimages,
+            ) is False:
+                raise RuntimeError("Berechtigungsreparatur fehlgeschlagen")
+        finally:
+            if previous_expected_commit is None:
+                os.environ.pop(expected_commit_env, None)
+            else:
+                os.environ[expected_commit_env] = previous_expected_commit
         _secure_repo_permissions(
             target_root,
             install_user,
@@ -5065,94 +5180,17 @@ def _target_execution_archive_entries(
 ) -> dict[str, tuple[bytes, int]]:
     """Liest den vollständigen ausführbaren Installer-Baum direkt aus dem Commit."""
 
-    commit = _validate_full_commit(target_commit)
-    try:
-        completed = subprocess.run(
-            [
-                "sudo", "-H", "-u", str(install_user),
-                "git", "-c", "tar.umask=0022", "-C", str(repo_dir),
-                "archive", "--format=tar", commit, "--",
-                *TARGET_EXECUTION_SNAPSHOT_ROOT_FILES,
-                "Installer",
-            ],
-            capture_output=True,
-            text=False,
-            timeout=60,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise RuntimeError("Target-Ausführungssnapshot konnte nicht aus Git gelesen werden") from exc
-    if completed.returncode != 0:
-        detail = (completed.stderr or b"").decode("utf-8", errors="replace").strip()
-        raise RuntimeError("Target-Ausführungssnapshot fehlt im freigegebenen Commit: " + detail[-500:])
-    archive = bytes(completed.stdout or b"")
-    if not archive or len(archive) > TARGET_EXECUTION_SNAPSHOT_MAX_TOTAL_BYTES + (16 * 1024 * 1024):
-        raise RuntimeError("Target-Ausführungssnapshot besitzt eine unzulässige Archivgröße")
-
-    entries: dict[str, tuple[bytes, int]] = {}
-    total = 0
-    try:
-        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as bundle:
-            for member in bundle.getmembers():
-                relative_path = str(member.name or "").rstrip("/")
-                if not relative_path:
-                    continue
-                if (
-                    relative_path.startswith("/")
-                    or "\\" in relative_path
-                    or any(part in {"", ".", ".."} for part in Path(relative_path).parts)
-                    or not (
-                        relative_path in TARGET_EXECUTION_SNAPSHOT_ROOT_FILES
-                        or relative_path == "Installer"
-                        or relative_path.startswith("Installer/")
-                    )
-                ):
-                    raise RuntimeError("Target-Ausführungssnapshot enthält einen unzulässigen Pfad")
-                if member.isdir():
-                    continue
-                if not member.isfile() or member.islnk() or member.issym():
-                    raise RuntimeError(
-                        f"Target-Ausführungssnapshot enthält keinen regulären Blob: {relative_path}"
-                    )
-                if relative_path in entries:
-                    raise RuntimeError("Target-Ausführungssnapshot enthält einen doppelten Pfad")
-                mode = stat.S_IMODE(member.mode)
-                if mode not in {0o644, 0o755}:
-                    raise RuntimeError(
-                        f"Target-Ausführungssnapshot besitzt einen unzulässigen Git-Modus: {relative_path}"
-                    )
-                if member.size < 0 or member.size > TARGET_EXECUTION_SNAPSHOT_MAX_FILE_BYTES:
-                    raise RuntimeError(
-                        f"Target-Ausführungssnapshot besitzt eine unzulässige Dateigröße: {relative_path}"
-                    )
-                source = bundle.extractfile(member)
-                if source is None:
-                    raise RuntimeError(
-                        f"Target-Ausführungssnapshot konnte einen Blob nicht lesen: {relative_path}"
-                    )
-                payload = source.read(TARGET_EXECUTION_SNAPSHOT_MAX_FILE_BYTES + 1)
-                if len(payload) != member.size:
-                    raise RuntimeError(
-                        f"Target-Ausführungssnapshot besitzt eine driftende Blobgröße: {relative_path}"
-                    )
-                total += len(payload)
-                if (
-                    len(entries) >= TARGET_EXECUTION_SNAPSHOT_MAX_FILES
-                    or total > TARGET_EXECUTION_SNAPSHOT_MAX_TOTAL_BYTES
-                ):
-                    raise RuntimeError("Target-Ausführungssnapshot überschreitet die feste Größenbindung")
-                entries[relative_path] = (
-                    payload,
-                    0o555 if mode & 0o111 else 0o444,
-                )
-    except (tarfile.TarError, OSError) as exc:
-        raise RuntimeError("Target-Ausführungssnapshot besitzt kein gültiges Git-Archiv") from exc
-
     required = set(TARGET_EXECUTION_SNAPSHOT_ROOT_FILES) | set(TARGET_FINALIZER_RELATIVE_FILES)
-    if not required.issubset(entries):
-        missing = ", ".join(sorted(required.difference(entries)))
-        raise RuntimeError("Target-Ausführungssnapshot ist unvollständig: " + missing)
-    return entries
+    return read_commit_entries(
+        repo_dir,
+        _validate_full_commit(target_commit),
+        (*TARGET_EXECUTION_SNAPSHOT_ROOT_FILES, "Installer"),
+        required_paths=required,
+        run_as_user=install_user,
+        maximum_files=TARGET_EXECUTION_SNAPSHOT_MAX_FILES,
+        maximum_file_bytes=TARGET_EXECUTION_SNAPSHOT_MAX_FILE_BYTES,
+        maximum_total_bytes=TARGET_EXECUTION_SNAPSHOT_MAX_TOTAL_BYTES,
+    )
 
 
 def _snapshot_python_contract(
@@ -6108,40 +6146,19 @@ def _read_commit_blob(
     commit = _validate_full_commit(target_commit)
     if relative_path.startswith("/") or ".." in Path(relative_path).parts:
         raise RuntimeError("Target-Blobpfad ist nicht relativ und kanonisch")
-    size_result = _git_argv(
+    entries = read_commit_entries(
         repo_dir,
-        install_user,
-        "cat-file",
-        "-s",
-        f"{commit}:{relative_path}",
-        timeout=15,
+        commit,
+        (relative_path,),
+        required_paths=(relative_path,),
+        run_as_user=install_user,
+        maximum_files=1,
+        maximum_file_bytes=maximum,
+        maximum_total_bytes=maximum,
     )
-    try:
-        expected_size = int(size_result["stdout"].strip()) if size_result["success"] else -1
-    except (TypeError, ValueError):
-        expected_size = -1
-    if expected_size < 1 or expected_size > maximum:
+    payload, _mode = entries[relative_path]
+    if len(payload) < 1:
         raise RuntimeError("Target-Blob fehlt oder besitzt eine unzulässige Größe")
-    try:
-        completed = subprocess.run(
-            [
-                "sudo", "-H", "-u", str(install_user),
-                "git", "-C", str(repo_dir),
-                "cat-file", "blob", f"{commit}:{relative_path}",
-            ],
-            capture_output=True,
-            text=False,
-            timeout=15,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise RuntimeError("Target-Blob konnte nicht gelesen werden") from exc
-    if completed.returncode != 0:
-        detail = (completed.stderr or b"").decode("utf-8", errors="replace").strip()
-        raise RuntimeError("Target-Blob fehlt im freigegebenen Commit: " + detail[-500:])
-    payload = bytes(completed.stdout or b"")
-    if len(payload) != expected_size:
-        raise RuntimeError("Target-Blobgröße driftete während des Lesens")
     return payload
 
 
@@ -6155,36 +6172,18 @@ def _read_commit_file_mode(
     commit = _validate_full_commit(target_commit)
     if relative_path.startswith("/") or ".." in Path(relative_path).parts:
         raise RuntimeError("Target-Moduspfad ist nicht relativ und kanonisch")
-    try:
-        completed = subprocess.run(
-            [
-                "sudo", "-H", "-u", str(install_user),
-                "git", "-C", str(repo_dir),
-                "ls-tree", "-z", commit, "--", relative_path,
-            ],
-            capture_output=True,
-            text=False,
-            timeout=15,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise RuntimeError("Target-Dateimodus konnte nicht gelesen werden") from exc
-    if completed.returncode != 0:
-        detail = (completed.stderr or b"").decode("utf-8", errors="replace").strip()
-        raise RuntimeError("Target-Dateimodus fehlt im freigegebenen Commit: " + detail[-500:])
-    records = [record for record in bytes(completed.stdout or b"").split(b"\0") if record]
-    if len(records) != 1:
-        raise RuntimeError("Target-Dateimodus ist nicht eindeutig")
-    try:
-        header, raw_path = records[0].split(b"\t", 1)
-        raw_mode, object_type, _object_id = header.split(b" ", 2)
-        parsed_path = raw_path.decode("utf-8")
-        mode_text = raw_mode.decode("ascii")
-    except (UnicodeDecodeError, ValueError) as exc:
-        raise RuntimeError("Target-Dateimodus besitzt ein ungültiges Git-Format") from exc
-    if parsed_path != relative_path or object_type != b"blob" or mode_text not in {"100644", "100755"}:
-        raise RuntimeError("Target-Dateimodus ist nicht als reguläre Produktdatei freigegeben")
-    return 0o755 if mode_text == "100755" else 0o644
+    entries = read_commit_entries(
+        repo_dir,
+        commit,
+        (relative_path,),
+        required_paths=(relative_path,),
+        run_as_user=install_user,
+        maximum_files=1,
+        maximum_file_bytes=TARGET_EXECUTION_SNAPSHOT_MAX_FILE_BYTES,
+        maximum_total_bytes=TARGET_EXECUTION_SNAPSHOT_MAX_FILE_BYTES,
+    )
+    _payload, sealed_mode = entries[relative_path]
+    return 0o755 if sealed_mode == 0o555 else 0o644
 
 
 def _read_descriptor_bytes(descriptor: int, maximum: int) -> bytes:
@@ -6515,51 +6514,32 @@ def _tracked_release_file_contracts(
         else _bound_release_head_commit(repo_dir, install_user)
     )
 
-    result = _git_argv(
-        repo_dir,
-        install_user,
-        "ls-tree",
-        "-r",
-        "--full-tree",
-        "-z",
+    verified_entries = read_commit_entries(
+        os.path.abspath(repo_dir),
         commit,
-        timeout=30,
+        (),
+        include_all=True,
+        run_as_user=install_user,
+        maximum_files=TARGET_EXECUTION_SNAPSHOT_MAX_FILES,
+        maximum_file_bytes=TARGET_EXECUTION_SNAPSHOT_MAX_FILE_BYTES,
+        maximum_total_bytes=TARGET_EXECUTION_SNAPSHOT_MAX_TOTAL_BYTES,
     )
-    if not result.get("success"):
-        raise RuntimeError(
-            "Git-Dateivertrag ist nicht lesbar: "
-            + _combined_process_diagnostics(result, maximum=800)
-        )
     root = os.path.abspath(repo_dir)
     entries: list[tuple[str, int, str]] = []
-    seen_paths: set[str] = set()
-    for raw_entry in str(result.get("stdout") or "").split("\0"):
-        if not raw_entry:
-            continue
-        metadata_text, separator, relative_path = raw_entry.partition("\t")
-        fields = metadata_text.split()
-        if (
-            not separator
-            or len(fields) != 3
-            or fields[1] != "blob"
-            or fields[0] not in {"100644", "100755"}
-            or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", fields[2])
-            or not relative_path
-            or "\x00" in relative_path
-            or relative_path in seen_paths
-        ):
-            raise RuntimeError(
-                "Git-Dateivertrag enthält keinen regulären Commit-Blob"
-            )
+    for relative_path, (payload, sealed_mode) in sorted(verified_entries.items()):
         target = os.path.abspath(os.path.join(root, relative_path))
         if os.path.commonpath((root, target)) != root or target == root:
             raise RuntimeError("Getrackte Produktdatei verlässt das Repository")
-        seen_paths.add(relative_path)
+        object_id = hashlib.new(
+            "sha1",
+            b"blob " + str(len(payload)).encode("ascii") + b"\0" + payload,
+            usedforsecurity=False,
+        ).hexdigest()
         entries.append(
             (
                 relative_path,
-                0o755 if fields[0] == "100755" else 0o644,
-                fields[2],
+                0o755 if sealed_mode == 0o555 else 0o644,
+                object_id,
             )
         )
     if not entries:
@@ -7089,9 +7069,7 @@ def _execute_update_transaction(
             if not remote_add["success"]:
                 raise RuntimeError("Git-Origin konnte nicht gesetzt werden: " + remote_add["stderr"].strip())
 
-        remote = _git_argv(repo_dir, install_user, "remote", "get-url", "origin", timeout=15)
-        if not remote["success"] or remote["stdout"].strip() != SELFUPDATE_REPO:
-            raise RuntimeError("Git-Origin weicht vom fest freigegebenen Release-Repository ab")
+        _require_bound_origin(repo_dir, install_user)
 
         if verified_commit:
             target_commit = verified_commit
@@ -7245,9 +7223,7 @@ def _handoff_to_verified_target_updater(
         old_commit = _resolve_git_commit(repo_dir, "HEAD", install_user)
         if not old_commit:
             raise RuntimeError("Aktueller HEAD konnte nicht als volle Commit-SHA verifiziert werden")
-        remote = _git_argv(repo_dir, install_user, "remote", "get-url", "origin", timeout=15)
-        if not remote["success"] or remote["stdout"].strip() != SELFUPDATE_REPO:
-            raise RuntimeError("Git-Origin weicht vom fest freigegebenen Release-Repository ab")
+        _require_bound_origin(repo_dir, install_user)
 
         effective_target_tag = requested_tag
         if reinstall_current:

@@ -7,7 +7,7 @@ on:
         description: "Exact approved release tag"
         required: true
         type: choice
-        options: [v5.3.2b, v5.4.0, v5.4.0a, v5.4.0b, v5.4.0c, v5.4.0d, v5.4.0e, v5.4.1, v5.4.1a, v5.4.1b, v5.4.1c, v5.4.1d, v5.4.2, v5.4.2a, v5.4.2b, v5.4.2c, v5.4.2d, v5.4.3, v5.4.3d, v5.4.3e, v5.4.3f]
+        options: [v5.3.2b, v5.4.0, v5.4.0a, v5.4.0b, v5.4.0c, v5.4.0d, v5.4.0e, v5.4.1, v5.4.1a, v5.4.1b, v5.4.1c, v5.4.1d, v5.4.2, v5.4.2a, v5.4.2b, v5.4.2c, v5.4.2d, v5.4.3, v5.4.3d, v5.4.3e, v5.4.3f, v5.4.3g]
       release_sha:
         description: "Approved 40-hex release commit"
         required: true
@@ -105,7 +105,7 @@ jobs:
               )
           ]
           assert installer_versions == [version], "Installer.__version__ passt nicht zum Release-Tag"
-          if tag in {"v5.4.2", "v5.4.2a", "v5.4.2b", "v5.4.2c", "v5.4.2d", "v5.4.3", "v5.4.3d", "v5.4.3e", "v5.4.3f"}:
+          if tag in {"v5.4.2", "v5.4.2a", "v5.4.2b", "v5.4.2c", "v5.4.2d", "v5.4.3", "v5.4.3d", "v5.4.3e", "v5.4.3f", "v5.4.3g"}:
               matches = [
                   item
                   for item in policy.get("rollback_releases", [])
@@ -434,6 +434,12 @@ jobs:
             [ "$(git rev-parse HEAD~23)" = "$ROOT_SHA" ]
             [ "$(git rev-parse 'HEAD~23^{tree}')" = "$ROOT_TREE" ]
             [ "$(git rev-list --parents -n 1 "$ROOT_SHA" | awk '{print NF-1}')" -eq 0 ]
+          elif [ "$RELEASE_TAG" = "v5.4.3g" ]; then
+            [ "$(git rev-list --parents -n 1 HEAD | awk '{print NF-1}')" -eq 1 ]
+            [ "$(git rev-parse HEAD^)" = "5bdbb96eaddcaacfde356859c95e61469106eae1" ]
+            [ "$(git rev-parse HEAD~24)" = "$ROOT_SHA" ]
+            [ "$(git rev-parse 'HEAD~24^{tree}')" = "$ROOT_TREE" ]
+            [ "$(git rev-list --parents -n 1 "$ROOT_SHA" | awk '{print NF-1}')" -eq 0 ]
           else
             exit 1
           fi
@@ -714,7 +720,7 @@ jobs:
           docker buildx imagetools create --tag "${image}:${version}" "${image}@${digest}"
           [ "$(docker buildx imagetools inspect "${image}:${RELEASE_TAG}" | awk '$1 == "Digest:" {print $2; exit}')" = "$digest" ]
           [ "$(docker buildx imagetools inspect "${image}:${version}" | awk '$1 == "Digest:" {print $2; exit}')" = "$digest" ]
-          if [ "$RELEASE_TAG" = "v5.4.3f" ]; then
+          if [ "$RELEASE_TAG" = "v5.4.3g" ]; then
             docker buildx imagetools create --tag "${image}:latest" "${image}@${digest}"
             [ "$(docker buildx imagetools inspect "${image}:latest" | awk '$1 == "Digest:" {print $2; exit}')" = "$digest" ]
           fi

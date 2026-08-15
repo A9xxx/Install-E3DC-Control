@@ -2358,10 +2358,10 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                     <div class="mb-3 d-flex justify-content-between align-items-center">
                         <a href="index.php" class="btn btn-outline-secondary btn-sm"><i class="fas fa-arrow-left me-2"></i>Zurück</a>
                         <div>
-                            <!-- Installer / Diagramm Update -->
+                            <!-- Sicheres System-Update -->
                             <?php if (!$isDocker): ?>
-                            <button id="btn-update-installer" class="btn btn-outline-info btn-sm me-2" onclick="startInstallerUpdate()" title="Aktualisiert die Weboberfläche und Diagramme">
-                                <i class="fas fa-magic me-2"></i>Web-UI Update <span id="update-badge-installer" class="badge bg-danger ms-1" style="display:none;">!</span>
+                            <button id="btn-update-installer" class="btn btn-outline-info btn-sm me-2" onclick="startInstallerUpdate()" title="Aktualisiert E3DC-Control über den sicheren Systemjob">
+                                <i class="fas fa-sync-alt me-2"></i>System Update <span id="update-badge-installer" class="badge bg-danger ms-1" style="display:none;">!</span>
                             </button>
                             <button class="btn btn-outline-warning btn-sm me-2" onclick="openReleaseRollback()" title="Stabile Rückfallversion auswählen">
                                 <i class="fas fa-life-ring me-2"></i>Rückfallversion

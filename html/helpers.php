@@ -413,7 +413,7 @@ function handleDiagnoseAck() {
             'mqtt_hub'       => '/var/www/html/logs/e3dc_mqtt_hub.log',
             'websocket'      => '/var/www/html/logs/e3dc_websocket.log',
             'update'         => '/var/www/html/logs/update.log',
-            'self_update'    => '/var/www/html/logs/self_update_php.log'
+            'self_update'    => '/var/log/e3dc-control/web-update.log'
         ];
         foreach ($logFiles as $key => $file) {
             if (file_exists($file)) $ackState['sizes'][$key] = filesize($file);
@@ -1221,7 +1221,7 @@ function handleSystemLog() {
             'mqtt_hub'       => '/var/www/html/logs/e3dc_mqtt_hub.log',
             'websocket'      => '/var/www/html/logs/e3dc_websocket.log',
             'update'         => '/var/www/html/logs/update.log',
-            'self_update'    => '/var/www/html/logs/self_update_php.log'
+            'self_update'    => '/var/log/e3dc-control/web-update.log'
         ];
 
         if ($logType === 'docker') {
@@ -3713,9 +3713,9 @@ function e3dcFindInstallerMainAndWrapper() {
 }
 
 /**
- * Der frühere gemeinsame sudo-Einstieg für Installer, Update, Reparatur und
- * Rückfall ist zu breit. Er bleibt deaktiviert, bis ein eigener
- * root-kontrollierter und aktionsgebundener Web-Launcher verfügbar ist.
+ * Der frühere gemeinsame sudo-Einstieg für Installer, Reparatur und Rückfall
+ * ist zu breit und bleibt deaktiviert. Das reguläre Self-Update besitzt einen
+ * getrennten argumentlosen root-eigenen Launcher und nutzt dieses Gate nicht.
  */
 function e3dcPrivilegedInstallerWebActionsEnabled() {
     return false;
@@ -3725,7 +3725,7 @@ function e3dcPrivilegedInstallerWebBlockMessage($operation) {
     $label = trim((string)$operation);
     if ($label === '') $label = 'Diese Aktion';
     return $label . ' ist im Web aus Sicherheitsgründen deaktiviert. '
-         . 'Bitte bis zu einem eigenen engen Launcher eine administrative Konsole verwenden.';
+         . 'Bitte dafür weiterhin eine administrative Konsole verwenden.';
 }
 
 function e3dcResolveGitObjectId($repoDir, $objectSpec) {
@@ -3988,6 +3988,98 @@ function e3dcInspectServiceWrapper($wrapper) {
     $result['actual_sha256'] = hash('sha256', $actual);
     $result['dev'] = (int)$metadata['dev'];
     $result['ino'] = (int)$metadata['ino'];
+    return $result;
+}
+
+function e3dcInspectWebUpdateLauncher() {
+    $launcher = '/usr/local/sbin/e3dc-web-update-launcher';
+    $result = ['ok' => false, 'path' => $launcher, 'status' => 'missing'];
+    $paths = getInstallPaths();
+    if (empty($paths['valid']) || empty($paths['install_path']) || empty($paths['install_user'])) {
+        $result['status'] = 'install_context_unbound';
+        return $result;
+    }
+    $repoDir = rtrim((string)$paths['install_path'], '/');
+    $installUser = trim((string)$paths['install_user']);
+    if (realpath($launcher) !== $launcher || is_link($launcher)) {
+        $result['status'] = 'unbound_path';
+        return $result;
+    }
+    foreach (['/usr/local', '/usr/local/sbin'] as $directory) {
+        $metadata = @lstat($directory);
+        if (!is_array($metadata)
+            || (($metadata['mode'] ?? 0) & 0170000) !== 0040000
+            || (int)($metadata['uid'] ?? -1) !== 0
+            || (int)($metadata['gid'] ?? -1) !== 0
+            || (((int)($metadata['mode'] ?? 0)) & 0022) !== 0) {
+            $result['status'] = 'unsafe_path_permissions';
+            return $result;
+        }
+    }
+    $metadata = @lstat($launcher);
+    if (!is_array($metadata)
+        || (($metadata['mode'] ?? 0) & 0170000) !== 0100000
+        || (int)($metadata['nlink'] ?? 0) !== 1
+        || (int)($metadata['uid'] ?? -1) !== 0
+        || (int)($metadata['gid'] ?? -1) !== 0
+        || (((int)($metadata['mode'] ?? 0)) & 0777) !== 0755) {
+        $result['status'] = 'unsafe_file_permissions';
+        return $result;
+    }
+    $head = e3dcResolveGitObjectId($repoDir, 'HEAD^{commit}');
+    if ($head === null) {
+        $result['status'] = 'head_unbound';
+        return $result;
+    }
+    $git = '/usr/bin/git';
+    $templateRead = e3dcRunArgvProcess(
+        [$git, '-c', 'safe.directory=' . $repoDir, '-C', $repoDir, 'cat-file', 'blob', $head . ':Installer/web_update_launcher.sh'],
+        10.0,
+        ['max_output_bytes' => 131072]
+    );
+    if (empty($templateRead['success']) || (int)($templateRead['exit_code'] ?? 1) !== 0) {
+        $result['status'] = 'head_unbound';
+        return $result;
+    }
+    $template = (string)($templateRead['stdout'] ?? '');
+    if (substr_count($template, '@E3DC_INSTALL_ROOT@') !== 1
+        || substr_count($template, '@E3DC_INSTALL_USER@') !== 1
+        || substr_count($template, '@E3DC_RELEASE_COMMIT@') !== 1) {
+        $result['status'] = 'template_invalid';
+        return $result;
+    }
+    $expected = str_replace(
+        ['@E3DC_INSTALL_ROOT@', '@E3DC_INSTALL_USER@', '@E3DC_RELEASE_COMMIT@'],
+        [$repoDir, $installUser, $head],
+        $template
+    );
+    $handle = @fopen($launcher, 'rb');
+    if ($handle === false) {
+        $result['status'] = 'not_readable';
+        return $result;
+    }
+    $openedBefore = @fstat($handle);
+    $actual = (string)@stream_get_contents($handle, 131073);
+    $openedAfter = @fstat($handle);
+    @fclose($handle);
+    $pathAfter = @lstat($launcher);
+    foreach (['dev', 'ino', 'mode', 'nlink', 'uid', 'gid', 'size', 'mtime', 'ctime'] as $key) {
+        if (!is_array($openedBefore) || !is_array($openedAfter) || !is_array($pathAfter)
+            || ($metadata[$key] ?? null) !== ($openedBefore[$key] ?? null)
+            || ($openedBefore[$key] ?? null) !== ($openedAfter[$key] ?? null)
+            || ($openedAfter[$key] ?? null) !== ($pathAfter[$key] ?? null)) {
+            $result['status'] = 'read_drift';
+            return $result;
+        }
+    }
+    if (!hash_equals(hash('sha256', $expected), hash('sha256', $actual))) {
+        $result['status'] = 'content_drift';
+        return $result;
+    }
+    $result['ok'] = true;
+    $result['status'] = 'ok';
+    $result['head'] = $head;
+    $result['actual_sha256'] = hash('sha256', $actual);
     return $result;
 }
 
@@ -4464,6 +4556,7 @@ function e3dcSelfUpdateLogHasTerminalFailure($log) {
     return preg_match(
         '/traceback|exception|critical|fatal|permission denied|'
         . '\[!\]\s+self-update fehlgeschlagen|self-update fehlgeschlagen:|'
+        . '\[!\]\s+web-update fehlgeschlagen|'
         . 'REPAIR_REQUIRED|'
         . 'web-update kann nicht starten|konnte update-prozess nicht starten/i',
         (string)$log
@@ -4492,9 +4585,9 @@ function handleRunSelfUpdate() {
         header('Cache-Control: no-cache, no-store, must-revalidate');
         header('Content-Type: application/json');
 
-        $logFile = '/var/www/html/logs/self_update_php.log';
-        $pidFile = '/var/www/html/tmp/self_update.pid';
-        $statusFile = '/var/www/html/tmp/self_update.status';
+        $logFile = '/var/log/e3dc-control/web-update.log';
+        $pidFile = '/run/e3dc-web-update/pid';
+        $statusFile = '/run/e3dc-web-update/status';
         $log = 'Status: Initialisiere... (Log-Datei noch nicht erstellt)';
         if (file_exists($logFile)) {
             $content = file_get_contents($logFile);
@@ -4506,8 +4599,6 @@ function handleRunSelfUpdate() {
             $pid = (int)trim(file_get_contents($pidFile));
             if ($pid > 0 && file_exists("/proc/$pid")) {
                 $running = true;
-            } else {
-                @unlink($pidFile);
             }
         }
 
@@ -4556,133 +4647,42 @@ function handleRunSelfUpdate() {
             exit;
         }
         $reinstallRaw = isset($_POST['reinstall']) ? (string)$_POST['reinstall'] : '0';
-        if (!in_array($reinstallRaw, ['0', '1'], true)) {
+        if ($reinstallRaw !== '0') {
             echo json_encode([
                 'success' => false,
-                'message' => 'Ungültige Neuinstallationsabsicht.',
+                'message' => 'Über das Web ist ausschließlich das reguläre Update ohne Neuinstallation zulässig.',
             ]);
             exit;
         }
-        $reinstallCurrent = ($reinstallRaw === '1');
-        if (!e3dcPrivilegedInstallerWebActionsEnabled()) {
+        $launcherInspection = e3dcInspectWebUpdateLauncher();
+        if (empty($launcherInspection['ok'])) {
             echo json_encode([
                 'success' => false,
-                'message' => e3dcPrivilegedInstallerWebBlockMessage(
-                    $reinstallCurrent ? 'Neuinstallation' : 'Self-Update'
-                ),
+                'message' => 'Der root-eigene Web-Update-Launcher ist nicht sicher gebunden ('
+                    . (string)($launcherInspection['status'] ?? 'unbekannt')
+                    . '). Bitte einmal administrativ die Rechte-Reparatur des aktuellen Releases ausführen.',
             ]);
             exit;
         }
-        $paths = getInstallPaths();
-        if (empty($paths['valid'])) {
-            echo json_encode(['success' => false, 'message' => $paths['error'] ?? 'Installationskontext fehlt.']);
-            exit;
-        }
-        // Pfad zum self_update.py ermitteln
-        $candidates = [rtrim($paths['install_path'], '/') . '/installer_main.py'];
-
-        $script = false;
-        foreach ($candidates as $c) {
-            if (file_exists($c)) { $script = $c; break; }
-        }
-
-        if (!$script) {
-            echo json_encode(['success' => false, 'message' => 'Update-Skript nicht gefunden.']);
-            exit;
-        }
-
-        // Starte das Skript via sudo als der Installationsbenutzer
-        // Wir nutzen --silent, damit es durchläuft
-        // Wir setzen PYTHONPATH damit relative Importe funktionieren
-        // Wir leiten die Ausgabe in eine Log-Datei um für Debugging
-        $baseDir = (basename($script) === 'installer_main.py') ? dirname($script) : dirname(dirname($script)); // .../Install
-        $logFile = '/var/www/html/logs/self_update_php.log';
-        $pidFile = '/var/www/html/tmp/self_update.pid';
-        $statusFile = '/var/www/html/tmp/self_update.status';
-
-        if (file_exists($pidFile)) {
-            $pid = (int)trim(file_get_contents($pidFile));
-            if ($pid > 0 && file_exists("/proc/$pid")) {
-                echo json_encode(['success' => true, 'running' => true, 'message' => 'Update läuft bereits.']);
-                exit;
-            }
-            @unlink($pidFile);
-        }
-
-        // Log-Datei vorbereiten und bei jedem Lauf leeren
-        @file_put_contents($logFile, "=== Starting V4 Web-Update at ".date('Y-m-d H:i:s')." ===\n\n");
-        @chmod($logFile, 0664);
-        @unlink($statusFile);
         $zeroPayload = json_encode(['success' => true, 'missing' => 0, 'updating' => true]);
         foreach (['/var/www/html/ramdisk/e3dc_self_update_status.json', '/var/www/html/ramdisk/e3dc_update_status.json'] as $cacheFile) {
             @file_put_contents($cacheFile, $zeroPayload);
             @chmod($cacheFile, 0666);
         }
-
-        // Aufruf via sudo als root. V5 nutzt die Wrapper-Freigabe, aeltere
-        // Installationen können noch die direkte installer_main.py-Freigabe
-        // besitzen. Beide Pfade werden non-interaktiv getestet.
-        $installerWrapper = $baseDir . '/Installer/installer_wrapper.sh';
-        $wrapperInspection = e3dcInspectInstallerWrapper($installerWrapper);
-        $wrapperAction = $reinstallCurrent ? 'reinstall_current' : 'update_e3dc';
-        $directAction = $reinstallCurrent ? ' --reinstall-current' : ' --update-e3dc';
-        $sudoAttempts = [];
-        if (basename($script) === 'installer_main.py' && !empty($wrapperInspection['ok'])) {
-            $sudoAttempts[] = [
-                'label' => 'installer_wrapper.sh',
-                'preflight' => "sudo -n " . escapeshellarg($installerWrapper) . " check",
-                'run' => "sudo -n " . escapeshellarg($installerWrapper) . " " . $wrapperAction,
-            ];
-        }
-        $legacyRunArgs = (basename($script) === 'installer_main.py') ? $directAction : " --silent";
-        $sudoAttempts[] = [
-            'label' => 'installer_main.py direkt',
-            'preflight' => "sudo -n /usr/bin/python3 -I -B -u " . escapeshellarg($script) . " --check",
-            'run' => "sudo -n /usr/bin/python3 -I -B -u " . escapeshellarg($script) . $legacyRunArgs,
-        ];
-
-        $selectedRunCmd = null;
-        $preflightOut = [];
-        foreach ($sudoAttempts as $attempt) {
-            $attemptOut = [];
-            exec($attempt['preflight'] . " 2>&1", $attemptOut, $attemptRet);
-            if ($attemptRet === 0) {
-                $selectedRunCmd = $attempt['run'];
-                $preflightOut[] = $attempt['label'] . ": OK";
-                break;
-            }
-            $preflightOut[] = $attempt['label'] . " fehlgeschlagen:";
-            $preflightOut[] = implode("\n", $attemptOut);
-        }
-        if ($selectedRunCmd === null) {
-            $consoleCmd = "cd " . escapeshellarg($baseDir)
-                . " && sudo /usr/bin/python3 -I -B -u installer_main.py"
-                . $directAction;
-            $msg = e3dcInstallerPrivilegeFailureMessage('Web-Update', $baseDir, $wrapperInspection, $preflightOut);
-            if (!empty($wrapperInspection['ok']) || !empty($wrapperInspection['repairable'])) {
-                $msg .= "\n" . $consoleCmd;
-            }
-            file_put_contents($logFile, $msg . "\n", FILE_APPEND);
-            echo json_encode(['success' => false, 'message' => $msg]);
-            exit;
-        }
-
-        file_put_contents($logFile, "Start-Befehl: $selectedRunCmd\n--------------------------------\n", FILE_APPEND);
-        $runner = $selectedRunCmd
-            . ' >> ' . escapeshellarg($logFile)
-            . ' 2>&1; ret=$?; umask 022; printf "%s\n" "$ret" > '
-            . escapeshellarg($statusFile)
-            . '; exit "$ret"';
-        $cmd = 'nohup /bin/sh -c ' . escapeshellarg($runner) . ' >/dev/null 2>&1 & echo $!';
-        $pid = trim((string)shell_exec($cmd));
-
-        if ($pid !== '') {
-            @file_put_contents($pidFile, $pid);
-            @chmod($pidFile, 0666);
-            file_put_contents($logFile, "Prozess gestartet mit PID: $pid\n", FILE_APPEND);
-            echo json_encode(['success' => true, 'running' => true, 'pid' => $pid, 'message' => 'Update gestartet. Das Protokoll wird live angezeigt.']);
+        $output = [];
+        $exitCode = 1;
+        exec('/usr/bin/sudo -n -- /usr/local/sbin/e3dc-web-update-launcher 2>&1', $output, $exitCode);
+        if ($exitCode === 0) {
+            echo json_encode([
+                'success' => true,
+                'running' => true,
+                'message' => trim(implode("\n", $output)) ?: 'Update als root-kontrollierten Systemjob gestartet.',
+            ]);
         } else {
-            echo json_encode(['success' => false, 'message' => 'Konnte Update-Prozess nicht starten.']);
+            echo json_encode([
+                'success' => false,
+                'message' => 'Web-Update konnte den engen Launcher nicht starten: ' . trim(implode("\n", $output)),
+            ]);
         }
         exit;
     }
@@ -5716,7 +5716,7 @@ function handleWatchdogStatus() {
         if (!$isDocker) {
             $logFiles['watchdog'] = '/var/www/html/logs/piguard.log';
             $logFiles['update'] = '/var/www/html/logs/update.log';
-            $logFiles['self_update'] = '/var/www/html/logs/self_update_php.log';
+            $logFiles['self_update'] = '/var/log/e3dc-control/web-update.log';
         }
 
         foreach ($logFiles as $key => $file) {
@@ -6330,117 +6330,28 @@ function handleRunUpdate() {
             ]);
             exit;
         }
-        if ($mode === 'start' && !e3dcPrivilegedInstallerWebActionsEnabled()) {
-            echo json_encode([
-                'status' => 'error',
-                'running' => false,
-                'message' => e3dcPrivilegedInstallerWebBlockMessage('Web-Update'),
-            ]);
-            exit;
-        }
-        $paths = getInstallPaths();
-        if (empty($paths['valid'])) {
-            echo json_encode(['status' => 'error', 'message' => $paths['error'] ?? 'Installationskontext fehlt.']);
-            exit;
-        }
-
-        // Installer suchen
-        $candidates = [rtrim($paths['install_path'], '/') . '/installer_main.py'];
-        $installer_main = false;
-        foreach ($candidates as $candidate) {
-            if (file_exists($candidate)) { $installer_main = realpath($candidate); break; }
-        }
-
-        if (!$installer_main) {
-            echo json_encode(['status' => 'error', 'message' => "Installer nicht gefunden."]);
-            exit;
-        }
-
-        $logFile = '/var/www/html/logs/update.log';
-        $pidFile = '/var/www/html/tmp/update.pid';
-        $statusFile = '/var/www/html/tmp/update.status';
+        $logFile = '/var/log/e3dc-control/web-update.log';
+        $pidFile = '/run/e3dc-web-update/pid';
+        $statusFile = '/run/e3dc-web-update/status';
         if ($mode === 'start') {
-            if (file_exists($pidFile)) {
-                $pid = (int)trim(file_get_contents($pidFile));
-                if (file_exists("/proc/$pid")) { echo json_encode(['status' => 'running', 'message' => 'Update läuft bereits.']); exit; }
-                @unlink($pidFile);
-            }
-            @unlink($statusFile);
-
-            // 1. Log-Datei vorbereiten & Rechte prüfen
-            if (file_put_contents($logFile, "=== UPDATE DIAGNOSE START ===\n") === false) {
-                echo json_encode(['status' => 'error', 'message' => 'PHP kann Log-Datei nicht schreiben.']);
+            $launcherInspection = e3dcInspectWebUpdateLauncher();
+            if (empty($launcherInspection['ok'])) {
+                echo json_encode([
+                    'status' => 'error',
+                    'running' => false,
+                    'message' => 'Der root-eigene Web-Update-Launcher ist nicht sicher gebunden ('
+                        . (string)($launcherInspection['status'] ?? 'unbekannt') . ').',
+                ]);
                 exit;
             }
-            @chmod($logFile, 0666);
-
-            // 2. Pfad-Check
-            if (!$installer_main) {
-                file_put_contents($logFile, "FEHLER: installer_main.py konnte nicht gefunden werden.\n", FILE_APPEND);
-                echo json_encode(['status' => 'error', 'message' => 'Installer nicht gefunden.']);
-                exit;
-            }
-            file_put_contents($logFile, "Installer-Pfad: $installer_main\n", FILE_APPEND);
-
-            // 3. Shell-Test (Kann www-data überhaupt schreiben?)
-            exec("echo 'Shell-Write-Test: OK' >> " . escapeshellarg($logFile));
-
-            // 4. Sudo-Test (Darf www-data sudo nutzen?)
-            // (Entfernt, da 'true' nicht zwingend in sudoers steht und zu falschen Fehlern führt)
-            // Sudoers expects the unquoted explicit path!
-            $repoDir = dirname($installer_main);
-            $installerWrapper = $repoDir . '/Installer/installer_wrapper.sh';
-            $wrapperInspection = e3dcInspectInstallerWrapper($installerWrapper);
-            $attempts = [];
-            if (!empty($wrapperInspection['ok'])) {
-                $attempts[] = [
-                    'label' => 'installer_wrapper.sh',
-                    'preflight' => 'sudo -n ' . escapeshellarg($installerWrapper) . ' check',
-                    'run' => 'sudo -n ' . escapeshellarg($installerWrapper) . ' update_e3dc',
-                ];
-            }
-            $attempts[] = [
-                'label' => 'installer_main.py direkt',
-                'preflight' => 'sudo -n /usr/bin/python3 -I -B -u ' . escapeshellarg($installer_main) . ' --check',
-                'run' => 'sudo -n /usr/bin/python3 -I -B -u ' . escapeshellarg($installer_main) . ' --update-e3dc',
-            ];
-            $cmd = '';
-            $sudoErrors = [];
-            foreach ($attempts as $attempt) {
-                $attemptOut = [];
-                exec($attempt['preflight'] . ' 2>&1', $attemptOut, $attemptRet);
-                if ($attemptRet === 0) {
-                    $cmd = $attempt['run'];
-                    $sudoErrors[] = $attempt['label'] . ': OK';
-                    break;
-                }
-                $sudoErrors[] = $attempt['label'] . " fehlgeschlagen:\n" . implode("\n", $attemptOut);
-            }
-            if ($cmd === '') {
-                $msg = e3dcInstallerPrivilegeFailureMessage('Web-Update', $repoDir, $wrapperInspection, $sudoErrors);
-                file_put_contents($logFile, $msg . "\n", FILE_APPEND);
-                echo json_encode(['status' => 'error', 'message' => $msg]);
-                exit;
-            }
-            file_put_contents($logFile, "Start-Befehl: $cmd\n--------------------------------\n", FILE_APPEND);
-
-            // Der kleine Shell-Wrapper schreibt nach Prozessende einen Exitcode.
-            // Dadurch kann das Frontend ein erfolgreiches Update auch dann erkennen,
-            // wenn die letzte Logzeile wegen Webserver-/Dateitausch leicht verzögert sichtbar wird.
-            $runner = $cmd
-                . ' >> ' . escapeshellarg($logFile)
-                . ' 2>&1; ret=$?; printf "%s\n" "$ret" > '
-                . escapeshellarg($statusFile)
-                . '; exit "$ret"';
-            $fullCmd = 'nohup /bin/sh -c ' . escapeshellarg($runner) . ' >/dev/null 2>&1 & echo $!';
-            $pid = exec($fullCmd);
-
-            if ($pid) {
-                file_put_contents($pidFile, $pid);
-                file_put_contents($logFile, "Prozess gestartet mit PID: $pid\n", FILE_APPEND);
-                echo json_encode(['status' => 'started', 'pid' => $pid]);
-            }
-            else { echo json_encode(['status' => 'error', 'message' => 'Konnte Prozess nicht starten.']); }
+            $output = [];
+            $exitCode = 1;
+            exec('/usr/bin/sudo -n -- /usr/local/sbin/e3dc-web-update-launcher 2>&1', $output, $exitCode);
+            echo json_encode([
+                'status' => $exitCode === 0 ? 'started' : 'error',
+                'running' => $exitCode === 0,
+                'message' => trim(implode("\n", $output)),
+            ]);
         } elseif ($mode === 'poll') {
             clearstatcache(true, $logFile);
             $log = '';
@@ -6463,7 +6374,7 @@ function handleRunUpdate() {
             $running = false;
             if (file_exists($pidFile)) {
                 $pid = (int)trim(file_get_contents($pidFile));
-                if (file_exists("/proc/$pid")) $running = true; else @unlink($pidFile);
+                if (file_exists("/proc/$pid")) $running = true;
             }
             $exitCode = null;
             if (file_exists($statusFile)) {

@@ -64,6 +64,11 @@ try:
     )
     from .service_catalog import READ_ACTIONS, SERVICE_ACTIONS, get_module, iter_modules
     from .installer_config import get_install_path
+    from .git_commit_reader import (
+        read_commit_entries,
+        repository_git_reader_user,
+        run_isolated_git,
+    )
     from .utils import MANAGER_LOCK_TMPFILES_CONFIG, ensure_manager_lock_namespace
 except ImportError:  # pragma: no cover - direct script execution fallback
     from backup_retention import WEB_INSTALLER_BACKUP_KEEP_COUNT, prune_backup_dir
@@ -85,6 +90,11 @@ except ImportError:  # pragma: no cover - direct script execution fallback
     if package_root not in sys.path:
         sys.path.insert(0, package_root)
     from Installer.installer_config import get_install_path
+    from Installer.git_commit_reader import (
+        read_commit_entries,
+        repository_git_reader_user,
+        run_isolated_git,
+    )
     from Installer.utils import MANAGER_LOCK_TMPFILES_CONFIG, ensure_manager_lock_namespace
 
 
@@ -232,6 +242,8 @@ WRITE_ACTION_NAMES = sorted(
 
 SERVICE_WRAPPER_SOURCE = INSTALLER_DIR / "service_wrapper.sh"
 SERVICE_WRAPPER = Path("/usr/local/sbin/e3dc-service-control")
+WEB_UPDATE_LAUNCHER_SOURCE = INSTALLER_DIR / "web_update_launcher.sh"
+WEB_UPDATE_LAUNCHER = Path("/usr/local/sbin/e3dc-web-update-launcher")
 SERVICE_WRAPPER_ACTIONS = (
     "start",
     "stop",
@@ -268,51 +280,61 @@ INSTALLER_WRAPPER = INSTALLER_DIR / "installer_wrapper.sh"
 WRAPPER_RELATIVE_PATHS = (
     "Installer/service_wrapper.sh",
     "Installer/installer_wrapper.sh",
+    "Installer/web_update_launcher.sh",
 )
 SUDOERS_FILE = Path("/etc/sudoers.d/020_e3dc_services")
 SUDOERS_DIR = Path("/etc/sudoers.d")
 MAX_BACKUP_FILE_BYTES = 10 * 1024 * 1024
+EXPECTED_RELEASE_COMMIT_ENV = "E3DC_RELEASE_EXPECTED_COMMIT"
 
 
 def _git_head_wrapper_bytes(repo_root: Path) -> tuple[str, dict[str, bytes]]:
     """Liest die freigegebenen Wrapperbytes direkt aus dem lokalen Git-HEAD."""
     root = Path(repo_root)
+    reader_user = repository_git_reader_user(root)
     try:
-        head_result = subprocess.run(
-            ["git", "-c", f"safe.directory={root}", "-C", str(root), "rev-parse", "--verify", "HEAD^{commit}"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+        head_result = run_isolated_git(
+            root,
+            "rev-parse",
+            "--verify",
+            "HEAD^{commit}",
+            run_as_user=reader_user,
             timeout=10,
-            check=False,
         )
     except Exception as exc:
         raise RuntimeError(f"Lokaler Git-HEAD konnte nicht gebunden werden: {exc}") from exc
-    head = head_result.stdout.strip().lower()
-    if head_result.returncode != 0 or len(head) != 40 or any(ch not in "0123456789abcdef" for ch in head):
-        error = head_result.stderr.strip() or "ungültige HEAD-Antwort"
+    head = bytes(head_result.stdout or b"").decode("ascii", errors="replace").strip().lower()
+    if head_result.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", head):
+        error = bytes(head_result.stderr or b"").decode("utf-8", errors="replace").strip() or "ungültige HEAD-Antwort"
         raise RuntimeError(f"Lokaler Git-HEAD konnte nicht gebunden werden: {error}")
+    expected = str(os.environ.get(EXPECTED_RELEASE_COMMIT_ENV) or "").strip().lower()
+    if expected:
+        if not re.fullmatch(r"[0-9a-f]{40}", expected) or head != expected:
+            raise RuntimeError("Lokaler Git-HEAD weicht vom gebundenen Release-Commit ab")
+        commit = expected
+    else:
+        commit = head
 
+    try:
+        entries = read_commit_entries(
+            root,
+            commit,
+            WRAPPER_RELATIVE_PATHS,
+            required_paths=WRAPPER_RELATIVE_PATHS,
+            run_as_user=reader_user,
+            maximum_files=len(WRAPPER_RELATIVE_PATHS),
+            maximum_file_bytes=1024 * 1024,
+            maximum_total_bytes=3 * 1024 * 1024,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"HEAD-Wrapper konnten nicht gebunden werden: {exc}") from exc
     canonical: dict[str, bytes] = {}
     for relative_path in WRAPPER_RELATIVE_PATHS:
-        try:
-            blob_result = subprocess.run(
-                ["git", "-c", f"safe.directory={root}", "-C", str(root), "cat-file", "blob", f"{head}:{relative_path}"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=10,
-                check=False,
-            )
-        except Exception as exc:
-            raise RuntimeError(f"HEAD-Blob fehlt für {relative_path}: {exc}") from exc
-        if blob_result.returncode != 0:
-            error = blob_result.stderr.decode("utf-8", errors="replace").strip() or "Blob nicht lesbar"
-            raise RuntimeError(f"HEAD-Blob fehlt für {relative_path}: {error}")
-        payload = bytes(blob_result.stdout)
-        if not payload.startswith(b"#!/bin/bash\n") or b"\r" in payload:
+        payload, sealed_mode = entries[relative_path]
+        if sealed_mode != 0o555 or not payload.startswith(b"#!/bin/bash\n") or b"\r" in payload:
             raise RuntimeError(f"HEAD-Blob ist kein LF-kodierter Bash-Wrapper: {relative_path}")
         canonical[relative_path] = payload
-    return head, canonical
+    return commit, canonical
 
 
 def _classify_wrapper(path: Path, canonical: bytes) -> dict[str, Any]:
@@ -695,20 +717,22 @@ def _atomic_write_sudoers(
         tmp_path.unlink(missing_ok=True)
 
 
-def _atomic_write_service_launcher(
+def _atomic_write_root_launcher(
+    path: Path,
     payload: bytes,
     preimage: dict[str, Any] | None = None,
+    *,
+    label: str,
 ) -> None:
-    """Installiert den einzigen Web-sudo-Aktor root-eigen und race-frei."""
+    """Installiert einen eng gebundenen Web-sudo-Aktor root-eigen und race-frei."""
 
-    path = SERVICE_WRAPPER
     parent = path.parent
     for ancestor in (parent.parent, parent):
         try:
             ancestor_meta = os.lstat(ancestor)
         except OSError as exc:
             raise RuntimeError(
-                f"Service-Launcher-Elternpfad ist nicht prüfbar: {ancestor}"
+                f"{label}-Elternpfad ist nicht prüfbar: {ancestor}"
             ) from exc
         if (
             stat.S_ISLNK(ancestor_meta.st_mode)
@@ -718,14 +742,14 @@ def _atomic_write_service_launcher(
             or ancestor_meta.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
         ):
             raise RuntimeError(
-                f"Service-Launcher-Elternpfad ist nicht root-kontrolliert: {ancestor}"
+                f"{label}-Elternpfad ist nicht root-kontrolliert: {ancestor}"
             )
     if (
         not payload.startswith(b"#!/bin/bash\n")
         or b"\r" in payload
         or len(payload) > 64 * 1024
     ):
-        raise RuntimeError("Service-Launcher-Quelle ist nicht zulässig")
+        raise RuntimeError(f"{label}-Quelle ist nicht zulässig")
 
     descriptor, tmp_name = tempfile.mkstemp(
         prefix=f".{path.name}.txn-",
@@ -755,6 +779,115 @@ def _atomic_write_service_launcher(
     finally:
         os.close(descriptor)
         tmp_path.unlink(missing_ok=True)
+
+
+def _atomic_write_service_launcher(
+    payload: bytes,
+    preimage: dict[str, Any] | None = None,
+) -> None:
+    _atomic_write_root_launcher(
+        SERVICE_WRAPPER,
+        payload,
+        preimage,
+        label="Service-Launcher",
+    )
+
+
+def _render_web_update_launcher(
+    template: bytes,
+    *,
+    root: Path,
+    user: str,
+    release_commit: str,
+) -> bytes:
+    """Bindet genau einen kanonischen Installationspfad und Benutzer ein."""
+
+    root_text = str(root)
+    user_text = str(user or "")
+    commit_text = str(release_commit or "").strip().lower()
+    try:
+        resolved_root = root.resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError(
+            "Web-Update-Launcher besitzt keinen vorhandenen Installationspfad"
+        ) from exc
+    if (
+        not root.is_absolute()
+        or any(part in {".", ".."} for part in root.parts)
+        or resolved_root != root
+        or not re.fullmatch(r"/[A-Za-z0-9._/-]+", root_text)
+        or "//" in root_text
+        or root_text.endswith("/")
+        or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]*", user_text)
+        or user_text in {"root", "www-data"}
+        or not re.fullmatch(r"[0-9a-f]{40}", commit_text)
+    ):
+        raise RuntimeError("Web-Update-Launcher besitzt keine kanonische Installationsbindung")
+    root_marker = b"@E3DC_INSTALL_ROOT@"
+    user_marker = b"@E3DC_INSTALL_USER@"
+    commit_marker = b"@E3DC_RELEASE_COMMIT@"
+    if (
+        template.count(root_marker) != 1
+        or template.count(user_marker) != 1
+        or template.count(commit_marker) != 1
+    ):
+        raise RuntimeError("Web-Update-Launcher-Vorlage besitzt keinen eindeutigen Platzhaltervertrag")
+    rendered = template.replace(root_marker, root_text.encode("utf-8"))
+    rendered = rendered.replace(user_marker, user_text.encode("utf-8"))
+    rendered = rendered.replace(commit_marker, commit_text.encode("ascii"))
+    if root_marker in rendered or user_marker in rendered or commit_marker in rendered:
+        raise RuntimeError("Web-Update-Launcher-Vorlage blieb unvollständig")
+    return rendered
+
+
+def web_update_launcher_integrity_preview() -> dict[str, Any]:
+    """Prüft den installierten argumentlosen Update-Launcher gegen Git-HEAD."""
+
+    try:
+        head, canonical = _git_head_wrapper_bytes(INSTALL_ROOT)
+        payload = _render_web_update_launcher(
+            canonical["Installer/web_update_launcher.sh"],
+            root=INSTALL_ROOT,
+            user=install_user(),
+            release_commit=head,
+        )
+    except Exception as exc:
+        return {
+            "success": False,
+            "path": str(WEB_UPDATE_LAUNCHER),
+            "status": "head_error",
+            "error": str(exc),
+        }
+    item = _classify_wrapper(WEB_UPDATE_LAUNCHER, payload)
+    parent_checks = []
+    for parent in (WEB_UPDATE_LAUNCHER.parent.parent, WEB_UPDATE_LAUNCHER.parent):
+        try:
+            metadata = os.lstat(parent)
+            ok = (
+                stat.S_ISDIR(metadata.st_mode)
+                and not stat.S_ISLNK(metadata.st_mode)
+                and metadata.st_uid == 0
+                and metadata.st_gid == 0
+                and not metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            )
+        except OSError:
+            ok = False
+        parent_checks.append({"path": str(parent), "ok": ok})
+    success = bool(
+        item.get("uid") == 0
+        and item.get("gid") == 0
+        and item.get("status") == "ok"
+        and all(check["ok"] for check in parent_checks)
+    )
+    return {
+        "success": success,
+        "path": str(WEB_UPDATE_LAUNCHER),
+        "source": str(WEB_UPDATE_LAUNCHER_SOURCE),
+        "head": head,
+        "status": "ok" if success else item.get("status", "invalid"),
+        "item": item,
+        "parent_checks": parent_checks,
+    }
 
 
 def service_launcher_integrity_preview() -> dict[str, Any]:
@@ -1247,13 +1380,17 @@ def validate_bound_preimage_snapshot(
 
 
 def desired_sudoers_lines() -> list[str]:
-    return [
+    service_lines = [
         (
             f"www-data ALL=(root) NOPASSWD: "
             f"{SERVICE_WRAPPER} {action} {unit}"
         )
         for action in SERVICE_WRAPPER_ACTIONS
         for unit in SERVICE_WRAPPER_UNITS
+    ]
+    return [
+        *service_lines,
+        f'www-data ALL=(root) NOPASSWD: {WEB_UPDATE_LAUNCHER} ""',
     ]
 
 
@@ -1322,6 +1459,7 @@ def _classify_sudoers_line(path: Path | None, line: str) -> dict[str, bool]:
         or "e3dc" in lowered
         or str(INSTALL_ROOT).lower() in lowered
         or str(SERVICE_WRAPPER).lower() in lowered
+        or str(WEB_UPDATE_LAUNCHER).lower() in lowered
         or str(INSTALLER_WRAPPER).lower() in lowered
     )
     managed_direct = bool(e3dc_owned and (direct_web or direct_systemctl or legacy))
@@ -2302,6 +2440,20 @@ def write_readiness(ignore_active_lock: bool = False) -> dict[str, Any]:
         ),
         "details": service_launcher,
     }
+    web_update_launcher = web_update_launcher_integrity_preview()
+    web_update_wrapper = {
+        "label": "Root-eigener Web-Update-Launcher",
+        "path": str(WEB_UPDATE_LAUNCHER),
+        "ok": bool(web_update_launcher.get("success")),
+        "hard": True,
+        "status": web_update_launcher.get("status", "unbekannt"),
+        "issue": (
+            None
+            if web_update_launcher.get("success")
+            else "Web-Update-Launcher fehlt oder ist nicht root-eigen an Git-HEAD gebunden"
+        ),
+        "details": web_update_launcher,
+    }
     installer_wrapper = file_check(INSTALLER_WRAPPER, "Installer-Wrapper", executable=True)
     wrapper_integrity = wrapper_integrity_preview()
     wrapper_integrity_ok = bool(wrapper_integrity.get("success")) and not wrapper_integrity.get("repair_needed")
@@ -2335,6 +2487,7 @@ def write_readiness(ignore_active_lock: bool = False) -> dict[str, Any]:
             "issue": "Docker benötigt später einen eigenen Container-Ablauf" if is_docker() else None,
         },
         service_wrapper,
+        web_update_wrapper,
         installer_wrapper,
         {
             "label": "Wrapperintegrität gegen lokalen Git-HEAD",
@@ -2377,7 +2530,7 @@ def write_readiness(ignore_active_lock: bool = False) -> dict[str, Any]:
             },
         },
         {
-            "label": "sudoers: kein privilegierter Installer-Webzugang",
+            "label": "sudoers: kein breiter privilegierter Installer-Webzugang",
             "ok": not sudoers_has_installer,
             "hard": True,
             "issue": (
@@ -2439,12 +2592,13 @@ def write_readiness(ignore_active_lock: bool = False) -> dict[str, Any]:
         "success": True,
         "write_actions_enabled": WRITE_ACTIONS_ENABLED,
         "privileged_installer_web_enabled": False,
+        "web_update_launcher_ready": bool(web_update_launcher.get("success") and service_wrapper_ready),
         "service_wrapper_ready": service_wrapper_ready,
         "ready_for_manual_enable": False,
         "can_write_now": False,
         "summary": (
-            "Privilegierte Installer-Webaktionen bleiben fail-closed gesperrt. "
-            "Bereits installierte Dienste verwenden ausschließlich den engeren Service-Wrapper."
+            "Breite privilegierte Installer-Webaktionen bleiben fail-closed gesperrt. "
+            "Dienststeuerung und Self-Update besitzen getrennte root-eigene Launcher."
         ),
         "checks": checks,
         "hard_blocker_count": len(hard_blockers),
@@ -2453,11 +2607,11 @@ def write_readiness(ignore_active_lock: bool = False) -> dict[str, Any]:
         "release_steps": [
             "Alte installer_wrapper.sh- und direkte installer_main.py-Freigaben aus sudoers entfernen",
             "Service-Wrapper und seine feste Aktions-/Unit-Allowlist getrennt prüfen",
-            "Für spätere Webinstallationen einen root-kontrollierten, aktionsgebundenen Launcher entwickeln",
-            "Aufträge ausschließlich race-frei, einmalig und mit privilegierter Neuvalidierung übernehmen",
-            "Bis dahin Installation, Rechte-Reparatur, Update und Rückfall nur administrativ ausführen",
+            "Argumentlosen Web-Update-Launcher root-eigen und commitgebunden installieren",
+            "Update aus einem versiegelten veröffentlichten Ausgangssnapshot starten",
+            "Installation, Rechte-Reparatur und Rückfall weiterhin nur administrativ ausführen",
         ],
-        "next_step": "Privilegierte Installer-Webjobs bleiben bis zu einem eigenen sicheren Launcher deaktiviert.",
+        "next_step": "Nur das Self-Update darf über den engen Launcher starten; alle anderen Installer-Webjobs bleiben gesperrt.",
     }
 
 
@@ -2507,13 +2661,14 @@ def write_permission_plan() -> dict[str, Any]:
             "allowed_lines": desired_sudoers,
             "missing_lines": missing_lines,
             "service_wrapper": str(SERVICE_WRAPPER),
+            "web_update_launcher": str(WEB_UPDATE_LAUNCHER),
             "installer_wrapper_admin_only": str(INSTALLER_WRAPPER),
         },
         "file_preview": file_preview,
         "planned_steps": [
             "Bestehende sudoers-Datei sichern, bevor sie ersetzt wird.",
             "Nur E3DC-eigene direkte systemctl-/WebUI-Freigaben entfernen; fremde Fragmente bleiben byte- und metadatengleich.",
-            "Nur die enge Service-Wrapper-Zeile für www-data setzen; installer_wrapper.sh bleibt administrativ.",
+            "Nur die engen Service- und argumentlosen Update-Launcher für www-data setzen; installer_wrapper.sh bleibt administrativ.",
             "sudoers-Syntax mit visudo -cf prüfen.",
             "Freigabe-Check erneut ausführen; privilegierte Installer-Webjobs bleiben gesperrt.",
         ],
@@ -2530,10 +2685,10 @@ def write_permission_plan() -> dict[str, Any]:
         "safety_rules": [
             "Keine freien Shell-Kommandos aus PHP.",
             "Keine direkten E3DC-systemctl-Freigaben für www-data.",
-            "Keine privilegierte installer_wrapper.sh- oder installer_main.py-Freigabe für www-data.",
+            "Keine privilegierte installer_wrapper.sh- oder installer_main.py-Freigabe für www-data; Update nur über den root-eigenen argumentlosen Launcher.",
             "Fremde sudoers-Fragmente werden ausschließlich gemeldet und niemals vom E3DC-Installer verändert.",
             "Der alte C++ Dienst e3dc.service bleibt kein erlaubtes WebUI-Startziel.",
-            "Installer-Mutationen nur administrativ, bis ein eigener enger Web-Launcher vollständig geprüft ist.",
+            "Web-Updates starten ausschließlich als versiegelter Systemjob ohne freie Aktion, Pfade oder Releaseparameter.",
         ],
         "readiness": checks,
     }
@@ -2565,6 +2720,7 @@ def backup_plan(module_key: str | None = None) -> dict[str, Any]:
     system_files = [
         SUDOERS_FILE,
         SERVICE_WRAPPER,
+        WEB_UPDATE_LAUNCHER,
         INSTALLER_WRAPPER,
     ]
     sudoers_findings = sudoers_file_findings()
@@ -3445,7 +3601,34 @@ def prepare_module_runner(module: Any) -> dict[str, Any]:
             "workdir": str(workdir),
             "error": f"package.json fehlt: {package_json}",
         }
+    package_lock = workdir / "package-lock.json"
+    if not package_lock.is_file():
+        return {
+            "step": "prepare_runner",
+            "ok": False,
+            "runner": runner,
+            "workdir": str(workdir),
+            "error": f"package-lock.json fehlt: {package_lock}",
+        }
     npm = npm_executable()
+    node_check = run_cmd(["node", "--version"], timeout=15)
+    node_match = re.fullmatch(
+        r"v([0-9]+)(?:\.[0-9]+){1,2}",
+        str(node_check.get("stdout") or "").strip(),
+    )
+    if (
+        not node_check.get("ok")
+        or node_match is None
+        or int(node_match.group(1)) < 18
+    ):
+        return {
+            "step": "prepare_runner",
+            "ok": False,
+            "runner": runner,
+            "workdir": str(workdir),
+            "error": "Matter.js benötigt Node.js 18 oder neuer",
+            "node_check": node_check,
+        }
     npm_check = run_cmd([npm, "--version"], timeout=15)
     if not npm_check.get("ok"):
         return {
@@ -3456,13 +3639,19 @@ def prepare_module_runner(module: Any) -> dict[str, Any]:
             "error": "npm ist nicht verfügbar",
             "npm_check": npm_check,
         }
-    install = run_cmd([npm, "install"], timeout=180, cwd=workdir)
+    install = run_cmd(
+        [npm, "ci", "--omit=dev", "--ignore-scripts"],
+        timeout=180,
+        cwd=workdir,
+    )
     return {
         "step": "prepare_runner",
         "ok": bool(install.get("ok")),
         "runner": runner,
         "workdir": str(workdir),
         "package_json": str(package_json),
+        "package_lock": str(package_lock),
+        "node_version": node_check.get("stdout"),
         "npm_version": npm_check.get("stdout"),
         "install": install,
     }
@@ -3846,6 +4035,7 @@ def permissions_check() -> dict[str, Any]:
         (INSTALLER_DIR, "www-data", False),
         (INSTALLER_DIR / "service_wrapper.sh", "www-data", False),
         (INSTALLER_DIR / "installer_wrapper.sh", "www-data", False),
+        (INSTALLER_DIR / "web_update_launcher.sh", "www-data", False),
         (CONFIG_FILE, "www-data", True),
     ]
     checks = [check_path(path, group, write) for path, group, write in paths]
@@ -3865,7 +4055,11 @@ def permissions_check() -> dict[str, Any]:
     }
 
 
-def repair_permissions(*, repair_runtime: bool = False) -> dict[str, Any]:
+def repair_permissions(
+    *,
+    repair_runtime: bool = False,
+    bound_privileged_preimages: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """Ersetzt atomar nur die commitgebundenen Wrapper und sudoers-Fragmente."""
     readiness = write_readiness()
     if repair_runtime:
@@ -3923,15 +4117,43 @@ def repair_permissions(*, repair_runtime: bool = False) -> dict[str, Any]:
                 _capture_file_preimage(Path(str(item.get("path") or "")))
                 for item in wrapper_preview.get("items", [])
             ]
-            launcher_preimages = [_capture_file_preimage(SERVICE_WRAPPER)]
             sudoers_paths = {SUDOERS_FILE}
             sudoers_paths.update(
                 Path(str(item.get("file") or ""))
                 for item in findings.get("repairable_lines", [])
                 if str(item.get("file") or "")
             )
+            privileged_paths = {
+                SERVICE_WRAPPER,
+                WEB_UPDATE_LAUNCHER,
+                *sudoers_paths,
+            }
+            if bound_privileged_preimages is None:
+                privileged_by_path = {
+                    str(path): _capture_file_preimage(path)
+                    for path in sorted(privileged_paths, key=lambda item: str(item))
+                }
+            else:
+                privileged_by_path = {
+                    str(item.get("path") or ""): item
+                    for item in bound_privileged_preimages
+                }
+                if (
+                    len(privileged_by_path) != len(bound_privileged_preimages)
+                    or set(privileged_by_path)
+                    != {str(path) for path in privileged_paths}
+                ):
+                    raise RuntimeError(
+                        "Gebundene privilegierte Preimages sind unvollständig oder doppelt"
+                    )
+                for preimage in privileged_by_path.values():
+                    _assert_preimage_unchanged(preimage)
+            launcher_preimages = [
+                privileged_by_path[str(SERVICE_WRAPPER)],
+                privileged_by_path[str(WEB_UPDATE_LAUNCHER)],
+            ]
             sudoers_preimages = [
-                _capture_file_preimage(path)
+                privileged_by_path[str(path)]
                 for path in sorted(sudoers_paths, key=lambda item: str(item))
             ]
         except Exception as exc:
@@ -4059,7 +4281,8 @@ def repair_permissions(*, repair_runtime: bool = False) -> dict[str, Any]:
                 "steps": steps,
                 "rollback": rollback,
             }
-        launcher_preimage = launcher_preimages[0]
+        launcher_by_path = {str(item["path"]): item for item in launcher_preimages}
+        launcher_preimage = launcher_by_path[str(SERVICE_WRAPPER)]
         _atomic_write_service_launcher(
             rebound_canonical["Installer/service_wrapper.sh"],
             launcher_preimage,
@@ -4076,6 +4299,32 @@ def repair_permissions(*, repair_runtime: bool = False) -> dict[str, Any]:
         ):
             raise RuntimeError(
                 "Root-eigener Service-Launcher bestand das Endgate nicht"
+            )
+
+        web_update_payload = _render_web_update_launcher(
+            rebound_canonical["Installer/web_update_launcher.sh"],
+            root=INSTALL_ROOT,
+            user=user,
+            release_commit=rebound_head,
+        )
+        _atomic_write_root_launcher(
+            WEB_UPDATE_LAUNCHER,
+            web_update_payload,
+            launcher_by_path[str(WEB_UPDATE_LAUNCHER)],
+            label="Web-Update-Launcher",
+        )
+        installed_web_update_launcher = web_update_launcher_integrity_preview()
+        steps.append({
+            "step": "install_root_web_update_launcher",
+            "ok": bool(installed_web_update_launcher.get("success")),
+            "path": str(WEB_UPDATE_LAUNCHER),
+        })
+        if (
+            not installed_web_update_launcher.get("success")
+            or installed_web_update_launcher.get("head") != rebound_head
+        ):
+            raise RuntimeError(
+                "Root-eigener Web-Update-Launcher bestand das Endgate nicht"
             )
 
         sudoers_by_path = {str(item["path"]): item for item in sudoers_preimages}
@@ -4335,9 +4584,9 @@ def execute_job(job: dict[str, Any]) -> dict[str, Any]:
             "planned_steps": [
                 "Commitgebundene Wrapper für administrative Nutzung prüfen",
                 "Installer-Wrapper, installer_main.py und direkte systemctl-Freigaben für www-data entfernen",
-                "Nur den festen Service-Wrapper für erlaubte Dienstaktionen behalten",
+                "Nur den festen Service-Wrapper und den argumentlosen Self-Update-Launcher behalten",
                 "Ziel-sudoers mit visudo prüfen, bevor sie aktiv wird",
-                "Privilegierte Installer-Webjobs weiterhin nicht freischalten",
+                "Breite Installer-Webjobs weiterhin nicht freischalten",
             ],
             "permissions": permissions_check(),
             "sudoers_plan": plan,

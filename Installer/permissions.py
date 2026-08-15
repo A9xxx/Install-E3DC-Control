@@ -2285,7 +2285,7 @@ def cleanup_legacy_cronjobs():
 
 
 def check_wrapper_integrity():
-    """Bindet die beiden sudo-freigegebenen Wrapper read-only an Git-HEAD."""
+    """Bindet Quellen und root-eigene Launcher read-only an Git-HEAD."""
     print("\n=== Wrapper-Integritätsprüfung (lokaler Git-HEAD) ===\n")
     try:
         if __package__ in (None, ""):
@@ -2293,12 +2293,29 @@ def check_wrapper_integrity():
         else:
             from . import web_installer
         result = web_installer.wrapper_integrity_preview(INSTALL_ROOT)
+        root_launchers = (
+            (
+                "Root-eigener Service-Launcher",
+                web_installer.service_launcher_integrity_preview(),
+            ),
+            (
+                "Root-eigener Web-Update-Launcher",
+                web_installer.web_update_launcher_integrity_preview(),
+            ),
+        )
     except Exception as exc:
         print(f"{RED}✗{RESET} Wrapper-Integrität konnte nicht geprüft werden: {exc}")
         return [{"wrapper_integrity": True, "status": "check_error", "error": str(exc)}]
 
-    if result.get("success") and not result.get("repair_needed"):
-        print(f"{GREEN}✓{RESET} Beide Wrapper stimmen bytegenau mit Git-HEAD {result.get('head', '')[:12]} überein.")
+    sources_ok = bool(result.get("success")) and not result.get("repair_needed")
+    root_launchers_ok = all(
+        bool(preview.get("success")) for _label, preview in root_launchers
+    )
+    if sources_ok and root_launchers_ok:
+        print(
+            f"{GREEN}✓{RESET} Wrapperquellen und root-eigene Launcher stimmen "
+            f"bytegenau mit Git-HEAD {result.get('head', '')[:12]} überein."
+        )
         return []
 
     labels = {
@@ -2311,22 +2328,41 @@ def check_wrapper_integrity():
         "not_regular": "ist keine reguläre Datei; automatische Reparatur ist gesperrt",
         "read_error": "konnte nicht sicher gelesen werden",
     }
-    for item in result.get("items", []):
-        status = str(item.get("status") or "unknown")
-        if status == "ok":
+    issues = []
+    if not sources_ok:
+        for item in result.get("items", []):
+            status = str(item.get("status") or "unknown")
+            if status == "ok":
+                continue
+            detail = labels.get(status, f"hat den unbekannten Zustand {status}")
+            print(f"{RED}✗{RESET} {item.get('path')}: {detail}.")
+        for blocker in result.get("hard_blockers", []):
+            if blocker.get("status") == "head_error":
+                print(f"{RED}✗{RESET} Git-HEAD-Bindung fehlgeschlagen: {blocker.get('error', 'unbekannt')}")
+        issues.append({
+            "wrapper_integrity": True,
+            "file": INSTALLER_DIR,
+            "head": result.get("head"),
+            "repairable": bool(result.get("success")),
+            "result": result,
+        })
+
+    for label, preview in root_launchers:
+        if preview.get("success"):
             continue
-        detail = labels.get(status, f"hat den unbekannten Zustand {status}")
-        print(f"{RED}✗{RESET} {item.get('path')}: {detail}.")
-    for blocker in result.get("hard_blockers", []):
-        if blocker.get("status") == "head_error":
-            print(f"{RED}✗{RESET} Git-HEAD-Bindung fehlgeschlagen: {blocker.get('error', 'unbekannt')}")
-    return [{
-        "wrapper_integrity": True,
-        "file": INSTALLER_DIR,
-        "head": result.get("head"),
-        "repairable": bool(result.get("success")),
-        "result": result,
-    }]
+        status = str(preview.get("status") or "unknown")
+        print(
+            f"{RED}✗{RESET} {label} {preview.get('path')}: "
+            f"stimmt nicht mit dem gebundenen Git-HEAD überein ({status})."
+        )
+        issues.append({
+            "root_launcher_integrity": True,
+            "file": preview.get("path"),
+            "head": preview.get("head") or result.get("head"),
+            "status": status,
+            "result": preview,
+        })
+    return issues
 
 
 def check_sudoers_permissions():
@@ -2351,7 +2387,7 @@ def check_sudoers_permissions():
         {
             "file": sudoers_file_path,
             "content": wrapper_sudoers_content,
-            "description": "WebUI Service-/Installer-Wrapper"
+            "description": "WebUI Service-, Update- und Installer-Wrapper"
         }
     ]
 
@@ -2477,7 +2513,7 @@ def check_sudoers_permissions():
         )
     return issues
 
-def fix_sudoers_permissions(issues):
+def fix_sudoers_permissions(issues, *, bound_privileged_preimages=None):
     """Erstellt oder korrigiert die Sudoers-Dateien für Web-Funktionen."""
     print("\n→ Richte Sudoers für Web-Funktionen ein…\n")
     if issues:
@@ -2500,8 +2536,11 @@ def fix_sudoers_permissions(issues):
             else:
                 from . import web_installer
 
-            print("  -> Nutze zentrale Web-Installer-Rechte-Reparatur (Wrapper-only, mit Backup/visudo).")
-            result = web_installer.repair_permissions(repair_runtime=False)
+            print("  -> Nutze zentrale Web-Launcher-Rechte-Reparatur (mit Backup/visudo).")
+            result = web_installer.repair_permissions(
+                repair_runtime=False,
+                bound_privileged_preimages=bound_privileged_preimages,
+            )
             for step in result.get("steps", []):
                 status = GREEN + "OK" + RESET if step.get("ok") else RED + "FEHLER" + RESET
                 label = step.get("step", "step")
@@ -3295,7 +3334,11 @@ def _install_legacy_532b_service_contract():
     return True
 
 
-def run_permissions_wizard(headless=False, release_quiesced=None):
+def run_permissions_wizard(
+    headless=False,
+    release_quiesced=None,
+    bound_privileged_preimages=None,
+):
     """Hauptlogik für Rechteprüfung und -korrektur."""
     if release_quiesced is None:
         # Kompatibilität für alte, bereits veröffentlichte Updater: Nach deren
@@ -3494,7 +3537,10 @@ def run_permissions_wizard(headless=False, release_quiesced=None):
         success = fix_file_permissions(file_issues)
         all_success = all_success and success
     if sudo_issues:
-        success = fix_sudoers_permissions(sudo_issues)
+        success = fix_sudoers_permissions(
+            sudo_issues,
+            bound_privileged_preimages=bound_privileged_preimages,
+        )
         all_success = all_success and success
     if service_issues:
         success = fix_services(service_issues)

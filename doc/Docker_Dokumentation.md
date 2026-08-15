@@ -2,10 +2,15 @@
 
 Veröffentlichte Images entstehen ausschließlich aus einem versionierten stabilen Release-Tag. `latest` verweist damit auf die zuletzt veröffentlichte stabile Version.
 
-Der aktuelle Stable-Stand ist `v5.4.3f`. Die Tags `latest`, `v5.4.3f` und
-`5.4.3f` müssen auf denselben geprüften Multi-Arch-Digest verweisen.
+Der aktuelle Stable-Stand ist `v5.4.3g`. Die Tags `latest`, `v5.4.3g` und
+`5.4.3g` müssen auf denselben geprüften Multi-Arch-Digest verweisen.
 
 E3DC-Control kann isoliert über **Docker** betrieben werden. Der Container kapselt die Anwendung; persistente Betriebsdaten liegen in den dafür vorgesehenen Volumes. Der Multi-Architektur-Support (`arm64`, `amd64`) deckt die vorgesehenen Plattformen ab. Docker benötigt dabei zwingend ein 64-Bit-Betriebssystem; `armhf`, `arm/v7` und andere 32-Bit-Installationen können das veröffentlichte Image nicht starten.
+
+Bei aktivierter Matter-Bridge startet der Container zuerst D-Bus und den
+Bookworm-Avahi-Daemon, überwacht dessen Prozess und wartet begrenzt auf den
+mDNS-Bereitschaftsnachweis. Erst danach wird die Matter-Bridge gestartet; ein
+fehlender Discovery-Dienst lässt den Container absichtlich ungesund enden.
 
 Docker ist ausschließlich für eine eigenständige Instanz mit exakt
 `ha_mode=off` freigegeben. HA-Master/-Slave und die read-only Shadow-Instanz
@@ -217,7 +222,7 @@ unverändert gesperrt und benötigen eine manuelle Prüfung.
 
 Ohne `E3DC_IMAGE_TAG` folgt diese Compose-Datei dem geprüften Stable-Tag
 `latest`. Ein fester Tag bleibt bei `pull` absichtlich unverändert. Für einen
-bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.3f` in der Datei `.env`
+bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.3g` in der Datei `.env`
 gesetzt. `docker compose config --images` zeigt vorab das tatsächlich gewählte
 Image.
 
@@ -244,7 +249,7 @@ Versionswahl.
 
 Gezielte Rückfallversion:
 
-Den Stable-Container `v5.4.3f` auf den veröffentlichten Rollback-Root
+Den Stable-Container `v5.4.3g` auf den veröffentlichten Rollback-Root
 `v5.3.2b` zurücksetzen:
 
 ```bash
@@ -287,6 +292,11 @@ Für normale Installationen bleibt das veröffentlichte GHCR-Image der
 vorgesehene Weg. Ein lokaler Build benötigt den **vollständigen
 Repository-Checkout**, weil `Dockerfile`, `entrypoint.sh` und der Quellbaum im
 Build-Kontext liegen müssen.
+
+Der Docker-Build normalisiert den kopierten Produktbaum unabhängig von den
+Dateimodi des Host-Dateisystems auf root-eigene, für Gruppe und Andere nicht
+schreibbare Pfade. Persistente Konfiguration, Logs, RAM-Disk und Matter-Storage
+bleiben davon getrennt in den vorgesehenen Laufzeitverzeichnissen und Volumes.
 
 Docker Compose ist nicht auf Images aus einer Registry beschränkt. Es kann ein
 lokal gebautes Image direkt aus dem Docker-Daemon verwenden. Entscheidend ist,

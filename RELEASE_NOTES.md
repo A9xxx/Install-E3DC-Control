@@ -1,3 +1,57 @@
+# E3DC-Control v5.4.3g
+
+E3DC-Control 5.4.3g bringt das eng begrenzte System-Update ins Dashboard
+zurück und härtet die Matter-Laufzeit. Speicher-, Wallbox-, Wärme- und
+Direktvermarktungsregelung bleiben gegenüber 5.4.3f unverändert.
+
+## Sicheres Web-Update
+
+- Das Dashboard darf ausschließlich einen argumentlosen, root-eigenen
+  Systemjob starten. Pfad, Installationsnutzer, unveränderter Ausgangscommit
+  und dessen veröffentlichter annotierter Stable-Tag werden erneut gebunden.
+- Freie Installer-Aktionen, Pfade, Tags, Reparaturen, Neuinstallationen und
+  Rückfälle bleiben im Web gesperrt. Der eigentliche Updater läuft aus einem
+  root-eigenen, versiegelten Snapshot und bleibt im Dashboard beobachtbar.
+- Jede verifizierte Ziel-Policy muss die gebundene Rechte- und
+  Root-Launcher-Aktualisierung ausführen. Ein Release kann deshalb nicht
+  erfolgreich enden und zugleich einen Launcher des Vorgängerstands
+  zurücklassen.
+- Beim ersten Wechsel aus 5.4.2 beendet die Kompatibilitätsbrücke einen zu
+  lange laufenden Ziel-Finalizer einschließlich seiner Kindprozesse sicher
+  vor dem unveränderbaren 900-Sekunden-Limit des alten Updaters. Erst danach
+  darf dessen Wiederherstellung beginnen.
+- Der Standardlink `lib64 -> lib` eines eindeutig gebundenen Benutzer-venv
+  wird akzeptiert. Absolute oder fremde Linkziele, falsche Eigentümer und
+  ACL-Abweichungen bleiben fail-closed.
+- Bestehende Installationen bis einschließlich 5.4.3f besitzen den neuen
+  Launcher noch nicht. Der erste Wechsel auf 5.4.3g erfolgt deshalb einmalig
+  über die administrative Konsole; danach steht der Dashboard-Weg bereit.
+
+## Matter-Härtung
+
+- Die Bridge verwendet die offizielle Matter-Kompatibilitätsschicht 0.12.6
+  statt der alten verwundbaren Abhängigkeitskette. Nicht benötigte
+  Laufzeitpakete wurden entfernt; der Laufzeit-Audit meldet keine bekannte
+  npm-Schwachstelle.
+- Web- und Matter-Installer verlangen Node.js ab Version 18 und installieren
+  exakt aus der Lockdatei mit `npm ci --omit=dev --ignore-scripts`.
+- Das bisherige Storageformat und bestehende Kopplungen bleiben erhalten. Die
+  inkompatible Migration auf das neue `ServerNode`-Storageformat ist nicht
+  Teil dieses Releases.
+- Im Bookworm-Container werden D-Bus und Avahi ohne nicht vorhandenes
+  SysV-Avahi-Skript gestartet und vor dem Bridge-Start auf echte
+  mDNS-Bereitschaft geprüft.
+
+## Docker-Veröffentlichung
+
+- Der kopierte Produktbaum wird unabhängig von den Dateimodi des Build-Hosts
+  root-eigen und ohne Schreibrechte für Gruppe oder Andere versiegelt.
+- Der gebaute Multi-Arch-Kandidat wird real gestartet und erst nach Digest-,
+  SBOM- und Provenance-Nachweis auf `v5.4.3g`, `5.4.3g` und `latest`
+  befördert.
+
+---
+
 # E3DC-Control v5.4.3f
 
 E3DC-Control 5.4.3f ist ein Wartungsrelease für Bare-Metal-Update,

@@ -1,16 +1,15 @@
 # Betrieb des E3DC-Control Installers
 
-Dokumentation Stand: 5.4.3f
+Dokumentation Stand: 5.4.3g
 
 Der Installer ist der freigegebene Einstieg für Installation, Update,
 Reparatur, Backup, Rollback und Deinstallation. Die vollständige Bedienung ist
 in [E3DC-Control Installer](Installer.md) beschrieben.
 
-5.4.3f ordnet die frische Bookworm-Installation verbindlich: Systempakete,
-Apache, Konfiguration, RAM-Disk, Webportal und Dienste bauen geprüft
-aufeinander auf. Der erste Fehler beendet den Lauf, und ein vorhandener
-funktionierender Zustand wird zurückgestellt, statt einen halben Stand als
-erfolgreich zu melden.
+5.4.3g richtet einen argumentlosen, root-eigenen Web-Update-Launcher ein. Er
+bindet Installationspfad, Installationsnutzer und veröffentlichten Ausgangstag;
+freie Aktionen und Zielparameter bleiben gesperrt. Der erste Wechsel von
+5.4.3f auf 5.4.3g erfolgt noch über die administrative Konsole.
 
 ## Start
 

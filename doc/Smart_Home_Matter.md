@@ -5,7 +5,7 @@ Die Matter-Bridge bringt Live-Werte und einfache Schaltzustände von E3DC-Contro
 ## Datenfluss
 
 ```text
-E3DC RSCP -> e3dc_live.py -> Ramdisk JSON -> get_live_json.php -> Matter Bridge
+E3DC RSCP -> e3dc_live.py -> Ramdisk JSON -> Matter Bridge
 ```
 
 Die Bridge nutzt die bestehenden Live-Daten aus der V4-Architektur. Sie liest keine Legacy-Config direkt.
@@ -22,13 +22,34 @@ Typische Parameter:
 
 ```ini
 matter_bridge = 1
-matter_port = 5540
 ```
+
+Die Bridge verwendet den festen Matter-Standardport `5540`. Dieser Port ist
+derzeit nicht als Konfigurationsparameter freigegeben.
 
 Matter ist ein optionales Modul. Das normale E3DC-Control-Update installiert
 deshalb keine Node.js-, npm-, Avahi- oder D-Bus-Pakete. Erst die ausdrücklich
 gestartete Matter-Installation prüft diese Paketgruppe gemeinsam und bricht bei
 einem Solverfehler ab, ohne die Core-Aktualisierung zu blockieren.
+
+Die Node-Abhängigkeiten sind vollständig in `package-lock.json` gebunden und
+werden mit `npm ci --omit=dev --ignore-scripts` installiert. Die Bridge nutzt
+Matter.js `0.12.6`; nicht benötigte QR- und TypeScript-Laufzeitpakete gehören
+nicht zum installierten Produktionsbaum. Die Installation verlangt dafür
+Node.js 18 oder neuer und bricht mit einer eindeutigen Meldung ab, wenn das
+optionale Matter-Modul auf einem älteren System gestartet wird.
+
+## Bestehende Kopplungen bei Aktualisierungen
+
+Die Aktualisierung auf Matter.js `0.12.6` bleibt bewusst auf der kompatiblen
+Matter.js-Geräte-API und verwendet den vorhandenen Storage weiter. Sie löscht
+keine Kopplungen und verlangt keinen Werksreset. Lösche
+`/var/www/html/data/matter-storage` nur über den ausdrücklich bestätigten
+Werksreset in der Weboberfläche.
+
+Eine spätere Umstellung auf die neue native `ServerNode`-API wird getrennt
+angekündigt: Deren Storageformat ist laut Matter.js-Migrationsvertrag nicht mit
+der bisherigen Geräte-API kompatibel und erfordert eine neue Kopplung.
 
 ## Dienst
 

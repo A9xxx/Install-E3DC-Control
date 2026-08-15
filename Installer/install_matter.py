@@ -1,4 +1,5 @@
 import os
+import re
 import shlex
 import tempfile
 import time
@@ -50,6 +51,19 @@ def install_matter_bridge(headless=False):
     ]
     if missing_commands:
         print(f"✗ Matter-Laufzeitprogramme fehlen: {', '.join(missing_commands)}")
+        return False
+
+    node_version = run_command("node --version")
+    node_match = re.fullmatch(
+        r"v([0-9]+)(?:\.[0-9]+){1,2}",
+        str(node_version.get("stdout") or "").strip(),
+    )
+    if (
+        not node_version.get("success")
+        or node_match is None
+        or int(node_match.group(1)) < 18
+    ):
+        print("✗ Matter.js 0.12.6 benötigt Node.js 18 oder neuer.")
         return False
 
     print("→ Installiere hashgebundene NPM-Pakete (npm ci)...")

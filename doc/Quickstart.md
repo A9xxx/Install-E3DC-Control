@@ -2,14 +2,13 @@
 
 Diese Anleitung fasst die schnellsten Schritte zusammen, um E3DC-Control auf einem frischen Raspberry Pi OS (oder ähnlichem Debian-System) zu installieren.
 
-Aktueller Stable-Stand: `v5.4.3f`.
+Aktueller Stable-Stand: `v5.4.3g`.
 
-5.4.3f verbessert die frische Bookworm-Installation, trennt Docker-Aktionen
-klar vom Container und sichert Update sowie Rückfall gegen unvollständige
-Zustände ab. Speicher, Wallbox und Wärmeverbraucher teilen Leistung nach der
-eingestellten Priorität. Im Dashboard erscheint nur die zum Betriebsmodus
-passende Prognose und Ladekurve; der aktuelle SoC bleibt ein eigener frischer
-Messwert.
+5.4.3g bringt das eng gebundene System-Update ins Dashboard zurück und härtet
+die Matter-Laufzeit. Der erste Wechsel von 5.4.3f auf 5.4.3g erfolgt noch
+einmalig über die administrative Konsole; danach steht der feste Web-Launcher
+für normale Updates bereit. Die EMS-Regelung bleibt gegenüber 5.4.3f
+unverändert.
 
 ## Variante A: Klassische Installation (Installer)
 
@@ -55,8 +54,9 @@ Für eine Erstinstallation oder ein Update ist die empfohlene Option **"1 Instal
 3.  Folgen Sie den Anweisungen auf dem Bildschirm.
 
 **Einmalige Ausnahme für Version 5.3.2b:** Der erste Wechsel auf das aktuelle
-Stable-Release erfolgt über den Web-Update-Button oder über die folgende
-vollständige SSH-Kette. Der interaktive Menüpunkt darf für genau diesen ersten
+Stable-Release erfolgt über die folgende vollständige administrative
+SSH-Kette. Der Web-Launcher ist in diesem Altstand noch nicht vorhanden. Der
+interaktive Menüpunkt darf für genau diesen ersten
 Hybridwechsel nicht verwendet werden, weil sein Altprozess bereits zusätzliche
 5.3.2b-Module geladen hat.
 
@@ -218,7 +218,7 @@ Ohne das Label bleibt auch ein versehentlich gestarteter Watchtower für den
 Hauptcontainer wirkungslos. Der oben gezeigte manuelle Host-Helfer bleibt der
 empfohlene Updateweg.
 
-**Docker-Rückfall von v5.4.3f auf den veröffentlichten Docker-Rollback-Root:**
+**Docker-Rückfall von v5.4.3g auf den veröffentlichten Docker-Rollback-Root:**
 ```bash
 (
   set -euo pipefail
@@ -286,7 +286,7 @@ Nach der Installation können Sie den Installer über `bash "$E3DC_INSTALL_PATH/
   - Option `1` (Installation / Update)
   - Hält Anwendung, Webdateien, Dienste und Rechte auf dem aktuellen Stand.
   - Ausnahme: Für den einmaligen Wechsel von 5.3.2b auf das aktuelle Stable-Release den
-    Web-Update-Button oder den direkten `--update-e3dc`-Aufruf aus
+    direkten administrativen `--update-e3dc`-Aufruf aus
     [Update.md](Update.md) verwenden, nicht den interaktiven Menüpunkt.
 
 - **Berechtigungen überprüfen & korrigieren:**

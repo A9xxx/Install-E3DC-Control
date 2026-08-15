@@ -14,7 +14,7 @@ test -f "$E3DC_INSTALL_PATH/e3dc-setup"
 
 ## Programmstand zurücksetzen
 
-Der aktuelle Stable-Stand `v5.4.3` führt den gebundenen Rückfallvertrag fort.
+Der aktuelle Stable-Stand `v5.4.3g` führt den gebundenen Rückfallvertrag fort.
 
 Beim Rücklauf wird der tatsächliche Dateisystemzustand einer Unit weiterhin
 streng gegen reguläre Unit-Datei, kanonische `/dev/null`-Maske, unerwarteten

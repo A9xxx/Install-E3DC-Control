@@ -6,6 +6,25 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.3g] – 2026-08-16
+
+### 🔐 Web-Update und Python-Umgebung
+
+- **System-Update kehrt eng ins Dashboard zurück:** Die Weboberfläche darf ausschließlich einen argumentlosen, root-eigenen Systemjob starten. Der Launcher bindet Installationspfad, Installationsnutzer, unveränderten Ausgangscommit und dessen veröffentlichten Stable-Tag, führt den Installer aus einem versiegelten Snapshot aus und akzeptiert keine freien Aktionen, Pfade, Tags, Reparaturen, Neuinstallationen oder Rückfälle.
+- **Erster Wechsel aus 5.4.2 bleibt transaktional:** Die Kompatibilitätsbrücke beendet einen zu lange laufenden Ziel-Finalizer samt Kindprozessen sicher vor dem unveränderbaren 900-Sekunden-Limit des alten Updaters. Erst nach dem bestätigten Prozessende darf dessen Wiederherstellung beginnen; Installation und Rückweg können dadurch nicht gleichzeitig schreiben.
+- **Jeder Zielstand erneuert den gebundenen Root-Launcher:** Eine verifizierte Release-Policy darf den Rechte- und Launcher-Lauf nicht auslassen. Dadurch kann ein erfolgreicher Versionswechsel keinen Launcher mit der Commitbindung des Vorgängerstands zurücklassen.
+- **Debian-venv bleibt updatefähig:** Der übliche relative Python-venv-Link `lib64 -> lib` wird nur dann akzeptiert, wenn Ziel, Eigentümer und ACL-Vertrag exakt zum selben gebundenen venv passen. Absolute, fremde, mehrdeutige oder manipulierte Linkziele bleiben fail-closed gesperrt.
+
+### 🏠 Matter
+
+- **Matter-Laufzeit ohne bekannte npm-Schwachstelle:** Die Bridge wechselt von der alten `matter-node.js`-Kette auf die offizielle Kompatibilitätsschicht `0.12.6`. Nicht benötigte Laufzeitpakete entfallen; der Installer verwendet die gebundene Lockdatei reproduzierbar mit `npm ci --omit=dev --ignore-scripts` und verlangt Node.js ab Version 18.
+- **Bestehende Kopplungen bleiben erhalten:** Die Kompatibilitätsschicht liest den bisherigen Matter-Storage weiter. Ein Wechsel auf das inkompatible neue `ServerNode`-Storageformat ist ausdrücklich nicht Bestandteil dieses Releases.
+- **Matter-mDNS startet im Bookworm-Container belegbar:** Der Entrypoint startet D-Bus und den vorhandenen Avahi-Daemon direkt, überwacht dessen Prozess und verlangt einen begrenzten Bereitschaftsnachweis, bevor die Bridge läuft. Ein fehlender oder früh beendeter Discovery-Dienst stoppt den Container fail-closed.
+
+### 🐳 Docker
+
+- **Produktcode bleibt auch bei lokalen Windows-/WSL-Builds unveränderlich:** Nach dem Kopieren wird der gesamte Produktbaum root-eigen gebunden und verliert Schreibrechte für Gruppe und Andere. Die erforderlichen Start- und Installerdateien bleiben ausführbar; persistente Laufzeitdaten liegen weiterhin ausschließlich in den vorgesehenen Volumes.
+
 ## [5.4.3f] – 2026-08-15
 
 ### 🧰 Installation und Update
@@ -3214,7 +3233,7 @@ Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame
 
 - ✨ **Verbesserung:** Mittagsziel erzwingt Ladekurvenführung.
 - 🐛 **Fehlerbehebung:** Kurventoleranz greift wieder bei 3% statt 30%.
-- ✨ **Verbesserung:** Ursi-Fall abgesichert.
+- ✨ **Verbesserung:** Ein gemeldeter Praxisfall wurde abgesichert.
 - 🐛 **Fehlerbehebung:** Lokale ML-Modelle erhalten zuverlässig die benötigten Zugriffsrechte.
 - ✨ **Verbesserung:** Speicher-Simulator loggt ML-Verbrauchsquellen eindeutig.
 - 🐛 **Fehlerbehebung:** ML-Lernprozess kann in Docker aus der Echtzeit-Historie starten.

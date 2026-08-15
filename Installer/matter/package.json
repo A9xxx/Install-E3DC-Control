@@ -5,11 +5,10 @@
   "main": "matter_bridge.js",
   "type": "module",
   "scripts": {
-    "start": "npx tsx matter_bridge.js"
+    "start": "node matter_bridge.js"
   },
   "dependencies": {
-    "@project-chip/matter-node.js": "0.7.1",
-    "tsx": "^4.19.2",
-    "qrcode": "^1.5.3"
+    "@project-chip/matter-node.js": "0.12.6",
+    "@project-chip/matter.js": "0.12.6"
   }
 }

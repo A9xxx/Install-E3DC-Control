@@ -1,12 +1,12 @@
 # E3DC-Control Web-Portal & Installer
 
-Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.4.3f</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
+Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.4.3g</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
 
 ![E3DC-Control Dashboard](html/app-icon-512.png)
 
 ## Aktuelle Version und Update
 
-Die aktuelle stabile Version ist **5.4.3f**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur geprüften Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
+Die aktuelle stabile Version ist **5.4.3g**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur geprüften Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
 
 > [!WARNING]
 > **⚠️ Achtung: Nutzung auf eigenes Risiko!**
@@ -20,7 +20,7 @@ Die aktuelle stabile Version ist **5.4.3f**. Hinweise zum Web-, Konsolen- und Do
 
 > **Bedienansichten:** Config-Editor und Wallbox-Seite unterscheiden zwischen einfacher Ansicht für Einrichtung und täglichen Betrieb sowie erweiterter Ansicht für alle Detailparameter. Die Logik und Abgrenzung sind in [doc/Frontend_Ansichten.md](doc/Frontend_Ansichten.md) dokumentiert.
 
-> **Neu in 5.4.3f Stable:** Ältere Benutzer-venvs mit historischen Gruppenrechten werden vor dem Paketupdate eng gebunden und auf sichere Schreibrechte migriert. Bare-Metal-Updates ersetzen eine fehlerhafte Logrotate-Konfiguration atomar und parsergeprüft. Frische Bookworm-Installationen prüfen den Apache-Laufzeitpfad erst nach Veröffentlichung des Webbaums. openWB-Pro verwirft beim Wechsel auf `Aus / autonom` nur alte Startversuchs-Evidenz; Schutzlatches bleiben bestehen. Die Direktvermarktung trennt Tagesbudgets am lokalen Markttag und archiviert Auswahl, Anforderung, Ausgabe und Hardwarewirkung getrennt.
+> **Neu in 5.4.3g Stable:** Das Dashboard startet Updates wieder über einen argumentlosen, root-eigenen und releasegebundenen Systemjob; freie Aktionen, Pfade, Tags, Reparaturen und Rückfälle bleiben gesperrt. Der erste Wechsel von 5.4.3f auf 5.4.3g erfolgt einmalig über die administrative Konsole. Der übliche venv-Link `lib64 -> lib` bleibt bei exakt passendem Eigentümer- und ACL-Vertrag updatefähig. Matter nutzt die offizielle Kompatibilitätsschicht 0.12.6, eine reproduzierbare Lockdatei und Node.js ab Version 18; bestehender Matter-Storage bleibt erhalten.
 
 > **Neu in 5.4.2d Stable:** Der Bare-Metal-Updater bewertet den Wiederanlauf erforderlicher Dienste anhand des belegten systemd-Endzustands statt allein anhand eines Zwischen-Rückgabecodes. Nicht installierte optionale Units werden beim verifizierten Maskenrücklauf als legitimer fehlender Zustand behandelt. Echte Start-, Masken- oder Wiederherstellungsfehler bleiben fail-closed; Writer und Aktoren bleiben dann sicher gestoppt. Die EMS-Regelung entspricht unverändert 5.4.2c.
 
@@ -97,7 +97,7 @@ Die aktuelle stabile Version ist **5.4.3f**. Hinweise zum Web-, Konsolen- und Do
 * **Betriebswartung:** Log-Rotation und begrenzte Update-/Installer-Backups reduzieren den Speicherbedarf. Die Rechteprüfung kann bekannte Abweichungen korrigieren; Systemzustand und freier Speicher bleiben zu überwachen.
 
 ### 🔄 Auto-Update & Rollback
-* **Web-Updater:** Freigegebene Stable-Stände lassen sich über das Web-Dashboard (`index.php`) installieren. Der Browser zeigt den Installationsfortschritt; Fehler brechen den Vorgang ab und bleiben diagnostizierbar.
+* **Web-Updater:** Freigegebene Stable-Stände lassen sich über einen argumentlosen, root-eigenen Systemjob im Web-Dashboard (`index.php`) installieren. Der Launcher akzeptiert weder freie Installer-Aktionen noch Pfade, Tags, Reparaturen oder Rückfälle, bindet den veröffentlichten Ausgangsstand und führt den Installer aus einem versiegelten Snapshot aus. Der Browser zeigt den Installationsfortschritt; Fehler brechen den Vorgang ab und bleiben diagnostizierbar.
 * **Optionale Updateprüfung:** Das System kann nachts nach einem freigegebenen Stable-Stand suchen und den geprüften Installerweg starten.
 * **Umgebungsgebundener Rückfall:** Docker kann auf das in `UPDATE_POLICY.json` exakt gebundene Image `v5.3.2b` zurückgesetzt werden. Bare-Metal-Installationen bieten für diesen Altstand keinen Programm-Rückfall an; verifizierte Datei-Backups bleiben wiederherstellbar.
 
@@ -477,7 +477,7 @@ sudo docker compose logs --tail=80 e3dc-control
 > `ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}`. Ohne Eintrag
 > folgt sie dem geprüften Stable-Tag `latest`. Ein fester Versions-Tag wechselt
 > bei `pull` absichtlich nicht; für einen bewussten Pin wird
-> `E3DC_IMAGE_TAG=v5.4.3f` in `.env` gesetzt. `config --images` zeigt vor dem
+> `E3DC_IMAGE_TAG=v5.4.3g` in `.env` gesetzt. `config --images` zeigt vor dem
 > Pull das tatsächlich gewählte Image.
 >
 > Ein fehlgeschlagener `pull` ist ein harter Abbruch. Nach begonnenem

@@ -1,17 +1,16 @@
 # E3DC-Control Installer
 
-Dokumentation Stand: 5.4.3f
+Dokumentation Stand: 5.4.3g
 
 Der Installer verwaltet Bare-Metal-Installation, Update, Rechte, Dienste,
 Backup, Rollback und optionale Produktmodule. Er ermittelt Benutzer, Home,
 Installationspfad und Python-Umgebung aus dem geprüften Installationskontext.
 
-Mit 5.4.3f führt eine frische Bookworm-Installation Paket-, Apache-,
-Konfigurations-, RAM-Disk-, Webportal- und Dienstschritte in einer festen
-Reihenfolge aus. Ein Fehler beendet die Installation mit einer verständlichen
-Meldung und stoppt alle nachfolgenden Pflichtschritte. Ein bereits vorhandener
-funktionierender Zustand wird gebunden zurückgestellt, statt einen
-unvollständigen Stand als erfolgreich zu melden.
+Mit 5.4.3g darf die Weboberfläche das reguläre System-Update wieder über
+einen argumentlosen, root-eigenen Launcher starten. Freie Aktionen, Pfade,
+Tags, Reparaturen, Neuinstallationen und Rückfälle bleiben im Web gesperrt.
+Installationen bis einschließlich 5.4.3f benötigen für diesen einmaligen
+Übergang noch den administrativen Konsolenweg aus [Update.md](Update.md).
 
 Seit 5.4.2d bewertet der Updatepfad den Wiederanlauf erforderlicher Dienste
 anhand des belegten systemd-Endzustands. Nicht installierte optionale Units
@@ -124,7 +123,7 @@ Menü- und Prozess-Exitcode weitergegeben. Ein fehlgeschlagener Schritt wird
 nicht als erfolgreicher Abschluss angezeigt.
 
 Für den einmaligen Wechsel von 5.3.2b auf das aktuelle Stable-Release gilt eine engere
-Startbedingung: ausschließlich Web-Update oder der direkte
+Startbedingung: ausschließlich der direkte administrative
 `sudo /usr/bin/python3 -I -B -u installer_main.py --update-e3dc`-Aufruf aus
 [Update.md](Update.md). Der interaktive Menüpunkt lädt im 5.3.2b-Altprozess
 bereits zusätzliche Module und ist für diesen ersten Hybridwechsel nicht

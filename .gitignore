@@ -137,6 +137,7 @@
 !/Installer/ems_decision_diagnostics.py
 !/Installer/epex_manager.py
 !/Installer/generate_vapid.py
+!/Installer/git_commit_reader.py
 !/Installer/ha_manager.py
 !/Installer/ha_writer_admission.py
 !/Installer/heat_actuator_safety.py
@@ -195,6 +196,7 @@
 !/Installer/secure_file_transaction.py
 !/Installer/service_load_snapshot.py
 !/Installer/service_wrapper.sh
+!/Installer/web_update_launcher.sh
 !/Installer/shadow_sync.py
 !/Installer/sqlite_archiver.py
 !/Installer/status_check.py

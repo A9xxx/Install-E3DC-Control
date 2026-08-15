@@ -9,12 +9,31 @@ Installation, Rechte, Web-Synchronisation sowie Dienststart finalisieren.
 
 from __future__ import annotations
 
+import time as _bootstrap_time
+
+_PROCESS_ENTRY_MONOTONIC = _bootstrap_time.monotonic()
+
+# Veröffentlichte Updater bis einschließlich v5.4.2 starten diesen Zielcode
+# direkt aus dem benutzereigenen Produktverzeichnis und noch ohne ``-I``.
+# Entferne deshalb den Skriptpfad, bevor irgendein nicht eingebautes Modul
+# importiert wird. Zielmodule werden später ausschließlich aus dem gebundenen
+# Ausführungssnapshot wieder explizit in ``sys.path`` aufgenommen.
+import sys as _bootstrap_sys
+
+if __name__ == "__main__":
+    _bootstrap_script_dir = __file__.rpartition("/")[0]
+    _bootstrap_sys.path[:] = [
+        item
+        for item in _bootstrap_sys.path
+        if item not in {"", _bootstrap_script_dir}
+    ]
+
 import argparse
 import fcntl
 import hashlib
-import io
 import inspect
 import os
+import pwd
 import queue
 import re
 import shutil
@@ -22,7 +41,6 @@ import signal
 import stat
 import subprocess
 import sys
-import tarfile
 import tempfile
 import threading
 import time
@@ -33,6 +51,7 @@ from pathlib import Path
 _SNAPSHOT_ROOT_FILES = ("VERSION", "installer_main.py")
 _FINALIZER_FILES = (
     "Installer/__init__.py",
+    "Installer/git_commit_reader.py",
     "Installer/optional_service_contract.py",
     "Installer/release_finalize.py",
     "Installer/update.py",
@@ -45,12 +64,19 @@ _COMPAT_SNAPSHOT_PREFIX = ".e3dc-release-finalizer-compat-"
 _FINALIZER_SUCCESS = "E3DC_RELEASE_TARGET_FINALIZER_OK"
 _TARGET_UPDATER_SUCCESS = "E3DC_RELEASE_TARGET_UPDATER_OK"
 _TARGET_UPDATER_NOOP = "E3DC_RELEASE_TARGET_UPDATER_NOOP"
-_FINALIZER_TIMEOUT_S = 30 * 60
+_LEGACY_BRIDGE_FINALIZER_TIMEOUT_S = 12 * 60
 _FINALIZER_HEARTBEAT_S = 30
 _FINALIZER_TERMINATE_GRACE_S = 10
 _FINALIZER_DIAGNOSTIC_LINES = 512
 _UPDATE_LOCK_PATH = Path("/run/lock/e3dc-control/update.lock")
 _UPDATE_LOCK_ENV = "E3DC_UPDATE_LOCK_FD"
+_COMMIT_READER_PATH = "Installer/git_commit_reader.py"
+_FULL_SHA1_RE = re.compile(r"[0-9a-f]{40}\Z")
+_ACCOUNT_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]*\Z")
+_COMMIT_READER_CACHE: dict[
+    tuple[str, str],
+    tuple[object, object, object],
+] = {}
 
 
 class _DeferredParentSignal(BaseException):
@@ -393,6 +419,21 @@ def _required_update_lock_fd() -> int:
 def _run_compat_finalizer(command, *, environment, pass_fds=()) -> dict:
     """Streamt den mutierenden Alt-Updater-Bridgeprozess mit hartem Zeitlimit."""
 
+    deadline = (
+        _PROCESS_ENTRY_MONOTONIC + _LEGACY_BRIDGE_FINALIZER_TIMEOUT_S
+    )
+    if time.monotonic() >= deadline:
+        return {
+            "returncode": -1,
+            "output": "",
+            "line_counts": {},
+            "timed_out": True,
+            "error": (
+                "Zeitbudget der Kompatibilitätsbrücke war vor dem "
+                "mutierenden Kindprozess erschöpft"
+            ),
+        }
+
     signal_guard = _TerminalSignalGuard()
     signal_guard.install()
     try:
@@ -466,16 +507,24 @@ def _run_compat_finalizer(command, *, environment, pass_fds=()) -> dict:
                     pass
 
     try:
-        while not stream_done or process.poll() is None:
+        while (
+            not stream_done
+            or process.poll() is None
+            or (timed_out and not force_sent)
+        ):
             signal_guard.raise_if_requested()
             now = time.monotonic()
-            if not timed_out and now - started >= _FINALIZER_TIMEOUT_S:
+            if (
+                not timed_out
+                and now >= deadline
+            ):
                 timed_out = True
                 termination_started = now
                 _stop_process_tree(force=False)
                 print(
                     f"[!] Kompatibilitäts-Finalizer überschreitet "
-                    f"{_FINALIZER_TIMEOUT_S} Sekunden; Recovery wird vorbereitet.",
+                    f"{_LEGACY_BRIDGE_FINALIZER_TIMEOUT_S} Sekunden; "
+                    "Recovery wird vorbereitet.",
                     flush=True,
                 )
             elif (
@@ -513,9 +562,16 @@ def _run_compat_finalizer(command, *, environment, pass_fds=()) -> dict:
         # der Kindprozess unter demselben Lock, bis sein mutierender Lauf
         # eindeutig beendet ist. Das reguläre Finalizer-Zeitlimit gilt weiter.
         try:
-            while not stream_done or process.poll() is None:
+            while (
+                not stream_done
+                or process.poll() is None
+                or (timed_out and not force_sent)
+            ):
                 now = time.monotonic()
-                if not timed_out and now - started >= _FINALIZER_TIMEOUT_S:
+                if (
+                    not timed_out
+                    and now >= deadline
+                ):
                     timed_out = True
                     termination_started = now
                     _stop_process_tree(force=False)
@@ -540,6 +596,8 @@ def _run_compat_finalizer(command, *, environment, pass_fds=()) -> dict:
         finally:
             signal_guard.restore()
         raise
+    # Erst der nachgewiesene Prozessabschluss darf den unveränderbaren
+    # 900-Sekunden-Außenprozess der Alt-Updater in deren Recovery entlassen.
     returncode = process.wait()
     reader.join(timeout=1)
     try:
@@ -550,7 +608,8 @@ def _run_compat_finalizer(command, *, environment, pass_fds=()) -> dict:
             "line_counts": dict(line_counts),
             "timed_out": timed_out,
             "error": (
-                f"Zeitlimit von {_FINALIZER_TIMEOUT_S} Sekunden überschritten"
+                "Zeitlimit von "
+                f"{_LEGACY_BRIDGE_FINALIZER_TIMEOUT_S} Sekunden überschritten"
                 if timed_out
                 else ""
             ),
@@ -635,78 +694,386 @@ def _read_regular_nofollow(path: Path, maximum: int = 1024 * 1024) -> bytes:
         os.close(descriptor)
 
 
-def _commit_execution_entries(root: Path, expected_commit: str) -> dict[str, tuple[bytes, int]]:
-    commit = str(expected_commit or "").strip().lower()
-    if not re.fullmatch(r"[0-9a-f]{40}", commit):
-        raise RuntimeError("Erwartete Release-SHA ist ungültig")
+def _bootstrap_repository_reader_user(root: Path) -> str | None:
+    """Bindet Git-Lesezugriffe vor dem Laden des zentralen Commit-Lesers."""
+
+    git_dir = root / ".git"
+    root_metadata = root.lstat()
+    git_metadata = git_dir.lstat()
+    if (
+        not root.is_absolute()
+        or root.resolve(strict=True) != root
+        or root.is_symlink()
+        or not root.is_dir()
+        or git_dir.is_symlink()
+        or not git_dir.is_dir()
+        or root_metadata.st_uid == 0
+        or git_metadata.st_uid != root_metadata.st_uid
+    ):
+        raise RuntimeError(
+            "Git-Repository besitzt vor dem Commit-Leser keine gebundene Eigentümerstruktur"
+        )
     try:
-        result = subprocess.run(
-            [
-                "git", "-c", f"safe.directory={root}", "-c", "tar.umask=0022", "-C", str(root),
-                "archive", "--format=tar", commit, "--",
-                *_SNAPSHOT_ROOT_FILES,
-                "Installer",
-            ],
-            capture_output=True,
-            text=False,
-            timeout=60,
+        account = pwd.getpwuid(root_metadata.st_uid)
+    except KeyError as exc:
+        raise RuntimeError("Git-Repository-Eigentümer fehlt lokal") from exc
+    if not _ACCOUNT_NAME_RE.fullmatch(account.pw_name):
+        raise RuntimeError("Git-Repository-Eigentümer besitzt keinen sicheren Namen")
+    if os.geteuid() == root_metadata.st_uid:
+        return None
+    if os.geteuid() != 0:
+        raise RuntimeError(
+            "Commit-Leser-Bootstrap läuft weder als Root noch als Repository-Eigentümer"
+        )
+    return account.pw_name
+
+
+def _bootstrap_git_command(
+    root: Path,
+    *arguments: str,
+    run_as_user: str | None,
+) -> list[str]:
+    """Erzeugt den festen, konfigurationsfreien Git-Objektleser."""
+
+    if run_as_user is None:
+        prefix = ["/usr/bin/env", "-i"]
+    else:
+        user = str(run_as_user or "").strip()
+        if not _ACCOUNT_NAME_RE.fullmatch(user):
+            raise RuntimeError("Commit-Lese-Benutzer ist ungültig")
+        try:
+            account = pwd.getpwnam(user)
+        except KeyError as exc:
+            raise RuntimeError("Commit-Lese-Benutzer fehlt lokal") from exc
+        if account.pw_uid == 0:
+            raise RuntimeError("Commit-Lese-Benutzer darf nicht Root sein")
+        prefix = [
+            "/usr/bin/sudo",
+            "-n",
+            "-H",
+            "-u",
+            user,
+            "--",
+            "/usr/bin/env",
+            "-i",
+        ]
+    return [
+        *prefix,
+        "PATH=/usr/bin:/bin",
+        "HOME=/nonexistent",
+        "XDG_CONFIG_HOME=/nonexistent",
+        "LANG=C",
+        "LC_ALL=C",
+        "GIT_CONFIG_NOSYSTEM=1",
+        "GIT_CONFIG_SYSTEM=/dev/null",
+        "GIT_CONFIG_GLOBAL=/dev/null",
+        "GIT_ATTR_NOSYSTEM=1",
+        "GIT_NO_REPLACE_OBJECTS=1",
+        "GIT_OPTIONAL_LOCKS=0",
+        "GIT_TERMINAL_PROMPT=0",
+        "GIT_ASKPASS=/bin/false",
+        "SSH_ASKPASS=/bin/false",
+        "GIT_ALLOW_PROTOCOL=https",
+        "/usr/bin/git",
+        "--no-replace-objects",
+        "-c",
+        f"safe.directory={root}",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.untrackedCache=false",
+        "-c",
+        "core.attributesFile=/dev/null",
+        "-c",
+        "credential.helper=",
+        "-c",
+        "core.askPass=/bin/false",
+        "-c",
+        "protocol.ext.allow=never",
+        "-c",
+        "protocol.file.allow=never",
+        f"--git-dir={root / '.git'}",
+        f"--work-tree={root}",
+        *arguments,
+    ]
+
+
+def _bootstrap_run_git(
+    root: Path,
+    *arguments: str,
+    run_as_user: str | None,
+    input_bytes: bytes | None = None,
+    timeout: int = 30,
+) -> subprocess.CompletedProcess[bytes]:
+    try:
+        return subprocess.run(
+            _bootstrap_git_command(
+                root,
+                *arguments,
+                run_as_user=run_as_user,
+            ),
+            input=input_bytes,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise RuntimeError("Target-Commit konnte den Ausführungssnapshot nicht binden") from exc
-    if result.returncode != 0:
-        raise RuntimeError("Target-Commit enthält keinen eindeutigen Ausführungssnapshot")
-    archive = bytes(result.stdout or b"")
-    if not archive or len(archive) > _SNAPSHOT_MAX_TOTAL_BYTES + (16 * 1024 * 1024):
-        raise RuntimeError("Target-Commit besitzt eine unzulässige Snapshot-Archivgröße")
+        raise RuntimeError("Commit-Leser-Bootstrap konnte Git nicht ausführen") from exc
 
-    entries: dict[str, tuple[bytes, int]] = {}
-    total = 0
+
+def _bootstrap_read_object(
+    root: Path,
+    object_id: str,
+    expected_type: bytes,
+    *,
+    run_as_user: str | None,
+    maximum_bytes: int,
+) -> bytes:
+    """Liest genau ein Git-Objekt und prüft seine SHA-1 selbst."""
+
+    if not _FULL_SHA1_RE.fullmatch(object_id):
+        raise RuntimeError("Commit-Leser-Bootstrap erhielt keine volle Objekt-ID")
+    completed = _bootstrap_run_git(
+        root,
+        "cat-file",
+        "--batch",
+        run_as_user=run_as_user,
+        input_bytes=object_id.encode("ascii") + b"\n",
+        timeout=30,
+    )
+    if completed.returncode != 0:
+        detail = bytes(completed.stderr or b"").decode(
+            "utf-8", errors="replace"
+        ).strip()
+        raise RuntimeError(
+            "Commit-Leser-Bootstrap konnte ein Git-Objekt nicht lesen: "
+            + detail[-500:]
+        )
+    output = bytes(completed.stdout or b"")
+    header, separator, remainder = output.partition(b"\n")
     try:
-        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as bundle:
-            for member in bundle.getmembers():
-                relative_path = str(member.name or "").rstrip("/")
-                if not relative_path:
-                    continue
-                if (
-                    relative_path.startswith("/")
-                    or "\\" in relative_path
-                    or any(part in {"", ".", ".."} for part in Path(relative_path).parts)
-                    or not (
-                        relative_path in _SNAPSHOT_ROOT_FILES
-                        or relative_path == "Installer"
-                        or relative_path.startswith("Installer/")
-                    )
-                ):
-                    raise RuntimeError("Target-Commit enthält einen unzulässigen Snapshotpfad")
-                if member.isdir():
-                    continue
-                if not member.isfile() or member.islnk() or member.issym():
-                    raise RuntimeError("Target-Commit enthält keinen regulären Snapshot-Blob")
-                if relative_path in entries or stat.S_IMODE(member.mode) not in {0o644, 0o755}:
-                    raise RuntimeError("Target-Commit enthält einen doppelten oder unzulässigen Snapshot-Blob")
-                if member.size < 0 or member.size > _SNAPSHOT_MAX_FILE_BYTES:
-                    raise RuntimeError("Target-Commit enthält einen zu großen Snapshot-Blob")
-                source = bundle.extractfile(member)
-                if source is None:
-                    raise RuntimeError("Target-Commit konnte einen Snapshot-Blob nicht lesen")
-                payload = source.read(_SNAPSHOT_MAX_FILE_BYTES + 1)
-                if len(payload) != member.size:
-                    raise RuntimeError("Target-Commit besitzt eine driftende Snapshot-Blobgröße")
-                total += len(payload)
-                if len(entries) >= _SNAPSHOT_MAX_FILES or total > _SNAPSHOT_MAX_TOTAL_BYTES:
-                    raise RuntimeError("Target-Commit überschreitet die feste Snapshotgröße")
-                entries[relative_path] = (
-                    payload,
-                    0o555 if stat.S_IMODE(member.mode) & 0o111 else 0o444,
-                )
-    except (tarfile.TarError, OSError) as exc:
-        raise RuntimeError("Target-Commit besitzt kein gültiges Snapshot-Archiv") from exc
+        raw_id, object_type, raw_size = header.split(b" ", 2)
+        actual_id = raw_id.decode("ascii")
+        size = int(raw_size)
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise RuntimeError(
+            "Commit-Leser-Bootstrap erhielt keine eindeutige Objektantwort"
+        ) from exc
+    if (
+        separator != b"\n"
+        or actual_id != object_id
+        or object_type != expected_type
+        or size < 1
+        or size > maximum_bytes
+        or len(remainder) != size + 1
+        or remainder[-1:] != b"\n"
+    ):
+        raise RuntimeError("Commit-Leser-Bootstrap erhielt ein unzulässiges Git-Objekt")
+    payload = remainder[:-1]
+    digest = hashlib.new(
+        "sha1",
+        expected_type + b" " + str(size).encode("ascii") + b"\0" + payload,
+        usedforsecurity=False,
+    ).hexdigest()
+    if digest != object_id:
+        raise RuntimeError(
+            "Commit-Leser-Bootstrap erkannte eine abweichende Objekt-ID"
+        )
+    return payload
 
-    required = set(_SNAPSHOT_ROOT_FILES) | set(_FINALIZER_FILES)
-    if not required.issubset(entries):
-        raise RuntimeError("Target-Commit enthält keinen vollständigen Finalizer-Snapshot")
+
+def _bootstrap_parse_tree(payload: bytes) -> dict[bytes, tuple[str, str]]:
+    """Parst einen kryptographisch gebundenen Git-Baum ohne Arbeitsbaumfilter."""
+
+    entries: dict[bytes, tuple[str, str]] = {}
+    folded_names: set[str] = set()
+    offset = 0
+    while offset < len(payload):
+        separator = payload.find(b" ", offset)
+        terminator = payload.find(b"\0", separator + 1)
+        if (
+            separator <= offset
+            or terminator <= separator + 1
+            or terminator + 21 > len(payload)
+        ):
+            raise RuntimeError("Commit-Leser-Bootstrap erhielt keinen kanonischen Git-Baum")
+        raw_mode = payload[offset:separator]
+        raw_name = payload[separator + 1 : terminator]
+        raw_oid = payload[terminator + 1 : terminator + 21]
+        try:
+            mode = raw_mode.decode("ascii")
+            name = raw_name.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise RuntimeError(
+                "Commit-Leser-Bootstrap erhielt keinen UTF-8-Baumpfad"
+            ) from exc
+        folded = name.casefold()
+        if (
+            mode not in {"40000", "100644", "100755"}
+            or not raw_name
+            or b"/" in raw_name
+            or raw_name in {b".", b".."}
+            or any(ord(character) < 32 or ord(character) == 127 for character in name)
+            or folded in folded_names
+            or raw_name in entries
+        ):
+            raise RuntimeError(
+                "Commit-Leser-Bootstrap erhielt einen mehrdeutigen Git-Baumeintrag"
+            )
+        entries[raw_name] = (mode, raw_oid.hex())
+        folded_names.add(folded)
+        offset = terminator + 21
+    if offset != len(payload):
+        raise RuntimeError("Commit-Leser-Bootstrap erhielt überzählige Baumdaten")
     return entries
+
+
+def _bootstrap_commit_reader_payload(
+    root: Path,
+    expected_commit: str,
+) -> bytes:
+    """Bindet den neuen Helper aus dem Zielcommit, nie aus dem Produktbaum."""
+
+    commit = str(expected_commit or "").strip().lower()
+    if not _FULL_SHA1_RE.fullmatch(commit):
+        raise RuntimeError("Erwartete Release-SHA ist für den Commit-Leser ungültig")
+    reader_user = _bootstrap_repository_reader_user(root)
+    object_format = _bootstrap_run_git(
+        root,
+        "rev-parse",
+        "--show-object-format",
+        run_as_user=reader_user,
+        timeout=15,
+    )
+    if object_format.returncode != 0 or object_format.stdout.strip() != b"sha1":
+        raise RuntimeError("Git-Repository verwendet nicht das gebundene SHA-1-Objektformat")
+    replace_refs = _bootstrap_run_git(
+        root,
+        "for-each-ref",
+        "--format=%(refname)",
+        "refs/replace/",
+        run_as_user=reader_user,
+        timeout=15,
+    )
+    if replace_refs.returncode != 0 or replace_refs.stdout.strip():
+        raise RuntimeError("Git-Repository enthält Replace-Refs")
+    grafts = root / ".git" / "info" / "grafts"
+    if grafts.exists() or grafts.is_symlink():
+        raise RuntimeError("Git-Repository enthält eine Legacy-Graft-Datei")
+
+    commit_payload = _bootstrap_read_object(
+        root,
+        commit,
+        b"commit",
+        run_as_user=reader_user,
+        maximum_bytes=16 * 1024 * 1024,
+    )
+    first_line = commit_payload.split(b"\n", 1)[0]
+    if not first_line.startswith(b"tree "):
+        raise RuntimeError("Release-Commit besitzt keinen gebundenen Wurzelbaum")
+    try:
+        root_tree_id = first_line[5:].decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise RuntimeError("Release-Wurzelbaum besitzt keine ASCII-Objekt-ID") from exc
+    if not _FULL_SHA1_RE.fullmatch(root_tree_id):
+        raise RuntimeError("Release-Wurzelbaum besitzt keine volle Objekt-ID")
+    root_tree = _bootstrap_parse_tree(
+        _bootstrap_read_object(
+            root,
+            root_tree_id,
+            b"tree",
+            run_as_user=reader_user,
+            maximum_bytes=16 * 1024 * 1024,
+        )
+    )
+    installer_entry = root_tree.get(b"Installer")
+    if installer_entry is None or installer_entry[0] != "40000":
+        raise RuntimeError("Release-Commit besitzt keinen gebundenen Installer-Baum")
+    installer_tree = _bootstrap_parse_tree(
+        _bootstrap_read_object(
+            root,
+            installer_entry[1],
+            b"tree",
+            run_as_user=reader_user,
+            maximum_bytes=16 * 1024 * 1024,
+        )
+    )
+    helper_entry = installer_tree.get(b"git_commit_reader.py")
+    if helper_entry is None or helper_entry[0] not in {"100644", "100755"}:
+        raise RuntimeError(
+            "Release-Commit besitzt keinen regulären gebundenen Git-Commit-Leser"
+        )
+    return _bootstrap_read_object(
+        root,
+        helper_entry[1],
+        b"blob",
+        run_as_user=reader_user,
+        maximum_bytes=_SNAPSHOT_MAX_FILE_BYTES,
+    )
+
+
+def _commit_reader_api(
+    root: Path,
+    expected_commit: str,
+) -> tuple[object, object, object]:
+    """Lädt Commit-Leser-Code erst nach Objektbindung direkt in den Speicher."""
+
+    commit = str(expected_commit or "").strip().lower()
+    cache_key = (str(root), commit)
+    cached = _COMMIT_READER_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    payload = _bootstrap_commit_reader_payload(root, commit)
+    module_name = f"_e3dc_bound_git_commit_reader_{commit}"
+    namespace = {
+        "__builtins__": __builtins__,
+        "__file__": f"<git:{commit}:{_COMMIT_READER_PATH}>",
+        "__name__": module_name,
+        "__package__": None,
+    }
+    try:
+        code = compile(
+            payload,
+            namespace["__file__"],
+            "exec",
+            dont_inherit=True,
+            optimize=0,
+        )
+        exec(code, namespace)
+    except Exception as exc:
+        raise RuntimeError(
+            "Gebundener Git-Commit-Leser konnte nicht geladen werden"
+        ) from exc
+    api = (
+        namespace.get("read_commit_entries"),
+        namespace.get("repository_git_reader_user"),
+        namespace.get("run_isolated_git"),
+    )
+    if not all(callable(item) for item in api):
+        raise RuntimeError("Gebundener Git-Commit-Leser besitzt keine vollständige API")
+    _COMMIT_READER_CACHE[cache_key] = api
+    return api
+
+
+def _commit_execution_entries(root: Path, expected_commit: str) -> dict[str, tuple[bytes, int]]:
+    required = set(_SNAPSHOT_ROOT_FILES) | set(_FINALIZER_FILES)
+    read_commit_entries, repository_git_reader_user, _run_isolated_git = (
+        _commit_reader_api(root, expected_commit)
+    )
+    reader_user = repository_git_reader_user(root)
+    return read_commit_entries(
+        root,
+        str(expected_commit or "").strip().lower(),
+        (*_SNAPSHOT_ROOT_FILES, "Installer"),
+        required_paths=required,
+        run_as_user=reader_user,
+        maximum_files=_SNAPSHOT_MAX_FILES,
+        maximum_file_bytes=_SNAPSHOT_MAX_FILE_BYTES,
+        maximum_total_bytes=_SNAPSHOT_MAX_TOTAL_BYTES,
+    )
 
 
 def _file_identity(metadata: os.stat_result) -> tuple[int, ...]:
@@ -750,6 +1117,9 @@ def _bind_legacy_product_invocation(
         raise RuntimeError("Direkter Target-Finalizer besitzt einen widersprüchlichen Bootstrap-Kontext")
 
     entries = _commit_execution_entries(root, args.expected_release_sha)
+    _read_entries, repository_git_reader_user, run_isolated_git = (
+        _commit_reader_api(root, args.expected_release_sha)
+    )
     version_bytes = _read_regular_nofollow(root / "VERSION", maximum=256)
     if version_bytes != entries["VERSION"][0]:
         raise RuntimeError("Produktversion weicht vom freigegebenen Ziel-Commit ab")
@@ -764,23 +1134,15 @@ def _bind_legacy_product_invocation(
     ):
         raise RuntimeError("Release-Tag und Produktversion sind nicht kohärent")
 
-    head = subprocess.run(
-        [
-            "git",
-            "-c",
-            f"safe.directory={root}",
-            "-C",
-            str(root),
-            "rev-parse",
-            "--verify",
-            "HEAD^{commit}",
-        ],
-        capture_output=True,
-        text=True,
+    head = run_isolated_git(
+        root,
+        "rev-parse",
+        "--verify",
+        "HEAD^{commit}",
+        run_as_user=repository_git_reader_user(root),
         timeout=15,
-        check=False,
     )
-    actual_head = str(head.stdout or "").strip().lower()
+    actual_head = bytes(head.stdout or b"").decode("ascii", errors="strict").strip().lower()
     if head.returncode != 0 or actual_head != args.expected_release_sha.lower():
         raise RuntimeError("Direkter Target-Finalizer sieht nicht den freigegebenen Ziel-Commit")
 
@@ -1645,24 +2007,82 @@ def _main_with_update_lock(
     ):
         raise RuntimeError("Installer.update wurde nicht aus dem versiegelten Snapshot geladen")
 
-    finalize_release_from_target(
-        repo_dir=root_text,
-        execution_root=execution_text,
-        target_commit=args.expected_release_sha,
-        target_tag=args.expected_release_tag,
-        expected_role=args.expected_ha_role,
-        expected_config_state=args.expected_config_state,
-        expected_config_sha256=args.expected_config_sha256,
-        expected_units_sha256=args.expected_units_sha256,
-        expected_legacy_activity=args.expected_legacy_activity,
-        expected_venv_state=args.expected_venv_state,
-        expected_venv_path=args.expected_venv_path,
-        headless=True,
+    from Installer import web_installer as web_installer_module  # pylint: disable=import-outside-toplevel
+    if (
+        Path(os.path.abspath(str(getattr(web_installer_module, "__file__", "")))).parent.parent
+        != execution_root
+    ):
+        raise RuntimeError("Installer.web_installer wurde nicht aus dem versiegelten Snapshot geladen")
+
+    # Der Ziel-Finalizer kann zusätzlich zur kanonischen sudoers-Datei alte,
+    # eindeutig E3DC-eigene Fragmente bereinigen. Veröffentlichte äußere
+    # Updater kennen diese dynamische Zielmenge noch nicht zwingend. Deshalb
+    # bindet der versiegelte Zielprozess alle tatsächlich berührbaren
+    # privilegierten Webflächen selbst und stellt sie bei jedem späteren
+    # Finalizerfehler vollständig wieder her.
+    sudoers_findings = web_installer_module.sudoers_file_findings()
+    privileged_paths = {
+        web_installer_module.SERVICE_WRAPPER,
+        web_installer_module.WEB_UPDATE_LAUNCHER,
+        web_installer_module.SUDOERS_FILE,
+    }
+    privileged_paths.update(
+        Path(str(item.get("file") or ""))
+        for item in sudoers_findings.get("repairable_lines", [])
+        if str(item.get("file") or "")
     )
-    # Der Berechtigungsdurchlauf darf ausschließlich den gebundenen
-    # Produktbaum verändern. Der privilegierte Ausführungssnapshot muss über
-    # den gesamten Finalizer-Lauf byte- und modusidentisch bleiben.
-    _bind_execution_snapshot(execution_root, root, args.expected_release_sha)
+    privileged_preimages = [
+        web_installer_module._capture_file_preimage(path)
+        for path in sorted(privileged_paths, key=lambda item: str(item))
+    ]
+
+    try:
+        finalize_release_from_target(
+            repo_dir=root_text,
+            execution_root=execution_text,
+            target_commit=args.expected_release_sha,
+            target_tag=args.expected_release_tag,
+            expected_role=args.expected_ha_role,
+            expected_config_state=args.expected_config_state,
+            expected_config_sha256=args.expected_config_sha256,
+            expected_units_sha256=args.expected_units_sha256,
+            expected_legacy_activity=args.expected_legacy_activity,
+            expected_venv_state=args.expected_venv_state,
+            expected_venv_path=args.expected_venv_path,
+            headless=True,
+            privileged_preimages=privileged_preimages,
+        )
+        # Der Berechtigungsdurchlauf darf ausschließlich den gebundenen
+        # Produktbaum verändern. Der privilegierte Ausführungssnapshot muss
+        # über den gesamten Finalizer-Lauf byte- und modusidentisch bleiben.
+        _bind_execution_snapshot(execution_root, root, args.expected_release_sha)
+    except BaseException as original_error:
+        try:
+            restored = web_installer_module._restore_preimages(privileged_preimages)
+            syntax = subprocess.run(
+                ["/usr/sbin/visudo", "-cf", "/etc/sudoers"],
+                cwd="/",
+                env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C", "LC_ALL": "C"},
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=30,
+                check=False,
+            )
+            if not bool(restored.get("success")) or syntax.returncode != 0:
+                detail = bytes(syntax.stderr or syntax.stdout or b"").decode(
+                    "utf-8", errors="replace"
+                ).strip()
+                raise RuntimeError(
+                    "Privilegierte Ziel-Preimages konnten nach dem Finalizerfehler "
+                    "nicht vollständig wiederhergestellt werden: " + detail[-1000:]
+                )
+        except Exception as recovery_error:
+            raise RuntimeError(
+                "Target-Finalizer und privilegierter Rückweg sind fehlgeschlagen: "
+                f"{recovery_error}"
+            ) from original_error
+        raise
     print(
         f"{TARGET_FINALIZER_SUCCESS} "
         f"{args.expected_release_sha} {args.expected_release_tag}"

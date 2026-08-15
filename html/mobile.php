@@ -1361,11 +1361,8 @@ if (in_array($seite, $protectedPages) && !isWebAuthenticated()) {
                 </div>
                 <?php if (!$isDocker): ?>
                     <div class="d-grid gap-2 mt-3">
-                        <button id="btn-update-installer" class="btn btn-outline-info w-100 py-3 rounded-4 fw-bold shadow-sm" onclick="startInstallerUpdate()" title="Aktualisiert die Weboberfläche und Diagramme">
-                            <i class="fas fa-magic me-2"></i>Web-UI Update <span id="update-badge-installer" class="badge bg-danger ms-1" style="display:none;">!</span>
-                        </button>
-                        <button id="btn-update-mobile-system" class="btn btn-outline-warning w-100 py-3 rounded-4 fw-bold shadow-sm" onclick="startSystemUpdate('btn-update-mobile-system')" title="Aktualisiert E3DC-Control über den Installer">
-                            <i class="fas fa-sync-alt me-2"></i>System Update
+                        <button id="btn-update-installer" class="btn btn-outline-info w-100 py-3 rounded-4 fw-bold shadow-sm" onclick="startInstallerUpdate()" title="Aktualisiert E3DC-Control über den sicheren Systemjob">
+                            <i class="fas fa-sync-alt me-2"></i>System Update <span id="update-badge-installer" class="badge bg-danger ms-1" style="display:none;">!</span>
                         </button>
                     </div>
                 <?php else: ?>

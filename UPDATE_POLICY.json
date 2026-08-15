@@ -1,9 +1,9 @@
 {
-  "version": "5.4.3f",
+  "version": "5.4.3g",
   "min_version": "4.0.0",
-  "stable_release": "v5.4.3f",
-  "release_date": "2026-08-15",
-  "description": "v5.4.3f - Wartungsrelease für Update, Erstinstallation, Wallbox und Direktvermarktung",
+  "stable_release": "v5.4.3g",
+  "release_date": "2026-08-16",
+  "description": "v5.4.3g - Sicheres Web-Update und Matter-Härtung",
   "installer_requires": "python3",
   "sanitized_republication": false,
   "history_transition": {

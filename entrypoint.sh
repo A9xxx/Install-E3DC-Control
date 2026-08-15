@@ -686,8 +686,36 @@ nohup $PYTHON_EXEC notification_manager.py > /var/www/html/logs/notification_man
 # Matter Bridge (optional, read-only Statusendpunkte)
 if optional_service_selected "e3dc-matter-bridge"; then
     echo "-> Starte D-Bus und Avahi für Matter mDNS..."
-    service dbus start >/dev/null 2>&1 || true
-    service avahi-daemon start >/dev/null 2>&1 || true
+    if ! service dbus start >/dev/null 2>&1 \
+        || [ ! -S /run/dbus/system_bus_socket ]; then
+        echo "-> FEHLER: D-Bus konnte für Matter nicht sicher gestartet werden."
+        exit 1
+    fi
+    if [ ! -x /usr/sbin/avahi-daemon ]; then
+        echo "-> FEHLER: Avahi-Daemon fehlt; Matter mDNS bleibt gestoppt."
+        exit 1
+    fi
+    /usr/sbin/avahi-daemon -s &
+    AVAHI_PID=$!
+    AVAHI_READY=0
+    for _avahi_wait in $(seq 1 25); do
+        if ! kill -0 "$AVAHI_PID" 2>/dev/null; then
+            echo "-> FEHLER: Avahi endete vor dem mDNS-Bereitschaftsnachweis."
+            wait "$AVAHI_PID" || true
+            exit 1
+        fi
+        if /usr/sbin/avahi-daemon --check >/dev/null 2>&1; then
+            AVAHI_READY=1
+            break
+        fi
+        sleep 0.2
+    done
+    if [ "$AVAHI_READY" -ne 1 ]; then
+        echo "-> FEHLER: Avahi lieferte keinen mDNS-Bereitschaftsnachweis."
+        kill "$AVAHI_PID" 2>/dev/null || true
+        wait "$AVAHI_PID" || true
+        exit 1
+    fi
     echo "   -> Matter Bridge aktiv."
     nohup runuser -u www-data -- sh -c "cd '$MATTER_DIR' && exec npm run start" \
         > /var/www/html/logs/matter_bridge.log 2>&1 &

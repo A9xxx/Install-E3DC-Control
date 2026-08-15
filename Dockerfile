@@ -65,17 +65,28 @@ RUN echo '{"install_user": "root", "home_dir": "/app", "install_path": "/app/pi/
 # Der gebackene Entrypoint delegiert beim Start an /app/pi/Install/entrypoint.sh,
 # sobald dort Projektcode liegt. Mit Dev-Volume gewinnt der Host-Code, sonst
 # gewinnt der im Image enthaltene Release-Code.
-COPY entrypoint.sh /usr/local/bin/
+COPY --chown=root:root --chmod=0555 entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY --chown=root:root --chmod=0555 Installer/docker_healthcheck.py /usr/local/bin/e3dc-docker-healthcheck
 COPY --chown=root:root --chmod=0555 Installer/docker_logrotate_manager.py /usr/local/bin/e3dc-docker-logrotate
 COPY --chown=root:root --chmod=0644 Installer/docker-logrotate.conf /etc/logrotate.d/e3dc-control
-RUN chmod +x /usr/local/bin/entrypoint.sh && \
+RUN test "$(stat -c '%u:%g:%a' /usr/local/bin/entrypoint.sh)" = "0:0:555" && \
     ln -sf /usr/local/bin/entrypoint.sh /app/entrypoint.sh
 
 # 6. Anwendungscode für Production-/Image-only-Docker.
 # Entwicklungsumgebungen dürfen /app/pi/Install weiterhin per Volume überlagern.
-COPY . /app/pi/Install/
-RUN test -f /app/pi/Install/Installer/matter/package-lock.json && \
+COPY --chown=root:root . /app/pi/Install/
+RUN find -P /app/pi/Install -xdev -type d -exec chmod 0755 -- {} + && \
+    find -P /app/pi/Install -xdev -type f -exec chmod 0644 -- {} + && \
+    chmod 0755 \
+        /app/pi/Install/entrypoint.sh \
+        /app/pi/Install/e3dc-bootstrap \
+        /app/pi/Install/e3dc-setup \
+        /app/pi/Install/installer_main.py \
+        /app/pi/Install/Installer/installer_wrapper.sh \
+        /app/pi/Install/Installer/service_wrapper.sh \
+        /app/pi/Install/Installer/web_update_launcher.sh && \
+    find -P /app/pi/Install/Installer -xdev -type f -name "*.py" -exec chmod 0755 -- {} + && \
+    test -f /app/pi/Install/Installer/matter/package-lock.json && \
     test -f /app/pi/Install/Installer/apache/e3dc-control-security.conf && \
     test -f /app/pi/Install/Installer/apache/e3dc-control-access-log.conf && \
     test -f /app/pi/Install/Installer/Storage/process_singleton.py && \
@@ -102,8 +113,16 @@ RUN test -f /app/pi/Install/Installer/matter/package-lock.json && \
     npm ci --omit=dev --ignore-scripts && \
     chown -R root:root /app/pi/Install/Installer/matter/node_modules && \
     test -z "$(find /app/pi/Install/Installer/matter/node_modules \( ! -uid 0 -o ! -gid 0 \) -print -quit)" && \
-    chmod +x /app/pi/Install/entrypoint.sh && \
-    find /app/pi/Install/Installer -name "*.py" -exec chmod 755 {} \;
+    find -P /app/pi/Install/Installer/matter/node_modules -xdev \( -type f -o -type d \) -exec chmod go-w -- {} + && \
+    test -x /app/pi/Install/entrypoint.sh && \
+    test -x /app/pi/Install/e3dc-bootstrap && \
+    test -x /app/pi/Install/e3dc-setup && \
+    test -x /app/pi/Install/installer_main.py && \
+    test -x /app/pi/Install/Installer/installer_wrapper.sh && \
+    test -x /app/pi/Install/Installer/service_wrapper.sh && \
+    test -x /app/pi/Install/Installer/web_update_launcher.sh && \
+    test -z "$(find -P /app/pi/Install -xdev \( ! -uid 0 -o ! -gid 0 \) -print -quit)" && \
+    test -z "$(find -P /app/pi/Install -xdev \( -type f -o -type d \) -perm /0022 -print -quit)"
 
 WORKDIR /app/pi/Install
 

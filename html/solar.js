@@ -5675,8 +5675,8 @@ function hasExactSameReleaseEvidence(data) {
         && headSha === targetSha;
 }
 
-function startInstallerUpdate() {
-    const btn = document.getElementById('btn-update-installer');
+function startInstallerUpdate(btnId = 'btn-update-installer') {
+    const btn = document.getElementById(btnId);
     let origText = '';
     if(btn) {
         origText = btn.innerHTML;
@@ -5685,7 +5685,7 @@ function startInstallerUpdate() {
     }
 
     e3dcPostAction('action=check_self_update&force=1&t=' + Date.now())
-        .then(r => e3dcParseJsonResponse(r, 'Web-UI Update-Check'))
+        .then(r => e3dcParseJsonResponse(r, 'System-Update-Check'))
         .then(data => {
             if (data && data.docker) {
                 const message = data.message
@@ -5694,38 +5694,38 @@ function startInstallerUpdate() {
                 if (btn) { btn.innerHTML = origText; btn.disabled = false; }
                 return;
             }
-            const missing = Number(data && data.missing);
-            const sameRelease = hasExactSameReleaseEvidence(data);
-            let question = "Möchtest du das Web-Interface & Diagramm-Skripte aktualisieren?";
-            if (sameRelease) {
-                question = "Das Web-Interface ist bereits auf dem aktuellen Stand.\n\n"
-                    + "Ein erzwungenes Neuinstallieren kopiert die Release-Dateien erneut ins Webroot und überschreibt lokale Live-Hotfixes.\n\n"
-                    + "Trotzdem neu installieren?";
-            } else if (data && data.success && Number.isFinite(missing) && missing > 0) {
-                question = `Es sind ${missing} Web-UI Update(s) verfügbar.\nJetzt installieren?`;
-            }
-            if (!confirm(question)) {
+            if (!data || data.success !== true) {
+                alert("Der System-Update-Check ist fehlgeschlagen:\n"
+                    + ((data && (data.error || data.message)) || "Unbekannter Fehler")
+                    + "\n\nDas Update wurde nicht gestartet.");
                 if (btn) { btn.innerHTML = origText; btn.disabled = false; }
                 return;
             }
-            startInstallerUpdateRun(
-                btn,
-                origText,
-                sameRelease
-            );
-        })
-        .catch(err => {
-            const question = "Der Web-UI Update-Check ist fehlgeschlagen:\n" + err.message
-                + "\n\nTrotzdem Update starten? Das kann lokale Live-Hotfixes überschreiben.";
+            const missing = Number(data && data.missing);
+            const sameRelease = hasExactSameReleaseEvidence(data);
+            if (sameRelease) {
+                alert("E3DC-Control ist bereits auf dem veröffentlichten aktuellen Stand.\n\nEine Neuinstallation derselben Version bleibt im Web gesperrt und ist nur administrativ möglich.");
+                if (btn) { btn.innerHTML = origText; btn.disabled = false; }
+                return;
+            }
+            let question = "Möchtest Du E3DC-Control auf den veröffentlichten Stable-Stand aktualisieren?";
+            if (data && data.success && Number.isFinite(missing) && missing > 0) {
+                question = `Es sind ${missing} System-Update(s) verfügbar.\nJetzt installieren?`;
+            }
             if (!confirm(question)) {
                 if (btn) { btn.innerHTML = origText; btn.disabled = false; }
                 return;
             }
             startInstallerUpdateRun(btn, origText);
+        })
+        .catch(err => {
+            alert("Der System-Update-Check ist fehlgeschlagen:\n" + err.message
+                + "\n\nDas Update wurde nicht gestartet.");
+            if (btn) { btn.innerHTML = origText; btn.disabled = false; }
         });
 }
 
-function startInstallerUpdateRun(btn, origText, reinstallCurrent = false) {
+function startInstallerUpdateRun(btn, origText) {
     if(btn) {
         btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Starte...';
         btn.disabled = true;
@@ -5740,29 +5740,21 @@ function startInstallerUpdateRun(btn, origText, reinstallCurrent = false) {
     const closeBtn = document.getElementById('update-close-btn');
     const finishBtn = document.getElementById('update-finish-btn');
 
-    if (title) {
-        title.innerText = reinstallCurrent
-            ? "Aktuelle Version neu installieren"
-            : "Web-UI Update";
-    }
-    if (log) {
-        log.innerText = reinstallCurrent
-            ? "Starte ausdrücklich bestätigte Neuinstallation...\n"
-            : "Starte Web-UI Update...\n";
-    }
+    if (title) title.innerText = "System Update";
+    if (log) log.innerText = "Starte System Update...\n";
     if (spinner) spinner.className = "fas fa-sync fa-spin me-2";
     if (closeBtn) closeBtn.style.display = 'none';
     if (finishBtn) {
         finishBtn.disabled = true;
-        finishBtn.innerText = "Schliessen";
+        finishBtn.innerText = "Schließen";
         finishBtn.onclick = null;
     }
     if (modal) modal.show();
 
     e3dcPostAction('action=run_self_update&t=' + Date.now(), {
-        reinstall: reinstallCurrent ? '1' : '0'
+        reinstall: '0'
     })
-    .then(r => e3dcParseJsonResponse(r, 'Web-UI Update-Start'))
+    .then(r => e3dcParseJsonResponse(r, 'System-Update-Start'))
     .then(data => {
         if (data && data.success) {
             if (log) log.innerText = (data.message || "Update gestartet.") + "\nWarte auf Log-Ausgabe...\n";
@@ -5810,7 +5802,7 @@ function e3dcClassifyInstallerUpdatePoll(data) {
     const completionSucceeded = payload.completion === "success";
     const completionFailed = payload.completion === "failed";
     const abortedFound = logText.includes("Vorgang abgebrochen");
-    const errorFound = /(traceback|exception|critical|fatal|permission denied|REPAIR_REQUIRED|\[!\]\s+self-update fehlgeschlagen|self-update fehlgeschlagen:|web-update kann nicht starten|konnte update-prozess nicht starten)/i.test(logText);
+    const errorFound = /(traceback|exception|critical|fatal|permission denied|REPAIR_REQUIRED|\[!\]\s+(?:self-update|web-update) fehlgeschlagen|self-update fehlgeschlagen:|web-update kann nicht starten|konnte update-prozess nicht starten)/i.test(logText);
     const successFound = !running &&
                          !exitFailed &&
                          !completionFailed &&
@@ -5901,22 +5893,22 @@ function pollInstallerUpdate(log, spinner, closeBtn, finishBtn, btn, origText) {
                     }
                     if (log) {
                         if (ok) {
-                            log.innerText += "\n\n[OK] Web-UI Update beendet. Bitte Seite neu laden.";
+                            log.innerText += "\n\n[OK] System Update beendet. Bitte Seite neu laden.";
                         } else if (abortedFound) {
-                            log.innerText += "\n\n[INFO] Web-UI Update wurde abgebrochen.";
+                            log.innerText += "\n\n[INFO] System Update wurde abgebrochen.";
                         } else if (tick >= maxPollTicks) {
                             log.innerText += "\n\n[HINWEIS] Die Weboberfläche beendet das Polling nach 60 Minuten. "
                                 + "Der Updateprozess wird dadurch nicht beendet; bitte Konsolen- oder Diagnose-Log prüfen.";
                         } else if (exitFailed) {
-                            log.innerText += "\n\n[FEHLER] Web-UI Update beendet mit Exitcode " + exitCode + ".";
+                            log.innerText += "\n\n[FEHLER] System Update beendet mit Exitcode " + exitCode + ".";
                         } else {
-                            log.innerText += "\n\n[FEHLER] Web-UI Update beendet, aber ohne eindeutige Erfolgsmeldung.";
+                            log.innerText += "\n\n[FEHLER] System Update beendet, aber ohne eindeutige Erfolgsmeldung.";
                         }
                     }
                     if (closeBtn) closeBtn.style.display = 'block';
                     if (finishBtn) {
                         finishBtn.disabled = false;
-                        finishBtn.innerText = ok ? "Neu laden" : "Schliessen";
+                        finishBtn.innerText = ok ? "Neu laden" : "Schließen";
                         finishBtn.onclick = ok ? () => location.reload() : null;
                     }
                     if(btn) { btn.innerHTML = origText; btn.disabled = false; }
@@ -5946,106 +5938,7 @@ function pollInstallerUpdate(log, spinner, closeBtn, finishBtn, btn, origText) {
 
 // Gemeinsame Update-Logik
 function startSystemUpdate(btnId = null) {
-    // Optional: Button disablen während des Checks
-    const btn = btnId ? document.getElementById(btnId) : null;
-    let originalContent = '';
-    if (btn) {
-        originalContent = btn.innerHTML;
-        btn.innerHTML = '<i class="fas fa-circle-notch fa-spin"></i>';
-        btn.disabled = true;
-    }
-
-    e3dcPostAction('action=check_update&t=' + Date.now())
-    .then(r => r.json())
-    .then(data => {
-        if (btn) {
-            btn.innerHTML = originalContent;
-            btn.disabled = false;
-        }
-
-        if (data && data.docker) {
-            alert(data.message || 'Docker-Installation erkannt. Bitte das Container-Image auf dem Docker-Host aktualisieren.');
-            return;
-        }
-
-        let missing = data.missing || 0;
-        let force = false;
-        let proceed = false;
-
-        if (data.success) {
-            if (missing > 0) {
-                if (confirm(`Es sind ${missing} neue Updates verfügbar.\nUpdate jetzt durchführen?`)) {
-                    proceed = true;
-                }
-            } else {
-                if (confirm("Das System ist bereits auf dem neuesten Stand.\nMöchtest du E3DC-Control trotzdem neu installieren (Update erzwingen)?")) {
-                    proceed = true;
-                    force = true;
-                }
-            }
-        } else {
-            alert("Fehler beim Update-Check: " + (data.error || "Unbekannt"));
-        }
-
-        if (!proceed) return;
-
-        let discard = true;
-        if (!force) {
-            discard = confirm("Möchtest du eventuelle lokale Code-Änderungen verwerfen (Empfohlen für fehlerfreie Updates)?\n\n(Häufig entstehen lokale Änderungen nur durch Dateirechte-Korrekturen. Ein Verwerfen stellt den Originalzustand wieder her.)");
-        }
-
-        return e3dcPostAction('action=prepare_update', {
-            force: force ? 'true' : 'false',
-            discard: discard ? 'true' : 'false'
-        });
-    })
-    .then(response => {
-        if (!response) return; // Abgebrochen
-
-        const modal = new bootstrap.Modal(document.getElementById('updateModal'));
-        modal.show();
-
-        const title = document.getElementById('update-modal-title');
-        const log = document.getElementById('update-log');
-        const spinner = document.getElementById('update-spinner');
-        const closeBtn = document.getElementById('update-close-btn');
-        const finishBtn = document.getElementById('update-finish-btn');
-
-        // Reset UI
-        if (title) title.innerText = "System Update";
-        log.innerText = "Starte Anfrage...\n";
-        spinner.className = "fas fa-sync fa-spin me-2";
-        closeBtn.style.display = 'none';
-        finishBtn.disabled = true;
-        finishBtn.onclick = null;
-        finishBtn.innerText = "Schließen";
-
-        // Start Request
-        e3dcPostAction('action=run_update&mode=start&t=' + Date.now())
-            .then(r => r.json())
-            .then(data => {
-                if (data.status === 'started' || data.status === 'running') {
-                    log.innerText = "Update gestartet. Warte auf Ausgabe...\n";
-                    pollUpdate(log, spinner, closeBtn, finishBtn);
-                } else if (data.status === 'docker') {
-                    log.innerText = data.message || 'Docker-Installation erkannt. Bitte das Container-Image auf dem Docker-Host aktualisieren.';
-                    spinner.classList.remove('fa-spin', 'fa-sync');
-                    spinner.classList.add('fa-info-circle', 'text-info');
-                    finishBtn.disabled = false;
-                } else {
-                    log.innerText = "Fehler: " + (data.message || "Unbekannter Fehler");
-                    finishBtn.disabled = false;
-                }
-            })
-            .catch(err => {
-                log.innerText = "Netzwerkfehler beim Starten: " + err;
-                finishBtn.disabled = false;
-            });
-    })
-    .catch(err => {
-        if (btn) { btn.innerHTML = originalContent; btn.disabled = false; }
-        alert("Fehler: " + err);
-    });
+    return startInstallerUpdate(btnId || 'btn-update-installer');
 }
 
 function pollUpdate(log, spinner, closeBtn, finishBtn) {

@@ -72,7 +72,7 @@ Assets ausgeliefert.
 
 Die lokale Matter-Bridge verwendet die fest in
 `Installer/matter/package-lock.json` aufgelösten Laufzeitpakete
-`@project-chip/matter-node.js` und `@project-chip/matter.js` 0.7.1
+`@project-chip/matter-node.js` und `@project-chip/matter.js` 0.12.6
 (Apache-2.0). Das Lockfile bindet auch die transitiven Paketversionen und
 Integritätswerte. Für diese Pakete gelten die jeweils mitgelieferten
 Lizenzhinweise. Vor Veröffentlichung eines Release-Images werden dessen SBOM

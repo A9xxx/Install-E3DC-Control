@@ -810,10 +810,130 @@ def _root_marker_payload(install: Path) -> Dict[str, object]:
     }
 
 
+def _descriptor_has_unsafe_backup_xattrs(descriptor: int) -> bool:
+    """Ein Backup-Authority-Pfad darf keine ungebundenen xattrs tragen."""
+
+    try:
+        return bool(os.listxattr(descriptor))
+    except AttributeError:
+        return True
+    except OSError as exc:
+        if exc.errno in {
+            getattr(errno, "ENODATA", -1),
+            getattr(errno, "ENOTSUP", -1),
+            getattr(errno, "EOPNOTSUPP", -1),
+        }:
+            return False
+        return True
+
+
+def _open_root_controlled_backup_directory_chain(
+    path: PathValue,
+    *,
+    leaf_mode: Optional[int] = None,
+) -> int:
+    """Öffnet jede Pfadkomponente nofollow und bindet Root-Besitz und Inodes."""
+
+    candidate = _lexical_absolute(path)
+    if not _NOFOLLOW or not _DIRECTORY:
+        raise BackupIntegrityError("Backup-Root benötigt O_NOFOLLOW und O_DIRECTORY")
+    flags = os.O_RDONLY | _DIRECTORY | _NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open(candidate.anchor, flags)
+    try:
+        anchor_metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(anchor_metadata.st_mode)
+            or anchor_metadata.st_uid != 0
+            or anchor_metadata.st_gid != 0
+            or anchor_metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            or _descriptor_has_unsafe_backup_xattrs(descriptor)
+        ):
+            raise BackupIntegrityError("Backup-Root-Anker ist nicht root-kontrolliert")
+        current = Path(candidate.anchor)
+        components = candidate.parts[1:]
+        for index, component in enumerate(components):
+            before = os.stat(component, dir_fd=descriptor, follow_symlinks=False)
+            next_descriptor = os.open(component, flags, dir_fd=descriptor)
+            current = current / component
+            try:
+                opened = os.fstat(next_descriptor)
+                named_after = os.stat(
+                    component,
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
+                )
+                expected_leaf_mode = (
+                    leaf_mode if index == len(components) - 1 else None
+                )
+                if (
+                    not stat.S_ISDIR(opened.st_mode)
+                    or opened.st_uid != 0
+                    or opened.st_gid != 0
+                    or opened.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                    or (
+                        expected_leaf_mode is not None
+                        and stat.S_IMODE(opened.st_mode) != expected_leaf_mode
+                    )
+                    or _descriptor_has_unsafe_backup_xattrs(next_descriptor)
+                    or (before.st_dev, before.st_ino)
+                    != (opened.st_dev, opened.st_ino)
+                    or (named_after.st_dev, named_after.st_ino)
+                    != (opened.st_dev, opened.st_ino)
+                ):
+                    raise BackupIntegrityError(
+                        "Backup-Root-Komponente ist nicht root-kontrolliert: {}".format(
+                            current
+                        )
+                    )
+            except Exception:
+                os.close(next_descriptor)
+                raise
+            os.close(descriptor)
+            descriptor = next_descriptor
+        root_metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(root_metadata.st_mode)
+            or root_metadata.st_uid != 0
+            or root_metadata.st_gid != 0
+            or root_metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            or (leaf_mode is not None and stat.S_IMODE(root_metadata.st_mode) != leaf_mode)
+            or _descriptor_has_unsafe_backup_xattrs(descriptor)
+        ):
+            raise BackupIntegrityError(
+                "Backup-Root ist nicht root-kontrolliert: {}".format(candidate)
+            )
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
 def _read_root_marker(root: Path) -> Dict[str, object]:
     marker = root / ROOT_MARKER_NAME
-    descriptor, _metadata = _open_regular_file_nofollow(marker)
+    descriptor, metadata = _open_regular_file_nofollow(marker)
     try:
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_uid != 0
+            or metadata.st_gid != 0
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or _descriptor_has_unsafe_backup_xattrs(descriptor)
+        ):
+            raise BackupIntegrityError(
+                "Backup-Root-Marker ist nicht root:root 0600 gebunden."
+            )
+        identity = (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
+            metadata.st_nlink,
+            metadata.st_uid,
+            metadata.st_gid,
+            stat.S_IMODE(metadata.st_mode),
+        )
         data = b""
         while True:
             block = os.read(descriptor, 65536)
@@ -822,6 +942,30 @@ def _read_root_marker(root: Path) -> Dict[str, object]:
             data += block
             if len(data) > 65536:
                 raise BackupIntegrityError("Backup-Root-Marker ist unplausibel gross.")
+        after = os.fstat(descriptor)
+        named_after = os.lstat(str(marker))
+        if identity != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+            after.st_nlink,
+            after.st_uid,
+            after.st_gid,
+            stat.S_IMODE(after.st_mode),
+        ) or identity != (
+            named_after.st_dev,
+            named_after.st_ino,
+            named_after.st_size,
+            named_after.st_mtime_ns,
+            named_after.st_ctime_ns,
+            named_after.st_nlink,
+            named_after.st_uid,
+            named_after.st_gid,
+            stat.S_IMODE(named_after.st_mode),
+        ):
+            raise BackupIntegrityError("Backup-Root-Marker driftete beim Readback.")
     finally:
         os.close(descriptor)
     try:
@@ -839,7 +983,14 @@ def configured_backup_root(install_root: PathValue) -> Path:
     root = _lexical_absolute(configured) if configured else DEFAULT_BACKUP_ROOT
     root, install = _validate_backup_root_path(root, install)
     if root.exists():
-        entries = set(os.listdir(str(root)))
+        root_descriptor = _open_root_controlled_backup_directory_chain(
+            root,
+            leaf_mode=0o700,
+        )
+        try:
+            entries = set(os.listdir(root_descriptor))
+        finally:
+            os.close(root_descriptor)
         if ROOT_MARKER_NAME not in entries:
             if entries:
                 raise BackupIntegrityError("Bestehender Backup-Root ist kein markierter E3DC-Unterbaum.")
@@ -853,26 +1004,47 @@ def configured_backup_root(install_root: PathValue) -> Path:
 def ensure_external_backup_root(backup_root: PathValue, install_root: PathValue) -> Path:
     root, install = _validate_backup_root_path(backup_root, install_root)
     if not root.exists():
-        os.mkdir(str(root), 0o700)
-    root = _assert_no_symlink_components(root)
-    os.chmod(str(root), 0o700)
-    entries = set(os.listdir(str(root)))
-    marker = root / ROOT_MARKER_NAME
-    expected = _root_marker_payload(install)
-    if ROOT_MARKER_NAME in entries:
-        if _read_root_marker(root) != expected:
-            raise BackupIntegrityError("Backup-Root gehoert zu einer anderen Installation.")
-    else:
-        if entries:
-            raise BackupIntegrityError("Fremdordner darf nicht als Backup-Root initialisiert werden.")
-        descriptor = os.open(
-            str(marker), os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW, 0o600
-        )
+        parent_descriptor = _open_root_controlled_backup_directory_chain(root.parent)
         try:
-            os.write(descriptor, (json.dumps(expected, sort_keys=True) + "\n").encode("utf-8"))
-            os.fsync(descriptor)
+            os.mkdir(root.name, 0o700, dir_fd=parent_descriptor)
+            os.fsync(parent_descriptor)
         finally:
-            os.close(descriptor)
+            os.close(parent_descriptor)
+    root = _assert_no_symlink_components(root)
+    root_descriptor = _open_root_controlled_backup_directory_chain(
+        root,
+        leaf_mode=0o700,
+    )
+    entries = set(os.listdir(root_descriptor))
+    expected = _root_marker_payload(install)
+    try:
+        if ROOT_MARKER_NAME in entries:
+            if _read_root_marker(root) != expected:
+                raise BackupIntegrityError("Backup-Root gehört zu einer anderen Installation.")
+        else:
+            if entries:
+                raise BackupIntegrityError("Fremdordner darf nicht als Backup-Root initialisiert werden.")
+            descriptor = os.open(
+                ROOT_MARKER_NAME,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW,
+                0o600,
+                dir_fd=root_descriptor,
+            )
+            try:
+                os.write(
+                    descriptor,
+                    (json.dumps(expected, sort_keys=True) + "\n").encode("utf-8"),
+                )
+                os.fchown(descriptor, 0, 0)
+                os.fchmod(descriptor, 0o600)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            os.fsync(root_descriptor)
+            if _read_root_marker(root) != expected:
+                raise BackupIntegrityError("Backup-Root-Marker konnte nicht gebunden werden.")
+    finally:
+        os.close(root_descriptor)
     return root
 
 
@@ -889,6 +1061,8 @@ def validate_existing_backup_root(backup_root: PathValue, install_root: PathValu
     root, install = _validate_backup_root_path(backup_root, install_root)
     if not root.exists():
         raise BackupIntegrityError("Backup-Root existiert nicht: {}".format(root))
+    descriptor = _open_root_controlled_backup_directory_chain(root, leaf_mode=0o700)
+    os.close(descriptor)
     marker = _read_root_marker(root)
     if marker != _root_marker_payload(install):
         raise BackupIntegrityError("Backup-Root-Marker stimmt nicht mit der Installation ueberein.")
@@ -1591,6 +1765,7 @@ def _verify_entry(
     mode: int,
     uid: int,
     gid: int,
+    expected_identity: Optional[Tuple[int, int]] = None,
 ) -> None:
     descriptor = os.open(name, os.O_RDONLY | _NOFOLLOW, dir_fd=parent_descriptor)
     digest = hashlib.sha256()
@@ -1598,6 +1773,13 @@ def _verify_entry(
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
             raise BackupIntegrityError("Restore-Ziel ist keine regulaere Datei: {}".format(name))
+        if expected_identity is not None and (
+            metadata.st_dev,
+            metadata.st_ino,
+        ) != expected_identity:
+            raise BackupIntegrityError(
+                "Restore-Ziel-Inode stimmt nicht: {}".format(name)
+            )
         while True:
             block = os.read(descriptor, 1024 * 1024)
             if not block:
@@ -1607,6 +1789,18 @@ def _verify_entry(
             raise BackupIntegrityError("Restore-Pruefsumme stimmt nicht: {}".format(name))
         _apply_descriptor_metadata(descriptor, mode, uid, gid, name)
         os.fsync(descriptor)
+        durable = os.fstat(descriptor)
+        live = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(durable.st_mode)
+            or (live.st_dev, live.st_ino) != (durable.st_dev, durable.st_ino)
+            or stat.S_IMODE(durable.st_mode) != (mode & 0o7777)
+            or durable.st_uid != uid
+            or durable.st_gid != gid
+        ):
+            raise BackupIntegrityError(
+                "Restore-Ziel driftete beim dauerhaften Schreiben: {}".format(name)
+            )
     finally:
         os.close(descriptor)
 
@@ -1770,6 +1964,8 @@ def _open_or_create_exact_directory(path: Path) -> Dict[str, object]:
             "parent_fd": parent_descriptor,
             "parent_metadata": os.fstat(parent_descriptor),
             "fd": descriptor,
+            "dev": int(opened.st_dev),
+            "ino": int(opened.st_ino),
             "created": created,
             "original_mode": stat.S_IMODE(opened.st_mode),
             "original_uid": int(opened.st_uid),
@@ -2008,11 +2204,37 @@ def restore_persistent_payload(
     exchange_func=None,
     rollback_replace_func=os.replace,
     before_commit=None,
+    restored_payload_guard=None,
+    restore_metadata_overrides=None,
+    verified_manifest_guard=None,
 ) -> int:
     """Restore one fd-bound transaction in the isolated single-thread updater."""
 
     backup = _assert_no_symlink_components(backup_dir)
     manifest = verify_backup(backup, expected_kind=SYSTEM_BACKUP_KIND)
+    if verified_manifest_guard is not None:
+        if not callable(verified_manifest_guard):
+            raise BackupIntegrityError("Restore-Manifestguard ist nicht aufrufbar")
+        verified_manifest_guard(manifest)
+    if restore_metadata_overrides is None:
+        metadata_overrides: Dict[str, Tuple[int, int, int]] = {}
+    elif not isinstance(restore_metadata_overrides, dict):
+        raise BackupIntegrityError("Restore-Metadaten-Overrides sind ungültig")
+    else:
+        metadata_overrides = {}
+        for raw_path, raw_metadata in restore_metadata_overrides.items():
+            path = str(_lexical_absolute(str(raw_path)))
+            if (
+                path != "/etc/systemd/system/e3dc-storage-manager.service"
+                or not isinstance(raw_metadata, (tuple, list))
+                or tuple(raw_metadata) != (0o644, 0, 0)
+            ):
+                raise BackupIntegrityError(
+                    "Nur die receiptgebundene Storage-Unit darf root-promotet werden"
+                )
+            metadata_overrides[path] = (0o644, 0, 0)
+    if restored_payload_guard is not None and not callable(restored_payload_guard):
+        raise BackupIntegrityError("Restore-Payloadguard ist nicht aufrufbar")
     roots = [_lexical_absolute(path) for path in allowed_roots]
     files = [_lexical_absolute(path) for path in allowed_files]
     cleanup_candidates, cleanup_directories = _exact_cleanup_candidates(manifest, roots, files)
@@ -2044,6 +2266,7 @@ def restore_persistent_payload(
     cleanup_applied: List[Dict[str, object]] = []
     committed = False
     previous_descriptor_limit = None
+    used_metadata_overrides: Set[str] = set()
 
     try:
         previous_descriptor_limit = _reserve_restore_descriptor_budget(
@@ -2096,15 +2319,35 @@ def restore_persistent_payload(
             if _entry_sha256(parent_descriptor, new_name) != new_sha:
                 raise BackupIntegrityError("Restore-Staging-Pruefsumme stimmt nicht: {}".format(destination))
             new_metadata = _entry_metadata(parent_descriptor, new_name)
+            manifest_mode = int(entry.get("mode", 0o600)) & 0o7777
+            manifest_uid = int(entry["uid"])
+            manifest_gid = int(entry["gid"])
+            override = metadata_overrides.get(str(destination))
+            if override is not None:
+                if (
+                    str(entry.get("category") or "") != "systemd"
+                    or manifest_mode != 0o644
+                ):
+                    raise BackupIntegrityError(
+                        "Storage-Unit-Metadatenoverride passt nicht zum Manifest"
+                    )
+                used_metadata_overrides.add(str(destination))
+                new_mode, new_uid, new_gid = override
+            else:
+                new_mode, new_uid, new_gid = (
+                    manifest_mode,
+                    manifest_uid,
+                    manifest_gid,
+                )
             staged.append({
                 "destination": destination,
                 "parent_fd": parent_descriptor,
                 "parent_metadata": parent_metadata,
                 "new_name": new_name,
                 "new_sha": new_sha,
-                "new_mode": int(entry.get("mode", 0o600)) & 0o7777,
-                "new_uid": int(entry["uid"]),
-                "new_gid": int(entry["gid"]),
+                "new_mode": int(new_mode),
+                "new_uid": int(new_uid),
+                "new_gid": int(new_gid),
                 "new_dev": int(new_metadata.st_dev),
                 "new_ino": int(new_metadata.st_ino),
                 "original_exists": original_exists,
@@ -2124,6 +2367,11 @@ def restore_persistent_payload(
                 "placeholder_gid": None,
                 "new_installed": False,
             })
+
+        if used_metadata_overrides != set(metadata_overrides):
+            raise BackupIntegrityError(
+                "Storage-Unit-Metadatenoverride fehlt im verifizierten Manifest"
+            )
 
         for candidate in cleanup_candidates:
             destination = Path(str(candidate["path"]))
@@ -2294,6 +2542,7 @@ def restore_persistent_payload(
                     int(item["new_mode"]),
                     int(item["new_uid"]),
                     int(item["new_gid"]),
+                    (int(item["new_dev"]), int(item["new_ino"])),
                 )
                 _verify_parent_binding(destination.parent, parent_descriptor, item["parent_metadata"])
 
@@ -2446,6 +2695,129 @@ def restore_persistent_payload(
                 os.unlink(destination.name, dir_fd=parent_descriptor)
                 item["placeholder_removed"] = True
                 _verify_parent_binding(destination.parent, parent_descriptor, item["parent_metadata"])
+
+            # Durability-Gate: Der receiptgebundene Guard und insbesondere der
+            # nachfolgende systemd-Callback dürfen erst laufen, wenn sowohl die
+            # finalen Datei-/Verzeichnismetadaten als auch jeder in dieser
+            # Transaktion geänderte Name rebootfest sind. Ein fsync-Fehler
+            # läuft in den vollständigen Restore-Rücklauf; das äußere
+            # Recovery-Gate bleibt dabei scharf.
+            for item in staged:
+                destination = Path(str(item["destination"]))
+                _verify_entry(
+                    int(item["parent_fd"]),
+                    destination.name,
+                    str(item["new_sha"]),
+                    int(item["new_mode"]),
+                    int(item["new_uid"]),
+                    int(item["new_gid"]),
+                    (int(item["new_dev"]), int(item["new_ino"])),
+                )
+
+            for item in sorted(
+                directory_items,
+                key=lambda value: (
+                    len(Path(str(value["path"])).parts),
+                    str(value["path"]),
+                ),
+                reverse=True,
+            ):
+                path = Path(str(item["path"]))
+                descriptor = int(item["fd"])
+                parent_descriptor = int(item["parent_fd"])
+                expected_identity = (int(item["dev"]), int(item["ino"]))
+                opened = os.fstat(descriptor)
+                live = os.stat(
+                    path.name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISDIR(opened.st_mode)
+                    or not stat.S_ISDIR(live.st_mode)
+                    or (opened.st_dev, opened.st_ino) != expected_identity
+                    or (live.st_dev, live.st_ino) != expected_identity
+                    or stat.S_IMODE(opened.st_mode)
+                    != (int(item["expected_mode"]) & 0o7777)
+                    or opened.st_uid != int(item["expected_uid"])
+                    or opened.st_gid != int(item["expected_gid"])
+                ):
+                    raise BackupIntegrityError(
+                        "Restore-Verzeichnis driftete vor dauerhaftem Schreiben: {}".format(
+                            path
+                        )
+                    )
+                os.fsync(descriptor)
+                durable = os.fstat(descriptor)
+                live_after = os.stat(
+                    path.name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                if (
+                    (durable.st_dev, durable.st_ino) != expected_identity
+                    or (live_after.st_dev, live_after.st_ino) != expected_identity
+                ):
+                    raise BackupIntegrityError(
+                        "Restore-Verzeichnis driftete beim dauerhaften Schreiben: {}".format(
+                            path
+                        )
+                    )
+                _verify_parent_binding(
+                    path.parent,
+                    parent_descriptor,
+                    item["parent_metadata"],
+                )
+
+            parent_bindings: Dict[
+                Tuple[int, int], Tuple[Path, int, os.stat_result]
+            ] = {}
+            parent_sources = [
+                *((Path(str(item["destination"])).parent, item) for item in staged),
+                *((Path(str(item["destination"])).parent, item) for item in cleanup_items),
+                *((Path(str(item["destination"])).parent, item) for item in cleanup_directory_items),
+                *((Path(str(item["path"])).parent, item) for item in directory_items),
+            ]
+            for parent_path, item in parent_sources:
+                descriptor = int(item["parent_fd"])
+                expected = item["parent_metadata"]
+                opened = os.fstat(descriptor)
+                identity = (int(opened.st_dev), int(opened.st_ino))
+                if (
+                    not stat.S_ISDIR(opened.st_mode)
+                    or identity != (int(expected.st_dev), int(expected.st_ino))
+                ):
+                    raise BackupIntegrityError(
+                        "Restore-Elternverzeichnis driftete vor dauerhaftem Schreiben: {}".format(
+                            parent_path
+                        )
+                    )
+                _verify_parent_binding(parent_path, descriptor, expected)
+                previous = parent_bindings.get(identity)
+                if previous is not None and previous[0] != parent_path:
+                    raise BackupIntegrityError(
+                        "Restore-Elternverzeichnis ist mehrdeutig gebunden: {}".format(
+                            parent_path
+                        )
+                    )
+                parent_bindings.setdefault(
+                    identity,
+                    (parent_path, descriptor, expected),
+                )
+
+            for parent_path, descriptor, expected in sorted(
+                parent_bindings.values(),
+                key=lambda value: (len(value[0].parts), str(value[0])),
+                reverse=True,
+            ):
+                os.fsync(descriptor)
+                _verify_parent_binding(parent_path, descriptor, expected)
+
+            # Der receiptgebundene Payloadguard läuft nach allen sichtbaren
+            # Swaps und Metadaten, aber vor jeder systemd-Maskenprojektion und
+            # damit vor dem ersten daemon-reload auf restaurierte Unitnamen.
+            if restored_payload_guard is not None:
+                restored_payload_guard()
 
             # Dieser Callback ist die letzte fehlschlagbare Änderung am
             # sichtbaren Zustand. Ein Fehler läuft in den vollständigen
@@ -2688,4 +3060,3 @@ def restore_persistent_payload(
                 os.close(int(item["parent_fd"]))
         finally:
             _restore_descriptor_budget(previous_descriptor_limit)
-

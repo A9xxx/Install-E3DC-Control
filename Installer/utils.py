@@ -1,4 +1,7 @@
 import os
+import errno
+import hashlib
+import secrets
 import pwd
 import subprocess
 import logging
@@ -32,6 +35,10 @@ _PATH_METADATA_FILES = (
     Path("/var/www/html/data/e3dc_v4.json"),
     Path("/var/www/html/e3dc_paths.json"),
     _INSTALLER_DIR / "installer_config.json",
+)
+_RAMDISK_DROPIN_NAME = "20-e3dc-ramdisk-tmpfs.conf"
+_RAMDISK_DROPIN_SHA256 = (
+    "93419276f394da30fa3e13674093c38de43318f00f0b3814699df4607fc2dc73"
 )
 
 
@@ -1551,6 +1558,208 @@ def ensure_manager_lock_namespace():
         return False
 
 
+def _render_managed_service_unit(
+    *,
+    description,
+    runtime_user,
+    runtime_group,
+    working_dir,
+    exec_argv,
+    restart_sec=60,
+    restart_policy="always",
+    nice=None,
+    io_scheduling_class=None,
+    after_services=(),
+    start_limit_interval_sec=None,
+    start_limit_burst=None,
+    wants_services=(),
+    documentation="",
+    syslog_identifier="",
+    manager_lock_prestart="",
+):
+    """Rendert den einzigen freigegebenen Unitvertrag des Core-Helpers."""
+
+    after_units = ["network.target"]
+    after_units.extend(
+        str(item).strip()
+        for item in (after_services or ())
+        if str(item).strip()
+    )
+    wants_units = [
+        str(item).strip()
+        for item in (wants_services or ())
+        if str(item).strip()
+    ]
+    documentation_line = (
+        f"Documentation={str(documentation).strip()}\n"
+        if str(documentation or "").strip()
+        else ""
+    )
+    wants_line = f"Wants={' '.join(wants_units)}\n" if wants_units else ""
+    syslog_line = (
+        f"SyslogIdentifier={str(syslog_identifier).strip()}\n"
+        if str(syslog_identifier or "").strip()
+        else ""
+    )
+    service_tuning = ""
+    if nice is not None:
+        service_tuning += f"Nice={int(nice)}\n"
+    if io_scheduling_class:
+        service_tuning += f"IOSchedulingClass={str(io_scheduling_class).strip()}\n"
+
+    start_limit_tuning = ""
+    if (start_limit_interval_sec is None) != (start_limit_burst is None):
+        raise ValueError("StartLimitIntervalSec und StartLimitBurst nur gemeinsam setzen")
+    if start_limit_interval_sec is not None and start_limit_burst is not None:
+        interval = int(start_limit_interval_sec)
+        burst = int(start_limit_burst)
+        if interval <= 0 or burst <= 0:
+            raise ValueError("systemd-Startlimit muss positiv sein")
+        start_limit_tuning = (
+            f"StartLimitIntervalSec={interval}\n"
+            f"StartLimitBurst={burst}\n"
+        )
+
+    normalized_argv = []
+    for argument in exec_argv or ():
+        value = str(argument)
+        if not value or "\n" in value or "\r" in value or "\x00" in value:
+            raise ValueError("Ungültiges Argument im systemd-ExecStart-Vertrag")
+        normalized_argv.append(value)
+    if not normalized_argv:
+        raise ValueError("systemd-ExecStart-Vertrag ist leer")
+    exec_start = " ".join(shlex.quote(item) for item in normalized_argv)
+
+    return f"""[Unit]
+Description={description}
+{documentation_line}{wants_line}After={' '.join(after_units)}
+{start_limit_tuning}
+
+[Service]
+Type=simple
+User={runtime_user}
+Group={runtime_group}
+WorkingDirectory={working_dir}
+{manager_lock_prestart}ExecStart={exec_start}
+Restart={restart_policy}
+RestartSec={restart_sec}
+{service_tuning}
+StandardOutput=journal
+StandardError=journal
+{syslog_line}
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def _approved_storage_manager_unit_payloads() -> tuple[bytes, ...]:
+    """Rendert ausschließlich belegte Ziel-/Legacy-Storage-Unitverträge."""
+
+    install_user = get_install_user()
+    installer_dir = os.path.join(get_install_path(), "Installer")
+    script_path = os.path.normpath(os.path.join(installer_dir, "storage_manager.py"))
+    if not os.path.isfile(script_path):
+        raise RuntimeError("Storage-Manager-Skript für Unitbindung fehlt")
+    _venv_name, bound_venv_path = resolve_venv_target(install_user)
+    runtime = require_bound_venv_runtime(
+        install_user=install_user,
+        venv_path=bound_venv_path,
+    )
+    target_content = _render_managed_service_unit(
+        description="E3DC Storage Manager",
+        runtime_user=install_user,
+        runtime_group="www-data",
+        working_dir=os.path.dirname(script_path),
+        exec_argv=(runtime["python"], script_path),
+        restart_sec=5,
+        restart_policy="always",
+        after_services=("e3dc-live.service",),
+        start_limit_interval_sec=300,
+        start_limit_burst=3,
+        manager_lock_prestart=(
+            "ExecStartPre=+/usr/bin/systemd-tmpfiles --create "
+            f"{MANAGER_LOCK_TMPFILES_CONFIG}\n"
+        ),
+    )
+    legacy_executors = [runtime["python"]]
+    legacy_python = os.path.join(bound_venv_path, "bin", "python")
+    if os.path.lexists(legacy_python):
+        legacy_executors.append(
+            _trusted_executable(
+                legacy_python,
+                {0, pwd.getpwnam(install_user).pw_uid},
+                "Legacy-Venv-Python",
+            )
+        )
+
+    def legacy_payload(executor, *, after_services, restart_sec):
+        after_units = ["network.target", *after_services]
+        return f"""[Unit]
+Description=E3DC Storage Manager
+After={' '.join(after_units)}
+
+[Service]
+Type=simple
+User={install_user}
+Group=www-data
+WorkingDirectory={os.path.dirname(script_path)}
+ExecStart={executor} {script_path}
+Restart=always
+RestartSec={restart_sec}
+
+
+[Install]
+WantedBy=multi-user.target
+""".encode("utf-8")
+
+    def transition_payload(executor):
+        """Historischer, bytegenau belegter Storage-Übergangsvertrag."""
+
+        return f"""[Unit]
+Description=E3DC Storage Manager
+After=network.target e3dc-live.service
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+
+[Service]
+Type=simple
+User={install_user}
+Group=www-data
+WorkingDirectory={os.path.dirname(script_path)}
+ExecStart={executor} {script_path}
+Restart=always
+RestartSec=5
+
+
+[Install]
+WantedBy=multi-user.target
+""".encode("utf-8")
+
+    candidates = [target_content.encode("utf-8")]
+    for executor in dict.fromkeys(legacy_executors):
+        # Öffentlicher 5.4.2d-Generator.
+        candidates.append(
+            legacy_payload(executor, after_services=(), restart_sec=60)
+        )
+        # Auf dem Bestandszweig belegter Storage-Aufruf vor dem gehärteten
+        # Zielrenderer: bereits mit Live-Abhängigkeit und kurzem Restart,
+        # aber noch ohne Root-Prestart/StartLimit/Journalzeilen.
+        candidates.append(
+            legacy_payload(
+                executor,
+                after_services=("e3dc-live.service",),
+                restart_sec=5,
+            )
+        )
+        # Bytegenau belegte Übergangsfamilie: Startlimit bereits vorhanden,
+        # Root-Prestart und Journalzeilen jedoch noch nicht. Sie bleibt an
+        # denselben Installationsbenutzer, Venv- und Skriptpfad gebunden.
+        candidates.append(transition_payload(executor))
+    return tuple(dict.fromkeys(candidates))
+
+
 def _create_service_file(
     service_name,
     description,
@@ -1635,76 +1844,26 @@ def _create_service_file(
             f"{MANAGER_LOCK_TMPFILES_CONFIG}\n"
         )
 
-    after_units = ["network.target"]
-    after_units.extend(
-        str(item).strip()
-        for item in (after_services or ())
-        if str(item).strip()
-    )
-    wants_units = [
-        str(item).strip()
-        for item in (wants_services or ())
-        if str(item).strip()
-    ]
-    documentation_line = (
-        f"Documentation={str(documentation).strip()}\n"
-        if str(documentation or "").strip()
-        else ""
-    )
-    wants_line = f"Wants={' '.join(wants_units)}\n" if wants_units else ""
-    syslog_line = (
-        f"SyslogIdentifier={str(syslog_identifier).strip()}\n"
-        if str(syslog_identifier or "").strip()
-        else ""
-    )
-    service_tuning = ""
-    if nice is not None:
-        service_tuning += f"Nice={int(nice)}\n"
-    if io_scheduling_class:
-        service_tuning += f"IOSchedulingClass={str(io_scheduling_class).strip()}\n"
-
-    start_limit_tuning = ""
-    if (start_limit_interval_sec is None) != (start_limit_burst is None):
-        raise ValueError("StartLimitIntervalSec und StartLimitBurst nur gemeinsam setzen")
-    if start_limit_interval_sec is not None and start_limit_burst is not None:
-        interval = int(start_limit_interval_sec)
-        burst = int(start_limit_burst)
-        if interval <= 0 or burst <= 0:
-            raise ValueError("systemd-Startlimit muss positiv sein")
-        start_limit_tuning = (
-            f"StartLimitIntervalSec={interval}\n"
-            f"StartLimitBurst={burst}\n"
-        )
-
     exec_argv = [str(script_executor), str(script_abs_path)]
-    for argument in script_args or ():
-        value = str(argument)
-        if not value or "\n" in value or "\r" in value or "\x00" in value:
-            raise ValueError("Ungültiges Argument im systemd-ExecStart-Vertrag")
-        exec_argv.append(value)
-    exec_start = " ".join(shlex.quote(item) for item in exec_argv)
-
-    service_content = f"""[Unit]
-Description={description}
-{documentation_line}{wants_line}After={' '.join(after_units)}
-{start_limit_tuning}
-
-[Service]
-Type=simple
-User={runtime_user}
-Group={runtime_group}
-WorkingDirectory={working_dir}
-{manager_lock_prestart}ExecStart={exec_start}
-Restart={restart_policy}
-RestartSec={restart_sec}
-{service_tuning}
-StandardOutput=journal
-StandardError=journal
-{syslog_line}
-
-[Install]
-WantedBy=multi-user.target
-"""
+    exec_argv.extend(str(argument) for argument in (script_args or ()))
+    service_content = _render_managed_service_unit(
+        description=description,
+        runtime_user=runtime_user,
+        runtime_group=runtime_group,
+        working_dir=working_dir,
+        exec_argv=exec_argv,
+        restart_sec=restart_sec,
+        restart_policy=restart_policy,
+        nice=nice,
+        io_scheduling_class=io_scheduling_class,
+        after_services=after_services,
+        start_limit_interval_sec=start_limit_interval_sec,
+        start_limit_burst=start_limit_burst,
+        wants_services=wants_services,
+        documentation=documentation,
+        syslog_identifier=syslog_identifier,
+        manager_lock_prestart=manager_lock_prestart,
+    )
     tmp_path = None
     staged_service_path = f"{service_path}.e3dc-control-{os.getpid()}.tmp"
     staged_service_created = False
@@ -1857,6 +2016,16 @@ def _bundle_unit_name(service_name):
 
 
 def _systemd_show_contract(unit):
+    unit = _bundle_unit_name(unit)
+    property_names = (
+        "LoadState",
+        "UnitFileState",
+        "ActiveState",
+        "FragmentPath",
+        "DropInPaths",
+        "User",
+        "ExecStart",
+    )
     result = run_command(
         "systemctl show --no-pager "
         + shlex.quote(unit)
@@ -1865,18 +2034,41 @@ def _systemd_show_contract(unit):
         + " --property=ExecStart",
         timeout=15,
     )
+    stdout = str(result.get("stdout") or "")
+    stderr = str(result.get("stderr") or "")
+    if (
+        not result.get("success")
+        or int(result.get("returncode", -1)) != 0
+        or stderr
+        or "\x00" in stdout
+        or "\x00" in stderr
+    ):
+        raise RuntimeError(f"systemd-Show-Vertrag von {unit} ist nicht lesbar")
     values = {}
-    for line in str(result.get("stdout") or "").splitlines():
+    expected = set(property_names)
+    for line in stdout.splitlines():
         key, separator, value = line.partition("=")
-        if separator:
-            values[key.strip()] = value.strip()
+        if (
+            separator != "="
+            or key not in expected
+            or key in values
+            or key != key.strip()
+            or value != value.strip()
+        ):
+            raise RuntimeError(f"systemd-Show-Vertrag von {unit} ist widersprüchlich")
+        values[key] = value
+    if set(values) != expected:
+        raise RuntimeError(f"systemd-Show-Vertrag von {unit} ist unvollständig")
     load_state = values.get("LoadState", "").lower()
     unit_file_state = values.get("UnitFileState", "").lower()
     active_state = values.get("ActiveState", "").lower()
     fragment_path = values.get("FragmentPath", "")
-    dropin_paths = tuple(
-        item for item in values.get("DropInPaths", "").split() if item
-    )
+    try:
+        dropin_paths = tuple(shlex.split(values.get("DropInPaths", "")))
+    except ValueError as exc:
+        raise RuntimeError(f"DropInPaths von {unit} sind nicht eindeutig") from exc
+    if len(dropin_paths) != len(set(dropin_paths)):
+        raise RuntimeError(f"DropInPaths von {unit} enthalten Duplikate")
     service_user = values.get("User", "")
     exec_start = values.get("ExecStart", "")
     if load_state not in {"loaded", "not-found"}:
@@ -1993,6 +2185,458 @@ def _systemd_effective_contract_matches(
     return True
 
 
+def _descriptor_has_unsafe_unit_xattrs(descriptor):
+    """Verweigert am Altbesitz-Inode jede ACL und jedes sonstige xattr."""
+
+    try:
+        names = set(os.listxattr(descriptor))
+    except AttributeError:
+        return True
+    except OSError as exc:
+        if exc.errno in {
+            getattr(errno, "ENODATA", -1),
+            getattr(errno, "ENOTSUP", -1),
+            getattr(errno, "EOPNOTSUPP", -1),
+        }:
+            return False
+        return True
+    return bool(names)
+
+
+def _read_unit_descriptor_bytes(descriptor, maximum=256 * 1024):
+    metadata = os.fstat(descriptor)
+    if metadata.st_size < 0 or metadata.st_size > maximum:
+        raise RuntimeError("systemd-Unit überschreitet die sichere Größe")
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    chunks = []
+    remaining = maximum + 1
+    while remaining:
+        chunk = os.read(descriptor, min(65536, remaining))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    payload = b"".join(chunks)
+    if len(payload) > maximum or len(payload) != metadata.st_size:
+        raise RuntimeError("systemd-Unit driftete beim Lesen")
+    return payload
+
+
+def _open_root_controlled_systemd_unit_directory():
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    if not nofollow or not directory:
+        raise RuntimeError("Systemd-Unitmigration benötigt O_NOFOLLOW und O_DIRECTORY")
+    flags = os.O_RDONLY | nofollow | directory | getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open("/", flags)
+    try:
+        root_metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(root_metadata.st_mode)
+            or root_metadata.st_uid != 0
+            or root_metadata.st_gid != 0
+            or root_metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            or _descriptor_has_unsafe_unit_xattrs(descriptor)
+        ):
+            raise RuntimeError(
+                "Systemd-Unitmigration besitzt keinen sicheren Root-Elternpfad"
+            )
+        for component in ("etc", "systemd", "system"):
+            before = os.stat(
+                component,
+                dir_fd=descriptor,
+                follow_symlinks=False,
+            )
+            next_descriptor = os.open(component, flags, dir_fd=descriptor)
+            metadata = os.fstat(next_descriptor)
+            named_after = os.stat(
+                component,
+                dir_fd=descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != 0
+                or metadata.st_gid != 0
+                or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                or _descriptor_has_unsafe_unit_xattrs(next_descriptor)
+                or (before.st_dev, before.st_ino)
+                != (metadata.st_dev, metadata.st_ino)
+                or (named_after.st_dev, named_after.st_ino)
+                != (metadata.st_dev, metadata.st_ino)
+            ):
+                os.close(next_descriptor)
+                raise RuntimeError(
+                    "Systemd-Unitmigration besitzt keinen root-kontrollierten Elternpfad"
+                )
+            os.close(descriptor)
+            descriptor = next_descriptor
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+class StorageUnitMigrationError(RuntimeError):
+    """Meldet, ob trotz Migrationsfehler ein sicherer Root-Inode benannt blieb."""
+
+    def __init__(self, message, *, root_unit_committed=False):
+        super().__init__(message)
+        self.root_unit_committed = bool(root_unit_committed)
+
+
+def _migrate_approved_storage_manager_unit_owner(
+    expected_payloads,
+    *,
+    install_user=None,
+):
+    """Ersetzt nur die bytegenaue pi-eigene Storage-Kernunit atomar.
+
+    Andere Units und Inhalte erhalten keinerlei Altbesitz-Ausnahme. Der
+    freigegebene Altinode wird nie aufgewertet: Ein neuer root:root-0644-Inode
+    ersetzt nur den noch namensgebundenen Preimage-Inode. Nach dem atomaren
+    Namensersatz wird dieser Root-Inode niemals wieder auf Altbesitz
+    zurückgestuft; ein Fehler meldet dem Caller den exakt neu gebundenen Stand.
+    """
+
+    if isinstance(expected_payloads, (bytes, bytearray, memoryview)):
+        payloads = (bytes(expected_payloads),)
+    else:
+        payloads = tuple(bytes(item) for item in expected_payloads)
+    if (
+        not payloads
+        or len(set(payloads)) != len(payloads)
+        or any(not payload or len(payload) > 256 * 1024 for payload in payloads)
+    ):
+        raise RuntimeError("Freigegebene Storage-Unitinhalte sind ungültig")
+    user = str(install_user or get_install_user()).strip()
+    account = pwd.getpwnam(user)
+    unit_name = "e3dc-storage-manager.service"
+    parent_descriptor = _open_root_controlled_systemd_unit_directory()
+    descriptor = None
+    try:
+        try:
+            before = os.stat(
+                unit_name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return False
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) != 0o644
+        ):
+            raise RuntimeError(
+                "Bestehende Storage-Manager-Unit ist kein regulärer nlink1-0644-Inode"
+            )
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        if not nofollow:
+            raise RuntimeError("Storage-Unitmigration benötigt O_NOFOLLOW")
+        descriptor = os.open(
+            unit_name,
+            os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_descriptor,
+        )
+        opened = os.fstat(descriptor)
+        if (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_uid,
+            opened.st_gid,
+            stat.S_IMODE(opened.st_mode),
+            opened.st_nlink,
+            opened.st_size,
+            opened.st_mtime_ns,
+            opened.st_ctime_ns,
+        ) != (
+            before.st_dev,
+            before.st_ino,
+            before.st_uid,
+            before.st_gid,
+            stat.S_IMODE(before.st_mode),
+            before.st_nlink,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        ):
+            raise RuntimeError("Storage-Manager-Unit driftete beim descriptorgebundenen Öffnen")
+        if _descriptor_has_unsafe_unit_xattrs(descriptor):
+            raise RuntimeError("Storage-Manager-Unit besitzt eine ACL oder andere xattrs")
+        if opened.st_uid == 0 and opened.st_gid == 0:
+            return False
+        if opened.st_uid != account.pw_uid or opened.st_gid != account.pw_gid:
+            raise RuntimeError("Storage-Manager-Unit besitzt einen fremden Eigentümer")
+        payload = _read_unit_descriptor_bytes(descriptor)
+        if payload not in payloads:
+            raise RuntimeError(
+                "Storage-Manager-Unit stimmt nicht bytegenau mit dem Zielvertrag überein"
+            )
+        loaded_state = _systemd_show_contract(unit_name)
+        dropin_preimages = _allowed_unit_dropin_preimages(
+            unit_name,
+            loaded_state,
+        )
+        expected_effective = _unit_file_effective_contract(
+            payload,
+            unit=unit_name,
+        )
+        if loaded_state.get("load_state") == "loaded" and not (
+            _systemd_effective_contract_matches(
+                unit_name,
+                loaded_state,
+                expected_effective,
+                dropin_preimages,
+            )
+        ):
+            raise RuntimeError(
+                "Storage-Manager-Unit besitzt vor der Migration keinen "
+                "gebundenen wirksamen Vertrag"
+            )
+        stable = os.fstat(descriptor)
+        if (
+            stable.st_dev,
+            stable.st_ino,
+            stable.st_size,
+            stable.st_mtime_ns,
+            stable.st_ctime_ns,
+            stable.st_nlink,
+            stable.st_uid,
+            stable.st_gid,
+            stat.S_IMODE(stable.st_mode),
+        ) != (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_size,
+            opened.st_mtime_ns,
+            opened.st_ctime_ns,
+            opened.st_nlink,
+            opened.st_uid,
+            opened.st_gid,
+            stat.S_IMODE(opened.st_mode),
+        ):
+            raise RuntimeError("Storage-Manager-Unit driftete vor dem atomaren Ersatz")
+
+        def create_candidate(owner_uid, owner_gid, label):
+            name = (
+                f".{unit_name}.e3dc-{label}-{os.getpid()}-"
+                f"{secrets.token_hex(8)}"
+            )
+            candidate_descriptor = None
+            try:
+                candidate_descriptor = os.open(
+                    name,
+                    os.O_RDWR
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0),
+                    0o600,
+                    dir_fd=parent_descriptor,
+                )
+                view = memoryview(payload)
+                while view:
+                    written = os.write(candidate_descriptor, view)
+                    if written <= 0:
+                        raise RuntimeError("Storage-Unitkandidat wurde nicht vollständig geschrieben")
+                    view = view[written:]
+                os.fchown(candidate_descriptor, int(owner_uid), int(owner_gid))
+                os.fchmod(candidate_descriptor, 0o644)
+                os.fsync(candidate_descriptor)
+                os.utime(
+                    name,
+                    ns=(opened.st_atime_ns, opened.st_mtime_ns),
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                os.fsync(candidate_descriptor)
+                candidate = os.fstat(candidate_descriptor)
+                named_candidate = os.stat(
+                    name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISREG(candidate.st_mode)
+                    or candidate.st_nlink != 1
+                    or candidate.st_uid != int(owner_uid)
+                    or candidate.st_gid != int(owner_gid)
+                    or stat.S_IMODE(candidate.st_mode) != 0o644
+                    or candidate.st_size != len(payload)
+                    or candidate.st_mtime_ns != opened.st_mtime_ns
+                    or (named_candidate.st_dev, named_candidate.st_ino)
+                    != (candidate.st_dev, candidate.st_ino)
+                    or _descriptor_has_unsafe_unit_xattrs(candidate_descriptor)
+                    or _read_unit_descriptor_bytes(candidate_descriptor) != payload
+                ):
+                    raise RuntimeError("Storage-Unitkandidat besitzt keinen sicheren Vertrag")
+                return name, candidate_descriptor
+            except Exception:
+                if candidate_descriptor is not None:
+                    os.close(candidate_descriptor)
+                try:
+                    os.unlink(name, dir_fd=parent_descriptor)
+                except FileNotFoundError:
+                    pass
+                raise
+
+        candidate_name = None
+        candidate_descriptor = None
+        installed_identity = None
+        installed = False
+        durably_committed = False
+        try:
+            candidate_name, candidate_descriptor = create_candidate(0, 0, "root-unit")
+            named_before = os.stat(
+                unit_name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                named_before.st_dev,
+                named_before.st_ino,
+                named_before.st_uid,
+                named_before.st_gid,
+                stat.S_IMODE(named_before.st_mode),
+                named_before.st_nlink,
+                named_before.st_size,
+                named_before.st_mtime_ns,
+                named_before.st_ctime_ns,
+            ) != (
+                opened.st_dev,
+                opened.st_ino,
+                opened.st_uid,
+                opened.st_gid,
+                stat.S_IMODE(opened.st_mode),
+                opened.st_nlink,
+                opened.st_size,
+                opened.st_mtime_ns,
+                opened.st_ctime_ns,
+            ):
+                raise RuntimeError("Storage-Manager-Unit driftete vor dem Namensersatz")
+            os.replace(
+                candidate_name,
+                unit_name,
+                src_dir_fd=parent_descriptor,
+                dst_dir_fd=parent_descriptor,
+            )
+            candidate_name = None
+            installed = True
+            os.fsync(parent_descriptor)
+            durably_committed = True
+            installed_metadata = os.fstat(candidate_descriptor)
+            installed_identity = (installed_metadata.st_dev, installed_metadata.st_ino)
+            named_after = os.stat(
+                unit_name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            old_after = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(installed_metadata.st_mode)
+                or installed_metadata.st_nlink != 1
+                or installed_metadata.st_uid != 0
+                or installed_metadata.st_gid != 0
+                or stat.S_IMODE(installed_metadata.st_mode) != 0o644
+                or installed_identity == (opened.st_dev, opened.st_ino)
+                or (named_after.st_dev, named_after.st_ino) != installed_identity
+                or old_after.st_uid != opened.st_uid
+                or old_after.st_gid != opened.st_gid
+                or stat.S_IMODE(old_after.st_mode) != stat.S_IMODE(opened.st_mode)
+                or old_after.st_nlink != 0
+                or _descriptor_has_unsafe_unit_xattrs(candidate_descriptor)
+                or _read_unit_descriptor_bytes(candidate_descriptor) != payload
+                or _read_unit_descriptor_bytes(descriptor) != payload
+            ):
+                raise RuntimeError("Storage-Manager-Unit besitzt keinen atomaren Root-Endvertrag")
+            rebound_descriptor = os.open(
+                unit_name,
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=parent_descriptor,
+            )
+            try:
+                rebound = os.fstat(rebound_descriptor)
+                if (
+                    (rebound.st_dev, rebound.st_ino) != installed_identity
+                    or rebound.st_uid != 0
+                    or rebound.st_gid != 0
+                    or stat.S_IMODE(rebound.st_mode) != 0o644
+                    or rebound.st_nlink != 1
+                    or _descriptor_has_unsafe_unit_xattrs(rebound_descriptor)
+                    or _read_unit_descriptor_bytes(rebound_descriptor) != payload
+                ):
+                    raise RuntimeError(
+                        "Storage-Manager-Unit ist nach Ersatz nicht neu gebunden"
+                    )
+            finally:
+                os.close(rebound_descriptor)
+            return True
+        except Exception as migration_exc:
+            if not installed:
+                raise
+            root_unit_committed = False
+            try:
+                named_before = os.stat(
+                    unit_name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                rebound = os.fstat(candidate_descriptor)
+                rebound_payload = _read_unit_descriptor_bytes(
+                    candidate_descriptor
+                )
+                stable = os.fstat(candidate_descriptor)
+                named_after = os.stat(
+                    unit_name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                root_unit_committed = bool(
+                    durably_committed
+                    and stat.S_ISREG(rebound.st_mode)
+                    and rebound.st_nlink == 1
+                    and rebound.st_uid == 0
+                    and rebound.st_gid == 0
+                    and stat.S_IMODE(rebound.st_mode) == 0o644
+                    and not _descriptor_has_unsafe_unit_xattrs(
+                        candidate_descriptor
+                    )
+                    and rebound_payload == payload
+                    and (named_before.st_dev, named_before.st_ino)
+                    == (rebound.st_dev, rebound.st_ino)
+                    and (stable.st_dev, stable.st_ino)
+                    == (rebound.st_dev, rebound.st_ino)
+                    and (named_after.st_dev, named_after.st_ino)
+                    == (rebound.st_dev, rebound.st_ino)
+                    and stable.st_uid == 0
+                    and stable.st_gid == 0
+                    and stat.S_IMODE(stable.st_mode) == 0o644
+                    and stable.st_nlink == 1
+                )
+            except Exception:
+                root_unit_committed = False
+            raise StorageUnitMigrationError(
+                "Storage-Unitmigration scheiterte nach atomarem Namensersatz: "
+                f"{migration_exc}",
+                root_unit_committed=root_unit_committed,
+            ) from migration_exc
+        finally:
+            if candidate_descriptor is not None:
+                os.close(candidate_descriptor)
+            if candidate_name is not None:
+                try:
+                    os.unlink(candidate_name, dir_fd=parent_descriptor)
+                except FileNotFoundError:
+                    pass
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(parent_descriptor)
+
+
 def _read_bound_unit_preimage(path):
     try:
         info = os.lstat(path)
@@ -2025,6 +2669,7 @@ def _read_bound_unit_preimage(path):
         named_after = os.lstat(path)
         if (
             len(data) > 256 * 1024
+            or _descriptor_has_unsafe_unit_xattrs(descriptor)
             or (
                 before.st_dev,
                 before.st_ino,
@@ -2079,10 +2724,269 @@ def _read_bound_unit_preimage(path):
         os.close(descriptor)
 
 
-def capture_systemd_service_bundle(service_names):
+def _read_bound_dropin_preimage_at(directory_descriptor, name, path):
+    """Liest ein Drop-in am bereits gebundenen root-kontrollierten Parent-FD."""
+
+    try:
+        before = os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if (
+        not nofollow
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+        or before.st_uid != 0
+        or before.st_gid != 0
+        or stat.S_IMODE(before.st_mode) != 0o644
+        or before.st_size > 256 * 1024
+    ):
+        raise RuntimeError(f"Unsicheres bestehendes systemd-Drop-in: {path}")
+    descriptor = os.open(
+        name,
+        os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0),
+        dir_fd=directory_descriptor,
+    )
+    try:
+        opened = os.fstat(descriptor)
+        signature = (
+            before.st_dev,
+            before.st_ino,
+            before.st_uid,
+            before.st_gid,
+            stat.S_IMODE(before.st_mode),
+            before.st_nlink,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        if signature != (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_uid,
+            opened.st_gid,
+            stat.S_IMODE(opened.st_mode),
+            opened.st_nlink,
+            opened.st_size,
+            opened.st_mtime_ns,
+            opened.st_ctime_ns,
+        ) or _descriptor_has_unsafe_unit_xattrs(descriptor):
+            raise RuntimeError(f"systemd-Drop-in driftete beim Öffnen: {path}")
+        data = _read_unit_descriptor_bytes(descriptor)
+        after = os.fstat(descriptor)
+        named_after = os.stat(
+            name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+        if signature != (
+            after.st_dev,
+            after.st_ino,
+            after.st_uid,
+            after.st_gid,
+            stat.S_IMODE(after.st_mode),
+            after.st_nlink,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ) or signature != (
+            named_after.st_dev,
+            named_after.st_ino,
+            named_after.st_uid,
+            named_after.st_gid,
+            stat.S_IMODE(named_after.st_mode),
+            named_after.st_nlink,
+            named_after.st_size,
+            named_after.st_mtime_ns,
+            named_after.st_ctime_ns,
+        ):
+            raise RuntimeError(f"systemd-Drop-in driftete beim Readback: {path}")
+        return {
+            "bytes": data,
+            "dev": before.st_dev,
+            "ino": before.st_ino,
+            "uid": before.st_uid,
+            "gid": before.st_gid,
+            "mode": stat.S_IMODE(before.st_mode),
+            "nlink": before.st_nlink,
+            "size": before.st_size,
+            "mtime_ns": before.st_mtime_ns,
+            "ctime_ns": before.st_ctime_ns,
+        }
+    finally:
+        os.close(descriptor)
+
+
+def _allowed_unit_dropin_preimages(
+    unit,
+    state,
+    *,
+    expected_recovery_dropins=None,
+):
+    ramdisk_path = os.path.join(
+        "/etc/systemd/system",
+        unit + ".d",
+        _RAMDISK_DROPIN_NAME,
+    )
+    recovery_dropins = dict(expected_recovery_dropins or {})
+    expected_recovery_path = os.path.join(
+        "/etc/systemd/system",
+        unit + ".d",
+        "00-e3dc-recovery-bootblock.conf",
+    )
+    if recovery_dropins and unit != "e3dc-storage-manager.service":
+        raise RuntimeError("Recovery-Drop-in-Ausnahme gilt nur für den Storage-Manager")
+    if set(recovery_dropins) not in (set(), {expected_recovery_path}):
+        raise RuntimeError(f"{unit} besitzt keinen eindeutigen Recovery-Drop-in-Vertrag")
+    for path, contract in recovery_dropins.items():
+        if (
+            not isinstance(contract, dict)
+            or contract.get("bytes") is None
+            or int(contract.get("dev", -1)) < 0
+            or int(contract.get("ino", 0)) <= 0
+            or int(contract.get("uid", -1)) != 0
+            or int(contract.get("gid", -1)) != 0
+            or int(contract.get("mode", -1)) != 0o644
+            or int(contract.get("nlink", -1)) != 1
+        ):
+            raise RuntimeError(f"{unit} besitzt einen ungültigen Recovery-Drop-in-Vertrag")
+    allowed_paths = {ramdisk_path, *recovery_dropins}
+    named_dropin_sequence = tuple(state.get("dropin_paths") or ())
+    if len(named_dropin_sequence) != len(set(named_dropin_sequence)):
+        raise RuntimeError(f"{unit} besitzt doppelte wirksame systemd-Drop-ins")
+    named_dropins = set(named_dropin_sequence)
+    foreign_dropins = named_dropins - allowed_paths
+    if foreign_dropins:
+        raise RuntimeError(
+            f"{unit} besitzt fremde systemd-Drop-ins: "
+            + ", ".join(sorted(foreign_dropins))
+        )
+    from .ramdisk_guard import render_ramdisk_service_dropin
+
+    ramdisk_payload = render_ramdisk_service_dropin().encode("utf-8")
+    if hashlib.sha256(ramdisk_payload).hexdigest() != _RAMDISK_DROPIN_SHA256:
+        raise RuntimeError("Freigegebener RAM-Disk-Drop-in-Vertrag driftete im Produkt")
+    directory_name = unit + ".d"
+    parent_descriptor = _open_root_controlled_systemd_unit_directory()
+    directory_descriptor = None
+    preimages = {}
+    try:
+        try:
+            before = os.stat(
+                directory_name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            disk_names = set()
+        else:
+            directory = getattr(os, "O_DIRECTORY", 0)
+            nofollow = getattr(os, "O_NOFOLLOW", 0)
+            if (
+                not directory
+                or not nofollow
+                or not stat.S_ISDIR(before.st_mode)
+                or before.st_uid != 0
+                or before.st_gid != 0
+                or before.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            ):
+                raise RuntimeError(f"{unit} besitzt ein unsicheres Drop-in-Verzeichnis")
+            directory_descriptor = os.open(
+                directory_name,
+                os.O_RDONLY | directory | nofollow | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=parent_descriptor,
+            )
+            opened = os.fstat(directory_descriptor)
+            named_after = os.stat(
+                directory_name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or (opened.st_dev, opened.st_ino)
+                != (before.st_dev, before.st_ino)
+                or (named_after.st_dev, named_after.st_ino)
+                != (opened.st_dev, opened.st_ino)
+                or _descriptor_has_unsafe_unit_xattrs(directory_descriptor)
+            ):
+                raise RuntimeError(f"{unit} besitzt kein gebundenes Drop-in-Verzeichnis")
+            disk_names = set(os.listdir(directory_descriptor))
+        allowed_names = {os.path.basename(path) for path in allowed_paths}
+        if disk_names - allowed_names:
+            raise RuntimeError(
+                f"{unit} besitzt fremde systemd-Drop-in-Dateien: "
+                + ", ".join(sorted(disk_names - allowed_names))
+            )
+        if directory_descriptor is not None:
+            preimage = _read_bound_dropin_preimage_at(
+                directory_descriptor,
+                _RAMDISK_DROPIN_NAME,
+                ramdisk_path,
+            )
+            if preimage is not None:
+                if (
+                    preimage.get("bytes") != ramdisk_payload
+                    or hashlib.sha256(preimage["bytes"]).hexdigest()
+                    != _RAMDISK_DROPIN_SHA256
+                ):
+                    raise RuntimeError(
+                        f"{unit} besitzt einen abweichenden RAM-Disk-Drop-in"
+                    )
+                preimages[ramdisk_path] = preimage
+            for recovery_path, expected in recovery_dropins.items():
+                recovery_preimage = _read_bound_dropin_preimage_at(
+                    directory_descriptor,
+                    os.path.basename(recovery_path),
+                    recovery_path,
+                )
+                if recovery_preimage is None or any(
+                    recovery_preimage.get(field) != expected.get(field)
+                    for field in (
+                        "bytes",
+                        "dev",
+                        "ino",
+                        "uid",
+                        "gid",
+                        "mode",
+                        "nlink",
+                        "size",
+                    )
+                ):
+                    raise RuntimeError(
+                        f"{unit} besitzt keinen gebundenen Recovery-Drop-in"
+                    )
+                preimages[recovery_path] = recovery_preimage
+            if set(os.listdir(directory_descriptor)) != disk_names:
+                raise RuntimeError(f"{unit} Drop-in-Verzeichnis driftete beim Readback")
+    finally:
+        if directory_descriptor is not None:
+            os.close(directory_descriptor)
+        os.close(parent_descriptor)
+    if (ramdisk_path in preimages) != (ramdisk_path in named_dropins):
+        raise RuntimeError(
+            f"On-Disk- und geladener Drop-in-Vertrag von {unit} weichen ab"
+        )
+    if {os.path.basename(path) for path in preimages} != disk_names:
+        raise RuntimeError(f"{unit} Drop-in-Verzeichnis driftete beim Readback")
+    return preimages
+
+
+def capture_systemd_service_bundle(
+    service_names,
+    *,
+    expected_recovery_dropins=None,
+):
     """Bindet Unitbytes, Enablement und Aktivität vor einer Bundle-Mutation."""
 
     snapshot = {}
+    recovery_contracts = dict(expected_recovery_dropins or {})
+    if set(recovery_contracts) not in (
+        set(),
+        {"e3dc-storage-manager.service"},
+    ):
+        raise RuntimeError("Recovery-Drop-in-Vertrag gilt nur für den Storage-Manager")
+    used_recovery_contracts = set()
     for requested in service_names:
         unit = _bundle_unit_name(requested)
         if unit in snapshot:
@@ -2095,21 +2999,16 @@ def capture_systemd_service_bundle(service_names):
                 f"{unit} wird außerhalb des gebundenen /etc-Produktpfads geladen"
             )
         pre_effective = None
-        dropin_preimages = {}
-        allowed_dropin = os.path.join(
-            "/etc/systemd/system",
-            unit + ".d",
-            "20-e3dc-ramdisk-tmpfs.conf",
-        )
         named_dropins = set(state.get("dropin_paths") or ())
-        foreign_dropins = named_dropins - {allowed_dropin}
-        if foreign_dropins:
-            raise RuntimeError(
-                f"{unit} besitzt fremde systemd-Drop-ins: "
-                + ", ".join(sorted(foreign_dropins))
-            )
-        dropin_preimage = _read_bound_unit_preimage(allowed_dropin)
-        if preimage is None and (named_dropins or dropin_preimage is not None):
+        expected_for_unit = recovery_contracts.get(unit, {})
+        if expected_for_unit:
+            used_recovery_contracts.add(unit)
+        dropin_preimages = _allowed_unit_dropin_preimages(
+            unit,
+            state,
+            expected_recovery_dropins=expected_for_unit,
+        )
+        if preimage is None and (named_dropins or dropin_preimages):
             raise RuntimeError(
                 f"{unit} besitzt ohne gebundene Hauptunit einen Drop-in"
             )
@@ -2118,12 +3017,6 @@ def capture_systemd_service_bundle(service_names):
                 preimage["bytes"],
                 unit=unit,
             )
-            if (dropin_preimage is not None) != (allowed_dropin in named_dropins):
-                raise RuntimeError(
-                    f"On-Disk- und geladener Drop-in-Vertrag von {unit} weichen ab"
-                )
-            if dropin_preimage is not None:
-                dropin_preimages[allowed_dropin] = dropin_preimage
             if state["load_state"] == "loaded" and not _systemd_effective_contract_matches(
                 unit,
                 state,
@@ -2140,6 +3033,8 @@ def capture_systemd_service_bundle(service_names):
             "pre_dropins": dropin_preimages,
             **state,
         }
+    if used_recovery_contracts != set(recovery_contracts):
+        raise RuntimeError("Recovery-Drop-in-Vertrag wurde keiner Zielunit zugeordnet")
     return snapshot
 
 

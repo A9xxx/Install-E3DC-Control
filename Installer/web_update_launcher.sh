@@ -36,6 +36,7 @@ readonly SNAPSHOT_MAX_TOTAL_BYTES=$((128 * 1024 * 1024))
 readonly SNAPSHOT_MAX_REPOSITORY_BYTES=$((256 * 1024 * 1024))
 readonly SNAPSHOT_MAX_PATH_BYTES=512
 readonly SNAPSHOT_PATH_PATTERN='^[A-Za-z0-9._/@+ -]+$'
+WORKER_SNAPSHOT=""
 
 git_local_read() {
     (
@@ -579,7 +580,7 @@ PY
 }
 
 run_worker() {
-    local snapshot identity head version extra rebound_state result=1
+    local identity head version extra rebound_state result=1
     [[ "${E3DC_WEB_UPDATE_WORKER:-}" == "1" && -n "${INVOCATION_ID:-}" ]] \
         || fail "Worker besitzt keinen systemd-Ausführungsvertrag" 126
     [[ -z "${SUDO_USER:-}" ]] || fail "Worker übernimmt keinen sudo-Aufrufer" 126
@@ -587,12 +588,14 @@ run_worker() {
     prepare_runtime_paths
     exec 9>"$LOCK_FILE"
     $FLOCK -n 9 || fail "Ein Web-Update läuft bereits" 75
-    snapshot=""
+    WORKER_SNAPSHOT=""
     cleanup() {
         local exit_code=$?
+        local snapshot_path="${WORKER_SNAPSHOT:-}"
         set +e
-        if [[ -n "$snapshot" && -d "$snapshot" && "$snapshot" == /run/e3dc-web-update.snapshot.* ]]; then
-            /usr/bin/find "$snapshot" -depth -delete
+        if [[ -n "$snapshot_path" && -d "$snapshot_path" \
+            && "$snapshot_path" == /run/e3dc-web-update.snapshot.* ]]; then
+            /usr/bin/find "$snapshot_path" -depth -delete
         fi
         write_runtime_value "$STATUS_FILE" "$exit_code"
         /usr/bin/unlink "$PID_FILE" 2>/dev/null || true
@@ -603,9 +606,9 @@ run_worker() {
     exec >> "$LOG_FILE" 2>&1
     write_runtime_value "$PID_FILE" "$$"
     write_runtime_value "$STATUS_FILE" "running"
-    snapshot="$(/usr/bin/mktemp -d /run/e3dc-web-update.snapshot.XXXXXX)"
-    /usr/bin/chown root:root -- "$snapshot"
-    /usr/bin/chmod 0700 -- "$snapshot"
+    WORKER_SNAPSHOT="$(/usr/bin/mktemp -d /run/e3dc-web-update.snapshot.XXXXXX)"
+    /usr/bin/chown root:root -- "$WORKER_SNAPSHOT"
+    /usr/bin/chmod 0700 -- "$WORKER_SNAPSHOT"
 
     identity="$(validate_product_identity)"
     IFS=$'\t' read -r head version extra <<< "$identity"
@@ -614,7 +617,7 @@ run_worker() {
         && -z "${extra:-}" ]] \
         || fail "Gebundene Produktidentität besitzt kein eindeutiges Format"
     printf '[OK] Veröffentlichter Ausgangsstand gebunden: %s\n' "$head"
-    create_execution_snapshot "$head" "$version" "$snapshot"
+    create_execution_snapshot "$head" "$version" "$WORKER_SNAPSHOT"
     [[ "$(git_local_read rev-parse --verify 'HEAD^{commit}')" == "$head" ]] \
         || fail "Ausgangscommit driftete während der Snapshot-Erstellung"
     rebound_state="$(git_local_read status \
@@ -637,7 +640,7 @@ run_worker() {
         E3DC_BOOTSTRAP_USER="$INSTALL_USER" \
         E3DC_INSTALL_ROOT="$INSTALL_ROOT" \
         PYTHONNOUSERSITE=1 \
-        "$PYTHON" -I -B -u "$snapshot/root/installer_main.py" --update-e3dc
+        "$PYTHON" -I -B -u "$WORKER_SNAPSHOT/root/installer_main.py" --update-e3dc
     result=$?
     set -e
     if (( result == 0 )); then

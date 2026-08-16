@@ -267,7 +267,11 @@ def _restore_allowlist(install_path=None):
     return roots, files
 
 
-def _backup_current_version_v2(install_path=None, preserve_backup_paths=None):
+def _backup_current_version_v2(
+    install_path=None,
+    preserve_backup_paths=None,
+    verified_pre_chown_callback=None,
+):
     active_install_path = _lexical_absolute(install_path or INSTALL_PATH)
     backup_dir = None
     try:
@@ -303,18 +307,30 @@ def _backup_current_version_v2(install_path=None, preserve_backup_paths=None):
             install_root=active_install_path,
             systemd_mask_state=systemd_mask_state,
         )
-        verify_backup(backup_dir, expected_kind=SYSTEM_BACKUP_KIND)
-        try:
-            uid, _ = get_user_ids()
-            gid = get_www_data_gid()
-            for root, dirs, files in os.walk(str(backup_dir), followlinks=False):
-                os.chown(root, uid, gid)
-                for name in dirs:
-                    os.chown(os.path.join(root, name), uid, gid)
-                for name in files:
-                    os.chown(os.path.join(root, name), uid, gid)
-        except Exception as exc:
-            raise BackupIntegrityError(f"Backup-Besitzrechte konnten nicht sicher gesetzt werden: {exc}")
+        manifest = verify_backup(backup_dir, expected_kind=SYSTEM_BACKUP_KIND)
+        if verified_pre_chown_callback is not None:
+            if not callable(verified_pre_chown_callback):
+                raise BackupIntegrityError("Backup-Receipt-Callback ist nicht aufrufbar")
+            verified_pre_chown_callback(str(backup_dir), manifest)
+        # Ein Update-Recovery-Receipt darf seine Autorität nicht unmittelbar
+        # nach dem Callback wieder an den Installationsnutzer verlieren. Der
+        # hierfür erzeugte Transaktionsbaum bleibt deshalb root:root 0700;
+        # normale manuelle Backups ohne Receipt behalten ihr bisheriges
+        # Besitzmodell.
+        if verified_pre_chown_callback is None:
+            try:
+                uid, _ = get_user_ids()
+                gid = get_www_data_gid()
+                for root, dirs, files in os.walk(str(backup_dir), followlinks=False):
+                    os.chown(root, uid, gid)
+                    for name in dirs:
+                        os.chown(os.path.join(root, name), uid, gid)
+                    for name in files:
+                        os.chown(os.path.join(root, name), uid, gid)
+            except Exception as exc:
+                raise BackupIntegrityError(
+                    f"Backup-Besitzrechte konnten nicht sicher gesetzt werden: {exc}"
+                )
         preserve = list(preserve_backup_paths or ()) + [backup_dir]
         retention = prune_install_backups(
             active_install_path,
@@ -336,11 +352,16 @@ def _backup_current_version_v2(install_path=None, preserve_backup_paths=None):
         return None
 
 
-def backup_current_version(install_path=None, preserve_backup_paths=None):
+def backup_current_version(
+    install_path=None,
+    preserve_backup_paths=None,
+    verified_pre_chown_callback=None,
+):
     """Create the only supported, complete, manifest-verified system backup."""
     return _backup_current_version_v2(
         install_path=install_path,
         preserve_backup_paths=preserve_backup_paths,
+        verified_pre_chown_callback=verified_pre_chown_callback,
     )
 
 
@@ -614,7 +635,16 @@ def _reload_and_verify_systemd_mask_states(states):
             )
 
 
-def _restore_payload_with_mask_contract(backup_path, manifest, allowed_roots, allowed_files):
+def _restore_payload_with_mask_contract(
+    backup_path,
+    manifest,
+    allowed_roots,
+    allowed_files,
+    *,
+    verified_manifest_guard=None,
+    restored_payload_guard=None,
+    restore_metadata_overrides=None,
+):
     contract = manifest.get("systemd_mask_state")
     if contract is None:
         # Bestehende Schema-2-Backups hatten keinen Maskenvertrag. Sie bleiben
@@ -624,6 +654,9 @@ def _restore_payload_with_mask_contract(backup_path, manifest, allowed_roots, al
             backup_path,
             allowed_roots=allowed_roots,
             allowed_files=allowed_files,
+            restored_payload_guard=restored_payload_guard,
+            restore_metadata_overrides=restore_metadata_overrides,
+            verified_manifest_guard=verified_manifest_guard,
         )
 
     entries = _mask_entries_by_path(contract)
@@ -664,6 +697,9 @@ def _restore_payload_with_mask_contract(backup_path, manifest, allowed_roots, al
             allowed_roots=allowed_roots,
             allowed_files=allowed_files,
             before_commit=apply_masks_before_commit,
+            restored_payload_guard=restored_payload_guard,
+            restore_metadata_overrides=restore_metadata_overrides,
+            verified_manifest_guard=verified_manifest_guard,
         )
     except Exception as exc:
         try:
@@ -677,15 +713,28 @@ def _restore_payload_with_mask_contract(backup_path, manifest, allowed_roots, al
     return restored
 
 
-def restore_verified_backup(backup_path, install_path=None):
+def restore_verified_backup(
+    backup_path,
+    install_path=None,
+    verified_manifest_guard=None,
+    restored_payload_guard=None,
+    restore_metadata_overrides=None,
+):
     """Restore the complete manifested recovery surface without prompting."""
     manifest = verify_backup(backup_path, expected_kind=SYSTEM_BACKUP_KIND)
+    if verified_manifest_guard is not None:
+        if not callable(verified_manifest_guard):
+            raise BackupIntegrityError("Restore-Manifestguard ist nicht aufrufbar")
+        verified_manifest_guard(manifest)
     allowed_roots, allowed_files = _restore_allowlist(install_path)
     restored = _restore_payload_with_mask_contract(
         backup_path,
         manifest,
         allowed_roots,
         allowed_files,
+        verified_manifest_guard=verified_manifest_guard,
+        restored_payload_guard=restored_payload_guard,
+        restore_metadata_overrides=restore_metadata_overrides,
     )
     validate_private_ml_store(PRIVATE_ML_ROOT, allow_missing=True)
     return restored
@@ -813,4 +862,3 @@ def backup_menu():
 
 
 register_command("13", "System-Backup erstellen / verwalten", backup_menu, sort_order=13)
-

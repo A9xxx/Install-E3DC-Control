@@ -12,9 +12,32 @@ export E3DC_INSTALL_PATH="/absoluter/pfad/zur/installation"
 test -f "$E3DC_INSTALL_PATH/e3dc-setup"
 ```
 
+## Updateeigener Rückweg in 5.4.3l
+
+Der in 5.4.3l ergänzte Byte- und Modivertrag gehört ausschließlich zum
+nativen Git-basierten Ziel-Updater: Er bindet Repository, `old_commit`,
+root-eigenes Transaktionsbackup und Update-Transaktion vor der ersten
+Dienstmutation. Bei belegten, weiterhin vorhandenen Änderungen an getrackten
+Dateien stellt dieser Rückweg die gesicherten Bytes wieder her und härtet den
+Dateimodus auf den im gebundenen `old_commit` belegten Git-Modus.
+Unveränderte getrackte Dateien folgen vollständig diesem Ausgangscommit.
+
+Staged Indexstände, ungetrackte oder gelöschte Dateien sowie die unten
+beschriebene manuelle Backup-Wiederherstellung erhalten durch diesen neuen
+Vertrag keine zusätzliche Vollständigkeitszusage. Auch die privilegierte
+Unit-Ausnahme bleibt eng: Nur eine exakt freigegebene historische Familie der
+`e3dc-storage-manager.service` darf atomar in den root-eigenen Unit-Vertrag
+überführt werden; abweichende Units und Drop-ins bleiben gesperrt.
+
+Scheitert dieser updater-eigene Rückweg synchron und nachweisbar, bleibt ein
+transaktionsgebundener systemd-Startschutz für PiGuard und die bekannten
+Writer bestehen. Der Schutz wird erst nach vollständig verifiziertem Rückweg
+entfernt. Das ist keine pauschale Absicherung gegen Stromausfall, `SIGKILL`
+oder einen Prozessabbruch außerhalb des erkannten Fehlerpfads.
+
 ## Programmstand zurücksetzen
 
-Der aktuelle Stable-Stand `v5.4.3k` führt den gebundenen Rückfallvertrag fort.
+Der aktuelle Stable-Stand `v5.4.3l` führt den gebundenen Rückfallvertrag fort.
 
 Beim Rücklauf wird der tatsächliche Dateisystemzustand einer Unit weiterhin
 streng gegen reguläre Unit-Datei, kanonische `/dev/null`-Maske, unerwarteten

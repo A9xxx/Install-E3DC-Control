@@ -1,10 +1,38 @@
 # E3DC-Control Installer
 
-Dokumentation Stand: 5.4.3k
+Dokumentation Stand: 5.4.3l
 
 Der Installer verwaltet Bare-Metal-Installation, Update, Rechte, Dienste,
 Backup, Rollback und optionale Produktmodule. Er ermittelt Benutzer, Home,
 Installationspfad und Python-Umgebung aus dem geprüften Installationskontext.
+
+Der Web-Update-Launcher bleibt absichtlich clean-only und lehnt lokale
+Änderungen an getrackten Produktdateien vor dem Aufruf des Ziel-Updaters ab.
+Die Dirty-Recovery von 5.4.3l gilt ausschließlich für den regulären
+Konsolen-/nativen Root-Updaterpfad; sie lockert das Web-Gate nicht. Im
+Web-Einstieg korrigiert 5.4.3l nur den EXIT-Cleanup, sodass ein früher Abbruch
+seine primäre Fehlermeldung und seinen Exitstatus behält und ein bereits
+angelegter root-eigener Ausführungssnapshot unter `/run` entfernt wird.
+
+Der Installer-Anteil von 5.4.3l bindet den updater-eigenen Git-Rückweg vor
+der ersten Dienstmutation an Repository, `old_commit`, root-eigenes
+Transaktionsbackup und Transaktionskennung. Bei belegten, weiterhin
+vorhandenen Änderungen an getrackten Dateien stellt dieser Rückweg die
+gesicherten Bytes wieder her und härtet den Dateimodus auf den im gebundenen
+`old_commit` belegten Git-Modus. Unveränderte getrackte Dateien folgen
+vollständig dem Ausgangscommit. Staged Indexstände, ungetrackte oder
+gelöschte Dateien sowie allgemeine manuelle Restorepfade gehören nicht zu
+dieser neuen Zusage.
+
+Eine exakt freigegebene historische Familie der
+`e3dc-storage-manager.service` kann vor dem ersten Dienststopp atomar in eine
+root-eigene Unit mit Modus `0644` überführt werden; abweichende Units oder
+Drop-ins bleiben gesperrt. PiGuard mit dem exakten systemd-Zustand
+`activating/auto-restart` wird als zuvor laufender Wächter erfasst. Erkennt
+der Ziel-Updater einen fehlgeschlagenen Rückweg synchron, hält er einen
+transaktionsgebundenen Startschutz für PiGuard und die bekannten Writer. Das
+ist keine pauschale Absicherung gegen Stromausfall, `SIGKILL` oder einen
+Prozessabbruch außerhalb dieses erkannten Fehlerpfads.
 
 Der Installer-Anteil von 5.4.3k schließt zusätzlich den älteren nativen
 `--target-updater-handoff`, der `E3DC_BOOTSTRAP_USER` vor seinem root-eigenen

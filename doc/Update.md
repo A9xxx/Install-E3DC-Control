@@ -5,7 +5,7 @@ Updates werden ausschließlich über den Installer ausgeführt. Ein manuelles
 Release-Historie ungeeignet, weil alter und neuer Git-Stand nicht miteinander
 verwandt sein müssen.
 
-Der aktuelle Stable-Stand ist `v5.4.3k`. Der Ziel-Updater bindet den
+Der aktuelle Stable-Stand ist `v5.4.3l`. Der Ziel-Updater bindet den
 freigegebenen Zielstand vor Backup und Dienststopp eindeutig an Version,
 Herkunft und Anlagenrolle. Fortschritt und Lebenszeichen bleiben auf
 langsameren Raspberry Pis sichtbar. Eine bereits vollständig installierte
@@ -74,6 +74,50 @@ dem Root-Lock aus demselben gültigen Nicht-Root-Eigentümer von Repository und
 Import aus dem Zielcode erneut geprüft. Die fail-closed Grenzen und alle
 übrigen Härtungen aus 5.4.3j bleiben unverändert.
 
+### 5.4.3l: updater-eigener Git-Rückweg
+
+5.4.3l bindet den nativen Rückweg vor der ersten Dienstmutation an
+Repository, `old_commit`, root-eigenes Transaktionsbackup und
+Transaktionskennung. Der konfigurierte Backup-Root und seine Elternkette
+müssen bereits root-kontrolliert und frei von unsicheren Links, ACLs oder
+Attributen sein. Der Updater macht einen ungeeigneten Bestandsordner nicht
+durch nachträgliche Rechteänderungen vertrauenswürdig.
+
+Der Web-Update-Launcher bleibt davon bewusst getrennt und weiterhin
+clean-only: Sobald er lokale Änderungen an getrackten Produktdateien erkennt,
+bricht er vor dem Aufruf des Ziel-Updaters ab. Die nachfolgend beschriebene
+Dirty-Recovery gilt ausschließlich für den regulären Konsolen-/nativen
+Root-Updaterpfad und lockert das Web-Gate nicht. 5.4.3l behebt am Web-Einstieg
+nur den EXIT-Cleanup. Auch bei einem frühen Abbruch bleiben dadurch die
+primäre Fehlermeldung und der Exitstatus erhalten; ein bereits erzeugter
+root-eigener Ausführungssnapshot unter `/run` wird entfernt, ohne den
+Primärfehler durch einen nachgelagerten Snapshot-Scope-Fehler zu überdecken.
+
+Bei belegten, weiterhin vorhandenen Änderungen an getrackten Dateien stellt
+dieser Rückweg die gesicherten Bytes wieder her und härtet den Dateimodus auf
+den im gebundenen `old_commit` belegten Git-Modus. Unveränderte getrackte
+Dateien folgen vollständig diesem Ausgangscommit. Staged Indexstände,
+ungetrackte oder gelöschte Dateien sowie allgemeine manuelle, ZIP- und ältere
+Restorepfade erhalten durch 5.4.3l keine neue Wiederherstellungszusage.
+
+Eine eng freigegebene historische Familie der
+`e3dc-storage-manager.service` wird, falls sie exakt passt, noch vor dem
+ersten Dienststopp atomar in eine neue root-eigene Unit mit Modus `0644`
+überführt. Danach müssen `daemon-reload` und der erneut gelesene effektive
+Unit-Vertrag vollständig passen. Abweichende Units oder fremde Drop-ins
+bleiben gesperrt. PiGuard mit dem exakten Zustand
+`ActiveState=activating`/`SubState=auto-restart` wird als zuvor laufender
+Wächter erfasst, vor den Writer-Diensten gestoppt und im Erfolgs- oder
+belegten Rückweg wieder entsprechend hergestellt.
+
+Scheitert der updater-eigene Rückweg synchron und nachweisbar, bleibt ein an
+dieselbe Transaktion gebundener systemd-Startschutz für PiGuard und die
+bekannten Writer bestehen. Ein vorhandener Marker oder ein nur teilweise
+belegbarer Satz reservierter Startbedingungen blockiert den nächsten normalen
+Updateversuch vor Backup und Dienstmutation. Der Startschutz ist keine
+pauschale Garantie bei Stromausfall, `SIGKILL` oder einem Prozessabbruch
+außerhalb dieses erkannten Fehlerpfads.
+
 Erreicht ein abweichender oder noch älterer lokaler Updater diese gebundene
 Kompatibilitätsbrücke nicht und bricht bereits vor Backup und Dienststopp mit
 `Installationsbenutzer ist nicht lokal gebunden` ab, steht für einen normalen
@@ -83,7 +127,7 @@ GitHub-Release-Seite übernommen werden:
 
 ```bash
 export E3DC_INSTALL_PATH="/absoluter/pfad/zur/installation"
-export E3DC_RELEASE_TAG="v5.4.3k"
+export E3DC_RELEASE_TAG="v5.4.3l"
 export E3DC_RELEASE_SHA="<40-stellige Commit-SHA des veröffentlichten Tags>"
 E3DC_BOOTSTRAP_DIR="$(mktemp -d)"
 curl -fL "https://github.com/A9xxx/Install-E3DC-Control/archive/refs/tags/${E3DC_RELEASE_TAG}.tar.gz" \
@@ -167,6 +211,12 @@ deren Dienst-, Rollen- und Gesundheitsnachweis vollständig gelingt, werden die
 Writer wieder freigegeben; andernfalls bleiben sie fail-closed gestoppt. Das
 Zeitlimit wird nicht durch stilles Weiterwarten oder ein schwächeres
 Gesundheitsgate umgangen.
+
+Seit 5.4.3l hinterlässt ein von diesem Ziel-Updater synchron erkannter und
+nicht vollständig behebbarer Recoveryfehler zusätzlich den oben beschriebenen
+persistenten Startschutz. Diese Aussage erweitert weder ältere noch manuelle
+Restorepfade und setzt voraus, dass der laufende Fehlerpfad den Schutz selbst
+belegen konnte.
 
 Wenn `--check` eine fehlende Web-/sudo-Freigabe meldet:
 
@@ -451,13 +501,19 @@ keinen gemeinsamen Vorfahren mit dem neuen Verlauf besitzen.
 Sobald der neue Updater selbst läuft, führt er den Wechsel in dieser
 Reihenfolge aus:
 
-1. externes Backup mit vollständigem Manifest, SHA-256 und dem Zustand
-   kanonischer systemd-Masken erstellen;
-2. alle katalogisierten Writer-/Integrationsdienste und den Watchdog stoppen;
-3. annotierten Ziel-Tag und vollständigen Ziel-SHA gegen manuelle Freigabe
-   beziehungsweise die Rollback-Policy binden;
-4. `UPDATE_POLICY.json` direkt aus dem verifizierten Commit-Objekt lesen;
-5. den Installationsbaum auf genau diesen SHA setzen und `HEAD` erneut prüfen;
+1. annotierten Ziel-Tag, vollständigen Ziel-SHA und
+   `UPDATE_POLICY.json` aus dem verifizierten Commit-Objekt gegen Freigabe,
+   Ausgangsrepository und Rolle binden;
+2. ein externes, root-eigenes Backup mit vollständigem Manifest, SHA-256,
+   Git-Ausgangszustand und dem Zustand kanonischer systemd-Masken erstellen
+   und mit einem Transaktionsbeleg erneut prüfen;
+3. eine exakt freigegebene historische Storage-Manager-Unit gegebenenfalls
+   atomar auf den root-eigenen Vertrag migrieren, `daemon-reload` ausführen
+   und das effektive Unit-Bündel erneut lesen;
+4. PiGuard und danach alle katalogisierten Writer-/Integrationsdienste stoppen
+   und ihren Endzustand streng prüfen;
+5. den Installationsbaum auf genau den Ziel-SHA setzen und `HEAD` erneut
+   prüfen;
 6. einen eigenen Target-Finalizer aus einem separaten root-eigenen,
    schreibgeschützten Ausführungssnapshot des verifizierten Zielcommits gegen
    Ziel-SHA, Ziel-Tag und gebundene Ausgangsdaten prüfen und starten;

@@ -1,3 +1,91 @@
+# E3DC-Control v5.4.3l
+
+E3DC-Control 5.4.3l härtet ausschließlich den nativen Ziel-Updater und dessen
+eigenen Git-basierten Rückweg. Lokale getrackte Änderungen, eine eng bekannte
+historische Storage-Manager-Unit und PiGuard im Auto-Restart-Zustand werden
+transaktionsgebunden behandelt. Die EMS-Regelung bleibt gegenüber 5.4.3k
+unverändert.
+
+## Web-Update bleibt clean-only
+
+- Der Web-Update-Launcher lehnt lokale Änderungen an getrackten
+  Produktdateien weiterhin vor dem Aufruf des Ziel-Updaters ab. Die neue
+  Dirty-Recovery ist ausschließlich ein Vertrag des regulären
+  Konsolen-/nativen Root-Updaterpfads und keine Freigabe, dieses Web-Gate zu
+  umgehen.
+- 5.4.3l korrigiert im Web-Launcher ausschließlich den EXIT-Cleanup. Bei einem
+  frühen Fehler bleiben die primäre Fehlermeldung und der zugehörige
+  Exitstatus erhalten; ein bereits erstellter root-eigener
+  Ausführungssnapshot unter `/run` wird entfernt. Der Cleanup erzeugt damit
+  keinen nachgelagerten Fehler wegen eines nicht mehr gebundenen
+  Snapshot-Namens.
+
+## Git-gebundener Ausgangszustand und Backup
+
+- Vor der ersten Dienstmutation bindet der Ziel-Updater Repository,
+  `old_commit`, root-eigenes Transaktionsbackup und Transaktionskennung an
+  einen gemeinsamen Beleg. Der konfigurierte Backup-Root und seine
+  Verzeichniskette müssen bereits root-kontrolliert und frei von unsicheren
+  Links, ACLs und Attributen sein; ein ungeeigneter Bestand wird nicht durch
+  nachträgliches `chmod` oder einen Marker vertrauenswürdig gemacht.
+- Das Backup bleibt während des Releasewechsels root-eigen. Seine Manifeste,
+  Nutzdaten und privilegierten Dateiketten werden gegen denselben Beleg
+  geprüft, bevor der Rückweg sie verwendet.
+- Bei belegten, weiterhin vorhandenen Änderungen an getrackten Dateien stellt
+  der Rückweg die gesicherten Bytes wieder her und härtet den Dateimodus auf
+  den im gebundenen `old_commit` belegten Git-Modus. Unveränderte getrackte
+  Dateien werden vollständig aus diesem Ausgangscommit rekonstruiert; die
+  kanonischen Produktmodi werden im Endgate erneut geprüft.
+
+## Historische Storage-Unit und PiGuard
+
+- Ausschließlich eine exakt freigegebene ältere Familie der
+  `e3dc-storage-manager.service` darf vor dem ersten Dienststopp atomar durch
+  eine neue root-eigene reguläre Datei mit Modus `0644` ersetzt werden. Die
+  Prüfung bindet Inhalt, Eigentümer, Modus, Linkzahl, ACLs, Attribute und die
+  freigegebenen effektiven Drop-ins. Abweichende oder zusätzliche Unit-Inhalte
+  bleiben ein harter Abbruchgrund.
+- Nach der atomaren Veröffentlichung verlangt der Updater ein erfolgreiches
+  `daemon-reload` und liest den wirksamen Unit-Vertrag erneut. Erst danach
+  werden PiGuard und anschließend die bekannten Writer-Dienste gestoppt.
+- Der exakte Zustand `ActiveState=activating` mit
+  `SubState=auto-restart` gilt bei PiGuard als voraktiver Zustand. Er wird wie
+  ein zuvor laufender Wächter erfasst, kontrolliert gestoppt und nach einem
+  erfolgreichen Update oder Rückweg wiederhergestellt. Andere unklare
+  Zustände werden nicht automatisch als aktiv oder inaktiv eingeordnet.
+
+## Persistenter Schutz nach erkanntem Recoveryfehler
+
+- Wird ein Wiederherstellungsfehler vom laufenden Ziel-Updater synchron
+  erkannt, bleiben eine transaktionsgebundene Markierung und eng geprüfte
+  systemd-Startbedingungen bestehen. Sie verhindern nach einem Neustart den
+  unbeabsichtigten Start von PiGuard und den bekannten Writer-Diensten.
+- Ein vorhandener Marker oder ein nur teilweise nachweisbarer Satz dieser
+  reservierten Startbedingungen blockiert einen neuen normalen Updateversuch
+  vor Backup, Dienststopp und Produktmutation. Fremde oder widersprüchliche
+  Bedingungen werden nicht übernommen oder still entfernt.
+- Der Schutz wird erst nach vollständig verifiziertem Rückweg entfernt. Die
+  Wiederherstellung prüft davor Produktdateien, privilegierte Dateien,
+  Dienstzustände, Rolle und den wirksamen systemd-Vertrag.
+
+## Evidenzgrenzen
+
+- Der neue Byte- und Modivertrag gilt ausschließlich für den updater-eigenen,
+  nativen Git-Rückweg aus dem gebundenen `old_commit`. Staged Indexstände,
+  ungetrackte oder gelöschte Dateien sowie manuelle, ZIP- und ältere
+  Restorepfade erhalten durch 5.4.3l keine neue Wiederherstellungszusage.
+- Der persistente Startschutz gilt ausschließlich, wenn der laufende
+  Ziel-Updater den Recoveryfehler synchron erkennt und den Schutz belegen
+  kann. Stromausfall, `SIGKILL` oder ein Prozessabbruch außerhalb dieses
+  Fehlerpfads sind damit nicht pauschal abgesichert.
+- Die Storage-Ausnahme ist keine allgemeine Freigabe für nutzereigene oder
+  abweichende systemd-Units. Ebenso erweitert 5.4.3l nicht pauschal die
+  Installationsnutzer-Erkennung anderer, nicht gebundener Alt-Updater.
+- HA-, Wallbox-, Speicher-, Wärme- und Direktvermarktungslogik sowie
+  Hardwareausgänge ändern sich nicht.
+
+---
+
 # E3DC-Control v5.4.3k
 
 E3DC-Control 5.4.3k schließt zusätzlich den älteren nativen Aufruf mit

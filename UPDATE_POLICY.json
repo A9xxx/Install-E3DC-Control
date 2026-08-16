@@ -1,9 +1,9 @@
 {
-  "version": "5.4.3k",
+  "version": "5.4.3l",
   "min_version": "4.0.0",
-  "stable_release": "v5.4.3k",
+  "stable_release": "v5.4.3l",
   "release_date": "2026-08-16",
-  "description": "v5.4.3k - Gebundene native Legacy-Ziel-Snapshots",
+  "description": "v5.4.3l - Git-gebundener Update-Rückweg und sichere Kernunits",
   "installer_requires": "python3",
   "sanitized_republication": false,
   "history_transition": {

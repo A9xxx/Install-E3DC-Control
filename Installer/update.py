@@ -1,4 +1,5 @@
 import ast
+import errno
 import os
 import sys
 import json
@@ -37,8 +38,20 @@ except Exception:
 
 from .core import register_command
 from .backup import backup_current_version, restore_verified_backup
-from .backup_integrity import _open_directory_nofollow, _open_regular_file_nofollow
+from .backup_integrity import (
+    MANIFEST_NAME,
+    SYSTEM_BACKUP_KIND,
+    _open_directory_nofollow,
+    _open_regular_file_nofollow,
+    configured_backup_root,
+    validate_existing_backup_root,
+    verify_backup,
+)
 from .utils import (
+    StorageUnitMigrationError,
+    _approved_storage_manager_unit_payloads,
+    _migrate_approved_storage_manager_unit_owner,
+    capture_systemd_service_bundle,
     cleanup_pycache,
     ensure_manager_lock_namespace,
     require_bound_venv_runtime,
@@ -83,6 +96,18 @@ SELFUPDATE_ALLOWED_ORIGINS = frozenset((SELFUPDATE_REPO, SELFUPDATE_REPO.removes
 WATCHDOG_PAUSE_FILE = '/var/www/html/ramdisk/watchdog.update_pause'
 WATCHDOG_GRACE_FILE = '/var/www/html/ramdisk/watchdog.update_grace'
 WATCHDOG_POST_UPDATE_GRACE_S = 300
+RECOVERY_BOOTBLOCK_STATE_DIR = "/var/lib/e3dc-update-safety"
+RECOVERY_BOOTBLOCK_MARKER = os.path.join(
+    RECOVERY_BOOTBLOCK_STATE_DIR,
+    "recovery.block",
+)
+RECOVERY_BOOTBLOCK_DROPIN_NAME = "00-e3dc-recovery-bootblock.conf"
+RECOVERY_BOOTBLOCK_DROPIN_PAYLOAD = (
+    "# E3DC_RECOVERY_BOOTBLOCK_V1\n"
+    "[Unit]\n"
+    f"ConditionPathExists=!{RECOVERY_BOOTBLOCK_MARKER}\n"
+).encode("utf-8")
+RECOVERY_BOOTBLOCK_TRANSACTION_RE = re.compile(r"[0-9a-f]{64}\Z")
 
 FULL_COMMIT_RE = re.compile(r"[0-9a-f]{40}\Z")
 PACKAGE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.+-]*\Z")
@@ -479,6 +504,115 @@ class RecoverySurfaceInventory:
 
 
 @dataclass(frozen=True)
+class RepoRecoveryContract:
+    install_root: str
+    install_user: str
+    expected_commit: str
+    tracked_files: tuple[tuple[str, int, str, str, int, int, int, int], ...]
+    dirty_paths: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class PrivilegedBackupFileReceipt:
+    restore_path: str
+    category: str
+    backup_relative_path: str
+    parent_path_chain: tuple[tuple[str, int, int, int, int, int], ...]
+    dev: int
+    ino: int
+    sha256: str
+    size: int
+    mode: int
+    uid: int
+    gid: int
+    nlink: int
+    mtime_ns: int
+    ctime_ns: int
+
+
+@dataclass(frozen=True)
+class RecoveryBackupReceipt:
+    backup_dir: str
+    backup_dev: int
+    backup_ino: int
+    parent_dev: int
+    parent_ino: int
+    backup_path_chain: tuple[tuple[str, int, int, int, int, int], ...]
+    transaction_id: str
+    backup_id: str
+    manifest_sha256: str
+    manifest_semantic_sha256: str
+    install_root: str
+    expected_commit: str
+    tracked_files: tuple[tuple[str, str, int, int, int, int], ...]
+    tracked_directories: tuple[tuple[str, int, int, int], ...]
+    manifest_files: tuple[tuple[str, str, int, int, int, int, str, str], ...]
+    privileged_files: tuple[tuple[str, str, str, int, int, int, int], ...]
+    privileged_backup_files: tuple[PrivilegedBackupFileReceipt, ...]
+
+
+@dataclass(frozen=True)
+class RecoveryBootblockContract:
+    units: tuple[str, ...]
+    created_directories: tuple[str, ...]
+    transaction_id: str
+    dropin_identities: tuple[tuple[str, int, int], ...]
+
+
+@dataclass(frozen=True)
+class RecoveryBootblockPartialContract:
+    """Bewahrt jeden bereits erzeugten eigenen Drop-in-Inode bis zur Vollendung."""
+
+    units: tuple[str, ...]
+    created_directories: tuple[str, ...]
+    transaction_id: str
+    dropin_identities: tuple[tuple[str, int, int], ...]
+    allow_missing_directories: bool
+
+
+class RecoveryBootblockArmError(RuntimeError):
+    """Bewahrt den eigenen Inodevertrag, falls ein Fresh-Arm nicht abräumen kann."""
+
+    def __init__(
+        self,
+        message: str,
+        contract: RecoveryBootblockContract | RecoveryBootblockPartialContract,
+    ):
+        self.contract = contract
+        super().__init__(message)
+
+
+@dataclass(frozen=True)
+class RecoveryTransitionResult:
+    recovered: bool
+    bootblock_contract: (
+        RecoveryBootblockContract | RecoveryBootblockPartialContract | None
+    )
+
+    def __bool__(self) -> bool:
+        return self.recovered
+
+    def __iter__(self):
+        yield self.recovered
+        yield self.bootblock_contract
+
+
+@dataclass(frozen=True)
+class RecoveryBootblockEnforcementResult:
+    enforced: bool
+    bootblock_contract: (
+        RecoveryBootblockContract | RecoveryBootblockPartialContract | None
+    )
+
+    def __bool__(self) -> bool:
+        return self.enforced
+
+    def __iter__(self):
+        yield self.enforced
+        yield self.bootblock_contract
+
+
+@dataclass(frozen=True)
 class PackageTransactionState:
     apt_before: frozenset[str]
     pip_before: tuple[tuple[str, str], ...]
@@ -513,13 +647,28 @@ def _run_argv(argv, *, timeout: int = 30, env=None) -> dict:
             check=False,
             env=env,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return {"success": False, "stdout": "", "stderr": str(exc), "returncode": -1}
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "success": False,
+            "stdout": "",
+            "stderr": str(exc),
+            "returncode": -1,
+            "timed_out": True,
+        }
+    except OSError as exc:
+        return {
+            "success": False,
+            "stdout": "",
+            "stderr": str(exc),
+            "returncode": -1,
+            "timed_out": False,
+        }
     return {
         "success": completed.returncode == 0,
         "stdout": completed.stdout or "",
         "stderr": completed.stderr or "",
         "returncode": completed.returncode,
+        "timed_out": False,
     }
 
 
@@ -1198,6 +1347,1115 @@ INSTALL_CENTER_CORE_SERVICES = (
     'e3dc-notifier',
 )
 
+PIGUARD_UNIT = "piguard.service"
+PIGUARD_FRAGMENT_PATH = "/etc/systemd/system/piguard.service"
+
+
+def _recovery_bootblock_units() -> tuple[str, ...]:
+    units = tuple(dict.fromkeys(
+        tuple(
+            f"{name}.service"
+            for name in _catalog_service_names(include_legacy=True)
+        )
+        + (PIGUARD_UNIT,)
+    ))
+    if not units or len(set(units)) != len(units):
+        raise RuntimeError("Recovery-Bootblock besitzt keinen eindeutigen Unitumfang")
+    if any(
+        not re.fullmatch(r"[A-Za-z0-9_.@-]+\.service", unit)
+        for unit in units
+    ):
+        raise RuntimeError("Recovery-Bootblock enthält einen ungültigen Unitnamen")
+    return units
+
+
+def _require_root_controlled_directory(descriptor: int, label: str, mode: int | None = None):
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        or (mode is not None and stat.S_IMODE(metadata.st_mode) != mode)
+        or _repo_descriptor_has_unsafe_xattrs(descriptor)
+    ):
+        raise RuntimeError(f"Recovery-Bootblock-Verzeichnis ist unsicher: {label}")
+    return metadata
+
+
+def _read_exact_root_file_at(
+    parent_descriptor: int,
+    name: str,
+    payload: bytes,
+    mode: int,
+    *,
+    allow_missing: bool = False,
+):
+    try:
+        before = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        if allow_missing:
+            return None
+        raise
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if not nofollow:
+        raise RuntimeError("Recovery-Bootblock benötigt O_NOFOLLOW")
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+        or before.st_uid != 0
+        or before.st_gid != 0
+        or stat.S_IMODE(before.st_mode) != mode
+        or before.st_size != len(payload)
+    ):
+        raise RuntimeError(f"Recovery-Bootblock-Datei ist unsicher: {name}")
+    descriptor = os.open(
+        name,
+        os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0),
+        dir_fd=parent_descriptor,
+    )
+    try:
+        opened = os.fstat(descriptor)
+        signature = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+            before.st_nlink,
+            before.st_uid,
+            before.st_gid,
+            stat.S_IMODE(before.st_mode),
+        )
+        if signature != (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_size,
+            opened.st_mtime_ns,
+            opened.st_ctime_ns,
+            opened.st_nlink,
+            opened.st_uid,
+            opened.st_gid,
+            stat.S_IMODE(opened.st_mode),
+        ) or _repo_descriptor_has_unsafe_xattrs(descriptor):
+            raise RuntimeError(f"Recovery-Bootblock-Datei driftete beim Öffnen: {name}")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        actual = bytearray()
+        while len(actual) <= len(payload):
+            block = os.read(descriptor, len(payload) + 1 - len(actual))
+            if not block:
+                break
+            actual.extend(block)
+        after = os.fstat(descriptor)
+        named_after = os.stat(
+            name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            bytes(actual) != payload
+            or signature
+            != (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+                after.st_nlink,
+                after.st_uid,
+                after.st_gid,
+                stat.S_IMODE(after.st_mode),
+            )
+            or signature
+            != (
+                named_after.st_dev,
+                named_after.st_ino,
+                named_after.st_size,
+                named_after.st_mtime_ns,
+                named_after.st_ctime_ns,
+                named_after.st_nlink,
+                named_after.st_uid,
+                named_after.st_gid,
+                stat.S_IMODE(named_after.st_mode),
+            )
+        ):
+            raise RuntimeError(f"Recovery-Bootblock-Datei besitzt falsche Bytes: {name}")
+        return after
+    finally:
+        os.close(descriptor)
+
+
+def _create_exact_root_file_at(
+    parent_descriptor: int,
+    name: str,
+    payload: bytes,
+    mode: int,
+) -> None:
+    if _read_exact_root_file_at(
+        parent_descriptor,
+        name,
+        payload,
+        mode,
+        allow_missing=True,
+    ) is not None:
+        return
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if not nofollow:
+        raise RuntimeError("Recovery-Bootblock benötigt O_NOFOLLOW")
+    temporary_name = f".e3dc-recovery-{os.getpid()}-{secrets.token_hex(12)}"
+    descriptor = None
+    linked = False
+    try:
+        descriptor = os.open(
+            temporary_name,
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_EXCL
+            | nofollow
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=parent_descriptor,
+        )
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise RuntimeError("Recovery-Bootblock-Datei konnte nicht geschrieben werden")
+            view = view[written:]
+        os.fchown(descriptor, 0, 0)
+        os.fchmod(descriptor, mode)
+        os.fsync(descriptor)
+        temporary = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(temporary.st_mode)
+            or temporary.st_nlink != 1
+            or temporary.st_uid != 0
+            or temporary.st_gid != 0
+            or stat.S_IMODE(temporary.st_mode) != mode
+            or temporary.st_size != len(payload)
+            or _repo_descriptor_has_unsafe_xattrs(descriptor)
+        ):
+            raise RuntimeError("Temporärer Recovery-Bootblock ist unsicher")
+        # linkat wirkt im root-kontrollierten Verzeichnis als atomare
+        # NOREPLACE-Installation; ein vorhandener reservierter Name wird nie
+        # überschrieben.
+        os.link(
+            temporary_name,
+            name,
+            src_dir_fd=parent_descriptor,
+            dst_dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        linked = True
+        os.unlink(temporary_name, dir_fd=parent_descriptor)
+        os.fsync(parent_descriptor)
+        _read_exact_root_file_at(parent_descriptor, name, payload, mode)
+    except Exception:
+        if linked:
+            try:
+                current = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+                opened = os.fstat(descriptor) if descriptor is not None else None
+                if opened is not None and (current.st_dev, current.st_ino) == (
+                    opened.st_dev,
+                    opened.st_ino,
+                ):
+                    os.unlink(name, dir_fd=parent_descriptor)
+            except (FileNotFoundError, OSError):
+                pass
+        try:
+            os.unlink(temporary_name, dir_fd=parent_descriptor)
+        except FileNotFoundError:
+            pass
+        raise
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _open_or_create_recovery_directory(
+    parent_descriptor: int,
+    name: str,
+    *,
+    mode: int,
+    label: str,
+) -> tuple[int, bool]:
+    created = False
+    try:
+        before = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        os.mkdir(name, mode, dir_fd=parent_descriptor)
+        os.fsync(parent_descriptor)
+        before = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        created = True
+    if not stat.S_ISDIR(before.st_mode):
+        raise RuntimeError(f"Recovery-Bootblock-Pfad ist kein Verzeichnis: {label}")
+    directory = getattr(os, "O_DIRECTORY", 0)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if not directory or not nofollow:
+        raise RuntimeError("Recovery-Bootblock benötigt O_DIRECTORY und O_NOFOLLOW")
+    descriptor = os.open(
+        name,
+        os.O_RDONLY | directory | nofollow | getattr(os, "O_CLOEXEC", 0),
+        dir_fd=parent_descriptor,
+    )
+    try:
+        opened = _require_root_controlled_directory(descriptor, label, mode)
+        named_after = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino) or (
+            named_after.st_dev,
+            named_after.st_ino,
+        ) != (opened.st_dev, opened.st_ino):
+            raise RuntimeError(f"Recovery-Bootblock-Verzeichnis driftete: {label}")
+        return descriptor, created
+    except Exception:
+        os.close(descriptor)
+        if created:
+            try:
+                os.rmdir(name, dir_fd=parent_descriptor)
+            except OSError:
+                pass
+        raise
+
+
+def _recovery_dropin_path(unit: str) -> str:
+    return os.path.join(
+        "/etc/systemd/system",
+        f"{unit}.d",
+        RECOVERY_BOOTBLOCK_DROPIN_NAME,
+    )
+
+
+def _recovery_bootblock_marker_payload(transaction_id: str) -> bytes:
+    value = str(transaction_id or "")
+    if not RECOVERY_BOOTBLOCK_TRANSACTION_RE.fullmatch(value):
+        raise RuntimeError("Recovery-Bootblock besitzt keine gültige Transaktions-ID")
+    return f"E3DC_RECOVERY_BOOTBLOCK_V2:{value}\n".encode("ascii")
+
+
+def _validate_recovery_bootblock_contract(
+    contract: RecoveryBootblockContract,
+) -> dict[str, tuple[int, int]]:
+    if (
+        not isinstance(contract, RecoveryBootblockContract)
+        or contract.units != _recovery_bootblock_units()
+        or not RECOVERY_BOOTBLOCK_TRANSACTION_RE.fullmatch(contract.transaction_id)
+        or not set(contract.created_directories).issubset(contract.units)
+    ):
+        raise RuntimeError("Recovery-Bootblock-Vertrag driftete")
+    identities = {
+        str(unit): (int(device), int(inode))
+        for unit, device, inode in contract.dropin_identities
+    }
+    if (
+        len(identities) != len(contract.dropin_identities)
+        or set(identities) != set(contract.units)
+        or any(device < 0 or inode <= 0 for device, inode in identities.values())
+    ):
+        raise RuntimeError("Recovery-Bootblock-Inodevertrag driftete")
+    return identities
+
+
+def _validate_partial_recovery_bootblock_contract(
+    contract: RecoveryBootblockPartialContract,
+) -> dict[str, tuple[int, int]]:
+    if (
+        not isinstance(contract, RecoveryBootblockPartialContract)
+        or contract.units != _recovery_bootblock_units()
+        or not RECOVERY_BOOTBLOCK_TRANSACTION_RE.fullmatch(contract.transaction_id)
+        or not set(contract.created_directories).issubset(contract.units)
+        or len(set(contract.created_directories)) != len(contract.created_directories)
+        or not isinstance(contract.allow_missing_directories, bool)
+    ):
+        raise RuntimeError("Partieller Recovery-Bootblock-Vertrag driftete")
+    identities = {
+        str(unit): (int(device), int(inode))
+        for unit, device, inode in contract.dropin_identities
+    }
+    if (
+        len(identities) != len(contract.dropin_identities)
+        or not set(identities).issubset(contract.units)
+        or any(device < 0 or inode <= 0 for device, inode in identities.values())
+    ):
+        raise RuntimeError("Partieller Recovery-Bootblock-Inodevertrag driftete")
+    return identities
+
+
+def _assert_no_existing_recovery_bootblock() -> None:
+    """Blockiert einen neuen Updatepfad bei jedem fremden/stalen Recovery-Gate."""
+
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        raise RuntimeError("Recovery-Bootblock-Preflight darf ausschließlich Root ausführen")
+    var_lib_descriptor = _open_directory_nofollow("/var/lib")
+    try:
+        _require_root_controlled_directory(var_lib_descriptor, "/var/lib")
+        state_name = Path(RECOVERY_BOOTBLOCK_STATE_DIR).name
+        try:
+            state_before = os.stat(
+                state_name,
+                dir_fd=var_lib_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            if not stat.S_ISDIR(state_before.st_mode):
+                raise RuntimeError("Recovery-Bootblock-Statepfad ist nicht sicher")
+            state_descriptor = os.open(
+                state_name,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=var_lib_descriptor,
+            )
+            try:
+                opened = _require_root_controlled_directory(
+                    state_descriptor,
+                    RECOVERY_BOOTBLOCK_STATE_DIR,
+                    0o700,
+                )
+                if (opened.st_dev, opened.st_ino) != (
+                    state_before.st_dev,
+                    state_before.st_ino,
+                ):
+                    raise RuntimeError("Recovery-Bootblock-Statepfad driftete")
+                if Path(RECOVERY_BOOTBLOCK_MARKER).name in set(
+                    os.listdir(state_descriptor)
+                ):
+                    raise RuntimeError(
+                        "Vorhandener Recovery-Bootblock-Marker sperrt einen neuen Updatepfad"
+                    )
+            finally:
+                os.close(state_descriptor)
+    finally:
+        os.close(var_lib_descriptor)
+
+    systemd_descriptor = _open_directory_nofollow("/etc/systemd/system")
+    try:
+        _require_root_controlled_directory(systemd_descriptor, "/etc/systemd/system")
+        for entry in os.listdir(systemd_descriptor):
+            if not entry.endswith(".d"):
+                continue
+            before = os.stat(entry, dir_fd=systemd_descriptor, follow_symlinks=False)
+            if not stat.S_ISDIR(before.st_mode):
+                raise RuntimeError(
+                    f"Systemd-Drop-in-Pfad ist nicht sicher prüfbar: {entry}"
+                )
+            directory_descriptor = os.open(
+                entry,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=systemd_descriptor,
+            )
+            try:
+                opened = _require_root_controlled_directory(
+                    directory_descriptor,
+                    f"/etc/systemd/system/{entry}",
+                )
+                named_after = os.stat(
+                    entry,
+                    dir_fd=systemd_descriptor,
+                    follow_symlinks=False,
+                )
+                if (
+                    (opened.st_dev, opened.st_ino)
+                    != (before.st_dev, before.st_ino)
+                    or (named_after.st_dev, named_after.st_ino)
+                    != (opened.st_dev, opened.st_ino)
+                ):
+                    raise RuntimeError(f"Systemd-Drop-in-Pfad driftete: {entry}")
+                if RECOVERY_BOOTBLOCK_DROPIN_NAME in set(
+                    os.listdir(directory_descriptor)
+                ):
+                    raise RuntimeError(
+                        "Vorhandenes Recovery-Bootblock-Drop-in sperrt einen neuen Updatepfad"
+                    )
+            finally:
+                os.close(directory_descriptor)
+    finally:
+        os.close(systemd_descriptor)
+
+
+def _assert_exclusive_not_found_recovery_dropin(unit: str) -> None:
+    """Bindet bei fehlendem Fragment die vollständige On-Disk-Drop-in-Fläche."""
+
+    systemd_descriptor = _open_directory_nofollow("/etc/systemd/system")
+    directory_descriptor = None
+    directory_name = f"{unit}.d"
+    try:
+        _require_root_controlled_directory(
+            systemd_descriptor,
+            "/etc/systemd/system",
+        )
+        before = os.stat(
+            directory_name,
+            dir_fd=systemd_descriptor,
+            follow_symlinks=False,
+        )
+        if not stat.S_ISDIR(before.st_mode):
+            raise RuntimeError(
+                f"Recovery-Bootblock-Pfad ist kein Verzeichnis: {unit}"
+            )
+        directory_descriptor = os.open(
+            directory_name,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=systemd_descriptor,
+        )
+        opened = _require_root_controlled_directory(
+            directory_descriptor,
+            _recovery_dropin_path(unit),
+            0o755,
+        )
+        named_after = os.stat(
+            directory_name,
+            dir_fd=systemd_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            (before.st_dev, before.st_ino)
+            != (opened.st_dev, opened.st_ino)
+            or (named_after.st_dev, named_after.st_ino)
+            != (opened.st_dev, opened.st_ino)
+        ):
+            raise RuntimeError(
+                f"Recovery-Bootblock-Pfad driftete bei not-found: {unit}"
+            )
+        entries = os.listdir(directory_descriptor)
+        if entries != [RECOVERY_BOOTBLOCK_DROPIN_NAME]:
+            raise RuntimeError(
+                "Fehlende systemd-Unit besitzt eine fremde On-Disk-Drop-in-Fläche: "
+                f"{unit}"
+            )
+        _read_exact_root_file_at(
+            directory_descriptor,
+            RECOVERY_BOOTBLOCK_DROPIN_NAME,
+            RECOVERY_BOOTBLOCK_DROPIN_PAYLOAD,
+            0o644,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            f"Recovery-Bootblock-Pfad fehlt bei not-found: {unit}"
+        ) from exc
+    finally:
+        if directory_descriptor is not None:
+            os.close(directory_descriptor)
+        os.close(systemd_descriptor)
+
+
+def _reload_and_verify_recovery_dropins(
+    units: tuple[str, ...],
+    *,
+    expected_present: bool,
+) -> None:
+    systemd_env = dict(os.environ)
+    systemd_env.update({"LC_ALL": "C", "LANG": "C"})
+    reload_result = _run_argv(
+        ["systemctl", "daemon-reload"],
+        timeout=30,
+        env=systemd_env,
+    )
+    if (
+        not reload_result.get("success")
+        or reload_result.get("timed_out")
+        or str(reload_result.get("stderr") or "")
+        or int(reload_result.get("returncode", -1)) != 0
+    ):
+        raise RuntimeError(
+            "systemd daemon-reload für Recovery-Bootblock fehlgeschlagen: "
+            + _combined_process_diagnostics(reload_result, maximum=800)
+        )
+    marker = "# E3DC_RECOVERY_BOOTBLOCK_V1"
+    def show_value(unit: str, property_name: str) -> str:
+        result = _run_argv(
+            [
+                "systemctl",
+                "show",
+                f"--property={property_name}",
+                "--value",
+                unit,
+            ],
+            timeout=15,
+            env=systemd_env,
+        )
+        output = str(result.get("stdout") or "")
+        if (
+            not result.get("success")
+            or result.get("timed_out")
+            or str(result.get("stderr") or "")
+            or int(result.get("returncode", -1)) != 0
+            or "\x00" in output
+            or len(output.splitlines()) > 1
+        ):
+            raise RuntimeError(
+                f"systemd-{property_name}-Readback ist unklar: {unit}"
+            )
+        return output.strip()
+
+    for unit in units:
+        load_state = show_value(unit, "LoadState").lower()
+        result = _run_argv(
+            ["systemctl", "cat", "--no-pager", unit],
+            timeout=15,
+            env=systemd_env,
+        )
+        output = str(result.get("stdout") or "")
+        stderr = str(result.get("stderr") or "")
+        if "\x00" in output or "\x00" in stderr:
+            raise RuntimeError(f"systemd-cat-Readback enthält NUL: {unit}")
+        canonical_not_found = bool(
+            not result.get("success")
+            and not result.get("timed_out")
+            and int(result.get("returncode", -1)) == 1
+            and output == ""
+            and stderr == f"No files found for {unit}.\n"
+        )
+        dropin_value = show_value(unit, "DropInPaths")
+        try:
+            dropin_paths = tuple(shlex.split(dropin_value)) if dropin_value else ()
+        except ValueError as exc:
+            raise RuntimeError(
+                f"systemd-DropInPaths sind nicht eindeutig lesbar: {unit}"
+            ) from exc
+        own_dropin = _recovery_dropin_path(unit)
+        marker_lines = [line for line in output.splitlines() if line.strip() == marker]
+        effective_conditions = []
+        condition_syntax_ambiguous = False
+        for line in output.splitlines():
+            match = re.fullmatch(r"\s*(Condition[A-Za-z0-9]+)\s*=(.*)", line)
+            stripped = line.lstrip()
+            if (
+                stripped.startswith("Condition")
+                and not stripped.startswith(("#", ";"))
+                and match is None
+            ):
+                condition_syntax_ambiguous = True
+            if match:
+                assignment = (match.group(1), match.group(2).strip())
+                if assignment[1].endswith("\\"):
+                    condition_syntax_ambiguous = True
+                # systemd setzt bei jeder leeren Condition*-Zuweisung die
+                # komplette bis dahin aufgebaute Condition-Liste zurück.
+                # Wir werten deshalb die zusammengefügte Unit in derselben
+                # Reihenfolge aus, statt bloß Textvorkommen zu zählen.
+                if not assignment[1]:
+                    effective_conditions.clear()
+                else:
+                    effective_conditions.append(assignment)
+        marker_path_conditions = [
+            value
+            for name, value in effective_conditions
+            if name == "ConditionPathExists"
+            and value.lstrip("|!") == RECOVERY_BOOTBLOCK_MARKER
+        ]
+
+        if expected_present:
+            # Eine exakt maskierte Unit ist bereits stärker rebootfest
+            # gesperrt; systemd muss deren Drop-in nicht in die effektive
+            # Unitansicht aufnehmen.
+            if load_state == "masked":
+                if show_value(unit, "UnitFileState").lower() != "masked":
+                    raise RuntimeError(
+                        f"Nur eine persistente systemd-Maske sperrt rebootfest: {unit}"
+                    )
+                continue
+            # Katalogisierte optionale Units dürfen auf heterogenen Anlagen
+            # vollständig fehlen. `not-found` ist nur dann ein sicherer
+            # Abwesenheitsbeweis, wenn systemd weder Fragment noch wirksamen
+            # Drop-in-Pfad meldet; der On-Disk-Inodevertrag wird vom direkten
+            # Caller separat descriptorgebunden gehalten.
+            if load_state == "not-found":
+                if (
+                    not canonical_not_found
+                    or dropin_paths
+                    or marker_lines
+                    or effective_conditions
+                    or condition_syntax_ambiguous
+                ):
+                    raise RuntimeError(
+                        f"systemd meldet einen inkonsistenten not-found-Bootblock: {unit}"
+                    )
+                # Bei einer aktuell fehlenden Basis-Unit lädt systemd Drop-ins
+                # nicht in seine effektive Sicht. Ein später restauriertes
+                # Fragment könnte deshalb einen bislang unsichtbaren, späteren
+                # Condition-Reset aktivieren. Zulässig ist hier ausschließlich
+                # unser bereits transaktionsgebundener 00-Inode.
+                _assert_exclusive_not_found_recovery_dropin(unit)
+                continue
+            if (
+                load_state != "loaded"
+                or not result.get("success")
+                or result.get("timed_out")
+                or str(result.get("stderr") or "")
+                or int(result.get("returncode", -1)) != 0
+                or dropin_paths.count(own_dropin) != 1
+                or len(marker_lines) != 1
+                or condition_syntax_ambiguous
+                or marker_path_conditions
+                != [f"!{RECOVERY_BOOTBLOCK_MARKER}"]
+            ):
+                raise RuntimeError(
+                    f"systemd-Readback des Recovery-Bootblocks weicht ab: {unit}"
+                )
+        else:
+            if load_state not in {"loaded", "masked", "not-found"}:
+                raise RuntimeError(
+                    f"systemd-Readback nach Bootblock-Entfernung ist unklar: {unit}"
+                )
+            if (
+                own_dropin in dropin_paths
+                or marker_lines
+                or (load_state == "not-found" and not canonical_not_found)
+                or (
+                    "ConditionPathExists",
+                    f"!{RECOVERY_BOOTBLOCK_MARKER}",
+                )
+                in effective_conditions
+                or (
+                    load_state == "loaded"
+                    and (
+                        not result.get("success")
+                        or result.get("timed_out")
+                        or str(result.get("stderr") or "")
+                        or int(result.get("returncode", -1)) != 0
+                    )
+                )
+            ):
+                raise RuntimeError(
+                    f"systemd-Readback enthält weiterhin den Recovery-Bootblock: {unit}"
+                )
+
+
+def _complete_partial_recovery_bootblock(
+    partial: RecoveryBootblockPartialContract,
+) -> RecoveryBootblockContract:
+    """Vollendet nur die transaktionsgebundenen, exakt lesbaren Residual-Inodes."""
+
+    identities = _validate_partial_recovery_bootblock_contract(partial)
+    created_directories = list(partial.created_directories)
+    absent_directories_seen: set[str] = set()
+    systemd_descriptor = _open_directory_nofollow("/etc/systemd/system")
+    try:
+        _require_root_controlled_directory(
+            systemd_descriptor,
+            "/etc/systemd/system",
+        )
+        try:
+            for unit in partial.units:
+                directory_name = f"{unit}.d"
+                try:
+                    os.stat(
+                        directory_name,
+                        dir_fd=systemd_descriptor,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    absent_directories_seen.add(unit)
+                    if (
+                        not partial.allow_missing_directories
+                        and unit not in set(created_directories)
+                    ):
+                        raise RuntimeError(
+                            f"Eigener Recovery-Bootblock-Pfad fehlt: {unit}"
+                        )
+                directory_descriptor, directory_created = (
+                    _open_or_create_recovery_directory(
+                        systemd_descriptor,
+                        directory_name,
+                        mode=0o755,
+                        label=_recovery_dropin_path(unit),
+                    )
+                )
+                if directory_created and unit not in created_directories:
+                    created_directories.append(unit)
+                try:
+                    metadata = _read_exact_root_file_at(
+                        directory_descriptor,
+                        RECOVERY_BOOTBLOCK_DROPIN_NAME,
+                        RECOVERY_BOOTBLOCK_DROPIN_PAYLOAD,
+                        0o644,
+                        allow_missing=True,
+                    )
+                    if metadata is None:
+                        _create_exact_root_file_at(
+                            directory_descriptor,
+                            RECOVERY_BOOTBLOCK_DROPIN_NAME,
+                            RECOVERY_BOOTBLOCK_DROPIN_PAYLOAD,
+                            0o644,
+                        )
+                        metadata = _read_exact_root_file_at(
+                            directory_descriptor,
+                            RECOVERY_BOOTBLOCK_DROPIN_NAME,
+                            RECOVERY_BOOTBLOCK_DROPIN_PAYLOAD,
+                            0o644,
+                        )
+                    current_identity = (
+                        int(metadata.st_dev),
+                        int(metadata.st_ino),
+                    )
+                    if (
+                        unit in identities
+                        and identities[unit] != current_identity
+                    ):
+                        raise RuntimeError(
+                            "Recovery-Bootblock-Inode wurde nicht von dieser "
+                            f"Transaktion erzeugt: {unit}"
+                        )
+                    identities[unit] = current_identity
+                finally:
+                    os.close(directory_descriptor)
+        except Exception as exc:
+            # Ein Fehler nach linkat/fsync darf den bereits erzeugten Inode
+            # nicht aus dem Prozessvertrag verlieren. Rescan übernimmt nur
+            # bytegenaue root:root-Inodes an zuvor autorisierten Namen.
+            for unit in partial.units:
+                directory_name = f"{unit}.d"
+                directory_descriptor = None
+                try:
+                    directory_before = os.stat(
+                        directory_name,
+                        dir_fd=systemd_descriptor,
+                        follow_symlinks=False,
+                    )
+                    directory_descriptor = os.open(
+                        directory_name,
+                        os.O_RDONLY
+                        | getattr(os, "O_DIRECTORY", 0)
+                        | getattr(os, "O_NOFOLLOW", 0)
+                        | getattr(os, "O_CLOEXEC", 0),
+                        dir_fd=systemd_descriptor,
+                    )
+                    directory_opened = _require_root_controlled_directory(
+                        directory_descriptor,
+                        _recovery_dropin_path(unit),
+                        0o755,
+                    )
+                    directory_after = os.stat(
+                        directory_name,
+                        dir_fd=systemd_descriptor,
+                        follow_symlinks=False,
+                    )
+                    if (
+                        (directory_before.st_dev, directory_before.st_ino)
+                        != (directory_opened.st_dev, directory_opened.st_ino)
+                        or (directory_after.st_dev, directory_after.st_ino)
+                        != (directory_opened.st_dev, directory_opened.st_ino)
+                    ):
+                        raise RuntimeError(
+                            f"Recovery-Bootblock-Pfad driftete: {unit}"
+                        )
+                    if (
+                        unit in absent_directories_seen
+                        and unit not in created_directories
+                    ):
+                        created_directories.append(unit)
+                    metadata = _read_exact_root_file_at(
+                        directory_descriptor,
+                        RECOVERY_BOOTBLOCK_DROPIN_NAME,
+                        RECOVERY_BOOTBLOCK_DROPIN_PAYLOAD,
+                        0o644,
+                        allow_missing=True,
+                    )
+                    if metadata is None:
+                        continue
+                    current_identity = (
+                        int(metadata.st_dev),
+                        int(metadata.st_ino),
+                    )
+                    if unit not in identities or identities[unit] == current_identity:
+                        identities[unit] = current_identity
+                except Exception:
+                    continue
+                finally:
+                    if directory_descriptor is not None:
+                        os.close(directory_descriptor)
+            residual = RecoveryBootblockPartialContract(
+                units=partial.units,
+                created_directories=tuple(created_directories),
+                transaction_id=partial.transaction_id,
+                dropin_identities=tuple(
+                    (unit, *identities[unit])
+                    for unit in partial.units
+                    if unit in identities
+                ),
+                allow_missing_directories=partial.allow_missing_directories,
+            )
+            raise RecoveryBootblockArmError(
+                f"Recovery-Bootblock-Vollendung blieb partiell: {exc}",
+                residual,
+            ) from exc
+    finally:
+        os.close(systemd_descriptor)
+    complete = RecoveryBootblockContract(
+        units=partial.units,
+        created_directories=tuple(created_directories),
+        transaction_id=partial.transaction_id,
+        dropin_identities=tuple(
+            (unit, *identities[unit]) for unit in partial.units
+        ),
+    )
+    _validate_recovery_bootblock_contract(complete)
+    return complete
+
+
+def _prepare_persistent_recovery_bootblock(
+    transaction_id: str,
+) -> RecoveryBootblockContract:
+    """Installiert rebootfeste Conditions mit erhaltener Partial-Autorität."""
+
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        raise RuntimeError("Recovery-Bootblock darf ausschließlich Root verwalten")
+    _recovery_bootblock_marker_payload(transaction_id)
+    _assert_no_existing_recovery_bootblock()
+    return _complete_partial_recovery_bootblock(
+        RecoveryBootblockPartialContract(
+            units=_recovery_bootblock_units(),
+            created_directories=(),
+            transaction_id=transaction_id,
+            dropin_identities=(),
+            allow_missing_directories=True,
+        )
+    )
+
+
+def _rebind_owned_recovery_dropins(
+    contract: RecoveryBootblockContract,
+    *,
+    recreate_missing: bool,
+) -> RecoveryBootblockContract:
+    identities = _validate_recovery_bootblock_contract(contract)
+    systemd_descriptor = _open_directory_nofollow("/etc/systemd/system")
+    rebound = {}
+    missing = set()
+    try:
+        _require_root_controlled_directory(systemd_descriptor, "/etc/systemd/system")
+        for unit in contract.units:
+            directory_name = f"{unit}.d"
+            try:
+                os.stat(
+                    directory_name,
+                    dir_fd=systemd_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                if not recreate_missing or unit not in set(contract.created_directories):
+                    raise RuntimeError(
+                        f"Eigener Recovery-Bootblock-Pfad fehlt: {unit}"
+                    )
+                missing.add(unit)
+                continue
+            directory_descriptor, _created = _open_or_create_recovery_directory(
+                systemd_descriptor,
+                directory_name,
+                mode=0o755,
+                label=_recovery_dropin_path(unit),
+            )
+            try:
+                metadata = _read_exact_root_file_at(
+                    directory_descriptor,
+                    RECOVERY_BOOTBLOCK_DROPIN_NAME,
+                    RECOVERY_BOOTBLOCK_DROPIN_PAYLOAD,
+                    0o644,
+                    allow_missing=True,
+                )
+                if metadata is None:
+                    if not recreate_missing:
+                        raise RuntimeError(f"Eigener Recovery-Bootblock fehlt: {unit}")
+                    missing.add(unit)
+                    continue
+                if (metadata.st_dev, metadata.st_ino) != identities[unit]:
+                    raise RuntimeError(
+                        f"Recovery-Bootblock-Inode wurde nicht von dieser Transaktion erzeugt: {unit}"
+                    )
+                rebound[unit] = (int(metadata.st_dev), int(metadata.st_ino))
+            finally:
+                os.close(directory_descriptor)
+    finally:
+        os.close(systemd_descriptor)
+    if not missing:
+        return contract
+    return _complete_partial_recovery_bootblock(
+        RecoveryBootblockPartialContract(
+            units=contract.units,
+            created_directories=contract.created_directories,
+            transaction_id=contract.transaction_id,
+            dropin_identities=tuple(
+                (unit, *rebound[unit])
+                for unit in contract.units
+                if unit in rebound
+            ),
+            allow_missing_directories=False,
+        )
+    )
+
+
+def _open_recovery_bootblock_state_directory() -> int:
+    parent = Path(RECOVERY_BOOTBLOCK_STATE_DIR).parent
+    parent_descriptor = _open_directory_nofollow(parent)
+    try:
+        _require_root_controlled_directory(parent_descriptor, str(parent))
+        descriptor, _created = _open_or_create_recovery_directory(
+            parent_descriptor,
+            Path(RECOVERY_BOOTBLOCK_STATE_DIR).name,
+            mode=0o700,
+            label=RECOVERY_BOOTBLOCK_STATE_DIR,
+        )
+        return descriptor
+    finally:
+        os.close(parent_descriptor)
+
+
+def _verify_recovery_bootblock_marker(
+    contract: RecoveryBootblockContract,
+    *,
+    expected_present: bool,
+) -> None:
+    _validate_recovery_bootblock_contract(contract)
+    marker_payload = _recovery_bootblock_marker_payload(contract.transaction_id)
+    state_descriptor = _open_recovery_bootblock_state_directory()
+    try:
+        present = _read_exact_root_file_at(
+            state_descriptor,
+            Path(RECOVERY_BOOTBLOCK_MARKER).name,
+            marker_payload,
+            0o600,
+            allow_missing=True,
+        ) is not None
+        if present != expected_present:
+            raise RuntimeError("Recovery-Bootblock-Marker besitzt den falschen Zustand")
+    finally:
+        os.close(state_descriptor)
+
+
+def _arm_persistent_recovery_bootblock(
+    contract: (
+        RecoveryBootblockContract | RecoveryBootblockPartialContract | None
+    ) = None,
+    *,
+    transaction_id: str | None = None,
+) -> RecoveryBootblockContract:
+    if contract is None:
+        value = str(transaction_id or "")
+        if not RECOVERY_BOOTBLOCK_TRANSACTION_RE.fullmatch(value):
+            raise RuntimeError("Recovery-Bootblock fehlt die vorab gebundene Transaktions-ID")
+        prepared = _prepare_persistent_recovery_bootblock(value)
+    elif isinstance(contract, RecoveryBootblockPartialContract):
+        if transaction_id is not None and contract.transaction_id != transaction_id:
+            raise RuntimeError("Recovery-Bootblock-Transaktions-ID driftete")
+        prepared = _complete_partial_recovery_bootblock(contract)
+    else:
+        if transaction_id is not None and contract.transaction_id != transaction_id:
+            raise RuntimeError("Recovery-Bootblock-Transaktions-ID driftete")
+        prepared = _rebind_owned_recovery_dropins(
+            contract,
+            recreate_missing=True,
+        )
+    try:
+        marker_payload = _recovery_bootblock_marker_payload(prepared.transaction_id)
+        state_descriptor = _open_recovery_bootblock_state_directory()
+        try:
+            _create_exact_root_file_at(
+                state_descriptor,
+                Path(RECOVERY_BOOTBLOCK_MARKER).name,
+                marker_payload,
+                0o600,
+            )
+            os.fsync(state_descriptor)
+        finally:
+            os.close(state_descriptor)
+        _verify_recovery_bootblock_marker(prepared, expected_present=True)
+        _reload_and_verify_recovery_dropins(prepared.units, expected_present=True)
+        return prepared
+    except Exception as arm_exc:
+        # Ab dem ersten eigenen Inode bleibt der Contract erhalten. Ein
+        # Folgeversuch bindet exakt diese Inodes und vervollständigt Marker/
+        # effektive systemd-Sicht; er beginnt nie als fremder Fresh-Arm.
+        raise RecoveryBootblockArmError(
+            f"Recovery-Bootblock-Aktivierung blieb unvollständig: {arm_exc}",
+            prepared,
+        ) from arm_exc
+
+
+def _clear_recovery_bootblock_marker(contract: RecoveryBootblockContract) -> None:
+    contract = _rebind_owned_recovery_dropins(contract, recreate_missing=False)
+    # Vor dem Öffnen des Gates muss die aktuelle systemd-Sicht nach Restore
+    # erneut beweisen, dass jede inzwischen geladene Unit exakt unsere eine
+    # negative Marker-Condition nutzt. Ein beim Fresh-Arm fehlender optionaler
+    # Dienst darf hier nicht still als weiterhin abwesend imputiert werden.
+    _reload_and_verify_recovery_dropins(contract.units, expected_present=True)
+    marker_payload = _recovery_bootblock_marker_payload(contract.transaction_id)
+    state_descriptor = _open_recovery_bootblock_state_directory()
+    try:
+        marker = _read_exact_root_file_at(
+            state_descriptor,
+            Path(RECOVERY_BOOTBLOCK_MARKER).name,
+            marker_payload,
+            0o600,
+            allow_missing=False,
+        )
+        if marker is None:
+            raise RuntimeError("Eigener Recovery-Bootblock-Marker fehlt")
+        os.unlink(Path(RECOVERY_BOOTBLOCK_MARKER).name, dir_fd=state_descriptor)
+        os.fsync(state_descriptor)
+    finally:
+        os.close(state_descriptor)
+    _verify_recovery_bootblock_marker(contract, expected_present=False)
+    _reload_and_verify_recovery_dropins(contract.units, expected_present=True)
+
+
+def _remove_persistent_recovery_bootblock(
+    contract: RecoveryBootblockContract,
+) -> None:
+    """Entfernt nur den exakt gebundenen Block nach erfolgreichem Endgate."""
+
+    contract = _rebind_owned_recovery_dropins(contract, recreate_missing=False)
+    identities = _validate_recovery_bootblock_contract(contract)
+    _verify_recovery_bootblock_marker(contract, expected_present=False)
+    systemd_descriptor = _open_directory_nofollow("/etc/systemd/system")
+    try:
+        _require_root_controlled_directory(
+            systemd_descriptor,
+            "/etc/systemd/system",
+        )
+        for unit in contract.units:
+            directory_descriptor, _created = _open_or_create_recovery_directory(
+                systemd_descriptor,
+                f"{unit}.d",
+                mode=0o755,
+                label=_recovery_dropin_path(unit),
+            )
+            try:
+                metadata = _read_exact_root_file_at(
+                    directory_descriptor,
+                    RECOVERY_BOOTBLOCK_DROPIN_NAME,
+                    RECOVERY_BOOTBLOCK_DROPIN_PAYLOAD,
+                    0o644,
+                )
+                if (metadata.st_dev, metadata.st_ino) != identities[unit]:
+                    raise RuntimeError(
+                        f"Fremdes Recovery-Bootblock-Drop-in wird nicht entfernt: {unit}"
+                    )
+                os.unlink(
+                    RECOVERY_BOOTBLOCK_DROPIN_NAME,
+                    dir_fd=directory_descriptor,
+                )
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
+        for unit in reversed(contract.created_directories):
+            try:
+                os.rmdir(f"{unit}.d", dir_fd=systemd_descriptor)
+            except OSError:
+                pass
+    finally:
+        os.close(systemd_descriptor)
+    _reload_and_verify_recovery_dropins(contract.units, expected_present=False)
+
+
 HA_SLAVE_STANDBY_SERVICES = _catalog_service_names(include_legacy=True, exclude={'e3dc-ha'})
 SHADOW_STANDBY_SERVICES = _catalog_service_names(include_legacy=True, exclude={'e3dc-shadow-sync'})
 
@@ -1220,6 +2478,23 @@ REQUIRED_WEB_FILES = (
 def _unit_name(service: str) -> str:
     name = str(service).strip()
     return name if name.endswith('.service') else f'{name}.service'
+
+
+def _systemd_activity_readback_matches(result: dict, *, should_be_active: bool) -> bool:
+    """Bindet is-active an stdout, rc, stderr und Timeoutstatus gemeinsam."""
+
+    activity = str(result.get("stdout") or "").strip().lower()
+    stderr = str(result.get("stderr") or "")
+    returncode = int(result.get("returncode", -1))
+    if result.get("timed_out") or stderr:
+        return False
+    if should_be_active:
+        return bool(result.get("success")) and returncode == 0 and activity == "active"
+    return (
+        not result.get("success")
+        and returncode == 3
+        and activity in {"inactive", "failed"}
+    )
 
 
 def _service_unit_exists(service: str) -> bool:
@@ -1295,6 +2570,119 @@ def _systemd_show_end_state(
         values.get("UnitFileState", ""),
         values.get("ActiveState", ""),
         result,
+    )
+
+
+def _capture_transition_unit_activity(
+    unit: str,
+    *,
+    piguard_contract: bool = False,
+) -> str:
+    """Bindet geladene und exakt abwesende Units aus der systemd-Autorität."""
+
+    unit_name = _unit_name(unit)
+    property_names = (
+        "LoadState",
+        "ActiveState",
+        "SubState",
+        "UnitFileState",
+        "FragmentPath",
+    )
+    result = _run_argv(
+        [
+            "systemctl",
+            "show",
+            "--no-pager",
+            *(f"--property={name}" for name in property_names),
+            unit_name,
+        ],
+        timeout=10,
+    )
+    stdout = str(result.get("stdout") or "")
+    if (
+        not result.get("success")
+        or result.get("timed_out")
+        or int(result.get("returncode", -1)) != 0
+        or str(result.get("stderr") or "")
+        or "\x00" in stdout
+    ):
+        raise RuntimeError(f"Betriebszustand von {unit_name} ist nicht lesbar")
+
+    values: dict[str, str] = {}
+    expected = set(property_names)
+    for raw_line in stdout.splitlines():
+        if not raw_line:
+            continue
+        key, separator, value = raw_line.partition("=")
+        if (
+            separator != "="
+            or key not in expected
+            or key in values
+            or value != value.strip()
+        ):
+            raise RuntimeError(f"Betriebszustand von {unit_name} ist widersprüchlich")
+        values[key] = value
+    if set(values) != expected:
+        raise RuntimeError(f"Betriebszustand von {unit_name} ist unvollständig")
+
+    load_state = values["LoadState"].lower()
+    active_state = values["ActiveState"].lower()
+    sub_state = values["SubState"].lower()
+    unit_file_state = values["UnitFileState"].lower()
+    fragment_path = values["FragmentPath"]
+    if (
+        load_state == "not-found"
+        and active_state == "inactive"
+        and sub_state == "dead"
+        and unit_file_state == ""
+        and fragment_path == ""
+    ):
+        return "absent"
+    if load_state == "masked":
+        if piguard_contract:
+            raise RuntimeError("Betriebsbindung von piguard.service weicht ab")
+        if (
+            active_state != "inactive"
+            or sub_state != "dead"
+            or unit_file_state not in {"masked", "masked-runtime"}
+            or fragment_path not in {"/dev/null", ""}
+        ):
+            raise RuntimeError(f"Maskenzustand von {unit_name} ist widersprüchlich")
+        return "inactive"
+    if (
+        load_state != "loaded"
+        or unit_file_state not in SYSTEMD_KNOWN_UNIT_FILE_STATES - {"not-found"}
+        or not os.path.isabs(fragment_path)
+    ):
+        raise RuntimeError(f"Betriebsbindung von {unit_name} weicht ab")
+    if piguard_contract and (
+        unit_file_state != "enabled"
+        or fragment_path != PIGUARD_FRAGMENT_PATH
+    ):
+        raise RuntimeError("Betriebsbindung von piguard.service weicht ab")
+
+    state = (active_state, sub_state)
+    accepted = {
+        ("active", "running"): "active",
+        ("inactive", "dead"): "inactive",
+        ("failed", "failed"): "failed",
+    }
+    if piguard_contract and state == ("activating", "auto-restart"):
+        return "active"
+    try:
+        return accepted[state]
+    except KeyError as exc:
+        raise RuntimeError(
+            f"Betriebszustand von {unit_name} ist nicht freigegeben"
+        ) from exc
+
+
+def _capture_piguard_transition_activity() -> str:
+    """Bindet PiGuard loaded/enabled/exact-fragment oder exakt absent."""
+
+    return _capture_transition_unit_activity(
+        PIGUARD_UNIT,
+        piguard_contract=True,
     )
 
 
@@ -1522,17 +2910,19 @@ def _capture_transition_state(
         config, raw, role, legacy = {"ha_mode": requested}, b"", requested, True
     if requested is not None and role != requested:
         raise RuntimeError(f"Erwartete HA-/Shadow-Rolle {requested}, gefunden {role}")
-    inventory = {
-        unit
-        for unit in (*_catalog_units_strict(), "piguard.service", "e3dc.service")
-        if _service_unit_exists(unit)
-    }
+    inventory: set[str] = set()
     activities: dict[str, str] = {}
-    for unit in sorted(inventory):
-        status = run_command(f"systemctl is-active {unit}", timeout=10)
-        activity = status.get("stdout", "").strip().lower()
-        if activity not in {"active", "inactive", "failed"}:
-            raise RuntimeError(f"Betriebszustand von {unit} ist nicht lesbar")
+    for unit in sorted(
+        set((*_catalog_units_strict(), PIGUARD_UNIT, "e3dc.service"))
+    ):
+        activity = (
+            _capture_piguard_transition_activity()
+            if unit == PIGUARD_UNIT
+            else _capture_transition_unit_activity(unit)
+        )
+        if activity == "absent":
+            continue
+        inventory.add(unit)
         activities[unit] = activity
     legacy_activity = activities.get("e3dc.service", "absent")
     return TransitionState(
@@ -2360,11 +3750,1215 @@ def _verify_worktree_policy(repo_dir: str, verified_policy: dict) -> None:
         raise RuntimeError("Worktree-Policy weicht vom verifizierten HEAD-Blob ab")
 
 
+def _require_clean_recovery_index(repo_dir: str, install_user: str) -> None:
+    result = _git_argv(
+        repo_dir,
+        install_user,
+        "diff",
+        "--cached",
+        "--quiet",
+        "--exit-code",
+        "--",
+        timeout=15,
+    )
+    returncode = int(result.get("returncode", -1))
+    if returncode == 1:
+        raise RuntimeError(
+            "Recovery-Preflight verweigert vorgemerkte Indexänderungen; "
+            "der Backupvertrag sichert ausschließlich Worktree-Dateien"
+        )
+    if returncode != 0:
+        raise RuntimeError(
+            "Recovery-Indexzustand ist nicht beweisbar: "
+            + _combined_process_diagnostics(result, maximum=800)
+        )
+
+
+def _repo_descriptor_has_unsafe_xattrs(descriptor: int) -> bool:
+    try:
+        names = set(os.listxattr(descriptor))
+    except AttributeError:
+        return True
+    except OSError as exc:
+        if exc.errno in {
+            getattr(errno, "ENODATA", -1),
+            getattr(errno, "ENOTSUP", -1),
+            getattr(errno, "EOPNOTSUPP", -1),
+        }:
+            return False
+        return True
+    # Das Recovery-Receipt friert Bytes und POSIX-Metadaten ein. Nicht im
+    # Backupvertrag enthaltene ACLs, Capabilities oder sonstige xattrs dürfen
+    # deshalb weder Autorität liefern noch unbemerkt verloren gehen.
+    return bool(names)
+
+
+def _descriptor_plain_sha256(descriptor: int, expected_size: int) -> str:
+    size = int(expected_size)
+    if size < 0:
+        raise RuntimeError("Recovery-Dateigröße ist ungültig")
+    digest = hashlib.sha256()
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    remaining = size
+    while remaining:
+        block = os.read(descriptor, min(1024 * 1024, remaining))
+        if not block:
+            raise RuntimeError("Recovery-Datei endet vor ihrer gebundenen Größe")
+        digest.update(block)
+        remaining -= len(block)
+    if os.read(descriptor, 1):
+        raise RuntimeError("Recovery-Datei überschreitet ihre gebundene Größe")
+    return digest.hexdigest()
+
+
+def _capture_repo_recovery_contract(
+    repo_dir: str,
+    install_user: str,
+    expected_commit: str,
+) -> RepoRecoveryContract:
+    """Friert Worktree-Bytes vor Backup und erster Mutation descriptorgebunden ein."""
+
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        raise RuntimeError("Repo-Recovery-Vertrag darf ausschließlich Root erzeugen")
+    root = os.path.abspath(repo_dir)
+    commit = _validate_full_commit(expected_commit)
+    if _bound_release_head_commit(root, install_user) != commit:
+        raise RuntimeError("Repo-Recovery-Vertrag sieht nicht den Ausgangs-Commit")
+    _require_clean_recovery_index(root, install_user)
+    account = pwd.getpwnam(str(install_user))
+    tracked_entries = _tracked_release_file_contracts(
+        root,
+        install_user,
+        target_commit=commit,
+    )
+    frozen = []
+    dirty_paths = []
+    for relative_path, git_mode, git_oid in tracked_entries:
+        target = os.path.join(root, relative_path)
+        descriptor, before = _open_regular_file_nofollow(target)
+        try:
+            mode = stat.S_IMODE(before.st_mode)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_nlink != 1
+                or before.st_uid not in {0, account.pw_uid}
+                or before.st_gid not in {0, account.pw_gid}
+                or mode & 0o7000
+                or _repo_descriptor_has_unsafe_xattrs(descriptor)
+            ):
+                raise RuntimeError(
+                    f"Repo-Recovery-Preimage besitzt unsichere Metadaten: {relative_path}"
+                )
+            actual_oid = _git_blob_oid_from_descriptor(
+                descriptor,
+                before.st_size,
+                git_oid,
+            )
+            digest = _descriptor_plain_sha256(descriptor, before.st_size)
+            after = os.fstat(descriptor)
+            named_after = os.lstat(target)
+            signature = (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+                before.st_nlink,
+                before.st_uid,
+                before.st_gid,
+                stat.S_IMODE(before.st_mode),
+            )
+            if signature != (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+                after.st_nlink,
+                after.st_uid,
+                after.st_gid,
+                stat.S_IMODE(after.st_mode),
+            ) or signature != (
+                named_after.st_dev,
+                named_after.st_ino,
+                named_after.st_size,
+                named_after.st_mtime_ns,
+                named_after.st_ctime_ns,
+                named_after.st_nlink,
+                named_after.st_uid,
+                named_after.st_gid,
+                stat.S_IMODE(named_after.st_mode),
+            ):
+                raise RuntimeError(
+                    f"Repo-Recovery-Preimage driftete beim Einfrieren: {relative_path}"
+                )
+            frozen.append(
+                (
+                    relative_path,
+                    git_mode,
+                    git_oid,
+                    digest,
+                    int(before.st_size),
+                    mode,
+                    int(before.st_uid),
+                    int(before.st_gid),
+                )
+            )
+            if actual_oid != git_oid:
+                dirty_paths.append(relative_path)
+        finally:
+            os.close(descriptor)
+    _require_clean_recovery_index(root, install_user)
+    if _bound_release_head_commit(root, install_user) != commit:
+        raise RuntimeError("Repository-HEAD driftete beim Recovery-Preflight")
+    return RepoRecoveryContract(
+        install_root=root,
+        install_user=str(install_user),
+        expected_commit=commit,
+        tracked_files=tuple(frozen),
+        dirty_paths=tuple(sorted(dirty_paths)),
+    )
+
+
+def _verify_recovered_repo_contract(
+    repo_dir: str,
+    install_user: str,
+    contract: RepoRecoveryContract,
+) -> None:
+    """Beweist nach der Härtung Bytes, Zielrechte, HEAD und Dirty-Pfadmenge."""
+
+    if not isinstance(contract, RepoRecoveryContract):
+        raise RuntimeError("Repo-Recovery-Endvertrag fehlt")
+    root = os.path.abspath(repo_dir)
+    account = pwd.getpwnam(str(install_user))
+    if (
+        contract.install_root != root
+        or contract.install_user != str(install_user)
+        or _bound_release_head_commit(root, install_user) != contract.expected_commit
+    ):
+        raise RuntimeError("Repo-Recovery-Endvertrag weicht vom Rückfallziel ab")
+    dirty_paths = []
+    for (
+        relative_path,
+        git_mode,
+        git_oid,
+        expected_sha256,
+        expected_size,
+        _pre_mode,
+        _pre_uid,
+        _pre_gid,
+    ) in contract.tracked_files:
+        target = os.path.join(root, relative_path)
+        descriptor, before = _open_regular_file_nofollow(target)
+        try:
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_nlink != 1
+                or before.st_uid != account.pw_uid
+                or before.st_gid != account.pw_gid
+                or stat.S_IMODE(before.st_mode) != git_mode
+                or before.st_size != expected_size
+                or _repo_descriptor_has_unsafe_xattrs(descriptor)
+                or _descriptor_plain_sha256(descriptor, expected_size) != expected_sha256
+            ):
+                raise RuntimeError(
+                    f"Repo-Recovery-Endvertrag ist verletzt: {relative_path}"
+                )
+            actual_oid = _git_blob_oid_from_descriptor(
+                descriptor,
+                expected_size,
+                git_oid,
+            )
+            after = os.fstat(descriptor)
+            named_after = os.lstat(target)
+            signature = (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+                before.st_nlink,
+                before.st_uid,
+                before.st_gid,
+                stat.S_IMODE(before.st_mode),
+            )
+            if signature != (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+                after.st_nlink,
+                after.st_uid,
+                after.st_gid,
+                stat.S_IMODE(after.st_mode),
+            ) or signature != (
+                named_after.st_dev,
+                named_after.st_ino,
+                named_after.st_size,
+                named_after.st_mtime_ns,
+                named_after.st_ctime_ns,
+                named_after.st_nlink,
+                named_after.st_uid,
+                named_after.st_gid,
+                stat.S_IMODE(named_after.st_mode),
+            ):
+                raise RuntimeError(
+                    f"Repo-Recovery-Datei driftete im Endgate: {relative_path}"
+                )
+            if actual_oid != git_oid:
+                dirty_paths.append(relative_path)
+        finally:
+            os.close(descriptor)
+    if tuple(sorted(dirty_paths)) != contract.dirty_paths:
+        raise RuntimeError("Repo-Recovery-Dirty-Pfadmenge weicht vom Vorzustand ab")
+    _require_clean_recovery_index(root, install_user)
+
+
+def _recovery_repo_contracts_from_manifest(
+    manifest: dict,
+    repo_dir: str,
+    tracked_entries: list[tuple[str, int, str]],
+) -> tuple[
+    dict[str, tuple[str, int, int, int, int]],
+    dict[str, tuple[int, int, int]],
+]:
+    """Bindet getrackte Recovery-Preimages ausschließlich an das Backupmanifest.
+
+    Der Git-Commit bleibt Autorität für Umfang und Zielmodus des Produktbaums.
+    Nur die Bytes und Ausgangsmetadaten dürfen bei einem Recovery absichtlich
+    vom Commit abweichen; ihre Autorität stammt aus dem erneut vollständig
+    verifizierten Systembackup, niemals aus dem aktuellen Worktree.
+    """
+
+    root = os.path.abspath(repo_dir)
+    manifest_root = str(manifest.get("install_root") or "")
+    if (
+        not os.path.isabs(manifest_root)
+        or os.path.abspath(manifest_root) != manifest_root
+        or manifest_root != root
+    ):
+        raise RuntimeError(
+            "Recovery-Backup ist nicht exakt an den Installationsbaum gebunden"
+        )
+
+    tracked_paths = {relative_path for relative_path, _mode, _oid in tracked_entries}
+    file_contracts: dict[str, tuple[str, int, int, int, int]] = {}
+    for raw_entry in manifest.get("files") or ():
+        if not isinstance(raw_entry, dict) or not raw_entry.get("restore_path"):
+            continue
+        raw_path = str(raw_entry["restore_path"])
+        if not os.path.isabs(raw_path) or os.path.abspath(raw_path) != raw_path:
+            raise RuntimeError("Recovery-Manifest enthält einen nichtkanonischen Zielpfad")
+        try:
+            within_root = os.path.commonpath((root, raw_path)) == root
+        except ValueError as exc:
+            raise RuntimeError("Recovery-Manifest enthält einen fremden Zielpfad") from exc
+        if not within_root or raw_path == root:
+            continue
+        relative_path = os.path.relpath(raw_path, root).replace(os.sep, "/")
+        if relative_path not in tracked_paths:
+            continue
+        if raw_entry.get("category") != "install-tree" or relative_path in file_contracts:
+            raise RuntimeError(
+                f"Recovery-Dateivertrag ist nicht eindeutig: {relative_path}"
+            )
+        digest = str(raw_entry.get("sha256") or "").strip().lower()
+        try:
+            size = int(raw_entry.get("size", -1))
+            mode = int(raw_entry.get("mode", -1))
+            uid = int(raw_entry.get("uid", -1))
+            gid = int(raw_entry.get("gid", -1))
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"Recovery-Dateivertrag besitzt ungültige Metadaten: {relative_path}"
+            ) from exc
+        if (
+            not re.fullmatch(r"[0-9a-f]{64}", digest)
+            or size < 0
+            or mode < 0
+            or mode > 0o7777
+            or uid < 0
+            or gid < 0
+        ):
+            raise RuntimeError(
+                f"Recovery-Dateivertrag besitzt ungültige Werte: {relative_path}"
+            )
+        file_contracts[relative_path] = (digest, size, mode, uid, gid)
+    if set(file_contracts) != tracked_paths:
+        missing = sorted(tracked_paths - set(file_contracts))
+        raise RuntimeError(
+            "Recovery-Backup deckt den getrackten Produktbaum nicht vollständig ab: "
+            + ", ".join(missing[:5])
+        )
+
+    source_records = [
+        record
+        for record in manifest.get("sources") or ()
+        if isinstance(record, dict)
+        and record.get("category") == "install-tree"
+        and record.get("source") == root
+    ]
+    if len(source_records) != 1:
+        raise RuntimeError("Recovery-Verzeichnisvertrag ist nicht eindeutig")
+    source = source_records[0]
+    if source.get("source_type") != "directory" or source.get("present") is not True:
+        raise RuntimeError("Recovery-Installationsbaum war im Backup nicht vorhanden")
+
+    directory_contracts: dict[str, tuple[int, int, int]] = {}
+
+    def add_directory(relative_path: str, raw: dict) -> None:
+        if relative_path in directory_contracts:
+            raise RuntimeError(
+                f"Recovery-Verzeichnisvertrag ist doppelt: {relative_path or root}"
+            )
+        try:
+            mode = int(raw.get("mode", -1))
+            uid = int(raw.get("uid", -1))
+            gid = int(raw.get("gid", -1))
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"Recovery-Verzeichnisvertrag ist ungültig: {relative_path or root}"
+            ) from exc
+        if mode < 0 or mode > 0o7777 or uid < 0 or gid < 0:
+            raise RuntimeError(
+                f"Recovery-Verzeichnisvertrag ist ungültig: {relative_path or root}"
+            )
+        directory_contracts[relative_path] = (mode, uid, gid)
+
+    add_directory("", source)
+    for raw_directory in source.get("directories") or ():
+        if not isinstance(raw_directory, dict):
+            raise RuntimeError("Recovery-Verzeichnisvertrag enthält keinen Objekteintrag")
+        relative_path = str(raw_directory.get("path") or "")
+        candidate = Path(relative_path)
+        if (
+            not relative_path
+            or candidate.is_absolute()
+            or ".." in candidate.parts
+            or candidate.as_posix() != relative_path
+        ):
+            raise RuntimeError("Recovery-Verzeichnisvertrag enthält einen ungültigen Pfad")
+        add_directory(relative_path, raw_directory)
+
+    tracked_directories = {""}
+    for relative_path in tracked_paths:
+        parent = Path(relative_path).parent
+        while str(parent) not in {"", "."}:
+            tracked_directories.add(parent.as_posix())
+            parent = parent.parent
+    if not tracked_directories.issubset(directory_contracts):
+        missing = sorted(tracked_directories - set(directory_contracts))
+        raise RuntimeError(
+            "Recovery-Backup deckt getrackte Produktverzeichnisse nicht ab: "
+            + ", ".join(missing[:5])
+        )
+    return file_contracts, {
+        relative_path: directory_contracts[relative_path]
+        for relative_path in tracked_directories
+    }
+
+
+def _read_stable_verified_backup_manifest(
+    backup_dir: str,
+) -> tuple[dict, str]:
+    """Liest Manifest und Digest mit einem Gleichheitsgate um die Vollprüfung."""
+
+    root = os.path.abspath(str(backup_dir or ""))
+    if not root or not os.path.isabs(root) or root != str(backup_dir):
+        raise RuntimeError("Recovery-Backuppfad ist nicht kanonisch")
+    manifest_path = os.path.join(root, MANIFEST_NAME)
+    digest_before, size_before = _regular_file_sha256(manifest_path)
+    manifest = verify_backup(root, expected_kind=SYSTEM_BACKUP_KIND)
+    digest_after, size_after = _regular_file_sha256(manifest_path)
+    if digest_before != digest_after or size_before != size_after:
+        raise RuntimeError("Recovery-Manifest driftete während der Root-Bindung")
+    return manifest, digest_after
+
+
+def _manifest_file_receipt(
+    manifest: dict,
+) -> tuple[tuple[str, str, int, int, int, int, str, str], ...]:
+    result = []
+    for entry in manifest.get("files") or ():
+        if not isinstance(entry, dict):
+            raise RuntimeError("Backup-Receipt enthält einen ungültigen Dateieintrag")
+        result.append(
+            (
+                str(entry.get("path") or ""),
+                str(entry.get("sha256") or ""),
+                int(entry.get("size", -1)),
+                int(entry.get("mode", -1)),
+                int(entry.get("uid", -1)),
+                int(entry.get("gid", -1)),
+                str(entry.get("category") or ""),
+                str(entry.get("restore_path") or ""),
+            )
+        )
+    return tuple(sorted(result))
+
+
+def _manifest_semantic_sha256(manifest: dict) -> str:
+    try:
+        encoded = json.dumps(
+            manifest,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise RuntimeError("Backupmanifest besitzt keinen kanonischen Semantikvertrag") from exc
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _open_root_receipt_directory_chain(
+    path: str,
+) -> tuple[int, tuple[tuple[str, int, int, int, int, int], ...]]:
+    """Öffnet und bindet jede Komponente eines Root-Receipt-Pfads."""
+
+    candidate = str(path or "")
+    if not os.path.isabs(candidate) or os.path.abspath(candidate) != candidate:
+        raise RuntimeError("Recovery-Backup-Pfad ist nicht kanonisch")
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    if not nofollow or not directory:
+        raise RuntimeError("Recovery-Receipt benötigt O_NOFOLLOW und O_DIRECTORY")
+    flags = os.O_RDONLY | nofollow | directory | getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open("/", flags)
+    receipts: list[tuple[str, int, int, int, int, int]] = []
+
+    def bind_component(
+        opened_descriptor: int,
+        absolute_path: str,
+        named_metadata=None,
+    ) -> tuple[str, int, int, int, int, int]:
+        metadata = os.fstat(opened_descriptor)
+        mode = stat.S_IMODE(metadata.st_mode)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != 0
+            or metadata.st_gid != 0
+            or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            or _repo_descriptor_has_unsafe_xattrs(opened_descriptor)
+        ):
+            raise RuntimeError(
+                f"Recovery-Backup-Elternpfad ist nicht root-kontrolliert: {absolute_path}"
+            )
+        if named_metadata is not None and (
+            named_metadata.st_dev,
+            named_metadata.st_ino,
+            named_metadata.st_uid,
+            named_metadata.st_gid,
+            stat.S_IMODE(named_metadata.st_mode),
+        ) != (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_uid,
+            metadata.st_gid,
+            mode,
+        ):
+            raise RuntimeError(
+                f"Recovery-Backup-Elternpfad driftete beim Öffnen: {absolute_path}"
+            )
+        return (
+            absolute_path,
+            int(metadata.st_dev),
+            int(metadata.st_ino),
+            int(metadata.st_uid),
+            int(metadata.st_gid),
+            int(mode),
+        )
+
+    try:
+        receipts.append(bind_component(descriptor, "/"))
+        current_path = ""
+        for component in Path(candidate).parts[1:]:
+            before = os.stat(
+                component,
+                dir_fd=descriptor,
+                follow_symlinks=False,
+            )
+            next_descriptor = os.open(component, flags, dir_fd=descriptor)
+            current_path = os.path.join(current_path, component)
+            absolute_path = "/" + current_path
+            try:
+                receipt = bind_component(
+                    next_descriptor,
+                    absolute_path,
+                    before,
+                )
+                named_after = os.stat(
+                    component,
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
+                )
+                if (
+                    named_after.st_dev,
+                    named_after.st_ino,
+                    named_after.st_uid,
+                    named_after.st_gid,
+                    stat.S_IMODE(named_after.st_mode),
+                ) != receipt[1:]:
+                    raise RuntimeError(
+                        f"Recovery-Backup-Elternpfad driftete beim Readback: {absolute_path}"
+                    )
+            except Exception:
+                os.close(next_descriptor)
+                raise
+            os.close(descriptor)
+            descriptor = next_descriptor
+            receipts.append(receipt)
+        return descriptor, tuple(receipts)
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _privileged_restore_path_allowed(path: str, category: str) -> bool:
+    candidate = str(path or "")
+    if not os.path.isabs(candidate) or os.path.abspath(candidate) != candidate:
+        return False
+    if category == "systemd":
+        return os.path.dirname(candidate) in {
+            "/etc/systemd/system",
+            "/lib/systemd/system",
+            "/usr/lib/systemd/system",
+        }
+    if category == "watchdog":
+        return candidate in {
+            "/usr/local/bin/boot_notify.sh",
+            "/usr/local/bin/pi_guard.sh",
+        }
+    if category == "system-config":
+        try:
+            return os.path.commonpath(("/etc/e3dc-control", candidate)) == "/etc/e3dc-control"
+        except ValueError:
+            return False
+    return False
+
+
+def _read_privileged_restore_source(
+    path: str,
+    category: str,
+    install_user: str,
+) -> tuple[str, str, str, int, int, int, int]:
+    """Bindet eine privilegiert restaurierte Quelle vor jeder Mutation."""
+
+    if not _privileged_restore_path_allowed(path, category):
+        raise RuntimeError(f"Privilegierter Restorepfad ist nicht freigegeben: {path}")
+    parent_descriptor, _parent_chain = _open_root_receipt_directory_chain(
+        os.path.dirname(path),
+    )
+    descriptor = None
+    try:
+        name = os.path.basename(path)
+        before = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        if (
+            not nofollow
+            or not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_size < 0
+            or before.st_size > 8 * 1024 * 1024
+            or before.st_mode
+            & (stat.S_IWGRP | stat.S_IWOTH | stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX)
+        ):
+            raise RuntimeError(f"Privilegierte Restorequelle ist unsicher: {path}")
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_descriptor,
+        )
+        opened = os.fstat(descriptor)
+        identity = (
+            before.st_dev,
+            before.st_ino,
+            before.st_uid,
+            before.st_gid,
+            stat.S_IMODE(before.st_mode),
+            before.st_nlink,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        if identity != (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_uid,
+            opened.st_gid,
+            stat.S_IMODE(opened.st_mode),
+            opened.st_nlink,
+            opened.st_size,
+            opened.st_mtime_ns,
+            opened.st_ctime_ns,
+        ) or _repo_descriptor_has_unsafe_xattrs(descriptor):
+            raise RuntimeError(f"Privilegierte Restorequelle driftete beim Öffnen: {path}")
+        digest = _descriptor_plain_sha256(descriptor, opened.st_size)
+        storage_exception = path == "/etc/systemd/system/e3dc-storage-manager.service"
+        if opened.st_uid == 0 and opened.st_gid == 0:
+            pass
+        elif storage_exception:
+            account = pwd.getpwnam(str(install_user))
+            if (
+                opened.st_uid != account.pw_uid
+                or opened.st_gid != account.pw_gid
+                or stat.S_IMODE(opened.st_mode) != 0o644
+                or opened.st_size > 256 * 1024
+            ):
+                raise RuntimeError("Storage-Unit-Altbesitz ist nicht lokal gebunden")
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            payload_chunks = []
+            remaining = 256 * 1024 + 1
+            while remaining:
+                block = os.read(descriptor, min(64 * 1024, remaining))
+                if not block:
+                    break
+                payload_chunks.append(block)
+                remaining -= len(block)
+            payload = b"".join(payload_chunks)
+            if len(payload) != opened.st_size:
+                raise RuntimeError("Storage-Unit-Altbesitz driftete beim Lesen")
+            if payload not in set(_approved_storage_manager_unit_payloads()):
+                raise RuntimeError(
+                    "Storage-Unit-Altbesitz besitzt keine freigegebenen Bytes"
+                )
+        else:
+            raise RuntimeError(
+                f"Privilegierte Restorequelle ist nicht root-eigen: {path}"
+            )
+        after = os.fstat(descriptor)
+        named_after = os.stat(
+            name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        after_identity = (
+            after.st_dev,
+            after.st_ino,
+            after.st_uid,
+            after.st_gid,
+            stat.S_IMODE(after.st_mode),
+            after.st_nlink,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        named_identity = (
+            named_after.st_dev,
+            named_after.st_ino,
+            named_after.st_uid,
+            named_after.st_gid,
+            stat.S_IMODE(named_after.st_mode),
+            named_after.st_nlink,
+            named_after.st_size,
+            named_after.st_mtime_ns,
+            named_after.st_ctime_ns,
+        )
+        if identity != after_identity or identity != named_identity:
+            raise RuntimeError(f"Privilegierte Restorequelle driftete beim Readback: {path}")
+        return (
+            path,
+            category,
+            digest,
+            int(opened.st_size),
+            int(stat.S_IMODE(opened.st_mode)),
+            int(opened.st_uid),
+            int(opened.st_gid),
+        )
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(parent_descriptor)
+
+
+def _privileged_restore_contract_from_manifest(
+    manifest: dict,
+    install_user: str,
+    *,
+    verify_sources: bool,
+) -> tuple[tuple[str, str, str, int, int, int, int], ...]:
+    privileged_categories = {"systemd", "watchdog", "system-config"}
+    result = []
+    seen = set()
+    for entry in manifest.get("files") or ():
+        if not isinstance(entry, dict):
+            raise RuntimeError("Backupmanifest enthält einen ungültigen Dateieintrag")
+        category = str(entry.get("category") or "")
+        if category not in privileged_categories:
+            continue
+        path = str(entry.get("restore_path") or "")
+        if path in seen or not _privileged_restore_path_allowed(path, category):
+            raise RuntimeError("Privilegierter Restorevertrag ist nicht eindeutig")
+        seen.add(path)
+        try:
+            manifest_record = (
+                path,
+                category,
+                str(entry.get("sha256") or "").lower(),
+                int(entry.get("size", -1)),
+                int(entry.get("mode", -1)),
+                int(entry.get("uid", -1)),
+                int(entry.get("gid", -1)),
+            )
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("Privilegierter Restorevertrag besitzt ungültige Metadaten") from exc
+        if (
+            not re.fullmatch(r"[0-9a-f]{64}", manifest_record[2])
+            or manifest_record[3] < 0
+        ):
+            raise RuntimeError("Privilegierter Restorevertrag besitzt ungültige Werte")
+        if verify_sources:
+            source_record = _read_privileged_restore_source(
+                path,
+                category,
+                install_user,
+            )
+            if source_record != manifest_record:
+                raise RuntimeError(
+                    f"Backup bindet die privilegierte Quelle nicht exakt: {path}"
+                )
+        result.append(manifest_record)
+    return tuple(sorted(result))
+
+
+def _privileged_backup_payload_receipts(
+    backup_dir: str,
+    manifest: dict,
+) -> tuple[PrivilegedBackupFileReceipt, ...]:
+    """Bindet privilegierte Backup-Payloads samt kompletter Inode-Elternkette."""
+
+    backup_root = os.path.abspath(str(backup_dir or ""))
+    if backup_root != str(backup_dir):
+        raise RuntimeError("Privilegierter Backup-Payloadpfad ist nicht kanonisch")
+    privileged_categories = {"systemd", "watchdog", "system-config"}
+    receipts = []
+    seen_restore_paths = set()
+    for entry in manifest.get("files") or ():
+        if not isinstance(entry, dict):
+            raise RuntimeError("Backupmanifest enthält einen ungültigen Dateieintrag")
+        category = str(entry.get("category") or "")
+        if category not in privileged_categories:
+            continue
+        restore_path = str(entry.get("restore_path") or "")
+        relative_text = str(entry.get("path") or "")
+        relative = Path(relative_text)
+        if (
+            restore_path in seen_restore_paths
+            or not _privileged_restore_path_allowed(restore_path, category)
+            or relative.is_absolute()
+            or not relative.parts
+            or ".." in relative.parts
+            or relative.as_posix() != relative_text
+        ):
+            raise RuntimeError("Privilegierter Backup-Payloadvertrag ist nicht eindeutig")
+        seen_restore_paths.add(restore_path)
+        parent_path = os.path.join(
+            backup_root,
+            *relative.parts[:-1],
+        )
+        parent_descriptor, parent_chain = _open_root_receipt_directory_chain(
+            parent_path,
+        )
+        descriptor = None
+        try:
+            name = relative.parts[-1]
+            before = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+            nofollow = getattr(os, "O_NOFOLLOW", 0)
+            if (
+                not nofollow
+                or not stat.S_ISREG(before.st_mode)
+                or before.st_nlink != 1
+                or before.st_uid != 0
+                or before.st_gid != 0
+                or stat.S_IMODE(before.st_mode) != 0o600
+                or before.st_size < 0
+                or before.st_size > 8 * 1024 * 1024
+            ):
+                raise RuntimeError(
+                    f"Privilegierter Backup-Payload ist unsicher: {relative_text}"
+                )
+            descriptor = os.open(
+                name,
+                os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=parent_descriptor,
+            )
+            opened = os.fstat(descriptor)
+            identity = (
+                int(before.st_dev),
+                int(before.st_ino),
+                int(before.st_size),
+                int(stat.S_IMODE(before.st_mode)),
+                int(before.st_uid),
+                int(before.st_gid),
+                int(before.st_nlink),
+                int(before.st_mtime_ns),
+                int(before.st_ctime_ns),
+            )
+            opened_identity = (
+                int(opened.st_dev),
+                int(opened.st_ino),
+                int(opened.st_size),
+                int(stat.S_IMODE(opened.st_mode)),
+                int(opened.st_uid),
+                int(opened.st_gid),
+                int(opened.st_nlink),
+                int(opened.st_mtime_ns),
+                int(opened.st_ctime_ns),
+            )
+            if identity != opened_identity or _repo_descriptor_has_unsafe_xattrs(
+                descriptor
+            ):
+                raise RuntimeError(
+                    f"Privilegierter Backup-Payload driftete beim Öffnen: {relative_text}"
+                )
+            digest = _descriptor_plain_sha256(descriptor, opened.st_size)
+            after = os.fstat(descriptor)
+            named_after = os.stat(
+                name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            after_identity = (
+                int(after.st_dev),
+                int(after.st_ino),
+                int(after.st_size),
+                int(stat.S_IMODE(after.st_mode)),
+                int(after.st_uid),
+                int(after.st_gid),
+                int(after.st_nlink),
+                int(after.st_mtime_ns),
+                int(after.st_ctime_ns),
+            )
+            named_identity = (
+                int(named_after.st_dev),
+                int(named_after.st_ino),
+                int(named_after.st_size),
+                int(stat.S_IMODE(named_after.st_mode)),
+                int(named_after.st_uid),
+                int(named_after.st_gid),
+                int(named_after.st_nlink),
+                int(named_after.st_mtime_ns),
+                int(named_after.st_ctime_ns),
+            )
+            if (
+                identity != after_identity
+                or identity != named_identity
+                or digest != str(entry.get("sha256") or "").lower()
+                or opened.st_size != int(entry.get("size", -1))
+            ):
+                raise RuntimeError(
+                    f"Privilegierter Backup-Payload weicht vom Manifest ab: {relative_text}"
+                )
+            receipts.append(
+                PrivilegedBackupFileReceipt(
+                    restore_path=restore_path,
+                    category=category,
+                    backup_relative_path=relative_text,
+                    parent_path_chain=parent_chain,
+                    dev=identity[0],
+                    ino=identity[1],
+                    sha256=digest,
+                    size=identity[2],
+                    mode=identity[3],
+                    uid=identity[4],
+                    gid=identity[5],
+                    nlink=identity[6],
+                    mtime_ns=identity[7],
+                    ctime_ns=identity[8],
+                )
+            )
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            os.close(parent_descriptor)
+    return tuple(sorted(receipts, key=lambda item: item.restore_path))
+
+
+def _verify_restored_privileged_files(
+    receipt: RecoveryBackupReceipt,
+    install_user: str,
+    *,
+    allow_storage_owner_promotion: bool = False,
+) -> None:
+    if not isinstance(receipt, RecoveryBackupReceipt):
+        raise RuntimeError("Privilegierter Restore besitzt keinen Root-Receipt")
+    current = tuple(
+        sorted(
+            _read_privileged_restore_source(path, category, install_user)
+            for path, category, _digest, _size, _mode, _uid, _gid
+            in receipt.privileged_files
+        )
+    )
+    expected = list(receipt.privileged_files)
+    if allow_storage_owner_promotion:
+        storage_path = "/etc/systemd/system/e3dc-storage-manager.service"
+        expected = [
+            (
+                path,
+                category,
+                digest,
+                size,
+                mode,
+                0 if path == storage_path else uid,
+                0 if path == storage_path else gid,
+            )
+            for path, category, digest, size, mode, uid, gid in expected
+        ]
+    if current != tuple(sorted(expected)):
+        raise RuntimeError("Privilegierte Restorequellen weichen nach Recovery ab")
+
+
+def _capture_recovery_backup_receipt(
+    backup_dir: str,
+    verified_manifest: dict,
+    repo_contract: RepoRecoveryContract,
+    transaction_id: str,
+) -> RecoveryBackupReceipt:
+    """Friert den noch root-kontrollierten Backupbaum vor dessen Chown ein."""
+
+    if not isinstance(repo_contract, RepoRecoveryContract):
+        raise RuntimeError("Repo-Recovery-Vertrag fehlt vor dem Backup-Receipt")
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        raise RuntimeError("Recovery-Receipt darf ausschließlich Root erzeugen")
+    if not RECOVERY_BOOTBLOCK_TRANSACTION_RE.fullmatch(str(transaction_id or "")):
+        raise RuntimeError("Recovery-Receipt besitzt keine gebundene Transaktions-ID")
+    backup_root = os.path.abspath(backup_dir)
+    backup_descriptor, backup_path_chain = _open_root_receipt_directory_chain(
+        backup_root,
+    )
+    try:
+        backup_metadata = os.fstat(backup_descriptor)
+    finally:
+        os.close(backup_descriptor)
+    if len(backup_path_chain) < 2:
+        raise RuntimeError("Backupbaum besitzt keine gebundene Elternkette")
+    parent_receipt = backup_path_chain[-2]
+    backup_receipt = backup_path_chain[-1]
+    if (
+        backup_root != backup_dir
+        or not stat.S_ISDIR(backup_metadata.st_mode)
+        or backup_metadata.st_uid != 0
+        or backup_metadata.st_gid != 0
+        or stat.S_IMODE(backup_metadata.st_mode) != 0o700
+        or (backup_receipt[1], backup_receipt[2])
+        != (backup_metadata.st_dev, backup_metadata.st_ino)
+    ):
+        raise RuntimeError("Backupbaum ist vor dem Receipt nicht root:root 0700")
+    root = repo_contract.install_root
+    install_user = repo_contract.install_user
+    commit = repo_contract.expected_commit
+    if _bound_release_head_commit(root, install_user) != commit:
+        raise RuntimeError("Recovery-Receipt sieht nicht den gebundenen Ausgangs-Commit")
+    _require_clean_recovery_index(root, install_user)
+    manifest, manifest_sha256 = _read_stable_verified_backup_manifest(backup_root)
+    if manifest != verified_manifest:
+        raise RuntimeError("Backupmanifest driftete vor dem Root-Receipt")
+    stable_descriptor, stable_chain = _open_root_receipt_directory_chain(backup_root)
+    os.close(stable_descriptor)
+    if stable_chain != backup_path_chain:
+        raise RuntimeError("Backup-Elternkette driftete vor dem Root-Receipt")
+    privileged_files = _privileged_restore_contract_from_manifest(
+        manifest,
+        install_user,
+        verify_sources=True,
+    )
+    privileged_backup_files = _privileged_backup_payload_receipts(
+        backup_root,
+        manifest,
+    )
+    tracked_entries = [
+        (relative_path, git_mode, git_oid)
+        for relative_path, git_mode, git_oid, _sha, _size, _mode, _uid, _gid
+        in repo_contract.tracked_files
+    ]
+    files, directories = _recovery_repo_contracts_from_manifest(
+        manifest,
+        root,
+        tracked_entries,
+    )
+    preimages = {
+        relative_path: (digest, size, mode, uid, gid)
+        for relative_path, _git_mode, _git_oid, digest, size, mode, uid, gid
+        in repo_contract.tracked_files
+    }
+    if files != preimages:
+        raise RuntimeError(
+            "Backup erfasst nicht exakt die vorab eingefrorenen Repo-Preimages"
+        )
+    return RecoveryBackupReceipt(
+        backup_dir=backup_root,
+        backup_dev=int(backup_metadata.st_dev),
+        backup_ino=int(backup_metadata.st_ino),
+        parent_dev=int(parent_receipt[1]),
+        parent_ino=int(parent_receipt[2]),
+        backup_path_chain=backup_path_chain,
+        transaction_id=transaction_id,
+        backup_id=str(manifest.get("backup_id") or ""),
+        manifest_sha256=manifest_sha256,
+        manifest_semantic_sha256=_manifest_semantic_sha256(manifest),
+        install_root=root,
+        expected_commit=commit,
+        tracked_files=tuple(
+            (relative_path, digest, size, mode, uid, gid)
+            for relative_path, (digest, size, mode, uid, gid) in sorted(files.items())
+        ),
+        tracked_directories=tuple(
+            (relative_path, mode, uid, gid)
+            for relative_path, (mode, uid, gid) in sorted(directories.items())
+        ),
+        manifest_files=_manifest_file_receipt(manifest),
+        privileged_files=privileged_files,
+        privileged_backup_files=privileged_backup_files,
+    )
+
+
+def _revalidate_recovery_backup_receipt(
+    receipt: RecoveryBackupReceipt,
+    repo_contract: RepoRecoveryContract,
+    *,
+    backup_dir: str,
+    repo_dir: str,
+    expected_commit: str,
+    install_user: str,
+) -> tuple[
+    dict[str, tuple[str, int, int, int, int]],
+    dict[str, tuple[int, int, int]],
+]:
+    """Akzeptiert nur exakt den vor Mutation im Root-Prozess eingefrorenen Beleg."""
+
+    if not isinstance(receipt, RecoveryBackupReceipt):
+        raise RuntimeError("Recovery-Receipt fehlt oder besitzt einen falschen Typ")
+    if not isinstance(repo_contract, RepoRecoveryContract):
+        raise RuntimeError("Repo-Recovery-Vertrag fehlt oder besitzt einen falschen Typ")
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        raise RuntimeError("Recovery-Receipt darf ausschließlich Root auswerten")
+    root = os.path.abspath(repo_dir)
+    commit = _validate_full_commit(expected_commit)
+    if (
+        os.path.abspath(backup_dir) != backup_dir
+        or receipt.backup_dir != backup_dir
+        or not RECOVERY_BOOTBLOCK_TRANSACTION_RE.fullmatch(receipt.transaction_id)
+        or receipt.install_root != root
+        or receipt.expected_commit != commit
+        or repo_contract.install_root != root
+        or repo_contract.install_user != str(install_user)
+        or repo_contract.expected_commit != commit
+        or _bound_release_head_commit(root, install_user) != commit
+    ):
+        raise RuntimeError("Recovery-Receipt weicht vom gebundenen Rückfallziel ab")
+    backup_descriptor, backup_path_chain = _open_root_receipt_directory_chain(
+        backup_dir,
+    )
+    try:
+        backup_metadata = os.fstat(backup_descriptor)
+    finally:
+        os.close(backup_descriptor)
+    if (
+        not stat.S_ISDIR(backup_metadata.st_mode)
+        or backup_metadata.st_uid != 0
+        or backup_metadata.st_gid != 0
+        or stat.S_IMODE(backup_metadata.st_mode) != 0o700
+        or backup_path_chain != receipt.backup_path_chain
+        or len(backup_path_chain) < 2
+        or (backup_path_chain[-2][1], backup_path_chain[-2][2])
+        != (receipt.parent_dev, receipt.parent_ino)
+        or (backup_metadata.st_dev, backup_metadata.st_ino)
+        != (receipt.backup_dev, receipt.backup_ino)
+    ):
+        raise RuntimeError("Recovery-Backup- oder Elterninode weicht vom Root-Receipt ab")
+    manifest, manifest_sha256 = _read_stable_verified_backup_manifest(backup_dir)
+    stable_descriptor, stable_chain = _open_root_receipt_directory_chain(backup_dir)
+    os.close(stable_descriptor)
+    if (
+        stable_chain != receipt.backup_path_chain
+        or
+        manifest_sha256 != receipt.manifest_sha256
+        or _manifest_semantic_sha256(manifest) != receipt.manifest_semantic_sha256
+        or str(manifest.get("backup_id") or "") != receipt.backup_id
+        or str(manifest.get("install_root") or "") != receipt.install_root
+        or _manifest_file_receipt(manifest) != receipt.manifest_files
+        or _privileged_restore_contract_from_manifest(
+            manifest,
+            install_user,
+            verify_sources=False,
+        )
+        != receipt.privileged_files
+        or _privileged_backup_payload_receipts(backup_dir, manifest)
+        != receipt.privileged_backup_files
+    ):
+        raise RuntimeError("Recovery-Backup weicht vom Root-Receipt ab")
+    tracked_entries = _tracked_release_file_contracts(
+        root,
+        install_user,
+        target_commit=commit,
+    )
+    frozen_git_entries = tuple(
+        (relative_path, git_mode, git_oid)
+        for relative_path, git_mode, git_oid, _sha, _size, _mode, _uid, _gid
+        in repo_contract.tracked_files
+    )
+    if tuple(tracked_entries) != frozen_git_entries:
+        raise RuntimeError("Git-Dateivertrag weicht vom Repo-Recovery-Vertrag ab")
+    files, directories = _recovery_repo_contracts_from_manifest(
+        manifest,
+        root,
+        tracked_entries,
+    )
+    current_files = tuple(
+        (relative_path, digest, size, mode, uid, gid)
+        for relative_path, (digest, size, mode, uid, gid) in sorted(files.items())
+    )
+    current_directories = tuple(
+        (relative_path, mode, uid, gid)
+        for relative_path, (mode, uid, gid) in sorted(directories.items())
+    )
+    if (
+        current_files != receipt.tracked_files
+        or current_directories != receipt.tracked_directories
+    ):
+        raise RuntimeError("Recovery-Produktvertrag weicht vom Root-Receipt ab")
+    preimages = {
+        relative_path: (digest, size, mode, uid, gid)
+        for relative_path, _git_mode, _git_oid, digest, size, mode, uid, gid
+        in repo_contract.tracked_files
+    }
+    if files != preimages:
+        raise RuntimeError("Backup-Receipt weicht vom Repo-Recovery-Preimage ab")
+    _require_clean_recovery_index(root, install_user)
+    return preimages, directories
+
+
+def _guard_recovery_manifest(
+    manifest: dict,
+    receipt: RecoveryBackupReceipt,
+) -> None:
+    """Bindet genau das vom Restore verwendete Manifest an den Root-Receipt."""
+
+    if not isinstance(manifest, dict) or not isinstance(receipt, RecoveryBackupReceipt):
+        raise RuntimeError("Restore-Manifestguard besitzt keinen gültigen Receipt")
+    if (
+        str(manifest.get("backup_id") or "") != receipt.backup_id
+        or str(manifest.get("install_root") or "") != receipt.install_root
+        or _manifest_semantic_sha256(manifest) != receipt.manifest_semantic_sha256
+        or _manifest_file_receipt(manifest) != receipt.manifest_files
+        or _privileged_restore_contract_from_manifest(
+            manifest,
+            "",
+            verify_sources=False,
+        )
+        != receipt.privileged_files
+    ):
+        raise RuntimeError("Restore verwendet nicht das root-autorisierte Backupmanifest")
+
+
 def _secure_repo_permissions(
     repo_dir: str,
     install_user: str,
     *,
     expected_commit: str | None = None,
+    recovery_backup_dir: str | None = None,
+    recovery_repo_contract: RepoRecoveryContract | None = None,
+    recovery_backup_receipt: RecoveryBackupReceipt | None = None,
 ) -> None:
     """Härtet ausschließlich den von Git gebundenen Produktbaum.
 
@@ -2390,6 +4984,34 @@ def _secure_repo_permissions(
         install_user,
         target_commit=bound_commit,
     )
+    recovery_file_contracts: dict[str, tuple[str, int, int, int, int]] = {}
+    recovery_directory_contracts: dict[str, tuple[int, int, int]] = {}
+    recovery_requested = any(
+        item is not None
+        for item in (
+            recovery_backup_dir,
+            recovery_repo_contract,
+            recovery_backup_receipt,
+        )
+    )
+    if recovery_requested:
+        if (
+            recovery_backup_dir is None
+            or recovery_repo_contract is None
+            or recovery_backup_receipt is None
+            or expected_commit is None
+        ):
+            raise RuntimeError("Recovery-Rechtehärtung besitzt keinen vollständigen Receipt-Vertrag")
+        recovery_file_contracts, recovery_directory_contracts = (
+            _revalidate_recovery_backup_receipt(
+                recovery_backup_receipt,
+                recovery_repo_contract,
+                backup_dir=recovery_backup_dir,
+                repo_dir=root,
+                expected_commit=bound_commit,
+                install_user=install_user,
+            )
+        )
     tracked_directories = {""}
     for relative_path, _expected_mode, _expected_oid in tracked_entries:
         parent = Path(relative_path).parent
@@ -2452,6 +5074,44 @@ def _secure_repo_permissions(
             metadata.st_uid,
             metadata.st_gid,
             stat.S_IMODE(metadata.st_mode),
+        )
+
+    def descriptor_sha256(descriptor: int, expected_size: int) -> str:
+        if int(expected_size) < 0:
+            raise RuntimeError("Recovery-Dateigröße ist ungültig")
+        digest = hashlib.sha256()
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        remaining = int(expected_size)
+        while remaining:
+            block = os.read(descriptor, min(1024 * 1024, remaining))
+            if not block:
+                raise RuntimeError("Recovery-Produktdatei endet vor der Manifestgröße")
+            digest.update(block)
+            remaining -= len(block)
+        if os.read(descriptor, 1):
+            raise RuntimeError("Recovery-Produktdatei überschreitet die Manifestgröße")
+        return digest.hexdigest()
+
+    def descriptor_content_matches(
+        descriptor: int,
+        relative_path: str,
+        expected_size: int,
+        expected_oid: str,
+    ) -> bool:
+        recovery = recovery_file_contracts.get(relative_path)
+        if recovery is not None:
+            digest, size, _mode, _uid, _gid = recovery
+            return int(expected_size) == size and descriptor_sha256(
+                descriptor,
+                size,
+            ) == digest
+        return (
+            _git_blob_oid_from_descriptor(
+                descriptor,
+                expected_size,
+                expected_oid,
+            )
+            == expected_oid
         )
 
     def open_bound_directory(
@@ -2545,6 +5205,9 @@ def _secure_repo_permissions(
                 raise RuntimeError(
                     f"Produktdatei wuchs während der Kopie: {relative_path}"
                 )
+            # Daten zuerst als vollständigen Temp-Payload persistieren; der
+            # zweite fsync nach den Metadaten bindet anschließend den finalen
+            # Inodevertrag.
             os.fsync(temporary_descriptor)
             os.fchown(temporary_descriptor, account.pw_uid, account.pw_gid)
             os.fchmod(temporary_descriptor, expected_mode)
@@ -2552,6 +5215,10 @@ def _secure_repo_permissions(
                 temporary_descriptor,
                 ns=(source_metadata.st_atime_ns, source_metadata.st_mtime_ns),
             )
+            # Erst die finalen Bytes *und* Metadaten dauerhaft schreiben. Ein
+            # früheres fsync vor chown/chmod/utime würde nur den 0600-Tempstand
+            # belegen und könnte nach Gate-Clear beim Neustart zurückfallen.
+            os.fsync(temporary_descriptor)
             hardened = os.fstat(temporary_descriptor)
             if (
                 not stat.S_ISREG(hardened.st_mode)
@@ -2560,12 +5227,12 @@ def _secure_repo_permissions(
                 or hardened.st_gid != account.pw_gid
                 or stat.S_IMODE(hardened.st_mode) != expected_mode
                 or hardened.st_size != source_metadata.st_size
-                or _git_blob_oid_from_descriptor(
+                or not descriptor_content_matches(
                     temporary_descriptor,
+                    relative_path,
                     hardened.st_size,
                     expected_oid,
                 )
-                != expected_oid
             ):
                 raise RuntimeError(
                     f"Neuer Produkt-Inode ist nicht exakt gebunden: {relative_path}"
@@ -2622,6 +5289,9 @@ def _secure_repo_permissions(
                 src_dir_fd=parent_descriptor,
                 dst_dir_fd=parent_descriptor,
             )
+            # Der neue Inode ist erst nach dem Directory-fsync auch als Name
+            # rebootfest. Jeder Fehler bleibt im Recoverypfad fail-closed.
+            os.fsync(parent_descriptor)
             installed = True
             live_hardened = os.stat(
                 name,
@@ -2632,12 +5302,12 @@ def _secure_repo_permissions(
             if (
                 file_contract(live_hardened)
                 != file_contract(hardened_after)
-                or _git_blob_oid_from_descriptor(
+                or not descriptor_content_matches(
                     temporary_descriptor,
+                    relative_path,
                     hardened_after.st_size,
                     expected_oid,
                 )
-                != expected_oid
             ):
                 raise RuntimeError(
                     f"Atomar eingesetzter Produkt-Inode driftete: {relative_path}"
@@ -2739,12 +5409,12 @@ def _secure_repo_permissions(
                         or opened.st_uid != account.pw_uid
                         or opened.st_gid != account.pw_gid
                         or stat.S_IMODE(opened.st_mode) != expected_mode
-                        or _git_blob_oid_from_descriptor(
+                        or not descriptor_content_matches(
                             descriptor,
+                            relative_path,
                             opened.st_size,
                             expected_oid,
                         )
-                        != expected_oid
                     ):
                         raise RuntimeError(
                             "Getrackte Produktdatei besitzt keinen stabilen "
@@ -2835,6 +5505,16 @@ def _secure_repo_permissions(
             if relative_directory:
                 directory_descriptors[relative_directory] = descriptor
             before = os.fstat(descriptor)
+            recovery_directory = recovery_directory_contracts.get(relative_directory)
+            if recovery_directory is not None and (
+                stat.S_IMODE(before.st_mode),
+                before.st_uid,
+                before.st_gid,
+            ) != recovery_directory:
+                raise RuntimeError(
+                    "Recovery-Produktverzeichnis weicht vom Backupmanifest ab: "
+                    + (relative_directory or root)
+                )
             if (
                 not stat.S_ISDIR(before.st_mode)
                 or before.st_uid not in (0, account.pw_uid)
@@ -2847,11 +5527,30 @@ def _secure_repo_permissions(
                 os.fchown(descriptor, account.pw_uid, account.pw_gid)
             if stat.S_IMODE(before.st_mode) != 0o755:
                 os.fchmod(descriptor, 0o755)
+            # Auch Verzeichnis-Metadaten müssen vor dem Recovery-Endgate auf
+            # dem gebundenen Inode dauerhaft sein. Ein Live-Readback allein
+            # schützt nicht gegen ein Metadaten-Rollback nach Stromverlust.
+            os.fsync(descriptor)
             after = os.fstat(descriptor)
+            if relative_directory:
+                parent_relative = Path(relative_directory).parent.as_posix()
+                if parent_relative == ".":
+                    parent_relative = ""
+                live_parent_descriptor = directory_descriptors[parent_relative]
+                live_name = Path(relative_directory).name
+            else:
+                live_parent_descriptor = root_parent_descriptor
+                live_name = root_name
+            live_after = os.stat(
+                live_name,
+                dir_fd=live_parent_descriptor,
+                follow_symlinks=False,
+            )
             if (
                 not stat.S_ISDIR(after.st_mode)
                 or (after.st_dev, after.st_ino)
                 != (before.st_dev, before.st_ino)
+                or directory_contract(live_after) != directory_contract(after)
                 or after.st_uid != account.pw_uid
                 or after.st_gid != account.pw_gid
                 or stat.S_IMODE(after.st_mode) != 0o755
@@ -2873,6 +5572,21 @@ def _secure_repo_permissions(
                 dir_fd=parent_descriptor,
                 follow_symlinks=False,
             )
+            recovery_file = recovery_file_contracts.get(relative_path)
+            if recovery_file is not None:
+                _digest, recovery_size, recovery_mode, recovery_uid, recovery_gid = (
+                    recovery_file
+                )
+                if (
+                    before.st_size != recovery_size
+                    or stat.S_IMODE(before.st_mode) != recovery_mode
+                    or before.st_uid != recovery_uid
+                    or before.st_gid != recovery_gid
+                ):
+                    raise RuntimeError(
+                        "Recovery-Produktdatei weicht in den Metadaten vom "
+                        f"Backupmanifest ab: {relative_path}"
+                    )
             if (
                 not stat.S_ISREG(before.st_mode)
                 or before.st_nlink != 1
@@ -2906,12 +5620,12 @@ def _secure_repo_permissions(
                     or opened.st_uid not in (0, account.pw_uid)
                     or (opened.st_dev, opened.st_ino)
                     != (before.st_dev, before.st_ino)
-                    or _git_blob_oid_from_descriptor(
+                    or not descriptor_content_matches(
                         descriptor,
+                        relative_path,
                         opened.st_size,
                         expected_oid,
                     )
-                    != expected_oid
                 ):
                     raise RuntimeError(
                         "Getrackte Produktdatei besitzt unsichere oder "
@@ -2957,12 +5671,12 @@ def _secure_repo_permissions(
                     or after.st_uid != account.pw_uid
                     or after.st_gid != account.pw_gid
                     or stat.S_IMODE(after.st_mode) != expected_mode
-                    or _git_blob_oid_from_descriptor(
+                    or not descriptor_content_matches(
                         descriptor,
+                        relative_path,
                         after.st_size,
                         expected_oid,
                     )
-                    != expected_oid
                 ):
                     raise RuntimeError(
                         "Getrackte Produktdatei konnte nicht exakt "
@@ -2996,6 +5710,12 @@ def _secure_repo_permissions(
             os.close(descriptor)
         if root_parent_descriptor is not None:
             os.close(root_parent_descriptor)
+    if recovery_repo_contract is not None:
+        _verify_recovered_repo_contract(
+            root,
+            install_user,
+            recovery_repo_contract,
+        )
 
 
 def _service_expected(service: str, state: TransitionState) -> tuple[bool, str]:
@@ -3668,7 +6388,7 @@ def _normalize_restart_services(services) -> list:
     return normalized
 
 
-def _stop_v4_services(services=None):
+def _stop_v4_services_impl(services=None):
     """Stop every catalogued writer/integration plus watchdog and legacy core."""
     print('\n[->] Stoppe E3DC-Control-Dienste fuer Release-Wechsel...')
     errors = []
@@ -3680,20 +6400,63 @@ def _stop_v4_services(services=None):
     for name in _normalize_restart_services(services):
         if name not in all_names and name not in {"piguard", "e3dc"}:
             errors.append(f"Nicht katalogisierter Stop-Dienst: {name}")
-    for srv in (*all_names, "piguard", "e3dc"):
-        if _service_unit_exists(srv):
-            res = run_command(f'sudo systemctl stop {srv}', timeout=15)
-            status = '[OK]' if res['success'] else '[!] FEHLER'
-            print(f'  {status} {srv}')
-            if not res['success']:
-                errors.append(f'{srv} konnte nicht gestoppt werden')
-                continue
-            active = run_command(f'systemctl is-active {srv}', timeout=10)
-            activity = active.get('stdout', '').strip().lower()
-            if activity not in {'inactive', 'failed'}:
-                errors.append(f'{srv} hat nach Stop keinen beweisbaren inaktiven Status ({activity or "unlesbar"})')
-    install_user = get_install_user()
-    for screen_user in (str(install_user), "root"):
+    stop_order = tuple(dict.fromkeys(("piguard", *all_names, "e3dc")))
+    # Hardware-Safety: PiGuard und danach jeder katalogisierte Writer erhalten
+    # den Stop aus dem bereits geladenen systemd-Zustand, bevor die potenziell
+    # langsameren Show-Inventarisierungen beginnen. Ein fehlgeschlagenes
+    # Stop-Kommando ist nur dann unschädlich, wenn der anschließende strikte
+    # Readback exakt inactive/failed oder canonical not-found beweist.
+    stop_results = {}
+    for srv in stop_order:
+        stop_results[srv] = _run_argv(
+            ["sudo", "systemctl", "stop", _unit_name(srv)],
+            timeout=15,
+        )
+    for srv in stop_order:
+        stopped = stop_results[srv]
+        active = _run_argv(
+            ["systemctl", "is-active", _unit_name(srv)],
+            timeout=10,
+        )
+        activity_text = str(active.get("stdout") or "").strip().lower()
+        if _systemd_activity_readback_matches(
+            active,
+            should_be_active=False,
+        ):
+            print(f"  [OK] {srv}")
+            continue
+        try:
+            activity = (
+                _capture_piguard_transition_activity()
+                if _unit_name(srv) == PIGUARD_UNIT
+                else _capture_transition_unit_activity(srv)
+            )
+        except Exception as exc:
+            errors.append(
+                f"{_unit_name(srv)} ist nach Sofortstop unklar: {exc}; "
+                f"Stop={_command_result_diagnostic(stopped)}, "
+                f"is-active={_command_result_diagnostic(active)}"
+            )
+            continue
+        if activity == "absent":
+            print(f"  [OK] {srv} (nicht installiert)")
+            continue
+        errors.append(
+            f"{srv} hat nach Sofortstop keinen beweisbaren inaktiven Status "
+            f"({activity_text or activity or 'unlesbar'}; "
+            f"Stop={_command_result_diagnostic(stopped)})"
+        )
+    try:
+        install_user = get_install_user()
+    except Exception as exc:
+        install_user = None
+        errors.append(f"Installationsbenutzer ist für Legacy-Stop unklar: {exc}")
+    screen_users = tuple(
+        dict.fromkeys(
+            ([str(install_user)] if install_user is not None else []) + ["root"]
+        )
+    )
+    for screen_user in screen_users:
         for screen_name in ("e3dc", "E3DC"):
             prefix = ["sudo", "-u", screen_user] if screen_user != "root" else ["sudo"]
             _run_argv([*prefix, "screen", "-S", screen_name, "-X", "quit"], timeout=10)
@@ -3706,18 +6469,59 @@ def _stop_v4_services(services=None):
         result = _run_argv(probe, timeout=10)
         if result.get("returncode") != 1:
             errors.append("Legacy-Screen-/Prozesspfad ist nicht beweisbar gestoppt")
-    for screen_user in (str(install_user), "root"):
+    for screen_user in screen_users:
         prefix = ["sudo", "-u", screen_user] if screen_user != "root" else ["sudo"]
         listing = _run_argv([*prefix, "screen", "-ls"], timeout=10)
         sessions = listing.get("stdout", "")
         if re.search(r"\.(?:e3dc|E3DC)(?:\s|$)", sessions):
             errors.append(f"Legacy-Screen-Session fuer {screen_user} ist weiterhin aktiv")
+    # Stop-Abhängigkeiten und Watchdogs können eine zuvor gestoppte Unit
+    # erneut aktivieren. Erst dieser zweite vollständige Pass beweist die
+    # globale Aktorruhe; transient/unknown/unlesbar bleibt fail-closed.
+    for srv in stop_order:
+        try:
+            show_activity = (
+                _capture_piguard_transition_activity()
+                if _unit_name(srv) == PIGUARD_UNIT
+                else _capture_transition_unit_activity(srv)
+            )
+        except Exception as exc:
+            errors.append(
+                f"{_unit_name(srv)} ist im globalen Stop-Endgate unklar: {exc}"
+            )
+            continue
+        if show_activity == "absent":
+            continue
+        active = _run_argv(
+            ["systemctl", "is-active", _unit_name(srv)],
+            timeout=10,
+        )
+        activity = str(active.get("stdout") or "").strip().lower()
+        if not _systemd_activity_readback_matches(
+            active,
+            should_be_active=False,
+        ):
+            errors.append(
+                f"{srv} ist im globalen Stop-Endgate nicht beweisbar inaktiv "
+                f"({activity or 'unlesbar'})"
+            )
     if errors:
         for error in errors:
             print(f'  [!] {error}')
         return False
     print('  [OK] Aktor-/Writer-Dienste sind fuer den Release-Wechsel in Ruhe.')
     return True
+
+
+def _stop_v4_services(services=None):
+    """Totaler Fail-closed-Wrapper: kein lokaler Bindefehler verlässt den Stop."""
+
+    try:
+        return bool(_stop_v4_services_impl(services))
+    except Exception as exc:
+        print(f"  [!] Stop-/Endgateprüfung brach intern ab: {exc}")
+        update_logger.error("Stop-/Endgateprüfung brach intern ab: %s", exc)
+        return False
 
 
 def _post_update_healthcheck(
@@ -6360,12 +9164,67 @@ def _recover_failed_transition(
     recovery_inventory: RecoverySurfaceInventory,
     state: TransitionState,
     package_transaction: PackageTransactionState | None = None,
-) -> bool:
+    repo_recovery_contract: RepoRecoveryContract | None = None,
+    backup_receipt: RecoveryBackupReceipt | None = None,
+    bootblock_contract: (
+        RecoveryBootblockContract | RecoveryBootblockPartialContract | None
+    ) = None,
+    recovery_transaction_id: str | None = None,
+) -> RecoveryTransitionResult:
     """Restore old Git/tree/persistent state and verify role/services after any mutation failure."""
     recovery_ok = True
-    if not _stop_v4_services(V4_SERVICES):
+    if (
+        not RECOVERY_BOOTBLOCK_TRANSACTION_RE.fullmatch(
+            str(recovery_transaction_id or "")
+        )
+        or (
+            backup_receipt is not None
+            and backup_receipt.transaction_id != recovery_transaction_id
+        )
+    ):
+        update_logger.error("Recovery-Transaktions-ID ist nicht an den Receipt gebunden")
+        return RecoveryTransitionResult(False, None)
+    try:
+        initial_quiesced = bool(_stop_v4_services(V4_SERVICES))
+    except Exception as exc:
+        initial_quiesced = False
+        update_logger.error(
+            "Recovery-Sofortstop warf vor persistentem Bootblock einen Fehler: %s",
+            exc,
+        )
+    if not initial_quiesced:
+        update_logger.error(
+            "Recovery-Sofortstop vor persistentem Bootblock ist nicht vollständig beweisbar"
+        )
+    try:
+        bootblock_contract = _arm_persistent_recovery_bootblock(
+            bootblock_contract,
+            transaction_id=recovery_transaction_id,
+        )
+    except RecoveryBootblockArmError as exc:
+        update_logger.error(
+            "Recovery-Bootblock blieb nach fehlgeschlagenem Fresh-Arm "
+            "nur über seinen eigenen Inodevertrag kontrollierbar: %s",
+            exc,
+        )
+        return RecoveryTransitionResult(False, exc.contract)
+    except Exception as exc:
+        update_logger.error(
+            "Recovery-Bootblock konnte nicht rebootfest aktiviert werden: %s",
+            exc,
+        )
+        return RecoveryTransitionResult(False, None)
+    try:
+        final_quiesced = bool(_stop_v4_services(V4_SERVICES))
+    except Exception as exc:
+        final_quiesced = False
+        update_logger.error(
+            "Recovery-Stop-Endpass warf nach persistentem Bootblock einen Fehler: %s",
+            exc,
+        )
+    if not initial_quiesced or not final_quiesced:
         update_logger.error("Recovery abgebrochen: Aktor-/Writer-Ruhe ist nicht beweisbar")
-        return False
+        return RecoveryTransitionResult(False, bootblock_contract)
     if old_commit and not git_created:
         reset = _git_argv(repo_dir, install_user, "reset", "--hard", old_commit, timeout=120)
         recovery_ok = recovery_ok and reset["success"]
@@ -6378,17 +9237,110 @@ def _recover_failed_transition(
             excluded_top=top_exclusions,
             excluded_anywhere=anywhere_exclusions,
         )
-        restore_verified_backup(backup_dir, install_path=repo_dir)
+        restore_manifest_guard = None
+        if old_commit is not None:
+            if repo_recovery_contract is None or backup_receipt is None:
+                raise RuntimeError(
+                    "Recovery besitzt keinen vorab eingefrorenen Repo-/Backup-Receipt"
+                )
+            _revalidate_recovery_backup_receipt(
+                backup_receipt,
+                repo_recovery_contract,
+                backup_dir=backup_dir,
+                repo_dir=repo_dir,
+                expected_commit=old_commit,
+                install_user=install_user,
+            )
+
+            def restore_manifest_guard(manifest):
+                _guard_recovery_manifest(manifest, backup_receipt)
+
+        restore_metadata_overrides = {}
+        if backup_receipt is not None:
+            storage_path = "/etc/systemd/system/e3dc-storage-manager.service"
+            for path, _category, _digest, _size, mode, uid, gid in (
+                backup_receipt.privileged_files
+            ):
+                if path == storage_path and (uid != 0 or gid != 0):
+                    if mode != 0o644:
+                        raise RuntimeError(
+                            "Storage-Unit-Altbesitz besitzt keinen 0644-Receipt"
+                        )
+                    restore_metadata_overrides[path] = (0o644, 0, 0)
+
+        def restored_payload_guard():
+            if not hasattr(os, "geteuid") or os.geteuid() != 0:
+                raise RuntimeError(
+                    "Privilegierter Restore-Endguard darf ausschließlich Root ausführen"
+                )
+            if backup_receipt is not None:
+                _verify_restored_privileged_files(
+                    backup_receipt,
+                    install_user,
+                    allow_storage_owner_promotion=True,
+                )
+
+        restore_verified_backup(
+            backup_dir,
+            install_path=repo_dir,
+            verified_manifest_guard=restore_manifest_guard,
+            restored_payload_guard=(
+                restored_payload_guard if backup_receipt is not None else None
+            ),
+            restore_metadata_overrides=restore_metadata_overrides,
+        )
         _restore_recovery_surface(recovery_inventory, state)
+        if backup_receipt is not None:
+            _verify_restored_privileged_files(
+                backup_receipt,
+                install_user,
+                allow_storage_owner_promotion=True,
+            )
+            if any(
+                path == "/etc/systemd/system/e3dc-storage-manager.service"
+                for path, _category, _digest, _size, _mode, _uid, _gid
+                in backup_receipt.privileged_files
+            ):
+                recovery_identities = _validate_recovery_bootblock_contract(
+                    bootblock_contract
+                )
+                storage_unit = "e3dc-storage-manager.service"
+                recovery_path = _recovery_dropin_path(storage_unit)
+                recovery_dev, recovery_ino = recovery_identities[storage_unit]
+                capture_systemd_service_bundle(
+                    ("e3dc-storage-manager",),
+                    expected_recovery_dropins={
+                        storage_unit: {
+                            recovery_path: {
+                                "bytes": RECOVERY_BOOTBLOCK_DROPIN_PAYLOAD,
+                                "dev": recovery_dev,
+                                "ino": recovery_ino,
+                                "uid": 0,
+                                "gid": 0,
+                                "mode": 0o644,
+                                "nlink": 1,
+                                "size": len(RECOVERY_BOOTBLOCK_DROPIN_PAYLOAD),
+                            }
+                        }
+                    },
+                )
         # Recovery installiert keine Units aus dem temporären Archivbaum. Die
         # verifizierte Sicherung stellt die alten Unitdateien wieder her; hier
         # werden ausschließlich Web- und Repo-Rechte am Zielbaum gehärtet.
         if not _fix_webroot_permissions():
             raise RuntimeError("Web-Programmrechte konnten nach Recovery nicht gehärtet werden")
+        recovery_permission_args = {}
+        if repo_recovery_contract is not None or backup_receipt is not None:
+            recovery_permission_args = {
+                "recovery_backup_dir": backup_dir,
+                "recovery_repo_contract": repo_recovery_contract,
+                "recovery_backup_receipt": backup_receipt,
+            }
         _secure_repo_permissions(
             repo_dir,
             install_user,
             expected_commit=old_commit,
+            **recovery_permission_args,
         )
         _verify_transition_state(
             state,
@@ -6403,9 +9355,51 @@ def _recover_failed_transition(
         except Exception as exc:
             update_logger.error(f"Paket-Ruecklauf fehlgeschlagen: {exc}")
             recovery_ok = False
-    if recovery_ok:
-        recovery_ok = _recover_pretransaction_service_state(state)
-    return recovery_ok
+    if recovery_ok and backup_receipt is not None:
+        try:
+            _verify_restored_privileged_files(
+                backup_receipt,
+                install_user,
+                allow_storage_owner_promotion=True,
+            )
+        except Exception as exc:
+            update_logger.error(
+                "Privilegierter Restore-Endvertrag fehlgeschlagen: %s",
+                exc,
+            )
+            recovery_ok = False
+    if not recovery_ok:
+        return RecoveryTransitionResult(False, bootblock_contract)
+    try:
+        # Erst der vollständig verifizierte Datei-/Paket-Rücklauf darf das
+        # atomare Startgate für den kontrollierten Service-Endtest öffnen.
+        _clear_recovery_bootblock_marker(bootblock_contract)
+    except Exception as exc:
+        update_logger.error("Recovery-Bootblock konnte nicht kontrolliert geöffnet werden: %s", exc)
+        enforcement = _enforce_fail_closed_after_recovery_failure(
+            bootblock_contract,
+            recovery_transaction_id=recovery_transaction_id,
+        )
+        bootblock_contract = enforcement.bootblock_contract
+        return RecoveryTransitionResult(False, bootblock_contract)
+    if not _recover_pretransaction_service_state(state):
+        enforcement = _enforce_fail_closed_after_recovery_failure(
+            bootblock_contract,
+            recovery_transaction_id=recovery_transaction_id,
+        )
+        bootblock_contract = enforcement.bootblock_contract
+        return RecoveryTransitionResult(False, bootblock_contract)
+    try:
+        _remove_persistent_recovery_bootblock(bootblock_contract)
+    except Exception as exc:
+        update_logger.error("Recovery-Bootblock konnte nach Endgate nicht entfernt werden: %s", exc)
+        enforcement = _enforce_fail_closed_after_recovery_failure(
+            bootblock_contract,
+            recovery_transaction_id=recovery_transaction_id,
+        )
+        bootblock_contract = enforcement.bootblock_contract
+        return RecoveryTransitionResult(False, bootblock_contract)
+    return RecoveryTransitionResult(True, None)
 
 
 def _recover_pretransaction_service_state(state: TransitionState) -> bool:
@@ -6441,12 +9435,11 @@ def _recover_pretransaction_service_state(state: TransitionState) -> bool:
             f"sudo systemctl {action} {unit}",
             timeout=30,
         )
-        status = run_command(f"systemctl is-active {unit}", timeout=10)
+        status = _run_argv(["systemctl", "is-active", unit], timeout=10)
         activity = status.get("stdout", "").strip().lower()
-        end_state_ok = (
-            bool(status.get("success")) and activity == "active"
-            if should_be_active
-            else activity in {"inactive", "failed"}
+        end_state_ok = _systemd_activity_readback_matches(
+            status,
+            should_be_active=should_be_active,
         )
         if not end_state_ok:
             update_logger.error(
@@ -6468,12 +9461,11 @@ def _recover_pretransaction_service_state(state: TransitionState) -> bool:
     # tatsächlich erreichten globalen Endzustand.
     for unit in prior_units:
         should_be_active = unit in state.preactive_units
-        status = run_command(f"systemctl is-active {unit}", timeout=10)
+        status = _run_argv(["systemctl", "is-active", unit], timeout=10)
         activity = status.get("stdout", "").strip().lower()
-        end_state_ok = (
-            bool(status.get("success")) and activity == "active"
-            if should_be_active
-            else activity in {"inactive", "failed"}
+        end_state_ok = _systemd_activity_readback_matches(
+            status,
+            should_be_active=should_be_active,
         )
         if not end_state_ok:
             update_logger.error(
@@ -6485,21 +9477,91 @@ def _recover_pretransaction_service_state(state: TransitionState) -> bool:
     return recovered
 
 
-def _enforce_fail_closed_after_recovery_failure() -> bool:
-    """Stoppt nach unvollständiger Recovery erneut alles und beweist die Aktorruhe."""
+def _enforce_fail_closed_after_recovery_failure(
+    bootblock_contract: (
+        RecoveryBootblockContract | RecoveryBootblockPartialContract | None
+    ) = None,
+    *,
+    recovery_transaction_id: str | None = None,
+) -> RecoveryBootblockEnforcementResult:
+    """Setzt rebootfestes Startgate, stoppt Writer und beweist beide Schranken."""
 
-    quiesced = _stop_v4_services(V4_SERVICES)
-    if quiesced:
+    blocked = False
+    latest_contract = bootblock_contract
+    try:
+        initial_quiesced = bool(_stop_v4_services(V4_SERVICES))
+    except Exception as exc:
+        initial_quiesced = False
+        update_logger.error(
+            "Fail-closed-Sofortstop warf vor persistentem Bootblock einen Fehler: %s",
+            exc,
+        )
+    if not initial_quiesced:
+        update_logger.error(
+            "Fail-closed-Sofortstop vor persistentem Bootblock ist nicht vollständig beweisbar"
+        )
+    try:
+        latest_contract = _arm_persistent_recovery_bootblock(
+            bootblock_contract,
+            transaction_id=recovery_transaction_id,
+        )
+        blocked = True
+    except RecoveryBootblockArmError as exc:
+        latest_contract = exc.contract
+        update_logger.error(
+            "Erster Recovery-Bootblock-Arm benötigte seinen erhaltenen "
+            "Inodevertrag: %s",
+            exc,
+        )
+        try:
+            latest_contract = _arm_persistent_recovery_bootblock(
+                exc.contract,
+                transaction_id=recovery_transaction_id,
+            )
+            blocked = True
+        except RecoveryBootblockArmError as retry_exc:
+            latest_contract = retry_exc.contract
+            update_logger.error(
+                "Persistenter Recovery-Bootblock blieb auch beim Retry "
+                "partiell; neuester Inodevertrag wurde erhalten: %s",
+                retry_exc,
+            )
+        except Exception as retry_exc:
+            update_logger.error(
+                "Persistenter Recovery-Bootblock ist auch mit eigenem "
+                "Inodevertrag nicht beweisbar: %s",
+                retry_exc,
+            )
+    except Exception as exc:
+        update_logger.error("Persistenter Recovery-Bootblock ist nicht beweisbar: %s", exc)
+    try:
+        final_quiesced = bool(_stop_v4_services(V4_SERVICES))
+    except Exception as exc:
+        final_quiesced = False
+        update_logger.error(
+            "Fail-closed-Stop-Endpass warf nach persistentem Bootblock einen Fehler: %s",
+            exc,
+        )
+    quiesced = initial_quiesced and final_quiesced
+    if quiesced and blocked:
         print(
-            "[!] Recovery blieb unvollständig; die Aktor-/Writer-Ruhe wurde "
-            "erneut bewiesen und die Watchdog-Sperre bleibt aktiv."
+            "[!] Recovery blieb unvollständig; rebootfester systemd-Bootblock "
+            "und Aktor-/Writer-Ruhe sind bewiesen."
+        )
+    elif quiesced:
+        print(
+            "[!] Recovery blieb unvollständig; die Writer sind gestoppt, der "
+            "rebootfeste systemd-Bootblock ist jedoch nicht beweisbar."
         )
     else:
         print(
-            "[!] Recovery und erneute Aktorruhe sind nicht vollständig "
-            "beweisbar; die Watchdog-Sperre bleibt aktiv."
+            "[!] Recovery, rebootfester Bootblock oder erneute Aktorruhe sind "
+            "nicht vollständig beweisbar; die Watchdog-Sperre bleibt aktiv."
         )
-    return quiesced
+    return RecoveryBootblockEnforcementResult(
+        quiesced and blocked,
+        latest_contract,
+    )
 
 
 def _regular_file_sha256(path: str) -> tuple[str, int]:
@@ -6998,6 +10060,7 @@ def _execute_update_transaction(
         headless = True
 
     try:
+        _assert_no_existing_recovery_bootblock()
         repo_dir = (
             _validate_bootstrap_install_path(target_install_path)
             if target_install_path
@@ -7025,6 +10088,7 @@ def _execute_update_transaction(
         print(f"[!] Release-Preflight fehlgeschlagen: {exc}")
         update_logger.error(f"Release-Preflight fehlgeschlagen: {exc}")
         return False
+    recovery_transaction_id = secrets.token_hex(32)
 
     print("\n" + "=" * 60)
     print("  E3DC-CONTROL " + transition_name.upper())
@@ -7045,17 +10109,151 @@ def _execute_update_transaction(
             print("[i] Release-Wechsel abgebrochen.")
             return True
 
+    repo_recovery_contract = None
+    backup_receipt = None
+    if old_commit is not None:
+        try:
+            preflight_install_user = get_install_user()
+            repo_recovery_contract = _capture_repo_recovery_contract(
+                repo_dir,
+                preflight_install_user,
+                old_commit,
+            )
+        except Exception as exc:
+            print(f"[!] Recovery-Preimage konnte nicht sicher eingefroren werden: {exc}")
+            update_logger.error(f"Recovery-Preimage-Preflight fehlgeschlagen: {exc}")
+            return False
+
+    try:
+        # Dieser Vorvertrag ist absichtlich read-only. Ein bestehender
+        # nutzereigener/ungekennzeichneter Root wird nicht per chmod oder
+        # Marker-Erzeugung nachträglich zur Recovery-Autorität aufgewertet.
+        backup_collection = str(
+            validate_existing_backup_root(
+                configured_backup_root(repo_dir),
+                repo_dir,
+            )
+        )
+        backup_collection_descriptor, _backup_collection_chain = (
+            _open_root_receipt_directory_chain(backup_collection)
+        )
+        try:
+            collection_metadata = os.fstat(backup_collection_descriptor)
+            if stat.S_IMODE(collection_metadata.st_mode) != 0o700:
+                raise RuntimeError("Backup-Root besitzt nicht den Modus 0700")
+        finally:
+            os.close(backup_collection_descriptor)
+    except Exception as exc:
+        print(f"[!] Root-kontrollierter Backup-Pfad fehlt: {exc}")
+        update_logger.error("Backup-Root-Preflight fehlgeschlagen: %s", exc)
+        return False
+
     _enable_watchdog_update_pause(transition_name)
     print("\n[->] Erstelle vollstaendiges externes, verifiziertes Backup...")
+
+    def freeze_backup_receipt(backup_path, verified_manifest):
+        nonlocal backup_receipt
+        if repo_recovery_contract is None or backup_receipt is not None:
+            raise RuntimeError("Backup-Receipt-Callback besitzt keinen eindeutigen Zustand")
+        backup_receipt = _capture_recovery_backup_receipt(
+            backup_path,
+            verified_manifest,
+            repo_recovery_contract,
+            recovery_transaction_id,
+        )
+
     try:
-        backup_dir = backup_current_version(install_path=repo_dir)
+        backup_dir = backup_current_version(
+            install_path=repo_dir,
+            verified_pre_chown_callback=(
+                freeze_backup_receipt
+                if repo_recovery_contract is not None
+                else None
+            ),
+        )
     except Exception as exc:
         backup_dir = None
         update_logger.error(f"Backup vor Release-Wechsel fehlgeschlagen: {exc}")
-    if not backup_dir:
+    if not backup_dir or (
+        repo_recovery_contract is not None and backup_receipt is None
+    ):
         print("[!] Backup fehlgeschlagen; Release-Wechsel hart abgebrochen.")
         _set_watchdog_update_pause(False, reason=transition_name)
         return False
+
+    install_user = None
+    storage_unit_promoted = False
+    storage_promotion_state_uncertain = False
+    if repo_recovery_contract is not None:
+        try:
+            install_user = get_install_user()
+            if repo_recovery_contract.install_user != install_user:
+                raise RuntimeError(
+                    "Installationsbenutzer driftete seit dem Recovery-Preflight"
+                )
+            try:
+                storage_unit_promoted = bool(
+                    _migrate_approved_storage_manager_unit_owner(
+                        _approved_storage_manager_unit_payloads(),
+                        install_user=install_user,
+                    )
+                )
+            except StorageUnitMigrationError as promotion_exc:
+                if not promotion_exc.root_unit_committed:
+                    storage_promotion_state_uncertain = True
+                    raise
+                # Der atomare Namensersatz ist bereits exakt root-gebunden;
+                # nur sein nachgelagerter Helper-Postcheck scheiterte. Der
+                # folgende daemon-reload plus Bundle-Readback entscheidet
+                # deshalb weiterhin fail-closed über den effektiven Vertrag.
+                storage_unit_promoted = True
+            if storage_unit_promoted:
+                reload_result = _run_argv(
+                    ["systemctl", "daemon-reload"],
+                    timeout=30,
+                    env={**os.environ, "LC_ALL": "C", "LANG": "C"},
+                )
+                if (
+                    not reload_result.get("success")
+                    or reload_result.get("timed_out")
+                    or str(reload_result.get("stderr") or "")
+                    or int(reload_result.get("returncode", -1)) != 0
+                ):
+                    raise RuntimeError(
+                        "systemd daemon-reload nach Storage-Unitmigration "
+                        "fehlgeschlagen: "
+                        + _combined_process_diagnostics(
+                            reload_result,
+                            maximum=800,
+                        )
+                    )
+                capture_systemd_service_bundle(("e3dc-storage-manager",))
+        except Exception as exc:
+            print(f"[!] Frühe Storage-Unitmigration fehlgeschlagen: {exc}")
+            update_logger.error("Frühe Storage-Unitmigration fehlgeschlagen: %s", exc)
+            if storage_unit_promoted:
+                # Der benannte Inode ist bereits root-kontrolliert. Ein
+                # synchron erkannter Folgefehler darf daher den normalen
+                # rebootfesten Fail-closed-Pfad sicher daemon-reloaden.
+                _enforce_fail_closed_after_recovery_failure(
+                    recovery_transaction_id=recovery_transaction_id,
+                )
+            elif storage_promotion_state_uncertain:
+                # Kein daemon-reload auf einem nicht mehr eindeutig
+                # gebundenen Namen. Stop-Aufrufe verwenden nur den letzten
+                # systemd-Cache; die Update-Pause bleibt zur manuellen
+                # Recovery bestehen.
+                _stop_v4_services(V4_SERVICES)
+                update_logger.critical(
+                    "Storage-Unitzustand ist nach atomarem Ersatz unklar; "
+                    "kein daemon-reload und kein Dienststart"
+                )
+            else:
+                # Pre-Rename-Fehler: kein Produktinode wurde verändert und
+                # kein Dienst gestoppt. Der bestehende systemd-Cache bleibt
+                # unangetastet.
+                _set_watchdog_update_pause(False, reason=transition_name)
+            return False
 
     # Dieser exakte Aufruf bleibt als statisch pruefbarer Aktorruhevertrag erhalten.
     if not _stop_v4_services(V4_SERVICES):
@@ -7068,18 +10266,27 @@ def _execute_update_transaction(
             )
             _set_watchdog_update_pause(False, reason=transition_name)
         else:
-            _enforce_fail_closed_after_recovery_failure()
+            _enforce_fail_closed_after_recovery_failure(
+                recovery_transaction_id=recovery_transaction_id,
+            )
         return False
 
-    install_user = None
     git_created = False
-    mutated = False
+    mutated = storage_unit_promoted
+    bootblock_contract = None
     role_anchor_created = False
     target_commit = None
     package_transaction = None
     packages_mutated = False
     try:
-        install_user = get_install_user()
+        install_user = install_user or get_install_user()
+        if (
+            repo_recovery_contract is not None
+            and repo_recovery_contract.install_user != install_user
+        ):
+            raise RuntimeError(
+                "Installationsbenutzer driftete seit dem Recovery-Preflight"
+            )
         if role_anchor_needed:
             # Ab hier besitzt jede Mutation ein verifiziertes Backup und eine
             # bestätigte Aktorruhe. Auch der einmalige Rollenanker fällt damit
@@ -7190,7 +10397,7 @@ def _execute_update_transaction(
         update_logger.error(f"{transition_name} fehlgeschlagen: {exc}")
         recovered = False
         if mutated:
-            recovered = _recover_failed_transition(
+            recovered, bootblock_contract = _recover_failed_transition(
                 repo_dir=repo_dir,
                 install_user=install_user,
                 backup_dir=backup_dir,
@@ -7200,6 +10407,10 @@ def _execute_update_transaction(
                 recovery_inventory=recovery_inventory,
                 state=state,
                 package_transaction=package_transaction if packages_mutated else None,
+                repo_recovery_contract=repo_recovery_contract,
+                backup_receipt=backup_receipt,
+                bootblock_contract=bootblock_contract,
+                recovery_transaction_id=recovery_transaction_id,
             )
         else:
             recovered = _recover_pretransaction_service_state(state)
@@ -7207,7 +10418,10 @@ def _execute_update_transaction(
             print("[OK] Ausgangszustand wurde automatisch und verifiziert wiederhergestellt.")
             _set_watchdog_update_pause(False, reason=transition_name)
         else:
-            _enforce_fail_closed_after_recovery_failure()
+            _enforce_fail_closed_after_recovery_failure(
+                bootblock_contract,
+                recovery_transaction_id=recovery_transaction_id,
+            )
         return False
 
     _set_watchdog_update_pause(False, reason=transition_name)

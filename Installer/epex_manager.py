@@ -1722,7 +1722,9 @@ def _install_forecast_evidence_service_compat(
 def install_epex_service(start_services=True, include_websocket=False):
     print("Installiere E3DC-Control Kern-Manager Services...")
     from .utils import (
+        _approved_storage_manager_unit_payloads,
         _create_service_file,
+        _migrate_approved_storage_manager_unit_owner,
         activate_systemd_service_bundle,
         capture_systemd_service_bundle,
         install_e3dc_live_service,
@@ -1770,6 +1772,22 @@ def install_epex_service(start_services=True, include_websocket=False):
         service_names.append("e3dc-forecast-evidence")
     if include_websocket:
         service_names.append("e3dc-websocket")
+
+    try:
+        storage_unit_migrated = _migrate_approved_storage_manager_unit_owner(
+            _approved_storage_manager_unit_payloads(),
+        )
+        if storage_unit_migrated:
+            print(
+                "  [OK] Bytegenaue Storage-Manager-Altunit sicher auf "
+                "root:root 0644 migriert."
+            )
+    except Exception as exc:
+        print(
+            "  [!] Bestehende Storage-Manager-Unit ist nicht für die enge "
+            f"Altbesitz-Migration freigegeben: {exc}"
+        )
+        return False
 
     try:
         service_snapshot = capture_systemd_service_bundle(service_names)

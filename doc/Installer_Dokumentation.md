@@ -1,10 +1,27 @@
 # Betrieb des E3DC-Control Installers
 
-Dokumentation Stand: 5.4.3k
+Dokumentation Stand: 5.4.3l
 
 Der Installer ist der freigegebene Einstieg für Installation, Update,
 Reparatur, Backup, Rollback und Deinstallation. Die vollständige Bedienung ist
 in [E3DC-Control Installer](Installer.md) beschrieben.
+
+Der Installer-Anteil von 5.4.3l bindet den nativen Git-Rückweg an den
+updater-eigenen Ausgangscommit, das root-eigene Transaktionsbackup und die
+laufende Transaktion. Bei belegten, weiterhin vorhandenen Änderungen an
+getrackten Dateien werden die gesicherten Bytes wiederhergestellt und die
+Dateimodi auf den in `old_commit` belegten Git-Modus gehärtet; staged,
+ungetrackte oder gelöschte Zustände und allgemeine manuelle
+Restorepfade sind nicht neu abgedeckt.
+
+Vor dem ersten Dienststopp darf ausschließlich eine exakt bekannte ältere
+Familie der `e3dc-storage-manager.service` atomar auf den root-eigenen
+Unit-Vertrag migriert werden. PiGuard im exakten Zustand
+`activating/auto-restart` wird als zuvor laufend behandelt. Ein vom
+Ziel-Updater synchron erkannter Recoveryfehler hinterlässt einen
+transaktionsgebundenen Startschutz für PiGuard und die bekannten Writer; eine
+allgemeine Zusage für Stromausfall, `SIGKILL` oder einen außerhalb dieses
+Fehlerpfads beendeten Prozess folgt daraus nicht.
 
 Der Installer-Anteil von 5.4.3k ergänzt den älteren nativen
 `--target-updater-handoff`, der `E3DC_BOOTSTRAP_USER` vor dem root-eigenen

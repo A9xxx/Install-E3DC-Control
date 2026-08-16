@@ -2,7 +2,20 @@
 
 Diese Anleitung fasst die schnellsten Schritte zusammen, um E3DC-Control auf einem frischen Raspberry Pi OS (oder ähnlichem Debian-System) zu installieren.
 
-Aktueller Stable-Stand: `v5.4.3k`.
+Aktueller Stable-Stand: `v5.4.3l`.
+
+5.4.3l härtet den updater-eigenen, nativen Git-Rückweg. Belegte,
+weiterhin vorhandene Änderungen an getrackten Dateien werden bei einem
+Rückweg mit ihren gesicherten Bytes wiederhergestellt; der Dateimodus folgt
+dem im gebundenen `old_commit` belegten Git-Modus. Eine
+exakt bekannte ältere Storage-Manager-Unit kann vor dem ersten Dienststopp
+sicher in den root-eigenen Unit-Vertrag überführt werden. PiGuard im Zustand
+`activating/auto-restart` gilt dabei als zuvor laufend. Erkennt der
+Ziel-Updater einen Recoveryfehler synchron, bleibt ein transaktionsgebundener
+Startschutz für PiGuard und die bekannten Writer bestehen. Staged,
+ungetrackte oder gelöschte Zustände, allgemeine manuelle Restores,
+Stromausfall und `SIGKILL` erhalten dadurch keine neue Vollständigkeitszusage.
+Die EMS-Regelung bleibt unverändert.
 
 5.4.3k schließt zusätzlich den älteren nativen
 `--target-updater-handoff`, der `E3DC_BOOTSTRAP_USER` vor seinem root-eigenen
@@ -241,7 +254,7 @@ Ohne das Label bleibt auch ein versehentlich gestarteter Watchtower für den
 Hauptcontainer wirkungslos. Der oben gezeigte manuelle Host-Helfer bleibt der
 empfohlene Updateweg.
 
-**Docker-Rückfall von v5.4.3k auf den veröffentlichten Docker-Rollback-Root:**
+**Docker-Rückfall von v5.4.3l auf den veröffentlichten Docker-Rollback-Root:**
 ```bash
 (
   set -euo pipefail

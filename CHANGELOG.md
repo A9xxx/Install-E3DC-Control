@@ -6,6 +6,25 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.3l] – 2026-08-16
+
+### 🔄 Git-gebundener Update-Rückweg
+
+- **Der Ziel-Updater besitzt einen beleggebundenen Rückweg:** Repository, Ausgangscommit, root-eigenes Transaktionsbackup und Update-Transaktion werden vor der ersten Dienstmutation gemeinsam gebunden. Ein unsicherer oder ausgetauschter Sicherungspfad bleibt ein harter Abbruchgrund und wird nicht durch eine nachträgliche Rechteänderung vertrauenswürdig gemacht.
+- **Lokale getrackte Änderungen bleiben im belegten Umfang erhalten:** Bei weiterhin vorhandenen, geänderten Git-Dateien stellt der Rückweg die gesicherten Bytes wieder her und härtet den Dateimodus auf den im gebundenen `old_commit` belegten Git-Modus. Unveränderte getrackte Dateien folgen vollständig diesem Ausgangscommit. Staged Indexstände, ungetrackte oder gelöschte Dateien und allgemeine manuelle Restorepfade sind keine neue Zusage dieses Vertrags.
+- **Das Web-Update bleibt absichtlich clean-only:** Lokale Änderungen an getrackten Produktdateien werden vom Web-Launcher weiterhin vor dem Aufruf des Ziel-Updaters abgelehnt. Die Dirty-Recovery gehört ausschließlich zum regulären Konsolen-/nativen Root-Updaterpfad und lockert dieses Web-Gate nicht. 5.4.3l korrigiert im Web-Launcher nur den EXIT-Cleanup: Ein früher Abbruch behält seine primäre Fehlermeldung und seinen Exitstatus, während ein bereits angelegter root-eigener Ausführungssnapshot unter `/run` entfernt wird.
+
+### 🛡️ Kernunits und erkannter Recoveryfehler
+
+- **Eine bekannte historische Storage-Unit wird vor dem Dienststopp sicher migriert:** Ausschließlich die exakt freigegebene ältere `e3dc-storage-manager.service`-Familie darf atomar durch eine neue root-eigene Unit mit Modus `0644` ersetzt werden. Inhalt, Eigentümer, Dateityp, Links, ACLs, Attribute und effektive Drop-ins werden eng geprüft; abweichende Bestände bleiben fail-closed gesperrt.
+- **PiGuard im Auto-Restart bleibt als laufender Wächter erhalten:** Der exakte systemd-Zustand `activating/auto-restart` wird als voraktiver Zustand erfasst, vor den Hardware-Writer-Diensten gestoppt und nach einem erfolgreichen Update oder Rückweg wieder entsprechend hergestellt. Mehrdeutige Zustände werden nicht als aktiv geraten.
+- **Ein synchron erkannter Recoveryfehler hinterlässt einen persistenten Startschutz:** Ein transaktionsgebundener Marker und eng geprüfte systemd-Drop-ins verhindern, dass PiGuard oder bekannte Writer nach einem Neustart unbeabsichtigt anlaufen. Ein vorhandener oder nur teilweise nachweisbarer Schutz blockiert den nächsten normalen Updateversuch vor Backup und Dienstmutation.
+
+### 📏 Belegte Reichweite
+
+- **Kein pauschaler Schutz bei Prozess- oder Stromverlust:** Der persistente Startschutz gilt für einen vom laufenden Ziel-Updater synchron erkannten Wiederherstellungsfehler. Stromausfall, `SIGKILL`, ein Abbruch außerhalb dieses Fehlerpfads sowie allgemeine manuelle, ZIP- oder ältere Restoreabläufe erhalten durch 5.4.3l keine neue Vollständigkeitszusage.
+- **Keine EMS-Regelungsänderung:** HA-, Wallbox-, Speicher-, Wärme- und Direktvermarktungsentscheidungen sowie Hardwareausgänge entsprechen unverändert 5.4.3k.
+
 ## [5.4.3k] – 2026-08-16
 
 ### 🔄 Native Alt-Updater-Handoffs

@@ -1,12 +1,13 @@
 # Speicher-Ladesteuerung - Systemablauf
 
-> **Stand:** v5.4.3k, gegen den Release-Betriebsvertrag geprüft am 2026-08-16
+> **Stand:** v5.4.3l, gegen den Release-Betriebsvertrag geprüft am 2026-08-16
 >
-> **Hinweis:** 5.4.3k erweitert ausschließlich die sichere Nutzerbindung auf
-> den älteren nativen `--target-updater-handoff`. Der flaglose Altübergang und
-> die Docker-Matter-Härtungen einschließlich Worker-Umask aus 5.4.3j bleiben
-> unverändert. Speicherentscheidungen und Hardwareausgänge entsprechen
-> unverändert 5.4.3j.
+> **Hinweis:** 5.4.3l härtet ausschließlich den updater-eigenen Git-Rückweg,
+> die eng freigegebene Migration einer historischen Storage-Manager-Unit und
+> den Startschutz nach einem synchron erkannten Recoveryfehler. Das betrifft
+> den systemd- und Dateivertrag des Updates, nicht die fachliche
+> Speicherregelung. Speicherentscheidungen, RSCP-Ausgänge und
+> Hardwaregrenzen entsprechen unverändert 5.4.3k.
 >
 > **Neu in 5.4.3:** Speicherreserve, Sollkurve, Direktvermarktung und
 > Verbraucherbudgets bleiben getrennt. Ein gemeinsamer Ownervertrag bindet die

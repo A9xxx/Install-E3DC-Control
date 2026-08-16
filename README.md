@@ -1,12 +1,12 @@
 # E3DC-Control Web-Portal & Installer
 
-Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.4.3k</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
+Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.4.3l</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
 
 ![E3DC-Control Dashboard](html/app-icon-512.png)
 
 ## Aktuelle Version und Update
 
-Die aktuelle stabile Version ist **5.4.3k**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur geprüften Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
+Die aktuelle stabile Version ist **5.4.3l**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur geprüften Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
 
 > [!WARNING]
 > **⚠️ Achtung: Nutzung auf eigenes Risiko!**
@@ -19,6 +19,8 @@ Die aktuelle stabile Version ist **5.4.3k**. Hinweise zum Web-, Konsolen- und Do
 > **Config-Schutz:** Standardinstallationen speichern `data/e3dc_v4.json` und lokale Config-Backups mit `660` für Install-User und `www-data`, damit WebUI und Dienste weiter automatisch starten, die Datei aber nicht mehr weltlesbar ist. Der normale Config-Download ist redigiert; der Raw-Download enthält Zugangsdaten und wird nur angeboten, wenn eine Web-PIN gesetzt ist. Der Kompatibilitätsmodus (`664`) ist nur für eigene externe Leser gedacht.
 
 > **Bedienansichten:** Config-Editor und Wallbox-Seite unterscheiden zwischen einfacher Ansicht für Einrichtung und täglichen Betrieb sowie erweiterter Ansicht für alle Detailparameter. Die Logik und Abgrenzung sind in [doc/Frontend_Ansichten.md](doc/Frontend_Ansichten.md) dokumentiert.
+
+> **Neu in 5.4.3l Stable:** Der native Ziel-Updater bindet seinen eigenen Git-basierten Rückweg an Repository, Ausgangscommit, Backup und Transaktion. Bei belegten, weiterhin vorhandenen Änderungen an getrackten Dateien werden deren Bytes aus dem root-eigenen Transaktionsbackup wiederhergestellt und die Dateimodi auf den im gebundenen `old_commit` belegten Git-Modus gehärtet; unveränderte Dateien folgen vollständig diesem Ausgangscommit. Staged Indexstände, ungetrackte oder gelöschte Dateien sowie allgemeine manuelle Restorewege sind davon nicht neu abgedeckt. Eine exakt freigegebene ältere Familie der Storage-Manager-Unit wird vor dem ersten Dienststopp atomar in eine root-eigene Unit überführt; abweichende Units oder Drop-ins bleiben gesperrt. PiGuard im exakten Zustand `activating/auto-restart` wird als zuvor laufender Wächter erfasst. Scheitert die Wiederherstellung synchron und nachweisbar, bleibt ein transaktionsgebundener Startschutz für PiGuard und die bekannten Writer aktiv. Das ist keine Zusage für Stromausfall, `SIGKILL` oder einen unterbrochenen Prozess außerhalb dieses erkannten Fehlerpfads. HA-, Wallbox-, Speicher-, Wärme- und Direktvermarktungsentscheidungen ändern sich nicht.
 
 > **Neu in 5.4.3k Stable:** Zusätzlich zum flaglosen Alt-Snapshot aus 5.4.3j bleibt nun auch der ältere native Aufruf mit `--target-updater-handoff` updatefähig, obwohl er `E3DC_BOOTSTRAP_USER` vor dem root-eigenen Ziel-Snapshot entfernt. Beide unterstützten Snapshot-Einstiege binden den lokalen Installationsnutzer erst nach dem Root-Lock aus demselben gültigen Nicht-Root-Eigentümer von Repository und `.git`. Nach der Bindung des versiegelten Snapshots werden Repository, `.git`, Nutzerkonto und Nutzerwert unmittelbar vor dem ersten Import aus dem Zielcode erneut geprüft. Root, `www-data`, fremde oder unterschiedliche Eigentümer, ein abweichender Nutzerwert und ein ausgetauschtes Repository bleiben gesperrt. Alle Härtungen aus 5.4.3j einschließlich des privaten Docker-Matter-Storage und der Worker-Umask bleiben unverändert; HA-, Wallbox-, Speicher-, Wärme- und Direktvermarktungslogik ändern sich nicht.
 
@@ -481,7 +483,7 @@ sudo docker compose logs --tail=80 e3dc-control
 > `ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}`. Ohne Eintrag
 > folgt sie dem geprüften Stable-Tag `latest`. Ein fester Versions-Tag wechselt
 > bei `pull` absichtlich nicht; für einen bewussten Pin wird
-> `E3DC_IMAGE_TAG=v5.4.3k` in `.env` gesetzt. `config --images` zeigt vor dem
+> `E3DC_IMAGE_TAG=v5.4.3l` in `.env` gesetzt. `config --images` zeigt vor dem
 > Pull das tatsächlich gewählte Image.
 >
 > Ein fehlgeschlagener `pull` ist ein harter Abbruch. Nach begonnenem

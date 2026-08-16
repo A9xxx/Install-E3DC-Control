@@ -214,13 +214,33 @@ else
 fi
 
 MATTER_DIR="/app/pi/Install/Installer/matter"
+MATTER_STORAGE="/var/www/html/data/matter-storage"
+MATTER_STORAGE_GUARD="/usr/local/bin/e3dc-docker-matter-storage-guard"
 
 # Rechte des persistenten Daten-Ordners korrigieren
-mkdir -p /var/www/html/data/matter-storage
-chown -R www-data:www-data /var/www/html/data
+find -P /var/www/html/data -xdev \
+    -path "$MATTER_STORAGE" -prune -o \
+    \( -type d -o -type f \) \
+    -exec chown -h www-data:www-data -- {} +
 chmod 2775 /var/www/html/data
-find /var/www/html/data/matter-storage -type d -exec chmod 700 {} \;
-find /var/www/html/data/matter-storage -type f -exec chmod 600 {} \;
+if [ ! -f "$MATTER_STORAGE_GUARD" ]; then
+    echo "-> FEHLER: Descriptorprüfer für Matter-Storage fehlt."
+    exit 1
+fi
+MATTER_STORAGE_IDENTITY="$(
+    /usr/bin/python3 -I -B "$MATTER_STORAGE_GUARD" \
+        --mode harden \
+        --path "$MATTER_STORAGE" \
+        --owner www-data \
+        --group www-data
+)"
+case "$MATTER_STORAGE_IDENTITY" in
+    e3dc-matter-storage-v1:*) ;;
+    *)
+        echo "-> FEHLER: Matter-Storage lieferte keine gebundene Rootidentität."
+        exit 1
+        ;;
+esac
 mkdir -p /var/www/html/tmp
 chown -R www-data:www-data /var/www/html/tmp
 chmod 2775 /var/www/html/tmp
@@ -717,7 +737,17 @@ if optional_service_selected "e3dc-matter-bridge"; then
         exit 1
     fi
     echo "   -> Matter Bridge aktiv."
-    nohup runuser -u www-data -- sh -c "cd '$MATTER_DIR' && exec npm run start" \
+    if ! /usr/bin/python3 -I -B "$MATTER_STORAGE_GUARD" \
+        --mode verify \
+        --path "$MATTER_STORAGE" \
+        --owner www-data \
+        --group www-data \
+        --expected-identity "$MATTER_STORAGE_IDENTITY" \
+        >/dev/null; then
+        echo "-> FEHLER: Matter-Storage driftete vor dem Workerstart."
+        exit 1
+    fi
+    nohup runuser -u www-data -- sh -c "umask 077; cd '$MATTER_DIR' && exec npm run start" \
         > /var/www/html/logs/matter_bridge.log 2>&1 &
 fi
 

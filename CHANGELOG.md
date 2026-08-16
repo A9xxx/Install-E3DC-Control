@@ -6,6 +6,19 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.3j] – 2026-08-16
+
+### 🔄 Update aus älteren Bare-Metal-Beständen
+
+- **Der flaglose 5.4.2d-Ziel-Snapshot bleibt updatefähig:** Der alte Aufrufer entfernt vor dem root-eigenen Ziel-Finalizer die Variable `E3DC_BOOTSTRAP_USER`. Fehlt sie genau in diesem gebundenen Altübergang, darf 5.4.3j den lokalen Installationsnutzer erst nach dem Root-Lock aus dem übereinstimmenden Eigentümer von Repository und `.git` ermitteln.
+- **Die Ersatzbindung bleibt eng und fail-closed:** Repository, `.git` und lokales Benutzerkonto werden unmittelbar vor dem Finalizer erneut geprüft. Ein bereits gesetzter Nutzerwert bleibt unverändert, muss aber exakt dem gebundenen Repository-Eigentümer entsprechen. Root, `www-data`, unterschiedliche oder fremde Eigentümer, ein abweichender Nutzerwert sowie ein ausgetauschtes Repository bleiben gesperrt. Nach dem Finalizer wird die Aufruferumgebung exakt auf ihren vorherigen Zustand zurückgesetzt.
+
+### 🏠 Docker und Matter
+
+- **Der persistente Matter-Storage wird fail-closed gebunden:** Vor der startseitigen Härtung akzeptiert der Container ausschließlich nofollow geöffnete Verzeichnisse sowie reguläre Dateien mit genau einem Hardlink auf derselben Dateisystem- und Mountgrenze. Symlinks, Sonderdateien, Mehrfachidentitäten, ein ausgetauschter Root oder ein driftender Namenssatz brechen den Start ab. Eigentümer und Modi werden nur über die gebundenen Deskriptoren gesetzt und unmittelbar vor dem Workerstart gegen dieselbe Rootidentität erneut geprüft.
+- **Neue Matter-Storage-Dateien bleiben privat:** Der als `www-data` gestartete Matter-Worker setzt vor Node.js zwingend `umask 077`. Sicher gebundene Bestandsverzeichnisse werden auf `0700` und Dateien auf `0600` gehärtet; neu während der Laufzeit erzeugte Fabric-, Endpoint- und Sessiondateien entstehen ebenfalls höchstens mit `0600`.
+- **Die EMS-Regelung bleibt unverändert:** Gegenüber 5.4.3i ändern sich keine HA-, Wallbox-, Speicher-, Wärme- oder Direktvermarktungsentscheidungen. Matter-Protokoll, Kopplung und mDNS-Verhalten bleiben unverändert; ausschließlich der persistente Docker-Matter-Dateivertrag einschließlich Worker-Umask wird verschärft.
+
 ## [5.4.3i] – 2026-08-16
 
 ### 🔄 Update und HA-Synchronisation

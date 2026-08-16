@@ -1,10 +1,21 @@
 # Betrieb des E3DC-Control Installers
 
-Dokumentation Stand: 5.4.3i
+Dokumentation Stand: 5.4.3j
 
 Der Installer ist der freigegebene Einstieg für Installation, Update,
 Reparatur, Backup, Rollback und Deinstallation. Die vollständige Bedienung ist
 in [E3DC-Control Installer](Installer.md) beschrieben.
+
+Der Installer-Anteil von 5.4.3j ergänzt ausschließlich den gebundenen
+Altübergang eines flaglosen, root-eigenen 5.4.2d-Ziel-Snapshots. Fehlt dort die
+vom alten Aufrufer entfernte
+Variable `E3DC_BOOTSTRAP_USER`, müssen Repository und `.git` nach dem Root-Lock
+demselben gültigen lokalen Nicht-Root-Nutzer gehören. Die Bindung wird direkt
+vor dem Finalizer erneut geprüft und die Aufruferumgebung danach
+wiederhergestellt. Ein bereits gesetzter Nutzerwert wird nicht ersetzt, muss
+aber exakt dem gebundenen Repository-Eigentümer entsprechen. Root, `www-data`,
+fremde oder unterschiedliche Eigentümer und ein abweichender Nutzerwert bleiben
+harte Abbruchgründe.
 
 5.4.3i richtet einen argumentlosen, root-eigenen Web-Update-Launcher ein. Er
 bindet Installationspfad, Installationsnutzer und veröffentlichten Ausgangstag;

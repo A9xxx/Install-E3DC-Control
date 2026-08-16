@@ -125,6 +125,7 @@
 !/Installer/docker_healthcheck.py
 !/Installer/docker_compose_update.py
 !/Installer/docker_logrotate_manager.py
+!/Installer/docker_matter_storage_guard.py
 !/Installer/docker-logrotate.conf
 !/Installer/e3dc_history_slots.py
 !/Installer/e3dc_live.py

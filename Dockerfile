@@ -68,8 +68,10 @@ RUN echo '{"install_user": "root", "home_dir": "/app", "install_path": "/app/pi/
 COPY --chown=root:root --chmod=0555 entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY --chown=root:root --chmod=0555 Installer/docker_healthcheck.py /usr/local/bin/e3dc-docker-healthcheck
 COPY --chown=root:root --chmod=0555 Installer/docker_logrotate_manager.py /usr/local/bin/e3dc-docker-logrotate
+COPY --chown=root:root --chmod=0555 Installer/docker_matter_storage_guard.py /usr/local/bin/e3dc-docker-matter-storage-guard
 COPY --chown=root:root --chmod=0644 Installer/docker-logrotate.conf /etc/logrotate.d/e3dc-control
 RUN test "$(stat -c '%u:%g:%a' /usr/local/bin/entrypoint.sh)" = "0:0:555" && \
+    test "$(stat -c '%u:%g:%a' /usr/local/bin/e3dc-docker-matter-storage-guard)" = "0:0:555" && \
     ln -sf /usr/local/bin/entrypoint.sh /app/entrypoint.sh
 
 # 6. Anwendungscode für Production-/Image-only-Docker.
@@ -100,6 +102,7 @@ RUN find -P /app/pi/Install -xdev -type d -exec chmod 0755 -- {} + && \
     test -f /app/pi/Install/Installer/storage_owner_paths.py && \
     test -f /app/pi/Install/Installer/docker_compose_update.py && \
     test -f /app/pi/Install/Installer/docker_logrotate_manager.py && \
+    test -f /app/pi/Install/Installer/docker_matter_storage_guard.py && \
     test -f /app/pi/Install/Installer/docker-logrotate.conf && \
     chown root:root /app/pi/Install /app/pi/Install/Installer /app/pi/Install/Installer/apache /app/pi/Install/Installer/apache/e3dc-control-security.conf /app/pi/Install/Installer/apache/e3dc-control-access-log.conf && \
     chmod 0755 /app/pi/Install /app/pi/Install/Installer /app/pi/Install/Installer/apache && \

@@ -5,7 +5,7 @@ Updates werden ausschließlich über den Installer ausgeführt. Ein manuelles
 Release-Historie ungeeignet, weil alter und neuer Git-Stand nicht miteinander
 verwandt sein müssen.
 
-Der aktuelle Stable-Stand ist `v5.4.3i`. Der Ziel-Updater bindet den
+Der aktuelle Stable-Stand ist `v5.4.3j`. Der Ziel-Updater bindet den
 freigegebenen Zielstand vor Backup und Dienststopp eindeutig an Version,
 Herkunft und Anlagenrolle. Fortschritt und Lebenszeichen bleiben auf
 langsameren Raspberry Pis sichtbar. Eine bereits vollständig installierte
@@ -35,12 +35,12 @@ bash "$E3DC_INSTALL_PATH/e3dc-setup" --check
 bash "$E3DC_INSTALL_PATH/e3dc-setup" --update-e3dc
 ```
 
-**Einmaliger Übergang auf 5.4.3i:** Installationen bis einschließlich 5.4.3f
-besitzen den neuen root-eigenen Web-Launcher noch nicht. Dieser erste Wechsel
-muss deshalb über den oben gezeigten administrativen Konsolenweg erfolgen.
-Erst die erfolgreiche Installation von 5.4.3i richtet den engen Launcher und
-seine argumentlose sudoers-Freigabe ein; alle folgenden normalen Updates
-können wieder aus dem Dashboard gestartet werden.
+**Einmaliger Übergang auf 5.4.3i oder neuer:** Installationen bis einschließlich
+5.4.3f besitzen den neuen root-eigenen Web-Launcher noch nicht. Dieser erste
+Wechsel muss deshalb über den oben gezeigten administrativen Konsolenweg
+erfolgen. Seit der erfolgreichen Installation von 5.4.3i richtet der Installer
+den engen Launcher und seine argumentlose sudoers-Freigabe ein; alle folgenden
+normalen Updates können wieder aus dem Dashboard gestartet werden.
 
 ### Übergang aus älteren 5.4.2-Beständen
 
@@ -52,6 +52,18 @@ bewusst kein Bestandteil dieses unveränderlichen Snapshots und muss dort nicht
 vorhanden sein. Root, `www-data`, fremde Konten und ein ausgetauschtes
 Repository bleiben harte Abbruchgründe.
 
+5.4.3j schließt zusätzlich exakt den flaglosen, root-eigenen Ziel-Snapshot des
+alten 5.4.2d-Aufrufers. Dieser Aufrufer entfernt `E3DC_BOOTSTRAP_USER`, bevor
+der Ziel-Finalizer startet. Fehlt die Variable in diesem eng gebundenen
+Altübergang, darf der Zielcode den Installationsnutzer erst nach dem Root-Lock
+aus dem übereinstimmenden Eigentümer von Repository und `.git` ermitteln.
+Beide Pfade und das lokale Benutzerkonto werden unmittelbar vor dem Finalizer
+erneut geprüft. Ein bereits gesetzter Nutzerwert wird nicht ersetzt, muss aber
+exakt dem gebundenen Repository-Eigentümer entsprechen. Root, `www-data`,
+unterschiedliche oder fremde Eigentümer und ein abweichender Nutzerwert bleiben
+gesperrt; nach dem Finalizer wird die Aufruferumgebung exakt auf ihren vorherigen
+Zustand zurückgesetzt.
+
 Erreicht ein abweichender oder noch älterer lokaler Updater diese gebundene
 Kompatibilitätsbrücke nicht und bricht bereits vor Backup und Dienststopp mit
 `Installationsbenutzer ist nicht lokal gebunden` ab, steht für einen normalen
@@ -61,7 +73,7 @@ GitHub-Release-Seite übernommen werden:
 
 ```bash
 export E3DC_INSTALL_PATH="/absoluter/pfad/zur/installation"
-export E3DC_RELEASE_TAG="v5.4.3i"
+export E3DC_RELEASE_TAG="v5.4.3j"
 export E3DC_RELEASE_SHA="<40-stellige Commit-SHA des veröffentlichten Tags>"
 E3DC_BOOTSTRAP_DIR="$(mktemp -d)"
 curl -fL "https://github.com/A9xxx/Install-E3DC-Control/archive/refs/tags/${E3DC_RELEASE_TAG}.tar.gz" \

@@ -1,10 +1,21 @@
 # E3DC-Control Installer
 
-Dokumentation Stand: 5.4.3i
+Dokumentation Stand: 5.4.3j
 
 Der Installer verwaltet Bare-Metal-Installation, Update, Rechte, Dienste,
 Backup, Rollback und optionale Produktmodule. Er ermittelt Benutzer, Home,
 Installationspfad und Python-Umgebung aus dem geprüften Installationskontext.
+
+Der Installer-Anteil von 5.4.3j schließt ausschließlich den flaglosen,
+root-eigenen Ziel-Snapshot eines älteren 5.4.2d-Aufrufers. Hat dieser Aufrufer
+`E3DC_BOOTSTRAP_USER` entfernt,
+darf der Zielcode den Installationsnutzer erst nach dem Root-Lock aus dem
+übereinstimmenden Eigentümer von Repository und `.git` binden. Unmittelbar vor
+dem Finalizer wird erneut geprüft; danach wird die Aufruferumgebung
+wiederhergestellt. Ein bereits gesetzter Nutzerwert bleibt unverändert, muss
+aber exakt dem gebundenen Repository-Eigentümer entsprechen. Root, `www-data`,
+fremde oder unterschiedliche Eigentümer und ein abweichender Nutzerwert bleiben
+gesperrt.
 
 Mit 5.4.3i darf die Weboberfläche das reguläre System-Update wieder über
 einen argumentlosen, root-eigenen Launcher starten. Freie Aktionen, Pfade,

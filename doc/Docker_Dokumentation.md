@@ -2,8 +2,8 @@
 
 Veröffentlichte Images entstehen ausschließlich aus einem versionierten stabilen Release-Tag. `latest` verweist damit auf die zuletzt veröffentlichte stabile Version.
 
-Der aktuelle Stable-Stand ist `v5.4.3i`. Die Tags `latest`, `v5.4.3i` und
-`5.4.3i` müssen auf denselben geprüften Multi-Arch-Digest verweisen.
+Der aktuelle Stable-Stand ist `v5.4.3j`. Die Tags `latest`, `v5.4.3j` und
+`5.4.3j` müssen auf denselben geprüften Multi-Arch-Digest verweisen.
 
 E3DC-Control kann isoliert über **Docker** betrieben werden. Der Container kapselt die Anwendung; persistente Betriebsdaten liegen in den dafür vorgesehenen Volumes. Der Multi-Architektur-Support (`arm64`, `amd64`) deckt die vorgesehenen Plattformen ab. Docker benötigt dabei zwingend ein 64-Bit-Betriebssystem; `armhf`, `arm/v7` und andere 32-Bit-Installationen können das veröffentlichte Image nicht starten.
 
@@ -11,6 +11,18 @@ Bei aktivierter Matter-Bridge startet der Container zuerst D-Bus und den
 Bookworm-Avahi-Daemon, überwacht dessen Prozess und wartet begrenzt auf den
 mDNS-Bereitschaftsnachweis. Erst danach wird die Matter-Bridge gestartet; ein
 fehlender Discovery-Dienst lässt den Container absichtlich ungesund enden.
+Der persistente Matter-Storage ist vom allgemeinen rekursiven Rechtepfad des
+`data`-Volumes getrennt. Ein root-eigener Prüfer öffnet Elternkette, Root und
+alle Einträge nofollow über Deskriptoren. Er akzeptiert ausschließlich
+Verzeichnisse und reguläre Dateien mit genau einem Hardlink innerhalb derselben
+Dateisystem- und Mountgrenze. Symlinks, Sonderdateien, Mehrfachidentitäten,
+Rootaustausch oder Namensdrift beenden den Container vor dem Matter-Start.
+Erst nach vollständiger Bindung setzt der Prüfer Eigentümer und Modi über die
+geöffneten Deskriptoren auf `www-data:www-data`, `0700` beziehungsweise `0600`.
+Unmittelbar vor dem Workerstart wird derselbe Root erneut gegen die beim Boot
+gebundene Identität geprüft. Der Worker setzt als `www-data` vor Node.js
+zusätzlich `umask 077`; dadurch bleiben auch während des Betriebs neu erzeugte
+Fabric-, Endpoint-, Event- und Sessiondateien privat.
 
 Docker ist ausschließlich für eine eigenständige Instanz mit exakt
 `ha_mode=off` freigegeben. HA-Master/-Slave und die read-only Shadow-Instanz
@@ -222,7 +234,7 @@ unverändert gesperrt und benötigen eine manuelle Prüfung.
 
 Ohne `E3DC_IMAGE_TAG` folgt diese Compose-Datei dem geprüften Stable-Tag
 `latest`. Ein fester Tag bleibt bei `pull` absichtlich unverändert. Für einen
-bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.3i` in der Datei `.env`
+bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.3j` in der Datei `.env`
 gesetzt. `docker compose config --images` zeigt vorab das tatsächlich gewählte
 Image.
 
@@ -249,7 +261,7 @@ Versionswahl.
 
 Gezielte Rückfallversion:
 
-Den Stable-Container `v5.4.3i` auf den veröffentlichten Rollback-Root
+Den Stable-Container `v5.4.3j` auf den veröffentlichten Rollback-Root
 `v5.3.2b` zurücksetzen:
 
 ```bash

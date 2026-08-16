@@ -782,6 +782,21 @@ def _legacy_repository_identity(root: Path) -> tuple[tuple[int, ...], tuple[int,
     return identities[0], identities[1]
 
 
+def _bound_legacy_snapshot_install_user(
+    root: Path,
+) -> tuple[str, tuple[tuple[int, ...], tuple[int, ...]]]:
+    """Bindet den Nutzer des flaglosen Alt-Snapshotpfads an das Repository."""
+
+    identity_before = _legacy_repository_identity(root)
+    install_user = _bound_legacy_install_user(root)
+    identity_after = _legacy_repository_identity(root)
+    if identity_before != identity_after:
+        raise RuntimeError(
+            "Repository driftete während der Legacy-Nutzerbindung"
+        )
+    return install_user, identity_after
+
+
 def _bootstrap_git_command(
     root: Path,
     *arguments: str,
@@ -2031,6 +2046,11 @@ def _main_with_update_lock(
     root: Path,
     args: argparse.Namespace,
     script: Path,
+    *,
+    legacy_snapshot_install_user: str | None = None,
+    legacy_snapshot_repository_identity: (
+        tuple[tuple[int, ...], tuple[int, ...]] | None
+    ) = None,
 ) -> int:
     """Führt genau einen bereits kernelgebundenen Finalizerpfad aus."""
 
@@ -2042,6 +2062,20 @@ def _main_with_update_lock(
         return _run_legacy_product_bridge(root, args)
     execution_root = _bound_execution_root(root)
     _bind_execution_snapshot(execution_root, root, args.expected_release_sha)
+    if legacy_snapshot_install_user is not None:
+        if (
+            not legacy_snapshot_repository_identity
+            or os.environ.get("E3DC_BOOTSTRAP_USER")
+            != legacy_snapshot_install_user
+            or _bound_legacy_install_user(root)
+            != legacy_snapshot_install_user
+            or _legacy_repository_identity(root)
+            != legacy_snapshot_repository_identity
+        ):
+            raise RuntimeError(
+                "Repository oder Installationsbenutzer driftete vor dem "
+                "Legacy-Snapshot-Finalizer"
+            )
 
     root_text = str(root)
     execution_text = str(execution_root)
@@ -2199,10 +2233,44 @@ def main() -> int:
         ),
     )
     previous_lock_env = os.environ.get(_UPDATE_LOCK_ENV)
+    previous_bootstrap_user = os.environ.get("E3DC_BOOTSTRAP_USER")
     os.environ[_UPDATE_LOCK_ENV] = str(lock_fd)
+    legacy_snapshot_install_user = None
+    legacy_snapshot_repository_identity = None
     try:
-        return _main_with_update_lock(root, args, script)
+        if legacy_target_snapshot_entry:
+            (
+                legacy_snapshot_install_user,
+                legacy_snapshot_repository_identity,
+            ) = _bound_legacy_snapshot_install_user(root)
+            # Veröffentlichte 5.4.2-Aufrufer entfernen diese Bindung vor dem
+            # Start ihres versiegelten Target-Snapshots. Der Root-Finalizer
+            # rekonstruiert sie ausschließlich aus der erneut gebundenen
+            # Repository-Eigentümerstruktur und vertraut geerbten
+            # Prozesswerten nicht ohne exakte Gleichheit.
+            if previous_bootstrap_user is None:
+                os.environ["E3DC_BOOTSTRAP_USER"] = (
+                    legacy_snapshot_install_user
+                )
+            elif previous_bootstrap_user != legacy_snapshot_install_user:
+                raise RuntimeError(
+                    "Legacy-Snapshot-Nutzer widerspricht dem "
+                    "Repository-Eigentümer"
+                )
+        return _main_with_update_lock(
+            root,
+            args,
+            script,
+            legacy_snapshot_install_user=legacy_snapshot_install_user,
+            legacy_snapshot_repository_identity=(
+                legacy_snapshot_repository_identity
+            ),
+        )
     finally:
+        if previous_bootstrap_user is None:
+            os.environ.pop("E3DC_BOOTSTRAP_USER", None)
+        else:
+            os.environ["E3DC_BOOTSTRAP_USER"] = previous_bootstrap_user
         if previous_lock_env is None:
             os.environ.pop(_UPDATE_LOCK_ENV, None)
         else:

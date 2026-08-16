@@ -1,3 +1,46 @@
+# E3DC-Control v5.4.3j
+
+E3DC-Control 5.4.3j schließt die noch offene Nutzerbindung beim flaglosen,
+root-eigenen Ziel-Snapshot aus 5.4.2d und bindet den persistenten
+Docker-Matter-Storage einschließlich neu erzeugter Dateien fail-closed privat.
+HA-, Wallbox-, Speicher-, Wärme- und
+Direktvermarktungslogik bleiben gegenüber 5.4.3i unverändert.
+
+## Gebundener Legacy-Zielübergang
+
+- Der alte 5.4.2d-Aufrufer entfernt `E3DC_BOOTSTRAP_USER`, bevor er den
+  versiegelten Ziel-Finalizer als Root startet. Fehlt die Variable in genau
+  diesem Altübergang, ermittelt der Zielcode den lokalen Installationsnutzer
+  erst nach dem Root-Lock aus dem kanonischen Repository und dessen `.git`-
+  Verzeichnis.
+- Repository und `.git` müssen demselben gültigen lokalen Nicht-Root-Nutzer
+  gehören. Root, `www-data`, unterschiedliche oder fremde Eigentümer und ein
+  ausgetauschtes Repository bleiben harte Abbruchgründe.
+- Die Bindung wird unmittelbar vor dem Finalizer erneut geprüft. Anschließend
+  wird die Aufruferumgebung exakt auf ihren vorherigen Zustand zurückgesetzt;
+  eine bereits gesetzte Bindung wird nicht durch die Ersatzlogik umgedeutet,
+  muss aber exakt dem gebundenen Repository-Eigentümer entsprechen.
+- Backup, Aktorruhe, Ziel-SHA, Rollenprüfung, Wiederanlauf und verifizierter
+  Rückweg bleiben unveränderte Voraussetzungen des Releasewechsels.
+
+## Docker und Matter
+
+- Der persistente Matter-Storage wird vor der startseitigen Härtung nofollow und
+  descriptorgebunden inventarisiert. Zugelassen sind ausschließlich
+  Verzeichnisse und reguläre Dateien mit genau einem Hardlink innerhalb
+  derselben Dateisystem- und Mountgrenze. Symlinks, Sonderdateien,
+  Mehrfachidentitäten sowie Root- oder Namensdrift stoppen den Container.
+- Eigentümer und Modi werden ausschließlich an den gebundenen Objekten gesetzt
+  und direkt vor dem Workerstart gegen dieselbe Rootidentität erneut geprüft.
+  Bestandsverzeichnisse enden bei `0700`, Bestandsdateien bei `0600`.
+- Der Matter-Worker setzt als `www-data` vor dem Node.js-Start zwingend
+  `umask 077`. Neue Fabric-, Endpoint-, Event- und Sessiondateien im
+  persistenten `matter-storage` entstehen damit höchstens im Modus `0600`.
+- Matter-Protokoll, Pairing, mDNS-Ankündigung und der knotenlokale HA-Vertrag
+  bleiben unverändert.
+
+---
+
 # E3DC-Control v5.4.3i
 
 E3DC-Control 5.4.3i korrigiert den älteren Bare-Metal-Zielübergang, trennt

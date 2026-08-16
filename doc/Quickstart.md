@@ -2,7 +2,20 @@
 
 Diese Anleitung fasst die schnellsten Schritte zusammen, um E3DC-Control auf einem frischen Raspberry Pi OS (oder ähnlichem Debian-System) zu installieren.
 
-Aktueller Stable-Stand: `v5.4.3i`.
+Aktueller Stable-Stand: `v5.4.3j`.
+
+5.4.3j schließt den flaglosen, root-eigenen 5.4.2d-Ziel-Snapshot: Fehlt die vom
+alten Aufrufer entfernte Nutzerumgebung, darf sie nur aus dem übereinstimmenden
+Eigentümer von Repository und `.git` sicher neu gebunden werden. Root,
+`www-data`, fremde oder unterschiedliche Eigentümer bleiben gesperrt. Ein schon
+gesetzter Nutzerwert muss exakt zum gebundenen Repository-Eigentümer passen.
+Im Docker-Container wird der persistente Matter-Baum vor der Härtung nofollow
+und descriptorgebunden geprüft; Symlinks, Sonderdateien, reguläre Dateien mit
+mehreren Hardlinks oder eine Mount- beziehungsweise Identitätsdrift stoppen den
+Start. Der Matter-Worker erzeugt neue Storage-Dateien durch `umask 077`
+höchstens mit `0600`. Die Regelung für HA, Wallbox, Speicher, Wärme und
+Direktvermarktung bleibt gegenüber 5.4.3i unverändert; Matter-Protokoll und
+Kopplung ändern sich nicht.
 
 5.4.3i bindet beim älteren 5.4.2-Zielübergang den lokalen Installationsnutzer,
 hält private HA- und Matter-Daten knotenlokal und vervollständigt den
@@ -219,7 +232,7 @@ Ohne das Label bleibt auch ein versehentlich gestarteter Watchtower für den
 Hauptcontainer wirkungslos. Der oben gezeigte manuelle Host-Helfer bleibt der
 empfohlene Updateweg.
 
-**Docker-Rückfall von v5.4.3i auf den veröffentlichten Docker-Rollback-Root:**
+**Docker-Rückfall von v5.4.3j auf den veröffentlichten Docker-Rollback-Root:**
 ```bash
 (
   set -euo pipefail

@@ -53,6 +53,18 @@ knotenlokal. Sie werden nicht über den allgemeinen Datensync übertragen. Ein
 Standby-Knoten benötigt daher bei Bedarf eine eigene Matter-Kopplung; ein
 transparentes Fabric-Failover ist derzeit nicht Bestandteil des HA-Vertrags.
 
+Im Docker-Container prüft ein root-eigener Descriptorwächter den persistenten
+Matter-Storage vor der startseitigen Härtung. Er folgt keinen Symlinks und lässt nur
+Verzeichnisse sowie reguläre Einzel-Link-Dateien innerhalb derselben
+Dateisystem- und Mountgrenze zu. Sonderdateien, Mehrfachidentitäten, ein
+ausgetauschter Root oder ein veränderter Namenssatz stoppen den Container. Erst
+danach werden gebundene Verzeichnisse auf `0700` und Dateien auf `0600`
+gehärtet; unmittelbar vor Node.js muss dieselbe Rootidentität noch einmal
+vollständig grün sein. Der Matter-Worker setzt zusätzlich `umask 077`, sodass
+auch neue Fabric-, Endpoint-, Event- und Sessiondateien während der Laufzeit
+höchstens mit `0600` entstehen. Matter-Protokoll, Pairing und mDNS-Verhalten
+ändern sich dadurch nicht.
+
 Der HA-Abgleich arbeitet ohne `--delete`. Neue Ausschlüsse entfernen deshalb
 keine Matter-Dateien, die eine frühere Version bereits auf den Partner kopiert
 hat. Wenn HA schon vor 5.4.3i aktiv war, prüfe beide Knoten. Entferne eine alte

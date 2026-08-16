@@ -1,12 +1,12 @@
 # E3DC-Control Web-Portal & Installer
 
-Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.4.3i</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
+Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.4.3j</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
 
 ![E3DC-Control Dashboard](html/app-icon-512.png)
 
 ## Aktuelle Version und Update
 
-Die aktuelle stabile Version ist **5.4.3i**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur geprüften Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
+Die aktuelle stabile Version ist **5.4.3j**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur geprüften Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
 
 > [!WARNING]
 > **⚠️ Achtung: Nutzung auf eigenes Risiko!**
@@ -19,6 +19,8 @@ Die aktuelle stabile Version ist **5.4.3i**. Hinweise zum Web-, Konsolen- und Do
 > **Config-Schutz:** Standardinstallationen speichern `data/e3dc_v4.json` und lokale Config-Backups mit `660` für Install-User und `www-data`, damit WebUI und Dienste weiter automatisch starten, die Datei aber nicht mehr weltlesbar ist. Der normale Config-Download ist redigiert; der Raw-Download enthält Zugangsdaten und wird nur angeboten, wenn eine Web-PIN gesetzt ist. Der Kompatibilitätsmodus (`664`) ist nur für eigene externe Leser gedacht.
 
 > **Bedienansichten:** Config-Editor und Wallbox-Seite unterscheiden zwischen einfacher Ansicht für Einrichtung und täglichen Betrieb sowie erweiterter Ansicht für alle Detailparameter. Die Logik und Abgrenzung sind in [doc/Frontend_Ansichten.md](doc/Frontend_Ansichten.md) dokumentiert.
+
+> **Neu in 5.4.3j Stable:** Der flaglose, root-eigene Ziel-Snapshot eines älteren 5.4.2d-Updaters kann den lokalen Installationsnutzer wieder sicher binden, obwohl sein alter Aufrufer `E3DC_BOOTSTRAP_USER` entfernt. Die Ersatzbindung ist ausschließlich bei fehlender Variable zulässig: Erst nach dem Root-Lock müssen Repository und `.git` demselben gültigen lokalen Nicht-Root-Nutzer gehören; unmittelbar vor dem Finalizer wird erneut geprüft und danach die Aufruferumgebung wiederhergestellt. Ein bereits gesetzter Nutzerwert bleibt unverändert, muss aber exakt dem gebundenen Repository-Eigentümer entsprechen. Root, `www-data`, fremde oder unterschiedliche Eigentümer und ein abweichender Nutzerwert bleiben gesperrt. Im Docker-Container wird ein bestehender Matter-Storage vor der Härtung descriptorgebunden auf Verzeichnisse und reguläre Einzel-Link-Dateien derselben Mountgrenze geprüft; unsichere oder driftende Bäume stoppen den Start. Der Matter-Worker startet anschließend mit `umask 077`, sodass neue persistente Storage-Dateien höchstens `0600` erhalten. HA-, Wallbox-, Speicher-, Wärme- und Direktvermarktungslogik sind gegenüber 5.4.3i unverändert.
 
 > **Neu in 5.4.3i Stable:** Der erste Zielübergang aus älteren 5.4.2-Beständen reicht den aus der Repository-Eigentümerstruktur gebundenen Installationsnutzer sicher an den Ziel-Finalizer weiter. Konfigurations- und Matter-Geheimnisse einschließlich Web-PIN, Pairingdatei, Backups, Legacy-Datei und V4-Cache bleiben knotenlokal; der Cache folgt dem Schutzmodus `0660`/`0664`. Weil der HA-Sync ohne `--delete` arbeitet, müssen Nutzer früherer HA-Versionen beide Knoten auf alte Kopien prüfen und betroffene Geheimnisse gegebenenfalls rotieren. `e3dc_stats.db` samt WebPush-Abonnements bleibt bewusst repliziert. Bei der openWB Pro sind ein bis drei Wake-up-Versuche möglich, Standard sind drei; bei Einstellung `1` darf der erste vollständig belegte Versuch sperren, ungültige Werte fallen einheitlich auf drei zurück. Der unveränderte 480-Sekunden-Schutz verhindert ausschließlich weitere Phasenwechsel, nicht den bestätigten Wiederanlauf.
 
@@ -477,7 +479,7 @@ sudo docker compose logs --tail=80 e3dc-control
 > `ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}`. Ohne Eintrag
 > folgt sie dem geprüften Stable-Tag `latest`. Ein fester Versions-Tag wechselt
 > bei `pull` absichtlich nicht; für einen bewussten Pin wird
-> `E3DC_IMAGE_TAG=v5.4.3i` in `.env` gesetzt. `config --images` zeigt vor dem
+> `E3DC_IMAGE_TAG=v5.4.3j` in `.env` gesetzt. `config --images` zeigt vor dem
 > Pull das tatsächlich gewählte Image.
 >
 > Ein fehlgeschlagener `pull` ist ein harter Abbruch. Nach begonnenem

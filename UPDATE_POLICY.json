@@ -1,9 +1,9 @@
 {
-  "version": "5.4.3i",
+  "version": "5.4.3j",
   "min_version": "4.0.0",
-  "stable_release": "v5.4.3i",
+  "stable_release": "v5.4.3j",
   "release_date": "2026-08-16",
-  "description": "v5.4.3i - Legacy-Update, HA-Sync und openWB-Pro-Startvertrag",
+  "description": "v5.4.3j - Gebundener Legacy-Ziel-Snapshot und privater Docker-Matter-Storage",
   "installer_requires": "python3",
   "sanitized_republication": false,
   "history_transition": {

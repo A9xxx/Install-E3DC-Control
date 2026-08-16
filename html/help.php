@@ -115,7 +115,7 @@ $paths = getInstallPaths();
     <div class="container">
         <div class="d-flex justify-content-between align-items-center mb-4">
             <a href="index.php" class="nav-link-back"><i class="fas fa-arrow-left me-2"></i>Dashboard</a>
-            <span class="badge bg-success text-light">v5.4.3i Stable</span>
+            <span class="badge bg-success text-light">v5.4.3j Stable</span>
         </div>
         <h1 class="display-4 fw-bold">Hilfe & Support</h1>
         <p class="lead opacity-75">Häufige Fragen und Lösungen rund um E3DC-Control.</p>
@@ -134,7 +134,7 @@ $paths = getInstallPaths();
         <div class="col-12 faq-item" data-tags="docker image stable rollback update">
             <div class="card bg-card border-0 shadow-sm"><div class="card-body">
                 <h5 class="card-title"><span class="tag">Docker</span> Wie prüfe ich Image und Update?</h5>
-                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem geprüften Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.3i</code> in <code>.env</code> gesetzt.</p>
+                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem geprüften Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.3j</code> in <code>.env</code> gesetzt.</p>
                 <pre>cd "${E3DC_DOCKER_PATH:-$HOME/e3dc-docker}"
 if [ -f ./docker_compose_update.py ]; then
   E3DC_DOCKER_HELPER=./docker_compose_update.py
@@ -212,6 +212,25 @@ sudo docker compose logs --tail=80 e3dc-control</pre>
                         <li>Nach der Freigabe im Account den RESTful API Security Token erzeugen.</li>
                         <li>Im Config-Editor unter <em>Tarif</em> den ENTSO-E-Token als Fallback-Token eintragen und mit <em>ENTSO-E testen</em> prüfen.</li>
                     </ol>
+                </div>
+            </div>
+        </div>
+
+        <h4 class="mb-4 text-accent"><i class="fas fa-shield-halved me-2"></i>Stable 5.4.3j: gebundener Altübergang</h4>
+        <div class="col-12 faq-item" data-tags="5.4.3j stable update 5.4.2d ziel snapshot installationsnutzer">
+            <div class="card bg-card border-0 shadow-sm">
+                <div class="card-body">
+                    <h5 class="card-title">
+                        <span class="tag">5.4.3j</span>
+                        Was korrigiert das Stable-Release 5.4.3j?
+                    </h5>
+                    <ul>
+                        <li><strong>Gezielter Altübergang:</strong> Der flaglose, root-eigene Ziel-Snapshot eines alten 5.4.2d-Aufrufers kann den lokalen Installationsnutzer wieder sicher binden, obwohl der Aufrufer <code>E3DC_BOOTSTRAP_USER</code> entfernt.</li>
+                        <li><strong>Enge Eigentümerprüfung:</strong> Die Ersatzbindung ist nur bei fehlender Variable zulässig. Repository und <code>.git</code> müssen nach dem Root-Lock demselben gültigen lokalen Nicht-Root-Nutzer gehören und werden unmittelbar vor dem Finalizer erneut geprüft. Ein bereits gesetzter Nutzerwert bleibt unverändert, muss aber exakt diesem Eigentümer entsprechen.</li>
+                        <li><strong>Fail-closed:</strong> Root, <code>www-data</code>, unterschiedliche oder fremde Eigentümer, ein abweichender Nutzerwert und ein ausgetauschtes Repository bleiben gesperrt. Nach dem Finalizer wird die Aufruferumgebung wiederhergestellt.</li>
+                        <li><strong>Privater Docker-Matter-Storage:</strong> Der Container bindet vorhandene Verzeichnisse und reguläre Einzel-Link-Dateien nofollow an dieselbe Mountgrenze; Symlinks, Sonderdateien oder Identitätsdrift stoppen den Start. Nach der descriptorgebundenen Härtung auf <code>0700</code>/<code>0600</code> startet der Matter-Worker mit <code>umask 077</code>, sodass auch neue persistente Fabric-, Endpoint- und Sessiondateien höchstens <code>0600</code> erhalten.</li>
+                        <li><strong>Keine Regelungsänderung:</strong> HA-, Wallbox-, Speicher-, Wärme- und Direktvermarktungslogik entsprechen unverändert 5.4.3i; Matter-Protokoll und Kopplung bleiben unverändert.</li>
+                    </ul>
                 </div>
             </div>
         </div>

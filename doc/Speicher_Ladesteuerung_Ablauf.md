@@ -1,6 +1,12 @@
 # Speicher-Ladesteuerung - Systemablauf
 
-> **Stand:** v5.4.3i, gegen den Release-Betriebsvertrag geprüft am 2026-08-16
+> **Stand:** v5.4.3j, gegen den Release-Betriebsvertrag geprüft am 2026-08-16
+>
+> **Hinweis:** 5.4.3j ändert den gebundenen Updateübergang aus einem älteren
+> 5.4.2d-Ziel-Snapshot und härtet im Docker-Container ausschließlich den
+> persistenten Matter-Dateivertrag einschließlich Worker-Umask.
+> Speicherentscheidungen und
+> Hardwareausgänge entsprechen unverändert 5.4.3i.
 >
 > **Neu in 5.4.3:** Speicherreserve, Sollkurve, Direktvermarktung und
 > Verbraucherbudgets bleiben getrennt. Ein gemeinsamer Ownervertrag bindet die

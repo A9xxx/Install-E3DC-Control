@@ -1,10 +1,19 @@
 # Betrieb des E3DC-Control Installers
 
-Dokumentation Stand: 5.4.3j
+Dokumentation Stand: 5.4.3k
 
 Der Installer ist der freigegebene Einstieg für Installation, Update,
 Reparatur, Backup, Rollback und Deinstallation. Die vollständige Bedienung ist
 in [E3DC-Control Installer](Installer.md) beschrieben.
+
+Der Installer-Anteil von 5.4.3k ergänzt den älteren nativen
+`--target-updater-handoff`, der `E3DC_BOOTSTRAP_USER` vor dem root-eigenen
+Ziel-Snapshot entfernt. Dieser Einstieg und der in 5.4.3j geschlossene
+flaglose Snapshot binden den Installationsnutzer erst nach dem Root-Lock aus
+demselben gültigen Nicht-Root-Eigentümer von Repository und `.git`. Nach der
+Snapshot-Bindung werden Repository, `.git`, Nutzerkonto und Nutzerwert vor dem
+ersten Import aus dem Zielcode erneut geprüft. Die Härtungen und
+Abbruchgründe aus 5.4.3j bleiben unverändert.
 
 Der Installer-Anteil von 5.4.3j ergänzt ausschließlich den gebundenen
 Altübergang eines flaglosen, root-eigenen 5.4.2d-Ziel-Snapshots. Fehlt dort die

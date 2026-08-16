@@ -1,9 +1,9 @@
 {
-  "version": "5.4.3j",
+  "version": "5.4.3k",
   "min_version": "4.0.0",
-  "stable_release": "v5.4.3j",
+  "stable_release": "v5.4.3k",
   "release_date": "2026-08-16",
-  "description": "v5.4.3j - Gebundener Legacy-Ziel-Snapshot und privater Docker-Matter-Storage",
+  "description": "v5.4.3k - Gebundene native Legacy-Ziel-Snapshots",
   "installer_requires": "python3",
   "sanitized_republication": false,
   "history_transition": {

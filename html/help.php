@@ -115,7 +115,7 @@ $paths = getInstallPaths();
     <div class="container">
         <div class="d-flex justify-content-between align-items-center mb-4">
             <a href="index.php" class="nav-link-back"><i class="fas fa-arrow-left me-2"></i>Dashboard</a>
-            <span class="badge bg-success text-light">v5.4.3j Stable</span>
+            <span class="badge bg-success text-light">v5.4.3k Stable</span>
         </div>
         <h1 class="display-4 fw-bold">Hilfe & Support</h1>
         <p class="lead opacity-75">Häufige Fragen und Lösungen rund um E3DC-Control.</p>
@@ -134,7 +134,7 @@ $paths = getInstallPaths();
         <div class="col-12 faq-item" data-tags="docker image stable rollback update">
             <div class="card bg-card border-0 shadow-sm"><div class="card-body">
                 <h5 class="card-title"><span class="tag">Docker</span> Wie prüfe ich Image und Update?</h5>
-                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem geprüften Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.3j</code> in <code>.env</code> gesetzt.</p>
+                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem geprüften Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.3k</code> in <code>.env</code> gesetzt.</p>
                 <pre>cd "${E3DC_DOCKER_PATH:-$HOME/e3dc-docker}"
 if [ -f ./docker_compose_update.py ]; then
   E3DC_DOCKER_HELPER=./docker_compose_update.py
@@ -212,6 +212,24 @@ sudo docker compose logs --tail=80 e3dc-control</pre>
                         <li>Nach der Freigabe im Account den RESTful API Security Token erzeugen.</li>
                         <li>Im Config-Editor unter <em>Tarif</em> den ENTSO-E-Token als Fallback-Token eintragen und mit <em>ENTSO-E testen</em> prüfen.</li>
                     </ol>
+                </div>
+            </div>
+        </div>
+
+        <h4 class="mb-4 text-accent"><i class="fas fa-shield-halved me-2"></i>Stable 5.4.3k: zwei gebundene native Alt-Snapshot-Einstiege</h4>
+        <div class="col-12 faq-item" data-tags="5.4.3k stable update target updater handoff snapshot installationsnutzer">
+            <div class="card bg-card border-0 shadow-sm">
+                <div class="card-body">
+                    <h5 class="card-title">
+                        <span class="tag">5.4.3k</span>
+                        Was korrigiert das Stable-Release 5.4.3k?
+                    </h5>
+                    <ul>
+                        <li><strong>Zweiter Altübergang:</strong> Zusätzlich zum flaglosen Ziel-Snapshot aus 5.4.3j bleibt auch der ältere native Aufruf mit <code>--target-updater-handoff</code> updatefähig, obwohl er <code>E3DC_BOOTSTRAP_USER</code> vor dem root-eigenen Ziel-Snapshot entfernt.</li>
+                        <li><strong>Ein Nutzervertrag:</strong> Beide unterstützten Snapshot-Einstiege binden den lokalen Installationsnutzer erst nach dem Root-Lock aus demselben gültigen Nicht-Root-Eigentümer von Repository und <code>.git</code>.</li>
+                        <li><strong>Prüfung vor Zielimport:</strong> Nach der Bindung des versiegelten Snapshots werden Repository, <code>.git</code>, lokales Benutzerkonto und Nutzerwert unmittelbar vor dem ersten Import aus dem Zielcode erneut geprüft.</li>
+                        <li><strong>Härtungen unverändert:</strong> Root, <code>www-data</code>, fremde oder unterschiedliche Eigentümer, ein abweichender Nutzerwert und ein ausgetauschtes Repository bleiben gesperrt. Der private Docker-Matter-Storage, die Worker-Umask sowie HA-, Wallbox-, Speicher-, Wärme- und Direktvermarktungslogik ändern sich nicht.</li>
+                    </ul>
                 </div>
             </div>
         </div>

@@ -2,7 +2,16 @@
 
 Diese Anleitung fasst die schnellsten Schritte zusammen, um E3DC-Control auf einem frischen Raspberry Pi OS (oder ähnlichem Debian-System) zu installieren.
 
-Aktueller Stable-Stand: `v5.4.3j`.
+Aktueller Stable-Stand: `v5.4.3k`.
+
+5.4.3k schließt zusätzlich den älteren nativen
+`--target-updater-handoff`, der `E3DC_BOOTSTRAP_USER` vor seinem root-eigenen
+Ziel-Snapshot entfernt. Beide unterstützten Snapshot-Einstiege binden den
+Installationsnutzer erst nach dem Root-Lock aus demselben gültigen
+Nicht-Root-Eigentümer von Repository und `.git`. Nach der Bindung des
+versiegelten Snapshots werden Repository, `.git`, Nutzerkonto und Nutzerwert
+unmittelbar vor dem ersten Import aus dem Zielcode erneut geprüft. Die
+Härtungen aus 5.4.3j bleiben unverändert.
 
 5.4.3j schließt den flaglosen, root-eigenen 5.4.2d-Ziel-Snapshot: Fehlt die vom
 alten Aufrufer entfernte Nutzerumgebung, darf sie nur aus dem übereinstimmenden
@@ -232,7 +241,7 @@ Ohne das Label bleibt auch ein versehentlich gestarteter Watchtower für den
 Hauptcontainer wirkungslos. Der oben gezeigte manuelle Host-Helfer bleibt der
 empfohlene Updateweg.
 
-**Docker-Rückfall von v5.4.3j auf den veröffentlichten Docker-Rollback-Root:**
+**Docker-Rückfall von v5.4.3k auf den veröffentlichten Docker-Rollback-Root:**
 ```bash
 (
   set -euo pipefail

@@ -1,3 +1,38 @@
+# E3DC-Control v5.4.3k
+
+E3DC-Control 5.4.3k schließt zusätzlich den älteren nativen Aufruf mit
+`--target-updater-handoff`, der die gebundene Nutzerumgebung vor seinem
+root-eigenen Ziel-Snapshot entfernt. Die Härtungen aus 5.4.3j bleiben
+unverändert; HA-, Wallbox-, Speicher-, Wärme- und
+Direktvermarktungslogik ändern sich nicht.
+
+## Zwei gebundene native Alt-Snapshot-Einstiege
+
+- Neben dem bereits in 5.4.3j geschlossenen flaglosen Ziel-Snapshot wird nun
+  auch der ältere native `--target-updater-handoff` unterstützt. Dieser
+  Alt-Aufrufer entfernt `E3DC_BOOTSTRAP_USER`, bevor er den versiegelten
+  Ziel-Snapshot als Root startet.
+- Beide unterstützten Snapshot-Einstiege dürfen den lokalen
+  Installationsnutzer erst nach dem Root-Lock aus demselben gültigen
+  Nicht-Root-Eigentümer von Repository und `.git` binden. Root, `www-data`,
+  unterschiedliche oder fremde Eigentümer, ein abweichender Nutzerwert und
+  ein ausgetauschtes Repository bleiben harte Abbruchgründe.
+- Nach der Bindung des versiegelten Snapshots werden Repository, `.git`,
+  lokales Benutzerkonto und Nutzerwert unmittelbar vor dem ersten Import aus
+  dem Zielcode erneut geprüft. Ein bereits vorhandener Nutzerwert muss exakt
+  zum gebundenen Repository-Eigentümer passen.
+- Backup, Aktorruhe, Ziel-SHA, Rollenprüfung, Wiederanlauf und verifizierter
+  Rückweg bleiben unveränderte Voraussetzungen des Releasewechsels.
+
+## Unveränderte Härtungen aus 5.4.3j
+
+- Der private Docker-Matter-Storage, seine descriptorgebundene Prüfung und
+  Härtung sowie die Worker-Umask `077` bleiben unverändert.
+- Matter-Protokoll, Pairing, mDNS-Ankündigung und der knotenlokale HA-Vertrag
+  bleiben unverändert.
+
+---
+
 # E3DC-Control v5.4.3j
 
 E3DC-Control 5.4.3j schließt die noch offene Nutzerbindung beim flaglosen,

@@ -6,6 +6,14 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.3k] – 2026-08-16
+
+### 🔄 Native Alt-Updater-Handoffs
+
+- **Auch der ältere native Ziel-Updater-Handoff bleibt updatefähig:** Der Aufruf mit `--target-updater-handoff` entfernt `E3DC_BOOTSTRAP_USER`, bevor er den root-eigenen Ziel-Snapshot startet. 5.4.3k schließt diesen zweiten unterstützten Altübergang zusätzlich zum bereits in 5.4.3j gebundenen flaglosen Snapshot.
+- **Beide Snapshot-Einstiege verwenden denselben engen Nutzervertrag:** Erst nach dem Root-Lock darf der lokale Installationsnutzer aus dem übereinstimmenden Eigentümer von Repository und `.git` gebunden werden. Nach der Bindung des versiegelten Snapshots werden Repository, `.git`, Nutzerkonto und Nutzerwert unmittelbar vor dem ersten Import aus dem Zielcode erneut geprüft.
+- **Die Härtungen aus 5.4.3j bleiben unverändert:** Root, `www-data`, unterschiedliche oder fremde Eigentümer, ein abweichender Nutzerwert und ein ausgetauschtes Repository bleiben gesperrt. Der private Docker-Matter-Storage, die Worker-Umask sowie HA-, Wallbox-, Speicher-, Wärme- und Direktvermarktungslogik ändern sich nicht.
+
 ## [5.4.3j] – 2026-08-16
 
 ### 🔄 Update aus älteren Bare-Metal-Beständen

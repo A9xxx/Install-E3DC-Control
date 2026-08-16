@@ -5,7 +5,7 @@ Updates werden ausschließlich über den Installer ausgeführt. Ein manuelles
 Release-Historie ungeeignet, weil alter und neuer Git-Stand nicht miteinander
 verwandt sein müssen.
 
-Der aktuelle Stable-Stand ist `v5.4.3j`. Der Ziel-Updater bindet den
+Der aktuelle Stable-Stand ist `v5.4.3k`. Der Ziel-Updater bindet den
 freigegebenen Zielstand vor Backup und Dienststopp eindeutig an Version,
 Herkunft und Anlagenrolle. Fortschritt und Lebenszeichen bleiben auf
 langsameren Raspberry Pis sichtbar. Eine bereits vollständig installierte
@@ -64,6 +64,16 @@ unterschiedliche oder fremde Eigentümer und ein abweichender Nutzerwert bleiben
 gesperrt; nach dem Finalizer wird die Aufruferumgebung exakt auf ihren vorherigen
 Zustand zurückgesetzt.
 
+5.4.3k schließt zusätzlich den älteren nativen
+`--target-updater-handoff`, der `E3DC_BOOTSTRAP_USER` ebenfalls vor seinem
+root-eigenen Ziel-Snapshot entfernt. Dieser Einstieg und der bereits in
+5.4.3j gebundene flaglose Snapshot dürfen den Installationsnutzer erst nach
+dem Root-Lock aus demselben gültigen Nicht-Root-Eigentümer von Repository und
+`.git` binden. Nach der Bindung des versiegelten Snapshots werden Repository,
+`.git`, lokales Benutzerkonto und Nutzerwert unmittelbar vor dem ersten
+Import aus dem Zielcode erneut geprüft. Die fail-closed Grenzen und alle
+übrigen Härtungen aus 5.4.3j bleiben unverändert.
+
 Erreicht ein abweichender oder noch älterer lokaler Updater diese gebundene
 Kompatibilitätsbrücke nicht und bricht bereits vor Backup und Dienststopp mit
 `Installationsbenutzer ist nicht lokal gebunden` ab, steht für einen normalen
@@ -73,7 +83,7 @@ GitHub-Release-Seite übernommen werden:
 
 ```bash
 export E3DC_INSTALL_PATH="/absoluter/pfad/zur/installation"
-export E3DC_RELEASE_TAG="v5.4.3j"
+export E3DC_RELEASE_TAG="v5.4.3k"
 export E3DC_RELEASE_SHA="<40-stellige Commit-SHA des veröffentlichten Tags>"
 E3DC_BOOTSTRAP_DIR="$(mktemp -d)"
 curl -fL "https://github.com/A9xxx/Install-E3DC-Control/archive/refs/tags/${E3DC_RELEASE_TAG}.tar.gz" \

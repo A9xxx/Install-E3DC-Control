@@ -136,6 +136,7 @@ SECRET_CONFIG_EXACT_KEYS = {
     "rscp_pw",
     "rscp_password",
     "telegram_chat_id",
+    "web_pin",
 }
 
 
@@ -823,10 +824,28 @@ def rsync_data(target_ip, push=True, owner_lease=None, peer_state_getter=query_p
         "--exclude", "watchdog.heartbeat",
         "-e", ssh_transport,
     ]
+    ramdisk_args = base_args + [
+        "--exclude", "rule_calm_analysis.json",
+        "--exclude", "watchdog.update_pause",
+        "--exclude", "watchdog.update_grace",
+        "--exclude", "matter_pairing.json",
+        "--exclude", "matter_pairing.json.*.tmp",
+        "--exclude", ".e3dc_config_cache.*",
+        "--exclude", ".wb_sessions_aggregate_*",
+        "--exclude", ".get_live_json_*",
+    ]
     data_args = base_args + [
         "--exclude", "e3dc_v4.json",
         "--exclude", "e3dc_v4.json.tmp",
         "--exclude", "e3dc_v4.json.bak*",
+        "--exclude", ".e3dc_v4_*",
+        "--exclude", "e3dc.config.txt",
+        "--exclude", "config_backups",
+        "--exclude", "config_backups/",
+        "--exclude", "matter-storage",
+        "--exclude", "matter-storage/",
+        "--exclude", ".wallbox_plan_jobs",
+        "--exclude", ".wallbox_plan_jobs/",
     ]
     optional_args = base_args + ["--ignore-missing-args"]
 
@@ -850,7 +869,7 @@ def rsync_data(target_ip, push=True, owner_lease=None, peer_state_getter=query_p
     txt_dst = _rsync_remote(user, target_ip, f"{INSTALL_PATH}/") if push else f"{INSTALL_PATH}/"
 
     try:
-        subprocess.run(base_args + [rd_src, rd_dst], timeout=45, check=True)
+        subprocess.run(ramdisk_args + [rd_src, rd_dst], timeout=45, check=True)
         subprocess.run(data_args + [data_src, data_dst], timeout=45, check=True)
         if dat_src:
             subprocess.run(optional_args + dat_src + [dat_dst], timeout=45, check=True)
@@ -859,9 +878,45 @@ def rsync_data(target_ip, push=True, owner_lease=None, peer_state_getter=query_p
 
         # Rechte der geholten Daten in der Ramdisk und Data anpassen (bei Pull)
         if not push:
-            subprocess.run(["sudo", "chown", "-R", "pi:www-data", "/var/www/html/ramdisk", "/var/www/html/data"])
-            subprocess.run(["sudo", "find", "/var/www/html/ramdisk", "-type", "f", "-exec", "chmod", "664", "{}", "+"])
-            protected_data = ["(", "-path", "/var/www/html/data/e3dc_v4.json", "-o", "-path", "/var/www/html/data/config_backups", ")", "-prune", "-o"]
+            protected_ramdisk = [
+                "(",
+                "-path", "/var/www/html/ramdisk/rule_calm_analysis.json", "-o",
+                "-path", "/var/www/html/ramdisk/watchdog.update_pause", "-o",
+                "-path", "/var/www/html/ramdisk/watchdog.update_grace",
+                "-o", "-path", "/var/www/html/ramdisk/matter_pairing.json",
+                "-o", "-path", "/var/www/html/ramdisk/matter_pairing.json.*.tmp",
+                "-o", "-path", "/var/www/html/ramdisk/e3dc_config_cache.json",
+                "-o", "-path", "/var/www/html/ramdisk/.e3dc_config_cache.*",
+                "-o", "-path", "/var/www/html/ramdisk/.wb_sessions_aggregate_*",
+                "-o", "-path", "/var/www/html/ramdisk/.get_live_json_*",
+                ")", "-prune", "-o",
+            ]
+            protected_data = [
+                "(",
+                "-path", "/var/www/html/data/e3dc_v4.json", "-o",
+                "-path", "/var/www/html/data/e3dc_v4.json.tmp", "-o",
+                "-path", "/var/www/html/data/e3dc_v4.json.bak*", "-o",
+                "-path", "/var/www/html/data/.e3dc_v4_*", "-o",
+                "-path", "/var/www/html/data/e3dc.config.txt", "-o",
+                "-path", "/var/www/html/data/config_backups", "-o",
+                "-path", "/var/www/html/data/matter-storage", "-o",
+                "-path", "/var/www/html/data/.wallbox_plan_jobs",
+                ")", "-prune", "-o",
+            ]
+            subprocess.run([
+                "sudo", "find", "-P", "/var/www/html/ramdisk", "-xdev",
+                *protected_ramdisk, "-type", "l", "-prune", "-o",
+                "-exec", "chown", "pi:www-data", "{}", "+",
+            ], check=True)
+            subprocess.run([
+                "sudo", "find", "-P", "/var/www/html/data", "-xdev",
+                *protected_data, "-type", "l", "-prune", "-o",
+                "-exec", "chown", "pi:www-data", "{}", "+",
+            ], check=True)
+            subprocess.run([
+                "sudo", "find", "-P", "/var/www/html/ramdisk", "-xdev",
+                *protected_ramdisk, "-type", "f", "-exec", "chmod", "664", "{}", "+",
+            ], check=True)
             subprocess.run(["sudo", "find", "-P", "/var/www/html/data", "-xdev", *protected_data, "-type", "d", "-exec", "chmod", "775", "{}", "+"])
             subprocess.run(["sudo", "find", "-P", "/var/www/html/data", "-xdev", *protected_data, "-type", "f", "-exec", "chmod", "664", "{}", "+"])
             subprocess.run(["sudo", "chmod", config_secret_file_mode_text(), "/var/www/html/data/e3dc_v4.json"], stderr=subprocess.DEVNULL)

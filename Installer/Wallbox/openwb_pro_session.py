@@ -129,8 +129,30 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
 def _safe_int(value: Any, default: int = 0) -> int:
     try:
         return int(round(_safe_float(value, default)))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return int(default)
+
+
+def start_cp_retry_limit(config: Optional[Dict[str, Any]] = None) -> int:
+    """Liefert ausschließlich einen endlichen ganzzahligen CP-Vertrag 1..3.
+
+    Boolesche, nichtendliche, gebrochene oder außerhalb des freigegebenen
+    Bereichs liegende Werte sind keine gültige Konfiguration. Sie fallen auf
+    den konservativen Produktstandard von drei Wake-up-Versuchen zurück.
+    """
+
+    cfg = config if isinstance(config, dict) else {}
+    raw_value = cfg.get("wb_openwb_start_cp_retries", 3)
+    if isinstance(raw_value, bool):
+        return 3
+    try:
+        numeric_value = float(raw_value)
+    except (TypeError, ValueError, OverflowError):
+        return 3
+    if not math.isfinite(numeric_value) or not numeric_value.is_integer():
+        return 3
+    retry_limit = int(numeric_value)
+    return retry_limit if 1 <= retry_limit <= 3 else 3
 
 
 def _explicit_inactive(value: Any) -> bool:
@@ -1844,10 +1866,7 @@ def start_wakeup_step_contract(
         if receipt_matches
         else 0
     )
-    max_retries = max(
-        1,
-        min(3, _safe_int(cfg.get("wb_openwb_start_cp_retries"), 3)),
-    )
+    max_retries = start_cp_retry_limit(cfg)
     cp_capability = automatic_start_cp_contract(
         cfg,
         st,
@@ -3550,7 +3569,8 @@ def evaluate_session(
         or predump_active
     )
     start_verifying = bool(
-        start_requested
+        not real_charging
+        and start_requested
         and (
             start_hold
             or (

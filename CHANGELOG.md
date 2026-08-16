@@ -6,6 +6,21 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.3i] – 2026-08-16
+
+### 🔄 Update und HA-Synchronisation
+
+- **Ältere Bare-Metal-Systeme erreichen den Ziel-Updater wieder:** Beim ersten Releasewechsel aus einem älteren 5.4.2-Bestand wird der lokale Installationsnutzer aus der kanonischen Repository-Eigentümerstruktur gebunden, unmittelbar vor dem Kindstart erneut geprüft und ausdrücklich an den versiegelten Ziel-Finalizer übergeben. Eine fehlende lokale `installer_config.json` im unveränderlichen Snapshot führt dadurch nicht mehr zum Abbruch „Installationsbenutzer ist nicht lokal gebunden“; Root, `www-data`, fremde Konten und ein ausgetauschtes Repository bleiben gesperrt.
+- **Konfigurations- und Matter-Geheimnisse bleiben knotenlokal:** Matter-Pairingdatei samt temporärer Schreibdatei, Matter-Storage, Config-Backups, eine alte `e3dc.config.txt`, temporäre beziehungsweise gesicherte V4-Konfigurationen und der V4-Laufzeitcache samt atomarer Schreibdatei werden weder übertragen noch durch die allgemeine Rechteprojektion verändert. Auch die Web-PIN wird aus der gefilterten HA-Konfiguration entfernt. Der Cache folgt dem gewählten Config-Schutz mit `0660` im Standard- oder `0664` im Kompatibilitätsmodus.
+- **Weitere lokale Zustände blockieren den HA-Sync nicht mehr:** Analysezustand, Update-Pause und -Nachlauf sowie Wallbox-Planertransaktionen bleiben ebenfalls lokal. Pull-Härtungen folgen keinen Symlinks und überschreiten keine Dateisystemgrenze. Die gemeinsam geführte Statistikdatenbank einschließlich WebPush-Abonnements wird dagegen weiterhin bewusst repliziert; die Lokalitätszusage gilt deshalb ausdrücklich für Konfigurations- und Matter-Geheimnisse.
+- **Altbestände benötigen eine einmalige Prüfung:** Der HA-Abgleich arbeitet weiterhin ohne `--delete`. Neue Ausschlüsse verhindern daher weitere Übertragungen, entfernen aber keine früher auf den Partner kopierten Dateien. Wer HA bereits vor 5.4.3i genutzt hat, prüft beide Knoten und rotiert betroffene Zugangsdaten, Web-PIN oder Matter-Kopplung, wenn vertrauliche Kopien auf dem jeweils anderen Knoten lagen.
+
+### 🚗 openWB Pro
+
+- **Startablehnung folgt exakt der konfigurierten Wake-up-Episode:** Ein bis drei Versuche sind zulässig; Standard sind drei. Bei bewusst konfiguriertem Wert `1` darf bereits der erste vollständig belegte Versuch weitere automatische Starts derselben Stecksession sperren. Boolesche, nicht endliche und nicht ganzzahlige Werte sind ungültig und fallen in beiden Entscheidungspfaden einheitlich auf drei Versuche zurück. Receipt, Stecksession, aktuelle Stromfreigabe und Zeitkette müssen zusammenpassen.
+- **Schutzgrenzen bleiben unverändert:** Die kurze sichere 0-A-/CP-Beruhigung wird eingehalten. Nach bestätigtem Phasenziel darf der Strom wieder anlaufen; die 480-Sekunden-Sperre schützt ausschließlich vor einem weiteren Phasenwechsel. Nutzer-`Aus`, Budget-, Reserve- und Hardwaregrenzen bleiben vorrangig. Status- und Detailansichten entfernen veraltete Episodendiagnose auch im Mischbetrieb.
+- **Andere EMS-Domänen bleiben unverändert:** Das Release ändert keine Preisfenster, Speicherreserve, RSCP-Leistungsbefehle, Wärme- oder Direktvermarktungsentscheidungen.
+
 ## [5.4.3h] – 2026-08-16
 
 ### 🧰 Update bestehender Python-Umgebungen

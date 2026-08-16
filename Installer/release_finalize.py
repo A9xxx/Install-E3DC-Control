@@ -728,6 +728,60 @@ def _bootstrap_repository_reader_user(root: Path) -> str | None:
     return account.pw_name
 
 
+def _bound_legacy_install_user(root: Path) -> str:
+    """Bindet den Altübergang an den nicht privilegierten Repo-Eigentümer."""
+
+    install_user = _bootstrap_repository_reader_user(root)
+    if (
+        not install_user
+        or not _ACCOUNT_NAME_RE.fullmatch(install_user)
+        or install_user in {"root", "www-data"}
+    ):
+        raise RuntimeError(
+            "Legacy-Zielübergang besitzt keinen gebundenen Installationsbenutzer"
+        )
+    try:
+        account = pwd.getpwnam(install_user)
+    except KeyError as exc:
+        raise RuntimeError(
+            "Legacy-Zielübergang besitzt keinen lokalen Installationsbenutzer"
+        ) from exc
+    root_metadata = root.lstat()
+    git_metadata = (root / ".git").lstat()
+    if (
+        account.pw_uid == 0
+        or root_metadata.st_uid != account.pw_uid
+        or git_metadata.st_uid != account.pw_uid
+    ):
+        raise RuntimeError(
+            "Legacy-Zielübergang besitzt keine gebundene Eigentümerstruktur"
+        )
+    return install_user
+
+
+def _legacy_repository_identity(root: Path) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Bindet Root und Git-Verzeichnis gegen Austausch vor dem Kindstart."""
+
+    identities = []
+    for path in (root, root / ".git"):
+        metadata = path.lstat()
+        if path.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
+            raise RuntimeError(
+                "Legacy-Zielübergang besitzt keine kanonische Repositorystruktur"
+            )
+        identities.append(
+            (
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_mode,
+                metadata.st_nlink,
+                metadata.st_uid,
+                metadata.st_gid,
+            )
+        )
+    return identities[0], identities[1]
+
+
 def _bootstrap_git_command(
     root: Path,
     *arguments: str,
@@ -1861,6 +1915,8 @@ def _run_legacy_product_bridge(
 ) -> int:
     lock_fd = _required_update_lock_fd()
     entries = _bind_legacy_product_invocation(root, args)
+    legacy_install_user = _bound_legacy_install_user(root)
+    legacy_repository_identity = _legacy_repository_identity(root)
     snapshot_parent = _trusted_same_filesystem_snapshot_parent(root)
     _cleanup_stale_compat_snapshots(snapshot_parent)
     snapshot_root = _create_compat_execution_snapshot(
@@ -1887,6 +1943,7 @@ def _run_legacy_product_bridge(
         environment.pop(name, None)
     environment["E3DC_BOOTSTRAP_ROOT"] = str(root)
     environment["E3DC_BOOTSTRAP_RUNNER_ROOT"] = str(snapshot_root)
+    environment["E3DC_BOOTSTRAP_USER"] = legacy_install_user
     environment["E3DC_INSTALL_ROOT"] = str(root)
     environment["PYTHONNOUSERSITE"] = "1"
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -1924,6 +1981,13 @@ def _run_legacy_product_bridge(
         args.expected_venv_path,
     ]
     try:
+        if (
+            _bound_legacy_install_user(root) != legacy_install_user
+            or _legacy_repository_identity(root) != legacy_repository_identity
+        ):
+            raise RuntimeError(
+                "Repository oder Installationsbenutzer driftete vor dem Legacy-Zielübergang"
+            )
         result = _run_compat_finalizer(
             command,
             environment=environment,

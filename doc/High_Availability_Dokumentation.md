@@ -67,7 +67,53 @@ Alle Parameter können komfortabel im **Config Editor** unter der Kategorie **Hi
 Wenn du am Master im Config-Editor Einstellungen veränderst (z.B. ein neues Preislimit setzt), wird diese Änderung **automatisch** binnen 60 Sekunden auf den Slave übertragen.
 *Die Intelligenz:* Das System überträgt nur generelle Einstellungen. Die Cluster-spezifischen Variablen (Rolle, IP-Adresse) des Slaves werden bei der Synchronisation geschützt, um ein Chaos (Split-Brain-Syndrom) zu verhindern.
 
-Zugangsdaten, API-Tokens und private Schlüssel bleiben ebenfalls lokal pro Knoten. Der Master stellt für den Slave nur eine gefilterte Sync-Konfiguration ohne diese Secret-Felder bereit; der Slave mischt anschließend seine eigenen lokalen Werte wieder ein. Für ein echtes Failover müssen die benötigten Zugangsdaten deshalb auf beiden Geräten einmal lokal hinterlegt sein.
+Konfigurations- und Matter-Geheimnisse bleiben lokal pro Knoten. Der Master
+stellt für den Slave nur eine gefilterte Konfiguration ohne Passwörter,
+API-Tokens, private Schlüssel und `web_pin` bereit; der Slave mischt seine
+eigenen lokalen Werte wieder ein. Für ein echtes Failover müssen die benötigten
+Zugangsdaten und die Web-PIN deshalb auf beiden Geräten einmal lokal
+hinterlegt sein.
+
+Folgende Pfade werden weder per Push noch Pull übertragen und von der
+allgemeinen Rechteprojektion nicht verändert:
+
+- `ramdisk/matter_pairing.json` einschließlich der temporären Schreibdatei,
+- `ramdisk/e3dc_config_cache.json` einschließlich seiner atomaren
+  Schreibdatei `.e3dc_config_cache.*`,
+- `data/matter-storage`,
+- `data/config_backups`,
+- `data/e3dc.config.txt`,
+- `data/e3dc_v4.json.tmp`, `data/e3dc_v4.json.bak*` und die atomaren
+  Schreibdateien `data/.e3dc_v4_*`,
+- `ramdisk/rule_calm_analysis.json`, `ramdisk/watchdog.update_pause` und
+  `ramdisk/watchdog.update_grace`,
+- `data/.wallbox_plan_jobs`.
+
+Der V4-Laufzeitcache enthält eine Projektion der Konfiguration und folgt deren
+Schutzmodus: `0660` im Standardmodus oder `0664` im ausdrücklich gewählten
+Kompatibilitätsmodus. Matter-Fabric, Pairingdatei und Commissioning-Zugangsdaten
+bleiben ebenfalls knotenlokal. Eine Matter-Kopplung bleibt bei Updates
+desselben Knotens erhalten; ein Standby-Knoten muss bei Bedarf separat
+gekoppelt werden.
+
+Reguläre synchronisierte Daten behalten den gemeinsamen HA-Vertrag. Dazu
+gehört bewusst auch `data/e3dc_stats.db` einschließlich gespeicherter
+WebPush-Abonnements. Die Aussage „knotenlokal“ gilt daher ausdrücklich für
+Konfigurations- und Matter-Geheimnisse, nicht pauschal für jede Datei mit
+Zugangsdatencharakter. Kurzlebige atomare Schreibdateien der Wallbox-
+Sessionaggregation und der Live-JSON-Projektion werden ebenfalls nicht
+übertragen oder umgehärtet; ihre regulären Zielartefakte bleiben Teil des
+HA-Abgleichs. Die Pull-Härtung folgt keinen Symlinks und überschreitet keine
+Dateisystemgrenze.
+
+> **Wichtig für bestehende HA-Installationen:** Der Abgleich arbeitet ohne
+> `--delete`. Neue Ausschlüsse verhindern weitere Übertragungen, entfernen aber
+> keine bereits auf den Partner kopierten Dateien. Wenn HA schon vor 5.4.3i
+> aktiv war, prüfe beide Knoten auf alte Kopien. Entferne sie erst nach klarer
+> Zuordnung und Sicherung des weiterhin benötigten Originals. Waren
+> Konfigurations- oder Matter-Geheimnisse auf dem jeweils anderen Knoten
+> vorhanden, rotiere die betroffenen Zugangsdaten beziehungsweise die Web-PIN
+> und kopple Matter bei Bedarf neu.
 
 ### Hot Standby vs. Warm Standby
 Du kannst bestimmen, wie aggressiv der Slave eingreifen soll (`Auto-Failover`):

@@ -5,7 +5,7 @@ Updates werden ausschließlich über den Installer ausgeführt. Ein manuelles
 Release-Historie ungeeignet, weil alter und neuer Git-Stand nicht miteinander
 verwandt sein müssen.
 
-Der aktuelle Stable-Stand ist `v5.4.3h`. Der Ziel-Updater bindet den
+Der aktuelle Stable-Stand ist `v5.4.3i`. Der Ziel-Updater bindet den
 freigegebenen Zielstand vor Backup und Dienststopp eindeutig an Version,
 Herkunft und Anlagenrolle. Fortschritt und Lebenszeichen bleiben auf
 langsameren Raspberry Pis sichtbar. Eine bereits vollständig installierte
@@ -35,25 +35,33 @@ bash "$E3DC_INSTALL_PATH/e3dc-setup" --check
 bash "$E3DC_INSTALL_PATH/e3dc-setup" --update-e3dc
 ```
 
-**Einmaliger Übergang auf 5.4.3h:** Installationen bis einschließlich 5.4.3f
+**Einmaliger Übergang auf 5.4.3i:** Installationen bis einschließlich 5.4.3f
 besitzen den neuen root-eigenen Web-Launcher noch nicht. Dieser erste Wechsel
 muss deshalb über den oben gezeigten administrativen Konsolenweg erfolgen.
-Erst die erfolgreiche Installation von 5.4.3h richtet den engen Launcher und
+Erst die erfolgreiche Installation von 5.4.3i richtet den engen Launcher und
 seine argumentlose sudoers-Freigabe ein; alle folgenden normalen Updates
 können wieder aus dem Dashboard gestartet werden.
 
-### Reparatur eines alten Bootstrap-Übergangs
+### Übergang aus älteren 5.4.2-Beständen
 
-Bricht ein älterer Updater bereits vor Backup und Dienststopp mit
-`Installationsbenutzer ist nicht lokal gebunden` ab, kann dieser laufende
-Altprozess nicht durch den Zielstand repariert werden. Für einen normalen
-Einzelknoten mit `ha_mode=off` steht deshalb der aktuelle offizielle Bootstrap
-zur Verfügung. Tag und vollständige Commit-SHA müssen von derselben
-veröffentlichten GitHub-Release-Seite übernommen werden:
+5.4.3i bindet den lokalen Installationsnutzer im Legacy-Zielübergang aus der
+kanonischen Repository-Eigentümerstruktur, prüft Nutzer und Repository
+unmittelbar vor dem Kindstart erneut und reicht die Bindung ausdrücklich an den
+versiegelten Ziel-Finalizer weiter. Die lokale `installer_config.json` ist
+bewusst kein Bestandteil dieses unveränderlichen Snapshots und muss dort nicht
+vorhanden sein. Root, `www-data`, fremde Konten und ein ausgetauschtes
+Repository bleiben harte Abbruchgründe.
+
+Erreicht ein abweichender oder noch älterer lokaler Updater diese gebundene
+Kompatibilitätsbrücke nicht und bricht bereits vor Backup und Dienststopp mit
+`Installationsbenutzer ist nicht lokal gebunden` ab, steht für einen normalen
+Einzelknoten mit `ha_mode=off` weiterhin der aktuelle offizielle Bootstrap zur
+Verfügung. Tag und vollständige Commit-SHA müssen von derselben veröffentlichten
+GitHub-Release-Seite übernommen werden:
 
 ```bash
 export E3DC_INSTALL_PATH="/absoluter/pfad/zur/installation"
-export E3DC_RELEASE_TAG="v5.4.3h"
+export E3DC_RELEASE_TAG="v5.4.3i"
 export E3DC_RELEASE_SHA="<40-stellige Commit-SHA des veröffentlichten Tags>"
 E3DC_BOOTSTRAP_DIR="$(mktemp -d)"
 curl -fL "https://github.com/A9xxx/Install-E3DC-Control/archive/refs/tags/${E3DC_RELEASE_TAG}.tar.gz" \

@@ -2,8 +2,8 @@
 
 Veröffentlichte Images entstehen ausschließlich aus einem versionierten stabilen Release-Tag. `latest` verweist damit auf die zuletzt veröffentlichte stabile Version.
 
-Der aktuelle Stable-Stand ist `v5.4.3h`. Die Tags `latest`, `v5.4.3h` und
-`5.4.3h` müssen auf denselben geprüften Multi-Arch-Digest verweisen.
+Der aktuelle Stable-Stand ist `v5.4.3i`. Die Tags `latest`, `v5.4.3i` und
+`5.4.3i` müssen auf denselben geprüften Multi-Arch-Digest verweisen.
 
 E3DC-Control kann isoliert über **Docker** betrieben werden. Der Container kapselt die Anwendung; persistente Betriebsdaten liegen in den dafür vorgesehenen Volumes. Der Multi-Architektur-Support (`arm64`, `amd64`) deckt die vorgesehenen Plattformen ab. Docker benötigt dabei zwingend ein 64-Bit-Betriebssystem; `armhf`, `arm/v7` und andere 32-Bit-Installationen können das veröffentlichte Image nicht starten.
 
@@ -222,7 +222,7 @@ unverändert gesperrt und benötigen eine manuelle Prüfung.
 
 Ohne `E3DC_IMAGE_TAG` folgt diese Compose-Datei dem geprüften Stable-Tag
 `latest`. Ein fester Tag bleibt bei `pull` absichtlich unverändert. Für einen
-bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.3h` in der Datei `.env`
+bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.3i` in der Datei `.env`
 gesetzt. `docker compose config --images` zeigt vorab das tatsächlich gewählte
 Image.
 
@@ -249,7 +249,7 @@ Versionswahl.
 
 Gezielte Rückfallversion:
 
-Den Stable-Container `v5.4.3h` auf den veröffentlichten Rollback-Root
+Den Stable-Container `v5.4.3i` auf den veröffentlichten Rollback-Root
 `v5.3.2b` zurücksetzen:
 
 ```bash

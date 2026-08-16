@@ -1,3 +1,74 @@
+# E3DC-Control v5.4.3i
+
+E3DC-Control 5.4.3i korrigiert den älteren Bare-Metal-Zielübergang, trennt
+knotenlokale Zustände vom HA-Sync und vervollständigt den openWB-Pro-
+Startvertrag. Speicher-, Wärme- und Direktvermarktungsentscheidungen bleiben
+gegenüber 5.4.3h unverändert.
+
+## Update bestehender 5.4.2-Systeme
+
+- Der Legacy-Zielübergang ermittelt den lokalen Installationsnutzer aus dem
+  kanonischen Repository-Eigentümer, prüft Repository und Nutzer unmittelbar
+  vor dem Kindstart erneut und reicht die Bindung ausdrücklich an den
+  versiegelten Ziel-Finalizer weiter.
+- Der Ziel-Snapshot benötigt dadurch keine lokale, bewusst nicht
+  veröffentlichte `installer_config.json`. Root, `www-data`, fremde Konten und
+  eine ausgetauschte Repositorystruktur bleiben harte Abbruchgründe.
+
+## HA und Matter
+
+- Die Matter-Pairingdatei einschließlich ihrer temporären Schreibdatei,
+  `matter-storage`, `config_backups`, eine alte `e3dc.config.txt`,
+  `e3dc_v4.json.tmp`, `e3dc_v4.json.bak*`, `.e3dc_v4_*`,
+  `e3dc_config_cache.json` und dessen atomare Schreibdatei
+  `.e3dc_config_cache.*` bleiben knotenlokal. Sie werden weder per Push noch
+  Pull übertragen und von der allgemeinen Rechteprojektion nicht verändert.
+- Die gefilterte HA-Konfiguration entfernt neben Zugangsdaten und API-Tokens
+  auch `web_pin`. Der V4-Laufzeitcache folgt demselben Schutzmodus wie die
+  Konfiguration: `0660` im Standard- und `0664` im ausdrücklich gewählten
+  Kompatibilitätsmodus.
+- `rule_calm_analysis.json`, `watchdog.update_pause`,
+  `watchdog.update_grace` und `.wallbox_plan_jobs` bleiben ebenfalls lokal.
+  Die Pull-Härtung folgt keinen Symlinks und überschreitet keine
+  Dateisystemgrenze. Reguläre synchronisierte Dateien behalten den gemeinsamen
+  HA-Rechtevertrag.
+- `e3dc_stats.db` wird weiterhin bewusst zwischen den Knoten repliziert. Das
+  umfasst auch gespeicherte WebPush-Abonnements; die Lokalitätszusage dieses
+  Releases gilt deshalb ausschließlich für Konfigurations- und
+  Matter-Geheimnisse.
+- Der HA-Abgleich verwendet kein `--delete`. Bereits vor 5.4.3i auf den Partner
+  kopierte Dateien werden durch die neuen Ausschlüsse nicht automatisch
+  entfernt. Bei früherer HA-Nutzung müssen beide Knoten geprüft und betroffene
+  Zugangsdaten, die Web-PIN oder die Matter-Kopplung rotiert werden, falls
+  vertrauliche Kopien auf dem jeweils anderen Knoten lagen.
+- Matter-Fabric und Pairingzustand bleiben knotenlokal. Ein Standby-Knoten muss
+  bei Bedarf separat gekoppelt werden; ein transparentes Fabric-Failover ist
+  nicht Bestandteil dieses Releases.
+
+## openWB Pro
+
+- Eine dauerhafte Startablehnung wird erst nach der vollständig belegten,
+  typisierten Wake-up-Episode ausgelöst. Konfiguriert sind ein bis drei
+  Versuche; Standard sind drei. Bei bewusst gewähltem Wert `1` darf bereits der
+  erste vollständig belegte Versuch weitere automatische Starts derselben
+  Stecksession sperren.
+- Boolesche, nicht endliche und nicht ganzzahlige Konfigurationswerte sind
+  ungültig und fallen einheitlich auf den Standardwert drei zurück. Wake-up-
+  Planung und Startablehnung verwenden denselben Parservertrag. Receipt,
+  aktuelle Stromfreigabe, Stecksession und Zeitkette müssen zusammenpassen.
+- Bei zwei oder drei konfigurierten Versuchen sperrt ein einzelner erfolgloser
+  Versuch die Ladung nicht bis zum nächsten Umstecken. Ein echtes Ab- und
+  Wiederanstecken eröffnet weiterhin eine neue Session.
+- Die kurze sichere 0-A-/CP-Beruhigung und der 480-Sekunden-Schutz bleiben
+  unverändert: Die Sperre verhindert nur einen weiteren Phasenwechsel, nicht
+  den bestätigten Wiederanlauf oder die laufende Stromregelung.
+- Veraltete Episodendiagnose wird auch in Mode 0 und in gemischten
+  Mehr-Wallbox-Ansichten entfernt.
+- Nutzer-`Aus`, Budget-, Reserve-, Datenfrische- und Hardwaregrenzen bleiben
+  unverändert vorrangig.
+
+---
+
 # E3DC-Control v5.4.3h
 
 E3DC-Control 5.4.3h behebt den letzten reproduzierten Abbruch beim Update

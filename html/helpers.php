@@ -2349,6 +2349,58 @@ function e3dcWallboxSessionCsvAggregate(
     return $aggregate;
 }
 
+function e3dcRemoveConfigCacheFailClosed($cacheFile) {
+    if (!file_exists($cacheFile) && !is_link($cacheFile)) return true;
+    if (@unlink($cacheFile)) return true;
+    error_log('E3DC-Konfigurationscache konnte nicht sicher entfernt werden.');
+    return false;
+}
+
+function e3dcConfigCacheMetadataMatches($cacheFile, $expectedMode) {
+    $meta = @lstat($cacheFile);
+    if (!is_array($meta)) return false;
+    if ((((int)$meta['mode']) & 0170000) !== 0100000) return false;
+    if ((int)($meta['nlink'] ?? 0) !== 1) return false;
+    if ((((int)$meta['mode']) & 0777) !== (int)$expectedMode) return false;
+    if (function_exists('posix_geteuid') && (int)$meta['uid'] !== (int)posix_geteuid()) return false;
+    if (function_exists('posix_getegid') && (int)$meta['gid'] !== (int)posix_getegid()) return false;
+    return true;
+}
+
+function e3dcWriteConfigCacheSecurely($cacheFile, $cacheBody, $configData) {
+    if (!is_string($cacheBody)) return e3dcRemoveConfigCacheFailClosed($cacheFile);
+    $expectedMode = e3dcConfigSecretFileModeFromData($configData);
+    if (
+        e3dcConfigCacheMetadataMatches($cacheFile, $expectedMode)
+        && @file_get_contents($cacheFile) === $cacheBody
+    ) {
+        return true;
+    }
+
+    $cacheDir = dirname($cacheFile);
+    $tmpFile = @tempnam($cacheDir, '.e3dc_config_cache.');
+    $ok = is_string($tmpFile) && dirname($tmpFile) === $cacheDir;
+    if ($ok) {
+        $written = @file_put_contents($tmpFile, $cacheBody, LOCK_EX);
+        $ok = $written === strlen($cacheBody);
+    }
+    if ($ok) $ok = @chmod($tmpFile, $expectedMode);
+    if ($ok) $ok = e3dcConfigCacheMetadataMatches($tmpFile, $expectedMode);
+    if ($ok) $ok = @rename($tmpFile, $cacheFile);
+    if ($ok) {
+        $tmpFile = null;
+        $ok = e3dcConfigCacheMetadataMatches($cacheFile, $expectedMode)
+            && @file_get_contents($cacheFile) === $cacheBody;
+    }
+    if (is_string($tmpFile) && (file_exists($tmpFile) || is_link($tmpFile))) {
+        @unlink($tmpFile);
+    }
+    if ($ok) return true;
+
+    error_log('E3DC-Konfigurationscache konnte nicht atomar und geschützt veröffentlicht werden.');
+    return e3dcRemoveConfigCacheFailClosed($cacheFile);
+}
+
 /**
  * Lädt die E3DC-Konfiguration aus e3dc_v4.json (Single Source of Truth).
  * e3dc.config.txt wird nicht mehr gelesen.
@@ -2357,6 +2409,7 @@ function loadE3dcConfig($basePath = null) {
     static $requestMemo = [];
 
     $v4Path = '/var/www/html/data/e3dc_v4.json';
+    $cacheFile = '/var/www/html/ramdisk/e3dc_config_cache.json';
     $memoGeneration = e3dcConfigRequestMemoGeneration($v4Path);
     if (isset($requestMemo[$memoGeneration]) && is_array($requestMemo[$memoGeneration])) {
         return $requestMemo[$memoGeneration];
@@ -2365,15 +2418,15 @@ function loadE3dcConfig($basePath = null) {
     // Pro Request wird ausschließlich die aktuelle Dateigeneration gehalten.
     // Ein erfolgreicher Schreibpfad erhöht zusätzlich den lokalen Memo-Epoch.
     $requestMemo = [];
-    $cacheFile = '/var/www/html/ramdisk/e3dc_config_cache.json';
-
     $v4Raw = e3dcReadRegularFileBound($v4Path, 1048576);
     if (!is_string($v4Raw)) {
+        e3dcRemoveConfigCacheFailClosed($cacheFile);
         $result = ['error' => errorMessage('Konfiguration fehlt', 'e3dc_v4.json nicht gefunden unter ' . $v4Path), 'config' => []];
         $requestMemo[$memoGeneration] = $result;
         return $result;
     }
     if (strlen($v4Raw) < 2) {
+        e3dcRemoveConfigCacheFailClosed($cacheFile);
         $result = ['error' => errorMessage('Konfigurationsfehler', 'e3dc_v4.json besitzt keine zulässige Größe.'), 'config' => []];
         $requestMemo[$memoGeneration] = $result;
         return $result;
@@ -2384,12 +2437,14 @@ function loadE3dcConfig($basePath = null) {
     // jedem PHP-Aufruf erneut geparst.
     $v4_mtime = @filemtime($v4Path);
     if ($v4_mtime === false) {
+        e3dcRemoveConfigCacheFailClosed($cacheFile);
         $result = ['error' => errorMessage('Konfigurationsfehler', 'e3dc_v4.json kann nicht sicher geprüft werden.'), 'config' => []];
         $requestMemo[$memoGeneration] = $result;
         return $result;
     }
     $v4Data = @json_decode($v4Raw, true);
     if (!is_array($v4Data)) {
+        e3dcRemoveConfigCacheFailClosed($cacheFile);
         $result = ['error' => errorMessage('Konfigurationsfehler', 'e3dc_v4.json ist kein gültiges JSON.'), 'config' => []];
         $requestMemo[$memoGeneration] = $result;
         return $result;
@@ -2405,15 +2460,22 @@ function loadE3dcConfig($basePath = null) {
     // Der Spiegel liegt in tmpfs und wird nur bei einer echten Änderung
     // erneuert. Er bleibt reine Projektion und niemals Auth-Autorität.
     $cacheBody = json_encode(['mtime' => (string)$v4_mtime, 'config' => $config]);
-    if (is_string($cacheBody) && @file_get_contents($cacheFile) !== $cacheBody) {
-        @file_put_contents($cacheFile, $cacheBody, LOCK_EX);
-        @chmod($cacheFile, 0664);
+    if (!e3dcWriteConfigCacheSecurely($cacheFile, $cacheBody, $v4Data)) {
+        $result = ['error' => errorMessage('Konfigurationsschutz', 'Der lokale Konfigurationscache konnte nicht sicher veröffentlicht oder entfernt werden.'), 'config' => []];
+        $requestMemo[$memoGeneration] = $result;
+        return $result;
     }
 
     $result = ['error' => null, 'config' => $config];
+    $stableRaw = e3dcReadRegularFileBound($v4Path, 1048576);
     $stableGeneration = e3dcConfigRequestMemoGeneration($v4Path);
-    if ($stableGeneration === $memoGeneration) {
+    if ($stableRaw === $v4Raw && $stableGeneration === $memoGeneration) {
         $requestMemo[$memoGeneration] = $result;
+    } elseif (!e3dcRemoveConfigCacheFailClosed($cacheFile)) {
+        return [
+            'error' => errorMessage('Konfigurationsschutz', 'Ein Cache einer überholten Konfigurationsgeneration konnte nicht sicher entfernt werden.'),
+            'config' => [],
+        ];
     }
     return $result;
 }

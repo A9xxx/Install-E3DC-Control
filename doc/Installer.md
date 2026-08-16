@@ -1,16 +1,20 @@
 # E3DC-Control Installer
 
-Dokumentation Stand: 5.4.3h
+Dokumentation Stand: 5.4.3i
 
 Der Installer verwaltet Bare-Metal-Installation, Update, Rechte, Dienste,
 Backup, Rollback und optionale Produktmodule. Er ermittelt Benutzer, Home,
 Installationspfad und Python-Umgebung aus dem geprüften Installationskontext.
 
-Mit 5.4.3h darf die Weboberfläche das reguläre System-Update wieder über
+Mit 5.4.3i darf die Weboberfläche das reguläre System-Update wieder über
 einen argumentlosen, root-eigenen Launcher starten. Freie Aktionen, Pfade,
 Tags, Reparaturen, Neuinstallationen und Rückfälle bleiben im Web gesperrt.
 Installationen bis einschließlich 5.4.3f benötigen für diesen einmaligen
 Übergang noch den administrativen Konsolenweg aus [Update.md](Update.md).
+Beim Zielübergang aus älteren 5.4.2-Beständen wird der Installationsnutzer aus
+der kanonischen Repository-Eigentümerstruktur gebunden und unmittelbar vor dem
+versiegelten Kindstart erneut geprüft; eine lokale Installer-Konfigurationsdatei
+im Snapshot ist dafür nicht erforderlich.
 
 Seit 5.4.2d bewertet der Updatepfad den Wiederanlauf erforderlicher Dienste
 anhand des belegten systemd-Endzustands. Nicht installierte optionale Units

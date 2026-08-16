@@ -1,15 +1,18 @@
 # Betrieb des E3DC-Control Installers
 
-Dokumentation Stand: 5.4.3h
+Dokumentation Stand: 5.4.3i
 
 Der Installer ist der freigegebene Einstieg für Installation, Update,
 Reparatur, Backup, Rollback und Deinstallation. Die vollständige Bedienung ist
 in [E3DC-Control Installer](Installer.md) beschrieben.
 
-5.4.3h richtet einen argumentlosen, root-eigenen Web-Update-Launcher ein. Er
+5.4.3i richtet einen argumentlosen, root-eigenen Web-Update-Launcher ein. Er
 bindet Installationspfad, Installationsnutzer und veröffentlichten Ausgangstag;
 freie Aktionen und Zielparameter bleiben gesperrt. Der erste Wechsel von
-5.4.3f auf 5.4.3h erfolgt noch über die administrative Konsole.
+5.4.3f auf 5.4.3i erfolgt noch über die administrative Konsole.
+Ältere 5.4.2-Zielübergänge binden den lokalen Installationsnutzer zusätzlich
+aus der kanonischen Repository-Eigentümerstruktur und prüfen diese unmittelbar
+vor dem versiegelten Kindstart erneut.
 
 ## Start
 

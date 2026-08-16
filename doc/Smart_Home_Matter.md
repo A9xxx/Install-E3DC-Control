@@ -47,6 +47,19 @@ keine Kopplungen und verlangt keinen Werksreset. Lösche
 `/var/www/html/data/matter-storage` nur über den ausdrücklich bestätigten
 Werksreset in der Weboberfläche.
 
+In einem HA-Verbund bleiben dieser private Storage, die Pairingdatei
+`/var/www/html/ramdisk/matter_pairing.json` und ihre temporäre Schreibdatei
+knotenlokal. Sie werden nicht über den allgemeinen Datensync übertragen. Ein
+Standby-Knoten benötigt daher bei Bedarf eine eigene Matter-Kopplung; ein
+transparentes Fabric-Failover ist derzeit nicht Bestandteil des HA-Vertrags.
+
+Der HA-Abgleich arbeitet ohne `--delete`. Neue Ausschlüsse entfernen deshalb
+keine Matter-Dateien, die eine frühere Version bereits auf den Partner kopiert
+hat. Wenn HA schon vor 5.4.3i aktiv war, prüfe beide Knoten. Entferne eine alte
+Kopie erst nach eindeutiger Zuordnung und Sicherung des weiterhin benötigten
+Originals; war Pairing- oder Fabric-Material auf dem anderen Knoten vorhanden,
+kopple Matter bei Bedarf neu.
+
 Eine spätere Umstellung auf die neue native `ServerNode`-API wird getrennt
 angekündigt: Deren Storageformat ist laut Matter.js-Migrationsvertrag nicht mit
 der bisherigen Geräte-API kompatibel und erfordert eine neue Kopplung.

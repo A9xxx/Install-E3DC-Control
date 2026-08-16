@@ -115,7 +115,7 @@ $paths = getInstallPaths();
     <div class="container">
         <div class="d-flex justify-content-between align-items-center mb-4">
             <a href="index.php" class="nav-link-back"><i class="fas fa-arrow-left me-2"></i>Dashboard</a>
-            <span class="badge bg-success text-light">v5.4.3h Stable</span>
+            <span class="badge bg-success text-light">v5.4.3i Stable</span>
         </div>
         <h1 class="display-4 fw-bold">Hilfe & Support</h1>
         <p class="lead opacity-75">Häufige Fragen und Lösungen rund um E3DC-Control.</p>
@@ -134,7 +134,7 @@ $paths = getInstallPaths();
         <div class="col-12 faq-item" data-tags="docker image stable rollback update">
             <div class="card bg-card border-0 shadow-sm"><div class="card-body">
                 <h5 class="card-title"><span class="tag">Docker</span> Wie prüfe ich Image und Update?</h5>
-                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem geprüften Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.3h</code> in <code>.env</code> gesetzt.</p>
+                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem geprüften Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.3i</code> in <code>.env</code> gesetzt.</p>
                 <pre>cd "${E3DC_DOCKER_PATH:-$HOME/e3dc-docker}"
 if [ -f ./docker_compose_update.py ]; then
   E3DC_DOCKER_HELPER=./docker_compose_update.py
@@ -216,21 +216,21 @@ sudo docker compose logs --tail=80 e3dc-control</pre>
             </div>
         </div>
 
-        <h4 class="mb-4 text-accent"><i class="fas fa-shield-halved me-2"></i>Stable 5.4.3h: Bestands-venv, Web-Update und Matter</h4>
-        <div class="col-12 faq-item" data-tags="5.4.3h stable web update launcher matter node npm konsole venv root">
+        <h4 class="mb-4 text-accent"><i class="fas fa-shield-halved me-2"></i>Stable 5.4.3i: Update, HA und openWB Pro</h4>
+        <div class="col-12 faq-item" data-tags="5.4.3i stable update ha matter openwb pro phasen wake-up konsole">
             <div class="card bg-card border-0 shadow-sm">
                 <div class="card-body">
                     <h5 class="card-title">
-                        <span class="tag">5.4.3h</span>
-                        Was bringt das Stable-Release 5.4.3h?
+                        <span class="tag">5.4.3i</span>
+                        Was bringt das Stable-Release 5.4.3i?
                     </h5>
                     <ul>
-                        <li><strong>Web-Update:</strong> Das Dashboard darf nur einen argumentlosen, root-eigenen Systemjob starten. Pfad, Installationsnutzer, Ausgangscommit und veröffentlichter Stable-Tag werden erneut gebunden; freie Aktionen, Pfade, Tags, Reparaturen und Rückfälle bleiben gesperrt.</li>
-                        <li><strong>Bestands-venv:</strong> Historisch root-installierte Paketpfade werden ohne Eigentümerwechsel akzeptiert, wenn sie nicht welt- oder über eine fremde Gruppe beschreibbar sind. Fremde UIDs und unsichere Metadaten bleiben gesperrt.</li>
-                        <li><strong>Einmaliger Übergang:</strong> Installationen bis einschließlich 5.4.3f besitzen den Launcher noch nicht. Der erste Wechsel auf 5.4.3h erfolgt daher über die administrative Konsole; danach steht der Dashboard-Weg bereit.</li>
-                        <li><strong>Python-venv:</strong> Der Standardlink <code>lib64 -&gt; lib</code> bleibt nur bei passendem Ziel-, Eigentümer- und ACL-Vertrag updatefähig. Fremde oder manipulierte Links bleiben gesperrt.</li>
-                        <li><strong>Matter:</strong> Die Bridge nutzt die offizielle Kompatibilitätsschicht 0.12.6 und Node.js ab Version 18. Installation erfolgt reproduzierbar aus der Lockdatei; vorhandener Matter-Storage und bestehende Kopplungen bleiben erhalten.</li>
-                        <li><strong>Regelung:</strong> Speicher-, Wallbox-, Wärme- und Direktvermarktungslogik entsprechen unverändert 5.4.3f.</li>
+                        <li><strong>Altübergang:</strong> Ein älterer 5.4.2-Bestand bindet den lokalen Installationsnutzer aus der Repository-Eigentümerstruktur und reicht ihn sicher an den Ziel-Finalizer weiter.</li>
+                        <li><strong>HA-Geheimnisse:</strong> Pairingdatei samt temporärer Schreibdatei, Matter-Storage, Config-Backups, <code>e3dc.config.txt</code>, V4-Temp-/Backup-Dateien und V4-Cache bleiben knotenlokal. Die Web-PIN wird nicht in die gefilterte Partnerkonfiguration übernommen; der Cache folgt dem Schutzmodus <code>0660</code>/<code>0664</code>.</li>
+                        <li><strong>HA-Altbestände:</strong> Der Sync arbeitet ohne <code>--delete</code>. Wer HA bereits vor 5.4.3i genutzt hat, prüft deshalb beide Knoten auf alte Kopien und rotiert betroffene Zugangsdaten, Web-PIN oder Matter-Kopplung. <code>e3dc_stats.db</code> samt WebPush-Abonnements bleibt bewusst repliziert.</li>
+                        <li><strong>openWB Pro:</strong> Ein bis drei Wake-up-Versuche sind möglich, Standard sind drei. Bei Einstellung <code>1</code> darf der erste vollständig belegte Versuch sperren. Boolesche, nicht endliche oder nicht ganzzahlige Werte sind ungültig und fallen in beiden Pfaden auf drei zurück. Nach einem sicheren Phasenwechsel läuft der Strom wieder an; die 480-Sekunden-Sperre schützt nur vor einem weiteren Phasenwechsel.</li>
+                        <li><strong>Einmaliger Übergang:</strong> Installationen bis einschließlich 5.4.3f besitzen den Launcher noch nicht. Der erste Wechsel auf 5.4.3i erfolgt daher über die administrative Konsole; danach steht der Dashboard-Weg bereit.</li>
+                        <li><strong>Regelung:</strong> Speicher-, Wärme- und Direktvermarktungslogik entsprechen unverändert 5.4.3h.</li>
                     </ul>
                 </div>
             </div>

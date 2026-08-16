@@ -5976,6 +5976,29 @@ def _priority_target_connected(chargers, valid_chargers_status, priority_mode):
     return False
 
 
+_OPENWB_PRO_START_REJECT_EPISODE_STATUS_KEYS = (
+    "openwb_pro_start_reject_episode_contract",
+    "openwb_pro_start_reject_episode_complete",
+    "openwb_pro_start_reject_episode_attempts",
+    "openwb_pro_start_reject_episode_max_attempts",
+)
+
+
+def _clear_stale_openwb_pro_start_reject_episode_status(c_data, status):
+    """Entfernt reine Episodendiagnose ohne aktuellen Manager-Vertrag."""
+    if not isinstance(status, dict):
+        return False
+    if isinstance(
+        (c_data or {}).get("_openwb_pro_start_reject_episode_contract"),
+        dict,
+    ):
+        return False
+    changed = False
+    for key in _OPENWB_PRO_START_REJECT_EPISODE_STATUS_KEYS:
+        changed = status.pop(key, None) is not None or changed
+    return changed
+
+
 def _build_wallbox_detail_list(
     chargers,
     valid_chargers_status,
@@ -6027,6 +6050,7 @@ def _build_wallbox_detail_list(
         except Exception:
             c_id = len(details) + 1
         st = status_by_id.get(c_id)
+        _clear_stale_openwb_pro_start_reject_episode_status(c_data, st)
         stop_display_state = _manager_stop_display_state(c_data)
         charge_contract = _wallbox_detail_charge_contract(
             st,
@@ -6379,6 +6403,10 @@ def _build_wallbox_detail_list(
                 "openwb_pro_temporary_stop_state_hint",
                 "openwb_pro_temporary_stop_waiting",
                 "openwb_pro_start_retry_guard_contract",
+                "openwb_pro_start_reject_episode_contract",
+                "openwb_pro_start_reject_episode_complete",
+                "openwb_pro_start_reject_episode_attempts",
+                "openwb_pro_start_reject_episode_max_attempts",
                 "openwb_pro_manager_zero_anchor_release_contract",
                 "openwb_pro_start_liveness_contract", "openwb_pro_start_liveness_state",
                 "openwb_pro_start_liveness_code", "openwb_pro_start_liveness_alert",
@@ -12036,6 +12064,7 @@ _OPENWB_PRO_START_SESSION_KEYS = (
     "_openwb_pro_start_wakeup_count",
     "_openwb_pro_start_wakeup_allowed_after",
     "_openwb_pro_start_wakeup_pending",
+    "_openwb_pro_start_reject_episode_contract",
     "_openwb_pro_start_phase_target",
     "_openwb_pro_unserved_since",
     "_openwb_pro_unserved_pause_since",
@@ -12056,6 +12085,7 @@ _WALLBOX_START_REJECT_EPISODE_KEYS = (
     "_openwb_pro_start_wakeup_count",
     "_openwb_pro_start_wakeup_allowed_after",
     "_openwb_pro_start_wakeup_pending",
+    "_openwb_pro_start_reject_episode_contract",
     "_openwb_pro_start_phase_target",
     "_openwb_pro_unserved_since",
     "_openwb_pro_unserved_pause_since",
@@ -12200,6 +12230,126 @@ def _openwb_pro_start_reject_anchor(
     if typed_current_session_receipt:
         anchor = max(anchor, receipt_sent_ts)
     return anchor
+
+
+def _openwb_pro_start_reject_episode_contract(
+    c_data,
+    config=None,
+    *,
+    now_ts=None,
+):
+    """Beweist die vollständig verbrauchte CP-Wake-up-Episode.
+
+    Ein einzelner positiver Strom-Retry und das Legacy-Flag
+    ``_openwb_cp_start_sent`` sind kein Beleg dafür, dass die für diese
+    Stecksession vorgesehenen Wake-up-Versuche vollständig abgearbeitet
+    wurden. Der persistente ``start_rejected``-Latch darf deshalb nur auf den
+    typisierten, an Stromauftrag und Stecksession gebundenen CP-Receipt
+    vertrauen.
+    """
+
+    data = c_data if isinstance(c_data, dict) else {}
+    cfg = config if isinstance(config, dict) else {}
+    now_value = _cfg_float(now_ts, 0.0)
+    if not math.isfinite(now_value) or now_value <= 0.0:
+        now_value = time.time()
+    max_retries = openwb_pro_session.start_cp_retry_limit(cfg)
+
+    plug_session_id = str(data.get("_openwb_pro_plug_session_id") or "")
+    issued_session_id = str(
+        data.get("_openwb_pro_start_current_session_id") or ""
+    )
+    issued_ts = _cfg_float(
+        data.get("_openwb_pro_start_current_issued_ts"),
+        0.0,
+    )
+    receipt = data.get("_openwb_pro_start_wakeup_receipt")
+    receipt = receipt if isinstance(receipt, dict) else {}
+    receipt_session_id = str(receipt.get("plug_session_id") or "")
+    receipt_current_ts = _cfg_float(receipt.get("current_issued_ts"), 0.0)
+    first_sent_ts = _cfg_float(receipt.get("first_sent_ts"), 0.0)
+    last_sent_ts = _cfg_float(receipt.get("last_sent_ts"), 0.0)
+    try:
+        raw_sent_count = receipt.get("count", 0)
+        if isinstance(raw_sent_count, bool):
+            raise ValueError("bool is not a receipt count")
+        numeric_sent_count = float(raw_sent_count)
+        if (
+            not math.isfinite(numeric_sent_count)
+            or not numeric_sent_count.is_integer()
+        ):
+            raise ValueError("receipt count is not an integer")
+        sent_count = int(numeric_sent_count)
+    except (TypeError, ValueError, OverflowError):
+        sent_count = -1
+    try:
+        legacy_current_retry_count = max(
+            0,
+            int(_cfg_float(data.get("_openwb_start_retry_count"), 0.0)),
+        )
+    except (TypeError, ValueError, OverflowError):
+        legacy_current_retry_count = 0
+
+    session_bound = bool(
+        plug_session_id
+        and issued_session_id == plug_session_id
+        and receipt_session_id == plug_session_id
+    )
+    current_receipt_bound = bool(
+        math.isfinite(issued_ts)
+        and math.isfinite(receipt_current_ts)
+        and issued_ts > 0.0
+        and receipt_current_ts == issued_ts
+    )
+    timestamp_chain_valid = bool(
+        current_receipt_bound
+        and math.isfinite(first_sent_ts)
+        and math.isfinite(last_sent_ts)
+        and first_sent_ts >= issued_ts
+        and last_sent_ts >= first_sent_ts
+        and last_sent_ts <= now_value
+    )
+    count_valid = bool(0 <= sent_count <= 3)
+    complete = bool(
+        str(receipt.get("schema") or "")
+        == "openwb_pro_start_wakeup_receipt_v1"
+        and session_bound
+        and timestamp_chain_valid
+        and count_valid
+        and sent_count >= max_retries
+    )
+
+    if complete:
+        reason = "bounded_cp_attempts_consumed"
+    elif not plug_session_id:
+        reason = "plug_session_missing"
+    elif issued_session_id != plug_session_id or issued_ts <= 0.0:
+        reason = "positive_current_receipt_not_session_bound"
+    elif str(receipt.get("schema") or "") != "openwb_pro_start_wakeup_receipt_v1":
+        reason = "typed_cp_receipt_missing"
+    elif not session_bound:
+        reason = "cp_receipt_session_mismatch"
+    elif not timestamp_chain_valid:
+        reason = "cp_receipt_timestamp_mismatch"
+    elif not count_valid:
+        reason = "cp_receipt_count_invalid"
+    else:
+        reason = "bounded_cp_attempts_pending"
+
+    return {
+        "contract": "openwb_pro_start_reject_episode_v1",
+        "complete": complete,
+        "reason": reason,
+        "plug_session_id": plug_session_id,
+        "session_bound": session_bound,
+        "current_receipt_bound": current_receipt_bound,
+        "timestamp_chain_valid": timestamp_chain_valid,
+        "sent_count": max(0, sent_count),
+        "max_retries": max_retries,
+        "remaining_retries": max(0, max_retries - max(0, sent_count)),
+        "legacy_cp_sent": bool(data.get("_openwb_cp_start_sent", False)),
+        "legacy_current_retry_count": legacy_current_retry_count,
+    }
 
 
 def _mark_openwb_pro_start_offer(
@@ -15347,6 +15497,24 @@ def _latch_wallbox_start_rejected_hold(
         now_ts=now_value,
     )
     result.update(enforced)
+    if openwb_pro_session.is_openwb_pro_charger(data.get("charger")):
+        # Der persistente Latch ist ab hier die autoritative Wahrheit. Der
+        # aufrufende Managerzweig beendet den Zyklus unmittelbar mit
+        # ``continue``; ohne diese gleichzyklische Neuprojektion bliebe in der
+        # Web-/Statusfläche fälschlich der zuvor berechnete Zustand
+        # ``starting`` sichtbar.
+        data["current_set_amp"] = 0
+        data["cap_amp"] = 0
+        data["is_charging"] = False
+        _evaluate_openwb_pro_session_for_manager(
+            data,
+            st,
+            cap_amp=0,
+            budget_ready=False,
+            mode_off=int(public_mode or 0) <= 0,
+            now_ts=now_value,
+            stable_hw_power_w=_wb_status_real_power(st),
+        )
     if not result.get("persisted", False):
         result["blocker"] = str(
             data.get("_charge_end_persist_failed")
@@ -16537,8 +16705,37 @@ def _evaluate_openwb_pro_session_for_manager(
                 c_data[key] = value
     c_data["_openwb_pro_start_liveness_contract"] = liveness
     session["start_liveness"] = liveness
+    start_reject_episode = (c_data or {}).get(
+        "_openwb_pro_start_reject_episode_contract"
+    )
+    if isinstance(start_reject_episode, dict):
+        session["start_reject_episode"] = dict(start_reject_episode)
+        session["start_reject_episode_complete"] = bool(
+            start_reject_episode.get("complete", False)
+        )
+    else:
+        session.pop("start_reject_episode", None)
+        session.pop("start_reject_episode_complete", None)
     if status is not None:
         openwb_pro_session.apply_session_to_status(status, session)
+        if isinstance(start_reject_episode, dict):
+            status["openwb_pro_start_reject_episode_contract"] = dict(
+                start_reject_episode
+            )
+            status["openwb_pro_start_reject_episode_complete"] = bool(
+                start_reject_episode.get("complete", False)
+            )
+            status["openwb_pro_start_reject_episode_attempts"] = int(
+                start_reject_episode.get("sent_count", 0) or 0
+            )
+            status["openwb_pro_start_reject_episode_max_attempts"] = int(
+                start_reject_episode.get("max_retries", 0) or 0
+            )
+        else:
+            _clear_stale_openwb_pro_start_reject_episode_status(
+                c_data,
+                status,
+            )
         finished_contract = (c_data or {}).get("_openwb_pro_vehicle_finished_contract")
         if isinstance(finished_contract, dict):
             openwb_pro_session.apply_vehicle_finished_drop_to_status(status, finished_contract)
@@ -25314,10 +25511,25 @@ def run():
                         start_reject_guard_supported = (
                             _wallbox_start_rejected_hold_supported(c_data)
                         )
-                        start_reject_openwb_wakeup_done = bool(
+                        start_reject_openwb_episode = (
+                            _openwb_pro_start_reject_episode_contract(
+                                c_data,
+                                config,
+                                now_ts=now_ts,
+                            )
+                            if openwb_pro
+                            else {}
+                        )
+                        if openwb_pro:
+                            c_data[
+                                "_openwb_pro_start_reject_episode_contract"
+                            ] = dict(start_reject_openwb_episode)
+                        start_reject_openwb_episode_complete = bool(
                             openwb_pro
-                            and c_data.get("_openwb_cp_start_sent", False)
-                            and int(c_data.get("_openwb_start_retry_count", 0) or 0) >= 1
+                            and start_reject_openwb_episode.get(
+                                "complete",
+                                False,
+                            )
                         )
                         start_reject_context_allows_soft_stop = bool(
                             (
@@ -25326,7 +25538,7 @@ def run():
                                 and not price_boost_wallbox_active
                                 and not predump_wallbox_active
                             )
-                            or start_reject_openwb_wakeup_done
+                            or start_reject_openwb_episode_complete
                         )
                         phase_transition_pending_for_start_reject = _phase_transition_pending_for_start_reject(
                             c_data,
@@ -25347,6 +25559,10 @@ def run():
                             and start_reject_age_s >= start_reject_timeout_s
                             and now_ts - float(c_data.get("_last_manager_stop_request_ts", 0.0) or 0.0) >= start_reject_timeout_s
                             and start_reject_context_allows_soft_stop
+                            and (
+                                not openwb_pro
+                                or start_reject_openwb_episode_complete
+                            )
                         ):
                             start_rejected_hold = (
                                 _latch_wallbox_start_rejected_hold(
@@ -30373,6 +30589,10 @@ def run():
                             if v['id'] == c_id:
                                 st = v['status']
                                 break
+                        _clear_stale_openwb_pro_start_reject_episode_status(
+                            c_data,
+                            st,
+                        )
                         if _wb_status_connected(st):
                             _stop_display_state = _manager_stop_display_state(c_data)
                             _charge_contract = _wallbox_detail_charge_contract(
@@ -30651,6 +30871,10 @@ def run():
                                 'openwb_pro_temporary_stop_state_hint',
                                 'openwb_pro_temporary_stop_waiting',
                                 'openwb_pro_start_retry_guard_contract',
+                                'openwb_pro_start_reject_episode_contract',
+                                'openwb_pro_start_reject_episode_complete',
+                                'openwb_pro_start_reject_episode_attempts',
+                                'openwb_pro_start_reject_episode_max_attempts',
                                 'openwb_pro_manager_zero_anchor_release_contract',
                                 'openwb_pro_start_liveness_contract', 'openwb_pro_start_liveness_state',
                                 'openwb_pro_start_liveness_code', 'openwb_pro_start_liveness_alert',

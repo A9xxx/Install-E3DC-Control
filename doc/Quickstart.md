@@ -2,15 +2,14 @@
 
 Diese Anleitung fasst die schnellsten Schritte zusammen, um E3DC-Control auf einem frischen Raspberry Pi OS (oder ähnlichem Debian-System) zu installieren.
 
-Aktueller Stable-Stand: `v5.4.3h`.
+Aktueller Stable-Stand: `v5.4.3i`.
 
-5.4.3h enthält das eng gebundene System-Update und die Matter-Härtung aus
-5.4.3g und akzeptiert vertrauenswürdige root-eigene Bestands-venv-Pakete,
-sofern sie nicht welt- oder über eine fremde Gruppe beschreibbar sind. Der
-erste Wechsel von 5.4.3f auf 5.4.3h erfolgt noch
+5.4.3i bindet beim älteren 5.4.2-Zielübergang den lokalen Installationsnutzer,
+hält private HA- und Matter-Daten knotenlokal und vervollständigt den
+openWB-Pro-Startvertrag. Der erste Wechsel von 5.4.3f auf 5.4.3i erfolgt noch
 einmalig über die administrative Konsole; danach steht der feste Web-Launcher
-für normale Updates bereit. Die EMS-Regelung bleibt gegenüber 5.4.3f
-unverändert.
+für normale Updates bereit. Speicher-, Wärme- und DV-Regelung bleiben
+gegenüber 5.4.3h unverändert.
 
 ## Variante A: Klassische Installation (Installer)
 
@@ -220,7 +219,7 @@ Ohne das Label bleibt auch ein versehentlich gestarteter Watchtower für den
 Hauptcontainer wirkungslos. Der oben gezeigte manuelle Host-Helfer bleibt der
 empfohlene Updateweg.
 
-**Docker-Rückfall von v5.4.3h auf den veröffentlichten Docker-Rollback-Root:**
+**Docker-Rückfall von v5.4.3i auf den veröffentlichten Docker-Rollback-Root:**
 ```bash
 (
   set -euo pipefail

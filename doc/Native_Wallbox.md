@@ -60,6 +60,7 @@ wb_openwb_auto_discovery = 1
 wb_openwb_auto_role_enable = 1
 wb_openwb_command_fail_limit = 3
 wb_openwb_command_block_s = 300
+wb_openwb_start_cp_retries = 3   # openWB Pro: 1..3, Standard 3; ungültig -> 3
 ```
 
 Eine alte `e3dc.config.txt` ist nur noch Migration und Legacy-Fallback. Neue
@@ -232,8 +233,10 @@ Pfad bewährt:
   12-V-Batterie schlafen können.
 * **Phasenwechsel mit Haltezeit:** E3DC-Control setzt über `connect.php` nur das
   Ziel (`phasetarget=1` oder `phasetarget=3`). Die Hardware der Pro übernimmt
-  Schütz-Trennung und CP-Ablauf. Der Wallbox-Manager hält danach die
-  konfigurierte Phasenwechsel-Haltezeit, Standard `180 s`.
+  Schütz-Trennung und CP-Ablauf. Nach der kurzen sicheren 0-A-/CP-Beruhigung
+  darf der Strom wieder anlaufen. Der persistente Schutz von mindestens
+  `480 s` sperrt ausschließlich einen weiteren Phasenwechsel; er blockiert
+  weder den bestätigten Wiederanlauf noch die laufende Stromregelung.
 * **1-Phasen-Fallback:** Wenn die Pro oder das Fahrzeug nach einem
   3-phasigen Ziel nicht plausibel auf 3-phasig wechselt, behandelt das System
   die Session als 1-phasig. Das verhindert Endlosschleifen bei Fahrzeugen mit
@@ -241,6 +244,16 @@ Pfad bewährt:
 * **CP-Interrupt nur als Weckruf:** `cp_interrupt=true` wird nicht für den
   normalen Phasenwechsel genutzt. Er ist ein gezielter Wakeup, wenn ein
   angestecktes Fahrzeug trotz freigegebener Leistung eingeschlafen ist.
+* **Begrenzte Wake-up-Episode:** Je positiver Stromfreigabe sind ein bis drei
+  Wake-up-Versuche konfigurierbar; Standard sind drei. Bei bewusst gewähltem
+  Wert `1` darf bereits der erste vollständig belegte Versuch weitere
+  automatische Starts derselben Stecksession sperren. Bei zwei oder drei
+  Versuchen reicht ein einzelner Fehlversuch dafür nicht aus. Boolesche, nicht
+  endliche und nicht ganzzahlige Werte sind ungültig und fallen auf drei
+  Versuche zurück; Wake-up-Planung und Startablehnung verwenden denselben
+  Parservertrag. Eine dauerhafte Startablehnung benötigt außerdem den
+  typisierten Receipt der vollständig abgearbeiteten Episode. Stecksession,
+  aktuelle Stromfreigabe und Zeitkette müssen exakt zusammenpassen.
 
 ### openWB Software 2.x als Primary
 

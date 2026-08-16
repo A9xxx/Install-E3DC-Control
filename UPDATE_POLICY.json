@@ -1,9 +1,9 @@
 {
-  "version": "5.4.3g",
+  "version": "5.4.3h",
   "min_version": "4.0.0",
-  "stable_release": "v5.4.3g",
+  "stable_release": "v5.4.3h",
   "release_date": "2026-08-16",
-  "description": "v5.4.3g - Sicheres Web-Update und Matter-Härtung",
+  "description": "v5.4.3h - Bestands-venv mit vertrauenswürdigem Root-Besitz",
   "installer_requires": "python3",
   "sanitized_republication": false,
   "history_transition": {

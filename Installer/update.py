@@ -54,6 +54,7 @@ from .installer_config import (
 )
 from .transition_context import (
     venv_directory_chain_is_trusted,
+    venv_group_is_private,
     venv_has_extended_acl,
     venv_metadata_is_trusted,
 )
@@ -3142,7 +3143,9 @@ def _harden_existing_release_venv(
     mit 0775/0664. Das war für den damaligen Betrieb ausreichend, widerspricht
     aber dem heutigen Interpreter-Vertrag. Die Migration entfernt nur
     Schreibrechte für Gruppe und Andere; Eigentümer, Lese-/Ausführungsbits und
-    Symlinkziele bleiben unverändert.
+    Symlinkziele bleiben unverändert. Historisch root-installierte Pakete sind
+    dabei ebenso vertrauenswürdig wie Pfade des gebundenen Installationsnutzers;
+    andere Eigentümer bleiben gesperrt.
     """
 
     try:
@@ -3169,6 +3172,7 @@ def _harden_existing_release_venv(
 
     allowed_link_names = {"bin/python", "bin/python3"}
     entries: list[tuple[Path, os.stat_result]] = []
+    entry_paths: set[Path] = set()
     for directory, dirnames, filenames in os.walk(
         target,
         topdown=True,
@@ -3221,43 +3225,77 @@ def _harden_existing_release_venv(
                 raise RuntimeError(
                     f"venv-Rechtemigration verweigert erweiterte ACLs: {relative}"
                 )
-            if metadata.st_uid != account.pw_uid:
+            if metadata.st_uid not in (0, account.pw_uid):
                 raise RuntimeError(
                     f"venv-Rechtemigration verweigert einen fremden Eigentümer: {relative}"
+                )
+            if metadata.st_mode & stat.S_IWOTH:
+                raise RuntimeError(
+                    f"venv-Rechtemigration verweigert einen weltbeschreibbaren Pfad: {relative}"
+                )
+            if (
+                metadata.st_mode & stat.S_IWGRP
+                and not venv_group_is_private(metadata.st_gid, account.pw_name)
+            ):
+                raise RuntimeError(
+                    f"venv-Rechtemigration verweigert eine fremd beschreibbare Gruppe: {relative}"
                 )
             if stat.S_ISREG(metadata.st_mode) and metadata.st_nlink != 1:
                 raise RuntimeError(
                     f"venv-Rechtemigration verweigert eine mehrfach verlinkte Datei: {relative}"
                 )
-            entries.append((path, metadata))
+            if path not in entry_paths:
+                entries.append((path, metadata))
+                entry_paths.add(path)
 
     for path, before in entries:
         requested_mode = stat.S_IMODE(before.st_mode) & ~0o022
         if requested_mode == stat.S_IMODE(before.st_mode):
             continue
-        current = path.lstat()
-        if (
-            current.st_dev != before.st_dev
-            or current.st_ino != before.st_ino
-            or current.st_uid != before.st_uid
-            or current.st_gid != before.st_gid
-            or stat.S_IFMT(current.st_mode) != stat.S_IFMT(before.st_mode)
-        ):
-            raise RuntimeError("venv-Pfad driftete vor der Rechtemigration")
-        os.chmod(path, requested_mode, follow_symlinks=False)
-        after = path.lstat()
-        if (
-            after.st_dev != before.st_dev
-            or after.st_ino != before.st_ino
-            or after.st_uid != before.st_uid
-            or after.st_gid != before.st_gid
-            or stat.S_IMODE(after.st_mode) != requested_mode
-        ):
-            raise RuntimeError(
-                "venv-Rechtemigration konnte einen Modus nicht verifizieren: "
-                f"{path.relative_to(target)} erwartet={requested_mode:04o} "
-                f"gefunden={stat.S_IMODE(after.st_mode):04o}"
-            )
+        descriptor = -1
+        try:
+            if stat.S_ISDIR(before.st_mode):
+                descriptor = _open_directory_nofollow(path)
+            else:
+                descriptor, _opened = _open_regular_file_nofollow(path)
+            current = os.fstat(descriptor)
+            if (
+                current.st_dev != before.st_dev
+                or current.st_ino != before.st_ino
+                or current.st_uid != before.st_uid
+                or current.st_gid != before.st_gid
+                or current.st_mode != before.st_mode
+                or current.st_nlink != before.st_nlink
+                or venv_has_extended_acl(path)
+            ):
+                raise RuntimeError("venv-Pfad driftete vor der Rechtemigration")
+            os.fchmod(descriptor, requested_mode)
+            after = os.fstat(descriptor)
+            path_after = path.lstat()
+            if (
+                after.st_dev != before.st_dev
+                or after.st_ino != before.st_ino
+                or after.st_uid != before.st_uid
+                or after.st_gid != before.st_gid
+                or stat.S_IFMT(after.st_mode) != stat.S_IFMT(before.st_mode)
+                or after.st_nlink != before.st_nlink
+                or stat.S_IMODE(after.st_mode) != requested_mode
+                or path_after.st_dev != after.st_dev
+                or path_after.st_ino != after.st_ino
+                or path_after.st_uid != after.st_uid
+                or path_after.st_gid != after.st_gid
+                or path_after.st_mode != after.st_mode
+                or path_after.st_nlink != after.st_nlink
+                or venv_has_extended_acl(path)
+            ):
+                raise RuntimeError(
+                    "venv-Rechtemigration konnte einen Modus nicht verifizieren: "
+                    f"{path.relative_to(target)} erwartet={requested_mode:04o} "
+                    f"gefunden={stat.S_IMODE(after.st_mode):04o}"
+                )
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
 
 
 def _apply_verified_package_policy(

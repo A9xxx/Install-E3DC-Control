@@ -1,6 +1,6 @@
 # Speicher-Ladesteuerung - Systemablauf
 
-> **Stand:** v5.4.3g, gegen den Release-Betriebsvertrag geprüft am 2026-08-16
+> **Stand:** v5.4.3h, gegen den Release-Betriebsvertrag geprüft am 2026-08-16
 >
 > **Neu in 5.4.3:** Speicherreserve, Sollkurve, Direktvermarktung und
 > Verbraucherbudgets bleiben getrennt. Ein gemeinsamer Ownervertrag bindet die

@@ -6,6 +6,14 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.3h] – 2026-08-16
+
+### 🧰 Update bestehender Python-Umgebungen
+
+- **Vertrauenswürdiger Root-Besitz blockiert das Update nicht mehr:** Historisch mit `sudo pip` in ein eindeutig gebundenes Benutzer-venv installierte Paketpfade dürfen Root oder dem bestätigten Installationsnutzer gehören. Die Härtung verändert keinen Eigentümer und entfernt ausschließlich Schreibrechte einer nachweislich privaten Gruppe; welt- oder fremd beschreibbare Pfade werden nicht nachträglich als sicher eingestuft.
+- **Fremde venv-Inhalte bleiben gesperrt:** Jede andere UID, fremde beschreibbare Gruppe, erweiterte ACL, Sonderdatei, mehrfach verlinkte reguläre Datei oder nicht freigegebene Symlink-Kante beendet den Releasewechsel weiterhin fail-closed. Geänderte Modi werden am nofollow-gebundenen Objekt ausgeführt und vor sowie nach der Änderung erneut geprüft. Ein abgebrochener Updateversuch stellt den vorherigen Produkt- und Dienststand verifiziert wieder her.
+- **Web-Update und Matter-Härtung aus 5.4.3g bleiben enthalten:** Der argumentlose Root-Launcher, die versiegelte Zielausführung, die 5.4.2-Kompatibilitätsbrücke und Matter 0.12.6 werden unverändert fortgeführt.
+
 ## [5.4.3g] – 2026-08-16
 
 ### 🔐 Web-Update und Python-Umgebung

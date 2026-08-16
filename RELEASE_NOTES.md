@@ -1,3 +1,27 @@
+# E3DC-Control v5.4.3h
+
+E3DC-Control 5.4.3h behebt den letzten reproduzierten Abbruch beim Update
+historischer Benutzer-venvs. Die Web-Update-, Matter- und Docker-Härtungen aus
+5.4.3g bleiben vollständig enthalten.
+
+## Bestands-venv
+
+- Tiefenpfade eines eindeutig gebundenen Benutzer-venv dürfen Root oder dem
+  bestätigten Installationsnutzer gehören. Das entspricht dem bestehenden
+  Runtime-Vertrag für vertrauenswürdige venv-Komponenten.
+- Die Migration ändert keinen Eigentümer. Sie entfernt weiterhin nur
+  Schreibrechte einer nachweislich privaten Gruppe und prüft das nofollow-
+  gebundene Objekt vor sowie nach der Änderung. Welt- oder über eine fremde
+  Gruppe beschreibbare Pfade werden nicht nachträglich als sicher eingestuft.
+- Fremde UIDs, fremde beschreibbare Gruppen, erweiterte ACLs, Sonderdateien,
+  mehrfach verlinkte reguläre Dateien und nicht freigegebene Symlinks bleiben
+  harte Abbruchgründe.
+- Ein fehlgeschlagener Vorgänger-Versuch darf keinen zweiten Updateprozess
+  auslösen; der nächste Versuch beginnt erst nach bestätigtem Rückfall und
+  freiem Transaktionslock.
+
+---
+
 # E3DC-Control v5.4.3g
 
 E3DC-Control 5.4.3g bringt das eng begrenzte System-Update ins Dashboard

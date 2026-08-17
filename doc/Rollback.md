@@ -12,6 +12,16 @@ export E3DC_INSTALL_PATH="/absoluter/pfad/zur/installation"
 test -f "$E3DC_INSTALL_PATH/e3dc-setup"
 ```
 
+## Fehlender Backup-Root im Download-Bootstrap in 5.4.3s
+
+5.4.3s legt im administrativen Root-Download-Bootstrap einen wirklich
+fehlenden kanonischen Backup-Root sicher an. Danach bleibt der Update- und
+Rückfallablauf unverändert: Backup erstellen und prüfen, Dienste stoppen,
+Dateien und Rechte aktualisieren, Dienste starten und ihren Zustand prüfen.
+Ein bereits vorhandener unsicherer oder widersprüchlicher Pfad bleibt
+gesperrt; EMS-, Direktvermarktungs-, Wallbox- und Hardwarelogik ändern sich
+nicht.
+
 ## HA-Rollenanker im Download-Bootstrap in 5.4.3r
 
 5.4.3r darf beim ausdrücklich mit Rolle und Peer gebundenen
@@ -90,7 +100,7 @@ oder einen Prozessabbruch außerhalb des erkannten Fehlerpfads.
 
 ## Programmstand zurücksetzen
 
-Der aktuelle Stable-Stand `v5.4.3r` führt den gebundenen Rückfallvertrag fort.
+Der aktuelle Stable-Stand `v5.4.3s` führt den gebundenen Rückfallvertrag fort.
 
 Beim Rücklauf wird der tatsächliche Dateisystemzustand einer Unit weiterhin
 streng gegen reguläre Unit-Datei, kanonische `/dev/null`-Maske, unerwarteten

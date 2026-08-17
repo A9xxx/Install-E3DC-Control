@@ -1,10 +1,17 @@
 # Betrieb des E3DC-Control Installers
 
-Dokumentation Stand: 5.4.3r
+Dokumentation Stand: 5.4.3s
 
 Der Installer ist der freigegebene Einstieg für Installation, Update,
 Reparatur, Backup, Rollback und Deinstallation. Die vollständige Bedienung ist
 in [E3DC-Control Installer](Installer.md) beschrieben.
+
+Der Installer-Anteil von 5.4.3s legt im administrativen
+Root-Download-Bootstrap einen wirklich fehlenden kanonischen Backup-Root
+sicher an. Danach bleibt der Ablauf unverändert: Backup erstellen und prüfen,
+Dienste stoppen, Dateien und Rechte aktualisieren, Dienste starten und ihren
+Zustand prüfen. EMS-, Direktvermarktungs-, Wallbox- und Hardwarelogik ändern
+sich nicht.
 
 Der Installer-Anteil von 5.4.3r darf beim ausdrücklich mit Rolle und Peer
 gebundenen Download-Bootstrap einen wirklich fehlenden HA-Rollenanker aus

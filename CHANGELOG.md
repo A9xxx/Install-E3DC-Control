@@ -6,6 +6,13 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.3s] – 2026-08-17
+
+### 🔄 Fehlender Backup-Root im Download-Bootstrap
+
+- **Der administrative Root-Bootstrap kann den ersten Sicherungspfad selbst vorbereiten:** Ein wirklich fehlender kanonischer Backup-Root wird sicher angelegt. Ein bereits vorhandener unsicherer oder widersprüchlicher Pfad bleibt ein harter Abbruchgrund.
+- **Der Updateablauf bleibt einfach und eindeutig:** Danach wird das Backup unverändert erstellt und geprüft. Erst anschließend werden Dienste gestoppt, Dateien und Rechte aktualisiert, Dienste gestartet und ihr Zustand geprüft. EMS-, Direktvermarktungs-, Wallbox- und Hardwarelogik ändern sich nicht.
+
 ## [5.4.3r] – 2026-08-17
 
 ### 🔄 HA-Rollenanker im Download-Bootstrap

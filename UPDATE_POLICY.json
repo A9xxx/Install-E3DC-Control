@@ -1,9 +1,9 @@
 {
-  "version": "5.4.3r",
+  "version": "5.4.3s",
   "min_version": "4.0.0",
-  "stable_release": "v5.4.3r",
+  "stable_release": "v5.4.3s",
   "release_date": "2026-08-17",
-  "description": "v5.4.3r - HA-Rollenanker aus gebundener Rolle und Peer nach Backup und Writer-Ruhe",
+  "description": "v5.4.3s - Fehlenden kanonischen Backup-Root im Root-Download-Bootstrap sicher anlegen",
   "installer_requires": "python3",
   "sanitized_republication": false,
   "history_transition": {

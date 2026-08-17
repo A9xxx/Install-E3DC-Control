@@ -1,3 +1,21 @@
+# E3DC-Control v5.4.3s
+
+E3DC-Control 5.4.3s ergänzt ausschließlich die sichere Erzeugung eines
+wirklich fehlenden kanonischen Backup-Roots im administrativen
+Root-Download-Bootstrap. Es enthält keine Änderung an EMS-,
+Direktvermarktungs-, Wallbox- oder Hardwarelogik.
+
+## Kanonischer Backup-Root beim ersten Bootstrap
+
+- Der Root-Download-Bootstrap legt einen wirklich fehlenden kanonischen
+  Backup-Root mit dem vorgeschriebenen Schutz an. Ein bereits vorhandener
+  unsicherer oder widersprüchlicher Pfad bleibt gesperrt.
+- Danach bleibt der Updateablauf unverändert: Backup erstellen und prüfen,
+  Dienste stoppen, Dateien und Rechte aktualisieren, Dienste starten und
+  ihren Zustand prüfen.
+
+---
+
 # E3DC-Control v5.4.3r
 
 E3DC-Control 5.4.3r ergänzt ausschließlich die Erzeugung eines wirklich

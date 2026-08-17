@@ -2,7 +2,13 @@
 
 Diese Anleitung fasst die schnellsten Schritte zusammen, um E3DC-Control auf einem frischen Raspberry Pi OS (oder ähnlichem Debian-System) zu installieren.
 
-Aktueller Stable-Stand: `v5.4.3r`.
+Aktueller Stable-Stand: `v5.4.3s`.
+
+5.4.3s legt im administrativen Root-Download-Bootstrap einen wirklich
+fehlenden kanonischen Backup-Root sicher an. Danach bleibt der Ablauf
+unverändert: Backup erstellen und prüfen, Dienste stoppen, Dateien und Rechte
+aktualisieren, Dienste starten und ihren Zustand prüfen. EMS-,
+Direktvermarktungs-, Wallbox- und Hardwarelogik ändern sich nicht.
 
 5.4.3r darf beim ausdrücklich mit Rolle und Peer gebundenen
 Download-Bootstrap einen wirklich fehlenden HA-Rollenanker aus dieser bereits
@@ -307,7 +313,7 @@ Ohne das Label bleibt auch ein versehentlich gestarteter Watchtower für den
 Hauptcontainer wirkungslos. Der oben gezeigte manuelle Host-Helfer bleibt der
 empfohlene Updateweg.
 
-**Docker-Rückfall von v5.4.3r auf den veröffentlichten Docker-Rollback-Root:**
+**Docker-Rückfall von v5.4.3s auf den veröffentlichten Docker-Rollback-Root:**
 ```bash
 (
   set -euo pipefail

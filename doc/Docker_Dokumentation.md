@@ -2,8 +2,14 @@
 
 Veröffentlichte Images entstehen ausschließlich aus einem versionierten stabilen Release-Tag. `latest` verweist damit auf die zuletzt veröffentlichte stabile Version.
 
-Der aktuelle Stable-Stand ist `v5.4.3r`. Die Tags `latest`, `v5.4.3r` und
-`5.4.3r` müssen auf denselben geprüften Multi-Arch-Digest verweisen.
+Der aktuelle Stable-Stand ist `v5.4.3s`. Die Tags `latest`, `v5.4.3s` und
+`5.4.3s` müssen auf denselben geprüften Multi-Arch-Digest verweisen.
+
+5.4.3s korrigiert ausschließlich den Bare-Metal-Download-Bootstrap: Der
+administrative Root-Bootstrap legt einen wirklich fehlenden kanonischen
+Backup-Root sicher an. Danach bleiben Backup-Prüfung, Dienststopp, Update,
+Rechtesetzung, Dienststart und Healthprüfung unverändert. Containerinhalt,
+EMS-, Direktvermarktungs-, Wallbox- und Hardwarelogik entsprechen 5.4.3r.
 
 5.4.3r korrigiert ausschließlich den Bare-Metal-Download-Bootstrap: Ein
 wirklich fehlender HA-Rollenanker darf erst nach verifiziertem Backup und
@@ -261,7 +267,7 @@ unverändert gesperrt und benötigen eine manuelle Prüfung.
 
 Ohne `E3DC_IMAGE_TAG` folgt diese Compose-Datei dem geprüften Stable-Tag
 `latest`. Ein fester Tag bleibt bei `pull` absichtlich unverändert. Für einen
-bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.3r` in der Datei `.env`
+bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.3s` in der Datei `.env`
 gesetzt. `docker compose config --images` zeigt vorab das tatsächlich gewählte
 Image.
 
@@ -288,7 +294,7 @@ Versionswahl.
 
 Gezielte Rückfallversion:
 
-Den Stable-Container `v5.4.3r` auf den veröffentlichten Rollback-Root
+Den Stable-Container `v5.4.3s` auf den veröffentlichten Rollback-Root
 `v5.3.2b` zurücksetzen:
 
 ```bash

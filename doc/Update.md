@@ -5,7 +5,7 @@ Updates werden ausschließlich über den Installer ausgeführt. Ein manuelles
 Release-Historie ungeeignet, weil alter und neuer Git-Stand nicht miteinander
 verwandt sein müssen.
 
-Der aktuelle Stable-Stand ist `v5.4.3r`. Der Ziel-Updater bindet den
+Der aktuelle Stable-Stand ist `v5.4.3s`. Der Ziel-Updater bindet den
 freigegebenen Zielstand vor Backup und Dienststopp eindeutig an Version,
 Herkunft und Anlagenrolle. Fortschritt und Lebenszeichen bleiben auf
 langsameren Raspberry Pis sichtbar. Eine bereits vollständig installierte
@@ -120,6 +120,15 @@ dem Root-Lock aus demselben gültigen Nicht-Root-Eigentümer von Repository und
 `.git`, lokales Benutzerkonto und Nutzerwert unmittelbar vor dem ersten
 Import aus dem Zielcode erneut geprüft. Die fail-closed Grenzen und alle
 übrigen Härtungen aus 5.4.3j bleiben unverändert.
+
+### 5.4.3s: fehlender kanonischer Backup-Root
+
+5.4.3s legt im administrativen Root-Download-Bootstrap einen wirklich
+fehlenden kanonischen Backup-Root sicher an. Ein bereits vorhandener
+unsicherer oder widersprüchlicher Pfad bleibt ein harter Abbruchgrund. Danach
+bleibt der Ablauf unverändert: Backup erstellen und prüfen, Dienste stoppen,
+Dateien und Rechte aktualisieren, Dienste starten und ihren Zustand prüfen.
+EMS-, Direktvermarktungs-, Wallbox- und Hardwarelogik ändern sich nicht.
 
 ### 5.4.3r: HA-Rollenanker aus gebundener Rolle und Peer
 

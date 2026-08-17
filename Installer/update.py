@@ -40,11 +40,13 @@ except Exception:
 from .core import register_command
 from .backup import backup_current_version, restore_verified_backup
 from .backup_integrity import (
+    DEFAULT_BACKUP_ROOT,
     MANIFEST_NAME,
     SYSTEM_BACKUP_KIND,
     _open_directory_nofollow,
     _open_regular_file_nofollow,
     configured_backup_root,
+    ensure_external_backup_root,
     validate_existing_backup_root,
     verify_backup,
 )
@@ -13339,6 +13341,28 @@ def _same_release_integrity_errors(
     return errors[:maximum]
 
 
+def _prepare_backup_collection(
+    repo_dir: str,
+    *,
+    explicit_download_bootstrap: bool,
+) -> str:
+    """Bindet einen vorhandenen Root oder erzeugt nur den fehlenden Standardroot."""
+
+    backup_root = configured_backup_root(repo_dir)
+    if (
+        explicit_download_bootstrap
+        and Path(backup_root) == DEFAULT_BACKUP_ROOT
+        and not os.path.lexists(backup_root)
+    ):
+        if not hasattr(os, "geteuid") or os.geteuid() != 0:
+            raise RuntimeError(
+                "Fehlender Backup-Root darf nur im Root-Download-Bootstrap "
+                "initialisiert werden"
+            )
+        backup_root = ensure_external_backup_root(backup_root, repo_dir)
+    return str(validate_existing_backup_root(backup_root, repo_dir))
+
+
 def _execute_update_transaction(
     headless: bool = False,
     target_ref: str | None = None,
@@ -13502,14 +13526,12 @@ def _execute_update_transaction(
             return False
 
     try:
-        # Dieser Vorvertrag ist absichtlich read-only. Ein bestehender
-        # nutzereigener/ungekennzeichneter Root wird nicht per chmod oder
-        # Marker-Erzeugung nachträglich zur Recovery-Autorität aufgewertet.
-        backup_collection = str(
-            validate_existing_backup_root(
-                configured_backup_root(repo_dir),
-                repo_dir,
-            )
+        # Bestehende Flächen bleiben strikt read-only validiert. Ausschließlich
+        # der explizite Root-Download-Bootstrap darf den wirklich fehlenden
+        # kanonischen Root einmalig anlegen und markieren.
+        backup_collection = _prepare_backup_collection(
+            repo_dir,
+            explicit_download_bootstrap=bool(target_install_path),
         )
         backup_collection_descriptor, _backup_collection_chain = (
             _open_root_receipt_directory_chain(backup_collection)

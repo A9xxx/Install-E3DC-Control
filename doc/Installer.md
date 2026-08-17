@@ -1,10 +1,20 @@
 # E3DC-Control Installer
 
-Dokumentation Stand: 5.4.3s
+Dokumentation Stand: 5.4.4
 
 Der Installer verwaltet Bare-Metal-Installation, Update, Rechte, Dienste,
 Backup, Rollback und optionale Produktmodule. Er ermittelt Benutzer, Home,
 Installationspfad und Python-Umgebung aus dem geprüften Installationskontext.
+
+Der Installer-Anteil von 5.4.4 konsolidiert den Updatepfad für heterogene
+Altanlagen. Web- und Download-Update starten den veröffentlichten Ziel-Updater
+aus einem root-eigenen Ausführungssnapshot und binden ihn an den tatsächlichen
+Installationsroot. Nach erstelltem und geprüftem Backup sowie stillgelegten
+Diensten werden Produktdateien, Rechte, ein eng bekannter redundanter
+Storage-Override und die benötigte Laufzeitumgebung auf den Zielstand gebracht.
+Danach folgen Dienststart und Healthcheck. Pfadflucht, Links, nicht eindeutig
+gebundene Systemdateien, konkurrierende Writer sowie fehlgeschlagene Backup-
+oder Gesundheitsprüfungen bleiben harte Stopps.
 
 Der Installer-Anteil von 5.4.3s legt im administrativen
 Root-Download-Bootstrap einen wirklich fehlenden kanonischen Backup-Root

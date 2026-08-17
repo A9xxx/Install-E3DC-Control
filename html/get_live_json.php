@@ -6959,6 +6959,146 @@ if (file_exists($storagePlanFile) && (time() - filemtime($storagePlanFile) < 900
             && preg_match('/^sha256:[0-9a-f]{64}$/', (string)($storPlan['plan_id'] ?? '')) === 1
             && isset($storPlan['slots'])
             && is_array($storPlan['slots']);
+        $runtime = $data['storage_dispatch_runtime'];
+        $effectiveStoragePlan = is_array($runtime['effective_storage_plan'] ?? null)
+            ? $runtime['effective_storage_plan']
+            : [];
+        $effectiveBinding = is_array($effectiveStoragePlan['binding'] ?? null)
+            ? $effectiveStoragePlan['binding']
+            : [];
+        $effectiveLifecycle = is_array($effectiveStoragePlan['lifecycle'] ?? null)
+            ? $effectiveStoragePlan['lifecycle']
+            : [];
+        $runtimeLifecycle = is_array($runtime['requested'] ?? null) ? $runtime['requested'] : [];
+        $runtimePhase5 = is_array($runtime['phase5'] ?? null) ? $runtime['phase5'] : [];
+        $runtimePhase5Lifecycle = is_array($runtimePhase5['request_lifecycle'] ?? null)
+            ? $runtimePhase5['request_lifecycle']
+            : [];
+        $runtimeTsMs = is_numeric($runtime['runtime_generated_at_ts_ms'] ?? null)
+            ? (int)$runtime['runtime_generated_at_ts_ms']
+            : 0;
+        $nowMs = (int)round(microtime(true) * 1000);
+        $runtimeAgeMs = $nowMs - $runtimeTsMs;
+        $lifecycleBound = true;
+        foreach (['selected', 'executable', 'commands_allowed'] as $key) {
+            $lifecycleBound = $lifecycleBound
+                && array_key_exists($key, $effectiveLifecycle)
+                && ($effectiveLifecycle[$key] === ($runtime[$key] ?? null));
+        }
+        foreach (['requested', 'attempted', 'issued', 'confirmed', 'hardware_effect'] as $key) {
+            $lifecycleBound = $lifecycleBound
+                && array_key_exists($key, $effectiveLifecycle)
+                && ($effectiveLifecycle[$key] === ($runtimeLifecycle[$key] ?? null));
+        }
+        foreach (['retained', 'retained_effect'] as $key) {
+            $lifecycleBound = $lifecycleBound
+                && array_key_exists($key, $effectiveLifecycle)
+                && ($effectiveLifecycle[$key] === ($runtimePhase5Lifecycle[$key] ?? false));
+        }
+        $effectiveStatus = (string)($effectiveStoragePlan['status'] ?? '');
+        $effectiveAction = strtoupper((string)($effectiveStoragePlan['effective_action'] ?? ''));
+        $runtimeAction = strtoupper((string)($runtime['effective_action'] ?? ''));
+        $knownEffectiveActions = ['CHARGE_BLOCK_WAIT', 'PV_STORE', 'ECONOMIC_EXPORT', 'HEADROOM_EXPORT', 'PASSIVE_NORMAL'];
+        $effectConfirmed = ($effectiveLifecycle['effect_confirmed'] ?? null) === true;
+        $selectionValid = $effectiveAction === 'PASSIVE_NORMAL'
+            ? (($effectiveLifecycle['selected'] ?? null) === false
+                && ($effectiveLifecycle['executable'] ?? null) === false
+                && ($effectiveLifecycle['commands_allowed'] ?? null) === false)
+            : (($effectiveLifecycle['selected'] ?? null) === true
+                && ($effectiveLifecycle['executable'] ?? null) === true
+                && ($effectiveLifecycle['commands_allowed'] ?? null) === true);
+        $activeEffectLifecycle = ($effectiveLifecycle['requested'] ?? null) === true
+            && ($effectiveLifecycle['hardware_effect'] ?? null) === true
+            && (($effectiveLifecycle['issued'] ?? null) === true
+                || ($effectiveLifecycle['retained'] ?? null) === true
+                || ($effectiveLifecycle['retained_effect'] ?? null) === true)
+            && (($effectiveLifecycle['confirmed'] ?? null) === true
+                || in_array($effectiveAction, ['ECONOMIC_EXPORT', 'HEADROOM_EXPORT'], true));
+        $passiveLifecycleClear = true;
+        foreach (['requested', 'attempted', 'issued', 'confirmed', 'hardware_effect', 'retained', 'retained_effect'] as $key) {
+            $passiveLifecycleClear = $passiveLifecycleClear && ($effectiveLifecycle[$key] ?? null) === false;
+        }
+        $lifecycleEffectValid = $effectiveAction === 'PASSIVE_NORMAL'
+            ? ($effectConfirmed && $passiveLifecycleClear)
+            : ($effectConfirmed === $activeEffectLifecycle);
+        $expectedStatus = in_array($effectiveAction, $knownEffectiveActions, true)
+            ? 'DIRECT_MARKETING_' . $effectiveAction . '_' . ($effectConfirmed ? 'EFFECTIVE' : 'PENDING')
+            : '';
+        $statusValid = $expectedStatus !== '' && $effectiveStatus === $expectedStatus;
+        $targetAuthorized = $effectiveStoragePlan['target_projection_authorized'] ?? null;
+        $effectivePowerW = $effectiveStoragePlan['effective_power_w'] ?? null;
+        $effectiveChargeW = $effectiveStoragePlan['effective_charge_w'] ?? null;
+        $curveEffect = $effectConfirmed && in_array($effectiveAction, ['PV_STORE', 'PASSIVE_NORMAL'], true);
+        $expectedTargetAuthorization = $effectConfirmed ? $curveEffect : null;
+        $effectValuesValid = $targetAuthorized === $expectedTargetAuthorization
+            && ($effectConfirmed
+                ? (is_numeric($effectivePowerW) && is_numeric($effectiveChargeW))
+                : ($effectivePowerW === null && $effectiveChargeW === null))
+            && (!$effectConfirmed || $effectiveAction !== 'CHARGE_BLOCK_WAIT'
+                || ((float)$effectivePowerW === 0.0 && (float)$effectiveChargeW === 0.0))
+            && (!$curveEffect
+                || ((float)$effectivePowerW > 0 && (float)$effectiveChargeW === (float)$effectivePowerW))
+            && (!$effectConfirmed || !in_array($effectiveAction, ['ECONOMIC_EXPORT', 'HEADROOM_EXPORT'], true)
+                || ((float)$effectivePowerW > 0 && (float)$effectiveChargeW === 0.0));
+        $effectiveRevision = (string)($effectiveStoragePlan['revision'] ?? '');
+        $effectiveRevisionMaterial = $effectiveStoragePlan;
+        unset($effectiveRevisionMaterial['revision']);
+        $effectiveRevisionJson = liveTrajectoryCanonicalJson($effectiveRevisionMaterial);
+        $calculatedEffectiveRevision = is_string($effectiveRevisionJson)
+            ? 'sha256:' . hash('sha256', $effectiveRevisionJson)
+            : '';
+        $effectiveRevisionValid = preg_match('/^sha256:[0-9a-f]{64}$/', $effectiveRevision) === 1
+            && $calculatedEffectiveRevision !== ''
+            && hash_equals($effectiveRevision, $calculatedEffectiveRevision);
+        $effectiveSlot = null;
+        foreach ($storPlan['slots'] as $planSlot) {
+            if (is_array($planSlot)
+                && ($planSlot['slot_id'] ?? null) === ($runtime['slot_id'] ?? null)) {
+                $effectiveSlot = $planSlot;
+                break;
+            }
+        }
+        $slotStartMs = is_array($effectiveSlot) ? (int)($effectiveSlot['start_ts_ms'] ?? 0) : 0;
+        $slotEndMs = is_array($effectiveSlot) ? (int)($effectiveSlot['end_ts_ms'] ?? 0) : 0;
+        $windowStartMs = (int)($effectiveBinding['window_start_ts_ms'] ?? 0);
+        $windowEndMs = (int)($effectiveBinding['window_end_ts_ms'] ?? 0);
+        $timeBindingValid = $slotStartMs > 0 && $slotEndMs > $slotStartMs
+            && (int)($effectiveBinding['slot_start_ts_ms'] ?? 0) === $slotStartMs
+            && (int)($effectiveBinding['slot_end_ts_ms'] ?? 0) === $slotEndMs
+            && $slotStartMs <= $runtimeTsMs && $runtimeTsMs < $slotEndMs
+            && $slotStartMs <= $nowMs && $nowMs < $slotEndMs
+            && $windowStartMs > 0 && $windowEndMs > $windowStartMs
+            && $windowStartMs <= $runtimeTsMs && $runtimeTsMs < $windowEndMs
+            && $windowStartMs <= $nowMs && $nowMs < $windowEndMs;
+        $effectiveStoragePlanBound = $canonicalPlan
+            && ($runtime['schema_version'] ?? '') === 'storage_dispatch_runtime_v1'
+            && ($runtime['owner'] ?? '') === 'storage_manager'
+            && ($runtime['plan_valid'] ?? null) === true
+            && $runtimeTsMs > 0 && $runtimeAgeMs >= -5000 && $runtimeAgeMs <= 60000
+            && ($effectiveStoragePlan['schema_version'] ?? '') === 'storage_effective_plan_v1'
+            && ($effectiveStoragePlan['consistent'] ?? null) === true
+            && $effectiveRevisionValid && $statusValid && $selectionValid
+            && $lifecycleEffectValid && $effectValuesValid
+            && $lifecycleBound && $timeBindingValid
+            && ($effectiveBinding['plan_id'] ?? null) === ($storPlan['plan_id'] ?? null)
+            && ($effectiveBinding['plan_id'] ?? null) === ($runtime['plan_id'] ?? null)
+            && ($effectiveBinding['slot_id'] ?? null) === ($runtime['slot_id'] ?? null)
+            && ($effectiveBinding['owner'] ?? '') === 'storage_manager'
+            && ($effectiveBinding['runtime_generated_at_ts_ms'] ?? null) === ($runtime['runtime_generated_at_ts_ms'] ?? null)
+            && preg_match('/^sha256:[0-9a-f]{64}$/', (string)($effectiveBinding['action_id'] ?? '')) === 1
+            && trim((string)($effectiveBinding['window_id'] ?? '')) !== ''
+            && trim((string)($effectiveBinding['segment_id'] ?? '')) !== ''
+            && ($effectiveBinding['action'] ?? '') === ($effectiveStoragePlan['effective_action'] ?? '')
+            && ($runtimeAction === $effectiveAction || ($effectiveAction === 'PASSIVE_NORMAL' && $runtimeAction === ''));
+        $activeDirectMarketingPlan = is_array($directMarketingForCurve)
+            && ($directMarketingForCurve['active'] ?? null) === true
+            && ($directMarketingForCurve['shadow'] ?? false) !== true;
+        $effectiveProjectionHidden = $activeDirectMarketingPlan
+            && (!$effectiveStoragePlanBound
+                || ($effectiveStoragePlan['target_projection_authorized'] ?? null) !== true);
+        if ($effectiveStoragePlanBound) {
+            $data['effective_storage_plan'] = $effectiveStoragePlan;
+        }
         $data['direct_marketing_trajectory'] = liveDirectMarketingTrajectoryForDisplay(
             $storPlan,
             $directMarketingConfigured,
@@ -7040,6 +7180,9 @@ if (file_exists($storagePlanFile) && (time() - filemtime($storagePlanFile) < 900
             $soc = isset($projection['soc_pct']) && is_numeric($projection['soc_pct'])
                 ? (float)$projection['soc_pct']
                 : null;
+            if ($effectiveProjectionHidden) {
+                $soc = null;
+            }
             $targetSoc = isset($projection['target_soc_pct']) && is_numeric($projection['target_soc_pct'])
                 ? (float)$projection['target_soc_pct']
                 : null;
@@ -7049,7 +7192,9 @@ if (file_exists($storagePlanFile) && (time() - filemtime($storagePlanFile) < 900
             $ceiling = $canonicalPlan && isset($slot['soc_pct']['ceiling']) && is_numeric($slot['soc_pct']['ceiling'])
                 ? (float)$slot['soc_pct']['ceiling']
                 : null;
-            if ($targetSoc !== null) $targetCurve[] = ['ts' => $tsMs, 'soc' => round($targetSoc, 1)];
+            if (!$effectiveProjectionHidden && $targetSoc !== null) {
+                $targetCurve[] = ['ts' => $tsMs, 'soc' => round($targetSoc, 1)];
+            }
             if ($reserveFloor !== null) $socMinCurve[] = ['ts' => $tsMs, 'soc' => round($reserveFloor, 1)];
             if ($ceiling !== null) $socCeilingCurve[] = ['ts' => $tsMs, 'soc' => round($ceiling, 1)];
             $projectionPlanAction = strtoupper((string)($projection['direct_marketing_plan_action'] ?? ''));
@@ -7141,6 +7286,12 @@ if (file_exists($storagePlanFile) && (time() - filemtime($storagePlanFile) < 900
                     'frozen' => !empty($slot['frozen']),
                 ];
             }
+        }
+        if ($effectiveProjectionHidden) {
+            $targetCurve = [];
+            $simCurve = [];
+            $curveAnchors = [];
+            $data['ladekurve'] = null;
         }
         if (empty($data['ladekurve']) && (!empty($targetCurve) || !empty($simCurve))) {
             $tzName = $confData['config']['timezone'] ?? 'Europe/Berlin';
@@ -7244,21 +7395,15 @@ if (file_exists($storagePlanFile) && (time() - filemtime($storagePlanFile) < 900
                 ],
             ];
         }
-        if (!empty($targetCurve)) {
-            $data['storage_target_curve']   = $targetCurve;
-        }
+        $data['storage_target_curve'] = $targetCurve;
         if (!empty($socMinCurve)) {
             $data['storage_soc_min_curve'] = $socMinCurve;
         }
         if (!empty($socCeilingCurve)) {
             $data['storage_soc_ceiling_curve'] = $socCeilingCurve;
         }
-        if (!empty($simCurve)) {
-            $data['storage_sim_curve'] = $simCurve;
-        }
-        if (!empty($curveAnchors)) {
-            $data['storage_curve_anchors'] = $curveAnchors;
-        }
+        $data['storage_sim_curve'] = $simCurve;
+        $data['storage_curve_anchors'] = $curveAnchors;
         // Metadaten: Ziel-SoC, erreichbarer Max-SoC, Q-Ratio
         $cheapGridCharge = (isset($storPlan['cheap_grid_charge']) && is_array($storPlan['cheap_grid_charge']))
             ? $storPlan['cheap_grid_charge']
@@ -7319,24 +7464,53 @@ if (file_exists($storagePlanFile) && (time() - filemtime($storagePlanFile) < 900
                 ? 'Nur E3DC-DC-PV laden: externer AC-Zusatzwechselrichter wird nicht als Akku-Ladequelle genutzt.'
                 : '';
         }
-        $displayTargetSoc = $storPlan['target_soc'] ?? null;
-        $displayMaxSoc = $storPlan['max_soc_pct'] ?? $simMaxSoc;
-        $displayCanReachTarget = array_key_exists('can_reach_target', $storPlan)
-            ? (bool)$storPlan['can_reach_target']
-            : true;
-        if (!array_key_exists('can_reach_target', $storPlan) && $displayMaxSoc !== null && $displayTargetSoc !== null) {
+        $effectiveValue = static function ($key, $fallback) use (
+            $effectiveStoragePlanBound,
+            $effectiveStoragePlan,
+            $activeDirectMarketingPlan
+        ) {
+            if ($effectiveStoragePlanBound && array_key_exists($key, $effectiveStoragePlan)) {
+                return $effectiveStoragePlan[$key];
+            }
+            return $activeDirectMarketingPlan ? null : $fallback;
+        };
+        $displayTargetSoc = $effectiveValue('target_soc', $storPlan['target_soc'] ?? null);
+        $displayMaxSoc = $effectiveValue('sim_max_soc_pct', $storPlan['max_soc_pct'] ?? $simMaxSoc);
+        $displayCanReachTarget = $effectiveValue(
+            'can_reach_target',
+            array_key_exists('can_reach_target', $storPlan) ? (bool)$storPlan['can_reach_target'] : true
+        );
+        if (!$activeDirectMarketingPlan && !array_key_exists('can_reach_target', $storPlan) && $displayMaxSoc !== null && $displayTargetSoc !== null) {
             $displayCanReachTarget = ((float)$displayMaxSoc >= ((float)$displayTargetSoc - 0.2));
         }
-        $targetReachState = $storPlan['target_reach_state']
-            ?? ($targetCurveMeta['target_reach_state'] ?? ($displayCanReachTarget ? 'reachable' : 'unreachable_auto'));
-        $targetReachMode = $storPlan['target_reach_mode']
-            ?? ($targetCurveMeta['target_reach_mode'] ?? ($displayCanReachTarget ? 'curve_servo' : 'e3dc_auto'));
-        $targetReachReason = $storPlan['target_reach_reason']
-            ?? ($targetCurveMeta['target_reach_reason'] ?? '');
-        if ($targetReachReason === '') {
-            $targetReachReason = $displayCanReachTarget
+        $targetReachState = $effectiveValue(
+            'target_reach_state',
+            $storPlan['target_reach_state'] ?? ($targetCurveMeta['target_reach_state'] ?? ($displayCanReachTarget ? 'reachable' : 'unreachable_auto'))
+        );
+        $targetReachMode = $activeDirectMarketingPlan
+            ? 'direct_marketing'
+            : ($storPlan['target_reach_mode']
+                ?? ($targetCurveMeta['target_reach_mode'] ?? ($displayCanReachTarget ? 'curve_servo' : 'e3dc_auto')));
+        $targetReachReason = $effectiveValue(
+            'target_reach_reason',
+            $storPlan['target_reach_reason'] ?? ($targetCurveMeta['target_reach_reason'] ?? '')
+        );
+        if ($targetReachReason === null || $targetReachReason === '') {
+            $targetReachReason = $activeDirectMarketingPlan
+                ? 'DV-Auswahl oder Hardwarewirkung ist noch nicht vollständig gebunden; Ziel und Leistung bleiben unbekannt.'
+                : ($displayCanReachTarget
                 ? 'Tagesziel erreichbar: Zielkurve aktiv. Die Prognose wird bei jedem Planlauf neu geprüft.'
-                : 'Tagesziel aktuell nicht erreichbar: E3DC AUTO. Der E3DC nutzt realen PV-Überschuss autonom; Entladung bleibt geschützt. Die Prognose wird bei jedem Planlauf neu geprüft.';
+                : 'Tagesziel aktuell nicht erreichbar: E3DC AUTO. Der E3DC nutzt realen PV-Überschuss autonom; Entladung bleibt geschützt. Die Prognose wird bei jedem Planlauf neu geprüft.');
+        }
+        if ($activeDirectMarketingPlan) {
+            $data['target_soc'] = $displayTargetSoc;
+            $data['storage_ifc_w'] = $effectiveStoragePlanBound
+                ? ($effectiveStoragePlan['effective_charge_w'] ?? null)
+                : null;
+            $data['storage_charge_request_w'] = $data['storage_ifc_w'];
+            $data['storage_curve_soc_now'] = $effectiveValue('current_curve_soc', null);
+            $data['storage_curve_soc_target'] = $effectiveValue('next_curve_soc', null);
+            $data['storage_curve_target_ts'] = $effectiveValue('next_curve_ts', null);
         }
         $targetReachRecheckActive = $storPlan['target_reach_recheck_active']
             ?? ($targetCurveMeta['target_reach_recheck_active'] ?? true);
@@ -7353,9 +7527,15 @@ if (file_exists($storagePlanFile) && (time() - filemtime($storagePlanFile) < 900
             'horizon_end'     => $storPlan['horizon_end'] ?? null,
             'input_revisions' => $storPlan['input_revisions'] ?? null,
             'planner'         => $storPlan['planner'] ?? null,
-            'target_soc'      => $storPlan['target_soc']      ?? null,
-            'planning_target_soc'=> $storPlan['planning_target_soc'] ?? ($targetCurveMeta['planning_target_soc'] ?? null),
-            'effective_target_soc'=> $storPlan['effective_target_soc'] ?? null,
+            'target_soc'      => $displayTargetSoc,
+            'planning_target_soc'=> $effectiveValue('planning_target_soc', $storPlan['planning_target_soc'] ?? ($targetCurveMeta['planning_target_soc'] ?? null)),
+            'effective_target_soc'=> $effectiveValue('effective_target_soc', $storPlan['effective_target_soc'] ?? null),
+            'effective_storage_plan'=> $effectiveStoragePlanBound ? $effectiveStoragePlan : null,
+            'effective_projection_status'=> $effectiveStoragePlanBound ? $effectiveStatus : 'EVIDENCE_LIMIT',
+            'target_projection_authorized'=> $effectiveStoragePlanBound
+                ? ($effectiveStoragePlan['target_projection_authorized'] ?? null)
+                : ($activeDirectMarketingPlan ? null : true),
+            'clear_classical_curves'=> $effectiveProjectionHidden,
             'morning_target'  => $storPlan['morning_target']  ?? null,
             'morning_hour'    => $storPlan['morning_hour']    ?? null,
             'predump_enabled' => $storPlan['predump_enabled'] ?? null,
@@ -7383,11 +7563,11 @@ if (file_exists($storagePlanFile) && (time() - filemtime($storagePlanFile) < 900
             'config_hard_predump_enabled' => $confData['config']['hard_predump_enable'] ?? null,
             'config_hard_predump_target_soc' => $confData['config']['hard_predump_target_soc'] ?? null,
             'config_hard_predump_grid_enabled' => $confData['config']['hard_predump_grid_enable'] ?? '0',
-            'ladestart_soc'   => $storPlan['ladestart_soc']   ?? null,
-            'ladestart_ts'    => $storPlan['ladestart_ts']    ?? null,
-            'start_anchor_ts' => $targetCurveMeta['start_anchor_ts'] ?? ($storPlan['ladestart_ts'] ?? null),
-            'start_anchor_t'  => $targetCurveMeta['start_anchor_t'] ?? null,
-            'start_anchor_soc'=> $targetCurveMeta['start_anchor_soc'] ?? ($storPlan['ladestart_soc'] ?? null),
+            'ladestart_soc'   => $effectiveProjectionHidden ? null : ($storPlan['ladestart_soc'] ?? null),
+            'ladestart_ts'    => $effectiveProjectionHidden ? null : ($storPlan['ladestart_ts'] ?? null),
+            'start_anchor_ts' => $effectiveProjectionHidden ? null : ($targetCurveMeta['start_anchor_ts'] ?? ($storPlan['ladestart_ts'] ?? null)),
+            'start_anchor_t'  => $effectiveProjectionHidden ? null : ($targetCurveMeta['start_anchor_t'] ?? null),
+            'start_anchor_soc'=> $effectiveProjectionHidden ? null : ($targetCurveMeta['start_anchor_soc'] ?? ($storPlan['ladestart_soc'] ?? null)),
             'pv_forecast_kwh' => $storPlan['pv_forecast_kwh'] ?? ($targetCurveMeta['pv_forecast_kwh'] ?? null),
             'adaptive_headroom_required_wh' => $storPlan['adaptive_headroom_required_wh'] ?? ($targetCurveMeta['adaptive_headroom_required_wh'] ?? 0),
             'adaptive_headroom_available_wh' => $storPlan['adaptive_headroom_available_wh'] ?? ($targetCurveMeta['adaptive_headroom_available_wh'] ?? 0),
@@ -7443,7 +7623,7 @@ if (file_exists($storagePlanFile) && (time() - filemtime($storagePlanFile) < 900
             'curtailment_unavoidable_wh' => $storPlan['curtailment_unavoidable_wh'] ?? ($targetCurveMeta['curtailment_unavoidable_wh'] ?? 0),
             'curtailment_first_pressure_ts' => $storPlan['curtailment_first_pressure_ts'] ?? ($targetCurveMeta['curtailment_first_pressure_ts'] ?? 0),
             'curtailment_soc_at_first_pressure' => $storPlan['curtailment_soc_at_first_pressure'] ?? ($targetCurveMeta['curtailment_soc_at_first_pressure'] ?? null),
-            'latest_charge_start_ts' => $storPlan['latest_charge_start_ts'] ?? ($targetCurveMeta['latest_charge_start_ts'] ?? 0),
+            'latest_charge_start_ts' => $effectiveProjectionHidden ? null : ($storPlan['latest_charge_start_ts'] ?? ($targetCurveMeta['latest_charge_start_ts'] ?? 0)),
             'evening_shortfall_wh' => $storPlan['evening_shortfall_wh'] ?? ($targetCurveMeta['evening_shortfall_wh'] ?? 0),
             'can_reach_target'=> $displayCanReachTarget,
             'target_reach_state'=> $targetReachState,
@@ -7456,18 +7636,20 @@ if (file_exists($storagePlanFile) && (time() - filemtime($storagePlanFile) < 900
             'target_reach_changed'=> (bool)($storPlan['target_reach_changed'] ?? ($targetCurveMeta['target_reach_changed'] ?? false)),
             'target_reach_last_change_ts'=> $storPlan['target_reach_last_change_ts'] ?? ($targetCurveMeta['target_reach_last_change_ts'] ?? null),
             'target_reach_stable_s'=> $storPlan['target_reach_stable_s'] ?? ($targetCurveMeta['target_reach_stable_s'] ?? null),
-            'target_reach_can_reach_target'=> $storPlan['target_reach_can_reach_target'] ?? ($targetCurveMeta['target_reach_can_reach_target'] ?? $displayCanReachTarget),
+            'target_reach_can_reach_target'=> $activeDirectMarketingPlan
+                ? $displayCanReachTarget
+                : ($storPlan['target_reach_can_reach_target'] ?? ($targetCurveMeta['target_reach_can_reach_target'] ?? $displayCanReachTarget)),
             'target_reach_surplus_wh'=> $storPlan['target_reach_surplus_wh'] ?? ($targetCurveMeta['target_reach_surplus_wh'] ?? null),
             'target_reach_required_wh'=> $storPlan['target_reach_required_wh'] ?? ($targetCurveMeta['target_reach_required_wh'] ?? null),
             'target_reach_margin_wh'=> $storPlan['target_reach_margin_wh'] ?? ($targetCurveMeta['target_reach_margin_wh'] ?? null),
             'target_reach_sim_max_soc_pct'=> $storPlan['target_reach_sim_max_soc_pct'] ?? ($targetCurveMeta['target_reach_sim_max_soc_pct'] ?? null),
-            'target_reach_max_reachable_soc'=> $storPlan['target_reach_max_reachable_soc'] ?? ($targetCurveMeta['target_reach_max_reachable_soc'] ?? null),
+            'target_reach_max_reachable_soc'=> $effectiveValue('max_reachable_soc', $storPlan['target_reach_max_reachable_soc'] ?? ($targetCurveMeta['target_reach_max_reachable_soc'] ?? null)),
             'max_soc_pct'     => $displayMaxSoc,
-            'sim_max_soc_pct' => $simMaxSoc ?? ($storPlan['max_soc_pct'] ?? null),
-            'max_reachable_soc'=> $storPlan['max_reachable_soc'] ?? ($targetCurveMeta['max_reachable_soc'] ?? null),
-            'q_ratio'         => $storPlan['q_ratio']         ?? null,
+            'sim_max_soc_pct' => $displayMaxSoc,
+            'max_reachable_soc'=> $effectiveValue('max_reachable_soc', $storPlan['max_reachable_soc'] ?? ($targetCurveMeta['max_reachable_soc'] ?? null)),
+            'q_ratio'         => $effectiveProjectionHidden ? null : ($storPlan['q_ratio'] ?? null),
             'bat_cap_kwh'     => $storPlan['bat_cap_kwh']     ?? null,
-            'target_curve_meta'=> $targetCurveMeta,
+            'target_curve_meta'=> $effectiveProjectionHidden ? [] : $targetCurveMeta,
             'display_day_label'=> $storageDisplayDayLabel,
             'display_day_start'=> $today0 * 1000,
             'display_day_end'  => $today1 * 1000,

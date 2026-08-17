@@ -1,6 +1,14 @@
 # Speicher-Ladesteuerung - Systemablauf
 
-> **Stand:** v5.4.3p, gegen den Release-Betriebsvertrag geprüft am 2026-08-17
+> **Stand:** v5.4.4, gegen den Release-Betriebsvertrag geprüft am 2026-08-17
+>
+> **Neu in 5.4.4:** Bei aktiver Direktvermarktung wird genau ein effektiver
+> Speicherplan aus Plan, Slot, Aktion, Zeitfenster, Owner und bestätigtem
+> Phase-5-Lebenszyklus angezeigt. Ausstehende oder widersprüchliche Wirkung
+> leert klassische Zielkurve, Leistung und Erreichbarkeitsbehauptung. Der
+> WB-Entladungsschutz verlangt zugleich frische gemessene Fahrzeuglast;
+> Netzladen der Wallbox benötigt eine eigene aktuelle Freigabe. Weder Anzeige
+> noch Wallboxfreigabe erzeugen einen zweiten RSCP-Ausgang.
 >
 > **Hinweis:** 5.4.3p korrigiert ausschließlich den Eigentümer der vom
 > Download-Bootstrap neu erzeugten Git-Metadaten. Speicherentscheidung,
@@ -95,6 +103,23 @@ Die Planung erzeugt:
 Vergangene und aktive Anker werden eingefroren. Zukünftige Anker dürfen sich
 bewegen, aber zukünftige Pre-Dump-/Startanker dürfen nicht durch den aktuellen
 SoC nach oben gezogen werden.
+
+### Effektive Direktvermarktungsprojektion
+
+Die klassische Ladekurve bleibt eine Planung, solange Direktvermarktung den
+aktuellen Slot führt. Für Diagnose und WebUI wird deshalb nur die tatsächlich
+ausgewählte und bestätigte Wirkung projiziert:
+
+- `PV_STORE` oder `PASSIVE_NORMAL` dürfen Zielkurve und Ladeleistung nur bei
+  vollständig gebundener positiver Wirkung anzeigen.
+- `CHARGE_BLOCK_WAIT`, `ECONOMIC_EXPORT` und `HEADROOM_EXPORT` ersetzen die
+  klassische Ladeprojektion durch ihre bestätigte aktuelle Wirkung.
+- Ein noch nicht ausgeführter, veralteter, unbekannter oder gemischter Zustand
+  bleibt `PENDING` beziehungsweise `EVIDENCE_LIMIT`; Leistung, Zielwerte und
+  `can_reach_target` bleiben dann leer.
+
+Diese Projektion ist kein Entscheider. Sie übernimmt ausschließlich den
+bereits vorhandenen Phase-5-Lebenszyklus und sendet keine RSCP-Kommandos.
 
 ## 2. Regelung
 

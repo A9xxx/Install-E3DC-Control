@@ -1610,6 +1610,13 @@ function cacheStorageCurveData(data) {
         : '';
     const planChanged = Boolean(previousPlanId && incomingPlanId && previousPlanId !== incomingPlanId);
     const mergedData = {...previousData, ...data};
+    const clearClassicalCurves = data.storage_plan_meta
+        && data.storage_plan_meta.clear_classical_curves === true;
+
+    if (clearClassicalCurves) {
+        ['storage_target_curve', 'storage_sim_curve', 'storage_curve_anchors']
+            .forEach(key => { mergedData[key] = []; });
+    }
 
     // Live-WebSocket-Telegramme enthalten häufig nur Messwerte. Sie dürfen
     // deshalb einen zuvor vollständig geladenen Plan samt Soll-/PV-Kurven
@@ -11140,7 +11147,10 @@ function _renderStorageCurveExplanation(meta, reason) {
     if (weatherBaseTarget != null && weatherReserveTarget != null && Math.abs(parseFloat(weatherReserveTarget) - parseFloat(weatherBaseTarget)) > 0.2) {
         weatherReserveText += ` Speicherziel wird vorsorglich von ${parseFloat(weatherBaseTarget).toFixed(0)}% auf ${parseFloat(weatherReserveTarget).toFixed(0)}% angehoben.`;
     }
-    const canReachTarget = !(meta.can_reach_target === false || meta.can_reach_target === 0 || meta.can_reach_target === '0');
+    const effectiveProjectionHidden = meta.clear_classical_curves === true;
+    const canReachTarget = effectiveProjectionHidden
+        ? null
+        : !(meta.can_reach_target === false || meta.can_reach_target === 0 || meta.can_reach_target === '0');
     const targetReachState = String(meta.target_reach_state ?? curveMeta.target_reach_state ?? (canReachTarget ? 'reachable' : 'unreachable_auto'));
     const targetReachReason = String(meta.target_reach_reason ?? curveMeta.target_reach_reason ?? '').trim();
     const targetReachRecheckActive = !(
@@ -11187,13 +11197,15 @@ function _renderStorageCurveExplanation(meta, reason) {
         }
     }
     const activeTarget = _storageActiveCurveTarget(meta, window._storageControlSoc ?? window._storageLiveSoc);
-    const curveStatus = window._storageSollCurveSource === 'curve_anchors_fallback'
+    const curveStatus = effectiveProjectionHidden
+        ? 'Die Direktvermarktung führt den aktuellen Slot; eine klassische Sollkurve wird erst nach bestätigter Freigabe wieder angezeigt.'
+        : (window._storageSollCurveSource === 'curve_anchors_fallback'
         ? 'Die blaue Sollkurve wird aus den gültigen, eingefrorenen Kurvenankern rekonstruiert, weil die slotweise Zielprojektion in diesem Snapshot fehlt. Die Regelung selbst bleibt unverändert.'
         : (meta.has_target_curve === false
         ? 'Für diesen Tag liegt noch keine eingefrorene Sollkurve vor; angezeigt wird die Vorschau aus der Simulation.'
         : (targetReachState === 'unreachable_auto'
             ? 'Blaue Linie: geplante Ladekurve bis zum Tagesziel. Sie bleibt sichtbar, auch wenn das Tagesziel laut aktueller Prognose nicht erreichbar ist; die voraussichtliche Speicherladung zeigt separat, ob der SoC dieser Planung folgt.'
-            : 'Blaue Linie: geplanter Tagespfad bis zum Freilauf-SoC. Sie ist kein harter Sekunden-Sollwert; die Regelung arbeitet mit Zielkorridor, Hysterese und ruhigem Nachladen. Liegt der Speicher unter der aktuellen Unterkante, wird zuerst in den Zielkorridor zurückgeladen. Ist das Tagesziel mit sicherer Rest-PV erreichbar, darf der gleitende Prognosehorizont die Ladung entspannen.'));
+            : 'Blaue Linie: geplanter Tagespfad bis zum Freilauf-SoC. Sie ist kein harter Sekunden-Sollwert; die Regelung arbeitet mit Zielkorridor, Hysterese und ruhigem Nachladen. Liegt der Speicher unter der aktuellen Unterkante, wird zuerst in den Zielkorridor zurückgeladen. Ist das Tagesziel mit sicherer Rest-PV erreichbar, darf der gleitende Prognosehorizont die Ladung entspannen.')));
     const hasAdaptiveBand = adaptiveFloorSoc != null && adaptiveCeilingSoc != null
         && !isNaN(parseFloat(adaptiveFloorSoc)) && !isNaN(parseFloat(adaptiveCeilingSoc));
     const latestChargeText = fmtPlanTs(latestChargeStartTs);
@@ -11206,7 +11218,9 @@ function _renderStorageCurveExplanation(meta, reason) {
     const targetReachRecheckText = targetReachRecheckActive
         ? ''
         : ' Achtung: laufende Prognose-Neubewertung ist nicht aktiv markiert.';
-    const targetReachText = targetReachState === 'unreachable_auto'
+    const targetReachText = effectiveProjectionHidden
+        ? (targetReachReason || 'Ziel, Erreichbarkeit und Ladeleistung bleiben bis zur bestätigten Wirkung unbekannt.')
+        : targetReachState === 'unreachable_auto'
         ? `${targetReachBaseText} Restprognose bis ${reachableSoc}. Punktlandungs-Simulation: ${simMaxSoc}.${targetReachEnergyText}${targetReachStableText}${targetReachServoText}${targetReachRecheckText}`
         : `${targetReachBaseText} Fachlich erreichbar: ${reachableSoc}. Punktlandungs-Simulation: ${simMaxSoc}.${targetReachEnergyText}${targetReachStableText}${targetReachServoText}${targetReachRecheckText}`;
 
@@ -11231,7 +11245,7 @@ function _renderStorageCurveExplanation(meta, reason) {
                 : `Aktives Vorab-Entladen ist deaktiviert. Die Prognose nutzt ${predumpMin} nicht als Entladeziel und plant keinen Pre-Dump.`
         },
         {icon:'fa-sun', color: forecastLooksLow ? '#f59e0b' : '#ffc107', title:'PV-Prognose', text:`Gelbe Fläche: erwartete PV-Leistung für ${dayLabel}. Sehr kleine Dämmerungswerte unter 100 W werden im Diagramm ausgeblendet.${pvForecastWarningText}`},
-        {icon:'fa-flag-checkered', color:'#22d3ee', title:'Tagesziel', text:`Gewünschter Speicherstand zum Freilauf: ${target}. ${targetReachText}`},
+        {icon:'fa-flag-checkered', color:'#22d3ee', title:effectiveProjectionHidden ? 'Wirksamer Speicherplan' : 'Tagesziel', text:effectiveProjectionHidden ? targetReachText : `Gewünschter Speicherstand zum Freilauf: ${target}. ${targetReachText}`},
         {icon:'fa-wave-square', color:'#38bdf8', title:'Kurvenform', text:qText}
     ];
 

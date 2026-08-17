@@ -5,7 +5,7 @@ Updates werden ausschließlich über den Installer ausgeführt. Ein manuelles
 Release-Historie ungeeignet, weil alter und neuer Git-Stand nicht miteinander
 verwandt sein müssen.
 
-Der aktuelle Stable-Stand ist `v5.4.3s`. Der Ziel-Updater bindet den
+Der aktuelle Stable-Stand ist `v5.4.4`. Der Ziel-Updater bindet den
 freigegebenen Zielstand vor Backup und Dienststopp eindeutig an Version,
 Herkunft und Anlagenrolle. Fortschritt und Lebenszeichen bleiben auf
 langsameren Raspberry Pis sichtbar. Eine bereits vollständig installierte
@@ -120,6 +120,24 @@ dem Root-Lock aus demselben gültigen Nicht-Root-Eigentümer von Repository und
 `.git`, lokales Benutzerkonto und Nutzerwert unmittelbar vor dem ersten
 Import aus dem Zielcode erneut geprüft. Die fail-closed Grenzen und alle
 übrigen Härtungen aus 5.4.3j bleiben unverändert.
+
+### 5.4.4: konsolidierter Ziel-Updater
+
+5.4.4 führt Web- und Download-Update für heterogene Altanlagen in einem
+gemeinsamen Zielstand zusammen. Der Webpfad startet den veröffentlichten
+Ziel-Updater aus einem root-eigenen Ausführungssnapshot; der tatsächliche
+Installationsroot bleibt davon getrennt und eindeutig gebunden. Der
+vorhandene Alt-Updater liefert keine Updateautorität.
+
+Der Ablauf bleibt bewusst kurz: Backup erstellen und prüfen, Dienste und
+Writer stilllegen, Produktdateien kopieren, Zielrechte und eng bekannte alte
+Dienstdarstellungen herstellen, Dienste starten und Healthcheck prüfen. Eine
+benötigte Laufzeitumgebung darf im ausdrücklich gebundenen Downloadpfad
+erstellt werden. Frühere Dateirechte oder ein redundanter kanonischer
+Storage-Override blockieren das Update nicht allein. Pfadflucht, Symlinks,
+Spezialdateien, nicht eindeutig gebundene Systemdateien, konkurrierende Writer
+sowie ein fehlgeschlagenes Backup oder ein fehlgeschlagener Ziel-Healthcheck
+bleiben harte Abbruchgründe.
 
 ### 5.4.3s: fehlender kanonischer Backup-Root
 

@@ -1,3 +1,59 @@
+# E3DC-Control v5.4.4
+
+E3DC-Control 5.4.4 ist ein konsolidierter Stable-Stand für heterogene
+Altanlagen. Das Release führt die Korrekturen am Download- und Web-Update,
+am Wallbox-Fortschritt, am WB-Entladungsschutz und an der effektiven
+Direktvermarktungsanzeige in einem gemeinsamen Zielstand zusammen.
+
+## Update aus heterogenen Altbeständen
+
+- Der Web-Updater startet den veröffentlichten Ziel-Updater aus einem
+  root-eigenen Ausführungssnapshot, bindet ihn aber weiterhin an den
+  tatsächlichen Installationsroot. Snapshot-Pfad und Produktpfad werden nicht
+  mehr verwechselt.
+- Nach erstelltem und geprüftem Backup sowie stillgelegten Diensten
+  werden Produktdateien, Rechte und eng bekannte historische
+  Dienstdarstellungen auf den Zielstand gebracht. Anschließend werden die
+  Dienste gestartet und ihr Zustand geprüft.
+- Abweichende frühere Dateirechte, ein redundanter alter Storage-Override und
+  eine im Ziel benötigte Laufzeitumgebung sind im ausdrücklich gestarteten
+  Downloadpfad normalisierbarer Altbestand. Pfadflucht, Links, nicht eindeutig
+  gebundene Systemdateien, konkurrierende Writer sowie fehlgeschlagene Backup-
+  oder Healthchecks bleiben gesperrt.
+
+## Wallbox-Fortschritt und Netzladefreigabe
+
+- E3DC-Multi-Connect hält nach einem bestätigten Ausgang den Stromsollwert für
+  den erforderlichen Heartbeat. Start und Weiterregelung bleiben dadurch
+  nicht nach einem einzelnen Startauftrag stehen.
+- Bei einem vor dem Hardwareausgang unterbrochenen openWB-Pro-Phasenwechsel
+  wird die alte ausgangslose Generation nach einem frischen Geräte-Readback
+  eindeutig abgeschlossen. Erst danach darf die aktuelle Regelung neu
+  entscheiden; es entsteht kein paralleler Phasenauftrag. Der
+  480-Sekunden-Schutz sperrt weiterhin nur einen weiteren bestätigten
+  Phasenwechsel.
+- Netzfinanzierte Wallboxleistung wird nur aus einer aktuellen, vollständig
+  gebundenen Freigabe bereitgestellt. Nutzer-`Aus`, manuelle Pausen, Not-Aus,
+  Speicherreserve, Netzpunkt, Hardwarelimits und Datenfrische bleiben
+  vorrangig.
+- Der WB-Entladungsschutz benötigt frische gemessene Fahrzeuglast. Ein alter
+  Sollwert, ein Ladebit oder ein früherer Hold allein begrenzt den Speicher
+  nicht mehr und hält damit keinen unnötigen Netzbezug.
+
+## Effektiver Speicherplan bei Direktvermarktung
+
+- Die Oberfläche verwendet bei aktiver Direktvermarktung genau eine
+  revisionsgebundene Projektion aus Plan, Slot, Aktion, Zeitfenster, Owner und
+  Phase-5-Lebenszyklus.
+- Nur eine bestätigte Wirkung darf als effektiv erscheinen. Bei ausstehender,
+  veralteter oder widersprüchlicher Evidenz werden Leistung, Zielkurve und
+  Zielerreichbarkeit geleert, statt parallel einen klassischen
+  100-%-Ladepfad zu behaupten.
+- Die Projektion bleibt reine Diagnose und Anzeige. Der Storage Manager bleibt
+  mit Phase 5 der einzige Speicherentscheider und der einzige RSCP-Ausgang.
+
+---
+
 # E3DC-Control v5.4.3s
 
 E3DC-Control 5.4.3s ergänzt ausschließlich die sichere Erzeugung eines

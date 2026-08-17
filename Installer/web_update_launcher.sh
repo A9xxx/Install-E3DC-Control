@@ -638,6 +638,9 @@ run_worker() {
         LOGNAME="$INSTALL_USER" \
         SUDO_USER="$INSTALL_USER" \
         E3DC_BOOTSTRAP_USER="$INSTALL_USER" \
+        E3DC_BOOTSTRAP_ROOT="$INSTALL_ROOT" \
+        E3DC_BOOTSTRAP_RUNNER_ROOT="$WORKER_SNAPSHOT/root" \
+        E3DC_BOOTSTRAP_SOURCE_COMMIT="$head" \
         E3DC_INSTALL_ROOT="$INSTALL_ROOT" \
         PYTHONNOUSERSITE=1 \
         "$PYTHON" -I -B -u "$WORKER_SNAPSHOT/root/installer_main.py" --update-e3dc

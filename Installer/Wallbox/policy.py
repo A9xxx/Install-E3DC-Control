@@ -254,6 +254,7 @@ class EnergyPolicyInput:
     peak_shaving_budget_valid: bool = False
     peak_shaving_allowed_remaining_import_w: Optional[float] = None
     peak_shaving_base_import_w: Optional[float] = None
+    grid_funded_wallbox_authorized: bool = False
 
 
 def peak_shaving_wallbox_power_cap(
@@ -313,6 +314,17 @@ def decide_energy_policy(ctx: EnergyPolicyInput) -> Dict[str, Any]:
     storage_curve_overcharge_relief_active = False
     storage_curve_overcharge_relief_w = 0.0
     display_wb_budget_curve_w = max(0.0, free_w * fz)
+    raw_grid_funded_mode_active = bool(
+        ctx.price_boost_wallbox_active
+        or ctx.effective_allow_grid
+        or ctx.grid_unlocked_all_controllable
+    )
+    grid_funded_budget_authority_active = bool(
+        mode != MODE_OFF
+        and ctx.effective_public_wb_mode != MODE_OFF
+        and raw_grid_funded_mode_active
+        and ctx.grid_funded_wallbox_authorized
+    )
 
     if ctx.price_boost_wallbox_active:
         allowed_w = _safe_float(ctx.wb_max_amp, 0.0) * 230.0 * phases
@@ -438,7 +450,7 @@ def decide_energy_policy(ctx: EnergyPolicyInput) -> Dict[str, Any]:
         )
 
     if ctx.storage_charge_priority_active and not (
-        ctx.price_boost_wallbox_active
+        grid_funded_budget_authority_active
         or ctx.predump_wallbox_active
         or curve_wb_relief_active
         or forecast_auto_relief_active
@@ -446,7 +458,8 @@ def decide_energy_policy(ctx: EnergyPolicyInput) -> Dict[str, Any]:
         allowed_w = 0.0
     elif (
         not (
-            ctx.price_boost_wallbox_active
+            grid_funded_budget_authority_active
+            or ctx.price_boost_wallbox_active
             or ctx.grid_unlocked_all_controllable
             or ctx.predump_wallbox_active
         )
@@ -723,6 +736,11 @@ def decide_energy_policy(ctx: EnergyPolicyInput) -> Dict[str, Any]:
         if allowed_w < 6.0 * 230.0 * phases:
             allowed_w = 0.0
 
+    # Nutzer-Aus ist unabhängig von Preis-, Plan- oder Flexbudgetsignalen eine
+    # harte Endentscheidung und wird vor allen Ausgangsdeckeln erneut gebunden.
+    if mode == MODE_OFF or ctx.effective_public_wb_mode == MODE_OFF:
+        allowed_w = 0.0
+
     peak_shaving_wallbox = peak_shaving_wallbox_power_cap(
         enabled=bool(ctx.peak_shaving_enabled),
         budget_valid=bool(ctx.peak_shaving_budget_valid),
@@ -748,7 +766,22 @@ def decide_energy_policy(ctx: EnergyPolicyInput) -> Dict[str, Any]:
             allowed_w = 0.0
 
     pre_auth_cap = max(0.0, float(allowed_w))
-    auth_budget = max(0.0, _safe_float(getattr(ctx, "authorized_wallbox_budget_w", 32.0 * 230.0 * 3.0), 32.0 * 230.0 * 3.0))
+    storage_auth_budget = max(
+        0.0,
+        _safe_float(
+            getattr(ctx, "authorized_wallbox_budget_w", 32.0 * 230.0 * 3.0),
+            32.0 * 230.0 * 3.0,
+        ),
+    )
+    # Das Storage-Budget autorisiert PV-/Speicherleistung für flexible
+    # Verbraucher. Netzladung besitzt einen eigenen, vom Manager frisch und
+    # fail-closed gebundenen Sicherheitsvertrag. Nur dieser Vertrag darf die
+    # zirkuläre 0-W-Kopplung lösen; rohe Preisflags genügen ausdrücklich nicht.
+    auth_budget = (
+        pre_auth_cap
+        if grid_funded_budget_authority_active
+        else storage_auth_budget
+    )
     final_allowed = min(pre_auth_cap, auth_budget)
     auth_budget_limited = bool(final_allowed < pre_auth_cap)
 
@@ -756,6 +789,11 @@ def decide_energy_policy(ctx: EnergyPolicyInput) -> Dict[str, Any]:
         "allowed_w": final_allowed,
         "pre_authorized_cap_allowed_w": pre_auth_cap,
         "authorized_wallbox_budget_w": auth_budget,
+        "storage_authorized_wallbox_budget_w": storage_auth_budget,
+        "grid_funded_budget_authority_active": bool(
+            grid_funded_budget_authority_active
+        ),
+        "raw_grid_funded_mode_active": bool(raw_grid_funded_mode_active),
         "authorized_wallbox_budget_limited": auth_budget_limited,
         "display_wb_budget_curve_w": max(0.0, float(display_wb_budget_curve_w)),
         "native_mode9_batt_start": bool(native_mode9_batt_start),

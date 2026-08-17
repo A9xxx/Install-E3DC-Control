@@ -1723,6 +1723,7 @@ def install_epex_service(
     start_services=True,
     include_websocket=False,
     expected_recovery_dropins=None,
+    allow_optional_not_found_compat=False,
 ):
     print("Installiere E3DC-Control Kern-Manager Services...")
     from .utils import (
@@ -1805,6 +1806,7 @@ def install_epex_service(
         service_snapshot = capture_systemd_service_bundle(
             service_names,
             expected_recovery_dropins=expected_recovery_dropins,
+            allow_optional_not_found_compat=allow_optional_not_found_compat,
         )
     except Exception as exc:
         print(f"  [!] Bestehender Kerndienstzustand ist nicht sicher gebunden: {exc}")

@@ -69,6 +69,7 @@ from .installer_config import (
     load_config,
 )
 from .transition_context import (
+    get_transition_context,
     venv_directory_chain_is_trusted,
     venv_group_is_private,
     venv_has_extended_acl,
@@ -671,6 +672,7 @@ class PackageTransactionState:
     pip_requested: tuple[str, ...]
     venv_path: str | None = None
     venv_existed: bool = True
+    runtime_venv_required: bool = False
 
 
 def _transition_units_sha256(units) -> str:
@@ -1064,8 +1066,17 @@ def migrate_storage_manager_next_override(
     override_file="/etc/systemd/system/e3dc-storage-manager.service.d/override.conf",
     command_runner=None,
     reload_systemd=True,
+    *,
+    allow_redundant_current_override=False,
 ) -> bool:
-    """Migriert einen Legacy-Override atomar mit effektivem Unit-Readback."""
+    """Migriert oder entfernt einen eng belegten Storage-Legacy-Override.
+
+    Der normale Pfad behält sein bisheriges Verhalten und ersetzt lediglich
+    bekannte alte Skriptnamen. Erst der ausdrücklich gebundene
+    Download-Bootstrap darf nach dem verifizierten Backup einen bereits
+    kanonischen, vollständig redundanten ExecStart-Override entfernen. Andere
+    Drop-ins oder abweichende Writer bleiben unverändert und blockieren.
+    """
 
     runner = command_runner or run_command
     target = Path(str(override_file or ""))
@@ -1076,6 +1087,7 @@ def migrate_storage_manager_next_override(
     original_metadata = None
     preimage_readback = None
     installed_inode = None
+    redundant_override_removed = False
 
     def _identity(metadata):
         return (
@@ -1113,6 +1125,11 @@ def migrate_storage_manager_next_override(
             opened = os.fstat(descriptor)
             if _identity(opened) != _identity(before):
                 raise RuntimeError("Storage-Override driftete beim Öffnen")
+            if (
+                allow_redundant_current_override
+                and _repo_descriptor_has_unsafe_xattrs(descriptor)
+            ):
+                raise RuntimeError("Storage-Override besitzt ACLs oder andere xattrs")
             chunks = []
             remaining = maximum_bytes + 1
             while remaining > 0:
@@ -1130,6 +1147,72 @@ def migrate_storage_manager_next_override(
         if len(payload) > maximum_bytes or b"\x00" in payload:
             raise RuntimeError("Storage-Override ist unplausibel oder enthält NUL")
         return payload, before
+
+    def _redundant_current_exec_argv(source):
+        """Erkennt ausschließlich den früher erzeugten reinen ExecStart-Override."""
+
+        section_seen = False
+        commands = []
+        for raw_line in str(source).splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith(("#", ";")):
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                if section_seen or line[1:-1].strip().lower() != "service":
+                    raise RuntimeError(
+                        "Storage-Override besitzt einen fremden systemd-Abschnitt"
+                    )
+                section_seen = True
+                continue
+            if not section_seen or "=" not in line:
+                raise RuntimeError("Storage-Override besitzt eine fremde Direktive")
+            key, value = line.split("=", 1)
+            if key.strip().lower() != "execstart":
+                raise RuntimeError("Storage-Override besitzt eine fremde Direktive")
+            commands.append(value.strip())
+
+        if not section_seen or len(commands) != 2 or commands[0] or not commands[1]:
+            raise RuntimeError(
+                "Storage-Override ist kein eindeutiger ExecStart-Reset mit einem Writer"
+            )
+        try:
+            argv = tuple(shlex.split(commands[1]))
+        except ValueError as exc:
+            raise RuntimeError("Storage-Override-ExecStart ist nicht eindeutig") from exc
+        canonical_script = os.path.normpath(
+            os.path.join(get_install_path(), "Installer", "storage_manager.py")
+        )
+        venv_bin = os.path.join(
+            os.path.normpath(get_venv_path(get_install_user())),
+            "bin",
+        )
+        allowed_executors = {
+            os.path.join(venv_bin, "python"),
+            os.path.join(venv_bin, "python3"),
+        }
+        if (
+            len(argv) != 2
+            or argv[0] not in allowed_executors
+            or argv[1] != canonical_script
+        ):
+            raise RuntimeError(
+                "Storage-Override setzt keinen exakt kanonischen Storage-Writer"
+            )
+        return argv
+
+    def _effective_exec_argv(readback):
+        value = str((readback or {}).get("ExecStart") or "")
+        marker = "argv[]="
+        if marker not in value:
+            raise RuntimeError("Effektiver Storage-ExecStart enthält kein argv[]")
+        argv_text = value.split(marker, 1)[1].split(" ;", 1)[0].strip()
+        try:
+            argv = tuple(shlex.split(argv_text))
+        except ValueError as exc:
+            raise RuntimeError("Effektiver Storage-ExecStart ist nicht eindeutig") from exc
+        if not argv:
+            raise RuntimeError("Effektiver Storage-ExecStart ist leer")
+        return argv
 
     def _atomic_replace(payload, preserved_metadata, expected_identity):
         nonlocal installed_inode
@@ -1191,13 +1274,27 @@ def migrate_storage_manager_next_override(
             ):
                 raise RuntimeError("Temporärer Storage-Override ist nicht sicher gebunden")
 
-            named_before = os.stat(
-                target.name,
-                dir_fd=parent_descriptor,
-                follow_symlinks=False,
-            )
-            if _identity(named_before) != expected_identity:
-                raise RuntimeError("Storage-Override driftete vor dem atomaren Ersatz")
+            if expected_identity is None:
+                try:
+                    os.stat(
+                        target.name,
+                        dir_fd=parent_descriptor,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise RuntimeError(
+                        "Storage-Override erschien fremd vor dem atomaren Restore"
+                    )
+            else:
+                named_before = os.stat(
+                    target.name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                if _identity(named_before) != expected_identity:
+                    raise RuntimeError("Storage-Override driftete vor dem atomaren Ersatz")
             os.replace(
                 temporary_name,
                 target.name,
@@ -1283,14 +1380,74 @@ def migrate_storage_manager_next_override(
             parent_descriptor = _open_directory_nofollow(target.parent)
         except FileNotFoundError:
             return True
+        if allow_redundant_current_override:
+            parent_metadata = os.fstat(parent_descriptor)
+            if (
+                not stat.S_ISDIR(parent_metadata.st_mode)
+                or parent_metadata.st_uid != 0
+                or parent_metadata.st_gid != 0
+                or parent_metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            ):
+                raise RuntimeError(
+                    "Storage-Override-Verzeichnis ist nicht root-kontrolliert"
+                )
         try:
             original_payload, original_metadata = _read_named_payload()
         except FileNotFoundError:
             return True
+        if allow_redundant_current_override and (
+            original_metadata.st_uid != 0
+            or original_metadata.st_gid != 0
+            or stat.S_IMODE(original_metadata.st_mode) != 0o644
+        ):
+            raise RuntimeError(
+                "Storage-Override besitzt nicht den sicheren root:root-0644-Vertrag"
+            )
         try:
             source = original_payload.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise RuntimeError("Storage-Override ist nicht UTF-8-lesbar") from exc
+        if allow_redundant_current_override:
+            override_argv = _redundant_current_exec_argv(source)
+            if not reload_systemd:
+                raise RuntimeError(
+                    "Storage-Override-Migration benötigt zwingend daemon-reload"
+                )
+            preimage_readback = _unit_readback()
+            if _effective_exec_argv(preimage_readback) != override_argv:
+                raise RuntimeError(
+                    "Storage-Override stimmt nicht mit dem effektiven Writer überein"
+                )
+            named_before = os.stat(
+                target.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            if _identity(named_before) != _identity(original_metadata):
+                raise RuntimeError("Storage-Override driftete vor der Entfernung")
+            os.unlink(target.name, dir_fd=parent_descriptor)
+            redundant_override_removed = True
+            os.fsync(parent_descriptor)
+            try:
+                os.stat(
+                    target.name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            else:
+                raise RuntimeError("Redundanter Storage-Override blieb vorhanden")
+            _daemon_reload()
+            if _effective_exec_argv(_unit_readback()) != override_argv:
+                raise RuntimeError(
+                    "Storage-Override war nicht redundant; effektiver Writer änderte sich"
+                )
+            print(
+                "  [OK] Redundanter Storage-ExecStart-Override nach Backup entfernt."
+            )
+            return True
+
         if not any(name in source for name in legacy_names):
             return True
         if not reload_systemd:
@@ -1331,22 +1488,37 @@ def migrate_storage_manager_next_override(
             parent_descriptor is not None
             and original_payload is not None
             and original_metadata is not None
-            and installed_inode is not None
+            and (installed_inode is not None or redundant_override_removed)
         ):
             try:
-                current = os.stat(
-                    target.name,
-                    dir_fd=parent_descriptor,
-                    follow_symlinks=False,
-                )
-                if (current.st_dev, current.st_ino) != installed_inode:
-                    raise RuntimeError(
-                        "Installierter Storage-Override driftete vor dem Rollback"
+                if redundant_override_removed:
+                    try:
+                        os.stat(
+                            target.name,
+                            dir_fd=parent_descriptor,
+                            follow_symlinks=False,
+                        )
+                    except FileNotFoundError:
+                        restore_expected_identity = None
+                    else:
+                        raise RuntimeError(
+                            "Storage-Override erschien fremd vor dem Restore"
+                        )
+                else:
+                    current = os.stat(
+                        target.name,
+                        dir_fd=parent_descriptor,
+                        follow_symlinks=False,
                     )
+                    if (current.st_dev, current.st_ino) != installed_inode:
+                        raise RuntimeError(
+                            "Installierter Storage-Override driftete vor dem Rollback"
+                        )
+                    restore_expected_identity = _identity(current)
                 _atomic_replace(
                     original_payload,
                     original_metadata,
-                    _identity(current),
+                    restore_expected_identity,
                 )
                 _daemon_reload()
                 restored_payload, restored_metadata = _read_named_payload()
@@ -1356,6 +1528,7 @@ def migrate_storage_manager_next_override(
                     or restored_metadata.st_gid != original_metadata.st_gid
                     or stat.S_IMODE(restored_metadata.st_mode)
                     != stat.S_IMODE(original_metadata.st_mode)
+                    or restored_metadata.st_nlink != original_metadata.st_nlink
                     or restored_metadata.st_mtime_ns != original_metadata.st_mtime_ns
                 ):
                     raise RuntimeError("Storage-Override-Preimage wurde nicht vollständig restauriert")
@@ -1365,7 +1538,10 @@ def migrate_storage_manager_next_override(
                 rollback_errors.append(str(rollback_exc))
         detail = str(exc)
         if rollback_errors:
-            detail += "; Restore fehlgeschlagen: " + "; ".join(rollback_errors)
+            detail += (
+                "; Restore fehlgeschlagen; Update bleibt fail-closed abgebrochen: "
+                + "; ".join(rollback_errors)
+            )
         print(f"  [!] Storage-Manager-Override konnte nicht migriert werden: {detail}")
         return False
     finally:
@@ -4815,7 +4991,11 @@ def _run_core_service_installer(label: str, installer) -> bool:
     return True
 
 
-def _ensure_install_center_core_services(*, expected_recovery_dropins=None) -> bool:
+def _ensure_install_center_core_services(
+    *,
+    expected_recovery_dropins=None,
+    allow_optional_not_found_compat=False,
+) -> bool:
     """Installiert fehlende Kernsystem-Units aus dem Install-Center nach."""
     print('\n[->] Stelle Kernsystem-Dienste aus dem Install-Center sicher...')
     ok = True
@@ -4828,6 +5008,7 @@ def _ensure_install_center_core_services(*, expected_recovery_dropins=None) -> b
                 start_services=False,
                 include_websocket=True,
                 expected_recovery_dropins=expected_recovery_dropins,
+                allow_optional_not_found_compat=allow_optional_not_found_compat,
             ),
         ) and ok
     except Exception as exc:
@@ -8084,13 +8265,25 @@ def _capture_package_transaction(
     install_user: str,
     *,
     allow_missing_venv: bool = False,
+    require_runtime_venv: bool = False,
 ) -> PackageTransactionState:
+    if not isinstance(require_runtime_venv, bool):
+        raise RuntimeError("Laufzeit-venv-Vertrag ist nicht boolesch")
     apt_requested = tuple(_validated_release_apt_packages(policy))
     pip_requested = tuple(_validated_venv_pip_packages(policy))
     apt_before = _installed_apt_packages() if apt_requested else frozenset()
-    venv_python = _find_venv_python(install_user) if pip_requested else None
+    venv_python = (
+        _find_venv_python(install_user)
+        if pip_requested or require_runtime_venv
+        else None
+    )
     venv_existed = bool(venv_python)
     venv_path = str(Path(venv_python).parent.parent) if venv_python else None
+    if require_runtime_venv and not venv_python:
+        raise RuntimeError(
+            "Installierter Watchdog besitzt keinen vertrauensgebundenen "
+            "venv-Interpreter"
+        )
     if pip_requested and not venv_python:
         if not allow_missing_venv:
             raise RuntimeError("Python-Pakete angefordert, aber kein verifiziertes venv gefunden")
@@ -8099,7 +8292,11 @@ def _capture_package_transaction(
         venv_path = _release_venv_path(install_user)
         if os.path.lexists(venv_path):
             raise RuntimeError("Fehlendes venv ist durch einen bestehenden Pfad blockiert")
-    pip_before = _installed_pip_packages(venv_python, install_user) if venv_python else {}
+    pip_before = (
+        _installed_pip_packages(venv_python, install_user)
+        if pip_requested and venv_python
+        else {}
+    )
     return PackageTransactionState(
         apt_before=apt_before,
         pip_before=tuple(sorted(pip_before.items())),
@@ -8109,7 +8306,90 @@ def _capture_package_transaction(
         pip_requested=pip_requested,
         venv_path=venv_path,
         venv_existed=venv_existed,
+        runtime_venv_required=require_runtime_venv,
     )
+
+
+def _watchdog_runtime_venv_required(state: TransitionState) -> bool:
+    """Erkennt einen vorhandenen Watchdog unabhängig von der pip-Policy."""
+
+    return bool(
+        PIGUARD_UNIT in state.preinstalled_units
+        or os.path.exists(PIGUARD_FRAGMENT_PATH)
+        or os.path.exists(PIGUARD_EXECUTABLE_PATH)
+    )
+
+
+def _finalizer_venv_contract(
+    package_transaction: PackageTransactionState,
+) -> tuple[str, str]:
+    """Trennt Paketmutation und bereits vorhandenen Watchdog-Laufzeitkontext."""
+
+    runtime_required = bool(
+        getattr(package_transaction, "runtime_venv_required", False)
+    )
+    if not package_transaction.pip_requested and not runtime_required:
+        return "unused", ""
+    state = "present" if package_transaction.venv_existed else "missing"
+    path = str(package_transaction.venv_path or "")
+    if not os.path.isabs(path) or os.path.abspath(path) != path:
+        raise RuntimeError("venv-Preimage besitzt keinen kanonischen absoluten Pfad")
+    if runtime_required and state != "present":
+        raise RuntimeError("Watchdog-Laufzeit-venv ist nicht vorhanden")
+    return state, path
+
+
+def _validate_watchdog_runtime_venv_contract(
+    *,
+    required: bool,
+    expected_venv_state: str,
+    expected_venv_path: str,
+    target_root: str,
+    install_user: str,
+):
+    """Prüft den Watchdog-Interpreter explizit vor jedem finalen Dienststart."""
+
+    if not required:
+        return None
+    if expected_venv_state != "present":
+        raise RuntimeError("Installierter Watchdog besitzt kein vorhandenes Laufzeit-venv")
+    path = str(expected_venv_path or "")
+    if not os.path.isabs(path) or os.path.abspath(path) != path:
+        raise RuntimeError("Watchdog-Laufzeit-venv besitzt keinen kanonischen Pfad")
+    context = get_transition_context(
+        explicit_install_path=target_root,
+        explicit_install_user=install_user,
+        explicit_venv_path=path,
+        require_trusted=True,
+    )
+    expected_python = os.path.join(path, "bin", "python3")
+    if (
+        not context.trusted
+        or context.install_path != target_root
+        or context.install_user != install_user
+        or context.venv_path != path
+        or context.venv_python != expected_python
+    ):
+        raise RuntimeError("Watchdog-Laufzeitkontext weicht vom gebundenen venv ab")
+    return context
+
+
+def _run_with_bound_bootstrap_venv(venv_path: str, callback):
+    """Gibt genau einem synchronen Watchdog-Aufruf den vorgeprüften venv-Pfad."""
+
+    path = str(venv_path or "")
+    if not os.path.isabs(path) or os.path.abspath(path) != path:
+        raise RuntimeError("Temporäre Watchdog-venv-Bindung ist nicht kanonisch")
+    variable = "E3DC_BOOTSTRAP_VENV"
+    previous = os.environ.get(variable)
+    os.environ[variable] = path
+    try:
+        return callback()
+    finally:
+        if previous is None:
+            os.environ.pop(variable, None)
+        else:
+            os.environ[variable] = previous
 
 
 def _remove_transaction_created_venv(state: PackageTransactionState) -> None:
@@ -10720,6 +11000,7 @@ def finalize_release_from_target(
     update_safety_service_unit: str | None = None,
     update_safety_runtime_directory: str | None = None,
     update_safety_token_path: str | None = None,
+    explicit_download_bootstrap: bool = False,
     headless: bool = True,
     privileged_preimages=None,
     postcommit_state: dict[str, bool] | None = None,
@@ -10743,6 +11024,8 @@ def finalize_release_from_target(
     role = str(expected_role or "").strip().lower()
     if role not in VALID_HA_ROLES:
         raise RuntimeError("Erwartete HA-/Shadow-Rolle ist ungültig")
+    if not isinstance(explicit_download_bootstrap, bool):
+        raise RuntimeError("Download-Bootstrap-Vertrag ist nicht boolesch")
 
     safety_values = (
         update_safety_transaction,
@@ -10796,6 +11079,7 @@ def finalize_release_from_target(
         expected_units_sha256=expected_units_sha256,
         expected_legacy_activity=expected_legacy_activity,
     )
+    watchdog_runtime_required = _watchdog_runtime_venv_required(state)
 
     install_user = get_install_user()
     policy = _read_policy_from_commit(target_root, commit, install_user)
@@ -10807,8 +11091,20 @@ def finalize_release_from_target(
             raise RuntimeError("Paket-Preimage besitzt keinen gültigen venv-Zustand")
         if not os.path.isabs(str(expected_venv_path or "")):
             raise RuntimeError("Paket-Preimage besitzt keinen absoluten venv-Pfad")
+    elif watchdog_runtime_required:
+        if expected_venv_state != "present":
+            raise RuntimeError("Watchdog-Laufzeit-venv ist im Finalizer nicht vorhanden")
+        if not os.path.isabs(str(expected_venv_path or "")):
+            raise RuntimeError("Watchdog-Laufzeit-venv besitzt keinen absoluten Pfad")
     elif expected_venv_state != "unused" or expected_venv_path:
         raise RuntimeError("venv-Preimage ist ohne Python-Paketpolicy unzulässig")
+    _validate_watchdog_runtime_venv_contract(
+        required=watchdog_runtime_required,
+        expected_venv_state=expected_venv_state,
+        expected_venv_path=expected_venv_path,
+        target_root=target_root,
+        install_user=install_user,
+    )
 
     _announce_finalizer_phase(2, phase_total, "Paket- und Repositoryzustand herstellen")
     _secure_repo_permissions(
@@ -10882,12 +11178,19 @@ def finalize_release_from_target(
         if safety_contract is not None
         else None
     )
+    # Der bekannte Storage-Alt-Override muss vor dem Bundle-Capture
+    # normalisiert werden. Andernfalls stuft der absichtlich strenge
+    # Service-Snapshot selbst einen semantisch identischen Produkt-Override
+    # als fremd ein und verhindert seine eigene Migration.
+    if not migrate_storage_manager_next_override(
+        allow_redundant_current_override=explicit_download_bootstrap,
+    ):
+        raise RuntimeError("Storage-Service-Migration ist fehlgeschlagen")
     if not _ensure_install_center_core_services(
         expected_recovery_dropins=expected_service_dropins,
+        allow_optional_not_found_compat=explicit_download_bootstrap,
     ):
         raise RuntimeError("Kernservice-Installation ist unvollständig")
-    if not migrate_storage_manager_next_override():
-        raise RuntimeError("Storage-Service-Migration ist fehlgeschlagen")
     from .permissions import storage_manager_writer_contract
     storage_writer = storage_manager_writer_contract()
     if not storage_writer.get("ok"):
@@ -10902,6 +11205,20 @@ def finalize_release_from_target(
             "Bare-Metal-Update hat die tmpfs-Startsperren unerwartet übersprungen"
         )
 
+    def refresh_bound_watchdog(*, start_service=True):
+        if not watchdog_runtime_required:
+            return refresh_watchdog_guard_script(start_service=start_service)
+        return _run_with_bound_bootstrap_venv(
+            expected_venv_path,
+            lambda: refresh_watchdog_guard_script(start_service=start_service),
+        )
+
+    watchdog_refresh_required = bool(
+        os.path.exists(PI_GUARD_PATH) or _service_unit_exists("piguard")
+    )
+    if watchdog_refresh_required != watchdog_runtime_required:
+        raise RuntimeError("Watchdog-Bestand driftete vor der Guard-Projektion")
+
     projected_piguard = False
     if safety_contract is not None:
         _validate_update_safety_contract(safety_contract, expected_state="pending")
@@ -10912,10 +11229,7 @@ def finalize_release_from_target(
             repo_dir=target_root,
             transaction_id=safety_contract.transaction_id,
         )
-        watchdog_refresh_required = bool(
-            os.path.exists(PI_GUARD_PATH) or _service_unit_exists("piguard")
-        )
-        if not refresh_watchdog_guard_script(start_service=False):
+        if not refresh_bound_watchdog(start_service=False):
             raise RuntimeError("Watchdog-Guard konnte unter Bootblock nicht aktualisiert werden")
         projected_piguard = watchdog_refresh_required
         if projected_piguard and not _service_unit_exists("piguard"):
@@ -10961,7 +11275,7 @@ def finalize_release_from_target(
         projected_piguard=projected_piguard,
     ):
         raise RuntimeError("Erwartete Dienste konnten nicht vollständig gestartet werden")
-    if safety_contract is None and not refresh_watchdog_guard_script():
+    if safety_contract is None and not refresh_bound_watchdog():
         _stop_v4_services(restart_services)
         raise RuntimeError("Watchdog-Guard konnte nach dem finalen Dienststart nicht aktualisiert werden")
     _announce_finalizer_phase(6, phase_total, "Gesundheit und Bootvertrag verifizieren")
@@ -11722,6 +12036,7 @@ def _invoke_verified_target_updater(
         for name in (
             "E3DC_BOOTSTRAP_ROOT",
             "E3DC_BOOTSTRAP_RUNNER_ROOT",
+            "E3DC_BOOTSTRAP_SOURCE_COMMIT",
             "E3DC_BOOTSTRAP_USER",
             "E3DC_BOOTSTRAP_VENV",
             "PYTHONHOME",
@@ -11832,6 +12147,7 @@ def _invoke_target_finalizer(
     state: TransitionState,
     package_transaction: PackageTransactionState,
     update_safety_contract: UpdateSafetyContract | None = None,
+    explicit_download_bootstrap: bool = False,
 ) -> None:
     """Startet den Zielprozess direkt oder im crash-sicheren transienten Service."""
 
@@ -11878,14 +12194,7 @@ def _invoke_target_finalizer(
             raise RuntimeError(f"Target-Modul wurde nach der Commit-Bindung ausgetauscht: {relative_path}")
 
     config_state = "missing" if state.bootstrap_legacy_config else "present"
-    if not package_transaction.pip_requested:
-        venv_state = "unused"
-        venv_path = ""
-    else:
-        venv_state = "present" if package_transaction.venv_existed else "missing"
-        venv_path = str(package_transaction.venv_path or "")
-        if not os.path.isabs(venv_path):
-            raise RuntimeError("Paket-Preimage besitzt keinen absoluten venv-Pfad")
+    venv_state, venv_path = _finalizer_venv_contract(package_transaction)
 
     snapshot_parent = _trusted_same_filesystem_snapshot_parent(repo_dir)
     _cleanup_stale_target_execution_snapshots(
@@ -11913,6 +12222,7 @@ def _invoke_target_finalizer(
     for name in (
         "E3DC_BOOTSTRAP_ROOT",
         "E3DC_BOOTSTRAP_RUNNER_ROOT",
+        "E3DC_BOOTSTRAP_SOURCE_COMMIT",
         "E3DC_BOOTSTRAP_USER",
         "E3DC_BOOTSTRAP_VENV",
         "PYTHONHOME",
@@ -11941,6 +12251,8 @@ def _invoke_target_finalizer(
         "--expected-venv-state", venv_state,
         "--expected-venv-path", venv_path,
     ]
+    if explicit_download_bootstrap:
+        finalizer_args.append("--explicit-download-bootstrap")
     if update_safety_contract is not None:
         finalizer_args.extend((
             "--update-safety-transaction", update_safety_contract.transaction_id,
@@ -13922,6 +14234,7 @@ def _execute_update_transaction(
                 "Ziel-Policy driftete gegenüber dem gebundenen Ziel-Updater-Tag"
             )
         _validated_restart_services(policy, state)
+        watchdog_runtime_required = _watchdog_runtime_venv_required(state)
         package_transaction = _capture_package_transaction(
             policy,
             install_user,
@@ -13930,6 +14243,10 @@ def _execute_update_transaction(
             # erlaubt dies nur bei freigegebenem python3-venv und exakt
             # absentem kanonischem Zielpfad; jeder belegte Fremdpfad stoppt.
             allow_missing_venv=True,
+            # Der Watchdog benötigt seinen Interpreter auch dann, wenn der
+            # Release selbst keine Python-Pakete ändert. Diese Laufzeitbindung
+            # darf deshalb nicht aus der pip-Policy abgeleitet werden.
+            require_runtime_venv=watchdog_runtime_required,
         )
 
         _assert_target_worktree_replaceable(
@@ -13962,6 +14279,7 @@ def _execute_update_transaction(
             state=state,
             package_transaction=package_transaction,
             update_safety_contract=update_safety_contract,
+            explicit_download_bootstrap=bool(target_install_path),
         )
     except BaseException as exc:
         print(f"[!] {transition_name} fehlgeschlagen: {exc}")
@@ -14039,6 +14357,35 @@ def _read_handoff_role(config_path: str = HA_CONFIG_PATH) -> str:
     return role
 
 
+def _bound_handoff_source_commit(repo_dir: str) -> str | None:
+    """Bindet den alten Updater entweder direkt oder an seinen Web-Snapshot."""
+
+    product_root = os.path.realpath(repo_dir)
+    module_root = os.path.realpath(os.path.dirname(INSTALLER_DIR))
+    if module_root == product_root:
+        return None
+
+    bootstrap_root = str(os.environ.get("E3DC_BOOTSTRAP_ROOT") or "").strip()
+    bootstrap_runner = str(
+        os.environ.get("E3DC_BOOTSTRAP_RUNNER_ROOT") or ""
+    ).strip()
+    source_commit = str(
+        os.environ.get("E3DC_BOOTSTRAP_SOURCE_COMMIT") or ""
+    ).strip().lower()
+    if (
+        not bootstrap_root
+        or not bootstrap_runner
+        or os.path.realpath(bootstrap_root) != product_root
+        or os.path.realpath(bootstrap_runner) != module_root
+        or not FULL_COMMIT_RE.fullmatch(source_commit)
+    ):
+        raise RuntimeError(
+            "Alt-Updater besitzt keinen vollständig gebundenen "
+            "Web-Ausführungssnapshot"
+        )
+    return source_commit
+
+
 def _handoff_to_verified_target_updater(
     *,
     headless: bool,
@@ -14056,11 +14403,7 @@ def _handoff_to_verified_target_updater(
             else None
         )
         repo_dir = _validate_bootstrap_install_path(INSTALL_PATH)
-        module_root = os.path.dirname(INSTALLER_DIR)
-        if os.path.realpath(module_root) != repo_dir:
-            raise RuntimeError(
-                "Alt-Updater darf den Ziel-Handoff nur aus dem aktiven Produktbaum starten"
-            )
+        snapshot_source_commit = _bound_handoff_source_commit(repo_dir)
         if not os.path.isdir(os.path.join(repo_dir, ".git")):
             raise RuntimeError(
                 "Installation ohne Git darf nur über den expliziten Erstinstallations-Bootstrap wechseln"
@@ -14070,6 +14413,13 @@ def _handoff_to_verified_target_updater(
         old_commit = _resolve_git_commit(repo_dir, "HEAD", install_user)
         if not old_commit:
             raise RuntimeError("Aktueller HEAD konnte nicht als volle Commit-SHA verifiziert werden")
+        if snapshot_source_commit and not _exact_commit_matches(
+            snapshot_source_commit,
+            old_commit,
+        ):
+            raise RuntimeError(
+                "Web-Ausführungssnapshot stimmt nicht mit dem aktuellen HEAD überein"
+            )
         _require_bound_origin(repo_dir, install_user)
 
         effective_target_tag = requested_tag

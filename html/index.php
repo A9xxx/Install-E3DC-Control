@@ -3399,6 +3399,14 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
 
                 $('#card-regler-wrapper').show();
 
+            } else if (data.storage_plan_meta && data.storage_plan_meta.clear_classical_curves === true) {
+                $('#stat-regler-rb-time, #stat-regler-re-time, #stat-regler-le-time').text('--:--');
+                $('#stat-regler-rb-soc, #stat-regler-re-soc, #stat-regler-le-soc').text('');
+                $('#stat-regler-soll-now, #stat-regler-meta').text('--');
+                $('#stat-regler-summary').text('Die Direktvermarktung führt den aktuellen Slot.');
+                $('#head-rb, #head-re, #head-le').text('--');
+                $('#card-regler-wrapper').hide();
+                $('#header-regler-plan').removeClass('d-xl-flex text-muted').addClass('d-none');
             } else if (data.regler && data.regler.rb_time) {
                 // Legacy-Fallback: C++ Fahrplan (alt)
                 const toLocal = gmtTime => {

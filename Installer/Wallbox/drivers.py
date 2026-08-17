@@ -4252,7 +4252,22 @@ class E3DCMultiConnectCharger(E3DCCharger):
                 return False
             self.external_suspended = False
             self.sonnenmodus = False
-            return self._send_command_internal(target_amp, force_state, is_heartbeat=False)
+            ok = bool(
+                self._send_command_internal(
+                    target_amp,
+                    force_state,
+                    is_heartbeat=False,
+                )
+            )
+            if ok:
+                # Die Multi-Connect-Klasse überschreibt die Basismethode. Ohne
+                # diesen bestätigten Sollwert bleibt ``last_amp`` auf ``None``
+                # und der für SET_EXTERN erforderliche <3-s-Heartbeat schweigt
+                # nach genau einem Managerbefehl. Ein fehlgeschlagener Ausgang
+                # darf dagegen keinen neuen Heartbeat-Sollwert vortäuschen.
+                self.last_amp = target_amp
+                self.last_force_state = force_state
+            return ok
 
     def take_control(self):
         request_generation = self._control_generation
@@ -4296,7 +4311,17 @@ class E3DCMultiConnectCharger(E3DCCharger):
                 return False
             self.external_suspended = False
             self.sonnenmodus = False
-            return self._send_command_internal(target_amp, force_state, is_heartbeat=False)
+            ok = bool(
+                self._send_command_internal(
+                    target_amp,
+                    force_state,
+                    is_heartbeat=False,
+                )
+            )
+            if ok:
+                self.last_amp = target_amp
+                self.last_force_state = force_state
+            return ok
 
 
 # ===========================================================================

@@ -328,6 +328,282 @@ def _wallbox_storage_power_budget_contract(
     }
 
 
+def _wallbox_grid_funded_safety_envelope_contract(
+    budget: Any,
+    freshness: Any,
+    *,
+    live_sample_invalid: bool = False,
+    storage_grid_hold_active: bool = False,
+) -> Dict[str, Any]:
+    """Prüft nur den Safety-Umschlag, nicht das PV-Flexbudget.
+
+    Ein fremder Verbraucher darf den gemeinsamen Flexbudget-Vertrag auf 0 W
+    setzen, ohne damit eine explizit netzfinanzierte Wallbox zu verbieten. Die
+    Quelle, Aktualität und wallboxbezogene Projektion müssen dennoch lückenlos
+    gebunden sein; fehlende oder widersprüchliche Felder schließen das Gate.
+    """
+
+    result = {
+        "valid": False,
+        "reason": "missing",
+        "producer_identity_valid": False,
+        "ifc_readback_blocked": True,
+        "ifc_readback_block_reason": "ifc_gate_missing",
+    }
+    if live_sample_invalid:
+        result["reason"] = "live_sample_invalid"
+        return result
+    if not isinstance(freshness, dict):
+        result["reason"] = "freshness_missing"
+        return result
+    if (
+        freshness.get("ok") is not True
+        or freshness.get("stale") is not False
+        or freshness.get("timeout") is not False
+        or freshness.get("valid") is not True
+    ):
+        result["reason"] = "budget_not_fresh"
+        return result
+    freshness_age_s = freshness.get("age_s")
+    if (
+        type(freshness_age_s) not in (int, float)
+        or not math.isfinite(float(freshness_age_s))
+        or not 0.0 <= float(freshness_age_s) < 15.0
+    ):
+        result["reason"] = "freshness_age_invalid"
+        return result
+    if not isinstance(budget, dict):
+        result["reason"] = "budget_missing"
+        return result
+    if budget.get("schema_version") != "wb_pv_budget_control_v2":
+        result["reason"] = "budget_schema_invalid"
+        return result
+    budget_w = budget.get("budget_w")
+    decision_ts = budget.get("ts")
+    if (
+        type(budget_w) is not int
+        or type(decision_ts) is not int
+        or budget_w < 0
+        or decision_ts <= 0
+    ):
+        result["reason"] = "budget_value_or_ts_invalid"
+        return result
+    budget_state = str(budget.get("state") or "").strip().lower()
+    storage_state = str(budget.get("storage_state") or "").strip().lower()
+    hard_state_active = bool(
+        budget_state == "ifc_grid_hold"
+        or storage_state == "ifc_grid_hold"
+        or budget_state == "wallbox_predump_floor_hold"
+        or storage_state == "wallbox_predump_floor_hold"
+        or budget_state.startswith("pre_discharge")
+        or storage_state.startswith("pre_discharge")
+    )
+    if (
+        storage_grid_hold_active
+        or hard_state_active
+    ):
+        result["reason"] = "storage_hard_state"
+        return result
+    if (
+        budget.get("force_wallbox_stop") is True
+        or budget.get("predump_floor_hold") is True
+        or budget.get("predump_active") is True
+        or budget.get("live_sample_invalid") is not False
+        or bool(str(budget.get("runtime_block_reason") or "").strip())
+    ):
+        result["reason"] = "storage_safety_block"
+        return result
+
+    identity = budget.get("producer_identity")
+    if not isinstance(identity, dict):
+        result["reason"] = "producer_identity_missing"
+        return result
+    generation_material = {
+        key: value
+        for key, value in identity.items()
+        if key != "decision_generation"
+    }
+    identity_wallbox_w = identity.get("authorized_wallbox_budget_w")
+    identity_valid = bool(
+        identity.get("schema_version")
+        == "storage_consumer_budget_identity_v1"
+        and identity.get("decision_owner") == "storage_manager"
+        and identity.get("decision_effect")
+        == "flexible_consumer_power_budget"
+        and identity.get("decision_ts") == decision_ts
+        and type(identity_wallbox_w) is int
+        and identity_wallbox_w >= 0
+        and identity_wallbox_w == budget_w
+        and identity.get("decision_generation")
+        == revision_hash(generation_material)
+    )
+    result["producer_identity_valid"] = identity_valid
+    if not identity_valid:
+        result["reason"] = "producer_identity_invalid"
+        return result
+
+    consumer_allocations = budget.get("consumer_allocations")
+    energy_score = budget.get("energy_score")
+    energy_allocations = (
+        energy_score.get("consumer_allocations")
+        if isinstance(energy_score, dict)
+        else None
+    )
+    consumer_wallbox_w = (
+        consumer_allocations.get("wallbox")
+        if isinstance(consumer_allocations, dict)
+        else None
+    )
+    energy_wallbox_w = (
+        energy_allocations.get("wallbox")
+        if isinstance(energy_allocations, dict)
+        else None
+    )
+    if (
+        not isinstance(consumer_allocations, dict)
+        or not isinstance(energy_allocations, dict)
+        or type(consumer_wallbox_w) is not int
+        or type(energy_wallbox_w) is not int
+        or consumer_wallbox_w < 0
+        or energy_wallbox_w < 0
+        or consumer_wallbox_w != budget_w
+        or energy_wallbox_w != budget_w
+    ):
+        result["reason"] = "wallbox_projection_mismatch"
+        return result
+    revision_material = {
+        key: value for key, value in budget.items() if key != "budget_revision"
+    }
+    if budget.get("budget_revision") != revision_hash(revision_material):
+        result["reason"] = "budget_revision_invalid"
+        return result
+
+    ifc_gate = budget.get("wallbox_ifc_readback_gate")
+    if not isinstance(ifc_gate, dict):
+        result["reason"] = "ifc_gate_missing"
+        return result
+    if (
+        ifc_gate.get("schema") != "wallbox_ifc_readback_gate_v1"
+        or type(ifc_gate.get("contract_version")) is not int
+        or ifc_gate.get("contract_version") != 2
+        or type(ifc_gate.get("required")) is not bool
+        or type(ifc_gate.get("released")) is not bool
+    ):
+        result["reason"] = "ifc_gate_contract_invalid"
+        return result
+    ifc_status = str(ifc_gate.get("status") or "")
+    ifc_reason = str(ifc_gate.get("block_reason") or "")
+    ifc_released = bool(
+        ifc_gate.get("released") is True
+        and not ifc_reason
+        and (
+            (
+                ifc_gate.get("required") is False
+                and ifc_status == "not_required"
+            )
+            or (
+                ifc_gate.get("required") is True
+                and ifc_status == "confirmed"
+            )
+        )
+    )
+    result["ifc_readback_blocked"] = not ifc_released
+    result["ifc_readback_block_reason"] = ifc_reason
+    if not ifc_released:
+        result["reason"] = "ifc_gate_blocked"
+        return result
+
+    result["valid"] = True
+    result["reason"] = "valid"
+    return result
+
+
+def _wallbox_grid_funded_authority_contract(
+    *,
+    controllable_charger_ids: Any,
+    price_optimized_charger_ids: Any,
+    manual_pause_by_id: Any,
+    effective_public_wb_mode: Any,
+    price_boost_wallbox_active: bool,
+    effective_allow_grid: bool,
+    grid_unlocked_all_controllable: bool,
+    safety_envelope_valid: bool,
+    hard_blocked: bool,
+    predump_wallbox_active: bool,
+    storage_predump_active: bool,
+    storage_grid_hold_active: bool,
+) -> Dict[str, Any]:
+    """Bindet globale Netzfreigabe an jeden tatsächlich steuerbaren Ausgang."""
+
+    try:
+        controllable = {
+            int(value)
+            for value in (controllable_charger_ids or ())
+            if int(value) > 0
+        }
+        price_optimized = {
+            int(value)
+            for value in (price_optimized_charger_ids or ())
+            if int(value) > 0
+        }
+    except (TypeError, ValueError):
+        controllable = set()
+        price_optimized = set()
+    manual_pause_contract_valid = isinstance(manual_pause_by_id, dict)
+    paused = manual_pause_by_id if manual_pause_contract_valid else {}
+    scope_ids = {
+        charger_id
+        for charger_id in controllable
+        if not bool(paused.get(charger_id, paused.get(str(charger_id), False)))
+    }
+    raw_mode_active = bool(
+        price_boost_wallbox_active
+        or effective_allow_grid
+        or grid_unlocked_all_controllable
+    )
+    outputs_bound = bool(scope_ids and scope_ids.issubset(price_optimized))
+    blockers = []
+    try:
+        if isinstance(effective_public_wb_mode, bool):
+            raise ValueError("bool_is_not_mode")
+        public_mode_value = float(effective_public_wb_mode)
+        public_mode = (
+            int(public_mode_value)
+            if math.isfinite(public_mode_value)
+            and public_mode_value.is_integer()
+            else MODE_OFF
+        )
+    except (TypeError, ValueError, OverflowError):
+        public_mode = MODE_OFF
+    if public_mode == MODE_OFF:
+        blockers.append("mode_off")
+    if not raw_mode_active:
+        blockers.append("grid_mode_not_active")
+    if not scope_ids:
+        blockers.append("no_controllable_output")
+    if not outputs_bound:
+        blockers.append("grid_output_scope_not_fully_bound")
+    if not manual_pause_contract_valid:
+        blockers.append("manual_pause_contract_invalid")
+    if safety_envelope_valid is not True:
+        blockers.append("safety_envelope_invalid")
+    if hard_blocked:
+        blockers.append("hard_blocked")
+    if predump_wallbox_active or storage_predump_active:
+        blockers.append("predump_active")
+    if storage_grid_hold_active:
+        blockers.append("storage_grid_hold_active")
+    return {
+        "contract": "grid_funded_wallbox_authority_v1",
+        "authorized": not blockers,
+        "raw_mode_active": raw_mode_active,
+        "outputs_bound": outputs_bound,
+        "scope_ids": sorted(scope_ids),
+        "price_optimized_ids": sorted(price_optimized),
+        "blockers": blockers,
+    }
+
+
 def _fresh_curve_forecast_budget(
     budget: Any,
     *,
@@ -10441,6 +10717,24 @@ def _execute_wallbox_driver_command(c_data, command, c_id=None, reason=""):
 
     recovery = box.get("_openwb_pro_phase_recovery_hold")
     recovery_active = isinstance(recovery, dict) and recovery.get("active")
+    restart_probe = box.get("_openwb_pro_phase_preoutput_restart_probe")
+    if (
+        isinstance(restart_probe, dict)
+        and restart_probe.get("active") is True
+        and (
+            (
+                method in _EFFECTIVE_CURRENT_METHODS
+                and _cfg_float(cmd.get("amp"), 0.0) > 0.0
+            )
+            or method in ("set_phases", "trigger_cp_interrupt", "cp_interrupt")
+        )
+    ):
+        box["_wallbox_driver_dispatch_contract"].update({
+            "blocked": True,
+            "blocker": "process_restart_preoutput_readback_required",
+            "wire_attempted": False,
+        })
+        return False
     session_persistence_recovery = box.get(
         "_openwb_pro_session_persistence_recovery_hold"
     )
@@ -11063,7 +11357,7 @@ def _execute_wallbox_driver_command(c_data, command, c_id=None, reason=""):
         getattr(charger, "_heartbeat_prepare_generation", 0) or 0
     ) if openwb_pro_charger else 0
     if (
-        method == "set_amp_sonnenmodus"
+        method in ("set_amp_sonnenmodus", "set_amp_and_state")
         and e3dc_session.is_e3dc_native_charger(charger)
         and hasattr(charger, "lock")
     ):
@@ -11221,6 +11515,36 @@ def _execute_wallbox_current_with_receipt(
     if not math.isfinite(executed_amp) or executed_amp < 0.0:
         return None
     return dict(receipt)
+
+
+def _confirmed_native_current_amp(c_data, previous_receipt):
+    """Projiziert nur den nach allen Gates bestätigten WBchar6-Strom."""
+
+    data = c_data if isinstance(c_data, dict) else {}
+    receipt = data.get("_last_executed_command")
+    if not (
+        isinstance(receipt, dict)
+        and receipt is not previous_receipt
+        and receipt.get("cycle_token") == data.get("_wallbox_cycle_token")
+        and str(receipt.get("method") or "")
+        in ("set_amp_and_state", "set_amp_sonnenmodus")
+        and receipt.get("wire_receipt_contract")
+        == "e3dc_wbchar6_wire_receipt_v1"
+        and receipt.get("wire_receipt_new") is True
+    ):
+        return None
+    amp = _cfg_float(receipt.get("amp"), -1.0)
+    if not math.isfinite(amp) or amp < 0.0:
+        return None
+    requested = _cfg_float(receipt.get("requested_amp"), amp)
+    data["_wallbox_current_gate_projection"] = {
+        "contract": "wallbox_current_gate_projection_v1",
+        "requested_amp": requested,
+        "executed_amp": amp,
+        "gate_limited": amp < requested,
+        "wire_receipt_seq": int(receipt.get("wire_receipt_seq", 0) or 0),
+    }
+    return amp
 
 
 def _execute_wallbox_hold_current_enforcement(
@@ -15564,6 +15888,52 @@ def _finalize_completed_openwb_pro_phase_transition(c_data, status, *, now_ts=No
     return False
 
 
+def _finalize_process_restart_preoutput_openwb_pro_phase_transition(
+    c_data, status, *, now_ts=None
+):
+    """Supersediert eine alte No-output-Generation ohne Geräteausgang."""
+
+    data = c_data if isinstance(c_data, dict) else {}
+    st = status if isinstance(status, dict) else {}
+    marker = data.get("_openwb_pro_phase_preoutput_restart_probe")
+    marker = marker if isinstance(marker, dict) else {}
+    readback_ts = _cfg_float(st.get("driver_status_last_ok_ts"), 0.0)
+    if readback_ts > 100_000_000_000.0:
+        readback_ts /= 1000.0
+    target = _valid_phase_count(marker.get("target_phases"), 0)
+    observed = _wallbox_observed_phase_count(st)
+    if not (
+        marker.get("active") is True
+        and _wallbox_status_fresh_real_charging(st)
+        and readback_ts > _cfg_float(marker.get("restored_ts"), 0.0) > 0.0
+        and st.get("cp_interrupt_isactive") in (False, 0)
+        and _wb_status_connected(st)
+        and _wb_status_real_power(st) > 500.0
+        and st.get("phase_power_verified") is True
+        and target in (1, 3)
+        and observed in (1, 3)
+        and observed != target
+        and (_fresh_wallbox_reported_current_amp(st) or 0.0) >= 5.5
+    ):
+        return False
+    result = _supersede_openwb_pro_preoutput_phase_reservation(
+        data,
+        observed,
+        now_ts=float(now_ts if now_ts is not None else time.time()),
+    )
+    result.update({
+        "source": "process_restart_fresh_opposite_phase_charge",
+        "observed_phases": observed,
+        "observed_power_w": round(_wb_status_real_power(st), 3),
+        "hardware_write": False,
+    })
+    data["_openwb_pro_phase_preoutput_restart_terminal"] = dict(result)
+    done = result.get("superseded") is True and result.get("persisted") is True
+    if done:
+        data.pop("_openwb_pro_phase_preoutput_restart_probe", None)
+    return done
+
+
 def _finalize_expired_uncommitted_openwb_pro_phase_transition(
     c_data,
     status,
@@ -15666,21 +16036,35 @@ def _wallbox_phase_transition_reservation(chargers, statuses=None, now_ts=None):
             if has_connection_state
             else None
         )
-        updated = phase_transition_reservation(
-            box,
-            status=status,
-            now_ts=now_value,
-            connected=connected,
-            clock_sample=clock_sample,
-        )
-        if _finalize_expired_uncommitted_openwb_pro_phase_transition(
-            box,
-            status,
-            now_ts=now_value,
-        ):
-            updated = wallbox_phase_transition.inactive_reservation(
-                "expired_uncommitted_idle_confirmed"
+        terminalized = (
+            _finalize_process_restart_preoutput_openwb_pro_phase_transition(
+                box, status, now_ts=now_value
             )
+        )
+        restart_probe = box.get("_openwb_pro_phase_preoutput_restart_probe")
+        if terminalized:
+            updated = wallbox_phase_transition.inactive_reservation(
+                "process_restart_preoutput_superseded"
+            )
+        elif isinstance(restart_probe, dict) and restart_probe.get("active") is True:
+            # Den alten Guard bis zum frischen Readback nicht auf 720 s rearmen.
+            updated = wallbox_phase_transition.public_reservation(
+                box.get("_wallbox_phase_transition_reservation"), now_value
+            )
+        else:
+            updated = phase_transition_reservation(
+                box,
+                status=status,
+                now_ts=now_value,
+                connected=connected,
+                clock_sample=clock_sample,
+            )
+            if _finalize_expired_uncommitted_openwb_pro_phase_transition(
+                box, status, now_ts=now_value
+            ):
+                updated = wallbox_phase_transition.inactive_reservation(
+                    "expired_uncommitted_idle_confirmed"
+                )
         if str(updated.get("stage") or "") == "completed" and not updated.get("active"):
             _finalize_completed_openwb_pro_phase_transition(
                 box,
@@ -17404,6 +17788,86 @@ def _phase_entry_is_terminal_restart_only(raw):
     )
 
 
+def _phase_entry_is_process_restart_preoutput(raw):
+    """True nur für eine persistiert belegte, ausgangslose Generation."""
+
+    item = raw if isinstance(raw, dict) else {}
+    reservation = item.get("phase_transition_reservation")
+    reservation = reservation if isinstance(reservation, dict) else {}
+    hold = item.get("openwb_pro_phase_recovery_hold")
+    hold = hold if isinstance(hold, dict) else {}
+    reservation_id = str(reservation.get("reservation_id") or "")
+    target = _valid_phase_count(reservation.get("target_phases"), 0)
+    synthetic_hold = bool(
+        str(reservation.get("stage") or "") == "recovery_hold"
+        and hold.get("active") is True
+        and str(hold.get("reason") or "") == "process_restart_recovery_hold"
+        and str(hold.get("recovery_class") or "") == "output_ambiguous"
+        and str(hold.get("reservation_id") or "") == reservation_id
+        and str(hold.get("transition_id") or "") == reservation_id
+        and _valid_phase_count(hold.get("target"), 0) == target
+        and not str(hold.get("intent_id") or "")
+    )
+    if not (
+        str(reservation.get("stage") or "") == "await_budget" and not hold
+        or synthetic_hold
+    ):
+        return False
+    candidate = dict(reservation)
+    candidate["stage"] = "await_budget"
+    evidence = wallbox_phase_transition.preoutput_supersession_evidence_contract(
+        candidate,
+        sequence=item.get("openwb_pro_phase_sequence"),
+        output_intent=item.get("openwb_pro_phase_output_intent"),
+        output_ack=item.get("openwb_pro_phase_output_ack"),
+        restart_authorized=item.get("openwb_pro_phase_restart_authorized"),
+    )
+    return bool(
+        evidence.get("eligible") is True
+        and reservation_id
+        and reservation.get("transition_id") == reservation_id
+        and reservation.get("owner") == "wallbox_manager"
+        and reservation.get("source") == "openwb_pro_phase_sequence"
+        and int(_cfg_float(reservation.get("requested_w"), 0.0)) > 0
+        and _cfg_float(reservation.get("cooldown_wire_receipt_ts"), 0.0)
+        <= 0.0
+        and not str(reservation.get("cooldown_source") or "")
+        and wallbox_phase_transition.preoutput_supersession_evidence_is_bound(
+            candidate
+        )
+    )
+
+
+def _phase_preoutput_process_restart_fields(raw, now):
+    item = raw if isinstance(raw, dict) else {}
+    if not _phase_entry_is_process_restart_preoutput(item):
+        return {}
+    result = _phase_passive_reboot_fields(item, now)
+    for key in ("_phase_3p_block_until", "_openwb_pro_phase_change_block_until"):
+        result.pop(key, None)
+    reservation = dict(item["phase_transition_reservation"])
+    reservation.update({
+        "stage": "await_budget",
+        "blocker": "process_restart_preoutput_readback_required",
+        "reason": "process_restart_preoutput_readback_required",
+        "reason_code": "process_restart_preoutput_readback_required",
+        "cooldown_until_ts": 0.0,
+    })
+    target = _valid_phase_count(reservation.get("target_phases"), 0)
+    result.update({
+        "_wallbox_phase_transition_reservation": reservation,
+        "_openwb_pro_phase_sequence_stage": "await_budget",
+        "_openwb_pro_phase_preoutput_restart_probe": {
+            "active": True,
+            "reservation_id": str(reservation.get("reservation_id") or ""),
+            "target_phases": target,
+            "restored_ts": float(now),
+            "hardware_write": False,
+        },
+    })
+    return result
+
+
 def _phase_entry_requires_output_recovery(raw):
     item = raw if isinstance(raw, dict) else {}
     if _phase_entry_is_terminal_restart_only(item):
@@ -17951,6 +18415,12 @@ def _restored_phase_fields(phase_state, charger_id):
             and saved_process_epoch != current_process_epoch
         )
         if process_changed:
+            preoutput_fields = _phase_preoutput_process_restart_fields(
+                raw,
+                now_value,
+            )
+            if preoutput_fields:
+                return preoutput_fields
             if _phase_entry_is_terminal_restart_only(raw):
                 return _phase_terminal_restart_fields(
                     raw,
@@ -21215,6 +21685,14 @@ def run():
                         and _authorized_wallbox_budget_w > 0.0
                     )
                     storage_grid_hold_active = (_budget_state == 'ifc_grid_hold')
+                    _grid_funded_safety_envelope = (
+                        _wallbox_grid_funded_safety_envelope_contract(
+                            _budget,
+                            _budget_freshness_contract,
+                            live_sample_invalid=_budget_live_sample_invalid,
+                            storage_grid_hold_active=storage_grid_hold_active,
+                        )
+                    )
                     _apply_phase_transition_grants(
                         chargers,
                         _budget if _budget_ok else {},
@@ -21766,6 +22244,76 @@ def run():
                     band_up = float(mode_policy["band_up"])
                     fz = float(mode_policy["fz"])
                     wbmin_mode4_gate_open = bool(mode_policy["wbmin_mode4_gate_open"])
+
+                    # Die Netzfreigabe hängt von der bereits aufgelösten
+                    # Modus-Policy ab. Vorher wäre effective_allow_grid noch
+                    # nicht für diesen Zyklus gebunden.
+                    _grid_funded_hard_blocked = (
+                        _wallbox_transient_invalid_budget_hard_blocked(
+                            emergency_stop_active=emergency_stop_active,
+                            budget_timeout=bool(
+                                _budget_freshness_contract.get("timeout")
+                                or _budget_freshness_contract.get("stale")
+                                or _budget_freshness_contract.get("ok")
+                                is not True
+                            ),
+                            budget_identity_valid=bool(
+                                _grid_funded_safety_envelope.get(
+                                    "producer_identity_valid"
+                                )
+                            ),
+                            wallbox_ifc_readback_blocked=bool(
+                                _grid_funded_safety_envelope.get(
+                                    "ifc_readback_blocked", True
+                                )
+                            ),
+                            wallbox_ifc_readback_block_reason=str(
+                                _grid_funded_safety_envelope.get(
+                                    "ifc_readback_block_reason", ""
+                                )
+                                or ""
+                            ),
+                            force_wallbox_stop=bool(
+                                _budget.get("force_wallbox_stop") is True
+                            ),
+                            predump_floor_hold=bool(
+                                _budget.get("predump_floor_hold") is True
+                                or predump_floor_hold_active
+                            ),
+                            runtime_block_reason=str(
+                                _budget.get("runtime_block_reason") or ""
+                            ),
+                            explicit_valid_zero=False,
+                        )
+                    )
+                    _grid_funded_authority = (
+                        _wallbox_grid_funded_authority_contract(
+                            controllable_charger_ids=controllable_charger_ids,
+                            price_optimized_charger_ids=(
+                                price_optimized_charger_ids
+                            ),
+                            manual_pause_by_id=wb_manual_pause,
+                            effective_public_wb_mode=effective_public_wb_mode,
+                            price_boost_wallbox_active=(
+                                price_boost_wallbox_active
+                            ),
+                            effective_allow_grid=effective_allow_grid,
+                            grid_unlocked_all_controllable=(
+                                grid_unlocked_all_controllable
+                            ),
+                            safety_envelope_valid=bool(
+                                _grid_funded_safety_envelope.get("valid")
+                                is True
+                            ),
+                            hard_blocked=_grid_funded_hard_blocked,
+                            predump_wallbox_active=predump_wallbox_active,
+                            storage_predump_active=storage_predump_active,
+                            storage_grid_hold_active=storage_grid_hold_active,
+                        )
+                    )
+                    grid_funded_wallbox_authorized = bool(
+                        _grid_funded_authority.get("authorized") is True
+                    )
 
                     # Grundladung stabil: 6A-Boden nur, solange wbminSoC im
                     # Hausspeicher erreichbar bleibt und der Storage Manager
@@ -22499,6 +23047,9 @@ def run():
                             ),
                             peak_shaving_base_import_w=peak_shaving_context.get(
                                 "base_import_w"
+                            ),
+                            grid_funded_wallbox_authorized=(
+                                grid_funded_wallbox_authorized
                             ),
                         )
                     )
@@ -23986,6 +24537,42 @@ def run():
                     # Preis-Optimierung Flag: storage_manager liest dies fuer EMS_IDLE-Entscheidung
                     ui_state["price_opt_active"]  = price_optimizing_active
                     ui_state["scheduled_slot_active"] = bool(scheduled_slot_charger_ids)
+                    ui_state["grid_funded_wallbox_authorized"] = bool(
+                        grid_funded_wallbox_authorized
+                    )
+                    ui_state["grid_funded_budget_authority_active"] = bool(
+                        energy_policy.get(
+                            "grid_funded_budget_authority_active", False
+                        )
+                    )
+                    ui_state["grid_funded_safety_envelope"] = dict(
+                        _grid_funded_safety_envelope
+                    )
+                    ui_state["grid_funded_wallbox_authority"] = dict(
+                        _grid_funded_authority
+                    )
+                    ui_state["storage_authorized_wallbox_budget_w"] = int(
+                        max(
+                            0.0,
+                            float(
+                                energy_policy.get(
+                                    "storage_authorized_wallbox_budget_w", 0.0
+                                )
+                                or 0.0
+                            ),
+                        )
+                    )
+                    ui_state["pre_authorized_cap_allowed_w"] = int(
+                        max(
+                            0.0,
+                            float(
+                                energy_policy.get(
+                                    "pre_authorized_cap_allowed_w", 0.0
+                                )
+                                or 0.0
+                            ),
+                        )
+                    )
                     ui_state["battery_departure_active"] = bool(battery_departure_active_ids)
                     ui_state["battery_departure_blocked"] = bool(battery_departure_blocked_ids)
                     ui_state["battery_departure_ids"] = sorted(list(battery_departure_active_ids))
@@ -31787,6 +32374,13 @@ def run():
                                             else:
                                                 c_data["_openwb_pro_start_hold_until"] = 0.0
                                                 c_data["_openwb_pro_start_hold_amp"] = 0
+                                    elif e3dc_native_toggle:
+                                        cap_amp = _confirmed_native_current_amp(
+                                            c_data,
+                                            _pre_general_current_receipt,
+                                        )
+                                        if cap_amp is None:
+                                            continue
                                     if (
                                         effective_wb_mode in (9, 10, 11)
                                         and wb_storage_cap_w > 0

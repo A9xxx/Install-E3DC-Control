@@ -115,7 +115,7 @@ $paths = getInstallPaths();
     <div class="container">
         <div class="d-flex justify-content-between align-items-center mb-4">
             <a href="index.php" class="nav-link-back"><i class="fas fa-arrow-left me-2"></i>Dashboard</a>
-            <span class="badge bg-success text-light">v5.4.3s Stable</span>
+            <span class="badge bg-success text-light">v5.4.4 Stable</span>
         </div>
         <h1 class="display-4 fw-bold">Hilfe & Support</h1>
         <p class="lead opacity-75">Häufige Fragen und Lösungen rund um E3DC-Control.</p>
@@ -134,7 +134,7 @@ $paths = getInstallPaths();
         <div class="col-12 faq-item" data-tags="docker image stable rollback update">
             <div class="card bg-card border-0 shadow-sm"><div class="card-body">
                 <h5 class="card-title"><span class="tag">Docker</span> Wie prüfe ich Image und Update?</h5>
-                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem geprüften Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.3s</code> in <code>.env</code> gesetzt.</p>
+                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem geprüften Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.4</code> in <code>.env</code> gesetzt.</p>
                 <pre>cd "${E3DC_DOCKER_PATH:-$HOME/e3dc-docker}"
 if [ -f ./docker_compose_update.py ]; then
   E3DC_DOCKER_HELPER=./docker_compose_update.py
@@ -212,6 +212,24 @@ sudo docker compose logs --tail=80 e3dc-control</pre>
                         <li>Nach der Freigabe im Account den RESTful API Security Token erzeugen.</li>
                         <li>Im Config-Editor unter <em>Tarif</em> den ENTSO-E-Token als Fallback-Token eintragen und mit <em>ENTSO-E testen</em> prüfen.</li>
                     </ol>
+                </div>
+            </div>
+        </div>
+
+        <h4 class="mb-4 text-accent"><i class="fas fa-shield-halved me-2"></i>Stable 5.4.4: konsolidiertes Update für heterogene Altanlagen</h4>
+        <div class="col-12 faq-item" data-tags="5.4.4 stable update altanlage snapshot wallbox netzladen entladungsschutz direktvermarktung ladekurve">
+            <div class="card bg-card border-0 shadow-sm">
+                <div class="card-body">
+                    <h5 class="card-title">
+                        <span class="tag">5.4.4</span>
+                        Was enthält das Stable-Release 5.4.4?
+                    </h5>
+                    <ul>
+                        <li><strong>Ein Ziel-Updater:</strong> Web- und Downloadpfad starten den veröffentlichten Updater aus einem root-eigenen Snapshot und binden ihn an den tatsächlichen Installationsroot. Nach geprüftem Backup und Dienststopp werden Produktdateien, Rechte und eng bekannte Altzustände auf den Releasezustand gebracht.</li>
+                        <li><strong>Wallbox-Fortschritt:</strong> Bestätigte Stromvorgaben bleiben im Heartbeat erhalten; nach einem unterbrochenen openWB-Pro-Phasenwechsel wird die alte ausgangslose Generation anhand eines frischen Geräte-Readbacks abgeschlossen, bevor neu entschieden wird. Netzladen benötigt eine eigene aktuelle Freigabe.</li>
+                        <li><strong>Entladungsschutz:</strong> Der Speicher wird nur bei frisch gemessener Fahrzeuglast für die Wallbox zurückgehalten. Alte Sollwerte oder frühere Holds allein können keinen unnötigen Netzbezug halten.</li>
+                        <li><strong>Direktvermarktung:</strong> Die WebUI zeigt nur den an Plan, Slot und bestätigte Phase-5-Wirkung gebundenen effektiven Speicherplan. Bei fehlender oder widersprüchlicher Evidenz bleiben klassische Zielkurve und Leistung leer.</li>
+                    </ul>
                 </div>
             </div>
         </div>

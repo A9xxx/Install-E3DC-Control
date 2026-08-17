@@ -12,6 +12,22 @@ export E3DC_INSTALL_PATH="/absoluter/pfad/zur/installation"
 test -f "$E3DC_INSTALL_PATH/e3dc-setup"
 ```
 
+## Konsolidierter Update- und Rückweg in 5.4.4
+
+5.4.4 führt den gebundenen Rückfallvertrag fort. Der Web-Updater führt den
+veröffentlichten Zielcode aus einem root-eigenen Snapshot aus, hält den
+tatsächlichen Installationsroot aber getrennt gebunden. Erst nach erstelltem
+und geprüftem Backup und bestätigter Writer-Ruhe werden Dateien, Rechte und
+eng bekannte historische Dienstdarstellungen auf den Zielstand gebracht.
+Scheitern Kopie, Rechteprojektion, Dienststart oder Healthcheck, bleibt der
+Rückweg an genau diese Sicherung und Transaktion gebunden.
+
+Frühere Dateirechte, ein redundanter alter Storage-Override oder eine neu
+benötigte Laufzeitumgebung sind im ausdrücklich gestarteten Downloadpfad kein
+eigenständiger Rückfallgrund. Unsichere Pfade, Links, nicht eindeutig
+gebundene Systemdateien, konkurrierende Writer und ein ungültiges Backup
+werden dadurch nicht freigegeben.
+
 ## Fehlender Backup-Root im Download-Bootstrap in 5.4.3s
 
 5.4.3s legt im administrativen Root-Download-Bootstrap einen wirklich
@@ -100,7 +116,7 @@ oder einen Prozessabbruch außerhalb des erkannten Fehlerpfads.
 
 ## Programmstand zurücksetzen
 
-Der aktuelle Stable-Stand `v5.4.3s` führt den gebundenen Rückfallvertrag fort.
+Der aktuelle Stable-Stand `v5.4.4` führt den gebundenen Rückfallvertrag fort.
 
 Beim Rücklauf wird der tatsächliche Dateisystemzustand einer Unit weiterhin
 streng gegen reguläre Unit-Datei, kanonische `/dev/null`-Maske, unerwarteten

@@ -16791,7 +16791,10 @@ def unmanaged_wallbox_wbminsoc_hold_decision(
         previous_since_ts = previous_ts
     previous_state_age_s = max(0.0, now_s - previous_since_ts) if previous_since_ts > 0.0 else previous_age_s
     owner_grace_s = max(30.0, safe_float(cfg.get("storage_wbminsoc_owner_grace_s"), 90.0))
-    previous_hold_grace = bool(previous_hold and previous_age_s <= owner_grace_s)
+    # Die Nachlaufzeit beginnt mit dem tatsächlichen Zustandswechsel. `ts`
+    # wird in jedem Regelzyklus erneuert und darf die Grace-Periode deshalb
+    # nicht selbst wieder aufziehen.
+    previous_hold_grace = bool(previous_hold and previous_state_age_s <= owner_grace_s)
     intent_fresh = bool(wb_intent) and now_s - safe_float(wb_intent.get("ts"), 0.0) <= 90.0
     wb_mode = normalize_wb_mode(wb_intent.get("wb_mode_active", cfg.get("wb1_mode", 0)))
     request = str(wb_intent.get("battery_request", "") or "").strip().lower()
@@ -16880,14 +16883,16 @@ def unmanaged_wallbox_wbminsoc_hold_decision(
     )
     if fresh_release_without_charge:
         return None
+    # Ein Soll-/Intentwert, ein Ladebit oder der vorherige Hold sind keine
+    # physische Last. Der Entladungsschutz darf den Speicher nur begrenzen,
+    # solange eine aktuelle, verwendbare Leistungsmessung echte Fahrzeuglast
+    # bestätigt. Sonst kann ein zyklisch erneuerter Hold Netzbezug erzeugen,
+    # obwohl die Wallbox längst 0 W aufnimmt.
     wallbox_charging = bool(
-        observed_wallbox_w > 500.0
-        or intent_w > 500.0
-        or wb_intent.get("charging_active")
-        or native_charging
-        or previous_hold_grace
+        wb_power.get("power_known") is True
+        and wallbox_w > 500.0
     )
-    if not wallbox_charging and not controlled_waiting_wbmin:
+    if not wallbox_charging:
         return None
 
     soc = safe_float(live.get("SOC"), 0.0)
@@ -17178,6 +17183,7 @@ def unmanaged_wallbox_wbminsoc_hold_decision(
             "controlled_wallbox_wbminsoc_pause": controlled_wallbox_no_grid,
             "wbminsoc_hold_hysteresis_pct": hysteresis_pct,
             "wbminsoc_owner_grace_active": previous_hold_grace,
+            "wbminsoc_real_wallbox_confirmed": wallbox_charging,
         }
         return result
     floor_relation = (
@@ -17254,6 +17260,7 @@ def unmanaged_wallbox_wbminsoc_hold_decision(
         "scheduled_grid_charge": scheduled_grid_charge,
         "controlled_wallbox_wbminsoc_pause": controlled_wallbox_no_grid,
         "wbminsoc_owner_grace_active": previous_hold_grace,
+        "wbminsoc_real_wallbox_confirmed": wallbox_charging,
         "wbminsoc_hold_hysteresis_pct": hysteresis_pct,
         "wbminsoc_grid_import_w": grid_import_w,
         "wbminsoc_grid_export_w": grid_export_w,

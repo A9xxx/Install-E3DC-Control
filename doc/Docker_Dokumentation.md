@@ -2,8 +2,16 @@
 
 Veröffentlichte Images entstehen ausschließlich aus einem versionierten stabilen Release-Tag. `latest` verweist damit auf die zuletzt veröffentlichte stabile Version.
 
-Der aktuelle Stable-Stand ist `v5.4.3s`. Die Tags `latest`, `v5.4.3s` und
-`5.4.3s` müssen auf denselben geprüften Multi-Arch-Digest verweisen.
+Der aktuelle Stable-Stand ist `v5.4.4`. Die Tags `latest`, `v5.4.4` und
+`5.4.4` müssen auf denselben geprüften Multi-Arch-Digest verweisen.
+
+5.4.4 ist der konsolidierte Zielstand für heterogene Installationen. Der
+root-eigene Web-Snapshot und die Normalisierung historischer Hostrechte oder
+Units betreffen den Bare-Metal-Updatepfad. Das gemeinsame Produkt enthält
+zugleich den korrigierten Wallbox-Fortschritt, die ausdrücklich gebundene
+Netzladefreigabe, den WB-Entladungsschutz nur bei gemessener Fahrzeuglast und
+die Anzeige genau eines effektiven Direktvermarktungsplans. Der Container
+erhält dadurch keinen zusätzlichen Hardware- oder Updatepfad.
 
 5.4.3s korrigiert ausschließlich den Bare-Metal-Download-Bootstrap: Der
 administrative Root-Bootstrap legt einen wirklich fehlenden kanonischen
@@ -267,7 +275,7 @@ unverändert gesperrt und benötigen eine manuelle Prüfung.
 
 Ohne `E3DC_IMAGE_TAG` folgt diese Compose-Datei dem geprüften Stable-Tag
 `latest`. Ein fester Tag bleibt bei `pull` absichtlich unverändert. Für einen
-bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.3s` in der Datei `.env`
+bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.4` in der Datei `.env`
 gesetzt. `docker compose config --images` zeigt vorab das tatsächlich gewählte
 Image.
 
@@ -294,7 +302,7 @@ Versionswahl.
 
 Gezielte Rückfallversion:
 
-Den Stable-Container `v5.4.3s` auf den veröffentlichten Rollback-Root
+Den Stable-Container `v5.4.4` auf den veröffentlichten Rollback-Root
 `v5.3.2b` zurücksetzen:
 
 ```bash

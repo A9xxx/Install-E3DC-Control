@@ -51,6 +51,7 @@ except ImportError:
 
 PLAN_SCHEMA = "storage_dispatch_plan_v1"
 RUNTIME_SCHEMA = "storage_dispatch_runtime_v1"
+EFFECTIVE_STORAGE_PLAN_SCHEMA = "storage_effective_plan_v1"
 ADAPTER_VERSION = "legacy_storage_plan_adapter_v1"
 SHADOW_INPUT_BINDING_SCHEMA = "storage_dispatch_shadow_input_binding_v2"
 PRICE_HORIZON_SCHEMA = "storage_dispatch_price_horizon_v2"
@@ -6213,6 +6214,229 @@ def _runtime_storage_action(value: Any) -> Optional[str]:
     return action if storage_action_contract(action) is not None else None
 
 
+def _effective_storage_plan_projection(
+    plan: Dict[str, Any],
+    slot: Dict[str, Any],
+    payload: Dict[str, Any],
+    runtime: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Projiziert Phase 5 für Diagnose/UI, ohne einen Ausgang zu erzeugen."""
+
+    projection = slot.get("projection") if isinstance(slot.get("projection"), dict) else {}
+    phase5 = payload.get("storage_dispatch_phase5") if isinstance(payload.get("storage_dispatch_phase5"), dict) else {}
+    candidate = phase5.get("candidate") if isinstance(phase5.get("candidate"), dict) else {}
+    phase5_lifecycle = phase5.get("request_lifecycle") if isinstance(phase5.get("request_lifecycle"), dict) else {}
+    direct = plan.get("direct_marketing") if isinstance(plan.get("direct_marketing"), dict) else {}
+    passive_binding = projection.get(DIRECT_MARKETING_PASSIVE_NORMAL_BINDING_SCHEMA) if isinstance(projection.get(DIRECT_MARKETING_PASSIVE_NORMAL_BINDING_SCHEMA), dict) else {}
+    passive_curve = phase5.get("passive_normal_curve_charge") if isinstance(phase5.get("passive_normal_curve_charge"), dict) else {}
+    guard = phase5.get("charge_block_contract") if isinstance(phase5.get("charge_block_contract"), dict) else {}
+    guard_window = guard.get("source_window") if isinstance(guard.get("source_window"), dict) else {}
+    lifecycle_source = runtime.get("requested") if isinstance(runtime.get("requested"), dict) else {}
+    lifecycle = {
+        "selected": bool(runtime.get("selected")),
+        "executable": bool(runtime.get("executable")),
+        "commands_allowed": bool(runtime.get("commands_allowed")),
+        "requested": bool(lifecycle_source.get("requested")),
+        "attempted": bool(lifecycle_source.get("attempted")),
+        "issued": bool(lifecycle_source.get("issued")),
+        "confirmed": bool(lifecycle_source.get("confirmed")),
+        "hardware_effect": bool(lifecycle_source.get("hardware_effect")),
+        "retained": bool(phase5_lifecycle.get("retained")),
+        "retained_effect": bool(phase5_lifecycle.get("retained_effect")),
+    }
+    direct_active = bool(
+        direct.get("active") is True and direct.get("shadow") is not True
+        and _normalized_direct_marketing_mode(direct.get("mode")) in {"eco", "eco_plus", "arbitrage"}
+    )
+    phase5_action_raw = str(phase5.get("selected_action") or "").strip().upper()
+    runtime_action_raw = phase5_action_raw or str(runtime.get("effective_action") or "").strip().upper()
+    action = _runtime_storage_action(runtime_action_raw)
+    unknown_runtime_action = bool(
+        runtime_action_raw and action is None and runtime_action_raw != "PASSIVE_NORMAL"
+    )
+    if action is None and not unknown_runtime_action and direct_active and passive_binding:
+        action = "PASSIVE_NORMAL"
+    known = {"CHARGE_BLOCK_WAIT", "PV_STORE", "ECONOMIC_EXPORT", "HEADROOM_EXPORT", "PASSIVE_NORMAL"}
+
+    projected_action = _runtime_storage_action(projection.get("direct_marketing_plan_action"))
+    candidate_action = _runtime_storage_action(candidate.get("action"))
+    action_id = window_id = segment_id = None
+    identity_source = None
+    if action == projected_action:
+        action_id = projection.get("direct_marketing_plan_action_id")
+        window_id = projection.get("direct_marketing_window_id")
+        segment_id = projection.get("direct_marketing_plan_segment_id")
+        identity_source = "canonical_slot_projection"
+    elif action == candidate_action:
+        action_id = candidate.get("action_id")
+        window_id = candidate.get("window_id")
+        segment_id = candidate.get("segment_id")
+        identity_source = "phase5_candidate"
+    elif action == "PASSIVE_NORMAL":
+        action_id = passive_binding.get("policy_action_id")
+        window_id = passive_binding.get("window_id")
+        segment_id = passive_binding.get("policy_slot_id")
+        identity_source = "passive_normal_binding"
+
+    start_ms = _safe_int(projection.get("direct_marketing_window_start_ts_ms"), _safe_int(guard_window.get("start_ts_ms"), _safe_int(slot.get("start_ts_ms"), 0)))
+    end_ms = _safe_int(projection.get("direct_marketing_window_end_ts_ms"), _safe_int(guard_window.get("end_ts_ms"), _safe_int(slot.get("end_ts_ms"), 0)))
+    guard_bound = bool(
+        action == "CHARGE_BLOCK_WAIT"
+        and guard.get("valid") is True
+        and guard.get("plan_id") == runtime.get("plan_id")
+        and guard.get("slot_id") == runtime.get("slot_id")
+    )
+    if guard_bound and not all(isinstance(value, str) and value for value in (action_id, window_id, segment_id)):
+        window_id = revision_hash({"plan_id": runtime.get("plan_id"), "start": start_ms, "end": end_ms})
+        segment_id = revision_hash({"window_id": window_id, "slot_id": runtime.get("slot_id")})
+        action_id = revision_hash({"action": action, "window_id": window_id, "segment_id": segment_id})
+        identity_source = "phase5_charge_guard"
+
+    passive_effect = bool(
+        action == "PASSIVE_NORMAL"
+        and passive_curve.get("valid") is True
+        and passive_curve.get("plan_id") == runtime.get("plan_id")
+        and passive_curve.get("slot_id") == runtime.get("slot_id")
+        and not any(lifecycle.values())
+    )
+    active_effect = bool(
+        action in known - {"PASSIVE_NORMAL"} and lifecycle["requested"] and lifecycle["hardware_effect"]
+        and (lifecycle["issued"] or lifecycle["retained"] or lifecycle["retained_effect"])
+        and (lifecycle["confirmed"] or action in {"ECONOMIC_EXPORT", "HEADROOM_EXPORT"})
+    )
+    lifecycle["effect_confirmed"] = bool(active_effect or passive_effect)
+    runtime_ts_ms = _safe_int(runtime.get("runtime_generated_at_ts_ms"), 0)
+    slot_start_ms = _safe_int(slot.get("start_ts_ms"), 0)
+    slot_end_ms = _safe_int(slot.get("end_ts_ms"), 0)
+    identity_complete = bool(
+        _sha256_revision_valid(runtime.get("plan_id"))
+        and _sha256_revision_valid(runtime.get("slot_id"))
+        and _sha256_revision_valid(action_id)
+        and isinstance(window_id, str)
+        and bool(window_id)
+        and isinstance(segment_id, str)
+        and bool(segment_id)
+        and start_ms > 0
+        and end_ms > start_ms
+        and slot_start_ms > 0
+        and slot_end_ms > slot_start_ms
+        and slot_start_ms <= runtime_ts_ms < slot_end_ms
+        and start_ms <= runtime_ts_ms < end_ms
+    )
+
+    consistent = bool(runtime.get("plan_valid"))
+    reason = "ok"
+    status = "CLASSICAL_CURVE_EFFECTIVE"
+    if direct_active:
+        if unknown_runtime_action or action not in known:
+            consistent, reason = False, "DIRECT_MARKETING_ACTION_UNKNOWN"
+        elif not identity_complete:
+            consistent, reason = False, "DIRECT_MARKETING_IDENTITY_INCOMPLETE"
+        elif action == "PASSIVE_NORMAL":
+            consistent = bool(consistent and passive_effect)
+            reason = "ok" if consistent else "PASSIVE_NORMAL_EFFECT_UNCONFIRMED"
+            status = "DIRECT_MARKETING_PASSIVE_NORMAL_EFFECTIVE"
+        elif not bool(lifecycle["selected"] and lifecycle["executable"] and lifecycle["commands_allowed"]):
+            consistent, reason = False, "ACTIVE_SELECTION_INCOMPLETE"
+        elif lifecycle["hardware_effect"] and not bool(
+            lifecycle["requested"] and (lifecycle["issued"] or lifecycle["retained"] or lifecycle["retained_effect"])
+        ):
+            consistent, reason = False, "LIFECYCLE_EFFECT_WITHOUT_ISSUE"
+        elif action == "CHARGE_BLOCK_WAIT" and _safe_int(runtime.get("charge_budget_w"), 0) != 0:
+            consistent, reason = False, "CHARGE_BLOCK_NONZERO_BUDGET"
+        elif active_effect and action == "PV_STORE" and _safe_int(runtime.get("charge_budget_w"), 0) <= 0:
+            consistent, reason = False, "PV_STORE_WITHOUT_POSITIVE_BUDGET"
+        elif active_effect and action in {"ECONOMIC_EXPORT", "HEADROOM_EXPORT"} and _safe_int(runtime.get("export_budget_w"), 0) <= 0:
+            consistent, reason = False, "EXPORT_WITHOUT_POSITIVE_BUDGET"
+        else:
+            status = "DIRECT_MARKETING_%s_%s" % (action, "EFFECTIVE" if active_effect else "PENDING")
+    if not consistent:
+        status = "EVIDENCE_LIMIT"
+
+    curve_authorized = status in {"CLASSICAL_CURVE_EFFECTIVE", "DIRECT_MARKETING_PV_STORE_EFFECTIVE", "DIRECT_MARKETING_PASSIVE_NORMAL_EFFECTIVE"}
+    target_authorized: Optional[bool] = True if curve_authorized else False if status.endswith("_EFFECTIVE") else None
+    curve_w: Optional[int] = None
+    if curve_authorized:
+        curve_w = (
+            max(0, _safe_int(passive_curve.get("preserved_charge_w"), 0))
+            if action == "PASSIVE_NORMAL"
+            else max(0, _safe_int(runtime.get("charge_budget_w"), 0))
+            if action == "PV_STORE"
+            else max(0, _safe_int(payload.get("iFc_w"), 0))
+        )
+    elif status.endswith("_EFFECTIVE"):
+        curve_w = 0
+    effective_power_w = max(0, _safe_int(runtime.get("export_budget_w"), 0)) \
+        if status.endswith("_EFFECTIVE") and action in {"ECONOMIC_EXPORT", "HEADROOM_EXPORT"} else curve_w
+
+    binding = {
+        "plan_id": runtime.get("plan_id"),
+        "slot_id": runtime.get("slot_id"),
+        "action": action,
+        "action_id": action_id,
+        "window_id": window_id,
+        "segment_id": segment_id,
+        "window_start_ts_ms": start_ms,
+        "window_end_ts_ms": end_ms,
+        "owner": runtime.get("owner"),
+        "runtime_generated_at_ts_ms": runtime.get("runtime_generated_at_ts_ms"),
+        "slot_start_ts_ms": slot_start_ms,
+        "slot_end_ts_ms": slot_end_ms,
+        "identity_source": identity_source,
+    }
+    values = {
+        "target_soc": plan.get("target_soc"),
+        "planning_target_soc": plan.get("planning_target_soc"),
+        "effective_target_soc": plan.get("effective_target_soc"),
+        "current_curve_soc": payload.get("curve_soc"),
+        "next_curve_soc": payload.get("target_soc"),
+        "next_curve_ts": payload.get("target_ts"),
+        "can_reach_target": plan.get("can_reach_target"),
+        "max_reachable_soc": plan.get("max_reachable_soc"),
+        "sim_max_soc_pct": plan.get("max_soc_pct"),
+    }
+    if not curve_authorized:
+        values = {key: None for key in values}
+    result = {
+        "schema_version": EFFECTIVE_STORAGE_PLAN_SCHEMA,
+        "status": status,
+        "consistent": consistent,
+        "consistency_reason": reason,
+        "direct_marketing_active": direct_active,
+        "binding": binding,
+        "lifecycle": lifecycle,
+        "effective_action": action,
+        "target_projection_authorized": target_authorized,
+        "clear_classical_curves": bool(direct_active and target_authorized is not True),
+        "classical_curve_role": (
+            "AUTHORIZED" if curve_authorized else "BLOCKED" if target_authorized is False else "EVIDENCE_LIMIT"
+        ),
+        "effective_power_w": effective_power_w,
+        "effective_charge_w": curve_w,
+        "target_reach_state": plan.get("target_reach_state") if curve_authorized else "direct_marketing",
+        "target_reach_reason": (
+            plan.get("target_reach_reason")
+            if curve_authorized
+            else "DV führt den Slot; klassische Zielkurve und Ladeleistung sind nicht wirksam bestätigt."
+        ),
+        "reserve_forecast": {
+            "physical_reserve_soc": plan.get("physical_reserve_soc"),
+            "morning_target": plan.get("morning_target"),
+            "weather_reserve_active": plan.get("weather_reserve_active"),
+            "weather_reserve_need_wh": plan.get("weather_reserve_need_wh"),
+            "target_reach_forecast_fresh": plan.get("target_reach_forecast_fresh"),
+        },
+        "classical_curve": {
+            "charge_w": payload.get("iFc_w"),
+            "target_soc": plan.get("target_soc"),
+            "can_reach_target": plan.get("can_reach_target"),
+        },
+        **values,
+    }
+    result["revision"] = revision_hash(result)
+    return result
+
+
 def _runtime_exact_zero(value: Any) -> bool:
     """Akzeptiert nur eine echte endliche numerische 0, keine Bool-/Textwerte."""
 
@@ -7062,7 +7286,7 @@ def build_runtime_overlay(
         candidate_projection["effect"] = (
             effect if runtime_effect_claim_allowed else None
         )
-    return {
+    runtime = {
         "schema_version": RUNTIME_SCHEMA,
         "runtime_generated_at": _utc_iso(now_value),
         "runtime_generated_at_ts_ms": now_value,
@@ -7130,6 +7354,13 @@ def build_runtime_overlay(
         "legacy_baseline": copy.deepcopy(phase5.get("legacy_baseline")) if explicit_phase5 else None,
         "phase5": copy.deepcopy(phase5) if explicit_phase5 else None,
     }
+    runtime["effective_storage_plan"] = _effective_storage_plan_projection(
+        plan,
+        slot,
+        payload,
+        runtime,
+    )
+    return runtime
 
 
 def canonical_projection_for_ts(plan: Dict[str, Any], ts_ms: int) -> Optional[Dict[str, Any]]:

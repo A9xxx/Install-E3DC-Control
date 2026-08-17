@@ -6,6 +6,24 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.4] – 2026-08-17
+
+### 🔄 Konsolidiertes Update für heterogene Altanlagen
+
+- **Der Web-Updater startet den veröffentlichten Ziel-Updater aus seinem root-eigenen Snapshot:** Ausführungsort und tatsächlicher Installationsroot bleiben dabei eindeutig getrennt. Nach geprüftem Backup und stillgelegten Diensten werden Produktdateien, Rechte und bekannte alte Dienstdarstellungen auf den Zielstand gebracht; anschließend folgen Dienststart und Healthcheck.
+- **Historischer Bestand ist keine unnötige Updatehürde:** Abweichende frühere Dateirechte, ein redundanter alter Storage-Override oder eine neu anzulegende Laufzeitumgebung dürfen im ausdrücklich gestarteten und sicher gebundenen Downloadpfad normalisiert werden. Pfadflucht, Links, nicht eindeutig gebundene Systemdateien, konkurrierende Writer und fehlgeschlagene Sicherungs- oder Gesundheitsprüfungen bleiben harte Stopps.
+
+### 🚗 Wallbox-Regelung
+
+- **Start, Wiederanlauf und Phasenwechsel kommen nachvollziehbar weiter:** E3DC-Multi-Connect hält den bestätigten Stromsollwert für den erforderlichen Heartbeat. Ein vor dem Hardwareausgang unterbrochener openWB-Pro-Phasenwechsel wird nach einem frischen Geräte-Readback ohne parallelen Phasenauftrag eindeutig abgeschlossen oder neu bewertet.
+- **Netzladen benötigt eine eigene aktuelle Freigabe:** Preis- oder Modusflags allein öffnen kein Ladebudget. Nutzer-`Aus`, aktuelle Speicher- und Netzpunktgrenzen, manuelle Pausen, Not-Aus und Datenfrische bleiben vorrangig.
+- **Kein falscher WB-Entladungsschutz ohne Fahrzeuglast:** Der Speicher begrenzt seine Entladung nur noch bei frischer, gemessener Wallboxleistung. Ein alter Intent, ein Ladebit oder ein früherer Hold allein kann dadurch keinen unnötigen Netzbezug halten.
+
+### ☀️ Effektiver Direktvermarktungsplan
+
+- **Planung und bestätigte Wirkung werden nicht mehr vermischt:** Die Oberfläche zeigt bei aktiver Direktvermarktung nur den an Plan, Slot, Aktion, Owner und Phase-5-Lebenszyklus gebundenen effektiven Speicherplan. Bei ausstehender, veralteter oder widersprüchlicher Evidenz werden Leistung, Zielkurve und Erreichbarkeitsversprechen geleert, statt einen klassischen 100-%-Pfad zu behaupten.
+- **Ein Entscheider und ein Hardwareausgang bleiben erhalten:** Die Projektion dient ausschließlich Diagnose und Anzeige; sie erzeugt keinen zusätzlichen RSCP-Schreibpfad.
+
 ## [5.4.3s] – 2026-08-17
 
 ### 🔄 Fehlender Backup-Root im Download-Bootstrap

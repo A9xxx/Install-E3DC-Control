@@ -1,10 +1,20 @@
 # Betrieb des E3DC-Control Installers
 
-Dokumentation Stand: 5.4.3s
+Dokumentation Stand: 5.4.4
 
 Der Installer ist der freigegebene Einstieg für Installation, Update,
 Reparatur, Backup, Rollback und Deinstallation. Die vollständige Bedienung ist
 in [E3DC-Control Installer](Installer.md) beschrieben.
+
+Der Installer-Anteil von 5.4.4 konsolidiert Web- und Download-Update für
+heterogene Altanlagen. Der veröffentlichte Ziel-Updater läuft aus einem
+root-eigenen Ausführungssnapshot, bleibt aber eindeutig an den tatsächlichen
+Installationsroot gebunden. Nach erstelltem und geprüftem Backup sowie
+stillgelegten Diensten werden Produktdateien, Rechte, ein eng bekannter
+redundanter Storage-Override und die benötigte Laufzeitumgebung auf den
+Zielstand gebracht. Anschließend werden die Dienste gestartet und geprüft;
+unsichere Pfade, nicht eindeutig gebundene Systemdateien und konkurrierende
+Writer bleiben gesperrt.
 
 Der Installer-Anteil von 5.4.3s legt im administrativen
 Root-Download-Bootstrap einen wirklich fehlenden kanonischen Backup-Root

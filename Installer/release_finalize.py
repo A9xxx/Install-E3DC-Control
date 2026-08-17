@@ -1796,6 +1796,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--update-safety-service-unit", default="")
     parser.add_argument("--update-safety-runtime-directory", default="")
     parser.add_argument("--update-safety-token-path", default="")
+    parser.add_argument("--explicit-download-bootstrap", action="store_true")
     return parser.parse_args()
 
 
@@ -2625,6 +2626,7 @@ def _main_with_update_lock(
             update_safety_service_unit=args.update_safety_service_unit or None,
             update_safety_runtime_directory=args.update_safety_runtime_directory or None,
             update_safety_token_path=args.update_safety_token_path or None,
+            explicit_download_bootstrap=bool(args.explicit_download_bootstrap),
             headless=True,
             privileged_preimages=privileged_preimages,
             postcommit_state=postcommit_state,

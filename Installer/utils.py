@@ -1869,15 +1869,23 @@ def _create_service_file(
     staged_service_created = False
     service_unit_mutated = False
     outer_bundle_recorded = False
+    unit_name = _bundle_unit_name(service_name)
+    inherited_optional_absence = bool(
+        bundle_snapshot is not None
+        and unit_name in bundle_snapshot
+        and bundle_snapshot[unit_name].get("incomplete_optional_not_found")
+    )
     try:
-        service_snapshot = capture_systemd_service_bundle((service_name,))
+        service_snapshot = capture_systemd_service_bundle(
+            (service_name,),
+            allow_optional_not_found_compat=inherited_optional_absence,
+        )
     except Exception as exc:
         print(
             f"✗ Bestehender Unit-Zustand für {service_name} ist nicht sicher "
             f"gebunden: {exc}"
         )
         return False
-    unit_name = _bundle_unit_name(service_name)
     if bundle_snapshot is not None:
         if unit_name not in bundle_snapshot:
             print(f"✗ Äußerer Bundle-Snapshot enthält {unit_name} nicht.")
@@ -1966,6 +1974,8 @@ def _create_service_file(
                 if outer_bundle_recorded and bundle_snapshot is not None:
                     bundle_snapshot[unit_name].pop("postimage", None)
                     bundle_snapshot[unit_name].pop("post_effective", None)
+                    bundle_snapshot[unit_name].pop("post_dropins", None)
+                    bundle_snapshot[unit_name].pop("post_inert_dropins", None)
                 print(f"  ↳ Vorzustand von {service_name} vollständig wiederhergestellt.")
             else:
                 print(
@@ -2000,6 +2010,9 @@ _SYSTEMD_ACTIVE_STATES = {
     "inactive",
     "failed",
 }
+_OPTIONAL_NOT_FOUND_COMPAT_UNITS = frozenset({
+    "e3dc-forecast-evidence.service",
+})
 
 
 def _bundle_unit_name(service_name):
@@ -2015,8 +2028,12 @@ def _bundle_unit_name(service_name):
     return value + ".service"
 
 
-def _systemd_show_contract(unit):
+def _systemd_show_contract(unit, *, allow_incomplete_optional_not_found=False):
     unit = _bundle_unit_name(unit)
+    optional_not_found_compat = bool(
+        allow_incomplete_optional_not_found
+        and unit in _OPTIONAL_NOT_FOUND_COMPAT_UNITS
+    )
     property_names = (
         "LoadState",
         "UnitFileState",
@@ -2025,15 +2042,17 @@ def _systemd_show_contract(unit):
         "DropInPaths",
         "User",
         "ExecStart",
+        *(("MainPID",) if optional_not_found_compat else ()),
     )
-    result = run_command(
+    command = (
         "systemctl show --no-pager "
         + shlex.quote(unit)
         + " --property=LoadState --property=UnitFileState --property=ActiveState"
         + " --property=FragmentPath --property=DropInPaths --property=User"
-        + " --property=ExecStart",
-        timeout=15,
+        + " --property=ExecStart"
+        + (" --property=MainPID" if optional_not_found_compat else "")
     )
+    result = run_command(command, timeout=15)
     stdout = str(result.get("stdout") or "")
     stderr = str(result.get("stderr") or "")
     if (
@@ -2057,8 +2076,31 @@ def _systemd_show_contract(unit):
         ):
             raise RuntimeError(f"systemd-Show-Vertrag von {unit} ist widersprüchlich")
         values[key] = value
+    incomplete_optional_not_found = False
     if set(values) != expected:
-        raise RuntimeError(f"systemd-Show-Vertrag von {unit} ist unvollständig")
+        absent_values = {
+            "UnitFileState": values.get("UnitFileState", ""),
+            "ActiveState": values.get("ActiveState", ""),
+            "FragmentPath": values.get("FragmentPath", ""),
+            "DropInPaths": values.get("DropInPaths", ""),
+            "User": values.get("User", ""),
+            "ExecStart": values.get("ExecStart", ""),
+            "MainPID": values.get("MainPID", ""),
+        }
+        if not (
+            optional_not_found_compat
+            and values.get("LoadState", "").lower() == "not-found"
+            and absent_values["UnitFileState"] == ""
+            and absent_values["ActiveState"] in {"", "inactive"}
+            and absent_values["FragmentPath"] == ""
+            and absent_values["DropInPaths"] == ""
+            and absent_values["User"] == ""
+            and absent_values["ExecStart"] == ""
+            and absent_values["MainPID"] in {"", "0"}
+        ):
+            raise RuntimeError(f"systemd-Show-Vertrag von {unit} ist unvollständig")
+        values = {name: values.get(name, "") for name in property_names}
+        incomplete_optional_not_found = True
     load_state = values.get("LoadState", "").lower()
     unit_file_state = values.get("UnitFileState", "").lower()
     active_state = values.get("ActiveState", "").lower()
@@ -2071,6 +2113,7 @@ def _systemd_show_contract(unit):
         raise RuntimeError(f"DropInPaths von {unit} enthalten Duplikate")
     service_user = values.get("User", "")
     exec_start = values.get("ExecStart", "")
+    main_pid = values.get("MainPID", "")
     if load_state not in {"loaded", "not-found"}:
         raise RuntimeError(f"LoadState von {unit} ist nicht sicher lesbar: {load_state or 'leer'}")
     if unit_file_state not in _SYSTEMD_UNIT_FILE_STATES:
@@ -2090,9 +2133,15 @@ def _systemd_show_contract(unit):
             raise RuntimeError(f"DropInPaths von {unit} sind nicht absolut gebunden")
         if not service_user or not exec_start:
             raise RuntimeError(f"User/ExecStart von {unit} sind nicht wirksam lesbar")
-    elif fragment_path or dropin_paths or service_user or exec_start:
+    elif (
+        fragment_path
+        or dropin_paths
+        or service_user
+        or exec_start
+        or (optional_not_found_compat and main_pid not in {"", "0"})
+    ):
         raise RuntimeError(f"Nicht vorhandene Unit {unit} besitzt wirksame Fragmente")
-    return {
+    state = {
         "load_state": load_state,
         "unit_file_state": unit_file_state,
         "active_state": active_state,
@@ -2101,6 +2150,9 @@ def _systemd_show_contract(unit):
         "service_user": service_user,
         "exec_start": exec_start,
     }
+    if incomplete_optional_not_found:
+        state["incomplete_optional_not_found"] = True
+    return state
 
 
 def _unit_file_effective_contract(payload, *, unit):
@@ -2824,7 +2876,12 @@ def _allowed_unit_dropin_preimages(
     state,
     *,
     expected_recovery_dropins=None,
+    inert_preimages_out=None,
 ):
+    if inert_preimages_out is not None and (
+        not isinstance(inert_preimages_out, dict) or inert_preimages_out
+    ):
+        raise RuntimeError("Inerter systemd-Drop-in-Vertrag ist nicht leer gebunden")
     ramdisk_path = os.path.join(
         "/etc/systemd/system",
         unit + ".d",
@@ -2913,12 +2970,33 @@ def _allowed_unit_dropin_preimages(
                 raise RuntimeError(f"{unit} besitzt kein gebundenes Drop-in-Verzeichnis")
             disk_names = set(os.listdir(directory_descriptor))
         allowed_names = {os.path.basename(path) for path in allowed_paths}
-        if disk_names - allowed_names:
+        if any(not name.endswith(".conf") for name in allowed_names):
+            raise RuntimeError("Freigegebener systemd-Drop-in-Name ist nicht wirksam")
+        active_disk_names = {name for name in disk_names if name.endswith(".conf")}
+        inert_disk_names = disk_names - active_disk_names
+        if active_disk_names - allowed_names:
             raise RuntimeError(
                 f"{unit} besitzt fremde systemd-Drop-in-Dateien: "
-                + ", ".join(sorted(disk_names - allowed_names))
+                + ", ".join(sorted(active_disk_names - allowed_names))
             )
+        inert_preimages = {}
         if directory_descriptor is not None:
+            for inert_name in sorted(inert_disk_names):
+                inert_path = os.path.join(
+                    "/etc/systemd/system",
+                    directory_name,
+                    inert_name,
+                )
+                inert_preimage = _read_bound_dropin_preimage_at(
+                    directory_descriptor,
+                    inert_name,
+                    inert_path,
+                )
+                if inert_preimage is None:
+                    raise RuntimeError(
+                        f"{unit} besitzt kein stabil gebundenes inertes Drop-in"
+                    )
+                inert_preimages[inert_path] = inert_preimage
             preimage = _read_bound_dropin_preimage_at(
                 directory_descriptor,
                 _RAMDISK_DROPIN_NAME,
@@ -2967,8 +3045,12 @@ def _allowed_unit_dropin_preimages(
         raise RuntimeError(
             f"On-Disk- und geladener Drop-in-Vertrag von {unit} weichen ab"
         )
-    if {os.path.basename(path) for path in preimages} != disk_names:
+    if {os.path.basename(path) for path in preimages} != active_disk_names:
         raise RuntimeError(f"{unit} Drop-in-Verzeichnis driftete beim Readback")
+    if {os.path.basename(path) for path in inert_preimages} != inert_disk_names:
+        raise RuntimeError(f"{unit} inerte Drop-ins drifteten beim Readback")
+    if inert_preimages_out is not None:
+        inert_preimages_out.update(inert_preimages)
     return preimages
 
 
@@ -2976,6 +3058,7 @@ def capture_systemd_service_bundle(
     service_names,
     *,
     expected_recovery_dropins=None,
+    allow_optional_not_found_compat=False,
 ):
     """Bindet Unitbytes, Enablement und Aktivität vor einer Bundle-Mutation."""
 
@@ -2988,7 +3071,14 @@ def capture_systemd_service_bundle(
             raise RuntimeError(f"Doppelte Unit im Dienstbundle: {unit}")
         path = os.path.join("/etc/systemd/system", unit)
         preimage = _read_bound_unit_preimage(path)
-        state = _systemd_show_contract(unit)
+        state = _systemd_show_contract(
+            unit,
+            allow_incomplete_optional_not_found=allow_optional_not_found_compat,
+        )
+        if state.get("incomplete_optional_not_found") and preimage is not None:
+            raise RuntimeError(
+                f"{unit} besitzt trotz unvollständigem not-found-Readback eine Hauptunit"
+            )
         if preimage is None and state["load_state"] == "loaded":
             raise RuntimeError(
                 f"{unit} wird außerhalb des gebundenen /etc-Produktpfads geladen"
@@ -2998,10 +3088,12 @@ def capture_systemd_service_bundle(
         expected_for_unit = recovery_contracts.get(unit, {})
         if expected_for_unit:
             used_recovery_contracts.add(unit)
+        inert_dropin_preimages = {}
         dropin_preimages = _allowed_unit_dropin_preimages(
             unit,
             state,
             expected_recovery_dropins=expected_for_unit,
+            inert_preimages_out=inert_dropin_preimages,
         )
         if preimage is None and (named_dropins or dropin_preimages):
             raise RuntimeError(
@@ -3026,6 +3118,7 @@ def capture_systemd_service_bundle(
             "preimage": preimage,
             "pre_effective": pre_effective,
             "pre_dropins": dropin_preimages,
+            "pre_inert_dropins": inert_dropin_preimages,
             **state,
         }
     if used_recovery_contracts != set(recovery_contracts):
@@ -3049,6 +3142,18 @@ def _unit_preimages_match(left, right):
         "ctime_ns",
     )
     return all(left.get(field) == right.get(field) for field in bound_fields)
+
+
+def _bound_inert_dropin_preimages_match(expected):
+    """Prüft, dass vom Updater nie mutierte inerte Drop-ins unverändert blieben."""
+
+    try:
+        return all(
+            _unit_preimages_match(_read_bound_unit_preimage(path), preimage)
+            for path, preimage in (expected or {}).items()
+        )
+    except Exception:
+        return False
 
 
 def record_systemd_service_bundle_postimage(
@@ -3075,12 +3180,21 @@ def record_systemd_service_bundle_postimage(
             rebound = _read_bound_unit_preimage(path)
             if not _unit_preimages_match(rebound, preimage):
                 raise RuntimeError(f"systemd-Drop-in driftete vor dem Bundle-Commit: {path}")
+        if not _bound_inert_dropin_preimages_match(
+            snapshot[unit].get("pre_inert_dropins") or {}
+        ):
+            raise RuntimeError(
+                f"Inertes systemd-Drop-in driftete vor dem Bundle-Commit: {unit}"
+            )
         snapshot[unit]["postimage"] = current
         snapshot[unit]["post_effective"] = _unit_file_effective_contract(
             current["bytes"],
             unit=unit,
         )
         snapshot[unit]["post_dropins"] = dict(snapshot[unit].get("pre_dropins", {}))
+        snapshot[unit]["post_inert_dropins"] = dict(
+            snapshot[unit].get("pre_inert_dropins", {})
+        )
     return True
 
 
@@ -3137,7 +3251,12 @@ def _restore_bound_unit_file(unit_state):
         run_command("sudo rm -f -- " + shlex.quote(sibling), timeout=10)
 
 
-def _restore_unit_enablement(unit, prior_state):
+def _restore_unit_enablement(
+    unit,
+    prior_state,
+    *,
+    allow_optional_not_found_compat=False,
+):
     state = str(prior_state or "")
     if state == "masked":
         command = "sudo systemctl mask " + shlex.quote(unit)
@@ -3160,7 +3279,10 @@ def _restore_unit_enablement(unit, prior_state):
     result = run_command(command, timeout=20)
     if result.get("success"):
         return True
-    current = _systemd_show_contract(unit)
+    current = _systemd_show_contract(
+        unit,
+        allow_incomplete_optional_not_found=allow_optional_not_found_compat,
+    )
     if state == "":
         return bool(
             current.get("load_state") == "not-found"
@@ -3299,7 +3421,12 @@ def rollback_systemd_service_bundle(snapshot):
         if not run_command("sudo systemctl stop " + shlex.quote(unit), timeout=30).get("success"):
             # Ein noch nicht geladener, neu anzulegender Dienst darf beim Stop
             # fehlen; nach dem Restore wird sein Zustand erneut exakt geprüft.
-            current = _systemd_show_contract(unit)
+            current = _systemd_show_contract(
+                unit,
+                allow_incomplete_optional_not_found=bool(
+                    snapshot[unit].get("incomplete_optional_not_found")
+                ),
+            )
             if current["active_state"] not in {"", "inactive", "failed"}:
                 ok = False
     for unit in units:
@@ -3309,7 +3436,11 @@ def rollback_systemd_service_bundle(snapshot):
         ok = False
     for unit in units:
         prior = snapshot[unit]
-        current_before_enablement = _systemd_show_contract(unit)
+        optional_absence = bool(prior.get("incomplete_optional_not_found"))
+        current_before_enablement = _systemd_show_contract(
+            unit,
+            allow_incomplete_optional_not_found=optional_absence,
+        )
         if (
             prior.get("unit_file_state") != "masked"
             and current_before_enablement.get("unit_file_state") == "masked"
@@ -3320,7 +3451,11 @@ def rollback_systemd_service_bundle(snapshot):
             )
             if not unmask.get("success"):
                 ok = False
-        if not _restore_unit_enablement(unit, prior.get("unit_file_state")):
+        if not _restore_unit_enablement(
+            unit,
+            prior.get("unit_file_state"),
+            allow_optional_not_found_compat=optional_absence,
+        ):
             ok = False
     if not ok:
         if not _fail_closed_service_bundle(units):
@@ -3347,7 +3482,12 @@ def rollback_systemd_service_bundle(snapshot):
             timeout=30,
         )
         if not result.get("success"):
-            current = _systemd_show_contract(unit)
+            current = _systemd_show_contract(
+                unit,
+                allow_incomplete_optional_not_found=bool(
+                    snapshot[unit].get("incomplete_optional_not_found")
+                ),
+            )
             expected = "active" if prior_active else {"", "inactive", "failed"}
             if (
                 current["active_state"] != expected
@@ -3368,7 +3508,12 @@ def rollback_systemd_service_bundle(snapshot):
         prior = snapshot[unit]
         try:
             current_preimage = _read_bound_unit_preimage(prior["path"])
-            current_state = _systemd_show_contract(unit)
+            current_state = _systemd_show_contract(
+                unit,
+                allow_incomplete_optional_not_found=bool(
+                    prior.get("incomplete_optional_not_found")
+                ),
+            )
             prior_bytes = (
                 prior["preimage"]["bytes"] if prior.get("preimage") is not None else None
             )
@@ -3387,6 +3532,10 @@ def rollback_systemd_service_bundle(snapshot):
                 current_state,
                 prior.get("pre_effective") or {},
                 prior.get("pre_dropins") or {},
+            ):
+                ok = False
+            if not _bound_inert_dropin_preimages_match(
+                prior.get("pre_inert_dropins") or {}
             ):
                 ok = False
             expected_active = "active" if prior.get("active_state") == "active" else {
@@ -3445,6 +3594,10 @@ def activate_systemd_service_bundle(
                     state,
                     snapshot[checked_unit].get("post_effective") or {},
                     snapshot[checked_unit].get("post_dropins") or {},
+                ):
+                    return False
+                if not _bound_inert_dropin_preimages_match(
+                    snapshot[checked_unit].get("post_inert_dropins") or {}
                 ):
                     return False
                 if checked_unit in enabled:

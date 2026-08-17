@@ -1,10 +1,16 @@
 # Betrieb des E3DC-Control Installers
 
-Dokumentation Stand: 5.4.3q
+Dokumentation Stand: 5.4.3r
 
 Der Installer ist der freigegebene Einstieg für Installation, Update,
 Reparatur, Backup, Rollback und Deinstallation. Die vollständige Bedienung ist
 in [E3DC-Control Installer](Installer.md) beschrieben.
+
+Der Installer-Anteil von 5.4.3r darf beim ausdrücklich mit Rolle und Peer
+gebundenen Download-Bootstrap einen wirklich fehlenden HA-Rollenanker aus
+dieser bereits bestehenden Bindung erzeugen. Das geschieht erst nach
+verifiziertem Backup und bestätigter Writer-Ruhe. EMS-Regelung und
+Hardwareausgänge ändern sich nicht.
 
 Der Installer-Anteil von 5.4.3q verwendet im Finalizer des administrativen
 Download-Bootstraps den absoluten Pfad `/usr/sbin/visudo` und ist damit nicht

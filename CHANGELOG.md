@@ -6,6 +6,13 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.3r] – 2026-08-17
+
+### 🔄 HA-Rollenanker im Download-Bootstrap
+
+- **Der gebundene HA-Verbund bleibt updatefähig:** Beim ausdrücklich mit Rolle und Peer gebundenen Download-Bootstrap darf ein wirklich fehlender HA-Rollenanker aus dieser bereits bestehenden Bindung erzeugt werden.
+- **Erst nach sicherem Vorlauf:** Die Erzeugung erfolgt erst nach verifiziertem Backup und bestätigter Writer-Ruhe. EMS-Regelung und Hardwareausgänge ändern sich nicht.
+
 ## [5.4.3q] – 2026-08-17
 
 ### 🔄 Absoluter visudo-Pfad im Download-Bootstrap

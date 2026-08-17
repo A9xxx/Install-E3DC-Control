@@ -1,9 +1,9 @@
 {
-  "version": "5.4.3q",
+  "version": "5.4.3r",
   "min_version": "4.0.0",
-  "stable_release": "v5.4.3q",
+  "stable_release": "v5.4.3r",
   "release_date": "2026-08-17",
-  "description": "v5.4.3q - Absoluter visudo-Pfad im Download-Bootstrap-Finalizer",
+  "description": "v5.4.3r - HA-Rollenanker aus gebundener Rolle und Peer nach Backup und Writer-Ruhe",
   "installer_requires": "python3",
   "sanitized_republication": false,
   "history_transition": {

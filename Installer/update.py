@@ -1,5 +1,6 @@
 import ast
 import errno
+import ipaddress
 import os
 import sys
 import json
@@ -4482,13 +4483,41 @@ def _capture_transition_state(
     )
 
 
+def _bound_explicit_bootstrap_role_peer(state: TransitionState) -> str:
+    """Bindet genau eine numerische Peer-IP an den unveränderlichen Rollenstand."""
+
+    configured_peer = state.config.get("ha_peer_ip")
+    if state.ha_role in {"master", "slave"}:
+        if not isinstance(configured_peer, str):
+            raise RuntimeError(
+                "HA-Rollenanker verlangt genau eine numerische Peer-IP"
+            )
+        peer_text = configured_peer.strip()
+        try:
+            peer_address = ipaddress.ip_address(peer_text)
+        except ValueError as exc:
+            raise RuntimeError(
+                "HA-Rollenanker verlangt genau eine gültige numerische Peer-IP"
+            ) from exc
+        if (
+            peer_address.is_unspecified
+            or peer_address.is_loopback
+            or peer_address.is_multicast
+        ):
+            raise RuntimeError(
+                "HA-Rollenanker verlangt eine eindeutige entfernte Peer-IP"
+            )
+        return str(peer_address)
+    return ""
+
+
 def _explicit_bootstrap_role_anchor_needed(
     state: TransitionState,
     *,
     target_install_path: str | None,
     sealed_target_updater: bool = False,
 ) -> bool:
-    """Prüft rein, ob der explizit gebundene Einzelknoten einen Anker braucht."""
+    """Prüft rein, ob der explizit gebundene Anlagenknoten einen Anker braucht."""
 
     if target_install_path and sealed_target_updater:
         raise RuntimeError(
@@ -4502,14 +4531,32 @@ def _explicit_bootstrap_role_anchor_needed(
         instance_role_anchor_matches,
     )
 
-    configured_peer = str(state.config.get("ha_peer_ip") or "").strip()
-    peer_ip = configured_peer if state.ha_role in {"master", "slave"} else ""
+    peer_ip = _bound_explicit_bootstrap_role_peer(state)
     if instance_role_anchor_matches(state.ha_role, peer_ip=peer_ip) is True:
         return False
-    if state.ha_role != "off" or configured_peer:
+    if state.ha_role in {"master", "slave"}:
+        if not target_install_path or sealed_target_updater:
+            raise RuntimeError(
+                "Ein fehlender HA-Rollenanker darf nur der explizite "
+                "Download-Bootstrap erzeugen"
+            )
+        if state.bootstrap_legacy_config:
+            raise RuntimeError(
+                "HA-Rollenanker verlangt eine bestehende gebundene "
+                "Betriebskonfiguration"
+            )
+    elif state.ha_role == "off" and str(
+        state.config.get("ha_peer_ip") or ""
+    ).strip():
         raise RuntimeError(
             "Ein fehlender Rollenanker darf automatisch nur für einen "
             "explizit gebundenen Einzelknoten ohne HA-Peer erzeugt werden"
+        )
+    elif state.ha_role != "off":
+        raise RuntimeError(
+            "Ein fehlender Rollenanker darf automatisch nur für einen "
+            "explizit gebundenen Einzelknoten oder ein bestehendes "
+            "Master-/Slave-System erzeugt werden"
         )
     if os.path.lexists(INSTANCE_ROLE_ANCHOR_PATH):
         raise RuntimeError(
@@ -4538,7 +4585,7 @@ def _bind_explicit_bootstrap_role_anchor(
         project_instance_role_anchor,
     )
 
-    peer_ip = ""
+    peer_ip = _bound_explicit_bootstrap_role_peer(state)
     if project_instance_role_anchor(state.ha_role, peer_ip=peer_ip) is not True:
         raise RuntimeError(
             "Explizit gebundener Instanzrollen-Anker konnte nicht erstellt werden"

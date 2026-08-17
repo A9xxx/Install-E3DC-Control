@@ -1,3 +1,20 @@
+# E3DC-Control v5.4.3r
+
+E3DC-Control 5.4.3r ergänzt ausschließlich die Erzeugung eines wirklich
+fehlenden HA-Rollenankers im ausdrücklich mit Rolle und Peer gebundenen
+Download-Bootstrap. Es enthält keine Änderung an EMS-Regelung oder
+Hardwareausgängen.
+
+## HA-Rollenanker aus bestehender Bindung
+
+- Der Download-Bootstrap erzeugt den fehlenden Rollenanker aus der bereits
+  gebundenen Rolle und Peer-Zuordnung.
+- Die Erzeugung erfolgt erst nach verifiziertem Backup und bestätigter
+  Writer-Ruhe. Alle übrigen Update- und Sicherheitsverträge bleiben
+  unverändert.
+
+---
+
 # E3DC-Control v5.4.3q
 
 E3DC-Control 5.4.3q korrigiert ausschließlich den Aufruf von `visudo` im

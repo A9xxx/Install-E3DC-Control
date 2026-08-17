@@ -12,6 +12,14 @@ export E3DC_INSTALL_PATH="/absoluter/pfad/zur/installation"
 test -f "$E3DC_INSTALL_PATH/e3dc-setup"
 ```
 
+## HA-Rollenanker im Download-Bootstrap in 5.4.3r
+
+5.4.3r darf beim ausdrücklich mit Rolle und Peer gebundenen
+Download-Bootstrap einen wirklich fehlenden HA-Rollenanker aus dieser bereits
+bestehenden Bindung erzeugen. Die Erzeugung erfolgt erst nach verifiziertem
+Backup und bestätigter Writer-Ruhe. Der Rückfallvertrag bleibt unverändert;
+EMS-Regelung und Hardwareausgänge ändern sich nicht.
+
 ## Bootstrap-Finalizer in 5.4.3q
 
 5.4.3q ruft `visudo` im Finalizer des administrativen Download-Bootstraps über
@@ -82,7 +90,7 @@ oder einen Prozessabbruch außerhalb des erkannten Fehlerpfads.
 
 ## Programmstand zurücksetzen
 
-Der aktuelle Stable-Stand `v5.4.3q` führt den gebundenen Rückfallvertrag fort.
+Der aktuelle Stable-Stand `v5.4.3r` führt den gebundenen Rückfallvertrag fort.
 
 Beim Rücklauf wird der tatsächliche Dateisystemzustand einer Unit weiterhin
 streng gegen reguläre Unit-Datei, kanonische `/dev/null`-Maske, unerwarteten

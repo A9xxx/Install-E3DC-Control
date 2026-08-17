@@ -8,6 +8,7 @@
 **/.github
 Dockerfile
 docker-compose.yml
+e3dc-update-bootstrap
 .local_rules.md
 **/.local_rules.md
 AGENTS.md

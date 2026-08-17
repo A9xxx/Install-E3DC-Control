@@ -6244,19 +6244,14 @@ def _default_charge_guard_runtime_safety_claim(
 ) -> Dict[str, Any]:
     """Bindet ausschließlich den fail-closed Default-Ladeblock.
 
-    Der Plankandidat bleibt dabei unverändert candidate-only. Der Storage
-    Manager darf im aktiven DV-Slot jedoch den separat typisierten
-    0-W-Ladeblock ausführen. Diese Ausnahme belegt deshalb den vollständigen
-    Managerausgang, ohne dem Plankandidaten Auswahl- oder Ausführungsrechte zu
-    verleihen. Das gilt auch für einen realen, suspendierten DV-HOLD; die
-    Runtime darf ihn nicht fälschlich als wirkungslos darstellen.
+    Der Plankandidat bleibt rein diagnostisch. Der Storage Manager darf im
+    aktiven DV-Slot den separat typisierten 0-W-Ladeblock ausführen, auch wenn
+    der passive Planslot bewusst keinen Kandidaten besitzt. Autoritativ sind
+    ausschließlich Plan/Slot, DV-Owner und der tatsächlich übersetzte sichere
+    Ausgang. Eine zusätzliche Kandidatenform darf diese Entscheidung nicht
+    nachträglich aushebeln.
     """
 
-    candidate = (
-        phase5.get("candidate")
-        if isinstance(phase5.get("candidate"), dict)
-        else {}
-    )
     projection = (
         slot.get("projection")
         if isinstance(slot.get("projection"), dict)
@@ -6309,12 +6304,6 @@ def _default_charge_guard_runtime_safety_claim(
     role_candidate_action = _runtime_storage_action(
         roles.get("candidate_action")
     )
-    phase_candidate_action = _runtime_storage_action(
-        candidate.get("action")
-    )
-    source_window_action = _runtime_storage_action(
-        source_window.get("action")
-    )
     applicable = bool(
         selected_source
         == "canonical_phase5_direct_marketing_default_charge_guard"
@@ -6358,17 +6347,10 @@ def _default_charge_guard_runtime_safety_claim(
         and roles.get("schema_version")
         == DIRECT_MARKETING_ACTION_ROLES_SCHEMA
         and roles.get("status") == "CONSISTENT"
-        and role_candidate_action is not None
-        and str(roles.get("candidate_action") or "").upper()
-        == role_candidate_action
-        and roles.get("candidate_only") is True
         and roles.get("plan_selected_action") is None
         and roles.get("plan_executable_action") is None
         and roles.get("effective_action") is None
         and roles.get("runtime_effect_claim_allowed") is False
-        and phase_candidate_action is not None
-        and str(candidate.get("action") or "").upper()
-        == phase_candidate_action
         and phase5.get("decision_available") is True
         and phase5.get("selected") is True
         and phase5.get("executable") is True
@@ -6398,7 +6380,6 @@ def _default_charge_guard_runtime_safety_claim(
         and source_window.get("start_ts_ms") == slot.get("start_ts_ms")
         and type(source_window.get("end_ts_ms")) is int
         and source_window.get("end_ts_ms") == slot.get("end_ts_ms")
-        and source_window_action == phase_candidate_action
         and intent.get("class") == "authorized_charge_block"
         and intent.get("authorized") is True
         and str(intent.get("action") or "").upper()
@@ -6459,7 +6440,8 @@ def _default_charge_guard_runtime_safety_claim(
         "claim_type": "default_charge_guard",
         "action": "CHARGE_BLOCK_WAIT" if valid else None,
         "plan_candidate_action": role_candidate_action,
-        "plan_candidate_only": True,
+        "plan_candidate_only": roles.get("candidate_only") is True,
+        "candidate_role": "diagnostic_only",
         "reason_code": (
             None
             if valid

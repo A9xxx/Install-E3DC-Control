@@ -2,8 +2,14 @@
 
 Veröffentlichte Images entstehen ausschließlich aus einem versionierten stabilen Release-Tag. `latest` verweist damit auf die zuletzt veröffentlichte stabile Version.
 
-Der aktuelle Stable-Stand ist `v5.4.3n`. Die Tags `latest`, `v5.4.3n` und
-`5.4.3n` müssen auf denselben geprüften Multi-Arch-Digest verweisen.
+Der aktuelle Stable-Stand ist `v5.4.3o`. Die Tags `latest`, `v5.4.3o` und
+`5.4.3o` müssen auf denselben geprüften Multi-Arch-Digest verweisen.
+
+5.4.3o ergänzt einen Bare-Metal-Rettungsbootstrap; dieser Host-Helfer gehört
+nicht in den Containerlayer. Das Docker-Image enthält dagegen weiterhin den
+gemeinsamen Ziel-Updater und den sicheren kandidatlosen passiven
+Direktvermarktungs-Ladeblock. Die Änderung autorisiert keine zusätzliche
+Speicheraktion.
 
 5.4.3n ändert ausschließlich den nativen privilegierten Backup- und
 Recoveryvertrag: Nur `/etc/e3dc-control/instance_role.json` wird mit
@@ -241,7 +247,7 @@ unverändert gesperrt und benötigen eine manuelle Prüfung.
 
 Ohne `E3DC_IMAGE_TAG` folgt diese Compose-Datei dem geprüften Stable-Tag
 `latest`. Ein fester Tag bleibt bei `pull` absichtlich unverändert. Für einen
-bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.3n` in der Datei `.env`
+bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.3o` in der Datei `.env`
 gesetzt. `docker compose config --images` zeigt vorab das tatsächlich gewählte
 Image.
 
@@ -268,7 +274,7 @@ Versionswahl.
 
 Gezielte Rückfallversion:
 
-Den Stable-Container `v5.4.3n` auf den veröffentlichten Rollback-Root
+Den Stable-Container `v5.4.3o` auf den veröffentlichten Rollback-Root
 `v5.3.2b` zurücksetzen:
 
 ```bash

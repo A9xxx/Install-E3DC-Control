@@ -1,3 +1,40 @@
+# E3DC-Control v5.4.3o
+
+E3DC-Control 5.4.3o ergänzt einen robusten administrativen Rettungsweg für
+heterogene Bare-Metal-Altinstallationen und schließt die kandidatlose passive
+Direktvermarktungs-Ladeblockkante. Der Bootstrap normalisiert bekannte
+Altzustände erst nach geprüftem Backup und bestätigter Writer-Ruhe; die
+Speicheränderung bleibt ein reiner sicherer 0-W-Ausgang.
+
+## Download-Bootstrap ohne Autorität aus dem Altbestand
+
+- `e3dc-update-bootstrap` lädt den aktuellen veröffentlichten Stable-Tag,
+  bindet dessen vollständige Commit-SHA über einen isolierten Git-Transport
+  und startet ausschließlich den Ziel-Updater aus einem root-eigenen
+  temporären Checkout.
+- Eine vorhandene `.git`-Fläche, ihre Rechte, ihr Index und ihre lokale
+  Historie werden im ausdrücklich gestarteten Rettungsweg nicht als
+  Updateautorität gelesen. Der bestehende Alt-Updater wird nicht ausgeführt.
+- Nach verifiziertem Backup und bestätigter Aktor-/Writer-Ruhe werden bekannte
+  Release-Dateien, Rechte und Units auf den veröffentlichten Zielzustand
+  projiziert. Historische Besitzer, Modi, Attribute oder bekannte alte
+  Dienstdarstellungen sind damit normalisierbarer Bestand.
+- Pfadflucht, Symlinks, Spezialdateien, zusätzliche Hardlinks, konkurrierende
+  Updates, nicht stillgelegte Writer, ein ungültiges Backup und ein
+  fehlgeschlagener Ziel-Healthcheck bleiben harte Abbruchgründe.
+
+## Passiver Direktvermarktungs-Ladeblock ohne Plankandidat
+
+- Der vollständig gebundene Laufzeitvertrag für `CHARGE_BLOCK_WAIT` stützt
+  sich auf Plan, Slot, DV-Owner und den tatsächlich übersetzten sicheren
+  Ausgang. Ein bewusst kandidatloser passiver Planslot bleibt dadurch
+  ausführbar, ohne eine diagnostische Kandidatenform zu erfinden.
+- Der Kandidat bleibt rein diagnostisch. Die Änderung autorisiert weder Laden
+  noch Entladen und erzeugt keinen zweiten Hardwareausgang; sämtliche Reserve-,
+  Netzpunkt-, Daten- und Ausgangsgrenzen bleiben unverändert.
+
+---
+
 # E3DC-Control v5.4.3n
 
 E3DC-Control 5.4.3n schließt einen eng begrenzten Widerspruch zwischen dem

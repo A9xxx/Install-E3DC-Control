@@ -5,7 +5,7 @@ Updates werden ausschließlich über den Installer ausgeführt. Ein manuelles
 Release-Historie ungeeignet, weil alter und neuer Git-Stand nicht miteinander
 verwandt sein müssen.
 
-Der aktuelle Stable-Stand ist `v5.4.3n`. Der Ziel-Updater bindet den
+Der aktuelle Stable-Stand ist `v5.4.3o`. Der Ziel-Updater bindet den
 freigegebenen Zielstand vor Backup und Dienststopp eindeutig an Version,
 Herkunft und Anlagenrolle. Fortschritt und Lebenszeichen bleiben auf
 langsameren Raspberry Pis sichtbar. Eine bereits vollständig installierte
@@ -34,6 +34,52 @@ reguläre Installer-Pfad zur Verfügung:
 bash "$E3DC_INSTALL_PATH/e3dc-setup" --check
 bash "$E3DC_INSTALL_PATH/e3dc-setup" --update-e3dc
 ```
+
+### Rettungsweg für heterogene Altinstallationen
+
+Wenn ein alter lokaler Updater an einer früheren Dateiberechtigung, einer
+manuell kopierten Produktdatei oder einer veralteten Dienstprojektion scheitert,
+kann der aktuelle Updater unabhängig vom installierten Programmstand geladen
+werden:
+
+```bash
+export E3DC_INSTALL_PATH="/absoluter/pfad/zur/installation"
+BOOTSTRAP_DIR=$(sudo /usr/bin/mktemp -d /run/e3dc-update-bootstrap.XXXXXX)
+sudo /usr/bin/curl -q -fsS --proto '=https' --tlsv1.2 \
+  -o "$BOOTSTRAP_DIR/e3dc-update-bootstrap" \
+  https://raw.githubusercontent.com/A9xxx/Install-E3DC-Control/main/e3dc-update-bootstrap
+sudo /bin/chmod 0700 "$BOOTSTRAP_DIR/e3dc-update-bootstrap"
+sudo /bin/sh "$BOOTSTRAP_DIR/e3dc-update-bootstrap" "$E3DC_INSTALL_PATH"
+sudo /bin/rm -rf -- "$BOOTSTRAP_DIR"
+```
+
+Der Download liegt damit von Anfang an in einer zufälligen, root-eigenen
+`0700`-Laufzeitfläche. Ein lokaler Benutzer kann die anschließend als Root
+ausgeführten Bytes weder austauschen noch über eine persönliche `curl`-
+Konfiguration beeinflussen. Die HTTPS-Quelle ist das öffentliche
+Projekt-Repository; der Bootstrap selbst bindet danach Stable-Tag und Commit
+noch einmal über einen isolierten Git-Transport.
+
+Der kleine Bootstrap ermittelt den aktuellen veröffentlichten Stable-Tag samt
+Commit, lädt dessen Installer und führt **nicht** den vorhandenen Alt-Updater
+aus. Die Rolle wird aus dem bestehenden Rollenanker beziehungsweise der
+Konfiguration übernommen. Ist sie nicht eindeutig, muss sie als zweites
+Argument (`off`, `master`, `slave` oder `shadow`) angegeben werden.
+
+Die vorhandene `.git`-Fläche ist dabei keine Eingangsbedingung. Der Rettungsweg
+liest weder ihre Rechte noch ihren Index oder ihre lokale Historie als
+Updateautorität, sondern baut die für den Zielstand benötigten Git-Metadaten
+nach dem Backup frisch auf. Gesichert werden die tatsächlich betriebenen
+Produkt- und Konfigurationsdateien, nicht ein möglicherweise beschädigter
+Git-Zwischenspeicher.
+
+Der Ziel-Updater erstellt und prüft zuerst das Backup, stoppt danach die
+bekannten Writer, projiziert Release-Dateien, Rechte und Dienste auf den
+kanonischen Zielzustand und prüft anschließend den Wiederanlauf. Abweichende
+Besitzer oder Modi bekannter Produktdateien sind dabei zu normalisierender
+Altbestand und kein eigener Abbruchgrund. Unklare Symlinks, Spezialdateien,
+konkurrierende Updates, nicht stoppbare Writer sowie ein fehlgeschlagenes
+Backup oder Dienst-Endgate bleiben harte Stopps.
 
 **Einmaliger Übergang auf 5.4.3i oder neuer:** Installationen bis einschließlich
 5.4.3f besitzen den neuen root-eigenen Web-Launcher noch nicht. Dieser erste
@@ -73,6 +119,20 @@ dem Root-Lock aus demselben gültigen Nicht-Root-Eigentümer von Repository und
 `.git`, lokales Benutzerkonto und Nutzerwert unmittelbar vor dem ersten
 Import aus dem Zielcode erneut geprüft. Die fail-closed Grenzen und alle
 übrigen Härtungen aus 5.4.3j bleiben unverändert.
+
+### 5.4.3o: robuster Rettungsweg für heterogene Altinstallationen
+
+5.4.3o führt `e3dc-update-bootstrap` als einheitlichen administrativen
+Rettungsweg ein. Er ermittelt den veröffentlichten Stable-Tag samt Commit über
+isolierten Git-Transport, lädt einen root-eigenen temporären Ziel-Checkout und
+führt ausschließlich dessen Ziel-Updater aus. Der vorhandene Alt-Updater und
+seine `.git`-Metadaten liefern keine Updateautorität.
+
+Nach verifiziertem Backup und bestätigter Writer-Ruhe normalisiert der
+Ziel-Updater bekannte Release-Dateien, Rechte und Units. Pfadflucht, Symlinks,
+Spezialdateien, zusätzliche Hardlinks, konkurrierende Updates, nicht
+stillgelegte Writer sowie ein ungültiges Backup oder fehlgeschlagener
+Ziel-Healthcheck bleiben harte Stopps.
 
 ### 5.4.3n: pfadgenauer Rollenanker im Backup- und Recoveryvertrag
 
@@ -192,30 +252,10 @@ erst nach nachweislich inaktiver Finalizer-Lease eingreifen. Fremde oder
 driftende Flächen bleiben unangetastet und fail-closed.
 
 Erreicht ein abweichender oder noch älterer lokaler Updater diese gebundene
-Kompatibilitätsbrücke nicht und bricht bereits vor Backup und Dienststopp mit
-`Installationsbenutzer ist nicht lokal gebunden` ab, steht für einen normalen
-Einzelknoten mit `ha_mode=off` weiterhin der aktuelle offizielle Bootstrap zur
-Verfügung. Tag und vollständige Commit-SHA müssen von derselben veröffentlichten
-GitHub-Release-Seite übernommen werden:
-
-```bash
-export E3DC_INSTALL_PATH="/absoluter/pfad/zur/installation"
-export E3DC_RELEASE_TAG="v5.4.3n"
-export E3DC_RELEASE_SHA="<40-stellige Commit-SHA des veröffentlichten Tags>"
-E3DC_BOOTSTRAP_DIR="$(mktemp -d)"
-curl -fL "https://github.com/A9xxx/Install-E3DC-Control/archive/refs/tags/${E3DC_RELEASE_TAG}.tar.gz" \
-  -o "$E3DC_BOOTSTRAP_DIR/release.tar.gz"
-tar -xzf "$E3DC_BOOTSTRAP_DIR/release.tar.gz" -C "$E3DC_BOOTSTRAP_DIR"
-bash "$E3DC_BOOTSTRAP_DIR/Install-E3DC-Control-${E3DC_RELEASE_TAG#v}/e3dc-bootstrap" \
-  "$E3DC_INSTALL_PATH" "$E3DC_RELEASE_TAG" "$E3DC_RELEASE_SHA" off
-```
-
-Der Bootstrap prüft den normalen lokalen Installationsnutzer, Stable-Tag,
-Commit-SHA, Zielpfad und Rolle erneut. Ein fehlender Einzelknoten-Rollenanker
-wird erst nach verifiziertem Backup und bestätigter Aktorruhe einmalig
-erzeugt. Für `master`, `slave` oder `shadow` wird kein Rollenanker aus der
-Web-Konfiguration abgeleitet; dort muss der vorhandene root-geschützte Anker
-bereits exakt passen. Bei einem Fehler bleibt der verifizierte Rückweg Pflicht.
+Kompatibilitätsbrücke nicht, gilt der oben beschriebene Download-Bootstrap als
+einheitlicher Rettungsweg. Er prüft Installationsnutzer, Stable-Tag,
+Commit-SHA, Zielpfad und Rolle im heruntergeladenen Zielstand erneut. Bei einem
+Fehler bleibt das verifizierte Backup der Rückweg.
 
 Ab dem Release mit Ziel-Updater-Handoff lädt die laufende Version zunächst
 ausschließlich die Git-Objekte des freigegebenen Zielstands. Sie bindet

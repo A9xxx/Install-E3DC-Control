@@ -287,6 +287,7 @@
 !/doc/Web_Push_Dokumentation.md
 !/docker-compose.yml
 !/e3dc-bootstrap
+!/e3dc-update-bootstrap
 !/e3dc-setup
 !/entrypoint.sh
 !/fix_bom.py

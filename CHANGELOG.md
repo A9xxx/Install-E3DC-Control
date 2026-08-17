@@ -6,6 +6,19 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.3o] – 2026-08-17
+
+### 🔄 Robuster Rettungsweg für heterogene Altinstallationen
+
+- **Der neue Download-Bootstrap verwendet ausschließlich den veröffentlichten Zielstand:** `e3dc-update-bootstrap` ermittelt den aktuellen Stable-Tag samt Commit über isolierten Git-Transport und führt den Installer aus einem root-eigenen temporären Ziel-Checkout aus. Der vorhandene Alt-Updater und seine möglicherweise beschädigte `.git`-Fläche liefern keine Autorität.
+- **Historische Metadaten werden nach dem Sicherheitsbackup normalisiert:** Abweichende Besitzer, Modi, Attribute und bekannte alte Dienstdarstellungen blockieren den ausdrücklich gestarteten Rettungsweg nicht mehr allein. Nach verifiziertem Backup und bestätigter Writer-Ruhe projiziert Root die bekannten Release-Dateien, Rechte und Units auf den Zielzustand.
+- **Echte Gefahren bleiben harte Stopps:** Pfadflucht, Symlinks, Spezialdateien, zusätzliche Hardlinks, ein konkurrierender Updater, nicht stillgelegte Writer, ein ungültiges Backup oder ein fehlgeschlagener Ziel-Healthcheck brechen weiterhin fail-closed ab.
+
+### ⚡ Kandidatloser passiver DV-Ladeblock
+
+- **Der sichere 0-W-Ladeblock hängt nicht von einem diagnostischen Kandidaten ab:** In einem vollständig gebundenen passiven Direktvermarktungsslot bleiben Plan, Slot, DV-Owner und der tatsächlich übersetzte sichere Ausgang maßgeblich. Ein absichtlich fehlender Plankandidat verhindert deshalb nicht mehr den autorisierten Laufzeitvertrag `CHARGE_BLOCK_WAIT`.
+- **Keine zusätzliche Speicheraktion:** Der Kandidat bleibt rein diagnostisch. Die Änderung öffnet weder Laden noch Entladen und erzeugt keinen konkurrierenden Hardwarepfad; Reserve-, Netzpunkt-, Daten- und Ausgangsgrenzen bleiben unverändert vorrangig.
+
 ## [5.4.3n] – 2026-08-17
 
 ### 🔐 Pfadgenauer Rollenanker im Update-Rückweg

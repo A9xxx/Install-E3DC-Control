@@ -1,10 +1,19 @@
 # Betrieb des E3DC-Control Installers
 
-Dokumentation Stand: 5.4.3n
+Dokumentation Stand: 5.4.3o
 
 Der Installer ist der freigegebene Einstieg für Installation, Update,
 Reparatur, Backup, Rollback und Deinstallation. Die vollständige Bedienung ist
 in [E3DC-Control Installer](Installer.md) beschrieben.
+
+Der Installer-Anteil von 5.4.3o ergänzt den administrativen
+`e3dc-update-bootstrap`. Er lädt den veröffentlichten Stable-Tag samt Commit
+in einen root-eigenen Ziel-Checkout und verwendet den vorhandenen Alt-Updater
+sowie dessen `.git`-Metadaten nicht als Autorität. Erst nach verifiziertem
+Backup und bestätigter Writer-Ruhe werden bekannte Release-Dateien, Rechte und
+Units normalisiert. Pfadflucht, Symlinks, Spezialdateien, zusätzliche
+Hardlinks, konkurrierende Updates sowie fehlgeschlagene Backup- oder
+Healthchecks bleiben harte Stopps.
 
 Der Installer-Anteil von 5.4.3n korrigiert ausschließlich den pfadgenauen
 Metadatenvertrag der privilegierten Restorequelle. Nur

@@ -75,6 +75,7 @@ from .logging_manager import get_or_create_logger, log_task_completed, log_error
 from .config_secret_permissions import config_secret_dir_mode_text, config_secret_file_mode_text
 from .git_commit_reader import (
     isolated_git_command,
+    isolated_git_environment_assignments,
     read_commit_entries,
     run_isolated_remote_git,
 )
@@ -953,8 +954,16 @@ def _combined_process_diagnostics(result: dict, maximum: int = 4000) -> str:
 
 
 def _git_argv(repo_dir: str, install_user: str, *args: str, timeout: int = 30) -> dict:
+    # Der Updater läuft als Root und projiziert anschließend den kanonischen
+    # Zielbesitzer. Git wird deshalb im Root-Prozess nicht künstlich auf die
+    # möglicherweise durch historische chmod/chown-Zustände ausgesperrte
+    # Altidentität abgesenkt. Die isolierte Git-Umgebung deaktiviert weiterhin
+    # Hooks, fremde Konfiguration, Credentials, Replace-Refs und unsichere
+    # Protokolle. Nicht privilegierte Diagnoseaufrufe bleiben beim gebundenen
+    # Installationsbenutzer.
+    git_user = None if hasattr(os, "geteuid") and os.geteuid() == 0 else install_user
     return _run_argv(
-        isolated_git_command(repo_dir, *args, run_as_user=install_user),
+        isolated_git_command(repo_dir, *args, run_as_user=git_user),
         timeout=timeout,
     )
 
@@ -4097,7 +4106,14 @@ def _capture_transition_unit_activity(
     *,
     piguard_contract: bool = False,
 ) -> str:
-    """Bindet geladene und exakt abwesende Units aus der systemd-Autorität."""
+    """Erfasst den Altbetrieb, ohne seine Unitform zur Zielautorität zu machen.
+
+    Unterschiedliche Community-Systeme besitzen historisch reguläre, maskierte,
+    deaktivierte oder beschädigte Produktunits. Diese Form wird nach dem Backup
+    durch den Zielrelease normalisiert. Der Preflight muss deshalb nur sicher
+    lesen können, ob ein bekannter Writer lief; die endgültige Aktorruhe wird
+    später separat über ``inactive/dead/MainPID=0`` bewiesen.
+    """
 
     unit_name = _unit_name(unit)
     property_names = (
@@ -4153,47 +4169,29 @@ def _capture_transition_unit_activity(
         load_state == "not-found"
         and active_state == "inactive"
         and sub_state == "dead"
-        and unit_file_state == ""
+        and unit_file_state in {"", "not-found"}
         and fragment_path == ""
     ):
         return "absent"
-    if load_state == "masked":
-        if piguard_contract:
-            raise RuntimeError("Betriebsbindung von piguard.service weicht ab")
-        if (
-            active_state != "inactive"
-            or sub_state != "dead"
-            or unit_file_state not in {"masked", "masked-runtime"}
-            or fragment_path not in {"/dev/null", ""}
-        ):
-            raise RuntimeError(f"Maskenzustand von {unit_name} ist widersprüchlich")
-        return "inactive"
-    if (
-        load_state != "loaded"
-        or unit_file_state not in SYSTEMD_KNOWN_UNIT_FILE_STATES - {"not-found"}
-        or not os.path.isabs(fragment_path)
-    ):
-        raise RuntimeError(f"Betriebsbindung von {unit_name} weicht ab")
-    if piguard_contract and (
-        unit_file_state != "enabled"
-        or fragment_path != PIGUARD_FRAGMENT_PATH
-    ):
-        raise RuntimeError("Betriebsbindung von piguard.service weicht ab")
-
-    state = (active_state, sub_state)
-    accepted = {
-        ("active", "running"): "active",
-        ("inactive", "dead"): "inactive",
-        ("failed", "failed"): "failed",
-    }
-    if piguard_contract and state == ("activating", "auto-restart"):
+    # Ein laufender oder gerade wechselnder bekannter Writer wird konservativ
+    # als aktiv aufgenommen und anschließend vom zentralen Stopgate beendet.
+    if active_state in {
+        "active",
+        "activating",
+        "deactivating",
+        "reloading",
+    }:
         return "active"
-    try:
-        return accepted[state]
-    except KeyError as exc:
-        raise RuntimeError(
-            f"Betriebszustand von {unit_name} ist nicht freigegeben"
-        ) from exc
+    if active_state == "inactive":
+        return "inactive"
+    if active_state == "failed":
+        return "failed"
+    raise RuntimeError(
+        f"Betriebszustand von {unit_name} ist nicht lesbar "
+        f"(load={load_state or '-'}, active={active_state or '-'}, "
+        f"sub={sub_state or '-'}, "
+        f"unit_file={unit_file_state or '-'}, fragment={fragment_path or '-'})"
+    )
 
 
 def _capture_piguard_transition_activity() -> str:
@@ -5461,28 +5459,37 @@ def _verify_worktree_policy(repo_dir: str, verified_policy: dict) -> None:
         raise RuntimeError("Worktree-Policy weicht vom verifizierten HEAD-Blob ab")
 
 
-def _require_clean_recovery_index(repo_dir: str, install_user: str) -> None:
-    result = _git_argv(
-        repo_dir,
-        install_user,
-        "diff",
-        "--cached",
-        "--quiet",
-        "--exit-code",
-        "--",
-        timeout=15,
-    )
-    returncode = int(result.get("returncode", -1))
-    if returncode == 1:
+def _bind_bootstrap_git_prestate(
+    repo_dir: str,
+    *,
+    explicit_bootstrap: bool,
+) -> tuple[str | None, bool]:
+    """Liest einen brauchbaren Alt-HEAD oder erlaubt dem Rettungsweg Neubau.
+
+    Die Git-Metadaten sind Updatewerkzeug, nicht EMS-Laufzeit. Ein normaler
+    Self-Update darf ein vorhandenes Repository weiterverwenden. Der ausdrücklich
+    gestartete Download-Bootstrap ignoriert dagegen jeden Alt-Git-Zustand und
+    baut die Zielmetadaten erst nach dem verifizierten Backup frisch auf.
+    """
+
+    git_path = os.path.join(os.path.abspath(repo_dir), ".git")
+    if explicit_bootstrap:
+        return None, os.path.lexists(git_path)
+
+    usable_directory = os.path.isdir(git_path) and not os.path.islink(git_path)
+    if not usable_directory:
         raise RuntimeError(
-            "Recovery-Preflight verweigert vorgemerkte Indexänderungen; "
-            "der Backupvertrag sichert ausschließlich Worktree-Dateien"
+            "Installation ohne gebundenes Git darf nur über den "
+            "expliziten Download-Bootstrap wechseln"
         )
-    if returncode != 0:
-        raise RuntimeError(
-            "Recovery-Indexzustand ist nicht beweisbar: "
-            + _combined_process_diagnostics(result, maximum=800)
-        )
+
+    try:
+        commit = get_current_commit(repo_dir)
+    except Exception:
+        commit = None
+    if commit:
+        return commit, False
+    raise RuntimeError("Aktueller HEAD konnte nicht als volle Commit-SHA verifiziert werden")
 
 
 def _repo_descriptor_has_unsafe_xattrs(descriptor: int) -> bool:
@@ -5498,9 +5505,10 @@ def _repo_descriptor_has_unsafe_xattrs(descriptor: int) -> bool:
         }:
             return False
         return True
-    # Das Recovery-Receipt friert Bytes und POSIX-Metadaten ein. Nicht im
-    # Backupvertrag enthaltene ACLs, Capabilities oder sonstige xattrs dürfen
-    # deshalb weder Autorität liefern noch unbemerkt verloren gehen.
+    # Erweiterte Attribute gehören nicht zum Release-Sollzustand. Der Aufrufer
+    # nutzt dieses Signal, um den bekannten Git-Blob nach dem Backup auf einen
+    # neuen kanonischen Inode zu projizieren und damit Alt-ACLs/xattrs zu
+    # entfernen; sie sind kein eigener Update-Blocker.
     return bool(names)
 
 
@@ -5535,8 +5543,12 @@ def _capture_repo_recovery_contract(
     commit = _validate_full_commit(expected_commit)
     if _bound_release_head_commit(root, install_user) != commit:
         raise RuntimeError("Repo-Recovery-Vertrag sieht nicht den Ausgangs-Commit")
-    _require_clean_recovery_index(root, install_user)
-    account = pwd.getpwnam(str(install_user))
+    # Der Installationsbenutzer muss existieren, ist aber keine Autorität für
+    # den Altzustand. Community-Installationen enthalten nach manuellen
+    # Kopien, chmod/chown oder älteren Root-Installern legitimerweise andere
+    # numerische Besitzer. Der Root-Backupvertrag friert diese Metadaten ein;
+    # erst die Zielprojektion setzt anschließend den kanonischen Besitzer.
+    pwd.getpwnam(str(install_user))
     tracked_entries = _tracked_release_file_contracts(
         root,
         install_user,
@@ -5552,10 +5564,6 @@ def _capture_repo_recovery_contract(
             if (
                 not stat.S_ISREG(before.st_mode)
                 or before.st_nlink != 1
-                or before.st_uid not in {0, account.pw_uid}
-                or before.st_gid not in {0, account.pw_gid}
-                or mode & 0o7000
-                or _repo_descriptor_has_unsafe_xattrs(descriptor)
             ):
                 raise RuntimeError(
                     f"Repo-Recovery-Preimage besitzt unsichere Metadaten: {relative_path}"
@@ -5619,7 +5627,6 @@ def _capture_repo_recovery_contract(
                 dirty_paths.append(relative_path)
         finally:
             os.close(descriptor)
-    _require_clean_recovery_index(root, install_user)
     if _bound_release_head_commit(root, install_user) != commit:
         raise RuntimeError("Repository-HEAD driftete beim Recovery-Preflight")
     return RepoRecoveryContract(
@@ -5649,7 +5656,6 @@ def _verify_repo_recovery_prestate(
         or _bound_release_head_commit(root, user) != commit
     ):
         raise RuntimeError("Repo-Recovery-Prestate weicht vom eingefrorenen HEAD ab")
-    _require_clean_recovery_index(root, user)
     expected_git_entries = tuple(
         (relative_path, git_mode, git_oid)
         for (
@@ -5705,7 +5711,6 @@ def _verify_repo_recovery_prestate(
                 or stat.S_IMODE(before.st_mode) != expected_mode
                 or before.st_uid != expected_uid
                 or before.st_gid != expected_gid
-                or _repo_descriptor_has_unsafe_xattrs(descriptor)
                 or _descriptor_plain_sha256(descriptor, expected_size)
                 != expected_digest
             ):
@@ -5751,7 +5756,6 @@ def _verify_repo_recovery_prestate(
             os.close(descriptor)
     if tuple(sorted(dirty_paths)) != contract.dirty_paths:
         raise RuntimeError("Repo-Recovery-Prestate besitzt eine andere Dirty-Pfadmenge")
-    _require_clean_recovery_index(root, user)
     if _bound_release_head_commit(root, user) != commit:
         raise RuntimeError("Repository-HEAD driftete beim finalen Prestate-Readback")
 
@@ -5848,7 +5852,6 @@ def _verify_recovered_repo_contract(
             os.close(descriptor)
     if tuple(sorted(dirty_paths)) != contract.dirty_paths:
         raise RuntimeError("Repo-Recovery-Dirty-Pfadmenge weicht vom Vorzustand ab")
-    _require_clean_recovery_index(root, install_user)
 
 
 def _recovery_repo_contracts_from_manifest(
@@ -6603,7 +6606,6 @@ def _capture_recovery_backup_receipt(
     commit = repo_contract.expected_commit
     if _bound_release_head_commit(root, install_user) != commit:
         raise RuntimeError("Recovery-Receipt sieht nicht den gebundenen Ausgangs-Commit")
-    _require_clean_recovery_index(root, install_user)
     manifest, manifest_sha256 = _read_stable_verified_backup_manifest(backup_root)
     if manifest != verified_manifest:
         raise RuntimeError("Backupmanifest driftete vor dem Root-Receipt")
@@ -6778,7 +6780,6 @@ def _revalidate_recovery_backup_receipt(
     }
     if files != preimages:
         raise RuntimeError("Backup-Receipt weicht vom Repo-Recovery-Preimage ab")
-    _require_clean_recovery_index(root, install_user)
     return preimages, directories
 
 
@@ -7369,10 +7370,7 @@ def _secure_repo_permissions(
                     "Recovery-Produktverzeichnis weicht vom Backupmanifest ab: "
                     + (relative_directory or root)
                 )
-            if (
-                not stat.S_ISDIR(before.st_mode)
-                or before.st_uid not in (0, account.pw_uid)
-            ):
+            if not stat.S_ISDIR(before.st_mode):
                 raise RuntimeError(
                     "Getracktes Produktverzeichnis besitzt unsichere Metadaten: "
                     + (relative_directory or root)
@@ -7444,7 +7442,6 @@ def _secure_repo_permissions(
             if (
                 not stat.S_ISREG(before.st_mode)
                 or before.st_nlink != 1
-                or before.st_uid not in (0, account.pw_uid)
             ):
                 raise RuntimeError(
                     "Getrackte Produktdatei besitzt unsichere oder "
@@ -7471,7 +7468,6 @@ def _secure_repo_permissions(
                 if (
                     not stat.S_ISREG(opened.st_mode)
                     or opened.st_nlink != 1
-                    or opened.st_uid not in (0, account.pw_uid)
                     or (opened.st_dev, opened.st_ino)
                     != (before.st_dev, before.st_ino)
                     or not descriptor_content_matches(
@@ -7505,6 +7501,7 @@ def _secure_repo_permissions(
                     or stable_before_mutation.st_gid != account.pw_gid
                     or stat.S_IMODE(stable_before_mutation.st_mode)
                     != expected_mode
+                    or _repo_descriptor_has_unsafe_xattrs(descriptor)
                 ):
                     replacement_descriptor = copy_to_hardened_inode(
                         parent_descriptor=parent_descriptor,
@@ -9150,6 +9147,84 @@ def _verify_prepared_service_quiesced(service: str) -> None:
         )
 
 
+LEGACY_E3DC_ADMIN_UNIT = "/etc/systemd/system/e3dc.service"
+
+
+def _normalize_legacy_e3dc_service() -> None:
+    """Projiziert den bekannten C++-Altdienst auf einen kanonischen Auszustand."""
+
+    # Der Altzustand ist im verifizierten Backup enthalten. Ab hier zählt der
+    # kanonische Releasezustand: gestoppt, disabled und persistent maskiert.
+    # Das gilt auch für generierte/transiente Altunits, die keinen der vier
+    # klassischen Unit-Dateipfade besitzen.
+    _run_argv(["sudo", "systemctl", "stop", "e3dc.service"], timeout=30)
+    _run_argv(["sudo", "systemctl", "unmask", "e3dc.service"], timeout=30)
+    _run_argv(["sudo", "systemctl", "disable", "e3dc.service"], timeout=30)
+
+    if os.path.lexists(LEGACY_E3DC_ADMIN_UNIT):
+        metadata = os.lstat(LEGACY_E3DC_ADMIN_UNIT)
+        if not (stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)):
+            raise RuntimeError(
+                "e3dc.service besitzt am kanonischen Unitpfad einen "
+                "nicht normalisierbaren Dateityp"
+            )
+        removed = _run_argv(
+            ["sudo", "rm", "-f", "--", LEGACY_E3DC_ADMIN_UNIT],
+            timeout=15,
+        )
+        if not removed.get("success") or os.path.lexists(LEGACY_E3DC_ADMIN_UNIT):
+            raise RuntimeError("Alte e3dc.service-Unit konnte nicht ersetzt werden")
+
+    masked = _run_argv(
+        ["sudo", "systemctl", "mask", "--force", "e3dc.service"],
+        timeout=30,
+    )
+    reloaded = _run_argv(["sudo", "systemctl", "daemon-reload"], timeout=30)
+    _run_argv(
+        ["sudo", "systemctl", "reset-failed", "e3dc.service"],
+        timeout=30,
+    )
+    if not masked.get("success") or not reloaded.get("success"):
+        raise RuntimeError("e3dc.service konnte nicht kanonisch maskiert werden")
+
+    try:
+        metadata = os.lstat(LEGACY_E3DC_ADMIN_UNIT)
+        target = os.readlink(LEGACY_E3DC_ADMIN_UNIT)
+    except OSError as exc:
+        raise RuntimeError("Persistente e3dc.service-Maske fehlt") from exc
+    if not stat.S_ISLNK(metadata.st_mode) or target != "/dev/null":
+        raise RuntimeError("Persistente e3dc.service-Maske ist nicht kanonisch")
+
+    show = _run_argv(
+        [
+            "systemctl",
+            "show",
+            "e3dc.service",
+            "--no-pager",
+            "--property=LoadState",
+            "--property=ActiveState",
+            "--property=SubState",
+            "--property=MainPID",
+            "--property=UnitFileState",
+        ],
+        timeout=10,
+    )
+    values: dict[str, str] = {}
+    for line in str(show.get("stdout") or "").splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            values[key] = value
+    if (
+        not show.get("success")
+        or values.get("LoadState") != "masked"
+        or values.get("ActiveState") != "inactive"
+        or values.get("SubState") != "dead"
+        or values.get("MainPID") != "0"
+        or values.get("UnitFileState") != "masked"
+    ):
+        raise RuntimeError("e3dc.service ist nach der Zielprojektion nicht sicher aus")
+
+
 def _prepare_v4_service_activation(
     *,
     services,
@@ -9177,32 +9252,11 @@ def _prepare_v4_service_activation(
         return False
 
     install_user = get_install_user()
-    legacy_unit_present = any(
-        os.path.exists(path)
-        for path in (
-            "/etc/systemd/system/e3dc.service",
-            "/lib/systemd/system/e3dc.service",
-            "/usr/lib/systemd/system/e3dc.service",
-        )
-    )
     errors = []
-    if legacy_unit_present:
-        for action in ("stop", "disable", "mask"):
-            result = _run_argv(
-                ["sudo", "systemctl", action, "e3dc.service"],
-                timeout=30,
-            )
-            if not result.get("success") or result.get("timed_out"):
-                errors.append(
-                    f"e3dc.service {action} blieb unbestätigt: "
-                    + _combined_process_diagnostics(result, maximum=500)
-                )
-        active = _run_argv(["systemctl", "is-active", "e3dc.service"], timeout=10)
-        enabled = _run_argv(["systemctl", "is-enabled", "e3dc.service"], timeout=10)
-        if not _systemd_activity_readback_matches(active, should_be_active=False):
-            errors.append("Legacy e3dc.service ist nach Vorbereitung nicht inaktiv")
-        if _systemd_state_from_result(enabled, SYSTEMD_KNOWN_UNIT_FILE_STATES) != "masked":
-            errors.append("Legacy e3dc.service ist nach Vorbereitung nicht persistent maskiert")
+    try:
+        _normalize_legacy_e3dc_service()
+    except Exception as exc:
+        errors.append(str(exc))
     for screen_user in tuple(dict.fromkeys((str(install_user), "root"))):
         for screen_name in ("e3dc", "E3DC"):
             prefix = ["sudo", "-u", screen_user] if screen_user != "root" else ["sudo"]
@@ -9331,15 +9385,18 @@ def _restart_v4_services(
     if not prepared_start_only:
         print('\n[->] Bereinige alte C++ E3DC-Dienste/Screens (falls vorhanden)...')
         install_user = get_install_user()
-        legacy_unit_present = any(os.path.exists(path) for path in (
+        legacy_unit_present = any(os.path.lexists(path) for path in (
             '/etc/systemd/system/e3dc.service',
             '/lib/systemd/system/e3dc.service',
             '/usr/lib/systemd/system/e3dc.service',
+            '/run/systemd/system/e3dc.service',
         ))
         if legacy_unit_present and not legacy_recovery:
-            run_command('sudo systemctl stop e3dc.service 2>/dev/null', timeout=15)
-            run_command('sudo systemctl disable e3dc.service 2>/dev/null', timeout=15)
-            run_command('sudo systemctl mask e3dc.service 2>/dev/null', timeout=15)
+            try:
+                _normalize_legacy_e3dc_service()
+            except Exception as exc:
+                print(f'  [!] Legacy e3dc.service konnte nicht normalisiert werden: {exc}')
+                return False
             print('  [OK] Legacy e3dc.service gestoppt/deaktiviert.')
         elif not legacy_unit_present:
             print('  [OK] Kein Legacy e3dc.service vorhanden.')
@@ -9577,10 +9634,13 @@ def _remove_tree_nofollow(path: str) -> None:
                     info = os.stat(entry, dir_fd=descriptor, follow_symlinks=False)
                     if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
                         remove_directory(descriptor, entry, info.st_dev, info.st_ino)
-                    elif stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
-                        os.unlink(entry, dir_fd=descriptor)
                     else:
-                        raise RuntimeError("Unerlaubter Dateityp im zu entfernenden Baum")
+                        # Der gesamte Baum ist hier bereits das ausdrücklich zum
+                        # Verwerfen gebundene Werkzeugverzeichnis (zum Beispiel
+                        # alte .git-Metadaten). FIFO-/Socket-Reste darin sind
+                        # keine Produktdateien und dürfen den Neubau nicht
+                        # verhindern; unlink folgt ihnen nicht.
+                        os.unlink(entry, dir_fd=descriptor)
             finally:
                 os.close(descriptor)
             current = os.stat(child_name, dir_fd=parent_descriptor, follow_symlinks=False)
@@ -10529,7 +10589,13 @@ def _verify_bound_target_state(
     expected_units_sha256: str,
     expected_legacy_activity: str,
 ) -> None:
-    """Beweist, dass Archiv- und Target-Prozess denselben Ausgangszustand sehen."""
+    """Bindet Rolle/Konfiguration; Unit-Altformen bleiben Rückfallinformation.
+
+    Der Finalizer läuft bereits mit dem Zielcode und darf deshalb bekannte
+    Produktunits normalisieren. Inventar, Aktivität, Maskierung und Enablement
+    des Altstands sind keine Zielautorität und müssen sich nach Stop,
+    ``daemon-reload`` oder Unitprojektion ändern dürfen.
+    """
 
     if expected_config_state not in {"present", "missing"}:
         raise RuntimeError("Ungültiger erwarteter Konfigurationszustand")
@@ -10542,12 +10608,17 @@ def _verify_bound_target_state(
         raise RuntimeError("Konfiguration driftete zwischen Archiv und Target-Finalizer")
     if not re.fullmatch(r"[0-9a-f]{64}", str(expected_units_sha256 or "")):
         raise RuntimeError("Erwarteter Unit-Inventarhash ist ungültig")
-    if _transition_units_sha256(state.preinstalled_units) != expected_units_sha256:
-        raise RuntimeError("Unit-Inventar driftete zwischen Archiv und Target-Finalizer")
     if expected_legacy_activity not in {"absent", "active", "inactive", "failed"}:
         raise RuntimeError("Erwarteter Legacy-Betriebszustand ist ungültig")
-    if state.legacy_e3dc_activity != expected_legacy_activity:
-        raise RuntimeError("Legacy-Betriebszustand driftete zwischen Archiv und Target-Finalizer")
+    current_units_sha256 = _transition_units_sha256(state.preinstalled_units)
+    if (
+        current_units_sha256 != expected_units_sha256
+        or state.legacy_e3dc_activity != expected_legacy_activity
+    ):
+        print(
+            "  [i] Alter Unitbestand änderte sich im sicheren Updatefenster; "
+            "der Zielrelease normalisiert den Sollzustand."
+        )
 
 
 def _announce_finalizer_phase(index: int, total: int, label: str) -> None:
@@ -12169,11 +12240,6 @@ def _normalize_target_finalizer_files(
                     "Target-Datei besitzt mehrere Hardlinks: "
                     + _target_metadata_detail(relative_path, before)
                 )
-            if before.st_uid not in (0, account.pw_uid):
-                raise RuntimeError(
-                    "Target-Datei besitzt einen nicht vertrauenswürdigen Eigentümer: "
-                    + _target_metadata_detail(relative_path, before)
-                )
             if before.st_size != len(expected):
                 raise RuntimeError("Target-Dateigröße stimmt nicht mit dem freigegebenen Commit überein")
             if _read_descriptor_bytes(descriptor, len(expected)) != expected:
@@ -12504,12 +12570,13 @@ def _recover_failed_transition(
                 "recovery_repo_contract": repo_recovery_contract,
                 "recovery_backup_receipt": backup_receipt,
             }
-        _secure_repo_permissions(
-            repo_dir,
-            install_user,
-            expected_commit=old_commit,
-            **recovery_permission_args,
-        )
+        if old_commit is not None:
+            _secure_repo_permissions(
+                repo_dir,
+                install_user,
+                expected_commit=old_commit,
+                **recovery_permission_args,
+            )
         _verify_transition_state(
             state,
             expect_legacy_config_missing=state.bootstrap_legacy_config,
@@ -12836,6 +12903,51 @@ def _tracked_release_file_modes(
             install_user,
         )
     ]
+
+
+def _assert_target_worktree_replaceable(
+    repo_dir: str,
+    install_user: str,
+    target_commit: str,
+) -> None:
+    """Blockiert nur Dateitypen, die ein sicheres Zielkopieren verhindern.
+
+    Besitzer, Gruppe, Modus und xattrs bekannter regulärer Produktdateien
+    werden nach dem Backup normalisiert. Symlinks, Hardlinks und Spezialdateien
+    dürfen dagegen nicht erst durch ``git reset`` berührt werden.
+    """
+
+    root = os.path.abspath(repo_dir)
+    for relative_path, _mode, _object_id in _tracked_release_file_contracts(
+        root,
+        install_user,
+        target_commit=_validate_full_commit(target_commit),
+    ):
+        parts = Path(relative_path).parts
+        current = root
+        parent_missing = False
+        for component in parts[:-1]:
+            current = os.path.join(current, component)
+            if parent_missing or not os.path.lexists(current):
+                parent_missing = True
+                continue
+            metadata = os.lstat(current)
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                raise RuntimeError(
+                    f"Ziel-Elternpfad ist nicht sicher ersetzbar: {relative_path}"
+                )
+        target = os.path.join(root, relative_path)
+        if parent_missing or not os.path.lexists(target):
+            continue
+        metadata = os.lstat(target)
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+        ):
+            raise RuntimeError(
+                f"Ziel-Dateipfad ist nicht sicher ersetzbar: {relative_path}"
+            )
 
 
 def _git_blob_oid_from_descriptor(
@@ -13260,12 +13372,11 @@ def _execute_update_transaction(
                 transaction_repo_dir or INSTALL_PATH
             )
         )
-        bootstrap_without_git = not os.path.isdir(os.path.join(repo_dir, ".git"))
-        if bootstrap_without_git and not target_install_path:
-            raise RuntimeError("Installation ohne Git darf nur ueber den expliziten Bootstrapweg migriert werden")
-        old_commit = None if bootstrap_without_git else get_current_commit(repo_dir)
-        if not bootstrap_without_git and not old_commit:
-            raise RuntimeError("Aktueller HEAD konnte nicht als volle Commit-SHA verifiziert werden")
+        old_commit, bootstrap_rebuild_git = _bind_bootstrap_git_prestate(
+            repo_dir,
+            explicit_bootstrap=bool(target_install_path),
+        )
+        bootstrap_without_git = old_commit is None
         state = _capture_transition_state(
             expected_role=expected_ha_role,
             allow_missing_config=bool(target_install_path and bootstrap_without_git),
@@ -13528,20 +13639,30 @@ def _execute_update_transaction(
 
     # Dieser exakte Aufruf bleibt für nicht versiegelte Altpfade als
     # statisch prüfbarer Aktorruhevertrag erhalten.
-    if not sealed_target_updater and not _stop_v4_services(V4_SERVICES):
-        print("[!] Sichere Aktorruhe konnte nicht nachgewiesen werden.")
-        recovered = _recover_pretransaction_service_state(state)
-        if recovered:
-            print(
-                "[OK] Der eingefrorene Ausgangszustand wurde nach dem "
-                "partiellen Stop verifiziert wiederhergestellt."
+    if not sealed_target_updater:
+        quiescence_error = None
+        if not _stop_v4_services(V4_SERVICES):
+            quiescence_error = RuntimeError(
+                "Sichere Aktorruhe konnte nicht nachgewiesen werden"
             )
-            _set_watchdog_update_pause(False, reason=transition_name)
         else:
+            try:
+                _assert_strict_update_writer_quiescence(
+                    repo_dir=repo_dir,
+                    transaction_id=recovery_transaction_id,
+                )
+            except Exception as exc:
+                quiescence_error = exc
+        if quiescence_error is not None:
+            print(f"[!] Sichere Aktorruhe konnte nicht nachgewiesen werden: {quiescence_error}")
+            # Ein fehlgeschlagenes Rogue-/Writer-Gate darf niemals durch das
+            # Starten des alten Unitbestands kompensiert werden. Erst eine
+            # bewiesene globale Ruhe könnte einen kontrollierten Altstart
+            # autorisieren; in diesem Fehlerzweig ist sie gerade nicht belegt.
             _enforce_fail_closed_after_recovery_failure(
                 recovery_transaction_id=recovery_transaction_id,
             )
-        return False
+            return False
 
     git_created = False
     mutated = storage_unit_promoted
@@ -13640,13 +13761,29 @@ def _execute_update_transaction(
         cleanup_pycache(repo_dir)
         if bootstrap_without_git:
             mutated = True
+            git_created = True
+            git_path = os.path.join(repo_dir, ".git")
+            if bootstrap_rebuild_git and os.path.lexists(git_path):
+                print(
+                    "  [i] Unbrauchbare Alt-Git-Metadaten werden nach dem "
+                    "verifizierten Backup neu aufgebaut."
+                )
+                _remove_tree_nofollow(git_path)
             init = _run_argv(
-                ["sudo", "-H", "-u", str(install_user), "git", "-C", repo_dir, "init"],
+                [
+                    "/usr/bin/env",
+                    "-i",
+                    *isolated_git_environment_assignments(),
+                    "/usr/bin/git",
+                    "-c",
+                    "init.defaultBranch=main",
+                    "init",
+                    repo_dir,
+                ],
                 timeout=30,
             )
             if not init["success"]:
                 raise RuntimeError("Git-Init fehlgeschlagen: " + init["stderr"].strip())
-            git_created = True
             mutated = True
             remote_add = _git_argv(repo_dir, install_user, "remote", "add", "origin", SELFUPDATE_REPO, timeout=15)
             if not remote_add["success"]:
@@ -13706,6 +13843,12 @@ def _execute_update_transaction(
             # erlaubt dies nur bei freigegebenem python3-venv und exakt
             # absentem kanonischem Zielpfad; jeder belegte Fremdpfad stoppt.
             allow_missing_venv=True,
+        )
+
+        _assert_target_worktree_replaceable(
+            repo_dir,
+            install_user,
+            target_commit,
         )
 
         mutated = True

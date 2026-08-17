@@ -1,6 +1,12 @@
 # Speicher-Ladesteuerung - Systemablauf
 
-> **Stand:** v5.4.3n, gegen den Release-Betriebsvertrag geprüft am 2026-08-17
+> **Stand:** v5.4.3o, gegen den Release-Betriebsvertrag geprüft am 2026-08-17
+>
+> **Hinweis:** 5.4.3o bindet den sicheren passiven
+> Direktvermarktungs-Ladeblock auch bei einem bewusst kandidatlosen Planslot
+> ausschließlich an Plan, Slot, DV-Owner und den tatsächlich übersetzten
+> 0-W-Ausgang. Der Kandidat bleibt diagnostisch; Laden, Entladen,
+> RSCP-Ausgang und Hardwaregrenzen erhalten keine zusätzliche Autorität.
 >
 > **Hinweis:** 5.4.3n korrigiert ausschließlich den Metadatenvertrag des
 > kanonischen Rollenankers im privilegierten Backup- und Recoverypfad.

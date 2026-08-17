@@ -1,9 +1,9 @@
 {
-  "version": "5.4.3n",
+  "version": "5.4.3o",
   "min_version": "4.0.0",
-  "stable_release": "v5.4.3n",
+  "stable_release": "v5.4.3o",
   "release_date": "2026-08-17",
-  "description": "v5.4.3n - Pfadgenauer Rollenanker-Metadatenvertrag im Update-Rückweg",
+  "description": "v5.4.3o - Robuster Altinstallations-Bootstrap und kandidatloser passiver DV-Ladeblock",
   "installer_requires": "python3",
   "sanitized_republication": false,
   "history_transition": {

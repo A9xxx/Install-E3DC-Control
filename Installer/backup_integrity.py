@@ -1138,6 +1138,12 @@ def copy_persistent_sources(
         root_is_file: bool,
     ) -> None:
         restore_text = str(source_path)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise BackupIntegrityError(
+                "Backupquelle ist keine eigenständige reguläre Datei: {}".format(
+                    source_path
+                )
+            )
         if restore_text in restore_destinations:
             raise BackupIntegrityError("Restore-Ziel ist doppelt definiert: {}".format(source_path))
         restore_destinations.add(restore_text)
@@ -1149,7 +1155,11 @@ def copy_persistent_sources(
         else:
             _copy_fd_to_path(source_descriptor, destination, stat.S_IMODE(metadata.st_mode))
         after = os.fstat(source_descriptor)
-        if (after.st_dev, after.st_ino) != (metadata.st_dev, metadata.st_ino):
+        if (
+            (after.st_dev, after.st_ino) != (metadata.st_dev, metadata.st_ino)
+            or not stat.S_ISREG(after.st_mode)
+            or after.st_nlink != 1
+        ):
             raise BackupIntegrityError("Quelle wurde waehrend des Backups ausgetauscht: {}".format(source_path))
         mapped_entries.append({
             "backup_path": archive_relative.as_posix(),

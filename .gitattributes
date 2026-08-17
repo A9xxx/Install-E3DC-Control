@@ -1,5 +1,7 @@
 *.sh text eol=lf
 e3dc-bootstrap text eol=lf
 e3dc-setup text eol=lf
+e3dc-update-bootstrap text eol=lf
+Installer/logrotate/e3dc-control text eol=lf
 Dockerfile text eol=lf
 .github/workflows/*.yml text eol=lf

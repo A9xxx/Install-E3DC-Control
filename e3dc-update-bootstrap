@@ -1,0 +1,209 @@
+#!/bin/sh
+# Lädt den aktuellen veröffentlichten Ziel-Updater unabhängig vom Altbestand.
+
+set -eu
+PATH=/usr/bin:/bin
+export PATH
+
+REPOSITORY_URL="https://github.com/A9xxx/Install-E3DC-Control"
+GIT_URL="${REPOSITORY_URL}.git"
+LATEST_URL="${REPOSITORY_URL}/releases/latest"
+
+fail() {
+    echo "Update-Bootstrap abgebrochen: $*" >&2
+    exit 1
+}
+
+for command in curl getent git python3; do
+    command -v "$command" >/dev/null 2>&1 || fail "$command fehlt"
+done
+
+if [ "$(id -u)" -eq 0 ]; then
+    INSTALL_USER=${E3DC_BOOTSTRAP_USER:-${SUDO_USER:-}}
+else
+    INSTALL_USER=$(id -un)
+fi
+case "$INSTALL_USER" in
+    ""|root|www-data|*[!A-Za-z0-9_.-]*)
+        fail "normaler lokaler Installationsbenutzer ist nicht bestimmbar"
+        ;;
+esac
+if [ "$(id -u)" -ne 0 ]; then
+    fail "Rettungsupdate bitte mit sudo starten"
+fi
+
+TARGET=${1:-${E3DC_INSTALL_PATH:-}}
+if [ -z "$TARGET" ]; then
+    USER_HOME=$(getent passwd "$INSTALL_USER" | cut -d: -f6)
+    [ -n "$USER_HOME" ] || fail "Home-Verzeichnis von $INSTALL_USER fehlt"
+    TARGET="$USER_HOME/Install"
+fi
+case "$TARGET" in
+    /*) ;;
+    *) fail "Installationspfad muss absolut sein" ;;
+esac
+[ -d "$TARGET" ] || fail "Installationspfad fehlt: $TARGET"
+TARGET=$(python3 - "$TARGET" <<'PY'
+import os
+from pathlib import Path
+import stat
+import sys
+
+candidate = Path(os.path.abspath(sys.argv[1]))
+current = Path(candidate.anchor)
+try:
+    for component in candidate.parts[1:]:
+        current /= component
+        metadata = os.lstat(current)
+        if stat.S_ISLNK(metadata.st_mode):
+            raise RuntimeError(f"Symlink im Installationspfad: {current}")
+    if not stat.S_ISDIR(os.lstat(candidate).st_mode):
+        raise RuntimeError("Installationspfad ist kein Verzeichnis")
+except (OSError, RuntimeError) as exc:
+    raise SystemExit(str(exc))
+print(candidate)
+PY
+) || fail "Installationspfad ist nicht kanonisch"
+
+ROLE=${2:-auto}
+case "$ROLE" in
+    off|master|slave|shadow) ;;
+    auto)
+        ROLE=$(python3 - "$TARGET" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+target = pathlib.Path(sys.argv[1])
+roles = []
+
+for path, key in (
+    (pathlib.Path("/etc/e3dc-control/instance_role.json"), "mode"),
+    (pathlib.Path("/var/www/html/data/e3dc_v4.json"), "ha_mode"),
+    (target / "data/e3dc_v4.json", "ha_mode"),
+):
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        continue
+    if isinstance(value, dict):
+        role = str(value.get(key) or "").strip().lower()
+        if role in {"off", "master", "slave", "shadow"}:
+            roles.append(role)
+
+for path in (target / "e3dc.config.txt", target / "data/e3dc.config.txt"):
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeError):
+        continue
+    for line in text.splitlines():
+        match = re.fullmatch(r"\s*ha_mode\s*=\s*(off|master|slave|shadow)\s*", line)
+        if match:
+            roles.append(match.group(1))
+
+unique = sorted(set(roles))
+if len(unique) != 1:
+    detail = ", ".join(unique) if unique else "keine"
+    raise SystemExit(
+        "Rolle nicht eindeutig automatisch erkennbar "
+        f"({detail}); off, master, slave oder shadow als zweites Argument angeben"
+    )
+print(unique[0])
+PY
+        ) || exit 1
+        ;;
+    *) fail "Rolle muss auto, off, master, slave oder shadow sein" ;;
+esac
+
+WORKDIR=$(mktemp -d)
+cleanup() {
+    rm -rf -- "$WORKDIR"
+}
+trap cleanup EXIT HUP INT TERM
+
+EFFECTIVE_LATEST=$(curl -q \
+    --fail --silent --show-error --location \
+    --proto '=https' --tlsv1.2 \
+    --output /dev/null --write-out '%{url_effective}' \
+    "$LATEST_URL")
+case "$EFFECTIVE_LATEST" in
+    "$REPOSITORY_URL/releases/tag/"*)
+        TAG=${EFFECTIVE_LATEST##*/}
+        ;;
+    *) fail "GitHub lieferte keinen eindeutigen aktuellen Release-Tag" ;;
+esac
+python3 - "$TAG" <<'PY' || fail "Release-Tag besitzt ein unerwartetes Format: $TAG"
+import re
+import sys
+
+raise SystemExit(0 if re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+[a-z]?", sys.argv[1]) else 1)
+PY
+
+isolated_git() {
+    env -i \
+        PATH=/usr/bin:/bin \
+        HOME=/nonexistent \
+        XDG_CONFIG_HOME=/nonexistent \
+        LANG=C \
+        LC_ALL=C \
+        GIT_CONFIG_NOSYSTEM=1 \
+        GIT_CONFIG_SYSTEM=/dev/null \
+        GIT_CONFIG_GLOBAL=/dev/null \
+        GIT_ATTR_NOSYSTEM=1 \
+        GIT_NO_REPLACE_OBJECTS=1 \
+        GIT_OPTIONAL_LOCKS=0 \
+        GIT_TERMINAL_PROMPT=0 \
+        GIT_ASKPASS=/bin/false \
+        SSH_ASKPASS=/bin/false \
+        GIT_ALLOW_PROTOCOL=https \
+        /usr/bin/git \
+        --no-replace-objects \
+        -c credential.helper= \
+        -c core.askPass=/bin/false \
+        -c protocol.ext.allow=never \
+        -c protocol.file.allow=never \
+        "$@"
+}
+
+isolated_git ls-remote --tags "$GIT_URL" \
+    "refs/tags/$TAG" "refs/tags/$TAG^{}" >"$WORKDIR/refs"
+TAG_OBJECT=$(awk -v ref="refs/tags/$TAG" '$2 == ref {print $1}' "$WORKDIR/refs")
+TARGET_SHA=$(awk -v ref="refs/tags/$TAG^{}" '$2 == ref {print $1}' "$WORKDIR/refs")
+[ "${#TAG_OBJECT}" -eq 40 ] || fail "Tagobjekt besitzt keine volle SHA"
+[ "${#TARGET_SHA}" -eq 40 ] || fail "Zielcommit besitzt keine volle SHA"
+case "$TAG_OBJECT:$TARGET_SHA" in
+    *[!0-9a-f:]*) fail "Release-Referenzen sind nicht hexadezimal" ;;
+esac
+[ "$TAG_OBJECT" != "$TARGET_SHA" ] || fail "aktueller Release-Tag ist nicht annotiert"
+
+CHECKOUT="$WORKDIR/release"
+mkdir -m 0700 -- "$CHECKOUT"
+isolated_git -c init.defaultBranch=main init "$CHECKOUT" >/dev/null
+isolated_git -C "$CHECKOUT" remote add origin "$GIT_URL"
+isolated_git -C "$CHECKOUT" fetch \
+    --no-tags --depth=1 origin \
+    "+refs/tags/$TAG:refs/tags/$TAG" >/dev/null
+CHECKOUT_SHA=$(isolated_git -C "$CHECKOUT" rev-parse --verify "refs/tags/$TAG^{commit}")
+[ "$CHECKOUT_SHA" = "$TARGET_SHA" ] || \
+    fail "temporärer Ziel-Checkout weicht von der Release-SHA ab"
+isolated_git -C "$CHECKOUT" checkout --detach "$TARGET_SHA" >/dev/null
+
+RUNNER="$CHECKOUT/e3dc-bootstrap"
+[ -f "$RUNNER" ] && [ ! -L "$RUNNER" ] || fail "Ziel-Updater fehlt im Release-Archiv"
+
+echo "E3DC-Control Update-Bootstrap"
+echo "  Installation : $TARGET"
+echo "  Benutzer     : $INSTALL_USER"
+echo "  Rolle        : $ROLE"
+echo "  Release      : $TAG"
+echo "  Zielcommit   : $TARGET_SHA"
+echo "  Alt-Updater  : wird nicht ausgeführt"
+
+env -i \
+    PATH=/usr/bin:/bin \
+    HOME=/root \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    E3DC_BOOTSTRAP_USER="$INSTALL_USER" \
+    /bin/sh "$RUNNER" "$TARGET" "$TAG" "$TARGET_SHA" "$ROLE"

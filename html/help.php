@@ -115,7 +115,7 @@ $paths = getInstallPaths();
     <div class="container">
         <div class="d-flex justify-content-between align-items-center mb-4">
             <a href="index.php" class="nav-link-back"><i class="fas fa-arrow-left me-2"></i>Dashboard</a>
-            <span class="badge bg-success text-light">v5.4.3m Stable</span>
+            <span class="badge bg-success text-light">v5.4.3n Stable</span>
         </div>
         <h1 class="display-4 fw-bold">Hilfe & Support</h1>
         <p class="lead opacity-75">Häufige Fragen und Lösungen rund um E3DC-Control.</p>
@@ -134,7 +134,7 @@ $paths = getInstallPaths();
         <div class="col-12 faq-item" data-tags="docker image stable rollback update">
             <div class="card bg-card border-0 shadow-sm"><div class="card-body">
                 <h5 class="card-title"><span class="tag">Docker</span> Wie prüfe ich Image und Update?</h5>
-                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem geprüften Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.3m</code> in <code>.env</code> gesetzt.</p>
+                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem geprüften Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.3n</code> in <code>.env</code> gesetzt.</p>
                 <pre>cd "${E3DC_DOCKER_PATH:-$HOME/e3dc-docker}"
 if [ -f ./docker_compose_update.py ]; then
   E3DC_DOCKER_HELPER=./docker_compose_update.py
@@ -212,6 +212,23 @@ sudo docker compose logs --tail=80 e3dc-control</pre>
                         <li>Nach der Freigabe im Account den RESTful API Security Token erzeugen.</li>
                         <li>Im Config-Editor unter <em>Tarif</em> den ENTSO-E-Token als Fallback-Token eintragen und mit <em>ENTSO-E testen</em> prüfen.</li>
                     </ol>
+                </div>
+            </div>
+        </div>
+
+        <h4 class="mb-4 text-accent"><i class="fas fa-shield-halved me-2"></i>Stable 5.4.3n: pfadgenauer Rollenanker im Update-Rückweg</h4>
+        <div class="col-12 faq-item" data-tags="5.4.3n stable update backup recovery restore rollenanker root www-data">
+            <div class="card bg-card border-0 shadow-sm">
+                <div class="card-body">
+                    <h5 class="card-title">
+                        <span class="tag">5.4.3n</span>
+                        Was korrigiert das Stable-Release 5.4.3n?
+                    </h5>
+                    <ul>
+                        <li><strong>Kanonischer Rollenanker:</strong> Ausschließlich <code>/etc/e3dc-control/instance_role.json</code> wird mit den vorgeschriebenen Metadaten <code>root:www-data 0640</code> als privilegierte Restorequelle akzeptiert.</li>
+                        <li><strong>Private Sicherung:</strong> Die Backup-Payload bleibt <code>root:root 0600</code>. Alle anderen privilegierten Pfade sowie falsche Eigentümer, Gruppen, Modi, Links, ACLs, Attribute oder Identitätsdrift bleiben strikt fail-closed.</li>
+                        <li><strong>Keine Regelungsänderung:</strong> EMS-, HA-, Wallbox-, Wärme- und Direktvermarktungsentscheidungen sowie Hardwareausgänge entsprechen unverändert 5.4.3m.</li>
+                    </ul>
                 </div>
             </div>
         </div>

@@ -6230,8 +6230,26 @@ def _read_privileged_restore_source(
         ) or _repo_descriptor_has_unsafe_xattrs(descriptor):
             raise RuntimeError(f"Privilegierte Restorequelle driftete beim Öffnen: {path}")
         digest = _descriptor_plain_sha256(descriptor, opened.st_size)
+        from .ha_writer_admission import INSTANCE_ROLE_ANCHOR_PATH
+
+        role_anchor_exception = path == INSTANCE_ROLE_ANCHOR_PATH
         storage_exception = path == "/etc/systemd/system/e3dc-storage-manager.service"
-        if opened.st_uid == 0 and opened.st_gid == 0:
+        if role_anchor_exception:
+            try:
+                www_data_gid = int(grp.getgrnam("www-data").gr_gid)
+            except (KeyError, OSError, TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    "Instanzrollen-Ankergruppe ist nicht lokal gebunden"
+                ) from exc
+            if (
+                opened.st_uid != 0
+                or opened.st_gid != www_data_gid
+                or stat.S_IMODE(opened.st_mode) != 0o640
+            ):
+                raise RuntimeError(
+                    "Instanzrollen-Anker besitzt nicht root:www-data 0640"
+                )
+        elif opened.st_uid == 0 and opened.st_gid == 0:
             pass
         elif storage_exception:
             account = pwd.getpwnam(str(install_user))

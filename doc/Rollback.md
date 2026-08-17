@@ -12,6 +12,17 @@ export E3DC_INSTALL_PATH="/absoluter/pfad/zur/installation"
 test -f "$E3DC_INSTALL_PATH/e3dc-setup"
 ```
 
+## Rollenanker-Restoregrenze in 5.4.3n
+
+5.4.3n akzeptiert ausschließlich den kanonischen Pfad
+`/etc/e3dc-control/instance_role.json` mit `root:www-data 0640` als
+privilegierte Restorequelle. Die private Backup-Payload bleibt
+`root:root 0600`. Für alle anderen privilegierten Systempfade gilt weiterhin
+der strenge `root:root`-Vertrag; ein falscher Pfad, eine abweichende Gruppe
+oder ein anderer Modus sowie Symlinks, zusätzliche Hardlinks, ACLs, Attribute
+oder Identitätsdrift bleiben harte Abbruchgründe. Regelungsentscheidungen und
+Hardwareausgänge ändern sich gegenüber 5.4.3m nicht.
+
 ## Rollenanker-Grenze in 5.4.3m
 
 5.4.3m erweitert ausschließlich den normalen vorwärtsgerichteten,
@@ -48,7 +59,7 @@ oder einen Prozessabbruch außerhalb des erkannten Fehlerpfads.
 
 ## Programmstand zurücksetzen
 
-Der aktuelle Stable-Stand `v5.4.3m` führt den gebundenen Rückfallvertrag fort.
+Der aktuelle Stable-Stand `v5.4.3n` führt den gebundenen Rückfallvertrag fort.
 
 Beim Rücklauf wird der tatsächliche Dateisystemzustand einer Unit weiterhin
 streng gegen reguläre Unit-Datei, kanonische `/dev/null`-Maske, unerwarteten

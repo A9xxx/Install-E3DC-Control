@@ -2,8 +2,15 @@
 
 Veröffentlichte Images entstehen ausschließlich aus einem versionierten stabilen Release-Tag. `latest` verweist damit auf die zuletzt veröffentlichte stabile Version.
 
-Der aktuelle Stable-Stand ist `v5.4.3m`. Die Tags `latest`, `v5.4.3m` und
-`5.4.3m` müssen auf denselben geprüften Multi-Arch-Digest verweisen.
+Der aktuelle Stable-Stand ist `v5.4.3n`. Die Tags `latest`, `v5.4.3n` und
+`5.4.3n` müssen auf denselben geprüften Multi-Arch-Digest verweisen.
+
+5.4.3n ändert ausschließlich den nativen privilegierten Backup- und
+Recoveryvertrag: Nur `/etc/e3dc-control/instance_role.json` wird mit
+`root:www-data 0640` als Restorequelle akzeptiert; die private Backup-Payload
+bleibt `root:root 0600`. Alle anderen privilegierten Pfade und abweichende
+Metadaten bleiben streng fail-closed. Containerbetrieb, EMS-Regelung und
+Hardwareausgänge entsprechen unverändert 5.4.3m.
 
 E3DC-Control kann isoliert über **Docker** betrieben werden. Der Container kapselt die Anwendung; persistente Betriebsdaten liegen in den dafür vorgesehenen Volumes. Der Multi-Architektur-Support (`arm64`, `amd64`) deckt die vorgesehenen Plattformen ab. Docker benötigt dabei zwingend ein 64-Bit-Betriebssystem; `armhf`, `arm/v7` und andere 32-Bit-Installationen können das veröffentlichte Image nicht starten.
 
@@ -234,7 +241,7 @@ unverändert gesperrt und benötigen eine manuelle Prüfung.
 
 Ohne `E3DC_IMAGE_TAG` folgt diese Compose-Datei dem geprüften Stable-Tag
 `latest`. Ein fester Tag bleibt bei `pull` absichtlich unverändert. Für einen
-bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.3m` in der Datei `.env`
+bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.3n` in der Datei `.env`
 gesetzt. `docker compose config --images` zeigt vorab das tatsächlich gewählte
 Image.
 
@@ -261,7 +268,7 @@ Versionswahl.
 
 Gezielte Rückfallversion:
 
-Den Stable-Container `v5.4.3m` auf den veröffentlichten Rollback-Root
+Den Stable-Container `v5.4.3n` auf den veröffentlichten Rollback-Root
 `v5.3.2b` zurücksetzen:
 
 ```bash

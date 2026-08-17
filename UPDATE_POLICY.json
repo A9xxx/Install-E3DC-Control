@@ -1,9 +1,9 @@
 {
-  "version": "5.4.3m",
+  "version": "5.4.3n",
   "min_version": "4.0.0",
-  "stable_release": "v5.4.3m",
+  "stable_release": "v5.4.3n",
   "release_date": "2026-08-17",
-  "description": "v5.4.3m - Gebundener Rollenanker, fail-closed Updateabschluss und openWB-Pro-Recovery/Sofortstart",
+  "description": "v5.4.3n - Pfadgenauer Rollenanker-Metadatenvertrag im Update-Rückweg",
   "installer_requires": "python3",
   "sanitized_republication": false,
   "history_transition": {

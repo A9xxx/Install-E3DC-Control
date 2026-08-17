@@ -6,6 +6,14 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.3n] – 2026-08-17
+
+### 🔐 Pfadgenauer Rollenanker im Update-Rückweg
+
+- **Der kanonische Rollenanker ist wieder sicher backupfähig:** Der privilegierte Backup- und Recovery-Vertrag akzeptiert ausschließlich `/etc/e3dc-control/instance_role.json` mit den bereits vom Rollenmodell vorgeschriebenen Metadaten `root:www-data 0640`. Die private Backup-Payload bleibt `root:root 0600`.
+- **Keine allgemeine Eigentümerlockerung:** Andere privilegierte Systemkonfigurationen bleiben `root:root`. Falscher Pfad, Gruppe oder Modus, zusätzliche Hardlinks, Symlinks, ACLs, Attribute und jede Identitätsdrift bleiben harte Abbruchgründe.
+- **Keine Regelungsänderung:** EMS-, HA-, Wallbox-, Wärme- und Direktvermarktungsentscheidungen sowie Hardwareausgänge entsprechen unverändert 5.4.3m.
+
 ## [5.4.3m] – 2026-08-17
 
 ### 🔐 Update- und Recovery-Vertrag

@@ -1,6 +1,11 @@
 # Speicher-Ladesteuerung - Systemablauf
 
-> **Stand:** v5.4.3m, gegen den Release-Betriebsvertrag geprüft am 2026-08-17
+> **Stand:** v5.4.3n, gegen den Release-Betriebsvertrag geprüft am 2026-08-17
+>
+> **Hinweis:** 5.4.3n korrigiert ausschließlich den Metadatenvertrag des
+> kanonischen Rollenankers im privilegierten Backup- und Recoverypfad.
+> Speicherentscheidung, Direktvermarktung, RSCP-Ausgang und Hardwaregrenzen
+> bleiben gegenüber 5.4.3m unverändert.
 >
 > **Hinweis:** 5.4.3m härtet den versiegelten normalen Ziel-Updater, dessen
 > Notifier-/Recovery-Drop-in-Vertrag und den openWB-Pro-Phasenautomaten. Eine

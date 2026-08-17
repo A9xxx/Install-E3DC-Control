@@ -1,10 +1,19 @@
 # E3DC-Control Installer
 
-Dokumentation Stand: 5.4.3m
+Dokumentation Stand: 5.4.3n
 
 Der Installer verwaltet Bare-Metal-Installation, Update, Rechte, Dienste,
 Backup, Rollback und optionale Produktmodule. Er ermittelt Benutzer, Home,
 Installationspfad und Python-Umgebung aus dem geprüften Installationskontext.
+
+Der Installer-Anteil von 5.4.3n korrigiert ausschließlich den pfadgenauen
+Metadatenvertrag der privilegierten Restorequelle. Nur
+`/etc/e3dc-control/instance_role.json` wird mit `root:www-data 0640`
+akzeptiert; die private Backup-Payload bleibt `root:root 0600`. Alle anderen
+privilegierten Pfade sowie falsche Eigentümer, Gruppen, Modi, Links, ACLs,
+Attribute oder Identitätsdrift bleiben streng fail-closed. EMS-Regelung,
+HA-, Wallbox-, Wärme- und Direktvermarktungsentscheidungen sowie
+Hardwareausgänge ändern sich gegenüber 5.4.3m nicht.
 
 Der Installer-Anteil von 5.4.3m erlaubt ausschließlich dem vollständig
 versiegelten nativen Ziel-Updater beim normalen vorwärtsgerichteten

@@ -5,7 +5,7 @@ Updates werden ausschließlich über den Installer ausgeführt. Ein manuelles
 Release-Historie ungeeignet, weil alter und neuer Git-Stand nicht miteinander
 verwandt sein müssen.
 
-Der aktuelle Stable-Stand ist `v5.4.3m`. Der Ziel-Updater bindet den
+Der aktuelle Stable-Stand ist `v5.4.3n`. Der Ziel-Updater bindet den
 freigegebenen Zielstand vor Backup und Dienststopp eindeutig an Version,
 Herkunft und Anlagenrolle. Fortschritt und Lebenszeichen bleiben auf
 langsameren Raspberry Pis sichtbar. Eine bereits vollständig installierte
@@ -73,6 +73,21 @@ dem Root-Lock aus demselben gültigen Nicht-Root-Eigentümer von Repository und
 `.git`, lokales Benutzerkonto und Nutzerwert unmittelbar vor dem ersten
 Import aus dem Zielcode erneut geprüft. Die fail-closed Grenzen und alle
 übrigen Härtungen aus 5.4.3j bleiben unverändert.
+
+### 5.4.3n: pfadgenauer Rollenanker im Backup- und Recoveryvertrag
+
+5.4.3n korrigiert ausschließlich die Metadatenprüfung der privilegierten
+Restorequelle. Nur der kanonische Pfad
+`/etc/e3dc-control/instance_role.json` wird mit dem vom Rollenmodell
+vorgegebenen Vertrag `root:www-data 0640` akzeptiert. Die daraus erzeugte
+private Backup-Payload bleibt `root:root 0600`.
+
+Für alle anderen privilegierten Pfade gilt weiterhin der strengere
+`root:root`-Vertrag. Ein falscher Pfad, eine andere Gruppe oder ein anderer
+Modus sowie Symlinks, zusätzliche Hardlinks, ACLs, Attribute oder eine
+Identitätsdrift brechen den Update-Rückweg weiterhin fail-closed ab. Die
+EMS-Regelung, HA-, Wallbox-, Wärme- und Direktvermarktungsentscheidungen sowie
+sämtliche Hardwareausgänge bleiben gegenüber 5.4.3m unverändert.
 
 ### 5.4.3m: vorwärtsgebundener Rollenanker und eindeutige Drop-ins
 
@@ -185,7 +200,7 @@ GitHub-Release-Seite übernommen werden:
 
 ```bash
 export E3DC_INSTALL_PATH="/absoluter/pfad/zur/installation"
-export E3DC_RELEASE_TAG="v5.4.3m"
+export E3DC_RELEASE_TAG="v5.4.3n"
 export E3DC_RELEASE_SHA="<40-stellige Commit-SHA des veröffentlichten Tags>"
 E3DC_BOOTSTRAP_DIR="$(mktemp -d)"
 curl -fL "https://github.com/A9xxx/Install-E3DC-Control/archive/refs/tags/${E3DC_RELEASE_TAG}.tar.gz" \

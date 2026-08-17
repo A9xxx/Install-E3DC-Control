@@ -1,3 +1,25 @@
+# E3DC-Control v5.4.3n
+
+E3DC-Control 5.4.3n schließt einen eng begrenzten Widerspruch zwischen dem
+Rollenanker- und dem privilegierten Backupvertrag. Es enthält keine Änderung
+an EMS-Regelung, HA-Entscheidungen, Wallbox, Wärme, Direktvermarktung oder
+Hardwareausgängen.
+
+## Kanonischer Rollenanker im Backup- und Recoveryvertrag
+
+- Ausschließlich `/etc/e3dc-control/instance_role.json` wird mit den bereits
+  vom Rollenmodell vorgeschriebenen Metadaten `root:www-data 0640` als
+  privilegierte Restorequelle akzeptiert.
+- Die private Backup-Payload bleibt `root:root 0600`; Manifest, Root-Receipt
+  und Restore binden weiterhin Bytes, Eigentümer, Gruppe, Modus, Inode,
+  Linkzahl und Identitätsstabilität.
+- Andere privilegierte Systemkonfigurationen bleiben `root:root`. Ein falscher
+  Pfad, eine fremde Gruppe, ein anderer Modus, Symlinks, zusätzliche
+  Hardlinks, ACLs, Attribute oder Drift brechen den Releasewechsel weiterhin
+  vor der ersten Produktmutation fail-closed ab.
+
+---
+
 # E3DC-Control v5.4.3m
 
 E3DC-Control 5.4.3m schließt zwei konkrete Betriebskanten: Der native

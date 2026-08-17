@@ -21,6 +21,13 @@ veröffentlichten Zielstand. Ein Fehler führt weiterhin ausschließlich über d
 gebundene Backup zurück; freie Commits und ein Rückfall über den beschädigten
 Alt-Updater bleiben ausgeschlossen.
 
+## Bootstrap-Eigentümer in 5.4.3p
+
+5.4.3p erzeugt die neue `.git`-Fläche des Download-Bootstraps als den zuvor
+eindeutig gebundenen Installationsbenutzer. Der Rückfallvertrag ändert sich
+nicht: Verifiziertes Backup, bestätigte Writer-Ruhe und sämtliche Safety-Gates
+bleiben verpflichtend; EMS-Regelung und Hardwareausgänge bleiben unverändert.
+
 ## Rollenanker-Restoregrenze in 5.4.3n
 
 5.4.3n akzeptiert ausschließlich den kanonischen Pfad
@@ -68,7 +75,7 @@ oder einen Prozessabbruch außerhalb des erkannten Fehlerpfads.
 
 ## Programmstand zurücksetzen
 
-Der aktuelle Stable-Stand `v5.4.3o` führt den gebundenen Rückfallvertrag fort.
+Der aktuelle Stable-Stand `v5.4.3p` führt den gebundenen Rückfallvertrag fort.
 
 Beim Rücklauf wird der tatsächliche Dateisystemzustand einer Unit weiterhin
 streng gegen reguläre Unit-Datei, kanonische `/dev/null`-Maske, unerwarteten

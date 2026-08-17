@@ -1,9 +1,9 @@
 {
-  "version": "5.4.3o",
+  "version": "5.4.3p",
   "min_version": "4.0.0",
-  "stable_release": "v5.4.3o",
+  "stable_release": "v5.4.3p",
   "release_date": "2026-08-17",
-  "description": "v5.4.3o - Robuster Altinstallations-Bootstrap und kandidatloser passiver DV-Ladeblock",
+  "description": "v5.4.3p - Git-Metadaten des Download-Bootstraps beim Installationsbenutzer",
   "installer_requires": "python3",
   "sanitized_republication": false,
   "history_transition": {

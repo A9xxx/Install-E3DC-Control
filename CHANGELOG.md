@@ -6,6 +6,13 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.3p] – 2026-08-17
+
+### 🔄 Git-Metadaten beim Installationsbenutzer
+
+- **Der Download-Bootstrap erzeugt die neue `.git`-Fläche als gebundener Installationsbenutzer:** Dadurch erfüllt der anschließende Ziel-Updater den normalen Repository-Eigentümervertrag auch dann, wenn der Bootstrap administrativ mit Root-Rechten gestartet wurde.
+- **Der Sicherheitsvertrag bleibt unverändert:** Verifiziertes Backup, bestätigte Writer-Ruhe und sämtliche Safety-Gates bleiben Pflicht. EMS-Regelung und Hardwareausgänge ändern sich nicht.
+
 ## [5.4.3o] – 2026-08-17
 
 ### 🔄 Robuster Rettungsweg für heterogene Altinstallationen

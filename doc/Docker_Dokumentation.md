@@ -2,8 +2,12 @@
 
 Veröffentlichte Images entstehen ausschließlich aus einem versionierten stabilen Release-Tag. `latest` verweist damit auf die zuletzt veröffentlichte stabile Version.
 
-Der aktuelle Stable-Stand ist `v5.4.3o`. Die Tags `latest`, `v5.4.3o` und
-`5.4.3o` müssen auf denselben geprüften Multi-Arch-Digest verweisen.
+Der aktuelle Stable-Stand ist `v5.4.3p`. Die Tags `latest`, `v5.4.3p` und
+`5.4.3p` müssen auf denselben geprüften Multi-Arch-Digest verweisen.
+
+5.4.3p korrigiert ausschließlich den Bare-Metal-Download-Bootstrap: Die neue
+`.git`-Fläche entsteht als der gebundene Installationsbenutzer. Containerinhalt,
+EMS-Regelung und Hardwareausgänge entsprechen unverändert 5.4.3o.
 
 5.4.3o ergänzt einen Bare-Metal-Rettungsbootstrap; dieser Host-Helfer gehört
 nicht in den Containerlayer. Das Docker-Image enthält dagegen weiterhin den
@@ -247,7 +251,7 @@ unverändert gesperrt und benötigen eine manuelle Prüfung.
 
 Ohne `E3DC_IMAGE_TAG` folgt diese Compose-Datei dem geprüften Stable-Tag
 `latest`. Ein fester Tag bleibt bei `pull` absichtlich unverändert. Für einen
-bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.3o` in der Datei `.env`
+bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.3p` in der Datei `.env`
 gesetzt. `docker compose config --images` zeigt vorab das tatsächlich gewählte
 Image.
 
@@ -274,7 +278,7 @@ Versionswahl.
 
 Gezielte Rückfallversion:
 
-Den Stable-Container `v5.4.3o` auf den veröffentlichten Rollback-Root
+Den Stable-Container `v5.4.3p` auf den veröffentlichten Rollback-Root
 `v5.3.2b` zurücksetzen:
 
 ```bash

@@ -5,7 +5,7 @@ Updates werden ausschließlich über den Installer ausgeführt. Ein manuelles
 Release-Historie ungeeignet, weil alter und neuer Git-Stand nicht miteinander
 verwandt sein müssen.
 
-Der aktuelle Stable-Stand ist `v5.4.3o`. Der Ziel-Updater bindet den
+Der aktuelle Stable-Stand ist `v5.4.3p`. Der Ziel-Updater bindet den
 freigegebenen Zielstand vor Backup und Dienststopp eindeutig an Version,
 Herkunft und Anlagenrolle. Fortschritt und Lebenszeichen bleiben auf
 langsameren Raspberry Pis sichtbar. Eine bereits vollständig installierte
@@ -69,9 +69,10 @@ Argument (`off`, `master`, `slave` oder `shadow`) angegeben werden.
 Die vorhandene `.git`-Fläche ist dabei keine Eingangsbedingung. Der Rettungsweg
 liest weder ihre Rechte noch ihren Index oder ihre lokale Historie als
 Updateautorität, sondern baut die für den Zielstand benötigten Git-Metadaten
-nach dem Backup frisch auf. Gesichert werden die tatsächlich betriebenen
-Produkt- und Konfigurationsdateien, nicht ein möglicherweise beschädigter
-Git-Zwischenspeicher.
+nach dem Backup frisch auf. Die neue `.git`-Fläche entsteht dabei als der
+zuvor eindeutig gebundene Installationsbenutzer. Gesichert werden die
+tatsächlich betriebenen Produkt- und Konfigurationsdateien, nicht ein
+möglicherweise beschädigter Git-Zwischenspeicher.
 
 Der Ziel-Updater erstellt und prüft zuerst das Backup, stoppt danach die
 bekannten Writer, projiziert Release-Dateien, Rechte und Dienste auf den
@@ -119,6 +120,17 @@ dem Root-Lock aus demselben gültigen Nicht-Root-Eigentümer von Repository und
 `.git`, lokales Benutzerkonto und Nutzerwert unmittelbar vor dem ersten
 Import aus dem Zielcode erneut geprüft. Die fail-closed Grenzen und alle
 übrigen Härtungen aus 5.4.3j bleiben unverändert.
+
+### 5.4.3p: Git-Metadaten beim Installationsbenutzer
+
+5.4.3p erzeugt die vom administrativen Download-Bootstrap neu aufgebaute
+`.git`-Fläche als den zuvor eindeutig gebundenen Installationsbenutzer. Der
+anschließende Ziel-Updater erfüllt damit den regulären
+Repository-Eigentümervertrag.
+
+Verifiziertes Backup, bestätigte Writer-Ruhe und sämtliche Safety-Gates des
+Rettungswegs bleiben unverändert verpflichtend. EMS-Regelung und
+Hardwareausgänge ändern sich nicht.
 
 ### 5.4.3o: robuster Rettungsweg für heterogene Altinstallationen
 

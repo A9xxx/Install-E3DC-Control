@@ -1,6 +1,11 @@
 # Speicher-Ladesteuerung - Systemablauf
 
-> **Stand:** v5.4.3o, gegen den Release-Betriebsvertrag geprüft am 2026-08-17
+> **Stand:** v5.4.3p, gegen den Release-Betriebsvertrag geprüft am 2026-08-17
+>
+> **Hinweis:** 5.4.3p korrigiert ausschließlich den Eigentümer der vom
+> Download-Bootstrap neu erzeugten Git-Metadaten. Speicherentscheidung,
+> Direktvermarktung, RSCP-Ausgang und Hardwaregrenzen bleiben gegenüber
+> 5.4.3o unverändert.
 >
 > **Hinweis:** 5.4.3o bindet den sicheren passiven
 > Direktvermarktungs-Ladeblock auch bei einem bewusst kandidatlosen Planslot

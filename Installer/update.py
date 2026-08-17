@@ -968,6 +968,32 @@ def _git_argv(repo_dir: str, install_user: str, *args: str, timeout: int = 30) -
     )
 
 
+def _initialize_bootstrap_git(repo_dir: str, install_user: str) -> None:
+    """Erzeugt nur die neue Git-Wurzel als gebundener Installationsbenutzer."""
+
+    result = _run_argv(
+        [
+            "/usr/bin/sudo",
+            "-n",
+            "-H",
+            "-u",
+            str(install_user),
+            "--",
+            "/usr/bin/env",
+            "-i",
+            *isolated_git_environment_assignments(),
+            "/usr/bin/git",
+            "-c",
+            "init.defaultBranch=main",
+            "init",
+            repo_dir,
+        ],
+        timeout=30,
+    )
+    if not result["success"]:
+        raise RuntimeError("Git-Init fehlgeschlagen: " + result["stderr"].strip())
+
+
 def _set_watchdog_update_grace(reason: str = 'update') -> None:
     """Gibt piguard nach Update-Restarts Zeit fuer frische State-Dateien."""
     try:
@@ -13769,21 +13795,13 @@ def _execute_update_transaction(
                     "verifizierten Backup neu aufgebaut."
                 )
                 _remove_tree_nofollow(git_path)
-            init = _run_argv(
-                [
-                    "/usr/bin/env",
-                    "-i",
-                    *isolated_git_environment_assignments(),
-                    "/usr/bin/git",
-                    "-c",
-                    "init.defaultBranch=main",
-                    "init",
-                    repo_dir,
-                ],
-                timeout=30,
-            )
-            if not init["success"]:
-                raise RuntimeError("Git-Init fehlgeschlagen: " + init["stderr"].strip())
+            # Nur die frisch erzeugte Metadatenwurzel gehört von Anfang an dem
+            # gebundenen Installationsbenutzer. Alle folgenden Projektionen
+            # dürfen weiter als Root laufen, damit beliebige Altmodi im
+            # Produktbaum das Update nach dem verifizierten Backup nicht
+            # blockieren. Der Ziel-Finalizer kann .git dadurch anschließend
+            # als genau diesen Nicht-Root-Besitz erneut binden.
+            _initialize_bootstrap_git(repo_dir, install_user)
             mutated = True
             remote_add = _git_argv(repo_dir, install_user, "remote", "add", "origin", SELFUPDATE_REPO, timeout=15)
             if not remote_add["success"]:

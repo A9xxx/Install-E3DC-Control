@@ -1,3 +1,19 @@
+# E3DC-Control v5.4.3p
+
+E3DC-Control 5.4.3p korrigiert ausschließlich die Eigentümerbindung der vom
+administrativen Download-Bootstrap neu erzeugten Git-Metadaten. Es enthält
+keine Änderung an EMS-Regelung oder Hardwareausgängen.
+
+## Git-Metadaten beim gebundenen Installationsbenutzer
+
+- `e3dc-update-bootstrap` erzeugt die neue `.git`-Fläche im Zielpfad als den
+  zuvor eindeutig gebundenen Installationsbenutzer. Der Ziel-Updater trifft
+  damit auf den regulären Repository-Eigentümervertrag.
+- Verifiziertes Backup, bestätigte Writer-Ruhe und sämtliche Safety-Gates des
+  Rettungswegs bleiben unverändert verpflichtend.
+
+---
+
 # E3DC-Control v5.4.3o
 
 E3DC-Control 5.4.3o ergänzt einen robusten administrativen Rettungsweg für

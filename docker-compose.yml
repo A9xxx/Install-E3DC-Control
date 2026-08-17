@@ -2,7 +2,7 @@ services:
   e3dc-control:
     # Ohne E3DC_IMAGE_TAG folgt die Installation dem geprüften Stable-Tag
     # "latest". Ein fester Pin oder Rückfall wird bewusst in .env gesetzt,
-    # zum Beispiel: E3DC_IMAGE_TAG=v5.4.3o
+    # zum Beispiel: E3DC_IMAGE_TAG=v5.4.3p
     image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"
 
     # Lokaler Entwickler-Selbstbau mit getrenntem Compose-Override:

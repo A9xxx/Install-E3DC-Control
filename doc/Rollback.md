@@ -12,6 +12,13 @@ export E3DC_INSTALL_PATH="/absoluter/pfad/zur/installation"
 test -f "$E3DC_INSTALL_PATH/e3dc-setup"
 ```
 
+## Bootstrap-Finalizer in 5.4.3q
+
+5.4.3q ruft `visudo` im Finalizer des administrativen Download-Bootstraps über
+den absoluten Pfad `/usr/sbin/visudo` auf. Der Rückfallvertrag sowie sämtliche
+übrigen Update- und Sicherheitsgrenzen bleiben unverändert; EMS-Regelung und
+Hardwareausgänge ändern sich nicht.
+
 ## Rettungsupdate in 5.4.3o
 
 Der Download-Bootstrap von 5.4.3o ist ein vorwärtsgerichteter administrativer
@@ -75,7 +82,7 @@ oder einen Prozessabbruch außerhalb des erkannten Fehlerpfads.
 
 ## Programmstand zurücksetzen
 
-Der aktuelle Stable-Stand `v5.4.3p` führt den gebundenen Rückfallvertrag fort.
+Der aktuelle Stable-Stand `v5.4.3q` führt den gebundenen Rückfallvertrag fort.
 
 Beim Rücklauf wird der tatsächliche Dateisystemzustand einer Unit weiterhin
 streng gegen reguläre Unit-Datei, kanonische `/dev/null`-Maske, unerwarteten

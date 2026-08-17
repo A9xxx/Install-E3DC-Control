@@ -5,7 +5,7 @@ Updates werden ausschließlich über den Installer ausgeführt. Ein manuelles
 Release-Historie ungeeignet, weil alter und neuer Git-Stand nicht miteinander
 verwandt sein müssen.
 
-Der aktuelle Stable-Stand ist `v5.4.3p`. Der Ziel-Updater bindet den
+Der aktuelle Stable-Stand ist `v5.4.3q`. Der Ziel-Updater bindet den
 freigegebenen Zielstand vor Backup und Dienststopp eindeutig an Version,
 Herkunft und Anlagenrolle. Fortschritt und Lebenszeichen bleiben auf
 langsameren Raspberry Pis sichtbar. Eine bereits vollständig installierte
@@ -120,6 +120,13 @@ dem Root-Lock aus demselben gültigen Nicht-Root-Eigentümer von Repository und
 `.git`, lokales Benutzerkonto und Nutzerwert unmittelbar vor dem ersten
 Import aus dem Zielcode erneut geprüft. Die fail-closed Grenzen und alle
 übrigen Härtungen aus 5.4.3j bleiben unverändert.
+
+### 5.4.3q: absoluter visudo-Pfad im Bootstrap-Finalizer
+
+5.4.3q verwendet im Finalizer des administrativen Download-Bootstraps den
+absoluten Pfad `/usr/sbin/visudo`. Der Abschluss ist damit nicht von einem
+verkürzten Root-`PATH` abhängig. Alle übrigen Update- und Sicherheitsverträge
+bleiben unverändert; EMS-Regelung und Hardwareausgänge ändern sich nicht.
 
 ### 5.4.3p: Git-Metadaten beim Installationsbenutzer
 

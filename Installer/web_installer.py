@@ -284,6 +284,7 @@ WRAPPER_RELATIVE_PATHS = (
 )
 SUDOERS_FILE = Path("/etc/sudoers.d/020_e3dc_services")
 SUDOERS_DIR = Path("/etc/sudoers.d")
+VISUDO = Path("/usr/sbin/visudo")
 MAX_BACKUP_FILE_BYTES = 10 * 1024 * 1024
 EXPECTED_RELEASE_COMMIT_ENV = "E3DC_RELEASE_EXPECTED_COMMIT"
 
@@ -4100,7 +4101,7 @@ def repair_permissions(
         rollback = _restore_preimages(
             [*wrapper_preimages, *launcher_preimages, *sudoers_preimages]
         )
-        syntax = run_cmd(["visudo", "-cf", "/etc/sudoers"], timeout=10)
+        syntax = run_cmd([str(VISUDO), "-cf", "/etc/sudoers"], timeout=10)
         rollback["visudo"] = syntax
         rollback["success"] = bool(rollback.get("success")) and bool(syntax.get("ok"))
         steps.append({"step": "permissions_rollback", "ok": rollback["success"], **rollback})
@@ -4345,7 +4346,7 @@ def repair_permissions(
             os.fsync(validation_fd)
         finally:
             os.close(validation_fd)
-        syntax_tmp = run_cmd(["visudo", "-cf", str(validation_tmp_path)], timeout=10)
+        syntax_tmp = run_cmd([str(VISUDO), "-cf", str(validation_tmp_path)], timeout=10)
         steps.append({"step": "validate_target", **syntax_tmp})
         if not syntax_tmp.get("ok"):
             validation_tmp_path.unlink(missing_ok=True)
@@ -4415,9 +4416,9 @@ def repair_permissions(
                 "removed_lines": removed_count,
             })
 
-        syntax_final = run_cmd(["visudo", "-cf", str(SUDOERS_FILE)], timeout=10)
+        syntax_final = run_cmd([str(VISUDO), "-cf", str(SUDOERS_FILE)], timeout=10)
         steps.append({"step": "validate_final", **syntax_final})
-        syntax_all = run_cmd(["visudo", "-cf", "/etc/sudoers"], timeout=10)
+        syntax_all = run_cmd([str(VISUDO), "-cf", "/etc/sudoers"], timeout=10)
         steps.append({"step": "validate_all_sudoers", **syntax_all})
 
         # Dieser Abschlusscheck laeuft noch innerhalb des eigenen Job-Locks.

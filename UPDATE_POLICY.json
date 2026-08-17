@@ -1,9 +1,9 @@
 {
-  "version": "5.4.3p",
+  "version": "5.4.3q",
   "min_version": "4.0.0",
-  "stable_release": "v5.4.3p",
+  "stable_release": "v5.4.3q",
   "release_date": "2026-08-17",
-  "description": "v5.4.3p - Git-Metadaten des Download-Bootstraps beim Installationsbenutzer",
+  "description": "v5.4.3q - Absoluter visudo-Pfad im Download-Bootstrap-Finalizer",
   "installer_requires": "python3",
   "sanitized_republication": false,
   "history_transition": {

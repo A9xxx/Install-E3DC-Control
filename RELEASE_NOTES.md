@@ -1,3 +1,17 @@
+# E3DC-Control v5.4.3q
+
+E3DC-Control 5.4.3q korrigiert ausschließlich den Aufruf von `visudo` im
+Finalizer des administrativen Download-Bootstraps. Es enthält keine Änderung
+an EMS-Regelung oder Hardwareausgängen.
+
+## Eindeutiger visudo-Aufruf
+
+- Der Bootstrap-Finalizer verwendet den absoluten Pfad `/usr/sbin/visudo` und
+  ist damit nicht von einem verkürzten Root-`PATH` abhängig.
+- Alle übrigen Update-, Sicherheits- und Betriebsverträge bleiben unverändert.
+
+---
+
 # E3DC-Control v5.4.3p
 
 E3DC-Control 5.4.3p korrigiert ausschließlich die Eigentümerbindung der vom

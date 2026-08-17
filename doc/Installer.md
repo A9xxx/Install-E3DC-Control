@@ -1,10 +1,15 @@
 # E3DC-Control Installer
 
-Dokumentation Stand: 5.4.3p
+Dokumentation Stand: 5.4.3q
 
 Der Installer verwaltet Bare-Metal-Installation, Update, Rechte, Dienste,
 Backup, Rollback und optionale Produktmodule. Er ermittelt Benutzer, Home,
 Installationspfad und Python-Umgebung aus dem geprüften Installationskontext.
+
+Der Installer-Anteil von 5.4.3q verwendet im Finalizer des administrativen
+Download-Bootstraps den absoluten Pfad `/usr/sbin/visudo` und ist damit nicht
+von einem verkürzten Root-`PATH` abhängig. EMS-Regelung und Hardwareausgänge
+ändern sich nicht.
 
 Der Installer-Anteil von 5.4.3p erzeugt die vom administrativen
 Download-Bootstrap neu aufgebaute `.git`-Fläche als den zuvor eindeutig

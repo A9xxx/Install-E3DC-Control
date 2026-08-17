@@ -6,6 +6,13 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.3q] – 2026-08-17
+
+### 🔄 Absoluter visudo-Pfad im Download-Bootstrap
+
+- **Der Bootstrap-Finalizer ruft `visudo` eindeutig auf:** Der administrative Download-Bootstrap verwendet den absoluten Pfad `/usr/sbin/visudo` und ist damit nicht von einem verkürzten Root-`PATH` abhängig.
+- **Keine Regelungsänderung:** EMS-Regelung und Hardwareausgänge bleiben unverändert.
+
 ## [5.4.3p] – 2026-08-17
 
 ### 🔄 Git-Metadaten beim Installationsbenutzer

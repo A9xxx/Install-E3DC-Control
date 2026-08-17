@@ -1,10 +1,15 @@
 # Betrieb des E3DC-Control Installers
 
-Dokumentation Stand: 5.4.3p
+Dokumentation Stand: 5.4.3q
 
 Der Installer ist der freigegebene Einstieg für Installation, Update,
 Reparatur, Backup, Rollback und Deinstallation. Die vollständige Bedienung ist
 in [E3DC-Control Installer](Installer.md) beschrieben.
+
+Der Installer-Anteil von 5.4.3q verwendet im Finalizer des administrativen
+Download-Bootstraps den absoluten Pfad `/usr/sbin/visudo` und ist damit nicht
+von einem verkürzten Root-`PATH` abhängig. EMS-Regelung und Hardwareausgänge
+ändern sich nicht.
 
 Der Installer-Anteil von 5.4.3p erzeugt die vom administrativen
 Download-Bootstrap neu aufgebaute `.git`-Fläche als den zuvor eindeutig

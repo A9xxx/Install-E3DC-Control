@@ -2,7 +2,27 @@
 
 Diese Anleitung fasst die schnellsten Schritte zusammen, um E3DC-Control auf einem frischen Raspberry Pi OS (oder ähnlichem Debian-System) zu installieren.
 
-Aktueller Stable-Stand: `v5.4.3l`.
+Aktueller Stable-Stand: `v5.4.3m`.
+
+5.4.3m erlaubt ausschließlich dem vollständig versiegelten nativen
+Ziel-Updater beim normalen vorwärtsgerichteten Releasewechsel, einen wirklich
+fehlenden Instanzrollenanker für den exakt gebundenen `off`-Einzelknoten ohne
+Peer einmalig zu erzeugen. Das geschieht erst nach Root-Receipt-gebundenem
+Backup, bewaffnetem persistentem Startschutz und bestätigter Aktorruhe; eine
+gegebenenfalls nötige Storage-Manager-Unit-Promotion folgt erst unter diesem
+Schutz. Bootstrap, Reinstall und Rollback besitzen diese
+Autorität nicht. Vorhandene fremde oder widersprüchliche Anker sowie HA- und
+Shadow-Rollen bleiben fail-closed und werden nicht automatisch repariert. Die
+openWB-Pro-Regelung schließt zugleich eine gestrandete ältere
+Phasenausgangsgeneration vor einem neuen Storage-Grant ausschließlich aus
+exakt gebundenem Intent, ACK und frischem 0-A-/0-W-Readback ohne neuen
+Hardwarebefehl. Eine Budgetreservierung startet keinen Phasen-Cooldown; die
+mindestens 480 Sekunden beginnen erst nach bestätigtem realem Phasenausgang.
+Ein bewusst neu gespeicherter Modus-5-Sofortauftrag darf nur die vollständig
+belegte 3/3-Startablehnung derselben aktuellen Stecksession einmalig neu
+öffnen. Preislimit, Nutzer-`Aus`, Not-Aus, Speicher-, Netzpunkt-, Phasen- und
+Hardwaregrenzen bleiben vorrangig; der Auftrag selbst erzeugt weder ein Budget
+noch einen Hardwareausgang.
 
 5.4.3l härtet den updater-eigenen, nativen Git-Rückweg. Belegte,
 weiterhin vorhandene Änderungen an getrackten Dateien werden bei einem
@@ -254,7 +274,7 @@ Ohne das Label bleibt auch ein versehentlich gestarteter Watchtower für den
 Hauptcontainer wirkungslos. Der oben gezeigte manuelle Host-Helfer bleibt der
 empfohlene Updateweg.
 
-**Docker-Rückfall von v5.4.3l auf den veröffentlichten Docker-Rollback-Root:**
+**Docker-Rückfall von v5.4.3m auf den veröffentlichten Docker-Rollback-Root:**
 ```bash
 (
   set -euo pipefail

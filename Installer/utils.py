@@ -2289,6 +2289,7 @@ def _migrate_approved_storage_manager_unit_owner(
     expected_payloads,
     *,
     install_user=None,
+    expected_recovery_dropins=None,
 ):
     """Ersetzt nur die bytegenaue pi-eigene Storage-Kernunit atomar.
 
@@ -2377,6 +2378,7 @@ def _migrate_approved_storage_manager_unit_owner(
         dropin_preimages = _allowed_unit_dropin_preimages(
             unit_name,
             loaded_state,
+            expected_recovery_dropins=expected_recovery_dropins,
         )
         expected_effective = _unit_file_effective_contract(
             payload,
@@ -2834,8 +2836,6 @@ def _allowed_unit_dropin_preimages(
         unit + ".d",
         "00-e3dc-recovery-bootblock.conf",
     )
-    if recovery_dropins and unit != "e3dc-storage-manager.service":
-        raise RuntimeError("Recovery-Drop-in-Ausnahme gilt nur für den Storage-Manager")
     if set(recovery_dropins) not in (set(), {expected_recovery_path}):
         raise RuntimeError(f"{unit} besitzt keinen eindeutigen Recovery-Drop-in-Vertrag")
     for path, contract in recovery_dropins.items():
@@ -2981,11 +2981,6 @@ def capture_systemd_service_bundle(
 
     snapshot = {}
     recovery_contracts = dict(expected_recovery_dropins or {})
-    if set(recovery_contracts) not in (
-        set(),
-        {"e3dc-storage-manager.service"},
-    ):
-        raise RuntimeError("Recovery-Drop-in-Vertrag gilt nur für den Storage-Manager")
     used_recovery_contracts = set()
     for requested in service_names:
         unit = _bundle_unit_name(requested)

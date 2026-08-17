@@ -1269,6 +1269,7 @@ class WatchdogBundleInstaller:
         context: TransitionContext,
         *,
         child_correlation_id: str | None = None,
+        start_service: bool = True,
     ) -> tuple[str, Path, dict[str, object]]:
         correlation = str(child_correlation_id or "")
         if correlation and not re.fullmatch(r"[0-9a-f]{32}", correlation):
@@ -1307,6 +1308,7 @@ class WatchdogBundleInstaller:
             "state": "preparing",
             "phase": "created",
             "previous_active": "unknown",
+            "desired_active": "active" if start_service else "inactive",
             "writer_stop_started": False,
             "writer_stopped": False,
             "live_files_installed": [],
@@ -1466,6 +1468,44 @@ class WatchdogBundleInstaller:
         if not value and result.returncode in {3, 4, 5}:
             return "inactive"
         raise WatchdogTransitionError("Piguard-Aktivzustand ist nicht eindeutig")
+
+    def _query_quiesced(self) -> bool:
+        """Belegt für den Release-Preparepfad inactive/dead und MainPID 0."""
+
+        result = self._run(
+            [
+                "/usr/bin/systemctl",
+                "show",
+                "--no-pager",
+                "--property=ActiveState",
+                "--property=SubState",
+                "--property=MainPID",
+                WATCHDOG_SERVICE,
+            ],
+            check=False,
+        )
+        values: dict[str, str] = {}
+        expected = {"ActiveState", "SubState", "MainPID"}
+        for raw_line in str(result.stdout or "").splitlines():
+            key, separator, value = raw_line.partition("=")
+            if (
+                separator != "="
+                or key not in expected
+                or key in values
+                or value != value.strip()
+            ):
+                return False
+            values[key] = value
+        return bool(
+            result.returncode == 0
+            and not str(result.stderr or "")
+            and values
+            == {
+                "ActiveState": "inactive",
+                "SubState": "dead",
+                "MainPID": "0",
+            }
+        )
 
     def _stop_writer(self) -> None:
         self._run(["/usr/bin/systemctl", "stop", WATCHDOG_SERVICE], check=False)
@@ -1669,7 +1709,20 @@ class WatchdogBundleInstaller:
                 )
                 self._mark_recovery_required(tx_dir, record, errors)
                 raise WatchdogRecoveryRequired(transaction_id)
-            if self._record_live_complete(record) and self._query_active() == "active":
+            desired_active = str(record.get("desired_active") or "active")
+            if desired_active not in {"active", "inactive"}:
+                self._mark_recovery_required(
+                    tx_dir,
+                    record,
+                    ["desired-active:invalid"],
+                )
+                raise WatchdogRecoveryRequired(transaction_id)
+            live_state_matches = (
+                self._query_active() == "active"
+                if desired_active == "active"
+                else self._query_quiesced()
+            )
+            if self._record_live_complete(record) and live_state_matches:
                 record["state"] = "committed"
                 record["recovered"] = True
                 self._advance(tx_dir, record, "recovered_commit")
@@ -1800,7 +1853,14 @@ class WatchdogBundleInstaller:
         monitor_file: str = "",
         *,
         child_correlation_id: str | None = None,
+        start_service: bool = True,
     ) -> str:
+        if not isinstance(start_service, bool):
+            raise WatchdogTransitionError("Watchdog-Startmodus ist nicht boolesch")
+        if child_correlation_id and not start_service:
+            raise WatchdogTransitionError(
+                "Korrelierte Watchdog-Installation darf nicht quiesced bleiben"
+            )
         bundle = self.render_bundle(context, router_ips, monitor_file)
         with self._locked():
             self.systemd.recover_incomplete()
@@ -1809,6 +1869,7 @@ class WatchdogBundleInstaller:
                 bundle,
                 context,
                 child_correlation_id=child_correlation_id,
+                start_service=start_service,
             )
             systemd_called = False
             try:
@@ -1854,14 +1915,19 @@ class WatchdogBundleInstaller:
                     self._advance(tx_dir, record, f"installed:{name}")
 
                 def postcheck(_spec) -> bool:
-                    return self._verify_live(bundle, context) and self._query_active() == "active"
+                    desired_state_ok = (
+                        self._query_active() == "active"
+                        if start_service
+                        else self._query_quiesced()
+                    )
+                    return self._verify_live(bundle, context) and desired_state_ok
 
                 systemd_called = True
                 result = self.systemd.install_unit(
                     self.paths.service,
                     bundle.service,
                     enable=True,
-                    start=True,
+                    start=start_service,
                     writer=True,
                     postcheck=postcheck,
                     label=f"watchdog-{transaction_id}",
@@ -1980,8 +2046,15 @@ def install_watchdog_bundle(
     explicit_install_user: str | None = None,
     explicit_home_dir: str | None = None,
     explicit_venv_path: str | None = None,
+    start_service: bool = True,
 ) -> str:
     """Löst den einmaligen Transitionskontext auf und installiert genau ein Paket."""
+    if not isinstance(start_service, bool):
+        raise WatchdogTransitionError("Watchdog-Startmodus ist nicht boolesch")
+    if install_auxiliaries and not start_service:
+        raise WatchdogTransitionError(
+            "Notifier- und Watchdog-Installation darf nicht quiesced gekoppelt werden"
+        )
     context = get_transition_context(
         explicit_install_path=explicit_install_path,
         explicit_install_user=explicit_install_user,
@@ -2005,9 +2078,15 @@ def install_watchdog_bundle(
                 router_ips,
                 monitor_file,
                 child_correlation_id=child_correlation_id,
+                start_service=start_service,
             )
     else:
-        bundle_sha = WatchdogBundleInstaller().install(context, router_ips, monitor_file)
+        bundle_sha = WatchdogBundleInstaller().install(
+            context,
+            router_ips,
+            monitor_file,
+            start_service=start_service,
+        )
     if install_auxiliaries:
         warnings = _restore_r1_watchdog_auxiliaries(context)
         for warning in warnings:
@@ -2022,9 +2101,13 @@ def create_boot_notify() -> bool:
     return True
 
 
-def create_pi_guard(router_ips, monitor_file="") -> bool:
+def create_pi_guard(router_ips, monitor_file="", *, start_service: bool = True) -> bool:
     """Kompatibilitätseinstieg: ersetzt Guard, Notify und Unit atomar."""
-    install_watchdog_bundle(router_ips, monitor_file)
+    install_watchdog_bundle(
+        router_ips,
+        monitor_file,
+        start_service=start_service,
+    )
     return True
 
 

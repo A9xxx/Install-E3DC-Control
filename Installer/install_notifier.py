@@ -26,6 +26,7 @@ from .logging_manager import log_task_completed
 from .secure_file_transaction import (
     atomic_write_bound_file,
     exclusive_transaction_lock,
+    open_bound_directory,
     restore_bound_file,
     snapshot_bound_file,
     snapshots_match,
@@ -39,6 +40,8 @@ NOTIFIER_SERVICE = "e3dc-notifier"
 NOTIFIER_UNIT = "e3dc-notifier.service"
 NOTIFIER_UNIT_PATH = "/etc/systemd/system/e3dc-notifier.service"
 NOTIFIER_DROPIN_DIR = "/etc/systemd/system/e3dc-notifier.service.d"
+SYSTEMD_TRANSACTION_STAGING_ROOT = "/etc/systemd/system"
+LEGACY_TRANSACTION_STAGING_NAME = ".e3dc-control-transactions"
 CRONTAB_BIN = "/usr/bin/crontab"
 NOTIFIER_WATCHDOG_JOURNAL_ROOT = "/var/lib/e3dc-control/notifier-watchdog-transitions"
 NOTIFIER_WATCHDOG_SCHEMA = 1
@@ -1985,6 +1988,154 @@ def _start_block_is_active(transaction: _NotifierTransaction) -> bool:
     )
 
 
+def _remove_legacy_notifier_staging_residue() -> bool:
+    """Entfernt nur das exakt leere, eigene Alt-Staging im Drop-in-Verzeichnis."""
+
+    from .utils import _descriptor_has_unsafe_unit_xattrs
+
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        raise NotifierRecoveryRequired(
+            "Notifier-Staging-Migration darf ausschließlich Root ausführen"
+        )
+    try:
+        parent_descriptor, parent_identity = open_bound_directory(
+            NOTIFIER_DROPIN_DIR
+        )
+    except FileNotFoundError:
+        return False
+    staging_descriptor = -1
+    try:
+        parent_metadata = os.fstat(parent_descriptor)
+        if (
+            not stat.S_ISDIR(parent_metadata.st_mode)
+            or parent_metadata.st_uid != 0
+            or parent_metadata.st_gid != 0
+            or stat.S_IMODE(parent_metadata.st_mode) != 0o755
+            or _descriptor_has_unsafe_unit_xattrs(parent_descriptor)
+        ):
+            raise NotifierRecoveryRequired(
+                "Notifier-Drop-in-Verzeichnis ist für die Staging-Migration unsicher"
+            )
+        try:
+            named_before = os.stat(
+                LEGACY_TRANSACTION_STAGING_NAME,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return False
+        signature = (
+            named_before.st_dev,
+            named_before.st_ino,
+            named_before.st_uid,
+            named_before.st_gid,
+            stat.S_IMODE(named_before.st_mode),
+        )
+        if (
+            not stat.S_ISDIR(named_before.st_mode)
+            or named_before.st_uid != 0
+            or named_before.st_gid != 0
+            or stat.S_IMODE(named_before.st_mode) != 0o700
+        ):
+            raise NotifierRecoveryRequired(
+                "Notifier-Alt-Staging besitzt keine sichere Verzeichnisform"
+            )
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        directory = getattr(os, "O_DIRECTORY", 0)
+        if not nofollow or not directory:
+            raise NotifierRecoveryRequired(
+                "Notifier-Staging-Migration benötigt O_NOFOLLOW/O_DIRECTORY"
+            )
+        staging_descriptor = os.open(
+            LEGACY_TRANSACTION_STAGING_NAME,
+            os.O_RDONLY | nofollow | directory | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_descriptor,
+        )
+        opened = os.fstat(staging_descriptor)
+        named_after = os.stat(
+            LEGACY_TRANSACTION_STAGING_NAME,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        opened_signature = (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_uid,
+            opened.st_gid,
+            stat.S_IMODE(opened.st_mode),
+        )
+        named_after_signature = (
+            named_after.st_dev,
+            named_after.st_ino,
+            named_after.st_uid,
+            named_after.st_gid,
+            stat.S_IMODE(named_after.st_mode),
+        )
+        if (
+            opened_signature != signature
+            or named_after_signature != signature
+            or _descriptor_has_unsafe_unit_xattrs(staging_descriptor)
+            or os.listdir(staging_descriptor)
+        ):
+            raise NotifierRecoveryRequired(
+                "Notifier-Alt-Staging ist nicht exakt leer und stabil gebunden"
+            )
+        named_final = os.stat(
+            LEGACY_TRANSACTION_STAGING_NAME,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            (
+                named_final.st_dev,
+                named_final.st_ino,
+                named_final.st_uid,
+                named_final.st_gid,
+                stat.S_IMODE(named_final.st_mode),
+            )
+            != signature
+            or os.listdir(staging_descriptor)
+        ):
+            raise NotifierRecoveryRequired(
+                "Notifier-Alt-Staging driftete unmittelbar vor der Entfernung"
+            )
+        os.rmdir(
+            LEGACY_TRANSACTION_STAGING_NAME,
+            dir_fd=parent_descriptor,
+        )
+        os.fsync(parent_descriptor)
+        try:
+            os.stat(
+                LEGACY_TRANSACTION_STAGING_NAME,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            raise NotifierRecoveryRequired(
+                "Notifier-Alt-Staging blieb nach rmdir vorhanden"
+            )
+        parent_after = os.fstat(parent_descriptor)
+        if (parent_after.st_dev, parent_after.st_ino) != tuple(parent_identity[:2]):
+            raise NotifierRecoveryRequired(
+                "Notifier-Drop-in-Verzeichnis driftete nach der Staging-Migration"
+            )
+    finally:
+        if staging_descriptor >= 0:
+            os.close(staging_descriptor)
+        os.close(parent_descriptor)
+    rebound_descriptor, rebound_identity = open_bound_directory(NOTIFIER_DROPIN_DIR)
+    try:
+        if tuple(rebound_identity[:2]) != tuple(parent_identity[:2]):
+            raise NotifierRecoveryRequired(
+                "Notifier-Drop-in-Pfad wurde nach der Staging-Migration ausgetauscht"
+            )
+    finally:
+        os.close(rebound_descriptor)
+    return True
+
+
 def _ensure_recovery_start_block(
     journal: _NotifierWatchdogJournal,
     tx_dir: Path,
@@ -2069,6 +2220,7 @@ def _ensure_recovery_start_block(
             mode=0o644,
             expected_snapshot=current,
             max_existing_bytes=64 * 1024,
+            staging_root=SYSTEMD_TRANSACTION_STAGING_ROOT,
         )
     else:
         raise _NotifierAmbiguousState("Notifier-Recoveryblock besitzt fremde Bytes")
@@ -2164,6 +2316,7 @@ def _ensure_transaction_start_block(transaction: _NotifierTransaction) -> None:
             mode=0o644,
             expected_snapshot=current,
             max_existing_bytes=64 * 1024,
+            staging_root=SYSTEMD_TRANSACTION_STAGING_ROOT,
         )
     else:
         raise _NotifierAmbiguousState("Notifier-Startblock besitzt fremde Bytes")
@@ -2294,6 +2447,7 @@ def _install_notifier_start_block(transaction: _NotifierTransaction) -> None:
         mode=0o644,
         expected_snapshot=preimage,
         max_existing_bytes=64 * 1024,
+        staging_root=SYSTEMD_TRANSACTION_STAGING_ROOT,
     )
     transaction.start_block_path = block_path
     transaction.start_block_marker = marker
@@ -2773,7 +2927,11 @@ def _legacy_token_updates(source: bytes, config_payload: bytes) -> tuple[bytes, 
     return payload, updated
 
 
-def _capture_transaction(*, migrate_legacy_config: bool) -> _NotifierTransaction:
+def _capture_transaction(
+    *,
+    migrate_legacy_config: bool,
+    expected_recovery_dropins=None,
+) -> _NotifierTransaction:
     from .utils import capture_systemd_service_bundle
 
     install_user, install_uid, www_gid = _require_root_identity()
@@ -2817,7 +2975,10 @@ def _capture_transaction(*, migrate_legacy_config: bool) -> _NotifierTransaction
         user: _capture_crontab(user)
         for user in (install_user, "root", "www-data")
     }
-    service_snapshot = capture_systemd_service_bundle((NOTIFIER_SERVICE,))
+    service_snapshot = capture_systemd_service_bundle(
+        (NOTIFIER_SERVICE,),
+        expected_recovery_dropins=expected_recovery_dropins,
+    )
     return _NotifierTransaction(
         install_user=install_user,
         install_uid=install_uid,
@@ -3054,6 +3215,7 @@ def notifier_install_transaction(
     start_service: bool = True,
     migrate_legacy_config: bool = True,
     watchdog_required: bool = False,
+    expected_recovery_dropins=None,
 ):
     """Installiert den Notifier und rollt bei einem Fehler exakt zurück.
 
@@ -3065,8 +3227,11 @@ def notifier_install_transaction(
 
     with exclusive_transaction_lock("notifier-install"):
         _recover_outer_transactions_locked()
+        if _remove_legacy_notifier_staging_residue():
+            print("[OK] Leeres Notifier-Transaktionsstaging aus Altbestand entfernt.")
         transaction = _capture_transaction(
             migrate_legacy_config=migrate_legacy_config,
+            expected_recovery_dropins=expected_recovery_dropins,
         )
         journal = _NotifierWatchdogJournal()
         tx_dir, record = journal.create(
@@ -3350,12 +3515,17 @@ def migrate_telegram_tokens() -> bool:
             return False
 
 
-def install_notifier(start_service: bool = True, migrate_legacy_config: bool = True) -> bool:
+def install_notifier(
+    start_service: bool = True,
+    migrate_legacy_config: bool = True,
+    expected_recovery_dropins=None,
+) -> bool:
     print("\n=== Benachrichtigungs-Dienst einrichten ===")
     try:
         with notifier_install_transaction(
             start_service=start_service,
             migrate_legacy_config=migrate_legacy_config,
+            expected_recovery_dropins=expected_recovery_dropins,
         ):
             pass
     except Exception as exc:

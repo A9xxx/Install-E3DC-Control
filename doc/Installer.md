@@ -1,10 +1,21 @@
 # E3DC-Control Installer
 
-Dokumentation Stand: 5.4.3l
+Dokumentation Stand: 5.4.3m
 
 Der Installer verwaltet Bare-Metal-Installation, Update, Rechte, Dienste,
 Backup, Rollback und optionale Produktmodule. Er ermittelt Benutzer, Home,
 Installationspfad und Python-Umgebung aus dem geprüften Installationskontext.
+
+Der Installer-Anteil von 5.4.3m erlaubt ausschließlich dem vollständig
+versiegelten nativen Ziel-Updater beim normalen vorwärtsgerichteten
+Releasewechsel, einen wirklich fehlenden Instanzrollenanker einmalig auf
+`off` zu projizieren. Die eingefrorene Rolle muss exakt `off` sein, und es
+darf kein HA-Peer konfiguriert sein. Die Erzeugung erfolgt erst nach
+Root-Receipt-gebundenem Transaktionsbackup, abgeschlossener gegebenenfalls
+nötiger Storage-Manager-Unit-Promotion und bestätigter Aktorruhe. Bootstrap,
+Reinstall und Rollback besitzen diese Autorität nicht. Vorhandene fremde oder
+widersprüchliche Anker sowie HA- und Shadow-Rollen bleiben fail-closed und
+werden nicht automatisch repariert.
 
 Der Web-Update-Launcher bleibt absichtlich clean-only und lehnt lokale
 Änderungen an getrackten Produktdateien vor dem Aufruf des Ziel-Updaters ab.

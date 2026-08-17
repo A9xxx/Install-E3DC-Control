@@ -55,7 +55,8 @@ RUN pip3 install --upgrade pip wheel setuptools && \
 RUN mkdir -p /app/pi/Install /var/www/html/tmp /var/www/html/logs /var/www/html/data /var/www/html/ramdisk && \
     install -d -o root -g root -m 0755 /etc/e3dc-control && \
     install -d -o root -g root -m 0700 /var/lib/e3dc-control/forecast-evidence && \
-    chown -R www-data:www-data /var/www/html
+    chown -R www-data:www-data /var/www/html && \
+    chmod 2775 /var/www/html/data
 
 # Pfad-Konfiguration für PHP (statisch, kennt die Container-Struktur)
 RUN echo '{"install_user": "root", "home_dir": "/app", "install_path": "/app/pi/Install", "venv_name": null, "venv_path": "/opt/venv"}' > /var/www/html/e3dc_paths.json && \

@@ -222,7 +222,11 @@ def begin_reservation(
         "started_ts": now,
         "lease_until_ts": now + lease_duration_s,
         "expires_ts": now + lease_duration_s,
-        "cooldown_until_ts": now + max(DEFAULT_COOLDOWN_S, _float(cooldown_s, DEFAULT_COOLDOWN_S)),
+        # Die Reservierung ist zunächst ausschließlich ein Budgetvertrag.
+        # Der elektromechanische Cooldown beginnt erst mit einem bestätigten
+        # ``send_phase``-Wire-Receipt, niemals bereits beim Warten auf den
+        # Storage-Grant.
+        "cooldown_until_ts": 0.0,
         "committed_ts": 0.0,
         "confirmed_ts": 0.0,
         "stable_since_ts": 0.0,
@@ -324,6 +328,82 @@ def grant_is_sufficient(reservation):
         item.get("active")
         and max(0, _int(item.get("granted_w"), 0)) >= max(1, _int(item.get("requested_w"), 0))
         and str(item.get("grant_state") or "") in ("granted", "committed")
+    )
+
+
+def bind_wire_cooldown(
+    state,
+    *,
+    reservation_id,
+    target_phases,
+    wire_receipt_ts,
+    cooldown_s=DEFAULT_COOLDOWN_S,
+):
+    """Bindet den Phasen-Cooldown an einen bestätigten Geräteausgang.
+
+    Ein Treiber-Rückgabewert ohne generationstreuen Wire-Receipt darf diese
+    Sperre nicht erzeugen. Der Vertrag verändert ausschließlich die aktive,
+    exakt passende Reservierung.
+    """
+
+    data = state if isinstance(state, dict) else {}
+    current = data.get(STATE_KEY)
+    reservation = dict(current) if isinstance(current, dict) else {}
+    rid = str(reservation_id or "")
+    current_id = str(
+        reservation.get("transition_id")
+        or reservation.get("reservation_id")
+        or ""
+    )
+    target = _int(target_phases, 0)
+    receipt_ts = _float(wire_receipt_ts, 0.0)
+    started_ts = _float(reservation.get("started_ts"), 0.0)
+    if not (
+        reservation.get("active") is True
+        and rid
+        and current_id == rid
+        and str(reservation.get("reservation_id") or "") == rid
+        and str(reservation.get("transition_id") or "") == rid
+        and target in (1, 3)
+        and _int(reservation.get("target_phases"), 0) == target
+        and math.isfinite(receipt_ts)
+        and receipt_ts > 0.0
+        and math.isfinite(started_ts)
+        and started_ts > 0.0
+        and receipt_ts >= started_ts
+    ):
+        return {}
+    reservation["cooldown_until_ts"] = receipt_ts + max(
+        DEFAULT_COOLDOWN_S,
+        _float(cooldown_s, DEFAULT_COOLDOWN_S),
+    )
+    reservation["cooldown_wire_receipt_ts"] = receipt_ts
+    reservation["cooldown_source"] = "confirmed_send_phase_wire_receipt"
+    data[STATE_KEY] = reservation
+    return deepcopy(reservation)
+
+
+def _reservation_output_bound(reservation):
+    """Erkennt jede Reservation mit möglicher oder bestätigter Ausgangskante."""
+
+    item = reservation if isinstance(reservation, dict) else {}
+    return bool(
+        _int(item.get("committed_w"), 0) > 0
+        or _float(item.get("committed_ts"), 0.0) > 0.0
+        or str(item.get("stage") or "")
+        in (
+            "request_output",
+            "phase_switch",
+            "ramp_to_zero",
+            "zero_settle",
+            "set_phase",
+            "cp_interrupt",
+            "restart_delay",
+            "cooldown",
+            "confirming",
+            "confirm_target",
+            "recovery_hold",
+        )
     )
 
 
@@ -462,12 +542,7 @@ def update_reservation(
         isinstance(lease_guard, dict)
         and lease_guard.get("fail_closed") is True
     )
-    output_bound = bool(
-        _int(reservation.get("committed_w"), 0) > 0
-        or _float(reservation.get("committed_ts"), 0.0) > 0.0
-        or str(reservation.get("stage") or "")
-        in ("request_output", "phase_switch", "cooldown", "confirming")
-    )
+    output_bound = _reservation_output_bound(reservation)
     if timebase_uncertain and output_bound:
         reservation.update({
             "active": True,
@@ -479,9 +554,7 @@ def update_reservation(
         data[STATE_KEY] = reservation
         return public_reservation(reservation, now)
     if lease_elapsed:
-        max_recovery_s = max(600.0, _float(reservation.get("cooldown_until_ts", 0.0) - lease, 600.0))
-        recovery_expired = bool(lease > 0.0 and now >= lease + max_recovery_s)
-        if output_bound and not recovery_expired:
+        if output_bound:
             reservation.update({
                 "active": True,
                 "stage": "recovery_hold",
@@ -1025,6 +1098,7 @@ def rehydrate_reservation(raw, *, now_ts=0.0, clock_sample=None):
     now = _float(now_ts, 0.0)
     lease = _float(item.get("lease_until_ts", item.get("expires_ts")), 0.0)
     cooldown = _float(item.get("cooldown_until_ts"), 0.0)
+    output_bound = _reservation_output_bound(item)
     raw_guard = item.get(LEASE_TIMEBASE_KEY)
     if isinstance(raw_guard, dict):
         lease_contract = reservation_lease_contract(
@@ -1035,7 +1109,11 @@ def rehydrate_reservation(raw, *, now_ts=0.0, clock_sample=None):
         guard = lease_contract.get("guard")
         if isinstance(guard, dict):
             item[LEASE_TIMEBASE_KEY] = guard
-        if lease_contract.get("expired") is True and cooldown <= now:
+        if (
+            lease_contract.get("expired") is True
+            and cooldown <= now
+            and not output_bound
+        ):
             return {}
         item["active"] = True
         item["stage"] = "recovery_hold"
@@ -1061,9 +1139,10 @@ def rehydrate_reservation(raw, *, now_ts=0.0, clock_sample=None):
         item["stage"] = "recovery_hold"
         item["blocker"] = "manager_restart_timebase_recovery"
         return item
-    if lease <= now and cooldown <= now:
+    if lease <= now and cooldown <= now and not output_bound:
         return {}
-    if item.get("active") and lease > now:
+    if item.get("active") and (lease > now or output_bound):
+        item["active"] = True
         item["stage"] = "recovery_hold"
         item["blocker"] = "manager_restart_recovery"
     return item
@@ -1224,7 +1303,8 @@ def explicit_inhibit_owner(evidence, *, status_valid=True):
 __all__ = [
     "ACTIVE_STAGES", "TERMINAL_STAGES", "STATE_KEY", "LEASE_TIMEBASE_KEY",
     "DISCONNECT_TIMEBASE_KEY", "STABLE_TIMEBASE_KEY", "aggregate_reservations",
-    "apply_grant", "arbitrate_grants", "begin_reservation", "grant_is_sufficient",
+    "apply_grant", "arbitrate_grants", "begin_reservation", "bind_wire_cooldown",
+    "grant_is_sufficient",
     "expiration_resolution_contract", "mark_committed", "planned_reservation_power_w", "public_reservation",
     "preoutput_supersession_evidence_contract", "preoutput_supersession_evidence_is_bound",
     "rehydrate_reservation", "reservation_lease_contract", "set_stage", "status_dimensions", "update_reservation",

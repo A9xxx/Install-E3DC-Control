@@ -859,7 +859,22 @@ if (isset($_POST['save_wb_status_ajax'])) {
         'emergency_flag' => $removeEmergency ? 'remove' : 'preserve',
     ];
     if (isset($newMode, $oldMode)) {
-        $txOptions['mode_transition'] = ['wb_id' => $wbId, 'new_mode' => $newMode, 'old_mode' => $oldMode];
+        $txOptions['mode_transition'] = [
+            'wb_id' => $wbId,
+            'new_mode' => $newMode,
+            'old_mode' => $oldMode,
+        ];
+        if ($newMode === '5' && $oldMode !== '5') {
+            // Der erweiterte Modus 5 bedeutet ausdrücklich „Sofort bis
+            // Preislimit“. Ein bloßes erneutes Speichern desselben Modus ist
+            // dagegen kein Re-arm; dafür existiert der bestätigte Simple-Submit.
+            $txOptions['mode_transition']['charge_intent'] = 'instant';
+            $txOptions['mode_transition']['energy_mode'] = 'grid_price';
+            $txOptions['mode_transition']['price_limit_ct'] = normalizeWallboxPriceLimitValue(
+                $confData['config']['dvcarlimit'] ?? '0.0',
+                0.0
+            );
+        }
     }
     $tx = e3dcWallboxPlanTransaction($updates, $txOptions);
     if (!empty($tx['success'])) {
@@ -940,7 +955,14 @@ if (isset($_POST['save_simple_wallbox_mode_ajax'])) {
     $tx = e3dcWallboxPlanTransaction($updates, [
         'operation' => $planHours === '0' ? 'clear' : 'plan',
         'abort_flag' => $planHours === '0' ? 'create' : 'remove',
-        'mode_transition' => ['wb_id' => $wbId, 'new_mode' => $newMode, 'old_mode' => $oldMode],
+        'mode_transition' => [
+            'wb_id' => $wbId,
+            'new_mode' => $newMode,
+            'old_mode' => $oldMode,
+            'charge_intent' => $chargeIntent,
+            'energy_mode' => $energyMode,
+            'price_limit_ct' => $priceLimit,
+        ],
     ]);
     if (!empty($tx['success'])) {
         echo "OK";
@@ -1038,7 +1060,14 @@ if (isset($_POST['save_simple_wallbox'])) {
         'operation' => $planHours === '0' && $smartEnabled !== '1' ? 'clear' : 'plan',
         'abort_flag' => $planHours === '0' && $smartEnabled !== '1' ? 'create' : 'remove',
         'manual_soc' => $manualSoc,
-        'mode_transition' => ['wb_id' => $wbId, 'new_mode' => $newMode, 'old_mode' => $oldMode],
+        'mode_transition' => [
+            'wb_id' => $wbId,
+            'new_mode' => $newMode,
+            'old_mode' => $oldMode,
+            'charge_intent' => $chargeIntent,
+            'energy_mode' => $energyMode,
+            'price_limit_ct' => $priceLimit,
+        ],
     ]);
     if (!empty($tx['success'])) {
         $message = successMessage('Ladeplan gespeichert. Die Wallbox-Regelung wird neu berechnet.');

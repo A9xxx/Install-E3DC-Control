@@ -6,6 +6,21 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.3m] – 2026-08-17
+
+### 🔐 Update- und Recovery-Vertrag
+
+- **Der normale Ziel-Updater darf einen wirklich fehlenden `off`-Anker einmalig erzeugen:** Die neue Autorität gilt ausschließlich beim vollständig versiegelten und über Git-Ancestry als echt vorwärtsgerichtet belegten Releasewechsel für einen eindeutig gebundenen Einzelknoten mit `ha_mode=off` und ohne konfigurierten HA-Peer. Bootstrap, Reinstall, Rollback und andere Aufrufpfade bleiben davon ausgeschlossen.
+- **Notifier-Drop-ins hinterlassen keine eigene Fremdfläche mehr:** Atomare Schreibvorgänge verwenden ihr privates Staging außerhalb des `*.service.d`-Verzeichnisses. Ein Altbestand wird nur dann migriert, wenn der verschachtelte Ordner stabil gebunden, root-eigen, exakt leer und frei von ACLs oder Attributen ist; jede Abweichung bleibt fail-closed.
+- **Optionale Units bleiben beim Startschutz eindeutig:** Bei einer nicht installierten optionalen Unit akzeptiert der Recoveryvertrag neben seinem eigenen Startschutz ausschließlich das byte- und metadatengenau geprüfte kanonische RAM-Disk-Drop-in. Weitere Namen oder Abweichungen sperren die Wiederherstellung weiterhin.
+- **Der Update-Sicherheitsbeleg bleibt über Prozessgrenzen eindeutig:** Nach verifiziertem Backup und vor der ersten Produktmutation persistiert der versiegelte Normalpfad einen txid-, ziel-, rollen-, backup-, bootblock- und servicegebundenen ausstehenden Beleg (`pending`) samt Marker und dynamischem `00`-Startschutz. `pending` bleibt fail-closed und ist kein Forward-Auto-Resume. Erst der vollständig bestätigte Ziel-, Dienst-, Gesundheits- und Bootvertrag wird dauerhaft `committed`; danach ist jeder Altstand-Rollback verboten und bei einem unterbrochenen Abschluss nur das exakt gebundene Cleanup eigener Reste zulässig. Ein äußerer oder späterer Cleanup-Pfad greift erst bei inaktiver Finalizer-Lease ein. Ältere, fremde, unvollständige oder nicht mehr eindeutig gebundene Recoveryflächen bleiben manuell zu prüfen und werden weder adoptiert noch einzeln entfernt.
+
+### 🚗 openWB Pro
+
+- **Die 480-Sekunden-Sperre beginnt erst am realen Phasenausgang:** Eine reine Budgetreservierung erzeugt keinen Cooldown. Die Sperre wird erst aus einem exakt generationgebundenen, bestätigten `send_phase`-Wire-Receipt abgeleitet und schützt ausschließlich vor einem weiteren Phasenwechsel.
+- **Ein Recovery-Hold überlebt Budgetmangel, Lease-Ablauf und Manager-Neustart:** Der Manager wertet die alte Ausgangsgeneration vor Supersession und vor dem Storage-Grant-Veto aus. Ein gestrandeter älterer 0-A-Intent darf ohne neuen Hardwarebefehl nur aus seinem eigenen Intent-/ACK-Paar und einem frischen post-intent 0-A-/0-W-Readback geschlossen werden.
+- **Ein neuer Sofortauftrag ist eine eigene Nutzerintention:** Der zentrale WebUI-Transaktionspfad übergibt einen typisierten, einmalig quittierten Modus-5-Auftrag an den Manager. Nur eine vollständig belegte 3/3-Startablehnung derselben aktuellen Stecksession wird für genau diesen neuen Auftrag zurückgesetzt. Preislimit, Nutzer-`Aus`, Not-Aus, Budget-, Reserve-, Phasen- und Hardwaregrenzen bleiben unverändert vorrangig.
+
 ## [5.4.3l] – 2026-08-16
 
 ### 🔄 Git-gebundener Update-Rückweg

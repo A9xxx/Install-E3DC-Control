@@ -118,7 +118,18 @@ Der Wallbox-Manager verwendet eine explizite Zustandsmaschine. Die Diagnose zeig
 | `ended` | Die Session ist fachlich beendet und bleibt bis zu einer benannten Freigabe gelatcht. |
 | `rscp_error` | Antwort oder Rücklesung ist ungültig; es wird kein Erfolg vorgetäuscht. |
 
-Ein Ladeende darf durch einen bewussten UI-Wechsel (`wallbox_php_limit_or_profile_change`) oder einen bestätigten Neustart des Fahrzeugs (`vehicle_self_restart`) freigegeben werden. Stromrampen, Start-/Stopflanken und Ladeende bleiben getrennte Verträge; Manager, Treiber und Diagnose geben denselben Zustand aus.
+Ein Ladeende darf grundsätzlich durch einen bewussten UI-Wechsel
+(`wallbox_php_limit_or_profile_change`) oder einen bestätigten Neustart des
+Fahrzeugs (`vehicle_self_restart`) freigegeben werden. Eine vollständig belegte
+3/3-Startablehnung der openWB Pro ist davon ausgenommen: Bloße Modus-, Limit-,
+Ziel-SoC- oder Profiländerungen erhalten ihren Latch und die Wake-up-Evidenz.
+Sie werden nur durch eine bestätigte neue Stecksession oder einen typisierten
+Modus-5-Nutzerauftrag gelöst, der bereits bei Annahme exakt an Boot,
+Stecksession, Konfigurationsstand, Preislimit und dieselbe persistierte
+Latchgeneration gebunden wurde. Andere, nicht vollständige
+Startablehnungs-/Ladeende-Latches behalten den bisherigen bewussten
+UI-Freigabevertrag. Stromrampen, Start-/Stopflanken und Ladeende bleiben
+getrennte Verträge; Manager, Treiber und Diagnose geben denselben Zustand aus.
 
 ## E3DC-native Regelvertrag
 
@@ -235,8 +246,16 @@ Pfad bewährt:
   Ziel (`phasetarget=1` oder `phasetarget=3`). Die Hardware der Pro übernimmt
   Schütz-Trennung und CP-Ablauf. Nach der kurzen sicheren 0-A-/CP-Beruhigung
   darf der Strom wieder anlaufen. Der persistente Schutz von mindestens
-  `480 s` sperrt ausschließlich einen weiteren Phasenwechsel; er blockiert
-  weder den bestätigten Wiederanlauf noch die laufende Stromregelung.
+  `480 s` beginnt erst mit dem bestätigten Wire-Receipt dieses realen
+  Phasenausgangs. Eine reine Budgetreservierung erzeugt keinen Cooldown. Die
+  Sperre schützt ausschließlich vor einem weiteren Phasenwechsel; sie
+  blockiert weder den bestätigten Wiederanlauf noch die laufende Stromregelung.
+* **Recovery vor neuem Budget:** Eine mögliche ältere Ausgangsgeneration wird
+  vor einem neuen Storage-Grant und vor jeder Supersession ausgewertet. Ein
+  gestrandeter 0-A-Intent darf nur anhand seines eigenen Intent-/ACK-Paars und
+  eines frischen, zeitlich nachfolgenden 0-A-/0-W-Gerätereadbacks geschlossen
+  werden. Dieser Recoverypfad sendet keinen neuen Hardwarebefehl. Mehrdeutige
+  oder fremde Generationen bleiben gesperrt.
 * **1-Phasen-Fallback:** Wenn die Pro oder das Fahrzeug nach einem
   3-phasigen Ziel nicht plausibel auf 3-phasig wechselt, behandelt das System
   die Session als 1-phasig. Das verhindert Endlosschleifen bei Fahrzeugen mit
@@ -254,6 +273,13 @@ Pfad bewährt:
   Parservertrag. Eine dauerhafte Startablehnung benötigt außerdem den
   typisierten Receipt der vollständig abgearbeiteten Episode. Stecksession,
   aktuelle Stromfreigabe und Zeitkette müssen exakt zusammenpassen.
+* **Bewusster neuer Sofortauftrag:** Ein erneuter WebUI-Auftrag für `Sofort bis
+  Preislimit` erhält eine eigene zufällige Kennung. Nur wenn dieselbe aktuelle
+  Stecksession eine vollständig belegte Startablehnung erreicht hat, darf der
+  Manager deren eigene Wake-up-Episode einmalig für diesen Nutzerauftrag neu
+  öffnen. Der Auftrag selbst sendet keinen Gerätebefehl und ändert kein
+  Budget. Preislimit, Nutzer-`Aus`, Not-Aus, Speicherreserve, Netzpunkt- und
+  Hardwaregrenzen bleiben danach unverändert vorrangig.
 
 ### openWB Software 2.x als Primary
 

@@ -97,6 +97,9 @@ PI_GUARD_PATH = "/usr/local/bin/pi_guard.sh"
 PIGUARD_SERVICE = "/etc/systemd/system/piguard.service"
 WATCHDOG_UPDATE_PAUSE_FILE = "/var/www/html/ramdisk/watchdog.update_pause"
 WALLBOX_PLAN_JOB_ROOT = "/var/www/html/data/.wallbox_plan_jobs"
+WALLBOX_MODE5_USER_START_REQUEST_FILE = (
+    "/var/www/html/data/wallbox_mode5_user_start_request.json"
+)
 HA_MANAGED_SERVICES = (
     "e3dc", "e3dc-live", "e3dc-storage-manager", "e3dc-storage-simulator",
     "e3dc-epex-manager", "e3dc-weather-manager", "e3dc-forecast-evidence", "e3dc-wallbox-manager",
@@ -354,8 +357,11 @@ YELLOW = '\033[93m'
 RESET = '\033[0m'
 
 
-def refresh_watchdog_guard_script():
+def refresh_watchdog_guard_script(*, start_service=True):
     """Aktualisiert das installierte piguard-Skript, ohne neue Nutzerkonfiguration zu erfinden."""
+    if not isinstance(start_service, bool):
+        print(f"{RED}[!]{RESET} Watchdog-Startmodus ist nicht eindeutig.")
+        return False
     if not (os.path.exists(PI_GUARD_PATH) or os.path.exists(PIGUARD_SERVICE)):
         return True
     try:
@@ -371,9 +377,14 @@ def refresh_watchdog_guard_script():
             log_warning("permissions", "Watchdog-Skript nicht verändert: keine Router-IP konfiguriert.")
             return False
         monitor_file = current.get("MONITOR_FILE") or ""
-        if create_pi_guard(router_ip, monitor_file) is not True:
+        if create_pi_guard(
+            router_ip,
+            monitor_file,
+            start_service=start_service,
+        ) is not True:
             raise RuntimeError("Watchdog-Bundle-Transaktion meldet keinen Erfolg")
-        print(f"{GREEN}[OK]{RESET} Watchdog-Skript aktualisiert.")
+        suffix = " und inaktiv gehalten" if not start_service else ""
+        print(f"{GREEN}[OK]{RESET} Watchdog-Skript aktualisiert{suffix}.")
         return True
     except Exception as exc:
         print(f"{RED}[!]{RESET} Watchdog-Skript konnte nicht aktualisiert werden: {exc}")
@@ -869,6 +880,112 @@ def _private_wallbox_plan_job_issues(storage_path=WALLBOX_PLAN_JOB_ROOT):
         if stat.S_IMODE(metadata.st_mode) != expected_mode:
             findings.add("mode")
     return findings
+
+
+def _mode5_user_start_request_nodes_safe(path, *, legacy_parent=False):
+    """Prüft Parent, Request und Lock ohne irgendeine Zielnormalisierung."""
+
+    try:
+        account = pwd.getpwnam("www-data")
+        group = grp.getgrnam("www-data")
+        manager = pwd.getpwnam(INSTALL_USER)
+        allowed_parent_uids = {int(account.pw_uid), int(manager.pw_uid)}
+        parent = os.lstat(os.path.dirname(path))
+        parent_mode = stat.S_IMODE(parent.st_mode)
+        if (
+            stat.S_ISLNK(parent.st_mode)
+            or not stat.S_ISDIR(parent.st_mode)
+            or bool(parent_mode & 0o002)
+            or parent.st_uid not in allowed_parent_uids
+            or parent.st_gid != int(group.gr_gid)
+            or (
+                parent_mode != 0o775
+                if legacy_parent
+                else parent_mode != 0o2775
+            )
+        ):
+            return False
+        contracts = (
+            (path, {int(account.pw_uid)}, True),
+            (
+                path + ".lock",
+                {0, int(account.pw_uid), int(manager.pw_uid)},
+                False,
+            ),
+        )
+        for target, allowed_uids, payload_file in contracts:
+            if not os.path.lexists(target):
+                continue
+            metadata = os.lstat(target)
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or stat.S_IMODE(metadata.st_mode) != 0o660
+                or metadata.st_uid not in allowed_uids
+                or metadata.st_gid != int(group.gr_gid)
+                or metadata.st_size > 65536
+                or (payload_file and metadata.st_size < 1)
+            ):
+                return False
+        return True
+    except (KeyError, OSError, TypeError, ValueError):
+        return False
+
+
+def _mode5_user_start_request_surface_safe(
+    path=WALLBOX_MODE5_USER_START_REQUEST_FILE,
+):
+    """Prüft die PHP-eigene Modus-5-Anforderung ohne Reparaturversuch."""
+
+    return _mode5_user_start_request_nodes_safe(path, legacy_parent=False)
+
+
+def _repair_mode5_user_start_legacy_parent(
+    path=WALLBOX_MODE5_USER_START_REQUEST_FILE,
+):
+    """Hebt ausschließlich den bekannten 0775-Parent descriptorgebunden an."""
+
+    if _mode5_user_start_request_surface_safe(path):
+        return True
+    if not _mode5_user_start_request_nodes_safe(path, legacy_parent=True):
+        return False
+    directory = os.path.dirname(path)
+    descriptor = None
+    try:
+        before = os.lstat(directory)
+        group = grp.getgrnam("www-data")
+        account = pwd.getpwnam("www-data")
+        manager = pwd.getpwnam(INSTALL_USER)
+        allowed_parent_uids = {int(account.pw_uid), int(manager.pw_uid)}
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(directory, flags)
+        current = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(current.st_mode)
+            or (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino)
+            or current.st_uid not in allowed_parent_uids
+            or current.st_gid != int(group.gr_gid)
+            or stat.S_IMODE(current.st_mode) != 0o775
+        ):
+            return False
+        os.fchmod(descriptor, 0o2775)
+        changed = os.fstat(descriptor)
+        named = os.lstat(directory)
+        if (
+            stat.S_IMODE(changed.st_mode) != 0o2775
+            or (named.st_dev, named.st_ino) != (changed.st_dev, changed.st_ino)
+            or named.st_uid not in allowed_parent_uids
+            or stat.S_IMODE(named.st_mode) != 0o2775
+        ):
+            return False
+    except (KeyError, OSError, TypeError, ValueError):
+        return False
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    return _mode5_user_start_request_surface_safe(path)
 
 
 def check_webportal_permissions(include_service_checks=True):
@@ -1655,6 +1772,8 @@ def fix_webportal_permissions(issues):
     wp_path = "/var/www/html"
     matter_storage = f"{wp_path}/data/matter-storage"
     wallbox_plan_jobs = WALLBOX_PLAN_JOB_ROOT
+    mode5_request = WALLBOX_MODE5_USER_START_REQUEST_FILE
+    mode5_request_lock = mode5_request + ".lock"
     v4_json_path = f"{wp_path}/data/e3dc_v4.json"
     config_backup_dir = f"{wp_path}/data/config_backups"
     if "wp_unsafe" in issues:
@@ -1688,6 +1807,12 @@ def fix_webportal_permissions(issues):
         print(
             f"{RED}✗{RESET} Unsichere Webverzeichnis-Namen werden nicht "
             "automatisch dereferenziert: " + ", ".join(unsafe_web_directories)
+        )
+        return False
+    if not _repair_mode5_user_start_legacy_parent(mode5_request):
+        print(
+            f"{RED}✗{RESET} Persistente Modus-5-Anforderungsfläche ist "
+            "unsicher; keine Webportal-Reparatur ausgeführt."
         )
         return False
     if not _ensure_install_user_www_data_group():
@@ -1872,7 +1997,8 @@ def fix_webportal_permissions(issues):
         print(f"  → Setze Datenbank-Verzeichnis Besitzer: {wp_path}/data -> {INSTALL_USER}:www-data")
         run_command(
             f"sudo find -P {wp_path}/data "
-            f"\\( -path {matter_storage} -o -path {wallbox_plan_jobs} \\) -prune -o "
+            f"\\( -path {matter_storage} -o -path {wallbox_plan_jobs} "
+            f"-o -path {mode5_request} -o -path {mode5_request_lock} \\) -prune -o "
             f"\\( -type d -o -type f \\) -exec chown {INSTALL_USER}:www-data {{}} +"
         )
     if "data_missing" in issues or "data_mode" in issues:
@@ -1970,6 +2096,12 @@ def fix_webportal_permissions(issues):
         )
         success = False
 
+    if not _mode5_user_start_request_surface_safe(mode5_request):
+        print(
+            f"{RED}✗{RESET} Persistente Modus-5-Anforderungsfläche "
+            "wechselte während der Webportal-Reparatur."
+        )
+        success = False
     return success
 
 

@@ -12,6 +12,17 @@ export E3DC_INSTALL_PATH="/absoluter/pfad/zur/installation"
 test -f "$E3DC_INSTALL_PATH/e3dc-setup"
 ```
 
+## Rollenanker-Grenze in 5.4.3m
+
+5.4.3m erweitert ausschließlich den normalen vorwärtsgerichteten,
+vollständig versiegelten Ziel-Updater: Ein wirklich fehlender Rollenanker darf
+für den exakt gebundenen `off`-Einzelknoten ohne konfigurierten Peer erst nach
+Root-Receipt-gebundenem Backup, abgeschlossener gegebenenfalls nötiger
+Storage-Manager-Unit-Promotion und Aktorruhe einmalig erzeugt werden. Rollback
+und Reinstall besitzen diese Autorität ausdrücklich nicht. Vorhandene fremde
+oder widersprüchliche Anker sowie HA- und Shadow-Rollen bleiben gesperrt und
+werden nicht repariert.
+
 ## Updateeigener Rückweg in 5.4.3l
 
 Der in 5.4.3l ergänzte Byte- und Modivertrag gehört ausschließlich zum
@@ -37,7 +48,7 @@ oder einen Prozessabbruch außerhalb des erkannten Fehlerpfads.
 
 ## Programmstand zurücksetzen
 
-Der aktuelle Stable-Stand `v5.4.3l` führt den gebundenen Rückfallvertrag fort.
+Der aktuelle Stable-Stand `v5.4.3m` führt den gebundenen Rückfallvertrag fort.
 
 Beim Rücklauf wird der tatsächliche Dateisystemzustand einer Unit weiterhin
 streng gegen reguläre Unit-Datei, kanonische `/dev/null`-Maske, unerwarteten

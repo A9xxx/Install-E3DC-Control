@@ -1719,7 +1719,11 @@ def _install_forecast_evidence_service_compat(
     )
     return result is True
 
-def install_epex_service(start_services=True, include_websocket=False):
+def install_epex_service(
+    start_services=True,
+    include_websocket=False,
+    expected_recovery_dropins=None,
+):
     print("Installiere E3DC-Control Kern-Manager Services...")
     from .utils import (
         _approved_storage_manager_unit_payloads,
@@ -1772,10 +1776,18 @@ def install_epex_service(start_services=True, include_websocket=False):
         service_names.append("e3dc-forecast-evidence")
     if include_websocket:
         service_names.append("e3dc-websocket")
+    expected_recovery_dropins = {
+        unit: contract
+        for unit, contract in dict(expected_recovery_dropins or {}).items()
+        if unit.removesuffix(".service") in service_names
+    }
 
     try:
         storage_unit_migrated = _migrate_approved_storage_manager_unit_owner(
             _approved_storage_manager_unit_payloads(),
+            expected_recovery_dropins=dict(expected_recovery_dropins or {}).get(
+                "e3dc-storage-manager.service"
+            ),
         )
         if storage_unit_migrated:
             print(
@@ -1790,7 +1802,10 @@ def install_epex_service(start_services=True, include_websocket=False):
         return False
 
     try:
-        service_snapshot = capture_systemd_service_bundle(service_names)
+        service_snapshot = capture_systemd_service_bundle(
+            service_names,
+            expected_recovery_dropins=expected_recovery_dropins,
+        )
     except Exception as exc:
         print(f"  [!] Bestehender Kerndienstzustand ist nicht sicher gebunden: {exc}")
         return False

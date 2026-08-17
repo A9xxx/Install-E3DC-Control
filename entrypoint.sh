@@ -216,13 +216,120 @@ fi
 MATTER_DIR="/app/pi/Install/Installer/matter"
 MATTER_STORAGE="/var/www/html/data/matter-storage"
 MATTER_STORAGE_GUARD="/usr/local/bin/e3dc-docker-matter-storage-guard"
+MODE5_USER_START_REQUEST="/var/www/html/data/wallbox_mode5_user_start_request.json"
+MODE5_USER_START_LOCK="${MODE5_USER_START_REQUEST}.lock"
+
+mode5_user_start_surface_action() {
+    local target="$MODE5_USER_START_REQUEST"
+    local action="${1:-verify}"
+    /usr/bin/python3 -I -B - "$target" "$action" <<'PY'
+import grp
+import os
+import pwd
+import stat
+import sys
+
+target = sys.argv[1]
+action = sys.argv[2]
+parent_path = os.path.dirname(target)
+try:
+    web = pwd.getpwnam("www-data")
+    group = grp.getgrnam("www-data")
+    allowed_parent_uids = {0, int(web.pw_uid)}
+    parent = os.lstat(parent_path)
+    parent_mode = stat.S_IMODE(parent.st_mode)
+    base_parent_safe = bool(
+        not stat.S_ISLNK(parent.st_mode)
+        and stat.S_ISDIR(parent.st_mode)
+        and not bool(parent_mode & 0o002)
+        and parent.st_uid in allowed_parent_uids
+        and parent.st_gid == int(group.gr_gid)
+    )
+    strict_parent = base_parent_safe and parent_mode == 0o2775
+    legacy_parent = base_parent_safe and parent_mode == 0o775
+    contracts = (
+        (target, {int(web.pw_uid)}, True),
+        (target + ".lock", {0, int(web.pw_uid)}, False),
+    )
+    nodes_safe = True
+    for path, allowed_uids, payload_file in contracts:
+        if not os.path.lexists(path):
+            continue
+        metadata = os.lstat(path)
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o660
+            or metadata.st_uid not in allowed_uids
+            or metadata.st_gid != int(group.gr_gid)
+            or metadata.st_size > 65536
+            or (payload_file and metadata.st_size < 1)
+        ):
+            nodes_safe = False
+            break
+    if action == "verify":
+        raise SystemExit(0 if strict_parent and nodes_safe else 1)
+    if action != "repair-legacy" or not legacy_parent or not nodes_safe:
+        raise SystemExit(1)
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(parent_path, flags)
+    try:
+        current = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(current.st_mode)
+            or (current.st_dev, current.st_ino) != (parent.st_dev, parent.st_ino)
+            or current.st_uid not in allowed_parent_uids
+            or current.st_gid != int(group.gr_gid)
+            or stat.S_IMODE(current.st_mode) != 0o775
+        ):
+            raise SystemExit(1)
+        os.fchmod(descriptor, 0o2775)
+        changed = os.fstat(descriptor)
+        named = os.lstat(parent_path)
+        if (
+            stat.S_IMODE(changed.st_mode) != 0o2775
+            or (named.st_dev, named.st_ino) != (changed.st_dev, changed.st_ino)
+            or named.st_uid not in allowed_parent_uids
+            or stat.S_IMODE(named.st_mode) != 0o2775
+        ):
+            raise SystemExit(1)
+    finally:
+        os.close(descriptor)
+    raise SystemExit(0)
+except (KeyError, OSError, TypeError, ValueError):
+    raise SystemExit(1)
+PY
+}
+
+mode5_user_start_surface_is_safe() {
+    mode5_user_start_surface_action verify
+}
+
+mode5_user_start_repair_legacy_parent() {
+    mode5_user_start_surface_action repair-legacy
+}
+
+if ! mode5_user_start_surface_is_safe; then
+    if ! mode5_user_start_repair_legacy_parent \
+        || ! mode5_user_start_surface_is_safe; then
+        echo "-> FEHLER: Persistente Modus-5-Anforderungsfläche ist unsicher; keine Datenrechte geändert."
+        exit 1
+    fi
+fi
 
 # Rechte des persistenten Daten-Ordners korrigieren
 find -P /var/www/html/data -xdev \
-    -path "$MATTER_STORAGE" -prune -o \
+    \( -path "$MATTER_STORAGE" -o -path "$MODE5_USER_START_REQUEST" \
+       -o -path "$MODE5_USER_START_LOCK" \) -prune -o \
     \( -type d -o -type f \) \
     -exec chown -h www-data:www-data -- {} +
 chmod 2775 /var/www/html/data
+if ! mode5_user_start_surface_is_safe; then
+    echo "-> FEHLER: Persistente Modus-5-Anforderungsfläche wechselte während der Datenrechteprüfung."
+    exit 1
+fi
 if [ ! -f "$MATTER_STORAGE_GUARD" ]; then
     echo "-> FEHLER: Descriptorprüfer für Matter-Storage fehlt."
     exit 1

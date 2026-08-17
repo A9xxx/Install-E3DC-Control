@@ -108,6 +108,15 @@ RECOVERY_BOOTBLOCK_DROPIN_PAYLOAD = (
     f"ConditionPathExists=!{RECOVERY_BOOTBLOCK_MARKER}\n"
 ).encode("utf-8")
 RECOVERY_BOOTBLOCK_TRANSACTION_RE = re.compile(r"[0-9a-f]{64}\Z")
+UPDATE_SAFETY_RECEIPT_SCHEMA = "e3dc_update_safety_v1"
+UPDATE_SAFETY_RECEIPT_NAME = "transaction.json"
+UPDATE_FINALIZER_UNIT_PREFIX = "e3dc-update-finalizer-"
+UPDATE_FINALIZER_RUNTIME_SUFFIX = "-runtime"
+UPDATE_FINALIZER_TOKEN_NAME = "start.token"
+UPDATE_FINALIZER_RUNTIME_MAX_S = 35 * 60
+UPDATE_FINALIZER_TIMEOUT_STOP_S = 15
+UPDATE_FINALIZER_TERMINAL_STABLE_READS = 3
+UPDATE_FINALIZER_TERMINAL_STABLE_INTERVAL_S = 0.2
 
 FULL_COMMIT_RE = re.compile(r"[0-9a-f]{40}\Z")
 PACKAGE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.+-]*\Z")
@@ -582,6 +591,42 @@ class RecoveryBootblockArmError(RuntimeError):
         super().__init__(message)
 
 
+class UpdateSafetyPostCommitError(RuntimeError):
+    """Der Zielstand ist committed; ein Altstand-Rollback ist verboten."""
+
+
+class UpdateSafetyManagedServiceUnquiescedError(RuntimeError):
+    """Finalizer-/Receipt-/Writer-Endgate ist unbewiesen; Recovery ist verboten."""
+
+
+@dataclass(frozen=True)
+class UpdateSafetyContract:
+    """Persistenter Vertrag des normalen versiegelten Ziel-Updaters."""
+
+    schema: str
+    state: str
+    transaction_id: str
+    target_commit: str
+    target_tag: str
+    role: str
+    backup_dir: str
+    backup_dev: int
+    backup_ino: int
+    backup_id: str
+    backup_manifest_sha256: str
+    units: tuple[str, ...]
+    created_directories: tuple[str, ...]
+    dropin_identities: tuple[tuple[str, int, int], ...]
+    dropin_payload_sha256: str
+    finalizer_unit: str
+    runtime_directory: str
+    token_path: str
+    receipt_path: str
+    receipt_dev: int
+    receipt_ino: int
+    receipt_sha256: str
+
+
 @dataclass(frozen=True)
 class RecoveryTransitionResult:
     recovered: bool
@@ -678,6 +723,7 @@ def _run_streaming_argv(
     timeout: int | None,
     env=None,
     pass_fds=(),
+    stdin_fd: int | None = None,
     heartbeat_s: int = TARGET_PROCESS_HEARTBEAT_S,
     label: str = "Prozess",
 ) -> dict:
@@ -693,6 +739,8 @@ def _run_streaming_argv(
     inherited_fds = tuple(int(item) for item in pass_fds)
     if any(item < 3 for item in inherited_fds):
         raise ValueError("Vererbte Dateideskriptoren sind unzulässig")
+    if stdin_fd is not None and int(stdin_fd) < 3:
+        raise ValueError("stdin-Dateideskriptor ist unzulässig")
 
     signal_guard = _TerminalSignalGuard()
     signal_guard.install()
@@ -706,6 +754,7 @@ def _run_streaming_argv(
             errors="replace",
             bufsize=1,
             env=env,
+            stdin=(int(stdin_fd) if stdin_fd is not None else None),
             start_new_session=os.name == "posix",
             pass_fds=inherited_fds,
         )
@@ -1349,6 +1398,7 @@ INSTALL_CENTER_CORE_SERVICES = (
 
 PIGUARD_UNIT = "piguard.service"
 PIGUARD_FRAGMENT_PATH = "/etc/systemd/system/piguard.service"
+PIGUARD_EXECUTABLE_PATH = "/usr/local/bin/pi_guard.sh"
 
 
 def _recovery_bootblock_units() -> tuple[str, ...]:
@@ -1680,11 +1730,173 @@ def _validate_partial_recovery_bootblock_contract(
     return identities
 
 
+def _assert_no_same_transaction_finalizer_processes(
+    contract: UpdateSafetyContract,
+) -> None:
+    """Beweist für committed Cleanup null Prozesse derselben Finalizer-Lease."""
+
+    unit_needle = contract.finalizer_unit.encode("ascii")
+    transaction_needle = contract.transaction_id.encode("ascii")
+    findings = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdecimal() or int(entry) == os.getpid():
+            continue
+        try:
+            raw = Path(f"/proc/{entry}/cmdline").read_bytes()
+            cgroup = Path(f"/proc/{entry}/cgroup").read_bytes()
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except PermissionError as exc:
+            raise RuntimeError(
+                f"Same-tx-Prozess {entry} ist beim committed Cleanup nicht lesbar"
+            ) from exc
+        argv = tuple(raw.rstrip(b"\0").split(b"\0")) if raw else ()
+        transaction_marked = any(
+            value == transaction_needle
+            and index > 0
+            and argv[index - 1] == b"--update-safety-transaction"
+            for index, value in enumerate(argv)
+        )
+        if (
+            any(unit_needle in value for value in argv)
+            or transaction_marked
+            or (b"/" + unit_needle) in cgroup
+        ):
+            findings.append(int(entry))
+    if findings:
+        raise RuntimeError(
+            "Committed Finalizer-Lease besitzt noch same-tx-Prozesse: "
+            + ",".join(str(pid) for pid in sorted(findings))
+        )
+
+
+def _assert_committed_finalizer_lease_inactive(
+    contract: UpdateSafetyContract,
+) -> None:
+    """Bindet eine vollständig inaktive oder bereits entladene transiente Lease."""
+
+    properties = (
+        "Id",
+        "LoadState",
+        "ActiveState",
+        "SubState",
+        "MainPID",
+        "ControlGroup",
+        "FragmentPath",
+        "DropInPaths",
+        "Transient",
+        "RuntimeDirectory",
+    )
+    result = _run_argv(
+        [
+            "systemctl",
+            "show",
+            "--no-pager",
+            *(f"--property={name}" for name in properties),
+            contract.finalizer_unit,
+        ],
+        timeout=15,
+        env={**os.environ, "LC_ALL": "C", "LANG": "C"},
+    )
+    values = {}
+    for line in str(result.get("stdout") or "").splitlines():
+        key, separator, value = line.partition("=")
+        if separator != "=" or key not in properties or key in values:
+            values = {}
+            break
+        values[key] = value
+    if (
+        not result.get("success")
+        or result.get("timed_out")
+        or int(result.get("returncode", -1)) != 0
+        or str(result.get("stderr") or "")
+        or set(values) != set(properties)
+        or values.get("Id") != contract.finalizer_unit
+        or values.get("ActiveState") != "inactive"
+        or values.get("SubState") != "dead"
+        or values.get("MainPID") != "0"
+        or values.get("DropInPaths") != ""
+    ):
+        raise RuntimeError("Committed Finalizer-Lease ist nicht eindeutig inaktiv")
+
+    load_state = values.get("LoadState")
+    fragment = values.get("FragmentPath", "")
+    control_group = values.get("ControlGroup", "")
+    if load_state == "not-found":
+        if (
+            fragment
+            or control_group
+            or values.get("Transient") != "no"
+            or values.get("RuntimeDirectory")
+        ):
+            raise RuntimeError("Entladene committed Finalizer-Lease besitzt Residuen")
+    elif load_state == "loaded":
+        expected_fragment = f"/run/systemd/transient/{contract.finalizer_unit}"
+        if (
+            fragment != expected_fragment
+            or values.get("Transient") != "yes"
+            or values.get("RuntimeDirectory") != contract.runtime_directory
+            or (
+                control_group
+                and not control_group.endswith("/" + contract.finalizer_unit)
+            )
+        ):
+            raise RuntimeError("Geladene committed Finalizer-Lease driftete")
+        fragment_metadata = os.lstat(expected_fragment)
+        if (
+            not stat.S_ISREG(fragment_metadata.st_mode)
+            or fragment_metadata.st_nlink != 1
+            or fragment_metadata.st_uid != 0
+            or fragment_metadata.st_gid != 0
+            or fragment_metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            raise RuntimeError("Transiente committed Unitdatei ist unsicher")
+    else:
+        raise RuntimeError(
+            f"Committed Finalizer-Lease besitzt LoadState {load_state!r}"
+        )
+
+    if control_group:
+        cgroup_path = Path("/sys/fs/cgroup") / control_group.lstrip("/")
+        try:
+            processes = (cgroup_path / "cgroup.procs").read_text(
+                encoding="ascii"
+            )
+        except FileNotFoundError:
+            processes = ""
+        except (OSError, UnicodeError) as exc:
+            raise RuntimeError("Committed Finalizer-cgroup ist nicht lesbar") from exc
+        if processes.strip():
+            raise RuntimeError("Committed Finalizer-cgroup besitzt noch Prozesse")
+
+
+def _finish_committed_update_safety_residue_if_safe() -> bool:
+    """Räumt nur vollständig gebundene committed Residuen vor einem neuen Lauf."""
+
+    residue = _read_update_safety_contract(allow_missing=True)
+    if residue is None or residue.state != "committed":
+        return False
+    _assert_committed_finalizer_lease_inactive(residue)
+    if os.path.lexists(f"/run/{residue.runtime_directory}") or os.path.lexists(
+        residue.token_path
+    ):
+        raise RuntimeError("Committed Finalizer-Runtime/Token ist noch vorhanden")
+    _assert_no_same_transaction_finalizer_processes(residue)
+    _finish_committed_update_safety_cleanup(
+        residue,
+        remove_receipt=True,
+    )
+    if _read_update_safety_contract(allow_missing=True) is not None:
+        raise RuntimeError("Committed Update-Sicherheitsreceipt blieb nach Cleanup")
+    return True
+
+
 def _assert_no_existing_recovery_bootblock() -> None:
     """Blockiert einen neuen Updatepfad bei jedem fremden/stalen Recovery-Gate."""
 
     if not hasattr(os, "geteuid") or os.geteuid() != 0:
         raise RuntimeError("Recovery-Bootblock-Preflight darf ausschließlich Root ausführen")
+    _finish_committed_update_safety_residue_if_safe()
     var_lib_descriptor = _open_directory_nofollow("/var/lib")
     try:
         _require_root_controlled_directory(var_lib_descriptor, "/var/lib")
@@ -1777,9 +1989,20 @@ def _assert_no_existing_recovery_bootblock() -> None:
     finally:
         os.close(systemd_descriptor)
 
+    residue = _read_update_safety_contract(allow_missing=True)
+    if residue is not None:
+        raise RuntimeError(
+            "Pending oder unvollständig bereinigtes Update-Sicherheitsreceipt "
+            "verlangt eine manuelle fail-closed Prüfung"
+        )
 
-def _assert_exclusive_not_found_recovery_dropin(unit: str) -> None:
-    """Bindet bei fehlendem Fragment die vollständige On-Disk-Drop-in-Fläche."""
+
+def _assert_exclusive_not_found_recovery_dropin(
+    unit: str,
+    *,
+    expected_payload: bytes = RECOVERY_BOOTBLOCK_DROPIN_PAYLOAD,
+) -> None:
+    """Bindet bei fehlendem Fragment nur Recovery- und kanonisches RAM-Disk-Drop-in."""
 
     systemd_descriptor = _open_directory_nofollow("/etc/systemd/system")
     directory_descriptor = None
@@ -1825,8 +2048,18 @@ def _assert_exclusive_not_found_recovery_dropin(unit: str) -> None:
             raise RuntimeError(
                 f"Recovery-Bootblock-Pfad driftete bei not-found: {unit}"
             )
-        entries = os.listdir(directory_descriptor)
-        if entries != [RECOVERY_BOOTBLOCK_DROPIN_NAME]:
+        from .ramdisk_guard import (
+            RAMDISK_DROPIN_NAME,
+            render_ramdisk_service_dropin,
+        )
+
+        entries = tuple(os.listdir(directory_descriptor))
+        entry_names = set(entries)
+        allowed_shapes = (
+            {RECOVERY_BOOTBLOCK_DROPIN_NAME},
+            {RECOVERY_BOOTBLOCK_DROPIN_NAME, RAMDISK_DROPIN_NAME},
+        )
+        if len(entries) != len(entry_names) or entry_names not in allowed_shapes:
             raise RuntimeError(
                 "Fehlende systemd-Unit besitzt eine fremde On-Disk-Drop-in-Fläche: "
                 f"{unit}"
@@ -1834,9 +2067,20 @@ def _assert_exclusive_not_found_recovery_dropin(unit: str) -> None:
         _read_exact_root_file_at(
             directory_descriptor,
             RECOVERY_BOOTBLOCK_DROPIN_NAME,
-            RECOVERY_BOOTBLOCK_DROPIN_PAYLOAD,
+            bytes(expected_payload),
             0o644,
         )
+        if RAMDISK_DROPIN_NAME in entry_names:
+            _read_exact_root_file_at(
+                directory_descriptor,
+                RAMDISK_DROPIN_NAME,
+                render_ramdisk_service_dropin().encode("utf-8"),
+                0o644,
+            )
+        if set(os.listdir(directory_descriptor)) != entry_names:
+            raise RuntimeError(
+                f"Recovery-Bootblock-Pfad driftete beim not-found-Readback: {unit}"
+            )
     except FileNotFoundError as exc:
         raise RuntimeError(
             f"Recovery-Bootblock-Pfad fehlt bei not-found: {unit}"
@@ -2456,6 +2700,1281 @@ def _remove_persistent_recovery_bootblock(
     _reload_and_verify_recovery_dropins(contract.units, expected_present=False)
 
 
+def _update_safety_names(transaction_id: str) -> tuple[str, str, str]:
+    """Leitet Unit, RuntimeDirectory und Token ausschließlich aus der txid ab."""
+
+    value = str(transaction_id or "")
+    if not RECOVERY_BOOTBLOCK_TRANSACTION_RE.fullmatch(value):
+        raise RuntimeError("Update-Sicherheitsvertrag besitzt keine gültige Transaktions-ID")
+    unit = f"{UPDATE_FINALIZER_UNIT_PREFIX}{value}.service"
+    runtime = f"{UPDATE_FINALIZER_UNIT_PREFIX}{value}{UPDATE_FINALIZER_RUNTIME_SUFFIX}"
+    token = f"/run/{runtime}/{UPDATE_FINALIZER_TOKEN_NAME}"
+    return unit, runtime, token
+
+
+def _render_update_safety_dropin(transaction_id: str) -> bytes:
+    """Erzeugt das marker-/lease-gebundene Startgate für genau eine Transaktion."""
+
+    unit, _runtime, token = _update_safety_names(transaction_id)
+    return (
+        "# E3DC_UPDATE_SAFETY_V1\n"
+        "[Unit]\n"
+        f"BindsTo={unit}\n"
+        f"After={unit}\n"
+        f"ConditionPathExists=|!{RECOVERY_BOOTBLOCK_MARKER}\n"
+        f"ConditionPathExists=|{token}\n"
+    ).encode("utf-8")
+
+
+def _read_bound_root_file_at(
+    parent_descriptor: int,
+    name: str,
+    *,
+    maximum: int,
+    mode: int,
+    allow_missing: bool = False,
+) -> tuple[bytes, os.stat_result] | None:
+    """Liest eine variable root:root-Datei descriptor- und inodegebunden."""
+
+    try:
+        before = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        if allow_missing:
+            return None
+        raise
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+        or before.st_uid != 0
+        or before.st_gid != 0
+        or stat.S_IMODE(before.st_mode) != mode
+        or before.st_size < 1
+        or before.st_size > int(maximum)
+    ):
+        raise RuntimeError(f"Root-Dateivertrag ist unsicher: {name}")
+    descriptor = os.open(
+        name,
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0),
+        dir_fd=parent_descriptor,
+    )
+    try:
+        opened = os.fstat(descriptor)
+        signature = _file_identity(opened)
+        if signature != _file_identity(before) or _repo_descriptor_has_unsafe_xattrs(descriptor):
+            raise RuntimeError(f"Root-Dateivertrag driftete beim Öffnen: {name}")
+        payload = bytearray()
+        while len(payload) <= int(maximum):
+            block = os.read(descriptor, min(64 * 1024, int(maximum) + 1 - len(payload)))
+            if not block:
+                break
+            payload.extend(block)
+        after = os.fstat(descriptor)
+        named_after = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if (
+            len(payload) > int(maximum)
+            or signature != _file_identity(after)
+            or signature != _file_identity(named_after)
+        ):
+            raise RuntimeError(f"Root-Dateivertrag driftete beim Lesen: {name}")
+        return bytes(payload), after
+    finally:
+        os.close(descriptor)
+
+
+def _create_owned_exact_root_file_at(
+    parent_descriptor: int,
+    name: str,
+    payload: bytes,
+    mode: int,
+) -> os.stat_result:
+    """Installiert einen neuen Namen atomar; vorhandene Namen werden nie adoptiert."""
+
+    temporary_name = f".e3dc-update-safety-{os.getpid()}-{secrets.token_hex(12)}"
+    descriptor = None
+    linked = False
+    try:
+        descriptor = os.open(
+            temporary_name,
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=parent_descriptor,
+        )
+        view = memoryview(bytes(payload))
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise RuntimeError("Update-Sicherheitsdatei konnte nicht vollständig geschrieben werden")
+            view = view[written:]
+        os.fchown(descriptor, 0, 0)
+        os.fchmod(descriptor, int(mode))
+        os.fsync(descriptor)
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_uid != 0
+            or metadata.st_gid != 0
+            or stat.S_IMODE(metadata.st_mode) != int(mode)
+            or metadata.st_size != len(payload)
+            or _repo_descriptor_has_unsafe_xattrs(descriptor)
+        ):
+            raise RuntimeError("Update-Sicherheitsdatei verletzt den Root-Vertrag")
+        os.link(
+            temporary_name,
+            name,
+            src_dir_fd=parent_descriptor,
+            dst_dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        linked = True
+        os.unlink(temporary_name, dir_fd=parent_descriptor)
+        os.fsync(parent_descriptor)
+        rebound = _read_exact_root_file_at(
+            parent_descriptor,
+            name,
+            bytes(payload),
+            int(mode),
+        )
+        if (rebound.st_dev, rebound.st_ino) != (metadata.st_dev, metadata.st_ino):
+            raise RuntimeError("Update-Sicherheitsdatei driftete nach linkat")
+        return rebound
+    except BaseException:
+        if linked and descriptor is not None:
+            try:
+                current = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+                opened = os.fstat(descriptor)
+                if (current.st_dev, current.st_ino) == (opened.st_dev, opened.st_ino):
+                    os.unlink(name, dir_fd=parent_descriptor)
+                    os.fsync(parent_descriptor)
+            except (FileNotFoundError, OSError):
+                pass
+        try:
+            os.unlink(temporary_name, dir_fd=parent_descriptor)
+        except FileNotFoundError:
+            pass
+        raise
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _update_safety_receipt_record(
+    *,
+    state: str,
+    transaction_id: str,
+    target_commit: str,
+    target_tag: str,
+    role: str,
+    backup_receipt: RecoveryBackupReceipt,
+    units: tuple[str, ...],
+    created_directories: tuple[str, ...],
+    dropin_identities: tuple[tuple[str, int, int], ...],
+) -> dict:
+    unit, runtime, token = _update_safety_names(transaction_id)
+    payload = _render_update_safety_dropin(transaction_id)
+    return {
+        "schema": UPDATE_SAFETY_RECEIPT_SCHEMA,
+        "state": state,
+        "transaction_id": transaction_id,
+        "target": {
+            "commit": _validate_full_commit(target_commit),
+            "tag": _normalize_release_tag(target_tag),
+            "role": str(role),
+        },
+        "backup": {
+            "dir": str(backup_receipt.backup_dir),
+            "dev": int(backup_receipt.backup_dev),
+            "ino": int(backup_receipt.backup_ino),
+            "id": str(backup_receipt.backup_id),
+            "manifest_sha256": str(backup_receipt.manifest_sha256),
+        },
+        "bootblock": {
+            "units": list(units),
+            "created_directories": list(created_directories),
+            "dropin_payload_sha256": hashlib.sha256(payload).hexdigest(),
+            "dropin_identities": [list(item) for item in dropin_identities],
+        },
+        "finalizer": {
+            "unit": unit,
+            "runtime_directory": runtime,
+            "token_path": token,
+        },
+    }
+
+
+def _canonical_update_safety_receipt_bytes(record: dict) -> bytes:
+    return (
+        json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        + "\n"
+    ).encode("ascii")
+
+
+def _parse_update_safety_receipt(
+    payload: bytes,
+    metadata: os.stat_result,
+) -> UpdateSafetyContract:
+    try:
+        record = json.loads(payload.decode("ascii"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Update-Sicherheitsreceipt ist nicht kanonisch lesbar") from exc
+    if (
+        not isinstance(record, dict)
+        or _canonical_update_safety_receipt_bytes(record) != payload
+        or set(record) != {
+            "schema", "state", "transaction_id", "target", "backup", "bootblock", "finalizer"
+        }
+    ):
+        raise RuntimeError("Update-Sicherheitsreceipt besitzt kein kanonisches Schema")
+    transaction_id = str(record.get("transaction_id") or "")
+    expected_unit, expected_runtime, expected_token = _update_safety_names(transaction_id)
+    target = record.get("target")
+    backup = record.get("backup")
+    bootblock = record.get("bootblock")
+    finalizer = record.get("finalizer")
+    if (
+        record.get("schema") != UPDATE_SAFETY_RECEIPT_SCHEMA
+        or record.get("state") not in {"pending", "committed"}
+        or not isinstance(target, dict)
+        or set(target) != {"commit", "tag", "role"}
+        or not isinstance(backup, dict)
+        or set(backup) != {"dir", "dev", "ino", "id", "manifest_sha256"}
+        or not isinstance(bootblock, dict)
+        or set(bootblock) != {
+            "units", "created_directories", "dropin_payload_sha256", "dropin_identities"
+        }
+        or not isinstance(finalizer, dict)
+        or set(finalizer) != {"unit", "runtime_directory", "token_path"}
+    ):
+        raise RuntimeError("Update-Sicherheitsreceipt besitzt eine unbekannte Form")
+    commit = _validate_full_commit(str(target.get("commit") or ""))
+    tag = _normalize_release_tag(str(target.get("tag") or ""))
+    role = str(target.get("role") or "")
+    if role not in VALID_HA_ROLES:
+        raise RuntimeError("Update-Sicherheitsreceipt besitzt eine ungültige Rolle")
+    units = tuple(str(item) for item in bootblock.get("units") or ())
+    created = tuple(str(item) for item in bootblock.get("created_directories") or ())
+    try:
+        identities = tuple(
+            (str(item[0]), int(item[1]), int(item[2]))
+            for item in (bootblock.get("dropin_identities") or ())
+            if isinstance(item, list) and len(item) == 3
+        )
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Update-Sicherheitsreceipt besitzt ungültige Inodes") from exc
+    identity_map = {unit: (device, inode) for unit, device, inode in identities}
+    expected_payload_hash = hashlib.sha256(
+        _render_update_safety_dropin(transaction_id)
+    ).hexdigest()
+    if (
+        units != _recovery_bootblock_units()
+        or len(set(units)) != len(units)
+        or not set(created).issubset(units)
+        or len(set(created)) != len(created)
+        or len(identity_map) != len(identities)
+        or set(identity_map) != set(units)
+        or any(device < 0 or inode <= 0 for device, inode in identity_map.values())
+        or bootblock.get("dropin_payload_sha256") != expected_payload_hash
+        or finalizer.get("unit") != expected_unit
+        or finalizer.get("runtime_directory") != expected_runtime
+        or finalizer.get("token_path") != expected_token
+        or not os.path.isabs(str(backup.get("dir") or ""))
+        or int(backup.get("dev", -1)) < 0
+        or int(backup.get("ino", 0)) <= 0
+        or not str(backup.get("id") or "")
+        or not re.fullmatch(r"[0-9a-f]{64}", str(backup.get("manifest_sha256") or ""))
+    ):
+        raise RuntimeError("Update-Sicherheitsreceipt driftete vom abgeleiteten Vertrag")
+    return UpdateSafetyContract(
+        schema=UPDATE_SAFETY_RECEIPT_SCHEMA,
+        state=str(record["state"]),
+        transaction_id=transaction_id,
+        target_commit=commit,
+        target_tag=tag,
+        role=role,
+        backup_dir=str(backup["dir"]),
+        backup_dev=int(backup["dev"]),
+        backup_ino=int(backup["ino"]),
+        backup_id=str(backup["id"]),
+        backup_manifest_sha256=str(backup["manifest_sha256"]),
+        units=units,
+        created_directories=created,
+        dropin_identities=identities,
+        dropin_payload_sha256=expected_payload_hash,
+        finalizer_unit=expected_unit,
+        runtime_directory=expected_runtime,
+        token_path=expected_token,
+        receipt_path=os.path.join(RECOVERY_BOOTBLOCK_STATE_DIR, UPDATE_SAFETY_RECEIPT_NAME),
+        receipt_dev=int(metadata.st_dev),
+        receipt_ino=int(metadata.st_ino),
+        receipt_sha256=hashlib.sha256(payload).hexdigest(),
+    )
+
+
+def _read_update_safety_contract(
+    *,
+    allow_missing: bool = False,
+) -> UpdateSafetyContract | None:
+    receipt_path = os.path.join(RECOVERY_BOOTBLOCK_STATE_DIR, UPDATE_SAFETY_RECEIPT_NAME)
+    if not os.path.lexists(receipt_path):
+        if allow_missing:
+            return None
+        raise RuntimeError("Update-Sicherheitsreceipt fehlt")
+    state_descriptor = _open_recovery_bootblock_state_directory()
+    try:
+        readback = _read_bound_root_file_at(
+            state_descriptor,
+            UPDATE_SAFETY_RECEIPT_NAME,
+            maximum=256 * 1024,
+            mode=0o600,
+            allow_missing=allow_missing,
+        )
+        if readback is None:
+            return None
+        payload, metadata = readback
+        return _parse_update_safety_receipt(payload, metadata)
+    finally:
+        os.close(state_descriptor)
+
+
+def _validate_update_safety_contract(
+    contract: UpdateSafetyContract,
+    *,
+    expected_state: str | None = None,
+) -> UpdateSafetyContract:
+    if not isinstance(contract, UpdateSafetyContract):
+        raise RuntimeError("Update-Sicherheitsvertrag besitzt den falschen Typ")
+    current = _read_update_safety_contract()
+    if current != contract:
+        raise RuntimeError("Update-Sicherheitsreceipt oder sein Inode driftete")
+    if expected_state is not None and current.state != expected_state:
+        raise RuntimeError(
+            f"Update-Sicherheitsreceipt ist {current.state!r} statt {expected_state!r}"
+        )
+    return current
+
+
+def _same_update_safety_transaction_shape(
+    first: UpdateSafetyContract,
+    second: UpdateSafetyContract,
+) -> bool:
+    """Vergleicht alles außer Zustand und atomar wechselnder Receipt-Identität."""
+
+    if not isinstance(first, UpdateSafetyContract) or not isinstance(
+        second,
+        UpdateSafetyContract,
+    ):
+        return False
+    ignored = {"state", "receipt_dev", "receipt_ino", "receipt_sha256"}
+    return all(
+        getattr(first, name) == getattr(second, name)
+        for name in UpdateSafetyContract.__dataclass_fields__
+        if name not in ignored
+    )
+
+
+def _write_pending_update_safety_receipt(record: dict) -> UpdateSafetyContract:
+    payload = _canonical_update_safety_receipt_bytes(record)
+    state_descriptor = _open_recovery_bootblock_state_directory()
+    try:
+        metadata = _create_owned_exact_root_file_at(
+            state_descriptor,
+            UPDATE_SAFETY_RECEIPT_NAME,
+            payload,
+            0o600,
+        )
+        os.fsync(state_descriptor)
+        return _parse_update_safety_receipt(payload, metadata)
+    finally:
+        os.close(state_descriptor)
+
+
+def _replace_update_safety_receipt(
+    contract: UpdateSafetyContract,
+    record: dict,
+) -> UpdateSafetyContract:
+    """Ersetzt nur das exakt gebundene aktuelle Receipt atomar und fsync-sicher."""
+
+    _validate_update_safety_contract(contract)
+    payload = _canonical_update_safety_receipt_bytes(record)
+    state_descriptor = _open_recovery_bootblock_state_directory()
+    temporary_name = f".e3dc-update-receipt-{os.getpid()}-{secrets.token_hex(12)}"
+    descriptor = None
+    replaced = False
+    irreversible_commit_boundary = False
+    result: UpdateSafetyContract | None = None
+    primary_error: BaseException | None = None
+    try:
+        current = _read_bound_root_file_at(
+            state_descriptor,
+            UPDATE_SAFETY_RECEIPT_NAME,
+            maximum=256 * 1024,
+            mode=0o600,
+        )
+        if current is None:
+            raise RuntimeError("Update-Sicherheitsreceipt verschwand vor dem Ersatz")
+        _current_payload, current_metadata = current
+        if (current_metadata.st_dev, current_metadata.st_ino) != (
+            contract.receipt_dev,
+            contract.receipt_ino,
+        ):
+            raise RuntimeError("Update-Sicherheitsreceipt driftete vor dem Ersatz")
+        descriptor = os.open(
+            temporary_name,
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=state_descriptor,
+        )
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise RuntimeError("Update-Sicherheitsreceipt blieb unvollständig")
+            view = view[written:]
+        os.fchown(descriptor, 0, 0)
+        os.fchmod(descriptor, 0o600)
+        os.fsync(descriptor)
+        staged = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(staged.st_mode)
+            or staged.st_nlink != 1
+            or staged.st_uid != 0
+            or staged.st_gid != 0
+            or stat.S_IMODE(staged.st_mode) != 0o600
+            or staged.st_size != len(payload)
+            or _repo_descriptor_has_unsafe_xattrs(descriptor)
+        ):
+            raise RuntimeError("Gestagtes Update-Sicherheitsreceipt ist unsicher")
+        # Ab diesem Punkt darf selbst ein scheinbarer rename-Fehler niemals
+        # mehr zum Altpreimage-Restore führen: Ein Signal oder Plattformfehler
+        # kann nach der Namensmutation, aber vor Python-Readback eintreffen.
+        irreversible_commit_boundary = True
+        os.replace(
+            temporary_name,
+            UPDATE_SAFETY_RECEIPT_NAME,
+            src_dir_fd=state_descriptor,
+            dst_dir_fd=state_descriptor,
+        )
+        replaced = True
+        os.fsync(state_descriptor)
+        rebound = _read_bound_root_file_at(
+            state_descriptor,
+            UPDATE_SAFETY_RECEIPT_NAME,
+            maximum=256 * 1024,
+            mode=0o600,
+        )
+        if rebound is None:
+            raise RuntimeError("Update-Sicherheitsreceipt fehlt nach dem Ersatz")
+        rebound_payload, rebound_metadata = rebound
+        if (
+            rebound_payload != payload
+            or (rebound_metadata.st_dev, rebound_metadata.st_ino)
+            != (staged.st_dev, staged.st_ino)
+        ):
+            raise RuntimeError("Update-Sicherheitsreceipt driftete nach dem Ersatz")
+        result = _parse_update_safety_receipt(rebound_payload, rebound_metadata)
+    except BaseException as exc:
+        primary_error = exc
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except BaseException as close_exc:
+                if primary_error is None:
+                    primary_error = close_exc
+                else:
+                    update_logger.critical(
+                        "Receipt-Staging-FD-Cleanup scheiterte zusätzlich: %s",
+                        close_exc,
+                    )
+        if not replaced:
+            try:
+                os.unlink(temporary_name, dir_fd=state_descriptor)
+            except FileNotFoundError:
+                pass
+            except BaseException as unlink_exc:
+                if primary_error is None:
+                    primary_error = unlink_exc
+                else:
+                    update_logger.critical(
+                        "Receipt-Staging-Cleanup scheiterte zusätzlich: %s",
+                        unlink_exc,
+                    )
+        try:
+            os.close(state_descriptor)
+        except BaseException as close_exc:
+            if primary_error is None:
+                primary_error = close_exc
+            else:
+                update_logger.critical(
+                    "Receipt-Verzeichnis-FD-Cleanup scheiterte zusätzlich: %s",
+                    close_exc,
+                )
+    if primary_error is not None:
+        if irreversible_commit_boundary and not isinstance(
+            primary_error,
+            UpdateSafetyPostCommitError,
+        ):
+            raise UpdateSafetyPostCommitError(
+                "Committed-Receipt-Grenze wurde betreten; Altstand-Rollback ist gesperrt"
+            ) from primary_error
+        raise primary_error
+    if result is None:
+        if irreversible_commit_boundary:
+            raise UpdateSafetyPostCommitError(
+                "Committed-Receipt-Grenze lieferte keinen gebundenen Abschluss"
+            )
+        raise RuntimeError("Receipt-Ersatz lieferte kein Ergebnis")
+    return result
+
+
+def _remove_exact_update_safety_receipt(contract: UpdateSafetyContract) -> None:
+    _validate_update_safety_contract(contract)
+    state_descriptor = _open_recovery_bootblock_state_directory()
+    try:
+        current = _read_bound_root_file_at(
+            state_descriptor,
+            UPDATE_SAFETY_RECEIPT_NAME,
+            maximum=256 * 1024,
+            mode=0o600,
+        )
+        if current is None or (current[1].st_dev, current[1].st_ino) != (
+            contract.receipt_dev,
+            contract.receipt_ino,
+        ):
+            raise RuntimeError("Fremdes Update-Sicherheitsreceipt wird nicht entfernt")
+        os.unlink(UPDATE_SAFETY_RECEIPT_NAME, dir_fd=state_descriptor)
+        os.fsync(state_descriptor)
+    finally:
+        os.close(state_descriptor)
+    if os.path.lexists(contract.receipt_path):
+        raise RuntimeError("Update-Sicherheitsreceipt blieb nach unlink vorhanden")
+
+
+def _rebind_update_safety_dropins(
+    contract: UpdateSafetyContract,
+    *,
+    allow_missing: bool = False,
+) -> dict[str, tuple[int, int] | None]:
+    identities = {
+        unit: (device, inode)
+        for unit, device, inode in contract.dropin_identities
+    }
+    payload = _render_update_safety_dropin(contract.transaction_id)
+    rebound: dict[str, tuple[int, int] | None] = {}
+    systemd_descriptor = _open_directory_nofollow("/etc/systemd/system")
+    try:
+        _require_root_controlled_directory(systemd_descriptor, "/etc/systemd/system")
+        for unit in contract.units:
+            directory_descriptor = None
+            try:
+                directory_descriptor = os.open(
+                    f"{unit}.d",
+                    os.O_RDONLY
+                    | getattr(os, "O_DIRECTORY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0),
+                    dir_fd=systemd_descriptor,
+                )
+                _require_root_controlled_directory(
+                    directory_descriptor,
+                    _recovery_dropin_path(unit),
+                    0o755,
+                )
+                metadata = _read_exact_root_file_at(
+                    directory_descriptor,
+                    RECOVERY_BOOTBLOCK_DROPIN_NAME,
+                    payload,
+                    0o644,
+                    allow_missing=allow_missing,
+                )
+                if metadata is None:
+                    rebound[unit] = None
+                    continue
+                current_identity = (int(metadata.st_dev), int(metadata.st_ino))
+                if identities.get(unit) != current_identity:
+                    raise RuntimeError(
+                        f"Dynamischer 00-Inode wurde nicht von dieser Transaktion erzeugt: {unit}"
+                    )
+                rebound[unit] = current_identity
+            except FileNotFoundError:
+                if not allow_missing:
+                    raise RuntimeError(f"Dynamischer 00-Pfad fehlt: {unit}")
+                rebound[unit] = None
+            finally:
+                if directory_descriptor is not None:
+                    os.close(directory_descriptor)
+    finally:
+        os.close(systemd_descriptor)
+    return rebound
+
+
+def _update_safety_expected_dropins(
+    contract: UpdateSafetyContract,
+    *,
+    selected_units: tuple[str, ...] | None = None,
+) -> dict[str, dict[str, dict[str, object]]]:
+    """Projiziert den gebundenen 00-Inodevertrag für Unit-Bundle-Prüfer."""
+
+    _validate_update_safety_contract(contract)
+    identities = {
+        unit: (device, inode)
+        for unit, device, inode in contract.dropin_identities
+    }
+    payload = _render_update_safety_dropin(contract.transaction_id)
+    selected = tuple(selected_units or contract.units)
+    if any(unit not in identities for unit in selected):
+        raise RuntimeError("Update-Sicherheits-Drop-in-Auswahl ist nicht gebunden")
+    return {
+        unit: {
+            _recovery_dropin_path(unit): {
+                "bytes": payload,
+                "dev": identities[unit][0],
+                "ino": identities[unit][1],
+                "uid": 0,
+                "gid": 0,
+                "mode": 0o644,
+                "nlink": 1,
+                "size": len(payload),
+            }
+        }
+        for unit in selected
+    }
+
+
+def _update_safety_record_from_contract(
+    contract: UpdateSafetyContract,
+    *,
+    state: str | None = None,
+    created_directories: tuple[str, ...] | None = None,
+    dropin_identities: tuple[tuple[str, int, int], ...] | None = None,
+) -> dict:
+    return {
+        "schema": UPDATE_SAFETY_RECEIPT_SCHEMA,
+        "state": str(state or contract.state),
+        "transaction_id": contract.transaction_id,
+        "target": {
+            "commit": contract.target_commit,
+            "tag": contract.target_tag,
+            "role": contract.role,
+        },
+        "backup": {
+            "dir": contract.backup_dir,
+            "dev": contract.backup_dev,
+            "ino": contract.backup_ino,
+            "id": contract.backup_id,
+            "manifest_sha256": contract.backup_manifest_sha256,
+        },
+        "bootblock": {
+            "units": list(contract.units),
+            "created_directories": list(
+                contract.created_directories
+                if created_directories is None
+                else created_directories
+            ),
+            "dropin_payload_sha256": contract.dropin_payload_sha256,
+            "dropin_identities": [
+                list(item)
+                for item in (
+                    contract.dropin_identities
+                    if dropin_identities is None
+                    else dropin_identities
+                )
+            ],
+        },
+        "finalizer": {
+            "unit": contract.finalizer_unit,
+            "runtime_directory": contract.runtime_directory,
+            "token_path": contract.token_path,
+        },
+    }
+
+
+def _remove_owned_update_safety_dropins(
+    *,
+    units: tuple[str, ...],
+    identities: dict[str, tuple[int, int]],
+    created_directories: tuple[str, ...],
+    payload: bytes,
+    allow_missing: bool,
+) -> None:
+    """Entfernt nur explizit erzeugte, unveränderte 00-Inodes."""
+
+    systemd_descriptor = _open_directory_nofollow("/etc/systemd/system")
+    try:
+        _require_root_controlled_directory(systemd_descriptor, "/etc/systemd/system")
+        for unit in reversed(units):
+            expected_identity = identities.get(unit)
+            if expected_identity is None:
+                continue
+            directory_descriptor = None
+            try:
+                directory_descriptor = os.open(
+                    f"{unit}.d",
+                    os.O_RDONLY
+                    | getattr(os, "O_DIRECTORY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0),
+                    dir_fd=systemd_descriptor,
+                )
+                _require_root_controlled_directory(
+                    directory_descriptor,
+                    _recovery_dropin_path(unit),
+                    0o755,
+                )
+                metadata = _read_exact_root_file_at(
+                    directory_descriptor,
+                    RECOVERY_BOOTBLOCK_DROPIN_NAME,
+                    payload,
+                    0o644,
+                    allow_missing=allow_missing,
+                )
+                if metadata is None:
+                    continue
+                if (metadata.st_dev, metadata.st_ino) != expected_identity:
+                    raise RuntimeError(
+                        f"Fremder dynamischer 00-Inode wird nicht entfernt: {unit}"
+                    )
+                os.unlink(
+                    RECOVERY_BOOTBLOCK_DROPIN_NAME,
+                    dir_fd=directory_descriptor,
+                )
+                os.fsync(directory_descriptor)
+            except FileNotFoundError:
+                if not allow_missing:
+                    raise
+            finally:
+                if directory_descriptor is not None:
+                    os.close(directory_descriptor)
+        for unit in reversed(created_directories):
+            try:
+                os.rmdir(f"{unit}.d", dir_fd=systemd_descriptor)
+                os.fsync(systemd_descriptor)
+            except OSError:
+                pass
+    finally:
+        os.close(systemd_descriptor)
+
+
+def _prepare_update_safety_contract(
+    *,
+    transaction_id: str,
+    target_commit: str,
+    target_tag: str,
+    role: str,
+    backup_receipt: RecoveryBackupReceipt,
+) -> UpdateSafetyContract:
+    """Installiert 00-Inodes und persistiert danach das pending Receipt."""
+
+    if os.geteuid() != 0:
+        raise RuntimeError("Vor-Mutations-Sicherheitsvertrag benötigt Root")
+    if (
+        not isinstance(backup_receipt, RecoveryBackupReceipt)
+        or backup_receipt.transaction_id != transaction_id
+    ):
+        raise RuntimeError("Backup-Receipt ist nicht an die Update-Transaktion gebunden")
+    _assert_no_existing_recovery_bootblock()
+    units = _recovery_bootblock_units()
+    payload = _render_update_safety_dropin(transaction_id)
+    identities: dict[str, tuple[int, int]] = {}
+    created_directories: list[str] = []
+    systemd_descriptor = _open_directory_nofollow("/etc/systemd/system")
+    try:
+        _require_root_controlled_directory(systemd_descriptor, "/etc/systemd/system")
+        for unit in units:
+            directory_descriptor, created = _open_or_create_recovery_directory(
+                systemd_descriptor,
+                f"{unit}.d",
+                mode=0o755,
+                label=_recovery_dropin_path(unit),
+            )
+            if created:
+                created_directories.append(unit)
+            try:
+                if _read_exact_root_file_at(
+                    directory_descriptor,
+                    RECOVERY_BOOTBLOCK_DROPIN_NAME,
+                    payload,
+                    0o644,
+                    allow_missing=True,
+                ) is not None:
+                    raise RuntimeError(
+                        f"Vorhandener dynamischer 00-Name wird nicht adoptiert: {unit}"
+                    )
+                metadata = _create_owned_exact_root_file_at(
+                    directory_descriptor,
+                    RECOVERY_BOOTBLOCK_DROPIN_NAME,
+                    payload,
+                    0o644,
+                )
+                identities[unit] = (int(metadata.st_dev), int(metadata.st_ino))
+            finally:
+                os.close(directory_descriptor)
+    except BaseException:
+        try:
+            _remove_owned_update_safety_dropins(
+                units=units,
+                identities=identities,
+                created_directories=tuple(created_directories),
+                payload=payload,
+                allow_missing=True,
+            )
+        except Exception as cleanup_exc:
+            update_logger.critical(
+                "Partieller Vor-Mutations-00-Vertrag blieb fail-closed liegen: %s",
+                cleanup_exc,
+            )
+        raise
+    finally:
+        os.close(systemd_descriptor)
+    try:
+        record = _update_safety_receipt_record(
+            state="pending",
+            transaction_id=transaction_id,
+            target_commit=target_commit,
+            target_tag=target_tag,
+            role=role,
+            backup_receipt=backup_receipt,
+            units=units,
+            created_directories=tuple(created_directories),
+            dropin_identities=tuple(
+                (unit, *identities[unit]) for unit in units
+            ),
+        )
+        contract = _write_pending_update_safety_receipt(record)
+        _rebind_update_safety_dropins(contract)
+        return contract
+    except BaseException:
+        try:
+            _remove_owned_update_safety_dropins(
+                units=units,
+                identities=identities,
+                created_directories=tuple(created_directories),
+                payload=payload,
+                allow_missing=True,
+            )
+        except Exception as cleanup_exc:
+            update_logger.critical(
+                "Vor-Mutations-00-Vertrag blieb nach Receiptfehler liegen: %s",
+                cleanup_exc,
+            )
+        raise
+
+
+def _verify_update_safety_marker(
+    contract: UpdateSafetyContract,
+    *,
+    expected_present: bool,
+) -> None:
+    payload = _recovery_bootblock_marker_payload(contract.transaction_id)
+    state_descriptor = _open_recovery_bootblock_state_directory()
+    try:
+        present = _read_exact_root_file_at(
+            state_descriptor,
+            Path(RECOVERY_BOOTBLOCK_MARKER).name,
+            payload,
+            0o600,
+            allow_missing=True,
+        ) is not None
+        if present != bool(expected_present):
+            raise RuntimeError("Dynamischer Update-Marker besitzt den falschen Zustand")
+    finally:
+        os.close(state_descriptor)
+
+
+def _systemd_scalar_value(unit: str, property_name: str) -> str:
+    result = _run_argv(
+        ["systemctl", "show", f"--property={property_name}", "--value", unit],
+        timeout=15,
+        env={**os.environ, "LC_ALL": "C", "LANG": "C"},
+    )
+    output = str(result.get("stdout") or "")
+    if (
+        not result.get("success")
+        or result.get("timed_out")
+        or int(result.get("returncode", -1)) != 0
+        or str(result.get("stderr") or "")
+        or "\x00" in output
+        or len(output.splitlines()) > 1
+    ):
+        raise RuntimeError(f"systemd-{property_name}-Readback ist unklar: {unit}")
+    return output.strip()
+
+
+def _reload_and_verify_update_safety_dropins(
+    contract: UpdateSafetyContract,
+    *,
+    expected_present: bool,
+) -> None:
+    """Bindet daemon-reload, Condition-OR und Lease-Abhängigkeiten gemeinsam."""
+
+    if expected_present:
+        _rebind_update_safety_dropins(contract)
+    reload_result = _run_argv(
+        ["systemctl", "daemon-reload"],
+        timeout=30,
+        env={**os.environ, "LC_ALL": "C", "LANG": "C"},
+    )
+    if (
+        not reload_result.get("success")
+        or reload_result.get("timed_out")
+        or int(reload_result.get("returncode", -1)) != 0
+        or str(reload_result.get("stderr") or "")
+    ):
+        raise RuntimeError(
+            "systemd daemon-reload für dynamischen Update-Bootblock fehlgeschlagen: "
+            + _combined_process_diagnostics(reload_result, maximum=800)
+        )
+    payload = _render_update_safety_dropin(contract.transaction_id)
+    marker_comment = "# E3DC_UPDATE_SAFETY_V1"
+    own_marker_condition = f"|!{RECOVERY_BOOTBLOCK_MARKER}"
+    own_token_condition = f"|{contract.token_path}"
+    for unit in contract.units:
+        load_state = _systemd_scalar_value(unit, "LoadState").lower()
+        dropin_value = _systemd_scalar_value(unit, "DropInPaths")
+        try:
+            dropin_paths = tuple(shlex.split(dropin_value)) if dropin_value else ()
+            binds_to = tuple(shlex.split(_systemd_scalar_value(unit, "BindsTo")))
+            after = tuple(shlex.split(_systemd_scalar_value(unit, "After")))
+        except ValueError as exc:
+            raise RuntimeError(f"systemd-Abhängigkeiten sind unklar: {unit}") from exc
+        cat_result = _run_argv(
+            ["systemctl", "cat", "--no-pager", unit],
+            timeout=15,
+            env={**os.environ, "LC_ALL": "C", "LANG": "C"},
+        )
+        output = str(cat_result.get("stdout") or "")
+        stderr = str(cat_result.get("stderr") or "")
+        canonical_not_found = bool(
+            not cat_result.get("success")
+            and not cat_result.get("timed_out")
+            and int(cat_result.get("returncode", -1)) == 1
+            and output == ""
+            and stderr == f"No files found for {unit}.\n"
+        )
+        conditions: list[tuple[str, str]] = []
+        ambiguous = False
+        condition_reset_seen = False
+        for line in output.splitlines():
+            match = re.fullmatch(r"\s*(Condition[A-Za-z0-9]+)\s*=(.*)", line)
+            stripped = line.lstrip()
+            if stripped.startswith("Condition") and match is None:
+                ambiguous = True
+            if match:
+                condition_name = match.group(1)
+                value = match.group(2).strip()
+                if value.endswith("\\"):
+                    ambiguous = True
+                if value:
+                    conditions.append((condition_name, value))
+                else:
+                    condition_reset_seen = True
+                    conditions = [
+                        condition
+                        for condition in conditions
+                        if condition[0] != condition_name
+                    ]
+        own_path = _recovery_dropin_path(unit)
+        if expected_present:
+            if load_state == "masked":
+                if _systemd_scalar_value(unit, "UnitFileState").lower() != "masked":
+                    raise RuntimeError(f"Nur persistente Maskierung gilt als Startblock: {unit}")
+                continue
+            if load_state == "not-found":
+                if not canonical_not_found or dropin_paths or binds_to or conditions or ambiguous:
+                    raise RuntimeError(f"Inkonsistenter not-found-Bootblock: {unit}")
+                _assert_exclusive_not_found_recovery_dropin(
+                    unit,
+                    expected_payload=payload,
+                )
+                continue
+            if (
+                load_state != "loaded"
+                or not cat_result.get("success")
+                or cat_result.get("timed_out")
+                or int(cat_result.get("returncode", -1)) != 0
+                or stderr
+                or dropin_paths.count(own_path) != 1
+                or output.splitlines().count(marker_comment) != 1
+                or output.splitlines().count(f"BindsTo={contract.finalizer_unit}") != 1
+                or output.splitlines().count(f"After={contract.finalizer_unit}") != 1
+                or binds_to.count(contract.finalizer_unit) != 1
+                or after.count(contract.finalizer_unit) != 1
+                or conditions.count(
+                    ("ConditionPathExists", own_marker_condition)
+                )
+                != 1
+                or conditions.count(
+                    ("ConditionPathExists", own_token_condition)
+                )
+                != 1
+                or [
+                    (condition_name, condition_value)
+                    for condition_name, condition_value in conditions
+                    if condition_value.startswith("|")
+                ]
+                != [
+                    ("ConditionPathExists", own_marker_condition),
+                    ("ConditionPathExists", own_token_condition),
+                ]
+                or condition_reset_seen
+                or ambiguous
+            ):
+                raise RuntimeError(f"Dynamischer Update-Bootblock driftete: {unit}")
+        else:
+            if load_state not in {"loaded", "masked", "not-found"}:
+                raise RuntimeError(f"systemd-Zustand nach dynamischem Cleanup ist unklar: {unit}")
+            if (
+                own_path in dropin_paths
+                or marker_comment in output.splitlines()
+                or contract.finalizer_unit in binds_to
+                or contract.finalizer_unit in after
+                or ("ConditionPathExists", own_marker_condition) in conditions
+                or ("ConditionPathExists", own_token_condition) in conditions
+                or ambiguous
+                or (load_state == "not-found" and not canonical_not_found)
+                or (
+                    load_state == "loaded"
+                    and (
+                        not cat_result.get("success")
+                        or cat_result.get("timed_out")
+                        or int(cat_result.get("returncode", -1)) != 0
+                        or stderr
+                    )
+                )
+            ):
+                raise RuntimeError(f"Dynamischer Update-Bootblock blieb effektiv: {unit}")
+
+
+def _arm_update_safety_contract(
+    contract: UpdateSafetyContract,
+) -> UpdateSafetyContract:
+    contract = _validate_update_safety_contract(contract, expected_state="pending")
+    _rebind_update_safety_dropins(contract)
+    marker_payload = _recovery_bootblock_marker_payload(contract.transaction_id)
+    state_descriptor = _open_recovery_bootblock_state_directory()
+    try:
+        _create_exact_root_file_at(
+            state_descriptor,
+            Path(RECOVERY_BOOTBLOCK_MARKER).name,
+            marker_payload,
+            0o600,
+        )
+        os.fsync(state_descriptor)
+    finally:
+        os.close(state_descriptor)
+    _verify_update_safety_marker(contract, expected_present=True)
+    _reload_and_verify_update_safety_dropins(contract, expected_present=True)
+    return contract
+
+
+def _clear_update_safety_marker(contract: UpdateSafetyContract) -> None:
+    _validate_update_safety_contract(contract)
+    _rebind_update_safety_dropins(contract)
+    _reload_and_verify_update_safety_dropins(contract, expected_present=True)
+    marker_payload = _recovery_bootblock_marker_payload(contract.transaction_id)
+    state_descriptor = _open_recovery_bootblock_state_directory()
+    try:
+        marker = _read_exact_root_file_at(
+            state_descriptor,
+            Path(RECOVERY_BOOTBLOCK_MARKER).name,
+            marker_payload,
+            0o600,
+        )
+        if marker is None:
+            raise RuntimeError("Eigener dynamischer Update-Marker fehlt")
+        os.unlink(Path(RECOVERY_BOOTBLOCK_MARKER).name, dir_fd=state_descriptor)
+        os.fsync(state_descriptor)
+    finally:
+        os.close(state_descriptor)
+    _verify_update_safety_marker(contract, expected_present=False)
+
+
+def _remove_update_safety_dropins(contract: UpdateSafetyContract) -> None:
+    _validate_update_safety_contract(contract)
+    _verify_update_safety_marker(contract, expected_present=False)
+    identities = {
+        unit: (device, inode)
+        for unit, device, inode in contract.dropin_identities
+    }
+    _remove_owned_update_safety_dropins(
+        units=contract.units,
+        identities=identities,
+        created_directories=contract.created_directories,
+        payload=_render_update_safety_dropin(contract.transaction_id),
+        allow_missing=False,
+    )
+    _reload_and_verify_update_safety_dropins(contract, expected_present=False)
+
+
+def _commit_update_safety_receipt(
+    contract: UpdateSafetyContract,
+) -> UpdateSafetyContract:
+    contract = _validate_update_safety_contract(contract, expected_state="pending")
+    _verify_update_safety_marker(contract, expected_present=True)
+    _reload_and_verify_update_safety_dropins(contract, expected_present=True)
+    return _replace_update_safety_receipt(
+        contract,
+        _update_safety_record_from_contract(contract, state="committed"),
+    )
+
+
+def _finish_committed_update_safety_cleanup(
+    contract: UpdateSafetyContract,
+    *,
+    remove_receipt: bool,
+) -> UpdateSafetyContract:
+    """Räumt nach Commit nur eigene Marker/00-Inodes; niemals Produktpreimages."""
+
+    current = _read_update_safety_contract()
+    if current is None or contract.state != "committed" or current != contract:
+        raise RuntimeError("Committed Update-Sicherheitsreceipt driftete")
+    # Vor dem Öffnen des Markergates müssen alle noch vorhandenen eigenen
+    # 00-Namen exakt den Receipt-Inodes und -Bytes entsprechen. Ein fremder
+    # Ersatz darf niemals erst nach Marker-Unlink erkannt werden.
+    _rebind_update_safety_dropins(contract, allow_missing=True)
+    marker_payload = _recovery_bootblock_marker_payload(contract.transaction_id)
+    state_descriptor = _open_recovery_bootblock_state_directory()
+    try:
+        marker = _read_exact_root_file_at(
+            state_descriptor,
+            Path(RECOVERY_BOOTBLOCK_MARKER).name,
+            marker_payload,
+            0o600,
+            allow_missing=True,
+        )
+        if marker is not None:
+            os.unlink(Path(RECOVERY_BOOTBLOCK_MARKER).name, dir_fd=state_descriptor)
+            os.fsync(state_descriptor)
+    finally:
+        os.close(state_descriptor)
+    _verify_update_safety_marker(contract, expected_present=False)
+    _remove_owned_update_safety_dropins(
+        units=contract.units,
+        identities={
+            unit: (device, inode)
+            for unit, device, inode in contract.dropin_identities
+        },
+        created_directories=contract.created_directories,
+        payload=_render_update_safety_dropin(contract.transaction_id),
+        allow_missing=True,
+    )
+    _reload_and_verify_update_safety_dropins(contract, expected_present=False)
+    if remove_receipt:
+        _remove_exact_update_safety_receipt(contract)
+    return contract
+
+
+def _rearm_pending_update_safety_contract(
+    contract: UpdateSafetyContract,
+) -> UpdateSafetyContract:
+    """Vervollständigt denselben tx-/payloadgebundenen pending Vertrag erneut."""
+
+    # Dieser Contract wurde bereits am Managed-Finalizer-Endgate vollständig
+    # gebunden. Ein atomar ersetztes, nur ähnlich geformtes Receipt darf hier
+    # weder neue 00-Inodes noch einen Marker, Stop oder Restore autorisieren.
+    current = _validate_update_safety_contract(
+        contract,
+        expected_state="pending",
+    )
+    if current != contract:
+        raise RuntimeError(
+            "Pending Update-Sicherheitsvertrag kann nicht exakt rearmed werden"
+        )
+    payload = _render_update_safety_dropin(current.transaction_id)
+    prior_identities = {
+        unit: (device, inode)
+        for unit, device, inode in current.dropin_identities
+    }
+    identities: dict[str, tuple[int, int]] = {}
+    created = list(current.created_directories)
+    systemd_descriptor = _open_directory_nofollow("/etc/systemd/system")
+    try:
+        _require_root_controlled_directory(systemd_descriptor, "/etc/systemd/system")
+        for unit in current.units:
+            directory_descriptor, directory_created = _open_or_create_recovery_directory(
+                systemd_descriptor,
+                f"{unit}.d",
+                mode=0o755,
+                label=_recovery_dropin_path(unit),
+            )
+            if directory_created and unit not in created:
+                created.append(unit)
+            try:
+                metadata = _read_exact_root_file_at(
+                    directory_descriptor,
+                    RECOVERY_BOOTBLOCK_DROPIN_NAME,
+                    payload,
+                    0o644,
+                    allow_missing=True,
+                )
+                was_missing = metadata is None
+                if was_missing:
+                    metadata = _create_owned_exact_root_file_at(
+                        directory_descriptor,
+                        RECOVERY_BOOTBLOCK_DROPIN_NAME,
+                        payload,
+                        0o644,
+                    )
+                identity = (int(metadata.st_dev), int(metadata.st_ino))
+                prior = prior_identities.get(unit)
+                if prior is not None and prior != identity and not was_missing:
+                    # Ein fehlender alter Name darf neu erzeugt werden. Ein
+                    # weiterhin vorhandener anderer Inode wurde oben bereits
+                    # bytegebunden gelesen, ist aber nicht unser Eigentum.
+                    raise RuntimeError(
+                        f"Dynamischer 00-Inode driftete beim Re-Arm: {unit}"
+                    )
+                identities[unit] = identity
+            finally:
+                os.close(directory_descriptor)
+    finally:
+        os.close(systemd_descriptor)
+    new_identities = tuple((unit, *identities[unit]) for unit in current.units)
+    if (
+        new_identities != current.dropin_identities
+        or tuple(created) != current.created_directories
+    ):
+        current = _replace_update_safety_receipt(
+            current,
+            _update_safety_record_from_contract(
+                current,
+                state="pending",
+                created_directories=tuple(created),
+                dropin_identities=new_identities,
+            ),
+        )
+    return _arm_update_safety_contract(current)
+
+
+def _enforce_update_safety_fail_closed(
+    contract: UpdateSafetyContract,
+    *,
+    repo_dir: str,
+) -> UpdateSafetyContract:
+    """Rearmed denselben Vertrag und beweist danach Writer-Ruhe ohne Start."""
+
+    current = _rearm_pending_update_safety_contract(contract)
+    if not _stop_v4_services(V4_SERVICES):
+        raise RuntimeError("Dynamischer Fail-closed-Stop blieb unvollständig")
+    _assert_strict_update_writer_quiescence(
+        repo_dir=repo_dir,
+        transaction_id=current.transaction_id,
+    )
+    _verify_update_safety_marker(current, expected_present=True)
+    _reload_and_verify_update_safety_dropins(current, expected_present=True)
+    return current
+
+
 HA_SLAVE_STANDBY_SERVICES = _catalog_service_names(include_legacy=True, exclude={'e3dc-ha'})
 SHADOW_STANDBY_SERVICES = _catalog_service_names(include_legacy=True, exclude={'e3dc-shadow-sync'})
 
@@ -2943,10 +4462,16 @@ def _explicit_bootstrap_role_anchor_needed(
     state: TransitionState,
     *,
     target_install_path: str | None,
+    sealed_target_updater: bool = False,
 ) -> bool:
-    """Prüft rein, ob der explizite Einzelknoten-Bootstrap einen Anker braucht."""
+    """Prüft rein, ob der explizit gebundene Einzelknoten einen Anker braucht."""
 
-    if not target_install_path:
+    if target_install_path and sealed_target_updater:
+        raise RuntimeError(
+            "Erstinstallations-Bootstrap und versiegelter Ziel-Updater "
+            "dürfen die Rollenanker-Autorität nicht gemeinsam besitzen"
+        )
+    if not target_install_path and not sealed_target_updater:
         return False
     from .ha_writer_admission import (
         INSTANCE_ROLE_ANCHOR_PATH,
@@ -2964,7 +4489,8 @@ def _explicit_bootstrap_role_anchor_needed(
         )
     if os.path.lexists(INSTANCE_ROLE_ANCHOR_PATH):
         raise RuntimeError(
-            "Vorhandener Instanzrollen-Anker widerspricht dem expliziten Bootstrap"
+            "Vorhandener Instanzrollen-Anker widerspricht der expliziten "
+            "Rollenanker-Projektion"
         )
     return True
 
@@ -2973,12 +4499,14 @@ def _bind_explicit_bootstrap_role_anchor(
     state: TransitionState,
     *,
     target_install_path: str | None,
+    sealed_target_updater: bool = False,
 ) -> bool:
-    """Erzeugt den zuvor rein geprüften Anker erst im gesicherten Mutationsblock."""
+    """Erzeugt den rein geprüften Anker erst im gesicherten Mutationsblock."""
 
     if not _explicit_bootstrap_role_anchor_needed(
         state,
         target_install_path=target_install_path,
+        sealed_target_updater=sealed_target_updater,
     ):
         return False
     from .ha_writer_admission import (
@@ -3214,7 +4742,7 @@ def _run_core_service_installer(label: str, installer) -> bool:
     return True
 
 
-def _ensure_install_center_core_services() -> bool:
+def _ensure_install_center_core_services(*, expected_recovery_dropins=None) -> bool:
     """Installiert fehlende Kernsystem-Units aus dem Install-Center nach."""
     print('\n[->] Stelle Kernsystem-Dienste aus dem Install-Center sicher...')
     ok = True
@@ -3226,6 +4754,7 @@ def _ensure_install_center_core_services() -> bool:
             lambda: install_epex_service(
                 start_services=False,
                 include_websocket=True,
+                expected_recovery_dropins=expected_recovery_dropins,
             ),
         ) and ok
     except Exception as exc:
@@ -3240,6 +4769,13 @@ def _ensure_install_center_core_services() -> bool:
             lambda: install_notifier(
                 start_service=False,
                 migrate_legacy_config=False,
+                expected_recovery_dropins={
+                    unit: contract
+                    for unit, contract in dict(
+                        expected_recovery_dropins or {}
+                    ).items()
+                    if unit == "e3dc-notifier.service"
+                },
             ),
         ) and ok
     except Exception as exc:
@@ -3370,6 +4906,117 @@ def _harden_aux_inverter_migration_backups(path: str) -> bool:
     return _verify_aux_inverter_migration_backup_modes(path)
 
 
+WALLBOX_MODE5_USER_START_REQUEST_FILE = (
+    "/var/www/html/data/wallbox_mode5_user_start_request.json"
+)
+
+
+def _mode5_user_start_request_nodes_safe(path: str, *, legacy_parent=False) -> bool:
+    """Prüft Parent, Request und Lock ohne irgendeine Zielnormalisierung."""
+
+    try:
+        account = pwd.getpwnam("www-data")
+        group = grp.getgrnam("www-data")
+        manager = pwd.getpwnam(get_install_user())
+        allowed_parent_uids = {int(account.pw_uid), int(manager.pw_uid)}
+        parent = os.lstat(os.path.dirname(path))
+        parent_mode = stat.S_IMODE(parent.st_mode)
+        if (
+            stat.S_ISLNK(parent.st_mode)
+            or not stat.S_ISDIR(parent.st_mode)
+            or bool(parent_mode & 0o002)
+            or parent.st_uid not in allowed_parent_uids
+            or parent.st_gid != int(group.gr_gid)
+            or (
+                parent_mode != 0o775
+                if legacy_parent
+                else parent_mode != 0o2775
+            )
+        ):
+            return False
+        contracts = (
+            (path, {int(account.pw_uid)}, True),
+            (
+                path + ".lock",
+                {0, int(account.pw_uid), int(manager.pw_uid)},
+                False,
+            ),
+        )
+        for target, allowed_uids, payload_file in contracts:
+            if not os.path.lexists(target):
+                continue
+            metadata = os.lstat(target)
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or stat.S_IMODE(metadata.st_mode) != 0o660
+                or metadata.st_uid not in allowed_uids
+                or metadata.st_gid != int(group.gr_gid)
+                or metadata.st_size > 65536
+                or (payload_file and metadata.st_size < 1)
+            ):
+                return False
+        return True
+    except (KeyError, OSError, TypeError, ValueError):
+        return False
+
+
+def _mode5_user_start_request_surface_safe(
+    path: str = WALLBOX_MODE5_USER_START_REQUEST_FILE,
+) -> bool:
+    """Prüft die persistente PHP-Autorität read-only und exakt."""
+
+    return _mode5_user_start_request_nodes_safe(path, legacy_parent=False)
+
+
+def _repair_mode5_user_start_legacy_parent(
+    path: str = WALLBOX_MODE5_USER_START_REQUEST_FILE,
+) -> bool:
+    """Hebt ausschließlich den bekannten 0775-Parent descriptorgebunden an."""
+
+    if _mode5_user_start_request_surface_safe(path):
+        return True
+    if not _mode5_user_start_request_nodes_safe(path, legacy_parent=True):
+        return False
+    directory = os.path.dirname(path)
+    descriptor = None
+    try:
+        before = os.lstat(directory)
+        group = grp.getgrnam("www-data")
+        account = pwd.getpwnam("www-data")
+        manager = pwd.getpwnam(get_install_user())
+        allowed_parent_uids = {int(account.pw_uid), int(manager.pw_uid)}
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(directory, flags)
+        current = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(current.st_mode)
+            or (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino)
+            or current.st_uid not in allowed_parent_uids
+            or current.st_gid != int(group.gr_gid)
+            or stat.S_IMODE(current.st_mode) != 0o775
+        ):
+            return False
+        os.fchmod(descriptor, 0o2775)
+        changed = os.fstat(descriptor)
+        named = os.lstat(directory)
+        if (
+            stat.S_IMODE(changed.st_mode) != 0o2775
+            or (named.st_dev, named.st_ino) != (changed.st_dev, changed.st_ino)
+            or named.st_uid not in allowed_parent_uids
+            or stat.S_IMODE(named.st_mode) != 0o2775
+        ):
+            return False
+    except (KeyError, OSError, TypeError, ValueError):
+        return False
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    return _mode5_user_start_request_surface_safe(path)
+
+
 def _fix_webroot_permissions() -> bool:
     install_user = shlex.quote(get_install_user())
     secret_file_mode = config_secret_file_mode_text()
@@ -3377,12 +5024,21 @@ def _fix_webroot_permissions() -> bool:
     repo_v4_config = shlex.quote(os.path.join(get_install_path(), "data", "e3dc_v4.json"))
     web_backup_dir = "/var/www/html/data/config_backups"
     repo_backup_dir = os.path.join(get_install_path(), "data", "config_backups")
+    protected_mode5_request = WALLBOX_MODE5_USER_START_REQUEST_FILE
+    protected_mode5_lock = protected_mode5_request + ".lock"
+    if not _repair_mode5_user_start_legacy_parent(protected_mode5_request):
+        raise RuntimeError(
+            "Persistente Modus-5-Anforderungsfläche ist unsicher; "
+            "keine Webroot-Reparatur ausgeführt"
+        )
     run_command(f"sudo usermod -aG www-data {install_user} 2>/dev/null || true", timeout=10)
     protected_wallbox_jobs = "/var/www/html/data/.wallbox_plan_jobs"
     protected_matter_storage = "/var/www/html/data/matter-storage"
     run_command(
         "sudo find -P /var/www/html -xdev "
-        f"\\( -path {protected_wallbox_jobs} \\) -prune -o "
+        f"\\( -path {protected_wallbox_jobs} "
+        f"-o -path {protected_mode5_request} "
+        f"-o -path {protected_mode5_lock} \\) -prune -o "
         f"\\( -type d -o -type f \\) -exec chown {install_user}:www-data {{}} +",
         timeout=60,
     )
@@ -3391,7 +5047,9 @@ def _fix_webroot_permissions() -> bool:
         "\\( -path /var/www/html/data/e3dc_v4.json "
         "-o -path /var/www/html/data/config_backups "
         f"-o -path {protected_matter_storage} "
-        f"-o -path {protected_wallbox_jobs} \\) -prune -o "
+        f"-o -path {protected_wallbox_jobs} "
+        f"-o -path {protected_mode5_request} "
+        f"-o -path {protected_mode5_lock} \\) -prune -o "
         "-type d -exec chmod 775 {} +",
         timeout=60,
     )
@@ -3400,7 +5058,9 @@ def _fix_webroot_permissions() -> bool:
         "\\( -path /var/www/html/data/e3dc_v4.json "
         "-o -path /var/www/html/data/config_backups "
         f"-o -path {protected_matter_storage} "
-        f"-o -path {protected_wallbox_jobs} \\) -prune -o "
+        f"-o -path {protected_wallbox_jobs} "
+        f"-o -path {protected_mode5_request} "
+        f"-o -path {protected_mode5_lock} \\) -prune -o "
         "-type f -exec chmod 664 {} +",
         timeout=60,
     )
@@ -3425,6 +5085,11 @@ def _fix_webroot_permissions() -> bool:
         if not _harden_aux_inverter_migration_backups(raw_migration_dir):
             raise RuntimeError("Zusatz-WR-Migrationsbackups konnten nicht sicher gehärtet werden")
     run_command("sudo chmod 664 /var/www/html/ramdisk/value_filter.json 2>/dev/null || true", timeout=5)
+    if not _mode5_user_start_request_surface_safe(protected_mode5_request):
+        raise RuntimeError(
+            "Persistente Modus-5-Anforderungsfläche wechselte während der "
+            "Webroot-Reparatur"
+        )
     return True
 
 
@@ -3460,6 +5125,52 @@ def _exact_commit_matches(expected: str, actual: str) -> bool:
         return _validate_full_commit(expected) == _validate_full_commit(actual)
     except ValueError:
         return False
+
+
+def _require_strict_forward_update_ancestry(
+    repo_dir: str,
+    install_user: str,
+    current_commit: str,
+    target_commit: str,
+) -> None:
+    """Beweist, dass der normale Zielstand ein echter Git-Nachfolger ist."""
+
+    current = _validate_full_commit(current_commit)
+    target = _validate_full_commit(target_commit)
+    if _exact_commit_matches(current, target):
+        raise RuntimeError(
+            "Rollenanker-Autorität verlangt einen echten vorwärtsgerichteten Zielcommit"
+        )
+    result = _git_argv(
+        repo_dir,
+        install_user,
+        "merge-base",
+        "--is-ancestor",
+        current,
+        target,
+        timeout=15,
+    )
+    if (
+        result.get("success")
+        and not result.get("timed_out")
+        and int(result.get("returncode", -1)) == 0
+        and str(result.get("stdout") or "") == ""
+        and str(result.get("stderr") or "") == ""
+    ):
+        return
+    if (
+        not result.get("timed_out")
+        and int(result.get("returncode", -1)) == 1
+        and str(result.get("stdout") or "") == ""
+        and str(result.get("stderr") or "") == ""
+    ):
+        raise RuntimeError(
+            "Flagloser Zielcommit ist kein vorwärtsgerichteter Nachfolger des aktuellen HEAD"
+        )
+    raise RuntimeError(
+        "Git-Ancestry des normalen Ziel-Updaters ist nicht beweisbar: "
+        + _combined_process_diagnostics(result, maximum=800)
+    )
 
 
 def _resolve_git_commit(repo_dir: str, ref: str, install_user: str) -> str | None:
@@ -3918,6 +5629,131 @@ def _capture_repo_recovery_contract(
         tracked_files=tuple(frozen),
         dirty_paths=tuple(sorted(dirty_paths)),
     )
+
+
+def _verify_repo_recovery_prestate(
+    repo_dir: str,
+    install_user: str,
+    contract: RepoRecoveryContract,
+) -> None:
+    """Bindet den eingefrorenen Live-Worktree erneut direkt vor der Mutation."""
+
+    if not isinstance(contract, RepoRecoveryContract):
+        raise RuntimeError("Repo-Recovery-Prestate-Vertrag fehlt")
+    root = os.path.abspath(repo_dir)
+    user = str(install_user)
+    commit = _validate_full_commit(contract.expected_commit)
+    if (
+        contract.install_root != root
+        or contract.install_user != user
+        or _bound_release_head_commit(root, user) != commit
+    ):
+        raise RuntimeError("Repo-Recovery-Prestate weicht vom eingefrorenen HEAD ab")
+    _require_clean_recovery_index(root, user)
+    expected_git_entries = tuple(
+        (relative_path, git_mode, git_oid)
+        for (
+            relative_path,
+            git_mode,
+            git_oid,
+            _digest,
+            _size,
+            _mode,
+            _uid,
+            _gid,
+        ) in contract.tracked_files
+    )
+    current_git_entries = tuple(
+        _tracked_release_file_contracts(
+            root,
+            user,
+            target_commit=commit,
+        )
+    )
+    if current_git_entries != expected_git_entries:
+        raise RuntimeError("Repo-Recovery-Prestate besitzt einen anderen Git-Dateivertrag")
+
+    dirty_paths: list[str] = []
+    for (
+        relative_path,
+        git_mode,
+        git_oid,
+        expected_digest,
+        expected_size,
+        expected_mode,
+        expected_uid,
+        expected_gid,
+    ) in contract.tracked_files:
+        target = os.path.join(root, relative_path)
+        descriptor, before = _open_regular_file_nofollow(target)
+        try:
+            before_identity = (
+                int(before.st_dev),
+                int(before.st_ino),
+                int(before.st_size),
+                int(before.st_mtime_ns),
+                int(before.st_ctime_ns),
+                int(before.st_nlink),
+                int(before.st_uid),
+                int(before.st_gid),
+                int(stat.S_IMODE(before.st_mode)),
+            )
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_nlink != 1
+                or before.st_size != expected_size
+                or stat.S_IMODE(before.st_mode) != expected_mode
+                or before.st_uid != expected_uid
+                or before.st_gid != expected_gid
+                or _repo_descriptor_has_unsafe_xattrs(descriptor)
+                or _descriptor_plain_sha256(descriptor, expected_size)
+                != expected_digest
+            ):
+                raise RuntimeError(
+                    f"Repo-Recovery-Prestate driftete: {relative_path}"
+                )
+            actual_oid = _git_blob_oid_from_descriptor(
+                descriptor,
+                expected_size,
+                git_oid,
+            )
+            after = os.fstat(descriptor)
+            named_after = os.lstat(target)
+            after_identity = (
+                int(after.st_dev),
+                int(after.st_ino),
+                int(after.st_size),
+                int(after.st_mtime_ns),
+                int(after.st_ctime_ns),
+                int(after.st_nlink),
+                int(after.st_uid),
+                int(after.st_gid),
+                int(stat.S_IMODE(after.st_mode)),
+            )
+            named_identity = (
+                int(named_after.st_dev),
+                int(named_after.st_ino),
+                int(named_after.st_size),
+                int(named_after.st_mtime_ns),
+                int(named_after.st_ctime_ns),
+                int(named_after.st_nlink),
+                int(named_after.st_uid),
+                int(named_after.st_gid),
+                int(stat.S_IMODE(named_after.st_mode)),
+            )
+            if before_identity != after_identity or before_identity != named_identity:
+                raise RuntimeError(
+                    f"Repo-Recovery-Prestate driftete beim Readback: {relative_path}"
+                )
+            if actual_oid != git_oid:
+                dirty_paths.append(relative_path)
+        finally:
+            os.close(descriptor)
+    if tuple(sorted(dirty_paths)) != contract.dirty_paths:
+        raise RuntimeError("Repo-Recovery-Prestate besitzt eine andere Dirty-Pfadmenge")
+    _require_clean_recovery_index(root, user)
+    if _bound_release_head_commit(root, user) != commit:
+        raise RuntimeError("Repository-HEAD driftete beim finalen Prestate-Readback")
 
 
 def _verify_recovered_repo_contract(
@@ -5746,6 +7582,20 @@ def _service_expected(service: str, state: TransitionState) -> tuple[bool, str]:
     return True, "vor dem Wechsel installiert und nicht explizit deaktiviert"
 
 
+def _release_service_expected(
+    service: str,
+    state: TransitionState,
+    *,
+    projected_piguard: bool = False,
+) -> tuple[bool, str]:
+    """Erweitert ausschließlich den Releasepfad um ein quiesced projiziertes PiGuard."""
+
+    name = str(service).removesuffix(".service")
+    if name == "piguard" and projected_piguard:
+        return True, "Watchdog wurde vor dem Lease-Token quiesced projiziert"
+    return _service_expected(service, state)
+
+
 def _validated_restart_services(policy: dict, state: TransitionState) -> list[str]:
     if str(policy.get("restart_service_contract") or "") != "core_plus_preinstalled_v1":
         raise RuntimeError("restart_service_contract ist unbekannt oder fehlt")
@@ -6524,11 +8374,642 @@ def _stop_v4_services(services=None):
         return False
 
 
+def _assert_no_rogue_product_processes(repo_dir: str) -> None:
+    """Blockiert katalogisierte Writer, die außerhalb der gestoppten Units laufen."""
+
+    root = os.path.realpath(str(repo_dir))
+    expected_scripts = set()
+    for unit in _catalog_units_strict():
+        module = get_module_by_service(unit)
+        script = str(getattr(module, "script", "") or "")
+        if script:
+            expected_scripts.add(
+                os.path.realpath(os.path.join(root, "Installer", script))
+            )
+    expected_scripts.add(os.path.realpath(PIGUARD_EXECUTABLE_PATH))
+    findings = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdecimal() or int(entry) == os.getpid():
+            continue
+        try:
+            raw = Path(f"/proc/{entry}/cmdline").read_bytes()
+            if not raw:
+                continue
+            argv = [
+                item.decode("utf-8", errors="surrogateescape")
+                for item in raw.rstrip(b"\0").split(b"\0")
+            ]
+            cwd = os.path.realpath(os.readlink(f"/proc/{entry}/cwd"))
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except PermissionError as exc:
+            raise RuntimeError(
+                f"Produktprozess {entry} ist am finalen Writer-Gate nicht lesbar"
+            ) from exc
+        matched = False
+        for item in argv:
+            if not item or item.startswith("-"):
+                continue
+            candidate = (
+                os.path.realpath(item)
+                if os.path.isabs(item)
+                else os.path.realpath(os.path.join(cwd, item))
+            )
+            if candidate in expected_scripts:
+                matched = True
+                break
+            if os.path.basename(item) in {"E3DC-Control", "E3DC.sh"}:
+                matched = True
+                break
+        if matched:
+            findings.append(int(entry))
+    if findings:
+        raise RuntimeError(
+            "Katalogisierte Produktprozesse laufen außerhalb des gebundenen "
+            "systemd-Endzustands: " + ",".join(str(pid) for pid in sorted(findings))
+        )
+
+
+def _assert_no_concurrent_update_processes(transaction_id: str) -> None:
+    """Verwirft jede zweite transaktionsmarkierte Finalizer-/systemd-run-Kette."""
+
+    _update_safety_names(transaction_id)
+    foreign = []
+    own_unit = _update_safety_names(transaction_id)[0]
+    for entry in os.listdir("/proc"):
+        if not entry.isdecimal() or int(entry) == os.getpid():
+            continue
+        try:
+            raw = Path(f"/proc/{entry}/cmdline").read_bytes()
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except PermissionError as exc:
+            raise RuntimeError(
+                f"Updateprozess {entry} ist am finalen Gate nicht lesbar"
+            ) from exc
+        text = raw.replace(b"\0", b" ").decode("utf-8", errors="replace")
+        if UPDATE_FINALIZER_UNIT_PREFIX not in text and "--update-safety-transaction" not in text:
+            continue
+        if own_unit not in text and transaction_id not in text:
+            foreign.append(int(entry))
+    transient_root = Path("/run/systemd/transient")
+    try:
+        entries = tuple(transient_root.iterdir())
+    except FileNotFoundError:
+        entries = ()
+    for path in entries:
+        if (
+            path.name.startswith(UPDATE_FINALIZER_UNIT_PREFIX)
+            and path.name.endswith(".service")
+            and path.name != own_unit
+        ):
+            raise RuntimeError(
+                f"Fremde transiente Update-Finalizer-Unit ist vorhanden: {path.name}"
+            )
+    if foreign:
+        raise RuntimeError(
+            "Fremde Update-Finalizer-Prozesse sind vorhanden: "
+            + ",".join(str(pid) for pid in sorted(foreign))
+        )
+
+
+def _assert_strict_update_writer_quiescence(
+    *,
+    repo_dir: str,
+    transaction_id: str,
+) -> None:
+    """Unmittelbares Endgate: jede Unit inactive/dead, MainPID 0, keine Rogue-Writer."""
+
+    _assert_no_rogue_product_processes(repo_dir)
+    _assert_no_concurrent_update_processes(transaction_id)
+    expected_keys = {"LoadState", "ActiveState", "SubState", "MainPID"}
+    errors = []
+    for unit in _recovery_bootblock_units():
+        result = _run_argv(
+            [
+                "systemctl",
+                "show",
+                "--no-pager",
+                "--property=LoadState",
+                "--property=ActiveState",
+                "--property=SubState",
+                "--property=MainPID",
+                unit,
+            ],
+            timeout=10,
+            env={**os.environ, "LC_ALL": "C", "LANG": "C"},
+        )
+        values = {}
+        for line in str(result.get("stdout") or "").splitlines():
+            key, separator, value = line.partition("=")
+            if separator != "=" or key not in expected_keys or key in values:
+                values = {}
+                break
+            values[key] = value
+        load_state = values.get("LoadState", "").lower()
+        if (
+            not result.get("success")
+            or result.get("timed_out")
+            or int(result.get("returncode", -1)) != 0
+            or str(result.get("stderr") or "")
+            or set(values) != expected_keys
+            or load_state not in {"loaded", "masked", "not-found"}
+            or values.get("ActiveState", "").lower() != "inactive"
+            or values.get("SubState", "").lower() != "dead"
+            or values.get("MainPID") != "0"
+        ):
+            errors.append(
+                f"{unit}={load_state or 'unlesbar'}/"
+                f"{values.get('ActiveState') or 'unlesbar'}/"
+                f"PID{values.get('MainPID') or '?'}"
+            )
+    # Die beiden Prozessprüfungen werden nach sämtlichen Unit-Readbacks erneut
+    # ausgeführt. Damit bleibt kein Inventarisierungsfenster vor der Mutation.
+    _assert_no_rogue_product_processes(repo_dir)
+    _assert_no_concurrent_update_processes(transaction_id)
+    if errors:
+        raise RuntimeError(
+            "Striktes Writer-Endgate ist nicht erfüllt: " + "; ".join(errors)
+        )
+
+
+def _read_finalizer_service_properties(unit: str) -> dict[str, str]:
+    names = (
+        "Id",
+        "LoadState",
+        "ActiveState",
+        "SubState",
+        "MainPID",
+        "InvocationID",
+        "ControlGroup",
+        "FragmentPath",
+        "DropInPaths",
+        "Transient",
+        "Type",
+        "ExitType",
+        "KillMode",
+        "Restart",
+        "User",
+        "Group",
+        "DynamicUser",
+        "WorkingDirectory",
+        "UMask",
+        "Environment",
+        "RuntimeDirectory",
+        "RuntimeDirectoryMode",
+        "RuntimeDirectoryPreserve",
+        "RuntimeMaxUSec",
+        "TimeoutStopUSec",
+        "SendSIGKILL",
+        "OOMPolicy",
+    )
+    result = _run_argv(
+        [
+            "systemctl",
+            "show",
+            "--no-pager",
+            *(f"--property={name}" for name in names),
+            unit,
+        ],
+        timeout=15,
+        env={**os.environ, "LC_ALL": "C", "LANG": "C"},
+    )
+    values = {}
+    for line in str(result.get("stdout") or "").splitlines():
+        key, separator, value = line.partition("=")
+        if separator != "=" or key not in names or key in values or value != value.strip():
+            values = {}
+            break
+        values[key] = value
+    if (
+        not result.get("success")
+        or result.get("timed_out")
+        or int(result.get("returncode", -1)) != 0
+        or str(result.get("stderr") or "")
+        or set(values) != set(names)
+    ):
+        raise RuntimeError(f"Transiente Finalizer-Unit ist nicht vollständig lesbar: {unit}")
+    return values
+
+
+def _assert_managed_finalizer_service(contract: UpdateSafetyContract) -> dict[str, str]:
+    """Bindet PID, Invocation, cgroup und sämtliche sicherheitsrelevanten Properties."""
+
+    invocation = str(os.environ.get("E3DC_UPDATE_FINALIZER_INVOCATION_ID") or "")
+    if not re.fullmatch(r"[0-9a-f]{32}", invocation):
+        raise RuntimeError("Finalizer besitzt keine gebundene systemd-InvocationID")
+    values = _read_finalizer_service_properties(contract.finalizer_unit)
+    expected = {
+        "Id": contract.finalizer_unit,
+        "LoadState": "loaded",
+        "ActiveState": "active",
+        "MainPID": str(os.getpid()),
+        "InvocationID": invocation,
+        "FragmentPath": f"/run/systemd/transient/{contract.finalizer_unit}",
+        "DropInPaths": "",
+        "Transient": "yes",
+        "Type": "exec",
+        "ExitType": "main",
+        "KillMode": "control-group",
+        "Restart": "no",
+        "User": "root",
+        "Group": "root",
+        "DynamicUser": "no",
+        "WorkingDirectory": "/",
+        "UMask": "0077",
+        "RuntimeDirectory": contract.runtime_directory,
+        "RuntimeDirectoryMode": "0700",
+        "RuntimeDirectoryPreserve": "no",
+        "RuntimeMaxUSec": "35min",
+        "TimeoutStopUSec": "15s",
+        "SendSIGKILL": "yes",
+        "OOMPolicy": "stop",
+    }
+    mismatches = [
+        f"{name}={values.get(name)!r}"
+        for name, value in expected.items()
+        if values.get(name) != value
+    ]
+    control_group = values.get("ControlGroup", "")
+    if (
+        values.get("SubState") not in {"running", "start"}
+        or not control_group.startswith("/")
+        or not control_group.endswith("/" + contract.finalizer_unit)
+    ):
+        mismatches.append("cgroup/runtime/timeout")
+    expected_environment = (
+        f"E3DC_BOOTSTRAP_ROOT={os.environ.get('E3DC_BOOTSTRAP_ROOT', '')}",
+        f"E3DC_BOOTSTRAP_RUNNER_ROOT={os.environ.get('E3DC_BOOTSTRAP_RUNNER_ROOT', '')}",
+        f"E3DC_BOOTSTRAP_USER={os.environ.get('E3DC_BOOTSTRAP_USER', '')}",
+        f"E3DC_INSTALL_ROOT={os.environ.get('E3DC_INSTALL_ROOT', '')}",
+        "PYTHONNOUSERSITE=1",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "PYTHONUNBUFFERED=1",
+        "LC_ALL=C.UTF-8",
+        "LANG=C.UTF-8",
+    )
+    try:
+        actual_environment = tuple(shlex.split(values.get("Environment", "")))
+    except ValueError:
+        actual_environment = ()
+    if actual_environment != expected_environment:
+        mismatches.append("Environment")
+    try:
+        own_cgroups = Path("/proc/self/cgroup").read_text(encoding="ascii").splitlines()
+    except (OSError, UnicodeError) as exc:
+        raise RuntimeError("Eigene Finalizer-cgroup ist nicht lesbar") from exc
+    if not any(line.partition("::")[2] == control_group for line in own_cgroups):
+        mismatches.append("proc-cgroup")
+    runtime_path = Path("/run") / contract.runtime_directory
+    try:
+        runtime_metadata = runtime_path.lstat()
+    except FileNotFoundError:
+        mismatches.append("RuntimeDirectory-fehlt")
+    else:
+        if (
+            runtime_path.is_symlink()
+            or not stat.S_ISDIR(runtime_metadata.st_mode)
+            or runtime_metadata.st_uid != 0
+            or runtime_metadata.st_gid != 0
+            or stat.S_IMODE(runtime_metadata.st_mode) != 0o700
+        ):
+            mismatches.append("RuntimeDirectory-Metadaten")
+    if mismatches:
+        raise RuntimeError(
+            "Transiente Finalizer-Servicebindung driftete: " + ", ".join(mismatches)
+        )
+    return values
+
+
+def _verify_watchdog_pause_fresh(reason: str) -> None:
+    descriptor, before = _open_regular_file_nofollow(WATCHDOG_PAUSE_FILE)
+    try:
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) != 0o664
+            or before.st_size < 2
+            or before.st_size > 4096
+        ):
+            raise RuntimeError("Watchdog-Pause besitzt unsichere Metadaten")
+        payload = os.read(descriptor, 4097)
+        after = os.fstat(descriptor)
+        named_after = os.stat(WATCHDOG_PAUSE_FILE, follow_symlinks=False)
+        if (
+            _file_identity(before) != _file_identity(after)
+            or _file_identity(before) != _file_identity(named_after)
+            or len(payload) > 4096
+            or _repo_descriptor_has_unsafe_xattrs(descriptor)
+        ):
+            raise RuntimeError("Watchdog-Pause driftete beim Lesen")
+    finally:
+        os.close(descriptor)
+    try:
+        record = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Watchdog-Pause ist nicht JSON-gebunden") from exc
+    now = time.time()
+    if (
+        not isinstance(record, dict)
+        or record.get("active") is not True
+        or record.get("reason") != reason
+        or int(record.get("pid", -1)) != os.getpid()
+        or abs(now - float(record.get("ts", 0))) > 30
+        or now - (before.st_mtime_ns / 1_000_000_000) > 30
+        or (before.st_mtime_ns / 1_000_000_000) - now > 5
+    ):
+        raise RuntimeError("Watchdog-Pause ist nicht frisch und prozessgebunden")
+
+
+def _create_update_safety_start_token(
+    contract: UpdateSafetyContract,
+    *,
+    repo_dir: str,
+) -> None:
+    """Öffnet den Startpfad erst im gebundenen laufenden Finalizer-Service."""
+
+    _validate_update_safety_contract(contract, expected_state="pending")
+    _verify_update_safety_marker(contract, expected_present=True)
+    _reload_and_verify_update_safety_dropins(contract, expected_present=True)
+    _assert_managed_finalizer_service(contract)
+    _assert_strict_update_writer_quiescence(
+        repo_dir=repo_dir,
+        transaction_id=contract.transaction_id,
+    )
+    runtime_path = Path("/run") / contract.runtime_directory
+    runtime_descriptor = _open_directory_nofollow(runtime_path)
+    try:
+        _require_root_controlled_directory(
+            runtime_descriptor,
+            str(runtime_path),
+            0o700,
+        )
+        payload = f"E3DC_UPDATE_START_LEASE_V1:{contract.transaction_id}\n".encode("ascii")
+        _create_owned_exact_root_file_at(
+            runtime_descriptor,
+            UPDATE_FINALIZER_TOKEN_NAME,
+            payload,
+            0o600,
+        )
+        os.fsync(runtime_descriptor)
+        _read_exact_root_file_at(
+            runtime_descriptor,
+            UPDATE_FINALIZER_TOKEN_NAME,
+            payload,
+            0o600,
+        )
+    finally:
+        os.close(runtime_descriptor)
+
+
+def _require_exact_pending_update_safety_for_recovery(
+    contract: UpdateSafetyContract,
+) -> UpdateSafetyContract:
+    """Erlaubt Recovery nur mit demselben vollständigen Pending-Inodevertrag."""
+
+    try:
+        current = _validate_update_safety_contract(
+            contract,
+            expected_state="pending",
+        )
+        if current != contract:
+            raise RuntimeError("Pending Update-Sicherheitsreceipt wurde ersetzt")
+        _verify_update_safety_marker(contract, expected_present=True)
+        _reload_and_verify_update_safety_dropins(contract, expected_present=True)
+    except BaseException as exc:
+        if isinstance(exc, UpdateSafetyManagedServiceUnquiescedError):
+            raise
+        raise UpdateSafetyManagedServiceUnquiescedError(
+            "Ursprünglicher Pending-Receipt-/Marker-/00-Inodevertrag ist vor "
+            "einer Recoverymutation nicht mehr exakt beweisbar"
+        ) from exc
+    return contract
+
+
+def _read_managed_finalizer_terminal_snapshot(
+    contract: UpdateSafetyContract,
+) -> tuple[str, ...]:
+    """Bindet einen einzelnen vollständigen Lease-/cgroup-/Prozess-Endzustand."""
+
+    names = (
+        "Id",
+        "LoadState",
+        "ActiveState",
+        "SubState",
+        "MainPID",
+        "ControlGroup",
+        "FragmentPath",
+        "DropInPaths",
+        "Transient",
+        "RuntimeDirectory",
+    )
+    result = _run_argv(
+        [
+            "systemctl",
+            "show",
+            "--no-pager",
+            *(f"--property={name}" for name in names),
+            contract.finalizer_unit,
+        ],
+        timeout=10,
+        env={**os.environ, "LC_ALL": "C", "LANG": "C"},
+    )
+    values = {}
+    for line in str(result.get("stdout") or "").splitlines():
+        key, separator, value = line.partition("=")
+        if separator != "=" or key not in names or key in values:
+            values = {}
+            break
+        values[key] = value
+    if (
+        not result.get("success")
+        or result.get("timed_out")
+        or int(result.get("returncode", -1)) != 0
+        or str(result.get("stderr") or "")
+        or set(values) != set(names)
+        or values.get("Id") != contract.finalizer_unit
+        or values.get("ActiveState") != "inactive"
+        or values.get("SubState") != "dead"
+        or values.get("MainPID") != "0"
+        or values.get("DropInPaths") != ""
+    ):
+        raise RuntimeError("Transiente Finalizer-Unit ist nicht vollständig terminal")
+
+    load_state = values.get("LoadState")
+    fragment = values.get("FragmentPath", "")
+    control_group = values.get("ControlGroup", "")
+    if load_state == "not-found":
+        if (
+            fragment
+            or control_group
+            or values.get("Transient") != "no"
+            or values.get("RuntimeDirectory")
+        ):
+            raise RuntimeError("Entladene Finalizer-Unit besitzt Residuen")
+    elif load_state == "loaded":
+        expected_fragment = f"/run/systemd/transient/{contract.finalizer_unit}"
+        if (
+            fragment != expected_fragment
+            or values.get("Transient") != "yes"
+            or values.get("RuntimeDirectory") != contract.runtime_directory
+            or (
+                control_group
+                and (
+                    not control_group.startswith("/")
+                    or not control_group.endswith("/" + contract.finalizer_unit)
+                )
+            )
+        ):
+            raise RuntimeError("Geladene terminale Finalizer-Unit driftete")
+        fragment_metadata = os.lstat(expected_fragment)
+        if (
+            not stat.S_ISREG(fragment_metadata.st_mode)
+            or fragment_metadata.st_nlink != 1
+            or fragment_metadata.st_uid != 0
+            or fragment_metadata.st_gid != 0
+            or fragment_metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            raise RuntimeError("Transiente terminale Finalizer-Unitdatei ist unsicher")
+    else:
+        raise RuntimeError(f"Finalizer-Unit besitzt LoadState {load_state!r}")
+
+    if control_group:
+        cgroup_path = Path("/sys/fs/cgroup") / control_group.lstrip("/")
+        try:
+            processes = (cgroup_path / "cgroup.procs").read_text(encoding="ascii")
+        except FileNotFoundError:
+            processes = ""
+        except (OSError, UnicodeError) as exc:
+            raise RuntimeError("Finalizer-cgroup ist nicht eindeutig lesbar") from exc
+        if processes.strip():
+            raise RuntimeError("Finalizer-cgroup besitzt noch Prozesse")
+    if os.path.lexists(f"/run/{contract.runtime_directory}") or os.path.lexists(
+        contract.token_path
+    ):
+        raise RuntimeError("Finalizer-RuntimeDirectory oder Starttoken blieb vorhanden")
+    # Anders als das normale Concurrent-Gate erlaubt dieser Endbeweis auch
+    # keinen Prozess der eigenen txid außerhalb oder innerhalb der alten cgroup.
+    _assert_no_same_transaction_finalizer_processes(contract)
+    return tuple(values[name] for name in names)
+
+
+def _wait_managed_finalizer_inactive(
+    contract: UpdateSafetyContract,
+    *,
+    timeout_s: int = 30,
+    repo_dir: str | None = None,
+    require_pending_contract: bool = False,
+) -> None:
+    """Verlangt mehrfach denselben vollständigen terminalen Endzustand."""
+
+    if require_pending_contract and not repo_dir:
+        raise RuntimeError("Pending Finalizer-Endgate benötigt den Produktpfad")
+    deadline = time.monotonic() + max(1, int(timeout_s))
+    stable_signature = None
+    stable_reads = 0
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            if require_pending_contract:
+                _require_exact_pending_update_safety_for_recovery(contract)
+            if repo_dir is not None:
+                _assert_strict_update_writer_quiescence(
+                    repo_dir=repo_dir,
+                    transaction_id=contract.transaction_id,
+                )
+            signature = _read_managed_finalizer_terminal_snapshot(contract)
+        except Exception as exc:
+            last_error = exc
+            stable_signature = None
+            stable_reads = 0
+        else:
+            if signature == stable_signature:
+                stable_reads += 1
+            else:
+                stable_signature = signature
+                stable_reads = 1
+            if stable_reads >= UPDATE_FINALIZER_TERMINAL_STABLE_READS:
+                return
+        time.sleep(UPDATE_FINALIZER_TERMINAL_STABLE_INTERVAL_S)
+    detail = f": {last_error}" if last_error is not None else ""
+    raise RuntimeError(
+        "Transiente Finalizer-Unit erreichte keinen mehrfach stabilen, "
+        f"prozessfreien Endzustand{detail}"
+    )
+
+
+def _kill_managed_finalizer_and_quiesce(
+    contract: UpdateSafetyContract,
+    *,
+    repo_dir: str,
+    require_pending_contract: bool = True,
+) -> None:
+    """Beendet die ganze cgroup und beweist danach erneut vollständige Writer-Ruhe."""
+
+    action_failures = []
+    for label, argv in (
+        (
+            "kill",
+            [
+                "systemctl",
+                "kill",
+                "--kill-whom=all",
+                "--signal=SIGKILL",
+                contract.finalizer_unit,
+            ],
+        ),
+        ("stop", ["systemctl", "stop", contract.finalizer_unit]),
+    ):
+        result = _run_argv(
+            argv,
+            timeout=15,
+            env={**os.environ, "LC_ALL": "C", "LANG": "C"},
+        )
+        if (
+            not isinstance(result, dict)
+            or not result.get("success")
+            or result.get("timed_out")
+            or int(result.get("returncode", -1)) != 0
+            or str(result.get("stderr") or "")
+        ):
+            action_failures.append(
+                f"{label}={_combined_process_diagnostics(result or {}, maximum=600)}"
+            )
+    if not _stop_v4_services(V4_SERVICES):
+        raise RuntimeError("Writer konnten nach Finalizer-Tod nicht gestoppt werden")
+    _wait_managed_finalizer_inactive(
+        contract,
+        repo_dir=repo_dir,
+        require_pending_contract=require_pending_contract,
+    )
+    if action_failures:
+        update_logger.warning(
+            "Managed Finalizer kill/stop meldeten Fehler; der vollständige "
+            "mehrfache Endbeweis kompensierte sie: %s",
+            "; ".join(action_failures),
+        )
+    _assert_no_same_transaction_finalizer_processes(contract)
+    _assert_strict_update_writer_quiescence(
+        repo_dir=repo_dir,
+        transaction_id=contract.transaction_id,
+    )
+    if require_pending_contract:
+        _require_exact_pending_update_safety_for_recovery(contract)
+    # Der letzte Schritt ist erneut der vollständige Mehrfachnachweis; nach
+    # ihm folgt vor der Fehlerklassifikation kein systemd-Mutator mehr.
+    _wait_managed_finalizer_inactive(
+        contract,
+        repo_dir=repo_dir,
+        require_pending_contract=require_pending_contract,
+    )
+
+
 def _post_update_healthcheck(
     services=None,
     transition_state: TransitionState | None = None,
     *,
     legacy_recovery: bool = False,
+    projected_piguard: bool = False,
 ) -> bool:
     """Kleiner Gesundheitstest nach Update oder Release-Rueckfall."""
     print('\n[->] Gesundheitstest...')
@@ -6553,14 +9034,20 @@ def _post_update_healthcheck(
     for core_srv in INSTALL_CENTER_CORE_SERVICES:
         if core_srv not in health_services:
             health_services.append(core_srv)
-    if "piguard.service" in state.preinstalled_units and "piguard" not in health_services:
+    if (
+        projected_piguard or "piguard.service" in state.preinstalled_units
+    ) and "piguard" not in health_services:
         health_services.append("piguard")
 
     for srv in health_services:
         if not srv or srv == 'e3dc':
             continue
         try:
-            expected, reason = _service_expected(srv, state)
+            expected, reason = _release_service_expected(
+                srv,
+                state,
+                projected_piguard=projected_piguard,
+            )
         except Exception as exc:
             errors.append(str(exc))
             continue
@@ -6599,12 +9086,204 @@ def _post_update_healthcheck(
     return True
 
 
+def _verify_prepared_service_quiesced(service: str) -> None:
+    """Beweist nach Enable/Reset-failed den noch nicht gestarteten Unit-Zustand."""
+
+    unit = _unit_name(service)
+    property_names = ("LoadState", "ActiveState", "SubState", "MainPID")
+    result = _run_argv(
+        [
+            "systemctl",
+            "show",
+            "--no-pager",
+            *(f"--property={name}" for name in property_names),
+            unit,
+        ],
+        timeout=10,
+        env={**os.environ, "LC_ALL": "C", "LANG": "C"},
+    )
+    values: dict[str, str] = {}
+    for raw_line in str(result.get("stdout") or "").splitlines():
+        key, separator, value = raw_line.partition("=")
+        if (
+            separator != "="
+            or key not in property_names
+            or key in values
+            or value != value.strip()
+        ):
+            values = {}
+            break
+        values[key] = value
+    if (
+        not result.get("success")
+        or result.get("timed_out")
+        or int(result.get("returncode", -1)) != 0
+        or str(result.get("stderr") or "")
+        or values
+        != {
+            "LoadState": "loaded",
+            "ActiveState": "inactive",
+            "SubState": "dead",
+            "MainPID": "0",
+        }
+    ):
+        raise RuntimeError(
+            f"{unit} ist vor dem Lease-Token nicht loaded/inactive/dead/PID0"
+        )
+
+
+def _prepare_v4_service_activation(
+    *,
+    services,
+    transition_state: TransitionState,
+    projected_piguard: bool = False,
+) -> bool:
+    """Erledigt persistente Startvorbereitung vollständig vor dem Lease-Token."""
+
+    try:
+        state = transition_state
+        _verify_transition_state(state)
+        from .ha_writer_admission import instance_role_anchor_matches
+
+        if instance_role_anchor_matches(
+            state.ha_role,
+            peer_ip=str(state.config.get("ha_peer_ip") or ""),
+        ) is not True:
+            raise RuntimeError("Vorhandener Instanzrollen-Anker widerspricht dem Update")
+        if ensure_manager_lock_namespace() is not True:
+            raise RuntimeError(
+                "Root-kontrollierter Manager-Locknamespace ist nicht herstellbar"
+            )
+    except Exception as exc:
+        print(f"  [!] Persistente Startvorbereitung ist nicht beweisbar: {exc}")
+        return False
+
+    install_user = get_install_user()
+    legacy_unit_present = any(
+        os.path.exists(path)
+        for path in (
+            "/etc/systemd/system/e3dc.service",
+            "/lib/systemd/system/e3dc.service",
+            "/usr/lib/systemd/system/e3dc.service",
+        )
+    )
+    errors = []
+    if legacy_unit_present:
+        for action in ("stop", "disable", "mask"):
+            result = _run_argv(
+                ["sudo", "systemctl", action, "e3dc.service"],
+                timeout=30,
+            )
+            if not result.get("success") or result.get("timed_out"):
+                errors.append(
+                    f"e3dc.service {action} blieb unbestätigt: "
+                    + _combined_process_diagnostics(result, maximum=500)
+                )
+        active = _run_argv(["systemctl", "is-active", "e3dc.service"], timeout=10)
+        enabled = _run_argv(["systemctl", "is-enabled", "e3dc.service"], timeout=10)
+        if not _systemd_activity_readback_matches(active, should_be_active=False):
+            errors.append("Legacy e3dc.service ist nach Vorbereitung nicht inaktiv")
+        if _systemd_state_from_result(enabled, SYSTEMD_KNOWN_UNIT_FILE_STATES) != "masked":
+            errors.append("Legacy e3dc.service ist nach Vorbereitung nicht persistent maskiert")
+    for screen_user in tuple(dict.fromkeys((str(install_user), "root"))):
+        for screen_name in ("e3dc", "E3DC"):
+            prefix = ["sudo", "-u", screen_user] if screen_user != "root" else ["sudo"]
+            _run_argv([*prefix, "screen", "-S", screen_name, "-X", "quit"], timeout=10)
+    _run_argv(["sudo", "pkill", "-x", "E3DC-Control"], timeout=10)
+    _run_argv(["sudo", "pkill", "-f", r"(^|/)E3DC\.sh([[:space:]]|$)"], timeout=10)
+
+    standby = _ha_slave_standby_services(state)
+    start_services = _normalize_restart_services(services)
+    if (
+        projected_piguard or "piguard.service" in state.preinstalled_units
+    ) and "piguard" not in start_services:
+        start_services.append("piguard")
+    for service in start_services:
+        if not service or service == "e3dc":
+            continue
+        try:
+            expected, reason = _release_service_expected(
+                service,
+                state,
+                projected_piguard=projected_piguard,
+            )
+        except Exception as exc:
+            errors.append(str(exc))
+            continue
+        if not expected or service in standby:
+            if _service_unit_exists(service):
+                stopped = _run_argv(
+                    ["sudo", "systemctl", "stop", _unit_name(service)],
+                    timeout=30,
+                )
+                inactive = _run_argv(
+                    ["systemctl", "is-active", _unit_name(service)],
+                    timeout=10,
+                )
+                if (
+                    not stopped.get("success")
+                    or not _systemd_activity_readback_matches(
+                        inactive,
+                        should_be_active=False,
+                    )
+                ):
+                    errors.append(
+                        f"{service} blieb in {reason} nicht beweisbar gestoppt"
+                    )
+            continue
+        if not _service_unit_exists(service):
+            errors.append(f"{_unit_name(service)} fehlt, obwohl erwartet ({reason})")
+            continue
+        reset_failed = _run_argv(
+            ["sudo", "systemctl", "reset-failed", _unit_name(service)],
+            timeout=30,
+        )
+        if (
+            not reset_failed.get("success")
+            or reset_failed.get("timed_out")
+            or int(reset_failed.get("returncode", -1)) != 0
+            or str(reset_failed.get("stderr") or "")
+        ):
+            errors.append(f"{service} konnte vor dem Startgate nicht reset-failed werden")
+            continue
+        enabled = _run_argv(
+            ["sudo", "systemctl", "enable", _unit_name(service)],
+            timeout=30,
+        )
+        readback = _run_argv(
+            ["systemctl", "is-enabled", _unit_name(service)],
+            timeout=10,
+        )
+        if (
+            not enabled.get("success")
+            or enabled.get("timed_out")
+            or _systemd_state_from_result(
+                readback,
+                SYSTEMD_KNOWN_UNIT_FILE_STATES,
+            )
+            != "enabled"
+        ):
+            errors.append(f"{service} ist vor dem Start nicht rebootfest aktiviert")
+            continue
+        try:
+            _verify_prepared_service_quiesced(service)
+        except Exception as exc:
+            errors.append(str(exc))
+    if errors:
+        for error in errors:
+            print(f"  [!] {error}")
+        return False
+    return True
+
+
 def _restart_v4_services(
     headless: bool = False,
     services=None,
     transition_state: TransitionState | None = None,
     *,
     legacy_recovery: bool = False,
+    prepared_start_only: bool = False,
+    projected_piguard: bool = False,
 ) -> bool:
     """Startet die installierten E3DC-Control-Dienste neu."""
     try:
@@ -6628,39 +9307,42 @@ def _restart_v4_services(
     except Exception as exc:
         print(f"  [!] Root-kontrollierte Instanzrolle ist nicht bestätigbar: {exc}")
         return False
-    if ensure_manager_lock_namespace() is not True:
+    if not prepared_start_only and ensure_manager_lock_namespace() is not True:
         print("  [!] Root-kontrollierter Manager-Locknamespace ist nicht herstellbar.")
         return False
-    print('\n[->] Bereinige alte C++ E3DC-Dienste/Screens (falls vorhanden)...')
-    install_user = get_install_user()
-    legacy_unit_present = any(os.path.exists(path) for path in (
-        '/etc/systemd/system/e3dc.service',
-        '/lib/systemd/system/e3dc.service',
-        '/usr/lib/systemd/system/e3dc.service',
-    ))
-    if legacy_unit_present and not legacy_recovery:
-        run_command('sudo systemctl stop e3dc.service 2>/dev/null', timeout=15)
-        run_command('sudo systemctl disable e3dc.service 2>/dev/null', timeout=15)
-        run_command('sudo systemctl mask e3dc.service 2>/dev/null', timeout=15)
-        print('  [OK] Legacy e3dc.service gestoppt/deaktiviert.')
-    elif not legacy_unit_present:
-        print('  [OK] Kein Legacy e3dc.service vorhanden.')
-    if legacy_recovery:
-        print('  [OK] Legacy-Betriebszustand bleibt fuer die Recovery erhalten.')
-    else:
-        run_command(f'sudo -u {install_user} screen -S e3dc -X quit 2>/dev/null', timeout=5)
-        run_command(f'sudo -u {install_user} screen -S E3DC -X quit 2>/dev/null', timeout=5)
-        run_command('sudo screen -S e3dc -X quit 2>/dev/null', timeout=5)
-        run_command('sudo screen -S E3DC -X quit 2>/dev/null', timeout=5)
-        run_command('sudo pkill -x E3DC-Control 2>/dev/null', timeout=5)
-        run_command(r"sudo pkill -f '(^|/)E3DC\.sh([[:space:]]|$)' 2>/dev/null", timeout=5)
-        print('  [OK] Legacy-Cleanup abgeschlossen; der alte C++ Kern wird nicht gestartet.')
+    if not prepared_start_only:
+        print('\n[->] Bereinige alte C++ E3DC-Dienste/Screens (falls vorhanden)...')
+        install_user = get_install_user()
+        legacy_unit_present = any(os.path.exists(path) for path in (
+            '/etc/systemd/system/e3dc.service',
+            '/lib/systemd/system/e3dc.service',
+            '/usr/lib/systemd/system/e3dc.service',
+        ))
+        if legacy_unit_present and not legacy_recovery:
+            run_command('sudo systemctl stop e3dc.service 2>/dev/null', timeout=15)
+            run_command('sudo systemctl disable e3dc.service 2>/dev/null', timeout=15)
+            run_command('sudo systemctl mask e3dc.service 2>/dev/null', timeout=15)
+            print('  [OK] Legacy e3dc.service gestoppt/deaktiviert.')
+        elif not legacy_unit_present:
+            print('  [OK] Kein Legacy e3dc.service vorhanden.')
+        if legacy_recovery:
+            print('  [OK] Legacy-Betriebszustand bleibt fuer die Recovery erhalten.')
+        else:
+            run_command(f'sudo -u {install_user} screen -S e3dc -X quit 2>/dev/null', timeout=5)
+            run_command(f'sudo -u {install_user} screen -S E3DC -X quit 2>/dev/null', timeout=5)
+            run_command('sudo screen -S e3dc -X quit 2>/dev/null', timeout=5)
+            run_command('sudo screen -S E3DC -X quit 2>/dev/null', timeout=5)
+            run_command('sudo pkill -x E3DC-Control 2>/dev/null', timeout=5)
+            run_command(r"sudo pkill -f '(^|/)E3DC\.sh([[:space:]]|$)' 2>/dev/null", timeout=5)
+            print('  [OK] Legacy-Cleanup abgeschlossen; der alte C++ Kern wird nicht gestartet.')
 
     print('\n[->] E3DC-Control-Dienste werden aktiviert und gestartet...')
     ha_slave_services = _ha_slave_standby_services(state)
     standby_label = _ha_standby_label(state)
     start_services = _normalize_restart_services(services)
-    if "piguard.service" in state.preinstalled_units and "piguard" not in start_services:
+    if (
+        projected_piguard or "piguard.service" in state.preinstalled_units
+    ) and "piguard" not in start_services:
         start_services.append("piguard")
     errors = []
     for srv in start_services:
@@ -6669,26 +9351,48 @@ def _restart_v4_services(
                 print('  [SKIP] e3dc ist Legacy C++ und wird im Update nicht gestartet.')
             continue
         try:
-            expected, reason = _service_expected(srv, state)
+            expected, reason = _release_service_expected(
+                srv,
+                state,
+                projected_piguard=projected_piguard,
+            )
         except Exception as exc:
             errors.append(str(exc))
             continue
         if not expected or srv in ha_slave_services:
             if _service_unit_exists(srv):
-                stopped = run_command(f'sudo systemctl stop {srv}', timeout=15)
-                inactive = run_command(f'systemctl is-active {srv}', timeout=10)
-                activity = inactive.get('stdout', '').strip().lower()
-                if not stopped['success'] or activity not in {'inactive', 'failed'}:
-                    errors.append(f'{srv} konnte fuer Standby nicht sicher gestoppt werden')
+                if prepared_start_only:
+                    try:
+                        _verify_prepared_service_quiesced(srv)
+                    except Exception as exc:
+                        errors.append(str(exc))
+                else:
+                    stopped = run_command(f'sudo systemctl stop {srv}', timeout=15)
+                    inactive = run_command(f'systemctl is-active {srv}', timeout=10)
+                    activity = inactive.get('stdout', '').strip().lower()
+                    if not stopped['success'] or activity not in {'inactive', 'failed'}:
+                        errors.append(f'{srv} konnte fuer Standby nicht sicher gestoppt werden')
             print(f'  [SKIP] {srv} bleibt gestoppt: {reason}.')
             continue
         if not _service_unit_exists(srv):
             errors.append(f'{_unit_name(srv)} fehlt, obwohl erwartet ({reason})')
             continue
         if _service_unit_exists(srv):
-            run_command(f'sudo systemctl reset-failed {srv} 2>/dev/null || true', timeout=10)
-            enable = run_command(f'sudo systemctl enable {srv}', timeout=15)
-            res = run_command(f'sudo systemctl restart {srv}', timeout=15)
+            if prepared_start_only:
+                enable = {
+                    "success": True,
+                    "stdout": "vorbereitet",
+                    "stderr": "",
+                    "returncode": 0,
+                }
+            else:
+                run_command(f'sudo systemctl reset-failed {srv} 2>/dev/null || true', timeout=10)
+                enable = run_command(f'sudo systemctl enable {srv}', timeout=15)
+            start_action = "start" if prepared_start_only else "restart"
+            res = run_command(
+                f'sudo systemctl {start_action} {srv}',
+                timeout=15,
+            )
             enabled_probe = run_command(f'systemctl is-enabled {srv}', timeout=10)
             enabled_state = _systemd_state_from_result(
                 enabled_probe,
@@ -6709,7 +9413,7 @@ def _restart_v4_services(
             }
             command_results = (
                 ("enable", enable),
-                ("restart", res),
+                (start_action, res),
                 ("is-enabled", enabled_probe),
                 ("is-active", active_probe),
             )
@@ -6771,7 +9475,7 @@ def _restart_v4_services(
                     f"{srv} besitzt keinen sicheren Start-Endzustand "
                     f"({enabled_state or 'unlesbar'}/{active_state or 'unlesbar'}); "
                     f"enable {_command_result_diagnostic(enable)}; "
-                    f"restart {_command_result_diagnostic(res)}; "
+                    f"{start_action} {_command_result_diagnostic(res)}; "
                     f"is-enabled {_command_result_diagnostic(enabled_probe)}; "
                     f"is-active {_command_result_diagnostic(active_probe)}"
                     f"{settle_detail}"
@@ -7847,8 +10551,14 @@ def finalize_release_from_target(
     expected_legacy_activity: str,
     expected_venv_state: str,
     expected_venv_path: str,
+    update_safety_transaction: str | None = None,
+    update_safety_receipt_sha256: str | None = None,
+    update_safety_service_unit: str | None = None,
+    update_safety_runtime_directory: str | None = None,
+    update_safety_token_path: str | None = None,
     headless: bool = True,
     privileged_preimages=None,
+    postcommit_state: dict[str, bool] | None = None,
 ) -> None:
     """Finalisiert einen Reset ausschließlich aus dem versiegelten Commit-Snapshot."""
 
@@ -7869,6 +10579,43 @@ def finalize_release_from_target(
     role = str(expected_role or "").strip().lower()
     if role not in VALID_HA_ROLES:
         raise RuntimeError("Erwartete HA-/Shadow-Rolle ist ungültig")
+
+    safety_values = (
+        update_safety_transaction,
+        update_safety_receipt_sha256,
+        update_safety_service_unit,
+        update_safety_runtime_directory,
+        update_safety_token_path,
+    )
+    if any(safety_values) and not all(safety_values):
+        raise RuntimeError("Target-Finalizer besitzt einen partiellen Update-Sicherheitsvertrag")
+    if postcommit_state is not None and postcommit_state != {
+        "commit_attempted": False
+    }:
+        raise RuntimeError("Target-Finalizer besitzt keinen frischen PostCommit-Grenzzustand")
+    safety_contract = None
+    if all(safety_values):
+        safety_contract = _read_update_safety_contract()
+        if (
+            safety_contract is None
+            or safety_contract.state != "pending"
+            or safety_contract.transaction_id != update_safety_transaction
+            or safety_contract.receipt_sha256 != update_safety_receipt_sha256
+            or safety_contract.finalizer_unit != update_safety_service_unit
+            or safety_contract.runtime_directory != update_safety_runtime_directory
+            or safety_contract.token_path != update_safety_token_path
+            or safety_contract.target_commit != commit
+            or safety_contract.target_tag != _normalize_release_tag(target_tag)
+            or safety_contract.role != role
+        ):
+            raise RuntimeError("Target-Finalizer sieht nicht das pending Sicherheitsreceipt")
+        _verify_update_safety_marker(safety_contract, expected_present=True)
+        _reload_and_verify_update_safety_dropins(safety_contract, expected_present=True)
+        _assert_managed_finalizer_service(safety_contract)
+        _assert_strict_update_writer_quiescence(
+            repo_dir=target_root,
+            transaction_id=safety_contract.transaction_id,
+        )
 
     actual_commit = _resolve_git_commit(target_root, "HEAD", get_install_user())
     if not actual_commit or not _exact_commit_matches(commit, actual_commit):
@@ -7917,6 +10664,10 @@ def finalize_release_from_target(
     delete_ok, delete_errors = _delete_approved_stale_paths(policy.get("delete_files") or [])
     if not delete_ok:
         raise RuntimeError("Stale-Delete-Positivliste verletzt: " + "; ".join(delete_errors))
+    if safety_contract is not None:
+        _validate_update_safety_contract(safety_contract, expected_state="pending")
+        _verify_update_safety_marker(safety_contract, expected_present=True)
+        _reload_and_verify_update_safety_dropins(safety_contract, expected_present=True)
 
     _announce_finalizer_phase(3, phase_total, "Webroot und Berechtigungen synchronisieren")
     _sync_release_web(
@@ -7946,8 +10697,13 @@ def finalize_release_from_target(
             install_user,
             expected_commit=commit,
         )
+    if safety_contract is not None:
+        _validate_update_safety_contract(safety_contract, expected_state="pending")
+        _verify_update_safety_marker(safety_contract, expected_present=True)
+        _reload_and_verify_update_safety_dropins(safety_contract, expected_present=True)
 
     from .permissions import (
+        PI_GUARD_PATH,
         ensure_private_ml_model_store,
         harden_web_program_permissions,
         refresh_watchdog_guard_script,
@@ -7957,7 +10713,14 @@ def finalize_release_from_target(
     if not harden_web_program_permissions():
         raise RuntimeError("Web-Programmrechte konnten nicht gehärtet werden")
     _announce_finalizer_phase(4, phase_total, "Kernservices und Migrationen vorbereiten")
-    if not _ensure_install_center_core_services():
+    expected_service_dropins = (
+        _update_safety_expected_dropins(safety_contract)
+        if safety_contract is not None
+        else None
+    )
+    if not _ensure_install_center_core_services(
+        expected_recovery_dropins=expected_service_dropins,
+    ):
         raise RuntimeError("Kernservice-Installation ist unvollständig")
     if not migrate_storage_manager_next_override():
         raise RuntimeError("Storage-Service-Migration ist fehlgeschlagen")
@@ -7975,19 +10738,74 @@ def finalize_release_from_target(
             "Bare-Metal-Update hat die tmpfs-Startsperren unerwartet übersprungen"
         )
 
-    _verify_transition_state(state)
+    projected_piguard = False
+    if safety_contract is not None:
+        _validate_update_safety_contract(safety_contract, expected_state="pending")
+        _verify_update_safety_marker(safety_contract, expected_present=True)
+        _reload_and_verify_update_safety_dropins(safety_contract, expected_present=True)
+        _assert_managed_finalizer_service(safety_contract)
+        _assert_strict_update_writer_quiescence(
+            repo_dir=target_root,
+            transaction_id=safety_contract.transaction_id,
+        )
+        watchdog_refresh_required = bool(
+            os.path.exists(PI_GUARD_PATH) or _service_unit_exists("piguard")
+        )
+        if not refresh_watchdog_guard_script(start_service=False):
+            raise RuntimeError("Watchdog-Guard konnte unter Bootblock nicht aktualisiert werden")
+        projected_piguard = watchdog_refresh_required
+        if projected_piguard and not _service_unit_exists("piguard"):
+            raise RuntimeError("Quiesced Watchdog-Projektion besitzt keine geladene Unit")
+        _project_bare_metal_logrotate_config(
+            repo_dir=target_root,
+            target_commit=commit,
+            install_user=install_user,
+        )
+        if not _prepare_v4_service_activation(
+            services=restart_services,
+            transition_state=state,
+            projected_piguard=projected_piguard,
+        ):
+            raise RuntimeError(
+                "Persistente Dienstvorbereitung blieb vor dem Startgate unvollständig"
+            )
+        pause_reason = f"update-safety:{safety_contract.transaction_id}"
+        _enable_watchdog_update_pause(pause_reason)
+        _verify_watchdog_pause_fresh(pause_reason)
+        _validate_update_safety_contract(safety_contract, expected_state="pending")
+        _verify_update_safety_marker(safety_contract, expected_present=True)
+        _reload_and_verify_update_safety_dropins(safety_contract, expected_present=True)
+        _assert_managed_finalizer_service(safety_contract)
+        _assert_strict_update_writer_quiescence(
+            repo_dir=target_root,
+            transaction_id=safety_contract.transaction_id,
+        )
+        _verify_transition_state(state)
+        _create_update_safety_start_token(
+            safety_contract,
+            repo_dir=target_root,
+        )
+
+    if safety_contract is None:
+        _verify_transition_state(state)
     _announce_finalizer_phase(5, phase_total, "Dienste aktivieren und geordnet starten")
     if not _restart_v4_services(
         headless=headless,
         services=restart_services,
         transition_state=state,
+        prepared_start_only=safety_contract is not None,
+        projected_piguard=projected_piguard,
     ):
         raise RuntimeError("Erwartete Dienste konnten nicht vollständig gestartet werden")
-    if not refresh_watchdog_guard_script():
+    if safety_contract is None and not refresh_watchdog_guard_script():
         _stop_v4_services(restart_services)
         raise RuntimeError("Watchdog-Guard konnte nach dem finalen Dienststart nicht aktualisiert werden")
     _announce_finalizer_phase(6, phase_total, "Gesundheit und Bootvertrag verifizieren")
-    if not _post_update_healthcheck(restart_services, transition_state=state):
+    if not _post_update_healthcheck(
+        restart_services,
+        transition_state=state,
+        projected_piguard=projected_piguard,
+    ):
         _stop_v4_services(restart_services)
         raise RuntimeError("Dienst-/HTTP-/HA-Gesundheitsgate fehlgeschlagen")
 
@@ -8005,13 +10823,54 @@ def finalize_release_from_target(
         _config, raw = _read_json_nofollow(state.config_path)
         if hashlib.sha256(raw).hexdigest() != expected_config_sha256:
             raise RuntimeError("Betriebskonfiguration driftete während des Target-Finalizers")
-    _announce_finalizer_phase(7, phase_total, "Initiale lokale Prognose aktualisieren")
-    run_initial_forecast(os.path.join(target_root, "Installer"))
-    _project_bare_metal_logrotate_config(
-        repo_dir=target_root,
-        target_commit=commit,
-        install_user=install_user,
-    )
+    current_head = _resolve_git_commit(target_root, "HEAD", install_user)
+    if not current_head or not _exact_commit_matches(commit, current_head):
+        raise RuntimeError("Repository-HEAD driftete im finalen Target-Readback")
+    if safety_contract is not None:
+        _validate_update_safety_contract(safety_contract, expected_state="pending")
+        _verify_update_safety_marker(safety_contract, expected_present=True)
+        _reload_and_verify_update_safety_dropins(safety_contract, expected_present=True)
+        _assert_managed_finalizer_service(safety_contract)
+        commit_may_be_irreversible = False
+        try:
+            # Die Grenze liegt bewusst vor dem Call. Dadurch bleibt auch ein
+            # Signal nach möglicher Receipt-Mutation, aber vor Return/Assign,
+            # konservativ und kann niemals Altpreimages restaurieren.
+            commit_may_be_irreversible = True
+            if postcommit_state is not None:
+                postcommit_state["commit_attempted"] = True
+            committed_contract = _commit_update_safety_receipt(safety_contract)
+            _clear_update_safety_marker(committed_contract)
+            _remove_update_safety_dropins(committed_contract)
+            _announce_finalizer_phase(
+                7,
+                phase_total,
+                "Initiale lokale Prognose aktualisieren",
+            )
+            try:
+                run_initial_forecast(os.path.join(target_root, "Installer"))
+            except Exception as exc:
+                update_logger.warning(
+                    "Initiale Prognose blieb nach committed Update best-effort: %s",
+                    exc,
+                )
+        except BaseException as exc:
+            if isinstance(exc, UpdateSafetyPostCommitError):
+                raise
+            if not commit_may_be_irreversible:
+                raise
+            raise UpdateSafetyPostCommitError(
+                "Target-Finalizer brach nach Eintritt in seine irreversible "
+                "Commit-/PostCommit-Kapsel ab"
+            ) from exc
+    else:
+        _announce_finalizer_phase(7, phase_total, "Initiale lokale Prognose aktualisieren")
+        run_initial_forecast(os.path.join(target_root, "Installer"))
+        _project_bare_metal_logrotate_config(
+            repo_dir=target_root,
+            target_commit=commit,
+            install_user=install_user,
+        )
 
 
 def _target_execution_archive_entries(
@@ -8808,11 +11667,32 @@ def _invoke_target_finalizer(
     target_tag: str,
     state: TransitionState,
     package_transaction: PackageTransactionState,
+    update_safety_contract: UpdateSafetyContract | None = None,
 ) -> None:
-    """Startet den SHA-gebundenen zweiten Prozess mit bereinigtem Importkontext."""
+    """Startet den Zielprozess direkt oder im crash-sicheren transienten Service."""
 
     lock_fd = _required_update_lock_fd()
     install_user = get_install_user()
+    if update_safety_contract is not None:
+        update_safety_contract = _validate_update_safety_contract(
+            update_safety_contract,
+            expected_state="pending",
+        )
+        if (
+            update_safety_contract.target_commit != target_commit
+            or update_safety_contract.target_tag != _normalize_release_tag(target_tag)
+            or update_safety_contract.role != state.ha_role
+        ):
+            raise RuntimeError("Target-Finalizer widerspricht dem Update-Sicherheitsreceipt")
+        _verify_update_safety_marker(update_safety_contract, expected_present=True)
+        _reload_and_verify_update_safety_dropins(
+            update_safety_contract,
+            expected_present=True,
+        )
+        _assert_strict_update_writer_quiescence(
+            repo_dir=repo_dir,
+            transaction_id=update_safety_contract.transaction_id,
+        )
     bound_target_files = {
         relative_path: _bind_target_file_to_commit(
             repo_dir=repo_dir,
@@ -8885,6 +11765,31 @@ def _invoke_target_finalizer(
     environment["LC_ALL"] = "C.UTF-8"
     environment["LANG"] = "C.UTF-8"
     environment[UPDATE_LOCK_ENV] = str(lock_fd)
+    finalizer_args = [
+        "--install-path", repo_dir,
+        "--expected-release-sha", target_commit,
+        "--expected-release-tag", target_tag,
+        "--expected-ha-role", state.ha_role,
+        "--expected-config-state", config_state,
+        "--expected-config-sha256", state.config_sha256,
+        "--expected-units-sha256", _transition_units_sha256(state.preinstalled_units),
+        "--expected-legacy-activity", state.legacy_e3dc_activity,
+        "--expected-venv-state", venv_state,
+        "--expected-venv-path", venv_path,
+    ]
+    if update_safety_contract is not None:
+        finalizer_args.extend((
+            "--update-safety-transaction", update_safety_contract.transaction_id,
+            "--update-safety-receipt-sha256", update_safety_contract.receipt_sha256,
+            "--update-safety-service-unit", update_safety_contract.finalizer_unit,
+            "--update-safety-runtime-directory", update_safety_contract.runtime_directory,
+            "--update-safety-token-path", update_safety_contract.token_path,
+        ))
+    result = None
+    managed_service_spawn_attempted = False
+    managed_service_quiesced = False
+    managed_service_quiesce_error: BaseException | None = None
+    durable_committed_observed: UpdateSafetyContract | None = None
     try:
         _verify_target_execution_snapshot(
             snapshot_root,
@@ -8892,48 +11797,216 @@ def _invoke_target_finalizer(
             owner_uid=os.geteuid(),
             owner_gid=os.getegid(),
         )
-        result = _run_streaming_argv(
-            [
+        if update_safety_contract is None:
+            result = _run_streaming_argv(
+                [python, "-I", "-B", "-u", finalizer, *finalizer_args],
+                timeout=TARGET_FINALIZER_TIMEOUT_S,
+                env=environment,
+                pass_fds=(lock_fd,),
+                label="Target-Finalizer",
+            )
+        else:
+            systemd_run = Path("/usr/bin/systemd-run")
+            systemd_metadata = systemd_run.lstat()
+            if (
+                systemd_run.is_symlink()
+                or not stat.S_ISREG(systemd_metadata.st_mode)
+                or systemd_metadata.st_uid != 0
+                or systemd_metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                or not systemd_metadata.st_mode & 0o111
+            ):
+                raise RuntimeError("Fester systemd-run-Pfad ist nicht vertrauenswürdig")
+            lock_metadata = os.fstat(lock_fd)
+            service_environment = (
+                ("E3DC_BOOTSTRAP_ROOT", repo_dir),
+                ("E3DC_BOOTSTRAP_RUNNER_ROOT", snapshot_root),
+                ("E3DC_BOOTSTRAP_USER", install_user),
+                ("E3DC_INSTALL_ROOT", repo_dir),
+                ("PYTHONNOUSERSITE", "1"),
+                ("PYTHONDONTWRITEBYTECODE", "1"),
+                ("PYTHONUNBUFFERED", "1"),
+                ("LC_ALL", "C.UTF-8"),
+                ("LANG", "C.UTF-8"),
+            )
+            command = [
+                str(systemd_run),
+                "--system",
+                "--quiet",
+                "--wait",
+                "--pipe",
+                f"--unit={update_safety_contract.finalizer_unit}",
+                "--service-type=exec",
+                "--property=ExitType=main",
+                "--property=KillMode=control-group",
+                "--property=Restart=no",
+                "--property=User=root",
+                "--property=Group=root",
+                "--property=DynamicUser=no",
+                "--property=WorkingDirectory=/",
+                "--property=UMask=0077",
+                f"--property=RuntimeDirectory={update_safety_contract.runtime_directory}",
+                "--property=RuntimeDirectoryMode=0700",
+                "--property=RuntimeDirectoryPreserve=no",
+                f"--property=RuntimeMaxSec={UPDATE_FINALIZER_RUNTIME_MAX_S}s",
+                f"--property=TimeoutStopSec={UPDATE_FINALIZER_TIMEOUT_STOP_S}s",
+                "--property=SendSIGKILL=yes",
+                "--property=OOMPolicy=stop",
+                *(f"--setenv={name}={value}" for name, value in service_environment),
                 python,
                 "-I",
                 "-B",
                 "-u",
                 finalizer,
+                "--systemd-finalizer-wrapper",
                 "--install-path", repo_dir,
+                "--execution-root", snapshot_root,
                 "--expected-release-sha", target_commit,
-                "--expected-release-tag", target_tag,
-                "--expected-ha-role", state.ha_role,
-                "--expected-config-state", config_state,
-                "--expected-config-sha256", state.config_sha256,
-                "--expected-units-sha256", _transition_units_sha256(state.preinstalled_units),
-                "--expected-legacy-activity", state.legacy_e3dc_activity,
-                "--expected-venv-state", venv_state,
-                "--expected-venv-path", venv_path,
-            ],
-            timeout=TARGET_FINALIZER_TIMEOUT_S,
-            env=environment,
-            pass_fds=(lock_fd,),
-            label="Target-Finalizer",
+                "--expected-install-user", install_user,
+                "--update-safety-transaction", update_safety_contract.transaction_id,
+                "--update-safety-receipt-sha256", update_safety_contract.receipt_sha256,
+                "--update-safety-service-unit", update_safety_contract.finalizer_unit,
+                "--update-safety-runtime-directory", update_safety_contract.runtime_directory,
+                "--update-safety-token-path", update_safety_contract.token_path,
+                "--expected-lock-device", str(lock_metadata.st_dev),
+                "--expected-lock-inode", str(lock_metadata.st_ino),
+                "--",
+                *finalizer_args,
+            ]
+            managed_service_spawn_attempted = True
+            result = _run_streaming_argv(
+                command,
+                timeout=UPDATE_FINALIZER_RUNTIME_MAX_S + 60,
+                env={
+                    "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+                    "LC_ALL": "C.UTF-8",
+                    "LANG": "C.UTF-8",
+                },
+                pass_fds=(lock_fd,),
+                stdin_fd=lock_fd,
+                label="Verwalteter Target-Finalizer",
+            )
+            if not result or not result.get("success"):
+                raise RuntimeError(
+                    "Verwalteter Target-Finalizer fehlgeschlagen: "
+                    + _combined_process_diagnostics(result or {})
+                )
+            _wait_managed_finalizer_inactive(update_safety_contract)
+            managed_service_quiesced = True
+
+        if result is None:
+            raise RuntimeError("Target-Finalizer lieferte kein Ergebnis")
+        marker = f"{TARGET_FINALIZER_SUCCESS} {target_commit} {target_tag}"
+        marker_count = int(
+            (result.get("stdout_line_counts") or {}).get(marker, 0)
         )
-    finally:
-        try:
-            if os.path.lexists(snapshot_root):
-                if os.lstat(snapshot_root).st_dev != os.lstat(repo_dir).st_dev:
-                    raise RuntimeError(
-                        "Target-Finalizer-Snapshot driftete vom Produkt-Dateisystem"
+        if not result.get("success") or marker_count != 1:
+            raise RuntimeError(
+                "Target-Finalizer fehlgeschlagen: "
+                + _combined_process_diagnostics(result)
+            )
+        if update_safety_contract is not None:
+            committed = _read_update_safety_contract()
+            if (
+                committed is None
+                or committed.state != "committed"
+                or committed.transaction_id != update_safety_contract.transaction_id
+                or not _same_update_safety_transaction_shape(
+                    committed,
+                    update_safety_contract,
+                )
+            ):
+                raise RuntimeError(
+                    "Finalizer-Erfolg besitzt nicht den committed Ersatz seines "
+                    "ursprünglichen Sicherheitsreceipts"
+                )
+            # Ab diesem erfolgreichen durable Readback ist ein Altstand-Rollback
+            # auch dann verboten, wenn unlink/fsync oder ein Signal das Receipt-
+            # Cleanup unterbricht und ein nachfolgender Readback nichts mehr sieht.
+            durable_committed_observed = committed
+            _verify_update_safety_marker(committed, expected_present=False)
+            _reload_and_verify_update_safety_dropins(committed, expected_present=False)
+            if os.path.lexists(committed.token_path) or os.path.lexists(
+                f"/run/{committed.runtime_directory}"
+            ):
+                raise RuntimeError("Finalizer-Lease blieb nach erfolgreichem Serviceende liegen")
+            _remove_exact_update_safety_receipt(committed)
+    except BaseException as original_error:
+        if update_safety_contract is not None and managed_service_spawn_attempted:
+            try:
+                _kill_managed_finalizer_and_quiesce(
+                    update_safety_contract,
+                    repo_dir=repo_dir,
+                    require_pending_contract=durable_committed_observed is None,
+                )
+                managed_service_quiesced = True
+            except BaseException as quiesce_error:
+                managed_service_quiesce_error = quiesce_error
+                update_logger.critical(
+                    "Verwaltete Finalizer-cgroup/Writer-Ruhe blieb unbewiesen: %s",
+                    quiesce_error,
+                )
+            if durable_committed_observed is not None:
+                try:
+                    current = _read_update_safety_contract(allow_missing=True)
+                except Exception as receipt_error:
+                    update_logger.critical(
+                        "Committed Update-Sicherheitsreceipt ist beim Cleanup unlesbar: %s",
+                        receipt_error,
                     )
-            _remove_target_execution_snapshot(snapshot_root)
-        except Exception as exc:
-            update_logger.warning("Target-Ausführungssnapshot konnte nicht bereinigt werden: %s", exc)
-    marker = f"{TARGET_FINALIZER_SUCCESS} {target_commit} {target_tag}"
-    marker_count = int(
-        (result.get("stdout_line_counts") or {}).get(marker, 0)
-    )
-    if not result.get("success") or marker_count != 1:
-        raise RuntimeError(
-            "Target-Finalizer fehlgeschlagen: "
-            + _combined_process_diagnostics(result)
-        )
+                    current = None
+                if (
+                    managed_service_quiesced
+                    and current == durable_committed_observed
+                ):
+                    try:
+                        _finish_committed_update_safety_cleanup(
+                            durable_committed_observed,
+                            remove_receipt=False,
+                        )
+                    except Exception as cleanup_error:
+                        update_logger.critical(
+                            "Committed Update-Gate blieb fail-closed stehen: %s",
+                            cleanup_error,
+                        )
+                raise UpdateSafetyPostCommitError(
+                    "Receipt-Cleanup brach nach durable committed ab"
+                ) from original_error
+            if not managed_service_quiesced:
+                raise UpdateSafetyManagedServiceUnquiescedError(
+                    "Verwaltete Finalizer-cgroup/Writer-Ruhe blieb nach "
+                    "Kindprozessfehler unbewiesen; Recoverymutation ist gesperrt: "
+                    f"{managed_service_quiesce_error}"
+                ) from original_error
+        raise
+    finally:
+        if (
+            update_safety_contract is not None
+            and managed_service_spawn_attempted
+            and not managed_service_quiesced
+        ):
+            update_logger.critical(
+                "Finalizer-Snapshot bleibt wegen unbewiesener Service-Ruhe erhalten: %s",
+                snapshot_root,
+            )
+        else:
+            try:
+                if os.path.lexists(snapshot_root):
+                    if os.lstat(snapshot_root).st_dev != os.lstat(repo_dir).st_dev:
+                        raise RuntimeError(
+                            "Target-Finalizer-Snapshot driftete vom Produkt-Dateisystem"
+                        )
+                _remove_target_execution_snapshot(snapshot_root)
+            except BaseException as exc:
+                if durable_committed_observed is not None:
+                    raise UpdateSafetyPostCommitError(
+                        "Snapshot-Cleanup brach nach durable committed ab"
+                    ) from exc
+                if not isinstance(exc, Exception):
+                    raise
+                update_logger.warning(
+                    "Target-Ausführungssnapshot konnte nicht bereinigt werden: %s",
+                    exc,
+                )
 
 
 def _file_identity(metadata: os.stat_result) -> tuple[int, ...]:
@@ -9153,6 +12226,61 @@ def _bind_target_file_to_commit(
     return identity
 
 
+def _complete_dynamic_recovery_start(
+    contract: UpdateSafetyContract,
+    *,
+    repo_dir: str,
+    state: TransitionState,
+) -> bool:
+    """Öffnet das Recovery-Gate signalgeschützt und rearmed jeden Fehler."""
+
+    signal_guard = _TerminalSignalGuard()
+    signal_guard.install()
+    signal_guard.arm()
+    original_error: BaseException | None = None
+    rearm_error: BaseException | None = None
+    try:
+        # Wegen BindsTo/After muss die dynamische Abhängigkeit vor dem ersten
+        # Altstart vollständig aus der effektiven Unitansicht verschwinden.
+        _clear_update_safety_marker(contract)
+        _remove_update_safety_dropins(contract)
+        if not _recover_pretransaction_service_state(state):
+            raise RuntimeError("Recovery-Altstart blieb unvollständig")
+        _remove_exact_update_safety_receipt(contract)
+    except BaseException as exc:
+        original_error = exc
+        try:
+            _enforce_update_safety_fail_closed(
+                contract,
+                repo_dir=repo_dir,
+            )
+        except BaseException as enforcement_exc:
+            rearm_error = enforcement_exc
+    requested_signum = signal_guard.requested_signum
+    signal_guard.restore()
+    if requested_signum is not None:
+        if rearm_error is not None:
+            update_logger.critical(
+                "Signalabbruch und dynamisches Recovery-Re-Arm schlugen fehl: %s",
+                rearm_error,
+            )
+        raise _DeferredParentSignal(requested_signum)
+    if original_error is None:
+        return True
+    if rearm_error is not None:
+        update_logger.critical(
+            "Dynamisches Recovery-Re-Arm blieb nach Altstartfehler unvollständig: %s",
+            rearm_error,
+        )
+    update_logger.error(
+        "Dynamisches Recovery-Gate/Altstart schlug fehl: %s",
+        original_error,
+    )
+    if not isinstance(original_error, Exception):
+        raise original_error
+    return False
+
+
 def _recover_failed_transition(
     *,
     repo_dir: str,
@@ -9169,6 +12297,7 @@ def _recover_failed_transition(
     bootblock_contract: (
         RecoveryBootblockContract | RecoveryBootblockPartialContract | None
     ) = None,
+    update_safety_contract: UpdateSafetyContract | None = None,
     recovery_transaction_id: str | None = None,
 ) -> RecoveryTransitionResult:
     """Restore old Git/tree/persistent state and verify role/services after any mutation failure."""
@@ -9184,47 +12313,61 @@ def _recover_failed_transition(
     ):
         update_logger.error("Recovery-Transaktions-ID ist nicht an den Receipt gebunden")
         return RecoveryTransitionResult(False, None)
-    try:
-        initial_quiesced = bool(_stop_v4_services(V4_SERVICES))
-    except Exception as exc:
-        initial_quiesced = False
-        update_logger.error(
-            "Recovery-Sofortstop warf vor persistentem Bootblock einen Fehler: %s",
-            exc,
-        )
-    if not initial_quiesced:
-        update_logger.error(
-            "Recovery-Sofortstop vor persistentem Bootblock ist nicht vollständig beweisbar"
-        )
-    try:
-        bootblock_contract = _arm_persistent_recovery_bootblock(
-            bootblock_contract,
-            transaction_id=recovery_transaction_id,
-        )
-    except RecoveryBootblockArmError as exc:
-        update_logger.error(
-            "Recovery-Bootblock blieb nach fehlgeschlagenem Fresh-Arm "
-            "nur über seinen eigenen Inodevertrag kontrollierbar: %s",
-            exc,
-        )
-        return RecoveryTransitionResult(False, exc.contract)
-    except Exception as exc:
-        update_logger.error(
-            "Recovery-Bootblock konnte nicht rebootfest aktiviert werden: %s",
-            exc,
-        )
-        return RecoveryTransitionResult(False, None)
-    try:
-        final_quiesced = bool(_stop_v4_services(V4_SERVICES))
-    except Exception as exc:
-        final_quiesced = False
-        update_logger.error(
-            "Recovery-Stop-Endpass warf nach persistentem Bootblock einen Fehler: %s",
-            exc,
-        )
-    if not initial_quiesced or not final_quiesced:
-        update_logger.error("Recovery abgebrochen: Aktor-/Writer-Ruhe ist nicht beweisbar")
-        return RecoveryTransitionResult(False, bootblock_contract)
+    dynamic_safety = update_safety_contract is not None
+    if dynamic_safety:
+        try:
+            update_safety_contract = _enforce_update_safety_fail_closed(
+                update_safety_contract,
+                repo_dir=repo_dir,
+            )
+        except Exception as exc:
+            update_logger.error(
+                "Dynamischer Recovery-Bootblock ist nicht vollständig beweisbar: %s",
+                exc,
+            )
+            return RecoveryTransitionResult(False, None)
+    else:
+        try:
+            initial_quiesced = bool(_stop_v4_services(V4_SERVICES))
+        except Exception as exc:
+            initial_quiesced = False
+            update_logger.error(
+                "Recovery-Sofortstop warf vor persistentem Bootblock einen Fehler: %s",
+                exc,
+            )
+        if not initial_quiesced:
+            update_logger.error(
+                "Recovery-Sofortstop vor persistentem Bootblock ist nicht vollständig beweisbar"
+            )
+        try:
+            bootblock_contract = _arm_persistent_recovery_bootblock(
+                bootblock_contract,
+                transaction_id=recovery_transaction_id,
+            )
+        except RecoveryBootblockArmError as exc:
+            update_logger.error(
+                "Recovery-Bootblock blieb nach fehlgeschlagenem Fresh-Arm "
+                "nur über seinen eigenen Inodevertrag kontrollierbar: %s",
+                exc,
+            )
+            return RecoveryTransitionResult(False, exc.contract)
+        except Exception as exc:
+            update_logger.error(
+                "Recovery-Bootblock konnte nicht rebootfest aktiviert werden: %s",
+                exc,
+            )
+            return RecoveryTransitionResult(False, None)
+        try:
+            final_quiesced = bool(_stop_v4_services(V4_SERVICES))
+        except Exception as exc:
+            final_quiesced = False
+            update_logger.error(
+                "Recovery-Stop-Endpass warf nach persistentem Bootblock einen Fehler: %s",
+                exc,
+            )
+        if not initial_quiesced or not final_quiesced:
+            update_logger.error("Recovery abgebrochen: Aktor-/Writer-Ruhe ist nicht beweisbar")
+            return RecoveryTransitionResult(False, bootblock_contract)
     if old_commit and not git_created:
         reset = _git_argv(repo_dir, install_user, "reset", "--hard", old_commit, timeout=120)
         recovery_ok = recovery_ok and reset["success"]
@@ -9301,15 +12444,19 @@ def _recover_failed_transition(
                 for path, _category, _digest, _size, _mode, _uid, _gid
                 in backup_receipt.privileged_files
             ):
-                recovery_identities = _validate_recovery_bootblock_contract(
-                    bootblock_contract
-                )
                 storage_unit = "e3dc-storage-manager.service"
-                recovery_path = _recovery_dropin_path(storage_unit)
-                recovery_dev, recovery_ino = recovery_identities[storage_unit]
-                capture_systemd_service_bundle(
-                    ("e3dc-storage-manager",),
-                    expected_recovery_dropins={
+                if dynamic_safety:
+                    expected_recovery_dropins = _update_safety_expected_dropins(
+                        update_safety_contract,
+                        selected_units=(storage_unit,),
+                    )
+                else:
+                    recovery_identities = _validate_recovery_bootblock_contract(
+                        bootblock_contract
+                    )
+                    recovery_path = _recovery_dropin_path(storage_unit)
+                    recovery_dev, recovery_ino = recovery_identities[storage_unit]
+                    expected_recovery_dropins = {
                         storage_unit: {
                             recovery_path: {
                                 "bytes": RECOVERY_BOOTBLOCK_DROPIN_PAYLOAD,
@@ -9322,7 +12469,10 @@ def _recover_failed_transition(
                                 "size": len(RECOVERY_BOOTBLOCK_DROPIN_PAYLOAD),
                             }
                         }
-                    },
+                    }
+                capture_systemd_service_bundle(
+                    ("e3dc-storage-manager",),
+                    expected_recovery_dropins=expected_recovery_dropins,
                 )
         # Recovery installiert keine Units aus dem temporären Archivbaum. Die
         # verifizierte Sicherung stellt die alten Unitdateien wieder her; hier
@@ -9370,6 +12520,14 @@ def _recover_failed_transition(
             recovery_ok = False
     if not recovery_ok:
         return RecoveryTransitionResult(False, bootblock_contract)
+    if dynamic_safety:
+        if not _complete_dynamic_recovery_start(
+            update_safety_contract,
+            repo_dir=repo_dir,
+            state=state,
+        ):
+            return RecoveryTransitionResult(False, None)
+        return RecoveryTransitionResult(True, None)
     try:
         # Erst der vollständig verifizierte Datei-/Paket-Rücklauf darf das
         # atomare Startgate für den kontrollierten Service-Endtest öffnen.
@@ -9988,6 +13146,7 @@ def _execute_update_transaction(
     preverified_target_commit: str | None = None,
     preverified_target_tag: str | None = None,
     transaction_repo_dir: str | None = None,
+    sealed_target_updater: bool = False,
     reinstall_current: bool = False,
 ):
     """Transactional stable update, SHA-bound rollback, or unrelated-history bootstrap."""
@@ -10041,6 +13200,21 @@ def _execute_update_transaction(
     if target_install_path and verified_commit:
         print("[!] Erstinstallations-Bootstrap und Ziel-Updater-Handoff dürfen nicht vermischt werden.")
         return False
+    if sealed_target_updater and (
+        target_install_path
+        or target_tag
+        or reinstall_current
+        or not verified_commit
+        or not verified_tag
+        or not transaction_repo_dir
+        or not expected_sha
+        or not expected_ha_role
+    ):
+        print(
+            "[!] Rollenanker-Autorität verlangt den vollständig "
+            "versiegelten nativen Ziel-Updater."
+        )
+        return False
     if target_install_path and not target_tag:
         print("[!] Bootstrap verlangt einen expliziten Release-Tag.")
         return False
@@ -10081,6 +13255,7 @@ def _execute_update_transaction(
         role_anchor_needed = _explicit_bootstrap_role_anchor_needed(
             state,
             target_install_path=target_install_path,
+            sealed_target_updater=sealed_target_updater,
         )
         inventory = _capture_install_inventory(repo_dir)
         recovery_inventory = _capture_recovery_surface(state)
@@ -10182,9 +13357,11 @@ def _execute_update_transaction(
         return False
 
     install_user = None
+    sealed_storage_payloads = None
+    sealed_storage_expected_dropins = None
     storage_unit_promoted = False
     storage_promotion_state_uncertain = False
-    if repo_recovery_contract is not None:
+    if repo_recovery_contract is not None and not sealed_target_updater:
         try:
             install_user = get_install_user()
             if repo_recovery_contract.install_user != install_user:
@@ -10255,8 +13432,85 @@ def _execute_update_transaction(
                 _set_watchdog_update_pause(False, reason=transition_name)
             return False
 
-    # Dieser exakte Aufruf bleibt als statisch pruefbarer Aktorruhevertrag erhalten.
-    if not _stop_v4_services(V4_SERVICES):
+    update_safety_contract = None
+    if sealed_target_updater:
+        try:
+            if (
+                repo_recovery_contract is None
+                or backup_receipt is None
+                or not verified_commit
+                or not verified_tag
+            ):
+                raise RuntimeError(
+                    "Versiegelter Ziel-Updater besitzt keinen vollständigen Backup-/Zielvertrag"
+                )
+            update_safety_contract = _prepare_update_safety_contract(
+                transaction_id=recovery_transaction_id,
+                target_commit=verified_commit,
+                target_tag=verified_tag,
+                role=state.ha_role,
+                backup_receipt=backup_receipt,
+            )
+            update_safety_contract = _arm_update_safety_contract(
+                update_safety_contract
+            )
+            if not _stop_v4_services(V4_SERVICES):
+                raise RuntimeError("Sichere Aktorruhe konnte unter Bootblock nicht nachgewiesen werden")
+            install_user = get_install_user()
+            if repo_recovery_contract.install_user != install_user:
+                raise RuntimeError(
+                    "Installationsbenutzer driftete seit dem Recovery-Preflight"
+                )
+            sealed_storage_payloads = _approved_storage_manager_unit_payloads()
+            sealed_storage_expected_dropins = _update_safety_expected_dropins(
+                update_safety_contract,
+                selected_units=("e3dc-storage-manager.service",),
+            )
+            _validate_update_safety_contract(
+                update_safety_contract,
+                expected_state="pending",
+            )
+            _verify_update_safety_marker(
+                update_safety_contract,
+                expected_present=True,
+            )
+            _reload_and_verify_update_safety_dropins(
+                update_safety_contract,
+                expected_present=True,
+            )
+            _revalidate_recovery_backup_receipt(
+                backup_receipt,
+                repo_recovery_contract,
+                backup_dir=backup_dir,
+                repo_dir=repo_dir,
+                expected_commit=old_commit,
+                install_user=install_user,
+            )
+            _verify_restored_privileged_files(
+                backup_receipt,
+                install_user,
+            )
+            _verify_repo_recovery_prestate(
+                repo_dir,
+                install_user,
+                repo_recovery_contract,
+            )
+            _verify_transition_state(state)
+            _assert_strict_update_writer_quiescence(
+                repo_dir=repo_dir,
+                transaction_id=recovery_transaction_id,
+            )
+        except BaseException as exc:
+            print(f"[!] Vor-Mutations-Sicherheitsgate fehlgeschlagen: {exc}")
+            update_logger.critical(
+                "Versiegeltes Vor-Mutations-Sicherheitsgate blieb fail-closed: %s",
+                exc,
+            )
+            return False
+
+    # Dieser exakte Aufruf bleibt für nicht versiegelte Altpfade als
+    # statisch prüfbarer Aktorruhevertrag erhalten.
+    if not sealed_target_updater and not _stop_v4_services(V4_SERVICES):
         print("[!] Sichere Aktorruhe konnte nicht nachgewiesen werden.")
         recovered = _recover_pretransaction_service_state(state)
         if recovered:
@@ -10279,7 +13533,8 @@ def _execute_update_transaction(
     package_transaction = None
     packages_mutated = False
     try:
-        install_user = install_user or get_install_user()
+        if not sealed_target_updater:
+            install_user = install_user or get_install_user()
         if (
             repo_recovery_contract is not None
             and repo_recovery_contract.install_user != install_user
@@ -10287,21 +13542,86 @@ def _execute_update_transaction(
             raise RuntimeError(
                 "Installationsbenutzer driftete seit dem Recovery-Preflight"
             )
+        if sealed_target_updater:
+            if update_safety_contract is None:
+                raise RuntimeError("Versiegelter Ziel-Updater verlor seinen Bootblockvertrag")
+            mutated = True
+            try:
+                storage_unit_promoted = bool(
+                    _migrate_approved_storage_manager_unit_owner(
+                        sealed_storage_payloads,
+                        install_user=install_user,
+                        expected_recovery_dropins=sealed_storage_expected_dropins[
+                            "e3dc-storage-manager.service"
+                        ],
+                    )
+                )
+            except StorageUnitMigrationError as promotion_exc:
+                if not promotion_exc.root_unit_committed:
+                    storage_promotion_state_uncertain = True
+                    raise
+                storage_unit_promoted = True
+            if storage_unit_promoted:
+                reload_result = _run_argv(
+                    ["systemctl", "daemon-reload"],
+                    timeout=30,
+                    env={**os.environ, "LC_ALL": "C", "LANG": "C"},
+                )
+                if (
+                    not reload_result.get("success")
+                    or reload_result.get("timed_out")
+                    or str(reload_result.get("stderr") or "")
+                    or int(reload_result.get("returncode", -1)) != 0
+                ):
+                    raise RuntimeError(
+                        "systemd daemon-reload nach versiegelter Storage-Unitmigration fehlgeschlagen: "
+                        + _combined_process_diagnostics(reload_result, maximum=800)
+                    )
+                capture_systemd_service_bundle(
+                    ("e3dc-storage-manager",),
+                    expected_recovery_dropins=sealed_storage_expected_dropins,
+                )
+            _validate_update_safety_contract(
+                update_safety_contract,
+                expected_state="pending",
+            )
+            _verify_update_safety_marker(
+                update_safety_contract,
+                expected_present=True,
+            )
+            _reload_and_verify_update_safety_dropins(
+                update_safety_contract,
+                expected_present=True,
+            )
+            _assert_strict_update_writer_quiescence(
+                repo_dir=repo_dir,
+                transaction_id=recovery_transaction_id,
+            )
         if role_anchor_needed:
             # Ab hier besitzt jede Mutation ein verifiziertes Backup und eine
             # bestätigte Aktorruhe. Auch der einmalige Rollenanker fällt damit
             # bei jedem Folgefehler unter den vollständigen Rückweg.
+            if sealed_target_updater and (
+                repo_recovery_contract is None or backup_receipt is None
+            ):
+                raise RuntimeError(
+                    "Versiegelter Rollenanker besitzt keinen Root-Receipt-gebundenen "
+                    "Recovery-Vertrag"
+                )
             mutated = True
             role_anchor_created = _bind_explicit_bootstrap_role_anchor(
                 state,
                 target_install_path=target_install_path,
+                sealed_target_updater=sealed_target_updater,
             )
             if role_anchor_created is not True:
                 raise RuntimeError(
                     "Fehlender Instanzrollen-Anker wurde nicht eindeutig gebunden"
                 )
+        mutated = True
         cleanup_pycache(repo_dir)
         if bootstrap_without_git:
+            mutated = True
             init = _run_argv(
                 ["sudo", "-H", "-u", str(install_user), "git", "-C", repo_dir, "init"],
                 timeout=30,
@@ -10378,12 +13698,14 @@ def _execute_update_transaction(
         if not new_commit or not _exact_commit_matches(target_commit, new_commit):
             raise RuntimeError("HEAD stimmt nicht exakt mit dem freigegebenen Ziel-SHA ueberein")
 
+        mutated = True
         _normalize_target_finalizer_files(
             repo_dir=repo_dir,
             target_commit=target_commit,
             install_user=install_user,
         )
 
+        mutated = True
         packages_mutated = True
         _invoke_target_finalizer(
             repo_dir=repo_dir,
@@ -10391,10 +13713,22 @@ def _execute_update_transaction(
             target_tag=bound_target_tag,
             state=state,
             package_transaction=package_transaction,
+            update_safety_contract=update_safety_contract,
         )
-    except Exception as exc:
+    except BaseException as exc:
         print(f"[!] {transition_name} fehlgeschlagen: {exc}")
         update_logger.error(f"{transition_name} fehlgeschlagen: {exc}")
+        if isinstance(exc, UpdateSafetyPostCommitError):
+            update_logger.critical(
+                "Zielstand ist committed; Altstand-Rollback bleibt ausdrücklich gesperrt"
+            )
+            return False
+        if isinstance(exc, UpdateSafetyManagedServiceUnquiescedError):
+            update_logger.critical(
+                "Managed Finalizer-/Writer-Ruhe ist unbewiesen; "
+                "jede Recoverymutation bleibt ausdrücklich gesperrt"
+            )
+            return False
         recovered = False
         if mutated:
             recovered, bootblock_contract = _recover_failed_transition(
@@ -10410,6 +13744,7 @@ def _execute_update_transaction(
                 repo_recovery_contract=repo_recovery_contract,
                 backup_receipt=backup_receipt,
                 bootblock_contract=bootblock_contract,
+                update_safety_contract=update_safety_contract,
                 recovery_transaction_id=recovery_transaction_id,
             )
         else:
@@ -10418,10 +13753,22 @@ def _execute_update_transaction(
             print("[OK] Ausgangszustand wurde automatisch und verifiziert wiederhergestellt.")
             _set_watchdog_update_pause(False, reason=transition_name)
         else:
-            _enforce_fail_closed_after_recovery_failure(
-                bootblock_contract,
-                recovery_transaction_id=recovery_transaction_id,
-            )
+            if update_safety_contract is not None:
+                try:
+                    _enforce_update_safety_fail_closed(
+                        update_safety_contract,
+                        repo_dir=repo_dir,
+                    )
+                except Exception as enforcement_exc:
+                    update_logger.critical(
+                        "Dynamischer Update-Bootblock ist nicht vollständig beweisbar: %s",
+                        enforcement_exc,
+                    )
+            else:
+                _enforce_fail_closed_after_recovery_failure(
+                    bootblock_contract,
+                    recovery_transaction_id=recovery_transaction_id,
+                )
         return False
 
     _set_watchdog_update_pause(False, reason=transition_name)
@@ -10612,6 +13959,19 @@ def execute_verified_target_update(
     )
     if bound_tag != tag:
         raise RuntimeError("Ziel-Tag driftete gegenüber dem versiegelten Updater-Handoff")
+    strict_forward_update = False
+    if (
+        requested is None
+        and not reinstall_current
+        and not _exact_commit_matches(current_commit, commit)
+    ):
+        _require_strict_forward_update_ancestry(
+            product_root,
+            install_user,
+            current_commit,
+            commit,
+        )
+        strict_forward_update = True
     transition_state = _capture_transition_state(expected_role=role)
     # Zielversionsspezifische Aktionslisten werden ausschließlich hier, also
     # bereits mit dem versiegelten Code des Ziel-Releases, interpretiert.
@@ -10664,6 +14024,7 @@ def execute_verified_target_update(
         preverified_target_commit=commit,
         preverified_target_tag=tag,
         transaction_repo_dir=product_root,
+        sealed_target_updater=strict_forward_update,
         reinstall_current=reinstall_current,
     )
 

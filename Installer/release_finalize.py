@@ -32,10 +32,12 @@ import argparse
 import fcntl
 import hashlib
 import inspect
+import json
 import os
 import pwd
 import queue
 import re
+import shlex
 import shutil
 import signal
 import stat
@@ -70,6 +72,10 @@ _FINALIZER_TERMINATE_GRACE_S = 10
 _FINALIZER_DIAGNOSTIC_LINES = 512
 _UPDATE_LOCK_PATH = Path("/run/lock/e3dc-control/update.lock")
 _UPDATE_LOCK_ENV = "E3DC_UPDATE_LOCK_FD"
+_UPDATE_SAFETY_RECEIPT_PATH = Path("/var/lib/e3dc-update-safety/transaction.json")
+_UPDATE_SAFETY_MARKER_PATH = "/var/lib/e3dc-update-safety/recovery.block"
+_UPDATE_SAFETY_SCHEMA = "e3dc_update_safety_v1"
+_UPDATE_FINALIZER_INVOCATION_ENV = "E3DC_UPDATE_FINALIZER_INVOCATION_ID"
 _COMMIT_READER_PATH = "Installer/git_commit_reader.py"
 _FULL_SHA1_RE = re.compile(r"[0-9a-f]{40}\Z")
 _ACCOUNT_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]*\Z")
@@ -85,6 +91,56 @@ class _DeferredParentSignal(BaseException):
     def __init__(self, signum: int):
         self.signum = int(signum)
         super().__init__(f"Elternprozess erhielt Signal {self.signum}")
+
+
+class _LegacyUpdateSafetyPostCommitError(RuntimeError):
+    """Niemals ausgelöster Typ-Sentinel für Updater ohne Safety-Vertrag."""
+
+
+class _LegacyUpdateSafetyManagedServiceUnquiescedError(RuntimeError):
+    """Niemals ausgelöster Typ-Sentinel für Updater ohne Safety-Vertrag."""
+
+
+def _bind_update_safety_exception_types(
+    update_module,
+    *,
+    require_native: bool,
+) -> tuple[type[RuntimeError], type[RuntimeError]]:
+    """Bindet neue Safety-Typen, ohne Legacy-Fehler zu breit zu klassifizieren."""
+
+    bindings = []
+    for name, fallback in (
+        ("UpdateSafetyPostCommitError", _LegacyUpdateSafetyPostCommitError),
+        (
+            "UpdateSafetyManagedServiceUnquiescedError",
+            _LegacyUpdateSafetyManagedServiceUnquiescedError,
+        ),
+    ):
+        candidate = getattr(update_module, name, None)
+        if candidate is None:
+            if require_native:
+                raise RuntimeError(
+                    "Versiegelter Target-Updater besitzt für den aktiven "
+                    f"Update-Sicherheitsvertrag keinen nativen Fehlertyp {name}"
+                )
+            candidate = fallback
+        elif (
+            not inspect.isclass(candidate)
+            or candidate is RuntimeError
+            or not issubclass(candidate, RuntimeError)
+            or getattr(candidate, "__module__", "")
+            != getattr(update_module, "__name__", "")
+        ):
+            raise RuntimeError(
+                f"Versiegelter Target-Updater besitzt einen ungültigen Fehlertyp {name}"
+            )
+        bindings.append(candidate)
+    if bindings[0] is bindings[1]:
+        raise RuntimeError(
+            "Versiegelter Target-Updater vermischt Postcommit- und "
+            "Unquiesced-Fehlertyp"
+        )
+    return bindings[0], bindings[1]
 
 
 class _TerminalSignalGuard:
@@ -1663,6 +1719,25 @@ def _bind_compat_bridge_snapshot(
 
 
 def _parse_args() -> argparse.Namespace:
+    if "--systemd-finalizer-wrapper" in sys.argv[1:]:
+        parser = argparse.ArgumentParser(
+            description="E3DC-Control systemd-Finalizer-Wrapper"
+        )
+        parser.add_argument("--systemd-finalizer-wrapper", action="store_true", required=True)
+        parser.add_argument("--install-path", required=True)
+        parser.add_argument("--execution-root", required=True)
+        parser.add_argument("--expected-release-sha", required=True)
+        parser.add_argument("--expected-install-user", required=True)
+        parser.add_argument("--update-safety-transaction", required=True)
+        parser.add_argument("--update-safety-receipt-sha256", required=True)
+        parser.add_argument("--update-safety-service-unit", required=True)
+        parser.add_argument("--update-safety-runtime-directory", required=True)
+        parser.add_argument("--update-safety-token-path", required=True)
+        parser.add_argument("--expected-lock-device", required=True, type=int)
+        parser.add_argument("--expected-lock-inode", required=True, type=int)
+        parser.add_argument("finalizer_argv", nargs=argparse.REMAINDER)
+        return parser.parse_args()
+
     if "--compat-target-updater-handoff" in sys.argv[1:]:
         parser = argparse.ArgumentParser(
             description="E3DC-Control Ziel-Updater-Kompatibilitäts-Handoff"
@@ -1716,7 +1791,328 @@ def _parse_args() -> argparse.Namespace:
         choices=("present", "missing", "unused"),
     )
     parser.add_argument("--expected-venv-path", required=True)
+    parser.add_argument("--update-safety-transaction", default="")
+    parser.add_argument("--update-safety-receipt-sha256", default="")
+    parser.add_argument("--update-safety-service-unit", default="")
+    parser.add_argument("--update-safety-runtime-directory", default="")
+    parser.add_argument("--update-safety-token-path", default="")
     return parser.parse_args()
+
+
+def _bind_wrapper_receipt(args: argparse.Namespace) -> None:
+    path = _UPDATE_SAFETY_RECEIPT_PATH
+    if path.parent != Path("/var/lib/e3dc-update-safety"):
+        raise RuntimeError("Systemd-Wrapper besitzt keinen kanonischen Receiptpfad")
+    _assert_root_controlled_directory_chain(path.parent)
+    metadata = path.lstat()
+    if (
+        path.is_symlink()
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+    ):
+        raise RuntimeError("Systemd-Wrapper-Receipt besitzt unsichere Metadaten")
+    payload = _read_regular_nofollow(path, maximum=256 * 1024)
+    if hashlib.sha256(payload).hexdigest() != args.update_safety_receipt_sha256:
+        raise RuntimeError("Systemd-Wrapper-Receipt driftete vom Parent-Digest")
+    try:
+        record = json.loads(payload.decode("ascii"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Systemd-Wrapper-Receipt ist nicht lesbar") from exc
+    if (
+        not isinstance(record, dict)
+        or (
+            json.dumps(
+                record,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            )
+            + "\n"
+        ).encode("ascii")
+        != payload
+        or set(record)
+        != {
+            "schema",
+            "state",
+            "transaction_id",
+            "target",
+            "backup",
+            "bootblock",
+            "finalizer",
+        }
+    ):
+        raise RuntimeError("Systemd-Wrapper-Receipt besitzt kein kanonisches Schema")
+    finalizer = record.get("finalizer") if isinstance(record, dict) else None
+    target = record.get("target") if isinstance(record, dict) else None
+    backup = record.get("backup") if isinstance(record, dict) else None
+    bootblock = record.get("bootblock") if isinstance(record, dict) else None
+    units = bootblock.get("units") if isinstance(bootblock, dict) else None
+    created = bootblock.get("created_directories") if isinstance(bootblock, dict) else None
+    identities = bootblock.get("dropin_identities") if isinstance(bootblock, dict) else None
+    expected_dropin = (
+        "# E3DC_UPDATE_SAFETY_V1\n"
+        "[Unit]\n"
+        f"BindsTo={args.update_safety_service_unit}\n"
+        f"After={args.update_safety_service_unit}\n"
+        f"ConditionPathExists=|!{_UPDATE_SAFETY_MARKER_PATH}\n"
+        f"ConditionPathExists=|{args.update_safety_token_path}\n"
+    ).encode("utf-8")
+    if (
+        not isinstance(finalizer, dict)
+        or not isinstance(target, dict)
+        or not isinstance(backup, dict)
+        or not isinstance(bootblock, dict)
+        or set(finalizer) != {"unit", "runtime_directory", "token_path"}
+        or set(target) != {"commit", "tag", "role"}
+        or set(backup) != {"dir", "dev", "ino", "id", "manifest_sha256"}
+        or set(bootblock)
+        != {
+            "units",
+            "created_directories",
+            "dropin_payload_sha256",
+            "dropin_identities",
+        }
+        or record.get("schema") != _UPDATE_SAFETY_SCHEMA
+        or record.get("state") != "pending"
+        or record.get("transaction_id") != args.update_safety_transaction
+        or not re.fullmatch(r"[0-9a-f]{64}", args.update_safety_transaction)
+        or target.get("commit") != args.expected_release_sha
+        or not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+[a-z]?", str(target.get("tag") or ""))
+        or target.get("role") not in {"off", "master", "slave", "shadow"}
+        or not os.path.isabs(str(backup.get("dir") or ""))
+        or not isinstance(backup.get("dev"), int)
+        or int(backup.get("dev", -1)) < 0
+        or not isinstance(backup.get("ino"), int)
+        or int(backup.get("ino", 0)) <= 0
+        or not str(backup.get("id") or "")
+        or not re.fullmatch(r"[0-9a-f]{64}", str(backup.get("manifest_sha256") or ""))
+        or not isinstance(units, list)
+        or not units
+        or len(units) != len(set(units))
+        or any(not re.fullmatch(r"[A-Za-z0-9_.@-]+\.service", str(unit)) for unit in units)
+        or not isinstance(created, list)
+        or len(created) != len(set(created))
+        or not set(created).issubset(set(units))
+        or not isinstance(identities, list)
+        or len(identities) != len(units)
+        or {
+            str(item[0])
+            for item in identities
+            if isinstance(item, list)
+            and len(item) == 3
+            and isinstance(item[1], int)
+            and isinstance(item[2], int)
+            and item[1] >= 0
+            and item[2] > 0
+        }
+        != set(units)
+        or bootblock.get("dropin_payload_sha256")
+        != hashlib.sha256(expected_dropin).hexdigest()
+        or finalizer.get("unit") != args.update_safety_service_unit
+        or finalizer.get("runtime_directory") != args.update_safety_runtime_directory
+        or finalizer.get("token_path") != args.update_safety_token_path
+    ):
+        raise RuntimeError("Systemd-Wrapper-Receipt widerspricht seinem argv-Vertrag")
+
+
+def _wrapper_systemd_properties(args: argparse.Namespace) -> tuple[str, str]:
+    names = (
+        "Id", "LoadState", "ActiveState", "MainPID", "InvocationID",
+        "ControlGroup", "FragmentPath", "DropInPaths", "Transient", "Type", "ExitType",
+        "KillMode", "Restart", "User", "Group", "DynamicUser",
+        "WorkingDirectory", "UMask", "Environment",
+        "RuntimeDirectory", "RuntimeDirectoryMode",
+        "RuntimeDirectoryPreserve", "RuntimeMaxUSec", "TimeoutStopUSec",
+        "SendSIGKILL", "OOMPolicy",
+    )
+    completed = subprocess.run(
+        [
+            "/usr/bin/systemctl",
+            "show",
+            "--no-pager",
+            *(f"--property={name}" for name in names),
+            args.update_safety_service_unit,
+        ],
+        cwd="/",
+        env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C", "LC_ALL": "C"},
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=15,
+        check=False,
+        text=True,
+    )
+    values = {}
+    for line in completed.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if separator != "=" or key not in names or key in values or value != value.strip():
+            values = {}
+            break
+        values[key] = value
+    invocation = str(os.environ.get("INVOCATION_ID") or "")
+    expected = {
+        "Id": args.update_safety_service_unit,
+        "LoadState": "loaded",
+        "ActiveState": "active",
+        "MainPID": str(os.getpid()),
+        "InvocationID": invocation,
+        "FragmentPath": f"/run/systemd/transient/{args.update_safety_service_unit}",
+        "DropInPaths": "",
+        "Transient": "yes",
+        "Type": "exec",
+        "ExitType": "main",
+        "KillMode": "control-group",
+        "Restart": "no",
+        "User": "root",
+        "Group": "root",
+        "DynamicUser": "no",
+        "WorkingDirectory": "/",
+        "UMask": "0077",
+        "RuntimeDirectory": args.update_safety_runtime_directory,
+        "RuntimeDirectoryMode": "0700",
+        "RuntimeDirectoryPreserve": "no",
+        "RuntimeMaxUSec": "35min",
+        "TimeoutStopUSec": "15s",
+        "SendSIGKILL": "yes",
+        "OOMPolicy": "stop",
+    }
+    if (
+        completed.returncode != 0
+        or completed.stderr
+        or set(values) != set(names)
+        or not re.fullmatch(r"[0-9a-f]{32}", invocation)
+        or any(values.get(key) != value for key, value in expected.items())
+    ):
+        raise RuntimeError("Systemd-Wrapper-Serviceproperties drifteten")
+    expected_environment = (
+        f"E3DC_BOOTSTRAP_ROOT={args.install_path}",
+        f"E3DC_BOOTSTRAP_RUNNER_ROOT={args.execution_root}",
+        f"E3DC_BOOTSTRAP_USER={args.expected_install_user}",
+        f"E3DC_INSTALL_ROOT={args.install_path}",
+        "PYTHONNOUSERSITE=1",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "PYTHONUNBUFFERED=1",
+        "LC_ALL=C.UTF-8",
+        "LANG=C.UTF-8",
+    )
+    try:
+        actual_environment = tuple(shlex.split(values["Environment"]))
+    except ValueError as exc:
+        raise RuntimeError("Systemd-Wrapper-Environment ist unlesbar") from exc
+    if actual_environment != expected_environment:
+        raise RuntimeError("Systemd-Wrapper-Environment driftete")
+    control_group = values["ControlGroup"]
+    if (
+        not control_group.startswith("/")
+        or not control_group.endswith("/" + args.update_safety_service_unit)
+    ):
+        raise RuntimeError("Systemd-Wrapper-cgroup ist nicht kanonisch")
+    own_cgroups = Path("/proc/self/cgroup").read_text(encoding="ascii").splitlines()
+    if not any(line.partition("::")[2] == control_group for line in own_cgroups):
+        raise RuntimeError("Systemd-Wrapper läuft nicht in der gebundenen cgroup")
+    runtime = Path("/run") / args.update_safety_runtime_directory
+    runtime_metadata = runtime.lstat()
+    if (
+        runtime.is_symlink()
+        or not stat.S_ISDIR(runtime_metadata.st_mode)
+        or runtime_metadata.st_uid != 0
+        or runtime_metadata.st_gid != 0
+        or stat.S_IMODE(runtime_metadata.st_mode) != 0o700
+        or str(runtime / "start.token") != args.update_safety_token_path
+    ):
+        raise RuntimeError("Systemd-Wrapper-RuntimeDirectory driftete")
+    return invocation, control_group
+
+
+def _run_systemd_finalizer_wrapper(args: argparse.Namespace) -> int:
+    """Übernimmt fd0 als dasselbe flock-OFD und exec't den versiegelten Finalizer."""
+
+    if os.geteuid() != 0:
+        raise RuntimeError("Systemd-Finalizer-Wrapper benötigt Root")
+    root = _bound_product_root(args.install_path)
+    execution_root = _bound_execution_root(root)
+    if str(execution_root) != os.path.realpath(args.execution_root):
+        raise RuntimeError("Systemd-Wrapper-Ausführungssnapshot driftete")
+    _bind_execution_snapshot(execution_root, root, args.expected_release_sha)
+    system_python = _trusted_system_python()
+    _bind_wrapper_receipt(args)
+    invocation, _control_group = _wrapper_systemd_properties(args)
+
+    lock_fd = fcntl.fcntl(0, fcntl.F_DUPFD, 10)
+    try:
+        os.set_inheritable(lock_fd, True)
+        _validate_update_lock_fd(lock_fd)
+        lock_metadata = os.fstat(lock_fd)
+        if (lock_metadata.st_dev, lock_metadata.st_ino) != (
+            args.expected_lock_device,
+            args.expected_lock_inode,
+        ):
+            raise RuntimeError("Systemd-Wrapper erhielt nicht das Parent-Lock-OFD")
+        # LOCK_NB auf derselben offenen Dateibeschreibung muss erfolgreich
+        # bleiben, obwohl der Parent den Exklusivlock weiterhin hält.
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        null_fd = os.open("/dev/null", os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+        try:
+            os.dup2(null_fd, 0)
+        finally:
+            os.close(null_fd)
+        if os.readlink("/proc/self/fd/0") != "/dev/null":
+            raise RuntimeError("Systemd-Wrapper konnte stdin nicht auf /dev/null binden")
+
+        finalizer_argv = list(args.finalizer_argv)
+        if finalizer_argv[:1] == ["--"]:
+            finalizer_argv = finalizer_argv[1:]
+        required_pairs = {
+            "--install-path": str(root),
+            "--expected-release-sha": args.expected_release_sha,
+            "--update-safety-transaction": args.update_safety_transaction,
+            "--update-safety-receipt-sha256": args.update_safety_receipt_sha256,
+            "--update-safety-service-unit": args.update_safety_service_unit,
+            "--update-safety-runtime-directory": args.update_safety_runtime_directory,
+            "--update-safety-token-path": args.update_safety_token_path,
+        }
+        for name, value in required_pairs.items():
+            if finalizer_argv.count(name) != 1:
+                raise RuntimeError(f"Systemd-Wrapper-Finalizerargv fehlt {name}")
+            index = finalizer_argv.index(name)
+            if index + 1 >= len(finalizer_argv) or finalizer_argv[index + 1] != value:
+                raise RuntimeError(f"Systemd-Wrapper-Finalizerargv driftete bei {name}")
+        finalizer_script = _regular_nofollow(
+            Path(os.path.abspath(__file__)),
+            "Systemd-Target-Finalizer",
+        )
+        environment = {
+            "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "PYTHONNOUSERSITE": "1",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONUNBUFFERED": "1",
+            "E3DC_BOOTSTRAP_ROOT": str(root),
+            "E3DC_BOOTSTRAP_RUNNER_ROOT": str(execution_root),
+            "E3DC_BOOTSTRAP_USER": args.expected_install_user,
+            "E3DC_INSTALL_ROOT": str(root),
+            _UPDATE_LOCK_ENV: str(lock_fd),
+            _UPDATE_FINALIZER_INVOCATION_ENV: invocation,
+        }
+        os.execve(
+            system_python,
+            [
+                system_python,
+                "-I",
+                "-B",
+                "-u",
+                str(finalizer_script),
+                *finalizer_argv,
+            ],
+            environment,
+        )
+    finally:
+        os.close(lock_fd)
+    return 1
 
 
 def _run_target_updater_handoff(
@@ -2140,6 +2536,46 @@ def _main_with_update_lock(
         != execution_root
     ):
         raise RuntimeError("Installer.update wurde nicht aus dem versiegelten Snapshot geladen")
+    (
+        UpdateSafetyPostCommitError,
+        UpdateSafetyManagedServiceUnquiescedError,
+    ) = _bind_update_safety_exception_types(
+        update_module,
+        require_native=bool(getattr(args, "update_safety_transaction", "")),
+    )
+
+    expected_pending_contract = None
+    if getattr(args, "update_safety_transaction", ""):
+        try:
+            expected_pending_contract = update_module._read_update_safety_contract()
+        except BaseException as exc:
+            raise UpdateSafetyManagedServiceUnquiescedError(
+                "Target-Finalizer kann sein ursprüngliches Pending-Receipt "
+                "vor dem privilegierten Mutationspfad nicht binden"
+            ) from exc
+        if (
+            expected_pending_contract is None
+            or expected_pending_contract.state != "pending"
+            or expected_pending_contract.transaction_id
+            != args.update_safety_transaction
+            or expected_pending_contract.receipt_sha256
+            != args.update_safety_receipt_sha256
+            or expected_pending_contract.target_commit
+            != args.expected_release_sha
+            or expected_pending_contract.target_tag
+            != args.expected_release_tag
+            or expected_pending_contract.role != args.expected_ha_role
+            or expected_pending_contract.finalizer_unit
+            != args.update_safety_service_unit
+            or expected_pending_contract.runtime_directory
+            != args.update_safety_runtime_directory
+            or expected_pending_contract.token_path
+            != args.update_safety_token_path
+        ):
+            raise UpdateSafetyManagedServiceUnquiescedError(
+                "Target-Finalizer sieht vor dem privilegierten Mutationspfad "
+                "nicht sein exaktes ursprüngliches Pending-Receipt"
+            )
 
     from Installer import web_installer as web_installer_module  # pylint: disable=import-outside-toplevel
     if (
@@ -2169,6 +2605,7 @@ def _main_with_update_lock(
         web_installer_module._capture_file_preimage(path)
         for path in sorted(privileged_paths, key=lambda item: str(item))
     ]
+    postcommit_state = {"commit_attempted": False}
 
     try:
         finalize_release_from_target(
@@ -2183,14 +2620,59 @@ def _main_with_update_lock(
             expected_legacy_activity=args.expected_legacy_activity,
             expected_venv_state=args.expected_venv_state,
             expected_venv_path=args.expected_venv_path,
+            update_safety_transaction=args.update_safety_transaction or None,
+            update_safety_receipt_sha256=args.update_safety_receipt_sha256 or None,
+            update_safety_service_unit=args.update_safety_service_unit or None,
+            update_safety_runtime_directory=args.update_safety_runtime_directory or None,
+            update_safety_token_path=args.update_safety_token_path or None,
             headless=True,
             privileged_preimages=privileged_preimages,
+            postcommit_state=postcommit_state,
         )
         # Der Berechtigungsdurchlauf darf ausschließlich den gebundenen
         # Produktbaum verändern. Der privilegierte Ausführungssnapshot muss
         # über den gesamten Finalizer-Lauf byte- und modusidentisch bleiben.
         _bind_execution_snapshot(execution_root, root, args.expected_release_sha)
     except BaseException as original_error:
+        if isinstance(original_error, UpdateSafetyPostCommitError) or bool(
+            postcommit_state.get("commit_attempted")
+        ):
+            # Ab durable committed ist jeder Altstand-Rollback verboten. Der
+            # wartende Ziel-Updater räumt ausschließlich eigene Gate-Reste
+            # fertig oder lässt sie bewusst fail-closed stehen.
+            if isinstance(original_error, UpdateSafetyPostCommitError):
+                raise
+            raise UpdateSafetyPostCommitError(
+                "Target-Finalizerfehler trat nach Eintritt in die konservative "
+                "Commit-Attempt-Grenze auf; Altpreimage-Restore ist gesperrt"
+            ) from original_error
+        if expected_pending_contract is not None:
+            try:
+                current_contract = update_module._read_update_safety_contract()
+            except BaseException as receipt_error:
+                raise UpdateSafetyManagedServiceUnquiescedError(
+                    "Update-Sicherheitsreceipt ist vor dem privilegierten "
+                    "Altpreimage-Restore nicht mehr lesbar; Restore bleibt gesperrt"
+                ) from receipt_error
+            if current_contract == expected_pending_contract:
+                pass
+            elif (
+                current_contract is not None
+                and current_contract.state == "committed"
+                and update_module._same_update_safety_transaction_shape(
+                    current_contract,
+                    expected_pending_contract,
+                )
+            ):
+                raise UpdateSafetyPostCommitError(
+                    "Durable committed Receipt verbietet den privilegierten "
+                    "Altpreimage-Restore"
+                ) from original_error
+            else:
+                raise UpdateSafetyManagedServiceUnquiescedError(
+                    "Ursprüngliches Pending-Receipt driftete vor dem privilegierten "
+                    "Altpreimage-Restore; Restore bleibt fail-closed gesperrt"
+                ) from original_error
         try:
             restored = web_installer_module._restore_preimages(privileged_preimages)
             syntax = subprocess.run(
@@ -2229,6 +2711,8 @@ def main() -> int:
     args = _parse_args()
     if os.geteuid() != 0:
         raise RuntimeError("Release-Finalizer muss mit Root-Rechten laufen")
+    if getattr(args, "systemd_finalizer_wrapper", False):
+        return _run_systemd_finalizer_wrapper(args)
     root = _bound_product_root(args.install_path)
     script = _regular_nofollow(
         Path(os.path.abspath(__file__)),

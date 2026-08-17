@@ -1,10 +1,19 @@
 # Betrieb des E3DC-Control Installers
 
-Dokumentation Stand: 5.4.3l
+Dokumentation Stand: 5.4.3m
 
 Der Installer ist der freigegebene Einstieg für Installation, Update,
 Reparatur, Backup, Rollback und Deinstallation. Die vollständige Bedienung ist
 in [E3DC-Control Installer](Installer.md) beschrieben.
+
+Der Installer-Anteil von 5.4.3m darf ausschließlich im vollständig
+versiegelten, normalen vorwärtsgerichteten Ziel-Updater einen wirklich
+fehlenden Rollenanker für den exakt gebundenen `off`-Einzelknoten ohne Peer
+einmalig projizieren. Das geschieht erst nach Root-Receipt-gebundenem Backup,
+abgeschlossener gegebenenfalls nötiger Storage-Manager-Unit-Promotion und
+bestätigter Aktorruhe. Bootstrap, Reinstall und Rollback bleiben ausgeschlossen.
+Ein vorhandener fremder oder widersprüchlicher Anker sowie HA- und
+Shadow-Rollen werden weder umgedeutet noch automatisch repariert.
 
 Der Installer-Anteil von 5.4.3l bindet den nativen Git-Rückweg an den
 updater-eigenen Ausgangscommit, das root-eigene Transaktionsbackup und die

@@ -115,7 +115,7 @@ $paths = getInstallPaths();
     <div class="container">
         <div class="d-flex justify-content-between align-items-center mb-4">
             <a href="index.php" class="nav-link-back"><i class="fas fa-arrow-left me-2"></i>Dashboard</a>
-            <span class="badge bg-success text-light">v5.4.3l Stable</span>
+            <span class="badge bg-success text-light">v5.4.3m Stable</span>
         </div>
         <h1 class="display-4 fw-bold">Hilfe & Support</h1>
         <p class="lead opacity-75">Häufige Fragen und Lösungen rund um E3DC-Control.</p>
@@ -134,7 +134,7 @@ $paths = getInstallPaths();
         <div class="col-12 faq-item" data-tags="docker image stable rollback update">
             <div class="card bg-card border-0 shadow-sm"><div class="card-body">
                 <h5 class="card-title"><span class="tag">Docker</span> Wie prüfe ich Image und Update?</h5>
-                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem geprüften Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.3l</code> in <code>.env</code> gesetzt.</p>
+                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem geprüften Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.3m</code> in <code>.env</code> gesetzt.</p>
                 <pre>cd "${E3DC_DOCKER_PATH:-$HOME/e3dc-docker}"
 if [ -f ./docker_compose_update.py ]; then
   E3DC_DOCKER_HELPER=./docker_compose_update.py
@@ -212,6 +212,25 @@ sudo docker compose logs --tail=80 e3dc-control</pre>
                         <li>Nach der Freigabe im Account den RESTful API Security Token erzeugen.</li>
                         <li>Im Config-Editor unter <em>Tarif</em> den ENTSO-E-Token als Fallback-Token eintragen und mit <em>ENTSO-E testen</em> prüfen.</li>
                     </ol>
+                </div>
+            </div>
+        </div>
+
+        <h4 class="mb-4 text-accent"><i class="fas fa-shield-halved me-2"></i>Stable 5.4.3m: eindeutiger Update-Rückweg und openWB-Pro-Start</h4>
+        <div class="col-12 faq-item" data-tags="5.4.3m stable update ziel updater rollenanker notifier recovery openwb pro phase sofort preislimit">
+            <div class="card bg-card border-0 shadow-sm">
+                <div class="card-body">
+                    <h5 class="card-title">
+                        <span class="tag">5.4.3m</span>
+                        Was korrigiert das Stable-Release 5.4.3m?
+                    </h5>
+                    <ul>
+                        <li><strong>Enger Rollenanker-Normalpfad:</strong> Ausschließlich der vollständig versiegelte Ziel-Updater darf bei einem über Git-Ancestry als echt vorwärtsgerichtet belegten Releasewechsel einen wirklich fehlenden Rollenanker einmalig auf <code>off</code> projizieren. Die Rolle muss exakt <code>off</code> und der HA-Peer leer sein; Bootstrap, Reinstall, Rollback, <code>master</code>, <code>slave</code>, <code>shadow</code> und widersprüchliche Bestände bleiben gesperrt.</li>
+                        <li><strong>Kein eigener Drop-in-Konflikt:</strong> Notifier-Schreibvorgänge legen ihr privates Staging außerhalb von <code>*.service.d</code> an. Ein eigener Altordner wird nur root-eigen, stabil gebunden und exakt leer entfernt. Bei einer optional fehlenden Unit bleibt neben dem Recovery-Startschutz nur das bytegenau kanonische RAM-Disk-Drop-in zulässig.</li>
+                        <li><strong>Update-Sicherheitsbeleg ohne Forward-Auto-Resume:</strong> Nach verifiziertem Backup und vor der ersten Produktmutation persistiert der versiegelte Normalpfad einen txid-, ziel-, rollen-, backup-, bootblock- und servicegebundenen ausstehenden Beleg (<code>pending</code>) samt Marker und dynamischem <code>00</code>-Startschutz. <code>pending</code> bleibt fail-closed und wird nicht automatisch vorwärts fortgesetzt. Erst der vollständig bestätigte Ziel-, Dienst-, Gesundheits- und Bootvertrag wird dauerhaft <code>committed</code>; danach ist kein Altstand-Rollback mehr zulässig. Bei einem unterbrochenen Abschluss darf nur der exakt eigene Rest bereinigt werden; ein äußerer oder späterer Cleanup-Pfad greift erst bei inaktiver Finalizer-Lease ein. Ältere, fremde, unvollständige oder nicht eindeutig gebundene Recoveryflächen bleiben manuell zu prüfen.</li>
+                        <li><strong>openWB-Pro-Phasenvertrag:</strong> Die 480-Sekunden-Sperre beginnt erst nach einem bestätigten realen Phasenausgang. Recovery läuft vor dem Budget-Veto; ein gestrandeter älterer 0-A-Intent darf nur aus seinem eigenen Intent-/ACK-Paar und einem frischen 0-A-/0-W-Gerätereadback ohne neuen Hardwarebefehl geschlossen werden.</li>
+                        <li><strong>Bewusster Sofortstart:</strong> Ein neuer WebUI-Auftrag für <em>Sofort bis Preislimit</em> darf ausschließlich die vollständig verbrauchte Wake-up-Episode derselben aktuellen Stecksession einmalig neu öffnen. Preislimit, Nutzer-<code>Aus</code>, Not-Aus, Speicherreserve, Netzpunkt-, Phasen- und Hardwaregrenzen bleiben vorrangig.</li>
+                    </ul>
                 </div>
             </div>
         </div>

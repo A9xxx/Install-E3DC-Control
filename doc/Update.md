@@ -5,7 +5,7 @@ Updates werden ausschließlich über den Installer ausgeführt. Ein manuelles
 Release-Historie ungeeignet, weil alter und neuer Git-Stand nicht miteinander
 verwandt sein müssen.
 
-Der aktuelle Stable-Stand ist `v5.4.3l`. Der Ziel-Updater bindet den
+Der aktuelle Stable-Stand ist `v5.4.3m`. Der Ziel-Updater bindet den
 freigegebenen Zielstand vor Backup und Dienststopp eindeutig an Version,
 Herkunft und Anlagenrolle. Fortschritt und Lebenszeichen bleiben auf
 langsameren Raspberry Pis sichtbar. Eine bereits vollständig installierte
@@ -74,6 +74,40 @@ dem Root-Lock aus demselben gültigen Nicht-Root-Eigentümer von Repository und
 Import aus dem Zielcode erneut geprüft. Die fail-closed Grenzen und alle
 übrigen Härtungen aus 5.4.3j bleiben unverändert.
 
+### 5.4.3m: vorwärtsgebundener Rollenanker und eindeutige Drop-ins
+
+5.4.3m erlaubt ausschließlich dem vollständig versiegelten nativen
+Ziel-Updater bei einem durch `git merge-base --is-ancestor` als echt
+vorwärtsgerichtet belegten Releasewechsel, einen wirklich fehlenden
+Instanzrollenanker einmalig auf `off` zu projizieren. Dafür müssen die
+eingefrorene Rolle exakt `off` und die konfigurierte HA-Peer-Adresse leer sein.
+Bootstrap, Reinstall, Rollback, ein identischer oder rückwärtsgerichteter
+Commit und andere Aufrufpfade besitzen diese Autorität nicht.
+
+Der Bedarf wird zunächst rein lesend geprüft. Die Erzeugung erfolgt erst nach
+dem Root-Receipt-gebundenen Transaktionsbackup, einer gegebenenfalls nötigen
+und vollständig bestätigten Storage-Manager-Unit-Promotion sowie der
+nachgewiesenen Aktorruhe. Dadurch liegt die Projektion innerhalb derselben
+Update- und Recovery-Transaktion. Fehlt der gebundene Recovery-Vertrag, bleibt
+die Mutation gesperrt. Ein passender vorhandener Anker bleibt unverändert;
+`master`, `slave`, `shadow`, ein konfigurierter Peer sowie ein vorhandener
+fremder oder widersprüchlicher Anker bleiben harte Abbruchgründe.
+
+Atomare Schreibvorgänge für Notifier-Drop-ins verwenden ihr privates
+Transaktionsstaging ab 5.4.3m außerhalb des `*.service.d`-Verzeichnisses. Ein
+vom älteren Writer zurückgelassener verschachtelter Staging-Ordner wird nur
+dann entfernt, wenn er descriptorgebunden stabil, root-eigen, Modus `0700`,
+exakt leer und frei von ACLs oder Attributen ist. Ein nichtleerer,
+ausgetauschter oder fremder Bestand bleibt gesperrt.
+
+Für eine optionale, nicht installierte Unit darf die On-Disk-Drop-in-Fläche
+neben dem eigenen Recovery-Startschutz ausschließlich das byte- und
+metadatengenau geprüfte kanonische RAM-Disk-Drop-in enthalten. Weitere Namen,
+abweichende Bytes, Eigentümer, Modi, Links, ACLs oder Attribute bleiben
+fail-closed. Dadurch ist eine bewusst optionale Unit nicht allein wegen ihres
+kanonischen RAM-Disk-Schutzes mehrdeutig, ohne die Fremdflächenprüfung zu
+lockern.
+
 ### 5.4.3l: updater-eigener Git-Rückweg
 
 5.4.3l bindet den nativen Rückweg vor der ersten Dienstmutation an
@@ -118,6 +152,30 @@ Updateversuch vor Backup und Dienstmutation. Der Startschutz ist keine
 pauschale Garantie bei Stromausfall, `SIGKILL` oder einem Prozessabbruch
 außerhalb dieses erkannten Fehlerpfads.
 
+### 5.4.3m: persistenter Update-Sicherheitsbeleg
+
+Der vollständig versiegelte Normalpfad persistiert nach dem verifizierten
+Backup und vor der ersten Produktmutation einen ausstehenden
+Update-Sicherheitsbeleg (`pending`). Er bindet Transaktionskennung, Zielstand,
+Rolle, Backup, dynamische `00`-Bootblock-Inodes und den verwalteten
+Finalizer-Dienst. Anschließend werden Marker und Startschutz armiert, Writer und
+PiGuard gestoppt sowie Backup, Repository, privilegierte Konfiguration und
+Dienstruhe unmittelbar vor der Mutation erneut geprüft.
+
+`pending` bleibt fail-closed und ist ausdrücklich **kein Forward-Auto-Resume**.
+Ein ausstehender, älterer, fremder, unvollständiger oder nicht mehr eindeutig
+gebundener Vertrag verlangt einen separat geprüften manuellen Rückweg. Seine
+Marker, Drop-ins und Belege werden weder adoptiert noch einzeln entfernt oder
+durch einen neuen Updateversuch umgangen.
+
+Erst wenn Zielstand, Dienststart, Gesundheit und Boot-Sanity vollständig
+bestätigt sind, wird der Beleg dauerhaft auf `committed` gesetzt. Ab diesem
+Punkt ist jeder Rückweg auf den Altstand verboten. Bei einem unterbrochenen
+Abschluss ist ausschließlich das exakt gebundene Cleanup der eigenen Marker-,
+`00`- und Receipt-Reste zulässig. Ein äußerer oder späterer Cleanup-Pfad darf
+erst nach nachweislich inaktiver Finalizer-Lease eingreifen. Fremde oder
+driftende Flächen bleiben unangetastet und fail-closed.
+
 Erreicht ein abweichender oder noch älterer lokaler Updater diese gebundene
 Kompatibilitätsbrücke nicht und bricht bereits vor Backup und Dienststopp mit
 `Installationsbenutzer ist nicht lokal gebunden` ab, steht für einen normalen
@@ -127,7 +185,7 @@ GitHub-Release-Seite übernommen werden:
 
 ```bash
 export E3DC_INSTALL_PATH="/absoluter/pfad/zur/installation"
-export E3DC_RELEASE_TAG="v5.4.3l"
+export E3DC_RELEASE_TAG="v5.4.3m"
 export E3DC_RELEASE_SHA="<40-stellige Commit-SHA des veröffentlichten Tags>"
 E3DC_BOOTSTRAP_DIR="$(mktemp -d)"
 curl -fL "https://github.com/A9xxx/Install-E3DC-Control/archive/refs/tags/${E3DC_RELEASE_TAG}.tar.gz" \
@@ -507,20 +565,32 @@ Reihenfolge aus:
 2. ein externes, root-eigenes Backup mit vollständigem Manifest, SHA-256,
    Git-Ausgangszustand und dem Zustand kanonischer systemd-Masken erstellen
    und mit einem Transaktionsbeleg erneut prüfen;
-3. eine exakt freigegebene historische Storage-Manager-Unit gegebenenfalls
-   atomar auf den root-eigenen Vertrag migrieren, `daemon-reload` ausführen
-   und das effektive Unit-Bündel erneut lesen;
-4. PiGuard und danach alle katalogisierten Writer-/Integrationsdienste stoppen
-   und ihren Endzustand streng prüfen;
-5. den Installationsbaum auf genau den Ziel-SHA setzen und `HEAD` erneut
+3. im versiegelten Normalpfad den txid-, ziel-, rollen-, backup-, bootblock-
+   und servicegebundenen ausstehenden Update-Sicherheitsbeleg (`pending`)
+   zusammen mit den eigenen dynamischen `00`-Startbedingungen persistieren
+   und den Marker vor der ersten Produktmutation armieren;
+4. PiGuard und danach alle katalogisierten Writer-/Integrationsdienste unter
+   diesem Startschutz stoppen; `inactive/dead`, `MainPID=0`, Backup,
+   Repository, privilegierte Konfiguration und den vollständigen Schutzvertrag
+   unmittelbar am Mutationsgate erneut prüfen;
+5. eine exakt freigegebene historische Storage-Manager-Unit gegebenenfalls
+   unter demselben Schutz atomar auf den root-eigenen Vertrag migrieren,
+   `daemon-reload` ausführen und das effektive Unit-Bündel erneut lesen;
+6. den Installationsbaum auf genau den Ziel-SHA setzen und `HEAD` erneut
    prüfen;
-6. einen eigenen Target-Finalizer aus einem separaten root-eigenen,
-   schreibgeschützten Ausführungssnapshot des verifizierten Zielcommits gegen
-   Ziel-SHA, Ziel-Tag und gebundene Ausgangsdaten prüfen und starten;
-7. Webdateien synchronisieren und veraltete Pfade nur über feste Positivlisten
+7. den Target-Finalizer aus einem separaten root-eigenen,
+   schreibgeschützten Ausführungssnapshot des verifizierten Zielcommits als
+   verwalteten systemd-Dienst unter demselben Update-Lock und seiner
+   transaktionsgebundenen Lease starten;
+8. Webdateien synchronisieren und veraltete Pfade nur über feste Positivlisten
    entfernen;
-8. eingefrorene HA-/Shadow-Rolle und Feature-Konfiguration, alle erwarteten
-   Dienste, lokale HTTP-Endpunkte und Boot-Sanity hart prüfen.
+9. eingefrorene HA-/Shadow-Rolle und Feature-Konfiguration, alle erwarteten
+   Dienste, lokale HTTP-Endpunkte und Boot-Sanity hart prüfen;
+10. erst danach den Update-Sicherheitsbeleg dauerhaft als `committed`
+    bestätigen. Ein Altstand-Rollback ist ab hier verboten; der Finalizer
+    entfernt nur seinen exakt eigenen Marker-/`00`-Vertrag. Der äußere Pfad
+    entfernt das exakt gebundene Receipt erst nach inaktiver Lease; ein
+    unterbrochener Abschluss bleibt auf genau dieses Cleanup begrenzt.
 
 Beim direkten ersten Wechsel aus 5.3.2b bleibt der bereits
 gestartete Altprozess bis zum Abschluss aktiv. Nach dem Git-Wechsel importiert

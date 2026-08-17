@@ -1,3 +1,79 @@
+# E3DC-Control v5.4.3m
+
+E3DC-Control 5.4.3m schließt zwei konkrete Betriebskanten: Der native
+Ziel-Updater kann einen fehlenden Einzelknoten-Rollenanker im eng gebundenen
+Normalpfad erzeugen, ohne seine eigene systemd-Transaktionsfläche später als
+fremd zu verwerfen. Bei der openWB Pro bleiben Phasen-Recovery und ein neuer
+bewusster Sofortstart auch nach Budgetmangel, Manager-Neustart und einer
+verbrauchten Wake-up-Episode eindeutig gebunden.
+
+## Updatepfad ohne selbst erzeugten Drop-in-Konflikt
+
+- Die Autorität für einen fehlenden Rollenanker gehört ausschließlich dem
+  vollständig versiegelten Ziel-Updater bei einem durch Git-Ancestry als echt
+  vorwärtsgerichtet belegten Releasewechsel. Die eingefrorene Rolle muss
+  `off` sein und die Peer-Adresse leer. Bootstrap, Reinstall, Rollback,
+  `master`, `slave`, `shadow` sowie vorhandene fremde oder widersprüchliche
+  Anker bleiben gesperrt.
+- Atomare Notifier-Drop-in-Schreibvorgänge legen ihr privates Staging nicht
+  mehr innerhalb von `e3dc-notifier.service.d` an. Ein eigener Altbestand wird
+  nur als stabil gebundener, root-eigener, exakt leerer Ordner ohne ACLs oder
+  Attribute entfernt. Ein nichtleerer, ausgetauschter oder fremder Bestand
+  bleibt ein harter Abbruchgrund.
+- Fehlt eine optionale systemd-Unit, darf ihre On-Disk-Drop-in-Fläche neben
+  dem transaktionsgebundenen Recovery-Startschutz ausschließlich das exakt
+  kanonische RAM-Disk-Drop-in enthalten. Namen, Bytes, Eigentümer, Modi,
+  Links, ACLs und Attribute werden weiterhin fail-closed geprüft.
+
+## Persistenter Update-Sicherheitsbeleg ohne Forward-Auto-Resume
+
+- Der versiegelte Normalpfad persistiert nach dem verifizierten Backup und vor
+  der ersten Produktmutation einen an Transaktion, Ziel, Rolle, Backup,
+  Bootblock und Finalizer-Dienst gebundenen ausstehenden
+  Update-Sicherheitsbeleg (`pending`). Marker und dynamische `00`-Drop-ins
+  halten die Writer dabei fail-closed; `pending` ist ausdrücklich kein Auftrag,
+  den Zielstand automatisch vorwärts fortzusetzen.
+- Erst nach vollständig bestätigtem Zielstand, Dienststart, Gesundheit und
+  Boot-Sanity wird der Abschluss dauerhaft als `committed` bestätigt. Ab
+  diesem Zustand ist ein Rückweg auf den Altstand verboten; bei einem
+  unterbrochenen Abschluss ist nur das exakt gebundene Cleanup der eigenen
+  Marker-, `00`- und Receipt-Reste zulässig. Ein äußerer oder späterer
+  Cleanup-Pfad greift erst nach nachgewiesen inaktiver Finalizer-Lease ein.
+- Ausstehende, ältere, fremde, unvollständige oder nicht mehr eindeutig
+  gebundene Recoveryflächen benötigen weiterhin einen separat geprüften
+  manuellen Rückweg. Sie werden weder adoptiert noch einzeln gelöscht oder
+  durch einen neuen Updateversuch umgangen.
+
+## openWB-Pro-Phasenvertrag
+
+- Eine Reservierung im Zustand `await_budget` startet keinen
+  Phasen-Cooldown. Die mindestens 480 Sekunden lange elektromechanische Sperre
+  beginnt ausschließlich nach einem neuen, exakt generationgebundenen und
+  bestätigten `send_phase`-Wire-Receipt; sie sperrt nur den nächsten
+  Phasenwechsel, nicht den bestätigten Wiederanlauf.
+- Ein `recovery_hold` bleibt über Lease-Ablauf und Manager-Neustart
+  ausgangsgebunden. Der Manager wertet ihn vor Supersession und vor dem
+  Storage-Grant-Veto aus. Ein gestrandeter älterer `send_zero`-Intent wird nur
+  aus seinem eigenen negativen ACK und einem frischen post-intent
+  0-A-/0-W-Gerätereadback geschlossen. Dieser Recoverypfad sendet keinen
+  Hardwarebefehl.
+
+## Neuer bewusster Sofortstart
+
+- Die WebUI schreibt einen typisierten, zufällig identifizierten
+  Modus-5-Nutzerauftrag gemeinsam mit Konfiguration und Plan. Der Manager
+  verarbeitet ihn als `peek → persist → exact ack`; ein Prozessabbruch vor der
+  Quittierung führt dadurch nicht zu einem zweiten Reset.
+- Nur eine vollständig belegte 3/3-Startablehnung der aktuellen
+  openWB-Pro-Stecksession darf für genau diesen neuen Nutzerauftrag verworfen
+  werden. Fremde Sessions, unvollständige Episoden, alte Anforderungen sowie
+  fremde oder sicherheitsrelevante Anker bleiben unangetastet.
+- Der Auftrag sendet selbst keine Hardwarekommandos und erzeugt kein Budget.
+  Nutzer-`Aus`, Not-Aus, `dvcarlimit`, Speicherreserve, Netzpunkt-, Phasen- und
+  Hardwaregrenzen entscheiden anschließend unverändert über den realen Start.
+
+---
+
 # E3DC-Control v5.4.3l
 
 E3DC-Control 5.4.3l härtet ausschließlich den nativen Ziel-Updater und dessen

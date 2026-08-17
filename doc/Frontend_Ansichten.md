@@ -97,6 +97,13 @@ Die Bedeutungen sind:
 - **Sofort-Preislimit**
   Dieses Limit gilt nur für spontanes Netzladen im Modus `Sofort`. Geplante Ladungen und automatisch berechnete Ladefenster werden dadurch nicht gekürzt, blockiert oder gelöscht.
 
+  Jeder bewusst neu gespeicherte Sofortauftrag wird als eigene, einmalig
+  quittierte Nutzerintention an den Wallbox Manager übergeben. Bei einer
+  openWB Pro darf sie ausschließlich eine vollständig verbrauchte
+  Startversuchs-Episode derselben aktuellen Stecksession neu öffnen. Sie
+  umgeht weder das eingestellte Preislimit noch Nutzer-`Aus`, Not-Aus,
+  Speicherreserve, Netzpunkt-, Phasen- oder Hardwaregrenzen.
+
 - **Statuszeile**
   Die einfache Wallbox-Ansicht trennt bewusst zwischen Betriebsart und Planwerten. Bei `Überschuss` steht nur die aktive Betriebsart. Bei `PV + Akku` nennt sie die Hausakku-Reserve und den Hinweis, dass unterhalb davon nur Hausverbrauch und Wärmepumpe aus dem Akku gestützt werden. Bei `Fertig bis` werden Zielwert und Zielzeit angezeigt. Bei `Sofort` wird nur das Sofort-Preislimit angezeigt, wenn Netzstrom erlaubt ist.
 

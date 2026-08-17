@@ -29,6 +29,21 @@ import math
 import stat
 from copy import deepcopy
 
+try:
+    import pwd
+except ImportError:  # Windows-Testumgebung; Produktionsmanager läuft auf Linux.
+    pwd = None
+
+try:
+    import grp
+except ImportError:  # Windows-Testumgebung; Produktionsmanager läuft auf Linux.
+    grp = None
+
+try:
+    import fcntl
+except ImportError:  # Windows-Testumgebung; Produktionsmanager läuft auf Linux.
+    fcntl = None
+
 # Installer-Verzeichnis in Pfad aufnehmen (fuer rscp_client u.a.)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -1695,6 +1710,21 @@ WB_PHASE_STATE_FILE = os.environ.get(
 )
 WB_DEFAULT_RELEASE_REQUEST_FILE = os.path.join(RAMDISK_DIR, "wallbox_default_release_request.json")
 WB_USER_MODE_REQUEST_FILE = os.path.join(RAMDISK_DIR, "wallbox_user_mode_request.json")
+WB_USER_MODE_REQUEST_LOCK_FILE = WB_USER_MODE_REQUEST_FILE + ".lock"
+WB_MODE5_USER_START_REQUEST_FILE = os.path.join(
+    os.path.dirname(V4_CONFIG_FILE),
+    "wallbox_mode5_user_start_request.json",
+)
+try:
+    WB_MODE5_REQUEST_OWNER_UID = (
+        int(pwd.getpwnam("www-data").pw_uid) if pwd is not None else -1
+    )
+    WB_MODE5_REQUEST_GROUP_GID = (
+        int(grp.getgrnam("www-data").gr_gid) if grp is not None else -1
+    )
+except Exception:
+    WB_MODE5_REQUEST_OWNER_UID = -1
+    WB_MODE5_REQUEST_GROUP_GID = -1
 EMS_DECISION_FILE = default_surface_path(RAMDISK_DIR)
 WB_LIVE_SESSION_FILE = os.path.join(RAMDISK_DIR, "wb_live_session.json")
 WB_LIVE_SESSION_CHECKPOINT_FILE = os.path.join(
@@ -5332,6 +5362,37 @@ def _wallbox_charge_end_latch_contract(
     release_exception = str(user_release_exception or "")
     if not diagnostic_only and not release_exception and config is not None:
         release_exception = _detect_wallbox_charge_end_user_release(c_data, config, cid, public_mode)
+    protected_start_reject_episode = {}
+    if (
+        bool(c_data.get("_bev_full_blocked", False))
+        and str(c_data.get("_bev_full_block_reason") or "")
+        == "start_rejected"
+        and release_exception
+    ):
+        protected_start_reject_episode = (
+            _openwb_pro_start_reject_episode_contract(
+                c_data,
+                config if isinstance(config, dict) else {},
+                now_ts=now_ts,
+            )
+        )
+    if (
+        protected_start_reject_episode.get("complete") is True
+        and protected_start_reject_episode.get("session_bound") is True
+        and int(protected_start_reject_episode.get("sent_count", 0) or 0) == 3
+        and int(protected_start_reject_episode.get("max_retries", 0) or 0) == 3
+        and str(protected_start_reject_episode.get("plug_session_id") or "")
+        == str(c_data.get("_charge_end_latched_plug_session_id") or "")
+    ):
+        # Ein allgemeiner Mode-/Limit-/Profil-Token ist für eine verbrauchte
+        # openWB-Pro-3/3-Episode keine Freigabeautorität. Nur der separat
+        # versiegelte Same-Session-Mode-5-Request oder ein bestätigter Replug
+        # darf diesen Latch lösen.
+        c_data["_start_rejected_generic_release_blocked"] = {
+            "exception": release_exception,
+            "hardware_write": False,
+        }
+        release_exception = ""
     phase_transition_grace = _wallbox_phase_transition_grace_active(c_data, status, now_ts=now_ts)
     openwb_pro_transient_grace = False
     if openwb_pro_session.is_openwb_pro_charger(c_data.get("charger")):
@@ -7198,6 +7259,21 @@ def _bind_openwb_pro_phase_post_receipt(
     )
     restart_delay_s = openwb_pro_session.phase_restart_delay_s(cfg)
     phase_cooldown_s = openwb_pro_session.phase_wait_s(cfg)
+    cooldown_reservation = wallbox_phase_transition.bind_wire_cooldown(
+        data,
+        reservation_id=str(intent_item.get("transition_id") or ""),
+        target_phases=target,
+        wire_receipt_ts=receipt_ts,
+        cooldown_s=phase_cooldown_s,
+    )
+    if not cooldown_reservation:
+        _phase_output_recovery_hold(
+            data,
+            "phase_target_cooldown_binding_failed",
+            intent_item,
+        )
+        _save_wallbox_phase_state([data])
+        return None, None
     stage_timer = openwb_pro_session._phase_stage_timer(
         "restart_delay",
         phase_settle_s + restart_delay_s,
@@ -7378,13 +7454,206 @@ def _phase_output_recovery_post_intent_readback(status, intent, now_ts):
     )
 
 
+def _resolve_stranded_phase_zero_recovery(
+    data,
+    status,
+    hold,
+    intent,
+    *,
+    now_ts,
+):
+    """Terminalisiert einen alten 0-A-Intent vor einer neuen No-output-Generation.
+
+    Ältere Stände konnten nach Ablauf einer Reservierungslease eine neue
+    ``await_budget``-Generation anlegen, während der negative ``send_zero``-
+    ACK der Vorgängergeneration global erhalten blieb. Die alte Generation
+    darf ausschließlich anhand ihres eigenen Intent-/ACK-Paars und eines
+    frischen post-intent 0-A/0-W-Readbacks geschlossen werden. Die nachfolgende
+    Reservierung bleibt dabei unverändert aktiv und erhält keinen Cooldown.
+    """
+
+    box = data if isinstance(data, dict) else {}
+    st = status if isinstance(status, dict) else {}
+    hold_item = hold if isinstance(hold, dict) else {}
+    intent_item = intent if isinstance(intent, dict) else {}
+    ack = box.get("_openwb_pro_phase_output_ack")
+    ack = ack if isinstance(ack, dict) else {}
+    reservation = box.get("_wallbox_phase_transition_reservation")
+    reservation = reservation if isinstance(reservation, dict) else {}
+    grant = box.get("_phase_transition_grant")
+    grant = grant if isinstance(grant, dict) else {}
+
+    old_id = str(intent_item.get("transition_id") or "")
+    intent_id = str(intent_item.get("intent_id") or "")
+    current_id = str(
+        reservation.get("transition_id")
+        or reservation.get("reservation_id")
+        or ""
+    )
+    target = _valid_phase_count(intent_item.get("target"), 0)
+    sequence_after = intent_item.get("sequence_after")
+    sequence_after = sequence_after if isinstance(sequence_after, dict) else {}
+    intent_ts = _cfg_float(intent_item.get("wall_ts"), 0.0)
+    ack_ts = _cfg_float(ack.get("wall_ts"), 0.0)
+    started_ts = _cfg_float(reservation.get("started_ts"), 0.0)
+    readback_ts = _cfg_float(st.get("driver_status_last_ok_ts"), 0.0)
+    now_value = _cfg_float(now_ts, 0.0)
+    if intent_ts > 100_000_000_000.0:
+        intent_ts /= 1000.0
+    if ack_ts > 100_000_000_000.0:
+        ack_ts /= 1000.0
+    if started_ts > 100_000_000_000.0:
+        started_ts /= 1000.0
+    if readback_ts > 100_000_000_000.0:
+        readback_ts /= 1000.0
+
+    active_sequence = box.get("_openwb_pro_phase_sequence")
+    active_restart = box.get("_openwb_pro_phase_restart_authorized")
+    last_executed = box.get("_last_executed_command")
+    last_executed = last_executed if isinstance(last_executed, dict) else {}
+    last_output_ts = _cfg_float(last_executed.get("ts"), 0.0)
+    if last_output_ts > 100_000_000_000.0:
+        last_output_ts /= 1000.0
+    last_output_after_successor = bool(
+        str(last_executed.get("method") or "")
+        in (
+            "set_phases",
+            "set_amp_and_state",
+            "set_current",
+            "set_direct_current",
+            "trigger_cp_interrupt",
+            "cp_interrupt",
+        )
+        and (last_output_ts <= 0.0 or last_output_ts >= started_ts)
+    )
+    cooldown_receipt_ts = _cfg_float(
+        reservation.get("cooldown_wire_receipt_ts"),
+        0.0,
+    )
+
+    exact = bool(
+        reservation.get("schema_version")
+        == "wallbox_phase_transition_v2"
+        and reservation.get("active") is True
+        and str(reservation.get("stage") or "") == "await_budget"
+        and current_id
+        and current_id != old_id
+        and str(reservation.get("reservation_id") or "") == current_id
+        and str(reservation.get("transition_id") or "") == current_id
+        and int(_cfg_float(reservation.get("wb_id"), 0.0))
+        == int(_cfg_float(box.get("id"), 0.0))
+        and int(_cfg_float(reservation.get("wb_id"), 0.0)) > 0
+        and str(reservation.get("owner") or "") == "wallbox_manager"
+        and str(reservation.get("source") or "")
+        == "openwb_pro_phase_sequence"
+        and _valid_phase_count(reservation.get("target_phases"), 0) == target
+        and target in (1, 3)
+        and str(reservation.get("grant_state") or "") == "waiting"
+        and int(_cfg_float(reservation.get("requested_w"), 0.0)) > 0
+        and int(_cfg_float(reservation.get("granted_w"), 0.0)) == 0
+        and int(_cfg_float(reservation.get("committed_w"), 0.0)) == 0
+        and _cfg_float(reservation.get("committed_ts"), 0.0) <= 0.0
+        and int(_cfg_float(reservation.get("valid_frames"), 0.0)) == 0
+        and cooldown_receipt_ts <= 0.0
+        and not str(reservation.get("cooldown_source") or "")
+        and grant
+        and str(grant.get("reservation_id") or "") == current_id
+        and str(grant.get("grant_state") or "") == "waiting"
+        and int(_cfg_float(grant.get("granted_w"), 0.0)) == 0
+        and hold_item.get("active") is True
+        and str(hold_item.get("reason") or "") == "phase_zero_unconfirmed"
+        and str(hold_item.get("reservation_id") or "") == old_id
+        and str(hold_item.get("transition_id") or "") == old_id
+        and str(hold_item.get("intent_id") or "") == intent_id
+        and _valid_phase_count(hold_item.get("target"), 0) == target
+        and intent_item.get("schema") == "openwb_pro_phase_output_intent_v1"
+        and old_id
+        and intent_id.startswith(old_id + ":send_zero:")
+        and str(intent_item.get("action") or "") == "send_zero"
+        and str(intent_item.get("method") or "") == "set_amp_and_state"
+        and sequence_after.get("stage") == "zero_wait"
+        and _valid_phase_count(sequence_after.get("target"), 0) == target
+        and ack.get("schema") == "openwb_pro_phase_output_ack_v1"
+        and str(ack.get("intent_id") or "") == intent_id
+        and ack.get("success") is False
+        and str(ack.get("reason") or "") == "phase_zero_unconfirmed"
+        and all(
+            math.isfinite(value) and value > 0.0
+            for value in (intent_ts, ack_ts, started_ts, readback_ts, now_value)
+        )
+        and intent_ts <= ack_ts < started_ts
+        and readback_ts > max(intent_ts, ack_ts)
+        and readback_ts <= now_value + 1.0
+        and openwb_pro_session.phase_zero_readback_confirmed(st)
+        and openwb_pro_session.status_connected(st)
+        and _cfg_float(box.get("current_set_amp"), 0.0) <= 0.5
+        and not (isinstance(active_sequence, dict) and active_sequence)
+        and not (
+            isinstance(active_restart, dict)
+            and active_restart.get("active") is True
+        )
+        and not last_output_after_successor
+    )
+    if not exact:
+        return False
+
+    touched_keys = (
+        "_wallbox_phase_transition_reservation",
+        "_openwb_pro_phase_output_intent",
+        "_openwb_pro_phase_output_ack",
+        "_openwb_pro_phase_recovery_hold",
+        "_openwb_pro_phase_sequence_stage",
+        "_openwb_pro_phase_stranded_zero_recovery",
+    )
+    previous = {
+        key: (key in box, deepcopy(box.get(key)))
+        for key in touched_keys
+    }
+    successor = dict(reservation)
+    successor["cooldown_until_ts"] = 0.0
+    successor.pop("cooldown_wire_receipt_ts", None)
+    successor.pop("cooldown_source", None)
+    box["_wallbox_phase_transition_reservation"] = successor
+    box.pop("_openwb_pro_phase_output_intent", None)
+    box.pop("_openwb_pro_phase_output_ack", None)
+    box.pop("_openwb_pro_phase_recovery_hold", None)
+    box["_openwb_pro_phase_sequence_stage"] = "await_budget"
+    box["_openwb_pro_phase_stranded_zero_recovery"] = {
+        "schema": "openwb_pro_phase_stranded_zero_recovery_v1",
+        "old_transition_id": old_id,
+        "successor_transition_id": current_id,
+        "intent_id": intent_id,
+        "target": target,
+        "intent_ts": intent_ts,
+        "readback_ts": readback_ts,
+        "recovered_ts": now_value,
+        "zero_readback_confirmed": True,
+        "successor_preserved": True,
+        "hardware_write": False,
+    }
+    if _save_wallbox_phase_state([box]):
+        return True
+    for key, (present, value) in previous.items():
+        if present:
+            box[key] = value
+        else:
+            box.pop(key, None)
+    return False
+
+
 def _resolve_phase_output_recovery(data, status, cfg):
     hold = data.get("_openwb_pro_phase_recovery_hold")
     intent = data.get("_openwb_pro_phase_output_intent")
     if not (isinstance(hold, dict) and hold.get("active") and isinstance(intent, dict)):
         return False
     if not _phase_output_recovery_generation_bound(data, hold, intent):
-        return False
+        return _resolve_stranded_phase_zero_recovery(
+            data,
+            status,
+            hold,
+            intent,
+            now_ts=time.time(),
+        )
     action = str(intent.get("action") or "")
     target = _valid_phase_count(intent.get("target"), 0)
     confirmed = False
@@ -7505,6 +7774,24 @@ def _resolve_phase_output_recovery(data, status, cfg):
         True,
         reason="recovered_from_fresh_unambiguous_readback",
     )
+
+
+def _resolve_phase_output_recovery_once_per_cycle(data, status, cfg):
+    """Schließt alte Ausgangsevidenz einmal vor jeder Wallbox-Policy."""
+
+    box = data if isinstance(data, dict) else {}
+    cycle_token = str(box.get("_wallbox_cycle_token") or "")
+    if (
+        cycle_token
+        and str(box.get("_phase_output_recovery_cycle_token") or "")
+        == cycle_token
+    ):
+        return bool(box.get("_phase_output_recovery_cycle_resolved", False))
+    resolved = bool(_resolve_phase_output_recovery(box, status, cfg))
+    if cycle_token:
+        box["_phase_output_recovery_cycle_token"] = cycle_token
+        box["_phase_output_recovery_cycle_resolved"] = resolved
+    return resolved
 
 
 def _abort_openwb_pro_phase_transition_before_output(
@@ -8052,6 +8339,24 @@ def _openwb_pro_phase_sequence_step(
     sequencer = PhaseSwitchSequencer(data)
     st = _openwb_pro_driver_status(data, active)
 
+    # Recovery besitzt die alte Ausgangsgeneration und muss deshalb vor
+    # Supersession und vor dem Storage-Grant-Veto ausgewertet werden. Auch ein
+    # erfolgreicher Readback-Abschluss erzeugt in diesem Zyklus keinen neuen
+    # Hardwareausgang.
+    recovery = data.get("_openwb_pro_phase_recovery_hold")
+    if isinstance(recovery, dict) and recovery.get("active"):
+        _resolve_phase_output_recovery_once_per_cycle(data, st, cfg)
+        return False
+    if (
+        str(data.get("_wallbox_cycle_token") or "")
+        and str(data.get("_phase_output_recovery_cycle_token") or "")
+        == str(data.get("_wallbox_cycle_token") or "")
+        and data.get("_phase_output_recovery_cycle_resolved") is True
+    ):
+        # Ein frischer Readback darf die alte Generation schließen, aber im
+        # selben Zyklus niemals schon einen neuen Phasenausgang nachschieben.
+        return False
+
     preoutput_supersession = (
         _supersede_openwb_pro_preoutput_phase_reservation(
             data,
@@ -8309,11 +8614,6 @@ def _openwb_pro_phase_sequence_step(
         )
     if not wallbox_phase_transition.grant_is_sufficient(existing_reservation):
         wallbox_phase_transition.set_stage(data, "await_budget", now_ts=now_ts)
-        return False
-
-    recovery = data.get("_openwb_pro_phase_recovery_hold")
-    if isinstance(recovery, dict) and recovery.get("active"):
-        _resolve_phase_output_recovery(data, st, cfg)
         return False
 
     contract = sequencer.propose(
@@ -11077,62 +11377,503 @@ def _consume_mode0_default_release_request(charger_id, max_age_s=86400.0):
         return None
     return request
 
-def _load_wallbox_user_mode_requests():
+def _wallbox_user_mode_request_path(request_file=None):
+    return str(request_file or WB_USER_MODE_REQUEST_FILE or "")
+
+
+def _mode5_user_start_surface_contract(request_file):
+    """Prüft die gruppengebundene persistente PHP->Manager-Fläche."""
+
+    target = _wallbox_user_mode_request_path(request_file)
+    directory = os.path.dirname(target)
     try:
-        if not os.path.exists(WB_USER_MODE_REQUEST_FILE):
+        parent = os.lstat(directory)
+        trusted_gid = int(WB_MODE5_REQUEST_GROUP_GID)
+        allowed_parent_uids = {
+            int(os.geteuid()),
+            int(WB_MODE5_REQUEST_OWNER_UID),
+        }
+        allowed_parent_uids.discard(-1)
+        runtime_group_allowed = bool(
+            os.geteuid() == 0 or os.getegid() == trusted_gid
+        )
+        if (
+            stat.S_ISLNK(parent.st_mode)
+            or not stat.S_ISDIR(parent.st_mode)
+            or stat.S_IMODE(parent.st_mode) != 0o2775
+            or trusted_gid < 0
+            or parent.st_uid not in allowed_parent_uids
+            or parent.st_gid != trusted_gid
+            or not runtime_group_allowed
+            or int(WB_MODE5_REQUEST_OWNER_UID) < 0
+        ):
+            return False
+        if not os.path.lexists(target):
+            return True
+        current = os.lstat(target)
+        return bool(
+            not stat.S_ISLNK(current.st_mode)
+            and stat.S_ISREG(current.st_mode)
+            and current.st_nlink == 1
+            and 1 <= current.st_size <= 65536
+            and stat.S_IMODE(current.st_mode) == 0o660
+            and int(WB_MODE5_REQUEST_OWNER_UID) >= 0
+            and current.st_uid == int(WB_MODE5_REQUEST_OWNER_UID)
+            and current.st_gid == parent.st_gid
+        )
+    except Exception:
+        return False
+
+
+def _acquire_wallbox_user_mode_request_lock(
+    timeout_s=0.25,
+    request_file=None,
+    *,
+    lock_mode=0o664,
+    required_gid=None,
+):
+    """Gemeinsame PHP/Python-Sperre für Peek, Persistenz und exaktes ACK."""
+
+    path = _wallbox_user_mode_request_path(request_file) + ".lock"
+    if not path:
+        return None
+    fd = None
+    try:
+        directory = os.path.dirname(path)
+        if not os.path.isdir(directory) or os.path.islink(directory):
+            return None
+        strict_shared_lock = required_gid is not None
+        allowed_owner_uids = {
+            0,
+            int(os.geteuid()),
+            int(WB_MODE5_REQUEST_OWNER_UID),
+        }
+        allowed_owner_uids.discard(-1)
+        before = None
+        if os.path.lexists(path):
+            before = os.lstat(path)
+            if (
+                stat.S_ISLNK(before.st_mode)
+                or not stat.S_ISREG(before.st_mode)
+                or before.st_nlink != 1
+                or (
+                    strict_shared_lock
+                    and (
+                        stat.S_IMODE(before.st_mode)
+                        != (int(lock_mode) & 0o777)
+                        or before.st_size > 65536
+                        or before.st_gid != int(required_gid)
+                        or before.st_uid not in allowed_owner_uids
+                    )
+                )
+            ):
+                return None
+        flags = os.O_RDWR
+        if strict_shared_lock:
+            if before is None:
+                flags |= os.O_CREAT | os.O_EXCL
+        else:
+            flags |= os.O_CREAT
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        expected_mode = int(lock_mode) & 0o777
+        fd = os.open(path, flags, expected_mode)
+        meta = os.fstat(fd)
+        if not stat.S_ISREG(meta.st_mode) or meta.st_nlink != 1:
+            os.close(fd)
+            return None
+        if before is not None:
+            if (meta.st_dev, meta.st_ino) != (before.st_dev, before.st_ino):
+                os.close(fd)
+                return None
+            if not strict_shared_lock:
+                os.fchmod(fd, expected_mode)
+        else:
+            if strict_shared_lock and (
+                meta.st_gid != int(required_gid)
+                or meta.st_uid not in allowed_owner_uids
+            ):
+                os.close(fd)
+                return None
+            os.fchmod(fd, expected_mode)
+        meta = os.fstat(fd)
+        if (
+            stat.S_IMODE(meta.st_mode) != expected_mode
+            or (strict_shared_lock and meta.st_size > 65536)
+            or (required_gid is not None and meta.st_gid != int(required_gid))
+            or (
+                strict_shared_lock
+                and meta.st_uid not in allowed_owner_uids
+            )
+        ):
+            os.close(fd)
+            return None
+        if strict_shared_lock:
+            named = os.lstat(path)
+            if (
+                stat.S_ISLNK(named.st_mode)
+                or not stat.S_ISREG(named.st_mode)
+                or named.st_nlink != 1
+                or (named.st_dev, named.st_ino) != (meta.st_dev, meta.st_ino)
+                or named.st_size != meta.st_size
+                or named.st_size > 65536
+                or stat.S_IMODE(named.st_mode) != expected_mode
+                or named.st_gid != int(required_gid)
+                or named.st_uid not in allowed_owner_uids
+            ):
+                os.close(fd)
+                return None
+        if fcntl is None:
+            return fd
+        deadline = time.monotonic() + max(
+            0.05,
+            min(5.0, float(timeout_s or 0.0)),
+        )
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                if strict_shared_lock:
+                    locked_meta = os.fstat(fd)
+                    locked_named = os.lstat(path)
+                    if (
+                        stat.S_ISLNK(locked_named.st_mode)
+                        or not stat.S_ISREG(locked_meta.st_mode)
+                        or not stat.S_ISREG(locked_named.st_mode)
+                        or locked_meta.st_nlink != 1
+                        or locked_named.st_nlink != 1
+                        or (locked_meta.st_dev, locked_meta.st_ino)
+                        != (locked_named.st_dev, locked_named.st_ino)
+                        or locked_meta.st_size != locked_named.st_size
+                        or locked_meta.st_size > 65536
+                        or stat.S_IMODE(locked_meta.st_mode) != expected_mode
+                        or stat.S_IMODE(locked_named.st_mode) != expected_mode
+                        or locked_meta.st_gid != int(required_gid)
+                        or locked_named.st_gid != int(required_gid)
+                        or locked_meta.st_uid not in allowed_owner_uids
+                        or locked_named.st_uid not in allowed_owner_uids
+                    ):
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                        os.close(fd)
+                        return None
+                return fd
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    os.close(fd)
+                    return None
+                time.sleep(0.01)
+    except Exception:
+        try:
+            if fd is not None:
+                os.close(fd)
+        except Exception:
+            pass
+        return None
+
+
+def _release_wallbox_user_mode_request_lock(fd):
+    if fd is None:
+        return
+    if fcntl is not None:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except Exception:
+            pass
+    try:
+        os.close(fd)
+    except Exception:
+        pass
+
+
+def _load_wallbox_user_mode_requests_unlocked(request_file=None):
+    request_path = _wallbox_user_mode_request_path(request_file)
+    try:
+        if not os.path.lexists(request_path):
             return {}
-        with open(WB_USER_MODE_REQUEST_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        meta = os.lstat(request_path)
+        if (
+            stat.S_ISLNK(meta.st_mode)
+            or not stat.S_ISREG(meta.st_mode)
+            or meta.st_nlink != 1
+            or meta.st_size > 65536
+        ):
+            return {}
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(request_path, flags)
+        try:
+            current = os.fstat(fd)
+            if (
+                not stat.S_ISREG(current.st_mode)
+                or current.st_nlink != 1
+                or current.st_ino != meta.st_ino
+                or current.st_size != meta.st_size
+            ):
+                return {}
+            payload = b""
+            while len(payload) < current.st_size:
+                chunk = os.read(fd, min(65536, current.st_size - len(payload)))
+                if not chunk:
+                    break
+                payload += chunk
+        finally:
+            os.close(fd)
+        if len(payload) != meta.st_size:
+            return {}
+        data = json.loads(payload.decode("utf-8"))
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
 
-def _save_wallbox_user_mode_requests(data):
-    try:
-        tmp = WB_USER_MODE_REQUEST_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data if isinstance(data, dict) else {}, f)
-        os.replace(tmp, WB_USER_MODE_REQUEST_FILE)
-    except Exception:
-        pass
 
-def _consume_wallbox_user_mode_request(charger_id, target_mode=None, max_age_s=86400.0):
-    """Consumes an explicit Wallbox.php mode-switch request for one charger."""
-    data = _load_wallbox_user_mode_requests()
-    key = str(int(charger_id or 1))
-    now_ts = time.time()
-    changed = False
-    for stale_key, stale_request in list(data.items()):
+def _save_wallbox_user_mode_requests_unlocked(data, request_file=None):
+    request_path = _wallbox_user_mode_request_path(request_file)
+    tmp = ""
+    try:
+        directory = os.path.dirname(request_path)
+        if not os.path.isdir(directory) or os.path.islink(directory):
+            return False
+        if os.path.lexists(request_path):
+            meta = os.lstat(request_path)
+            if stat.S_ISLNK(meta.st_mode) or not stat.S_ISREG(meta.st_mode):
+                return False
+        tmp = "%s.tmp.%d.%d" % (
+            request_path,
+            os.getpid(),
+            time.time_ns(),
+        )
+        payload = json.dumps(
+            data if isinstance(data, dict) else {},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ) + "\n"
+        with open(tmp, "x", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, 0o664)
+        os.replace(tmp, request_path)
+        directory_fd = os.open(directory, os.O_RDONLY)
         try:
-            if now_ts - float((stale_request or {}).get("ts", 0.0) or 0.0) > max_age_s:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        return True
+    except Exception:
+        try:
+            if tmp and os.path.exists(tmp):
+                os.unlink(tmp)
+        except Exception:
+            pass
+        return False
+
+
+def _delete_wallbox_user_mode_request_unlocked(request_file=None):
+    """Löscht die exakt gelockte Request-Datei und persistiert den Dir-Eintrag."""
+
+    request_path = _wallbox_user_mode_request_path(request_file)
+    try:
+        current = os.lstat(request_path)
+        if (
+            stat.S_ISLNK(current.st_mode)
+            or not stat.S_ISREG(current.st_mode)
+            or current.st_nlink != 1
+        ):
+            return False
+        os.unlink(request_path)
+        directory_fd = os.open(os.path.dirname(request_path), os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        return True
+    except Exception:
+        return False
+
+
+def _load_wallbox_user_mode_requests():
+    lock_fd = _acquire_wallbox_user_mode_request_lock()
+    if lock_fd is None:
+        return {}
+    try:
+        return _load_wallbox_user_mode_requests_unlocked()
+    finally:
+        _release_wallbox_user_mode_request_lock(lock_fd)
+
+
+def _save_wallbox_user_mode_requests(data):
+    lock_fd = _acquire_wallbox_user_mode_request_lock()
+    if lock_fd is None:
+        return False
+    try:
+        return _save_wallbox_user_mode_requests_unlocked(data)
+    finally:
+        _release_wallbox_user_mode_request_lock(lock_fd)
+
+
+def _prune_wallbox_user_mode_requests(data, *, now_ts, max_age_s):
+    changed = False
+    for stale_key, stale_request in list((data or {}).items()):
+        try:
+            request_ts = float((stale_request or {}).get("ts", 0.0) or 0.0)
+            if (
+                not math.isfinite(request_ts)
+                or request_ts <= 0.0
+                or request_ts > float(now_ts) + 5.0
+                or float(now_ts) - request_ts > float(max_age_s)
+            ):
                 data.pop(stale_key, None)
                 changed = True
         except Exception:
             data.pop(stale_key, None)
             changed = True
-    request = data.get(key)
-    if isinstance(request, dict):
-        try:
-            if now_ts - float(request.get("ts", 0.0) or 0.0) > max_age_s:
-                data.pop(key, None)
-                changed = True
+    return changed
+
+
+def _peek_wallbox_user_mode_request(
+    charger_id,
+    target_mode=None,
+    max_age_s=86400.0,
+    request_file=None,
+    strict_mode5_surface=False,
+    now_ts=None,
+):
+    """Liest eine Request-Generation, ohne sie vor dem Zustandscommit zu löschen."""
+
+    if strict_mode5_surface and not _mode5_user_start_surface_contract(
+        request_file
+    ):
+        return None
+    required_gid = (
+        int(WB_MODE5_REQUEST_GROUP_GID)
+        if strict_mode5_surface
+        else None
+    )
+    lock_fd = _acquire_wallbox_user_mode_request_lock(
+        request_file=request_file,
+        lock_mode=0o660 if strict_mode5_surface else 0o664,
+        required_gid=required_gid,
+    )
+    if lock_fd is None:
+        return None
+    try:
+        if strict_mode5_surface and not _mode5_user_start_surface_contract(
+            request_file
+        ):
+            return None
+        data = _load_wallbox_user_mode_requests_unlocked(request_file)
+        now_value = _cfg_float(now_ts, 0.0)
+        if not math.isfinite(now_value) or now_value <= 0.0:
+            now_value = time.time()
+        changed = _prune_wallbox_user_mode_requests(
+            data,
+            now_ts=now_value,
+            max_age_s=max_age_s,
+        )
+        request = data.get(str(int(charger_id or 1)))
+        if isinstance(request, dict) and target_mode is not None:
+            try:
+                if normalize_wb_mode(request.get("target_mode")) != normalize_wb_mode(target_mode):
+                    request = None
+            except Exception:
                 request = None
-        except Exception:
+        if changed:
+            if strict_mode5_surface:
+                if data or not _delete_wallbox_user_mode_request_unlocked(
+                    request_file
+                ):
+                    return None
+            elif not _save_wallbox_user_mode_requests_unlocked(
+                data,
+                request_file,
+            ):
+                return None
+        return deepcopy(request) if isinstance(request, dict) else None
+    finally:
+        _release_wallbox_user_mode_request_lock(lock_fd)
+
+
+def _ack_wallbox_user_mode_request(
+    charger_id,
+    request_id,
+    request_file=None,
+    *,
+    strict_mode5_surface=False,
+    delete_exact_file=False,
+):
+    """Entfernt ausschließlich die zuvor persistierte Request-Generation."""
+
+    expected_id = str(request_id or "")
+    if not expected_id:
+        return False
+    if strict_mode5_surface and not _mode5_user_start_surface_contract(
+        request_file
+    ):
+        return False
+    lock_fd = _acquire_wallbox_user_mode_request_lock(
+        request_file=request_file,
+        lock_mode=0o660 if strict_mode5_surface else 0o664,
+        required_gid=(
+            int(WB_MODE5_REQUEST_GROUP_GID)
+            if strict_mode5_surface
+            else None
+        ),
+    )
+    if lock_fd is None:
+        return False
+    try:
+        if strict_mode5_surface and not _mode5_user_start_surface_contract(
+            request_file
+        ):
+            return False
+        data = _load_wallbox_user_mode_requests_unlocked(request_file)
+        key = str(int(charger_id or 1))
+        current = data.get(key)
+        if not (
+            isinstance(current, dict)
+            and str(current.get("request_id") or "") == expected_id
+        ):
+            return False
+        if delete_exact_file:
+            if set(data) != {key}:
+                return False
+            return _delete_wallbox_user_mode_request_unlocked(request_file)
+        data.pop(key, None)
+        return _save_wallbox_user_mode_requests_unlocked(data, request_file)
+    finally:
+        _release_wallbox_user_mode_request_lock(lock_fd)
+
+
+def _consume_wallbox_user_mode_request(charger_id, target_mode=None, max_age_s=60.0):
+    """Verbraucht den bestehenden Mode-2-Auftrag atomar unter derselben Sperre."""
+
+    lock_fd = _acquire_wallbox_user_mode_request_lock()
+    if lock_fd is None:
+        return None
+    try:
+        data = _load_wallbox_user_mode_requests_unlocked()
+        key = str(int(charger_id or 1))
+        now_ts = time.time()
+        changed = _prune_wallbox_user_mode_requests(
+            data,
+            now_ts=now_ts,
+            max_age_s=max_age_s,
+        )
+        request = data.get(key)
+        if isinstance(request, dict) and target_mode is not None:
+            try:
+                if normalize_wb_mode(request.get("target_mode")) != normalize_wb_mode(target_mode):
+                    request = None
+            except Exception:
+                request = None
+        if isinstance(request, dict):
             data.pop(key, None)
             changed = True
-            request = None
-    if isinstance(request, dict) and target_mode is not None:
-        try:
-            if normalize_wb_mode(request.get("target_mode")) != normalize_wb_mode(target_mode):
-                request = None
-        except Exception:
-            request = None
-    if isinstance(request, dict):
-        data.pop(key, None)
-        changed = True
-    if changed:
-        _save_wallbox_user_mode_requests(data)
-    return request if isinstance(request, dict) else None
+        if changed and not _save_wallbox_user_mode_requests_unlocked(data):
+            return None
+        return request if isinstance(request, dict) else None
+    finally:
+        _release_wallbox_user_mode_request_lock(lock_fd)
 
 def _wallbox_curve_switch_quiet_until(request, *, now_ts=None, hold_s=60.0):
     """Return the quiet-until timestamp after an explicit switch to PV curve."""
@@ -11179,6 +11920,52 @@ def _apply_pv_curve_mode_switch_quiet_request(
             quiet_until,
         )
     return request
+
+
+def _apply_openwb_primary_curve_user_request(c_data, charger, charger_id):
+    """Projiziert nur einen frischen expliziten Mode-2-Intent zum Driver-Gate."""
+
+    data = c_data if isinstance(c_data, dict) else {}
+    result = {
+        "contract": "openwb_primary_curve_user_request_v1",
+        "request_present": False,
+        "applied": False,
+        "hardware_write": False,
+        "ok": False,
+        "blocker": "request_missing_or_stale",
+    }
+    request = _consume_wallbox_user_mode_request(
+        charger_id,
+        MODE_CURVE,
+        max_age_s=60.0,
+    )
+    if not isinstance(request, dict):
+        return result
+    result["request_present"] = True
+    if charger is None or not hasattr(charger, "set_pv_mode"):
+        result["blocker"] = "set_pv_mode_not_supported"
+        return result
+    with command_gate.default_release_scope(
+        charger,
+        reason="mode2_user_switch_pv",
+    ):
+        ok = bool(_execute_wallbox_driver_command(
+            data,
+            {
+                "method": "set_pv_mode",
+                "reason": "mode2_user_switch_pv",
+            },
+            c_id=charger_id,
+        ))
+    data["_pv_mode_active"] = ok
+    data["_openwb_primary_pv_mode_set_ts"] = time.time()
+    result.update({
+        "applied": True,
+        "hardware_write": True,
+        "ok": ok,
+        "blocker": "",
+    })
+    return result
 
 def _reset_mode0_default_release(c_data):
     if isinstance(c_data, dict):
@@ -12074,6 +12861,8 @@ _OPENWB_PRO_START_SESSION_KEYS = (
     "_openwb_start_reject_anchor_ts",
     "_openwb_start_reject_soft_until",
     "_phase_up_budget_since",
+    "_mode5_user_start_request_receipt",
+    "_openwb_pro_session_persistence_recovery_hold",
     "last_start_ts",
 )
 
@@ -12104,7 +12893,11 @@ _WALLBOX_START_REJECT_EPISODE_KEYS = (
 )
 
 
-def _reset_wallbox_start_reject_episode(c_data):
+def _reset_wallbox_start_reject_episode(
+    c_data,
+    *,
+    preserve_latched_start_rejected=False,
+):
     """Verwirf nur die Startversuchs-Evidenz beim Übergang auf Aus/autonom.
 
     Eine spätere Startablehnung darf nicht auf einem Strom-/Wake-up-Beleg aus
@@ -12115,6 +12908,29 @@ def _reset_wallbox_start_reject_episode(c_data):
 
     if not isinstance(c_data, dict):
         return False
+    if preserve_latched_start_rejected:
+        plug_session_id = str(
+            c_data.get("_openwb_pro_plug_session_id") or ""
+        )
+        latch_owns_episode = bool(
+            openwb_pro_session.is_openwb_pro_charger(c_data.get("charger"))
+            and c_data.get("_bev_full_blocked") is True
+            and str(c_data.get("_bev_full_block_reason") or "")
+            == "start_rejected"
+            and plug_session_id
+            and str(
+                c_data.get("_charge_end_latched_plug_session_id") or ""
+            )
+            == plug_session_id
+        )
+        if latch_owns_episode:
+            # Die typisierte 3/3-Evidenz ist Teil der Freigabeautorität des
+            # persistenten Same-Session-Latches. Aus/autonom und passive
+            # Modi dürfen sie nicht vor einem späteren expliziten Mode-5-
+            # Nutzerauftrag vernichten. Der erfolgreiche Mode-5-CAS nutzt
+            # den Default ``False`` und löscht sie erst zusammen mit dem
+            # Latch in der dual persistierten Transaktion.
+            return False
     changed = any(key in c_data for key in _WALLBOX_START_REJECT_EPISODE_KEYS)
     for key in _WALLBOX_START_REJECT_EPISODE_KEYS:
         c_data.pop(key, None)
@@ -12350,6 +13166,827 @@ def _openwb_pro_start_reject_episode_contract(
         "legacy_cp_sent": bool(data.get("_openwb_cp_start_sent", False)),
         "legacy_current_retry_count": legacy_current_retry_count,
     }
+
+
+def _sha256_regular_file(path, max_bytes=4 * 1024 * 1024):
+    """Hash eines eindeutigen regulären Files; Symlinks und Wechsel fail-closed."""
+
+    target = str(path or "")
+    if not target:
+        return ""
+    fd = None
+    try:
+        before = os.lstat(target)
+        if (
+            stat.S_ISLNK(before.st_mode)
+            or not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_size < 2
+            or before.st_size > int(max_bytes)
+        ):
+            return ""
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(target, flags)
+        current = os.fstat(fd)
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or current.st_nlink != 1
+            or current.st_ino != before.st_ino
+            or current.st_size != before.st_size
+        ):
+            return ""
+        digest = hashlib.sha256()
+        remaining = current.st_size
+        while remaining > 0:
+            chunk = os.read(fd, min(65536, remaining))
+            if not chunk:
+                return ""
+            digest.update(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(fd)
+        if (
+            after.st_ino != current.st_ino
+            or after.st_size != current.st_size
+            or after.st_mtime_ns != current.st_mtime_ns
+        ):
+            return ""
+        return digest.hexdigest()
+    except Exception:
+        return ""
+    finally:
+        try:
+            if fd is not None:
+                os.close(fd)
+        except Exception:
+            pass
+
+
+def _mode5_user_start_request_base_contract(
+    c_data,
+    status,
+    config,
+    request,
+    *,
+    charger_id,
+    public_mode,
+    now_ts=None,
+):
+    """Bindet den Webauftrag an Config, Preis, Pro-Treiber und Live-Session."""
+
+    data = c_data if isinstance(c_data, dict) else {}
+    st = status if isinstance(status, dict) else {}
+    cfg = config if isinstance(config, dict) else {}
+    item = request if isinstance(request, dict) else {}
+    now_value = _cfg_float(now_ts, 0.0)
+    if not math.isfinite(now_value) or now_value <= 0.0:
+        now_value = time.time()
+    result = {
+        "contract": "wallbox_mode5_user_start_validation_v1",
+        "valid": False,
+        "blocker": "request_invalid",
+        "hardware_write": False,
+        "price_override": False,
+        "request_id": str(item.get("request_id") or ""),
+    }
+    request_id = str(item.get("request_id") or "").lower()
+    candidate_sha = str(item.get("candidate_config_sha256") or "").lower()
+    expected_session_id = str(item.get("expected_plug_session_id") or "")
+    expected_boot_id = str(item.get("expected_boot_id") or "")
+    expected_latch = item.get("expected_latch_generation")
+    expected_latch = expected_latch if isinstance(expected_latch, dict) else {}
+    expected_latch_state = str(expected_latch.get("state") or "")
+    expected_latch_shape_valid = bool(
+        expected_latch.get("schema")
+        == "wallbox_mode5_latch_generation_v1"
+        and expected_latch_state in {"absent", "present"}
+    )
+    if expected_latch_shape_valid and expected_latch_state == "absent":
+        expected_latch_shape_valid = bool(
+            set(expected_latch) == {"schema", "state", "wb"}
+        )
+    elif expected_latch_shape_valid:
+        try:
+            expected_latched_ts = float(expected_latch.get("latched_ts"))
+        except (TypeError, ValueError, OverflowError):
+            expected_latched_ts = 0.0
+        expected_latch_shape_valid = bool(
+            str(expected_latch.get("reason") or "")
+            and len(str(expected_latch.get("reason") or "")) <= 128
+            and str(expected_latch.get("plug_session_id") or "")
+            and len(str(expected_latch.get("plug_session_id") or "")) <= 256
+            and str(expected_latch.get("release_token") or "")
+            and len(str(expected_latch.get("release_token") or "")) <= 4096
+            and math.isfinite(expected_latched_ts)
+            and expected_latched_ts > 0.0
+        )
+    if (
+        item.get("schema") != "wallbox_mode5_user_start_request_v1"
+        or item.get("source") != "Wallbox.php"
+        or item.get("reason") != "mode5_user_start"
+        or item.get("charge_intent") != "instant"
+        or item.get("energy_mode") != "grid_price"
+        or len(request_id) != 32
+        or any(char not in "0123456789abcdef" for char in request_id)
+        or len(candidate_sha) != 64
+        or any(char not in "0123456789abcdef" for char in candidate_sha)
+        or not expected_session_id
+        or len(expected_session_id) > 256
+        or not expected_boot_id
+        or len(expected_boot_id) > 128
+        or not expected_latch_shape_valid
+    ):
+        return result
+    try:
+        request_wb = int(item.get("wb", 0) or 0)
+        request_ts = float(item.get("ts", 0.0) or 0.0)
+        requested_price = float(item.get("price_limit_ct"))
+    except (TypeError, ValueError, OverflowError):
+        return result
+    if (
+        request_wb != int(charger_id or 0)
+        or int(expected_latch.get("wb", 0) or 0) != int(charger_id or 0)
+        or normalize_wb_mode(item.get("target_mode")) != MODE_PRICE
+        or normalize_wb_mode(public_mode) != MODE_PRICE
+    ):
+        result["blocker"] = "charger_or_mode_mismatch"
+        return result
+    if (
+        not math.isfinite(request_ts)
+        or request_ts <= 0.0
+        or request_ts > now_value + 5.0
+        or now_value - request_ts > 86400.0
+    ):
+        result["blocker"] = "request_timestamp_invalid"
+        return result
+    if (
+        not math.isfinite(requested_price)
+        or requested_price < 0.0
+        or requested_price > 200.0
+    ):
+        result["blocker"] = "price_limit_invalid"
+        return result
+    current_sha = _sha256_regular_file(V4_CONFIG_FILE)
+    if not current_sha or current_sha != candidate_sha:
+        result["blocker"] = "candidate_config_generation_mismatch"
+        return result
+    try:
+        configured_price = float(cfg.get("dvcarlimit"))
+    except (TypeError, ValueError, OverflowError):
+        result["blocker"] = "configured_price_limit_missing"
+        return result
+    effective_price = price_limit_ct(cfg)
+    price_bound = bool(
+        math.isfinite(configured_price)
+        and abs(configured_price - requested_price) <= 0.000001
+        and (
+            abs(effective_price - requested_price) <= 0.000001
+            if requested_price > 0.0
+            else effective_price <= 0.0
+        )
+    )
+    if not price_bound:
+        result["blocker"] = "configured_price_limit_mismatch"
+        return result
+    if not openwb_pro_session.is_openwb_pro_charger(data.get("charger")):
+        result["blocker"] = "openwb_pro_driver_required"
+        return result
+    plug_session_id = str(data.get("_openwb_pro_plug_session_id") or "")
+    if expected_boot_id != str(_wallbox_phase_boot_id() or ""):
+        result["blocker"] = "request_boot_generation_mismatch"
+        return result
+    if expected_session_id != plug_session_id:
+        result["blocker"] = "request_plug_session_mismatch"
+        return result
+    fresh_connected = bool(
+        plug_session_id
+        and st.get("driver_status_valid") is True
+        and st.get("driver_status_stale") is False
+        and st.get("driver_status_degraded") is False
+        and st.get("driver_status_glitch") is False
+        and _wb_status_connected(st)
+    )
+    if not fresh_connected:
+        result["blocker"] = "current_connected_plug_session_not_proven"
+        return result
+    result.update({
+        "valid": True,
+        "blocker": "",
+        "request_id": request_id,
+        "request_ts": request_ts,
+        "plug_session_id": plug_session_id,
+        "expected_boot_id": expected_boot_id,
+        "expected_latch_generation": deepcopy(expected_latch),
+        "candidate_config_sha256": candidate_sha,
+        "price_limit_ct": requested_price,
+    })
+    return result
+
+
+def _mode5_user_start_current_latch_generation(c_data, charger_id):
+    data = c_data if isinstance(c_data, dict) else {}
+    base = {
+        "schema": "wallbox_mode5_latch_generation_v1",
+        "state": "absent",
+        "wb": int(charger_id or 0),
+    }
+    if data.get("_bev_full_blocked") is not True:
+        return base
+    return {
+        "schema": "wallbox_mode5_latch_generation_v1",
+        "state": "present",
+        "wb": int(charger_id or 0),
+        "reason": str(data.get("_bev_full_block_reason") or ""),
+        "plug_session_id": str(
+            data.get("_charge_end_latched_plug_session_id") or ""
+        ),
+        "latched_ts": _cfg_float(data.get("_charge_end_latched_ts"), 0.0),
+        "release_token": str(data.get("_charge_end_release_token") or ""),
+    }
+
+
+def _mode5_user_start_latch_generation_matches(c_data, validation):
+    proof = validation if isinstance(validation, dict) else {}
+    expected = proof.get("expected_latch_generation")
+    expected = expected if isinstance(expected, dict) else {}
+    return bool(
+        expected
+        and expected
+        == _mode5_user_start_current_latch_generation(
+            c_data,
+            int(expected.get("wb", 0) or 0),
+        )
+    )
+
+
+def _mode5_user_start_exact_latch(c_data, validation):
+    data = c_data if isinstance(c_data, dict) else {}
+    proof = validation if isinstance(validation, dict) else {}
+    session_id = str(proof.get("plug_session_id") or "")
+    return bool(
+        data.get("_bev_full_blocked") is True
+        and str(data.get("_bev_full_block_reason") or "") == "start_rejected"
+        and session_id
+        and str(data.get("_charge_end_latched_plug_session_id") or "")
+        == session_id
+        and _cfg_float(data.get("_charge_end_latched_ts"), 0.0) > 0.0
+    )
+
+
+def _mode5_user_start_anchor_contract(c_data, plug_session_id):
+    """Klassifiziert einen vorhandenen Nullanker, ohne fremde Anker zu lösen."""
+
+    data = c_data if isinstance(c_data, dict) else {}
+    active = data.get("_manager_zero_anchor_active") is True
+    anchor = data.get("_manager_zero_anchor_contract")
+    anchor = anchor if isinstance(anchor, dict) else {}
+    exact = bool(
+        active
+        and anchor.get("contract") == "wallbox_manager_zero_anchor_v1"
+        and anchor.get("owner") == "wallbox_manager"
+        and anchor.get("class") == "hard_stop"
+        and anchor.get("reason_code") == "start_rejected"
+        and str(anchor.get("plug_session_id") or "") == str(plug_session_id or "")
+    )
+    return {
+        "active": active,
+        "exact": exact,
+        "blocker": "" if not active or exact else "foreign_or_protected_zero_anchor",
+    }
+
+
+def _clear_exact_mode5_start_rejected_anchor(c_data, plug_session_id):
+    anchor = _mode5_user_start_anchor_contract(c_data, plug_session_id)
+    if anchor.get("active") and not anchor.get("exact"):
+        return False
+    if anchor.get("exact"):
+        c_data["_manager_zero_anchor_active"] = False
+        c_data.pop("_manager_zero_anchor_contract", None)
+        c_data.pop("_last_manager_zero_anchor_reason", None)
+        c_data.pop("_last_manager_zero_anchor_ts", None)
+    return True
+
+
+def _mode5_user_start_receipt_matches(receipt, validation):
+    item = receipt if isinstance(receipt, dict) else {}
+    proof = validation if isinstance(validation, dict) else {}
+    return bool(
+        item.get("schema") == "wallbox_mode5_user_start_receipt_v1"
+        and str(item.get("request_id") or "")
+        == str(proof.get("request_id") or "")
+        and str(item.get("plug_session_id") or "")
+        == str(proof.get("plug_session_id") or "")
+        and str(item.get("candidate_config_sha256") or "")
+        == str(proof.get("candidate_config_sha256") or "")
+        and str(item.get("expected_boot_id") or "")
+        == str(proof.get("expected_boot_id") or "")
+        and abs(
+            _cfg_float(item.get("price_limit_ct"), -1.0)
+            - _cfg_float(proof.get("price_limit_ct"), -2.0)
+        ) <= 0.000001
+        and item.get("hardware_write") is False
+        and item.get("price_override") is False
+    )
+
+
+def _finalize_mode5_user_start_receipt(c_data, validation, *, now_ts):
+    receipt = c_data.get("_mode5_user_start_request_receipt")
+    if not _mode5_user_start_receipt_matches(receipt, validation):
+        return False
+    receipt["state"] = "committed"
+    receipt["committed_ts"] = float(now_ts)
+    c_data["_mode5_user_start_request_receipt"] = receipt
+    return bool(_save_wallbox_phase_state([c_data]))
+
+
+def _ack_and_seal_mode5_user_start_request(c_data, validation, *, now_ts):
+    """Exaktes ACK; danach wird das persistente Receipt als abgeschlossen markiert."""
+
+    data = c_data if isinstance(c_data, dict) else {}
+    proof = validation if isinstance(validation, dict) else {}
+    request_id = str(proof.get("request_id") or "")
+    if not _ack_wallbox_user_mode_request(
+        data.get("id"),
+        request_id,
+        request_file=WB_MODE5_USER_START_REQUEST_FILE,
+        strict_mode5_surface=True,
+        delete_exact_file=True,
+    ):
+        return {"acknowledged": False, "sealed": False}
+    receipt = data.get("_mode5_user_start_request_receipt")
+    if not _mode5_user_start_receipt_matches(receipt, proof):
+        return {"acknowledged": True, "sealed": True}
+    previous = deepcopy(receipt)
+    receipt["state"] = "acked"
+    receipt["acked_ts"] = float(now_ts)
+    data["_mode5_user_start_request_receipt"] = receipt
+    if _save_wallbox_phase_state([data]):
+        return {"acknowledged": True, "sealed": True}
+    data["_mode5_user_start_request_receipt"] = previous
+    return {"acknowledged": True, "sealed": False}
+
+
+def _clear_exact_mode5_replay_recovery_hold(c_data, validation):
+    data = c_data if isinstance(c_data, dict) else {}
+    proof = validation if isinstance(validation, dict) else {}
+    hold = data.get("_openwb_pro_session_persistence_recovery_hold")
+    if not isinstance(hold, dict) or hold.get("active") is not True:
+        return True
+    if (
+        str(hold.get("reason") or "")
+        != "mode5_user_start_unfinished_replay"
+        or str(hold.get("request_id") or "")
+        != str(proof.get("request_id") or "")
+    ):
+        return False
+    data.pop("_openwb_pro_session_persistence_recovery_hold", None)
+    return True
+
+
+_MODE5_USER_START_TERMINAL_INVALIDATION_BLOCKERS = frozenset({
+    "charger_or_mode_mismatch",
+    "request_timestamp_invalid",
+    "price_limit_invalid",
+    "candidate_config_generation_mismatch",
+    "configured_price_limit_missing",
+    "configured_price_limit_mismatch",
+    "openwb_pro_driver_required",
+    "request_boot_generation_mismatch",
+    "request_plug_session_mismatch",
+})
+
+
+def _terminalize_invalid_mode5_user_start_request(
+    c_data,
+    request,
+    validation,
+    *,
+    now_ts,
+):
+    """Verwirft nur eine exakt gebundene, dauerhaft überholte Generation."""
+
+    data = c_data if isinstance(c_data, dict) else {}
+    item = request if isinstance(request, dict) else {}
+    checked = validation if isinstance(validation, dict) else {}
+    blocker = str(checked.get("blocker") or "")
+    result = {
+        "terminal": False,
+        "persisted": False,
+        "acknowledged": False,
+        "hardware_write": False,
+        "price_override": False,
+        "reason": blocker,
+    }
+    if blocker not in _MODE5_USER_START_TERMINAL_INVALIDATION_BLOCKERS:
+        return result
+    request_id = str(item.get("request_id") or "").lower()
+    candidate_sha = str(item.get("candidate_config_sha256") or "").lower()
+    plug_session_id = str(item.get("expected_plug_session_id") or "")
+    expected_boot_id = str(item.get("expected_boot_id") or "")
+    try:
+        price_limit = float(item.get("price_limit_ct"))
+    except (TypeError, ValueError, OverflowError):
+        return result
+    if (
+        len(request_id) != 32
+        or any(char not in "0123456789abcdef" for char in request_id)
+        or len(candidate_sha) != 64
+        or any(char not in "0123456789abcdef" for char in candidate_sha)
+        or not plug_session_id
+        or not expected_boot_id
+        or not math.isfinite(price_limit)
+    ):
+        return result
+    proof = {
+        "request_id": request_id,
+        "plug_session_id": plug_session_id,
+        "candidate_config_sha256": candidate_sha,
+        "expected_boot_id": expected_boot_id,
+        "price_limit_ct": price_limit,
+    }
+    receipt = data.get("_mode5_user_start_request_receipt")
+    receipt = receipt if isinstance(receipt, dict) else {}
+    receipt_state = str(receipt.get("state") or "")
+    if receipt:
+        if not _mode5_user_start_receipt_matches(receipt, proof):
+            result["reason"] = "terminal_request_receipt_mismatch"
+            return result
+        if receipt_state == "prepared":
+            hold = data.get("_openwb_pro_session_persistence_recovery_hold")
+            if isinstance(hold, dict) and hold.get("active") is True and not (
+                str(hold.get("reason") or "")
+                == "mode5_user_start_unfinished_replay"
+                and str(hold.get("request_id") or "") == request_id
+            ):
+                result["reason"] = "foreign_session_persistence_recovery_hold"
+                return result
+
+            def cancel_prepared_generation():
+                data.pop("_mode5_user_start_request_receipt", None)
+                if isinstance(hold, dict) and hold.get("active") is True:
+                    data.pop(
+                        "_openwb_pro_session_persistence_recovery_hold",
+                        None,
+                    )
+                return {
+                    "terminal_request_id": request_id,
+                    "terminal_reason": blocker,
+                    "hardware_write": False,
+                    "price_override": False,
+                }
+
+            persistence = _persist_openwb_pro_session_transaction(
+                data,
+                cancel_prepared_generation,
+                name="mode5_user_start_terminal_cancel",
+            )
+            result["persistence"] = persistence
+            if persistence.get("committed") is not True:
+                result["reason"] = str(
+                    persistence.get("reason")
+                    or "terminal_request_persist_failed"
+                )
+                return result
+            result["persisted"] = True
+        elif receipt_state not in {"committed", "acked"}:
+            result["reason"] = "terminal_request_receipt_state_invalid"
+            return result
+    elif isinstance(
+        data.get("_openwb_pro_session_persistence_recovery_hold"),
+        dict,
+    ) and data["_openwb_pro_session_persistence_recovery_hold"].get(
+        "active"
+    ) is True:
+        result["reason"] = "session_persistence_recovery_hold_active"
+        return result
+
+    acknowledged = _ack_wallbox_user_mode_request(
+        data.get("id"),
+        request_id,
+        request_file=WB_MODE5_USER_START_REQUEST_FILE,
+        strict_mode5_surface=True,
+        delete_exact_file=True,
+    )
+    result["acknowledged"] = bool(acknowledged)
+    result["terminal"] = bool(acknowledged)
+    if not acknowledged:
+        result["reason"] = "terminal_request_ack_failed_or_superseded"
+    return result
+
+
+def _apply_mode5_user_start_request(
+    c_data,
+    status,
+    config,
+    *,
+    charger_id,
+    public_mode,
+    now_ts=None,
+):
+    """Reset nur der exakten alten 3/3-Startablehnung; niemals Geräte-I/O."""
+
+    data = c_data if isinstance(c_data, dict) else {}
+    now_value = _cfg_float(now_ts, 0.0)
+    if not math.isfinite(now_value) or now_value <= 0.0:
+        now_value = time.time()
+    result = {
+        "contract": "wallbox_mode5_user_start_apply_v1",
+        "request_present": False,
+        "applied": False,
+        "persisted": False,
+        "acknowledged": False,
+        "replayed": False,
+        "hardware_write": False,
+        "price_override": False,
+        "blocker": "request_missing",
+    }
+    request = _peek_wallbox_user_mode_request(
+        charger_id,
+        MODE_PRICE,
+        request_file=WB_MODE5_USER_START_REQUEST_FILE,
+        strict_mode5_surface=True,
+        now_ts=now_value,
+    )
+    if not isinstance(request, dict):
+        return result
+    result["request_present"] = True
+    validation = _mode5_user_start_request_base_contract(
+        data,
+        status,
+        config,
+        request,
+        charger_id=charger_id,
+        public_mode=public_mode,
+        now_ts=now_value,
+    )
+    result["validation"] = validation
+    result["request_id"] = str(validation.get("request_id") or "")
+    if validation.get("valid") is not True:
+        terminal = _terminalize_invalid_mode5_user_start_request(
+            data,
+            request,
+            validation,
+            now_ts=now_value,
+        )
+        result["terminal_invalidation"] = terminal
+        result["terminal_rejected"] = terminal.get("terminal") is True
+        result["acknowledged"] = terminal.get("acknowledged") is True
+        result["persisted"] = terminal.get("persisted") is True
+        result["blocker"] = str(
+            terminal.get("reason")
+            or validation.get("blocker")
+            or "request_invalid"
+        )
+        return result
+
+    receipt = data.get("_mode5_user_start_request_receipt")
+    receipt = receipt if isinstance(receipt, dict) else {}
+    receipt_matches = _mode5_user_start_receipt_matches(receipt, validation)
+    receipt_state = str(receipt.get("state") or "") if receipt_matches else ""
+    if receipt_state == "committed":
+        if data.get("_bev_full_blocked") is True:
+            result["blocker"] = "committed_receipt_but_latch_active"
+            return result
+        if not _clear_exact_mode5_replay_recovery_hold(data, validation):
+            result["blocker"] = "foreign_session_persistence_recovery_hold"
+            return result
+        if not _save_wallbox_phase_state([data]):
+            result["blocker"] = "committed_receipt_repersist_failed"
+            return result
+        ack = _ack_and_seal_mode5_user_start_request(
+            data,
+            validation,
+            now_ts=now_value,
+        )
+        result.update({
+            "persisted": True,
+            "acknowledged": ack["acknowledged"],
+            "ack_sealed": ack["sealed"],
+            "replayed": True,
+            "blocker": "",
+        })
+        if result["acknowledged"] and not result["ack_sealed"]:
+            result["blocker"] = "request_ack_receipt_not_sealed"
+        elif not result["acknowledged"]:
+            result["blocker"] = "exact_request_ack_failed_or_superseded"
+        return result
+
+    if receipt_state == "prepared":
+        if data.get("_bev_full_blocked") is True:
+            if (
+                not _mode5_user_start_exact_latch(data, validation)
+                or not _mode5_user_start_latch_generation_matches(
+                    data,
+                    validation,
+                )
+            ):
+                result["blocker"] = "prepared_replay_latch_mismatch"
+                return result
+        anchor_state = _mode5_user_start_anchor_contract(
+            data,
+            validation["plug_session_id"],
+        )
+        if anchor_state.get("blocker"):
+            result["blocker"] = anchor_state["blocker"]
+            return result
+
+        def replay_mutation():
+            if data.get("_bev_full_blocked") is True:
+                _clear_wallbox_charge_end_latch(
+                    data,
+                    "mode5_user_start_request_replay",
+                )
+            _clear_exact_mode5_start_rejected_anchor(
+                data,
+                validation["plug_session_id"],
+            )
+            if not _clear_exact_mode5_replay_recovery_hold(data, validation):
+                raise RuntimeError("foreign_session_persistence_recovery_hold")
+            return {"replayed": True, "hardware_write": False}
+
+        replay = _persist_openwb_pro_session_transaction(
+            data,
+            replay_mutation,
+            name="mode5_user_start_replay",
+        )
+        result["persistence"] = replay
+        if replay.get("committed") is not True:
+            result["blocker"] = str(replay.get("reason") or "replay_persist_failed")
+            return result
+        if not _finalize_mode5_user_start_receipt(
+            data,
+            validation,
+            now_ts=now_value,
+        ):
+            result["blocker"] = "replay_receipt_finalize_failed"
+            return result
+        ack = _ack_and_seal_mode5_user_start_request(
+            data,
+            validation,
+            now_ts=now_value,
+        )
+        result.update({
+            "persisted": True,
+            "applied": True,
+            "replayed": True,
+            "acknowledged": ack["acknowledged"],
+            "ack_sealed": ack["sealed"],
+            "blocker": "",
+        })
+        if result["acknowledged"] and not result["ack_sealed"]:
+            result["blocker"] = "request_ack_receipt_not_sealed"
+        elif not result["acknowledged"]:
+            result["blocker"] = "exact_request_ack_failed_or_superseded"
+        return result
+
+    if not _mode5_user_start_latch_generation_matches(data, validation):
+        # Ein nach dem Klick entstandener oder inzwischen ersetzter Latch ist
+        # keine rückwirkende Nutzerfreigabe. Das veraltete Intent wird exakt
+        # quittiert, damit es auch nach Uhrsprüngen niemals eine spätere
+        # Startablehnung derselben Stecksession lösen kann.
+        ack = _ack_and_seal_mode5_user_start_request(
+            data,
+            validation,
+            now_ts=now_value,
+        )
+        result["acknowledged"] = ack["acknowledged"]
+        result["ack_sealed"] = ack["sealed"]
+        result["blocker"] = (
+            "latch_generation_changed_after_user_intent"
+            if result["acknowledged"] and result["ack_sealed"]
+            else "stale_latch_generation_ack_failed_or_superseded"
+        )
+        return result
+
+    if data.get("_bev_full_blocked") is not True:
+        # Ohne alte Startablehnung ist der Nutzerauftrag bereits durch den
+        # normalen Mode-5-Preisvertrag wirksam. Er darf keine künftige Episode
+        # derselben Stecksession nachträglich freigeben.
+        ack = _ack_and_seal_mode5_user_start_request(
+            data,
+            validation,
+            now_ts=now_value,
+        )
+        result["acknowledged"] = ack["acknowledged"]
+        result["ack_sealed"] = ack["sealed"]
+        result["blocker"] = (
+            ""
+            if result["acknowledged"] and result["ack_sealed"]
+            else "no_latch_request_ack_failed_or_superseded"
+        )
+        return result
+    if not _mode5_user_start_exact_latch(data, validation):
+        result["blocker"] = "exact_start_rejected_latch_missing"
+        return result
+    latched_ts = _cfg_float(data.get("_charge_end_latched_ts"), 0.0)
+    anchor_state = _mode5_user_start_anchor_contract(
+        data,
+        validation["plug_session_id"],
+    )
+    if anchor_state.get("blocker"):
+        result["blocker"] = anchor_state["blocker"]
+        return result
+    session_persistence_hold = data.get(
+        "_openwb_pro_session_persistence_recovery_hold"
+    )
+    if (
+        isinstance(session_persistence_hold, dict)
+        and session_persistence_hold.get("active") is True
+    ):
+        result["blocker"] = "session_persistence_recovery_hold_active"
+        return result
+    episode = _openwb_pro_start_reject_episode_contract(
+        data,
+        config,
+        now_ts=now_value,
+    )
+    result["episode"] = episode
+    if not (
+        episode.get("complete") is True
+        and episode.get("session_bound") is True
+        and str(episode.get("plug_session_id") or "")
+        == validation["plug_session_id"]
+        and int(episode.get("sent_count", 0) or 0) == 3
+        and int(episode.get("max_retries", 0) or 0) == 3
+    ):
+        result["blocker"] = "complete_own_three_of_three_episode_missing"
+        return result
+    wake_receipt = data.get("_openwb_pro_start_wakeup_receipt")
+    wake_receipt = wake_receipt if isinstance(wake_receipt, dict) else {}
+    episode_sha = hashlib.sha256(
+        json.dumps(
+            {"episode": episode, "wake_receipt": wake_receipt},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    prepared_receipt = {
+        "schema": "wallbox_mode5_user_start_receipt_v1",
+        "state": "prepared",
+        "request_id": validation["request_id"],
+        "request_ts": validation["request_ts"],
+        "plug_session_id": validation["plug_session_id"],
+        "candidate_config_sha256": validation["candidate_config_sha256"],
+        "expected_boot_id": validation["expected_boot_id"],
+        "price_limit_ct": validation["price_limit_ct"],
+        "latched_ts": latched_ts,
+        "episode_sha256": episode_sha,
+        "episode_sent_count": 3,
+        "episode_max_retries": 3,
+        "prepared_ts": now_value,
+        "hardware_write": False,
+        "price_override": False,
+    }
+
+    def reset_mutation():
+        data["_mode5_user_start_request_receipt"] = dict(prepared_receipt)
+        _reset_wallbox_start_reject_episode(data)
+        _clear_wallbox_charge_end_latch(data, "mode5_user_start_request")
+        if not _clear_exact_mode5_start_rejected_anchor(
+            data,
+            validation["plug_session_id"],
+        ):
+            raise RuntimeError("zero_anchor_generation_changed")
+        return {
+            "episode_sha256": episode_sha,
+            "hardware_write": False,
+            "price_override": False,
+        }
+
+    persistence = _persist_openwb_pro_session_transaction(
+        data,
+        reset_mutation,
+        name="mode5_user_start_reset",
+    )
+    result["persistence"] = persistence
+    if persistence.get("committed") is not True:
+        result["blocker"] = str(
+            persistence.get("reason") or "mode5_user_start_persist_failed"
+        )
+        return result
+    result["applied"] = True
+    if not _finalize_mode5_user_start_receipt(
+        data,
+        validation,
+        now_ts=now_value,
+    ):
+        result["blocker"] = "receipt_finalize_failed"
+        return result
+    result["persisted"] = True
+    ack = _ack_and_seal_mode5_user_start_request(
+        data,
+        validation,
+        now_ts=now_value,
+    )
+    result["acknowledged"] = ack["acknowledged"]
+    result["ack_sealed"] = ack["sealed"]
+    result["blocker"] = (
+        ""
+        if result["acknowledged"] and result["ack_sealed"]
+        else "exact_request_ack_failed_or_superseded"
+    )
+    return result
 
 
 def _mark_openwb_pro_start_offer(
@@ -13314,18 +14951,23 @@ def _persist_openwb_pro_session_transaction(c_data, mutate, *, name):
 
     data.clear()
     data.update(previous)
-    result["phase_restored"] = bool(
-        _restore_wallbox_state_file_preimage(
-            WB_PHASE_STATE_FILE,
-            phase_preimage,
-        )
-    )
     result["abort_restored"] = bool(
         _restore_wallbox_state_file_preimage(
             WB_ABORT_STATE_FILE,
             abort_preimage,
         )
     )
+    # Der Freigabe-Latch muss auf Platte wieder aktiv sein, bevor ein
+    # vorbereitetes Receipt/Wakeup-Reset zurückgerollt werden darf. Ein Kill
+    # zwischen den beiden Restores bleibt damit fail-closed: entweder ist der
+    # alte Abort-Latch wieder da oder das vorbereitete WAL bleibt erhalten.
+    if result["abort_restored"]:
+        result["phase_restored"] = bool(
+            _restore_wallbox_state_file_preimage(
+                WB_PHASE_STATE_FILE,
+                phase_preimage,
+            )
+        )
     result["restore_failed"] = not bool(
         result["phase_restored"] and result["abort_restored"]
     )
@@ -15595,8 +17237,17 @@ def _phase_state_entry(c_data, now):
         ("_openwb_pro_phase_output_intent", "openwb_pro_phase_output_intent"),
         ("_openwb_pro_phase_output_ack", "openwb_pro_phase_output_ack"),
         ("_openwb_pro_phase_recovery_hold", "openwb_pro_phase_recovery_hold"),
+        (
+            "_openwb_pro_phase_stranded_zero_recovery",
+            "openwb_pro_phase_stranded_zero_recovery",
+        ),
         ("_openwb_pro_phase_restart_authorized", "openwb_pro_phase_restart_authorized"),
         ("_openwb_pro_start_wakeup_receipt", "openwb_pro_start_wakeup_receipt"),
+        ("_mode5_user_start_request_receipt", "mode5_user_start_request_receipt"),
+        (
+            "_openwb_pro_session_persistence_recovery_hold",
+            "openwb_pro_session_persistence_recovery_hold",
+        ),
     ):
         value = c_data.get(source_key)
         if isinstance(value, dict) and value:
@@ -15610,6 +17261,8 @@ def _phase_state_entry(c_data, now):
         or entry["openwb_pro_start_wakeup_count"] > 0
         or entry["openwb_pro_start_wakeup_pending"]
         or "openwb_pro_start_wakeup_receipt" in entry
+        or "mode5_user_start_request_receipt" in entry
+        or "openwb_pro_session_persistence_recovery_hold" in entry
         or any(key in entry for key in (
             "phase_transition_reservation",
             "openwb_pro_phase_sequence",
@@ -15826,6 +17479,27 @@ def _phase_passive_reboot_fields(raw, now):
         receipt = item.get("openwb_pro_start_wakeup_receipt")
         if isinstance(receipt, dict) and receipt:
             start_fields["_openwb_pro_start_wakeup_receipt"] = dict(receipt)
+        mode5_receipt = item.get("mode5_user_start_request_receipt")
+        if isinstance(mode5_receipt, dict) and mode5_receipt:
+            start_fields["_mode5_user_start_request_receipt"] = dict(
+                mode5_receipt
+            )
+            if str(mode5_receipt.get("state") or "") == "prepared":
+                start_fields[
+                    "_openwb_pro_session_persistence_recovery_hold"
+                ] = {
+                    "active": True,
+                    "reason": "mode5_user_start_unfinished_replay",
+                    "request_id": str(mode5_receipt.get("request_id") or ""),
+                    "hardware_write": False,
+                }
+        persisted_session_hold = item.get(
+            "openwb_pro_session_persistence_recovery_hold"
+        )
+        if isinstance(persisted_session_hold, dict) and persisted_session_hold:
+            start_fields[
+                "_openwb_pro_session_persistence_recovery_hold"
+            ] = dict(persisted_session_hold)
     if not (had_wait or had_block):
         return start_fields
     conservative_until = float(now) + 480.0
@@ -15981,6 +17655,123 @@ def _save_wallbox_phase_state(chargers):
         return False
 
 
+def _phase_entry_is_cross_generation_stranded_zero(raw):
+    """Erkennt den einzigen alten Output-/neuen Pre-output-Umschlag."""
+
+    item = raw if isinstance(raw, dict) else {}
+    reservation = item.get("phase_transition_reservation")
+    reservation = reservation if isinstance(reservation, dict) else {}
+    hold = item.get("openwb_pro_phase_recovery_hold")
+    hold = hold if isinstance(hold, dict) else {}
+    intent = item.get("openwb_pro_phase_output_intent")
+    intent = intent if isinstance(intent, dict) else {}
+    ack = item.get("openwb_pro_phase_output_ack")
+    ack = ack if isinstance(ack, dict) else {}
+    current_id = str(
+        reservation.get("transition_id")
+        or reservation.get("reservation_id")
+        or ""
+    )
+    old_id = str(intent.get("transition_id") or "")
+    intent_id = str(intent.get("intent_id") or "")
+    target = _valid_phase_count(intent.get("target"), 0)
+    sequence_after = intent.get("sequence_after")
+    sequence_after = sequence_after if isinstance(sequence_after, dict) else {}
+    intent_ts = _cfg_float(intent.get("wall_ts"), 0.0)
+    ack_ts = _cfg_float(ack.get("wall_ts"), 0.0)
+    started_ts = _cfg_float(reservation.get("started_ts"), 0.0)
+    if intent_ts > 100_000_000_000.0:
+        intent_ts /= 1000.0
+    if ack_ts > 100_000_000_000.0:
+        ack_ts /= 1000.0
+    if started_ts > 100_000_000_000.0:
+        started_ts /= 1000.0
+    return bool(
+        reservation.get("schema_version")
+        == "wallbox_phase_transition_v2"
+        and reservation.get("active") is True
+        and str(reservation.get("stage") or "") == "await_budget"
+        and current_id
+        and current_id != old_id
+        and str(reservation.get("reservation_id") or "") == current_id
+        and str(reservation.get("transition_id") or "") == current_id
+        and str(reservation.get("owner") or "") == "wallbox_manager"
+        and str(reservation.get("source") or "")
+        == "openwb_pro_phase_sequence"
+        and _valid_phase_count(reservation.get("target_phases"), 0)
+        == target
+        and target in (1, 3)
+        and str(reservation.get("grant_state") or "") == "waiting"
+        and int(_cfg_float(reservation.get("requested_w"), 0.0)) > 0
+        and int(_cfg_float(reservation.get("granted_w"), 0.0)) == 0
+        and int(_cfg_float(reservation.get("committed_w"), 0.0)) == 0
+        and _cfg_float(reservation.get("committed_ts"), 0.0) <= 0.0
+        and int(_cfg_float(reservation.get("valid_frames"), 0.0)) == 0
+        and _cfg_float(
+            reservation.get("cooldown_wire_receipt_ts"),
+            0.0,
+        )
+        <= 0.0
+        and not str(reservation.get("cooldown_source") or "")
+        and hold.get("active") is True
+        and str(hold.get("reason") or "") == "phase_zero_unconfirmed"
+        and str(hold.get("reservation_id") or "") == old_id
+        and str(hold.get("transition_id") or "") == old_id
+        and str(hold.get("intent_id") or "") == intent_id
+        and _valid_phase_count(hold.get("target"), 0) == target
+        and intent.get("schema") == "openwb_pro_phase_output_intent_v1"
+        and old_id
+        and intent_id.startswith(old_id + ":send_zero:")
+        and str(intent.get("action") or "") == "send_zero"
+        and str(intent.get("method") or "") == "set_amp_and_state"
+        and sequence_after.get("stage") == "zero_wait"
+        and _valid_phase_count(sequence_after.get("target"), 0) == target
+        and ack.get("schema") == "openwb_pro_phase_output_ack_v1"
+        and str(ack.get("intent_id") or "") == intent_id
+        and ack.get("success") is False
+        and str(ack.get("reason") or "") == "phase_zero_unconfirmed"
+        and all(
+            math.isfinite(value) and value > 0.0
+            for value in (intent_ts, ack_ts, started_ts)
+        )
+        and intent_ts <= ack_ts < started_ts
+        and not (
+            isinstance(item.get("openwb_pro_phase_sequence"), dict)
+            and item.get("openwb_pro_phase_sequence")
+        )
+        and not (
+            isinstance(item.get("openwb_pro_phase_restart_authorized"), dict)
+            and item["openwb_pro_phase_restart_authorized"].get("active")
+            is True
+        )
+    )
+
+
+def _phase_stranded_zero_process_restart_fields(raw, now):
+    """Erhält den Umschlag bis zum ersten frischen post-intent Readback."""
+
+    item = raw if isinstance(raw, dict) else {}
+    if not _phase_entry_is_cross_generation_stranded_zero(item):
+        return {}
+    result = _phase_passive_reboot_fields(item, now)
+    result.update({
+        "_wallbox_phase_transition_reservation": dict(
+            item["phase_transition_reservation"]
+        ),
+        "_openwb_pro_phase_recovery_hold": dict(
+            item["openwb_pro_phase_recovery_hold"]
+        ),
+        "_openwb_pro_phase_output_intent": dict(
+            item["openwb_pro_phase_output_intent"]
+        ),
+        "_openwb_pro_phase_output_ack": dict(
+            item["openwb_pro_phase_output_ack"]
+        ),
+        "_openwb_pro_phase_sequence_stage": "await_budget",
+    })
+    return result
+
+
 def _phase_recovery_fields(reason, raw=None):
     item = raw if isinstance(raw, dict) else {}
     target = int(item.get("openwb_pro_phase_wait_target", 0) or 0)
@@ -16080,6 +17871,52 @@ def _phase_recovery_fields(reason, raw=None):
             if isinstance(item.get("openwb_pro_phase_restart_authorized"), dict)
             else {}
         ),
+        **(
+            {
+                "_mode5_user_start_request_receipt": dict(
+                    item["mode5_user_start_request_receipt"]
+                )
+            }
+            if isinstance(item.get("mode5_user_start_request_receipt"), dict)
+            else {}
+        ),
+        **(
+            {
+                "_openwb_pro_session_persistence_recovery_hold": dict(
+                    item["openwb_pro_session_persistence_recovery_hold"]
+                )
+            }
+            if isinstance(
+                item.get("openwb_pro_session_persistence_recovery_hold"),
+                dict,
+            )
+            else (
+                {
+                    "_openwb_pro_session_persistence_recovery_hold": {
+                        "active": True,
+                        "reason": "mode5_user_start_unfinished_replay",
+                        "request_id": str(
+                            (
+                                item.get("mode5_user_start_request_receipt")
+                                or {}
+                            ).get("request_id")
+                            or ""
+                        ),
+                        "hardware_write": False,
+                    }
+                }
+                if isinstance(
+                    item.get("mode5_user_start_request_receipt"),
+                    dict,
+                )
+                and str(
+                    item["mode5_user_start_request_receipt"].get("state")
+                    or ""
+                )
+                == "prepared"
+                else {}
+            )
+        ),
     }
 
 def _restored_phase_fields(phase_state, charger_id):
@@ -16121,6 +17958,11 @@ def _restored_phase_fields(phase_state, charger_id):
                     saved_wall_ts=saved_wall_ts,
                     saved_monotonic_ts=saved_monotonic_ts,
                     current_monotonic_ts=current_monotonic_ts,
+                )
+            if _phase_entry_is_cross_generation_stranded_zero(raw):
+                return _phase_stranded_zero_process_restart_fields(
+                    raw,
+                    now_value,
                 )
             if _phase_entry_requires_output_recovery(raw):
                 return _phase_recovery_fields(
@@ -16191,6 +18033,13 @@ def _restored_phase_fields(phase_state, charger_id):
         recovery_hold = raw.get("openwb_pro_phase_recovery_hold")
         if isinstance(recovery_hold, dict) and recovery_hold:
             result["_openwb_pro_phase_recovery_hold"] = dict(recovery_hold)
+        stranded_zero_recovery = raw.get(
+            "openwb_pro_phase_stranded_zero_recovery"
+        )
+        if isinstance(stranded_zero_recovery, dict) and stranded_zero_recovery:
+            result["_openwb_pro_phase_stranded_zero_recovery"] = dict(
+                stranded_zero_recovery
+            )
         phase_restart = raw.get("openwb_pro_phase_restart_authorized")
         if isinstance(phase_restart, dict) and phase_restart:
             result["_openwb_pro_phase_restart_authorized"] = dict(phase_restart)
@@ -16217,6 +18066,16 @@ def _restored_phase_fields(phase_state, charger_id):
         receipt = raw.get("openwb_pro_start_wakeup_receipt")
         if isinstance(receipt, dict) and receipt:
             result["_openwb_pro_start_wakeup_receipt"] = dict(receipt)
+        mode5_receipt = raw.get("mode5_user_start_request_receipt")
+        if isinstance(mode5_receipt, dict) and mode5_receipt:
+            result["_mode5_user_start_request_receipt"] = dict(mode5_receipt)
+        session_persistence_hold = raw.get(
+            "openwb_pro_session_persistence_recovery_hold"
+        )
+        if isinstance(session_persistence_hold, dict) and session_persistence_hold:
+            result["_openwb_pro_session_persistence_recovery_hold"] = dict(
+                session_persistence_hold
+            )
         return result
     except Exception as exc:
         return _phase_recovery_fields("phase_state_restore_failed:%s" % exc.__class__.__name__)
@@ -18512,6 +20371,14 @@ def run():
                                     now_ts=_status_now,
                                 )
                             )
+                            if openwb_pro_session.is_openwb_pro_charger(c):
+                                c_data[
+                                    "_phase_output_recovery_cycle_resolved"
+                                ] = _resolve_phase_output_recovery_once_per_cycle(
+                                    c_data,
+                                    st,
+                                    config,
+                                )
                             _charge_contract = _wallbox_charge_observation_contract(st, c_data, now_ts=time.time())
                             _apply_charge_contract_to_status(st, _charge_contract)
                             c_data["_wallbox_plug_episode_contract"] = (
@@ -22878,7 +24745,10 @@ def run():
                         _mode0_start_episode_changed = False
                         for cd in chargers:
                             _mode0_start_episode_changed = bool(
-                                _reset_wallbox_start_reject_episode(cd)
+                                _reset_wallbox_start_reject_episode(
+                                    cd,
+                                    preserve_latched_start_rejected=True,
+                                )
                                 or _mode0_start_episode_changed
                             )
                             _mode0_max_amp = _charger_max_amp(config, cd.get("id", 1), wb_global_max_amp)
@@ -24203,7 +26073,10 @@ def run():
                         if c_mode == 0:
                             charger = c_data["charger"]
                             _mode0_start_episode_changed = (
-                                _reset_wallbox_start_reject_episode(c_data)
+                                _reset_wallbox_start_reject_episode(
+                                    c_data,
+                                    preserve_latched_start_rejected=True,
+                                )
                             )
                             if (
                                 _mode0_start_episode_changed
@@ -24280,6 +26153,18 @@ def run():
                                 )
                             c_data["_session_vehicle_binding_id"] = (
                                 _identity_binding_id
+                            )
+                        mode5_user_start = _apply_mode5_user_start_request(
+                            c_data,
+                            charger_status,
+                            config,
+                            charger_id=c_id,
+                            public_mode=c_public_mode,
+                            now_ts=now_ts,
+                        )
+                        if mode5_user_start.get("request_present") is True:
+                            c_data["_mode5_user_start_request_action"] = dict(
+                                mode5_user_start
                             )
                         _release_before = dict(c_data)
                         _release_disk_preimage = _snapshot_wallbox_state_file_preimage(
@@ -24439,18 +26324,15 @@ def run():
                             and not predump_wallbox_active
                         )
                         if openwb_primary_curve_frame_control:
-                            user_curve_request = _consume_wallbox_user_mode_request(c_id, MODE_CURVE)
-                            if user_curve_request and hasattr(charger, "set_pv_mode"):
-                                with command_gate.default_release_scope(charger, reason="mode2_user_switch_pv"):
-                                    pv_ok = _execute_wallbox_driver_command(
-                                        c_data,
-                                        {
-                                            "method": "set_pv_mode",
-                                            "reason": "mode2_user_switch_pv",
-                                        },
-                                        c_id=c_id,
-                                    )
-                                c_data["_pv_mode_active"] = bool(pv_ok)
+                            user_curve_action = (
+                                _apply_openwb_primary_curve_user_request(
+                                    c_data,
+                                    charger,
+                                    c_id,
+                                )
+                            )
+                            if user_curve_action.get("applied") is True:
+                                pv_ok = bool(user_curve_action.get("ok"))
                                 last_change_ts[c_id] = now_ts
                                 made_changes = True
                                 logger.info(

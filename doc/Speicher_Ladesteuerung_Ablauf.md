@@ -1,6 +1,14 @@
 # Speicher-Ladesteuerung - Systemablauf
 
-> **Stand:** v5.4.3l, gegen den Release-Betriebsvertrag geprüft am 2026-08-16
+> **Stand:** v5.4.3m, gegen den Release-Betriebsvertrag geprüft am 2026-08-17
+>
+> **Hinweis:** 5.4.3m härtet den versiegelten normalen Ziel-Updater, dessen
+> Notifier-/Recovery-Drop-in-Vertrag und den openWB-Pro-Phasenautomaten. Eine
+> reine Wallbox-Budgetreservierung startet keinen Phasen-Cooldown; eine alte
+> Ausgangsgeneration wird vor einem neuen Storage-Grant ausgewertet. Der neue
+> Sofortauftrag erzeugt selbst weder ein Budget noch einen Hardwareausgang.
+> Speicherentscheidung, RSCP-Ausgang und Hardwaregrenzen bleiben gegenüber
+> 5.4.3l unverändert.
 >
 > **Hinweis:** 5.4.3l härtet ausschließlich den updater-eigenen Git-Rückweg,
 > die eng freigegebene Migration einer historischen Storage-Manager-Unit und

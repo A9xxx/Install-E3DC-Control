@@ -97,6 +97,11 @@ if p_data.get('install_path'):
         raise RuntimeError("HA-Pfadmetadaten zeigen auf einen anderen Release-Baum")
 
 CONFIG_PATH = "/var/www/html/data/e3dc_v4.json"
+WEB_DATA_DIR = "/var/www/html/data"
+WALLBOX_MODE5_USER_START_REQUEST_FILE = os.path.join(
+    WEB_DATA_DIR,
+    "wallbox_mode5_user_start_request.json",
+)
 LOG_DIR = "/var/www/html/logs"
 NOTIFY_SCRIPT = "/usr/local/bin/boot_notify.sh"
 # Der HA-Owner ist Hardwareautorität und darf deshalb nicht unter einem vom
@@ -579,6 +584,124 @@ def set_web_permissions(filepath, data=None):
     except Exception as e:
         logger.error(f"Konnte Rechte für {filepath} nicht setzen: {e}")
 
+
+def _mode5_user_start_nodes_safe(
+    request_path=WALLBOX_MODE5_USER_START_REQUEST_FILE,
+    *,
+    legacy_parent=False,
+):
+    """Bindet Parent, Request und Lock read-only vor und nach HA-Sync."""
+
+    try:
+        account = pwd.getpwnam("www-data")
+        group = grp.getgrnam("www-data")
+        parent = os.lstat(os.path.dirname(request_path))
+        parent_mode = stat.S_IMODE(parent.st_mode)
+        if (
+            stat.S_ISLNK(parent.st_mode)
+            or not stat.S_ISDIR(parent.st_mode)
+            or bool(parent_mode & 0o002)
+            or parent.st_gid != int(group.gr_gid)
+            or (
+                parent_mode != 0o775
+                if legacy_parent
+                else parent_mode != 0o2775
+            )
+        ):
+            return False
+        install_user = str(
+            read_paths_config().get("install_user", "pi") or "pi"
+        )
+        manager_uid = int(pwd.getpwnam(install_user).pw_uid)
+        allowed_parent_uids = {int(account.pw_uid), manager_uid}
+        if parent.st_uid not in allowed_parent_uids:
+            return False
+        target_contracts = (
+            (request_path, {int(account.pw_uid)}, True),
+            (
+                request_path + ".lock",
+                {0, int(account.pw_uid), manager_uid},
+                False,
+            ),
+        )
+        for target, allowed_uids, payload_file in target_contracts:
+            if not os.path.lexists(target):
+                continue
+            metadata = os.lstat(target)
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or stat.S_IMODE(metadata.st_mode) != 0o660
+                or metadata.st_uid not in allowed_uids
+                or metadata.st_gid != int(group.gr_gid)
+                or metadata.st_size > 65536
+                or (payload_file and metadata.st_size < 1)
+            ):
+                return False
+        return True
+    except (KeyError, OSError, TypeError, ValueError):
+        return False
+
+
+def _mode5_user_start_surfaces_safe(
+    request_path=WALLBOX_MODE5_USER_START_REQUEST_FILE,
+):
+    return _mode5_user_start_nodes_safe(
+        request_path,
+        legacy_parent=False,
+    )
+
+
+def _repair_mode5_user_start_legacy_parent(
+    request_path=WALLBOX_MODE5_USER_START_REQUEST_FILE,
+):
+    """Hebt ausschließlich den bekannten 0775-Parent descriptorgebunden an."""
+
+    if _mode5_user_start_surfaces_safe(request_path):
+        return True
+    if not _mode5_user_start_nodes_safe(request_path, legacy_parent=True):
+        return False
+    directory = os.path.dirname(request_path)
+    descriptor = None
+    try:
+        before = os.lstat(directory)
+        group = grp.getgrnam("www-data")
+        account = pwd.getpwnam("www-data")
+        install_user = str(
+            read_paths_config().get("install_user", "pi") or "pi"
+        )
+        manager_uid = int(pwd.getpwnam(install_user).pw_uid)
+        allowed_parent_uids = {int(account.pw_uid), manager_uid}
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(directory, flags)
+        current = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(current.st_mode)
+            or (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino)
+            or current.st_uid not in allowed_parent_uids
+            or current.st_gid != int(group.gr_gid)
+            or stat.S_IMODE(current.st_mode) != 0o775
+        ):
+            return False
+        os.fchmod(descriptor, 0o2775)
+        changed = os.fstat(descriptor)
+        named = os.lstat(directory)
+        if (
+            stat.S_IMODE(changed.st_mode) != 0o2775
+            or (named.st_dev, named.st_ino) != (changed.st_dev, changed.st_ino)
+            or named.st_uid not in allowed_parent_uids
+            or stat.S_IMODE(named.st_mode) != 0o2775
+        ):
+            return False
+    except (KeyError, OSError, TypeError, ValueError):
+        return False
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    return _mode5_user_start_surfaces_safe(request_path)
+
 def is_secret_config_key(key):
     """Erkennt Config-Schlüssel, deren Werte nicht zwischen HA-Knoten wandern."""
     normalized = str(key or "").strip().lower()
@@ -809,6 +932,11 @@ def rsync_data(target_ip, push=True, owner_lease=None, peer_state_getter=query_p
     if not push and not local_writers_quiesced():
         logger.error("Rsync pull blocked: local writers are not confirmed stopped.")
         return False
+    if not _repair_mode5_user_start_legacy_parent():
+        logger.error(
+            "Rsync blocked: persistente Modus-5-Anforderungsfläche ist unsicher."
+        )
+        return False
 
     user = "pi"
     ssh_transport = "ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
@@ -846,6 +974,8 @@ def rsync_data(target_ip, push=True, owner_lease=None, peer_state_getter=query_p
         "--exclude", "matter-storage/",
         "--exclude", ".wallbox_plan_jobs",
         "--exclude", ".wallbox_plan_jobs/",
+        "--exclude", "wallbox_mode5_user_start_request.json",
+        "--exclude", "wallbox_mode5_user_start_request.json.lock",
     ]
     optional_args = base_args + ["--ignore-missing-args"]
 
@@ -900,7 +1030,9 @@ def rsync_data(target_ip, push=True, owner_lease=None, peer_state_getter=query_p
                 "-path", "/var/www/html/data/e3dc.config.txt", "-o",
                 "-path", "/var/www/html/data/config_backups", "-o",
                 "-path", "/var/www/html/data/matter-storage", "-o",
-                "-path", "/var/www/html/data/.wallbox_plan_jobs",
+                "-path", "/var/www/html/data/.wallbox_plan_jobs", "-o",
+                "-path", "/var/www/html/data/wallbox_mode5_user_start_request.json", "-o",
+                "-path", "/var/www/html/data/wallbox_mode5_user_start_request.json.lock",
                 ")", "-prune", "-o",
             ]
             subprocess.run([
@@ -910,15 +1042,32 @@ def rsync_data(target_ip, push=True, owner_lease=None, peer_state_getter=query_p
             ], check=True)
             subprocess.run([
                 "sudo", "find", "-P", "/var/www/html/data", "-xdev",
-                *protected_data, "-type", "l", "-prune", "-o",
+                "-mindepth", "1", *protected_data,
+                "-type", "l", "-prune", "-o",
                 "-exec", "chown", "pi:www-data", "{}", "+",
             ], check=True)
             subprocess.run([
                 "sudo", "find", "-P", "/var/www/html/ramdisk", "-xdev",
                 *protected_ramdisk, "-type", "f", "-exec", "chmod", "664", "{}", "+",
             ], check=True)
-            subprocess.run(["sudo", "find", "-P", "/var/www/html/data", "-xdev", *protected_data, "-type", "d", "-exec", "chmod", "775", "{}", "+"])
-            subprocess.run(["sudo", "find", "-P", "/var/www/html/data", "-xdev", *protected_data, "-type", "f", "-exec", "chmod", "664", "{}", "+"])
+            subprocess.run(
+                ["sudo", "chown", "pi:www-data", "/var/www/html/data"],
+                check=True,
+            )
+            subprocess.run(
+                ["sudo", "chmod", "2775", "/var/www/html/data"],
+                check=True,
+            )
+            subprocess.run([
+                "sudo", "find", "-P", "/var/www/html/data", "-xdev",
+                "-mindepth", "1", *protected_data,
+                "-type", "d", "-exec", "chmod", "775", "{}", "+",
+            ])
+            subprocess.run([
+                "sudo", "find", "-P", "/var/www/html/data", "-xdev",
+                "-mindepth", "1", *protected_data,
+                "-type", "f", "-exec", "chmod", "664", "{}", "+",
+            ])
             subprocess.run(["sudo", "chmod", config_secret_file_mode_text(), "/var/www/html/data/e3dc_v4.json"], stderr=subprocess.DEVNULL)
             subprocess.run(["sudo", "chmod", config_secret_dir_mode_text(), "/var/www/html/data/config_backups"], stderr=subprocess.DEVNULL)
             migration_backup_dir = "/var/www/html/data/config_backups/aux_inverter_migration"
@@ -927,6 +1076,11 @@ def rsync_data(target_ip, push=True, owner_lease=None, peer_state_getter=query_p
             subprocess.run(["sudo", "find", "-P", "/var/www/html/data/config_backups", *protected_backup, "-type", "f", "-exec", "chmod", config_secret_file_mode_text(), "{}", "+"], stderr=subprocess.DEVNULL)
             if not _harden_aux_inverter_migration_backups(migration_backup_dir):
                 logger.error("Zusatz-WR-Migrationsbackups konnten nicht sicher gehärtet werden.")
+                return False
+            if not _mode5_user_start_surfaces_safe():
+                logger.error(
+                    "Rsync blocked: Modus-5-Anforderungsfläche wechselte beim HA-Pull."
+                )
                 return False
 
         return True

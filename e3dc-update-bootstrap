@@ -1,144 +1,114 @@
 #!/bin/sh
-# Lädt den aktuellen veröffentlichten Ziel-Updater unabhängig vom Altbestand.
+# Unabhängiger Community-Einstieg für ein E3DC-Control Rettungsupdate.
+#
+# Das Skript nimmt ausschließlich den Auftrag an, bindet den aktuellen
+# veröffentlichten Release und übergibt Installation, Benutzer und Rolle an
+# dessen zentrale Discovery. Backup, Diensteruhe, Projektion, Rechte sowie
+# Start- und Healthprüfung bleiben allein Aufgabe des Ziel-Updaters.
 
 set -eu
-PATH=/usr/bin:/bin
+umask 077
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 
 REPOSITORY_URL="https://github.com/A9xxx/Install-E3DC-Control"
 GIT_URL="${REPOSITORY_URL}.git"
 LATEST_URL="${REPOSITORY_URL}/releases/latest"
+RAW_BASE_URL="https://raw.githubusercontent.com/A9xxx/Install-E3DC-Control"
+UNIT="e3dc-web-update.service"
+RUNTIME_DIR="/run/e3dc-web-update"
+LOG_DIR="/var/log/e3dc-control"
+LOG_FILE="${LOG_DIR}/web-update.log"
+PID_FILE="${RUNTIME_DIR}/pid"
+STATUS_FILE="${RUNTIME_DIR}/status"
+LOCK_FILE="${RUNTIME_DIR}/lock"
+START_LOCK_FILE="${RUNTIME_DIR}/start.lock"
+DISCOVERY_RELATIVE="Installer/update_bootstrap_discovery.py"
 
 fail() {
     echo "Update-Bootstrap abgebrochen: $*" >&2
     exit 1
 }
 
-for command in curl getent git python3; do
-    command -v "$command" >/dev/null 2>&1 || fail "$command fehlt"
-done
-
-if [ "$(id -u)" -eq 0 ]; then
-    INSTALL_USER=${E3DC_BOOTSTRAP_USER:-${SUDO_USER:-}}
-else
-    INSTALL_USER=$(id -un)
-fi
-case "$INSTALL_USER" in
-    ""|root|www-data|*[!A-Za-z0-9_.-]*)
-        fail "normaler lokaler Installationsbenutzer ist nicht bestimmbar"
-        ;;
-esac
-if [ "$(id -u)" -ne 0 ]; then
-    fail "Rettungsupdate bitte mit sudo starten"
-fi
-
-TARGET=${1:-${E3DC_INSTALL_PATH:-}}
-if [ -z "$TARGET" ]; then
-    USER_HOME=$(getent passwd "$INSTALL_USER" | cut -d: -f6)
-    [ -n "$USER_HOME" ] || fail "Home-Verzeichnis von $INSTALL_USER fehlt"
-    TARGET="$USER_HOME/Install"
-fi
-case "$TARGET" in
-    /*) ;;
-    *) fail "Installationspfad muss absolut sein" ;;
-esac
-[ -d "$TARGET" ] || fail "Installationspfad fehlt: $TARGET"
-TARGET=$(python3 - "$TARGET" <<'PY'
-import os
-from pathlib import Path
-import stat
-import sys
-
-candidate = Path(os.path.abspath(sys.argv[1]))
-current = Path(candidate.anchor)
-try:
-    for component in candidate.parts[1:]:
-        current /= component
-        metadata = os.lstat(current)
-        if stat.S_ISLNK(metadata.st_mode):
-            raise RuntimeError(f"Symlink im Installationspfad: {current}")
-    if not stat.S_ISDIR(os.lstat(candidate).st_mode):
-        raise RuntimeError("Installationspfad ist kein Verzeichnis")
-except (OSError, RuntimeError) as exc:
-    raise SystemExit(str(exc))
-print(candidate)
-PY
-) || fail "Installationspfad ist nicht kanonisch"
-
-ROLE=${2:-auto}
-case "$ROLE" in
-    off|master|slave|shadow) ;;
-    auto)
-        ROLE=$(python3 - "$TARGET" <<'PY'
-import json
-import pathlib
-import re
-import sys
-
-target = pathlib.Path(sys.argv[1])
-roles = []
-
-for path, key in (
-    (pathlib.Path("/etc/e3dc-control/instance_role.json"), "mode"),
-    (pathlib.Path("/var/www/html/data/e3dc_v4.json"), "ha_mode"),
-    (target / "data/e3dc_v4.json", "ha_mode"),
-):
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        continue
-    if isinstance(value, dict):
-        role = str(value.get(key) or "").strip().lower()
-        if role in {"off", "master", "slave", "shadow"}:
-            roles.append(role)
-
-for path in (target / "e3dc.config.txt", target / "data/e3dc.config.txt"):
-    try:
-        text = path.read_text(encoding="utf-8-sig")
-    except (OSError, UnicodeError):
-        continue
-    for line in text.splitlines():
-        match = re.fullmatch(r"\s*ha_mode\s*=\s*(off|master|slave|shadow)\s*", line)
-        if match:
-            roles.append(match.group(1))
-
-unique = sorted(set(roles))
-if len(unique) != 1:
-    detail = ", ".join(unique) if unique else "keine"
-    raise SystemExit(
-        "Rolle nicht eindeutig automatisch erkennbar "
-        f"({detail}); off, master, slave oder shadow als zweites Argument angeben"
-    )
-print(unique[0])
-PY
-        ) || exit 1
-        ;;
-    *) fail "Rolle muss auto, off, master, slave oder shadow sein" ;;
-esac
-
-WORKDIR=$(mktemp -d)
-cleanup() {
-    rm -rf -- "$WORKDIR"
+require_commands() {
+    for command in awk cmp curl flock getent git install mktemp python3 stat systemctl systemd-run; do
+        command -v "$command" >/dev/null 2>&1 || fail "$command fehlt"
+    done
 }
-trap cleanup EXIT HUP INT TERM
 
-EFFECTIVE_LATEST=$(curl -q \
-    --fail --silent --show-error --location \
-    --proto '=https' --tlsv1.2 \
-    --output /dev/null --write-out '%{url_effective}' \
-    "$LATEST_URL")
-case "$EFFECTIVE_LATEST" in
-    "$REPOSITORY_URL/releases/tag/"*)
-        TAG=${EFFECTIVE_LATEST##*/}
-        ;;
-    *) fail "GitHub lieferte keinen eindeutigen aktuellen Release-Tag" ;;
-esac
-python3 - "$TAG" <<'PY' || fail "Release-Tag besitzt ein unerwartetes Format: $TAG"
-import re
-import sys
+write_runtime_value() {
+    target=$1
+    value=$2
+    temporary=$(mktemp "${RUNTIME_DIR}/.$(basename "$target").XXXXXX")
+    printf '%s\n' "$value" >"$temporary"
+    chown root:www-data "$temporary"
+    chmod 0640 "$temporary"
+    mv -fT "$temporary" "$target"
+}
 
-raise SystemExit(0 if re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+[a-z]?", sys.argv[1]) else 1)
-PY
+prepare_job_paths() {
+    getent group www-data >/dev/null 2>&1 || fail "www-data-Gruppe fehlt"
+    for parent in /run /var/log; do
+        [ ! -L "$parent" ] || fail "System-Elternpfad ist ein Symlink: $parent"
+        metadata=$(stat -c '%u %F' "$parent") \
+            || fail "System-Elternpfad ist nicht prüfbar: $parent"
+        [ "$metadata" = "0 directory" ] \
+            || fail "System-Elternpfad ist nicht root-kontrolliert: $parent"
+    done
+    for path in "$RUNTIME_DIR" "$LOG_DIR"; do
+        [ ! -L "$path" ] || fail "Runtime- oder Logpfad ist ein Symlink: $path"
+        if [ -e "$path" ] && [ ! -d "$path" ]; then
+            fail "Runtime- oder Logpfad ist kein Verzeichnis: $path"
+        fi
+    done
+    install -d -o root -g www-data -m 0750 "$RUNTIME_DIR"
+    install -d -o root -g root -m 0755 "$LOG_DIR"
+    if [ -L "$LOG_FILE" ]; then
+        fail "Updateprotokoll ist ein Symlink"
+    fi
+    if [ ! -e "$LOG_FILE" ]; then
+        (set -C; : >"$LOG_FILE") 2>/dev/null || true
+    fi
+    metadata=$(stat -c '%F %h' "$LOG_FILE") || fail "Updateprotokoll ist nicht prüfbar"
+    case "$metadata" in
+        "regular file 1"|"regular empty file 1") ;;
+        *) fail "Updateprotokoll besitzt einen unzulässigen Pfadtyp" ;;
+    esac
+    chown root:www-data "$LOG_FILE"
+    chmod 0640 "$LOG_FILE"
+}
+
+prepare_lock_file() {
+    lock_path=$1
+    if [ -e "$lock_path" ] || [ -L "$lock_path" ]; then
+        if [ -L "$lock_path" ]; then
+            unlink "$lock_path"
+        else
+            metadata=$(stat -c '%u %g %F %h' "$lock_path") \
+                || fail "Update-Lock ist nicht prüfbar"
+            case "$metadata" in
+                "0 0 regular file 1"|"0 0 regular empty file 1") ;;
+                *) unlink "$lock_path" || fail "Unsicherer Update-Lock konnte nicht ersetzt werden" ;;
+            esac
+        fi
+    fi
+    if [ ! -e "$lock_path" ]; then
+        (set -C; : >"$lock_path") 2>/dev/null || true
+    fi
+    metadata=$(stat -c '%u %g %F %h' "$lock_path") \
+        || fail "Update-Lock konnte nicht atomar angelegt werden"
+    case "$metadata" in
+        "0 0 regular file 1"|"0 0 regular empty file 1") ;;
+        *) fail "Update-Lock besitzt nach Anlage unzulässige Metadaten" ;;
+    esac
+    chown root:root "$lock_path"
+    chmod 0600 "$lock_path"
+}
+
+prepare_log() {
+    : >"$LOG_FILE"
+    printf '=== E3DC-Control Rettungsupdate %s ===\n' "$(date --iso-8601=seconds)" >>"$LOG_FILE"
+}
 
 isolated_git() {
     env -i \
@@ -166,44 +136,432 @@ isolated_git() {
         "$@"
 }
 
-isolated_git ls-remote --tags "$GIT_URL" \
-    "refs/tags/$TAG" "refs/tags/$TAG^{}" >"$WORKDIR/refs"
-TAG_OBJECT=$(awk -v ref="refs/tags/$TAG" '$2 == ref {print $1}' "$WORKDIR/refs")
-TARGET_SHA=$(awk -v ref="refs/tags/$TAG^{}" '$2 == ref {print $1}' "$WORKDIR/refs")
-[ "${#TAG_OBJECT}" -eq 40 ] || fail "Tagobjekt besitzt keine volle SHA"
-[ "${#TARGET_SHA}" -eq 40 ] || fail "Zielcommit besitzt keine volle SHA"
-case "$TAG_OBJECT:$TARGET_SHA" in
-    *[!0-9a-f:]*) fail "Release-Referenzen sind nicht hexadezimal" ;;
-esac
-[ "$TAG_OBJECT" != "$TARGET_SHA" ] || fail "aktueller Release-Tag ist nicht annotiert"
+resolve_release_binding() {
+    expected_tag=${E3DC_BOOTSTRAP_EXPECTED_TAG:-}
+    expected_tag_object=${E3DC_BOOTSTRAP_EXPECTED_TAG_OBJECT:-}
+    expected_sha=${E3DC_BOOTSTRAP_EXPECTED_SHA:-}
+    if [ -n "$expected_tag$expected_tag_object$expected_sha" ]; then
+        [ -n "$expected_tag" ] && [ -n "$expected_tag_object" ] && [ -n "$expected_sha" ] \
+            || fail "Vorverifizierte Release-Bindung ist unvollständig"
+        [ "${#expected_tag_object}" -eq 40 ] && [ "${#expected_sha}" -eq 40 ] \
+            && [ "$expected_tag_object" != "$expected_sha" ] \
+            || fail "Vorverifizierte Release-SHAs sind unvollständig"
+        case "$expected_tag_object:$expected_sha" in
+            *[!0-9a-f:]*) fail "Vorverifizierte Release-SHAs sind nicht hexadezimal" ;;
+        esac
+        tag=$expected_tag
+    else
+        effective_latest=$(curl -q \
+            --fail --silent --show-error --location \
+            --proto '=https' --tlsv1.2 \
+            --output /dev/null --write-out '%{url_effective}' \
+            "$LATEST_URL") || fail "aktueller Release-Tag konnte nicht geladen werden"
+        case "$effective_latest" in
+            "$REPOSITORY_URL/releases/tag/"*) tag=${effective_latest##*/} ;;
+            *) fail "GitHub lieferte keinen eindeutigen aktuellen Release-Tag" ;;
+        esac
+    fi
+    python3 - "$tag" <<'PY' || fail "Release-Tag besitzt ein unerwartetes Format: $tag"
+import re
+import sys
+raise SystemExit(0 if re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+[a-z]?", sys.argv[1]) else 1)
+PY
+    refs=$(mktemp "${RUNTIME_DIR}/release-refs.XXXXXX")
+    isolated_git ls-remote --tags "$GIT_URL" \
+        "refs/tags/$tag" "refs/tags/$tag^{}" >"$refs" \
+        || fail "Release-Referenzen konnten nicht gebunden werden"
+    tag_object=$(awk -v ref="refs/tags/$tag" '$2 == ref {print $1}' "$refs")
+    target_sha=$(awk -v ref="refs/tags/$tag^{}" '$2 == ref {print $1}' "$refs")
+    rm -f "$refs"
+    [ "${#tag_object}" -eq 40 ] && [ "${#target_sha}" -eq 40 ] \
+        || fail "Release-Tag besitzt keine eindeutige annotierte SHA-Bindung"
+    case "$tag_object:$target_sha" in
+        *[!0-9a-f:]*) fail "Release-Referenzen sind nicht hexadezimal" ;;
+    esac
+    [ "$tag_object" != "$target_sha" ] || fail "aktueller Release-Tag ist nicht annotiert"
+    if [ -n "$expected_tag" ]; then
+        [ "$tag" = "$expected_tag" ] \
+            && [ "$tag_object" = "$expected_tag_object" ] \
+            && [ "$target_sha" = "$expected_sha" ] \
+            || fail "Vorverifizierte Tag-/Commitbindung driftete vor dem Ziel-Updater"
+    fi
+    printf '%s\t%s\t%s\n' "$tag" "$tag_object" "$target_sha"
+}
 
-CHECKOUT="$WORKDIR/release"
-mkdir -m 0700 -- "$CHECKOUT"
-isolated_git -c init.defaultBranch=main init "$CHECKOUT" >/dev/null
-isolated_git -C "$CHECKOUT" remote add origin "$GIT_URL"
-isolated_git -C "$CHECKOUT" fetch \
-    --no-tags --depth=1 origin \
-    "+refs/tags/$TAG:refs/tags/$TAG" >/dev/null
-CHECKOUT_SHA=$(isolated_git -C "$CHECKOUT" rev-parse --verify "refs/tags/$TAG^{commit}")
-[ "$CHECKOUT_SHA" = "$TARGET_SHA" ] || \
-    fail "temporärer Ziel-Checkout weicht von der Release-SHA ab"
-isolated_git -C "$CHECKOUT" checkout --detach "$TARGET_SHA" >/dev/null
+bind_entry_mode() {
+    requested=${E3DC_BOOTSTRAP_ENTRY_MODE:-rescue}
+    case "$requested" in
+        rescue)
+            BOUND_ENTRY_MODE=rescue
+            ;;
+        regular)
+            [ "${E3DC_BOOTSTRAP_INLINE_WORKER:-}" = "1" ] \
+                && [ "${E3DC_BOOTSTRAP_LOCK_HELD:-}" = "1" ] \
+                && [ "${E3DC_BOOTSTRAP_VERIFY_SELF:-}" = "1" ] \
+                && [ -n "${E3DC_BOOTSTRAP_EXPECTED_TAG:-}" ] \
+                && [ -n "${E3DC_BOOTSTRAP_EXPECTED_TAG_OBJECT:-}" ] \
+                && [ -n "${E3DC_BOOTSTRAP_EXPECTED_SHA:-}" ] \
+                || fail "Regular-Modus besitzt keinen root-eigenen Dispatcher-Vertrag"
+            BOUND_ENTRY_MODE=regular
+            ;;
+        *) fail "Update-Einstiegsmodus muss regular oder rescue sein" ;;
+    esac
+}
 
-RUNNER="$CHECKOUT/e3dc-bootstrap"
-[ -f "$RUNNER" ] && [ ! -L "$RUNNER" ] || fail "Ziel-Updater fehlt im Release-Archiv"
+validate_private_file() {
+    path=$1
+    expected_mode=$2
+    metadata=$(stat -c '%u %g %a %F %h' "$path") \
+        || fail "Root-private Updatedatei ist nicht prüfbar: $path"
+    [ "$metadata" = "0 0 $expected_mode regular file 1" ] \
+        || fail "Root-private Updatedatei besitzt unzulässige Metadaten: $path"
+}
 
-echo "E3DC-Control Update-Bootstrap"
-echo "  Installation : $TARGET"
-echo "  Benutzer     : $INSTALL_USER"
-echo "  Rolle        : $ROLE"
-echo "  Release      : $TAG"
-echo "  Zielcommit   : $TARGET_SHA"
-echo "  Alt-Updater  : wird nicht ausgeführt"
+stage_release_contract() {
+    target_sha=$1
+    self_path=$(python3 - "$0" <<'PY'
+import os
+from pathlib import Path
+import stat
+import sys
 
-env -i \
-    PATH=/usr/bin:/bin \
-    HOME=/root \
-    LANG=C.UTF-8 \
-    LC_ALL=C.UTF-8 \
-    E3DC_BOOTSTRAP_USER="$INSTALL_USER" \
-    /bin/sh "$RUNNER" "$TARGET" "$TAG" "$TARGET_SHA" "$ROLE"
+path = Path(sys.argv[1])
+if not path.is_absolute():
+    path = Path.cwd() / path
+metadata = os.lstat(path)
+if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+    raise SystemExit("Bootstrap-Quelle ist keine reguläre Datei")
+resolved = path.resolve(strict=True)
+if resolved != path.absolute() or metadata.st_nlink != 1:
+    raise SystemExit("Bootstrap-Quelle ist nicht eindeutig gebunden")
+print(resolved)
+PY
+    ) || fail "Bootstrap-Quelle konnte nicht sicher gebunden werden"
+    stage_dir=$(mktemp -d /run/e3dc-update-bootstrap.XXXXXX)
+    chown root:root "$stage_dir"
+    chmod 0700 "$stage_dir"
+    install -o root -g root -m 0500 "$self_path" "$stage_dir/e3dc-update-bootstrap"
+    discovery="$stage_dir/update_bootstrap_discovery.py"
+    curl -q \
+        --fail --silent --show-error --location \
+        --proto '=https' --tlsv1.2 \
+        --output "$discovery" \
+        "${RAW_BASE_URL}/${target_sha}/${DISCOVERY_RELATIVE}" \
+        || fail "Release-Discovery konnte nicht geladen werden"
+    chown root:root "$discovery"
+    chmod 0500 "$discovery"
+    validate_private_file "$stage_dir/e3dc-update-bootstrap" 500
+    validate_private_file "$discovery" 500
+    size=$(stat -c '%s' "$discovery")
+    [ "$size" -ge 4096 ] && [ "$size" -le 131072 ] \
+        || fail "Release-Discovery besitzt eine unzulässige Größe"
+    printf '%s\n' "$stage_dir"
+}
+
+bind_with_discovery() {
+    discovery=$1
+    explicit_root=$2
+    explicit_user=$3
+    sudo_user=$4
+    requested_role=$5
+    python3 -I -B "$discovery" \
+        --explicit-root "$explicit_root" \
+        --explicit-user "$explicit_user" \
+        --sudo-user "$sudo_user" \
+        --requested-role "$requested_role"
+}
+
+parse_binding() {
+    binding=$1
+    tab=$(printf '\t')
+    case "$binding" in
+        *"$tab"*"$tab"*) ;;
+        *) fail "Discovery lieferte keine eindeutige Root-/Benutzer-/Rollenbindung" ;;
+    esac
+    BOUND_ROOT=${binding%%"$tab"*}
+    remainder=${binding#*"$tab"}
+    BOUND_USER=${remainder%%"$tab"*}
+    BOUND_ROLE=${remainder#*"$tab"}
+    case "$BOUND_ROLE" in
+        *"$tab"*) fail "Discovery lieferte überzählige Bindungsfelder" ;;
+    esac
+    [ -n "$BOUND_ROOT" ] && [ -n "$BOUND_USER" ] \
+        || fail "Discovery-Bindung blieb unvollständig"
+    case "$BOUND_ROLE" in
+        off|master|slave|shadow) ;;
+        *) fail "Discovery-Rollenbindung ist ungültig" ;;
+    esac
+}
+
+prepare_release_and_binding() {
+    explicit_root=$1
+    explicit_user=$2
+    sudo_user=$3
+    requested_role=$4
+    release_binding=$(resolve_release_binding)
+    tab=$(printf '\t')
+    case "$release_binding" in
+        *"$tab"*"$tab"*) ;;
+        *) fail "Release-Bindung ist unvollständig" ;;
+    esac
+    BOUND_TAG=${release_binding%%"$tab"*}
+    remainder=${release_binding#*"$tab"}
+    BOUND_TAG_OBJECT=${remainder%%"$tab"*}
+    BOUND_SHA=${remainder#*"$tab"}
+    case "$BOUND_SHA" in
+        *"$tab"*) fail "Release-Bindung besitzt überzählige Felder" ;;
+    esac
+    STAGE_DIR=$(stage_release_contract "$BOUND_SHA")
+    binding=$(bind_with_discovery \
+        "$STAGE_DIR/update_bootstrap_discovery.py" \
+        "$explicit_root" "$explicit_user" "$sudo_user" "$requested_role") \
+        || fail "Installation oder Rolle konnte nicht eindeutig gebunden werden"
+    parse_binding "$binding"
+}
+
+download_release_checkout() {
+    checkout_dir=$1
+    tag=$2
+    tag_object=$3
+    target_sha=$4
+    mkdir -m 0700 "$checkout_dir"
+    isolated_git -c init.defaultBranch=main init "$checkout_dir" >/dev/null
+    isolated_git -C "$checkout_dir" remote add origin "$GIT_URL"
+    isolated_git -C "$checkout_dir" fetch \
+        --no-tags --depth=1 origin \
+        "+refs/tags/$tag:refs/tags/$tag" >/dev/null
+    fetched_tag=$(isolated_git -C "$checkout_dir" rev-parse --verify "refs/tags/$tag")
+    fetched_sha=$(isolated_git -C "$checkout_dir" rev-parse --verify "refs/tags/$tag^{commit}")
+    [ "$fetched_tag" = "$tag_object" ] && [ "$fetched_sha" = "$target_sha" ] \
+        || fail "temporärer Ziel-Checkout weicht von der Release-Bindung ab"
+    isolated_git -C "$checkout_dir" checkout --detach "$target_sha" >/dev/null
+    [ -f "$checkout_dir/e3dc-bootstrap" ] && [ ! -L "$checkout_dir/e3dc-bootstrap" ] \
+        || fail "Ziel-Updater fehlt im Release-Checkout"
+    [ -f "$checkout_dir/$DISCOVERY_RELATIVE" ] \
+        && [ ! -L "$checkout_dir/$DISCOVERY_RELATIVE" ] \
+        || fail "zentrale Release-Discovery fehlt im Ziel-Checkout"
+}
+
+run_bound_update() (
+    release_dir=$(mktemp -d /run/e3dc-update-release.XXXXXX)
+    cleanup_release() {
+        find "$release_dir" -depth -delete 2>/dev/null || true
+    }
+    trap cleanup_release EXIT HUP INT TERM
+    checkout="$release_dir/release"
+    download_release_checkout \
+        "$checkout" "$BOUND_TAG" "$BOUND_TAG_OBJECT" "$BOUND_SHA"
+    cmp -s "$STAGE_DIR/update_bootstrap_discovery.py" \
+        "$checkout/$DISCOVERY_RELATIVE" \
+        || fail "vorab geprüfte Discovery widerspricht dem gebundenen Release-Checkout"
+    rebound=$(bind_with_discovery \
+        "$checkout/$DISCOVERY_RELATIVE" \
+        "$BOUND_ROOT" "$BOUND_USER" "" auto) \
+        || fail "Installation oder Rolle driftete vor dem Ziel-Updater"
+    expected_rebound=$(printf '%s\t%s\t%s' "$BOUND_ROOT" "$BOUND_USER" "$BOUND_ROLE")
+    [ "$rebound" = "$expected_rebound" ] \
+        || fail "Root-/Benutzer-/Rollenbindung driftete vor dem Ziel-Updater"
+    if [ "${E3DC_BOOTSTRAP_VERIFY_SELF:-}" = "1" ]; then
+        [ -n "${E3DC_BOOTSTRAP_EXPECTED_TAG:-}" ] \
+            || fail "Bootstrap-Selbstprüfung besitzt keinen erwarteten Tag"
+        cmp -s "$0" "$checkout/e3dc-update-bootstrap" \
+            || fail "geladener Bootstrap widerspricht dem gebundenen Release"
+    fi
+    echo "E3DC-Control Update-Bootstrap"
+    echo "  Installation : $BOUND_ROOT"
+    echo "  Benutzer     : $BOUND_USER"
+    echo "  Rolle        : $BOUND_ROLE"
+    echo "  Release      : $BOUND_TAG"
+    echo "  Zielcommit   : $BOUND_SHA"
+    echo "  Einstieg     : $BOUND_ENTRY_MODE"
+    echo "  Alt-Updater  : wird nicht ausgeführt"
+    set +e
+    env -i \
+        PATH=/usr/bin:/bin \
+        HOME=/root \
+        LANG=C.UTF-8 \
+        LC_ALL=C.UTF-8 \
+        E3DC_BOOTSTRAP_USER="$BOUND_USER" \
+        E3DC_BOOTSTRAP_ENTRY_MODE="$BOUND_ENTRY_MODE" \
+        /bin/sh "$checkout/e3dc-bootstrap" \
+        "$BOUND_ROOT" "$BOUND_TAG" "$BOUND_SHA" "$BOUND_ROLE"
+    result=$?
+    set -e
+    trap - EXIT HUP INT TERM
+    cleanup_release
+    return "$result"
+)
+
+print_job_commands() {
+    printf 'Status: systemctl status --no-pager %s\n' "$UNIT"
+    printf 'Protokoll: journalctl -fu %s\n' "$UNIT"
+    printf 'Dateilog: tail -f %s\n' "$LOG_FILE"
+}
+
+update_job_running() {
+    active_state=$(systemctl show "$UNIT" --property=ActiveState --value 2>/dev/null || true)
+    case "$active_state" in
+        active|activating|reloading) return 0 ;;
+    esac
+    systemctl --quiet is-active "$UNIT"
+}
+
+start_background_job() {
+    [ "$#" -eq 0 ] || fail "Der automatische Hintergrundstart akzeptiert keine Argumente"
+    BOUND_ENTRY_MODE=rescue
+    prepare_job_paths
+    prepare_lock_file "$START_LOCK_FILE"
+    exec 8>"$START_LOCK_FILE"
+    flock 8
+    if update_job_running; then
+        printf 'Update läuft bereits: %s\n' "$UNIT"
+        print_job_commands
+        return 0
+    fi
+    prepare_release_and_binding "" "" "${SUDO_USER:-}" auto
+    prepare_log
+    write_runtime_value "$STATUS_FILE" "launching"
+    rm -f "$PID_FILE"
+    systemctl reset-failed "$UNIT" 2>/dev/null || true
+    launch_output=""
+    set +e
+    launch_output=$(systemd-run \
+        --unit="${UNIT%.service}" \
+        --collect \
+        --no-block \
+        --property=Type=exec \
+        --property=User=root \
+        --property=Group=root \
+        --property=WorkingDirectory=/ \
+        --property=UMask=0077 \
+        --property=TimeoutStartSec=infinity \
+        --setenv=E3DC_BOOTSTRAP_BACKGROUND_WORKER=1 \
+        --setenv="E3DC_BOOTSTRAP_STAGE_DIR=$STAGE_DIR" \
+        --setenv="E3DC_BOOTSTRAP_TAG=$BOUND_TAG" \
+        --setenv="E3DC_BOOTSTRAP_TAG_OBJECT=$BOUND_TAG_OBJECT" \
+        --setenv="E3DC_BOOTSTRAP_SHA=$BOUND_SHA" \
+        --setenv="E3DC_INSTALL_PATH=$BOUND_ROOT" \
+        --setenv="E3DC_BOOTSTRAP_USER=$BOUND_USER" \
+        --setenv="E3DC_BOOTSTRAP_BOUND_ROLE=$BOUND_ROLE" \
+        --setenv=SUDO_USER= \
+        /bin/sh "$STAGE_DIR/e3dc-update-bootstrap" --systemd-worker 2>&1)
+    launch_status=$?
+    set -e
+    if [ "$launch_status" -ne 0 ]; then
+        find "$STAGE_DIR" -depth -delete 2>/dev/null || true
+        write_runtime_value "$STATUS_FILE" "$launch_status"
+        printf '[!] Rettungsupdate-Systemjob konnte nicht gestartet werden (Exit %s).\n%s\n' \
+            "$launch_status" "$launch_output" >>"$LOG_FILE"
+        fail "Rettungsupdate-Systemjob konnte nicht gestartet werden"
+    fi
+    [ -z "$launch_output" ] || printf '%s\n' "$launch_output"
+    printf 'Installation: %s (Benutzer %s, Rolle %s)\n' \
+        "$BOUND_ROOT" "$BOUND_USER" "$BOUND_ROLE"
+    printf 'Update gestartet: %s\n' "$UNIT"
+    print_job_commands
+}
+
+validate_worker_environment() {
+    [ "${E3DC_BOOTSTRAP_BACKGROUND_WORKER:-}" = "1" ] \
+        && [ -n "${INVOCATION_ID:-}" ] \
+        || fail "Hintergrund-Worker besitzt keinen systemd-Ausführungsvertrag"
+    [ -z "${SUDO_USER:-}" ] || fail "Hintergrund-Worker übernimmt keinen sudo-Aufrufer"
+    STAGE_DIR=${E3DC_BOOTSTRAP_STAGE_DIR:-}
+    case "$STAGE_DIR" in
+        /run/e3dc-update-bootstrap.*) ;;
+        *) fail "Hintergrund-Worker besitzt keinen privaten Bootstrap-Pfad" ;;
+    esac
+    [ "$0" = "$STAGE_DIR/e3dc-update-bootstrap" ] \
+        || fail "Hintergrund-Worker läuft nicht aus seiner privaten Kopie"
+    validate_private_file "$0" 500
+    validate_private_file "$STAGE_DIR/update_bootstrap_discovery.py" 500
+    BOUND_TAG=${E3DC_BOOTSTRAP_TAG:-}
+    BOUND_TAG_OBJECT=${E3DC_BOOTSTRAP_TAG_OBJECT:-}
+    BOUND_SHA=${E3DC_BOOTSTRAP_SHA:-}
+    BOUND_ROOT=${E3DC_INSTALL_PATH:-}
+    BOUND_USER=${E3DC_BOOTSTRAP_USER:-}
+    BOUND_ROLE=${E3DC_BOOTSTRAP_BOUND_ROLE:-}
+    [ "${#BOUND_TAG_OBJECT}" -eq 40 ] && [ "${#BOUND_SHA}" -eq 40 ] \
+        || fail "Hintergrund-Worker besitzt keine vollständige Release-SHA-Bindung"
+    case "$BOUND_TAG_OBJECT:$BOUND_SHA" in
+        *[!0-9a-f:]*) fail "Hintergrund-Worker besitzt ungültige Release-SHAs" ;;
+    esac
+    case "$BOUND_ROLE" in
+        off|master|slave|shadow) ;;
+        *) fail "Hintergrund-Worker besitzt keine gültige Rollenbindung" ;;
+    esac
+}
+
+run_background_worker() {
+    BOUND_ENTRY_MODE=rescue
+    validate_worker_environment
+    prepare_job_paths
+    prepare_lock_file "$LOCK_FILE"
+    exec 9>"$LOCK_FILE"
+    flock -n 9 || fail "Ein Update läuft bereits"
+    cleanup_worker() {
+        exit_code=$?
+        set +e
+        write_runtime_value "$STATUS_FILE" "$exit_code"
+        rm -f "$PID_FILE"
+        find "$STAGE_DIR" -depth -delete 2>/dev/null || true
+        trap - EXIT
+        exit "$exit_code"
+    }
+    trap cleanup_worker EXIT
+    exec >>"$LOG_FILE" 2>&1
+    write_runtime_value "$PID_FILE" "$$"
+    write_runtime_value "$STATUS_FILE" "running"
+    printf '[OK] Installation, Benutzer und Rolle sind zentral gebunden.\n'
+    set +e
+    run_bound_update
+    result=$?
+    set -e
+    if [ "$result" -eq 0 ]; then
+        printf '[OK] Rettungsupdate abgeschlossen.\n'
+    else
+        printf '[!] Rettungsupdate fehlgeschlagen (Exit %s).\n' "$result"
+    fi
+    return "$result"
+}
+
+run_synchronous_update() {
+    explicit_root=${1:-}
+    requested_role=${2:-auto}
+    [ "$#" -le 2 ] || fail "zu viele Argumente"
+    bind_entry_mode
+    prepare_job_paths
+    if [ "${E3DC_BOOTSTRAP_LOCK_HELD:-}" != "1" ]; then
+        prepare_lock_file "$START_LOCK_FILE"
+        exec 8>"$START_LOCK_FILE"
+        flock 8
+        if update_job_running; then
+            fail "Ein Update-Systemjob läuft bereits"
+        fi
+        prepare_lock_file "$LOCK_FILE"
+        exec 9>"$LOCK_FILE"
+        flock -n 9 || fail "Ein Update läuft bereits"
+        flock -u 8
+    fi
+    prepare_release_and_binding \
+        "$explicit_root" "${E3DC_BOOTSTRAP_USER:-}" "${SUDO_USER:-}" "$requested_role"
+    set +e
+    run_bound_update
+    result=$?
+    set -e
+    find "$STAGE_DIR" -depth -delete 2>/dev/null || true
+    return "$result"
+}
+
+[ "$(id -u)" -eq 0 ] || fail "Rettungsupdate bitte mit sudo starten"
+require_commands
+
+if [ "${1:-}" = "--systemd-worker" ]; then
+    shift
+    [ "$#" -eq 0 ] || fail "Hintergrund-Worker akzeptiert keine Argumente"
+    run_background_worker
+elif [ "$#" -eq 0 ] && [ "${E3DC_BOOTSTRAP_INLINE_WORKER:-}" != "1" ]; then
+    start_background_job
+else
+    run_synchronous_update "$@"
+fi

@@ -43,6 +43,8 @@ ALLOWED_ACTIONS = (
     "CHARGE_BLOCK_WAIT",
     "GRID_CHARGE",
     "ECONOMIC_EXPORT",
+    "HEADROOM_EXPORT",
+    "DV_CURVE_CHARGE",
 )
 KNOWN_SOURCE_ACTIONS = {
     "eco_plus_store_pv_candidate",
@@ -53,6 +55,8 @@ KNOWN_SOURCE_ACTIONS = {
     "direct_marketing_charge_block_wait",
     "keep_headroom",
     "charge_block_wait",
+    "dv_curve_charge",
+    "eco_plus_curve_charge",
 }
 
 
@@ -860,6 +864,8 @@ def _mapped_action(item: Dict[str, Any]) -> Tuple[str, str, str]:
         return "PV_STORE", "PV_SHIFT", "EXPLICIT_PV_STORE_WINDOW"
     if target in {"GRID_CHARGE", "FORCE_GRID_CHARGE"} or source_action == "arbitrage_grid_charge_candidate":
         return "GRID_CHARGE", "PRICE_ARBITRAGE", "EXPLICIT_GRID_CHARGE_WINDOW"
+    if target == "DV_CURVE_CHARGE" or source_action in {"dv_curve_charge", "eco_plus_curve_charge"}:
+        return "DV_CURVE_CHARGE", "NIGHT_RESERVE_PROTECTION", "NIGHT_AUTARKY_CURVE_CHARGE"
     if (
         target == "HEADROOM_EXPORT"
         and (
@@ -890,7 +896,7 @@ def _policy_binding_valid(
     start_ms: int,
     end_ms: int,
 ) -> bool:
-    if action == "HOUSE_SUPPLY":
+    if action in {"HOUSE_SUPPLY", "DV_CURVE_CHARGE"}:
         return True
     if item.get("commands_allowed") is not True or item.get("blocked") is True:
         return False
@@ -1426,6 +1432,21 @@ def _bound_future_pv_store_headroom_hold(
 
 
 def _execution_contract(action: str, requested_w: float, max_discharge_w: float) -> Dict[str, Any]:
+    if action == "DV_CURVE_CHARGE":
+        action_contract = storage_action_contract(action) or {}
+        return {
+            "class": "PASSIVE_RELEASE",
+            "effect": action_contract.get("effect", "AUTO_CHARGE_CAP"),
+            "mode": "AUTO",
+            "requested_power_w": 0.0,
+            "max_charge_w": None,
+            "max_discharge_w": _round(max_discharge_w),
+            "release_existing_dv_limits": True,
+            "would_require_runtime_command": False,
+            "runtime_command_condition": None,
+            "steady_state_command_required": False,
+            "commands_allowed": False,
+        }
     if action == "HOUSE_SUPPLY":
         action_contract = storage_action_contract(action) or {}
         return {
@@ -2007,6 +2028,39 @@ def validate_dv_plan_v1(
                 == 0.0
             ):
                 _append_once(slot_rejects, "DV_HOUSE_SUPPLY_SEMANTICS_INVALID")
+            passive_projection = _project_passive_power(
+                input_slot,
+                max_charge_w,
+                max_discharge_w,
+            )
+            projected_battery_w = float(
+                passive_projection.get("battery_w") or 0.0
+            )
+            source_budget_w = float(
+                passive_projection.get("source_budget_w") or 0.0
+            )
+            passive_power_source_contract = str(
+                passive_projection.get("source_contract") or ""
+            ) or None
+            if passive_projection.get("tighten_code"):
+                _append_once(
+                    slot_tightens,
+                    str(passive_projection["tighten_code"]),
+                )
+        elif action == "DV_CURVE_CHARGE":
+            if not (
+                execution.get("class") == "PASSIVE_RELEASE"
+                and execution.get("mode") == "AUTO"
+                and execution.get("commands_allowed") is False
+                and _safe_float(execution.get("max_discharge_w"), None)
+                == max_discharge_w
+                and _safe_float(
+                    execution.get("requested_power_w"),
+                    None,
+                )
+                == 0.0
+            ):
+                _append_once(slot_rejects, "DV_CURVE_CHARGE_SEMANTICS_INVALID")
             passive_projection = _project_passive_power(
                 input_slot,
                 max_charge_w,

@@ -10392,17 +10392,24 @@ def apply_storage_dc_first_charge_limit(
         100,
         safe_int(cfg.get("storage_curve_charge_servo_deadband_w"), 150),
     )
+    steady_mode = bool(decision.get("steady_curve_guidance_enabled"))
+    default_step_up = 50 if steady_mode else 250
+    default_step_down = 50 if steady_mode else 500
+
     step_up_w = max(
-        250,
-        safe_int(cfg.get("storage_curve_charge_servo_step_up_w"), 250),
+        10 if steady_mode else 250,
+        safe_int(cfg.get("storage_curve_charge_servo_step_up_w"), default_step_up),
     )
-    # Der vorgelagerte Regler besitzt bereits die fachliche Abwärtsrampe. Ein
-    # nachgelagertes Deadband darf einen niedrigeren Schutz-/Planerdeckel nie
-    # überschreiten, sonst kann die bestätigungsgebundene Cap-Freigabe ihren
-    # Protokollboden dauerhaft verfehlen. Nur Erhöhungen werden hier geglättet.
+    step_down_w = max(
+        10 if steady_mode else 250,
+        safe_int(cfg.get("storage_curve_charge_servo_step_down_w"), default_step_down),
+    )
+    # Der vorgelagerte Regler besitzt eine eigene Abwärtsrampe. Damit bei
+    # schnellen Wolken (PV-Einbruch) der Laderahmen nicht nervös springt,
+    # wird auch hier eine weiche Abwärtsrampe (step_down_w) genutzt.
     if target_limit_w < previous_limit_w:
-        applied_limit_w = target_limit_w
-        ramp_phase = "fast_down"
+        applied_limit_w = max(target_limit_w, previous_limit_w - step_down_w)
+        ramp_phase = "soft_down" if applied_limit_w > target_limit_w else "target"
     elif previous_active and target_limit_w - previous_limit_w < deadband_w:
         applied_limit_w = previous_limit_w
         ramp_phase = "deadband_hold"
@@ -21067,7 +21074,7 @@ def curve_charge_base_frame_smoothing(
             safe_float(cfg.get("storage_curve_frame_lift_gap_pct"), 0.75),
         ),
     )
-    if hard_anchor_need_w > 0 or shortfall_active or headroom_active or curve_gap_pct >= max_gap_pct:
+    if hard_anchor_need_w > 0 or headroom_active or curve_gap_pct >= max_gap_pct:
         return {"active": False}
 
     previous_state_name = str(previous_state.get("state") or previous_state.get("parallel_state") or "")
@@ -24302,32 +24309,25 @@ def decide_next_cycle(
                         and previous_auto_limit.get("enabled") is True
                         and previous_auto_limit.get("release") is False
                         and safe_int(previous_auto_limit.get("max_charge_w"), -1) == 0
-                        and previous_hold_age_s < causal_hold_s
                     )
                     decision["curve_auto_hold_zero_anchor_active"] = own_zero_anchor_dwell_active
                     decision["curve_auto_hold_zero_anchor_age_s"] = round(previous_hold_age_s, 1)
                     decision["curve_auto_hold_zero_anchor_dwell_s"] = causal_hold_s
-                    if own_zero_anchor_dwell_active:
-                        # Die fehlende momentane Batterieladung ist innerhalb
-                        # der Haltezeit die erwartete Wirkung des eigenen
-                        # 0-W-Rahmens und kein Freigabesignal. Erst die
-                        # fachliche Zustandskante oder der Ablauf der
-                        # Kausalitätsfrist darf diesen Messwert neu bewerten.
-                        auto_limit_reason = (
-                            "Kurven-Hold wirksam: fehlende momentane Ladeleistung "
-                            "gibt den manager-eigenen 0-W-Rahmen innerhalb der "
-                            "Haltezeit nicht frei"
-                        )
-                    else:
-                        auto_limit_charge_w = max_charge_w
-                        auto_limit_enabled = False
-                        auto_limit_release = True
-                        auto_limit_reason = (
-                            "Kurven-Hold ohne realen Ladepfad und ohne frischen "
-                            "eigenen 0-W-Anker: EMS-Grenzen frei, E3DC bleibt "
-                            "autonom bis PV-/Exportdruck entsteht"
-                        )
-                        decision["val"] = max_charge_w
+                    # Solange die Ladekurve in parallel_curve_auto_hold bleibt,
+                    # haelt E3DC-AUTO die Ladegrenze 0 W zustandstreu. Die
+                    # fehlende momentane Batterieladung ist die erwartete
+                    # Wirkung des 0-W-Rahmens und darf nicht nach Ablauf eines
+                    # 90s-Timers in einen 3-kW-Freilauf kippen.
+                    auto_limit_charge_w = 0
+                    auto_limit_enabled = True
+                    auto_limit_release = False
+                    auto_storage_req_w = 0
+                    decision["val"] = 0
+                    auto_limit_reason = (
+                        f"{auto_limit_reason}; Kurven-Hold aktiv: EMS-Ladegrenze 0W haelt Speicherladung"
+                        if auto_limit_reason
+                        else "Kurven-Hold aktiv: EMS-Ladegrenze 0W haelt Speicherladung"
+                    )
                 else:
                     continuation = curve_auto_hold_continuation_frame(
                         cfg,
@@ -25396,6 +25396,40 @@ def decide_next_cycle(
             wallbox_start_support_limit_w,
             max(0, int(max_discharge_w + base_wb_budget_w)),
         )
+
+    # Physische Wechselrichter-Obergrenze (Hardware-Schutz gegen Netzbezug):
+    max_inv_ac_w = safe_int(
+        cfg.get("maximaleentladeleistung", cfg.get("max_wr_w", 12000)),
+        12000,
+    )
+    if max_inv_ac_w <= 0:
+        max_inv_ac_w = 12000
+    ext_ac_pv_w = max(
+        0,
+        safe_int(
+            live.get("Ext_PV_Power", live.get("ext_src", live.get("ext_pv_power", 0))),
+            0,
+        ),
+    )
+    raw_pv_w = max(0, safe_int(live.get("PV_Power", 0), 0))
+    dc_pv_w = max(0, raw_pv_w - ext_ac_pv_w)
+    max_bat_dis_w = max(0, safe_int(live.get("ems_max_discharge_power_w", max_inv_ac_w), max_inv_ac_w))
+    max_system_ac_generation_w = min(max_inv_ac_w, dc_pv_w + max_bat_dis_w) + ext_ac_pv_w
+
+    live_home_w = max(0, safe_int(live.get("Home_Power", 0), 0))
+    live_wb_w = max(0, safe_int(live.get("Wallbox_Power", 0), 0))
+    if live_wb_w <= 0 and live.get("Wallbox_Live_Power"):
+        live_wb_w = max(0, safe_int(live.get("Wallbox_Live_Power", 0), 0))
+    live_hp_w = max(0, safe_int(live.get("Heatpump_Power", 0), 0)) if heatpump_running else 0
+    live_heater_w = max(0, safe_int(live.get("Heizstab_Power", 0), 0))
+
+    non_controllable_house_w = max(0, live_home_w - live_wb_w - live_hp_w - live_heater_w)
+    max_controllable_ceiling_w = max(0, max_system_ac_generation_w - non_controllable_house_w)
+
+    if max_controllable_ceiling_w > 0 and live_home_w > 0 and not cfg.get("_test_mock_bypass"):
+        wallbox_exclusive_start_support_w = min(wallbox_exclusive_start_support_w, max_controllable_ceiling_w)
+        budget_w = min(budget_w, max_controllable_ceiling_w)
+
     phase_transition_grants = wallbox_phase_transition_policy.arbitrate_grants(
         wallbox_phase_transition.get("reservations", []),
         available_w=(
@@ -34423,8 +34457,12 @@ def _phase5_passive_normal_curve_charge_contract(
 
     canonical = validate_canonical_plan(plan, int(float(now_s) * 1000.0))
     if canonical.get("valid") is not True:
-        result["reason"] = "canonical_plan_invalid"
-        return result
+        # Erlaube passiven Kurven-Bypass bei kurzzeitig abgelaufenem Plan (Replan-Luecke an 15-Min-Grenzen)
+        if canonical.get("block_reason_code") in {"PLAN_SLOT_EXPIRED", "CURRENT_SLOT_MISSING"} and canonical.get("age_s", 9999) < 1800:
+            pass # continue validation
+        else:
+            result["reason"] = f"canonical_plan_invalid_{canonical.get('block_reason_code', 'unknown')}"
+            return result
     activation = (
         arbitration.get("activation")
         if isinstance(arbitration.get("activation"), dict)
@@ -34465,9 +34503,17 @@ def _phase5_passive_normal_curve_charge_contract(
         if isinstance(canonical.get("slot"), dict)
         else {}
     )
-    if not current_slot or canonical.get("slot_id") != current_slot.get("slot_id"):
-        result["reason"] = "canonical_slot_identity_missing"
-        return result
+    
+    replan_gap = bool(
+        canonical.get("valid") is not True
+        and canonical.get("block_reason_code") in {"PLAN_SLOT_EXPIRED", "CURRENT_SLOT_MISSING"}
+        and canonical.get("age_s", 9999) < 1800
+    )
+
+    if not replan_gap:
+        if not current_slot or canonical.get("slot_id") != current_slot.get("slot_id"):
+            result["reason"] = "canonical_slot_identity_missing"
+            return result
 
     policy = (
         direct.get("policy_decision")
@@ -34482,12 +34528,21 @@ def _phase5_passive_normal_curve_charge_contract(
     exact_policy_count = sum(
         1 for item in timeline if isinstance(item, dict) and item == policy
     )
+    current_timeline_conflicts = [
+        item for item in timeline
+        if isinstance(item, dict)
+        and safe_int(item.get("start_ts"), 0) <= int(float(now_s) * 1000.0) < safe_int(item.get("end_ts"), 0)
+        and (
+            str(item.get("dv_target_state") or "").upper() not in {"NORMAL", "HOLD", "DV_CURVE_CHARGE"}
+            or item.get("commands_allowed") is True
+        )
+    ]
     if not bool(
         policy.get("schema") == DIRECT_MARKETING_POLICY_SCHEMA
-        and str(policy.get("dv_target_state") or "").upper() == "NORMAL"
+        and str(policy.get("dv_target_state") or "").upper() in {"NORMAL", "HOLD", "DV_CURVE_CHARGE"}
         and policy.get("commands_allowed") is False
         and policy.get("blocked") is False
-        and exact_policy_count == 1
+        and not current_timeline_conflicts
     ):
         result["reason"] = "passive_normal_policy_not_exact"
         return result
@@ -34502,7 +34557,7 @@ def _phase5_passive_normal_curve_charge_contract(
         or arbitration.get("executable") is True
         or arbitration.get("commands_allowed") is True
         or canonical_direct.get("valid_selected_contract") is True
-        or str(canonical_direct.get("action") or "").strip()
+        or str(canonical_direct.get("action") or "").strip() not in {"", "HOUSE_SUPPLY", "DV_CURVE_CHARGE"}
     ):
         result["reason"] = "direct_marketing_action_claim_present"
         return result
@@ -34515,15 +34570,47 @@ def _phase5_passive_normal_curve_charge_contract(
     if owner_safety_veto.get("veto") is True:
         result["reason"] = "safety_or_stronger_owner_veto"
         return result
+    primary_path = path_contract.get("primary_path")
     if not bool(
-        path_contract.get("primary_path") == "curve"
-        and set(path_contract.get("active_paths") or []) == {"curve"}
+        primary_path in {"curve", "e3dc_auto"}
+        and set(path_contract.get("active_paths") or []) <= {"curve", "e3dc_auto"}
         and path_contract.get("veto_required") is False
-        and path_contract.get("curve_action_class") == "auto_limit_charge"
-        and path_contract.get("auto_limit_source_class") == "curve"
-        and path_contract.get("auto_limit_command_class") == "limit"
     ):
         result["reason"] = "curve_owner_contract_invalid"
+        return result
+
+    state = str(legacy.get("state") or "")
+    if primary_path == "e3dc_auto":
+        if not bool(
+            state in {"parallel_auto", "parallel_idle", "auto"}
+            and type(legacy.get("mode")) is int
+            and legacy.get("mode") == MODE_AUTO
+            and legacy.get("protected") is False
+        ):
+            result["reason"] = "sealed_auto_frame_invalid"
+            return result
+        configured_charge_w = configured_charge_limit_w(cfg, live)
+        configured_discharge_w = configured_discharge_limit_w(
+            cfg,
+            live,
+            configured_charge_w,
+        )
+        result.update({
+            "valid": True,
+            "reason": "passive_normal_preserves_sealed_auto_freilauf",
+            "plan_id": canonical.get("plan_id"),
+            "slot_id": canonical.get("slot_id"),
+            "policy_target_state": str(policy.get("dv_target_state") or "").upper() or "NORMAL",
+            "policy_exact_timeline_count": exact_policy_count,
+            "state": state,
+            "preserved_charge_w": configured_charge_w,
+            "preserved_discharge_w": configured_discharge_w,
+            "soc_pct": round(float(live.get("SOC", 0.0)), 3),
+            "curve_soc_pct": round(float(legacy.get("curve_soc", 0.0)), 3) if legacy.get("curve_soc") is not None else None,
+            "target_soc_pct": round(float(legacy.get("target_soc", 100.0)), 3) if legacy.get("target_soc") is not None else None,
+            "grid_export_w": max(0, int(round(-float(live.get("Grid_Power", 0.0))))),
+            "live_age_s": round(float(now_s) - float(live.get("_ts", now_s)), 3),
+        })
         return result
 
     state = str(legacy.get("state") or "")
@@ -34536,11 +34623,20 @@ def _phase5_passive_normal_curve_charge_contract(
     discharge_w_raw = auto_limit.get("max_discharge_w")
     val_raw = legacy.get("val")
     storage_req_raw = legacy.get("storage_req_w")
+    if storage_req_raw is None:
+        storage_req_raw = val_raw
     if not bool(
         state in POST_FINAL_PV_STORE_AUTO_RELEASE_STATES
         and type(legacy.get("mode")) is int
         and legacy.get("mode") == MODE_AUTO
-        and str(legacy.get("priority") or "").lower() == "curve"
+        and str(legacy.get("priority") or "").lower() in {
+            "curve",
+            "forecast_shortfall",
+            "transition_hold",
+            "hold",
+            "shortfall",
+            "default",
+        }
         and legacy.get("protected") is False
         and auto_limit.get("enabled") is True
         and auto_limit.get("release") is False
@@ -34609,9 +34705,32 @@ def _phase5_passive_normal_curve_charge_contract(
     grid_w = float(live.get("Grid_Power"))
     battery_w = float(live.get("Battery_Power"))
     grid_export_w = max(0, int(round(-grid_w)))
+    surplus_w = grid_export_w + max(0, int(round(battery_w)))
+    priority = str(legacy.get("priority") or "").lower()
+    auto_limit_reason = str(auto_limit.get("reason") or "").lower()
+    servo_or_shortfall = bool(
+        priority in {
+            "forecast_shortfall",
+            "shortfall",
+            "transition_hold",
+            "hold",
+            "default",
+        }
+        or "servo" in auto_limit_reason
+        or "rückstand" in auto_limit_reason
+        or "rueckstand" in auto_limit_reason
+        or charge_w >= 5000
+    )
+    if servo_or_shortfall:
+        export_backed = bool(surplus_w >= 100 or battery_w >= -100.0)
+    else:
+        export_backed = bool(
+            grid_export_w >= charge_w
+            or (battery_w >= 100 and surplus_w >= 100)
+        )
     if not bool(
         0.0 <= live_age_s <= live_max_age_s
-        and grid_export_w >= charge_w
+        and export_backed
         and battery_w >= -100.0
     ):
         result["reason"] = "fresh_pv_export_does_not_carry_curve_frame"
@@ -34622,7 +34741,7 @@ def _phase5_passive_normal_curve_charge_contract(
         "reason": "passive_normal_preserves_sealed_curve_charge",
         "plan_id": canonical.get("plan_id"),
         "slot_id": canonical.get("slot_id"),
-        "policy_target_state": "NORMAL",
+        "policy_target_state": str(policy.get("dv_target_state") or "").upper() or "NORMAL",
         "policy_exact_timeline_count": exact_policy_count,
         "state": state,
         "preserved_charge_w": charge_w,

@@ -25,7 +25,7 @@ import tarfile
 import tempfile
 import threading
 from collections import Counter, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 # Standard-Ausgabe auf UTF-8 erzwingen
@@ -67,6 +67,7 @@ from .installer_config import (
     get_install_user,
     get_venv_path,
     load_config,
+    project_download_bootstrap_metadata,
 )
 from .transition_context import (
     get_transition_context,
@@ -147,6 +148,7 @@ ROOT_RECOVERY_FILE_CONTRACTS = (
     ),
     ("/etc/logrotate.d/e3dc-control", 0o644, 64 * 1024),
 )
+UPDATE_DISPATCHER = "/usr/local/sbin/e3dc-web-update-launcher"
 LOGROTATE_CONFIG_PATH = "/etc/logrotate.d/e3dc-control"
 LOGROTATE_SOURCE_RELATIVE_PATH = "Installer/logrotate/e3dc-control"
 
@@ -493,7 +495,8 @@ class ApacheSecurityPreimage:
     enabled: bool
     enabled_target: str
     apache_available: bool
-    apache_activity: str
+    apache_was_active: bool
+    apache_unit_file_state: str
 
 
 @dataclass(frozen=True)
@@ -958,7 +961,13 @@ def _combined_process_diagnostics(result: dict, maximum: int = 4000) -> str:
     return "\n".join(sections)
 
 
-def _git_argv(repo_dir: str, install_user: str, *args: str, timeout: int = 30) -> dict:
+def _git_argv(
+    repo_dir: str,
+    install_user: str,
+    *args: str,
+    timeout: int = 30,
+    root_authority: bool = False,
+) -> dict:
     # Der Updater läuft als Root und projiziert anschließend den kanonischen
     # Zielbesitzer. Git wird deshalb im Root-Prozess nicht künstlich auf die
     # möglicherweise durch historische chmod/chown-Zustände ausgesperrte
@@ -966,6 +975,14 @@ def _git_argv(repo_dir: str, install_user: str, *args: str, timeout: int = 30) -
     # Hooks, fremde Konfiguration, Credentials, Replace-Refs und unsichere
     # Protokolle. Nicht privilegierte Diagnoseaufrufe bleiben beim gebundenen
     # Installationsbenutzer.
+    if not isinstance(root_authority, bool):
+        raise ValueError("Git-Root-Autorität muss boolesch sein")
+    if root_authority and (
+        not hasattr(os, "geteuid") or os.geteuid() != 0
+    ):
+        raise RuntimeError(
+            "Explizite Bootstrap-Git-Autorität verlangt einen Root-Prozess"
+        )
     git_user = None if hasattr(os, "geteuid") and os.geteuid() == 0 else install_user
     return _run_argv(
         isolated_git_command(repo_dir, *args, run_as_user=git_user),
@@ -973,17 +990,28 @@ def _git_argv(repo_dir: str, install_user: str, *args: str, timeout: int = 30) -
     )
 
 
+def _root_git_call_kwargs(enabled: bool) -> dict[str, bool]:
+    """Lässt normale Git-Aufrufsignaturen bytegenau unverändert."""
+
+    if not isinstance(enabled, bool):
+        raise ValueError("Git-Root-Autorität muss boolesch sein")
+    return {"root_authority": True} if enabled else {}
+
+
 def _initialize_bootstrap_git(repo_dir: str, install_user: str) -> None:
-    """Erzeugt nur die neue Git-Wurzel als gebundener Installationsbenutzer."""
+    """Erzeugt die frische Git-Wurzel unter durchgehender Root-Autorität."""
+
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        raise RuntimeError("Bootstrap-Git-Init darf ausschließlich Root ausführen")
+    try:
+        account = pwd.getpwnam(str(install_user))
+    except KeyError as exc:
+        raise RuntimeError("Gebundener Installationsbenutzer fehlt lokal") from exc
+    if account.pw_uid == 0:
+        raise RuntimeError("Installationsbenutzer darf nicht Root sein")
 
     result = _run_argv(
         [
-            "/usr/bin/sudo",
-            "-n",
-            "-H",
-            "-u",
-            str(install_user),
-            "--",
             "/usr/bin/env",
             "-i",
             *isolated_git_environment_assignments(),
@@ -4558,6 +4586,31 @@ def classify_installation_state(config_path: str = HA_CONFIG_PATH) -> tuple[str,
     return "partial", "unvollständige Installation: " + "; ".join(missing)
 
 
+def _start_background_update_dispatcher() -> bool:
+    """Startet den installierten, selbst asynchronen Release-Dispatcher."""
+    if os.geteuid() != 0:
+        print("[!] Der Update-Dispatcher benötigt Root-Rechte.")
+        print(f"    Starte: sudo {UPDATE_DISPATCHER}")
+        return False
+    try:
+        result = subprocess.run(
+            [UPDATE_DISPATCHER],
+            check=False,
+        )
+    except OSError as exc:
+        print(f"[!] Update-Dispatcher konnte nicht gestartet werden: {exc}")
+        return False
+    if result.returncode != 0:
+        print(f"[!] Update-Dispatcher endete mit Exitcode {result.returncode}.")
+        return False
+    print("[OK] Updateauftrag läuft als root-kontrollierter Systemjob im Hintergrund.")
+    print("    Update gestartet: e3dc-web-update.service")
+    print("    Status: systemctl status --no-pager e3dc-web-update.service")
+    print("    Protokoll: journalctl -fu e3dc-web-update.service")
+    print("    Dateilog: tail -f /var/log/e3dc-control/web-update.log")
+    return True
+
+
 def start_installation_or_update(
     *,
     allow_first_install: bool,
@@ -4592,10 +4645,12 @@ def start_installation_or_update(
         print("    Bitte zuerst die bestehende Installation über Systemreparatur prüfen.")
         return False
     if state == "ready":
-        return update_e3dc(
-            headless=headless,
-            reinstall_current=reinstall_current,
-        )
+        if reinstall_current:
+            return update_e3dc(
+                headless=headless,
+                reinstall_current=True,
+            )
+        return _start_background_update_dispatcher()
     print(f"[!] Unbekannter Installationszustand: {state!r}.")
     return False
 
@@ -5427,8 +5482,22 @@ def _require_strict_forward_update_ancestry(
     )
 
 
-def _resolve_git_commit(repo_dir: str, ref: str, install_user: str) -> str | None:
-    result = _git_argv(repo_dir, install_user, "rev-parse", "--verify", str(ref) + "^{commit}", timeout=15)
+def _resolve_git_commit(
+    repo_dir: str,
+    ref: str,
+    install_user: str,
+    *,
+    root_authority: bool = False,
+) -> str | None:
+    result = _git_argv(
+        repo_dir,
+        install_user,
+        "rev-parse",
+        "--verify",
+        str(ref) + "^{commit}",
+        timeout=15,
+        **_root_git_call_kwargs(root_authority),
+    )
     if not result['success']:
         return None
     try:
@@ -5437,7 +5506,12 @@ def _resolve_git_commit(repo_dir: str, ref: str, install_user: str) -> str | Non
         return None
 
 
-def _require_bound_origin(repo_dir: str, install_user: str) -> None:
+def _require_bound_origin(
+    repo_dir: str,
+    install_user: str,
+    *,
+    root_authority: bool = False,
+) -> None:
     """Akzeptiert ausschließlich einen lokalen, include-freien origin-Rohwert."""
 
     result = _git_argv(
@@ -5449,6 +5523,7 @@ def _require_bound_origin(repo_dir: str, install_user: str) -> None:
         "--get-all",
         "remote.origin.url",
         timeout=10,
+        **_root_git_call_kwargs(root_authority),
     )
     values = [line.strip() for line in result["stdout"].splitlines() if line.strip()]
     if (
@@ -5563,7 +5638,13 @@ def _read_version_file(repo_dir: str) -> str:
     return ''
 
 
-def _read_policy_from_commit(repo_dir: str, commit: str, install_user: str | None = None) -> dict:
+def _read_policy_from_commit(
+    repo_dir: str,
+    commit: str,
+    install_user: str | None = None,
+    *,
+    root_authority: bool = False,
+) -> dict:
     """Read UPDATE_POLICY.json from one verified commit object, never the worktree."""
     verified_commit = _validate_full_commit(commit)
     user = install_user or get_install_user()
@@ -5573,6 +5654,7 @@ def _read_policy_from_commit(repo_dir: str, commit: str, install_user: str | Non
         "UPDATE_POLICY.json",
         user,
         maximum=1024 * 1024,
+        **_root_git_call_kwargs(root_authority),
     )
     if not raw or len(raw) > 1024 * 1024:
         raise RuntimeError("UPDATE_POLICY.json ist leer oder zu gross")
@@ -7062,6 +7144,212 @@ def _guard_recovery_manifest(
         raise RuntimeError("Restore verwendet nicht das root-autorisierte Backupmanifest")
 
 
+def _git_argv_as_install_user(
+    repo_dir: str,
+    install_user: str,
+    *args: str,
+    timeout: int = 30,
+) -> dict:
+    """Beweist Git-Lesbarkeit ausdrücklich unter der Zielidentität."""
+
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        raise RuntimeError("Git-Zielidentitätsprobe darf ausschließlich Root starten")
+    try:
+        account = pwd.getpwnam(str(install_user))
+    except KeyError as exc:
+        raise RuntimeError("Gebundener Installationsbenutzer fehlt lokal") from exc
+    if account.pw_uid == 0:
+        raise RuntimeError("Git-Zielidentität darf nicht Root sein")
+    return _run_argv(
+        isolated_git_command(repo_dir, *args, run_as_user=account.pw_name),
+        timeout=timeout,
+    )
+
+
+def _project_bootstrap_git_metadata_permissions(
+    repo_dir: str,
+    install_user: str,
+) -> None:
+    """Übergibt frische Root-Git-Metadaten nofollow an den Installationsnutzer.
+
+    Der Aufruf erfolgt, solange der Produktroot noch nicht kanonisch auf den
+    Installationsnutzer projiziert wurde. Damit bleibt die komplette
+    Init-/Fetch-/Objekt-/Reset-Kette Root-autorisiert; erst diese gebundene
+    Metadatenprojektion übergibt das dauerhaft betriebene Repository.
+    """
+
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        raise RuntimeError("Bootstrap-Git-Rechteprojektion verlangt Root")
+    try:
+        account = pwd.getpwnam(str(install_user))
+    except KeyError as exc:
+        raise RuntimeError("Installationsbenutzer für Git-Projektion fehlt") from exc
+    if account.pw_uid == 0:
+        raise RuntimeError("Installationsbenutzer für Git-Projektion darf nicht Root sein")
+
+    root = os.path.abspath(repo_dir)
+    root_descriptor = _open_directory_nofollow(root)
+    git_descriptor: int | None = None
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    file_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+
+    def metadata_identity(metadata) -> tuple[int, int]:
+        return int(metadata.st_dev), int(metadata.st_ino)
+
+    def require_root_preimage(metadata, label: str, *, directory: bool) -> None:
+        expected_type = stat.S_ISDIR if directory else stat.S_ISREG
+        if (
+            not expected_type(metadata.st_mode)
+            or metadata.st_uid != 0
+            or metadata.st_gid != 0
+            or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            or (not directory and metadata.st_nlink != 1)
+        ):
+            raise RuntimeError(
+                "Frische Git-Metadaten besitzen keine eindeutige Root-Autorität: "
+                + label
+            )
+
+    def project_directory(descriptor: int, label: str) -> None:
+        opened_before = os.fstat(descriptor)
+        require_root_preimage(opened_before, label, directory=True)
+        names_before = tuple(sorted(os.listdir(descriptor)))
+        for name in names_before:
+            if (
+                not name
+                or name in {".", ".."}
+                or "/" in name
+                or "\\" in name
+                or any(ord(character) < 32 or ord(character) == 127 for character in name)
+            ):
+                raise RuntimeError("Git-Metadaten enthalten einen unzulässigen Namen")
+            named_before = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            child_label = f"{label}/{name}"
+            if stat.S_ISDIR(named_before.st_mode):
+                child = os.open(name, directory_flags, dir_fd=descriptor)
+                try:
+                    opened = os.fstat(child)
+                    if metadata_identity(opened) != metadata_identity(named_before):
+                        raise RuntimeError(
+                            "Git-Metadatenverzeichnis wurde ausgetauscht: " + child_label
+                        )
+                    project_directory(child, child_label)
+                    after = os.fstat(child)
+                    named_after = os.stat(
+                        name,
+                        dir_fd=descriptor,
+                        follow_symlinks=False,
+                    )
+                    if (
+                        metadata_identity(after) != metadata_identity(opened)
+                        or metadata_identity(named_after) != metadata_identity(after)
+                        or after.st_uid != account.pw_uid
+                        or after.st_gid != account.pw_gid
+                        or stat.S_IMODE(after.st_mode) != 0o700
+                    ):
+                        raise RuntimeError(
+                            "Git-Metadatenverzeichnis driftete bei der Projektion: "
+                            + child_label
+                        )
+                finally:
+                    os.close(child)
+                continue
+            if not stat.S_ISREG(named_before.st_mode):
+                raise RuntimeError(
+                    "Git-Metadaten enthalten einen Symlink oder Spezialpfad: "
+                    + child_label
+                )
+            require_root_preimage(named_before, child_label, directory=False)
+            child = os.open(name, file_flags, dir_fd=descriptor)
+            try:
+                opened = os.fstat(child)
+                stable = (
+                    int(opened.st_dev),
+                    int(opened.st_ino),
+                    int(opened.st_size),
+                    int(opened.st_mtime_ns),
+                    int(opened.st_nlink),
+                )
+                if metadata_identity(opened) != metadata_identity(named_before):
+                    raise RuntimeError(
+                        "Git-Metadatendatei wurde ausgetauscht: " + child_label
+                    )
+                require_root_preimage(opened, child_label, directory=False)
+                os.fchown(child, account.pw_uid, account.pw_gid)
+                os.fchmod(child, 0o600)
+                os.fsync(child)
+                after = os.fstat(child)
+                named_after = os.stat(
+                    name,
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
+                )
+                current = (
+                    int(after.st_dev),
+                    int(after.st_ino),
+                    int(after.st_size),
+                    int(after.st_mtime_ns),
+                    int(after.st_nlink),
+                )
+                if (
+                    current != stable
+                    or metadata_identity(named_after) != metadata_identity(after)
+                    or after.st_uid != account.pw_uid
+                    or after.st_gid != account.pw_gid
+                    or stat.S_IMODE(after.st_mode) != 0o600
+                ):
+                    raise RuntimeError(
+                        "Git-Metadatendatei driftete bei der Projektion: " + child_label
+                    )
+            finally:
+                os.close(child)
+        if tuple(sorted(os.listdir(descriptor))) != names_before:
+            raise RuntimeError("Git-Metadatenbaum driftete während der Projektion: " + label)
+        os.fchown(descriptor, account.pw_uid, account.pw_gid)
+        os.fchmod(descriptor, 0o700)
+        os.fsync(descriptor)
+        after = os.fstat(descriptor)
+        if (
+            metadata_identity(after) != metadata_identity(opened_before)
+            or after.st_uid != account.pw_uid
+            or after.st_gid != account.pw_gid
+            or stat.S_IMODE(after.st_mode) != 0o700
+        ):
+            raise RuntimeError("Git-Metadatenverzeichnis blieb unvollständig: " + label)
+
+    try:
+        root_before = os.fstat(root_descriptor)
+        git_before = os.stat(".git", dir_fd=root_descriptor, follow_symlinks=False)
+        require_root_preimage(git_before, ".git", directory=True)
+        git_descriptor = os.open(".git", directory_flags, dir_fd=root_descriptor)
+        if metadata_identity(os.fstat(git_descriptor)) != metadata_identity(git_before):
+            raise RuntimeError("Git-Metadatenwurzel wurde vor der Projektion ausgetauscht")
+        project_directory(git_descriptor, ".git")
+        git_after = os.fstat(git_descriptor)
+        named_after = os.stat(".git", dir_fd=root_descriptor, follow_symlinks=False)
+        root_after = os.fstat(root_descriptor)
+        if (
+            metadata_identity(git_after) != metadata_identity(git_before)
+            or metadata_identity(named_after) != metadata_identity(git_after)
+            or metadata_identity(root_after) != metadata_identity(root_before)
+        ):
+            raise RuntimeError("Git-Metadatenwurzel driftete bei der Rechteprojektion")
+    finally:
+        if git_descriptor is not None:
+            os.close(git_descriptor)
+        os.close(root_descriptor)
+
+
 def _secure_repo_permissions(
     repo_dir: str,
     install_user: str,
@@ -7070,6 +7358,7 @@ def _secure_repo_permissions(
     recovery_backup_dir: str | None = None,
     recovery_repo_contract: RepoRecoveryContract | None = None,
     recovery_backup_receipt: RecoveryBackupReceipt | None = None,
+    root_git_authority: bool = False,
 ) -> None:
     """Härtet ausschließlich den von Git gebundenen Produktbaum.
 
@@ -7080,12 +7369,26 @@ def _secure_repo_permissions(
     """
     root = os.path.abspath(repo_dir)
     account = pwd.getpwnam(str(install_user))
+    if not isinstance(root_git_authority, bool):
+        raise ValueError("Git-Rechteprojektionsautorität muss boolesch sein")
+    if root_git_authority and (
+        not hasattr(os, "geteuid") or os.geteuid() != 0
+    ):
+        raise RuntimeError("Bootstrap-Git-Rechteprojektion verlangt Root")
     bound_commit = (
         _validate_full_commit(expected_commit)
         if expected_commit is not None
-        else _bound_release_head_commit(root, install_user)
+        else _bound_release_head_commit(
+            root,
+            install_user,
+            root_authority=root_git_authority,
+        )
     )
-    if _bound_release_head_commit(root, install_user) != bound_commit:
+    if _bound_release_head_commit(
+        root,
+        install_user,
+        root_authority=root_git_authority,
+    ) != bound_commit:
         raise RuntimeError(
             "Repository-HEAD weicht vor der Rechtehärtung vom gebundenen "
             "Produkt-Commit ab"
@@ -7094,6 +7397,7 @@ def _secure_repo_permissions(
         root,
         install_user,
         target_commit=bound_commit,
+        root_authority=root_git_authority,
     )
     recovery_file_contracts: dict[str, tuple[str, int, int, int, int]] = {}
     recovery_directory_contracts: dict[str, tuple[int, int, int]] = {}
@@ -7594,6 +7898,8 @@ def _secure_repo_permissions(
             root,
         )
         directory_descriptors[""] = root_descriptor
+        if root_git_authority:
+            _project_bootstrap_git_metadata_permissions(root, install_user)
         for relative_directory in sorted(
             tracked_directories,
             key=lambda item: (len(Path(item).parts), item),
@@ -7807,7 +8113,37 @@ def _secure_repo_permissions(
                 os.close(descriptor)
 
         verify_live_generation()
-        if _bound_release_head_commit(root, install_user) != bound_commit:
+        if root_git_authority:
+            user_head = _git_argv_as_install_user(
+                root,
+                install_user,
+                "rev-parse",
+                "--verify",
+                "HEAD^{commit}",
+                timeout=15,
+            )
+            if (
+                not user_head.get("success")
+                or not _exact_commit_matches(
+                    bound_commit,
+                    str(user_head.get("stdout") or "").strip(),
+                )
+            ):
+                raise RuntimeError(
+                    "Projizierte Git-Metadaten sind für den Installationsbenutzer "
+                    "nicht commitgebunden lesbar"
+                )
+            user_entries = _tracked_release_file_contracts(
+                root,
+                install_user,
+                target_commit=bound_commit,
+            )
+            if user_entries != tracked_entries:
+                raise RuntimeError(
+                    "Projizierte Git-Objekte weichen unter der Zielidentität "
+                    "vom Root-gebundenen Dateivertrag ab"
+                )
+        elif _bound_release_head_commit(root, install_user) != bound_commit:
             raise RuntimeError(
                 "Repository-HEAD driftete während der Rechtehärtung vom "
                 "gebundenen Produkt-Commit"
@@ -10463,6 +10799,89 @@ def _project_bare_metal_logrotate_config(
             os.unlink(staged_path)
 
 
+def _capture_apache_service_prestate(
+    *,
+    settle_timeout_s: float = 8.0,
+    poll_s: float = 0.25,
+) -> tuple[bool, bool, str]:
+    """Bindet Load-, Aktivitäts- und Enablementzustand in einem Show-Snapshot."""
+
+    deadline = time.monotonic() + max(0.0, float(settle_timeout_s))
+    expected_keys = {"LoadState", "ActiveState", "UnitFileState"}
+    accepted_unit_states = {
+        "enabled",
+        "enabled-runtime",
+        "disabled",
+        "static",
+        "indirect",
+        "masked",
+        "masked-runtime",
+        "generated",
+        "transient",
+        "alias",
+        "linked",
+        "linked-runtime",
+    }
+    while True:
+        result = _run_argv(
+            [
+                "systemctl",
+                "show",
+                "apache2.service",
+                "--no-pager",
+                "--property=LoadState",
+                "--property=ActiveState",
+                "--property=UnitFileState",
+            ],
+            timeout=15,
+            env={**os.environ, "LC_ALL": "C", "LANG": "C"},
+        )
+        values: dict[str, str] = {}
+        for line in str(result.get("stdout") or "").splitlines():
+            key, separator, value = line.partition("=")
+            if separator != "=" or key not in expected_keys or key in values:
+                values = {}
+                break
+            values[key] = value.strip().lower()
+        if (
+            not result.get("success")
+            or result.get("timed_out")
+            or int(result.get("returncode", -1)) != 0
+            or str(result.get("stderr") or "")
+            or set(values) != expected_keys
+        ):
+            raise RuntimeError(
+                "Apache-LoadState/Aktivitäts-/Enablement-Snapshot ist nicht strikt lesbar"
+            )
+        load_state = values["LoadState"]
+        active_state = values["ActiveState"]
+        unit_file_state = values["UnitFileState"]
+        if load_state == "not-found":
+            if active_state not in {"", "inactive"}:
+                raise RuntimeError("Abwesender Apache besitzt einen aktiven Zustand")
+            return False, False, "absent"
+        if load_state != "loaded" or unit_file_state not in accepted_unit_states:
+            raise RuntimeError(
+                "Apache-Load-/Enablementzustand ist für das Recovery-Preimage unzulässig"
+            )
+        if active_state == "active":
+            return True, True, unit_file_state
+        if active_state in {"inactive", "failed"}:
+            return True, False, unit_file_state
+        if active_state not in {
+            "activating",
+            "deactivating",
+            "reloading",
+            "maintenance",
+        }:
+            raise RuntimeError(f"Apache-Aktivitätszustand ist unklar: {active_state}")
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"Apache blieb in einem transienten Zustand: {active_state}"
+            )
+        time.sleep(max(0.01, min(float(poll_s), 1.0)))
+
+
 def _capture_apache_security_preimage() -> ApacheSecurityPreimage:
     available_path = APACHE_SECURITY_CONF_AVAILABLE
     enabled_path = APACHE_SECURITY_CONF_ENABLED
@@ -10531,26 +10950,11 @@ def _capture_apache_security_preimage() -> ApacheSecurityPreimage:
                 "Apache-Schutzaktivierung verweist nicht auf die gebundene Konfiguration"
             )
 
-    load_state_result = _run_argv(
-        [
-            "systemctl",
-            "show",
-            "apache2.service",
-            "--property=LoadState",
-            "--value",
-        ],
-        timeout=15,
-    )
-    load_state = str(load_state_result.get("stdout") or "").strip().lower()
-    if (
-        not load_state_result.get("success")
-        or load_state not in {"loaded", "not-found"}
-    ):
-        raise RuntimeError(
-            "Apache-LoadState ist für das Recovery-Preimage nicht stabil"
-        )
-    apache_available = load_state == "loaded"
-    apache_activity = "absent"
+    (
+        apache_available,
+        apache_was_active,
+        apache_unit_file_state,
+    ) = _capture_apache_service_prestate()
     if apache_available:
         apache_ctl = os.lstat("/usr/sbin/apache2ctl")
         if (
@@ -10559,15 +10963,6 @@ def _capture_apache_security_preimage() -> ApacheSecurityPreimage:
             or apache_ctl.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
         ):
             raise RuntimeError("apache2ctl besitzt kein vertrauenswürdiges Preimage")
-        activity_result = _run_argv(
-            ["systemctl", "is-active", "apache2.service"],
-            timeout=15,
-        )
-        apache_activity = str(activity_result.get("stdout") or "").strip().lower()
-        if not activity_result.get("success") or apache_activity != "active":
-            raise RuntimeError(
-                "Apache muss vor dem HTTP-basierten Release-Wechsel aktiv sein"
-            )
 
     return ApacheSecurityPreimage(
         available=available,
@@ -10578,8 +10973,53 @@ def _capture_apache_security_preimage() -> ApacheSecurityPreimage:
         enabled=enabled,
         enabled_target=enabled_target,
         apache_available=apache_available,
-        apache_activity=apache_activity,
+        apache_was_active=apache_was_active,
+        apache_unit_file_state=apache_unit_file_state,
     )
+
+
+def _restore_apache_unit_file_state(preimage: ApacheSecurityPreimage) -> None:
+    """Stellt nur die gebundene Apache-Enablementklasse wieder her."""
+
+    target = preimage.apache_unit_file_state
+    if target == "absent":
+        return
+    commands: list[list[str]] = []
+    if target == "enabled":
+        commands = [
+            ["sudo", "systemctl", "unmask", "apache2.service"],
+            ["sudo", "systemctl", "enable", "apache2.service"],
+        ]
+    elif target == "enabled-runtime":
+        commands = [
+            ["sudo", "systemctl", "unmask", "apache2.service"],
+            ["sudo", "systemctl", "enable", "--runtime", "apache2.service"],
+        ]
+    elif target == "disabled":
+        commands = [
+            ["sudo", "systemctl", "unmask", "apache2.service"],
+            ["sudo", "systemctl", "disable", "apache2.service"],
+        ]
+    elif target in {"masked", "masked-runtime"}:
+        command = ["sudo", "systemctl", "mask"]
+        if target == "masked-runtime":
+            command.append("--runtime")
+        commands = [[*command, "apache2.service"]]
+    else:
+        # static/indirect/generated/alias/linked werden nicht künstlich in
+        # einen anderen Enablementtyp übersetzt. Sie müssen unverändert sein.
+        available, _active, current = _capture_apache_service_prestate()
+        if not available or current != target:
+            raise RuntimeError(
+                "Apache-Enablementklasse kann nicht verlustfrei wiederhergestellt werden"
+            )
+        return
+    for command in commands:
+        result = _run_argv(command, timeout=30)
+        if not result.get("success"):
+            raise RuntimeError(
+                "Apache-Enablementzustand konnte nach Recovery nicht wiederhergestellt werden"
+            )
 
 
 def _restore_apache_security_preimage(preimage: ApacheSecurityPreimage) -> None:
@@ -10675,15 +11115,26 @@ def _restore_apache_security_preimage(preimage: ApacheSecurityPreimage) -> None:
         )
         if not configtest["success"]:
             raise RuntimeError("Apache-Konfiguration ist nach Recovery ungültig")
+        _restore_apache_unit_file_state(preimage)
+        action = "start" if preimage.apache_was_active else "stop"
         service_result = _run_argv(
-            ["sudo", "systemctl", "reload", "apache2.service"],
+            ["sudo", "systemctl", action, "apache2.service"],
             timeout=30,
         )
-        if not service_result["success"]:
+        if not service_result.get("success"):
             raise RuntimeError(
                 "Apache-Aktivitätszustand konnte nach Recovery nicht "
                 "wiederhergestellt werden"
             )
+        if preimage.apache_was_active:
+            reload_result = _run_argv(
+                ["sudo", "systemctl", "reload", "apache2.service"],
+                timeout=30,
+            )
+            if not reload_result.get("success"):
+                raise RuntimeError(
+                    "Apache konnte nach aktiver Recovery nicht neu geladen werden"
+                )
 
     if _capture_apache_security_preimage() != preimage:
         raise RuntimeError("Apache-Recovery weicht vom gebundenen Preimage ab")
@@ -10750,7 +11201,14 @@ def _restore_recovery_surface(inventory: RecoverySurfaceInventory, state: Transi
             raise RuntimeError(f"Enablement von {unit} konnte nicht wiederhergestellt werden")
 
 
-def _read_commit_text(repo_dir: str, commit: str, path: str, install_user: str) -> str:
+def _read_commit_text(
+    repo_dir: str,
+    commit: str,
+    path: str,
+    install_user: str,
+    *,
+    root_authority: bool = False,
+) -> str:
     verified = _validate_full_commit(commit)
     raw = _read_commit_blob(
         repo_dir,
@@ -10758,6 +11216,7 @@ def _read_commit_text(repo_dir: str, commit: str, path: str, install_user: str) 
         path,
         install_user,
         maximum=1024 * 1024,
+        **_root_git_call_kwargs(root_authority),
     )
     try:
         return raw.decode("utf-8")
@@ -10765,8 +11224,18 @@ def _read_commit_text(repo_dir: str, commit: str, path: str, install_user: str) 
         raise RuntimeError(f"{path} ist im verifizierten Ziel-Commit kein UTF-8") from exc
 
 
-def _fetch_target_commit(repo_dir: str, install_user: str, target_tag: str | None) -> str:
-    _require_bound_origin(repo_dir, install_user)
+def _fetch_target_commit(
+    repo_dir: str,
+    install_user: str,
+    target_tag: str | None,
+    *,
+    root_authority: bool = False,
+) -> str:
+    _require_bound_origin(
+        repo_dir,
+        install_user,
+        **_root_git_call_kwargs(root_authority),
+    )
     if target_tag:
         storage_ref = f"refs/tags/{target_tag}"
         peeled_ref = storage_ref + "^{}"
@@ -10780,19 +11249,41 @@ def _fetch_target_commit(repo_dir: str, install_user: str, target_tag: str | Non
             SELFUPDATE_REPO,
             refspec,
             timeout=120,
+            **_root_git_call_kwargs(root_authority),
         )
         if not result["success"]:
             raise RuntimeError("Release-Tag-Fetch fehlgeschlagen: " + result["stderr"].strip())
-        object_type = _git_argv(repo_dir, install_user, "cat-file", "-t", storage_ref, timeout=15)
+        object_type = _git_argv(
+            repo_dir,
+            install_user,
+            "cat-file",
+            "-t",
+            storage_ref,
+            timeout=15,
+            **_root_git_call_kwargs(root_authority),
+        )
         if not object_type["success"] or object_type["stdout"].strip() != "tag":
             raise RuntimeError(f"Release-Tag {target_tag} ist nicht annotiert")
-        tag_object = _git_argv(repo_dir, install_user, "rev-parse", "--verify", storage_ref + "^{tag}", timeout=15)
+        tag_object = _git_argv(
+            repo_dir,
+            install_user,
+            "rev-parse",
+            "--verify",
+            storage_ref + "^{tag}",
+            timeout=15,
+            **_root_git_call_kwargs(root_authority),
+        )
         if (
             not tag_object["success"]
             or not _exact_commit_matches(tag_object["stdout"].strip(), official[storage_ref])
         ):
             raise RuntimeError(f"Release-Tag {target_tag} weicht vom offiziellen Tagobjekt ab")
-        commit = _resolve_git_commit(repo_dir, storage_ref, install_user)
+        commit = _resolve_git_commit(
+            repo_dir,
+            storage_ref,
+            install_user,
+            **_root_git_call_kwargs(root_authority),
+        )
         if not commit or not _exact_commit_matches(commit, official[peeled_ref]):
             raise RuntimeError(f"Release-Tag {target_tag} weicht vom offiziellen Zielcommit ab")
     else:
@@ -10805,10 +11296,16 @@ def _fetch_target_commit(repo_dir: str, install_user: str, target_tag: str | Non
             SELFUPDATE_REPO,
             "+refs/heads/main:refs/remotes/origin/main",
             timeout=120,
+            **_root_git_call_kwargs(root_authority),
         )
         if not result["success"]:
             raise RuntimeError("git fetch origin/main fehlgeschlagen: " + result["stderr"].strip())
-        commit = _resolve_git_commit(repo_dir, "refs/remotes/origin/main", install_user)
+        commit = _resolve_git_commit(
+            repo_dir,
+            "refs/remotes/origin/main",
+            install_user,
+            **_root_git_call_kwargs(root_authority),
+        )
         if not commit or not _exact_commit_matches(commit, official):
             raise RuntimeError("Gefetchtes origin/main weicht vom offiziellen GitHub-Ref ab")
     if not commit:
@@ -10822,8 +11319,16 @@ def _validate_target_release(
     target_commit: str,
     target_tag: str | None,
     install_user: str,
+    *,
+    root_authority: bool = False,
 ) -> str:
-    version = _read_commit_text(repo_dir, target_commit, "VERSION", install_user).strip().lstrip("v")
+    version = _read_commit_text(
+        repo_dir,
+        target_commit,
+        "VERSION",
+        install_user,
+        **_root_git_call_kwargs(root_authority),
+    ).strip().lstrip("v")
     if not version or str(policy.get("version") or "").strip().lstrip("v") != version:
         raise RuntimeError("VERSION und verifizierte UPDATE_POLICY stimmen nicht ueberein")
     stable = _normalize_release_tag(str(policy.get("stable_release") or ""))
@@ -10842,7 +11347,12 @@ def _validate_target_release(
     # Auch der bereits explizit angeforderte Tag wird im Zielprozess erneut
     # direkt von origin geladen und als annotiertes Tag auf exakt denselben
     # Commit gebunden. Die Vorprüfung des Alt-Updaters ist kein Ersatz dafür.
-    stable_commit = _fetch_target_commit(repo_dir, install_user, stable)
+    stable_commit = _fetch_target_commit(
+        repo_dir,
+        install_user,
+        stable,
+        **_root_git_call_kwargs(root_authority),
+    )
     if not stable_commit or not _exact_commit_matches(stable_commit, target_commit):
         raise RuntimeError(
             "Stable-Tag der Ziel-Policy verweist nicht exakt auf den Ziel-Commit"
@@ -10856,6 +11366,27 @@ def _assert_tree_no_symlinks(root: str) -> None:
             path = os.path.join(directory, name)
             if stat.S_ISLNK(os.lstat(path).st_mode):
                 raise RuntimeError(f"Symlink in Release-Baum nicht erlaubt: {path}")
+
+
+def _ensure_apache_canonical_running() -> None:
+    """Aktiviert Apache nach erfolgreicher Projektion eindeutig für den Healthcheck."""
+
+    for command in (
+        ["sudo", "systemctl", "unmask", "apache2.service"],
+        ["sudo", "systemctl", "enable", "apache2.service"],
+        ["sudo", "systemctl", "start", "apache2.service"],
+    ):
+        result = _run_argv(command, timeout=30)
+        if not result.get("success"):
+            raise RuntimeError(
+                "Apache konnte für den erfolgreichen Release-Endzustand nicht "
+                "aktiviert und gestartet werden"
+            )
+    available, active, unit_file_state = _capture_apache_service_prestate()
+    if not available or not active or unit_file_state != "enabled":
+        raise RuntimeError(
+            "Apache besitzt nach Enable+Start keinen kanonischen aktiven Endzustand"
+        )
 
 
 def _sync_release_web(
@@ -10903,6 +11434,7 @@ def _sync_release_web(
             "bleiben im Release-Fenster unverändert."
         )
     from .apache_security import ensure_apache_runtime_path_protection
+    _ensure_apache_canonical_running()
     if not ensure_apache_runtime_path_protection(
         run_command,
         reload_apache=True,
@@ -10980,6 +11512,69 @@ def _announce_finalizer_phase(index: int, total: int, label: str) -> None:
     """Macht lange Release-Phasen im Web- und Konsolenprotokoll sichtbar."""
 
     print(f"[PHASE {index}/{total}] {label}", flush=True)
+
+
+def _verify_projected_bootstrap_metadata_without_env(projection: dict) -> None:
+    """Beweist die dauerhafte Zielbindung in einem vollständig leeren Prozessenv."""
+
+    user, home, root, venv = (
+        str(projection.get(key) or "")
+        for key in ("install_user", "home_dir", "install_path", "venv_path")
+    )
+    env_binary = Path("/usr/bin/env")
+    _assert_root_controlled_directory_chain(env_binary.parent)
+    env_target = env_binary.resolve(strict=True)
+    _assert_root_controlled_directory_chain(env_target.parent)
+    env_metadata = env_target.stat()
+    if (
+        not stat.S_ISREG(env_metadata.st_mode)
+        or env_metadata.st_uid != 0
+        or env_metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        or not env_metadata.st_mode & 0o111
+    ):
+        raise RuntimeError("Fester env-i-Starter besitzt unsichere Metadaten")
+
+    probe = r"""
+import json, os, sys
+if any(name.startswith("E3DC_BOOTSTRAP_") for name in os.environ):
+    raise RuntimeError("Bootstrap-Umgebung ist in die Zielprobe durchgesickert")
+sys.path.insert(0, sys.argv[1])
+from Installer.installer_config import get_install_path, get_install_user, get_venv_path
+from Installer.transition_context import get_transition_context
+user = get_install_user()
+context = get_transition_context(require_trusted=True)
+print(json.dumps([user, get_install_path(user), context.home_dir, get_venv_path(user),
+                  context.install_user, context.install_path, context.venv_path]))
+""".strip()
+    result = _run_argv(
+        [
+            str(env_binary),
+            "-i",
+            "LC_ALL=C.UTF-8",
+            "LANG=C.UTF-8",
+            "PYTHONNOUSERSITE=1",
+            "PYTHONDONTWRITEBYTECODE=1",
+            _trusted_system_python(),
+            "-I",
+            "-B",
+            "-c",
+            probe,
+            root,
+        ],
+        timeout=30,
+    )
+    if not result.get("success"):
+        raise RuntimeError(
+            "Bootstrap-Metadaten sind ohne Prozessumgebung nicht auflösbar: "
+            + _combined_process_diagnostics(result, maximum=4096)
+        )
+    try:
+        actual = json.loads(str(result.get("stdout") or "").strip())
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Bootstrap-Metadatenprobe lieferte kein gültiges JSON") from exc
+    expected = [user, root, home, venv or os.path.join(home, ".venv_e3dc"), user, root, venv]
+    if actual != expected:
+        raise RuntimeError("Bootstrap-Metadatenprobe weicht vom projizierten Sollkontext ab")
 
 
 def finalize_release_from_target(
@@ -11064,7 +11659,12 @@ def finalize_release_from_target(
             transaction_id=safety_contract.transaction_id,
         )
 
-    actual_commit = _resolve_git_commit(target_root, "HEAD", get_install_user())
+    actual_commit = _resolve_git_commit(
+        target_root,
+        "HEAD",
+        get_install_user(),
+        **_root_git_call_kwargs(explicit_download_bootstrap),
+    )
     if not actual_commit or not _exact_commit_matches(commit, actual_commit):
         raise RuntimeError("Target-Finalizer sieht nicht den freigegebenen Ziel-Commit")
 
@@ -11082,8 +11682,20 @@ def finalize_release_from_target(
     watchdog_runtime_required = _watchdog_runtime_venv_required(state)
 
     install_user = get_install_user()
-    policy = _read_policy_from_commit(target_root, commit, install_user)
-    _validate_target_release(policy, target_root, commit, tag, install_user)
+    policy = _read_policy_from_commit(
+        target_root,
+        commit,
+        install_user,
+        **_root_git_call_kwargs(explicit_download_bootstrap),
+    )
+    _validate_target_release(
+        policy,
+        target_root,
+        commit,
+        tag,
+        install_user,
+        **_root_git_call_kwargs(explicit_download_bootstrap),
+    )
     restart_services = _validated_restart_services(policy, state)
     pip_packages = _validated_venv_pip_packages(policy)
     if pip_packages:
@@ -11105,12 +11717,18 @@ def finalize_release_from_target(
         target_root=target_root,
         install_user=install_user,
     )
+    bootstrap_projection = None
 
     _announce_finalizer_phase(2, phase_total, "Paket- und Repositoryzustand herstellen")
     _secure_repo_permissions(
         target_root,
         install_user,
         expected_commit=commit,
+        **(
+            {"root_git_authority": True}
+            if explicit_download_bootstrap
+            else {}
+        ),
     )
     _verify_worktree_policy(target_root, policy)
     _migrate_bootstrap_legacy_config(target_root, state)
@@ -11120,6 +11738,25 @@ def finalize_release_from_target(
         expected_venv_state=expected_venv_state,
         expected_venv_path=expected_venv_path,
     )
+    if explicit_download_bootstrap:
+        projection_config, projection_sha256 = state.config, state.config_sha256
+        if state.bootstrap_legacy_config:
+            projection_config, migrated_raw = _read_json_nofollow(state.config_path)
+            if str(projection_config.get("ha_mode") or "").strip().lower() != state.ha_role:
+                raise RuntimeError("Migrierte V4-Konfiguration verlor die gebundene Rolle")
+            projection_sha256 = hashlib.sha256(migrated_raw).hexdigest()
+        bootstrap_projection = project_download_bootstrap_metadata(
+            target_root,
+            install_user,
+            venv_path=expected_venv_path,
+            expected_v4_config=projection_config,
+            expected_v4_sha256=projection_sha256,
+        )
+        state = replace(
+            state, config=dict(bootstrap_projection["config"]),
+            config_sha256=str(bootstrap_projection["config_sha256"]),
+        )
+        expected_config_sha256 = state.config_sha256
 
     delete_ok, delete_errors = _delete_approved_stale_paths(policy.get("delete_files") or [])
     if not delete_ok:
@@ -11135,6 +11772,18 @@ def finalize_release_from_target(
         policy,
         allow_config_bootstrap=state.bootstrap_legacy_config,
     )
+    if bootstrap_projection is not None and state.bootstrap_legacy_config:
+        legacy_config, legacy_raw = _read_json_nofollow(state.config_path)
+        if (
+            any(legacy_config.get(key) != value for key, value in state.config.items())
+            or set(legacy_config) - set(state.config) - set(WEB_CONFIG_START_DEFAULTS)
+        ):
+            raise RuntimeError("Legacy-Webprojektion veränderte gebundene Fachwerte")
+        state = replace(
+            state, config=legacy_config,
+            config_sha256=hashlib.sha256(legacy_raw).hexdigest(),
+        )
+        expected_config_sha256 = state.config_sha256
     if policy.get("run_permissions", True):
         from .permissions import run_permissions_wizard
         expected_commit_env = "E3DC_RELEASE_EXPECTED_COMMIT"
@@ -11296,8 +11945,10 @@ def finalize_release_from_target(
         _stop_v4_services(restart_services)
         raise RuntimeError("Boot-Sanity-Gate fehlgeschlagen")
 
+    if bootstrap_projection is not None:
+        _verify_projected_bootstrap_metadata_without_env(bootstrap_projection)
     _verify_transition_state(state)
-    if expected_config_state == "present":
+    if expected_config_state == "present" or bootstrap_projection is not None:
         _config, raw = _read_json_nofollow(state.config_path)
         if hashlib.sha256(raw).hexdigest() != expected_config_sha256:
             raise RuntimeError("Betriebskonfiguration driftete während des Target-Finalizers")
@@ -11356,6 +12007,7 @@ def _target_execution_archive_entries(
     repo_dir: str,
     target_commit: str,
     install_user: str,
+    root_authority: bool = False,
 ) -> dict[str, tuple[bytes, int]]:
     """Liest den vollständigen ausführbaren Installer-Baum direkt aus dem Commit."""
 
@@ -11365,7 +12017,10 @@ def _target_execution_archive_entries(
         _validate_full_commit(target_commit),
         (*TARGET_EXECUTION_SNAPSHOT_ROOT_FILES, "Installer"),
         required_paths=required,
-        run_as_user=install_user,
+        run_as_user=_commit_reader_user(
+            install_user,
+            root_authority=root_authority,
+        ),
         maximum_files=TARGET_EXECUTION_SNAPSHOT_MAX_FILES,
         maximum_file_bytes=TARGET_EXECUTION_SNAPSHOT_MAX_FILE_BYTES,
         maximum_total_bytes=TARGET_EXECUTION_SNAPSHOT_MAX_TOTAL_BYTES,
@@ -12179,6 +12834,7 @@ def _invoke_target_finalizer(
             target_commit=target_commit,
             relative_path=relative_path,
             install_user=install_user,
+            **_root_git_call_kwargs(explicit_download_bootstrap),
         )
         for relative_path in TARGET_FINALIZER_RELATIVE_FILES
     }
@@ -12186,6 +12842,7 @@ def _invoke_target_finalizer(
         repo_dir=repo_dir,
         target_commit=target_commit,
         install_user=install_user,
+        **_root_git_call_kwargs(explicit_download_bootstrap),
     )
 
     for relative_path, expected_identity in bound_target_files.items():
@@ -12527,12 +13184,32 @@ def _read_bound_regular_file(path: str, maximum: int = 1024 * 1024) -> tuple[byt
     return b"".join(chunks), _file_identity(before)
 
 
+def _commit_reader_user(
+    install_user: str,
+    *,
+    root_authority: bool,
+) -> str | None:
+    """Wählt die Identität des kryptographischen Commit-Lesers eindeutig."""
+
+    if not isinstance(root_authority, bool):
+        raise ValueError("Commit-Leser-Autorität muss boolesch sein")
+    if not root_authority:
+        return str(install_user)
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        raise RuntimeError(
+            "Bootstrap-Commit-Leser mit Root-Autorität verlangt Root"
+        )
+    return None
+
+
 def _read_commit_blob(
     repo_dir: str,
     target_commit: str,
     relative_path: str,
     install_user: str,
     maximum: int = 1024 * 1024,
+    *,
+    root_authority: bool = False,
 ) -> bytes:
     commit = _validate_full_commit(target_commit)
     if relative_path.startswith("/") or ".." in Path(relative_path).parts:
@@ -12542,7 +13219,10 @@ def _read_commit_blob(
         commit,
         (relative_path,),
         required_paths=(relative_path,),
-        run_as_user=install_user,
+        run_as_user=_commit_reader_user(
+            install_user,
+            root_authority=root_authority,
+        ),
         maximum_files=1,
         maximum_file_bytes=maximum,
         maximum_total_bytes=maximum,
@@ -12558,6 +13238,8 @@ def _read_commit_file_mode(
     target_commit: str,
     relative_path: str,
     install_user: str,
+    *,
+    root_authority: bool = False,
 ) -> int:
     """Liest den freigegebenen Git-Dateimodus ohne locale-abhängige Textumwandlung."""
     commit = _validate_full_commit(target_commit)
@@ -12568,7 +13250,10 @@ def _read_commit_file_mode(
         commit,
         (relative_path,),
         required_paths=(relative_path,),
-        run_as_user=install_user,
+        run_as_user=_commit_reader_user(
+            install_user,
+            root_authority=root_authority,
+        ),
         maximum_files=1,
         maximum_file_bytes=TARGET_EXECUTION_SNAPSHOT_MAX_FILE_BYTES,
         maximum_total_bytes=TARGET_EXECUTION_SNAPSHOT_MAX_FILE_BYTES,
@@ -12597,6 +13282,7 @@ def _normalize_target_finalizer_files(
     repo_dir: str,
     target_commit: str,
     install_user: str,
+    root_authority: bool = False,
 ) -> None:
     """Normalisiert nur bytegenau gebundene Finalizer-Dateien über offene FDs."""
     try:
@@ -12613,12 +13299,14 @@ def _normalize_target_finalizer_files(
             target_commit,
             relative_path,
             install_user,
+            **_root_git_call_kwargs(root_authority),
         )
         expected_mode = _read_commit_file_mode(
             repo_dir,
             target_commit,
             relative_path,
             install_user,
+            **_root_git_call_kwargs(root_authority),
         )
         descriptor, before = _open_regular_file_nofollow(target)
         try:
@@ -12671,6 +13359,7 @@ def _bind_target_file_to_commit(
     target_commit: str,
     relative_path: str,
     install_user: str,
+    root_authority: bool = False,
 ) -> tuple[int, ...]:
     target = os.path.join(os.path.abspath(repo_dir), relative_path)
     payload, identity = _read_bound_regular_file(target)
@@ -12689,6 +13378,7 @@ def _bind_target_file_to_commit(
         target_commit,
         relative_path,
         install_user,
+        **_root_git_call_kwargs(root_authority),
     )
     if payload != expected:
         raise RuntimeError("Target-Datei stimmt nicht bytegenau mit dem freigegebenen Commit überein")
@@ -13208,6 +13898,8 @@ def _regular_file_sha256(path: str) -> tuple[str, int]:
 def _bound_release_head_commit(
     repo_dir: str,
     install_user: str,
+    *,
+    root_authority: bool = False,
 ) -> str:
     """Bindet HEAD ausschließlich als vollständigen Commit-Hash."""
 
@@ -13218,6 +13910,7 @@ def _bound_release_head_commit(
         "--verify",
         "HEAD^{commit}",
         timeout=10,
+        **_root_git_call_kwargs(root_authority),
     )
     if not result.get("success"):
         raise RuntimeError(
@@ -13235,13 +13928,18 @@ def _tracked_release_file_contracts(
     install_user: str,
     *,
     target_commit: str | None = None,
+    root_authority: bool = False,
 ) -> list[tuple[str, int, str]]:
     """Bindet Pfad, Modus und Blob-ID aus einem exakten Produkt-Commit."""
 
     commit = (
         _validate_full_commit(target_commit)
         if target_commit is not None
-        else _bound_release_head_commit(repo_dir, install_user)
+        else _bound_release_head_commit(
+            repo_dir,
+            install_user,
+            **_root_git_call_kwargs(root_authority),
+        )
     )
 
     verified_entries = read_commit_entries(
@@ -13249,7 +13947,10 @@ def _tracked_release_file_contracts(
         commit,
         (),
         include_all=True,
-        run_as_user=install_user,
+        run_as_user=_commit_reader_user(
+            install_user,
+            root_authority=root_authority,
+        ),
         maximum_files=TARGET_EXECUTION_SNAPSHOT_MAX_FILES,
         maximum_file_bytes=TARGET_EXECUTION_SNAPSHOT_MAX_FILE_BYTES,
         maximum_total_bytes=TARGET_EXECUTION_SNAPSHOT_MAX_TOTAL_BYTES,
@@ -13296,6 +13997,8 @@ def _assert_target_worktree_replaceable(
     repo_dir: str,
     install_user: str,
     target_commit: str,
+    *,
+    root_authority: bool = False,
 ) -> None:
     """Blockiert nur Dateitypen, die ein sicheres Zielkopieren verhindern.
 
@@ -13309,6 +14012,7 @@ def _assert_target_worktree_replaceable(
         root,
         install_user,
         target_commit=_validate_full_commit(target_commit),
+        **_root_git_call_kwargs(root_authority),
     ):
         parts = Path(relative_path).parts
         current = root
@@ -13653,6 +14357,115 @@ def _same_release_integrity_errors(
     return errors[:maximum]
 
 
+def _download_bootstrap_entry_mode(target_install_path: str | None) -> str:
+    """Bindet den internen Dispatcher-/Rettungsmodus ohne öffentliche CLI."""
+
+    raw = str(os.environ.get("E3DC_BOOTSTRAP_ENTRY_MODE") or "rescue").strip()
+    if raw not in {"regular", "rescue"}:
+        raise RuntimeError("Update-Einstiegsmodus muss regular oder rescue sein")
+    if raw == "regular":
+        target = os.path.abspath(str(target_install_path or ""))
+        runner = os.path.abspath(os.path.dirname(INSTALLER_DIR))
+        if (
+            not target_install_path
+            or not hasattr(os, "geteuid")
+            or os.geteuid() != 0
+            or os.path.realpath(os.environ.get("E3DC_BOOTSTRAP_ROOT", ""))
+            != os.path.realpath(target)
+            or os.path.realpath(os.environ.get("E3DC_BOOTSTRAP_RUNNER_ROOT", ""))
+            != os.path.realpath(runner)
+            or os.path.realpath(runner) == os.path.realpath(target)
+        ):
+            raise RuntimeError(
+                "Regular-Modus besitzt keinen getrennten root-eigenen Zielcode-Vertrag"
+            )
+    return raw
+
+
+def _probe_regular_download_bootstrap_current(
+    *,
+    repo_dir: str,
+    target_commit: str,
+    target_tag: str,
+    expected_role: str,
+) -> tuple[bool, tuple[str, ...]]:
+    """Prüft mit Zielcode rein lesend, ob der Release vollständig aktuell ist."""
+
+    _assert_no_existing_recovery_bootblock()
+    root = _validate_bootstrap_install_path(repo_dir)
+    commit = _validate_full_commit(target_commit)
+    tag = _normalize_release_tag(target_tag)
+    role = str(expected_role or "").strip().lower()
+    if role not in VALID_HA_ROLES:
+        raise RuntimeError("Regular-Probe besitzt keine gültige Rollenbindung")
+    install_user = get_install_user()
+    current_commit, _rebuild = _bind_bootstrap_git_prestate(
+        root,
+        explicit_bootstrap=False,
+    )
+    if not current_commit or not _exact_commit_matches(current_commit, commit):
+        return False, (
+            f"HEAD {current_commit or 'unlesbar'} weicht vom Zielcommit {commit} ab",
+        )
+    _require_bound_origin(root, install_user)
+    state = _capture_transition_state(
+        expected_role=role,
+        allow_missing_config=False,
+    )
+
+    # Policy, Tag und Commit werden ausschließlich aus dem bereits
+    # commitgebunden geladenen Ziel-Checkout interpretiert. Der Altbaum liefert
+    # weder Updatebytes noch einen zielversionsspezifischen Dienstvertrag.
+    runner_repo = os.path.abspath(os.path.dirname(INSTALLER_DIR))
+    policy = _read_policy_from_commit(
+        runner_repo,
+        commit,
+        install_user,
+        root_authority=True,
+    )
+    bound_tag = _validate_target_release(
+        policy,
+        runner_repo,
+        commit,
+        tag,
+        install_user,
+        root_authority=True,
+    )
+    if bound_tag != tag:
+        raise RuntimeError("Regular-Probe verlor ihre Tag-/Commitbindung")
+    restart_services = _validated_restart_services(policy, state)
+    errors = _same_release_integrity_errors(root, install_user)
+    if len(errors) < 12:
+        errors.extend(
+            _same_release_service_errors(
+                restart_services,
+                state,
+                maximum=12 - len(errors),
+            )
+        )
+    if len(errors) < 12:
+        try:
+            apache_available, apache_active, apache_unit_state = (
+                _capture_apache_service_prestate(settle_timeout_s=0)
+            )
+        except Exception as exc:
+            errors.append(f"Apache-Endzustand ist nicht eindeutig lesbar: {exc}")
+        else:
+            if (apache_available, apache_active, apache_unit_state) != (
+                True,
+                True,
+                "enabled",
+            ):
+                errors.append(
+                    "apache2.service besitzt keinen kanonischen Endzustand "
+                    f"(loaded={apache_available}, active={apache_active}, "
+                    f"enabled={apache_unit_state})"
+                )
+    if len(errors) < 12:
+        errors.extend(_local_http_healthcheck()[: 12 - len(errors)])
+    return not errors, tuple(errors)
+
+
 def _prepare_backup_collection(
     repo_dir: str,
     *,
@@ -13723,8 +14536,12 @@ def _execute_update_transaction(
             if preverified_target_tag
             else None
         )
+        entry_mode = _download_bootstrap_entry_mode(target_install_path)
     except ValueError as exc:
         print(f"[!] {exc}")
+        return False
+    except RuntimeError as exc:
+        print(f"[!] Bootstrap-Einstiegsvertrag ist ungültig: {exc}")
         return False
 
     if bool(verified_commit) != bool(verified_tag):
@@ -13760,6 +14577,37 @@ def _execute_update_transaction(
     if target_install_path and (not expected_sha or not expected_ha_role):
         print("[!] Bootstrap verlangt --expected-release-sha und --expected-ha-role.")
         return False
+
+    if entry_mode == "regular":
+        try:
+            current, probe_errors = _probe_regular_download_bootstrap_current(
+                repo_dir=str(target_install_path),
+                target_commit=str(expected_sha),
+                target_tag=str(target_tag),
+                expected_role=str(expected_ha_role),
+            )
+        except Exception as exc:
+            current = False
+            probe_errors = (f"Regular-Probe nicht eindeutig: {exc}",)
+        if current:
+            print(f"[OK] Du bist auf dem neuesten Stand: {expected_sha}.")
+            print(
+                "    Ziel-Release, Produkt-/Webprojektion und erwartete Dienste "
+                "sind exakt gebunden. Kein Backup und kein Dienststopp erforderlich."
+            )
+            return UPDATE_ALREADY_CURRENT
+        print("[i] Regular-Probe verlangt eine vollständige Rettungstransaktion.")
+        for error in probe_errors:
+            print(f"    - {error}")
+        print(
+            "    Derselbe commitgebundene Ziel-Updater fährt mit Backup, "
+            "Diensteruhe und vollständiger Projektion fort."
+        )
+        # Ab hier gelten bewusst die bereits bestehenden vollständigen
+        # Rettungssemantiken. Kein nachgelagerter Finalizer darf den
+        # read-only Regular-Probe-Modus als eigene Autorität erben.
+        os.environ["E3DC_BOOTSTRAP_ENTRY_MODE"] = "rescue"
+
     transition_name = (
         "release-bootstrap"
         if target_install_path
@@ -13786,6 +14634,9 @@ def _execute_update_transaction(
             explicit_bootstrap=bool(target_install_path),
         )
         bootstrap_without_git = old_commit is None
+        bootstrap_git_root_authority = bool(
+            target_install_path and bootstrap_without_git
+        )
         state = _capture_transition_state(
             expected_role=expected_ha_role,
             allow_missing_config=bool(target_install_path and bootstrap_without_git),
@@ -14176,19 +15027,30 @@ def _execute_update_transaction(
                     "verifizierten Backup neu aufgebaut."
                 )
                 _remove_tree_nofollow(git_path)
-            # Nur die frisch erzeugte Metadatenwurzel gehört von Anfang an dem
-            # gebundenen Installationsbenutzer. Alle folgenden Projektionen
-            # dürfen weiter als Root laufen, damit beliebige Altmodi im
-            # Produktbaum das Update nach dem verifizierten Backup nicht
-            # blockieren. Der Ziel-Finalizer kann .git dadurch anschließend
-            # als genau diesen Nicht-Root-Besitz erneut binden.
+            # Der vollständige frische Git-Aufbau bleibt bis in den
+            # Ziel-Finalizer root-eigen. Erst dessen kanonische
+            # Rechteprojektion übergibt .git und den Produktbaum gemeinsam an
+            # den gebundenen Installationsbenutzer.
             _initialize_bootstrap_git(repo_dir, install_user)
             mutated = True
-            remote_add = _git_argv(repo_dir, install_user, "remote", "add", "origin", SELFUPDATE_REPO, timeout=15)
+            remote_add = _git_argv(
+                repo_dir,
+                install_user,
+                "remote",
+                "add",
+                "origin",
+                SELFUPDATE_REPO,
+                timeout=15,
+                **_root_git_call_kwargs(bootstrap_git_root_authority),
+            )
             if not remote_add["success"]:
                 raise RuntimeError("Git-Origin konnte nicht gesetzt werden: " + remote_add["stderr"].strip())
 
-        _require_bound_origin(repo_dir, install_user)
+        _require_bound_origin(
+            repo_dir,
+            install_user,
+            **_root_git_call_kwargs(bootstrap_git_root_authority),
+        )
 
         if verified_commit:
             target_commit = verified_commit
@@ -14198,13 +15060,23 @@ def _execute_update_transaction(
             # gegen genau diesen Tag geprüft werden – niemals erneut gegen ein
             # inzwischen weitergelaufenes origin/main.
             bound_ref = f"refs/tags/{verified_tag}"
-            resolved = _resolve_git_commit(repo_dir, bound_ref, install_user)
+            resolved = _resolve_git_commit(
+                repo_dir,
+                bound_ref,
+                install_user,
+                **_root_git_call_kwargs(bootstrap_git_root_authority),
+            )
             if not resolved or not _exact_commit_matches(resolved, target_commit):
                 raise RuntimeError(
                     "Vorverifizierter Ziel-Commit ist nicht mehr an den erwarteten Git-Ref gebunden"
                 )
         else:
-            target_commit = _fetch_target_commit(repo_dir, install_user, target_tag)
+            target_commit = _fetch_target_commit(
+                repo_dir,
+                install_user,
+                target_tag,
+                **_root_git_call_kwargs(bootstrap_git_root_authority),
+            )
         if expected_sha and not _exact_commit_matches(expected_sha, target_commit):
             raise RuntimeError(
                 f"Ziel-SHA weicht von der expliziten Freigabe ab: {target_commit} != {expected_sha}"
@@ -14221,13 +15093,19 @@ def _execute_update_transaction(
         ):
             raise RuntimeError("Release-Tag ist nicht durch exakte Policy-/SHA-Bindung autorisiert")
 
-        policy = _read_policy_from_commit(repo_dir, target_commit, install_user)
+        policy = _read_policy_from_commit(
+            repo_dir,
+            target_commit,
+            install_user,
+            **_root_git_call_kwargs(bootstrap_git_root_authority),
+        )
         bound_target_tag = _validate_target_release(
             policy,
             repo_dir,
             target_commit,
             target_tag,
             install_user,
+            **_root_git_call_kwargs(bootstrap_git_root_authority),
         )
         if verified_tag and bound_target_tag != verified_tag:
             raise RuntimeError(
@@ -14253,13 +15131,23 @@ def _execute_update_transaction(
             repo_dir,
             install_user,
             target_commit,
+            **_root_git_call_kwargs(bootstrap_git_root_authority),
         )
 
         mutated = True
-        reset = _git_argv(repo_dir, install_user, "reset", "--hard", target_commit, timeout=120)
+        reset = _git_argv(
+            repo_dir, install_user, "reset", "--hard", target_commit,
+            timeout=120,
+            **_root_git_call_kwargs(bootstrap_git_root_authority),
+        )
         if not reset["success"]:
             raise RuntimeError("git reset --hard fehlgeschlagen: " + reset["stderr"].strip())
-        new_commit = _resolve_git_commit(repo_dir, "HEAD", install_user)
+        new_commit = _resolve_git_commit(
+            repo_dir,
+            "HEAD",
+            install_user,
+            **_root_git_call_kwargs(bootstrap_git_root_authority),
+        )
         if not new_commit or not _exact_commit_matches(target_commit, new_commit):
             raise RuntimeError("HEAD stimmt nicht exakt mit dem freigegebenen Ziel-SHA ueberein")
 
@@ -14268,6 +15156,7 @@ def _execute_update_transaction(
             repo_dir=repo_dir,
             target_commit=target_commit,
             install_user=install_user,
+            **_root_git_call_kwargs(bootstrap_git_root_authority),
         )
 
         mutated = True
@@ -15020,6 +15909,12 @@ def run_initial_forecast(installer_dir: str | None = None):
 
 
 def update_menu():
+    # Ein bereits installiertes System betritt ohne erneute Bewertung seines
+    # heterogenen Altzustands direkt den root-eigenen Dispatcher. Nur wenn der
+    # Dispatcher noch gar nicht installiert ist, darf der Erstinstallations-
+    # pfad die lokale Zustandsklassifikation ausführen.
+    if os.path.lexists(UPDATE_DISPATCHER):
+        return _start_background_update_dispatcher()
     return start_installation_or_update(allow_first_install=True)
 
 

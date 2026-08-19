@@ -6,6 +6,31 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.4a] – 2026-08-19
+
+### 🚗 Wallbox-Regelung & Phasenwechsel
+
+- **Robuster Phasenwechsel und verlässlicher Wiederanlauf:** Ein potenzieller Parameterfehler (`started_ts`) im Wire-Cooldown nach Phasenwechseln wurde behoben. Telemetrie und physische Zielphasen-Readbacks werden vor der Lease-Ablaufprüfung ausgewertet, sodass bestätigte Umschaltungen ohne Verzögerung oder Deadlock direkt in die Freigabe des Ladestroms übergehen.
+- **Saubere Recovery-Autorisierung bei Dienstneustarts:** Startet der Wallbox Manager während oder kurz nach einem Phasenwechsel neu, wird der Zustand anhand des bestätigten Hardware-Readbacks sofort wiederhergestellt, anstatt den Ladestrom fälschlicherweise in einer Dauersperre zu halten.
+- **Entstörung der Start- und Haltezustände:** Im Hold-Current-Enforcement-Vertrag wurde ein Deadlock behoben, bei dem ein ruhendes Fahrzeug während der PV-Startvorbereitung fälschlicherweise gestoppt und das Startintegral zyklisch gelöscht wurde. Wiederholte Starts im selben Steckzyklus werden nach erfolgreicher Ladung nicht mehr fälschlicherweise als Startablehnung gewertet.
+- **Zuverlässige E3DC- und openWB-Aktorik:** Die Stop-Verriegelung für E3DC-Wallboxen wurde entprellt, sodass neue Start-Toggles bei anliegendem Budget sofort übertragen werden. Das Speichern von openWB-Parametern über die Web-Oberfläche schlägt nicht mehr durch redundante Dateirechte-Prüfungen auf gemeinsamen Lockdateien fehl.
+- **Stabilität auf der Wallbox-Bedienseite:** Dienstneustarts aus `Wallbox.php` werden zuverlässig quittiert und unnötige Dateisystemzugriffe auf geschützte Konfigurationsdateien unterbunden.
+
+### 🔋 Speicher- und Ladekurvenführung
+
+- **Beseitigung des 3-Minuten-Taktens bei aktiver Ladekurve:** In der Ladekurven-Haltefunktion (`parallel_curve_auto_hold`) wurde ein fehlerhafter Freilauf-Timeout behoben. Hält die Ladekurve den Speicher am Vormittag auf 0 W, bleibt diese EMS-Ladegrenze zustandstreu aktiv und kippt nicht mehr nach 90 Sekunden unbegründet in einen 3-kW-Freilauf.
+- **Ruhige Batterieladung bei laufender Fahrzeugladung:** Die Drossellogik für DC-gekoppelte Speicher wurde geglättet, um sprunghafte Schwingungen zwischen Speicherladung und Netzeinspeisung bei schnellen Lastwechseln zuverlässig zu verhindern.
+
+### 📊 Live-Verbrauch & Visualisierung
+
+- **Glitch-Schutz für die Hausverbrauchsberechnung:** Fällt der berechnete Hausverbrauch durch sporadische 0-W-RSCP-Frames oder Messwert-Glitches kurzzeitig unter 50 W, hält die Visualisierung den letzten plausiblen Realverbrauch, um unruhige Ausschläge im Dashboard zu glätten.
+
+### ☀️ Direktvermarktung & Ertragsberechnung
+
+- **1:1 Zeitachsen-Kopplung im Fahrplan-Modal:** Das Direktvermarktungs-Diagramm ist nun exakt auf dasselbe 15-Minuten-Tagesraster (00:00–24:00 Uhr) wie die Standard-Ladekurve synchronisiert.
+- **Konsistente Ertragsbewertung bei Negativpreisen:** Bei negativen Strompreisen (≤ 0 ct/kWh) wird nur noch der tatsächlich im Haus oder Speicher genutzte PV-Ertrag in die wirtschaftliche Ertragsanzeige einbezogen.
+
+
 ## [5.4.4] – 2026-08-17
 
 ### 🔄 Konsolidiertes Update für heterogene Altanlagen

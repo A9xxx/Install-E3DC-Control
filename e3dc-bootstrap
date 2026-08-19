@@ -12,6 +12,12 @@ TARGET=$1
 TAG=$2
 EXPECTED_SHA=$3
 EXPECTED_ROLE=$4
+ENTRY_MODE=${E3DC_BOOTSTRAP_ENTRY_MODE:-rescue}
+
+case "$ENTRY_MODE" in
+    regular|rescue) ;;
+    *) echo "Interner Update-Einstiegsmodus ist ungültig." >&2; exit 2 ;;
+esac
 
 case "$TARGET" in
     /*) ;;
@@ -49,11 +55,27 @@ else
     INSTALL_USER=$(id -un)
 fi
 case "$INSTALL_USER" in
-    ""|root|www-data|*[!A-Za-z0-9_.-]*)
+    ""|root|www-data)
         echo "Ein normaler Installationsbenutzer ist nicht eindeutig gebunden." >&2
         exit 2
         ;;
 esac
+"$PYTHON" - "$INSTALL_USER" <<'PY' || {
+import sys
+
+value = sys.argv[1]
+valid = bool(
+    value
+    and value == value.strip()
+    and "/" not in value
+    and "\\" not in value
+    and all(character.isalnum() or character in {"_", "-", "."} for character in value)
+)
+raise SystemExit(0 if valid else 1)
+PY
+    echo "Ein normaler Installationsbenutzer ist nicht eindeutig gebunden." >&2
+    exit 2
+}
 id -u "$INSTALL_USER" >/dev/null 2>&1 || {
     echo "Der gebundene Installationsbenutzer existiert nicht." >&2
     exit 2
@@ -64,6 +86,7 @@ if [ "$(id -u)" -eq 0 ]; then
         E3DC_BOOTSTRAP_ROOT="$TARGET" \
         E3DC_BOOTSTRAP_RUNNER_ROOT="$SCRIPT_DIR" \
         E3DC_BOOTSTRAP_USER="$INSTALL_USER" \
+        E3DC_BOOTSTRAP_ENTRY_MODE="$ENTRY_MODE" \
         "$PYTHON" "$SCRIPT_DIR/installer_main.py" \
         --unattended \
         --install-release-tag "$TAG" \
@@ -76,6 +99,7 @@ exec sudo -- env \
     E3DC_BOOTSTRAP_ROOT="$TARGET" \
     E3DC_BOOTSTRAP_RUNNER_ROOT="$SCRIPT_DIR" \
     E3DC_BOOTSTRAP_USER="$INSTALL_USER" \
+    E3DC_BOOTSTRAP_ENTRY_MODE="$ENTRY_MODE" \
     "$PYTHON" "$SCRIPT_DIR/installer_main.py" \
     --unattended \
     --install-release-tag "$TAG" \

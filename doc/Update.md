@@ -5,66 +5,68 @@ Updates werden ausschließlich über den Installer ausgeführt. Ein manuelles
 Release-Historie ungeeignet, weil alter und neuer Git-Stand nicht miteinander
 verwandt sein müssen.
 
-Der aktuelle Stable-Stand ist `v5.4.4`. Der Ziel-Updater bindet den
+Der aktuelle Stable-Stand ist `v5.4.4a`. Der Ziel-Updater bindet den
 freigegebenen Zielstand vor Backup und Dienststopp eindeutig an Version,
 Herkunft und Anlagenrolle. Fortschritt und Lebenszeichen bleiben auf
-langsameren Raspberry Pis sichtbar. Eine bereits vollständig installierte
-Version bleibt beim normalen Update ohne Unterbrechung unverändert; eine
-Reparatur oder Neuinstallation derselben Version muss ausdrücklich bestätigt
-werden. Das Dashboard darf ausschließlich das reguläre Update über einen
+langsameren Raspberry Pis sichtbar. Auch ein erneut gestarteter Auftrag folgt
+dem einheitlichen Ziel-Updatervertrag; er ist kein ungeprüfter Schnellpfad.
+Das Dashboard darf ausschließlich das reguläre Update über einen
 argumentlosen, root-eigenen Systemjob starten. Freie Installer-Aktionen,
 Pfade, Release-Tags, Reparaturen, Neuinstallationen und Rückfälle bleiben im
 Web gesperrt und erfolgen über den geschützten Konsolenweg.
 
-Die Konsolenbeispiele verwenden den zuvor geprüften absoluten Produktpfad:
-
-```bash
-export E3DC_INSTALL_PATH="/absoluter/pfad/zur/installation"
-test -f "$E3DC_INSTALL_PATH/e3dc-setup"
-```
-
 ## Normales Update
 
-Der bevorzugte Weg ist der Update-Button der Weboberfläche. Er bindet den
-unveränderten veröffentlichten Ausgangsstand an dessen Remote-Tag und startet
-den Installer aus einem versiegelten Snapshot. Auf der Konsole steht derselbe
-reguläre Installer-Pfad zur Verfügung:
+Der bevorzugte Weg ist der Update-Button der Weboberfläche. Weboberfläche,
+Installer-Menü und Konsole starten denselben root-eigenen Hintergrundauftrag.
+Der lokale Git-, Rechte- oder Änderungszustand entscheidet nicht mehr darüber,
+ob dieser Auftrag angenommen wird. Der eigentliche Ziel-Updater prüft weiterhin
+Backup, Writer-Ruhe, Zielstand, Rechte, Dienste und Gesundheit.
+
+Nach einmaliger Installation des gemeinsamen Dispatchers kann der Auftrag auch
+direkt auf der Konsole gestartet werden:
 
 ```bash
-bash "$E3DC_INSTALL_PATH/e3dc-setup" --check
-bash "$E3DC_INSTALL_PATH/e3dc-setup" --update-e3dc
+sudo /usr/local/sbin/e3dc-web-update-launcher
+```
+
+Der Befehl kehrt nach Annahme des Auftrags zurück. Status und Protokoll laufen
+unabhängig vom SSH-Fenster weiter:
+
+```bash
+systemctl status --no-pager e3dc-web-update.service
+journalctl -fu e3dc-web-update.service
 ```
 
 ### Rettungsweg für heterogene Altinstallationen
 
-Wenn ein alter lokaler Updater an einer früheren Dateiberechtigung, einer
-manuell kopierten Produktdatei oder einer veralteten Dienstprojektion scheitert,
-kann der aktuelle Updater unabhängig vom installierten Programmstand geladen
-werden:
+Für heterogene Altinstallationen wird genau **eine Datei** benötigt:
+`e3dc-update-bootstrap`. Sie kann über den Community-Beitrag oder aus dem
+offiziellen Repository heruntergeladen und anschließend an einen beliebigen Ort
+auf den Raspberry Pi kopiert werden. Im Verzeichnis der Datei genügt:
 
 ```bash
-export E3DC_INSTALL_PATH="/absoluter/pfad/zur/installation"
-BOOTSTRAP_DIR=$(sudo /usr/bin/mktemp -d /run/e3dc-update-bootstrap.XXXXXX)
-sudo /usr/bin/curl -q -fsS --proto '=https' --tlsv1.2 \
-  -o "$BOOTSTRAP_DIR/e3dc-update-bootstrap" \
-  https://raw.githubusercontent.com/A9xxx/Install-E3DC-Control/main/e3dc-update-bootstrap
-sudo /bin/chmod 0700 "$BOOTSTRAP_DIR/e3dc-update-bootstrap"
-sudo /bin/sh "$BOOTSTRAP_DIR/e3dc-update-bootstrap" "$E3DC_INSTALL_PATH"
-sudo /bin/rm -rf -- "$BOOTSTRAP_DIR"
+sudo /bin/sh ./e3dc-update-bootstrap
 ```
 
-Der Download liegt damit von Anfang an in einer zufälligen, root-eigenen
-`0700`-Laufzeitfläche. Ein lokaler Benutzer kann die anschließend als Root
-ausgeführten Bytes weder austauschen noch über eine persönliche `curl`-
-Konfiguration beeinflussen. Die HTTPS-Quelle ist das öffentliche
-Projekt-Repository; der Bootstrap selbst bindet danach Stable-Tag und Commit
-noch einmal über einen isolierten Git-Transport.
+Ein `chmod`, ein fester Installationspfad und weitere Argumente sind nicht
+nötig. Der Aufruf startet den veröffentlichten Updatepfad in einem
+root-kontrollierten Hintergrundauftrag. Dieser ermittelt Installationsordner,
+Installationsbenutzer und Anlagenrolle aus dem laufenden System. Werden auf
+einer Anlage in derselben maßgeblichen Evidenzstufe mehrere Installationen
+gefunden, listet der Auftrag die Kandidaten auf und stoppt, statt eine davon zu
+raten.
+
+Der Start gibt die Befehle für Status und Protokoll aus; das Terminal kann
+danach geschlossen werden. Die Community-Datei wird zuerst kopiert und dann
+mit `sudo /bin/sh` gestartet; sie wird nicht über eine Pipe direkt aus dem
+Netz als Root ausgeführt.
 
 Der kleine Bootstrap ermittelt den aktuellen veröffentlichten Stable-Tag samt
 Commit, lädt dessen Installer und führt **nicht** den vorhandenen Alt-Updater
-aus. Die Rolle wird aus dem bestehenden Rollenanker beziehungsweise der
-Konfiguration übernommen. Ist sie nicht eindeutig, muss sie als zweites
-Argument (`off`, `master`, `slave` oder `shadow`) angegeben werden.
+aus. Ein sicherer kanonischer Rollenanker hat Vorrang; nur wenn er fehlt, wird
+eine eindeutige vorhandene Konfiguration als Fallback verwendet. Ein
+widersprüchlicher Rollen- oder Installationsbestand stoppt mit Diagnose.
 
 Die vorhandene `.git`-Fläche ist dabei keine Eingangsbedingung. Der Rettungsweg
 liest weder ihre Rechte noch ihren Index oder ihre lokale Historie als
@@ -82,12 +84,10 @@ Altbestand und kein eigener Abbruchgrund. Unklare Symlinks, Spezialdateien,
 konkurrierende Updates, nicht stoppbare Writer sowie ein fehlgeschlagenes
 Backup oder Dienst-Endgate bleiben harte Stopps.
 
-**Einmaliger Übergang auf 5.4.3i oder neuer:** Installationen bis einschließlich
-5.4.3f besitzen den neuen root-eigenen Web-Launcher noch nicht. Dieser erste
-Wechsel muss deshalb über den oben gezeigten administrativen Konsolenweg
-erfolgen. Seit der erfolgreichen Installation von 5.4.3i richtet der Installer
-den engen Launcher und seine argumentlose sudoers-Freigabe ein; alle folgenden
-normalen Updates können wieder aus dem Dashboard gestartet werden.
+**Einmaliger Übergang aus einem Altstand:** Der oben gezeigte Ein-Datei-Befehl
+installiert den gemeinsamen root-eigenen Dispatcher. Danach verwenden
+Dashboard, Konsole, Installer-Menü und automatische Updateprüfung denselben
+Hintergrundauftrag; ein weiterer Altstands-Workaround ist nicht nötig.
 
 ### Übergang aus älteren 5.4.2-Beständen
 
@@ -120,6 +120,30 @@ dem Root-Lock aus demselben gültigen Nicht-Root-Eigentümer von Repository und
 `.git`, lokales Benutzerkonto und Nutzerwert unmittelbar vor dem ersten
 Import aus dem Zielcode erneut geprüft. Die fail-closed Grenzen und alle
 übrigen Härtungen aus 5.4.3j bleiben unverändert.
+
+### 5.4.4a: ein gemeinsamer Ein-Datei-Updateeinstieg
+
+5.4.4a macht `e3dc-update-bootstrap` zum portablen Community-Einstieg für
+heterogene Altinstallationen. Der Aufruf
+`sudo /bin/sh ./e3dc-update-bootstrap` benötigt weder einen fest codierten
+Installationspfad noch ein vorgeschaltetes `chmod` oder Rollenargument. Der
+damit gestartete veröffentlichte Updatepfad bindet Installationsroot,
+Installationsbenutzer und Anlagenrolle eindeutig. Mehrere gleichrangige
+Kandidaten oder eine widersprüchliche Rolle werden angezeigt und nicht geraten.
+
+Weboberfläche, Konsole, Installer-Menü und automatische Updateprüfung starten
+danach denselben root-eigenen systemd-Hintergrundauftrag. Der vorhandene
+Alt-Updater, lokale Git-Metadaten, getrackte Änderungen und historische
+Dateimodi sind keine vorgelagerte Updateautorität. Installer- und
+Web-Pfadmetadaten werden auf den erkannten Bestand normalisiert und vom
+Zielprozess ohne Bootstrap-Umgebung erneut geprüft.
+
+Der eigentliche Zielvertrag bleibt unverändert: Backup erstellen und prüfen,
+Writer und Dienste stoppen, veröffentlichte Dateien kopieren, Release-Rechte
+setzen, Dienste starten und Gesundheit prüfen. Unsichere Pfade, Links oder
+Spezialdateien, konkurrierende Writer und fehlgeschlagene Backup-, Start- oder
+Healthchecks bleiben harte Stopps. EMS-, Direktvermarktungs-, Wallbox- und
+Hardwarelogik entsprechen unverändert 5.4.4.
 
 ### 5.4.4: konsolidierter Ziel-Updater
 
@@ -246,15 +270,12 @@ müssen bereits root-kontrolliert und frei von unsicheren Links, ACLs oder
 Attributen sein. Der Updater macht einen ungeeigneten Bestandsordner nicht
 durch nachträgliche Rechteänderungen vertrauenswürdig.
 
-Der Web-Update-Launcher bleibt davon bewusst getrennt und weiterhin
-clean-only: Sobald er lokale Änderungen an getrackten Produktdateien erkennt,
-bricht er vor dem Aufruf des Ziel-Updaters ab. Die nachfolgend beschriebene
-Dirty-Recovery gilt ausschließlich für den regulären Konsolen-/nativen
-Root-Updaterpfad und lockert das Web-Gate nicht. 5.4.3l behebt am Web-Einstieg
-nur den EXIT-Cleanup. Auch bei einem frühen Abbruch bleiben dadurch die
-primäre Fehlermeldung und der Exitstatus erhalten; ein bereits erzeugter
-root-eigener Ausführungssnapshot unter `/run` wird entfernt, ohne den
-Primärfehler durch einen nachgelagerten Snapshot-Scope-Fehler zu überdecken.
+Historisch war der damalige Web-Launcher davon getrennt und noch clean-only.
+Der aktuelle gemeinsame Dispatcher verwendet diesen vorgelagerten Git- und
+Dirty-Vertrag nicht mehr; Web, Konsole und automatische Prüfung starten
+denselben Download-Zielpfad. Die hier beschriebene 5.4.3l-Recovery bleibt als
+historischer Rückweg dokumentiert, ist aber keine Startbedingung des heutigen
+Ein-Datei-Bootstraps.
 
 Bei belegten, weiterhin vorhandenen Änderungen an getrackten Dateien stellt
 dieser Rückweg die gesicherten Bytes wieder her und härtet den Dateimodus auf
@@ -342,29 +363,18 @@ dadurch nicht parallel zu einem weiterlaufenden Ziel-Finalizer arbeiten. Nach
 erfolgreicher Installation des neuen Vertrags verwenden alle folgenden Updates
 den Ziel-Updater-Handoff.
 
-Ist der exakt gebundene Release-Stand bereits installiert und stimmt seine
-kanonische Webprojektion überein, endet ein normales Update ohne Backup und
-ohne Dienstunterbrechung mit „Du bist auf dem neuesten Stand“. Dabei werden
-keine Produkt- oder Webdateien, kein Dienstzustand und keine globale oder
-repo-lokale Git-Konfiguration verändert. Die Git-Prüfung verwendet
-ausschließlich pro Aufruf gebundene Optionen. Ungetrackte private Laufzeit-
-und Diagnosedateien lösen dabei keinen Reparaturalarm aus.
+Der gemeinsame Update-Einstieg verwendet auch beim bereits aktuellen Bestand
+den vollständigen Ziel-Updater-Vertrag: Backup erstellen und prüfen, Dienste
+kontrolliert anhalten, den veröffentlichten Stand samt Rechten projizieren,
+Dienste starten und ihren Zustand prüfen. Lokale Git-Metadaten, abweichende
+Dateimodi oder regulär geänderte Produktdateien sperren diesen
+administrativen Reparaturweg nicht mehr vorab. Unsichere Pfadobjekte, ein
+fehlerhaftes Backup, unklare Rollen oder Installationswurzeln, konkurrierende
+Schreiber und ein fehlgeschlagener Wiederanlauf bleiben harte Abbruchgründe.
 
-Weicht dagegen eine getrackte Produktdatei oder eine kanonische Webdatei vom
-veröffentlichten Stand ab, meldet das normale Update `REPAIR_REQUIRED` und
-verändert weder Produkt- oder Webdateien noch Dienstzustände. Die aktuelle
-Version kann dann ausschließlich nach ausdrücklicher Bestätigung auf der
-administrativen Konsole erneut installiert werden:
-
-```bash
-bash "$E3DC_INSTALL_PATH/e3dc-setup" --reinstall-current
-```
-
-Diese Neuinstallation ist ein vollständiger Releasewechsel derselben
-veröffentlichten SHA: verifiziertes Backup, Aktorruhe, Release-Synchronisation,
-Dienst- und Gesundheitsgates sowie ein beweisbarer Rückweg bleiben erhalten.
-`--update-e3dc`, `--reinstall-current` und ein gezielter Release-Tag dürfen
-nicht kombiniert werden.
+`--reinstall-current` und ein gezielter Release-Tag bleiben eigenständige
+administrative Vorgänge und dürfen nicht mit `--update-e3dc` kombiniert
+werden.
 
 Der versiegelte Release-Finalizer meldet seine Phasen und während langer
 Arbeit alle 30 Sekunden einen Heartbeat. Für langsame Raspberry Pis gilt ein
@@ -392,48 +402,31 @@ bash "$E3DC_INSTALL_PATH/e3dc-setup" --fix-permissions
 bash "$E3DC_INSTALL_PATH/e3dc-setup" --check
 ```
 
-Ist bei einer 5.3.2b-Installation bereits der privilegierte
-Web-Launcher fehlend oder nicht ausführbar, kann die Weboberfläche genau
-diesen Einstieg nicht selbst reparieren. Dann ist einmalig eine interaktive
-SSH-Konsole erforderlich. Bei der üblichen Installation ist folgende Kette
-vollständig kopierbar:
+Ist bei einer Altinstallation der privilegierte Web-Launcher fehlend oder nicht
+ausführbar, wird die veröffentlichte Datei `e3dc-update-bootstrap` auf den
+Raspberry Pi kopiert. In der SSH-Konsole genügt unabhängig vom
+Installationspfad:
 
 ```bash
-export E3DC_INSTALL_PATH="$HOME/Install"
-test -f "$E3DC_INSTALL_PATH/installer_main.py"
-test -x "$HOME/.venv_e3dc/bin/python3"
-cd "$E3DC_INSTALL_PATH"
-sudo /usr/bin/python3 installer_main.py --fix-permissions
-sudo /usr/bin/python3 -I -B -u installer_main.py --check
-sudo /usr/bin/python3 -I -B -u installer_main.py --update-e3dc
-cat VERSION
-systemctl --failed --no-pager
+sudo /bin/sh ./e3dc-update-bootstrap
 ```
 
-Für den einmaligen Wechsel aus 5.3.2b ist ausschließlich der oben gezeigte
-direkte Konsolenaufruf mit `--update-e3dc` freigegeben. Der Web-Launcher ist
-in diesem Altstand noch nicht vorhanden. Der interaktive Installer-Menüpunkt lädt im
-Altprozess bereits vor dem Git-Wechsel zusätzliche Module und darf für diesen
-Hybridübergang nicht verwendet werden.
-
-Liegt E3DC-Control nicht unter `$HOME/Install`, muss ausschließlich die erste
-Zeile an den tatsächlichen absoluten Installationspfad angepasst werden. Eine
-Passwortabfrage von `sudo` ist an der interaktiven SSH-Konsole in diesem Fall
-normal. Schlägt eine der beiden `test`-Zeilen fehl, bitte dort stoppen und
-weder System-`pip` noch `--break-system-packages` verwenden. Nach der
-erfolgreichen Reparatur steht der reguläre Web-Update-Pfad wieder zur
-Verfügung.
+Der Bootstrap startet das Update im Hintergrund und führt weder den alten
+Web-Launcher noch den alten `installer_main.py`-Updatepfad aus. Eine
+Passwortabfrage von `sudo` ist an der interaktiven SSH-Konsole normal. Meldet
+der Bootstrap mehrere gleichrangige Installationen oder einen
+widersprüchlichen Rollenbestand, bitte dort stoppen und die ausgegebenen
+Kandidaten prüfen. Nach einem erfolgreichen Abschluss steht der reguläre
+Web-Update-Pfad wieder zur Verfügung.
 
 Python-Abhängigkeiten werden bei einem Release-Wechsel ausschließlich im
 gebundenen Benutzer-venv installiert. Auf Debian-Systemen mit PEP 668 wird
 deshalb kein System-`pip` und kein `--break-system-packages` verwendet. Fehlt
-das Standard-venv, darf der neue Installer nach Installation von
-`python3-venv` genau dieses venv im Home des Installationsbenutzers neu
-anlegen. Beim direkten ersten Wechsel aus 5.3.2b läuft bis zum
-Git-Wechsel noch der alte Prozess; für diesen ersten Schritt muss das
-gebundene Benutzer-venv bereits vorhanden sein. Andernfalls bricht der
-Altprozess ab und stellt den Ausgangszustand wieder her. Abweichende oder
-mehrdeutige venv-Pfade brechen den Updatevorgang ebenfalls ab.
+das Standard-venv, darf der heruntergeladene Ziel-Installer nach Installation
+von `python3-venv` genau dieses venv im Home des Installationsbenutzers neu
+anlegen. Der Ein-Datei-Bootstrap führt hierfür keinen alten lokalen
+Installerprozess weiter. Abweichende oder mehrdeutige venv-Pfade brechen den
+Updatevorgang weiterhin ab.
 
 ## Einmalige ML-Lock-Reparatur für Alt-Updater bis 5.4.1c
 

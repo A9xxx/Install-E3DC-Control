@@ -12,6 +12,24 @@ export E3DC_INSTALL_PATH="/absoluter/pfad/zur/installation"
 test -f "$E3DC_INSTALL_PATH/e3dc-setup"
 ```
 
+## Ein-Datei-Update und Rückweg in 5.4.4a
+
+5.4.4a macht `e3dc-update-bootstrap` zum portablen vorwärtsgerichteten
+Updateeinstieg für heterogene Altinstallationen. Der damit gestartete
+veröffentlichte Updatepfad erkennt Installationsroot, Installationsbenutzer und
+Anlagenrolle eindeutig und arbeitet als gemeinsamer root-eigener
+Hintergrundauftrag. Der vorhandene Alt-Updater,
+lokale Git-Metadaten, Dirty-Status und historische Dateimodi sind keine
+vorgelagerte Rückfall- oder Updateautorität. Mehrdeutige Installationen oder
+Rollen bleiben gesperrt.
+
+Der Rückweg bleibt an das vor jeder Produktmutation erstellte und geprüfte
+Backup sowie die konkrete Transaktion gebunden. Erst danach werden Writer und
+Dienste gestoppt, Dateien und Rechte projiziert und Dienststart sowie
+Gesundheit geprüft. Der Ein-Datei-Bootstrap ist kein freier Programm-Rollback;
+freie Commits und nicht gebundene Zielstände bleiben ausgeschlossen. EMS-,
+Direktvermarktungs-, Wallbox- und Hardwarelogik entsprechen unverändert 5.4.4.
+
 ## Konsolidierter Update- und Rückweg in 5.4.4
 
 5.4.4 führt den gebundenen Rückfallvertrag fort. Der Web-Updater führt den
@@ -116,7 +134,7 @@ oder einen Prozessabbruch außerhalb des erkannten Fehlerpfads.
 
 ## Programmstand zurücksetzen
 
-Der aktuelle Stable-Stand `v5.4.4` führt den gebundenen Rückfallvertrag fort.
+Der aktuelle Stable-Stand `v5.4.4a` führt den gebundenen Rückfallvertrag fort.
 
 Beim Rücklauf wird der tatsächliche Dateisystemzustand einer Unit weiterhin
 streng gegen reguläre Unit-Datei, kanonische `/dev/null`-Maske, unerwarteten

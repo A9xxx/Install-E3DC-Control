@@ -20,6 +20,7 @@ PYTHON_BIN="$SYSTEM_PYTHON"
 PYTHON_FLAGS=()
 WEB_INSTALLER="${SCRIPT_DIR}/web_installer.py"
 INSTALLER_MAIN="${SCRIPT_DIR}/../installer_main.py"
+UPDATE_DISPATCHER="/usr/local/sbin/e3dc-web-update-launcher"
 
 bind_release_system_python() {
     local resolved owner mode parent_owner parent_mode
@@ -92,17 +93,32 @@ if [ -n "$MODULE" ] && [[ ! "$MODULE" =~ ^[A-Za-z0-9_.-]+$ ]]; then
     exit 1
 fi
 
+# Das reguläre Update besitzt genau einen privilegierten Einstieg. Es darf
+# weder vom lokalen Pythonbestand noch von einem durch den Aufrufer gewählten
+# Installationspfad abhängen.
+if [ "$ACTION" = "update_e3dc" ]; then
+    if [ -n "$MODULE" ]; then
+        echo "Die Aktion update_e3dc akzeptiert weder Modul noch Zielpfad." >&2
+        exit 64
+    fi
+    if [ ! -x "$UPDATE_DISPATCHER" ]; then
+        echo "Root-eigener Update-Dispatcher fehlt: $UPDATE_DISPATCHER" >&2
+        exit 127
+    fi
+    exec "$UPDATE_DISPATCHER"
+fi
+
 if [ ! -f "$WEB_INSTALLER" ]; then
     echo "web_installer.py nicht gefunden: $WEB_INSTALLER"
     exit 1
 fi
 
-if [[ "$ACTION" =~ ^(check|fix_permissions|update_e3dc|reinstall_current|install_release)$ ]] && [ ! -f "$INSTALLER_MAIN" ]; then
+if [[ "$ACTION" =~ ^(check|fix_permissions|reinstall_current|install_release)$ ]] && [ ! -f "$INSTALLER_MAIN" ]; then
     echo "installer_main.py nicht gefunden: $INSTALLER_MAIN"
     exit 1
 fi
 
-if [[ "$ACTION" =~ ^(update_e3dc|reinstall_current|install_release)$ ]]; then
+if [[ "$ACTION" =~ ^(reinstall_current|install_release)$ ]]; then
     bind_release_system_python || exit 1
 elif [[ "$ACTION" =~ ^(check|fix_permissions)$ ]]; then
     select_installer_python || exit 1
@@ -137,7 +153,7 @@ case "$ACTION" in
         exec "$PYTHON_BIN" "${PYTHON_FLAGS[@]}" "$INSTALLER_MAIN" --fix-permissions
         ;;
     update_e3dc)
-        exec "$PYTHON_BIN" "${PYTHON_FLAGS[@]}" "$INSTALLER_MAIN" --update-e3dc
+        exec "$UPDATE_DISPATCHER"
         ;;
     reinstall_current)
         exec "$PYTHON_BIN" "${PYTHON_FLAGS[@]}" "$INSTALLER_MAIN" --reinstall-current

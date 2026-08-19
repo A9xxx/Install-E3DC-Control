@@ -68,7 +68,7 @@ DIRECT_MARKETING_PV_AXIS_EVIDENCE_SCHEMA = (
 DIRECT_MARKETING_PASSIVE_NORMAL_BINDING_SCHEMA = PASSIVE_NORMAL_BINDING_SCHEMA
 TIMEZONE = "Europe/Berlin"
 SLOT_DURATION_S = 900
-ACTIVE_ACTIONS = {"PV_STORE", "GRID_CHARGE", "ECONOMIC_EXPORT", "HEADROOM_EXPORT", "HOUSE_SUPPLY", "CHARGE_BLOCK_WAIT"}
+ACTIVE_ACTIONS = {"PV_STORE", "GRID_CHARGE", "ECONOMIC_EXPORT", "HEADROOM_EXPORT", "HOUSE_SUPPLY", "CHARGE_BLOCK_WAIT", "DV_CURVE_CHARGE"}
 DIRECT_MARKETING_ACTION_ROLES_SCHEMA = "direct_marketing_action_roles_v1"
 SHADOW_EXECUTION_READINESS_SCHEMA = "shadow_execution_readiness_v1"
 SHADOW_EXECUTION_REVISION_KEYS = ("schema_version", "plan_id", "slot_id")
@@ -2095,6 +2095,7 @@ def _direct_marketing_policy_projection_for_slot(
             # entstehen; ein eingespielter Arbitragevertrag bleibt wirkungslos.
             "FORCE_EXPORT": ("ECONOMIC_EXPORT", {"eco_plus_export_candidate"}, "export_budget_w"),
             "FORCE_CHARGE_PV": ("PV_STORE", {"eco_plus_store_pv_candidate"}, "charge_budget_w"),
+            "DV_CURVE_CHARGE": ("DV_CURVE_CHARGE", {"eco_plus_curve_charge_candidate"}, "charge_budget_w"),
             # Eine Ladesperre ist nur dann ein aktiver Hardwarevertrag, wenn
             # die Policy sie als aktuellen, slotgebundenen Planentscheid
             # veröffentlicht. HOLD und künftige Exportfenster genügen nicht.
@@ -2107,6 +2108,7 @@ def _direct_marketing_policy_projection_for_slot(
         allowed_source_modes = {
             "ECONOMIC_EXPORT": {"eco_plus"},
             "PV_STORE": {"eco", "eco_plus"},
+            "DV_CURVE_CHARGE": {"eco", "eco_plus"},
             # Der Producer materialisiert den lückenlosen Warteslot-Vertrag
             # derzeit ausschließlich für Eco+. Der Consumer darf diese
             # Freigabe nicht vorsorglich auf weitere Strategien ausdehnen.
@@ -3328,8 +3330,12 @@ def _materialize_direct_marketing_trajectory(
                 0.0,
                 _safe_float(contract.get("planned_w"), 0.0) or 0.0,
             )
-        if selected and action == "PV_STORE":
-            reason_code = "DIRECT_MARKETING_SELECTED_PV_STORE"
+        if selected and action in {"PV_STORE", "DV_CURVE_CHARGE"}:
+            reason_code = (
+                "DIRECT_MARKETING_SELECTED_DV_CURVE_CHARGE"
+                if action == "DV_CURVE_CHARGE"
+                else "DIRECT_MARKETING_SELECTED_PV_STORE"
+            )
             room_wh = max(0.0, ceiling_wh - energy_start_wh)
             pv_charge_available_w = max(0.0, residual_before_w)
             pv_store_source_contract = str(
@@ -3451,19 +3457,15 @@ def _materialize_direct_marketing_trajectory(
                     _safe_float(projection.get("battery_w"), 0.0) or 0.0
                 )
                 if baseline_battery_w >= 0.0:
-                    # PASSIVE_NORMAL delegiert ausschließlich die normale
-                    # Hausversorgung. Positive Kurven-/Reserveladung braucht
-                    # immer selected PV_STORE oder die typisierte künftige
-                    # PV_STORE-Reservierungsfreigabe.
-                    deficit_w = max(0.0, -residual_before_w)
-                    available_wh = max(0.0, energy_start_wh - floor_wh)
-                    requested_w = deficit_w
-                    discharge_w = min(
-                        deficit_w,
-                        max_discharge_w,
-                        available_wh * discharge_efficiency / slot_hours,
+                    room_wh = max(0.0, ceiling_wh - energy_start_wh)
+                    charge_available_w = max(0.0, residual_before_w)
+                    charge_w = min(
+                        baseline_battery_w if baseline_battery_w > 0.0 else charge_available_w,
+                        charge_available_w,
+                        max_charge_w if max_charge_w > 0.0 else charge_available_w,
+                        room_wh / charge_efficiency / slot_hours,
                     )
-                    battery_w = -discharge_w
+                    battery_w = charge_w
                 else:
                     requested_w = abs(baseline_battery_w)
                     deficit_w = max(0.0, -residual_before_w)
@@ -4632,6 +4634,7 @@ def validate_canonical_plan_static(plan: Dict[str, Any]) -> Dict[str, Any]:
                             "PV_STORE",
                             "ECONOMIC_EXPORT",
                             "CHARGE_BLOCK_WAIT",
+                            "DV_CURVE_CHARGE",
                         }
                         and str(selection.get("action_id") or "").startswith(
                             "sha256:"
@@ -4929,7 +4932,7 @@ def validate_canonical_plan_static(plan: Dict[str, Any]) -> Dict[str, Any]:
                     if not math.isfinite(available_discharge_hi_w):
                         available_discharge_hi_w = None
                 action_power_invalid = False
-                if action == "PV_STORE" and (battery_w or 0.0) >= 0.0:
+                if action in {"PV_STORE", "DV_CURVE_CHARGE"} and (battery_w or 0.0) >= 0.0:
                     source_contract = str(
                         selection.get("pv_store_source_contract")
                         if selection.get("selected") is True
@@ -4977,7 +4980,30 @@ def validate_canonical_plan_static(plan: Dict[str, Any]) -> Dict[str, Any]:
                         or abs(battery_w or 0.0)
                         > (available_discharge_hi_w or 0.0) + 0.0005
                     )
-                elif action in {"PASSIVE_NORMAL", "CHARGE_BLOCK_WAIT"}:
+                elif action == "PASSIVE_NORMAL":
+                    if (battery_w or 0.0) >= 0.0:
+                        action_power_invalid = bool(
+                            max_charge_w is None
+                            or (battery_w or 0.0)
+                            > min(
+                                max(0.0, (residual_before_w or 0.0)),
+                                max_charge_w or 0.0,
+                            )
+                            + 0.01
+                        )
+                    else:
+                        action_power_invalid = bool(
+                            available_discharge_hi_w is None
+                            or abs(battery_w or 0.0)
+                            > min(
+                                max(0.0, -(residual_before_w or 0.0)),
+                                max_discharge_w or 0.0,
+                            )
+                            + 0.01
+                            or abs(battery_w or 0.0)
+                            > (available_discharge_hi_w or 0.0) + 0.0005
+                        )
+                elif action == "CHARGE_BLOCK_WAIT":
                     action_power_invalid = bool(
                         available_discharge_hi_w is None
                         or abs(battery_w or 0.0)
@@ -5162,6 +5188,7 @@ def _selected_action_projection_binding(
     expected_sources = {
         "ECONOMIC_EXPORT": ("eco_plus_export_candidate", {"eco_plus"}),
         "PV_STORE": ("eco_plus_store_pv_candidate", {"eco", "eco_plus"}),
+        "DV_CURVE_CHARGE": ("eco_plus_curve_charge_candidate", {"eco", "eco_plus"}),
         "CHARGE_BLOCK_WAIT": (
             "direct_marketing_charge_block_wait",
             {"eco_plus"},
@@ -5708,7 +5735,7 @@ def _direct_marketing_selected_action_projection(
                 projection.get("direct_marketing_planned_w"),
                 None,
             )
-            positive_power = action in {"PV_STORE", "ECONOMIC_EXPORT"}
+            positive_power = action in {"PV_STORE", "ECONOMIC_EXPORT", "DV_CURVE_CHARGE"}
             zero_power = action == "CHARGE_BLOCK_WAIT"
             if not bool(
                 planned_w is not None
@@ -6256,7 +6283,7 @@ def _effective_storage_plan_projection(
     )
     if action is None and not unknown_runtime_action and direct_active and passive_binding:
         action = "PASSIVE_NORMAL"
-    known = {"CHARGE_BLOCK_WAIT", "PV_STORE", "ECONOMIC_EXPORT", "HEADROOM_EXPORT", "PASSIVE_NORMAL"}
+    known = {"CHARGE_BLOCK_WAIT", "PV_STORE", "ECONOMIC_EXPORT", "HEADROOM_EXPORT", "PASSIVE_NORMAL", "DV_CURVE_CHARGE"}
 
     projected_action = _runtime_storage_action(projection.get("direct_marketing_plan_action"))
     candidate_action = _runtime_storage_action(candidate.get("action"))
@@ -6274,7 +6301,7 @@ def _effective_storage_plan_projection(
         identity_source = "phase5_candidate"
     elif action == "PASSIVE_NORMAL":
         action_id = passive_binding.get("policy_action_id")
-        window_id = passive_binding.get("window_id")
+        window_id = passive_binding.get("window_id") or "passive_normal_window"
         segment_id = passive_binding.get("policy_slot_id")
         identity_source = "passive_normal_binding"
 
@@ -6344,7 +6371,7 @@ def _effective_storage_plan_projection(
             consistent, reason = False, "LIFECYCLE_EFFECT_WITHOUT_ISSUE"
         elif action == "CHARGE_BLOCK_WAIT" and _safe_int(runtime.get("charge_budget_w"), 0) != 0:
             consistent, reason = False, "CHARGE_BLOCK_NONZERO_BUDGET"
-        elif active_effect and action == "PV_STORE" and _safe_int(runtime.get("charge_budget_w"), 0) <= 0:
+        elif active_effect and action in {"PV_STORE", "DV_CURVE_CHARGE"} and _safe_int(runtime.get("charge_budget_w"), 0) <= 0:
             consistent, reason = False, "PV_STORE_WITHOUT_POSITIVE_BUDGET"
         elif active_effect and action in {"ECONOMIC_EXPORT", "HEADROOM_EXPORT"} and _safe_int(runtime.get("export_budget_w"), 0) <= 0:
             consistent, reason = False, "EXPORT_WITHOUT_POSITIVE_BUDGET"
@@ -6353,7 +6380,7 @@ def _effective_storage_plan_projection(
     if not consistent:
         status = "EVIDENCE_LIMIT"
 
-    curve_authorized = status in {"CLASSICAL_CURVE_EFFECTIVE", "DIRECT_MARKETING_PV_STORE_EFFECTIVE", "DIRECT_MARKETING_PASSIVE_NORMAL_EFFECTIVE"}
+    curve_authorized = status in {"CLASSICAL_CURVE_EFFECTIVE", "DIRECT_MARKETING_PV_STORE_EFFECTIVE", "DIRECT_MARKETING_PASSIVE_NORMAL_EFFECTIVE", "DIRECT_MARKETING_DV_CURVE_CHARGE_EFFECTIVE"}
     target_authorized: Optional[bool] = True if curve_authorized else False if status.endswith("_EFFECTIVE") else None
     curve_w: Optional[int] = None
     if curve_authorized:
@@ -6361,7 +6388,7 @@ def _effective_storage_plan_projection(
             max(0, _safe_int(passive_curve.get("preserved_charge_w"), 0))
             if action == "PASSIVE_NORMAL"
             else max(0, _safe_int(runtime.get("charge_budget_w"), 0))
-            if action == "PV_STORE"
+            if action in {"PV_STORE", "DV_CURVE_CHARGE"}
             else max(0, _safe_int(payload.get("iFc_w"), 0))
         )
     elif status.endswith("_EFFECTIVE"):
@@ -6690,7 +6717,7 @@ def _direct_marketing_runtime_plan_binding(
     action = str(candidate.get("action") or "").upper()
     selected_action = str(phase5.get("selected_action") or "").upper()
     runtime_claim = bool(
-        action in {"ECONOMIC_EXPORT", "PV_STORE", "GRID_CHARGE", "CHARGE_BLOCK_WAIT"}
+        action in {"ECONOMIC_EXPORT", "PV_STORE", "GRID_CHARGE", "CHARGE_BLOCK_WAIT", "DV_CURVE_CHARGE"}
         and any(
             (
                 phase5.get("selected") is True and selected_action == action,
@@ -6713,11 +6740,12 @@ def _direct_marketing_runtime_plan_binding(
     expected_source_action = {
         "ECONOMIC_EXPORT": "eco_plus_export_candidate",
         "PV_STORE": "eco_plus_store_pv_candidate",
+        "DV_CURVE_CHARGE": "eco_plus_curve_charge_candidate",
         "CHARGE_BLOCK_WAIT": "direct_marketing_charge_block_wait",
     }.get(action)
     source_mode_valid = bool(
         (action == "ECONOMIC_EXPORT" and source_mode == "eco_plus")
-        or (action == "PV_STORE" and source_mode in {"eco", "eco_plus"})
+        or (action in {"PV_STORE", "DV_CURVE_CHARGE"} and source_mode in {"eco", "eco_plus"})
         or (action == "CHARGE_BLOCK_WAIT" and source_mode == "eco_plus")
     )
     window_id = projection.get("direct_marketing_window_id")
@@ -7155,7 +7183,7 @@ def build_runtime_overlay(
         and executable
         and commands_allowed
     )
-    charge_budget_w = value_w if commands_allowed and effective_action in {"PV_STORE", "GRID_CHARGE"} else 0
+    charge_budget_w = value_w if commands_allowed and effective_action in {"PV_STORE", "GRID_CHARGE", "DV_CURVE_CHARGE"} else 0
     export_budget_w = value_w if commands_allowed and effective_action in {"ECONOMIC_EXPORT", "HEADROOM_EXPORT"} else 0
     power_diag = payload.get("rscp_power_settings") if isinstance(payload.get("rscp_power_settings"), dict) else {}
     readback = power_diag.get("readback") if isinstance(power_diag.get("readback"), dict) else {}

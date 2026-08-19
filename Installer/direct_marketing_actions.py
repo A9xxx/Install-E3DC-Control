@@ -96,6 +96,15 @@ STORAGE_ACTION_CONTRACTS: Dict[str, Dict[str, Any]] = {
         "phase5_command": True,
         "field_released": False,
     },
+    "DV_CURVE_CHARGE": {
+        "direction": "charge",
+        "effect": "AUTO_CHARGE_CAP",
+        "manager_action": "DV_CURVE_CHARGE",
+        "canonical_active": True,
+        "phase5_command": False,
+        "field_released": True,
+        "discharge_contract": "RESERVE_AND_HARDWARE_BOUND_AUTO",
+    },
 }
 
 

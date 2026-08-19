@@ -2,8 +2,15 @@
 
 Veröffentlichte Images entstehen ausschließlich aus einem versionierten stabilen Release-Tag. `latest` verweist damit auf die zuletzt veröffentlichte stabile Version.
 
-Der aktuelle Stable-Stand ist `v5.4.4`. Die Tags `latest`, `v5.4.4` und
-`5.4.4` müssen auf denselben geprüften Multi-Arch-Digest verweisen.
+Der aktuelle Stable-Stand ist `v5.4.4a`. Die Tags `latest`, `v5.4.4a` und
+`5.4.4a` müssen auf denselben geprüften Multi-Arch-Digest verweisen.
+
+5.4.4a vereinheitlicht ausschließlich den Bare-Metal-Updateeinstieg mit der
+einzelnen Community-Datei `e3dc-update-bootstrap` und dem Aufruf
+`sudo /bin/sh ./e3dc-update-bootstrap`. Dieser Host-Bootstrap gehört nicht in
+den Containerlayer. Das Docker-Image erhält keine neue Updateautorität und
+keinen zusätzlichen Hardwarepfad; EMS-, Direktvermarktungs-, Wallbox- und
+Hardwarelogik entsprechen unverändert 5.4.4.
 
 5.4.4 ist der konsolidierte Zielstand für heterogene Installationen. Der
 root-eigene Web-Snapshot und die Normalisierung historischer Hostrechte oder
@@ -275,7 +282,7 @@ unverändert gesperrt und benötigen eine manuelle Prüfung.
 
 Ohne `E3DC_IMAGE_TAG` folgt diese Compose-Datei dem geprüften Stable-Tag
 `latest`. Ein fester Tag bleibt bei `pull` absichtlich unverändert. Für einen
-bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.4` in der Datei `.env`
+bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.4a` in der Datei `.env`
 gesetzt. `docker compose config --images` zeigt vorab das tatsächlich gewählte
 Image.
 
@@ -302,7 +309,7 @@ Versionswahl.
 
 Gezielte Rückfallversion:
 
-Den Stable-Container `v5.4.4` auf den veröffentlichten Rollback-Root
+Den Stable-Container `v5.4.4a` auf den veröffentlichten Rollback-Root
 `v5.3.2b` zurücksetzen:
 
 ```bash

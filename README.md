@@ -1,12 +1,12 @@
 # E3DC-Control Web-Portal & Installer
 
-Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.4.4</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
+Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.4.4a</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
 
 ![E3DC-Control Dashboard](html/app-icon-512.png)
 
 ## Aktuelle Version und Update
 
-Die aktuelle stabile Version ist **5.4.4**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur geprüften Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
+Die aktuelle stabile Version ist **5.4.4a**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur geprüften Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
 
 > [!WARNING]
 > **⚠️ Achtung: Nutzung auf eigenes Risiko!**
@@ -19,6 +19,8 @@ Die aktuelle stabile Version ist **5.4.4**. Hinweise zum Web-, Konsolen- und Doc
 > **Config-Schutz:** Standardinstallationen speichern `data/e3dc_v4.json` und lokale Config-Backups mit `660` für Install-User und `www-data`, damit WebUI und Dienste weiter automatisch starten, die Datei aber nicht mehr weltlesbar ist. Der normale Config-Download ist redigiert; der Raw-Download enthält Zugangsdaten und wird nur angeboten, wenn eine Web-PIN gesetzt ist. Der Kompatibilitätsmodus (`664`) ist nur für eigene externe Leser gedacht.
 
 > **Bedienansichten:** Config-Editor und Wallbox-Seite unterscheiden zwischen einfacher Ansicht für Einrichtung und täglichen Betrieb sowie erweiterter Ansicht für alle Detailparameter. Die Logik und Abgrenzung sind in [doc/Frontend_Ansichten.md](doc/Frontend_Ansichten.md) dokumentiert.
+
+> **Neu in 5.4.4a Stable:** E3DC-Control 5.4.4a stabilisiert die Wallbox-Phasenumschaltung, beseitigt das 3-Minuten-Takten bei aktiver Ladekurve und härtet die Hausverbrauchs- sowie Ertragsberechnung im Web-Frontend.
 
 > **Neu in 5.4.4 Stable:** Der konsolidierte Zielstand aktualisiert heterogene Altanlagen über den heruntergeladenen, root-eigenen Ziel-Updater nach geprüftem Backup, Dienststopp und Writer-Ruhe; frühere Rechte und eng bekannte alte Dienstdarstellungen werden auf den Releasezustand normalisiert. Wallbox-Start, Heartbeat und openWB-Pro-Phasenfortschritt bleiben eindeutig, während Netzladen eine eigene aktuelle Freigabe benötigt. Der WB-Entladungsschutz gilt nur bei real gemessener Fahrzeuglast. Bei aktiver Direktvermarktung zeigt die WebUI ausschließlich den an Plan, Slot und bestätigte Phase-5-Wirkung gebundenen effektiven Speicherplan; ausstehende oder widersprüchliche Evidenz blendet klassische Zielkurve und Leistung aus. Es entsteht kein zusätzlicher Hardwareausgang.
 
@@ -123,8 +125,8 @@ Die aktuelle stabile Version ist **5.4.4**. Hinweise zum Web-, Konsolen- und Doc
 * **Betriebswartung:** Log-Rotation und begrenzte Update-/Installer-Backups reduzieren den Speicherbedarf. Die Rechteprüfung kann bekannte Abweichungen korrigieren; Systemzustand und freier Speicher bleiben zu überwachen.
 
 ### 🔄 Auto-Update & Rollback
-* **Web-Updater:** Freigegebene Stable-Stände lassen sich über einen argumentlosen, root-eigenen Systemjob im Web-Dashboard (`index.php`) installieren. Der Launcher akzeptiert weder freie Installer-Aktionen noch Pfade, Tags, Reparaturen oder Rückfälle, bindet den veröffentlichten Ausgangsstand und führt den Installer aus einem versiegelten Snapshot aus. Der Browser zeigt den Installationsfortschritt; Fehler brechen den Vorgang ab und bleiben diagnostizierbar.
-* **Altinstallations-Bootstrap:** Scheitert ein alter lokaler Updater an historischen Dateirechten oder Dienstdarstellungen, kann `e3dc-update-bootstrap` den aktuellen veröffentlichten Ziel-Updater direkt von GitHub laden. Bekannte Release-Dateien und -Dienste werden nach geprüftem Backup auf den Zielzustand normalisiert; der vorhandene Alt-Updater wird dabei nicht ausgeführt. Der knappe Konsolenbefehl und die verbleibenden echten Stop-Gründe stehen in [doc/Update.md](doc/Update.md).
+* **Ein gemeinsamer Updateauftrag:** Web-Dashboard, Konsole, Installer-Menü und automatische Updateprüfung starten denselben root-eigenen Hintergrundjob. Lokale Git-Änderungen, historische Dateirechte oder ein abweichender Installationsordner blockieren die Jobannahme nicht; der Ziel-Updater behält Backup-, Writer-, Sicherheits- und Gesundheitsprüfung.
+* **Ein-Datei-Bootstrap für Altinstallationen:** `e3dc-update-bootstrap` wird an einen beliebigen Ort auf den Raspberry Pi kopiert und mit `sudo /bin/sh ./e3dc-update-bootstrap` gestartet. Der veröffentlichte Updatepfad ermittelt Installationsordner, Installationsbenutzer und Rolle selbst, arbeitet als systemd-Auftrag im Hintergrund und führt den vorhandenen Alt-Updater nicht aus. Der genaue Ablauf und die verbleibenden echten Stop-Gründe stehen in [doc/Update.md](doc/Update.md).
 * **Optionale Updateprüfung:** Das System kann nachts nach einem freigegebenen Stable-Stand suchen und den geprüften Installerweg starten.
 * **Umgebungsgebundener Rückfall:** Docker kann auf das in `UPDATE_POLICY.json` exakt gebundene Image `v5.3.2b` zurückgesetzt werden. Bare-Metal-Installationen bieten für diesen Altstand keinen Programm-Rückfall an; verifizierte Datei-Backups bleiben wiederherstellbar.
 
@@ -504,7 +506,7 @@ sudo docker compose logs --tail=80 e3dc-control
 > `ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}`. Ohne Eintrag
 > folgt sie dem geprüften Stable-Tag `latest`. Ein fester Versions-Tag wechselt
 > bei `pull` absichtlich nicht; für einen bewussten Pin wird
-> `E3DC_IMAGE_TAG=v5.4.4` in `.env` gesetzt. `config --images` zeigt vor dem
+> `E3DC_IMAGE_TAG=v5.4.4a` in `.env` gesetzt. `config --images` zeigt vor dem
 > Pull das tatsächlich gewählte Image.
 >
 > Ein fehlgeschlagener `pull` ist ein harter Abbruch. Nach begonnenem

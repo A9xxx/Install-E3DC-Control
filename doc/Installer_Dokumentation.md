@@ -1,10 +1,29 @@
 # Betrieb des E3DC-Control Installers
 
-Dokumentation Stand: 5.4.4
+Dokumentation Stand: 5.4.4a
 
 Der Installer ist der freigegebene Einstieg für Installation, Update,
 Reparatur, Backup, Rollback und Deinstallation. Die vollständige Bedienung ist
 in [E3DC-Control Installer](Installer.md) beschrieben.
+
+Für heterogene Altinstallationen wird genau eine Datei auf den Raspberry Pi
+kopiert. Der Aufruf `sudo /bin/sh ./e3dc-update-bootstrap` erkennt
+Installationsordner, Installationsbenutzer und Rolle selbst und startet den
+gemeinsamen systemd-Hintergrundauftrag. Nach diesem einmaligen Übergang nutzen
+Dashboard, Konsole, Installer-Menü und automatische Updateprüfung denselben
+Dispatcher.
+
+Der Installer-Anteil von 5.4.4a verwendet den vorhandenen Alt-Updater, lokale
+Git-Metadaten, getrackte Änderungen und historische Dateimodi nicht als
+vorgelagertes Gate. Der gestartete veröffentlichte Updatepfad bindet
+Installationsroot, Installationsbenutzer und Anlagenrolle eindeutig; mehrere
+gleichrangige Kandidaten oder widersprüchliche Rollen stoppen mit Diagnose.
+Alte Installer- und
+Web-Pfadmetadaten werden auf den erkannten Bestand normalisiert und vom
+Zielprozess ohne Bootstrap-Umgebung erneut geprüft. Danach gilt weiterhin der
+vollständige Ablauf: Backup erstellen und prüfen, Writer und Dienste stoppen,
+Dateien und Rechte projizieren, Dienste starten und Gesundheit prüfen. EMS-,
+Direktvermarktungs-, Wallbox- und Hardwarelogik entsprechen unverändert 5.4.4.
 
 Der Installer-Anteil von 5.4.4 konsolidiert Web- und Download-Update für
 heterogene Altanlagen. Der veröffentlichte Ziel-Updater läuft aus einem

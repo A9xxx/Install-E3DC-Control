@@ -3261,7 +3261,7 @@ def _enrich_policy_candidate_contract(decision, windows, now_ms):
     executable = bool(result.get("commands_allowed") and not result.get("blocked") and selected_action)
     if target_state == "FORCE_EXPORT":
         executable = executable and safe_float(budget.get("export_budget_w"), 0.0) > 0.0
-    elif target_state == "FORCE_CHARGE_PV":
+    elif target_state in {"FORCE_CHARGE_PV", "DV_CURVE_CHARGE"}:
         executable = executable and safe_float(budget.get("charge_budget_w"), 0.0) > 0.0
     elif target_state not in DIRECT_MARKETING_ACTIVE_TARGETS:
         executable = False
@@ -3411,7 +3411,7 @@ def _policy_rollforward_soc(
         export_pct = export_w * duration_h / capacity_wh * 100.0
         return _clamp(start_soc + passive_discharge_pct - export_pct, 0.0, 100.0)
 
-    if target_state == "FORCE_CHARGE_PV":
+    if target_state in {"FORCE_CHARGE_PV", "DV_CURVE_CHARGE"}:
         charge_wh, used_forecast = _policy_forecast_charge_wh(
             annotated,
             start_ts,
@@ -3594,8 +3594,8 @@ def _build_charge_block_wait_policy_slots(
     slots = sorted(
         (
             {
-                "start_ts": safe_int(item.get("ts"), 0),
-                "end_ts": safe_int(item.get("end_ts"), 0),
+                "start_ts": safe_int(_slot_ts(item), 0),
+                "end_ts": safe_int(_slot_end_ts(item), 0),
             }
             for item in (annotated or [])
             if isinstance(item, dict)
@@ -3623,7 +3623,14 @@ def _build_charge_block_wait_policy_slots(
         report["reason"] = "planned_900s_slots_not_contiguous"
         return [], [], report
 
-    decisions = [item for item in (policy_timeline or []) if isinstance(item, dict)]
+    decisions = [
+        item for item in (policy_timeline or [])
+        if isinstance(item, dict)
+        and not (
+            item.get("blocked") is True
+            and str(item.get("dv_target_state") or "").upper() in {"HOLD", "NORMAL"}
+        )
+    ]
 
     def decisions_for_slot(slot):
         return [
@@ -3684,7 +3691,7 @@ def _build_charge_block_wait_policy_slots(
                 or safe_float(storage_budget.get("export_budget_w"), 0.0) < 300.0
             )
         )
-        if target in {"FORCE_EXPORT", "FORCE_CHARGE_PV", "HEADROOM_EXPORT"} and not headroom_hold:
+        if target in {"FORCE_EXPORT", "FORCE_CHARGE_PV", "HEADROOM_EXPORT", "DV_CURVE_CHARGE"} and not headroom_hold:
             selected = (
                 decision.get("selected_window")
                 if isinstance(decision.get("selected_window"), dict)
@@ -8972,18 +8979,34 @@ def build_direct_marketing_shadow_plan(
         efficiency,
     )
     valid_until_ts = _plan_valid_until_ts(windows, now_ms)
+    timeline_horizon_slots = [
+        {
+            "ts": _slot_ts(slot),
+            "end_ts": _slot_end_ts(slot),
+        }
+        for slot in (timeline or [])
+        if isinstance(slot, dict) and _slot_end_ts(slot) > now_ms
+    ]
     (
         charge_block_wait_slots,
         neutral_policy_slots,
         charge_block_wait_plan,
     ) = _build_charge_block_wait_policy_slots(
         policy_timeline,
-        annotated,
+        timeline_horizon_slots if timeline_horizon_slots else annotated,
         flags,
         mode,
         now_ms,
     )
     if neutral_policy_slots:
+        policy_timeline = [
+            item for item in policy_timeline
+            if not (
+                isinstance(item, dict)
+                and item.get("blocked") is True
+                and str(item.get("dv_target_state") or "").upper() in {"HOLD", "NORMAL"}
+            )
+        ]
         policy_timeline.extend(neutral_policy_slots)
     if charge_block_wait_slots:
         windows.extend(

@@ -693,7 +693,7 @@ function forecastTrajectoryValidationReason($plan, $source, $planCoherent) {
         $selection = is_array($slot['selection'] ?? null) ? $slot['selection'] : [];
         $action = strtoupper((string)($slot['action'] ?? ''));
         $projection = is_array($planSlot['projection'] ?? null) ? $planSlot['projection'] : [];
-        $selectedAction = in_array($action, ['PV_STORE', 'ECONOMIC_EXPORT', 'CHARGE_BLOCK_WAIT'], true);
+        $selectedAction = in_array($action, ['PV_STORE', 'ECONOMIC_EXPORT', 'CHARGE_BLOCK_WAIT', 'DV_CURVE_CHARGE'], true);
         $delegation = is_array($slot['delegation'] ?? null) ? $slot['delegation'] : null;
         $delegatedPvStore = $action === 'PV_STORE'
             && is_array($delegation)
@@ -748,7 +748,7 @@ function forecastTrajectoryValidationReason($plan, $source, $planCoherent) {
                 return 'DIRECT_MARKETING_TRAJECTORY_PASSIVE_ROLE_INVALID';
             }
         }
-        if ($action === 'PV_STORE') {
+        if ($action === 'PV_STORE' || $action === 'DV_CURVE_CHARGE') {
             $dcOnly = $delegatedPvStore || (($selection['pv_store_source_contract'] ?? null) === 'E3DC_DC');
             if ((float)$slot['battery_w'] < -0.01
                 || (float)$slot['battery_w'] > (float)$slot['residual_before_storage_w'] + 0.01
@@ -3233,8 +3233,12 @@ $midnightNextMs = $midnightMs + (24 * 3600 * 1000);
 $nowMs = (int)round(microtime(true) * 1000);
 $todayRestStartMs = max($midnightMs, $nowMs);
 
+$directMarketingActive = !empty($conf['direct_marketing_enabled'])
+    || !empty($liveData['direct_marketing_enabled'])
+    || (isset($storagePlanParsed['plan_meta']['direct_marketing_enabled']) && $storagePlanParsed['plan_meta']['direct_marketing_enabled'] === true);
+
 if (!function_exists('sumStoragePlanWindowKwh')) {
-    function sumStoragePlanWindowKwh($timeline, $startMs, $endMs) {
+    function sumStoragePlanWindowKwh($timeline, $startMs, $endMs, $dmActive = false) {
         if (!is_array($timeline) || empty($timeline)) return null;
         $sums = ['pv_kwh' => 0.0, 'home_kwh' => 0.0, 'wp_kwh' => 0.0, 'climate_kwh' => 0.0];
         $found = false;
@@ -3246,10 +3250,34 @@ if (!function_exists('sumStoragePlanWindowKwh')) {
             $overlapMs = min($slotEnd, $endMs) - max($slotStart, $startMs);
             $weight = max(0.0, min(1.0, $overlapMs / 900000.0));
             if ($weight <= 0.0) continue;
-            $sums['pv_kwh']   += max(0.0, (float)($slot['pv_w'] ?? 0.0)) / 1000.0 * 0.25 * $weight;
-            $sums['home_kwh'] += max(0.0, (float)($slot['home_w'] ?? 0.0)) / 1000.0 * 0.25 * $weight;
-            $sums['wp_kwh']   += max(0.0, (float)($slot['wp_w'] ?? 0.0)) / 1000.0 * 0.25 * $weight;
-            $sums['climate_kwh'] += max(0.0, (float)($slot['climate_w'] ?? 0.0)) / 1000.0 * 0.25 * $weight;
+
+            $slotPvW = max(0.0, (float)($slot['pv_w'] ?? 0.0));
+            $slotHomeW = max(0.0, (float)($slot['home_w'] ?? 0.0));
+            $slotWpW = max(0.0, (float)($slot['wp_w'] ?? 0.0));
+            $slotClimateW = max(0.0, (float)($slot['climate_w'] ?? 0.0));
+            $slotChargeW = max(0.0, (float)($slot['charge_w'] ?? ($slot['target_charge_w'] ?? 0.0)));
+
+            // Bei Direktvermarktung und negativem Börsenpreis (<= 0):
+            // Keine Netzeinspeisung / Zusatz-WR aus. Real nutzbarer Ertrag ist
+            // nur Eigenverbrauch (Haus + WP + Klima) plus Batterieladung.
+            $isNegPrice = false;
+            if ($dmActive) {
+                $dmPrice = isset($slot['direct_marketing_marketprice'])
+                    ? (float)$slot['direct_marketing_marketprice']
+                    : (isset($slot['direct_marketing_market_price_ct']) ? (float)$slot['direct_marketing_market_price_ct'] : null);
+                if ($dmPrice !== null && $dmPrice <= 0.0) {
+                    $isNegPrice = true;
+                }
+            }
+
+            $effectivePvW = $isNegPrice
+                ? min($slotPvW, $slotHomeW + $slotWpW + $slotClimateW + $slotChargeW)
+                : $slotPvW;
+
+            $sums['pv_kwh']   += $effectivePvW / 1000.0 * 0.25 * $weight;
+            $sums['home_kwh'] += $slotHomeW / 1000.0 * 0.25 * $weight;
+            $sums['wp_kwh']   += $slotWpW / 1000.0 * 0.25 * $weight;
+            $sums['climate_kwh'] += $slotClimateW / 1000.0 * 0.25 * $weight;
             $found = true;
         }
         if (!$found) return null;
@@ -3258,8 +3286,8 @@ if (!function_exists('sumStoragePlanWindowKwh')) {
     }
 }
 if (!function_exists('sumStoragePlanRestOfTodayKwh')) {
-    function sumStoragePlanRestOfTodayKwh($timeline, $startMs, $endMs) {
-        return sumStoragePlanWindowKwh($timeline, $startMs, $endMs);
+    function sumStoragePlanRestOfTodayKwh($timeline, $startMs, $endMs, $dmActive = false) {
+        return sumStoragePlanWindowKwh($timeline, $startMs, $endMs, $dmActive);
     }
 }
 
@@ -3294,8 +3322,6 @@ if (isset($mlData) && $mlData) {
 }
 
 // V4 PV Ensemble Summation für die Kopfzeile.
-// predicted_kwh ist historisch falsch benannt und enthält die mittlere kW-Leistung.
-// Falls das Ensemble fehlt, aber Einzelmodelle sichtbar sind, nutzen wir deren Mittelwert.
 $forecastPvDaySums = [];
 if (isset($pvForecastsParsed) && $pvForecastsParsed) {
     $v4PvByDay = ['today' => 0.0, 'tomorrow' => 0.0, 'day_after' => 0.0];
@@ -3332,39 +3358,41 @@ if (isset($pvForecastsParsed) && $pvForecastsParsed) {
     $data['stable_today_pv_kwh'] = null;
 }
 
-// Für die Kopfzeile zählt "Heute" als Restprognose ab jetzt. Die normale
-// Tagesaggregation oben bleibt für Morgen/Übermorgen erhalten, aber heute
-// darf spaet am Abend nicht mehr den bereits vergangenen Haus-/WP-Verbrauch
-// anzeigen.
-$todayRest = (isset($storagePlanParsed) && $storagePlanParsed)
-    ? sumStoragePlanRestOfTodayKwh($storagePlanParsed, $todayRestStartMs, $midnightNextMs)
+// Für die Kopfzeile zählt "Heute" als Restprognose ab jetzt für Verbrauch, aber als voller Tagesertrag für PV.
+$todayRest = (isset($storagePlanParsed['timeline']) && is_array($storagePlanParsed['timeline']))
+    ? sumStoragePlanRestOfTodayKwh($storagePlanParsed['timeline'], $todayRestStartMs, $midnightNextMs, $directMarketingActive)
     : null;
+$todayFullDay = (isset($storagePlanParsed['timeline']) && is_array($storagePlanParsed['timeline']))
+    ? sumStoragePlanWindowKwh($storagePlanParsed['timeline'], $midnightMs, $midnightNextMs, $directMarketingActive)
+    : null;
+
 if ($todayRest !== null) {
-    if (($todayRest['pv_kwh'] ?? 0.0) <= 0.0 && isset($forecastPvDaySums['today']) && $forecastPvDaySums['today'] > 0.0) {
-        $todayRest['pv_kwh'] = $forecastPvDaySums['today'];
-    }
-    $dailySums['today'] = $todayRest;
-    $data['stable_today_pv_kwh'] = $todayRest['pv_kwh'];
+    $todayPvKwh = ($todayFullDay !== null && ($todayFullDay['pv_kwh'] ?? 0.0) > 0.0)
+        ? $todayFullDay['pv_kwh']
+        : ($forecastPvDaySums['today'] ?? ($todayRest['pv_kwh'] ?? 0.0));
+    $dailySums['today'] = [
+        'pv_kwh' => round($todayPvKwh, 1),
+        'home_kwh' => round($todayRest['home_kwh'], 1),
+        'wp_kwh' => round($todayRest['wp_kwh'], 1),
+        'climate_kwh' => round($todayRest['climate_kwh'], 1),
+    ];
+    $data['stable_today_pv_kwh'] = $dailySums['today']['pv_kwh'];
 }
 
-// Für Morgen/Übermorgen muss die Kopfzeile dieselbe bereinigte
-// Verbrauchsbasis zeigen wie die Speicherplanung. Die rohe ML-Prognose kann
-// z.B. vor der Nachtverbrauchs-Sanity sichtbar höher liegen.
-if (isset($storagePlanParsed) && $storagePlanParsed) {
+// Für Morgen/Übermorgen bereinigte Werte aus der Speicherplanung nutzen
+if (isset($storagePlanParsed['timeline']) && is_array($storagePlanParsed['timeline'])) {
     $planDayWindows = [
         'tomorrow' => $midnightNextMs,
         'day_after' => $midnightNextMs + (24 * 3600 * 1000),
     ];
     foreach ($planDayWindows as $key => $dayStartMs) {
-        $planDay = sumStoragePlanWindowKwh($storagePlanParsed, $dayStartMs, $dayStartMs + (24 * 3600 * 1000));
+        $planDay = sumStoragePlanWindowKwh($storagePlanParsed['timeline'], $dayStartMs, $dayStartMs + (24 * 3600 * 1000), $directMarketingActive);
         if ($planDay === null) continue;
         if (!isset($dailySums[$key])) $dailySums[$key] = ['pv_kwh' => 0.0, 'home_kwh' => 0.0, 'wp_kwh' => 0.0, 'climate_kwh' => 0.0];
-        $dailySums[$key]['home_kwh'] = $planDay['home_kwh'];
-        $dailySums[$key]['wp_kwh'] = $planDay['wp_kwh'];
-        $dailySums[$key]['climate_kwh'] = $planDay['climate_kwh'];
-        if (($dailySums[$key]['pv_kwh'] ?? 0.0) <= 0.0) {
-            $dailySums[$key]['pv_kwh'] = $planDay['pv_kwh'];
-        }
+        $dailySums[$key]['home_kwh'] = round($planDay['home_kwh'], 1);
+        $dailySums[$key]['wp_kwh'] = round($planDay['wp_kwh'], 1);
+        $dailySums[$key]['climate_kwh'] = round($planDay['climate_kwh'], 1);
+        $dailySums[$key]['pv_kwh'] = round(($planDay['pv_kwh'] > 0.0) ? $planDay['pv_kwh'] : ($forecastPvDaySums[$key] ?? 0.0), 1);
     }
 }
 

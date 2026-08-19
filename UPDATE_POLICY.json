@@ -1,9 +1,9 @@
 {
-  "version": "5.4.4",
+  "version": "5.4.4a",
   "min_version": "4.0.0",
-  "stable_release": "v5.4.4",
+  "stable_release": "v5.4.4a",
   "release_date": "2026-08-17",
-  "description": "v5.4.4 - Konsolidiertes Update für heterogene Altanlagen, Wallbox und Direktvermarktung",
+  "description": "v5.4.4a - Robuste Phasenumschaltung, taktfreie Ladekurve und Glitch-Schutz",
   "installer_requires": "python3",
   "sanitized_republication": false,
   "history_transition": {

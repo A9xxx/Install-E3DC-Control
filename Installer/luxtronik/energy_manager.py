@@ -85,6 +85,7 @@ except ModuleNotFoundError:
 
 logger = logging.getLogger("EnergyManager")
 _SESSION_WRITE_WARNED = set()
+UPDATE_DISPATCHER = "/usr/local/sbin/e3dc-web-update-launcher"
 
 
 def _new_energy_actuator_gate():
@@ -7905,24 +7906,57 @@ def main():
                         install_root = os.path.abspath(os.path.join(script_dir, "../../"))
 
                         if AUTO_UPDATE_ENABLE == 1:
-                            installer_main = os.path.join(install_root, "installer_main.py")
-                            if os.path.exists(installer_main):
+                            if os.path.isfile("/.dockerenv"):
+                                logger.error(
+                                    "Auto-Update im Container ist gesperrt; "
+                                    "der Release-Wechsel muss auf dem Docker-Host erfolgen."
+                                )
+                            elif os.path.isfile(UPDATE_DISPATCHER) and os.access(UPDATE_DISPATCHER, os.X_OK):
                                 try:
                                     log_file = os.path.join(LOG_DIR, "auto_self_update.log")
-                                    cmd = f"sudo /usr/bin/python3 {installer_main} --update-e3dc --unattended"
+                                    cmd = (
+                                        [UPDATE_DISPATCHER]
+                                        if os.geteuid() == 0
+                                        else ["/usr/bin/sudo", "-n", "--", UPDATE_DISPATCHER]
+                                    )
 
                                     with open(log_file, "w") as f:
                                         f.write(f"=== Starting Auto-Update at {datetime.now()} ===\n")
-                                        f.write(f"Command: {cmd}\n---\n")
+                                        f.write("Command: " + " ".join(cmd) + "\n---\n")
                                     os.chmod(log_file, 0o664)
 
-                                    logger.info(f"Führe Update-Kommando aus: {cmd}")
-                                    subprocess.Popen(f"nohup {cmd} >> {log_file} 2>&1 &", shell=True)
-                                    logger.info("Update-Prozess im Hintergrund gestartet.")
+                                    logger.info("Übergebe Auto-Update an den root-eigenen Hintergrund-Dispatcher.")
+                                    with open(log_file, "a") as output:
+                                        result = subprocess.run(
+                                            cmd,
+                                            stdin=subprocess.DEVNULL,
+                                            stdout=output,
+                                            stderr=subprocess.STDOUT,
+                                            timeout=30,
+                                            check=False,
+                                        )
+                                    if result.returncode == 0:
+                                        logger.info(
+                                            "Update gestartet: e3dc-web-update.service; "
+                                            "Status: systemctl status --no-pager e3dc-web-update.service; "
+                                            "Protokoll: journalctl -fu e3dc-web-update.service; "
+                                            "Dateilog: tail -f /var/log/e3dc-control/web-update.log"
+                                        )
+                                    else:
+                                        logger.error(
+                                            "Update-Dispatcher lehnte den Auftrag ab (Exit %s); "
+                                            "Details: %s",
+                                            result.returncode,
+                                            log_file,
+                                        )
                                 except Exception as e:
                                     logger.error(f"Fehler beim Starten des Auto-Updates: {e}")
                             else:
-                                logger.error("Auto-Update fehlgeschlagen: self_update.py nicht gefunden.")
+                                logger.error(
+                                    "Auto-Update fehlgeschlagen: root-eigener Update-Dispatcher "
+                                    "fehlt oder ist nicht ausführbar (%s).",
+                                    UPDATE_DISPATCHER,
+                                )
 
                         # Nur Benachrichtigung (kein Auto-Update)
                         elif push_notify_updates:

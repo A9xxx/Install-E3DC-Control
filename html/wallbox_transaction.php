@@ -515,14 +515,14 @@ function e3dcWbTxAcquireSharedRequestLock(
             @fclose($handle);
             return false;
         }
-        if ($expectedGid === null && !@chmod($path, (int)$mode)) {
+        if ($expectedGid === null && ((((int)$meta['mode']) & 0777) !== $expectedMode) && !@chmod($path, (int)$mode)) {
             @fclose($handle);
             return false;
         }
     } else {
         if (($expectedGid !== null && (int)$meta['gid'] !== (int)$expectedGid)
             || ($ownerUids !== null && !in_array((int)$meta['uid'], $ownerUids, true))
-            || (!$strictSharedLock && !@chmod($path, (int)$mode))) {
+            || (!$strictSharedLock && ((((int)$meta['mode']) & 0777) !== $expectedMode) && !@chmod($path, (int)$mode))) {
             @fclose($handle);
             return false;
         }

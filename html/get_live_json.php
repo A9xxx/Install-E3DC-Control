@@ -984,29 +984,31 @@ function stabilizeCleanHomePower(&$data) {
         : $previousSeen;
     $previousAgeS = ($previousRealSeen !== null) ? max(0.0, $nowFloat - $previousRealSeen) : null;
     $externalDeltaW = abs($rawHomeForHold - $externalConsumerW);
-    $zeroByConsumerSubtraction = (
-        $displayHomeCandidate <= 0
-        && $rawHomeForHold > 500.0
-        && $externalConsumerW > 500.0
-        && $externalDeltaW <= max(350.0, $externalConsumerW * 0.25)
+    $zeroGlitchCandidate = (
+        $displayHomeCandidate <= 50.0
+        && (
+            ($rawHomeForHold > 500.0 && $externalConsumerW > 500.0 && $externalDeltaW <= max(350.0, $externalConsumerW * 0.25))
+            || $rawHomeForHold <= 50.0
+            || $displayHomeCandidate <= 0
+        )
     );
     $heldZeroGlitch = false;
     if (
-        $zeroByConsumerSubtraction
+        $zeroGlitchCandidate
         && $previousHome !== null
-        && $previousHome > 150.0
+        && $previousHome > 80.0
         && $previousHome < 30000.0
         && $previousAgeS !== null
         && $previousAgeS <= 180.0
     ) {
         $data['home'] = round($previousHome);
-        $data['home_source'] = 'held_external_consumer_zero_glitch';
+        $data['home_source'] = ($rawHomeForHold <= 50.0) ? 'held_rscp_zero_glitch' : 'held_external_consumer_zero_glitch';
         $data['home_held_zero_glitch'] = true;
         $heldZeroGlitch = true;
     } else {
         $data['home'] = $displayHomeCandidate;
     }
-    $lastPlausibleFloat = ($data['home'] > 150)
+    $lastPlausibleFloat = ($data['home'] > 80)
         ? ($heldZeroGlitch ? $previousRealSeen : $nowFloat)
         : $previousRealSeen;
 
@@ -2506,7 +2508,7 @@ function liveTrajectoryValidationReason($plan, $source, $canonicalPlan) {
         $selection = is_array($slot['selection'] ?? null) ? $slot['selection'] : [];
         $action = strtoupper((string)($slot['action'] ?? ''));
         $projection = is_array($planSlot['projection'] ?? null) ? $planSlot['projection'] : [];
-        $selectedAction = in_array($action, ['PV_STORE', 'ECONOMIC_EXPORT', 'CHARGE_BLOCK_WAIT'], true);
+        $selectedAction = in_array($action, ['PV_STORE', 'ECONOMIC_EXPORT', 'CHARGE_BLOCK_WAIT', 'DV_CURVE_CHARGE'], true);
         $delegation = is_array($slot['delegation'] ?? null) ? $slot['delegation'] : null;
         $delegatedPvStore = $action === 'PV_STORE'
             && is_array($delegation)
@@ -2561,7 +2563,7 @@ function liveTrajectoryValidationReason($plan, $source, $canonicalPlan) {
                 return 'DIRECT_MARKETING_TRAJECTORY_PASSIVE_ROLE_INVALID';
             }
         }
-        if ($action === 'PV_STORE') {
+        if ($action === 'PV_STORE' || $action === 'DV_CURVE_CHARGE') {
             $dcOnly = $delegatedPvStore || (($selection['pv_store_source_contract'] ?? null) === 'E3DC_DC');
             if ((float)$slot['battery_w'] < -0.01
                 || (float)$slot['battery_w'] > (float)$slot['residual_before_storage_w'] + 0.01
@@ -7288,10 +7290,8 @@ if (file_exists($storagePlanFile) && (time() - filemtime($storagePlanFile) < 900
             }
         }
         if ($effectiveProjectionHidden) {
-            $targetCurve = [];
-            $simCurve = [];
-            $curveAnchors = [];
-            $data['ladekurve'] = null;
+            // Bei aktiver DV bleibt die physikalische Standard-Ladekurve als Referenz
+            // für das Ladekurven-Modal und die Dashboard-Kachel erhalten.
         }
         if (empty($data['ladekurve']) && (!empty($targetCurve) || !empty($simCurve))) {
             $tzName = $confData['config']['timezone'] ?? 'Europe/Berlin';

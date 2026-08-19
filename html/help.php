@@ -115,7 +115,7 @@ $paths = getInstallPaths();
     <div class="container">
         <div class="d-flex justify-content-between align-items-center mb-4">
             <a href="index.php" class="nav-link-back"><i class="fas fa-arrow-left me-2"></i>Dashboard</a>
-            <span class="badge bg-success text-light">v5.4.4 Stable</span>
+            <span class="badge bg-success text-light">v5.4.4a Stable</span>
         </div>
         <h1 class="display-4 fw-bold">Hilfe & Support</h1>
         <p class="lead opacity-75">Häufige Fragen und Lösungen rund um E3DC-Control.</p>
@@ -134,7 +134,7 @@ $paths = getInstallPaths();
         <div class="col-12 faq-item" data-tags="docker image stable rollback update">
             <div class="card bg-card border-0 shadow-sm"><div class="card-body">
                 <h5 class="card-title"><span class="tag">Docker</span> Wie prüfe ich Image und Update?</h5>
-                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem geprüften Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.4</code> in <code>.env</code> gesetzt.</p>
+                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem geprüften Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.4a</code> in <code>.env</code> gesetzt.</p>
                 <pre>cd "${E3DC_DOCKER_PATH:-$HOME/e3dc-docker}"
 if [ -f ./docker_compose_update.py ]; then
   E3DC_DOCKER_HELPER=./docker_compose_update.py
@@ -212,6 +212,28 @@ sudo docker compose logs --tail=80 e3dc-control</pre>
                         <li>Nach der Freigabe im Account den RESTful API Security Token erzeugen.</li>
                         <li>Im Config-Editor unter <em>Tarif</em> den ENTSO-E-Token als Fallback-Token eintragen und mit <em>ENTSO-E testen</em> prüfen.</li>
                     </ol>
+                </div>
+            </div>
+        </div>
+
+        <h4 class="mb-4 text-accent"><i class="fas fa-shield-halved me-2"></i>Stable 5.4.4a: Phasenumschaltung, taktfreie Ladekurve und Glitch-Schutz</h4>
+        <div class="col-12 faq-item" data-tags="5.4.4a stable update bootstrap community hintergrund installationsordner benutzer rolle git dirty chmod metadaten">
+            <div class="card bg-card border-0 shadow-sm">
+                <div class="card-body">
+                    <h5 class="card-title">
+                        <span class="tag">5.4.4a</span>
+                        Was enthält das Stable-Release 5.4.4a?
+                    </h5>
+                    <p>Kopiere nur die veröffentlichte Datei <code>e3dc-update-bootstrap</code> an einen beliebigen Ort auf den Raspberry Pi und starte sie dort:</p>
+                    <pre>sudo /bin/sh ./e3dc-update-bootstrap</pre>
+                    <ul>
+                        <li><strong>Keine Pfadkenntnis nötig:</strong> Der damit gestartete veröffentlichte Updatepfad erkennt Installationsroot, Installationsbenutzer und Anlagenrolle selbst. Ein vorgeschaltetes <code>chmod</code> und weitere Argumente sind nicht erforderlich.</li>
+                        <li><strong>Eindeutig oder Stopp:</strong> Mehrere gleichrangige Installationen oder eine widersprüchliche Rolle werden angezeigt und nicht erraten.</li>
+                        <li><strong>Arbeitet im Hintergrund:</strong> Nach der Annahme läuft derselbe root-eigene systemd-Auftrag weiter, den auch Weboberfläche, Konsole, Installer-Menü und automatische Updateprüfung verwenden. Das SSH-Fenster kann geschlossen werden.</li>
+                        <li><strong>Kein Alt-Updater-Gate:</strong> Der vorhandene Updater, lokale Git-Metadaten, Dirty-Status und frühere Dateimodi entscheiden nicht über den Start. Alte Pfadmetadaten werden auf den eindeutig erkannten Bestand normalisiert.</li>
+                        <li><strong>Sicherer Ablauf bleibt:</strong> Der Ziel-Updater prüft das Backup, stoppt Writer und Dienste, kopiert Dateien, setzt Rechte und bestätigt Dienststart und Gesundheit. Unsichere Pfade, konkurrierende Writer und fehlgeschlagene Backup- oder Healthchecks bleiben harte Stopps.</li>
+                        <li><strong>Keine Regelungsänderung:</strong> EMS-, Direktvermarktungs-, Wallbox- und Hardwarelogik entsprechen unverändert 5.4.4.</li>
+                    </ul>
                 </div>
             </div>
         </div>
@@ -623,7 +645,7 @@ Was korrigiert das Stable-Release 5.4.1d?
                     </h5>
                     <ul>
                         <li><strong>Definierter 5.3.2b-Übergang:</strong> Der noch laufende Alt-Updater startet nach dem Git-Wechsel ausschließlich die Pflichtdienste und die vor dem Wechsel bereits installierten, in der eingefrorenen Konfiguration aktiven Zusatzdienste. Deaktivierte Zusatzdienste bleiben aus.</li>
-                        <li><strong>Erster Aufruf:</strong> Für diesen einmaligen Übergang ausdrücklich <code>installer_main.py --update-e3dc</code> an der administrativen Konsole verwenden, nicht den interaktiven Installer-Menüpunkt. Ältere Installationen wechseln zuerst über den dokumentierten Bootstrap auf 5.3.2b.</li>
+                        <li><strong>Heutiger Altstandsweg:</strong> Die damalige direkte <code>installer_main.py</code>-Kette ist durch den dokumentierten Ein-Datei-Bootstrap ersetzt. Kopiere <code>e3dc-update-bootstrap</code> auf den Raspberry Pi und starte <code>sudo /bin/sh ./e3dc-update-bootstrap</code>.</li>
                         <li><strong>Keine unerwartete Aktivierung:</strong> Vorhandene Konfigurationsfelder allein installieren oder starten keine neue Wallbox-, Wärme- oder Integrationssteuerung.</li>
                         <li><strong>Sichtbare Diagnose:</strong> Konfigurierte, aber bislang nicht installierte Zusatzmodule werden im Updateprotokoll genannt und können anschließend bewusst über das Install-Center eingerichtet werden.</li>
                         <li><strong>Unveränderte Regelung:</strong> Betriebskonfiguration, openWB-Pro-Regelung und andere fachliche Reglerbytes wurden nicht verändert.</li>
@@ -659,7 +681,7 @@ Was korrigiert das Stable-Release 5.4.1d?
                         Was korrigiert das Stable-Release 5.4.0c?
                     </h5>
                     <ul>
-                        <li><strong>Alt-Updater:</strong> Der Web-Update-Pfad aus 5.3.2b übernimmt nach dem Git-Wechsel den neuen Rechtevertrag. Vom Updater selbst angehaltene Dienste sind kein Rechtefehler; leere Paketlisten starten kein System-<code>pip</code>. Für den ersten Wechsel muss das Benutzer-venv bereits vorhanden sein. Ist der alte privilegierte Web-Launcher selbst fehlend oder nicht ausführbar, ist einmalig die SSH-Reparatur mit dem ausdrücklich dokumentierten <code>--update-e3dc</code>-Aufruf erforderlich.</li>
+                        <li><strong>Alt-Updater:</strong> Der Web-Update-Pfad aus 5.3.2b übernimmt nach dem Git-Wechsel den neuen Rechtevertrag. Vom Updater selbst angehaltene Dienste sind kein Rechtefehler; leere Paketlisten starten kein System-<code>pip</code>. Für heutige Altstände wird nicht mehr dieser lokale Updater repariert, sondern die einzelne Datei <code>e3dc-update-bootstrap</code> mit <code>sudo /bin/sh</code> gestartet.</li>
                         <li><strong>Sudoers:</strong> Klar abgegrenzte fremde ioBroker-Freigaben bleiben unverändert und blockieren das E3DC-Control-Update nicht. Fremde direkte E3DC-<code>systemctl</code>-Freigaben bleiben gesperrt.</li>
                         <li><strong>openWB Pro:</strong> Der Start folgt nach bestätigtem Anstecken zügig dem verfügbaren Budget. Der Phasenwechsel nutzt eine kurze sichere CP-Unterbrechung; die folgenden 480 Sekunden sperren nur einen weiteren Phasenwechsel und nicht die Ladung.</li>
                         <li><strong>Pause und SoC:</strong> Eine Pause gilt erst nach bestätigtem STOP. Der SoC-Fallback verwendet ausschließlich die aktuelle Stecksession und überschreibt keine echten Fahrzeug- oder Wallboxwerte.</li>
@@ -1297,21 +1319,13 @@ journalctl -u e3dc-live -n 80 --no-pager</pre>
                         <li>Über das Dashboard (Kachel Konfiguration -> "Update suchen").</li>
                         <li>Bei aktuellen Ständen direkt über den Menüpunkt <em>Update</em> im Installer.</li>
                     </ol>
-                    <p>Neuere Releases übergeben den Wechsel noch vor Backup und Dienststopp an einen bytegenau versiegelten Updater des Ziel-Releases. Erst dieser interpretiert seine eigenen Dienst-, Paket- und Wiederanlaufverträge und besitzt Backup sowie Rückweg. Beim ersten Sprung von einer älteren Version ohne diesen Vertrag gelten technisch noch deren bisherige Zeitgrenzen; ab dem anschließend installierten Stand laufen weitere Updates vollständig über den Ziel-Updater.</p>
-                    <p>Der Dashboard-Button startet ausschließlich das reguläre Update über einen argumentlosen root-eigenen Systemjob. Der Launcher bindet den unveränderten veröffentlichten Ausgangsstand an dessen Remote-Tag und führt den Installer aus einem versiegelten Snapshot aus. Freie Pfade, Release-Tags, Rückfälle, Rechte-Reparaturen und Neuinstallationen sind über diesen Webweg nicht zulässig.</p>
-                    <p>Ist der exakt veröffentlichte Stand bereits vollständig installiert, endet ein normales Update ohne Backup und ohne Dienstunterbrechung. Dabei werden keine Produkt- oder Webdateien und kein Dienstzustand verändert; die für die Zielprüfung erforderlichen Git-Metadaten dürfen aktualisiert werden. Eine bewusst gewünschte Reparatur oder Neuinstallation derselben Version bleibt eine administrative Konsolenaktion mit <code>bash "$E3DC_INSTALL_PATH/e3dc-setup" --reinstall-current</code>.</p>
+                    <p>Weboberfläche, Konsole, Installer-Menü und automatische Updateprüfung starten denselben root-eigenen Hintergrundauftrag. Der lokale Git-, Rechte- oder Änderungszustand ist keine vorgelagerte Startautorität. Erst der heruntergeladene Ziel-Updater erstellt und prüft das Backup, beendet die Writer, projiziert Dateien und Rechte und bestätigt danach Dienststart und Gesundheit.</p>
+                    <p>Für eine heterogene Altinstallation genügt genau eine auf den Raspberry Pi kopierte Datei. Im Ablageverzeichnis wird sie ohne Pfad- oder Rollenargument gestartet:</p>
+                    <pre>sudo /bin/sh ./e3dc-update-bootstrap</pre>
+                    <p>Der damit gestartete veröffentlichte Updatepfad ermittelt Installationsordner, Installationsbenutzer und Anlagenrolle selbst und arbeitet im Hintergrund. Der Start gibt Status- und Protokollbefehl aus; das Terminal kann danach geschlossen werden. Bei mehreren gleichrangig erkannten Installationen oder einer widersprüchlichen Rolle stoppt der Auftrag mit Diagnose, statt zu raten.</p>
+                    <p>Auch ein erneut gestarteter Auftrag folgt dem vollständigen Ziel-Updatervertrag. Es gibt keinen ungeprüften Schnellpfad: Backup, Writer-Ruhe, Projektion, Dienststart und Gesundheit werden vom Zielrelease kontrolliert.</p>
                     <p>Der Release-Finalizer zeigt seine Phasen und alle 30 Sekunden ein Lebenszeichen. Erst nach 30 Minuten Finalizerlauf wird hart abgebrochen; danach versucht der Installer die verifizierte Wiederherstellung des Ausgangszustands. Nur bei vollständigem Dienst-, Rollen- und Gesundheitsnachweis werden die Writer wieder freigegeben, andernfalls bleiben sie fail-closed gestoppt. Backup und Wiederherstellung selbst liegen außerhalb dieses Zeitlimits.</p>
-                    <p><strong>Einmalige Ausnahme für 5.3.2b:</strong> Den ersten Wechsel auf das aktuelle Stable-Release ausschließlich über die folgende vollständige administrative SSH-Kette starten. Der Web-Launcher ist in diesem Altstand noch nicht vorhanden. Der interaktive Menüpunkt ist für diesen Hybridwechsel nicht freigegeben, weil der 5.3.2b-Altprozess bereits zusätzliche Module geladen hat.</p>
-                    <pre>export E3DC_INSTALL_PATH="$HOME/Install"
-test -f "$E3DC_INSTALL_PATH/installer_main.py"
-test -x "$HOME/.venv_e3dc/bin/python3"
-cd "$E3DC_INSTALL_PATH"
-sudo /usr/bin/python3 installer_main.py --fix-permissions
-sudo /usr/bin/python3 -I -B -u installer_main.py --check
-sudo /usr/bin/python3 -I -B -u installer_main.py --update-e3dc
-cat VERSION
-systemctl --failed --no-pager</pre>
-                    <p>Liegt E3DC-Control nicht unter <code>$HOME/Install</code>, wird nur die erste Zeile an den tatsächlichen absoluten Installationspfad angepasst. Schlägt eine der beiden <code>test</code>-Zeilen fehl, dort stoppen.</p>
+                    <p><strong>Einmaliger Altstandsübergang:</strong> Auch bei einem fehlenden oder defekten lokalen Updater wird ausschließlich der oben gezeigte Ein-Datei-Bootstrap verwendet. Ein fester Installationspfad, ein vorgeschaltetes <code>chmod</code> oder ein direkter Aufruf von <code>installer_main.py</code> ist nicht erforderlich.</p>
                     <p>Verwenden Sie für den einmaligen Wechsel auf die bereinigte Historie keinen manuellen <code>git pull --ff-only</code>-Ablauf. Der Installer erstellt und prüft zuerst das externe Backup und validiert anschließend Zielstand, Dienste und Weboberfläche.</p>
                     Updates werden im Changelog oben rechts im Dashboard signalisiert.
                 </div>

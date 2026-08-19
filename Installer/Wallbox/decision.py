@@ -177,10 +177,17 @@ def hold_current_enforcement_contract(
     if name not in CURRENT_OUTPUT_HOLD_ACTIONS:
         return result
     if target < minimum:
+        if observed >= minimum:
+            result.update({
+                "action": "stop",
+                "target_amp": 0.0,
+                "reason": "hold_target_below_minimum",
+            })
+            return result
         result.update({
-            "action": "stop",
+            "action": "none",
             "target_amp": 0.0,
-            "reason": "hold_target_below_minimum",
+            "reason": "standby_hold_below_minimum",
         })
         return result
     if observed > target + 1e-6:

@@ -158,6 +158,7 @@
 !/Installer/install_watchdog.py
 !/Installer/installer_config.py
 !/Installer/installer_wrapper.sh
+!/Installer/update_bootstrap_discovery.py
 !/Installer/json_cache.py
 !/Installer/live_snapshot.py
 !/Installer/logging_manager.py

@@ -126,10 +126,9 @@ def _weighted_split_freshness(*, model_values, model_weights, model_freshness, p
     for model_id in ("m1", "m2", "m3"):
         try:
             weight = float((model_weights or {}).get(model_id) or 0.0)
-            value = float((model_values or {}).get(model_id) or 0.0)
         except (TypeError, ValueError):
             return {"fresh": False, "source": "model_provenance_unknown"}
-        if weight > 0.0 and value > 0.005:
+        if weight > 0.0:
             required.append(model_id)
     if not required:
         return {"fresh": False, "source": "no_weighted_source_model"}
@@ -2671,8 +2670,8 @@ class EnsemblePVForecaster:
         # Nur Zeitstempel der naechsten 72h behalten (Prognose-Horizont)
         import time as _t2
         now_h = int(_t2.time())
-        horizon_72h = now_h + 72 * 3600
-        all_timestamps = {ts for ts in all_timestamps if ts <= horizon_72h}
+        horizon_96h = now_h + 96 * 3600
+        all_timestamps = {ts for ts in all_timestamps if ts <= horizon_96h}
 
         # Zwischenspeicher fuer stuendliche Werte
         hourly_values = []
@@ -3015,11 +3014,14 @@ class EnsemblePVForecaster:
         past_slots = [s for s in ensemble_forecast if s['end_timestamp'] <= now_ms]
         _save_forecast_history(past_slots, cutoff_24h_ms)
 
-        # Vergangene Slots aus dem Live-Forecast entfernen
-        future_forecast = [s for s in ensemble_forecast if s['end_timestamp'] > now_ms]
+        # Im Live-Forecast behalten wir alle Slots des aktuellen Kalendertags (ab 00:00 Uhr)
+        # bis zum vollen Mehrtages-Horizont, damit Simulator und Trajektorienberechnung
+        # zu jedem Zeitpunkt des Tages eine lückenlose, konsistente Datenbasis vorfinden.
+        start_of_today_ms = int(datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
+        future_forecast = [s for s in ensemble_forecast if s['end_timestamp'] > start_of_today_ms]
         removed = len(ensemble_forecast) - len(future_forecast)
         if removed > 0:
-            logger.info(f"Gefiltert: {removed} vergangene Slots gesichert in History + entfernt aus Live-Forecast.")
+            logger.info(f"Gefiltert: {removed} vergangene Vortages-Slots gesichert in History + entfernt aus Live-Forecast.")
 
         ensemble_forecast = future_forecast
         remaining_forecast_totals = _daily_forecast_totals(ensemble_forecast)

@@ -257,6 +257,15 @@ def get_transition_context(
 
     try:
         bootstrap_root = str(os.environ.get("E3DC_BOOTSTRAP_ROOT") or "").strip()
+        bootstrap_runner = str(
+            os.environ.get("E3DC_BOOTSTRAP_RUNNER_ROOT") or ""
+        ).strip()
+        bootstrap_user = str(os.environ.get("E3DC_BOOTSTRAP_USER") or "").strip()
+        bootstrap_venv = str(os.environ.get("E3DC_BOOTSTRAP_VENV") or "").strip()
+        if any((bootstrap_root, bootstrap_runner, bootstrap_user, bootstrap_venv)) and os.geteuid() != 0:
+            raise TransitionContextError(
+                "Bootstrap-Autorität ist ausschließlich als Root zulässig"
+            )
         root_values = _unique_nonempty((explicit_install_path, bootstrap_root))
         if len(root_values) > 1:
             roots = {str(Path(value).resolve(strict=True)) for value in root_values}
@@ -266,23 +275,49 @@ def get_transition_context(
         if not _has_product_markers(root):
             raise TransitionContextError("Produkt-Root besitzt nicht alle Release-Marker")
 
-        bootstrap_user = str(os.environ.get("E3DC_BOOTSTRAP_USER") or "").strip()
-        explicit_authority = bool(root_values and (explicit_install_user or bootstrap_user))
+        if bool(bootstrap_root) != bool(bootstrap_runner):
+            raise TransitionContextError(
+                "Bootstrap-Root und Bootstrap-Runner müssen gemeinsam gebunden sein"
+            )
+        bootstrap_authority = False
+        if bootstrap_root:
+            if not bootstrap_user:
+                raise TransitionContextError(
+                    "Download-Bootstrap besitzt keine vollständige Nutzerbindung"
+                )
+            runner = _real_directory(bootstrap_runner, "Bootstrap-Runner")
+            target = _real_directory(bootstrap_root, "Bootstrap-Ziel")
+            module_root = _real_directory(str(_MODULE_ROOT), "Ausgeführter Release-Root")
+            if runner != module_root or target != root:
+                raise TransitionContextError(
+                    "Download-Bootstrap stimmt nicht mit Runner oder Ziel überein"
+                )
+            common = os.path.commonpath((str(runner), str(target)))
+            if runner == target or common in {str(runner), str(target)}:
+                raise TransitionContextError(
+                    "Bootstrap-Runner und Bootstrap-Ziel müssen getrennte Bäume sein"
+                )
+            bootstrap_authority = True
+        explicit_authority = bool(
+            bootstrap_authority
+            or (root_values and (explicit_install_user or bootstrap_user))
+        )
         metadata: list[tuple[str, dict]] = []
         rejected_metadata = False
-        for path in (_METADATA_PATHS[0], *_METADATA_PATHS[1:]):
-            try:
-                data = _flatten_metadata(_read_metadata(path))
-            except TransitionContextError:
-                # Veröffentlichte 5.3.2a-Installationen können noch eine
-                # installer_config.json mit Modus 0664 enthalten. Solche Daten
-                # werden ignoriert und nie als vertrauenswürdig behandelt; ein
-                # sicherer kanonischer Datensatz oder eine vollständige
-                # root-eigene Bootstrap-Autorität muss den Kontext auflösen.
-                rejected_metadata = True
-                continue
-            if data:
-                metadata.append((str(path), data))
+        if not bootstrap_authority:
+            for path in (_METADATA_PATHS[0], *_METADATA_PATHS[1:]):
+                try:
+                    data = _flatten_metadata(_read_metadata(path))
+                except TransitionContextError:
+                    # Veröffentlichte 5.3.2a-Installationen können noch eine
+                    # installer_config.json mit Modus 0664 enthalten. Solche Daten
+                    # werden ignoriert und nie als vertrauenswürdig behandelt; ein
+                    # sicherer kanonischer Datensatz oder eine vollständige
+                    # root-eigene Bootstrap-Autorität muss den Kontext auflösen.
+                    rejected_metadata = True
+                    continue
+                if data:
+                    metadata.append((str(path), data))
         if rejected_metadata and not metadata and not explicit_authority:
             raise TransitionContextError("Es existieren nur nicht vertrauenswürdige Pfadmetadaten")
 
@@ -324,7 +359,6 @@ def get_transition_context(
             raise TransitionContextError("Container-Kontext entspricht nicht dem Image-Vertrag")
 
         metadata_venvs = _unique_nonempty(data.get("venv_path") for _, data in metadata)
-        bootstrap_venv = str(os.environ.get("E3DC_BOOTSTRAP_VENV") or "").strip()
         venv_values = _unique_nonempty(
             (explicit_venv_path, bootstrap_venv, *metadata_venvs)
         )
@@ -340,7 +374,7 @@ def get_transition_context(
             venv_path = str(venv)
             venv_python = str(python)
 
-        source = (
+        source = "bootstrap-authority" if bootstrap_authority else (
             "explicit"
             if root_values or bootstrap_user or explicit_venv_path
             else "secure-metadata"

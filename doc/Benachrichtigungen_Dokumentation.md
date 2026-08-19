@@ -41,15 +41,17 @@ Der Daemon läuft in einer Endlosschleife und prüft regelmäßig:
 ## 3. Einrichtung und Konfiguration
 
 `e3dc-notifier` ist ein Kerndienst aus dem Service-Katalog und wird bei
-Installation, Update und Rechte-Reparatur mitgeprüft. Auf Altinstallationen
-reicht normalerweise:
+Installation, Update und Rechte-Reparatur mitgeprüft. Auf einem aktuellen
+Bestand startet derselbe Hintergrundauftrag wie im Web:
 
 ```bash
-export E3DC_INSTALL_PATH="/absoluter/pfad/zur/installation"
-test -f "$E3DC_INSTALL_PATH/e3dc-setup"
-bash "$E3DC_INSTALL_PATH/e3dc-setup" --fix-permissions
-bash "$E3DC_INSTALL_PATH/e3dc-setup" --update-e3dc
+sudo /usr/local/sbin/e3dc-web-update-launcher
 ```
+
+Für einen heterogenen Altstand wird die veröffentlichte Datei
+`e3dc-update-bootstrap` auf den Raspberry Pi kopiert und dort einmalig mit
+`sudo /bin/sh ./e3dc-update-bootstrap` gestartet. Sie erkennt den
+Installationsordner selbst.
 
 Die Einrichtung erfolgt danach im **Config Editor**:
 

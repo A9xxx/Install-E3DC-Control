@@ -27,6 +27,7 @@ _reject_privileged_web_invocation()
 # Basis-Pfade
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 INSTALLER_DIR = os.path.join(SCRIPT_DIR, "Installer")
+UPDATE_DISPATCHER = "/usr/local/sbin/e3dc-web-update-launcher"
 
 # Sicherstellen, dass Installer-Paket importierbar ist
 if INSTALLER_DIR not in sys.path:
@@ -66,6 +67,28 @@ def _print_docker_host_update_contract(*, image_tag=""):
     if image_tag:
         command += f" --image-tag {shlex.quote(str(image_tag))}"
     print(f"    Danach ausführen: {command}")
+
+
+def _dispatch_background_update():
+    """Übergibt ein reguläres Bare-Metal-Update an den Root-Dispatcher."""
+    if os.geteuid() != 0:
+        print("✗ Der Update-Dispatcher benötigt Root-Rechte.", file=sys.stderr)
+        print(f"  Starte: sudo {UPDATE_DISPATCHER}", file=sys.stderr)
+        raise SystemExit(77)
+    if not os.path.isfile(UPDATE_DISPATCHER) or not os.access(UPDATE_DISPATCHER, os.X_OK):
+        print(
+            f"✗ Root-eigener Update-Dispatcher fehlt oder ist nicht ausführbar: "
+            f"{UPDATE_DISPATCHER}",
+            file=sys.stderr,
+        )
+        raise SystemExit(127)
+    print("→ Übergebe das Update an den root-eigenen Hintergrund-Dispatcher …")
+    sys.stdout.flush()
+    try:
+        os.execv(UPDATE_DISPATCHER, [UPDATE_DISPATCHER])
+    except OSError as exc:
+        print(f"✗ Update-Dispatcher konnte nicht gestartet werden: {exc}", file=sys.stderr)
+        raise SystemExit(126) from exc
 
 # Standard-Ausgabe auf UTF-8 erzwingen (verhindert UnicodeEncodeError z.B. bei sudo ohne Locale)
 # und Pufferung für Non-TTY Umgebungen (Web-Interface) anpassen
@@ -271,6 +294,9 @@ def main():
         _print_docker_host_update_contract(image_tag=args.install_release_tag)
         sys.exit(2)
 
+    if args.update_e3dc:
+        _dispatch_background_update()
+
     docker_native_mutations = tuple(
         option
         for option, selected in (
@@ -324,13 +350,11 @@ def main():
         print(f"→ Konfiguration:  {CONFIG_FILE}")
         sys.stdout.flush()
 
-        # Direktes Update wenn angefordert
-        if args.update_e3dc or args.reinstall_current:
-            print(
-                "→ Starte ausdrückliche Neuinstallation..."
-                if args.reinstall_current
-                else "→ Starte Update-Modul..."
-            )
+        # Eine ausdrückliche Neuinstallation desselben Releases bleibt eine
+        # lokale Wartungsaktion. Das reguläre Update wurde bereits vor allen
+        # Produktimporten an den Hintergrund-Dispatcher übergeben.
+        if args.reinstall_current:
+            print("→ Starte ausdrückliche Neuinstallation...")
             sys.stdout.flush()
             from Installer.update import (
                 UPDATE_ALREADY_CURRENT,
@@ -339,7 +363,7 @@ def main():
             update_ok = start_installation_or_update(
                 allow_first_install=False,
                 headless=True,
-                reinstall_current=args.reinstall_current,
+                reinstall_current=True,
             )
             
             # Pfadmetadaten nur nach einem tatsächlichen Update synchronisieren.

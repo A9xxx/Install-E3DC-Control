@@ -357,6 +357,7 @@ def bind_wire_cooldown(
     )
     target = _int(target_phases, 0)
     receipt_ts = _float(wire_receipt_ts, 0.0)
+    res_target = _int(reservation.get("target_phases"), 0)
     started_ts = _float(reservation.get("started_ts"), 0.0)
     if not (
         reservation.get("active") is True
@@ -365,7 +366,7 @@ def bind_wire_cooldown(
         and str(reservation.get("reservation_id") or "") == rid
         and str(reservation.get("transition_id") or "") == rid
         and target in (1, 3)
-        and _int(reservation.get("target_phases"), 0) == target
+        and (res_target == target or res_target == 0)
         and math.isfinite(receipt_ts)
         and receipt_ts > 0.0
         and math.isfinite(started_ts)
@@ -373,6 +374,7 @@ def bind_wire_cooldown(
         and receipt_ts >= started_ts
     ):
         return {}
+    reservation["target_phases"] = target
     reservation["cooldown_until_ts"] = receipt_ts + max(
         DEFAULT_COOLDOWN_S,
         _float(cooldown_s, DEFAULT_COOLDOWN_S),
@@ -543,35 +545,6 @@ def update_reservation(
         and lease_guard.get("fail_closed") is True
     )
     output_bound = _reservation_output_bound(reservation)
-    if timebase_uncertain and output_bound:
-        reservation.update({
-            "active": True,
-            "stage": "recovery_hold",
-            "blocker": "phase_transition_timebase_unbound",
-        })
-        if _int(reservation.get("committed_w"), 0) > 0:
-            reservation["grant_state"] = "committed"
-        data[STATE_KEY] = reservation
-        return public_reservation(reservation, now)
-    if lease_elapsed:
-        if output_bound:
-            reservation.update({
-                "active": True,
-                "stage": "recovery_hold",
-                "blocker": "lease_elapsed_output_bound",
-            })
-            if _int(reservation.get("committed_w"), 0) > 0:
-                reservation["grant_state"] = "committed"
-        else:
-            reservation.update({
-                "active": False,
-                "stage": "recovery_hold",
-                "grant_state": "expired",
-                "blocker": "lease_expired",
-            })
-        data[STATE_KEY] = reservation
-        return public_reservation(reservation, now)
-
     if connected is False:
         since = _float(reservation.get("disconnected_since_ts"), 0.0)
         disconnect_guard = reservation.get(DISCONNECT_TIMEBASE_KEY)
@@ -647,10 +620,41 @@ def update_reservation(
                 "active": False, "stage": "completed", "grant_state": "expired",
                 "confirmed_ts": now, "blocker": "",
             })
+            data[STATE_KEY] = reservation
+            return public_reservation(reservation, now)
     elif valid:
         reservation["valid_frames"] = 0
         reservation["stable_since_ts"] = 0.0
         reservation.pop(STABLE_TIMEBASE_KEY, None)
+
+    if timebase_uncertain and output_bound:
+        reservation.update({
+            "active": True,
+            "stage": "recovery_hold",
+            "blocker": "phase_transition_timebase_unbound",
+        })
+        if _int(reservation.get("committed_w"), 0) > 0:
+            reservation["grant_state"] = "committed"
+        data[STATE_KEY] = reservation
+        return public_reservation(reservation, now)
+    if lease_elapsed:
+        if output_bound:
+            reservation.update({
+                "active": True,
+                "stage": "recovery_hold",
+                "blocker": "lease_elapsed_output_bound",
+            })
+            if _int(reservation.get("committed_w"), 0) > 0:
+                reservation["grant_state"] = "committed"
+        else:
+            reservation.update({
+                "active": False,
+                "stage": "recovery_hold",
+                "grant_state": "expired",
+                "blocker": "lease_expired",
+            })
+        data[STATE_KEY] = reservation
+        return public_reservation(reservation, now)
 
     data[STATE_KEY] = reservation
     return public_reservation(reservation, now)

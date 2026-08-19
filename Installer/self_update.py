@@ -18,57 +18,59 @@ def _reject_privileged_web_invocation() -> None:
 
 _reject_privileged_web_invocation()
 
-SYSTEM_PYTHON = "/usr/bin/python3"
+UPDATE_DISPATCHER = "/usr/local/sbin/e3dc-web-update-launcher"
 
 
-def _ensure_isolated_system_python() -> None:
-    """Route release changes through the fixed, isolated system interpreter."""
-    current = os.path.realpath(sys.executable)
-    expected = os.path.realpath(SYSTEM_PYTHON)
-    isolated = bool(getattr(sys.flags, "isolated", 0))
-    no_bytecode = bool(getattr(sys.flags, "dont_write_bytecode", 0))
-    unbuffered = bool(os.environ.get("PYTHONUNBUFFERED")) or bool(
-        getattr(sys.stdout, "write_through", False)
-    )
-    if current == expected and isolated and no_bytecode and unbuffered:
-        return
+def _dispatch_background_update() -> int:
+    """Startet den einzigen regulären Bare-Metal-Update-Einstieg."""
     if os.geteuid() != 0:
-        raise PermissionError(
-            "Der Kompatibilitäts-Updater muss als root über den geprüften "
-            "Installer-Wrapper gestartet werden."
+        print("Der Update-Dispatcher benötigt Root-Rechte.", file=sys.stderr)
+        print(f"Starte: sudo {UPDATE_DISPATCHER}", file=sys.stderr)
+        return 77
+    if not os.path.isfile(UPDATE_DISPATCHER) or not os.access(UPDATE_DISPATCHER, os.X_OK):
+        print(
+            f"Root-eigener Update-Dispatcher fehlt oder ist nicht ausführbar: "
+            f"{UPDATE_DISPATCHER}",
+            file=sys.stderr,
         )
-    os.execv(
-        SYSTEM_PYTHON,
-        [
-            SYSTEM_PYTHON,
-            "-I",
-            "-B",
-            "-u",
-            os.path.abspath(__file__),
-            *sys.argv[1:],
-        ],
-    )
+        return 127
+    print("Übergebe das Update an den root-eigenen Hintergrund-Dispatcher …")
+    sys.stdout.flush()
+    try:
+        os.execv(UPDATE_DISPATCHER, [UPDATE_DISPATCHER])
+    except OSError as exc:
+        print(f"Update-Dispatcher konnte nicht gestartet werden: {exc}", file=sys.stderr)
+        return 126
+    return 0
 
 
 def main() -> int:
-    silent = "--silent" in sys.argv
-    is_check = "--check" in sys.argv
-    is_fix_permissions = "--fix-permissions" in sys.argv
+    arguments = sys.argv[1:]
+    allowed = {"--silent", "--unattended", "--check", "--fix-permissions"}
+    unknown = [argument for argument in arguments if argument not in allowed]
+    if unknown or len(arguments) != len(set(arguments)):
+        print(
+            "Unzulässige oder doppelte self_update-Option: "
+            + ", ".join(unknown or arguments),
+            file=sys.stderr,
+        )
+        return 64
+    silent = "--silent" in arguments
+    unattended = "--unattended" in arguments
+    is_check = "--check" in arguments
+    is_fix_permissions = "--fix-permissions" in arguments
+    if (is_check and is_fix_permissions) or (
+        unattended and (is_check or is_fix_permissions)
+    ):
+        print("self_update-Aktionen dürfen nicht kombiniert werden.", file=sys.stderr)
+        return 64
     if not is_check and not is_fix_permissions:
-        _ensure_isolated_system_python()
+        return _dispatch_background_update()
 
-    if not silent and not is_check and not is_fix_permissions:
-        print("="*60)
-        print(" 🚀 WILLKOMMEN BEIM V4 UPGRADE 🚀")
-        print("="*60)
-        print("\nE3DC-Control wurde massiv auf Architektur V4 aktualisiert!")
-        print("Das alte 'self_update.py' Skript wurde durch unser neues und")
-        print("sicheres Installer-Menü ersetzt.\n")
-    
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if repo_root not in sys.path:
         sys.path.insert(0, repo_root)
-        
+
     try:
         if is_check:
             from Installer.update import check_for_updates
@@ -86,16 +88,6 @@ def main() -> int:
             from Installer.permissions import run_permissions_wizard
             ok = run_permissions_wizard(headless=True)
             return 0 if ok is not False else 1
-        else:
-            if not silent:
-                print("Starte den V4 Upgrade & Update Prozess via installer_main.py...\n")
-                sys.stdout.flush()
-            from Installer.update import start_installation_or_update
-            result = start_installation_or_update(
-                allow_first_install=False,
-                headless=True,
-            )
-            return 0 if result is not False else 1
     except Exception as e:
         print(f"Fehler beim Ausführen von self_update.py: {e}")
         if not silent:

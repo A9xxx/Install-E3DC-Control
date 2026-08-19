@@ -1,10 +1,25 @@
 # E3DC-Control Installer
 
-Dokumentation Stand: 5.4.4
+Dokumentation Stand: 5.4.4a
 
 Der Installer verwaltet Bare-Metal-Installation, Update, Rechte, Dienste,
 Backup, Rollback und optionale Produktmodule. Er ermittelt Benutzer, Home,
 Installationspfad und Python-Umgebung aus dem geprüften Installationskontext.
+
+Der Installer-Anteil von 5.4.4a führt alle normalen Bare-Metal-Updateeinstiege
+auf denselben root-eigenen Hintergrundauftrag. Für heterogene Altinstallationen
+genügt die einzelne Datei `e3dc-update-bootstrap` mit
+`sudo /bin/sh ./e3dc-update-bootstrap`. Der damit gestartete veröffentlichte
+Updatepfad erkennt Installationsroot, Installationsbenutzer und Anlagenrolle
+eindeutig; ein fester Pfad, ein
+vorgeschaltetes `chmod` und weitere Argumente sind nicht nötig. Der vorhandene
+Alt-Updater, lokale Git-Metadaten, getrackte Änderungen und historische
+Dateimodi sind kein vorgelagertes Gate. Alte Installer- und Web-Pfadmetadaten
+werden auf den erkannten Bestand normalisiert und vom Zielprozess erneut
+geprüft. Der vollständige Vertrag aus Backup-Prüfung, Writer- und Dienststopp,
+Datei- und Rechteprojektion, Dienststart und Healthcheck bleibt erhalten.
+EMS-, Direktvermarktungs-, Wallbox- und Hardwarelogik entsprechen unverändert
+5.4.4.
 
 Der Installer-Anteil von 5.4.4 konsolidiert den Updatepfad für heterogene
 Altanlagen. Web- und Download-Update starten den veröffentlichten Ziel-Updater
@@ -69,13 +84,14 @@ Reinstall und Rollback besitzen diese Autorität nicht. Vorhandene fremde oder
 widersprüchliche Anker sowie HA- und Shadow-Rollen bleiben fail-closed und
 werden nicht automatisch repariert.
 
-Der Web-Update-Launcher bleibt absichtlich clean-only und lehnt lokale
-Änderungen an getrackten Produktdateien vor dem Aufruf des Ziel-Updaters ab.
-Die Dirty-Recovery von 5.4.3l gilt ausschließlich für den regulären
-Konsolen-/nativen Root-Updaterpfad; sie lockert das Web-Gate nicht. Im
-Web-Einstieg korrigiert 5.4.3l nur den EXIT-Cleanup, sodass ein früher Abbruch
-seine primäre Fehlermeldung und seinen Exitstatus behält und ein bereits
-angelegter root-eigener Ausführungssnapshot unter `/run` entfernt wird.
+Der Web-Update-Launcher ist ein kleiner gemeinsamer Download-Dispatcher. Er
+startet denselben root-eigenen Hintergrundauftrag wie Konsole, Installer-Menü
+und automatische Updateprüfung. Lokale Git-Metadaten, getrackte Änderungen und
+historische Dateimodi sind keine vorgelagerte Startautorität mehr. Der
+heruntergeladene Ziel-Updater entscheidet nach verifiziertem Backup über
+Normalisierung oder harten Abbruch; unklare Links, Spezialdateien,
+konkurrierende Writer sowie fehlgeschlagene Backup- oder Gesundheitsprüfungen
+bleiben gesperrt.
 
 Der Installer-Anteil von 5.4.3l bindet den updater-eigenen Git-Rückweg vor
 der ersten Dienstmutation an Repository, `old_commit`, root-eigenes
@@ -136,7 +152,23 @@ Wiederherstellungsabweichungen bleiben harte, fail-closed Abbruchgründe.
 
 ## Portabler Einstieg
 
-Setze für Konsolenbeispiele den tatsächlichen absoluten Produktpfad:
+Für einen bereits aktualisierten Bestand kann der gemeinsame Hintergrundjob
+ohne Kenntnis des Produktpfads gestartet werden:
+
+```bash
+sudo /usr/local/sbin/e3dc-web-update-launcher
+```
+
+Für heterogene Altstände wird nur die Datei `e3dc-update-bootstrap` auf den
+Raspberry Pi kopiert und im Ablageverzeichnis gestartet:
+
+```bash
+sudo /bin/sh ./e3dc-update-bootstrap
+```
+
+Der veröffentlichte Updatepfad erkennt Produktpfad und Installationsbenutzer
+selbst. Erst für andere administrative Installeraktionen wird der tatsächliche
+absolute Produktpfad benötigt:
 
 ```bash
 export E3DC_INSTALL_PATH="/absoluter/pfad/zur/installation"
@@ -215,12 +247,11 @@ systemctl status e3dc-live e3dc-epex-manager e3dc-weather-manager \
   --no-pager
 ```
 
-`--update-e3dc` installiert ausschließlich einen neueren freigegebenen Stand.
-Ist der exakte Release bereits vollständig vorhanden, endet der Aufruf ohne
-Backup und Dienstunterbrechung. `--reinstall-current` ist die ausdrücklich
-gewählte Reparatur beziehungsweise Neuinstallation desselben veröffentlichten
-Stands und durchläuft deshalb den vollständigen Backup-, Ruhe-, Finalizer-,
-Gesundheits- und Rücklaufvertrag. Details und Zeitgrenzen stehen in
+`--update-e3dc` startet denselben Hintergrundauftrag wie Web und automatische
+Updateprüfung. Auch wenn der exakte Release bereits vorhanden ist, folgt der
+Auftrag dem vollständigen Backup-, Ruhe-, Finalizer-, Gesundheits- und
+Rücklaufvertrag. `--reinstall-current` bleibt eine getrennte, ausdrücklich
+gewählte administrative Reparaturaktion. Details und Zeitgrenzen stehen in
 [Update.md](Update.md).
 
 Seit 5.4.2 unterscheidet der Einstieg drei Zustände:
@@ -238,12 +269,12 @@ Paket-, Konfigurations-, Webportal-, Rechte- und Dienstfehler werden bis zum
 Menü- und Prozess-Exitcode weitergegeben. Ein fehlgeschlagener Schritt wird
 nicht als erfolgreicher Abschluss angezeigt.
 
-Für den einmaligen Wechsel von 5.3.2b auf das aktuelle Stable-Release gilt eine engere
-Startbedingung: ausschließlich der direkte administrative
-`sudo /usr/bin/python3 -I -B -u installer_main.py --update-e3dc`-Aufruf aus
-[Update.md](Update.md). Der interaktive Menüpunkt lädt im 5.3.2b-Altprozess
-bereits zusätzliche Module und ist für diesen ersten Hybridwechsel nicht
-freigegeben.
+Für den einmaligen Wechsel aus einem heterogenen Altstand wird ausschließlich
+die veröffentlichte Datei `e3dc-update-bootstrap` auf den Raspberry Pi kopiert
+und dort mit `sudo /bin/sh ./e3dc-update-bootstrap` gestartet. Der damit
+gestartete veröffentlichte Updatepfad erkennt die Installation selbst und
+verwendet den alten `installer_main.py`-Updatepfad nicht. Details stehen in
+[Update.md](Update.md).
 
 ## Hauptmenü
 

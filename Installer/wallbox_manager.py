@@ -2477,6 +2477,14 @@ def _cfg_float(value, default=0.0):
     except (TypeError, ValueError):
         return float(default)
 
+
+def _cfg_int(value, default=0):
+    try:
+        s = str(value).strip() if value is not None else ""
+        return int(float(s)) if s else int(default)
+    except (TypeError, ValueError):
+        return int(default)
+
 def _first_cfg_float(*values, default=0.0):
     for value in values:
         try:
@@ -4669,6 +4677,7 @@ def _reset_wallbox_confirmed_disconnect_runtime(c_data):
     data["_session_1p_only"] = False
     data["_phase_change_seen_session"] = False
     data["_real_charge_since"] = 0.0
+    data["_had_real_charge_in_session"] = False
     data["_aha_real_charge_confirmed"] = False
     data["_aha_real_charge_confirmed_since"] = 0.0
     data["_openwb_zero_budget_since"] = 0.0
@@ -7591,7 +7600,7 @@ def _bind_openwb_pro_phase_post_receipt(
     return bound_contract, bound_intent
 
 
-def _phase_output_recovery_generation_bound(data, hold, intent):
+def _phase_output_recovery_generation_bound(data, hold, intent, status=None):
     """Bindet einen Recovery-ACK fail-closed an genau eine Reservation."""
 
     reservation = data.get("_wallbox_phase_transition_reservation")
@@ -7665,22 +7674,31 @@ def _phase_output_recovery_generation_bound(data, hold, intent):
         and (ack_success is True or ack_success is False)
     )
     recovery_reason_bound = bool(
-        ack_bound
-        and (
-            (
-                hold_reason == negative_ack_reason
-                and ack_success is False
-                and ack_reason == negative_ack_reason
-            )
-            or (
-                hold_reason == "phase_ack_persist_failed"
-                and (
-                    (ack_success is True and ack_reason == "confirmed")
-                    or (
-                        ack_success is False
-                        and ack_reason == negative_ack_reason
+        (
+            ack_bound
+            and (
+                (
+                    hold_reason == negative_ack_reason
+                    and ack_success is False
+                    and ack_reason == negative_ack_reason
+                )
+                or (
+                    hold_reason == "phase_ack_persist_failed"
+                    and (
+                        (ack_success is True and ack_reason == "confirmed")
+                        or (
+                            ack_success is False
+                            and ack_reason == negative_ack_reason
+                        )
                     )
                 )
+            )
+        )
+        or (
+            hold_reason == "process_restart_recovery_hold"
+            and (
+                (action == "send_zero" and openwb_pro_session.phase_zero_readback_confirmed(status))
+                or (action == "send_phase" and openwb_pro_session.phase_target_readback_confirmed(status, target))
             )
         )
     )
@@ -7700,10 +7718,10 @@ def _phase_output_recovery_generation_bound(data, hold, intent):
         and method_bound
         and sequence_bound
         and target == reservation_target
-        and hold_intent_id == intent_id
-        and hold_reservation_id == reservation_id
-        and hold_transition_id == reservation_id
-        and hold_target == target
+        and (hold_intent_id == intent_id or (hold_reason == "process_restart_recovery_hold" and not hold_intent_id))
+        and (hold_reservation_id == reservation_id or (hold_reason == "process_restart_recovery_hold" and not hold_reservation_id))
+        and (hold_transition_id == reservation_id or (hold_reason == "process_restart_recovery_hold" and not hold_transition_id))
+        and (hold_target == target or (hold_reason == "process_restart_recovery_hold" and hold_target == 0))
         and recovery_reason_bound
     )
 
@@ -7922,7 +7940,7 @@ def _resolve_phase_output_recovery(data, status, cfg):
     intent = data.get("_openwb_pro_phase_output_intent")
     if not (isinstance(hold, dict) and hold.get("active") and isinstance(intent, dict)):
         return False
-    if not _phase_output_recovery_generation_bound(data, hold, intent):
+    if not _phase_output_recovery_generation_bound(data, hold, intent, status=status):
         return _resolve_stranded_phase_zero_recovery(
             data,
             status,
@@ -7963,6 +7981,11 @@ def _resolve_phase_output_recovery(data, status, cfg):
             sequence_patch.get("phase_sent_ts"),
             0.0,
         )
+        intent_wall_ts = _cfg_float(intent.get("wall_ts"), 0.0)
+        if wire_receipt_ts <= 0.0 and intent_wall_ts > 0.0:
+            wire_receipt_ts = intent_wall_ts
+            if phase_sent_ts <= 0.0:
+                phase_sent_ts = intent_wall_ts
         now_value = time.time()
         if not (
             math.isfinite(wire_receipt_ts)
@@ -13064,6 +13087,7 @@ def _send_wallbox_stop_command_if_due(
     confirmed_ts = float(now_ts if now_ts is not None else time.time())
     c_data["current_set_amp"] = 0
     c_data["is_charging"] = False
+    c_data["last_start_ts"] = 0.0
     c_data["_wb_stop_sent_active"] = True
     c_data["_last_stop_toggle_ts"] = confirmed_ts
     if native_charger or bool(e3dc_native_toggle):
@@ -15856,8 +15880,16 @@ def _finalize_completed_openwb_pro_phase_transition(c_data, status, *, now_ts=No
         or str(reservation.get("stage") or "") != "completed"
         or target not in (1, 3)
         or not openwb_pro_session.phase_target_readback_confirmed(st, target)
-        or wallbox_phase_transition.status_power_w(st) <= 500.0
     ):
+        return False
+
+    is_idle_transition = bool(
+        _cfg_float(reservation.get("restart_amp"), 0.0) <= 0.5
+        or _cfg_int(reservation.get("requested_w"), 0) == 0
+        or _cfg_float(data.get("current_set_amp"), 0.0) <= 0.5
+        or _cfg_float(st.get("evse_current"), 0.0) <= 0.5
+    )
+    if not is_idle_transition and wallbox_phase_transition.status_power_w(st) <= 500.0:
         return False
 
     cleanup_keys = (
@@ -20691,6 +20723,12 @@ def run():
                                 if test_config != config:
                                     logger.info("Parameteraenderung erkannt! Uebernehme Einstellungen nahtlos (ohne Neustart).")
                                     config = test_config
+                                    for cd in chargers:
+                                        cd["_wb_stop_sent_active"] = False
+                                        cd["abort_cooldown_ts"] = 0.0
+                                        cd["_last_manager_stop_request_ts"] = 0.0
+                                        cd["_manager_zero_anchor_active"] = False
+                                        cd.pop("_manager_zero_anchor_contract", None)
                                 wb_dist_mode = normalize_distribution_mode(config.get("wb_native_mode", 0))
                                 if str(config.get("wb_native_enable", "0")).lower() not in ("1", "true"):
                                     logger.info("Native Regelung wurde deaktiviert - gebe E3DC-Wallbox frei und verlasse Regel-Loop.")
@@ -20989,6 +21027,7 @@ def run():
                                             c_data["_aha_real_charge_confirmed_since"] = 0.0
                                         elif _now_real - _real_since >= _aha_confirm_s:
                                             c_data["_aha_real_charge_confirmed"] = True
+                                            c_data["_had_real_charge_in_session"] = True
                                             if float(c_data.get("_aha_real_charge_confirmed_since", 0.0) or 0.0) <= 0.0:
                                                 c_data["_aha_real_charge_confirmed_since"] = _now_real
                                         if (
@@ -28018,6 +28057,7 @@ def run():
                         if (
                             charger_connected
                             and start_reject_guard_supported
+                            and not c_data.get("_had_real_charge_in_session", False)
                             and not phase_transition_pending_for_start_reject
                             and c_control_mode > 0
                             and start_reject_start_ts > 0.0

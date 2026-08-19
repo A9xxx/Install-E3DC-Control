@@ -93,6 +93,12 @@ if [ "$ACTION" == "status" ]; then
         LC_ALL=C \
         "$SYSTEMCTL" --no-pager status -- "$SERVICE"
 fi
+if [ "$ACTION" == "restart" ] || [ "$ACTION" == "start" ]; then
+    "$ENV" -i \
+        PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+        LC_ALL=C \
+        "$SYSTEMCTL" reset-failed -- "$SERVICE" 2>/dev/null || true
+fi
 exec "$ENV" -i \
     PATH=/usr/sbin:/usr/bin:/sbin:/bin \
     LC_ALL=C \

@@ -15,6 +15,49 @@ while [[ -L "$SOURCE" ]]; do
 done
 SCRIPT_DIR=$(cd -P -- "$(dirname -- "$SOURCE")" >/dev/null 2>&1 && pwd)
 
+# Ein reguläres Update wird ausschließlich vom installierten, root-eigenen
+# Hintergrund-Dispatcher gestartet. Dieser liest den Installationskontext aus
+# den vertrauenswürdigen Systembindungen; der aufrufende Benutzer übergibt
+# deshalb weder einen Pfad noch einen Release-Tag. Der Einstieg liegt bewusst
+# vor den lokalen Produktprüfungen, damit ein beschädigter Altbestand den
+# Download des neuen Updaters nicht verhindern kann.
+UPDATE_DISPATCHER=/usr/local/sbin/e3dc-web-update-launcher
+if [[ ! -f /.dockerenv ]]; then
+    UPDATE_REQUESTED=0
+    UPDATE_ARGUMENTS_VALID=1
+    for argument in "$@"; do
+        case "$argument" in
+            --update-e3dc)
+                UPDATE_REQUESTED=$((UPDATE_REQUESTED + 1))
+                ;;
+            --unattended)
+                ;;
+            *)
+                UPDATE_ARGUMENTS_VALID=0
+                ;;
+        esac
+    done
+    if (( UPDATE_REQUESTED > 0 )); then
+        if (( UPDATE_REQUESTED != 1 || UPDATE_ARGUMENTS_VALID != 1 )); then
+            echo "Update abgebrochen: --update-e3dc akzeptiert nur optional --unattended." >&2
+            exit 64
+        fi
+        if [[ ! -x "$UPDATE_DISPATCHER" ]]; then
+            echo "Update abgebrochen: Der root-eigene Update-Dispatcher fehlt: $UPDATE_DISPATCHER" >&2
+            exit 127
+        fi
+        if (( EUID != 0 )); then
+            CALLING_USER=$(id -un)
+            if [[ -z "$CALLING_USER" || "$CALLING_USER" = "www-data" ]]; then
+                echo "Update abgebrochen: Das aufrufende Administrationskonto ist nicht zulässig." >&2
+                exit 77
+            fi
+            exec sudo -- "$UPDATE_DISPATCHER"
+        fi
+        exec "$UPDATE_DISPATCHER"
+    fi
+fi
+
 if [[ ! -f "$SCRIPT_DIR/VERSION" ||
       ! -f "$SCRIPT_DIR/installer_main.py" ||
       ! -f "$SCRIPT_DIR/Installer/installer_config.py" ]]; then

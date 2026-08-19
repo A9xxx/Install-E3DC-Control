@@ -1124,11 +1124,11 @@ if (isset($_POST['restart_manager'])) {
     requireWebAuth(false);
     $restartResult = e3dcRunServiceWrapperAction('restart', ['e3dc-wallbox-manager']);
     usleep(1000000); // 1 Sekunde warten, damit der neue Log-Eintrag für den Neustart ins Dashboard gerendert wird!
-    $message = successMessage('✓ Python Wallbox-Manager wurde im Hintergrund neu gestartet.');
-    if (
-        empty($restartResult['success'])
-        || !in_array('e3dc-wallbox-manager', $restartResult['changed'] ?? [], true)
-    ) {
+    $restarted = in_array('e3dc-wallbox-manager', $restartResult['changed'] ?? [], true)
+        || in_array('e3dc-wallbox-manager.service', $restartResult['changed'] ?? [], true);
+    if (!empty($restartResult['success']) && $restarted) {
+        $message = successMessage('✓ Python Wallbox-Manager wurde im Hintergrund neu gestartet.');
+    } else {
         $details = array_merge(
             $restartResult['errors'] ?? [],
             array_map(static fn($service) => $service . ': Dienst fehlt oder ist nicht geladen.', $restartResult['ignored'] ?? [])
@@ -1705,7 +1705,8 @@ function parseWallboxConfigValues($filePath) {
         'bluelink_vin' => '',
         'bluelink_car_name' => '',
         'bluelink_interval' => '15',
-        'bluelink_ignore_plug_status' => '0'
+        'bluelink_ignore_plug_status' => '0',
+        'wbcostpowers' => '7.2, 11.0, 22.0'
     ];
 
     if (is_file($filePath) && is_readable($filePath)) {
@@ -2169,15 +2170,18 @@ $activePlanSlotsBeforePost = [
 ];
 
 // Ladeleistungen für die Kostenvorschau aus der Konfiguration laden
-$powerOptionsStr = '7.2, 11.0, 22.0';
-if (file_exists($config_file)) {
-    $cLines = file($config_file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+$powerOptionsStr = trim((string)($wallboxConfig['wbcostpowers'] ?? '7.2, 11.0, 22.0'));
+if ($powerOptionsStr === '' && is_file($config_file) && is_readable($config_file)) {
+    $cLines = @file($config_file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [];
     foreach ($cLines as $cLine) {
         if (preg_match('/^\s*wbcostpowers\s*=\s*(.*)/i', $cLine, $m)) {
             $powerOptionsStr = trim($m[1]);
             break;
         }
     }
+}
+if ($powerOptionsStr === '') {
+    $powerOptionsStr = '7.2, 11.0, 22.0';
 }
 $powerOptionsArr = array_map('trim', explode(',', $powerOptionsStr));
 

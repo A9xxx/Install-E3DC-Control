@@ -31,6 +31,7 @@ def passive_normal_identity(
 ):
     """Berechnet die Action- und Slot-ID aus dem vollständigen Semantikkern."""
 
+    resolved_window_id = str(window_id) if window_id else "passive_normal_window"
     action_id = _contract_id({
         "schema": PASSIVE_NORMAL_BINDING_SCHEMA,
         "policy_schema": POLICY_SCHEMA,
@@ -44,7 +45,7 @@ def passive_normal_identity(
         "end_ts": int(end_ts),
         "selected_start_ts": int(selected_start_ts),
         "selected_end_ts": int(selected_end_ts),
-        "window_id": str(window_id or ""),
+        "window_id": resolved_window_id,
     })
     return {
         "schema": PASSIVE_NORMAL_BINDING_SCHEMA,
@@ -55,5 +56,5 @@ def passive_normal_identity(
         "end_ts": int(end_ts),
         "selected_start_ts": int(selected_start_ts),
         "selected_end_ts": int(selected_end_ts),
-        "window_id": str(window_id or "") or None,
+        "window_id": resolved_window_id,
     }

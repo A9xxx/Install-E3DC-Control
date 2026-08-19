@@ -183,12 +183,15 @@ def get_install_user():
 
     bootstrap_user = str(os.environ.get("E3DC_BOOTSTRAP_USER") or "").strip()
     if bootstrap_user:
+        bootstrap_authority = _bound_download_bootstrap_authority()
         if bootstrap_user in {"root", "www-data"}:
             raise RuntimeError("Bootstrap-Nutzer ist kein zulässiges lokales Konto")
         try:
             bootstrap_account = pwd.getpwnam(bootstrap_user)
         except KeyError as exc:
             raise RuntimeError("Bootstrap-Nutzer existiert nicht") from exc
+        if bootstrap_authority is not None:
+            return bootstrap_user
         configured_user, role_snapshot = _bound_local_role_metadata()
         if role_snapshot.get("exists") and (
             role_snapshot.get("uid") != bootstrap_account.pw_uid
@@ -293,7 +296,12 @@ def _validated_product_root(value):
     return resolved
 
 
-def _validated_strict_product_root(value, label):
+def _validated_strict_product_root(
+    value,
+    label,
+    *,
+    allow_one_missing_marker=False,
+):
     """Bindet einen echten Produktbaum ohne Symlink-Komponente."""
 
     candidate = str(value or "").strip()
@@ -318,40 +326,70 @@ def _validated_strict_product_root(value, label):
         os.path.join(normalized, "installer_main.py"),
         os.path.join(normalized, "Installer", "installer_config.py"),
     )
+    missing_markers = 0
     for marker in markers:
         try:
             metadata = os.lstat(marker)
-        except FileNotFoundError as exc:
-            raise RuntimeError(f"{label} besitzt nicht alle Release-Marker") from exc
+        except FileNotFoundError:
+            missing_markers += 1
+            continue
         if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
             raise RuntimeError(f"{label} besitzt keinen eindeutigen Release-Marker")
+    if missing_markers > (1 if allow_one_missing_marker else 0):
+        raise RuntimeError(f"{label} besitzt nicht alle Release-Marker")
     return normalized
+
+
+def _bound_download_bootstrap_authority():
+    """Bindet den unabhängigen Release-Runner an genau einen Produkt-Root."""
+
+    target_value = str(os.environ.get("E3DC_BOOTSTRAP_ROOT") or "").strip()
+    runner_value = str(os.environ.get("E3DC_BOOTSTRAP_RUNNER_ROOT") or "").strip()
+    user_value = str(os.environ.get("E3DC_BOOTSTRAP_USER") or "").strip()
+    venv_value = str(os.environ.get("E3DC_BOOTSTRAP_VENV") or "").strip()
+    if any((target_value, runner_value, user_value, venv_value)) and os.geteuid() != 0:
+        raise RuntimeError("Bootstrap-Autorität ist ausschließlich als Root zulässig")
+    if bool(target_value) != bool(runner_value):
+        raise RuntimeError("Bootstrap-Root und Bootstrap-Runner müssen gemeinsam gebunden sein")
+    if not target_value:
+        return None
+    if not user_value:
+        raise RuntimeError("Download-Bootstrap besitzt keine vollständige Nutzerbindung")
+    module_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    runner = _validated_strict_product_root(runner_value, "Bootstrap-Runner")
+    target = _validated_strict_product_root(
+        target_value,
+        "Bootstrap-Ziel",
+        allow_one_missing_marker=True,
+    )
+    module = _validated_strict_product_root(module_root, "Ausgeführter Release-Root")
+    if runner != module:
+        raise RuntimeError("Bootstrap-Runner stimmt nicht mit dem ausgeführten Release-Root überein")
+    common = os.path.commonpath((runner, target))
+    if runner == target or common in {runner, target}:
+        raise RuntimeError("Bootstrap-Runner und Bootstrap-Ziel müssen getrennte Bäume sein")
+    return target, runner
 
 
 def _resolve_install_root(module_root, explicit_root="", configured_root=""):
     """Erlaubt einen fremden Zielroot nur im vollständig dual gebundenen Bootstrap."""
 
     module = _validated_product_root(module_root)
-    bootstrap_target = str(os.environ.get("E3DC_BOOTSTRAP_ROOT") or "").strip()
-    bootstrap_runner = str(os.environ.get("E3DC_BOOTSTRAP_RUNNER_ROOT") or "").strip()
-    if bool(bootstrap_target) != bool(bootstrap_runner):
-        raise RuntimeError("Bootstrap-Root und Bootstrap-Runner müssen gemeinsam gebunden sein")
-
-    if bootstrap_target:
-        runner = _validated_strict_product_root(bootstrap_runner, "Bootstrap-Runner")
-        target = _validated_strict_product_root(bootstrap_target, "Bootstrap-Ziel")
+    bootstrap_authority = _bound_download_bootstrap_authority()
+    if bootstrap_authority is not None:
+        target, runner = bootstrap_authority
         strict_module = _validated_strict_product_root(module_root, "Ausgeführter Release-Root")
-        if runner != strict_module or module != strict_module:
+        if module != strict_module or runner != strict_module:
             raise RuntimeError("Bootstrap-Runner stimmt nicht mit dem ausgeführten Release-Root überein")
-        common = os.path.commonpath((runner, target))
-        if runner == target or common in {runner, target}:
-            raise RuntimeError("Bootstrap-Runner und Bootstrap-Ziel müssen getrennte Bäume sein")
-        for candidate, label in (
-            (explicit_root, "E3DC_INSTALL_ROOT"),
-            (configured_root, "Pfadmetadaten"),
-        ):
-            if candidate and _validated_strict_product_root(candidate, label) != target:
-                raise RuntimeError(f"{label} widersprechen dem gebundenen Bootstrap-Ziel")
+        if explicit_root and _validated_strict_product_root(
+            explicit_root,
+            "E3DC_INSTALL_ROOT",
+            allow_one_missing_marker=True,
+        ) != target:
+            raise RuntimeError("E3DC_INSTALL_ROOT widerspricht dem gebundenen Bootstrap-Ziel")
+        # Alte Produkt-/Web-Metadaten sind in diesem engen Pfad ausschließlich
+        # Backup- und Reparaturdaten. Die aus dem unabhängigen, root-eigenen
+        # Runner gebundene Zielwurzel darf von ihnen nicht rückautorisiert werden.
         return target
 
     root = _validated_product_root(explicit_root or configured_root or module_root)
@@ -602,6 +640,143 @@ def _write_web_config_pair(
                     + "; ".join(rollback_errors)
                 ) from exc
             raise
+
+
+def _project_path_metadata(data, *, user, home_dir, install_path, venv_path):
+    """Ersetzt nur die fünf technischen Pfad-/Nutzerfelder eines JSON-Objekts."""
+
+    projected = dict(data)
+    projected.update({
+        "install_user": user,
+        "home_dir": home_dir,
+        "install_path": install_path,
+    })
+    if venv_path:
+        projected.update({"venv_name": os.path.basename(venv_path), "venv_path": venv_path})
+    else:
+        projected.pop("venv_name", None)
+        projected.pop("venv_path", None)
+    return projected
+
+
+def project_download_bootstrap_metadata(
+    target_root,
+    install_user,
+    *,
+    venv_path,
+    expected_v4_config,
+    expected_v4_sha256,
+):
+    """Repariert genau drei Pfadspiegel unter der Root-Bootstrap-Autorität."""
+
+    authority = _bound_download_bootstrap_authority()
+    if authority is None:
+        raise RuntimeError("Altmetadaten-Projektion verlangt die Root-Bootstrap-Autorität")
+    target = os.path.abspath(str(target_root or ""))
+    if target != authority[0]:
+        raise RuntimeError("Altmetadaten-Projektion weicht vom gebundenen Bootstrap-Ziel ab")
+    user = str(install_user or "").strip()
+    if user != str(os.environ.get("E3DC_BOOTSTRAP_USER") or "").strip():
+        raise RuntimeError("Altmetadaten-Projektion besitzt keine eindeutige Nutzerbindung")
+    try:
+        account = pwd.getpwnam(user)
+    except KeyError as exc:
+        raise RuntimeError("Installationsbenutzer der Altmetadaten-Projektion existiert nicht") from exc
+    home, venv = get_home_dir(user), str(venv_path or "").strip()
+    if venv and (
+        os.path.abspath(venv) != venv
+        or os.path.realpath(venv) != venv
+        or os.path.dirname(venv) != home
+    ):
+        raise RuntimeError("Bootstrap-venv ist kein kanonisches direktes Home-Kind")
+
+    installer_path = os.path.join(target, "Installer", "installer_config.json")
+    uid, gid = int(account.pw_uid), int(get_www_data_gid())
+    paths = (installer_path, WEB_CONFIG_FILE, LEGACY_WEB_CONFIG_FILE)
+
+    with exclusive_transaction_lock("e3dc-bootstrap-metadata.lock"):
+        sources, snapshots = {}, {}
+        for path in paths:
+            sources[path], snapshots[path] = _read_json_snapshot_nofollow(
+                path,
+                allow_missing=path != WEB_CONFIG_FILE,
+            )
+        if (
+            sources[WEB_CONFIG_FILE] != expected_v4_config
+            or snapshots[WEB_CONFIG_FILE].get("sha256") != expected_v4_sha256
+        ):
+            raise RuntimeError("V4-Konfiguration driftete vor der Altmetadaten-Projektion")
+
+        projected = {
+            path: _project_path_metadata(
+                sources[path] or {}, user=user, home_dir=home,
+                install_path=target, venv_path=venv,
+            )
+            for path in paths
+        }
+        payloads = {
+            path: json.dumps(projected[path], indent=2).encode("utf-8")
+            for path in paths
+        }
+        if max(map(len, payloads.values())) > 1024 * 1024:
+            raise RuntimeError("Bootstrap-Pfadmetadaten überschreiten das Bytelimit")
+
+        installer_committed = None
+        web_projected = False
+        v4_mode = config_secret_file_mode(projected[WEB_CONFIG_FILE])
+        try:
+            _write_web_config_pair(
+                projected[WEB_CONFIG_FILE],
+                projected[LEGACY_WEB_CONFIG_FILE],
+                user=user,
+                expected_v4_snapshot=snapshots[WEB_CONFIG_FILE],
+                expected_paths_snapshot=snapshots[LEGACY_WEB_CONFIG_FILE],
+            )
+            web_projected = True
+            installer_committed = atomic_write_bound_file(
+                installer_path,
+                payloads[installer_path], uid=uid, gid=gid, mode=0o640,
+                expected_snapshot=snapshots[installer_path],
+                max_existing_bytes=1024 * 1024,
+            )
+            for path in paths:
+                readback, readback_snapshot = _read_json_snapshot_nofollow(path)
+                if readback != projected[path] or (
+                    path == installer_path
+                    and not snapshots_match(readback_snapshot, installer_committed, exact_metadata=True)
+                ):
+                    raise RuntimeError("Bootstrap-Pfadspiegel-Readback weicht vom Soll ab")
+        except Exception as exc:
+            rollback_errors = []
+            rollback = [(snapshots[installer_path], installer_committed, payloads[installer_path], 0o640, None)]
+            if web_projected:
+                rollback += [
+                    (snapshots[LEGACY_WEB_CONFIG_FILE], None, payloads[LEGACY_WEB_CONFIG_FILE], 0o640, "/var/www"),
+                    (snapshots[WEB_CONFIG_FILE], None, payloads[WEB_CONFIG_FILE], v4_mode, "/var/www"),
+                ]
+            for previous, committed, payload, mode, staging_root in rollback:
+                try:
+                    _restore_json_projection(
+                        previous, committed, payload, uid=uid, gid=gid,
+                        mode=mode, staging_root=staging_root,
+                    )
+                except Exception as rollback_exc:
+                    rollback_errors.append(str(rollback_exc))
+            if rollback_errors:
+                raise RuntimeError(
+                    f"Bootstrap-Pfadmetadaten fehlgeschlagen ({exc}); "
+                    "Rollback unvollständig: " + "; ".join(rollback_errors)
+                ) from exc
+            raise
+
+    return {
+        "config": projected[WEB_CONFIG_FILE],
+        "config_sha256": hashlib.sha256(payloads[WEB_CONFIG_FILE]).hexdigest(),
+        "install_user": user,
+        "home_dir": home,
+        "install_path": target,
+        "venv_path": venv,
+    }
 
 
 def _existing_installation_markers():

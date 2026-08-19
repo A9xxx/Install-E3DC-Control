@@ -1,3 +1,62 @@
+# E3DC-Control v5.4.4a
+
+E3DC-Control 5.4.4a stabilisiert die Wallbox-Phasenumschaltung und Startketten,
+beseitigt das 3-Minuten-Takten bei aktiver Ladekurve und härtet die
+Hausverbrauchs- sowie Ertragsberechnung im Web-Frontend.
+
+## Robuste Wallbox-Phasenumschaltung, Startführung und Recovery
+
+- **Sofortige Stromfreigabe nach Phasenwechsel:** Ein potenzieller
+  Parameterfehler (`started_ts`) im Wire-Cooldown nach Phasenwechseln wurde
+  behoben. Telemetrie und physische Zielphasen-Readbacks werden vor der
+  Lease-Ablaufprüfung ausgewertet, sodass bestätigte Umschaltungen ohne
+  Verzögerung oder Deadlock direkt in die Freigabe des Ladestroms übergehen.
+- **Saubere Recovery-Autorisierung bei Dienstneustarts:** Startet der Wallbox
+  Manager während oder kurz nach einem Phasenwechsel neu, wird der Zustand
+  anhand des bestätigten Hardware-Readbacks sofort wiederhergestellt, anstatt
+  den Ladestrom fälschlicherweise in einer Dauersperre zu halten.
+- **Entstörung der Start- und Haltezustände:** Im Hold-Current-Enforcement-
+  Vertrag wurde ein Deadlock behoben, bei dem ein ruhendes Fahrzeug während
+  der PV-Startvorbereitung fälschlicherweise gestoppt und das Startintegral
+  zyklisch gelöscht wurde. Wiederholte Starts im selben Steckzyklus werden
+  nach erfolgreicher Ladung nicht mehr als Startablehnung gewertet.
+- **Zuverlässige E3DC- und openWB-Aktorik:** Die Stop-Verriegelung für
+  E3DC-Wallboxen wurde entprellt, sodass neue Start-Toggles bei anliegendem
+  Budget sofort übertragen werden. Das Speichern von openWB-Parametern über
+  die Web-Oberfläche schlägt nicht mehr durch redundante Dateirechte-Prüfungen
+  auf gemeinsamen Lockdateien fehl.
+- **Stabilität auf der Wallbox-Bedienseite:** Dienstneustarts aus
+  `Wallbox.php` werden zuverlässig quittiert und unnötige Dateisystemzugriffe
+  auf geschützte Konfigurationsdateien unterbunden.
+
+## Entprellte Speicherführung und Ladekurven-Stabilität
+
+- **Beseitigung des 3-Minuten-Taktens:** In der Ladekurven-Haltefunktion
+  (`parallel_curve_auto_hold`) wurde ein fehlerhafter Freilauf-Timeout behoben.
+  Hält die Ladekurve den Speicher am Vormittag auf 0 W, bleibt diese
+  EMS-Ladegrenze zustandstreu aktiv und kippt nicht mehr nach 90 Sekunden
+  unbegründet in einen 3-kW-Freilauf.
+- **Ruhige Batterieladung bei laufender Fahrzeugladung:** Die Drossellogik
+  für DC-gekoppelte Speicher wurde geglättet, um sprunghafte Schwingungen
+  zwischen Speicherladung und Netzeinspeisung bei schnellen Lastwechseln
+  zuverlässig zu verhindern.
+
+## Frontend-Visualisierung & Direktvermarktung
+
+- **Glitch-Schutz für die Hausverbrauchsberechnung:** Fällt der berechnete
+  Hausverbrauch durch sporadische 0-W-RSCP-Frames oder Messwert-Glitches
+  kurzzeitig unter 50 W, hält die Visualisierung den letzten plausiblen
+  Realverbrauch, um unruhige Ausschläge im Dashboard zu glätten.
+- **1:1 Zeitachsen-Kopplung im Fahrplan-Modal:** Das Direktvermarktungs-
+  Diagramm ist nun exakt auf dasselbe 15-Minuten-Tagesraster (00:00–24:00 Uhr)
+  wie die Standard-Ladekurve synchronisiert.
+- **Konsistente Ertragsbewertung bei Negativpreisen:** Bei negativen
+  Strompreisen (≤ 0 ct/kWh) wird nur noch der tatsächlich im Haus oder
+  Speicher genutzte PV-Ertrag in die wirtschaftliche Ertragsanzeige einbezogen.
+
+---
+
+
 # E3DC-Control v5.4.4
 
 E3DC-Control 5.4.4 ist ein konsolidierter Stable-Stand für heterogene

@@ -1262,7 +1262,7 @@ function directMarketingSelectedActionFallbackViewModel(data, planId, planMeta) 
         if (roles) {
             action = typeof source.action === 'string' ? source.action.trim().toUpperCase() : '';
             plannedW = Number(source.planned_w);
-            const positivePowerAction = action === 'PV_STORE' || action === 'ECONOMIC_EXPORT';
+            const positivePowerAction = action === 'PV_STORE' || action === 'ECONOMIC_EXPORT' || action === 'DV_CURVE_CHARGE';
             const zeroPowerAction = action === 'CHARGE_BLOCK_WAIT';
             if ((!positivePowerAction && !zeroPowerAction) || !Number.isFinite(plannedW) || (positivePowerAction && plannedW <= 0) || (zeroPowerAction && Math.abs(plannedW) > 0.01) || !/^sha256:[0-9a-f]{64}$/.test(String(source.action_id || '')) || typeof source.window_id !== 'string' || source.window_id.trim() === '' || typeof source.segment_id !== 'string' || source.segment_id.trim() === '' || typeof source.source_action !== 'string' || source.source_action.trim() === '' || typeof source.source_mode !== 'string' || source.source_mode.trim() === '') return limited('DIRECT_MARKETING_ACTION_FALLBACK_ACTION_BINDING_INVALID');
         } else if (source.action !== null || source.planned_w !== null || source.action_id !== null || source.window_id !== null || source.segment_id !== null || source.source_action !== null || source.source_mode !== null) return limited('DIRECT_MARKETING_ACTION_FALLBACK_PASSIVE_ROLE_INVALID');
@@ -1270,7 +1270,7 @@ function directMarketingSelectedActionFallbackViewModel(data, planId, planMeta) 
         previousEnd = end;
     }
     if (previousEnd !== horizonEndTs) return limited('DIRECT_MARKETING_ACTION_FALLBACK_HORIZON_INVALID');
-    return {state: 'complete', reasonCode: null, slots, series: {pvStoreW: slots.map(slot => slot.plannedAllowed && slot.action === 'PV_STORE' ? slot.plannedW : null), economicExportW: slots.map(slot => slot.plannedAllowed && slot.action === 'ECONOMIC_EXPORT' ? slot.plannedW : null), chargeBlock: slots.map(slot => slot.plannedAllowed && slot.action === 'CHARGE_BLOCK_WAIT' ? 1 : null)}};
+    return {state: 'complete', reasonCode: null, slots, series: {pvStoreW: slots.map(slot => slot.plannedAllowed && (slot.action === 'PV_STORE' || slot.action === 'DV_CURVE_CHARGE') ? slot.plannedW : null), economicExportW: slots.map(slot => slot.plannedAllowed && slot.action === 'ECONOMIC_EXPORT' ? slot.plannedW : null), chargeBlock: slots.map(slot => slot.plannedAllowed && slot.action === 'CHARGE_BLOCK_WAIT' ? 1 : null)}};
 }
 
 function directMarketingTrajectoryViewModel(data = {}) {
@@ -1402,7 +1402,7 @@ function directMarketingTrajectoryViewModel(data = {}) {
             && Number(delegation.valid_until_ts_ms) >= end
             && Number.isFinite(Number(delegation.max_curve_charge_w))
             && Number(delegation.max_curve_charge_w) > 0;
-        const selectedAction = action === 'PV_STORE' || action === 'ECONOMIC_EXPORT' || action === 'CHARGE_BLOCK_WAIT';
+        const selectedAction = action === 'PV_STORE' || action === 'ECONOMIC_EXPORT' || action === 'CHARGE_BLOCK_WAIT' || action === 'DV_CURVE_CHARGE';
         const passiveBinding = source.passive_binding;
         if ((selection.selected === true && delegation !== null)
             || (selectedAction && !selectedRole && !delegatedPvStore)
@@ -1412,7 +1412,7 @@ function directMarketingTrajectoryViewModel(data = {}) {
                 || passiveBinding.schema !== 'direct_marketing_passive_normal_binding_v1'))) {
             return evidenceLimit('DIRECT_MARKETING_TRAJECTORY_ACTION_ROLE_INVALID');
         }
-        if (action === 'PV_STORE') {
+        if (action === 'PV_STORE' || action === 'DV_CURVE_CHARGE') {
             const dcOnly = delegatedPvStore || selection.pv_store_source_contract === 'E3DC_DC';
             const capW = delegatedPvStore ? Number(delegation.max_curve_charge_w) : Number(selection.requested_w);
             if (source.battery_w < -0.01
@@ -1499,7 +1499,7 @@ function directMarketingTrajectoryViewModel(data = {}) {
         slots,
         series: {
             soc,
-            pvStoreW: fallbackBound ? actionFallback.series.pvStoreW : slots.map(slot => slot.plannedAllowed && slot.action === 'PV_STORE' ? Math.abs(slot.batteryW) : null),
+            pvStoreW: fallbackBound ? actionFallback.series.pvStoreW : slots.map(slot => slot.plannedAllowed && (slot.action === 'PV_STORE' || slot.action === 'DV_CURVE_CHARGE') ? Math.abs(slot.batteryW) : null),
             economicExportW: fallbackBound ? actionFallback.series.economicExportW : slots.map(slot => slot.plannedAllowed && slot.action === 'ECONOMIC_EXPORT' ? Math.abs(slot.batteryW) : null),
             chargeBlock: fallbackBound ? actionFallback.series.chargeBlock : slots.map(slot => slot.plannedAllowed && slot.action === 'CHARGE_BLOCK_WAIT' ? 1 : null)
         }
@@ -2437,6 +2437,7 @@ function directMarketingRuntimePhysicalAction(data = {}) {
 
     const displayActions = {
         PV_STORE: 'eco_plus_store_pv_candidate',
+        DV_CURVE_CHARGE: 'eco_plus_curve_charge_candidate',
         ECONOMIC_EXPORT: 'eco_plus_export_candidate',
         HEADROOM_EXPORT: 'policy_headroom_export'
     };
@@ -7965,12 +7966,7 @@ function loadJsForecastChart(file = '') {
         .then(data => {
             if (!isCurrentJsChartRequest('forecast', requestGeneration)) return;
             updateForecastProjectionStatus(data);
-            updatePvForecastDiagnostics(data);
-            const directMarketingView = renderDirectMarketingForecastChart(data, {exclusive: true});
-            // Bei aktiver Direktvermarktung ist deren gebundene Trajektorie die
-            // einzige Prognoseansicht. Unvollständige Evidence fällt nicht auf
-            // eine scheinbar gültige Standardprognose zurück.
-            if (directMarketingView && directMarketingView.active === true) return;
+            renderDirectMarketingForecastChart(data, {exclusive: false});
             if (data.error || !data.labels || data.labels.length === 0) return;
 
             // SoC kommt aus der physikalischen Batterie-Bilanz der Prognose.
@@ -11407,7 +11403,7 @@ function showStorageCurveModal() {
     const directMarketingActive = directMarketingView.active === true;
     const standardChartWrap = document.getElementById('sc-standard-chart-wrap');
     const directMarketingChartWrap = document.getElementById('sc-direct-marketing-chart-wrap');
-    if (standardChartWrap) standardChartWrap.style.display = directMarketingActive ? 'none' : '';
+    if (standardChartWrap) standardChartWrap.style.display = '';
     if (directMarketingChartWrap) directMarketingChartWrap.style.display = directMarketingActive ? '' : 'none';
     $('#sc-current-soc').text(currentSoc !== null ? `${currentSoc.toFixed(1)}%` : '--%');
     $('#sc-modal-day').text(meta.display_day_label || 'Heute');
@@ -11467,27 +11463,19 @@ function showStorageCurveModal() {
     const today0 = displayStart ? new Date(displayStart) : new Date();
     today0.setHours(0,0,0,0);
 
-    // Pro Betriebsart wird genau eine Ladekurve gezeichnet. Eine aktive, aber
-    // unvollständige DV-Evidence fällt bewusst nicht auf die Standardkurve zurück.
-    const renderModalChart = directMarketingActive
-        ? () => _renderDirectMarketingTrajectoryChart()
-        : () => _renderStorageCurveChart([]);
-    $(el).one('shown.bs.modal', renderModalChart);
-    if (directMarketingActive) {
-        if (_storageCurveChartInstance) {
-            _storageCurveChartInstance.destroy();
-            _storageCurveChartInstance = null;
+    // Modal-Charts rendern: Die Standard-Ladekurve wird immer gerendert.
+    // Bei aktiver Direktvermarktung wird zusätzlich der DV-Fahrplan gerendert.
+    const renderModalCharts = () => {
+        _renderStorageCurveChart(_storageCurvePendingSocPoints);
+        if (directMarketingActive) {
+            _renderDirectMarketingTrajectoryChart();
         }
-    } else if (_directMarketingTrajectoryChartInstance) {
-        _directMarketingTrajectoryChartInstance.destroy();
-        _directMarketingTrajectoryChartInstance = null;
-    }
-    renderModalChart();
-    setTimeout(renderModalChart, 150);
-    if (directMarketingActive) return;
+    };
+    $(el).one('shown.bs.modal', renderModalCharts);
+    renderModalCharts();
+    setTimeout(renderModalCharts, 150);
 
-    // Nur die Standard-Ladekurve benötigt die historische IST-SoC-Linie.
-    // Der aktuelle Messpunkt selbst ist bereits beim ersten Zeichnen sichtbar.
+    // Historische IST-SoC-Linie für die Standard-Ladekurve nachladen
     const historyUrl = 'get_live_json.php?storage_curve_history=1&day_start_ms='
         + encodeURIComponent(today0.getTime());
     $.getJSON(historyUrl, function(historyData) {
@@ -11501,8 +11489,14 @@ function showStorageCurveModal() {
                 .sort((a, b) => a.ts - b.ts)
             : [];
         _renderStorageCurveChart(socPoints);
+        if (directMarketingActive) {
+            _renderDirectMarketingTrajectoryChart();
+        }
     }).fail(function() {
         _renderStorageCurveChart([]);
+        if (directMarketingActive) {
+            _renderDirectMarketingTrajectoryChart();
+        }
     });
 }
 
@@ -11601,6 +11595,30 @@ function _renderStorageCurveChart(socPoints) {
             const anchor = intermediateCurveAnchors.find(a => Math.abs(ts - a.ts) <= 8 * 60000);
             return anchor ? parseFloat(anchor.soc) : null;
         });
+
+        // Direktvermarktungs-Aktionsbänder für den heutigen Tag
+        const dvView = directMarketingTrajectoryViewModel(window._storageLiveData || {});
+        const dvSlots = Array.isArray(dvView.slots) ? dvView.slots : [];
+        const interpDvKw = (actionType, ts) => {
+            const slot = dvSlots.find(s => ts >= s.startTs && ts < s.endTs);
+            if (!slot) return null;
+            if (actionType === 'pv_store' && (slot.action === 'PV_STORE' || slot.action === 'DV_CURVE_CHARGE')) {
+                return slot.plannedW && slot.plannedW > 0 ? slot.plannedW / 1000 : null;
+            }
+            if (actionType === 'export' && (slot.action === 'ECONOMIC_EXPORT' || slot.action === 'HEADROOM_EXPORT')) {
+                return slot.plannedW && slot.plannedW > 0 ? slot.plannedW / 1000 : null;
+            }
+            return null;
+        };
+        const interpDvHold = ts => {
+            const slot = dvSlots.find(s => ts >= s.startTs && ts < s.endTs);
+            if (!slot) return null;
+            if (slot.action === 'CHARGE_BLOCK_WAIT') return 1;
+            return null;
+        };
+        const dvPvStoreData = sortedTs.map(ts => interpDvKw('pv_store', ts));
+        const dvExportData = sortedTs.map(ts => interpDvKw('export', ts));
+        const dvHoldData = sortedTs.map(ts => interpDvHold(ts));
 
         // Jetzt-Linie: Index des ersten Timestamps >= nowMs
         const nowIdx = (nowMs >= sortedTs[0] && nowMs <= sortedTs[sortedTs.length - 1])
@@ -11710,6 +11728,43 @@ function _renderStorageCurveChart(socPoints) {
                         fill: true,
                         yAxisID: 'yPV',
                     },
+                    ...(dvView.active ? [
+                        {
+                            label: 'DV: PV speichern (Plan)',
+                            data: dvPvStoreData,
+                            type: 'bar',
+                            borderColor: '#3b82f6',
+                            backgroundColor: 'rgba(59,130,246,0.32)',
+                            borderWidth: 1,
+                            borderSkipped: false,
+                            yAxisID: 'yPV',
+                            order: 7,
+                        },
+                        {
+                            label: 'DV: Wirtschaftl. Export (Plan)',
+                            data: dvExportData,
+                            type: 'bar',
+                            borderColor: '#10b981',
+                            backgroundColor: 'rgba(16,185,129,0.32)',
+                            borderWidth: 1,
+                            borderSkipped: false,
+                            yAxisID: 'yPV',
+                            order: 7,
+                        },
+                        {
+                            label: 'DV: Laden gesperrt / Halten',
+                            data: dvHoldData,
+                            type: 'bar',
+                            borderColor: '#f59e0b',
+                            backgroundColor: 'rgba(245,158,11,0.16)',
+                            borderWidth: 0,
+                            borderSkipped: false,
+                            barPercentage: 1,
+                            categoryPercentage: 1,
+                            yAxisID: 'yState',
+                            order: 15,
+                        }
+                    ] : []),
                     {
                         label: 'Zwischenziel',
                         data: intermediateData,
@@ -11751,6 +11806,9 @@ function _renderStorageCurveChart(socPoints) {
                                 if (label === 'Aktueller SoC (Messwert)') return 'Aktueller SoC: ' + (ctx.raw !== null ? ctx.raw.toFixed(1) + '%' : '--');
                                 if (label === 'IST-SoC') return 'IST:  ' + (ctx.raw !== null ? ctx.raw.toFixed(1) + '%' : '--');
                                 if (label === 'PV-Prognose (kW)') return 'PV:   ' + (ctx.raw !== null ? ctx.raw.toFixed(2) + ' kW' : '--');
+                                if (label === 'DV: PV speichern (Plan)') return 'DV PV speichern: ' + (ctx.raw !== null ? Number(ctx.raw).toFixed(2) + ' kW' : '--');
+                                if (label === 'DV: Wirtschaftl. Export (Plan)') return 'DV Export: ' + (ctx.raw !== null ? Number(ctx.raw).toFixed(2) + ' kW' : '--');
+                                if (label === 'DV: Laden gesperrt / Halten') return 'DV: Laden gesperrt / Halten';
                                 if (label === 'Zwischenziel') return 'Zwischenziel: ' + (ctx.raw !== null ? ctx.raw.toFixed(1) + '%' : '--');
                                 return '';
                             }
@@ -11775,6 +11833,13 @@ function _renderStorageCurveChart(socPoints) {
                         ticks: { color: 'rgba(255,176,0,0.8)', callback: v => v + ' kW' },
                         grid: { display: false },
                         title: { display: true, text: 'PV (kW)', color: 'rgba(255,176,0,0.8)', font: { size: 11 } }
+                    },
+                    yState: {
+                        type: 'linear',
+                        display: false,
+                        min: 0,
+                        max: 1,
+                        grid: { display: false }
                     }
                 }
             },
@@ -11842,41 +11907,78 @@ function _renderDirectMarketingTrajectoryChart() {
         return;
     }
 
-    wrap.style.display = '';
+wrap.style.display = '';
     if (_directMarketingTrajectoryChartInstance) {
         _directMarketingTrajectoryChartInstance.destroy();
         _directMarketingTrajectoryChartInstance = null;
     }
-    if (!['complete', 'actions_only'].includes(view.state)) {
-        if (stateEl) {
-            const currentSoc = currentLiveSocForChart();
-            const currentSocText = currentSoc !== null ? ` · aktueller SoC ${currentSoc.toFixed(1)}%` : '';
-            stateEl.textContent = `EVIDENCE_LIMIT: ${view.reasonCode || 'DV-Trajektorie unvollständig'}${currentSocText}`;
-        }
-        return;
+    // Gemeinsame Zeitachse: Wir erzeugen exakt dasselbe feste 15-Minuten Raster für den ganzen Tag (00:00 - 24:00),
+    // damit Standard-Ladekurve und Direktvermarktungs-Fahrplan 1:1 vertikal gekoppelt und direkt vergleichbar sind.
+    const meta = window._storagePlanMeta || {};
+    const displayStart = meta.display_day_start ? parseInt(meta.display_day_start, 10) : null;
+    const today0 = displayStart ? new Date(displayStart) : new Date();
+    today0.setHours(0,0,0,0);
+    const fixedGrid = [];
+    for (let m = 0; m <= 24 * 60; m += 15) {
+        fixedGrid.push(today0.getTime() + m * 60000);
     }
-    if (typeof Chart === 'undefined') {
-        if (stateEl) stateEl.textContent = 'Diagrammbibliothek wird geladen';
-        return;
-    }
-
-    const pointTimestamps = view.slots.map(slot => slot.startTs)
-        .concat([view.slots[view.slots.length - 1].endTs]);
-    const appendEnd = values => values.concat([null]);
-    const socData = view.state === 'complete'
-        ? [view.slots[0].socStartPct].concat(view.slots.map(slot => slot.socEndPct))
-        : view.slots.map(() => null).concat([null]);
-    const pvStoreKw = appendEnd(view.series.pvStoreW.map(value => value === null ? null : value / 1000));
-    const exportKw = appendEnd(view.series.economicExportW.map(value => value === null ? null : value / 1000));
-    const chargeBlock = appendEnd(view.series.chargeBlock);
+    const sortedTs = fixedGrid;
     const isDark = document.documentElement.getAttribute('data-bs-theme') === 'dark';
     const gridColor = isDark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.07)';
     const tickColor = isDark ? '#adb5bd' : '#6c757d';
-    const timeContext = buildCompactChartTimeContext(pointTimestamps, [], gridColor, tickColor, isDark, 8);
-    const currentSoc = currentSocMarkerForTimestamps(pointTimestamps);
-    const showSocAxis = view.state === 'complete' || currentSoc.index >= 0;
+    const timeContext = buildCompactChartTimeContext(sortedTs, [], gridColor, tickColor, isDark, 7);
+
+    const rawSlots = Array.isArray(view.slots) ? view.slots : [];
+    const interpDvSoc = ts => {
+        const slot = rawSlots.find(s => ts >= s.startTs && ts < s.endTs);
+        if (slot) return slot.socStartPct;
+        if (rawSlots.length > 0) {
+            if (ts < rawSlots[0].startTs) return rawSlots[0].socStartPct;
+            if (ts >= rawSlots[rawSlots.length - 1].endTs) return rawSlots[rawSlots.length - 1].socEndPct;
+        }
+        return null;
+    };
+    const interpDvPvStore = ts => {
+        const slot = rawSlots.find(s => ts >= s.startTs && ts < s.endTs);
+        if (slot && slot.plannedAllowed && (slot.action === 'PV_STORE' || slot.action === 'DV_CURVE_CHARGE')) {
+            return slot.plannedW && slot.plannedW > 0 ? slot.plannedW / 1000 : null;
+        }
+        return null;
+    };
+    const interpDvExport = ts => {
+        const slot = rawSlots.find(s => ts >= s.startTs && ts < s.endTs);
+        if (slot && slot.plannedAllowed && (slot.action === 'ECONOMIC_EXPORT' || slot.action === 'HEADROOM_EXPORT')) {
+            return slot.plannedW && slot.plannedW > 0 ? slot.plannedW / 1000 : null;
+        }
+        return null;
+    };
+    const interpDvHold = ts => {
+        const slot = rawSlots.find(s => ts >= s.startTs && ts < s.endTs);
+        if (slot && slot.plannedAllowed && slot.action === 'CHARGE_BLOCK_WAIT') {
+            return 1;
+        }
+        return null;
+    };
+
+    const socData = view.state === 'complete'
+        ? sortedTs.map(ts => interpDvSoc(ts))
+        : sortedTs.map(() => null);
+    const pvStoreKw = sortedTs.map(ts => interpDvPvStore(ts));
+    const exportKw = sortedTs.map(ts => interpDvExport(ts));
+    const chargeBlock = sortedTs.map(ts => interpDvHold(ts));
+
+    // Jetzt-Linie: Index des ersten Timestamps >= nowMs
+    const nowMs = Date.now();
+    const nowIdx = (nowMs >= sortedTs[0] && nowMs <= sortedTs[sortedTs.length - 1])
+        ? sortedTs.findIndex(ts => ts >= nowMs)
+        : -1;
+    const chartLiveSoc = currentLiveSocForChart();
+    const currentSocData = sortedTs.map((ts, index) => (
+        index === nowIdx && chartLiveSoc !== null ? chartLiveSoc : null
+    ));
+
     if (stateEl) {
-        const currentSocText = currentSoc.soc !== null ? ` · aktueller SoC ${currentSoc.soc.toFixed(1)}%` : '';
+        const currentSocText = chartLiveSoc !== null ? ` · aktueller SoC ${chartLiveSoc.toFixed(1)}%` : '';
         stateEl.textContent = view.state === 'actions_only'
             ? `SoC-Prognose EVIDENCE_LIMIT · nur ausgewählte Planaktionen${currentSocText}`
             : `Kanonischer DV-Plan · Ausführung und Hardwarewirkung separat${currentSocText}`;
@@ -11899,9 +12001,9 @@ function _renderDirectMarketingTrajectoryChart() {
                     yAxisID: 'ySoc',
                     order: 1
                 }] : []),
-                ...(currentSoc.index >= 0 ? [{
+                ...(chartLiveSoc !== null && nowIdx >= 0 ? [{
                     label: 'Aktueller SoC (Messwert)',
-                    data: currentSoc.data,
+                    data: currentSocData,
                     showLine: false,
                     borderColor: '#22c55e',
                     backgroundColor: '#22c55e',
@@ -11971,21 +12073,51 @@ function _renderDirectMarketingTrajectoryChart() {
             },
             scales: {
                 x: timeContext.xScale,
-                ...(showSocAxis ? {ySoc: {
-                    type: 'linear', position: 'left', min: 0, max: 100,
-                    ticks: {color: '#8b5cf6', callback: value => value + '%'},
+                ySoc: {
+                    type: 'linear',
+                    position: 'left',
+                    min: 0,
+                    max: 100,
+                    ticks: {color: '#8b5cf6', callback: e => e + '%'},
                     grid: {color: gridColor},
                     title: {display: true, text: 'DV-SoC (%)', color: '#8b5cf6'}
-                }} : {}),
+                },
                 yPower: {
-                    type: 'linear', position: 'right', min: 0,
-                    ticks: {color: tickColor, callback: value => value + ' kW'},
+                    type: 'linear',
+                    position: 'right',
+                    min: 0,
+                    ticks: {color: tickColor, callback: e => e + ' kW'},
                     grid: {display: false},
                     title: {display: true, text: 'geplante Leistung (kW)', color: tickColor}
                 },
                 yState: {type: 'linear', display: false, min: 0, max: 1, grid: {display: false}}
             }
-        }
+        },
+        plugins: [{
+            // Vertikale "Jetzt"-Linie (exakt deckungsgleich zur oberen Ladekurve)
+            id: 'nowLine',
+            afterDraw: chart => {
+                if (nowIdx < 0) return;
+                const meta = chart.getDatasetMeta(0);
+                if (!meta.data[nowIdx]) return;
+                const x = meta.data[nowIdx].x;
+                const ctx = chart.ctx;
+                const yAxis = chart.scales.ySoc;
+                if (!yAxis) return;
+                ctx.save();
+                ctx.beginPath();
+                ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+                ctx.lineWidth = 1.5;
+                ctx.setLineDash([4, 4]);
+                ctx.moveTo(x, yAxis.top);
+                ctx.lineTo(x, yAxis.bottom);
+                ctx.stroke();
+                ctx.fillStyle = 'rgba(255,255,255,0.7)';
+                ctx.font = '11px sans-serif';
+                ctx.fillText('Jetzt', x + 4, yAxis.top + 14);
+                ctx.restore();
+            }
+        }]
     });
 }
 

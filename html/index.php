@@ -3396,7 +3396,6 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                     summary += ' Der Tagespfad wird beim nächsten Tagesplan neu eingefroren.';
                 }
                 $('#stat-regler-summary').text(summary);
-
                 $('#card-regler-wrapper').show();
 
             } else if (data.storage_plan_meta && data.storage_plan_meta.clear_classical_curves === true) {
@@ -3405,7 +3404,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                 $('#stat-regler-soll-now, #stat-regler-meta').text('--');
                 $('#stat-regler-summary').text('Die Direktvermarktung führt den aktuellen Slot.');
                 $('#head-rb, #head-re, #head-le').text('--');
-                $('#card-regler-wrapper').hide();
+                $('#card-regler-wrapper').show();
                 $('#header-regler-plan').removeClass('d-xl-flex text-muted').addClass('d-none');
             } else if (data.regler && data.regler.rb_time) {
                 // Legacy-Fallback: C++ Fahrplan (alt)
@@ -3422,7 +3421,6 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                 let leLocal = toLocal(data.regler.le_time);
                 $('#stat-regler-rb-time').text(rbLocal);
                 $('#stat-regler-rb-soc').text(parseFloat(data.regler.rb_soc).toFixed(1) + '%');
-                $('#stat-regler-re-time').text(reLocal);
                 $('#stat-regler-re-soc').text(parseFloat(data.regler.re_soc).toFixed(1) + '%');
                 $('#stat-regler-le-time').text(leLocal);
                 $('#stat-regler-le-soc').text(parseFloat(data.regler.le_soc).toFixed(1) + '%');
@@ -3432,7 +3430,10 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                 $('#head-re-wrap').attr('title', 'Regelende');
                 $('#head-re-icon').attr('class', 'fas fa-stop text-warning opacity-75');
                 $('#head-le').text(leLocal + ' (' + parseFloat(data.regler.le_soc).toFixed(0) + '%)');
-                // $('#card-regler-wrapper').show();  // Legacy: nur Header zeigen
+                $('#card-regler-wrapper').show();
+            } else if (data.direct_marketing_enabled || data.storage_plan_meta) {
+                $('#stat-regler-summary').text('Direktvermarktung / Speicherregelung aktiv.');
+                $('#card-regler-wrapper').show();
             } else {
                 $('#card-regler-wrapper').hide();
                 $('#header-regler-plan').removeClass('d-xl-flex text-muted').addClass('d-none');

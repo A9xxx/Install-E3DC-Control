@@ -2,7 +2,19 @@
 
 Diese Anleitung fasst die schnellsten Schritte zusammen, um E3DC-Control auf einem frischen Raspberry Pi OS (oder ähnlichem Debian-System) zu installieren.
 
-Aktueller Stable-Stand: `v5.4.4`.
+Aktueller Stable-Stand: `v5.4.4a`.
+
+5.4.4a vereinheitlicht den Bare-Metal-Updateeinstieg. Für einen heterogenen
+Altstand wird nur `e3dc-update-bootstrap` auf den Raspberry Pi kopiert und mit
+`sudo /bin/sh ./e3dc-update-bootstrap` gestartet. Installationsroot,
+Installationsbenutzer und Anlagenrolle werden eindeutig erkannt; ein fester
+Pfad, ein vorgeschaltetes `chmod` und weitere Argumente sind nicht nötig. Das
+Update läuft danach als gemeinsamer root-eigener Hintergrundauftrag weiter.
+Lokale Git-Metadaten, Dirty-Status und historische Dateimodi sind kein
+vorgelagertes Gate. Backup-Prüfung, Writer- und Dienststopp, Datei- und
+Rechteprojektion, Dienststart und Healthcheck bleiben vollständig erhalten.
+EMS-, Direktvermarktungs-, Wallbox- und Hardwarelogik ändern sich gegenüber
+5.4.4 nicht.
 
 5.4.4 ist der konsolidierte Zielstand für heterogene Altanlagen. Der
 heruntergeladene Ziel-Updater erstellt und prüft zuerst das Backup, legt die
@@ -159,29 +171,20 @@ Für eine Erstinstallation oder ein Update ist die empfohlene Option **"1 Instal
 2.  Der Installer richtet Pakete, Dienste, Webdateien, Rechte und die sichere Grundkonfiguration ein.
 3.  Folgen Sie den Anweisungen auf dem Bildschirm.
 
-**Einmalige Ausnahme für Version 5.3.2b:** Der erste Wechsel auf das aktuelle
-Stable-Release erfolgt über die folgende vollständige administrative
-SSH-Kette. Der Web-Launcher ist in diesem Altstand noch nicht vorhanden. Der
-interaktive Menüpunkt darf für genau diesen ersten
-Hybridwechsel nicht verwendet werden, weil sein Altprozess bereits zusätzliche
-5.3.2b-Module geladen hat.
+**Einmaliger Übergang aus einem Altstand:** Kopiere die veröffentlichte Datei
+`e3dc-update-bootstrap` an einen beliebigen Ort auf den Raspberry Pi und starte
+sie im Ablageverzeichnis:
 
 ```bash
-export E3DC_INSTALL_PATH="$HOME/Install"
-test -f "$E3DC_INSTALL_PATH/installer_main.py"
-test -x "$HOME/.venv_e3dc/bin/python3"
-cd "$E3DC_INSTALL_PATH"
-sudo /usr/bin/python3 installer_main.py --fix-permissions
-sudo /usr/bin/python3 -I -B -u installer_main.py --check
-sudo /usr/bin/python3 -I -B -u installer_main.py --update-e3dc
-cat VERSION
-systemctl --failed --no-pager
+sudo /bin/sh ./e3dc-update-bootstrap
 ```
 
-Liegt E3DC-Control nicht unter `$HOME/Install`, wird nur die erste Zeile an den
-tatsächlichen absoluten Installationspfad angepasst. Schlägt eine der beiden
-`test`-Zeilen fehl, dort stoppen. Weitere Hintergründe stehen in
-[Update.md](Update.md).
+Der damit gestartete veröffentlichte Updatepfad erkennt Installationsordner,
+Installationsbenutzer und Rolle selbst und arbeitet als
+systemd-Hintergrundauftrag. Ein fester
+Installationspfad oder ein `chmod` ist nicht erforderlich. Bei mehreren
+gleichrangigen Installationen stoppt sie und zeigt die Kandidaten an. Weitere
+Hintergründe stehen in [Update.md](Update.md).
 
 ```text
 1) Installation / Update
@@ -324,7 +327,7 @@ Ohne das Label bleibt auch ein versehentlich gestarteter Watchtower für den
 Hauptcontainer wirkungslos. Der oben gezeigte manuelle Host-Helfer bleibt der
 empfohlene Updateweg.
 
-**Docker-Rückfall von v5.4.4 auf den veröffentlichten Docker-Rollback-Root:**
+**Docker-Rückfall von v5.4.4a auf den veröffentlichten Docker-Rollback-Root:**
 ```bash
 (
   set -euo pipefail
@@ -391,9 +394,10 @@ Nach der Installation können Sie den Installer über `bash "$E3DC_INSTALL_PATH/
 - **E3DC-Control installieren oder aktualisieren:**
   - Option `1` (Installation / Update)
   - Hält Anwendung, Webdateien, Dienste und Rechte auf dem aktuellen Stand.
-  - Ausnahme: Für den einmaligen Wechsel von 5.3.2b auf das aktuelle Stable-Release den
-    direkten administrativen `--update-e3dc`-Aufruf aus
-    [Update.md](Update.md) verwenden, nicht den interaktiven Menüpunkt.
+  - Für den einmaligen Wechsel aus einem heterogenen Altstand die Datei
+    `e3dc-update-bootstrap` kopieren und mit
+    `sudo /bin/sh ./e3dc-update-bootstrap` starten; Details stehen in
+    [Update.md](Update.md).
 
 - **Berechtigungen überprüfen & korrigieren:**
   - Option `3` (Rechte prüfen & korrigieren)

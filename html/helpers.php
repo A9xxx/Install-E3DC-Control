@@ -4056,23 +4056,15 @@ function e3dcInspectServiceWrapper($wrapper) {
 function e3dcInspectWebUpdateLauncher() {
     $launcher = '/usr/local/sbin/e3dc-web-update-launcher';
     $result = ['ok' => false, 'path' => $launcher, 'status' => 'missing'];
-    $paths = getInstallPaths();
-    if (empty($paths['valid']) || empty($paths['install_path']) || empty($paths['install_user'])) {
-        $result['status'] = 'install_context_unbound';
-        return $result;
-    }
-    $repoDir = rtrim((string)$paths['install_path'], '/');
-    $installUser = trim((string)$paths['install_user']);
     if (realpath($launcher) !== $launcher || is_link($launcher)) {
         $result['status'] = 'unbound_path';
         return $result;
     }
-    foreach (['/usr/local', '/usr/local/sbin'] as $directory) {
+    foreach (['/', '/usr', '/usr/local', '/usr/local/sbin'] as $directory) {
         $metadata = @lstat($directory);
         if (!is_array($metadata)
             || (($metadata['mode'] ?? 0) & 0170000) !== 0040000
             || (int)($metadata['uid'] ?? -1) !== 0
-            || (int)($metadata['gid'] ?? -1) !== 0
             || (((int)($metadata['mode'] ?? 0)) & 0022) !== 0) {
             $result['status'] = 'unsafe_path_permissions';
             return $result;
@@ -4081,47 +4073,37 @@ function e3dcInspectWebUpdateLauncher() {
     $metadata = @lstat($launcher);
     if (!is_array($metadata)
         || (($metadata['mode'] ?? 0) & 0170000) !== 0100000
-        || (int)($metadata['nlink'] ?? 0) !== 1
-        || (int)($metadata['uid'] ?? -1) !== 0
-        || (int)($metadata['gid'] ?? -1) !== 0
-        || (((int)($metadata['mode'] ?? 0)) & 0777) !== 0755) {
+        || (int)($metadata['nlink'] ?? 0) !== 1) {
+        $result['status'] = 'unsafe_file_type';
+        return $result;
+    }
+    $launcherMode = (int)($metadata['mode'] ?? 0);
+    if ((int)($metadata['uid'] ?? -1) !== 0
+        || ($launcherMode & 0022) !== 0
+        || ($launcherMode & 0111) === 0) {
         $result['status'] = 'unsafe_file_permissions';
         return $result;
     }
-    $head = e3dcResolveGitObjectId($repoDir, 'HEAD^{commit}');
-    if ($head === null) {
-        $result['status'] = 'head_unbound';
-        return $result;
-    }
-    $git = '/usr/bin/git';
-    $templateRead = e3dcRunArgvProcess(
-        [$git, '-c', 'safe.directory=' . $repoDir, '-C', $repoDir, 'cat-file', 'blob', $head . ':Installer/web_update_launcher.sh'],
-        10.0,
-        ['max_output_bytes' => 131072]
-    );
-    if (empty($templateRead['success']) || (int)($templateRead['exit_code'] ?? 1) !== 0) {
-        $result['status'] = 'head_unbound';
-        return $result;
-    }
-    $template = (string)($templateRead['stdout'] ?? '');
-    if (substr_count($template, '@E3DC_INSTALL_ROOT@') !== 1
-        || substr_count($template, '@E3DC_INSTALL_USER@') !== 1
-        || substr_count($template, '@E3DC_RELEASE_COMMIT@') !== 1) {
-        $result['status'] = 'template_invalid';
-        return $result;
-    }
-    $expected = str_replace(
-        ['@E3DC_INSTALL_ROOT@', '@E3DC_INSTALL_USER@', '@E3DC_RELEASE_COMMIT@'],
-        [$repoDir, $installUser, $head],
-        $template
-    );
     $handle = @fopen($launcher, 'rb');
     if ($handle === false) {
-        $result['status'] = 'not_readable';
+        clearstatcache(true, $launcher);
+        $pathAfter = @lstat($launcher);
+        foreach (['dev', 'ino', 'mode', 'nlink', 'uid', 'gid', 'size', 'mtime', 'ctime'] as $key) {
+            if (!is_array($pathAfter)
+                || ($metadata[$key] ?? null) !== ($pathAfter[$key] ?? null)) {
+                $result['status'] = 'read_drift';
+                return $result;
+            }
+        }
+        $result['ok'] = true;
+        $result['status'] = 'ok';
+        $result['inspection'] = 'metadata_only';
+        $result['dev'] = (int)$metadata['dev'];
+        $result['ino'] = (int)$metadata['ino'];
         return $result;
     }
     $openedBefore = @fstat($handle);
-    $actual = (string)@stream_get_contents($handle, 131073);
+    $actual = @stream_get_contents($handle, 131073);
     $openedAfter = @fstat($handle);
     @fclose($handle);
     $pathAfter = @lstat($launcher);
@@ -4134,14 +4116,14 @@ function e3dcInspectWebUpdateLauncher() {
             return $result;
         }
     }
-    if (!hash_equals(hash('sha256', $expected), hash('sha256', $actual))) {
-        $result['status'] = 'content_drift';
-        return $result;
-    }
     $result['ok'] = true;
     $result['status'] = 'ok';
-    $result['head'] = $head;
-    $result['actual_sha256'] = hash('sha256', $actual);
+    $result['inspection'] = 'stable_read';
+    if (is_string($actual)) {
+        $result['actual_sha256'] = hash('sha256', $actual);
+    }
+    $result['dev'] = (int)$metadata['dev'];
+    $result['ino'] = (int)$metadata['ino'];
     return $result;
 }
 

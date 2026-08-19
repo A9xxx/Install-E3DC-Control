@@ -244,6 +244,7 @@ SERVICE_WRAPPER_SOURCE = INSTALLER_DIR / "service_wrapper.sh"
 SERVICE_WRAPPER = Path("/usr/local/sbin/e3dc-service-control")
 WEB_UPDATE_LAUNCHER_SOURCE = INSTALLER_DIR / "web_update_launcher.sh"
 WEB_UPDATE_LAUNCHER = Path("/usr/local/sbin/e3dc-web-update-launcher")
+WEB_UPDATE_DISPATCHER_CONTRACT = b'e3dc-download-bootstrap-v1'
 SERVICE_WRAPPER_ACTIONS = (
     "start",
     "stop",
@@ -799,13 +800,11 @@ def _render_web_update_launcher(
     *,
     root: Path,
     user: str,
-    release_commit: str,
 ) -> bytes:
     """Bindet genau einen kanonischen Installationspfad und Benutzer ein."""
 
     root_text = str(root)
     user_text = str(user or "")
-    commit_text = str(release_commit or "").strip().lower()
     try:
         resolved_root = root.resolve(strict=True)
     except OSError as exc:
@@ -816,50 +815,120 @@ def _render_web_update_launcher(
         not root.is_absolute()
         or any(part in {".", ".."} for part in root.parts)
         or resolved_root != root
-        or not re.fullmatch(r"/[A-Za-z0-9._/-]+", root_text)
-        or "//" in root_text
+        or any(character in root_text for character in ("\x00", "\t", "\r", "\n"))
         or root_text.endswith("/")
-        or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]*", user_text)
+        or user_text != user_text.strip()
+        or not user_text
+        or "/" in user_text
+        or "\\" in user_text
+        or not all(
+            character.isalnum() or character in {"_", "-", "."}
+            for character in user_text
+        )
         or user_text in {"root", "www-data"}
-        or not re.fullmatch(r"[0-9a-f]{40}", commit_text)
     ):
         raise RuntimeError("Web-Update-Launcher besitzt keine kanonische Installationsbindung")
     root_marker = b"@E3DC_INSTALL_ROOT@"
     user_marker = b"@E3DC_INSTALL_USER@"
-    commit_marker = b"@E3DC_RELEASE_COMMIT@"
     if (
         template.count(root_marker) != 1
         or template.count(user_marker) != 1
-        or template.count(commit_marker) != 1
     ):
         raise RuntimeError("Web-Update-Launcher-Vorlage besitzt keinen eindeutigen Platzhaltervertrag")
-    rendered = template.replace(root_marker, root_text.encode("utf-8"))
-    rendered = rendered.replace(user_marker, user_text.encode("utf-8"))
-    rendered = rendered.replace(commit_marker, commit_text.encode("ascii"))
-    if root_marker in rendered or user_marker in rendered or commit_marker in rendered:
+    def shell_literal(value: str) -> bytes:
+        # Ausschließlich statische Single-Quote-Segmente erzeugen. Damit
+        # bleiben Leerzeichen, Unicode, Dollar, Backticks und einfache
+        # Anführungszeichen reine Daten und können beim Root-Start niemals
+        # Shellsyntax werden.
+        encoded = "'" + value.replace("'", "'\"'\"'") + "'"
+        return encoded.encode("utf-8")
+
+    rendered = template.replace(root_marker, shell_literal(root_text))
+    rendered = rendered.replace(user_marker, shell_literal(user_text))
+    if root_marker in rendered or user_marker in rendered:
         raise RuntimeError("Web-Update-Launcher-Vorlage blieb unvollständig")
     return rendered
 
 
-def web_update_launcher_integrity_preview() -> dict[str, Any]:
-    """Prüft den installierten argumentlosen Update-Launcher gegen Git-HEAD."""
+def web_update_launcher_integrity_preview(
+    *,
+    expected_payload: bytes | None = None,
+) -> dict[str, Any]:
+    """Prüft Root-Vertrag und Dispatcherkennung ohne Produkt-Git-Abhängigkeit."""
 
+    item: dict[str, Any] = {
+        "path": str(WEB_UPDATE_LAUNCHER),
+        "status": "unknown",
+        "needs_repair": True,
+    }
     try:
-        head, canonical = _git_head_wrapper_bytes(INSTALL_ROOT)
-        payload = _render_web_update_launcher(
-            canonical["Installer/web_update_launcher.sh"],
-            root=INSTALL_ROOT,
-            user=install_user(),
-            release_commit=head,
-        )
+        metadata = os.lstat(WEB_UPDATE_LAUNCHER)
+        item.update({
+            "uid": int(metadata.st_uid),
+            "gid": int(metadata.st_gid),
+            "mode": f"{stat.S_IMODE(metadata.st_mode):04o}",
+            "nlink": int(metadata.st_nlink),
+        })
+        if stat.S_ISLNK(metadata.st_mode):
+            item["status"] = "symlink"
+        elif not stat.S_ISREG(metadata.st_mode):
+            item["status"] = "not_regular"
+        elif metadata.st_nlink != 1:
+            item["status"] = "hardlink"
+        elif (
+            metadata.st_uid != 0
+            or stat.S_IMODE(metadata.st_mode) & 0o022
+            or stat.S_IMODE(metadata.st_mode) & 0o500 != 0o500
+        ):
+            item["status"] = "unsafe_permissions"
+        elif metadata.st_size < 512 or metadata.st_size > 64 * 1024:
+            item["status"] = "size_invalid"
+        else:
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+            descriptor = os.open(WEB_UPDATE_LAUNCHER, flags)
+            try:
+                bound = os.fstat(descriptor)
+                payload = b""
+                while len(payload) <= 64 * 1024:
+                    chunk = os.read(descriptor, 64 * 1024 + 1 - len(payload))
+                    if not chunk:
+                        break
+                    payload += chunk
+                rebound = os.fstat(descriptor)
+            finally:
+                os.close(descriptor)
+            named_rebound = os.stat(WEB_UPDATE_LAUNCHER, follow_symlinks=False)
+            item["sha256"] = hashlib.sha256(payload).hexdigest()
+            stable = (
+                bound.st_dev == metadata.st_dev
+                and bound.st_ino == metadata.st_ino
+                and bound.st_size == metadata.st_size
+                and bound.st_mtime_ns == metadata.st_mtime_ns
+                and rebound.st_dev == bound.st_dev
+                and rebound.st_ino == bound.st_ino
+                and rebound.st_size == bound.st_size
+                and rebound.st_mtime_ns == bound.st_mtime_ns
+                and named_rebound.st_dev == rebound.st_dev
+                and named_rebound.st_ino == rebound.st_ino
+                and named_rebound.st_size == rebound.st_size
+                and named_rebound.st_mtime_ns == rebound.st_mtime_ns
+            )
+            content_ok = (
+                stable
+                and payload.startswith(b"#!/bin/bash\n")
+                and b"\r" not in payload
+                and payload.count(WEB_UPDATE_DISPATCHER_CONTRACT) == 1
+                and b"@E3DC_INSTALL_ROOT@" not in payload
+                and b"@E3DC_INSTALL_USER@" not in payload
+                and (expected_payload is None or payload == expected_payload)
+            )
+            item["status"] = "ok" if content_ok else "content_invalid"
+            item["needs_repair"] = not content_ok
+    except FileNotFoundError:
+        item["status"] = "missing"
     except Exception as exc:
-        return {
-            "success": False,
-            "path": str(WEB_UPDATE_LAUNCHER),
-            "status": "head_error",
-            "error": str(exc),
-        }
-    item = _classify_wrapper(WEB_UPDATE_LAUNCHER, payload)
+        item.update({"status": "read_error", "error": str(exc)})
+
     parent_checks = []
     for parent in (WEB_UPDATE_LAUNCHER.parent.parent, WEB_UPDATE_LAUNCHER.parent):
         try:
@@ -876,7 +945,7 @@ def web_update_launcher_integrity_preview() -> dict[str, Any]:
         parent_checks.append({"path": str(parent), "ok": ok})
     success = bool(
         item.get("uid") == 0
-        and item.get("gid") == 0
+        and item.get("nlink") == 1
         and item.get("status") == "ok"
         and all(check["ok"] for check in parent_checks)
     )
@@ -884,7 +953,6 @@ def web_update_launcher_integrity_preview() -> dict[str, Any]:
         "success": success,
         "path": str(WEB_UPDATE_LAUNCHER),
         "source": str(WEB_UPDATE_LAUNCHER_SOURCE),
-        "head": head,
         "status": "ok" if success else item.get("status", "invalid"),
         "item": item,
         "parent_checks": parent_checks,
@@ -1392,12 +1460,13 @@ def desired_sudoers_lines() -> list[str]:
     return [
         *service_lines,
         f'www-data ALL=(root) NOPASSWD: {WEB_UPDATE_LAUNCHER} ""',
+        f'{install_user()} ALL=(root) NOPASSWD: {WEB_UPDATE_LAUNCHER} ""',
     ]
 
 
 def desired_sudoers_content() -> str:
     lines = [
-        "# E3DC-Control WebUI wrapper permissions",
+        "# E3DC-Control WebUI and unattended-update wrapper permissions",
         "# Managed by the Web-Installer. Do not add direct systemctl commands here.",
         *desired_sudoers_lines(),
         "",
@@ -2329,11 +2398,28 @@ def sudoers_context() -> dict[str, Any]:
     )
     effective = parse_effective_www_data_sudoers(effective_output)
     listing_ok = www_data_listing.get("ok") is True
+    bound_install_user = install_user()
+    install_user_listing = run_cmd(
+        ["/usr/bin/sudo", "-n", "-l", "-U", bound_install_user],
+        timeout=5,
+    )
+    install_user_output = (
+        str(install_user_listing.get("stdout") or "")
+        + "\n"
+        + str(install_user_listing.get("stderr") or "")
+    )
+    install_user_effective = parse_effective_www_data_sudoers(install_user_output)
+    update_launcher_spec = f'{WEB_UPDATE_LAUNCHER} ""'
+    install_user_contract_proven = bool(
+        install_user_listing.get("ok") is True
+        and update_launcher_spec in install_user_effective["effective_specs"]
+    )
     effective_contract_proven = bool(
         listing_ok
         and not effective["missing_effective_specs"]
         and not effective["unexpected_effective_specs"]
         and not effective["ambiguous_lines"]
+        and install_user_contract_proven
     )
     effective_status = (
         "effective_sudoers_exact"
@@ -2418,6 +2504,10 @@ def sudoers_context() -> dict[str, Any]:
         "unexpected_effective_specs": effective["unexpected_effective_specs"],
         "effective_ambiguous_lines": effective["ambiguous_lines"],
         "effective_contract_proven": effective_contract_proven,
+        "install_user": bound_install_user,
+        "install_user_listing_ok": install_user_listing.get("ok") is True,
+        "install_user_update_launcher_proven": install_user_contract_proven,
+        "install_user_effective_specs": install_user_effective["effective_specs"],
         "file_findings": file_findings,
     }
 
@@ -2451,7 +2541,7 @@ def write_readiness(ignore_active_lock: bool = False) -> dict[str, Any]:
         "issue": (
             None
             if web_update_launcher.get("success")
-            else "Web-Update-Launcher fehlt oder ist nicht root-eigen an Git-HEAD gebunden"
+            else "Web-Update-Launcher fehlt oder besitzt keinen sicheren Dispatcher-Vertrag"
         ),
         "details": web_update_launcher,
     }
@@ -2608,8 +2698,8 @@ def write_readiness(ignore_active_lock: bool = False) -> dict[str, Any]:
         "release_steps": [
             "Alte installer_wrapper.sh- und direkte installer_main.py-Freigaben aus sudoers entfernen",
             "Service-Wrapper und seine feste Aktions-/Unit-Allowlist getrennt prüfen",
-            "Argumentlosen Web-Update-Launcher root-eigen und commitgebunden installieren",
-            "Update aus einem versiegelten veröffentlichten Ausgangssnapshot starten",
+            "Argumentlosen Update-Dispatcher root-eigen und pfadgebunden installieren",
+            "Veröffentlichten Ziel-Bootstrap root-privat laden und im Systemjob starten",
             "Installation, Rechte-Reparatur und Rückfall weiterhin nur administrativ ausführen",
         ],
         "next_step": "Nur das Self-Update darf über den engen Launcher starten; alle anderen Installer-Webjobs bleiben gesperrt.",
@@ -4306,7 +4396,6 @@ def repair_permissions(
             rebound_canonical["Installer/web_update_launcher.sh"],
             root=INSTALL_ROOT,
             user=user,
-            release_commit=rebound_head,
         )
         _atomic_write_root_launcher(
             WEB_UPDATE_LAUNCHER,
@@ -4314,7 +4403,9 @@ def repair_permissions(
             launcher_by_path[str(WEB_UPDATE_LAUNCHER)],
             label="Web-Update-Launcher",
         )
-        installed_web_update_launcher = web_update_launcher_integrity_preview()
+        installed_web_update_launcher = web_update_launcher_integrity_preview(
+            expected_payload=web_update_payload,
+        )
         steps.append({
             "step": "install_root_web_update_launcher",
             "ok": bool(installed_web_update_launcher.get("success")),
@@ -4322,7 +4413,6 @@ def repair_permissions(
         })
         if (
             not installed_web_update_launcher.get("success")
-            or installed_web_update_launcher.get("head") != rebound_head
         ):
             raise RuntimeError(
                 "Root-eigener Web-Update-Launcher bestand das Endgate nicht"

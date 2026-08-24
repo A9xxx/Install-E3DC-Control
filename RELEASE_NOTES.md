@@ -1,3 +1,91 @@
+# E3DC-Control v5.4.4b
+
+E3DC-Control 5.4.4b verbindet den universellen, backupgestützten Updateweg mit
+Korrekturen an Wallbox-, Speicher-, Wärmepumpen- und
+Direktvermarktungsregelung. Das Release ist ausdrücklich ein Gesamtpaket und
+kein reines Installer-Update.
+
+## Ein aktueller Updater für heterogene Bestände
+
+- Weboberfläche, Konsole, Installer-Menü und `e3dc-update-bootstrap` starten
+  denselben aktuellen Ziel-Updater als root-eigenen Hintergrundauftrag.
+- Eine laufende Einzelinstanz liefert Installationsroot und Benutzer. Andere
+  Verzeichnisnamen, lokale Produktänderungen, fehlende Release-Dateien und
+  historische Rechte sind kein vorgeschaltetes Alt-Updater-Gate. Mehrere
+  gleichrangige Instanzen stoppen mit einer Kandidatenliste.
+- Zielcode, Abhängigkeiten und das verifizierte Backup werden vor dem kurzen
+  Writer- und Dienststopp vorbereitet. Erst danach werden Produktdateien,
+  Rechte und Units atomar auf den Releasezustand projiziert und der
+  Wiederanlauf geprüft.
+- Exakt gebundene, bereits abgeschlossene Sicherheitsreste aus 5.4.4 und
+  5.4.4a können ohne erneute Produktmutation bereinigt werden. Ausstehende,
+  gemischte oder nicht eindeutig gebundene Recoveryflächen bleiben gesperrt.
+- Jeder kontrollierte Abbruch nennt Fehlercode, Ursache, Systemzustand, Ziel
+  und genau den nächsten sicheren Diagnose- oder Reparaturbefehl.
+
+## Docker-Update mit belegtem Kandidaten und Rückfall
+
+- Der Host-Helfer migriert vorhandene Compose-Installationen auf das
+  veröffentlichte 5.4.4b-Image, ohne persistente Datenvolumes neu anzulegen.
+- Image-ID, OCI-Version, Start, Healthcheck und zwei stabile
+  Laufzeitsnapshots werden vor der Übernahme geprüft. Bei einem Fehler wird
+  der Kandidat gestoppt und der belegte Ausgangsstand wiederhergestellt.
+- Der parentlose Docker-Rollback-Root `v5.3.2b` und sein in der Policy
+  gebundener Digest bleiben unverändert. Bare Metal verwendet weiterhin den
+  transaktionsgebundenen Datei-Rückweg, nicht dieses alte Docker-Image.
+
+## Wallbox: voller PV-Anteil, klarer Pre-Dump und ruhige Phasenführung
+
+- Im Sonnenmodus kann ein kleineres Storage-Budget den batterieneutralen
+  PV-Überschuss nicht mehr beschneiden. Der Storage Manager übergibt einen
+  getrennten, typisierten `predump_discharge_add_w`, der ausschließlich
+  zusätzliche Batterieentladung autorisiert.
+- Ist nur eine frische, verbundene und kommandierbare openWB Pro aktiv, nutzt
+  die Gruppenregelung deren 0,1-A-Schritt. Eine zweite ausgesteckte Wallbox
+  erzwingt nicht länger 1-A-Schritte; stale oder unklare Daten bleiben
+  fail-closed beim gemeinsamen 1-A-Raster.
+- Eine laufende Ladung wird bei einer noch ausstehenden Phasenempfehlung ohne
+  aktive Übergangsreservierung gehalten statt mit 0 A beziehungsweise STOP
+  abgebrochen. Der Cooldown schützt weiterhin nur vor dem nächsten
+  Phasenwechsel.
+
+## Wärmepumpe, Speicher und Direktvermarktung
+
+- `wp_type = 6` liest die Wärmepumpenleistung aus einem konfigurierbaren
+  E3DC-PM-Index. Nur vollständige Phasenwerte eines Verbrauchers werden als
+  valide Leistung übernommen. Erzeugung oder Rückspeisung wird mit
+  `WP_Power_Valid = false` und eindeutiger Quelle abgewiesen.
+- Bei aktivem Automatikmodus und thermischem PV-Potenzial hat `pv_surplus`
+  mit dem Boost-Sollwert Vorrang vor einem gleichzeitig aktiven
+  Warmwasser-Zeitfenster. Die Timer-Klassen bleiben gültige Startnachfragen;
+  nach Ablauf der nicht rollierend verlängerten Retry-Sperre kann bei
+  fortbestehender Bereitschaft und ausreichendem Überschuss unmittelbar ein
+  frisches Startbudget entstehen.
+- Bei aktiver Wallbox bleibt der Storage-Regler in E3DC-AUTO und bindet den
+  Laderahmen an das berechnete `iFc`; die Entladestützung bleibt frei.
+  Pre-Curve-Holds ohne reales Ladeangebot halten keine unnötige
+  0-W-EMS-Grenze.
+- Ergänzte Quellenfelder verhindern, dass Endkundentarife als belastbarer
+  Direktvermarktungs-Marktpreis bewertet werden. Slots mit ungeeigneter
+  Preisqualität öffnen kein wirtschaftliches DV-Fenster.
+- Ein ausgegebener Direktvermarktungsauftrag mit bestätigtem Hardware-Effekt
+  wird auch ohne synchrones RSCP-ACK als wirksam dargestellt. Die Ladekurve
+  zeigt dabei `DV-Export aktiv` statt einer falschen Nichtfreigabe.
+
+## Verständliche Diagnose im Dashboard
+
+- Die Wärmepumpenkachel zeigt Startwunsch, autorisiertes Budget und den
+  Verbraucher, an den ein nicht nutzbarer Rest weitergegeben wurde.
+- Der Konfigurationsdialog kann den ausgewählten E3DC-PM-Index prüfen und
+  unterscheidet Verbraucher, Erzeuger und fehlende Phasen.
+- Wallbox-Budget, Stromraster und Phasenstatus orientieren sich an der
+  tatsächlich kommandierbaren Wallbox.
+- Der Klimatagesverbrauch bleibt auf der eigenen Klima-Karte sichtbar; die
+  redundante Zweitanzeige in der Haus-Kachel wurde entfernt.
+
+---
+
+
 # E3DC-Control v5.4.4a
 
 E3DC-Control 5.4.4a stabilisiert die Wallbox-Phasenumschaltung und Startketten,

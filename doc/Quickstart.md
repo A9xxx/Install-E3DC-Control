@@ -2,7 +2,25 @@
 
 Diese Anleitung fasst die schnellsten Schritte zusammen, um E3DC-Control auf einem frischen Raspberry Pi OS (oder ähnlichem Debian-System) zu installieren.
 
-Aktueller Stable-Stand: `v5.4.4a`.
+Aktueller Stable-Stand: `v5.4.4b`.
+
+5.4.4b verwendet bei Web-, Konsolen- und Community-Update immer den aktuellen
+veröffentlichten Ziel-Updater. Eine laufende Einzelinstanz wird unabhängig von
+Benutzer- und Ordnernamen erkannt. Lokale Änderungen, fehlende Release-Dateien,
+alte Rechte oder beschädigte Git-Metadaten verhindern die Annahme nicht; sie
+werden zuerst durch den Backupvertrag des Zielstands gesichert. Download,
+Vorprüfung und Backup laufen noch bei aktiven Diensten. Erst für die
+abschließende Projektion werden Writer kurz gestoppt und nach Healthcheck
+wieder freigegeben. Mehrere gleichrangige Instanzen stoppen mit einer
+Kandidatenliste. Im Fehlerfall zeigt die Ausgabe Ursache, Systemzustand und
+genau den nächsten sicheren Befehl.
+
+Das Release enthält außerdem den hostseitigen Docker-Migrations- und
+Rückfallweg, die Trennung von echtem PV-Überschuss und zusätzlicher
+Pre-Dump-Entladung, 0,1-A-Regelung für eine allein aktive openWB Pro,
+Phasen-Hold für laufende Ladungen sowie den fail-closed E3DC-Leistungsmesser
+für `wp_type = 6`. Das Dashboard erläutert nicht finanziertes
+Wärmepumpen-Startbudget und seine Weitergabe.
 
 5.4.4a vereinheitlicht den Bare-Metal-Updateeinstieg. Für einen heterogenen
 Altstand wird nur `e3dc-update-bootstrap` auf den Raspberry Pi kopiert und mit
@@ -304,14 +322,17 @@ Konfiguration wird im Config-Editor eingerichtet.
 Ohne `E3DC_IMAGE_TAG` holt `pull` das aktuelle geprüfte Stable-Image `latest`.
 Ein fester Tag bleibt absichtlich fest; `config --images` zeigt vorab das
 tatsächlich gewählte Image. Der Host-Helfer übernimmt Pull, Start, Wartephase,
-Identitätsprüfung und den bestätigten Stopp eines fehlerhaften Kandidaten als
-eine Transaktion.
+Identitätsprüfung, den bestätigten Stopp eines fehlerhaften Kandidaten und den
+gebundenen Rückstart des vorherigen Images als eine Transaktion. Vor dem Pull
+verlangt er mindestens 2 GiB freien Platz im DockerRootDir und löscht weder
+Images noch Volumes automatisch.
 
 Fehlt der Helfer in einer älteren Installation, wird ein separater frischer
 Checkout des veröffentlichten Verwaltungsbaums verwendet. Dessen
 `Installer/docker_compose_update.py` erhält mit `--compose-dir` den Pfad des
-bestehenden Compose-Verzeichnisses. Er migriert ausschließlich unveränderte
-offizielle Compose-Dateien aus 5.4.2 bis 5.4.2d sowie die bekannte
+bestehenden Compose-Verzeichnisses. Er migriert ausschließlich die semantisch
+gebundene offizielle 5.3.2b-Compose-Datei, unveränderte offizielle
+Compose-Dateien aus 5.4.2 bis 5.4.2d sowie die bekannte
 Installer-Bind-Mount-Variante atomar, also ganz oder gar nicht. `.env` und die
 vorhandenen Daten-, Log-, ML- und Forecast-Quellen bleiben unverändert. Einen
 alten Watchtower stoppt und prüft der Helfer vor Migration und Pull; er bleibt
@@ -327,7 +348,7 @@ Ohne das Label bleibt auch ein versehentlich gestarteter Watchtower für den
 Hauptcontainer wirkungslos. Der oben gezeigte manuelle Host-Helfer bleibt der
 empfohlene Updateweg.
 
-**Docker-Rückfall von v5.4.4a auf den veröffentlichten Docker-Rollback-Root:**
+**Docker-Rückfall von v5.4.4b auf den veröffentlichten Docker-Rollback-Root:**
 ```bash
 (
   set -euo pipefail

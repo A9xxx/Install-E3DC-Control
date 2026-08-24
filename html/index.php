@@ -33,6 +33,7 @@ e3dcCallHandlerIfAvailable('handleEnergyFlowLayout');
 e3dcCallHandlerIfAvailable('handleRunUpdate');
 e3dcCallHandlerIfAvailable('handleDailyStats');
 e3dcCallHandlerIfAvailable('handleForceSocUpdate');
+e3dcCallHandlerIfAvailable('handleTestPmIndex');
 e3dcCallHandlerIfAvailable('handleSystemLog');
 
 // Zero-Touch Onboarding Check
@@ -426,9 +427,6 @@ if (isset($_GET['ajax']) && $_GET['ajax'] == '1') {
 	            color: var(--bs-secondary-color) !important;
 	            padding: 0 0.08rem !important;
 	            text-align: left !important;
-	        }
-	        body.frontend-modern.detail-normal #dashboard-status-cards .home-climate-badge {
-	            display: none !important;
 	        }
 	        body.frontend-modern.detail-normal #dashboard-status-cards .grid-kwh-meta.status-tile-meta {
 	            display: flex !important;
@@ -1556,9 +1554,6 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                                 <div class="badge bg-body-tertiary text-body border border-secondary-subtle tile-kwh-badge" title="Hausverbrauch heute"><i class="fas fa-home text-info me-1"></i><span id="home-today">-- kWh</span></div>
                                 <div class="badge bg-body-tertiary text-body border border-secondary-subtle" title="Autarkie (Live / Heute)"><i class="fas fa-leaf text-success me-1"></i><span id="val-autarky-live">--%</span> <span class="text-muted fw-normal">| <span id="val-autarky-day">--%</span></span></div>
                                 <div class="badge bg-body-tertiary text-body border border-secondary-subtle" title="Eigenverbrauch (Heute)"><i class="fas fa-recycle text-warning me-1"></i><span id="val-selfcon-day">--%</span></div>
-                                <?php if($climateEnabled): ?>
-                                <div class="badge bg-body-tertiary text-body border border-info border-opacity-50 tile-kwh-badge home-climate-badge" title="Klimaverbrauch heute"><i class="fas fa-snowflake text-info me-1"></i><span id="climate-today">-- kWh</span></div>
-                                <?php endif; ?>
                             </div>
                         </div>
                     </div>
@@ -1978,9 +1973,14 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                                             <div id="wb-peak-detail" style="display:none;" class="small text-muted mt-1 tile-detail"><i class="fas fa-arrow-up text-danger opacity-75"></i> <span id="val-wb-max" class="fw-bold">--</span> (Max)</div>
                                         </div>
                                         <div class="d-flex flex-column align-items-end gap-1 ms-2 wallbox-meta-stack">
-                                            <button type="button" id="wb-pause-toggle" class="btn btn-sm btn-outline-secondary rounded-circle wallbox-pause-btn" data-dashboard-wb-pause="1" data-paused="0" title="Wallbox manuell pausieren" aria-label="Wallbox 1 pausieren" style="width:2rem;height:2rem;display:inline-flex;align-items:center;justify-content:center;">
-                                                <i class="fas fa-pause"></i>
-                                            </button>
+                                            <div class="d-flex gap-1">
+                                                <button type="button" id="wb-force-start-btn" class="btn btn-sm btn-outline-success rounded-circle wallbox-force-start-btn" data-dashboard-wb-force-start="1" title="Ladung sofort starten / Freigabe erzwingen" aria-label="Wallbox 1 starten" onclick="event.stopPropagation(); triggerWallboxForceStart(1);" style="width:2rem;height:2rem;display:inline-flex;align-items:center;justify-content:center;">
+                                                    <i class="fas fa-play" style="font-size: 0.75rem;"></i>
+                                                </button>
+                                                <button type="button" id="wb-pause-toggle" class="btn btn-sm btn-outline-secondary rounded-circle wallbox-pause-btn" data-dashboard-wb-pause="1" data-paused="0" title="Wallbox manuell pausieren" aria-label="Wallbox 1 pausieren" style="width:2rem;height:2rem;display:inline-flex;align-items:center;justify-content:center;">
+                                                    <i class="fas fa-pause"></i>
+                                                </button>
+                                            </div>
                                             <span id="val-car-soc" class="badge text-bg-success fw-bold wallbox-car-badge" style="display:none; cursor: pointer; font-size: 0.8em;" onclick="event.stopPropagation(); forceSocUpdate()" title="SoC vom Auto abrufen"></span>
                                             <span id="wb-daily" class="badge bg-body-tertiary text-body border border-secondary-subtle tile-kwh-badge w-100 text-end" title="Wallbox 1 heute"><i class="fas fa-calendar-day text-info me-1"></i><span id="wb-daily-value">-- kWh</span></span>
                                             <div id="wb-session-container" class="d-flex flex-column align-items-end gap-1" style="display:none; font-size: 0.8em;">
@@ -2021,9 +2021,14 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                                             <div id="wb2-peak-detail" style="display:none;" class="small text-muted mt-1 tile-detail"><i class="fas fa-arrow-up text-danger opacity-75"></i> <span id="val-wb2-max" class="fw-bold">--</span> (Max)</div>
                                         </div>
                                         <div class="d-flex flex-column align-items-end gap-1 ms-2 wallbox-meta-stack">
-                                            <button type="button" id="wb2-pause-toggle" class="btn btn-sm btn-outline-secondary rounded-circle wallbox-pause-btn" data-dashboard-wb-pause="2" data-paused="0" title="Wallbox manuell pausieren" aria-label="Wallbox 2 pausieren" style="width:2rem;height:2rem;display:inline-flex;align-items:center;justify-content:center;">
-                                                <i class="fas fa-pause"></i>
-                                            </button>
+                                            <div class="d-flex gap-1">
+                                                <button type="button" id="wb2-force-start-btn" class="btn btn-sm btn-outline-success rounded-circle wallbox-force-start-btn" data-dashboard-wb-force-start="2" title="Ladung sofort starten / Freigabe erzwingen" aria-label="Wallbox 2 starten" onclick="event.stopPropagation(); triggerWallboxForceStart(2);" style="width:2rem;height:2rem;display:inline-flex;align-items:center;justify-content:center;">
+                                                    <i class="fas fa-play" style="font-size: 0.75rem;"></i>
+                                                </button>
+                                                <button type="button" id="wb2-pause-toggle" class="btn btn-sm btn-outline-secondary rounded-circle wallbox-pause-btn" data-dashboard-wb-pause="2" data-paused="0" title="Wallbox manuell pausieren" aria-label="Wallbox 2 pausieren" style="width:2rem;height:2rem;display:inline-flex;align-items:center;justify-content:center;">
+                                                    <i class="fas fa-pause"></i>
+                                                </button>
+                                            </div>
                                             <span id="val-car-soc2" class="badge text-bg-success fw-bold wallbox-car-badge" style="display:none; cursor: pointer; font-size: 0.8em;" onclick="event.stopPropagation(); forceSocUpdate()" title="SoC vom Auto abrufen"></span>
                                             <span id="wb2-daily" class="badge bg-body-tertiary text-body border border-secondary-subtle tile-kwh-badge w-100 text-end" title="Wallbox 2 heute"><i class="fas fa-calendar-day text-info me-1"></i><span id="wb2-daily-value">-- kWh</span></span>
                                             <div id="wb2-session-container" class="d-flex flex-column align-items-end gap-1" style="display:none; font-size: 0.8em;">
@@ -3185,7 +3190,14 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                             else if (budgetW !== null && budgetW > 0) heatLabel = 'Budget bereit';
                             else heatLabel = 'Beobachtet';
                         }
-                        const heatReason = data.heat_manager_owner_reason || data.heat_manager_reason || '';
+                        let heatReason = data.heat_manager_owner_reason || data.heat_manager_reason || '';
+                        if (data.heatpump_start_state === 'unfunded' && data.heatpump_start_request_w > 0) {
+                            const receiverText = data.released_budget_receiver === 'wallbox' ? 'Wallbox' : (data.released_budget_receiver === 'heater' ? 'Heizstab' : 'nicht weitergegeben');
+                            const unfundedReason = data.released_budget_receiver !== 'none'
+                                ? ('Startwunsch ' + data.heatpump_start_request_w + ' W unvollständig gedeckt; Budget an ' + receiverText + ' übergeben.')
+                                : ('Startwunsch ' + data.heatpump_start_request_w + ' W unvollständig gedeckt; nicht weitergegeben.');
+                            heatReason = heatReason ? (heatReason + ' · ' + unfundedReason) : unfundedReason;
+                        }
                         const wpModeText = data.wp_mode_text || ({0:'Heizen',1:'WW',5:'Standby'}[data.wp_mode] || 'Standby');
                         const stateColor = heatActive ? '#fb923c' : (budgetW !== null && budgetW > 0 ? '#10b981' : '#adb5bd');
                         if (heatStateEl) {
@@ -3204,9 +3216,14 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                             heatWpModeEl.style.color = wpModeText === 'WW' ? '#38bdf8' : (wpModeText === 'Heizen' ? '#fb923c' : '#adb5bd');
                         }
                         if (heatBudgetEl) {
-                            heatBudgetEl.textContent = budgetW !== null ? ('Budget: ' + budgetW + ' W') : 'Budget: --';
-                            const reason = data.heat_manager_reason || heatReason || data.wp_mode_text || '';
-                            heatBudgetEl.title = reason;
+                            if (budgetW !== null && budgetW > 0) {
+                                heatBudgetEl.textContent = 'Budget: ' + budgetW + ' W';
+                            } else if (data.heatpump_start_state === 'unfunded' && data.heatpump_start_request_w > 0) {
+                                heatBudgetEl.textContent = 'Budget: 0 W (Bedarf: ' + data.heatpump_start_request_w + ' W)';
+                            } else {
+                                heatBudgetEl.textContent = 'Budget: --';
+                            }
+                            heatBudgetEl.title = heatReason || data.wp_mode_text || '';
                         }
                     }
                 }

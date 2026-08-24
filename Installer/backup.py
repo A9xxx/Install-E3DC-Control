@@ -21,18 +21,26 @@ from .backup_integrity import (
     LEGACY_ML_MODEL,
     PRIVATE_ML_ROOT,
     PersistentSource,
+    QuiescedOverlayRestoreGuard,
+    QUIESCED_OVERLAY_KIND,
     SYSTEMD_ADMIN_UNIT_DIR,
     SYSTEM_BACKUP_KIND,
     _lexical_absolute,
+    _normalized_backup_id,
+    _normalized_transaction_id,
+    _open_root_controlled_backup_directory_chain,
     build_systemd_mask_state_contract,
     copy_persistent_sources,
     default_backup_root,
+    estimate_persistent_sources_size,
     finalize_backup,
     normalize_private_ml_lock_metadata,
     restore_persistent_payload,
     secure_backup_tree,
+    validate_existing_backup_root,
     validate_private_ml_store,
     verify_backup,
+    verified_manifest_sha256,
     verify_systemd_mask_state_contract,
 )
 from .installer_config import get_install_path, get_user_ids, get_www_data_gid, load_config
@@ -254,6 +262,16 @@ def _persistent_sources(install_path=None, systemd_mask_state=None):
     return sources
 
 
+def estimate_full_backup_size(install_path=None, systemd_mask_state=None):
+    """Schätzt die vollständige Recovery-Fläche ohne Dateien zu verändern."""
+
+    active_install_path = _lexical_absolute(install_path or INSTALL_PATH)
+    mask_state = systemd_mask_state or _systemd_mask_state_contract()
+    return estimate_persistent_sources_size(
+        _persistent_sources(active_install_path, mask_state)
+    )
+
+
 def _restore_allowlist(install_path=None):
     install = _lexical_absolute(install_path or INSTALL_PATH)
     roots = [
@@ -362,6 +380,263 @@ def backup_current_version(
         install_path=install_path,
         preserve_backup_paths=preserve_backup_paths,
         verified_pre_chown_callback=verified_pre_chown_callback,
+    )
+
+
+def _quiesced_overlay_sources(install_path=None):
+    """Kleine, nach Aktorruhe erneut zu versiegelnde Veränderungsfläche."""
+
+    install = _lexical_absolute(install_path or INSTALL_PATH)
+    return [
+        PersistentSource("install-config", install / "e3dc.config.txt"),
+        PersistentSource("install-data", install / "data"),
+        PersistentSource(
+            "web-data",
+            Path("/var/www/html/data"),
+            exclude_top_level=(LEGACY_ML_MODEL.name,),
+        ),
+        PersistentSource("system-state", Path("/var/lib/e3dc-control")),
+        PersistentSource("system-config", Path("/etc/e3dc-control")),
+    ]
+
+
+def estimate_quiesced_overlay_size(install_path=None):
+    """Schätzt die nach Dienststopp erneut zu sichernde mutable Fläche."""
+
+    install = _lexical_absolute(install_path or INSTALL_PATH)
+    return estimate_persistent_sources_size(_quiesced_overlay_sources(install))
+
+
+def create_quiesced_overlay(
+    overlay_dir,
+    install_path=None,
+    *,
+    transaction_id,
+    parent_backup_dir,
+    parent_backup_id,
+):
+    """Versiegelt mutable Nutzerdaten nach bestätigtem Dienststopp.
+
+    Das große Systembackup bleibt der vollständige Rückfall. Dieses kleine,
+    root-eigene Overlay hält ausschließlich den späteren, quieszierten Stand
+    der während des Live-Backups noch veränderbaren Daten fest.
+    """
+
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        raise BackupIntegrityError(
+            "Quiesced-Overlay darf ausschließlich Root erzeugen"
+        )
+    install = _lexical_absolute(install_path or INSTALL_PATH)
+    transaction = _normalized_transaction_id(transaction_id)
+    expected_parent_backup_id = _normalized_backup_id(
+        parent_backup_id,
+        label="Parent-Backup-ID",
+    )
+    target = _lexical_absolute(overlay_dir)
+    parent_backup = _lexical_absolute(parent_backup_dir)
+    collection = validate_existing_backup_root(parent_backup.parent, install)
+    expected_target = collection / ".{}.quiesced-{}".format(
+        parent_backup.name,
+        transaction,
+    )
+    if (
+        parent_backup.parent != collection
+        or target.parent != collection
+        or target != expected_target
+    ):
+        raise BackupIntegrityError(
+            "Quiesced-Overlay-Ziel ist nicht an Parent-Backup und Transaktion gebunden"
+        )
+
+    collection_descriptor = _open_root_controlled_backup_directory_chain(
+        collection,
+        leaf_mode=0o700,
+    )
+    parent_descriptor = None
+    target_descriptor = None
+    try:
+        collection_metadata = os.fstat(collection_descriptor)
+        parent_before = os.stat(
+            parent_backup.name,
+            dir_fd=collection_descriptor,
+            follow_symlinks=False,
+        )
+        parent_descriptor = _open_root_controlled_backup_directory_chain(
+            parent_backup,
+            leaf_mode=0o700,
+        )
+        parent_metadata = os.fstat(parent_descriptor)
+        if (
+            not stat.S_ISDIR(parent_before.st_mode)
+            or (parent_before.st_dev, parent_before.st_ino)
+            != (parent_metadata.st_dev, parent_metadata.st_ino)
+        ):
+            raise BackupIntegrityError(
+                "Parent-Backup wurde während der Bindung ausgetauscht"
+            )
+        parent_manifest = verify_backup(
+            parent_backup,
+            expected_kind=SYSTEM_BACKUP_KIND,
+        )
+        if (
+            str(parent_manifest.get("backup_id") or "")
+            != expected_parent_backup_id
+            or str(parent_manifest.get("install_root") or "") != str(install)
+        ):
+            raise BackupIntegrityError(
+                "Parent-Backup stimmt nicht mit ID und Installationspfad überein"
+            )
+        parent_manifest_sha256 = verified_manifest_sha256(
+            parent_backup,
+            expected_kind=SYSTEM_BACKUP_KIND,
+        )
+        parent_after = os.stat(
+            parent_backup.name,
+            dir_fd=collection_descriptor,
+            follow_symlinks=False,
+        )
+        if (parent_after.st_dev, parent_after.st_ino) != (
+            parent_metadata.st_dev,
+            parent_metadata.st_ino,
+        ):
+            raise BackupIntegrityError(
+                "Parent-Backup driftete vor der Overlay-Anlage"
+            )
+        try:
+            os.stat(
+                target.name,
+                dir_fd=collection_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            raise BackupIntegrityError("Quiesced-Overlay-Ziel existiert bereits")
+        os.mkdir(target.name, 0o700, dir_fd=collection_descriptor)
+        os.fsync(collection_descriptor)
+        target_before = os.stat(
+            target.name,
+            dir_fd=collection_descriptor,
+            follow_symlinks=False,
+        )
+        target_descriptor = _open_root_controlled_backup_directory_chain(
+            target,
+            leaf_mode=0o700,
+        )
+        target_metadata = os.fstat(target_descriptor)
+        if (
+            not stat.S_ISDIR(target_before.st_mode)
+            or (target_before.st_dev, target_before.st_ino)
+            != (target_metadata.st_dev, target_metadata.st_ino)
+        ):
+            raise BackupIntegrityError(
+                "Quiesced-Overlay wurde während der Anlage ausgetauscht"
+            )
+
+        mapped_entries, source_records = copy_persistent_sources(
+            target,
+            _quiesced_overlay_sources(install),
+        )
+        secure_backup_tree(target)
+        finalize_backup(
+            target,
+            mapped_entries,
+            source_records,
+            kind=QUIESCED_OVERLAY_KIND,
+            install_root=install,
+            transaction_id=transaction,
+            parent_backup_id=expected_parent_backup_id,
+        )
+        manifest = verify_backup(target, expected_kind=QUIESCED_OVERLAY_KIND)
+        manifest_sha256 = verified_manifest_sha256(
+            target,
+            expected_kind=QUIESCED_OVERLAY_KIND,
+        )
+        os.fsync(target_descriptor)
+        os.fsync(collection_descriptor)
+        target_after = os.stat(
+            target.name,
+            dir_fd=collection_descriptor,
+            follow_symlinks=False,
+        )
+        parent_final = os.stat(
+            parent_backup.name,
+            dir_fd=collection_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            (target_after.st_dev, target_after.st_ino)
+            != (target_metadata.st_dev, target_metadata.st_ino)
+            or (parent_final.st_dev, parent_final.st_ino)
+            != (parent_metadata.st_dev, parent_metadata.st_ino)
+        ):
+            raise BackupIntegrityError(
+                "Quiesced-Overlay oder Parent-Backup driftete vor dem Receipt"
+            )
+        guard = QuiescedOverlayRestoreGuard(
+            transaction_id=transaction,
+            overlay_dir=str(target),
+            overlay_dev=int(target_metadata.st_dev),
+            overlay_ino=int(target_metadata.st_ino),
+            backup_id=str(manifest["backup_id"]),
+            manifest_sha256=manifest_sha256,
+            install_root=str(install),
+            parent_backup_dir=str(parent_backup),
+            parent_backup_dev=int(parent_metadata.st_dev),
+            parent_backup_ino=int(parent_metadata.st_ino),
+            parent_backup_id=expected_parent_backup_id,
+            parent_backup_manifest_sha256=parent_manifest_sha256,
+            collection_dir=str(collection),
+            collection_dev=int(collection_metadata.st_dev),
+            collection_ino=int(collection_metadata.st_ino),
+        )
+        print(
+            "  ✓ Quiesced-Zustands-Overlay für {} Dateien verifiziert".format(
+                len(manifest.get("files", []))
+            )
+        )
+        return str(target), manifest, guard
+    except Exception:
+        # Unvollständige Overlays bleiben absichtlich root-privat für die
+        # Diagnose liegen. Ohne vollständiges Manifest autorisieren sie
+        # niemals einen Restore.
+        raise
+    finally:
+        if target_descriptor is not None:
+            os.close(target_descriptor)
+        if parent_descriptor is not None:
+            os.close(parent_descriptor)
+        os.close(collection_descriptor)
+
+
+def restore_quiesced_overlay(
+    overlay_dir,
+    install_path=None,
+    *,
+    guard: QuiescedOverlayRestoreGuard,
+):
+    """Spielt den verifizierten quieszierten Zustand über das Vollbackup."""
+
+    install = _lexical_absolute(install_path or INSTALL_PATH)
+    if (
+        not isinstance(guard, QuiescedOverlayRestoreGuard)
+        or _lexical_absolute(guard.install_root) != install
+        or _lexical_absolute(guard.overlay_dir) != _lexical_absolute(overlay_dir)
+    ):
+        raise BackupIntegrityError(
+            "Quiesced-Overlay-Restore widerspricht Pfad oder Installations-Guard"
+        )
+    return restore_persistent_payload(
+        overlay_dir,
+        expected_kind=QUIESCED_OVERLAY_KIND,
+        allowed_roots=(
+            install / "data",
+            Path("/var/www/html/data"),
+            Path("/var/lib/e3dc-control"),
+            Path("/etc/e3dc-control"),
+        ),
+        allowed_files=(install / "e3dc.config.txt",),
+        overlay_restore_guard=guard,
     )
 
 

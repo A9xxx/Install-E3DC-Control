@@ -1,12 +1,12 @@
 # E3DC-Control Web-Portal & Installer
 
-Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.4.4a</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
+Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.4.4b</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
 
 ![E3DC-Control Dashboard](html/app-icon-512.png)
 
 ## Aktuelle Version und Update
 
-Die aktuelle stabile Version ist **5.4.4a**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur geprüften Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
+Die aktuelle stabile Version ist **5.4.4b**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur geprüften Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
 
 > [!WARNING]
 > **⚠️ Achtung: Nutzung auf eigenes Risiko!**
@@ -19,6 +19,8 @@ Die aktuelle stabile Version ist **5.4.4a**. Hinweise zum Web-, Konsolen- und Do
 > **Config-Schutz:** Standardinstallationen speichern `data/e3dc_v4.json` und lokale Config-Backups mit `660` für Install-User und `www-data`, damit WebUI und Dienste weiter automatisch starten, die Datei aber nicht mehr weltlesbar ist. Der normale Config-Download ist redigiert; der Raw-Download enthält Zugangsdaten und wird nur angeboten, wenn eine Web-PIN gesetzt ist. Der Kompatibilitätsmodus (`664`) ist nur für eigene externe Leser gedacht.
 
 > **Bedienansichten:** Config-Editor und Wallbox-Seite unterscheiden zwischen einfacher Ansicht für Einrichtung und täglichen Betrieb sowie erweiterter Ansicht für alle Detailparameter. Die Logik und Abgrenzung sind in [doc/Frontend_Ansichten.md](doc/Frontend_Ansichten.md) dokumentiert.
+
+> **Neu in 5.4.4b Stable:** Der aktuelle Ziel-Updater erkennt eine laufende Einzelinstanz unabhängig von Benutzer- und Ordnernamen, erstellt und prüft das vollständige Backup vor dem kurzen Writer-Stopp und liefert bei einem kontrollierten Abbruch Ursache, Systemzustand und den nächsten sicheren Befehl. Docker-Installationen erhalten einen hostseitigen, geprüften Migrations- und Rückfallweg. In der Regelung bleiben echter PV-Überschuss und typisierte Pre-Dump-Zusatzentladung getrennt; eine allein aktive openWB Pro kann mit 0,1 A regeln und eine laufende Ladung wird während einer ausstehenden Phasenempfehlung nicht unnötig beendet. `wp_type = 6` liest einen E3DC-Leistungsmesser fail-closed, während Dashboard und Direktvermarktung Budget- beziehungsweise Preisursachen eindeutiger ausweisen.
 
 > **Neu in 5.4.4a Stable:** E3DC-Control 5.4.4a stabilisiert die Wallbox-Phasenumschaltung, beseitigt das 3-Minuten-Takten bei aktiver Ladekurve und härtet die Hausverbrauchs- sowie Ertragsberechnung im Web-Frontend.
 
@@ -506,19 +508,23 @@ sudo docker compose logs --tail=80 e3dc-control
 > `ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}`. Ohne Eintrag
 > folgt sie dem geprüften Stable-Tag `latest`. Ein fester Versions-Tag wechselt
 > bei `pull` absichtlich nicht; für einen bewussten Pin wird
-> `E3DC_IMAGE_TAG=v5.4.4a` in `.env` gesetzt. `config --images` zeigt vor dem
+> `E3DC_IMAGE_TAG=v5.4.4b` in `.env` gesetzt. `config --images` zeigt vor dem
 > Pull das tatsächlich gewählte Image.
 >
-> Ein fehlgeschlagener `pull` ist ein harter Abbruch. Nach begonnenem
-> Kandidatenstart stoppt der Helfer bei jedem Fehler den Kandidaten und prüft
-> dessen Stillstand. Erst gezogene Image-ID, OCI-Version, gestartete `VERSION`
-> und zwei identische gesunde Snapshots bestätigen den Wechsel.
+> Vor dem `pull` prüft der Helfer mindestens 2 GiB freien Platz im
+> DockerRootDir. Ein fehlgeschlagener `pull` ist ein harter Abbruch und löscht
+> keine Volumes. Nach begonnenem Kandidatenstart stoppt der Helfer bei jedem
+> Fehler den Kandidaten, stellt Compose-Preimage und belegtes Ausgangsimage
+> wieder her und prüft den Rückstart. Erst gezogene Image-ID, OCI-Version,
+> gestartete `VERSION` und zwei identische gesunde Snapshots bestätigen den
+> Wechsel.
 
 Fehlt der Host-Helfer in einer älteren Docker-Installation, lege daneben einen
 frischen Checkout des veröffentlichten `main` als Verwaltungsbaum an und rufe
 dessen `Installer/docker_compose_update.py` mit `--compose-dir` für das
 bestehende `e3dc-docker`-Verzeichnis auf. Der Helfer migriert ausschließlich
-unveränderte offizielle Compose-Dateien aus 5.4.2 bis 5.4.2d sowie die bekannte
+die semantisch gebundene offizielle 5.3.2b-Compose-Datei, unveränderte
+offizielle Compose-Dateien aus 5.4.2 bis 5.4.2d sowie die bekannte
 Installer-Bind-Mount-Variante atomar, also ganz oder gar nicht. `.env` und die
 vorhandenen Daten-, Log-, ML- und Forecast-Quellen bleiben unverändert. Einen
 alten Watchtower stoppt und prüft er vor Migration und Pull; er bleibt danach

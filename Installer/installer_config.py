@@ -301,6 +301,7 @@ def _validated_strict_product_root(
     label,
     *,
     allow_one_missing_marker=False,
+    ignore_release_markers=False,
 ):
     """Bindet einen echten Produktbaum ohne Symlink-Komponente."""
 
@@ -308,6 +309,8 @@ def _validated_strict_product_root(
     if not candidate or not os.path.isabs(candidate):
         raise RuntimeError(f"{label} fehlt oder ist nicht absolut")
     normalized = os.path.abspath(candidate)
+    if normalized in {"/", "/bin", "/etc", "/home", "/lib", "/sbin", "/usr", "/var"}:
+        raise RuntimeError(f"{label} ist zu weit gefasst")
     current = os.path.sep
     for component in Path(normalized).parts[1:]:
         current = os.path.join(current, component)
@@ -321,22 +324,23 @@ def _validated_strict_product_root(
         raise RuntimeError(f"{label} ist kein Verzeichnis")
     if os.path.realpath(normalized) != normalized:
         raise RuntimeError(f"{label} ist nicht kanonisch")
-    markers = (
-        os.path.join(normalized, "VERSION"),
-        os.path.join(normalized, "installer_main.py"),
-        os.path.join(normalized, "Installer", "installer_config.py"),
-    )
-    missing_markers = 0
-    for marker in markers:
-        try:
-            metadata = os.lstat(marker)
-        except FileNotFoundError:
-            missing_markers += 1
-            continue
-        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
-            raise RuntimeError(f"{label} besitzt keinen eindeutigen Release-Marker")
-    if missing_markers > (1 if allow_one_missing_marker else 0):
-        raise RuntimeError(f"{label} besitzt nicht alle Release-Marker")
+    if not ignore_release_markers:
+        markers = (
+            os.path.join(normalized, "VERSION"),
+            os.path.join(normalized, "installer_main.py"),
+            os.path.join(normalized, "Installer", "installer_config.py"),
+        )
+        missing_markers = 0
+        for marker in markers:
+            try:
+                metadata = os.lstat(marker)
+            except FileNotFoundError:
+                missing_markers += 1
+                continue
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+                raise RuntimeError(f"{label} besitzt keinen eindeutigen Release-Marker")
+        if missing_markers > (1 if allow_one_missing_marker else 0):
+            raise RuntimeError(f"{label} besitzt nicht alle Release-Marker")
     return normalized
 
 
@@ -360,7 +364,7 @@ def _bound_download_bootstrap_authority():
     target = _validated_strict_product_root(
         target_value,
         "Bootstrap-Ziel",
-        allow_one_missing_marker=True,
+        ignore_release_markers=True,
     )
     module = _validated_strict_product_root(module_root, "Ausgeführter Release-Root")
     if runner != module:
@@ -384,7 +388,7 @@ def _resolve_install_root(module_root, explicit_root="", configured_root=""):
         if explicit_root and _validated_strict_product_root(
             explicit_root,
             "E3DC_INSTALL_ROOT",
-            allow_one_missing_marker=True,
+            ignore_release_markers=True,
         ) != target:
             raise RuntimeError("E3DC_INSTALL_ROOT widerspricht dem gebundenen Bootstrap-Ziel")
         # Alte Produkt-/Web-Metadaten sind in diesem engen Pfad ausschließlich

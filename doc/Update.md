@@ -5,7 +5,7 @@ Updates werden ausschließlich über den Installer ausgeführt. Ein manuelles
 Release-Historie ungeeignet, weil alter und neuer Git-Stand nicht miteinander
 verwandt sein müssen.
 
-Der aktuelle Stable-Stand ist `v5.4.4a`. Der Ziel-Updater bindet den
+Der aktuelle Stable-Stand ist `v5.4.4b`. Der Ziel-Updater bindet den
 freigegebenen Zielstand vor Backup und Dienststopp eindeutig an Version,
 Herkunft und Anlagenrolle. Fortschritt und Lebenszeichen bleiben auf
 langsameren Raspberry Pis sichtbar. Auch ein erneut gestarteter Auftrag folgt
@@ -120,6 +120,39 @@ dem Root-Lock aus demselben gültigen Nicht-Root-Eigentümer von Repository und
 `.git`, lokales Benutzerkonto und Nutzerwert unmittelbar vor dem ersten
 Import aus dem Zielcode erneut geprüft. Die fail-closed Grenzen und alle
 übrigen Härtungen aus 5.4.3j bleiben unverändert.
+
+### 5.4.4b: universeller Ziel-Updater mit geringer Ausfallzeit
+
+5.4.4b lädt für jeden normalen Einstieg zuerst den veröffentlichten
+Ziel-Updater. Eine laufende Einzelinstanz liefert Installationsroot und
+Installationsbenutzer unabhängig davon, ob sie unter `pi`, einem anderen
+lokalen Konto oder in einem abweichenden Verzeichnis installiert wurde.
+Pfade aus vorhandenen Metadatendateien dienen nur als Hinweise und müssen zum
+laufenden Dienst passen. Werden mehrere gleichrangige Instanzen erkannt,
+werden ihre Pfade ausgegeben und der Auftrag stoppt ohne Änderung.
+
+Der alte Produktbaum entscheidet nicht, welche Daten gesichert werden. Der
+neue Ziel-Updater inventarisiert Konfiguration, Betriebsdaten, Programmbaum,
+Webdateien und privilegierte Releaseflächen nach seinem eigenen
+Backupvertrag, erstellt das Backup und prüft Manifest sowie Digest. Dienste
+und Hardware-Writer laufen während Download, Vorprüfung und Backup weiter.
+Erst unmittelbar vor der atomaren Datei-, Rechte- und Unit-Projektion werden
+sie gestoppt. Nach Dienststart, Healthcheck und stabilem Zielzustand wird der
+transaktionsgebundene Startschutz entfernt.
+
+Lokale Produktänderungen, fehlende Release-Dateien, frühere Besitzer oder
+Modi und beschädigte Git-Metadaten sind deshalb keine vorgelagerte
+Updateautorität. Sie werden gesichert und nach bestätigter Writer-Ruhe durch
+den freigegebenen Releasebaum ersetzt. Echte Mehrdeutigkeit, Pfadflucht,
+Symlinks, Spezialdateien, konkurrierende Writer oder ein nicht prüfbares
+Backup bleiben harte Stopps.
+
+Ein kontrollierter Abbruch enthält immer Fehlercode, Ursache, belegten
+Systemzustand, Updateziel und genau den nächsten sicheren Diagnose- oder
+Reparaturbefehl. Bereits `committed` markierte Sicherheitsreste aus 5.4.4 und
+5.4.4a dürfen nur bei exakter Tag-, Commit-, Backup-, Drop-in- und
+Instanzbindung bereinigt werden. Ein `pending`-Beleg wird nicht geraten oder
+automatisch fortgesetzt; die Ausgabe verweist dann auf das gebundene Journal.
 
 ### 5.4.4a: ein gemeinsamer Ein-Datei-Updateeinstieg
 

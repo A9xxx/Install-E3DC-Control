@@ -2,10 +2,11 @@
 # E3DC-Control Web-/Konsolen-Update-Dispatcher
 #
 # Diese Installationsvorlage wird root-eigen nach /usr/local/sbin projiziert.
-# Sie bindet ausschließlich Installationspfad und -benutzer. Der installierte
-# Produktbaum und seine Git-Metadaten sind keine Autorität für den Start des
-# Updates: Der Systemjob lädt den Bootstrap des neuesten veröffentlichten
-# Releases in ein privates Root-Verzeichnis und übergibt ihm die Installation.
+# Der eingebettete Installationspfad und -benutzer sind ausschließlich Hinweise
+# für die aktuelle Release-Discovery. Der installierte Produktbaum und seine
+# Git-Metadaten sind keine Autorität für den Start des Updates: Der Systemjob
+# lädt den Bootstrap des neuesten veröffentlichten Releases in ein privates
+# Root-Verzeichnis; dessen Discovery bindet Installation, Benutzer und Rolle.
 
 set -euo pipefail
 umask 027
@@ -35,8 +36,30 @@ readonly ENV="/usr/bin/env"
 DOWNLOAD_DIR=""
 
 fail() {
-    printf 'E3DC-Update-Dispatcher: %s\n' "$1" >&2
-    exit "${2:-1}"
+    local message="$1"
+    local exit_code="${2:-1}"
+    local solution
+    case "$exit_code" in
+        64)
+            solution="Starte den installierten Web-Update-Dispatcher ohne zusätzliche Argumente."
+            ;;
+        75)
+            solution="Warte auf den laufenden Updatejob und prüfe: systemctl status --no-pager ${UNIT}"
+            ;;
+        77)
+            solution="Starte den Dispatcher über die Weboberfläche oder mit sudo."
+            ;;
+        126)
+            solution="Repariere den root-eigenen Dispatcher einmalig mit dem aktuellen Community-Bootstrap und starte danach das Webupdate erneut."
+            ;;
+        *)
+            solution="Prüfe die unmittelbar vorherige Ursache sowie ${LOG_FILE} und starte denselben Updatebefehl anschließend erneut."
+            ;;
+    esac
+    printf '\n[ABBRUCH] E3DC-UPD-WEB-%s\n' "$exit_code" >&2
+    printf 'Was ist passiert: %s\n' "$message" >&2
+    printf 'Lösung: %s\n' "$solution" >&2
+    exit "$exit_code"
 }
 
 require_root_path() {
@@ -135,8 +158,8 @@ prepare_log() {
     printf '=== E3DC-Control Update %s ===\n' "$(/usr/bin/date --iso-8601=seconds)" >> "$LOG_FILE"
 }
 
-validate_launcher_and_binding() {
-    local metadata account canonical_root parent_mode launcher_owner launcher_mode launcher_kind launcher_links
+validate_launcher_contract() {
+    local metadata parent_mode launcher_owner launcher_mode launcher_kind launcher_links
     for binary in "$SYSTEMCTL" "$SYSTEMD_RUN" "$FLOCK" "$CURL" "$GIT" "$PYTHON" "$ENV"; do
         [[ -x "$binary" ]] || fail "Fest gebundenes Systemprogramm fehlt: ${binary}" 126
     done
@@ -163,44 +186,6 @@ validate_launcher_and_binding() {
         && $((8#$launcher_mode & 8#500)) -eq $((8#500)) ]] \
         || fail "Installierter Update-Dispatcher ist nicht sicher root-lesbar/ausführbar" 126
 
-    account="$(/usr/bin/getent passwd "$INSTALL_USER")"
-    [[ -n "$account" && "$INSTALL_USER" != "root" && "$INSTALL_USER" != "www-data" ]] \
-        || fail "Installationsbenutzer ist nicht zulässig" 126
-    canonical_root="$($PYTHON -I -B - "$INSTALL_ROOT" <<'PY'
-import os
-from pathlib import Path
-import stat
-import sys
-
-candidate = Path(os.path.abspath(sys.argv[1]))
-current = Path(candidate.anchor)
-for component in candidate.parts[1:]:
-    current /= component
-    metadata = os.lstat(current)
-    if stat.S_ISLNK(metadata.st_mode):
-        raise SystemExit(f"Symlink im Installationspfad: {current}")
-if not stat.S_ISDIR(os.lstat(candidate).st_mode):
-    raise SystemExit("Installationspfad ist kein Verzeichnis")
-missing_markers = 0
-for marker in (candidate / "VERSION", candidate / "installer_main.py", candidate / "Installer"):
-    try:
-        metadata = os.lstat(marker)
-    except FileNotFoundError:
-        missing_markers += 1
-        continue
-    if marker.name == "Installer":
-        valid = stat.S_ISDIR(metadata.st_mode)
-    else:
-        valid = stat.S_ISREG(metadata.st_mode)
-    if stat.S_ISLNK(metadata.st_mode) or not valid:
-        raise SystemExit(f"Release-Marker ist nicht regulär: {marker}")
-if missing_markers > 1:
-    raise SystemExit("Installationspfad besitzt mehr als einen fehlenden Release-Marker")
-print(candidate)
-PY
-)" || fail "Installationspfad ist nicht sicher gebunden"
-    [[ "$canonical_root" == "$INSTALL_ROOT" ]] \
-        || fail "Installationspfad ist nicht kanonisch gebunden"
 }
 
 isolated_git() {
@@ -329,7 +314,7 @@ run_worker() {
     write_runtime_value "$PID_FILE" "$$"
     write_runtime_value "$STATUS_FILE" "running"
     printf '%s\n' "[INFO] Update-Dispatcher-Vertrag: ${DISPATCHER_CONTRACT}"
-    validate_launcher_and_binding
+    validate_launcher_contract
 
     release_binding="$(resolve_release_binding)"
     tab=$'\t'
@@ -356,7 +341,6 @@ run_worker() {
         HOME=/root \
         LANG=C.UTF-8 \
         LC_ALL=C.UTF-8 \
-        E3DC_BOOTSTRAP_USER="$INSTALL_USER" \
         E3DC_BOOTSTRAP_ENTRY_MODE=regular \
         E3DC_BOOTSTRAP_EXPECTED_TAG="$tag" \
         E3DC_BOOTSTRAP_EXPECTED_TAG_OBJECT="$tag_object" \
@@ -364,7 +348,7 @@ run_worker() {
         E3DC_BOOTSTRAP_VERIFY_SELF=1 \
         E3DC_BOOTSTRAP_INLINE_WORKER=1 \
         E3DC_BOOTSTRAP_LOCK_HELD=1 \
-        /bin/sh "$bootstrap" "$INSTALL_ROOT" auto
+        /bin/sh "$bootstrap"
     result=$?
     set -e
     if (( result == 0 )); then
@@ -387,7 +371,7 @@ update_job_running() {
 start_worker() {
     local launch_output launch_status
     (( $# == 0 )) || fail "Der Update-Dispatcher akzeptiert keine Argumente" 64
-    validate_launcher_and_binding
+    validate_launcher_contract
     prepare_runtime_paths
     prepare_lock_file "$START_LOCK_FILE"
     exec 8>"$START_LOCK_FILE"

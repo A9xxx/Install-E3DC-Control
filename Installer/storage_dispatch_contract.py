@@ -3453,34 +3453,19 @@ def _materialize_direct_marketing_trajectory(
                     )
             elif passive_binding is not None:
                 reason_code = "DIRECT_MARKETING_PASSIVE_NORMAL_BINDING"
-                baseline_battery_w = (
-                    _safe_float(projection.get("battery_w"), 0.0) or 0.0
+                deficit_w = max(0.0, -residual_before_w)
+                available_wh = max(0.0, energy_start_wh - floor_wh)
+                discharge_w = min(
+                    deficit_w,
+                    (
+                        max_discharge_w
+                        if max_discharge_w > 0.0
+                        else deficit_w
+                    ),
+                    available_wh * discharge_efficiency / slot_hours,
                 )
-                if baseline_battery_w >= 0.0:
-                    room_wh = max(0.0, ceiling_wh - energy_start_wh)
-                    charge_available_w = max(0.0, residual_before_w)
-                    charge_w = min(
-                        baseline_battery_w if baseline_battery_w > 0.0 else charge_available_w,
-                        charge_available_w,
-                        max_charge_w if max_charge_w > 0.0 else charge_available_w,
-                        room_wh / charge_efficiency / slot_hours,
-                    )
-                    battery_w = charge_w
-                else:
-                    requested_w = abs(baseline_battery_w)
-                    deficit_w = max(0.0, -residual_before_w)
-                    available_wh = max(0.0, energy_start_wh - floor_wh)
-                    discharge_w = min(
-                        requested_w,
-                        deficit_w,
-                        (
-                            max_discharge_w
-                            if max_discharge_w > 0.0
-                            else requested_w
-                        ),
-                        available_wh * discharge_efficiency / slot_hours,
-                    )
-                    battery_w = -discharge_w
+                battery_w = -discharge_w
+
             else:
                 # CHARGE_BLOCK_WAIT deckt nur den Hausbedarf und exportiert
                 # keine zusätzliche Batterieenergie.

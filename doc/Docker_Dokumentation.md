@@ -2,8 +2,25 @@
 
 Veröffentlichte Images entstehen ausschließlich aus einem versionierten stabilen Release-Tag. `latest` verweist damit auf die zuletzt veröffentlichte stabile Version.
 
-Der aktuelle Stable-Stand ist `v5.4.4a`. Die Tags `latest`, `v5.4.4a` und
-`5.4.4a` müssen auf denselben geprüften Multi-Arch-Digest verweisen.
+Der aktuelle Stable-Stand ist `v5.4.4b`. Die Tags `latest`, `v5.4.4b` und
+`5.4.4b` müssen auf denselben geprüften Multi-Arch-Digest verweisen.
+
+5.4.4b erweitert den Host-Updater um die semantisch gebundene Migration der
+veröffentlichten 5.3.2b-Compose-Struktur und der bekannten 5.4.2-Bestände. Die
+vorhandenen Daten-, Log- und privaten Volumes bleiben erhalten. Vor dem Pull
+werden DockerRootDir und mindestens 2 GiB freier Speicher geprüft. Der Helfer
+führt bewusst weder `docker prune` noch eine Volume-Löschung aus; bei Platzmangel
+nennt er die Diagnosebefehle. Image-ID, OCI-Version, Start, Healthcheck und zwei
+stabile Laufzeitsnapshots müssen zum Ziel passen. Scheitert ein bereits
+gestarteter Kandidat, werden Compose-Preimage und belegtes Ausgangsimage
+wiederhergestellt. Der parentlose Rollback-Root `v5.3.2b` und sein
+Policy-Digest bleiben unverändert.
+
+Das 5.4.4b-Image enthält zugleich die freigegebenen Regelungsänderungen:
+batterieneutraler PV-Überschuss und zusätzliche Pre-Dump-Entladung bleiben
+getrennt, eine allein aktive openWB Pro kann mit 0,1 A regeln, laufende Ladung
+wird während einer ausstehenden Phasenempfehlung gehalten und der
+E3DC-Leistungsmesser für `wp_type = 6` weist Erzeugerwerte fail-closed ab.
 
 5.4.4a vereinheitlicht ausschließlich den Bare-Metal-Updateeinstieg mit der
 einzelnen Community-Datei `e3dc-update-bootstrap` und dem Aufruf
@@ -272,8 +289,8 @@ einen separaten frischen Checkout des veröffentlichten `main` als
 Verwaltungsbaum. Starte daraus `Installer/docker_compose_update.py` und übergib
 mit `--compose-dir` den absoluten Pfad des bestehenden
 `e3dc-docker`-Verzeichnisses. Der Helfer migriert ausschließlich unveränderte
-offizielle Compose-Dateien aus 5.4.2 bis 5.4.2d sowie die bekannte
-Installer-Bind-Mount-Variante atomar, also ganz oder gar nicht. `.env` und die
+offizielle 5.3.2b-Compose-Datei, Compose-Dateien aus 5.4.2 bis 5.4.2d sowie die
+bekannte Installer-Bind-Mount-Variante atomar, also ganz oder gar nicht. `.env` und die
 vorhandenen Daten-, Log-, ML- und Forecast-Quellen bleiben unverändert. Einen
 alten Watchtower stoppt und prüft er vor Migration und Pull; er bleibt danach
 aus und darf nur per ausdrücklichem Opt-in wieder aktiviert werden. Ältere,
@@ -282,7 +299,7 @@ unverändert gesperrt und benötigen eine manuelle Prüfung.
 
 Ohne `E3DC_IMAGE_TAG` folgt diese Compose-Datei dem geprüften Stable-Tag
 `latest`. Ein fester Tag bleibt bei `pull` absichtlich unverändert. Für einen
-bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.4a` in der Datei `.env`
+bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.4b` in der Datei `.env`
 gesetzt. `docker compose config --images` zeigt vorab das tatsächlich gewählte
 Image.
 
@@ -309,7 +326,7 @@ Versionswahl.
 
 Gezielte Rückfallversion:
 
-Den Stable-Container `v5.4.4a` auf den veröffentlichten Rollback-Root
+Den Stable-Container `v5.4.4b` auf den veröffentlichten Rollback-Root
 `v5.3.2b` zurücksetzen:
 
 ```bash
@@ -629,11 +646,13 @@ erst nach dem imagegebundenen Healthcheck; zwei identische Snapshots binden
 zusätzlich Container-ID, Image-ID, Restart-Zähler, Startzeit, Dienstsatz und
 Laufzeit-`VERSION`.
 
-Schlägt `pull` fehl, ist der Updateversuch beendet. Ein bereits vorhandenes
-Altimage darf danach weder automatisch neu gestartet noch als aktualisierte
-Version gemeldet werden. Nach einem begonnenen Kandidatenstart führt jeder
-Fehler zum verifizierten Stopp; bleibt dieser Stopp unbestätigt, meldet der
-Helfer einen gesonderten Sicherheitsfehler.
+Vor dem `pull` verlangt der Helfer mindestens 2 GiB nachweisbaren freien Platz
+im DockerRootDir. Schlägt die Prüfung oder das Entpacken mit Platzmangel fehl,
+bleiben Altcontainer und Volumes erhalten; die Ausgabe nennt
+`docker system df -v`, DockerRootDir und `df -h` als nächste Diagnose. Nach einem begonnenen
+Kandidatenstart führt jeder Fehler zum verifizierten Stopp und zum gebundenen
+Rückstart des vorherigen Images. Bleibt Kandidatenstillstand oder Rückstart
+unbestätigt, meldet der Helfer einen gesonderten Sicherheitsfehler.
 
 Für einen Rückfall wird ausschließlich der Host-Helfer aus dem Abschnitt
 „Gezielte Rückfallversion“ verwendet. Er erhält den freigegebenen Tag über

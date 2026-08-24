@@ -102,6 +102,13 @@ def _safe_float_config_value(value, default):
         return float(default)
 
 
+def _safe_int_config_value(value, default):
+    try:
+        return int(float(str(value).strip().replace(",", ".")))
+    except (TypeError, ValueError):
+        return int(default)
+
+
 def persistent_acquisition_sections(cfg):
     """Definiert Poll-Gruppen; regelrelevante Werte haben immer TTL 0."""
 
@@ -118,6 +125,7 @@ def persistent_acquisition_sections(cfg):
         ("PVI DC/AC", lambda conn: get_pvi(conn), 0.0, False),
         ("Batterie", lambda conn: get_bat(conn, cfg), 0.0, False),
         ("Wallbox", lambda conn: get_wb(conn, cfg), 0.0, False),
+        ("Wärmepumpe (E3DC PM)", lambda conn: get_wp_pm(conn, cfg), 0.0, False),
         # Dieser Block enthält neben Stammdaten auch aktive EMS-Leistungsgrenzen.
         # Er darf deshalb nicht als statischer Bereich gecacht werden.
         ("EMS Anlagendata", lambda conn: get_ems_config(conn), 0.0, False),
@@ -1106,6 +1114,72 @@ def get_pm(conn, cfg=None):
             break
     _print_pm_summary(best)
     return best
+
+
+def get_wp_pm(conn, cfg=None):
+    """Liest E3DC-Leistungsmesser für Wärmepumpe ausschließlich bei wp_type=6."""
+    wp_type = str((cfg or {}).get("wp_type", "-1")).strip()
+    if wp_type != "6":
+        return {}
+    wp_pm_idx = _safe_int_config_value((cfg or {}).get("wp_e3dc_pm_index"), 2)
+    if wp_pm_idx < 0 or wp_pm_idx > 7:
+        wp_pm_idx = 2
+    try:
+        req = _pm_request_item(wp_pm_idx)
+        resp = conn.request([req])
+        pm_data = find_tag(resp, RscpTag.PM_DATA)
+        if pm_data and isinstance(pm_data.get('value'), list):
+            pd = pm_data['value']
+            p1 = find_tag_value(pd, RscpTag.PM_POWER_L1)
+            p2 = find_tag_value(pd, RscpTag.PM_POWER_L2)
+            p3 = find_tag_value(pd, RscpTag.PM_POWER_L3)
+            # Alle 3 Phasen müssen numerisch vorhanden sein (keine Teilphasen, keine Booleans, keine Null-Imputation)
+            if (
+                p1 is not None and p2 is not None and p3 is not None
+                and not isinstance(p1, bool) and not isinstance(p2, bool) and not isinstance(p3, bool)
+                and isinstance(p1, (int, float)) and isinstance(p2, (int, float)) and isinstance(p3, (int, float))
+            ):
+                p1_val = round(float(p1), 1)
+                p2_val = round(float(p2), 1)
+                p3_val = round(float(p3), 1)
+                p_sum = round(p1_val + p2_val + p3_val, 1)
+
+                # Ein Verbraucher (Wärmepumpe) speist niemals ein. Summe < 0 oder signifikant negative Phase ist Erzeuger/Rückspeisung.
+                is_producer = bool(p_sum < 0.0 or p1_val < -10.0 or p2_val < -10.0 or p3_val < -10.0)
+                if is_producer:
+                    return {
+                        "WP_Power": None,
+                        "Heatpump_Power": None,
+                        "WP_Power_Valid": False,
+                        "WP_Power_Source": f"e3dc_pm_{wp_pm_idx}_producer_rejected",
+                        "wp_p1": p1_val,
+                        "wp_p2": p2_val,
+                        "wp_p3": p3_val,
+                        "wp_pm_index": wp_pm_idx,
+                        "wp_producer_detected": True,
+                    }
+
+                wp_power_val = int(round(p_sum))
+                return {
+                    "WP_Power": wp_power_val,
+                    "Heatpump_Power": wp_power_val,
+                    "WP_Power_Valid": True,
+                    "WP_Power_Source": f"e3dc_pm_{wp_pm_idx}",
+                    "wp_p1": p1_val,
+                    "wp_p2": p2_val,
+                    "wp_p3": p3_val,
+                    "wp_pm_index": wp_pm_idx,
+                    "wp_producer_detected": False,
+                }
+    except Exception:
+        pass
+    return {
+        "WP_Power": None,
+        "Heatpump_Power": None,
+        "WP_Power_Valid": False,
+        "WP_Power_Source": f"e3dc_pm_{wp_pm_idx}_read_failed",
+        "wp_pm_index": wp_pm_idx,
+    }
 
 
 def get_power_snapshot(conn, cfg=None):
@@ -2913,6 +2987,7 @@ def run_test(host, port, user, pw, aes_pw, cfg, loops=1, interval=3, write=False
                     ("PVI DC/AC",        lambda: get_pvi(conn)),
                     ("Batterie",         lambda: get_bat(conn, cfg)),
                     ("Wallbox",          lambda: get_wb(conn, cfg)),
+                    ("Wärmepumpe (E3DC PM)", lambda: get_wp_pm(conn, cfg)),
                     ("System-Info",      lambda: get_system_info(conn)),
                 ]
 

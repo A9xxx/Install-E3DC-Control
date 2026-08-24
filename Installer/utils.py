@@ -151,27 +151,62 @@ except Exception:
 _logging_initialized = False
 
 def setup_logging():
-    """Initialisiert das Logging in eine Datei."""
+    """Initialisiert das Dateilog oder einen sichtbaren stderr-Rückfall.
+
+    Die Installationswurzel wird bewusst vor dem I/O-Rückfall gebunden.
+    Widersprüchliche Pfadmetadaten sind ein Sicherheitsfehler und dürfen nicht
+    als bloßes Logdateiproblem verschluckt werden. Ausschließlich ein lokaler
+    Dateisystemfehler beim Anlegen des Logs degradiert auf stderr, damit der
+    frisch geladene Updater anschließend die Zielrechte reparieren kann.
+    """
     global _logging_initialized
     if _logging_initialized:
         return
 
-    # Bei einem Release-Bootstrap läuft dieses Modul aus einem versiegelten
-    # Ausführungssnapshot. Installationslogs gehören dennoch ausschließlich
-    # in den explizit gebundenen Produktbaum.
-    log_dir = os.path.join(get_install_path(), "logs")
-    os.makedirs(log_dir, exist_ok=True)
+    install_root = get_install_path()
+    log_dir = os.path.join(install_root, "logs")
     log_file = os.path.join(log_dir, "install.log")
-
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO)
-    if not root_logger.handlers:
-        handler = RotatingFileHandler(log_file, maxBytes=2*1024*1024, backupCount=2, encoding='utf-8')
-        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-        handler.setFormatter(formatter)
-        root_logger.addHandler(handler)
-
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    bootstrap_root = str(os.environ.get("E3DC_BOOTSTRAP_ROOT") or "").strip()
+    runner_root = str(
+        os.environ.get("E3DC_BOOTSTRAP_RUNNER_ROOT") or ""
+    ).strip()
+    if (
+        bootstrap_root
+        and runner_root
+        and os.path.realpath(bootstrap_root) == os.path.realpath(install_root)
+        and os.path.realpath(runner_root) != os.path.realpath(install_root)
+    ):
+        # Der Download-Bootstrap leitet stdout/stderr bereits in sein
+        # root-eigenes Systemprotokoll. Vor dem verifizierten Anlagenbackup
+        # darf der frisch geladene Runner im alten Produktbaum weder ein
+        # Logverzeichnis noch eine Datei anlegen.
+        if not root_logger.handlers:
+            handler = logging.StreamHandler(sys.stderr)
+            handler.setFormatter(formatter)
+            root_logger.addHandler(handler)
+        _logging_initialized = True
+        return
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        if not root_logger.handlers:
+            handler = RotatingFileHandler(log_file, maxBytes=2*1024*1024, backupCount=2, encoding='utf-8')
+            handler.setFormatter(formatter)
+            root_logger.addHandler(handler)
+    except OSError as exc:
+        if not root_logger.handlers:
+            handler = logging.StreamHandler(sys.stderr)
+            handler.setFormatter(formatter)
+            root_logger.addHandler(handler)
+        root_logger.error(
+            "Installationslog %s ist vor der Rechteprojektion nicht verfügbar: %s",
+            log_file,
+            exc,
+        )
     _logging_initialized = True
+
 
 def run_command(cmd, timeout=10, use_shell=True, cwd=None):
     """Führt Shell-Kommando aus mit vollständiger Fehlerbehandlung und Logging."""
@@ -1760,7 +1795,44 @@ WantedBy=multi-user.target
     return tuple(dict.fromkeys(candidates))
 
 
+_SYSTEMD_UNIT_FILE_STATES = {
+    "enabled",
+    "enabled-runtime",
+    "disabled",
+    "masked",
+    "masked-runtime",
+    "static",
+    "indirect",
+    "generated",
+    "transient",
+    "alias",
+    "",
+}
+_SYSTEMD_ACTIVE_STATES = {
+    "active",
+    "inactive",
+    "failed",
+}
+_OPTIONAL_NOT_FOUND_COMPAT_UNITS = frozenset({
+    "e3dc-forecast-evidence.service",
+})
+
+
+def _bundle_unit_name(service_name):
+    value = str(service_name or "").strip()
+    if value.endswith(".service"):
+        value = value[:-8]
+    if (
+        not value
+        or any(not (char.isalnum() or char in "@_.-") for char in value)
+        or "/" in value
+    ):
+        raise RuntimeError("Ungültiger systemd-Dienstname im Bundle")
+    return value + ".service"
+
+
 def _create_service_file(
+
     service_name,
     description,
     python_script_rel_path,
@@ -1870,15 +1942,24 @@ def _create_service_file(
     service_unit_mutated = False
     outer_bundle_recorded = False
     unit_name = _bundle_unit_name(service_name)
+    if bundle_snapshot is not None:
+        if unit_name not in bundle_snapshot:
+            print(f"✗ Äußerer Bundle-Snapshot enthält {unit_name} nicht.")
+            return False
     inherited_optional_absence = bool(
         bundle_snapshot is not None
-        and unit_name in bundle_snapshot
         and bundle_snapshot[unit_name].get("incomplete_optional_not_found")
     )
     try:
         service_snapshot = capture_systemd_service_bundle(
             (service_name,),
-            allow_optional_not_found_compat=inherited_optional_absence,
+            allow_optional_not_found_compat=bool(
+                inherited_optional_absence
+                or (
+                    bundle_snapshot is None
+                    and unit_name in _OPTIONAL_NOT_FOUND_COMPAT_UNITS
+                )
+            ),
         )
     except Exception as exc:
         print(
@@ -1886,13 +1967,13 @@ def _create_service_file(
             f"gebunden: {exc}"
         )
         return False
-    if bundle_snapshot is not None:
-        if unit_name not in bundle_snapshot:
-            print(f"✗ Äußerer Bundle-Snapshot enthält {unit_name} nicht.")
-            return False
-        if service_snapshot[unit_name] != bundle_snapshot[unit_name]:
-            print(f"✗ Unit-Vorzustand von {unit_name} driftete seit dem Bundle-Snapshot.")
-            return False
+    if (
+        bundle_snapshot is not None
+        and service_snapshot[unit_name] != bundle_snapshot[unit_name]
+    ):
+        print(f"✗ Unit-Vorzustand von {unit_name} driftete seit dem Bundle-Snapshot.")
+        return False
+
     try:
         with tempfile.NamedTemporaryFile(mode='w', delete=False) as tmp:
             tmp.write(service_content)
@@ -1993,42 +2074,8 @@ def _create_service_file(
             )
 
 
-_SYSTEMD_UNIT_FILE_STATES = {
-    "enabled",
-    "enabled-runtime",
-    "disabled",
-    "static",
-    "indirect",
-    "masked",
-    "generated",
-    "transient",
-    "alias",
-    "",
-}
-_SYSTEMD_ACTIVE_STATES = {
-    "active",
-    "inactive",
-    "failed",
-}
-_OPTIONAL_NOT_FOUND_COMPAT_UNITS = frozenset({
-    "e3dc-forecast-evidence.service",
-})
-
-
-def _bundle_unit_name(service_name):
-    value = str(service_name or "").strip()
-    if value.endswith(".service"):
-        value = value[:-8]
-    if (
-        not value
-        or any(not (char.isalnum() or char in "@_.-") for char in value)
-        or "/" in value
-    ):
-        raise RuntimeError("Ungültiger systemd-Dienstname im Bundle")
-    return value + ".service"
-
-
 def _systemd_show_contract(unit, *, allow_incomplete_optional_not_found=False):
+
     unit = _bundle_unit_name(unit)
     optional_not_found_compat = bool(
         allow_incomplete_optional_not_found

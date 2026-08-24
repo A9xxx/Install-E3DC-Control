@@ -1002,7 +1002,11 @@ function stabilizeCleanHomePower(&$data) {
         && $previousAgeS <= 180.0
     ) {
         $data['home'] = round($previousHome);
-        $data['home_source'] = ($rawHomeForHold <= 50.0) ? 'held_rscp_zero_glitch' : 'held_external_consumer_zero_glitch';
+        if ($rawHomeForHold <= 50.0) {
+            $data['home_source'] = 'held_rscp_zero_glitch';
+        } else {
+            $data['home_source'] = 'held_external_consumer_zero_glitch';
+        }
         $data['home_held_zero_glitch'] = true;
         $heldZeroGlitch = true;
     } else {
@@ -6798,6 +6802,11 @@ if (
                 $data['heat_manager_reason'] = $data['heat_manager_owner_reason'] . ' | Budget ' . (int)$data['heatpump_budget_w'] . ' W';
             }
         }
+        $data['heatpump_start_request_w'] = (int)($wbBudget['heatpump_start_request_w'] ?? 0);
+        $data['authorized_heatpump_budget_w'] = (int)($wbBudget['authorized_heatpump_budget_w'] ?? 0);
+        $data['heatpump_start_state'] = (string)($wbBudget['heatpump_start_state'] ?? 'idle');
+        $data['heatpump_start_reason_code'] = (string)($wbBudget['heatpump_start_reason_code'] ?? 'none');
+        $data['released_budget_receiver'] = (string)($wbBudget['released_budget_receiver'] ?? 'none');
         $data['consumer_priority_order'] = $wbBudget['consumer_priority_order'] ?? ($es['consumer_priority_order'] ?? null);
         $data['consumer_priority_effective_order'] = $wbBudget['consumer_priority_effective_order'] ?? ($es['consumer_priority_effective_order'] ?? null);
         $data['bat_charge_req_w']   = (int)($es['bat_charge_request_w'] ?? 0);

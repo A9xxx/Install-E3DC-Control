@@ -241,7 +241,14 @@ def _read_verified_objects(
     for expected_id in ordered_ids:
         header = stream.readline()
         try:
-            raw_id, object_type, raw_size = header.rstrip(b"\n").split(b" ", 2)
+            parts = header.rstrip(b"\n").split(b" ", 2)
+            if len(parts) == 2 and parts[1] == b"missing":
+                detail = completed.stderr.decode("utf-8", errors="replace").strip()
+                error_msg = f"Commit-Objekt {expected_id} fehlt in lokaler Objektdatenbank"
+                if detail:
+                    error_msg += ": " + detail[-300:]
+                raise RuntimeError(error_msg)
+            raw_id, object_type, raw_size = parts
             actual_id = raw_id.decode("ascii")
             size = int(raw_size)
         except (UnicodeDecodeError, ValueError) as exc:

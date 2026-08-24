@@ -53,6 +53,7 @@ BACKUP_ROOT_NAMES = {"e3dc-control-backups", ".e3dc-control-backups"}
 DEFAULT_BACKUP_ROOT = Path("/srv/e3dc-control-backups")
 SYSTEM_BACKUP_KIND = "system-backup"
 WEB_SNAPSHOT_KIND = "web-snapshot"
+QUIESCED_OVERLAY_KIND = "quiesced-overlay"
 _CATEGORY_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
@@ -66,6 +67,10 @@ ML_MODEL_FORMAT = "e3dc-sklearn-pickle"
 ML_MODEL_MAX_BYTES = 128 * 1024 * 1024
 _ML_MODEL_FILE_RE = re.compile(r"ml_model-([0-9a-f]{64})\.pkl\Z")
 MAX_CLEANUP_TREE_DEPTH = 512
+BACKUP_ESTIMATE_FIXED_OVERHEAD_BYTES = 64 * 1024
+BACKUP_ESTIMATE_SOURCE_OVERHEAD_BYTES = 1024
+BACKUP_ESTIMATE_DIRECTORY_OVERHEAD_BYTES = 4 * 1024
+BACKUP_ESTIMATE_FILE_OVERHEAD_BYTES = 8 * 1024
 
 
 class BackupIntegrityError(RuntimeError):
@@ -151,6 +156,58 @@ class PersistentSource:
     exclude_anywhere: Tuple[str, ...] = field(default_factory=tuple)
 
 
+@dataclass(frozen=True)
+class PersistentSourceSizeEstimate:
+    """Rein lesende Größenabschätzung für einen PersistentSource-Satz.
+
+    ``payload_bytes`` ist die Summe der logischen ``st_size``-Werte aller
+    Dateien, die der Backup-Kopierer tatsächlich berücksichtigen würde.
+    ``metadata_bytes`` reserviert zusätzlich einen kleinen konservativen
+    Betrag für Zielverzeichnisse, Inodes, Blockrundung und Manifestdateien.
+    """
+
+    payload_bytes: int
+    metadata_bytes: int
+    file_count: int
+    directory_count: int
+    present_source_count: int
+    missing_source_count: int
+
+    @property
+    def total_bytes(self) -> int:
+        """Gesamtbedarf aus Nutzdaten und konservativem Metadatenaufschlag."""
+
+        return int(self.payload_bytes) + int(self.metadata_bytes)
+
+
+@dataclass(frozen=True)
+class QuiescedOverlayRestoreGuard:
+    """Bindet ein Zustands-Overlay an genau eine Update-Transaktion.
+
+    Der Guard wird beim Erzeugen des Overlays aus bereits verifizierten
+    Manifesten und nofollow geöffneten Verzeichnissen abgeleitet. Ein Restore
+    akzeptiert weder einen frei konstruierten Pfad noch nur eine Backup-ID,
+    sondern prüft die komplette Bindung erneut, bevor eine Zieldatei angelegt,
+    ersetzt oder entfernt wird.
+    """
+
+    transaction_id: str
+    overlay_dir: str
+    overlay_dev: int
+    overlay_ino: int
+    backup_id: str
+    manifest_sha256: str
+    install_root: str
+    parent_backup_dir: str
+    parent_backup_dev: int
+    parent_backup_ino: int
+    parent_backup_id: str
+    parent_backup_manifest_sha256: str
+    collection_dir: str
+    collection_dev: int
+    collection_ino: int
+
+
 def _lexical_absolute(path: PathValue) -> Path:
     raw = os.path.expanduser(str(path or ""))
     candidate = Path(raw)
@@ -159,6 +216,26 @@ def _lexical_absolute(path: PathValue) -> Path:
     if ".." in candidate.parts:
         raise BackupIntegrityError("Pfad darf keine '..'-Komponente enthalten: {}".format(candidate))
     return Path(os.path.normpath(raw))
+
+
+def _normalized_transaction_id(value: object) -> str:
+    transaction_id = str(value or "")
+    if not _SHA256_RE.fullmatch(transaction_id):
+        raise BackupIntegrityError(
+            "Quiesced-Overlay besitzt keine gültige Transaktions-ID"
+        )
+    return transaction_id
+
+
+def _normalized_backup_id(value: object, *, label: str = "Backup-ID") -> str:
+    backup_id = str(value or "")
+    if (
+        not backup_id
+        or len(backup_id) > 128
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", backup_id) is None
+    ):
+        raise BackupIntegrityError("{} ist ungültig".format(label))
+    return backup_id
 
 
 def _is_within(path: Path, root: Path) -> bool:
@@ -1076,17 +1153,21 @@ def _validate_category(category: str) -> str:
     return value
 
 
-def _copy_fd_to_path(source_descriptor: int, destination: Path, source_mode: int) -> None:
+def _copy_fd_to_path(source_descriptor: int, destination: Path, source_mode: int) -> tuple[int, str]:
     _ensure_directory_tree(destination.parent)
     descriptor = os.open(
         str(destination), os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW, 0o600
     )
+    hasher = hashlib.sha256()
+    total_size = 0
     try:
         os.lseek(source_descriptor, 0, os.SEEK_SET)
         while True:
             block = os.read(source_descriptor, 1024 * 1024)
             if not block:
                 break
+            hasher.update(block)
+            total_size += len(block)
             view = memoryview(block)
             while view:
                 written = os.write(descriptor, view)
@@ -1095,9 +1176,10 @@ def _copy_fd_to_path(source_descriptor: int, destination: Path, source_mode: int
     finally:
         os.close(descriptor)
     os.chmod(str(destination), source_mode & 0o777)
+    return total_size, hasher.hexdigest()
 
 
-def _copy_sqlite_fd(source_descriptor: int, destination: Path, source_mode: int) -> None:
+def _copy_sqlite_fd(source_descriptor: int, destination: Path, source_mode: int) -> tuple[int, str]:
     _ensure_directory_tree(destination.parent)
     source_uri = "file:/proc/self/fd/{}?mode=ro".format(source_descriptor)
     try:
@@ -1109,12 +1191,276 @@ def _copy_sqlite_fd(source_descriptor: int, destination: Path, source_mode: int)
         _unlink_if_exists(destination)
         raise BackupIntegrityError("SQLite-Online-Backup fehlgeschlagen: {}".format(exc))
     os.chmod(str(destination), source_mode & 0o777)
+    return destination.stat().st_size, sha256_file(destination)
 
 
 def _archive_path(category: str, source_root: Path, relative: Path, root_is_file: bool) -> Path:
     if root_is_file:
         return Path("recovery") / category / Path(*source_root.parts[1:])
     return Path("recovery") / category / relative
+
+
+def _persistent_entry_is_excluded(
+    name: str,
+    relative: Path,
+    source: PersistentSource,
+) -> bool:
+    """Gemeinsamer Ausschlussvertrag für Kopie und Größenabschätzung."""
+
+    if not relative.parts and _is_private_local_entry(name):
+        return True
+    if name in source.exclude_anywhere:
+        return True
+    return not relative.parts and name in source.exclude_top_level
+
+
+def _sqlite_sidecar_is_excluded(directory_descriptor: int, name: str) -> bool:
+    """Spiegelt exakt den WAL-/SHM-Ausschluss der SQLite-Online-Kopie."""
+
+    if not name.endswith(("-wal", "-shm")):
+        return False
+    base_name = name.rsplit("-", 1)[0]
+    try:
+        base_metadata = os.stat(
+            base_name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return False
+    return (
+        stat.S_ISREG(base_metadata.st_mode)
+        and Path(base_name).suffix.lower() in {".db", ".sqlite", ".sqlite3"}
+    )
+
+
+def estimate_persistent_sources_size(
+    sources: Sequence[PersistentSource],
+) -> PersistentSourceSizeEstimate:
+    """Schätzt die tatsächlich kopierte PersistentSource-Fläche read-only.
+
+    Die Traversierung verwendet wie :func:`copy_persistent_sources`
+    Verzeichnisdeskriptoren und ``O_NOFOLLOW``. Fehlende Quellen sind erlaubt;
+    Symlinks, Spezialdateien, Hardlinks und während des Öffnens ausgetauschte
+    Einträge führen fail-closed zu ``BackupIntegrityError``.
+    """
+
+    payload_bytes = 0
+    file_count = 0
+    directory_count = 0
+    present_source_count = 0
+    missing_source_count = 0
+    restore_destinations: Set[str] = set()
+
+    def account_open_file(
+        source_path: Path,
+        source_descriptor: int,
+        metadata: os.stat_result,
+    ) -> None:
+        nonlocal payload_bytes, file_count
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise BackupIntegrityError(
+                "Backupquelle ist keine eigenständige reguläre Datei: {}".format(
+                    source_path
+                )
+            )
+        restore_text = str(source_path)
+        if restore_text in restore_destinations:
+            raise BackupIntegrityError(
+                "Restore-Ziel ist doppelt definiert: {}".format(source_path)
+            )
+        restore_destinations.add(restore_text)
+        size = int(metadata.st_size)
+        if size < 0:
+            raise BackupIntegrityError(
+                "Backupquelle besitzt eine ungültige Dateigröße: {}".format(
+                    source_path
+                )
+            )
+        after = os.fstat(source_descriptor)
+        if (
+            (after.st_dev, after.st_ino) != (metadata.st_dev, metadata.st_ino)
+            or not stat.S_ISREG(after.st_mode)
+            or after.st_nlink != 1
+            or after.st_size != metadata.st_size
+            or after.st_mtime_ns != metadata.st_mtime_ns
+            or after.st_ctime_ns != metadata.st_ctime_ns
+            or after.st_uid != metadata.st_uid
+            or after.st_gid != metadata.st_gid
+            or stat.S_IMODE(after.st_mode) != stat.S_IMODE(metadata.st_mode)
+        ):
+            raise BackupIntegrityError(
+                "Quelle driftete während der Backup-Größenabschätzung: {}".format(
+                    source_path
+                )
+            )
+        payload_bytes += size
+        file_count += 1
+
+    def walk_directory(
+        source_root: Path,
+        directory_descriptor: int,
+        relative: Path,
+        item: PersistentSource,
+    ) -> None:
+        nonlocal directory_count
+        for name in sorted(os.listdir(directory_descriptor)):
+            if _persistent_entry_is_excluded(name, relative, item):
+                continue
+            metadata = os.stat(
+                name,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+            child_relative = relative / name
+            child_path = source_root / child_relative
+            if stat.S_ISLNK(metadata.st_mode):
+                raise BackupIntegrityError(
+                    "Symlink in Backupquelle ist nicht erlaubt: {}".format(
+                        child_path
+                    )
+                )
+            if stat.S_ISDIR(metadata.st_mode):
+                child_descriptor = os.open(
+                    name,
+                    os.O_RDONLY | _DIRECTORY | _NOFOLLOW,
+                    dir_fd=directory_descriptor,
+                )
+                try:
+                    opened = os.fstat(child_descriptor)
+                    if (
+                        not stat.S_ISDIR(opened.st_mode)
+                        or (opened.st_dev, opened.st_ino)
+                        != (metadata.st_dev, metadata.st_ino)
+                    ):
+                        raise BackupIntegrityError(
+                            "Quellverzeichnis wurde ausgetauscht: {}".format(
+                                child_path
+                            )
+                        )
+                    directory_count += 1
+                    walk_directory(
+                        source_root,
+                        child_descriptor,
+                        child_relative,
+                        item,
+                    )
+                finally:
+                    os.close(child_descriptor)
+            elif stat.S_ISREG(metadata.st_mode):
+                if _sqlite_sidecar_is_excluded(directory_descriptor, name):
+                    continue
+                file_descriptor = os.open(
+                    name,
+                    os.O_RDONLY | _NOFOLLOW,
+                    dir_fd=directory_descriptor,
+                )
+                try:
+                    opened = os.fstat(file_descriptor)
+                    if (opened.st_dev, opened.st_ino) != (
+                        metadata.st_dev,
+                        metadata.st_ino,
+                    ):
+                        raise BackupIntegrityError(
+                            "Quelldatei wurde ausgetauscht: {}".format(child_path)
+                        )
+                    account_open_file(child_path, file_descriptor, opened)
+                finally:
+                    os.close(file_descriptor)
+            else:
+                raise BackupIntegrityError(
+                    "Nicht regulärer Eintrag in Backupquelle: {}".format(
+                        child_path
+                    )
+                )
+
+    for source in sources:
+        _validate_category(source.category)
+        source_path = _lexical_absolute(source.source)
+        try:
+            parent_descriptor = _open_directory_nofollow(source_path.parent)
+        except FileNotFoundError:
+            missing_source_count += 1
+            continue
+        try:
+            try:
+                metadata = os.stat(
+                    source_path.name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                missing_source_count += 1
+                continue
+            present_source_count += 1
+            if stat.S_ISLNK(metadata.st_mode):
+                raise BackupIntegrityError(
+                    "Backupquelle darf kein Symlink sein: {}".format(source_path)
+                )
+            if stat.S_ISREG(metadata.st_mode):
+                descriptor = os.open(
+                    source_path.name,
+                    os.O_RDONLY | _NOFOLLOW,
+                    dir_fd=parent_descriptor,
+                )
+                try:
+                    opened = os.fstat(descriptor)
+                    if (opened.st_dev, opened.st_ino) != (
+                        metadata.st_dev,
+                        metadata.st_ino,
+                    ):
+                        raise BackupIntegrityError(
+                            "Backupquelle wurde ausgetauscht: {}".format(
+                                source_path
+                            )
+                        )
+                    account_open_file(source_path, descriptor, opened)
+                finally:
+                    os.close(descriptor)
+            elif stat.S_ISDIR(metadata.st_mode):
+                descriptor = os.open(
+                    source_path.name,
+                    os.O_RDONLY | _DIRECTORY | _NOFOLLOW,
+                    dir_fd=parent_descriptor,
+                )
+                try:
+                    opened = os.fstat(descriptor)
+                    if (
+                        not stat.S_ISDIR(opened.st_mode)
+                        or (opened.st_dev, opened.st_ino)
+                        != (metadata.st_dev, metadata.st_ino)
+                    ):
+                        raise BackupIntegrityError(
+                            "Backupquelle wurde ausgetauscht: {}".format(
+                                source_path
+                            )
+                        )
+                    directory_count += 1
+                    walk_directory(source_path, descriptor, Path(), source)
+                finally:
+                    os.close(descriptor)
+            else:
+                raise BackupIntegrityError(
+                    "Backupquelle ist kein regulärer Pfad: {}".format(source_path)
+                )
+        finally:
+            os.close(parent_descriptor)
+
+    source_count = present_source_count + missing_source_count
+    metadata_bytes = (
+        BACKUP_ESTIMATE_FIXED_OVERHEAD_BYTES
+        + source_count * BACKUP_ESTIMATE_SOURCE_OVERHEAD_BYTES
+        + directory_count * BACKUP_ESTIMATE_DIRECTORY_OVERHEAD_BYTES
+        + file_count * BACKUP_ESTIMATE_FILE_OVERHEAD_BYTES
+    )
+    return PersistentSourceSizeEstimate(
+        payload_bytes=payload_bytes,
+        metadata_bytes=metadata_bytes,
+        file_count=file_count,
+        directory_count=directory_count,
+        present_source_count=present_source_count,
+        missing_source_count=missing_source_count,
+    )
 
 
 def copy_persistent_sources(
@@ -1150,10 +1496,11 @@ def copy_persistent_sources(
         archive_relative = _archive_path(category, archive_root, relative, root_is_file)
         destination = backup / archive_relative
         suffix = source_path.suffix.lower()
-        if suffix in {".db", ".sqlite", ".sqlite3"}:
-            _copy_sqlite_fd(source_descriptor, destination, stat.S_IMODE(metadata.st_mode))
+        sqlite_source = suffix in {".db", ".sqlite", ".sqlite3"}
+        if sqlite_source:
+            size, sha = _copy_sqlite_fd(source_descriptor, destination, stat.S_IMODE(metadata.st_mode))
         else:
-            _copy_fd_to_path(source_descriptor, destination, stat.S_IMODE(metadata.st_mode))
+            size, sha = _copy_fd_to_path(source_descriptor, destination, stat.S_IMODE(metadata.st_mode))
         after = os.fstat(source_descriptor)
         if (
             (after.st_dev, after.st_ino) != (metadata.st_dev, metadata.st_ino)
@@ -1161,6 +1508,22 @@ def copy_persistent_sources(
             or after.st_nlink != 1
         ):
             raise BackupIntegrityError("Quelle wurde waehrend des Backups ausgetauscht: {}".format(source_path))
+        if not sqlite_source and (
+            after.st_size != metadata.st_size
+            or after.st_mtime_ns != metadata.st_mtime_ns
+            or after.st_ctime_ns != metadata.st_ctime_ns
+            or after.st_uid != metadata.st_uid
+            or after.st_gid != metadata.st_gid
+            or stat.S_IMODE(after.st_mode) != stat.S_IMODE(metadata.st_mode)
+            or size != metadata.st_size
+        ):
+            raise BackupIntegrityError(
+                "Quelle wurde während des Backups in-place verändert: {}. "
+                "Das Update hat noch keinen Dienst gestoppt; bitte den erneut "
+                "ausgegebenen Updatebefehl nach Abschluss der laufenden Änderung starten.".format(
+                    source_path
+                )
+            )
         mapped_entries.append({
             "backup_path": archive_relative.as_posix(),
             "restore_path": restore_text,
@@ -1168,6 +1531,8 @@ def copy_persistent_sources(
             "restore_mode": stat.S_IMODE(metadata.st_mode),
             "restore_uid": int(metadata.st_uid),
             "restore_gid": int(metadata.st_gid),
+            "size": size,
+            "sha256": sha,
         })
 
     def walk_directory(
@@ -1180,11 +1545,7 @@ def copy_persistent_sources(
     ) -> int:
         copied = 0
         for name in sorted(os.listdir(directory_descriptor)):
-            if not relative.parts and _is_private_local_entry(name):
-                continue
-            if name in item.exclude_anywhere:
-                continue
-            if not relative.parts and name in item.exclude_top_level:
+            if _persistent_entry_is_excluded(name, relative, item):
                 continue
             metadata = os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
             child_relative = relative / name
@@ -1216,14 +1577,8 @@ def copy_persistent_sources(
                 finally:
                     os.close(child_descriptor)
             elif stat.S_ISREG(metadata.st_mode):
-                if name.endswith(("-wal", "-shm")):
-                    base_name = name.rsplit("-", 1)[0]
-                    try:
-                        base_meta = os.stat(base_name, dir_fd=directory_descriptor, follow_symlinks=False)
-                    except FileNotFoundError:
-                        base_meta = None
-                    if base_meta is not None and stat.S_ISREG(base_meta.st_mode) and Path(base_name).suffix.lower() in {".db", ".sqlite", ".sqlite3"}:
-                        continue
+                if _sqlite_sidecar_is_excluded(directory_descriptor, name):
+                    continue
                 file_descriptor = os.open(name, os.O_RDONLY | _NOFOLLOW, dir_fd=directory_descriptor)
                 try:
                     opened = os.fstat(file_descriptor)
@@ -1359,22 +1714,60 @@ def finalize_backup(
     kind: str = SYSTEM_BACKUP_KIND,
     install_root: Optional[PathValue] = None,
     systemd_mask_state: Optional[Dict[str, object]] = None,
+    transaction_id: Optional[str] = None,
+    parent_backup_id: Optional[str] = None,
 ) -> Dict[str, object]:
     backup = _assert_no_symlink_components(backup_dir)
-    if kind not in {SYSTEM_BACKUP_KIND, WEB_SNAPSHOT_KIND}:
+    if kind not in {SYSTEM_BACKUP_KIND, WEB_SNAPSHOT_KIND, QUIESCED_OVERLAY_KIND}:
         raise BackupIntegrityError("Ungueltige Backup-Art: {}".format(kind))
-    mapped = {str(item["backup_path"]): dict(item) for item in mapped_entries}
+    mapped_entries_list = [dict(item) for item in mapped_entries]
+    source_records_list = [dict(item) for item in source_records]
+    mapped = {str(item["backup_path"]): item for item in mapped_entries_list}
+    if len(mapped) != len(mapped_entries_list):
+        raise BackupIntegrityError("Manifestzuordnung enthält doppelte Backuppfade")
+    if kind == QUIESCED_OVERLAY_KIND:
+        overlay_transaction_id = _normalized_transaction_id(transaction_id)
+        overlay_parent_backup_id = _normalized_backup_id(
+            parent_backup_id,
+            label="Parent-Backup-ID",
+        )
+        if install_root is None:
+            raise BackupIntegrityError(
+                "Quiesced-Overlay besitzt keinen gebundenen Installationspfad"
+            )
+        overlay_install_root = _lexical_absolute(install_root)
+        if not source_records_list:
+            raise BackupIntegrityError(
+                "Quiesced-Overlay besitzt keinen manifestierten Quellumfang"
+            )
+        if systemd_mask_state is not None:
+            raise BackupIntegrityError(
+                "Quiesced-Overlay darf keinen systemd-Maskenzustand enthalten"
+            )
+    else:
+        if transaction_id is not None or parent_backup_id is not None:
+            raise BackupIntegrityError(
+                "Transaktionsbindung ist ausschließlich für Quiesced-Overlays zulässig"
+            )
+        overlay_transaction_id = None
+        overlay_parent_backup_id = None
+        overlay_install_root = None
     files = _scan_backup_files(backup)
-    if not files:
+    if not files and kind != QUIESCED_OVERLAY_KIND:
         raise BackupIntegrityError("Leeres Backup ist nicht zulaessig.")
     manifest_files: List[Dict[str, object]] = []
     for path in files:
         relative = path.relative_to(backup).as_posix()
         mapping = mapped.get(relative, {})
+        entry_size = mapping.get("size")
+        entry_sha = mapping.get("sha256")
+        if entry_size is None or entry_sha is None:
+            entry_size = path.stat().st_size
+            entry_sha = sha256_file(path)
         manifest_files.append({
             "path": relative,
-            "size": path.stat().st_size,
-            "sha256": sha256_file(path),
+            "size": int(entry_size),
+            "sha256": str(entry_sha),
             "mode": int(mapping.get("restore_mode", stat.S_IMODE(path.stat().st_mode))),
             "uid": int(mapping.get("restore_uid", path.stat().st_uid)),
             "gid": int(mapping.get("restore_gid", path.stat().st_gid)),
@@ -1392,12 +1785,20 @@ def finalize_backup(
         "schema": MANIFEST_SCHEMA if systemd_mask_state is not None else LEGACY_MANIFEST_SCHEMA,
         "kind": kind,
         "state": "complete",
-        "backup_id": str(uuid.uuid4()),
+        # Neue Transaktionsreceipts binden die ID als 256-Bit-Hexwert. Bereits
+        # vorhandene UUID-Manifeste bleiben in verify_backup kompatibel.
+        "backup_id": os.urandom(32).hex(),
         "created_utc": _datetime.datetime.now(_datetime.timezone.utc).isoformat(),
         "install_root": str(_lexical_absolute(install_root)) if install_root else None,
         "files": manifest_files,
-        "sources": list(source_records),
+        "sources": source_records_list,
     }
+    if kind == QUIESCED_OVERLAY_KIND:
+        manifest.update({
+            "transaction_id": overlay_transaction_id,
+            "parent_backup_id": overlay_parent_backup_id,
+            "install_root": str(overlay_install_root),
+        })
     if systemd_mask_state is not None:
         if kind != SYSTEM_BACKUP_KIND:
             raise BackupIntegrityError("Systemd-Maskenzustand ist nur für System-Backups zulässig")
@@ -1421,8 +1822,14 @@ def finalize_backup(
 def verify_backup(
     backup_dir: PathValue,
     expected_kind: Optional[str] = None,
+    expected_manifest_sha256: Optional[str] = None,
 ) -> Dict[str, object]:
     backup = _assert_no_symlink_components(backup_dir)
+    if (
+        expected_manifest_sha256 is not None
+        and not _SHA256_RE.fullmatch(str(expected_manifest_sha256))
+    ):
+        raise BackupIntegrityError("Erwartete Manifest-SHA-256 ist ungültig")
     manifest_path = backup / MANIFEST_NAME
     digest_path = backup / MANIFEST_DIGEST_NAME
     try:
@@ -1434,6 +1841,13 @@ def verify_backup(
         raise BackupIntegrityError("Manifest-Pruefsummendatei ist ungueltig.")
     if hashlib.sha256(manifest_bytes).hexdigest() != digest_text[0]:
         raise BackupIntegrityError("Manifest-Pruefsumme stimmt nicht.")
+    if (
+        expected_manifest_sha256 is not None
+        and digest_text[0] != str(expected_manifest_sha256)
+    ):
+        raise BackupIntegrityError(
+            "Manifest-Prüfsumme stimmt nicht mit dem Restore-Guard überein"
+        )
     try:
         manifest = json.loads(manifest_bytes.decode("utf-8"))
     except (UnicodeError, json.JSONDecodeError) as exc:
@@ -1446,14 +1860,36 @@ def verify_backup(
         MANIFEST_SCHEMA,
     }:
         raise BackupIntegrityError("Nicht unterstützte Backup-Manifestversion.")
-    if manifest.get("state") != "complete" or manifest.get("kind") not in {SYSTEM_BACKUP_KIND, WEB_SNAPSHOT_KIND}:
+    if manifest.get("state") != "complete" or manifest.get("kind") not in {
+        SYSTEM_BACKUP_KIND,
+        WEB_SNAPSHOT_KIND,
+        QUIESCED_OVERLAY_KIND,
+    }:
         raise BackupIntegrityError("Backup ist nicht als vollstaendig markiert.")
     if expected_kind and manifest.get("kind") != expected_kind:
         raise BackupIntegrityError("Backup-Art stimmt nicht: erwartet {}, ist {}".format(expected_kind, manifest.get("kind")))
     if not isinstance(manifest.get("backup_id"), str) or not manifest.get("backup_id"):
         raise BackupIntegrityError("Backup-ID fehlt.")
+    if manifest.get("kind") == QUIESCED_OVERLAY_KIND:
+        _normalized_backup_id(manifest.get("backup_id"))
+        _normalized_transaction_id(manifest.get("transaction_id"))
+        _normalized_backup_id(
+            manifest.get("parent_backup_id"),
+            label="Parent-Backup-ID",
+        )
+        if manifest.get("install_root") is None:
+            raise BackupIntegrityError(
+                "Quiesced-Overlay besitzt keinen gebundenen Installationspfad"
+            )
+        _lexical_absolute(str(manifest.get("install_root")))
+    elif "transaction_id" in manifest or "parent_backup_id" in manifest:
+        raise BackupIntegrityError(
+            "Nicht-Overlay-Manifest enthält eine unbeachtete Transaktionsbindung"
+        )
     entries = manifest.get("files")
-    if not isinstance(entries, list) or not entries:
+    if not isinstance(entries, list) or (
+        not entries and manifest.get("kind") != QUIESCED_OVERLAY_KIND
+    ):
         raise BackupIntegrityError("Leeres oder unvollstaendiges Backup-Manifest.")
     expected_paths: Set[str] = set()
     for entry in entries:
@@ -1485,7 +1921,9 @@ def verify_backup(
             if mode < 0 or mode > 0o7777 or uid < 0 or gid < 0:
                 raise BackupIntegrityError("Ungueltige Restore-Metadaten fuer {}".format(relative_text))
     sources = manifest.get("sources")
-    if not isinstance(sources, list):
+    if not isinstance(sources, list) or (
+        manifest.get("kind") == QUIESCED_OVERLAY_KIND and not sources
+    ):
         raise BackupIntegrityError("Manifest-Sources muessen eine Liste sein")
     for record in sources:
         if not isinstance(record, dict):
@@ -1531,6 +1969,179 @@ def verify_backup(
     elif "systemd_mask_state" in manifest:
         raise BackupIntegrityError("Web-Snapshot darf keinen systemd-Maskenzustand enthalten")
     return manifest
+
+
+def verified_manifest_sha256(
+    backup_dir: PathValue,
+    *,
+    expected_kind: Optional[str] = None,
+) -> str:
+    """Liefert die SHA-256 nur für ein zweimal stabil verifiziertes Manifest."""
+
+    backup = _assert_no_symlink_components(backup_dir)
+    first = _read_small_file_bytes(backup / MANIFEST_NAME, 16 * 1024 * 1024)
+    digest = hashlib.sha256(first).hexdigest()
+    verify_backup(
+        backup,
+        expected_kind=expected_kind,
+        expected_manifest_sha256=digest,
+    )
+    second = _read_small_file_bytes(backup / MANIFEST_NAME, 16 * 1024 * 1024)
+    if second != first:
+        raise BackupIntegrityError(
+            "Backup-Manifest driftete während der Vertragsbindung"
+        )
+    return digest
+
+
+def _validate_quiesced_overlay_restore_guard(
+    backup: Path,
+    manifest: Dict[str, object],
+    guard: QuiescedOverlayRestoreGuard,
+) -> None:
+    """Prüft Pfade, Inodes und beide Manifeste vor jeder Restore-Mutation."""
+
+    if not isinstance(guard, QuiescedOverlayRestoreGuard):
+        raise BackupIntegrityError(
+            "Quiesced-Overlay-Restore besitzt keinen expliziten Guard"
+        )
+    transaction_id = _normalized_transaction_id(guard.transaction_id)
+    overlay = _lexical_absolute(guard.overlay_dir)
+    install = _lexical_absolute(guard.install_root)
+    parent_backup = _lexical_absolute(guard.parent_backup_dir)
+    collection = _lexical_absolute(guard.collection_dir)
+    overlay_backup_id = _normalized_backup_id(guard.backup_id)
+    parent_backup_id = _normalized_backup_id(
+        guard.parent_backup_id,
+        label="Parent-Backup-ID",
+    )
+    for label, value in (
+        ("Overlay-Manifest-SHA-256", guard.manifest_sha256),
+        ("Parent-Manifest-SHA-256", guard.parent_backup_manifest_sha256),
+    ):
+        if not _SHA256_RE.fullmatch(str(value or "")):
+            raise BackupIntegrityError("{} ist ungültig".format(label))
+    for label, value in (
+        ("Overlay-Gerät", guard.overlay_dev),
+        ("Overlay-Inode", guard.overlay_ino),
+        ("Parent-Backup-Gerät", guard.parent_backup_dev),
+        ("Parent-Backup-Inode", guard.parent_backup_ino),
+        ("Backup-Root-Gerät", guard.collection_dev),
+        ("Backup-Root-Inode", guard.collection_ino),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise BackupIntegrityError("{} ist ungültig".format(label))
+    expected_name = ".{}.quiesced-{}".format(parent_backup.name, transaction_id)
+    if (
+        overlay != backup
+        or overlay.parent != collection
+        or parent_backup.parent != collection
+        or overlay.name != expected_name
+    ):
+        raise BackupIntegrityError(
+            "Quiesced-Overlay ist nicht an Parent-Backup und Transaktion gebunden"
+        )
+    if (
+        manifest.get("kind") != QUIESCED_OVERLAY_KIND
+        or str(manifest.get("transaction_id") or "") != transaction_id
+        or str(manifest.get("parent_backup_id") or "") != parent_backup_id
+        or str(manifest.get("backup_id") or "") != overlay_backup_id
+        or str(manifest.get("install_root") or "") != str(install)
+    ):
+        raise BackupIntegrityError(
+            "Quiesced-Overlay-Manifest widerspricht dem Restore-Guard"
+        )
+
+    validate_existing_backup_root(collection, install)
+    collection_descriptor = _open_root_controlled_backup_directory_chain(
+        collection,
+        leaf_mode=0o700,
+    )
+    parent_descriptor = None
+    overlay_descriptor = None
+    try:
+        collection_metadata = os.fstat(collection_descriptor)
+        if (collection_metadata.st_dev, collection_metadata.st_ino) != (
+            guard.collection_dev,
+            guard.collection_ino,
+        ):
+            raise BackupIntegrityError("Backup-Root-Inode driftete vor Restore")
+        parent_before = os.stat(
+            parent_backup.name,
+            dir_fd=collection_descriptor,
+            follow_symlinks=False,
+        )
+        overlay_before = os.stat(
+            overlay.name,
+            dir_fd=collection_descriptor,
+            follow_symlinks=False,
+        )
+        flags = os.O_RDONLY | _DIRECTORY | _NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        parent_descriptor = os.open(
+            parent_backup.name,
+            flags,
+            dir_fd=collection_descriptor,
+        )
+        overlay_descriptor = os.open(
+            overlay.name,
+            flags,
+            dir_fd=collection_descriptor,
+        )
+        parent_opened = os.fstat(parent_descriptor)
+        overlay_opened = os.fstat(overlay_descriptor)
+        if (
+            not stat.S_ISDIR(parent_opened.st_mode)
+            or not stat.S_ISDIR(overlay_opened.st_mode)
+            or (parent_before.st_dev, parent_before.st_ino)
+            != (parent_opened.st_dev, parent_opened.st_ino)
+            or (overlay_before.st_dev, overlay_before.st_ino)
+            != (overlay_opened.st_dev, overlay_opened.st_ino)
+            or (parent_opened.st_dev, parent_opened.st_ino)
+            != (guard.parent_backup_dev, guard.parent_backup_ino)
+            or (overlay_opened.st_dev, overlay_opened.st_ino)
+            != (guard.overlay_dev, guard.overlay_ino)
+        ):
+            raise BackupIntegrityError(
+                "Quiesced-Overlay- oder Parent-Backup-Inode driftete vor Restore"
+            )
+
+        parent_manifest = verify_backup(
+            parent_backup,
+            expected_kind=SYSTEM_BACKUP_KIND,
+            expected_manifest_sha256=guard.parent_backup_manifest_sha256,
+        )
+        if (
+            str(parent_manifest.get("backup_id") or "") != parent_backup_id
+            or str(parent_manifest.get("install_root") or "") != str(install)
+        ):
+            raise BackupIntegrityError(
+                "Parent-Backup widerspricht dem Quiesced-Overlay-Guard"
+            )
+        parent_after = os.stat(
+            parent_backup.name,
+            dir_fd=collection_descriptor,
+            follow_symlinks=False,
+        )
+        overlay_after = os.stat(
+            overlay.name,
+            dir_fd=collection_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            (parent_after.st_dev, parent_after.st_ino)
+            != (parent_opened.st_dev, parent_opened.st_ino)
+            or (overlay_after.st_dev, overlay_after.st_ino)
+            != (overlay_opened.st_dev, overlay_opened.st_ino)
+        ):
+            raise BackupIntegrityError(
+                "Quiesced-Overlay- oder Parent-Backup-Pfad driftete während der Prüfung"
+            )
+    finally:
+        if overlay_descriptor is not None:
+            os.close(overlay_descriptor)
+        if parent_descriptor is not None:
+            os.close(parent_descriptor)
+        os.close(collection_descriptor)
 
 
 def _read_small_file_bytes(path: PathValue, maximum: int) -> bytes:
@@ -2209,6 +2820,7 @@ def _remove_directory_tree_at(
 def restore_persistent_payload(
     backup_dir: PathValue,
     *,
+    expected_kind: str = SYSTEM_BACKUP_KIND,
     allowed_roots: Sequence[PathValue],
     allowed_files: Sequence[PathValue] = (),
     exchange_func=None,
@@ -2217,11 +2829,44 @@ def restore_persistent_payload(
     restored_payload_guard=None,
     restore_metadata_overrides=None,
     verified_manifest_guard=None,
+    overlay_restore_guard: Optional[QuiescedOverlayRestoreGuard] = None,
 ) -> int:
     """Restore one fd-bound transaction in the isolated single-thread updater."""
 
     backup = _assert_no_symlink_components(backup_dir)
-    manifest = verify_backup(backup, expected_kind=SYSTEM_BACKUP_KIND)
+    if expected_kind not in {
+        SYSTEM_BACKUP_KIND,
+        WEB_SNAPSHOT_KIND,
+        QUIESCED_OVERLAY_KIND,
+    }:
+        raise BackupIntegrityError("Restore verlangt eine bekannte Backup-Art")
+    if expected_kind == QUIESCED_OVERLAY_KIND:
+        if not isinstance(overlay_restore_guard, QuiescedOverlayRestoreGuard):
+            raise BackupIntegrityError(
+                "Quiesced-Overlay-Restore besitzt keinen expliziten Guard"
+            )
+        if not _SHA256_RE.fullmatch(str(overlay_restore_guard.manifest_sha256 or "")):
+            raise BackupIntegrityError(
+                "Quiesced-Overlay-Restore besitzt keine gültige Manifest-SHA-256"
+            )
+        expected_manifest_sha256 = overlay_restore_guard.manifest_sha256
+    else:
+        if overlay_restore_guard is not None:
+            raise BackupIntegrityError(
+                "Overlay-Restore-Guard ist nur für Quiesced-Overlays zulässig"
+            )
+        expected_manifest_sha256 = None
+    manifest = verify_backup(
+        backup,
+        expected_kind=expected_kind,
+        expected_manifest_sha256=expected_manifest_sha256,
+    )
+    if expected_kind == QUIESCED_OVERLAY_KIND:
+        _validate_quiesced_overlay_restore_guard(
+            backup,
+            manifest,
+            overlay_restore_guard,
+        )
     if verified_manifest_guard is not None:
         if not callable(verified_manifest_guard):
             raise BackupIntegrityError("Restore-Manifestguard ist nicht aufrufbar")
@@ -2247,6 +2892,19 @@ def restore_persistent_payload(
         raise BackupIntegrityError("Restore-Payloadguard ist nicht aufrufbar")
     roots = [_lexical_absolute(path) for path in allowed_roots]
     files = [_lexical_absolute(path) for path in allowed_files]
+    if expected_kind == QUIESCED_OVERLAY_KIND:
+        guarded_install = _lexical_absolute(overlay_restore_guard.install_root)
+        expected_roots = {
+            guarded_install / "data",
+            Path("/var/www/html/data"),
+            Path("/var/lib/e3dc-control"),
+            Path("/etc/e3dc-control"),
+        }
+        expected_files = {guarded_install / "e3dc.config.txt"}
+        if set(roots) != expected_roots or set(files) != expected_files:
+            raise BackupIntegrityError(
+                "Quiesced-Overlay-Restore besitzt keine exakte Ziel-Positivliste"
+            )
     cleanup_candidates, cleanup_directories = _exact_cleanup_candidates(manifest, roots, files)
     directory_entries = _manifest_directory_entries(manifest, roots, files)
     restorable_files = sum(
@@ -2434,7 +3092,7 @@ def restore_persistent_payload(
                 "placeholder_removed": False,
             })
 
-        if not staged:
+        if not staged and expected_kind != QUIESCED_OVERLAY_KIND:
             raise BackupIntegrityError("Backup enthaelt keine wiederherstellbaren Dateien.")
 
         try:

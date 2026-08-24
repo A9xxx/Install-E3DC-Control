@@ -240,6 +240,8 @@ def evaluate_session(
         and (
             real_charging
             or real_power_w > 50.0
+            or current_amp >= min_current
+            or cap >= min_current
         )
     )
 

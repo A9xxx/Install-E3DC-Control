@@ -10165,6 +10165,14 @@ def main():
                             if market_heatpump_active
                             else "price"
                         )
+                    elif (
+                        AUTO_MODE == 1
+                        and pv_temperature_demand
+                    ):
+                        heatpump_budget_demand_class = "pv_surplus"
+                        heatpump_budget_demand_target_c = (
+                            CONF_WWS if at_mittel > HEIZGRENZE_TEMP else CONF_HZ
+                        )
                     elif timer_ww_demand:
                         heatpump_budget_demand_class = (
                             "ww_timer_comfort"
@@ -10172,21 +10180,7 @@ def main():
                             else "ww_timer_eco"
                         )
                         heatpump_budget_demand_target_c = ww_timer_target_c
-                    elif (
-                        AUTO_MODE == 1
-                        and pv_temperature_demand
-                        and (
-                            (
-                                heat_policy_decision is not None
-                                and heat_policy_decision.target_state
-                                == heat_policy.TARGET_PV_SURPLUS
-                            )
-                            or (heatpump_budget_w is not None and heatpump_budget_w >= 1500)
-                            or heat_policy_budget_w >= 1500
-                            or central_heatpump_boost_permission_active
-                        )
-                    ):
-                        heatpump_budget_demand_class = "pv_surplus"
+
 
                     if (
                         heatpump_positive_signal_window.get("active") is True

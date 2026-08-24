@@ -2645,6 +2645,51 @@ def check_sudoers_permissions():
         )
     return issues
 
+
+def _print_update_readiness_blockers(readiness):
+    """Gibt jeden harten Endgate-Blocker mit Ziel und nächster Prüfung aus."""
+
+    if not isinstance(readiness, dict):
+        return
+    blockers = readiness.get("hard_blockers") or []
+    if not isinstance(blockers, list) or not blockers:
+        return
+
+    print(f"\n{RED}[ABBRUCH] E3DC-UPD-READINESS-BLOCKED{RESET}")
+    print("Was ist passiert: Die Rechteprojektion bestand ihr abschließendes Freigabegate nicht.")
+    print("Was läuft jetzt: Der Updater führt den gebundenen automatischen Rückfall aus.")
+    print("Betroffene Prüfungen:")
+    for index, blocker in enumerate(blockers, start=1):
+        if not isinstance(blocker, dict):
+            print(f"  {index}. Unlesbarer Readiness-Blocker")
+            continue
+        label = str(blocker.get("label") or "Unbenannte Prüfung").strip()
+        issue = str(blocker.get("issue") or "Prüfung ist nicht erfüllt").strip()
+        path = str(blocker.get("path") or "").strip()
+        status = str(blocker.get("status") or "").strip()
+        print(f"  {index}. {label}: {issue}")
+        if path:
+            print(f"     Datei/Unit: {path}")
+        if status:
+            print(f"     Zustand: {status}")
+        details = blocker.get("details")
+        if details not in (None, "", [], {}):
+            try:
+                encoded = json.dumps(details, ensure_ascii=False, sort_keys=True)
+            except (TypeError, ValueError):
+                encoded = str(details)
+            print(f"     Details: {encoded[:2000]}")
+
+    print("Lösung und Ziel:")
+    print("  Die oben genannte Datei oder Unit zuerst korrigieren; danach muss das Readiness-Gate 0 harte Blocker melden.")
+    print("Prüfen:")
+    print("  sudo /usr/sbin/visudo -cf /etc/sudoers")
+    print("  sudo systemctl status --no-pager e3dc-web-update.service")
+    next_step = str(readiness.get("next_step") or "").strip()
+    if next_step:
+        print(f"Danach: {next_step}")
+
+
 def fix_sudoers_permissions(issues, *, bound_privileged_preimages=None):
     """Erstellt oder korrigiert die Sudoers-Dateien für Web-Funktionen."""
     print("\n→ Richte Sudoers für Web-Funktionen ein…\n")
@@ -2685,6 +2730,7 @@ def fix_sudoers_permissions(issues, *, bound_privileged_preimages=None):
                 )
                 perm_logger.info("Sudoers ueber Web-Installer-Reparatur bereinigt.")
                 return True
+            _print_update_readiness_blockers(result.get("readiness"))
             print(f"{RED}FEHLER{RESET} Web-Installer-Reparatur meldet Fehler: {result.get('message', 'unbekannt')}")
             perm_logger.error("Web-Installer-Reparatur fehlgeschlagen: %s", result)
             return False

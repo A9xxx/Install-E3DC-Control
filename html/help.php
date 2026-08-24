@@ -115,7 +115,7 @@ $paths = getInstallPaths();
     <div class="container">
         <div class="d-flex justify-content-between align-items-center mb-4">
             <a href="index.php" class="nav-link-back"><i class="fas fa-arrow-left me-2"></i>Dashboard</a>
-            <span class="badge bg-success text-light">v5.4.4a Stable</span>
+            <span class="badge bg-success text-light">v5.4.4b Stable</span>
         </div>
         <h1 class="display-4 fw-bold">Hilfe & Support</h1>
         <p class="lead opacity-75">Häufige Fragen und Lösungen rund um E3DC-Control.</p>
@@ -134,7 +134,7 @@ $paths = getInstallPaths();
         <div class="col-12 faq-item" data-tags="docker image stable rollback update">
             <div class="card bg-card border-0 shadow-sm"><div class="card-body">
                 <h5 class="card-title"><span class="tag">Docker</span> Wie prüfe ich Image und Update?</h5>
-                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem geprüften Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.4a</code> in <code>.env</code> gesetzt.</p>
+                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem geprüften Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.4b</code> in <code>.env</code> gesetzt.</p>
                 <pre>cd "${E3DC_DOCKER_PATH:-$HOME/e3dc-docker}"
 if [ -f ./docker_compose_update.py ]; then
   E3DC_DOCKER_HELPER=./docker_compose_update.py
@@ -146,7 +146,7 @@ else
 fi
 sudo python3 "$E3DC_DOCKER_HELPER" --compose-dir . --sudo
 sudo docker compose logs --tail=80 e3dc-control</pre>
-                <p>Der Host-Helfer zieht das gewählte GHCR-Image ausdrücklich, bindet seine SHA-256-ID und OCI-Version vor dem Start, wartet auf den imagegebundenen Healthcheck und verlangt zwei identische Laufzeit-Snapshots. Scheitert Start, Warten, Snapshot oder Versionsabgleich, stoppt er den Kandidaten und bestätigt dessen Stillstand.</p>
+                <p>Der Host-Helfer prüft vor dem Pull mindestens 2 GiB freien Platz im DockerRootDir, zieht das gewählte GHCR-Image ausdrücklich und bindet seine SHA-256-ID sowie OCI-Version vor dem Start. Danach verlangt er den imagegebundenen Healthcheck und zwei identische Laufzeit-Snapshots. Scheitert Start, Warten, Snapshot oder Versionsabgleich, stoppt er den Kandidaten, stellt den belegten Ausgangsstand wieder her und bestätigt dessen Rückstart. Volumes werden nicht automatisch gelöscht.</p>
                 <p>Der nicht mehr gepflegte Watchtower ist wegen seines weitreichenden Docker-Socket-Zugriffs kein Standardstart. Für den bewussten Opt-in muss in <code>.env</code> zusätzlich <code>E3DC_WATCHTOWER_ENABLE=true</code> gesetzt und danach das Profil <code>auto-update</code> gestartet werden. Ohne das Label-Opt-in bleibt auch ein versehentlich gestarteter Watchtower wirkungslos.</p>
                 <p><strong>HA-Abgrenzung:</strong> Docker ist nur mit exakt <code>ha_mode=off</code> freigegeben. HA-Master/-Slave und Shadow bleiben Bare-Metal-Betriebsarten. Der Container projiziert den persistenten Instanzrollenanker create-once auf <code>off</code> und stoppt vor jedem Hardware-Writer, wenn Konfiguration und Anker nicht exakt passen. Beim ersten Wechsel einer nativen Installation verhindert ausschließlich der Installer-Menüpunkt <strong>31</strong> die Doppelsteuerung durch kontrolliertes Stoppen und Deaktivieren aller Host-Dienste. Zusätzlich werden manuelle Hardware-Writer und Legacy-Screens über zwei stabile <code>/proc</code>-Snapshots erkannt und blockieren die Migration; der Installer beendet sie nicht. Ein vorhandener E3DC-Container, eine vorhandene Compose-Datei oder bereits verwaltete E3DC-Docker-Daten stoppen diesen Migrationsweg vor der ersten Änderung; bestehende Docker-Installationen nutzen den Compose-Updateweg.</p>
                 <p>Der Docker-Rückfall erfolgt ausschließlich auf ein in der Update-Policy mit <code>docker_supported</code> freigegebenes Image. <code>v5.3.2b</code> ist nicht als Bare-Metal-Programm-Rückfall freigegeben.</p>
@@ -212,6 +212,26 @@ sudo docker compose logs --tail=80 e3dc-control</pre>
                         <li>Nach der Freigabe im Account den RESTful API Security Token erzeugen.</li>
                         <li>Im Config-Editor unter <em>Tarif</em> den ENTSO-E-Token als Fallback-Token eintragen und mit <em>ENTSO-E testen</em> prüfen.</li>
                     </ol>
+                </div>
+            </div>
+        </div>
+
+        <h4 class="mb-4 text-accent"><i class="fas fa-shield-halved me-2"></i>Stable 5.4.4b: universelles Update und klare Verbraucherbudgets</h4>
+        <div class="col-12 faq-item" data-tags="5.4.4b stable update bootstrap docker backup recovery wallbox predump waermepumpe pm direktvermarktung">
+            <div class="card bg-card border-0 shadow-sm">
+                <div class="card-body">
+                    <h5 class="card-title">
+                        <span class="tag">5.4.4b</span>
+                        Was enthält das Stable-Release 5.4.4b?
+                    </h5>
+                    <ul>
+                        <li><strong>Ein aktueller Ziel-Updater:</strong> Weboberfläche, Konsole, Installer-Menü und <code>e3dc-update-bootstrap</code> starten denselben Hintergrundauftrag. Eine laufende Einzelinstanz wird unabhängig von Benutzer- und Ordnernamen erkannt; mehrere gleichrangige Instanzen werden aufgelistet und nicht geraten.</li>
+                        <li><strong>Kurze Unterbrechung und belegter Rückweg:</strong> Zielcode und vollständiges Backup werden vor dem Writer-Stopp vorbereitet. Erst für die abschließende Projektion werden die Dienste gestoppt. Fehler nennen Ursache, Systemzustand und den nächsten sicheren Befehl.</li>
+                        <li><strong>Docker auf dem Host:</strong> Der Compose-Helfer prüft Image, Version, Start und Healthcheck. Scheitert der Kandidat, wird er gestoppt und der gebundene Ausgangsstand wiederhergestellt; <code>v5.3.2b</code> bleibt der unveränderte Docker-Rollback-Root.</li>
+                        <li><strong>Wallbox und Pre-Dump:</strong> Echter PV-Überschuss wird nicht durch ein kleineres Storage-Budget beschnitten. Pre-Dump autorisiert nur die getrennte zusätzliche Batterieentladung. Eine allein aktive openWB Pro kann mit 0,1 A regeln, und eine ausstehende Phasenempfehlung beendet die laufende Ladung nicht unnötig.</li>
+                        <li><strong>Wärmepumpe und Diagnose:</strong> <code>wp_type = 6</code> liest einen E3DC-Leistungsmesser nur bei vollständigen Verbraucherwerten. Erzeugung wird fail-closed abgewiesen. Das Dashboard zeigt fehlendes Wärmepumpen-Startbudget und seine Weitergabe verständlich an.</li>
+                        <li><strong>Direktvermarktung:</strong> Endkundentarife werden nicht als belastbare Direktvermarktungs-Marktpreise behandelt; ungeeignete Preisslots öffnen kein wirtschaftliches DV-Fenster.</li>
+                    </ul>
                 </div>
             </div>
         </div>

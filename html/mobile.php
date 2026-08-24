@@ -1580,7 +1580,6 @@ function updateDashboard() {
         && window.liveWsLastMessageTs
         && (Date.now() - window.liveWsLastMessageTs) < 5000;
     if (wsFresh) return Promise.resolve(null);
-    if (document.getElementById('m-flow-wrapper') == null) return Promise.resolve(null);
     if (mobileLiveFetchPromise) return mobileLiveFetchPromise;
 
     const requestGeneration = ++mobileLiveRequestGeneration;

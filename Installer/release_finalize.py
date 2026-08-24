@@ -31,6 +31,7 @@ if __name__ == "__main__":
 import argparse
 import fcntl
 import hashlib
+import importlib.util
 import inspect
 import json
 import os
@@ -56,7 +57,15 @@ _FINALIZER_FILES = (
     "Installer/git_commit_reader.py",
     "Installer/optional_service_contract.py",
     "Installer/release_finalize.py",
+    "Installer/secure_file_transaction.py",
     "Installer/update.py",
+    "Installer/update_legacy_forward.py",
+    "Installer/update_legacy_safety.py",
+    "Installer/update_offline_preflight.py",
+    "Installer/update_prejournal_construction.py",
+    "Installer/update_recovery_context.py",
+    "Installer/update_recovery_journal.py",
+    "Installer/update_recovery_surface.py",
 )
 _SNAPSHOT_MAX_FILES = 4096
 _SNAPSHOT_MAX_FILE_BYTES = 8 * 1024 * 1024
@@ -74,8 +83,11 @@ _UPDATE_LOCK_PATH = Path("/run/lock/e3dc-control/update.lock")
 _UPDATE_LOCK_ENV = "E3DC_UPDATE_LOCK_FD"
 _UPDATE_SAFETY_RECEIPT_PATH = Path("/var/lib/e3dc-update-safety/transaction.json")
 _UPDATE_SAFETY_MARKER_PATH = "/var/lib/e3dc-update-safety/recovery.block"
-_UPDATE_SAFETY_SCHEMA = "e3dc_update_safety_v1"
+_UPDATE_SAFETY_SCHEMA = "e3dc_update_safety_v2"
 _UPDATE_FINALIZER_INVOCATION_ENV = "E3DC_UPDATE_FINALIZER_INVOCATION_ID"
+_UPDATE_FINALIZER_UNIT_PREFIX = "e3dc-update-finalizer-"
+_UPDATE_FINALIZER_RUNTIME_SUFFIX = "-runtime"
+_UPDATE_FINALIZER_TOKEN_NAME = "start.token"
 _COMMIT_READER_PATH = "Installer/git_commit_reader.py"
 _FULL_SHA1_RE = re.compile(r"[0-9a-f]{40}\Z")
 _ACCOUNT_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]*\Z")
@@ -1718,8 +1730,189 @@ def _bind_compat_bridge_snapshot(
         )
 
 
+def _take_exact_arg(argv: list[str], cursor: int, name: str) -> tuple[str, int]:
+    if cursor + 1 >= len(argv) or argv[cursor] != name:
+        raise RuntimeError(f"Legacy-v1-Aufruf fehlt an fester Position: {name}")
+    value = argv[cursor + 1]
+    return value, cursor + 2
+
+
+def _parse_exact_legacy_v1_finalizer_argv(argv: list[str]) -> argparse.Namespace:
+    """Parst ausschließlich die in v5.4.4/v5.4.4a erzeugte innere Reihenfolge."""
+
+    cursor = 0
+    values: dict[str, object] = {}
+    pairs = (
+        ("install_path", "--install-path"),
+        ("expected_release_sha", "--expected-release-sha"),
+        ("expected_release_tag", "--expected-release-tag"),
+        ("expected_ha_role", "--expected-ha-role"),
+        ("expected_config_state", "--expected-config-state"),
+        ("expected_config_sha256", "--expected-config-sha256"),
+        ("expected_units_sha256", "--expected-units-sha256"),
+        ("expected_legacy_activity", "--expected-legacy-activity"),
+        ("expected_venv_state", "--expected-venv-state"),
+        ("expected_venv_path", "--expected-venv-path"),
+    )
+    for attribute, flag in pairs:
+        values[attribute], cursor = _take_exact_arg(argv, cursor, flag)
+    explicit_download_bootstrap = False
+    if cursor < len(argv) and argv[cursor] == "--explicit-download-bootstrap":
+        explicit_download_bootstrap = True
+        cursor += 1
+    safety_pairs = (
+        ("update_safety_transaction", "--update-safety-transaction"),
+        ("update_safety_receipt_sha256", "--update-safety-receipt-sha256"),
+        ("update_safety_service_unit", "--update-safety-service-unit"),
+        ("update_safety_runtime_directory", "--update-safety-runtime-directory"),
+        ("update_safety_token_path", "--update-safety-token-path"),
+    )
+    for attribute, flag in safety_pairs:
+        values[attribute], cursor = _take_exact_arg(argv, cursor, flag)
+    if cursor != len(argv):
+        raise RuntimeError("Legacy-v1-Finalizerargv enthält zusätzliche Parameter")
+
+    install_path = str(values["install_path"])
+    release_sha = str(values["expected_release_sha"])
+    release_tag = str(values["expected_release_tag"])
+    role = str(values["expected_ha_role"])
+    transaction = str(values["update_safety_transaction"])
+    receipt_sha = str(values["update_safety_receipt_sha256"])
+    expected_unit = f"{_UPDATE_FINALIZER_UNIT_PREFIX}{transaction}.service"
+    expected_runtime = (
+        f"{_UPDATE_FINALIZER_UNIT_PREFIX}{transaction}"
+        f"{_UPDATE_FINALIZER_RUNTIME_SUFFIX}"
+    )
+    expected_token = f"/run/{expected_runtime}/{_UPDATE_FINALIZER_TOKEN_NAME}"
+    venv_state = str(values["expected_venv_state"])
+    venv_path = str(values["expected_venv_path"])
+    if (
+        not install_path
+        or not os.path.isabs(install_path)
+        or os.path.abspath(install_path) != install_path
+        or not _FULL_SHA1_RE.fullmatch(release_sha)
+        or not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+[a-z]?", release_tag)
+        or role not in {"off", "master", "slave", "shadow"}
+        or values["expected_config_state"] not in {"present", "missing"}
+        or not re.fullmatch(r"[0-9a-f]{64}", str(values["expected_config_sha256"]))
+        or not re.fullmatch(r"[0-9a-f]{64}", str(values["expected_units_sha256"]))
+        or values["expected_legacy_activity"]
+        not in {"absent", "active", "inactive", "failed"}
+        or venv_state not in {"present", "missing", "unused"}
+        or (
+            venv_state == "unused"
+            and venv_path != ""
+        )
+        or (
+            venv_state != "unused"
+            and (
+                not venv_path
+                or not os.path.isabs(venv_path)
+                or os.path.abspath(venv_path) != venv_path
+            )
+        )
+        or not re.fullmatch(r"[0-9a-f]{64}", transaction)
+        or not re.fullmatch(r"[0-9a-f]{64}", receipt_sha)
+        or values["update_safety_service_unit"] != expected_unit
+        or values["update_safety_runtime_directory"] != expected_runtime
+        or values["update_safety_token_path"] != expected_token
+    ):
+        raise RuntimeError("Legacy-v1-Finalizerargv verletzt den veröffentlichten Vertrag")
+    values["explicit_download_bootstrap"] = explicit_download_bootstrap
+    return argparse.Namespace(**values)
+
+
+def _parse_exact_legacy_v1_wrapper_argv(argv: list[str]) -> argparse.Namespace:
+    """Erkennt byteförmig nur den veröffentlichten v5.4.4/v5.4.4a-Wrapper."""
+
+    if not argv or argv[0] != "--systemd-finalizer-wrapper":
+        raise RuntimeError("Legacy-v1-Wrappermarker fehlt")
+    cursor = 1
+    values: dict[str, object] = {"systemd_finalizer_wrapper": True}
+    outer_pairs = (
+        ("install_path", "--install-path"),
+        ("execution_root", "--execution-root"),
+        ("expected_release_sha", "--expected-release-sha"),
+        ("expected_install_user", "--expected-install-user"),
+        ("update_safety_transaction", "--update-safety-transaction"),
+        ("update_safety_receipt_sha256", "--update-safety-receipt-sha256"),
+        ("update_safety_service_unit", "--update-safety-service-unit"),
+        ("update_safety_runtime_directory", "--update-safety-runtime-directory"),
+        ("update_safety_token_path", "--update-safety-token-path"),
+        ("expected_lock_device", "--expected-lock-device"),
+        ("expected_lock_inode", "--expected-lock-inode"),
+    )
+    for attribute, flag in outer_pairs:
+        values[attribute], cursor = _take_exact_arg(argv, cursor, flag)
+    if cursor >= len(argv) or argv[cursor] != "--":
+        raise RuntimeError("Legacy-v1-Wrapper besitzt keine exakte argv-Grenze")
+    inner_argv = argv[cursor + 1 :]
+    inner = _parse_exact_legacy_v1_finalizer_argv(inner_argv)
+
+    transaction = str(values["update_safety_transaction"])
+    expected_unit = f"{_UPDATE_FINALIZER_UNIT_PREFIX}{transaction}.service"
+    expected_runtime = (
+        f"{_UPDATE_FINALIZER_UNIT_PREFIX}{transaction}"
+        f"{_UPDATE_FINALIZER_RUNTIME_SUFFIX}"
+    )
+    expected_token = f"/run/{expected_runtime}/{_UPDATE_FINALIZER_TOKEN_NAME}"
+    install_path = str(values["install_path"])
+    execution_root = str(values["execution_root"])
+    install_user = str(values["expected_install_user"])
+    try:
+        lock_device = int(str(values["expected_lock_device"]), 10)
+        lock_inode = int(str(values["expected_lock_inode"]), 10)
+    except ValueError as exc:
+        raise RuntimeError("Legacy-v1-Wrapper besitzt ungültige Lock-Inodes") from exc
+    if (
+        not install_path
+        or not os.path.isabs(install_path)
+        or os.path.abspath(install_path) != install_path
+        or not execution_root
+        or not os.path.isabs(execution_root)
+        or os.path.abspath(execution_root) != execution_root
+        or not _FULL_SHA1_RE.fullmatch(str(values["expected_release_sha"]))
+        or not _ACCOUNT_NAME_RE.fullmatch(install_user)
+        or not re.fullmatch(r"[0-9a-f]{64}", transaction)
+        or not re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(values["update_safety_receipt_sha256"]),
+        )
+        or values["update_safety_service_unit"] != expected_unit
+        or values["update_safety_runtime_directory"] != expected_runtime
+        or values["update_safety_token_path"] != expected_token
+        or lock_device < 0
+        or lock_inode <= 0
+        or inner.install_path != install_path
+        or inner.expected_release_sha != values["expected_release_sha"]
+        or inner.update_safety_transaction != transaction
+        or inner.update_safety_receipt_sha256
+        != values["update_safety_receipt_sha256"]
+        or inner.update_safety_service_unit != expected_unit
+        or inner.update_safety_runtime_directory != expected_runtime
+        or inner.update_safety_token_path != expected_token
+    ):
+        raise RuntimeError("Legacy-v1-Wrapper und innerer Finalizervertrag widersprechen sich")
+    values["expected_lock_device"] = lock_device
+    values["expected_lock_inode"] = lock_inode
+    values["finalizer_argv"] = inner_argv
+    values["legacy_v1_active_forward_wrapper"] = True
+    values["legacy_v1_inner"] = inner
+    return argparse.Namespace(**values)
+
+
 def _parse_args() -> argparse.Namespace:
+    argv = sys.argv[1:]
     if "--systemd-finalizer-wrapper" in sys.argv[1:]:
+        current_wrapper_only = {
+            "--static-recovery-contract-json",
+            "--expected-recovery-journal-sha256",
+            "--expected-recovery-journal-device",
+            "--expected-recovery-journal-inode",
+            "--expected-recovery-journal-phase",
+        }
+        if not current_wrapper_only.intersection(argv):
+            return _parse_exact_legacy_v1_wrapper_argv(argv)
         parser = argparse.ArgumentParser(
             description="E3DC-Control systemd-Finalizer-Wrapper"
         )
@@ -1729,12 +1922,25 @@ def _parse_args() -> argparse.Namespace:
         parser.add_argument("--expected-release-sha", required=True)
         parser.add_argument("--expected-install-user", required=True)
         parser.add_argument("--update-safety-transaction", required=True)
-        parser.add_argument("--update-safety-receipt-sha256", required=True)
+        parser.add_argument("--update-safety-receipt-sha256", default="")
         parser.add_argument("--update-safety-service-unit", required=True)
         parser.add_argument("--update-safety-runtime-directory", required=True)
         parser.add_argument("--update-safety-token-path", required=True)
+        parser.add_argument("--static-recovery-contract-json", default="")
         parser.add_argument("--expected-lock-device", required=True, type=int)
         parser.add_argument("--expected-lock-inode", required=True, type=int)
+        parser.add_argument("--expected-recovery-journal-sha256", required=True)
+        parser.add_argument(
+            "--expected-recovery-journal-device", required=True, type=int
+        )
+        parser.add_argument(
+            "--expected-recovery-journal-inode", required=True, type=int
+        )
+        parser.add_argument(
+            "--expected-recovery-journal-phase",
+            required=True,
+            choices=("product_mutating",),
+        )
         parser.add_argument("finalizer_argv", nargs=argparse.REMAINDER)
         return parser.parse_args()
 
@@ -1776,6 +1982,78 @@ def _parse_args() -> argparse.Namespace:
         )
         return parser.parse_args()
 
+    if argv[:1] == ["--legacy-v1-active-forward"]:
+        if len(argv) < 6:
+            raise RuntimeError("Interner Legacy-v1-Forward-Handoff ist unvollständig")
+        try:
+            receipt_device = int(argv[2], 10)
+            receipt_inode = int(argv[4], 10)
+        except ValueError as exc:
+            raise RuntimeError("Interner Legacy-v1-Receipt-Inode ist ungültig") from exc
+        if (
+            argv[1] != "--legacy-v1-receipt-device"
+            or argv[3] != "--legacy-v1-receipt-inode"
+            or receipt_device < 0
+            or receipt_inode <= 0
+            or argv[5] != "--"
+        ):
+            raise RuntimeError("Interner Legacy-v1-Forward-Handoff driftete")
+        parsed = _parse_exact_legacy_v1_finalizer_argv(argv[6:])
+        parsed.legacy_v1_active_forward = True
+        parsed.legacy_v1_receipt_device = receipt_device
+        parsed.legacy_v1_receipt_inode = receipt_inode
+        return parsed
+
+    # Veröffentlichte Updater vor dem nativen Ziel-Updater-Handoff kennen
+    # die zielversionsspezifischen Paket-/Apache-Verträge noch nicht. Sie
+    # dürfen dafür weder Leerwerte erfinden noch den neuen Target-Finalizer
+    # direkt betreten: Der aktuelle, bereits heruntergeladene Ziel-Updater
+    # muss Backup, Preimages, Aktorruhe und die gesamte Transaktion selbst
+    # erfassen. Nur die exakt alte, vollständig paket-/apachefreie argv-Form
+    # wird deshalb als einmaliger Generationswechsel erkannt. Sobald auch nur
+    # ein neuer Pflichtparameter vorkommt, greift unten der strikte aktuelle
+    # Parser und weist jeden unvollständigen Mischvertrag ab.
+    target_owned_contract_args = {
+        # Das alte argv-JSON bleibt ausschließlich ein Mischaufruf-Detektor.
+        # Es wird weder geparst noch in den aktuellen Finalizer übernommen.
+        "--expected-package-state-json",
+        "--expected-package-receipt-sha256",
+        "--expected-package-receipt-device",
+        "--expected-package-receipt-inode",
+        "--expected-package-full-backup-id",
+        "--expected-recovery-journal-sha256",
+        "--expected-recovery-journal-device",
+        "--expected-recovery-journal-inode",
+        "--expected-recovery-journal-phase",
+        "--expected-apache-available",
+        "--expected-apache-active",
+        "--expected-apache-unit-file-state",
+    }
+    if not target_owned_contract_args.intersection(argv):
+        parser = argparse.ArgumentParser(
+            description="E3DC-Control Legacy-Ziel-Updater-Brücke"
+        )
+        parser.set_defaults(legacy_target_updater_bridge=True)
+        parser.add_argument("--install-path", required=True)
+        parser.add_argument("--expected-release-sha", required=True)
+        parser.add_argument("--expected-release-tag", required=True)
+        parser.add_argument(
+            "--expected-ha-role",
+            required=True,
+            choices=("off", "master", "slave", "shadow"),
+        )
+        parser.add_argument("--expected-config-state", required=True)
+        parser.add_argument("--expected-config-sha256", required=True)
+        parser.add_argument("--expected-units-sha256", required=True)
+        parser.add_argument("--expected-legacy-activity", required=True)
+        parser.add_argument(
+            "--expected-venv-state",
+            required=True,
+            choices=("present", "missing", "unused"),
+        )
+        parser.add_argument("--expected-venv-path", required=True)
+        return parser.parse_args()
+
     parser = argparse.ArgumentParser(description="E3DC-Control Release-Finalizer")
     parser.add_argument("--install-path", required=True)
     parser.add_argument("--expected-release-sha", required=True)
@@ -1791,6 +2069,42 @@ def _parse_args() -> argparse.Namespace:
         choices=("present", "missing", "unused"),
     )
     parser.add_argument("--expected-venv-path", required=True)
+    parser.add_argument("--expected-package-receipt-sha256", required=True)
+    parser.add_argument(
+        "--expected-package-receipt-device",
+        required=True,
+        type=int,
+    )
+    parser.add_argument(
+        "--expected-package-receipt-inode",
+        required=True,
+        type=int,
+    )
+    parser.add_argument("--expected-package-full-backup-id", required=True)
+    parser.add_argument("--expected-recovery-journal-sha256", required=True)
+    parser.add_argument(
+        "--expected-recovery-journal-device", required=True, type=int
+    )
+    parser.add_argument(
+        "--expected-recovery-journal-inode", required=True, type=int
+    )
+    parser.add_argument(
+        "--expected-recovery-journal-phase",
+        required=True,
+        choices=("product_mutating",),
+    )
+    parser.add_argument(
+        "--expected-apache-available",
+        required=True,
+        choices=("0", "1"),
+    )
+    parser.add_argument(
+        "--expected-apache-active",
+        required=True,
+        choices=("0", "1"),
+    )
+    parser.add_argument("--expected-apache-unit-file-state", required=True)
+    parser.add_argument("--static-recovery-contract-json", default="")
     parser.add_argument("--update-safety-transaction", default="")
     parser.add_argument("--update-safety-receipt-sha256", default="")
     parser.add_argument("--update-safety-service-unit", default="")
@@ -1841,6 +2155,7 @@ def _bind_wrapper_receipt(args: argparse.Namespace) -> None:
             "transaction_id",
             "target",
             "backup",
+            "apache",
             "bootblock",
             "finalizer",
         }
@@ -1849,6 +2164,7 @@ def _bind_wrapper_receipt(args: argparse.Namespace) -> None:
     finalizer = record.get("finalizer") if isinstance(record, dict) else None
     target = record.get("target") if isinstance(record, dict) else None
     backup = record.get("backup") if isinstance(record, dict) else None
+    apache = record.get("apache") if isinstance(record, dict) else None
     bootblock = record.get("bootblock") if isinstance(record, dict) else None
     units = bootblock.get("units") if isinstance(bootblock, dict) else None
     created = bootblock.get("created_directories") if isinstance(bootblock, dict) else None
@@ -1865,10 +2181,13 @@ def _bind_wrapper_receipt(args: argparse.Namespace) -> None:
         not isinstance(finalizer, dict)
         or not isinstance(target, dict)
         or not isinstance(backup, dict)
+        or not isinstance(apache, dict)
         or not isinstance(bootblock, dict)
         or set(finalizer) != {"unit", "runtime_directory", "token_path"}
         or set(target) != {"commit", "tag", "role"}
         or set(backup) != {"dir", "dev", "ino", "id", "manifest_sha256"}
+        or set(apache)
+        != {"completion_required", "available", "was_active", "unit_file_state"}
         or set(bootblock)
         != {
             "units",
@@ -1890,6 +2209,26 @@ def _bind_wrapper_receipt(args: argparse.Namespace) -> None:
         or int(backup.get("ino", 0)) <= 0
         or not str(backup.get("id") or "")
         or not re.fullmatch(r"[0-9a-f]{64}", str(backup.get("manifest_sha256") or ""))
+        or apache.get("completion_required") is not True
+        or not isinstance(apache.get("available"), bool)
+        or not isinstance(apache.get("was_active"), bool)
+        or (apache.get("was_active") and not apache.get("available"))
+        or (
+            not apache.get("available")
+            and (
+                apache.get("was_active")
+                or apache.get("unit_file_state") != "absent"
+            )
+        )
+        or (
+            apache.get("available")
+            and apache.get("unit_file_state")
+            not in {
+                "enabled", "enabled-runtime", "disabled", "static", "indirect",
+                "masked", "masked-runtime", "generated", "transient", "alias",
+                "linked", "linked-runtime",
+            }
+        )
         or not isinstance(units, list)
         or not units
         or len(units) != len(set(units))
@@ -1917,6 +2256,147 @@ def _bind_wrapper_receipt(args: argparse.Namespace) -> None:
         or finalizer.get("token_path") != args.update_safety_token_path
     ):
         raise RuntimeError("Systemd-Wrapper-Receipt widerspricht seinem argv-Vertrag")
+
+
+def _load_bound_legacy_safety_codec(execution_root: Path):
+    """Lädt nur den bereits snapshotgebundenen reinen v1-Decoder."""
+
+    path = execution_root / "Installer" / "update_legacy_safety.py"
+    metadata = path.lstat()
+    if (
+        path.is_symlink()
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or stat.S_IMODE(metadata.st_mode) != 0o444
+    ):
+        raise RuntimeError("Legacy-Safety-Decoder besitzt unsichere Snapshotmetadaten")
+    module_name = "_e3dc_bound_legacy_safety_codec"
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("Legacy-Safety-Decoder ist nicht ladbar")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(module_name, None)
+        raise
+    if (
+        Path(os.path.abspath(str(getattr(module, "__file__", "")))) != path
+        or getattr(module, "LEGACY_UPDATE_SAFETY_SCHEMA", "")
+        != "e3dc_update_safety_v1"
+        or not callable(getattr(module, "parse_active_legacy_forward_receipt", None))
+    ):
+        raise RuntimeError("Legacy-Safety-Decoder driftete vom Ziel-Snapshot")
+    return module
+
+
+def _bind_legacy_v1_forward_wrapper_receipt(
+    args: argparse.Namespace,
+    execution_root: Path,
+) -> tuple[object, os.stat_result]:
+    path = _UPDATE_SAFETY_RECEIPT_PATH
+    _assert_root_controlled_directory_chain(path.parent)
+    metadata = path.lstat()
+    if (
+        path.is_symlink()
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+    ):
+        raise RuntimeError("Legacy-v1-Wrapper-Receipt besitzt unsichere Metadaten")
+    payload = _read_regular_nofollow(path, maximum=256 * 1024)
+    if hashlib.sha256(payload).hexdigest() != args.update_safety_receipt_sha256:
+        raise RuntimeError("Legacy-v1-Wrapper-Receipt driftete vom Parent-Digest")
+    codec = _load_bound_legacy_safety_codec(execution_root)
+    inner = args.legacy_v1_inner
+    receipt = codec.parse_active_legacy_forward_receipt(
+        payload,
+        expected_target_commit=args.expected_release_sha,
+        expected_target_tag=inner.expected_release_tag,
+    )
+    if (
+        receipt.state != "pending"
+        or receipt.transaction_id != args.update_safety_transaction
+        or receipt.target_commit != args.expected_release_sha
+        or receipt.target_tag != inner.expected_release_tag
+        or receipt.role != inner.expected_ha_role
+        or receipt.finalizer_unit != args.update_safety_service_unit
+        or receipt.runtime_directory != args.update_safety_runtime_directory
+        or receipt.token_path != args.update_safety_token_path
+        or receipt.receipt_sha256 != args.update_safety_receipt_sha256
+    ):
+        raise RuntimeError("Legacy-v1-Wrapper-Receipt widerspricht seinem argv-Vertrag")
+    return receipt, metadata
+
+
+def _bind_wrapper_static_recovery_contract(args: argparse.Namespace) -> None:
+    """Bindet die statische Bootblocklease ohne ein dynamisches Backup-Receipt."""
+
+    raw = str(args.static_recovery_contract_json or "")
+    if not raw or len(raw.encode("utf-8")) > 128 * 1024:
+        raise RuntimeError("Systemd-Wrapper besitzt keinen statischen Bootblockvertrag")
+    try:
+        record = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Statischer Wrapper-Bootblockvertrag ist kein JSON") from exc
+    canonical = json.dumps(
+        record,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    units = record.get("units") if isinstance(record, dict) else None
+    created = record.get("created_directories") if isinstance(record, dict) else None
+    identities = record.get("dropin_identities") if isinstance(record, dict) else None
+    transaction_id = str(record.get("transaction_id") or "") if isinstance(record, dict) else ""
+    expected_unit = f"{_UPDATE_FINALIZER_UNIT_PREFIX}{transaction_id}.service"
+    expected_runtime = (
+        f"{_UPDATE_FINALIZER_UNIT_PREFIX}{transaction_id}"
+        f"{_UPDATE_FINALIZER_RUNTIME_SUFFIX}"
+    )
+    expected_token = f"/run/{expected_runtime}/{_UPDATE_FINALIZER_TOKEN_NAME}"
+    if (
+        not isinstance(record, dict)
+        or set(record)
+        != {"created_directories", "dropin_identities", "transaction_id", "units"}
+        or canonical != raw
+        or not re.fullmatch(r"[0-9a-f]{64}", transaction_id)
+        or transaction_id != args.update_safety_transaction
+        or not isinstance(units, list)
+        or not units
+        or len(units) != len(set(units))
+        or any(
+            not re.fullmatch(r"[A-Za-z0-9_.@-]+\.service", str(unit))
+            for unit in units
+        )
+        or not isinstance(created, list)
+        or len(created) != len(set(created))
+        or not set(created).issubset(set(units))
+        or not isinstance(identities, list)
+        or len(identities) != len(units)
+        or {
+            str(item[0])
+            for item in identities
+            if isinstance(item, list)
+            and len(item) == 3
+            and isinstance(item[1], int)
+            and isinstance(item[2], int)
+            and item[1] >= 0
+            and item[2] > 0
+        }
+        != set(units)
+        or args.update_safety_service_unit != expected_unit
+        or args.update_safety_runtime_directory != expected_runtime
+        or args.update_safety_token_path != expected_token
+    ):
+        raise RuntimeError(
+            "Statischer Wrapper-Bootblockvertrag widerspricht seiner Finalizerlease"
+        )
 
 
 def _wrapper_systemd_properties(args: argparse.Namespace) -> tuple[str, str]:
@@ -2039,7 +2519,16 @@ def _run_systemd_finalizer_wrapper(args: argparse.Namespace) -> int:
         raise RuntimeError("Systemd-Wrapper-Ausführungssnapshot driftete")
     _bind_execution_snapshot(execution_root, root, args.expected_release_sha)
     system_python = _trusted_system_python()
-    _bind_wrapper_receipt(args)
+    dynamic_contract = bool(args.update_safety_receipt_sha256)
+    static_contract = bool(args.static_recovery_contract_json)
+    if dynamic_contract == static_contract:
+        raise RuntimeError(
+            "Systemd-Wrapper benötigt genau einen dynamischen oder statischen Vertrag"
+        )
+    if dynamic_contract:
+        _bind_wrapper_receipt(args)
+    else:
+        _bind_wrapper_static_recovery_contract(args)
     invocation, _control_group = _wrapper_systemd_properties(args)
 
     lock_fd = fcntl.fcntl(0, fcntl.F_DUPFD, 10)
@@ -2069,12 +2558,31 @@ def _run_systemd_finalizer_wrapper(args: argparse.Namespace) -> int:
         required_pairs = {
             "--install-path": str(root),
             "--expected-release-sha": args.expected_release_sha,
-            "--update-safety-transaction": args.update_safety_transaction,
-            "--update-safety-receipt-sha256": args.update_safety_receipt_sha256,
-            "--update-safety-service-unit": args.update_safety_service_unit,
-            "--update-safety-runtime-directory": args.update_safety_runtime_directory,
-            "--update-safety-token-path": args.update_safety_token_path,
+            "--expected-recovery-journal-sha256": (
+                args.expected_recovery_journal_sha256
+            ),
+            "--expected-recovery-journal-device": str(
+                args.expected_recovery_journal_device
+            ),
+            "--expected-recovery-journal-inode": str(
+                args.expected_recovery_journal_inode
+            ),
+            "--expected-recovery-journal-phase": (
+                args.expected_recovery_journal_phase
+            ),
         }
+        if dynamic_contract:
+            required_pairs.update({
+                "--update-safety-transaction": args.update_safety_transaction,
+                "--update-safety-receipt-sha256": args.update_safety_receipt_sha256,
+                "--update-safety-service-unit": args.update_safety_service_unit,
+                "--update-safety-runtime-directory": args.update_safety_runtime_directory,
+                "--update-safety-token-path": args.update_safety_token_path,
+            })
+        else:
+            required_pairs["--static-recovery-contract-json"] = (
+                args.static_recovery_contract_json
+            )
         for name, value in required_pairs.items():
             if finalizer_argv.count(name) != 1:
                 raise RuntimeError(f"Systemd-Wrapper-Finalizerargv fehlt {name}")
@@ -2108,6 +2616,96 @@ def _run_systemd_finalizer_wrapper(args: argparse.Namespace) -> int:
                 "-u",
                 str(finalizer_script),
                 *finalizer_argv,
+            ],
+            environment,
+        )
+    finally:
+        os.close(lock_fd)
+    return 1
+
+
+def _run_legacy_v1_forward_wrapper(args: argparse.Namespace) -> int:
+    """Übergibt den exakt alten Wrappervertrag im selben Vollsnapshot."""
+
+    if os.geteuid() != 0:
+        raise RuntimeError("Legacy-v1-Finalizer-Wrapper benötigt Root")
+    root = _bound_product_root(args.install_path)
+    execution_root = _bound_execution_root(root)
+    if str(execution_root) != os.path.realpath(args.execution_root):
+        raise RuntimeError("Legacy-v1-Wrapper-Ausführungssnapshot driftete")
+    # v5.4.4 und v5.4.4a archivieren VERSION, installer_main.py und den
+    # vollständigen Installer-Baum rekursiv aus dem Zielcommit. Der alte
+    # Snapshot ist deshalb bereits der vollständige aktuelle Ziel-Snapshot;
+    # ein zweiter Snapshot würde die laufende v1-Lease nur unnötig aufspalten.
+    _bind_execution_snapshot(
+        execution_root,
+        root,
+        args.expected_release_sha,
+        require_product_target_files=True,
+    )
+
+    system_python = _trusted_system_python()
+    _receipt, receipt_metadata = _bind_legacy_v1_forward_wrapper_receipt(
+        args,
+        execution_root,
+    )
+    invocation, _control_group = _wrapper_systemd_properties(args)
+    lock_fd = fcntl.fcntl(0, fcntl.F_DUPFD, 10)
+    try:
+        os.set_inheritable(lock_fd, True)
+        _validate_update_lock_fd(lock_fd)
+        lock_metadata = os.fstat(lock_fd)
+        if (lock_metadata.st_dev, lock_metadata.st_ino) != (
+            args.expected_lock_device,
+            args.expected_lock_inode,
+        ):
+            raise RuntimeError("Legacy-v1-Wrapper erhielt nicht das Parent-Lock-OFD")
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        null_fd = os.open("/dev/null", os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+        try:
+            os.dup2(null_fd, 0)
+        finally:
+            os.close(null_fd)
+        if os.readlink("/proc/self/fd/0") != "/dev/null":
+            raise RuntimeError("Legacy-v1-Wrapper konnte stdin nicht binden")
+
+        # Die äußere exakte Parserbindung wird direkt vor exec erneut ausgeführt.
+        rebound = _parse_exact_legacy_v1_finalizer_argv(list(args.finalizer_argv))
+        if vars(rebound) != vars(args.legacy_v1_inner):
+            raise RuntimeError("Legacy-v1-Finalizerargv driftete vor dem exec")
+        finalizer_script = _regular_nofollow(
+            execution_root / "Installer" / "release_finalize.py",
+            "Legacy-v1-Target-Finalizer",
+        )
+        environment = {
+            "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "PYTHONNOUSERSITE": "1",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONUNBUFFERED": "1",
+            "E3DC_BOOTSTRAP_ROOT": str(root),
+            "E3DC_BOOTSTRAP_RUNNER_ROOT": str(execution_root),
+            "E3DC_BOOTSTRAP_USER": args.expected_install_user,
+            "E3DC_INSTALL_ROOT": str(root),
+            _UPDATE_LOCK_ENV: str(lock_fd),
+            _UPDATE_FINALIZER_INVOCATION_ENV: invocation,
+        }
+        os.execve(
+            system_python,
+            [
+                system_python,
+                "-I",
+                "-B",
+                "-u",
+                str(finalizer_script),
+                "--legacy-v1-active-forward",
+                "--legacy-v1-receipt-device",
+                str(receipt_metadata.st_dev),
+                "--legacy-v1-receipt-inode",
+                str(receipt_metadata.st_ino),
+                "--",
+                *args.finalizer_argv,
             ],
             environment,
         )
@@ -2407,6 +3005,7 @@ def _run_legacy_product_bridge(
         "-B",
         "-u",
         str(finalizer),
+        "--target-updater-handoff",
         "--install-path",
         str(root),
         "--expected-release-sha",
@@ -2415,18 +3014,11 @@ def _run_legacy_product_bridge(
         args.expected_release_tag,
         "--expected-ha-role",
         args.expected_ha_role,
-        "--expected-config-state",
-        args.expected_config_state,
-        "--expected-config-sha256",
-        args.expected_config_sha256,
-        "--expected-units-sha256",
-        args.expected_units_sha256,
-        "--expected-legacy-activity",
-        args.expected_legacy_activity,
-        "--expected-venv-state",
-        args.expected_venv_state,
-        "--expected-venv-path",
-        args.expected_venv_path,
+        # Der alte Aufrufer befindet sich bereits hinter seinem Checkout des
+        # Ziel-Commits. Eine ausdrückliche Neuinstallation erzwingt, dass der
+        # aktuelle Ziel-Updater trotzdem eine neue, eigene Transaktion samt
+        # aktuellem Backup und echten Paket-/Apache-/Safety-Preimages startet.
+        "--reinstall-current",
     ]
     try:
         if (
@@ -2451,7 +3043,7 @@ def _run_legacy_product_bridge(
             )
 
     marker = (
-        f"{_FINALIZER_SUCCESS} "
+        f"{_TARGET_UPDATER_SUCCESS} "
         f"{args.expected_release_sha} {args.expected_release_tag}"
     )
     marker_count = int((result.get("line_counts") or {}).get(marker, 0))
@@ -2472,6 +3064,277 @@ def _run_legacy_product_bridge(
             "Kompatibilitäts-Snapshot meldete keinen eindeutigen Erfolg: "
             + detail[-4000:]
         )
+    # Veröffentlichte Aufrufer vor dem Ziel-Updater-Handoff kennen nur den
+    # alten Finalizer-Erfolgsmarker. Erst nachdem der neue Ziel-Updater seine
+    # eigene vollständige Transaktion eindeutig bestätigt hat, wird genau
+    # dieser reine Rückgabevertrag für den wartenden Altprozess übersetzt.
+    print(
+        f"{_FINALIZER_SUCCESS} "
+        f"{args.expected_release_sha} {args.expected_release_tag}"
+    )
+    return 0
+
+
+def _report_committed_legacy_v1_to_parent(
+    args: argparse.Namespace,
+    original_error: BaseException,
+) -> int:
+    """Liefert dem alten Parent erst nach durable Commit seinen alten Handshake."""
+
+    print(
+        "[WARNUNG] E3DC-UPD-LEGACY-POSTCOMMIT-001: Der Zielstand ist "
+        "bereits durable committed; der veröffentlichte Parent übernimmt "
+        f"den gebundenen Abschluss. Detail: {original_error}",
+        file=sys.stderr,
+    )
+    print(
+        f"{_FINALIZER_SUCCESS} "
+        f"{args.expected_release_sha} {args.expected_release_tag}"
+    )
+    return 0
+
+
+def _run_active_legacy_v1_forward(
+    root: Path,
+    args: argparse.Namespace,
+    *,
+    legacy_snapshot_install_user: str | None,
+    legacy_snapshot_repository_identity: (
+        tuple[tuple[int, ...], tuple[int, ...]] | None
+    ),
+) -> int:
+    """Schließt nur den vom alten Parent bereits begonnenen v1-Übergang ab."""
+
+    execution_root = _bound_execution_root(root)
+    _bind_execution_snapshot(
+        execution_root,
+        root,
+        args.expected_release_sha,
+        require_product_target_files=True,
+    )
+    _revalidate_legacy_snapshot_install_user(
+        root,
+        legacy_snapshot_install_user,
+        legacy_snapshot_repository_identity,
+        context="Aktiver Legacy-v1-Forward",
+    )
+    root_text = str(root)
+    execution_text = str(execution_root)
+    sys.path[:] = [
+        execution_text,
+        *[
+            item
+            for item in sys.path
+            if item
+            and os.path.realpath(item)
+            not in {
+                os.path.realpath(root_text),
+                os.path.realpath(str(root / "Installer")),
+                os.path.realpath(execution_text),
+                os.path.realpath(str(execution_root / "Installer")),
+            }
+        ],
+    ]
+    from Installer import update as update_module  # pylint: disable=import-outside-toplevel
+    from Installer import update_legacy_forward as forward_module  # pylint: disable=import-outside-toplevel
+
+    for module, name in (
+        (update_module, "Installer.update"),
+        (forward_module, "Installer.update_legacy_forward"),
+    ):
+        if (
+            Path(os.path.abspath(str(getattr(module, "__file__", "")))).parent.parent
+            != execution_root
+        ):
+            raise RuntimeError(f"{name} wurde nicht aus dem Ziel-Snapshot geladen")
+    (
+        UpdateSafetyPostCommitError,
+        UpdateSafetyManagedServiceUnquiescedError,
+    ) = _bind_update_safety_exception_types(update_module, require_native=True)
+
+    expected_receipt, expected_metadata = (
+        update_module._read_bound_active_legacy_forward_receipt(
+            expected_target_commit=args.expected_release_sha,
+            expected_target_tag=args.expected_release_tag,
+        )
+    )
+    if (
+        expected_receipt.state != "pending"
+        or expected_receipt.transaction_id != args.update_safety_transaction
+        or expected_receipt.receipt_sha256 != args.update_safety_receipt_sha256
+        or expected_receipt.finalizer_unit != args.update_safety_service_unit
+        or expected_receipt.runtime_directory
+        != args.update_safety_runtime_directory
+        or expected_receipt.token_path != args.update_safety_token_path
+        or expected_receipt.role != args.expected_ha_role
+        or (int(expected_metadata.st_dev), int(expected_metadata.st_ino))
+        != (
+            int(args.legacy_v1_receipt_device),
+            int(args.legacy_v1_receipt_inode),
+        )
+    ):
+        raise UpdateSafetyManagedServiceUnquiescedError(
+            "Aktiver Legacy-v1-Forward sieht nicht das wrappergebundene Pending-Receipt"
+        )
+
+    from Installer import web_installer as web_installer_module  # pylint: disable=import-outside-toplevel
+
+    if (
+        Path(os.path.abspath(str(getattr(web_installer_module, "__file__", "")))).parent.parent
+        != execution_root
+    ):
+        raise RuntimeError("Installer.web_installer stammt nicht aus dem Ziel-Snapshot")
+    sudoers_findings = web_installer_module.sudoers_file_findings()
+    privileged_paths = {
+        web_installer_module.SERVICE_WRAPPER,
+        web_installer_module.WEB_UPDATE_LAUNCHER,
+        web_installer_module.SUDOERS_FILE,
+    }
+    privileged_paths.update(
+        Path(str(item.get("file") or ""))
+        for item in sudoers_findings.get("repairable_lines", [])
+        if str(item.get("file") or "")
+    )
+    privileged_preimages = [
+        web_installer_module._capture_file_preimage(path)
+        for path in sorted(privileged_paths, key=lambda item: str(item))
+    ]
+
+    try:
+        forward_module.finalize_active_legacy_v1_release(
+            update_module,
+            repo_dir=root_text,
+            execution_root=execution_text,
+            target_commit=args.expected_release_sha,
+            target_tag=args.expected_release_tag,
+            expected_role=args.expected_ha_role,
+            expected_config_state=args.expected_config_state,
+            expected_config_sha256=args.expected_config_sha256,
+            expected_units_sha256=args.expected_units_sha256,
+            expected_legacy_activity=args.expected_legacy_activity,
+            expected_venv_state=args.expected_venv_state,
+            expected_venv_path=args.expected_venv_path,
+            update_safety_transaction=args.update_safety_transaction,
+            update_safety_receipt_sha256=args.update_safety_receipt_sha256,
+            update_safety_service_unit=args.update_safety_service_unit,
+            update_safety_runtime_directory=args.update_safety_runtime_directory,
+            update_safety_token_path=args.update_safety_token_path,
+            update_safety_receipt_device=args.legacy_v1_receipt_device,
+            update_safety_receipt_inode=args.legacy_v1_receipt_inode,
+            explicit_download_bootstrap=bool(args.explicit_download_bootstrap),
+            privileged_preimages=privileged_preimages,
+        )
+        try:
+            _bind_execution_snapshot(
+                execution_root,
+                root,
+                args.expected_release_sha,
+                require_product_target_files=True,
+            )
+        except BaseException as postcommit_error:
+            # Der Forward kehrt erst nach durable committed Receipt und
+            # abgeschlossenem v1-Gate zurück. Ein danach fehlschlagender
+            # Snapshot-Readback darf den wartenden alten Parent daher nicht
+            # mehr in einen verbotenen Rollback schicken.
+            raise UpdateSafetyPostCommitError(
+                "Legacy-v1-Ausführungssnapshot driftete nach durable Commit"
+            ) from postcommit_error
+    except BaseException as original_error:
+        try:
+            current, metadata = (
+                update_module._read_bound_active_legacy_forward_receipt(
+                    expected_target_commit=args.expected_release_sha,
+                    expected_target_tag=args.expected_release_tag,
+                )
+            )
+        except BaseException as receipt_error:
+            raise UpdateSafetyManagedServiceUnquiescedError(
+                "Aktives Legacy-v1-Receipt ist vor dem privilegierten Rückweg "
+                "nicht mehr sicher lesbar"
+            ) from receipt_error
+        ignored = {"state", "receipt_sha256"}
+        same_shape = all(
+            getattr(current, name) == getattr(expected_receipt, name)
+            for name in type(expected_receipt).__dataclass_fields__
+            if name not in ignored
+        )
+        if (
+            isinstance(original_error, UpdateSafetyPostCommitError)
+            and current.state == "committed"
+            and same_shape
+        ):
+            # Der veröffentlichte v1-Parent liest ein committed Receipt erst,
+            # nachdem sein Kind Exit 0 und genau den alten Erfolgsmarker
+            # geliefert hat. Ein Fehlerstatus an dieser Stelle ließe ihn daher
+            # fälschlich noch ein pending Receipt verlangen und in einen
+            # Recovery-Deadlock laufen. Der Zielstand ist bereits irreversibel
+            # committed; wir übersetzen ausschließlich diesen exakt
+            # gleichförmigen Zustand zurück in den alten Erfolgshandshake. Der
+            # Parent bindet danach selbst Receipt, Marker, Drop-ins, Token und
+            # Serviceende und übernimmt den restlichen committed Cleanup.
+            return _report_committed_legacy_v1_to_parent(args, original_error)
+        if current.state == "committed" and same_shape:
+            raise UpdateSafetyManagedServiceUnquiescedError(
+                "Committed Legacy-v1-Receipt ist nach einem untypisierten "
+                "Fehler sichtbar; durable Commit-Bestätigung fehlt und der "
+                "alte Erfolgshandshake bleibt gesperrt"
+            ) from original_error
+        if (
+            current != expected_receipt
+            or (int(metadata.st_dev), int(metadata.st_ino))
+            != (
+                int(args.legacy_v1_receipt_device),
+                int(args.legacy_v1_receipt_inode),
+            )
+        ):
+            raise UpdateSafetyManagedServiceUnquiescedError(
+                "Pending Legacy-v1-Receipt driftete; privilegierter Rückweg bleibt gesperrt"
+            ) from original_error
+        try:
+            update_module._assert_legacy_recovery_namespace_exclusive()
+            update_module._rebind_legacy_update_safety_dropins(
+                expected_receipt,
+                allow_missing=False,
+            )
+            update_module._verify_update_safety_marker(
+                expected_receipt,
+                expected_present=True,
+            )
+            restored = web_installer_module._restore_preimages(privileged_preimages)
+            syntax = subprocess.run(
+                ["/usr/sbin/visudo", "-cf", "/etc/sudoers"],
+                cwd="/",
+                env={
+                    "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+                    "LANG": "C",
+                    "LC_ALL": "C",
+                },
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=30,
+                check=False,
+            )
+            if not bool(restored.get("success")) or syntax.returncode != 0:
+                detail = bytes(syntax.stderr or syntax.stdout or b"").decode(
+                    "utf-8",
+                    errors="replace",
+                ).strip()
+                raise RuntimeError(
+                    "Privilegierte Legacy-v1-Preimages konnten nicht vollständig "
+                    "wiederhergestellt werden: "
+                    + detail[-1000:]
+                )
+        except Exception as recovery_error:
+            raise UpdateSafetyManagedServiceUnquiescedError(
+                "Legacy-v1-Finalizer und privilegierter Rückweg sind fehlgeschlagen: "
+                f"{recovery_error}"
+            ) from original_error
+        raise
+    print(
+        f"{_FINALIZER_SUCCESS} "
+        f"{args.expected_release_sha} {args.expected_release_tag}"
+    )
     return 0
 
 
@@ -2487,6 +3350,15 @@ def _main_with_update_lock(
 ) -> int:
     """Führt genau einen bereits kernelgebundenen Finalizerpfad aus."""
 
+    if getattr(args, "legacy_v1_active_forward", False):
+        return _run_active_legacy_v1_forward(
+            root,
+            args,
+            legacy_snapshot_install_user=legacy_snapshot_install_user,
+            legacy_snapshot_repository_identity=(
+                legacy_snapshot_repository_identity
+            ),
+        )
     if getattr(args, "compat_target_updater_handoff", False):
         return _run_compat_target_updater_handoff(root, args)
     if getattr(args, "target_updater_handoff", False):
@@ -2498,6 +3370,35 @@ def _main_with_update_lock(
                 legacy_snapshot_repository_identity
             ),
         )
+    if getattr(args, "legacy_target_updater_bridge", False):
+        if script.parent.parent == root:
+            return _run_legacy_product_bridge(root, args)
+        # v5.4.2d und weitere veröffentlichte Übergangsversionen starteten
+        # den neuen Finalizer bereits aus einem commitgebundenen Snapshot,
+        # kannten dessen spätere Paket-/Apache-Pflichtargumente aber noch
+        # nicht. Auch hier übernimmt deshalb der aktuelle Snapshot-Updater
+        # die ganze Transaktion; die Altparameter dienen nur der SHA-/Tag-/
+        # Rollenbindung und werden niemals zu neuen Preimages umgedeutet.
+        target_args = argparse.Namespace(
+            expected_release_sha=args.expected_release_sha,
+            expected_release_tag=args.expected_release_tag,
+            expected_ha_role=args.expected_ha_role,
+            requested_release_tag="",
+            reinstall_current=True,
+        )
+        result = _run_target_updater_handoff(
+            root,
+            target_args,
+            legacy_snapshot_install_user=legacy_snapshot_install_user,
+            legacy_snapshot_repository_identity=(
+                legacy_snapshot_repository_identity
+            ),
+        )
+        print(
+            f"{_FINALIZER_SUCCESS} "
+            f"{args.expected_release_sha} {args.expected_release_tag}"
+        )
+        return result
     if script.parent.parent == root:
         return _run_legacy_product_bridge(root, args)
     execution_root = _bound_execution_root(root)
@@ -2544,6 +3445,38 @@ def _main_with_update_lock(
         update_module,
         require_native=bool(getattr(args, "update_safety_transaction", "")),
     )
+
+    try:
+        expected_recovery_journal_contract = (
+            update_module.recovery_journal.read_recovery_journal()
+        )
+    except BaseException as exc:
+        raise UpdateSafetyManagedServiceUnquiescedError(
+            "Target-Finalizer kann sein Parent-gebundenes Master-Journal "
+            "vor dem privilegierten Mutationspfad nicht lesen"
+        ) from exc
+    if (
+        expected_recovery_journal_contract is None
+        or expected_recovery_journal_contract.journal_device
+        != args.expected_recovery_journal_device
+        or expected_recovery_journal_contract.journal_inode
+        != args.expected_recovery_journal_inode
+        or expected_recovery_journal_contract.journal_sha256
+        != args.expected_recovery_journal_sha256
+        or expected_recovery_journal_contract.payload.phase
+        != args.expected_recovery_journal_phase
+        or expected_recovery_journal_contract.payload.install_root != root_text
+        or expected_recovery_journal_contract.payload.target.commit
+        != args.expected_release_sha
+        or expected_recovery_journal_contract.payload.target.tag
+        != args.expected_release_tag
+        or expected_recovery_journal_contract.payload.target.role
+        != args.expected_ha_role
+    ):
+        raise UpdateSafetyManagedServiceUnquiescedError(
+            "Target-Finalizer sieht nicht das exakte Parent-gebundene "
+            "Master-Journal"
+        )
 
     expected_pending_contract = None
     if getattr(args, "update_safety_transaction", ""):
@@ -2606,8 +3539,6 @@ def _main_with_update_lock(
         web_installer_module._capture_file_preimage(path)
         for path in sorted(privileged_paths, key=lambda item: str(item))
     ]
-    postcommit_state = {"commit_attempted": False}
-
     try:
         finalize_release_from_target(
             repo_dir=root_text,
@@ -2621,6 +3552,34 @@ def _main_with_update_lock(
             expected_legacy_activity=args.expected_legacy_activity,
             expected_venv_state=args.expected_venv_state,
             expected_venv_path=args.expected_venv_path,
+            expected_package_receipt_sha256=(
+                args.expected_package_receipt_sha256
+            ),
+            expected_package_receipt_device=(
+                args.expected_package_receipt_device
+            ),
+            expected_package_receipt_inode=(
+                args.expected_package_receipt_inode
+            ),
+            expected_package_full_backup_id=(
+                args.expected_package_full_backup_id
+            ),
+            expected_recovery_journal_sha256=(
+                args.expected_recovery_journal_sha256
+            ),
+            expected_recovery_journal_device=(
+                args.expected_recovery_journal_device
+            ),
+            expected_recovery_journal_inode=(
+                args.expected_recovery_journal_inode
+            ),
+            expected_recovery_journal_phase=(
+                args.expected_recovery_journal_phase
+            ),
+            expected_apache_available=args.expected_apache_available == "1",
+            expected_apache_active=args.expected_apache_active == "1",
+            expected_apache_unit_file_state=args.expected_apache_unit_file_state,
+            static_recovery_contract_json=args.static_recovery_contract_json,
             update_safety_transaction=args.update_safety_transaction or None,
             update_safety_receipt_sha256=args.update_safety_receipt_sha256 or None,
             update_safety_service_unit=args.update_safety_service_unit or None,
@@ -2629,24 +3588,47 @@ def _main_with_update_lock(
             explicit_download_bootstrap=bool(args.explicit_download_bootstrap),
             headless=True,
             privileged_preimages=privileged_preimages,
-            postcommit_state=postcommit_state,
         )
         # Der Berechtigungsdurchlauf darf ausschließlich den gebundenen
         # Produktbaum verändern. Der privilegierte Ausführungssnapshot muss
         # über den gesamten Finalizer-Lauf byte- und modusidentisch bleiben.
         _bind_execution_snapshot(execution_root, root, args.expected_release_sha)
     except BaseException as original_error:
-        if isinstance(original_error, UpdateSafetyPostCommitError) or bool(
-            postcommit_state.get("commit_attempted")
+        try:
+            current_recovery_journal = (
+                update_module.recovery_journal.read_recovery_journal(
+                    allow_missing=True
+                )
+            )
+        except BaseException as journal_error:
+            raise UpdateSafetyManagedServiceUnquiescedError(
+                "Master-Journal ist vor dem privilegierten Altpreimage-Restore "
+                "nicht sicher lesbar; Restore bleibt fail-closed gesperrt"
+            ) from journal_error
+        if current_recovery_journal == expected_recovery_journal_contract:
+            pass
+        elif (
+            current_recovery_journal is not None
+            and current_recovery_journal.payload.phase
+            == update_module.recovery_journal.PHASE_COMMITTED
+            and update_module._same_recovery_journal_transaction_shape(
+                current_recovery_journal,
+                expected_recovery_journal_contract,
+            )
         ):
-            # Ab durable committed ist jeder Altstand-Rollback verboten. Der
-            # wartende Ziel-Updater räumt ausschließlich eigene Gate-Reste
-            # fertig oder lässt sie bewusst fail-closed stehen.
-            if isinstance(original_error, UpdateSafetyPostCommitError):
-                raise
             raise UpdateSafetyPostCommitError(
-                "Target-Finalizerfehler trat nach Eintritt in die konservative "
-                "Commit-Attempt-Grenze auf; Altpreimage-Restore ist gesperrt"
+                "Durable committed Master-Journal verbietet den "
+                "privilegierten Altpreimage-Restore"
+            ) from original_error
+        else:
+            raise UpdateSafetyManagedServiceUnquiescedError(
+                "Master-Journal driftete vor dem privilegierten "
+                "Altpreimage-Restore; Restore bleibt fail-closed gesperrt"
+            ) from original_error
+        if isinstance(original_error, UpdateSafetyPostCommitError):
+            raise UpdateSafetyManagedServiceUnquiescedError(
+                "Finalizer meldete PostCommit, aber das Master-Journal blieb "
+                "product_mutating; Restore bleibt fail-closed gesperrt"
             ) from original_error
         if expected_pending_contract is not None:
             try:
@@ -2666,9 +3648,10 @@ def _main_with_update_lock(
                     expected_pending_contract,
                 )
             ):
-                raise UpdateSafetyPostCommitError(
-                    "Durable committed Receipt verbietet den privilegierten "
-                    "Altpreimage-Restore"
+                raise UpdateSafetyManagedServiceUnquiescedError(
+                    "Safety-Receipt ist committed, obwohl das autoritative "
+                    "Master-Journal noch product_mutating ist; Restore bleibt "
+                    "fail-closed gesperrt"
                 ) from original_error
             else:
                 raise UpdateSafetyManagedServiceUnquiescedError(
@@ -2714,6 +3697,8 @@ def main() -> int:
     if os.geteuid() != 0:
         raise RuntimeError("Release-Finalizer muss mit Root-Rechten laufen")
     if getattr(args, "systemd_finalizer_wrapper", False):
+        if getattr(args, "legacy_v1_active_forward_wrapper", False):
+            return _run_legacy_v1_forward_wrapper(args)
         return _run_systemd_finalizer_wrapper(args)
     root = _bound_product_root(args.install_path)
     script = _regular_nofollow(
@@ -2726,17 +3711,22 @@ def main() -> int:
     compat_handoff_entry = bool(
         getattr(args, "compat_target_updater_handoff", False)
     )
+    legacy_v1_active_forward_entry = bool(
+        getattr(args, "legacy_v1_active_forward", False)
+    )
     legacy_product_entry = (
         not target_handoff_entry
         and not compat_handoff_entry
+        and not legacy_v1_active_forward_entry
         and script.parent.parent == root
     )
     legacy_target_snapshot_entry = (
         not target_handoff_entry
         and not compat_handoff_entry
+        and not legacy_v1_active_forward_entry
         and script.parent.parent != root
     )
-    if legacy_target_snapshot_entry:
+    if legacy_target_snapshot_entry or legacy_v1_active_forward_entry:
         # Veröffentlichte Updater vor dem globalen Lock übergeben keinen FD.
         # Nur ihr flagloser, bereits commit- und produktgebundener
         # Target-Finalizer darf den Lock selbst anlegen. Nach dem Lock bindet
@@ -2760,7 +3750,11 @@ def main() -> int:
     legacy_snapshot_install_user = None
     legacy_snapshot_repository_identity = None
     try:
-        if target_handoff_entry or legacy_target_snapshot_entry:
+        if (
+            target_handoff_entry
+            or legacy_target_snapshot_entry
+            or legacy_v1_active_forward_entry
+        ):
             (
                 legacy_snapshot_install_user,
                 legacy_snapshot_repository_identity,

@@ -254,7 +254,10 @@ class EnergyPolicyInput:
     peak_shaving_budget_valid: bool = False
     peak_shaving_allowed_remaining_import_w: Optional[float] = None
     peak_shaving_base_import_w: Optional[float] = None
+    predump_discharge_add_w: Optional[float] = None
+    predump_discharge_contract_valid: bool = True
     grid_funded_wallbox_authorized: bool = False
+
 
 
 def peak_shaving_wallbox_power_cap(
@@ -313,7 +316,16 @@ def decide_energy_policy(ctx: EnergyPolicyInput) -> Dict[str, Any]:
     controlled_floor_netpoint_limit_w = 0.0
     storage_curve_overcharge_relief_active = False
     storage_curve_overcharge_relief_w = 0.0
+    storage_auth_budget = max(
+
+        0.0,
+        _safe_float(
+            getattr(ctx, "authorized_wallbox_budget_w", 32.0 * 230.0 * 3.0),
+            32.0 * 230.0 * 3.0,
+        ),
+    )
     display_wb_budget_curve_w = max(0.0, free_w * fz)
+
     raw_grid_funded_mode_active = bool(
         ctx.price_boost_wallbox_active
         or ctx.effective_allow_grid
@@ -328,11 +340,6 @@ def decide_energy_policy(ctx: EnergyPolicyInput) -> Dict[str, Any]:
 
     if ctx.price_boost_wallbox_active:
         allowed_w = _safe_float(ctx.wb_max_amp, 0.0) * 230.0 * phases
-    elif ctx.predump_wallbox_active:
-        if ctx.predump_wallbox_gate_open:
-            allowed_w = max(0.0, wb_actual + free_w)
-        else:
-            allowed_w = 0.0
     elif ctx.price_optimizing_active or ctx.effective_allow_grid:
         allowed_w = 32.0 * 230.0 * phases
     elif mode == 0:
@@ -355,6 +362,15 @@ def decide_energy_policy(ctx: EnergyPolicyInput) -> Dict[str, Any]:
             budget_w = free_w * fz
             allowed_w = min(wb_actual + budget_w, phys_surplus)
 
+        if mode == 2:
+            pv_only_w = max(
+                0.0,
+                _safe_float(ctx.pv_only_allowed_w, 0.0),
+                _safe_float(ctx.pv_surplus_ex_wb_w, 0.0),
+            )
+            if pv_only_w > 0.0:
+                allowed_w = max(allowed_w, min(phys_surplus, pv_only_w) if phys_surplus > 0.0 else pv_only_w)
+
         if free_w > 0.0:
             direct_pv_surplus_w = min(max(0.0, wb_actual + free_w), max(0.0, phys_surplus))
             if direct_pv_surplus_w > 0.0:
@@ -362,6 +378,7 @@ def decide_energy_policy(ctx: EnergyPolicyInput) -> Dict[str, Any]:
                 display_wb_budget_curve_w = max(display_wb_budget_curve_w, direct_pv_surplus_w)
 
         if mode == 4:
+
             allowed_w = max(0.0, wb_actual + _safe_float(ctx.eba_iaval_w, 0.0))
         if mode == 9:
             if ctx.native_sun_capable:
@@ -414,6 +431,31 @@ def decide_energy_policy(ctx: EnergyPolicyInput) -> Dict[str, Any]:
                     mode5_pv_surplus_active = True
         elif free_w >= 99000.0:
             allowed_w = max(0.0, phys_surplus + wb_actual)
+
+
+    if mode != 0 and ctx.predump_wallbox_active:
+        pv_only_w = max(0.0, _safe_float(ctx.pv_only_allowed_w, 0.0))
+        raw_predump_add = getattr(ctx, "predump_discharge_add_w", None)
+        if raw_predump_add is None:
+            predump_add_w = (
+                min(free_w, storage_auth_budget) if free_w > 0.0 else 0.0
+            )
+        else:
+            predump_add_w = max(0.0, _safe_float(raw_predump_add, 0.0))
+        if ctx.predump_wallbox_gate_open and predump_add_w > 0.0:
+            allowed_w = max(allowed_w, max(pv_only_w, wb_actual) + predump_add_w)
+        elif pv_only_w > 0.0:
+            allowed_w = max(allowed_w, pv_only_w)
+        elif not ctx.predump_wallbox_gate_open:
+            allowed_w = pv_only_w
+        elif raw_predump_add is not None and predump_add_w == 0.0 and pv_only_w == 0.0:
+            allowed_w = 0.0
+
+
+
+
+
+
 
     if curve_wb_relief_active and not ctx.price_boost_wallbox_active:
         curve_relief_limit_w = max(0.0, wb_actual + max(0.0, free_w))
@@ -762,9 +804,6 @@ def decide_energy_policy(ctx: EnergyPolicyInput) -> Dict[str, Any]:
             allowed_w > 0.0
             and allowed_w < peak_shaving_wallbox_minimum_power_w
         )
-        if peak_shaving_wallbox_minimum_blocked:
-            allowed_w = 0.0
-
     pre_auth_cap = max(0.0, float(allowed_w))
     storage_auth_budget = max(
         0.0,
@@ -773,24 +812,72 @@ def decide_energy_policy(ctx: EnergyPolicyInput) -> Dict[str, Any]:
             32.0 * 230.0 * 3.0,
         ),
     )
-    # Das Storage-Budget autorisiert PV-/Speicherleistung für flexible
-    # Verbraucher. Netzladung besitzt einen eigenen, vom Manager frisch und
-    # fail-closed gebundenen Sicherheitsvertrag. Nur dieser Vertrag darf die
-    # zirkuläre 0-W-Kopplung lösen; rohe Preisflags genügen ausdrücklich nicht.
-    auth_budget = (
-        pre_auth_cap
-        if grid_funded_budget_authority_active
-        else storage_auth_budget
+    curve_pv_allowed_w = max(
+        0.0, _safe_float(getattr(ctx, "pv_only_allowed_w", 0.0), 0.0)
     )
-    final_allowed = min(pre_auth_cap, auth_budget)
+    raw_predump_add = getattr(ctx, "predump_discharge_add_w", None)
+    if raw_predump_add is None:
+        predump_discharge_add_w = (
+            min(free_w, storage_auth_budget) if free_w > 0.0 else 0.0
+        )
+    else:
+        predump_discharge_add_w = max(0.0, _safe_float(raw_predump_add, 0.0))
+
+    predump_active = bool(getattr(ctx, "predump_wallbox_active", False))
+    predump_gate_open = bool(getattr(ctx, "predump_wallbox_gate_open", False))
+    predump_contract_valid = bool(
+        predump_active
+        and predump_gate_open
+        and predump_discharge_add_w > 0.0
+        and getattr(ctx, "predump_discharge_contract_valid", True)
+    )
+
+    if mode == MODE_OFF or ctx.effective_public_wb_mode == MODE_OFF:
+        final_allowed = 0.0
+        effective_auth_w = 0.0
+    elif grid_funded_budget_authority_active:
+        effective_auth_w = pre_auth_cap
+        final_allowed = pre_auth_cap
+
+    elif predump_active:
+        if predump_contract_valid:
+            effective_auth_w = max(curve_pv_allowed_w, wb_actual) + predump_discharge_add_w
+        elif predump_gate_open and raw_predump_add is None and storage_auth_budget > curve_pv_allowed_w:
+            effective_auth_w = max(curve_pv_allowed_w, storage_auth_budget)
+        else:
+            effective_auth_w = curve_pv_allowed_w
+        final_allowed = min(pre_auth_cap, effective_auth_w)
+
+
+
+    elif mode == 2:
+        effective_auth_w = max(storage_auth_budget, curve_pv_allowed_w)
+        final_allowed = min(pre_auth_cap, effective_auth_w)
+    else:
+        effective_auth_w = storage_auth_budget
+        final_allowed = min(pre_auth_cap, storage_auth_budget)
+
+
+
+    if peak_shaving_wallbox.get("active"):
+        peak_cap_w = max(
+            0.0,
+            _safe_float(peak_shaving_wallbox.get("cap_w"), 0.0),
+        )
+        final_allowed = min(final_allowed, peak_cap_w)
+        if peak_shaving_wallbox_minimum_blocked:
+            final_allowed = 0.0
+
     auth_budget_limited = bool(final_allowed < pre_auth_cap)
 
     return {
         "allowed_w": final_allowed,
         "pre_authorized_cap_allowed_w": pre_auth_cap,
-        "authorized_wallbox_budget_w": auth_budget,
+        "authorized_wallbox_budget_w": storage_auth_budget,
+        "effective_authorized_wallbox_budget_w": effective_auth_w,
         "storage_authorized_wallbox_budget_w": storage_auth_budget,
         "grid_funded_budget_authority_active": bool(
+
             grid_funded_budget_authority_active
         ),
         "raw_grid_funded_mode_active": bool(raw_grid_funded_mode_active),

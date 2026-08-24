@@ -540,10 +540,14 @@ def _slot_requires_direct_market_price(slot, config):
     retail_sources = {"tibber", "octopus", "octopus_energy", "retail", "end_customer"}
     sources = {
         str((slot or {}).get("price_source") or "").strip().lower(),
+        str((slot or {}).get("market_price_source") or "").strip().lower(),
         str((slot or {}).get("tariff_provider") or "").strip().lower(),
         str((config or {}).get("tariff_provider") or "").strip().lower(),
+        str((config or {}).get("direct_marketing_price_provider") or "").strip().lower(),
+        str((config or {}).get("price_source") or "").strip().lower(),
     }
     return bool(sources.intersection(retail_sources))
+
 
 
 def _slot_price_quality_blocker(slot, config):
@@ -3626,11 +3630,8 @@ def _build_charge_block_wait_policy_slots(
     decisions = [
         item for item in (policy_timeline or [])
         if isinstance(item, dict)
-        and not (
-            item.get("blocked") is True
-            and str(item.get("dv_target_state") or "").upper() in {"HOLD", "NORMAL"}
-        )
     ]
+
 
     def decisions_for_slot(slot):
         return [
@@ -8308,22 +8309,22 @@ def build_direct_marketing_shadow_plan(
             reserve=reserve,
             flags=flags,
         )
-        if isinstance(previous_policy_decision, dict):
-            plan["policy_decision"] = _build_policy_decision(
-                config,
-                [],
-                [],
-                reserve,
-                flags,
-                {},
-                mode,
-                now_ms,
-                current_soc,
-                capacity_wh,
-                blocked,
-                previous_policy_decision=previous_policy_decision,
-            )
+        plan["policy_decision"] = _build_policy_decision(
+            config,
+            [],
+            [],
+            reserve,
+            flags,
+            {},
+            mode,
+            now_ms,
+            current_soc,
+            capacity_wh,
+            blocked,
+            previous_policy_decision=previous_policy_decision,
+        )
         return plan
+
 
     market_values = [_market_ct(slot) for slot in raw_slots]
     min_market_ct = min(market_values)
@@ -8985,8 +8986,11 @@ def build_direct_marketing_shadow_plan(
             "end_ts": _slot_end_ts(slot),
         }
         for slot in (timeline or [])
-        if isinstance(slot, dict) and _slot_end_ts(slot) > now_ms
+        if isinstance(slot, dict)
+        and _slot_end_ts(slot) > now_ms
+        and not _slot_price_quality_blocker(slot, config)
     ]
+
     (
         charge_block_wait_slots,
         neutral_policy_slots,
@@ -8999,15 +9003,8 @@ def build_direct_marketing_shadow_plan(
         now_ms,
     )
     if neutral_policy_slots:
-        policy_timeline = [
-            item for item in policy_timeline
-            if not (
-                isinstance(item, dict)
-                and item.get("blocked") is True
-                and str(item.get("dv_target_state") or "").upper() in {"HOLD", "NORMAL"}
-            )
-        ]
         policy_timeline.extend(neutral_policy_slots)
+
     if charge_block_wait_slots:
         windows.extend(
             dict(item["selected_window"])

@@ -1,9 +1,9 @@
 {
-  "version": "5.4.4a",
+  "version": "5.4.4b",
   "min_version": "4.0.0",
-  "stable_release": "v5.4.4a",
-  "release_date": "2026-08-17",
-  "description": "v5.4.4a - Robuste Phasenumschaltung, taktfreie Ladekurve und Glitch-Schutz",
+  "stable_release": "v5.4.4b",
+  "release_date": "2026-08-24",
+  "description": "v5.4.4b - Universelles Update, robuste Verbraucherbudgets und sichere Messwerterfassung",
   "installer_requires": "python3",
   "sanitized_republication": false,
   "history_transition": {

@@ -1,6 +1,6 @@
 # Betrieb des E3DC-Control Installers
 
-Dokumentation Stand: 5.4.4a
+Dokumentation Stand: 5.4.4b
 
 Der Installer ist der freigegebene Einstieg für Installation, Update,
 Reparatur, Backup, Rollback und Deinstallation. Die vollständige Bedienung ist
@@ -12,6 +12,18 @@ Installationsordner, Installationsbenutzer und Rolle selbst und startet den
 gemeinsamen systemd-Hintergrundauftrag. Nach diesem einmaligen Übergang nutzen
 Dashboard, Konsole, Installer-Menü und automatische Updateprüfung denselben
 Dispatcher.
+
+Der Installer-Anteil von 5.4.4b bindet eine laufende Einzelinstanz aus ihrem
+systemd-Dienst und verwendet den aktuellen Ziel-Updater für Inventar, Backup,
+Dateiprojektion und Recovery. Der Installationsbenutzer und das Verzeichnis
+sind nicht fest codiert. Lokale Änderungen, fehlende Release-Dateien, alte
+Rechte und beschädigte Git-Metadaten werden vor dem Ersetzen gesichert, statt
+den Auftrag vorgelagert zu blockieren. Download, Vorprüfung und vollständiges
+Backup erfolgen vor dem kurzen Writer-Stopp; danach folgen atomare Projektion,
+Dienststart und Healthcheck. Mehrere gleichrangige Instanzen werden angezeigt
+und nicht geraten. Ein kontrollierter Abbruch nennt Ursache, Systemzustand und
+den nächsten sicheren Befehl. Nur exakt als abgeschlossen belegte
+5.4.4-/5.4.4a-Recoveryreste dürfen automatisch bereinigt werden.
 
 Der Installer-Anteil von 5.4.4a verwendet den vorhandenen Alt-Updater, lokale
 Git-Metadaten, getrackte Änderungen und historische Dateimodi nicht als

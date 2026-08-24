@@ -617,7 +617,11 @@ class PhaseSwitchSequencer:
         charger_max_amp: Any,
     ) -> None:
         existing = self._state.get("_wallbox_phase_transition_reservation")
-        if isinstance(existing, dict) and existing.get("active"):
+        if (
+            isinstance(existing, dict)
+            and existing.get("active")
+            and _safe_int(existing.get("target_phases"), 0) == _safe_int(target_phases, 0)
+        ):
             return
         begin_phase_transition_reservation(
             self._state,

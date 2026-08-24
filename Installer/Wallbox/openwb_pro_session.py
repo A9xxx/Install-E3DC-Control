@@ -365,7 +365,7 @@ def _explicit_connection_state(status: Optional[Dict[str, Any]] = None) -> Optio
         return _explicit_numeric_bool(st.get("plug_state"))
 
     observed = []
-    for key in ("plug_state_raw", "locked", "plugged"):
+    for key in ("plug_state_raw", "locked", "plugged", "plug", "connected"):
         if key not in st:
             continue
         parsed = _explicit_numeric_bool(st.get(key))
@@ -1366,7 +1366,14 @@ def _phase_readback_confirmed(status: Optional[Dict[str, Any]], target: int) -> 
     # Geräteannahme. Er darf ausschließlich im physisch ruhigen, verbundenen
     # und CP-inaktiven Zustand die Wiederanlaufsperre lösen.
     reported_target = _valid_phase_count(st.get("phases_target"), 0)
-    connected = bool(st.get("plug_state") or st.get("car") == 2)
+    connected = bool(
+        st.get("plug_state")
+        or st.get("car") == 2
+        or st.get("plug")
+        or st.get("connected")
+        or _explicit_connection_state(st) is True
+    )
+
     idle = bool(
         not bool(st.get("charging") or st.get("charge_state"))
         and _phase_status_power_w(st) <= 100.0
@@ -1932,7 +1939,14 @@ def start_wakeup_step_contract(
         if allowed_after > 0.0 and allowed_after <= now_value <= allowed_after + phase_restart_grace_s:
             command_patch["_guard_allow_restart_after_stop"] = True
 
-    connected = bool(st.get("plug_state") or st.get("car") == 2)
+    connected = bool(
+        st.get("plug_state")
+        or st.get("car") == 2
+        or st.get("plug")
+        or st.get("connected")
+        or _explicit_connection_state(st) is True
+    )
+
     real_power_w = max(
         _safe_float(st.get("real_power_w"), 0.0),
         _safe_float(st.get("phase_power_sum_w"), 0.0),
@@ -1958,7 +1972,13 @@ def start_wakeup_step_contract(
             "command_patch": command_patch,
             "state_patch": {"_openwb_pro_start_wakeup_pending": True},
         }
-    if charging or real_power_w > 500.0:
+    had_confirmed_charge = bool(
+        charging
+        or real_power_w > 100.0
+        or _safe_float(st.get("session_kwh"), 0.0) > 0.005
+        or bool(data.get("_charge_started", False))
+    )
+    if had_confirmed_charge:
         return {
             **base,
             "action": "clear_connected_or_charging",
@@ -1967,9 +1987,10 @@ def start_wakeup_step_contract(
             "state_patch": {
                 "_openwb_pro_start_wakeup_allowed_after": 0.0,
                 "_openwb_pro_start_wakeup_pending": False,
-                # Receipt bleibt bis zum Abstecken erhalten: genau ein
-                # Wake-up pro physischer Stecksession, auch nach Neustart.
-                "_openwb_pro_start_wakeup_count": sent_count,
+                "_openwb_pro_start_wakeup_count": 0,
+                "_openwb_pro_unserved_since": 0.0,
+                "_openwb_pro_unserved_pause_since": 0.0,
+                "_openwb_pro_unserved_paused_s": 0.0,
             },
         }
 
@@ -2918,6 +2939,15 @@ def start_liveness_contract(
         or phase_wait_active_now
         or wakeup_wait_active
     )
+    had_confirmed_charge = bool(
+        sess.get("had_confirmed_charge", False)
+        or sess.get("real_charging", False)
+        or _safe_float(st.get("session_kwh"), 0.0) > 0.005
+        or _safe_float(st.get("power_w"), 0.0) > 100.0
+        or _safe_float(st.get("real_power_w"), 0.0) > 100.0
+        or _safe_float(st.get("phase_power_sum_w"), 0.0) > 100.0
+        or bool(data.get("_charge_started", False))
+    )
     start_scope = bool(
         plug_session_id
         and status_fresh
@@ -2925,6 +2955,7 @@ def start_liveness_contract(
         and sess.get("start_requested", False)
         and sess.get("budget_ready", False)
         and not sess.get("real_charging", False)
+        and not had_confirmed_charge
     )
     issued_session_id = str(
         data.get("_openwb_pro_start_current_session_id") or ""

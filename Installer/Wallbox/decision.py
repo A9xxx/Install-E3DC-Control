@@ -697,6 +697,7 @@ def compact_vehicle_identifier(value: Any) -> str:
 
 VEHICLE_PROFILE_ID_KEYS = (
     "id",
+    "key",
     "profile_id",
     "cloud_vehicle_id",
     "vehicle_id",
@@ -705,6 +706,7 @@ VEHICLE_PROFILE_ID_KEYS = (
     "rfid",
     "rfid_tag",
 )
+
 
 
 def confirmed_session_vehicle_identity(
@@ -746,9 +748,10 @@ def confirmed_session_vehicle_identity(
     if (
         st.get("session_vehicle_identity_confirmed") is True
         and explicit_key
-        and binding_id
-        and plug_session_id
-        and binding_id == plug_session_id
+        and (
+            not (binding_id or plug_session_id)
+            or (binding_id and plug_session_id and binding_id == plug_session_id)
+        )
     ):
         return {
             "confirmed": True,
@@ -756,6 +759,7 @@ def confirmed_session_vehicle_identity(
             "source": "confirmed_session_binding",
             "session_bound": True,
         }
+
 
     return {
         "confirmed": False,
@@ -821,6 +825,7 @@ def vehicle_phase_capability_from_profiles(
 
     for key in (
         "max_phases",
+        "obc_max_phases",
         "phases",
         "ac_phases",
         "charge_phases",
@@ -1884,20 +1889,20 @@ def vehicle_max_ac_phases_from_profiles(
     statische Wallbox-Zuordnung oder ein SoC-/Cloud-Profil darf die aktuelle
     Stecksession nicht identifizieren.
     """
-
     cfg = config or {}
     st = status or {}
     try:
         cid = int(charger_id or 1)
     except (TypeError, ValueError):
         cid = 1
+
     identity = confirmed_session_vehicle_identity(st)
     profile = _vehicle_profile_for_identity(
         profiles,
         identity.get("key") if identity.get("confirmed", False) else "",
     )
     if profile:
-        for key in ("max_phases", "phases", "ac_phases", "charge_phases", "charging_phases"):
+        for key in ("max_phases", "obc_max_phases", "phases", "ac_phases", "charge_phases", "charging_phases"):
             phases = valid_phase_count(profile.get(key), 0)
             if phases:
                 return phases
@@ -1909,30 +1914,28 @@ def vehicle_max_ac_phases_from_profiles(
                 continue
             if 0.1 <= power_kw <= 7.6:
                 return 1
-            if power_kw >= 8.0:
+            if power_kw > 7.6:
                 return 3
 
-    for key in (
-        f"wb{cid}_max_phases",
-        f"wb{cid}_phases",
-        f"wb{cid}_ac_phases",
-        f"wb{cid}_charge_phases",
-        f"wb{cid}_charging_phases",
-    ):
+    for key in (f"wb{cid}_obc_max_phases",):
         phases = valid_phase_count(cfg.get(key), 0)
         if phases:
             return phases
 
-    for key in (f"wb{cid}_charge_power", f"wb{cid}_charge_power_kw", f"wb{cid}_max_ac_power_kw"):
+    for key in (f"wb{cid}_charge_power", f"wb{cid}_power", f"wb{cid}_charge_power_kw", f"wb{cid}_ac_power_kw", f"wb{cid}_max_ac_power_kw"):
         try:
             power_kw = float(str(cfg.get(key, "")).replace(",", "."))
         except (TypeError, ValueError):
             continue
         if 0.1 <= power_kw <= 7.6:
             return 1
-        if power_kw >= 8.0:
+        if power_kw > 7.6:
             return 3
+
     return 0
+
+
+
 
 
 def vehicle_max_ac_power_kw_from_profiles(

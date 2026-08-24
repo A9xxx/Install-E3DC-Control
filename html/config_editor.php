@@ -427,6 +427,8 @@ $defaults = [
     // Shelly Pro3EM WP-Integration (wp_type=3)
     "shelly_3em_ip" => "0.0.0.0", "shelly_3em_relay_id" => "-1",
     "shelly_3em_wp_min_w" => "1000", "shelly_3em_wp_max_w" => "3000", "shelly_3em_enable" => "0",
+    // E3DC Leistungsmesser WP-Integration (wp_type=6)
+    "wp_e3dc_pm_index" => "2",
     // Stiebel Eltron ISG / WPM (wp_type=4, Live-Dienst read-only)
     "stiebel_isg_ip" => "0.0.0.0", "stiebel_isg_port" => "502", "stiebel_isg_device_id" => "1",
     "stiebel_isg_power_heating_w" => "1500", "stiebel_isg_power_dhw_w" => "2500",
@@ -793,7 +795,8 @@ $tooltips = [
 
     // Energy Manager / Smart Home
     "luxtronik"              => "Aktiviert WP-/Verbrauchslogging und, falls erlaubt, den Energy Manager. Historischer Config-Key: luxtronik. Muss bei Luxtronik, IDM, Stiebel, Dimplex oder SG-Ready per Shelly aktiv sein.",
-    "wp_type"                => "Wärmepumpen-Typ: -1=Keine WP, 0=Luxtronik (WebSocket), 1=IDM Navigator 2.0 (Modbus-TCP), 2=Heizstab/Shelly, 3=Shelly Pro3EM ohne native WP, 4=Stiebel Eltron ISG/WPM, 5=Dimplex WPM Touch/NWPM.",
+    "wp_type"                => "Wärmepumpen-Typ: -1=Keine WP, 0=Luxtronik (WebSocket), 1=IDM Navigator 2.0 (Modbus-TCP), 2=Heizstab/Shelly, 3=Shelly Pro3EM ohne native WP, 4=Stiebel Eltron ISG/WPM, 5=Dimplex WPM Touch/NWPM, 6=E3DC Leistungsmesser (PM).",
+    "wp_e3dc_pm_index"       => "PM-Index des E3DC-Leistungsmessers für die Wärmepumpe (0..7, üblich: 1..6). Plausibilität vor dem Speichern testen.",
     "wp_source_type"         => "Wärmequelle der Wärmepumpe. Quell-Erholung ist nur für speichernde Quellen wie Sole/Erdreich, Grundwasser oder Direktverdampfung sinnvoll; Luft blockiert diesen Pausenmodus.",
     "stiebel_isg_ip"        => "IP-Adresse des Stiebel-Eltron ISG im lokalen Netz.",
     "stiebel_isg_port"      => "Modbus-TCP-Port des ISG. Standard: 502.",
@@ -2271,7 +2274,7 @@ if ($configEditorRequestMethod === 'POST') {
         $guard_warnings = [];
         $old_wp_type = e3dc_cfg_scalar($v4_data, 'wp_type', $defaults['wp_type'] ?? '-1');
         $new_wp_type = e3dc_cfg_scalar($posted_values, 'wp_type', $old_wp_type);
-        $safe_wp_type = in_array($old_wp_type, ['0', '1', '3', '4', '5'], true)
+        $safe_wp_type = in_array($old_wp_type, ['0', '1', '3', '4', '5', '6'], true)
             ? $old_wp_type
             : e3dc_cfg_detect_native_wp_type($v4_data, $defaults['wp_type'] ?? '-1');
         $native_wp_configured = e3dc_cfg_native_wp_configured($v4_data)
@@ -3901,7 +3904,7 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
             elseif ($simpleHasAddress('shelly_3em_ip')) $simpleDetectedWpType = '3';
             $simpleWpType = trim($simpleRaw('wp_type', '-1'));
             if (is_numeric($simpleWpType)) $simpleWpType = (string)(int)$simpleWpType;
-            if (!in_array($simpleWpType, ['-1', '0', '1', '2', '3', '4', '5'], true)) {
+            if (!in_array($simpleWpType, ['-1', '0', '1', '2', '3', '4', '5', '6'], true)) {
                 $simpleWpType = $simpleDetectedWpType;
             } elseif ($simpleWpType === '-1' && $simpleLuxEnabled && $simpleDetectedWpType !== '-1') {
                 $simpleWpType = $simpleDetectedWpType;
@@ -3927,6 +3930,7 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
                 '3' => 'Shelly Pro3EM',
                 '4' => 'Stiebel Eltron ISG',
                 '5' => 'Dimplex WPM Touch',
+                '6' => 'E3DC Leistungsmesser (PM)',
             ];
             $simpleWpIpKey = [
                 '0' => 'luxtronik_ip',
@@ -3935,6 +3939,7 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
                 '3' => 'shelly_3em_ip',
                 '4' => 'stiebel_isg_ip',
                 '5' => 'dimplex_ip',
+                '6' => 'wp_e3dc_pm_index',
             ][$simpleWpType] ?? '';
             $simpleWpIpValue = $simpleWpIpKey !== '' ? trim($simpleRaw($simpleWpIpKey, '')) : '';
             $simpleWpSummary = $simpleWpType !== '-1'
@@ -4220,6 +4225,10 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
                             <label class="config-label">Shelly Pro3EM IP</label>
                             <input type="text" name="values[shelly_3em_ip]" class="form-control config-input" data-simple-config-field value="<?= $simpleVal('shelly_3em_ip') ?>">
                         </div>
+                        <div class="col-md-6 simple-wp-ip" data-simple-wp-types="6" style="display: <?= $simpleWpType === '6' ? 'block' : 'none' ?>;">
+                            <label class="config-label">E3DC PM-Index (0..7)</label>
+                            <input type="number" min="0" max="7" name="values[wp_e3dc_pm_index]" class="form-control config-input" data-simple-config-field value="<?= htmlspecialchars($simpleVal('wp_e3dc_pm_index', '2')) ?>" placeholder="2">
+                        </div>
                     </div>
                     <div class="config-simple-actions">
                         <button type="button" class="btn btn-sm btn-outline-warning" onclick="openAdvancedConfigGroup('group-luxtronik', 'conf_lux')" title="Vorhandene Wärmepumpe prüfen, aktivieren oder Typ wechseln.">
@@ -4342,7 +4351,8 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
                     '2' => 'Legacy Heizstab/Shelly (wird beim Speichern getrennt)',
                     '3' => 'Shelly Pro3EM Monitoring',
                     '4' => 'Stiebel Eltron ISG / WPM',
-                    '5' => 'Dimplex WPM Touch / NWPM'
+                    '5' => 'Dimplex WPM Touch / NWPM',
+                    '6' => 'E3DC Leistungsmesser (PM)'
                 ][$wp_type_val] ?? 'Keine Wärmepumpe';
                 $showWpSourceControls = $isLuxEnabled && in_array($wp_type_val, ['0','1'], true);
                 $showShellySgControls = $isLuxEnabled && in_array($wp_type_val, ['-1','0'], true);
@@ -4399,6 +4409,7 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
                                     <option value="3" <?= ($wp_type_val === '3') ? 'selected' : '' ?> <?= ($nativeWpConfigured && $wp_type_val !== '3') ? 'disabled' : '' ?>>Shelly Pro3EM (WP ohne native Anbindung)</option>
                                     <option value="4" <?= ($wp_type_val === '4') ? 'selected' : '' ?>>Stiebel Eltron ISG / WPM</option>
                                     <option value="5" <?= ($wp_type_val === '5') ? 'selected' : '' ?>>Dimplex WPM Touch / NWPM</option>
+                                    <option value="6" <?= ($wp_type_val === '6') ? 'selected' : '' ?>>E3DC Leistungsmesser (PM)</option>
                                 </select>
                                 <div class="small text-muted mt-1">
                                     Heizstab/BWWP bitte nicht als Wärmepumpe auswählen, sondern unten als Zusatzverbraucher konfigurieren.
@@ -4773,6 +4784,21 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
                                     <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['hs_min_soc'] ?? '') ?>">Mindest-SOC (%)</label>
                                     <input type="number" name="values[hs_min_soc]" class="form-control config-input" value="<?= $val('hs_min_soc') ?>" placeholder="20">
                                     <div class="text-muted" style="font-size:0.72rem;">Batterie-Reserve vor WP-Start</div>
+                                </div>
+                            <?php elseif ($wp_type_val === '6'): ?>
+                                <div class="col-12 mt-2">
+                                    <div class="alert alert-info border-0 py-2 px-3 mb-2" style="background:rgba(6,182,212,0.1);border-left:3px solid #06b6d4!important;">
+                                        <strong><i class="fas fa-gauge-high me-1"></i>E3DC Leistungsmesser (PM) — Wärmepumpe</strong><br>
+                                        <small class="text-muted">Der am E3DC-Hauskraftwerk angeschlossene Leistungsmesser erfasst den Wärmepumpenverbrauch per RSCP. Dieser Wert wird automatisch vom Gesamthausverbrauch abgezogen und fließt separat in die Wärmebedarfs- und Ladekurvenprognose ein.</small>
+                                    </div>
+                                </div>
+                                <div class="col-12 col-md-6">
+                                    <label class="config-label text-info fw-bold" data-tooltip="<?= htmlspecialchars($tooltipMap['wp_e3dc_pm_index'] ?? '') ?>"><i class="fas fa-hashtag me-1"></i>PM-Index (0..7)</label>
+                                    <div class="input-group">
+                                        <input type="number" min="0" max="7" name="values[wp_e3dc_pm_index]" id="conf_wp_e3dc_pm_index" class="form-control config-input" value="<?= htmlspecialchars($val('wp_e3dc_pm_index', '2')) ?>" placeholder="2 (üblich: 1..6)">
+                                        <button type="button" class="btn btn-outline-info" id="btn_test_pm_index" onclick="testE3dcPmIndex();"><i class="fas fa-vial me-1"></i>Zähler jetzt testen</button>
+                                    </div>
+                                    <div id="pm_test_feedback" class="mt-2 small" style="display:none;"></div>
                                 </div>
                             <?php elseif ($wp_type_val === '0'): ?>
                                 <div class="col-12">
@@ -11344,6 +11370,45 @@ function updateSimpleWpFields(wpType) {
         const types = String(el.getAttribute('data-simple-wp-types') || '').split(',').map(v => v.trim());
         el.style.display = types.includes(value) ? '' : 'none';
     });
+}
+
+function testE3dcPmIndex() {
+    const input = document.getElementById('conf_wp_e3dc_pm_index');
+    const fb = document.getElementById('pm_test_feedback');
+    const btn = document.getElementById('btn_test_pm_index');
+    if (!input || !fb) return;
+    const idx = parseInt(input.value, 10);
+    if (isNaN(idx) || idx < 0 || idx > 7) {
+        fb.style.display = 'block';
+        fb.className = 'mt-2 small alert alert-warning p-2';
+        fb.innerHTML = '<i class="fas fa-exclamation-triangle me-1"></i>Bitte einen gültigen PM-Index zwischen 0 und 7 eingeben.';
+        return;
+    }
+    fb.style.display = 'block';
+    fb.className = 'mt-2 small alert alert-info p-2';
+    fb.innerHTML = '<i class="fas fa-spinner fa-spin me-1"></i>Frage E3DC PM-Index ' + idx + ' per RSCP ab...';
+    if (btn) btn.disabled = true;
+
+    fetch('index.php?action=test_pm_index&index=' + idx)
+        .then(r => r.json())
+        .then(data => {
+            if (btn) btn.disabled = false;
+            if (data.success && data.plausible_consumer) {
+                fb.className = 'mt-2 small alert alert-success p-2';
+                fb.innerHTML = '<i class="fas fa-check-circle me-1"></i><strong>Plausibel!</strong> ' + (data.message || 'Leistungsbezug erkannt.');
+            } else if (data.success && data.is_producer) {
+                fb.className = 'mt-2 small alert alert-danger p-2';
+                fb.innerHTML = '<i class="fas fa-hand me-1"></i><strong>Veto / Warnung!</strong> ' + (data.message || 'Zähler misst Einspeisung (Erzeugungsanlage, keine WP)!');
+            } else {
+                fb.className = 'mt-2 small alert alert-danger p-2';
+                fb.innerHTML = '<i class="fas fa-times-circle me-1"></i><strong>Fehler:</strong> ' + (data.message || data.error || 'Zähler antwortet nicht.');
+            }
+        })
+        .catch(err => {
+            if (btn) btn.disabled = false;
+            fb.className = 'mt-2 small alert alert-danger p-2';
+            fb.innerHTML = '<i class="fas fa-times-circle me-1"></i>Verbindungsfehler: ' + err;
+        });
 }
 
 function activeConfigEditorView() {

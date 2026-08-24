@@ -6,6 +6,39 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.4b] – 2026-08-24
+
+### 🔄 Universelles Update mit kurzer Betriebsunterbrechung
+
+- **Ein gemeinsamer Einstieg für alte und veränderte Installationen:** Weboberfläche, Konsole, Installer-Menü und die einzelne Community-Datei `e3dc-update-bootstrap` starten denselben aktuellen Ziel-Updater. Eine laufende Einzelinstanz wird aus ihrem Dienst gebunden; ein abweichender Benutzername, Installationsordner, fehlende Dateien, frühere Rechte oder lokale Produktänderungen sind keine vorgelagerte Updateautorität mehr. Mehrere gleichrangige Instanzen werden angezeigt und nicht geraten.
+- **Backup vor dem kurzen Dienststopp:** Der Zielstand und die tatsächlich zu sichernden Produkt-, Konfigurations- und Betriebsdaten werden zuerst geprüft und gesichert. Erst für die abschließende Datei-, Rechte- und Unit-Projektion werden die Writer gestoppt; nach Healthcheck und bestätigtem Wiederanlauf wird der Startschutz entfernt.
+- **Belegter Rückweg statt unverständlichem Abbruch:** 5.4.4b erkennt exakt gebundene, bereits abgeschlossene Sicherheitsreste aus 5.4.4 und 5.4.4a und darf nur deren eigenen Rest bereinigen. Ein ausstehender, fremder oder widersprüchlicher Zustand bleibt fail-closed. Abbrüche nennen Ursache, Systemzustand, Ziel und genau den nächsten sicheren Diagnose- oder Reparaturbefehl.
+
+### 🐳 Docker-Update und Rückfall
+
+- **Bestehende Docker-Installationen werden auf dem Host aktualisiert:** Der Compose-Helfer unterstützt den gebundenen Wechsel älterer Images auf 5.4.4b, prüft Image-ID, OCI-Version und Laufzeitgesundheit und hält persistente Volumes unverändert.
+- **Kandidat und Rückfall bleiben getrennt:** Scheitert Download, Start oder Healthcheck, wird der fehlerhafte Kandidat gestoppt und der belegte Ausgangsstand wiederhergestellt. Der veröffentlichte Docker-Rollback-Root `v5.3.2b` samt festem Digest bleibt unverändert.
+
+### 🚗 Wallbox, PV-Überschuss und Pre-Dump
+
+- **PV-Überschuss bleibt vollständig für das Fahrzeug verfügbar:** Ein kleineres Storage-Budget deckelt im Sonnenmodus nicht länger den batterieneutralen PV-Anteil. Pre-Dump übergibt ausschließlich eine typisierte zusätzliche Batterieentladung; PV-Anteil und Entladezusatz werden nicht doppelt gezählt.
+- **0,1-A-Regelung in gemischten Anlagen:** Ist nur eine frische, verbundene und kommandierbare Wallbox mit 0,1-A-Unterstützung aktiv, wird ihre Feinregelung nicht länger durch eine ausgesteckte zweite Wallbox auf 1 A vergröbert. Unklare oder veraltete Statusdaten bleiben konservativ bei 1 A.
+- **Laufende Ladung bleibt beim Phasenentscheid erhalten:** Eine noch ausstehende Phasenempfehlung führt ohne aktive Übergangsreservierung nicht mehr unnötig zu 0 A beziehungsweise STOP. Der mindestens 480 Sekunden lange Cooldown sperrt weiterhin nur einen weiteren Phasenwechsel.
+
+### ♨️ Wärmepumpe, Speicher und Direktvermarktung
+
+- **E3DC-Leistungsmesser als Wärmepumpenquelle:** `wp_type = 6` liest einen konfigurierbaren E3DC-PM-Index mit vollständigen Phasenwerten. Ein Erzeuger- oder Rückspeisewert wird strikt als ungültig abgewiesen und niemals als 0-W-Verbrauch in die Regelung übernommen.
+- **PV-Boost bleibt auch im Warmwasser-Zeitfenster nutzbar:** Bei aktivem Automatikmodus und thermischem PV-Potenzial hat `pv_surplus` mit dem Boost-Sollwert Vorrang vor dem statischen Komfort-Zeitplan. Die Timer-Klassen bleiben gültige Startnachfragen; nach einer abgelaufenen, nicht rollierend verlängerten Retry-Sperre kann bei fortbestehendem Überschuss sofort ein frisches Startbudget angeboten werden.
+- **Ladekurve und Wallbox bleiben gekoppelt:** Bei aktiver Wallbox führt der Storage-Regler den Speicher im E3DC-AUTO-Modus am berechneten `iFc`-Laderahmen; die Entladestützung des Hauses bleibt frei. Pre-Curve-Holds ohne reales Ladeangebot erzeugen keine unnötige 0-W-Grenze.
+- **Preisqualität der Direktvermarktung bleibt eindeutig:** Endkundentarife werden auch über die ergänzten Quellenfelder als solche erkannt und nicht als belastbarer Direktvermarktungs-Marktpreis verwendet. Ungeeignete Preisslots öffnen kein wirtschaftliches DV-Fenster.
+- **Aktive Direktvermarktung wird als solche dargestellt:** Ein ausgegebener RSCP-Auftrag mit bestätigtem Hardware-Effekt gilt auch ohne synchrones ACK als wirksam. Das Fahrplan-Diagramm kennzeichnet diesen Zustand mit `DV-Export aktiv`, statt ihn fälschlich als nicht freigegeben darzustellen.
+
+### 🖥️ Diagnose und Frontend
+
+- **Wärmepumpen-Warteursache statt leerem Budget:** Das Dashboard zeigt angeforderte Startleistung, tatsächlich autorisiertes Budget und den nachrangigen Empfänger eines nicht nutzbaren Restbudgets.
+- **Messwerte können vor der Freigabe geprüft werden:** Der Konfigurationsdialog testet den E3DC-PM-Index und kennzeichnet Verbraucher, Erzeuger sowie fehlende Phasen eindeutig. Wallbox-Status, PV-Budget und Ladeführung werden mit der tatsächlich kommandierbaren Box dargestellt.
+- **Klimatagesverbrauch ohne Doppelanzeige:** Der Tageswert bleibt auf der eigenen Klima-Karte sichtbar; das redundante zusätzliche Badge in der Haus-Kachel entfällt.
+
 ## [5.4.4a] – 2026-08-19
 
 ### 🚗 Wallbox-Regelung & Phasenwechsel

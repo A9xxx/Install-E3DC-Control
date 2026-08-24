@@ -98,6 +98,12 @@ function e3dcWbTxConfiguredContext(array $config, array $options = []) {
     $installRoot = $test
         ? (string)($options['install_root'] ?? '')
         : rtrim((string)($flat['install_path'] ?? ''), '/');
+    if ($installRoot === '' && function_exists('getInstallPath')) {
+        $resolvedInstallPath = (string)getInstallPath();
+        if ($resolvedInstallPath !== '') {
+            $installRoot = rtrim($resolvedInstallPath, '/');
+        }
+    }
     $planner = $test
         ? (string)($options['planner_script'] ?? '')
         : $installRoot . '/Installer/wallbox_planer.py';
@@ -522,7 +528,7 @@ function e3dcWbTxAcquireSharedRequestLock(
     } else {
         if (($expectedGid !== null && (int)$meta['gid'] !== (int)$expectedGid)
             || ($ownerUids !== null && !in_array((int)$meta['uid'], $ownerUids, true))
-            || (!$strictSharedLock && ((((int)$meta['mode']) & 0777) !== $expectedMode) && !@chmod($path, (int)$mode))) {
+            || (!$strictSharedLock && !@chmod($path, (int)$mode))) {
             @fclose($handle);
             return false;
         }

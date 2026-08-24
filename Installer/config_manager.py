@@ -376,6 +376,8 @@ V4_BLOCK_HEATPUMP = {
     'shelly_3em_wp_min_w', # WP Mindestleistung als Einschaltschwelle (W)
     'shelly_3em_wp_max_w', # WP-Nennleistung für Budgetberechnung (W)
     'shelly_3em_enable',   # 1=PV-Auto-Schalten, 0=nur Messen
+    # E3DC Leistungsmesser WP-Integration (wp_type=6)
+    'wp_e3dc_pm_index',    # PM-Index des E3DC-Leistungsmessers (0..7, üblich 1..6)
     # Klimaanlage / gemessener Zusatzverbraucher
     'climate_enable',
     'climate_name',

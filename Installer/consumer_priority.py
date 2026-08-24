@@ -29,6 +29,8 @@ CONSUMER_ALIASES = {
 }
 
 CONSUMER_BUDGET_SCHEMA = "flexible_consumer_budget_contract_v1"
+PRE_DUMP_DISCHARGE_ADD_SCHEMA = "predump_discharge_add_contract_v1"
+HEATPUMP_START_FUNDING_SCHEMA = "heatpump_start_funding_v1"
 
 
 def _strict_nonnegative_int(value):
@@ -273,6 +275,30 @@ def allocate_consumer_budget_contract(
             requested_total_w=total,
             order=parsed_order,
         )
+
+    hp_request_w = requests.get("heatpump", 0)
+    hp_allocated_w = allocations.get("heatpump", 0)
+    hp_min_w = minimums.get("heatpump", 0)
+    if hp_allocated_w >= hp_min_w and hp_allocated_w > 0:
+        hp_start_state = "authorized"
+        hp_start_reason_code = "start_lease_authorized"
+    elif hp_request_w > 0:
+        hp_start_state = "unfunded"
+        hp_start_reason_code = "start_lease_unfunded"
+    else:
+        hp_start_state = "idle"
+        hp_start_reason_code = "none"
+
+    if hp_request_w > 0 and hp_allocated_w == 0:
+        if allocations.get("wallbox", 0) > 0:
+            released_receiver = "wallbox"
+        elif allocations.get("heater", 0) > 0:
+            released_receiver = "heater"
+        else:
+            released_receiver = "none"
+    else:
+        released_receiver = "none"
+
     return {
         "schema_version": CONSUMER_BUDGET_SCHEMA,
         "valid": True,
@@ -296,6 +322,11 @@ def allocate_consumer_budget_contract(
         "priority_front": front,
         "invariant_conserved": conserved,
         "blockers": sorted(set(blockers)),
+        "heatpump_start_request_w": int(hp_request_w),
+        "authorized_heatpump_budget_w": int(hp_allocated_w),
+        "heatpump_start_state": hp_start_state,
+        "heatpump_start_reason_code": hp_start_reason_code,
+        "released_budget_receiver": released_receiver,
     }
 
 
@@ -459,6 +490,20 @@ def cap_consumer_budget_contract(contract, caps_w):
         command_allocations[consumer] = (
             capped if command_eligible.get(consumer) is True else 0
         )
+    if "predump_discharge_add_contract" in result and isinstance(
+        result["predump_discharge_add_contract"], dict
+    ):
+        p_contract = dict(result["predump_discharge_add_contract"])
+        p_allocs = dict(p_contract.get("allocations_w") or {})
+        for consumer in CONSUMERS:
+            if consumer in applied_caps:
+                p_allocs[consumer] = min(
+                    p_allocs.get(consumer, 0),
+                    applied_caps[consumer],
+                )
+        p_contract["allocations_w"] = p_allocs
+        p_contract["allocation_sum_w"] = sum(p_allocs.values())
+        result["predump_discharge_add_contract"] = p_contract
     result.update({
         "allocations": allocations,
         "accounting_allocations": dict(allocations),
@@ -468,6 +513,201 @@ def cap_consumer_budget_contract(contract, caps_w):
         "invariant_conserved": True,
     })
     return result
+
+
+def build_predump_discharge_add_contract(
+    *,
+    valid,
+    authorization_status,
+    reason_code,
+    source_ts,
+    source_frame_revision,
+    no_grid=True,
+    grid_fallback=False,
+    target_discharge_w=0,
+    nonflexible_load_w=0,
+    pv_supply_w=0,
+    available_discharge_pool_w=0,
+    eligible=None,
+    requests_w=None,
+    allocations_w=None,
+    order=None,
+    contract_revision="",
+):
+    """Baut den typisierten predump_discharge_add_contract_v1."""
+    parsed_order = parse_priority_order(order)
+    clean_target = _strict_nonnegative_int(target_discharge_w) or 0
+    clean_nonflex = _strict_nonnegative_int(nonflexible_load_w) or 0
+    clean_pv = _strict_nonnegative_int(pv_supply_w) or 0
+    clean_pool = _strict_nonnegative_int(available_discharge_pool_w) or 0
+    clean_eligible = _strict_bool_map(eligible, default=False) or {
+        c: False for c in CONSUMERS
+    }
+    clean_requests = _strict_power_map(
+        requests_w, defaults={c: 0 for c in CONSUMERS}
+    ) or {c: 0 for c in CONSUMERS}
+    clean_allocations = _strict_power_map(
+        allocations_w, defaults={c: 0 for c in CONSUMERS}
+    ) or {c: 0 for c in CONSUMERS}
+    clean_source_ts = _strict_time(source_ts) or 0.0
+
+    natural_deficit = max(0, clean_nonflex - clean_pv)
+    pool_computed = max(0, clean_target - natural_deficit)
+    allocation_sum = sum(clean_allocations.values())
+    remaining = max(0, clean_pool - allocation_sum)
+    invariant_conserved = bool(
+        allocation_sum <= clean_pool and clean_pool <= pool_computed
+    )
+
+    is_valid = bool(
+        valid
+        and not grid_fallback
+        and no_grid
+        and clean_source_ts > 0.0
+        and invariant_conserved
+    )
+    if not is_valid:
+        clean_allocations = {c: 0 for c in CONSUMERS}
+        allocation_sum = 0
+        remaining = 0
+
+    return {
+        "schema_version": PRE_DUMP_DISCHARGE_ADD_SCHEMA,
+        "valid": is_valid,
+        "authorization_status": str(
+            authorization_status or ("authorized" if is_valid else "invalid")
+        ),
+        "reason_code": str(
+            reason_code or ("predump_authorized" if is_valid else "predump_invalid")
+        ),
+        "owner": "storage_manager",
+        "effect": "additional_battery_discharge_only",
+        "source_ts": clean_source_ts,
+        "source_frame_revision": str(source_frame_revision or ""),
+        "no_grid": bool(no_grid),
+        "grid_fallback": bool(grid_fallback),
+        "target_discharge_w": clean_target,
+        "nonflexible_load_w": clean_nonflex,
+        "pv_supply_w": clean_pv,
+        "natural_deficit_w": natural_deficit,
+        "available_discharge_pool_w": clean_pool,
+        "eligible": clean_eligible,
+        "requests_w": clean_requests,
+        "allocations_w": clean_allocations,
+        "allocation_sum_w": allocation_sum,
+        "remaining_w": remaining,
+        "consumer_priority_order": parsed_order,
+        "invariant_conserved": invariant_conserved,
+        "contract_revision": str(contract_revision or ""),
+    }
+
+
+def validate_predump_discharge_add_contract(contract):
+    """Validiert predump_discharge_add_contract_v1 fail-closed."""
+    if not isinstance(contract, dict):
+        return {
+            "valid": False,
+            "reason_code": "contract_not_dict",
+            "allocations_w": {c: 0 for c in CONSUMERS},
+        }
+    if contract.get("schema_version") != PRE_DUMP_DISCHARGE_ADD_SCHEMA:
+        return {
+            "valid": False,
+            "reason_code": "schema_invalid",
+            "allocations_w": {c: 0 for c in CONSUMERS},
+        }
+    if contract.get("owner") != "storage_manager":
+        return {
+            "valid": False,
+            "reason_code": "owner_invalid",
+            "allocations_w": {c: 0 for c in CONSUMERS},
+        }
+    if contract.get("effect") != "additional_battery_discharge_only":
+        return {
+            "valid": False,
+            "reason_code": "effect_invalid",
+            "allocations_w": {c: 0 for c in CONSUMERS},
+        }
+    if contract.get("valid") is not True:
+        return {
+            "valid": False,
+            "reason_code": str(contract.get("reason_code") or "contract_invalid"),
+            "allocations_w": {c: 0 for c in CONSUMERS},
+        }
+    if contract.get("grid_fallback") is True or contract.get("no_grid") is not True:
+        return {
+            "valid": False,
+            "reason_code": "grid_fallback_active",
+            "allocations_w": {c: 0 for c in CONSUMERS},
+        }
+
+    allocations = _strict_power_map(contract.get("allocations_w"))
+    if allocations is None:
+        return {
+            "valid": False,
+            "reason_code": "allocations_type_invalid",
+            "allocations_w": {c: 0 for c in CONSUMERS},
+        }
+    pool = _strict_nonnegative_int(contract.get("available_discharge_pool_w"))
+    if pool is None or sum(allocations.values()) > pool:
+        return {
+            "valid": False,
+            "reason_code": "allocations_exceed_pool",
+            "allocations_w": {c: 0 for c in CONSUMERS},
+        }
+
+    return {
+        "valid": True,
+        "reason_code": "predump_contract_valid",
+        "allocations_w": allocations,
+        "available_discharge_pool_w": pool,
+    }
+
+
+def build_heatpump_start_funding_contract(
+    *,
+    required_start_w,
+    accounting_allocated_w,
+    command_authorized_w,
+    state,
+    reason_code,
+    released_budget_receiver="none",
+    released_budget_w=0,
+    released_budget_allocations_w=None,
+):
+    """Baut den Vertrag heatpump_start_funding_v1."""
+    clean_req = _strict_nonnegative_int(required_start_w) or 0
+    clean_acc = _strict_nonnegative_int(accounting_allocated_w) or 0
+    clean_cmd = _strict_nonnegative_int(command_authorized_w) or 0
+    clean_rel_w = _strict_nonnegative_int(released_budget_w) or 0
+    clean_receiver = str(released_budget_receiver or "none").strip().lower()
+    if clean_receiver not in ("wallbox", "heater", "none"):
+        clean_receiver = "none"
+    clean_allocs = _strict_power_map(
+        released_budget_allocations_w, defaults={c: 0 for c in CONSUMERS}
+    ) or {c: 0 for c in CONSUMERS}
+
+    return {
+        "schema_version": HEATPUMP_START_FUNDING_SCHEMA,
+        "required_start_w": clean_req,
+        "accounting_allocated_w": clean_acc,
+        "command_authorized_w": clean_cmd,
+        "state": str(state or "idle"),
+        "reason_code": str(reason_code or ""),
+        "released_budget_receiver": clean_receiver,
+        "released_budget_w": clean_rel_w,
+        "released_budget_allocations_w": clean_allocs,
+    }
+
+
+def validate_heatpump_start_funding_contract(contract):
+    """Validiert heatpump_start_funding_v1."""
+    if not isinstance(contract, dict):
+        return {"valid": False, "reason_code": "contract_not_dict"}
+    if contract.get("schema_version") != HEATPUMP_START_FUNDING_SCHEMA:
+        return {"valid": False, "reason_code": "schema_invalid"}
+    return {"valid": True, "reason_code": "heatpump_start_funding_valid"}
+
 
 
 def parse_priority_order(value):

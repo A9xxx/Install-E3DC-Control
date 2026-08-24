@@ -3277,7 +3277,8 @@ if (!function_exists('sumStoragePlanWindowKwh')) {
             $sums['pv_kwh']   += $effectivePvW / 1000.0 * 0.25 * $weight;
             $sums['home_kwh'] += $slotHomeW / 1000.0 * 0.25 * $weight;
             $sums['wp_kwh']   += $slotWpW / 1000.0 * 0.25 * $weight;
-            $sums['climate_kwh'] += $slotClimateW / 1000.0 * 0.25 * $weight;
+            $sums['climate_kwh'] += max(0.0, (float)($slot['climate_w'] ?? 0.0)) / 1000.0 * 0.25 * $weight;
+
             $found = true;
         }
         if (!$found) return null;
@@ -3358,7 +3359,10 @@ if (isset($pvForecastsParsed) && $pvForecastsParsed) {
     $data['stable_today_pv_kwh'] = null;
 }
 
-// Für die Kopfzeile zählt "Heute" als Restprognose ab jetzt für Verbrauch, aber als voller Tagesertrag für PV.
+// Für die Kopfzeile zählt "Heute" als Restprognose ab jetzt. Die normale
+// Tagesaggregation oben bleibt für Morgen/Übermorgen erhalten, aber heute
+// darf spaet am Abend nicht mehr den bereits vergangenen Haus-/WP-Verbrauch
+// anzeigen.
 $todayRest = (isset($storagePlanParsed['timeline']) && is_array($storagePlanParsed['timeline']))
     ? sumStoragePlanRestOfTodayKwh($storagePlanParsed['timeline'], $todayRestStartMs, $midnightNextMs, $directMarketingActive)
     : null;
@@ -3367,17 +3371,17 @@ $todayFullDay = (isset($storagePlanParsed['timeline']) && is_array($storagePlanP
     : null;
 
 if ($todayRest !== null) {
+    if (($todayRest['pv_kwh'] ?? 0.0) <= 0.0 && isset($forecastPvDaySums['today']) && $forecastPvDaySums['today'] > 0.0) {
+        $todayRest['pv_kwh'] = $forecastPvDaySums['today'];
+    }
     $todayPvKwh = ($todayFullDay !== null && ($todayFullDay['pv_kwh'] ?? 0.0) > 0.0)
         ? $todayFullDay['pv_kwh']
         : ($forecastPvDaySums['today'] ?? ($todayRest['pv_kwh'] ?? 0.0));
-    $dailySums['today'] = [
-        'pv_kwh' => round($todayPvKwh, 1),
-        'home_kwh' => round($todayRest['home_kwh'], 1),
-        'wp_kwh' => round($todayRest['wp_kwh'], 1),
-        'climate_kwh' => round($todayRest['climate_kwh'], 1),
-    ];
+    $todayRest['pv_kwh'] = round($todayPvKwh, 1);
+    $dailySums['today'] = $todayRest;
     $data['stable_today_pv_kwh'] = $dailySums['today']['pv_kwh'];
 }
+
 
 // Für Morgen/Übermorgen bereinigte Werte aus der Speicherplanung nutzen
 if (isset($storagePlanParsed['timeline']) && is_array($storagePlanParsed['timeline'])) {
@@ -3389,9 +3393,9 @@ if (isset($storagePlanParsed['timeline']) && is_array($storagePlanParsed['timeli
         $planDay = sumStoragePlanWindowKwh($storagePlanParsed['timeline'], $dayStartMs, $dayStartMs + (24 * 3600 * 1000), $directMarketingActive);
         if ($planDay === null) continue;
         if (!isset($dailySums[$key])) $dailySums[$key] = ['pv_kwh' => 0.0, 'home_kwh' => 0.0, 'wp_kwh' => 0.0, 'climate_kwh' => 0.0];
-        $dailySums[$key]['home_kwh'] = round($planDay['home_kwh'], 1);
-        $dailySums[$key]['wp_kwh'] = round($planDay['wp_kwh'], 1);
-        $dailySums[$key]['climate_kwh'] = round($planDay['climate_kwh'], 1);
+        $dailySums[$key]['home_kwh'] = $planDay['home_kwh'];
+        $dailySums[$key]['wp_kwh'] = $planDay['wp_kwh'];
+        $dailySums[$key]['climate_kwh'] = $planDay['climate_kwh'];
         $dailySums[$key]['pv_kwh'] = round(($planDay['pv_kwh'] > 0.0) ? $planDay['pv_kwh'] : ($forecastPvDaySums[$key] ?? 0.0), 1);
     }
 }

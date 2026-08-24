@@ -5796,12 +5796,27 @@ async function runModuleAction(moduleKey, action) {
 
 async function runGlobalAction(action) {
     const log = document.getElementById('actionLog');
-    log.textContent = `Lese ${action}...`;
+    const label = (typeof actionLabel === 'function' ? actionLabel(action) : null) || action;
+    log.textContent = `Lese ${label}...`;
+    if (typeof showJobModal === 'function') {
+        showJobModal(
+            `<i class="fas fa-traffic-light text-info me-2"></i>Prüfung läuft`,
+            `${esc(label)} · Read-Only Analyse`,
+            '<div class="job-progress-box"><i class="fas fa-spinner fa-spin warn me-1"></i>Analysiere Module und Systemstand...</div>',
+            true
+        );
+    }
     try {
         const data = await loadJson(`install_center.php?action=${encodeURIComponent(action)}`);
-        log.innerHTML = renderActionResult(data, action);
+        const html = renderActionResult(data, action);
+        log.innerHTML = html;
+        const modalBody = document.getElementById('jobModalBody');
+        if (modalBody) modalBody.innerHTML = html;
     } catch (err) {
-        log.textContent = `Fehler: ${err.message}`;
+        const errHtml = `<div class="bad">Prüfung fehlgeschlagen: ${esc(err.message || err)}</div>`;
+        log.innerHTML = errHtml;
+        const modalBody = document.getElementById('jobModalBody');
+        if (modalBody) modalBody.innerHTML = errHtml;
     }
 }
 

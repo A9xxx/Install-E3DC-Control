@@ -1,6 +1,16 @@
 # Speicher-Ladesteuerung - Systemablauf
 
-> **Stand:** v5.4.4, gegen den Release-Betriebsvertrag geprüft am 2026-08-17
+> **Stand:** v5.4.4b, gegen den Release-Betriebsvertrag geprüft am 2026-08-24
+>
+> **Neu in 5.4.4b:** Im Sonnenmodus bleibt der batterieneutrale
+> PV-Überschuss ein unantastbarer Wallbox-Mindestrahmen. Das Storage-Budget
+> autorisiert ausschließlich darüber hinausgehende Leistung; Pre-Dump liefert
+> diese Batterieentladung als typisierten, frischen
+> `predump_discharge_add_contract_v1`, damit PV-Anteil und Entladezusatz nicht
+> doppelt gezählt werden. Bei aktiver Wallbox bindet die parallele
+> Speicherführung den AUTO-Laderahmen an `iFc`, ohne die Entladestützung zu
+> sperren. Die Verbraucherpriorität weist einen nicht vollständig finanzierbaren
+> Wärmepumpen-Startwunsch samt tatsächlichem nachrangigem Empfänger aus.
 >
 > **Neu in 5.4.4:** Bei aktiver Direktvermarktung wird genau ein effektiver
 > Speicherplan aus Plan, Slot, Aktion, Zeitfenster, Owner und bestätigtem

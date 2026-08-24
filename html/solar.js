@@ -1775,9 +1775,15 @@ function renderStorageCurveSparkline(data = {}) {
     }
     const series = storageSparklineSeries(data);
     if (series.state !== 'bound') {
-        clear(series.state === 'plan_mismatch' ? 'mismatch' : 'missing', series.state === 'plan_mismatch'
-            ? 'Planrevision passt nicht'
-            : 'Keine SoC-Prognose');
+        const effectivePlan = data.effective_storage_plan && typeof data.effective_storage_plan === 'object'
+            ? data.effective_storage_plan
+            : {};
+        const isDvExport = effectivePlan.status === 'DIRECT_MARKETING_ECONOMIC_EXPORT_EFFECTIVE'
+            || effectivePlan.effective_action === 'ECONOMIC_EXPORT'
+            || effectivePlan.direct_marketing_active === true;
+        clear(series.state === 'plan_mismatch' ? 'mismatch' : 'missing', isDvExport
+            ? 'DV-Export aktiv'
+            : (series.state === 'plan_mismatch' ? 'Planrevision passt nicht' : 'Keine SoC-Prognose'));
         return;
     }
     const domainPoints = series.forecast.concat(series.target);
@@ -2332,7 +2338,7 @@ function directMarketingRuntimePhysicalAction(data = {}) {
         || runtime.executable !== true
         || runtime.commands_allowed !== true
         || requested.dispatch_authorized !== true
-        || requested.confirmed !== true
+        || (requested.confirmed !== true && !(requested.hardware_effect === true && requested.issued === true))
         || requested.hardware_effect !== true
     ) {
         return null;
@@ -6962,7 +6968,7 @@ function livePvSourceInfo(data) {
 
 function livePvSourceSplitText(data, separator = ' | ', compact = false) {
     const pv = livePvSourceInfo(data);
-    if (!(pv.topologyPresent || pv.external > 20 || pv.dcOnly)) return '';
+    if (!(pv.external > 20 || (pv.locked && pv.dcOnlyActive))) return '';
     const e3dcLabel = compact && !getEnergyFlowLabels().pv ? 'E3DC' : getFlowLabel('pv');
     const externalLabel = getFlowLabel('external_pv');
     const parts = [
@@ -6974,7 +6980,7 @@ function livePvSourceSplitText(data, separator = ' | ', compact = false) {
 
 function livePvSourceSplitHtml(data, separator = ' | ', compact = false) {
     const pv = livePvSourceInfo(data);
-    if (!(pv.topologyPresent || pv.external > 20 || pv.dcOnly)) return '';
+    if (!(pv.external > 20 || (pv.locked && pv.dcOnlyActive))) return '';
     const e3dcLabel = compact && !getEnergyFlowLabels().pv ? 'E3DC' : getFlowLabel('pv');
     const externalLabel = getFlowLabel('external_pv');
     const lock = pv.locked
@@ -7965,9 +7971,14 @@ function loadJsForecastChart(file = '') {
         .then(r => r.json())
         .then(data => {
             if (!isCurrentJsChartRequest('forecast', requestGeneration)) return;
+            const directMarketingView = renderDirectMarketingForecastChart(data, {exclusive: true});
+            if (directMarketingView && directMarketingView.active === true) return;
             updateForecastProjectionStatus(data);
-            renderDirectMarketingForecastChart(data, {exclusive: false});
             if (data.error || !data.labels || data.labels.length === 0) return;
+
+
+
+
 
             // SoC kommt aus der physikalischen Batterie-Bilanz der Prognose.
             // Keine nachträgliche Wert-Glättung, sonst kann die Linie vor
@@ -9519,12 +9530,16 @@ function processLiveData(data) {
 
         if (data.autarky_day !== undefined) $('#val-autarky-day').text(Math.round(data.autarky_day) + '%');
         if (data.selfcon_day !== undefined) $('#val-selfcon-day').text(Math.round(data.selfcon_day) + '%');
-        if (document.getElementById('climate-today')) {
+        if (document.getElementById('climate-card-today-value') || document.getElementById('climate-today')) {
             const climateToday = normalizeKwh(data.climate_daily_kwh, null);
             const climateStatsToday = data.stats ? normalizeKwh(data.stats.total_climate_kwh, null) : null;
             const climateTodayValue = climateToday !== null ? climateToday : climateStatsToday;
-            $('#climate-today').text(formatKwh(climateTodayValue, 2));
-            $('#climate-card-today-value').text(formatKwh(climateTodayValue, 2));
+            if (document.getElementById('climate-today')) {
+                $('#climate-today').text(formatKwh(climateTodayValue, 2));
+            }
+            if (document.getElementById('climate-card-today-value')) {
+                $('#climate-card-today-value').text(formatKwh(climateTodayValue, 2));
+            }
         }
         if (document.getElementById('val-climate-card')) {
             $('#val-climate-card').html(formatWatts(climateVal));
@@ -9623,6 +9638,44 @@ function processLiveData(data) {
                         alert('Fehler beim Speichern der Wallbox-Pause!');
                     });
             });
+        };
+
+        window.triggerWallboxForceStart = function(wbIdx) {
+            wbIdx = String(wbIdx || '1');
+            const btn = $(`[data-dashboard-wb-force-start="${wbIdx}"]`);
+            const icon = btn.find('i');
+            icon.attr('class', 'fas fa-spinner fa-spin');
+            btn.prop('disabled', true);
+            const formData = new FormData();
+            formData.append('trigger_wb_force_start_ajax', '1');
+            formData.append('wb_id', wbIdx);
+            formData.append('csrf_token', String(window.E3DC_CSRF_TOKEN || ''));
+            fetch('Wallbox.php', {
+                method: 'POST',
+                headers: {
+                    'X-Requested-With': 'XMLHttpRequest',
+                    'X-CSRF-Token': String(window.E3DC_CSRF_TOKEN || '')
+                },
+                body: formData
+            })
+                .then(res => {
+                    if (!res.ok) throw new Error('Network error');
+                    return res.json();
+                })
+                .then(payload => {
+                    icon.attr('class', 'fas fa-check text-success');
+                    setTimeout(() => {
+                        icon.attr('class', 'fas fa-play');
+                        btn.prop('disabled', false);
+                    }, 2500);
+                })
+                .catch(err => {
+                    icon.attr('class', 'fas fa-exclamation-triangle text-danger');
+                    setTimeout(() => {
+                        icon.attr('class', 'fas fa-play');
+                        btn.prop('disabled', false);
+                    }, 3000);
+                });
         };
 
         const updateSingleWallboxUI = (id, power, locked, mode, p1, p2, p3, session, apparentKva, powerFactor, setAmp, capAmp, statusAmp, offeredCurrentRaw, currentStepAmp, fractionalCurrentSupported, peaks, carName) => {
@@ -11403,7 +11456,7 @@ function showStorageCurveModal() {
     const directMarketingActive = directMarketingView.active === true;
     const standardChartWrap = document.getElementById('sc-standard-chart-wrap');
     const directMarketingChartWrap = document.getElementById('sc-direct-marketing-chart-wrap');
-    if (standardChartWrap) standardChartWrap.style.display = '';
+    if (standardChartWrap) standardChartWrap.style.display = directMarketingActive ? 'none' : '';
     if (directMarketingChartWrap) directMarketingChartWrap.style.display = directMarketingActive ? '' : 'none';
     $('#sc-current-soc').text(currentSoc !== null ? `${currentSoc.toFixed(1)}%` : '--%');
     $('#sc-modal-day').text(meta.display_day_label || 'Heute');
@@ -11463,17 +11516,24 @@ function showStorageCurveModal() {
     const today0 = displayStart ? new Date(displayStart) : new Date();
     today0.setHours(0,0,0,0);
 
-    // Modal-Charts rendern: Die Standard-Ladekurve wird immer gerendert.
-    // Bei aktiver Direktvermarktung wird zusätzlich der DV-Fahrplan gerendert.
-    const renderModalCharts = () => {
-        _renderStorageCurveChart(_storageCurvePendingSocPoints);
-        if (directMarketingActive) {
-            _renderDirectMarketingTrajectoryChart();
+    if (directMarketingActive) {
+        if (_storageCurveChartInstance) {
+            _storageCurveChartInstance.destroy();
+            _storageCurveChartInstance = null;
         }
-    };
-    $(el).one('shown.bs.modal', renderModalCharts);
-    renderModalCharts();
-    setTimeout(renderModalCharts, 150);
+    } else if (_directMarketingTrajectoryChartInstance) {
+        _directMarketingTrajectoryChartInstance.destroy();
+        _directMarketingTrajectoryChartInstance = null;
+    }
+
+    const renderModalChart = directMarketingActive
+        ? () => _renderDirectMarketingTrajectoryChart()
+        : () => _renderStorageCurveChart([]);
+    $(el).one('shown.bs.modal', renderModalChart);
+    renderModalChart();
+    setTimeout(renderModalChart, 150);
+
+    if (directMarketingActive) return;
 
     // Historische IST-SoC-Linie für die Standard-Ladekurve nachladen
     const historyUrl = 'get_live_json.php?storage_curve_history=1&day_start_ms='
@@ -11489,15 +11549,11 @@ function showStorageCurveModal() {
                 .sort((a, b) => a.ts - b.ts)
             : [];
         _renderStorageCurveChart(socPoints);
-        if (directMarketingActive) {
-            _renderDirectMarketingTrajectoryChart();
-        }
     }).fail(function() {
         _renderStorageCurveChart([]);
-        if (directMarketingActive) {
-            _renderDirectMarketingTrajectoryChart();
-        }
     });
+
+
 }
 
 function _renderStorageCurveChart(socPoints) {

@@ -99,8 +99,15 @@ RUN find -P /app/pi/Install -xdev -type d -exec chmod 0755 -- {} + && \
     test -f /app/pi/Install/Installer/direct_marketing_actions.py && \
     test -f /app/pi/Install/Installer/docker_healthcheck.py && \
     test -f /app/pi/Install/Installer/ha_writer_admission.py && \
+    test -f /app/pi/Install/Installer/probe_pm.py && \
     test -f /app/pi/Install/Installer/secure_file_transaction.py && \
     test -f /app/pi/Install/Installer/storage_owner_paths.py && \
+    test -f /app/pi/Install/Installer/update_legacy_safety.py && \
+    test -f /app/pi/Install/Installer/update_offline_preflight.py && \
+    test -f /app/pi/Install/Installer/update_prejournal_construction.py && \
+    test -f /app/pi/Install/Installer/update_recovery_context.py && \
+    test -f /app/pi/Install/Installer/update_recovery_journal.py && \
+    test -f /app/pi/Install/Installer/update_recovery_surface.py && \
     test -f /app/pi/Install/Installer/docker_compose_update.py && \
     test -f /app/pi/Install/Installer/docker_logrotate_manager.py && \
     test -f /app/pi/Install/Installer/docker_matter_storage_guard.py && \

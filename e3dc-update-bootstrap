@@ -25,29 +25,123 @@ LOCK_FILE="${RUNTIME_DIR}/lock"
 START_LOCK_FILE="${RUNTIME_DIR}/start.lock"
 DISCOVERY_RELATIVE="Installer/update_bootstrap_discovery.py"
 
+fail_with_solution() {
+    code=$1
+    happened=$2
+    system_state=$3
+    target=$4
+    solution=$5
+    exit_code=${6:-1}
+    printf '\n[ABBRUCH] %s\n' "$code" >&2
+    printf 'Was ist passiert: %s\n' "$happened" >&2
+    printf 'Systemzustand: %s\n' "$system_state" >&2
+    printf 'Ziel: %s\n' "$target" >&2
+    printf 'Lösung: Führe genau diesen sicheren Befehl aus:\n  %s\n' "$solution" >&2
+    exit "$exit_code"
+}
+
 fail() {
-    echo "Update-Bootstrap abgebrochen: $*" >&2
-    exit 1
+    if [ "$*" = "Rettungsupdate bitte mit sudo starten" ]; then
+        fail_with_solution \
+            "E3DC-UPD-PRIV-001" \
+            "Der Update-Bootstrap wurde ohne root-Rechte gestartet; bitte mit sudo starten." \
+            "Es wurden noch keine Updatedateien geladen und keine Dienste verändert." \
+            "Lokaler Update-Bootstrap" \
+            "sudo /bin/sh ./e3dc-update-bootstrap" \
+            77
+    fi
+    fail_with_solution \
+        "E3DC-UPD-BOOT-999" \
+        "$*" \
+        "Der zuletzt vollständig bestätigte Zustand bleibt maßgeblich; ein erfolgreicher Abschluss wurde nicht gemeldet." \
+        "E3DC-Control Update" \
+        "sudo journalctl -u $UNIT --no-pager -n 120"
+}
+
+dependency_package() {
+    case "$1" in
+        awk) printf '%s\n' gawk ;;
+        cmp) printf '%s\n' diffutils ;;
+        curl) printf '%s\n' curl ;;
+        find) printf '%s\n' findutils ;;
+        flock) printf '%s\n' util-linux ;;
+        getent) printf '%s\n' libc-bin ;;
+        git) printf '%s\n' git ;;
+        journalctl|systemctl|systemd-run) printf '%s\n' systemd ;;
+        basename|cat|chmod|chown|date|dirname|env|id|install|mkdir|mktemp|mv|rm|stat|unlink)
+            printf '%s\n' coreutils
+            ;;
+        python3) printf '%s\n' python3 ;;
+        *) printf '%s\n' "$1" ;;
+    esac
 }
 
 require_commands() {
-    for command in awk cmp curl flock getent git install mktemp python3 stat systemctl systemd-run; do
-        command -v "$command" >/dev/null 2>&1 || fail "$command fehlt"
+    for command in \
+        awk cmp curl basename cat chmod chown date dirname env find flock getent git id \
+        install journalctl mkdir mktemp mv python3 rm stat systemctl systemd-run unlink
+    do
+        if ! command -v "$command" >/dev/null 2>&1; then
+            package=$(dependency_package "$command")
+            fail_with_solution \
+                "E3DC-UPD-DEP-001" \
+                "Das benötigte Programm '$command' fehlt." \
+                "Das Update wurde vor Download, Backup und Dienständerungen beendet." \
+                "Systempaket $package" \
+                "sudo apt-get install -y $package"
+        fi
     done
 }
 
 write_runtime_value() {
     target=$1
     value=$2
-    temporary=$(mktemp "${RUNTIME_DIR}/.$(basename "$target").XXXXXX")
-    printf '%s\n' "$value" >"$temporary"
-    chown root:www-data "$temporary"
-    chmod 0640 "$temporary"
-    mv -fT "$temporary" "$target"
+    temporary=$(mktemp "${RUNTIME_DIR}/.$(basename "$target").XXXXXX") \
+        || fail_with_solution \
+            "E3DC-UPD-RUN-003" \
+            "Die temporäre Statusdatei konnte nicht im privaten Laufzeitverzeichnis angelegt werden." \
+            "Der bisherige Status blieb unverändert; der neue Wert wurde nicht veröffentlicht." \
+            "$target" \
+            "sudo stat -c '%U %G %a %F %n' $RUNTIME_DIR"
+    if ! printf '%s\n' "$value" >"$temporary"; then
+        fail_with_solution \
+            "E3DC-UPD-FS-201" \
+            "Der neue Laufzeitstatus konnte nicht geschrieben werden." \
+            "Die Zieldatei wurde nicht ersetzt." \
+            "$target" \
+            "sudo stat -c '%U %G %a %F %n' $temporary $RUNTIME_DIR"
+    fi
+    chown root:www-data "$temporary" \
+        || fail_with_solution \
+            "E3DC-UPD-FS-202" \
+            "Der Besitzer der neuen Laufzeitstatusdatei konnte nicht gesetzt werden." \
+            "Die Zieldatei wurde nicht ersetzt." \
+            "$target" \
+            "sudo stat -c '%U %G %a %F %n' $temporary"
+    chmod 0640 "$temporary" \
+        || fail_with_solution \
+            "E3DC-UPD-FS-203" \
+            "Die Rechte der neuen Laufzeitstatusdatei konnten nicht gesetzt werden." \
+            "Die Zieldatei wurde nicht ersetzt." \
+            "$target" \
+            "sudo stat -c '%U %G %a %F %n' $temporary"
+    mv -fT "$temporary" "$target" \
+        || fail_with_solution \
+            "E3DC-UPD-FS-204" \
+            "Der vollständig vorbereitete Laufzeitstatus konnte nicht atomar veröffentlicht werden." \
+            "Die bisherige Zieldatei blieb maßgeblich." \
+            "$target" \
+            "sudo stat -c '%U %G %a %F %n' $target $RUNTIME_DIR"
 }
 
 prepare_job_paths() {
-    getent group www-data >/dev/null 2>&1 || fail "www-data-Gruppe fehlt"
+    getent group www-data >/dev/null 2>&1 \
+        || fail_with_solution \
+            "E3DC-UPD-DEP-002" \
+            "Die für Webstatus und Protokoll benötigte Gruppe www-data fehlt." \
+            "Der Ziel-Updater wurde nicht gestartet; Installation und Dienste wurden durch diesen Schritt nicht verändert." \
+            "Systemgruppe www-data" \
+            "sudo apt-get install -y apache2"
     for parent in /run /var/log; do
         [ ! -L "$parent" ] || fail "System-Elternpfad ist ein Symlink: $parent"
         metadata=$(stat -c '%u %F' "$parent") \
@@ -61,8 +155,20 @@ prepare_job_paths() {
             fail "Runtime- oder Logpfad ist kein Verzeichnis: $path"
         fi
     done
-    install -d -o root -g www-data -m 0750 "$RUNTIME_DIR"
-    install -d -o root -g root -m 0755 "$LOG_DIR"
+    install -d -o root -g www-data -m 0750 "$RUNTIME_DIR" \
+        || fail_with_solution \
+            "E3DC-UPD-RUN-001" \
+            "Das private Laufzeitverzeichnis konnte nicht angelegt oder bestätigt werden." \
+            "Der Ziel-Updater wurde nicht gestartet; Installation und Dienste wurden durch diesen Schritt nicht verändert." \
+            "$RUNTIME_DIR" \
+            "sudo stat -c '%U %G %a %F %n' /run"
+    install -d -o root -g root -m 0755 "$LOG_DIR" \
+        || fail_with_solution \
+            "E3DC-UPD-RUN-002" \
+            "Das Update-Protokollverzeichnis konnte nicht angelegt oder bestätigt werden." \
+            "Der Ziel-Updater wurde nicht gestartet; Installation und Dienste wurden durch diesen Schritt nicht verändert." \
+            "$LOG_DIR" \
+            "sudo stat -c '%U %G %a %F %n' /var/log"
     if [ -L "$LOG_FILE" ]; then
         fail "Updateprotokoll ist ein Symlink"
     fi
@@ -74,8 +180,20 @@ prepare_job_paths() {
         "regular file 1"|"regular empty file 1") ;;
         *) fail "Updateprotokoll besitzt einen unzulässigen Pfadtyp" ;;
     esac
-    chown root:www-data "$LOG_FILE"
-    chmod 0640 "$LOG_FILE"
+    chown root:www-data "$LOG_FILE" \
+        || fail_with_solution \
+            "E3DC-UPD-FS-205" \
+            "Der Besitzer des Updateprotokolls konnte nicht gesetzt werden." \
+            "Der Ziel-Updater wurde nicht gestartet; Installation und Dienste wurden durch diesen Schritt nicht verändert." \
+            "$LOG_FILE" \
+            "sudo stat -c '%U %G %a %F %n' $LOG_FILE"
+    chmod 0640 "$LOG_FILE" \
+        || fail_with_solution \
+            "E3DC-UPD-FS-206" \
+            "Die geschützten Rechte des Updateprotokolls konnten nicht gesetzt werden." \
+            "Der Ziel-Updater wurde nicht gestartet; Installation und Dienste wurden durch diesen Schritt nicht verändert." \
+            "$LOG_FILE" \
+            "sudo stat -c '%U %G %a %F %n' $LOG_FILE"
 }
 
 prepare_lock_file() {
@@ -101,13 +219,37 @@ prepare_lock_file() {
         "0 0 regular file 1"|"0 0 regular empty file 1") ;;
         *) fail "Update-Lock besitzt nach Anlage unzulässige Metadaten" ;;
     esac
-    chown root:root "$lock_path"
-    chmod 0600 "$lock_path"
+    chown root:root "$lock_path" \
+        || fail_with_solution \
+            "E3DC-UPD-FS-207" \
+            "Der Besitzer der privaten Update-Sperre konnte nicht gesetzt werden." \
+            "Es wurde kein neuer Updateauftrag unter dieser Sperre angenommen." \
+            "$lock_path" \
+            "sudo stat -c '%U %G %a %F %n' $lock_path"
+    chmod 0600 "$lock_path" \
+        || fail_with_solution \
+            "E3DC-UPD-FS-208" \
+            "Die privaten Rechte der Update-Sperre konnten nicht gesetzt werden." \
+            "Es wurde kein neuer Updateauftrag unter dieser Sperre angenommen." \
+            "$lock_path" \
+            "sudo stat -c '%U %G %a %F %n' $lock_path"
 }
 
 prepare_log() {
-    : >"$LOG_FILE"
-    printf '=== E3DC-Control Rettungsupdate %s ===\n' "$(date --iso-8601=seconds)" >>"$LOG_FILE"
+    : >"$LOG_FILE" \
+        || fail_with_solution \
+            "E3DC-UPD-FS-209" \
+            "Das Updateprotokoll konnte nicht für den neuen Auftrag geöffnet werden." \
+            "Der eigentliche Updatevorgang wurde noch nicht gestartet." \
+            "$LOG_FILE" \
+            "sudo stat -c '%U %G %a %s %F %n' $LOG_FILE"
+    printf '=== E3DC-Control Rettungsupdate %s ===\n' "$(date --iso-8601=seconds)" >>"$LOG_FILE" \
+        || fail_with_solution \
+            "E3DC-UPD-FS-210" \
+            "Der Kopf des Updateprotokolls konnte nicht geschrieben werden." \
+            "Der eigentliche Updatevorgang wurde noch nicht gestartet." \
+            "$LOG_FILE" \
+            "sudo stat -c '%U %G %a %s %F %n' $LOG_FILE"
 }
 
 isolated_git() {
@@ -155,7 +297,13 @@ resolve_release_binding() {
             --fail --silent --show-error --location \
             --proto '=https' --tlsv1.2 \
             --output /dev/null --write-out '%{url_effective}' \
-            "$LATEST_URL") || fail "aktueller Release-Tag konnte nicht geladen werden"
+            "$LATEST_URL") \
+            || fail_with_solution \
+                "E3DC-UPD-NET-001" \
+                "Der aktuelle veröffentlichte Release konnte nicht über HTTPS ermittelt werden." \
+                "Es wurde noch kein Release heruntergeladen; Installation und Dienste blieben unverändert." \
+                "$LATEST_URL" \
+                "curl -I --proto '=https' --tlsv1.2 $LATEST_URL"
         case "$effective_latest" in
             "$REPOSITORY_URL/releases/tag/"*) tag=${effective_latest##*/} ;;
             *) fail "GitHub lieferte keinen eindeutigen aktuellen Release-Tag" ;;
@@ -166,10 +314,21 @@ import re
 import sys
 raise SystemExit(0 if re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+[a-z]?", sys.argv[1]) else 1)
 PY
-    refs=$(mktemp "${RUNTIME_DIR}/release-refs.XXXXXX")
+    refs=$(mktemp "${RUNTIME_DIR}/release-refs.XXXXXX") \
+        || fail_with_solution \
+            "E3DC-UPD-RUN-004" \
+            "Die private Datei für die Release-Bindung konnte nicht angelegt werden." \
+            "Es wurde noch kein Release ausgecheckt; Installation und Dienste blieben unverändert." \
+            "$RUNTIME_DIR" \
+            "sudo stat -c '%U %G %a %F %n' $RUNTIME_DIR"
     isolated_git ls-remote --tags "$GIT_URL" \
         "refs/tags/$tag" "refs/tags/$tag^{}" >"$refs" \
-        || fail "Release-Referenzen konnten nicht gebunden werden"
+        || fail_with_solution \
+            "E3DC-UPD-GIT-001" \
+            "Die signierten Release-Referenzen konnten nicht aus dem Repository gelesen werden." \
+            "Es wurde noch kein Release ausgecheckt; Installation und Dienste blieben unverändert." \
+            "$GIT_URL, Tag $tag" \
+            "git ls-remote --tags $GIT_URL refs/tags/$tag 'refs/tags/$tag^{}'"
     tag_object=$(awk -v ref="refs/tags/$tag" '$2 == ref {print $1}' "$refs")
     target_sha=$(awk -v ref="refs/tags/$tag^{}" '$2 == ref {print $1}' "$refs")
     rm -f "$refs"
@@ -237,19 +396,60 @@ if resolved != path.absolute() or metadata.st_nlink != 1:
 print(resolved)
 PY
     ) || fail "Bootstrap-Quelle konnte nicht sicher gebunden werden"
-    stage_dir=$(mktemp -d /run/e3dc-update-bootstrap.XXXXXX)
-    chown root:root "$stage_dir"
-    chmod 0700 "$stage_dir"
-    install -o root -g root -m 0500 "$self_path" "$stage_dir/e3dc-update-bootstrap"
+    stage_dir=$(mktemp -d /run/e3dc-update-bootstrap.XXXXXX) \
+        || fail_with_solution \
+            "E3DC-UPD-RUN-005" \
+            "Der private Arbeitsbereich für den neuen Updater konnte nicht angelegt werden." \
+            "Es wurden weder Installationsdateien ersetzt noch Dienste verändert." \
+            "/run/e3dc-update-bootstrap.*" \
+            "sudo stat -c '%U %G %a %F %n' /run"
+    chown root:root "$stage_dir" \
+        || fail_with_solution \
+            "E3DC-UPD-FS-211" \
+            "Der private Arbeitsbereich konnte nicht root zugeordnet werden." \
+            "Der Arbeitsbereich wird nicht als Updatequelle verwendet; Installation und Dienste blieben unverändert." \
+            "$stage_dir" \
+            "sudo stat -c '%U %G %a %F %n' $stage_dir"
+    chmod 0700 "$stage_dir" \
+        || fail_with_solution \
+            "E3DC-UPD-FS-212" \
+            "Der private Arbeitsbereich konnte nicht auf root beschränkt werden." \
+            "Der Arbeitsbereich wird nicht als Updatequelle verwendet; Installation und Dienste blieben unverändert." \
+            "$stage_dir" \
+            "sudo stat -c '%U %G %a %F %n' $stage_dir"
+    install -o root -g root -m 0500 "$self_path" "$stage_dir/e3dc-update-bootstrap" \
+        || fail_with_solution \
+            "E3DC-UPD-FS-213" \
+            "Der geprüfte Bootstrap konnte nicht in den privaten Arbeitsbereich kopiert werden." \
+            "Der eigentliche Updater wurde nicht gestartet; Installation und Dienste blieben unverändert." \
+            "$stage_dir/e3dc-update-bootstrap" \
+            "sudo stat -c '%U %G %a %F %n' $self_path $stage_dir"
     discovery="$stage_dir/update_bootstrap_discovery.py"
     curl -q \
         --fail --silent --show-error --location \
         --proto '=https' --tlsv1.2 \
         --output "$discovery" \
         "${RAW_BASE_URL}/${target_sha}/${DISCOVERY_RELATIVE}" \
-        || fail "Release-Discovery konnte nicht geladen werden"
-    chown root:root "$discovery"
-    chmod 0500 "$discovery"
+        || fail_with_solution \
+            "E3DC-UPD-NET-002" \
+            "Die Installationserkennung des gebundenen Release konnte nicht über HTTPS geladen werden." \
+            "Der eigentliche Updater wurde nicht gestartet; Installation und Dienste blieben unverändert." \
+            "${RAW_BASE_URL}/${target_sha}/${DISCOVERY_RELATIVE}" \
+            "curl -I --proto '=https' --tlsv1.2 ${RAW_BASE_URL}/${target_sha}/${DISCOVERY_RELATIVE}"
+    chown root:root "$discovery" \
+        || fail_with_solution \
+            "E3DC-UPD-FS-214" \
+            "Die geladene Installationserkennung konnte nicht root zugeordnet werden." \
+            "Der eigentliche Updater wurde nicht gestartet; Installation und Dienste blieben unverändert." \
+            "$discovery" \
+            "sudo stat -c '%U %G %a %F %n' $discovery"
+    chmod 0500 "$discovery" \
+        || fail_with_solution \
+            "E3DC-UPD-FS-215" \
+            "Die Installationserkennung konnte nicht auf root und Nur-Lesen beschränkt werden." \
+            "Der eigentliche Updater wurde nicht gestartet; Installation und Dienste blieben unverändert." \
+            "$discovery" \
+            "sudo stat -c '%U %G %a %F %n' $discovery"
     validate_private_file "$stage_dir/e3dc-update-bootstrap" 500
     validate_private_file "$discovery" 500
     size=$(stat -c '%s' "$discovery")
@@ -269,6 +469,126 @@ bind_with_discovery() {
         --explicit-user "$explicit_user" \
         --sudo-user "$sudo_user" \
         --requested-role "$requested_role"
+}
+
+list_with_discovery() {
+    discovery=$1
+    python3 -I -B "$discovery" --list-candidates
+}
+
+interactive_terminal() {
+    [ -t 0 ] && [ -t 1 ]
+}
+
+shell_quote() {
+    python3 - "$1" <<'PY'
+import shlex
+import sys
+print(shlex.quote(sys.argv[1]))
+PY
+}
+
+bootstrap_display_path() {
+    python3 - "$0" <<'PY'
+import os
+import sys
+print(os.path.abspath(sys.argv[1]))
+PY
+}
+
+select_console_target() {
+    discovery=$1
+    requested_root=$2
+    if [ -n "$requested_root" ]; then
+        SELECTED_EXPLICIT_ROOT=$requested_root
+        return 0
+    fi
+
+    candidates_file=$(mktemp "${STAGE_DIR}/candidates.XXXXXX") \
+        || fail_with_solution \
+            "E3DC-UPD-RUN-006" \
+            "Die private Kandidatenliste für die Installationserkennung konnte nicht angelegt werden." \
+            "Es wurde keine Installation ausgewählt und der eigentliche Updater nicht gestartet." \
+            "$STAGE_DIR" \
+            "sudo stat -c '%U %G %a %F %n' $STAGE_DIR"
+    if ! list_with_discovery "$discovery" >"$candidates_file"; then
+        find "$STAGE_DIR" -depth -delete 2>/dev/null || true
+        fail_with_solution \
+            "E3DC-UPD-PATH-009" \
+            "Die lokale Installationserkennung konnte nicht ausgeführt werden." \
+            "Es wurde keine Installation ausgewählt und der eigentliche Updater nicht gestartet." \
+            "Lokale E3DC-Control-Installation" \
+            "sudo journalctl -u $UNIT --no-pager -n 120"
+    fi
+    candidate_count=$(awk 'NF { count += 1 } END { print count + 0 }' "$candidates_file")
+    if [ "$candidate_count" -eq 0 ]; then
+        SELECTED_EXPLICIT_ROOT=""
+        rm -f "$candidates_file"
+        return 0
+    fi
+    if [ "$candidate_count" -eq 1 ]; then
+        candidate_line=$(awk 'NF { print; exit }' "$candidates_file")
+        SELECTED_EXPLICIT_ROOT=${candidate_line%%"$(printf '\t')"*}
+        rm -f "$candidates_file"
+        return 0
+    fi
+
+    if interactive_terminal; then
+        printf '\nMehrere gleichrangige E3DC-Control-Instanzen wurden erkannt:\n'
+        awk -F '\t' '{ printf "  %d) %s [%s]\n", NR, $1, $2 }' "$candidates_file"
+        printf 'Bitte wähle die zu aktualisierende Instanz (1-%s): ' "$candidate_count"
+        if ! IFS= read -r selection; then
+            find "$STAGE_DIR" -depth -delete 2>/dev/null || true
+            fail_with_solution \
+                "E3DC-UPD-PATH-010" \
+                "Die Instanzauswahl wurde ohne Eingabe beendet." \
+                "Keine der erkannten Installationen wurde verändert." \
+                "Lokale E3DC-Control-Instanz" \
+                "sudo /bin/sh ./e3dc-update-bootstrap" \
+                64
+        fi
+        case "$selection" in
+            ''|*[!0-9]*|????*)
+                find "$STAGE_DIR" -depth -delete 2>/dev/null || true
+                fail_with_solution \
+                    "E3DC-UPD-PATH-010" \
+                    "Die Instanzauswahl ist keine gültige Nummer." \
+                    "Keine der erkannten Installationen wurde verändert." \
+                    "Lokale E3DC-Control-Instanz" \
+                    "sudo /bin/sh ./e3dc-update-bootstrap" \
+                    64
+                ;;
+        esac
+        if [ "$selection" -lt 1 ] || [ "$selection" -gt "$candidate_count" ]; then
+            find "$STAGE_DIR" -depth -delete 2>/dev/null || true
+            fail_with_solution \
+                "E3DC-UPD-PATH-010" \
+                "Die Instanzauswahl liegt außerhalb der angezeigten Liste." \
+                "Keine der erkannten Installationen wurde verändert." \
+                "Lokale E3DC-Control-Instanz" \
+                "sudo /bin/sh ./e3dc-update-bootstrap" \
+                64
+        fi
+        candidate_line=$(awk -v number="$selection" 'NR == number { print; exit }' "$candidates_file")
+        SELECTED_EXPLICIT_ROOT=${candidate_line%%"$(printf '\t')"*}
+        rm -f "$candidates_file"
+        return 0
+    fi
+
+    display_path=$(shell_quote "$(bootstrap_display_path)")
+    printf '\n[ABBRUCH] E3DC-UPD-PATH-005\n' >&2
+    printf 'Was ist passiert: Mehrere gleichrangige E3DC-Control-Instanzen wurden erkannt; kein Pfad wurde geraten.\n' >&2
+    printf 'Systemzustand: Keine der erkannten Installationen wurde verändert.\n' >&2
+    printf 'Ziel: Eine vom Nutzer eindeutig ausgewählte E3DC-Control-Instanz.\n' >&2
+    printf 'Lösung: Starte genau einen der folgenden Hintergrundbefehle:\n' >&2
+    while IFS="$(printf '\t')" read -r candidate_root candidate_sources; do
+        [ -n "$candidate_root" ] || continue
+        quoted_root=$(shell_quote "$candidate_root")
+        printf '  sudo /bin/sh %s %s  # %s\n' \
+            "$display_path" "$quoted_root" "$candidate_sources" >&2
+    done <"$candidates_file"
+    find "$STAGE_DIR" -depth -delete 2>/dev/null || true
+    exit 64
 }
 
 parse_binding() {
@@ -312,10 +632,28 @@ prepare_release_and_binding() {
         *"$tab"*) fail "Release-Bindung besitzt überzählige Felder" ;;
     esac
     STAGE_DIR=$(stage_release_contract "$BOUND_SHA")
-    binding=$(bind_with_discovery \
+    select_console_target "$STAGE_DIR/update_bootstrap_discovery.py" "$explicit_root"
+    binding_error=$(mktemp "${STAGE_DIR}/binding-error.XXXXXX") \
+        || fail_with_solution \
+            "E3DC-UPD-RUN-007" \
+            "Die private Fehlerdatei für die Installationsbindung konnte nicht angelegt werden." \
+            "Der eigentliche Updater wurde nicht gestartet; Installation und Dienste blieben unverändert." \
+            "$STAGE_DIR" \
+            "sudo stat -c '%U %G %a %F %n' $STAGE_DIR"
+    if ! binding=$(bind_with_discovery \
         "$STAGE_DIR/update_bootstrap_discovery.py" \
-        "$explicit_root" "$explicit_user" "$sudo_user" "$requested_role") \
-        || fail "Installation oder Rolle konnte nicht eindeutig gebunden werden"
+        "$SELECTED_EXPLICIT_ROOT" "$explicit_user" "$sudo_user" "$requested_role" \
+        2>"$binding_error"); then
+        cat "$binding_error" >&2
+        find "$STAGE_DIR" -depth -delete 2>/dev/null || true
+        fail_with_solution \
+            "E3DC-UPD-PATH-011" \
+            "Die erkannte Installation konnte nicht eindeutig an Root, Benutzer und Rolle gebunden werden." \
+            "Der eigentliche Updater wurde nicht gestartet; keine Installation wurde verändert." \
+            "Lokale E3DC-Control-Installation" \
+            "sudo /bin/sh ./e3dc-update-bootstrap"
+    fi
+    rm -f "$binding_error"
     parse_binding "$binding"
 }
 
@@ -324,17 +662,59 @@ download_release_checkout() {
     tag=$2
     tag_object=$3
     target_sha=$4
-    mkdir -m 0700 "$checkout_dir"
-    isolated_git -c init.defaultBranch=main init "$checkout_dir" >/dev/null
-    isolated_git -C "$checkout_dir" remote add origin "$GIT_URL"
+    mkdir -m 0700 "$checkout_dir" \
+        || fail_with_solution \
+            "E3DC-UPD-RUN-008" \
+            "Das private Checkout-Verzeichnis konnte nicht angelegt werden." \
+            "Der gebundene Release wurde nicht ausgecheckt; die Installation wurde nicht verändert." \
+            "$checkout_dir" \
+            "sudo stat -c '%U %G %a %F %n' $(dirname "$checkout_dir")"
+    isolated_git -c init.defaultBranch=main init "$checkout_dir" >/dev/null \
+        || fail_with_solution \
+            "E3DC-UPD-GIT-002" \
+            "Das private temporäre Git-Repository konnte nicht initialisiert werden." \
+            "Es wurde kein Release ausgecheckt; die Installation wurde nicht verändert." \
+            "$checkout_dir" \
+            "sudo stat -c '%U %G %a %F %n' $checkout_dir"
+    isolated_git -C "$checkout_dir" remote add origin "$GIT_URL" \
+        || fail_with_solution \
+            "E3DC-UPD-GIT-003" \
+            "Die feste GitHub-Quelle konnte im privaten Checkout nicht gebunden werden." \
+            "Es wurde kein Release geladen; die Installation wurde nicht verändert." \
+            "$GIT_URL" \
+            "git ls-remote --exit-code $GIT_URL HEAD"
     isolated_git -C "$checkout_dir" fetch \
         --no-tags --depth=1 origin \
-        "+refs/tags/$tag:refs/tags/$tag" >/dev/null
-    fetched_tag=$(isolated_git -C "$checkout_dir" rev-parse --verify "refs/tags/$tag")
-    fetched_sha=$(isolated_git -C "$checkout_dir" rev-parse --verify "refs/tags/$tag^{commit}")
+        "+refs/tags/$tag:refs/tags/$tag" >/dev/null \
+        || fail_with_solution \
+            "E3DC-UPD-GIT-004" \
+            "Der gebundene Release-Tag konnte nicht in den privaten Checkout geladen werden." \
+            "Der temporäre Checkout ist unvollständig und wird verworfen; die Installation wurde nicht verändert." \
+            "$GIT_URL, Tag $tag" \
+            "git ls-remote --exit-code --tags $GIT_URL refs/tags/$tag"
+    fetched_tag=$(isolated_git -C "$checkout_dir" rev-parse --verify "refs/tags/$tag") \
+        || fail_with_solution \
+            "E3DC-UPD-GIT-005" \
+            "Das geladene Tag-Objekt konnte im privaten Checkout nicht bestätigt werden." \
+            "Der temporäre Checkout wird verworfen; die Installation wurde nicht verändert." \
+            "Tag $tag" \
+            "git ls-remote --exit-code --tags $GIT_URL refs/tags/$tag"
+    fetched_sha=$(isolated_git -C "$checkout_dir" rev-parse --verify "refs/tags/$tag^{commit}") \
+        || fail_with_solution \
+            "E3DC-UPD-GIT-006" \
+            "Der Commit des geladenen Release-Tags konnte nicht bestätigt werden." \
+            "Der temporäre Checkout wird verworfen; die Installation wurde nicht verändert." \
+            "Tag $tag" \
+            "git ls-remote --exit-code --tags $GIT_URL 'refs/tags/$tag^{}'"
     [ "$fetched_tag" = "$tag_object" ] && [ "$fetched_sha" = "$target_sha" ] \
         || fail "temporärer Ziel-Checkout weicht von der Release-Bindung ab"
-    isolated_git -C "$checkout_dir" checkout --detach "$target_sha" >/dev/null
+    isolated_git -C "$checkout_dir" checkout --detach "$target_sha" >/dev/null \
+        || fail_with_solution \
+            "E3DC-UPD-GIT-007" \
+            "Der verifizierte Zielcommit konnte nicht als privater Checkout bereitgestellt werden." \
+            "Der temporäre Checkout wird verworfen; die Installation wurde nicht verändert." \
+            "Commit $target_sha" \
+            "git ls-remote --exit-code --tags $GIT_URL refs/tags/$tag"
     [ -f "$checkout_dir/e3dc-bootstrap" ] && [ ! -L "$checkout_dir/e3dc-bootstrap" ] \
         || fail "Ziel-Updater fehlt im Release-Checkout"
     [ -f "$checkout_dir/$DISCOVERY_RELATIVE" ] \
@@ -343,7 +723,13 @@ download_release_checkout() {
 }
 
 run_bound_update() (
-    release_dir=$(mktemp -d /run/e3dc-update-release.XXXXXX)
+    release_dir=$(mktemp -d /run/e3dc-update-release.XXXXXX) \
+        || fail_with_solution \
+            "E3DC-UPD-RUN-009" \
+            "Der private Arbeitsbereich für den Release-Checkout konnte nicht angelegt werden." \
+            "Der eigentliche Updater wurde nicht gestartet; die Installation wurde nicht verändert." \
+            "/run/e3dc-update-release.*" \
+            "sudo stat -c '%U %G %a %F %n' /run"
     cleanup_release() {
         find "$release_dir" -depth -delete 2>/dev/null || true
     }
@@ -407,18 +793,36 @@ update_job_running() {
 }
 
 start_background_job() {
-    [ "$#" -eq 0 ] || fail "Der automatische Hintergrundstart akzeptiert keine Argumente"
+    explicit_root=${1:-}
+    requested_role=${2:-auto}
+    [ "$#" -le 2 ] || fail_with_solution \
+        "E3DC-UPD-CALL-001" \
+            "Der Hintergrundstart hat zu viele Argumente erhalten." \
+            "Es wurde kein Updateauftrag angenommen und nichts am System verändert." \
+            "Aufruf des Update-Bootstrap" \
+            "sudo /bin/sh ./e3dc-update-bootstrap" \
+        64
     BOUND_ENTRY_MODE=rescue
     prepare_job_paths
     prepare_lock_file "$START_LOCK_FILE"
     exec 8>"$START_LOCK_FILE"
-    flock 8
+    flock 8 \
+        || fail_with_solution \
+            "E3DC-UPD-BUSY-003" \
+            "Die Start-Sperre des Updates konnte nicht übernommen werden." \
+            "Es wurde kein zweiter Updateauftrag gestartet." \
+            "$START_LOCK_FILE" \
+            "sudo systemctl status --no-pager $UNIT"
     if update_job_running; then
-        printf 'Update läuft bereits: %s\n' "$UNIT"
-        print_job_commands
+        printf '\n[HINWEIS] E3DC-UPD-BUSY-001\n'
+        printf 'Was ist passiert: Ein Update-Systemjob läuft bereits; es wird kein zweiter gestartet.\n'
+        printf 'Systemzustand: Der vorhandene Updatejob arbeitet unverändert weiter.\n'
+        printf 'Ziel: %s\n' "$UNIT"
+        printf 'Lösung: Führe genau diesen sicheren Befehl aus:\n  sudo systemctl status --no-pager %s\n' "$UNIT"
         return 0
     fi
-    prepare_release_and_binding "" "" "${SUDO_USER:-}" auto
+    prepare_release_and_binding \
+        "$explicit_root" "" "${SUDO_USER:-}" "$requested_role"
     prepare_log
     write_runtime_value "$STATUS_FILE" "launching"
     rm -f "$PID_FILE"
@@ -452,7 +856,12 @@ start_background_job() {
         write_runtime_value "$STATUS_FILE" "$launch_status"
         printf '[!] Rettungsupdate-Systemjob konnte nicht gestartet werden (Exit %s).\n%s\n' \
             "$launch_status" "$launch_output" >>"$LOG_FILE"
-        fail "Rettungsupdate-Systemjob konnte nicht gestartet werden"
+        fail_with_solution \
+            "E3DC-UPD-SYSTEMD-001" \
+            "Der vorbereitete Update-Systemjob konnte nicht gestartet werden (Exit $launch_status)." \
+            "Der eigentliche Ziel-Updater lief nicht an; Installation und Dienste wurden durch diesen Auftrag nicht verändert." \
+            "$UNIT" \
+            "sudo journalctl -u $UNIT --no-pager -n 120"
     fi
     [ -z "$launch_output" ] || printf '%s\n' "$launch_output"
     printf 'Installation: %s (Benutzer %s, Rolle %s)\n' \
@@ -498,14 +907,21 @@ run_background_worker() {
     prepare_job_paths
     prepare_lock_file "$LOCK_FILE"
     exec 9>"$LOCK_FILE"
-    flock -n 9 || fail "Ein Update läuft bereits"
+    flock -n 9 \
+        || fail_with_solution \
+            "E3DC-UPD-BUSY-002" \
+            "Die exklusive Update-Sperre ist bereits belegt." \
+            "Der zweite Worker beendet sich; der vorhandene Updatevorgang bleibt alleiniger Entscheider." \
+            "$LOCK_FILE" \
+            "sudo systemctl status --no-pager $UNIT" \
+            75
     cleanup_worker() {
         exit_code=$?
+        trap - EXIT
         set +e
-        write_runtime_value "$STATUS_FILE" "$exit_code"
         rm -f "$PID_FILE"
         find "$STAGE_DIR" -depth -delete 2>/dev/null || true
-        trap - EXIT
+        write_runtime_value "$STATUS_FILE" "$exit_code"
         exit "$exit_code"
     }
     trap cleanup_worker EXIT
@@ -528,20 +944,51 @@ run_background_worker() {
 run_synchronous_update() {
     explicit_root=${1:-}
     requested_role=${2:-auto}
-    [ "$#" -le 2 ] || fail "zu viele Argumente"
+    [ "$#" -le 2 ] || fail_with_solution \
+        "E3DC-UPD-CALL-002" \
+            "Der synchrone Bootstrap-Aufruf hat zu viele Argumente erhalten." \
+            "Es wurde kein Updateauftrag angenommen und nichts am System verändert." \
+            "Aufruf des Update-Bootstrap" \
+            "sudo /bin/sh ./e3dc-update-bootstrap" \
+        64
     bind_entry_mode
     prepare_job_paths
     if [ "${E3DC_BOOTSTRAP_LOCK_HELD:-}" != "1" ]; then
         prepare_lock_file "$START_LOCK_FILE"
         exec 8>"$START_LOCK_FILE"
-        flock 8
+        flock 8 \
+            || fail_with_solution \
+                "E3DC-UPD-BUSY-003" \
+                "Die Start-Sperre des Updates konnte nicht übernommen werden." \
+                "Es wurde kein zweiter Updateauftrag gestartet." \
+                "$START_LOCK_FILE" \
+                "sudo systemctl status --no-pager $UNIT"
         if update_job_running; then
-            fail "Ein Update-Systemjob läuft bereits"
+            fail_with_solution \
+                "E3DC-UPD-BUSY-001" \
+                "Ein Update-Systemjob läuft bereits." \
+                "Der synchrone Zweitaufruf beendet sich; der vorhandene Updatejob arbeitet unverändert weiter." \
+                "$UNIT" \
+                "sudo systemctl status --no-pager $UNIT" \
+                75
         fi
         prepare_lock_file "$LOCK_FILE"
         exec 9>"$LOCK_FILE"
-        flock -n 9 || fail "Ein Update läuft bereits"
-        flock -u 8
+        flock -n 9 \
+            || fail_with_solution \
+                "E3DC-UPD-BUSY-002" \
+                "Die exklusive Update-Sperre ist bereits belegt." \
+                "Der synchrone Zweitaufruf beendet sich; der vorhandene Updatevorgang bleibt alleiniger Entscheider." \
+                "$LOCK_FILE" \
+                "sudo systemctl status --no-pager $UNIT" \
+                75
+        flock -u 8 \
+            || fail_with_solution \
+                "E3DC-UPD-BUSY-004" \
+                "Die Start-Sperre konnte nach Übernahme der exklusiven Update-Sperre nicht freigegeben werden." \
+                "Der Ziel-Updater wurde noch nicht gestartet; dieser Aufruf beendet sich vorsorglich." \
+                "$START_LOCK_FILE" \
+                "sudo systemctl status --no-pager $UNIT"
     fi
     prepare_release_and_binding \
         "$explicit_root" "${E3DC_BOOTSTRAP_USER:-}" "${SUDO_USER:-}" "$requested_role"
@@ -553,15 +1000,28 @@ run_synchronous_update() {
     return "$result"
 }
 
+command -v id >/dev/null 2>&1 \
+    || fail_with_solution \
+        "E3DC-UPD-DEP-001" \
+        "Das benötigte Programm 'id' fehlt." \
+        "Das Update wurde vor Download, Backup und Dienständerungen beendet." \
+        "Systempaket coreutils" \
+        "sudo apt-get install -y coreutils"
 [ "$(id -u)" -eq 0 ] || fail "Rettungsupdate bitte mit sudo starten"
 require_commands
 
 if [ "${1:-}" = "--systemd-worker" ]; then
     shift
-    [ "$#" -eq 0 ] || fail "Hintergrund-Worker akzeptiert keine Argumente"
+    [ "$#" -eq 0 ] || fail_with_solution \
+        "E3DC-UPD-CALL-003" \
+        "Der interne Hintergrund-Worker erhielt unerwartete Argumente." \
+        "Der Worker wurde vor dem Ziel-Updater beendet; die Installation wurde durch ihn nicht verändert." \
+        "$UNIT" \
+        "sudo journalctl -u $UNIT --no-pager -n 120" \
+        64
     run_background_worker
-elif [ "$#" -eq 0 ] && [ "${E3DC_BOOTSTRAP_INLINE_WORKER:-}" != "1" ]; then
-    start_background_job
+elif [ "${E3DC_BOOTSTRAP_INLINE_WORKER:-}" != "1" ]; then
+    start_background_job "$@"
 else
     run_synchronous_update "$@"
 fi

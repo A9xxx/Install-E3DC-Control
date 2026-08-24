@@ -366,7 +366,6 @@ def bind_wire_cooldown(
         and str(reservation.get("reservation_id") or "") == rid
         and str(reservation.get("transition_id") or "") == rid
         and target in (1, 3)
-        and (res_target == target or res_target == 0)
         and math.isfinite(receipt_ts)
         and receipt_ts > 0.0
         and math.isfinite(started_ts)

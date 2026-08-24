@@ -647,9 +647,8 @@ function getDetectedOpenwbVehiclesForWallbox($savedCars) {
             'vehicle_id' => $vehicleId,
             'soc' => $socConfirmed ? ($data['car_soc'] ?? null) : null,
             'range_km' => $socConfirmed ? ($data['car_range'] ?? null) : null,
-            'capacity' => $data['car_capacity_kwh'] ?? 0,
-            'power' => (int)($data['phases_in_use'] ?? 0) >= 3 ? 11.0 : 7.4,
-            'max_phases' => (int)($data['phases_in_use'] ?? 0) >= 3 ? 3 : 1,
+            'power' => (int)($data['phases_in_use'] ?? 0) >= 3 ? 11.0 : (isset($data['charge_power']) ? (float)$data['charge_power'] : 11.0),
+            'max_phases' => isset($data['max_phases']) && is_numeric($data['max_phases']) ? (int)$data['max_phases'] : ((int)($data['phases_in_use'] ?? 0) >= 3 ? 3 : null),
             'source' => $socSource !== '' ? $socSource : ($data['source'] ?? ($wb === 1 ? 'openWB' : 'openWB Pro')),
         ];
     }
@@ -913,6 +912,35 @@ if (isset($_POST['save_wb_manual_pause_ajax'])) {
     exit;
 }
 
+if (isset($_POST['trigger_wb_force_start_ajax'])) {
+    $wbId = max(1, min(2, (int)($_POST['wb_id'] ?? 1)));
+    $nativeUpdates = [
+        "wb{$wbId}_manual_pause" => '0',
+        "wb{$wbId}_mode" => '1',
+        'wb_sofort' => '1',
+        'wbhour' => '99',
+    ];
+    @unlink('/var/www/html/ramdisk/native_schedule_aborted.flag');
+    @unlink('/var/www/html/ramdisk/wallbox_abort_state.json');
+    $forceReqFile = '/var/www/html/ramdisk/wallbox_user_mode_request.json';
+    $forceReqs = [
+        (string)$wbId => ['mode' => 'force_start', 'ts' => time()],
+    ];
+    @file_put_contents($forceReqFile, json_encode($forceReqs, JSON_UNESCAPED_UNICODE));
+    $tx = e3dcWallboxPlanTransaction($nativeUpdates, [
+        'operation' => 'plan',
+        'abort_flag' => 'remove',
+    ]);
+    header('Content-Type: application/json; charset=utf-8');
+    echo json_encode([
+        'ok' => !empty($tx['success']),
+        'wb' => $wbId,
+        'mode' => '1',
+        'message' => 'Ladung sofort gestartet (Freigabe erzwungen).',
+    ], JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
 if (isset($_POST['save_simple_wallbox_mode_ajax'])) {
     $wbId = max(1, min(2, (int)($_POST['simple_wb_id'] ?? 1)));
     [$energyMode, $chargeIntent] = normalizeWallboxSimpleChoice(
@@ -1153,6 +1181,9 @@ if (isset($_POST['save_soc_settings'])) {
         $updates['wb1_target_soc'] = (string)(int)($_POST['wb1_target_soc'] ?? '80');
         $updates['wb1_max_soc_si'] = (string)(int)($_POST['wb1_max_soc_si'] ?? '90');
         $updates['wb1_charge_power'] = (string)(float)str_replace(',', '.', $_POST['wb1_charge_power'] ?? '11.0');
+        if (isset($_POST['wb1_min_amp'])) {
+            $updates['wb1_min_amp'] = (string)max(6, min(16, (int)$_POST['wb1_min_amp']));
+        }
 
         // Abwärtskompatibilität: Auch die Schlüssel für ein einzelnes Fahrzeug setzen
         $updates['car_capacity'] = $updates['wb1_capacity'];
@@ -1185,6 +1216,9 @@ if (isset($_POST['save_soc_settings'])) {
         $updates['wb2_target_soc'] = (string)(int)($_POST['wb2_target_soc'] ?? '80');
         $updates['wb2_max_soc_si'] = (string)(int)($_POST['wb2_max_soc_si'] ?? '90');
         $updates['wb2_charge_power'] = (string)(float)str_replace(',', '.', $_POST['wb2_charge_power'] ?? '11.0');
+        if (isset($_POST['wb2_min_amp'])) {
+            $updates['wb2_min_amp'] = (string)max(6, min(16, (int)$_POST['wb2_min_amp']));
+        }
 
         if (isset($_POST['manual_soc_wb2']) && trim($_POST['manual_soc_wb2']) !== '') {
             $msoc = (float)str_replace(',', '.', $_POST['manual_soc_wb2']);
@@ -1680,6 +1714,7 @@ function parseWallboxConfigValues($filePath) {
         'wb1_max_soc_si' => '',
         'wb1_charge_power' => '',
         'wb1_max_amp' => '',
+        'wb1_min_amp' => '6',
         'wb2_car_id' => '__none',
         'wb2_capacity' => '',
         'wb2_target_unit' => 'soc',
@@ -1688,6 +1723,7 @@ function parseWallboxConfigValues($filePath) {
         'wb2_max_soc_si' => '',
         'wb2_charge_power' => '',
         'wb2_max_amp' => '',
+        'wb2_min_amp' => '6',
         'wb1_locked' => '0',
         'wb1_mode' => '0',
         'wb1_observe_storage_policy' => 'curve',
@@ -2219,7 +2255,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
     $quickAction = null;
     if (isset($_POST['quick_action'])) {
         $quickAction = $_POST['quick_action'];
-        if ($quickAction === 'start_now') {
+        if ($quickAction === 'start_now' || $quickAction === 'force_start') {
             $_POST['zwei'] = '99';
         } elseif ($quickAction === 'clear_times') {
             $_POST['zwei'] = '0';
@@ -2243,11 +2279,21 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 : ($wallboxConfig['wb_native_eco'] ?? '0');
             $nativeUpdates = [
                 'wbhour'       => $wbhourVal,
-                'wb_sofort'    => ($quickAction === 'start_now') ? '1' : '0',
+                'wb_sofort'    => ($quickAction === 'start_now' || $quickAction === 'force_start') ? '1' : '0',
                 'wb_native_eco'=> $ecoMode,
-                'wb1_mode'     => '5', // Sofort bis Preislimit
+                'wb1_mode'     => ($quickAction === 'force_start') ? '1' : '5',
+                'wb2_mode'     => ($quickAction === 'force_start') ? '1' : '5',
             ];
-            if ($quickAction === 'start_now') {
+            if ($quickAction === 'force_start') {
+                $nativeUpdates['wbvon'] = date('H:00');
+                @unlink('/var/www/html/ramdisk/wallbox_abort_state.json');
+                $forceReqFile = '/var/www/html/ramdisk/wallbox_user_mode_request.json';
+                $forceReqs = [
+                    '1' => ['mode' => 'force_start', 'ts' => time()],
+                    '2' => ['mode' => 'force_start', 'ts' => time()],
+                ];
+                @file_put_contents($forceReqFile, json_encode($forceReqs, JSON_UNESCAPED_UNICODE));
+            } elseif ($quickAction === 'start_now') {
                 // Sofortladen: wbvon auf aktuelle Stunde setzen, damit sofort geplant wird.
                 // Netzbezug bleibt trotzdem an die Wallbox-Preisgrenze gekoppelt.
                 $nativeUpdates['wbvon'] = date('H:00');
@@ -2274,7 +2320,9 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
             if (!empty($tx['success'])) {
                 // Abbruchflag löschen: Der Benutzer hat explizit eine Ladedauer gesetzt.
                 // Das Abbruchflag ist Bestandteil derselben Dateitransaktion.
-                if ($quickAction === 'start_now') {
+                if ($quickAction === 'force_start') {
+                    $message = successMessage('Ladung sofort gestartet (Freigabe erzwungen). Alle Blockaden wurden aufgehoben.');
+                } elseif ($quickAction === 'start_now') {
                     $message = successMessage('Sofortladen (Max) aktiviert. wallbox_manager startet die Ladung.');
                 } elseif ($quickAction === 'clear_times') {
                     $message = successMessage('Laden gestoppt (wbhour=0).');
@@ -4058,28 +4106,60 @@ if ($hasWb2) {
                         <?php if ($houseReserveFloorNotice !== ''): ?>
                             <div class="form-text small text-warning">
                                 <i class="fas fa-shield-alt me-1"></i><?= htmlspecialchars($houseReserveFloorNotice) ?>
+                        <div class="row g-2 mb-3">
+                            <div class="col-6">
+                                <label class="form-label text-muted small fw-bold mb-1">Von (Uhr)</label>
+                                <input type="time" name="wbvon" class="form-control form-control-sm rounded-pill" value="<?= htmlspecialchars($wallboxConfig['wbvon'] ?? '00:00') ?>">
                             </div>
-                        <?php endif; ?>
-                    </div>
-                    <div class="col-12 col-md-8 col-xl-9 d-flex align-items-end">
-                        <div class="small text-body-secondary pb-1">
-                            Schützt den Hausspeicher, wenn PV knapp wird oder Netzladen begrenzt werden soll. Die Wallbox-Hardwarelimits stehen im Konfigurations-Editor und werden hier nur angezeigt.
+                            <div class="col-6">
+                                <label class="form-label text-muted small fw-bold mb-1">Bis (Uhr)</label>
+                                <input type="time" name="wbbis" class="form-control form-control-sm rounded-pill" value="<?= htmlspecialchars($wallboxConfig['wbbis'] ?? '00:00') ?>">
+                            </div>
                         </div>
-                    </div>
+
+                        <div class="mb-3">
+                            <label class="form-label text-muted small fw-bold mb-1">Modus</label>
+                            <select name="wb_native_eco" class="form-select form-select-sm rounded-pill">
+                                <option value="0" <?= (($wallboxConfig['wb_native_eco'] ?? '0') === '0') ? 'selected' : '' ?>>Normal (PV-geführt)</option>
+                                <option value="1" <?= (($wallboxConfig['wb_native_eco'] ?? '0') === '1') ? 'selected' : '' ?>>Eco (Nur günstigste Stunden)</option>
+                            </select>
+                        </div>
+
+                        <button type="submit" class="btn btn-outline-info w-100 rounded-pill fw-bold border-2">
+                            ✓ Zeiten speichern
+                        </button>
+                    </form>
                 </div>
-                <div class="<?= $hasWb2 ? 'row g-3 align-items-stretch' : 'row g-3' ?>">
-                    <div class="<?= $hasWb2 ? 'col-12 col-xl-6' : 'col-12' ?>">
+            </div>
+        </div>
+    </div>
+    <?php endif; ?>
+
+    <!-- Fahrzeugzuordnung & Profile -->
+    <div class="card shadow-sm mb-4" style="border-radius: 16px;">
+        <div class="card-body p-3">
+            <div class="d-flex justify-content-between align-items-center mb-3">
+                <h6 class="card-title text-warning fw-bold m-0"><i class="fas fa-car me-2"></i>Fahrzeugzuordnung &amp; Profile</h6>
+                <span class="badge bg-warning-subtle text-warning border border-warning-subtle">Aktiv</span>
+            </div>
+
+            <form action="<?= htmlspecialchars($formAction) ?>" method="post" id="vehicleAssignmentForm">
+                <?= e3dcCsrfInput() ?>
+                <input type="hidden" name="action" value="save_vehicle_assignment">
+                <div class="row g-3">
+                    <!-- Wallbox 1 -->
+                    <div class="col-12 <?= $hasWb2 ? 'col-xl-6' : '' ?>">
                         <div class="vehicle-assignment-panel border rounded-3 p-3 h-100 bg-body-tertiary">
                             <div class="d-flex justify-content-between align-items-center mb-3">
-                                <h6 class="fw-bold mb-0 text-info"><i class="fas fa-plug me-2"></i>Wallbox 1 <span class="badge bg-info-subtle text-info border border-info-subtle ms-1">max <?= (int)$wb1MaxAmpLabel ?>A</span></h6>
-                                <span class="badge bg-info-subtle text-info small">Haupteinfahrt</span>
+                                <h6 class="fw-bold mb-0 text-warning"><i class="fas fa-plug me-2"></i>Wallbox 1 <span class="badge bg-warning-subtle text-warning border border-warning-subtle ms-1">max <?= (int)$wb1MaxAmpLabel ?>A</span></h6>
+                                <span class="badge bg-warning-subtle text-warning small">Haupt</span>
                             </div>
 
                             <div class="row g-2 align-items-end">
                                 <div class="col-12 col-lg-4">
                                     <label class="form-label text-muted small fw-bold mb-1">Fahrzeug</label>
                                     <select name="wb1_car_id" id="wb1_car_selector" class="form-select form-select-sm rounded-pill fw-bold car-selector" data-wb="1">
-                                        <?php $wb1SelectedCar = canonicalWallboxVehicleSelection($wallboxConfig['wb1_car_id'] ?? '__none', $saved_cars); ?>
+                                        <?php $wb1SelectedCar = canonicalWallboxVehicleSelection($wallboxConfig['wb1_car_id'] ?? $wallboxConfig['car_id'] ?? '__none', $saved_cars); ?>
                                         <?php foreach ($vehicleSelectOptions as $vehicleOption): ?>
                                             <option value="<?= htmlspecialchars($vehicleOption['id']) ?>"
                                                     data-name="<?= htmlspecialchars($vehicleOption['name'] ?? '', ENT_QUOTES) ?>"
@@ -4103,10 +4183,19 @@ if ($hasWb2) {
                                     <input type="number" step="0.1" name="wb1_charge_power" class="form-control form-control-sm rounded-pill" value="<?= htmlspecialchars($wallboxConfig['wb1_charge_power'] ?? '11.0') ?>">
                                 </div>
                                 <div class="col-6 col-lg-2">
+                                    <label class="form-label text-muted small fw-bold mb-1">Min. Strom</label>
+                                    <select name="wb1_min_amp" class="form-select form-select-sm rounded-pill">
+                                        <?php $wb1MinAmp = (int)($wallboxConfig['wb1_min_amp'] ?? 6); ?>
+                                        <?php foreach ([6, 8, 10, 13, 16] as $amp): ?>
+                                            <option value="<?= $amp ?>" <?= ($wb1MinAmp === $amp) ? 'selected' : '' ?>><?= $amp ?> A</option>
+                                        <?php endforeach; ?>
+                                    </select>
+                                </div>
+                                <div class="col-6 col-lg-1">
                                     <label class="form-label text-muted small fw-bold mb-1">Ziel %</label>
                                     <input type="number" name="wb1_target_soc" class="form-control form-control-sm rounded-pill" value="<?= htmlspecialchars($wallboxConfig['wb1_target_soc'] ?? '80') ?>">
                                 </div>
-                                <div class="col-6 col-lg-2">
+                                <div class="col-6 col-lg-1">
                                     <label class="form-label text-muted small fw-bold mb-1">Boost %</label>
                                     <input type="number" name="wb1_max_soc_si" class="form-control form-control-sm rounded-pill" value="<?= htmlspecialchars($wallboxConfig['wb1_max_soc_si'] ?? '90') ?>">
                                 </div>
@@ -4156,10 +4245,19 @@ if ($hasWb2) {
                                     <input type="number" step="0.1" name="wb2_charge_power" class="form-control form-control-sm rounded-pill" value="<?= htmlspecialchars($wallboxConfig['wb2_charge_power'] ?? '11.0') ?>">
                                 </div>
                                 <div class="col-6 col-lg-2">
+                                    <label class="form-label text-muted small fw-bold mb-1">Min. Strom</label>
+                                    <select name="wb2_min_amp" class="form-select form-select-sm rounded-pill">
+                                        <?php $wb2MinAmp = (int)($wallboxConfig['wb2_min_amp'] ?? 6); ?>
+                                        <?php foreach ([6, 8, 10, 13, 16] as $amp): ?>
+                                            <option value="<?= $amp ?>" <?= ($wb2MinAmp === $amp) ? 'selected' : '' ?>><?= $amp ?> A</option>
+                                        <?php endforeach; ?>
+                                    </select>
+                                </div>
+                                <div class="col-6 col-lg-1">
                                     <label class="form-label text-muted small fw-bold mb-1">Ziel %</label>
                                     <input type="number" name="wb2_target_soc" class="form-control form-control-sm rounded-pill" value="<?= htmlspecialchars($wallboxConfig['wb2_target_soc'] ?? '80') ?>">
                                 </div>
-                                <div class="col-6 col-lg-2">
+                                <div class="col-6 col-lg-1">
                                     <label class="form-label text-muted small fw-bold mb-1">Boost %</label>
                                     <input type="number" name="wb2_max_soc_si" class="form-control form-control-sm rounded-pill" value="<?= htmlspecialchars($wallboxConfig['wb2_max_soc_si'] ?? '90') ?>">
                                 </div>

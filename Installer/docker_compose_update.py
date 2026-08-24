@@ -38,6 +38,8 @@ START_TIMEOUT_GRACE_S = 60
 COMPOSE_FILENAME = "docker-compose.yml"
 MAX_COMPOSE_BYTES = 512 * 1024
 MAX_ENV_BYTES = 128 * 1024
+MIN_DOCKER_FREE_BYTES = 2 * 1024 * 1024 * 1024
+DOCKER_STORAGE_FULL_CODE = "DOCKER_STORAGE_FULL"
 ROLE_VOLUME_NAME = "e3dc_instance_role"
 ROLE_VOLUME_TARGET = "/etc/e3dc-control"
 DATA_VOLUME_TARGET = "/var/www/html/data"
@@ -188,6 +190,11 @@ KNOWN_542_LEGACY_HASHES = {
     "f253d492f3dbece0ea388996466c2a9e7c1f1911e7595de129895ecf2e06401b": "repo_named_volumes",
     "b4e66cc98b005e34e0c900b91f762539e6bb7d513b33126e196050f520cf06a6": "installer_bind_mounts",
 }
+PUBLISHED_532B_NORMALISED_HASHES = {
+    # v5.3.2b enthält historisch gemischte LF-/CRLF-Zeilenenden. Gebunden wird
+    # deshalb der inhaltlich identische, ausschließlich auf LF normalisierte Blob.
+    "cb30967959cac6df8476ecf8cb1dfc5258a92a327afd51a6e2c79c8de27939ef",
+}
 
 
 class DockerUpdateError(RuntimeError):
@@ -196,6 +203,10 @@ class DockerUpdateError(RuntimeError):
 
 class CandidateStopError(DockerUpdateError):
     """Der Kandidatenstillstand konnte nicht bewiesen werden."""
+
+
+class DockerStorageFullError(DockerUpdateError):
+    """Der Docker-Datenträger besitzt nicht genug nachgewiesenen Freiraum."""
 
 
 def _normalise_version(value: Any) -> str:
@@ -276,8 +287,75 @@ class DockerCli:
 def _require_success(result: subprocess.CompletedProcess[str], label: str) -> str:
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or str(result.returncode)).strip()
+        if re.search(
+            r"(?:no space left on device|disk quota exceeded|not enough space)",
+            detail,
+            flags=re.IGNORECASE,
+        ):
+            raise DockerStorageFullError(_docker_storage_full_message(detail))
         raise DockerUpdateError(f"{label} fehlgeschlagen: {detail}")
     return (result.stdout or "").strip()
+
+
+def _docker_storage_full_message(detail: str) -> str:
+    technical = str(detail or "").strip()
+    suffix = f"\nDocker meldet: {technical}" if technical else ""
+    return (
+        f"[{DOCKER_STORAGE_FULL_CODE}] Im Docker-Speicher ist nicht genug freier "
+        "Platz für Download und sichere Image-Entpackung vorhanden. Der bisherige "
+        "E3DC-Control-Container und seine Volumes werden nicht gelöscht.\n"
+        "Diagnose:\n"
+        "  sudo docker system df -v\n"
+        "  sudo docker info --format '{{.DockerRootDir}}'\n"
+        "  sudo df -h \"$(sudo docker info --format '{{.DockerRootDir}}')\"\n"
+        "Danach gezielt nicht mehr benötigte Images oder andere Hostdateien prüfen; "
+        "dieser Updater führt weder docker prune noch eine Volume-Löschung aus."
+        + suffix
+    )
+
+
+def _docker_storage_preflight(cli: DockerCli) -> dict[str, Any]:
+    """Bindet DockerRootDir und beweist einen konservativen lokalen Freiraum."""
+
+    root_output = _require_success(
+        cli.run(["info", "--format", "{{json .DockerRootDir}}"]),
+        "Docker-Speicherpfad-Prüfung",
+    )
+    try:
+        docker_root = str(json.loads(root_output) or "").strip()
+    except (TypeError, ValueError) as exc:
+        raise DockerUpdateError(
+            f"DockerRootDir ist nicht eindeutig auswertbar: {exc}"
+        ) from exc
+    if not docker_root.startswith("/") or docker_root == "/":
+        raise DockerUpdateError("DockerRootDir ist kein sicherer absoluter Hostpfad.")
+
+    df_result = subprocess.run(
+        [*cli.prefix, "/bin/df", "-Pk", "--", docker_root],
+        cwd=str(cli.compose_dir),
+        env=cli.environment,
+        capture_output=True,
+        text=True,
+        timeout=COMMAND_TIMEOUT_S,
+        check=False,
+    )
+    output = _require_success(df_result, "Docker-Freiraum-Prüfung")
+    rows = [line.split() for line in output.splitlines() if line.strip()]
+    if len(rows) < 2 or len(rows[-1]) < 4 or not rows[-1][3].isdigit():
+        raise DockerUpdateError("Docker-Freiraum konnte nicht eindeutig ausgewertet werden.")
+    available_bytes = int(rows[-1][3]) * 1024
+    if available_bytes < MIN_DOCKER_FREE_BYTES:
+        raise DockerStorageFullError(
+            _docker_storage_full_message(
+                f"DockerRootDir {docker_root}: {available_bytes // (1024 * 1024)} MiB frei; "
+                f"mindestens {MIN_DOCKER_FREE_BYTES // (1024 * 1024)} MiB erforderlich"
+            )
+        )
+    return {
+        "docker_root": docker_root,
+        "available_bytes": available_bytes,
+        "minimum_bytes": MIN_DOCKER_FREE_BYTES,
+    }
 
 
 def _normalised_lf_bytes(value: bytes) -> bytes:
@@ -443,9 +521,29 @@ def _without_migration_fields(value: dict[str, Any]) -> dict[str, Any]:
     services = cleaned.get("services") or {}
     e3dc = services.get(SERVICE_NAME) or {}
     watchtower = services.get("watchtower") or {}
-    for key in ("hostname", "logging", "labels"):
+    for key in ("hostname", "image", "logging"):
         e3dc.pop(key, None)
+    labels = e3dc.get("labels")
+    if isinstance(labels, dict):
+        labels.pop("com.centurylinklabs.watchtower.enable", None)
+        if not labels:
+            e3dc.pop("labels", None)
+    environment = e3dc.get("environment")
+    if isinstance(environment, dict):
+        environment.pop("E3DC_CONTAINER_MODE", None)
+        if not environment:
+            e3dc.pop("environment", None)
     watchtower.pop("logging", None)
+    profiles = watchtower.get("profiles")
+    if isinstance(profiles, list):
+        watchtower["profiles"] = [item for item in profiles if item != "auto-update"]
+        if not watchtower["profiles"]:
+            watchtower.pop("profiles", None)
+    watch_environment = watchtower.get("environment")
+    if isinstance(watch_environment, dict):
+        watch_environment.pop("WATCHTOWER_LABEL_ENABLE", None)
+        if not watch_environment:
+            watchtower.pop("environment", None)
     volumes = e3dc.get("volumes")
     if isinstance(volumes, list):
         e3dc["volumes"] = [
@@ -453,12 +551,18 @@ def _without_migration_fields(value: dict[str, Any]) -> dict[str, Any]:
             for item in volumes
             if not (
                 isinstance(item, dict)
-                and str(item.get("target") or "") == ROLE_VOLUME_TARGET
+                and str(item.get("target") or "")
+                in {
+                    "/var/lib/e3dc-control/ml",
+                    "/var/lib/e3dc-control/forecast-evidence",
+                    ROLE_VOLUME_TARGET,
+                }
             )
         ]
     top_volumes = cleaned.get("volumes")
     if isinstance(top_volumes, dict):
-        top_volumes.pop(ROLE_VOLUME_NAME, None)
+        for name in ("e3dc_ml", "e3dc_forecast_evidence", ROLE_VOLUME_NAME):
+            top_volumes.pop(name, None)
     return cleaned
 
 
@@ -501,6 +605,14 @@ def _validate_projection_delta(
         raise DockerUpdateError("Der persistente Instanzrollen-Mount ist nicht eindeutig.")
     if ROLE_VOLUME_NAME not in (after.get("volumes") or {}):
         raise DockerUpdateError("Das Top-Level-Volume für die Instanzrolle fehlt.")
+    environment = service.get("environment") or {}
+    if str(environment.get("E3DC_CONTAINER_MODE") or "") != "1":
+        raise DockerUpdateError("Die Docker-Laufzeitrolle E3DC_CONTAINER_MODE=1 fehlt.")
+    watch_environment = watchtower.get("environment") or {}
+    if str(watch_environment.get("WATCHTOWER_LABEL_ENABLE") or "").lower() != "true":
+        raise DockerUpdateError("Watchtower ist nicht auf explizit markierte Container begrenzt.")
+    if "auto-update" not in tuple(watchtower.get("profiles") or ()):
+        raise DockerUpdateError("Watchtower besitzt nicht das explizite auto-update-Profil.")
     expected_watchtower = (
         {"max-size": "10m", "max-file": "3"}
         if topology == "installer_bind_mounts"
@@ -895,22 +1007,30 @@ def _validate_e3dc_container_binding(
         )
 
     projected_service = ((projection.get("services") or {}).get(SERVICE_NAME) or {})
-    projected_volumes = projected_service.get("volumes") or ()
-    expected_targets = {
-        DATA_VOLUME_TARGET,
-        LOG_VOLUME_TARGET,
+    projected_volumes = [
+        item
+        for item in (projected_service.get("volumes") or ())
+        if isinstance(item, dict) and str(item.get("type") or "") in {"bind", "volume"}
+    ]
+    expected_targets = {str(item.get("target") or "") for item in projected_volumes}
+    mandatory_targets = {DATA_VOLUME_TARGET, LOG_VOLUME_TARGET}
+    if require_role:
+        mandatory_targets.add(ROLE_VOLUME_TARGET)
+    if not mandatory_targets.issubset(expected_targets):
+        raise DockerUpdateError("Die projizierten persistenten E3DC-Mounts sind unvollständig.")
+    if len(expected_targets) != len(projected_volumes):
+        raise DockerUpdateError("Die projizierten persistenten E3DC-Mountziele sind mehrdeutig.")
+    private_targets = {
         "/var/lib/e3dc-control/ml",
         "/var/lib/e3dc-control/forecast-evidence",
+        ROLE_VOLUME_TARGET,
     }
-    if require_role:
-        expected_targets.add(ROLE_VOLUME_TARGET)
-    expected_items = [
-        item
-        for item in projected_volumes
-        if isinstance(item, dict) and str(item.get("target") or "") in expected_targets
-    ]
-    if {str(item.get("target") or "") for item in expected_items} != expected_targets:
-        raise DockerUpdateError("Die projizierten persistenten E3DC-Mounts sind unvollständig.")
+    for item in projected_volumes:
+        target = str(item.get("target") or "")
+        if target not in mandatory_targets | private_targets and not _safe_custom_mount(item):
+            raise DockerUpdateError(
+                f"Der projizierte Fremdmount {target or '<leer>'} ist nicht sicher read-only gebunden."
+            )
     actual_mounts = info.get("Mounts") or ()
     actual_persistent = [
         mount
@@ -923,7 +1043,7 @@ def _validate_e3dc_container_binding(
         raise DockerUpdateError(
             "Der reale Container besitzt zusätzliche oder fehlende persistente Mounts."
         )
-    for expected in expected_items:
+    for expected in projected_volumes:
         target = str(expected.get("target") or "")
         matches = [
             mount
@@ -938,15 +1058,11 @@ def _validate_e3dc_container_binding(
             raise DockerUpdateError(f"Der reale Container-Mount {target} wechselte seinen Typ.")
         if expected_type == "bind":
             expected_source = os.path.realpath(str(expected.get("source") or ""))
-            if target == DATA_VOLUME_TARGET:
-                required_source = os.path.realpath(cli.compose_dir / "data")
-            elif target == LOG_VOLUME_TARGET:
-                required_source = os.path.realpath(cli.compose_dir / "logs")
-            else:
+            if target in private_targets:
                 raise DockerUpdateError("Ein privater E3DC-Mount darf kein Bind-Mount sein.")
-            if expected_source != required_source or os.path.realpath(
-                str(actual.get("Source") or "")
-            ) != required_source:
+            if not expected_source.startswith("/") or expected_source == "/":
+                raise DockerUpdateError(f"Der Bind-Mount {target} besitzt keinen sicheren Quellpfad.")
+            if os.path.realpath(str(actual.get("Source") or "")) != expected_source:
                 raise DockerUpdateError(f"Der Bind-Mount {target} zeigt auf einen fremden Pfad.")
         elif expected_type == "volume":
             logical_name = str(expected.get("source") or "")
@@ -1031,7 +1147,403 @@ def _env_sets_compose_file(data: bytes) -> bool:
     return False
 
 
-def _classify_compose_source(data: bytes) -> tuple[str, str]:
+def _safe_custom_mount(item: dict[str, Any]) -> bool:
+    target = str(item.get("target") or "")
+    if not target.startswith("/") or target == "/":
+        return False
+    protected = (
+        "/app",
+        "/opt",
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/lib",
+        "/etc/e3dc-control",
+        "/var/www/html",
+        "/var/lib/e3dc-control",
+        "/var/run/docker.sock",
+    )
+    if any(target == root or target.startswith(root + "/") for root in protected):
+        return False
+    return bool(item.get("read_only")) and str(item.get("type") or "") in {
+        "bind",
+        "volume",
+    }
+
+
+def _legacy_532b_projection_topology(projection: dict[str, Any]) -> str:
+    services = projection.get("services") or {}
+    e3dc = services.get(SERVICE_NAME) or {}
+    watchtower = services.get("watchtower") or {}
+    image = _require_official_image(str(e3dc.get("image") or ""))
+    if _tag_version(image) != LEGACY_NO_HEALTHCHECK_VERSION:
+        raise DockerUpdateError("Die semantische Altmigration gilt nur für v5.3.2b.")
+    if (
+        str(e3dc.get("container_name") or "") != SERVICE_NAME
+        or str(e3dc.get("network_mode") or "") != "host"
+        or str(e3dc.get("restart") or "") != "unless-stopped"
+    ):
+        raise DockerUpdateError("Der v5.3.2b-Dienst besitzt keine sichere Standardidentität.")
+    forbidden = {
+        "build",
+        "command",
+        "entrypoint",
+        "privileged",
+        "devices",
+        "cap_add",
+        "pid",
+        "ipc",
+        "uts",
+        "userns_mode",
+        "security_opt",
+        "sysctls",
+        "develop",
+    }
+    if forbidden & set(e3dc):
+        raise DockerUpdateError(
+            "Die angepasste v5.3.2b-Compose-Datei enthält nicht automatisch "
+            "migrierbare Prozess- oder Hardwareprivilegien."
+        )
+
+    volume_items = [item for item in (e3dc.get("volumes") or ()) if isinstance(item, dict)]
+    mappings = {
+        target: _volume_mapping(e3dc, target)
+        for target in (DATA_VOLUME_TARGET, LOG_VOLUME_TARGET)
+    }
+    if any(len(items) != 1 for items in mappings.values()):
+        raise DockerUpdateError("Die v5.3.2b-Daten- und Logpersistenz ist nicht eindeutig.")
+    data_type = str(mappings[DATA_VOLUME_TARGET][0].get("type") or "")
+    log_type = str(mappings[LOG_VOLUME_TARGET][0].get("type") or "")
+    if data_type != log_type or data_type not in {"bind", "volume"}:
+        raise DockerUpdateError("Daten und Logs verwenden keine einheitliche sichere Topologie.")
+    for item in volume_items:
+        target = str(item.get("target") or "")
+        if target in {DATA_VOLUME_TARGET, LOG_VOLUME_TARGET}:
+            if bool(item.get("read_only")):
+                raise DockerUpdateError(f"Der persistente Mount {target} ist schreibgeschützt.")
+            continue
+        if not _safe_custom_mount(item):
+            raise DockerUpdateError(
+                f"Der benutzerdefinierte Mount {target or '<leer>'} ist nicht "
+                "nachweislich read-only und außerhalb der Produktpfade."
+            )
+
+    watch_image = str(watchtower.get("image") or "").strip()
+    if watch_image not in {"containrrr/watchtower", "containrrr/watchtower:latest"}:
+        raise DockerUpdateError("Die v5.3.2b-Watchtower-Quelle ist nicht offiziell gebunden.")
+    socket_mounts = _volume_mapping(watchtower, "/var/run/docker.sock")
+    if len(socket_mounts) != 1 or str(socket_mounts[0].get("source") or "") != "/var/run/docker.sock":
+        raise DockerUpdateError("Der v5.3.2b-Watchtower besitzt keinen eindeutigen Docker-Socket.")
+    watch_persistent = [
+        item
+        for item in (watchtower.get("volumes") or ())
+        if isinstance(item, dict) and str(item.get("type") or "") in {"bind", "volume"}
+    ]
+    if len(watch_persistent) != 1:
+        raise DockerUpdateError("Der v5.3.2b-Watchtower besitzt zusätzliche Hostmounts.")
+    watch_environment = watchtower.get("environment") or {}
+    docker_host_override = (
+        "DOCKER_HOST" in watch_environment
+        if isinstance(watch_environment, dict)
+        else any(str(item).startswith("DOCKER_HOST=") for item in watch_environment)
+    )
+    if forbidden & set(watchtower) or docker_host_override:
+        raise DockerUpdateError(
+            "Der v5.3.2b-Watchtower besitzt eine nicht migrierbare Prozess- oder Docker-Host-Anpassung."
+        )
+    if str(watchtower.get("container_name") or "") != "watchtower":
+        raise DockerUpdateError("Der v5.3.2b-Watchtower besitzt einen fremden Containername.")
+    return "installer_bind_mounts" if data_type == "bind" else "repo_named_volumes"
+
+
+def _yaml_lines_for_semantic_migration(data: bytes) -> list[str]:
+    normalised = _normalised_lf_bytes(data)
+    try:
+        text = normalised.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise DockerUpdateError("Compose ist nicht gültig UTF-8-kodiert.") from exc
+    if not text.endswith("\n"):
+        raise DockerUpdateError("Compose muss mit einem eindeutigen Zeilenende enden.")
+    _active_yaml_lines(text)
+    return text.splitlines()
+
+
+def _mapping_span(lines: list[str], *, indent: int, key: str) -> tuple[int, int]:
+    prefix = " " * indent + key + ":"
+    matches = [
+        index
+        for index, line in enumerate(lines)
+        if (_active_yaml_lines(line)[0] if _active_yaml_lines(line) else "") == prefix
+    ]
+    if len(matches) != 1:
+        raise DockerUpdateError(f"Der YAML-Block {key} ist nicht eindeutig.")
+    start = matches[0]
+    end = len(lines)
+    for index in range(start + 1, len(lines)):
+        active = _active_yaml_lines(lines[index])
+        if not active:
+            continue
+        content = active[0]
+        child_indent = len(content) - len(content.lstrip(" "))
+        if child_indent <= indent:
+            end = index
+            break
+    return start, end
+
+
+def _service_span(lines: list[str], service: str) -> tuple[int, int]:
+    services_start, services_end = _mapping_span(lines, indent=0, key="services")
+    prefix = "  " + service + ":"
+    matches = [
+        index
+        for index in range(services_start + 1, services_end)
+        if (_active_yaml_lines(lines[index])[0] if _active_yaml_lines(lines[index]) else "")
+        == prefix
+    ]
+    if len(matches) != 1:
+        raise DockerUpdateError(f"Der Compose-Dienst {service} ist nicht eindeutig.")
+    start = matches[0]
+    end = services_end
+    for index in range(start + 1, services_end):
+        active = _active_yaml_lines(lines[index])
+        if not active:
+            continue
+        content = active[0]
+        child_indent = len(content) - len(content.lstrip(" "))
+        if child_indent <= 2:
+            end = index
+            break
+    return start, end
+
+
+def _direct_field_indices(
+    lines: list[str],
+    *,
+    start: int,
+    end: int,
+    indent: int,
+    key: str,
+) -> list[int]:
+    pattern = re.compile(rf"^{{}}{re.escape(key)}\s*:".format(" " * indent))
+    return [
+        index
+        for index in range(start + 1, end)
+        if (
+            (active := _active_yaml_lines(lines[index]))
+            and pattern.match(active[0])
+            and len(active[0]) - len(active[0].lstrip(" ")) == indent
+        )
+    ]
+
+
+def _set_service_scalar(
+    lines: list[str],
+    service: str,
+    key: str,
+    value: str,
+    *,
+    replace: bool,
+) -> None:
+    start, end = _service_span(lines, service)
+    matches = _direct_field_indices(lines, start=start, end=end, indent=4, key=key)
+    if len(matches) > 1:
+        raise DockerUpdateError(f"{service}.{key} ist mehrfach vorhanden.")
+    if matches:
+        active = _active_yaml_lines(lines[matches[0]])[0]
+        current = active.split(":", 1)[1].strip()
+        if not replace and current.strip("'\"") != value.strip("'\""):
+            raise DockerUpdateError(f"{service}.{key} widerspricht dem Zielvertrag.")
+        if replace:
+            lines[matches[0]] = f"    {key}: {value}"
+        return
+    lines.insert(start + 1, f"    {key}: {value}")
+
+
+def _service_field_span(lines: list[str], service: str, field: str) -> tuple[int, int] | None:
+    start, end = _service_span(lines, service)
+    matches = _direct_field_indices(lines, start=start, end=end, indent=4, key=field)
+    if len(matches) > 1:
+        raise DockerUpdateError(f"{service}.{field} ist mehrfach vorhanden.")
+    if not matches:
+        return None
+    field_start = matches[0]
+    field_end = end
+    for index in range(field_start + 1, end):
+        active = _active_yaml_lines(lines[index])
+        if not active:
+            continue
+        content = active[0]
+        child_indent = len(content) - len(content.lstrip(" "))
+        if child_indent <= 4:
+            field_end = index
+            break
+    return field_start, field_end
+
+
+def _ensure_service_sequence_entry(
+    lines: list[str], service: str, field: str, value: str
+) -> None:
+    span = _service_field_span(lines, service, field)
+    if span is None:
+        _start, service_end = _service_span(lines, service)
+        lines[service_end:service_end] = [f"    {field}:", f"      - {value}"]
+        return
+    field_start, field_end = span
+    entries: list[str] = []
+    for index in range(field_start + 1, field_end):
+        active = _active_yaml_lines(lines[index])
+        if not active:
+            continue
+        content = active[0]
+        child_indent = len(content) - len(content.lstrip(" "))
+        if child_indent != 6 or not content.strip().startswith("- "):
+            raise DockerUpdateError(
+                f"{service}.{field} verwendet keine sicher erweiterbare Kurzlistenform."
+            )
+        entries.append(content.strip()[2:].strip())
+    if value not in entries:
+        lines.insert(field_end, f"      - {value}")
+
+
+def _ensure_service_assignment(
+    lines: list[str],
+    service: str,
+    field: str,
+    key: str,
+    value: str,
+) -> None:
+    span = _service_field_span(lines, service, field)
+    if span is None:
+        _start, service_end = _service_span(lines, service)
+        lines[service_end:service_end] = [f"    {field}:", f"      - {key}={value}"]
+        return
+    field_start, field_end = span
+    style = ""
+    matches: list[int] = []
+    for index in range(field_start + 1, field_end):
+        active = _active_yaml_lines(lines[index])
+        if not active:
+            continue
+        content = active[0]
+        child_indent = len(content) - len(content.lstrip(" "))
+        stripped = content.strip()
+        if child_indent != 6:
+            raise DockerUpdateError(
+                f"{service}.{field} verwendet eine verschachtelte, nicht sicher erweiterbare Form."
+            )
+        current_style = "sequence" if stripped.startswith("- ") else "mapping"
+        if style and current_style != style:
+            raise DockerUpdateError(f"{service}.{field} mischt YAML-Darstellungsformen.")
+        style = current_style
+        material = stripped[2:].strip() if style == "sequence" else stripped
+        assignment_key = material.split("=", 1)[0] if style == "sequence" else material.split(":", 1)[0]
+        if assignment_key.strip("'\"") == key:
+            matches.append(index)
+    if len(matches) > 1:
+        raise DockerUpdateError(f"{service}.{field}.{key} ist mehrfach vorhanden.")
+    if matches:
+        lines[matches[0]] = (
+            f"      - {key}={value}"
+            if style == "sequence"
+            else f'      {key}: "{value}"'
+        )
+        return
+    lines.insert(
+        field_end,
+        f"      - {key}={value}" if style != "mapping" else f'      {key}: "{value}"',
+    )
+
+
+def _ensure_service_mapping(
+    lines: list[str], service: str, field: str, body: tuple[str, ...]
+) -> None:
+    if _service_field_span(lines, service, field) is not None:
+        return
+    _start, service_end = _service_span(lines, service)
+    lines[service_end:service_end] = [f"    {field}:", *body]
+
+
+def _ensure_top_volume(lines: list[str], name: str) -> None:
+    start, end = _mapping_span(lines, indent=0, key="volumes")
+    matches = _direct_field_indices(lines, start=start, end=end, indent=2, key=name)
+    if len(matches) > 1:
+        raise DockerUpdateError(f"Das Top-Level-Volume {name} ist mehrfach vorhanden.")
+    if not matches:
+        lines.insert(end, f"  {name}:")
+
+
+def _project_legacy_532b_compose(data: bytes, *, topology: str) -> bytes:
+    lines = _yaml_lines_for_semantic_migration(data)
+    _set_service_scalar(
+        lines,
+        SERVICE_NAME,
+        "image",
+        VARIABLE_IMAGE_EXPRESSION,
+        replace=True,
+    )
+    _set_service_scalar(lines, SERVICE_NAME, "hostname", SERVICE_NAME, replace=False)
+    _ensure_service_mapping(
+        lines,
+        SERVICE_NAME,
+        "logging",
+        (
+            "      driver: json-file",
+            "      options:",
+            '        max-size: "10m"',
+            '        max-file: "3"',
+        ),
+    )
+    _ensure_service_assignment(
+        lines,
+        SERVICE_NAME,
+        "labels",
+        "com.centurylinklabs.watchtower.enable",
+        "${E3DC_WATCHTOWER_ENABLE:-false}",
+    )
+    for value in (
+        "e3dc_ml:/var/lib/e3dc-control/ml",
+        "e3dc_forecast_evidence:/var/lib/e3dc-control/forecast-evidence",
+        f"{ROLE_VOLUME_NAME}:{ROLE_VOLUME_TARGET}",
+    ):
+        _ensure_service_sequence_entry(lines, SERVICE_NAME, "volumes", value)
+    _ensure_service_assignment(
+        lines,
+        SERVICE_NAME,
+        "environment",
+        "E3DC_CONTAINER_MODE",
+        "1",
+    )
+    watch_size, watch_files = (
+        ("10m", "3") if topology == "installer_bind_mounts" else ("5m", "2")
+    )
+    _ensure_service_mapping(
+        lines,
+        "watchtower",
+        "logging",
+        (
+            "      driver: json-file",
+            "      options:",
+            f'        max-size: "{watch_size}"',
+            f'        max-file: "{watch_files}"',
+        ),
+    )
+    _ensure_service_sequence_entry(lines, "watchtower", "profiles", "auto-update")
+    _ensure_service_assignment(
+        lines,
+        "watchtower",
+        "environment",
+        "WATCHTOWER_LABEL_ENABLE",
+        "true",
+    )
+    for name in ("e3dc_ml", "e3dc_forecast_evidence", ROLE_VOLUME_NAME):
+        _ensure_top_volume(lines, name)
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def _classify_compose_source(
+    data: bytes,
+    projection: dict[str, Any] | None = None,
+) -> tuple[str, str]:
     normalised = _normalised_lf_bytes(data)
     legacy_hash = hashlib.sha256(normalised).hexdigest()
     topology = KNOWN_542_LEGACY_HASHES.get(legacy_hash)
@@ -1040,15 +1552,37 @@ def _classify_compose_source(data: bytes) -> tuple[str, str]:
     except UnicodeDecodeError as exc:
         raise DockerUpdateError("Compose ist nicht gültig UTF-8-kodiert.") from exc
     current_topology = KNOWN_CURRENT_TEMPLATES.get(active)
-    if topology is None and current_topology is None:
-        raise DockerUpdateError(
-            "Automatisch migriert werden nur die unveränderten veröffentlichten "
-            "5.4.2–5.4.2d-Compose-Dateien oder ihre Installer-Bind-Mount-Variante. "
-            "Ältere beziehungsweise angepasste Dateien müssen manuell geprüft werden."
+    published_532b = legacy_hash in PUBLISHED_532B_NORMALISED_HASHES
+    legacy_532b_topology = "repo_named_volumes" if published_532b else ""
+    if projection is not None:
+        projected_image = str(
+            (((projection.get("services") or {}).get(SERVICE_NAME) or {}).get("image"))
+            or ""
         )
-    if topology is not None and current_topology is not None:
+        if _tag_version(projected_image) == LEGACY_NO_HEALTHCHECK_VERSION:
+            semantic_topology = _legacy_532b_projection_topology(projection)
+            if published_532b and semantic_topology != legacy_532b_topology:
+                raise DockerUpdateError(
+                    "Die veröffentlichte v5.3.2b-Datei widerspricht ihrer gebundenen Topologie."
+                )
+            legacy_532b_topology = semantic_topology
+        elif published_532b:
+            raise DockerUpdateError(
+                "Der veröffentlichte v5.3.2b-Blob projiziert nicht sein gebundenes Altimage."
+            )
+    if topology is None and current_topology is None and not legacy_532b_topology:
+        raise DockerUpdateError(
+            "Automatisch migriert werden die semantisch sichere v5.3.2b-Compose-Datei, "
+            "die unveränderten veröffentlichten 5.4.2–5.4.2d-Dateien und der "
+            "aktuelle Pflichtvertrag. Prozess-, Hardware- oder schreibbare "
+            "Fremdmount-Anpassungen müssen manuell geprüft werden."
+        )
+    found = sum(bool(item) for item in (topology, current_topology, legacy_532b_topology))
+    if found != 1:
         raise DockerUpdateError("Der Compose-Stand ist strukturell mehrdeutig.")
-    return topology or current_topology or "", "legacy" if topology is not None else "current"
+    if legacy_532b_topology:
+        return legacy_532b_topology, "legacy_532b"
+    return topology or current_topology or "", "legacy_542" if topology is not None else "current"
 
 
 def _prepare_compose_contract(cli: DockerCli) -> dict[str, Any]:
@@ -1108,11 +1642,13 @@ def _prepare_compose_contract(cli: DockerCli) -> dict[str, Any]:
         if env_snapshot is not None and _env_sets_compose_file(env_snapshot["data"]):
             raise DockerUpdateError(".env enthält eine mehrdeutige COMPOSE_FILE-Überlagerung.")
 
-        topology, compose_state = _classify_compose_source(source["data"])
-        if topology is None:
-            raise DockerUpdateError("Die Compose-Topologie konnte nicht gebunden werden.")
-
         before_projection = _compose_projection(cli, cli.compose_file)
+        topology, compose_state = _classify_compose_source(
+            source["data"],
+            before_projection,
+        )
+        if not topology:
+            raise DockerUpdateError("Die Compose-Topologie konnte nicht gebunden werden.")
         selected = str(
             ((before_projection.get("services") or {}).get(SERVICE_NAME) or {}).get("image")
             or ""
@@ -1148,11 +1684,17 @@ def _prepare_compose_contract(cli: DockerCli) -> dict[str, Any]:
                 "state": "current",
                 "topology": topology,
                 "compose": source,
+                "preimage": source,
                 "env": env_snapshot,
                 "projection": before_projection,
+                "pre_projection": before_projection,
             }
 
-        candidate_data = _project_current_compose(source["data"], topology=topology)
+        candidate_data = (
+            _project_legacy_532b_compose(source["data"], topology=topology)
+            if compose_state == "legacy_532b"
+            else _project_current_compose(source["data"], topology=topology)
+        )
         candidate_name, candidate_path = _write_candidate(
             directory_fd,
             compose_dir,
@@ -1200,7 +1742,8 @@ def _prepare_compose_contract(cli: DockerCli) -> dict[str, Any]:
                 f"Compose-Endprüfung fehlgeschlagen; der gebundene Preimage wurde wiederhergestellt: {exc}"
             ) from exc
         print(
-            "✓ Compose 5.4.2 wurde atomar auf den aktuellen Host-Vertrag migriert; "
+            f"✓ Compose {('5.3.2b' if compose_state == 'legacy_532b' else '5.4.2')} "
+            "wurde atomar auf den aktuellen Host-Vertrag migriert; "
             "Daten- und Logtopologie blieb unverändert.",
             flush=True,
         )
@@ -1208,10 +1751,13 @@ def _prepare_compose_contract(cli: DockerCli) -> dict[str, Any]:
             print("✓ Watchtower bleibt nach der sicheren Migration bewusst gestoppt.", flush=True)
         return {
             "state": "migrated",
+            "source_state": compose_state,
             "topology": topology,
             "compose": bound_source,
+            "preimage": source,
             "env": env_snapshot,
             "projection": final_projection,
+            "pre_projection": before_projection,
         }
     finally:
         if candidate_name:
@@ -1227,6 +1773,7 @@ def _require_prepared_contract(
     contract: dict[str, Any],
     *,
     require_role: bool = False,
+    runtime_projection: dict[str, Any] | None = None,
 ) -> None:
     compose_dir = cli.compose_dir
     _validate_directory_chain(compose_dir)
@@ -1267,7 +1814,7 @@ def _require_prepared_contract(
     _stop_update_watchtower(cli, contract.get("projection") or {})
     _validate_e3dc_container_binding(
         cli,
-        contract.get("projection") or {},
+        runtime_projection or contract.get("projection") or {},
         require_role=require_role,
     )
 
@@ -1350,6 +1897,271 @@ def _image_contract(
         "version": image_version,
         "legacy_without_healthcheck": "1" if legacy_health else "0",
     }
+
+
+def _projection_has_role(projection: dict[str, Any]) -> bool:
+    service = ((projection.get("services") or {}).get(SERVICE_NAME) or {})
+    return bool(_volume_mapping(service, ROLE_VOLUME_TARGET))
+
+
+def _capture_previous_runtime(
+    cli: DockerCli,
+    projection: dict[str, Any],
+) -> dict[str, Any]:
+    ids = _named_container_ids(cli, SERVICE_NAME)
+    if len(ids) > 1:
+        raise DockerUpdateError("Das Altcontainer-Inventar ist mehrdeutig.")
+    if not ids:
+        return {"present": False, "running": False}
+    container_id = ids[0]
+    before = _e3dc_stop_authority(cli, container_id)
+    _validate_e3dc_container_binding(
+        cli,
+        projection,
+        require_role=_projection_has_role(projection),
+    )
+    image_ref = _require_official_image(
+        str((before.get("Config") or {}).get("Image") or "")
+    )
+    legacy_version = (
+        LEGACY_NO_HEALTHCHECK_VERSION
+        if _tag_version(image_ref) == LEGACY_NO_HEALTHCHECK_VERSION
+        else ""
+    )
+    contract = _image_contract(
+        cli,
+        image_ref,
+        legacy_no_healthcheck_version=legacy_version,
+    )
+    if str(before.get("Image") or "") != contract["image_id"]:
+        raise DockerUpdateError("Die lokale Altimage-ID widerspricht dem laufenden Container.")
+    running = (before.get("State") or {}).get("Running") is True
+    if running and _runtime_version(cli, container_id) != contract["version"]:
+        raise DockerUpdateError("Altimage und laufende Altversion widersprechen sich.")
+    after = _e3dc_stop_authority(cli, container_id)
+    stable_keys = lambda info: (
+        str(info.get("Id") or ""),
+        str(info.get("Image") or ""),
+        bool((info.get("State") or {}).get("Running")),
+        int(info.get("RestartCount") or 0),
+        str((info.get("State") or {}).get("StartedAt") or ""),
+    )
+    if stable_keys(before) != stable_keys(after):
+        raise DockerUpdateError("Der Altcontainer driftete während seiner Rückfallbindung.")
+    return {
+        "present": True,
+        "running": running,
+        "container_id": container_id,
+        "contract": contract,
+    }
+
+
+def _replace_active_compose_data(
+    cli: DockerCli,
+    *,
+    expected_data: bytes,
+    replacement_data: bytes,
+    metadata_source: dict[str, Any],
+) -> dict[str, Any]:
+    directory_fd = os.open(
+        cli.compose_dir,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+    )
+    candidate_name = ""
+    try:
+        current = _secure_snapshot(
+            directory_fd,
+            COMPOSE_FILENAME,
+            required=True,
+            max_size=MAX_COMPOSE_BYTES,
+        )
+        if current is None or current["data"] != expected_data:
+            raise DockerUpdateError(
+                "Compose driftete; der gebundene Stand darf beim Rückfall nicht überschrieben werden."
+            )
+        candidate_name, _candidate_path = _write_candidate(
+            directory_fd,
+            cli.compose_dir,
+            replacement_data,
+            metadata_source,
+        )
+        replaced = _replace_candidate(
+            directory_fd,
+            candidate_name,
+            replacement_data,
+            metadata_source,
+        )
+        candidate_name = ""
+        return replaced
+    finally:
+        if candidate_name:
+            try:
+                os.unlink(candidate_name, dir_fd=directory_fd)
+            except OSError:
+                pass
+        os.close(directory_fd)
+
+
+def _restore_compose_contract_preimage(
+    cli: DockerCli,
+    contract: dict[str, Any],
+) -> dict[str, Any]:
+    current = contract.get("compose") or {}
+    preimage = contract.get("preimage") or current
+    if current.get("data") == preimage.get("data"):
+        return current
+    return _replace_active_compose_data(
+        cli,
+        expected_data=current["data"],
+        replacement_data=preimage["data"],
+        metadata_source=preimage,
+    )
+
+
+def _compose_with_image(data: bytes, image: str) -> bytes:
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(image or "")):
+        raise DockerUpdateError("Das Rückfallimage besitzt keine unveränderliche Image-ID.")
+    lines = _yaml_lines_for_semantic_migration(data)
+    _set_service_scalar(lines, SERVICE_NAME, "image", image, replace=True)
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def _restore_old_image_reference(cli: DockerCli, contract: dict[str, str]) -> None:
+    image_ref = _require_official_image(str(contract.get("image") or ""))
+    image_id = str(contract.get("image_id") or "")
+    _require_success(
+        cli.run(["image", "tag", image_id, image_ref]),
+        "Wiederherstellung der Altimage-Referenz",
+    )
+    rebound = _image_contract(
+        cli,
+        image_ref,
+        legacy_no_healthcheck_version=(
+            LEGACY_NO_HEALTHCHECK_VERSION
+            if contract.get("legacy_without_healthcheck") == "1"
+            else ""
+        ),
+    )
+    if rebound != contract:
+        raise DockerUpdateError("Die wiederhergestellte Altimage-Referenz ist nicht identisch.")
+
+
+def _rollback_previous_runtime(
+    cli: DockerCli,
+    compose_contract: dict[str, Any],
+    previous: dict[str, Any],
+    *,
+    wait_timeout: int,
+) -> dict[str, Any]:
+    restored = _restore_compose_contract_preimage(cli, compose_contract)
+    if not previous.get("present") or not previous.get("running"):
+        return {
+            "restored": True,
+            "previous_running": False,
+            "version": "",
+        }
+
+    old_contract = dict(previous.get("contract") or {})
+    old_image_id = str(old_contract.get("image_id") or "")
+    pinned_data = _compose_with_image(restored["data"], old_image_id)
+    pinned = _replace_active_compose_data(
+        cli,
+        expected_data=restored["data"],
+        replacement_data=pinned_data,
+        metadata_source=restored,
+    )
+    pinned_contract = dict(old_contract)
+    pinned_contract["image"] = old_image_id
+    start_error: BaseException | None = None
+    verification: dict[str, Any] | None = None
+    try:
+        up_result = cli.compose(
+            [
+                "up",
+                "-d",
+                "--pull",
+                "never",
+                "--force-recreate",
+                "--wait",
+                "--wait-timeout",
+                str(wait_timeout),
+                SERVICE_NAME,
+            ],
+            timeout=wait_timeout + START_TIMEOUT_GRACE_S,
+            capture=True,
+        )
+        _require_success(up_result, "Start des gebundenen Altcontainers")
+        verification = _verify_candidate(cli, pinned_contract)
+        _restore_old_image_reference(cli, old_contract)
+    except BaseException as exc:
+        start_error = exc
+    finally:
+        try:
+            _replace_active_compose_data(
+                cli,
+                expected_data=pinned["data"],
+                replacement_data=restored["data"],
+                metadata_source=restored,
+            )
+        except BaseException as restore_exc:
+            raise CandidateStopError(
+                "Der Altcontainer-Rückfall konnte die originale Compose-Datei nicht "
+                f"wiederherstellen: {restore_exc}"
+            ) from restore_exc
+    if start_error is not None:
+        raise CandidateStopError(
+            f"Der gebundene Altcontainer konnte nicht wieder gestartet werden: {start_error}"
+        ) from start_error
+    second = _verify_candidate(cli, pinned_contract)
+    return {
+        "restored": True,
+        "previous_running": True,
+        "version": old_contract.get("version") or "",
+        "verification": second or verification or {},
+    }
+
+
+def _restore_prestart_state(
+    cli: DockerCli,
+    compose_contract: dict[str, Any],
+    previous: dict[str, Any],
+) -> None:
+    _restore_compose_contract_preimage(cli, compose_contract)
+    _require_previous_runtime_unchanged(
+        cli,
+        previous,
+        compose_contract.get("pre_projection") or {},
+    )
+
+
+def _require_previous_runtime_unchanged(
+    cli: DockerCli,
+    previous: dict[str, Any],
+    projection: dict[str, Any],
+) -> None:
+    ids = _named_container_ids(cli, SERVICE_NAME)
+    if not previous.get("present"):
+        if ids:
+            raise CandidateStopError("Vor dem Kandidatenstart entstand ein fremder Altcontainer.")
+        return
+    if ids != (str(previous.get("container_id") or ""),):
+        raise CandidateStopError(
+            "Der Altcontainerzustand driftete vor dem Kandidatenstart und konnte nicht "
+            "unverändert bestätigt werden."
+        )
+    info = _e3dc_stop_authority(cli, ids[0])
+    _validate_e3dc_container_binding(
+        cli,
+        projection,
+        require_role=_projection_has_role(projection),
+    )
+    if (
+        str(info.get("Image") or "")
+        != str((previous.get("contract") or {}).get("image_id") or "")
+        or ((info.get("State") or {}).get("Running") is True)
+        != bool(previous.get("running"))
+    ):
+        raise CandidateStopError("Altimage-ID oder Laufzustand driftete vor dem Kandidatenstart.")
 
 
 def _container_ids(cli: DockerCli, *, include_stopped: bool = False) -> tuple[str, ...]:
@@ -1503,7 +2315,6 @@ def _stop_candidate(
 ) -> bool:
     previous_ids: tuple[str, ...] | None = None
     stable = 0
-    bound_seen = False
     contract_drift = False
     stop_error = ""
     last_running: list[str] = []
@@ -1525,7 +2336,6 @@ def _stop_candidate(
                     contract_drift = True
                 if str(info.get("Image") or "") != expected_image_id:
                     contract_drift = True
-                bound_seen = True
                 if (info.get("State") or {}).get("Running") is True:
                     running.append(container_id)
                     stop_result = cli.run(
@@ -1543,7 +2353,7 @@ def _stop_candidate(
                 f"Kandidatenstillstand ist nicht inventarisierbar: {exc}"
             ) from exc
         last_running = running
-        if bound_seen and not running and ids == previous_ids:
+        if not running and ids == previous_ids:
             stable += 1
             if stable >= 2:
                 return contract_drift
@@ -1552,8 +2362,6 @@ def _stop_candidate(
         previous_ids = ids
         time.sleep(1)
     detail = ", ".join(last_running) or stop_error or "unbekannter Zustand"
-    if not bound_seen:
-        detail = "nach begonnenem Start erschien keine eindeutig stoppbare Containeridentität"
     raise CandidateStopError(
         "Der fehlerhafte Updatekandidat ist nicht bestätigt gestoppt: " + detail
     )
@@ -1587,57 +2395,74 @@ def update_container(args: argparse.Namespace) -> dict[str, Any]:
     cli = DockerCli(compose_dir, use_sudo=args.sudo, environment=environment)
 
     compose_contract = _prepare_compose_contract(cli)
-    pre_up_role_required = compose_contract.get("state") == "current"
-    _require_prepared_contract(
-        cli,
-        compose_contract,
-        require_role=pre_up_role_required,
-    )
-
-    selected_before = _require_official_image(_selected_image(cli))
-    if args.image_tag:
-        expected = f"ghcr.io/a9xxx/install-e3dc-control:{args.image_tag}"
-        if selected_before != expected:
-            raise DockerUpdateError(
-                f"Compose projiziert {selected_before} statt des angeforderten {expected}."
-            )
-    if args.recreate_current:
-        print(f"→ Binde das bereits lokale Image für den reinen Neustart: {selected_before} …", flush=True)
-    else:
-        print(f"→ Ziehe explizit {selected_before} …", flush=True)
-        _require_success(
-            cli.compose(
-                ["pull", SERVICE_NAME],
-                timeout=max(args.wait_timeout, 300),
-                capture=False,
-            ),
-            "Docker-Image-Pull",
-        )
-    _require_prepared_contract(
-        cli,
-        compose_contract,
-        require_role=pre_up_role_required,
-    )
-    selected_after = _require_official_image(_selected_image(cli))
-    if selected_after != selected_before:
-        raise DockerUpdateError("Die Compose-Imageprojektion driftete während des Pulls.")
-    contract = _image_contract(
-        cli,
-        selected_after,
-        legacy_no_healthcheck_version=args.legacy_no_healthcheck_version,
-    )
-    print(
-        f"✓ Gezogene Identität gebunden: {contract['image_id']} / Version {contract['version']}",
-        flush=True,
-    )
-
+    previous: dict[str, Any] | None = None
+    contract: dict[str, str] | None = None
     candidate_started = False
     try:
+        pre_projection = compose_contract.get("pre_projection") or {}
+        previous = _capture_previous_runtime(cli, pre_projection)
+        pre_up_role_required = _projection_has_role(pre_projection)
         _require_prepared_contract(
             cli,
             compose_contract,
             require_role=pre_up_role_required,
+            runtime_projection=pre_projection,
         )
+
+        selected_before = _require_official_image(_selected_image(cli))
+        if args.image_tag:
+            expected = f"ghcr.io/a9xxx/install-e3dc-control:{args.image_tag}"
+            if selected_before != expected:
+                raise DockerUpdateError(
+                    f"Compose projiziert {selected_before} statt des angeforderten {expected}."
+                )
+        if args.recreate_current:
+            print(
+                f"→ Binde das bereits lokale Image für den reinen Neustart: {selected_before} …",
+                flush=True,
+            )
+        else:
+            storage = _docker_storage_preflight(cli)
+            print(
+                "✓ Docker-Speicher vor dem Pull: "
+                f"{storage['available_bytes'] // (1024 * 1024)} MiB frei.",
+                flush=True,
+            )
+            print(f"→ Ziehe explizit {selected_before} …", flush=True)
+            _require_success(
+                cli.compose(
+                    ["pull", SERVICE_NAME],
+                    timeout=max(args.wait_timeout, 300),
+                    capture=True,
+                ),
+                "Docker-Image-Pull",
+            )
+        _require_prepared_contract(
+            cli,
+            compose_contract,
+            require_role=pre_up_role_required,
+            runtime_projection=pre_projection,
+        )
+        selected_after = _require_official_image(_selected_image(cli))
+        if selected_after != selected_before:
+            raise DockerUpdateError("Die Compose-Imageprojektion driftete während des Pulls.")
+        contract = _image_contract(
+            cli,
+            selected_after,
+            legacy_no_healthcheck_version=args.legacy_no_healthcheck_version,
+        )
+        print(
+            f"✓ Gezogene Identität gebunden: {contract['image_id']} / Version {contract['version']}",
+            flush=True,
+        )
+        _require_previous_runtime_unchanged(cli, previous, pre_projection)
+        _require_prepared_contract(
+            cli,
+            compose_contract,
+            require_role=pre_up_role_required,
+            runtime_projection=pre_projection,
+        )
+
         pre_start_contract = _image_contract(
             cli,
             selected_after,
@@ -1661,7 +2486,7 @@ def update_container(args: argparse.Namespace) -> dict[str, Any]:
                 SERVICE_NAME,
             ],
             timeout=args.wait_timeout + START_TIMEOUT_GRACE_S,
-            capture=False,
+            capture=True,
         )
         _require_success(up_result, "Compose-Kandidatenstart")
         _require_prepared_contract(cli, compose_contract, require_role=True)
@@ -1672,6 +2497,10 @@ def update_container(args: argparse.Namespace) -> dict[str, Any]:
         return result
     except BaseException as exc:
         if candidate_started:
+            if contract is None:
+                raise CandidateStopError(
+                    f"{exc}; der Kandidatenstart begann ohne gebundenen Imagevertrag."
+                ) from exc
             try:
                 stopped_with_contract_drift = _stop_candidate(
                     cli,
@@ -1684,11 +2513,38 @@ def update_container(args: argparse.Namespace) -> dict[str, Any]:
                 ) from exc
             print("✓ Fehlerhafter Updatekandidat ist bestätigt gestoppt.", file=sys.stderr)
             _diagnostics(cli)
-            if stopped_with_contract_drift:
-                raise DockerUpdateError(
-                    f"{exc}; der per Stop-Autorität gebundene Container wurde gestoppt, "
-                    "wich aber bei Image, Projekt oder persistenten Mounts vom Kandidatenvertrag ab."
+            try:
+                rollback = _rollback_previous_runtime(
+                    cli,
+                    compose_contract,
+                    previous or {"present": False, "running": False},
+                    wait_timeout=args.wait_timeout,
+                )
+            except BaseException as rollback_exc:
+                raise CandidateStopError(
+                    f"{exc}; der Kandidat ist gestoppt, aber der automatische "
+                    f"Altcontainer-Rückfall blieb unbestätigt: {rollback_exc}"
                 ) from exc
+            version = str(rollback.get("version") or "unbekannt")
+            drift_note = (
+                " Der gestoppte Kandidat zeigte zuvor Vertragsdrift."
+                if stopped_with_contract_drift
+                else ""
+            )
+            raise DockerUpdateError(
+                f"{exc}; [ROLLBACK_OK] die vorherige Compose-Datei und "
+                f"Altversion {version} laufen wieder verifiziert.{drift_note}"
+            ) from exc
+        try:
+            if previous is None:
+                _restore_compose_contract_preimage(cli, compose_contract)
+            else:
+                _restore_prestart_state(cli, compose_contract, previous)
+        except BaseException as restore_exc:
+            raise CandidateStopError(
+                f"{exc}; der Kandidat wurde noch nicht gestartet, aber der unveränderte "
+                f"Altzustand konnte nicht bestätigt werden: {restore_exc}"
+            ) from exc
         raise
 
 

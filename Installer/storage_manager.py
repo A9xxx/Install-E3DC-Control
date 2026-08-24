@@ -55,16 +55,19 @@ from Wallbox.modes import (  # noqa: E402
 )
 from Wallbox import phase_transition as wallbox_phase_transition_policy  # noqa: E402
 from Wallbox import start_hold as wallbox_start_hold_policy  # noqa: E402
+import consumer_priority  # noqa: E402
 from consumer_priority import (  # noqa: E402
     CONSUMER_MIN_W,
     allocate_consumer_budget_contract,
     cap_consumer_budget_contract,
+    parse_priority_order,
     priority_order_from_config,
     priority_order_key,
     priority_runon_s_from_config,
     validate_consumer_budget_contract,
     validate_consumer_command_allocations,
 )
+
 import control_time  # noqa: E402
 from runtime_logging import configure_service_logger  # noqa: E402
 from config_validator import write_config_validation  # noqa: E402
@@ -4503,6 +4506,7 @@ def augment_consumer_live(
         and bool(str(heatpump_demand_class).strip())
     )
     shelly_3em_heatpump = str(cfg.get("wp_type", "")).strip() == "3"
+    e3dc_pm_heatpump = str(cfg.get("wp_type", "")).strip() == "6"
     # Vorbelegte Live-/Legacy-Felder sind für keinen Provider Evidenz. Erst der
     # anschließend vollständig validierte native beziehungsweise Pro3EM-Vertrag
     # darf Leistung, Readiness oder einen Messzeitpunkt neu projizieren.
@@ -4534,7 +4538,7 @@ def augment_consumer_live(
         "Predump_Heatpump_Source",
     ):
         merged.pop(key, None)
-    if not shelly_3em_heatpump:
+    if not shelly_3em_heatpump and not e3dc_pm_heatpump:
         merged["Heatpump_Power_Known"] = False
         merged["Heatpump_Accepting_Power"] = False
         merged["Heatpump_Compressor_Running"] = False
@@ -4545,7 +4549,7 @@ def augment_consumer_live(
         merged["Heatpump_Budget_Offered"] = False
         merged["Heatpump_Signal_Active_Confirmed"] = False
         merged["Heatpump_Withdrawal_Confirmed"] = False
-    if heatpump and not shelly_3em_heatpump:
+    if heatpump and not shelly_3em_heatpump and not e3dc_pm_heatpump:
         native_source_ts = heatpump.get("source_ts")
         native_power_w = heatpump.get("wp_power_w")
         native_accepting_power = heatpump.get("accepting_power")
@@ -4607,6 +4611,11 @@ def augment_consumer_live(
             # stehende Luxtronik darf Nachfrage melden, ohne dafür bereits
             # Verdichterleistung vortäuschen zu müssen.
             merged["Heatpump_Evidence_TS"] = float(native_source_ts)
+            merged["Heatpump_Pause_Active"] = bool(
+                decision.get("pv_pause_active") is True
+                or decision.get("source_recovery_pause_blocks_boost") is True
+                or decision.get("source_recovery_pause_latched") is True
+            )
         if native_power_contract_valid:
             wp_power_w = native_power_w
             merged["WP_Power"] = wp_power_w
@@ -4924,6 +4933,59 @@ def augment_consumer_live(
             merged["Heatpump_Start_Demand_Class"] = "none"
             merged["Heatpump_Signal_Active_Confirmed"] = False
             merged["Heatpump_Withdrawal_Confirmed"] = False
+    elif e3dc_pm_heatpump:
+        pm_valid = bool(
+            live.get("WP_Power_Valid") is True
+            and type(live.get("WP_Power")) is int
+            and live.get("WP_Power") >= 0
+            and not bool(live.get("wp_producer_detected"))
+        )
+        merged["Heatpump_Provider"] = "e3dc_pm"
+        merged["Heatpump_Provider_Bound"] = pm_valid
+        merged["Heatpump_Provider_Contract_Valid"] = pm_valid
+        merged["Heatpump_Provider_Command_Eligible"] = False
+        merged["Heatpump_Provider_Conflict"] = False
+        merged["Heatpump_Power_Known"] = pm_valid
+        merged["Heatpump_Accepting_Power"] = bool(pm_valid and live.get("WP_Power", 0) >= 500)
+        merged["Heatpump_Compressor_Running"] = False
+        merged["Heatpump_Compressor_Observation_Valid"] = False
+        merged["Heatpump_Start_Ready"] = False
+        merged["Heatpump_Start_Request_W"] = 0
+        merged["Heatpump_Start_Demand_Class"] = "none"
+        merged["Heatpump_Budget_Offered"] = False
+        merged["Heatpump_Signal_Active_Confirmed"] = False
+        merged["Heatpump_Withdrawal_Confirmed"] = False
+        if pm_valid:
+            wp_power_w = live["WP_Power"]
+            merged["WP_Power"] = wp_power_w
+            merged["Heatpump_Power"] = wp_power_w
+            merged["WP_Power_Source"] = str(live.get("WP_Power_Source") or "e3dc_pm")
+            raw_home_w = max(0, safe_int(merged.get("Home_Power"), 0))
+            split_mode = str(
+                cfg.get("storage_home_wp_split", "auto") or "auto"
+            ).strip().lower()
+            if split_mode in (
+                "1", "true", "yes", "on", "include", "included",
+                "home_includes_wp",
+            ):
+                home_includes_wp = True
+            elif split_mode in (
+                "0", "false", "no", "off", "separate", "excluded",
+                "home_excludes_wp",
+            ):
+                home_includes_wp = False
+            else:
+                home_includes_wp = raw_home_w >= max(
+                    500,
+                    int(wp_power_w * 0.55),
+                )
+            if home_includes_wp:
+                merged["Home_Power_Raw"] = raw_home_w
+                merged["Home_Power"] = max(0, raw_home_w - wp_power_w)
+                merged["Home_Includes_WP"] = True
+            else:
+                merged.setdefault("Home_Power_Raw", raw_home_w)
+                merged["Home_Includes_WP"] = False
     if heater:
         for key in (
             "Heater_Evidence_TS",
@@ -19170,12 +19232,18 @@ def build_flexible_consumer_budget_contract(
                 if heatpump_pump_prerun
                 else 0
             )
+            timeout_retry_not_before_s = retry_not_before_s
+            if not prior_timeout_released:
+                timeout_retry_not_before_s = max(
+                    timeout_retry_not_before_s,
+                    current_wall_s + lease_retry_s,
+                )
             return {
                 "offered": False,
                 "request_w": 0,
                 "started_s": prior_started_s,
                 "expires_s": prior_expires_s,
-                "retry_not_before_s": 0.0,
+                "retry_not_before_s": timeout_retry_not_before_s,
                 "reason": (
                     "heatpump_start_timeout_pump_prerun_accounting_only"
                     if pump_prerun_w > 0
@@ -19325,12 +19393,11 @@ def build_flexible_consumer_budget_contract(
                 "late_start_unresolved": False,
                 "timebase_rearm_count": 0,
             }
-        if prior_timeout_released:
+        if prior_timeout_released and (now_s < retry_not_before_s or not ready):
             # Nach Ablauf der Startlease bleibt die Freigabe fachlich bestehen,
-            # aber ohne erneute Vollreservierung. Erst eine bestätigte
-            # Rücknahme/Ready-low-Kante darf ein neues Startangebot aufspannen;
-            # eine später gemessene Leistungsaufnahme wird unabhängig davon im
-            # nächsten Producerzyklus sofort wieder gebunden.
+            # bis die einmal gesetzte Retry-Sperre abgelaufen ist. Bei weiter
+            # bestätigter Startbereitschaft und ausreichendem Überschuss darf
+            # danach ein frisches Startangebot gebildet werden.
             return heatpump_timeout_released_lease(prior_guard)
         if prior_offered and consumer != "heatpump" and not command_eligible:
             return {
@@ -20424,6 +20491,8 @@ def build_flexible_consumer_budget_contract(
         "market_price",
         "price",
         "ww_immediate_manual",
+        "ww_timer_comfort",
+        "ww_timer_eco",
     }
     heatpump_start_lease_w = max(
         0,
@@ -20444,10 +20513,12 @@ def build_flexible_consumer_budget_contract(
         and heatpump_evidence_fresh
         and heatpump_demand_ready
         and heatpump_boost_demand
-        and not heatpump_withdrawal_confirmed
         and (
             heatpump_first_permission_grant
-            or heatpump_permission_continuation
+            or (
+                heatpump_permission_continuation
+                and not heatpump_withdrawal_confirmed
+            )
         )
     )
     contract["heatpump_boost_permission_active"] = (
@@ -20619,6 +20690,53 @@ def build_flexible_consumer_budget_contract(
         wallbox_exclusive_start_support_w
     )
     contract["wallbox_start_generation"] = wallbox_start_generation
+
+    # Phase 6: heatpump_start_funding_v1 Vertrag
+    hp_cmd_w = max(0, safe_int(command_allocations.get("heatpump"), 0))
+    hp_acc_w = max(0, safe_int(accounting_allocations.get("heatpump"), 0))
+    hp_req_w = max(0, safe_int(heatpump_start_request_w, 0))
+
+    if hp_cmd_w >= hp_req_w and hp_req_w > 0:
+        hp_funding_state = "authorized"
+        hp_funding_reason = "heatpump_start_command_authorized"
+    elif "heatpump" in consumer_command_quarantine:
+        hp_funding_state = "command_quarantined"
+        hp_funding_reason = "heatpump_in_quarantine"
+    elif hp_req_w > hp_cmd_w and hp_req_w > 0:
+        hp_funding_state = "unfunded"
+        hp_funding_reason = "start_lease_unfunded"
+    elif hp_acc_w > 0:
+        hp_funding_state = "authorized"
+        hp_funding_reason = "heatpump_running_funded"
+    else:
+        hp_funding_state = "idle"
+        hp_funding_reason = "heatpump_idle"
+
+    released_receiver = "none"
+    released_w = 0
+    if hp_funding_state == "unfunded":
+        if command_allocations.get("wallbox", 0) > 0:
+            released_receiver = "wallbox"
+            released_w = command_allocations.get("wallbox", 0)
+        elif command_allocations.get("heater", 0) > 0:
+            released_receiver = "heater"
+            released_w = command_allocations.get("heater", 0)
+
+    hp_funding_contract = consumer_priority.build_heatpump_start_funding_contract(
+        required_start_w=hp_req_w,
+        accounting_allocated_w=hp_acc_w,
+        command_authorized_w=hp_cmd_w,
+        state=hp_funding_state,
+        reason_code=hp_funding_reason,
+        released_budget_receiver=released_receiver,
+        released_budget_w=released_w,
+        released_budget_allocations_w=dict(command_allocations),
+    )
+    contract["heatpump_start_funding"] = hp_funding_contract
+    contract["released_budget_receiver"] = released_receiver
+    contract["heatpump_start_request_w"] = hp_req_w
+    contract["authorized_heatpump_budget_w"] = hp_cmd_w
+
     return contract
 
 
@@ -24286,8 +24404,34 @@ def decide_next_cycle(
                         next_curve_evening_release.get("max_lead_s"),
                         0,
                     )
+                elif (
+                    (
+                        adaptive_above_ceiling
+                        or not can_reach_target
+                        or bool(shadow_inputs.get("pre_curve_hold_active"))
+                    )
+                    and not hold_offer_active
+                ):
+                    auto_limit_charge_w = max_charge_w
+                    auto_limit_enabled = False
+                    auto_limit_release = True
+                    auto_limit_reason = (
+                        "Vor Kurvenstart ohne realen Ladepfad: EMS-Grenzen frei, E3DC darf autonom regeln"
+                        if bool(shadow_inputs.get("pre_curve_hold_active"))
+                        else (
+                            "SoC oberhalb der adaptiven Obergrenze ohne Ladeangebot: "
+                            "EMS-Grenzen frei, E3DC darf autonom laden"
+                            if adaptive_above_ceiling
+                            else "Keine aktive Ladekurve: EMS-Grenzen frei, E3DC darf autonom laden"
+                        )
+                    )
+                    auto_storage_req_w = 0
+                    decision["val"] = max_charge_w
+
+
                 elif not hold_offer_active:
                     previous_auto_limit = (
+
                         previous_state.get("auto_limit")
                         if isinstance(previous_state.get("auto_limit"), dict)
                         else {}
@@ -25528,7 +25672,10 @@ def decide_next_cycle(
         heatpump_running=heatpump_running,
         heatpump_commitment_w=heatpump_running_commitment_w,
         heatpump_new_start_allowed=heatpump_new_start_allowed,
-        heatpump_pause_active=bool(heatpump_pause_request.get("active")),
+        heatpump_pause_active=bool(
+            live.get("Heatpump_Pause_Active") is True
+            and not live.get("Heatpump_Start_Ready")
+        ),
         evidence_valid=consumer_source_evidence_valid,
         protected=bool(decision.get("protected")),
         protected_consumer_release=protected_consumer_release,
@@ -25572,8 +25719,66 @@ def decide_next_cycle(
     )
     budget_w = max(0, safe_int(consumer_allocations.get("wallbox"), 0))
 
+    predump_discharge_allocations_w = {"heatpump": 0, "wallbox": 0, "heater": 0}
+    predump_discharge_add_w = 0
+    predump_discharge_contract = consumer_priority.build_predump_discharge_add_contract(
+        valid=False,
+        authorization_status="disabled",
+        reason_code="predump_inactive",
+        source_ts=now_s,
+        source_frame_revision=str(getattr(live_model, "frame_revision", "") or ""),
+        no_grid=bool(decision.get("predump_no_grid", True)),
+        grid_fallback=bool(decision.get("predump_grid_fallback", False)),
+        target_discharge_w=0,
+        nonflexible_load_w=int(non_controllable_house_w),
+        pv_supply_w=int(raw_pv_w),
+        available_discharge_pool_w=0,
+        eligible=protected_consumer_release,
+        requests_w=consumer_allocations,
+        allocations_w=predump_discharge_allocations_w,
+        order=consumer_budget_contract.get("consumer_priority_order"),
+    )
+    if predump_consumer_window and consumer_source_evidence_valid:
+        _predump_target_w = max(0, safe_int(decision.get("val"), 0))
+        _nonflex_load_w = max(0, int(non_controllable_house_w))
+        _pv_pwr_w = max(0, int(raw_pv_w))
+        _natural_deficit_w = max(0, _nonflex_load_w - _pv_pwr_w)
+        _predump_battery_pool_w = max(0, _predump_target_w - _natural_deficit_w)
+        _order = list(consumer_budget_contract.get("consumer_priority_order") or ["wallbox", "heatpump", "heater"])
+        for _c_name in _order:
+            if _c_name in predump_discharge_allocations_w and protected_consumer_release.get(_c_name):
+                _req = max(0, safe_int(consumer_allocations.get(_c_name), 0))
+                if _req > 0 and _predump_battery_pool_w > 0:
+                    _grant = min(_req, _predump_battery_pool_w)
+                    predump_discharge_allocations_w[_c_name] = _grant
+                    _predump_battery_pool_w -= _grant
+
+        predump_discharge_contract = consumer_priority.build_predump_discharge_add_contract(
+            valid=True,
+            authorization_status="authorized",
+            reason_code="predump_consumer_window_active",
+            source_ts=now_s,
+            source_frame_revision=str(getattr(live_model, "frame_revision", "") or ""),
+            no_grid=bool(decision.get("predump_no_grid", True)),
+            grid_fallback=bool(decision.get("predump_grid_fallback", False)),
+            target_discharge_w=_predump_target_w,
+            nonflexible_load_w=_nonflex_load_w,
+            pv_supply_w=_pv_pwr_w,
+            available_discharge_pool_w=max(0, _predump_target_w - _natural_deficit_w),
+            eligible=protected_consumer_release,
+            requests_w=consumer_allocations,
+            allocations_w=predump_discharge_allocations_w,
+            order=_order,
+            contract_revision=f"padd_{int(now_s)}_{_predump_target_w}",
+        )
+        predump_discharge_add_w = predump_discharge_allocations_w.get("wallbox", 0)
+
+    consumer_budget_contract["predump_discharge_add_contract"] = predump_discharge_contract
     budget = {
         "budget_w": budget_w,
+        "predump_discharge_contract": predump_discharge_contract,
+        "predump_discharge_allocations_w": dict(predump_discharge_allocations_w),
+        "predump_discharge_add_w": int(predump_discharge_add_w),
         "iAVal_w": budget_w,
         "raw_iAVal_w": raw_iaval_w,
         "min_required_w": max(
@@ -29379,7 +29584,9 @@ _WB_BUDGET_CONTROL_KEYS = {
     "curve_wb_relief", "curve_ref_soc", "curve_excess_pct", "curve_gap_pct",
     "adaptive_curve_relation", "direct_marketing_active", "direct_marketing_policy_target_state",
     "force_wallbox_stop", "predump_active", "predump_allow_wallbox", "predump_floor_hold",
-    "predump_target_soc", "predump_bev_block_w", "live_sample_invalid", "phase_contract",
+    "predump_target_soc", "predump_bev_block_w", "predump_discharge_allocations_w", "predump_discharge_add_w",
+    "predump_discharge_contract", "heatpump_start_funding",
+    "live_sample_invalid", "phase_contract",
     "phases", "budget_ready", "can_start_or_hold", "real_charging", "switch_to_1p_ready",
     "iFc_w", "iMinLade_w", "iMinLade_raw_w", "iMinLade2_w", "iBattLoad_w",
     "iMaxBattLade_w", "fAvBatterie_w", "fAvBatterie900_w", "wb_fine_trim_step_w",
@@ -29389,6 +29596,9 @@ _WB_BUDGET_CONTROL_KEYS = {
     "consumer_requests_w", "consumer_priority_order",
     "consumer_priority_effective_order", "consumer_priority_key",
     "consumer_priority_changed_at_s", "heatpump_pause_request", "manager_title",
+    "heatpump_start_request_w", "authorized_heatpump_budget_w",
+    "heatpump_start_state", "heatpump_start_reason_code",
+    "released_budget_receiver",
     "state_label", "display_reason", "reason", "control_owner", "control_owner_label",
     "wallbox_w", "wallbox_power_source", "auto_limit", "runtime_block_reason",
     "ems_budget_runtime_class", "ems_budget_runtime_cap_applied",
@@ -29650,6 +29860,11 @@ def _apply_consumer_budget_contract_projection(
     energy_score["consumer_allocations"] = dict(command_allocations)
     if contract:
         result["consumer_requests_w"] = dict(contract.get("requests_w") or {})
+        result["heatpump_start_request_w"] = int(contract.get("heatpump_start_request_w", 0) or 0)
+        result["authorized_heatpump_budget_w"] = int(contract.get("authorized_heatpump_budget_w", 0) or 0)
+        result["heatpump_start_state"] = str(contract.get("heatpump_start_state") or "idle")
+        result["heatpump_start_reason_code"] = str(contract.get("heatpump_start_reason_code") or "none")
+        result["released_budget_receiver"] = str(contract.get("released_budget_receiver") or "none")
         result["consumer_priority_order"] = list(
             contract.get("consumer_priority_order") or []
         )

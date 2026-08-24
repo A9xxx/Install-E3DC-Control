@@ -365,8 +365,11 @@ function e3dcShadowSnapshotDvActions(): array
         'CHARGE_BLOCK_WAIT',
         'GRID_CHARGE',
         'ECONOMIC_EXPORT',
+        'HEADROOM_EXPORT',
+        'DV_CURVE_CHARGE',
     ];
 }
+
 
 function e3dcShadowSnapshotDvActionCounts($source, int $slotCount): ?array
 {

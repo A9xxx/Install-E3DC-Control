@@ -29,6 +29,9 @@ PRODUCT_MARKERS = (
     ("installer_main.py", "file"),
     ("Installer", "directory"),
 )
+INSTANCE_ANCHOR_DIRECTORY = Path("/etc/e3dc-control/instances.d")
+INSTANCE_ANCHOR_SCHEMA = "e3dc_update_instance_v1"
+MARKERLESS_AUTHORITY_TIERS = frozenset({0, 1})
 
 
 @dataclass(frozen=True)
@@ -36,6 +39,22 @@ class Binding:
     root: str
     user: str
     role: str
+
+
+@dataclass(frozen=True)
+class InstallationCandidate:
+    root: str
+    tier: int
+    sources: tuple[str, ...]
+
+
+class DiscoveryError(RuntimeError):
+    """Maschinenlesbarer Abbruch mit einer unmittelbar ausführbaren Lösung."""
+
+    def __init__(self, code: str, message: str, solution: str):
+        super().__init__(message)
+        self.code = code
+        self.solution = solution
 
 
 def _has_control_characters(value: object) -> bool:
@@ -64,6 +83,8 @@ def canonical_product_root(
     raw: object,
     *,
     allow_one_missing_marker: bool = False,
+    allow_all_missing_markers: bool = False,
+    ignore_product_markers: bool = False,
 ) -> Path | None:
     text = str(raw or "")
     if _has_control_characters(text):
@@ -72,6 +93,8 @@ def canonical_product_root(
     if not text.startswith("/"):
         return None
     candidate = Path(os.path.abspath(text))
+    if str(candidate) in {"/", "/bin", "/etc", "/home", "/lib", "/sbin", "/usr", "/var"}:
+        return None
     current = Path(candidate.anchor)
     try:
         for component in candidate.parts[1:]:
@@ -81,23 +104,29 @@ def canonical_product_root(
                 return None
         if not stat.S_ISDIR(os.lstat(candidate).st_mode):
             return None
-        missing_markers = 0
-        for relative, expected_kind in PRODUCT_MARKERS:
-            marker = candidate / relative
-            try:
-                metadata = os.lstat(marker)
-            except FileNotFoundError:
-                missing_markers += 1
-                continue
-            valid_kind = (
-                stat.S_ISREG(metadata.st_mode)
-                if expected_kind == "file"
-                else stat.S_ISDIR(metadata.st_mode)
+        if not ignore_product_markers:
+            missing_markers = 0
+            for relative, expected_kind in PRODUCT_MARKERS:
+                marker = candidate / relative
+                try:
+                    metadata = os.lstat(marker)
+                except FileNotFoundError:
+                    missing_markers += 1
+                    continue
+                valid_kind = (
+                    stat.S_ISREG(metadata.st_mode)
+                    if expected_kind == "file"
+                    else stat.S_ISDIR(metadata.st_mode)
+                )
+                if stat.S_ISLNK(metadata.st_mode) or not valid_kind:
+                    return None
+            allowed_missing = (
+                len(PRODUCT_MARKERS)
+                if allow_all_missing_markers
+                else (1 if allow_one_missing_marker else 0)
             )
-            if stat.S_ISLNK(metadata.st_mode) or not valid_kind:
+            if missing_markers > allowed_missing:
                 return None
-        if missing_markers > (1 if allow_one_missing_marker else 0):
-            return None
     except OSError:
         return None
     return candidate
@@ -107,6 +136,8 @@ def product_root_from_hint(
     raw: object,
     *,
     allow_one_missing_marker: bool = False,
+    allow_all_missing_markers: bool = False,
+    ignore_product_markers: bool = False,
 ) -> Path | None:
     text = str(raw or "")
     if _has_control_characters(text):
@@ -121,6 +152,8 @@ def product_root_from_hint(
         root = canonical_product_root(
             current,
             allow_one_missing_marker=allow_one_missing_marker,
+            allow_all_missing_markers=allow_all_missing_markers,
+            ignore_product_markers=ignore_product_markers,
         )
         if root is not None:
             return root
@@ -128,6 +161,25 @@ def product_root_from_hint(
             break
         current = current.parent
     return None
+
+
+def _unit_working_directory_root(raw: object) -> str:
+    """Leitet aus einem root-eigenen Unit-Arbeitsverzeichnis den Produktroot ab."""
+
+    text = str(raw or "").strip().lstrip("-")
+    if _has_control_characters(text) or not text.startswith("/"):
+        return ""
+    marker_bound = product_root_from_hint(text, allow_one_missing_marker=True)
+    if marker_bound is not None:
+        return str(marker_bound)
+    candidate = Path(os.path.abspath(text))
+    try:
+        installer_index = candidate.parts.index("Installer")
+    except ValueError:
+        return str(candidate)
+    if installer_index <= 1:
+        return ""
+    return str(Path(*candidate.parts[:installer_index]))
 
 
 def _safe_root_file(path: Path, *, require_root_read_execute: bool = False) -> bool:
@@ -206,15 +258,8 @@ def _unit_properties(name: str) -> dict[str, str] | None:
     return fields
 
 
-def discover_installation(
-    *,
-    explicit_target: str = "",
-    explicit_user: str = "",
-    sudo_user: str = "",
-) -> tuple[Path, str]:
-    if _has_control_characters(explicit_target):
-        raise RuntimeError("Expliziter Installationspfad enthält unzulässige Steuerzeichen")
-    explicit = str(explicit_target or "").strip()
+def _collect_installation_evidence(
+) -> tuple[list[dict[str, set[str]]], list[dict[str, set[str]]]]:
     tiers: list[dict[str, set[str]]] = [defaultdict(set) for _ in range(5)]
     tier_users: list[dict[str, set[str]]] = [defaultdict(set) for _ in range(5)]
 
@@ -225,11 +270,24 @@ def discover_installation(
         *,
         tier: int,
         allow_one_missing_marker: bool = False,
+        allow_all_missing_markers: bool = False,
+        ignore_product_markers: bool = False,
+        exact_root: bool = False,
     ) -> None:
-        root = product_root_from_hint(
-            raw,
-            allow_one_missing_marker=allow_one_missing_marker,
-        )
+        if exact_root:
+            root = canonical_product_root(
+                raw,
+                allow_one_missing_marker=allow_one_missing_marker,
+                allow_all_missing_markers=allow_all_missing_markers,
+                ignore_product_markers=ignore_product_markers,
+            )
+        else:
+            root = product_root_from_hint(
+                raw,
+                allow_one_missing_marker=allow_one_missing_marker,
+                allow_all_missing_markers=allow_all_missing_markers,
+                ignore_product_markers=ignore_product_markers,
+            )
         if root is None:
             return
         key = str(root)
@@ -241,7 +299,8 @@ def discover_installation(
     launcher = Path("/usr/local/sbin/e3dc-web-update-launcher")
     if _safe_root_file(launcher, require_root_read_execute=True):
         try:
-            payload = launcher.read_text(encoding="utf-8", errors="strict")
+            _metadata, raw_payload = _stable_regular_read(launcher, 131072)
+            payload = raw_payload.decode("utf-8", errors="strict")
         except (OSError, UnicodeError):
             payload = ""
         if len(payload) <= 131072:
@@ -256,8 +315,34 @@ def discover_installation(
                         "root-eigener Update-Dispatcher",
                         bound_user,
                         tier=1,
-                        allow_one_missing_marker=True,
+                        ignore_product_markers=True,
+                        exact_root=True,
                     )
+
+    try:
+        anchor_paths = sorted(INSTANCE_ANCHOR_DIRECTORY.glob("*.json"))[:128]
+    except OSError:
+        anchor_paths = []
+    for anchor_path in anchor_paths:
+        if _has_control_characters(str(anchor_path)) or not _safe_root_file(anchor_path):
+            continue
+        try:
+            metadata, payload = _stable_regular_read(anchor_path, 64 * 1024)
+            if metadata.st_uid != 0 or stat.S_IMODE(metadata.st_mode) & 0o022:
+                continue
+            value = json.loads(payload.decode("utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(value, dict) or value.get("schema") != INSTANCE_ANCHOR_SCHEMA:
+            continue
+        add(
+            value.get("install_root"),
+            f"root-eigener Instanzanker:{anchor_path}",
+            value.get("install_user"),
+            tier=1,
+            ignore_product_markers=True,
+            exact_root=True,
+        )
 
     try:
         listed = subprocess.run(
@@ -298,11 +383,17 @@ def discover_installation(
             continue
         active = fields.get("ActiveState") == "active"
         add(
-            fields.get("WorkingDirectory", "").lstrip("-"),
+            (
+                _unit_working_directory_root(fields.get("WorkingDirectory", ""))
+                if active
+                else fields.get("WorkingDirectory", "").lstrip("-")
+            ),
             f"systemd:{name}:WorkingDirectory",
             fields.get("User", ""),
             tier=0 if active else 2,
             allow_one_missing_marker=active,
+            ignore_product_markers=active,
+            exact_root=active,
         )
 
     for metadata_path, tier in (
@@ -343,31 +434,32 @@ def discover_installation(
             continue
         add(root, f"Pfadmetadaten:{metadata_path}", selected_user, tier=tier)
 
-    if explicit:
-        selected = canonical_product_root(explicit, allow_one_missing_marker=True)
-        if selected is None:
-            raise RuntimeError(f"Expliziter Installationspfad ist ungültig: {explicit}")
-        selected_key = str(selected)
-    else:
-        selected_tier = next((index for index, values in enumerate(tiers) if values), None)
-        candidates = sorted(tiers[selected_tier]) if selected_tier is not None else []
-        if not candidates:
-            raise RuntimeError(
-                "Keine Installation aus aktiven Diensten, Root-Dispatcher, geladenen "
-                "Diensten oder sicheren Web-Pfadmetadaten erkannt."
-            )
-        if len(candidates) != 1:
-            details = ["Automatische Installationserkennung ist mehrdeutig:"]
-            for candidate in candidates:
-                sources = ", ".join(sorted(tiers[selected_tier][candidate]))
-                details.append(f"  - {candidate} ({sources})")
-            details.append(
-                "Kein Pfad wurde geraten; jede Installation muss getrennt aktualisiert werden."
-            )
-            raise RuntimeError("\n".join(details))
-        selected_key = candidates[0]
-        selected = Path(selected_key)
+    return tiers, tier_users
 
+
+def list_installation_candidates() -> tuple[InstallationCandidate, ...]:
+    tiers, _tier_users = _collect_installation_evidence()
+    selected_tier = next((index for index, values in enumerate(tiers) if values), None)
+    if selected_tier is None:
+        return ()
+    return tuple(
+        InstallationCandidate(
+            root=root,
+            tier=selected_tier,
+            sources=tuple(sorted(tiers[selected_tier][root])),
+        )
+        for root in sorted(tiers[selected_tier])
+    )
+
+
+def _resolve_install_user(
+    *,
+    selected: Path,
+    selected_key: str,
+    tier_users: list[dict[str, set[str]]],
+    explicit_user: str,
+    sudo_user: str,
+) -> str:
     install_user = valid_user(explicit_user)
     if install_user is None:
         for level in tier_users:
@@ -375,9 +467,12 @@ def discover_installation(
             if not trusted_users:
                 continue
             if len(trusted_users) > 1:
-                raise RuntimeError(
+                raise DiscoveryError(
+                    "E3DC-UPD-PATH-006",
                     f"Installationsbenutzer ist mehrdeutig für {selected_key}: "
-                    + ", ".join(trusted_users)
+                    + ", ".join(trusted_users),
+                    "Starte den Bootstrap erneut mit dem eindeutigen Installationspfad; "
+                    "bereinige danach den widersprüchlichen Dienst- oder Instanzanker.",
                 )
             install_user = trusted_users[0]
             break
@@ -389,7 +484,89 @@ def discover_installation(
         except (KeyError, OSError):
             install_user = None
     if install_user is None:
-        raise RuntimeError(f"Installationsbenutzer ist nicht bestimmbar für {selected_key}")
+        raise DiscoveryError(
+            "E3DC-UPD-PATH-007",
+            f"Installationsbenutzer ist nicht bestimmbar für {selected_key}",
+            "Ergänze den Installationsbenutzer im root-eigenen Update-Dispatcher "
+            "oder Instanzanker und starte den Bootstrap anschließend erneut.",
+        )
+    return install_user
+
+
+def discover_installation(
+    *,
+    explicit_target: str = "",
+    explicit_user: str = "",
+    sudo_user: str = "",
+) -> tuple[Path, str]:
+    if _has_control_characters(explicit_target):
+        raise DiscoveryError(
+            "E3DC-UPD-PATH-001",
+            "Expliziter Installationspfad enthält unzulässige Steuerzeichen",
+            "Verwende einen absoluten lokalen Verzeichnispfad ohne Steuerzeichen.",
+        )
+    explicit = str(explicit_target or "").strip()
+    tiers, tier_users = _collect_installation_evidence()
+
+    if explicit:
+        marker_bound = canonical_product_root(explicit)
+        selected = marker_bound or canonical_product_root(
+            explicit,
+            ignore_product_markers=True,
+        )
+        if selected is None:
+            raise DiscoveryError(
+                "E3DC-UPD-PATH-002",
+                f"Expliziter Installationspfad ist ungültig: {explicit}",
+                "Prüfe, ob das Verzeichnis existiert, absolut angegeben ist und sein "
+                "Pfad keine Symlinks enthält.",
+            )
+        selected_key = str(selected)
+        if marker_bound is None and not any(
+            selected_key in tiers[tier] for tier in MARKERLESS_AUTHORITY_TIERS
+        ):
+            raise DiscoveryError(
+                "E3DC-UPD-PATH-003",
+                "Der explizite Installationspfad besitzt keine vollständigen "
+                f"Produktmarker und keine unabhängige Systembindung: {selected_key}",
+                "Starte den Bootstrap ohne Pfadangabe bei laufenden E3DC-Diensten oder "
+                "installiere den root-eigenen Web-Update-Dispatcher für diese Instanz.",
+            )
+    else:
+        selected_tier = next((index for index, values in enumerate(tiers) if values), None)
+        candidates = sorted(tiers[selected_tier]) if selected_tier is not None else []
+        if not candidates:
+            raise DiscoveryError(
+                "E3DC-UPD-PATH-004",
+                "Keine Installation aus aktiven Diensten, Root-Dispatcher, Instanzankern, "
+                "geladenen Diensten oder sicheren Web-Pfadmetadaten erkannt.",
+                "Starte einen vorhandenen E3DC-Dienst oder rufe den Bootstrap mit dem "
+                "absoluten Installationspfad auf.",
+            )
+        if len(candidates) != 1:
+            details = ["Automatische Installationserkennung ist mehrdeutig:"]
+            for candidate in candidates:
+                sources = ", ".join(sorted(tiers[selected_tier][candidate]))
+                details.append(f"  - {candidate} ({sources})")
+            details.append(
+                "Kein Pfad wurde geraten; jede Installation muss getrennt aktualisiert werden."
+            )
+            raise DiscoveryError(
+                "E3DC-UPD-PATH-005",
+                "\n".join(details),
+                "Wähle im Terminal eine Instanz aus oder starte den ausgegebenen "
+                "Hintergrundbefehl für genau einen Installationspfad.",
+            )
+        selected_key = candidates[0]
+        selected = Path(selected_key)
+
+    install_user = _resolve_install_user(
+        selected=selected,
+        selected_key=selected_key,
+        tier_users=tier_users,
+        explicit_user=explicit_user,
+        sudo_user=sudo_user,
+    )
     return selected, install_user
 
 
@@ -597,20 +774,49 @@ def bind(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--list-candidates", action="store_true")
     parser.add_argument("--explicit-root", default="")
     parser.add_argument("--explicit-user", default="")
     parser.add_argument("--sudo-user", default="")
     parser.add_argument("--requested-role", default="auto")
     args = parser.parse_args(argv)
     try:
+        if args.list_candidates:
+            if any(
+                (
+                    args.explicit_root,
+                    args.explicit_user,
+                    args.sudo_user,
+                    args.requested_role != "auto",
+                )
+            ):
+                raise DiscoveryError(
+                    "E3DC-UPD-PATH-008",
+                    "Kandidatenliste und explizite Bindungsparameter wurden vermischt",
+                    "Rufe --list-candidates ohne weitere Bindungsparameter auf.",
+                )
+            for candidate in list_installation_candidates():
+                print(f"{candidate.root}\t{', '.join(candidate.sources)}")
+            return 0
         binding = bind(
             explicit_target=args.explicit_root,
             explicit_user=args.explicit_user,
             sudo_user=args.sudo_user,
             requested_role=args.requested_role,
         )
+    except DiscoveryError as exc:
+        print(f"[ABBRUCH] {exc.code}", file=sys.stderr)
+        print(f"Was ist passiert: {exc}", file=sys.stderr)
+        print(f"Lösung: {exc.solution}", file=sys.stderr)
+        return 1
     except RuntimeError as exc:
-        print(str(exc), file=sys.stderr)
+        print("[ABBRUCH] E3DC-UPD-BIND-099", file=sys.stderr)
+        print(f"Was ist passiert: {exc}", file=sys.stderr)
+        print(
+            "Lösung: Prüfe die genannte Rollen- oder Konfigurationsquelle und starte "
+            "denselben Updatebefehl anschließend erneut.",
+            file=sys.stderr,
+        )
         return 1
     print(f"{binding.root}\t{binding.user}\t{binding.role}")
     return 0

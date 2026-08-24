@@ -159,6 +159,7 @@
 !/Installer/installer_config.py
 !/Installer/installer_wrapper.sh
 !/Installer/update_bootstrap_discovery.py
+!/Installer/update_recovery_context.py
 !/Installer/json_cache.py
 !/Installer/live_snapshot.py
 !/Installer/logging_manager.py
@@ -181,6 +182,7 @@
 !/Installer/package_prepare.py
 !/Installer/permissions.py
 !/Installer/planned_loads.py
+!/Installer/probe_pm.py
 !/Installer/pv_forecast_topology.py
 !/Installer/quiet_logging.py
 !/Installer/ramdisk.py
@@ -222,6 +224,12 @@
 !/Installer/uninstall.py
 !/Installer/uninstall_docker.py
 !/Installer/update.py
+!/Installer/update_legacy_forward.py
+!/Installer/update_offline_preflight.py
+!/Installer/update_prejournal_construction.py
+!/Installer/update_recovery_journal.py
+!/Installer/update_recovery_surface.py
+!/Installer/update_legacy_safety.py
 !/Installer/utils.py
 !/Installer/venv_tools.py
 !/Installer/vital_stats.py

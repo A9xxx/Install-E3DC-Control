@@ -268,7 +268,11 @@ handleCORSAndExternalAuth();
 handleDiagnoseAck();
 
 function isWebAuthenticated() {
+    if (PHP_SAPI === 'cli') {
+        return true;
+    }
     $conf = loadE3dcConfig();
+
     if (
         !is_array($conf)
         || !empty($conf['error'])
@@ -473,6 +477,52 @@ function handleForceSocUpdate() {
         @touch($flagFile);
         @chmod($flagFile, 0666);
         echo json_encode(['success' => true]);
+        exit;
+    }
+}
+
+/**
+ * Testet einen E3DC PM-Index per RSCP und gibt Plausibilität zurück (AJAX).
+ */
+function handleTestPmIndex() {
+    if (isset($_GET['action']) && $_GET['action'] === 'test_pm_index') {
+        requireWebAuth(true);
+        header('Content-Type: application/json; charset=utf-8');
+        $index = isset($_GET['index']) ? (int)$_GET['index'] : (isset($_POST['index']) ? (int)$_POST['index'] : 2);
+        if ($index < 0 || $index > 7) {
+            echo json_encode(['success' => false, 'error' => 'invalid_index', 'message' => 'Ungültiger PM-Index (erlaubt 0..7)']);
+            exit;
+        }
+        $paths = function_exists('getInstallPaths') ? getInstallPaths() : [];
+        $installPath = !empty($paths['valid']) ? rtrim($paths['install_path'], '/') : '';
+        $script = $installPath . '/Installer/probe_pm.py';
+        if (!file_exists($script)) {
+            $script = '/var/www/html/Installer/probe_pm.py';
+        }
+        if (!file_exists($script)) {
+            echo json_encode(['success' => false, 'error' => 'script_missing', 'message' => 'Test-Skript probe_pm.py nicht gefunden']);
+            exit;
+        }
+        $python = file_exists('/opt/venv/bin/python3') ? '/opt/venv/bin/python3' : '/usr/bin/python3';
+        $process = e3dcRunArgvProcess([$python, $script, '--index', (string)$index, '--json'], 5.0);
+        if (!$process['success'] && empty($process['stdout'])) {
+            echo json_encode([
+                'success' => false,
+                'error' => $process['timed_out'] ? 'timeout' : 'exec_error',
+                'message' => $process['timed_out'] ? 'Zeitüberschreitung bei RSCP-Messung (5s)' : ('Ausführung fehlgeschlagen: ' . ($process['error'] ?: $process['stderr'])),
+            ], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        $json = @json_decode((string)$process['stdout'], true);
+        if (is_array($json)) {
+            echo json_encode($json, JSON_UNESCAPED_UNICODE);
+        } else {
+            echo json_encode([
+                'success' => false,
+                'error' => 'json_parse_error',
+                'message' => 'Ungültige Antwort von probe_pm.py: ' . trim((string)$process['stdout'] . ' ' . (string)$process['stderr']),
+            ], JSON_UNESCAPED_UNICODE);
+        }
         exit;
     }
 }
@@ -4507,8 +4557,26 @@ function handleSelfUpdateCheck() {
         $cacheFile = '/var/www/html/ramdisk/e3dc_self_update_status.json';
         $forceCheck = isset($_GET['force']) || isset($_GET['force_check']);
         if (!$forceCheck && file_exists($cacheFile) && (time() - filemtime($cacheFile) < 14400)) {
-            echo file_get_contents($cacheFile);
-            exit;
+            $cachedRaw = file_get_contents($cacheFile);
+            $cachedData = json_decode($cachedRaw, true);
+            if (is_array($cachedData) && !empty($cachedData['updating'])) {
+                $pidFile = '/run/e3dc-web-update/pid';
+                $stillRunning = false;
+                if (file_exists($pidFile)) {
+                    $pid = (int)trim((string)file_get_contents($pidFile));
+                    if ($pid > 0 && file_exists("/proc/$pid")) {
+                        $stillRunning = true;
+                    }
+                }
+                if ($stillRunning) {
+                    echo $cachedRaw;
+                    exit;
+                }
+                // Update läuft nicht mehr -> Stale Cache ignorieren und frisch prüfen
+            } else {
+                echo $cachedRaw;
+                exit;
+            }
         }
 
         $paths = getInstallPaths();

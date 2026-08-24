@@ -38,10 +38,23 @@ except Exception:
     pass
 
 from .core import register_command
-from .backup import backup_current_version, restore_verified_backup
+from .backup import (
+    backup_current_version,
+    create_quiesced_overlay,
+    estimate_full_backup_size,
+    estimate_quiesced_overlay_size,
+    restore_quiesced_overlay,
+    restore_verified_backup,
+)
 from .backup_integrity import (
+    BACKUP_ESTIMATE_DIRECTORY_OVERHEAD_BYTES,
+    BACKUP_ESTIMATE_FILE_OVERHEAD_BYTES,
+    BACKUP_ESTIMATE_FIXED_OVERHEAD_BYTES,
+    BACKUP_ESTIMATE_SOURCE_OVERHEAD_BYTES,
     DEFAULT_BACKUP_ROOT,
     MANIFEST_NAME,
+    QuiescedOverlayRestoreGuard,
+    QUIESCED_OVERLAY_KIND,
     SYSTEM_BACKUP_KIND,
     _open_directory_nofollow,
     _open_regular_file_nofollow,
@@ -49,6 +62,35 @@ from .backup_integrity import (
     ensure_external_backup_root,
     validate_existing_backup_root,
     verify_backup,
+)
+from .update_offline_preflight import (
+    OfflinePackageReceipt,
+    OfflinePreflightError,
+    build_offline_install_commands,
+    cleanup_offline_cache,
+    cleanup_offline_package_artifacts,
+    create_preparation_plan,
+    execute_preparation,
+    materialize_wheel_mirror,
+    parse_offline_package_receipt,
+    require_conservative_free_space,
+    serialize_offline_package_receipt,
+    verify_preparation,
+)
+from . import update_recovery_context as recovery_context_codec
+from . import update_recovery_journal as recovery_journal
+from . import update_legacy_safety as legacy_safety_codec
+from . import update_prejournal_construction as prejournal_codec
+from . import update_recovery_surface as recovery_surface_codec
+from .update_recovery_surface import (
+    CrontabInventory,
+    RootFileInventory,
+    capture_crontab_preimages,
+    capture_crontab_restore_guard,
+    capture_root_file_preimages,
+    capture_root_file_restore_guard,
+    restore_crontab_preimages,
+    restore_root_file_preimages,
 )
 from .utils import (
     StorageUnitMigrationError,
@@ -108,14 +150,12 @@ RECOVERY_BOOTBLOCK_MARKER = os.path.join(
     "recovery.block",
 )
 RECOVERY_BOOTBLOCK_DROPIN_NAME = "00-e3dc-recovery-bootblock.conf"
-RECOVERY_BOOTBLOCK_DROPIN_PAYLOAD = (
-    "# E3DC_RECOVERY_BOOTBLOCK_V1\n"
-    "[Unit]\n"
-    f"ConditionPathExists=!{RECOVERY_BOOTBLOCK_MARKER}\n"
-).encode("utf-8")
+RECOVERY_BOOTBLOCK_DROPIN_MARKER = "# E3DC_RECOVERY_BOOTBLOCK_V2"
 RECOVERY_BOOTBLOCK_TRANSACTION_RE = re.compile(r"[0-9a-f]{64}\Z")
-UPDATE_SAFETY_RECEIPT_SCHEMA = "e3dc_update_safety_v1"
+UPDATE_SAFETY_RECEIPT_SCHEMA = "e3dc_update_safety_v2"
 UPDATE_SAFETY_RECEIPT_NAME = "transaction.json"
+QUIESCED_OVERLAY_RECEIPT_NAME = "quiesced-overlay.json"
+QUIESCED_OVERLAY_RECEIPT_SCHEMA = "e3dc_quiesced_overlay_v1"
 UPDATE_FINALIZER_UNIT_PREFIX = "e3dc-update-finalizer-"
 UPDATE_FINALIZER_RUNTIME_SUFFIX = "-runtime"
 UPDATE_FINALIZER_TOKEN_NAME = "start.token"
@@ -126,6 +166,11 @@ UPDATE_FINALIZER_TERMINAL_STABLE_INTERVAL_S = 0.2
 
 FULL_COMMIT_RE = re.compile(r"[0-9a-f]{40}\Z")
 PACKAGE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.+-]*\Z")
+PREPARED_PACKAGE_STATE_SCHEMA = "e3dc_prepared_package_state_v1"
+PACKAGE_TRANSACTION_STATE_SCHEMA = "e3dc_package_transaction_state_v1"
+PREPARED_PACKAGE_RECEIPT_SCHEMA = "e3dc_prepared_package_receipt_v1"
+PREPARED_PACKAGE_RECEIPT_NAME = "prepared-packages.json"
+PREPARED_PACKAGE_RECEIPT_MAX_BYTES = 2 * 1024 * 1024
 LOCAL_HEALTH_URLS = (
     "http://127.0.0.1/index.php",
     "http://127.0.0.1/help.php",
@@ -178,6 +223,7 @@ APPROVED_APT_PACKAGES = frozenset({
     "python3-websockets", "nodejs", "npm", "avahi-daemon", "avahi-utils",
     "dbus", "rsync",
 })
+UPDATE_RUNTIME_APT_PACKAGES = ("rsync",)
 # Alte signierte Policies führen diese optionalen Pakete noch im Core-Block.
 # Sie bleiben prüfbar, werden aber ausschließlich vom Matter-Installer gesetzt.
 MATTER_ONLY_APT_PACKAGES = frozenset({
@@ -202,7 +248,15 @@ TARGET_FINALIZER_RELATIVE_FILES = (
     "Installer/git_commit_reader.py",
     "Installer/optional_service_contract.py",
     "Installer/release_finalize.py",
+    "Installer/secure_file_transaction.py",
     "Installer/update.py",
+    "Installer/update_legacy_forward.py",
+    "Installer/update_legacy_safety.py",
+    "Installer/update_offline_preflight.py",
+    "Installer/update_prejournal_construction.py",
+    "Installer/update_recovery_context.py",
+    "Installer/update_recovery_journal.py",
+    "Installer/update_recovery_surface.py",
 )
 TARGET_EXECUTION_SNAPSHOT_ROOT_FILES = (
     "VERSION",
@@ -296,6 +350,52 @@ class _TerminalSignalGuard:
 
 class UpdateTransactionBusy(RuntimeError):
     """Ein anderer Release-Wechsel hält bereits den systemweiten Lock."""
+
+
+class ActionableUpdateAbort(RuntimeError):
+    """Ein sicherer Abbruch mit genau einer ausführbaren nächsten Aktion."""
+
+    def __init__(
+        self,
+        code: str,
+        detail: str,
+        *,
+        system_state: str,
+        target: str,
+        solution: str,
+    ):
+        self.code = str(code).strip()
+        self.detail = str(detail).strip()
+        self.system_state = str(system_state).strip()
+        self.target = str(target).strip()
+        self.solution = str(solution).strip()
+        if (
+            not re.fullmatch(r"E3DC-UPD-[A-Z0-9-]+", self.code)
+            or not self.detail
+            or not self.system_state
+            or not self.target
+            or not self.solution
+            or any(
+                "\n" in value or "\r" in value
+                for value in (
+                    self.code,
+                    self.detail,
+                    self.system_state,
+                    self.target,
+                    self.solution,
+                )
+            )
+        ):
+            raise ValueError("Strukturierter Updateabbruch ist unvollständig")
+        super().__init__(self.detail)
+
+
+def _print_actionable_update_abort(error: ActionableUpdateAbort) -> None:
+    print(f"[ABBRUCH] {error.code}")
+    print(f"Was ist passiert: {error.detail}")
+    print(f"Systemzustand: {error.system_state}")
+    print(f"Ziel: {error.target}")
+    print(f"Lösung: {error.solution}")
 
 
 def _assert_trusted_update_lock_directory(path: Path) -> None:
@@ -518,6 +618,8 @@ class RecoverySurfaceInventory:
     unit_enablement: tuple[tuple[str, str], ...]
     root_managed_files: tuple[RootManagedFilePreimage, ...]
     apache_security: ApacheSecurityPreimage
+    root_file_preimages: RootFileInventory | None = None
+    crontab_preimages: CrontabInventory | None = None
 
 
 @dataclass(frozen=True)
@@ -569,11 +671,61 @@ class RecoveryBackupReceipt:
 
 
 @dataclass(frozen=True)
+class QuiescedOverlayReceipt:
+    transaction_id: str
+    overlay_dir: str
+    overlay_dev: int
+    overlay_ino: int
+    parent_dev: int
+    parent_ino: int
+    backup_id: str
+    manifest_sha256: str
+    install_root: str
+    full_backup_dir: str
+    full_backup_dev: int
+    full_backup_ino: int
+    full_backup_id: str
+    full_backup_manifest_sha256: str
+    receipt_dev: int
+    receipt_ino: int
+    receipt_sha256: str
+
+
+def _canonical_quiesced_overlay_receipt_bytes(record: dict) -> bytes:
+    """Serialisiert ausschließlich den eng typisierten Overlay-Rückfallbeleg."""
+
+    try:
+        payload = json.dumps(
+            record,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8") + b"\n"
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise RuntimeError("Quiesced-Overlay-Receipt ist nicht kanonisch") from exc
+    if len(payload) > 64 * 1024:
+        raise RuntimeError("Quiesced-Overlay-Receipt ist unplausibel groß")
+    return payload
+
+
+@dataclass(frozen=True)
 class RecoveryBootblockContract:
     units: tuple[str, ...]
     created_directories: tuple[str, ...]
     transaction_id: str
     dropin_identities: tuple[tuple[str, int, int], ...]
+
+    @property
+    def finalizer_unit(self) -> str:
+        return _update_safety_names(self.transaction_id)[0]
+
+    @property
+    def runtime_directory(self) -> str:
+        return _update_safety_names(self.transaction_id)[1]
+
+    @property
+    def token_path(self) -> str:
+        return _update_safety_names(self.transaction_id)[2]
 
 
 @dataclass(frozen=True)
@@ -633,6 +785,10 @@ class UpdateSafetyContract:
     receipt_dev: int
     receipt_ino: int
     receipt_sha256: str
+    apache_completion_required: bool = False
+    apache_available: bool = False
+    apache_was_active: bool = False
+    apache_unit_file_state: str = "absent"
 
 
 @dataclass(frozen=True)
@@ -641,6 +797,9 @@ class RecoveryTransitionResult:
     bootblock_contract: (
         RecoveryBootblockContract | RecoveryBootblockPartialContract | None
     )
+    recovery_journal_contract: (
+        recovery_journal.RecoveryJournalContract | None
+    ) = None
 
     def __bool__(self) -> bool:
         return self.recovered
@@ -667,15 +826,154 @@ class RecoveryBootblockEnforcementResult:
 
 @dataclass(frozen=True)
 class PackageTransactionState:
-    apt_before: frozenset[str]
+    apt_before: tuple[tuple[str, str], ...]
     pip_before: tuple[tuple[str, str], ...]
     venv_python: str | None
     install_user: str
     apt_requested: tuple[str, ...]
     pip_requested: tuple[str, ...]
+    apt_candidate_packages: tuple[str, ...] = ()
     venv_path: str | None = None
     venv_existed: bool = True
     runtime_venv_required: bool = False
+
+
+@dataclass(frozen=True)
+class PreparedPackageState:
+    transaction_id: str
+    offline_receipt_json: str
+    offline_receipt_sha256: str
+    apt_after: tuple[tuple[str, str], ...]
+    pip_after: tuple[tuple[str, str], ...]
+    venv_python: str | None
+    install_user: str
+    apt_requested: tuple[str, ...]
+    pip_requested: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class PreparedPackageReceipt:
+    """Rebootfester Pre-/Postzustand genau einer Offline-Pakettransaktion."""
+
+    state: str
+    transaction_id: str
+    install_root: str
+    full_backup_id: str
+    payload_sha256: str
+    package_transaction: PackageTransactionState
+    prepared_state: PreparedPackageState | None
+    receipt_path: str
+    receipt_dev: int
+    receipt_ino: int
+    receipt_sha256: str
+    target_commit: str = ""
+    target_tag: str = ""
+    role: str = ""
+    apache_completion_required: bool = False
+    apache_available: bool = False
+    apache_was_active: bool = False
+    apache_unit_file_state: str = "absent"
+    static_recovery_contract_json: str = ""
+
+
+@dataclass(frozen=True)
+class PackageRecoveryReceipt:
+    """Nur der cacheunabhängige Rücklaufabschnitt eines Paket-Receipts."""
+
+    state: str
+    transaction_id: str
+    install_root: str
+    full_backup_id: str
+    payload_sha256: str
+    package_transaction: PackageTransactionState
+    receipt_path: str
+    receipt_dev: int
+    receipt_ino: int
+    receipt_sha256: str
+    target_commit: str = ""
+    target_tag: str = ""
+    role: str = ""
+    apache_completion_required: bool = False
+    apache_available: bool = False
+    apache_was_active: bool = False
+    apache_unit_file_state: str = "absent"
+    static_recovery_contract_json: str = ""
+
+
+class PreparedPackageReceiptTransitionError(RuntimeError):
+    """Bewahrt den exakt gebundenen Prestate an der atomaren Replace-Grenze."""
+
+    def __init__(
+        self,
+        message: str,
+        recovery_receipt: PreparedPackageReceipt | PackageRecoveryReceipt,
+    ):
+        if not isinstance(
+            recovery_receipt,
+            (PreparedPackageReceipt, PackageRecoveryReceipt),
+        ):
+            raise TypeError("Paket-Receipt-Transition besitzt keinen Recovery-Vertrag")
+        self.recovery_receipt = recovery_receipt
+        self.package_transaction = recovery_receipt.package_transaction
+        super().__init__(message)
+
+
+@dataclass(frozen=True)
+class TargetReleaseSpaceEstimate:
+    """Commitgebundener zusätzlicher Speicherbedarf der Zielprojektion."""
+
+    product_tree_bytes: int
+    web_projection_bytes: int
+    finalizer_snapshot_bytes: int
+
+
+@dataclass(frozen=True)
+class PersistentRecoveryBundle:
+    """Alle rebootfesten Begleitverträge genau einer Update-Transaktion."""
+
+    journal: recovery_journal.RecoveryJournalContract
+    # In einer laufenden Transaktion sind alle drei Belege zwingend vorhanden.
+    # Nach durable ``committed`` beziehungsweise ``rolled_back`` darf ein
+    # Prozessabbruch jedoch zwischen zwei exakt gebundenen Unlinks liegen. Der
+    # nächste Lauf muss diesen terminalen Cleanup fortsetzen können, ohne einen
+    # bereits entfernten Begleiter künstlich wieder zu verlangen.
+    context: recovery_context_codec.RecoveryContextContract | None
+    surface: recovery_surface_codec.PersistedRecoverySurfaceReceipt | None
+    systemd: recovery_surface_codec.PersistedSystemdRecoveryReceipt | None
+
+
+@dataclass(frozen=True)
+class ReconstructedRecoveryTransaction:
+    """Vollständig aus rebootfesten Belegen rekonstruierte Transaktion."""
+
+    bundle: PersistentRecoveryBundle
+    transition_state: TransitionState | None
+    install_inventory: frozenset[str] | None
+    recovery_inventory: RecoverySurfaceInventory | None
+    repo_contract: RepoRecoveryContract | None
+    backup_receipt: RecoveryBackupReceipt | None
+    package_receipt: PreparedPackageReceipt | PackageRecoveryReceipt | None
+    package_transaction: PackageTransactionState | None
+    update_safety_contract: UpdateSafetyContract | None
+    static_bootblock_contract: RecoveryBootblockContract | None
+    overlay_receipt: QuiescedOverlayReceipt | None
+    offline_receipt: OfflinePackageReceipt | None
+
+
+@dataclass
+class UpdateFilesystemDemand:
+    """Noch nicht belegter Bedarf eines einzelnen realen Dateisystems."""
+
+    device: int
+    representative_path: str
+    labels: list[str]
+    payload_bytes: int = 0
+    backup_bytes: int = 0
+    working_bytes: int = 0
+
+    @property
+    def total_bytes(self) -> int:
+        return self.payload_bytes + self.backup_bytes + self.working_bytes
 
 
 def _transition_units_sha256(units) -> str:
@@ -983,7 +1281,7 @@ def _git_argv(
         raise RuntimeError(
             "Explizite Bootstrap-Git-Autorität verlangt einen Root-Prozess"
         )
-    git_user = None if hasattr(os, "geteuid") and os.geteuid() == 0 else install_user
+    git_user = None if (root_authority and hasattr(os, "geteuid") and os.geteuid() == 0) else install_user
     return _run_argv(
         isolated_git_command(repo_dir, *args, run_as_user=git_user),
         timeout=timeout,
@@ -1947,6 +2245,104 @@ def _validate_recovery_bootblock_contract(
     return identities
 
 
+def _persistent_recovery_expected_dropins(
+    contract: RecoveryBootblockContract,
+    *,
+    selected_units=(),
+) -> dict[str, dict[str, dict[str, object]]]:
+    """Projiziert den gebundenen statischen Bootblock als Service-Readbackvertrag."""
+
+    identities = _validate_recovery_bootblock_contract(contract)
+    selected = tuple(str(unit) for unit in selected_units) or contract.units
+    if not set(selected).issubset(contract.units):
+        raise RuntimeError("Recovery-Drop-in-Auswahl enthält eine fremde Unit")
+    payload = _render_recovery_bootblock_dropin(contract.transaction_id)
+    result: dict[str, dict[str, dict[str, object]]] = {}
+    for unit in selected:
+        device, inode = identities[unit]
+        path = _recovery_dropin_path(unit)
+        result[unit] = {
+            path: {
+                "bytes": payload,
+                "dev": device,
+                "ino": inode,
+                "uid": 0,
+                "gid": 0,
+                "mode": 0o644,
+                "nlink": 1,
+                "size": len(payload),
+            }
+        }
+    return result
+
+
+def _serialize_recovery_bootblock_contract(
+    contract: RecoveryBootblockContract,
+) -> str:
+    """Serialisiert nur den bereits validierten Inodevertrag für den Ziel-Finalizer."""
+
+    _validate_recovery_bootblock_contract(contract)
+    record = {
+        "created_directories": list(contract.created_directories),
+        "dropin_identities": [list(item) for item in contract.dropin_identities],
+        "transaction_id": contract.transaction_id,
+        "units": list(contract.units),
+    }
+    return json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def _parse_recovery_bootblock_contract(
+    payload: str,
+    *,
+    verify_active_gate: bool = True,
+) -> RecoveryBootblockContract:
+    """Bindet den statischen Cutover-Bootblock im getrennten Finalizerprozess."""
+
+    raw = str(payload or "")
+    if not raw or len(raw.encode("utf-8")) > 128 * 1024:
+        raise RuntimeError("Statischer Recovery-Bootblock-Vertrag fehlt oder ist zu groß")
+    try:
+        record = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Statischer Recovery-Bootblock-Vertrag ist kein JSON") from exc
+    if (
+        not isinstance(record, dict)
+        or set(record)
+        != {"created_directories", "dropin_identities", "transaction_id", "units"}
+        or json.dumps(
+            record,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        )
+        != raw
+    ):
+        raise RuntimeError("Statischer Recovery-Bootblock-Vertrag ist nicht kanonisch")
+    try:
+        contract = RecoveryBootblockContract(
+            units=tuple(str(item) for item in record["units"]),
+            created_directories=tuple(
+                str(item) for item in record["created_directories"]
+            ),
+            transaction_id=str(record["transaction_id"]),
+            dropin_identities=tuple(
+                (str(item[0]), int(item[1]), int(item[2]))
+                for item in record["dropin_identities"]
+            ),
+        )
+    except (TypeError, ValueError, IndexError) as exc:
+        raise RuntimeError("Statischer Recovery-Bootblock-Vertrag ist ungültig") from exc
+    _validate_recovery_bootblock_contract(contract)
+    if verify_active_gate:
+        _verify_recovery_bootblock_marker(contract, expected_present=True)
+        _reload_and_verify_recovery_dropins(
+            contract.units,
+            expected_present=True,
+            transaction_id=contract.transaction_id,
+        )
+    return contract
+
+
 def _validate_partial_recovery_bootblock_contract(
     contract: RecoveryBootblockPartialContract,
 ) -> dict[str, tuple[int, int]]:
@@ -1973,7 +2369,11 @@ def _validate_partial_recovery_bootblock_contract(
 
 
 def _assert_no_same_transaction_finalizer_processes(
-    contract: UpdateSafetyContract,
+    contract: (
+        UpdateSafetyContract
+        | RecoveryBootblockContract
+        | legacy_safety_codec.LegacyUpdateSafetyReceipt
+    ),
 ) -> None:
     """Beweist für committed Cleanup null Prozesse derselben Finalizer-Lease."""
 
@@ -2013,7 +2413,10 @@ def _assert_no_same_transaction_finalizer_processes(
 
 
 def _assert_committed_finalizer_lease_inactive(
-    contract: UpdateSafetyContract,
+    contract: (
+        UpdateSafetyContract
+        | legacy_safety_codec.LegacyUpdateSafetyReceipt
+    ),
 ) -> None:
     """Bindet eine vollständig inaktive oder bereits entladene transiente Lease."""
 
@@ -2112,77 +2515,647 @@ def _assert_committed_finalizer_lease_inactive(
             raise RuntimeError("Committed Finalizer-cgroup besitzt noch Prozesse")
 
 
+def _read_bound_legacy_update_safety_receipt(
+    *,
+    allow_missing: bool = False,
+) -> tuple[
+    legacy_safety_codec.LegacyUpdateSafetyReceipt,
+    os.stat_result,
+] | None:
+    """Liest nur den exakt veröffentlichten v5.4.4/v5.4.4a-Vertrag."""
+
+    receipt_path = legacy_safety_codec.LEGACY_UPDATE_SAFETY_RECEIPT_PATH
+    if not os.path.lexists(receipt_path):
+        if allow_missing:
+            return None
+        raise RuntimeError("Legacy-Update-Sicherheitsreceipt fehlt")
+    state_descriptor = _open_recovery_bootblock_state_directory()
+    try:
+        readback = _read_bound_root_file_at(
+            state_descriptor,
+            UPDATE_SAFETY_RECEIPT_NAME,
+            maximum=legacy_safety_codec.LEGACY_UPDATE_SAFETY_MAX_BYTES,
+            mode=0o600,
+            allow_missing=allow_missing,
+        )
+        if readback is None:
+            return None
+        payload, metadata = readback
+        receipt = legacy_safety_codec.parse_legacy_update_safety_receipt(payload)
+        if receipt.receipt_path != receipt_path:
+            raise RuntimeError("Legacy-Receiptpfad driftete vom veröffentlichten Vertrag")
+        return receipt, metadata
+    finally:
+        os.close(state_descriptor)
+
+
+def _read_bound_active_legacy_forward_receipt(
+    *,
+    expected_target_commit: str,
+    expected_target_tag: str,
+) -> tuple[
+    legacy_safety_codec.LegacyUpdateSafetyReceipt,
+    os.stat_result,
+]:
+    """Liest den laufenden v1-Vertrag nur gegen den gebundenen Ziel-Snapshot."""
+
+    receipt_path = legacy_safety_codec.LEGACY_UPDATE_SAFETY_RECEIPT_PATH
+    if not os.path.lexists(receipt_path):
+        raise RuntimeError("Aktives Legacy-Forward-Receipt fehlt")
+    state_descriptor = _open_recovery_bootblock_state_directory()
+    try:
+        readback = _read_bound_root_file_at(
+            state_descriptor,
+            UPDATE_SAFETY_RECEIPT_NAME,
+            maximum=legacy_safety_codec.LEGACY_UPDATE_SAFETY_MAX_BYTES,
+            mode=0o600,
+        )
+        if readback is None:
+            raise RuntimeError("Aktives Legacy-Forward-Receipt verschwand")
+        payload, metadata = readback
+        receipt = legacy_safety_codec.parse_active_legacy_forward_receipt(
+            payload,
+            expected_target_commit=expected_target_commit,
+            expected_target_tag=expected_target_tag,
+        )
+        if receipt.receipt_path != receipt_path:
+            raise RuntimeError(
+                "Aktiver Legacy-Forward-Receiptpfad driftete vom veröffentlichten Vertrag"
+            )
+        return receipt, metadata
+    finally:
+        os.close(state_descriptor)
+
+
+def _revalidate_bound_active_legacy_forward_receipt(
+    receipt: legacy_safety_codec.LegacyUpdateSafetyReceipt,
+    *,
+    receipt_dev: int,
+    receipt_ino: int,
+) -> os.stat_result:
+    current, metadata = _read_bound_active_legacy_forward_receipt(
+        expected_target_commit=receipt.target_commit,
+        expected_target_tag=receipt.target_tag,
+    )
+    if (
+        current != receipt
+        or (int(metadata.st_dev), int(metadata.st_ino))
+        != (int(receipt_dev), int(receipt_ino))
+    ):
+        raise RuntimeError("Aktives Legacy-Forward-Receipt oder Inode driftete")
+    return metadata
+
+
+def _bind_active_legacy_forward_backup_source(
+    receipt: legacy_safety_codec.LegacyUpdateSafetyReceipt,
+    *,
+    requested_install_root: str,
+) -> str:
+    """Beweist den v5.4.4/v5.4.4a-Writer über vier Vollbackup-Blobs."""
+
+    root = _bind_legacy_update_backup_instance(
+        receipt,
+        requested_install_root=requested_install_root,
+    )
+    manifest, manifest_sha256 = _read_stable_verified_backup_manifest(
+        receipt.backup_dir
+    )
+    if manifest_sha256 != receipt.backup_manifest_sha256:
+        raise RuntimeError("Legacy-Forward-Backupmanifest driftete")
+    entries = manifest.get("files")
+    if not isinstance(entries, list):
+        raise RuntimeError("Legacy-Forward-Vollbackup besitzt keine Dateiliste")
+    by_restore: dict[str, dict] = {}
+    for raw in entries:
+        if not isinstance(raw, dict):
+            raise RuntimeError("Legacy-Forward-Vollbackup besitzt einen ungültigen Eintrag")
+        restore_path = str(raw.get("restore_path") or "")
+        if restore_path:
+            if restore_path in by_restore:
+                raise RuntimeError(
+                    f"Legacy-Forward-Vollbackup besitzt ein doppeltes Ziel: {restore_path}"
+                )
+            by_restore[restore_path] = raw
+
+    matching_sources: list[str] = []
+    for source_tag, expected_files in (
+        legacy_safety_codec.LEGACY_FORWARD_SOURCE_BLOBS.items()
+    ):
+        matched = True
+        for relative_path, expected_sha256 in expected_files.items():
+            restore_path = os.path.join(root, relative_path)
+            entry = by_restore.get(restore_path)
+            if (
+                entry is None
+                or entry.get("category") != "install-tree"
+                or entry.get("sha256") != expected_sha256
+            ):
+                matched = False
+                break
+        if matched:
+            matching_sources.append(source_tag)
+    if len(matching_sources) != 1:
+        raise RuntimeError(
+            "Legacy-Forward-Parent ist im Vollbackup nicht eindeutig als "
+            "veröffentlichtes v5.4.4 oder v5.4.4a gebunden"
+        )
+    return matching_sources[0]
+
+
+def _revalidate_bound_legacy_update_safety_receipt(
+    receipt: legacy_safety_codec.LegacyUpdateSafetyReceipt,
+    *,
+    receipt_dev: int,
+    receipt_ino: int,
+) -> os.stat_result:
+    current = _read_bound_legacy_update_safety_receipt()
+    if current is None:
+        raise RuntimeError("Legacy-Update-Sicherheitsreceipt verschwand")
+    rebound, metadata = current
+    if (
+        rebound != receipt
+        or (int(metadata.st_dev), int(metadata.st_ino))
+        != (int(receipt_dev), int(receipt_ino))
+    ):
+        raise RuntimeError("Legacy-Update-Sicherheitsreceipt oder Inode driftete")
+    return metadata
+
+
+def _bind_legacy_update_backup_instance(
+    receipt: legacy_safety_codec.LegacyUpdateSafetyReceipt,
+    *,
+    requested_install_root: str,
+) -> str:
+    """Bindet die im alten Receipt fehlende Instanz über dessen Vollbackup."""
+
+    backup_dir = receipt.backup_dir
+    metadata = os.lstat(backup_dir)
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+        or os.path.realpath(backup_dir) != backup_dir
+        or (int(metadata.st_dev), int(metadata.st_ino))
+        != (receipt.backup_dev, receipt.backup_ino)
+    ):
+        raise RuntimeError("Legacy-Vollbackup besitzt nicht mehr seinen Root-/Inodevertrag")
+    manifest, manifest_sha256 = _read_stable_verified_backup_manifest(backup_dir)
+    if (
+        manifest_sha256 != receipt.backup_manifest_sha256
+        or str(manifest.get("backup_id") or "") != receipt.backup_id
+    ):
+        raise RuntimeError("Legacy-Receipt und verifiziertes Vollbackup widersprechen sich")
+    manifest_root = str(manifest.get("install_root") or "")
+    requested = os.path.realpath(os.path.abspath(requested_install_root))
+    if (
+        not manifest_root
+        or not os.path.isabs(manifest_root)
+        or os.path.abspath(manifest_root) != manifest_root
+        or os.path.realpath(manifest_root) != requested
+    ):
+        raise RuntimeError(
+            "Legacy-Vollbackup gehört nicht zur angeforderten Installation "
+            f"({manifest_root or 'unbekannt'} != {requested})"
+        )
+    return requested
+
+
+def _rebind_legacy_update_safety_dropins(
+    receipt: legacy_safety_codec.LegacyUpdateSafetyReceipt,
+    *,
+    allow_missing: bool,
+) -> dict[str, tuple[int, int]]:
+    """Beweist vor Marker-Unlink, dass kein fremdes 00-Gate übersehen wird."""
+
+    expected = {
+        unit: (int(device), int(inode))
+        for unit, device, inode in receipt.dropin_identities
+    }
+    payload = receipt.dropin_payload
+    rebound: dict[str, tuple[int, int]] = {}
+    systemd_descriptor = _open_directory_nofollow("/etc/systemd/system")
+    try:
+        _require_root_controlled_directory(
+            systemd_descriptor,
+            "/etc/systemd/system",
+        )
+        for entry in os.listdir(systemd_descriptor):
+            if not entry.endswith(".d"):
+                continue
+            before = os.stat(
+                entry,
+                dir_fd=systemd_descriptor,
+                follow_symlinks=False,
+            )
+            if not stat.S_ISDIR(before.st_mode):
+                raise RuntimeError(
+                    f"Systemd-Drop-in-Pfad ist nicht sicher prüfbar: {entry}"
+                )
+            directory_descriptor = os.open(
+                entry,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=systemd_descriptor,
+            )
+            try:
+                opened = _require_root_controlled_directory(
+                    directory_descriptor,
+                    f"/etc/systemd/system/{entry}",
+                    0o755,
+                )
+                named_after = os.stat(
+                    entry,
+                    dir_fd=systemd_descriptor,
+                    follow_symlinks=False,
+                )
+                if (
+                    (opened.st_dev, opened.st_ino)
+                    != (before.st_dev, before.st_ino)
+                    or (named_after.st_dev, named_after.st_ino)
+                    != (opened.st_dev, opened.st_ino)
+                ):
+                    raise RuntimeError(f"Systemd-Drop-in-Pfad driftete: {entry}")
+                if RECOVERY_BOOTBLOCK_DROPIN_NAME not in set(
+                    os.listdir(directory_descriptor)
+                ):
+                    continue
+                unit = entry[:-2]
+                if unit not in expected:
+                    raise RuntimeError(
+                        f"Fremdes Recovery-Drop-in sperrt Legacy-Cleanup: {unit}"
+                    )
+                dropin = _read_exact_root_file_at(
+                    directory_descriptor,
+                    RECOVERY_BOOTBLOCK_DROPIN_NAME,
+                    payload,
+                    0o644,
+                    allow_missing=False,
+                )
+                identity = (int(dropin.st_dev), int(dropin.st_ino))
+                if identity != expected[unit]:
+                    raise RuntimeError(
+                        f"Legacy-Drop-in-Inode driftete vor Cleanup: {unit}"
+                    )
+                rebound[unit] = identity
+            finally:
+                os.close(directory_descriptor)
+    finally:
+        os.close(systemd_descriptor)
+    if not allow_missing and set(rebound) != set(receipt.units):
+        missing = sorted(set(receipt.units) - set(rebound))
+        raise RuntimeError(
+            "Pending Legacy-Gate ist nicht vollständig vorhanden: "
+            + ", ".join(missing[:5])
+        )
+    return rebound
+
+
+def _remove_exact_legacy_update_safety_receipt(
+    receipt: legacy_safety_codec.LegacyUpdateSafetyReceipt,
+    *,
+    receipt_dev: int,
+    receipt_ino: int,
+) -> None:
+    _revalidate_bound_legacy_update_safety_receipt(
+        receipt,
+        receipt_dev=receipt_dev,
+        receipt_ino=receipt_ino,
+    )
+    state_descriptor = _open_recovery_bootblock_state_directory()
+    try:
+        current = _read_bound_root_file_at(
+            state_descriptor,
+            UPDATE_SAFETY_RECEIPT_NAME,
+            maximum=legacy_safety_codec.LEGACY_UPDATE_SAFETY_MAX_BYTES,
+            mode=0o600,
+        )
+        if current is None:
+            raise RuntimeError("Legacy-Receipt verschwand vor dem Unlink")
+        rebound = legacy_safety_codec.parse_legacy_update_safety_receipt(current[0])
+        if (
+            rebound != receipt
+            or (int(current[1].st_dev), int(current[1].st_ino))
+            != (int(receipt_dev), int(receipt_ino))
+        ):
+            raise RuntimeError("Fremdes Legacy-Receipt wird nicht entfernt")
+        os.unlink(UPDATE_SAFETY_RECEIPT_NAME, dir_fd=state_descriptor)
+        os.fsync(state_descriptor)
+    finally:
+        os.close(state_descriptor)
+    if os.path.lexists(receipt.receipt_path):
+        raise RuntimeError("Legacy-Update-Sicherheitsreceipt blieb erhalten")
+
+
+def _remove_exact_legacy_update_safety_marker(
+    receipt: legacy_safety_codec.LegacyUpdateSafetyReceipt,
+    *,
+    receipt_dev: int,
+    receipt_ino: int,
+) -> None:
+    """Entfernt nur den unmittelbar erneut gebundenen Legacy-Marker."""
+
+    _revalidate_bound_legacy_update_safety_receipt(
+        receipt,
+        receipt_dev=receipt_dev,
+        receipt_ino=receipt_ino,
+    )
+    _rebind_legacy_update_safety_dropins(receipt, allow_missing=True)
+    marker_name = Path(RECOVERY_BOOTBLOCK_MARKER).name
+    marker_payload = _recovery_bootblock_marker_payload(receipt.transaction_id)
+    state_descriptor = _open_recovery_bootblock_state_directory()
+    try:
+        marker = _read_exact_root_file_at(
+            state_descriptor,
+            marker_name,
+            marker_payload,
+            0o600,
+            allow_missing=True,
+        )
+        if marker is None:
+            return
+        marker_identity = _file_identity(marker)
+        _revalidate_bound_legacy_update_safety_receipt(
+            receipt,
+            receipt_dev=receipt_dev,
+            receipt_ino=receipt_ino,
+        )
+        rebound = _read_exact_root_file_at(
+            state_descriptor,
+            marker_name,
+            marker_payload,
+            0o600,
+            allow_missing=False,
+        )
+        named_after = os.stat(
+            marker_name,
+            dir_fd=state_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            rebound is None
+            or _file_identity(rebound) != marker_identity
+            or _file_identity(named_after) != marker_identity
+        ):
+            raise RuntimeError("Legacy-Marker driftete unmittelbar vor dem Unlink")
+        os.unlink(marker_name, dir_fd=state_descriptor)
+        os.fsync(state_descriptor)
+    finally:
+        os.close(state_descriptor)
+    _verify_update_safety_marker(receipt, expected_present=False)
+
+
+def _finish_committed_legacy_update_safety_residue(
+    receipt: legacy_safety_codec.LegacyUpdateSafetyReceipt,
+    *,
+    receipt_dev: int,
+    receipt_ino: int,
+) -> None:
+    """Vollendet nur ein bereits dauerhaft committed altes Startgate."""
+
+    _assert_legacy_recovery_namespace_exclusive()
+    _revalidate_bound_legacy_update_safety_receipt(
+        receipt,
+        receipt_dev=receipt_dev,
+        receipt_ino=receipt_ino,
+    )
+    _rebind_legacy_update_safety_dropins(receipt, allow_missing=True)
+    _settle_terminal_finalizer_lease(receipt)
+    if os.path.lexists(f"/run/{receipt.runtime_directory}") or os.path.lexists(
+        receipt.token_path
+    ):
+        raise RuntimeError("Committed Legacy-Finalizer-Runtime/Token ist noch vorhanden")
+    _assert_no_same_transaction_finalizer_processes(receipt)
+    _revalidate_bound_legacy_update_safety_receipt(
+        receipt,
+        receipt_dev=receipt_dev,
+        receipt_ino=receipt_ino,
+    )
+    _assert_legacy_recovery_namespace_exclusive()
+    _rebind_legacy_update_safety_dropins(receipt, allow_missing=True)
+    _remove_exact_legacy_update_safety_marker(
+        receipt,
+        receipt_dev=receipt_dev,
+        receipt_ino=receipt_ino,
+    )
+    _remove_owned_update_safety_dropins(
+        units=receipt.units,
+        identities={
+            unit: (int(device), int(inode))
+            for unit, device, inode in receipt.dropin_identities
+        },
+        created_directories=receipt.created_directories,
+        payload=receipt.dropin_payload,
+        allow_missing=True,
+    )
+    _reload_and_verify_update_safety_dropins(receipt, expected_present=False)
+    _remove_exact_legacy_update_safety_receipt(
+        receipt,
+        receipt_dev=receipt_dev,
+        receipt_ino=receipt_ino,
+    )
+
+
 def _finish_committed_update_safety_residue_if_safe() -> bool:
     """Räumt nur vollständig gebundene committed Residuen vor einem neuen Lauf."""
 
     residue = _read_update_safety_contract(allow_missing=True)
-    if residue is None or residue.state != "committed":
+    if residue is None:
+        return _finish_committed_package_residue_if_safe()
+    if residue.state != "committed":
         return False
-    _assert_committed_finalizer_lease_inactive(residue)
+    expected_root = _validate_bootstrap_install_path(INSTALL_PATH)
+    package_receipt = _read_prepared_package_receipt(allow_missing=True)
+    if package_receipt is not None:
+        if (
+            package_receipt.state not in {"prepared", "committed"}
+            or package_receipt.transaction_id != residue.transaction_id
+            or package_receipt.install_root != expected_root
+            or package_receipt.full_backup_id != residue.backup_id
+            or package_receipt.target_commit != residue.target_commit
+            or package_receipt.target_tag != residue.target_tag
+            or package_receipt.role != residue.role
+            or not package_receipt.apache_completion_required
+            or package_receipt.apache_available != residue.apache_available
+            or package_receipt.apache_was_active != residue.apache_was_active
+            or package_receipt.apache_unit_file_state
+            != residue.apache_unit_file_state
+            or package_receipt.static_recovery_contract_json
+        ):
+            raise RuntimeError(
+                "Committed Update-Sicherheitsreceipt und Paket-Receipt widersprechen sich"
+            )
+        if package_receipt.prepared_state is None:
+            raise RuntimeError("Committed Paket-Receipt besitzt keinen Postzustand")
+        _package_transaction_from_receipt(package_receipt)
+    _settle_terminal_finalizer_lease(residue)
     if os.path.lexists(f"/run/{residue.runtime_directory}") or os.path.lexists(
         residue.token_path
     ):
         raise RuntimeError("Committed Finalizer-Runtime/Token ist noch vorhanden")
     _assert_no_same_transaction_finalizer_processes(residue)
+    # Marker und Drop-ins dürfen zuerst fallen, der durable committed-Anker
+    # bleibt aber bis nach dem exakt inodegebundenen Paket-Receipt erhalten.
+    # Ein Absturz zwischen beiden Unlinks hinterlässt dadurch niemals ein
+    # orphaned Paket-Receipt ohne den zugehörigen Commitnachweis.
     _finish_committed_update_safety_cleanup(
         residue,
-        remove_receipt=True,
+        remove_receipt=False,
     )
+    # Der durable Beleg bleibt bestehen, bis auch die äußeren, weiterhin
+    # transaktionsgebundenen Arbeitsartefakte bestätigt entfernt sind.
+    if package_receipt is not None:
+        offline_receipt = parse_offline_package_receipt(
+            package_receipt.prepared_state.offline_receipt_json.encode("utf-8")
+        )
+        if not _cleanup_terminal_offline_package_receipt(
+            offline_receipt,
+            terminal_state="committed neue Stand",
+        ):
+            raise RuntimeError("Committed Offline-Paketcache blieb beim Retry erhalten")
+    overlay_receipt = _read_quiesced_overlay_receipt(allow_missing=True)
+    if overlay_receipt is not None:
+        if (
+            overlay_receipt.transaction_id != residue.transaction_id
+            or overlay_receipt.install_root != expected_root
+        ):
+            raise RuntimeError("Committed Overlay-Receipt widerspricht dem Update-Receipt")
+        _remove_quiesced_overlay_receipt_and_tree(overlay_receipt)
+    snapshot_parent = _trusted_same_filesystem_snapshot_parent(expected_root)
+    _cleanup_stale_target_execution_snapshots(
+        snapshot_parent,
+        prefixes=(TARGET_FINALIZER_SNAPSHOT_PREFIX,),
+    )
+    if package_receipt is not None:
+        _remove_exact_prepared_package_receipt(package_receipt)
+    _remove_exact_update_safety_receipt(residue)
     if _read_update_safety_contract(allow_missing=True) is not None:
         raise RuntimeError("Committed Update-Sicherheitsreceipt blieb nach Cleanup")
+    if _read_package_recovery_receipt(allow_missing=True) is not None:
+        raise RuntimeError("Committed Paket-Receipt blieb nach Cleanup")
     return True
 
 
-def _assert_no_existing_recovery_bootblock() -> None:
-    """Blockiert einen neuen Updatepfad bei jedem fremden/stalen Recovery-Gate."""
+def _finish_committed_package_gate_cleanup(
+    contract: PreparedPackageReceipt,
+) -> PreparedPackageReceipt:
+    """Vollendet den statischen Bootblock und Apache nur aus committed Beleg."""
 
-    if not hasattr(os, "geteuid") or os.geteuid() != 0:
-        raise RuntimeError("Recovery-Bootblock-Preflight darf ausschließlich Root ausführen")
-    _finish_committed_update_safety_residue_if_safe()
-    var_lib_descriptor = _open_directory_nofollow("/var/lib")
-    try:
-        _require_root_controlled_directory(var_lib_descriptor, "/var/lib")
-        state_name = Path(RECOVERY_BOOTBLOCK_STATE_DIR).name
+    current = _validate_prepared_package_receipt(
+        contract,
+        expected_state="committed",
+    )
+    static_contract = None
+    if current.static_recovery_contract_json:
+        static_contract = _parse_recovery_bootblock_contract(
+            current.static_recovery_contract_json,
+            verify_active_gate=False,
+        )
+        marker_payload = _recovery_bootblock_marker_payload(
+            static_contract.transaction_id
+        )
+        state_descriptor = _open_recovery_bootblock_state_directory()
         try:
-            state_before = os.stat(
-                state_name,
-                dir_fd=var_lib_descriptor,
-                follow_symlinks=False,
+            marker = _read_exact_root_file_at(
+                state_descriptor,
+                Path(RECOVERY_BOOTBLOCK_MARKER).name,
+                marker_payload,
+                0o600,
+                allow_missing=True,
             )
-        except FileNotFoundError:
-            pass
-        else:
-            if not stat.S_ISDIR(state_before.st_mode):
-                raise RuntimeError("Recovery-Bootblock-Statepfad ist nicht sicher")
-            state_descriptor = os.open(
-                state_name,
-                os.O_RDONLY
-                | getattr(os, "O_DIRECTORY", 0)
-                | getattr(os, "O_NOFOLLOW", 0)
-                | getattr(os, "O_CLOEXEC", 0),
-                dir_fd=var_lib_descriptor,
-            )
-            try:
-                opened = _require_root_controlled_directory(
-                    state_descriptor,
-                    RECOVERY_BOOTBLOCK_STATE_DIR,
-                    0o700,
-                )
-                if (opened.st_dev, opened.st_ino) != (
-                    state_before.st_dev,
-                    state_before.st_ino,
-                ):
-                    raise RuntimeError("Recovery-Bootblock-Statepfad driftete")
-                if Path(RECOVERY_BOOTBLOCK_MARKER).name in set(
-                    os.listdir(state_descriptor)
-                ):
-                    raise RuntimeError(
-                        "Vorhandener Recovery-Bootblock-Marker sperrt einen neuen Updatepfad"
-                    )
-            finally:
-                os.close(state_descriptor)
-    finally:
-        os.close(var_lib_descriptor)
+            if marker is not None:
+                os.unlink(Path(RECOVERY_BOOTBLOCK_MARKER).name, dir_fd=state_descriptor)
+                os.fsync(state_descriptor)
+        finally:
+            os.close(state_descriptor)
+        _verify_recovery_bootblock_marker(static_contract, expected_present=False)
+        _remove_owned_update_safety_dropins(
+            units=static_contract.units,
+            identities={
+                unit: (device, inode)
+                for unit, device, inode in static_contract.dropin_identities
+            },
+            created_directories=static_contract.created_directories,
+            payload=_render_recovery_bootblock_dropin(
+                static_contract.transaction_id
+            ),
+            allow_missing=True,
+        )
+        _reload_and_verify_recovery_dropins(
+            static_contract.units,
+            expected_present=False,
+            transaction_id=static_contract.transaction_id,
+        )
+    elif os.path.lexists(RECOVERY_BOOTBLOCK_MARKER):
+        raise RuntimeError(
+            "Committed Paket-Receipt ohne statischen Vertrag sieht einen Marker"
+        )
+    if current.apache_completion_required:
+        _complete_bound_apache_after_commit(
+            expected_available=current.apache_available,
+            expected_active=current.apache_was_active,
+            expected_unit_file_state=current.apache_unit_file_state,
+        )
+    return current
+
+
+def _finish_committed_package_residue_if_safe() -> bool:
+    """Wiederholt einen statischen/direct PostCommit-Abschluss beim nächsten Lauf."""
+
+    package_receipt = _read_prepared_package_receipt(allow_missing=True)
+    if package_receipt is None or package_receipt.state != "committed":
+        return False
+    static_contract = (
+        _parse_recovery_bootblock_contract(
+            package_receipt.static_recovery_contract_json,
+            verify_active_gate=False,
+        )
+        if package_receipt.static_recovery_contract_json
+        else RecoveryBootblockContract(
+            units=(),
+            created_directories=(),
+            transaction_id=package_receipt.transaction_id,
+            dropin_identities=(),
+        )
+    )
+    _settle_terminal_finalizer_lease(static_contract)
+    if os.path.lexists(f"/run/{static_contract.runtime_directory}") or os.path.lexists(
+        static_contract.token_path
+    ):
+        raise RuntimeError("Committed statische Finalizer-Runtime/Token ist noch vorhanden")
+    _assert_no_same_transaction_finalizer_processes(static_contract)
+    _finish_committed_package_gate_cleanup(package_receipt)
+    if package_receipt.prepared_state is None:
+        raise RuntimeError("Committed Paket-Receipt besitzt keinen Postzustand")
+    offline_receipt = parse_offline_package_receipt(
+        package_receipt.prepared_state.offline_receipt_json.encode("utf-8")
+    )
+    if not _cleanup_terminal_offline_package_receipt(
+        offline_receipt,
+        terminal_state="committed neue Stand",
+    ):
+        raise RuntimeError("Committed Offline-Paketcache blieb beim Retry erhalten")
+    overlay_receipt = _read_quiesced_overlay_receipt(allow_missing=True)
+    if overlay_receipt is not None:
+        if (
+            overlay_receipt.transaction_id != package_receipt.transaction_id
+            or overlay_receipt.install_root != package_receipt.install_root
+        ):
+            raise RuntimeError("Committed Paket- und Overlay-Receipt widersprechen sich")
+        _remove_quiesced_overlay_receipt_and_tree(overlay_receipt)
+    _cleanup_stale_target_execution_snapshots(
+        _trusted_same_filesystem_snapshot_parent(package_receipt.install_root),
+        prefixes=(TARGET_FINALIZER_SNAPSHOT_PREFIX,),
+    )
+    _remove_exact_prepared_package_receipt(package_receipt)
+    return True
+
+
+def _assert_no_recovery_bootblock_dropins() -> None:
+    """Prüft den globalen systemd-Gate-Namensraum ohne Mutation."""
 
     systemd_descriptor = _open_directory_nofollow("/etc/systemd/system")
     try:
@@ -2231,6 +3204,77 @@ def _assert_no_existing_recovery_bootblock() -> None:
     finally:
         os.close(systemd_descriptor)
 
+
+def _assert_no_existing_recovery_bootblock() -> None:
+    """Blockiert einen neuen Updatepfad bei jedem fremden/stalen Recovery-Gate."""
+
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        raise RuntimeError("Recovery-Bootblock-Preflight darf ausschließlich Root ausführen")
+    _finish_committed_update_safety_residue_if_safe()
+    var_lib_descriptor = _open_directory_nofollow("/var/lib")
+    try:
+        _require_root_controlled_directory(var_lib_descriptor, "/var/lib")
+        state_name = Path(RECOVERY_BOOTBLOCK_STATE_DIR).name
+        try:
+            state_before = os.stat(
+                state_name,
+                dir_fd=var_lib_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            if not stat.S_ISDIR(state_before.st_mode):
+                raise RuntimeError("Recovery-Bootblock-Statepfad ist nicht sicher")
+            state_descriptor = os.open(
+                state_name,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=var_lib_descriptor,
+            )
+            try:
+                opened = _require_root_controlled_directory(
+                    state_descriptor,
+                    RECOVERY_BOOTBLOCK_STATE_DIR,
+                    0o700,
+                )
+                if (opened.st_dev, opened.st_ino) != (
+                    state_before.st_dev,
+                    state_before.st_ino,
+                ):
+                    raise RuntimeError("Recovery-Bootblock-Statepfad driftete")
+                state_entries = set(os.listdir(state_descriptor))
+                if PREPARED_PACKAGE_RECEIPT_NAME in state_entries:
+                    raise RuntimeError(
+                        "[E3DC-UPD-PACKAGE-PENDING] Ein unvollständiger "
+                        "Update-Lauf besitzt einen rebootfesten Paket-Prestate. "
+                        f"Lösung: {os.path.join(RECOVERY_BOOTBLOCK_STATE_DIR, PREPARED_PACKAGE_RECEIPT_NAME)} "
+                        "nicht löschen und Pakete nicht manuell ändern. Prüfe zuerst "
+                        "sudo dpkg --audit und sudo journalctl -b -u "
+                        "'e3dc-*update*' --no-pager; führe anschließend nur den "
+                        "dort für diese Transaktion genannten Recovery-Schritt aus."
+                    )
+                if Path(RECOVERY_BOOTBLOCK_MARKER).name in state_entries:
+                    raise RuntimeError(
+                        "Vorhandener Recovery-Bootblock-Marker sperrt einen neuen Updatepfad"
+                    )
+                if QUIESCED_OVERLAY_RECEIPT_NAME in state_entries:
+                    raise RuntimeError(
+                        "[E3DC-UPD-OVERLAY-PENDING] Ein unvollständiger Update-"
+                        "Rückfall besitzt noch Nutzerdaten. Lösung: Dienste nicht "
+                        "manuell starten oder Dateien löschen; zuerst "
+                        "sudo journalctl -u 'e3dc-*update*' --no-pager prüfen und "
+                        "den dort genannten Recovery-Befehl ausführen."
+                    )
+            finally:
+                os.close(state_descriptor)
+    finally:
+        os.close(var_lib_descriptor)
+
+    _assert_no_recovery_bootblock_dropins()
+
     residue = _read_update_safety_contract(allow_missing=True)
     if residue is not None:
         raise RuntimeError(
@@ -2239,10 +3283,85 @@ def _assert_no_existing_recovery_bootblock() -> None:
         )
 
 
+def _assert_active_recovery_transaction_namespace(
+    journal_contract: recovery_journal.RecoveryJournalContract,
+    *,
+    expected_transaction_id: str,
+) -> PersistentRecoveryBundle:
+    """Bindet den noch leeren Gate-Namensraum derselben Preproduct-Transaktion.
+
+    Der äußere Update-Einstieg behandelt Altlasten und vorherige Transaktionen.
+    Dieser interne Guard darf dagegen weder Cleanup ausführen noch das eigene
+    Master-Journal als fremde Altlast fehlklassifizieren.
+    """
+
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        raise RuntimeError("Interner Recovery-Guard darf ausschließlich Root ausführen")
+    current = recovery_journal.read_recovery_journal(allow_missing=False)
+    current = recovery_journal.verify_recovery_journal(current)
+    expected = recovery_journal.verify_recovery_journal(journal_contract)
+    if (
+        expected.payload.phase != recovery_journal.PHASE_PREPRODUCT
+        or current.payload.phase != recovery_journal.PHASE_PREPRODUCT
+        or expected.payload.transaction_id != expected_transaction_id
+        or current.payload.transaction_id != expected_transaction_id
+        or not _same_recovery_journal_transaction_shape(current, expected)
+        or current.journal_device != expected.journal_device
+        or current.journal_inode != expected.journal_inode
+        or current.journal_sha256 != expected.journal_sha256
+        or current.payload.package is not None
+        or current.payload.safety is not None
+        or current.payload.overlay is not None
+    ):
+        raise RuntimeError(
+            "Interner Recovery-Guard widerspricht dem aktiven Preproduct-Journal"
+        )
+    if os.path.lexists(
+        prejournal_codec.PREJOURNAL_CONSTRUCTION_PATH
+    ):
+        raise RuntimeError(
+            "Aktiver Preproduct-Parent besitzt noch einen Construction-Receipt"
+        )
+
+    bundle = _load_persistent_recovery_bundle(current)
+    if bundle.context is None or bundle.surface is None or bundle.systemd is None:
+        raise RuntimeError("Aktiver Preproduct-Parent ist unvollständig")
+
+    forbidden_paths = (
+        os.path.join(
+            RECOVERY_BOOTBLOCK_STATE_DIR,
+            PREPARED_PACKAGE_RECEIPT_NAME,
+        ),
+        os.path.join(
+            RECOVERY_BOOTBLOCK_STATE_DIR,
+            UPDATE_SAFETY_RECEIPT_NAME,
+        ),
+        os.path.join(
+            RECOVERY_BOOTBLOCK_STATE_DIR,
+            QUIESCED_OVERLAY_RECEIPT_NAME,
+        ),
+        RECOVERY_BOOTBLOCK_MARKER,
+    )
+    present = tuple(path for path in forbidden_paths if os.path.lexists(path))
+    if present:
+        raise RuntimeError(
+            "Aktiver Preproduct-Parent besitzt bereits Gate-/Paketartefakte: "
+            + ", ".join(present)
+        )
+    for unit in _recovery_bootblock_units():
+        path = _recovery_dropin_path(unit)
+        if os.path.lexists(path):
+            raise RuntimeError(
+                "Aktiver Preproduct-Parent besitzt bereits ein Gate-Drop-in: "
+                + path
+            )
+    return bundle
+
+
 def _assert_exclusive_not_found_recovery_dropin(
     unit: str,
     *,
-    expected_payload: bytes = RECOVERY_BOOTBLOCK_DROPIN_PAYLOAD,
+    expected_payload: bytes,
 ) -> None:
     """Bindet bei fehlendem Fragment nur Recovery- und kanonisches RAM-Disk-Drop-in."""
 
@@ -2337,7 +3456,15 @@ def _reload_and_verify_recovery_dropins(
     units: tuple[str, ...],
     *,
     expected_present: bool,
+    transaction_id: str,
 ) -> None:
+    transaction_id = str(transaction_id or "")
+    if not RECOVERY_BOOTBLOCK_TRANSACTION_RE.fullmatch(transaction_id):
+        raise RuntimeError("Recovery-Bootblock-Readback besitzt keine gültige Transaktion")
+    payload = _render_recovery_bootblock_dropin(transaction_id)
+    finalizer_unit, _runtime_directory, token_path = _update_safety_names(
+        transaction_id
+    )
     systemd_env = dict(os.environ)
     systemd_env.update({"LC_ALL": "C", "LANG": "C"})
     reload_result = _run_argv(
@@ -2355,7 +3482,10 @@ def _reload_and_verify_recovery_dropins(
             "systemd daemon-reload für Recovery-Bootblock fehlgeschlagen: "
             + _combined_process_diagnostics(reload_result, maximum=800)
         )
-    marker = "# E3DC_RECOVERY_BOOTBLOCK_V1"
+    marker = RECOVERY_BOOTBLOCK_DROPIN_MARKER
+    marker_condition = f"|!{RECOVERY_BOOTBLOCK_MARKER}"
+    token_condition = f"|{token_path}"
+
     def show_value(unit: str, property_name: str) -> str:
         result = _run_argv(
             [
@@ -2409,8 +3539,9 @@ def _reload_and_verify_recovery_dropins(
             ) from exc
         own_dropin = _recovery_dropin_path(unit)
         marker_lines = [line for line in output.splitlines() if line.strip() == marker]
-        effective_conditions = []
+        effective_conditions: list[tuple[str, str]] = []
         condition_syntax_ambiguous = False
+        condition_reset_seen = False
         for line in output.splitlines():
             match = re.fullmatch(r"\s*(Condition[A-Za-z0-9]+)\s*=(.*)", line)
             stripped = line.lstrip()
@@ -2429,14 +3560,14 @@ def _reload_and_verify_recovery_dropins(
                 # Wir werten deshalb die zusammengefügte Unit in derselben
                 # Reihenfolge aus, statt bloß Textvorkommen zu zählen.
                 if not assignment[1]:
+                    condition_reset_seen = True
                     effective_conditions.clear()
                 else:
                     effective_conditions.append(assignment)
-        marker_path_conditions = [
-            value
-            for name, value in effective_conditions
-            if name == "ConditionPathExists"
-            and value.lstrip("|!") == RECOVERY_BOOTBLOCK_MARKER
+        own_or_conditions = [
+            condition
+            for condition in effective_conditions
+            if condition[1].startswith("|")
         ]
 
         if expected_present:
@@ -2470,8 +3601,18 @@ def _reload_and_verify_recovery_dropins(
                 # Fragment könnte deshalb einen bislang unsichtbaren, späteren
                 # Condition-Reset aktivieren. Zulässig ist hier ausschließlich
                 # unser bereits transaktionsgebundener 00-Inode.
-                _assert_exclusive_not_found_recovery_dropin(unit)
+                _assert_exclusive_not_found_recovery_dropin(
+                    unit,
+                    expected_payload=payload,
+                )
                 continue
+            try:
+                binds_to = tuple(shlex.split(show_value(unit, "BindsTo")))
+                after = tuple(shlex.split(show_value(unit, "After")))
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"systemd-Lease-Abhängigkeiten sind unklar: {unit}"
+                ) from exc
             if (
                 load_state != "loaded"
                 or not result.get("success")
@@ -2481,8 +3622,24 @@ def _reload_and_verify_recovery_dropins(
                 or dropin_paths.count(own_dropin) != 1
                 or len(marker_lines) != 1
                 or condition_syntax_ambiguous
-                or marker_path_conditions
-                != [f"!{RECOVERY_BOOTBLOCK_MARKER}"]
+                or condition_reset_seen
+                or output.splitlines().count(f"BindsTo={finalizer_unit}") != 1
+                or output.splitlines().count(f"After={finalizer_unit}") != 1
+                or binds_to.count(finalizer_unit) != 1
+                or after.count(finalizer_unit) != 1
+                or effective_conditions.count(
+                    ("ConditionPathExists", marker_condition)
+                )
+                != 1
+                or effective_conditions.count(
+                    ("ConditionPathExists", token_condition)
+                )
+                != 1
+                or own_or_conditions
+                != [
+                    ("ConditionPathExists", marker_condition),
+                    ("ConditionPathExists", token_condition),
+                ]
             ):
                 raise RuntimeError(
                     f"systemd-Readback des Recovery-Bootblocks weicht ab: {unit}"
@@ -2492,15 +3649,34 @@ def _reload_and_verify_recovery_dropins(
                 raise RuntimeError(
                     f"systemd-Readback nach Bootblock-Entfernung ist unklar: {unit}"
                 )
+            binds_to: tuple[str, ...] = ()
+            after: tuple[str, ...] = ()
+            if load_state == "loaded":
+                try:
+                    binds_to = tuple(shlex.split(show_value(unit, "BindsTo")))
+                    after = tuple(shlex.split(show_value(unit, "After")))
+                except ValueError as exc:
+                    raise RuntimeError(
+                        f"systemd-Lease-Abhängigkeiten sind unklar: {unit}"
+                    ) from exc
             if (
                 own_dropin in dropin_paths
                 or marker_lines
+                or finalizer_unit in binds_to
+                or finalizer_unit in after
                 or (load_state == "not-found" and not canonical_not_found)
                 or (
                     "ConditionPathExists",
-                    f"!{RECOVERY_BOOTBLOCK_MARKER}",
+                    marker_condition,
                 )
                 in effective_conditions
+                or (
+                    "ConditionPathExists",
+                    token_condition,
+                )
+                in effective_conditions
+                or condition_reset_seen
+                or condition_syntax_ambiguous
                 or (
                     load_state == "loaded"
                     and (
@@ -2522,6 +3698,7 @@ def _complete_partial_recovery_bootblock(
     """Vollendet nur die transaktionsgebundenen, exakt lesbaren Residual-Inodes."""
 
     identities = _validate_partial_recovery_bootblock_contract(partial)
+    payload = _render_recovery_bootblock_dropin(partial.transaction_id)
     created_directories = list(partial.created_directories)
     absent_directories_seen: set[str] = set()
     systemd_descriptor = _open_directory_nofollow("/etc/systemd/system")
@@ -2562,7 +3739,7 @@ def _complete_partial_recovery_bootblock(
                     metadata = _read_exact_root_file_at(
                         directory_descriptor,
                         RECOVERY_BOOTBLOCK_DROPIN_NAME,
-                        RECOVERY_BOOTBLOCK_DROPIN_PAYLOAD,
+                        payload,
                         0o644,
                         allow_missing=True,
                     )
@@ -2570,13 +3747,13 @@ def _complete_partial_recovery_bootblock(
                         _create_exact_root_file_at(
                             directory_descriptor,
                             RECOVERY_BOOTBLOCK_DROPIN_NAME,
-                            RECOVERY_BOOTBLOCK_DROPIN_PAYLOAD,
+                            payload,
                             0o644,
                         )
                         metadata = _read_exact_root_file_at(
                             directory_descriptor,
                             RECOVERY_BOOTBLOCK_DROPIN_NAME,
-                            RECOVERY_BOOTBLOCK_DROPIN_PAYLOAD,
+                            payload,
                             0o644,
                         )
                     current_identity = (
@@ -2642,7 +3819,7 @@ def _complete_partial_recovery_bootblock(
                     metadata = _read_exact_root_file_at(
                         directory_descriptor,
                         RECOVERY_BOOTBLOCK_DROPIN_NAME,
-                        RECOVERY_BOOTBLOCK_DROPIN_PAYLOAD,
+                        payload,
                         0o644,
                         allow_missing=True,
                     )
@@ -2690,13 +3867,18 @@ def _complete_partial_recovery_bootblock(
 
 def _prepare_persistent_recovery_bootblock(
     transaction_id: str,
+    *,
+    recovery_journal_contract: recovery_journal.RecoveryJournalContract,
 ) -> RecoveryBootblockContract:
     """Installiert rebootfeste Conditions mit erhaltener Partial-Autorität."""
 
     if not hasattr(os, "geteuid") or os.geteuid() != 0:
         raise RuntimeError("Recovery-Bootblock darf ausschließlich Root verwalten")
     _recovery_bootblock_marker_payload(transaction_id)
-    _assert_no_existing_recovery_bootblock()
+    _assert_active_recovery_transaction_namespace(
+        recovery_journal_contract,
+        expected_transaction_id=transaction_id,
+    )
     return _complete_partial_recovery_bootblock(
         RecoveryBootblockPartialContract(
             units=_recovery_bootblock_units(),
@@ -2714,6 +3896,7 @@ def _rebind_owned_recovery_dropins(
     recreate_missing: bool,
 ) -> RecoveryBootblockContract:
     identities = _validate_recovery_bootblock_contract(contract)
+    payload = _render_recovery_bootblock_dropin(contract.transaction_id)
     systemd_descriptor = _open_directory_nofollow("/etc/systemd/system")
     rebound = {}
     missing = set()
@@ -2744,7 +3927,7 @@ def _rebind_owned_recovery_dropins(
                 metadata = _read_exact_root_file_at(
                     directory_descriptor,
                     RECOVERY_BOOTBLOCK_DROPIN_NAME,
-                    RECOVERY_BOOTBLOCK_DROPIN_PAYLOAD,
+                    payload,
                     0o644,
                     allow_missing=True,
                 )
@@ -2823,12 +4006,20 @@ def _arm_persistent_recovery_bootblock(
     ) = None,
     *,
     transaction_id: str | None = None,
+    recovery_journal_contract: recovery_journal.RecoveryJournalContract | None = None,
 ) -> RecoveryBootblockContract:
     if contract is None:
         value = str(transaction_id or "")
         if not RECOVERY_BOOTBLOCK_TRANSACTION_RE.fullmatch(value):
             raise RuntimeError("Recovery-Bootblock fehlt die vorab gebundene Transaktions-ID")
-        prepared = _prepare_persistent_recovery_bootblock(value)
+        if recovery_journal_contract is None:
+            raise RuntimeError(
+                "Recovery-Bootblock fehlt der gebundene Master-Journal-Parent"
+            )
+        prepared = _prepare_persistent_recovery_bootblock(
+            value,
+            recovery_journal_contract=recovery_journal_contract,
+        )
     elif isinstance(contract, RecoveryBootblockPartialContract):
         if transaction_id is not None and contract.transaction_id != transaction_id:
             raise RuntimeError("Recovery-Bootblock-Transaktions-ID driftete")
@@ -2854,7 +4045,11 @@ def _arm_persistent_recovery_bootblock(
         finally:
             os.close(state_descriptor)
         _verify_recovery_bootblock_marker(prepared, expected_present=True)
-        _reload_and_verify_recovery_dropins(prepared.units, expected_present=True)
+        _reload_and_verify_recovery_dropins(
+            prepared.units,
+            expected_present=True,
+            transaction_id=prepared.transaction_id,
+        )
         return prepared
     except Exception as arm_exc:
         # Ab dem ersten eigenen Inode bleibt der Contract erhalten. Ein
@@ -2872,7 +4067,11 @@ def _clear_recovery_bootblock_marker(contract: RecoveryBootblockContract) -> Non
     # erneut beweisen, dass jede inzwischen geladene Unit exakt unsere eine
     # negative Marker-Condition nutzt. Ein beim Fresh-Arm fehlender optionaler
     # Dienst darf hier nicht still als weiterhin abwesend imputiert werden.
-    _reload_and_verify_recovery_dropins(contract.units, expected_present=True)
+    _reload_and_verify_recovery_dropins(
+        contract.units,
+        expected_present=True,
+        transaction_id=contract.transaction_id,
+    )
     marker_payload = _recovery_bootblock_marker_payload(contract.transaction_id)
     state_descriptor = _open_recovery_bootblock_state_directory()
     try:
@@ -2890,7 +4089,11 @@ def _clear_recovery_bootblock_marker(contract: RecoveryBootblockContract) -> Non
     finally:
         os.close(state_descriptor)
     _verify_recovery_bootblock_marker(contract, expected_present=False)
-    _reload_and_verify_recovery_dropins(contract.units, expected_present=True)
+    _reload_and_verify_recovery_dropins(
+        contract.units,
+        expected_present=True,
+        transaction_id=contract.transaction_id,
+    )
 
 
 def _remove_persistent_recovery_bootblock(
@@ -2900,6 +4103,7 @@ def _remove_persistent_recovery_bootblock(
 
     contract = _rebind_owned_recovery_dropins(contract, recreate_missing=False)
     identities = _validate_recovery_bootblock_contract(contract)
+    payload = _render_recovery_bootblock_dropin(contract.transaction_id)
     _verify_recovery_bootblock_marker(contract, expected_present=False)
     systemd_descriptor = _open_directory_nofollow("/etc/systemd/system")
     try:
@@ -2918,7 +4122,7 @@ def _remove_persistent_recovery_bootblock(
                 metadata = _read_exact_root_file_at(
                     directory_descriptor,
                     RECOVERY_BOOTBLOCK_DROPIN_NAME,
-                    RECOVERY_BOOTBLOCK_DROPIN_PAYLOAD,
+                    payload,
                     0o644,
                 )
                 if (metadata.st_dev, metadata.st_ino) != identities[unit]:
@@ -2939,7 +4143,11 @@ def _remove_persistent_recovery_bootblock(
                 pass
     finally:
         os.close(systemd_descriptor)
-    _reload_and_verify_recovery_dropins(contract.units, expected_present=False)
+    _reload_and_verify_recovery_dropins(
+        contract.units,
+        expected_present=False,
+        transaction_id=contract.transaction_id,
+    )
 
 
 def _update_safety_names(transaction_id: str) -> tuple[str, str, str]:
@@ -2952,6 +4160,20 @@ def _update_safety_names(transaction_id: str) -> tuple[str, str, str]:
     runtime = f"{UPDATE_FINALIZER_UNIT_PREFIX}{value}{UPDATE_FINALIZER_RUNTIME_SUFFIX}"
     token = f"/run/{runtime}/{UPDATE_FINALIZER_TOKEN_NAME}"
     return unit, runtime, token
+
+
+def _render_recovery_bootblock_dropin(transaction_id: str) -> bytes:
+    """Erzeugt das rebootfeste statische Gate mit einer flüchtigen Startlease."""
+
+    unit, _runtime, token = _update_safety_names(transaction_id)
+    return (
+        f"{RECOVERY_BOOTBLOCK_DROPIN_MARKER}\n"
+        "[Unit]\n"
+        f"BindsTo={unit}\n"
+        f"After={unit}\n"
+        f"ConditionPathExists=|!{RECOVERY_BOOTBLOCK_MARKER}\n"
+        f"ConditionPathExists=|{token}\n"
+    ).encode("utf-8")
 
 
 def _render_update_safety_dropin(transaction_id: str) -> bytes:
@@ -3114,12 +4336,15 @@ def _update_safety_receipt_record(
     target_tag: str,
     role: str,
     backup_receipt: RecoveryBackupReceipt,
+    apache_preimage: ApacheSecurityPreimage,
     units: tuple[str, ...],
     created_directories: tuple[str, ...],
     dropin_identities: tuple[tuple[str, int, int], ...],
 ) -> dict:
     unit, runtime, token = _update_safety_names(transaction_id)
     payload = _render_update_safety_dropin(transaction_id)
+    if not isinstance(apache_preimage, ApacheSecurityPreimage):
+        raise RuntimeError("Update-Sicherheitsreceipt besitzt kein Apache-Preimage")
     return {
         "schema": UPDATE_SAFETY_RECEIPT_SCHEMA,
         "state": state,
@@ -3135,6 +4360,12 @@ def _update_safety_receipt_record(
             "ino": int(backup_receipt.backup_ino),
             "id": str(backup_receipt.backup_id),
             "manifest_sha256": str(backup_receipt.manifest_sha256),
+        },
+        "apache": {
+            "completion_required": True,
+            "available": apache_preimage.apache_available,
+            "was_active": apache_preimage.apache_was_active,
+            "unit_file_state": apache_preimage.apache_unit_file_state,
         },
         "bootblock": {
             "units": list(units),
@@ -3169,7 +4400,8 @@ def _parse_update_safety_receipt(
         not isinstance(record, dict)
         or _canonical_update_safety_receipt_bytes(record) != payload
         or set(record) != {
-            "schema", "state", "transaction_id", "target", "backup", "bootblock", "finalizer"
+            "schema", "state", "transaction_id", "target", "backup", "apache",
+            "bootblock", "finalizer"
         }
     ):
         raise RuntimeError("Update-Sicherheitsreceipt besitzt kein kanonisches Schema")
@@ -3177,6 +4409,7 @@ def _parse_update_safety_receipt(
     expected_unit, expected_runtime, expected_token = _update_safety_names(transaction_id)
     target = record.get("target")
     backup = record.get("backup")
+    apache = record.get("apache")
     bootblock = record.get("bootblock")
     finalizer = record.get("finalizer")
     if (
@@ -3186,6 +4419,10 @@ def _parse_update_safety_receipt(
         or set(target) != {"commit", "tag", "role"}
         or not isinstance(backup, dict)
         or set(backup) != {"dir", "dev", "ino", "id", "manifest_sha256"}
+        or not isinstance(apache, dict)
+        or set(apache) != {
+            "completion_required", "available", "was_active", "unit_file_state"
+        }
         or not isinstance(bootblock, dict)
         or set(bootblock) != {
             "units", "created_directories", "dropin_payload_sha256", "dropin_identities"
@@ -3210,6 +4447,14 @@ def _parse_update_safety_receipt(
     except (TypeError, ValueError) as exc:
         raise RuntimeError("Update-Sicherheitsreceipt besitzt ungültige Inodes") from exc
     identity_map = {unit: (device, inode) for unit, device, inode in identities}
+    apache_available = apache.get("available")
+    apache_was_active = apache.get("was_active")
+    apache_unit_file_state = str(apache.get("unit_file_state") or "").strip().lower()
+    accepted_apache_unit_states = {
+        "enabled", "enabled-runtime", "disabled", "static", "indirect",
+        "masked", "masked-runtime", "generated", "transient", "alias",
+        "linked", "linked-runtime",
+    }
     expected_payload_hash = hashlib.sha256(
         _render_update_safety_dropin(transaction_id)
     ).hexdigest()
@@ -3230,6 +4475,18 @@ def _parse_update_safety_receipt(
         or int(backup.get("ino", 0)) <= 0
         or not str(backup.get("id") or "")
         or not re.fullmatch(r"[0-9a-f]{64}", str(backup.get("manifest_sha256") or ""))
+        or apache.get("completion_required") is not True
+        or not isinstance(apache_available, bool)
+        or not isinstance(apache_was_active, bool)
+        or apache_was_active and not apache_available
+        or (
+            not apache_available
+            and (apache_was_active or apache_unit_file_state != "absent")
+        )
+        or (
+            apache_available
+            and apache_unit_file_state not in accepted_apache_unit_states
+        )
     ):
         raise RuntimeError("Update-Sicherheitsreceipt driftete vom abgeleiteten Vertrag")
     return UpdateSafetyContract(
@@ -3255,6 +4512,10 @@ def _parse_update_safety_receipt(
         receipt_dev=int(metadata.st_dev),
         receipt_ino=int(metadata.st_ino),
         receipt_sha256=hashlib.sha256(payload).hexdigest(),
+        apache_completion_required=True,
+        apache_available=apache_available,
+        apache_was_active=apache_was_active,
+        apache_unit_file_state=apache_unit_file_state,
     )
 
 
@@ -3348,7 +4609,6 @@ def _replace_update_safety_receipt(
     temporary_name = f".e3dc-update-receipt-{os.getpid()}-{secrets.token_hex(12)}"
     descriptor = None
     replaced = False
-    irreversible_commit_boundary = False
     result: UpdateSafetyContract | None = None
     primary_error: BaseException | None = None
     try:
@@ -3396,10 +4656,6 @@ def _replace_update_safety_receipt(
             or _repo_descriptor_has_unsafe_xattrs(descriptor)
         ):
             raise RuntimeError("Gestagtes Update-Sicherheitsreceipt ist unsicher")
-        # Ab diesem Punkt darf selbst ein scheinbarer rename-Fehler niemals
-        # mehr zum Altpreimage-Restore führen: Ein Signal oder Plattformfehler
-        # kann nach der Namensmutation, aber vor Python-Readback eintreffen.
-        irreversible_commit_boundary = True
         os.replace(
             temporary_name,
             UPDATE_SAFETY_RECEIPT_NAME,
@@ -3462,19 +4718,8 @@ def _replace_update_safety_receipt(
                     close_exc,
                 )
     if primary_error is not None:
-        if irreversible_commit_boundary and not isinstance(
-            primary_error,
-            UpdateSafetyPostCommitError,
-        ):
-            raise UpdateSafetyPostCommitError(
-                "Committed-Receipt-Grenze wurde betreten; Altstand-Rollback ist gesperrt"
-            ) from primary_error
         raise primary_error
     if result is None:
-        if irreversible_commit_boundary:
-            raise UpdateSafetyPostCommitError(
-                "Committed-Receipt-Grenze lieferte keinen gebundenen Abschluss"
-            )
         raise RuntimeError("Receipt-Ersatz lieferte kein Ergebnis")
     return result
 
@@ -3616,6 +4861,12 @@ def _update_safety_record_from_contract(
             "id": contract.backup_id,
             "manifest_sha256": contract.backup_manifest_sha256,
         },
+        "apache": {
+            "completion_required": contract.apache_completion_required,
+            "available": contract.apache_available,
+            "was_active": contract.apache_was_active,
+            "unit_file_state": contract.apache_unit_file_state,
+        },
         "bootblock": {
             "units": list(contract.units),
             "created_directories": list(
@@ -3714,6 +4965,8 @@ def _prepare_update_safety_contract(
     target_tag: str,
     role: str,
     backup_receipt: RecoveryBackupReceipt,
+    apache_preimage: ApacheSecurityPreimage,
+    recovery_journal_contract: recovery_journal.RecoveryJournalContract,
 ) -> UpdateSafetyContract:
     """Installiert 00-Inodes und persistiert danach das pending Receipt."""
 
@@ -3724,7 +4977,10 @@ def _prepare_update_safety_contract(
         or backup_receipt.transaction_id != transaction_id
     ):
         raise RuntimeError("Backup-Receipt ist nicht an die Update-Transaktion gebunden")
-    _assert_no_existing_recovery_bootblock()
+    _assert_active_recovery_transaction_namespace(
+        recovery_journal_contract,
+        expected_transaction_id=transaction_id,
+    )
     units = _recovery_bootblock_units()
     payload = _render_update_safety_dropin(transaction_id)
     identities: dict[str, tuple[int, int]] = {}
@@ -3786,6 +5042,7 @@ def _prepare_update_safety_contract(
             target_tag=target_tag,
             role=role,
             backup_receipt=backup_receipt,
+            apache_preimage=apache_preimage,
             units=units,
             created_directories=tuple(created_directories),
             dropin_identities=tuple(
@@ -4075,7 +5332,7 @@ def _finish_committed_update_safety_cleanup(
     *,
     remove_receipt: bool,
 ) -> UpdateSafetyContract:
-    """Räumt nach Commit nur eigene Marker/00-Inodes; niemals Produktpreimages."""
+    """Räumt eigene Gates und vollendet danach Apache; niemals Altpreimages."""
 
     current = _read_update_safety_contract()
     if current is None or contract.state != "committed" or current != contract:
@@ -4111,6 +5368,11 @@ def _finish_committed_update_safety_cleanup(
         allow_missing=True,
     )
     _reload_and_verify_update_safety_dropins(contract, expected_present=False)
+    # Erst das durable committed Receipt autorisiert den extern erreichbaren
+    # Webabschluss. Der Aufruf bleibt wiederholbar: fehlende eigene Gate-Namen
+    # sind oben zulässig, systemctl start ist idempotent und HTTP wird erneut
+    # ausschließlich über Loopback geprüft.
+    _complete_committed_apache_from_receipt(contract)
     if remove_receipt:
         _remove_exact_update_safety_receipt(contract)
     return contract
@@ -5141,9 +6403,16 @@ def _restore_repo_web_files(repo_dir: str, target_commit: str | None = None) -> 
     return False
 
 
-def _ensure_rsync_available() -> bool:
+def _ensure_rsync_available(*, allow_install: bool = True) -> bool:
     if shutil.which("rsync"):
         return True
+    if not allow_install:
+        print(
+            "  [!] [E3DC-UPD-RSYNC-MISSING] rsync fehlt nach dem Dienststopp. "
+            "Lösung: Altstand nicht manuell verändern; das Update stellt ihn "
+            "wieder her. Danach sudo apt-get install rsync ausführen und erneut starten."
+        )
+        return False
     print("  [->] rsync fehlt, installiere Paket...")
     result = _run_argv(["sudo", "apt-get", "install", "-y", "--", "rsync"], timeout=180)
     if result["success"]:
@@ -5780,7 +7049,7 @@ def _validated_core_apt_packages(policy: dict) -> list[str]:
 
 
 def _validated_release_apt_packages(policy: dict) -> list[str]:
-    """Verbindet alte Core-Pakete mit dem altupdater-neutralen venv-Bootstrap."""
+    """Bindet Release-Pakete plus interne, versionsneutrale Updatewerkzeuge."""
 
     core = _validated_core_apt_packages(policy)
     managed = _validate_policy_packages(
@@ -5788,7 +7057,13 @@ def _validated_release_apt_packages(policy: dict) -> list[str]:
         MANAGED_VENV_APT_POLICY_KEY,
         APPROVED_MANAGED_VENV_APT_PACKAGES,
     )
-    return [*core, *(package for package in managed if package not in core)]
+    packages = [*core, *(package for package in managed if package not in core)]
+    packages.extend(
+        package
+        for package in UPDATE_RUNTIME_APT_PACKAGES
+        if package not in packages
+    )
+    return packages
 
 
 def _verify_worktree_policy(repo_dir: str, verified_policy: dict) -> None:
@@ -7119,6 +8394,55 @@ def _revalidate_recovery_backup_receipt(
     if files != preimages:
         raise RuntimeError("Backup-Receipt weicht vom Repo-Recovery-Preimage ab")
     return preimages, directories
+
+
+def _revalidate_recovery_backup_payload_receipt(
+    receipt: RecoveryBackupReceipt,
+    *,
+    backup_dir: str,
+    repo_dir: str,
+    transaction_id: str,
+) -> dict:
+    """Prüft das Rückfallarchiv vor jeder Git-/Dateimutation ohne HEAD-Annahme."""
+
+    if not isinstance(receipt, RecoveryBackupReceipt):
+        raise RuntimeError("Recovery-Backup-Receipt fehlt vor der Rückfallmutation")
+    root = os.path.abspath(str(repo_dir or ""))
+    backup = os.path.abspath(str(backup_dir or ""))
+    if (
+        root != str(repo_dir)
+        or backup != str(backup_dir)
+        or receipt.backup_dir != backup
+        or receipt.install_root != root
+        or receipt.transaction_id != str(transaction_id or "")
+    ):
+        raise RuntimeError("Recovery-Backup-Receipt widerspricht der Transaktion")
+    descriptor, chain = _open_root_receipt_directory_chain(backup)
+    try:
+        metadata = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if (
+        chain != receipt.backup_path_chain
+        or len(chain) < 2
+        or (metadata.st_dev, metadata.st_ino)
+        != (receipt.backup_dev, receipt.backup_ino)
+        or (chain[-2][1], chain[-2][2])
+        != (receipt.parent_dev, receipt.parent_ino)
+    ):
+        raise RuntimeError("Recovery-Backup- oder Parent-Inode driftete")
+    manifest, manifest_sha256 = _read_stable_verified_backup_manifest(backup)
+    if (
+        manifest_sha256 != receipt.manifest_sha256
+        or _manifest_semantic_sha256(manifest) != receipt.manifest_semantic_sha256
+        or str(manifest.get("backup_id") or "") != receipt.backup_id
+        or str(manifest.get("install_root") or "") != receipt.install_root
+        or _manifest_file_receipt(manifest) != receipt.manifest_files
+        or _privileged_backup_payload_receipts(backup, manifest)
+        != receipt.privileged_backup_files
+    ):
+        raise RuntimeError("Recovery-Backup-Payload weicht vom Root-Receipt ab")
+    return manifest
 
 
 def _guard_recovery_manifest(
@@ -8547,21 +9871,35 @@ def _apply_verified_package_policy(
             )
 
 
-def _installed_apt_packages() -> frozenset[str]:
+def _installed_apt_packages() -> dict[str, str]:
     result = _run_argv(
-        ["dpkg-query", "-W", "-f=${binary:Package}\t${db:Status-Abbrev}\n"],
+        [
+            "dpkg-query",
+            "-W",
+            "-f=${binary:Package}\t${Version}\t${db:Status-Abbrev}\n",
+        ],
         timeout=60,
     )
     if not result["success"]:
         raise RuntimeError("Installierter apt-Paketstand ist nicht lesbar")
-    installed = set()
+    installed: dict[str, str] = {}
     for line in result["stdout"].splitlines():
-        parts = line.split("\t", 1)
-        if len(parts) == 2 and parts[1].startswith("ii "):
-            installed.add(parts[0].strip())
+        parts = line.split("\t", 2)
+        if len(parts) != 3 or not parts[2].startswith("ii "):
+            continue
+        name = parts[0].strip()
+        version = parts[1].strip()
+        if (
+            not name
+            or not version
+            or name in installed
+            or any(char in name + version for char in "\x00\r\n\t")
+        ):
+            raise RuntimeError("Installierter apt-Paketstand ist mehrdeutig")
+        installed[name] = version
     if not installed:
         raise RuntimeError("Installierter apt-Paketstand ist leer oder unplausibel")
-    return frozenset(installed)
+    return installed
 
 
 def _normalize_python_package_name(value: str) -> str:
@@ -8596,6 +9934,1506 @@ def _installed_pip_packages(venv_python: str, install_user: str) -> dict[str, st
     return installed
 
 
+def _apt_binary_names_for_candidates(
+    installed: dict[str, str],
+    candidates,
+) -> tuple[str, ...]:
+    """Löst Debian-Paketnamen eindeutig auf ihren installierten Binärnamen auf."""
+
+    resolved = []
+    for raw_candidate in candidates:
+        candidate = str(raw_candidate or "").strip()
+        if not PACKAGE_NAME_RE.fullmatch(candidate):
+            raise RuntimeError("Offline-APT-Kandidat besitzt einen ungültigen Paketnamen")
+        matches = sorted(
+            name
+            for name in installed
+            if name == candidate or name.partition(":")[0] == candidate
+        )
+        if len(matches) > 1:
+            raise RuntimeError(
+                f"APT-Paket {candidate} ist über mehrere Architekturen mehrdeutig"
+            )
+        if matches and matches[0] not in resolved:
+            resolved.append(matches[0])
+    return tuple(resolved)
+
+
+def _apt_archive_candidate_packages(
+    receipt: OfflinePackageReceipt,
+) -> tuple[str, ...]:
+    """Bindet alle durch die versiegelten DEBs überhaupt mutierbaren Pakete."""
+
+    verify_preparation(receipt)
+    candidates = []
+    for archive in receipt.apt_archives:
+        result = _run_argv(
+            ["/usr/bin/dpkg-deb", "--field", archive, "Package"],
+            timeout=30,
+        )
+        name = str(result.get("stdout") or "").strip()
+        if (
+            not result.get("success")
+            or not PACKAGE_NAME_RE.fullmatch(name)
+            or name in candidates
+        ):
+            raise RuntimeError(
+                f"Offline-DEB besitzt keinen eindeutigen Paketvertrag: {archive}"
+            )
+        candidates.append(name)
+    return tuple(sorted(candidates))
+
+
+def _bind_package_transaction_to_offline_receipt(
+    state: PackageTransactionState,
+    receipt: OfflinePackageReceipt,
+) -> PackageTransactionState:
+    """Erweitert das Preimage nur um manifestgebundene APT-Mutationskandidaten."""
+
+    verified = verify_preparation(receipt)
+    expected_venv_state, _expected_venv_path = _finalizer_venv_contract(state)
+    offline_expected_venv_state = (
+        expected_venv_state
+        if expected_venv_state in {"present", "missing"}
+        else "present"
+    )
+    if (
+        verified.apt_packages != state.apt_requested
+        or verified.pip_packages != state.pip_requested
+        or verified.expected_venv_state != offline_expected_venv_state
+    ):
+        raise RuntimeError("Offline-Paketreceipt widerspricht dem Paket-Preimage")
+    return replace(
+        state,
+        apt_candidate_packages=_apt_archive_candidate_packages(verified),
+    )
+
+
+def _prepared_package_state_mapping(state: PreparedPackageState) -> dict:
+    return {
+        "schema": PREPARED_PACKAGE_STATE_SCHEMA,
+        "transaction_id": state.transaction_id,
+        "offline_receipt_json": state.offline_receipt_json,
+        "offline_receipt_sha256": state.offline_receipt_sha256,
+        "apt_after": [list(item) for item in state.apt_after],
+        "pip_after": [list(item) for item in state.pip_after],
+        "venv_python": state.venv_python,
+        "install_user": state.install_user,
+        "apt_requested": list(state.apt_requested),
+        "pip_requested": list(state.pip_requested),
+    }
+
+
+def _canonical_prepared_package_state_json(mapping: dict) -> str:
+    try:
+        payload = json.dumps(
+            mapping,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise RuntimeError("Vorbereiteter Paketvertrag ist nicht kanonisch") from exc
+    if len(payload.encode("utf-8")) > 512 * 1024 or "\x00" in payload:
+        raise RuntimeError("Vorbereiteter Paketvertrag ist unplausibel groß")
+    return payload
+
+
+def _validate_package_version_rows(raw, *, label: str) -> tuple[tuple[str, str], ...]:
+    if not isinstance(raw, list):
+        raise RuntimeError(f"{label} ist keine Paketversionsliste")
+    rows = []
+    for entry in raw:
+        if not isinstance(entry, list) or len(entry) != 2:
+            raise RuntimeError(f"{label} enthält keinen Paketversionssatz")
+        name, version = entry
+        if (
+            not isinstance(name, str)
+            or not isinstance(version, str)
+            or not name
+            or not version
+            or any(char in name + version for char in "\x00\r\n\t")
+            or any(previous[0] == name for previous in rows)
+        ):
+            raise RuntimeError(f"{label} enthält mehrdeutige Paketmetadaten")
+        rows.append((name, version))
+    if rows != sorted(rows):
+        raise RuntimeError(f"{label} ist nicht kanonisch sortiert")
+    return tuple(rows)
+
+
+def _validate_package_name_list(raw, *, label: str) -> tuple[str, ...]:
+    if not isinstance(raw, list):
+        raise RuntimeError(f"{label} ist keine Paketliste")
+    values = []
+    for item in raw:
+        if (
+            not isinstance(item, str)
+            or not PACKAGE_NAME_RE.fullmatch(item)
+            or item in values
+        ):
+            raise RuntimeError(f"{label} enthält einen ungültigen Paketnamen")
+        values.append(item)
+    return tuple(values)
+
+
+def _serialize_prepared_package_state(state: PreparedPackageState) -> str:
+    if not isinstance(state, PreparedPackageState):
+        raise TypeError("Vorbereiteter Paketvertrag fehlt")
+    receipt_payload = state.offline_receipt_json.encode("utf-8")
+    if hashlib.sha256(receipt_payload).hexdigest() != state.offline_receipt_sha256:
+        raise RuntimeError("Offline-Receipt-Hash widerspricht dem Paketvertrag")
+    receipt = parse_offline_package_receipt(receipt_payload)
+    if (
+        receipt.cache.transaction_id != state.transaction_id
+        or receipt.apt_packages != state.apt_requested
+        or receipt.pip_packages != state.pip_requested
+    ):
+        raise RuntimeError("Offline-Receipt widerspricht dem vorbereiteten Paketvertrag")
+    payload = _canonical_prepared_package_state_json(
+        _prepared_package_state_mapping(state)
+    )
+    if _parse_prepared_package_state(payload) != state:
+        raise RuntimeError("Vorbereiteter Paketvertrag ist nicht roundtrip-stabil")
+    return payload
+
+
+def _parse_prepared_package_state(payload: str) -> PreparedPackageState:
+    if not isinstance(payload, str) or not payload or "\x00" in payload:
+        raise RuntimeError("Vorbereiteter Paketvertrag fehlt oder ist ungültig")
+    try:
+        mapping = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Vorbereiteter Paketvertrag ist kein gültiges JSON") from exc
+    required = {
+        "schema",
+        "transaction_id",
+        "offline_receipt_json",
+        "offline_receipt_sha256",
+        "apt_after",
+        "pip_after",
+        "venv_python",
+        "install_user",
+        "apt_requested",
+        "pip_requested",
+    }
+    if (
+        not isinstance(mapping, dict)
+        or set(mapping) != required
+        or mapping.get("schema") != PREPARED_PACKAGE_STATE_SCHEMA
+        or _canonical_prepared_package_state_json(mapping) != payload
+    ):
+        raise RuntimeError("Vorbereiteter Paketvertrag besitzt kein exaktes Schema")
+    transaction_id = str(mapping.get("transaction_id") or "")
+    receipt_json = mapping.get("offline_receipt_json")
+    receipt_sha256 = str(mapping.get("offline_receipt_sha256") or "")
+    install_user = str(mapping.get("install_user") or "")
+    venv_python = mapping.get("venv_python")
+    if (
+        not RECOVERY_BOOTBLOCK_TRANSACTION_RE.fullmatch(transaction_id)
+        or not isinstance(receipt_json, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", receipt_sha256)
+        or not install_user
+        or any(char in install_user for char in "\x00\r\n\t/")
+        or (
+            venv_python is not None
+            and (
+                not isinstance(venv_python, str)
+                or not os.path.isabs(venv_python)
+                or os.path.abspath(venv_python) != venv_python
+            )
+        )
+    ):
+        raise RuntimeError("Vorbereiteter Paketvertrag enthält ungültige Bindungsfelder")
+    receipt_payload = receipt_json.encode("utf-8")
+    if hashlib.sha256(receipt_payload).hexdigest() != receipt_sha256:
+        raise RuntimeError("Vorbereiteter Paketvertrag verlor seinen Receipt-Hash")
+    receipt = parse_offline_package_receipt(receipt_payload)
+    state = PreparedPackageState(
+        transaction_id=transaction_id,
+        offline_receipt_json=receipt_json,
+        offline_receipt_sha256=receipt_sha256,
+        apt_after=_validate_package_version_rows(
+            mapping["apt_after"],
+            label="apt_after",
+        ),
+        pip_after=_validate_package_version_rows(
+            mapping["pip_after"],
+            label="pip_after",
+        ),
+        venv_python=venv_python,
+        install_user=install_user,
+        apt_requested=_validate_package_name_list(
+            mapping["apt_requested"],
+            label="apt_requested",
+        ),
+        pip_requested=_validate_package_name_list(
+            mapping["pip_requested"],
+            label="pip_requested",
+        ),
+    )
+    if (
+        receipt.cache.transaction_id != transaction_id
+        or receipt.apt_packages != state.apt_requested
+        or receipt.pip_packages != state.pip_requested
+    ):
+        raise RuntimeError("Vorbereiteter Paketvertrag und Offline-Receipt widersprechen sich")
+    return state
+
+
+def _package_transaction_state_mapping(state: PackageTransactionState) -> dict:
+    if not isinstance(state, PackageTransactionState):
+        raise TypeError("Paket-Prestate fehlt")
+    return {
+        "schema": PACKAGE_TRANSACTION_STATE_SCHEMA,
+        "apt_before": [list(item) for item in state.apt_before],
+        "pip_before": [list(item) for item in state.pip_before],
+        "venv_python": state.venv_python,
+        "install_user": state.install_user,
+        "apt_requested": list(state.apt_requested),
+        "pip_requested": list(state.pip_requested),
+        "apt_candidate_packages": list(state.apt_candidate_packages),
+        "venv_path": state.venv_path,
+        "venv_existed": state.venv_existed,
+        "runtime_venv_required": state.runtime_venv_required,
+    }
+
+
+def _parse_package_transaction_state(mapping: object) -> PackageTransactionState:
+    required = {
+        "schema",
+        "apt_before",
+        "pip_before",
+        "venv_python",
+        "install_user",
+        "apt_requested",
+        "pip_requested",
+        "apt_candidate_packages",
+        "venv_path",
+        "venv_existed",
+        "runtime_venv_required",
+    }
+    if (
+        not isinstance(mapping, dict)
+        or set(mapping) != required
+        or mapping.get("schema") != PACKAGE_TRANSACTION_STATE_SCHEMA
+    ):
+        raise RuntimeError("Paket-Prestate besitzt kein exaktes Schema")
+    install_user = str(mapping.get("install_user") or "")
+    venv_python = mapping.get("venv_python")
+    venv_path = mapping.get("venv_path")
+    venv_existed = mapping.get("venv_existed")
+    runtime_required = mapping.get("runtime_venv_required")
+    for value, label in (
+        (venv_python, "venv_python"),
+        (venv_path, "venv_path"),
+    ):
+        if value is not None and (
+            not isinstance(value, str)
+            or not os.path.isabs(value)
+            or os.path.abspath(value) != value
+            or any(char in value for char in "\x00\r\n\t")
+            or (label == "venv_path" and os.path.realpath(value) != value)
+        ):
+            raise RuntimeError(f"Paket-Prestate besitzt keinen kanonischen {label}")
+    if (
+        not install_user
+        or any(char in install_user for char in "\x00\r\n\t/")
+        or not isinstance(venv_existed, bool)
+        or not isinstance(runtime_required, bool)
+    ):
+        raise RuntimeError("Paket-Prestate besitzt ungültige Bindungsfelder")
+    state = PackageTransactionState(
+        apt_before=_validate_package_version_rows(
+            mapping["apt_before"],
+            label="apt_before",
+        ),
+        pip_before=_validate_package_version_rows(
+            mapping["pip_before"],
+            label="pip_before",
+        ),
+        venv_python=venv_python,
+        install_user=install_user,
+        apt_requested=_validate_package_name_list(
+            mapping["apt_requested"],
+            label="apt_requested",
+        ),
+        pip_requested=_validate_package_name_list(
+            mapping["pip_requested"],
+            label="pip_requested",
+        ),
+        apt_candidate_packages=_validate_package_name_list(
+            mapping["apt_candidate_packages"],
+            label="apt_candidate_packages",
+        ),
+        venv_path=venv_path,
+        venv_existed=venv_existed,
+        runtime_venv_required=runtime_required,
+    )
+    venv_contract_needed = bool(state.pip_requested or state.runtime_venv_required)
+    if (
+        (not state.apt_requested and (state.apt_before or state.apt_candidate_packages))
+        or (not state.pip_requested and state.pip_before)
+        or (state.runtime_venv_required and not state.venv_existed)
+        or (
+            state.venv_existed
+            and venv_contract_needed
+            and (not state.venv_python or not state.venv_path)
+        )
+        or (
+            not state.venv_existed
+            and (state.venv_python is not None or (state.pip_requested and not state.venv_path))
+        )
+        or (
+            not venv_contract_needed
+            and (state.venv_python is not None or state.venv_path is not None)
+        )
+        or (
+            state.venv_python is not None
+            and state.venv_path is not None
+            and os.path.dirname(os.path.dirname(state.venv_python)) != state.venv_path
+        )
+        or _package_transaction_state_mapping(state) != mapping
+    ):
+        raise RuntimeError("Paket-Prestate widerspricht seinem Rücklaufvertrag")
+    return state
+
+
+def _canonical_prepared_package_receipt_payload(payload: dict) -> bytes:
+    try:
+        return json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("ascii")
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise RuntimeError("Paket-Receipt-Payload ist nicht kanonisch") from exc
+
+
+def _prepared_package_receipt_record(
+    *,
+    state: str,
+    transaction_id: str,
+    install_root: str,
+    full_backup_id: str,
+    package_transaction: PackageTransactionState,
+    prepared_state: PreparedPackageState | None,
+    target_commit: str,
+    target_tag: str,
+    role: str,
+    apache_available: bool,
+    apache_was_active: bool,
+    apache_unit_file_state: str,
+    static_recovery_contract_json: str,
+) -> dict:
+    transaction = str(transaction_id or "")
+    root = os.path.abspath(str(install_root or ""))
+    backup_id = str(full_backup_id or "")
+    unit_state = str(apache_unit_file_state or "").strip().lower()
+    accepted_apache_unit_states = {
+        "enabled", "enabled-runtime", "disabled", "static", "indirect",
+        "masked", "masked-runtime", "generated", "transient", "alias",
+        "linked", "linked-runtime",
+    }
+    if (
+        state not in {"applying", "prepared", "committed"}
+        or not RECOVERY_BOOTBLOCK_TRANSACTION_RE.fullmatch(transaction)
+        or not os.path.isabs(root)
+        or root != str(install_root or "")
+        or os.path.realpath(root) != root
+        or not re.fullmatch(r"[0-9a-f]{64}", backup_id)
+        or (state == "applying") != (prepared_state is None)
+        or not isinstance(apache_available, bool)
+        or not isinstance(apache_was_active, bool)
+        or (apache_was_active and not apache_available)
+        or (
+            not apache_available
+            and (apache_was_active or unit_state != "absent")
+        )
+        or (apache_available and unit_state not in accepted_apache_unit_states)
+    ):
+        raise RuntimeError("Paket-Receipt besitzt keinen vollständigen Transaktionsanker")
+    prestate_mapping = _package_transaction_state_mapping(package_transaction)
+    if _parse_package_transaction_state(prestate_mapping) != package_transaction:
+        raise RuntimeError("Paket-Prestate ist vor der Persistierung nicht roundtrip-stabil")
+    if prepared_state is not None:
+        prepared_state = _parse_prepared_package_state(
+            _serialize_prepared_package_state(prepared_state)
+        )
+        if (
+            prepared_state.transaction_id != transaction
+            or prepared_state.install_user != package_transaction.install_user
+            or prepared_state.apt_requested != package_transaction.apt_requested
+            or prepared_state.pip_requested != package_transaction.pip_requested
+        ):
+            raise RuntimeError("Paket-Poststate widerspricht seinem Prestate")
+    payload = {
+        "prestate": prestate_mapping,
+        "poststate": (
+            _prepared_package_state_mapping(prepared_state)
+            if prepared_state is not None
+            else None
+        ),
+    }
+    payload_sha256 = hashlib.sha256(
+        _canonical_prepared_package_receipt_payload(payload)
+    ).hexdigest()
+    commit = _validate_full_commit(target_commit)
+    tag = _normalize_release_tag(target_tag)
+    bound_role = str(role or "").strip().lower()
+    if bound_role not in VALID_HA_ROLES:
+        raise RuntimeError("Paket-Receipt besitzt keine gültige Zielrolle")
+    static_contract = str(static_recovery_contract_json or "")
+    if static_contract:
+        _parse_recovery_bootblock_contract(static_contract)
+    return {
+        "schema": PREPARED_PACKAGE_RECEIPT_SCHEMA,
+        "state": state,
+        "transaction_id": transaction,
+        "install_root": root,
+        "full_backup_id": backup_id,
+        "payload_sha256": payload_sha256,
+        "payload": payload,
+        "completion": {
+            "target_commit": commit,
+            "target_tag": tag,
+            "role": bound_role,
+            "apache": {
+                "completion_required": True,
+                "available": apache_available,
+                "was_active": apache_was_active,
+                "unit_file_state": unit_state,
+            },
+            "static_recovery_contract_json": static_contract,
+        },
+    }
+
+
+def _canonical_prepared_package_receipt_bytes(record: dict) -> bytes:
+    payload = _canonical_prepared_package_receipt_payload(record) + b"\n"
+    if len(payload) > PREPARED_PACKAGE_RECEIPT_MAX_BYTES:
+        raise RuntimeError("Paket-Receipt ist unplausibel groß")
+    return payload
+
+
+def _parse_package_completion_record(
+    completion: object,
+    *,
+    transaction_id: str,
+) -> tuple[str, str, str, bool, bool, str, str]:
+    if not isinstance(completion, dict) or set(completion) != {
+        "target_commit", "target_tag", "role", "apache",
+        "static_recovery_contract_json",
+    }:
+        raise RuntimeError("Paket-Receipt besitzt keinen Abschlussvertrag")
+    apache = completion.get("apache")
+    if not isinstance(apache, dict) or set(apache) != {
+        "completion_required", "available", "was_active", "unit_file_state"
+    }:
+        raise RuntimeError("Paket-Receipt besitzt keinen Apache-Abschlussvertrag")
+    commit = _validate_full_commit(str(completion.get("target_commit") or ""))
+    tag = _normalize_release_tag(str(completion.get("target_tag") or ""))
+    role = str(completion.get("role") or "").strip().lower()
+    available = apache.get("available")
+    was_active = apache.get("was_active")
+    unit_state = str(apache.get("unit_file_state") or "").strip().lower()
+    accepted_states = {
+        "enabled", "enabled-runtime", "disabled", "static", "indirect",
+        "masked", "masked-runtime", "generated", "transient", "alias",
+        "linked", "linked-runtime",
+    }
+    static_json = str(completion.get("static_recovery_contract_json") or "")
+    if (
+        role not in VALID_HA_ROLES
+        or apache.get("completion_required") is not True
+        or not isinstance(available, bool)
+        or not isinstance(was_active, bool)
+        or (was_active and not available)
+        or (not available and (was_active or unit_state != "absent"))
+        or (available and unit_state not in accepted_states)
+    ):
+        raise RuntimeError("Paket-Receipt besitzt ungültige Abschlussfelder")
+    if static_json:
+        static_contract = _parse_recovery_bootblock_contract(static_json)
+        if static_contract.transaction_id != transaction_id:
+            raise RuntimeError("Paket-Receipt und statischer Bootblock widersprechen sich")
+    return commit, tag, role, available, was_active, unit_state, static_json
+
+
+def _parse_package_recovery_receipt(
+    payload: bytes,
+    metadata: os.stat_result,
+) -> PackageRecoveryReceipt:
+    """Parst den Rücklauf-Prestate ohne flüchtigen Offline-Cache-Readback."""
+
+    try:
+        record = json.loads(payload.decode("ascii"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Paket-Recovery-Receipt ist nicht kanonisch lesbar") from exc
+    required = {
+        "schema",
+        "state",
+        "transaction_id",
+        "install_root",
+        "full_backup_id",
+        "payload_sha256",
+        "payload",
+        "completion",
+    }
+    state_payload = record.get("payload") if isinstance(record, dict) else None
+    state = str(record.get("state") or "") if isinstance(record, dict) else ""
+    transaction_id = (
+        str(record.get("transaction_id") or "") if isinstance(record, dict) else ""
+    )
+    install_root = (
+        str(record.get("install_root") or "") if isinstance(record, dict) else ""
+    )
+    full_backup_id = (
+        str(record.get("full_backup_id") or "") if isinstance(record, dict) else ""
+    )
+    payload_sha256 = (
+        str(record.get("payload_sha256") or "") if isinstance(record, dict) else ""
+    )
+    poststate = state_payload.get("poststate") if isinstance(state_payload, dict) else None
+    prepared_keys = {
+        "schema",
+        "transaction_id",
+        "offline_receipt_json",
+        "offline_receipt_sha256",
+        "apt_after",
+        "pip_after",
+        "venv_python",
+        "install_user",
+        "apt_requested",
+        "pip_requested",
+    }
+    if (
+        not isinstance(record, dict)
+        or set(record) != required
+        or record.get("schema") != PREPARED_PACKAGE_RECEIPT_SCHEMA
+        or _canonical_prepared_package_receipt_bytes(record) != payload
+        or state not in {"applying", "prepared", "committed"}
+        or not RECOVERY_BOOTBLOCK_TRANSACTION_RE.fullmatch(transaction_id)
+        or not os.path.isabs(install_root)
+        or os.path.abspath(install_root) != install_root
+        or os.path.realpath(install_root) != install_root
+        or not re.fullmatch(r"[0-9a-f]{64}", full_backup_id)
+        or not re.fullmatch(r"[0-9a-f]{64}", payload_sha256)
+        or not isinstance(state_payload, dict)
+        or set(state_payload) != {"prestate", "poststate"}
+        or hashlib.sha256(
+            _canonical_prepared_package_receipt_payload(state_payload)
+        ).hexdigest()
+        != payload_sha256
+        or (state == "applying" and poststate is not None)
+        or (
+            state in {"prepared", "committed"}
+            and (
+                not isinstance(poststate, dict)
+                or set(poststate) != prepared_keys
+                or poststate.get("schema") != PREPARED_PACKAGE_STATE_SCHEMA
+            )
+        )
+    ):
+        raise RuntimeError("Paket-Recovery-Receipt besitzt ungültige Bindungsfelder")
+    (
+        target_commit,
+        target_tag,
+        role,
+        apache_available,
+        apache_was_active,
+        apache_unit_file_state,
+        static_recovery_contract_json,
+    ) = _parse_package_completion_record(
+        record.get("completion"),
+        transaction_id=transaction_id,
+    )
+    return PackageRecoveryReceipt(
+        state=state,
+        transaction_id=transaction_id,
+        install_root=install_root,
+        full_backup_id=full_backup_id,
+        payload_sha256=payload_sha256,
+        package_transaction=_parse_package_transaction_state(
+            state_payload["prestate"]
+        ),
+        receipt_path=os.path.join(
+            RECOVERY_BOOTBLOCK_STATE_DIR,
+            PREPARED_PACKAGE_RECEIPT_NAME,
+        ),
+        receipt_dev=int(metadata.st_dev),
+        receipt_ino=int(metadata.st_ino),
+        receipt_sha256=hashlib.sha256(payload).hexdigest(),
+        target_commit=target_commit,
+        target_tag=target_tag,
+        role=role,
+        apache_completion_required=True,
+        apache_available=apache_available,
+        apache_was_active=apache_was_active,
+        apache_unit_file_state=apache_unit_file_state,
+        static_recovery_contract_json=static_recovery_contract_json,
+    )
+
+
+def _parse_prepared_package_receipt(
+    payload: bytes,
+    metadata: os.stat_result,
+) -> PreparedPackageReceipt:
+    recovery = _parse_package_recovery_receipt(payload, metadata)
+    try:
+        record = json.loads(payload.decode("ascii"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Paket-Receipt ist nicht kanonisch lesbar") from exc
+    required = {
+        "schema",
+        "state",
+        "transaction_id",
+        "install_root",
+        "full_backup_id",
+        "payload_sha256",
+        "payload",
+        "completion",
+    }
+    if (
+        not isinstance(record, dict)
+        or set(record) != required
+        or record.get("schema") != PREPARED_PACKAGE_RECEIPT_SCHEMA
+        or _canonical_prepared_package_receipt_bytes(record) != payload
+    ):
+        raise RuntimeError("Paket-Receipt besitzt kein exaktes kanonisches Schema")
+    state = str(record.get("state") or "")
+    transaction_id = str(record.get("transaction_id") or "")
+    install_root = str(record.get("install_root") or "")
+    full_backup_id = str(record.get("full_backup_id") or "")
+    payload_sha256 = str(record.get("payload_sha256") or "")
+    state_payload = record.get("payload")
+    if (
+        state not in {"applying", "prepared", "committed"}
+        or not RECOVERY_BOOTBLOCK_TRANSACTION_RE.fullmatch(transaction_id)
+        or not os.path.isabs(install_root)
+        or os.path.abspath(install_root) != install_root
+        or os.path.realpath(install_root) != install_root
+        or not re.fullmatch(r"[0-9a-f]{64}", full_backup_id)
+        or not re.fullmatch(r"[0-9a-f]{64}", payload_sha256)
+        or not isinstance(state_payload, dict)
+        or set(state_payload) != {"prestate", "poststate"}
+        or hashlib.sha256(
+            _canonical_prepared_package_receipt_payload(state_payload)
+        ).hexdigest()
+        != payload_sha256
+    ):
+        raise RuntimeError("Paket-Receipt besitzt ungültige Bindungsfelder")
+    package_transaction = _parse_package_transaction_state(
+        state_payload["prestate"]
+    )
+    poststate_mapping = state_payload["poststate"]
+    prepared_state = None
+    if poststate_mapping is not None:
+        prepared_state = _parse_prepared_package_state(
+            _canonical_prepared_package_state_json(poststate_mapping)
+        )
+    if (
+        (state == "applying") != (prepared_state is None)
+        or (
+            prepared_state is not None
+            and (
+                prepared_state.transaction_id != transaction_id
+                or prepared_state.install_user != package_transaction.install_user
+                or prepared_state.apt_requested != package_transaction.apt_requested
+                or prepared_state.pip_requested != package_transaction.pip_requested
+            )
+        )
+    ):
+        raise RuntimeError("Paket-Receipt verlor seinen Pre-/Postzustandsvertrag")
+    if package_transaction != recovery.package_transaction:
+        raise RuntimeError("Paket-Receipt-Prestate driftete zwischen den Parsern")
+    return PreparedPackageReceipt(
+        state=state,
+        transaction_id=transaction_id,
+        install_root=install_root,
+        full_backup_id=full_backup_id,
+        payload_sha256=payload_sha256,
+        package_transaction=package_transaction,
+        prepared_state=prepared_state,
+        receipt_path=os.path.join(
+            RECOVERY_BOOTBLOCK_STATE_DIR,
+            PREPARED_PACKAGE_RECEIPT_NAME,
+        ),
+        receipt_dev=int(metadata.st_dev),
+        receipt_ino=int(metadata.st_ino),
+        receipt_sha256=hashlib.sha256(payload).hexdigest(),
+        target_commit=recovery.target_commit,
+        target_tag=recovery.target_tag,
+        role=recovery.role,
+        apache_completion_required=recovery.apache_completion_required,
+        apache_available=recovery.apache_available,
+        apache_was_active=recovery.apache_was_active,
+        apache_unit_file_state=recovery.apache_unit_file_state,
+        static_recovery_contract_json=recovery.static_recovery_contract_json,
+    )
+
+
+def _read_prepared_package_receipt(
+    *,
+    allow_missing: bool = False,
+) -> PreparedPackageReceipt | None:
+    path = os.path.join(
+        RECOVERY_BOOTBLOCK_STATE_DIR,
+        PREPARED_PACKAGE_RECEIPT_NAME,
+    )
+    if not os.path.lexists(path):
+        if allow_missing:
+            return None
+        raise RuntimeError("Paket-Receipt fehlt")
+    state_descriptor = _open_recovery_bootblock_state_directory()
+    try:
+        readback = _read_bound_root_file_at(
+            state_descriptor,
+            PREPARED_PACKAGE_RECEIPT_NAME,
+            maximum=PREPARED_PACKAGE_RECEIPT_MAX_BYTES,
+            mode=0o600,
+            allow_missing=allow_missing,
+        )
+        if readback is None:
+            return None
+        return _parse_prepared_package_receipt(*readback)
+    finally:
+        os.close(state_descriptor)
+
+
+def _read_package_recovery_receipt(
+    *,
+    allow_missing: bool = False,
+) -> PackageRecoveryReceipt | None:
+    """Liest nur den dauerhaften Prestate; /run-Cache darf bereits fehlen."""
+
+    path = os.path.join(
+        RECOVERY_BOOTBLOCK_STATE_DIR,
+        PREPARED_PACKAGE_RECEIPT_NAME,
+    )
+    if not os.path.lexists(path):
+        if allow_missing:
+            return None
+        raise RuntimeError("Paket-Recovery-Receipt fehlt")
+    state_descriptor = _open_recovery_bootblock_state_directory()
+    try:
+        readback = _read_bound_root_file_at(
+            state_descriptor,
+            PREPARED_PACKAGE_RECEIPT_NAME,
+            maximum=PREPARED_PACKAGE_RECEIPT_MAX_BYTES,
+            mode=0o600,
+            allow_missing=allow_missing,
+        )
+        if readback is None:
+            return None
+        return _parse_package_recovery_receipt(*readback)
+    finally:
+        os.close(state_descriptor)
+
+
+def _require_prepared_package_receipt_binding(
+    *,
+    expected_state: str,
+    expected_transaction_id: str | None,
+    expected_install_root: str,
+    expected_full_backup_id: str,
+    expected_receipt_sha256: str,
+    expected_receipt_dev: int,
+    expected_receipt_ino: int,
+) -> PreparedPackageReceipt:
+    expected_root = os.path.abspath(str(expected_install_root or ""))
+    if (
+        expected_state not in {"applying", "prepared", "committed"}
+        or (
+            expected_transaction_id is not None
+            and not RECOVERY_BOOTBLOCK_TRANSACTION_RE.fullmatch(
+                str(expected_transaction_id or "")
+            )
+        )
+        or not os.path.isabs(expected_root)
+        or expected_root != str(expected_install_root or "")
+        or os.path.realpath(expected_root) != expected_root
+        or not re.fullmatch(r"[0-9a-f]{64}", str(expected_full_backup_id or ""))
+        or not re.fullmatch(r"[0-9a-f]{64}", str(expected_receipt_sha256 or ""))
+        or isinstance(expected_receipt_dev, bool)
+        or not isinstance(expected_receipt_dev, int)
+        or expected_receipt_dev < 0
+        or isinstance(expected_receipt_ino, bool)
+        or not isinstance(expected_receipt_ino, int)
+        or expected_receipt_ino <= 0
+    ):
+        raise RuntimeError("Paket-Receipt-Handoff besitzt ungültige Metadaten")
+    current = _read_prepared_package_receipt()
+    if (
+        current is None
+        or current.state != expected_state
+        or (
+            expected_transaction_id is not None
+            and current.transaction_id != str(expected_transaction_id or "")
+        )
+        or current.install_root != expected_root
+        or current.full_backup_id != str(expected_full_backup_id or "")
+        or current.receipt_sha256 != str(expected_receipt_sha256 or "")
+        or current.receipt_dev != expected_receipt_dev
+        or current.receipt_ino != expected_receipt_ino
+    ):
+        raise RuntimeError("Paket-Receipt oder sein Inode driftete vom Handoff")
+    return current
+
+
+def _validate_prepared_package_receipt(
+    contract: PreparedPackageReceipt,
+    *,
+    expected_state: str | None = None,
+) -> PreparedPackageReceipt:
+    if not isinstance(contract, PreparedPackageReceipt):
+        raise RuntimeError("Paket-Receipt besitzt den falschen Typ")
+    state = expected_state or contract.state
+    current = _require_prepared_package_receipt_binding(
+        expected_state=state,
+        expected_transaction_id=contract.transaction_id,
+        expected_install_root=contract.install_root,
+        expected_full_backup_id=contract.full_backup_id,
+        expected_receipt_sha256=contract.receipt_sha256,
+        expected_receipt_dev=contract.receipt_dev,
+        expected_receipt_ino=contract.receipt_ino,
+    )
+    if current != contract:
+        raise RuntimeError("Paket-Receipt-Payload driftete vom gebundenen Vertrag")
+    return current
+
+
+def _same_prepared_package_transaction_shape(
+    first: PreparedPackageReceipt,
+    second: PreparedPackageReceipt,
+) -> bool:
+    if not isinstance(first, PreparedPackageReceipt) or not isinstance(
+        second,
+        PreparedPackageReceipt,
+    ):
+        return False
+    ignored = {"state", "receipt_dev", "receipt_ino", "receipt_sha256"}
+    return all(
+        getattr(first, name) == getattr(second, name)
+        for name in PreparedPackageReceipt.__dataclass_fields__
+        if name not in ignored
+    )
+
+
+def _same_package_receipt_recovery_anchor(
+    first: PreparedPackageReceipt,
+    second: PreparedPackageReceipt,
+) -> bool:
+    """Vergleicht die unveränderlichen Anker über applying -> prepared."""
+
+    if not isinstance(first, PreparedPackageReceipt) or not isinstance(
+        second,
+        PreparedPackageReceipt,
+    ):
+        return False
+    fields = (
+        "transaction_id",
+        "install_root",
+        "full_backup_id",
+        "package_transaction",
+        "receipt_path",
+        "target_commit",
+        "target_tag",
+        "role",
+        "apache_completion_required",
+        "apache_available",
+        "apache_was_active",
+        "apache_unit_file_state",
+        "static_recovery_contract_json",
+    )
+    return all(getattr(first, name) == getattr(second, name) for name in fields)
+
+
+def _package_receipt_transition_error(
+    *,
+    original_error: Exception,
+    applying_receipt: PreparedPackageReceipt,
+    prepared_receipt: PreparedPackageReceipt | None,
+    replace_attempted: bool,
+    replace_completed: bool,
+) -> PreparedPackageReceiptTransitionError:
+    """Wählt ausschließlich den exakten alten oder vorgestagten Receipt-Inode."""
+
+    if not replace_attempted:
+        raise RuntimeError(
+            "Paket-Receipt-Fehler trat vor der atomaren Replace-Grenze auf"
+        ) from original_error
+    selected = applying_receipt
+    if replace_completed:
+        if prepared_receipt is None:
+            raise RuntimeError(
+                "Paket-Receipt-Replace endete ohne gebundenen prepared-Inode"
+            ) from original_error
+        selected = prepared_receipt
+    else:
+        # os.replace kann bei einer Signal-/Wrappergrenze bereits gewirkt haben,
+        # obwohl der Aufruf einen Fehler meldet. Nur ein exakter Readback eines
+        # der beiden gebundenen Inodes löst diese Mehrdeutigkeit auf.
+        try:
+            persisted = _read_prepared_package_receipt()
+        except Exception as readback_error:
+            raise RuntimeError(
+                "Paket-Receipt-Replace blieb ohne eindeutigen Inode-Readback"
+            ) from readback_error
+        if persisted == applying_receipt:
+            selected = applying_receipt
+        elif prepared_receipt is not None and persisted == prepared_receipt:
+            selected = prepared_receipt
+        else:
+            raise RuntimeError(
+                "Paket-Receipt-Replace ergab weder den alten noch den neuen Vertrag"
+            ) from original_error
+    if (
+        selected.state not in {"applying", "prepared"}
+        or applying_receipt.state != "applying"
+        or not _same_package_receipt_recovery_anchor(
+            applying_receipt,
+            selected,
+        )
+    ):
+        raise RuntimeError(
+            "Paket-Receipt-Transition verlor Transaktion, Installationspfad, "
+            "Backup oder Paket-Prestate"
+        ) from original_error
+    return PreparedPackageReceiptTransitionError(
+        f"Paket-Receipt-Transition blieb nach {selected.state!r} unvollständig: "
+        f"{original_error}",
+        selected,
+    )
+
+
+def _write_applying_prepared_package_receipt(
+    *,
+    transaction_id: str,
+    install_root: str,
+    full_backup_id: str,
+    package_transaction: PackageTransactionState,
+    target_commit: str,
+    target_tag: str,
+    role: str,
+    apache_preimage: ApacheSecurityPreimage,
+    static_recovery_contract_json: str,
+) -> PreparedPackageReceipt:
+    record = _prepared_package_receipt_record(
+        state="applying",
+        transaction_id=transaction_id,
+        install_root=install_root,
+        full_backup_id=full_backup_id,
+        package_transaction=package_transaction,
+        prepared_state=None,
+        target_commit=target_commit,
+        target_tag=target_tag,
+        role=role,
+        apache_available=apache_preimage.apache_available,
+        apache_was_active=apache_preimage.apache_was_active,
+        apache_unit_file_state=apache_preimage.apache_unit_file_state,
+        static_recovery_contract_json=static_recovery_contract_json,
+    )
+    payload = _canonical_prepared_package_receipt_bytes(record)
+    state_descriptor = _open_recovery_bootblock_state_directory()
+    try:
+        metadata = _create_owned_exact_root_file_at(
+            state_descriptor,
+            PREPARED_PACKAGE_RECEIPT_NAME,
+            payload,
+            0o600,
+        )
+        os.fsync(state_descriptor)
+        return _parse_prepared_package_receipt(payload, metadata)
+    finally:
+        os.close(state_descriptor)
+
+
+def _replace_prepared_package_receipt(
+    contract: PreparedPackageReceipt,
+    prepared_state: PreparedPackageState,
+    *,
+    expected_state: str = "applying",
+    target_state: str = "prepared",
+) -> PreparedPackageReceipt:
+    if (expected_state, target_state) not in {
+        ("applying", "prepared"),
+        ("prepared", "committed"),
+    }:
+        raise RuntimeError("Paket-Receipt-Ersatz besitzt keinen zulässigen Übergang")
+    current = _validate_prepared_package_receipt(
+        contract,
+        expected_state=expected_state,
+    )
+    record = _prepared_package_receipt_record(
+        state=target_state,
+        transaction_id=current.transaction_id,
+        install_root=current.install_root,
+        full_backup_id=current.full_backup_id,
+        package_transaction=current.package_transaction,
+        prepared_state=prepared_state,
+        target_commit=current.target_commit,
+        target_tag=current.target_tag,
+        role=current.role,
+        apache_available=current.apache_available,
+        apache_was_active=current.apache_was_active,
+        apache_unit_file_state=current.apache_unit_file_state,
+        static_recovery_contract_json=current.static_recovery_contract_json,
+    )
+    payload = _canonical_prepared_package_receipt_bytes(record)
+    state_descriptor = _open_recovery_bootblock_state_directory()
+    temporary_name = f".e3dc-package-receipt-{os.getpid()}-{secrets.token_hex(12)}"
+    descriptor = None
+    replaced = False
+    replace_attempted = False
+    prepared_transition_receipt = None
+    try:
+        rebound = _read_bound_root_file_at(
+            state_descriptor,
+            PREPARED_PACKAGE_RECEIPT_NAME,
+            maximum=PREPARED_PACKAGE_RECEIPT_MAX_BYTES,
+            mode=0o600,
+        )
+        if rebound is None or (rebound[1].st_dev, rebound[1].st_ino) != (
+            current.receipt_dev,
+            current.receipt_ino,
+        ):
+            raise RuntimeError("Paket-Receipt driftete vor dem vorbereiteten Ersatz")
+        descriptor = os.open(
+            temporary_name,
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=state_descriptor,
+        )
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise RuntimeError("Vorbereitetes Paket-Receipt blieb unvollständig")
+            view = view[written:]
+        os.fchown(descriptor, 0, 0)
+        os.fchmod(descriptor, 0o600)
+        os.fsync(descriptor)
+        staged = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(staged.st_mode)
+            or staged.st_nlink != 1
+            or staged.st_uid != 0
+            or staged.st_gid != 0
+            or stat.S_IMODE(staged.st_mode) != 0o600
+            or staged.st_size != len(payload)
+            or _repo_descriptor_has_unsafe_xattrs(descriptor)
+        ):
+            raise RuntimeError("Gestagtes Paket-Receipt ist unsicher")
+        if (expected_state, target_state) == ("applying", "prepared"):
+            prepared_transition_receipt = _parse_prepared_package_receipt(
+                payload,
+                staged,
+            )
+            if (
+                prepared_transition_receipt.state != "prepared"
+                or prepared_transition_receipt.prepared_state != prepared_state
+                or not _same_package_receipt_recovery_anchor(
+                    current,
+                    prepared_transition_receipt,
+                )
+            ):
+                raise RuntimeError(
+                    "Gestagtes Paket-Receipt verlor seinen Recovery-Anker"
+                )
+        replace_attempted = True
+        os.replace(
+            temporary_name,
+            PREPARED_PACKAGE_RECEIPT_NAME,
+            src_dir_fd=state_descriptor,
+            dst_dir_fd=state_descriptor,
+        )
+        replaced = True
+        os.fsync(state_descriptor)
+        rebound = _read_bound_root_file_at(
+            state_descriptor,
+            PREPARED_PACKAGE_RECEIPT_NAME,
+            maximum=PREPARED_PACKAGE_RECEIPT_MAX_BYTES,
+            mode=0o600,
+        )
+        if rebound is None or rebound[0] != payload or (
+            rebound[1].st_dev,
+            rebound[1].st_ino,
+        ) != (staged.st_dev, staged.st_ino):
+            raise RuntimeError("Vorbereitetes Paket-Receipt driftete nach dem Ersatz")
+        return _parse_prepared_package_receipt(*rebound)
+    except Exception as exc:
+        if (
+            (expected_state, target_state) == ("applying", "prepared")
+            and replace_attempted
+        ):
+            raise _package_receipt_transition_error(
+                original_error=exc,
+                applying_receipt=current,
+                prepared_receipt=prepared_transition_receipt,
+                replace_attempted=replace_attempted,
+                replace_completed=replaced,
+            ) from exc
+        raise
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if not replaced:
+            try:
+                os.unlink(temporary_name, dir_fd=state_descriptor)
+            except FileNotFoundError:
+                pass
+        os.close(state_descriptor)
+
+
+def _commit_prepared_package_receipt(
+    contract: PreparedPackageReceipt,
+) -> PreparedPackageReceipt:
+    if contract.prepared_state is None:
+        raise RuntimeError("Paket-Receipt besitzt vor Commit keinen Postzustand")
+    return _replace_prepared_package_receipt(
+        contract,
+        contract.prepared_state,
+        expected_state="prepared",
+        target_state="committed",
+    )
+
+
+def _package_transaction_from_receipt(
+    contract: PreparedPackageReceipt | PackageRecoveryReceipt,
+) -> PackageTransactionState:
+    if not isinstance(contract, (PreparedPackageReceipt, PackageRecoveryReceipt)):
+        raise RuntimeError("Paket-Recovery-Receipt besitzt den falschen Typ")
+    current = _read_package_recovery_receipt()
+    if (
+        current is None
+        or current.state != contract.state
+        or current.transaction_id != contract.transaction_id
+        or current.install_root != contract.install_root
+        or current.full_backup_id != contract.full_backup_id
+        or current.payload_sha256 != contract.payload_sha256
+        or current.package_transaction != contract.package_transaction
+        or current.receipt_path != contract.receipt_path
+        or current.receipt_dev != contract.receipt_dev
+        or current.receipt_ino != contract.receipt_ino
+        or current.receipt_sha256 != contract.receipt_sha256
+        or current.target_commit != contract.target_commit
+        or current.target_tag != contract.target_tag
+        or current.role != contract.role
+        or current.apache_completion_required
+        != contract.apache_completion_required
+        or current.apache_available != contract.apache_available
+        or current.apache_was_active != contract.apache_was_active
+        or current.apache_unit_file_state != contract.apache_unit_file_state
+        or current.static_recovery_contract_json
+        != contract.static_recovery_contract_json
+    ):
+        raise RuntimeError("Paket-Recovery-Receipt oder sein Inode driftete")
+    return current.package_transaction
+
+
+def _remove_exact_prepared_package_receipt(
+    contract: PreparedPackageReceipt | PackageRecoveryReceipt,
+) -> None:
+    _package_transaction_from_receipt(contract)
+    state_descriptor = _open_recovery_bootblock_state_directory()
+    try:
+        rebound = _read_bound_root_file_at(
+            state_descriptor,
+            PREPARED_PACKAGE_RECEIPT_NAME,
+            maximum=PREPARED_PACKAGE_RECEIPT_MAX_BYTES,
+            mode=0o600,
+        )
+        if rebound is None or (rebound[1].st_dev, rebound[1].st_ino) != (
+            contract.receipt_dev,
+            contract.receipt_ino,
+        ):
+            raise RuntimeError("Fremdes Paket-Receipt wird nicht entfernt")
+        os.unlink(PREPARED_PACKAGE_RECEIPT_NAME, dir_fd=state_descriptor)
+        os.fsync(state_descriptor)
+    finally:
+        os.close(state_descriptor)
+    if os.path.lexists(contract.receipt_path):
+        raise RuntimeError("Paket-Receipt blieb nach unlink vorhanden")
+
+
+def _cleanup_confirmed_prepared_package_receipt(
+    contract: PreparedPackageReceipt | PackageRecoveryReceipt | None,
+    *,
+    terminal_state: str,
+) -> bool:
+    """Entfernt nach bestätigtem Erfolg/Rücklauf nur den gebundenen Inode."""
+
+    if contract is None:
+        return True
+    try:
+        _remove_exact_prepared_package_receipt(contract)
+        return True
+    except Exception as exc:
+        print(f"[HINWEIS] E3DC-UPD-PACKAGE-RECEIPT-CLEANUP: {exc}")
+        print(
+            f"Lösung: Der {terminal_state} ist bestätigt. "
+            f"{contract.receipt_path} nicht löschen oder verändern; prüfe "
+            "sudo journalctl -u 'e3dc-*update*' --no-pager, bevor Du ein "
+            "weiteres Update startest."
+        )
+        update_logger.critical(
+            "Gebundenes Paket-Receipt blieb nach %s erhalten: %s",
+            terminal_state,
+            exc,
+        )
+        return False
+
+
+def _bind_package_apply_failure_recovery(
+    *,
+    error: Exception,
+    receipt: PreparedPackageReceipt | PackageRecoveryReceipt | None,
+    packages_mutated: bool,
+    expected_transaction_id: str,
+    expected_install_root: str,
+    expected_full_backup_id: str,
+    expected_package_transaction: PackageTransactionState,
+) -> tuple[
+    PreparedPackageReceipt | PackageRecoveryReceipt | None,
+    PackageTransactionState | None,
+]:
+    """Bindet den Prestate auch bei einem Fehler nach erfolgreichem Replace."""
+
+    if not packages_mutated:
+        return receipt, None
+    candidate = receipt
+    if isinstance(error, PreparedPackageReceiptTransitionError):
+        candidate = error.recovery_receipt
+        package_transaction = error.package_transaction
+    else:
+        if candidate is None:
+            raise RuntimeError("Paket-Recovery-Receipt fehlt nach Paketmutation")
+        package_transaction = _package_transaction_from_receipt(candidate)
+    if (
+        not isinstance(candidate, (PreparedPackageReceipt, PackageRecoveryReceipt))
+        or candidate.transaction_id != expected_transaction_id
+        or candidate.install_root != expected_install_root
+        or candidate.full_backup_id != expected_full_backup_id
+        or candidate.package_transaction != expected_package_transaction
+        or package_transaction != expected_package_transaction
+    ):
+        raise RuntimeError("Paket-Recovery-Prestate widerspricht der Update-Transaktion")
+    return candidate, package_transaction
+
+
+def _capture_prepared_package_state(
+    state: PackageTransactionState,
+    receipt: OfflinePackageReceipt,
+) -> PreparedPackageState:
+    """Beweist den rein additiven Paket-Postzustand unmittelbar nach Anwendung."""
+
+    apt_after_all = _installed_apt_packages() if state.apt_requested else {}
+    apt_before = dict(state.apt_before)
+    missing_before = sorted(set(apt_before) - set(apt_after_all))
+    changed_before = sorted(
+        name
+        for name, version in apt_before.items()
+        if apt_after_all.get(name) != version
+    )
+    candidate_binary_names = set(
+        _apt_binary_names_for_candidates(
+            apt_after_all,
+            state.apt_candidate_packages,
+        )
+    )
+    introduced = set(apt_after_all) - set(apt_before)
+    unexpected_introduced = sorted(introduced - candidate_binary_names)
+    missing_requested = sorted(
+        package
+        for package in state.apt_requested
+        if not _apt_binary_names_for_candidates(apt_after_all, (package,))
+    )
+    if missing_before or changed_before or unexpected_introduced or missing_requested:
+        raise RuntimeError(
+            "APT-Postzustand verletzt den rein additiven --no-upgrade-Vertrag"
+        )
+
+    venv_python = state.venv_python
+    pip_after = {}
+    if state.pip_requested:
+        venv_python = _find_venv_python(state.install_user)
+        if not venv_python:
+            raise RuntimeError("Vorbereitetes venv ist nach Offline-Installation nicht gebunden")
+        pip_after = _installed_pip_packages(venv_python, state.install_user)
+        requested_normalized = {
+            _normalize_python_package_name(name)
+            for name in state.pip_requested
+        }
+        if not requested_normalized.issubset(pip_after):
+            raise RuntimeError("Vorbereitete Python-Pakete fehlen im gebundenen venv")
+        if state.venv_existed:
+            pip_before = dict(state.pip_before)
+            changed = sorted(
+                name
+                for name, version in pip_before.items()
+                if pip_after.get(name) != version
+            )
+            introduced_pip = set(pip_after) - set(pip_before)
+            if changed or not introduced_pip.issubset(requested_normalized):
+                raise RuntimeError(
+                    "venv-Postzustand verletzt den rein additiven --no-deps-Vertrag"
+                )
+
+    if not _ensure_rsync_available(allow_install=False):
+        raise RuntimeError("rsync fehlt trotz vorbereiteter Offline-Pakettransaktion")
+    receipt_json = serialize_offline_package_receipt(receipt).decode("utf-8")
+    return PreparedPackageState(
+        transaction_id=receipt.cache.transaction_id,
+        offline_receipt_json=receipt_json,
+        offline_receipt_sha256=hashlib.sha256(receipt_json.encode("utf-8")).hexdigest(),
+        apt_after=tuple(
+            sorted(
+                (name, apt_after_all[name])
+                for name in candidate_binary_names
+            )
+        ),
+        pip_after=tuple(sorted(pip_after.items())),
+        venv_python=venv_python,
+        install_user=state.install_user,
+        apt_requested=state.apt_requested,
+        pip_requested=state.pip_requested,
+    )
+
+
+def _apply_prepared_offline_package_policy(
+    state: PackageTransactionState,
+    receipt: OfflinePackageReceipt,
+) -> tuple[PackageTransactionState, PreparedPackageState]:
+    """Wendet nach dem Vollbackup nur versiegelte lokale Paketartefakte an."""
+
+    bound_state = _bind_package_transaction_to_offline_receipt(state, receipt)
+    apt_commands = build_offline_install_commands(
+        receipt,
+        include_pip=False,
+    )
+    if apt_commands.apt_install_argv is not None:
+        result = _run_argv(list(apt_commands.apt_install_argv), timeout=600)
+        if not result.get("success"):
+            raise RuntimeError(
+                "Offline-APT-Installation fehlgeschlagen: "
+                + _combined_process_diagnostics(result, maximum=1600)
+            )
+
+    venv_python = bound_state.venv_python
+    if bound_state.pip_requested:
+        if not bound_state.venv_existed:
+            venv_python = _create_release_venv(
+                bound_state.install_user,
+                str(bound_state.venv_path or ""),
+            )
+        if not venv_python:
+            raise RuntimeError("Gebundener venv-Interpreter fehlt vor Offline-pip")
+        pip_commands = build_offline_install_commands(
+            receipt,
+            venv_python=venv_python,
+        )
+        if pip_commands.pip_install_argv is None:
+            raise RuntimeError("Offline-pip-Kommando fehlt trotz Paketpolicy")
+        result = _run_argv(
+            [
+                "sudo",
+                "-H",
+                "-u",
+                bound_state.install_user,
+                *pip_commands.pip_install_argv,
+            ],
+            timeout=600,
+        )
+        if not result.get("success"):
+            raise RuntimeError(
+                "Offline-venv-pip-Installation fehlgeschlagen: "
+                + _combined_process_diagnostics(result, maximum=1600)
+            )
+        require_bound_venv_runtime(
+            install_user=bound_state.install_user,
+            venv_path=str(bound_state.venv_path or ""),
+        )
+
+    prepared = _capture_prepared_package_state(bound_state, receipt)
+    _serialize_prepared_package_state(prepared)
+    return bound_state, prepared
+
+
+def _verify_prepared_package_policy_applied(
+    policy: dict,
+    install_user: str,
+    *,
+    expected_transaction_id: str,
+    prepared: PreparedPackageState,
+) -> PreparedPackageState:
+    """Finalizer-Readback ohne Paketmutation und ohne Netzwerkzugriff."""
+
+    if not isinstance(prepared, PreparedPackageState):
+        raise RuntimeError("Vorbereiteter Paket-Postzustand fehlt")
+    prepared = _parse_prepared_package_state(
+        _serialize_prepared_package_state(prepared)
+    )
+    if (
+        prepared.transaction_id != expected_transaction_id
+        or prepared.install_user != install_user
+        or prepared.apt_requested != tuple(_validated_release_apt_packages(policy))
+        or prepared.pip_requested != tuple(_validated_venv_pip_packages(policy))
+    ):
+        raise RuntimeError("Vorbereiteter Paketvertrag widerspricht Zielpolicy oder Transaktion")
+    apt_now = _installed_apt_packages() if prepared.apt_requested else {}
+    missing_requested = [
+        package
+        for package in prepared.apt_requested
+        if not _apt_binary_names_for_candidates(apt_now, (package,))
+    ]
+    if missing_requested or any(
+        apt_now.get(name) != version for name, version in prepared.apt_after
+    ):
+        raise RuntimeError("APT-Postzustand driftete vor dem Target-Finalizer")
+    if prepared.pip_requested:
+        actual_venv = _find_venv_python(install_user)
+        if actual_venv != prepared.venv_python:
+            raise RuntimeError("venv-Interpreter driftete vor dem Target-Finalizer")
+        if _installed_pip_packages(actual_venv, install_user) != dict(prepared.pip_after):
+            raise RuntimeError("venv-Paketstand driftete vor dem Target-Finalizer")
+    if not _ensure_rsync_available(allow_install=False):
+        raise RuntimeError("rsync fehlt vor dem Target-Finalizer")
+    return prepared
+
+
+def _cleanup_terminal_offline_package_receipt(
+    receipt: OfflinePackageReceipt | None,
+    *,
+    terminal_state: str,
+) -> bool:
+    """Räumt nur nach bewiesenem Erfolg/Rücklauf auf; Fehler bleiben nicht fatal."""
+
+    if receipt is None:
+        return True
+    try:
+        cleanup_offline_package_artifacts(receipt)
+        return True
+    except Exception as exc:
+        print(f"[HINWEIS] E3DC-UPD-OFFLINE-CLEANUP: {exc}")
+        print(
+            f"Lösung: Der {terminal_state} ist bereits verifiziert. Den Cache "
+            f"{receipt.cache.root} nicht rekursiv oder mit Wildcards löschen; "
+            "prüfe vor dem nächsten Update das vollständige Journal."
+        )
+        update_logger.warning(
+            "Offline-Paketartefakte blieben nach %s erhalten: %s",
+            terminal_state,
+            exc,
+        )
+        return False
+
+
 def _capture_package_transaction(
     policy: dict,
     install_user: str,
@@ -8607,7 +11445,7 @@ def _capture_package_transaction(
         raise RuntimeError("Laufzeit-venv-Vertrag ist nicht boolesch")
     apt_requested = tuple(_validated_release_apt_packages(policy))
     pip_requested = tuple(_validated_venv_pip_packages(policy))
-    apt_before = _installed_apt_packages() if apt_requested else frozenset()
+    apt_before = _installed_apt_packages() if apt_requested else {}
     venv_python = (
         _find_venv_python(install_user)
         if pip_requested or require_runtime_venv
@@ -8634,7 +11472,7 @@ def _capture_package_transaction(
         else {}
     )
     return PackageTransactionState(
-        apt_before=apt_before,
+        apt_before=tuple(sorted(apt_before.items())),
         pip_before=tuple(sorted(pip_before.items())),
         venv_python=venv_python,
         install_user=str(install_user),
@@ -8758,7 +11596,7 @@ def _remove_transaction_created_venv(state: PackageTransactionState) -> None:
 
 
 def _restore_package_transaction(state: PackageTransactionState) -> None:
-    """Remove only packages introduced by this no-upgrade/no-deps transaction."""
+    """Entfernt ausschließlich von dieser Offline-Transaktion eingeführte Pakete."""
 
     if state.pip_requested:
         if not state.venv_existed:
@@ -8770,6 +11608,16 @@ def _restore_package_transaction(state: PackageTransactionState) -> None:
             after = _installed_pip_packages(state.venv_python, state.install_user)
             introduced = sorted(set(after) - set(before))
             changed = sorted(name for name in set(after) & set(before) if after[name] != before[name])
+            allowed_introduced = {
+                _normalize_python_package_name(name)
+                for name in state.pip_requested
+            }
+            unexpected = sorted(set(introduced) - allowed_introduced)
+            if changed or unexpected:
+                raise RuntimeError(
+                    "venv-Paketstand driftete außerhalb des rein additiven "
+                    "Offline-Vertrags; automatischer Rücklauf bleibt fail-closed"
+                )
             if introduced:
                 result = _run_argv(
                     [
@@ -8781,29 +11629,50 @@ def _restore_package_transaction(state: PackageTransactionState) -> None:
                 )
                 if not result["success"]:
                     raise RuntimeError("Neu installierte venv-Pakete konnten nicht entfernt werden")
-            if changed:
-                pins = ["{}=={}".format(name, before[name]) for name in changed]
-                result = _run_argv(
-                    [
-                        "sudo", "-H", "-u", state.install_user,
-                        state.venv_python, "-m", "pip", "install", "--quiet", "--no-deps", "--",
-                        *pins,
-                    ],
-                    timeout=180,
-                )
-                if not result["success"]:
-                    raise RuntimeError("Geaenderte venv-Paketversionen konnten nicht restauriert werden")
             if _installed_pip_packages(state.venv_python, state.install_user) != before:
-                raise RuntimeError("venv-Paketstand stimmt nach Ruecklauf nicht exakt")
+                raise RuntimeError("venv-Paketstand stimmt nach Rücklauf nicht exakt")
     if state.apt_requested:
         apt_after = _installed_apt_packages()
-        introduced = sorted(apt_after - state.apt_before)
+        before = dict(state.apt_before)
+        changed = sorted(
+            name
+            for name, version in before.items()
+            if name in apt_after and apt_after[name] != version
+        )
+        missing = sorted(set(before) - set(apt_after))
+        candidates = set(
+            _apt_binary_names_for_candidates(
+                apt_after,
+                state.apt_candidate_packages,
+            )
+        )
+        introduced = sorted(
+            name for name in candidates if name not in before and name in apt_after
+        )
+        if changed or missing:
+            raise RuntimeError(
+                "apt-Paketstand driftete außerhalb des --no-upgrade-Vertrags; "
+                "automatischer Rücklauf bleibt fail-closed"
+            )
         if introduced:
-            result = _run_argv(["sudo", "apt-get", "remove", "-y", "--", *introduced], timeout=300)
+            result = _run_argv(
+                [
+                    "/usr/bin/apt-get",
+                    "--no-download",
+                    "remove",
+                    "-y",
+                    "--",
+                    *introduced,
+                ],
+                timeout=300,
+            )
             if not result["success"]:
-                raise RuntimeError("Neu installierte apt-Pakete konnten nicht zurueckgerollt werden")
-        if _installed_apt_packages() != state.apt_before:
-            raise RuntimeError("apt-Paketstand stimmt nach Ruecklauf nicht exakt")
+                raise RuntimeError("Neu installierte apt-Pakete konnten nicht zurückgerollt werden")
+        restored = _installed_apt_packages()
+        if any(restored.get(name) != version for name, version in before.items()):
+            raise RuntimeError("apt-Paketstand stimmt nach Rücklauf nicht exakt")
+        if any(name in restored for name in introduced):
+            raise RuntimeError("Transaktionseigene apt-Pakete blieben nach Rücklauf installiert")
 
 
 def _release_version_tuple(version: str) -> tuple:
@@ -8851,14 +11720,33 @@ def _validate_bootstrap_install_path(path: str) -> str:
             raise ValueError(f'Symlink im Bootstrap-Installationspfad: {current}')
     if not stat.S_ISDIR(os.lstat(candidate).st_mode):
         raise ValueError('Bootstrap-Installationspfad existiert nicht.')
-    markers = (
-        os.path.join(candidate, 'Installer'),
-        os.path.join(candidate, 'installer_main.py'),
-        os.path.join(candidate, 'e3dc.config.txt'),
-        os.path.join(candidate, 'E3DC-Control'),
+    bootstrap_root = str(os.environ.get("E3DC_BOOTSTRAP_ROOT") or "").strip()
+    runner_root = str(
+        os.environ.get("E3DC_BOOTSTRAP_RUNNER_ROOT") or ""
+    ).strip()
+    independent_runner = bool(
+        bootstrap_root
+        and runner_root
+        and os.path.realpath(bootstrap_root) == os.path.realpath(candidate)
+        and os.path.realpath(runner_root) != os.path.realpath(candidate)
+        and os.path.isfile(os.path.join(runner_root, "installer_main.py"))
+        and not os.path.islink(os.path.join(runner_root, "installer_main.py"))
     )
-    if not any(os.path.lexists(marker) and not stat.S_ISLNK(os.lstat(marker).st_mode) for marker in markers):
-        raise ValueError('Bootstrap-Ziel ist keine erkennbare E3DC-Control Installation.')
+    if not independent_runner:
+        markers = (
+            os.path.join(candidate, 'Installer'),
+            os.path.join(candidate, 'installer_main.py'),
+            os.path.join(candidate, 'e3dc.config.txt'),
+            os.path.join(candidate, 'E3DC-Control'),
+        )
+        if not any(
+            os.path.lexists(marker)
+            and not stat.S_ISLNK(os.lstat(marker).st_mode)
+            for marker in markers
+        ):
+            raise ValueError(
+                'Bootstrap-Ziel ist keine erkennbare E3DC-Control Installation.'
+            )
     return candidate
 
 
@@ -8944,6 +11832,146 @@ def _normalize_restart_services(services) -> list:
     return normalized
 
 
+def _read_stopped_unit_contract(service: str) -> dict[str, object]:
+    """Liest den vollständigen Stopzustand einer Unit in genau einem Readback."""
+
+    unit = _unit_name(service)
+    diagnostic_hint = (
+        f"Prüfen: sudo systemctl status --no-pager {unit}; "
+        f"sudo journalctl -u {unit} --no-pager -n 100"
+    )
+    properties = ("LoadState", "ActiveState", "SubState", "MainPID")
+    result = _run_argv(
+        [
+            "systemctl",
+            "show",
+            "--no-pager",
+            *(f"--property={name}" for name in properties),
+            unit,
+        ],
+        timeout=10,
+    )
+    stdout = str(result.get("stdout") or "")
+    if (
+        not result.get("success")
+        or result.get("timed_out")
+        or int(result.get("returncode", -1)) != 0
+        or str(result.get("stderr") or "")
+        or "\x00" in stdout
+    ):
+        raise RuntimeError(
+            f"Stopzustand von {unit} ist nicht lesbar: "
+            + _command_result_diagnostic(result)
+            + f". {diagnostic_hint}"
+        )
+    values: dict[str, str] = {}
+    for raw_line in stdout.splitlines():
+        if not raw_line:
+            continue
+        key, separator, value = raw_line.partition("=")
+        if (
+            separator != "="
+            or key not in properties
+            or key in values
+            or value != value.strip()
+        ):
+            raise RuntimeError(
+                f"Stopzustand von {unit} ist widersprüchlich. {diagnostic_hint}"
+            )
+        values[key] = value
+    if set(values) != set(properties):
+        raise RuntimeError(
+            f"Stopzustand von {unit} ist unvollständig. {diagnostic_hint}"
+        )
+    try:
+        main_pid = int(values["MainPID"])
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"MainPID von {unit} ist ungültig. {diagnostic_hint}"
+        ) from exc
+    if main_pid < 0:
+        raise RuntimeError(
+            f"MainPID von {unit} ist ungültig. {diagnostic_hint}"
+        )
+    return {
+        "unit": unit,
+        "load_state": values["LoadState"].lower(),
+        "active_state": values["ActiveState"].lower(),
+        "sub_state": values["SubState"].lower(),
+        "main_pid": main_pid,
+    }
+
+
+def _normalize_stopped_unit_contract(
+    service: str,
+    *,
+    allow_failed_reset: bool = True,
+) -> dict[str, object]:
+    """Setzt ausschließlich stale ``failed/PID0`` auf ``inactive/dead`` zurück."""
+
+    state = _read_stopped_unit_contract(service)
+    diagnostic_hint = (
+        f"Prüfen: sudo systemctl status --no-pager {state['unit']}; "
+        f"sudo journalctl -u {state['unit']} --no-pager -n 100"
+    )
+
+    def state_text(current: dict[str, object]) -> str:
+        return (
+            f"{current['load_state']}/{current['active_state']}/"
+            f"{current['sub_state']}/MainPID={current['main_pid']}"
+        )
+
+    absent = (
+        state["load_state"] == "not-found"
+        and state["active_state"] == "inactive"
+        and state["sub_state"] == "dead"
+        and state["main_pid"] == 0
+    )
+    if absent:
+        return state
+    if state["active_state"] == "failed":
+        if state["main_pid"] != 0:
+            raise RuntimeError(
+                f"{state['unit']} besitzt nach Stop einen unsicheren Zustand "
+                f"({state_text(state)}); failed mit MainPID>0 wird nicht "
+                f"zurückgesetzt. {diagnostic_hint}"
+            )
+        if not allow_failed_reset:
+            raise RuntimeError(
+                f"{state['unit']} driftete nach dem bestätigten Stop erneut "
+                f"in failed ({state_text(state)}); ein zweites reset-failed "
+                f"ist nicht zulässig. {diagnostic_hint}"
+            )
+        reset = _run_argv(
+            ["sudo", "systemctl", "reset-failed", str(state["unit"])],
+            timeout=10,
+        )
+        if (
+            not reset.get("success")
+            or reset.get("timed_out")
+            or int(reset.get("returncode", -1)) != 0
+            or str(reset.get("stderr") or "")
+        ):
+            raise RuntimeError(
+                f"Failed-Zustand von {state['unit']} ({state_text(state)}) "
+                "konnte nicht zurückgesetzt werden: "
+                + _command_result_diagnostic(reset)
+                + f". {diagnostic_hint}"
+            )
+        state = _read_stopped_unit_contract(service)
+    if not (
+        state["load_state"] in {"loaded", "masked", "not-found"}
+        and state["active_state"] == "inactive"
+        and state["sub_state"] == "dead"
+        and state["main_pid"] == 0
+    ):
+        raise RuntimeError(
+            f"{state['unit']} besitzt keinen sicheren Stopzustand "
+            f"({state_text(state)}). {diagnostic_hint}"
+        )
+    return state
+
+
 def _stop_v4_services_impl(services=None):
     """Stop every catalogued writer/integration plus watchdog and legacy core."""
     print('\n[->] Stoppe E3DC-Control-Dienste fuer Release-Wechsel...')
@@ -8959,9 +11987,9 @@ def _stop_v4_services_impl(services=None):
     stop_order = tuple(dict.fromkeys(("piguard", *all_names, "e3dc")))
     # Hardware-Safety: PiGuard und danach jeder katalogisierte Writer erhalten
     # den Stop aus dem bereits geladenen systemd-Zustand, bevor die potenziell
-    # langsameren Show-Inventarisierungen beginnen. Ein fehlgeschlagenes
-    # Stop-Kommando ist nur dann unschädlich, wenn der anschließende strikte
-    # Readback exakt inactive/failed oder canonical not-found beweist.
+    # langsameren Show-Readbacks beginnen. Unmittelbar nach diesem Stop-Burst
+    # wird jede Unit kanonisch gebunden; failed/PID0 wird dabei höchstens einmal
+    # zurückgesetzt und muss danach frisch inactive/dead/MainPID=0 liefern.
     stop_results = {}
     for srv in stop_order:
         stop_results[srv] = _run_argv(
@@ -8970,38 +11998,18 @@ def _stop_v4_services_impl(services=None):
         )
     for srv in stop_order:
         stopped = stop_results[srv]
-        active = _run_argv(
-            ["systemctl", "is-active", _unit_name(srv)],
-            timeout=10,
-        )
-        activity_text = str(active.get("stdout") or "").strip().lower()
-        if _systemd_activity_readback_matches(
-            active,
-            should_be_active=False,
-        ):
-            print(f"  [OK] {srv}")
-            continue
         try:
-            activity = (
-                _capture_piguard_transition_activity()
-                if _unit_name(srv) == PIGUARD_UNIT
-                else _capture_transition_unit_activity(srv)
-            )
+            stopped_state = _normalize_stopped_unit_contract(srv)
         except Exception as exc:
             errors.append(
-                f"{_unit_name(srv)} ist nach Sofortstop unklar: {exc}; "
-                f"Stop={_command_result_diagnostic(stopped)}, "
-                f"is-active={_command_result_diagnostic(active)}"
+                f"{_unit_name(srv)} ist nach Sofortstop nicht sicher gebunden: "
+                f"{exc}; Stop={_command_result_diagnostic(stopped)}"
             )
             continue
-        if activity == "absent":
+        if stopped_state["load_state"] == "not-found":
             print(f"  [OK] {srv} (nicht installiert)")
             continue
-        errors.append(
-            f"{srv} hat nach Sofortstop keinen beweisbaren inaktiven Status "
-            f"({activity_text or activity or 'unlesbar'}; "
-            f"Stop={_command_result_diagnostic(stopped)})"
-        )
+        print(f"  [OK] {srv}")
     try:
         install_user = get_install_user()
     except Exception as exc:
@@ -9033,34 +12041,22 @@ def _stop_v4_services_impl(services=None):
             errors.append(f"Legacy-Screen-Session fuer {screen_user} ist weiterhin aktiv")
     # Stop-Abhängigkeiten und Watchdogs können eine zuvor gestoppte Unit
     # erneut aktivieren. Erst dieser zweite vollständige Pass beweist die
-    # globale Aktorruhe; transient/unknown/unlesbar bleibt fail-closed.
+    # globale Aktorruhe. Ein erneutes failed ist Drift und darf nicht durch
+    # ein zweites reset-failed verdeckt werden.
     for srv in stop_order:
         try:
-            show_activity = (
-                _capture_piguard_transition_activity()
-                if _unit_name(srv) == PIGUARD_UNIT
-                else _capture_transition_unit_activity(srv)
+            stopped_state = _normalize_stopped_unit_contract(
+                srv,
+                allow_failed_reset=False,
             )
         except Exception as exc:
             errors.append(
-                f"{_unit_name(srv)} ist im globalen Stop-Endgate unklar: {exc}"
+                f"{_unit_name(srv)} ist im globalen Stop-Endgate nicht sicher "
+                f"gebunden: {exc}"
             )
             continue
-        if show_activity == "absent":
+        if stopped_state["load_state"] == "not-found":
             continue
-        active = _run_argv(
-            ["systemctl", "is-active", _unit_name(srv)],
-            timeout=10,
-        )
-        activity = str(active.get("stdout") or "").strip().lower()
-        if not _systemd_activity_readback_matches(
-            active,
-            should_be_active=False,
-        ):
-            errors.append(
-                f"{srv} ist im globalen Stop-Endgate nicht beweisbar inaktiv "
-                f"({activity or 'unlesbar'})"
-            )
     if errors:
         for error in errors:
             print(f'  [!] {error}')
@@ -9298,7 +12294,9 @@ def _read_finalizer_service_properties(unit: str) -> dict[str, str]:
     return values
 
 
-def _assert_managed_finalizer_service(contract: UpdateSafetyContract) -> dict[str, str]:
+def _assert_managed_finalizer_service(
+    contract: UpdateSafetyContract | RecoveryBootblockContract,
+) -> dict[str, str]:
     """Bindet PID, Invocation, cgroup und sämtliche sicherheitsrelevanten Properties."""
 
     invocation = str(os.environ.get("E3DC_UPDATE_FINALIZER_INVOCATION_ID") or "")
@@ -9428,15 +12426,26 @@ def _verify_watchdog_pause_fresh(reason: str) -> None:
 
 
 def _create_update_safety_start_token(
-    contract: UpdateSafetyContract,
+    contract: UpdateSafetyContract | RecoveryBootblockContract,
     *,
     repo_dir: str,
 ) -> None:
     """Öffnet den Startpfad erst im gebundenen laufenden Finalizer-Service."""
 
-    _validate_update_safety_contract(contract, expected_state="pending")
-    _verify_update_safety_marker(contract, expected_present=True)
-    _reload_and_verify_update_safety_dropins(contract, expected_present=True)
+    if isinstance(contract, UpdateSafetyContract):
+        _validate_update_safety_contract(contract, expected_state="pending")
+        _verify_update_safety_marker(contract, expected_present=True)
+        _reload_and_verify_update_safety_dropins(contract, expected_present=True)
+    elif isinstance(contract, RecoveryBootblockContract):
+        _validate_recovery_bootblock_contract(contract)
+        _verify_recovery_bootblock_marker(contract, expected_present=True)
+        _reload_and_verify_recovery_dropins(
+            contract.units,
+            expected_present=True,
+            transaction_id=contract.transaction_id,
+        )
+    else:
+        raise RuntimeError("Startlease besitzt keinen unterstützten Bootblockvertrag")
     _assert_managed_finalizer_service(contract)
     _assert_strict_update_writer_quiescence(
         repo_dir=repo_dir,
@@ -9493,7 +12502,7 @@ def _require_exact_pending_update_safety_for_recovery(
 
 
 def _read_managed_finalizer_terminal_snapshot(
-    contract: UpdateSafetyContract,
+    contract: UpdateSafetyContract | RecoveryBootblockContract,
 ) -> tuple[str, ...]:
     """Bindet einen einzelnen vollständigen Lease-/cgroup-/Prozess-Endzustand."""
 
@@ -9600,7 +12609,7 @@ def _read_managed_finalizer_terminal_snapshot(
 
 
 def _wait_managed_finalizer_inactive(
-    contract: UpdateSafetyContract,
+    contract: UpdateSafetyContract | RecoveryBootblockContract,
     *,
     timeout_s: int = 30,
     repo_dir: str | None = None,
@@ -9645,7 +12654,7 @@ def _wait_managed_finalizer_inactive(
 
 
 def _kill_managed_finalizer_and_quiesce(
-    contract: UpdateSafetyContract,
+    contract: UpdateSafetyContract | RecoveryBootblockContract,
     *,
     repo_dir: str,
     require_pending_contract: bool = True,
@@ -9716,6 +12725,8 @@ def _post_update_healthcheck(
     *,
     legacy_recovery: bool = False,
     projected_piguard: bool = False,
+    check_web: bool = True,
+    check_http: bool = True,
 ) -> bool:
     """Kleiner Gesundheitstest nach Update oder Release-Rueckfall."""
     print('\n[->] Gesundheitstest...')
@@ -9728,13 +12739,16 @@ def _post_update_healthcheck(
     except Exception as exc:
         print(f"  [!] HA-/Shadow-Zustand nicht beweisbar: {exc}")
         return False
-    if not os.path.exists('/var/www/html/index.php'):
-        errors.append('/var/www/html/index.php fehlt')
+    if not isinstance(check_web, bool):
+        errors.append("Web-Gesundheitsvertrag ist nicht boolesch")
+    elif check_web:
+        if not os.path.exists('/var/www/html/index.php'):
+            errors.append('/var/www/html/index.php fehlt')
 
-    if shutil.which('php') and os.path.exists('/var/www/html/index.php'):
-        lint = run_command('php -l /var/www/html/index.php', timeout=15)
-        if not lint['success']:
-            errors.append('PHP-Lint index.php fehlgeschlagen: ' + (lint['stderr'] or lint['stdout']).strip())
+        if shutil.which('php') and os.path.exists('/var/www/html/index.php'):
+            lint = run_command('php -l /var/www/html/index.php', timeout=15)
+            if not lint['success']:
+                errors.append('PHP-Lint index.php fehlgeschlagen: ' + (lint['stderr'] or lint['stdout']).strip())
 
     health_services = _normalize_restart_services(services)
     for core_srv in INSTALL_CENTER_CORE_SERVICES:
@@ -9779,7 +12793,10 @@ def _post_update_healthcheck(
         elif legacy_activity not in {"inactive", "failed"}:
             errors.append(f"Legacy e3dc.service ist nicht beweisbar inaktiv ({legacy_activity or 'unlesbar'})")
 
-    errors.extend(_local_http_healthcheck())
+    if not isinstance(check_http, bool):
+        errors.append("HTTP-Gesundheitsvertrag ist nicht boolesch")
+    elif check_http:
+        errors.extend(_local_http_healthcheck())
 
     if errors:
         for error in errors[:8]:
@@ -10882,6 +13899,160 @@ def _capture_apache_service_prestate(
         time.sleep(max(0.01, min(float(poll_s), 1.0)))
 
 
+def _quiesce_apache_for_cutover(preimage: ApacheSecurityPreimage) -> None:
+    """Stoppt ausschließlich einen zuvor aktiven Apache und beweist Web-Schreibruhe."""
+
+    if not isinstance(preimage, ApacheSecurityPreimage):
+        raise RuntimeError("Apache-Cutover besitzt kein gebundenes Preimage")
+    if preimage.apache_available and preimage.apache_was_active:
+        stopped = _run_argv(
+            ["sudo", "systemctl", "stop", "apache2.service"],
+            timeout=30,
+        )
+        if not stopped.get("success"):
+            raise RuntimeError(
+                "Apache konnte für das kurze Daten-/Web-Cutover nicht gestoppt werden: "
+                + _combined_process_diagnostics(stopped, maximum=800)
+            )
+    available, active, unit_state = _capture_apache_service_prestate()
+    if (
+        available != preimage.apache_available
+        or active
+        or unit_state != preimage.apache_unit_file_state
+    ):
+        raise RuntimeError(
+            "Apache besitzt keine gebundene inaktive Cutover-Lage "
+            f"(loaded={available}, active={active}, unit={unit_state})"
+        )
+
+
+def _restore_apache_after_successful_cutover(
+    *,
+    expected_available: bool,
+    expected_active: bool,
+    expected_unit_file_state: str,
+) -> None:
+    """Stellt vor dem HTTP-Gate exakt den gebundenen Apache-Aktivzustand her."""
+
+    if not isinstance(expected_available, bool) or not isinstance(expected_active, bool):
+        raise RuntimeError("Apache-Zielzustand ist nicht boolesch gebunden")
+    unit_state = str(expected_unit_file_state or "").strip().lower()
+    if expected_available and expected_active:
+        started = _run_argv(
+            ["sudo", "systemctl", "start", "apache2.service"],
+            timeout=30,
+        )
+        if not started.get("success"):
+            raise RuntimeError(
+                "Apache konnte nach dem Cutover nicht gestartet werden: "
+                + _combined_process_diagnostics(started, maximum=800)
+            )
+    available, active, current_unit_state = _capture_apache_service_prestate()
+    if (available, active, current_unit_state) != (
+        expected_available,
+        expected_active,
+        unit_state,
+    ):
+        raise RuntimeError(
+            "Apache-Endzustand weicht vom gebundenen Vorzustand ab "
+            f"(loaded={available}, active={active}, unit={current_unit_state})"
+        )
+
+
+def _verify_apache_quiesced_before_commit(
+    *,
+    expected_available: bool,
+    expected_active: bool,
+    expected_unit_file_state: str,
+) -> None:
+    """Prüft Apache vollständig, ohne den externen Webzugang zu öffnen."""
+
+    if not isinstance(expected_available, bool) or not isinstance(expected_active, bool):
+        raise RuntimeError("Apache-PreCommit-Vertrag ist nicht boolesch gebunden")
+    unit_state = str(expected_unit_file_state or "").strip().lower()
+    if expected_active and not expected_available:
+        raise RuntimeError("Abwesender Apache kann nicht als zuvor aktiv gebunden sein")
+    available, active, current_unit_state = _capture_apache_service_prestate()
+    if (available, active, current_unit_state) != (
+        expected_available,
+        False,
+        unit_state,
+    ):
+        raise RuntimeError(
+            "Apache blieb vor der durable Commit-Grenze nicht exakt inaktiv "
+            f"(loaded={available}, active={active}, unit={current_unit_state})"
+        )
+    if expected_available:
+        configtest = _run_argv(
+            ["sudo", "/usr/sbin/apache2ctl", "configtest"],
+            timeout=30,
+        )
+        if not configtest.get("success"):
+            raise RuntimeError(
+                "Apache-Konfiguration ist vor der Commit-Grenze ungültig: "
+                + _combined_process_diagnostics(configtest, maximum=800)
+            )
+
+
+def _complete_bound_apache_after_commit(
+    *,
+    expected_available: bool,
+    expected_active: bool,
+    expected_unit_file_state: str,
+) -> None:
+    """Stellt Apache nach Commit idempotent her und prüft nur lokalen HTTP-Zugriff."""
+
+    if not isinstance(expected_available, bool) or not isinstance(expected_active, bool):
+        raise RuntimeError("Apache-PostCommit-Vertrag ist nicht boolesch gebunden")
+    unit_state = str(expected_unit_file_state or "").strip().lower()
+    if expected_active and not expected_available:
+        raise RuntimeError("Abwesender Apache kann nach Commit nicht gestartet werden")
+
+    available, active, current_unit_state = _capture_apache_service_prestate()
+    if available != expected_available or current_unit_state != unit_state:
+        raise RuntimeError(
+            "Apache driftete vor dem wiederholbaren PostCommit-Abschluss "
+            f"(loaded={available}, active={active}, unit={current_unit_state})"
+        )
+    if not expected_active:
+        if active:
+            raise RuntimeError("Absichtlich inaktiver Apache wurde nach Commit aktiv")
+        return
+
+    configtest = _run_argv(
+        ["sudo", "/usr/sbin/apache2ctl", "configtest"],
+        timeout=30,
+    )
+    if not configtest.get("success"):
+        raise RuntimeError(
+            "Apache-Konfiguration ist beim PostCommit-Abschluss ungültig: "
+            + _combined_process_diagnostics(configtest, maximum=800)
+        )
+    _restore_apache_after_successful_cutover(
+        expected_available=expected_available,
+        expected_active=expected_active,
+        expected_unit_file_state=unit_state,
+    )
+    http_errors = _local_http_healthcheck()
+    if http_errors:
+        raise RuntimeError("; ".join(http_errors[:4]))
+
+
+def _complete_committed_apache_from_receipt(
+    contract: UpdateSafetyContract,
+) -> None:
+    """Bindet einen wiederholten Apache-Abschluss an das durable Commit-Receipt."""
+
+    current = _validate_update_safety_contract(contract, expected_state="committed")
+    if not current.apache_completion_required:
+        return
+    _complete_bound_apache_after_commit(
+        expected_available=current.apache_available,
+        expected_active=current.apache_was_active,
+        expected_unit_file_state=current.apache_unit_file_state,
+    )
+
+
 def _capture_apache_security_preimage() -> ApacheSecurityPreimage:
     available_path = APACHE_SECURITY_CONF_AVAILABLE
     enabled_path = APACHE_SECURITY_CONF_ENABLED
@@ -11022,7 +14193,15 @@ def _restore_apache_unit_file_state(preimage: ApacheSecurityPreimage) -> None:
             )
 
 
-def _restore_apache_security_preimage(preimage: ApacheSecurityPreimage) -> None:
+def _restore_apache_security_preimage(
+    preimage: ApacheSecurityPreimage,
+    *,
+    restore_activity: bool = True,
+) -> None:
+    """Stellt Dateien/Enablement her; der Prozessstart kann bis zum Endgate warten."""
+
+    if not isinstance(restore_activity, bool):
+        raise RuntimeError("Apache-Recovery-Aktivitätsvertrag ist nicht boolesch")
     remove_enabled = _run_argv(
         ["sudo", "rm", "-f", APACHE_SECURITY_CONF_ENABLED],
         timeout=15,
@@ -11116,7 +14295,7 @@ def _restore_apache_security_preimage(preimage: ApacheSecurityPreimage) -> None:
         if not configtest["success"]:
             raise RuntimeError("Apache-Konfiguration ist nach Recovery ungültig")
         _restore_apache_unit_file_state(preimage)
-        action = "start" if preimage.apache_was_active else "stop"
+        action = "start" if restore_activity and preimage.apache_was_active else "stop"
         service_result = _run_argv(
             ["sudo", "systemctl", action, "apache2.service"],
             timeout=30,
@@ -11126,7 +14305,7 @@ def _restore_apache_security_preimage(preimage: ApacheSecurityPreimage) -> None:
                 "Apache-Aktivitätszustand konnte nach Recovery nicht "
                 "wiederhergestellt werden"
             )
-        if preimage.apache_was_active:
+        if restore_activity and preimage.apache_was_active:
             reload_result = _run_argv(
                 ["sudo", "systemctl", "reload", "apache2.service"],
                 timeout=30,
@@ -11136,11 +14315,20 @@ def _restore_apache_security_preimage(preimage: ApacheSecurityPreimage) -> None:
                     "Apache konnte nach aktiver Recovery nicht neu geladen werden"
                 )
 
-    if _capture_apache_security_preimage() != preimage:
+    expected = (
+        preimage
+        if restore_activity
+        else replace(preimage, apache_was_active=False)
+    )
+    if _capture_apache_security_preimage() != expected:
         raise RuntimeError("Apache-Recovery weicht vom gebundenen Preimage ab")
 
 
-def _capture_recovery_surface(state: TransitionState) -> RecoverySurfaceInventory:
+def _capture_recovery_surface(
+    state: TransitionState,
+    install_user: str | None = None,
+) -> RecoverySurfaceInventory:
+    bound_install_user = str(install_user or get_install_user())
     web_inventory = _capture_tree_inventory(
         "/var/www/html",
         excluded_top=("data", "logs", "ramdisk", "tmp"),
@@ -11162,10 +14350,1105 @@ def _capture_recovery_surface(state: TransitionState) -> RecoverySurfaceInventor
         unit_enablement=tuple(enablement),
         root_managed_files=_capture_root_managed_preimages(),
         apache_security=_capture_apache_security_preimage(),
+        root_file_preimages=capture_root_file_preimages(),
+        crontab_preimages=capture_crontab_preimages(bound_install_user),
     )
 
 
-def _restore_recovery_surface(inventory: RecoverySurfaceInventory, state: TransitionState) -> None:
+def _surface_receipt_from_inventory(
+    inventory: RecoverySurfaceInventory,
+    *,
+    transaction_id: str,
+    install_root: str,
+    full_backup_id: str,
+) -> recovery_surface_codec.RecoverySurfaceReceipt:
+    """Überführt nur bereits eingefrorene Nebenflächen in den neutralen Codec."""
+
+    if inventory.root_file_preimages is None or inventory.crontab_preimages is None:
+        raise RuntimeError("Recovery-Nebenfläche besitzt kein vollständiges Preimage")
+    root_managed = tuple(
+        recovery_surface_codec.RootManagedFileRecoveryPreimage(
+            path=item.path,
+            existed=item.existed,
+            payload=item.payload if item.existed else None,
+            sha256=(hashlib.sha256(item.payload).hexdigest() if item.existed else None),
+            uid=item.uid if item.existed else None,
+            gid=item.gid if item.existed else None,
+            mode=item.mode if item.existed else None,
+            parent_dev=item.parent_dev,
+            parent_ino=item.parent_ino,
+        )
+        for item in inventory.root_managed_files
+    )
+    apache = inventory.apache_security
+    apache_neutral = recovery_surface_codec.ApacheSecurityRecoveryPreimage(
+        available=apache.available,
+        payload=apache.payload if apache.available else None,
+        sha256=(hashlib.sha256(apache.payload).hexdigest() if apache.available else None),
+        uid=apache.uid if apache.available else None,
+        gid=apache.gid if apache.available else None,
+        mode=apache.mode if apache.available else None,
+        enabled=apache.enabled,
+        enabled_target=apache.enabled_target if apache.enabled else None,
+        apache_available=apache.apache_available,
+        apache_was_active=apache.apache_was_active,
+        apache_unit_file_state=apache.apache_unit_file_state,
+    )
+    return recovery_surface_codec.create_recovery_surface_receipt(
+        transaction_id=transaction_id,
+        install_root=install_root,
+        full_backup_id=full_backup_id,
+        root_files=inventory.root_file_preimages,
+        crontabs=inventory.crontab_preimages,
+        root_managed_files=root_managed,
+        apache_security=apache_neutral,
+    )
+
+
+def _context_directory_chain(
+    chain: tuple[tuple[str, int, int, int, int, int], ...],
+) -> tuple[recovery_context_codec.DirectoryIdentity, ...]:
+    return tuple(
+        recovery_context_codec.DirectoryIdentity(
+            path=str(path),
+            device=int(device),
+            inode=int(inode),
+            uid=int(uid),
+            gid=int(gid),
+            mode=int(mode),
+        )
+        for path, device, inode, uid, gid, mode in chain
+    )
+
+
+def _context_privileged_payloads(
+    payloads: tuple[PrivilegedBackupFileReceipt, ...],
+) -> tuple[recovery_context_codec.PrivilegedBackupPayloadBinding, ...]:
+    return tuple(
+        recovery_context_codec.PrivilegedBackupPayloadBinding(
+            restore_path=item.restore_path,
+            category=item.category,
+            backup_relative_path=item.backup_relative_path,
+            parent_path_chain=_context_directory_chain(item.parent_path_chain),
+            device=item.dev,
+            inode=item.ino,
+            sha256=item.sha256,
+            size=item.size,
+            mode=item.mode,
+            uid=item.uid,
+            gid=item.gid,
+            nlink=item.nlink,
+            mtime_ns=item.mtime_ns,
+            ctime_ns=item.ctime_ns,
+        )
+        for item in payloads
+    )
+
+
+def _context_receipt_reference(
+    binding,
+) -> recovery_context_codec.RecoveryReceiptReference:
+    return recovery_context_codec.RecoveryReceiptReference(
+        path=str(binding.path),
+        device=int(binding.dev),
+        inode=int(binding.ino),
+        sha256=str(binding.sha256),
+    )
+
+
+def _capture_context_backup_binding(
+    *,
+    backup_dir: str,
+    manifest: dict,
+    recovery_receipt: RecoveryBackupReceipt | None,
+) -> recovery_context_codec.RecoveryBackupBinding:
+    stable_manifest, manifest_sha256 = _read_stable_verified_backup_manifest(
+        backup_dir
+    )
+    if stable_manifest != manifest:
+        raise RuntimeError("Vollbackup driftete vor der Recovery-Kontextbindung")
+    if recovery_receipt is not None:
+        chain = recovery_receipt.backup_path_chain
+        backup_device = recovery_receipt.backup_dev
+        backup_inode = recovery_receipt.backup_ino
+        parent_device = recovery_receipt.parent_dev
+        parent_inode = recovery_receipt.parent_ino
+    else:
+        descriptor, chain = _open_root_receipt_directory_chain(backup_dir)
+        try:
+            metadata = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        if len(chain) < 2:
+            raise RuntimeError("Vollbackup besitzt keine gebundene Elternkette")
+        backup_device = int(metadata.st_dev)
+        backup_inode = int(metadata.st_ino)
+        parent_device = int(chain[-2][1])
+        parent_inode = int(chain[-2][2])
+    return recovery_context_codec.RecoveryBackupBinding(
+        backup_dir=backup_dir,
+        backup_device=backup_device,
+        backup_inode=backup_inode,
+        parent_device=parent_device,
+        parent_inode=parent_inode,
+        path_chain=_context_directory_chain(chain),
+        backup_id=str(manifest.get("backup_id") or ""),
+        manifest_sha256=manifest_sha256,
+    )
+
+
+def _verify_prejournal_against_journal(
+    construction: prejournal_codec.PersistedPrejournalConstruction,
+    journal: recovery_journal.RecoveryJournalContract,
+    context: recovery_context_codec.RecoveryContextContract,
+) -> tuple[
+    prejournal_codec.PersistedPrejournalConstruction,
+    recovery_journal.RecoveryJournalContract,
+]:
+    """Kreuzbindet den kurzlebigen Bauzeugen mit Journal und Context."""
+
+    bound_construction = prejournal_codec.verify_prejournal_construction(
+        construction
+    )
+    bound_journal = recovery_journal.verify_recovery_journal(journal)
+    bound_context = recovery_context_codec.read_recovery_context(
+        expected_transaction_id=context.context.transaction_id,
+        expected_install_root=context.context.install_root,
+        expected_full_backup_id=context.context.backup.backup_id,
+        path=context.context_path,
+    )
+    if bound_context != context:
+        raise RuntimeError("Recovery-Kontext driftete an der Journalgrenze")
+    construction_receipt = bound_construction.receipt
+    journal_payload = bound_journal.payload
+    context_payload = bound_context.context
+    if (
+        journal_payload.phase != recovery_journal.PHASE_PREPRODUCT
+        or journal_payload.package is not None
+        or journal_payload.safety is not None
+        or journal_payload.overlay is not None
+        or construction_receipt.transaction_id
+        != journal_payload.transaction_id
+        or construction_receipt.install_root != journal_payload.install_root
+        or construction_receipt.install_user != journal_payload.install_user
+        or construction_receipt.source != journal_payload.source
+        or construction_receipt.target != journal_payload.target
+        or construction_receipt.full_backup != journal_payload.full_backup
+        or context_payload.transaction_id
+        != construction_receipt.transaction_id
+        or context_payload.install_root != construction_receipt.install_root
+        or context_payload.install_user != construction_receipt.install_user
+        or context_payload.target.commit != construction_receipt.target.commit
+        or context_payload.target.tag != construction_receipt.target.tag
+        or context_payload.target.role != construction_receipt.target.role
+        or context_payload.backup.backup_dir
+        != construction_receipt.backup_dir
+        or context_payload.backup.backup_id
+        != construction_receipt.full_backup.backup_id
+        or context_payload.backup.manifest_sha256
+        != construction_receipt.full_backup.manifest_sha256
+        or context_payload.source.old_commit
+        != construction_receipt.source.commit
+        or context_payload.source.bootstrap_without_git
+        == construction_receipt.source.repository_present
+        or context_payload.source.bootstrap_rebuild_git
+        != construction_receipt.source.repository_rebuild_required
+    ):
+        raise RuntimeError(
+            "Construction-Receipt, Recovery-Kontext und Master-Journal "
+            "widersprechen sich"
+        )
+    return bound_construction, bound_journal
+
+
+def _persist_preproduct_recovery_bundle(
+    *,
+    transaction_id: str,
+    repo_dir: str,
+    install_user: str,
+    old_commit: str | None,
+    bootstrap_rebuild_git: bool,
+    target_commit: str,
+    target_tag: str,
+    state: TransitionState,
+    inventory: frozenset[str],
+    recovery_inventory: RecoverySurfaceInventory,
+    backup_dir: str,
+    full_backup_manifest: dict,
+    repo_recovery_contract: RepoRecoveryContract | None,
+    backup_receipt: RecoveryBackupReceipt | None,
+) -> PersistentRecoveryBundle:
+    """Persistiert alle Altstandsbelege vor Bootblock und Paketmutation."""
+
+    surface_binding = None
+    systemd_binding = None
+    context_binding = None
+    journal_contract = None
+    construction_binding = None
+    try:
+        full_backup_id = str(full_backup_manifest.get("backup_id") or "")
+        backup_binding = _capture_context_backup_binding(
+            backup_dir=backup_dir,
+            manifest=full_backup_manifest,
+            recovery_receipt=backup_receipt,
+        )
+        journal_source = recovery_journal.make_source_binding(
+            kind=_bootstrap_source_kind(
+                _read_version_file(repo_dir),
+                old_commit is not None,
+            ),
+            version=_read_version_file(repo_dir),
+            commit=old_commit,
+            repository_present=old_commit is not None,
+            repository_rebuild_required=bool(bootstrap_rebuild_git),
+        )
+        journal_target = recovery_journal.make_target_binding(
+            commit=target_commit,
+            tag=target_tag,
+            role=state.ha_role,
+        )
+        journal_backup = recovery_journal.make_full_backup_binding(
+            backup_id=full_backup_id,
+            manifest_sha256=backup_binding.manifest_sha256,
+        )
+        construction_binding = (
+            prejournal_codec.write_prejournal_construction(
+                prejournal_codec.make_prejournal_construction_receipt(
+                    transaction_id=transaction_id,
+                    install_root=repo_dir,
+                    install_user=install_user,
+                    source=journal_source,
+                    target=journal_target,
+                    backup_dir=backup_dir,
+                    full_backup=journal_backup,
+                )
+            )
+        )
+        surface_binding = recovery_surface_codec.write_recovery_surface_receipt(
+            _surface_receipt_from_inventory(
+                recovery_inventory,
+                transaction_id=transaction_id,
+                install_root=repo_dir,
+                full_backup_id=full_backup_id,
+            )
+        )
+        systemd_binding = recovery_surface_codec.write_systemd_recovery_receipt(
+            recovery_surface_codec.capture_systemd_recovery_receipt(
+                _recovery_bootblock_units(),
+                transaction_id=transaction_id,
+                install_root=repo_dir,
+                full_backup_id=full_backup_id,
+            )
+        )
+        privileged_payloads = (
+            backup_receipt.privileged_backup_files
+            if backup_receipt is not None
+            else _privileged_backup_payload_receipts(
+                backup_dir,
+                full_backup_manifest,
+            )
+        )
+        install_count, install_digest = (
+            recovery_context_codec.inventory_entries_fingerprint(inventory)
+        )
+        web_count, web_digest = recovery_context_codec.inventory_entries_fingerprint(
+            recovery_inventory.web_program_entries
+        )
+        context_repo = None
+        if repo_recovery_contract is not None:
+            context_repo = recovery_context_codec.RepoRecoveryBinding(
+                expected_commit=repo_recovery_contract.expected_commit,
+                tracked_git=tuple(
+                    recovery_context_codec.RepoTrackedBinding(
+                        relative_path=relative_path,
+                        git_mode=git_mode,
+                        git_object_id=git_oid,
+                    )
+                    for (
+                        relative_path,
+                        git_mode,
+                        git_oid,
+                        _digest,
+                        _size,
+                        _mode,
+                        _uid,
+                        _gid,
+                    ) in repo_recovery_contract.tracked_files
+                ),
+                dirty_paths=repo_recovery_contract.dirty_paths,
+            )
+        context = recovery_context_codec.RecoveryContext(
+            transaction_id=transaction_id,
+            install_root=repo_dir,
+            install_user=install_user,
+            source=recovery_context_codec.RecoverySourceBinding(
+                old_commit=old_commit,
+                bootstrap_without_git=old_commit is None,
+                bootstrap_rebuild_git=bool(bootstrap_rebuild_git),
+            ),
+            target=recovery_context_codec.RecoveryTargetBinding(
+                commit=target_commit,
+                tag=target_tag,
+                role=state.ha_role,
+            ),
+            transition=recovery_context_codec.RecoveryTransitionBinding(
+                ha_role=state.ha_role,
+                config_path=state.config_path,
+                config_sha256=state.config_sha256,
+                config_source=(
+                    recovery_context_codec.CONFIG_SOURCE_SYNTHETIC_MISSING
+                    if state.bootstrap_legacy_config
+                    else recovery_context_codec.CONFIG_SOURCE_FULL_BACKUP
+                ),
+                bootstrap_legacy_config=state.bootstrap_legacy_config,
+                preinstalled_units=tuple(sorted(state.preinstalled_units)),
+                preactive_units=tuple(sorted(state.preactive_units)),
+                legacy_e3dc_activity=state.legacy_e3dc_activity,
+            ),
+            backup=backup_binding,
+            repo=context_repo,
+            inventory=recovery_context_codec.InventoryFingerprint(
+                install_entries_count=install_count,
+                install_entries_sha256=install_digest,
+                web_entries_count=web_count,
+                web_entries_sha256=web_digest,
+                watchdog_files=tuple(sorted(recovery_inventory.watchdog_files)),
+            ),
+            privileged_backup_payloads=_context_privileged_payloads(
+                privileged_payloads
+            ),
+            surface_receipt=_context_receipt_reference(surface_binding),
+            systemd_receipt=_context_receipt_reference(systemd_binding),
+        )
+        try:
+            context_binding = recovery_context_codec.write_recovery_context(context)
+        except recovery_context_codec.UpdateRecoveryContextPersistenceError as exc:
+            if exc.contract is None:
+                raise
+            context_binding = exc.contract
+
+        immutable_receipts = recovery_journal.make_immutable_receipt_references(
+            context=recovery_journal.capture_recovery_receipt_reference(
+                "context",
+                context_binding.context_path,
+            ),
+            surface=recovery_journal.capture_recovery_receipt_reference(
+                "surface",
+                surface_binding.path,
+            ),
+            systemd=recovery_journal.capture_recovery_receipt_reference(
+                "systemd",
+                systemd_binding.path,
+            ),
+        )
+        initial_payload = recovery_journal.make_recovery_journal_payload(
+            transaction_id=transaction_id,
+            install_root=repo_dir,
+            install_user=install_user,
+            source=journal_source,
+            target=journal_target,
+            transition_id=context_binding.context_sha256,
+            full_backup=journal_backup,
+            immutable_receipts=immutable_receipts,
+        )
+        try:
+            journal_contract = recovery_journal.create_recovery_journal(
+                initial_payload
+            )
+        except recovery_journal.UpdateRecoveryJournalPersistenceError as exc:
+            if exc.journal is None:
+                raise
+            journal_contract = recovery_journal.verify_recovery_journal(exc.journal)
+        construction_binding, journal_contract = (
+            _verify_prejournal_against_journal(
+                construction_binding,
+                journal_contract,
+                context_binding,
+            )
+        )
+        prejournal_codec.remove_prejournal_construction(
+            construction_binding
+        )
+        construction_binding = None
+        journal_contract = recovery_journal.verify_recovery_journal(
+            journal_contract
+        )
+        return PersistentRecoveryBundle(
+            journal=journal_contract,
+            context=context_binding,
+            surface=surface_binding,
+            systemd=systemd_binding,
+        )
+    except BaseException as original_error:
+        # Ein Fehler oder Signal zwischen Kernel-Commit und Python-Zuweisung
+        # beweist niemals, dass der zuletzt geschriebene Name fehlt. Deshalb
+        # werden ab dem ersten Construction-Receipt keinerlei Parent-Belege im
+        # Fehlerpfad entfernt. Der nächste echte Updateeinstieg liest den
+        # persistenten Präfix frisch und räumt ihn nur construction-autorisiert
+        # auf beziehungsweise setzt ein bereits vorhandenes Journal fort.
+        # Ohne diesen Grundsatz könnte ein tatsächlich durable Journal durch
+        # das Entfernen seiner Parents verwaisen.
+        raise
+
+
+def _canonical_recovery_shape_sha256(mapping: dict) -> str:
+    try:
+        payload = json.dumps(
+            mapping,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise RuntimeError("Recovery-Semantik ist nicht kanonisch hashbar") from exc
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _package_prestate_shape_sha256(
+    state: PackageTransactionState,
+) -> str:
+    return _canonical_recovery_shape_sha256(
+        _package_transaction_state_mapping(state)
+    )
+
+
+def _dynamic_safety_shape_sha256(contract: UpdateSafetyContract) -> str:
+    ignored = {"state", "receipt_dev", "receipt_ino", "receipt_sha256"}
+    return _canonical_recovery_shape_sha256(
+        {
+            name: getattr(contract, name)
+            for name in UpdateSafetyContract.__dataclass_fields__
+            if name not in ignored
+        }
+    )
+
+
+def _static_bootblock_shape_sha256(
+    contract: RecoveryBootblockContract,
+) -> str:
+    payload = _serialize_recovery_bootblock_contract(contract).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _bind_persistent_recovery_package_safety(
+    bundle: PersistentRecoveryBundle,
+    *,
+    package_receipt: PreparedPackageReceipt | PackageRecoveryReceipt,
+    update_safety_contract: UpdateSafetyContract | None,
+    static_bootblock_contract: RecoveryBootblockContract | None,
+) -> PersistentRecoveryBundle:
+    """Bindet Paket- und Gate-Semantik gemeinsam vor dem ersten Paketbefehl."""
+
+    current_journal = recovery_journal.verify_recovery_journal(bundle.journal)
+    payload = current_journal.payload
+    if payload.phase != recovery_journal.PHASE_PREPRODUCT:
+        raise RuntimeError("Paket-/Safety-Bindung sieht keine preproduct-Phase")
+    if (update_safety_contract is None) == (static_bootblock_contract is None):
+        raise RuntimeError("Recovery benötigt genau einen dynamischen oder statischen Gatevertrag")
+    package_transaction = _package_transaction_from_receipt(package_receipt)
+    if (
+        package_receipt.transaction_id != payload.transaction_id
+        or package_receipt.install_root != payload.install_root
+        or package_receipt.full_backup_id != payload.full_backup.backup_id
+        or package_receipt.target_commit != payload.target.commit
+        or package_receipt.target_tag != payload.target.tag
+        or package_receipt.role != payload.target.role
+    ):
+        raise RuntimeError("Paket-Receipt widerspricht dem Master-Journal")
+
+    static_digest = None
+    if update_safety_contract is not None:
+        current_safety = _validate_update_safety_contract(
+            update_safety_contract,
+            expected_state="pending",
+        )
+        safety_binding = recovery_journal.make_dynamic_safety_binding(
+            receipt_path=current_safety.receipt_path,
+            transaction_id=current_safety.transaction_id,
+            install_root=payload.install_root,
+            full_backup_id=current_safety.backup_id,
+            target_identity_sha256=payload.target.identity_sha256,
+            receipt_shape_sha256=_dynamic_safety_shape_sha256(current_safety),
+        )
+        gate_mode = recovery_journal.GATE_MODE_DYNAMIC
+    else:
+        _validate_recovery_bootblock_contract(static_bootblock_contract)
+        static_digest = _static_bootblock_shape_sha256(static_bootblock_contract)
+        safety_binding = recovery_journal.make_static_safety_binding(
+            transaction_id=static_bootblock_contract.transaction_id,
+            install_root=payload.install_root,
+            full_backup_id=payload.full_backup.backup_id,
+            target_identity_sha256=payload.target.identity_sha256,
+            static_contract_sha256=static_digest,
+        )
+        gate_mode = recovery_journal.GATE_MODE_STATIC
+    package_binding = recovery_journal.make_package_binding(
+        path=package_receipt.receipt_path,
+        transaction_id=package_receipt.transaction_id,
+        install_root=package_receipt.install_root,
+        full_backup_id=package_receipt.full_backup_id,
+        target_identity_sha256=payload.target.identity_sha256,
+        prestate_shape_sha256=_package_prestate_shape_sha256(package_transaction),
+        gate_mode=gate_mode,
+        static_contract_sha256=static_digest,
+    )
+    bound_journal = recovery_journal.bind_preproduct_recovery_receipts(
+        current_journal,
+        package=package_binding,
+        safety=safety_binding,
+    )
+    return replace(bundle, journal=bound_journal)
+
+
+def _advance_persistent_recovery_product_mutating(
+    bundle: PersistentRecoveryBundle,
+    overlay_receipt: QuiescedOverlayReceipt,
+) -> PersistentRecoveryBundle:
+    """Setzt die durable Produktmutationsgrenze vor dem ersten Mutator."""
+
+    if overlay_receipt.transaction_id != bundle.journal.payload.transaction_id:
+        raise RuntimeError("Overlay und Master-Journal besitzen verschiedene Transaktionen")
+    receipt_reference = recovery_journal.capture_recovery_receipt_reference(
+        "overlay",
+        os.path.join(
+            RECOVERY_BOOTBLOCK_STATE_DIR,
+            QUIESCED_OVERLAY_RECEIPT_NAME,
+        ),
+    )
+    if (
+        receipt_reference.device != overlay_receipt.receipt_dev
+        or receipt_reference.inode != overlay_receipt.receipt_ino
+        or receipt_reference.sha256 != overlay_receipt.receipt_sha256
+    ):
+        raise RuntimeError("Overlay-Receipt driftete vor der Produktmutation")
+    overlay_binding = recovery_journal.make_overlay_binding(
+        backup_id=overlay_receipt.backup_id,
+        manifest_sha256=overlay_receipt.manifest_sha256,
+        receipt=receipt_reference,
+    )
+    advanced = recovery_journal.advance_recovery_journal(
+        bundle.journal,
+        recovery_journal.PHASE_PRODUCT_MUTATING,
+        overlay=overlay_binding,
+    )
+    return replace(bundle, journal=advanced)
+
+
+def _context_reference_matches_journal(
+    context_reference: recovery_context_codec.RecoveryReceiptReference,
+    journal_reference: recovery_journal.RecoveryReceiptReference,
+) -> bool:
+    return (
+        context_reference.path == journal_reference.path
+        and context_reference.device == journal_reference.device
+        and context_reference.inode == journal_reference.inode
+        and context_reference.sha256 == journal_reference.sha256
+    )
+
+
+def _bind_product_mutating_recovery_journal(
+    *,
+    expected_device: int,
+    expected_inode: int,
+    expected_sha256: str,
+    expected_phase: str,
+    repo_dir: str,
+    target_commit: str,
+    target_tag: str,
+    role: str,
+    package_receipt: PreparedPackageReceipt,
+    update_safety_contract: UpdateSafetyContract | None,
+    static_bootblock_contract: RecoveryBootblockContract | None,
+) -> recovery_journal.RecoveryJournalContract:
+    """Kreuzbindet Parent-Journal, Context und alle Receipt-Semantiken."""
+
+    if expected_phase != recovery_journal.PHASE_PRODUCT_MUTATING:
+        raise RuntimeError(
+            "Target-Finalizer erhielt keine zulässige Parent-Journalphase"
+        )
+    contract = recovery_journal.read_recovery_journal()
+    if contract is None:
+        raise RuntimeError("Target-Finalizer besitzt kein Master-Journal")
+    if (
+        contract.journal_device != int(expected_device)
+        or contract.journal_inode != int(expected_inode)
+        or contract.journal_sha256 != str(expected_sha256)
+        or contract.payload.phase != expected_phase
+    ):
+        raise RuntimeError("Target-Finalizer erhielt nicht das Parent-gebundene Master-Journal")
+    payload = contract.payload
+    if (
+        payload.install_root != repo_dir
+        or payload.target.commit != target_commit
+        or payload.target.tag != target_tag
+        or payload.target.role != role
+        or payload.transaction_id != package_receipt.transaction_id
+        or payload.full_backup.backup_id != package_receipt.full_backup_id
+    ):
+        raise RuntimeError("Master-Journal widerspricht dem Target-Finalizer")
+
+    for kind in ("context", "surface", "systemd"):
+        recovery_journal.verify_recovery_receipt_reference(
+            getattr(payload.immutable_receipts, kind)
+        )
+    if payload.overlay is None:
+        raise RuntimeError("product_mutating-Journal besitzt kein Overlay")
+    recovery_journal.verify_recovery_receipt_reference(payload.overlay.receipt)
+
+    context_contract = recovery_context_codec.read_recovery_context(
+        expected_transaction_id=payload.transaction_id,
+        expected_install_root=payload.install_root,
+        expected_full_backup_id=payload.full_backup.backup_id,
+    )
+    if context_contract is None:
+        raise RuntimeError("Master-Journal besitzt keinen Recovery-Kontext")
+    context = context_contract.context
+    if (
+        context_contract.context_sha256 != payload.transition_id
+        or context_contract.context_device
+        != payload.immutable_receipts.context.device
+        or context_contract.context_inode
+        != payload.immutable_receipts.context.inode
+        or context_contract.context_sha256
+        != payload.immutable_receipts.context.sha256
+        or context.transaction_id != payload.transaction_id
+        or context.install_root != payload.install_root
+        or context.install_user != payload.install_user
+        or context.target.commit != payload.target.commit
+        or context.target.tag != payload.target.tag
+        or context.target.role != payload.target.role
+        or context.backup.backup_id != payload.full_backup.backup_id
+        or context.backup.manifest_sha256
+        != payload.full_backup.manifest_sha256
+        or not _context_reference_matches_journal(
+            context.surface_receipt,
+            payload.immutable_receipts.surface,
+        )
+        or not _context_reference_matches_journal(
+            context.systemd_receipt,
+            payload.immutable_receipts.systemd,
+        )
+    ):
+        raise RuntimeError("Recovery-Kontext widerspricht dem Master-Journal")
+
+    package = payload.package
+    safety = payload.safety
+    if package is None or safety is None:
+        raise RuntimeError("Master-Journal besitzt keinen Paket-/Safety-Vertrag")
+    current_package_transaction = _package_transaction_from_receipt(package_receipt)
+    if (
+        package.path != package_receipt.receipt_path
+        or package.transaction_id != package_receipt.transaction_id
+        or package.install_root != package_receipt.install_root
+        or package.full_backup_id != package_receipt.full_backup_id
+        or package.target_identity_sha256 != payload.target.identity_sha256
+        or package.prestate_shape_sha256
+        != _package_prestate_shape_sha256(current_package_transaction)
+    ):
+        raise RuntimeError("Paket-Semantik widerspricht dem Master-Journal")
+
+    if update_safety_contract is not None:
+        if static_bootblock_contract is not None:
+            raise RuntimeError("Finalizer vermischt dynamischen und statischen Gatevertrag")
+        current_safety = _validate_update_safety_contract(
+            update_safety_contract,
+            expected_state="pending",
+        )
+        if (
+            package.gate_mode != recovery_journal.GATE_MODE_DYNAMIC
+            or safety.mode != recovery_journal.GATE_MODE_DYNAMIC
+            or safety.receipt_path != current_safety.receipt_path
+            or safety.transaction_id != current_safety.transaction_id
+            or safety.install_root != payload.install_root
+            or safety.full_backup_id != current_safety.backup_id
+            or safety.target_identity_sha256 != payload.target.identity_sha256
+            or safety.receipt_shape_sha256
+            != _dynamic_safety_shape_sha256(current_safety)
+        ):
+            raise RuntimeError("Dynamische Safety-Semantik widerspricht dem Master-Journal")
+    else:
+        if static_bootblock_contract is None:
+            raise RuntimeError("Finalizer besitzt keinen gebundenen Gatevertrag")
+        _validate_recovery_bootblock_contract(static_bootblock_contract)
+        static_digest = _static_bootblock_shape_sha256(static_bootblock_contract)
+        if (
+            package.gate_mode != recovery_journal.GATE_MODE_STATIC
+            or safety.mode != recovery_journal.GATE_MODE_STATIC
+            or package.static_contract_sha256 != static_digest
+            or safety.static_contract_sha256 != static_digest
+            or safety.transaction_id != static_bootblock_contract.transaction_id
+            or safety.install_root != payload.install_root
+            or safety.full_backup_id != payload.full_backup.backup_id
+            or safety.target_identity_sha256 != payload.target.identity_sha256
+        ):
+            raise RuntimeError("Statische Safety-Semantik widerspricht dem Master-Journal")
+    return contract
+
+
+def _advance_persistent_recovery_committed(
+    contract: recovery_journal.RecoveryJournalContract,
+) -> recovery_journal.RecoveryJournalContract:
+    """Macht ausschließlich den durable Journal-Readback irreversibel."""
+
+    try:
+        return recovery_journal.advance_recovery_journal(
+            contract,
+            recovery_journal.PHASE_COMMITTED,
+        )
+    except BaseException as exc:
+        try:
+            current = recovery_journal.read_recovery_journal(
+                contract.journal_path,
+                allow_missing=True,
+            )
+        except Exception as read_error:
+            raise UpdateSafetyManagedServiceUnquiescedError(
+                "Master-Journal ist nach dem Commitversuch nicht sicher lesbar; "
+                "Altstand-Rollback bleibt fail-closed gesperrt"
+            ) from read_error
+        if current == contract:
+            raise
+        if (
+            current is not None
+            and current.payload.phase == recovery_journal.PHASE_COMMITTED
+            and _same_recovery_journal_transaction_shape(current, contract)
+        ):
+            committed = recovery_journal.verify_recovery_journal(current)
+            if isinstance(exc, Exception):
+                return committed
+            raise UpdateSafetyPostCommitError(
+                "Signal oder Prozessabbruch trat nach durable committed "
+                "Master-Journal ein; Altstand-Rollback ist verboten"
+            ) from exc
+        raise UpdateSafetyManagedServiceUnquiescedError(
+            "Master-Journal driftete nach dem Commitversuch; Altstand-Rollback "
+            "bleibt fail-closed gesperrt"
+        ) from exc
+
+
+def _same_recovery_journal_transaction_shape(
+    candidate: recovery_journal.RecoveryJournalContract,
+    original: recovery_journal.RecoveryJournalContract,
+) -> bool:
+    """Vergleicht die phasenunabhängige Identität derselben Transaktion."""
+
+    return (
+        isinstance(candidate, recovery_journal.RecoveryJournalContract)
+        and isinstance(original, recovery_journal.RecoveryJournalContract)
+        and candidate.journal_path == original.journal_path
+        and candidate.payload.transaction_id == original.payload.transaction_id
+        and candidate.payload.install_root == original.payload.install_root
+        and candidate.payload.target == original.payload.target
+        and candidate.payload.full_backup == original.payload.full_backup
+        and candidate.payload.binding_sha256
+        == original.payload.binding_sha256
+        and candidate.payload.phase_state_sha256
+        == original.payload.phase_state_sha256
+    )
+
+
+def _read_matching_committed_recovery_journal(
+    original: recovery_journal.RecoveryJournalContract,
+    *,
+    allow_missing: bool = False,
+) -> recovery_journal.RecoveryJournalContract | None:
+    """Liest nur den durable Commit derselben gebundenen Transaktion."""
+
+    current = recovery_journal.read_recovery_journal(
+        original.journal_path,
+        allow_missing=allow_missing,
+    )
+    if current is None:
+        return None
+    if (
+        current.payload.phase == recovery_journal.PHASE_COMMITTED
+        and _same_recovery_journal_transaction_shape(current, original)
+    ):
+        return recovery_journal.verify_recovery_journal(current)
+    return None
+
+
+def _advance_persistent_recovery_rolled_back(
+    contract: recovery_journal.RecoveryJournalContract,
+) -> recovery_journal.RecoveryJournalContract:
+    """Entscheidet nach verifiziertem Offline-Preimage dauerhaft den Altstand.
+
+    systemd-Gate-Cleanup, Dienststart und Apache-Wiederherstellung dürfen danach
+    noch idempotent offen sein. Die irreversible Richtung bleibt dennoch der
+    alte Produktstand; ein neuer Ziel-Commit ist ab dieser Phase verboten.
+    """
+
+    if contract.payload.phase not in {
+        recovery_journal.PHASE_PREPRODUCT,
+        recovery_journal.PHASE_PRODUCT_MUTATING,
+    }:
+        raise RuntimeError(
+            "Nur eine laufende Recovery-Phase darf rolled_back werden"
+        )
+    try:
+        return recovery_journal.advance_recovery_journal(
+            contract,
+            recovery_journal.PHASE_ROLLED_BACK,
+        )
+    except BaseException as exc:
+        try:
+            current = recovery_journal.read_recovery_journal(
+                contract.journal_path,
+                allow_missing=True,
+            )
+        except Exception as read_error:
+            raise UpdateSafetyManagedServiceUnquiescedError(
+                "Master-Journal ist nach dem Rollback-Abschluss nicht sicher "
+                "lesbar; terminaler Cleanup bleibt gesperrt"
+            ) from read_error
+        if current == contract:
+            raise
+        if (
+            current is not None
+            and current.payload.phase == recovery_journal.PHASE_ROLLED_BACK
+            and _same_recovery_journal_transaction_shape(current, contract)
+        ):
+            rolled_back = recovery_journal.verify_recovery_journal(current)
+            if isinstance(exc, Exception):
+                return rolled_back
+            raise UpdateSafetyManagedServiceUnquiescedError(
+                "Signal trat nach durable rolled_back ein; ausschließlich "
+                "terminaler Cleanup ist noch zulässig"
+            ) from exc
+        raise UpdateSafetyManagedServiceUnquiescedError(
+            "Master-Journal driftete am Rollback-Abschluss; terminaler "
+            "Cleanup bleibt fail-closed gesperrt"
+        ) from exc
+
+
+def _read_matching_rolled_back_recovery_journal(
+    original: recovery_journal.RecoveryJournalContract,
+    *,
+    allow_missing: bool = False,
+) -> recovery_journal.RecoveryJournalContract | None:
+    """Liest nur den durable Rücklauf derselben gebundenen Transaktion."""
+
+    current = recovery_journal.read_recovery_journal(
+        original.journal_path,
+        allow_missing=allow_missing,
+    )
+    if current is None:
+        return None
+    if (
+        current.payload.phase == recovery_journal.PHASE_ROLLED_BACK
+        and _same_recovery_journal_transaction_shape(current, original)
+    ):
+        return recovery_journal.verify_recovery_journal(current)
+    return None
+
+
+def _cleanup_terminal_recovery_bundle(
+    bundle: PersistentRecoveryBundle,
+) -> None:
+    """Entfernt Begleitbelege idempotent; das Master-Journal immer zuletzt."""
+
+    if not isinstance(bundle, PersistentRecoveryBundle):
+        raise TypeError("Terminaler Recovery-Cleanup besitzt kein Bundle")
+    terminal = recovery_journal.verify_recovery_journal(bundle.journal)
+    if terminal.payload.phase not in {
+        recovery_journal.PHASE_COMMITTED,
+        recovery_journal.PHASE_ROLLED_BACK,
+    }:
+        raise RuntimeError("Nichtterminales Master-Journal darf nicht bereinigt werden")
+
+    if bundle.systemd is not None and os.path.lexists(bundle.systemd.path):
+        recovery_surface_codec.remove_systemd_recovery_receipt(bundle.systemd)
+    if bundle.surface is not None and os.path.lexists(bundle.surface.path):
+        recovery_surface_codec.remove_recovery_surface_receipt(bundle.surface)
+    if bundle.context is not None and os.path.lexists(bundle.context.context_path):
+        recovery_context_codec.remove_recovery_context(bundle.context)
+
+    remaining = tuple(
+        path
+        for path in (
+            terminal.payload.immutable_receipts.systemd.path,
+            terminal.payload.immutable_receipts.surface.path,
+            terminal.payload.immutable_receipts.context.path,
+        )
+        if os.path.lexists(path)
+    )
+    if remaining:
+        raise RuntimeError(
+            "Recovery-Begleitbelege blieben vor dem Journal-Cleanup stehen: "
+            + ", ".join(remaining)
+        )
+    recovery_journal.remove_recovery_journal(terminal)
+
+
+def _refresh_terminal_recovery_bundle(
+    bundle: PersistentRecoveryBundle,
+    *,
+    phase: str,
+) -> PersistentRecoveryBundle:
+    """Bindet den terminalen Journal-Inode derselben Transaktion erneut."""
+
+    if phase == recovery_journal.PHASE_COMMITTED:
+        terminal = _read_matching_committed_recovery_journal(
+            bundle.journal,
+            allow_missing=True,
+        )
+    elif phase == recovery_journal.PHASE_ROLLED_BACK:
+        terminal = _read_matching_rolled_back_recovery_journal(
+            bundle.journal,
+            allow_missing=True,
+        )
+    else:
+        raise ValueError("Unbekannte terminale Recovery-Phase")
+    if terminal is None:
+        raise RuntimeError(
+            "[E3DC-UPD-TERMINAL-JOURNAL-001] Master-Journal besitzt nicht "
+            f"die erwartete terminale Phase {phase}. Lösung: Keine Parent-, "
+            "Paket- oder Safety-Datei löschen; führe `sudo stat -c "
+            f"'%U:%G %a %h %s %n' {bundle.journal.journal_path}` und danach "
+            "`sudo journalctl -b -u 'e3dc-*update*' --no-pager` aus."
+        )
+    return replace(bundle, journal=terminal)
+
+
+def _cleanup_terminal_update_artifacts(
+    *,
+    bundle: PersistentRecoveryBundle,
+    offline_receipt: OfflinePackageReceipt | None,
+    overlay_receipt: QuiescedOverlayReceipt | None,
+    package_receipt: PreparedPackageReceipt | PackageRecoveryReceipt | None,
+    update_safety_contract: UpdateSafetyContract | None,
+    terminal_label: str,
+) -> None:
+    """Räumt nur nach terminalem Journal alle Transaktionsartefakte geordnet auf."""
+
+    terminal = recovery_journal.verify_recovery_journal(bundle.journal)
+    expected_phase = terminal.payload.phase
+    expected_transaction_id = terminal.payload.transaction_id
+    if expected_phase not in {
+        recovery_journal.PHASE_COMMITTED,
+        recovery_journal.PHASE_ROLLED_BACK,
+    }:
+        raise RuntimeError("Artefakt-Cleanup besitzt kein terminales Journal")
+
+    def assert_terminal_cleanup_authority():
+        """Bindet vor jeder Cleanup-Klasse exakt denselben Journal-Inode."""
+
+        current = recovery_journal.verify_recovery_journal(terminal)
+        if (
+            current.payload.phase != expected_phase
+            or current.payload.transaction_id != expected_transaction_id
+        ):
+            raise RuntimeError(
+                "Terminale Cleanup-Autorität wechselte Phase oder Transaktion"
+            )
+        return current
+
+    assert_terminal_cleanup_authority()
+    if not _cleanup_terminal_offline_package_receipt(
+        offline_receipt,
+        terminal_state=terminal_label,
+    ):
+        raise RuntimeError("Offline-Paketartefakte blieben unvollständig")
+    assert_terminal_cleanup_authority()
+    _cleanup_stale_target_execution_snapshots(
+        _trusted_same_filesystem_snapshot_parent(
+            bundle.journal.payload.install_root
+        ),
+        prefixes=(TARGET_FINALIZER_SNAPSHOT_PREFIX,),
+    )
+
+    if overlay_receipt is not None and os.path.lexists(
+        os.path.join(
+            RECOVERY_BOOTBLOCK_STATE_DIR,
+            QUIESCED_OVERLAY_RECEIPT_NAME,
+        )
+    ):
+        assert_terminal_cleanup_authority()
+        _remove_quiesced_overlay_receipt_and_tree(overlay_receipt)
+
+    current_package = _read_prepared_package_receipt(allow_missing=True)
+    if current_package is not None:
+        if (
+            package_receipt is None
+            or current_package.transaction_id
+            != package_receipt.transaction_id
+            or current_package.install_root != package_receipt.install_root
+            or current_package.full_backup_id != package_receipt.full_backup_id
+            or current_package.package_transaction
+            != package_receipt.package_transaction
+        ):
+            raise RuntimeError("Terminales Paket-Receipt gehört zu einer fremden Transaktion")
+        assert_terminal_cleanup_authority()
+        _remove_exact_prepared_package_receipt(current_package)
+
+    current_safety = _read_update_safety_contract(allow_missing=True)
+    if current_safety is not None:
+        if (
+            update_safety_contract is None
+            or not _same_update_safety_transaction_shape(
+                current_safety,
+                update_safety_contract,
+            )
+        ):
+            raise RuntimeError("Terminales Safety-Receipt gehört zu einer fremden Transaktion")
+        assert_terminal_cleanup_authority()
+        _remove_exact_update_safety_receipt(current_safety)
+
+    current_terminal = assert_terminal_cleanup_authority()
+    _cleanup_terminal_recovery_bundle(
+        replace(bundle, journal=current_terminal)
+    )
+
+
+def _finish_rolled_back_update_cleanup(
+    *,
+    bundle: PersistentRecoveryBundle,
+    offline_receipt: OfflinePackageReceipt | None,
+    overlay_receipt: QuiescedOverlayReceipt | None,
+    package_receipt: PreparedPackageReceipt | PackageRecoveryReceipt | None,
+    update_safety_contract: UpdateSafetyContract | None,
+) -> PersistentRecoveryBundle:
+    """Bindet rolled_back erneut und führt ausschließlich terminalen Cleanup aus."""
+
+    terminal = _refresh_terminal_recovery_bundle(
+        bundle,
+        phase=recovery_journal.PHASE_ROLLED_BACK,
+    )
+    _cleanup_terminal_update_artifacts(
+        bundle=terminal,
+        offline_receipt=offline_receipt,
+        overlay_receipt=overlay_receipt,
+        package_receipt=package_receipt,
+        update_safety_contract=update_safety_contract,
+        terminal_label="wiederhergestellte Altstand",
+    )
+    return terminal
+
+
+def _restore_recovery_surface(
+    inventory: RecoverySurfaceInventory,
+    state: TransitionState,
+    *,
+    restore_legacy_systemd_surface: bool = True,
+) -> None:
+    # Die aktuellen Zustände aller privilegierten Nebenflächen werden als
+    # Restore-Guard gebunden, bevor die erste davon verändert wird. Der Guard
+    # ist ein interner Fremdänderungsschutz, keine Nutzerhürde.
+    root_file_guard = (
+        capture_root_file_restore_guard(inventory.root_file_preimages)
+        if inventory.root_file_preimages is not None
+        else None
+    )
+    crontab_guard = (
+        capture_crontab_restore_guard(inventory.crontab_preimages)
+        if inventory.crontab_preimages is not None
+        else None
+    )
+    if root_file_guard is not None:
+        restore_root_file_preimages(inventory.root_file_preimages, root_file_guard)
+    if crontab_guard is not None:
+        restore_crontab_preimages(inventory.crontab_preimages, crontab_guard)
     # Die beiden privilegierten Web-Aktoren werden vom Ziel-Finalizer früh
     # mutiert. Ihr Rücklauf hat deshalb Vorrang vor allen nachfolgenden,
     # voneinander unabhängigen Recovery-Schritten.
@@ -11175,30 +15458,40 @@ def _restore_recovery_surface(inventory: RecoverySurfaceInventory, state: Transi
         inventory.web_program_entries,
         excluded_top=("data", "logs", "ramdisk", "tmp"),
     )
-    allowed_units = set(_catalog_units_strict()) | {"piguard.service", "e3dc.service"}
-    for unit in sorted(allowed_units - set(state.preinstalled_units)):
-        path = os.path.join("/etc/systemd/system", unit)
-        if os.path.lexists(path):
-            os.unlink(path)
+    if restore_legacy_systemd_surface:
+        allowed_units = set(_catalog_units_strict()) | {
+            "piguard.service",
+            "e3dc.service",
+        }
+        for unit in sorted(allowed_units - set(state.preinstalled_units)):
+            path = os.path.join("/etc/systemd/system", unit)
+            if os.path.lexists(path):
+                os.unlink(path)
     for path in ("/usr/local/bin/boot_notify.sh", "/usr/local/bin/pi_guard.sh"):
         if path not in inventory.watchdog_files and os.path.lexists(path):
             os.unlink(path)
-    _restore_apache_security_preimage(inventory.apache_security)
-    daemon_reload = run_command("sudo systemctl daemon-reload", timeout=20)
-    if not daemon_reload["success"]:
-        raise RuntimeError("systemd daemon-reload nach Recovery fehlgeschlagen")
-    for unit, previous in inventory.unit_enablement:
-        if previous in {"enabled", "enabled-runtime"}:
-            command = f"sudo systemctl enable {unit}"
-        elif previous == "masked":
-            command = f"sudo systemctl mask {unit}"
-        elif previous == "disabled":
-            command = f"sudo systemctl disable {unit}"
-        else:
-            continue
-        result = run_command(command, timeout=20)
-        if not result["success"]:
-            raise RuntimeError(f"Enablement von {unit} konnte nicht wiederhergestellt werden")
+    _restore_apache_security_preimage(
+        inventory.apache_security,
+        restore_activity=False,
+    )
+    if restore_legacy_systemd_surface:
+        daemon_reload = run_command("sudo systemctl daemon-reload", timeout=20)
+        if not daemon_reload["success"]:
+            raise RuntimeError("systemd daemon-reload nach Recovery fehlgeschlagen")
+        for unit, previous in inventory.unit_enablement:
+            if previous in {"enabled", "enabled-runtime"}:
+                command = f"sudo systemctl enable {unit}"
+            elif previous == "masked":
+                command = f"sudo systemctl mask {unit}"
+            elif previous == "disabled":
+                command = f"sudo systemctl disable {unit}"
+            else:
+                continue
+            result = run_command(command, timeout=20)
+            if not result["success"]:
+                raise RuntimeError(
+                    f"Enablement von {unit} konnte nicht wiederhergestellt werden"
+                )
 
 
 def _read_commit_text(
@@ -11360,6 +15653,58 @@ def _validate_target_release(
     return stable
 
 
+def _validate_local_target_release_binding(
+    policy: dict,
+    repo_dir: str,
+    target_commit: str,
+    target_tag: str,
+    install_user: str,
+    *,
+    root_authority: bool = False,
+) -> str:
+    """Prüft nach dem Freeze nur zuvor geladene Git-Objekte, ohne Netzwerk."""
+
+    commit = _validate_full_commit(target_commit)
+    tag = _normalize_release_tag(target_tag)
+    version = _read_commit_text(
+        repo_dir,
+        commit,
+        "VERSION",
+        install_user,
+        **_root_git_call_kwargs(root_authority),
+    ).strip().lstrip("v")
+    stable = _normalize_release_tag(str(policy.get("stable_release") or ""))
+    if (
+        not version
+        or str(policy.get("version") or "").strip().lstrip("v") != version
+        or stable != _normalize_release_tag(version)
+        or stable != tag
+        or policy.get("run_permissions") is not True
+    ):
+        raise RuntimeError("Lokale Ziel-Policy, VERSION und Stable-Tag widersprechen sich")
+    storage_ref = f"refs/tags/{tag}"
+    object_type = _git_argv(
+        repo_dir,
+        install_user,
+        "cat-file",
+        "-t",
+        storage_ref,
+        timeout=15,
+        **_root_git_call_kwargs(root_authority),
+    )
+    if not object_type.get("success") or object_type.get("stdout", "").strip() != "tag":
+        raise RuntimeError(f"Lokal vorbereitetes Release-Tag {tag} ist nicht annotiert")
+    resolved = _resolve_git_commit(
+        repo_dir,
+        storage_ref,
+        install_user,
+        **_root_git_call_kwargs(root_authority),
+    )
+    if not resolved or not _exact_commit_matches(resolved, commit):
+        raise RuntimeError("Lokal vorbereitetes Release-Tag verweist nicht auf die Ziel-SHA")
+    return stable
+
+
 def _assert_tree_no_symlinks(root: str) -> None:
     for directory, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
         for name in (*dirnames, *filenames):
@@ -11400,12 +15745,12 @@ def _sync_release_web(
     if errors:
         raise RuntimeError("Webquelle unvollstaendig: " + "; ".join(errors))
     _assert_tree_no_symlinks(html_src)
-    if not _ensure_rsync_available():
+    if not _ensure_rsync_available(allow_install=False):
         raise RuntimeError("rsync ist nicht verfuegbar")
     _prepare_webroot_dirs()
     result = _run_argv(
         [
-            "sudo", "rsync", "-a",
+            "sudo", "rsync", "-a", "--delete", "--delete-delay",
             "--exclude", "data", "--exclude", "logs", "--exclude", "ramdisk", "--exclude", "tmp",
             html_src.rstrip(os.sep) + os.sep,
             "/var/www/html/",
@@ -11434,15 +15779,14 @@ def _sync_release_web(
             "bleiben im Release-Fenster unverändert."
         )
     from .apache_security import ensure_apache_runtime_path_protection
-    _ensure_apache_canonical_running()
     if not ensure_apache_runtime_path_protection(
         run_command,
-        reload_apache=True,
+        reload_apache=False,
         allow_mutation=True,
     ):
         raise RuntimeError(
             "Apache-Schutz für Daten-, Log-, Ramdisk- und Temp-Pfade "
-            "konnte nicht aktiviert werden"
+            "konnte unter gestopptem Apache nicht vorbereitet werden"
         )
     if not policy.get("run_permissions", True):
         if _fix_webroot_permissions() is not True:
@@ -11590,6 +15934,18 @@ def finalize_release_from_target(
     expected_legacy_activity: str,
     expected_venv_state: str,
     expected_venv_path: str,
+    expected_package_receipt_sha256: str,
+    expected_package_receipt_device: int,
+    expected_package_receipt_inode: int,
+    expected_package_full_backup_id: str,
+    expected_recovery_journal_sha256: str,
+    expected_recovery_journal_device: int,
+    expected_recovery_journal_inode: int,
+    expected_recovery_journal_phase: str,
+    expected_apache_available: bool,
+    expected_apache_active: bool,
+    expected_apache_unit_file_state: str,
+    static_recovery_contract_json: str = "",
     update_safety_transaction: str | None = None,
     update_safety_receipt_sha256: str | None = None,
     update_safety_service_unit: str | None = None,
@@ -11598,7 +15954,6 @@ def finalize_release_from_target(
     explicit_download_bootstrap: bool = False,
     headless: bool = True,
     privileged_preimages=None,
-    postcommit_state: dict[str, bool] | None = None,
 ) -> None:
     """Finalisiert einen Reset ausschließlich aus dem versiegelten Commit-Snapshot."""
 
@@ -11631,10 +15986,6 @@ def finalize_release_from_target(
     )
     if any(safety_values) and not all(safety_values):
         raise RuntimeError("Target-Finalizer besitzt einen partiellen Update-Sicherheitsvertrag")
-    if postcommit_state is not None and postcommit_state != {
-        "commit_attempted": False
-    }:
-        raise RuntimeError("Target-Finalizer besitzt keinen frischen PostCommit-Grenzzustand")
     safety_contract = None
     if all(safety_values):
         safety_contract = _read_update_safety_contract()
@@ -11649,6 +16000,11 @@ def finalize_release_from_target(
             or safety_contract.target_commit != commit
             or safety_contract.target_tag != _normalize_release_tag(target_tag)
             or safety_contract.role != role
+            or not safety_contract.apache_completion_required
+            or safety_contract.apache_available != expected_apache_available
+            or safety_contract.apache_was_active != expected_apache_active
+            or safety_contract.apache_unit_file_state
+            != str(expected_apache_unit_file_state or "").strip().lower()
         ):
             raise RuntimeError("Target-Finalizer sieht nicht das pending Sicherheitsreceipt")
         _verify_update_safety_marker(safety_contract, expected_present=True)
@@ -11658,6 +16014,71 @@ def finalize_release_from_target(
             repo_dir=target_root,
             transaction_id=safety_contract.transaction_id,
         )
+    static_bootblock_contract = None
+    if static_recovery_contract_json:
+        if safety_contract is not None:
+            raise RuntimeError(
+                "Dynamischer und statischer Update-Bootblock dürfen nicht kombiniert werden"
+            )
+        static_bootblock_contract = _parse_recovery_bootblock_contract(
+            static_recovery_contract_json
+        )
+        _assert_managed_finalizer_service(static_bootblock_contract)
+        _assert_strict_update_writer_quiescence(
+            repo_dir=target_root,
+            transaction_id=static_bootblock_contract.transaction_id,
+        )
+
+    expected_package_transaction = (
+        safety_contract.transaction_id
+        if safety_contract is not None
+        else (
+            static_bootblock_contract.transaction_id
+            if static_bootblock_contract is not None
+            else None
+        )
+    )
+    package_receipt = _require_prepared_package_receipt_binding(
+        expected_state="prepared",
+        expected_transaction_id=expected_package_transaction,
+        expected_install_root=target_root,
+        expected_full_backup_id=expected_package_full_backup_id,
+        expected_receipt_sha256=expected_package_receipt_sha256,
+        expected_receipt_dev=expected_package_receipt_device,
+        expected_receipt_ino=expected_package_receipt_inode,
+    )
+    if (
+        safety_contract is not None
+        and package_receipt.full_backup_id != safety_contract.backup_id
+    ):
+        raise RuntimeError("Paket-Receipt widerspricht dem Recovery-Backup")
+    if (
+        not package_receipt.apache_completion_required
+        or package_receipt.target_commit != commit
+        or package_receipt.target_tag != tag
+        or package_receipt.role != role
+        or package_receipt.apache_available != expected_apache_available
+        or package_receipt.apache_was_active != expected_apache_active
+        or package_receipt.apache_unit_file_state
+        != str(expected_apache_unit_file_state or "").strip().lower()
+        or package_receipt.static_recovery_contract_json
+        != str(static_recovery_contract_json or "")
+    ):
+        raise RuntimeError("Paket-Receipt widerspricht dem Release-/Apache-Abschluss")
+
+    recovery_journal_contract = _bind_product_mutating_recovery_journal(
+        expected_device=expected_recovery_journal_device,
+        expected_inode=expected_recovery_journal_inode,
+        expected_sha256=expected_recovery_journal_sha256,
+        expected_phase=expected_recovery_journal_phase,
+        repo_dir=target_root,
+        target_commit=commit,
+        target_tag=tag,
+        role=role,
+        package_receipt=package_receipt,
+        update_safety_contract=safety_contract,
+        static_bootblock_contract=static_bootblock_contract,
+    )
 
     actual_commit = _resolve_git_commit(
         target_root,
@@ -11688,7 +16109,7 @@ def finalize_release_from_target(
         install_user,
         **_root_git_call_kwargs(explicit_download_bootstrap),
     )
-    _validate_target_release(
+    _validate_local_target_release_binding(
         policy,
         target_root,
         commit,
@@ -11710,6 +16131,32 @@ def finalize_release_from_target(
             raise RuntimeError("Watchdog-Laufzeit-venv besitzt keinen absoluten Pfad")
     elif expected_venv_state != "unused" or expected_venv_path:
         raise RuntimeError("venv-Preimage ist ohne Python-Paketpolicy unzulässig")
+    contract_transaction_id = (
+        safety_contract.transaction_id
+        if safety_contract is not None
+        else (
+            static_bootblock_contract.transaction_id
+            if static_bootblock_contract is not None
+            else package_receipt.transaction_id
+        )
+    )
+    if package_receipt.prepared_state is None:
+        raise RuntimeError("Paket-Receipt besitzt keinen vorbereiteten Postzustand")
+    receipt_venv_state, receipt_venv_path = _finalizer_venv_contract(
+        package_receipt.package_transaction
+    )
+    if (
+        package_receipt.package_transaction.install_user != install_user
+        or receipt_venv_state != expected_venv_state
+        or receipt_venv_path != expected_venv_path
+    ):
+        raise RuntimeError("Paket-Receipt widerspricht dem Finalizer-Preimage")
+    _verify_prepared_package_policy_applied(
+        policy,
+        install_user,
+        expected_transaction_id=contract_transaction_id,
+        prepared=package_receipt.prepared_state,
+    )
     _validate_watchdog_runtime_venv_contract(
         required=watchdog_runtime_required,
         expected_venv_state=expected_venv_state,
@@ -11732,12 +16179,11 @@ def finalize_release_from_target(
     )
     _verify_worktree_policy(target_root, policy)
     _migrate_bootstrap_legacy_config(target_root, state)
-    _apply_verified_package_policy(
-        policy,
-        install_user,
-        expected_venv_state=expected_venv_state,
-        expected_venv_path=expected_venv_path,
-    )
+    if expected_venv_path:
+        _harden_existing_release_venv(
+            install_user,
+            expected_venv_path,
+        )
     if explicit_download_bootstrap:
         projection_config, projection_sha256 = state.config, state.config_sha256
         if state.bootstrap_legacy_config:
@@ -11916,6 +16362,15 @@ def finalize_release_from_target(
     if safety_contract is None:
         _verify_transition_state(state)
     _announce_finalizer_phase(5, phase_total, "Dienste aktivieren und geordnet starten")
+    if static_bootblock_contract is not None:
+        _assert_strict_update_writer_quiescence(
+            repo_dir=target_root,
+            transaction_id=static_bootblock_contract.transaction_id,
+        )
+        _create_update_safety_start_token(
+            static_bootblock_contract,
+            repo_dir=target_root,
+        )
     if not _restart_v4_services(
         headless=headless,
         services=restart_services,
@@ -11924,17 +16379,25 @@ def finalize_release_from_target(
         projected_piguard=projected_piguard,
     ):
         raise RuntimeError("Erwartete Dienste konnten nicht vollständig gestartet werden")
-    if safety_contract is None and not refresh_bound_watchdog():
-        _stop_v4_services(restart_services)
-        raise RuntimeError("Watchdog-Guard konnte nach dem finalen Dienststart nicht aktualisiert werden")
-    _announce_finalizer_phase(6, phase_total, "Gesundheit und Bootvertrag verifizieren")
+    # Der Webserver bleibt bis hinter der durable Commit-Grenze vollständig
+    # inaktiv. PHP, Dienste und HA werden daher zunächst ohne HTTP geprüft.
     if not _post_update_healthcheck(
         restart_services,
         transition_state=state,
         projected_piguard=projected_piguard,
+        check_http=False,
     ):
         _stop_v4_services(restart_services)
-        raise RuntimeError("Dienst-/HTTP-/HA-Gesundheitsgate fehlgeschlagen")
+        raise RuntimeError("Dienst-/HA-Gesundheitsgate vor Apache-Freigabe fehlgeschlagen")
+    _verify_apache_quiesced_before_commit(
+        expected_available=expected_apache_available,
+        expected_active=expected_apache_active,
+        expected_unit_file_state=expected_apache_unit_file_state,
+    )
+    if safety_contract is None and not refresh_bound_watchdog():
+        _stop_v4_services(restart_services)
+        raise RuntimeError("Watchdog-Guard konnte nach dem finalen Dienststart nicht aktualisiert werden")
+    _announce_finalizer_phase(6, phase_total, "Boot-, Paket- und Releasevertrag verifizieren")
 
     try:
         from .boot_sanity import check_boot_sanity
@@ -11960,21 +16423,35 @@ def finalize_release_from_target(
         _verify_update_safety_marker(safety_contract, expected_present=True)
         _reload_and_verify_update_safety_dropins(safety_contract, expected_present=True)
         _assert_managed_finalizer_service(safety_contract)
-        commit_may_be_irreversible = False
+        _validate_prepared_package_receipt(
+            package_receipt,
+            expected_state="prepared",
+        )
+    else:
+        _validate_prepared_package_receipt(
+            package_receipt,
+            expected_state="prepared",
+        )
+        if static_bootblock_contract is None:
+            raise RuntimeError("Statischer Abschluss besitzt keinen Bootblockvertrag")
+        _assert_managed_finalizer_service(static_bootblock_contract)
+
+    recovery_journal_contract = _advance_persistent_recovery_committed(
+        recovery_journal_contract
+    )
+
+    if safety_contract is not None:
         try:
-            # Die Grenze liegt bewusst vor dem Call. Dadurch bleibt auch ein
-            # Signal nach möglicher Receipt-Mutation, aber vor Return/Assign,
-            # konservativ und kann niemals Altpreimages restaurieren.
-            commit_may_be_irreversible = True
-            if postcommit_state is not None:
-                postcommit_state["commit_attempted"] = True
             committed_contract = _commit_update_safety_receipt(safety_contract)
-            _clear_update_safety_marker(committed_contract)
-            _remove_update_safety_dropins(committed_contract)
+            package_receipt = _commit_prepared_package_receipt(package_receipt)
+            _finish_committed_update_safety_cleanup(
+                committed_contract,
+                remove_receipt=False,
+            )
             _announce_finalizer_phase(
                 7,
                 phase_total,
-                "Initiale lokale Prognose aktualisieren",
+                "Apache öffnen und initiale Prognose aktualisieren",
             )
             try:
                 run_initial_forecast(os.path.join(target_root, "Installer"))
@@ -11986,20 +16463,38 @@ def finalize_release_from_target(
         except BaseException as exc:
             if isinstance(exc, UpdateSafetyPostCommitError):
                 raise
-            if not commit_may_be_irreversible:
-                raise
             raise UpdateSafetyPostCommitError(
-                "Target-Finalizer brach nach Eintritt in seine irreversible "
-                "Commit-/PostCommit-Kapsel ab"
+                "Target-Finalizer brach nach durable committed Master-Journal "
+                "im PostCommit-Abschluss ab"
             ) from exc
     else:
-        _announce_finalizer_phase(7, phase_total, "Initiale lokale Prognose aktualisieren")
-        run_initial_forecast(os.path.join(target_root, "Installer"))
-        _project_bare_metal_logrotate_config(
-            repo_dir=target_root,
-            target_commit=commit,
-            install_user=install_user,
-        )
+        try:
+            package_receipt = _commit_prepared_package_receipt(package_receipt)
+            _clear_recovery_bootblock_marker(static_bootblock_contract)
+            _remove_persistent_recovery_bootblock(static_bootblock_contract)
+            _complete_bound_apache_after_commit(
+                expected_available=expected_apache_available,
+                expected_active=expected_apache_active,
+                expected_unit_file_state=expected_apache_unit_file_state,
+            )
+            _announce_finalizer_phase(
+                7,
+                phase_total,
+                "Apache öffnen und initiale Prognose aktualisieren",
+            )
+            run_initial_forecast(os.path.join(target_root, "Installer"))
+            _project_bare_metal_logrotate_config(
+                repo_dir=target_root,
+                target_commit=commit,
+                install_user=install_user,
+            )
+        except BaseException as exc:
+            if isinstance(exc, UpdateSafetyPostCommitError):
+                raise
+            raise UpdateSafetyPostCommitError(
+                "Statischer Target-Finalizer brach nach durable committed "
+                "Master-Journal im PostCommit-Abschluss ab"
+            ) from exc
 
 
 def _target_execution_archive_entries(
@@ -12800,7 +17295,10 @@ def _invoke_target_finalizer(
     target_commit: str,
     target_tag: str,
     state: TransitionState,
-    package_transaction: PackageTransactionState,
+    package_receipt: PreparedPackageReceipt,
+    recovery_journal_contract: recovery_journal.RecoveryJournalContract,
+    apache_preimage: ApacheSecurityPreimage,
+    static_bootblock_contract: RecoveryBootblockContract | None = None,
     update_safety_contract: UpdateSafetyContract | None = None,
     explicit_download_bootstrap: bool = False,
 ) -> None:
@@ -12808,6 +17306,33 @@ def _invoke_target_finalizer(
 
     lock_fd = _required_update_lock_fd()
     install_user = get_install_user()
+    package_receipt = _validate_prepared_package_receipt(
+        package_receipt,
+        expected_state="prepared",
+    )
+    recovery_journal_contract = recovery_journal.verify_recovery_journal(
+        recovery_journal_contract
+    )
+    if (
+        recovery_journal_contract.payload.phase
+        != recovery_journal.PHASE_PRODUCT_MUTATING
+        or recovery_journal_contract.payload.install_root != repo_dir
+        or recovery_journal_contract.payload.target.commit != target_commit
+        or recovery_journal_contract.payload.target.tag != target_tag
+        or recovery_journal_contract.payload.target.role != state.ha_role
+        or recovery_journal_contract.payload.transaction_id
+        != package_receipt.transaction_id
+        or recovery_journal_contract.payload.full_backup.backup_id
+        != package_receipt.full_backup_id
+    ):
+        raise RuntimeError(
+            "Master-Journal widerspricht dem Finalizer-Handoff"
+        )
+    if (
+        package_receipt.install_root != repo_dir
+        or package_receipt.package_transaction.install_user != install_user
+    ):
+        raise RuntimeError("Paket-Receipt widerspricht dem Finalizer-Handoff")
     if update_safety_contract is not None:
         update_safety_contract = _validate_update_safety_contract(
             update_safety_contract,
@@ -12817,6 +17342,8 @@ def _invoke_target_finalizer(
             update_safety_contract.target_commit != target_commit
             or update_safety_contract.target_tag != _normalize_release_tag(target_tag)
             or update_safety_contract.role != state.ha_role
+            or update_safety_contract.transaction_id != package_receipt.transaction_id
+            or update_safety_contract.backup_id != package_receipt.full_backup_id
         ):
             raise RuntimeError("Target-Finalizer widerspricht dem Update-Sicherheitsreceipt")
         _verify_update_safety_marker(update_safety_contract, expected_present=True)
@@ -12828,6 +17355,28 @@ def _invoke_target_finalizer(
             repo_dir=repo_dir,
             transaction_id=update_safety_contract.transaction_id,
         )
+    if update_safety_contract is not None and static_bootblock_contract is not None:
+        raise RuntimeError(
+            "Target-Finalizer erhielt dynamischen und statischen Bootblock zugleich"
+        )
+    if static_bootblock_contract is not None:
+        _validate_recovery_bootblock_contract(static_bootblock_contract)
+        _verify_recovery_bootblock_marker(
+            static_bootblock_contract,
+            expected_present=True,
+        )
+        _reload_and_verify_recovery_dropins(
+            static_bootblock_contract.units,
+            expected_present=True,
+            transaction_id=static_bootblock_contract.transaction_id,
+        )
+        _assert_strict_update_writer_quiescence(
+            repo_dir=repo_dir,
+            transaction_id=static_bootblock_contract.transaction_id,
+        )
+        if static_bootblock_contract.transaction_id != package_receipt.transaction_id:
+            raise RuntimeError("Statischer Bootblock widerspricht dem Paket-Receipt")
+    managed_lease_contract = update_safety_contract or static_bootblock_contract
     bound_target_files = {
         relative_path: _bind_target_file_to_commit(
             repo_dir=repo_dir,
@@ -12851,7 +17400,9 @@ def _invoke_target_finalizer(
             raise RuntimeError(f"Target-Modul wurde nach der Commit-Bindung ausgetauscht: {relative_path}")
 
     config_state = "missing" if state.bootstrap_legacy_config else "present"
-    venv_state, venv_path = _finalizer_venv_contract(package_transaction)
+    venv_state, venv_path = _finalizer_venv_contract(
+        package_receipt.package_transaction
+    )
 
     snapshot_parent = _trusted_same_filesystem_snapshot_parent(repo_dir)
     _cleanup_stale_target_execution_snapshots(
@@ -12907,9 +17458,29 @@ def _invoke_target_finalizer(
         "--expected-legacy-activity", state.legacy_e3dc_activity,
         "--expected-venv-state", venv_state,
         "--expected-venv-path", venv_path,
+        "--expected-package-receipt-sha256", package_receipt.receipt_sha256,
+        "--expected-package-receipt-device", str(package_receipt.receipt_dev),
+        "--expected-package-receipt-inode", str(package_receipt.receipt_ino),
+        "--expected-package-full-backup-id", package_receipt.full_backup_id,
+        "--expected-recovery-journal-sha256",
+        recovery_journal_contract.journal_sha256,
+        "--expected-recovery-journal-device",
+        str(recovery_journal_contract.journal_device),
+        "--expected-recovery-journal-inode",
+        str(recovery_journal_contract.journal_inode),
+        "--expected-recovery-journal-phase",
+        recovery_journal_contract.payload.phase,
+        "--expected-apache-available", "1" if apache_preimage.apache_available else "0",
+        "--expected-apache-active", "1" if apache_preimage.apache_was_active else "0",
+        "--expected-apache-unit-file-state", apache_preimage.apache_unit_file_state,
     ]
     if explicit_download_bootstrap:
         finalizer_args.append("--explicit-download-bootstrap")
+    if static_bootblock_contract is not None:
+        finalizer_args.extend((
+            "--static-recovery-contract-json",
+            _serialize_recovery_bootblock_contract(static_bootblock_contract),
+        ))
     if update_safety_contract is not None:
         finalizer_args.extend((
             "--update-safety-transaction", update_safety_contract.transaction_id,
@@ -12922,7 +17493,11 @@ def _invoke_target_finalizer(
     managed_service_spawn_attempted = False
     managed_service_quiesced = False
     managed_service_quiesce_error: BaseException | None = None
+    durable_recovery_committed_observed: (
+        recovery_journal.RecoveryJournalContract | None
+    ) = None
     durable_committed_observed: UpdateSafetyContract | None = None
+    durable_package_committed_observed: PreparedPackageReceipt | None = None
     try:
         _verify_target_execution_snapshot(
             snapshot_root,
@@ -12930,7 +17505,7 @@ def _invoke_target_finalizer(
             owner_uid=os.geteuid(),
             owner_gid=os.getegid(),
         )
-        if update_safety_contract is None:
+        if managed_lease_contract is None:
             result = _run_streaming_argv(
                 [python, "-I", "-B", "-u", finalizer, *finalizer_args],
                 timeout=TARGET_FINALIZER_TIMEOUT_S,
@@ -12967,7 +17542,7 @@ def _invoke_target_finalizer(
                 "--quiet",
                 "--wait",
                 "--pipe",
-                f"--unit={update_safety_contract.finalizer_unit}",
+                f"--unit={managed_lease_contract.finalizer_unit}",
                 "--service-type=exec",
                 "--property=ExitType=main",
                 "--property=KillMode=control-group",
@@ -12977,7 +17552,7 @@ def _invoke_target_finalizer(
                 "--property=DynamicUser=no",
                 "--property=WorkingDirectory=/",
                 "--property=UMask=0077",
-                f"--property=RuntimeDirectory={update_safety_contract.runtime_directory}",
+                f"--property=RuntimeDirectory={managed_lease_contract.runtime_directory}",
                 "--property=RuntimeDirectoryMode=0700",
                 "--property=RuntimeDirectoryPreserve=no",
                 f"--property=RuntimeMaxSec={UPDATE_FINALIZER_RUNTIME_MAX_S}s",
@@ -12995,16 +17570,34 @@ def _invoke_target_finalizer(
                 "--execution-root", snapshot_root,
                 "--expected-release-sha", target_commit,
                 "--expected-install-user", install_user,
-                "--update-safety-transaction", update_safety_contract.transaction_id,
-                "--update-safety-receipt-sha256", update_safety_contract.receipt_sha256,
-                "--update-safety-service-unit", update_safety_contract.finalizer_unit,
-                "--update-safety-runtime-directory", update_safety_contract.runtime_directory,
-                "--update-safety-token-path", update_safety_contract.token_path,
+                "--update-safety-transaction", managed_lease_contract.transaction_id,
+                "--update-safety-service-unit", managed_lease_contract.finalizer_unit,
+                "--update-safety-runtime-directory", managed_lease_contract.runtime_directory,
+                "--update-safety-token-path", managed_lease_contract.token_path,
                 "--expected-lock-device", str(lock_metadata.st_dev),
                 "--expected-lock-inode", str(lock_metadata.st_ino),
-                "--",
-                *finalizer_args,
+                "--expected-recovery-journal-sha256",
+                recovery_journal_contract.journal_sha256,
+                "--expected-recovery-journal-device",
+                str(recovery_journal_contract.journal_device),
+                "--expected-recovery-journal-inode",
+                str(recovery_journal_contract.journal_inode),
+                "--expected-recovery-journal-phase",
+                recovery_journal_contract.payload.phase,
             ]
+            if update_safety_contract is not None:
+                command.extend((
+                    "--update-safety-receipt-sha256",
+                    update_safety_contract.receipt_sha256,
+                ))
+            else:
+                command.extend((
+                    "--static-recovery-contract-json",
+                    _serialize_recovery_bootblock_contract(
+                        static_bootblock_contract
+                    ),
+                ))
+            command.extend(("--", *finalizer_args))
             managed_service_spawn_attempted = True
             result = _run_streaming_argv(
                 command,
@@ -13023,7 +17616,7 @@ def _invoke_target_finalizer(
                     "Verwalteter Target-Finalizer fehlgeschlagen: "
                     + _combined_process_diagnostics(result or {})
                 )
-            _wait_managed_finalizer_inactive(update_safety_contract)
+            _wait_managed_finalizer_inactive(managed_lease_contract)
             managed_service_quiesced = True
 
         if result is None:
@@ -13037,6 +17630,38 @@ def _invoke_target_finalizer(
                 "Target-Finalizer fehlgeschlagen: "
                 + _combined_process_diagnostics(result)
             )
+        durable_recovery_committed_observed = (
+            _read_matching_committed_recovery_journal(
+                recovery_journal_contract
+            )
+        )
+        if durable_recovery_committed_observed is None:
+            current_recovery_journal = recovery_journal.read_recovery_journal(
+                allow_missing=True
+            )
+            if current_recovery_journal == recovery_journal_contract:
+                raise RuntimeError(
+                    "Finalizer-Erfolg besitzt kein durable committed "
+                    "Master-Journal"
+                )
+            raise UpdateSafetyManagedServiceUnquiescedError(
+                "Master-Journal driftete nach Finalizer-Erfolg; "
+                "Altstand-Rollback bleibt fail-closed gesperrt"
+            )
+        committed_package_receipt = _read_prepared_package_receipt()
+        if (
+            committed_package_receipt is None
+            or committed_package_receipt.state != "committed"
+            or not _same_prepared_package_transaction_shape(
+                committed_package_receipt,
+                package_receipt,
+            )
+        ):
+            raise RuntimeError(
+                "Finalizer-Erfolg besitzt nicht den committed Ersatz seines "
+                "Paket-Receipts"
+            )
+        durable_package_committed_observed = committed_package_receipt
         if update_safety_contract is not None:
             committed = _read_update_safety_contract()
             if (
@@ -13062,14 +17687,99 @@ def _invoke_target_finalizer(
                 f"/run/{committed.runtime_directory}"
             ):
                 raise RuntimeError("Finalizer-Lease blieb nach erfolgreichem Serviceende liegen")
-            _remove_exact_update_safety_receipt(committed)
+            # Safety- und Paket-Receipt bleiben bis hinter Snapshot-, Offline-
+            # und Overlay-Cleanup als durable Abschlussbeleg erhalten.
+        elif static_bootblock_contract is not None:
+            _verify_recovery_bootblock_marker(
+                static_bootblock_contract,
+                expected_present=False,
+            )
+            _reload_and_verify_recovery_dropins(
+                static_bootblock_contract.units,
+                expected_present=False,
+                transaction_id=static_bootblock_contract.transaction_id,
+            )
+            # Das Paket-Receipt bleibt als statischer Abschlussbeleg bis zum
+            # vollständig bestätigten äußeren Cleanup erhalten.
+        else:
+            # Auch der direkte Pfad entfernt seinen Paketbeleg erst außen.
+            pass
     except BaseException as original_error:
-        if update_safety_contract is not None and managed_service_spawn_attempted:
+        if durable_recovery_committed_observed is None:
+            try:
+                durable_recovery_committed_observed = (
+                    _read_matching_committed_recovery_journal(
+                        recovery_journal_contract,
+                        allow_missing=True,
+                    )
+                )
+                current_recovery_journal = (
+                    recovery_journal.read_recovery_journal(allow_missing=True)
+                )
+            except Exception as journal_error:
+                raise UpdateSafetyManagedServiceUnquiescedError(
+                    "Master-Journal ist nach Finalizerfehler nicht sicher "
+                    "lesbar; Altstand-Rollback bleibt fail-closed gesperrt"
+                ) from journal_error
+            if (
+                durable_recovery_committed_observed is None
+                and current_recovery_journal != recovery_journal_contract
+            ):
+                raise UpdateSafetyManagedServiceUnquiescedError(
+                    "Master-Journal driftete nach Finalizerfehler; "
+                    "Altstand-Rollback bleibt fail-closed gesperrt"
+                ) from original_error
+        if managed_lease_contract is not None and managed_service_spawn_attempted:
+            if durable_package_committed_observed is None:
+                try:
+                    current_package_after_failure = _read_prepared_package_receipt(
+                        allow_missing=True
+                    )
+                except Exception as package_receipt_error:
+                    update_logger.critical(
+                        "Paket-Receipt ist nach Finalizerfehler unlesbar: %s",
+                        package_receipt_error,
+                    )
+                    current_package_after_failure = None
+                if (
+                    current_package_after_failure is not None
+                    and current_package_after_failure.state == "committed"
+                    and _same_prepared_package_transaction_shape(
+                        current_package_after_failure,
+                        package_receipt,
+                    )
+                ):
+                    durable_package_committed_observed = (
+                        current_package_after_failure
+                    )
+            if update_safety_contract is not None and durable_committed_observed is None:
+                try:
+                    current_after_failure = _read_update_safety_contract(
+                        allow_missing=True
+                    )
+                except Exception as receipt_error:
+                    update_logger.critical(
+                        "Update-Sicherheitsreceipt ist nach Finalizerfehler unlesbar: %s",
+                        receipt_error,
+                    )
+                    current_after_failure = None
+                if (
+                    current_after_failure is not None
+                    and current_after_failure.state == "committed"
+                    and _same_update_safety_transaction_shape(
+                        current_after_failure,
+                        update_safety_contract,
+                    )
+                ):
+                    durable_committed_observed = current_after_failure
             try:
                 _kill_managed_finalizer_and_quiesce(
-                    update_safety_contract,
+                    managed_lease_contract,
                     repo_dir=repo_dir,
-                    require_pending_contract=durable_committed_observed is None,
+                    require_pending_contract=(
+                        update_safety_contract is not None
+                        and durable_committed_observed is None
+                    ),
                 )
                 managed_service_quiesced = True
             except BaseException as quiesce_error:
@@ -13078,6 +17788,18 @@ def _invoke_target_finalizer(
                     "Verwaltete Finalizer-cgroup/Writer-Ruhe blieb unbewiesen: %s",
                     quiesce_error,
                 )
+            if (
+                durable_recovery_committed_observed is None
+                and (
+                    durable_committed_observed is not None
+                    or durable_package_committed_observed is not None
+                )
+            ):
+                raise UpdateSafetyManagedServiceUnquiescedError(
+                    "Safety- oder Paket-Receipt ist committed, obwohl das "
+                    "autoritative Master-Journal nicht committed ist; "
+                    "Recoverymutation bleibt fail-closed gesperrt"
+                ) from original_error
             if durable_committed_observed is not None:
                 try:
                     current = _read_update_safety_contract(allow_missing=True)
@@ -13101,8 +17823,23 @@ def _invoke_target_finalizer(
                             "Committed Update-Gate blieb fail-closed stehen: %s",
                             cleanup_error,
                         )
+            if durable_package_committed_observed is not None:
+                if managed_service_quiesced:
+                    try:
+                        _finish_committed_package_gate_cleanup(
+                            durable_package_committed_observed
+                        )
+                    except Exception as cleanup_error:
+                        update_logger.critical(
+                            "Committed statischer Apache-Abschluss blieb stehen: %s",
+                            cleanup_error,
+                        )
+            if durable_recovery_committed_observed is not None:
                 raise UpdateSafetyPostCommitError(
-                    "Receipt-Cleanup brach nach durable committed ab"
+                    "Apache-/Receipt-Abschluss brach nach durable committed "
+                    "Master-Journal ab. Lösung: Keine Receipt-, Overlay- oder "
+                    "Backup-Datei manuell löschen; denselben Updatebefehl "
+                    "erneut starten."
                 ) from original_error
             if not managed_service_quiesced:
                 raise UpdateSafetyManagedServiceUnquiescedError(
@@ -13110,10 +17847,16 @@ def _invoke_target_finalizer(
                     "Kindprozessfehler unbewiesen; Recoverymutation ist gesperrt: "
                     f"{managed_service_quiesce_error}"
                 ) from original_error
+        if durable_recovery_committed_observed is not None:
+            raise UpdateSafetyPostCommitError(
+                "Target-Finalizer brach nach durable committed Master-Journal "
+                "ab. Lösung: Keine Receipt-, Overlay- oder Backup-Datei "
+                "manuell löschen; denselben Updatebefehl erneut starten."
+            ) from original_error
         raise
     finally:
         if (
-            update_safety_contract is not None
+            managed_lease_contract is not None
             and managed_service_spawn_attempted
             and not managed_service_quiesced
         ):
@@ -13130,7 +17873,11 @@ def _invoke_target_finalizer(
                         )
                 _remove_target_execution_snapshot(snapshot_root)
             except BaseException as exc:
-                if durable_committed_observed is not None:
+                if (
+                    durable_recovery_committed_observed is not None
+                    or durable_committed_observed is not None
+                    or durable_package_committed_observed is not None
+                ):
                     raise UpdateSafetyPostCommitError(
                         "Snapshot-Cleanup brach nach durable committed ab"
                     ) from exc
@@ -13392,9 +18139,15 @@ def _complete_dynamic_recovery_start(
     *,
     repo_dir: str,
     state: TransitionState,
+    post_service_guard=None,
+    remove_receipt: bool = True,
 ) -> bool:
     """Öffnet das Recovery-Gate signalgeschützt und rearmed jeden Fehler."""
 
+    if post_service_guard is not None and not callable(post_service_guard):
+        raise ValueError("Dynamischer Recovery-Endguard ist nicht aufrufbar")
+    if not isinstance(remove_receipt, bool):
+        raise ValueError("Dynamischer Receipt-Cleanup-Vertrag ist nicht boolesch")
     signal_guard = _TerminalSignalGuard()
     signal_guard.install()
     signal_guard.arm()
@@ -13407,7 +18160,10 @@ def _complete_dynamic_recovery_start(
         _remove_update_safety_dropins(contract)
         if not _recover_pretransaction_service_state(state):
             raise RuntimeError("Recovery-Altstart blieb unvollständig")
-        _remove_exact_update_safety_receipt(contract)
+        if post_service_guard is not None:
+            post_service_guard()
+        if remove_receipt:
+            _remove_exact_update_safety_receipt(contract)
     except BaseException as exc:
         original_error = exc
         try:
@@ -13442,6 +18198,58 @@ def _complete_dynamic_recovery_start(
     return False
 
 
+def _complete_static_recovery_start(
+    contract: RecoveryBootblockContract,
+    *,
+    recovery_transaction_id: str,
+    state: TransitionState,
+    post_service_guard=None,
+) -> RecoveryTransitionResult:
+    """Entfernt BindsTo-Gates vor dem Altstart und rearmed jeden Fehler."""
+
+    if post_service_guard is not None and not callable(post_service_guard):
+        raise ValueError("Statischer Recovery-Endguard ist nicht aufrufbar")
+    if contract.transaction_id != recovery_transaction_id:
+        raise RuntimeError("Statischer Recovery-Vertrag driftete zur Transaktion")
+    _validate_recovery_bootblock_contract(contract)
+    signal_guard = _TerminalSignalGuard()
+    signal_guard.install()
+    signal_guard.arm()
+    original_error: BaseException | None = None
+    latest_contract: RecoveryBootblockContract | RecoveryBootblockPartialContract | None = contract
+    try:
+        # BindsTo/After auf den beendeten transienten Finalizer darf beim
+        # Altstart nicht mehr in der effektiven Unitansicht liegen. Der
+        # erhaltene Inodevertrag kann die Startsperre bei jedem Folgefehler
+        # exakt neu anlegen.
+        _clear_recovery_bootblock_marker(contract)
+        _remove_persistent_recovery_bootblock(contract)
+        if not _recover_pretransaction_service_state(state):
+            raise RuntimeError("Statischer Recovery-Altstart blieb unvollständig")
+        if post_service_guard is not None:
+            post_service_guard()
+    except BaseException as exc:
+        original_error = exc
+        enforcement = _enforce_fail_closed_after_recovery_failure(
+            contract,
+            recovery_transaction_id=recovery_transaction_id,
+        )
+        latest_contract = enforcement.bootblock_contract
+    requested_signum = signal_guard.requested_signum
+    signal_guard.restore()
+    if requested_signum is not None:
+        raise _DeferredParentSignal(requested_signum)
+    if original_error is None:
+        return RecoveryTransitionResult(True, None)
+    update_logger.error(
+        "Statisches Recovery-Gate/Altstart schlug fehl: %s",
+        original_error,
+    )
+    if not isinstance(original_error, Exception):
+        raise original_error
+    return RecoveryTransitionResult(False, latest_contract)
+
+
 def _recover_failed_transition(
     *,
     repo_dir: str,
@@ -13460,9 +18268,40 @@ def _recover_failed_transition(
     ) = None,
     update_safety_contract: UpdateSafetyContract | None = None,
     recovery_transaction_id: str | None = None,
+    quiesced_overlay_receipt: QuiescedOverlayReceipt | None = None,
+    recovery_journal_contract: (
+        recovery_journal.RecoveryJournalContract | None
+    ) = None,
+    persistent_recovery_transaction: (
+        ReconstructedRecoveryTransaction | None
+    ) = None,
 ) -> RecoveryTransitionResult:
     """Restore old Git/tree/persistent state and verify role/services after any mutation failure."""
     recovery_ok = True
+    if (
+        not isinstance(
+            recovery_journal_contract,
+            recovery_journal.RecoveryJournalContract,
+        )
+        or recovery_journal.verify_recovery_journal(
+            recovery_journal_contract
+        ).payload.phase
+        != recovery_journal.PHASE_PRODUCT_MUTATING
+    ):
+        update_logger.error(
+            "Vollständiger Recovery-Pfad besitzt kein product_mutating-Journal"
+        )
+        return RecoveryTransitionResult(False, None)
+    if persistent_recovery_transaction is not None and (
+        not isinstance(
+            persistent_recovery_transaction,
+            ReconstructedRecoveryTransaction,
+        )
+        or persistent_recovery_transaction.bundle.journal
+        != recovery_journal_contract
+    ):
+        update_logger.error("Rekonstruierte Recovery-Transaktion driftete")
+        return RecoveryTransitionResult(False, None)
     if (
         not RECOVERY_BOOTBLOCK_TRANSACTION_RE.fullmatch(
             str(recovery_transaction_id or "")
@@ -13501,9 +18340,12 @@ def _recover_failed_transition(
                 "Recovery-Sofortstop vor persistentem Bootblock ist nicht vollständig beweisbar"
             )
         try:
+            arm_kwargs = {"transaction_id": recovery_transaction_id}
+            if bootblock_contract is None:
+                arm_kwargs["recovery_journal_contract"] = recovery_journal_contract
             bootblock_contract = _arm_persistent_recovery_bootblock(
                 bootblock_contract,
-                transaction_id=recovery_transaction_id,
+                **arm_kwargs,
             )
         except RecoveryBootblockArmError as exc:
             update_logger.error(
@@ -13529,6 +18371,45 @@ def _recover_failed_transition(
         if not initial_quiesced or not final_quiesced:
             update_logger.error("Recovery abgebrochen: Aktor-/Writer-Ruhe ist nicht beweisbar")
             return RecoveryTransitionResult(False, bootblock_contract)
+
+    # Weder Git noch Produkt-/Webdateien dürfen vor dem vollständigen Beweis
+    # beider Sicherungsstufen verändert werden. Apache wird erneut gestoppt,
+    # weil ein Fehler auch nach seinem späten Health-Start eingetreten sein kann.
+    try:
+        if quiesced_overlay_receipt is None:
+            raise RuntimeError("Quiesced-Overlay-Receipt fehlt")
+        for stop_apache in (False, True):
+            _revalidate_quiesced_overlay_receipt(
+                quiesced_overlay_receipt,
+                backup_dir=backup_dir,
+                install_root=repo_dir,
+                transaction_id=str(recovery_transaction_id),
+            )
+            if old_commit is not None:
+                _revalidate_recovery_backup_payload_receipt(
+                    backup_receipt,
+                    backup_dir=backup_dir,
+                    repo_dir=repo_dir,
+                    transaction_id=str(recovery_transaction_id),
+                )
+            if stop_apache:
+                break
+            _quiesce_apache_for_cutover(recovery_inventory.apache_security)
+    except Exception as exc:
+        print(f"[ABBRUCH] E3DC-UPD-RECOVERY-EVIDENCE: {exc}")
+        print(f"Vollbackup: {backup_dir}")
+        if quiesced_overlay_receipt is not None:
+            print(f"Zustands-Overlay: {quiesced_overlay_receipt.overlay_dir}")
+        print(
+            "Lösung: Dienste nicht manuell starten und keine Sicherung löschen; "
+            "prüfe das vollständige Updatejournal und führe erst danach den dort "
+            "genannten Recovery-Befehl aus."
+        )
+        update_logger.critical(
+            "Recovery-Sicherungsbeweis scheiterte vor jeder Rückfallmutation: %s",
+            exc,
+        )
+        return RecoveryTransitionResult(False, bootblock_contract)
     if old_commit and not git_created:
         reset = _git_argv(repo_dir, install_user, "reset", "--hard", old_commit, timeout=120)
         recovery_ok = recovery_ok and reset["success"]
@@ -13558,6 +18439,17 @@ def _recover_failed_transition(
 
             def restore_manifest_guard(manifest):
                 _guard_recovery_manifest(manifest, backup_receipt)
+        else:
+            def restore_manifest_guard(manifest):
+                if (
+                    not isinstance(manifest, dict)
+                    or str(manifest.get("backup_id") or "")
+                    != quiesced_overlay_receipt.full_backup_id
+                    or str(manifest.get("install_root") or "") != repo_dir
+                ):
+                    raise RuntimeError(
+                        "Vollrestore verwendet nicht das Overlay-gebundene Backupmanifest"
+                    )
 
         restore_metadata_overrides = {}
         if backup_receipt is not None:
@@ -13593,7 +18485,28 @@ def _recover_failed_transition(
             ),
             restore_metadata_overrides=restore_metadata_overrides,
         )
-        _restore_recovery_surface(recovery_inventory, state)
+        restore_quiesced_overlay(
+            quiesced_overlay_receipt.overlay_dir,
+            install_path=repo_dir,
+            guard=_overlay_restore_guard_from_receipt(
+                quiesced_overlay_receipt
+            ),
+        )
+        # apt-/pip-Rückläufe können über Paket-Maintainer-Skripte Apache,
+        # Unitdateien oder Enablement erneut verändern. Sie müssen deshalb
+        # zwingend vor dem abschließenden Restore der privilegierten
+        # Recovery-Fläche laufen. Erst danach wird deren exaktes Preimage
+        # projiziert und gebunden.
+        if package_transaction is not None:
+            _restore_package_transaction(package_transaction)
+            package_transaction = None
+        _restore_recovery_surface(
+            recovery_inventory,
+            state,
+            restore_legacy_systemd_surface=(
+                persistent_recovery_transaction is None
+            ),
+        )
         if backup_receipt is not None:
             _verify_restored_privileged_files(
                 backup_receipt,
@@ -13615,19 +18528,22 @@ def _recover_failed_transition(
                     recovery_identities = _validate_recovery_bootblock_contract(
                         bootblock_contract
                     )
+                    recovery_payload = _render_recovery_bootblock_dropin(
+                        bootblock_contract.transaction_id
+                    )
                     recovery_path = _recovery_dropin_path(storage_unit)
                     recovery_dev, recovery_ino = recovery_identities[storage_unit]
                     expected_recovery_dropins = {
                         storage_unit: {
                             recovery_path: {
-                                "bytes": RECOVERY_BOOTBLOCK_DROPIN_PAYLOAD,
+                                "bytes": recovery_payload,
                                 "dev": recovery_dev,
                                 "ino": recovery_ino,
                                 "uid": 0,
                                 "gid": 0,
                                 "mode": 0o644,
                                 "nlink": 1,
-                                "size": len(RECOVERY_BOOTBLOCK_DROPIN_PAYLOAD),
+                                "size": len(recovery_payload),
                             }
                         }
                     }
@@ -13661,12 +18577,6 @@ def _recover_failed_transition(
     except Exception as exc:
         update_logger.error(f"Automatische Wiederherstellung fehlgeschlagen: {exc}")
         recovery_ok = False
-    if package_transaction is not None:
-        try:
-            _restore_package_transaction(package_transaction)
-        except Exception as exc:
-            update_logger.error(f"Paket-Ruecklauf fehlgeschlagen: {exc}")
-            recovery_ok = False
     if recovery_ok and backup_receipt is not None:
         try:
             _verify_restored_privileged_files(
@@ -13682,44 +18592,55 @@ def _recover_failed_transition(
             recovery_ok = False
     if not recovery_ok:
         return RecoveryTransitionResult(False, bootblock_contract)
+
+    def restore_recovery_apache() -> None:
+        _restore_apache_after_successful_cutover(
+            expected_available=recovery_inventory.apache_security.apache_available,
+            expected_active=recovery_inventory.apache_security.apache_was_active,
+            expected_unit_file_state=(
+                recovery_inventory.apache_security.apache_unit_file_state
+            ),
+        )
+
+    if persistent_recovery_transaction is not None:
+        try:
+            rolled_back = _restore_persistent_systemd_prestate(
+                persistent_recovery_transaction
+            )
+            restore_recovery_apache()
+        except Exception as exc:
+            update_logger.error(
+                "Persistenter systemd-/Apache-Altstart blieb unvollständig: %s",
+                exc,
+            )
+            return RecoveryTransitionResult(False, bootblock_contract)
+        return RecoveryTransitionResult(True, None, rolled_back)
+
     if dynamic_safety:
         if not _complete_dynamic_recovery_start(
             update_safety_contract,
             repo_dir=repo_dir,
             state=state,
+            post_service_guard=restore_recovery_apache,
+            remove_receipt=False,
         ):
             return RecoveryTransitionResult(False, None)
-        return RecoveryTransitionResult(True, None)
-    try:
-        # Erst der vollständig verifizierte Datei-/Paket-Rücklauf darf das
-        # atomare Startgate für den kontrollierten Service-Endtest öffnen.
-        _clear_recovery_bootblock_marker(bootblock_contract)
-    except Exception as exc:
-        update_logger.error("Recovery-Bootblock konnte nicht kontrolliert geöffnet werden: %s", exc)
-        enforcement = _enforce_fail_closed_after_recovery_failure(
-            bootblock_contract,
-            recovery_transaction_id=recovery_transaction_id,
+        rolled_back = _advance_persistent_recovery_rolled_back(
+            recovery_journal_contract
         )
-        bootblock_contract = enforcement.bootblock_contract
-        return RecoveryTransitionResult(False, bootblock_contract)
-    if not _recover_pretransaction_service_state(state):
-        enforcement = _enforce_fail_closed_after_recovery_failure(
-            bootblock_contract,
-            recovery_transaction_id=recovery_transaction_id,
-        )
-        bootblock_contract = enforcement.bootblock_contract
-        return RecoveryTransitionResult(False, bootblock_contract)
-    try:
-        _remove_persistent_recovery_bootblock(bootblock_contract)
-    except Exception as exc:
-        update_logger.error("Recovery-Bootblock konnte nach Endgate nicht entfernt werden: %s", exc)
-        enforcement = _enforce_fail_closed_after_recovery_failure(
-            bootblock_contract,
-            recovery_transaction_id=recovery_transaction_id,
-        )
-        bootblock_contract = enforcement.bootblock_contract
-        return RecoveryTransitionResult(False, bootblock_contract)
-    return RecoveryTransitionResult(True, None)
+        return RecoveryTransitionResult(True, None, rolled_back)
+    static_result = _complete_static_recovery_start(
+        bootblock_contract,
+        recovery_transaction_id=str(recovery_transaction_id),
+        state=state,
+        post_service_guard=restore_recovery_apache,
+    )
+    if not static_result.recovered:
+        return static_result
+    rolled_back = _advance_persistent_recovery_rolled_back(
+        recovery_journal_contract
+    )
+    return RecoveryTransitionResult(True, None, rolled_back)
 
 
 def _recover_pretransaction_service_state(state: TransitionState) -> bool:
@@ -13797,12 +18718,187 @@ def _recover_pretransaction_service_state(state: TransitionState) -> bool:
     return recovered
 
 
+def _abort_before_product_mutation(
+    *,
+    repo_dir: str,
+    state: TransitionState,
+    apache_preimage: ApacheSecurityPreimage,
+    transaction_id: str,
+    bootblock_contract: (
+        RecoveryBootblockContract | RecoveryBootblockPartialContract | None
+    ),
+    update_safety_contract: UpdateSafetyContract | None,
+    overlay_receipt: QuiescedOverlayReceipt | None,
+    package_transaction: PackageTransactionState | None = None,
+    packages_mutated: bool = False,
+    recovery_inventory: RecoverySurfaceInventory | None = None,
+    recovery_journal_contract: (
+        recovery_journal.RecoveryJournalContract | None
+    ) = None,
+    persistent_recovery_transaction: (
+        ReconstructedRecoveryTransaction | None
+    ) = None,
+) -> bool:
+    """Öffnet nach reinem Cutoverfehler den unveränderten Altstand kontrolliert."""
+
+    try:
+        if (
+            not isinstance(
+                recovery_journal_contract,
+                recovery_journal.RecoveryJournalContract,
+            )
+            or recovery_journal.verify_recovery_journal(
+                recovery_journal_contract
+            ).payload.phase
+            != recovery_journal.PHASE_PREPRODUCT
+        ):
+            raise RuntimeError(
+                "Vorprodukt-Rücklauf besitzt kein preproduct-Master-Journal"
+            )
+        if persistent_recovery_transaction is not None and (
+            not isinstance(
+                persistent_recovery_transaction,
+                ReconstructedRecoveryTransaction,
+            )
+            or persistent_recovery_transaction.bundle.journal
+            != recovery_journal_contract
+        ):
+            raise RuntimeError("Rekonstruierte Vorprodukt-Transaktion driftete")
+        if persistent_recovery_transaction is not None:
+            if not _stop_v4_services(V4_SERVICES):
+                raise RuntimeError(
+                    "Aktor-/Writer-Ruhe vor persistentem Vorprodukt-Rücklauf fehlt"
+                )
+            _quiesce_apache_for_cutover(apache_preimage)
+        if packages_mutated:
+            if package_transaction is None:
+                raise RuntimeError("Paketrücklauf besitzt kein gebundenes Preimage")
+            _restore_package_transaction(package_transaction)
+        # Paket-Maintainer-Skripte dürfen Apache verändert oder gestartet
+        # haben. Zuerst wird sein Dateipreimage bei inaktivem Dienst
+        # restauriert; extern geöffnet wird er erst nach gesunden Altdiensten.
+        if recovery_inventory is not None:
+            if recovery_inventory.apache_security != apache_preimage:
+                raise RuntimeError("Apache-Preimage driftete im Recovery-Inventar")
+            _restore_recovery_surface(
+                recovery_inventory,
+                state,
+                restore_legacy_systemd_surface=(
+                    persistent_recovery_transaction is None
+                ),
+            )
+        else:
+            _restore_apache_security_preimage(
+                apache_preimage,
+                restore_activity=False,
+            )
+
+        def restore_bound_apache() -> None:
+            _restore_apache_after_successful_cutover(
+                expected_available=apache_preimage.apache_available,
+                expected_active=apache_preimage.apache_was_active,
+                expected_unit_file_state=apache_preimage.apache_unit_file_state,
+            )
+
+        if persistent_recovery_transaction is not None:
+            _restore_persistent_systemd_prestate(
+                persistent_recovery_transaction
+            )
+            restore_bound_apache()
+        elif update_safety_contract is not None:
+            if not _complete_dynamic_recovery_start(
+                update_safety_contract,
+                repo_dir=repo_dir,
+                state=state,
+                post_service_guard=restore_bound_apache,
+                remove_receipt=False,
+            ):
+                raise RuntimeError("Dynamischer Altstart blieb unvollständig")
+        elif isinstance(bootblock_contract, RecoveryBootblockContract):
+            static_result = _complete_static_recovery_start(
+                bootblock_contract,
+                recovery_transaction_id=transaction_id,
+                state=state,
+                post_service_guard=restore_bound_apache,
+            )
+            bootblock_contract = static_result.bootblock_contract
+            if not static_result.recovered:
+                raise RuntimeError("Statischer Altstart blieb unvollständig")
+        else:
+            if not _recover_pretransaction_service_state(state):
+                raise RuntimeError("Altstart ohne Bootblock blieb unvollständig")
+            restore_bound_apache()
+
+        if overlay_receipt is not None:
+            raise RuntimeError(
+                "preproduct-Rücklauf darf kein Produkt-Overlay besitzen"
+            )
+        if persistent_recovery_transaction is None:
+            _advance_persistent_recovery_rolled_back(
+                recovery_journal_contract
+            )
+        return True
+    except Exception as exc:
+        print(f"[ABBRUCH] E3DC-UPD-PREMUTATION-RECOVERY: {exc}")
+        print(
+            "Lösung: Produktdateien wurden noch nicht verändert. Dienste und "
+            "Sicherungsdateien nicht manuell löschen; prüfe das Updatejournal "
+            "und die dort genannten systemctl-Statusbefehle."
+        )
+        update_logger.critical(
+            "Altzustand konnte nach Cutoverfehler nicht vollständig geöffnet werden: %s",
+            exc,
+        )
+        terminal_rollback = None
+        if isinstance(
+            recovery_journal_contract,
+            recovery_journal.RecoveryJournalContract,
+        ):
+            try:
+                terminal_rollback = _read_matching_rolled_back_recovery_journal(
+                    recovery_journal_contract,
+                    allow_missing=True,
+                )
+            except Exception as journal_error:
+                update_logger.critical(
+                    "Rollback-Journal ist nach Altstartfehler unlesbar: %s",
+                    journal_error,
+                )
+        if terminal_rollback is not None:
+            print(
+                "Lösung: Der Altstand ist dauerhaft gewählt. Starte denselben "
+                "Updatebefehl erneut; es werden nur Gate-Cleanup, Altstart und "
+                "Apache-Abschluss fortgesetzt."
+            )
+        elif update_safety_contract is not None:
+            try:
+                _enforce_update_safety_fail_closed(
+                    update_safety_contract,
+                    repo_dir=repo_dir,
+                )
+            except Exception as enforcement_exc:
+                update_logger.critical(
+                    "Dynamischer Bootblock blieb zusätzlich unbewiesen: %s",
+                    enforcement_exc,
+                )
+        else:
+            _enforce_fail_closed_after_recovery_failure(
+                bootblock_contract,
+                recovery_transaction_id=transaction_id,
+                recovery_journal_contract=recovery_journal_contract,
+            )
+        return False
+
+
 def _enforce_fail_closed_after_recovery_failure(
     bootblock_contract: (
         RecoveryBootblockContract | RecoveryBootblockPartialContract | None
     ) = None,
     *,
     recovery_transaction_id: str | None = None,
+    recovery_journal_contract: (
+        recovery_journal.RecoveryJournalContract | None
+    ) = None,
 ) -> RecoveryBootblockEnforcementResult:
     """Setzt rebootfestes Startgate, stoppt Writer und beweist beide Schranken."""
 
@@ -13821,9 +18917,12 @@ def _enforce_fail_closed_after_recovery_failure(
             "Fail-closed-Sofortstop vor persistentem Bootblock ist nicht vollständig beweisbar"
         )
     try:
+        arm_kwargs = {"transaction_id": recovery_transaction_id}
+        if bootblock_contract is None:
+            arm_kwargs["recovery_journal_contract"] = recovery_journal_contract
         latest_contract = _arm_persistent_recovery_bootblock(
             bootblock_contract,
-            transaction_id=recovery_transaction_id,
+            **arm_kwargs,
         )
         blocked = True
     except RecoveryBootblockArmError as exc:
@@ -14391,7 +19490,7 @@ def _probe_regular_download_bootstrap_current(
 ) -> tuple[bool, tuple[str, ...]]:
     """Prüft mit Zielcode rein lesend, ob der Release vollständig aktuell ist."""
 
-    _assert_no_existing_recovery_bootblock()
+    _assert_recovery_namespace_read_only_clear()
     root = _validate_bootstrap_install_path(repo_dir)
     commit = _validate_full_commit(target_commit)
     tag = _normalize_release_tag(target_tag)
@@ -14466,6 +19565,323 @@ def _probe_regular_download_bootstrap_current(
     return not errors, tuple(errors)
 
 
+def _logical_commit_tree_space_bytes(
+    entries: dict[str, tuple[bytes, int]],
+) -> int:
+    """Schätzt einen später geschriebenen Commitbaum mit Backup-Blockaufschlag."""
+
+    if not isinstance(entries, dict) or not entries:
+        raise RuntimeError("Commitgebundene Speicherfläche ist leer")
+    payload_bytes = 0
+    directories = {"."}
+    for relative_path, entry in entries.items():
+        if (
+            not isinstance(relative_path, str)
+            or not relative_path
+            or relative_path.startswith("/")
+            or "\\" in relative_path
+            or any(char in relative_path for char in "\x00\r\n\t")
+        ):
+            raise RuntimeError("Commitgebundene Speicherfläche enthält einen ungültigen Pfad")
+        parts = relative_path.split("/")
+        if any(part in {"", ".", ".."} for part in parts):
+            raise RuntimeError("Commitgebundene Speicherfläche verlässt ihren Zielbaum")
+        try:
+            payload, mode = entry
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("Commitgebundener Speichereintrag ist ungültig") from exc
+        if not isinstance(payload, bytes) or mode not in {0o444, 0o555}:
+            raise RuntimeError("Commitgebundener Speichereintrag besitzt keinen Blobvertrag")
+        payload_bytes += len(payload)
+        for depth in range(1, len(parts)):
+            directories.add("/".join(parts[:depth]))
+    metadata_bytes = (
+        BACKUP_ESTIMATE_FIXED_OVERHEAD_BYTES
+        + BACKUP_ESTIMATE_SOURCE_OVERHEAD_BYTES
+        + len(entries) * BACKUP_ESTIMATE_FILE_OVERHEAD_BYTES
+        + len(directories) * BACKUP_ESTIMATE_DIRECTORY_OVERHEAD_BYTES
+    )
+    return payload_bytes + metadata_bytes
+
+
+def _estimate_target_release_space(
+    *,
+    source_repo: str,
+    target_commit: str,
+    install_user: str,
+    root_authority: bool,
+) -> TargetReleaseSpaceEstimate:
+    """Bindet Produkt-, Web- und Finalizerbedarf an genau den Zielcommit."""
+
+    entries = read_commit_entries(
+        os.path.abspath(source_repo),
+        _validate_full_commit(target_commit),
+        (),
+        include_all=True,
+        run_as_user=_commit_reader_user(
+            install_user,
+            root_authority=root_authority,
+        ),
+        maximum_files=TARGET_EXECUTION_SNAPSHOT_MAX_FILES,
+        maximum_file_bytes=TARGET_EXECUTION_SNAPSHOT_MAX_FILE_BYTES,
+        maximum_total_bytes=TARGET_EXECUTION_SNAPSHOT_MAX_TOTAL_BYTES,
+    )
+    product_tree_bytes = _logical_commit_tree_space_bytes(entries)
+
+    web_entries: dict[str, tuple[bytes, int]] = {}
+    excluded_web_roots = {"data", "logs", "ramdisk", "tmp"}
+    for relative_path, entry in entries.items():
+        if relative_path in {"VERSION", "CHANGELOG.md", "UPDATE_POLICY.json"}:
+            web_entries[relative_path] = entry
+            continue
+        if not relative_path.startswith("html/"):
+            continue
+        projected = relative_path[len("html/"):]
+        if not projected or projected.split("/", 1)[0] in excluded_web_roots:
+            continue
+        if projected in web_entries:
+            raise RuntimeError("Webprojektion besitzt ein doppeltes Ziel")
+        web_entries[projected] = entry
+    required_web = {"index.php", "helpers.php", "VERSION", "UPDATE_POLICY.json"}
+    if not required_web.issubset(web_entries):
+        raise RuntimeError("Zielcommit besitzt keine vollständige Webprojektion")
+
+    snapshot_entries = {
+        relative_path: entry
+        for relative_path, entry in entries.items()
+        if relative_path in TARGET_EXECUTION_SNAPSHOT_ROOT_FILES
+        or relative_path == "Installer"
+        or relative_path.startswith("Installer/")
+    }
+    required_snapshot = set(TARGET_EXECUTION_SNAPSHOT_ROOT_FILES) | set(
+        TARGET_FINALIZER_RELATIVE_FILES
+    )
+    if not required_snapshot.issubset(snapshot_entries):
+        raise RuntimeError("Zielcommit besitzt keinen vollständigen Finalizer-Snapshot")
+    return TargetReleaseSpaceEstimate(
+        product_tree_bytes=product_tree_bytes,
+        web_projection_bytes=_logical_commit_tree_space_bytes(web_entries),
+        finalizer_snapshot_bytes=_logical_commit_tree_space_bytes(snapshot_entries),
+    )
+
+
+def _disk_space_allocation_anchor(path: str) -> tuple[str, int]:
+    """Bindet einen Zielpfad an den nächsten vorhandenen no-symlink Datenträger."""
+
+    raw = str(path or "")
+    candidate = os.path.abspath(raw)
+    if (
+        not raw
+        or candidate != raw
+        or not os.path.isabs(candidate)
+        or any(char in candidate for char in "\x00\r\n\t")
+    ):
+        raise OfflinePreflightError(
+            "E3DC-UPD-DISK-001",
+            "Ein Zielpfad der Speicherplatzprüfung ist nicht kanonisch.",
+            "Prüfe Installations-, Backup- und Webpfad. Korrigiere den genannten "
+            "Pfad und starte denselben Updatebefehl erneut; es wurden noch keine "
+            "Dienste gestoppt.",
+        )
+    while not os.path.lexists(candidate):
+        parent = os.path.dirname(candidate)
+        if parent == candidate:
+            break
+        candidate = parent
+    try:
+        metadata = os.stat(candidate, follow_symlinks=False)
+    except OSError as exc:
+        raise OfflinePreflightError(
+            "E3DC-UPD-DISK-001",
+            f"Der Datenträger für {raw} ist nicht sicher lesbar.",
+            f"Prüfe Einhängung und Pfad mit: findmnt -T {shlex.quote(candidate)}. "
+            "Korrigiere Pfad oder Mount und starte denselben Updatebefehl erneut; "
+            "es wurden noch keine Dienste gestoppt.",
+        ) from exc
+    if stat.S_ISLNK(metadata.st_mode) or os.path.realpath(candidate) != candidate:
+        raise OfflinePreflightError(
+            "E3DC-UPD-DISK-001",
+            f"Der Datenträgerpfad {candidate} enthält eine Symlink-Umleitung.",
+            f"Prüfe den echten Zielpfad mit: findmnt -T {shlex.quote(candidate)}. "
+            "Verwende einen kanonischen Installations-, Backup- oder Webpfad und "
+            "starte danach denselben Updatebefehl erneut; es wurden noch keine "
+            "Dienste gestoppt.",
+        )
+    return candidate, int(metadata.st_dev)
+
+
+def _add_update_filesystem_demand(
+    groups: dict[int, UpdateFilesystemDemand],
+    *,
+    path: str,
+    label: str,
+    payload_bytes: int = 0,
+    backup_bytes: int = 0,
+    working_bytes: int = 0,
+) -> None:
+    """Addiert logische Flächen, ohne Reserve je Pfad mehrfach anzusetzen."""
+
+    values = (payload_bytes, backup_bytes, working_bytes)
+    if (
+        not isinstance(label, str)
+        or not label.strip()
+        or any(char in label for char in "\x00\r\n\t")
+        or any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in values)
+    ):
+        raise ValueError("Dateisystembedarf ist ungültig")
+    anchor, device = _disk_space_allocation_anchor(path)
+    group = groups.get(device)
+    if group is None:
+        group = UpdateFilesystemDemand(
+            device=device,
+            representative_path=anchor,
+            labels=[],
+        )
+        groups[device] = group
+    elif group.total_bytes == 0 and any(values):
+        # Ein Nullbeitrag wie der bereits belegte Cache soll nicht zum weniger
+        # hilfreichen Repräsentanten einer späteren echten Anforderung werden.
+        group.representative_path = anchor
+    normalized_label = label.strip()
+    if normalized_label not in group.labels:
+        group.labels.append(normalized_label)
+    group.payload_bytes += payload_bytes
+    group.backup_bytes += backup_bytes
+    group.working_bytes += working_bytes
+
+
+def _require_grouped_update_free_space(
+    contributions: tuple[tuple[str, str, int, int, int], ...],
+    *,
+    phase_label: str,
+) -> tuple:
+    """Prüft jede reale st_dev-Gruppe genau einmal mit einer Reserve."""
+
+    groups: dict[int, UpdateFilesystemDemand] = {}
+    for path, label, payload, backup, working in contributions:
+        _add_update_filesystem_demand(
+            groups,
+            path=path,
+            label=label,
+            payload_bytes=payload,
+            backup_bytes=backup,
+            working_bytes=working,
+        )
+    receipts = []
+    for device in sorted(groups):
+        group = groups[device]
+        if group.total_bytes == 0:
+            # Bereits materialisierte Cachebytes sind in f_bavail enthalten.
+            # Ein dediziertes Cache-Dateisystem erhält deshalb keine zweite,
+            # künstliche Nutzlast oder 512-MiB-Reserve.
+            continue
+        labels = ", ".join(group.labels)
+        try:
+            receipt = require_conservative_free_space(
+                group.representative_path,
+                payload_bytes=group.payload_bytes,
+                backup_bytes=group.backup_bytes,
+                working_bytes=group.working_bytes,
+            )
+        except OfflinePreflightError as exc:
+            extra = (
+                f" Betroffene Bereiche: {labels}. Prüfe die Einhängung mit: "
+                f"findmnt -T {shlex.quote(group.representative_path)}."
+            )
+            if "Backup" in labels:
+                extra += (
+                    " Alte Sicherungen ausschließlich über Installer-Menü 13 "
+                    "und „Backup-Limit anwenden“ bereinigen; Backupordner nicht "
+                    "manuell löschen."
+                )
+            raise OfflinePreflightError(
+                exc.code,
+                f"{phase_label}: {exc.message} Betroffene Bereiche: {labels}.",
+                exc.solution + extra,
+            ) from exc
+        receipts.append(receipt)
+    return tuple(receipts)
+
+
+def _require_update_transaction_space(
+    *,
+    repo_dir: str,
+    backup_collection: str,
+    offline_receipt: OfflinePackageReceipt,
+    target_space: TargetReleaseSpaceEstimate,
+    full_backup_bytes: int,
+    overlay_bytes: int,
+    bootstrap_without_git: bool,
+    phase_label: str,
+) -> tuple:
+    """Baut die noch ausstehenden Flächen für ein Vor-Stopp-Gate auf."""
+
+    if not isinstance(offline_receipt, OfflinePackageReceipt):
+        raise RuntimeError("Offline-Paketreceipt fehlt bei der Speicherplatzprüfung")
+    verify_preparation(offline_receipt)
+    if offline_receipt.pip_packages:
+        if offline_receipt.wheel_mirror is None:
+            raise RuntimeError("Wheel-Mirror fehlt bei der Speicherplatzprüfung")
+        mirror_path = offline_receipt.wheel_mirror.root
+    else:
+        mirror_path = None
+    if (
+        not isinstance(target_space, TargetReleaseSpaceEstimate)
+        or any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in (full_backup_bytes, overlay_bytes)
+        )
+    ):
+        raise RuntimeError("Speicherplatzvertrag ist unvollständig")
+    git_rebuild_bytes = (
+        target_space.product_tree_bytes if bootstrap_without_git else 0
+    )
+    contributions = [
+        (
+            repo_dir,
+            "Produktbaum und Finalizer-Snapshot",
+            target_space.product_tree_bytes,
+            0,
+            target_space.finalizer_snapshot_bytes + git_rebuild_bytes,
+        ),
+        (
+            backup_collection,
+            "Backup und quiesziertes Zustands-Overlay",
+            0,
+            full_backup_bytes + overlay_bytes,
+            0,
+        ),
+        (
+            "/var/www/html",
+            "Webprojektion",
+            target_space.web_projection_bytes,
+            0,
+            0,
+        ),
+        (
+            offline_receipt.cache.root,
+            "Offline-Cache (bereits belegt)",
+            0,
+            0,
+            0,
+        ),
+    ]
+    if mirror_path is not None:
+        contributions.append(
+            (
+                mirror_path,
+                "Wheel-Mirror (bereits belegt)",
+                0,
+                0,
+                0,
+            )
+        )
+    return _require_grouped_update_free_space(
+        tuple(contributions),
+        phase_label=phase_label,
+    )
+
+
 def _prepare_backup_collection(
     repo_dir: str,
     *,
@@ -14486,6 +19902,2688 @@ def _prepare_backup_collection(
             )
         backup_root = ensure_external_backup_root(backup_root, repo_dir)
     return str(validate_existing_backup_root(backup_root, repo_dir))
+
+
+def _quiesced_overlay_path(
+    backup_dir: str,
+    recovery_transaction_id: str,
+) -> str:
+    """Leitet den rebootfest auffindbaren Delta-Sicherungspfad streng ab."""
+
+    transaction_id = str(recovery_transaction_id or "").strip().lower()
+    if not RECOVERY_BOOTBLOCK_TRANSACTION_RE.fullmatch(transaction_id):
+        raise RuntimeError("Quiesced-Overlay besitzt keine gültige Transaktions-ID")
+    backup = os.path.abspath(str(backup_dir or ""))
+    if not backup or backup != str(backup_dir):
+        raise RuntimeError("Quiesced-Overlay besitzt keinen kanonischen Backuppfad")
+    parent = os.path.dirname(backup)
+    name = os.path.basename(backup)
+    if not name or name in {".", ".."}:
+        raise RuntimeError("Quiesced-Overlay besitzt keinen gültigen Backupnamen")
+    target = os.path.join(parent, f".{name}.quiesced-{transaction_id}")
+    if os.path.dirname(target) != parent:
+        raise RuntimeError("Quiesced-Overlay verlässt den Backup-Root")
+    return target
+
+
+def _read_stable_verified_manifest(
+    directory: str,
+    *,
+    expected_kind: str,
+) -> tuple[dict, str]:
+    """Bindet die tatsächlich verifizierten Manifestbytes gegen Austausch."""
+
+    root = os.path.abspath(str(directory or ""))
+    if not root or root != str(directory) or not os.path.isabs(root):
+        raise RuntimeError("Backup-/Overlaypfad ist nicht kanonisch")
+    manifest_path = os.path.join(root, MANIFEST_NAME)
+    digest_before, size_before = _regular_file_sha256(manifest_path)
+    manifest = verify_backup(root, expected_kind=expected_kind)
+    digest_after, size_after = _regular_file_sha256(manifest_path)
+    if digest_before != digest_after or size_before != size_after:
+        raise RuntimeError("Backup-/Overlaymanifest driftete während der Prüfung")
+    return manifest, digest_after
+
+
+def _parse_quiesced_overlay_receipt(
+    payload: bytes,
+    metadata: os.stat_result,
+) -> QuiescedOverlayReceipt:
+    try:
+        record = json.loads(payload.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Quiesced-Overlay-Receipt ist nicht lesbar") from exc
+    if not isinstance(record, dict) or set(record) != {
+        "schema",
+        "state",
+        "transaction_id",
+        "install_root",
+        "overlay",
+        "parent",
+        "full_backup",
+    }:
+        raise RuntimeError("Quiesced-Overlay-Receipt besitzt ein unbekanntes Schema")
+    overlay = record.get("overlay")
+    parent = record.get("parent")
+    full = record.get("full_backup")
+    if (
+        record.get("schema") != QUIESCED_OVERLAY_RECEIPT_SCHEMA
+        or record.get("state") != "pending"
+        or not isinstance(overlay, dict)
+        or set(overlay) != {"dir", "dev", "ino", "id", "manifest_sha256"}
+        or not isinstance(parent, dict)
+        or set(parent) != {"dev", "ino"}
+        or not isinstance(full, dict)
+        or set(full) != {"dir", "dev", "ino", "id", "manifest_sha256"}
+    ):
+        raise RuntimeError("Quiesced-Overlay-Receipt ist nicht eng typisiert")
+    transaction_id = str(record.get("transaction_id") or "")
+    install_root = str(record.get("install_root") or "")
+    overlay_dir = str(overlay.get("dir") or "")
+    full_backup_dir = str(full.get("dir") or "")
+    hashes = (
+        str(overlay.get("id") or ""),
+        str(overlay.get("manifest_sha256") or ""),
+        str(full.get("id") or ""),
+        str(full.get("manifest_sha256") or ""),
+    )
+    if (
+        not RECOVERY_BOOTBLOCK_TRANSACTION_RE.fullmatch(transaction_id)
+        or not os.path.isabs(install_root)
+        or os.path.abspath(install_root) != install_root
+        or not os.path.isabs(overlay_dir)
+        or os.path.abspath(overlay_dir) != overlay_dir
+        or not os.path.isabs(full_backup_dir)
+        or os.path.abspath(full_backup_dir) != full_backup_dir
+        or any(not re.fullmatch(r"[0-9a-f]{64}", value) for value in hashes)
+    ):
+        raise RuntimeError("Quiesced-Overlay-Receipt besitzt ungültige Bindungswerte")
+    try:
+        numeric = tuple(
+            int(value)
+            for value in (
+                overlay.get("dev"),
+                overlay.get("ino"),
+                parent.get("dev"),
+                parent.get("ino"),
+                full.get("dev"),
+                full.get("ino"),
+            )
+        )
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Quiesced-Overlay-Receipt besitzt ungültige Inodes") from exc
+    if any(value <= 0 for value in numeric):
+        raise RuntimeError("Quiesced-Overlay-Receipt besitzt ungültige Inodes")
+    canonical = _canonical_quiesced_overlay_receipt_bytes(record)
+    if canonical != payload:
+        raise RuntimeError("Quiesced-Overlay-Receipt ist nicht kanonisch kodiert")
+    return QuiescedOverlayReceipt(
+        transaction_id=transaction_id,
+        overlay_dir=overlay_dir,
+        overlay_dev=numeric[0],
+        overlay_ino=numeric[1],
+        parent_dev=numeric[2],
+        parent_ino=numeric[3],
+        backup_id=hashes[0],
+        manifest_sha256=hashes[1],
+        install_root=install_root,
+        full_backup_dir=full_backup_dir,
+        full_backup_dev=numeric[4],
+        full_backup_ino=numeric[5],
+        full_backup_id=hashes[2],
+        full_backup_manifest_sha256=hashes[3],
+        receipt_dev=int(metadata.st_dev),
+        receipt_ino=int(metadata.st_ino),
+        receipt_sha256=hashlib.sha256(payload).hexdigest(),
+    )
+
+
+def _read_quiesced_overlay_receipt(
+    *,
+    allow_missing: bool = False,
+) -> QuiescedOverlayReceipt | None:
+    state_descriptor = _open_recovery_bootblock_state_directory()
+    try:
+        readback = _read_bound_root_file_at(
+            state_descriptor,
+            QUIESCED_OVERLAY_RECEIPT_NAME,
+            maximum=64 * 1024,
+            mode=0o600,
+            allow_missing=allow_missing,
+        )
+        if readback is None:
+            return None
+        return _parse_quiesced_overlay_receipt(*readback)
+    finally:
+        os.close(state_descriptor)
+
+
+def _capture_quiesced_overlay_receipt(
+    *,
+    overlay_dir: str,
+    backup_dir: str,
+    install_root: str,
+    transaction_id: str,
+    restore_guard: QuiescedOverlayRestoreGuard,
+) -> QuiescedOverlayReceipt:
+    """Friert Overlay, Vollbackup und beide Inodes vor jeder Produktmutation ein."""
+
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        raise RuntimeError("Quiesced-Overlay-Receipt darf ausschließlich Root erzeugen")
+    transaction_id = str(transaction_id or "").strip().lower()
+    root = os.path.abspath(str(install_root or ""))
+    backup = os.path.abspath(str(backup_dir or ""))
+    overlay = os.path.abspath(str(overlay_dir or ""))
+    if (
+        not RECOVERY_BOOTBLOCK_TRANSACTION_RE.fullmatch(transaction_id)
+        or root != str(install_root)
+        or backup != str(backup_dir)
+        or overlay != str(overlay_dir)
+        or overlay != _quiesced_overlay_path(backup, transaction_id)
+    ):
+        raise RuntimeError("Quiesced-Overlay-Pfade sind nicht transaktionsgebunden")
+    full_manifest, full_manifest_sha256 = _read_stable_verified_manifest(
+        backup,
+        expected_kind=SYSTEM_BACKUP_KIND,
+    )
+    overlay_manifest, overlay_manifest_sha256 = _read_stable_verified_manifest(
+        overlay,
+        expected_kind=QUIESCED_OVERLAY_KIND,
+    )
+    full_backup_id = str(full_manifest.get("backup_id") or "")
+    overlay_id = str(overlay_manifest.get("backup_id") or "")
+    if (
+        str(full_manifest.get("install_root") or "") != root
+        or str(overlay_manifest.get("install_root") or "") != root
+        or str(overlay_manifest.get("transaction_id") or "") != transaction_id
+        or str(overlay_manifest.get("parent_backup_id") or "") != full_backup_id
+        or not re.fullmatch(r"[0-9a-f]{64}", full_backup_id)
+        or not re.fullmatch(r"[0-9a-f]{64}", overlay_id)
+    ):
+        raise RuntimeError("Quiesced-Overlay-Manifest ist nicht an Vollbackup und Transaktion gebunden")
+
+    overlay_descriptor, overlay_chain = _open_root_receipt_directory_chain(overlay)
+    backup_descriptor, backup_chain = _open_root_receipt_directory_chain(backup)
+    try:
+        overlay_metadata = os.fstat(overlay_descriptor)
+        backup_metadata = os.fstat(backup_descriptor)
+    finally:
+        os.close(overlay_descriptor)
+        os.close(backup_descriptor)
+    if (
+        len(overlay_chain) < 2
+        or len(backup_chain) < 2
+        or overlay_chain[-2][:3] != backup_chain[-2][:3]
+        or stat.S_IMODE(overlay_metadata.st_mode) != 0o700
+        or stat.S_IMODE(backup_metadata.st_mode) != 0o700
+    ):
+        raise RuntimeError("Quiesced-Overlay und Vollbackup besitzen keinen gemeinsamen sicheren Parent")
+    record = {
+        "schema": QUIESCED_OVERLAY_RECEIPT_SCHEMA,
+        "state": "pending",
+        "transaction_id": transaction_id,
+        "install_root": root,
+        "overlay": {
+            "dir": overlay,
+            "dev": int(overlay_metadata.st_dev),
+            "ino": int(overlay_metadata.st_ino),
+            "id": overlay_id,
+            "manifest_sha256": overlay_manifest_sha256,
+        },
+        "parent": {
+            "dev": int(overlay_chain[-2][1]),
+            "ino": int(overlay_chain[-2][2]),
+        },
+        "full_backup": {
+            "dir": backup,
+            "dev": int(backup_metadata.st_dev),
+            "ino": int(backup_metadata.st_ino),
+            "id": full_backup_id,
+            "manifest_sha256": full_manifest_sha256,
+        },
+    }
+    payload = _canonical_quiesced_overlay_receipt_bytes(record)
+    state_descriptor = _open_recovery_bootblock_state_directory()
+    try:
+        metadata = _create_owned_exact_root_file_at(
+            state_descriptor,
+            QUIESCED_OVERLAY_RECEIPT_NAME,
+            payload,
+            0o600,
+        )
+        os.fsync(state_descriptor)
+    finally:
+        os.close(state_descriptor)
+    receipt = _parse_quiesced_overlay_receipt(payload, metadata)
+    receipt = _revalidate_quiesced_overlay_receipt(
+        receipt,
+        backup_dir=backup,
+        install_root=root,
+        transaction_id=transaction_id,
+    )
+    if not isinstance(restore_guard, QuiescedOverlayRestoreGuard) or (
+        _overlay_restore_guard_from_receipt(receipt) != restore_guard
+    ):
+        raise RuntimeError("Overlay-Restore-Guard driftete vor dem Root-Receipt")
+    return receipt
+
+
+def _revalidate_quiesced_overlay_receipt(
+    receipt: QuiescedOverlayReceipt,
+    *,
+    backup_dir: str,
+    install_root: str,
+    transaction_id: str,
+) -> QuiescedOverlayReceipt:
+    """Beweist Receipt, Pfadinodes und beide Manifeste erneut ohne Mutation."""
+
+    if not isinstance(receipt, QuiescedOverlayReceipt):
+        raise RuntimeError("Quiesced-Overlay-Receipt fehlt oder besitzt den falschen Typ")
+    current = _read_quiesced_overlay_receipt()
+    if current != receipt:
+        raise RuntimeError("Quiesced-Overlay-Receipt oder sein Inode driftete")
+    transaction_id = str(transaction_id or "")
+    backup = os.path.abspath(str(backup_dir or ""))
+    root = os.path.abspath(str(install_root or ""))
+    if (
+        receipt.transaction_id != transaction_id
+        or receipt.full_backup_dir != backup
+        or receipt.install_root != root
+        or receipt.overlay_dir != _quiesced_overlay_path(backup, transaction_id)
+    ):
+        raise RuntimeError("Quiesced-Overlay-Receipt widerspricht der Update-Transaktion")
+    overlay_descriptor, overlay_chain = _open_root_receipt_directory_chain(
+        receipt.overlay_dir
+    )
+    backup_descriptor, backup_chain = _open_root_receipt_directory_chain(backup)
+    try:
+        overlay_metadata = os.fstat(overlay_descriptor)
+        backup_metadata = os.fstat(backup_descriptor)
+    finally:
+        os.close(overlay_descriptor)
+        os.close(backup_descriptor)
+    if (
+        len(overlay_chain) < 2
+        or len(backup_chain) < 2
+        or (overlay_metadata.st_dev, overlay_metadata.st_ino)
+        != (receipt.overlay_dev, receipt.overlay_ino)
+        or (backup_metadata.st_dev, backup_metadata.st_ino)
+        != (receipt.full_backup_dev, receipt.full_backup_ino)
+        or (overlay_chain[-2][1], overlay_chain[-2][2])
+        != (receipt.parent_dev, receipt.parent_ino)
+        or overlay_chain[-2][:3] != backup_chain[-2][:3]
+    ):
+        raise RuntimeError("Quiesced-Overlay-, Vollbackup- oder Parent-Inode driftete")
+    full_manifest, full_digest = _read_stable_verified_manifest(
+        backup,
+        expected_kind=SYSTEM_BACKUP_KIND,
+    )
+    overlay_manifest, overlay_digest = _read_stable_verified_manifest(
+        receipt.overlay_dir,
+        expected_kind=QUIESCED_OVERLAY_KIND,
+    )
+    if (
+        full_digest != receipt.full_backup_manifest_sha256
+        or str(full_manifest.get("backup_id") or "") != receipt.full_backup_id
+        or str(full_manifest.get("install_root") or "") != root
+        or overlay_digest != receipt.manifest_sha256
+        or str(overlay_manifest.get("backup_id") or "") != receipt.backup_id
+        or str(overlay_manifest.get("install_root") or "") != root
+        or str(overlay_manifest.get("transaction_id") or "") != transaction_id
+        or str(overlay_manifest.get("parent_backup_id") or "")
+        != receipt.full_backup_id
+    ):
+        raise RuntimeError("Quiesced-Overlay- oder Vollbackupmanifest driftete")
+    return receipt
+
+
+def _guard_quiesced_overlay_manifest(
+    manifest: dict,
+    receipt: QuiescedOverlayReceipt,
+) -> None:
+    if (
+        not isinstance(manifest, dict)
+        or not isinstance(receipt, QuiescedOverlayReceipt)
+        or manifest.get("kind") != QUIESCED_OVERLAY_KIND
+        or str(manifest.get("backup_id") or "") != receipt.backup_id
+        or str(manifest.get("install_root") or "") != receipt.install_root
+        or str(manifest.get("transaction_id") or "") != receipt.transaction_id
+        or str(manifest.get("parent_backup_id") or "") != receipt.full_backup_id
+    ):
+        raise RuntimeError("Overlay-Restore verwendet nicht das transaktionsgebundene Manifest")
+
+
+def _overlay_restore_guard_from_receipt(
+    receipt: QuiescedOverlayReceipt,
+) -> QuiescedOverlayRestoreGuard:
+    if not isinstance(receipt, QuiescedOverlayReceipt):
+        raise RuntimeError("Overlay-Restore besitzt keinen Root-Receipt")
+    return QuiescedOverlayRestoreGuard(
+        transaction_id=receipt.transaction_id,
+        overlay_dir=receipt.overlay_dir,
+        overlay_dev=receipt.overlay_dev,
+        overlay_ino=receipt.overlay_ino,
+        backup_id=receipt.backup_id,
+        manifest_sha256=receipt.manifest_sha256,
+        install_root=receipt.install_root,
+        parent_backup_dir=receipt.full_backup_dir,
+        parent_backup_dev=receipt.full_backup_dev,
+        parent_backup_ino=receipt.full_backup_ino,
+        parent_backup_id=receipt.full_backup_id,
+        parent_backup_manifest_sha256=receipt.full_backup_manifest_sha256,
+        collection_dir=os.path.dirname(receipt.full_backup_dir),
+        collection_dev=receipt.parent_dev,
+        collection_ino=receipt.parent_ino,
+    )
+
+
+def _remove_quiesced_overlay_receipt_and_tree(
+    receipt: QuiescedOverlayReceipt,
+) -> None:
+    """Entfernt nach Endgate erst das Blockier-Receipt, dann dessen eigenen Baum.
+
+    Ein Crash darf höchstens einen harmlosen, inodegebundenen Backuprest
+    hinterlassen. Umgekehrt wäre ein persistentes Receipt ohne Restorebaum ein
+    nicht mehr automatisch auflösbarer Folgeupdate-Blocker.
+    """
+
+    _revalidate_quiesced_overlay_receipt(
+        receipt,
+        backup_dir=receipt.full_backup_dir,
+        install_root=receipt.install_root,
+        transaction_id=receipt.transaction_id,
+    )
+    state_descriptor = _open_recovery_bootblock_state_directory()
+    try:
+        current = _read_bound_root_file_at(
+            state_descriptor,
+            QUIESCED_OVERLAY_RECEIPT_NAME,
+            maximum=64 * 1024,
+            mode=0o600,
+        )
+        if current is None or (current[1].st_dev, current[1].st_ino) != (
+            receipt.receipt_dev,
+            receipt.receipt_ino,
+        ):
+            raise RuntimeError("Fremdes Quiesced-Overlay-Receipt wird nicht entfernt")
+        os.unlink(QUIESCED_OVERLAY_RECEIPT_NAME, dir_fd=state_descriptor)
+        os.fsync(state_descriptor)
+    finally:
+        os.close(state_descriptor)
+    if _read_quiesced_overlay_receipt(allow_missing=True) is not None:
+        raise RuntimeError("Quiesced-Overlay-Receipt blieb nach Cleanup vorhanden")
+    _remove_tree_nofollow(receipt.overlay_dir)
+    if os.path.lexists(receipt.overlay_dir):
+        raise RuntimeError("Quiesced-Overlay-Cleanup blieb unvollständig")
+
+
+def _persistent_receipt_reference_matches(
+    reference: recovery_journal.RecoveryReceiptReference,
+    *,
+    path: str,
+    device: int,
+    inode: int,
+    sha256: str,
+) -> bool:
+    """Vergleicht Journalreferenz und gebundenen Root-Beleg einschließlich Größe."""
+
+    try:
+        metadata = os.lstat(path)
+    except OSError:
+        return False
+    return bool(
+        reference.path == path
+        and reference.device == int(device)
+        and reference.inode == int(inode)
+        and reference.sha256 == str(sha256)
+        and reference.size == int(metadata.st_size)
+        and (metadata.st_dev, metadata.st_ino)
+        == (int(device), int(inode))
+        and stat.S_ISREG(metadata.st_mode)
+        and metadata.st_nlink == 1
+    )
+
+
+def _assert_recovery_context_matches_journal(
+    journal_contract: recovery_journal.RecoveryJournalContract,
+    context_contract: recovery_context_codec.RecoveryContextContract,
+) -> None:
+    """Kreuzbindet die unveränderliche fachliche Altstandsautorität."""
+
+    payload = journal_contract.payload
+    context = context_contract.context
+    if (
+        context.transaction_id != payload.transaction_id
+        or context.install_root != payload.install_root
+        or context.install_user != payload.install_user
+        or context_contract.context_sha256 != payload.transition_id
+        or context.source.old_commit != payload.source.commit
+        or context.source.bootstrap_without_git
+        == payload.source.repository_present
+        or context.source.bootstrap_rebuild_git
+        != payload.source.repository_rebuild_required
+        or context.target.commit != payload.target.commit
+        or context.target.tag != payload.target.tag
+        or context.target.role != payload.target.role
+        or context.transition.ha_role != payload.target.role
+        or context.backup.backup_id != payload.full_backup.backup_id
+        or context.backup.manifest_sha256
+        != payload.full_backup.manifest_sha256
+        or not _context_reference_matches_journal(
+            context.surface_receipt,
+            payload.immutable_receipts.surface,
+        )
+        or not _context_reference_matches_journal(
+            context.systemd_receipt,
+            payload.immutable_receipts.systemd,
+        )
+    ):
+        raise RuntimeError(
+            "Recovery-Kontext widerspricht dem gebundenen Master-Journal"
+        )
+
+
+def _load_persistent_recovery_bundle(
+    journal_contract: recovery_journal.RecoveryJournalContract,
+) -> PersistentRecoveryBundle:
+    """Bindet nach Prozessende alle noch vorhandenen Journalbegleiter neu."""
+
+    journal_contract = recovery_journal.verify_recovery_journal(
+        journal_contract
+    )
+    payload = journal_contract.payload
+    terminal = payload.phase in {
+        recovery_journal.PHASE_COMMITTED,
+        recovery_journal.PHASE_ROLLED_BACK,
+    }
+
+    context_reference = payload.immutable_receipts.context
+    context_contract = None
+    if os.path.lexists(context_reference.path):
+        context_contract = recovery_context_codec.read_recovery_context(
+            expected_transaction_id=payload.transaction_id,
+            expected_install_root=payload.install_root,
+            expected_full_backup_id=payload.full_backup.backup_id,
+            path=context_reference.path,
+        )
+        if context_contract is None or not _persistent_receipt_reference_matches(
+            context_reference,
+            path=context_contract.context_path,
+            device=context_contract.context_device,
+            inode=context_contract.context_inode,
+            sha256=context_contract.context_sha256,
+        ):
+            raise RuntimeError("Recovery-Kontext driftete vom Master-Journal")
+        _assert_recovery_context_matches_journal(
+            journal_contract,
+            context_contract,
+        )
+    elif not terminal:
+        raise RuntimeError("Nichtterminaler Recovery-Kontext fehlt")
+
+    surface_reference = payload.immutable_receipts.surface
+    surface_contract = None
+    if os.path.lexists(surface_reference.path):
+        surface_contract = recovery_surface_codec.read_recovery_surface_receipt(
+            receipt_path=surface_reference.path,
+            expected_transaction_id=payload.transaction_id,
+            expected_install_root=payload.install_root,
+            expected_full_backup_id=payload.full_backup.backup_id,
+        )
+        if not _persistent_receipt_reference_matches(
+            surface_reference,
+            path=surface_contract.path,
+            device=surface_contract.dev,
+            inode=surface_contract.ino,
+            sha256=surface_contract.sha256,
+        ):
+            raise RuntimeError("Recovery-Nebenflächenreceipt driftete vom Journal")
+    elif not terminal:
+        raise RuntimeError("Nichtterminales Recovery-Nebenflächenreceipt fehlt")
+
+    systemd_reference = payload.immutable_receipts.systemd
+    systemd_contract = None
+    if os.path.lexists(systemd_reference.path):
+        systemd_contract = recovery_surface_codec.read_systemd_recovery_receipt(
+            receipt_path=systemd_reference.path,
+            expected_transaction_id=payload.transaction_id,
+            expected_install_root=payload.install_root,
+            expected_full_backup_id=payload.full_backup.backup_id,
+            expected_units=_recovery_bootblock_units(),
+        )
+        if not _persistent_receipt_reference_matches(
+            systemd_reference,
+            path=systemd_contract.path,
+            device=systemd_contract.dev,
+            inode=systemd_contract.ino,
+            sha256=systemd_contract.sha256,
+        ):
+            raise RuntimeError("systemd-Recovery-Receipt driftete vom Journal")
+    elif not terminal:
+        raise RuntimeError("Nichtterminales systemd-Recovery-Receipt fehlt")
+
+    if not terminal and (
+        context_contract is None
+        or surface_contract is None
+        or systemd_contract is None
+    ):
+        raise RuntimeError("Nichtterminales Recovery-Bundle ist unvollständig")
+    if terminal and (
+        (systemd_contract is not None, surface_contract is not None, context_contract is not None)
+        not in {
+            (True, True, True),
+            (False, True, True),
+            (False, False, True),
+            (False, False, False),
+        }
+    ):
+        raise RuntimeError(
+            "Terminale Recovery-Begleiter besitzen eine unmögliche Cleanup-Reihenfolge"
+        )
+    return PersistentRecoveryBundle(
+        journal=journal_contract,
+        context=context_contract,
+        surface=surface_contract,
+        systemd=systemd_contract,
+    )
+
+
+def _manifest_tree_inventory(
+    manifest: dict,
+    *,
+    category: str,
+    root: str,
+) -> frozenset[str]:
+    """Rekonstruiert ein bereits gesichertes Baum-Inventar aus dem Manifest."""
+
+    root_path = Path(os.path.abspath(root))
+    source_records = [
+        item
+        for item in manifest.get("sources") or ()
+        if isinstance(item, dict)
+        and item.get("category") == category
+        and item.get("source") == str(root_path)
+    ]
+    if len(source_records) != 1:
+        raise RuntimeError(
+            f"Backupmanifest besitzt keinen eindeutigen {category}-Quellbaum"
+        )
+    source = source_records[0]
+    if (
+        source.get("present") is not True
+        or source.get("source_type") != "directory"
+        or not isinstance(source.get("directories"), list)
+    ):
+        raise RuntimeError(f"Backupmanifest besitzt keinen {category}-Verzeichnisbaum")
+    entries: set[str] = set()
+    for raw in source["directories"]:
+        if not isinstance(raw, dict):
+            raise RuntimeError(f"{category}-Verzeichnisinventar ist ungültig")
+        relative = str(raw.get("path") or "")
+        candidate = Path(relative)
+        if (
+            not relative
+            or candidate.is_absolute()
+            or ".." in candidate.parts
+            or candidate.as_posix() != relative
+        ):
+            raise RuntimeError(f"{category}-Verzeichnisinventar enthält Fremdpfade")
+        entries.add(relative)
+    for raw in manifest.get("files") or ():
+        if not isinstance(raw, dict) or raw.get("category") != category:
+            continue
+        restore_path = str(raw.get("restore_path") or "")
+        try:
+            relative = Path(restore_path).relative_to(root_path).as_posix()
+        except (TypeError, ValueError):
+            raise RuntimeError(
+                f"{category}-Dateiinventar enthält einen fremden Restorepfad"
+            )
+        if not relative or relative == "." or ".." in Path(relative).parts:
+            raise RuntimeError(f"{category}-Dateiinventar enthält Fremdpfade")
+        entries.add(relative)
+    return frozenset(entries)
+
+
+def _read_manifest_json_preimage(
+    *,
+    backup_dir: str,
+    manifest: dict,
+    restore_path: str,
+    expected_sha256: str,
+) -> dict:
+    """Liest genau ein nofollow-gebundenes JSON-Preimage aus dem Vollbackup."""
+
+    matches = [
+        item
+        for item in manifest.get("files") or ()
+        if isinstance(item, dict) and item.get("restore_path") == restore_path
+    ]
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"Backup besitzt kein eindeutiges Konfigurationspreimage für {restore_path}"
+        )
+    entry = matches[0]
+    relative = Path(str(entry.get("path") or ""))
+    if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+        raise RuntimeError("Konfigurationspreimage besitzt einen ungültigen Backuppfad")
+    source = os.path.join(backup_dir, *relative.parts)
+    descriptor, metadata = _open_regular_file_nofollow(source)
+    try:
+        if metadata.st_size < 0 or metadata.st_size > 4 * 1024 * 1024:
+            raise RuntimeError("Konfigurationspreimage ist unplausibel groß")
+        payload = b""
+        while len(payload) <= metadata.st_size:
+            block = os.read(descriptor, min(65536, metadata.st_size + 1 - len(payload)))
+            if not block:
+                break
+            payload += block
+    finally:
+        os.close(descriptor)
+    digest = hashlib.sha256(payload).hexdigest()
+    if (
+        len(payload) != metadata.st_size
+        or len(payload) != int(entry.get("size", -1))
+        or digest != str(entry.get("sha256") or "")
+        or digest != expected_sha256
+    ):
+        raise RuntimeError("Konfigurationspreimage driftete vom Recovery-Kontext")
+    try:
+        parsed = json.loads(payload.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Konfigurationspreimage ist kein gültiges UTF-8-JSON") from exc
+    if not isinstance(parsed, dict):
+        raise RuntimeError("Konfigurationspreimage ist kein JSON-Objekt")
+    return parsed
+
+
+def _reconstruct_transition_state(
+    context: recovery_context_codec.RecoveryContext,
+    *,
+    backup_dir: str,
+    manifest: dict,
+) -> TransitionState:
+    transition = context.transition
+    if transition.config_source == recovery_context_codec.CONFIG_SOURCE_SYNTHETIC_MISSING:
+        config = {"ha_mode": transition.ha_role}
+        if transition.config_sha256 != hashlib.sha256(b"").hexdigest():
+            raise RuntimeError("Synthetischer Konfigurationsvertrag driftete")
+    elif transition.config_source == recovery_context_codec.CONFIG_SOURCE_FULL_BACKUP:
+        config = _read_manifest_json_preimage(
+            backup_dir=backup_dir,
+            manifest=manifest,
+            restore_path=transition.config_path,
+            expected_sha256=transition.config_sha256,
+        )
+    else:
+        raise RuntimeError("Recovery-Kontext besitzt eine unbekannte Konfigurationsquelle")
+    if str(config.get("ha_mode") or "").strip().lower() != transition.ha_role:
+        raise RuntimeError("Konfigurationspreimage widerspricht der gebundenen Rolle")
+    return TransitionState(
+        ha_role=transition.ha_role,
+        config=dict(config),
+        config_sha256=transition.config_sha256,
+        config_path=transition.config_path,
+        preinstalled_units=frozenset(transition.preinstalled_units),
+        preactive_units=frozenset(transition.preactive_units),
+        bootstrap_legacy_config=transition.bootstrap_legacy_config,
+        legacy_e3dc_activity=transition.legacy_e3dc_activity,
+    )
+
+
+def _runtime_root_managed_preimage(
+    item: recovery_surface_codec.RootManagedFileRecoveryPreimage,
+) -> RootManagedFilePreimage:
+    return RootManagedFilePreimage(
+        path=item.path,
+        existed=item.existed,
+        payload=bytes(item.payload or b""),
+        uid=int(item.uid if item.uid is not None else -1),
+        gid=int(item.gid if item.gid is not None else -1),
+        mode=int(item.mode if item.mode is not None else 0),
+        parent_dev=item.parent_dev,
+        parent_ino=item.parent_ino,
+    )
+
+
+def _runtime_apache_preimage(
+    item: recovery_surface_codec.ApacheSecurityRecoveryPreimage,
+) -> ApacheSecurityPreimage:
+    return ApacheSecurityPreimage(
+        available=item.available,
+        payload=bytes(item.payload or b""),
+        uid=int(item.uid if item.uid is not None else -1),
+        gid=int(item.gid if item.gid is not None else -1),
+        mode=int(item.mode if item.mode is not None else 0),
+        enabled=item.enabled,
+        enabled_target=str(item.enabled_target or ""),
+        apache_available=item.apache_available,
+        apache_was_active=item.apache_was_active,
+        apache_unit_file_state=item.apache_unit_file_state,
+    )
+
+
+def _reconstruct_recovery_inventory(
+    context: recovery_context_codec.RecoveryContext,
+    surface: recovery_surface_codec.RecoverySurfaceReceipt,
+    *,
+    manifest: dict,
+) -> RecoverySurfaceInventory:
+    web_inventory = _manifest_tree_inventory(
+        manifest,
+        category="web-program",
+        root="/var/www/html",
+    )
+    web_count, web_sha256 = recovery_context_codec.inventory_entries_fingerprint(
+        web_inventory
+    )
+    if (
+        web_count != context.inventory.web_entries_count
+        or web_sha256 != context.inventory.web_entries_sha256
+    ):
+        raise RuntimeError("Web-Inventar driftete vom Recovery-Kontext")
+    watchdogs = frozenset(
+        str(item.get("restore_path"))
+        for item in manifest.get("files") or ()
+        if isinstance(item, dict)
+        and item.get("category") == "watchdog"
+        and item.get("restore_path")
+    )
+    if watchdogs != frozenset(context.inventory.watchdog_files):
+        raise RuntimeError("Watchdog-Inventar driftete vom Recovery-Kontext")
+    if surface.apache_security is None:
+        raise RuntimeError("Recovery-Nebenfläche besitzt kein Apache-Preimage")
+    return RecoverySurfaceInventory(
+        web_program_entries=web_inventory,
+        watchdog_files=watchdogs,
+        unit_enablement=(),
+        root_managed_files=tuple(
+            _runtime_root_managed_preimage(item)
+            for item in surface.root_managed_files
+        ),
+        apache_security=_runtime_apache_preimage(surface.apache_security),
+        root_file_preimages=surface.root_files,
+        crontab_preimages=surface.crontabs,
+    )
+
+
+def _runtime_directory_chain(
+    chain: tuple[recovery_context_codec.DirectoryIdentity, ...],
+) -> tuple[tuple[str, int, int, int, int, int], ...]:
+    return tuple(
+        (
+            item.path,
+            item.device,
+            item.inode,
+            item.uid,
+            item.gid,
+            item.mode,
+        )
+        for item in chain
+    )
+
+
+def _runtime_privileged_backup_payloads(
+    context: recovery_context_codec.RecoveryContext,
+) -> tuple[PrivilegedBackupFileReceipt, ...]:
+    return tuple(
+        PrivilegedBackupFileReceipt(
+            restore_path=item.restore_path,
+            category=item.category,
+            backup_relative_path=item.backup_relative_path,
+            parent_path_chain=_runtime_directory_chain(item.parent_path_chain),
+            dev=item.device,
+            ino=item.inode,
+            sha256=item.sha256,
+            size=item.size,
+            mode=item.mode,
+            uid=item.uid,
+            gid=item.gid,
+            nlink=item.nlink,
+            mtime_ns=item.mtime_ns,
+            ctime_ns=item.ctime_ns,
+        )
+        for item in context.privileged_backup_payloads
+    )
+
+
+def _reconstruct_backup_contracts(
+    context: recovery_context_codec.RecoveryContext,
+) -> tuple[
+    dict,
+    frozenset[str],
+    RepoRecoveryContract | None,
+    RecoveryBackupReceipt | None,
+]:
+    """Bindet Vollbackup, Inventar und optionale Git-Recovery neu."""
+
+    backup_dir = context.backup.backup_dir
+    descriptor, path_chain = _open_root_receipt_directory_chain(backup_dir)
+    try:
+        metadata = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    expected_chain = _runtime_directory_chain(context.backup.path_chain)
+    if (
+        path_chain != expected_chain
+        or len(path_chain) < 2
+        or (metadata.st_dev, metadata.st_ino)
+        != (context.backup.backup_device, context.backup.backup_inode)
+        or (path_chain[-2][1], path_chain[-2][2])
+        != (context.backup.parent_device, context.backup.parent_inode)
+    ):
+        raise RuntimeError("Vollbackup- oder Parent-Inode driftete vom Kontext")
+    manifest, manifest_sha256 = _read_stable_verified_backup_manifest(backup_dir)
+    if (
+        manifest_sha256 != context.backup.manifest_sha256
+        or str(manifest.get("backup_id") or "") != context.backup.backup_id
+        or str(manifest.get("install_root") or "") != context.install_root
+    ):
+        raise RuntimeError("Vollbackupmanifest driftete vom Recovery-Kontext")
+
+    install_inventory = _manifest_tree_inventory(
+        manifest,
+        category="install-tree",
+        root=context.install_root,
+    )
+    install_count, install_sha256 = (
+        recovery_context_codec.inventory_entries_fingerprint(install_inventory)
+    )
+    if (
+        install_count != context.inventory.install_entries_count
+        or install_sha256 != context.inventory.install_entries_sha256
+    ):
+        raise RuntimeError("Installationsinventar driftete vom Recovery-Kontext")
+
+    payload_receipts = _runtime_privileged_backup_payloads(context)
+    if payload_receipts != _privileged_backup_payload_receipts(
+        backup_dir,
+        manifest,
+    ):
+        raise RuntimeError("Privilegierte Backup-Payloads drifteten vom Kontext")
+
+    repo_binding = context.repo
+    if context.source.old_commit is None:
+        if repo_binding is not None:
+            raise RuntimeError("Bootstrap-Kontext besitzt unerwartete Git-Recovery")
+        return manifest, install_inventory, None, None
+    if repo_binding is None or repo_binding.expected_commit != context.source.old_commit:
+        raise RuntimeError("Git-Recovery-Bindung fehlt für den Alt-Commit")
+    tracked_git = tuple(
+        (
+            item.relative_path,
+            item.git_mode,
+            item.git_object_id,
+        )
+        for item in repo_binding.tracked_git
+    )
+    file_contracts, directory_contracts = _recovery_repo_contracts_from_manifest(
+        manifest,
+        context.install_root,
+        tracked_git,
+    )
+    git_by_path = {
+        relative_path: (git_mode, git_object_id)
+        for relative_path, git_mode, git_object_id in tracked_git
+    }
+    tracked_files = tuple(
+        (
+            relative_path,
+            git_by_path[relative_path][0],
+            git_by_path[relative_path][1],
+            digest,
+            size,
+            mode,
+            uid,
+            gid,
+        )
+        for relative_path, (digest, size, mode, uid, gid)
+        in sorted(file_contracts.items())
+    )
+    repo_contract = RepoRecoveryContract(
+        install_root=context.install_root,
+        install_user=context.install_user,
+        expected_commit=repo_binding.expected_commit,
+        tracked_files=tracked_files,
+        dirty_paths=repo_binding.dirty_paths,
+    )
+    privileged_files = _privileged_restore_contract_from_manifest(
+        manifest,
+        context.install_user,
+        verify_sources=False,
+    )
+    backup_receipt = RecoveryBackupReceipt(
+        backup_dir=backup_dir,
+        backup_dev=context.backup.backup_device,
+        backup_ino=context.backup.backup_inode,
+        parent_dev=context.backup.parent_device,
+        parent_ino=context.backup.parent_inode,
+        backup_path_chain=expected_chain,
+        transaction_id=context.transaction_id,
+        backup_id=context.backup.backup_id,
+        manifest_sha256=context.backup.manifest_sha256,
+        manifest_semantic_sha256=_manifest_semantic_sha256(manifest),
+        install_root=context.install_root,
+        expected_commit=repo_binding.expected_commit,
+        tracked_files=tuple(
+            (
+                relative_path,
+                digest,
+                size,
+                mode,
+                uid,
+                gid,
+            )
+            for relative_path, (digest, size, mode, uid, gid)
+            in sorted(file_contracts.items())
+        ),
+        tracked_directories=tuple(
+            (relative_path, mode, uid, gid)
+            for relative_path, (mode, uid, gid)
+            in sorted(directory_contracts.items())
+        ),
+        manifest_files=_manifest_file_receipt(manifest),
+        privileged_files=privileged_files,
+        privileged_backup_files=payload_receipts,
+    )
+    _revalidate_recovery_backup_payload_receipt(
+        backup_receipt,
+        backup_dir=backup_dir,
+        repo_dir=context.install_root,
+        transaction_id=context.transaction_id,
+    )
+    return manifest, install_inventory, repo_contract, backup_receipt
+
+
+def _static_bootblock_namespace_present() -> bool:
+    if os.path.lexists(RECOVERY_BOOTBLOCK_MARKER):
+        return True
+    return any(os.path.lexists(_recovery_dropin_path(unit)) for unit in _recovery_bootblock_units())
+
+
+def _rebind_or_rearm_static_bootblock(
+    transaction_id: str,
+) -> RecoveryBootblockContract:
+    """Bindet einen frühen statischen Gate-Crash und vervollständigt nur ihn."""
+
+    payload = _render_recovery_bootblock_dropin(transaction_id)
+    identities = []
+    for unit in _recovery_bootblock_units():
+        path = _recovery_dropin_path(unit)
+        if not os.path.lexists(path):
+            continue
+        parent_descriptor = _open_directory_nofollow(os.path.dirname(path))
+        try:
+            metadata = _read_exact_root_file_at(
+                parent_descriptor,
+                os.path.basename(path),
+                payload,
+                0o644,
+            )
+            if metadata is None:
+                raise RuntimeError(f"Statisches Recovery-Drop-in fehlt: {unit}")
+            identities.append((unit, int(metadata.st_dev), int(metadata.st_ino)))
+        finally:
+            os.close(parent_descriptor)
+    partial = RecoveryBootblockPartialContract(
+        units=_recovery_bootblock_units(),
+        created_directories=(),
+        transaction_id=transaction_id,
+        dropin_identities=tuple(identities),
+        allow_missing_directories=True,
+    )
+    return _arm_persistent_recovery_bootblock(
+        partial,
+        transaction_id=transaction_id,
+    )
+
+
+def _assert_package_binding_matches_journal(
+    package_receipt: PreparedPackageReceipt | PackageRecoveryReceipt,
+    journal_contract: recovery_journal.RecoveryJournalContract,
+) -> None:
+    payload = journal_contract.payload
+    binding = payload.package
+    if binding is None:
+        raise RuntimeError("Master-Journal besitzt keine Paketbindung")
+    if (
+        package_receipt.receipt_path != binding.path
+        or package_receipt.transaction_id != binding.transaction_id
+        or package_receipt.install_root != binding.install_root
+        or package_receipt.full_backup_id != binding.full_backup_id
+        or binding.transaction_id != payload.transaction_id
+        or binding.install_root != payload.install_root
+        or binding.full_backup_id != payload.full_backup.backup_id
+        or binding.target_identity_sha256 != payload.target.identity_sha256
+        or package_receipt.target_commit != payload.target.commit
+        or package_receipt.target_tag != payload.target.tag
+        or package_receipt.role != payload.target.role
+        or _package_prestate_shape_sha256(package_receipt.package_transaction)
+        != binding.prestate_shape_sha256
+    ):
+        raise RuntimeError("Paket-Receipt widerspricht dem Master-Journal")
+
+
+def _assert_dynamic_safety_matches_journal(
+    safety_contract: UpdateSafetyContract,
+    journal_contract: recovery_journal.RecoveryJournalContract,
+) -> None:
+    payload = journal_contract.payload
+    binding = payload.safety
+    if binding is None or binding.mode != recovery_journal.GATE_MODE_DYNAMIC:
+        raise RuntimeError("Master-Journal besitzt keine dynamische Safety-Bindung")
+    if (
+        binding.receipt_path != safety_contract.receipt_path
+        or binding.transaction_id != safety_contract.transaction_id
+        or binding.install_root != payload.install_root
+        or binding.full_backup_id != safety_contract.backup_id
+        or binding.full_backup_id != payload.full_backup.backup_id
+        or binding.target_identity_sha256 != payload.target.identity_sha256
+        or binding.receipt_shape_sha256
+        != _dynamic_safety_shape_sha256(safety_contract)
+        or safety_contract.target_commit != payload.target.commit
+        or safety_contract.target_tag != payload.target.tag
+        or safety_contract.role != payload.target.role
+    ):
+        raise RuntimeError("Dynamisches Safety-Receipt widerspricht dem Journal")
+
+
+def _bind_persisted_runtime_receipts(
+    bundle: PersistentRecoveryBundle,
+) -> tuple[
+    PreparedPackageReceipt | PackageRecoveryReceipt | None,
+    PackageTransactionState | None,
+    UpdateSafetyContract | None,
+    RecoveryBootblockContract | None,
+    QuiescedOverlayReceipt | None,
+    OfflinePackageReceipt | None,
+]:
+    """Bindet veränderliche Begleitreceipts ausschließlich über Journalsemantik."""
+
+    journal_contract = recovery_journal.verify_recovery_journal(bundle.journal)
+    payload = journal_contract.payload
+    terminal = payload.phase in {
+        recovery_journal.PHASE_COMMITTED,
+        recovery_journal.PHASE_ROLLED_BACK,
+    }
+    package_receipt = _read_prepared_package_receipt(allow_missing=True)
+    package_transaction = None
+    if payload.package is not None:
+        if package_receipt is None:
+            if not terminal:
+                raise RuntimeError("Nichtterminales Paket-Receipt fehlt")
+        else:
+            _assert_package_binding_matches_journal(package_receipt, journal_contract)
+            package_transaction = _package_transaction_from_receipt(package_receipt)
+            if (
+                payload.phase == recovery_journal.PHASE_PRODUCT_MUTATING
+                and package_receipt.state != "prepared"
+            ):
+                raise RuntimeError("Produktmutation besitzt kein prepared Paket-Receipt")
+            if (
+                payload.phase == recovery_journal.PHASE_COMMITTED
+                and package_receipt.state == "applying"
+            ):
+                raise RuntimeError("Committed Journal besitzt nur applying Paketzustand")
+            if (
+                payload.phase == recovery_journal.PHASE_ROLLED_BACK
+                and package_receipt.state == "committed"
+            ):
+                raise RuntimeError("Rolled-back Journal besitzt committed Paketzustand")
+    elif package_receipt is not None:
+        # Crashfenster nach Receipt-Create, aber vor der Journalbindung: Das
+        # erste Paketkommando war noch nicht autorisiert. Der Beleg darf daher
+        # nur derselben Transaktion zugeordnet und anschließend entfernt werden.
+        if (
+            payload.phase != recovery_journal.PHASE_PREPRODUCT
+            or package_receipt.transaction_id != payload.transaction_id
+            or package_receipt.install_root != payload.install_root
+            or package_receipt.full_backup_id != payload.full_backup.backup_id
+            or package_receipt.target_commit != payload.target.commit
+            or package_receipt.target_tag != payload.target.tag
+            or package_receipt.role != payload.target.role
+        ):
+            raise RuntimeError("Ungebundenes Paket-Receipt gehört nicht zur preproduct-Transaktion")
+
+    update_safety_contract = _read_update_safety_contract(allow_missing=True)
+    static_bootblock_contract = None
+    safety_binding = payload.safety
+    if safety_binding is not None:
+        if safety_binding.mode == recovery_journal.GATE_MODE_DYNAMIC:
+            if update_safety_contract is None:
+                if not terminal:
+                    raise RuntimeError("Nichtterminales dynamisches Safety-Receipt fehlt")
+            else:
+                _assert_dynamic_safety_matches_journal(
+                    update_safety_contract,
+                    journal_contract,
+                )
+                if (
+                    payload.phase == recovery_journal.PHASE_ROLLED_BACK
+                    and update_safety_contract.state == "committed"
+                ):
+                    raise RuntimeError("Rolled-back Journal besitzt committed Safety")
+                if not terminal:
+                    if update_safety_contract.state != "pending":
+                        raise RuntimeError(
+                            "Nichtterminales Journal besitzt kein pending Safety-Receipt"
+                        )
+                    if os.path.lexists(RECOVERY_BOOTBLOCK_MARKER):
+                        _verify_update_safety_marker(
+                            update_safety_contract,
+                            expected_present=True,
+                        )
+                        _reload_and_verify_update_safety_dropins(
+                            update_safety_contract,
+                            expected_present=True,
+                        )
+                    else:
+                        # Ein Stromausfall kann exakt zwischen Gateöffnung und
+                        # durable rolled_back liegen. Nur die unveränderten,
+                        # receiptgebundenen 00-Inodes dürfen den Marker derselben
+                        # Transaktion wieder scharf stellen.
+                        update_safety_contract = _arm_update_safety_contract(
+                            update_safety_contract
+                        )
+                        _assert_dynamic_safety_matches_journal(
+                            update_safety_contract,
+                            journal_contract,
+                        )
+        elif safety_binding.mode == recovery_journal.GATE_MODE_STATIC:
+            if update_safety_contract is not None:
+                raise RuntimeError("Statisches Journal besitzt dynamisches Safety-Receipt")
+            if package_receipt is not None and package_receipt.static_recovery_contract_json:
+                static_bootblock_contract = _parse_recovery_bootblock_contract(
+                    package_receipt.static_recovery_contract_json,
+                    verify_active_gate=False,
+                )
+                if (
+                    safety_binding.static_contract_sha256
+                    != _static_bootblock_shape_sha256(static_bootblock_contract)
+                ):
+                    raise RuntimeError("Statischer Bootblock driftete vom Journal")
+                if not terminal:
+                    if os.path.lexists(RECOVERY_BOOTBLOCK_MARKER):
+                        _verify_recovery_bootblock_marker(
+                            static_bootblock_contract,
+                            expected_present=True,
+                        )
+                        _reload_and_verify_recovery_dropins(
+                            static_bootblock_contract.units,
+                            expected_present=True,
+                            transaction_id=static_bootblock_contract.transaction_id,
+                        )
+                    else:
+                        static_bootblock_contract = (
+                            _arm_persistent_recovery_bootblock(
+                                static_bootblock_contract,
+                                transaction_id=payload.transaction_id,
+                            )
+                        )
+                        if (
+                            safety_binding.static_contract_sha256
+                            != _static_bootblock_shape_sha256(
+                                static_bootblock_contract
+                            )
+                        ):
+                            raise RuntimeError(
+                                "Reaktivierter statischer Bootblock driftete vom Journal"
+                            )
+            elif not terminal:
+                raise RuntimeError("Nichtterminaler statischer Bootblockvertrag fehlt")
+        else:
+            raise RuntimeError("Journal besitzt einen unbekannten Gate-Modus")
+    else:
+        if update_safety_contract is not None:
+            if (
+                payload.phase != recovery_journal.PHASE_PREPRODUCT
+                or update_safety_contract.transaction_id != payload.transaction_id
+                or update_safety_contract.backup_id != payload.full_backup.backup_id
+                or update_safety_contract.target_commit != payload.target.commit
+                or update_safety_contract.target_tag != payload.target.tag
+                or update_safety_contract.role != payload.target.role
+            ):
+                raise RuntimeError("Ungebundenes Safety-Receipt gehört nicht zum Journal")
+        elif payload.phase == recovery_journal.PHASE_PREPRODUCT and _static_bootblock_namespace_present():
+            static_bootblock_contract = _rebind_or_rearm_static_bootblock(
+                payload.transaction_id
+            )
+
+    overlay_receipt = _read_quiesced_overlay_receipt(allow_missing=True)
+    if payload.overlay is not None:
+        if overlay_receipt is None:
+            if not terminal:
+                raise RuntimeError("Nichtterminales Quiesced-Overlay fehlt")
+        else:
+            reference = payload.overlay.receipt
+            if (
+                overlay_receipt.transaction_id != payload.transaction_id
+                or overlay_receipt.install_root != payload.install_root
+                or overlay_receipt.full_backup_id != payload.full_backup.backup_id
+                or overlay_receipt.backup_id != payload.overlay.backup_id
+                or overlay_receipt.manifest_sha256 != payload.overlay.manifest_sha256
+                or not _persistent_receipt_reference_matches(
+                    reference,
+                    path=reference.path,
+                    device=overlay_receipt.receipt_dev,
+                    inode=overlay_receipt.receipt_ino,
+                    sha256=overlay_receipt.receipt_sha256,
+                )
+            ):
+                raise RuntimeError("Quiesced-Overlay widerspricht dem Journal")
+    elif overlay_receipt is not None:
+        raise RuntimeError("Journalphase besitzt ein unerwartetes Quiesced-Overlay")
+
+    offline_receipt = None
+    if (
+        isinstance(package_receipt, PreparedPackageReceipt)
+        and package_receipt.prepared_state is not None
+    ):
+        offline_receipt = parse_offline_package_receipt(
+            package_receipt.prepared_state.offline_receipt_json.encode("utf-8")
+        )
+    return (
+        package_receipt,
+        package_transaction,
+        update_safety_contract,
+        static_bootblock_contract,
+        overlay_receipt,
+        offline_receipt,
+    )
+
+
+def _reconstruct_persisted_recovery_transaction(
+    journal_contract: recovery_journal.RecoveryJournalContract,
+) -> ReconstructedRecoveryTransaction:
+    bundle = _load_persistent_recovery_bundle(journal_contract)
+    (
+        package_receipt,
+        package_transaction,
+        update_safety_contract,
+        static_bootblock_contract,
+        overlay_receipt,
+        offline_receipt,
+    ) = _bind_persisted_runtime_receipts(bundle)
+    phase = bundle.journal.payload.phase
+    rollback_finish_pending = bool(
+        phase == recovery_journal.PHASE_ROLLED_BACK
+        and (
+            update_safety_contract is not None
+            or static_bootblock_contract is not None
+        )
+    )
+    if rollback_finish_pending and (
+        bundle.context is None
+        or bundle.surface is None
+        or bundle.systemd is None
+    ):
+        raise RuntimeError(
+            "Rolled-back Altstart verlor vor seinem Abschluss einen Parent-Beleg"
+        )
+    if phase == recovery_journal.PHASE_COMMITTED or (
+        phase == recovery_journal.PHASE_ROLLED_BACK
+        and not rollback_finish_pending
+    ):
+        return ReconstructedRecoveryTransaction(
+            bundle=bundle,
+            transition_state=None,
+            install_inventory=None,
+            recovery_inventory=None,
+            repo_contract=None,
+            backup_receipt=None,
+            package_receipt=package_receipt,
+            package_transaction=package_transaction,
+            update_safety_contract=update_safety_contract,
+            static_bootblock_contract=static_bootblock_contract,
+            overlay_receipt=overlay_receipt,
+            offline_receipt=offline_receipt,
+        )
+    if bundle.context is None or bundle.surface is None or bundle.systemd is None:
+        raise RuntimeError("Nichtterminale Recovery-Transaktion ist unvollständig")
+    context = bundle.context.context
+    (
+        manifest,
+        install_inventory,
+        repo_contract,
+        backup_receipt,
+    ) = _reconstruct_backup_contracts(context)
+    transition_state = _reconstruct_transition_state(
+        context,
+        backup_dir=context.backup.backup_dir,
+        manifest=manifest,
+    )
+    recovery_inventory = _reconstruct_recovery_inventory(
+        context,
+        bundle.surface.receipt,
+        manifest=manifest,
+    )
+    return ReconstructedRecoveryTransaction(
+        bundle=bundle,
+        transition_state=transition_state,
+        install_inventory=install_inventory,
+        recovery_inventory=recovery_inventory,
+        repo_contract=repo_contract,
+        backup_receipt=backup_receipt,
+        package_receipt=package_receipt,
+        package_transaction=package_transaction,
+        update_safety_contract=update_safety_contract,
+        static_bootblock_contract=static_bootblock_contract,
+        overlay_receipt=overlay_receipt,
+        offline_receipt=offline_receipt,
+    )
+
+
+def _persistent_gate_dropin_preimages(
+    guard: recovery_surface_codec.SystemdRecoveryRestoreGuard,
+    *,
+    update_safety_contract: UpdateSafetyContract | None,
+    static_bootblock_contract: RecoveryBootblockContract | None,
+) -> tuple[recovery_surface_codec.SystemdFilePreimage, ...]:
+    if (update_safety_contract is None) == (static_bootblock_contract is None):
+        raise RuntimeError("Systemd-Recovery benötigt genau einen Gatevertrag")
+    contract = update_safety_contract or static_bootblock_contract
+    expected_identities = {
+        unit: (device, inode)
+        for unit, device, inode in contract.dropin_identities
+    }
+    expected_payload = (
+        _render_update_safety_dropin(contract.transaction_id)
+        if update_safety_contract is not None
+        else _render_recovery_bootblock_dropin(contract.transaction_id)
+    )
+    result = []
+    for unit_state in guard.current.units:
+        path = _recovery_dropin_path(unit_state.unit)
+        candidates = tuple(
+            item
+            for item in unit_state.managed_dropins.entries
+            if item.path == path
+        )
+        if len(candidates) != 1:
+            raise RuntimeError(
+                f"Startsperr-Drop-in ist nicht eindeutig gebunden: {unit_state.unit}"
+            )
+        item = candidates[0]
+        if (
+            item.kind != "regular"
+            or bytes(item.payload or b"") != expected_payload
+            or item.sha256 != hashlib.sha256(expected_payload).hexdigest()
+            or item.uid != 0
+            or item.gid != 0
+            or item.mode != 0o644
+            or item.identity is None
+            or tuple(item.identity[:2]) != expected_identities.get(unit_state.unit)
+        ):
+            raise RuntimeError(
+                f"Startsperr-Drop-in driftete vom Gatevertrag: {unit_state.unit}"
+            )
+        result.append(item)
+    if len(result) != len(guard.current.units):
+        raise RuntimeError("Startsperr-Drop-in-Menge ist unvollständig")
+    return tuple(result)
+
+
+def _restore_persistent_systemd_prestate(
+    transaction: ReconstructedRecoveryTransaction,
+) -> recovery_journal.RecoveryJournalContract:
+    """Restauriert systemd offline und entscheidet vor Gateöffnung durable Alt."""
+
+    bundle = transaction.bundle
+    if bundle.systemd is None:
+        raise RuntimeError("Persistentes systemd-Recovery-Receipt fehlt")
+    journal_contract = recovery_journal.verify_recovery_journal(bundle.journal)
+    if journal_contract.payload.phase not in {
+        recovery_journal.PHASE_PREPRODUCT,
+        recovery_journal.PHASE_PRODUCT_MUTATING,
+    }:
+        raise RuntimeError("Systemd-Altstart besitzt keine Recovery-Phase")
+    safety = transaction.update_safety_contract
+    static_gate = transaction.static_bootblock_contract
+    if (safety is None) == (static_gate is None):
+        raise RuntimeError("Systemd-Altstart besitzt keinen eindeutigen Gatevertrag")
+    receipt = bundle.systemd.receipt
+
+    def closed_gate_verifier(transaction_id: str, units: tuple[str, ...]) -> bool:
+        current_journal = recovery_journal.read_recovery_journal()
+        if (
+            current_journal is None
+            or not _same_recovery_journal_transaction_shape(
+                current_journal,
+                journal_contract,
+            )
+            or current_journal.payload.phase != journal_contract.payload.phase
+            or transaction_id != journal_contract.payload.transaction_id
+            or tuple(units) != tuple(item.unit for item in receipt.units)
+        ):
+            return False
+        if safety is not None:
+            _validate_update_safety_contract(safety, expected_state="pending")
+            _verify_update_safety_marker(safety, expected_present=True)
+            _reload_and_verify_update_safety_dropins(safety, expected_present=True)
+        else:
+            _validate_recovery_bootblock_contract(static_gate)
+            _verify_recovery_bootblock_marker(static_gate, expected_present=True)
+            _reload_and_verify_recovery_dropins(
+                static_gate.units,
+                expected_present=True,
+                transaction_id=static_gate.transaction_id,
+            )
+        return True
+
+    guard = recovery_surface_codec.capture_systemd_recovery_restore_guard(
+        receipt
+    )
+    preserved = _persistent_gate_dropin_preimages(
+        guard,
+        update_safety_contract=safety,
+        static_bootblock_contract=static_gate,
+    )
+    plan = recovery_surface_codec.restore_systemd_files_masks_enablement(
+        receipt,
+        guard,
+        closed_gate_verifier=closed_gate_verifier,
+        preserved_gate_dropins=preserved,
+    )
+    rolled_back_journal = None
+
+    def start_authorizer(transaction_id: str, units: tuple[str, ...]) -> bool:
+        nonlocal rolled_back_journal
+        if closed_gate_verifier(transaction_id, units) is not True:
+            return False
+        # Ab hier ist Produkt-, Paket-, Nebenflächen- und systemd-Preimage
+        # offline verifiziert. Die Richtung Altstand wird vor dem ersten
+        # Marker-/Drop-in-Unlink dauerhaft entschieden, damit ein Stromausfall
+        # mitten im per-Unit-Gate-Cleanup nur diesen Altstart fortsetzen darf.
+        rolled_back_journal = _advance_persistent_recovery_rolled_back(
+            journal_contract
+        )
+        if safety is not None:
+            _clear_update_safety_marker(safety)
+        else:
+            _clear_recovery_bootblock_marker(static_gate)
+        return True
+
+    try:
+        recovery_surface_codec.restore_systemd_pre_active_state(
+            receipt,
+            plan,
+            start_authorizer=start_authorizer,
+        )
+    except BaseException:
+        terminal = _read_matching_rolled_back_recovery_journal(
+            journal_contract,
+            allow_missing=True,
+        )
+        if terminal is None:
+            try:
+                if safety is not None:
+                    _rearm_pending_update_safety_contract(safety)
+                else:
+                    _arm_persistent_recovery_bootblock(
+                        static_gate,
+                        transaction_id=journal_contract.payload.transaction_id,
+                    )
+            except Exception as gate_error:
+                update_logger.critical(
+                    "Systemd-Recovery-Gate konnte nach Startfehler nicht erneut gebunden werden: %s",
+                    gate_error,
+                )
+        else:
+            update_logger.warning(
+                "Altstand ist durable gewählt; ein Folgeaufruf vollendet "
+                "ausschließlich Gate-Cleanup und Altstart."
+            )
+        raise
+    if rolled_back_journal is None:
+        raise RuntimeError("Systemd-Altstart verlor den durable rolled_back-Beleg")
+    return rolled_back_journal
+
+
+def _settle_terminal_finalizer_lease(
+    contract: (
+        UpdateSafetyContract
+        | RecoveryBootblockContract
+        | legacy_safety_codec.LegacyUpdateSafetyReceipt
+    ),
+) -> None:
+    """Akzeptiert failed/PID0 erst nach bestätigtem reset-failed-Readback."""
+
+    try:
+        _assert_committed_finalizer_lease_inactive(contract)
+        return
+    except Exception as original_error:
+        properties = ("Id", "ActiveState", "SubState", "MainPID")
+        result = _run_argv(
+            [
+                "systemctl",
+                "show",
+                "--no-pager",
+                *(f"--property={name}" for name in properties),
+                contract.finalizer_unit,
+            ],
+            timeout=15,
+            env={**os.environ, "LC_ALL": "C", "LANG": "C"},
+        )
+        values = {}
+        for line in str(result.get("stdout") or "").splitlines():
+            key, separator, value = line.partition("=")
+            if separator == "=" and key in properties and key not in values:
+                values[key] = value
+        if (
+            not result.get("success")
+            or result.get("timed_out")
+            or int(result.get("returncode", -1)) != 0
+            or str(result.get("stderr") or "")
+            or values
+            != {
+                "Id": contract.finalizer_unit,
+                "ActiveState": "failed",
+                "SubState": "failed",
+                "MainPID": "0",
+            }
+        ):
+            raise original_error
+        _assert_no_same_transaction_finalizer_processes(contract)
+        reset = _run_argv(
+            ["systemctl", "reset-failed", "--", contract.finalizer_unit],
+            timeout=15,
+            env={**os.environ, "LC_ALL": "C", "LANG": "C"},
+        )
+        if (
+            not reset.get("success")
+            or reset.get("timed_out")
+            or int(reset.get("returncode", -1)) != 0
+            or str(reset.get("stderr") or "")
+        ):
+            raise RuntimeError(
+                "Beendete failed Finalizer-Lease konnte nicht zurückgesetzt werden"
+            ) from original_error
+        _assert_committed_finalizer_lease_inactive(contract)
+
+
+def _assert_transaction_gate_absent(transaction_id: str) -> None:
+    if os.path.lexists(RECOVERY_BOOTBLOCK_MARKER):
+        raise RuntimeError("Terminaler Recovery-Marker ist noch vorhanden")
+    for unit in _recovery_bootblock_units():
+        path = _recovery_dropin_path(unit)
+        if os.path.lexists(path):
+            raise RuntimeError(
+                f"Terminales Recovery-Drop-in ist noch vorhanden: {path}"
+            )
+
+
+def _finish_committed_recovery_transaction(
+    transaction: ReconstructedRecoveryTransaction,
+) -> None:
+    """Vollendet ausschließlich den dauerhaft bestätigten neuen Stand."""
+
+    bundle = transaction.bundle
+    payload = bundle.journal.payload
+    if payload.phase != recovery_journal.PHASE_COMMITTED:
+        raise RuntimeError("PostCommit-Abschluss besitzt kein committed Journal")
+    current_head = _bound_release_head_commit(
+        payload.install_root,
+        payload.install_user,
+        root_authority=True,
+    )
+    if not _exact_commit_matches(current_head, payload.target.commit):
+        raise RuntimeError(
+            "Committed Journal und aktueller Ziel-HEAD widersprechen sich"
+        )
+
+    package_receipt = transaction.package_receipt
+    safety = transaction.update_safety_contract
+    static_gate = transaction.static_bootblock_contract
+    postcommit_health_required = True
+    if safety is not None:
+        _settle_terminal_finalizer_lease(safety)
+        if safety.state == "pending":
+            safety = _commit_update_safety_receipt(safety)
+        elif safety.state != "committed":
+            raise RuntimeError("Committed Journal besitzt einen unbekannten Safety-Zustand")
+        if isinstance(package_receipt, PreparedPackageReceipt):
+            if package_receipt.state == "prepared":
+                package_receipt = _commit_prepared_package_receipt(package_receipt)
+            elif package_receipt.state != "committed":
+                raise RuntimeError("Committed Journal besitzt keinen commitfähigen Paketzustand")
+        _finish_committed_update_safety_cleanup(safety, remove_receipt=False)
+    elif static_gate is not None:
+        _settle_terminal_finalizer_lease(static_gate)
+        if isinstance(package_receipt, PreparedPackageReceipt):
+            if package_receipt.state == "prepared":
+                package_receipt = _commit_prepared_package_receipt(package_receipt)
+            elif package_receipt.state != "committed":
+                raise RuntimeError("Statischer PostCommit besitzt falschen Paketzustand")
+        if package_receipt is None:
+            raise RuntimeError("Statischer PostCommit besitzt kein Paket-Receipt")
+        package_receipt = _finish_committed_package_gate_cleanup(
+            package_receipt
+        )
+    else:
+        _assert_transaction_gate_absent(payload.transaction_id)
+        if package_receipt is not None:
+            raise RuntimeError("Committed Journal verlor seinen Gatevertrag")
+        # Safety-/Paket-Receipt werden erst entfernt, nachdem Apache und der
+        # Zielstand erfolgreich geprüft wurden. Fehlen beide bei weiterhin
+        # vorhandenem committed Journal, ist deshalb ausschließlich ein durch
+        # Stromausfall unterbrochener Artefakt-Cleanup offen. Ohne den bereits
+        # verbrauchten Apache-Prestate dürfen weder Dienste noch HTTP erneut
+        # interpretiert oder mutiert werden.
+        postcommit_health_required = False
+
+    if postcommit_health_required:
+        # Nach einem Reboot wurden die Conditions zwar entfernt, systemd
+        # startet zuvor blockierte Units aber nicht rückwirkend. Daher wird
+        # ausschließlich der gebundene Ziel-Policy-Satz bei Bedarf aktiviert.
+        state = _capture_transition_state(expected_role=payload.target.role)
+        policy = _read_policy_from_commit(
+            payload.install_root,
+            payload.target.commit,
+            payload.install_user,
+            root_authority=True,
+        )
+        services = _validated_restart_services(policy, state)
+        services_healthy = _post_update_healthcheck(
+            services=services,
+            transition_state=state,
+            check_web=False,
+            check_http=False,
+        )
+        if not services_healthy:
+            if not _restart_v4_services(
+                headless=True,
+                services=services,
+                transition_state=state,
+            ):
+                raise RuntimeError(
+                    "Committed Zieldienste konnten nicht vollständig aktiviert werden"
+                )
+            if not _post_update_healthcheck(
+                services=services,
+                transition_state=state,
+                check_web=False,
+                check_http=False,
+            ):
+                raise RuntimeError(
+                    "Committed Zieldienste bestanden das Dienst-/HA-Gesundheitsgate nicht"
+                )
+
+        apache_was_active = False
+        if safety is not None:
+            apache_was_active = bool(
+                safety.apache_available and safety.apache_was_active
+            )
+        elif isinstance(package_receipt, PreparedPackageReceipt):
+            apache_was_active = bool(
+                package_receipt.apache_available
+                and package_receipt.apache_was_active
+            )
+        if not _post_update_healthcheck(
+            services=services,
+            transition_state=state,
+            check_web=True,
+            check_http=apache_was_active,
+        ):
+            raise RuntimeError(
+                "Committed Zielstand bestand das Web-/HTTP-Endgate nicht"
+            )
+
+    terminal_bundle = _refresh_terminal_recovery_bundle(
+        bundle,
+        phase=recovery_journal.PHASE_COMMITTED,
+    )
+    _cleanup_terminal_update_artifacts(
+        bundle=terminal_bundle,
+        offline_receipt=transaction.offline_receipt,
+        overlay_receipt=transaction.overlay_receipt,
+        package_receipt=package_receipt,
+        update_safety_contract=safety,
+        terminal_label="committed neue Stand",
+    )
+
+
+def _terminal_gate_dropin_contracts(
+    transaction: ReconstructedRecoveryTransaction,
+) -> dict[str, dict[str, object]]:
+    """Projiziert den unveränderlichen Gatevertrag für Teilcleanup-Replays."""
+
+    safety = transaction.update_safety_contract
+    static_gate = transaction.static_bootblock_contract
+    if (safety is None) == (static_gate is None):
+        raise RuntimeError("Terminaler Altstart besitzt keinen eindeutigen Gatevertrag")
+    contract = safety or static_gate
+    identities = {
+        unit: (device, inode)
+        for unit, device, inode in contract.dropin_identities
+    }
+    if set(identities) != set(contract.units):
+        raise RuntimeError("Terminaler Gatevertrag besitzt keine vollständigen Inodes")
+    payload = (
+        _render_update_safety_dropin(contract.transaction_id)
+        if safety is not None
+        else _render_recovery_bootblock_dropin(contract.transaction_id)
+    )
+    return {
+        _recovery_dropin_path(unit): {
+            "device": identities[unit][0],
+            "inode": identities[unit][1],
+            "payload": payload,
+            "uid": 0,
+            "gid": 0,
+            "mode": 0o644,
+            "nlink": 1,
+        }
+        for unit in contract.units
+    }
+
+
+def _finish_rolled_back_recovery_transaction(
+    transaction: ReconstructedRecoveryTransaction,
+) -> None:
+    """Führt nach durable rolled_back ausschließlich den Cleanup fort."""
+
+    if transaction.bundle.journal.payload.phase != recovery_journal.PHASE_ROLLED_BACK:
+        raise RuntimeError("Altstands-Cleanup besitzt kein rolled_back Journal")
+    terminal_lease = (
+        transaction.update_safety_contract
+        or transaction.static_bootblock_contract
+    )
+    if terminal_lease is not None:
+        _settle_terminal_finalizer_lease(terminal_lease)
+    if transaction.transition_state is not None:
+        if (
+            transaction.bundle.systemd is None
+            or transaction.recovery_inventory is None
+        ):
+            raise RuntimeError("Terminaler Altstart besitzt kein vollständiges Preimage")
+        if os.path.lexists(RECOVERY_BOOTBLOCK_MARKER):
+            if transaction.update_safety_contract is not None:
+                _clear_update_safety_marker(
+                    transaction.update_safety_contract
+                )
+            else:
+                _clear_recovery_bootblock_marker(
+                    transaction.static_bootblock_contract
+                )
+
+        terminal_journal = recovery_journal.verify_recovery_journal(
+            transaction.bundle.journal
+        )
+        receipt = transaction.bundle.systemd.receipt
+
+        def terminal_start_authorizer(
+            transaction_id: str,
+            units: tuple[str, ...],
+        ) -> bool:
+            try:
+                current = recovery_journal.verify_recovery_journal(
+                    terminal_journal
+                )
+            except Exception:
+                return False
+            return bool(
+                current.payload.phase == recovery_journal.PHASE_ROLLED_BACK
+                and transaction_id == terminal_journal.payload.transaction_id
+                and tuple(units) == tuple(item.unit for item in receipt.units)
+            )
+
+        recovery_surface_codec.resume_systemd_pre_active_state_after_gate_open(
+            receipt,
+            gate_dropins=_terminal_gate_dropin_contracts(transaction),
+            start_authorizer=terminal_start_authorizer,
+        )
+        apache = transaction.recovery_inventory.apache_security
+        _restore_apache_after_successful_cutover(
+            expected_available=apache.apache_available,
+            expected_active=apache.apache_was_active,
+            expected_unit_file_state=apache.apache_unit_file_state,
+        )
+    _assert_transaction_gate_absent(
+        transaction.bundle.journal.payload.transaction_id
+    )
+    _cleanup_terminal_update_artifacts(
+        bundle=transaction.bundle,
+        offline_receipt=transaction.offline_receipt,
+        overlay_receipt=transaction.overlay_receipt,
+        package_receipt=transaction.package_receipt,
+        update_safety_contract=transaction.update_safety_contract,
+        terminal_label="wiederhergestellte Altstand",
+    )
+
+
+def _dispatch_persisted_recovery_transaction(
+    transaction: ReconstructedRecoveryTransaction,
+) -> None:
+    payload = transaction.bundle.journal.payload
+    phase = payload.phase
+    if phase == recovery_journal.PHASE_COMMITTED:
+        _finish_committed_recovery_transaction(transaction)
+        return
+    if phase == recovery_journal.PHASE_ROLLED_BACK:
+        _finish_rolled_back_recovery_transaction(transaction)
+        return
+    if (
+        transaction.transition_state is None
+        or transaction.install_inventory is None
+        or transaction.recovery_inventory is None
+    ):
+        raise RuntimeError("Nichtterminale Recovery-Projektion ist unvollständig")
+    if phase == recovery_journal.PHASE_PREPRODUCT:
+        gate_present = (
+            transaction.update_safety_contract is not None
+            or transaction.static_bootblock_contract is not None
+        )
+        package_was_authorized = payload.package is not None
+        if not gate_present:
+            if package_was_authorized:
+                raise RuntimeError("Gebundene Paketmutation besitzt kein Recovery-Gate")
+            rolled_back = _advance_persistent_recovery_rolled_back(
+                transaction.bundle.journal
+            )
+            transaction = replace(
+                transaction,
+                bundle=replace(transaction.bundle, journal=rolled_back),
+            )
+        else:
+            recovered = _abort_before_product_mutation(
+                repo_dir=payload.install_root,
+                state=transaction.transition_state,
+                apache_preimage=transaction.recovery_inventory.apache_security,
+                transaction_id=payload.transaction_id,
+                bootblock_contract=transaction.static_bootblock_contract,
+                update_safety_contract=transaction.update_safety_contract,
+                overlay_receipt=None,
+                package_transaction=(
+                    transaction.package_transaction
+                    if package_was_authorized
+                    else None
+                ),
+                packages_mutated=package_was_authorized,
+                recovery_inventory=transaction.recovery_inventory,
+                recovery_journal_contract=transaction.bundle.journal,
+                persistent_recovery_transaction=transaction,
+            )
+            if not recovered:
+                raise RuntimeError("Automatischer preproduct-Rücklauf blieb unvollständig")
+        _finish_rolled_back_update_cleanup(
+            bundle=transaction.bundle,
+            offline_receipt=transaction.offline_receipt,
+            overlay_receipt=None,
+            package_receipt=transaction.package_receipt,
+            update_safety_contract=transaction.update_safety_contract,
+        )
+        return
+    if phase == recovery_journal.PHASE_PRODUCT_MUTATING:
+        result = _recover_failed_transition(
+            repo_dir=payload.install_root,
+            install_user=payload.install_user,
+            backup_dir=transaction.bundle.context.context.backup.backup_dir,
+            old_commit=payload.source.commit,
+            git_created=not payload.source.repository_present,
+            inventory=transaction.install_inventory,
+            recovery_inventory=transaction.recovery_inventory,
+            state=transaction.transition_state,
+            package_transaction=transaction.package_transaction,
+            repo_recovery_contract=transaction.repo_contract,
+            backup_receipt=transaction.backup_receipt,
+            bootblock_contract=transaction.static_bootblock_contract,
+            update_safety_contract=transaction.update_safety_contract,
+            recovery_transaction_id=payload.transaction_id,
+            quiesced_overlay_receipt=transaction.overlay_receipt,
+            recovery_journal_contract=transaction.bundle.journal,
+            persistent_recovery_transaction=transaction,
+        )
+        if not result.recovered:
+            raise RuntimeError("Automatischer Vollrücklauf blieb unvollständig")
+        _finish_rolled_back_update_cleanup(
+            bundle=transaction.bundle,
+            offline_receipt=transaction.offline_receipt,
+            overlay_receipt=transaction.overlay_receipt,
+            package_receipt=transaction.package_receipt,
+            update_safety_contract=transaction.update_safety_contract,
+        )
+        return
+    raise RuntimeError(f"Unbekannte Recovery-Journalphase: {phase}")
+
+
+def _peek_orphan_recovery_mapping(
+    path: str,
+    *,
+    maximum_bytes: int,
+) -> dict:
+    """Liest nur die drei Anker eines rootgebundenen Parent-Receipts vor.
+
+    Die Vorablesung erteilt keine Autorität. Unmittelbar danach muss der
+    jeweilige öffentliche Codec mit den extrahierten Ankern denselben Inode
+    kanonisch, xattr-frei und schemaexakt zurückbinden.
+    """
+
+    snapshot = recovery_surface_codec.snapshot_bound_file(
+        path,
+        allow_missing=False,
+        expected_uid=0,
+        expected_gid=0,
+        max_bytes=maximum_bytes,
+    )
+    payload = snapshot.get("payload")
+    identity = tuple(snapshot.get("identity") or ())
+    if (
+        not isinstance(payload, bytes)
+        or len(identity) != 9
+        or identity[2] != 0
+        or identity[3] != 0
+        or identity[4] != 0o600
+        or identity[5] != 1
+        or identity[6] != len(payload)
+        or snapshot.get("mode") != 0o600
+        or snapshot.get("sha256") != hashlib.sha256(payload).hexdigest()
+    ):
+        raise RuntimeError(
+            f"Orphan-Receipt besitzt keinen root:root-0600-Einzelinode: {path}"
+        )
+    try:
+        mapping = json.loads(payload.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Orphan-Receipt ist kein lesbares JSON: {path}") from exc
+    if not isinstance(mapping, dict):
+        raise RuntimeError(f"Orphan-Receipt besitzt kein JSON-Objekt: {path}")
+    return mapping
+
+
+def _cleanup_prejournal_construction_prefix(
+    *,
+    requested_install_root: str,
+) -> bool:
+    """Bereinigt nur den construction-autorisierten Parent-Aufbau."""
+
+    construction = prejournal_codec.read_prejournal_construction(
+        allow_missing=True
+    )
+    if construction is None:
+        return False
+    construction = prejournal_codec.verify_prejournal_construction(
+        construction
+    )
+    receipt = construction.receipt
+    requested = os.path.realpath(os.path.abspath(requested_install_root))
+    if requested != receipt.install_root:
+        raise RuntimeError(
+            "[E3DC-UPD-PREJOURNAL-INSTANCE-001] Der unterbrochene "
+            f"Parent-Aufbau gehört zu {receipt.install_root}, dieser Aufruf "
+            f"zu {requested}. Lösung: Starte denselben Updatebefehl für "
+            "die zuerst genannte Instanz; bei zwei Instanzen keine "
+            "Recovery-Datei löschen"
+        )
+    stable_manifest, manifest_sha256 = _read_stable_verified_backup_manifest(
+        receipt.backup_dir
+    )
+    if (
+        str(stable_manifest.get("backup_id") or "")
+        != receipt.full_backup.backup_id
+        or manifest_sha256 != receipt.full_backup.manifest_sha256
+    ):
+        raise RuntimeError(
+            "[E3DC-UPD-PREJOURNAL-BACKUP-001] Das verifizierte Vollbackup "
+            "widerspricht dem Construction-Receipt. Lösung: Backup nicht "
+            "verschieben oder löschen; prüfe dessen Manifest und starte "
+            "danach denselben Updatebefehl erneut"
+        )
+
+    context_path = recovery_context_codec.RECOVERY_CONTEXT_PATH
+    surface_path = recovery_surface_codec.RECOVERY_SURFACE_RECEIPT_PATH
+    systemd_path = recovery_surface_codec.SYSTEMD_RECOVERY_RECEIPT_PATH
+    has_context = os.path.lexists(context_path)
+    has_surface = os.path.lexists(surface_path)
+    has_systemd = os.path.lexists(systemd_path)
+    if (has_systemd and not has_surface) or (
+        has_context and not (has_surface and has_systemd)
+    ):
+        raise RuntimeError(
+            "[E3DC-UPD-PREJOURNAL-PREFIX-001] Parent-Belege verletzen die "
+            "Construction-Reihenfolge. Lösung: Keine Datei löschen; prüfe "
+            f"sudo stat {context_path} {surface_path} {systemd_path} und "
+            "das Updatejournal"
+        )
+
+    surface_binding = None
+    if has_surface:
+        surface_binding = (
+            recovery_surface_codec.read_recovery_surface_receipt(
+                receipt_path=surface_path,
+                expected_transaction_id=receipt.transaction_id,
+                expected_install_root=receipt.install_root,
+                expected_full_backup_id=receipt.full_backup.backup_id,
+            )
+        )
+
+    systemd_binding = None
+    if has_systemd:
+        systemd_mapping = _peek_orphan_recovery_mapping(
+            systemd_path,
+            maximum_bytes=(
+                recovery_surface_codec.MAX_SYSTEMD_RECOVERY_RECEIPT_BYTES
+            ),
+        )
+        raw_units = systemd_mapping.get("units")
+        if not isinstance(raw_units, list):
+            raise RuntimeError(
+                "Construction-systemd-Receipt besitzt keine Unitliste"
+            )
+        expected_units = tuple(
+            str(item.get("unit") or "")
+            for item in raw_units
+            if isinstance(item, dict)
+        )
+        if len(expected_units) != len(raw_units):
+            raise RuntimeError(
+                "Construction-systemd-Receipt besitzt ungültige Uniteinträge"
+            )
+        systemd_binding = (
+            recovery_surface_codec.read_systemd_recovery_receipt(
+                receipt_path=systemd_path,
+                expected_transaction_id=receipt.transaction_id,
+                expected_install_root=receipt.install_root,
+                expected_full_backup_id=receipt.full_backup.backup_id,
+                expected_units=expected_units,
+                expected_unit_root=str(
+                    systemd_mapping.get("unit_root") or ""
+                ),
+            )
+        )
+
+    context_binding = None
+    if has_context:
+        context_binding = recovery_context_codec.read_recovery_context(
+            expected_transaction_id=receipt.transaction_id,
+            expected_install_root=receipt.install_root,
+            expected_full_backup_id=receipt.full_backup.backup_id,
+            path=context_path,
+        )
+        context = context_binding.context
+        if (
+            surface_binding is None
+            or systemd_binding is None
+            or context.surface_receipt
+            != _context_receipt_reference(surface_binding)
+            or context.systemd_receipt
+            != _context_receipt_reference(systemd_binding)
+            or context.install_user != receipt.install_user
+            or context.target.commit != receipt.target.commit
+            or context.target.tag != receipt.target.tag
+            or context.target.role != receipt.target.role
+            or context.backup.backup_dir != receipt.backup_dir
+            or context.backup.manifest_sha256
+            != receipt.full_backup.manifest_sha256
+            or context.source.old_commit != receipt.source.commit
+            or context.source.bootstrap_without_git
+            == receipt.source.repository_present
+            or context.source.bootstrap_rebuild_git
+            != receipt.source.repository_rebuild_required
+        ):
+            raise RuntimeError(
+                "Construction-Receipt und Recovery-Kontext widersprechen sich"
+            )
+
+    forbidden_paths = (
+        os.path.join(
+            RECOVERY_BOOTBLOCK_STATE_DIR,
+            PREPARED_PACKAGE_RECEIPT_NAME,
+        ),
+        os.path.join(
+            RECOVERY_BOOTBLOCK_STATE_DIR,
+            UPDATE_SAFETY_RECEIPT_NAME,
+        ),
+        os.path.join(
+            RECOVERY_BOOTBLOCK_STATE_DIR,
+            QUIESCED_OVERLAY_RECEIPT_NAME,
+        ),
+        RECOVERY_BOOTBLOCK_MARKER,
+    )
+    finalizer_contract = RecoveryBootblockContract(
+        units=(),
+        created_directories=(),
+        transaction_id=receipt.transaction_id,
+        dropin_identities=(),
+    )
+
+    def revalidate_before_mutation() -> None:
+        """Bestätigt die vollständige Nichtmutationsautorität just in time."""
+
+        prejournal_codec.verify_prejournal_construction(construction)
+        forbidden = tuple(
+            path for path in forbidden_paths if os.path.lexists(path)
+        )
+        runtime_path = f"/run/{finalizer_contract.runtime_directory}"
+        if os.path.lexists(runtime_path):
+            forbidden += (runtime_path,)
+        if os.path.lexists(finalizer_contract.token_path):
+            forbidden += (finalizer_contract.token_path,)
+        if forbidden:
+            raise RuntimeError(
+                "[E3DC-UPD-PREJOURNAL-MUTATION-001] Der reine Parent-Aufbau "
+                "besitzt bereits Mutationsartefakte: "
+                + ", ".join(forbidden)
+                + ". Lösung: Dateien und Dienste unverändert lassen und das "
+                "Updatejournal prüfen"
+            )
+        _assert_no_same_transaction_finalizer_processes(finalizer_contract)
+        _assert_no_recovery_bootblock_dropins()
+        if recovery_journal.read_recovery_journal(
+            allow_missing=True
+        ) is not None:
+            raise RuntimeError(
+                "Master-Journal erschien während des Construction-Cleanups"
+            )
+
+    # Der Construction-Pfad liegt vollständig vor jeder Diensteruhe und
+    # Produktmutation. Der Watchdog-Latch darf deshalb gelöst werden.
+    revalidate_before_mutation()
+    _set_watchdog_update_pause(False, reason="prejournal-construction-cleanup")
+    if context_binding is not None:
+        revalidate_before_mutation()
+        recovery_context_codec.remove_recovery_context(context_binding)
+    if systemd_binding is not None:
+        revalidate_before_mutation()
+        recovery_surface_codec.remove_systemd_recovery_receipt(systemd_binding)
+    if surface_binding is not None:
+        revalidate_before_mutation()
+        recovery_surface_codec.remove_recovery_surface_receipt(surface_binding)
+    revalidate_before_mutation()
+    prejournal_codec.remove_prejournal_construction(construction)
+    remaining = tuple(
+        path
+        for path in (
+            prejournal_codec.PREJOURNAL_CONSTRUCTION_PATH,
+            context_path,
+            systemd_path,
+            surface_path,
+        )
+        if os.path.lexists(path)
+    )
+    if remaining:
+        raise RuntimeError(
+            "Construction-Cleanup blieb unvollständig: "
+            + ", ".join(remaining)
+        )
+    print(
+        "[OK] Unterbrochener Parent-Aufbau wurde automatisch bereinigt; "
+        "das verifizierte Vollbackup bleibt erhalten."
+    )
+    return True
+
+
+def _cleanup_preproduct_orphan_receipt_prefix(
+    *,
+    requested_install_root: str,
+) -> bool:
+    """Räumt ausschließlich den mutationsfreien Parent-Präfix vor Journal auf.
+
+    Die Erzeugungsreihenfolge ist Surface -> systemd -> Context -> Journal ->
+    Gate. Ohne Journal ist nur Surface bzw. Surface+systemd eindeutig vor der
+    Context-/Journal-Grenze unterbrochen. Ein vollständiger Parent-Dreiersatz
+    ist ohne Master-Journal phasenambig und bleibt deshalb unverändert.
+    """
+
+    context_path = recovery_context_codec.RECOVERY_CONTEXT_PATH
+    surface_path = recovery_surface_codec.RECOVERY_SURFACE_RECEIPT_PATH
+    systemd_path = recovery_surface_codec.SYSTEMD_RECOVERY_RECEIPT_PATH
+    has_context = os.path.lexists(context_path)
+    has_surface = os.path.lexists(surface_path)
+    has_systemd = os.path.lexists(systemd_path)
+    if not (has_context or has_surface or has_systemd):
+        return False
+    if not has_surface or (has_context and not has_systemd):
+        raise RuntimeError(
+            "[E3DC-UPD-ORPHAN-CONTEXT-002] Recovery-Begleiter bilden keinen "
+            "zulässigen Vorbereitungspräfix. Lösung: Keine Datei löschen; "
+            "führe `sudo stat -c '%U:%G %a %h %s %n' "
+            f"{context_path} {surface_path} {systemd_path}` aus und prüfe "
+            "danach `sudo journalctl -b -u 'e3dc-*update*' --no-pager`"
+        )
+    if has_context:
+        raise RuntimeError(
+            "[E3DC-UPD-ORPHAN-JOURNAL-AMBIGUOUS-003] Surface-, systemd- "
+            "und Context-Parent sind vollständig, aber das richtungsgebende "
+            "Master-Journal fehlt. Dieser Zustand darf weder als Alt- noch "
+            "als Neustand geraten werden. Lösung: Keine Recovery-Datei und "
+            "keinen systemd-Drop-in löschen; führe `sudo stat -c "
+            "'%U:%G %a %h %s %n' "
+            f"{context_path} {surface_path} {systemd_path}` und danach "
+            "`sudo journalctl -b -u 'e3dc-*update*' --no-pager` aus."
+        )
+
+    surface_mapping = _peek_orphan_recovery_mapping(
+        surface_path,
+        maximum_bytes=recovery_surface_codec.MAX_RECOVERY_SURFACE_RECEIPT_BYTES,
+    )
+    transaction_id = str(surface_mapping.get("transaction_id") or "")
+    install_root = str(surface_mapping.get("install_root") or "")
+    full_backup_id = str(surface_mapping.get("full_backup_id") or "")
+    surface_binding = recovery_surface_codec.read_recovery_surface_receipt(
+        receipt_path=surface_path,
+        expected_transaction_id=transaction_id,
+        expected_install_root=install_root,
+        expected_full_backup_id=full_backup_id,
+    )
+    requested = os.path.realpath(os.path.abspath(requested_install_root))
+    if requested != surface_binding.receipt.install_root:
+        raise RuntimeError(
+            "[E3DC-UPD-ORPHAN-INSTANCE-001] Der mutationsfreie "
+            f"Recovery-Präfix gehört zu {surface_binding.receipt.install_root}, "
+            f"dieser Aufruf zu {requested}. Lösung: Starte denselben "
+            "Updatebefehl für die zuerst genannte Instanz; bei zwei Instanzen "
+            "keine Recovery-Datei löschen"
+        )
+
+    systemd_binding = None
+    if has_systemd:
+        systemd_mapping = _peek_orphan_recovery_mapping(
+            systemd_path,
+            maximum_bytes=recovery_surface_codec.MAX_SYSTEMD_RECOVERY_RECEIPT_BYTES,
+        )
+        raw_units = systemd_mapping.get("units")
+        if not isinstance(raw_units, list):
+            raise RuntimeError("Orphan-systemd-Receipt besitzt keine Unitliste")
+        expected_units = tuple(
+            str(item.get("unit") or "")
+            for item in raw_units
+            if isinstance(item, dict)
+        )
+        if len(expected_units) != len(raw_units):
+            raise RuntimeError("Orphan-systemd-Receipt besitzt ungültige Uniteinträge")
+        systemd_binding = recovery_surface_codec.read_systemd_recovery_receipt(
+            receipt_path=systemd_path,
+            expected_transaction_id=transaction_id,
+            expected_install_root=install_root,
+            expected_full_backup_id=full_backup_id,
+            expected_units=expected_units,
+            expected_unit_root=str(systemd_mapping.get("unit_root") or ""),
+        )
+
+    forbidden_paths = (
+        os.path.join(
+            RECOVERY_BOOTBLOCK_STATE_DIR,
+            PREPARED_PACKAGE_RECEIPT_NAME,
+        ),
+        os.path.join(
+            RECOVERY_BOOTBLOCK_STATE_DIR,
+            UPDATE_SAFETY_RECEIPT_NAME,
+        ),
+        os.path.join(
+            RECOVERY_BOOTBLOCK_STATE_DIR,
+            QUIESCED_OVERLAY_RECEIPT_NAME,
+        ),
+        RECOVERY_BOOTBLOCK_MARKER,
+    )
+    forbidden = tuple(path for path in forbidden_paths if os.path.lexists(path))
+    units = set(_recovery_bootblock_units())
+    if systemd_binding is not None:
+        units.update(item.unit for item in systemd_binding.receipt.units)
+    forbidden += tuple(
+        _recovery_dropin_path(unit)
+        for unit in sorted(units)
+        if os.path.lexists(_recovery_dropin_path(unit))
+    )
+    finalizer_contract = RecoveryBootblockContract(
+        units=(),
+        created_directories=(),
+        transaction_id=transaction_id,
+        dropin_identities=(),
+    )
+    if os.path.lexists(f"/run/{finalizer_contract.runtime_directory}"):
+        forbidden += (f"/run/{finalizer_contract.runtime_directory}",)
+    if os.path.lexists(finalizer_contract.token_path):
+        forbidden += (finalizer_contract.token_path,)
+    if forbidden:
+        raise RuntimeError(
+            "[E3DC-UPD-ORPHAN-MUTATION-001] Parent-Receipts ohne Journal "
+            "besitzen bereits Gate-/Paket-/Overlay-Artefakte: "
+            + ", ".join(forbidden)
+            + ". Lösung: Dienste und Dateien unverändert lassen; führe "
+            "`sudo journalctl -b -u 'e3dc-*update*' --no-pager` aus und "
+            "verwende nur die dort genannte Recovery-Richtung"
+        )
+    _assert_no_same_transaction_finalizer_processes(finalizer_contract)
+    # Direkt vor der ersten Mutation wird der gesamte systemd-Namensraum
+    # descriptorgebunden geprüft. Nicht katalogisierte Alt-/Fremd-Gates dürfen
+    # die Parent-Belege niemals erst nach deren Entfernung sichtbar machen.
+    _assert_no_recovery_bootblock_dropins()
+
+    # Der alte Produktstand lief während dieses Vorbereitungspräfixes weiter.
+    # Der Update-Latch darf daher vor den inodegebundenen Removals fallen; ein
+    # weiterer Stromausfall wiederholt lediglich denselben Präfix-Cleanup.
+    _set_watchdog_update_pause(False, reason="preproduct-orphan-cleanup")
+    if systemd_binding is not None:
+        recovery_surface_codec.remove_systemd_recovery_receipt(systemd_binding)
+    recovery_surface_codec.remove_recovery_surface_receipt(surface_binding)
+    remaining = tuple(
+        path
+        for path in (context_path, systemd_path, surface_path)
+        if os.path.lexists(path)
+    )
+    if remaining:
+        raise RuntimeError(
+            "Mutationsfreier Recovery-Präfix blieb nach inodegebundenem Cleanup: "
+            + ", ".join(remaining)
+        )
+    print(
+        "[OK] Unterbrochene Update-Vorbereitung ohne Produktänderung wurde "
+        "automatisch bereinigt; das verifizierte Backup bleibt erhalten."
+    )
+    return True
+
+
+def _assert_legacy_recovery_namespace_exclusive() -> None:
+    """Verhindert jede Vermischung alter Safety- und neuer Journalartefakte."""
+
+    new_artifacts = (
+        recovery_journal.RECOVERY_JOURNAL_PATH,
+        prejournal_codec.PREJOURNAL_CONSTRUCTION_PATH,
+        recovery_context_codec.RECOVERY_CONTEXT_PATH,
+        recovery_surface_codec.RECOVERY_SURFACE_RECEIPT_PATH,
+        recovery_surface_codec.SYSTEMD_RECOVERY_RECEIPT_PATH,
+        os.path.join(
+            RECOVERY_BOOTBLOCK_STATE_DIR,
+            PREPARED_PACKAGE_RECEIPT_NAME,
+        ),
+        os.path.join(
+            RECOVERY_BOOTBLOCK_STATE_DIR,
+            QUIESCED_OVERLAY_RECEIPT_NAME,
+        ),
+    )
+    present = tuple(path for path in new_artifacts if os.path.lexists(path))
+    if present:
+        command = "sudo stat -c '%U:%G %a %h %s %n' " + " ".join(
+            shlex.quote(path) for path in present
+        )
+        raise ActionableUpdateAbort(
+            "E3DC-UPD-LEGACY-MIXED-001",
+            "Ein altes 5.4.4/5.4.4a-Safety-Receipt ist mit neuen "
+            "Recovery-Artefakten vermischt; eine automatische Richtung wäre unsicher.",
+            system_state="UNGEKLÄRT_FAIL_CLOSED",
+            target=legacy_safety_codec.LEGACY_UPDATE_SAFETY_RECEIPT_PATH,
+            solution=command,
+        )
+
+
+def _resolve_legacy_update_safety_residue(
+    *,
+    requested_install_root: str,
+) -> bool:
+    """Löst ausschließlich committed Residuen der direkten Vorgänger."""
+
+    receipt_path = legacy_safety_codec.LEGACY_UPDATE_SAFETY_RECEIPT_PATH
+    if not os.path.lexists(receipt_path):
+        return False
+    _assert_legacy_recovery_namespace_exclusive()
+    try:
+        bound = _read_bound_legacy_update_safety_receipt()
+    except legacy_safety_codec.LegacyUpdateSafetyError as exc:
+        raise ActionableUpdateAbort(
+            "E3DC-UPD-LEGACY-RECEIPT-001",
+            f"Das vorhandene Alt-Receipt ist nicht exakt als veröffentlichter "
+            f"5.4.4/5.4.4a-Vertrag beweisbar: {exc.detail}",
+            system_state="UNGEKLÄRT_FAIL_CLOSED",
+            target=(
+                "Alt-Receipt unverändert lassen und dessen genaue Form für "
+                "eine geführte Recovery sichern"
+            ),
+            solution=(
+                "sudo stat -c '%U:%G %a %h %s %n' "
+                + shlex.quote(receipt_path)
+            ),
+        ) from exc
+    except Exception as exc:
+        raise ActionableUpdateAbort(
+            "E3DC-UPD-LEGACY-RECEIPT-METADATA-001",
+            "Das vorhandene Alt-Receipt konnte nicht mit seinem Root-, "
+            f"Datei- und Inodevertrag gelesen werden: {exc}",
+            system_state="UNGEKLÄRT_FAIL_CLOSED",
+            target=(
+                "Alt-Receipt unverändert lassen und seine Metadaten für eine "
+                "geführte Recovery sichern"
+            ),
+            solution=(
+                "sudo stat -c '%U:%G %a %h %s %n' "
+                + shlex.quote(receipt_path)
+            ),
+        ) from exc
+    if bound is None:
+        return False
+    receipt, metadata = bound
+    try:
+        install_root = _bind_legacy_update_backup_instance(
+            receipt,
+            requested_install_root=requested_install_root,
+        )
+    except Exception as exc:
+        manifest_path = os.path.join(receipt.backup_dir, MANIFEST_NAME)
+        raise ActionableUpdateAbort(
+            "E3DC-UPD-LEGACY-BACKUP-001",
+            f"Das alte Safety-Receipt lässt sich nicht eindeutig seiner "
+            f"verifizierten Installation zuordnen: {exc}",
+            system_state=(
+                "COMMITTED_RECEIPT_INSTANZ_UNGEKLÄRT_FAIL_CLOSED"
+                if receipt.state == "committed"
+                else "UNGEKLÄRT_FAIL_CLOSED"
+            ),
+            target=(
+                f"Alt-Receipt und Backup unverändert lassen; Zuordnung von "
+                f"{receipt.target_tag} zu {requested_install_root} klären"
+            ),
+            solution=(
+                "sudo stat -c '%U:%G %a %h %s %n' "
+                + shlex.quote(receipt.backup_dir)
+                + " "
+                + shlex.quote(manifest_path)
+            ),
+        ) from exc
+
+    target = f"{receipt.target_tag} ({receipt.target_commit}) in {install_root}"
+    if receipt.state == "pending":
+        try:
+            _verify_update_safety_marker(receipt, expected_present=True)
+            _rebind_legacy_update_safety_dropins(
+                receipt,
+                allow_missing=False,
+            )
+        except Exception as exc:
+            raise ActionableUpdateAbort(
+                "E3DC-UPD-LEGACY-PENDING-DRIFT-001",
+                f"Ein alter pending Updatevertrag ist vorhanden, sein "
+                f"rebootfestes Startgate aber nicht vollständig beweisbar: {exc}",
+                system_state="UNGEKLÄRT_FAIL_CLOSED",
+                target=(
+                    f"Finalizerursache für {target} auslesen; Receipt und "
+                    "Backup unverändert lassen"
+                ),
+                solution=(
+                    "sudo journalctl -u "
+                    + shlex.quote(receipt.finalizer_unit)
+                    + " --no-pager -n 200"
+                ),
+            ) from exc
+        raise ActionableUpdateAbort(
+            "E3DC-UPD-LEGACY-PENDING-001",
+            "Der Vorgänger hat den Zielstand noch nicht dauerhaft committed. "
+            "Ohne dessen Apache- und Dienstpreimage darf der Ziel-Updater "
+            "weder Alt- noch Neustand erraten.",
+            system_state="UNGEKLÄRT_FAIL_CLOSED",
+            target=(
+                f"Finalizerursache für {target} auslesen; Receipt und Backup "
+                "unverändert lassen"
+            ),
+            solution=(
+                "sudo journalctl -u "
+                + shlex.quote(receipt.finalizer_unit)
+                + " --no-pager -n 200"
+            ),
+        )
+
+    try:
+        _finish_committed_legacy_update_safety_residue(
+            receipt,
+            receipt_dev=int(metadata.st_dev),
+            receipt_ino=int(metadata.st_ino),
+        )
+    except ActionableUpdateAbort:
+        raise
+    except Exception as exc:
+        raise ActionableUpdateAbort(
+            "E3DC-UPD-LEGACY-CLEANUP-001",
+            f"Der alte Zielstand ist committed, aber sein exakter "
+            f"Gate-/Finalizer-Cleanup ist noch nicht beweisbar: {exc}",
+            system_state="NEUSTAND_COMMITTED",
+            target=target,
+            solution=(
+                "sudo systemctl status --no-pager "
+                + shlex.quote(receipt.finalizer_unit)
+            ),
+        ) from exc
+    print(
+        f"[OK] Committed Alt-Receipt von {receipt.target_tag} wurde "
+        "inodegebunden abgeschlossen."
+    )
+    return True
+
+
+def _resume_or_cleanup_recovery_namespace(
+    *,
+    requested_install_root: str,
+) -> bool:
+    """Wird genau einmal am echten Update-Einstieg vor jedem neuen Lauf aktiv."""
+
+    journal_contract = recovery_journal.read_recovery_journal(
+        allow_missing=True
+    )
+    if journal_contract is None:
+        construction_cleaned = _cleanup_prejournal_construction_prefix(
+            requested_install_root=requested_install_root,
+        )
+        if not construction_cleaned:
+            _cleanup_preproduct_orphan_receipt_prefix(
+                requested_install_root=requested_install_root,
+            )
+        # Erst wenn neues Master-Journal und alle neuen Parent-Receipts sicher
+        # fehlen, darf der eng begrenzte 5.4.4/5.4.4a-Legacy-Resolver laufen.
+        # Er vollendet ausschließlich bereits committed Receipts; pending oder
+        # unklare Altzustände bleiben mit konkretem Lösungstext fail-closed.
+        _resolve_legacy_update_safety_residue(
+            requested_install_root=requested_install_root,
+        )
+        _assert_no_existing_recovery_bootblock()
+        return False
+    journal_contract = recovery_journal.verify_recovery_journal(
+        journal_contract
+    )
+    requested = os.path.realpath(os.path.abspath(requested_install_root))
+    if requested != journal_contract.payload.install_root:
+        raise RuntimeError(
+            "[E3DC-UPD-RESIDUE-INSTANCE-001] Die offene Transaktion gehört zu "
+            f"{journal_contract.payload.install_root}, dieser Aufruf zu {requested}. "
+            "Lösung: Führe denselben Updatebefehl für die zuerst genannte "
+            "Instanz zu Ende; bei zwei Instanzen keine Recovery-Datei löschen"
+        )
+    construction = prejournal_codec.read_prejournal_construction(
+        allow_missing=True
+    )
+    if construction is not None:
+        # Construction muss vollständig read-only gegen Journal und Context
+        # gebunden werden, bevor die Runtime-Rekonstruktion Gate-Receipts
+        # interpretieren oder reaktivieren kann.
+        readonly_bundle = _load_persistent_recovery_bundle(journal_contract)
+        if readonly_bundle.context is None:
+            raise RuntimeError(
+                "Master-Journal mit Construction-Receipt besitzt keinen Context"
+            )
+        construction, journal_contract = _verify_prejournal_against_journal(
+            construction,
+            journal_contract,
+            readonly_bundle.context,
+        )
+        prejournal_codec.remove_prejournal_construction(construction)
+        journal_contract = recovery_journal.verify_recovery_journal(
+            journal_contract
+        )
+        print(
+            "[OK] Unterbrochene Journal-Veröffentlichung wurde anhand des "
+            "Construction-Receipts automatisch abgeschlossen."
+        )
+    transaction = _reconstruct_persisted_recovery_transaction(
+        journal_contract
+    )
+    print(
+        "[i] Offene Update-Transaktion erkannt; der aktuelle Updater setzt "
+        f"Phase {journal_contract.payload.phase} automatisch fort."
+    )
+    _dispatch_persisted_recovery_transaction(transaction)
+    if recovery_journal.read_recovery_journal(allow_missing=True) is not None:
+        raise RuntimeError("Master-Journal blieb nach dem automatischen Abschluss erhalten")
+    print("[OK] Vorherige Update-Transaktion wurde sicher abgeschlossen.")
+    return True
+
+
+def _prepare_true_update_entry(requested_install_root: str) -> bool:
+    """Vollendet Alttransaktionen vor Git-, Policy- und Versionsprüfungen."""
+
+    try:
+        # Alte Installationen kennen diesen ausschließlich internen
+        # Sicherheitsnamensraum noch nicht. Sein Fehlen ist kein Nutzerfehler:
+        # Der aktuelle Root-Updater legt ihn nofollow, root:root und 0700 an,
+        # bevor irgendein Receipt gelesen wird. Ein vorhandener unsicherer Pfad
+        # bleibt dagegen fail-closed und wird niemals automatisch umgedeutet.
+        state_descriptor = _open_recovery_bootblock_state_directory()
+        os.close(state_descriptor)
+        _resume_or_cleanup_recovery_namespace(
+            requested_install_root=requested_install_root,
+        )
+    except ActionableUpdateAbort as exc:
+        _print_actionable_update_abort(exc)
+        update_logger.critical(
+            "Strukturierter Updateabbruch %s: %s",
+            exc.code,
+            exc.detail,
+        )
+        return False
+    except Exception as exc:
+        print(f"[ABBRUCH] E3DC-UPD-RESIDUE-001: {exc}")
+        print(
+            "Lösung: Keine Recovery-Datei, kein Overlay und kein Backup "
+            "manuell löschen. Behebe ausschließlich die konkret genannte "
+            "Pfad-, Rechte-, Speicher- oder Dienstursache und starte danach "
+            "denselben Updatebefehl erneut."
+        )
+        update_logger.critical(
+            "Persistente Update-Recovery konnte nicht fortgesetzt werden: %s",
+            exc,
+        )
+        return False
+    return True
+
+
+def _assert_recovery_namespace_read_only_clear() -> None:
+    """Reiner Probe-Guard; führt niemals Cleanup oder Dienstaktionen aus."""
+
+    known_paths = (
+        recovery_journal.RECOVERY_JOURNAL_PATH,
+        prejournal_codec.PREJOURNAL_CONSTRUCTION_PATH,
+        recovery_context_codec.RECOVERY_CONTEXT_PATH,
+        recovery_surface_codec.RECOVERY_SURFACE_RECEIPT_PATH,
+        recovery_surface_codec.SYSTEMD_RECOVERY_RECEIPT_PATH,
+        os.path.join(RECOVERY_BOOTBLOCK_STATE_DIR, PREPARED_PACKAGE_RECEIPT_NAME),
+        os.path.join(RECOVERY_BOOTBLOCK_STATE_DIR, UPDATE_SAFETY_RECEIPT_NAME),
+        os.path.join(RECOVERY_BOOTBLOCK_STATE_DIR, QUIESCED_OVERLAY_RECEIPT_NAME),
+        RECOVERY_BOOTBLOCK_MARKER,
+    )
+    present = tuple(path for path in known_paths if os.path.lexists(path))
+    if present or any(
+        os.path.lexists(_recovery_dropin_path(unit))
+        for unit in _recovery_bootblock_units()
+    ):
+        raise RuntimeError(
+            "Offene Update-Recovery erkannt; der echte Update-Einstieg muss "
+            "sie vor der read-only Versionsprobe fortsetzen"
+        )
 
 
 def _execute_update_transaction(
@@ -14578,6 +22676,22 @@ def _execute_update_transaction(
         print("[!] Bootstrap verlangt --expected-release-sha und --expected-ha-role.")
         return False
 
+    try:
+        _assert_recovery_namespace_read_only_clear()
+    except Exception as exc:
+        print(f"[ABBRUCH] E3DC-UPD-REENTRY-001: {exc}")
+        print(
+            "Lösung: Starte den Updatebefehl erneut über den normalen Web-, "
+            "Bootstrap- oder Konsoleneinstieg. Dort wird die offene "
+            "Transaktion vor jedem Git-/Policy-Preflight automatisch fortgesetzt. "
+            "Keine Recovery-Datei, kein Overlay und kein Backup manuell löschen."
+        )
+        update_logger.critical(
+            "Transaktionskern wurde mit offenem Recovery-Namensraum betreten: %s",
+            exc,
+        )
+        return False
+
     if entry_mode == "regular":
         try:
             current, probe_errors = _probe_regular_download_bootstrap_current(
@@ -14621,7 +22735,6 @@ def _execute_update_transaction(
         headless = True
 
     try:
-        _assert_no_existing_recovery_bootblock()
         repo_dir = (
             _validate_bootstrap_install_path(target_install_path)
             if target_install_path
@@ -14637,6 +22750,7 @@ def _execute_update_transaction(
         bootstrap_git_root_authority = bool(
             target_install_path and bootstrap_without_git
         )
+        bound_install_user = get_install_user()
         state = _capture_transition_state(
             expected_role=expected_ha_role,
             allow_missing_config=bool(target_install_path and bootstrap_without_git),
@@ -14647,7 +22761,10 @@ def _execute_update_transaction(
             sealed_target_updater=sealed_target_updater,
         )
         inventory = _capture_install_inventory(repo_dir)
-        recovery_inventory = _capture_recovery_surface(state)
+        recovery_inventory = _capture_recovery_surface(
+            state,
+            bound_install_user,
+        )
     except Exception as exc:
         print(f"[!] Release-Preflight fehlgeschlagen: {exc}")
         update_logger.error(f"Release-Preflight fehlgeschlagen: {exc}")
@@ -14673,8 +22790,132 @@ def _execute_update_transaction(
             print("[i] Release-Wechsel abgebrochen.")
             return True
 
+    # Alle externen Ziel- und Paketentscheidungen werden bei laufendem Altstand
+    # abgeschlossen. Nach dem späteren Freeze sind nur noch lokale Readbacks,
+    # lokale Paketartefakte und Dateisystemumschaltungen zulässig.
+    offline_preparation_plan = None
+    offline_package_receipt = None
+    try:
+        prepared_install_user = get_install_user()
+        if prepared_install_user != bound_install_user:
+            raise RuntimeError(
+                "Installationsbenutzer driftete seit der Instanzbindung"
+            )
+        prepared_source_repo = (
+            os.path.abspath(os.path.dirname(INSTALLER_DIR))
+            if target_install_path
+            else repo_dir
+        )
+        prepared_root_authority = bool(target_install_path)
+        if target_install_path:
+            prepared_target_commit = _validate_full_commit(str(expected_sha or ""))
+        elif verified_commit:
+            prepared_target_commit = verified_commit
+        else:
+            prepared_target_commit = _fetch_target_commit(
+                repo_dir,
+                prepared_install_user,
+                target_tag,
+            )
+        prepared_policy = _read_policy_from_commit(
+            prepared_source_repo,
+            prepared_target_commit,
+            prepared_install_user,
+            **_root_git_call_kwargs(prepared_root_authority),
+        )
+        prepared_requested_tag = target_tag or verified_tag
+        prepared_bound_target_tag = _validate_target_release(
+            prepared_policy,
+            prepared_source_repo,
+            prepared_target_commit,
+            prepared_requested_tag,
+            prepared_install_user,
+            **_root_git_call_kwargs(prepared_root_authority),
+        )
+        if verified_tag and prepared_bound_target_tag != verified_tag:
+            raise RuntimeError(
+                "Vorbereiteter Ziel-Tag driftete gegenüber dem Ziel-Updater-Handoff"
+            )
+        if target_tag and not _target_tag_authorized(
+            target_tag,
+            policy_repo=repo_dir,
+            target_commit=prepared_target_commit,
+            expected_release_sha=expected_sha,
+            install_user=prepared_install_user,
+            bootstrap_runner_repo=(
+                prepared_source_repo if target_install_path else None
+            ),
+        ):
+            raise RuntimeError(
+                "Release-Tag ist nicht durch exakte Policy-/SHA-Bindung autorisiert"
+            )
+        _validated_restart_services(prepared_policy, state)
+        prepared_watchdog_runtime_required = _watchdog_runtime_venv_required(state)
+        prepared_package_transaction = _capture_package_transaction(
+            prepared_policy,
+            prepared_install_user,
+            allow_missing_venv=True,
+            require_runtime_venv=prepared_watchdog_runtime_required,
+        )
+        prepared_venv_state, _prepared_venv_path = _finalizer_venv_contract(
+            prepared_package_transaction
+        )
+        offline_preparation_plan = create_preparation_plan(
+            recovery_transaction_id,
+            apt_packages=prepared_package_transaction.apt_requested,
+            pip_packages=prepared_package_transaction.pip_requested,
+            expected_venv_state=(
+                prepared_venv_state
+                if prepared_venv_state in {"present", "missing"}
+                else "present"
+            ),
+            download_python=_trusted_system_python(),
+        )
+        offline_package_receipt = execute_preparation(
+            offline_preparation_plan,
+            _run_argv,
+        )
+        if prepared_package_transaction.pip_requested:
+            offline_package_receipt = materialize_wheel_mirror(
+                offline_package_receipt
+            )
+        offline_package_receipt = parse_offline_package_receipt(
+            serialize_offline_package_receipt(offline_package_receipt)
+        )
+        prepared_package_transaction = _bind_package_transaction_to_offline_receipt(
+            prepared_package_transaction,
+            offline_package_receipt,
+        )
+    except Exception as exc:
+        cleanup_error = None
+        try:
+            if offline_package_receipt is not None:
+                cleanup_offline_package_artifacts(offline_package_receipt)
+            elif offline_preparation_plan is not None:
+                cleanup_offline_cache(offline_preparation_plan.cache)
+        except Exception as cleanup_exc:
+            cleanup_error = cleanup_exc
+        if isinstance(exc, OfflinePreflightError):
+            print(str(exc))
+        else:
+            print(f"[ABBRUCH] E3DC-UPD-PREPARE: {exc}")
+            print(
+                "Lösung: Das laufende System wurde nicht gestoppt und keine "
+                "Produktdatei verändert. Prüfe Netzwerk, Paketquellen und freien "
+                "Speicher; behebe die genannte Ursache und starte denselben "
+                "Updatebefehl erneut."
+            )
+        if cleanup_error is not None and offline_preparation_plan is not None:
+            print(
+                "[HINWEIS] Der nicht verwendete Offline-Cache blieb zur sicheren "
+                f"Prüfung erhalten: {offline_preparation_plan.cache.root}"
+            )
+        update_logger.error("Release-Vorbereitung vor Dienststopp fehlgeschlagen: %s", exc)
+        return False
+
     repo_recovery_contract = None
     backup_receipt = None
+    full_backup_manifest = None
     if old_commit is not None:
         try:
             preflight_install_user = get_install_user()
@@ -14686,6 +22927,10 @@ def _execute_update_transaction(
         except Exception as exc:
             print(f"[!] Recovery-Preimage konnte nicht sicher eingefroren werden: {exc}")
             update_logger.error(f"Recovery-Preimage-Preflight fehlgeschlagen: {exc}")
+            _cleanup_terminal_offline_package_receipt(
+                offline_package_receipt,
+                terminal_state="unveränderte Altstand",
+            )
             return False
 
     try:
@@ -14708,38 +22953,129 @@ def _execute_update_transaction(
     except Exception as exc:
         print(f"[!] Root-kontrollierter Backup-Pfad fehlt: {exc}")
         update_logger.error("Backup-Root-Preflight fehlgeschlagen: %s", exc)
+        _cleanup_terminal_offline_package_receipt(
+            offline_package_receipt,
+            terminal_state="unveränderte Altstand",
+        )
+        return False
+
+    target_release_space = None
+    try:
+        if offline_package_receipt is None:
+            raise RuntimeError("Offline-Paketreceipt fehlt vor der Speicherplatzprüfung")
+        target_release_space = _estimate_target_release_space(
+            source_repo=prepared_source_repo,
+            target_commit=prepared_target_commit,
+            install_user=prepared_install_user,
+            root_authority=prepared_root_authority,
+        )
+        full_backup_estimate = estimate_full_backup_size(repo_dir)
+        overlay_estimate = estimate_quiesced_overlay_size(repo_dir)
+        _require_update_transaction_space(
+            repo_dir=repo_dir,
+            backup_collection=backup_collection,
+            offline_receipt=offline_package_receipt,
+            target_space=target_release_space,
+            full_backup_bytes=full_backup_estimate.total_bytes,
+            overlay_bytes=overlay_estimate.total_bytes,
+            bootstrap_without_git=bootstrap_without_git,
+            phase_label="Speicherplatzprüfung vor dem Vollbackup",
+        )
+        print("  [OK] Dateisystemgruppierter Speicherplatz vor dem Backup bestätigt.")
+    except Exception as exc:
+        if isinstance(exc, OfflinePreflightError):
+            print(str(exc))
+        else:
+            print(f"[ABBRUCH] E3DC-UPD-DISK-001")
+            print(
+                "Was ist passiert: Der vollständige Speicherbedarf für Backup, "
+                f"Produktbaum und Webprojektion ist nicht sicher ermittelbar: {exc}"
+            )
+            print(
+                "Lösung: Prüfe Installations-, Backup-, Cache- und Webpfad mit "
+                "findmnt -T und df -h. Korrigiere fehlende Mounts, Symlinks oder "
+                "unsichere Dateitypen und starte denselben Updatebefehl erneut; "
+                "es wurden noch keine Dienste gestoppt."
+            )
+        update_logger.error("Speicherplatzgate vor Vollbackup fehlgeschlagen: %s", exc)
+        _cleanup_terminal_offline_package_receipt(
+            offline_package_receipt,
+            terminal_state="unveränderte Altstand",
+        )
         return False
 
     _enable_watchdog_update_pause(transition_name)
     print("\n[->] Erstelle vollstaendiges externes, verifiziertes Backup...")
 
     def freeze_backup_receipt(backup_path, verified_manifest):
-        nonlocal backup_receipt
-        if repo_recovery_contract is None or backup_receipt is not None:
+        nonlocal backup_receipt, full_backup_manifest
+        if full_backup_manifest is not None or backup_receipt is not None:
             raise RuntimeError("Backup-Receipt-Callback besitzt keinen eindeutigen Zustand")
-        backup_receipt = _capture_recovery_backup_receipt(
-            backup_path,
-            verified_manifest,
-            repo_recovery_contract,
-            recovery_transaction_id,
-        )
+        full_backup_manifest = dict(verified_manifest)
+        if repo_recovery_contract is not None:
+            backup_receipt = _capture_recovery_backup_receipt(
+                backup_path,
+                verified_manifest,
+                repo_recovery_contract,
+                recovery_transaction_id,
+            )
 
     try:
         backup_dir = backup_current_version(
             install_path=repo_dir,
-            verified_pre_chown_callback=(
-                freeze_backup_receipt
-                if repo_recovery_contract is not None
-                else None
-            ),
+            verified_pre_chown_callback=freeze_backup_receipt,
         )
     except Exception as exc:
         backup_dir = None
         update_logger.error(f"Backup vor Release-Wechsel fehlgeschlagen: {exc}")
-    if not backup_dir or (
+    if not backup_dir or full_backup_manifest is None or (
         repo_recovery_contract is not None and backup_receipt is None
     ):
         print("[!] Backup fehlgeschlagen; Release-Wechsel hart abgebrochen.")
+        _cleanup_terminal_offline_package_receipt(
+            offline_package_receipt,
+            terminal_state="unveränderte Altstand",
+        )
+        _set_watchdog_update_pause(False, reason=transition_name)
+        return False
+    full_backup_id = str(full_backup_manifest.get("backup_id") or "")
+    if not re.fullmatch(r"[0-9a-f]{64}", full_backup_id):
+        print("[!] Backup-Manifest besitzt keine gebundene Backup-ID; Update abgebrochen.")
+        _cleanup_terminal_offline_package_receipt(
+            offline_package_receipt,
+            terminal_state="unveränderte Altstand",
+        )
+        _set_watchdog_update_pause(False, reason=transition_name)
+        return False
+
+    persistent_recovery_bundle = None
+    try:
+        persistent_recovery_bundle = _persist_preproduct_recovery_bundle(
+            transaction_id=recovery_transaction_id,
+            repo_dir=repo_dir,
+            install_user=bound_install_user,
+            old_commit=old_commit,
+            bootstrap_rebuild_git=bootstrap_rebuild_git,
+            target_commit=prepared_target_commit,
+            target_tag=prepared_bound_target_tag,
+            state=state,
+            inventory=inventory,
+            recovery_inventory=recovery_inventory,
+            backup_dir=backup_dir,
+            full_backup_manifest=full_backup_manifest,
+            repo_recovery_contract=repo_recovery_contract,
+            backup_receipt=backup_receipt,
+        )
+        print("  [OK] Rebootfester Recovery-Kontext und Master-Journal bestätigt.")
+    except BaseException as exc:
+        print(f"[ABBRUCH] E3DC-UPD-JOURNAL-001: {exc}")
+        print(
+            "Lösung: Das alte System läuft weiter. Keine Recovery-Datei unter "
+            f"{RECOVERY_BOOTBLOCK_STATE_DIR} manuell löschen; starte denselben "
+            "Updatebefehl erneut. Der aktuelle Updater wertet den vorhandenen "
+            "Transaktionsstand automatisch aus."
+        )
+        update_logger.error("Recovery-Journal konnte nicht sicher gebunden werden: %s", exc)
         _set_watchdog_update_pause(False, reason=transition_name)
         return False
 
@@ -14748,78 +23084,19 @@ def _execute_update_transaction(
     sealed_storage_expected_dropins = None
     storage_unit_promoted = False
     storage_promotion_state_uncertain = False
-    if repo_recovery_contract is not None and not sealed_target_updater:
-        try:
-            install_user = get_install_user()
-            if repo_recovery_contract.install_user != install_user:
-                raise RuntimeError(
-                    "Installationsbenutzer driftete seit dem Recovery-Preflight"
-                )
-            try:
-                storage_unit_promoted = bool(
-                    _migrate_approved_storage_manager_unit_owner(
-                        _approved_storage_manager_unit_payloads(),
-                        install_user=install_user,
-                    )
-                )
-            except StorageUnitMigrationError as promotion_exc:
-                if not promotion_exc.root_unit_committed:
-                    storage_promotion_state_uncertain = True
-                    raise
-                # Der atomare Namensersatz ist bereits exakt root-gebunden;
-                # nur sein nachgelagerter Helper-Postcheck scheiterte. Der
-                # folgende daemon-reload plus Bundle-Readback entscheidet
-                # deshalb weiterhin fail-closed über den effektiven Vertrag.
-                storage_unit_promoted = True
-            if storage_unit_promoted:
-                reload_result = _run_argv(
-                    ["systemctl", "daemon-reload"],
-                    timeout=30,
-                    env={**os.environ, "LC_ALL": "C", "LANG": "C"},
-                )
-                if (
-                    not reload_result.get("success")
-                    or reload_result.get("timed_out")
-                    or str(reload_result.get("stderr") or "")
-                    or int(reload_result.get("returncode", -1)) != 0
-                ):
-                    raise RuntimeError(
-                        "systemd daemon-reload nach Storage-Unitmigration "
-                        "fehlgeschlagen: "
-                        + _combined_process_diagnostics(
-                            reload_result,
-                            maximum=800,
-                        )
-                    )
-                capture_systemd_service_bundle(("e3dc-storage-manager",))
-        except Exception as exc:
-            print(f"[!] Frühe Storage-Unitmigration fehlgeschlagen: {exc}")
-            update_logger.error("Frühe Storage-Unitmigration fehlgeschlagen: %s", exc)
-            if storage_unit_promoted:
-                # Der benannte Inode ist bereits root-kontrolliert. Ein
-                # synchron erkannter Folgefehler darf daher den normalen
-                # rebootfesten Fail-closed-Pfad sicher daemon-reloaden.
-                _enforce_fail_closed_after_recovery_failure(
-                    recovery_transaction_id=recovery_transaction_id,
-                )
-            elif storage_promotion_state_uncertain:
-                # Kein daemon-reload auf einem nicht mehr eindeutig
-                # gebundenen Namen. Stop-Aufrufe verwenden nur den letzten
-                # systemd-Cache; die Update-Pause bleibt zur manuellen
-                # Recovery bestehen.
-                _stop_v4_services(V4_SERVICES)
-                update_logger.critical(
-                    "Storage-Unitzustand ist nach atomarem Ersatz unklar; "
-                    "kein daemon-reload und kein Dienststart"
-                )
-            else:
-                # Pre-Rename-Fehler: kein Produktinode wurde verändert und
-                # kein Dienst gestoppt. Der bestehende systemd-Cache bleibt
-                # unangetastet.
-                _set_watchdog_update_pause(False, reason=transition_name)
-            return False
-
+    bootblock_contract = None
     update_safety_contract = None
+    quiesced_overlay_dir = None
+    quiesced_overlay_receipt = None
+    planned_overlay_dir = _quiesced_overlay_path(
+        backup_dir,
+        recovery_transaction_id,
+    )
+
+    # Nach dem verifizierten Vollbackup wird zuerst die rebootfeste
+    # Startsperre gebunden. Erst danach darf ein lokales Paketkommando einen
+    # globalen Systemzustand verändern; die Alt-Dienste laufen bis zum späteren
+    # kurzen Cutover weiter.
     if sealed_target_updater:
         try:
             if (
@@ -14837,17 +23114,280 @@ def _execute_update_transaction(
                 target_tag=verified_tag,
                 role=state.ha_role,
                 backup_receipt=backup_receipt,
+                apache_preimage=recovery_inventory.apache_security,
+                recovery_journal_contract=persistent_recovery_bundle.journal,
             )
             update_safety_contract = _arm_update_safety_contract(
                 update_safety_contract
             )
-            if not _stop_v4_services(V4_SERVICES):
-                raise RuntimeError("Sichere Aktorruhe konnte unter Bootblock nicht nachgewiesen werden")
-            install_user = get_install_user()
-            if repo_recovery_contract.install_user != install_user:
-                raise RuntimeError(
-                    "Installationsbenutzer driftete seit dem Recovery-Preflight"
+        except BaseException as exc:
+            print(f"[ABBRUCH] E3DC-UPD-BOOTBLOCK-001: {exc}")
+            print(
+                "Lösung: Keine Produktdatei wurde ersetzt. Dienste nicht "
+                "manuell starten oder Sicherungen löschen; prüfe das "
+                "Updatejournal und starte danach denselben Updatebefehl erneut."
+            )
+            if update_safety_contract is not None:
+                _enforce_update_safety_fail_closed(
+                    update_safety_contract,
+                    repo_dir=repo_dir,
                 )
+            _set_watchdog_update_pause(False, reason=transition_name)
+            return False
+    else:
+        try:
+            bootblock_contract = _arm_persistent_recovery_bootblock(
+                transaction_id=recovery_transaction_id,
+                recovery_journal_contract=persistent_recovery_bundle.journal,
+            )
+        except RecoveryBootblockArmError as exc:
+            bootblock_contract = exc.contract
+            print(
+                "[ABBRUCH] E3DC-UPD-BOOTBLOCK-001: Der rebootfeste "
+                "Startsperrvertrag blieb unvollständig."
+            )
+            print(
+                "Lösung: Dienste nicht manuell starten; prüfe "
+                "sudo systemctl status --no-pager e3dc-storage-manager.service "
+                "und das Updatejournal."
+            )
+            _enforce_fail_closed_after_recovery_failure(
+                bootblock_contract,
+                recovery_transaction_id=recovery_transaction_id,
+                recovery_journal_contract=persistent_recovery_bundle.journal,
+            )
+            return False
+        except Exception as exc:
+            print(f"[ABBRUCH] E3DC-UPD-BOOTBLOCK-001: {exc}")
+            print(
+                "Lösung: Dienste nicht manuell starten; prüfe das Updatejournal "
+                "und sudo systemctl status --no-pager e3dc-storage-manager.service."
+            )
+            _enforce_fail_closed_after_recovery_failure(
+                recovery_transaction_id=recovery_transaction_id,
+                recovery_journal_contract=persistent_recovery_bundle.journal,
+            )
+            return False
+
+    package_transaction = prepared_package_transaction
+    prepared_package_state = None
+    prepared_package_receipt = None
+    packages_mutated = False
+    try:
+        if offline_package_receipt is None:
+            raise RuntimeError("Versiegeltes Offline-Paketreceipt fehlt nach dem Vollbackup")
+        prepared_package_receipt = _write_applying_prepared_package_receipt(
+            transaction_id=recovery_transaction_id,
+            install_root=repo_dir,
+            full_backup_id=full_backup_id,
+            package_transaction=package_transaction,
+            target_commit=prepared_target_commit,
+            target_tag=prepared_bound_target_tag,
+            role=state.ha_role,
+            apache_preimage=recovery_inventory.apache_security,
+            static_recovery_contract_json=(
+                _serialize_recovery_bootblock_contract(bootblock_contract)
+                if isinstance(bootblock_contract, RecoveryBootblockContract)
+                else ""
+            ),
+        )
+        if persistent_recovery_bundle is None:
+            raise RuntimeError("Master-Journal ging vor der Paketbindung verloren")
+        persistent_recovery_bundle = _bind_persistent_recovery_package_safety(
+            persistent_recovery_bundle,
+            package_receipt=prepared_package_receipt,
+            update_safety_contract=update_safety_contract,
+            static_bootblock_contract=(
+                bootblock_contract
+                if isinstance(bootblock_contract, RecoveryBootblockContract)
+                else None
+            ),
+        )
+        # Auch ein fehlgeschlagenes APT-Kommando kann bereits Maintainer-
+        # Skripte ausgeführt haben. Der Rücklaufvertrag ist deshalb vor dem
+        # ersten lokalen Paketkommando rebootfest und inodegebunden aktiv.
+        packages_mutated = True
+        (
+            package_transaction,
+            prepared_package_state,
+        ) = _apply_prepared_offline_package_policy(
+            package_transaction,
+            offline_package_receipt,
+        )
+        prepared_package_receipt = _replace_prepared_package_receipt(
+            prepared_package_receipt,
+            prepared_package_state,
+        )
+        print("  [OK] Pakete vollständig offline vorbereitet und verifiziert.")
+    except Exception as exc:
+        print(f"[ABBRUCH] E3DC-UPD-OFFLINE-APPLY: {exc}")
+        try:
+            (
+                prepared_package_receipt,
+                recovery_package_transaction,
+            ) = _bind_package_apply_failure_recovery(
+                error=exc,
+                receipt=prepared_package_receipt,
+                packages_mutated=packages_mutated,
+                expected_transaction_id=recovery_transaction_id,
+                expected_install_root=repo_dir,
+                expected_full_backup_id=full_backup_id,
+                expected_package_transaction=package_transaction,
+            )
+            recovered = _abort_before_product_mutation(
+                repo_dir=repo_dir,
+                state=state,
+                apache_preimage=recovery_inventory.apache_security,
+                transaction_id=recovery_transaction_id,
+                bootblock_contract=bootblock_contract,
+                update_safety_contract=update_safety_contract,
+                overlay_receipt=None,
+                package_transaction=recovery_package_transaction,
+                packages_mutated=packages_mutated,
+                recovery_inventory=recovery_inventory,
+                recovery_journal_contract=persistent_recovery_bundle.journal,
+            )
+        except Exception as recovery_binding_exc:
+            recovered = False
+            update_logger.critical(
+                "Paket-Receipt konnte für den Rücklauf nicht gebunden werden: %s",
+                recovery_binding_exc,
+            )
+        if recovered:
+            try:
+                persistent_recovery_bundle = _finish_rolled_back_update_cleanup(
+                    bundle=persistent_recovery_bundle,
+                    offline_receipt=offline_package_receipt,
+                    overlay_receipt=None,
+                    package_receipt=prepared_package_receipt,
+                    update_safety_contract=update_safety_contract,
+                )
+            except Exception as cleanup_exc:
+                recovered = False
+                update_logger.critical(
+                    "Terminaler Paket-Rücklauf-Cleanup blieb unvollständig: %s",
+                    cleanup_exc,
+                )
+        if recovered:
+            print(
+                "Lösung: Der Paket-Ausgangszustand wurde automatisch "
+                "wiederhergestellt. Prüfe Paketquellen und freien Speicher und "
+                "starte denselben Updatebefehl erneut."
+            )
+            _set_watchdog_update_pause(False, reason=transition_name)
+        else:
+            print(
+                "Lösung: Dienste nicht manuell neu starten. Der sichere "
+                f"Offline-Cache bleibt unter {offline_package_receipt.cache.root}. "
+                "Prüfe das vollständige Updatejournal und den Paketstatus mit "
+                "sudo dpkg --audit."
+            )
+            update_logger.critical(
+                "Gate-gebundener Offline-Paketrücklauf blieb unvollständig"
+            )
+        return False
+
+    try:
+        if target_release_space is None or offline_package_receipt is None:
+            raise RuntimeError("Gebundener Speicherplatzvertrag fehlt vor der Diensteruhe")
+        remaining_overlay_estimate = estimate_quiesced_overlay_size(repo_dir)
+        _require_update_transaction_space(
+            repo_dir=repo_dir,
+            backup_collection=backup_collection,
+            offline_receipt=offline_package_receipt,
+            target_space=target_release_space,
+            full_backup_bytes=0,
+            overlay_bytes=remaining_overlay_estimate.total_bytes,
+            bootstrap_without_git=bootstrap_without_git,
+            phase_label="Restbedarf unmittelbar vor der Diensteruhe",
+        )
+        print("  [OK] Restbedarf unmittelbar vor dem Dienststopp bestätigt.")
+    except Exception as exc:
+        if isinstance(exc, OfflinePreflightError):
+            print(str(exc))
+        else:
+            print("[ABBRUCH] E3DC-UPD-DISK-001")
+            print(
+                "Was ist passiert: Der verbleibende Speicherbedarf vor der "
+                f"Diensteruhe ist nicht sicher ermittelbar: {exc}"
+            )
+            print(
+                "Lösung: Prüfe die genannten Pfade mit findmnt -T und df -h. "
+                "Korrigiere Speicherplatz, Mount oder Dateityp und starte danach "
+                "denselben Updatebefehl erneut."
+            )
+        update_logger.error("Speicherplatz-Restbedarfsgate fehlgeschlagen: %s", exc)
+        try:
+            recovery_package_transaction = _package_transaction_from_receipt(
+                prepared_package_receipt
+            )
+            recovered = _abort_before_product_mutation(
+                repo_dir=repo_dir,
+                state=state,
+                apache_preimage=recovery_inventory.apache_security,
+                transaction_id=recovery_transaction_id,
+                bootblock_contract=bootblock_contract,
+                update_safety_contract=update_safety_contract,
+                overlay_receipt=None,
+                package_transaction=recovery_package_transaction,
+                packages_mutated=packages_mutated,
+                recovery_inventory=recovery_inventory,
+                recovery_journal_contract=persistent_recovery_bundle.journal,
+            )
+        except Exception as recovery_binding_exc:
+            recovered = False
+            update_logger.critical(
+                "Paket-Receipt konnte am Speicherplatz-Rücklauf nicht gebunden werden: %s",
+                recovery_binding_exc,
+            )
+        if recovered:
+            try:
+                persistent_recovery_bundle = _finish_rolled_back_update_cleanup(
+                    bundle=persistent_recovery_bundle,
+                    offline_receipt=offline_package_receipt,
+                    overlay_receipt=None,
+                    package_receipt=prepared_package_receipt,
+                    update_safety_contract=update_safety_contract,
+                )
+            except Exception as cleanup_exc:
+                recovered = False
+                update_logger.critical(
+                    "Terminaler Speicherplatz-Rücklauf-Cleanup blieb "
+                    "unvollständig: %s",
+                    cleanup_exc,
+                )
+        if recovered:
+            print(
+                "Lösung: Der Paket-Ausgangszustand und die Startsperre wurden "
+                "automatisch wiederhergestellt. Gib den ausgewiesenen Speicher "
+                "frei und starte denselben Updatebefehl erneut; der reguläre "
+                "Cutover wurde nicht begonnen."
+            )
+            _set_watchdog_update_pause(False, reason=transition_name)
+        else:
+            print(
+                "Lösung: Dienste nicht manuell starten. Prüfe das vollständige "
+                "Updatejournal und den Paketstatus mit sudo dpkg --audit."
+            )
+        return False
+
+    try:
+        install_user = get_install_user()
+        if install_user != bound_install_user:
+            raise RuntimeError(
+                "Installationsbenutzer driftete seit der Instanzbindung"
+            )
+        if (
+            repo_recovery_contract is not None
+            and repo_recovery_contract.install_user != install_user
+        ):
+            raise RuntimeError(
+                "Installationsbenutzer driftete seit dem Recovery-Preflight"
+            )
+
+        if sealed_target_updater:
+            if update_safety_contract is None:
+                raise RuntimeError("Versiegelter Ziel-Updater verlor seinen Bootblockvertrag")
             sealed_storage_payloads = _approved_storage_manager_unit_payloads()
             sealed_storage_expected_dropins = _update_safety_expected_dropins(
                 update_safety_contract,
@@ -14882,54 +23422,115 @@ def _execute_update_transaction(
                 install_user,
                 repo_recovery_contract,
             )
-            _verify_transition_state(state)
-            _assert_strict_update_writer_quiescence(
-                repo_dir=repo_dir,
+        else:
+            bootblock_contract = _arm_persistent_recovery_bootblock(
+                bootblock_contract,
                 transaction_id=recovery_transaction_id,
             )
-        except BaseException as exc:
-            print(f"[!] Vor-Mutations-Sicherheitsgate fehlgeschlagen: {exc}")
-            update_logger.critical(
-                "Versiegeltes Vor-Mutations-Sicherheitsgate blieb fail-closed: %s",
-                exc,
-            )
-            return False
+        _verify_transition_state(state)
 
-    # Dieser exakte Aufruf bleibt für nicht versiegelte Altpfade als
-    # statisch prüfbarer Aktorruhevertrag erhalten.
-    if not sealed_target_updater:
-        quiescence_error = None
         if not _stop_v4_services(V4_SERVICES):
-            quiescence_error = RuntimeError(
-                "Sichere Aktorruhe konnte nicht nachgewiesen werden"
+            raise RuntimeError("Sichere Aktorruhe konnte unter Bootblock nicht nachgewiesen werden")
+        _assert_strict_update_writer_quiescence(
+            repo_dir=repo_dir,
+            transaction_id=recovery_transaction_id,
+        )
+        if sealed_target_updater:
+            _validate_update_safety_contract(
+                update_safety_contract,
+                expected_state="pending",
             )
-        else:
+            _verify_update_safety_marker(
+                update_safety_contract,
+                expected_present=True,
+            )
+            _reload_and_verify_update_safety_dropins(
+                update_safety_contract,
+                expected_present=True,
+            )
+    except BaseException as exc:
+        print(f"[ABBRUCH] E3DC-UPD-QUIESCE-001: {exc}")
+        print(
+            "Lösung: Prüfe die im Updatejournal genannte aktive Unit oder "
+            "den fremden Writer. Nach automatisch bestätigtem Rücklauf kann "
+            "derselbe Updatebefehl erneut gestartet werden."
+        )
+        try:
+            recovery_package_transaction = _package_transaction_from_receipt(
+                prepared_package_receipt
+            )
+            recovered = _abort_before_product_mutation(
+                repo_dir=repo_dir,
+                state=state,
+                apache_preimage=recovery_inventory.apache_security,
+                transaction_id=recovery_transaction_id,
+                bootblock_contract=bootblock_contract,
+                update_safety_contract=update_safety_contract,
+                overlay_receipt=None,
+                package_transaction=recovery_package_transaction,
+                packages_mutated=packages_mutated,
+                recovery_inventory=recovery_inventory,
+                recovery_journal_contract=persistent_recovery_bundle.journal,
+            )
+        except Exception as recovery_binding_exc:
+            recovered = False
+            update_logger.critical(
+                "Paket-Receipt konnte am Quiesce-Rücklauf nicht gebunden werden: %s",
+                recovery_binding_exc,
+            )
+        if recovered:
             try:
-                _assert_strict_update_writer_quiescence(
-                    repo_dir=repo_dir,
-                    transaction_id=recovery_transaction_id,
+                persistent_recovery_bundle = _finish_rolled_back_update_cleanup(
+                    bundle=persistent_recovery_bundle,
+                    offline_receipt=offline_package_receipt,
+                    overlay_receipt=None,
+                    package_receipt=prepared_package_receipt,
+                    update_safety_contract=update_safety_contract,
                 )
-            except Exception as exc:
-                quiescence_error = exc
-        if quiescence_error is not None:
-            print(f"[!] Sichere Aktorruhe konnte nicht nachgewiesen werden: {quiescence_error}")
-            # Ein fehlgeschlagenes Rogue-/Writer-Gate darf niemals durch das
-            # Starten des alten Unitbestands kompensiert werden. Erst eine
-            # bewiesene globale Ruhe könnte einen kontrollierten Altstart
-            # autorisieren; in diesem Fehlerzweig ist sie gerade nicht belegt.
-            _enforce_fail_closed_after_recovery_failure(
-                recovery_transaction_id=recovery_transaction_id,
-            )
-            return False
+            except Exception as cleanup_exc:
+                recovered = False
+                update_logger.critical(
+                    "Terminaler Quiesce-Rücklauf-Cleanup blieb unvollständig: %s",
+                    cleanup_exc,
+                )
+        if recovered:
+            _set_watchdog_update_pause(False, reason=transition_name)
+        return False
 
     git_created = False
-    mutated = storage_unit_promoted
-    bootblock_contract = None
+    # Erst der vollständig versiegelte Overlay-Receipt autorisiert die erste
+    # Produktmutation. Stop und Apache-Cutover allein verändern keine Nutzdaten.
+    mutated = False
     role_anchor_created = False
     target_commit = None
-    package_transaction = None
-    packages_mutated = False
     try:
+        _quiesce_apache_for_cutover(recovery_inventory.apache_security)
+        (
+            quiesced_overlay_dir,
+            _overlay_manifest,
+            overlay_restore_guard,
+        ) = create_quiesced_overlay(
+            planned_overlay_dir,
+            install_path=repo_dir,
+            transaction_id=recovery_transaction_id,
+            parent_backup_dir=backup_dir,
+            parent_backup_id=str(full_backup_manifest.get("backup_id") or ""),
+        )
+        quiesced_overlay_receipt = _capture_quiesced_overlay_receipt(
+            overlay_dir=quiesced_overlay_dir,
+            backup_dir=backup_dir,
+            install_root=repo_dir,
+            transaction_id=recovery_transaction_id,
+            restore_guard=overlay_restore_guard,
+        )
+        if persistent_recovery_bundle is None:
+            raise RuntimeError("Master-Journal ging vor der Produktmutation verloren")
+        persistent_recovery_bundle = (
+            _advance_persistent_recovery_product_mutating(
+                persistent_recovery_bundle,
+                quiesced_overlay_receipt,
+            )
+        )
         if not sealed_target_updater:
             install_user = install_user or get_install_user()
         if (
@@ -14942,42 +23543,56 @@ def _execute_update_transaction(
         if sealed_target_updater:
             if update_safety_contract is None:
                 raise RuntimeError("Versiegelter Ziel-Updater verlor seinen Bootblockvertrag")
+            storage_payloads = sealed_storage_payloads
+            storage_expected_dropins = sealed_storage_expected_dropins
+        else:
+            if not isinstance(bootblock_contract, RecoveryBootblockContract):
+                raise RuntimeError("Bootstrap verlor seinen persistenten Bootblockvertrag")
+            storage_payloads = _approved_storage_manager_unit_payloads()
+            storage_expected_dropins = _persistent_recovery_expected_dropins(
+                bootblock_contract,
+                selected_units=("e3dc-storage-manager.service",),
+            )
+        try:
+            # Ab hier beginnt die erste Produkt-/Systemmutation. Das reine
+            # Stoppen sowie das versiegelte Overlay bleiben bis zu diesem
+            # Punkt über den schlanken Vor-Mutations-Rückweg reversibel.
             mutated = True
-            try:
-                storage_unit_promoted = bool(
-                    _migrate_approved_storage_manager_unit_owner(
-                        sealed_storage_payloads,
-                        install_user=install_user,
-                        expected_recovery_dropins=sealed_storage_expected_dropins[
-                            "e3dc-storage-manager.service"
-                        ],
-                    )
+            storage_unit_promoted = bool(
+                _migrate_approved_storage_manager_unit_owner(
+                    storage_payloads,
+                    install_user=install_user,
+                    expected_recovery_dropins=storage_expected_dropins[
+                        "e3dc-storage-manager.service"
+                    ],
                 )
-            except StorageUnitMigrationError as promotion_exc:
-                if not promotion_exc.root_unit_committed:
-                    storage_promotion_state_uncertain = True
-                    raise
-                storage_unit_promoted = True
-            if storage_unit_promoted:
-                reload_result = _run_argv(
-                    ["systemctl", "daemon-reload"],
-                    timeout=30,
-                    env={**os.environ, "LC_ALL": "C", "LANG": "C"},
+            )
+        except StorageUnitMigrationError as promotion_exc:
+            if not promotion_exc.root_unit_committed:
+                storage_promotion_state_uncertain = True
+                raise
+            storage_unit_promoted = True
+        if storage_unit_promoted:
+            reload_result = _run_argv(
+                ["systemctl", "daemon-reload"],
+                timeout=30,
+                env={**os.environ, "LC_ALL": "C", "LANG": "C"},
+            )
+            if (
+                not reload_result.get("success")
+                or reload_result.get("timed_out")
+                or str(reload_result.get("stderr") or "")
+                or int(reload_result.get("returncode", -1)) != 0
+            ):
+                raise RuntimeError(
+                    "systemd daemon-reload nach quieszierter Storage-Unitmigration fehlgeschlagen: "
+                    + _combined_process_diagnostics(reload_result, maximum=800)
                 )
-                if (
-                    not reload_result.get("success")
-                    or reload_result.get("timed_out")
-                    or str(reload_result.get("stderr") or "")
-                    or int(reload_result.get("returncode", -1)) != 0
-                ):
-                    raise RuntimeError(
-                        "systemd daemon-reload nach versiegelter Storage-Unitmigration fehlgeschlagen: "
-                        + _combined_process_diagnostics(reload_result, maximum=800)
-                    )
-                capture_systemd_service_bundle(
-                    ("e3dc-storage-manager",),
-                    expected_recovery_dropins=sealed_storage_expected_dropins,
-                )
+            capture_systemd_service_bundle(
+                ("e3dc-storage-manager",),
+                expected_recovery_dropins=storage_expected_dropins,
+            )
+        if sealed_target_updater:
             _validate_update_safety_contract(
                 update_safety_contract,
                 expected_state="pending",
@@ -15052,79 +23667,61 @@ def _execute_update_transaction(
             **_root_git_call_kwargs(bootstrap_git_root_authority),
         )
 
-        if verified_commit:
-            target_commit = verified_commit
-            # Der äußere Handoff hat Commit und Stable-Tag bereits gemeinsam
-            # gebunden. Auch eine ausdrücklich gewünschte Neuinstallation
-            # eines älteren, weiterhin veröffentlichten Stands muss deshalb
-            # gegen genau diesen Tag geprüft werden – niemals erneut gegen ein
-            # inzwischen weitergelaufenes origin/main.
-            bound_ref = f"refs/tags/{verified_tag}"
-            resolved = _resolve_git_commit(
+        # Beim Download-Bootstrap stammen Tagobjekt und Commit aus dem bereits
+        # vor dem Stop vollständig verifizierten Runner-Checkout. Der Fetch ist
+        # absichtlich lokal; GitHub wird im Cutover nicht mehr kontaktiert.
+        if target_install_path:
+            local_fetch = _git_argv(
                 repo_dir,
-                bound_ref,
                 install_user,
+                "fetch",
+                "--no-tags",
+                prepared_source_repo,
+                f"+refs/tags/{prepared_bound_target_tag}:refs/tags/{prepared_bound_target_tag}",
+                timeout=120,
                 **_root_git_call_kwargs(bootstrap_git_root_authority),
             )
-            if not resolved or not _exact_commit_matches(resolved, target_commit):
+            if not local_fetch.get("success"):
                 raise RuntimeError(
-                    "Vorverifizierter Ziel-Commit ist nicht mehr an den erwarteten Git-Ref gebunden"
+                    "Lokal vorbereitetes Release-Tag konnte nicht in die "
+                    "Installation übernommen werden: "
+                    + str(local_fetch.get("stderr") or "").strip()
                 )
-        else:
-            target_commit = _fetch_target_commit(
-                repo_dir,
-                install_user,
-                target_tag,
-                **_root_git_call_kwargs(bootstrap_git_root_authority),
-            )
+
+        target_commit = prepared_target_commit
         if expected_sha and not _exact_commit_matches(expected_sha, target_commit):
             raise RuntimeError(
                 f"Ziel-SHA weicht von der expliziten Freigabe ab: {target_commit} != {expected_sha}"
             )
-
-        runner_repo = os.path.dirname(INSTALLER_DIR)
-        if target_tag and not _target_tag_authorized(
-            target_tag,
-            policy_repo=repo_dir,
-            target_commit=target_commit,
-            expected_release_sha=expected_sha,
-            install_user=install_user,
-            bootstrap_runner_repo=runner_repo if target_install_path else None,
-        ):
-            raise RuntimeError("Release-Tag ist nicht durch exakte Policy-/SHA-Bindung autorisiert")
-
         policy = _read_policy_from_commit(
             repo_dir,
             target_commit,
             install_user,
             **_root_git_call_kwargs(bootstrap_git_root_authority),
         )
-        bound_target_tag = _validate_target_release(
+        if policy != prepared_policy:
+            raise RuntimeError("Lokal gelesene Ziel-Policy driftete seit der Vorbereitung")
+        bound_target_tag = _validate_local_target_release_binding(
             policy,
             repo_dir,
             target_commit,
-            target_tag,
+            prepared_bound_target_tag,
             install_user,
             **_root_git_call_kwargs(bootstrap_git_root_authority),
         )
-        if verified_tag and bound_target_tag != verified_tag:
-            raise RuntimeError(
-                "Ziel-Policy driftete gegenüber dem gebundenen Ziel-Updater-Tag"
-            )
         _validated_restart_services(policy, state)
-        watchdog_runtime_required = _watchdog_runtime_venv_required(state)
-        package_transaction = _capture_package_transaction(
+        watchdog_runtime_required = prepared_watchdog_runtime_required
+        prepared_package_receipt = _validate_prepared_package_receipt(
+            prepared_package_receipt,
+            expected_state="prepared",
+        )
+        if prepared_package_receipt.prepared_state is None:
+            raise RuntimeError("Vorbereitetes Paket-Receipt besitzt keinen Postzustand")
+        _verify_prepared_package_policy_applied(
             policy,
             install_user,
-            # Auch ein normaler Self-Update darf einen wirklich fehlenden,
-            # policygebundenen Benutzer-venv erstmals erzeugen. Capture
-            # erlaubt dies nur bei freigegebenem python3-venv und exakt
-            # absentem kanonischem Zielpfad; jeder belegte Fremdpfad stoppt.
-            allow_missing_venv=True,
-            # Der Watchdog benötigt seinen Interpreter auch dann, wenn der
-            # Release selbst keine Python-Pakete ändert. Diese Laufzeitbindung
-            # darf deshalb nicht aus der pip-Policy abgeleitet werden.
-            require_runtime_venv=watchdog_runtime_required,
+            expected_transaction_id=recovery_transaction_id,
+            prepared=prepared_package_receipt.prepared_state,
         )
 
         _assert_target_worktree_replaceable(
@@ -15135,11 +23732,7 @@ def _execute_update_transaction(
         )
 
         mutated = True
-        reset = _git_argv(
-            repo_dir, install_user, "reset", "--hard", target_commit,
-            timeout=120,
-            **_root_git_call_kwargs(bootstrap_git_root_authority),
-        )
+        reset = _git_argv(repo_dir, install_user, "reset", "--hard", target_commit, timeout=120, **_root_git_call_kwargs(bootstrap_git_root_authority))
         if not reset["success"]:
             raise RuntimeError("git reset --hard fehlgeschlagen: " + reset["stderr"].strip())
         new_commit = _resolve_git_commit(
@@ -15160,23 +23753,93 @@ def _execute_update_transaction(
         )
 
         mutated = True
-        packages_mutated = True
         _invoke_target_finalizer(
             repo_dir=repo_dir,
             target_commit=target_commit,
             target_tag=bound_target_tag,
             state=state,
-            package_transaction=package_transaction,
+            package_receipt=prepared_package_receipt,
+            recovery_journal_contract=persistent_recovery_bundle.journal,
+            apache_preimage=recovery_inventory.apache_security,
+            static_bootblock_contract=(
+                bootblock_contract if not sealed_target_updater else None
+            ),
             update_safety_contract=update_safety_contract,
             explicit_download_bootstrap=bool(target_install_path),
+        )
+        persistent_recovery_bundle = _refresh_terminal_recovery_bundle(
+            persistent_recovery_bundle,
+            phase=recovery_journal.PHASE_COMMITTED,
         )
     except BaseException as exc:
         print(f"[!] {transition_name} fehlgeschlagen: {exc}")
         update_logger.error(f"{transition_name} fehlgeschlagen: {exc}")
-        if isinstance(exc, UpdateSafetyPostCommitError):
+        try:
+            current_recovery_journal = recovery_journal.read_recovery_journal()
+        except Exception as journal_error:
+            update_logger.critical(
+                "Master-Journal ist am Transaktionsfehler unlesbar: %s",
+                journal_error,
+            )
+            print(
+                "[ABBRUCH] E3DC-UPD-JOURNAL-READ-001: Der Transaktionsstand "
+                "ist nicht sicher lesbar; jede Recoverymutation bleibt gesperrt."
+            )
+            print(
+                "Lösung: Dienste und Recovery-Dateien nicht manuell verändern. "
+                "Prüfe sudo stat /var/lib/e3dc-update-safety/recovery-journal.json "
+                "und starte denselben Updatebefehl erneut."
+            )
+            return False
+        if (
+            current_recovery_journal is None
+            or not _same_recovery_journal_transaction_shape(
+                current_recovery_journal,
+                persistent_recovery_bundle.journal,
+            )
+        ):
+            update_logger.critical(
+                "Master-Journal gehört am Transaktionsfehler nicht mehr zur "
+                "gebundenen Transaktion"
+            )
+            return False
+
+        journal_phase = current_recovery_journal.payload.phase
+        persistent_recovery_bundle = replace(
+            persistent_recovery_bundle,
+            journal=current_recovery_journal,
+        )
+        if journal_phase == recovery_journal.PHASE_COMMITTED:
             update_logger.critical(
                 "Zielstand ist committed; Altstand-Rollback bleibt ausdrücklich gesperrt"
             )
+            print(
+                "[ABBRUCH] E3DC-UPD-APACHE-POSTCOMMIT-001: Der neue Stand ist "
+                "dauerhaft übernommen, aber der Web-/Cleanup-Abschluss blieb "
+                "unvollständig."
+            )
+            print(
+                "Lösung: Keine Receipt-, Overlay- oder Backup-Datei manuell "
+                "löschen. Starte denselben Updatebefehl erneut; der aktuelle "
+                "Updater wiederholt den gebundenen Apache-/Cleanup-Abschluss."
+            )
+            return False
+        if journal_phase == recovery_journal.PHASE_ROLLED_BACK:
+            try:
+                _cleanup_terminal_update_artifacts(
+                    bundle=persistent_recovery_bundle,
+                    offline_receipt=offline_package_receipt,
+                    overlay_receipt=quiesced_overlay_receipt,
+                    package_receipt=prepared_package_receipt,
+                    update_safety_contract=update_safety_contract,
+                    terminal_label="wiederhergestellte Altstand",
+                )
+                _set_watchdog_update_pause(False, reason=transition_name)
+            except Exception as cleanup_error:
+                update_logger.critical(
+                    "Terminaler rolled_back-Cleanup blieb unvollständig: %s",
+                    cleanup_error,
+                )
             return False
         if isinstance(exc, UpdateSafetyManagedServiceUnquiescedError):
             update_logger.critical(
@@ -15185,28 +23848,81 @@ def _execute_update_transaction(
             )
             return False
         recovered = False
-        if mutated:
-            recovered, bootblock_contract = _recover_failed_transition(
-                repo_dir=repo_dir,
-                install_user=install_user,
-                backup_dir=backup_dir,
-                old_commit=old_commit,
-                git_created=git_created,
-                inventory=inventory,
-                recovery_inventory=recovery_inventory,
-                state=state,
-                package_transaction=package_transaction if packages_mutated else None,
-                repo_recovery_contract=repo_recovery_contract,
-                backup_receipt=backup_receipt,
-                bootblock_contract=bootblock_contract,
-                update_safety_contract=update_safety_contract,
-                recovery_transaction_id=recovery_transaction_id,
+        try:
+            recovery_package_transaction = (
+                _package_transaction_from_receipt(prepared_package_receipt)
+                if packages_mutated
+                else None
             )
-        else:
-            recovered = _recover_pretransaction_service_state(state)
+            if journal_phase == recovery_journal.PHASE_PRODUCT_MUTATING:
+                recovery_result = _recover_failed_transition(
+                    repo_dir=repo_dir,
+                    install_user=install_user,
+                    backup_dir=backup_dir,
+                    old_commit=old_commit,
+                    git_created=git_created,
+                    inventory=inventory,
+                    recovery_inventory=recovery_inventory,
+                    state=state,
+                    package_transaction=recovery_package_transaction,
+                    repo_recovery_contract=repo_recovery_contract,
+                    backup_receipt=backup_receipt,
+                    bootblock_contract=bootblock_contract,
+                    update_safety_contract=update_safety_contract,
+                    recovery_transaction_id=recovery_transaction_id,
+                    quiesced_overlay_receipt=quiesced_overlay_receipt,
+                    recovery_journal_contract=current_recovery_journal,
+                )
+                recovered = bool(recovery_result)
+                bootblock_contract = recovery_result.bootblock_contract
+                if recovery_result.recovery_journal_contract is not None:
+                    persistent_recovery_bundle = replace(
+                        persistent_recovery_bundle,
+                        journal=recovery_result.recovery_journal_contract,
+                    )
+            elif journal_phase == recovery_journal.PHASE_PREPRODUCT:
+                recovered = _abort_before_product_mutation(
+                    repo_dir=repo_dir,
+                    state=state,
+                    apache_preimage=recovery_inventory.apache_security,
+                    transaction_id=recovery_transaction_id,
+                    bootblock_contract=bootblock_contract,
+                    update_safety_contract=update_safety_contract,
+                    overlay_receipt=None,
+                    package_transaction=recovery_package_transaction,
+                    packages_mutated=packages_mutated,
+                    recovery_inventory=recovery_inventory,
+                    recovery_journal_contract=current_recovery_journal,
+                )
+            else:
+                raise RuntimeError(
+                    f"Unzulässige Recovery-Journalphase: {journal_phase}"
+                )
+        except Exception as recovery_binding_exc:
+            update_logger.critical(
+                "Paket-Receipt konnte am Transaktionsrücklauf nicht gebunden werden: %s",
+                recovery_binding_exc,
+            )
         if recovered:
-            print("[OK] Ausgangszustand wurde automatisch und verifiziert wiederhergestellt.")
-            _set_watchdog_update_pause(False, reason=transition_name)
+            try:
+                persistent_recovery_bundle = _finish_rolled_back_update_cleanup(
+                    bundle=persistent_recovery_bundle,
+                    offline_receipt=offline_package_receipt,
+                    overlay_receipt=quiesced_overlay_receipt,
+                    package_receipt=prepared_package_receipt,
+                    update_safety_contract=update_safety_contract,
+                )
+                print(
+                    "[OK] Ausgangszustand wurde automatisch und verifiziert "
+                    "wiederhergestellt."
+                )
+                _set_watchdog_update_pause(False, reason=transition_name)
+            except Exception as cleanup_error:
+                recovered = False
+                update_logger.critical(
+                    "Terminaler Rücklauf-Cleanup blieb unvollständig: %s",
+                    cleanup_error,
+                )
         else:
             if update_safety_contract is not None:
                 try:
@@ -15223,9 +23939,52 @@ def _execute_update_transaction(
                 _enforce_fail_closed_after_recovery_failure(
                     bootblock_contract,
                     recovery_transaction_id=recovery_transaction_id,
+                    recovery_journal_contract=persistent_recovery_bundle.journal,
                 )
         return False
 
+    try:
+        if update_safety_contract is not None:
+            committed_contract = _read_update_safety_contract()
+            if (
+                committed_contract is None
+                or committed_contract.state != "committed"
+                or not _same_update_safety_transaction_shape(
+                    committed_contract,
+                    update_safety_contract,
+                )
+            ):
+                raise RuntimeError(
+                    "Äußerer Abschluss besitzt nicht den committed Safety-Beleg"
+                )
+            _finish_committed_update_safety_cleanup(
+                committed_contract,
+                remove_receipt=False,
+            )
+        _cleanup_terminal_update_artifacts(
+            bundle=persistent_recovery_bundle,
+            offline_receipt=offline_package_receipt,
+            overlay_receipt=quiesced_overlay_receipt,
+            package_receipt=prepared_package_receipt,
+            update_safety_contract=update_safety_contract,
+            terminal_label="neue Stand",
+        )
+    except BaseException as exc:
+        print(
+            f"[ABBRUCH] E3DC-UPD-POSTCOMMIT-CLEANUP-001: {exc}"
+        )
+        print(
+            "Lösung: Der neue Stand ist dauerhaft übernommen. Keine Receipt-, "
+            "Overlay- oder Backup-Datei manuell löschen. Starte denselben "
+            "Updatebefehl erneut; der aktuelle Updater setzt ausschließlich "
+            "den gebundenen terminalen Cleanup fort."
+        )
+        update_logger.critical(
+            "Committed äußerer Updateabschluss blieb unvollständig: %s",
+            exc,
+        )
+        _set_watchdog_update_pause(False, reason=transition_name)
+        return False
     _set_watchdog_update_pause(False, reason=transition_name)
     print(f"\n[OK] {transition_name} auf {target_commit} abgeschlossen.")
     update_logger.info(f"E3DC-Control {transition_name} abgeschlossen: {old_commit} -> {target_commit}")
@@ -15407,6 +24166,8 @@ def execute_verified_target_update(
 
     _required_update_lock_fd()
     product_root = _validate_bootstrap_install_path(repo_dir)
+    if not _prepare_true_update_entry(product_root):
+        return False
     snapshot_root = os.path.dirname(INSTALLER_DIR)
     if (
         os.path.realpath(os.environ.get("E3DC_BOOTSTRAP_ROOT", "")) != product_root
@@ -15536,6 +24297,10 @@ def _update_e3dc_locked(
             "[!] --reinstall-current darf nicht mit Bootstrap-, Rollback- "
             "oder Ziel-SHA-Optionen kombiniert werden."
         )
+        return False
+    if not _is_docker_environment() and not _prepare_true_update_entry(
+        os.path.abspath(str(target_install_path or INSTALL_PATH))
+    ):
         return False
     if target_install_path:
         return _execute_update_transaction(

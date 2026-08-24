@@ -12,6 +12,27 @@ export E3DC_INSTALL_PATH="/absoluter/pfad/zur/installation"
 test -f "$E3DC_INSTALL_PATH/e3dc-setup"
 ```
 
+## Kurze Updateunterbrechung und gebundener Rückweg in 5.4.4b
+
+5.4.4b lässt Dienste und Hardware-Writer während Download, Zielprüfung und
+vollständigem Backup weiterlaufen. Der neue Ziel-Updater stoppt sie erst für
+die abschließende Produkt-, Rechte- und Unit-Projektion. Der Rückweg ist an
+genau dieses geprüfte Backup, die Instanz, den Ausgangsstand und die laufende
+Transaktion gebunden. Erst ein bestätigter Dienst- und Health-Endzustand
+schließt die Transaktion ab.
+
+Ein unterbrochener Abschluss wird nicht durch einen neuen Updateversuch
+überfahren. Ein exakt als `committed` belegter Sicherheitsrest aus 5.4.4 oder
+5.4.4a darf ohne erneute Produktmutation bereinigt werden, wenn Receipt,
+Backup, Marker, Drop-ins und Instanz weiterhin identisch gebunden sind. Ein
+`pending`, gemischter oder widersprüchlicher Zustand bleibt fail-closed; die
+Ausgabe nennt das zu prüfende Journal und den nächsten sicheren Befehl.
+
+Für Docker bindet der Host-Helfer Ausgangsimage und Kandidat getrennt. Ein
+fehlgeschlagener Kandidat wird gestoppt und der belegte Ausgangsstand wieder
+gestartet. Der öffentliche parentlose Rollback-Root `v5.3.2b` und sein Digest
+bleiben unverändert. Er ist weiterhin kein Bare-Metal-Programm-Rückfall.
+
 ## Ein-Datei-Update und Rückweg in 5.4.4a
 
 5.4.4a macht `e3dc-update-bootstrap` zum portablen vorwärtsgerichteten
@@ -134,7 +155,7 @@ oder einen Prozessabbruch außerhalb des erkannten Fehlerpfads.
 
 ## Programmstand zurücksetzen
 
-Der aktuelle Stable-Stand `v5.4.4a` führt den gebundenen Rückfallvertrag fort.
+Der aktuelle Stable-Stand `v5.4.4b` führt den gebundenen Rückfallvertrag fort.
 
 Beim Rücklauf wird der tatsächliche Dateisystemzustand einer Unit weiterhin
 streng gegen reguläre Unit-Datei, kanonische `/dev/null`-Maske, unerwarteten

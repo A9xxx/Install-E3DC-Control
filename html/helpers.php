@@ -5361,7 +5361,7 @@ function e3dcClassifySelfUpdateCompletion($running, $exitCode, $log) {
 
 function e3dcCommunityBootstrapReleaseTag() {
     // RELEASE_MARKER: Beim Versionssprung gemeinsam mit VERSION/Release Notes aktualisieren.
-    return 'v5.4.4d';
+    return 'v5.4.4e';
 }
 
 function e3dcCommunityBootstrapCommand() {

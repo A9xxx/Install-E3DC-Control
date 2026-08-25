@@ -1,6 +1,11 @@
 # Speicher-Ladesteuerung - Systemablauf
 
-> **Stand:** v5.4.4d
+> **Stand:** v5.4.4e
+>
+> **Hinweis zu 5.4.4e:** Dieses Release korrigiert ausschließlich den
+> Webupdate- und Rücklaufpfad für die produktive RAM-Disk. Speicherentscheidung,
+> Direktvermarktung, Wallbox- und Wärmepumpenbudgets, RSCP-Ausgang und
+> Hardwaregrenzen entsprechen unverändert 5.4.4d.
 >
 > **Neu in 5.4.4d:** Das gemeinsame Wallboxziel wird in allen von E3DC-Control
 > geführten Lademodi durch die konfigurierte Hausabsicherung abzüglich

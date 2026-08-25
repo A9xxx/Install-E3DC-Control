@@ -4,7 +4,7 @@ E3DC-Control Installer Package
 Ein modulares Installer-System für E3DC-Control mit dynamischer Menüregistrierung.
 """
 
-__version__ = "5.4.4d"
+__version__ = "5.4.4e"
 
 
 

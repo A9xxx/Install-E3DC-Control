@@ -2310,9 +2310,20 @@ def _delete_approved_stale_paths(target_root: Path, policy: dict) -> None:
             "Python beziehungsweise das Linux-System aktualisieren und danach denselben Updatebefehl erneut starten.",
         )
 
+    allowed_root_candidates = [
+        Path(os.path.abspath(target_root)),
+        Path("/var/www/html"),
+    ]
+    # Nur ein tatsächlich bestätigter eigener tmpfs-Mount benötigt einen
+    # separaten Löschroot. Auf Altanlagen kann ``ramdisk`` ein gewöhnliches
+    # Verzeichnis im Webbaum sein; dann bleibt der bewährte Webroot zuständig.
+    # Ein unbestätigter Fremdmount wird beim fd-relativen Abstieg weiterhin
+    # über die abweichende Mount-ID fail-closed erkannt.
+    if _probe_ramdisk_tmpfs():
+        allowed_root_candidates.append(RAMDISK_PATH)
     allowed_roots = tuple(
         sorted(
-            (Path(os.path.abspath(target_root)), Path("/var/www/html")),
+            allowed_root_candidates,
             key=lambda item: len(str(item)),
             reverse=True,
         )
@@ -2349,6 +2360,28 @@ def _delete_approved_stale_paths(target_root: Path, policy: dict) -> None:
             root_metadata = os.fstat(root_fd)
             root_device = root_metadata.st_dev
             root_mount_id = _fd_mount_id(root_fd)
+            if selected_root == RAMDISK_PATH:
+                # Die pfadbasierte tmpfs-Bestätigung wird an genau den bereits
+                # geöffneten nofollow-FD gebunden. Ein Un-/Ummount während der
+                # Probe darf nicht unbemerkt einen neuen Löschroot autorisieren.
+                if not _probe_ramdisk_tmpfs():
+                    raise RuntimeError("RAM-Disk ist kein bestätigtes tmpfs")
+                confirmation_fd = os.open(
+                    selected_root,
+                    os.O_RDONLY | nofollow | directory | cloexec,
+                )
+                try:
+                    confirmation_metadata = os.fstat(confirmation_fd)
+                    if (
+                        (confirmation_metadata.st_dev, confirmation_metadata.st_ino)
+                        != (root_metadata.st_dev, root_metadata.st_ino)
+                        or _fd_mount_id(confirmation_fd) != root_mount_id
+                    ):
+                        raise RuntimeError(
+                            "RAM-Disk-Mount änderte sich während der Bestätigung"
+                        )
+                finally:
+                    os.close(confirmation_fd)
             parent_fd = root_fd
             missing = False
             for depth, component in enumerate(relative.parts[:-1], start=1):
@@ -3058,6 +3091,13 @@ def _sync_web_tree(
         root_device = root_metadata.st_dev
         root_mount_id = _fd_mount_id(root_fd)
         for name in sorted(PRESERVED_WEB_DIRS):
+            # Die produktive RAM-Disk ist absichtlich ein eigenes tmpfs. Ihr
+            # Inhalt ist bereits von der Releaseprojektion ausgeschlossen und
+            # wird später über den Laufzeit-Rechtevertrag normalisiert. Nur
+            # dieser exakt bestätigte Mount wird hier nicht wie ein gewöhnliches
+            # Verzeichnis gegen die Geräte-/Mount-ID des Webroots geprüft.
+            if destination / name == RAMDISK_PATH and _probe_ramdisk_tmpfs():
+                continue
             runtime_fd = _open_bound_projection_directory(
                 root_fd,
                 name,
@@ -4281,6 +4321,7 @@ def _start_previous_services_best_effort(
     allow_legacy: bool,
     role: str = "",
     extra_units: Iterable[str] = (),
+    enabled_before: Iterable[str] = (),
     exact_prestate: bool = False,
 ) -> tuple[str, ...]:
     from Installer.service_catalog import allowed_services
@@ -4289,6 +4330,7 @@ def _start_previous_services_best_effort(
     catalog = set(restartable)
     restartable.update(EXPLICIT_CUTOVER_SERVICES)
     extra_set = {_normalize_unit(item) for item in extra_units}
+    enabled_set = {_normalize_unit(item) for item in enabled_before}
     restartable.update(extra_set)
     selected_role_service = ROLE_SERVICE_BY_MODE.get(role)
     role_units = set(ROLE_SERVICE_BY_MODE.values())
@@ -4301,6 +4343,21 @@ def _start_previous_services_best_effort(
         ordered.remove(selected_role_service)
         ordered.insert(0, selected_role_service)
     failed: list[str] = []
+    role_managed = {
+        unit
+        for unit in ordered
+        if role_was_active
+        and role in {"master", "slave"}
+        and unit in catalog
+        and unit in enabled_set
+        and unit != selected_role_service
+        and _service_exists(unit)
+    }
+    for unit in ordered:
+        if unit in restartable and _service_exists(unit):
+            # Ein fehlgeschlagener Zielstart darf den bestätigten Altstand
+            # nicht anschließend über systemds StartLimit blockieren.
+            _run(["/usr/bin/systemctl", "reset-failed", unit], timeout=20)
     for unit in ordered:
         if unit not in restartable:
             continue
@@ -4324,6 +4381,15 @@ def _start_previous_services_best_effort(
             if unit == "e3dc.service":
                 continue
         if unit == "e3dc.service" and not allow_legacy:
+            continue
+        if unit in role_managed:
+            # Bei Master/Slave übernimmt ausschließlich der zuvor aktive
+            # HA-Manager den ebenfalls zuvor aktivierten Katalog-Dienstsatz.
+            # Es gibt hier bewusst kein zweites Zeit-Endgate: Peerprüfung und
+            # Auto-Recovery dürfen länger dauern, ohne den Rücklauf erneut als
+            # fehlgeschlagen zu deklarieren. Shadow verwaltet diese Dienste
+            # nicht; zuvor aktive, aber deaktivierte Dienste werden ebenfalls
+            # direkt wiederhergestellt.
             continue
         if _service_exists(unit):
             started = _run(["/usr/bin/systemctl", "start", unit], timeout=60)
@@ -4457,6 +4523,8 @@ def _restore_preupdate_state(
     prestate: ServicePrestate,
     target_services: Iterable[str],
     target_enable_services: Iterable[str],
+    install_user: str,
+    config: dict,
     role: str,
 ) -> tuple[bool, str]:
     """Stellt nach begonnener Zielmutation den gesicherten Altstand wieder her."""
@@ -4488,6 +4556,14 @@ def _restore_preupdate_state(
             guard=quiesced_guard,
         )
         _clear_legacy_update_blockers(backup_path)
+        # Die Zielprojektion schützt erhaltene Laufzeitverzeichnisse während
+        # des Austauschs vor parallelen Schreibern. Nach einem Rücklauf müssen
+        # deren veröffentlichte Alt-Rechte vor jedem Dienststart wieder gelten.
+        _normalize_preserved_web_permissions(
+            Path("/var/www/html"),
+            install_user,
+            config,
+        )
     except Exception as exc:
         detail = str(exc).strip() or exc.__class__.__name__
         return (
@@ -4549,6 +4625,7 @@ def _restore_preupdate_state(
         allow_legacy=True,
         role=role,
         extra_units=prestate.cutover_unknown_units,
+        enabled_before=prestate.enabled,
         exact_prestate=True,
     )
     if start_failed:
@@ -4575,6 +4652,8 @@ def _recover_failed_cutover(
     active_before: tuple[str, ...],
     services: tuple[str, ...],
     enable_services: tuple[str, ...],
+    install_user: str,
+    config: dict,
     role: str,
     product_mutated: bool,
     replacement_confirmed: bool,
@@ -4610,6 +4689,8 @@ def _recover_failed_cutover(
             prestate=prestate,
             target_services=services,
             target_enable_services=enable_services,
+            install_user=install_user,
+            config=config,
             role=role,
         )
         return (
@@ -4627,6 +4708,7 @@ def _recover_failed_cutover(
         extra_units=(
             prestate.cutover_unknown_units if prestate is not None else ()
         ),
+        enabled_before=(prestate.enabled if prestate is not None else ()),
         exact_prestate=True,
     )
     if failed:
@@ -4870,6 +4952,8 @@ def perform_update(
                     active_before=active_before,
                     services=services,
                     enable_services=enable_services,
+                    install_user=install_user,
+                    config=config,
                     role=role,
                     product_mutated=product_mutated,
                     replacement_confirmed=replacement_confirmed,
@@ -4901,6 +4985,8 @@ def perform_update(
                     active_before=active_before,
                     services=services,
                     enable_services=enable_services,
+                    install_user=install_user,
+                    config=config,
                     role=role,
                     product_mutated=product_mutated,
                     replacement_confirmed=replacement_confirmed,

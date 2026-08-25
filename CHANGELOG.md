@@ -6,6 +6,15 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.4e] – 2026-08-26
+
+### 🔄 Webupdate auf Systemen mit RAM-Disk
+
+- **Produktive RAM-Disk korrekt erkannt:** Das Webupdate akzeptiert das exakt bestätigte `tmpfs` unter `/var/www/html/ramdisk`. Eine ausdrücklich in der Release-Löschliste benannte Altdatei wird fd-gebunden innerhalb dieses eigenen Mounts entfernt. Andere fremde oder nicht bestätigte Mounts bleiben weiterhin vom Dateiaustausch ausgeschlossen.
+- **Verlässlicher Rücklauf nach einem Projektionsfehler:** Schlägt der Releasewechsel nach dem Dienststopp fehl, werden die bekannten Rechte von `data`, `logs`, `tmp` und `ramdisk` vor dem Neustart des vorherigen Dienstsatzes wiederhergestellt.
+- **Kein zusätzliches Zeit-Endgate:** Master und Slave übergeben zuvor aktive und aktivierte Regelungsdienste wieder an den HA-Manager. Shadow-Systeme sowie zuvor aktive, aber deaktivierte Dienste werden direkt wiederhergestellt. Eine feste 30-Sekunden-Frist blockiert den Rücklauf nicht.
+- **Regelung unverändert:** Gegenüber 5.4.4d wurden ausschließlich der Ziel-Updater und die Versions-/Betriebsdokumentation geändert.
+
 ## [5.4.4d] – 2026-08-25
 
 ### 🔄 Git-unabhängiges Update mit kurzer Unterbrechung

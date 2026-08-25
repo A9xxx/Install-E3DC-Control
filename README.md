@@ -1,12 +1,12 @@
 # E3DC-Control Web-Portal & Installer
 
-Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.4.4d</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
+Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.4.4e</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
 
 ![E3DC-Control Dashboard](html/app-icon-512.png)
 
 ## Aktuelle Version und Update
 
-Die aktuelle stabile Version ist **5.4.4d**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
+Die aktuelle stabile Version ist **5.4.4e**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
 
 ### Web-Update startet nicht? Einmaliger Rettungsweg
 
@@ -39,6 +39,8 @@ sondern eine eindeutige Auswahl verlangt.
 > **Config-Schutz:** Standardinstallationen speichern `data/e3dc_v4.json` und lokale Config-Backups mit `660` für Install-User und `www-data`, damit WebUI und Dienste weiter automatisch starten, die Datei aber nicht mehr weltlesbar ist. Der normale Config-Download ist redigiert; der Raw-Download enthält Zugangsdaten und wird nur angeboten, wenn eine Web-PIN gesetzt ist. Der Kompatibilitätsmodus (`664`) ist nur für eigene externe Leser gedacht.
 
 > **Bedienansichten:** Config-Editor und Wallbox-Seite unterscheiden zwischen einfacher Ansicht für Einrichtung und täglichen Betrieb sowie erweiterter Ansicht für alle Detailparameter. Die Logik und Abgrenzung sind in [doc/Frontend_Ansichten.md](doc/Frontend_Ansichten.md) dokumentiert.
+
+> **Neu in 5.4.4e Stable:** Der Ziel-Updater akzeptiert die exakt bestätigte produktive RAM-Disk unter `/var/www/html/ramdisk`, ohne den Schutz gegen andere fremde Mounts zu lockern. Eine ausdrücklich in der Release-Löschliste benannte Altdatei wird innerhalb dieses eigenen Mounts fd-gebunden entfernt. Nach einem fehlgeschlagenen Dateiaustausch stellt er die bekannten Webrechte vor dem Dienstneustart wieder her. Der HA-Rücklauf besitzt kein zusätzliches festes Zeit-Endgate. Regelung und Bedienfunktionen bleiben gegenüber 5.4.4d unverändert.
 
 > **Neu in 5.4.4d Stable:** Der jeweils heruntergeladene Ziel-Updater sichert den betriebenen Bestand Git-unabhängig, hält die Dienste nur für die ruhende Nachsicherung und Releaseprojektion kurz an, repariert bekannte Rechte und startet die benötigten Dienste neu. Die Web-Einstiege aus 5.4.4a bis 5.4.4c werden trotz ihrer unterschiedlichen Übergabeparameter direkt übernommen; Abhängigkeiten entstehen vor dem Dienststopp in einer neuen Zielumgebung. Platzmangel, ein schreibgeschütztes Dateisystem, fehlende Rechte, mehrere gleichrangige Installationen oder ein nicht wieder gestarteter vorher aktiver Zusatzdienst enden mit einer konkreten Prüf- und Fortsetzungsanweisung. Alle sichtbaren zustandsändernden WebUI-Aktionen verlangen Anmeldung und CSRF-Schutz und melden Erfolg erst nach bestätigtem Backup, atomarem Schreiben, Readback, Cache- sowie HTTP-/Payload-Ergebnis; der Rechte-Button verwendet den root-eigenen Backup-/Updateauftrag. Die erweiterte Wallbox-Ansicht besitzt wieder genau eine korrekt geschlossene Fahrzeug- und Profilkarte. HA-Leases werden nur bei exakt passender Rolle und Peer-Bindung übernommen, Bluelink folgt einer eindeutigen Konfigurationspriorität, und Modus 5 akzeptiert den sicheren Datenmodus `02770` sowie den ausdrücklich gewählten Kompatibilitätsmodus `02775`. In allen von E3DC-Control geführten Lademodi wird die Wallbox-Gruppenleistung phasenbezogen durch die konfigurierte Hausabsicherung abzüglich Reserve begrenzt. In `Aus / autonom` muss dieselbe Grenze zusätzlich in der Wallbox beziehungsweise im Ladeprofil hinterlegt sein, weil E3DC-Control nach der Übergabe keine Strombefehle mehr sendet. Mangels echter PCC-Phasen-RMS-Messung bleibt eine aus Wirkleistung durch `P/230` abgeleitete Stromangabe rein diagnostisch und autorisiert keine zusätzliche Ladeleistung.
 
@@ -534,7 +536,7 @@ sudo docker compose logs --tail=80 e3dc-control
 > `ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}`. Ohne Eintrag
 > folgt sie dem geprüften Stable-Tag `latest`. Ein fester Versions-Tag wechselt
 > bei `pull` absichtlich nicht; für einen bewussten Pin wird
-> `E3DC_IMAGE_TAG=v5.4.4d` in `.env` gesetzt. `config --images` zeigt vor dem
+> `E3DC_IMAGE_TAG=v5.4.4e` in `.env` gesetzt. `config --images` zeigt vor dem
 > Pull das tatsächlich gewählte Image.
 >
 > Vor dem `pull` prüft der Helfer mindestens 2 GiB freien Platz im

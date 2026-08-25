@@ -1,9 +1,9 @@
 {
-  "version": "5.4.4d",
+  "version": "5.4.4e",
   "min_version": "4.0.0",
-  "stable_release": "v5.4.4d",
-  "release_date": "2026-08-25",
-  "description": "v5.4.4d - Robustes Git-unabhängiges Update, verlässliche Webaktionen und zentrale Wallbox-Stromgrenze",
+  "stable_release": "v5.4.4e",
+  "release_date": "2026-08-26",
+  "description": "v5.4.4e - Webupdate mit RAM-Disk-Unterstützung und verlässlichem Rücklauf",
   "update_strategy": "backup_replace_restart_v1",
   "installer_requires": "python3",
   "sanitized_republication": false,

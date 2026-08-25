@@ -1,10 +1,28 @@
-# E3DC-Control v5.4.4d
+# E3DC-Control v5.4.4e
 
-Veröffentlichungsdatum: 2026-08-25.
+Veröffentlichungsdatum: 2026-08-26.
 
-E3DC-Control 5.4.4d führt den Git-unabhängigen Updateweg zu Ende, bestätigt
-schreibende Webaktionen zuverlässig und ergänzt eine statische, phasenbezogene
-Hausanschlussgrenze für die gemeinsame Wallbox-Steuerung.
+E3DC-Control 5.4.4e ist ein enges Wartungsrelease für den in 5.4.4d
+eingeführten Git-unabhängigen Updateweg. Regelung, Webaktionen und
+Wallbox-Hausanschlussgrenze bleiben gegenüber 5.4.4d unverändert.
+
+## Korrektur des Webupdates
+
+- Das exakt bestätigte `tmpfs` unter `/var/www/html/ramdisk` wird beim
+  Dateiaustausch als beabsichtigte produktive RAM-Disk behandelt. Andere
+  fremde oder unbestätigte Mounts bleiben weiterhin gesperrt. Eine ausdrücklich
+  in der Release-Löschliste benannte Altdatei wird innerhalb der bestätigten
+  RAM-Disk über deren eigenen fd-gebundenen Mountroot entfernt.
+- Muss der Updater nach begonnener Projektion zum gesicherten Altstand
+  zurückkehren, normalisiert er die bekannten Webrechte vor jedem
+  Dienstneustart. Dadurch können unter anderem die vorhandenen Logdateien
+  wieder vom Installationsnutzer geöffnet werden.
+- Master und Slave übergeben zuvor aktive und aktivierte Regelungsdienste an
+  den HA-Manager. Shadow-Systeme sowie zuvor aktive, aber deaktivierte Dienste
+  werden direkt wiederhergestellt. Der Rücklauf besitzt kein zusätzliches
+  festes Zeit-Endgate.
+
+## Enthaltener Stand aus 5.4.4d
 
 ## Update, Backup und Rechte mit kurzer Unterbrechung
 
@@ -32,7 +50,7 @@ Hausanschlussgrenze für die gemeinsame Wallbox-Steuerung.
   Erfolg. Private Datenverzeichnisse verwenden den sicheren Modus `02770`,
   der ausdrücklich gewählte Kompatibilitätsmodus `02775` bleibt unterstützt.
 - Startet ein zuvor aktiver, an die Installation gebundener Zusatzdienst nach
-  dem bestätigten Wechsel nicht wieder, bleibt 5.4.4d installiert. Der Auftrag
+  dem bestätigten Wechsel nicht wieder, bleibt 5.4.4e installiert. Der Auftrag
   endet aber nicht grün, sondern nennt den Dienst und den passenden
   `journalctl`-Befehl.
 

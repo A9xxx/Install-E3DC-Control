@@ -12,14 +12,21 @@ export E3DC_INSTALL_PATH="/absoluter/pfad/zur/installation"
 test -f "$E3DC_INSTALL_PATH/e3dc-setup"
 ```
 
-## Backup und Rückweg in 5.4.4d
+## Backup und Rückweg in 5.4.4e
 
-5.4.4d lässt den heruntergeladenen Ziel-Updater das Vollbackup bei laufenden
+5.4.4e lässt den heruntergeladenen Ziel-Updater das Vollbackup bei laufenden
 Diensten erstellen. Erst für die ruhende Daten-Nachsicherung, Releaseprojektion
 und Rechte-Reparatur werden die betroffenen Dienste kurz gestoppt; danach
 startet der benötigte Dienstsatz neu. Das Nutzer-`.git` ist weder Update- noch
 Rückfallautorität. Ein kontrollierter Abbruch vor dem Zielzustand verwendet den
 vom aktuellen Ziel-Updater gebundenen Sicherungspunkt.
+
+Die exakt bestätigte produktive RAM-Disk bleibt vom Dateiaustausch
+ausgenommen. Eine ausdrücklich benannte Altdatei wird fd-gebunden über ihren
+eigenen bestätigten Mountroot entfernt. Nach einem Rücklauf normalisiert der Ziel-Updater die bekannten
+Webrechte vor dem Neustart. Master und Slave übergeben aktivierte
+Regelungsdienste an HA; Shadow und zuvor aktive, aber deaktivierte Dienste
+werden direkt gestartet, ohne zusätzliches festes Zeit-Endgate.
 
 `ENOSPC`, `EROFS`, `EACCES` und mehrere gleichrangige Installationen werden mit
 einer konkreten Prüf- und Fortsetzungsanweisung ausgegeben. Bei mehreren
@@ -186,7 +193,7 @@ oder einen Prozessabbruch außerhalb des erkannten Fehlerpfads.
 
 ## Programmstand zurücksetzen
 
-Der aktuelle Stable-Stand ist `v5.4.4d`.
+Der aktuelle Stable-Stand ist `v5.4.4e`.
 
 Beim Rücklauf wird der tatsächliche Dateisystemzustand einer Unit weiterhin
 streng gegen reguläre Unit-Datei, kanonische `/dev/null`-Maske, unerwarteten

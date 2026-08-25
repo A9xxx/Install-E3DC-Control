@@ -1,6 +1,6 @@
 # Betrieb des E3DC-Control Installers
 
-Dokumentation Stand: 5.4.4d
+Dokumentation Stand: 5.4.4e
 
 Der Installer ist der freigegebene Einstieg für Installation, Update,
 Reparatur, Backup, Rollback und Deinstallation. Die vollständige Bedienung ist
@@ -14,7 +14,7 @@ Dashboard, Konsole und Installer-Menü denselben Dispatcher. Die automatische
 Updateprüfung verwendet dieselbe Stable-Quelle, informiert aber nur über einen
 neuen Stand.
 
-Der Installer-Anteil von 5.4.4d lässt den heruntergeladenen Ziel-Updater
+Der Installer-Anteil von 5.4.4e lässt den heruntergeladenen Ziel-Updater
 Vollbackup, kurze ruhende Daten-Nachsicherung, Releaseprojektion, Reparatur
 bekannter Rechte und Dienstneustart durchführen. Das Nutzer-`.git`, lokale
 Produktänderungen, fehlende Produktdateien und historische Rechte sind keine
@@ -26,6 +26,12 @@ Backup-/Updateauftrag. Alle sichtbaren zustandsändernden
 Webaktionen werten Anmeldung, CSRF, HTTP-Ergebnis, Antwortinhalt und Teilfehler
 aus, bevor sie Erfolg anzeigen. Für private Modus-5-Daten gilt `02770`; der
 ausdrücklich gewählte Kompatibilitätsmodus `02775` bleibt zulässig.
+
+Die exakt bestätigte RAM-Disk unter `/var/www/html/ramdisk` bleibt beim
+Dateiaustausch erhalten. Nach einem Rücklauf werden ihre und die übrigen
+bekannten Webrechte vor jedem Dienstneustart wiederhergestellt. Master und
+Slave übergeben aktivierte Regelungsdienste an HA; Shadow und zuvor aktive,
+aber deaktivierte Dienste werden direkt gestartet.
 
 Der Installer-Anteil von 5.4.4c verwendet den heruntergeladenen Ziel-Updater
 direkt. Das `.git`-Verzeichnis des Nutzers, lokale Produktänderungen, fehlende

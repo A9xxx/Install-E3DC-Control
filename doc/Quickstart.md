@@ -2,9 +2,9 @@
 
 Diese Anleitung fasst die schnellsten Schritte zusammen, um E3DC-Control auf einem frischen Raspberry Pi OS (oder ähnlichem Debian-System) zu installieren.
 
-Aktueller Stable-Stand: `v5.4.4d`.
+Aktueller Stable-Stand: `v5.4.4e`.
 
-5.4.4d führt das normale Bare-Metal-Update vollständig mit dem
+5.4.4e führt das normale Bare-Metal-Update vollständig mit dem
 heruntergeladenen Ziel-Updater aus: Vollbackup bei laufenden Diensten, kurze
 ruhende Nachsicherung, Releaseprojektion, Reparatur bekannter Rechte und
 Dienstneustart. Das Nutzer-`.git`, lokale Produktänderungen und fehlende
@@ -16,6 +16,11 @@ Wallbox-Gruppenleistung wird in allen von E3DC-Control geführten Modi statisch
 aus Hausabsicherung und Reserve phasenbezogen begrenzt. In `Aus / autonom`
 muss diese Grenze in der Wallbox beziehungsweise im Ladeprofil hinterlegt sein;
 `P/230` bleibt mangels echter PCC-Phasen-RMS-Messung ausschließlich Diagnose.
+Die exakt bestätigte RAM-Disk unter `/var/www/html/ramdisk` wird dabei als
+beabsichtigter Laufzeit-Mount behandelt. Eine ausdrücklich benannte Altdatei
+wird fd-gebunden innerhalb dieses eigenen Mounts entfernt. Nach einem fehlgeschlagenen
+Dateiaustausch werden die bekannten Webrechte vor dem Dienstneustart
+wiederhergestellt; eine zusätzliche feste HA-Wartefrist gibt es nicht.
 
 5.4.4c korrigiert ausschließlich den Updateweg. Das Nutzer-`.git`, lokale
 Produktänderungen, fehlende Dateien und alte Rechte blockieren das Update nicht.
@@ -373,7 +378,7 @@ Ohne das Label bleibt auch ein versehentlich gestarteter Watchtower für den
 Hauptcontainer wirkungslos. Der oben gezeigte manuelle Host-Helfer bleibt der
 empfohlene Updateweg.
 
-**Docker-Rückfall von v5.4.4d auf den veröffentlichten Docker-Rollback-Root:**
+**Docker-Rückfall von v5.4.4e auf den veröffentlichten Docker-Rollback-Root:**
 ```bash
 (
   set -euo pipefail

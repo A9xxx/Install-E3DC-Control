@@ -5,7 +5,7 @@ Updates werden ausschließlich über den Installer ausgeführt. Ein manuelles
 Nutzerinstallation ist für den regulären Ziel-Updater weder Voraussetzung noch
 Updateautorität.
 
-Der aktuelle Stable-Stand ist `v5.4.4d`. Das Dashboard startet ausschließlich
+Der aktuelle Stable-Stand ist `v5.4.4e`. Das Dashboard startet ausschließlich
 den argumentlosen, root-eigenen Systemjob. Dieser installiert den neuesten
 veröffentlichten Stable-Stand oder repariert dieselbe Version. Der
 Stable-Versionscheck ist nur eine Anzeige und keine Startfreigabe. Freie Pfade,
@@ -141,6 +141,19 @@ dem Root-Lock aus demselben gültigen Nicht-Root-Eigentümer von Repository und
 `.git`, lokales Benutzerkonto und Nutzerwert unmittelbar vor dem ersten
 Import aus dem Zielcode erneut geprüft. Die fail-closed Grenzen und alle
 übrigen Härtungen aus 5.4.3j bleiben unverändert.
+
+### 5.4.4e: RAM-Disk und verlässlicher Rücklauf
+
+5.4.4e akzeptiert das exakt bestätigte `tmpfs` unter
+`/var/www/html/ramdisk`, ohne den Schutz gegen andere fremde Mounts zu
+lockern. Eine ausdrücklich in der Release-Löschliste benannte Altdatei wird
+fd-gebunden über den eigenen Mountroot der bestätigten RAM-Disk entfernt.
+Scheitert der Dateiaustausch nach dem Dienststopp, werden die
+bekannten Webrechte vor dem Neustart des gesicherten Altstands normalisiert.
+Master und Slave übergeben aktivierte Katalogdienste an den HA-Manager;
+Shadow-Systeme sowie zuvor aktive, aber deaktivierte Dienste werden direkt
+wiederhergestellt. Eine zusätzliche feste Zeitprüfung blockiert den Rücklauf
+nicht. Die Regelung entspricht unverändert 5.4.4d.
 
 ### 5.4.4d: lösungsorientierter Ziel-Updater und bestätigte Webaktionen
 

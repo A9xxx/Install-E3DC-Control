@@ -787,26 +787,121 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         message=shortfall_aux_ac_message,
     )
 
-    grid_amps = safe_float(cfg.get("grid_max_amps"), 63.0)
-    grid_severity = "ok"
-    grid_message = "Hausanschlusslimit ist plausibel."
-    if grid_amps < 16.0 or grid_amps > 100.0:
+    grid_user_present = _has_user_value(cfg, "grid_max_amps")
+    grid_candidate = (
+        safe_float(cfg.get("grid_max_amps"), float("nan"))
+        if grid_user_present
+        else None
+    )
+    grid_invalid = bool(
+        grid_user_present
+        and (
+            grid_candidate is None
+            or not math.isfinite(grid_candidate)
+            or grid_candidate <= 0.0
+        )
+    )
+    if grid_invalid:
+        grid_amps = 0.0
+        grid_source = "invalid"
         grid_severity = "warning"
-        grid_message = "Hausanschlusslimit wirkt unplausibel; typische Werte liegen etwa zwischen 16 A und 100 A je Phase."
+        grid_message = (
+            "Hausabsicherung ist ungültig (Wert <= 0 oder keine Zahl). "
+            "Bitte einen gültigen Wert je Phase wie z. B. 35, 40, 50 oder 63 A "
+            "in den Einstellungen hinterlegen. Gesteuerte Wallbox-Ladung bleibt "
+            "aus Sicherheitsgründen gesperrt."
+        )
+    elif grid_candidate is not None and math.isfinite(grid_candidate) and grid_candidate > 0.0:
+        grid_amps = grid_candidate
+        grid_source = "user"
+        if grid_amps < 16.0 or grid_amps > 100.0:
+            grid_severity = "warning"
+            grid_message = "Hausanschlusslimit wirkt unplausibel; typische Werte liegen etwa zwischen 16 A und 100 A je Phase."
+        else:
+            grid_severity = "ok"
+            grid_message = "Hausanschlusslimit ist plausibel."
+    else:
+        grid_amps = 35.0
+        grid_source = "default"
+        grid_severity = "ok"
+        grid_message = "Hausanschlusslimit verwendet den Standardwert von 35 A je Phase."
+
     wallbox["grid_max_amps"] = _entry(
         key="grid_max_amps",
         label="Hausanschluss",
         unit="A",
-        configured=grid_amps if _has_user_value(cfg, "grid_max_amps") else None,
+        configured=(
+            grid_candidate
+            if grid_user_present and not grid_invalid
+            else (cfg.get("grid_max_amps") if grid_user_present else None)
+        ),
         live_value=None,
         live_key=None,
         effective=grid_amps,
-        source="user" if _has_user_value(cfg, "grid_max_amps") else "default",
+        source=grid_source,
         severity=grid_severity,
         message=grid_message,
     )
 
-    grid_reserve = safe_float(cfg.get("grid_wallbox_reserve_amps"), 2.0)
+    grid_reserve_present = _has_user_value(cfg, "grid_wallbox_reserve_amps")
+    grid_reserve_candidate = (
+        safe_float(cfg.get("grid_wallbox_reserve_amps"), float("nan"))
+        if grid_reserve_present
+        else None
+    )
+    grid_reserve_invalid = bool(
+        grid_reserve_present
+        and (
+            grid_reserve_candidate is None
+            or not math.isfinite(grid_reserve_candidate)
+            or grid_reserve_candidate < 0.0
+        )
+    )
+    grid_reserve = (
+        grid_reserve_candidate
+        if grid_reserve_candidate is not None
+        and math.isfinite(grid_reserve_candidate)
+        and grid_reserve_candidate >= 0.0
+        else 2.0
+    )
+    grid_reserve_severity = "ok"
+    grid_reserve_message = (
+        "Die globale Betriebsreserve für die gemeinsamen Wallbox-Phasenlimits "
+        "ist plausibel."
+    )
+    if grid_reserve_invalid:
+        grid_reserve_severity = "warning"
+        grid_reserve_message = (
+            "Die globale Wallbox-Reserve ist ungültig; der sichere Rückfallwert "
+            "von 2 A wird verwendet."
+        )
+    elif grid_reserve >= grid_amps:
+        grid_reserve_severity = "warning"
+        grid_reserve_message = (
+            "Die globale Wallbox-Reserve muss nichtnegativ und kleiner als die "
+            "Hausabsicherung je Phase sein."
+        )
+    wallbox["grid_wallbox_reserve_amps"] = _entry(
+        key="grid_wallbox_reserve_amps",
+        label="Globale Wallbox-Reserve",
+        unit="A",
+        configured=(
+            grid_reserve_candidate
+            if grid_reserve_candidate is not None
+            and math.isfinite(grid_reserve_candidate)
+            else None
+        ),
+        live_value=None,
+        live_key=None,
+        effective=grid_reserve,
+        source=(
+            "invalid"
+            if grid_reserve_invalid
+            else ("user" if grid_reserve_present else "default")
+        ),
+        severity=grid_reserve_severity,
+        message=grid_reserve_message,
+    )
     phase_grid_limits = {}
     phase_grid_reserves = {}
     phase_grid_contract_valid = {}
@@ -907,20 +1002,32 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
 
     global_wb_max = safe_float(cfg.get("wbmaxladestrom"), 16.0)
     for key, label, fallback in (
-        ("wbmaxladestrom", "Wallbox global max.", 16.0),
+        ("wbmaxladestrom", "Standard-Maximalstrom je Wallbox", 16.0),
         ("wb1_max_amp", "WB1 max. Ladestrom", global_wb_max),
         ("wb2_max_amp", "WB2 max. Ladestrom", global_wb_max),
     ):
         configured = safe_float(cfg.get(key), float("nan")) if _has_user_value(cfg, key) else None
         effective = configured if configured is not None and math.isfinite(configured) else float(fallback)
         severity = "ok"
-        message = "Ladestrom-Grenze ist plausibel."
+        message = (
+            "Der Standard-Maximalstrom je Wallbox ist plausibel."
+            if key == "wbmaxladestrom"
+            else "Die Ladestrom-Grenze des Ladepunkts ist plausibel."
+        )
         if effective < 6.0 or effective > 32.0:
             severity = "warning"
-            message = "Wallbox-Ladestrom sollte zwischen 6 A und 32 A liegen."
+            message = (
+                "Der Standard-Maximalstrom je Wallbox muss zwischen 6 A und 32 A liegen."
+                if key == "wbmaxladestrom"
+                else "Der Wallbox-Ladestrom je Ladepunkt muss zwischen 6 A und 32 A liegen."
+            )
         elif effective > grid_amps:
             severity = "warning"
-            message = "Der Wallbox-Ladestrom liegt über der Hausabsicherung je Phase."
+            message = (
+                "Der Standard-Maximalstrom je Wallbox liegt über der Hausabsicherung je Phase."
+                if key == "wbmaxladestrom"
+                else "Der Wallbox-Ladestrom je Ladepunkt liegt über der Hausabsicherung je Phase."
+            )
         wallbox[key] = _entry(
             key=key,
             label=label,

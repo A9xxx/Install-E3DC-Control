@@ -2,8 +2,14 @@
 
 Veröffentlichte Images entstehen ausschließlich aus einem versionierten stabilen Release-Tag. `latest` verweist damit auf die zuletzt veröffentlichte stabile Version.
 
-Der aktuelle Stable-Stand ist `v5.4.4c`. Die Tags `latest`, `v5.4.4c` und
-`5.4.4c` bezeichnen denselben Stable-Stand.
+Der aktuelle Stable-Stand ist `v5.4.4d`. Die Tags `latest`, `v5.4.4d` und
+`5.4.4d` bezeichnen denselben Stable-Stand.
+
+5.4.4d enthält den aktuellen gemeinsamen Produktstand mit bestätigten
+Webaktionen, eindeutiger Bluelink-Konfigurationspriorität und der statischen,
+phasenbezogenen Hausanschlussgrenze der Wallboxen. Der Bare-Metal-Updater
+arbeitet weiterhin Git-unabhängig mit Vollbackup und kurzer Umschaltphase; der
+Container selbst führt keine Host-Updates oder Docker-Daemon-Aktionen aus.
 
 5.4.4c korrigiert ausschließlich den Update- und Reparaturpfad. Der direkte
 Bare-Metal-Ziel-Updater ist unabhängig vom Nutzer-`.git`, arbeitet mit
@@ -305,7 +311,7 @@ unverändert gesperrt und benötigen eine manuelle Prüfung.
 
 Ohne `E3DC_IMAGE_TAG` folgt diese Compose-Datei dem geprüften Stable-Tag
 `latest`. Ein fester Tag bleibt bei `pull` absichtlich unverändert. Für einen
-bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.4c` in der Datei `.env`
+bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.4d` in der Datei `.env`
 gesetzt. `docker compose config --images` zeigt vorab das tatsächlich gewählte
 Image.
 
@@ -332,7 +338,7 @@ Versionswahl.
 
 Gezielte Rückfallversion:
 
-Den Stable-Container `v5.4.4c` auf den veröffentlichten Rollback-Root
+Den Stable-Container `v5.4.4d` auf den veröffentlichten Rollback-Root
 `v5.3.2b` zurücksetzen:
 
 ```bash

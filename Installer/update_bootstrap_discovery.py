@@ -40,6 +40,7 @@ class Binding:
     root: str
     user: str
     role: str
+    peer_ip: str = ""
 
 
 @dataclass(frozen=True)
@@ -480,6 +481,30 @@ def _stable_main_pid_hints(
     return tuple(sorted(hints))
 
 
+def _installed_web_launcher_binding() -> tuple[Path, str] | None:
+    """Liest die sichere Instanzbindung des root-eigenen Web-Launchers."""
+
+    launcher = Path("/usr/local/sbin/e3dc-web-update-launcher")
+    if not _safe_root_file(launcher, require_root_read_execute=True):
+        return None
+    try:
+        _metadata, raw_payload = _stable_regular_read(launcher, 131072)
+        payload = raw_payload.decode("utf-8", errors="strict")
+    except (OSError, UnicodeError):
+        return None
+    root_matches = re.findall(r"^readonly INSTALL_ROOT=(.+)$", payload, re.MULTILINE)
+    user_matches = re.findall(r"^readonly INSTALL_USER=(.+)$", payload, re.MULTILINE)
+    if len(root_matches) != 1 or len(user_matches) != 1:
+        return None
+    bound_root = _decode_launcher_literal(root_matches[0])
+    bound_user = _decode_launcher_literal(user_matches[0])
+    root = canonical_product_root(bound_root, ignore_product_markers=True)
+    user = valid_user(bound_user)
+    if root is None or user is None:
+        return None
+    return root, user
+
+
 def _collect_installation_evidence(
 ) -> tuple[list[dict[str, set[str]]], list[dict[str, set[str]]]]:
     tiers: list[dict[str, set[str]]] = [defaultdict(set) for _ in range(5)]
@@ -521,28 +546,17 @@ def _collect_installation_evidence(
             tier_users[tier][key].add(selected_user)
         return key
 
-    launcher = Path("/usr/local/sbin/e3dc-web-update-launcher")
-    if _safe_root_file(launcher, require_root_read_execute=True):
-        try:
-            _metadata, raw_payload = _stable_regular_read(launcher, 131072)
-            payload = raw_payload.decode("utf-8", errors="strict")
-        except (OSError, UnicodeError):
-            payload = ""
-        if len(payload) <= 131072:
-            root_matches = re.findall(r"^readonly INSTALL_ROOT=(.+)$", payload, re.MULTILINE)
-            user_matches = re.findall(r"^readonly INSTALL_USER=(.+)$", payload, re.MULTILINE)
-            if len(root_matches) == 1 and len(user_matches) == 1:
-                bound_root = _decode_launcher_literal(root_matches[0])
-                bound_user = _decode_launcher_literal(user_matches[0])
-                if bound_root is not None and bound_user is not None:
-                    add(
-                        bound_root,
-                        "root-eigener Update-Dispatcher",
-                        bound_user,
-                        tier=1,
-                        ignore_product_markers=True,
-                        exact_root=True,
-                    )
+    launcher_binding = _installed_web_launcher_binding()
+    if launcher_binding is not None:
+        bound_root, bound_user = launcher_binding
+        add(
+            bound_root,
+            "root-eigener Update-Dispatcher",
+            bound_user,
+            tier=1,
+            ignore_product_markers=True,
+            exact_root=True,
+        )
 
     try:
         anchor_paths = sorted(INSTANCE_ANCHOR_DIRECTORY.glob("*.json"))[:128]
@@ -923,7 +937,7 @@ def _validate_anchor_role_against_services(
         )
 
 
-def discover_role(target: Path) -> str:
+def discover_role_binding(target: Path) -> tuple[str, str]:
     active_role_services = _active_role_services()
     if {
         "e3dc-ha.service",
@@ -932,6 +946,8 @@ def discover_role(target: Path) -> str:
         _validate_anchor_role_against_services("off", active_role_services)
 
     anchor = Path("/etc/e3dc-control/instance_role.json")
+    anchor_role: str | None = None
+    anchor_peer_raw: object = ""
     try:
         anchor_entry = os.lstat(anchor)
     except FileNotFoundError:
@@ -966,7 +982,11 @@ def discover_role(target: Path) -> str:
             pass
         else:
             _validate_anchor_role_against_services(role, active_role_services)
-            return role
+            # Der sichere Rollenanker bleibt die Rollenautorität. Eine dort
+            # noch fehlende Peer-IP darf aber aus einer eindeutigen alten
+            # Konfiguration ergänzt werden, bevor der Ziel-Updater startet.
+            anchor_role = role
+            anchor_peer_raw = value.get("peer_ip") if isinstance(value, dict) else ""
 
     fallback_roles: list[tuple[str, str]] = []
     invalid_sources: list[str] = []
@@ -983,6 +1003,10 @@ def discover_role(target: Path) -> str:
             invalid_sources.append(f"{source}:ha_peer_ip ungültig")
             return
         ha_peer_ips.append((source, normalized))
+
+    if _configured_signal(anchor_peer_raw):
+        ha_indicators.append(f"{anchor}:peer_ip")
+        collect_ha_peer(str(anchor), anchor_peer_raw)
 
     def collect_json_role(path: Path) -> None:
         try:
@@ -1054,7 +1078,21 @@ def discover_role(target: Path) -> str:
         fallback_roles.append(("systemd:e3dc-shadow-sync.service", "shadow"))
 
     unique_roles = sorted({role for _source, role in fallback_roles})
-    if not unique_roles:
+    if anchor_role is not None:
+        conflicting_roles = sorted(
+            (source, role)
+            for source, role in set(fallback_roles)
+            if role != anchor_role
+        )
+        if conflicting_roles:
+            details = "; ".join(
+                f"{source}={role}" for source, role in conflicting_roles
+            )
+            raise RuntimeError(
+                f"Rollenanker mode={anchor_role} widerspricht Alt-Rollenquellen: {details}"
+            )
+        selected_role = anchor_role
+    elif not unique_roles:
         if "e3dc-ha.service" in active_role_services:
             raise RuntimeError(
                 "e3dc-ha.service ist aktiv, aber weder ein gültiger Rollenanker noch "
@@ -1067,18 +1105,25 @@ def discover_role(target: Path) -> str:
             )
         # Ungültige Alt-Konfigurationsdateien und ein reparierbarer Altanker
         # erzeugen ohne jedes HA-Signal keine zweite Instanzrolle.
-        return "off"
-    if len(unique_roles) != 1:
+        return "off", ""
+    elif len(unique_roles) != 1:
         details = "; ".join(
             f"{source}={role}" for source, role in sorted(set(fallback_roles))
         )
         raise RuntimeError(f"Fallback-Rollenquellen widersprechen sich: {details}")
+    else:
+        selected_role = unique_roles[0]
+    unique_peer_ips = sorted({peer for _source, peer in ha_peer_ips})
+    if anchor_role is not None and selected_role in {"master", "slave"} and len(unique_peer_ips) > 1:
+        details = "; ".join(
+            f"{source}={peer}" for source, peer in sorted(set(ha_peer_ips))
+        )
+        raise RuntimeError(f"HA-Peer-Quellen widersprechen sich: {details}")
     if "e3dc-ha.service" in active_role_services:
-        if unique_roles[0] not in {"master", "slave"}:
+        if selected_role not in {"master", "slave"}:
             raise RuntimeError(
-                f"Aktives e3dc-ha.service widerspricht der eindeutigen Altrolle {unique_roles[0]}"
+                f"Aktives e3dc-ha.service widerspricht der gebundenen Rolle {selected_role}"
             )
-        unique_peer_ips = sorted({peer for _source, peer in ha_peer_ips})
         if len(unique_peer_ips) != 1:
             details = "; ".join(
                 f"{source}={peer}" for source, peer in sorted(set(ha_peer_ips))
@@ -1087,12 +1132,22 @@ def discover_role(target: Path) -> str:
                 "Aktives e3dc-ha.service benötigt genau eine gültige alte ha_peer_ip: "
                 + details
             )
-    if unique_roles[0] == "off" and ha_indicators:
+    if selected_role == "off" and ha_indicators:
         raise RuntimeError(
             "Rolle off widerspricht vorhandenen HA-Indizien: "
             + "; ".join(sorted(set(ha_indicators)))
         )
-    return unique_roles[0]
+    peer_ip = (
+        unique_peer_ips[0]
+        if selected_role in {"master", "slave"} and len(unique_peer_ips) == 1
+        else ""
+    )
+    return selected_role, peer_ip
+
+
+def discover_role(target: Path) -> str:
+    role, _peer_ip = discover_role_binding(target)
+    return role
 
 
 def bind(
@@ -1101,20 +1156,27 @@ def bind(
     explicit_user: str = "",
     sudo_user: str = "",
     requested_role: str = "auto",
+    prefer_launcher_binding: bool = False,
 ) -> Binding:
+    if prefer_launcher_binding and not explicit_target and not explicit_user:
+        launcher_binding = _installed_web_launcher_binding()
+        if launcher_binding is not None:
+            launcher_root, launcher_user = launcher_binding
+            explicit_target = str(launcher_root)
+            explicit_user = launcher_user
     root, user = discover_installation(
         explicit_target=explicit_target,
         explicit_user=explicit_user,
         sudo_user=sudo_user,
     )
-    role = discover_role(root)
+    role, peer_ip = discover_role_binding(root)
     if requested_role not in {*VALID_ROLES, "auto"}:
         raise RuntimeError("Rolle muss auto, off, master, slave oder shadow sein")
     if requested_role != "auto" and requested_role != role:
         raise RuntimeError(
             f"Explizite Rolle {requested_role} widerspricht der erkannten Rolle {role}"
         )
-    return Binding(str(root), user, role)
+    return Binding(str(root), user, role, peer_ip)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1124,6 +1186,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--explicit-user", default="")
     parser.add_argument("--sudo-user", default="")
     parser.add_argument("--requested-role", default="auto")
+    parser.add_argument("--prefer-launcher-binding", action="store_true")
     args = parser.parse_args(argv)
     try:
         if args.list_candidates:
@@ -1133,6 +1196,7 @@ def main(argv: list[str] | None = None) -> int:
                     args.explicit_user,
                     args.sudo_user,
                     args.requested_role != "auto",
+                    args.prefer_launcher_binding,
                 )
             ):
                 raise DiscoveryError(
@@ -1148,6 +1212,7 @@ def main(argv: list[str] | None = None) -> int:
             explicit_user=args.explicit_user,
             sudo_user=args.sudo_user,
             requested_role=args.requested_role,
+            prefer_launcher_binding=args.prefer_launcher_binding,
         )
     except DiscoveryError as exc:
         print(f"[ABBRUCH] {exc.code}", file=sys.stderr)
@@ -1163,7 +1228,7 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
-    print(f"{binding.root}\t{binding.user}\t{binding.role}")
+    print(f"{binding.root}\t{binding.user}\t{binding.role}\t{binding.peer_ip}")
     return 0
 
 

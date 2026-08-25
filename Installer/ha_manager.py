@@ -1816,13 +1816,15 @@ def main_loop():
         if mode == "master":
             peer_online = is_host_online(peer_ip)
             peer_writer_state = query_peer_writer_state(peer_ip) if peer_online else "unknown"
+            resumed_master_continuity = False
             already_owner = owner_lease.valid(mode="master", peer_ip=peer_ip)
             if not already_owner and peer_writer_state != "active":
-                already_owner = owner_lease.resume_same_context_only(
+                resumed_master_continuity = owner_lease.resume_same_context_only(
                     "master",
                     peer_ip,
                     context_valid=True,
                 )
+                already_owner = resumed_master_continuity
             if not owner_admission_allowed("master", already_owner, peer_writer_state):
                 if owner_lease.held:
                     manage_services("stop", owner_lease=owner_lease)
@@ -1842,7 +1844,7 @@ def main_loop():
                 )
                 time.sleep(60)
                 continue
-            if owner_lease.resumed_same_context:
+            if resumed_master_continuity:
                 # Kontrollierter Neustart desselben lokalen Owners: Der Peer
                 # war vor der Übernahme bereits als stillstehend bestätigt.
                 # Ein Rücklesen vom Slave würde nur die Downtime verlängern.

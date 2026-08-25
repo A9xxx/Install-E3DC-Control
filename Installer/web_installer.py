@@ -61,6 +61,8 @@ try:
     from .config_secret_permissions import (
         apply_config_backup_dir_permissions,
         apply_config_secret_permissions,
+        config_secret_dir_mode,
+        config_secret_file_mode,
     )
     from .service_catalog import READ_ACTIONS, SERVICE_ACTIONS, get_module, iter_modules
     from .installer_config import get_install_path
@@ -82,6 +84,8 @@ except ImportError:  # pragma: no cover - direct script execution fallback
     from config_secret_permissions import (
         apply_config_backup_dir_permissions,
         apply_config_secret_permissions,
+        config_secret_dir_mode,
+        config_secret_file_mode,
     )
     from service_catalog import READ_ACTIONS, SERVICE_ACTIONS, get_module, iter_modules
     # installer_config besitzt absichtlich Paketimporte. Beim direkten
@@ -3962,17 +3966,43 @@ def remove_module(module_key: str | None = None) -> dict[str, Any]:
     }
 
 
-def check_path(path: Path, expected_group: str | None = "www-data", should_write: bool = False) -> dict[str, Any]:
+def check_path(
+    path: Path,
+    *,
+    expected_owner: str | tuple[str, ...] | None = None,
+    expected_group: str | None = "www-data",
+    expected_mode: int | None = None,
+    should_write: bool = False,
+) -> dict[str, Any]:
     exists = path.exists()
     meta = owner_group(path) if exists else {"owner": None, "group": None, "mode": None}
     writable = os.access(path, os.W_OK) if exists else False
-    issue = None
+    problems: list[str] = []
     if not exists:
-        issue = "fehlt"
-    elif expected_group and meta.get("group") != expected_group:
-        issue = f"Gruppe ist {meta.get('group')}, erwartet {expected_group}"
-    elif should_write and not writable:
-        issue = "nicht schreibbar für aktuellen Web-Installer-Kontext"
+        problems.append("fehlt")
+    elif path.is_symlink():
+        problems.append("ist ein symbolischer Link")
+    else:
+        allowed_owners = (
+            tuple(str(owner) for owner in expected_owner)
+            if isinstance(expected_owner, tuple)
+            else ((str(expected_owner),) if expected_owner else ())
+        )
+        if allowed_owners and meta.get("owner") not in allowed_owners:
+            problems.append(
+                f"Besitzer ist {meta.get('owner')}, erwartet {' oder '.join(allowed_owners)}"
+            )
+        if expected_group and meta.get("group") != expected_group:
+            problems.append(
+                f"Gruppe ist {meta.get('group')}, erwartet {expected_group}"
+            )
+        if expected_mode is not None and meta.get("mode") != oct(expected_mode):
+            problems.append(
+                f"Modus ist {meta.get('mode')}, erwartet {oct(expected_mode)}"
+            )
+        if should_write and not writable:
+            problems.append("nicht schreibbar für aktuellen Web-Installer-Kontext")
+    issue = "; ".join(problems) if problems else None
     return {
         "path": str(path),
         "exists": exists,
@@ -3984,24 +4014,57 @@ def check_path(path: Path, expected_group: str | None = "www-data", should_write
 
 
 def permissions_check() -> dict[str, Any]:
+    user = install_user()
+    data_mode = config_secret_dir_mode()
+    config_mode = config_secret_file_mode()
+    config_owners: tuple[str, ...] = (user,)
+    try:
+        import grp as _grp
+        import pwd as _pwd
+
+        install_account = _pwd.getpwnam(user)
+        web_group = _grp.getgrnam("www-data")
+        if install_account.pw_gid == web_group.gr_gid or user in web_group.gr_mem:
+            config_owners = (user, "www-data")
+    except (ImportError, KeyError, OSError):
+        pass
     paths = [
-        (WEB_ROOT, "www-data", True),
-        (TMP_DIR, "www-data", True),
-        (RAMDISK_DIR, "www-data", True),
-        (LOG_DIR, "www-data", True),
-        (DATA_DIR, "www-data", True),
-        (INSTALL_ROOT, "www-data", False),
-        (INSTALLER_DIR, "www-data", False),
-        (INSTALLER_DIR / "service_wrapper.sh", "www-data", False),
-        (INSTALLER_DIR / "installer_wrapper.sh", "www-data", False),
-        (INSTALLER_DIR / "web_update_launcher.sh", "www-data", False),
-        (CONFIG_FILE, "www-data", True),
+        (WEB_ROOT, "root", "www-data", 0o755, False),
+        (TMP_DIR, user, "www-data", 0o2775, True),
+        (RAMDISK_DIR, user, "www-data", 0o2775, True),
+        (LOG_DIR, user, "www-data", 0o2775, True),
+        (DATA_DIR, user, "www-data", data_mode, True),
+        (INSTALL_ROOT, user, "www-data", 0o755, False),
+        (INSTALLER_DIR, user, "www-data", 0o755, False),
+        (INSTALLER_DIR / "service_wrapper.sh", user, "www-data", 0o755, False),
+        (INSTALLER_DIR / "installer_wrapper.sh", user, "www-data", 0o755, False),
+        (INSTALLER_DIR / "web_update_launcher.sh", user, "www-data", 0o755, False),
+        (CONFIG_FILE, config_owners, "www-data", config_mode, True),
     ]
-    checks = [check_path(path, group, write) for path, group, write in paths]
+    checks = [
+        check_path(
+            path,
+            expected_owner=owner,
+            expected_group=group,
+            expected_mode=mode,
+            should_write=write,
+        )
+        for path, owner, group, mode, write in paths
+    ]
     for session_file in SESSION_FILES:
         if session_file.exists():
-            checks.append(check_path(session_file, "www-data", True))
+            checks.append(
+                check_path(
+                    session_file,
+                    expected_owner=user,
+                    expected_group="www-data",
+                    expected_mode=0o664,
+                    should_write=True,
+                )
+            )
     issues = [item for item in checks if not item["ok"]]
+    launcher_state = web_update_launcher_integrity_preview()
+    repair_command = "/usr/bin/sudo -n -- /usr/local/sbin/e3dc-web-update-launcher"
     return {
         "success": True,
         "write_actions_enabled": WRITE_ACTIONS_ENABLED,
@@ -4009,8 +4072,23 @@ def permissions_check() -> dict[str, Any]:
         "checks": checks,
         "issue_count": len(issues),
         "issues": issues,
-        "repair_available": False,
-        "repair_message": "Rechte-Reparatur ist als WebUI-Aktion vorbereitet, aber noch nicht freigeschaltet.",
+        "repair_available": bool(launcher_state.get("success")),
+        "privileged_web_repair_enabled": False,
+        "repair_via": "canonical_web_update_launcher",
+        "repair_launcher_status": launcher_state.get("status", "unbekannt"),
+        "repair_message": (
+            "Die direkte Web-Installer-Reparatur bleibt gesperrt. Backup, "
+            "Rechteprojektion, Releaseabgleich und Dienstneustart laufen über "
+            "den root-eigenen argumentlosen Web-Update-Launcher."
+        ),
+        "detected_install_path": str(INSTALL_ROOT),
+        "repair_command": repair_command,
+        "repair_instruction": (
+            "Per SSH am E3DC-Control-System anmelden und den folgenden Befehl "
+            "ausführen. Fehlt der root-eigene Launcher, zuerst das für die "
+            "installierte Version veröffentlichte Community-Bootstrap verwenden; "
+            "dieses installiert den Launcher gebunden und startet danach das Update."
+        ),
     }
 
 
@@ -4502,7 +4580,22 @@ def execute_job(job: dict[str, Any]) -> dict[str, Any]:
     if action not in ALLOWED_JOB_TYPES:
         raise RuntimeError(f"Nicht erlaubter Job-Typ: {action}")
 
-    if normalized_action in SERVICE_ACTIONS or normalized_action in {"repair_permissions", "run_update", "install_module", "remove_module", "install_missing_packages"}:
+    if normalized_action == "repair_permissions":
+        check = permissions_check()
+        return {
+            "success": False,
+            "action": action,
+            "write_blocked": True,
+            "privileged_web_repair_enabled": False,
+            "repair_available": check["repair_available"],
+            "repair_via": check["repair_via"],
+            "message": check["repair_message"],
+            "detected_install_path": check["detected_install_path"],
+            "repair_command": check["repair_command"],
+            "repair_instruction": check["repair_instruction"],
+        }
+
+    if normalized_action in SERVICE_ACTIONS or normalized_action in {"run_update", "install_module", "remove_module", "install_missing_packages"}:
         if not WRITE_ACTIONS_ENABLED:
             return {
                 "success": False,

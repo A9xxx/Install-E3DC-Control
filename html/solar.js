@@ -5356,48 +5356,25 @@ function restartService(skipConfirm = false) {
             'X-CSRF-Token': String(window.E3DC_CSRF_TOKEN || '')
         }
     })
-        .then(r => r.json())
-        .then(data => {
-            if (data.success) {
-                alert("✓ Alle Dienste wurden zurückgesetzt und neu gestartet.\nDas Web-Interface ist kurzzeitig eventuell nicht erreichbar.");
-            } else {
-                alert("✗ Fehler beim Neustart: " + data.message);
+        .then(async response => {
+            let data = null;
+            try { data = await response.json(); } catch (_) { data = null; }
+            if (!response.ok || !data || data.success !== true) {
+                throw new Error(data && data.message ? String(data.message) : ('HTTP ' + response.status));
             }
+            return data;
         })
-        .catch(err => alert("Netzwerkfehler: " + err));
+        .then(() => {
+                alert("✓ Alle Dienste wurden zurückgesetzt und neu gestartet.\nDas Web-Interface ist kurzzeitig eventuell nicht erreichbar.");
+        })
+        .catch(err => alert("✗ Neustart nicht bestätigt: " + err.message));
 }
 
-function fixPermissions() {
-    if (!confirm('Möchtest du eine automatische Rechteprüfung (permissions.py) starten und Fehler reparieren lassen?\n(Dauert einen Moment)')) return;
-
-    // UI Feedback
-    const btn = event ? event.currentTarget : null;
-    let oldHtml = '';
-    if (btn) {
-        oldHtml = btn.innerHTML;
-        btn.innerHTML = '<i class="fas fa-spinner fa-spin me-2"></i>Repariere...';
-        btn.disabled = true;
-    }
-
-    e3dcPostAction('action=fix_permissions')
-        .then(r => r.json())
-        .then(data => {
-            if (btn) {
-                btn.innerHTML = oldHtml;
-                btn.disabled = false;
-            }
-            if (data.success) {
-                if (confirm("✓ Dateirechte erfolgreich geprüft!\n\nDetails:\n" + (data.message || "") + "\n\nSollen die Hintergrund-Dienste jetzt neu gestartet werden, damit die geänderten Rechte greifen?")) {
-                    restartService(true);
-                }
-            } else {
-                alert("✗ Fehler bei der Rechte-Korrektur:\n" + data.message);
-            }
-        })
-        .catch(err => {
-            if (btn) { btn.innerHTML = oldHtml; btn.disabled = false; }
-            alert("Netzwerkfehler: " + err);
-        });
+function fixPermissions(btnId = 'btn-repair-permissions') {
+    // Rechteprojektion, Backup, Releaseabgleich und Dienstneustart gehören
+    // demselben root-eigenen, argumentlosen Systemjob. Es gibt absichtlich
+    // keinen zweiten privilegierten Webpfad für nutzerbeschreibbaren Code.
+    return startInstallerUpdate(btnId);
 }
 
 function showWatchdogLog() {
@@ -5469,7 +5446,7 @@ function handleConnectionClick() {
 
 function forceSocUpdate() {
     // Schutz: Nur aufwecken wenn Bluelink Token konfiguriert ist
-    if (window._hasBluelink === false) return;
+    if (window._hasBluelink === false || window._forceSocUpdatePending === true) return;
 
     const socBadges = document.querySelectorAll('#val-car-soc, #f-val-car-soc, #val-car-soc2, #f-val-car-soc2');
 
@@ -5483,20 +5460,57 @@ function forceSocUpdate() {
 
     if (isGuest) return;
 
+    const previousBadges = [];
     socBadges.forEach(el => {
+        if (el) previousBadges.push([el, el.innerHTML]);
         if (el) el.innerHTML = '<i class="fas fa-sync fa-spin"></i>';
     });
 
     const fzBtn = document.getElementById('fz-update-btn');
+    const previousButtonHtml = fzBtn ? fzBtn.innerHTML : '';
     if (fzBtn) {
         fzBtn.innerHTML = '<i class="fas fa-sync-alt fa-spin me-1"></i> Wecke auf...';
         fzBtn.disabled = true;
     }
 
-    e3dcPostAction('action=force_soc');
-    // Die UI-Rückmeldung (Erfolg oder Fehler) wird ab jetzt vollautomatisch
-    // vom 2-Sekunden-Polling (get_live_json.php) übernommen, welches den
-    // Status der Hintergrund-Aktion abfragt!
+    window._forceSocUpdatePending = true;
+    const restore = () => {
+        previousBadges.forEach(([el, html]) => { el.innerHTML = html; });
+        if (fzBtn) {
+            fzBtn.innerHTML = previousButtonHtml;
+            fzBtn.disabled = false;
+        }
+    };
+    const request = e3dcPostAction('action=force_soc').then(async response => {
+        let payload = null;
+        try {
+            payload = await response.json();
+        } catch (_error) {
+            throw new Error('Ungültige Antwort beim Aufwecken des Fahrzeugs.');
+        }
+        if (!response.ok || payload.success !== true) {
+            throw new Error(payload.message || 'Die Fahrzeug-Anforderung wurde abgelehnt.');
+        }
+        return payload;
+    });
+    const timeout = new Promise((_, reject) => {
+        setTimeout(() => reject(new Error('Zeitüberschreitung beim Aufwecken des Fahrzeugs.')), 10000);
+    });
+    Promise.race([request, timeout])
+        .then(payload => {
+            if (fzBtn) {
+                fzBtn.innerHTML = '<i class="fas fa-check me-1"></i> Anfrage angenommen';
+            }
+            setTimeout(() => {
+                restore();
+                window._forceSocUpdatePending = false;
+            }, 2000);
+        })
+        .catch(error => {
+            restore();
+            window._forceSocUpdatePending = false;
+            alert(error && error.message ? error.message : 'Das Fahrzeug konnte nicht aufgeweckt werden.');
+        });
 }
 
 function e3dcActionEndpoint() {
@@ -6028,9 +6042,8 @@ function updateReleaseRollbackPreview() {
     const warning = document.getElementById('rollback-warning');
     const preview = document.getElementById('rollback-command-preview');
     const runLog = document.getElementById('rollback-run-log');
-    const runBtn = document.getElementById('rollback-run-btn');
     const copyBtn = document.getElementById('rollback-copy-btn');
-    if (!releaseRollbackState || !release || !warning || !preview || !runBtn || !copyBtn) return;
+    if (!releaseRollbackState || !release || !warning || !preview || !copyBtn) return;
 
     if (runLog) {
         runLog.style.display = 'none';
@@ -6041,15 +6054,11 @@ function updateReleaseRollbackPreview() {
         warning.className = 'alert alert-info py-2 small mb-3';
         warning.innerText = 'Docker-Rückfall wird bewusst nicht im Container ausgeführt. Bitte diese Befehle auf dem Docker-Host ausführen.';
         preview.innerText = release.docker_commands || '';
-        runBtn.style.display = 'none';
         copyBtn.style.display = 'inline-block';
     } else {
-        warning.className = release.downgrade ? 'alert alert-danger py-2 small mb-3' : 'alert alert-warning py-2 small mb-3';
-        warning.innerText = release.downgrade
-            ? 'Downgrade: Vor dem Checkout wird ein Backup erstellt, Dienste werden gestoppt und danach folgt ein Gesundheitstest.'
-            : 'Release wird gezielt installiert: Backup, Dienststopp, git fetch --tags, Checkout und Gesundheitstest.';
+        warning.className = 'alert alert-warning py-2 small mb-3';
+        warning.innerText = 'Bare-Metal-Rückfälle werden im Web nicht gestartet. Verwende die verifizierte Backup-Wiederherstellung über die administrative Konsole.';
         preview.innerText = release.bare_metal_summary || '';
-        runBtn.style.display = 'inline-block';
         copyBtn.style.display = 'none';
     }
 }
@@ -6076,7 +6085,7 @@ function openReleaseRollback() {
             releaseRollbackState = data;
             if (currentBadge) currentBadge.innerText = 'Aktuell: ' + (data.current_version ? 'v' + String(data.current_version).replace(/^v/, '') : '--');
             if (stableBadge) stableBadge.innerText = 'Stable: ' + (data.stable_release || '--');
-            if (envBadge) envBadge.innerText = data.docker ? 'Docker: Host-Befehle' : 'Bare Metal: Installation möglich';
+            if (envBadge) envBadge.innerText = data.docker ? 'Docker: Host-Befehle' : 'Bare Metal: Wiederherstellungshinweise';
             (data.releases || []).forEach(release => {
                 const opt = document.createElement('option');
                 opt.value = release.tag;
@@ -6088,9 +6097,7 @@ function openReleaseRollback() {
                 warning.innerText = data.empty_message || 'Keine validierte Rückfallversion hinterlegt.';
                 preview.innerText = '';
                 select.disabled = true;
-                const runBtn = document.getElementById('rollback-run-btn');
                 const copyBtn = document.getElementById('rollback-copy-btn');
-                if (runBtn) runBtn.style.display = 'none';
                 if (copyBtn) copyBtn.style.display = 'none';
                 return;
             }
@@ -6107,11 +6114,50 @@ function openReleaseRollback() {
     new bootstrap.Modal(modalEl).show();
 }
 
-function copyReleaseRollbackCommands() {
+function setReleaseRollbackCopyFeedback(message, success) {
+    const button = document.getElementById('rollback-copy-btn');
+    if (!button) return;
+    if (!button.dataset.originalHtml) button.dataset.originalHtml = button.innerHTML;
+    if (!button.dataset.originalClass) button.dataset.originalClass = button.className;
+    if (button._copyFeedbackTimer) clearTimeout(button._copyFeedbackTimer);
+    button.innerHTML = '<i class="fas ' + (success ? 'fa-check' : 'fa-exclamation-triangle') + ' me-2"></i>' + message;
+    button.className = button.dataset.originalClass + (success ? ' text-success' : ' text-danger');
+    button._copyFeedbackTimer = setTimeout(() => {
+        button.innerHTML = button.dataset.originalHtml;
+        button.className = button.dataset.originalClass;
+    }, 2500);
+}
+
+async function copyReleaseRollbackCommands() {
     const preview = document.getElementById('rollback-command-preview');
-    if (!preview || !preview.innerText.trim()) return;
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(preview.innerText).catch(() => {});
+    const text = preview ? preview.innerText.trim() : '';
+    if (!text) {
+        setReleaseRollbackCopyFeedback('Keine Befehle', false);
+        return;
+    }
+
+    try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            await navigator.clipboard.writeText(text);
+        } else {
+            const helper = document.createElement('textarea');
+            helper.value = text;
+            helper.setAttribute('readonly', '');
+            helper.style.position = 'fixed';
+            helper.style.opacity = '0';
+            document.body.appendChild(helper);
+            let copied = false;
+            try {
+                helper.select();
+                copied = typeof document.execCommand === 'function' && document.execCommand('copy');
+            } finally {
+                helper.remove();
+            }
+            if (!copied) throw new Error('Zwischenablage nicht verfügbar.');
+        }
+        setReleaseRollbackCopyFeedback('Kopiert', true);
+    } catch (error) {
+        setReleaseRollbackCopyFeedback('Kopieren fehlgeschlagen', false);
     }
 }
 
@@ -6134,7 +6180,7 @@ function startReleaseRollback() {
         confirm: '1',
         tag: release.tag
     })
-        .then(r => r.json())
+        .then(r => e3dcParseJsonResponse(r, 'Release-Rückfall-Start'))
         .then(data => {
             if (data.status === 'started' || data.status === 'running') {
                 pollReleaseRollback(log, runBtn);
@@ -6175,13 +6221,26 @@ function pollReleaseRollback(log, runBtn) {
  * DASHBOARD & CHART LOGIC (Moved from index.php)
  */
 
-function toggleDarkMode(el) {
-    if (typeof DARK_MODE === 'undefined') return;
-    DARK_MODE = !DARK_MODE;
-    const theme = DARK_MODE ? 'dark' : 'light';
+let themeSaveFeedbackTimer = null;
+
+function showThemeSaveFeedback(message, success) {
+    const status = document.getElementById('theme-save-status');
+    if (!status) return;
+    if (themeSaveFeedbackTimer) clearTimeout(themeSaveFeedbackTimer);
+    status.textContent = message;
+    status.className = 'small ms-1 ' + (success ? 'text-success' : 'text-danger');
+    status.hidden = false;
+    themeSaveFeedbackTimer = setTimeout(() => {
+        status.textContent = '';
+        status.hidden = true;
+    }, 3000);
+}
+
+function applyDarkModeTheme(darkMode, icon = null) {
+    const theme = darkMode ? 'dark' : 'light';
     const html = document.documentElement;
     const body = document.body;
-    const icon = el || document.getElementById('darkmode-icon') || document.getElementById('mobile-darkmode-icon');
+    const targetIcon = icon || document.getElementById('darkmode-icon') || document.getElementById('mobile-darkmode-icon');
 
     html.setAttribute('data-bs-theme', theme);
     html.setAttribute('data-theme', theme);
@@ -6189,47 +6248,88 @@ function toggleDarkMode(el) {
         body.setAttribute('data-bs-theme', theme);
         body.setAttribute('data-theme', theme);
     }
-    try { localStorage.setItem('theme', theme); } catch (e) {}
-    if (icon) {
-        const tone = icon.classList && icon.classList.contains('text-secondary') ? 'text-secondary' : 'text-warning';
-        icon.className = (DARK_MODE ? 'fas fa-sun ' : 'fas fa-moon ') + tone;
+    if (targetIcon) {
+        const tone = targetIcon.classList && targetIcon.classList.contains('text-secondary') ? 'text-secondary' : 'text-warning';
+        targetIcon.className = (darkMode ? 'fas fa-sun ' : 'fas fa-moon ') + tone;
     }
+}
 
-    e3dcPostAction('', {
+function notifyThemeChanged() {
+    window.dispatchEvent(new CustomEvent('themeChanged'));
+    const body = document.body;
+    if (body && body.classList.contains('mode-mobile')) {
+        const page = window.E3DC_PAGE || '';
+        if ((page === 'live' || page === 'hybrid') && typeof updateDiagram === 'function') updateDiagram();
+        else if (page === 'forecast' && typeof updateForecast === 'function') updateForecast();
+        else if (page === 'history' && typeof window.triggerHistoryUpdate === 'function') window.triggerHistoryUpdate();
+    } else if (typeof refreshData === 'function') {
+        refreshData(false);
+    }
+}
+
+function toggleDarkMode(el) {
+    if (typeof DARK_MODE === 'undefined') return;
+    const previousDarkMode = DARK_MODE;
+    DARK_MODE = !DARK_MODE;
+    const icon = el || document.getElementById('darkmode-icon') || document.getElementById('mobile-darkmode-icon');
+    applyDarkModeTheme(DARK_MODE, icon);
+    try { localStorage.setItem('theme', DARK_MODE ? 'dark' : 'light'); } catch (e) {}
+
+    const saveRequest = e3dcPostAction('', {
         action: 'save_setting',
         key: 'darkmode',
         value: DARK_MODE ? '1' : '0'
-    });
+    })
+        .then(async response => {
+            if (!response.ok) throw new Error('HTTP ' + response.status);
+            const result = await response.text();
+            if (result.trim() !== 'ok') throw new Error('Einstellung wurde nicht bestätigt.');
+            showThemeSaveFeedback('Gespeichert', true);
+        })
+        .catch(() => {
+            DARK_MODE = previousDarkMode;
+            applyDarkModeTheme(DARK_MODE, icon);
+            try { localStorage.setItem('theme', DARK_MODE ? 'dark' : 'light'); } catch (e) {}
+            showThemeSaveFeedback('Nicht gespeichert – zurückgesetzt', false);
+            notifyThemeChanged();
+        });
 
-    setTimeout(() => {
-        window.dispatchEvent(new CustomEvent('themeChanged'));
-        if (body && body.classList.contains('mode-mobile')) {
-            const page = window.E3DC_PAGE || '';
-            if ((page === 'live' || page === 'hybrid') && typeof updateDiagram === 'function') updateDiagram();
-            else if (page === 'forecast' && typeof updateForecast === 'function') updateForecast();
-            else if (page === 'history' && typeof window.triggerHistoryUpdate === 'function') window.triggerHistoryUpdate();
-        } else if (typeof refreshData === 'function') {
-            refreshData(false);
-        }
-    }, 100);
+    void saveRequest;
+    setTimeout(notifyThemeChanged, 100);
 }
 
 function toggleForecast(el) {
     if (typeof SHOW_FORECAST === 'undefined') return;
+    const previousShowForecast = SHOW_FORECAST;
     SHOW_FORECAST = !SHOW_FORECAST;
 
-    if (el) {
-        if (SHOW_FORECAST) el.classList.replace('fa-eye-slash', 'fa-eye');
-        else el.classList.replace('fa-eye', 'fa-eye-slash');
-    }
+    const applyForecastIcon = () => {
+        if (!el || !el.classList) return;
+        el.classList.toggle('fa-eye', SHOW_FORECAST);
+        el.classList.toggle('fa-eye-slash', !SHOW_FORECAST);
+    };
+    applyForecastIcon();
 
-    e3dcPostAction('', {
+    const saveRequest = e3dcPostAction('', {
         action: 'save_setting',
         key: 'show_forecast',
         value: SHOW_FORECAST ? '1' : '0'
-    });
+    })
+        .then(async response => {
+            if (!response.ok) throw new Error('HTTP ' + response.status);
+            const result = await response.text();
+            if (result.trim() !== 'ok') throw new Error('Einstellung wurde nicht bestätigt.');
+            showThemeSaveFeedback('Prognose gespeichert', true);
+            if (typeof fetchData === 'function') fetchData();
+        })
+        .catch(() => {
+            SHOW_FORECAST = previousShowForecast;
+            applyForecastIcon();
+            showThemeSaveFeedback('Prognose nicht gespeichert – zurückgesetzt', false);
+            if (typeof fetchData === 'function') fetchData();
+        });
 
-    if (typeof fetchData === 'function') fetchData();
+    void saveRequest;
 }
 
 function switchChartMode(mode, view = 'normal') {
@@ -9218,6 +9318,104 @@ function publishE3dcLiveData(data) {
     }
 }
 
+function setDashboardWallboxPauseButton(wbIdx, paused, pending = false) {
+    const btn = $(`[data-dashboard-wb-pause="${wbIdx}"]`);
+    if (!btn.length) return;
+    btn.attr('data-paused', paused ? '1' : '0')
+        .toggleClass('btn-warning', paused)
+        .toggleClass('btn-outline-secondary', !paused)
+        .prop('disabled', pending)
+        .attr('title', paused ? 'Automatik fortsetzen' : 'Wallbox manuell pausieren')
+        .attr('aria-label', `Wallbox ${wbIdx} ${paused ? 'fortsetzen' : 'pausieren'}`);
+    const icon = btn.find('i');
+    icon.attr('class', `fas ${pending ? 'fa-spinner fa-spin' : (paused ? 'fa-play' : 'fa-pause')}`);
+}
+
+function bindDashboardWallboxPauseButtons() {
+    $('[data-dashboard-wb-pause]').off('click.wbpause').on('click.wbpause', function(e) {
+        e.preventDefault();
+        e.stopPropagation();
+        const btn = $(this);
+        const wbIdx = String(btn.data('dashboard-wb-pause') || '1');
+        const paused = btn.attr('data-paused') === '1';
+        const nextPaused = !paused;
+        const formData = new FormData();
+        formData.append('save_wb_manual_pause_ajax', '1');
+        formData.append('wb_id', wbIdx);
+        formData.append('manual_pause', nextPaused ? '1' : '0');
+        formData.append('csrf_token', String(window.E3DC_CSRF_TOKEN || ''));
+        setDashboardWallboxPauseButton(wbIdx, nextPaused, true);
+        fetch('Wallbox.php', {
+            method: 'POST',
+            headers: {
+                'X-Requested-With': 'XMLHttpRequest',
+                'X-CSRF-Token': String(window.E3DC_CSRF_TOKEN || '')
+            },
+            body: formData
+        })
+            .then(res => {
+                return res.json().catch(() => null).then(payload => {
+                    if (!res.ok || !payload || payload.ok !== true) {
+                        throw new Error(payload && payload.message ? String(payload.message) : ('HTTP ' + res.status));
+                    }
+                    return payload;
+                });
+            })
+            .then(payload => {
+                setDashboardWallboxPauseButton(wbIdx, !!payload.manual_pause, false);
+            })
+            .catch(() => {
+                setDashboardWallboxPauseButton(wbIdx, paused, false);
+                alert('Fehler beim Speichern der Wallbox-Pause!');
+            });
+    });
+}
+
+function triggerWallboxForceStart(wbIdx) {
+    wbIdx = String(wbIdx || '1');
+    const btn = $(`[data-dashboard-wb-force-start="${wbIdx}"]`);
+    const icon = btn.find('i');
+    icon.attr('class', 'fas fa-spinner fa-spin');
+    btn.prop('disabled', true);
+    const formData = new FormData();
+    formData.append('trigger_wb_force_start_ajax', '1');
+    formData.append('wb_id', wbIdx);
+    formData.append('csrf_token', String(window.E3DC_CSRF_TOKEN || ''));
+    fetch('Wallbox.php', {
+        method: 'POST',
+        headers: {
+            'X-Requested-With': 'XMLHttpRequest',
+            'X-CSRF-Token': String(window.E3DC_CSRF_TOKEN || '')
+        },
+        body: formData
+    })
+        .then(res => {
+            if (!res.ok) throw new Error('Network error');
+            return res.json();
+        })
+        .then(payload => {
+            if (!payload || payload.ok !== true) {
+                throw new Error((payload && (payload.message || payload.error)) || 'Wallbox-Sofortstart wurde abgelehnt.');
+            }
+            icon.attr('class', 'fas fa-check text-success');
+            setTimeout(() => {
+                icon.attr('class', 'fas fa-play');
+                btn.prop('disabled', false);
+            }, 2500);
+        })
+        .catch(err => {
+            icon.attr('class', 'fas fa-exclamation-triangle text-danger');
+            alert(err && err.message ? err.message : 'Wallbox-Sofortstart ist fehlgeschlagen.');
+            setTimeout(() => {
+                icon.attr('class', 'fas fa-play');
+                btn.prop('disabled', false);
+            }, 3000);
+        });
+}
+
+window.triggerWallboxForceStart = triggerWallboxForceStart;
+if (typeof $ === 'function') bindDashboardWallboxPauseButtons();
+
 function processLiveData(data) {
     if (!data) return;
     const wb1Configured = wallboxConfiguredFlag(data, 1);
@@ -9550,93 +9748,6 @@ function processLiveData(data) {
             if (data.bat1_v && data.bat1_v > 0) batDet += ` | K2: ${data.bat1_v}V | ${data.bat1_a}A`;
             $('#bat-details').html(batDet).show();
         } else { $('#bat-details').hide(); }
-
-        const setDashboardWallboxPauseButton = (wbIdx, paused, pending = false) => {
-            const btn = $(`[data-dashboard-wb-pause="${wbIdx}"]`);
-            if (!btn.length) return;
-            btn.attr('data-paused', paused ? '1' : '0')
-                .toggleClass('btn-warning', paused)
-                .toggleClass('btn-outline-secondary', !paused)
-                .prop('disabled', pending)
-                .attr('title', paused ? 'Automatik fortsetzen' : 'Wallbox manuell pausieren')
-                .attr('aria-label', `Wallbox ${wbIdx} ${paused ? 'fortsetzen' : 'pausieren'}`);
-            const icon = btn.find('i');
-            icon.attr('class', `fas ${pending ? 'fa-spinner fa-spin' : (paused ? 'fa-play' : 'fa-pause')}`);
-        };
-
-        const bindDashboardWallboxPauseButtons = () => {
-            $('[data-dashboard-wb-pause]').off('click.wbpause').on('click.wbpause', function(e) {
-                e.preventDefault();
-                e.stopPropagation();
-                const btn = $(this);
-                const wbIdx = String(btn.data('dashboard-wb-pause') || '1');
-                const paused = btn.attr('data-paused') === '1';
-                const nextPaused = !paused;
-                const formData = new FormData();
-                formData.append('save_wb_manual_pause_ajax', '1');
-                formData.append('wb_id', wbIdx);
-                formData.append('manual_pause', nextPaused ? '1' : '0');
-                formData.append('csrf_token', String(window.E3DC_CSRF_TOKEN || ''));
-                setDashboardWallboxPauseButton(wbIdx, nextPaused, true);
-                fetch('Wallbox.php', {
-                    method: 'POST',
-                    headers: {
-                        'X-Requested-With': 'XMLHttpRequest',
-                        'X-CSRF-Token': String(window.E3DC_CSRF_TOKEN || '')
-                    },
-                    body: formData
-                })
-                    .then(res => {
-                        if (!res.ok) throw new Error('Network error');
-                        return res.json();
-                    })
-                    .then(payload => {
-                        setDashboardWallboxPauseButton(wbIdx, !!payload.manual_pause, false);
-                    })
-                    .catch(() => {
-                        setDashboardWallboxPauseButton(wbIdx, paused, false);
-                        alert('Fehler beim Speichern der Wallbox-Pause!');
-                    });
-            });
-        };
-
-        window.triggerWallboxForceStart = function(wbIdx) {
-            wbIdx = String(wbIdx || '1');
-            const btn = $(`[data-dashboard-wb-force-start="${wbIdx}"]`);
-            const icon = btn.find('i');
-            icon.attr('class', 'fas fa-spinner fa-spin');
-            btn.prop('disabled', true);
-            const formData = new FormData();
-            formData.append('trigger_wb_force_start_ajax', '1');
-            formData.append('wb_id', wbIdx);
-            formData.append('csrf_token', String(window.E3DC_CSRF_TOKEN || ''));
-            fetch('Wallbox.php', {
-                method: 'POST',
-                headers: {
-                    'X-Requested-With': 'XMLHttpRequest',
-                    'X-CSRF-Token': String(window.E3DC_CSRF_TOKEN || '')
-                },
-                body: formData
-            })
-                .then(res => {
-                    if (!res.ok) throw new Error('Network error');
-                    return res.json();
-                })
-                .then(payload => {
-                    icon.attr('class', 'fas fa-check text-success');
-                    setTimeout(() => {
-                        icon.attr('class', 'fas fa-play');
-                        btn.prop('disabled', false);
-                    }, 2500);
-                })
-                .catch(err => {
-                    icon.attr('class', 'fas fa-exclamation-triangle text-danger');
-                    setTimeout(() => {
-                        icon.attr('class', 'fas fa-play');
-                        btn.prop('disabled', false);
-                    }, 3000);
-                });
-        };
 
         const updateSingleWallboxUI = (id, power, locked, mode, p1, p2, p3, session, apparentKva, powerFactor, setAmp, capAmp, statusAmp, offeredCurrentRaw, currentStepAmp, fractionalCurrentSupported, peaks, carName) => {
             const valWb = Math.abs(parseFloat(power) || 0);

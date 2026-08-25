@@ -1,3 +1,113 @@
+# E3DC-Control v5.4.4d
+
+Veröffentlichungsdatum: 2026-08-25.
+
+E3DC-Control 5.4.4d führt den Git-unabhängigen Updateweg zu Ende, bestätigt
+schreibende Webaktionen zuverlässig und ergänzt eine statische, phasenbezogene
+Hausanschlussgrenze für die gemeinsame Wallbox-Steuerung.
+
+## Update, Backup und Rechte mit kurzer Unterbrechung
+
+- Der heruntergeladene Ziel-Updater erstellt bei laufenden Diensten das
+  Vollbackup. Erst für die Nachsicherung veränderlicher Daten und die
+  Projektion des veröffentlichten Releasezustands werden die betroffenen
+  Dienste kurz gestoppt; anschließend werden bekannte Rechte repariert und die
+  benötigten Dienste neu gestartet.
+- Das Nutzer-`.git`, lokale Produktänderungen, fehlende Produktdateien und
+  historische Rechte entscheiden nicht über die Annahme des Updates. Der
+  veröffentlichte Zielstand bestimmt, was gesichert und projiziert wird.
+- Installierte Web-Launcher aus 5.4.4a, 5.4.4b und 5.4.4c dürfen ihren bereits
+  commitgebundenen, root-privaten Einzel-Bootstrap weiterreichen, auch wenn
+  ihnen spätere Übergabeparameter fehlen. Der aktuelle Bootstrap lädt daraus
+  den vollständigen Releasebaum selbst und bestätigt Tag und Commit erneut.
+- Die neue Ziel-Pythonumgebung sowie ausgewählte optionale Abhängigkeiten
+  werden vor dem Dienststopp vorbereitet. Das vorhandene `venv` bleibt
+  unverändert; fremde System-Python-Konflikte werden nicht zum Updateveto.
+- Platzmangel (`ENOSPC`), ein schreibgeschütztes Dateisystem (`EROFS`),
+  fehlende Rechte (`EACCES`) oder mehrere gleichrangige Installationen enden
+  mit einer konkreten Prüf- und Fortsetzungsanweisung. Bei mehreren Instanzen
+  wird keine geraten.
+- Die Rechte-Reparatur in der Weboberfläche startet denselben root-eigenen
+  Backup-/Updateauftrag; sie meldet erst nach dessen bestätigtem Ergebnis
+  Erfolg. Private Datenverzeichnisse verwenden den sicheren Modus `02770`,
+  der ausdrücklich gewählte Kompatibilitätsmodus `02775` bleibt unterstützt.
+- Startet ein zuvor aktiver, an die Installation gebundener Zusatzdienst nach
+  dem bestätigten Wechsel nicht wieder, bleibt 5.4.4d installiert. Der Auftrag
+  endet aber nicht grün, sondern nennt den Dienst und den passenden
+  `journalctl`-Befehl.
+
+## Verlässliche WebUI-Aktionen
+
+- Alle sichtbaren zustandsändernden Buttons und Aktionen verlangen
+  Anmeldung und CSRF-Schutz. Erfolg setzt einen passenden HTTP-Status, eine
+  gültige Antwort und die Auswertung möglicher Teilfehler voraus; ein Fehler
+  wird nicht durch einen blinden Reload als Erfolg verdeckt.
+- Konfigurationsaktionen einschließlich Hauptspeichern, Import, Rückfall,
+  Schnellschalter, Energiefluss und Wallbox-/Fahrzeugwerten verwenden einen
+  gemeinsamen bestätigten Backup-, atomaren Schreib-, Readback- und
+  Cachevertrag. Ein nicht bestätigter Schritt kann keinen grünen Erfolg
+  erzeugen.
+- Die erweiterte Wallbox-Ansicht enthält wieder genau eine korrekt geschlossene
+  Fahrzeugzuordnung. Der in 5.4.4c verschachtelte Profilbereich kollabiert
+  dadurch nicht mehr in eine schmale Spalte.
+- Diese Prüfung bestätigt den Softwarevertrag der Webaktionen. Sie behauptet
+  nicht, dass im Feld jeder damit erreichbare physische Aktor betätigt wurde.
+
+## HA und Bluelink
+
+- Ein HA-Prozess übernimmt eine bestehende Lease nur bei exakt passender
+  Knotenrolle und Peer-Bindung. Abweichende oder mehrdeutige Kontexte bleiben
+  gesperrt.
+- Bluelink wertet ausdrücklich vorhandene aktuelle Konfigurationsfelder zuerst
+  aus. Ein bewusst leerer oberster Token wird nicht durch einen älteren
+  Fallback überschrieben; nur wirklich fehlende Felder dürfen zurückfallen.
+  Ein fehlender Token wird einmalig als ruhiger Informationszustand gemeldet.
+
+## Wallbox: gemeinsame statische Hausgrenze
+
+- `grid_max_amps` und `grid_wallbox_reserve_amps` begrenzen das gemeinsame
+  Wallboxziel in allen von E3DC-Control geführten Lademodi. Optional
+  konfigurierte Werte je Phase werden phasenbezogen berücksichtigt; bei
+  unbekannter Zuordnung gilt der ungünstigste Fall.
+- Fehlt `grid_max_amps` oder ist der Eintrag leer, gelten konservativ 35 A je
+  Phase. Ein ausdrücklich ungültiger Wert sperrt die aktive Regelung mit einer
+  Korrekturanweisung und wird nicht still auf einen größeren Wert gesetzt.
+- Mehrere Wallboxen teilen den Phasenrahmen als Vektor statt durch eine
+  pauschale Gleichteilung. Bei 40 A verfügbarem Rahmen erhalten eine
+  16-A- und eine 32-A-Wallbox beispielsweise 16 A und 24 A; eine allein aktive
+  Wallbox kann bis an ihre eigene Grenze geführt werden.
+- In `Aus / autonom` sendet E3DC-Control nach der einmaligen Übergabe keine
+  Strombefehle mehr. Deshalb muss die statische Hausanschlussgrenze zusätzlich
+  in der Wallbox beziehungsweise im Lade- oder Fahrzeugprofil abgesichert sein.
+- Die Reserve ist der konfigurierte Abstand für andere Hausverbraucher. Eine
+  dynamische Subtraktion ihrer tatsächlichen Ströme wird nicht behauptet:
+  Solange keine echte PCC-Phasen-RMS-Messung vorliegt, ist eine aus Wirkleistung
+  durch `P/230` abgeleitete Stromangabe ausschließlich Diagnose und keine
+  Autorisierung zusätzlicher Ladeleistung.
+
+## Wallbox: Fahrzeugphasen, Startbudget und Mindest-SoC
+
+- Ein ausdrücklich zugeordnetes einphasiges Fahrzeugprofil wie der Honda e
+  bindet die wirksame Last auf eine Phase, auch wenn die E3/DC-Wallbox selbst
+  fest dreiphasig angeschlossen ist. Damit entsprechen 1.380 W exakt 6 A.
+  Ohne gebundenes Fahrzeugprofil bleibt eine feste dreiphasige Wallbox
+  konservativ dreiphasig; Zielwerte oder aus Leistung errechnete Ströme sind
+  kein Fahrzeugbeweis.
+- Wird `wbminsoc` während einer laufenden Ladung über den aktuellen Speicher-SoC
+  angehoben, wird die Batterieunterstützung im selben Regelzyklus entzogen.
+  Echter PV-Überschuss darf die Ladung weitertragen oder absenken. Reicht er
+  nicht für den phasenabhängigen Mindeststrom, folgt ein Stop; ein alter Hold
+  kann diese Grenze nicht umgehen.
+- Das autorisierte Wattbudget ist die einzige Leistungsquelle des gemeinsamen
+  Allocators. Preisfenster, Grundladung, Priorität und Phasenrahmen dürfen nur
+  Reihenfolge und Obergrenzen beeinflussen; bei 0 W bleiben auch Mindest- und
+  Sofortlademodi bei 0 A.
+- Ein Start-Hold ist nur gültig, wenn der gesamte Fehlbetrag zur Mindestleistung
+  durch verringerte Speicherladung oder eine ausdrückliche Batterie-Freigabe
+  finanziert ist. Eine Teilfinanzierung erzeugt keine Startleistung.
+
+---
+
 # E3DC-Control v5.4.4c
 
 E3DC-Control 5.4.4c korrigiert ausschließlich den Update- und Reparaturpfad

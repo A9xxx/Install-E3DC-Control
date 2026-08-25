@@ -316,13 +316,32 @@ if ($isServiceMutation) {
         $kill_pattern = $docker_service_map[$service][4] ?? explode(' ', $script)[0];
         $py       = "/opt/venv/bin/python3";
 
+        $pgrep = is_executable('/usr/bin/pgrep') ? '/usr/bin/pgrep' : '/bin/pgrep';
+        $pkill = is_executable('/usr/bin/pkill') ? '/usr/bin/pkill' : '/bin/pkill';
+        $alive_file = $docker_alive_files[$service][0] ?? null;
+        $alive_age = $docker_alive_files[$service][1] ?? 120;
+        $alive_before_mtime = $alive_file && is_file($alive_file) ? (int)@filemtime($alive_file) : 0;
+        $before_probe = is_executable($pgrep)
+            ? e3dcRunArgvProcess([$pgrep, '-f', $kill_pattern], 5.0, ['max_output_bytes' => 8192])
+            : ['success' => false, 'stdout' => ''];
+        $before_pids = preg_split('/\s+/', trim((string)($before_probe['stdout'] ?? '')), -1, PREG_SPLIT_NO_EMPTY) ?: [];
+        sort($before_pids, SORT_STRING);
+        $was_running = !empty($before_probe['success']) && $before_pids !== [];
+
         $out = "";
+        $stop_ok = true;
+        $start_ok = true;
+        $noop = in_array($action, ['start', 'enable'], true) && $was_running;
         if (in_array($action, ['stop', 'restart'])) {
-            $kill_out = shell_exec("pkill -f " . escapeshellarg($kill_pattern) . " 2>&1");
-            $out .= "pkill: " . ($kill_out ?: "OK") . "\n";
+            $stop_result = is_executable($pkill)
+                ? e3dcRunArgvProcess([$pkill, '-f', $kill_pattern], 5.0, ['max_output_bytes' => 8192])
+                : ['exit_code' => 127, 'stderr' => 'pkill fehlt'];
+            $stop_ok = in_array((int)($stop_result['exit_code'] ?? 1), [0, 1], true);
+            $kill_out = trim((string)($stop_result['stdout'] ?? '') . "\n" . (string)($stop_result['stderr'] ?? ''));
+            $out .= "pkill: " . ($kill_out !== '' ? $kill_out : ($stop_ok ? "OK" : "fehlgeschlagen")) . "\n";
             sleep(1);
         }
-        if (in_array($action, ['start', 'restart', 'enable'])) {
+        if (in_array($action, ['start', 'restart', 'enable']) && !$noop && $stop_ok) {
             if ($runner === 'npm') {
                 $start_cmd = "cd " . escapeshellarg($workdir) . " && nohup npm run start"
                            . " >> " . escapeshellarg($logfile) . " 2>&1 &";
@@ -331,29 +350,47 @@ if ($isServiceMutation) {
                            . escapeshellarg($py) . " " . $script
                            . " >> " . escapeshellarg($logfile) . " 2>&1 &";
             }
-            shell_exec($start_cmd);
-            $out .= "Gestartet: $script\n";
+            $start_result = is_executable('/bin/sh')
+                ? e3dcRunArgvProcess(['/bin/sh', '-c', $start_cmd], 5.0, ['max_output_bytes' => 8192])
+                : ['success' => false];
+            $start_ok = !empty($start_result['success']);
+            $out .= ($start_ok ? "Gestartet: " : "Start fehlgeschlagen: ") . "$script\n";
+        } elseif ($noop) {
+            $out .= "Bereits aktiv; kein zweiter Prozess gestartet.\n";
         }
         if ($action === 'disable') {
-            $kill_out = shell_exec("pkill -f " . escapeshellarg($kill_pattern) . " 2>&1");
-            $out .= "Gestoppt: " . ($kill_out ?: "OK") . "\n";
+            $stop_result = is_executable($pkill)
+                ? e3dcRunArgvProcess([$pkill, '-f', $kill_pattern], 5.0, ['max_output_bytes' => 8192])
+                : ['exit_code' => 127, 'stderr' => 'pkill fehlt'];
+            $stop_ok = in_array((int)($stop_result['exit_code'] ?? 1), [0, 1], true);
+            $kill_out = trim((string)($stop_result['stdout'] ?? '') . "\n" . (string)($stop_result['stderr'] ?? ''));
+            $out .= "Gestoppt: " . ($kill_out !== '' ? $kill_out : ($stop_ok ? "OK" : "fehlgeschlagen")) . "\n";
         }
 
         // Kurz warten, dann Prozess-/Alive-Check
         sleep(2);
-        $alive_file = $docker_alive_files[$service][0] ?? null;
-        $alive_age  = $docker_alive_files[$service][1] ?? 120;
-        $alive_fresh = $alive_file && file_exists($alive_file) && (time() - filemtime($alive_file)) < $alive_age;
-        $pgrep_output = trim((string)shell_exec("pgrep -f " . escapeshellarg($kill_pattern) . " 2>/dev/null"));
-        $process_running = ($pgrep_output !== '');
+        $alive_after_mtime = $alive_file && is_file($alive_file) ? (int)@filemtime($alive_file) : 0;
+        $alive_fresh = $alive_after_mtime > 0 && (time() - $alive_after_mtime) < $alive_age;
+        $alive_advanced = $alive_fresh && $alive_after_mtime > $alive_before_mtime;
+        $after_probe = is_executable($pgrep)
+            ? e3dcRunArgvProcess([$pgrep, '-f', $kill_pattern], 5.0, ['max_output_bytes' => 8192])
+            : ['success' => false, 'stdout' => ''];
+        $after_pids = preg_split('/\s+/', trim((string)($after_probe['stdout'] ?? '')), -1, PREG_SPLIT_NO_EMPTY) ?: [];
+        sort($after_pids, SORT_STRING);
+        $process_running = !empty($after_probe['success']) && $after_pids !== [];
+        $process_replaced = $process_running && $after_pids !== $before_pids;
         $is_active = $process_running || $alive_fresh;
         $action_success = true;
-        if (in_array($action, ['start', 'restart', 'enable'], true)) {
-            $action_success = $is_active;
+        if ($action === 'restart') {
+            $action_success = $stop_ok && $start_ok && ($process_replaced || $alive_advanced);
+        } elseif (in_array($action, ['start', 'enable'], true)) {
+            $action_success = $noop || ($start_ok && ($process_running || $alive_advanced));
         } elseif (in_array($action, ['stop', 'disable'], true)) {
-            $action_success = !$process_running;
+            $action_success = $stop_ok && !$process_running;
             $is_active = $process_running ? true : false;
         }
+
+        if (!$action_success) http_response_code(500);
 
         echo json_encode([
             "success" => $action_success,
@@ -361,6 +398,7 @@ if ($isServiceMutation) {
             "status"  => $is_active ? "active (docker)" : "inactive (docker)",
             "enabled" => $is_active,
             "is_docker" => true,
+            "noop" => $noop,
             "message" => $action_success
                 ? "Docker-Dienstaktion abgeschlossen."
                 : "Docker-Dienstaktion wurde ausgeführt, aber der erwartete Zielzustand wurde nicht erreicht.",

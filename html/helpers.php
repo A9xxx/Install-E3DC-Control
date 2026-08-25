@@ -422,10 +422,25 @@ function handleDiagnoseAck() {
         foreach ($logFiles as $key => $file) {
             if (file_exists($file)) $ackState['sizes'][$key] = filesize($file);
         }
-        file_put_contents('/var/www/html/ramdisk/diagnose_ack.json', json_encode($ackState));
-        @chmod('/var/www/html/ramdisk/diagnose_ack.json', 0664);
+        $encoded = json_encode($ackState, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        $published = is_string($encoded)
+            ? e3dcPublishRuntimeCommandFile(
+                '/var/www/html/ramdisk/diagnose_ack.json',
+                $encoded . "\n",
+                0664,
+                '.diagnose_ack.'
+            )
+            : ['success' => false, 'message' => 'Die Diagnose-Quittierung konnte nicht kodiert werden.'];
         header('Content-Type: application/json');
-        echo json_encode(['success' => true]);
+        if (empty($published['success'])) {
+            http_response_code(500);
+            echo json_encode([
+                'success' => false,
+                'message' => (string)($published['message'] ?? 'Die Diagnose-Quittierung konnte nicht gespeichert werden.'),
+            ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+            exit;
+        }
+        echo json_encode(['success' => true, 'message' => 'Diagnosemeldungen wurden quittiert.']);
         exit;
     }
 }
@@ -454,29 +469,256 @@ function handleHAManagerLog() {
 /**
  * Setzt das Flag für einen Force-Refresh des Auto-SoC
  */
+function e3dcBluelinkRefreshTokenConfigured($v4Path = '/var/www/html/data/e3dc_v4.json', $txtPath = null) {
+    $topLevelBound = false;
+    $token = '';
+    $v4Raw = e3dcReadRegularFileBound((string)$v4Path, 1048576);
+    $v4 = is_string($v4Raw) ? @json_decode($v4Raw, true) : null;
+    if (is_array($v4)) {
+        if (array_key_exists('bluelink_refresh_token', $v4)) {
+            $topLevelBound = true;
+            $value = $v4['bluelink_refresh_token'];
+            $token = (is_scalar($value) || $value === null) ? trim((string)$value) : '';
+        } elseif (isset($v4['config']) && is_array($v4['config'])
+            && array_key_exists('bluelink_refresh_token', $v4['config'])) {
+            $value = $v4['config']['bluelink_refresh_token'];
+            if (is_scalar($value) || $value === null) {
+                $token = trim((string)$value);
+            }
+        }
+    }
+    if ($topLevelBound || $token !== '') {
+        return $token !== '';
+    }
+
+    if ($txtPath === null) {
+        $paths = getInstallPaths();
+        $txtPath = !empty($paths['valid'])
+            ? rtrim((string)$paths['install_path'], '/') . '/e3dc.config.txt'
+            : '';
+    }
+    if (!is_string($txtPath) || $txtPath === '') return false;
+    $txtRaw = e3dcReadRegularFileBound($txtPath, 1048576);
+    if (!is_string($txtRaw)) return false;
+    foreach (preg_split('/\R/', $txtRaw) ?: [] as $line) {
+        $trimmed = trim((string)$line);
+        if ($trimmed === '' || str_starts_with($trimmed, '#') || strpos($line, '=') === false) continue;
+        [$key, $value] = array_map('trim', explode('=', $line, 2));
+        if (strtolower($key) === 'bluelink_refresh_token' && $value !== '') {
+            return true;
+        }
+    }
+    return false;
+}
+
+function e3dcPublishRuntimeCommandFile($targetFile, $payload, $mode = 0664, $temporaryPrefix = '.e3dc_runtime.') {
+    $targetFile = (string)$targetFile;
+    $payload = (string)$payload;
+    $mode = (int)$mode & 0777;
+    $temporaryPrefix = preg_replace('/[^a-z0-9_.-]/i', '', (string)$temporaryPrefix);
+    if ($targetFile === '' || $payload === '' || strlen($payload) > 1048576) {
+        return ['success' => false, 'message' => 'Die Laufzeit-Anforderung besitzt keinen zulässigen Inhalt.'];
+    }
+    if (!in_array($mode, [0660, 0664], true) || $temporaryPrefix === '') {
+        return ['success' => false, 'message' => 'Die Laufzeit-Anforderung besitzt keinen zulässigen Dateivertrag.'];
+    }
+
+    $targetDir = dirname($targetFile);
+    $dirBefore = @lstat($targetDir);
+    if (!is_array($dirBefore)
+        || (((int)($dirBefore['mode'] ?? 0)) & 0170000) !== 0040000
+        || is_link($targetDir)) {
+        return ['success' => false, 'message' => 'Das Laufzeitverzeichnis ist nicht sicher verfügbar.'];
+    }
+    $targetBefore = @lstat($targetFile);
+    if (is_array($targetBefore) && (
+        (((int)($targetBefore['mode'] ?? 0)) & 0170000) !== 0100000
+        || (int)($targetBefore['nlink'] ?? 0) !== 1
+        || is_link($targetFile)
+    )) {
+        return ['success' => false, 'message' => 'Die vorhandene Laufzeit-Anforderung ist keine sichere reguläre Datei.'];
+    }
+
+    try {
+        $suffix = bin2hex(random_bytes(16));
+    } catch (Throwable $error) {
+        return ['success' => false, 'message' => 'Die Laufzeit-Anforderung konnte nicht eindeutig erzeugt werden.'];
+    }
+    $temporary = $targetDir . '/' . $temporaryPrefix . $suffix . '.tmp';
+    $oldUmask = @umask((~$mode) & 0777);
+    $handle = @fopen($temporary, 'x+b');
+    if (is_int($oldUmask)) @umask($oldUmask);
+    if (!is_resource($handle)) {
+        return ['success' => false, 'message' => 'Die Laufzeit-Anforderung konnte nicht exklusiv vorbereitet werden.'];
+    }
+
+    $published = false;
+    try {
+        $written = 0;
+        $payloadLength = strlen($payload);
+        while ($written < $payloadLength) {
+            $count = @fwrite($handle, substr($payload, $written));
+            if ($count === false || $count <= 0) break;
+            $written += $count;
+        }
+        $flushed = $written === $payloadLength && @fflush($handle);
+        if ($flushed && function_exists('fsync')) $flushed = @fsync($handle);
+        $opened = @fstat($handle);
+        $dirAfter = @lstat($targetDir);
+        $targetAfter = @lstat($targetFile);
+        $targetStable = is_array($targetBefore)
+            ? (
+                is_array($targetAfter)
+                && (int)($targetAfter['dev'] ?? -1) === (int)($targetBefore['dev'] ?? -2)
+                && (int)($targetAfter['ino'] ?? -1) === (int)($targetBefore['ino'] ?? -2)
+            )
+            : !is_array($targetAfter);
+        $metadataOk = $flushed
+            && is_array($opened)
+            && ((((int)($opened['mode'] ?? 0)) & 0170000) === 0100000)
+            && (int)($opened['nlink'] ?? 0) === 1
+            && (int)($opened['size'] ?? -1) === $payloadLength
+            && ((((int)($opened['mode'] ?? 0)) & 0777) === $mode)
+            && is_array($dirAfter)
+            && (int)($dirAfter['dev'] ?? -1) === (int)($dirBefore['dev'] ?? -2)
+            && (int)($dirAfter['ino'] ?? -1) === (int)($dirBefore['ino'] ?? -2)
+            && $targetStable;
+        if (!$metadataOk || !@rename($temporary, $targetFile)) {
+            return ['success' => false, 'message' => 'Die Laufzeit-Anforderung konnte nicht atomar veröffentlicht werden.'];
+        }
+        $published = true;
+        // Der atomare Rename ist der Commitpunkt. Ein Verbraucher darf die
+        // vollständig geschriebene Datei unmittelbar danach entfernen.
+        return ['success' => true];
+    } finally {
+        @fclose($handle);
+        if (!$published && (file_exists($temporary) || is_link($temporary))) {
+            @unlink($temporary);
+        }
+    }
+}
+
+function e3dcRemoveRuntimeCommandFile($targetFile) {
+    $targetFile = (string)$targetFile;
+    $before = @lstat($targetFile);
+    if (!is_array($before)) return ['success' => true, 'removed' => false];
+    if (
+        (((int)($before['mode'] ?? 0)) & 0170000) !== 0100000
+        || (int)($before['nlink'] ?? 0) !== 1
+        || is_link($targetFile)
+    ) {
+        return ['success' => false, 'removed' => false, 'message' => 'Die Laufzeit-Anforderung ist keine sichere reguläre Datei.'];
+    }
+    $handle = @fopen($targetFile, 'rb');
+    $opened = is_resource($handle) ? @fstat($handle) : false;
+    if (is_resource($handle)) @fclose($handle);
+    @clearstatcache(true, $targetFile);
+    $named = @lstat($targetFile);
+    $stable = is_array($opened)
+        && is_array($named)
+        && (int)($opened['dev'] ?? -1) === (int)($before['dev'] ?? -2)
+        && (int)($opened['ino'] ?? -1) === (int)($before['ino'] ?? -2)
+        && (int)($named['dev'] ?? -1) === (int)($before['dev'] ?? -2)
+        && (int)($named['ino'] ?? -1) === (int)($before['ino'] ?? -2)
+        && (int)($named['nlink'] ?? 0) === 1;
+    if (!$stable || !@unlink($targetFile)) {
+        return ['success' => false, 'removed' => false, 'message' => 'Die Laufzeit-Anforderung konnte nicht bestätigt entfernt werden.'];
+    }
+    @clearstatcache(true, $targetFile);
+    if (@lstat($targetFile) !== false) {
+        return ['success' => false, 'removed' => false, 'message' => 'Die Laufzeit-Anforderung ist nach dem Entfernen weiterhin vorhanden.'];
+    }
+    return ['success' => true, 'removed' => true];
+}
+
+function e3dcPublishForceBluelinkFlag($flagFile, $requestedAt = null) {
+    $flagFile = (string)$flagFile;
+    $requestedAt = is_int($requestedAt) && $requestedAt > 0 ? $requestedAt : time();
+    $flagDir = dirname($flagFile);
+    $dirBefore = @lstat($flagDir);
+    if (!is_array($dirBefore)
+        || (((int)($dirBefore['mode'] ?? 0)) & 0170000) !== 0040000
+        || is_link($flagDir)) {
+        return ['success' => false, 'message' => 'Die Ramdisk für die Fahrzeug-Anforderung ist nicht sicher verfügbar.'];
+    }
+    try {
+        $suffix = bin2hex(random_bytes(16));
+    } catch (Throwable $error) {
+        return ['success' => false, 'message' => 'Die Fahrzeug-Anforderung konnte nicht eindeutig erzeugt werden.'];
+    }
+    $temporary = $flagDir . '/.force_bluelink.' . $suffix . '.tmp';
+    $oldUmask = umask(0002);
+    $handle = @fopen($temporary, 'x+b');
+    umask($oldUmask);
+    if (!is_resource($handle)) {
+        return ['success' => false, 'message' => 'Die Fahrzeug-Anforderung konnte nicht exklusiv vorbereitet werden.'];
+    }
+
+    $renamed = false;
+    try {
+        $payload = (string)$requestedAt . "\n";
+        $written = 0;
+        while ($written < strlen($payload)) {
+            $count = @fwrite($handle, substr($payload, $written));
+            if ($count === false || $count <= 0) break;
+            $written += $count;
+        }
+        $flushed = $written === strlen($payload) && @fflush($handle);
+        $opened = @fstat($handle);
+        $dirAfter = @lstat($flagDir);
+        $groupInfo = function_exists('posix_getgrnam') ? @posix_getgrnam('www-data') : false;
+        $metadataOk = $flushed
+            && is_array($opened)
+            && ((((int)($opened['mode'] ?? 0)) & 0170000) === 0100000)
+            && (int)($opened['nlink'] ?? 0) === 1
+            && (int)($opened['size'] ?? -1) === strlen($payload)
+            && ((((int)($opened['mode'] ?? 0)) & 0777) === 0664)
+            && (!is_array($groupInfo) || (int)($opened['gid'] ?? -1) === (int)($groupInfo['gid'] ?? -2))
+            && is_array($dirAfter)
+            && (int)($dirAfter['dev'] ?? -1) === (int)($dirBefore['dev'] ?? -2)
+            && (int)($dirAfter['ino'] ?? -1) === (int)($dirBefore['ino'] ?? -2);
+        if (!$metadataOk || !@rename($temporary, $flagFile)) {
+            return [
+                'success' => false,
+                'message' => 'Die Fahrzeug-Anforderung konnte nicht mit den benötigten Ramdisk-Rechten veröffentlicht werden.',
+            ];
+        }
+        $renamed = true;
+        // Der atomare Rename ist der Veröffentlichungspunkt. Der Bluelink-Client
+        // darf die vollständig descriptorbestätigte Datei danach sofort verbrauchen.
+        return ['success' => true, 'requested_at' => $requestedAt];
+    } finally {
+        @fclose($handle);
+        if (!$renamed && (file_exists($temporary) || is_link($temporary))) {
+            @unlink($temporary);
+        }
+    }
+}
+
 function handleForceSocUpdate() {
     if (isset($_GET['action']) && $_GET['action'] === 'force_soc') {
         e3dcRequirePostMutation(true);
         header('Content-Type: application/json');
         $flagFile = '/var/www/html/ramdisk/force_bluelink.flag';
 
-        // Nur aufwecken wenn Bluelink Token konfiguriert ist
-        $conf = loadE3dcConfig();
-        $hasBluelink = !empty($conf['config']['bluelink_refresh_token']);
-        // Auch V4 JSON prüfen (Token könnte dort gespeichert sein)
-        if (!$hasBluelink) {
-            $v4 = @json_decode(@file_get_contents('/var/www/html/data/e3dc_v4.json'), true);
-            $hasBluelink = !empty($v4['bluelink_refresh_token']);
-        }
-
-        if (!$hasBluelink) {
-            echo json_encode(['success' => false, 'message' => 'Kein Bluelink Token konfiguriert']);
+        $fail = static function ($message, $status = 500) {
+            http_response_code((int)$status);
+            echo json_encode(['success' => false, 'message' => (string)$message]);
             exit;
+        };
+
+        if (!e3dcBluelinkRefreshTokenConfigured()) {
+            $fail('Kein Bluelink-Token konfiguriert.', 400);
+        }
+        $flagResult = e3dcPublishForceBluelinkFlag($flagFile);
+        if (empty($flagResult['success'])) {
+            $fail((string)($flagResult['message'] ?? 'Die Fahrzeug-Anforderung konnte nicht bestätigt werden.'));
         }
 
-        @touch($flagFile);
-        @chmod($flagFile, 0666);
-        echo json_encode(['success' => true]);
+        echo json_encode([
+            'success' => true,
+            'message' => 'Fahrzeug-Anforderung wurde sicher angenommen.',
+        ]);
         exit;
     }
 }
@@ -2552,33 +2794,575 @@ function e3dcJsonAtomicFileMode($path, $json) {
     return e3dcConfigSecretFileModeFromData(is_array($decoded) ? $decoded : []);
 }
 
+function e3dcJsonWriteHandleMatchesPath($handle, $path) {
+    if (!is_resource($handle) || is_link($path)) return false;
+    $opened = @fstat($handle);
+    $named = @lstat($path);
+    return is_array($opened)
+        && is_array($named)
+        && ((((int)($opened['mode'] ?? 0)) & 0170000) === 0100000)
+        && ((((int)($named['mode'] ?? 0)) & 0170000) === 0100000)
+        && (int)($opened['nlink'] ?? 0) === 1
+        && (int)($named['nlink'] ?? 0) === 1
+        && (int)($opened['dev'] ?? -1) === (int)($named['dev'] ?? -2)
+        && (int)($opened['ino'] ?? -1) === (int)($named['ino'] ?? -2);
+}
+
+function e3dcWriteLockedStreamFully($handle, $payload) {
+    if (!is_resource($handle) || !is_string($payload) || !@rewind($handle)) return false;
+    $length = strlen($payload);
+    $written = 0;
+    while ($written < $length) {
+        $count = @fwrite($handle, substr($payload, $written));
+        if ($count === false || $count <= 0) return false;
+        $written += $count;
+    }
+    if (!@ftruncate($handle, $length) || !@fflush($handle) || !@rewind($handle)) return false;
+    $confirmed = @stream_get_contents($handle);
+    return is_string($confirmed)
+        && strlen($confirmed) === $length
+        && hash_equals(hash('sha256', $payload), hash('sha256', $confirmed));
+}
+
+function e3dcWebMutationIdentity($options = []) {
+    $testMode = !empty($options['test_mode']);
+    $publisherUid = isset($options['publisher_uid'])
+        ? (int)$options['publisher_uid']
+        : (function_exists('posix_geteuid') ? (int)posix_geteuid() : -1);
+    if ($testMode) {
+        $groupGid = isset($options['group_gid'])
+            ? (int)$options['group_gid']
+            : (function_exists('posix_getegid') ? (int)posix_getegid() : -1);
+        $groupInfo = $groupGid >= 0 && function_exists('posix_getgrgid')
+            ? @posix_getgrgid($groupGid)
+            : false;
+        $groupName = (string)($options['group_name'] ?? (is_array($groupInfo) ? ($groupInfo['name'] ?? '') : ''));
+    } else {
+        $groupName = 'www-data';
+        $groupInfo = function_exists('posix_getgrnam') ? @posix_getgrnam($groupName) : false;
+        $groupGid = is_array($groupInfo) ? (int)($groupInfo['gid'] ?? -1) : -1;
+    }
+    if ($publisherUid < 0 || $groupGid < 0 || $groupName === '') {
+        return ['success' => false, 'status' => 'identity_unavailable'];
+    }
+    return [
+        'success' => true,
+        'publisher_uid' => $publisherUid,
+        'group_gid' => $groupGid,
+        'group_name' => $groupName,
+    ];
+}
+
+function e3dcPublishConfirmedAtomicFile($targetFile, $payload, $mode = 0660, $options = []) {
+    $targetFile = (string)$targetFile;
+    $payload = (string)$payload;
+    $mode = (int)$mode & 0777;
+    $failOperation = (string)($options['fail_operation'] ?? '');
+    $identity = e3dcWebMutationIdentity($options);
+    if (empty($identity['success'])) return $identity;
+    if ($targetFile === '' || $payload === '' || strlen($payload) > 4 * 1024 * 1024) {
+        return ['success' => false, 'status' => 'payload_invalid'];
+    }
+    if (!in_array($mode, [0600, 0640, 0660, 0664], true)) {
+        return ['success' => false, 'status' => 'mode_invalid'];
+    }
+    if (!empty($options['require_json'])) {
+        $decodedPayload = @json_decode($payload, true);
+        if (!is_array($decodedPayload)) return ['success' => false, 'status' => 'json_invalid'];
+    }
+
+    $targetDir = dirname($targetFile);
+    $dirBefore = @lstat($targetDir);
+    if (!is_array($dirBefore)
+        || ((((int)($dirBefore['mode'] ?? 0)) & 0170000) !== 0040000)
+        || is_link($targetDir)) {
+        return ['success' => false, 'status' => 'directory_invalid'];
+    }
+
+    clearstatcache(true, $targetFile);
+    $targetBefore = @lstat($targetFile);
+    $targetRawBefore = null;
+    if (is_array($targetBefore)) {
+        if ((((int)($targetBefore['mode'] ?? 0)) & 0170000) !== 0100000
+            || (int)($targetBefore['nlink'] ?? 0) !== 1
+            || is_link($targetFile)) {
+            return ['success' => false, 'status' => 'target_invalid'];
+        }
+        if (!empty($options['target_must_be_absent'])) {
+            return ['success' => false, 'status' => 'target_exists'];
+        }
+        $targetRawBefore = e3dcReadRegularFileBound($targetFile, 4 * 1024 * 1024);
+        if (!is_string($targetRawBefore)) return ['success' => false, 'status' => 'target_read_failed'];
+        if (array_key_exists('expected_target_raw', $options)
+            && (!is_string($options['expected_target_raw'])
+                || !hash_equals(hash('sha256', $options['expected_target_raw']), hash('sha256', $targetRawBefore)))) {
+            return ['success' => false, 'status' => 'target_drift'];
+        }
+        if (isset($options['expected_existing_mode'])
+            && ((((int)($targetBefore['mode'] ?? 0)) & 0777) !== (((int)$options['expected_existing_mode']) & 0777))) {
+            return ['success' => false, 'status' => 'target_metadata_invalid'];
+        }
+        if (isset($options['expected_existing_gid'])
+            && (int)($targetBefore['gid'] ?? -1) !== (int)$options['expected_existing_gid']) {
+            return ['success' => false, 'status' => 'target_metadata_invalid'];
+        }
+        if (isset($options['allowed_existing_uids'])) {
+            $allowed = array_map('intval', (array)$options['allowed_existing_uids']);
+            if (!in_array((int)($targetBefore['uid'] ?? -1), $allowed, true)) {
+                return ['success' => false, 'status' => 'target_metadata_invalid'];
+            }
+        }
+    } elseif (array_key_exists('expected_target_raw', $options) && is_string($options['expected_target_raw'])) {
+        return ['success' => false, 'status' => 'target_missing'];
+    }
+
+    try {
+        $suffix = bin2hex(random_bytes(16));
+    } catch (Throwable $error) {
+        return ['success' => false, 'status' => 'temp_name_failed'];
+    }
+    $prefix = preg_replace('/[^a-z0-9_.-]/i', '', (string)($options['temporary_prefix'] ?? '.e3dc_confirmed.'));
+    if ($prefix === '') return ['success' => false, 'status' => 'temp_name_failed'];
+    $temporary = $targetDir . '/' . $prefix . $suffix . '.tmp';
+    if ($failOperation === 'temp_create') return ['success' => false, 'status' => 'temp_create_failed'];
+    $oldUmask = @umask((~$mode) & 0777);
+    $handle = @fopen($temporary, 'x+b');
+    if (is_int($oldUmask)) @umask($oldUmask);
+    if (!is_resource($handle)) return ['success' => false, 'status' => 'temp_create_failed'];
+
+    $published = false;
+    try {
+        $groupOk = $failOperation !== 'chgrp' && @chgrp($temporary, (int)$identity['group_gid']);
+        $modeOk = $failOperation !== 'chmod' && @chmod($temporary, $mode);
+        if (!$groupOk || !$modeOk) return ['success' => false, 'status' => 'temp_metadata_failed'];
+
+        $written = 0;
+        $length = strlen($payload);
+        while ($failOperation !== 'write' && $written < $length) {
+            $count = @fwrite($handle, substr($payload, $written));
+            if ($count === false || $count <= 0) break;
+            $written += $count;
+        }
+        if ($written !== $length) return ['success' => false, 'status' => 'write_failed'];
+        if ($failOperation === 'flush' || !@fflush($handle)) {
+            return ['success' => false, 'status' => 'flush_failed'];
+        }
+        if ($failOperation === 'fsync' || (function_exists('fsync') && !@fsync($handle))) {
+            return ['success' => false, 'status' => 'fsync_failed'];
+        }
+        if (!@rewind($handle)) return ['success' => false, 'status' => 'readback_failed'];
+        $preparedReadback = @stream_get_contents($handle);
+        clearstatcache(true, $temporary);
+        $opened = @fstat($handle);
+        $named = @lstat($temporary);
+        $dirAfterPrepare = @lstat($targetDir);
+        $preparedOk = $failOperation !== 'metadata'
+            && $failOperation !== 'readback'
+            && is_string($preparedReadback)
+            && hash_equals(hash('sha256', $payload), hash('sha256', $preparedReadback))
+            && is_array($opened)
+            && is_array($named)
+            && ((((int)($opened['mode'] ?? 0)) & 0170000) === 0100000)
+            && (int)($opened['nlink'] ?? 0) === 1
+            && (int)($named['nlink'] ?? 0) === 1
+            && (int)($opened['dev'] ?? -1) === (int)($named['dev'] ?? -2)
+            && (int)($opened['ino'] ?? -1) === (int)($named['ino'] ?? -2)
+            && (int)($opened['uid'] ?? -1) === (int)$identity['publisher_uid']
+            && (int)($opened['gid'] ?? -1) === (int)$identity['group_gid']
+            && ((((int)($opened['mode'] ?? 0)) & 0777) === $mode)
+            && (int)($opened['size'] ?? -1) === $length
+            && is_array($dirAfterPrepare)
+            && (int)($dirAfterPrepare['dev'] ?? -1) === (int)($dirBefore['dev'] ?? -2)
+            && (int)($dirAfterPrepare['ino'] ?? -1) === (int)($dirBefore['ino'] ?? -2);
+        if (!$preparedOk) return ['success' => false, 'status' => 'prepared_unconfirmed'];
+
+        clearstatcache(true, $targetFile);
+        $targetNow = @lstat($targetFile);
+        if (is_array($targetBefore)) {
+            $targetStillBound = is_array($targetNow)
+                && (int)($targetNow['dev'] ?? -1) === (int)($targetBefore['dev'] ?? -2)
+                && (int)($targetNow['ino'] ?? -1) === (int)($targetBefore['ino'] ?? -2)
+                && (int)($targetNow['nlink'] ?? 0) === 1;
+            $targetRawNow = $targetStillBound
+                ? e3dcReadRegularFileBound($targetFile, 4 * 1024 * 1024)
+                : null;
+            $targetStillBound = $targetStillBound
+                && is_string($targetRawNow)
+                && is_string($targetRawBefore)
+                && hash_equals(hash('sha256', $targetRawBefore), hash('sha256', $targetRawNow));
+        } else {
+            $targetStillBound = !is_array($targetNow);
+        }
+        if (!$targetStillBound) return ['success' => false, 'status' => 'target_drift'];
+
+        $cacheFile = (string)($options['cache_file'] ?? '');
+        if ($cacheFile !== '') {
+            if ($failOperation === 'pre_cache' || !e3dcRemoveConfigCacheFailClosed($cacheFile)) {
+                return ['success' => false, 'status' => 'cache_invalidation_failed'];
+            }
+        }
+        if ($failOperation === 'rename' || !@rename($temporary, $targetFile)) {
+            return ['success' => false, 'status' => 'rename_failed'];
+        }
+        $published = true;
+
+        clearstatcache(true, $targetFile);
+        $finalNamed = @lstat($targetFile);
+        $finalOpened = @fstat($handle);
+        $finalReadback = @rewind($handle) ? @stream_get_contents($handle) : false;
+        $boundReadback = e3dcReadRegularFileBound($targetFile, 4 * 1024 * 1024);
+        $finalOk = $failOperation !== 'final_readback'
+            && is_array($finalNamed)
+            && is_array($finalOpened)
+            && ((((int)($finalNamed['mode'] ?? 0)) & 0170000) === 0100000)
+            && (int)($finalNamed['nlink'] ?? 0) === 1
+            && (int)($finalOpened['dev'] ?? -1) === (int)($finalNamed['dev'] ?? -2)
+            && (int)($finalOpened['ino'] ?? -1) === (int)($finalNamed['ino'] ?? -2)
+            && (int)($finalNamed['uid'] ?? -1) === (int)$identity['publisher_uid']
+            && (int)($finalNamed['gid'] ?? -1) === (int)$identity['group_gid']
+            && ((((int)($finalNamed['mode'] ?? 0)) & 0777) === $mode)
+            && is_string($finalReadback)
+            && is_string($boundReadback)
+            && hash_equals(hash('sha256', $payload), hash('sha256', $finalReadback))
+            && hash_equals(hash('sha256', $payload), hash('sha256', $boundReadback));
+        if (!$finalOk) {
+            return ['success' => false, 'published' => true, 'status' => 'published_unconfirmed'];
+        }
+        if (!empty($options['require_json']) && !is_array(@json_decode($boundReadback, true))) {
+            return ['success' => false, 'published' => true, 'status' => 'published_json_invalid'];
+        }
+
+        if (isset($options['after_commit_hook']) && is_callable($options['after_commit_hook'])) {
+            ($options['after_commit_hook'])($targetFile, $cacheFile);
+        }
+        if ($cacheFile !== ''
+            && ($failOperation === 'post_cache' || !e3dcRemoveConfigCacheFailClosed($cacheFile))) {
+            $rollbackRaw = $options['expected_target_raw'] ?? null;
+            $rolledBack = false;
+            $cacheRecovered = false;
+            if (is_string($rollbackRaw)) {
+                $rollbackOptions = $options;
+                $rollbackOptions['expected_target_raw'] = $payload;
+                $rollbackOptions['expected_existing_mode'] = $mode;
+                $rollbackOptions['expected_existing_gid'] = (int)$identity['group_gid'];
+                $rollbackOptions['allowed_existing_uids'] = [(int)$identity['publisher_uid']];
+                $rollbackOptions['fail_operation'] = '';
+                $rollbackOptions['cache_file'] = '';
+                unset(
+                    $rollbackOptions['after_commit_hook'],
+                    $rollbackOptions['target_must_be_absent']
+                );
+                $rollback = e3dcPublishConfirmedAtomicFile(
+                    $targetFile,
+                    $rollbackRaw,
+                    $mode,
+                    $rollbackOptions
+                );
+                $rolledBack = !empty($rollback['success']);
+                $cacheRecovered = $rolledBack && e3dcRemoveConfigCacheFailClosed($cacheFile);
+            }
+            return [
+                'success' => false,
+                'published' => !$rolledBack,
+                'rolled_back' => $rolledBack,
+                'state_unknown' => !$rolledBack || !$cacheRecovered,
+                'status' => $rolledBack && $cacheRecovered
+                    ? 'post_commit_cache_failed_rolled_back'
+                    : 'post_commit_cache_failed_state_unknown',
+            ];
+        }
+        return [
+            'success' => true,
+            'published' => true,
+            'status' => 'ok',
+            'path' => $targetFile,
+            'sha256' => hash('sha256', $payload),
+            'readback' => $boundReadback,
+        ];
+    } finally {
+        @fclose($handle);
+        if (!$published && (file_exists($temporary) || is_link($temporary))) @unlink($temporary);
+    }
+}
+
+function e3dcCreateConfirmedV4Backup($v4Path, $suffix = '', $options = []) {
+    $v4Path = (string)$v4Path;
+    $preimage = e3dcReadRegularFileBound($v4Path, 4 * 1024 * 1024);
+    if (!is_string($preimage) || !is_array(@json_decode($preimage, true))) {
+        return ['success' => false, 'status' => 'backup_source_invalid'];
+    }
+    if (array_key_exists('expected_preimage', $options)
+        && (!is_string($options['expected_preimage'])
+            || !hash_equals(hash('sha256', $options['expected_preimage']), hash('sha256', $preimage)))) {
+        return ['success' => false, 'status' => 'backup_source_drift'];
+    }
+    $configData = @json_decode($preimage, true);
+    $identity = e3dcWebMutationIdentity($options);
+    if (empty($identity['success'])) return $identity;
+    $dirMode = e3dcConfigSecretDirModeFromData($configData);
+    $fileMode = e3dcConfigSecretFileModeFromData($configData);
+    $backupDir = (string)($options['backup_dir'] ?? (dirname($v4Path) . '/config_backups'));
+    $failOperation = (string)($options['fail_operation'] ?? '');
+    if (!is_dir($backupDir)) {
+        if ($failOperation === 'backup_dir'
+            || is_link($backupDir)
+            || !@mkdir($backupDir, $dirMode, true)) {
+            return ['success' => false, 'status' => 'backup_directory_failed'];
+        }
+    }
+    clearstatcache(true, $backupDir);
+    $dirBefore = @lstat($backupDir);
+    if (!is_array($dirBefore)
+        || ((((int)($dirBefore['mode'] ?? 0)) & 0170000) !== 0040000)
+        || is_link($backupDir)) {
+        return ['success' => false, 'status' => 'backup_directory_invalid'];
+    }
+    if ((int)($dirBefore['uid'] ?? -1) === (int)$identity['publisher_uid']) {
+        @chgrp($backupDir, (int)$identity['group_gid']);
+        @chmod($backupDir, $dirMode);
+        clearstatcache(true, $backupDir);
+        $dirBefore = @lstat($backupDir);
+    }
+    if (!is_array($dirBefore)
+        || (int)($dirBefore['gid'] ?? -1) !== (int)$identity['group_gid']
+        || ((((int)($dirBefore['mode'] ?? 0)) & 0777) !== ($dirMode & 0777))) {
+        return ['success' => false, 'status' => 'backup_directory_metadata_invalid'];
+    }
+
+    $safeSuffix = preg_replace('/[^A-Za-z0-9_-]/', '', (string)$suffix);
+    try {
+        $random = bin2hex(random_bytes(8));
+    } catch (Throwable $error) {
+        return ['success' => false, 'status' => 'backup_name_failed'];
+    }
+    $name = 'e3dc_v4_' . date('Ymd_His')
+        . ($safeSuffix !== '' ? '_' . $safeSuffix : '')
+        . '_' . $random . '.json';
+    $target = rtrim($backupDir, '/') . '/' . $name;
+    $mappedFailure = str_starts_with($failOperation, 'backup_')
+        ? substr($failOperation, strlen('backup_'))
+        : $failOperation;
+    $publishOptions = $options;
+    $publishOptions['fail_operation'] = $mappedFailure;
+    $publishOptions['target_must_be_absent'] = true;
+    $publishOptions['require_json'] = true;
+    $publishOptions['temporary_prefix'] = '.e3dc_backup.';
+    unset($publishOptions['cache_file'], $publishOptions['after_commit_hook']);
+    $published = e3dcPublishConfirmedAtomicFile($target, $preimage, $fileMode, $publishOptions);
+    if (empty($published['success'])) {
+        return [
+            'success' => false,
+            'status' => (string)($published['status'] ?? 'backup_publish_failed'),
+        ];
+    }
+    $confirmed = e3dcReadRegularFileBound($target, 4 * 1024 * 1024);
+    if (!is_string($confirmed)
+        || !hash_equals(hash('sha256', $preimage), hash('sha256', $confirmed))) {
+        return ['success' => false, 'status' => 'backup_readback_failed'];
+    }
+
+    $limit = max(1, (int)($options['prune_limit'] ?? 20));
+    $backups = glob(rtrim($backupDir, '/') . '/e3dc_v4_*.json') ?: [];
+    if (count($backups) > $limit) {
+        usort($backups, static fn($a, $b) => (@filemtime($a) ?: 0) <=> (@filemtime($b) ?: 0));
+        foreach (array_slice($backups, 0, count($backups) - $limit) as $old) @unlink($old);
+    }
+    return [
+        'success' => true,
+        'status' => 'backup_confirmed',
+        'path' => $target,
+        'preimage_sha256' => hash('sha256', $preimage),
+        'backup_sha256' => hash('sha256', $confirmed),
+        'preimage' => $preimage,
+    ];
+}
+
+function e3dcAcquireV4MutationLock($v4Path, $options = []) {
+    $v4Path = (string)$v4Path;
+    $identity = e3dcWebMutationIdentity($options);
+    if (empty($identity['success'])) return $identity;
+    $directory = dirname($v4Path);
+    $directoryBefore = @lstat($directory);
+    if (!is_array($directoryBefore)
+        || ((((int)($directoryBefore['mode'] ?? 0)) & 0170000) !== 0040000)
+        || is_link($directory)) {
+        return ['success' => false, 'status' => 'lock_directory_invalid'];
+    }
+    $lockPath = (string)($options['lock_path'] ?? ($directory . '/.e3dc_v4.transaction.lock'));
+    if (is_link($lockPath)) return ['success' => false, 'status' => 'lock_invalid'];
+    $handle = @fopen($lockPath, 'c+b');
+    if (!is_resource($handle)) return ['success' => false, 'status' => 'lock_open_failed'];
+    clearstatcache(true, $lockPath);
+    $opened = @fstat($handle);
+    $named = @lstat($lockPath);
+    if (is_array($opened) && (int)($opened['uid'] ?? -1) === (int)$identity['publisher_uid']) {
+        @chgrp($lockPath, (int)$identity['group_gid']);
+        @chmod($lockPath, 0660);
+        clearstatcache(true, $lockPath);
+        $opened = @fstat($handle);
+        $named = @lstat($lockPath);
+    }
+    $sourceStat = @lstat($v4Path);
+    $allowedOwners = [(int)$identity['publisher_uid']];
+    if (is_array($sourceStat)) $allowedOwners[] = (int)($sourceStat['uid'] ?? -1);
+    $metadataOk = is_array($opened)
+        && is_array($named)
+        && ((((int)($opened['mode'] ?? 0)) & 0170000) === 0100000)
+        && (int)($opened['nlink'] ?? 0) === 1
+        && (int)($named['nlink'] ?? 0) === 1
+        && (int)($opened['dev'] ?? -1) === (int)($named['dev'] ?? -2)
+        && (int)($opened['ino'] ?? -1) === (int)($named['ino'] ?? -2)
+        && in_array((int)($opened['uid'] ?? -1), array_unique($allowedOwners), true)
+        && (int)($opened['gid'] ?? -1) === (int)$identity['group_gid']
+        && ((((int)($opened['mode'] ?? 0)) & 0777) === 0660);
+    if (!$metadataOk || !@flock($handle, LOCK_EX)) {
+        @fclose($handle);
+        return ['success' => false, 'status' => $metadataOk ? 'lock_failed' : 'lock_metadata_invalid'];
+    }
+    return [
+        'success' => true,
+        'status' => 'locked',
+        'handle' => $handle,
+        'path' => $lockPath,
+    ];
+}
+
+function e3dcReleaseV4MutationLock($lock) {
+    if (!is_array($lock) || !is_resource($lock['handle'] ?? null)) return;
+    @flock($lock['handle'], LOCK_UN);
+    @fclose($lock['handle']);
+}
+
+function e3dcMutateV4ConfigDetailed(
+    $mutator,
+    $backupSuffix = 'web',
+    $v4Path = null,
+    $cacheFile = null,
+    $options = []
+) {
+    if (!is_callable($mutator)) return ['success' => false, 'status' => 'mutator_invalid'];
+    $v4Path = is_string($v4Path) && $v4Path !== ''
+        ? $v4Path
+        : '/var/www/html/data/e3dc_v4.json';
+    $cacheFile = is_string($cacheFile) && $cacheFile !== ''
+        ? $cacheFile
+        : '/var/www/html/ramdisk/e3dc_config_cache.json';
+    if (basename($v4Path) !== 'e3dc_v4.json' || !is_file($v4Path) || is_link($v4Path)) {
+        return ['success' => false, 'status' => 'config_missing'];
+    }
+    $lock = e3dcAcquireV4MutationLock($v4Path, $options);
+    if (empty($lock['success'])) return $lock;
+    try {
+        $preimage = e3dcReadRegularFileBound($v4Path, 4 * 1024 * 1024);
+        $current = is_string($preimage) ? @json_decode($preimage, true) : null;
+        if (!is_string($preimage) || !is_array($current)) {
+            return ['success' => false, 'status' => 'config_invalid_json'];
+        }
+        $mutation = $mutator($current, $preimage);
+        if (!is_array($mutation) || empty($mutation['success'])) {
+            return is_array($mutation)
+                ? array_merge(['success' => false, 'status' => 'mutation_rejected'], $mutation)
+                : ['success' => false, 'status' => 'mutation_invalid'];
+        }
+        $next = $mutation['data'] ?? null;
+        if (!is_array($next)) return ['success' => false, 'status' => 'mutation_data_invalid'];
+        $json = @json_encode($next, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        if (!is_string($json)) return ['success' => false, 'status' => 'config_encode_failed'];
+        $payload = $json . "\n";
+        if (hash_equals(hash('sha256', $preimage), hash('sha256', $payload))) {
+            $result = array_merge($mutation, [
+                'success' => true,
+                'status' => 'no_changes',
+                'published' => false,
+                'readback' => $preimage,
+            ]);
+            unset($result['data']);
+            return $result;
+        }
+
+        $backupOptions = $options;
+        $backupOptions['expected_preimage'] = $preimage;
+        $backup = e3dcCreateConfirmedV4Backup($v4Path, $backupSuffix, $backupOptions);
+        if (empty($backup['success'])) {
+            return [
+                'success' => false,
+                'status' => (string)($backup['status'] ?? 'backup_failed'),
+                'backup_failed' => true,
+            ];
+        }
+        $identity = e3dcWebMutationIdentity($options);
+        if (empty($identity['success'])) return $identity;
+        $currentMode = e3dcConfigSecretFileModeFromData($current);
+        $publishOptions = $options;
+        $publishOptions['expected_target_raw'] = $preimage;
+        $publishOptions['expected_existing_mode'] = $currentMode;
+        $publishOptions['expected_existing_gid'] = (int)$identity['group_gid'];
+        $sourceStat = @lstat($v4Path);
+        $publishOptions['allowed_existing_uids'] = array_values(array_unique([
+            (int)$identity['publisher_uid'],
+            is_array($sourceStat) ? (int)($sourceStat['uid'] ?? -1) : -1,
+        ]));
+        $publishOptions['cache_file'] = $cacheFile;
+        $publishOptions['require_json'] = true;
+        $publishOptions['temporary_prefix'] = '.e3dc_v4_publish.';
+        $published = e3dcPublishConfirmedAtomicFile(
+            $v4Path,
+            $payload,
+            e3dcConfigSecretFileModeFromData($next),
+            $publishOptions
+        );
+        $result = array_merge($mutation, $published, [
+            'backup_path' => (string)$backup['path'],
+        ]);
+        unset($result['data']);
+        if (!empty($result['success'])) e3dcInvalidateConfigRequestMemo();
+        return $result;
+    } finally {
+        e3dcReleaseV4MutationLock($lock);
+    }
+}
+
 function e3dcWriteJsonPreservingOwner($path, $json, $fileMode) {
     if (basename((string)$path) !== 'e3dc_v4.json') return false;
-    if (!file_exists($path) || !is_writable($path)) return false;
+    if (!file_exists($path) || !is_writable($path) || is_link($path)) return false;
     $payload = $json . "\n";
-    $fh = @fopen($path, 'c+');
-    if ($fh === false) return false;
+    $fh = @fopen($path, 'r+b');
+    if ($fh === false || !e3dcJsonWriteHandleMatchesPath($fh, $path)) {
+        if (is_resource($fh)) @fclose($fh);
+        return false;
+    }
     $ok = false;
     if (@flock($fh, LOCK_EX)) {
-        $original = @stream_get_contents($fh);
-        if ($original === false) $original = null;
+        if (!e3dcJsonWriteHandleMatchesPath($fh, $path)) {
+            @flock($fh, LOCK_UN);
+            @fclose($fh);
+            return false;
+        }
+        $opened = @fstat($fh);
+        $groupInfo = function_exists('posix_getgrnam') ? @posix_getgrnam('www-data') : false;
+        $metadataOk = is_array($opened)
+            && is_array($groupInfo)
+            && (int)($opened['gid'] ?? -1) === (int)($groupInfo['gid'] ?? -2)
+            && ((((int)($opened['mode'] ?? 0)) & 0777) === ((int)$fileMode & 0777));
+        if (!$metadataOk) {
+            error_log('e3dc_v4.json hat nicht die erwarteten Rechte; bitte den Rechte-Systemjob ausführen.');
+        }
         @rewind($fh);
-        $bytes = @fwrite($fh, $payload);
-        if ($bytes === strlen($payload) && @ftruncate($fh, strlen($payload)) && @fflush($fh)) {
-            $ok = true;
-        } elseif ($original !== null) {
-            @rewind($fh);
-            @fwrite($fh, $original);
-            @ftruncate($fh, strlen($original));
-            @fflush($fh);
+        $original = $metadataOk ? @stream_get_contents($fh) : false;
+        if (is_string($original)) {
+            $ok = e3dcWriteLockedStreamFully($fh, $payload)
+                && e3dcJsonWriteHandleMatchesPath($fh, $path);
+            if (!$ok) {
+                $rolledBack = e3dcJsonWriteHandleMatchesPath($fh, $path)
+                    && e3dcWriteLockedStreamFully($fh, $original);
+                if (!$rolledBack) {
+                    error_log('e3dc_v4.json konnte nach einem Schreibfehler nicht vollständig zurückgesetzt werden.');
+                }
+            }
         }
         @flock($fh, LOCK_UN);
     }
     @fclose($fh);
-    if ($ok) {
-        @chgrp($path, 'www-data');
-        @chmod($path, $fileMode);
-    }
     return $ok;
 }
 
@@ -2591,6 +3375,11 @@ function e3dcWriteJsonAtomic($path, $json) {
             e3dcInvalidateConfigRequestMemo();
         }
         return true;
+    }
+    if (basename((string)$path) === 'e3dc_v4.json' && (file_exists($path) || is_link($path))) {
+        // Bei einer bestehenden V4-Konfiguration niemals nach einem
+        // fehlgeschlagenen gebundenen Write per Rename den Eigentümer wechseln.
+        return false;
     }
     $tmpFile = tempnam($dir, '.e3dc_v4_');
     if ($tmpFile === false) return false;
@@ -2624,35 +3413,42 @@ function e3dcReadExistingJsonOrFalse($path) {
  * Speichert V4-Konfigurationswerte atomar in e3dc_v4.json.
  * Legacy-TXT-Dateien werden hier bewusst nicht mehr beschrieben.
  */
-function saveE3dcConfigValues($updates) {
+function saveE3dcConfigValuesDetailed($updates, $v4Path = null, $cacheFile = null, $options = []) {
     if (!is_array($updates) || empty($updates)) {
-        return false;
+        return ['success' => false, 'status' => 'updates_invalid'];
     }
 
-    $v4Path = '/var/www/html/data/e3dc_v4.json';
-    $cacheFile = '/var/www/html/ramdisk/e3dc_config_cache.json';
-    $data = e3dcReadExistingJsonOrFalse($v4Path);
-    if ($data === false) return false;
-
+    $normalizedUpdates = [];
     foreach ($updates as $key => $value) {
         $key = strtolower(trim((string)$key));
         if (!preg_match('/^[a-z0-9_]+$/i', $key)) {
             continue;
         }
-        $data[$key] = is_string($value) ? trim($value) : $value;
+        $normalizedUpdates[$key] = is_string($value) ? trim($value) : $value;
     }
+    if ($normalizedUpdates === []) return ['success' => false, 'status' => 'updates_invalid'];
 
-    $json = json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
-    if ($json === false) {
-        return false;
-    }
+    return e3dcMutateV4ConfigDetailed(
+        static function($data) use ($normalizedUpdates) {
+            foreach ($normalizedUpdates as $key => $value) $data[$key] = $value;
+            return ['success' => true, 'data' => $data];
+        },
+        'setting',
+        $v4Path,
+        $cacheFile,
+        $options
+    );
+}
 
-    $ok = e3dcWriteJsonAtomic($v4Path, $json);
+function saveE3dcConfigValues($updates, $v4Path = null, $cacheFile = null, $options = []) {
+    $result = saveE3dcConfigValuesDetailed($updates, $v4Path, $cacheFile, $options);
+    $GLOBALS['e3dc_config_save_last_result'] = $result;
+    return !empty($result['success']);
+}
 
-    if ($ok && file_exists($cacheFile)) {
-        @unlink($cacheFile);
-    }
-    return $ok;
+function e3dcLastConfigSaveResult() {
+    $result = $GLOBALS['e3dc_config_save_last_result'] ?? null;
+    return is_array($result) ? $result : ['success' => false, 'status' => 'not_available'];
 }
 
 function saveE3dcConfigValue($key, $value) {
@@ -2797,7 +3593,7 @@ function getEnergyFlowUiConfig() {
     return normalizeEnergyFlowUiConfig(loadE3dcRawConfigData());
 }
 
-function saveEnergyFlowUiPatchLocked($layout, $nodes, $colorPatch, $labelPatch, $baseRevisions = [], $v4Path = null, $cacheFile = null) {
+function saveEnergyFlowUiPatchLocked($layout, $nodes, $colorPatch, $labelPatch, $baseRevisions = [], $v4Path = null, $cacheFile = null, $options = []) {
     $layout = strtolower(trim((string)$layout));
     if (!in_array($layout, ['desktop', 'mobile'], true)) {
         return ['success' => false, 'status' => 'invalid_layout'];
@@ -2814,29 +3610,23 @@ function saveEnergyFlowUiPatchLocked($layout, $nodes, $colorPatch, $labelPatch, 
         || ($appearanceChanges && !preg_match('/^[0-9a-f]{64}$/', $expectedAppearanceRevision))) {
         return ['success' => false, 'status' => 'invalid_base_revision'];
     }
-    $v4Path = is_string($v4Path) && $v4Path !== '' ? $v4Path : '/var/www/html/data/e3dc_v4.json';
-    $cacheFile = is_string($cacheFile) && $cacheFile !== '' ? $cacheFile : '/var/www/html/ramdisk/e3dc_config_cache.json';
-    if (!file_exists($v4Path) || !is_writable($v4Path)) {
-        return ['success' => false, 'status' => 'config_not_writable'];
-    }
-
-    $fh = @fopen($v4Path, 'c+');
-    if ($fh === false) return ['success' => false, 'status' => 'config_open_failed'];
-    $result = ['success' => false, 'status' => 'config_lock_failed'];
-    if (@flock($fh, LOCK_EX)) {
-        @rewind($fh);
-        $original = @stream_get_contents($fh);
-        $decoded = is_string($original) ? @json_decode($original, true) : null;
-        if (!is_array($decoded)) {
-            $result = ['success' => false, 'status' => 'config_invalid_json'];
-        } else {
+    return e3dcMutateV4ConfigDetailed(
+        static function($decoded) use (
+            $layout,
+            $nodePatch,
+            $colorPatch,
+            $labelPatch,
+            $expectedLayoutRevision,
+            $expectedAppearanceRevision,
+            $appearanceChanges
+        ) {
             $before = normalizeEnergyFlowUiConfig($decoded);
             $layoutConflict = !e3dcWebAuthHashEquals($before['revisions'][$layout] ?? '', $expectedLayoutRevision);
             $appearanceConflict = $appearanceChanges
                 && !e3dcWebAuthHashEquals($before['revisions']['appearance'] ?? '', $expectedAppearanceRevision);
 
             if ($layoutConflict || $appearanceConflict) {
-                $result = [
+                return [
                     'success' => false,
                     'status' => 'revision_conflict',
                     'conflicts' => array_values(array_filter([
@@ -2847,88 +3637,60 @@ function saveEnergyFlowUiPatchLocked($layout, $nodes, $colorPatch, $labelPatch, 
                     'revision' => $before['revision'] ?? '',
                     'revisions' => $before['revisions'] ?? []
                 ];
-            } else {
-                $ui = (isset($decoded['ui_energy_flow']) && is_array($decoded['ui_energy_flow']))
-                    ? $decoded['ui_energy_flow']
-                    : [];
-                $ui[$layout] = is_array($ui[$layout] ?? null) ? $ui[$layout] : [];
-                $storedNodes = (isset($ui[$layout]['nodes']) && is_array($ui[$layout]['nodes']))
-                    ? $ui[$layout]['nodes']
-                    : [];
-                foreach ($nodePatch as $key => $position) {
-                    $storedNode = is_array($storedNodes[$key] ?? null) ? $storedNodes[$key] : [];
-                    $storedNode['x'] = $position['x'];
-                    $storedNode['y'] = $position['y'];
-                    $storedNodes[$key] = $storedNode;
-                }
-                $ui[$layout]['nodes'] = $storedNodes;
+            }
 
-                $defaults = energyFlowDefaultColors();
-                $storedColors = (isset($ui['colors']) && is_array($ui['colors'])) ? $ui['colors'] : [];
-                if (is_array($colorPatch)) {
-                    foreach ($colorPatch as $key => $value) {
-                        if (!array_key_exists($key, $defaults)) continue;
-                        $storedColors[$key] = normalizeEnergyFlowColor($value, $defaults[$key]);
-                    }
-                }
-                $ui['colors'] = $storedColors;
+            $ui = (isset($decoded['ui_energy_flow']) && is_array($decoded['ui_energy_flow']))
+                ? $decoded['ui_energy_flow']
+                : [];
+            $ui[$layout] = is_array($ui[$layout] ?? null) ? $ui[$layout] : [];
+            $storedNodes = (isset($ui[$layout]['nodes']) && is_array($ui[$layout]['nodes']))
+                ? $ui[$layout]['nodes']
+                : [];
+            foreach ($nodePatch as $key => $position) {
+                $storedNode = is_array($storedNodes[$key] ?? null) ? $storedNodes[$key] : [];
+                $storedNode['x'] = $position['x'];
+                $storedNode['y'] = $position['y'];
+                $storedNodes[$key] = $storedNode;
+            }
+            $ui[$layout]['nodes'] = $storedNodes;
 
-                $storedLabels = (isset($ui['labels']) && is_array($ui['labels'])) ? $ui['labels'] : [];
-                if (is_array($labelPatch)) {
-                    foreach ($labelPatch as $key => $value) {
-                        if (!array_key_exists($key, energyFlowDefaultLabels())) continue;
-                        $alias = sanitizeEnergyFlowLabel($value);
-                        if ($alias === '') unset($storedLabels[$key]);
-                        else $storedLabels[$key] = $alias;
-                    }
-                }
-                $ui['labels'] = $storedLabels;
-                $decoded['ui_energy_flow'] = $ui;
-
-                $json = json_encode($decoded, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
-                if ($json === false) {
-                    $result = ['success' => false, 'status' => 'config_encode_failed'];
-                } else {
-                    $payload = $json . "\n";
-                    @rewind($fh);
-                    $bytes = @fwrite($fh, $payload);
-                    $written = $bytes === strlen($payload)
-                        && @ftruncate($fh, strlen($payload))
-                        && @fflush($fh);
-                    if (!$written) {
-                        @rewind($fh);
-                        if (is_string($original)) {
-                            @fwrite($fh, $original);
-                            @ftruncate($fh, strlen($original));
-                            @fflush($fh);
-                        }
-                        $result = ['success' => false, 'status' => 'config_write_failed'];
-                    } else {
-                        $after = normalizeEnergyFlowUiConfig($decoded);
-                        $result = [
-                            'success' => true,
-                            'status' => 'saved',
-                            'layout' => $layout,
-                            'ui_energy_flow' => $after,
-                            'revision' => $after['revision'] ?? '',
-                            'revisions' => $after['revisions'] ?? []
-                        ];
-                    }
+            $defaults = energyFlowDefaultColors();
+            $storedColors = (isset($ui['colors']) && is_array($ui['colors'])) ? $ui['colors'] : [];
+            if (is_array($colorPatch)) {
+                foreach ($colorPatch as $key => $value) {
+                    if (!array_key_exists($key, $defaults)) continue;
+                    $storedColors[$key] = normalizeEnergyFlowColor($value, $defaults[$key]);
                 }
             }
-        }
-        @flock($fh, LOCK_UN);
-    }
-    @fclose($fh);
-    if (!empty($result['success'])) {
-        @chgrp($v4Path, 'www-data');
-        @chmod($v4Path, e3dcConfigSecretFileModeFromData($decoded ?? []));
-        if (file_exists($cacheFile)) @unlink($cacheFile);
-        if (basename((string)$v4Path) === 'e3dc_v4.json') {
-            e3dcInvalidateConfigRequestMemo();
-        }
-    }
-    return $result;
+            $ui['colors'] = $storedColors;
+
+            $storedLabels = (isset($ui['labels']) && is_array($ui['labels'])) ? $ui['labels'] : [];
+            if (is_array($labelPatch)) {
+                foreach ($labelPatch as $key => $value) {
+                    if (!array_key_exists($key, energyFlowDefaultLabels())) continue;
+                    $alias = sanitizeEnergyFlowLabel($value);
+                    if ($alias === '') unset($storedLabels[$key]);
+                    else $storedLabels[$key] = $alias;
+                }
+            }
+            $ui['labels'] = $storedLabels;
+            $decoded['ui_energy_flow'] = $ui;
+            $after = normalizeEnergyFlowUiConfig($decoded);
+            return [
+                'success' => true,
+                'status' => 'saved',
+                'data' => $decoded,
+                'layout' => $layout,
+                'ui_energy_flow' => $after,
+                'revision' => $after['revision'] ?? '',
+                'revisions' => $after['revisions'] ?? [],
+            ];
+        },
+        'energy_flow',
+        $v4Path,
+        $cacheFile,
+        $options
+    );
 }
 
 function handleEnergyFlowLayout() {
@@ -3860,7 +4622,7 @@ function e3dcBuildReleaseRollbackOptions($dockerEnvironment = null) {
             'notes' => trim((string)($entry['notes'] ?? '')),
             'docker_commands' => $dockerSupported ? e3dcDockerReleaseCommandText($tag) : '',
             'bare_metal_summary' => $bareMetalSupported
-                ? "Backup, Dienststopp, git fetch --tags, Checkout auf $tag, Rechte-Reparatur und Gesundheitstest."
+                ? "Ein Bare-Metal-Rückfall wird im Web nicht gestartet. Nutze dafür die verifizierte Backup-Wiederherstellung über die administrative Konsole."
                 : '',
         ];
     }
@@ -4597,6 +5359,65 @@ function e3dcClassifySelfUpdateCompletion($running, $exitCode, $log) {
     return 'unknown';
 }
 
+function e3dcCommunityBootstrapReleaseTag() {
+    // RELEASE_MARKER: Beim Versionssprung gemeinsam mit VERSION/Release Notes aktualisieren.
+    return 'v5.4.4d';
+}
+
+function e3dcCommunityBootstrapCommand() {
+    $bootstrapReleaseTag = e3dcCommunityBootstrapReleaseTag();
+    return 'bootstrap_file="$(mktemp)" && '
+        . "curl -q -fsS --proto '=https' --tlsv1.2 "
+        . '-o "$bootstrap_file" '
+        . 'https://raw.githubusercontent.com/A9xxx/Install-E3DC-Control/'
+        . $bootstrapReleaseTag
+        . '/e3dc-update-bootstrap '
+        . '&& sudo /bin/sh "$bootstrap_file"; rc=$?; '
+        . 'rm -f -- "$bootstrap_file"; exit $rc';
+}
+
+function e3dcStartCanonicalWebUpdateJob($purpose = 'update') {
+    $purpose = in_array((string)$purpose, ['update', 'permissions_repair'], true)
+        ? (string)$purpose
+        : 'update';
+    if (e3dcIsDockerEnvironment()) {
+        return [
+            'success' => false,
+            'docker' => true,
+            'message' => e3dcDockerHostUpdateMessage(),
+            'commands' => e3dcDockerHostUpdateCommandText(),
+        ];
+    }
+    $launcherInspection = e3dcInspectWebUpdateLauncher();
+    if (empty($launcherInspection['ok'])) {
+        return [
+            'success' => false,
+            'message' => 'Der root-eigene Web-Update-Launcher ist nicht sicher gebunden ('
+                . (string)($launcherInspection['status'] ?? 'unbekannt')
+                . "). Lösung: Führe einmalig diesen Befehl aus:\n"
+                . e3dcCommunityBootstrapCommand(),
+        ];
+    }
+
+    $output = [];
+    $exitCode = 1;
+    exec('/usr/bin/sudo -n -- /usr/local/sbin/e3dc-web-update-launcher 2>&1', $output, $exitCode);
+    $startedMessage = $purpose === 'permissions_repair'
+        ? 'Rechteprüfung und Reparatur wurden über den kanonischen Backup-/Update-Systemjob gestartet.'
+        : 'Update als root-kontrollierter Systemjob gestartet.';
+    return [
+        'success' => $exitCode === 0,
+        'running' => $exitCode === 0,
+        'purpose' => $purpose,
+        'message' => $exitCode === 0
+            ? (trim(implode("\n", $output)) ?: $startedMessage)
+            : 'Der enge Web-Update-Launcher konnte nicht gestartet werden: '
+                . (trim(implode("\n", $output)) ?: 'keine Detailausgabe')
+                . "\n\nLösung: Führe einmalig diesen Befehl aus:\n"
+                . e3dcCommunityBootstrapCommand(),
+    ];
+}
+
 function handleRunSelfUpdate() {
     if (isset($_GET['action']) && $_GET['action'] === 'poll_self_update') {
         requireWebAuth(true);
@@ -4659,15 +5480,6 @@ function handleRunSelfUpdate() {
         e3dcRequirePostMutation(true);
         header('Content-Type: application/json');
 
-        if (e3dcIsDockerEnvironment()) {
-            echo json_encode([
-                'success' => false,
-                'docker' => true,
-                'message' => e3dcDockerHostUpdateMessage(),
-                'commands' => e3dcDockerHostUpdateCommandText(),
-            ]);
-            exit;
-        }
         $reinstallRaw = isset($_POST['reinstall']) ? (string)$_POST['reinstall'] : '0';
         if ($reinstallRaw !== '0') {
             echo json_encode([
@@ -4676,42 +5488,7 @@ function handleRunSelfUpdate() {
             ]);
             exit;
         }
-        $launcherInspection = e3dcInspectWebUpdateLauncher();
-        if (empty($launcherInspection['ok'])) {
-            echo json_encode([
-                'success' => false,
-                'message' => 'Der root-eigene Web-Update-Launcher ist nicht sicher gebunden ('
-                    . (string)($launcherInspection['status'] ?? 'unbekannt')
-                    . "). Lösung: Führe einmalig diesen Befehl aus:\n"
-                    . 'bootstrap_file="$(mktemp)" && '
-                    . "curl -q -fsS --proto '=https' --tlsv1.2 "
-                    . '-o "$bootstrap_file" '
-                    . "https://raw.githubusercontent.com/A9xxx/Install-E3DC-Control/v5.4.4c/e3dc-update-bootstrap "
-                    . '&& sudo /bin/sh "$bootstrap_file"; rc=$?; '
-                    . 'rm -f -- "$bootstrap_file"; exit $rc',
-            ]);
-            exit;
-        }
-        $zeroPayload = json_encode(['success' => true, 'missing' => 0, 'updating' => true]);
-        foreach (['/var/www/html/ramdisk/e3dc_self_update_status.json', '/var/www/html/ramdisk/e3dc_update_status.json'] as $cacheFile) {
-            @file_put_contents($cacheFile, $zeroPayload);
-            @chmod($cacheFile, 0666);
-        }
-        $output = [];
-        $exitCode = 1;
-        exec('/usr/bin/sudo -n -- /usr/local/sbin/e3dc-web-update-launcher 2>&1', $output, $exitCode);
-        if ($exitCode === 0) {
-            echo json_encode([
-                'success' => true,
-                'running' => true,
-                'message' => trim(implode("\n", $output)) ?: 'Update als root-kontrollierten Systemjob gestartet.',
-            ]);
-        } else {
-            echo json_encode([
-                'success' => false,
-                'message' => 'Web-Update konnte den engen Launcher nicht starten: ' . trim(implode("\n", $output)),
-            ]);
-        }
+        echo json_encode(e3dcStartCanonicalWebUpdateJob('update'));
         exit;
     }
 }
@@ -4832,6 +5609,54 @@ function e3dcRunServiceWrapperAction($action, array $services) {
         'ignored' => $ignored,
         'output' => implode("\n", $output),
         'errors' => $errors,
+    ];
+}
+
+function e3dcRestartEnergyManagerFromWeb($runtimePaths = null) {
+    if (!e3dcIsDockerEnvironment()) {
+        $result = e3dcRunServiceWrapperAction('restart', ['energy_manager']);
+        $confirmed = !empty($result['success'])
+            && in_array('energy_manager.service', (array)($result['changed'] ?? []), true);
+        return [
+            'success' => $confirmed,
+            'message' => $confirmed
+                ? 'Energy-Manager wurde neu gestartet.'
+                : (implode('; ', (array)($result['errors'] ?? [])) ?: 'Energy-Manager-Neustart wurde nicht bestätigt.'),
+        ];
+    }
+
+    $runtimePaths = is_array($runtimePaths) ? $runtimePaths : getInstallPaths();
+    $installRoot = !empty($runtimePaths['valid'])
+        ? @realpath(rtrim((string)$runtimePaths['install_path'], '/'))
+        : false;
+    $script = $installRoot !== false ? $installRoot . '/Installer/luxtronik/energy_manager.py' : '';
+    $scriptReal = $script !== '' ? @realpath($script) : false;
+    $python = e3dcGetTrustedPythonInterpreter();
+    $pkill = is_executable('/usr/bin/pkill') ? '/usr/bin/pkill' : '/bin/pkill';
+    $pgrep = is_executable('/usr/bin/pgrep') ? '/usr/bin/pgrep' : '/bin/pgrep';
+    if ($python === null || $scriptReal === false || is_link($script) || !is_file($scriptReal)
+        || !str_starts_with($scriptReal, rtrim((string)$installRoot, '/') . '/Installer/luxtronik/')
+        || !is_executable($pkill) || !is_executable($pgrep) || !is_executable('/bin/sh')) {
+        return ['success' => false, 'message' => 'Der Energy-Manager ist im gebundenen Docker-Laufzeitkontext nicht eindeutig verfügbar.'];
+    }
+
+    $stop = e3dcRunArgvProcess([$pkill, '-f', $scriptReal], 5.0, ['max_output_bytes' => 8192]);
+    if (!in_array((int)($stop['exit_code'] ?? 1), [0, 1], true)) {
+        return ['success' => false, 'message' => 'Der bisherige Energy-Manager-Prozess konnte nicht kontrolliert beendet werden.'];
+    }
+    $command = 'nohup ' . escapeshellarg($python) . ' ' . escapeshellarg($scriptReal)
+        . ' > /var/www/html/logs/energy_manager.log 2>&1 &';
+    $start = e3dcRunArgvProcess(['/bin/sh', '-c', $command], 5.0, ['max_output_bytes' => 8192]);
+    sleep(1);
+    $probe = e3dcRunArgvProcess([$pgrep, '-f', $scriptReal], 5.0, ['max_output_bytes' => 8192]);
+    $confirmed = !empty($start['success'])
+        && !empty($probe['success'])
+        && trim((string)($probe['stdout'] ?? '')) !== '';
+    return [
+        'success' => $confirmed,
+        'message' => $confirmed
+            ? 'Energy-Manager wurde neu gestartet.'
+            : 'Der Energy-Manager-Prozess wurde nach dem Startversuch nicht bestätigt.',
     ];
 }
 
@@ -5336,7 +6161,22 @@ function handleServiceRestart() {
             '/var/www/html/data/morning_boost_state.json',
             '/var/www/html/data/home_soc_state.json'
         ];
-        foreach($flags as $f) { if (file_exists($f)) @unlink($f); }
+        $flagRemovalErrors = [];
+        foreach ($flags as $f) {
+            $removed = e3dcRemoveRuntimeCommandFile($f);
+            if (empty($removed['success'])) {
+                $flagRemovalErrors[] = basename($f) . ': ' . (string)($removed['message'] ?? 'nicht entfernt');
+            }
+        }
+        if ($flagRemovalErrors !== []) {
+            http_response_code(500);
+            echo json_encode([
+                'success' => false,
+                'message' => "Der Notfall-Reset wurde vor dem Dienstneustart abgebrochen. Folgende Zustandsdateien konnten nicht sicher entfernt werden:\n"
+                    . implode("\n", $flagRemovalErrors),
+            ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+            exit;
+        }
 
         if (file_exists('/.dockerenv')) {
             $restartFlag = '/var/www/html/ramdisk/restart_container.flag';
@@ -5529,128 +6369,13 @@ function handleServiceRestart() {
 }
 
 /**
- * Führt den Rechte-Check und die automatische Korrektur per Python aus
+ * Startet Backup, Rechteprojektion und Releaseabgleich über den root-eigenen Systemjob.
  */
 function handleFixPermissions() {
     if (isset($_GET['action']) && $_GET['action'] === 'fix_permissions') {
         e3dcRequirePostMutation(true);
         header('Content-Type: application/json');
-        if (!e3dcPrivilegedInstallerWebActionsEnabled()) {
-            echo json_encode([
-                'success' => false,
-                'message' => e3dcPrivilegedInstallerWebBlockMessage('Rechte-Reparatur'),
-            ]);
-            exit;
-        }
-
-        $paths = getInstallPaths();
-        if (empty($paths['valid'])) {
-            echo json_encode(['success' => false, 'message' => $paths['error'] ?? 'Installationskontext fehlt.']);
-            exit;
-        }
-        $candidates = [
-            rtrim($paths['install_path'], '/') . '/installer_main.py',
-            rtrim($paths['install_path'], '/') . '/Installer/self_update.py'
-        ];
-        $installerScript = false;
-        foreach ($candidates as $c) {
-            if (file_exists($c)) { $installerScript = $c; break; }
-        }
-        if (!$installerScript) {
-            echo json_encode(['success' => false, 'message' => 'Updater nicht gefunden.']);
-            exit;
-        }
-        $repoDir = (basename($installerScript) === 'installer_main.py') ? dirname($installerScript) : dirname(dirname($installerScript));
-        $installerWrapper = $repoDir . '/Installer/installer_wrapper.sh';
-        $wrapperInspection = e3dcInspectInstallerWrapper($installerWrapper);
-        $attempts = [];
-        if (basename($installerScript) === 'installer_main.py' && !empty($wrapperInspection['ok'])) {
-            $attempts[] = [
-                'label' => 'installer_wrapper.sh',
-                'cmd' => "sudo -n " . escapeshellarg($installerWrapper) . " fix_permissions",
-            ];
-        }
-        $attempts[] = [
-            'label' => 'installer_main.py direkt',
-            'cmd' => "sudo -n /usr/bin/python3 " . escapeshellarg($installerScript) . " --fix-permissions",
-        ];
-
-        $cmd = '';
-        $out = [];
-        $ret = 1;
-        $failedAttempts = [];
-        foreach ($attempts as $attempt) {
-            $attemptOut = [];
-            exec($attempt['cmd'] . " 2>&1", $attemptOut, $attemptRet);
-            if ($attemptRet === 0) {
-                $cmd = $attempt['cmd'];
-                $out = $attemptOut;
-                $ret = 0;
-                break;
-            }
-            $failedAttempts[] = $attempt['label'] . " fehlgeschlagen:\n" . implode("\n", $attemptOut);
-            $cmd = $attempt['cmd'];
-            $out = $attemptOut;
-            $ret = $attemptRet;
-        }
-
-        if ($ret === 0) {
-            $filtered = [];
-            foreach ($out as $line) {
-                // ANSI Colors entfernen
-                $clean_line = preg_replace('/\e\[[0-9;]*m/', '', $line);
-                $trim_line = trim($clean_line);
-
-                // Wir filtern alles heraus, was auf Erfolg oder reine Status-Info hindeutet
-                if ($trim_line === '') continue;
-                if (strpos($trim_line, '✓') !== false) continue;
-                if (strpos($trim_line, ' OK') !== false) continue;
-                if (strpos($trim_line, '===') === 0) continue;
-                if (strpos($trim_line, '---') === 0) continue;
-                if (strpos($trim_line, 'Prüfe ') === 0) continue;
-
-                $filtered[] = $clean_line; // Wir behalten das Original (clean_line wg. Einrückungen)
-            }
-
-            // Wenn nach dem Filtern nur noch "→ Korrigiere..." Action-Header übrig bleiben, war alles OK
-            $has_real_issues = false;
-            foreach ($filtered as $f) {
-                if (strpos($f, '→ Korrigiere') === false && strpos($f, '■ Bereinige') === false) {
-                    $has_real_issues = true;
-                    break;
-                }
-            }
-
-            if (!$has_real_issues) {
-                $filtered = ["\nAlles OK! Es waren keine Reparaturen notwendig."];
-            }
-            echo json_encode(['success' => true, 'message' => implode("\n", $filtered)]);
-        } else {
-            $debug = [];
-            exec("whoami", $debug);
-            exec("ls -la " . escapeshellarg($installerScript) . " 2>&1", $debug);
-            $consoleCmd = "cd " . escapeshellarg($repoDir) . " && sudo python3 installer_main.py --fix-permissions";
-            $sudoText = implode("\n", array_filter([
-                implode("\n\n", $failedAttempts),
-                implode("\n", $out),
-            ]));
-            if (empty($wrapperInspection['ok'])) {
-                $err_msg = e3dcInstallerPrivilegeFailureMessage(
-                    'Rechte-Reparatur',
-                    $repoDir,
-                    $wrapperInspection,
-                    [$sudoText]
-                );
-            } elseif (preg_match('/sudo:|password|not in the sudoers|terminal is required/i', $sudoText)) {
-                $err_msg = "Die WebUI darf die Rechte-Reparatur noch nicht per sudo starten.\n\n"
-                         . "Bitte einmal per SSH ausführen:\n" . $consoleCmd . "\n\n"
-                         . "Danach Apache neu laden und die Seite aktualisieren.\n\n"
-                         . "Antwort:\n" . $sudoText;
-            } else {
-                $err_msg = "Rechte-Reparatur fehlgeschlagen.\n\nVersuchter Befehl:\n" . $cmd . "\n\nAntwort:\n" . $sudoText . "\n\nDEBUG-INFO:\n" . implode("\n", $debug);
-            }
-            echo json_encode(['success' => false, 'message' => $err_msg]);
-        }
+        echo json_encode(e3dcStartCanonicalWebUpdateJob('permissions_repair'));
         exit;
     }
 }
@@ -5954,7 +6679,6 @@ function renderReleaseRollbackModal($dialogClass = 'modal-lg modal-dialog-scroll
                 </div>
                 <div class="modal-footer border-secondary d-flex gap-2">
                     <button type="button" class="btn btn-outline-secondary" id="rollback-copy-btn" onclick="copyReleaseRollbackCommands()"><i class="fas fa-copy me-2"></i>Befehle kopieren</button>
-                    <button type="button" class="btn btn-warning" id="rollback-run-btn" onclick="startReleaseRollback()"><i class="fas fa-rotate-left me-2"></i>Rückfall installieren</button>
                     <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Schließen</button>
                 </div>
             </div>
@@ -6085,11 +6809,18 @@ function renderDiagnoseModal($dialogClass = 'modal-lg modal-dialog-scrollable') 
                 "X-Requested-With": "XMLHttpRequest",
                 "X-CSRF-Token": String(window.E3DC_CSRF_TOKEN || "")
             }
-        }).then(r => r.json()).then(d => {
-            if (d.success) {
-                window.currentDiagnoseErrors = []; updateDiagnoseDropdown();
-                document.querySelectorAll(".btn-diagnose").forEach(b => { if (b.dataset.origClass) b.className = b.dataset.origClass; });
+        }).then(async response => {
+            let payload = null;
+            try { payload = await response.json(); } catch (_) { payload = null; }
+            if (!response.ok || !payload || payload.success !== true) {
+                throw new Error(payload && payload.message ? String(payload.message) : ("HTTP " + response.status));
             }
+            return payload;
+        }).then(() => {
+            window.currentDiagnoseErrors = []; updateDiagnoseDropdown();
+            document.querySelectorAll(".btn-diagnose").forEach(b => { if (b.dataset.origClass) b.className = b.dataset.origClass; });
+        }).catch(error => {
+            alert("Diagnosemeldungen wurden nicht quittiert: " + error.message);
         });
     }
     </script>';
@@ -6297,6 +7028,53 @@ function handleSaveSetting() {
  * Verarbeitet ausschließlich die manuelle Zusatz-WR-Notsperre.
  * Hardwarebefehle bleiben dem Storage Manager vorbehalten.
  */
+function e3dcSetDirectMarketingAuxInverterManualLock($path, $locked, $timestamp = null, $options = []) {
+    $path = (string)$path;
+    $locked = (bool)$locked;
+    $options = is_array($options) ? $options : [];
+    $identity = e3dcWebMutationIdentity($options);
+    if (empty($identity['success'])) return $identity;
+    if ($locked) {
+        $payload = [
+            'schema' => 'direct_marketing_aux_inverter_shelly_manual_lock_v1',
+            'locked' => true,
+            'ts' => is_int($timestamp) && $timestamp > 0 ? $timestamp : time(),
+            'source' => 'dashboard',
+        ];
+        $json = @json_encode($payload, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        if (!is_string($json)) return ['success' => false, 'status' => 'encode_failed'];
+        $publishOptions = $options;
+        $publishOptions['require_json'] = true;
+        $publishOptions['temporary_prefix'] = '.aux_inverter_lock.';
+        $publishOptions['expected_existing_mode'] = 0660;
+        $publishOptions['expected_existing_gid'] = (int)$identity['group_gid'];
+        $result = e3dcPublishConfirmedAtomicFile($path, $json . "\n", 0660, $publishOptions);
+        $result['locked'] = true;
+        return $result;
+    }
+
+    clearstatcache(true, $path);
+    $before = @lstat($path);
+    if (!is_array($before)) return ['success' => true, 'status' => 'already_unlocked', 'locked' => false];
+    $metadataOk = ((((int)($before['mode'] ?? 0)) & 0170000) === 0100000)
+        && (int)($before['nlink'] ?? 0) === 1
+        && (int)($before['gid'] ?? -1) === (int)$identity['group_gid']
+        && ((((int)($before['mode'] ?? 0)) & 0777) === 0660)
+        && !is_link($path);
+    if (!$metadataOk) {
+        return ['success' => false, 'status' => 'unlock_metadata_invalid', 'locked' => true];
+    }
+    if (($options['fail_operation'] ?? '') === 'remove') {
+        return ['success' => false, 'status' => 'unlock_remove_failed', 'locked' => true];
+    }
+    $removed = e3dcRemoveRuntimeCommandFile($path);
+    clearstatcache(true, $path);
+    if (empty($removed['success']) || @lstat($path) !== false) {
+        return ['success' => false, 'status' => 'unlock_remove_unconfirmed', 'locked' => true];
+    }
+    return ['success' => true, 'status' => 'unlocked', 'locked' => false];
+}
+
 function handleDirectMarketingDashboardAction() {
     $action = (string)($_POST['action'] ?? '');
     if ($action !== 'set_direct_marketing_aux_inverter_shelly_lock') {
@@ -6309,21 +7087,15 @@ function handleDirectMarketingDashboardAction() {
 
     $locked = in_array(strtolower(trim((string)($_POST['locked'] ?? '0'))), ['1', 'true', 'yes', 'on'], true);
     $path = '/var/www/html/data/direct_marketing_aux_inverter_shelly_manual_lock.json';
-    if ($locked) {
-        $payload = [
-            'schema' => 'direct_marketing_aux_inverter_shelly_manual_lock_v1',
-            'locked' => true,
-            'ts' => time(),
-            'source' => 'dashboard',
-        ];
-        $json = json_encode($payload, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
-        $ok = $json !== false;
-        $ok = $ok && e3dcWriteJsonAtomic($path, $json);
-    } else {
-        $ok = !file_exists($path) || @unlink($path);
-    }
+    $result = e3dcSetDirectMarketingAuxInverterManualLock($path, $locked);
+    $ok = !empty($result['success']);
     if (!$ok) http_response_code(500);
-    echo json_encode(['success' => $ok, 'locked' => $locked]);
+    echo json_encode([
+        'success' => $ok,
+        'locked' => $ok ? $locked : !empty($result['locked']),
+        'status' => (string)($result['status'] ?? ($ok ? 'ok' : 'unknown')),
+        'error' => $ok ? null : 'Zusatz-WR-Sperre konnte nicht sicher bestätigt werden. Bitte Rechte prüfen und reparieren.',
+    ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
     exit;
 }
 
@@ -6362,23 +7134,12 @@ function handleRunUpdate() {
         $pidFile = '/run/e3dc-web-update/pid';
         $statusFile = '/run/e3dc-web-update/status';
         if ($mode === 'start') {
-            $launcherInspection = e3dcInspectWebUpdateLauncher();
-            if (empty($launcherInspection['ok'])) {
-                echo json_encode([
-                    'status' => 'error',
-                    'running' => false,
-                    'message' => 'Der root-eigene Web-Update-Launcher ist nicht sicher gebunden ('
-                        . (string)($launcherInspection['status'] ?? 'unbekannt') . ').',
-                ]);
-                exit;
-            }
-            $output = [];
-            $exitCode = 1;
-            exec('/usr/bin/sudo -n -- /usr/local/sbin/e3dc-web-update-launcher 2>&1', $output, $exitCode);
+            $started = e3dcStartCanonicalWebUpdateJob('update');
             echo json_encode([
-                'status' => $exitCode === 0 ? 'started' : 'error',
-                'running' => $exitCode === 0,
-                'message' => trim(implode("\n", $output)),
+                'status' => !empty($started['success']) ? 'started' : (!empty($started['docker']) ? 'docker' : 'error'),
+                'running' => !empty($started['running']),
+                'message' => (string)($started['message'] ?? ''),
+                'commands' => $started['commands'] ?? null,
             ]);
         } elseif ($mode === 'poll') {
             clearstatcache(true, $logFile);

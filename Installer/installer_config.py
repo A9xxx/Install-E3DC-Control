@@ -7,7 +7,7 @@ import logging
 import stat
 from pathlib import Path
 
-from .config_secret_permissions import config_secret_file_mode
+from .config_secret_permissions import config_secret_dir_mode, config_secret_file_mode
 from .secure_file_transaction import (
     atomic_write_bound_file,
     ensure_bound_directory,
@@ -456,16 +456,20 @@ def set_config_file_permissions(install_user=None):
         return False
 
 
-def _ensure_web_metadata_directories(user):
+def _ensure_web_metadata_directories(user, config_data=None):
     uid, _ = get_user_ids(user)
     gid = get_www_data_gid()
+    data_mode = config_secret_dir_mode(config_data)
     ensure_bound_directory("/var/www", uid=0, gid=0, mode=0o755)
     ensure_bound_directory("/var/www/html", uid=0, gid=gid, mode=0o755)
-    ensure_bound_directory("/var/www/html/data", uid=uid, gid=gid, mode=0o2775)
+    ensure_bound_directory("/var/www/html/data", uid=uid, gid=gid, mode=data_mode)
 
 
 def _write_json_with_web_permissions(path, data, user, *, expected_snapshot=None):
-    _ensure_web_metadata_directories(user)
+    _ensure_web_metadata_directories(
+        user,
+        data if os.path.basename(path) == "e3dc_v4.json" else None,
+    )
     uid, _ = get_user_ids(user)
     gid = get_www_data_gid()
     mode = (
@@ -586,7 +590,7 @@ def _write_web_config_pair(
             raise RuntimeError(
                 "Web-Konfigurationsquellen drifteten seit dem gebundenen Read"
             )
-        _ensure_web_metadata_directories(user)
+        _ensure_web_metadata_directories(user, v4_data)
         try:
             v4_committed = _write_json_with_web_permissions(
                 WEB_CONFIG_FILE,

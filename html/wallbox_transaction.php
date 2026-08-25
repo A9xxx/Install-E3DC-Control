@@ -338,15 +338,23 @@ function e3dcWbTxMode5AllowedLockUids() {
     return array_values(array_unique($allowed));
 }
 
+function e3dcWbTxConfiguredDataDirMode($path) {
+    $configPath = dirname((string)$path) . '/e3dc_v4.json';
+    $raw = e3dcReadRegularFileBound($configPath, 1048576);
+    $data = is_string($raw) ? @json_decode($raw, true) : null;
+    return e3dcConfigSecretDirModeFromData(is_array($data) ? $data : []);
+}
+
 function e3dcWbTxMode5SurfaceContract($path) {
     if (!function_exists('posix_geteuid') || !function_exists('posix_getegid')) return false;
     $dir = dirname($path);
     $parent = @lstat($dir);
     $allowedParentUids = e3dcWbTxMode5AllowedParentUids($path);
+    $expectedParentMode = e3dcWbTxConfiguredDataDirMode($path);
     if (!is_array($parent)
         || ((((int)$parent['mode']) & 0170000) !== 0040000)
         || is_link($dir)
-        || ((((int)$parent['mode']) & 07777) !== 02775)
+        || ((((int)$parent['mode']) & 07777) !== $expectedParentMode)
         || !in_array((int)$parent['uid'], $allowedParentUids, true)
         || (int)$parent['gid'] !== (int)posix_getegid()) {
         return false;

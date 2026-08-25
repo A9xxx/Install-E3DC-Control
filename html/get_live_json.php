@@ -6170,7 +6170,7 @@ if (file_exists($_blFlag)) {
 } else {
     $data['car_force_running'] = false;
 }
-$data['has_bluelink'] = !empty($c['bluelink_refresh_token']);
+$data['has_bluelink'] = e3dcBluelinkRefreshTokenConfigured();
 
 
 // --- NEU: Virtuelle Lade-Sessions (Interpolation & Restzeit) einmischen für Dual-WB ---

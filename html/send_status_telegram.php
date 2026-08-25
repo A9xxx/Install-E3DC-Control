@@ -1,7 +1,89 @@
 <?php
 require_once __DIR__ . '/helpers.php';
+
+function e3dcSendTelegramTestMessage(array $config) {
+    $token = trim((string)($config['telegram_token'] ?? ''));
+    $chatIdRaw = trim((string)($config['telegram_chat_id'] ?? ''));
+    $deviceName = trim((string)($config['telegram_device_name'] ?? 'E3DC-Control'));
+    if ($token === '' || $chatIdRaw === '') {
+        return [
+            'success' => false,
+            'message' => 'Telegram Bot Token und Chat ID müssen ausgefüllt sein.',
+        ];
+    }
+    if (!function_exists('curl_init')) {
+        return [
+            'success' => false,
+            'message' => 'Die PHP-cURL-Erweiterung für Telegram ist nicht verfügbar.',
+        ];
+    }
+
+    $chatIds = array_values(array_filter(array_map('trim', explode(',', $chatIdRaw)), static function($chatId) {
+        return $chatId !== '';
+    }));
+    if ($chatIds === [] || count($chatIds) > 20) {
+        return [
+            'success' => false,
+            'message' => 'Es muss mindestens eine und höchstens 20 Chat IDs geben.',
+        ];
+    }
+
+    $message = '✅ Telegram-Test von ' . ($deviceName !== '' ? $deviceName : 'E3DC-Control')
+        . ' (' . date('d.m.Y H:i:s') . ')';
+    $url = 'https://api.telegram.org/bot' . $token . '/sendMessage';
+    $sent = 0;
+    foreach ($chatIds as $chatId) {
+        $handle = curl_init();
+        curl_setopt($handle, CURLOPT_URL, $url);
+        curl_setopt($handle, CURLOPT_POST, true);
+        curl_setopt($handle, CURLOPT_POSTFIELDS, http_build_query([
+            'chat_id' => $chatId,
+            'text' => $message,
+        ]));
+        curl_setopt($handle, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($handle, CURLOPT_CONNECTTIMEOUT, 5);
+        curl_setopt($handle, CURLOPT_TIMEOUT, 10);
+        if (defined('CURLOPT_PROTOCOLS') && defined('CURLPROTO_HTTPS')) {
+            curl_setopt($handle, CURLOPT_PROTOCOLS, CURLPROTO_HTTPS);
+        }
+        $response = curl_exec($handle);
+        $curlError = curl_errno($handle);
+        $httpStatus = (int)curl_getinfo($handle, CURLINFO_HTTP_CODE);
+        curl_close($handle);
+        $payload = is_string($response) ? json_decode($response, true) : null;
+        if ($curlError !== 0 || $httpStatus < 200 || $httpStatus >= 300 || !is_array($payload) || ($payload['ok'] ?? false) !== true) {
+            return [
+                'success' => false,
+                'message' => $curlError !== 0
+                    ? 'Telegram ist derzeit nicht erreichbar.'
+                    : 'Telegram hat die Testnachricht abgelehnt (HTTP ' . ($httpStatus > 0 ? $httpStatus : 502) . ').',
+            ];
+        }
+        $sent++;
+    }
+
+    return [
+        'success' => true,
+        'count' => $sent,
+        'message' => $sent === 1
+            ? 'Telegram-Testnachricht wurde bestätigt.'
+            : $sent . ' Telegram-Testnachrichten wurden bestätigt.',
+    ];
+}
+
+$telegramScript = realpath((string)($_SERVER['SCRIPT_FILENAME'] ?? ''));
+if ($telegramScript === false || $telegramScript !== realpath(__FILE__)) {
+    return;
+}
+
 if (PHP_SAPI !== 'cli') {
     requireWebAuth(true);
+    if (strtoupper((string)($_SERVER['REQUEST_METHOD'] ?? 'GET')) !== 'POST') {
+        http_response_code(405);
+        header('Allow: POST');
+        exit('Telegram-Versand ist nur als bestätigte POST-Aktion zulässig.');
+    }
+    e3dcRequireCsrfToken(true);
 }
 
 $paths = getInstallPaths();

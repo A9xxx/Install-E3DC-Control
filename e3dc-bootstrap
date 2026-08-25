@@ -12,6 +12,7 @@ TARGET=$1
 TAG=$2
 EXPECTED_SHA=$3
 EXPECTED_ROLE=$4
+BOUND_PEER_IP=${E3DC_BOOTSTRAP_BOUND_PEER_IP:-}
 ENTRY_MODE=${E3DC_BOOTSTRAP_ENTRY_MODE:-rescue}
 
 case "$ENTRY_MODE" in
@@ -39,7 +40,9 @@ esac
 
 PYTHON=${PYTHON:-python3}
 "$PYTHON" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' || {
-    echo "Dieser Release-Installer benoetigt Python 3.10 oder neuer; es wurde noch nichts veraendert." >&2
+    echo "[FEHLER] E3DC-UPD-PLATFORM-001: Dieser Release-Updater benötigt Python 3.10 oder neuer." >&2
+    echo "[ZUSTAND] Die Installation und ihre Dienste wurden nicht verändert." >&2
+    echo "[LÖSUNG] Prüfe 'python3 --version'. Aktualisiere das Raspberry-Pi-/Debian-System auf eine unterstützte Version mit Python 3.10 oder neuer und starte danach denselben Updatebefehl erneut." >&2
     exit 1
 }
 
@@ -110,7 +113,8 @@ if [ "$(id -u)" -eq 0 ]; then
         --target "$TARGET" \
         --install-user "$INSTALL_USER" \
         --tag "$TAG" \
-        --role "$EXPECTED_ROLE"
+        --role "$EXPECTED_ROLE" \
+        --peer-ip "$BOUND_PEER_IP"
 fi
 
 exec sudo -- env \
@@ -122,4 +126,5 @@ exec sudo -- env \
     --target "$TARGET" \
     --install-user "$INSTALL_USER" \
     --tag "$TAG" \
-    --role "$EXPECTED_ROLE"
+    --role "$EXPECTED_ROLE" \
+    --peer-ip "$BOUND_PEER_IP"

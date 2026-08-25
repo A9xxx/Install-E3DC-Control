@@ -2,9 +2,9 @@
 
 Das Modul besitzt weder Hardware- noch Datei-I/O. Der Wallbox Manager meldet
 eine sitzungsgebundene Mindestleistungsreservierung an; ausschließlich der
-Storage Manager darf daraus ein Wattbudget freigeben. Die gemeinsame
-40-Wh-Grenze gilt am Anlagenanschlusspunkt und wird deshalb bei mehreren
-Wallboxen nicht vervielfacht.
+Storage Manager darf daraus ein vollständig finanziertes Wattbudget freigeben.
+Die gemeinsame 40-Wh-Grenze begrenzt die zusätzliche Energie und wird deshalb
+bei mehreren Wallboxen nicht vervielfacht; sie ist keine Netzbezugsfreigabe.
 """
 
 from __future__ import annotations
@@ -660,13 +660,31 @@ def arbitrate_grants(
     if previous_terminal:
         blockers.append("episode_terminated")
 
+    requested_extension_w = max(0, required_w - base_w)
+    available_charge_reduction_w = min(
+        max(0, _int(storage_charge_request_w, 0)),
+        requested_extension_w,
+    )
+    uncovered_extension_w = max(
+        0,
+        requested_extension_w - available_charge_reduction_w,
+    )
+    if (
+        uncovered_extension_w > 0
+        and not battery_support_allowed
+        and "extension_unfunded" not in blockers
+    ):
+        blockers.append("extension_unfunded")
+
     active = not blockers
-    extension_w = max(0, required_w - base_w) if active else 0
+    extension_w = requested_extension_w if active else 0
     effective_budget_w = max(base_w, required_w) if active else base_w
-    charge_reduction_w = min(max(0, _int(storage_charge_request_w, 0)), extension_w)
-    discharge_support_w = max(0, extension_w - charge_reduction_w)
-    if not battery_support_allowed:
-        discharge_support_w = 0
+    charge_reduction_w = available_charge_reduction_w if active else 0
+    discharge_support_w = (
+        uncovered_extension_w
+        if active and battery_support_allowed
+        else 0
+    )
     episode_terminal = bool(
         committed_active and (previous_terminal or bool(blockers))
     )
@@ -748,10 +766,36 @@ def arbitrate_grants(
         "battery_support_allowed": bool(battery_support_allowed),
         "charge_reduction_w": charge_reduction_w,
         "discharge_support_w": discharge_support_w,
+        "funding_required_w": requested_extension_w,
+        "funding_covered_w": (
+            available_charge_reduction_w
+            + (
+                uncovered_extension_w
+                if battery_support_allowed
+                else 0
+            )
+        ),
+        "funding_applied_w": charge_reduction_w + discharge_support_w,
+        "funding_uncovered_w": max(
+            0,
+            requested_extension_w
+            - available_charge_reduction_w
+            - (
+                uncovered_extension_w
+                if battery_support_allowed
+                else 0
+            ),
+        ),
         "source_mode": (
-            "storage_supported"
-            if battery_support_allowed
-            else "bounded_grid_without_battery_discharge"
+            "storage_charge_reduction_and_battery_support"
+            if charge_reduction_w > 0 and discharge_support_w > 0
+            else "storage_charge_reduction"
+            if charge_reduction_w > 0
+            else "authorized_battery_support"
+            if discharge_support_w > 0
+            else "base_budget_only"
+            if active and requested_extension_w <= 0
+            else "unfunded"
         ),
         "blockers": blockers,
         "last_sample_ts": now_value,

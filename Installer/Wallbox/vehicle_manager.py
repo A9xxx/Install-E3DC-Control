@@ -144,13 +144,15 @@ def vehicle_max_ac_phases(config, charger_id, status=None, profiles=None):
     )
 
 
-def vehicle_phase_capability(status=None, profiles=None):
+def vehicle_phase_capability(status=None, profiles=None, config=None, charger_id=1):
     """Liefere den expliziten, sitzungsgebundenen Fahrzeug-Phasenbeleg."""
 
     profile_list = load_saved_car_profiles() if profiles is None else profiles
     return wallbox_decision.vehicle_phase_capability_from_profiles(
         profile_list,
         status,
+        config=config,
+        charger_id=charger_id,
     )
 
 
@@ -435,10 +437,12 @@ class VehicleManager:
         )
 
     @staticmethod
-    def vehicle_phase_capability(status=None, profiles=None):
+    def vehicle_phase_capability(status=None, profiles=None, config=None, charger_id=1):
         return vehicle_phase_capability(
             status=status,
             profiles=profiles,
+            config=config,
+            charger_id=charger_id,
         )
 
     @staticmethod

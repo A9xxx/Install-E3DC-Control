@@ -6499,17 +6499,19 @@ def _mode5_user_start_request_nodes_safe(path: str, *, legacy_parent=False) -> b
         allowed_parent_uids = {int(account.pw_uid), int(manager.pw_uid)}
         parent = os.lstat(os.path.dirname(path))
         parent_mode = stat.S_IMODE(parent.st_mode)
+        expected_parent_mode = int(config_secret_dir_mode_text(), 8)
+        required_parent_mode = (
+            expected_parent_mode & 0o777
+            if legacy_parent
+            else expected_parent_mode
+        )
         if (
             stat.S_ISLNK(parent.st_mode)
             or not stat.S_ISDIR(parent.st_mode)
             or bool(parent_mode & 0o002)
             or parent.st_uid not in allowed_parent_uids
             or parent.st_gid != int(group.gr_gid)
-            or (
-                parent_mode != 0o775
-                if legacy_parent
-                else parent_mode != 0o2775
-            )
+            or parent_mode != required_parent_mode
         ):
             return False
         contracts = (
@@ -6551,7 +6553,7 @@ def _mode5_user_start_request_surface_safe(
 def _repair_mode5_user_start_legacy_parent(
     path: str = WALLBOX_MODE5_USER_START_REQUEST_FILE,
 ) -> bool:
-    """Hebt ausschließlich den bekannten 0775-Parent descriptorgebunden an."""
+    """Ergänzt nur dem konfigurierten Datenmodus das Setgid-Bit."""
 
     if _mode5_user_start_request_surface_safe(path):
         return True
@@ -6565,6 +6567,8 @@ def _repair_mode5_user_start_legacy_parent(
         account = pwd.getpwnam("www-data")
         manager = pwd.getpwnam(get_install_user())
         allowed_parent_uids = {int(account.pw_uid), int(manager.pw_uid)}
+        expected_parent_mode = int(config_secret_dir_mode_text(), 8)
+        legacy_parent_mode = expected_parent_mode & 0o777
         flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
         flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(directory, flags)
@@ -6574,17 +6578,17 @@ def _repair_mode5_user_start_legacy_parent(
             or (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino)
             or current.st_uid not in allowed_parent_uids
             or current.st_gid != int(group.gr_gid)
-            or stat.S_IMODE(current.st_mode) != 0o775
+            or stat.S_IMODE(current.st_mode) != legacy_parent_mode
         ):
             return False
-        os.fchmod(descriptor, 0o2775)
+        os.fchmod(descriptor, expected_parent_mode)
         changed = os.fstat(descriptor)
         named = os.lstat(directory)
         if (
-            stat.S_IMODE(changed.st_mode) != 0o2775
+            stat.S_IMODE(changed.st_mode) != expected_parent_mode
             or (named.st_dev, named.st_ino) != (changed.st_dev, changed.st_ino)
             or named.st_uid not in allowed_parent_uids
-            or stat.S_IMODE(named.st_mode) != 0o2775
+            or stat.S_IMODE(named.st_mode) != expected_parent_mode
         ):
             return False
     except (KeyError, OSError, TypeError, ValueError):
@@ -6642,7 +6646,21 @@ def _fix_webroot_permissions() -> bool:
         "-type f -exec chmod 664 {} +",
         timeout=60,
     )
-    run_command("sudo chmod 2775 /var/www/html/data /var/www/html/logs /var/www/html/ramdisk /var/www/html/tmp 2>/dev/null || true", timeout=10)
+    permission_steps = (
+        (
+            f"sudo chmod {secret_dir_mode} /var/www/html/data",
+            "Datenverzeichnis",
+        ),
+        (
+            "sudo chmod 2775 /var/www/html/logs /var/www/html/ramdisk /var/www/html/tmp",
+            "Laufzeitverzeichnisse",
+        ),
+    )
+    for command, label in permission_steps:
+        result = run_command(command, timeout=10)
+        if not isinstance(result, dict) or not result.get("success"):
+            detail = str((result or {}).get("stderr") or (result or {}).get("stdout") or "unbekannter Fehler")
+            raise RuntimeError(f"{label} konnten nicht auf den Sollmodus gesetzt werden: {detail}")
     run_command(f"sudo chmod {secret_file_mode} /var/www/html/data/e3dc_v4.json 2>/dev/null || true", timeout=5)
     run_command(f"sudo chmod {secret_file_mode} {repo_v4_config} 2>/dev/null || true", timeout=5)
     for raw_backup_dir in (web_backup_dir, repo_backup_dir):

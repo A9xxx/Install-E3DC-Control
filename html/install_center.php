@@ -17,16 +17,15 @@ $web_installer = $installer_path . '/web_installer.py';
 $installer_wrapper = $installer_path . '/installer_wrapper.sh';
 
 function installCenterCsrfToken() {
-    if (empty($_SESSION['install_center_csrf'])) {
-        $_SESSION['install_center_csrf'] = bin2hex(random_bytes(32));
-    }
-    return $_SESSION['install_center_csrf'];
+    return e3dcCsrfToken();
 }
 
 function validateInstallCenterCsrf() {
     $sent = $_POST['csrf_token'] ?? '';
-    $expected = $_SESSION['install_center_csrf'] ?? '';
-    return is_string($sent) && is_string($expected) && $expected !== '' && hash_equals($expected, $sent);
+    $expected = e3dcCsrfToken();
+    return is_string($sent)
+        && $sent !== ''
+        && e3dcWebAuthHashEquals($expected, $sent);
 }
 
 function installCenterDashboardReturnUrl() {
@@ -107,14 +106,14 @@ function runInstallerJob($action, $module = null, $viaWrapper = false) {
             'write_blocked' => true,
             'privileged_installer_web_enabled' => false,
             'error' => 'Privilegierte Installer-Webjobs sind aus Sicherheitsgründen deaktiviert.',
-            'message' => 'Read-only Prüfungen laufen ohne sudo. Installation, Rechte-Reparatur, Update und Rückfall benötigen bis zu einem eigenen engen Launcher eine administrative Konsole.',
+            'message' => 'Read-only Prüfungen laufen ohne sudo. Rechte-Reparatur und Update nutzen den vorhandenen root-eigenen Systemjob; Modulinstallation und Rückfall benötigen eine administrative Konsole.',
         ];
     }
     if (!file_exists($web_installer)) {
         return ['success' => false, 'error' => 'web_installer.py nicht gefunden'];
     }
     $ramdisk = '/var/www/html/ramdisk';
-    if (!is_dir($ramdisk) && !@mkdir($ramdisk, 0775, true)) {
+    if (!is_dir($ramdisk) && !@mkdir($ramdisk, 02775, true)) {
         return ['success' => false, 'error' => 'Ramdisk-Verzeichnis konnte nicht angelegt werden'];
     }
     $job = [
@@ -127,7 +126,7 @@ function runInstallerJob($action, $module = null, $viaWrapper = false) {
     if (@file_put_contents($job_file, json_encode($job, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE)) === false) {
         return ['success' => false, 'error' => 'Jobdatei konnte nicht geschrieben werden'];
     }
-    @chmod($job_file, 0666);
+    @chmod($job_file, 0664);
     $cmd = escapeshellarg($python) . ' ' . escapeshellarg($web_installer) . ' --job-file 2>&1';
     $out = shell_exec($cmd);
     $json = json_decode($out ?: '', true);
@@ -276,8 +275,8 @@ function installCenterModuleConfigFields($moduleKey) {
                 ['value' => '1', 'label' => 'Vorrang Wallbox 1'],
                 ['value' => '2', 'label' => 'Vorrang Wallbox 2']
             ]),
-            installCenterConfigField('wbmaxladestrom', 'Max. Ladestrom (A)', 'number', [], '', false, '16'),
-            installCenterConfigField('grid_max_amps', 'Hausabsicherung (A je Phase)', 'number', [], '', false, '63'),
+            installCenterConfigField('wbmaxladestrom', 'Standard-Maximalstrom je Wallbox (6–32 A)', 'number', [], '', false, '16'),
+            installCenterConfigField('grid_max_amps', 'Hausabsicherung (A je Phase)', 'number', [], '', false, '35'),
             installCenterConfigField('wbminsoc', 'Batterie-Reserve für Wallbox (%)', 'number', [], '', false, '45'),
         ],
         'heatpump' => array_merge($commonHeatPump, [
@@ -613,40 +612,18 @@ function installCenterNormalizeConfigValue($field, $value) {
     return $value;
 }
 
-function installCenterBackupConfig(&$error = null) {
-    $configFile = '/var/www/html/data/e3dc_v4.json';
-    $backupDir = '/var/www/html/data/config_backups';
+function installCenterBackupConfig(&$error = null, $options = []) {
+    $options = is_array($options) ? $options : [];
+    $configFile = (string)($options['v4_path'] ?? '/var/www/html/data/e3dc_v4.json');
+    $backupDir = (string)($options['backup_dir'] ?? '/var/www/html/data/config_backups');
     $error = null;
-    if (!file_exists($configFile)) {
-        $error = 'e3dc_v4.json nicht gefunden';
+    $options['backup_dir'] = $backupDir;
+    $result = e3dcCreateConfirmedV4Backup($configFile, 'install_center', $options);
+    if (empty($result['success'])) {
+        $error = 'Config-Backup nicht bestätigt (' . (string)($result['status'] ?? 'unknown') . ')';
         return null;
     }
-    $configData = @json_decode((string)@file_get_contents($configFile), true);
-    if (!is_array($configData)) $configData = [];
-    if (!is_dir($backupDir) && !@mkdir($backupDir, e3dcConfigSecretDirModeFromData($configData), true)) {
-        $error = 'Backup-Verzeichnis konnte nicht angelegt werden';
-        return null;
-    }
-    $installUser = (string)($GLOBALS['paths']['install_user'] ?? '');
-    if ($installUser !== '') @chown($backupDir, $installUser);
-    @chgrp($backupDir, 'www-data');
-    @chmod($backupDir, e3dcConfigSecretDirModeFromData($configData));
-    $target = $backupDir . '/e3dc_v4_install_center_' . date('Ymd_His') . '.json';
-    if (!@copy($configFile, $target)) {
-        $error = 'Config-Backup konnte nicht geschrieben werden';
-        return null;
-    }
-    if ($installUser !== '') @chown($target, $installUser);
-    @chgrp($target, 'www-data');
-    @chmod($target, e3dcConfigSecretFileModeFromData($configData));
-    $baks = glob($backupDir . '/e3dc_v4_install_center_*.json') ?: [];
-    if (count($baks) > 20) {
-        usort($baks, fn($a, $b) => filemtime($a) <=> filemtime($b));
-        foreach (array_slice($baks, 0, count($baks) - 20) as $old) {
-            @unlink($old);
-        }
-    }
-    return $target;
+    return (string)$result['path'];
 }
 
 function installCenterSaveModuleConfig($moduleKey, $postedValues) {
@@ -701,15 +678,21 @@ function installCenterSaveModuleConfig($moduleKey, $postedValues) {
     if (!$updates) {
         return ['success' => true, 'message' => 'Keine Änderung gespeichert.'];
     }
-    $backupError = null;
-    $backupPath = installCenterBackupConfig($backupError);
-    if ($backupPath === null) {
-        return ['success' => false, 'error' => $backupError ?: 'Config-Backup fehlgeschlagen'];
+    $saveResult = saveE3dcConfigValuesDetailed($updates);
+    if (empty($saveResult['success'])) {
+        $status = (string)($saveResult['status'] ?? 'unknown');
+        $error = !empty($saveResult['state_unknown'])
+            ? 'Konfiguration wurde veröffentlicht, Cache-/Rückfallzustand ist unklar'
+            : (!empty($saveResult['rolled_back'])
+                ? 'Konfigurationsänderung wurde nach Cachefehler zurückgesetzt'
+                : 'Konfiguration wurde vor dem Commit nicht geändert');
+        return [
+            'success' => false,
+            'error' => $error . ' (' . $status . ')',
+            'backup' => $saveResult['backup_path'] ?? null,
+        ];
     }
-    $ok = saveE3dcConfigValues($updates);
-    if (!$ok) {
-        return ['success' => false, 'error' => 'Konfiguration konnte nicht gespeichert werden', 'backup' => $backupPath];
-    }
+    $backupPath = (string)($saveResult['backup_path'] ?? '');
     $message = count($updates) . ' Wert(e) gespeichert. Bitte betroffene Dienste bei Bedarf neu starten.';
     if (!empty($guardWarnings)) {
         $message .= ' Schutz: ' . implode(' ', $guardWarnings);
@@ -3684,7 +3667,8 @@ if (isset($_GET['action']) && $_GET['action'] === 'repair_permissions_dry_run') 
     <div class="alert alert-warning border-warning bg-warning bg-opacity-10 text-warning small">
         <i class="fas fa-triangle-exclamation me-1"></i>
         Sicherer Installationsmodus: Dienst-Start/Stop läuft nur für erlaubte Dienste.
-        Schreibjobs laufen ausschließlich über den Installer-Wrapper mit Backup, Allowlist und Rückbaupfad.
+        Die Rechteprüfung ist read-only. Eine Reparatur startet den vorhandenen root-eigenen Systemjob mit Backup,
+        Rechteprojektion, Releaseabgleich und Dienstneustart; nutzerbeschreibbarer Installer-Code erhält keine sudo-Freigabe.
         Core-Dienste bleiben gegen Deinstallation geschützt.
     </div>
 
@@ -3692,17 +3676,8 @@ if (isset($_GET['action']) && $_GET['action'] === 'repair_permissions_dry_run') 
         <button class="btn btn-outline-info rounded-pill" onclick="runGlobalAction('permissions_check')">
             <i class="fas fa-shield-halved me-1"></i> Rechte prüfen
         </button>
-        <button class="btn btn-outline-warning rounded-pill" onclick="runGlobalAction('repair_permissions_dry_run')">
-            <i class="fas fa-screwdriver me-1"></i> Reparatur Dry-Run
-        </button>
-        <button class="btn btn-outline-warning rounded-pill" onclick="runGlobalJob('repair_permissions_dry_run')">
-            <i class="fas fa-clipboard-check me-1"></i> Reparatur Job-Test
-        </button>
-        <button class="btn btn-outline-warning rounded-pill" onclick="runGlobalJob('repair_permissions_dry_run', true)">
-            <i class="fas fa-user-shield me-1"></i> Wrapper-Test
-        </button>
-        <button class="btn btn-outline-danger rounded-pill" disabled title="Privilegierte Installer-Webjobs sind deaktiviert">
-            <i class="fas fa-lock me-1"></i> Rechte-Reparatur nur administrativ
+        <button class="btn btn-outline-warning rounded-pill" onclick="runPermissionRepairUpdate()">
+            <i class="fas fa-tools me-1"></i> Rechte reparieren &amp; System abgleichen
         </button>
         <button class="btn btn-outline-secondary rounded-pill" onclick="runGlobalAction('write_readiness')">
             <i class="fas fa-user-shield me-1"></i> Freigabe prüfen
@@ -3734,7 +3709,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'repair_permissions_dry_run') 
         <button class="btn btn-outline-primary rounded-pill" onclick="runGlobalAction('job_status')">
             <i class="fas fa-clipboard-list me-1"></i> Job-Status
         </button>
-        <span class="text-secondary small">Prüfaktionen lesen nur. Installation, Rechte-Reparatur, Update und Rückfall bleiben im Web bis zu einem eigenen engen Launcher gesperrt und benötigen eine administrative Konsole.</span>
+        <span class="text-secondary small">Prüfaktionen lesen nur. Rechte-Reparatur und Update laufen über den root-eigenen Systemjob; Modulinstallation und Rückfall bleiben der administrativen Konsole vorbehalten.</span>
     </div>
 
     <div id="installerStatus" class="installer-status skeleton">
@@ -4448,7 +4423,7 @@ function renderModuleNextAction(module, installBlock) {
     if (state === 'ready') {
         return `
             <button class="btn btn-sm btn-outline-primary" title="Sicheren Ramdisk-Job testen, noch ohne echte Installation" onclick="runModuleJob('${esc(module.key)}','install_module_dry_run')"><i class="fas fa-clipboard-check me-1"></i>Job-Test</button>
-            <button class="btn btn-sm btn-outline-success" title="Echte Installation nur über Installer-Wrapper und nur für optionale Module" onclick="confirmModuleInstall('${esc(module.key)}','${esc(module.display_name)}')"><i class="fas fa-lock-open me-1"></i>Installieren</button>
+            <button class="btn btn-sm btn-outline-success" title="Zeigt Voraussetzungen und den sicheren Installationsbedarf ohne Systemänderung" onclick="runModuleAction('${esc(module.key)}','install_module_dry_run')"><i class="fas fa-box-open me-1"></i>Installationsdetails</button>
         `;
     }
     if (state === 'blocked' && hasConfigBlocker && module.config_keys && module.config_keys.length) {
@@ -4523,16 +4498,6 @@ function renderModule(module, serviceInfo, diagnosis, installBlock = null) {
         : '';
     const configKeyDisplay = configDisplayList(config, 'config_key_labels', 'config_keys');
     const configKeyText = configKeyDisplay.length ? configKeyDisplay : (module.config_keys || []);
-    const removeDisabled = isCore
-        ? 'disabled'
-        : (!state.installed
-            ? 'disabled'
-            : '');
-    const removeTitle = isCore
-        ? 'Core-Module dürfen nicht deinstalliert werden'
-        : (!state.installed
-            ? 'Dienst fehlt: kein Rückbau nötig'
-            : 'Optionales Modul rückbauen: stoppt/deaktiviert und entfernt nur die systemd-Unit. Config, Historie, Logs und Script bleiben erhalten.');
     const warningBadge = module.install_warning
         ? `<span class="badge text-bg-warning" title="${esc(module.install_warning)}">Hinweis</span>`
         : '';
@@ -4577,7 +4542,6 @@ function renderModule(module, serviceInfo, diagnosis, installBlock = null) {
                     <button class="btn btn-sm btn-success" ${startDisabled} onclick="controlService('${esc(unit)}','start')"><i class="fas fa-play me-1"></i> Start</button>
                     <button class="btn btn-sm btn-outline-info" ${restartDisabled} onclick="controlService('${esc(unit)}','restart')"><i class="fas fa-rotate me-1"></i> Neustart</button>
                     <button class="btn btn-sm btn-outline-danger" ${stopDisabled} onclick="controlService('${esc(unit)}','stop')"><i class="fas fa-stop me-1"></i> Stop</button>
-                    <button class="btn btn-sm btn-outline-danger" ${removeDisabled} title="${esc(removeTitle)}" onclick="runModuleWriteJob('${esc(module.key)}','remove_module')"><i class="fas fa-box-archive me-1"></i> Rückbau</button>
                     ${configLink}
                 </div>
             </details>
@@ -5113,63 +5077,6 @@ async function showBlockedInstall(moduleKey, displayName) {
     }
 }
 
-async function confirmModuleInstall(moduleKey, displayName) {
-    const module = installCenterModules[moduleKey] || {};
-    const titleName = module.display_name || displayName || moduleKey;
-    const notes = (module.install_notes || []).map(note => `<li><i class="fas fa-circle-info text-info me-1"></i>${esc(note)}</li>`).join('');
-    const moduleWarning = module.install_warning
-        ? `<div class="alert alert-danger bg-danger bg-opacity-10 border-danger text-danger mb-3">
-                <strong><i class="fas fa-triangle-exclamation me-1"></i>Modul-Hinweis</strong><br>${esc(module.install_warning)}
-           </div>`
-        : '';
-    const notesHtml = notes
-        ? `<div class="job-progress-box mb-3"><strong>Modul-Checkliste</strong><ul class="result-list">${notes}</ul></div>`
-        : '';
-    showJobModal(
-        '<i class="fas fa-lock-open text-success me-2"></i>Optionale Modulinstallation',
-        `${esc(titleName)}`,
-        `
-            <div class="alert alert-warning bg-warning bg-opacity-10 border-warning text-warning mb-3">
-                Dieser Schritt schreibt eine systemd-Unit aus dem zentralen Katalog, führt daemon-reload aus, aktiviert den Autostart und startet den Dienst neu. Config und Historie bleiben unberührt.
-            </div>
-            ${moduleWarning}
-            ${notesHtml}
-            <div class="job-progress-box">
-                <strong>Sicherheitsrahmen</strong>
-                <ul class="result-list">
-                    <li><i class="fas fa-check-circle ok me-1"></i>Nur optionale Module aus dem Service-Katalog.</li>
-                    <li><i class="fas fa-check-circle ok me-1"></i>Nur hinterlegte Unit und hinterlegtes Script.</li>
-                    <li><i class="fas fa-lock text-warning me-1"></i>Der frühere gemeinsame installer_wrapper-/Ramdisk-Pfad ist deaktiviert.</li>
-                    <li><i class="fas fa-check-circle ok me-1"></i>Core-Dienste und alter C++ Dienst bleiben gesperrt.</li>
-                </ul>
-            </div>
-            <div id="writeGatePreview" class="mt-3 text-secondary small">
-                <i class="fas fa-spinner fa-spin me-1"></i>Freigabe-Check wird gelesen...
-            </div>
-            <div class="mt-3 d-flex flex-wrap gap-2">
-                <button class="btn btn-sm btn-outline-primary" onclick="runModuleJob('${esc(moduleKey)}','install_module_dry_run')"><i class="fas fa-clipboard-check me-1"></i>Erst Job-Test</button>
-                <button id="confirmInstallButton" class="btn btn-sm btn-success" disabled title="Nur über eine administrative Konsole verfügbar"><i class="fas fa-lock me-1"></i>Webinstallation gesperrt</button>
-            </div>
-        `
-    );
-    try {
-        const data = await loadJson('install_center.php?action=write_readiness');
-        const box = document.getElementById('writeGatePreview');
-        if (box) box.innerHTML = renderWriteGatePreview(data);
-        const installButton = document.getElementById('confirmInstallButton');
-        if (installButton) {
-            const ready = Boolean(data && data.privileged_installer_web_enabled && data.ready_for_manual_enable);
-            installButton.disabled = !ready;
-            installButton.title = ready
-                ? 'Startet über einen aktionsgebundenen sicheren Launcher'
-                : 'Privilegierte Webinstallation ist bis zu einem eigenen engen Launcher gesperrt';
-        }
-    } catch (err) {
-        const box = document.getElementById('writeGatePreview');
-        if (box) box.innerHTML = `<div class="bad">Freigabe-Check konnte nicht geladen werden: ${esc(err.message || err)}</div>`;
-    }
-}
-
 function jobStateLabel(state) {
     const labels = {
         running: 'läuft',
@@ -5438,14 +5345,18 @@ function renderPermissionsResult(data, action) {
         return `<li>${boolBadge(isOk, 'OK', 'Prüfen', true)} <span class="small-code">${esc(item.path)}</span>${item.issue ? ` <span class="text-secondary">- ${esc(item.issue)}</span>` : ''}</li>`;
     }).join('');
     const stepItems = steps.map(step => `<li>${esc(step)}</li>`).join('');
+    const installPath = data.detected_install_path || '';
+    const repairCommand = data.repair_command || '';
+    const instruction = data.repair_instruction || data.repair_message || '';
     return `
         <div class="result-title"><i class="fas ${ok ? 'fa-circle-check ok' : 'fa-triangle-exclamation warn'}"></i>${esc(title)}</div>
         <div class="text-secondary small">${esc(data.summary || 'Prüfung abgeschlossen.')}</div>
         <div class="result-grid">
             <div class="result-tile"><strong>Ergebnis</strong>${boolBadge(ok, 'alles OK', issueCount + ' Hinweis(e)', true)}</div>
-            <div class="result-tile"><strong>Schreibaktionen</strong>${boolBadge(Boolean(data.write_actions_enabled), 'freigeschaltet', 'gesperrt', true)}<div class="text-secondary mt-1">Sicherer Testmodus</div></div>
-            <div class="result-tile"><strong>Reparatur</strong>${boolBadge(Boolean(data.repair_available), 'verfügbar', 'nur vorbereitet', true)}</div>
+            <div class="result-tile"><strong>Reparaturweg</strong>${boolBadge(Boolean(data.repair_available), 'Systemjob verfügbar', 'Konsole nötig', true)}<div class="text-secondary mt-1">Root-eigener argumentloser Launcher</div></div>
+            <div class="result-tile"><strong>Installationspfad</strong><div class="text-secondary mt-1 small-code">${esc(installPath || 'nicht erkannt')}</div></div>
         </div>
+        ${repairCommand ? `<details class="mt-3"><summary><strong>Konsolen-Rückfallweg</strong></summary><div class="text-secondary small mt-1">${esc(instruction)}</div><pre class="raw-json mt-2">${esc(repairCommand)}</pre></details>` : ''}
         ${stepItems ? `<div><strong>Geplanter Ablauf</strong><ul class="result-list">${stepItems}</ul></div>` : ''}
         ${rows ? `<div class="mt-2"><strong>Geprüfte Pfade</strong><ul class="result-list">${rows}</ul></div>` : ''}
         ${renderRawDetails(data)}
@@ -5794,6 +5705,81 @@ async function runModuleAction(moduleKey, action) {
     }
 }
 
+function pollPermissionRepairUpdate() {
+    const log = document.getElementById('actionLog');
+    const modalBody = document.getElementById('jobModalBody');
+    let ticks = 0;
+    let transientErrors = 0;
+    const timer = window.setInterval(async () => {
+        ticks += 1;
+        try {
+            const data = await loadJson(`index.php?action=poll_self_update&t=${Date.now()}`);
+            transientErrors = 0;
+            const output = typeof data.log === 'string' ? data.log : '';
+            const state = data.completion || (data.running ? 'running' : 'unknown');
+            const finished = state === 'success' || state === 'failed';
+            const ok = state === 'success';
+            const html = `
+                <div class="result-title"><i class="fas ${finished ? (ok ? 'fa-circle-check ok' : 'fa-circle-xmark bad') : 'fa-spinner fa-spin warn'}"></i>${finished ? (ok ? 'Reparatur/Systemabgleich abgeschlossen' : 'Reparatur/Systemabgleich fehlgeschlagen') : 'Reparatur/Systemabgleich läuft'}</div>
+                <pre class="raw-json mt-2">${esc(output || 'Warte auf Protokoll...')}</pre>`;
+            log.innerHTML = html;
+            if (modalBody) modalBody.innerHTML = html;
+            if (finished || ticks >= 1800) {
+                window.clearInterval(timer);
+                await loadInstallCenter();
+            }
+        } catch (err) {
+            transientErrors += 1;
+            if (transientErrors > 8) {
+                window.clearInterval(timer);
+                const html = `<div class="bad">Status konnte nicht weiter gelesen werden: ${esc(err.message || err)}. Der root-eigene Systemjob kann im Hintergrund weiterlaufen.</div>`;
+                log.innerHTML = html;
+                if (modalBody) modalBody.innerHTML = html;
+            }
+        }
+    }, 1000);
+}
+
+async function runPermissionRepairUpdate() {
+    if (!confirm('Rechte jetzt reparieren?\n\nDer kanonische Systemjob erstellt zuerst ein Backup, projiziert die Rechte, gleicht den veröffentlichten Release-Stand ab und startet die Dienste neu.')) return;
+    const log = document.getElementById('actionLog');
+    showJobModal(
+        '<i class="fas fa-tools text-warning me-2"></i>Rechte reparieren & System abgleichen',
+        'Root-eigener argumentloser Update-Launcher',
+        '<div class="job-progress-box"><i class="fas fa-spinner fa-spin warn me-1"></i>Systemjob wird gestartet...</div>',
+        true
+    );
+    const body = new FormData();
+    body.append('csrf_token', installCenterCsrfToken);
+    try {
+        const response = await fetch('index.php?action=fix_permissions', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: {
+                'X-Requested-With': 'XMLHttpRequest',
+                'X-CSRF-Token': installCenterCsrfToken
+            },
+            body
+        });
+        const text = await response.text();
+        let data = null;
+        try { data = JSON.parse(text); } catch (_error) {}
+        if (!response.ok || !data || !data.success) {
+            throw new Error((data && data.message) || text || `HTTP ${response.status}`);
+        }
+        const html = `<div class="result-title"><i class="fas fa-spinner fa-spin warn"></i>Systemjob gestartet</div><div class="text-secondary small mt-2">${esc(data.message || 'Backup, Rechteprojektion und Systemabgleich laufen im Hintergrund.')}</div>`;
+        log.innerHTML = html;
+        const modalBody = document.getElementById('jobModalBody');
+        if (modalBody) modalBody.innerHTML = html;
+        pollPermissionRepairUpdate();
+    } catch (err) {
+        const html = `<div class="bad">Rechte-Reparatur konnte nicht gestartet werden: ${esc(err.message || err)}</div>`;
+        log.innerHTML = html;
+        const modalBody = document.getElementById('jobModalBody');
+        if (modalBody) modalBody.innerHTML = html;
+    }
+}
+
 async function runGlobalAction(action) {
     const log = document.getElementById('actionLog');
     const label = (typeof actionLabel === 'function' ? actionLabel(action) : null) || action;
@@ -5840,6 +5826,7 @@ async function runModuleJob(moduleKey, action, viaWrapper = false) {
         const res = await fetch(`install_center.php?action=${endpoint}`, {method: 'POST', body: form});
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
+        if (!data || data.success !== true) throw new Error((data && (data.error || data.message)) || 'Job-Start wurde nicht bestätigt.');
         log.innerHTML = renderActionResult(data, action);
         await refreshInstallerStatusOnly();
         await updateJobModalFromStatus();
@@ -5873,6 +5860,7 @@ async function runGlobalJob(action, viaWrapper = false) {
         const res = await fetch(`install_center.php?action=${endpoint}`, {method: 'POST', body: form});
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
+        if (!data || data.success !== true) throw new Error((data && (data.error || data.message)) || 'Job-Start wurde nicht bestätigt.');
         log.innerHTML = renderActionResult(data, action);
         await refreshInstallerStatusOnly();
         await updateJobModalFromStatus();
@@ -5885,28 +5873,6 @@ async function runGlobalJob(action, viaWrapper = false) {
             jobModalRefreshTimer = null;
         }
     }
-}
-
-async function runGlobalWriteJob(action) {
-    const blockedMessage = 'Privilegierte Installer-Webjobs sind deaktiviert. Bitte Rechte-Reparatur, Installation, Update oder Rückfall bis zu einem eigenen engen Launcher über eine administrative Konsole ausführen.';
-    document.getElementById('actionLog').innerHTML = `<div class="bad">${esc(blockedMessage)}</div>`;
-    showJobModal(
-        '<i class="fas fa-lock text-warning me-2"></i>Webaktion gesperrt',
-        `${esc(actionLabel(action))}`,
-        `<div class="job-progress-box">${esc(blockedMessage)}</div>`
-    );
-    return;
-}
-
-async function runModuleWriteJob(moduleKey, action) {
-    const blockedMessage = 'Privilegierte Modulinstallationen und -rückbauten sind im Web deaktiviert. Bitte die administrative Konsole verwenden.';
-    document.getElementById('actionLog').innerHTML = `<div class="bad">${esc(blockedMessage)}</div>`;
-    showJobModal(
-        '<i class="fas fa-lock text-warning me-2"></i>Webaktion gesperrt',
-        `${esc(moduleKey)}`,
-        `<div class="job-progress-box">${esc(blockedMessage)}</div>`
-    );
-    return;
 }
 
 async function refreshInstallerStatusOnly() {
@@ -6004,7 +5970,14 @@ async function controlService(service, action) {
             },
             body
         });
-        const data = await res.json();
+        let data = null;
+        try { data = await res.json(); } catch (_) { data = null; }
+        if (!res.ok || !data || data.success !== true) {
+            const message = data && (data.message || data.error)
+                ? String(data.message || data.error)
+                : `HTTP ${res.status}`;
+            throw new Error(message);
+        }
         log.innerHTML = renderServiceControlResult(data, service, action);
         await loadInstallCenter();
     } catch (err) {

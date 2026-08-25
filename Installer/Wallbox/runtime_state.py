@@ -48,6 +48,7 @@ class WallboxRuntimeState:
 
     hysteresis_gates: Dict[str, bool] = field(default_factory=dict)
     house_fuse_log_ts: float = 0.0
+    last_configured_wbminsoc: Optional[float] = None
 
     @classmethod
     def from_restore(cls, *, wb_min_power_meas: float = 1380.0, wb_current_amp: int = 6):
@@ -225,6 +226,34 @@ class WallboxRuntimeState:
                 is_open = True
         self.hysteresis_gates[key] = is_open
         return is_open
+
+    def bind_configured_wbminsoc(self, value: float) -> Dict[str, Any]:
+        """Bindet eine Laufzeitänderung der Wallbox-Speicheruntergrenze.
+
+        Der erste gelesene Wert ist nur der Prozess-Startzustand. Erst eine
+        spätere echte Anhebung ist eine Bedienhandlung, die eine bereits
+        laufende Akkuunterstützung noch im selben Regelzyklus widerrufen muss.
+        """
+
+        try:
+            current = float(value)
+        except (TypeError, ValueError, OverflowError):
+            current = 100.0
+        if not math.isfinite(current):
+            current = 100.0
+        current = max(0.0, min(100.0, current))
+        previous = self.last_configured_wbminsoc
+        raised = bool(
+            previous is not None
+            and current > float(previous) + 0.05
+        )
+        self.last_configured_wbminsoc = current
+        return {
+            "contract": "wallbox_wbminsoc_runtime_change_v1",
+            "previous_soc": previous,
+            "current_soc": current,
+            "raised": raised,
+        }
 
     def update_grid_import_budget_gate(
         self,

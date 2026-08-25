@@ -14,6 +14,7 @@ export PATH
 REPOSITORY_URL="https://github.com/A9xxx/Install-E3DC-Control"
 GIT_URL="${REPOSITORY_URL}.git"
 LATEST_URL="${REPOSITORY_URL}/releases/latest"
+RAW_RELEASE_URL="https://raw.githubusercontent.com/A9xxx/Install-E3DC-Control"
 UNIT="e3dc-web-update.service"
 RUNTIME_DIR="/run/e3dc-web-update"
 LOG_DIR="/var/log/e3dc-control"
@@ -23,6 +24,8 @@ STATUS_FILE="${RUNTIME_DIR}/status"
 LOCK_FILE="${RUNTIME_DIR}/lock"
 START_LOCK_FILE="${RUNTIME_DIR}/start.lock"
 DISCOVERY_RELATIVE="Installer/update_bootstrap_discovery.py"
+LEGACY_REGULAR_PARENT=""
+PREVALIDATED_REGULAR_RELEASE=0
 
 fail_with_solution() {
     code=$1
@@ -312,14 +315,32 @@ bind_entry_mode() {
             BOUND_ENTRY_MODE=rescue
             ;;
         regular)
-            [ "${E3DC_BOOTSTRAP_INLINE_WORKER:-}" = "1" ] \
-                && [ "${E3DC_BOOTSTRAP_LOCK_HELD:-}" = "1" ] \
-                && [ -n "${E3DC_BOOTSTRAP_EXPECTED_TAG:-}" ] \
+            [ -n "${E3DC_BOOTSTRAP_EXPECTED_TAG:-}" ] \
                 && [ -n "${E3DC_BOOTSTRAP_EXPECTED_TAG_OBJECT:-}" ] \
                 && [ -n "${E3DC_BOOTSTRAP_EXPECTED_SHA:-}" ] \
-                && [ -n "${E3DC_BOOTSTRAP_RELEASE_DIR:-}" ] \
-                || fail "Regular-Modus besitzt keinen root-eigenen Dispatcher-Vertrag"
+                || fail "Regular-Modus besitzt keine vollständige Tag-/SHA-Bindung"
+            [ "${#E3DC_BOOTSTRAP_EXPECTED_TAG_OBJECT}" -eq 40 ] \
+                && [ "${#E3DC_BOOTSTRAP_EXPECTED_SHA}" -eq 40 ] \
+                || fail "Regular-Modus besitzt keine vollständige Release-SHA-Bindung"
+            case "$E3DC_BOOTSTRAP_EXPECTED_TAG_OBJECT:$E3DC_BOOTSTRAP_EXPECTED_SHA" in
+                *[!0-9a-f:]*) fail "Regular-Modus besitzt ungültige Release-SHAs" ;;
+            esac
             BOUND_ENTRY_MODE=regular
+            if [ -n "${E3DC_BOOTSTRAP_RELEASE_DIR:-}" ]; then
+                validate_release_checkout \
+                    "$E3DC_BOOTSTRAP_RELEASE_DIR" \
+                    "$E3DC_BOOTSTRAP_EXPECTED_TAG" \
+                    "$E3DC_BOOTSTRAP_EXPECTED_TAG_OBJECT" \
+                    "$E3DC_BOOTSTRAP_EXPECTED_SHA"
+                PREVALIDATED_REGULAR_RELEASE=1
+            else
+                LEGACY_REGULAR_PARENT=$(legacy_regular_bootstrap_parent)
+            fi
+            # Alte Web-Launcher halten den äußeren Update-Lock bereits, benennen
+            # ihn aber nicht in jeder veröffentlichten Generation gleich. Nach
+            # der privaten Pfad-/Releaseprüfung ist kein weiterer Parent-Guard
+            # nötig; der Ziel-Updater besitzt zusätzlich seinen eigenen Lock.
+            E3DC_BOOTSTRAP_LOCK_HELD=1
             ;;
         *) fail "Update-Einstiegsmodus muss regular oder rescue sein" ;;
     esac
@@ -332,6 +353,27 @@ validate_private_file() {
         || fail "Root-private Updatedatei ist nicht prüfbar: $path"
     [ "$metadata" = "0 0 $expected_mode regular file 1" ] \
         || fail "Root-private Updatedatei besitzt unzulässige Metadaten: $path"
+}
+
+legacy_regular_bootstrap_parent() {
+    bootstrap_path=$0
+    case "$bootstrap_path" in
+        /run/e3dc-update-download.*/e3dc-update-bootstrap) ;;
+        *) fail "Legacy-Regular-Bootstrap liegt nicht im privaten Downloadpfad" ;;
+    esac
+    parent=${bootstrap_path%/e3dc-update-bootstrap}
+    suffix=${parent#/run/e3dc-update-download.}
+    case "$suffix" in
+        ""|*/*) fail "Legacy-Regular-Bootstrap besitzt keinen eindeutigen Elternpfad" ;;
+    esac
+    [ ! -L "$parent" ] && [ ! -L "$bootstrap_path" ] \
+        || fail "Legacy-Regular-Bootstrap darf kein Symlink sein"
+    parent_metadata=$(stat -c '%u %g %a %F' "$parent") \
+        || fail "Privater Legacy-Downloadpfad ist nicht prüfbar"
+    [ "$parent_metadata" = "0 0 700 directory" ] \
+        || fail "Privater Legacy-Downloadpfad ist nicht ausschließlich root-zugänglich"
+    validate_private_file "$bootstrap_path" 500
+    printf '%s\n' "$parent"
 }
 
 stage_release_contract() {
@@ -377,11 +419,21 @@ bind_with_discovery() {
     explicit_user=$3
     sudo_user=$4
     requested_role=$5
-    python3 -I -B "$discovery" \
-        --explicit-root "$explicit_root" \
-        --explicit-user "$explicit_user" \
-        --sudo-user "$sudo_user" \
-        --requested-role "$requested_role"
+    prefer_launcher_binding=${6:-0}
+    if [ "$prefer_launcher_binding" = "1" ]; then
+        python3 -I -B "$discovery" \
+            --explicit-root "$explicit_root" \
+            --explicit-user "$explicit_user" \
+            --sudo-user "$sudo_user" \
+            --requested-role "$requested_role" \
+            --prefer-launcher-binding
+    else
+        python3 -I -B "$discovery" \
+            --explicit-root "$explicit_root" \
+            --explicit-user "$explicit_user" \
+            --sudo-user "$sudo_user" \
+            --requested-role "$requested_role"
+    fi
 }
 
 list_with_discovery() {
@@ -398,14 +450,6 @@ shell_quote() {
 import shlex
 import sys
 print(shlex.quote(sys.argv[1]))
-PY
-}
-
-bootstrap_display_path() {
-    python3 - "$0" <<'PY'
-import os
-import sys
-print(os.path.abspath(sys.argv[1]))
 PY
 }
 
@@ -488,7 +532,6 @@ select_console_target() {
         return 0
     fi
 
-    display_path=$(shell_quote "$(bootstrap_display_path)")
     printf '\n[ABBRUCH] E3DC-UPD-PATH-005\n' >&2
     printf 'Was ist passiert: Mehrere gleichrangige E3DC-Control-Instanzen wurden erkannt; kein Pfad wurde geraten.\n' >&2
     printf 'Systemzustand: Keine der erkannten Installationen wurde verändert.\n' >&2
@@ -497,8 +540,9 @@ select_console_target() {
     while IFS="$(printf '\t')" read -r candidate_root candidate_sources; do
         [ -n "$candidate_root" ] || continue
         quoted_root=$(shell_quote "$candidate_root")
-        printf '  sudo /bin/sh %s %s  # %s\n' \
-            "$display_path" "$quoted_root" "$candidate_sources" >&2
+        quoted_url=$(shell_quote "$RAW_RELEASE_URL/$BOUND_TAG/e3dc-update-bootstrap")
+        printf '  bootstrap_file="$(mktemp)" && curl -q -fsS --proto =https --tlsv1.2 -o "$bootstrap_file" %s && sudo /bin/sh "$bootstrap_file" %s; rc=$?; rm -f -- "$bootstrap_file"; [ "$rc" -eq 0 ]  # %s\n' \
+            "$quoted_url" "$quoted_root" "$candidate_sources" >&2
     done <"$candidates_file"
     find "$STAGE_DIR" -depth -delete 2>/dev/null || true
     exit 64
@@ -508,14 +552,16 @@ parse_binding() {
     binding=$1
     tab=$(printf '\t')
     case "$binding" in
-        *"$tab"*"$tab"*) ;;
-        *) fail "Discovery lieferte keine eindeutige Root-/Benutzer-/Rollenbindung" ;;
+        *"$tab"*"$tab"*"$tab"*) ;;
+        *) fail "Discovery lieferte keine eindeutige Root-/Benutzer-/Rollen-/Peer-Bindung" ;;
     esac
     BOUND_ROOT=${binding%%"$tab"*}
     remainder=${binding#*"$tab"}
     BOUND_USER=${remainder%%"$tab"*}
-    BOUND_ROLE=${remainder#*"$tab"}
-    case "$BOUND_ROLE" in
+    role_and_peer=${remainder#*"$tab"}
+    BOUND_ROLE=${role_and_peer%%"$tab"*}
+    BOUND_PEER_IP=${role_and_peer#*"$tab"}
+    case "$BOUND_PEER_IP" in
         *"$tab"*) fail "Discovery lieferte überzählige Bindungsfelder" ;;
     esac
     [ -n "$BOUND_ROOT" ] && [ -n "$BOUND_USER" ] \
@@ -531,25 +577,54 @@ prepare_release_and_binding() {
     explicit_user=$2
     sudo_user=$3
     requested_role=$4
+    prefer_launcher_binding=0
     BOUND_TAG=$(resolve_release_tag)
     STAGE_DIR=$(stage_release_contract)
     if [ "${SYNCHRONOUS_STAGE_OWNED:-}" = "1" ]; then
         trap cleanup_synchronous_stage EXIT
     fi
+    release_download_required=0
     if [ "$BOUND_ENTRY_MODE" = "regular" ]; then
-        RELEASE_DIR=${E3DC_BOOTSTRAP_RELEASE_DIR:-}
-        validate_release_checkout \
-            "$RELEASE_DIR" "$BOUND_TAG" \
-            "${E3DC_BOOTSTRAP_EXPECTED_TAG_OBJECT:-}" \
-            "${E3DC_BOOTSTRAP_EXPECTED_SHA:-}"
+        if [ -n "${E3DC_BOOTSTRAP_RELEASE_DIR:-}" ]; then
+            RELEASE_DIR=$E3DC_BOOTSTRAP_RELEASE_DIR
+            if [ "${PREVALIDATED_REGULAR_RELEASE:-0}" != "1" ]; then
+                validate_release_checkout \
+                    "$RELEASE_DIR" "$BOUND_TAG" \
+                    "${E3DC_BOOTSTRAP_EXPECTED_TAG_OBJECT:-}" \
+                    "${E3DC_BOOTSTRAP_EXPECTED_SHA:-}"
+            fi
+        else
+            [ -n "${LEGACY_REGULAR_PARENT:-}" ] \
+                || LEGACY_REGULAR_PARENT=$(legacy_regular_bootstrap_parent)
+            RELEASE_DIR="$LEGACY_REGULAR_PARENT/release"
+            release_download_required=1
+        fi
     else
         RELEASE_DIR="$STAGE_DIR/release"
+        release_download_required=1
+    fi
+    if [ "$release_download_required" = "1" ]; then
         download_release_checkout "$RELEASE_DIR" "$BOUND_TAG"
+        if [ "$BOUND_ENTRY_MODE" = "regular" ]; then
+            validate_release_checkout \
+                "$RELEASE_DIR" "$BOUND_TAG" \
+                "${E3DC_BOOTSTRAP_EXPECTED_TAG_OBJECT:-}" \
+                "${E3DC_BOOTSTRAP_EXPECTED_SHA:-}"
+        fi
     fi
     BOUND_TAG_OBJECT=$RELEASE_TAG_OBJECT
     BOUND_SHA=$RELEASE_SHA
     discovery="$RELEASE_DIR/$DISCOVERY_RELATIVE"
-    select_console_target "$discovery" "$explicit_root"
+    if [ -z "$explicit_root" ] \
+        && [ "$BOUND_ENTRY_MODE" = "regular" ]; then
+        # Kompatibilitätsbrücke für installierte Launcher, die ihren bereits
+        # gebundenen Root noch nicht als Argument weiterreichen. Die sichere
+        # Root-/Benutzerbindung wird aus dem root-eigenen Launcher gelesen.
+        prefer_launcher_binding=1
+        SELECTED_EXPLICIT_ROOT=""
+    else
+        select_console_target "$discovery" "$explicit_root"
+    fi
     binding_error=$(mktemp "${STAGE_DIR}/binding-error.XXXXXX") \
         || fail_with_solution \
             "E3DC-UPD-RUN-007" \
@@ -560,15 +635,14 @@ prepare_release_and_binding() {
     if ! binding=$(bind_with_discovery \
         "$discovery" \
         "$SELECTED_EXPLICIT_ROOT" "$explicit_user" "$sudo_user" "$requested_role" \
+        "$prefer_launcher_binding" \
         2>"$binding_error"); then
+        # Die Discovery liefert bereits genau einen typisierten Abbruch samt
+        # konkreter Lösung. Diese Ausgabe darf nicht durch einen zweiten,
+        # im privaten Web-Updatepfad nicht ausführbaren Befehl verwässert werden.
         cat "$binding_error" >&2
         find "$STAGE_DIR" -depth -delete 2>/dev/null || true
-        fail_with_solution \
-            "E3DC-UPD-PATH-011" \
-            "Die erkannte Installation konnte nicht eindeutig an Root, Benutzer und Rolle gebunden werden." \
-            "Der eigentliche Updater wurde nicht gestartet; keine Installation wurde verändert." \
-            "Lokale E3DC-Control-Installation" \
-            "sudo /bin/sh ./e3dc-update-bootstrap"
+        exit 1
     fi
     rm -f "$binding_error"
     parse_binding "$binding"
@@ -631,8 +705,19 @@ validate_release_checkout() {
     [ -n "$release_version" ] && [ "v$release_version" = "$tag" ] \
         || fail "VERSION, Tag und Commit des privaten Release widersprechen sich"
     if [ "$BOUND_ENTRY_MODE" = "regular" ]; then
-        [ "$0" = "$checkout_dir/e3dc-update-bootstrap" ] \
-            || fail "Regular-Modus läuft nicht aus dem privaten Release-Checkout"
+        if [ "$0" = "$checkout_dir/e3dc-update-bootstrap" ]; then
+            :
+        elif [ -n "${LEGACY_REGULAR_PARENT:-}" ] \
+            && [ "$0" = "$LEGACY_REGULAR_PARENT/e3dc-update-bootstrap" ] \
+            && [ "$checkout_dir" = "$LEGACY_REGULAR_PARENT/release" ]; then
+            # Launcher 5.4.4a/b laden nur den commitgebundenen Bootstrap in
+            # ihren root-privaten Downloadpfad. Dessen frisch geladener voller
+            # Release darf nach obigem exakten Tag-/SHA-Abgleich übernommen
+            # werden, ohne einen neuen Parent-Parameter zu verlangen.
+            :
+        else
+            fail "Regular-Modus läuft nicht aus einer gebundenen privaten Releasequelle"
+        fi
     fi
     RELEASE_TAG_OBJECT=$fetched_tag
     RELEASE_SHA=$fetched_sha
@@ -719,6 +804,7 @@ run_bound_update() (
         LANG=C.UTF-8 \
         LC_ALL=C.UTF-8 \
         E3DC_BOOTSTRAP_USER="$BOUND_USER" \
+        E3DC_BOOTSTRAP_BOUND_PEER_IP="$BOUND_PEER_IP" \
         E3DC_BOOTSTRAP_ENTRY_MODE="$BOUND_ENTRY_MODE" \
         E3DC_RELEASE_CHECKOUT_VERIFIED=1 \
         /bin/sh "$checkout/e3dc-bootstrap" \
@@ -798,6 +884,7 @@ start_background_job() {
         --setenv="E3DC_INSTALL_PATH=$BOUND_ROOT" \
         --setenv="E3DC_BOOTSTRAP_USER=$BOUND_USER" \
         --setenv="E3DC_BOOTSTRAP_BOUND_ROLE=$BOUND_ROLE" \
+        --setenv="E3DC_BOOTSTRAP_BOUND_PEER_IP=$BOUND_PEER_IP" \
         --setenv=SUDO_USER= \
         /bin/sh "$STAGE_DIR/release/e3dc-update-bootstrap" --systemd-worker 2>&1)
     launch_status=$?
@@ -842,6 +929,7 @@ validate_worker_environment() {
     BOUND_ROOT=${E3DC_INSTALL_PATH:-}
     BOUND_USER=${E3DC_BOOTSTRAP_USER:-}
     BOUND_ROLE=${E3DC_BOOTSTRAP_BOUND_ROLE:-}
+    BOUND_PEER_IP=${E3DC_BOOTSTRAP_BOUND_PEER_IP:-}
     [ "${#BOUND_TAG_OBJECT}" -eq 40 ] && [ "${#BOUND_SHA}" -eq 40 ] \
         || fail "Hintergrund-Worker besitzt keine vollständige Release-SHA-Bindung"
     case "$BOUND_TAG_OBJECT:$BOUND_SHA" in
@@ -976,7 +1064,8 @@ if [ "${1:-}" = "--systemd-worker" ]; then
         "sudo journalctl -u $UNIT --no-pager -n 120" \
         64
     run_background_worker
-elif [ "${E3DC_BOOTSTRAP_INLINE_WORKER:-}" != "1" ]; then
+elif [ "${E3DC_BOOTSTRAP_ENTRY_MODE:-}" != "regular" ] \
+    && [ "${E3DC_BOOTSTRAP_INLINE_WORKER:-}" != "1" ]; then
     start_background_job "$@"
 else
     run_synchronous_update "$@"

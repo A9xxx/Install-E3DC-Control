@@ -19,16 +19,22 @@ from .modes import (
     normalize_wb_mode,
 )
 from .decision import status_connected
+from .phase_balancing import (
+    normalize_rotation,
+    _strict_numeric_vector,
+)
 
 logger = logging.getLogger("WallboxManager.Controller")
 
 
 def _classify_mode(c_mode):
     """
-    Vereinfacht den oeffentlichen WB-Modus auf drei interne Controller-Klassen:
-      'instant'   - Sofortladen mit max Strom (Netz erlaubt, durch Config/Hauslimit gedeckelt)
-      'corridor'  - Ladekorridor (Mindest-Amp = 6A immer gesichert, dann Rest aufteilen)
-      'pv'        - PV-Ueberschuss (nur was uebrig ist nach Bat-Prio)
+    Vereinfacht den öffentlichen WB-Modus auf interne Controller-Klassen:
+      'instant'   - autorisiertes Budget bevorzugt bis zum Stromdeckel zuteilen
+      'corridor'  - Mindeststrom innerhalb des autorisierten Budgets priorisieren
+      'pv'        - ausschließlich das autorisierte PV-/Speicherbudget verteilen
+
+    Keine Klasse erzeugt selbst Leistung; ``available_watts`` bleibt bindend.
     """
     c_mode = normalize_wb_mode(c_mode)
     if c_mode == MODE_BASE:
@@ -82,7 +88,9 @@ def _status_running(status):
 def allocate_power(available_watts, chargers_status, mode, max_amp,
                    wb_charge_mode, price_optimizing_active=False,
                    max_amp_by_id=None, fairness_weight_by_id=None,
-                   phase_count_by_id=None, watts_per_amp_by_id=None):
+                   phase_count_by_id=None, watts_per_amp_by_id=None,
+                   grid_phase_limit_vector=None, phase_rotation_by_id=None,
+                   unmanaged_phase_amps=None):
     """
     Verteilt 'available_watts' auf alle verbundenen Wallboxen.
 
@@ -104,8 +112,15 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
     ``available_watts``. Gemessene Watt-pro-Ampere-Werte dürfen den nominalen
     Leistungsansatz von 230 V je aktiver Phase nicht absenken: Ein Fahrzeug,
     das sein Stromangebot gerade nicht vollständig abnimmt, öffnet dadurch
-    kein zusätzliches Gruppenbudget. Ohne diese neuen Maps bleibt der
-    historische Rückgabevertrag für bestehende Aufrufer unverändert.
+    kein zusätzliches Gruppenbudget. Auch ohne diese Maps bleibt
+    ``available_watts`` die einzige Leistungsautorität; Modus-, Preis- und
+    Phaseninformationen dürfen kein eigenes Startbudget erzeugen.
+
+    ``grid_phase_limit_vector``: Optionaler Phasenvektor [L1, L2, L3] in Ampere
+    (z. B. Hausabsicherung minus Reserve). Startzuteilung und Stromerhöhung
+    werden gemeinsam gegen diesen Phasenvektor verteilt, ohne pauschale Halbierung.
+    Autonome oder unmanaged Verbraucher werden konservativ gegen den verfügbaren
+    Rest reserviert und erhalten keine Stromkommandos.
 
     Der Wattvertrag ergänzt je Ladepunkt ``target_power_w``,
     ``target_phases`` und ``target_amp_per_phase``; ``target_amp`` bleibt der
@@ -126,6 +141,23 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
     per_charger_limits = max_amp_by_id if isinstance(max_amp_by_id, dict) else {}
     fairness_weights = fairness_weight_by_id if isinstance(fairness_weight_by_id, dict) else {}
     phase_counts = phase_count_by_id if isinstance(phase_count_by_id, dict) else None
+    rotations_by_id = phase_rotation_by_id if isinstance(phase_rotation_by_id, dict) else {}
+    phase_limits = None
+    phase_limits_valid = True
+    if grid_phase_limit_vector is not None:
+        raw_p_limits = _strict_numeric_vector(grid_phase_limit_vector)
+        if raw_p_limits is None or any(v < 0.0 for v in raw_p_limits):
+            phase_limits = [0.0, 0.0, 0.0]
+            phase_limits_valid = False
+        else:
+            phase_limits = [float(v) for v in raw_p_limits]
+
+    if phase_limits is not None and phase_limits_valid and unmanaged_phase_amps is not None:
+        raw_unm = _strict_numeric_vector(unmanaged_phase_amps)
+        if raw_unm is not None:
+            for p in range(3):
+                phase_limits[p] = max(0.0, phase_limits[p] - max(0.0, float(raw_unm[p])))
+
     def _mapped_value(values, c_id, default=None):
         if not isinstance(values, dict):
             return default
@@ -149,10 +181,6 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
 
     def _watts_per_amp(c_id, phases):
         nominal = 230.0 * float(phases)
-        # ``watts_per_amp_by_id`` bleibt als Eingangs-/Diagnosevertrag
-        # kompatibel, ist aber niemals Autorität für die harte Zuteilung.
-        # Maßgeblich ist die Leistung, die das angebotene Stromlimit bei
-        # nominaler Netzspannung ermöglichen würde.
         return nominal
 
     def _allocation_result(target_amp, state, phases, w_per_amp):
@@ -169,40 +197,150 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
             })
         return result
 
-    # --- Phase 1: Sofortladen / Ladekorridor Vorab-Zuteilung -----------------
+    # --- Phase 1: Vorab-Prüfung und Autonome Verbraucher ---------------------
     for c in chargers_status:
         c_id = c['id']
-        # Alle Treiber werden bereits auf ein echtes Steckersignal
-        # normalisiert. openWB Pro liefert dabei nicht zwingend das alte
-        # numerische ``car``-Feld; eine Prüfung ausschließlich darauf ließ
-        # einen nachweislich verbundenen Ladepunkt trotz positivem Wattbudget
-        # aus der Verteilung fallen.
-        if not (c['status'] and status_connected(c['status'])):
-            continue
-        if c['status'].get('locked', False):
-            continue
+        status = c.get('status') if isinstance(c.get('status'), dict) else {}
+        c_mode = normalize_wb_mode(wb_charge_mode.get(c_id, MODE_OFF))
 
-        c_mode    = normalize_wb_mode(wb_charge_mode.get(c_id, MODE_OFF))
-        
-        # E3DC Autonom/Python aus: immer aus der Python-Verteilung ignorieren.
+        # E3DC Autonom / MODE_OFF: keine Steuerbefehle, aber konservative
+        # Reservierung gegen das verbleibende Phasenbudget.
         if c_mode == 0:
+            if phase_limits is not None and phase_limits_valid:
+                c_phases = _phase_count(status, c_id)
+                c_rot = normalize_rotation(_mapped_value(rotations_by_id, c_id))
+
+                # Evidenzreihenfolge:
+                # 1. Frische gemessene Phasenströme
+                # 2. Frischer bestätigter tatsächlicher Ladestrom
+                # 3. Bei laufender Ladung ohne gültigen Iststrom sowie bei
+                #    stale/unklarem Status: konfiguriertes Hardwaremaximum
+                # 4. Frisch und widerspruchsfrei nicht ladend: 0 A
+                c_accepted = 0.0
+                phase_amps = None
+
+                try:
+                    fallback_max = float(max_amp)
+                except (TypeError, ValueError):
+                    fallback_max = 32.0
+                if not math.isfinite(fallback_max) or fallback_max <= 0.0:
+                    fallback_max = 32.0
+                try:
+                    hw_max = float(
+                        per_charger_limits.get(c_id, fallback_max)
+                        or fallback_max
+                    )
+                except (TypeError, ValueError):
+                    hw_max = fallback_max
+                if not math.isfinite(hw_max) or hw_max <= 0.0:
+                    hw_max = fallback_max
+                hw_max = max(0.0, hw_max)
+
+                status_fresh = bool(
+                    status.get('driver_status_valid') is True
+                    and status.get('driver_status_stale') is not True
+                    and status.get('driver_status_glitch') is not True
+                    and status.get('stale') is not True
+                )
+                if not status_fresh:
+                    # Ein autonomer Ladepunkt kann bei Kommunikationsverlust
+                    # physisch weiterladen. Da wir ihn in MODE_OFF nicht
+                    # kommandieren dürfen, muss sein Hardwaremaximum den
+                    # verbleibenden Phasenraum konservativ belegen.
+                    c_accepted = hw_max
+                else:
+                    raw_phase_amps = []
+                    complete_phase_vector = True
+                    for p in (1, 2, 3):
+                        p_val = status.get(f"phase_current_l{p}_a")
+                        try:
+                            p_amp = float(p_val)
+                        except (TypeError, ValueError):
+                            complete_phase_vector = False
+                            break
+                        if not math.isfinite(p_amp) or p_amp < 0.0:
+                            complete_phase_vector = False
+                            break
+                        raw_phase_amps.append(p_amp)
+
+                    if (
+                        complete_phase_vector
+                        and len(raw_phase_amps) == 3
+                        and any(value > 0.5 for value in raw_phase_amps)
+                    ):
+                        if c_rot is not None:
+                            phase_amps = [0.0, 0.0, 0.0]
+                            for local_index, pcc_index in enumerate(c_rot):
+                                phase_amps[pcc_index] = raw_phase_amps[local_index]
+                        else:
+                            # Ohne bestätigte Zuordnung darf eine lokale
+                            # Phasenmessung keine PCC-Phase freigeben.
+                            c_accepted = max(raw_phase_amps)
+                        if phase_amps is not None:
+                            c_accepted = max(phase_amps)
+
+                    if c_accepted <= 0.0:
+                        actual_amp = (
+                            status.get("charging_current")
+                            or status.get("actual_charging_current")
+                            or status.get("real_current_a")
+                            or status.get("current_a")
+                        )
+                        try:
+                            actual_amp = float(actual_amp or 0.0)
+                        except (TypeError, ValueError):
+                            actual_amp = 0.0
+                        if math.isfinite(actual_amp) and actual_amp > 0.0:
+                            c_accepted = actual_amp
+
+                    if c_accepted <= 0.0 and _status_running(status):
+                        # Wirkleistung ist wegen Spannung und Leistungsfaktor
+                        # keine RMS-Stromautorität. Läuft die autonome Box ohne
+                        # gültigen Stromwert, bleibt nur das Hardwaremaximum.
+                        c_accepted = hw_max
+
+                if c_accepted > 0.0:
+                    if phase_amps is not None:
+                        for p in range(3):
+                            phase_limits[p] = max(0.0, phase_limits[p] - phase_amps[p])
+                    elif c_phases >= 3:
+                        for p in range(3):
+                            phase_limits[p] = max(0.0, phase_limits[p] - c_accepted)
+                    elif c_phases == 1 and c_rot is not None:
+                        idx = c_rot[0]
+                        phase_limits[idx] = max(0.0, phase_limits[idx] - c_accepted)
+                    else:
+                        for p in range(3):
+                            phase_limits[p] = max(0.0, phase_limits[p] - c_accepted)
             continue
 
-        # Zeitplan aktiv -> Sofortladen, aber nur fuer aktiv von Python
-        # verwaltete Ladepunkte. Mode 0 bleibt auch bei Preisfenstern stumm.
-        local_price_optimizing_active = _price_active_for(price_optimizing_active, c_id)
+        if not (status and status_connected(status)):
+            continue
+        if status.get('locked', False):
+            continue
+        if (
+            status.get('driver_status_valid') is False
+            or status.get('driver_status_stale') is True
+            or status.get('stale') is True
+        ):
+            continue
+
+        local_price_optimizing_active = (
+            _price_active_for(price_optimizing_active, c_id)
+            and c_mode == 5
+        )
 
         if local_price_optimizing_active:
             behavior = 'instant'
         else:
             behavior = _classify_mode(c_mode)
-        phases    = _phase_count(c['status'], c_id)
+        phases = _phase_count(c['status'], c_id)
         if strict_watt_contract and phases == 0:
             alloc[c_id] = _allocation_result(0, 1, 0, 0.0)
             logger.debug(f"WB{c_id} keine frische/plausible Phasenzahl: Zuteilung bleibt 0A")
             continue
         w_per_amp = _watts_per_amp(c_id, phases)
-        min_w     = 6 * w_per_amp
+        min_w = 6 * w_per_amp
         try:
             charger_max_amp = int(per_charger_limits.get(c_id, max_amp) or max_amp)
         except (TypeError, ValueError):
@@ -212,82 +350,38 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
             alloc[c_id] = _allocation_result(0, 1, phases, w_per_amp)
             logger.debug(f"WB{c_id} Stromlimit unter 6A: Zuteilung bleibt 0A")
             continue
-        max_w     = charger_max_amp * w_per_amp
+        max_w = charger_max_amp * w_per_amp
         try:
             fairness_weight = max(0.01, float(fairness_weights.get(c_id, 1.0) or 1.0))
         except (TypeError, ValueError):
             fairness_weight = 1.0
 
-        # Zeitplan aktiv -> immer Sofortladen (ueberschreibt c_mode)
-        if local_price_optimizing_active:
-            behavior = 'instant'
+        rotation = normalize_rotation(_mapped_value(rotations_by_id, c_id))
 
         if behavior == 'instant':
-            if strict_watt_contract:
-                active_chargers.append({
-                    'id': c_id,
-                    'charger': c['charger'],
-                    'phases': phases,
-                    'w_per_amp': w_per_amp,
-                    'min_w': min_w,
-                    'max_w': max_w,
-                    'max_amp': charger_max_amp,
-                    'fairness_weight': fairness_weight,
-                    'mode': c_mode,
-                    'behavior': behavior,
-                    'allocated_amp': 0,
-                    'state': 1,
-                    'running': _status_running(c['status']),
-                })
-                logger.debug(
-                    f"WB{c_id} Sofortladen im Wattvertrag ({c_mode=}): "
-                    f"Zuteilung nach gruppenweitem Lauf-/Prioritätsvertrag bei {phases}p"
-                )
-            else:
-                # Historischer Vertrag: Die explizite Netzfreigabe fordert Maximalstrom an.
-                alloc[c_id] = {
-                    'target_amp': charger_max_amp,
-                    'state': 2,
-                }
-                remaining_watts -= max_w
-                logger.debug(f"WB{c_id} Sofortladen ({c_mode=}): {charger_max_amp}A")
+            active_chargers.append({
+                'id': c_id,
+                'charger': c.get('charger'),
+                'phases': phases,
+                'rotation': rotation,
+                'w_per_amp': w_per_amp,
+                'min_w': min_w,
+                'max_w': max_w,
+                'max_amp': charger_max_amp,
+                'fairness_weight': fairness_weight,
+                'mode': c_mode,
+                'behavior': behavior,
+                'allocated_amp': 0,
+                'state': 1,
+                'running': _status_running(c['status']),
+            })
 
         elif behavior == 'corridor':
-            # Im Wattvertrag muss auch der 6-A-Boden durch das gemeinsame
-            # Leistungsbudget gedeckt sein. Der Legacy-Aufruf behält seine
-            # bisherige Grundladefreigabe.
-            allocated_amp = 0 if strict_watt_contract else 6
-            if not strict_watt_contract:
-                remaining_watts -= min_w
             active_chargers.append({
                 'id':            c_id,
-                'charger':       c['charger'],
+                'charger':       c.get('charger'),
                 'phases':        phases,
-                'w_per_amp':     w_per_amp,
-                'min_w':         min_w,
-                'max_w':         max_w,
-                'max_amp':       charger_max_amp,
-                'fairness_weight': fairness_weight,
-                'mode':          c_mode,
-                'behavior':      behavior,
-                'allocated_amp': allocated_amp,
-                'state':         1 if strict_watt_contract else 2,
-                'running':       _status_running(c['status']),
-            })
-            if strict_watt_contract:
-                logger.debug(
-                    f"WB{c_id} Ladekorridor im Wattvertrag ({c_mode=}): "
-                    "Mindeststrom nur bei gedecktem Leistungsbudget"
-                )
-            else:
-                logger.debug(f"WB{c_id} Ladekorridor ({c_mode=}): 6A garantiert + Ueberschuss")
-
-        else:
-            # PV-Ueberschuss: Nur laden wenn genug da ist (kommt aus Phase 2)
-            active_chargers.append({
-                'id':            c_id,
-                'charger':       c['charger'],
-                'phases':        phases,
+                'rotation':      rotation,
                 'w_per_amp':     w_per_amp,
                 'min_w':         min_w,
                 'max_w':         max_w,
@@ -296,35 +390,89 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
                 'mode':          c_mode,
                 'behavior':      behavior,
                 'allocated_amp': 0,
-                'state':         1,  # Default: Stop, wird in Phase 2 gesetzt
+                'state':         1,
+                'running':       _status_running(c['status']),
+            })
+
+        else:
+            active_chargers.append({
+                'id':            c_id,
+                'charger':       c.get('charger'),
+                'phases':        phases,
+                'rotation':      rotation,
+                'w_per_amp':     w_per_amp,
+                'min_w':         min_w,
+                'max_w':         max_w,
+                'max_amp':       charger_max_amp,
+                'fairness_weight': fairness_weight,
+                'mode':          c_mode,
+                'behavior':      behavior,
+                'allocated_amp': 0,
+                'state':         1,
                 'running':       _status_running(c['status']),
             })
 
     if not active_chargers:
         return alloc
 
-    # --- Phase 2: Ueberschuss auf verbleibende Boxen verteilen ---------------
-    # Sortierung nach Prioritaet (wb_native_mode)
-    if mode == 1:
-        active_chargers.sort(key=lambda x: 0 if x['id'] == 1 else 1)
-    elif mode == 2:
-        active_chargers.sort(key=lambda x: 0 if x['id'] == 2 else 1)
+    # --- Phase 2: Zuteilung gegen Wattbudget und Phasenvektor ----------------
+    allocated_pcc_phase_a = [0.0, 0.0, 0.0]
 
-    if strict_watt_contract:
-        priority_id = int(mode) if int(mode) in (1, 2) else 0
-
-        def _grant_strict_minimum(c):
-            nonlocal remaining_watts
-            if c['allocated_amp'] < 6 and remaining_watts >= c['min_w']:
-                remaining_watts -= c['min_w']
-                c['allocated_amp'] = 6
-                c['state'] = 2
-                return True
+    def _can_allocate_delta(c, delta_a):
+        if c['allocated_amp'] + delta_a > c['max_amp']:
             return False
+        # Das Gruppen-Wattbudget bleibt in jedem Aufruf bindend. Der optionale
+        # Phasenvektor ist nur eine zusätzliche Hausanschlussgrenze und darf
+        # weder einen 6-A-Start noch eine Erhöhung aus 0 W erzeugen.
+        if math.isfinite(remaining_watts):
+            if remaining_watts + 1e-9 < delta_a * c['w_per_amp']:
+                return False
+        if phase_limits is not None:
+            if not phase_limits_valid:
+                return False
+            rot = c.get('rotation')
+            if c['phases'] >= 3:
+                if any(allocated_pcc_phase_a[p] + delta_a > phase_limits[p] + 1e-9 for p in range(3)):
+                    return False
+            elif c['phases'] == 1 and rot is not None:
+                idx = rot[0]
+                if allocated_pcc_phase_a[idx] + delta_a > phase_limits[idx] + 1e-9:
+                    return False
+            else:
+                if any(allocated_pcc_phase_a[p] + delta_a > phase_limits[p] + 1e-9 for p in range(3)):
+                    return False
+        return True
 
-        # Elektromechanisch zuerst die bereits physisch laufenden Ladungen
-        # halten. Erst danach dürfen Preis-/Prioritätswünsche eine nur
-        # verbundene Wallbox neu starten; die Eingangsreihenfolge ist bedeutungslos.
+    def _apply_delta(c, delta_a):
+        nonlocal remaining_watts
+        c['allocated_amp'] += delta_a
+        if math.isfinite(remaining_watts):
+            remaining_watts -= delta_a * c['w_per_amp']
+        if phase_limits is not None:
+            rot = c.get('rotation')
+            if c['phases'] >= 3:
+                for p in range(3):
+                    allocated_pcc_phase_a[p] += delta_a
+            elif c['phases'] == 1 and rot is not None:
+                idx = rot[0]
+                allocated_pcc_phase_a[idx] += delta_a
+            else:
+                for p in range(3):
+                    allocated_pcc_phase_a[p] += delta_a
+
+    def _grant_strict_minimum(c):
+        if c['allocated_amp'] < 6 and _can_allocate_delta(c, 6):
+            _apply_delta(c, 6)
+            c['state'] = 2
+            return True
+        return False
+
+    def _grant_minimum(c):
+        return _grant_strict_minimum(c)
+
+    priority_id = int(mode) if int(mode) in (1, 2) else 0
+
+    if strict_watt_contract or phase_limits is not None:
         running_order = sorted(
             (c for c in active_chargers if c.get('running')),
             key=lambda c: (
@@ -336,41 +484,24 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
         for c in running_order:
             _grant_strict_minimum(c)
 
-        priority_started = any(
-            int(c.get('id', 0)) == priority_id and c.get('state') == 2
-            for c in active_chargers
-        )
-        priority_present = any(
-            int(c.get('id', 0)) == priority_id for c in active_chargers
-        )
-        if priority_id and priority_present and not priority_started:
-            for c in active_chargers:
-                if int(c.get('id', 0)) == priority_id:
-                    priority_started = _grant_strict_minimum(c)
-                    break
-
         idle_order = sorted(
             (c for c in active_chargers if not c.get('running')),
             key=lambda c: (
+                0 if int(c.get('id', 0)) == priority_id else 1,
                 0 if c.get('behavior') == 'instant' else 1,
                 int(c.get('id', 0)),
             ),
         )
-        if priority_id == 0:
-            for c in idle_order:
+        for c in idle_order:
+            if c['state'] != 2:
                 _grant_strict_minimum(c)
-        elif not priority_present or not priority_started:
-            for c in idle_order:
-                if _grant_strict_minimum(c):
-                    break
 
         if priority_id == 0:
             while remaining_watts > 0:
                 candidates = [
                     c for c in active_chargers
                     if c['state'] == 2
-                    and c['allocated_amp'] < c['max_amp']
-                    and remaining_watts >= c['w_per_amp']
+                    and _can_allocate_delta(c, 1)
                 ]
                 if not candidates:
                     break
@@ -385,8 +516,7 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
                         c['id'],
                     ),
                 )
-                chosen['allocated_amp'] += 1
-                remaining_watts -= chosen['w_per_amp']
+                _apply_delta(chosen, 1)
         else:
             extra_order = sorted(
                 active_chargers,
@@ -399,42 +529,25 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
             while remaining_watts > 0:
                 allocated_any = False
                 for c in extra_order:
-                    if (
-                        c['state'] == 2
-                        and c['allocated_amp'] < c['max_amp']
-                        and remaining_watts >= c['w_per_amp']
-                    ):
-                        c['allocated_amp'] += 1
-                        remaining_watts -= c['w_per_amp']
+                    if c['state'] == 2 and _can_allocate_delta(c, 1):
+                        _apply_delta(c, 1)
                         allocated_any = True
                 if not allocated_any:
                     break
 
     elif mode == 0:
-        # Ausgeglichen: Eine bereits physisch laufende Wallbox darf nicht nur
-        # wegen der Eingangsreihenfolge ihr Mindestbudget an eine stehende
-        # Wallbox verlieren. Innerhalb beider Gruppen bleibt die ID-Reihenfolge
-        # stabil; angebotene Ampere gelten ausdrücklich nicht als Ladebeleg.
         minimum_order = sorted(
             active_chargers,
             key=lambda c: (0 if c.get('running') else 1, int(c.get('id', 0))),
         )
         for c in minimum_order:
-            if c['allocated_amp'] < 6 and remaining_watts >= c['min_w']:
-                remaining_watts -= c['min_w']
-                c['allocated_amp'] = 6
-                c['state'] = 2
+            _grant_minimum(c)
 
-        # Progressive Füllung nach zugeteilter Wirkleistung. Damit sind z. B.
-        # 16 A einphasig und 6 A dreiphasig annähernd energiefair, während
-        # 16 A + 16 A dies nicht wären. Ein optionales Gewicht bildet später
-        # Deadline-/Energieschuld ab, ohne die Safety-Caps zu verändern.
         while remaining_watts > 0:
             candidates = [
                 c for c in active_chargers
                 if c['state'] == 2
-                and c['allocated_amp'] < c['max_amp']
-                and remaining_watts >= c['w_per_amp']
+                and _can_allocate_delta(c, 1)
             ]
             if not candidates:
                 break
@@ -445,56 +558,27 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
                     c['id'],
                 ),
             )
-            chosen['allocated_amp'] += 1
-            remaining_watts -= chosen['w_per_amp']
+            _apply_delta(chosen, 1)
     else:
-        # Prioritaet: die gewaehlte Box bekommt zuerst Mindeststrom und den
-        # ersten Extra-Ampere je Runde. Sobald das Budget fuer weitere
-        # Mindeststroeme reicht, werden diese aber gehalten oder gestartet.
-        # So wird Prioritaet nicht zur Monopol-Freigabe.
-        priority_id = int(mode) if int(mode) in (1, 2) else 0
-        priority_present = any(int(c.get('id', 0)) == priority_id for c in active_chargers)
-
-        def _grant_minimum(c):
-            nonlocal remaining_watts
-            if c['allocated_amp'] < 6 and remaining_watts >= c['min_w']:
-                remaining_watts -= c['min_w']
-                c['allocated_amp'] = 6
-                c['state'] = 2
-                return True
-            return False
-
-        priority_started = False
-        if priority_present:
-            for c in active_chargers:
-                if int(c.get('id', 0)) == priority_id and _grant_minimum(c):
-                    priority_started = True
-                    break
-
-            # Laufende Neben-WB halten, aber keine schlafende Neben-WB neu
-            # starten, solange die priorisierte WB nutzbares Budget bekommt.
+        if priority_id:
             for c in active_chargers:
                 if int(c.get('id', 0)) == priority_id:
-                    continue
-                if c.get('running'):
                     _grant_minimum(c)
+                    break
 
-        # Falls die priorisierte Box wegen Phasen/Mindestleistung nicht starten
-        # kann oder kein expliziter Prioritaetstreffer existiert, darf nutzbares
-        # Budget trotzdem eine andere verbundene Box starten.
-        if not priority_present or not priority_started:
-            for c in active_chargers:
+        for c in active_chargers:
+            if int(c.get('id', 0)) != priority_id and c.get('running'):
                 _grant_minimum(c)
 
-        # Extra-Budget wird rundlaufend verteilt. Die sortierte Reihenfolge
-        # sorgt dafuer, dass die priorisierte WB je Runde den ersten Ampere
-        # bekommt, ohne eine zweite sinnvolle Ladung zu verhungern.
+        for c in active_chargers:
+            if c['state'] != 2:
+                _grant_minimum(c)
+
         while remaining_watts > 0:
             allocated_any = False
             for c in active_chargers:
-                if c['state'] == 2 and c['allocated_amp'] < c['max_amp'] and remaining_watts >= c['w_per_amp']:
-                    c['allocated_amp'] += 1
-                    remaining_watts -= c['w_per_amp']
+                if c['state'] == 2 and _can_allocate_delta(c, 1):
+                    _apply_delta(c, 1)
                     allocated_any = True
             if not allocated_any:
                 break
@@ -508,5 +592,3 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
         )
 
     return alloc
-
-

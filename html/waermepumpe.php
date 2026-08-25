@@ -145,69 +145,89 @@ $error = $json['error'] ?? ($json['error'] ?? '');
 // Neustart auslösen (Absturzsicher)
 if (isset($_POST['restart_manager'])) {
     requireWebAuth(false);
+    $restartOk = false;
+    $restartErrors = [];
     if ($isDocker) {
         if ($installRoot === '') {
             http_response_code(503);
             echo 'Installationskontext fehlt; es wurde kein Dienst beendet oder gestartet.';
             exit;
         }
-        $python = getPythonInterpreter();
-        $pythonArg = escapeshellarg($python);
+        $installRootReal = @realpath($installRoot);
+        $python = e3dcGetTrustedPythonInterpreter();
+        $scripts = [];
         if ($isHeaterPage) {
-            $hsPath = $installRoot . '/Installer/heizstab_manager.py';
-            if (!is_file($hsPath)) {
-                http_response_code(503);
-                echo 'Heizstab-Manager wurde im Installationspfad nicht gefunden.';
-                exit;
-            }
-            shell_exec("pkill -f 'heizstab_manager.py'");
-            sleep(1);
-            $hsScript = escapeshellarg($hsPath);
-            shell_exec("nohup $pythonArg $hsScript > /var/www/html/logs/heizstab_manager.log 2>&1 &");
-            echo "<script>window.location.href = window.location.href;</script>";
-            exit;
-        }
-        // Beende Hauptdienst und Livedienst
-        $energyManagerPath = $luxInstallDir . 'energy_manager.py';
-        if (!is_file($energyManagerPath)) {
-            http_response_code(503);
-            echo 'Energy-Manager wurde im Installationspfad nicht gefunden.';
-            exit;
-        }
-        shell_exec("pkill -f 'energy_manager.py'");
-        shell_exec("pkill -f 'idm_live.py'");
-        shell_exec("pkill -f 'e3dc_websocket.py'");
-        shell_exec("pkill -f 'stiebel_live.py'");
-        shell_exec("pkill -f 'dimplex_live.py'");
-        sleep(1);
-        shell_exec("nohup $pythonArg " . escapeshellarg($energyManagerPath) . " > /proc/1/fd/1 2>&1 &");
-        if ($wpType === 4) {
-            $stiebelPath = $installRoot . '/Installer/stiebel/stiebel_live.py';
-            if (is_file($stiebelPath)) {
-                $stiebelScript = escapeshellarg($stiebelPath);
-                shell_exec("nohup $pythonArg $stiebelScript > /var/www/html/logs/stiebel_live.log 2>&1 &");
-            }
-        } elseif ($wpType === 5) {
-            $dimplexPath = $installRoot . '/Installer/dimplex/dimplex_live.py';
-            if (is_file($dimplexPath)) {
-                $dimplexScript = escapeshellarg($dimplexPath);
-                shell_exec("nohup $pythonArg $dimplexScript > /proc/1/fd/1 2>&1 &");
+            $scripts['Heizstab-Manager'] = [$installRoot . '/Installer/heizstab_manager.py', '/var/www/html/logs/heizstab_manager.log'];
+        } else {
+            $scripts['Energy-Manager'] = [$luxInstallDir . 'energy_manager.py', '/var/www/html/logs/energy_manager.log'];
+            if ($wpType === 4) {
+                $scripts['Stiebel-Livedienst'] = [$installRoot . '/Installer/stiebel/stiebel_live.py', '/var/www/html/logs/stiebel_live.log'];
+            } elseif ($wpType === 5) {
+                $scripts['Dimplex-Livedienst'] = [$installRoot . '/Installer/dimplex/dimplex_live.py', '/var/www/html/logs/dimplex_live.log'];
             }
         }
-        // Der Livedienst bei Docker wird meist extern oder im Wrapper gemanagt, ein pkill reicht zum Auslösen eines Neustarts.
+
+        $pkill = is_executable('/usr/bin/pkill') ? '/usr/bin/pkill' : '/bin/pkill';
+        $pgrep = is_executable('/usr/bin/pgrep') ? '/usr/bin/pgrep' : '/bin/pgrep';
+        if ($python === null || $installRootReal === false || !is_executable($pkill) || !is_executable($pgrep) || !is_executable('/bin/sh')) {
+            $restartErrors[] = 'Der Docker-Laufzeitkontext ist nicht eindeutig verfügbar.';
+        } else {
+            foreach ($scripts as $label => [$scriptPath, $logPath]) {
+                $scriptReal = @realpath($scriptPath);
+                if ($scriptReal === false || is_link($scriptPath) || !is_file($scriptReal)
+                    || !str_starts_with($scriptReal, rtrim($installRootReal, '/') . '/')) {
+                    $restartErrors[] = $label . ' wurde im gebundenen Installationspfad nicht gefunden.';
+                    continue;
+                }
+                $stop = e3dcRunArgvProcess([$pkill, '-f', $scriptReal], 5.0, ['max_output_bytes' => 8192]);
+                $stopCode = (int)($stop['exit_code'] ?? 1);
+                if (!in_array($stopCode, [0, 1], true)) {
+                    $restartErrors[] = $label . ' konnte nicht kontrolliert beendet werden.';
+                    continue;
+                }
+                $command = 'nohup ' . escapeshellarg($python) . ' ' . escapeshellarg($scriptReal)
+                    . ' > ' . escapeshellarg($logPath) . ' 2>&1 &';
+                $start = e3dcRunArgvProcess(['/bin/sh', '-c', $command], 5.0, ['max_output_bytes' => 8192]);
+                sleep(1);
+                $probe = e3dcRunArgvProcess([$pgrep, '-f', $scriptReal], 5.0, ['max_output_bytes' => 8192]);
+                if (empty($start['success']) || empty($probe['success']) || trim((string)($probe['stdout'] ?? '')) === '') {
+                    $restartErrors[] = $label . ' wurde nach dem Startversuch nicht als laufend bestätigt.';
+                }
+            }
+        }
+        $restartOk = $restartErrors === [];
     } else {
         if ($isHeaterPage) {
-            e3dcRunServiceWrapperAction('restart', ['e3dc-heizstab']);
-            echo "<script>window.location.href = window.location.href;</script>";
-            exit;
-        }
-        if ($wpType === 4) {
-            e3dcRunServiceWrapperAction('restart', ['energy_manager', 'e3dc-stiebel-live']);
+            $requestedServices = ['e3dc-heizstab'];
+            $requiredServices = ['e3dc-heizstab.service'];
+        } elseif ($wpType === 4) {
+            $requestedServices = ['energy_manager', 'e3dc-stiebel-live'];
+            $requiredServices = ['energy_manager.service', 'e3dc-stiebel-live.service'];
         } elseif ($wpType === 5) {
-            e3dcRunServiceWrapperAction('restart', ['energy_manager', 'e3dc-dimplex-live']);
+            $requestedServices = ['energy_manager', 'e3dc-dimplex-live'];
+            $requiredServices = ['energy_manager.service', 'e3dc-dimplex-live.service'];
         } else {
-            e3dcRunServiceWrapperAction('restart', [$serviceName, 'e3dc-idm-live', 'e3dc-lux-live']);
+            $requestedServices = [$serviceName, 'e3dc-idm-live', 'e3dc-lux-live'];
+            $requiredServices = [(str_ends_with($serviceName, '.service') ? $serviceName : $serviceName . '.service')];
         }
+        $restart = e3dcRunServiceWrapperAction('restart', $requestedServices);
+        $changedServices = (array)($restart['changed'] ?? []);
+        $missingRequired = array_values(array_diff($requiredServices, $changedServices));
+        $restartOk = !empty($restart['success']) && $missingRequired === [];
+        if (!$restartOk) {
+            $restartErrors = array_merge(
+                (array)($restart['errors'] ?? []),
+                array_map(static fn($unit) => $unit . ' wurde nicht als neu gestartet bestätigt.', $missingRequired)
+            );
+        }
+    }
+    if (!$restartOk) {
+        http_response_code(500);
+        echo errorMessage(
+            'Dienstneustart nicht bestätigt',
+            implode(' ', $restartErrors) ?: 'Der angeforderte Manager wurde nicht als laufend bestätigt.'
+        );
+        exit;
     }
     echo "<script>window.location.href = window.location.href;</script>";
     exit;
@@ -355,6 +375,7 @@ if (file_exists($historyFile)) {
 }
 
 $manualBoostMessage = '';
+$manualWwMessage = '';
 if (isset($_POST['manual_boost']) && $wpType != 4) {
     requireWebAuth(false);
     e3dcRequireCsrfToken(false);
@@ -395,10 +416,27 @@ if (isset($_POST['manual_ww']) && $wpType != 4) {
     $action = $_POST['manual_ww'] === 'on' ? 'on' : 'off';
     $flagFile = '/var/www/html/ramdisk/manual_ww_boost.flag';
     if ($action === 'on') {
-        file_put_contents($flagFile, time());
-        @chmod($flagFile, 0666);
+        $manualWwResult = e3dcPublishRuntimeCommandFile(
+            $flagFile,
+            (string)time() . "\n",
+            0664,
+            '.manual_ww_boost.'
+        );
     } else {
-        if (file_exists($flagFile)) @unlink($flagFile);
+        $manualWwResult = e3dcRemoveRuntimeCommandFile($flagFile);
+    }
+    if (!empty($manualWwResult['success'])) {
+        $manualWwMessage = successMessage(
+            $action === 'on'
+                ? 'Manuelle Warmwasser-Anforderung wurde sicher gespeichert.'
+                : 'Manuelle Warmwasser-Anforderung wurde sicher beendet.'
+        );
+    } else {
+        http_response_code(500);
+        $manualWwMessage = errorMessage(
+            'Warmwasser-Anforderung nicht geändert',
+            (string)($manualWwResult['message'] ?? 'Die Zustandsdatei konnte nicht sicher geändert werden.')
+        );
     }
 }
 
@@ -406,22 +444,70 @@ if (isset($_POST['toggle_auto_mode'])) {
     requireWebAuth(false);
     e3dcRequireCsrfToken(false);
     $new_mode = (int)$_POST['toggle_auto_mode'];
-    // V4-JSON als maßgebliche Datenquelle schreiben
-    $v4Path = '/var/www/html/data/e3dc_v4.json';
-    $v4Data = @json_decode(@file_get_contents($v4Path), true) ?? [];
-    $v4Data['auto_mode'] = (string)$new_mode;
-    $json = json_encode($v4Data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
-    if ($json !== false) e3dcWriteJsonAtomic($v4Path, $json);
-    // Ramdisk-Zwischenspeicher verwerfen
-    @unlink('/var/www/html/ramdisk/e3dc_config_cache.json');
+    if (!saveE3dcConfigValue('auto_mode', (string)$new_mode)) {
+        http_response_code(500);
+        echo errorMessage(
+            'Wärmepumpen-Automatik nicht gespeichert',
+            'Die bestehende Konfiguration blieb unverändert; der Dienst wurde nicht neu gestartet. '
+            . 'Bitte führe im Installationscenter einmal „Rechte reparieren“ aus und versuche es erneut.'
+        );
+        exit;
+    }
+    // Ramdisk-Zwischenspeicher verwerfen. Ohne bestätigte Invalidierung
+    // darf kein Dienst mit einer möglicherweise alten Projektion starten.
+    if (!e3dcRemoveConfigCacheFailClosed('/var/www/html/ramdisk/e3dc_config_cache.json')) {
+        http_response_code(500);
+        echo errorMessage(
+            'Automatik gespeichert, Konfigurationscache nicht entfernt',
+            'Der Dienst wurde nicht neu gestartet. Bitte führe im Installationscenter „Rechte reparieren“ aus und starte den Dienst danach erneut.'
+        );
+        exit;
+    }
+    $restartOk = false;
+    $restartDetails = '';
     if ($isDocker) {
-        shell_exec("pkill -f 'energy_manager.py'");
-        sleep(1);
-        shell_exec("nohup $python {$luxInstallDir}energy_manager.py > /var/www/html/logs/energy_manager.log 2>&1 &");
+        $python = e3dcGetTrustedPythonInterpreter();
+        $energyManagerPath = $luxInstallDir . 'energy_manager.py';
+        $energyManagerReal = $energyManagerPath !== '' ? @realpath($energyManagerPath) : false;
+        if ($python !== null && $energyManagerReal !== false && !is_link($energyManagerPath)) {
+            $pkill = is_executable('/usr/bin/pkill') ? '/usr/bin/pkill' : '/bin/pkill';
+            $pgrep = is_executable('/usr/bin/pgrep') ? '/usr/bin/pgrep' : '/bin/pgrep';
+            $stop = is_executable($pkill)
+                ? e3dcRunArgvProcess([$pkill, '-f', $energyManagerReal], 5.0, ['max_output_bytes' => 8192])
+                : ['exit_code' => 127];
+            $stopCode = (int)($stop['exit_code'] ?? 1);
+            if (in_array($stopCode, [0, 1], true) && is_executable('/bin/sh')) {
+                $command = 'nohup ' . escapeshellarg($python) . ' ' . escapeshellarg($energyManagerReal)
+                    . ' > /var/www/html/logs/energy_manager.log 2>&1 &';
+                $start = e3dcRunArgvProcess(['/bin/sh', '-c', $command], 5.0, ['max_output_bytes' => 8192]);
+                sleep(1);
+                $probe = is_executable($pgrep)
+                    ? e3dcRunArgvProcess([$pgrep, '-f', $energyManagerReal], 5.0, ['max_output_bytes' => 8192])
+                    : ['success' => false];
+                $restartOk = !empty($start['success'])
+                    && !empty($probe['success'])
+                    && trim((string)($probe['stdout'] ?? '')) !== '';
+            }
+        }
+        if (!$restartOk) $restartDetails = 'Der Energy-Manager-Prozess wurde nach dem Startversuch nicht bestätigt.';
     } else {
-        e3dcRunServiceWrapperAction('restart', [$serviceName]);
+        $restart = e3dcRunServiceWrapperAction('restart', [$serviceName]);
+        $requiredUnit = str_ends_with($serviceName, '.service') ? $serviceName : $serviceName . '.service';
+        $restartOk = !empty($restart['success']) && in_array($requiredUnit, (array)($restart['changed'] ?? []), true);
+        if (!$restartOk) {
+            $restartDetails = implode('; ', (array)($restart['errors'] ?? []));
+            if ($restartDetails === '') $restartDetails = 'Der Dienstneustart wurde nicht bestätigt.';
+        }
     }
 
+    if (!$restartOk) {
+        http_response_code(500);
+        echo errorMessage(
+            'Automatik gespeichert, Dienstneustart nicht bestätigt',
+            $restartDetails . ' Die gespeicherte Einstellung bleibt erhalten; bitte den Dienststatus prüfen und den Neustart erneut auslösen.'
+        );
+        exit;
+    }
     echo "<script>window.location.href = window.location.href;</script>";
     exit;
 }
@@ -525,6 +611,7 @@ $hsData = [];
 $hsServiceRunning = false;
 $hsManualFile = '/var/www/html/ramdisk/heizstab_manual_override.json';
 $hsManualOverride = null;
+$hsManualMessage = '';
 if ($isHeaterPage) {
     $hsFile = '/var/www/html/ramdisk/heizstab_data.json';
     if (file_exists($hsFile) && (time() - filemtime($hsFile)) < 60) {
@@ -551,15 +638,25 @@ if ($isHeaterPage) {
 // POST: Heizstab Auto-Modus umschalten
 if (isset($_POST['toggle_hs_auto'])) {
     requireWebAuth(false);
+    e3dcRequireCsrfToken(false);
     $new_mode = (int)$_POST['toggle_hs_auto'];
-    // V4-JSON als maßgebliche Datenquelle schreiben
-    $v4Path = '/var/www/html/data/e3dc_v4.json';
-    $v4Data = @json_decode(@file_get_contents($v4Path), true) ?? [];
-    $v4Data['hs_auto_mode'] = (string)$new_mode;
-    $json = json_encode($v4Data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
-    if ($json !== false) e3dcWriteJsonAtomic($v4Path, $json);
-    // Ramdisk-Zwischenspeicher verwerfen
-    @unlink('/var/www/html/ramdisk/e3dc_config_cache.json');
+    if (!saveE3dcConfigValue('hs_auto_mode', (string)$new_mode)) {
+        http_response_code(500);
+        echo errorMessage(
+            'Heizstab-Automatik nicht gespeichert',
+            'Die bestehende Konfiguration blieb unverändert. '
+            . 'Bitte führe im Installationscenter einmal „Rechte reparieren“ aus und versuche es erneut.'
+        );
+        exit;
+    }
+    if (!e3dcRemoveConfigCacheFailClosed('/var/www/html/ramdisk/e3dc_config_cache.json')) {
+        http_response_code(500);
+        echo errorMessage(
+            'Heizstab-Automatik gespeichert, Konfigurationscache nicht entfernt',
+            'Bitte führe im Installationscenter „Rechte reparieren“ aus und lade die Seite danach erneut.'
+        );
+        exit;
+    }
     echo "<script>window.location.href = window.location.href;</script>";
     exit;
 }
@@ -567,6 +664,7 @@ if (isset($_POST['toggle_hs_auto'])) {
 // POST: Heizstab manuell mit voller Leistung oder zurück zur normalen Regelung
 if (isset($_POST['hs_manual_full']) || isset($_POST['hs_manual_auto'])) {
     requireWebAuth(false);
+    e3dcRequireCsrfToken(false);
     if (isset($_POST['hs_manual_full'])) {
         $ttlHours = 2;
         $payload = [
@@ -575,14 +673,27 @@ if (isset($_POST['hs_manual_full']) || isset($_POST['hs_manual_auto'])) {
             'expires_ts' => time() + ($ttlHours * 3600),
             'source' => 'webui',
         ];
-        @file_put_contents($hsManualFile . '.tmp', json_encode($payload, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
-        @rename($hsManualFile . '.tmp', $hsManualFile);
-        @chmod($hsManualFile, 0666);
+        $encoded = json_encode($payload, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        $hsManualResult = is_string($encoded)
+            ? e3dcPublishRuntimeCommandFile($hsManualFile, $encoded . "\n", 0664, '.heizstab_manual_override.')
+            : ['success' => false, 'message' => 'Die Heizstab-Anforderung konnte nicht kodiert werden.'];
     } else {
-        @unlink($hsManualFile);
+        $hsManualResult = e3dcRemoveRuntimeCommandFile($hsManualFile);
     }
-    echo "<script>window.location.href = window.location.href;</script>";
-    exit;
+    if (!empty($hsManualResult['success'])) {
+        $hsManualOverride = isset($_POST['hs_manual_full']) ? $payload : null;
+        $hsManualMessage = successMessage(
+            isset($_POST['hs_manual_full'])
+                ? 'Heizstab-Vollleistung wurde für zwei Stunden sicher angefordert.'
+                : 'Heizstab-Vollleistung wurde sicher beendet; die Automatik übernimmt.'
+        );
+    } else {
+        http_response_code(500);
+        $hsManualMessage = errorMessage(
+            'Heizstab-Anforderung nicht geändert',
+            (string)($hsManualResult['message'] ?? 'Die Zustandsdatei konnte nicht sicher geändert werden.')
+        );
+    }
 }
 
 
@@ -676,6 +787,10 @@ if ($isChargingOnly) {
             $manualFullActive = ($manualMode === 'full') || ($hsMode === 'manual_full');
             $manualUntil = isset($hsManualOverride['expires_ts']) ? date('H:i', (int)$hsManualOverride['expires_ts']) : '';
         ?>
+
+            <?php if ($hsManualMessage !== ''): ?>
+                <?= $hsManualMessage ?>
+            <?php endif; ?>
 
             <?php if (!$hsServiceRunning): ?>
                 <div class="alert alert-warning py-2 small">
@@ -888,6 +1003,9 @@ if ($isChargingOnly) {
         <?php else: // Luxtronik / IDM ?>
             <?php if ($manualBoostMessage !== ''): ?>
                 <?= $manualBoostMessage ?>
+            <?php endif; ?>
+            <?php if ($manualWwMessage !== ''): ?>
+                <?= $manualWwMessage ?>
             <?php endif; ?>
             <?php if (!$success): ?>
                 <?php if ($wpType == 4): ?>

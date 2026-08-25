@@ -548,19 +548,25 @@ def default_release_scope(charger: Any, *, reason: str = "mode0_user_switch") ->
     prev_reason = getattr(charger, "_command_gate_release_reason", "")
     prev_release_type = getattr(charger, "_command_gate_release_type", "")
     release_reason = str(reason or "mode0_user_switch")
-    charger._command_gate_default_release = True
-    charger._command_gate_release_reason = release_reason
-    charger._command_gate_release_type = (
-        _USER_OFF_RELEASE_TYPE
-        if release_reason == "mode0_user_switch"
-        else "other_default_release"
-    )
+    try:
+        charger._command_gate_default_release = True
+        charger._command_gate_release_reason = release_reason
+        charger._command_gate_release_type = (
+            _USER_OFF_RELEASE_TYPE
+            if release_reason == "mode0_user_switch"
+            else "other_default_release"
+        )
+    except AttributeError:
+        pass
     try:
         yield
     finally:
-        charger._command_gate_default_release = prev_allowed
-        charger._command_gate_release_reason = prev_reason
-        charger._command_gate_release_type = prev_release_type
+        try:
+            charger._command_gate_default_release = prev_allowed
+            charger._command_gate_release_reason = prev_reason
+            charger._command_gate_release_type = prev_release_type
+        except AttributeError:
+            pass
 
 
 def allow_command(

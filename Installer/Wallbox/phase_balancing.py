@@ -275,10 +275,13 @@ def openwb_pro_one_phase_current_cap(
     static_limit = min(fallback, user_limit, charger_limit)
     requested_limit = min(user_limit, charger_limit)
 
-    try:
-        grid_limit = float(grid_max_amps)
-    except (TypeError, ValueError):
-        grid_limit = 0.0
+    if grid_max_amps is None or str(grid_max_amps).strip() == "":
+        grid_limit = 35.0
+    else:
+        try:
+            grid_limit = float(grid_max_amps)
+        except (TypeError, ValueError):
+            grid_limit = 0.0
     scalar_grid_valid = bool(
         math.isfinite(grid_limit) and grid_limit > 0.0
     )

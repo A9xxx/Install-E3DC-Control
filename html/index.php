@@ -47,21 +47,27 @@ if (isset($_POST['save_lux_global'])) {
     requireWebAuth(false);
     e3dcRequireCsrfToken(false);
     $val = isset($_POST['lux_active']) ? '1' : '0';
-    saveE3dcConfigValue('luxtronik', $val);
-
-    if (e3dcIsDockerEnvironment()) {
-        $python = getPythonInterpreter();
-        $runtimePaths = getInstallPaths();
-        $script = !empty($runtimePaths['valid'])
-            ? rtrim($runtimePaths['install_path'], '/') . '/Installer/luxtronik/energy_manager.py'
-            : '';
-        if ($script !== '' && is_file($script)) {
-            shell_exec("pkill -f 'energy_manager.py'");
-            sleep(1);
-            shell_exec("nohup " . escapeshellarg($python) . " " . escapeshellarg($script) . " > /var/www/html/logs/energy_manager.log 2>&1 &");
-        }
-    } else {
-        e3dcRunServiceWrapperAction('restart', ['energy_manager']);
+    if (!saveE3dcConfigValue('luxtronik', $val)) {
+        http_response_code(500);
+        echo errorMessage(
+            'Luxtronik-Einstellung nicht gespeichert',
+            'Die bestehende Konfiguration blieb unverändert; der Dienst wurde nicht neu gestartet. Bitte führe im Installationscenter „Rechte reparieren“ aus.'
+        );
+        exit;
+    }
+    if (!e3dcRemoveConfigCacheFailClosed('/var/www/html/ramdisk/e3dc_config_cache.json')) {
+        http_response_code(500);
+        echo errorMessage('Luxtronik-Einstellung gespeichert, Cache nicht entfernt', 'Der Dienst wurde nicht neu gestartet. Bitte führe „Rechte reparieren“ aus.');
+        exit;
+    }
+    $restart = e3dcRestartEnergyManagerFromWeb(getInstallPaths());
+    if (empty($restart['success'])) {
+        http_response_code(500);
+        echo errorMessage(
+            'Luxtronik-Einstellung gespeichert, Dienstneustart nicht bestätigt',
+            (string)($restart['message'] ?? 'Bitte Dienststatus prüfen und den Neustart erneut auslösen.')
+        );
+        exit;
     }
     header("Location: index.php?seite=config");
     exit;
@@ -1320,6 +1326,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                 <button class="btn btn-link p-0" onclick="toggleDarkMode()" title="Dark Mode umschalten">
                     <i class="fas fa-<?= $darkMode ? 'sun' : 'moon' ?> text-warning" id="darkmode-icon"></i>
                 </button>
+                <span id="theme-save-status" class="small ms-1" role="status" aria-live="polite" aria-atomic="true"></span>
                 <button class="btn btn-link p-0 detail-toggle-button" id="tiledetails-button" onclick="toggleTileDetails()" title="Ansichtsdichte umschalten" aria-label="Ansichtsdichte umschalten">
                     <i class="fas fa-eye text-primary" id="tiledetails-icon"></i>
                 </button>
@@ -2368,15 +2375,15 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                             <button id="btn-update-installer" class="btn btn-outline-info btn-sm me-2" onclick="startInstallerUpdate()" title="Aktualisiert E3DC-Control über den sicheren Systemjob">
                                 <i class="fas fa-sync-alt me-2"></i>System Update <span id="update-badge-installer" class="badge bg-danger ms-1" style="display:none;">!</span>
                             </button>
-                            <button class="btn btn-outline-warning btn-sm me-2" onclick="openReleaseRollback()" title="Stabile Rückfallversion auswählen">
-                                <i class="fas fa-life-ring me-2"></i>Rückfallversion
+                            <button class="btn btn-outline-warning btn-sm me-2" onclick="openReleaseRollback()" title="Verfügbare Rückfallhinweise und den unterstützten Wiederherstellungsweg anzeigen">
+                                <i class="fas fa-life-ring me-2"></i>Rückfallhinweise
                             </button>
                             <?php else: ?>
                             <button class="btn btn-outline-secondary btn-sm me-2" onclick="openReleaseRollback()" title="Zeigt Docker-Befehle für Update und Rückfallversionen an">
                                 <i class="fab fa-docker me-2"></i>Docker Versionen
                             </button>
                             <?php endif; ?>
-                            <button class="btn btn-outline-warning btn-sm me-2" onclick="fixPermissions()" title="Startet die automatische Prüfung und Reparatur defekter Dateirechte"><i class="fas fa-tools me-2"></i>Rechte reparieren</button>
+                            <button id="btn-repair-permissions" class="btn btn-outline-warning btn-sm me-2" onclick="fixPermissions('btn-repair-permissions')" title="Startet Backup, Rechteprojektion und Systemaktualisierung über den root-eigenen Update-Launcher"><i class="fas fa-tools me-2"></i>Rechte reparieren</button>
                             <button class="btn btn-danger btn-sm" onclick="restartService()" title="Setzt alle Dienste sanft zurück und entfernt temporäre Boosts"><i class="fas fa-power-off me-2"></i>Notfall-Neustart (Reset)</button>
                         </div>
                     </div>
@@ -2643,16 +2650,32 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
 
         // Dark Mode Umschaltung für Desktop (überschreibt evt. solar.js)
         function toggleDarkMode() {
+            const previousDarkMode = DARK_MODE;
             DARK_MODE = !DARK_MODE;
             // Bootstrap 5 (Desktop) verlangt den Theme-Tag zwingend auf <html> (documentElement)
             document.documentElement.setAttribute('data-bs-theme', DARK_MODE ? 'dark' : 'light');
+            document.documentElement.setAttribute('data-theme', DARK_MODE ? 'dark' : 'light');
             document.body.setAttribute('data-bs-theme', DARK_MODE ? 'dark' : 'light');
+            document.body.setAttribute('data-theme', DARK_MODE ? 'dark' : 'light');
 
             const icon = document.getElementById('darkmode-icon');
             if (icon) {
                 icon.className = DARK_MODE ? 'fas fa-sun' : 'fas fa-moon';
             }
 
+            const setStatus = (message, success) => {
+                if (typeof showThemeSaveFeedback === 'function') {
+                    showThemeSaveFeedback(message, success);
+                    return;
+                }
+                const status = document.getElementById('theme-save-status');
+                if (status) {
+                    status.textContent = message;
+                    status.className = 'small ms-1 ' + (success ? 'text-success' : 'text-danger');
+                    status.hidden = false;
+                }
+            };
+            try { localStorage.setItem('theme', DARK_MODE ? 'dark' : 'light'); } catch (e) {}
             fetch('index.php', {
                 method: 'POST',
                 headers: {
@@ -2660,6 +2683,22 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                     'X-CSRF-Token': String(window.E3DC_CSRF_TOKEN || '')
                 },
                 body: 'action=save_setting&key=darkmode&value=' + (DARK_MODE ? '1' : '0')
+            }).then(response => {
+                if (!response.ok) throw new Error('HTTP ' + response.status);
+                return response.text();
+            }).then(result => {
+                if (result.trim() !== 'ok') throw new Error('Einstellung wurde nicht bestätigt.');
+                setStatus('Gespeichert', true);
+            }).catch(() => {
+                DARK_MODE = previousDarkMode;
+                document.documentElement.setAttribute('data-bs-theme', DARK_MODE ? 'dark' : 'light');
+                document.documentElement.setAttribute('data-theme', DARK_MODE ? 'dark' : 'light');
+                document.body.setAttribute('data-bs-theme', DARK_MODE ? 'dark' : 'light');
+                document.body.setAttribute('data-theme', DARK_MODE ? 'dark' : 'light');
+                if (icon) icon.className = DARK_MODE ? 'fas fa-sun' : 'fas fa-moon';
+                try { localStorage.setItem('theme', DARK_MODE ? 'dark' : 'light'); } catch (e) {}
+                setStatus('Nicht gespeichert – zurückgesetzt', false);
+                window.dispatchEvent(new CustomEvent('themeChanged'));
             });
 
             // Explizites Event auslösen, damit Diagramme (langzeit.php) reagieren können
@@ -3611,11 +3650,25 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
 
         // Watchdog Status prüfen
         function checkWatchdog() {
+            const setWatchdogUnknown = function() {
+                const badge = $('#watchdog-badge');
+                badge.show()
+                    .removeClass('bg-success bg-danger bg-warning text-dark text-white')
+                    .addClass('bg-secondary text-body')
+                    .attr('data-watchdog-state', 'unknown')
+                    .attr('title', 'Watchdog-Status unbekannt (Abruf fehlgeschlagen)')
+                    .attr('aria-label', 'Watchdog-Status unbekannt');
+            };
             $.getJSON('index.php?action=watchdog_status', function(data) {
                 const badge = $('#watchdog-badge');
+                if (!data || typeof data !== 'object') {
+                    setWatchdogUnknown();
+                    return;
+                }
                 if (data.installed) {
                     badge.show();
                     badge.attr('title', data.message);
+                    badge.attr('data-watchdog-state', data.warning ? 'warning' : (data.active ? 'active' : 'inactive'));
                     if (data.warning) {
                         badge.removeClass('bg-secondary bg-success bg-danger').addClass('bg-warning text-dark');
                     } else if (data.active) {
@@ -3641,7 +3694,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                 });
                 if (typeof updateDiagnoseDropdown === 'function') updateDiagnoseDropdown();
             }
-            });
+            }).fail(setWatchdogUnknown);
         }
         setInterval(checkWatchdog, 10000); // Alle 10 Sek prüfen
         checkWatchdog();

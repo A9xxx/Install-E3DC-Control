@@ -2,11 +2,13 @@
 # E3DC-Control Web-/Konsolen-Update-Dispatcher
 #
 # Diese Installationsvorlage wird root-eigen nach /usr/local/sbin projiziert.
-# Der eingebettete Installationspfad und -benutzer sind ausschließlich Hinweise
-# für die aktuelle Release-Discovery. Der installierte Produktbaum und seine
-# Git-Metadaten sind keine Autorität für den Start des Updates: Der Systemjob
-# lädt das neueste veröffentlichte Release genau einmal in ein privates
-# Root-Verzeichnis; dessen Discovery bindet Installation, Benutzer und Rolle.
+# Der eingebettete Installationspfad und -benutzer binden diesen Webaufruf an
+# genau die Installation, aus der der Launcher projiziert wurde. Der
+# installierte Produktbaum und seine Git-Metadaten sind keine Updatequelle: Der
+# Systemjob lädt das neueste veröffentlichte Release genau einmal in ein
+# privates Root-Verzeichnis; dessen Discovery bestätigt Pfad, Benutzer und
+# Rolle. Eine globale Kandidatensuche bleibt Konsolenaufrufen ohne expliziten
+# Pfad vorbehalten.
 
 set -euo pipefail
 umask 027
@@ -402,9 +404,10 @@ run_worker() {
         E3DC_BOOTSTRAP_EXPECTED_TAG_OBJECT="$tag_object" \
         E3DC_BOOTSTRAP_EXPECTED_SHA="$target_sha" \
         E3DC_BOOTSTRAP_RELEASE_DIR="$release_dir" \
+        E3DC_BOOTSTRAP_USER="$INSTALL_USER" \
         E3DC_BOOTSTRAP_INLINE_WORKER=1 \
         E3DC_BOOTSTRAP_LOCK_HELD=1 \
-        /bin/sh "$release_dir/e3dc-update-bootstrap"
+        /bin/sh "$release_dir/e3dc-update-bootstrap" "$INSTALL_ROOT"
     result=$?
     set -e
     if (( result == 0 )); then

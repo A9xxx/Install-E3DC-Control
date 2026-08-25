@@ -23,6 +23,7 @@ if (isset($_GET['ajax']) && $_GET['ajax'] == '1') {
     $date = $_POST['date'] ?? null;
 
     if (!$date) {
+        http_response_code(400);
         echo json_encode(['success' => false, 'error' => 'Kein Datum angegeben.']);
         exit;
     }
@@ -33,7 +34,11 @@ if (isset($_GET['ajax']) && $_GET['ajax'] == '1') {
         $res = saveDailyStats($date, $_POST, 'save');
     }
 
-    echo json_encode(['success' => (bool)$res]);
+    if (!$res) http_response_code(500);
+    echo json_encode([
+        'success' => (bool)$res,
+        'error' => $res ? null : 'Die Statistikänderung konnte nicht bestätigt gespeichert werden. Bitte Datenbankrechte und freien Speicher prüfen.',
+    ]);
     exit;
 }
 
@@ -1641,14 +1646,18 @@ document.addEventListener("DOMContentLoaded", function() {
             method: 'POST',
             body: formData
         })
-        .then(r => r.json())
-        .then(res => {
-            if (res.success) {
-                setTimeout(() => { location.reload(); }, 120);
-            } else {
-                alert("Fehler beim Speichern: " + (res.error || 'Unbekannt'));
+        .then(async r => {
+            let payload = null;
+            try { payload = await r.json(); } catch (_) { payload = null; }
+            if (!r.ok || !payload || payload.success !== true) {
+                throw new Error(payload && payload.error ? String(payload.error) : ('HTTP ' + r.status));
             }
-        });
+            return payload;
+        })
+        .then(res => {
+            setTimeout(() => { location.reload(); }, 120);
+        })
+        .catch(error => alert("Fehler beim Speichern: " + error.message));
     };
 
     window.deleteStatsEntry = function(date) {
@@ -1663,14 +1672,18 @@ document.addEventListener("DOMContentLoaded", function() {
             method: 'POST',
             body: formData
         })
-        .then(r => r.json())
-        .then(res => {
-            if (res.success) {
-                setTimeout(() => { location.reload(); }, 120);
-            } else {
-                alert("Fehler beim Löschen.");
+        .then(async r => {
+            let payload = null;
+            try { payload = await r.json(); } catch (_) { payload = null; }
+            if (!r.ok || !payload || payload.success !== true) {
+                throw new Error(payload && payload.error ? String(payload.error) : ('HTTP ' + r.status));
             }
-        });
+            return payload;
+        })
+        .then(res => {
+            setTimeout(() => { location.reload(); }, 120);
+        })
+        .catch(error => alert("Fehler beim Löschen: " + error.message));
     };
 
     // --- Initialisierung am Ende nach allen Definitionen ---

@@ -6,6 +6,40 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.4d] – 2026-08-25
+
+### 🔄 Git-unabhängiges Update mit kurzer Unterbrechung
+
+- **Der Ziel-Updater führt den gesamten Wechsel aus:** Vollbackup, kurze ruhende Daten-Nachsicherung, Releaseprojektion, Reparatur bekannter Rechte und Dienstneustart stammen aus dem heruntergeladenen Zielrelease. Nutzer-`.git`, lokale Produktänderungen, fehlende Produktdateien und historische Rechte sind keine vorgelagerten Updateblocker.
+- **Web-Übergang aus 5.4.4a bis 5.4.4c:** Auch ältere Launcher, die nur den commitgebundenen Einzel-Bootstrap und noch nicht alle späteren Übergabeparameter liefern, erreichen den aktuellen Ziel-Updater. Dieser lädt und bestätigt den vollständigen Releasebaum selbst; der bisherige manuelle Rettungsbefehl ist für diese drei veröffentlichten Web-Einstiege nicht mehr nötig.
+- **Abhängigkeiten vor dem Stopp:** Eine neue Ziel-Pythonumgebung und ausgewählte optionale Paketabhängigkeiten werden bei laufenden Diensten vorbereitet. Das bisherige `venv` bleibt unangetastet; Konflikte fremder System-Python-Pakete blockieren das Update nicht.
+- **Abbrüche führen zur Lösung:** `ENOSPC`, `EROFS`, `EACCES` und mehrere gleichrangige Installationen nennen eine konkrete Prüf- und Fortsetzungsanweisung. Bei mehreren Instanzen wird keine geraten.
+- **Kein grüner Abschluss mit gestopptem Zusatzdienst:** Kann ein vor dem Wechsel aktiver, an diese Installation gebundener Beobachterdienst anschließend nicht wieder starten, bleibt der bestätigte neue Release installiert, aber der Auftrag endet mit Dienstname und konkretem `journalctl`-Befehl statt mit einer falschen Erfolgsmeldung.
+- **Rechte-Reparatur folgt demselben Vertrag:** Der sichtbare Rechte-Button startet den root-eigenen Backup-/Updateauftrag. Modus 5 akzeptiert den privaten Standard `02770` und den ausdrücklich gewählten Kompatibilitätsmodus `02775`.
+
+### 🖥️ Bestätigte WebUI-Aktionen
+
+- **Keine falschen Erfolgsmeldungen:** Alle sichtbaren zustandsändernden Webaktionen verlangen Anmeldung und CSRF-Schutz und werten HTTP-Status, Antwortinhalt und Teilfehler aus. Ein blinder Reload kann einen Fehler nicht als Erfolg verdecken.
+- **Konfiguration atomar bestätigt:** Hauptspeichern, Import, Rückfall, Schnellschalter, Energiefluss und Wallbox-/Fahrzeugwerte verwenden einen gemeinsamen Backup-, Schreib-, Readback- und Cachevertrag. Ein fehlgeschlagenes Backup oder Schreiben verändert die Konfiguration nicht; ein nachträglicher Cachefehler wird zurückgerollt und nie grün gemeldet.
+- **Erweiterte Wallbox-Ansicht repariert:** Die doppelte, fehlerhaft verschachtelte Fahrzeugzuordnung aus 5.4.4c wurde entfernt. Reserve, Fahrzeugprofile und Ladeplanung stehen wieder in genau einer balancierten Karte, ohne kollabierende oder überlagerte Felder.
+- **Klare Beweisgrenze:** Geprüft ist der Softwarevertrag dieser Aktionen; das Release behauptet nicht, dass jeder erreichbare physische Aktor im Feld betätigt wurde.
+
+### 🏠 HA und Bluelink
+
+- **HA-Lease nur bei exakter Identität:** Ein Neustart übernimmt eine bestehende Lease nur bei passender Knotenrolle und passender Peer-Bindung. Abweichende oder mehrdeutige Kontexte bleiben gesperrt.
+- **Eindeutige Bluelink-Konfiguration:** Ausdrücklich vorhandene aktuelle Felder haben Vorrang; ein bewusst leerer oberster Token wird nicht durch einen älteren Fallback ersetzt. Ein fehlender Token erzeugt nur eine einmalige ruhige Information.
+
+### 🚗 Statische Hausanschlussgrenze der Wallboxen
+
+- **Gemeinsames Limit in allen managergeführten Modi:** Hausabsicherung und Wallbox-Reserve begrenzen das gemeinsame Ladeziel phasenbezogen. Optionale Phasenwerte werden berücksichtigt; bei unbekannter einphasiger Zuordnung gilt der ungünstigste Fall. In `Aus / autonom` muss die Wallbox- oder Fahrzeugprofilgrenze den Hausanschluss absichern, weil E3DC-Control dort keine Strombefehle mehr sendet.
+- **35 A als konservativer Standard:** Fehlt `grid_max_amps` oder ist der Wert leer, gelten 35 A je Phase. Ein ausdrücklich ungültiger Wert wird nicht still ersetzt, sondern sperrt die aktive Wallboxregelung mit einer konkreten Korrekturanweisung.
+- **Phasenvektor statt Gleichteilung:** Mehrere Ladepunkte teilen den tatsächlich konfigurierten Phasenrahmen. Bei 40 A verfügbarem Budget können eine 16-A- und eine 32-A-Wallbox beispielsweise 16 A und 24 A erhalten; eine allein aktive 32-A-Wallbox bleibt nicht künstlich halbiert.
+- **Keine erfundene dynamische Stromreserve:** Die konfigurierte Reserve deckt andere Verbraucher statisch ab. Mangels echter PCC-Phasen-RMS-Messung bleibt `P/230` rein diagnostisch und darf keine zusätzliche Wallboxleistung autorisieren.
+- **Fahrzeugprofil bindet die Lastphasen:** Ein ausdrücklich ausgewähltes einphasiges Fahrzeug wie der Honda e wird auch an einer festen dreiphasigen E3/DC-Wallbox mit einer einphasigen Mindestleistung von 1.380 W geführt. Ein bloßer Zahlenwert, eine Zielphase oder ein unbekanntes Fahrzeug erzeugen dagegen keine 1p-Freigabe; dann gilt konservativ die Wallboxtopologie.
+- **Anhebung von `wbminsoc` wirkt während der Ladung:** Wird der Mindest-SoC über den aktuellen Speicher-SoC angehoben, endet die Akku-Unterstützung im selben Regelzyklus. Eine laufende Ladung darf nur mit dem batterieneutralen PV-Budget weiterlaufen, wird nötigenfalls abgesenkt und unterhalb der physikalischen Mindestleistung gestoppt; alte Holds dürfen sie nicht wieder öffnen.
+- **Kein Strom ohne autorisiertes Leistungsbudget:** Preisfenster, Grundlademodus, Priorität und Hausanschluss-Phasenvektor steuern nur Reihenfolge und Obergrenzen. Bei 0 W autorisiertem Gruppenbudget bleibt jeder aktiv geregelte Ladepunkt bei 0 A; weder 6-A-Mindeststrom noch Maximalstrom werden aus einem Modusflag erzeugt.
+- **Start-Hold nur vollständig finanziert:** Ein kurzer Fehlbetrag zur Mindestleistung darf ausschließlich aus gleichzeitig verringerter Speicherladung oder einer ausdrücklichen Batterie-Freigabe stammen. Teilfinanzierte oder nur behauptete Holds starten keine Wallbox.
+
 ## [5.4.4c] – 2026-08-25
 
 ### 🔄 Git-unabhängiges Update und Same-Version-Reparatur

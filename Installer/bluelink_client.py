@@ -50,18 +50,33 @@ def write_json_atomic(path, payload, indent=None):
 def load_bluelink_config():
     """Lädt Token, VIN und Heimat-Koordinaten aus der V4-Konfig mit TXT-Fallback."""
     config = {'refresh_token': None, 'vin': None, 'car_name': None, 'bluelink_interval': '15', 'hoehe': '0', 'laenge': '0'}
+    v4_bound_keys = set()
     if os.path.exists(V4_CONFIG_FILE):
         try:
             with open(V4_CONFIG_FILE, 'r', encoding='utf-8') as f:
                 v4 = json.load(f)
-            cfg = v4.get('config', v4) if isinstance(v4, dict) else {}
-            if isinstance(cfg, dict):
-                config['refresh_token'] = cfg.get('bluelink_refresh_token') or config['refresh_token']
-                config['vin'] = cfg.get('bluelink_vin') or config['vin']
-                config['car_name'] = cfg.get('bluelink_car_name') or config['car_name']
-                config['bluelink_interval'] = str(cfg.get('bluelink_interval') or config['bluelink_interval'])
-                config['hoehe'] = str(cfg.get('hoehe') or config['hoehe'])
-                config['laenge'] = str(cfg.get('laenge') or config['laenge'])
+            if isinstance(v4, dict):
+                sub_cfg = v4.get('config') if isinstance(v4.get('config'), dict) else {}
+                for source_key, target_key, stringify in (
+                    ('bluelink_refresh_token', 'refresh_token', False),
+                    ('bluelink_vin', 'vin', False),
+                    ('bluelink_car_name', 'car_name', False),
+                    ('bluelink_interval', 'bluelink_interval', True),
+                    ('hoehe', 'hoehe', True),
+                    ('laenge', 'laenge', True),
+                ):
+                    if source_key in v4:
+                        value = v4.get(source_key)
+                        v4_bound_keys.add(source_key)
+                        config[target_key] = (
+                            '' if value is None else str(value)
+                        ) if stringify else value
+                    elif source_key in sub_cfg:
+                        value = sub_cfg.get(source_key)
+                        if value is not None and str(value).strip() != '':
+                            config[target_key] = str(value) if stringify else value
+                    else:
+                        continue
         except Exception as e:
             logger.warning(f"V4-Konfig konnte nicht gelesen werden: {e}")
 
@@ -72,17 +87,18 @@ def load_bluelink_config():
         for line in f:
             if '=' in line and not line.strip().startswith('#'):
                 key, value = [x.strip() for x in line.split('=', 1)]
-                if key.lower() == 'bluelink_refresh_token' and not config['refresh_token']:
+                key = key.lower()
+                if key == 'bluelink_refresh_token' and key not in v4_bound_keys and not config['refresh_token']:
                     config['refresh_token'] = value
-                elif key.lower() == 'bluelink_vin' and not config['vin']:
+                elif key == 'bluelink_vin' and key not in v4_bound_keys and not config['vin']:
                     config['vin'] = value
-                elif key.lower() == 'bluelink_car_name' and not config['car_name']:
+                elif key == 'bluelink_car_name' and key not in v4_bound_keys and not config['car_name']:
                     config['car_name'] = value
-                elif key.lower() == 'bluelink_interval' and config['bluelink_interval'] == '15':
+                elif key == 'bluelink_interval' and key not in v4_bound_keys and config['bluelink_interval'] == '15':
                     config['bluelink_interval'] = value
-                elif key.lower() == 'hoehe' and config['hoehe'] == '0':
+                elif key == 'hoehe' and key not in v4_bound_keys and config['hoehe'] == '0':
                     config['hoehe'] = value
-                elif key.lower() == 'laenge' and config['laenge'] == '0':
+                elif key == 'laenge' and key not in v4_bound_keys and config['laenge'] == '0':
                     config['laenge'] = value
     return config
 
@@ -93,6 +109,7 @@ def main():
         return
         
     last_update = 0
+    missing_token_logged = False
 
     while True:
         config = load_bluelink_config()
@@ -104,9 +121,12 @@ def main():
         if interval < 5: interval = 5 # Absicherung für die API
 
         if not refresh_token:
-            logger.error("Kein 'bluelink_refresh_token' gefunden. Warte 60s...")
+            if not missing_token_logged:
+                logger.info("Bluelink ist ohne refresh_token deaktiviert; warte auf Konfiguration.")
+                missing_token_logged = True
             time.sleep(60)
             continue
+        missing_token_logged = False
             
         now = time.time()
         force_requested = os.path.exists(FORCE_FLAG_FILE)

@@ -10,7 +10,7 @@ if (in_array($action, ['get_vapid', 'subscribe', 'test_push'], true)) {
     requireWebAuth(true);
 }
 $paths = getInstallPaths();
-// $configFile entfernt: generate_vapid.py liest V4 JSON selbst
+$installRoot = !empty($paths['valid']) ? @realpath(rtrim((string)$paths['install_path'], '/')) : false;
 
 // Helper to base64url encode
 function base64url_encode($data) {
@@ -20,20 +20,41 @@ function base64url_encode($data) {
 if ($action === 'get_vapid') {
     $config = loadE3dcConfig();
     $pub = $config['config']['push_vapid_public'] ?? '';
-    
+    $private = $config['config']['push_vapid_private'] ?? '';
+
     // Auto-Generate VAPID if missing
-    if (empty($pub)) {
-        $homeDir = rtrim($paths['home_dir'], '/');
-        $scriptPath = "$homeDir/Install/Installer/generate_vapid.py";
-        if (!file_exists($scriptPath)) { $scriptPath = "$homeDir/pi/Install/Installer/generate_vapid.py"; }
-        $pythonScript = escapeshellarg($scriptPath);
-        $pythonCmd = escapeshellarg(getPythonInterpreter());
-        exec("$pythonCmd " . $pythonScript . ' 2>&1', $out, $ret);
+    if (empty($pub) || empty($private)) {
+        $scriptPath = $installRoot !== false ? $installRoot . '/Installer/generate_vapid.py' : '';
+        $scriptReal = $scriptPath !== '' ? @realpath($scriptPath) : false;
+        $python = e3dcGetTrustedPythonInterpreter();
+        if ($python === null || $scriptReal === false || is_link($scriptPath)
+            || !str_starts_with($scriptReal, rtrim((string)$installRoot, '/') . '/Installer/')) {
+            http_response_code(503);
+            echo json_encode(['error' => 'VAPID-Helfer ist im gebundenen Installationspfad nicht sicher verfügbar. Bitte Installation oder Rechte reparieren.']);
+            exit;
+        }
+        $result = e3dcRunArgvProcess([$python, $scriptReal], 10.0, ['cwd' => dirname($scriptReal), 'max_output_bytes' => 16384]);
+        $generated = @json_decode(trim((string)($result['stdout'] ?? '')), true);
+        $generatedPublic = is_array($generated) ? trim((string)($generated['public'] ?? '')) : '';
+        $generatedPrivate = is_array($generated) ? trim((string)($generated['private'] ?? '')) : '';
+        $keysValid = !empty($result['success'])
+            && !empty($generated['success'])
+            && preg_match('/^[A-Za-z0-9_-]{80,100}$/', $generatedPublic)
+            && preg_match('/^[A-Za-z0-9_-]{40,50}$/', $generatedPrivate);
+        if (!$keysValid || !saveE3dcConfigValues([
+            'push_vapid_public' => $generatedPublic,
+            'push_vapid_private' => $generatedPrivate,
+        ])) {
+            http_response_code(500);
+            echo json_encode(['error' => 'VAPID-Schlüssel konnten nicht sicher gespeichert werden. Bitte im Installationscenter „Rechte reparieren“ ausführen.']);
+            exit;
+        }
         $config = loadE3dcConfig();
         $pub = $config['config']['push_vapid_public'] ?? '';
-        
-        if (empty($pub)) {
-            echo json_encode(['error' => 'Auto-Generierung fehlgeschlagen. ' . implode(" ", $out)]);
+        $private = $config['config']['push_vapid_private'] ?? '';
+        if (!hash_equals($generatedPublic, (string)$pub) || !hash_equals($generatedPrivate, (string)$private)) {
+            http_response_code(500);
+            echo json_encode(['error' => 'VAPID-Schlüssel wurden gespeichert, konnten aber nicht eindeutig zurückgelesen werden.']);
             exit;
         }
     }
@@ -43,14 +64,24 @@ if ($action === 'get_vapid') {
 }
 
 if ($action === 'subscribe') {
-    $data = json_decode(file_get_contents('php://input'), true);
-    if (!$data || !isset($data['endpoint'])) {
-        echo json_encode(['success' => false, 'error' => 'Invalid data']);
+    $rawBody = file_get_contents('php://input');
+    $data = is_string($rawBody) && strlen($rawBody) <= 65536 ? json_decode($rawBody, true) : null;
+    $endpoint = is_array($data) ? trim((string)($data['endpoint'] ?? '')) : '';
+    $p256dh = is_array($data) ? trim((string)($data['keys']['p256dh'] ?? '')) : '';
+    $auth = is_array($data) ? trim((string)($data['keys']['auth'] ?? '')) : '';
+    if (!is_array($data) || !filter_var($endpoint, FILTER_VALIDATE_URL)
+        || !str_starts_with(strtolower($endpoint), 'https://') || $p256dh === '' || $auth === '') {
+        http_response_code(400);
+        echo json_encode(['success' => false, 'error' => 'Push-Abonnement ist unvollständig oder ungültig.']);
         exit;
     }
 
     $dbPath = '/var/www/html/data/e3dc_stats.db';
-    if (!file_exists(dirname($dbPath))) { @mkdir(dirname($dbPath), 0775, true); }
+    if (!is_dir(dirname($dbPath))) {
+        http_response_code(500);
+        echo json_encode(['success' => false, 'error' => 'Datenverzeichnis fehlt. Bitte Installation oder Rechte reparieren.']);
+        exit;
+    }
     
     try {
         $db = new PDO('sqlite:' . $dbPath);
@@ -68,43 +99,45 @@ if ($action === 'subscribe') {
 
         $stmt = $db->prepare("INSERT OR REPLACE INTO push_subscriptions (endpoint, p256dh, auth, device_name) VALUES (?, ?, ?, ?)");
         $stmt->execute([
-            $data['endpoint'],
-            $data['keys']['p256dh'] ?? '',
-            $data['keys']['auth'] ?? '',
-            $data['device_name'] ?? 'PWA Client'
+            $endpoint,
+            $p256dh,
+            $auth,
+            substr((string)($data['device_name'] ?? 'PWA Client'), 0, 255)
         ]);
 
         echo json_encode(['success' => true]);
     } catch (Exception $e) {
-        echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+        error_log('WebPush-Abonnement konnte nicht gespeichert werden.');
+        http_response_code(500);
+        echo json_encode(['success' => false, 'error' => 'Push-Abonnement konnte nicht gespeichert werden. Bitte Datenbankrechte prüfen.']);
     }
     exit;
 }
 
 if ($action === 'test_push') {
-    $homeDir = rtrim($paths['home_dir'], '/');
-    $scriptPath = "$homeDir/Install/Installer/send_push.py";
-    if (!file_exists($scriptPath)) { $scriptPath = "$homeDir/pi/Install/Installer/send_push.py"; }
-    $pythonScript = escapeshellarg($scriptPath);
-    $pythonCmd = escapeshellarg(getPythonInterpreter());
-    
-    // We execute the python script as a helper to send WebPush via pywebpush
-    // The script will return JSON directly.
-    $command = "$pythonCmd " . $pythonScript . ' ' . escapeshellarg("E3DC-Control Testnachricht") . ' ' . escapeshellarg("Die Push-Schnittstelle wurde erfolgreich verbunden!");
-    exec("$command 2>&1", $out, $ret);
-    
-    // Output could be multiple lines or error traceback
-    $responseString = implode("\n", $out);
-    
-    // Try to decode exactly what python printed to JSON
-    $jsonValid = @json_decode($responseString, true);
-    if (json_last_error() === JSON_ERROR_NONE) {
-        echo $responseString;
-    } else {
-        // If Python crashed (e.g. pywebpush not installed)
-        echo json_encode(['success' => false, 'error' => substr($responseString, 0, 500)]);
+    $scriptPath = $installRoot !== false ? $installRoot . '/Installer/send_push.py' : '';
+    $scriptReal = $scriptPath !== '' ? @realpath($scriptPath) : false;
+    $python = e3dcGetTrustedPythonInterpreter();
+    if ($python === null || $scriptReal === false || is_link($scriptPath)
+        || !str_starts_with($scriptReal, rtrim((string)$installRoot, '/') . '/Installer/')) {
+        http_response_code(503);
+        echo json_encode(['success' => false, 'error' => 'Push-Helfer ist im gebundenen Installationspfad nicht sicher verfügbar.']);
+        exit;
     }
+    $result = e3dcRunArgvProcess(
+        [$python, $scriptReal, 'E3DC-Control Testnachricht', 'Die Push-Schnittstelle wurde erfolgreich verbunden!'],
+        20.0,
+        ['cwd' => dirname($scriptReal), 'max_output_bytes' => 32768]
+    );
+    $payload = @json_decode(trim((string)($result['stdout'] ?? '')), true);
+    if (empty($result['success']) || !is_array($payload) || empty($payload['success'])) {
+        http_response_code(500);
+        echo json_encode(['success' => false, 'error' => 'Testnachricht wurde nicht bestätigt. Bitte Push-Konfiguration und registrierte Geräte prüfen.']);
+        exit;
+    }
+    echo json_encode(['success' => true, 'count' => max(0, (int)($payload['count'] ?? 0))]);
     exit;
 }
 
+http_response_code(400);
 echo json_encode(['error' => 'Unknown action']);

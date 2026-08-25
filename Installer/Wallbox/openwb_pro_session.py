@@ -52,6 +52,12 @@ RELEASABLE_ZERO_ANCHOR_REASONS = frozenset({
     # für dieselbe Stecksession bindet, darf er den nächsten Start nicht als
     # dauerhaften Nutzer-/Safety-Stop behandeln.
     "wbminsoc_floor_pause",
+    # Eine im laufenden Betrieb angehobene wbminSoC-Grenze entzieht der
+    # Wallbox zunächst ausschließlich die Akku-Unterstützung. Der dadurch
+    # gesetzte 0-A-Anker ist kein Nutzer-Aus: Er darf in derselben
+    # Stecksession erst mit einem frischen, ausführbaren positiven Budget und
+    # hinter allen übrigen Safety-Gates wieder gelöst werden.
+    "wbminsoc_runtime_raise_no_pv_budget",
     # Die Pre-Dump-Startqualifizierung ist eine vorübergehende Policy-Kante.
     # Ein frisches positives Budget derselben Stecksession darf den dadurch
     # gesetzten Nullanker wieder lösen; Nutzer-Aus und Safety-Vetos bleiben

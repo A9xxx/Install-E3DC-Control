@@ -5,7 +5,7 @@ Updates werden ausschließlich über den Installer ausgeführt. Ein manuelles
 Nutzerinstallation ist für den regulären Ziel-Updater weder Voraussetzung noch
 Updateautorität.
 
-Der aktuelle Stable-Stand ist `v5.4.4c`. Das Dashboard startet ausschließlich
+Der aktuelle Stable-Stand ist `v5.4.4d`. Das Dashboard startet ausschließlich
 den argumentlosen, root-eigenen Systemjob. Dieser installiert den neuesten
 veröffentlichten Stable-Stand oder repariert dieselbe Version. Der
 Stable-Versionscheck ist nur eine Anzeige und keine Startfreigabe. Freie Pfade,
@@ -19,7 +19,10 @@ Der lokale Git-, Rechte- oder Änderungszustand entscheidet nicht darüber, ob
 dieser Auftrag angenommen wird. Der Ziel-Updater erstellt das Vollbackup,
 sichert nach dem kurzen Dienststopp die nun ruhenden veränderlichen Daten nach,
 tauscht Dateien, Rechte, Core-Units und Launcher aus und startet die benötigten
-Dienste neu.
+Dienste neu. Die unterschiedlichen Web-Launcher aus 5.4.4a, 5.4.4b und 5.4.4c
+werden direkt unterstützt: Fehlen spätere Übergabeparameter, lädt der
+commitgebundene Ziel-Bootstrap den vollständigen Releasebaum selbst und prüft
+Tag und Commit erneut.
 
 Nach einmaliger Installation des gemeinsamen Dispatchers kann der Auftrag auch
 direkt auf der Konsole gestartet werden:
@@ -100,11 +103,12 @@ Unit projiziert, gestartet und als Pflichtdienst geprüft. War sie nur
 aktiviert, wird die neue Unit ebenfalls nur aktiviert. Erst nach dem
 bestätigten Zielstand wird die alte Unit deaktiviert.
 
-**Einmaliger Übergang aus einem Altstand:** Ein defekter 5.4.4b-Launcher kann
-abbrechen, bevor er den neuen Ziel-Updater erreicht. Dann installiert der oben
-gezeigte Ein-Datei-Befehl einmalig den neuen Stand samt root-eigenem Dispatcher.
-Danach verwenden Dashboard, Konsole und Installer-Menü denselben
-Hintergrundauftrag.
+**Übergang aus 5.4.4a bis 5.4.4c:** Die drei veröffentlichten Web-Launcher
+reichen unterschiedliche Teilverträge weiter. 5.4.4d erkennt diese gebundenen,
+root-privaten Einstiege und vervollständigt den Zielrelease selbst. Der
+Ein-Datei-Befehl bleibt für noch ältere, beschädigte oder gar nicht mehr
+startbare Web-Launcher der universelle Rettungsweg; für den normalen Übergang
+aus 5.4.4a bis 5.4.4c ist er nicht mehr erforderlich.
 
 ### Übergang aus älteren 5.4.2-Beständen
 
@@ -137,6 +141,33 @@ dem Root-Lock aus demselben gültigen Nicht-Root-Eigentümer von Repository und
 `.git`, lokales Benutzerkonto und Nutzerwert unmittelbar vor dem ersten
 Import aus dem Zielcode erneut geprüft. Die fail-closed Grenzen und alle
 übrigen Härtungen aus 5.4.3j bleiben unverändert.
+
+### 5.4.4d: lösungsorientierter Ziel-Updater und bestätigte Webaktionen
+
+5.4.4d führt Vollbackup, kurze ruhende Daten-Nachsicherung,
+Releaseprojektion, Reparatur bekannter Rechte und Dienstneustart vollständig im
+heruntergeladenen Ziel-Updater aus. Das Nutzer-`.git`, lokale
+Produktänderungen, fehlende Produktdateien und historische Rechte sind keine
+vorgelagerten Startbedingungen. Der Rechte-Button verwendet denselben
+root-eigenen Backup-/Updateauftrag.
+
+Kann der Auftrag wegen `ENOSPC`, `EROFS` oder `EACCES` nicht fortfahren, nennt
+er den betroffenen Pfad und einen konkreten Prüf- beziehungsweise
+Fortsetzungsbefehl. Werden mehrere gleichrangige Installationen gefunden,
+werden dauerhafte, einzeln ausführbare Befehle für die Kandidaten ausgegeben;
+der Updater rät keine Instanz.
+
+Alle sichtbaren zustandsändernden Webaktionen verlangen Anmeldung
+und CSRF-Schutz. Ein Erfolg setzt passenden HTTP-Status, gültige Antwort und
+ausgewertete Teilergebnisse voraus. Das bestätigt den Softwarevertrag der
+Buttons, nicht die Feldbetätigung jedes erreichbaren physischen Aktors.
+
+Der Modus-5-Datenvertrag akzeptiert den privaten Standard `02770` und den
+ausdrücklich gewählten Kompatibilitätsmodus `02775`. HA-Leases werden nur bei
+exakt passender Rolle und Peer-Bindung übernommen. Bluelink priorisiert
+ausdrücklich vorhandene aktuelle Felder; ein bewusst leerer oberster Token wird
+nicht durch einen älteren Fallback ersetzt und ein fehlender Token nur einmalig
+als ruhige Information gemeldet.
 
 ### 5.4.4c: direkter, Git-unabhängiger Updatepfad
 
@@ -702,97 +733,35 @@ In einer Docker-Installation führen weder Weboberfläche noch Konsole einen
 Release-Wechsel im laufenden Container aus. Sie zeigen stattdessen die drei
 Host-Befehle aus dem Abschnitt [Docker-Update](#docker-update).
 
-## Einmaliger Wechsel von alten Installationen
+## Alte Installationen und unterstützte Plattform
 
-Der Bootstrap gilt auch für 5.3.2a, V4.0.1 bis V4.0.5 sowie für V3-/ZIP-Stände
-ohne `.git`. Diese Stände wechseln zuerst auf die bewusst dafür veröffentlichte
-Übergangsbasis 5.3.2b und führen danach deren regulären Updatepfad aus. Lade
-das veröffentlichte 5.3.2b-Release-Archiv in ein temporäres Verzeichnis
-und prüfe dessen veröffentlichte SHA-256. Notiere außerdem den vollständigen
-40-stelligen Commit-SHA und die bestehende HA-/Shadow-Rolle (`off`, `master`,
-`slave` oder `shadow`).
+Auch alte, veränderte oder unvollständige Bare-Metal-Installationen verwenden
+heute ausschließlich den oben beschriebenen Ein-Datei-Rettungsweg. Ein
+Zwischenschritt über 5.3.2b, ein manueller Git-Aufbau, ein selbst eingetragener
+Commit oder der historische Target-Finalizer sind nicht mehr erforderlich und
+sollen nicht mehr ausgeführt werden.
+
+Der Ziel-Updater benötigt Python 3.10 oder neuer. Ist nur eine ältere
+Python-Version vorhanden, endet der Auftrag vor jeder Änderung mit dem
+Fehlercode `E3DC-UPD-PLATFORM-001`, bestätigt den unveränderten Systemzustand
+und nennt die Lösung. Prüfe zunächst:
 
 ```bash
-/tmp/e3dc-release/e3dc-bootstrap \
-  "$E3DC_INSTALL_PATH" \
-  vX.Y.Z \
-  0123456789abcdef0123456789abcdef01234567 \
-  off
+python3 --version
 ```
 
-Tag, SHA und Rolle werden durch die auf der Release-Seite freigegebenen Werte
-und die zuvor geprüfte Rolle ersetzt. Der Launcher verlangt Python 3.10 oder
-neuer und beendet sich bei einer älteren Laufzeit, bevor der Zielbaum
-verändert wird. Bei einer V3-Installation kann der absolute Zielpfad zum
-Beispiel `$HOME/E3DC-Control` sein.
+Aktualisiere ein zu altes Raspberry-Pi-/Debian-System auf eine unterstützte
+Version mit Python 3.10 oder neuer und starte anschließend exakt denselben
+Updatebefehl erneut. Der Updater versucht kein eigenmächtiges Betriebssystem-
+Upgrade.
 
-Der Bootstrap akzeptiert nur einen annotierten Tag, dessen aufgelöster Commit
-exakt dem angegebenen SHA entspricht. Er sichert zuerst den tatsächlichen
-Zielbaum. Erst nach Manifest- und Prüfsummengate werden Git initialisiert und
-der neue Release-Stand eingespielt. Ein vorhandener alter Git-Verlauf muss
-keinen gemeinsamen Vorfahren mit dem neuen Verlauf besitzen.
-
-## Harte Gates
-
-Sobald der neue Updater selbst läuft, führt er den Wechsel in dieser
-Reihenfolge aus:
-
-1. annotierten Ziel-Tag, vollständigen Ziel-SHA und
-   `UPDATE_POLICY.json` aus dem verifizierten Commit-Objekt gegen Freigabe,
-   Ausgangsrepository und Rolle binden;
-2. ein externes, root-eigenes Backup mit vollständigem Manifest, SHA-256,
-   Git-Ausgangszustand und dem Zustand kanonischer systemd-Masken erstellen
-   und mit einem Transaktionsbeleg erneut prüfen;
-3. im versiegelten Normalpfad den txid-, ziel-, rollen-, backup-, bootblock-
-   und servicegebundenen ausstehenden Update-Sicherheitsbeleg (`pending`)
-   zusammen mit den eigenen dynamischen `00`-Startbedingungen persistieren
-   und den Marker vor der ersten Produktmutation armieren;
-4. PiGuard und danach alle katalogisierten Writer-/Integrationsdienste unter
-   diesem Startschutz stoppen; `inactive/dead`, `MainPID=0`, Backup,
-   Repository, privilegierte Konfiguration und den vollständigen Schutzvertrag
-   unmittelbar am Mutationsgate erneut prüfen;
-5. eine exakt freigegebene historische Storage-Manager-Unit gegebenenfalls
-   unter demselben Schutz atomar auf den root-eigenen Vertrag migrieren,
-   `daemon-reload` ausführen und das effektive Unit-Bündel erneut lesen;
-6. den Installationsbaum auf genau den Ziel-SHA setzen und `HEAD` erneut
-   prüfen;
-7. den Target-Finalizer aus einem separaten root-eigenen,
-   schreibgeschützten Ausführungssnapshot des verifizierten Zielcommits als
-   verwalteten systemd-Dienst unter demselben Update-Lock und seiner
-   transaktionsgebundenen Lease starten;
-8. Webdateien synchronisieren und veraltete Pfade nur über feste Positivlisten
-   entfernen;
-9. eingefrorene HA-/Shadow-Rolle und Feature-Konfiguration, alle erwarteten
-   Dienste, lokale HTTP-Endpunkte und Boot-Sanity hart prüfen;
-10. erst danach den Update-Sicherheitsbeleg dauerhaft als `committed`
-    bestätigen. Ein Altstand-Rollback ist ab hier verboten; der Finalizer
-    entfernt nur seinen exakt eigenen Marker-/`00`-Vertrag. Der äußere Pfad
-    entfernt das exakt gebundene Receipt erst nach inaktiver Lease; ein
-    unterbrochener Abschluss bleibt auf genau dieses Cleanup begrenzt.
-
-Beim direkten ersten Wechsel aus 5.3.2b bleibt der bereits
-gestartete Altprozess bis zum Abschluss aktiv. Nach dem Git-Wechsel importiert
-er die neue, dienstneutrale Rechteprüfung; der zielgebundene Finalizer gilt ab
-dem anschließend laufenden neuen Updater. Der erste Wechsel behauptet deshalb
-keine nachträgliche Ausführung eines Finalizers, den der Altprozess noch nicht
-kennt.
-
-Für diesen ersten Hybridwechsel enthält die Zielpolicy ausschließlich die
-sieben Pflichtdienste. Der Altprozess erfasst die vor dem Wechsel bereits
-installierten Zusatzdienste und die gebundene HA-/Shadow-Rolle. Nur die in der
-eingefrorenen Konfiguration aktiven Zusatzdienste werden gestartet;
-deaktivierte Zusatzdienste bleiben aus. Eine
-vorbereitete Konfiguration allein installiert oder startet keine bislang
-fehlende Wallbox-, Wärme- oder Integrationssteuerung. Solche konfigurierten,
-aber nicht installierten Zusatzmodule werden im Updateprotokoll genannt und
-können nach dem Release-Wechsel bewusst über das Install-Center eingerichtet
-werden.
-
-Scheitert ein Gate nach einer Änderung, setzt der Installer den alten Git-Stand
-zurück, entfernt bei einem ZIP-Bootstrap die neu angelegte `.git`-Struktur,
-stellt das Sicherheits-Backup wieder her und prüft Rolle, Dienste und HTTP
-erneut. Ist diese Wiederherstellung nicht vollständig beweisbar, bleiben die
-Writer-/Aktor-Dienste gestoppt.
+Der aktuelle Ablauf bleibt bewusst kurz: Zielrelease laden, Vollbackup bei
+laufenden Diensten, Abhängigkeiten vorbereiten, einmaliger kurzer Dienststopp,
+ruhende Daten nachsichern, Produkt/Web/Rechte/Units projizieren und die
+benötigten Dienste neu starten. Das Nutzer-`.git` ist daran nicht beteiligt.
+Scheitert der Austausch nach begonnener Produktänderung, werden das gebundene
+Vollbackup und danach die neuere ruhende Daten-Nachsicherung wiederhergestellt,
+bevor der vorherige Dienstsatz erneut gestartet wird.
 
 ## Gezielter Rückfall
 

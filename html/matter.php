@@ -34,23 +34,38 @@ function clearMatterDir($dir) {
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['reset_pairing'])) {
     e3dcRequireCsrfToken(false);
     $matterStorageDir = '/var/www/html/data/matter-storage';
-    $storageOk = clearMatterDir($matterStorageDir);
-    @unlink('/var/www/html/ramdisk/matter_pairing.json');
+    $pairingFile = '/var/www/html/ramdisk/matter_pairing.json';
 
     if (!matterServiceInstalled()) {
+        $storageOk = clearMatterDir($matterStorageDir);
+        $pairingRemoval = e3dcRemoveRuntimeCommandFile($pairingFile);
         $resetOk = false;
-        $resetNotice = "Matter-Kopplung wurde gelöscht, aber der Dienst e3dc-matter-bridge ist nicht installiert.";
+        $resetNotice = ($storageOk && !empty($pairingRemoval['success']))
+            ? "Matter-Kopplungsdaten wurden gelöscht, aber der Dienst e3dc-matter-bridge ist nicht installiert. Installiere das Matter-Modul, um einen neuen Code zu erzeugen."
+            : "Matter-Kopplungsdaten konnten nicht vollständig gelöscht werden. Bitte führe im Installationscenter „Rechte reparieren“ aus.";
     } else {
-        $restart = e3dcRunServiceWrapperAction('restart', ['e3dc-matter-bridge']);
-        $restartOk = !empty($restart['success']);
-        $resetOk = $storageOk && $restartOk;
-        $resetNotice = $storageOk
-            ? (
-                $restartOk
-                    ? "Matter-Kopplung wurde zurückgesetzt. Der Dienst startet neu und erzeugt gleich einen neuen Code."
-                    : "Matter-Kopplung wurde zurückgesetzt, aber der Dienst konnte nicht neu gestartet werden: " . implode("; ", $restart['errors'] ?? [])
-            )
-            : "Matter-Kopplung teilweise zurückgesetzt, aber nicht alle Storage-Dateien konnten gelöscht werden.";
+        $stop = e3dcRunServiceWrapperAction('stop', ['e3dc-matter-bridge']);
+        if (empty($stop['success'])) {
+            $resetOk = false;
+            $resetNotice = "Matter-Dienst konnte vor dem Löschen nicht sicher gestoppt werden. Es wurden keine Kopplungsdaten verändert: "
+                . implode("; ", $stop['errors'] ?? []);
+        } else {
+            $storageOk = clearMatterDir($matterStorageDir);
+            $pairingRemoval = e3dcRemoveRuntimeCommandFile($pairingFile);
+            $start = e3dcRunServiceWrapperAction('start', ['e3dc-matter-bridge']);
+            $startOk = !empty($start['success'])
+                && in_array('e3dc-matter-bridge.service', (array)($start['changed'] ?? []), true);
+            $resetOk = $storageOk && !empty($pairingRemoval['success']) && $startOk;
+            if ($resetOk) {
+                $resetNotice = "Matter-Kopplung wurde zurückgesetzt. Der bestätigte Dienststart erzeugt gleich einen neuen Code.";
+            } elseif (!$storageOk || empty($pairingRemoval['success'])) {
+                $resetNotice = "Matter-Kopplung wurde nicht vollständig gelöscht. Der Dienststart wurde anschließend "
+                    . ($startOk ? "bestätigt." : "ebenfalls nicht bestätigt. Bitte „Rechte reparieren“ ausführen.");
+            } else {
+                $resetNotice = "Matter-Kopplung wurde gelöscht, aber der Dienststart nicht bestätigt: "
+                    . implode("; ", $start['errors'] ?? []);
+            }
+        }
     }
 }
 

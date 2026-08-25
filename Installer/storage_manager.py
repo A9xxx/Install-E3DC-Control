@@ -18242,6 +18242,48 @@ def apply_wallbox_start_hold_decision(
         ),
         clock_sample=control_time.sample(wall_ts=now_s),
     )
+    grant_extension_w = max(0, safe_int(grant.get("extension_w"), 0))
+    grant_charge_reduction_w = max(
+        0,
+        min(
+            storage_request_w,
+            safe_int(grant.get("charge_reduction_w"), 0),
+        ),
+    )
+    grant_discharge_support_w = max(
+        0,
+        safe_int(grant.get("discharge_support_w"), 0),
+    )
+    grant_funding_valid = bool(
+        grant.get("active") is not True
+        or (
+            grant_charge_reduction_w + grant_discharge_support_w
+            == grant_extension_w
+            and (
+                grant_discharge_support_w <= 0
+                or battery_support_allowed
+            )
+        )
+    )
+    if not grant_funding_valid:
+        grant = copy.deepcopy(grant)
+        blockers = list(grant.get("blockers") or [])
+        if "extension_unfunded" not in blockers:
+            blockers.append("extension_unfunded")
+        grant.update({
+            "active": False,
+            "status": "extension_unfunded",
+            "grants": [],
+            "effective_budget_w": base_budget_w,
+            "extension_w": 0,
+            "charge_reduction_w": 0,
+            "discharge_support_w": 0,
+            "funding_covered_w": 0,
+            "funding_applied_w": 0,
+            "funding_uncovered_w": grant_extension_w,
+            "source_mode": "unfunded",
+            "blockers": blockers,
+        })
     result["wallbox_start_hold_intent"] = intent
     result["wallbox_start_hold_grants"] = grant
     if not grant.get("active"):
@@ -18269,12 +18311,22 @@ def apply_wallbox_start_hold_decision(
     auto = result.get("auto_limit") if isinstance(result.get("auto_limit"), dict) else {}
     auto = dict(auto)
     auto_active = bool(auto.get("enabled")) and not bool(auto.get("release"))
-    if auto_active and charge_reduction_w > 0:
-        auto["max_charge_w"] = max(
-            0,
+    if charge_reduction_w > 0:
+        charge_limit_before_w = (
             safe_int(auto.get("max_charge_w"), max_charge_w)
-            - charge_reduction_w,
+            if auto_active
+            else min(max_charge_w, storage_request_w)
         )
+        auto.update({
+            "enabled": True,
+            "release": False,
+            "max_charge_w": max(
+                0,
+                charge_limit_before_w - charge_reduction_w,
+            ),
+            "heartbeat_s": auto_limit_heartbeat_s(cfg),
+        })
+        auto_active = True
     if not battery_support_allowed:
         auto.update({
             "enabled": True,
@@ -18290,12 +18342,23 @@ def apply_wallbox_start_hold_decision(
             "discharge_start_w": 0,
             "heartbeat_s": auto_limit_heartbeat_s(cfg),
             "reason": (
-                "Wallbox-Start-Haltefenster unter wbminSoC: "
-                "maximal 40 Wh Netzpuffer, keine Batterieentladung"
+                "Wallbox-Start-Haltefenster aus reduzierter Speicherladung: "
+                "keine Batterieentladung und keine Netzbezugsfreigabe"
             ),
         })
         auto_active = True
-    elif auto_active and safe_int(grant.get("discharge_support_w"), 0) > 0:
+    elif safe_int(grant.get("discharge_support_w"), 0) > 0:
+        if not auto_active:
+            auto.update({
+                "enabled": True,
+                "release": False,
+                "max_charge_w": max(
+                    0,
+                    min(max_charge_w, storage_request_w),
+                ),
+                "heartbeat_s": auto_limit_heartbeat_s(cfg),
+            })
+            auto_active = True
         auto["max_discharge_w"] = min(
             max_discharge_w,
             max(
@@ -22130,6 +22193,56 @@ def protected_decision(
     )
     if direct_marketing_owner is not None:
         return direct_marketing_owner
+
+    wb_intent_fresh = bool(wb_intent) and (
+        now_s - safe_float(wb_intent.get("ts"), 0.0) <= 90.0
+    )
+    wbminsoc_runtime_raise_active = bool(
+        wb_intent_fresh
+        and wb_intent.get("wbminsoc_runtime_raise_active") is True
+        and wb_intent.get("battery_support_authorized") is False
+        and normalize_wb_mode(
+            wb_intent.get("wb_mode_active", cfg.get("wb1_mode", 0))
+        ) != MODE_OFF
+        and not wallbox_intent_external_manager(wb_intent)
+        and not bool(wb_intent.get("scheduled_slot_active"))
+        and not bool(wb_intent.get("price_boost_active"))
+        and not bool(wb_intent.get("price_plan_storage_protect"))
+    )
+    if wbminsoc_runtime_raise_active:
+        pv_only_budget_w = max(
+            0,
+            safe_int(
+                wb_intent.get(
+                    "pv_only_authorized_w",
+                    wb_intent.get("pv_only_allowed_w"),
+                ),
+                0,
+            ),
+        )
+        reason = (
+            "wbminSoC wurde während der Wallbox-Ladung angehoben: "
+            "Akku-Unterstützung sofort gesperrt; nur PV-Budget bleibt frei"
+        )
+        return {
+            "state": "wallbox_wbminsoc_runtime_raise_hold",
+            "mode": MODE_AUTO,
+            "val": max_charge_w,
+            "priority": "wallbox_floor",
+            "reason": reason,
+            "protected": True,
+            "storage_req_w": 0,
+            "budget_w": pv_only_budget_w,
+            "wbminsoc_runtime_raise_active": True,
+            "wbminsoc_runtime_raise_pv_only_budget_w": pv_only_budget_w,
+            "battery_support_authorized": False,
+            "battery_support_reason": "wbminsoc_runtime_raise",
+            "auto_limit": discharge_block_auto_limit(
+                cfg,
+                max_charge_w,
+                reason,
+            ),
+        }
 
     predump_floor_hold = predump_wallbox_floor_hold_decision(
         cfg,
@@ -29604,6 +29717,9 @@ _WB_BUDGET_CONTROL_KEYS = {
     "ems_budget_runtime_class", "ems_budget_runtime_cap_applied",
     "ems_budget_runtime_single_sink_superseded",
     "wallbox_ifc_readback_gate",
+    "wbminsoc_runtime_raise_active", "wbminsoc_runtime_raise_pv_only_budget_w",
+    "battery_support_authorized", "battery_support_reason",
+    "pv_only_allowed_w", "pv_only_authorized_w",
     "controlled_wallbox_auto_freerun", "controlled_wallbox_auto_limit_active",
     "abregel_active", "abregel_source", "safe_start",
     "peak_shaving", "grid_import_headroom_w",

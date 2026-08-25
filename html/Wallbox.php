@@ -42,6 +42,148 @@ function wallboxTruthy($value) {
     return in_array(strtolower(trim((string)$value)), ['1', 'true', 'yes', 'on', 'locked', 'connected'], true);
 }
 
+function wallboxPublishForceStartRequest($wbIds) {
+    $requestedIds = is_array($wbIds) ? $wbIds : [$wbIds];
+    $normalizedIds = [];
+    foreach ($requestedIds as $requestedId) {
+        $normalizedIds[max(1, min(2, (int)$requestedId))] = true;
+    }
+    $normalizedIds = array_map('intval', array_keys($normalizedIds));
+    sort($normalizedIds, SORT_NUMERIC);
+    if ($normalizedIds === []) {
+        return [
+            'success' => false,
+            'code' => 'request_target_missing',
+            'message' => 'Für die Sofort-Anforderung wurde keine Wallbox ausgewählt.',
+        ];
+    }
+    $requestFile = '/var/www/html/ramdisk/wallbox_user_mode_request.json';
+    $lock = e3dcWbTxAcquireSharedRequestLock($requestFile . '.lock', 2.0, 0664);
+    if ($lock === false) {
+        return [
+            'success' => false,
+            'code' => 'request_lock_failed',
+            'message' => 'Die Wallbox-Anforderung ist gerade belegt oder nicht sicher beschreibbar.',
+        ];
+    }
+
+    try {
+        $snapshot = e3dcWbTxSnapshot($requestFile, 65536);
+        $requests = [];
+        if (!empty($snapshot['exists'])) {
+            $requests = json_decode((string)$snapshot['bytes'], true);
+            if (!is_array($requests)) {
+                return [
+                    'success' => false,
+                    'code' => 'request_invalid',
+                    'message' => 'Die vorhandene Wallbox-Anforderungsdatei ist ungültig; sie wurde nicht überschrieben.',
+                ];
+            }
+        }
+
+        try {
+            $requestId = bin2hex(random_bytes(16));
+        } catch (Throwable $error) {
+            return [
+                'success' => false,
+                'code' => 'request_id_failed',
+                'message' => 'Die Sofort-Anforderung konnte nicht eindeutig erzeugt werden.',
+            ];
+        }
+        $timestamp = time();
+        $requestIds = [];
+        foreach ($normalizedIds as $wbId) {
+            try {
+                $wallboxRequestId = count($normalizedIds) === 1
+                    ? $requestId
+                    : bin2hex(random_bytes(16));
+            } catch (Throwable $error) {
+                return [
+                    'success' => false,
+                    'code' => 'request_id_failed',
+                    'message' => 'Die Sofort-Anforderung konnte nicht eindeutig erzeugt werden.',
+                ];
+            }
+            $requestKey = (string)$wbId;
+            $requestIds[$requestKey] = $wallboxRequestId;
+            $requests[$requestKey] = [
+                'mode' => 'force_start',
+                'ts' => $timestamp,
+                'source' => 'Wallbox.php',
+                'request_id' => $wallboxRequestId,
+            ];
+        }
+        $bytes = json_encode(
+            $requests,
+            JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES
+        );
+        if (!is_string($bytes) || strlen($bytes) > 65535) {
+            return [
+                'success' => false,
+                'code' => 'request_encode_failed',
+                'message' => 'Die Sofort-Anforderung konnte nicht sicher kodiert werden.',
+            ];
+        }
+
+        $publishedMutation = false;
+        if (!e3dcWbTxAtomicWrite(
+            $requestFile,
+            $bytes . "\n",
+            0664,
+            '',
+            false,
+            $publishedMutation
+        )) {
+            return [
+                'success' => false,
+                'code' => 'request_write_failed',
+                'message' => 'Die Sofort-Anforderung konnte nicht dauerhaft gespeichert werden. Bitte Dateirechte der Ramdisk prüfen.',
+            ];
+        }
+
+        $confirmed = e3dcWbTxSnapshot($requestFile, 65536);
+        $confirmedRequests = !empty($confirmed['exists'])
+            ? json_decode((string)$confirmed['bytes'], true)
+            : null;
+        $confirmedAll = is_array($confirmedRequests)
+            && (int)($confirmed['mode'] ?? 0) === 0664;
+        foreach ($requestIds as $requestKey => $wallboxRequestId) {
+            $confirmedRequest = is_array($confirmedRequests)
+                ? ($confirmedRequests[$requestKey] ?? null)
+                : null;
+            $confirmedAll = $confirmedAll
+                && is_array($confirmedRequest)
+                && (string)($confirmedRequest['mode'] ?? '') === 'force_start'
+                && (int)($confirmedRequest['ts'] ?? 0) === $timestamp
+                && hash_equals($wallboxRequestId, (string)($confirmedRequest['request_id'] ?? ''));
+        }
+        if (!$confirmedAll) {
+            return [
+                'success' => false,
+                'code' => 'request_confirmation_failed',
+                'message' => 'Die gespeicherte Sofort-Anforderung konnte nicht eindeutig bestätigt werden.',
+            ];
+        }
+
+        return [
+            'success' => true,
+            'code' => 'request_committed',
+            'request_id' => count($requestIds) === 1 ? reset($requestIds) : null,
+            'request_ids' => $requestIds,
+            'timestamp' => $timestamp,
+        ];
+    } catch (Throwable $error) {
+        return [
+            'success' => false,
+            'code' => 'request_surface_failed',
+            'message' => 'Die Wallbox-Anforderungsfläche ist nicht sicher oder nicht lesbar.',
+        ];
+    } finally {
+        @flock($lock, LOCK_UN);
+        @fclose($lock);
+    }
+}
+
 function wallboxWantsConfigJsonResponse() {
     return (string)($_POST['response_format'] ?? '') === 'json';
 }
@@ -682,15 +824,12 @@ function getObservedOpenwbChargeProfilesForWallbox() {
 
 function wallboxVehicleMaxPhases($vehicle) {
     if (!is_array($vehicle)) return '';
-    foreach (['max_phases', 'phases', 'ac_phases', 'charge_phases', 'charging_phases'] as $key) {
+    foreach (['max_phases', 'obc_max_phases', 'phases', 'ac_phases', 'charge_phases', 'charging_phases'] as $key) {
         if (isset($vehicle[$key]) && is_numeric($vehicle[$key])) {
             $ph = (int)$vehicle[$key];
             if (in_array($ph, [1, 2, 3], true)) return $ph;
         }
     }
-    $power = isset($vehicle['power']) ? (float)$vehicle['power'] : (float)($vehicle['charge_power'] ?? $vehicle['charge_power_kw'] ?? 0);
-    if ($power > 0 && $power <= 7.6) return 1;
-    if ($power >= 8.0) return 3;
     return '';
 }
 
@@ -920,24 +1059,55 @@ if (isset($_POST['trigger_wb_force_start_ajax'])) {
         'wb_sofort' => '1',
         'wbhour' => '99',
     ];
-    @unlink('/var/www/html/ramdisk/native_schedule_aborted.flag');
-    @unlink('/var/www/html/ramdisk/wallbox_abort_state.json');
-    $forceReqFile = '/var/www/html/ramdisk/wallbox_user_mode_request.json';
-    $forceReqs = [
-        (string)$wbId => ['mode' => 'force_start', 'ts' => time()],
-    ];
-    @file_put_contents($forceReqFile, json_encode($forceReqs, JSON_UNESCAPED_UNICODE));
     $tx = e3dcWallboxPlanTransaction($nativeUpdates, [
         'operation' => 'plan',
         'abort_flag' => 'remove',
     ]);
     header('Content-Type: application/json; charset=utf-8');
+    if (empty($tx['success'])) {
+        $txCode = preg_replace('/[^a-z0-9_\-]/i', '', (string)($tx['code'] ?? 'transaction_failed')) ?: 'transaction_failed';
+        http_response_code(in_array($txCode, ['lock_busy', 'concurrent_change'], true) ? 409 : 500);
+        echo json_encode([
+            'ok' => false,
+            'code' => $txCode,
+            'wb' => $wbId,
+            'configuration_committed' => false,
+            'request_confirmed' => false,
+            'message' => (string)($tx['message'] ?? 'Die Wallbox-Konfiguration konnte nicht bestätigt werden.'),
+        ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        exit;
+    }
+
+    $requestResult = wallboxPublishForceStartRequest($wbId);
+    if (empty($requestResult['success'])) {
+        $requestCode = (string)($requestResult['code'] ?? 'request_failed');
+        // 207 hält den typisierten Teilstatus für den bestehenden Dashboard-
+        // Client lesbar; `ok: false` verhindert trotzdem jede grüne Meldung.
+        http_response_code(207);
+        echo json_encode([
+            'ok' => false,
+            'code' => 'force_start_partial',
+            'request_code' => $requestCode,
+            'wb' => $wbId,
+            'configuration_committed' => true,
+            'request_confirmed' => false,
+            'message' => 'Die Wallbox-Grundfreigabe wurde gespeichert, aber die zusätzliche Sofort-Anforderung nicht bestätigt. Die Aktion wird deshalb nicht als erfolgreich gemeldet. '
+                . (string)($requestResult['message'] ?? 'Bitte Dateirechte der Ramdisk prüfen und den Status neu laden.'),
+        ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        exit;
+    }
+
     echo json_encode([
-        'ok' => !empty($tx['success']),
+        'ok' => true,
+        'code' => 'force_start_committed',
         'wb' => $wbId,
         'mode' => '1',
-        'message' => 'Ladung sofort gestartet (Freigabe erzwungen).',
-    ], JSON_UNESCAPED_UNICODE);
+        'configuration_committed' => true,
+        'request_confirmed' => true,
+        'request_id' => $requestResult['request_id'],
+        'request_ts' => $requestResult['timestamp'],
+        'message' => 'Sofortladen ist gespeichert und die Wallbox-Anforderung wurde bestätigt.',
+    ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
     exit;
 }
 
@@ -1468,6 +1638,16 @@ if (isset($_POST['save_manual_soc'])) {
     } else {
         $message = errorMessage('Manueller Start-SoC nicht übernommen', (string)($tx['message'] ?? 'Der kanonische manuelle SoC konnte nicht geschrieben werden.'));
     }
+    if (strtolower((string)($_SERVER['HTTP_X_REQUESTED_WITH'] ?? '')) === 'xmlhttprequest') {
+        header('Content-Type: text/plain; charset=utf-8');
+        if (empty($tx['success'])) {
+            http_response_code(in_array((string)($tx['code'] ?? ''), ['lock_busy', 'concurrent_change'], true) ? 409 : 500);
+            echo 'Manueller Start-SoC konnte nicht bestätigt gespeichert werden.';
+        } else {
+            echo 'OK';
+        }
+        exit;
+    }
 }
 
 // Behandlung für Fahrzeugvorlagen
@@ -1624,8 +1804,22 @@ if (isset($_POST['save_cloud_integration'])) {
         'bluelink_ignore_plug_status' => isset($_POST['bluelink_ignore_plug_status']) && $_POST['bluelink_ignore_plug_status'] == '1' ? '1' : '0'
     ];
     if (upsertWallboxConfigValues($config_file, $updates)) {
-        $message = successMessage('✓ Cloud-Integration gespeichert.');
-        e3dcRunServiceWrapperAction('restart', ['e3dc-bluelink']);
+        if (e3dcIsDockerEnvironment()) {
+            $message = errorMessage(
+                'Cloud-Integration gespeichert, Neustart nicht bestätigt',
+                'Die neue Konfiguration ist gespeichert. Bitte starte den Docker-Container einmal neu; erst danach ist die Bluelink-Übernahme bestätigt.'
+            );
+        } else {
+            $restart = e3dcRunServiceWrapperAction('restart', ['e3dc-bluelink']);
+            $restartOk = !empty($restart['success'])
+                && in_array('e3dc-bluelink.service', (array)($restart['changed'] ?? []), true);
+            $message = $restartOk
+                ? successMessage('✓ Cloud-Integration gespeichert und Bluelink-Dienst neu gestartet.')
+                : errorMessage(
+                    'Cloud-Integration gespeichert, Dienstneustart nicht bestätigt',
+                    (implode('; ', (array)($restart['errors'] ?? [])) ?: 'Bitte Dienststatus prüfen und den Neustart erneut auslösen.')
+                );
+        }
     } else {
         $message = errorMessage('Schreibberechtigung fehlt', 'Konnte Cloud-Integration in der V4-Konfiguration nicht speichern.');
     }
@@ -1818,8 +2012,11 @@ function parseWallboxConfigValues($filePath) {
     return $result;
 }
 
-function wallboxConfigUpsertResult($success, $code) {
-    return ['success' => (bool)$success, 'code' => (string)$code];
+function wallboxConfigUpsertResult($success, $code, $details = []) {
+    return array_merge(
+        is_array($details) ? $details : [],
+        ['success' => (bool)$success, 'code' => (string)$code]
+    );
 }
 
 function wallboxLogConfigFailure($operation, $code) {
@@ -1889,73 +2086,42 @@ function upsertWallboxConfigValuesDetailed($filePath, $updates, $options = []) {
         return $result;
     }
 
-    $tmpPath = '';
-    $finish = function($success, $code) use (&$lock, &$tmpPath) {
-        if ($tmpPath !== '' && file_exists($tmpPath)) @unlink($tmpPath);
+    $finish = function($success, $code, $details = []) use (&$lock) {
         @flock($lock, LOCK_UN);
         @fclose($lock);
-        $result = wallboxConfigUpsertResult($success, $code);
+        $result = wallboxConfigUpsertResult($success, $code, $details);
         if (!$success) wallboxLogConfigFailure('wallbox_config_upsert', $code);
         return $result;
     };
 
     if ($failOperation === 'read') return $finish(false, 'read_failed');
-    $raw = @file_get_contents($v4Path);
-    if ($raw === false) return $finish(false, 'read_failed');
-    $data = json_decode($raw, true);
-    if (!is_array($data)) return $finish(false, 'json_invalid');
-    foreach ($updates as $key => $value) $data[$key] = $value;
-    $json = json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
-    if ($json === false) return $finish(false, 'encode_failed');
-    $payload = $json . "\n";
-
-    if ($failOperation === 'temp') return $finish(false, 'temp_create_failed');
-    try {
-        $tmpPath = dirname($v4Path) . '/.e3dc-v4-' . bin2hex(random_bytes(12)) . '.tmp';
-    } catch (Throwable $e) {
-        return $finish(false, 'temp_create_failed');
-    }
-    $tmp = @fopen($tmpPath, 'x+b');
-    if ($tmp === false) return $finish(false, 'temp_create_failed');
-    $ok = @chmod($tmpPath, e3dcJsonAtomicFileMode($v4Path, $json));
-    $written = 0;
-    $length = strlen($payload);
-    while ($ok && $written < $length) {
-        if ($failOperation === 'write') {
-            $ok = false;
-            break;
+    $mappedFailure = [
+        'temp' => 'temp_create',
+        'verify' => 'final_readback',
+    ][$failOperation] ?? $failOperation;
+    $mutationOptions = [
+        'test_mode' => $testMode,
+        'fail_operation' => $mappedFailure,
+    ];
+    if ($testMode) {
+        $mutationOptions['backup_dir'] = (string)($options['backup_dir'] ?? (dirname($v4Path) . '/config_backups'));
+        if (isset($options['after_commit_hook']) && is_callable($options['after_commit_hook'])) {
+            $mutationOptions['after_commit_hook'] = $options['after_commit_hook'];
         }
-        $count = @fwrite($tmp, substr($payload, $written));
-        if ($count === false || $count <= 0) {
-            $ok = false;
-            break;
-        }
-        $written += $count;
     }
-    if (!$ok || $written !== $length) {
-        @fclose($tmp);
-        return $finish(false, 'write_failed');
-    }
-    if (!@fflush($tmp)) {
-        @fclose($tmp);
-        return $finish(false, 'flush_failed');
-    }
-    if ($failOperation === 'fsync' || (function_exists('fsync') && !@fsync($tmp))) {
-        @fclose($tmp);
-        return $finish(false, 'fsync_failed');
-    }
-    @fclose($tmp);
-    $verify = @file_get_contents($tmpPath);
-    if ($verify === false || !hash_equals(hash('sha256', $payload), hash('sha256', $verify))) {
-        return $finish(false, 'verify_failed');
-    }
-    if ($failOperation === 'rename' || !@rename($tmpPath, $v4Path)) {
-        return $finish(false, 'rename_failed');
-    }
-    $tmpPath = '';
-    @chmod($v4Path, e3dcJsonAtomicFileMode($v4Path, $json));
-    if ($cachePath !== '' && is_file($cachePath)) @unlink($cachePath);
-    return $finish(true, 'ok');
+    $mutation = e3dcMutateV4ConfigDetailed(
+        static function($data) use ($updates) {
+            foreach ($updates as $key => $value) $data[$key] = $value;
+            return ['success' => true, 'data' => $data];
+        },
+        'wallbox',
+        $v4Path,
+        $cachePath,
+        $mutationOptions
+    );
+    $success = !empty($mutation['success']);
+    $code = $success ? 'ok' : (string)($mutation['status'] ?? 'mutation_failed');
+    return $finish($success, $code, $mutation);
 }
 
 function upsertWallboxConfigValues($filePath, $updates) {
@@ -2286,13 +2452,6 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
             ];
             if ($quickAction === 'force_start') {
                 $nativeUpdates['wbvon'] = date('H:00');
-                @unlink('/var/www/html/ramdisk/wallbox_abort_state.json');
-                $forceReqFile = '/var/www/html/ramdisk/wallbox_user_mode_request.json';
-                $forceReqs = [
-                    '1' => ['mode' => 'force_start', 'ts' => time()],
-                    '2' => ['mode' => 'force_start', 'ts' => time()],
-                ];
-                @file_put_contents($forceReqFile, json_encode($forceReqs, JSON_UNESCAPED_UNICODE));
             } elseif ($quickAction === 'start_now') {
                 // Sofortladen: wbvon auf aktuelle Stunde setzen, damit sofort geplant wird.
                 // Netzbezug bleibt trotzdem an die Wallbox-Preisgrenze gekoppelt.
@@ -2321,7 +2480,16 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 // Abbruchflag löschen: Der Benutzer hat explizit eine Ladedauer gesetzt.
                 // Das Abbruchflag ist Bestandteil derselben Dateitransaktion.
                 if ($quickAction === 'force_start') {
-                    $message = successMessage('Ladung sofort gestartet (Freigabe erzwungen). Alle Blockaden wurden aufgehoben.');
+                    $requestResult = wallboxPublishForceStartRequest([1, 2]);
+                    if (!empty($requestResult['success'])) {
+                        $message = successMessage('Sofortladen ist gespeichert und die Wallbox-Anforderungen wurden bestätigt.');
+                    } else {
+                        $message = errorMessage(
+                            'Sofortladen nur teilweise gespeichert',
+                            'Die Konfiguration wurde gespeichert, aber die Startanforderung nicht bestätigt. Bitte erneut versuchen. '
+                                . (string)($requestResult['message'] ?? '')
+                        );
+                    }
                 } elseif ($quickAction === 'start_now') {
                     $message = successMessage('Sofortladen (Max) aktiviert. wallbox_manager startet die Ladung.');
                 } elseif ($quickAction === 'clear_times') {
@@ -3366,7 +3534,7 @@ if ($hasWb2) {
     $wb1TargetLabel = htmlspecialchars($wallboxConfig['wb1_target_soc'] ?? $wallboxConfig['car_target_soc'] ?? '80');
     $wb2TargetLabel = htmlspecialchars($wallboxConfig['wb2_target_soc'] ?? '80');
     $wbModeOptionsBase = [
-        '0'  => ['label' => 'Aus / autonom', 'help' => 'E3DC-Control sendet keine Start- oder Strombefehle. Der Ladepunkt bleibt frei für die Wallbox, den E3DC oder ein Fremdsystem. Geplante Ladefenster werden in Aus nicht gestartet.'],
+        '0'  => ['label' => 'Aus / autonom', 'help' => 'E3DC-Control sendet keine Start- oder Strombefehle. Der Ladepunkt bleibt frei für die Wallbox, den E3DC oder ein Fremdsystem. In diesem autonomen Betrieb muss die Hausanschlussgrenze zusätzlich in der Wallbox beziehungsweise im Ladeprofil abgesichert sein. Geplante Ladefenster werden in Aus nicht gestartet.'],
         '2'  => ['label' => 'PV-Kurve ruhig', 'help' => 'Lädt entlang der Speicher-Ladekurve mit Hysterese. Kurze Lastwechsel werden geglättet, damit das Schütz nicht flattert.'],
         '3'  => ['label' => 'Grundladung stabil', 'help' => 'Hält eine ruhige Mindestladung gegen Takten. Gestoppt wird erst, wenn wbminSoC bzw. das Speicherziel sonst nicht erreichbar bleibt.'],
         '4'  => ['label' => 'PV + Akku bis Untergrenze', 'help' => 'Das Auto darf PV und Hausakku bis zur Hausakku-Reserve nutzen. Bis zu dieser Untergrenze lädt das Auto normal. Netz bleibt aus; wenn die Wallbox mehr Leistung will, stützt der Akku nur Hausverbrauch und Wärmepumpe.'],
@@ -3376,11 +3544,11 @@ if ($hasWb2) {
     $wb1ModeOptions = $wbModeOptionsBase;
     $wb2ModeOptions = $wbModeOptionsBase;
     $wb1ModeOptions['0'] = isE3dcNativeWallboxType($wb1_type_raw)
-        ? ['label' => 'Nur beobachten, E3DC regelt', 'help' => 'E3DC-Control sendet keine Ladebefehle. Der E3DC regelt diese Wallbox selbst. Geplante Ladefenster werden in Beobachten nicht gestartet.']
-        : ['label' => 'Nur beobachten, Wallbox regelt', 'help' => 'E3DC-Control sendet keine Ladebefehle. Die Wallbox oder ein anderes System regelt selbst. Geplante Ladefenster werden in Beobachten nicht gestartet.'];
+        ? ['label' => 'Nur beobachten, E3DC regelt', 'help' => 'E3DC-Control sendet keine Ladebefehle. Der E3DC regelt diese Wallbox selbst; dessen Hardware-/Profilgrenze muss den Hausanschluss absichern. Geplante Ladefenster werden in Beobachten nicht gestartet.']
+        : ['label' => 'Nur beobachten, Wallbox regelt', 'help' => 'E3DC-Control sendet keine Ladebefehle. Die Wallbox oder ein anderes System regelt selbst; dort muss die Hausanschlussgrenze abgesichert sein. Geplante Ladefenster werden in Beobachten nicht gestartet.'];
     $wb2ModeOptions['0'] = isE3dcNativeWallboxType($wb2_type_raw)
-        ? ['label' => 'Nur beobachten, E3DC regelt', 'help' => 'E3DC-Control sendet keine Ladebefehle. Der E3DC regelt diese Wallbox selbst. Geplante Ladefenster werden in Beobachten nicht gestartet.']
-        : ['label' => 'Nur beobachten, Wallbox regelt', 'help' => 'E3DC-Control sendet keine Ladebefehle. Die Wallbox oder ein anderes System regelt selbst. Geplante Ladefenster werden in Beobachten nicht gestartet.'];
+        ? ['label' => 'Nur beobachten, E3DC regelt', 'help' => 'E3DC-Control sendet keine Ladebefehle. Der E3DC regelt diese Wallbox selbst; dessen Hardware-/Profilgrenze muss den Hausanschluss absichern. Geplante Ladefenster werden in Beobachten nicht gestartet.']
+        : ['label' => 'Nur beobachten, Wallbox regelt', 'help' => 'E3DC-Control sendet keine Ladebefehle. Die Wallbox oder ein anderes System regelt selbst; dort muss die Hausanschlussgrenze abgesichert sein. Geplante Ladefenster werden in Beobachten nicht gestartet.'];
     $wb1ModeHelp = array_map(fn($entry) => $entry['help'], $wb1ModeOptions);
     $wb2ModeHelp = array_map(fn($entry) => $entry['help'], $wb2ModeOptions);
     ?>
@@ -4084,17 +4252,19 @@ if ($hasWb2) {
     </div>
     <?php endif; // Ende des alten Wallbox-Blocks ?>
 
+    <!-- Fahrzeugzuordnung & Profile -->
     <div class="card shadow-sm mb-4" id="vehicle-assignment-card" style="border-radius: 16px;">
         <div class="card-body p-3">
-            <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
-                <h6 class="card-title text-info fw-bold m-0"><i class="fas fa-car-side me-2"></i>Fahrzeugzuordnung</h6>
-                <span class="badge bg-info-subtle text-info border border-info-subtle">WB1<?= $hasWb2 ? ' / WB2' : '' ?></span>
+            <div class="d-flex justify-content-between align-items-center mb-3">
+                <h6 class="card-title text-warning fw-bold m-0"><i class="fas fa-car me-2"></i>Fahrzeugzuordnung &amp; Profile</h6>
+                <span class="badge bg-warning-subtle text-warning border border-warning-subtle">Aktiv</span>
             </div>
 
-            <form action="<?= htmlspecialchars($formAction) ?>" method="post" id="vehicleAssignmentForm" onsubmit="return false;">
+            <form action="<?= htmlspecialchars($formAction) ?>" method="post" id="vehicleAssignmentForm">
                 <?= e3dcCsrfInput() ?>
+                <input type="hidden" name="action" value="save_vehicle_assignment">
                 <div class="row g-2 mb-3">
-                    <div class="col-12 col-md-4 col-xl-3">
+                    <div class="col-12 col-md-6 col-xl-4">
                         <label class="form-label text-muted small fw-bold mb-1" title="Reserve im Hausspeicher für die Wallbox-Regelung. Unterhalb dieses SoC wird die Wallbox je nach Modus gehalten oder gesperrt.">Reserve im Hausspeicher</label>
                         <div class="input-group input-group-sm">
                             <input type="number" min="0" max="100" name="wbminsoc" class="form-control rounded-start-pill fw-bold"
@@ -4106,46 +4276,10 @@ if ($hasWb2) {
                         <?php if ($houseReserveFloorNotice !== ''): ?>
                             <div class="form-text small text-warning">
                                 <i class="fas fa-shield-alt me-1"></i><?= htmlspecialchars($houseReserveFloorNotice) ?>
-                        <div class="row g-2 mb-3">
-                            <div class="col-6">
-                                <label class="form-label text-muted small fw-bold mb-1">Von (Uhr)</label>
-                                <input type="time" name="wbvon" class="form-control form-control-sm rounded-pill" value="<?= htmlspecialchars($wallboxConfig['wbvon'] ?? '00:00') ?>">
                             </div>
-                            <div class="col-6">
-                                <label class="form-label text-muted small fw-bold mb-1">Bis (Uhr)</label>
-                                <input type="time" name="wbbis" class="form-control form-control-sm rounded-pill" value="<?= htmlspecialchars($wallboxConfig['wbbis'] ?? '00:00') ?>">
-                            </div>
-                        </div>
-
-                        <div class="mb-3">
-                            <label class="form-label text-muted small fw-bold mb-1">Modus</label>
-                            <select name="wb_native_eco" class="form-select form-select-sm rounded-pill">
-                                <option value="0" <?= (($wallboxConfig['wb_native_eco'] ?? '0') === '0') ? 'selected' : '' ?>>Normal (PV-geführt)</option>
-                                <option value="1" <?= (($wallboxConfig['wb_native_eco'] ?? '0') === '1') ? 'selected' : '' ?>>Eco (Nur günstigste Stunden)</option>
-                            </select>
-                        </div>
-
-                        <button type="submit" class="btn btn-outline-info w-100 rounded-pill fw-bold border-2">
-                            ✓ Zeiten speichern
-                        </button>
-                    </form>
+                        <?php endif; ?>
+                    </div>
                 </div>
-            </div>
-        </div>
-    </div>
-    <?php endif; ?>
-
-    <!-- Fahrzeugzuordnung & Profile -->
-    <div class="card shadow-sm mb-4" style="border-radius: 16px;">
-        <div class="card-body p-3">
-            <div class="d-flex justify-content-between align-items-center mb-3">
-                <h6 class="card-title text-warning fw-bold m-0"><i class="fas fa-car me-2"></i>Fahrzeugzuordnung &amp; Profile</h6>
-                <span class="badge bg-warning-subtle text-warning border border-warning-subtle">Aktiv</span>
-            </div>
-
-            <form action="<?= htmlspecialchars($formAction) ?>" method="post" id="vehicleAssignmentForm">
-                <?= e3dcCsrfInput() ?>
-                <input type="hidden" name="action" value="save_vehicle_assignment">
                 <div class="row g-3">
                     <!-- Wallbox 1 -->
                     <div class="col-12 <?= $hasWb2 ? 'col-xl-6' : '' ?>">
@@ -4953,6 +5087,24 @@ function wallboxPost(formData) {
     });
 }
 
+async function wallboxRequireConfirmedText(response, allowedValues = ['OK']) {
+    const text = await response.text();
+    const normalized = text.trim();
+    if (!response.ok || !allowedValues.includes(normalized)) {
+        throw new Error(normalized || ('HTTP ' + response.status));
+    }
+    return normalized;
+}
+
+async function wallboxRequireConfirmedJson(response) {
+    let payload = null;
+    try { payload = await response.json(); } catch (_) { payload = null; }
+    if (!response.ok || !payload || payload.ok !== true) {
+        throw new Error(payload && payload.message ? String(payload.message) : ('HTTP ' + response.status));
+    }
+    return payload;
+}
+
 function wallboxFetchLiveJson() {
     const body = new URLSearchParams();
     body.set('csrf_token', WALLBOX_CSRF_TOKEN);
@@ -5393,11 +5545,10 @@ function initSimpleWallboxTargetControls() {
         formData.append('simple_house_reserve', globalReserveValue(true));
         formData.append('simple_price_limit', globalPriceValue());
         setModeState(form, 'Speichert...', 'warning');
-        wallboxPost(formData).then(res => {
-            if (!res.ok) throw new Error('Speichern fehlgeschlagen');
-            return res.text();
-        }).then(text => {
-            if (text.trim() === 'PLAN_REQUIRED') {
+        wallboxPost(formData)
+        .then(res => wallboxRequireConfirmedText(res, ['OK', 'PLAN_REQUIRED']))
+        .then(text => {
+            if (text === 'PLAN_REQUIRED') {
                 form.dataset.simplePlanActive = '0';
                 setModeState(form, 'Ladeplan speichern', 'warning');
                 return;
@@ -5421,8 +5572,7 @@ function initSimpleWallboxTargetControls() {
             formData.append('save_simple_wallbox_limits_ajax', '1');
             formData.append('simple_house_reserve', globalReserveValue(true));
             formData.append('simple_price_limit', globalPriceValue());
-            wallboxPost(formData).then(res => {
-            if (!res.ok) throw new Error('Speichern fehlgeschlagen');
+            wallboxPost(formData).then(res => wallboxRequireConfirmedText(res)).then(() => {
             setGlobalStatus('Gespeichert', 'success');
             if (window.e3dcSimpleWallboxSync) window.e3dcSimpleWallboxSync.globalsFromSimple();
         }).catch(() => {
@@ -5981,7 +6131,10 @@ function setManualSoC(wbIdx) {
     formData.append('manual_car_name', carName);
     formData.append('manual_car_capacity', capacity);
 
-    saveVehicleAssignment(wbIdx, {silent: true}).catch(() => {}).then(() => wallboxPost(formData)).then(res => res.text()).then(() => {
+    saveVehicleAssignment(wbIdx, {silent: true})
+    .then(() => wallboxPost(formData))
+    .then(res => wallboxRequireConfirmedText(res))
+    .then(() => {
         alert(`✓ Manueller SoC für Wallbox ${wbIdx} gesetzt.`);
         window.location.reload();
     }).catch(err => alert('Fehler beim Speichern: ' + err));
@@ -6025,10 +6178,7 @@ function saveWallboxManualPause(wbIdx, paused) {
     formData.append('wb_id', wbIdx);
     formData.append('manual_pause', paused ? '1' : '0');
     setWallboxPauseUi(wbIdx, paused, true);
-    return wallboxPost(formData).then(res => {
-        if (!res.ok) throw new Error('Network error');
-        return res.json();
-    }).then(data => {
+    return wallboxPost(formData).then(res => wallboxRequireConfirmedJson(res)).then(data => {
         setWallboxPauseUi(wbIdx, !!data.manual_pause, false);
     }).catch(() => {
         setWallboxPauseUi(wbIdx, !paused, false);
@@ -6078,10 +6228,7 @@ function toggleWbMode(wbIdx) {
         formData.append('wb_battery_departure_window_h', departureWindow.value || '3');
     }
 
-    wallboxPost(formData).then(res => {
-        if (!res.ok) throw new Error('Network error');
-        return res.text();
-    }).then(data => {
+    wallboxPost(formData).then(res => wallboxRequireConfirmedText(res)).then(() => {
         console.log(`WB${wbIdx} Mode/Lock saved.`);
         if (previousMode !== String(mode)) setWallboxPauseUi(wbIdx, false, false);
         modeSelect.dataset.savedMode = String(mode);
@@ -6105,10 +6252,7 @@ function saveWbBatteryDeparture(wbIdx) {
     formData.append('wb_battery_departure_time', departureInput ? (departureInput.value || '06:30') : '06:30');
     formData.append('wb_battery_departure_window_h', departureWindow ? (departureWindow.value || '3') : '3');
 
-    wallboxPost(formData).then(res => {
-        if (!res.ok) throw new Error('Network error');
-        return res.text();
-    }).then(() => {
+    wallboxPost(formData).then(res => wallboxRequireConfirmedText(res)).then(() => {
         if (window.e3dcSimpleWallboxSync) window.e3dcSimpleWallboxSync.departureFromAdvanced(wbIdx);
     }).catch(() => {
         alert('Fehler beim Speichern der Abfahrtszeit!');
@@ -6139,10 +6283,7 @@ function saveWbPriority(mode) {
     radios.forEach(radio => radio.disabled = true);
     setWbPriorityStatus('Speichert...', 'warning');
 
-    wallboxPost(formData).then(res => {
-        if (!res.ok) throw new Error('Network error');
-        return res.text();
-    }).then(() => {
+    wallboxPost(formData).then(res => wallboxRequireConfirmedText(res)).then(() => {
         if (status) status.dataset.savedMode = String(mode);
         radios.forEach(radio => { radio.defaultChecked = String(radio.value) === String(mode); });
         setWbPriorityStatus('Gespeichert', 'success');
@@ -6161,7 +6302,9 @@ function saveWbName(wbIdx, newName) {
     formData.append('wb_id', wbIdx);
     formData.append('wb_name', newName);
 
-    wallboxPost(formData).catch(err => alert('Fehler beim Speichern des Namens!'));
+    wallboxPost(formData)
+        .then(res => wallboxRequireConfirmedText(res))
+        .catch(() => alert('Fehler beim Speichern des Namens!'));
 }
 
 function syncPriceLimitGuard() {

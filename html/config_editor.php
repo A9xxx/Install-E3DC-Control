@@ -452,7 +452,7 @@ $defaults = [
 
     // Wallbox & Auto
     "wbminsoc" => "70", "wbcostpowers" => "7.2, 11.0, 22.0", "wbmaxladestrom" => "16", "wb1_max_amp" => "", "wb2_max_amp" => "", "wb1_current_step_amp" => "1.0", "wb2_current_step_amp" => "1.0",
-    "grid_max_amps" => "63", "grid_max_amps_l1" => "", "grid_max_amps_l2" => "", "grid_max_amps_l3" => "",
+    "grid_max_amps" => "35", "grid_max_amps_l1" => "", "grid_max_amps_l2" => "", "grid_max_amps_l3" => "",
     "grid_wallbox_reserve_amps" => "2", "grid_wallbox_reserve_amps_l1" => "", "grid_wallbox_reserve_amps_l2" => "", "grid_wallbox_reserve_amps_l3" => "",
     "wb1_grid_phase" => "", "wb2_grid_phase" => "", "wb1_openwb_pro_1p_max_amp" => "", "wb2_openwb_pro_1p_max_amp" => "",
     "wb_surplus_target_grid_w" => "-125", "wb_surplus_noise_w" => "100", "phase_transition_safety_margin_w" => "0", "heatpump_start_settle_s" => "30",
@@ -928,11 +928,11 @@ $tooltips = [
     "wb_surplus_noise_w"     => "Zusätzlicher Totbereich der schnellen Wallbox-PV-Regelung in Watt. Verhindert Nachregeln auf Messrauschen.",
     "phase_transition_safety_margin_w" => "Zusätzliche Leistungsreserve je aktivem Phasenwechsel in Watt. 0 verwendet die automatisch berechnete Reserve.",
     "heatpump_start_settle_s" => "Zeit in Sekunden, in der nach einem erkannten Wärmepumpenstart keine Wallbox-Aufregelung erfolgt.",
-    "grid_max_amps"          => "Hausabsicherung/SLS in Ampere je Phase. Netz-Modi wie Sofort MAX und Preis-Laden dürfen Netz nutzen, werden aber vor dem Wallbox-Ampere-Befehl auf diese Grenze begrenzt.",
+    "grid_max_amps"          => "Hausabsicherung/SLS in Ampere je Phase (z. B. 35, 40, 50 oder 63 A). Dieses harte Hardwarelimit gilt in allen von E3DC-Control aktiv geregelten Lademodi. Ohne bestätigte PCC-RMS-Phasenströme wird aus Wirkleistung kein zusätzlicher Spielraum berechnet; maßgeblich bleiben Hausabsicherung minus konfigurierte Reserve sowie die Wallbox-Grenzen.",
     "grid_max_amps_l1"       => "Optionales abweichendes Betriebslimit für Netzphase L1. Leer verwendet die globale Hausabsicherung. Nur einen tatsächlich bekannten Wert eintragen.",
     "grid_max_amps_l2"       => "Optionales abweichendes Betriebslimit für Netzphase L2. Leer verwendet die globale Hausabsicherung. Nur einen tatsächlich bekannten Wert eintragen.",
     "grid_max_amps_l3"       => "Optionales abweichendes Betriebslimit für Netzphase L3. Leer verwendet die globale Hausabsicherung. Nur einen tatsächlich bekannten Wert eintragen.",
-    "grid_wallbox_reserve_amps" => "Betriebsreserve unterhalb der Hausabsicherung je Phase. Der Wallbox-Regler begrenzt auf Hausabsicherung minus Reserve; bei 50 A und 10 A Reserve also auf höchstens 40 A je Phase.",
+    "grid_wallbox_reserve_amps" => "Betriebsreserve für übrige Hausverbraucher unterhalb der Hausabsicherung je Phase. Der Wallbox-Regler begrenzt das gemeinsame Wallbox-Budget auf Hausabsicherung minus Reserve (z. B. bei 50 A SLS und 10 A Reserve auf 40 A je Phase).",
     "grid_wallbox_reserve_amps_l1" => "Optionale zusätzliche Reserve für Netzphase L1. Leer verwendet die globale Wallbox-Reserve.",
     "grid_wallbox_reserve_amps_l2" => "Optionale zusätzliche Reserve für Netzphase L2. Leer verwendet die globale Wallbox-Reserve.",
     "grid_wallbox_reserve_amps_l3" => "Optionale zusätzliche Reserve für Netzphase L3. Leer verwendet die globale Wallbox-Reserve.",
@@ -1741,22 +1741,39 @@ function e3dc_prune_config_backups($limit = 20) {
     foreach (array_slice($baks, 0, count($baks) - $limit) as $f) @unlink($f);
 }
 
-function e3dc_backup_current_v4_json($file_path, $suffix = '') {
-    if (!file_exists($file_path)) return null;
-    $backup_dir = e3dc_config_backup_dir();
-    $current_data = e3dc_read_existing_v4_json($file_path);
-    if (!is_dir($backup_dir)) { @mkdir($backup_dir, e3dc_config_secret_dir_mode($current_data), true); }
-    e3dc_apply_config_backup_dir_permissions($backup_dir, $GLOBALS['install_user'] ?? '', $current_data);
-    $safeSuffix = preg_replace('/[^A-Za-z0-9_-]/', '', (string)$suffix);
-    $base = 'e3dc_v4_' . date('Ymd_His') . ($safeSuffix !== '' ? '_' . $safeSuffix : '');
-    $bak_path = $backup_dir . $base . '.json';
-    if (file_exists($bak_path)) {
-        $bak_path = $backup_dir . $base . '_' . substr(str_replace('.', '', (string)microtime(true)), -6) . '.json';
+function e3dc_backup_current_v4_json($file_path, $suffix = '', $options = []) {
+    $options = is_array($options) ? $options : [];
+    if (empty($options['test_mode'])) {
+        $options['backup_dir'] = rtrim(e3dc_config_backup_dir(), '/');
+    } elseif (empty($options['backup_dir'])) {
+        $options['backup_dir'] = dirname((string)$file_path) . '/config_backups';
     }
-    if (!@copy($file_path, $bak_path)) return false;
-    e3dc_apply_config_secret_permissions($bak_path, $GLOBALS['install_user'] ?? '', $current_data);
-    e3dc_prune_config_backups();
-    return $bak_path;
+    return e3dcCreateConfirmedV4Backup($file_path, $suffix, $options);
+}
+
+function e3dc_config_backup_succeeded($backup_result, $source_path = null) {
+    if (!is_array($backup_result)
+        || empty($backup_result['success'])
+        || !is_string($backup_result['path'] ?? null)
+        || !hash_equals(
+            (string)($backup_result['preimage_sha256'] ?? ''),
+            (string)($backup_result['backup_sha256'] ?? '')
+        )) {
+        return false;
+    }
+    $backupRaw = e3dcReadRegularFileBound((string)$backup_result['path'], 4 * 1024 * 1024);
+    if (!is_string($backupRaw)
+        || !hash_equals(hash('sha256', $backupRaw), (string)$backup_result['backup_sha256'])) {
+        return false;
+    }
+    if (is_string($source_path) && $source_path !== '') {
+        $sourceRaw = e3dcReadRegularFileBound($source_path, 4 * 1024 * 1024);
+        if (!is_string($sourceRaw)
+            || !hash_equals(hash('sha256', $sourceRaw), (string)$backup_result['preimage_sha256'])) {
+            return false;
+        }
+    }
+    return true;
 }
 
 function e3dc_config_import_local_keys() {
@@ -1772,6 +1789,549 @@ function e3dc_config_preserve_local_keys($current, $next) {
         }
     }
     return $next;
+}
+
+function e3dc_config_editor_protected_extra_key($key) {
+    $normalized = strtolower(trim((string)$key));
+    if ($normalized === '' || str_starts_with($normalized, '_')) return true;
+    return in_array($normalized, [
+        'stop', 'config', 'schema', 'schema_version', 'version', 'config_version',
+        'install_user', 'home_dir', 'install_path', 'venv_name', 'venv_path',
+        'instance_role', 'node_id', 'ha_role', 'e3dcwallboxtxt',
+        'installer_debug_console', 'logfile', 'ui_energy_flow', 'pvatmosphere',
+    ], true);
+}
+
+function e3dc_config_editor_stream_is_bound($handle, $filePath) {
+    if (!is_resource($handle) || is_link($filePath)) return false;
+    $opened = @fstat($handle);
+    $named = @lstat($filePath);
+    return is_array($opened)
+        && is_array($named)
+        && ((((int)$opened['mode']) & 0170000) === 0100000)
+        && ((((int)$named['mode']) & 0170000) === 0100000)
+        && (int)$opened['nlink'] === 1
+        && (int)$named['nlink'] === 1
+        && (int)$opened['dev'] === (int)$named['dev']
+        && (int)$opened['ino'] === (int)$named['ino'];
+}
+
+function e3dc_config_editor_write_new_stream($handle, $bytes) {
+    if (!is_resource($handle) || !is_string($bytes) || !@rewind($handle)) return false;
+    $length = strlen($bytes);
+    $written = 0;
+    while ($written < $length) {
+        $count = @fwrite($handle, substr($bytes, $written));
+        if ($count === false || $count <= 0) return false;
+        $written += $count;
+    }
+    if (!@ftruncate($handle, $length) || !@fflush($handle)) return false;
+    if (function_exists('fsync') && !@fsync($handle)) return false;
+    if (!@rewind($handle)) return false;
+    $confirmed = @stream_get_contents($handle);
+    return is_string($confirmed)
+        && strlen($confirmed) === $length
+        && hash_equals(hash('sha256', $bytes), hash('sha256', $confirmed));
+}
+
+function e3dc_config_editor_publish_authority($installUser, $groupName = 'www-data') {
+    if (!function_exists('posix_geteuid')
+        || !function_exists('posix_getpwuid')
+        || !function_exists('posix_getpwnam')
+        || !function_exists('posix_getgrnam')) {
+        return [
+            'success' => false,
+            'message' => 'Die lokale Benutzer- und Gruppenbindung ist nicht verfügbar.',
+        ];
+    }
+    $installUser = trim((string)$installUser);
+    $groupName = trim((string)$groupName);
+    $publisherUid = (int)posix_geteuid();
+    $publisher = @posix_getpwuid($publisherUid);
+    $install = $installUser !== '' ? @posix_getpwnam($installUser) : false;
+    $group = $groupName !== '' ? @posix_getgrnam($groupName) : false;
+    if (!is_array($publisher) || !is_array($install) || !is_array($group)) {
+        return [
+            'success' => false,
+            'message' => 'Installationsbenutzer, Web-Publisher oder gemeinsame Gruppe konnten nicht gebunden werden.',
+        ];
+    }
+    $publisherName = (string)($publisher['name'] ?? '');
+    $installUid = (int)($install['uid'] ?? -1);
+    $groupGid = (int)($group['gid'] ?? -1);
+    $installInGroup = (int)($install['gid'] ?? -2) === $groupGid
+        || in_array($installUser, (array)($group['members'] ?? []), true);
+    $publisherInGroup = (int)($publisher['gid'] ?? -2) === $groupGid
+        || in_array($publisherName, (array)($group['members'] ?? []), true);
+    if (!$installInGroup
+        || !$publisherInGroup
+        || !in_array($publisherName, [$installUser, 'www-data'], true)) {
+        return [
+            'success' => false,
+            'message' => 'Der Web-Publisher und der Installationsbenutzer sind nicht sicher über die gemeinsame www-data-Gruppe gebunden.',
+        ];
+    }
+    return [
+        'success' => true,
+        'publisher_uid' => $publisherUid,
+        'install_uid' => $installUid,
+        'group_gid' => $groupGid,
+        'publisher_name' => $publisherName,
+    ];
+}
+
+function e3dc_config_editor_open_transaction_lock($filePath, array $authority) {
+    $directory = dirname((string)$filePath);
+    $directoryBefore = @lstat($directory);
+    if (!is_array($directoryBefore)
+        || ((((int)($directoryBefore['mode'] ?? 0)) & 0170000) !== 0040000)
+        || is_link($directory)) {
+        return ['success' => false, 'message' => 'Das Konfigurationsverzeichnis ist nicht sicher gebunden.'];
+    }
+
+    $lockPath = $directory . '/.e3dc_v4.transaction.lock';
+    clearstatcache(true, $lockPath);
+    $lockBefore = @lstat($lockPath);
+    if (!is_array($lockBefore)) {
+        $oldUmask = @umask(0007);
+        $handle = @fopen($lockPath, 'x+b');
+        if (is_int($oldUmask)) @umask($oldUmask);
+        if (!is_resource($handle)) {
+            clearstatcache(true, $lockPath);
+            $lockBefore = @lstat($lockPath);
+            $handle = is_array($lockBefore) ? @fopen($lockPath, 'r+b') : false;
+        }
+    } else {
+        $handle = @fopen($lockPath, 'r+b');
+    }
+    if (!is_resource($handle)) {
+        return ['success' => false, 'message' => 'Der feste Konfigurations-Lock ist nicht verfügbar.'];
+    }
+
+    clearstatcache(true, $lockPath);
+    $opened = @fstat($handle);
+    $named = @lstat($lockPath);
+    $allowedOwners = [(int)$authority['install_uid'], (int)$authority['publisher_uid']];
+    $metadataOk = is_array($opened)
+        && is_array($named)
+        && ((((int)($opened['mode'] ?? 0)) & 0170000) === 0100000)
+        && ((((int)($named['mode'] ?? 0)) & 0170000) === 0100000)
+        && (int)($opened['nlink'] ?? 0) === 1
+        && (int)($named['nlink'] ?? 0) === 1
+        && (int)($opened['dev'] ?? -1) === (int)($named['dev'] ?? -2)
+        && (int)($opened['ino'] ?? -1) === (int)($named['ino'] ?? -2)
+        && in_array((int)($opened['uid'] ?? -1), $allowedOwners, true)
+        && (int)($opened['gid'] ?? -1) === (int)$authority['group_gid']
+        && ((((int)($opened['mode'] ?? 0)) & 0777) === 0660);
+    if (!$metadataOk || !@flock($handle, LOCK_EX)) {
+        @fclose($handle);
+        return [
+            'success' => false,
+            'message' => 'Der feste Konfigurations-Lock besitzt nicht die erwarteten Rechte oder konnte nicht exklusiv belegt werden.',
+        ];
+    }
+    if (!e3dc_config_editor_stream_is_bound($handle, $lockPath)) {
+        @flock($handle, LOCK_UN);
+        @fclose($handle);
+        return ['success' => false, 'message' => 'Der feste Konfigurations-Lock wurde während der Bindung ausgetauscht.'];
+    }
+    return [
+        'success' => true,
+        'handle' => $handle,
+        'path' => $lockPath,
+        'directory_stat' => $directoryBefore,
+    ];
+}
+
+function e3dc_config_editor_directory_is_bound($directory, array $expected) {
+    if (is_link($directory)) return false;
+    $current = @lstat($directory);
+    return is_array($current)
+        && ((((int)($current['mode'] ?? 0)) & 0170000) === 0040000)
+        && (int)($current['dev'] ?? -1) === (int)($expected['dev'] ?? -2)
+        && (int)($current['ino'] ?? -1) === (int)($expected['ino'] ?? -2);
+}
+
+function e3dc_config_editor_sync_directory($directory, array $expected) {
+    if (!function_exists('fsync') || !e3dc_config_editor_directory_is_bound($directory, $expected)) return true;
+    $handle = @fopen($directory, 'rb');
+    if (!is_resource($handle)) return false;
+    $opened = @fstat($handle);
+    $bound = is_array($opened)
+        && ((((int)($opened['mode'] ?? 0)) & 0170000) === 0040000)
+        && (int)($opened['dev'] ?? -1) === (int)($expected['dev'] ?? -2)
+        && (int)($opened['ino'] ?? -1) === (int)($expected['ino'] ?? -2);
+    $synced = $bound && @fsync($handle);
+    @fclose($handle);
+    return $synced;
+}
+
+function e3dc_config_editor_publish_atomic(
+    $filePath,
+    $candidateBytes,
+    $preimageBytes,
+    $targetHandle,
+    array $targetStat,
+    array $lock,
+    array $authority,
+    $expectedMode
+) {
+    $directory = dirname((string)$filePath);
+    try {
+        $suffix = bin2hex(random_bytes(16));
+    } catch (Throwable $error) {
+        return ['success' => false, 'message' => 'Die atomare Zieldatei konnte nicht eindeutig benannt werden.'];
+    }
+    $temporary = $directory . '/.e3dc_v4.extra.' . $suffix . '.tmp';
+    $expectedMode = (int)$expectedMode & 0777;
+    $oldUmask = @umask((~$expectedMode) & 0777);
+    $temporaryHandle = @fopen($temporary, 'x+b');
+    if (is_int($oldUmask)) @umask($oldUmask);
+    if (!is_resource($temporaryHandle)) {
+        return ['success' => false, 'message' => 'Die atomare Zieldatei konnte nicht exklusiv angelegt werden.'];
+    }
+
+    $published = false;
+    try {
+        if (!e3dc_config_editor_write_new_stream($temporaryHandle, $candidateBytes)) {
+            return ['success' => false, 'message' => 'Die neue Konfiguration konnte nicht vollständig geschrieben und synchronisiert werden.'];
+        }
+        clearstatcache(true, $temporary);
+        $temporaryStat = @fstat($temporaryHandle);
+        $temporaryNamed = @lstat($temporary);
+        $temporaryOk = is_array($temporaryStat)
+            && is_array($temporaryNamed)
+            && ((((int)($temporaryStat['mode'] ?? 0)) & 0170000) === 0100000)
+            && (int)($temporaryStat['nlink'] ?? 0) === 1
+            && (int)($temporaryStat['dev'] ?? -1) === (int)($temporaryNamed['dev'] ?? -2)
+            && (int)($temporaryStat['ino'] ?? -1) === (int)($temporaryNamed['ino'] ?? -2)
+            && (int)($temporaryStat['uid'] ?? -1) === (int)$authority['publisher_uid']
+            && (int)($temporaryStat['gid'] ?? -1) === (int)$authority['group_gid']
+            && ((((int)($temporaryStat['mode'] ?? 0)) & 0777) === ((int)$expectedMode & 0777))
+            && (int)($temporaryStat['size'] ?? -1) === strlen($candidateBytes);
+        if (!$temporaryOk) {
+            return [
+                'success' => false,
+                'message' => 'Die neue Konfiguration besitzt vor der Veröffentlichung nicht die erwarteten Owner-/Gruppen-/Dateirechte.',
+            ];
+        }
+
+        if (!e3dc_config_editor_stream_is_bound($lock['handle'], $lock['path'])
+            || !e3dc_config_editor_stream_is_bound($targetHandle, $filePath)
+            || !e3dc_config_editor_directory_is_bound($directory, $lock['directory_stat'])
+            || !@rewind($targetHandle)) {
+            return ['success' => false, 'message' => 'Lock, Verzeichnis oder Konfigurations-Preimage sind vor dem Commit gedriftet.'];
+        }
+        $currentBytes = @stream_get_contents($targetHandle);
+        $currentStat = @fstat($targetHandle);
+        $preimageStillBound = is_string($currentBytes)
+            && hash_equals(hash('sha256', $preimageBytes), hash('sha256', $currentBytes))
+            && is_array($currentStat)
+            && (int)($currentStat['dev'] ?? -1) === (int)($targetStat['dev'] ?? -2)
+            && (int)($currentStat['ino'] ?? -1) === (int)($targetStat['ino'] ?? -2);
+        if (!$preimageStillBound) {
+            return [
+                'success' => false,
+                'message' => 'Die Konfiguration wurde parallel geändert. Bitte die Seite neu laden; es wurde nichts überschrieben.',
+            ];
+        }
+
+        if (!@rename($temporary, $filePath)) {
+            return ['success' => false, 'message' => 'Die neue Konfiguration konnte nicht atomar veröffentlicht werden.'];
+        }
+        $published = true;
+        clearstatcache(true, $filePath);
+        $publishedStat = @lstat($filePath);
+        if (!e3dc_config_editor_stream_is_bound($temporaryHandle, $filePath)
+            || !is_array($publishedStat)
+            || (int)($publishedStat['uid'] ?? -1) !== (int)$authority['publisher_uid']
+            || (int)($publishedStat['gid'] ?? -1) !== (int)$authority['group_gid']
+            || ((((int)($publishedStat['mode'] ?? 0)) & 0777) !== ((int)$expectedMode & 0777))
+            || !@rewind($temporaryHandle)) {
+            return [
+                'success' => false,
+                'published' => true,
+                'message' => 'Die Konfiguration wurde veröffentlicht, der gebundene Readback blieb jedoch unvollständig. Bitte die Seite neu laden und die Rechteprüfung starten.',
+            ];
+        }
+        $confirmedBytes = @stream_get_contents($temporaryHandle);
+        if (!is_string($confirmedBytes)
+            || !hash_equals(hash('sha256', $candidateBytes), hash('sha256', $confirmedBytes))) {
+            return [
+                'success' => false,
+                'published' => true,
+                'message' => 'Die Konfiguration wurde veröffentlicht, ihr Inhalt konnte aber nicht bestätigt werden. Bitte die Seite neu laden und die Konfiguration prüfen.',
+            ];
+        }
+        if (!e3dc_config_editor_sync_directory($directory, $lock['directory_stat'])) {
+            return [
+                'success' => false,
+                'published' => true,
+                'message' => 'Die Konfiguration ist vollständig veröffentlicht, die dauerhafte Verzeichnissynchronisation konnte aber nicht bestätigt werden.',
+            ];
+        }
+        return ['success' => true];
+    } finally {
+        @fclose($temporaryHandle);
+        if (!$published && (file_exists($temporary) || is_link($temporary))) {
+            @unlink($temporary);
+        }
+    }
+}
+
+function e3dc_config_editor_extra_key_transaction(
+    $operation,
+    $requestedKey,
+    $requestedValue,
+    $filePath,
+    $installUser,
+    array $knownKeys,
+    $groupName = 'www-data'
+) {
+    $operation = (string)$operation;
+    $rawKey = trim((string)$requestedKey);
+    $key = $operation === 'add' ? strtolower($rawKey) : $rawKey;
+    $keyPattern = '/\A[a-z][a-z0-9_.-]{0,127}\z/D';
+    if (!in_array($operation, ['add', 'delete'], true) || preg_match($keyPattern, $key) !== 1) {
+        return [
+            'success' => false,
+            'code' => 'invalid_key',
+            'message' => 'Der Schlüssel muss mit einem Buchstaben beginnen und darf nur Kleinbuchstaben, Zahlen, Punkt, Bindestrich oder Unterstrich enthalten.',
+        ];
+    }
+    $normalizedKey = strtolower($key);
+    $knownSet = [];
+    foreach ($knownKeys as $knownKey) {
+        $knownSet[strtolower((string)$knownKey)] = true;
+    }
+    if (isset($knownSet[$normalizedKey]) || e3dc_config_editor_protected_extra_key($normalizedKey)) {
+        return [
+            'success' => false,
+            'code' => 'protected_key',
+            'message' => 'Dieser bekannte Pflicht- oder Schutzparameter darf hier weder angelegt noch gelöscht werden.',
+        ];
+    }
+    if ($operation === 'add') {
+        if (is_array($requestedValue) || is_object($requestedValue)) {
+            return [
+                'success' => false,
+                'code' => 'invalid_value',
+                'message' => 'Der neue Wert muss ein einzelner Text- oder Zahlenwert sein.',
+            ];
+        }
+        $requestedValue = trim((string)$requestedValue);
+        if ($requestedValue === '' || strlen($requestedValue) > 65535 || strpos($requestedValue, "\0") !== false) {
+            return [
+                'success' => false,
+                'code' => 'invalid_value',
+                'message' => 'Für die neue Variable ist ein nicht leerer Wert mit höchstens 65.535 Zeichen erforderlich.',
+            ];
+        }
+    }
+
+    $authority = e3dc_config_editor_publish_authority($installUser, $groupName);
+    if (empty($authority['success'])) {
+        return [
+            'success' => false,
+            'code' => 'publisher_authority_failed',
+            'message' => (string)($authority['message'] ?? 'Der Web-Publisher konnte nicht sicher gebunden werden.')
+                . ' Bitte im Installationscenter „Rechte prüfen und reparieren“ ausführen.',
+        ];
+    }
+    $directory = dirname((string)$filePath);
+    if (basename((string)$filePath) !== 'e3dc_v4.json'
+        || !is_dir($directory)
+        || is_link($directory)
+        || !is_file($filePath)
+        || is_link($filePath)) {
+        return [
+            'success' => false,
+            'code' => 'unsafe_context',
+            'message' => 'Der Konfigurationspfad ist nicht eindeutig oder nicht sicher.',
+        ];
+    }
+    $lock = e3dc_config_editor_open_transaction_lock($filePath, $authority);
+    if (empty($lock['success'])) {
+        return [
+            'success' => false,
+            'code' => 'lock_failed',
+            'message' => (string)($lock['message'] ?? 'Die Konfiguration konnte nicht exklusiv gesperrt werden.')
+                . ' Bitte die Seite neu laden oder im Installationscenter die Rechte reparieren.',
+        ];
+    }
+
+    $handle = @fopen($filePath, 'rb');
+    if ($handle === false || !e3dc_config_editor_stream_is_bound($handle, $filePath)) {
+        if (is_resource($handle)) @fclose($handle);
+        @flock($lock['handle'], LOCK_UN);
+        @fclose($lock['handle']);
+        return [
+            'success' => false,
+            'code' => 'config_open_failed',
+            'message' => 'Die Konfiguration ist nicht eindeutig oder nicht beschreibbar.',
+        ];
+    }
+    if (!@flock($handle, LOCK_EX)) {
+        @fclose($handle);
+        @flock($lock['handle'], LOCK_UN);
+        @fclose($lock['handle']);
+        return [
+            'success' => false,
+            'code' => 'lock_failed',
+            'message' => 'Die Konfiguration wird gerade bearbeitet oder konnte nicht exklusiv gesperrt werden.',
+        ];
+    }
+
+    try {
+        if (!e3dc_config_editor_stream_is_bound($handle, $filePath)) {
+            return [
+                'success' => false,
+                'code' => 'concurrent_change',
+                'message' => 'Die Konfigurationsdatei wurde während des Sperrens ausgetauscht. Bitte die Seite neu laden.',
+            ];
+        }
+        @rewind($handle);
+        $preimageBytes = @stream_get_contents($handle);
+        $preimage = is_string($preimageBytes) ? json_decode($preimageBytes, true) : null;
+        if (!is_array($preimage)) {
+            return [
+                'success' => false,
+                'code' => 'config_invalid',
+                'message' => 'Die aktuelle e3dc_v4.json ist nicht lesbar oder ungültig.',
+            ];
+        }
+        $targetStat = @fstat($handle);
+        if (!is_array($targetStat)
+            || (int)($targetStat['size'] ?? -1) < 2
+            || (int)($targetStat['size'] ?? -1) > 4 * 1024 * 1024
+            || strlen($preimageBytes) !== (int)($targetStat['size'] ?? -1)) {
+            return [
+                'success' => false,
+                'code' => 'config_size_invalid',
+                'message' => 'Die e3dc_v4.json besitzt keine zulässige und vollständig gebundene Größe.',
+            ];
+        }
+        $expectedMode = e3dc_config_secret_file_mode($preimage);
+        $allowedTargetOwners = [(int)$authority['install_uid'], (int)$authority['publisher_uid']];
+        $targetMetadataOk = is_array($targetStat)
+            && in_array((int)($targetStat['uid'] ?? -1), $allowedTargetOwners, true)
+            && (int)($targetStat['gid'] ?? -1) === (int)$authority['group_gid']
+            && ((((int)($targetStat['mode'] ?? 0)) & 0777) === ($expectedMode & 0777));
+        if (!$targetMetadataOk) {
+            return [
+                'success' => false,
+                'code' => 'config_metadata_invalid',
+                'message' => 'Die e3dc_v4.json besitzt nicht den sicheren Install-User-/Web-Publisher-, www-data- und Schutzmodus-Vertrag. Bitte im Installationscenter „Rechte prüfen und reparieren“ ausführen.',
+            ];
+        }
+        $matchingKeys = array_values(array_filter(array_keys($preimage), static function($existingKey) use ($normalizedKey) {
+            return strtolower((string)$existingKey) === $normalizedKey;
+        }));
+        $boundDeleteKey = null;
+        if ($operation === 'delete') {
+            if (count($matchingKeys) !== 1) {
+                return [
+                    'success' => false,
+                    'code' => 'key_not_bound',
+                    'message' => 'Der zusätzliche Parameter ist im frisch gelesenen Konfigurationsstand nicht eindeutig vorhanden.',
+                ];
+            }
+            $boundDeleteKey = (string)$matchingKeys[0];
+            if (is_array($preimage[$boundDeleteKey]) || is_object($preimage[$boundDeleteKey])) {
+                return [
+                    'success' => false,
+                    'code' => 'key_not_deletable',
+                    'message' => 'Dieser Parameter gehört nicht zur frisch bestätigten Liste „Weitere Parameter“ und wurde nicht gelöscht.',
+                ];
+            }
+        } elseif ($matchingKeys !== []) {
+            return [
+                'success' => false,
+                'code' => 'key_exists',
+                'message' => 'Dieser Schlüssel ist bereits vorhanden und wurde nicht überschrieben.',
+            ];
+        }
+
+        $backupResult = e3dc_backup_current_v4_json(
+            $filePath,
+            'extra_key',
+            ['expected_preimage' => $preimageBytes]
+        );
+        $backupPath = is_array($backupResult) ? (string)($backupResult['path'] ?? '') : '';
+        $backupBytes = $backupPath !== '' ? e3dcReadRegularFileBound($backupPath, 4 * 1024 * 1024) : false;
+        if (!e3dc_config_backup_succeeded($backupResult, $filePath)
+            || !is_string($backupBytes)
+            || !hash_equals(hash('sha256', $preimageBytes), hash('sha256', $backupBytes))) {
+            return [
+                'success' => false,
+                'code' => 'backup_failed',
+                'message' => 'Vor der Änderung konnte keine bestätigte Konfigurationssicherung angelegt werden.',
+            ];
+        }
+        if (!e3dcRemoveConfigCacheFailClosed('/var/www/html/ramdisk/e3dc_config_cache.json')) {
+            return [
+                'success' => false,
+                'code' => 'cache_invalidation_failed',
+                'message' => 'Der Laufzeitcache konnte vor der Änderung nicht sicher entfernt werden. Bitte im Installationscenter „Rechte prüfen und reparieren“ ausführen.',
+            ];
+        }
+
+        $candidate = $preimage;
+        if ($operation === 'delete') {
+            unset($candidate[$boundDeleteKey]);
+        } else {
+            $candidate[$key] = $requestedValue;
+        }
+        $candidateBytes = json_encode(
+            $candidate,
+            JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES
+        );
+        if (!is_string($candidateBytes)) {
+            return [
+                'success' => false,
+                'code' => 'encode_failed',
+                'message' => 'Die Konfigurationsänderung konnte nicht sicher kodiert werden.',
+            ];
+        }
+        $candidateBytes .= "\n";
+        if (strlen($candidateBytes) > 4 * 1024 * 1024) {
+            return [
+                'success' => false,
+                'code' => 'config_size_invalid',
+                'message' => 'Die geänderte e3dc_v4.json überschreitet die zulässige Größe.',
+            ];
+        }
+        $publish = e3dc_config_editor_publish_atomic(
+            $filePath,
+            $candidateBytes,
+            $preimageBytes,
+            $handle,
+            $targetStat,
+            $lock,
+            $authority,
+            $expectedMode
+        );
+        if (empty($publish['success'])) {
+            return [
+                'success' => false,
+                'code' => !empty($publish['published']) ? 'published_unconfirmed' : 'publish_failed',
+                'message' => (string)($publish['message'] ?? 'Die Konfigurationsänderung konnte nicht atomar bestätigt werden.'),
+            ];
+        }
+        return [
+            'success' => true,
+            'code' => $operation === 'delete' ? 'key_deleted' : 'key_added',
+            'key' => $key,
+            'message' => $operation === 'delete'
+                ? 'Zusätzlicher Parameter „' . $key . '“ wurde gelöscht.'
+                : 'Neue Variable „' . $key . '“ wurde hinzugefügt.',
+        ];
+    } finally {
+        @flock($handle, LOCK_UN);
+        @fclose($handle);
+        @flock($lock['handle'], LOCK_UN);
+        @fclose($lock['handle']);
+    }
 }
 
 function e3dc_config_extract_import_payload($decoded) {
@@ -2161,6 +2721,33 @@ if ($configEditorRequestMethod === 'POST') {
         $token = $postedValues['entsoe_api_token'] ?? ($_POST['entsoe_api_token'] ?? '');
         echo json_encode(e3dc_entsoe_api_test($token), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
         exit;
+    } elseif (isset($_POST['test_telegram'])) {
+        $postedValues = (isset($_POST['values']) && is_array($_POST['values'])) ? $_POST['values'] : [];
+        $currentData = e3dc_read_existing_v4_json($v4_config_file_path);
+        if ($currentData === null) {
+            $telegramResult = [
+                'success' => false,
+                'message' => 'Die bestehende Konfiguration ist nicht lesbar.',
+            ];
+        } else {
+            $telegramConfig = $currentData;
+            foreach (['telegram_token', 'telegram_chat_id', 'telegram_device_name'] as $telegramKey) {
+                if (array_key_exists($telegramKey, $postedValues) && !is_array($postedValues[$telegramKey])) {
+                    $telegramConfig[$telegramKey] = trim((string)$postedValues[$telegramKey]);
+                }
+            }
+            require_once __DIR__ . '/send_status_telegram.php';
+            $telegramResult = e3dcSendTelegramTestMessage($telegramConfig);
+        }
+        if (!empty($telegramResult['success'])) {
+            $message = "<div class='alert alert-success py-2 border-0 mb-3 mx-2 animate__animated animate__fadeIn'>✓ "
+                . htmlspecialchars((string)$telegramResult['message'])
+                . " Die übrigen Formularwerte wurden nicht gespeichert.</div>";
+        } else {
+            $message = "<div class='alert alert-danger py-2 border-0 mb-3 mx-2 animate__animated animate__shakeX'>⚠ Telegram-Test fehlgeschlagen: "
+                . htmlspecialchars((string)($telegramResult['message'] ?? 'unbekannter Fehler'))
+                . " Die Konfiguration wurde nicht verändert.</div>";
+        }
     } elseif (($_POST['config_action'] ?? '') === 'upload_config') {
         requireWebAuth(false);
         $upload = $_FILES['config_upload_file'] ?? null;
@@ -2181,19 +2768,29 @@ if ($configEditorRequestMethod === 'POST') {
                 $message = "<div class='alert alert-danger py-2 border-0 mb-3 mx-2'>Fehler: Bestehende Konfiguration ist nicht lesbar. Import abgebrochen.</div>";
             } else {
                 unset($import_data['stop']);
-                $backupResult = e3dc_backup_current_v4_json($v4_config_file_path, 'preimport');
-                $next_data = array_replace(is_array($current_data) ? $current_data : [], $import_data);
-                $next_data = e3dc_config_preserve_local_keys($current_data, $next_data);
-                $success = e3dc_write_v4_json($v4_config_file_path, $next_data, $install_user);
-                if ($success) {
-                    @unlink('/var/www/html/ramdisk/e3dc_config_cache.json');
+                $mutation = e3dcMutateV4ConfigDetailed(
+                    static function($boundCurrent) use ($import_data) {
+                        $next = array_replace($boundCurrent, $import_data);
+                        $next = e3dc_config_preserve_local_keys($boundCurrent, $next);
+                        return ['success' => true, 'data' => $next];
+                    },
+                    'preimport',
+                    $v4_config_file_path,
+                    '/var/www/html/ramdisk/e3dc_config_cache.json'
+                );
+                if (!empty($mutation['success'])) {
                     $count = count($import_data);
-                    $backupText = $backupResult ? ' Backup wurde angelegt.' : '';
-                    $message = "<div class='alert alert-success py-2 border-0 mb-3 mx-2 animate__animated animate__fadeIn'>Konfiguration importiert ($count Werte). Lokale Installationspfade wurden beibehalten.$backupText Bitte IP-Adressen, HA-Rolle und aktive Dienste prüfen.</div>";
+                    $message = "<div class='alert alert-success py-2 border-0 mb-3 mx-2 animate__animated animate__fadeIn'>Konfiguration importiert ($count Werte). Lokale Installationspfade wurden beibehalten. Backup wurde bestätigt. Bitte IP-Adressen, HA-Rolle und aktive Dienste prüfen.</div>";
                     $config = readConfig($v4_config_file_path);
                     unset($config['stop']);
                 } else {
-                    $message = "<div class='alert alert-danger py-2 border-0 mb-3 mx-2 animate__animated animate__shakeX'>Fehler beim Import der Konfiguration! Rechte prüfen.</div>";
+                    $status = (string)($mutation['status'] ?? 'unknown');
+                    $detail = !empty($mutation['state_unknown'])
+                        ? 'Die neue Konfiguration wurde veröffentlicht, ihr Cache-/Rückfallzustand konnte aber nicht sicher bestätigt werden.'
+                        : (!empty($mutation['rolled_back'])
+                            ? 'Der Import wurde nach einem Cachefehler vollständig zurückgesetzt.'
+                            : 'Import vor dem Commit abgebrochen; die bestehende Konfiguration blieb erhalten.');
+                    $message = "<div class='alert alert-danger py-2 border-0 mb-3 mx-2 animate__animated animate__shakeX'>$detail Fehlercode: " . htmlspecialchars($status) . ". Bitte im Installationscenter „Rechte prüfen und reparieren“ ausführen.</div>";
                 }
             }
         }
@@ -2213,16 +2810,27 @@ if ($configEditorRequestMethod === 'POST') {
             } else {
                 $current_data = e3dc_read_existing_v4_json($v4_config_file_path);
                 if ($current_data === null) $current_data = [];
-                e3dc_backup_current_v4_json($v4_config_file_path, 'prerestore');
-                $backup_data = e3dc_config_preserve_local_keys($current_data, $backup_data);
-                $success = e3dc_write_v4_json($v4_config_file_path, $backup_data, $install_user);
-                if ($success) {
-                    @unlink('/var/www/html/ramdisk/e3dc_config_cache.json');
-                    $message = "<div class='alert alert-success py-2 border-0 mb-3 mx-2 animate__animated animate__fadeIn'>Konfiguration aus Backup wiederhergestellt. Lokale Installationspfade wurden beibehalten.</div>";
+                $mutation = e3dcMutateV4ConfigDetailed(
+                    static function($boundCurrent) use ($backup_data) {
+                        $next = e3dc_config_preserve_local_keys($boundCurrent, $backup_data);
+                        return ['success' => true, 'data' => $next];
+                    },
+                    'prerestore',
+                    $v4_config_file_path,
+                    '/var/www/html/ramdisk/e3dc_config_cache.json'
+                );
+                if (!empty($mutation['success'])) {
+                    $message = "<div class='alert alert-success py-2 border-0 mb-3 mx-2 animate__animated animate__fadeIn'>Konfiguration aus Backup wiederhergestellt. Der vorherige Stand wurde bestätigt gesichert; lokale Installationspfade wurden beibehalten.</div>";
                     $config = readConfig($v4_config_file_path);
                     unset($config['stop']);
                 } else {
-                    $message = "<div class='alert alert-danger py-2 border-0 mb-3 mx-2 animate__animated animate__shakeX'>Fehler beim Wiederherstellen der Konfiguration! Rechte prüfen.</div>";
+                    $status = (string)($mutation['status'] ?? 'unknown');
+                    $detail = !empty($mutation['state_unknown'])
+                        ? 'Die Wiederherstellung wurde veröffentlicht, ihr Cache-/Rückfallzustand konnte aber nicht sicher bestätigt werden.'
+                        : (!empty($mutation['rolled_back'])
+                            ? 'Die Wiederherstellung wurde nach einem Cachefehler vollständig auf den vorherigen Stand zurückgesetzt.'
+                            : 'Wiederherstellung vor dem Commit abgebrochen; der aktuelle Stand blieb erhalten.');
+                    $message = "<div class='alert alert-danger py-2 border-0 mb-3 mx-2 animate__animated animate__shakeX'>$detail Fehlercode: " . htmlspecialchars($status) . ". Bitte im Installationscenter „Rechte prüfen und reparieren“ ausführen.</div>";
                 }
             }
         }
@@ -2244,17 +2852,29 @@ if ($configEditorRequestMethod === 'POST') {
         $old_v4_data = $v4_data;
         $v4_data[$quickKey] = in_array(strtolower(trim((string)($_POST['quick_toggle_value'] ?? '0'))), ['1', 'true', 'yes', 'on'], true) ? 1 : 0;
 
-        $success = e3dc_write_v4_json($v4_config_file_path, $v4_data, $install_user);
+        $mutation = saveE3dcConfigValuesDetailed(
+            [$quickKey => $v4_data[$quickKey]],
+            $v4_config_file_path,
+            '/var/www/html/ramdisk/e3dc_config_cache.json'
+        );
+        $success = !empty($mutation['success']);
+        $status = (string)($mutation['status'] ?? 'unknown');
         echo json_encode([
             'success' => $success,
             'key' => $quickKey,
             'value' => $v4_data[$quickKey],
-            'message' => $success ? 'Gespeichert' : 'Fehler beim Speichern'
+            'message' => $success
+                ? 'Gespeichert'
+                : (!empty($mutation['state_unknown'])
+                    ? 'Konfiguration wurde veröffentlicht, der Cache-/Rückfallzustand ist unklar. Bitte Rechte prüfen und reparieren.'
+                    : (!empty($mutation['rolled_back'])
+                        ? 'Änderung wurde nach einem Cachefehler vollständig zurückgesetzt.'
+                        : 'Fehler vor dem Speichern (' . $status . '). Bitte Rechte prüfen und reparieren.'))
         ]);
         exit;
     }
     // Logik für "save_all" (Hauptspeicher-Button)
-    elseif (isset($_POST['save_all'])) {
+    elseif (isset($_POST['save_all']) && !isset($_POST['delete_key']) && !isset($_POST['add_key'])) {
         $posted_values = $_POST['values'] ?? [];
         $config_load_failed = false;
         $config_validation_failed = false;
@@ -2564,24 +3184,41 @@ if ($configEditorRequestMethod === 'POST') {
         }
 
         $success = false;
+        $config_backup_failed = false;
+        $config_cache_invalidation_failed = false;
+        $config_state_unknown = false;
+        $config_mutation_status = 'not_started';
         if (!$config_load_failed && !$config_validation_failed) {
-            // --- SICHERUNG VOR DEM SPEICHERN ---
-            e3dc_backup_current_v4_json($v4_config_file_path);
-
-            // Speichern
-            $success = e3dc_write_v4_json($v4_config_file_path, $v4_data, $install_user);
+            $mutation = e3dcMutateV4ConfigDetailed(
+                static function($boundCurrent) use ($v4_data) {
+                    return [
+                        'success' => true,
+                        'data' => e3dc_aux_inverter_prepare_config($v4_data),
+                    ];
+                },
+                'save',
+                $v4_config_file_path,
+                '/var/www/html/ramdisk/e3dc_config_cache.json'
+            );
+            $success = !empty($mutation['success']);
+            $config_mutation_status = (string)($mutation['status'] ?? 'unknown');
+            $config_backup_failed = !empty($mutation['backup_failed'])
+                || str_contains($config_mutation_status, 'backup_');
+            $config_cache_invalidation_failed = str_contains($config_mutation_status, 'cache_');
+            $config_state_unknown = !empty($mutation['state_unknown']);
         }
 
         if ($success) {
-            @unlink('/var/www/html/ramdisk/e3dc_config_cache.json');
             $autoInstallConfirmed = in_array(strtolower(trim((string)($_POST['config_auto_install_confirmed'] ?? '0'))), ['1', 'true', 'yes', 'on'], true);
             $autoInstallCandidates = e3dc_config_auto_install_missing_candidates($v4_data, $old_v4_data);
+            $auto_install_failed = false;
             if (!empty($autoInstallCandidates) && $autoInstallConfirmed) {
                 foreach (e3dc_config_auto_install_missing_services($v4_data, $old_v4_data) as $autoInstall) {
                     $label = $autoInstall['label'] ?? ($autoInstall['module'] ?? 'Modul');
                     if (!empty($autoInstall['ok'])) {
                         $guard_warnings[] = $label . ' wurde nach deiner Bestätigung automatisch installiert, aktiviert oder neu gestartet, weil die zugehörige Konfiguration aktiv ist.';
                     } else {
+                        $auto_install_failed = true;
                         $guard_warnings[] = $label . ' ist konfiguriert, konnte aber nicht automatisch installiert, aktiviert oder neu gestartet werden: ' . ($autoInstall['message'] ?? 'unbekannter Fehler') . '. Bitte Installationszentrale prüfen.';
                     }
                 }
@@ -2593,7 +3230,11 @@ if ($configEditorRequestMethod === 'POST') {
             if (!empty($guard_warnings)) {
                 $extra = '<div class="small mt-1">' . implode('<br>', array_map('htmlspecialchars', $guard_warnings)) . '</div>';
             }
-            $message = "<div class='alert alert-success py-2 border-0 mb-3 mx-2 animate__animated animate__fadeIn'>✓ Konfiguration erfolgreich gespeichert.$extra</div>";
+            $message_class = $auto_install_failed ? 'alert-warning' : 'alert-success';
+            $message_title = $auto_install_failed
+                ? '⚠ Konfiguration gespeichert, Dienste nicht vollständig aktualisiert.'
+                : '✓ Konfiguration erfolgreich gespeichert.';
+            $message = "<div class='alert $message_class py-2 border-0 mb-3 mx-2 animate__animated animate__fadeIn'>$message_title$extra</div>";
             $config = readConfig($v4_config_file_path);
             unset($config['stop']);
             $pv_topology_ui_state = e3dc_config_editor_pv_topology_ui_state($v4_data);
@@ -2612,7 +3253,20 @@ if ($configEditorRequestMethod === 'POST') {
             if ($config_validation_failed) {
                 $failure_details = array_merge($failure_details, $guard_warnings);
             }
-            if (!$config_load_failed && !$config_validation_failed) {
+            if ($config_backup_failed) {
+                $failure_details[] = 'Die aktuelle Konfiguration konnte vor dem Speichern nicht gesichert werden. Bitte im Installationscenter „Rechte prüfen und reparieren“ ausführen.';
+            }
+            if ($config_cache_invalidation_failed) {
+                $failure_details[] = !empty($mutation['rolled_back'])
+                    ? 'Die Änderung wurde nach einem Cachefehler vollständig auf den vorherigen Stand zurückgesetzt.'
+                    : ($config_state_unknown
+                        ? 'Die Konfiguration wurde veröffentlicht, ihr Cache-/Rückfallzustand konnte jedoch nicht sicher bestätigt werden.'
+                        : 'Der Laufzeitcache konnte vor dem Speichern nicht sicher entfernt werden.');
+            }
+            if (!$config_load_failed
+                && !$config_validation_failed
+                && !$config_backup_failed
+                && !$config_cache_invalidation_failed) {
                 clearstatcache(true, $v4_config_file_path);
                 if (!is_writable($v4_config_file_path)) {
                     $perms = @file_exists($v4_config_file_path)
@@ -2622,6 +3276,10 @@ if ($configEditorRequestMethod === 'POST') {
                 } else {
                     $failure_details[] = 'Die validierte Konfiguration konnte nicht vollständig geschrieben oder bestätigt werden.';
                 }
+            }
+            $failure_details = array_values(array_unique(array_filter(array_map('strval', $failure_details))));
+            if (!$config_load_failed && !$config_validation_failed && $config_mutation_status !== 'not_started') {
+                $failure_details[] = 'Fehlercode: ' . $config_mutation_status . '. Bitte im Installationscenter „Rechte prüfen und reparieren“ ausführen.';
             }
             $failure_details = array_values(array_unique(array_filter(array_map('strval', $failure_details))));
             $failure_html = $failure_details
@@ -2828,6 +3486,32 @@ $frontendHiddenKeys = [
     "wallbox_decision_history_enable", "wallbox_decision_history_max_bytes", "wallbox_decision_history_retention_days", "wallbox_decision_history_interval_s",
     "energy_decision_history_enable", "energy_decision_history_max_bytes", "energy_decision_history_retention_days", "energy_decision_history_interval_s",
 ];
+$allGroupKeys = array_map('strtolower', array_merge($frontendHiddenKeys, ...array_values($groups)));
+$configExtraKnownKeys = array_values(array_unique(array_merge($allGroupKeys, array_keys($defaults))));
+$configExtraKnownKeySet = array_fill_keys(array_map('strtolower', $configExtraKnownKeys), true);
+
+if ($configEditorRequestMethod === 'POST' && (isset($_POST['delete_key']) || isset($_POST['add_key']))) {
+    $extraOperation = isset($_POST['delete_key']) ? 'delete' : 'add';
+    $extraResult = e3dc_config_editor_extra_key_transaction(
+        $extraOperation,
+        $extraOperation === 'delete' ? ($_POST['delete_key'] ?? '') : ($_POST['new_key'] ?? ''),
+        $extraOperation === 'add' ? ($_POST['new_value'] ?? null) : null,
+        $v4_config_file_path,
+        $install_user,
+        $configExtraKnownKeys
+    );
+    if (!empty($extraResult['success'])) {
+        $message = "<div class='alert alert-success py-2 border-0 mb-3 mx-2 animate__animated animate__fadeIn'>✓ "
+            . htmlspecialchars((string)$extraResult['message'])
+            . " Die übrigen Formularwerte wurden nicht gespeichert.</div>";
+        $config = readConfig($v4_config_file_path);
+        unset($config['stop']);
+    } else {
+        $message = "<div class='alert alert-danger py-2 border-0 mb-3 mx-2 animate__animated animate__shakeX'>⚠ Änderung nicht ausgeführt: "
+            . htmlspecialchars((string)($extraResult['message'] ?? 'unbekannter Fehler'))
+            . "</div>";
+    }
+}
 ?>
 <?php
 // Tooltip-Map für case-insensitive Suche vorbereiten
@@ -3000,6 +3684,18 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
     }
     wrapper.appendChild(document.createTextNode(String(message ?? '')));
     target.appendChild(wrapper);
+}
+
+async function readConfirmedConfigJson(response) {
+    let payload = null;
+    try { payload = await response.json(); } catch (_) { payload = null; }
+    if (!response.ok || !payload || typeof payload !== 'object') {
+        const message = payload && (payload.message || payload.msg || payload.error)
+            ? String(payload.message || payload.msg || payload.error)
+            : ('HTTP ' + response.status);
+        throw new Error(message);
+    }
+    return payload;
 }
 </script>
 <style>
@@ -5797,188 +6493,231 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
                     </details>
                 </div>
 
-                <h6 class="text-muted small fw-bold mt-4 mb-2 border-bottom pb-1">Globale Ladeparameter & Grenzen</h6>
+                <h6 class="text-muted small fw-bold mt-4 mb-2 border-bottom pb-1">Hausanschluss & gemeinsame Grenzen</h6>
                 <div class="wallbox-limits-grid" data-wallbox-count="<?= $hasSecondWallbox ? '2' : '1' ?>">
                     <div class="col-6 col-lg-4">
-                        <label class="config-label text-danger" data-tooltip="<?= htmlspecialchars($tooltipMap['grid_max_amps'] ?? '') ?>">Hausabsicherung (A je Phase)</label>
-                        <input type="number" min="16" max="125" step="1" name="values[grid_max_amps]" class="form-control config-input" value="<?= $val('grid_max_amps') ?>" placeholder="<?= $defaults['grid_max_amps'] ?>">
+                        <label class="config-label text-danger" data-tooltip="<?= htmlspecialchars($tooltipMap['grid_max_amps'] ?? '') ?>">Hausabsicherung/SLS (A je Phase)</label>
+                        <input type="number" min="1" max="125" step="1" id="conf_grid_max_amps" name="values[grid_max_amps]" class="form-control config-input" value="<?= $val('grid_max_amps') ?>" placeholder="<?= $defaults['grid_max_amps'] ?>" oninput="updateWallboxBudgetDisplay()">
                         <?= $configValidationMarker('grid_max_amps') ?>
                     </div>
                     <div class="col-6 col-lg-4">
-                        <label class="config-label text-warning" data-tooltip="<?= htmlspecialchars($tooltipMap['grid_wallbox_reserve_amps'] ?? '') ?>">Wallbox-Reserve (A je Phase)</label>
-                        <input type="number" min="0" max="32" step="0.5" name="values[grid_wallbox_reserve_amps]" class="form-control config-input" value="<?= $val('grid_wallbox_reserve_amps') ?>" placeholder="<?= $defaults['grid_wallbox_reserve_amps'] ?>">
+                        <label class="config-label text-warning" data-tooltip="<?= htmlspecialchars($tooltipMap['grid_wallbox_reserve_amps'] ?? '') ?>">Reserve für übrige Hausverbraucher (A)</label>
+                        <input type="number" min="0" max="32" step="0.5" id="conf_grid_wallbox_reserve_amps" name="values[grid_wallbox_reserve_amps]" class="form-control config-input" value="<?= $val('grid_wallbox_reserve_amps') ?>" placeholder="<?= $defaults['grid_wallbox_reserve_amps'] ?>" oninput="updateWallboxBudgetDisplay()">
                     </div>
-                    <div class="col-6 col-lg-4">
-                        <label class="config-label text-info" data-tooltip="<?= htmlspecialchars($tooltipMap['wbmaxladestrom'] ?? '') ?>">Max. Ladestrom Fallback (A)</label>
-                        <input type="number" name="values[wbmaxladestrom]" class="form-control config-input" value="<?= $val('wbmaxladestrom') ?>" placeholder="<?= $defaults['wbmaxladestrom'] ?>">
-                        <?= $configValidationMarker('wbmaxladestrom') ?>
+                    <div class="col-12 col-lg-4">
+                        <label class="config-label text-success">Berechnetes Wallbox-Budget</label>
+                        <?php
+                            $curGridAmps = (float)($rawVal('grid_max_amps') !== '' ? $rawVal('grid_max_amps') : 35.0);
+                            $curReserveAmps = (float)($rawVal('grid_wallbox_reserve_amps') !== '' ? $rawVal('grid_wallbox_reserve_amps') : 2.0);
+                            $curBudgetAmps = max(0.0, $curGridAmps - $curReserveAmps);
+                        ?>
+                        <div class="form-control bg-body-tertiary d-flex align-items-center justify-content-between">
+                            <span class="small text-muted">Hausabsicherung − Reserve:</span>
+                            <span class="fw-bold text-success"><span id="wallbox_calc_budget_val"><?= htmlspecialchars((string)$curBudgetAmps) ?></span> A je Phase</span>
+                        </div>
                     </div>
-                    <?php foreach ([1, 2, 3] as $gridPhase): ?>
-                    <div class="col-6 col-lg-2">
-                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['grid_max_amps_l' . $gridPhase] ?? '') ?>">Netz L<?= $gridPhase ?> Limit (A)</label>
-                        <input type="number" min="6" max="125" step="0.5" name="values[grid_max_amps_l<?= $gridPhase ?>]" class="form-control config-input" value="<?= $val('grid_max_amps_l' . $gridPhase) ?>" placeholder="leer = global">
-                    </div>
-                    <div class="col-6 col-lg-2">
-                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['grid_wallbox_reserve_amps_l' . $gridPhase] ?? '') ?>">Netz L<?= $gridPhase ?> Reserve (A)</label>
-                        <input type="number" min="0" max="64" step="0.5" name="values[grid_wallbox_reserve_amps_l<?= $gridPhase ?>]" class="form-control config-input" value="<?= $val('grid_wallbox_reserve_amps_l' . $gridPhase) ?>" placeholder="leer = global">
-                    </div>
-                    <?php endforeach; ?>
                     <div class="col-12">
                         <small class="text-muted">
-                            Phasenwerte sind optional. Leer bedeutet globale Hausgrenze bzw. globale Reserve; eine höhere openWB-Pro-Freigabe benötigt zusätzlich eine bestätigte Wallbox-zu-Netzphasen-Zuordnung und frische Messwerte.
+                            <i class="fas fa-info-circle me-1"></i>Die Hausanschlussgrenze gilt in allen von E3DC-Control aktiv geregelten Lademodi. Im Modus Nur beobachten / autonom sendet E3DC-Control keine Stromvorgabe; dort muss die Wallbox oder der externe Regler den Hausanschluss absichern.
                         </small>
                     </div>
-                    <div class="col-6" data-wallbox-column="1">
-                        <label class="config-label text-info" data-tooltip="<?= htmlspecialchars($tooltipMap['wb1_max_amp'] ?? '') ?>">WB1 Max. Ladestrom (A)</label>
-                        <input type="number" min="6" max="32" name="values[wb1_max_amp]" class="form-control config-input" value="<?= $val('wb1_max_amp') ?>" placeholder="leer = Fallback">
-                        <?= $configValidationMarker('wb1_max_amp') ?>
-                    </div>
-                    <div class="col-6" data-wallbox-column="1">
-                        <label class="config-label text-info" data-tooltip="<?= htmlspecialchars($tooltipMap['wb1_current_step_amp'] ?? '') ?>">WB1 Strom-Schritt</label>
-                        <select name="values[wb1_current_step_amp]" class="form-select config-input">
-                            <?php foreach (['1.0' => '1 A', '0.5' => '0,5 A', '0.1' => '0,1 A'] as $stepValue => $stepLabel): ?>
-                                <option value="<?= htmlspecialchars($stepValue) ?>" <?= ((string)$val('wb1_current_step_amp') === $stepValue) ? 'selected' : '' ?>><?= htmlspecialchars($stepLabel) ?></option>
+
+                    <details class="col-12 mt-2">
+                        <summary class="small fw-bold text-muted">Abweichende Phasengrenzen (optional)</summary>
+                        <div class="row g-2 mt-1">
+                            <?php foreach ([1, 2, 3] as $gridPhase): ?>
+                            <div class="col-6 col-lg-2">
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['grid_max_amps_l' . $gridPhase] ?? '') ?>">Netz L<?= $gridPhase ?> Limit (A)</label>
+                                <input type="number" min="6" max="125" step="0.5" name="values[grid_max_amps_l<?= $gridPhase ?>]" class="form-control config-input" value="<?= $val('grid_max_amps_l' . $gridPhase) ?>" placeholder="leer = global">
+                            </div>
+                            <div class="col-6 col-lg-2">
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['grid_wallbox_reserve_amps_l' . $gridPhase] ?? '') ?>">Netz L<?= $gridPhase ?> Reserve (A)</label>
+                                <input type="number" min="0" max="64" step="0.5" name="values[grid_wallbox_reserve_amps_l<?= $gridPhase ?>]" class="form-control config-input" value="<?= $val('grid_wallbox_reserve_amps_l' . $gridPhase) ?>" placeholder="leer = global">
+                            </div>
                             <?php endforeach; ?>
-                        </select>
+                            <div class="col-12">
+                                <small class="text-muted">
+                                    Phasenwerte sind optional. Leer bedeutet globale Hausgrenze bzw. globale Reserve; eine höhere openWB-Pro-Freigabe benötigt zusätzlich eine bestätigte Wallbox-zu-Netzphasen-Zuordnung und frische Messwerte.
+                                </small>
+                            </div>
+                        </div>
+                    </details>
+
+                    <details class="col-12 mt-2">
+                        <summary class="small fw-bold text-muted">Erweiterte Ladepunkteinstellungen (optional)</summary>
+                        <div class="row g-2 mt-1">
+                            <div class="col-6" data-wallbox-column="1">
+                                <label class="config-label text-info" data-tooltip="<?= htmlspecialchars($tooltipMap['wb1_max_amp'] ?? '') ?>">WB1 Max. Ladestrom (A)</label>
+                                <input type="number" min="6" max="32" name="values[wb1_max_amp]" class="form-control config-input" value="<?= $val('wb1_max_amp') ?>" placeholder="leer = Fallback">
+                                <?= $configValidationMarker('wb1_max_amp') ?>
+                            </div>
+                            <div class="col-6" data-wallbox-column="1">
+                                <label class="config-label text-info" data-tooltip="<?= htmlspecialchars($tooltipMap['wb1_current_step_amp'] ?? '') ?>">WB1 Strom-Schritt</label>
+                                <select name="values[wb1_current_step_amp]" class="form-select config-input">
+                                    <?php foreach (['1.0' => '1 A', '0.5' => '0,5 A', '0.1' => '0,1 A'] as $stepValue => $stepLabel): ?>
+                                        <option value="<?= htmlspecialchars($stepValue) ?>" <?= ((string)$val('wb1_current_step_amp') === $stepValue) ? 'selected' : '' ?>><?= htmlspecialchars($stepLabel) ?></option>
+                                    <?php endforeach; ?>
+                                </select>
+                            </div>
+                            <div class="col-6 col-lg-3" data-wallbox-column="1">
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb1_grid_phase'] ?? '') ?>">WB1 lokale L1 liegt auf Netzphase</label>
+                                <select name="values[wb1_grid_phase]" class="form-select config-input">
+                                    <option value="" <?= $rawVal('wb1_grid_phase') === '' ? 'selected' : '' ?>>nicht gebunden</option>
+                                    <?php foreach ([1, 2, 3] as $phase): ?>
+                                        <option value="<?= $phase ?>" <?= $rawVal('wb1_grid_phase') === (string)$phase ? 'selected' : '' ?>>L<?= $phase ?></option>
+                                    <?php endforeach; ?>
+                                </select>
+                            </div>
+                            <div class="col-6 col-lg-3" data-wallbox-column="1">
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb1_openwb_pro_1p_max_amp'] ?? '') ?>">WB1 openWB Pro 1p Max. (A)</label>
+                                <input type="number" min="6" max="32" step="0.5" name="values[wb1_openwb_pro_1p_max_amp]" class="form-control config-input" value="<?= $val('wb1_openwb_pro_1p_max_amp') ?>" placeholder="leer = sicher 20 A">
+                            </div>
+                            <div class="col-6" data-wallbox-column="2" <?= $hasSecondWallbox ? '' : 'hidden' ?>>
+                                <label class="config-label text-info" data-tooltip="<?= htmlspecialchars($tooltipMap['wb2_max_amp'] ?? '') ?>">WB2 Max. Ladestrom (A)</label>
+                                <input type="number" min="6" max="32" name="values[wb2_max_amp]" class="form-control config-input" value="<?= $val('wb2_max_amp') ?>" placeholder="leer = Fallback">
+                                <?= $configValidationMarker('wb2_max_amp') ?>
+                            </div>
+                            <div class="col-6" data-wallbox-column="2" <?= $hasSecondWallbox ? '' : 'hidden' ?>>
+                                <label class="config-label text-info" data-tooltip="<?= htmlspecialchars($tooltipMap['wb2_current_step_amp'] ?? '') ?>">WB2 Strom-Schritt</label>
+                                <select name="values[wb2_current_step_amp]" class="form-select config-input">
+                                    <?php foreach (['1.0' => '1 A', '0.5' => '0,5 A', '0.1' => '0,1 A'] as $stepValue => $stepLabel): ?>
+                                        <option value="<?= htmlspecialchars($stepValue) ?>" <?= ((string)$val('wb2_current_step_amp') === $stepValue) ? 'selected' : '' ?>><?= htmlspecialchars($stepLabel) ?></option>
+                                    <?php endforeach; ?>
+                                </select>
+                            </div>
+                            <div class="col-6 col-lg-3" data-wallbox-column="2" <?= $hasSecondWallbox ? '' : 'hidden' ?>>
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb2_grid_phase'] ?? '') ?>">WB2 lokale L1 liegt auf Netzphase</label>
+                                <select name="values[wb2_grid_phase]" class="form-select config-input">
+                                    <option value="" <?= $rawVal('wb2_grid_phase') === '' ? 'selected' : '' ?>>nicht gebunden</option>
+                                    <?php foreach ([1, 2, 3] as $phase): ?>
+                                        <option value="<?= $phase ?>" <?= $rawVal('wb2_grid_phase') === (string)$phase ? 'selected' : '' ?>>L<?= $phase ?></option>
+                                    <?php endforeach; ?>
+                                </select>
+                            </div>
+                            <div class="col-6 col-lg-3" data-wallbox-column="2" <?= $hasSecondWallbox ? '' : 'hidden' ?>>
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb2_openwb_pro_1p_max_amp'] ?? '') ?>">WB2 openWB Pro 1p Max. (A)</label>
+                                <input type="number" min="6" max="32" step="0.5" name="values[wb2_openwb_pro_1p_max_amp]" class="form-control config-input" value="<?= $val('wb2_openwb_pro_1p_max_amp') ?>" placeholder="leer = sicher 20 A">
+                            </div>
+                        </div>
+                    </details>
+
+                    <div class="col-12" data-wallbox-common>
+                        <details class="col-12">
+                            <summary class="small fw-bold text-muted">Erweiterte Treibereinstellungen</summary>
+                            <div class="row g-2 mt-1">
+                                <div class="col-6 col-lg-4">
+                                    <label class="config-label text-info" data-tooltip="<?= htmlspecialchars($tooltipMap['wbmaxladestrom'] ?? '') ?>">Standard-Maximalstrom je Wallbox (6–32 A)</label>
+                                    <input type="number" min="6" max="32" step="1" name="values[wbmaxladestrom]" class="form-control config-input" value="<?= $val('wbmaxladestrom') ?>" placeholder="<?= $defaults['wbmaxladestrom'] ?>">
+                                    <?= $configValidationMarker('wbmaxladestrom') ?>
+                                </div>
+                            </div>
+                        </details>
                     </div>
-                    <div class="col-6 col-lg-3" data-wallbox-column="1">
-                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb1_grid_phase'] ?? '') ?>">WB1 lokale L1 liegt auf Netzphase</label>
-                        <select name="values[wb1_grid_phase]" class="form-select config-input">
-                            <option value="" <?= $rawVal('wb1_grid_phase') === '' ? 'selected' : '' ?>>nicht gebunden</option>
-                            <?php foreach ([1, 2, 3] as $phase): ?>
-                                <option value="<?= $phase ?>" <?= $rawVal('wb1_grid_phase') === (string)$phase ? 'selected' : '' ?>>L<?= $phase ?></option>
-                            <?php endforeach; ?>
-                        </select>
-                    </div>
-                    <div class="col-6 col-lg-3" data-wallbox-column="1">
-                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb1_openwb_pro_1p_max_amp'] ?? '') ?>">WB1 openWB Pro 1p Max. (A)</label>
-                        <input type="number" min="6" max="32" step="0.5" name="values[wb1_openwb_pro_1p_max_amp]" class="form-control config-input" value="<?= $val('wb1_openwb_pro_1p_max_amp') ?>" placeholder="leer = sicher 20 A">
-                    </div>
-                    <div class="col-6" data-wallbox-column="2" <?= $hasSecondWallbox ? '' : 'hidden' ?>>
-                        <label class="config-label text-info" data-tooltip="<?= htmlspecialchars($tooltipMap['wb2_max_amp'] ?? '') ?>">WB2 Max. Ladestrom (A)</label>
-                        <input type="number" min="6" max="32" name="values[wb2_max_amp]" class="form-control config-input" value="<?= $val('wb2_max_amp') ?>" placeholder="leer = Fallback">
-                        <?= $configValidationMarker('wb2_max_amp') ?>
-                    </div>
-                    <div class="col-6" data-wallbox-column="2" <?= $hasSecondWallbox ? '' : 'hidden' ?>>
-                        <label class="config-label text-info" data-tooltip="<?= htmlspecialchars($tooltipMap['wb2_current_step_amp'] ?? '') ?>">WB2 Strom-Schritt</label>
-                        <select name="values[wb2_current_step_amp]" class="form-select config-input">
-                            <?php foreach (['1.0' => '1 A', '0.5' => '0,5 A', '0.1' => '0,1 A'] as $stepValue => $stepLabel): ?>
-                                <option value="<?= htmlspecialchars($stepValue) ?>" <?= ((string)$val('wb2_current_step_amp') === $stepValue) ? 'selected' : '' ?>><?= htmlspecialchars($stepLabel) ?></option>
-                            <?php endforeach; ?>
-                        </select>
-                    </div>
-                    <div class="col-6 col-lg-3" data-wallbox-column="2" <?= $hasSecondWallbox ? '' : 'hidden' ?>>
-                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb2_grid_phase'] ?? '') ?>">WB2 lokale L1 liegt auf Netzphase</label>
-                        <select name="values[wb2_grid_phase]" class="form-select config-input">
-                            <option value="" <?= $rawVal('wb2_grid_phase') === '' ? 'selected' : '' ?>>nicht gebunden</option>
-                            <?php foreach ([1, 2, 3] as $phase): ?>
-                                <option value="<?= $phase ?>" <?= $rawVal('wb2_grid_phase') === (string)$phase ? 'selected' : '' ?>>L<?= $phase ?></option>
-                            <?php endforeach; ?>
-                        </select>
-                    </div>
-                    <div class="col-6 col-lg-3" data-wallbox-column="2" <?= $hasSecondWallbox ? '' : 'hidden' ?>>
-                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb2_openwb_pro_1p_max_amp'] ?? '') ?>">WB2 openWB Pro 1p Max. (A)</label>
-                        <input type="number" min="6" max="32" step="0.5" name="values[wb2_openwb_pro_1p_max_amp]" class="form-control config-input" value="<?= $val('wb2_openwb_pro_1p_max_amp') ?>" placeholder="leer = sicher 20 A">
-                    </div>
-                    <div class="col-6 col-lg-3">
-                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb_surplus_target_grid_w'] ?? '') ?>">PV-Netzziel (W)</label>
-                        <input type="number" min="-1000" max="500" step="25" name="values[wb_surplus_target_grid_w]" class="form-control config-input" value="<?= $val('wb_surplus_target_grid_w') ?>" placeholder="<?= $defaults['wb_surplus_target_grid_w'] ?>">
-                    </div>
-                    <div class="col-6 col-lg-3">
-                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb_surplus_noise_w'] ?? '') ?>">PV-Totbereich (W)</label>
-                        <input type="number" min="0" max="2000" step="10" name="values[wb_surplus_noise_w]" class="form-control config-input" value="<?= $val('wb_surplus_noise_w') ?>" placeholder="<?= $defaults['wb_surplus_noise_w'] ?>">
-                    </div>
-                    <div class="col-6 col-lg-3">
-                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['phase_transition_safety_margin_w'] ?? '') ?>">Phasenreserve (W)</label>
-                        <input type="number" min="0" max="5000" step="50" name="values[phase_transition_safety_margin_w]" class="form-control config-input" value="<?= $val('phase_transition_safety_margin_w') ?>" placeholder="<?= $defaults['phase_transition_safety_margin_w'] ?>">
-                    </div>
-                    <div class="col-6 col-lg-3">
-                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['heatpump_start_settle_s'] ?? '') ?>">WP-Anlaufruhe (s)</label>
-                        <input type="number" min="0" max="300" step="5" name="values[heatpump_start_settle_s]" class="form-control config-input" value="<?= $val('heatpump_start_settle_s') ?>" placeholder="<?= $defaults['heatpump_start_settle_s'] ?>">
-                    </div>
-                    <div class="col-6">
-                        <label class="config-label text-warning" data-tooltip="<?= htmlspecialchars($tooltipMap['wbminsoc'] ?? '') ?>">Haus-Priorität (Batterie-Reserve SoC %)</label>
-                        <input type="number" name="values[wbminsoc]" class="form-control config-input" value="<?= $val('wbminsoc') ?>" placeholder="<?= $defaults['wbminsoc'] ?>">
-                    </div>
-                    <div class="col-12 mt-3">
-                        <h6 class="text-muted small fw-bold mb-2 border-bottom pb-1">Schaltzeiten & Hysterese</h6>
-                    </div>
-                    <div class="col-6 col-lg-3">
-                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb_restart_delay_s'] ?? '') ?>">Wiedereinschalten (s)</label>
-                        <input type="number" min="0" max="1800" name="values[wb_restart_delay_s]" class="form-control config-input" value="<?= $val('wb_restart_delay_s') ?>" placeholder="<?= $defaults['wb_restart_delay_s'] ?>">
-                    </div>
-                    <div class="col-6 col-lg-3">
-                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb_min_charge_time_s'] ?? '') ?>">Mindestladezeit (s)</label>
-                        <input type="number" min="0" max="7200" name="values[wb_min_charge_time_s]" class="form-control config-input" value="<?= $val('wb_min_charge_time_s') ?>" placeholder="<?= $defaults['wb_min_charge_time_s'] ?>">
-                    </div>
-                    <div class="col-6 col-lg-3">
-                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb_cloud_stop_delay_s'] ?? '') ?>">Wolken-Halt (s)</label>
-                        <input type="number" min="0" max="3600" name="values[wb_cloud_stop_delay_s]" class="form-control config-input" value="<?= $val('wb_cloud_stop_delay_s') ?>" placeholder="<?= $defaults['wb_cloud_stop_delay_s'] ?>">
-                    </div>
-                    <div class="col-6 col-lg-3">
-                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb_phase_change_hold_s'] ?? '') ?>">Phasen-Halt (s)</label>
-                        <input type="number" min="0" max="1800" name="values[wb_phase_change_hold_s]" class="form-control config-input" value="<?= $val('wb_phase_change_hold_s') ?>" placeholder="<?= $defaults['wb_phase_change_hold_s'] ?>">
-                    </div>
-                    <div class="col-6 col-lg-3">
-                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['openwb_pro_phase_wait_s'] ?? '') ?>">Pro Phasen-Cooldown (s)</label>
-                        <input type="number" min="1" max="7200" name="values[openwb_pro_phase_wait_s]" class="form-control config-input" value="<?= $val('openwb_pro_phase_wait_s') ?>" placeholder="480">
-                        <?= $configValidationMarker('openwb_pro_phase_wait_s') ?>
-                    </div>
-                    <div class="col-6 col-lg-3">
-                        <label class="config-label text-danger" data-tooltip="<?= htmlspecialchars($tooltipMap['openwb_pro_phase_cp_interrupt_duration_s'] ?? '') ?>">Kurzer CP-Impuls (s)</label>
-                        <input type="number" min="2" max="30" name="values[openwb_pro_phase_cp_interrupt_duration_s]" class="form-control config-input" value="<?= $val('openwb_pro_phase_cp_interrupt_duration_s') ?>" placeholder="5">
-                        <?= $configValidationMarker('openwb_pro_phase_cp_interrupt_duration_s') ?>
-                    </div>
-                    <div class="col-6 col-lg-3">
-                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['openwb_pro_phase_restart_delay_s'] ?? '') ?>">Pro CP-Nachlauf (s)</label>
-                        <input type="number" min="0" max="1800" name="values[openwb_pro_phase_restart_delay_s]" class="form-control config-input" value="<?= $val('openwb_pro_phase_restart_delay_s') ?>" placeholder="0">
-                    </div>
-                    <div class="col-6 col-lg-3">
-                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['openwb_pro_start_wakeup_delay_s'] ?? '') ?>">Pro Wake-up-Nachlauf (s)</label>
-                        <input type="number" min="0" max="120" name="values[openwb_pro_start_wakeup_delay_s]" class="form-control config-input" value="<?= $val('openwb_pro_start_wakeup_delay_s') ?>" placeholder="5">
-                    </div>
-                    <div class="col-12">
-                        <small class="text-muted" style="font-size: 0.75rem;">
-                            <i class="fas fa-info-circle me-1"></i> Leer gelassene WB1/WB2-Felder verwenden die globalen Werte. Ladefenster starten ohne 6A-Anlaufbremse bis zum abgesicherten Maximaldeckel und enden hart mit 0 W.
-                        </small>
-                    </div>
-                    <div class="col-6 col-lg-3" data-wallbox-column="1">
-                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb1_restart_delay_s'] ?? '') ?>">WB1 Wiederein. (s)</label>
-                        <input type="number" min="0" max="1800" name="values[wb1_restart_delay_s]" class="form-control config-input" value="<?= $val('wb1_restart_delay_s') ?>" placeholder="global">
-                    </div>
-                    <div class="col-6 col-lg-3" data-wallbox-column="1">
-                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb1_min_charge_time_s'] ?? '') ?>">WB1 Mindest (s)</label>
-                        <input type="number" min="0" max="7200" name="values[wb1_min_charge_time_s]" class="form-control config-input" value="<?= $val('wb1_min_charge_time_s') ?>" placeholder="global">
-                    </div>
-                    <div class="col-6 col-lg-3" data-wallbox-column="1">
-                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb1_cloud_stop_delay_s'] ?? '') ?>">WB1 Wolken (s)</label>
-                        <input type="number" min="0" max="3600" name="values[wb1_cloud_stop_delay_s]" class="form-control config-input" value="<?= $val('wb1_cloud_stop_delay_s') ?>" placeholder="global">
-                    </div>
-                    <div class="col-6 col-lg-3" data-wallbox-column="1">
-                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb1_phase_change_hold_s'] ?? '') ?>">WB1 Phasen (s)</label>
-                        <input type="number" min="0" max="1800" name="values[wb1_phase_change_hold_s]" class="form-control config-input" value="<?= $val('wb1_phase_change_hold_s') ?>" placeholder="global">
-                    </div>
-                    <div class="col-6 col-lg-3" data-wallbox-column="2" <?= $hasSecondWallbox ? '' : 'hidden' ?>>
-                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb2_restart_delay_s'] ?? '') ?>">WB2 Wiederein. (s)</label>
-                        <input type="number" min="0" max="1800" name="values[wb2_restart_delay_s]" class="form-control config-input" value="<?= $val('wb2_restart_delay_s') ?>" placeholder="global">
-                    </div>
-                    <div class="col-6 col-lg-3" data-wallbox-column="2" <?= $hasSecondWallbox ? '' : 'hidden' ?>>
-                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb2_min_charge_time_s'] ?? '') ?>">WB2 Mindest (s)</label>
-                        <input type="number" min="0" max="7200" name="values[wb2_min_charge_time_s]" class="form-control config-input" value="<?= $val('wb2_min_charge_time_s') ?>" placeholder="global">
-                    </div>
-                    <div class="col-6 col-lg-3" data-wallbox-column="2" <?= $hasSecondWallbox ? '' : 'hidden' ?>>
-                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb2_cloud_stop_delay_s'] ?? '') ?>">WB2 Wolken (s)</label>
-                        <input type="number" min="0" max="3600" name="values[wb2_cloud_stop_delay_s]" class="form-control config-input" value="<?= $val('wb2_cloud_stop_delay_s') ?>" placeholder="global">
-                    </div>
-                    <div class="col-6 col-lg-3" data-wallbox-column="2" <?= $hasSecondWallbox ? '' : 'hidden' ?>>
-                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb2_phase_change_hold_s'] ?? '') ?>">WB2 Phasen (s)</label>
-                        <input type="number" min="0" max="1800" name="values[wb2_phase_change_hold_s]" class="form-control config-input" value="<?= $val('wb2_phase_change_hold_s') ?>" placeholder="global">
-                    </div>
-                    <div class="col-12 mt-1">
-                        <small class="text-muted" style="font-size: 0.75rem;">
-                            <i class="fas fa-info-circle me-1"></i> Diese Werte gelten global für alle angeschlossenen nativen Wallboxen.
-                        </small>
-                    </div>
+
+                    <details class="col-12 mt-3" data-wallbox-common>
+                        <summary class="small fw-bold text-muted">Erweiterte Wallbox-Regelung – nur für erfahrene Nutzer</summary>
+                        <div class="row g-2 mt-2">
+                            <div class="col-6 col-lg-3">
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb_surplus_target_grid_w'] ?? '') ?>">PV-Netzziel (W)</label>
+                                <input type="number" min="-1000" max="500" step="25" name="values[wb_surplus_target_grid_w]" class="form-control config-input" value="<?= $val('wb_surplus_target_grid_w') ?>" placeholder="<?= $defaults['wb_surplus_target_grid_w'] ?>">
+                            </div>
+                            <div class="col-6 col-lg-3">
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb_surplus_noise_w'] ?? '') ?>">PV-Totbereich (W)</label>
+                                <input type="number" min="0" max="2000" step="10" name="values[wb_surplus_noise_w]" class="form-control config-input" value="<?= $val('wb_surplus_noise_w') ?>" placeholder="<?= $defaults['wb_surplus_noise_w'] ?>">
+                            </div>
+                            <div class="col-6 col-lg-3">
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['phase_transition_safety_margin_w'] ?? '') ?>">Phasenreserve (W)</label>
+                                <input type="number" min="0" max="5000" step="50" name="values[phase_transition_safety_margin_w]" class="form-control config-input" value="<?= $val('phase_transition_safety_margin_w') ?>" placeholder="<?= $defaults['phase_transition_safety_margin_w'] ?>">
+                            </div>
+                            <div class="col-6 col-lg-3">
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['heatpump_start_settle_s'] ?? '') ?>">WP-Anlaufruhe (s)</label>
+                                <input type="number" min="0" max="300" step="5" name="values[heatpump_start_settle_s]" class="form-control config-input" value="<?= $val('heatpump_start_settle_s') ?>" placeholder="<?= $defaults['heatpump_start_settle_s'] ?>">
+                            </div>
+                            <div class="col-6">
+                                <label class="config-label text-warning" data-tooltip="<?= htmlspecialchars($tooltipMap['wbminsoc'] ?? '') ?>">Haus-Priorität (Batterie-Reserve SoC %)</label>
+                                <input type="number" name="values[wbminsoc]" class="form-control config-input" value="<?= $val('wbminsoc') ?>" placeholder="<?= $defaults['wbminsoc'] ?>">
+                            </div>
+                            <div class="col-12 mt-3">
+                                <h6 class="text-muted small fw-bold mb-2 border-bottom pb-1">Schaltzeiten & Hysterese</h6>
+                            </div>
+                            <div class="col-6 col-lg-3">
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb_restart_delay_s'] ?? '') ?>">Wiedereinschalten (s)</label>
+                                <input type="number" min="0" max="1800" name="values[wb_restart_delay_s]" class="form-control config-input" value="<?= $val('wb_restart_delay_s') ?>" placeholder="<?= $defaults['wb_restart_delay_s'] ?>">
+                            </div>
+                            <div class="col-6 col-lg-3">
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb_min_charge_time_s'] ?? '') ?>">Mindestladezeit (s)</label>
+                                <input type="number" min="0" max="7200" name="values[wb_min_charge_time_s]" class="form-control config-input" value="<?= $val('wb_min_charge_time_s') ?>" placeholder="<?= $defaults['wb_min_charge_time_s'] ?>">
+                            </div>
+                            <div class="col-6 col-lg-3">
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb_cloud_stop_delay_s'] ?? '') ?>">Wolken-Halt (s)</label>
+                                <input type="number" min="0" max="3600" name="values[wb_cloud_stop_delay_s]" class="form-control config-input" value="<?= $val('wb_cloud_stop_delay_s') ?>" placeholder="<?= $defaults['wb_cloud_stop_delay_s'] ?>">
+                            </div>
+                            <div class="col-6 col-lg-3">
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb_phase_change_hold_s'] ?? '') ?>">Phasen-Halt (s)</label>
+                                <input type="number" min="0" max="1800" name="values[wb_phase_change_hold_s]" class="form-control config-input" value="<?= $val('wb_phase_change_hold_s') ?>" placeholder="<?= $defaults['wb_phase_change_hold_s'] ?>">
+                            </div>
+                            <div class="col-6 col-lg-3">
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['openwb_pro_phase_wait_s'] ?? '') ?>">Pro Phasen-Cooldown (s)</label>
+                                <input type="number" min="1" max="7200" name="values[openwb_pro_phase_wait_s]" class="form-control config-input" value="<?= $val('openwb_pro_phase_wait_s') ?>" placeholder="480">
+                                <?= $configValidationMarker('openwb_pro_phase_wait_s') ?>
+                            </div>
+                            <div class="col-6 col-lg-3">
+                                <label class="config-label text-danger" data-tooltip="<?= htmlspecialchars($tooltipMap['openwb_pro_phase_cp_interrupt_duration_s'] ?? '') ?>">Kurzer CP-Impuls (s)</label>
+                                <input type="number" min="2" max="30" name="values[openwb_pro_phase_cp_interrupt_duration_s]" class="form-control config-input" value="<?= $val('openwb_pro_phase_cp_interrupt_duration_s') ?>" placeholder="5">
+                                <?= $configValidationMarker('openwb_pro_phase_cp_interrupt_duration_s') ?>
+                            </div>
+                            <div class="col-6 col-lg-3">
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['openwb_pro_phase_restart_delay_s'] ?? '') ?>">Pro CP-Nachlauf (s)</label>
+                                <input type="number" min="0" max="1800" name="values[openwb_pro_phase_restart_delay_s]" class="form-control config-input" value="<?= $val('openwb_pro_phase_restart_delay_s') ?>" placeholder="0">
+                            </div>
+                            <div class="col-6 col-lg-3">
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['openwb_pro_start_wakeup_delay_s'] ?? '') ?>">Pro Wake-up-Nachlauf (s)</label>
+                                <input type="number" min="0" max="120" name="values[openwb_pro_start_wakeup_delay_s]" class="form-control config-input" value="<?= $val('openwb_pro_start_wakeup_delay_s') ?>" placeholder="5">
+                            </div>
+                            <div class="col-12">
+                                <small class="text-muted" style="font-size: 0.75rem;">
+                                    <i class="fas fa-info-circle me-1"></i> Leer gelassene WB1/WB2-Felder verwenden die globalen Werte. Ladefenster starten ohne 6A-Anlaufbremse bis zum abgesicherten Maximaldeckel und enden hart mit 0 W.
+                                </small>
+                            </div>
+                            <div class="col-6 col-lg-3" data-wallbox-column="1">
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb1_restart_delay_s'] ?? '') ?>">WB1 Wiederein. (s)</label>
+                                <input type="number" min="0" max="1800" name="values[wb1_restart_delay_s]" class="form-control config-input" value="<?= $val('wb1_restart_delay_s') ?>" placeholder="global">
+                            </div>
+                            <div class="col-6 col-lg-3" data-wallbox-column="1">
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb1_min_charge_time_s'] ?? '') ?>">WB1 Mindest (s)</label>
+                                <input type="number" min="0" max="7200" name="values[wb1_min_charge_time_s]" class="form-control config-input" value="<?= $val('wb1_min_charge_time_s') ?>" placeholder="global">
+                            </div>
+                            <div class="col-6 col-lg-3" data-wallbox-column="1">
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb1_cloud_stop_delay_s'] ?? '') ?>">WB1 Wolken (s)</label>
+                                <input type="number" min="0" max="3600" name="values[wb1_cloud_stop_delay_s]" class="form-control config-input" value="<?= $val('wb1_cloud_stop_delay_s') ?>" placeholder="global">
+                            </div>
+                            <div class="col-6 col-lg-3" data-wallbox-column="1">
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb1_phase_change_hold_s'] ?? '') ?>">WB1 Phasen (s)</label>
+                                <input type="number" min="0" max="1800" name="values[wb1_phase_change_hold_s]" class="form-control config-input" value="<?= $val('wb1_phase_change_hold_s') ?>" placeholder="global">
+                            </div>
+                            <div class="col-6 col-lg-3" data-wallbox-column="2" <?= $hasSecondWallbox ? '' : 'hidden' ?>>
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb2_restart_delay_s'] ?? '') ?>">WB2 Wiederein. (s)</label>
+                                <input type="number" min="0" max="1800" name="values[wb2_restart_delay_s]" class="form-control config-input" value="<?= $val('wb2_restart_delay_s') ?>" placeholder="global">
+                            </div>
+                            <div class="col-6 col-lg-3" data-wallbox-column="2" <?= $hasSecondWallbox ? '' : 'hidden' ?>>
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb2_min_charge_time_s'] ?? '') ?>">WB2 Mindest (s)</label>
+                                <input type="number" min="0" max="7200" name="values[wb2_min_charge_time_s]" class="form-control config-input" value="<?= $val('wb2_min_charge_time_s') ?>" placeholder="global">
+                            </div>
+                            <div class="col-6 col-lg-3" data-wallbox-column="2" <?= $hasSecondWallbox ? '' : 'hidden' ?>>
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb2_cloud_stop_delay_s'] ?? '') ?>">WB2 Wolken (s)</label>
+                                <input type="number" min="0" max="3600" name="values[wb2_cloud_stop_delay_s]" class="form-control config-input" value="<?= $val('wb2_cloud_stop_delay_s') ?>" placeholder="global">
+                            </div>
+                            <div class="col-6 col-lg-3" data-wallbox-column="2" <?= $hasSecondWallbox ? '' : 'hidden' ?>>
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb2_phase_change_hold_s'] ?? '') ?>">WB2 Phasen (s)</label>
+                                <input type="number" min="0" max="1800" name="values[wb2_phase_change_hold_s]" class="form-control config-input" value="<?= $val('wb2_phase_change_hold_s') ?>" placeholder="global">
+                            </div>
+                            <div class="col-12 mt-1">
+                                <small class="text-muted" style="font-size: 0.75rem;">
+                                    <i class="fas fa-info-circle me-1"></i> Diese Werte gelten global für alle angeschlossenen nativen Wallboxen.
+                                </small>
+                            </div>
+                        </div>
+                    </details>
                 </div>
             </div>
         </details>
@@ -7872,7 +8611,7 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
                                         <input type="text" name="values[telegram_device_name]" class="form-control config-input" value="<?= $val('telegram_device_name') ?>" placeholder="E3DC-Control">
                                     </div>
                                     <div class="col-12">
-                                        <button type="submit" name="test_telegram" value="1" class="btn btn-sm btn-outline-info rounded-pill px-3 fw-bold" formnovalidate>
+                                        <button type="submit" name="test_telegram" value="1" class="btn btn-sm btn-outline-info rounded-pill px-3 fw-bold" data-config-isolated-action formnovalidate>
                                             <i class="fas fa-mobile-alt me-2"></i>Status-Testnachricht senden
                                         </button>
                                     </div>
@@ -8047,7 +8786,7 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
                             'X-CSRF-Token': <?= json_encode(e3dcCsrfToken()) ?>
                         }
                     });
-                    const vapidData = await res.json();
+                    const vapidData = await readConfirmedConfigJson(res);
 
                     if (vapidData.error) {
                         renderConfigStatus(status, vapidData.error, 'text-danger', 'fas fa-exclamation-triangle');
@@ -8084,8 +8823,8 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
                         body: JSON.stringify(subData)
                     });
 
-                    const saveJson = await saveRes.json();
-                    if(saveJson.success) {
+                    const saveJson = await readConfirmedConfigJson(saveRes);
+                    if(saveJson.success === true) {
                         renderConfigStatus(status, 'Gerät erfolgreich gesichert!', 'text-success', 'fas fa-check-circle fs-5 d-block mb-1');
                     } else {
                         renderConfigStatus(status, 'DB-Fehler: ' + String(saveJson.error ?? 'Unbekannter Fehler'), 'text-danger', 'fas fa-times');
@@ -8145,8 +8884,8 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
                             'X-CSRF-Token': <?= json_encode(e3dcCsrfToken()) ?>
                         }
                     });
-                    const json = await res.json();
-                    if(json.success) {
+                    const json = await readConfirmedConfigJson(res);
+                    if(json.success === true) {
                         renderConfigStatus(status, 'Testnachricht erfolgreich versendet! (' + String(json.count ?? 0) + ' Geräte)', 'text-success', 'fas fa-check');
                     } else {
                         renderConfigStatus(status, 'Fehler: ' + String(json.error ?? 'Unbekannter Fehler'), 'text-danger', 'fas fa-times');
@@ -8233,7 +8972,6 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
                             <?php else: ?>
                                 <input type="text" name="values[<?= $key ?>]" class="form-control config-input" value="<?= htmlspecialchars($data['value']) ?>" placeholder="Standard: <?= $defaults[$key] ?? '' ?>">
                             <?php endif; ?>
-                            <button type="submit" name="delete_key" value="<?= $key ?>" class="btn btn-outline-secondary border-secondary-subtle" title="Löschen"><i class="fas fa-trash text-danger"></i></button>
                         </div>
                     </div>
                 <?php endforeach; ?>
@@ -9300,8 +10038,8 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
 
                     try {
                         const res = await fetch('manual_bat_cmd.php', { method: 'POST', body: fd });
-                        const data = await res.json();
-                        if (data.ok) {
+                        const data = await readConfirmedConfigJson(res);
+                        if (data.ok === true) {
                             renderConfigStatus(result, data.msg ?? 'Befehl übernommen.', '', 'fas fa-check-circle text-success me-1');
                             // Badge sofort aktualisieren (kein Seitenreload nötig)
                             const badge = document.getElementById('bat-status-badge');
@@ -10775,14 +11513,22 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
             <div class="p-3">
                 <div class="row g-3">
                 <?php foreach ($rest as $key => $data): ?>
-                    <div class="col-12 col-md-6 col-xl-4 config-item" data-search-key="<?= strtolower($key) ?>" data-default-hidden="false">
+                    <?php
+                        $restKeyNormalized = strtolower((string)$key);
+                        $restKeyDeletable = preg_match('/\A[a-z][a-z0-9_.-]{0,127}\z/D', (string)$key) === 1
+                            && !isset($configExtraKnownKeySet[$restKeyNormalized])
+                            && !e3dc_config_editor_protected_extra_key($restKeyNormalized);
+                    ?>
+                    <div class="col-12 col-md-6 col-xl-4 config-item" data-search-key="<?= htmlspecialchars($restKeyNormalized, ENT_QUOTES, 'UTF-8') ?>" data-default-hidden="false">
                         <div class="d-flex justify-content-between align-items-center mb-1">
-                            <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap[strtolower($key)] ?? 'Keine Beschreibung.') ?>"><?= $key ?></label>
-                            <input type="checkbox" name="comments[]" value="<?= $key ?>" class="form-check-input small" title="Auskommentieren" <?= $data['commented'] ? 'checked':'' ?>>
+                            <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap[$restKeyNormalized] ?? 'Keine Beschreibung.') ?>"><?= htmlspecialchars((string)$key, ENT_QUOTES, 'UTF-8') ?></label>
+                            <input type="checkbox" name="comments[]" value="<?= htmlspecialchars((string)$key, ENT_QUOTES, 'UTF-8') ?>" class="form-check-input small" title="Auskommentieren" <?= $data['commented'] ? 'checked':'' ?>>
                         </div>
                         <div class="input-group input-group-sm">
-                            <input type="text" name="values[<?= $key ?>]" class="form-control config-input" value="<?= htmlspecialchars($data['value']) ?>">
-                            <button type="submit" name="delete_key" value="<?= $key ?>" class="btn btn-outline-secondary border-secondary-subtle" title="Löschen"><i class="fas fa-trash text-danger"></i></button>
+                            <input type="text" name="values[<?= htmlspecialchars((string)$key, ENT_QUOTES, 'UTF-8') ?>]" class="form-control config-input" value="<?= htmlspecialchars($data['value']) ?>">
+                            <?php if ($restKeyDeletable): ?>
+                            <button type="submit" name="delete_key" value="<?= htmlspecialchars((string)$key, ENT_QUOTES, 'UTF-8') ?>" class="btn btn-outline-secondary border-secondary-subtle" title="Zusätzlichen Parameter löschen" data-config-isolated-action formnovalidate onclick="return window.confirm('Diesen zusätzlichen Parameter wirklich löschen? Die übrigen Formularwerte werden dabei nicht gespeichert.');"><i class="fas fa-trash text-danger"></i></button>
+                            <?php endif; ?>
                         </div>
                     </div>
                 <?php endforeach; ?>
@@ -10807,8 +11553,11 @@ function renderConfigStatus(target, message, wrapperClass = '', iconClass = '') 
                     <input type="text" id="new_value_input" name="new_value" class="form-control config-input" placeholder="z.B. true oder 123">
                 </div>
                 <div class="form-text text-muted small">
-                    Die neue Variable wird beim Speichern hinzugefügt und erscheint danach in der Gruppe "Weitere Parameter". Um sie einer anderen Gruppe zuzuordnen, muss die Datei <code>config_editor.php</code> manuell bearbeitet werden.
+                    Mit „Variable hinzufügen“ wird ausschließlich dieser neue Eintrag gespeichert. Er erscheint danach in der Gruppe „Weitere Parameter“; die übrigen Formularwerte bleiben unverändert.
                 </div>
+                <button type="submit" name="add_key" value="1" class="btn btn-sm btn-outline-success rounded-pill px-3 fw-bold mt-3" data-config-isolated-action formnovalidate>
+                    <i class="fas fa-plus me-1"></i>Variable hinzufügen
+                </button>
             </div>
         </details>
 
@@ -11317,7 +12066,7 @@ async function testTibberApi(button) {
             credentials: 'same-origin',
             cache: 'no-store'
         });
-        const data = await response.json();
+        const data = await readConfirmedConfigJson(response);
         setTibberTestStatus(data.message || 'Tibber-Test ohne Rückmeldung beendet.', data.success ? 'text-success' : 'text-warning');
     } catch (err) {
         setTibberTestStatus('Tibber-Test fehlgeschlagen: ' + (err && err.message ? err.message : err), 'text-danger');
@@ -11352,7 +12101,7 @@ async function testEntsoeApi(button) {
             credentials: 'same-origin',
             cache: 'no-store'
         });
-        const data = await response.json();
+        const data = await readConfirmedConfigJson(response);
         setEntsoeTestStatus(data.message || 'ENTSO-E-Test ohne Rückmeldung beendet.', data.success ? 'text-success' : 'text-warning');
     } catch (err) {
         setEntsoeTestStatus('ENTSO-E-Test fehlgeschlagen: ' + (err && err.message ? err.message : err), 'text-danger');
@@ -11478,6 +12227,19 @@ function openAdvancedConfigGroup(groupId, focusId) {
     }, 80);
 }
 
+function updateWallboxBudgetDisplay() {
+    var gridInput = document.getElementById('conf_grid_max_amps') || document.querySelector('input[name="values[grid_max_amps]"]');
+    var reserveInput = document.getElementById('conf_grid_wallbox_reserve_amps') || document.querySelector('input[name="values[grid_wallbox_reserve_amps]"]');
+    var display = document.getElementById('wallbox_calc_budget_val');
+    if (!display) return;
+    var gridVal = parseFloat(gridInput ? gridInput.value : '35');
+    var resVal = parseFloat(reserveInput ? reserveInput.value : '2');
+    if (isNaN(gridVal)) gridVal = 35.0;
+    if (isNaN(resVal)) resVal = 2.0;
+    var budget = Math.max(0, gridVal - resVal);
+    display.textContent = (Math.round(budget * 10) / 10).toFixed(1).replace('.0', '');
+}
+
 function filterConfig() {
     var input = document.getElementById('configSearch');
     if (!input) return;
@@ -11516,6 +12278,21 @@ function filterConfig() {
         }
 
         if (filter.length > 0) {
+            var customInputs = groups[j].querySelectorAll('input[name^="values["], select[name^="values["], textarea[name^="values["]');
+            for (var ci = 0; ci < customInputs.length; ci++) {
+                var cName = customInputs[ci].getAttribute('name') || '';
+                var match = cName.match(/values\[(.*?)\]/);
+                var cKey = match ? match[1].toLowerCase() : '';
+                var cLabel = (customInputs[ci].closest('.col-12, .col-6, .col-md-6, .col-lg-4, .col-lg-3, .col-lg-2, div')?.querySelector('.config-label')?.textContent || '').toLowerCase();
+                if (cKey.includes(filter) || cLabel.includes(filter)) {
+                    hasVisibleItems = true;
+                    var parentDet = customInputs[ci].closest('details');
+                    while (parentDet) {
+                        parentDet.open = true;
+                        parentDet = parentDet.parentElement ? parentDet.parentElement.closest('details') : null;
+                    }
+                }
+            }
             groups[j].open = hasVisibleItems;
             groups[j].style.display = hasVisibleItems ? "" : "none";
         } else {
@@ -11736,12 +12513,33 @@ function initPlannedLoadWindowUi() {
     });
 
     const nativeSubmit = () => HTMLFormElement.prototype.submit.call(form);
+    const clearSubmitterProxy = () => {
+        const existing = document.getElementById('configEditorSubmitterProxy');
+        if (existing) existing.remove();
+    };
+    const bindSubmitterProxy = (submitter) => {
+        clearSubmitterProxy();
+        if (!submitter || !submitter.name) return;
+        const proxy = document.createElement('input');
+        proxy.type = 'hidden';
+        proxy.id = 'configEditorSubmitterProxy';
+        proxy.name = submitter.name;
+        proxy.value = submitter.value || '1';
+        form.appendChild(proxy);
+    };
     form.submit = function() {
+        clearSubmitterProxy();
         submitConfigEditorForm(form, nativeSubmit);
     };
     form.addEventListener('submit', (event) => {
         event.preventDefault();
         event.stopPropagation();
+        const submitter = event.submitter || null;
+        bindSubmitterProxy(submitter);
+        if (submitter && submitter.hasAttribute('data-config-isolated-action')) {
+            nativeSubmit();
+            return;
+        }
         submitConfigEditorForm(form, nativeSubmit);
     });
 }
@@ -14169,8 +14967,8 @@ document.addEventListener('DOMContentLoaded', () => {
                     headers: {'Content-Type': 'application/x-www-form-urlencoded'},
                     body
                 });
-                const data = await response.json();
-                if (!data || !data.success) throw new Error((data && data.message) || 'Fehler beim Speichern');
+                const data = await readConfirmedConfigJson(response);
+                if (data.success !== true) throw new Error(data.message || 'Fehler beim Speichern');
                 if (status) {
                     status.className = toggle.checked
                         ? 'badge rounded-pill bg-success-subtle text-success-emphasis ms-2'
@@ -14196,6 +14994,11 @@ document.addEventListener('DOMContentLoaded', function() {
         const selectorKey = focusKey.replace(/"/g, '\\"');
         const target = document.querySelector(`[name="values[${selectorKey}]"]`);
         if (target) {
+            let parentDetails = target.closest('details');
+            while (parentDetails) {
+                parentDetails.open = true;
+                parentDetails = parentDetails.parentElement ? parentDetails.parentElement.closest('details') : null;
+            }
             const group = target.closest('.config-group-el');
             if (group) {
                 document.querySelectorAll('.config-group-el').forEach(other => {

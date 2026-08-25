@@ -30,7 +30,11 @@ if __package__ in (None, ""):
     from Installer.installer_config import CONFIG_FILE, get_install_path, get_install_user, get_home_dir, get_www_data_gid, load_config
     from Installer.logging_manager import get_or_create_logger, log_task_completed, log_error, log_warning
     from Installer.config_manager import run_config_wizard
-    from Installer.config_secret_permissions import config_secret_dir_mode_text, config_secret_file_mode_text
+    from Installer.config_secret_permissions import (
+        config_secret_dir_mode,
+        config_secret_dir_mode_text,
+        config_secret_file_mode_text,
+    )
     from Installer.service_catalog import allowed_services, iter_modules
     from Installer.optional_service_contract import (
         configured_optional_services,
@@ -44,7 +48,11 @@ else:
     from .installer_config import CONFIG_FILE, get_install_path, get_install_user, get_home_dir, get_www_data_gid, load_config
     from .logging_manager import get_or_create_logger, log_task_completed, log_error, log_warning
     from .config_manager import run_config_wizard
-    from .config_secret_permissions import config_secret_dir_mode_text, config_secret_file_mode_text
+    from .config_secret_permissions import (
+        config_secret_dir_mode,
+        config_secret_dir_mode_text,
+        config_secret_file_mode_text,
+    )
     from .service_catalog import allowed_services, iter_modules
     from .optional_service_contract import (
         configured_optional_services,
@@ -639,6 +647,19 @@ def _install_user_in_www_data_group() -> bool:
         return True
 
 
+def _web_config_allowed_owners() -> set[str]:
+    """Erlaubt den atomaren Web-Publisher nur bei bestätigter Gruppenbindung."""
+    owners = {INSTALL_USER}
+    try:
+        user = pwd.getpwnam(INSTALL_USER)
+        www_data = grp.getgrnam("www-data")
+        if user.pw_gid == www_data.gr_gid or INSTALL_USER in www_data.gr_mem:
+            owners.add("www-data")
+    except Exception:
+        pass
+    return owners
+
+
 def _ensure_install_user_www_data_group() -> bool:
     """Nimmt den Install-User in www-data auf, damit 660-Config lesbar bleibt."""
     if _install_user_in_www_data_group():
@@ -892,17 +913,19 @@ def _mode5_user_start_request_nodes_safe(path, *, legacy_parent=False):
         allowed_parent_uids = {int(account.pw_uid), int(manager.pw_uid)}
         parent = os.lstat(os.path.dirname(path))
         parent_mode = stat.S_IMODE(parent.st_mode)
+        expected_parent_mode = int(config_secret_dir_mode())
+        required_parent_mode = (
+            expected_parent_mode & 0o777
+            if legacy_parent
+            else expected_parent_mode
+        )
         if (
             stat.S_ISLNK(parent.st_mode)
             or not stat.S_ISDIR(parent.st_mode)
             or bool(parent_mode & 0o002)
             or parent.st_uid not in allowed_parent_uids
             or parent.st_gid != int(group.gr_gid)
-            or (
-                parent_mode != 0o775
-                if legacy_parent
-                else parent_mode != 0o2775
-            )
+            or parent_mode != required_parent_mode
         ):
             return False
         contracts = (
@@ -944,7 +967,7 @@ def _mode5_user_start_request_surface_safe(
 def _repair_mode5_user_start_legacy_parent(
     path=WALLBOX_MODE5_USER_START_REQUEST_FILE,
 ):
-    """Hebt ausschließlich den bekannten 0775-Parent descriptorgebunden an."""
+    """Ergänzt nur dem konfigurierten Datenmodus das Setgid-Bit."""
 
     if _mode5_user_start_request_surface_safe(path):
         return True
@@ -958,6 +981,8 @@ def _repair_mode5_user_start_legacy_parent(
         account = pwd.getpwnam("www-data")
         manager = pwd.getpwnam(INSTALL_USER)
         allowed_parent_uids = {int(account.pw_uid), int(manager.pw_uid)}
+        expected_parent_mode = int(config_secret_dir_mode())
+        legacy_parent_mode = expected_parent_mode & 0o777
         flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
         flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(directory, flags)
@@ -967,17 +992,17 @@ def _repair_mode5_user_start_legacy_parent(
             or (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino)
             or current.st_uid not in allowed_parent_uids
             or current.st_gid != int(group.gr_gid)
-            or stat.S_IMODE(current.st_mode) != 0o775
+            or stat.S_IMODE(current.st_mode) != legacy_parent_mode
         ):
             return False
-        os.fchmod(descriptor, 0o2775)
+        os.fchmod(descriptor, expected_parent_mode)
         changed = os.fstat(descriptor)
         named = os.lstat(directory)
         if (
-            stat.S_IMODE(changed.st_mode) != 0o2775
+            stat.S_IMODE(changed.st_mode) != expected_parent_mode
             or (named.st_dev, named.st_ino) != (changed.st_dev, changed.st_ino)
             or named.st_uid not in allowed_parent_uids
-            or stat.S_IMODE(named.st_mode) != 0o2775
+            or stat.S_IMODE(named.st_mode) != expected_parent_mode
         ):
             return False
     except (KeyError, OSError, TypeError, ValueError):
@@ -1004,6 +1029,7 @@ def check_webportal_permissions(include_service_checks=True):
         return ", ".join(details) if details else "unbekannte Abweichung"
 
     issues = []
+    secret_dir_mode = config_secret_dir_mode_text()
     wp_path = "/var/www/html"
     if not os.path.lexists(wp_path):
         print(f"{RED}✗{RESET} {wp_path} existiert nicht – Webportal nicht installiert")
@@ -1047,12 +1073,12 @@ def check_webportal_permissions(include_service_checks=True):
             print(f"{GREEN}✓{RESET} {wp_path} hat korrekte Rechte (755)")
         # Sub-Ordner prüfen
         subfolders = [
-            (f"{wp_path}/tmp", "775"),
+            (f"{wp_path}/tmp", "2775"),
             (f"{wp_path}/ramdisk", "2775"),
-            (f"{wp_path}/data/history_backups", "775"),
-            (f"{wp_path}/data/luxtronik_archive", "775"),
-            (f"{wp_path}/logs", "775"),
-            (f"{wp_path}/data", "2775"),
+            (f"{wp_path}/data/history_backups", secret_dir_mode),
+            (f"{wp_path}/data/luxtronik_archive", secret_dir_mode),
+            (f"{wp_path}/logs", "2775"),
+            (f"{wp_path}/data", secret_dir_mode),
             (f"{wp_path}/data/matter-storage", "700")
         ]
         for folder_path, expected_mode in subfolders:
@@ -1364,6 +1390,386 @@ for _definition in FILE_DEFINITIONS:
                 _definition["mode"] = "755" if _definition.get("executable") else "644"
 
 
+def _permission_mount_id(descriptor):
+    """Bindet einen offenen Deskriptor zusätzlich zur Geräte-ID an seinen Mount."""
+
+    try:
+        with open(
+            f"/proc/self/fdinfo/{int(descriptor)}",
+            "r",
+            encoding="ascii",
+            errors="strict",
+        ) as handle:
+            payload = handle.read()
+    except OSError as exc:
+        raise RuntimeError(
+            "Die Mount-Bindung für die sichere Rechteprojektion ist nicht verfügbar"
+        ) from exc
+    for line in payload.splitlines():
+        if line.startswith("mnt_id:"):
+            value = line.partition(":")[2].strip()
+            if value.isdigit():
+                return value
+    raise RuntimeError("Die Mount-ID des Rechtepfads konnte nicht gebunden werden")
+
+
+def _copy_bound_permission_file(
+    parent_fd,
+    name,
+    source_fd,
+    *,
+    uid,
+    gid,
+    mode,
+    expected_mount_id,
+):
+    """Bricht einen Mehrfachlink atomar, ohne den fremden Inode zu verändern."""
+
+    temporary_name = f".e3dc-permissions-{os.getpid()}-{os.urandom(12).hex()}"
+    temporary_fd = -1
+    replaced = False
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+    try:
+        temporary_fd = os.open(temporary_name, flags, 0o600, dir_fd=parent_fd)
+        os.lseek(source_fd, 0, os.SEEK_SET)
+        while True:
+            chunk = os.read(source_fd, 1024 * 1024)
+            if not chunk:
+                break
+            offset = 0
+            while offset < len(chunk):
+                offset += os.write(temporary_fd, chunk[offset:])
+        source = os.fstat(source_fd)
+        os.utime(
+            temporary_fd,
+            ns=(int(source.st_atime_ns), int(source.st_mtime_ns)),
+        )
+        os.fchown(temporary_fd, int(uid), int(gid))
+        os.fchmod(temporary_fd, int(mode))
+        os.fsync(temporary_fd)
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != (source.st_dev, source.st_ino):
+            raise RuntimeError(
+                f"Rechtepfad wechselte vor dem sicheren Mehrfachlink-Austausch: {name}"
+            )
+        if _permission_mount_id(source_fd) != expected_mount_id:
+            raise RuntimeError(f"Rechtedatei liegt auf einem verschachtelten Mount: {name}")
+        os.replace(
+            temporary_name,
+            name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+        os.fsync(parent_fd)
+        secured = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(secured.st_mode)
+            or secured.st_nlink != 1
+            or secured.st_uid != int(uid)
+            or secured.st_gid != int(gid)
+            or stat.S_IMODE(secured.st_mode) != int(mode)
+        ):
+            raise RuntimeError(
+                f"Mehrfachlink-Rechteprojektion blieb unvollständig: {name}"
+            )
+        replaced = True
+    finally:
+        if temporary_fd >= 0:
+            os.close(temporary_fd)
+        if not replaced:
+            try:
+                os.unlink(temporary_name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+
+
+def _normalize_permission_tree_fd(
+    root,
+    contract,
+    *,
+    excluded_top_level=(),
+    reject_unsafe_entries=False,
+):
+    """Projiziert Baumrechte fd-relativ, nofollow-, mount- und hardlinksicher.
+
+    ``contract(relative, metadata, is_directory)`` liefert ``(uid, gid, mode)``.
+    Ein einzelner Wert ``None`` erhält die betreffende Metadatenkomponente; ein
+    vollständig leeres Ergebnis lässt den gebundenen Eintrag unverändert.
+    Symlinks und Spezialdateien werden niemals verfolgt oder verändert.
+    """
+
+    root = os.path.abspath(str(root))
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    if not nofollow or not directory:
+        raise RuntimeError("Sichere fd-relative Rechteprojektion ist nicht verfügbar")
+    before_root = os.lstat(root)
+    if stat.S_ISLNK(before_root.st_mode) or not stat.S_ISDIR(before_root.st_mode):
+        raise RuntimeError(f"Rechtewurzel ist kein echtes Verzeichnis: {root}")
+    root_fd = os.open(root, os.O_RDONLY | nofollow | directory | cloexec)
+    skipped = []
+    excluded = frozenset(str(item) for item in excluded_top_level)
+
+    def desired_values(metadata, result):
+        if result is None:
+            return None
+        uid, gid, mode = result
+        return (
+            metadata.st_uid if uid is None else int(uid),
+            metadata.st_gid if gid is None else int(gid),
+            stat.S_IMODE(metadata.st_mode) if mode is None else int(mode),
+        )
+
+    def verify_named(parent_fd, name, descriptor, *, uid, gid, mode, kind):
+        secured = os.fstat(descriptor)
+        named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            (secured.st_dev, secured.st_ino) != (named.st_dev, named.st_ino)
+            or secured.st_uid != uid
+            or secured.st_gid != gid
+            or stat.S_IMODE(secured.st_mode) != mode
+        ):
+            raise RuntimeError(f"{kind} blieb nach der Rechteprojektion nicht gebunden: {name}")
+
+    def normalize_regular(parent_fd, name, relative, metadata, mount_id):
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | nofollow | cloexec,
+            dir_fd=parent_fd,
+        )
+        try:
+            current = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(current.st_mode)
+                or (current.st_dev, current.st_ino)
+                != (metadata.st_dev, metadata.st_ino)
+                or _permission_mount_id(descriptor) != mount_id
+            ):
+                raise RuntimeError(
+                    f"Rechtedatei wechselte oder liegt auf einem verschachtelten Mount: "
+                    f"{os.path.join(root, *relative)}"
+                )
+            desired = desired_values(current, contract(relative, current, False))
+            if desired is None:
+                return
+            uid, gid, mode = desired
+            if current.st_nlink > 1:
+                _copy_bound_permission_file(
+                    parent_fd,
+                    name,
+                    descriptor,
+                    uid=uid,
+                    gid=gid,
+                    mode=mode,
+                    expected_mount_id=mount_id,
+                )
+                return
+            os.fchown(descriptor, uid, gid)
+            os.fchmod(descriptor, mode)
+            verify_named(
+                parent_fd,
+                name,
+                descriptor,
+                uid=uid,
+                gid=gid,
+                mode=mode,
+                kind="Rechtedatei",
+            )
+        finally:
+            os.close(descriptor)
+
+    def normalize_directory(parent_fd, name, relative, metadata, mount_id):
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | nofollow | directory | cloexec,
+            dir_fd=parent_fd,
+        )
+        try:
+            current = os.fstat(descriptor)
+            if (
+                not stat.S_ISDIR(current.st_mode)
+                or (current.st_dev, current.st_ino)
+                != (metadata.st_dev, metadata.st_ino)
+                or _permission_mount_id(descriptor) != mount_id
+            ):
+                raise RuntimeError(
+                    f"Rechteverzeichnis wechselte oder liegt auf einem verschachtelten Mount: "
+                    f"{os.path.join(root, *relative)}"
+                )
+            walk(descriptor, relative, mount_id)
+            desired = desired_values(current, contract(relative, current, True))
+            if desired is None:
+                return
+            uid, gid, mode = desired
+            os.fchown(descriptor, uid, gid)
+            os.fchmod(descriptor, mode)
+            verify_named(
+                parent_fd,
+                name,
+                descriptor,
+                uid=uid,
+                gid=gid,
+                mode=mode,
+                kind="Rechteverzeichnis",
+            )
+        finally:
+            os.close(descriptor)
+
+    def walk(parent_fd, relative, mount_id):
+        for name in sorted(os.listdir(parent_fd)):
+            if not relative and name in excluded:
+                continue
+            child_relative = (*relative, name)
+            metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if stat.S_ISDIR(metadata.st_mode):
+                normalize_directory(parent_fd, name, child_relative, metadata, mount_id)
+            elif stat.S_ISREG(metadata.st_mode):
+                normalize_regular(parent_fd, name, child_relative, metadata, mount_id)
+            else:
+                skipped.append(os.path.join(root, *child_relative))
+                if reject_unsafe_entries:
+                    raise RuntimeError(
+                        f"Symlink oder Spezialdatei im Rechtebaum: {skipped[-1]}"
+                    )
+
+    try:
+        opened_root = os.fstat(root_fd)
+        if (
+            not stat.S_ISDIR(opened_root.st_mode)
+            or (opened_root.st_dev, opened_root.st_ino)
+            != (before_root.st_dev, before_root.st_ino)
+        ):
+            raise RuntimeError(f"Rechtewurzel wechselte beim Öffnen: {root}")
+        mount_id = _permission_mount_id(root_fd)
+        walk(root_fd, (), mount_id)
+        desired = desired_values(opened_root, contract((), opened_root, True))
+        if desired is not None:
+            uid, gid, mode = desired
+            os.fchown(root_fd, uid, gid)
+            os.fchmod(root_fd, mode)
+            secured = os.fstat(root_fd)
+            named = os.lstat(root)
+            if (
+                stat.S_ISLNK(named.st_mode)
+                or not stat.S_ISDIR(named.st_mode)
+                or (secured.st_dev, secured.st_ino) != (named.st_dev, named.st_ino)
+                or secured.st_uid != uid
+                or secured.st_gid != gid
+                or stat.S_IMODE(secured.st_mode) != mode
+            ):
+                raise RuntimeError(f"Rechtewurzel blieb nach der Projektion nicht gebunden: {root}")
+    finally:
+        os.close(root_fd)
+    if skipped:
+        perm_logger.warning(
+            "Rechteprojektion ließ %d Symlink-/Spezialeinträge unverändert: %s",
+            len(skipped),
+            ", ".join(skipped[:8]),
+        )
+    return {"changed_surface": root, "skipped": tuple(skipped)}
+
+
+def _web_runtime_permission_contract(top_name, install_uid, www_uid, www_gid, config):
+    data_dir_mode = int(config_secret_dir_mode(config))
+    data_file_mode = int(config_secret_file_mode_text(config), 8)
+
+    def contract(relative, metadata, is_directory):
+        def desired(uid, gid, mode=None):
+            target_mode = stat.S_IMODE(metadata.st_mode) if mode is None else int(mode)
+            if (
+                metadata.st_uid == int(uid)
+                and metadata.st_gid == int(gid)
+                and stat.S_IMODE(metadata.st_mode) == target_mode
+            ):
+                return None
+            return int(uid), int(gid), target_mode
+
+        if top_name == "data":
+            if relative and relative[0] == "matter-storage":
+                return desired(install_uid, www_gid, 0o700 if is_directory else 0o600)
+            if relative and relative[0] == ".wallbox_plan_jobs":
+                return desired(www_uid, www_gid, 0o700 if is_directory else 0o600)
+            if relative[:2] == ("config_backups", "aux_inverter_migration"):
+                return desired(install_uid, www_gid, 0o700 if is_directory else 0o600)
+            if relative and relative[0] in {
+                "config_backups",
+                "history_backups",
+                "luxtronik_archive",
+            }:
+                return desired(
+                    install_uid,
+                    www_gid,
+                    data_dir_mode if is_directory else data_file_mode,
+                )
+            if relative in {
+                ("e3dc_v4.json",),
+            }:
+                return desired(
+                    www_uid,
+                    www_gid,
+                    data_dir_mode if is_directory else data_file_mode,
+                )
+            if relative in {
+                ("wallbox_mode5_user_start_request.json",),
+                ("wallbox_mode5_user_start_request.json.lock",),
+            }:
+                return desired(
+                    www_uid,
+                    www_gid,
+                    data_dir_mode if is_directory else 0o660,
+                )
+            return desired(
+                install_uid,
+                www_gid,
+                data_dir_mode if not relative and is_directory else None,
+            )
+        if top_name == "history_backups":
+            return desired(install_uid, www_gid, 0o750 if is_directory else 0o640)
+        if top_name == "tmp" and relative and relative[0] in {
+            "rule_calm_current",
+            "rule_calm_uploads",
+        }:
+            return desired(www_uid, www_gid, 0o700 if is_directory else 0o600)
+        if (
+            top_name == "ramdisk"
+            and relative
+            and relative[0].startswith("rule_calm_analysis.json")
+        ):
+            return desired(www_uid, www_gid, 0o2775 if is_directory else 0o600)
+        return desired(
+            install_uid,
+            www_gid,
+            0o2775 if not relative and is_directory else None,
+        )
+
+    return contract
+
+
+def _normalize_web_runtime_permissions(web_root="/var/www/html", config=None):
+    """Normalisiert nur freigegebene Web-Schreibflächen mit eigener Mount-Bindung."""
+
+    account = pwd.getpwnam(INSTALL_USER)
+    web_account = pwd.getpwnam("www-data")
+    web_group = grp.getgrnam("www-data")
+    runtime_config = dict(config or load_config() or {})
+    for top_name in ("data", "history_backups", "logs", "ramdisk", "tmp"):
+        target = os.path.join(os.path.abspath(str(web_root)), top_name)
+        if not os.path.lexists(target):
+            continue
+        _normalize_permission_tree_fd(
+            target,
+            _web_runtime_permission_contract(
+                top_name,
+                account.pw_uid,
+                web_account.pw_uid,
+                web_group.gr_gid,
+                runtime_config,
+            ),
+        )
+    return True
+
+
 def harden_web_program_permissions(web_root="/var/www/html", install_user=None, web_group="www-data"):
     """Hält den Web-Programmbaum lesbar, aber für den Webprozess unveränderlich."""
 
@@ -1630,7 +2036,11 @@ def check_file_permissions():
             mode = oct(st.st_mode)[-3:]
             owner = pwd.getpwuid(st.st_uid).pw_name
             group = grp.getgrgid(st.st_gid).gr_name
-            owner_ok = owner == expected_owner
+            allowed_owners = {expected_owner}
+            if os.path.abspath(path) == "/var/www/html/data/e3dc_v4.json":
+                allowed_owners = _web_config_allowed_owners()
+            owner_ok = owner in allowed_owners
+            expected_owner_text = " oder ".join(sorted(allowed_owners))
             
             # Toleranz für RAM-Disk & TMP Dateien: Webserver (www-data) oder System-Dienste (root) erstellen diese oft.
             if not owner_ok and expected_owner == INSTALL_USER and owner in ["www-data", "root"]:
@@ -1652,10 +2062,10 @@ def check_file_permissions():
             exec_ok = not is_executable or (is_executable and bool(st.st_mode & 0o111))
             if owner_ok and group_ok and mode_ok and exec_ok:
                 exec_str = ", ausführbar" if is_executable else ""
-                print(f"{GREEN}✓{RESET} {file_name} OK ({expected_owner}:{expected_group}, {expected_mode}{exec_str})")
+                print(f"{GREEN}✓{RESET} {file_name} OK ({expected_owner_text}:{expected_group}, {expected_mode}{exec_str})")
             else:
                 details = []
-                if not owner_ok: details.append(f"Owner={owner} (soll: {expected_owner})")
+                if not owner_ok: details.append(f"Owner={owner} (soll: {expected_owner_text})")
                 if not group_ok: details.append(f"Gruppe={group} (soll: {expected_group})")
                 if not mode_ok: details.append(f"Modus={mode} (soll: {expected_mode})")
                 if not exec_ok: details.append("nicht ausführbar")
@@ -1689,20 +2099,38 @@ def fix_permissions(issues):
             print(f"{GREEN}✓{RESET} {INSTALL_HOME}: Execute-Bit für Others gesetzt")
         else:
             success = False
-    if "owner" in issues:
-        print(f"  → Setze Besitzer rekursiv: {INSTALL_PATH} -> {INSTALL_USER}:{INSTALL_GROUP}")
-        result = run_command(f"sudo chown -R {INSTALL_USER}:{INSTALL_GROUP} {INSTALL_PATH}")
-        if result['success']:
-            print(f"{GREEN}✓{RESET} {INSTALL_PATH}: Besitzer auf {INSTALL_USER}:{INSTALL_GROUP} gesetzt")
-        else:
-            success = False
+    if "owner" in issues or "mode" in issues:
+        print(
+            f"  → Projiziere Installationsrechte sicher: "
+            f"{INSTALL_PATH} -> {INSTALL_USER}:{INSTALL_GROUP}, Verzeichnisse 755"
+        )
+        try:
+            account = pwd.getpwnam(INSTALL_USER)
+            group = grp.getgrnam(INSTALL_GROUP)
+            configured_venv = str(load_config().get("venv_name") or ".venv_e3dc")
 
-    if "mode" in issues:
-        print(f"  → Setze Verzeichnisrechte rekursiv: {INSTALL_PATH} -> 755")
-        result = run_command(f"sudo find {INSTALL_PATH} -type d -exec chmod 755 {{}} +")
-        if result['success']:
-            print(f"{GREEN}✓{RESET} {INSTALL_PATH}: Rechte auf 755 gesetzt")
-        else:
+            def install_contract(_relative, metadata, is_directory):
+                return (
+                    account.pw_uid if "owner" in issues else None,
+                    group.gr_gid if "owner" in issues else None,
+                    0o755 if "mode" in issues and is_directory else None,
+                )
+
+            _normalize_permission_tree_fd(
+                INSTALL_PATH,
+                install_contract,
+                excluded_top_level={
+                    ".git",
+                    ".venv",
+                    ".venv_e3dc",
+                    "venv",
+                    configured_venv,
+                },
+            )
+            print(f"{GREEN}✓{RESET} {INSTALL_PATH}: Rechte fd-relativ und mountgebunden projiziert")
+        except Exception as exc:
+            print(f"{RED}✗{RESET} Sichere Installations-Rechteprojektion fehlgeschlagen: {exc}")
+            perm_logger.error("Sichere Installations-Rechteprojektion fehlgeschlagen: %s", exc)
             success = False
     if "installer_dir" in issues:
         print(f"  -> Setze Installer-Verzeichnisrechte: {INSTALLER_DIR} -> {INSTALL_USER}:{INSTALL_GROUP}, 755")
@@ -1712,31 +2140,34 @@ def fix_permissions(issues):
             print(f"{GREEN}OK{RESET} {INSTALLER_DIR}: fuer Web-Diagnose betretbar")
         else:
             success = False
-    if "venv_owner" in issues:
+    if "venv_owner" in issues or "venv_mode" in issues:
         venv_name = load_config().get("venv_name", ".venv_e3dc")
-        print(f"  → Setze Besitzer für {venv_name}: {INSTALL_USER}:{INSTALL_USER}")
+        print(f"  → Projiziere Python-Umgebung sicher: {venv_name}")
         # Pfad erneut ermitteln
         venv_path = os.path.join(INSTALL_HOME, venv_name)
         if not os.path.exists(venv_path) and os.path.exists(os.path.join(INSTALL_PATH, venv_name)):
             venv_path = os.path.join(INSTALL_PATH, venv_name)
-            
-        result = run_command(f"sudo chown -R {INSTALL_USER}:{INSTALL_USER} {venv_path}")
-        if result['success']:
-            print(f"{GREEN}✓{RESET} {venv_name} Besitzer korrigiert")
-        else:
-            success = False
-    if "venv_mode" in issues:
-        venv_name = load_config().get("venv_name", ".venv_e3dc")
-        print(f"  → Setze Rechte für {venv_name}/bin: +x")
-        # Pfad erneut ermitteln
-        venv_bin = os.path.join(INSTALL_HOME, venv_name, "bin")
-        if not os.path.exists(venv_bin) and os.path.exists(os.path.join(INSTALL_PATH, venv_name, "bin")):
-            venv_bin = os.path.join(INSTALL_PATH, venv_name, "bin")
-            
-        result = run_command(f"sudo chmod -R +x {venv_bin}")
-        if result['success']:
-            print(f"{GREEN}✓{RESET} {venv_name} Executables korrigiert")
-        else:
+        try:
+            account = pwd.getpwnam(INSTALL_USER)
+
+            def venv_contract(relative, metadata, is_directory):
+                in_bin = bool(relative and relative[0] == "bin")
+                mode = (
+                    stat.S_IMODE(metadata.st_mode) | 0o111
+                    if "venv_mode" in issues and in_bin
+                    else None
+                )
+                return (
+                    account.pw_uid if "venv_owner" in issues else None,
+                    account.pw_gid if "venv_owner" in issues else None,
+                    mode,
+                )
+
+            _normalize_permission_tree_fd(venv_path, venv_contract)
+            print(f"{GREEN}✓{RESET} {venv_name}: Rechte sicher projiziert")
+        except Exception as exc:
+            print(f"{RED}✗{RESET} Sichere venv-Rechteprojektion fehlgeschlagen: {exc}")
+            perm_logger.error("Sichere venv-Rechteprojektion fehlgeschlagen: %s", exc)
             success = False
     if "notdir" in issues:
         print(f"{RED}✗{RESET} {INSTALL_PATH} ist keine Ordnerstruktur")
@@ -1773,9 +2204,9 @@ def fix_webportal_permissions(issues):
     matter_storage = f"{wp_path}/data/matter-storage"
     wallbox_plan_jobs = WALLBOX_PLAN_JOB_ROOT
     mode5_request = WALLBOX_MODE5_USER_START_REQUEST_FILE
-    mode5_request_lock = mode5_request + ".lock"
-    v4_json_path = f"{wp_path}/data/e3dc_v4.json"
     config_backup_dir = f"{wp_path}/data/config_backups"
+    secret_dir_mode = config_secret_dir_mode_text()
+    secret_file_mode = config_secret_file_mode_text()
     if "wp_unsafe" in issues:
         print(
             f"{RED}✗{RESET} Unsicherer Webroot wird nicht automatisch "
@@ -1862,19 +2293,14 @@ def fix_webportal_permissions(issues):
         else:
             success = False
     if "tmp_missing" in issues or "tmp_mode" in issues or "tmp_not_writable" in issues:
-        print(f"  → Setze tmp-Rechte: {wp_path}/tmp -> 775 (nicht-rekursiv)")
-        result = run_command(f"sudo chmod 775 {wp_path}/tmp")
+        print(f"  → Setze tmp-Rechte: {wp_path}/tmp -> 2775 (nicht-rekursiv)")
+        result = run_command(f"sudo chmod 2775 {wp_path}/tmp")
         if result['success']:
             print(f"{GREEN}✓{RESET} tmp-Rechte korrigiert")
         else:
             success = False
     if "tmp_owner" in issues:
-        print(f"  → Setze tmp-Besitzer rekursiv: {wp_path}/tmp -> {INSTALL_USER}:www-data")
-        result = run_command(f"sudo chown -R {INSTALL_USER}:www-data {wp_path}/tmp")
-        if result['success']:
-            print(f"{GREEN}✓{RESET} tmp-Besitzer korrigiert")
-        else:
-            success = False
+        print("  → tmp-Besitzer wird mit der sicheren Web-Laufzeitprojektion korrigiert")
     ramdisk_issues = {
         "ramdisk_missing",
         "ramdisk_unsafe",
@@ -1903,52 +2329,48 @@ def fix_webportal_permissions(issues):
         result = run_command(f"sudo mkdir -p {wp_path}/data/history_backups")
         if result['success']:
             print(f"{GREEN}✓{RESET} history_backups-Ordner erstellt")
-            # Migration alter Backups falls vorhanden
-            if os.path.exists(f"{wp_path}/tmp/history_backups"):
-                print(f"  → Migriere alte Backups nach data/history_backups...")
-                run_command(f"sudo cp -r {wp_path}/tmp/history_backups/* {wp_path}/data/history_backups/ 2>/dev/null")
-                run_command(f"sudo rm -rf {wp_path}/tmp/history_backups")
         else:
             success = False
     if "history_backups_owner" in issues:
-        print(f"  → Setze Backup-Verzeichnis Besitzer: {wp_path}/data/history_backups -> {INSTALL_USER}:www-data")
-        result = run_command(f"sudo chown -R {INSTALL_USER}:www-data {wp_path}/data/history_backups")
-        if result['success']:
-            print(f"{GREEN}✓{RESET} history_backups-Besitzer korrigiert")
-        else:
-            success = False
+        print("  → Backup-Besitzer wird mit der sicheren Web-Laufzeitprojektion korrigiert")
     if "history_backups_missing" in issues or "history_backups_mode" in issues:
-        print(f"  → Setze Backup-Verzeichnis Rechte: {wp_path}/data/history_backups -> 775")
-        result = run_command(f"sudo chmod -R 775 {wp_path}/data/history_backups")
-        if result['success']:
-            print(f"{GREEN}✓{RESET} history_backups-Rechte korrigiert")
-        else:
-            success = False
+        print(
+            f"  → Setze Backup-Verzeichnis Rechte: "
+            f"{wp_path}/data/history_backups -> "
+            f"{secret_dir_mode}/{secret_file_mode}"
+        )
+        print("    fd-relative Projektion vorgemerkt")
 
     if "luxtronik_archive_missing" in issues:
         print(f"  → Erstelle Archiv-Verzeichnis: {wp_path}/data/luxtronik_archive")
         result = run_command(f"sudo mkdir -p {wp_path}/data/luxtronik_archive")
         if result['success']:
             print(f"{GREEN}✓{RESET} luxtronik_archive-Ordner erstellt")
-            if os.path.exists(f"{wp_path}/tmp/luxtronik_archive"):
-                print(f"  → Migriere altes Luxtronik-Archiv nach data/luxtronik_archive...")
-                run_command(f"sudo cp -r {wp_path}/tmp/luxtronik_archive/* {wp_path}/data/luxtronik_archive/ 2>/dev/null")
-                run_command(f"sudo rm -rf {wp_path}/tmp/luxtronik_archive")
         else:
             success = False
     if "luxtronik_archive_owner" in issues:
-        print(f"  → Setze Archiv-Verzeichnis Besitzer: {wp_path}/data/luxtronik_archive -> {INSTALL_USER}:www-data")
-        result = run_command(f"sudo chown -R {INSTALL_USER}:www-data {wp_path}/data/luxtronik_archive")
-        if result['success']:
-            print(f"{GREEN}✓{RESET} luxtronik_archive-Besitzer korrigiert")
-        else:
-            success = False
+        print("  → Archiv-Besitzer wird mit der sicheren Web-Laufzeitprojektion korrigiert")
     if "luxtronik_archive_missing" in issues or "luxtronik_archive_mode" in issues:
-        print(f"  → Setze Archiv-Verzeichnis Rechte: {wp_path}/data/luxtronik_archive -> 775")
-        result = run_command(f"sudo chmod -R 775 {wp_path}/data/luxtronik_archive")
-        if result['success']:
-            print(f"{GREEN}✓{RESET} luxtronik_archive-Rechte korrigiert")
-        else:
+        print(
+            f"  → Setze Archiv-Verzeichnis Rechte: "
+            f"{wp_path}/data/luxtronik_archive -> "
+            f"{secret_dir_mode}/{secret_file_mode}"
+        )
+        print("    fd-relative Projektion vorgemerkt")
+
+    if "logs_missing" in issues:
+        print(f"  → Erstelle Log-Verzeichnis: {wp_path}/logs")
+        result = run_command(
+            f"sudo install -d -m 2775 -o {INSTALL_USER} -g www-data {wp_path}/logs"
+        )
+        if not result['success']:
+            success = False
+    if "logs_owner" in issues:
+        print("  → Log-Besitzer wird mit der sicheren Web-Laufzeitprojektion korrigiert")
+    if "logs_missing" in issues or "logs_mode" in issues:
+        print(f"  → Setze Log-Verzeichnis Rechte: {wp_path}/logs -> 2775")
+        result = run_command(f"sudo chmod 2775 {wp_path}/logs")
+        if not result['success']:
             success = False
 
     if "matter-storage_missing" in issues:
@@ -1962,26 +2384,12 @@ def fix_webportal_permissions(issues):
         else:
             success = False
     if "matter-storage_owner" in issues and "matter-storage_unsafe" not in issues:
-        print(f"  → Setze Matter-Storage Besitzer: {wp_path}/data/matter-storage -> {INSTALL_USER}:www-data")
-        result = run_command(
-            f"sudo find {wp_path}/data/matter-storage -xdev "
-            f"\\( -type d -o -type f \\) -exec chown {INSTALL_USER}:www-data {{}} +"
-        )
-        if result['success']:
-            print(f"{GREEN}✓{RESET} matter-storage-Besitzer korrigiert")
-        else:
-            success = False
+        print("  → Matter-Storage-Besitzer wird fd-relativ korrigiert")
     if (
         ("matter-storage_missing" in issues or "matter-storage_mode" in issues)
         and "matter-storage_unsafe" not in issues
     ):
-        print(f"  → Setze Matter-Storage Rechte: {wp_path}/data/matter-storage -> 700/600")
-        result_dirs = run_command(f"sudo find {wp_path}/data/matter-storage -xdev -type d -exec chmod 00700 {{}} +")
-        result_files = run_command(f"sudo find {wp_path}/data/matter-storage -xdev -type f -exec chmod 00600 {{}} +")
-        if result_dirs['success'] and result_files['success']:
-            print(f"{GREEN}✓{RESET} matter-storage-Rechte korrigiert")
-        else:
-            success = False
+        print(f"  → Matter-Storage-Rechte werden fd-relativ auf 700/600 gesetzt")
     if "matter-storage_unsafe" in issues:
         print(f"{RED}✗{RESET} Matter-Storage enthält unsichere Links oder Sonderdateien; keine automatische Änderung.")
         success = False
@@ -1994,16 +2402,15 @@ def fix_webportal_permissions(issues):
         else:
             success = False
     if "data_owner" in issues:
-        print(f"  → Setze Datenbank-Verzeichnis Besitzer: {wp_path}/data -> {INSTALL_USER}:www-data")
-        run_command(
-            f"sudo find -P {wp_path}/data "
-            f"\\( -path {matter_storage} -o -path {wallbox_plan_jobs} "
-            f"-o -path {mode5_request} -o -path {mode5_request_lock} \\) -prune -o "
-            f"\\( -type d -o -type f \\) -exec chown {INSTALL_USER}:www-data {{}} +"
-        )
+        print("  → Daten-Besitzer wird mit typisierten Ausnahmen fd-relativ korrigiert")
     if "data_missing" in issues or "data_mode" in issues:
-        print(f"  -> Setze Datenbank-Verzeichnis Rechte: {wp_path}/data -> 2775")
-        run_command(f"sudo chmod 2775 {wp_path}/data")  # KEIN -R: Unterverzeichnisse (history_backups, luxtronik_archive) haben eigene Soll-Rechte!
+        print(
+            f"  -> Setze Datenbank-Verzeichnis Rechte: "
+            f"{wp_path}/data -> {secret_dir_mode}"
+        )
+        result = run_command(f"sudo chmod {secret_dir_mode} {wp_path}/data")
+        if not result['success']:
+            success = False
 
     # Der Planner-Transaktionsbaum gehört ausschließlich dem PHP-Prozess.
     # Alle breiten Web-/data-Reparaturen prunen ihn; erst danach wird seine
@@ -2027,52 +2434,38 @@ def fix_webportal_permissions(issues):
             "  → Setze privaten Wallbox-Planer-Transaktionsbaum: "
             f"{wallbox_plan_jobs} -> www-data:www-data 700/600"
         )
-        owner_result = run_command(
-            f"sudo find -P {wallbox_plan_jobs} -xdev "
-            f"\\( -type d -o -type f \\) -exec chown www-data:www-data {{}} +"
+        print("    fd-relative Projektion vorgemerkt")
+
+    if os.path.isdir(config_backup_dir):
+        print(
+            f"  -> Config-Backup-Rechte werden fd-relativ auf "
+            f"{secret_dir_mode}/{secret_file_mode} projiziert"
         )
-        directory_result = run_command(
-            f"sudo find -P {wallbox_plan_jobs} -xdev -type d -exec chmod 00700 {{}} +"
-        )
-        file_result = run_command(
-            f"sudo find -P {wallbox_plan_jobs} -xdev -type f -exec chmod 00600 {{}} +"
-        )
-        if not (
-            owner_result["success"]
-            and directory_result["success"]
-            and file_result["success"]
-        ):
-            print(f"{RED}✗{RESET} Private Wallbox-Planer-Rechte konnten nicht exakt gesetzt werden.")
+
+    try:
+        print("  → Projiziere alle Web-Laufzeitrechte fd-relativ und mountgebunden")
+        _normalize_web_runtime_permissions(wp_path, config=load_config())
+        print(f"{GREEN}✓{RESET} Web-Laufzeitrechte sicher projiziert")
+    except Exception as exc:
+        print(f"{RED}✗{RESET} Sichere Web-Laufzeitprojektion fehlgeschlagen: {exc}")
+        perm_logger.error("Sichere Web-Laufzeitprojektion fehlgeschlagen: %s", exc)
+        success = False
+
+    if os.path.lexists(matter_storage):
+        remaining = _private_matter_storage_issues(matter_storage)
+        if remaining:
+            print(
+                f"{RED}✗{RESET} Private Matter-Rechte bleiben unvollständig: "
+                + ", ".join(sorted(remaining))
+            )
             success = False
+    if os.path.lexists(wallbox_plan_jobs):
         remaining = _private_wallbox_plan_job_issues(wallbox_plan_jobs)
         if remaining:
             print(
                 f"{RED}✗{RESET} Private Wallbox-Planer-Rechte bleiben unvollständig: "
                 + ", ".join(sorted(remaining))
             )
-            success = False
-
-    # Explizit e3dc_v4.json Rechte reparieren (kann nach WinSCP-Direktbearbeitung falsch sein)
-    if os.path.exists(v4_json_path):
-        print(f"  -> Setze e3dc_v4.json Rechte: {v4_json_path} -> {INSTALL_USER}:www-data {CONFIG_SECRET_FILE_MODE}")
-        run_command(f"sudo chown {INSTALL_USER}:www-data {v4_json_path}")
-        run_command(f"sudo chmod {CONFIG_SECRET_FILE_MODE} {v4_json_path}")
-        print(f"{GREEN}✓{RESET} e3dc_v4.json Rechte korrigiert")
-
-    if os.path.isdir(config_backup_dir):
-        print(f"  -> Setze Config-Backup-Rechte: {config_backup_dir} -> {INSTALL_USER}:www-data {CONFIG_SECRET_DIR_MODE}/{CONFIG_SECRET_FILE_MODE}")
-        run_command(f"sudo chown -R {INSTALL_USER}:www-data {config_backup_dir}")
-        migration_backup_dir = f"{config_backup_dir}/aux_inverter_migration"
-        run_command(
-            f"sudo find -P {config_backup_dir} -path {migration_backup_dir} -prune -o "
-            f"-type d -exec chmod {CONFIG_SECRET_DIR_MODE} {{}} +"
-        )
-        run_command(
-            f"sudo find -P {config_backup_dir} -path {migration_backup_dir} -prune -o "
-            f"-type f -exec chmod {CONFIG_SECRET_FILE_MODE} {{}} +"
-        )
-        if not _harden_aux_inverter_migration_backups(migration_backup_dir):
-            print(f"{RED}✗{RESET} Zusatz-WR-Migrationsbackups konnten nicht sicher gehärtet werden")
             success = False
 
     if "apache_service" in issues:
@@ -2150,15 +2543,24 @@ def _harden_aux_inverter_migration_backups(path):
         return True
     if not _aux_inverter_migration_backup_structure_safe(path):
         return False
-    quoted = shlex.quote(path)
-    for command in (
-        f"sudo chmod 00700 {quoted}",
-        f"sudo find -P {quoted} -type d -exec chmod 00700 {{}} +",
-        f"sudo find -P {quoted} -type f -exec chmod 00600 {{}} +",
-    ):
-        result = run_command(command, timeout=10)
-        if not isinstance(result, dict) or not result.get("success"):
-            return False
+    try:
+        account = pwd.getpwnam(INSTALL_USER)
+        group = grp.getgrnam("www-data")
+        _normalize_permission_tree_fd(
+            path,
+            lambda _relative, _metadata, is_directory: (
+                account.pw_uid,
+                group.gr_gid,
+                0o700 if is_directory else 0o600,
+            ),
+            reject_unsafe_entries=True,
+        )
+    except Exception as exc:
+        perm_logger.error(
+            "Zusatz-WR-Migrationsbackups konnten nicht sicher gehärtet werden: %s",
+            exc,
+        )
+        return False
     return _verify_aux_inverter_migration_backup_modes(path)
 
 
@@ -2167,35 +2569,48 @@ def cleanup_root_owned_files():
     print("\n■ Prüfe auf root-eigene Dateien…\n")
     
     paths_to_check = [
-        (INSTALL_PATH, f"{INSTALL_USER}:{INSTALL_USER}", False),
-        (INSTALL_ROOT, f"{INSTALL_USER}:www-data", False),
-        # Der Webroot selbst bleibt absichtlich root:www-data 0755 und schützt
-        # den Namen des RAM-Disk-Mountpoints. Nur darunter liegende alte
-        # root-Dateien werden dem Installationsnutzer zurückgegeben.
-        ("/var/www/html", f"{INSTALL_USER}:www-data", True),
+        (INSTALL_PATH, INSTALL_USER, INSTALL_GROUP),
+        (INSTALL_ROOT, INSTALL_USER, "www-data"),
     ]
 
     try:
-        for base_dir, correct_owner, preserve_root in paths_to_check:
-            if not os.path.exists(base_dir): continue
-            if preserve_root:
-                # Den aktiven Webbaum nie mit einem pathbasierten
-                # find/chown-Lauf anfassen. Der fd-relative Hardener schützt
-                # zuerst die Eltern und ändert anschließend nur gebundene
-                # Inodes; die vier Laufzeitwurzeln bleiben separat verwaltet.
-                if not harden_web_program_permissions(
-                    web_root=base_dir,
-                    install_user=INSTALL_USER,
-                    web_group="www-data",
-                ):
-                    return False
+        seen = set()
+        configured_venv = str(load_config().get("venv_name") or ".venv_e3dc")
+        for base_dir, owner_name, group_name in paths_to_check:
+            canonical = os.path.abspath(base_dir)
+            if canonical in seen or not os.path.exists(canonical):
                 continue
-            # Schnellere, systemnahe Bereinigung (ignoriert .git und .venv)
-            min_depth = " -mindepth 1" if preserve_root else ""
-            cmd = f"sudo find '{base_dir}' -xdev{min_depth} -path '*/.git*' -prune -o -path '*/.venv*' -prune -o -user root -exec chown {correct_owner} {{}} +"
-            result = run_command(cmd)
-            if not isinstance(result, dict) or not result.get("success"):
+            seen.add(canonical)
+            account = pwd.getpwnam(owner_name)
+            group = grp.getgrnam(group_name)
+
+            def root_owned_contract(_relative, metadata, _is_directory):
+                if metadata.st_uid != 0:
+                    return None
+                return account.pw_uid, group.gr_gid, None
+
+            _normalize_permission_tree_fd(
+                canonical,
+                root_owned_contract,
+                excluded_top_level={
+                    ".git",
+                    ".venv",
+                    ".venv_e3dc",
+                    "venv",
+                    configured_venv,
+                },
+            )
+        # Der Webroot selbst bleibt root-kontrolliert; Programminhalte und
+        # Laufzeitflächen werden durch zwei getrennte fd-relative Verträge
+        # normalisiert.
+        if os.path.exists("/var/www/html"):
+            if not harden_web_program_permissions(
+                web_root="/var/www/html",
+                install_user=INSTALL_USER,
+                web_group="www-data",
+            ):
                 return False
+            _normalize_web_runtime_permissions("/var/www/html", config=load_config())
     except Exception as e:
         print(f"{RED}✗{RESET} Fehler beim Scannen: {e}")
         return False

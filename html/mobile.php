@@ -34,26 +34,28 @@ if (isset($_POST['save_lux_global'])) {
     $paths = getInstallPaths();
     $val = isset($_POST['lux_active']) ? '1' : '0';
 
-    // V4 JSON schreiben (Single Source of Truth)
-    $v4Path = '/var/www/html/data/e3dc_v4.json';
-    $v4Data = @json_decode(@file_get_contents($v4Path), true) ?? [];
-    $v4Data['luxtronik'] = $val;
-    $json = json_encode($v4Data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
-    if ($json !== false) e3dcWriteJsonAtomic($v4Path, $json);
-    @unlink('/var/www/html/ramdisk/e3dc_config_cache.json');
-
-    if (e3dcIsDockerEnvironment()) {
-        $python = getPythonInterpreter();
-        $script = !empty($paths['valid'])
-            ? rtrim($paths['install_path'], '/') . '/Installer/luxtronik/energy_manager.py'
-            : '';
-        if ($script !== '' && is_file($script)) {
-            shell_exec("pkill -f 'energy_manager.py'");
-            sleep(1);
-            shell_exec("nohup " . escapeshellarg($python) . " " . escapeshellarg($script) . " > /var/www/html/logs/energy_manager.log 2>&1 &");
-        }
-    } else {
-        e3dcRunServiceWrapperAction('restart', ['energy_manager']);
+    if (!saveE3dcConfigValue('luxtronik', $val)) {
+        http_response_code(500);
+        echo errorMessage(
+            'Luxtronik-Einstellung nicht gespeichert',
+            'Die bestehende Konfiguration blieb unverändert; der Dienst wurde nicht neu gestartet. '
+            . 'Bitte führe im Installationscenter einmal „Rechte reparieren“ aus und versuche es erneut.'
+        );
+        exit;
+    }
+    if (!e3dcRemoveConfigCacheFailClosed('/var/www/html/ramdisk/e3dc_config_cache.json')) {
+        http_response_code(500);
+        echo errorMessage('Luxtronik-Einstellung gespeichert, Cache nicht entfernt', 'Der Dienst wurde nicht neu gestartet. Bitte führe „Rechte reparieren“ aus.');
+        exit;
+    }
+    $restart = e3dcRestartEnergyManagerFromWeb($paths);
+    if (empty($restart['success'])) {
+        http_response_code(500);
+        echo errorMessage(
+            'Luxtronik-Einstellung gespeichert, Dienstneustart nicht bestätigt',
+            (string)($restart['message'] ?? 'Bitte Dienststatus prüfen und den Neustart erneut auslösen.')
+        );
+        exit;
     }
     header("Location: mobile.php?seite=config");
     exit;
@@ -870,6 +872,7 @@ if (in_array($seite, $protectedPages) && !isWebAuthenticated()) {
                 </span>
                 <?= renderConnectionBadge() ?>
                 <i id="mobile-darkmode-icon" class="fas fa-<?= $darkMode ? 'sun' : 'moon' ?> text-secondary ms-2" style="cursor:pointer;" onclick="toggleDarkMode(this)"></i>
+                <span id="theme-save-status" class="small ms-1" role="status" aria-live="polite" aria-atomic="true"></span>
                 <span class="badge border border-secondary text-info ms-2" id="live-time" style="background: var(--bg-card);">--:--:--</span>
             </div>
         </div>
@@ -1502,31 +1505,73 @@ let CURRENT_VIEW = 'normal';
 let statusCheckInterval = null;
 
 function toggleForecast(el) {
+    const previousShowForecast = SHOW_FORECAST;
     SHOW_FORECAST = !SHOW_FORECAST;
-    // Icon umschalten
-    if (SHOW_FORECAST) el.classList.replace('fa-eye-slash', 'fa-eye');
-    else el.classList.replace('fa-eye', 'fa-eye-slash');
+    const applyForecastIcon = () => {
+        if (!el || !el.classList) return;
+        el.classList.toggle('fa-eye', SHOW_FORECAST);
+        el.classList.toggle('fa-eye-slash', !SHOW_FORECAST);
+    };
+    const setStatus = (message, success) => {
+        if (typeof showThemeSaveFeedback === 'function') {
+            showThemeSaveFeedback(message, success);
+            return;
+        }
+        const status = document.getElementById('theme-save-status');
+        if (status) {
+            status.textContent = message;
+            status.className = 'small ms-1 ' + (success ? 'text-success' : 'text-danger');
+            status.hidden = false;
+        }
+    };
+    applyForecastIcon();
 
-    // Speichern
-    fetch('mobile.php', {
+    const saveRequest = fetch('mobile.php', {
         method: 'POST',
         headers: {
             'Content-Type': 'application/x-www-form-urlencoded',
             'X-CSRF-Token': String(window.E3DC_CSRF_TOKEN || '')
         },
         body: 'action=save_setting&key=show_forecast&value=' + (SHOW_FORECAST ? '1' : '0')
+    }).then(response => {
+        if (!response.ok) throw new Error('HTTP ' + response.status);
+        return response.text();
+    }).then(result => {
+        if (result.trim() !== 'ok') throw new Error('Einstellung wurde nicht bestätigt.');
+        setStatus('Prognose gespeichert', true);
+        updateDashboard();
+    }).catch(() => {
+        SHOW_FORECAST = previousShowForecast;
+        applyForecastIcon();
+        setStatus('Prognose nicht gespeichert – zurückgesetzt', false);
+        updateDashboard();
     });
-    updateDashboard();
+    void saveRequest;
 }
 
 function toggleDarkMode(el) {
+    const previousDarkMode = DARK_MODE;
     DARK_MODE = !DARK_MODE;
     const theme = DARK_MODE ? 'dark' : 'light';
     document.body.setAttribute('data-theme', theme);
     document.body.setAttribute('data-bs-theme', theme);
     document.documentElement.setAttribute('data-bs-theme', theme); // Bootstrap CSS vars (z.B. --bs-body-bg)
-    localStorage.setItem('theme', theme);
+    document.documentElement.setAttribute('data-theme', theme);
+    try { localStorage.setItem('theme', theme); } catch (e) {}
     el.className = DARK_MODE ? 'fas fa-sun text-secondary' : 'fas fa-moon text-secondary';
+
+    const setStatus = (message, success) => {
+        if (typeof showThemeSaveFeedback === 'function') {
+            showThemeSaveFeedback(message, success);
+            return;
+        }
+        const status = document.getElementById('theme-save-status');
+        if (status) {
+            status.textContent = message;
+            status.className = 'small ms-1 ' + (success ? 'text-success' : 'text-danger');
+            status.hidden = false;
+        }
+    };
 
     // Speichern
     fetch('mobile.php', {
@@ -1536,6 +1581,23 @@ function toggleDarkMode(el) {
             'X-CSRF-Token': String(window.E3DC_CSRF_TOKEN || '')
         },
         body: 'action=save_setting&key=darkmode&value=' + (DARK_MODE ? '1' : '0')
+    }).then(response => {
+        if (!response.ok) throw new Error('HTTP ' + response.status);
+        return response.text();
+    }).then(result => {
+        if (result.trim() !== 'ok') throw new Error('Einstellung wurde nicht bestätigt.');
+        setStatus('Gespeichert', true);
+    }).catch(() => {
+        DARK_MODE = previousDarkMode;
+        const previousTheme = DARK_MODE ? 'dark' : 'light';
+        document.body.setAttribute('data-theme', previousTheme);
+        document.body.setAttribute('data-bs-theme', previousTheme);
+        document.documentElement.setAttribute('data-bs-theme', previousTheme);
+        document.documentElement.setAttribute('data-theme', previousTheme);
+        el.className = DARK_MODE ? 'fas fa-sun text-secondary' : 'fas fa-moon text-secondary';
+        try { localStorage.setItem('theme', previousTheme); } catch (e) {}
+        setStatus('Nicht gespeichert – zurückgesetzt', false);
+        window.dispatchEvent(new CustomEvent('themeChanged'));
     });
 
     // Explizites Event auslösen, damit Diagramme (langzeit.php) reagieren können
@@ -1853,11 +1915,28 @@ window.addEventListener('DOMContentLoaded', () => {
 
     // Watchdog Status
     function checkWatchdog() {
-        fetch('mobile.php?action=watchdog_status').then(r=>r.json()).then(data => {
+        const setWatchdogUnknown = function() {
             const icon = document.getElementById('watchdog-icon');
+            if (!icon) return;
+            icon.style.display = 'inline-block';
+            icon.className = 'fas fa-shield-alt text-secondary';
+            icon.title = 'Watchdog-Status unbekannt (Abruf fehlgeschlagen)';
+            icon.setAttribute('data-watchdog-state', 'unknown');
+            icon.setAttribute('aria-label', 'Watchdog-Status unbekannt');
+        };
+        fetch('mobile.php?action=watchdog_status').then(r => {
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            return r.json();
+        }).then(data => {
+            const icon = document.getElementById('watchdog-icon');
+            if (!data || typeof data !== 'object' || !icon) {
+                setWatchdogUnknown();
+                return;
+            }
             if (data.installed) {
                 icon.style.display = 'inline-block';
                 icon.title = data.message;
+                icon.setAttribute('data-watchdog-state', data.warning ? 'warning' : (data.active ? 'active' : 'inactive'));
                 if (data.warning) {
                     icon.className = 'fas fa-shield-alt text-warning';
                 } else if (data.active) {
@@ -1883,7 +1962,7 @@ window.addEventListener('DOMContentLoaded', () => {
                 });
                 if (typeof updateDiagnoseDropdown === 'function') updateDiagnoseDropdown();
             }
-        }).catch(e=>{});
+        }).catch(setWatchdogUnknown);
     }
     setInterval(checkWatchdog, 10000);
     checkWatchdog();

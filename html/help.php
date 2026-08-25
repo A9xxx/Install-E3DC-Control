@@ -115,7 +115,7 @@ $paths = getInstallPaths();
     <div class="container">
         <div class="d-flex justify-content-between align-items-center mb-4">
             <a href="index.php" class="nav-link-back"><i class="fas fa-arrow-left me-2"></i>Dashboard</a>
-            <span class="badge bg-success text-light">v5.4.4c Stable</span>
+            <span class="badge bg-success text-light">v5.4.4d Stable</span>
         </div>
         <h1 class="display-4 fw-bold">Hilfe & Support</h1>
         <p class="lead opacity-75">Häufige Fragen und Lösungen rund um E3DC-Control.</p>
@@ -134,7 +134,7 @@ $paths = getInstallPaths();
         <div class="col-12 faq-item" data-tags="docker image stable rollback update">
             <div class="card bg-card border-0 shadow-sm"><div class="card-body">
                 <h5 class="card-title"><span class="tag">Docker</span> Wie prüfe ich Image und Update?</h5>
-                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.4c</code> in <code>.env</code> gesetzt.</p>
+                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.4d</code> in <code>.env</code> gesetzt.</p>
                 <pre>cd "${E3DC_DOCKER_PATH:-$HOME/e3dc-docker}"
 if [ -f ./docker_compose_update.py ]; then
   E3DC_DOCKER_HELPER=./docker_compose_update.py
@@ -212,6 +212,28 @@ sudo docker compose logs --tail=80 e3dc-control</pre>
                         <li>Nach der Freigabe im Account den RESTful API Security Token erzeugen.</li>
                         <li>Im Config-Editor unter <em>Tarif</em> den ENTSO-E-Token als Fallback-Token eintragen und mit <em>ENTSO-E testen</em> prüfen.</li>
                     </ol>
+                </div>
+            </div>
+        </div>
+
+        <h4 class="mb-4 text-accent"><i class="fas fa-shield-halved me-2"></i>Stable 5.4.4d: einfacher Updateweg und bestätigte Webaktionen</h4>
+        <div class="col-12 faq-item" data-tags="5.4.4d stable update backup rechte buttons csrf ha bluelink wallbox hausabsicherung reserve">
+            <div class="card bg-card border-0 shadow-sm">
+                <div class="card-body">
+                    <h5 class="card-title">
+                        <span class="tag">5.4.4d</span>
+                        Was ändert das Stable-Release 5.4.4d?
+                    </h5>
+                    <ul>
+                        <li><strong>Ein vollständiger Ziel-Updater:</strong> Der heruntergeladene Release-Updater erstellt das Vollbackup, hält die Dienste nur für ruhende Nachsicherung und Projektion kurz an, repariert bekannte Rechte und startet die benötigten Dienste neu. Nutzer-<code>.git</code>, lokale Produktänderungen und fehlende Release-Dateien blockieren nicht.</li>
+                        <li><strong>Abbruch mit Lösung:</strong> Bei <code>ENOSPC</code>, <code>EROFS</code>, <code>EACCES</code> oder mehreren gleichrangigen Installationen zeigt die Ausgabe den betroffenen Pfad beziehungsweise die Kandidaten und einen konkret ausführbaren nächsten Befehl.</li>
+                        <li><strong>Alle sichtbaren zustandsändernden Aktionen:</strong> Die WebUI-Buttons verlangen Anmeldung und CSRF-Schutz und melden Erfolg erst nach Prüfung von HTTP-Status, Antwort und Teilfehlern. Der Rechte-Button verwendet den root-eigenen Backup-/Updateauftrag. Damit ist der Softwarevertrag geprüft; nicht jeder physische Aktor wurde dafür im Feld betätigt.</li>
+                        <li><strong>Modus 5, HA und Bluelink:</strong> Private Datenverzeichnisse verwenden <code>02770</code>, der gewählte Kompatibilitätsmodus <code>02775</code> bleibt möglich. Eine HA-Lease wird nur bei exakt passender Rolle und Peer-Bindung übernommen. Ein bewusst leerer aktueller Bluelink-Token wird nicht durch ältere Fallbacks ersetzt.</li>
+                        <li><strong>Wallbox-Hausgrenze:</strong> Hausabsicherung und Wallbox-Reserve begrenzen das gemeinsame Ladeziel in allen von E3DC-Control geführten Modi phasenbezogen. In <em>Aus / autonom</em> muss dieselbe Grenze in der Wallbox beziehungsweise im Ladeprofil abgesichert sein, weil E3DC-Control dort keine Strombefehle mehr sendet. Mangels echter PCC-Phasen-RMS-Messung bleibt <code>P/230</code> reine Diagnose; eine dynamische Subtraktion tatsächlicher Hausverbraucher wird nicht behauptet.</li>
+                        <li><strong>35-A-Standard und faire Verteilung:</strong> Fehlt die Hausabsicherung oder ist der Eintrag leer, gelten 35 A je Phase. Mehrere Ladepunkte teilen den verfügbaren Phasenrahmen ohne pauschale Halbierung; ausdrücklich ungültige Grenzwerte sperren mit Korrekturanweisung.</li>
+                        <li><strong>Honda e und andere Fahrzeugprofile:</strong> Ein ausdrücklich ausgewähltes 1p-Fahrzeugprofil bindet die wirksame Lastphase auch an einer festen dreiphasigen E3/DC-Wallbox. Ohne einen solchen Beleg bleibt die Regelung konservativ bei der Wallboxtopologie.</li>
+                        <li><strong><code>wbminsoc</code> während der Ladung:</strong> Eine Anhebung über den aktuellen Speicher-SoC entzieht sofort die Akku-Unterstützung. Ausreichender echter PV-Überschuss darf die Ladung weitertragen; andernfalls wird der Strom abgesenkt oder unterhalb der Mindestleistung gestoppt.</li>
+                    </ul>
                 </div>
             </div>
         </div>

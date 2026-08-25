@@ -140,7 +140,61 @@ class ServicePrestate:
     cutover_scope: tuple[str, ...]
     unknown_active_e3dc: tuple[str, ...]
     confirmed_unknown_writers: tuple[str, ...] = ()
+    target_bound_unknown_units: tuple[str, ...] = ()
+    enable_states: tuple[tuple[str, str], ...] = ()
+    fragment_paths: tuple[tuple[str, str], ...] = ()
+    masked_persistent: tuple[str, ...] = ()
+    masked_runtime: tuple[str, ...] = ()
     apache_security_enabled: bool = False
+
+    @property
+    def masked(self) -> tuple[str, ...]:
+        return tuple(
+            sorted(set(self.masked_persistent) | set(self.masked_runtime))
+        )
+
+    @property
+    def retired_unknown_units(self) -> tuple[str, ...]:
+        """Nur fachlich belegte Alt-Writer werden dauerhaft stillgelegt."""
+
+        return tuple(sorted(set(self.confirmed_unknown_writers)))
+
+    @property
+    def cutover_unknown_units(self) -> tuple[str, ...]:
+        """Alle unbekannten Zielroot-Dienste bleiben beim Austausch in Ruhe."""
+
+        return tuple(
+            sorted(
+                set(self.confirmed_unknown_writers)
+                | set(self.target_bound_unknown_units)
+            )
+        )
+
+    @property
+    def target_bound_observers(self) -> tuple[str, ...]:
+        """Zielroot-Dienste ohne belegten konkurrierenden Hardwarezugriff."""
+
+        return tuple(
+            sorted(
+                set(self.target_bound_unknown_units)
+                - set(self.confirmed_unknown_writers)
+            )
+        )
+
+    @property
+    def enable_state_map(self) -> dict[str, str]:
+        states = dict(self.enable_states)
+        if states:
+            return states
+        enabled = set(self.enabled)
+        return {
+            unit: ("enabled" if unit in enabled else "disabled")
+            for unit in self.present
+        }
+
+    @property
+    def fragment_path_map(self) -> dict[str, str]:
+        return dict(self.fragment_paths)
 
 
 def _fail(
@@ -172,7 +226,8 @@ def _run(
         command = ["/usr/bin/sudo", "-n", "-u", user, *command]
     result = subprocess.run(
         command,
-        text=True,
+        encoding="utf-8",
+        errors="replace",
         capture_output=True,
         check=False,
         timeout=timeout,
@@ -181,6 +236,42 @@ def _run(
         detail = (result.stderr or result.stdout or f"Exit {result.returncode}").strip()
         raise RuntimeError(f"{' '.join(command)}: {detail}")
     return result
+
+
+def _apply_failure_solution(detail: str, target_root: Path) -> str:
+    """Leitet aus einem Dateiaustauschfehler den nächsten konkreten Schritt ab."""
+
+    normalized = str(detail or "").lower()
+    target = shlex.quote(str(target_root))
+    if any(
+        marker in normalized
+        for marker in ("no space left", "disk quota exceeded", "kein platz")
+    ):
+        return (
+            "Schaffe auf dem betroffenen Dateisystem freien Speicherplatz. Prüfe zuerst: "
+            f"df -h {target} /var/www/html /run ; starte danach denselben Ein-Datei-Updater erneut."
+        )
+    if any(
+        marker in normalized
+        for marker in ("read-only file system", "read only file system", "nur-lese-dateisystem")
+    ):
+        return (
+            "Prüfe und behebe den schreibgeschützten Mount. Diagnose: "
+            f"findmnt -T {target} ; starte danach denselben Ein-Datei-Updater erneut."
+        )
+    if any(
+        marker in normalized
+        for marker in ("permission denied", "operation not permitted", "berechtigung")
+    ):
+        return (
+            "Prüfe Rechte, Mount und unveränderliche Dateiattribute des Installationspfads. "
+            f"Diagnose: sudo namei -l {target} ; sudo lsattr -d {target} ; "
+            "starte danach denselben Ein-Datei-Updater erneut."
+        )
+    return (
+        "Prüfe die unmittelbar genannte Ursache des Dateiaustauschs und starte danach "
+        "denselben Ein-Datei-Updater erneut; das vorhandene Vollbackup bleibt erhalten."
+    )
 
 
 def _service_load_state(unit: str) -> str:
@@ -211,6 +302,135 @@ def _service_enabled(unit: str) -> bool:
     result = _run(["/usr/bin/systemctl", "is-enabled", unit], timeout=20)
     state = result.stdout.strip().lower()
     return state in {"enabled", "enabled-runtime", "linked", "linked-runtime"}
+
+
+def _service_enable_state(unit: str) -> str:
+    result = _run(["/usr/bin/systemctl", "is-enabled", unit], timeout=20)
+    return result.stdout.strip().lower()
+
+
+def _service_fragment_path(unit: str) -> str:
+    result = _run(
+        [
+            "/usr/bin/systemctl",
+            "show",
+            unit,
+            "--property=FragmentPath",
+            "--value",
+            "--no-pager",
+        ],
+        timeout=20,
+    )
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()
+
+
+def _is_exact_dev_null_mask(path: Path) -> bool:
+    try:
+        metadata = os.lstat(path)
+        return (
+            stat.S_ISLNK(metadata.st_mode)
+            and metadata.st_uid == 0
+            and os.readlink(path) == "/dev/null"
+        )
+    except OSError:
+        return False
+
+
+def _service_mask_scopes(unit: str) -> tuple[bool, bool]:
+    """Liefert persistente/runtime Maske; uneindeutige Symlinks brechen ab."""
+
+    enabled_state = _service_enable_state(unit)
+    persistent = any(
+        _is_exact_dev_null_mask(root / unit)
+        for root in (
+            Path("/etc/systemd/system"),
+            Path("/usr/local/lib/systemd/system"),
+            Path("/usr/lib/systemd/system"),
+            Path("/lib/systemd/system"),
+        )
+    )
+    runtime = _is_exact_dev_null_mask(Path("/run/systemd/system") / unit)
+    reports_mask = enabled_state in {"masked", "masked-runtime"}
+    if reports_mask != (persistent or runtime):
+        _fail(
+            "E3DC-UPD-SERVICE-MASK-001",
+            f"Der Maskenzustand von {unit} ist nicht eindeutig (is-enabled={enabled_state or 'leer'}).",
+            f"Prüfe systemctl is-enabled {unit} und sudo find /etc/systemd/system /run/systemd/system -maxdepth 1 -name {shlex.quote(unit)} -ls; "
+            "stelle eine exakte /dev/null-Maske her oder entferne den fehlerhaften Symlink und starte danach denselben Updatebefehl erneut.",
+        )
+    if reports_mask and _service_load_state(unit) != "masked":
+        _fail(
+            "E3DC-UPD-SERVICE-MASK-001",
+            f"{unit} wird als {enabled_state} gemeldet, aber systemd hat die Maske nicht geladen.",
+            f"Führe sudo systemctl daemon-reload aus, prüfe systemctl show {unit} -p LoadState und starte danach denselben Updatebefehl erneut.",
+        )
+    if enabled_state == "masked-runtime" and not runtime:
+        _fail(
+            "E3DC-UPD-SERVICE-MASK-001",
+            f"Die Runtime-Maske von {unit} ist kein exakter /dev/null-Link.",
+            f"Führe sudo systemctl mask --runtime {unit} aus und starte danach denselben Updatebefehl erneut.",
+        )
+    return persistent, runtime
+
+
+def _service_mask_mismatches(prestate: ServicePrestate) -> tuple[str, ...]:
+    expected_persistent = set(prestate.masked_persistent)
+    expected_runtime = set(prestate.masked_runtime)
+    mismatches: list[str] = []
+    for unit in prestate.present:
+        persistent, runtime = _service_mask_scopes(unit)
+        if persistent != (unit in expected_persistent) or runtime != (unit in expected_runtime):
+            expected = "+".join(
+                scope
+                for scope, selected in (
+                    ("persistent", unit in expected_persistent),
+                    ("runtime", unit in expected_runtime),
+                )
+                if selected
+            ) or "unmasked"
+            actual = "+".join(
+                scope
+                for scope, selected in (("persistent", persistent), ("runtime", runtime))
+                if selected
+            ) or "unmasked"
+            mismatches.append(f"{unit}={actual} statt {expected}")
+    return tuple(mismatches)
+
+
+def _restore_service_masks_best_effort(prestate: ServicePrestate) -> tuple[str, ...]:
+    """Stellt den gebundenen Aus-Zustand vor jedem Rücklauf-Neustart wieder her."""
+
+    try:
+        if not _service_mask_mismatches(prestate):
+            return ()
+    except Exception:
+        pass
+    expected_persistent = set(prestate.masked_persistent)
+    expected_runtime = set(prestate.masked_runtime)
+    failed: list[str] = []
+    for unit in prestate.present:
+        try:
+            persistent, runtime = _service_mask_scopes(unit)
+        except Exception:
+            persistent, runtime = False, False
+        desired_persistent = unit in expected_persistent
+        desired_runtime = unit in expected_runtime
+        if (persistent, runtime) == (desired_persistent, desired_runtime):
+            continue
+        _run(["/usr/bin/systemctl", "unmask", "--runtime", unit], timeout=30)
+        _run(["/usr/bin/systemctl", "unmask", unit], timeout=30)
+        if desired_persistent:
+            _run(["/usr/bin/systemctl", "mask", unit], timeout=30)
+        if desired_runtime:
+            _run(["/usr/bin/systemctl", "mask", "--runtime", unit], timeout=30)
+    _run(["/usr/bin/systemctl", "daemon-reload"], timeout=60)
+    try:
+        failed.extend(_service_mask_mismatches(prestate))
+    except Exception as exc:
+        failed.append(str(exc).strip() or exc.__class__.__name__)
+    return tuple(failed)
 
 
 def _role_service_intended(role: str) -> bool:
@@ -246,7 +466,7 @@ def _is_update_runtime_unit(unit: str) -> bool:
     return name.startswith("e3dc-") and "update" in name
 
 
-def _loaded_e3dc_services() -> tuple[str, ...]:
+def _loaded_services() -> tuple[str, ...]:
     result = _run(
         [
             "/usr/bin/systemctl",
@@ -272,9 +492,127 @@ def _loaded_e3dc_services() -> tuple[str, ...]:
         if not fields:
             continue
         unit = _normalize_unit(fields[0])
-        if unit.startswith("e3dc") and not _is_update_runtime_unit(unit):
+        if not _is_update_runtime_unit(unit):
             units.add(unit)
     return tuple(sorted(units))
+
+
+def _loaded_e3dc_services() -> tuple[str, ...]:
+    """Kompatibilitätssicht auf geladene E3DC-Dienste."""
+
+    return tuple(unit for unit in _loaded_services() if unit.startswith("e3dc"))
+
+
+def _enabled_service_units() -> tuple[str, ...]:
+    """Liefert rebootfeste Units als Kandidaten für eine klare Zielroot-Bindung."""
+
+    result = _run(
+        [
+            "/usr/bin/systemctl",
+            "list-unit-files",
+            "--type=service",
+            "--no-legend",
+            "--plain",
+            "--no-pager",
+        ],
+        timeout=30,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "keine Detailausgabe").strip()
+        _fail(
+            "E3DC-UPD-SERVICE-DISCOVERY-001",
+            f"Die aktivierten systemd-Dienste konnten nicht ermittelt werden: {detail}",
+            "Führe sudo systemctl daemon-reload aus und starte danach denselben Updatebefehl erneut.",
+        )
+    enabled_states = {"enabled", "enabled-runtime", "linked", "linked-runtime"}
+    units: set[str] = set()
+    for raw_line in result.stdout.splitlines():
+        fields = raw_line.strip().split()
+        if len(fields) < 2 or fields[1].strip().lower() not in enabled_states:
+            continue
+        unit = _normalize_unit(fields[0])
+        if not _is_update_runtime_unit(unit):
+            units.add(unit)
+    return tuple(sorted(units))
+
+
+def _systemd_unescape(value: str) -> str:
+    """Dekodiert nur systemd-\\xNN-Sequenzen; andere Inhalte bleiben wörtlich."""
+
+    return re.sub(
+        r"\\x([0-9A-Fa-f]{2})",
+        lambda match: chr(int(match.group(1), 16)),
+        str(value or ""),
+    )
+
+
+def _path_is_within_target(value: str, target_root: Path) -> bool:
+    raw = str(value or "").strip()
+    if raw.startswith("-"):
+        raw = raw[1:]
+    if not raw or not os.path.isabs(raw):
+        return False
+    candidate = Path(os.path.abspath(raw))
+    target = Path(os.path.abspath(target_root))
+    try:
+        candidate.relative_to(target)
+        return True
+    except ValueError:
+        return False
+
+
+def _execstart_mentions_target(value: str, target_root: Path) -> bool:
+    """Bindet nur ein vollständiges absolutes Zielroot-Pfadsegment in ExecStart."""
+
+    payload = _systemd_unescape(value)
+    target = re.escape(os.path.abspath(target_root))
+    return re.search(
+        rf"(?<![A-Za-z0-9_.\-/]){target}(?:/|(?=$|[\s;,'\"}}\]]))",
+        payload,
+    ) is not None
+
+
+def _service_target_bindings(unit: str, target_root: Path) -> tuple[str, ...]:
+    """Belegt eine Zielroot-Bindung ohne Namens- oder Skriptheuristik."""
+
+    result = _run(
+        [
+            "/usr/bin/systemctl",
+            "show",
+            unit,
+            "--property=WorkingDirectory",
+            "--property=ExecStart",
+            "--property=MainPID",
+            "--no-pager",
+        ],
+        timeout=20,
+    )
+    if result.returncode != 0:
+        return ()
+    values: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key in {"WorkingDirectory", "ExecStart", "MainPID"}:
+            values[key] = value.strip()
+
+    evidence: list[str] = []
+    working_directory = _systemd_unescape(values.get("WorkingDirectory", ""))
+    if _path_is_within_target(working_directory, target_root):
+        evidence.append("WorkingDirectory")
+    if _execstart_mentions_target(values.get("ExecStart", ""), target_root):
+        evidence.append("ExecStart")
+    try:
+        main_pid = int(values.get("MainPID", "0"))
+    except ValueError:
+        main_pid = 0
+    if main_pid > 1:
+        try:
+            process_cwd = os.readlink(f"/proc/{main_pid}/cwd")
+        except OSError:
+            process_cwd = ""
+        if _path_is_within_target(process_cwd, target_root):
+            evidence.append("MainPID-CWD")
+    return tuple(evidence)
 
 
 def _is_confirmed_competing_hardware_writer(unit: str) -> bool:
@@ -302,25 +640,59 @@ def _is_confirmed_competing_hardware_writer(unit: str) -> bool:
     return False
 
 
-def _capture_service_prestate() -> ServicePrestate:
+def _capture_service_prestate(target_root: Path | None = None) -> ServicePrestate:
     from Installer.service_catalog import allowed_services
 
     catalog = {_normalize_unit(item) for item in allowed_services()}
-    dynamic = set(_loaded_e3dc_services())
+    loaded = (
+        set(_loaded_services())
+        if target_root is not None
+        else set(_loaded_e3dc_services())
+    )
+    dynamic = {unit for unit in loaded if unit.startswith("e3dc")}
+    enabled_unit_files = set(_enabled_service_units()) if target_root is not None else set()
     known_candidates = catalog | set(EXPLICIT_CUTOVER_SERVICES)
+    target_bound = (
+        {
+            unit
+            for unit in loaded | enabled_unit_files
+            if _service_target_bindings(unit, target_root)
+        }
+        if target_root is not None
+        else set()
+    )
+    target_bound_unknown = target_bound - known_candidates
     present = {
         unit
         for unit in known_candidates
         if _service_present_or_masked(unit) or _service_exists(unit)
-    } | dynamic
+    } | dynamic | target_bound
     inspected = {
         unit
         for unit in present | dynamic
         if not _is_update_runtime_unit(unit)
     }
+    masked_persistent: set[str] = set()
+    masked_runtime: set[str] = set()
+    enable_states: dict[str, str] = {}
+    fragment_paths: dict[str, str] = {}
+    for unit in sorted(inspected):
+        enable_state = _service_enable_state(unit)
+        enable_states[unit] = enable_state
+        if enable_state in {"enabled", "enabled-runtime", "linked", "linked-runtime"}:
+            fragment_paths[unit] = _service_fragment_path(unit)
+        persistent_mask, runtime_mask = _service_mask_scopes(unit)
+        if persistent_mask:
+            masked_persistent.add(unit)
+        if runtime_mask:
+            masked_runtime.add(unit)
     active = {unit for unit in inspected if _service_active(unit)}
-    enabled_candidates = catalog | set(EXPLICIT_CUTOVER_SERVICES) | active
-    enabled = {unit for unit in enabled_candidates if _service_enabled(unit)}
+    enabled_candidates = catalog | set(EXPLICIT_CUTOVER_SERVICES) | active | target_bound
+    enabled = {
+        unit
+        for unit in enabled_candidates
+        if enable_states.get(unit) in {"enabled", "enabled-runtime", "linked", "linked-runtime"}
+    }
     unknown_active = {
         unit
         for unit in active
@@ -335,7 +707,7 @@ def _capture_service_prestate() -> ServicePrestate:
         unit
         for unit in present
         if unit in known_candidates or unit == "e3dc.service"
-    } | confirmed_unknown_writers
+    } | confirmed_unknown_writers | target_bound_unknown
     return ServicePrestate(
         active=tuple(sorted(active)),
         enabled=tuple(sorted(enabled)),
@@ -346,14 +718,19 @@ def _capture_service_prestate() -> ServicePrestate:
         cutover_scope=tuple(sorted(scope)),
         unknown_active_e3dc=tuple(sorted(unknown_active)),
         confirmed_unknown_writers=tuple(sorted(confirmed_unknown_writers)),
+        target_bound_unknown_units=tuple(sorted(target_bound_unknown)),
+        enable_states=tuple(sorted(enable_states.items())),
+        fragment_paths=tuple(sorted(fragment_paths.items())),
+        masked_persistent=tuple(sorted(masked_persistent)),
+        masked_runtime=tuple(sorted(masked_runtime)),
         apache_security_enabled=os.path.lexists(APACHE_SECURITY_ENABLE_LINK),
     )
 
 
-def _capture_active_services() -> tuple[str, ...]:
+def _capture_active_services(target_root: Path | None = None) -> tuple[str, ...]:
     """Kompatibilitätshelfer für lokale Alt-Regressionen."""
 
-    return _capture_service_prestate().active
+    return _capture_service_prestate(target_root).active
 
 
 def _acquire_update_lock() -> int:
@@ -461,7 +838,13 @@ def _read_valid_role_anchor() -> dict:
     }
 
 
-def _bind_role_context(role: str, config: dict, *, require_peer: bool = False) -> dict:
+def _bind_role_context(
+    role: str,
+    config: dict,
+    *,
+    bound_peer_ip: str = "",
+    require_peer: bool = False,
+) -> dict:
     """Bindet die bereits erkannte Rolle vor jeder Updatewirkung an ihre Daten."""
 
     result = dict(config)
@@ -474,6 +857,22 @@ def _bind_role_context(role: str, config: dict, *, require_peer: bool = False) -
         )
     if anchor and anchor.get("mode") == role and anchor.get("peer_ip"):
         result["ha_peer_ip"] = anchor["peer_ip"]
+    elif role in {"master", "slave"} and bound_peer_ip:
+        normalized_bound_peer = _normalized_peer_ip(bound_peer_ip)
+        if not normalized_bound_peer:
+            _fail(
+                "E3DC-UPD-CONFIG-005",
+                "Die gebundene HA-Peer-IP ist nicht gültig.",
+                "Starte denselben Ein-Datei-Updater erneut, damit die Instanzbindung frisch ermittelt wird.",
+            )
+        configured_peer = _normalized_peer_ip(result.get("ha_peer_ip"))
+        if configured_peer and configured_peer != normalized_bound_peer:
+            _fail(
+                "E3DC-UPD-CONFIG-005",
+                "Die HA-Peer-IP änderte sich zwischen Installationserkennung und Ziel-Updater.",
+                "Prüfe ha_peer_ip in der genannten Konfiguration und starte danach denselben Updatebefehl erneut.",
+            )
+        result["ha_peer_ip"] = normalized_bound_peer
     result["ha_mode"] = role
     if role in {"master", "slave"}:
         peer_ip = _normalized_peer_ip(result.get("ha_peer_ip"))
@@ -657,15 +1056,6 @@ def _configured_venv_name(config: dict) -> str:
     return name
 
 
-def _configured_venv_python_preexists(install_user: str, config: dict) -> bool:
-    try:
-        home = Path(pwd.getpwnam(install_user).pw_dir)
-    except KeyError:
-        return False
-    python = home / _configured_venv_name(config) / "bin/python3"
-    return python.is_file() and os.access(python, os.X_OK)
-
-
 def _validated_managed_venv_pip_packages(policy: dict) -> tuple[str, ...]:
     raw = policy.get("managed_venv_pip_packages") or ()
     if not isinstance(raw, (list, tuple)):
@@ -692,24 +1082,97 @@ def _validated_managed_venv_pip_packages(policy: dict) -> tuple[str, ...]:
     return tuple(packages)
 
 
-def _repair_managed_venv_pip_packages(
-    policy: dict,
-    install_user: str,
-    python: Path,
-    *,
-    venv_preexisted: bool,
-) -> None:
-    packages = _validated_managed_venv_pip_packages(policy)
-    if not packages:
-        return
+def _normalized_distribution_name(value: str) -> str:
+    """Normalisiert Python-Distributionsnamen entsprechend ihrer Vergleichsform."""
+
+    return re.sub(r"[-_.]+", "-", str(value or "").strip()).lower()
+
+
+def _managed_pip_check_conflicts(
+    output: str,
+    packages: Iterable[str],
+) -> tuple[str, ...]:
+    """Filtert ``pip check`` strikt auf Konflikte verwalteter Pakete."""
+
+    managed = {
+        _normalized_distribution_name(package)
+        for package in packages
+        if _normalized_distribution_name(package)
+    }
+    conflicts: list[str] = []
+    for raw_line in str(output or "").splitlines():
+        line = raw_line.strip()
+        match = re.match(r"^([A-Za-z0-9][A-Za-z0-9._-]*)\s+", line)
+        if match and _normalized_distribution_name(match.group(1)) in managed:
+            conflicts.append(line)
+    return tuple(conflicts)
+
+
+def _runuser_binary(*, code: str = "E3DC-UPD-DEP-003") -> Path:
     runuser = Path("/usr/sbin/runuser")
     if not runuser.is_file() or not os.access(runuser, os.X_OK):
         _fail(
-            "E3DC-UPD-DEP-004",
-            "runuser fehlt; die freigegebenen Python-Pakete können nicht als Installationsbenutzer repariert werden.",
+            code,
+            "runuser fehlt; die Python-Umgebung kann nicht sicher als Installationsbenutzer vorbereitet werden.",
             "Installiere util-linux und starte danach denselben Updatebefehl erneut.",
         )
+    return runuser
+
+
+def _venv_python_usable_by_install_user(
+    install_user: str,
+    venv: Path,
+    python: Path,
+) -> bool:
+    """Führt den Interpreter real als Zielnutzer aus und belegt Schreibbarkeit."""
+
+    try:
+        account = pwd.getpwnam(install_user)
+        metadata = venv.lstat()
+    except (KeyError, OSError):
+        return False
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != account.pw_uid
+    ):
+        return False
+    runuser = _runuser_binary()
     probe = _run(
+        [
+            runuser,
+            "-u",
+            install_user,
+            "--",
+            python,
+            "-c",
+            (
+                "import os,pathlib,sys,sysconfig,tempfile; "
+                "expected=os.path.realpath(sys.argv[1]); "
+                "actual=os.path.realpath(sys.prefix); "
+                "assert actual==expected, (actual,expected); "
+                "assert os.geteuid()==int(sys.argv[2]); "
+                "roots=(pathlib.Path(sys.prefix),"
+                'pathlib.Path(sysconfig.get_path("purelib")),'
+                "pathlib.Path(sysconfig.get_path('scripts'))); "
+                "[(lambda pair:(os.close(pair[0]),os.unlink(pair[1])))"
+                "(tempfile.mkstemp(prefix='.e3dc-update-write-',dir=root)) for root in roots]"
+            ),
+            venv,
+            str(account.pw_uid),
+        ],
+        timeout=60,
+    )
+    return probe.returncode == 0
+
+
+def _managed_venv_package_probe(
+    runuser: Path,
+    install_user: str,
+    python: Path,
+    packages: tuple[str, ...],
+) -> subprocess.CompletedProcess[str]:
+    return _run(
         [
             runuser,
             "-u",
@@ -727,6 +1190,187 @@ def _repair_managed_venv_pip_packages(
         ],
         timeout=60,
     )
+
+
+def _target_venv_name(target_version: str, ordinal: int = 1) -> str:
+    version = re.sub(r"[^A-Za-z0-9]+", "_", str(target_version or "")).strip("_").lower()
+    if not version:
+        version = "target"
+    base = f"venv_e3dc_release_{version[:80]}"
+    return base if ordinal == 1 else f"{base}_{ordinal}"
+
+
+def _target_venv_marker_payload(
+    target_version: str,
+    packages: tuple[str, ...],
+) -> bytes:
+    return (
+        json.dumps(
+            {
+                "schema": 1,
+                "target_version": str(target_version),
+                "managed_packages": list(packages),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _target_venv_marker_matches(
+    venv: Path,
+    target_version: str,
+    packages: tuple[str, ...],
+    install_uid: int,
+) -> bool:
+    marker = venv / ".e3dc-target-venv.json"
+    descriptor = -1
+    try:
+        metadata = marker.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_uid != install_uid
+            or metadata.st_size > 16384
+        ):
+            return False
+        descriptor = os.open(
+            marker,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+        )
+        payload = b""
+        while len(payload) <= 16384:
+            chunk = os.read(descriptor, 4096)
+            if not chunk:
+                break
+            payload += chunk
+        if len(payload) > 16384:
+            return False
+        return payload == _target_venv_marker_payload(target_version, packages)
+    except (OSError, UnicodeError, ValueError):
+        return False
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _prepared_target_venv_ready(
+    policy: dict,
+    install_user: str,
+    venv: Path,
+    target_version: str,
+) -> bool:
+    packages = _validated_managed_venv_pip_packages(policy)
+    account = pwd.getpwnam(install_user)
+    python = venv / "bin/python3"
+    if not _target_venv_marker_matches(
+        venv,
+        target_version,
+        packages,
+        account.pw_uid,
+    ):
+        return False
+    if not _venv_python_usable_by_install_user(install_user, venv, python):
+        return False
+    runuser = _runuser_binary()
+    package_probe = _managed_venv_package_probe(
+        runuser,
+        install_user,
+        python,
+        packages,
+    )
+    if package_probe.returncode != 0 or package_probe.stdout.strip():
+        return False
+    pip_check = _run(
+        [runuser, "-u", install_user, "--", python, "-m", "pip", "check"],
+        timeout=120,
+    )
+    return not _managed_pip_check_conflicts(
+        "\n".join((pip_check.stdout, pip_check.stderr)),
+        packages,
+    )
+
+
+def _write_target_venv_marker(
+    runuser: Path,
+    install_user: str,
+    venv: Path,
+    payload: bytes,
+) -> bool:
+    marker = venv / ".e3dc-target-venv.json"
+    written = _run(
+        [
+            runuser,
+            "-u",
+            install_user,
+            "--",
+            "/usr/bin/python3",
+            "-c",
+            (
+                "import os,sys; path=sys.argv[1]; data=sys.argv[2].encode('utf-8'); "
+                "flags=os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,'O_NOFOLLOW',0); "
+                "fd=os.open(path,flags,0o600); "
+                "handle=os.fdopen(fd,'wb'); handle.write(data); handle.flush(); "
+                "os.fsync(handle.fileno()); handle.close()"
+            ),
+            marker,
+            payload.decode("utf-8"),
+        ],
+        timeout=30,
+    )
+    return written.returncode == 0
+
+
+def _remove_created_target_venv_best_effort(
+    runuser: Path,
+    install_user: str,
+    home: Path,
+    venv: Path,
+) -> bool:
+    """Entfernt nur den in diesem Lauf neu angelegten, nutzereigenen Kandidaten."""
+
+    try:
+        removed = _run(
+            [
+                runuser,
+                "-u",
+                install_user,
+                "--",
+                "/usr/bin/python3",
+                "-c",
+                (
+                    "import os,shutil,stat,sys; home=os.path.abspath(sys.argv[1]); "
+                    "path=os.path.abspath(sys.argv[2]); "
+                    "assert os.path.dirname(path)==home; st=os.lstat(path); "
+                    "assert stat.S_ISDIR(st.st_mode) and not stat.S_ISLNK(st.st_mode); "
+                    "assert st.st_uid==os.geteuid(); shutil.rmtree(path)"
+                ),
+                home,
+                venv,
+            ],
+            timeout=120,
+        )
+    except Exception:
+        return False
+    return removed.returncode == 0 and not os.path.lexists(venv)
+
+
+def _repair_managed_venv_pip_packages(
+    policy: dict,
+    install_user: str,
+    python: Path,
+    *,
+    venv_preexisted: bool,
+) -> None:
+    packages = _validated_managed_venv_pip_packages(policy)
+    runuser = _runuser_binary(code="E3DC-UPD-DEP-004")
+    probe = _managed_venv_package_probe(
+        runuser,
+        install_user,
+        python,
+        packages,
+    )
     if probe.returncode != 0:
         detail = (probe.stderr or probe.stdout or "unbekannter Metadatenfehler").strip()
         _fail(
@@ -739,10 +1383,7 @@ def _repair_managed_venv_pip_packages(
         for package in probe.stdout.splitlines()
         if package in packages
     )
-    if not missing:
-        return
-    pip_options = ["--no-deps"] if venv_preexisted else ["--prefer-binary"]
-    pip_command = [
+    pip_command_prefix = [
         str(python),
         "-m",
         "pip",
@@ -750,26 +1391,81 @@ def _repair_managed_venv_pip_packages(
         "--disable-pip-version-check",
         "--no-input",
         "--quiet",
-        *pip_options,
-        "--",
-        *missing,
+        "--prefer-binary",
     ]
-    installed = _run(
-        [runuser, "-u", install_user, "--", *pip_command],
+    install_targets = missing if venv_preexisted else packages
+    if install_targets:
+        pip_command = [
+            *pip_command_prefix,
+            "--",
+            *install_targets,
+        ]
+        installed = _run(
+            [runuser, "-u", install_user, "--", *pip_command],
+            timeout=600,
+        )
+        if installed.returncode != 0:
+            detail = (installed.stderr or installed.stdout or "unbekannter pip-Fehler").strip()
+            package_names = ", ".join(install_targets)
+            repair_command = shlex.join(["sudo", "-u", install_user, *pip_command])
+            _fail(
+                "E3DC-UPD-DEP-004",
+                f"Die Python-Pakete im venv konnten nicht repariert werden ({package_names}): {detail}",
+                f"Behebe die angezeigte pip-/Netzwerkursache und prüfe sie mit: {repair_command}",
+            )
+
+    check_command = [str(python), "-m", "pip", "check"]
+    checked = _run(
+        [runuser, "-u", install_user, "--", *check_command],
+        timeout=120,
+    )
+    managed_conflicts = _managed_pip_check_conflicts(
+        "\n".join((checked.stdout, checked.stderr)),
+        packages,
+    )
+    if not managed_conflicts:
+        return
+
+    repair_command = [
+        *pip_command_prefix,
+        "--upgrade",
+        "--",
+        *packages,
+    ]
+    repaired = _run(
+        [runuser, "-u", install_user, "--", *repair_command],
         timeout=600,
     )
-    if installed.returncode != 0:
-        detail = (installed.stderr or installed.stdout or "unbekannter pip-Fehler").strip()
-        package_names = ", ".join(missing)
-        repair_command = shlex.join(["sudo", "-u", install_user, *pip_command])
+    checked_again = _run(
+        [runuser, "-u", install_user, "--", *check_command],
+        timeout=120,
+    )
+    remaining_managed_conflicts = _managed_pip_check_conflicts(
+        "\n".join((checked_again.stdout, checked_again.stderr)),
+        packages,
+    )
+    if repaired.returncode != 0 or remaining_managed_conflicts:
+        detail = (
+            "\n".join(remaining_managed_conflicts)
+            or repaired.stderr
+            or repaired.stdout
+            or "unbekannter pip-check-Fehler"
+        ).strip()
         _fail(
             "E3DC-UPD-DEP-004",
-            f"Die Python-Pakete im venv konnten nicht repariert werden ({package_names}): {detail}",
-            f"Behebe die angezeigte pip-/Netzwerkursache und prüfe sie mit: {repair_command}",
+            f"Die Python-Umgebung enthält weiterhin unvollständige Abhängigkeiten: {detail}",
+            f"Prüfe die Umgebung mit: sudo -u {install_user} {python} -m pip check; starte danach denselben Updatebefehl erneut.",
         )
 
 
-def _ensure_minimal_venv(install_user: str, config: dict) -> Path:
+def _ensure_minimal_venv(
+    policy: dict,
+    install_user: str,
+    config: dict,
+    target_version: str,
+) -> Path:
+    """Bereitet den Zielstand in einem eigenen venv vor; das Alt-venv bleibt unverändert."""
+
     account = pwd.getpwnam(install_user)
     home = Path(account.pw_dir)
     if not home.is_absolute() or not home.is_dir():
@@ -778,29 +1474,38 @@ def _ensure_minimal_venv(install_user: str, config: dict) -> Path:
             f"Das Home-Verzeichnis des Installationsbenutzers fehlt: {home}",
             f"Lege {home} für {install_user} an und starte danach denselben Updatebefehl erneut.",
         )
-    venv_name = _configured_venv_name(config)
-    venv = home / venv_name
-    python = venv / "bin/python3"
-    if python.is_file() and os.access(python, os.X_OK):
-        config["venv_name"] = venv_name
-        config["venv_path"] = str(venv)
-        return python
-    if os.path.lexists(venv) and (venv.is_symlink() or not venv.is_dir()):
+    runuser = _runuser_binary()
+    packages = _validated_managed_venv_pip_packages(policy)
+    selected_name = ""
+    selected_venv: Path | None = None
+    for ordinal in range(1, 65):
+        candidate_name = _target_venv_name(target_version, ordinal)
+        candidate = home / candidate_name
+        if os.path.lexists(candidate):
+            if _prepared_target_venv_ready(
+                policy,
+                install_user,
+                candidate,
+                target_version,
+            ):
+                config["venv_name"] = candidate_name
+                config["venv_path"] = str(candidate)
+                return candidate / "bin/python3"
+            continue
+        selected_name = candidate_name
+        selected_venv = candidate
+        break
+    if selected_venv is None:
         _fail(
             "E3DC-UPD-DEP-003",
-            f"Das Python-Umgebungsziel ist kein normales Verzeichnis: {venv}",
-            f"Verschiebe {venv} beiseite und starte danach denselben Updatebefehl erneut.",
+            "Es ist kein freier, transaktionaler Zielplatz für die Python-Umgebung verfügbar.",
+            f"Entferne nicht mehr verwendete venv_e3dc_release_*-Ordner in {home} und starte danach denselben Updatebefehl erneut.",
         )
-    runner = Path("/usr/sbin/runuser")
-    if not runner.is_file() or not os.access(runner, os.X_OK):
-        _fail(
-            "E3DC-UPD-DEP-003",
-            "runuser fehlt; die Python-Umgebung kann nicht als Installationsbenutzer erzeugt werden.",
-            "Installiere util-linux und starte danach denselben Updatebefehl erneut.",
-        )
+
+    python = selected_venv / "bin/python3"
     created = _run(
         [
-            runner,
+            runuser,
             "-u",
             install_user,
             "--",
@@ -808,18 +1513,55 @@ def _ensure_minimal_venv(install_user: str, config: dict) -> Path:
             "-m",
             "venv",
             "--system-site-packages",
-            venv,
+            selected_venv,
         ],
         timeout=180,
     )
-    if created.returncode != 0 or not python.is_file() or not os.access(python, os.X_OK):
-        _fail(
-            "E3DC-UPD-DEP-003",
-            f"Die minimale Python-Umgebung konnte für {install_user} nicht erzeugt werden.",
-            f"Prüfe die Schreibrechte von {home} und starte danach denselben Updatebefehl erneut.",
+    try:
+        if created.returncode != 0 or not _venv_python_usable_by_install_user(
+            install_user,
+            selected_venv,
+            python,
+        ):
+            detail = (created.stderr or created.stdout or "keine Detailausgabe").strip()
+            _fail(
+                "E3DC-UPD-DEP-003",
+                f"Die neue Python-Umgebung konnte für {install_user} nicht vorbereitet werden: {detail}",
+                f"Prüfe die Schreibrechte von {home} und den freien Speicherplatz; starte danach denselben Updatebefehl erneut.",
+            )
+        _repair_managed_venv_pip_packages(
+            policy,
+            install_user,
+            python,
+            venv_preexisted=False,
         )
-    config["venv_name"] = venv_name
-    config["venv_path"] = str(venv)
+        marker_payload = _target_venv_marker_payload(target_version, packages)
+        if not _write_target_venv_marker(
+            runuser,
+            install_user,
+            selected_venv,
+            marker_payload,
+        ) or not _prepared_target_venv_ready(
+            policy,
+            install_user,
+            selected_venv,
+            target_version,
+        ):
+            _fail(
+                "E3DC-UPD-DEP-004",
+                "Die neue Python-Umgebung blieb nach Installation und pip check unvollständig.",
+                f"Prüfe freien Speicherplatz und Python/pip für {install_user}; starte danach denselben Updatebefehl erneut.",
+            )
+    except Exception:
+        _remove_created_target_venv_best_effort(
+            runuser,
+            install_user,
+            home,
+            selected_venv,
+        )
+        raise
+    config["venv_name"] = selected_name
+    config["venv_path"] = str(selected_venv)
     return python
 
 
@@ -828,7 +1570,11 @@ def _repair_packages(
     install_user: str,
     config: dict,
     selected_catalog_units: Iterable[str] = (),
+    *,
+    target_version: str = "",
 ) -> Path:
+    if not target_version:
+        target_version = (RELEASE_ROOT / "VERSION").read_text(encoding="utf-8").strip()
     packages = _validated_apt_packages(policy, selected_catalog_units)
     missing = [package for package in packages if not _apt_package_installed(package)]
     if missing:
@@ -853,20 +1599,18 @@ def _repair_packages(
                 f"Die fehlenden Systempakete konnten nicht installiert werden ({unresolved}): {detail}",
                 "Repariere APT mit sudo apt-get -f install und starte danach denselben Updatebefehl erneut.",
             )
-    venv_preexisted = _configured_venv_python_preexists(install_user, config)
-    python = _ensure_minimal_venv(install_user, config)
+    python = _ensure_minimal_venv(
+        policy,
+        install_user,
+        config,
+        target_version,
+    )
     if not python.is_file() or not os.access(python, os.X_OK):
         _fail(
             "E3DC-UPD-DEP-003",
             "Der vorbereitete Python-Interpreter fehlt oder ist nicht ausführbar.",
             "Prüfe den freien Speicherplatz und starte danach denselben Updatebefehl erneut.",
         )
-    _repair_managed_venv_pip_packages(
-        policy,
-        install_user,
-        python,
-        venv_preexisted=venv_preexisted,
-    )
     return python
 
 
@@ -1085,10 +1829,10 @@ def _stop_for_cutover(extra_units: Iterable[str] = ()) -> tuple[str, ...]:
 
 
 def _retire_unknown_active_e3dc(prestate: ServicePrestate) -> list[str]:
-    """Deaktiviert belegte Alt-Writer erst nach bestätigtem Ersatz."""
+    """Deaktiviert belegte Altunits erst nach bestätigtem Ersatz."""
 
     warnings: list[str] = []
-    for unit in prestate.confirmed_unknown_writers:
+    for unit in prestate.retired_unknown_units:
         disabled = _run(
             ["/usr/bin/systemctl", "disable", "--now", unit],
             timeout=60,
@@ -1106,9 +1850,43 @@ def _retire_unknown_active_e3dc(prestate: ServicePrestate) -> list[str]:
             )
         _run(["/usr/bin/systemctl", "reset-failed", unit], timeout=20)
         warnings.append(
-            f"Abgelöster alter E3DC-Dienst {unit} wurde nach dem erfolgreichen "
+            f"Abgelöster alter E3DC-Dienst {unit} wurde nach dem bestätigten "
             "Wechsel gestoppt und deaktiviert."
         )
+    return warnings
+
+
+def _restart_target_bound_observers_after_success(
+    prestate: ServicePrestate,
+) -> list[str]:
+    """Startet zuvor aktive Beobachter wieder, ohne ihre Freigabe zu verändern.
+
+    Der neue Release ist zu diesem Zeitpunkt bereits bestätigt. Ein fehlender
+    oder nicht startbarer zuvor aktiver Zusatzdienst löst deshalb keinen
+    Rückfall aus, darf aber auch nicht als vollständig erfolgreicher
+    Updateabschluss erscheinen.
+    """
+
+    warnings: list[str] = []
+    active_before = set(prestate.active)
+    masked = set(prestate.masked)
+    for unit in prestate.target_bound_observers:
+        if unit not in active_before or unit in masked:
+            continue
+        if not _service_exists(unit):
+            _fail(
+                "E3DC-UPD-SERVICE-OBSERVER-001",
+                f"Der zuvor aktive Zusatzdienst {unit} ist nach dem bestätigten Releasewechsel nicht mehr vorhanden.",
+                f"Prüfe die Unit mit sudo systemctl status {unit} --no-pager und stelle sie wieder her oder deaktiviere sie bewusst; der neue E3DC-Control-Release bleibt installiert.",
+            )
+        started = _run(["/usr/bin/systemctl", "start", unit], timeout=60)
+        if started.returncode != 0 or not _service_active(unit):
+            detail = (started.stderr or started.stdout or "keine Detailausgabe").strip()
+            _fail(
+                "E3DC-UPD-SERVICE-OBSERVER-002",
+                f"Der zuvor aktive Zusatzdienst {unit} konnte nach dem bestätigten Releasewechsel nicht wieder gestartet werden: {detail}",
+                f"Prüfe sudo journalctl -u {unit} --no-pager -n 120 und starte den Dienst anschließend mit sudo systemctl start {unit}; der neue E3DC-Control-Release bleibt installiert.",
+            )
     return warnings
 
 
@@ -1153,57 +1931,348 @@ def _create_stopped_data_backup(target_root: Path, backup_path: Path) -> tuple[P
     return Path(created), guard
 
 
-def _copy_release_files(release_root: Path, target_root: Path) -> None:
-    """Überschreibt Produktdateien, ohne unbekannte Nutzerdaten zu löschen."""
+def _fd_mount_id(descriptor: int) -> str:
+    """Bindet einen offenen Deskriptor zusätzlich zur Geräte-ID an seinen Mount."""
 
-    rsync = shutil.which("rsync")
-    if not rsync:
-        _fail(
-            "E3DC-UPD-DEP-001",
-            "Das für den Dateiaustausch benötigte rsync fehlt.",
-            "Installiere es mit: sudo apt-get install -y rsync",
+    try:
+        payload = Path(f"/proc/self/fdinfo/{descriptor}").read_text(
+            encoding="ascii",
+            errors="strict",
         )
-    _run(
-        [
-            rsync,
-            "-a",
-            "--checksum",
-            "--delay-updates",
-            "--exclude=/.git",
-            str(release_root) + "/",
-            str(target_root) + "/",
-        ],
-        check=True,
-        timeout=180,
+    except OSError as exc:
+        raise RuntimeError(
+            "Die Mount-Bindung für den sicheren Dateiaustausch ist nicht verfügbar"
+        ) from exc
+    for line in payload.splitlines():
+        if line.startswith("mnt_id:"):
+            value = line.partition(":")[2].strip()
+            if value.isdigit():
+                return value
+    raise RuntimeError("Die Mount-ID des Zielpfads konnte nicht gebunden werden")
+
+
+def _projection_failure(path: Path, detail: str) -> None:
+    _fail(
+        "E3DC-UPD-PROJECTION-001",
+        f"Der Zielpfad kann nicht sicher durch den neuen Releasebaum ersetzt werden: {path} ({detail}).",
+        f"Prüfe den Pfad mit sudo namei -l {shlex.quote(str(path))} und sudo findmnt -T {shlex.quote(str(path))}; "
+        "entferne dort Symlink, Spezialdatei oder verschachtelten Mount und starte danach denselben Ein-Datei-Updater erneut.",
     )
 
 
-def _set_release_tree_ownership(
-    release_root: Path,
-    target_root: Path,
-    install_user: str,
-) -> None:
-    """Setzt Rechte nur für Dateien des neuen Releases, nicht für fremde Daten."""
+def _open_bound_projection_directory(
+    parent_fd: int,
+    name: str,
+    display_path: Path,
+    *,
+    root_device: int,
+    root_mount_id: str,
+    uid: int,
+    gid: int,
+    mode: int,
+) -> int:
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    if not nofollow or not directory:
+        raise RuntimeError("Sichere fd-relative Releaseprojektion ist nicht verfügbar")
+    flags = os.O_RDONLY | nofollow | directory | cloexec
+    try:
+        descriptor = os.open(name, flags, dir_fd=parent_fd)
+    except FileNotFoundError:
+        os.mkdir(name, 0o700, dir_fd=parent_fd)
+        descriptor = os.open(name, flags, dir_fd=parent_fd)
+    except OSError as exc:
+        _projection_failure(display_path, str(exc))
+        raise AssertionError("unreachable")
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_dev != root_device
+            or _fd_mount_id(descriptor) != root_mount_id
+        ):
+            _projection_failure(display_path, "anderes Dateisystem oder verschachtelter Mount")
+        # Solange in diesem Verzeichnis noch benannte Tempdateien publiziert
+        # werden, darf der Installationsnutzer es nicht parallel verändern.
+        # Die endgültigen Metadaten setzt der Aufrufer erst nach dem fsync des
+        # vollständigen Unterbaums.
+        os.fchown(descriptor, 0, 0)
+        os.fchmod(descriptor, 0o700)
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
 
-    account = pwd.getpwnam(install_user)
-    web_gid = grp.getgrnam("www-data").gr_gid
-    os.chown(target_root, account.pw_uid, web_gid)
-    os.chmod(target_root, 0o755)
-    for source_dir, dirnames, filenames in os.walk(release_root, followlinks=False):
-        relative_dir = Path(source_dir).relative_to(release_root)
-        if relative_dir.parts and relative_dir.parts[0] == ".git":
-            dirnames[:] = []
-            continue
-        dirnames[:] = [name for name in dirnames if name != ".git"]
-        target_dir = target_root / relative_dir
-        if target_dir.exists() and not target_dir.is_symlink():
-            os.chown(target_dir, account.pw_uid, web_gid)
-        for name in filenames:
-            if not relative_dir.parts and name == ".git":
-                continue
-            target = target_dir / name
-            if target.exists() or target.is_symlink():
-                os.lchown(target, account.pw_uid, web_gid)
+
+def _project_regular_file(
+    source: Path,
+    parent_fd: int,
+    name: str,
+    display_path: Path,
+    *,
+    root_device: int,
+    root_mount_id: str,
+    uid: int,
+    gid: int,
+    mode: int | None = None,
+) -> None:
+    """Publiziert eine neue Inode; Ziel-Hardlinks und Symlink-Referenten bleiben unberührt."""
+
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    if not nofollow:
+        raise RuntimeError("Sichere fd-relative Releaseprojektion ist nicht verfügbar")
+    source_fd = os.open(source, os.O_RDONLY | nofollow | cloexec)
+    temporary_name = f".e3dc-release-{os.getpid()}-{os.urandom(12).hex()}"
+    temporary_fd = -1
+    replaced = False
+    try:
+        source_before = os.stat(source, follow_symlinks=False)
+        source_opened = os.fstat(source_fd)
+        if (
+            not stat.S_ISREG(source_opened.st_mode)
+            or (source_before.st_dev, source_before.st_ino)
+            != (source_opened.st_dev, source_opened.st_ino)
+        ):
+            raise RuntimeError(f"Releasequelle ist keine gebundene reguläre Datei: {source}")
+
+        try:
+            target_metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            target_metadata = None
+        if target_metadata is not None:
+            if stat.S_ISDIR(target_metadata.st_mode):
+                _projection_failure(display_path, "Verzeichnis steht anstelle einer Release-Datei")
+            if stat.S_ISREG(target_metadata.st_mode):
+                target_fd = os.open(name, os.O_RDONLY | nofollow | cloexec, dir_fd=parent_fd)
+                try:
+                    opened_target = os.fstat(target_fd)
+                    if (
+                        opened_target.st_dev != root_device
+                        or _fd_mount_id(target_fd) != root_mount_id
+                    ):
+                        _projection_failure(
+                            display_path,
+                            "Datei liegt auf einem verschachtelten Mount",
+                        )
+                finally:
+                    os.close(target_fd)
+            elif not stat.S_ISLNK(target_metadata.st_mode):
+                _projection_failure(display_path, "Spezialdatei steht anstelle einer Release-Datei")
+
+        temporary_fd = os.open(
+            temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | cloexec,
+            0o600,
+            dir_fd=parent_fd,
+        )
+        while True:
+            chunk = os.read(source_fd, 1024 * 1024)
+            if not chunk:
+                break
+            offset = 0
+            while offset < len(chunk):
+                offset += os.write(temporary_fd, chunk[offset:])
+        final_mode = (
+            stat.S_IMODE(source_opened.st_mode) & 0o777
+            if mode is None
+            else mode
+        )
+        os.fchown(temporary_fd, uid, gid)
+        os.fchmod(temporary_fd, final_mode)
+        os.fsync(temporary_fd)
+        os.replace(
+            temporary_name,
+            name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+        os.fsync(parent_fd)
+        replaced = True
+    finally:
+        os.close(source_fd)
+        if temporary_fd >= 0:
+            os.close(temporary_fd)
+        if not replaced:
+            try:
+                os.unlink(temporary_name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+
+
+def _project_release_symlink(
+    source_root: Path,
+    source: Path,
+    parent_fd: int,
+    name: str,
+    display_path: Path,
+    *,
+    uid: int,
+    gid: int,
+) -> None:
+    """Projiziert ausschließlich relative, innerhalb des Releasebaums bleibende Links."""
+
+    link_target = os.readlink(source)
+    if (
+        not link_target
+        or os.path.isabs(link_target)
+        or any(character in link_target for character in ("\x00", "\r", "\n"))
+    ):
+        raise RuntimeError(f"Unsicheres Symlinkziel im Ziel-Release: {source}")
+    lexical_target = Path(os.path.abspath(source.parent / link_target))
+    try:
+        lexical_target.relative_to(source_root)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Symlink im Ziel-Release verlässt den Releasebaum: {source} -> {link_target}"
+        ) from exc
+
+    try:
+        target_metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        target_metadata = None
+    if target_metadata is not None:
+        if stat.S_ISDIR(target_metadata.st_mode):
+            _projection_failure(
+                display_path,
+                "Verzeichnis steht anstelle eines Release-Symlinks",
+            )
+        if not (
+            stat.S_ISREG(target_metadata.st_mode)
+            or stat.S_ISLNK(target_metadata.st_mode)
+        ):
+            _projection_failure(
+                display_path,
+                "Spezialdatei steht anstelle eines Release-Symlinks",
+            )
+
+    temporary_name = f".e3dc-release-link-{os.getpid()}-{os.urandom(12).hex()}"
+    published = False
+    try:
+        os.symlink(link_target, temporary_name, dir_fd=parent_fd)
+        os.chown(
+            temporary_name,
+            uid,
+            gid,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        os.replace(
+            temporary_name,
+            name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+        os.fsync(parent_fd)
+        published = True
+    finally:
+        if not published:
+            try:
+                os.unlink(temporary_name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+
+
+def _project_release_tree(
+    source_root: Path,
+    target_root: Path,
+    *,
+    uid: int,
+    gid: int,
+    root_mode: int,
+    directory_mode: int | None = None,
+    file_mode: int | None = None,
+    excluded_top_level: frozenset[str] = frozenset(),
+) -> None:
+    """Projiziert Release-Dateien fd-relativ, nofollow und mountgebunden."""
+
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    if not nofollow or not directory:
+        raise RuntimeError("Sichere fd-relative Releaseprojektion ist nicht verfügbar")
+    source_root = source_root.resolve(strict=True)
+    target_root.mkdir(parents=True, exist_ok=True)
+    root_fd = os.open(target_root, os.O_RDONLY | nofollow | directory | cloexec)
+    completed = False
+    try:
+        root_metadata = os.fstat(root_fd)
+        root_device = root_metadata.st_dev
+        root_mount_id = _fd_mount_id(root_fd)
+        os.fchown(root_fd, 0, 0)
+        os.fchmod(root_fd, 0o700)
+
+        def project_directory(source_dir: Path, destination_fd: int, relative: tuple[str, ...]) -> None:
+            for entry in sorted(os.scandir(source_dir), key=lambda item: item.name):
+                if not relative and entry.name in excluded_top_level:
+                    continue
+                source_path = source_dir / entry.name
+                metadata = entry.stat(follow_symlinks=False)
+                display = target_root.joinpath(*relative, entry.name)
+                if stat.S_ISDIR(metadata.st_mode):
+                    mode = directory_mode
+                    if mode is None:
+                        mode = stat.S_IMODE(metadata.st_mode) & 0o777
+                    child_fd = _open_bound_projection_directory(
+                        destination_fd,
+                        entry.name,
+                        display,
+                        root_device=root_device,
+                        root_mount_id=root_mount_id,
+                        uid=uid,
+                        gid=gid,
+                        mode=mode,
+                    )
+                    try:
+                        project_directory(source_path, child_fd, (*relative, entry.name))
+                        os.fsync(child_fd)
+                        os.fchown(child_fd, uid, gid)
+                        os.fchmod(child_fd, mode)
+                        os.fsync(child_fd)
+                    finally:
+                        os.close(child_fd)
+                elif stat.S_ISREG(metadata.st_mode):
+                    _project_regular_file(
+                        source_path,
+                        destination_fd,
+                        entry.name,
+                        display,
+                        root_device=root_device,
+                        root_mount_id=root_mount_id,
+                        uid=uid,
+                        gid=gid,
+                        mode=file_mode,
+                    )
+                elif stat.S_ISLNK(metadata.st_mode):
+                    _project_release_symlink(
+                        source_root,
+                        source_path,
+                        destination_fd,
+                        entry.name,
+                        display,
+                        uid=uid,
+                        gid=gid,
+                    )
+                else:
+                    raise RuntimeError(
+                        f"Ziel-Release enthält einen nicht unterstützten Spezialpfad: {source_path}"
+                    )
+
+        project_directory(source_root, root_fd, ())
+        os.fsync(root_fd)
+        os.fchown(root_fd, uid, gid)
+        os.fchmod(root_fd, root_mode)
+        os.fsync(root_fd)
+        completed = True
+    finally:
+        if not completed:
+            try:
+                os.fchown(root_fd, root_metadata.st_uid, root_metadata.st_gid)
+                os.fchmod(root_fd, stat.S_IMODE(root_metadata.st_mode))
+            except (OSError, UnboundLocalError):
+                pass
+        os.close(root_fd)
 
 
 def _replace_product_tree(
@@ -1213,46 +2282,129 @@ def _replace_product_tree(
 ) -> None:
     """Projiziert den Zielbaum; vorhandene Git-Metadaten bleiben unbeachtet."""
 
-    _copy_release_files(release_root, target_root)
-    _set_release_tree_ownership(release_root, target_root, install_user)
+    account = pwd.getpwnam(install_user)
+    web_gid = grp.getgrnam("www-data").gr_gid
+    _project_release_tree(
+        release_root,
+        target_root,
+        uid=account.pw_uid,
+        gid=web_gid,
+        root_mode=0o755,
+        excluded_top_level=frozenset({".git"}),
+    )
 
 
 def _delete_approved_stale_paths(target_root: Path, policy: dict) -> None:
-    """Entfernt nur die im Ziel-Release ausdrücklich benannten alten Dateien."""
+    """Entfernt freigegebene Altdateien fd-relativ, nofollow und mountgebunden."""
 
-    allowed_roots = (target_root, Path("/var/www/html"))
+    raw_deletes = tuple(policy.get("delete_files") or ())
+    if not raw_deletes:
+        return
+
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    if not nofollow or not directory:
+        _fail(
+            "E3DC-UPD-WRITE-004",
+            "Sichere fd-relative Löschung veralteter Dateien ist auf diesem System nicht verfügbar. Es wurden keine Altdateien entfernt.",
+            "Python beziehungsweise das Linux-System aktualisieren und danach denselben Updatebefehl erneut starten.",
+        )
+
+    allowed_roots = tuple(
+        sorted(
+            (Path(os.path.abspath(target_root)), Path("/var/www/html")),
+            key=lambda item: len(str(item)),
+            reverse=True,
+        )
+    )
     errors: list[str] = []
-    for raw in policy.get("delete_files") or ():
+    for raw in raw_deletes:
         candidate = Path(str(raw))
         if not candidate.is_absolute():
             candidate = target_root / candidate
         candidate = Path(os.path.abspath(candidate))
-        if not any(
-            os.path.commonpath((str(candidate), str(root))) == str(root)
-            for root in allowed_roots
-        ):
+        selected_root: Path | None = None
+        relative: Path | None = None
+        for root in allowed_roots:
+            try:
+                bound_relative = candidate.relative_to(root)
+            except ValueError:
+                continue
+            if bound_relative.parts:
+                selected_root = root
+                relative = bound_relative
+                break
+        if selected_root is None or relative is None:
             errors.append(f"außerhalb des Produktbereichs: {candidate}")
             continue
-        if candidate in allowed_roots:
-            errors.append(f"Produktwurzel darf nicht als Löschziel verwendet werden: {candidate}")
-            continue
+
+        cloexec = getattr(os, "O_CLOEXEC", 0)
+        root_fd = -1
+        opened: list[int] = []
         try:
-            metadata = candidate.lstat()
-        except FileNotFoundError:
-            continue
+            root_fd = os.open(
+                selected_root,
+                os.O_RDONLY | nofollow | directory | cloexec,
+            )
+            root_metadata = os.fstat(root_fd)
+            root_device = root_metadata.st_dev
+            root_mount_id = _fd_mount_id(root_fd)
+            parent_fd = root_fd
+            missing = False
+            for depth, component in enumerate(relative.parts[:-1], start=1):
+                try:
+                    child_fd = os.open(
+                        component,
+                        os.O_RDONLY | nofollow | directory | cloexec,
+                        dir_fd=parent_fd,
+                    )
+                except FileNotFoundError:
+                    missing = True
+                    break
+                child_metadata = os.fstat(child_fd)
+                if (
+                    child_metadata.st_dev != root_device
+                    or _fd_mount_id(child_fd) != root_mount_id
+                ):
+                    os.close(child_fd)
+                    raise RuntimeError(
+                        "verschachtelter Mount in "
+                        + str(selected_root.joinpath(*relative.parts[:depth]))
+                    )
+                opened.append(child_fd)
+                parent_fd = child_fd
+            if missing:
+                continue
+            name = relative.parts[-1]
+            try:
+                metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISDIR(metadata.st_mode):
+                raise RuntimeError("Löschliste darf keine Verzeichnisse entfernen")
+            if stat.S_ISREG(metadata.st_mode):
+                target_fd = os.open(name, os.O_RDONLY | nofollow | cloexec, dir_fd=parent_fd)
+                try:
+                    if (
+                        os.fstat(target_fd).st_dev != root_device
+                        or _fd_mount_id(target_fd) != root_mount_id
+                    ):
+                        raise RuntimeError("Löschziel ist ein verschachtelter Mount")
+                finally:
+                    os.close(target_fd)
+            elif not stat.S_ISLNK(metadata.st_mode):
+                raise RuntimeError("Löschziel ist eine Spezialdatei")
+            os.unlink(name, dir_fd=parent_fd)
+            os.fsync(parent_fd)
         except OSError as exc:
             errors.append(f"{candidate}: {exc}")
-            continue
-        try:
-            if stat.S_ISDIR(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode):
-                if os.path.ismount(candidate):
-                    errors.append(f"Löschziel ist ein Mountpunkt: {candidate}")
-                    continue
-                shutil.rmtree(candidate)
-            else:
-                candidate.unlink()
-        except OSError as exc:
+        except RuntimeError as exc:
             errors.append(f"{candidate}: {exc}")
+        finally:
+            for descriptor in reversed(opened):
+                os.close(descriptor)
+            if root_fd >= 0:
+                os.close(root_fd)
     if errors:
         _fail(
             "E3DC-UPD-WRITE-004",
@@ -1432,6 +2584,7 @@ def _ensure_core_services(
     python: Path,
     dropin_payload: bytes | None,
     role: str = "off",
+    masked_units: Iterable[str] = (),
 ) -> None:
     """Ersetzt die Pflicht-Units direkt; der Altzustand ist keine Hürde."""
 
@@ -1530,7 +2683,10 @@ def _ensure_core_services(
             )
         start_condition = (str(python), str(start_gate))
 
+    masked = {_normalize_unit(unit) for unit in masked_units}
     for spec in specs:
+        if str(spec["unit"]) in masked:
+            continue
         script = installer / str(spec["script"])
         if not script.is_file():
             _fail(
@@ -1571,11 +2727,12 @@ def _ensure_role_service(
     dropin_payload: bytes | None,
     *,
     release_root: Path | None = None,
+    masked_units: Iterable[str] = (),
 ) -> str | None:
     unit = ROLE_SERVICE_BY_MODE.get(role)
     if unit is None:
         return None
-    if _service_masked(unit):
+    if unit in {_normalize_unit(item) for item in masked_units}:
         # Eine systemd-Maske ist ein ausdrückliches Nutzer-Aus. Sie bleibt
         # bytegenau erhalten und wird vom Reparatur-Updater nicht entmaskiert.
         return unit
@@ -1674,6 +2831,8 @@ def _prepare_npm_module(
     workdir: Path,
     install_user: str,
     module_name: str,
+    *,
+    stage_before_cutover: bool = False,
 ) -> tuple[Path, list[str]]:
     warnings: list[str] = []
     npm = _npm_executable()
@@ -1692,34 +2851,76 @@ def _prepare_npm_module(
         )
         return npm, warnings
     runuser = Path("/usr/sbin/runuser")
-    if not runuser.is_file() or not os.access(runuser, os.X_OK):
+    if (
+        not stage_before_cutover
+        and (not runuser.is_file() or not os.access(runuser, os.X_OK))
+    ):
         warnings.append(
             f"Optionales Modul {module_name}: runuser fehlt; npm-Abhängigkeiten "
             "wurden nicht automatisch repariert."
         )
         return npm, warnings
-    prepared = _run(
-        [
-            runuser,
-            "-u",
-            install_user,
-            "--",
-            npm,
-            "--prefix",
-            workdir,
-            "ci",
-            "--omit=dev",
-            "--ignore-scripts",
-        ],
-        timeout=240,
+    npm_command = [
+        npm,
+        "--prefix",
+        workdir,
+        "ci",
+        "--omit=dev",
+        "--ignore-scripts",
+    ]
+    command = (
+        npm_command
+        if stage_before_cutover
+        else [runuser, "-u", install_user, "--", *npm_command]
     )
+    prepared = _run(command, timeout=240)
     if prepared.returncode != 0:
         detail = (prepared.stderr or prepared.stdout or "unbekannter npm-Fehler").strip()
+        if stage_before_cutover:
+            shutil.rmtree(workdir / "node_modules", ignore_errors=True)
         warnings.append(
             f"Optionales Modul {module_name}: npm-Abhängigkeiten konnten nicht "
             f"repariert werden ({detail})."
         )
     return npm, warnings
+
+
+def _prepare_selected_release_dependencies(
+    release_root: Path,
+    install_user: str,
+    selected_units: Iterable[str],
+) -> tuple[frozenset[str], list[str]]:
+    """Erledigt optionale Netz-/Paketarbeit vollständig vor dem Dienststopp."""
+
+    from Installer.service_catalog import get_module_by_service
+
+    prepared: set[str] = set()
+    warnings: list[str] = []
+    installer = release_root / "Installer"
+    for raw_unit in sorted({_normalize_unit(unit) for unit in selected_units}):
+        module = get_module_by_service(raw_unit)
+        if module is None or str(module.runner or "python").strip().lower() != "npm":
+            continue
+        workdir = _catalog_target_path(
+            installer,
+            module.working_directory or ".",
+            label="Modul-Arbeitsverzeichnis",
+        )
+        _npm, npm_warnings = _prepare_npm_module(
+            workdir,
+            install_user,
+            raw_unit,
+            stage_before_cutover=True,
+        )
+        if npm_warnings:
+            detail = "; ".join(npm_warnings)
+            _fail(
+                "E3DC-UPD-DEP-005",
+                f"Die Abhängigkeiten des zuvor verwendeten Dienstes {raw_unit} konnten vor dem Dienststopp nicht vorbereitet werden: {detail}",
+                "Prüfe freien Speicherplatz, Netzwerkzugang sowie npm --version und starte danach denselben Ein-Datei-Updater erneut; die laufenden Dienste wurden noch nicht gestoppt.",
+            )
+        prepared.add(raw_unit)
+    return frozenset(prepared), warnings
 
 
 def _ensure_selected_catalog_services(
@@ -1729,6 +2930,8 @@ def _ensure_selected_catalog_services(
     role: str,
     dropin_payload: bytes | None,
     selected_units: Iterable[str],
+    masked_units: Iterable[str] = (),
+    prepared_npm_units: Iterable[str] = (),
 ) -> list[str]:
     """Projiziert nur optionale Module, die vorher aktiv oder enabled waren."""
 
@@ -1737,10 +2940,13 @@ def _ensure_selected_catalog_services(
     warnings: list[str] = []
     installer = target_root / "Installer"
     excluded = set(CORE_RESULT_SERVICES) | set(ROLE_SERVICE_BY_MODE.values())
+    masked = {_normalize_unit(unit) for unit in masked_units}
+    prepared_npm = {_normalize_unit(unit) for unit in prepared_npm_units}
     selected = {
         _normalize_unit(unit)
         for unit in selected_units
         if _normalize_unit(unit) not in excluded
+        and _normalize_unit(unit) not in masked
     }
     start_condition: tuple[str, ...] = ()
     if selected and role in {"master", "slave", "shadow"}:
@@ -1783,8 +2989,11 @@ def _ensure_selected_catalog_services(
         if runner == "python":
             argv = (str(python), "-u", str(script))
         elif runner == "npm":
-            npm, npm_warnings = _prepare_npm_module(workdir, install_user, unit)
-            warnings.extend(npm_warnings)
+            if unit in prepared_npm:
+                npm = _npm_executable() or Path("/usr/bin/npm")
+            else:
+                npm, npm_warnings = _prepare_npm_module(workdir, install_user, unit)
+                warnings.extend(npm_warnings)
             argv = (str(npm), "run", "start")
             after = ("network-online.target", "avahi-daemon.service")
             wants = ("network-online.target", "avahi-daemon.service")
@@ -1828,54 +3037,312 @@ def _sync_web_tree(
     destination: Path = Path("/var/www/html"),
 ) -> None:
     source = target_root / "html"
-    destination.mkdir(parents=True, exist_ok=True)
-    rsync = shutil.which("rsync")
-    if not rsync:
-        raise RuntimeError("rsync fehlt trotz vorbereitender Paketinstallation")
-    command = [rsync, "-a", "--checksum", "--delay-updates"]
-    for name in sorted(PRESERVED_WEB_ENTRIES):
-        command.extend(["--exclude", name])
-    command.extend([str(source) + "/", str(destination) + "/"])
-    _run(command, check=True, timeout=180)
+    www_gid = grp.getgrnam("www-data").gr_gid
+    _project_release_tree(
+        source,
+        destination,
+        uid=0,
+        gid=www_gid,
+        root_mode=0o755,
+        directory_mode=0o755,
+        file_mode=0o644,
+        excluded_top_level=PRESERVED_WEB_ENTRIES,
+    )
+
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    root_fd = os.open(destination, os.O_RDONLY | nofollow | directory | cloexec)
+    try:
+        root_metadata = os.fstat(root_fd)
+        root_device = root_metadata.st_dev
+        root_mount_id = _fd_mount_id(root_fd)
+        for name in sorted(PRESERVED_WEB_DIRS):
+            runtime_fd = _open_bound_projection_directory(
+                root_fd,
+                name,
+                destination / name,
+                root_device=root_device,
+                root_mount_id=root_mount_id,
+                uid=0,
+                gid=www_gid,
+                mode=0o700,
+            )
+            try:
+                os.fchown(runtime_fd, 0, www_gid)
+                os.fchmod(runtime_fd, 0o700)
+                os.fsync(runtime_fd)
+            finally:
+                os.close(runtime_fd)
+        for name in ("VERSION", "CHANGELOG.md", "UPDATE_POLICY.json"):
+            _project_regular_file(
+                target_root / name,
+                root_fd,
+                name,
+                destination / name,
+                root_device=root_device,
+                root_mount_id=root_mount_id,
+                uid=0,
+                gid=www_gid,
+                mode=0o644,
+            )
+    finally:
+        os.close(root_fd)
+
+
+def _permission_contract_for_preserved_entry(
+    top_name: str,
+    relative: tuple[str, ...],
+    *,
+    install_uid: int,
+    www_uid: int,
+    www_gid: int,
+    data_dir_mode: int,
+    data_file_mode: int,
+) -> tuple[int, int, int, int]:
+    """Liefert Owner und Modi für genau einen erhaltenen Web-Eintrag."""
+
+    if top_name == "data":
+        if relative and relative[0] == "matter-storage":
+            return install_uid, www_gid, 0o700, 0o600
+        if relative and relative[0] == ".wallbox_plan_jobs":
+            return www_uid, www_gid, 0o700, 0o600
+        if relative[:2] == ("config_backups", "aux_inverter_migration"):
+            return install_uid, www_gid, 0o700, 0o600
+        if relative in {
+            ("wallbox_mode5_user_start_request.json",),
+            ("wallbox_mode5_user_start_request.json.lock",),
+        }:
+            return www_uid, www_gid, data_dir_mode, 0o660
+        return install_uid, www_gid, data_dir_mode, data_file_mode
+    if top_name == "history_backups":
+        return install_uid, www_gid, 0o750, 0o640
+    if top_name == "tmp" and relative and relative[0] in {
+        "rule_calm_current",
+        "rule_calm_uploads",
+    }:
+        return www_uid, www_gid, 0o700, 0o600
+    if (
+        top_name == "ramdisk"
+        and relative
+        and relative[0].startswith("rule_calm_analysis.json")
+    ):
+        return www_uid, www_gid, 0o2775, 0o600
+    return install_uid, www_gid, 0o2775, 0o664
+
+
+def _copy_bound_regular_file(
+    parent_fd: int,
+    name: str,
+    source_fd: int,
+    *,
+    uid: int,
+    gid: int,
+    mode: int,
+) -> None:
+    """Bricht einen Mehrfachlink im gebundenen Verzeichnis ohne Fremd-Chown."""
+
+    temporary_name = f".e3dc-permissions-{os.getpid()}-{os.urandom(12).hex()}"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+    temporary_fd = os.open(temporary_name, flags, 0o600, dir_fd=parent_fd)
+    replaced = False
+    try:
+        os.lseek(source_fd, 0, os.SEEK_SET)
+        while True:
+            chunk = os.read(source_fd, 1024 * 1024)
+            if not chunk:
+                break
+            offset = 0
+            while offset < len(chunk):
+                offset += os.write(temporary_fd, chunk[offset:])
+        os.fchown(temporary_fd, uid, gid)
+        os.fchmod(temporary_fd, mode)
+        os.fsync(temporary_fd)
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        source = os.fstat(source_fd)
+        if (current.st_dev, current.st_ino) != (source.st_dev, source.st_ino):
+            raise RuntimeError(f"Erhaltener Web-Eintrag wechselte während der Rechteprojektion: {name}")
+        os.replace(
+            temporary_name,
+            name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+        os.fsync(parent_fd)
+        secured = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(secured.st_mode)
+            or secured.st_nlink != 1
+            or secured.st_uid != uid
+            or secured.st_gid != gid
+            or stat.S_IMODE(secured.st_mode) != mode
+        ):
+            raise RuntimeError(f"Mehrfachlink-Rechteprojektion blieb unvollständig: {name}")
+        replaced = True
+    finally:
+        os.close(temporary_fd)
+        if not replaced:
+            try:
+                os.unlink(temporary_name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+
+
+def _normalize_preserved_web_permissions(
+    destination: Path,
+    install_user: str,
+    config: dict,
+) -> None:
+    """Normalisiert erhaltene Nutzer-/Laufzeitdaten fd-relativ und symlinkfrei."""
+
+    from Installer.config_secret_permissions import config_secret_dir_mode, config_secret_file_mode
 
     account = pwd.getpwnam(install_user)
+    web_account = pwd.getpwnam("www-data")
     www_gid = grp.getgrnam("www-data").gr_gid
-    os.chown(destination, 0, www_gid)
-    os.chmod(destination, 0o755)
-    for source_dir, dirnames, filenames in os.walk(source, followlinks=False):
-        relative = Path(source_dir).relative_to(source)
-        target_dir = destination / relative
-        os.chown(target_dir, 0, www_gid)
-        os.chmod(target_dir, 0o755)
-        for name in filenames:
-            target = target_dir / name
-            os.chown(target, 0, www_gid)
-            os.chmod(target, 0o644)
+    data_dir_mode = config_secret_dir_mode(config)
+    data_file_mode = config_secret_file_mode(config)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory_flag = getattr(os, "O_DIRECTORY", 0)
+    if not nofollow or not directory_flag:
+        raise RuntimeError("Sichere fd-relative Rechteprojektion ist nicht verfügbar")
+    open_flags = os.O_RDONLY | nofollow | directory_flag | getattr(os, "O_CLOEXEC", 0)
+    root_fd = os.open(destination, open_flags)
 
-    for name in PRESERVED_WEB_DIRS:
-        runtime_dir = destination / name
-        runtime_dir.mkdir(parents=True, exist_ok=True)
-        os.chown(runtime_dir, account.pw_uid, www_gid)
-        os.chmod(runtime_dir, 0o2775)
+    def normalize_regular(
+        parent_fd: int,
+        name: str,
+        before: os.stat_result,
+        *,
+        uid: int,
+        gid: int,
+        mode: int,
+        device: int,
+    ) -> None:
+        flags = os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0)
+        descriptor = os.open(name, flags, dir_fd=parent_fd)
+        try:
+            current = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(current.st_mode)
+                or current.st_dev != device
+                or (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino)
+            ):
+                return
+            if current.st_nlink > 1:
+                _copy_bound_regular_file(
+                    parent_fd,
+                    name,
+                    descriptor,
+                    uid=uid,
+                    gid=gid,
+                    mode=mode,
+                )
+                return
+            os.fchown(descriptor, uid, gid)
+            os.fchmod(descriptor, mode)
+            secured = os.fstat(descriptor)
+            named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if (
+                (secured.st_dev, secured.st_ino) != (named.st_dev, named.st_ino)
+                or secured.st_uid != uid
+                or secured.st_gid != gid
+                or stat.S_IMODE(secured.st_mode) != mode
+            ):
+                raise RuntimeError(f"Rechteprojektion blieb unvollständig: {name}")
+        finally:
+            os.close(descriptor)
 
-    preserved_modes = {
-        "e3dc.config.txt": 0o640,
-        "e3dc.strompreise.txt": 0o640,
-        "e3dc.wallbox.out": 0o664,
-        "e3dc.wallbox.txt": 0o640,
-        "live_history.txt": 0o664,
-    }
-    for name, mode in preserved_modes.items():
-        preserved = destination / name
-        if preserved.is_file() and not preserved.is_symlink():
-            os.chown(preserved, account.pw_uid, www_gid)
-            os.chmod(preserved, mode)
+    def normalize_directory(
+        parent_fd: int,
+        name: str,
+        top_name: str,
+        relative: tuple[str, ...],
+        device: int,
+    ) -> None:
+        before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(before.st_mode) or before.st_dev != device:
+            return
+        descriptor = os.open(name, open_flags, dir_fd=parent_fd)
+        try:
+            current = os.fstat(descriptor)
+            if (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino):
+                raise RuntimeError(f"Erhaltener Web-Pfad wechselte beim Öffnen: {name}")
+            for child_name in sorted(os.listdir(descriptor)):
+                child = os.stat(child_name, dir_fd=descriptor, follow_symlinks=False)
+                child_relative = (*relative, child_name)
+                uid, gid, dir_mode, file_mode = _permission_contract_for_preserved_entry(
+                    top_name,
+                    child_relative,
+                    install_uid=account.pw_uid,
+                    www_uid=web_account.pw_uid,
+                    www_gid=www_gid,
+                    data_dir_mode=data_dir_mode,
+                    data_file_mode=data_file_mode,
+                )
+                if stat.S_ISDIR(child.st_mode):
+                    normalize_directory(
+                        descriptor,
+                        child_name,
+                        top_name,
+                        child_relative,
+                        device,
+                    )
+                elif stat.S_ISREG(child.st_mode):
+                    normalize_regular(
+                        descriptor,
+                        child_name,
+                        child,
+                        uid=uid,
+                        gid=gid,
+                        mode=file_mode,
+                        device=device,
+                    )
+            uid, gid, dir_mode, _file_mode = _permission_contract_for_preserved_entry(
+                top_name,
+                relative,
+                install_uid=account.pw_uid,
+                www_uid=web_account.pw_uid,
+                www_gid=www_gid,
+                data_dir_mode=data_dir_mode,
+                data_file_mode=data_file_mode,
+            )
+            os.fchown(descriptor, uid, gid)
+            os.fchmod(descriptor, dir_mode)
+        finally:
+            os.close(descriptor)
 
-    for name in ("VERSION", "CHANGELOG.md", "UPDATE_POLICY.json"):
-        target = destination / name
-        shutil.copy2(target_root / name, target)
-        os.chown(target, 0, www_gid)
-        os.chmod(target, 0o644)
+    try:
+        root = os.fstat(root_fd)
+        if not stat.S_ISDIR(root.st_mode):
+            raise RuntimeError("Webroot ist kein echtes Verzeichnis")
+        top_file_modes = {
+            "e3dc.config.txt": 0o640,
+            "e3dc.strompreise.txt": 0o640,
+            "e3dc.wallbox.out": 0o664,
+            "e3dc.wallbox.txt": 0o640,
+            "e3dc_paths.json": 0o640,
+            "live_history.txt": 0o664,
+        }
+        for name in sorted(PRESERVED_WEB_ENTRIES):
+            try:
+                entry = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISDIR(entry.st_mode):
+                normalize_directory(root_fd, name, name, (), entry.st_dev)
+            elif stat.S_ISREG(entry.st_mode) and name in top_file_modes:
+                normalize_regular(
+                    root_fd,
+                    name,
+                    entry,
+                    uid=account.pw_uid,
+                    gid=www_gid,
+                    mode=top_file_modes[name],
+                    device=entry.st_dev,
+                )
+    finally:
+        os.close(root_fd)
 
 
 def _atomic_write_file(path: Path, payload: bytes, *, uid: int, gid: int, mode: int) -> None:
@@ -1982,6 +3449,7 @@ def _project_path_metadata(
             f"[WARNUNG] {v4_path} ist nicht als JSON lesbar und bleibt unverändert: {exc}",
             flush=True,
         )
+    secret_mode_source = {} if v4 is None else (v4 if v4 else config)
     if v4 is not None:
         v4.update(
             {
@@ -1997,15 +3465,15 @@ def _project_path_metadata(
         if role in {"master", "slave"} and peer_ip:
             v4["ha_peer_ip"] = peer_ip
         v4_payload = (json.dumps(v4, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
-        os.chown(data_dir, account.pw_uid, www_gid)
-        os.chmod(data_dir, config_secret_dir_mode(v4))
         _atomic_write_file(
             v4_path,
             v4_payload,
             uid=account.pw_uid,
             gid=www_gid,
-            mode=config_secret_file_mode(v4),
+            mode=config_secret_file_mode(secret_mode_source),
         )
+    os.chown(data_dir, account.pw_uid, www_gid)
+    os.chmod(data_dir, config_secret_dir_mode(secret_mode_source))
 
     paths = {
         "install_user": install_user,
@@ -2210,6 +3678,7 @@ def _repair_units_and_permissions(
     venv_python: Path,
     service_prestate: ServicePrestate | None = None,
     selected_catalog_units: Iterable[str] = (),
+    prepared_npm_units: Iterable[str] = (),
     *,
     require_role_peer: bool = False,
 ) -> list[str]:
@@ -2223,6 +3692,7 @@ def _repair_units_and_permissions(
         venv_python,
         dropin_payload,
         role,
+        (() if service_prestate is None else service_prestate.masked),
     )
     _ensure_role_service(
         target_root,
@@ -2231,6 +3701,7 @@ def _repair_units_and_permissions(
         role,
         dropin_payload,
         release_root=release_root,
+        masked_units=(() if service_prestate is None else service_prestate.masked),
     )
     if service_prestate is not None:
         warnings.extend(
@@ -2245,6 +3716,8 @@ def _repair_units_and_permissions(
                     *service_prestate.catalog_active,
                     *service_prestate.catalog_enabled,
                 ),
+                service_prestate.masked,
+                prepared_npm_units,
             )
         )
     _project_path_metadata(
@@ -2253,6 +3726,11 @@ def _repair_units_and_permissions(
         role,
         config,
         require_peer=require_role_peer,
+    )
+    _normalize_preserved_web_permissions(
+        Path("/var/www/html"),
+        install_user,
+        config,
     )
     warnings.extend(_install_privileged_entrypoints(release_root, target_root, install_user))
 
@@ -2291,6 +3769,7 @@ def _services_to_start(
     enabled_before: tuple[str, ...] = (),
     *,
     role_service_intended: bool | None = None,
+    masked_units: Iterable[str] = (),
 ) -> tuple[str, ...]:
     from Installer.service_catalog import allowed_services
 
@@ -2333,8 +3812,13 @@ def _services_to_start(
         if role in {"master", "slave"} and "piguard.service" in active_before:
             services.append("piguard.service")
     services.append("apache2.service")
+    masked = {_normalize_unit(unit) for unit in masked_units}
     seen: set[str] = set()
-    return tuple(unit for unit in services if not (unit in seen or seen.add(unit)))
+    return tuple(
+        unit
+        for unit in services
+        if unit not in masked and not (unit in seen or seen.add(unit))
+    )
 
 
 def _services_to_enable(
@@ -2382,6 +3866,7 @@ def _services_to_enable(
         enabled.update(enabled_before & set(CORE_RESULT_SERVICES))
         if role_service in enabled_before or role_service_missing:
             enabled.update(CORE_RESULT_SERVICES)
+    enabled.difference_update(prestate.masked)
     return tuple(sorted(enabled))
 
 
@@ -2390,10 +3875,12 @@ def _required_services(
     selected_catalog_units: Iterable[str] = (),
     *,
     role_service_intended: bool = False,
+    masked_units: Iterable[str] = (),
 ) -> tuple[str, ...]:
     from Installer.service_catalog import LOAD_ACTIVE_CONTROL, get_module_by_service, service_load_profile
 
     selected_units = {_normalize_unit(unit) for unit in selected_catalog_units}
+    masked = {_normalize_unit(unit) for unit in masked_units}
     role_service = ROLE_SERVICE_BY_MODE.get(role)
     if role != "off":
         if (
@@ -2406,10 +3893,14 @@ def _required_services(
             # jedoch auf genau die Dienste, die auf diesem Master oder zuvor
             # aktiven Slave-Failover vor dem kurzen Cutover aktiv waren. Ein
             # reiner Standby-Slave erhält keine zusätzliche Startforderung.
-            return tuple(dict.fromkeys((role_service, *sorted(selected_units))))
+            return tuple(
+                unit
+                for unit in dict.fromkeys((role_service, *sorted(selected_units)))
+                if unit not in masked
+            )
         return (
             (role_service,)
-            if role_service_intended and role_service is not None
+            if role_service_intended and role_service is not None and role_service not in masked
             else ()
         )
     active_controllers = []
@@ -2419,12 +3910,14 @@ def _required_services(
         if module is not None and service_load_profile(module) == LOAD_ACTIVE_CONTROL:
             active_controllers.append(unit)
     return tuple(
-        dict.fromkeys(
+        unit
+        for unit in dict.fromkeys(
             (
                 *CORE_RESULT_SERVICES,
                 *active_controllers,
             )
         )
+        if unit not in masked
     )
 
 
@@ -2448,7 +3941,8 @@ def _forbidden_services_after_start(
         else role_service_intended
     )
     forbidden = {
-        *prestate.confirmed_unknown_writers,
+        *prestate.cutover_unknown_units,
+        *prestate.masked,
         "e3dc.service",
         *LEGACY_SERVICE_MIGRATIONS,
         *(
@@ -2494,6 +3988,7 @@ def _services_to_disable_after_success(
         if _normalize_unit(item) != role_service
     }
     units.update({"piguard.service", "luxtronik.service"})
+    units.difference_update(prestate.masked)
     return tuple(sorted(units))
 
 
@@ -2502,6 +3997,7 @@ def _start_services(
     *,
     required: tuple[str, ...],
     enable_services: tuple[str, ...],
+    masked_units: Iterable[str] = (),
 ) -> list[str]:
     print("[4/4] Starte Dienste neu …", flush=True)
     reload_result = _run(["/usr/bin/systemctl", "daemon-reload"], timeout=60)
@@ -2512,9 +4008,12 @@ def _start_services(
             "Führe sudo systemctl daemon-reload aus und starte danach denselben Updatebefehl erneut.",
         )
     warnings: list[str] = []
-    required_set = set(required) | {"apache2.service"}
-    enable_set = set(enable_services)
+    masked = {_normalize_unit(unit) for unit in masked_units}
+    required_set = (set(required) | {"apache2.service"}) - masked
+    enable_set = set(enable_services) - masked
     for unit in services:
+        if unit in masked:
+            continue
         if not _service_exists(unit):
             if unit in required_set:
                 _fail(
@@ -2563,6 +4062,7 @@ def _final_confirmation(
     forbidden_services: Iterable[str] = (),
     *,
     required_writer_admission_mode: str = "",
+    masked_units: Iterable[str] = (),
 ) -> list[str]:
     version = (target_root / "VERSION").read_text(encoding="utf-8").strip()
     if version != expected_version:
@@ -2579,7 +4079,8 @@ def _final_confirmation(
             "Starte den Ein-Datei-Updater erneut; das Vollbackup bleibt erhalten.",
         )
 
-    required = set(required_services) | {"apache2.service"}
+    masked = {_normalize_unit(unit) for unit in masked_units}
+    required = (set(required_services) | {"apache2.service"}) - masked
     forbidden = {_normalize_unit(unit) for unit in forbidden_services}
     pending = set(required)
     deadline = time.monotonic() + 30.0
@@ -2677,6 +4178,103 @@ def _final_confirmation(
     return []
 
 
+def _postflight_python_programming_warnings(
+    units: Iterable[str],
+) -> list[str]:
+    """Meldet frische interne Python-Fehler rein diagnostisch.
+
+    Die systemd-Invocation bindet den Befund an genau den soeben gestarteten
+    Prozess. Journalfehler und fachliche Laufzeitfehler verändern weder das
+    strukturelle Endgate noch den bestätigten Releasezustand.
+    """
+
+    programming_error = re.compile(
+        r"(?:\b(?:NameError|UnboundLocalError|SyntaxError|IndentationError|TabError)\s*:"
+        r"|\bname ['\"][A-Za-z_][A-Za-z0-9_]*['\"] is not defined\b"
+        r"|\bcannot access local variable ['\"][^'\"]+['\"] where it is not associated with a value\b"
+        r"|\blocal variable ['\"][^'\"]+['\"] referenced before assignment\b)"
+    )
+    loop_exception = re.compile(
+        r"(?:Fehler im Regel-Durchlauf|Unerwarteter Fehler im [^:]*Loop|"
+        r"Fehler im (?:[^: ]+ )?Loop):\s*(.+)",
+        re.IGNORECASE,
+    )
+    warnings: list[str] = []
+    seen: set[str] = set()
+    for raw_unit in units:
+        unit = _normalize_unit(raw_unit)
+        if not raw_unit or unit in seen or _is_update_runtime_unit(unit):
+            continue
+        seen.add(unit)
+        try:
+            if not _service_active(unit):
+                continue
+            invocation_result = _run(
+                [
+                    "/usr/bin/systemctl",
+                    "show",
+                    unit,
+                    "--property=InvocationID",
+                    "--value",
+                ],
+                timeout=5,
+            )
+            invocation_id = invocation_result.stdout.strip().lower()
+            if (
+                invocation_result.returncode != 0
+                or not re.fullmatch(r"[0-9a-f]{32}", invocation_id)
+                or invocation_id == "0" * 32
+            ):
+                continue
+            journal = _run(
+                [
+                    "/usr/bin/journalctl",
+                    "--quiet",
+                    "--no-pager",
+                    "--output=cat",
+                    "-u",
+                    unit,
+                    f"_SYSTEMD_INVOCATION_ID={invocation_id}",
+                    "-n",
+                    "200",
+                ],
+                timeout=5,
+            )
+            if journal.returncode != 0:
+                continue
+            journal_text = journal.stdout or ""
+            has_programming_error = programming_error.search(journal_text) is not None
+            loop_counts: dict[str, int] = {}
+            for line in journal_text.splitlines():
+                match = loop_exception.search(line)
+                if match is None:
+                    continue
+                signature = match.group(1).strip()
+                if signature:
+                    loop_counts[signature] = loop_counts.get(signature, 0) + 1
+            repeated_loop_exception = any(count >= 2 for count in loop_counts.values())
+            if not has_programming_error and not repeated_loop_exception:
+                continue
+            reasons = []
+            if has_programming_error:
+                reasons.append("einen eindeutigen internen Python-Programmierfehler")
+            if repeated_loop_exception:
+                reasons.append("eine wiederholte frische Loop-Ausnahme")
+            journal_command = (
+                f"sudo journalctl -u {shlex.quote(unit)} "
+                f"_SYSTEMD_INVOCATION_ID={invocation_id} --no-pager -n 120"
+            )
+            warnings.append(
+                f"{unit} meldet in der aktuellen systemd-Invocation "
+                f"{' und '.join(reasons)}. Das Update bleibt bestätigt. "
+                f"Details: {journal_command}"
+            )
+        except Exception:
+            # Diese Nachdiagnose ist ausdrücklich kein neues Update-Endgate.
+            continue
+    return warnings
+
+
 def _start_previous_services_best_effort(
     active_before: tuple[str, ...],
     *,
@@ -2738,18 +4336,78 @@ def _restore_service_enablement_best_effort(
     prestate: ServicePrestate,
     touched_units: Iterable[str],
 ) -> None:
-    """Stellt nach einem fehlgeschlagenen Wechsel den Enable-Vorzustand her."""
+    """Stellt den gebundenen persistenten/runtime Enable-Zustand wieder her."""
 
-    enabled_before = set(prestate.enabled)
+    desired_states = prestate.enable_state_map
+    desired_fragments = prestate.fragment_path_map
+    masked = set(prestate.masked)
+    enabled_states = {"enabled", "enabled-runtime", "linked", "linked-runtime"}
     for raw_unit in dict.fromkeys(_normalize_unit(item) for item in touched_units):
         unit = _normalize_unit(raw_unit)
-        if not _service_exists(unit):
+        if unit in masked:
             continue
-        should_enable = unit in enabled_before
-        if _service_enabled(unit) == should_enable:
+        desired = desired_states.get(
+            unit,
+            "enabled" if unit in set(prestate.enabled) else "disabled",
+        )
+        current = _service_enable_state(unit)
+        fragment = desired_fragments.get(unit, "")
+        fragment_matches = not (
+            desired in enabled_states
+            and fragment
+            and _service_fragment_path(unit) != fragment
+        )
+        if current == desired and fragment_matches:
             continue
-        action = "enable" if should_enable else "disable"
-        _run(["/usr/bin/systemctl", action, unit], timeout=60)
+        _run(["/usr/bin/systemctl", "disable", "--runtime", unit], timeout=60)
+        _run(["/usr/bin/systemctl", "disable", unit], timeout=60)
+        if desired in {"enabled", "enabled-runtime"}:
+            command = ["/usr/bin/systemctl", "enable"]
+            if desired == "enabled-runtime":
+                command.append("--runtime")
+            command.append(fragment or unit)
+            _run(command, timeout=60)
+        elif desired in {"linked", "linked-runtime"} and fragment:
+            command = ["/usr/bin/systemctl", "link"]
+            if desired == "linked-runtime":
+                command.append("--runtime")
+            command.append(fragment)
+            _run(command, timeout=60)
+
+
+def _service_enablement_mismatches(
+    prestate: ServicePrestate,
+    units: Iterable[str],
+) -> tuple[str, ...]:
+    """Vergleicht Zustand und Linkquelle ohne masked-Zustände zu duplizieren."""
+
+    desired_states = prestate.enable_state_map
+    desired_fragments = prestate.fragment_path_map
+    masked = set(prestate.masked)
+    mismatches: list[str] = []
+    for raw_unit in dict.fromkeys(_normalize_unit(item) for item in units):
+        unit = _normalize_unit(raw_unit)
+        if unit in masked:
+            continue
+        desired = desired_states.get(
+            unit,
+            "enabled" if unit in set(prestate.enabled) else "disabled",
+        )
+        actual = _service_enable_state(unit)
+        if actual != desired:
+            mismatches.append(f"{unit}={actual or 'leer'} statt {desired or 'leer'}")
+            continue
+        expected_fragment = desired_fragments.get(unit, "")
+        if (
+            desired in {"enabled", "enabled-runtime", "linked", "linked-runtime"}
+            and expected_fragment
+        ):
+            actual_fragment = _service_fragment_path(unit)
+            if actual_fragment != expected_fragment:
+                mismatches.append(
+                    f"{unit}=FragmentPath {actual_fragment or 'leer'} statt {expected_fragment}"
+                )
+    return tuple(mismatches)
 
 
 def _restore_apache_security_enablement_best_effort(
@@ -2853,6 +4511,16 @@ def _restore_preupdate_state(
             "E3DC-Control-Dienste bleiben bis dahin gestoppt.",
         )
 
+    mask_mismatch = _restore_service_masks_best_effort(prestate)
+    if mask_mismatch:
+        return (
+            False,
+            "Der gesicherte Dateistand wurde wiederhergestellt, aber der frühere "
+            "systemd-Maskenzustand blieb abweichend: "
+            + "; ".join(mask_mismatch)
+            + ". Die E3DC-Control-Dienste bleiben gestoppt.",
+        )
+
     touched_units = tuple(
         dict.fromkeys(
             (
@@ -2863,14 +4531,9 @@ def _restore_preupdate_state(
         )
     )
     _restore_service_enablement_best_effort(prestate, touched_units)
-    enabled_before = set(prestate.enabled)
-    enablement_mismatch = tuple(
-        sorted(
-            unit
-            for unit in prestate.present
-            if _service_exists(unit)
-            and _service_enabled(unit) != (unit in enabled_before)
-        )
+    enablement_mismatch = _service_enablement_mismatches(
+        prestate,
+        prestate.present,
     )
     if enablement_mismatch:
         return (
@@ -2885,7 +4548,7 @@ def _restore_preupdate_state(
         prestate.active,
         allow_legacy=True,
         role=role,
-        extra_units=prestate.confirmed_unknown_writers,
+        extra_units=prestate.cutover_unknown_units,
         exact_prestate=True,
     )
     if start_failed:
@@ -2962,7 +4625,7 @@ def _recover_failed_cutover(
         allow_legacy=True,
         role=role,
         extra_units=(
-            prestate.confirmed_unknown_writers if prestate is not None else ()
+            prestate.cutover_unknown_units if prestate is not None else ()
         ),
         exact_prestate=True,
     )
@@ -3003,6 +4666,7 @@ def perform_update(
     install_user: str,
     tag: str,
     role: str,
+    bound_peer_ip: str = "",
 ) -> int:
     release_root = RELEASE_ROOT
     policy = _load_policy(release_root)
@@ -3023,6 +4687,7 @@ def perform_update(
         replacement_confirmed = False
         services: tuple[str, ...] = ()
         enable_services: tuple[str, ...] = ()
+        prepared_npm_units: frozenset[str] = frozenset()
         warnings: list[str] = []
         try:
             backup_path = _create_backup(target_root)
@@ -3031,11 +4696,12 @@ def perform_update(
             config = _bind_role_context(
                 role,
                 existing_config,
+                bound_peer_ip=bound_peer_ip,
                 require_peer=(
                     role in {"master", "slave"} and role_service_intended
                 ),
             )
-            service_prestate = _capture_service_prestate()
+            service_prestate = _capture_service_prestate(target_root)
             selected_catalog_units = tuple(
                 dict.fromkeys(
                     (
@@ -3065,13 +4731,14 @@ def perform_update(
                 install_user,
                 config,
                 selected_catalog_units,
+                target_version=tag.removeprefix("v"),
             )
-            if not shutil.which("rsync"):
-                _fail(
-                    "E3DC-UPD-DEP-001",
-                    "rsync fehlt auch nach dem automatischen Reparaturversuch.",
-                    "Installiere es mit: sudo apt-get install -y rsync",
-                )
+            prepared_npm_units, npm_warnings = _prepare_selected_release_dependencies(
+                release_root,
+                install_user,
+                selected_catalog_units,
+            )
+            warnings.extend(npm_warnings)
             active_before = service_prestate.active
             cutover_started = True
             _stop_for_cutover(service_prestate.cutover_scope)
@@ -3099,6 +4766,7 @@ def perform_update(
                     venv_python,
                     service_prestate,
                     selected_catalog_units,
+                    prepared_npm_units,
                     require_role_peer=(
                         role in {"master", "slave"} and role_service_intended
                     ),
@@ -3110,6 +4778,7 @@ def perform_update(
                 role,
                 service_prestate.enabled,
                 role_service_intended=role_service_intended,
+                masked_units=service_prestate.masked,
             )
             enable_services = _services_to_enable(
                 service_prestate,
@@ -3124,6 +4793,7 @@ def perform_update(
                     *migrated_active_targets,
                 ),
                 role_service_intended=role_service_intended,
+                masked_units=service_prestate.masked,
             )
             required_writer_admission_mode = (
                 role
@@ -3139,8 +4809,17 @@ def perform_update(
                     services,
                     required=required,
                     enable_services=enable_services,
+                    masked_units=service_prestate.masked,
                 )
             )
+            mask_mismatch = _service_mask_mismatches(service_prestate)
+            if mask_mismatch:
+                _fail(
+                    "E3DC-UPD-SERVICE-MASK-002",
+                    "Ein ausdrücklich maskierter Dienstzustand wurde beim Releasewechsel verändert: "
+                    + "; ".join(mask_mismatch),
+                    "Stelle die genannte Unit mit sudo systemctl mask <unit> beziehungsweise sudo systemctl mask --runtime <unit> wieder auf Aus und starte danach denselben Updatebefehl erneut.",
+                )
             warnings.extend(
                 _final_confirmation(
                     target_root,
@@ -3152,10 +4831,19 @@ def perform_update(
                         role_service_intended=role_service_intended,
                     ),
                     required_writer_admission_mode=required_writer_admission_mode,
+                    masked_units=service_prestate.masked,
                 )
             )
             replacement_confirmed = True
+            warnings.extend(
+                _postflight_python_programming_warnings(
+                    (*services, *required),
+                )
+            )
             warnings.extend(_retire_unknown_active_e3dc(service_prestate))
+            warnings.extend(
+                _restart_target_bound_observers_after_success(service_prestate)
+            )
             _disable_competing_controllers(
                 role,
                 (
@@ -3227,7 +4915,7 @@ def perform_update(
                 "E3DC-UPD-APPLY-001",
                 f"Der Dateiaustausch konnte nicht vollständig abgeschlossen werden: {exc}",
                 recovery_solution
-                or "Starte den Ein-Datei-Updater erneut; das vorhandene Vollbackup bleibt erhalten.",
+                or _apply_failure_solution(str(exc), target_root),
                 system_state=state,
             )
     finally:
@@ -3246,6 +4934,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--install-user", required=True)
     parser.add_argument("--tag", required=True)
     parser.add_argument("--role", choices=("off", "master", "slave", "shadow"), required=True)
+    parser.add_argument("--peer-ip", default="")
     return parser
 
 
@@ -3257,6 +4946,7 @@ def main(argv: list[str] | None = None) -> int:
             install_user=args.install_user,
             tag=args.tag,
             role=args.role,
+            bound_peer_ip=args.peer_ip,
         )
     except UpdateFailure as exc:
         print(f"\n[ABBRUCH] {exc.code}", file=sys.stderr)

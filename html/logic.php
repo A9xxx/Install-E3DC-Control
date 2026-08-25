@@ -14,7 +14,7 @@ $wpMax = 5000;
 $pvMax = 10000; // Fallback
 $maxBatPower = 3000; // Fallback
 $batteryCapacity = 0; // Fallback
-$gridMaxAmps = 63; // Fallback (Ampere pro Phase)
+$gridMaxAmps = 35; // Fallback (Ampere pro Phase)
 $lat = 51.16; $lon = 10.45; // Default (Mitte DE)
 $pvStrings = [];
 $showForecast = true; // Default an
@@ -149,7 +149,7 @@ if (!$useLogicCache) {
             $trimmed = trim($line);
             if ($trimmed === 'Data') { $readingData = true; $lastTime = -1; $dayOffset = 0; continue; }
             if ($trimmed === 'DV' || $trimmed === 'Simulation') { $readingData = false; $lastTime = -1; $dayOffset = 0; continue; }
-            
+
             $cols = preg_split('/\s+/', $trimmed);
             if (count($cols) < 1 || !is_numeric($cols[0])) continue;
 
@@ -171,7 +171,7 @@ if (!$useLogicCache) {
 
     foreach ($chartDataMap as $h => $val) { if (empty($priceHistory)) $priceStartHour = (float)$h; elseif (count($priceHistory) === 1) $priceInterval = max(0.25, (float)$h - $priceStartHour); $priceHistory[] = $val; }
     foreach ($forecastDataMap as $h => $val) { $forecastData[] = ['h' => (float)$h, 'w' => $val]; }
-    
+
     @file_put_contents($logicCacheFile, json_encode([
         'mtime' => $mtimeSum,
         'priceHistory' => $priceHistory,
@@ -212,7 +212,7 @@ if ($stablePvForecastKwh <= 0.0) {
             $last23 = $t23;
             $tAbs23 = $t23 + $off23;
             // Die Datei beginnt um 23.00 (tAbs = 23).
-            // Um 0.00 springt tAbs auf 24.00. Der komplette nächste Tag (die echte "heute" Prognose) 
+            // Um 0.00 springt tAbs auf 24.00. Der komplette nächste Tag (die echte "heute" Prognose)
             // liegt also im Bereich tAbs23 >= 24.0 und tAbs23 < 48.0.
             if ($tAbs23 >= 24 && $tAbs23 < 48) {
                 // Slot-Intervall aus Zeitdifferenz bestimmen (typisch 0.25h = 15 Min)
@@ -260,18 +260,18 @@ if (file_exists($pvForecastFile)) {
                 }
             }
         }
-        
+
         foreach ($pvForecastsParsed as $pf) {
             $tsMs = $pf['start_timestamp'];
             // Nur Daten für "Heute" betrachten (0-24h)
             if ($tsMs >= $midnightMs && $tsMs < $midnightMs + (24 * 3600 * 1000)) {
                 $h = ($tsMs - $midnightMs) / (3600 * 1000);
-                
+
                 // solar.js erwartet Watt ('w') in entry.w und multipliziert selbst mit 0.25h
                 // predicted_kwh liefert laut get_forecast_data.php tatsächlich kW! (wird dort mit 0.25 multipliziert)
                 // W = kW * 1000
                 $energy_w = (float)$pf['predicted_kwh'] * 1000;
-                
+
                 $forecastData[] = ['h' => (float)$h, 'w' => $energy_w];
                 $slotKwh = ((float)$pf['predicted_kwh'] * 0.25);
                 $stablePvForecastKwh += $slotKwh;
@@ -294,7 +294,7 @@ if (file_exists($ecoScoreFile)) {
         $priceHistory = [];
         $midnightMs = strtotime('today') * 1000;
         $activeTariffStartMs = -1;
-        
+
         foreach ($ecoScoresParsed as $score) {
             $tsMs = $score['start_timestamp'];
             // Sammle Preise für Heute (0-24h) für die Trend-Linie
@@ -305,7 +305,7 @@ if (file_exists($ecoScoreFile)) {
                 $priceHistory[] = (float)$score['billing_price'];
             }
         }
-        
+
         if ($activeTariffStartMs !== -1) {
             $h = ($activeTariffStartMs - $midnightMs) / (3600 * 1000);
             $priceStartHour = (int)floor($h);

@@ -793,16 +793,19 @@ def _vehicle_profile_for_identity(
 def vehicle_phase_capability_from_profiles(
     profiles: Optional[Iterable[Dict[str, Any]]],
     status: Optional[Dict[str, Any]] = None,
+    config: Optional[Dict[str, Any]] = None,
+    charger_id: int = 1,
 ) -> Dict[str, Any]:
-    """Belegt Fahrzeugphasen nur aus der aktuellen, eindeutigen Stecksession.
+    """Belegt Fahrzeugphasen aus Session, Fahrerprofil oder Wallbox-Fahrzeugkonfiguration."""
 
-    Ladepunktwerte und aus einer Gesamtleistung abgeleitete Phasen bleiben
-    Planungsannahmen. Für eine vorgelagerte Wattzuteilung ist ausschließlich
-    ein explizites Phasenfeld eines eindeutig zur bestätigten Stecksession
-    passenden Fahrzeugprofils autoritativ.
-    """
+    st = status if isinstance(status, dict) else {}
+    cfg = config if isinstance(config, dict) else {}
+    try:
+        cid = int(charger_id or 1)
+    except (TypeError, ValueError):
+        cid = 1
 
-    identity = confirmed_session_vehicle_identity(status)
+    identity = confirmed_session_vehicle_identity(st)
     result = {
         "contract": "vehicle_phase_capability_v1",
         "active": False,
@@ -814,34 +817,89 @@ def vehicle_phase_capability_from_profiles(
         "phase_source": "none",
         "reason": "vehicle_identity_unconfirmed",
     }
-    if not identity.get("confirmed", False):
-        return result
 
-    profile = _vehicle_profile_for_identity(profiles, identity.get("key"))
-    if not profile:
-        result["reason"] = "confirmed_vehicle_profile_not_unique"
-        return result
-    result["profile_match"] = True
+    # Evidenzstufe 2: Aktuell bestätigtes Sitzungs-/Fahrerprofil
+    if identity.get("confirmed", False):
+        profile = _vehicle_profile_for_identity(profiles, identity.get("key"))
+        if profile:
+            result["profile_match"] = True
+            for key in (
+                "max_phases",
+                "obc_max_phases",
+                "phases",
+                "ac_phases",
+                "charge_phases",
+                "charging_phases",
+            ):
+                phases = valid_phase_count(profile.get(key), 0)
+                if phases:
+                    result.update({
+                        "active": True,
+                        "phase_count": int(phases),
+                        "phase_source": "confirmed_session_vehicle_profile",
+                        "reason": "confirmed_session_vehicle_phase_profile",
+                    })
+                    return result
+            result["reason"] = "confirmed_vehicle_explicit_phase_missing"
+            return result
 
-    for key in (
-        "max_phases",
-        "obc_max_phases",
-        "phases",
-        "ac_phases",
-        "charge_phases",
-        "charging_phases",
-    ):
-        phases = valid_phase_count(profile.get(key), 0)
+    # Evidenzstufe 3: Ausdrücklich ausgewähltes und WB-zugeordnetes Fahrzeugprofil
+    configured_key = (
+        cfg.get(f"wb{cid}_car_id")
+        or cfg.get(f"wb{cid}_vehicle_id")
+        or cfg.get(f"wb{cid}_selected_car_id")
+        or cfg.get(f"wb{cid}_car_profile")
+        or ""
+    )
+    if configured_key:
+        profile = _vehicle_profile_for_identity(profiles, configured_key)
+        if not profile and isinstance(profiles, (list, tuple)):
+            norm_key = str(configured_key).strip().lower()
+            for p in profiles:
+                if not isinstance(p, dict):
+                    continue
+                p_id = str(p.get("id") or "").strip().lower()
+                p_name = str(p.get("name") or "").strip().lower()
+                if norm_key in (p_id, p_name):
+                    profile = p
+                    break
+        if profile:
+            result["profile_match"] = True
+            result["identity_confirmed"] = False
+            result["identity_source"] = "configured_selected_vehicle_profile"
+            for key in (
+                "max_phases",
+                "obc_max_phases",
+                "phases",
+                "ac_phases",
+                "charge_phases",
+                "charging_phases",
+            ):
+                phases = valid_phase_count(profile.get(key), 0)
+                if phases:
+                    result.update({
+                        "active": True,
+                        "phase_count": int(phases),
+                        "phase_source": "configured_selected_vehicle_profile",
+                        "reason": "configured_selected_vehicle_phase_profile",
+                    })
+                    return result
+            result["reason"] = "configured_vehicle_explicit_phase_missing"
+            return result
+
+    for key in (f"wb{cid}_obc_max_phases",):
+        phases = valid_phase_count(cfg.get(key), 0)
         if phases:
             result.update({
                 "active": True,
+                "identity_confirmed": True,
+                "identity_source": "configured_wallbox_obc_max_phases",
                 "phase_count": int(phases),
-                "phase_source": key,
-                "reason": "confirmed_session_vehicle_phase_profile",
+                "phase_source": "configured_wallbox_obc_max_phases",
+                "reason": "configured_wallbox_obc_max_phases",
             })
             return result
 
-    result["reason"] = "confirmed_vehicle_explicit_phase_missing"
     return result
 
 
@@ -1733,6 +1791,8 @@ def phase_observation_contract(
     status: Optional[Dict[str, Any]] = None,
     c_data: Optional[Dict[str, Any]] = None,
     *,
+    config: Optional[Dict[str, Any]] = None,
+    charger_id: int = 1,
     detected_phases: int = 1,
     vehicle_max_phases: int = 0,
     phase_cap_phases: int = 0,
@@ -1743,10 +1803,11 @@ def phase_observation_contract(
     charger_class_name: str = "",
     driver_variant: str = "",
 ) -> Dict[str, Any]:
-    """Normalisiert Phasenbelege in einen Diagnosevertrag."""
+    """Normalisiert Phasenbelege in einen typisierten Phasenvertrag."""
 
     st = status or {}
     cd = c_data or {}
+    cfg = config or {}
     cap = phase_capability if isinstance(phase_capability, dict) else {}
     vehicle_cap = (
         vehicle_phase_capability
@@ -1759,7 +1820,23 @@ def phase_observation_contract(
     actual = valid_phase_count(st.get("phases_actual"), 0)
     switch_phases = valid_phase_count(phase_switch_phases, 0)
     cap_phases = valid_phase_count(phase_cap_phases, 0)
-    vehicle_phases = valid_phase_count(vehicle_max_phases, 0)
+    vehicle_phases = valid_phase_count(
+        vehicle_max_phases or vehicle_cap.get("phase_count"),
+        0,
+    )
+    vehicle_profile_phase_bound = bool(
+        vehicle_cap.get("contract") == "vehicle_phase_capability_v1"
+        and vehicle_cap.get("active") is True
+        and valid_phase_count(vehicle_cap.get("phase_count"), 0) == vehicle_phases
+        and (
+            vehicle_cap.get("identity_confirmed") is True
+            or str(vehicle_cap.get("identity_source") or "")
+            in {
+                "configured_selected_vehicle_profile",
+                "configured_wallbox_obc_max_phases",
+            }
+        )
+    )
     cable_phases = valid_phase_count(
         st.get("cable_phases", st.get("connected_phases", st.get("number_phases"))),
         0,
@@ -1767,7 +1844,8 @@ def phase_observation_contract(
     wallbox_phases = valid_phase_count(
         st.get("wallbox_phases", st.get("wallbox_max_phases")),
         0,
-    ) or cable_phases
+    ) or cable_phases or 3
+    evse_supply_phases = max(1, min(3, int(wallbox_phases or cable_phases or 3)))
 
     measured_phases = 0
     if bool(st.get("phase_power_verified", False)):
@@ -1800,65 +1878,106 @@ def phase_observation_contract(
     normalized_driver = str(driver_variant or st.get("driver_variant", "") or "")
     if charger_class_name == "E3DCMultiConnectCharger" or normalized_driver in {"e3dc_multi_connect", "e3dc_rscp"}:
         can_switch = False
+    if charger_class_name == "E3DCCharger" and normalized_driver == "e3dc_native":
+        can_switch = False
+    evse_phase_switch_capable = bool(can_switch)
+
     native_fixed_three_phase = bool(
-        charger_class_name == "E3DCCharger"
-        and normalized_driver == "e3dc_native"
+        (charger_class_name in ("E3DCCharger", "E3DCMultiConnectCharger") or normalized_driver in ("e3dc_native", "e3dc_multi_connect", "e3dc_rscp"))
         and not can_switch
         and not session_1p_only
         and cable_phases >= 3
         and wallbox_phases >= 3
     )
+
+    phase_evidence_valid = False
+    reason_code = "none"
+    vehicle_phase_source = "none"
+
     if actual_phases:
         effective = actual_phases
         basis = actual_source
-    elif native_fixed_three_phase:
-        effective = 3
-        basis = "fixed_wallbox_3p"
-    elif vehicle_phases == 1 or session_1p_only:
+        phase_evidence_valid = True
+        reason_code = f"measured_live_charging_{actual_phases}p"
+        vehicle_phase_source = "measured_power"
+    elif session_1p_only or (
+        vehicle_profile_phase_bound and vehicle_phases == 1
+    ):
         effective = 1
         basis = "vehicle_1p"
+        phase_evidence_valid = True
+        vehicle_phase_source = str(
+            vehicle_cap.get("phase_source") or "configured_selected_vehicle_profile"
+        )
+        if evse_supply_phases >= 3 and not evse_phase_switch_capable:
+            reason_code = "vehicle_profile_1p_on_fixed_3p_evse"
+        else:
+            reason_code = "vehicle_profile_1p"
+    elif vehicle_profile_phase_bound and vehicle_phases >= 3:
+        effective = min(evse_supply_phases, vehicle_phases)
+        basis = "vehicle_profile"
+        phase_evidence_valid = True
+        vehicle_phase_source = str(
+            vehicle_cap.get("phase_source") or "configured_selected_vehicle_profile"
+        )
+        reason_code = f"vehicle_profile_{effective}p"
     elif switch_phases:
         effective = switch_phases
         basis = "switch"
+        phase_evidence_valid = True
+        vehicle_phase_source = "evse_switch_target"
+        reason_code = f"evse_switch_target_{switch_phases}p"
     elif target:
         effective = target
         basis = "target"
+        phase_evidence_valid = True
+        vehicle_phase_source = "evse_target"
+        reason_code = f"evse_target_{target}p"
     elif cap_phases:
         effective = cap_phases
         basis = "phase_cap"
-    elif actual:
-        effective = actual
-        basis = "actual"
+        phase_evidence_valid = True
+        vehicle_phase_source = "evse_cap"
+        reason_code = f"evse_cap_{cap_phases}p"
+    elif native_fixed_three_phase:
+        effective = 3
+        basis = "fixed_wallbox_3p"
+        phase_evidence_valid = False
+        vehicle_phase_source = "evse_topology_fallback"
+        reason_code = "fixed_wallbox_3p_evse_topology"
     elif wallbox_phases and charger_class_name != "OpenWBCharger":
         effective = wallbox_phases
         basis = "wallbox"
+        phase_evidence_valid = False
+        vehicle_phase_source = "evse_topology_fallback"
+        reason_code = "wallbox_topology_fallback"
     else:
         effective = detected
         basis = "detected"
+        phase_evidence_valid = False
+        vehicle_phase_source = "evse_topology_fallback"
+        reason_code = "detected_topology_fallback"
 
     effective = max(1, min(3, int(effective or 1)))
-    vehicle_profile_phase_bound = bool(
-        vehicle_cap.get("contract") == "vehicle_phase_capability_v1"
-        and vehicle_cap.get("active") is True
-        and vehicle_cap.get("identity_confirmed") is True
-        and vehicle_cap.get("session_bound") is True
-        and vehicle_cap.get("profile_match") is True
-        and valid_phase_count(vehicle_cap.get("phase_count"), 0)
-        == vehicle_phases
-    )
-
     return {
         "actual_phases": int(actual_phases),
         "actual_source": actual_source,
         "effective_phases": int(effective),
         "effective_source": basis,
+        "effective_load_phases": int(effective),
+        "evse_supply_phases": int(evse_supply_phases),
+        "evse_phase_switch_capable": bool(evse_phase_switch_capable),
+        "vehicle_ac_max_phases": int(vehicle_phases),
+        "vehicle_phase_source": str(vehicle_phase_source),
+        "phase_evidence_valid": bool(phase_evidence_valid),
+        "reason_code": str(reason_code),
         "detected_phases": int(detected),
         "target_phases": int(target),
         "switch_phases": int(switch_phases),
         "cap_phases": int(cap_phases),
         "cable_phases": int(cable_phases),
         "vehicle_max_phases": int(vehicle_phases),
-        "vehicle_profile_phase_bound": vehicle_profile_phase_bound,
+        "vehicle_profile_phase_bound": bool(vehicle_profile_phase_bound),
         "vehicle_profile_phase_source": str(
             vehicle_cap.get("phase_source") or "none"
         ),
@@ -1883,55 +2002,15 @@ def vehicle_max_ac_phases_from_profiles(
     profiles: Optional[Iterable[Dict[str, Any]]] = None,
     status: Optional[Dict[str, Any]] = None,
 ) -> int:
-    """Liefert die Planungsphasen eines bestätigten aktiven Fahrzeugs.
-
-    Der Aufrufer übergibt ``profiles``, damit diese Hilfe rein bleibt. Eine
-    statische Wallbox-Zuordnung oder ein SoC-/Cloud-Profil darf die aktuelle
-    Stecksession nicht identifizieren.
-    """
-    cfg = config or {}
-    st = status or {}
-    try:
-        cid = int(charger_id or 1)
-    except (TypeError, ValueError):
-        cid = 1
-
-    identity = confirmed_session_vehicle_identity(st)
-    profile = _vehicle_profile_for_identity(
+    """Liefert die Planungsphasen eines bestätigten oder konfigurierten Fahrzeugs."""
+    cap = vehicle_phase_capability_from_profiles(
         profiles,
-        identity.get("key") if identity.get("confirmed", False) else "",
+        status=status,
+        config=config,
+        charger_id=charger_id,
     )
-    if profile:
-        for key in ("max_phases", "obc_max_phases", "phases", "ac_phases", "charge_phases", "charging_phases"):
-            phases = valid_phase_count(profile.get(key), 0)
-            if phases:
-                return phases
-
-        for key in ("power", "charge_power", "charge_power_kw", "ac_power_kw", "max_ac_power_kw"):
-            try:
-                power_kw = float(str(profile.get(key, "")).replace(",", "."))
-            except (TypeError, ValueError):
-                continue
-            if 0.1 <= power_kw <= 7.6:
-                return 1
-            if power_kw > 7.6:
-                return 3
-
-    for key in (f"wb{cid}_obc_max_phases",):
-        phases = valid_phase_count(cfg.get(key), 0)
-        if phases:
-            return phases
-
-    for key in (f"wb{cid}_charge_power", f"wb{cid}_power", f"wb{cid}_charge_power_kw", f"wb{cid}_ac_power_kw", f"wb{cid}_max_ac_power_kw"):
-        try:
-            power_kw = float(str(cfg.get(key, "")).replace(",", "."))
-        except (TypeError, ValueError):
-            continue
-        if 0.1 <= power_kw <= 7.6:
-            return 1
-        if power_kw > 7.6:
-            return 3
-
+    if cap.get("active") and valid_phase_count(cap.get("phase_count"), 0):
+        return int(cap["phase_count"])
     return 0
 
 
@@ -1990,6 +2069,8 @@ def wallbox_executable_budget(
     status: Optional[Dict[str, Any]] = None,
     c_data: Optional[Dict[str, Any]] = None,
     *,
+    config: Optional[Dict[str, Any]] = None,
+    charger_id: int = 1,
     allowed_w: float = 0.0,
     detected_phases: int = 1,
     min_amp: int = 6,
@@ -2002,6 +2083,7 @@ def wallbox_executable_budget(
     require_one_phase: bool = False,
     grid_unlocked: bool = False,
     phase_capability: Optional[Dict[str, Any]] = None,
+    vehicle_phase_capability: Optional[Dict[str, Any]] = None,
     charger_class_name: str = "",
     driver_variant: str = "",
 ) -> Dict[str, Any]:
@@ -2020,6 +2102,8 @@ def wallbox_executable_budget(
     phase_contract = phase_observation_contract(
         st,
         cd,
+        config=config,
+        charger_id=charger_id,
         detected_phases=detected,
         vehicle_max_phases=vehicle_phases,
         phase_cap_phases=cap_phases,
@@ -2031,6 +2115,7 @@ def wallbox_executable_budget(
             "source": st.get("phase_switch_source", ""),
             "api_surface": st.get("api_surface", ""),
         },
+        vehicle_phase_capability=vehicle_phase_capability,
         charger_class_name=str(charger_class_name or cd.get("charger_class_name", "") or cd.get("_charger_class_name", "") or ""),
         driver_variant=str(driver_variant or st.get("driver_variant", "") or ""),
     )
@@ -2049,7 +2134,10 @@ def wallbox_executable_budget(
     )
     one_phase_ready = bool(
         int(phase_contract.get("actual_phases", 0) or 0) == 1
-        or int(phase_contract.get("vehicle_max_phases", 0) or 0) == 1
+        or (
+            phase_contract.get("vehicle_profile_phase_bound") is True
+            and int(phase_contract.get("vehicle_max_phases", 0) or 0) == 1
+        )
         or int(phase_contract.get("target_phases", 0) or 0) == 1
         or int(phase_contract.get("switch_phases", 0) or 0) == 1
         or (
@@ -2161,19 +2249,19 @@ def budget_to_target_current(
             )
         else:
             reason = "Budget %.0f W -> %s A bei %d Phase(n)." % (budget_w, target_amp, phases)
-    elif base_6a_active:
-        target_amp = _amp_value(float(min_amp_int), step_amp)
-        reason = "6A-Boden aktiv; Budget %.0f W unter Mindestleistung %.0f W." % (
-            budget_w,
-            min_power_w,
-        )
     else:
         target_amp = 0
-        reason = "Budget %.0f W < Mindestleistung %.0f W (%dp)." % (
-            budget_w,
-            min_power_w,
-            phases,
-        )
+        if base_6a_active:
+            reason = (
+                "6A-Boden angefordert, aber Budget %.0f W < Mindestleistung "
+                "%.0f W (%dp); keine Leistungsautorität."
+            ) % (budget_w, min_power_w, phases)
+        else:
+            reason = "Budget %.0f W < Mindestleistung %.0f W (%dp)." % (
+                budget_w,
+                min_power_w,
+                phases,
+            )
 
     house_fuse_limited = False
     if apply_house_fuse and house_fuse_cap_amp is not None and target_amp > 0:
@@ -2554,8 +2642,7 @@ def pv_hybrid_energy_gate(
         and (
             hw_charging
             or hw_power > 500.0
-            or current >= minimum
-            or set_amp >= minimum
+            or (current >= minimum and hw_power > 100.0)
         )
     )
     inferred_running_power_w = max(current, set_amp) * min_power / float(minimum)
@@ -2565,9 +2652,15 @@ def pv_hybrid_energy_gate(
         else max(0.0, inferred_running_power_w)
     )
     uncovered_hold_w = max(0.0, running_power_w - budget, grid_w) if running else 0.0
-    start_signal = bool(charger_connected and cap >= minimum and budget >= max(1.0, min_power - 120.0))
-    stop_signal = bool(running and (cap <= 0 or budget < max(0.0, min_power - 120.0)))
     hard_stop = bool(grid_w >= hard_import)
+    start_signal = bool(
+        charger_connected
+        and not running
+        and (cap >= minimum or budget >= max(1.0, min_power - 120.0))
+        and budget >= max(1.0, min_power - 120.0)
+        and not hard_stop
+    )
+    stop_signal = bool(running and (budget < max(0.0, min_power - 120.0) or hard_stop))
     strong_start = bool(start_signal and (budget >= min_power + strong_w or cap >= minimum + 2))
 
     positive_wh = max(0.0, _safe_float(prev.get("positive_wh", 0.0), 0.0))
@@ -4188,6 +4281,7 @@ def multi_wallbox_allocation_contract(
             priority_waiting
             and not slot.get("running", False)
             and not slot.get("grid_allowed", False)
+            and not slot.get("allocated", False)
         )
         slot["priority_active"] = bool(is_priority and priority_target_active)
         slot["priority_waiting"] = bool(priority_waiting)

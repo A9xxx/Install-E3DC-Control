@@ -1,6 +1,28 @@
 # Speicher-Ladesteuerung - Systemablauf
 
-> **Stand:** v5.4.4c, fachliche Regelung unverändert gegenüber v5.4.4b
+> **Stand:** v5.4.4d
+>
+> **Neu in 5.4.4d:** Das gemeinsame Wallboxziel wird in allen von E3DC-Control
+> geführten Lademodi durch die konfigurierte Hausabsicherung abzüglich
+> Wallbox-Reserve begrenzt. In `Aus / autonom` muss dieselbe Grenze in der
+> Wallbox beziehungsweise im Ladeprofil hinterlegt sein, weil E3DC-Control
+> dort nach der Übergabe keine Strombefehle mehr sendet.
+> Optionale Grenz- und Reservewerte je Phase werden phasenbezogen angewendet;
+> bei unbekannter einphasiger Zuordnung gilt der ungünstigste Fall. Die Reserve
+> bildet den statisch konfigurierten Abstand für andere Verbraucher. Mangels
+> echter PCC-Phasen-RMS-Messung bleibt eine aus Wirkleistung durch `P/230`
+> abgeleitete Stromangabe rein diagnostisch und darf keine zusätzliche
+> Ladeleistung autorisieren.
+> Fehlt `grid_max_amps` oder ist der Wert leer, gelten 35 A je Phase. Mehrere
+> Ladepunkte teilen diesen Phasenrahmen ohne pauschale Gleichteilung. Ein
+> gebundenes einphasiges Fahrzeugprofil bestimmt die reale Lastphase; ohne
+> Fahrzeugbeleg bleibt die feste Wallboxtopologie maßgeblich.
+> Wird `wbminsoc` während der Ladung über den aktuellen Speicher-SoC angehoben,
+> endet die Akku-Unterstützung im selben Zyklus. Nur das batterieneutrale
+> PV-Budget darf die Ladung weiterführen; unterhalb der phasenabhängigen
+> Mindestleistung wird gestoppt. Start-Holds dürfen einen Fehlbetrag nur dann
+> ergänzen, wenn er vollständig durch verringerte Speicherladung oder eine
+> ausdrückliche Batterie-Freigabe finanziert ist.
 >
 > **Hinweis zu 5.4.4c:** Dieses Release korrigiert ausschließlich den Update-
 > und Reparaturpfad. Speicherentscheidung, Direktvermarktung, Wallbox- und

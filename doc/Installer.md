@@ -1,10 +1,28 @@
 # E3DC-Control Installer
 
-Dokumentation Stand: 5.4.4c
+Dokumentation Stand: 5.4.4d
 
 Der Installer verwaltet Bare-Metal-Installation, Update, Rechte, Dienste,
 Backup, Rollback und optionale Produktmodule. Er ermittelt Benutzer, Home,
 Installationspfad und Python-Umgebung aus dem geprüften Installationskontext.
+
+Der Installer-Anteil von 5.4.4d führt Backup, kurze Umschaltphase,
+Releaseprojektion, Reparatur bekannter Rechte und Dienstneustart vollständig im
+heruntergeladenen Ziel-Updater aus. Das Nutzer-`.git`, lokale
+Produktänderungen, fehlende Produktdateien und historische Rechte sind keine
+Startbedingungen. `ENOSPC`, `EROFS`, `EACCES` oder mehrere gleichrangige
+Installationen enden mit einer konkreten Prüf- und Fortsetzungsanweisung. Die
+Web-Rechte-Reparatur verwendet denselben root-eigenen Backup-/Updateauftrag;
+alle sichtbaren zustandsändernden Webaktionen prüfen Anmeldung,
+CSRF, HTTP-Ergebnis, Antwortinhalt und Teilfehler, bevor sie Erfolg melden.
+Private Modus-5-Datenverzeichnisse werden als `02770`, im ausdrücklich
+gewählten Kompatibilitätsmodus als `02775` geführt.
+Die Web-Launcher aus 5.4.4a bis 5.4.4c werden mit ihren jeweiligen gebundenen
+Übergabeverträgen unterstützt. Fehlt dort der vollständige Releasepfad, lädt
+der aktuelle Einzel-Bootstrap den Zielbaum selbst und gleicht ihn mit Tag und
+Commit ab. Eine neue Ziel-Pythonumgebung sowie optionale Abhängigkeiten werden
+vor dem einmaligen Dienststopp vorbereitet; fremde System-Python-Pakete sind
+keine Updatebedingung.
 
 Der Installer-Anteil von 5.4.4c ersetzt die bisherige Finalizer- und
 Recovery-Bootblock-Kette durch einen direkten Ziel-Updater. Das `.git`-
@@ -307,7 +325,7 @@ verwendet den alten `installer_main.py`-Updatepfad nicht. Details stehen in
 | :--- | :--- |
 | `1) Installation / Update` | Installation oder Update mit Paketen, Webdateien, Rechten und Diensten. |
 | `2) Systemstatus anzeigen` | Read-only Übersicht für Dienste, Pfade und Konfiguration. |
-| `3) Rechte prüfen & korrigieren` | Repariert Besitzer, Gruppen, sudoers, Webrechte und Ramdisk. |
+| `3) Rechte prüfen & korrigieren` | Startet den root-eigenen Backup-/Updateauftrag und repariert Besitzer, Gruppen, sudoers, Webrechte und Ramdisk. |
 | `4) Notfallmodus / System reparieren` | Gebündelte Reparatur einer beschädigten Installation. |
 | `5) Policygebundener Programm-Rückfall` | Rückfall auf einen ausdrücklich für Bare Metal freigegebenen Stable-Stand; `v5.3.2b` ist dafür nicht freigegeben. |
 | `6) Backup erstellen / verwalten` | Verifizierte Sicherungen erstellen, prüfen oder wiederherstellen. |
@@ -347,3 +365,8 @@ journalctl -u e3dc-live -n 80 --no-pager
 
 Ein Update oder Rollback meldet nur Erfolg, wenn Backup, Ziel-SHA, Migration,
 Dienste, Rolle und lokale HTTP-Prüfung vollständig bestätigt wurden.
+
+Bei `ENOSPC`, `EROFS`, `EACCES` oder mehreren gleichrangigen Installationen
+nennt die Ausgabe den betroffenen Pfad beziehungsweise die Kandidaten und den
+nächsten ausführbaren Prüf- oder Fortsetzungsbefehl. Es wird keine Instanz
+geraten und kein fehlgeschlagener Teilschritt als Erfolg ausgegeben.

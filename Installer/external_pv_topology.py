@@ -12,6 +12,11 @@ import tempfile
 import time
 from typing import Any, Dict, Optional
 
+try:
+    from .config_secret_permissions import config_secret_dir_mode
+except ImportError:  # Direkter Dienststart mit Installer/ im sys.path.
+    from config_secret_permissions import config_secret_dir_mode
+
 
 SCHEMA_VERSION = "external_pv_topology_v1"
 TOPOLOGY_SOURCE = "e3dc_add_power"
@@ -137,7 +142,9 @@ def _assert_safe_parent(parent: Path) -> None:
     try:
         metadata = parent.lstat()
     except FileNotFoundError:
-        parent.mkdir(parents=True, mode=0o2775, exist_ok=True)
+        expected_mode = config_secret_dir_mode()
+        parent.mkdir(parents=True, mode=expected_mode, exist_ok=True)
+        os.chmod(parent, expected_mode)
         metadata = parent.lstat()
     if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
         raise ExternalPvTopologyError("topology state directory is not a real directory")
